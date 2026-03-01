@@ -1,11 +1,7 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 
-const uefi = std.os.uefi;
-
 const serial_port: u16 = 0x3F8;
-
-pub fn main() void {}
 
 fn outb(port: u16, value: u8) void {
     asm volatile ("outb %[value], %[port]"
@@ -86,7 +82,7 @@ fn dumpState(state: *const kernel.KernelState, label: []const u8) void {
     serialWrite("\n");
 }
 
-pub export fn efi_main(_: uefi.Handle, _: *uefi.tables.SystemTable) callconv(.winapi) uefi.Status {
+pub fn main() void {
     serialInit();
     serialWrite("SakuraMicroKernel Phase1 boot\n");
 
@@ -97,7 +93,7 @@ pub export fn efi_main(_: uefi.Handle, _: *uefi.tables.SystemTable) callconv(.wi
         serialWrite("DMA start failed: ");
         serialWrite(@errorName(err));
         serialWrite("\n");
-        return .aborted;
+        return;
     };
     serialWrite("DMA start: region 0\n");
     serialWrite("owner -> Device0\n");
@@ -107,7 +103,7 @@ pub export fn efi_main(_: uefi.Handle, _: *uefi.tables.SystemTable) callconv(.wi
         serialWrite("DMA complete failed: ");
         serialWrite(@errorName(err));
         serialWrite("\n");
-        return .aborted;
+        return;
     };
     serialWrite("DMA complete: region 0\n");
     serialWrite("owner -> Process0\n");
@@ -116,6 +112,4 @@ pub export fn efi_main(_: uefi.Handle, _: *uefi.tables.SystemTable) callconv(.wi
     while (true) {
         asm volatile ("hlt");
     }
-
-    return .success;
 }

@@ -28,13 +28,11 @@ pub fn build(b: *std.Build) void {
         .target = efi_target,
         .optimize = optimize,
         .code_model = .small,
-        .no_builtin = true,
     });
     const efi_app = b.addExecutable(.{
         .name = "BOOTX64",
         .root_module = efi_mod,
     });
-    efi_app.entry = .disabled;
 
     const install_efi = b.addInstallArtifact(efi_app, .{
         .dest_sub_path = "EFI/BOOT/BOOTX64.EFI",

@@ -1,1 +1,17 @@
-tla/states
+# Zig build artifacts
+kernel/.zig-cache/
+kernel/zig-out/
+*.pdb
+
+# UEFI/QEMU artifacts
+BOOTX64.EFI
+*.img
+*.fd
+
+# TLA+ state dumps
+tla/states/
+states/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
