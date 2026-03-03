@@ -11,8 +11,10 @@ const user_va: u64 = 0x400000;
 const user_stack_top: u64 = 0x402000;
 const user_stack_page_va: u64 = user_stack_top - 0x1000;
 const user_unmapped_test_va: u64 = 0x500000;
+const user_recovery_stop_va: u64 = 0x600000;
 const reserved_low_mem_end: u64 = 16 * 1024 * 1024;
 const page_addr_mask: u64 = 0x000F_FFFF_FFFF_F000;
+const canonical_user_limit_exclusive: u64 = 0x0000_8000_0000_0000;
 const gdt_kernel_code_selector: u16 = 0x08;
 const gdt_kernel_data_selector: u16 = 0x10;
 const gdt_user_code_selector: u16 = 0x18;
@@ -27,6 +29,8 @@ const page_ps: u64 = 1 << 7;
 const debug_skip_exit_boot_services = false;
 const debug_skip_cr3_switch = false;
 const debug_trigger_page_fault_test = false;
+const debug_trigger_general_protection_test = false;
+const debug_trigger_pf_recovery_demo = true;
 
 var pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
@@ -50,10 +54,13 @@ var ring0_stack: [64 * 1024]u8 align(16) = [_]u8{0} ** (64 * 1024);
 var tss: Tss = std.mem.zeroes(Tss);
 var kernel_state_global: kernel.KernelState = undefined;
 var kernel_state_ready = false;
+export var kernel_cr3_value: u64 = 0;
+export var user_cr3_value: u64 = 0;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_move_cap: u64 = 0x3;
+const syscall_drop_present: u64 = 0x4;
 
 const syscall_ok: u64 = 0;
 const syscall_err_invalid = 1;
@@ -61,6 +68,7 @@ const syscall_err_not_ready = 2;
 const syscall_err_alloc = 4;
 const syscall_err_map = 5;
 const syscall_err_move = 6;
+const syscall_err_drop_present = 7;
 
 const MemoryStats = struct {
     detected_regions: usize,
@@ -110,7 +118,7 @@ const Tss = packed struct {
     iomap_base: u16 = 0,
 };
 
-const SyscallRegs = extern struct {
+const TrapFrame = extern struct {
     r15: u64,
     r14: u64,
     r13: u64,
@@ -126,6 +134,60 @@ const SyscallRegs = extern struct {
     rcx: u64,
     rbx: u64,
     rax: u64,
+    // CPU-pushed on ring transition (int 0x80 from ring3 -> ring0)
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+};
+
+comptime {
+    if (@offsetOf(TrapFrame, "rax") != 112) @compileError("TrapFrame layout mismatch: rax offset");
+    if (@offsetOf(TrapFrame, "rip") != 120) @compileError("TrapFrame layout mismatch: rip offset");
+    if (@offsetOf(TrapFrame, "ss") != 152) @compileError("TrapFrame layout mismatch: ss offset");
+}
+
+const ExceptionTrapFrame = extern struct {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rbp: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+};
+
+comptime {
+    if (@offsetOf(ExceptionTrapFrame, "rax") != 112) @compileError("ExceptionTrapFrame layout mismatch: rax offset");
+    if (@offsetOf(ExceptionTrapFrame, "error_code") != 120) @compileError("ExceptionTrapFrame layout mismatch: error_code offset");
+    if (@offsetOf(ExceptionTrapFrame, "rip") != 128) @compileError("ExceptionTrapFrame layout mismatch: rip offset");
+    if (@offsetOf(ExceptionTrapFrame, "ss") != 160) @compileError("ExceptionTrapFrame layout mismatch: ss offset");
+}
+
+const PageFaultCapability = struct {
+    principal: kernel.PrincipalId,
+    fault_va: u64,
+    fault_page_va: u64,
+    fault_rip: u64,
+    present_violation: bool,
+    write_access: bool,
+    instruction_fetch: bool,
+    candidate_paddr: ?u64,
 };
 
 fn zeroIdtEntry() IdtEntry {
@@ -181,18 +243,154 @@ fn serialWriteHexRaw(value: u64) void {
     }
 }
 
-pub export fn pageFaultHandlerCommon(cr2: u64, error_code: u64) callconv(.c) noreturn {
-    asm volatile ("cli");
-    serialWrite("PAGE FAULT\n");
+fn serialWriteBool01(value: bool) void {
+    serialWriteByte(if (value) '1' else '0');
+}
+
+fn readCr2() u64 {
+    var value: u64 = 0;
+    asm volatile ("mov %%cr2, %[out]"
+        : [out] "=r" (value),
+    );
+    return value;
+}
+
+fn exceptionName(vec: u64) []const u8 {
+    return switch (vec) {
+        13 => "GENERAL PROTECTION",
+        14 => "PAGE FAULT",
+        else => "EXCEPTION",
+    };
+}
+
+fn isUserCanonicalVa(va: u64) bool {
+    return va < canonical_user_limit_exclusive;
+}
+
+fn lookupUserMappedPaddrForVa(va: u64) ?u64 {
+    const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
+    const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
+    const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+    const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+    const user_pdp_index: usize = @intCast((user_va >> 30) & 0x1FF);
+    const user_pd_index: usize = @intCast((user_va >> 21) & 0x1FF);
+
+    // Current stage maps only one PT under the user_va PD slot.
+    if (pml4_index != 0 or pdp_index != user_pdp_index or pd_index != user_pd_index) return null;
+
+    const entry = user_pt_table[pt_index];
+    const paddr = entry & page_addr_mask;
+    if (paddr == 0) return null;
+    return paddr;
+}
+
+fn issuePageFaultCapability(frame: *const ExceptionTrapFrame, cr2: u64) ?PageFaultCapability {
+    const ec = frame.error_code;
+    const user_mode = (ec & (1 << 2)) != 0;
+    if (!user_mode) return null;
+    if (!isUserCanonicalVa(cr2)) return null;
+
+    const fault_page_va = pageAlignDown(cr2);
+    return .{
+        .principal = .Process0,
+        .fault_va = cr2,
+        .fault_page_va = fault_page_va,
+        .fault_rip = frame.rip,
+        .present_violation = (ec & (1 << 0)) != 0,
+        .write_access = (ec & (1 << 1)) != 0,
+        .instruction_fetch = (ec & (1 << 4)) != 0,
+        .candidate_paddr = lookupUserMappedPaddrForVa(fault_page_va),
+    };
+}
+
+fn resolvePageFaultCapability(pf_cap: PageFaultCapability) bool {
+    // Step3 policy: only user-mode not-present faults are recoverable.
+    if (pf_cap.present_violation) return false;
+    if (!kernel_state_ready) return false;
+
+    const candidate_paddr = pf_cap.candidate_paddr orelse return false;
+    const cap = kernel_state_global.getTableConst(pf_cap.principal).find(candidate_paddr) orelse return false;
+    if (!cap.rights.cpu_read) return false;
+    if (pf_cap.write_access and !cap.rights.cpu_write) return false;
+    if (pf_cap.instruction_fetch) return false;
+
+    return mapUserPageFromCapability(
+        &kernel_state_global,
+        pf_cap.principal,
+        pf_cap.fault_page_va,
+        candidate_paddr,
+        cap.rights.cpu_write,
+    );
+}
+
+fn logPageFaultStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
+    const ec_user = (frame.error_code & (1 << 2)) != 0;
+    const va_user = isUserCanonicalVa(cr2);
+
+    serialWrite("  USER_MODE=");
+    serialWriteBool01(ec_user);
+    serialWrite("\n");
+    serialWrite("  USER_VA=");
+    serialWriteBool01(va_user);
+    serialWrite("\n");
+
+    const pf_cap = issuePageFaultCapability(frame, cr2) orelse {
+        serialWrite("  PF_CAP=none\n");
+        serialWrite("  CAP_LOOKUP=skip\n");
+        return;
+    };
+    serialWrite("  PF_CAP=issued\n");
+
+    const candidate_paddr = pf_cap.candidate_paddr orelse {
+        serialWrite("  CAND_PADDR=none\n");
+        serialWrite("  CAP_LOOKUP=none\n");
+        return;
+    };
+    serialWrite("  CAND_PADDR=");
+    serialWriteHexRaw(candidate_paddr);
+    serialWrite("\n");
+
+    if (!kernel_state_ready) {
+        serialWrite("  CAP_LOOKUP=kernel_state_not_ready\n");
+        return;
+    }
+
+    const has_cap = kernel_state_global.getTableConst(pf_cap.principal).find(candidate_paddr) != null;
+    serialWrite("  CAP_LOOKUP=");
+    serialWrite(if (has_cap) "found(Process0)\n" else "none(Process0)\n");
+}
+
+pub export fn pageFaultDispatch(frame: *const ExceptionTrapFrame) callconv(.c) u64 {
+    const cr2 = readCr2();
+    const pf_cap = issuePageFaultCapability(frame, cr2) orelse return 0;
+    if (!resolvePageFaultCapability(pf_cap)) return 0;
+
+    serialWrite("PAGE FAULT RESOLVED\n");
     serialWrite("  CR2=");
     serialWriteHexRaw(cr2);
     serialWrite("\n");
-    serialWrite("  EC=");
-    serialWriteHexRaw(error_code);
+    serialWrite("  PF_CAP=consumed\n");
+    return 1;
+}
+
+pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFrame) callconv(.c) noreturn {
+    asm volatile ("cli");
+    serialWrite(exceptionName(vec));
     serialWrite("\n");
-    while (true) {
-        asm volatile ("hlt");
+    if (vec == 14) {
+        serialWrite("  CR2=");
+        const cr2 = readCr2();
+        serialWriteHexRaw(cr2);
+        serialWrite("\n");
+        logPageFaultStep2(cr2, frame);
     }
+    serialWrite("  EC=");
+    serialWriteHexRaw(frame.error_code);
+    serialWrite("\n");
+    serialWrite("  RIP=");
+    serialWriteHexRaw(frame.rip);
+    serialWrite("\n");
+    haltLoop();
 }
 
 pub export fn doubleFaultHandlerCommon(error_code: u64) callconv(.c) noreturn {
@@ -208,15 +406,6 @@ pub export fn doubleFaultHandlerCommon(error_code: u64) callconv(.c) noreturn {
 
 fn haltLoop() noreturn {
     while (true) asm volatile ("hlt");
-}
-
-pub export fn generalProtectionHandlerCommon(error_code: u64) callconv(.c) noreturn {
-    asm volatile ("cli");
-    serialWrite("GENERAL PROTECTION\n");
-    serialWrite("  EC=");
-    serialWriteHexRaw(error_code);
-    serialWrite("\n");
-    haltLoop();
 }
 
 pub export fn invalidTssHandlerCommon(error_code: u64) callconv(.c) noreturn {
@@ -290,32 +479,58 @@ fn mapUserPageFromCapability(
     return true;
 }
 
-pub export fn syscallDispatch(regs: *SyscallRegs) callconv(.c) u64 {
+fn dropPresentForUserMappedPaddr(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    paddr: u64,
+) bool {
+    _ = state.getTableConst(principal).find(paddr) orelse return false;
+    const user_pt_base_va = user_va & ~@as(u64, 0x1F_FFFF);
+
+    var i: usize = 0;
+    while (i < page_entries) : (i += 1) {
+        const entry = user_pt_table[i];
+        if ((entry & page_addr_mask) != paddr) continue;
+        if ((entry & page_present) == 0) continue;
+        user_pt_table[i] = entry & ~page_present;
+        invlpg(user_pt_base_va + (@as(u64, i) * 4096));
+        return true;
+    }
+    return false;
+}
+
+pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
     if (!kernel_state_ready) return syscall_err_not_ready;
     const state = &kernel_state_global;
 
-    switch (regs.rax) {
+    switch (frame.rax) {
         syscall_alloc_page => {
             const cap = state.allocPageTo(.Process0, &global_free_list) catch return syscall_err_alloc;
             return cap.paddr;
         },
         syscall_map_page => {
-            const writable = (regs.rdx & 0x1) != 0;
-            if (mapUserPageFromCapability(state, .Process0, regs.rdi, regs.rsi, writable)) {
+            const writable = (frame.rdx & 0x1) != 0;
+            if (mapUserPageFromCapability(state, .Process0, frame.rdi, frame.rsi, writable)) {
                 return syscall_ok;
             }
             return syscall_err_map;
         },
         syscall_move_cap => {
-            const to = switch (regs.rsi) {
+            const to = switch (frame.rsi) {
                 0 => kernel.PrincipalId.Process0,
                 1 => kernel.PrincipalId.Device0,
                 else => return syscall_err_invalid,
             };
             const from = if (to == .Process0) kernel.PrincipalId.Device0 else kernel.PrincipalId.Process0;
-            const rights = parseRights(regs.rdx);
-            state.moveCap(from, to, regs.rdi, rights) catch return syscall_err_move;
+            const rights = parseRights(frame.rdx);
+            state.moveCap(from, to, frame.rdi, rights) catch return syscall_err_move;
             return syscall_ok;
+        },
+        syscall_drop_present => {
+            if (dropPresentForUserMappedPaddr(state, .Process0, frame.rdi)) {
+                return syscall_ok;
+            }
+            return syscall_err_drop_present;
         },
         else => return syscall_err_invalid,
     }
@@ -323,13 +538,64 @@ pub export fn syscallDispatch(regs: *SyscallRegs) callconv(.c) u64 {
 
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
     asm volatile (
-        \\mov %cr2, %rdi
-        \\mov (%rsp), %rsi
-        \\mov %rdi, %rcx
-        \\mov %rsi, %rdx
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
+        \\push %rax
+        \\push %rbx
+        \\push %rcx
+        \\push %rdx
+        \\push %rsi
+        \\push %rdi
+        \\push %rbp
+        \\push %r8
+        \\push %r9
+        \\push %r10
+        \\push %r11
+        \\push %r12
+        \\push %r13
+        \\push %r14
+        \\push %r15
+        \\mov %rsp, %rcx
+        // Keep original stack pointer in a callee-saved register across the C call.
+        \\mov %rsp, %r15
         \\and $-16, %rsp
-        \\sub $8, %rsp
-        \\jmp pageFaultHandlerCommon
+        \\sub $32, %rsp
+        \\call pageFaultDispatch
+        \\mov %r15, %rsp
+        \\test %rax, %rax
+        \\jz 1f
+        \\pop %r15
+        \\pop %r14
+        \\pop %r13
+        \\pop %r12
+        \\pop %r11
+        \\pop %r10
+        \\pop %r9
+        \\pop %r8
+        \\pop %rbp
+        \\pop %rdi
+        \\pop %rsi
+        \\pop %rdx
+        \\pop %rcx
+        \\pop %rbx
+        \\pop %rax
+        \\push %r10
+        \\mov user_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
+        // #PF has error_code on stack; remove it before iretq.
+        \\add $8, %rsp
+        \\iretq
+        \\1:
+        \\mov %rsp, %rdx
+        \\mov %rsp, %r15
+        \\and $-16, %rsp
+        \\sub $32, %rsp
+        \\mov $14, %rcx
+        \\call exceptionWithErrorCommon
+        \\ud2
     );
 }
 
@@ -345,6 +611,11 @@ pub export fn doubleFaultHandlerStub() callconv(.naked) noreturn {
 
 pub export fn syscallHandlerStub() callconv(.naked) noreturn {
     asm volatile (
+    // ring3 -> kernel entry: scratch 利用前に r10 を退避し、完全保存を維持する。
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\push %rax
         \\push %rbx
         \\push %rcx
@@ -366,6 +637,7 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
         \\mov %rdi, %rcx
         \\call syscallDispatch
         \\add $32, %rsp
+        // TrapFrame.rax へ戻り値を書き戻す（offsetは comptime で検証済み）
         \\mov %rax, 112(%rsp)
         \\pop %r15
         \\pop %r14
@@ -382,17 +654,39 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
         \\pop %rcx
         \\pop %rbx
         \\pop %rax
+        // kernel -> ring3 return: r10 を壊さず user CR3 を復帰して iretq する。
+        \\push %r10
+        \\mov user_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\iretq
     );
 }
 
 pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
     asm volatile (
-        \\mov (%rsp), %rdi
-        \\mov %rdi, %rcx
+        \\push %rax
+        \\push %rbx
+        \\push %rcx
+        \\push %rdx
+        \\push %rsi
+        \\push %rdi
+        \\push %rbp
+        \\push %r8
+        \\push %r9
+        \\push %r10
+        \\push %r11
+        \\push %r12
+        \\push %r13
+        \\push %r14
+        \\push %r15
+        \\mov %rsp, %r8
         \\and $-16, %rsp
-        \\sub $8, %rsp
-        \\jmp generalProtectionHandlerCommon
+        \\sub $32, %rsp
+        \\mov $13, %rcx
+        \\mov %r8, %rdx
+        \\call exceptionWithErrorCommon
+        \\ud2
     );
 }
 
@@ -652,6 +946,7 @@ fn installIdentityPageTables0To1GiB() bool {
     }
 
     writeCr3(pml4_pa);
+    kernel_cr3_value = pml4_pa;
     return true;
 }
 
@@ -824,6 +1119,103 @@ fn installUserMemoryWritePfTestCode(user_page_paddr: u64) void {
     code[off + 3] = 0x56;
     code[off + 4] = 0x34;
     code[off + 5] = 0x12;
+    off += 6;
+
+    // fallback: jmp $
+    code[off] = 0xEB;
+    code[off + 1] = 0xFE;
+}
+
+fn installUserGeneralProtectionTestCode(user_page_paddr: u64) void {
+    // ring3 privileged instruction test:
+    // CLI in CPL3 must raise #GP(0).
+    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
+    code[0] = 0xFA; // cli
+    code[1] = 0xEB; // jmp $
+    code[2] = 0xFE;
+}
+
+fn installUserPfRecoveryDemoCode(user_page_paddr: u64) void {
+    // ring3 recovery demo:
+    // 1) sys_alloc_page -> paddr
+    // 2) sys_map_page(user_unmapped_test_va, paddr, writable=1)
+    // 3) sys_drop_present(paddr) with capability kept in Process0
+    // 4) write user_unmapped_test_va (first access #PF, then auto-recovered and retried)
+    // 5) write user_recovery_stop_va (no capability -> fatal #PF to stop demo)
+    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
+    var off: usize = 0;
+
+    // sys_alloc_page
+    code[off] = 0x48;
+    code[off + 1] = 0xB8;
+    writeU64LE(code, off + 2, syscall_alloc_page);
+    off += 10;
+    code[off] = 0xCD;
+    code[off + 1] = 0x80;
+    off += 2;
+    code[off] = 0x48; // mov rbx, rax
+    code[off + 1] = 0x89;
+    code[off + 2] = 0xC3;
+    off += 3;
+
+    // sys_map_page(va=user_unmapped_test_va, paddr=rbx, flags=1 writable)
+    code[off] = 0x48;
+    code[off + 1] = 0xB8;
+    writeU64LE(code, off + 2, syscall_map_page);
+    off += 10;
+    code[off] = 0x48;
+    code[off + 1] = 0xBF;
+    writeU64LE(code, off + 2, user_unmapped_test_va);
+    off += 10;
+    code[off] = 0x48; // mov rsi, rbx
+    code[off + 1] = 0x89;
+    code[off + 2] = 0xDE;
+    off += 3;
+    code[off] = 0x48;
+    code[off + 1] = 0xBA;
+    writeU64LE(code, off + 2, 0x1);
+    off += 10;
+    code[off] = 0xCD;
+    code[off + 1] = 0x80;
+    off += 2;
+
+    // sys_drop_present(paddr=rbx)
+    code[off] = 0x48;
+    code[off + 1] = 0xB8;
+    writeU64LE(code, off + 2, syscall_drop_present);
+    off += 10;
+    code[off] = 0x48; // mov rdi, rbx
+    code[off + 1] = 0x89;
+    code[off + 2] = 0xDF;
+    off += 3;
+    code[off] = 0xCD;
+    code[off + 1] = 0x80;
+    off += 2;
+
+    // this write should #PF once, then be recovered and retried successfully
+    code[off] = 0x48;
+    code[off + 1] = 0xB8;
+    writeU64LE(code, off + 2, user_unmapped_test_va);
+    off += 10;
+    code[off] = 0xC7;
+    code[off + 1] = 0x00;
+    code[off + 2] = 0x44;
+    code[off + 3] = 0x33;
+    code[off + 4] = 0x22;
+    code[off + 5] = 0x11;
+    off += 6;
+
+    // stop with a fatal PF (no mapping/capability for this VA)
+    code[off] = 0x48;
+    code[off + 1] = 0xB8;
+    writeU64LE(code, off + 2, user_recovery_stop_va);
+    off += 10;
+    code[off] = 0xC7;
+    code[off + 1] = 0x00;
+    code[off + 2] = 0x88;
+    code[off + 3] = 0x77;
+    code[off + 4] = 0x66;
+    code[off + 5] = 0x55;
     off += 6;
 
     // fallback: jmp $
@@ -1010,7 +1402,7 @@ pub fn main() void {
         serialWrite("CR3 switched to custom PML4\n");
     }
     initIdtPageFaultOnly();
-    serialWrite("IDT loaded (#PF/#DF/#INT80)\n");
+    serialWrite("IDT loaded (#PF/#GP/#DF/#INT80)\n");
     if (debug_trigger_page_fault_test) {
         triggerPageFaultTest();
     }
@@ -1039,6 +1431,7 @@ pub fn main() void {
         serialWrite("user page table build failed\n");
         while (true) asm volatile ("hlt");
     }
+    user_cr3_value = @intFromPtr(&user_pml4_table);
     serialWrite("user page table ready\n");
     serialWrite("  user_va=");
     printHex(user_va);
@@ -1052,7 +1445,13 @@ pub fn main() void {
     serialWrite("  user_stack_pa=");
     printHex(user_stack_page.paddr);
     serialWrite("\n");
-    installUserMemoryWritePfTestCode(user_page.paddr);
+    if (debug_trigger_general_protection_test) {
+        installUserGeneralProtectionTestCode(user_page.paddr);
+    } else if (debug_trigger_pf_recovery_demo) {
+        installUserPfRecoveryDemoCode(user_page.paddr);
+    } else {
+        installUserMemoryWritePfTestCode(user_page.paddr);
+    }
 
     var allocated: [3]u64 = undefined;
     var i: usize = 0;
@@ -1081,7 +1480,13 @@ pub fn main() void {
     dumpCapabilityView(&state);
     kernel_state_global = state;
     kernel_state_ready = true;
-    serialWrite("\nenter ring3 with iretq (sys_alloc/map/move + expected #PF)\n");
-    writeCr3(@intFromPtr(&user_pml4_table));
+    if (debug_trigger_general_protection_test) {
+        serialWrite("\nenter ring3 with iretq (expected #GP by user CLI)\n");
+    } else if (debug_trigger_pf_recovery_demo) {
+        serialWrite("\nenter ring3 with iretq (expected #PF recover + final fatal #PF)\n");
+    } else {
+        serialWrite("\nenter ring3 with iretq (sys_alloc/map/move + expected #PF)\n");
+    }
+    writeCr3(user_cr3_value);
     enterUserModeIretq(user_va, user_stack_top);
 }

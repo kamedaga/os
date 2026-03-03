@@ -70,6 +70,13 @@ PTE 生成は capability を唯一根拠とする。
    - 効果: `pte_sync_hook` により PTE 権限が同期される
    - 戻り値: `0` 成功 / エラーコード
 
+4. `sys_drop_present = 0x4`
+   - 引数:
+     - `RDI=paddr`
+   - 処理: Process0 が保持する `paddr` の user PTE から `Present` を落とす
+   - 効果: capability は維持したまま、次回アクセスで `#PF (P=0)` を発生させられる
+   - 戻り値: `0` 成功 / エラーコード
+
 ## テストコード（ring3）
 以下を順に実行:
 1. `sys_alloc_page`
@@ -105,3 +112,75 @@ PAGE FAULT
 - `U=1`（user）
 
 これにより、capability の移譲が PTE 権限に反映され、ring3 CPU 書き込みが遮断されることを確認した。
+
+---
+
+# Syscall Step3: レジスタ保存 + RAX戻り値 + iretq復帰
+
+## 目的
+`int 0x80` を「入口だけ」ではなく、ring3 から呼んで ring3 に戻る往復経路として完成させる。
+
+## 実装内容
+1. `syscallHandlerStub` で汎用レジスタを保存する。
+   - `rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15`
+2. 保存レジスタ領域へのポインタを `syscallDispatch` に渡して syscall を実行する。
+3. `syscallDispatch` の戻り値を保存済み `RAX` スロットへ書き戻す。
+4. レジスタを復帰し、最後に `iretq` で ring3 へ戻る。
+5. CR3 分離と整合するように、stub 入口で `kernel_cr3`、復帰直前で `user_cr3` に切り替える。
+
+## 実装上の注意
+- CR3 切替の scratch で使う `r10` は push/pop で保護し、ユーザー側 `r10` を破壊しない。
+- syscall 戻り値は `RAX` だけ更新し、その他レジスタ値は保存・復帰で維持する。
+
+## できるようになったこと
+1. ring3 から連続 syscall 呼び出しが可能。
+2. `RAX` で `success/error` や `paddr` を受け取り、ユーザーコード側で分岐できる。
+3. `sys_alloc -> sys_map -> sys_move` のような一連の capability 操作を ring3 主体で実行できる。
+
+## 実測確認（抜粋）
+```text
+INT80 enter
+  SYSNO=0x1
+  alloc paddr=0x...
+INT80 enter
+  SYSNO=0x2
+  map ok
+INT80 enter
+  SYSNO=0x3
+  move paddr=0x... from=0x0 to=0x1
+  move ok
+PAGE FAULT
+  CR2=0x500000
+  EC=0x6
+```
+
+`EC=0x6` は `user write + not-present` で、capability 反映後の期待どおり。
+
+---
+
+# Syscall Step4: 正式 TrapFrame 導入
+
+## 目的
+syscall 境界を「スタックに適当に積む」実装から、明示的な TrapFrame 構造へ統一する。
+
+## TrapFrame 定義
+`int 0x80` の入口は次の 1 つの型を唯一境界として扱う。
+
+```zig
+const TrapFrame = extern struct {
+    r15: u64, r14: u64, r13: u64, r12: u64, r11: u64, r10: u64, r9: u64, r8: u64,
+    rsi: u64, rdi: u64, rbp: u64, rdx: u64, rcx: u64, rbx: u64, rax: u64,
+    rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64,
+};
+```
+
+## 実装ポイント
+1. `SyscallRegs` を廃止し `TrapFrame` へ置換。
+2. `syscallDispatch(frame: *TrapFrame)` が引数・戻り値処理の唯一入口になる。
+3. スタブは `syscallDispatch` の戻り値を `TrapFrame.rax` に書き戻す。
+4. `rax/rip/ss` のオフセットは `comptime` 検証で固定化し、レイアウト破壊をビルド時に検出する。
+
+## 効果
+- syscall ABI の境界が構造体として明示される。
+- `RAX` 戻り値更新の意味がコード上で追いやすくなる。
+- 将来の完全な例外フレーム（error code あり/なし）拡張の土台になる。

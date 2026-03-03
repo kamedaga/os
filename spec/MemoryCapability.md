@@ -267,3 +267,39 @@ Capability の移譲結果を実際のページテーブルへ反映し、CPU �
 ## 効果
 - 「Capability を持たないページが user map される」状態を防止。
 - capability モデルと仮想メモリモデルの整合性を保つ。
+
+# Memory Capability Step9: 本物の user CR3 切替
+
+## 目的
+ring3 実行中に kernel CR3 を使い続ける状態をやめ、`user_cr3` と `kernel_cr3` を明確に切り替えてアドレス空間分離を強制する。
+
+## 実装
+1. `kernel_cr3_value` を保持する。
+   - 自前 PML4 を `writeCr3(...)` した直後の値を保存する。
+2. `user_cr3_value` を保持する。
+   - `user_pml4` 構築後にその物理アドレスを保存する。
+3. ring3 入場前に `CR3 = user_cr3_value` を設定する。
+4. `int 0x80` ハンドラ入口で `CR3 = kernel_cr3_value` に戻す。
+5. syscall の `iretq` 復帰直前で `CR3 = user_cr3_value` を再設定する。
+
+## 期待効果
+- ring3 実行時は user 用ページテーブルだけが有効になる。
+- syscall/例外処理時は kernel 用ページテーブルで安全に処理できる。
+- ユーザー未マップアクセスは確実に `#PF` になる。
+
+## 実測ログ
+```text
+enter ring3 with iretq (sys_alloc/map/move + expected #PF)
+PAGE FAULT
+  CR2=0x0000000000500000
+  EC=0x0000000000000006
+```
+
+解釈:
+- `CR2=0x500000`: テスト対象の user 側未許可/未存在アドレス
+- `EC=0x6`: `U=1` かつ `W=1` かつ `P=0`（user write to not-present）
+
+## 受け入れ条件
+- ring3 直前に user CR3 へ切替している。
+- `int 0x80` 往復で kernel/user CR3 が往復切替される。
+- ring3 から未マップ（または capability により剥奪済み）領域へ書き込み時に `#PF (CR2, EC)` が再現する。
