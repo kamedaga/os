@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const PrincipalId = enum(u8) {
     Process0,
+    Process1,
     Device0,
 };
 
@@ -187,11 +188,12 @@ pub const OwnershipView = enum {
 
 pub const KernelState = struct {
     pub const max_regions = 256;
+    const principal_count = 3;
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
-    cap_tables: [2]CNode = .{ .{}, .{} },
-    pte_sync_hook: ?*const fn (paddr: u64, rights: Rights) void = null,
+    cap_tables: [principal_count]CNode = .{ .{}, .{}, .{} },
+    pte_sync_hook: ?*const fn (state: *const KernelState, paddr: u64) void = null,
 
     pub fn initPhase1() KernelState {
         var state = KernelState{};
@@ -201,6 +203,7 @@ pub const KernelState = struct {
         state.region_len = 1;
 
         state.cap_tables[@intFromEnum(PrincipalId.Process0)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
 
         // Process0 initially owns region0 and has read + dma.
@@ -218,6 +221,7 @@ pub const KernelState = struct {
 
         var state = KernelState{};
         state.cap_tables[@intFromEnum(PrincipalId.Process0)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
 
         var i: usize = 0;
@@ -330,6 +334,9 @@ pub const KernelState = struct {
                 .dma = true,
             },
         });
+        if (self.pte_sync_hook) |hook| {
+            hook(self, cap.paddr);
+        }
         return cap;
     }
 
@@ -352,7 +359,7 @@ pub const KernelState = struct {
             .rights = rights,
         });
         if (self.pte_sync_hook) |hook| {
-            hook(paddr, rights);
+            hook(self, paddr);
         }
     }
 };

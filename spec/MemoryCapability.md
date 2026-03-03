@@ -230,15 +230,14 @@ Capability の移譲結果を実際のページテーブルへ反映し、CPU �
 
 ## 実装方針
 - `KernelState.moveCap` に `pte_sync_hook` を追加。
-- `moveCap` 成功後に `pte_sync_hook(paddr, rights)` を呼ぶ。
+- `moveCap`（および `allocPageTo`）成功後に `pte_sync_hook(state, paddr)` を呼ぶ。
 - フック側で対象 `paddr` の PTE を探索し、以下を適用する。
-  - `cpu_read=false` かつ `cpu_write=false`:
-    - `Present` を落として CPU アクセス不可にする。
-  - `cpu_read=true` かつ `cpu_write=false`:
-    - `Present=1`, `RW=0` にして read-only にする。
-  - `cpu_read=true` かつ `cpu_write=true`:
-    - `Present=1`, `RW=1` にする。
-- 反映後は CR3 リロードで TLB を更新する。
+  - Process0 が `paddr` capability を持たない:
+    - PTE を `0`（unmap）にする。
+  - Process0 が `cpu_read=true`:
+    - `Present=1`、`RW` は `cpu_write` に合わせる。
+  - 同一 `paddr` の複数 PTE は 1本だけ残し、他は unmap する。
+- 反映後は user CR3 側で `invlpg` して TLB を更新する。
 
 ## 期待効果
 - DMA へ move したページは CPU から実アクセス不能になる。
@@ -303,3 +302,95 @@ PAGE FAULT
 - ring3 直前に user CR3 へ切替している。
 - `int 0x80` 往復で kernel/user CR3 が往復切替される。
 - ring3 から未マップ（または capability により剥奪済み）領域へ書き込み時に `#PF (CR2, EC)` が再現する。
+
+# Memory Capability Step10: Strict PTE-Capability Synchronization
+
+## 目的
+`cap` と `PTE` の不整合を「設計上の前提」ではなく、カーネル実装で強制的に排除する。
+
+## 強制ルール
+1. `cap remove`（Process0から消える）時は対応 PTE を必ず unmap。
+2. PTE 変更時は必ず user CR3 側で `invlpg`。
+3. 同一 `paddr` の user PTE は1本のみ（1:1）に強制。
+4. `moveCap` の同期は「移譲先 rights」ではなく「Process0の実cap状態」を参照して決定。
+
+## 実装反映
+- `pte_sync_hook` 署名を `hook(state, paddr)` へ変更。
+- `allocPageTo` と `moveCap` の両方で同期フックを呼ぶ。
+- `syncPageTableRightsForPaddr(state, paddr)` が Process0 CNode を参照して
+  - unmap / read-only / read-write を決定する。
+- `mapUserPageFromCapability` は同一 `paddr` の alias PTE を削除してから map する。
+- `flushUserTlbForVa(va)` を導入し、現在 CR3 が kernel のときでも user CR3 側 TLB を確実に無効化する。
+
+## 効果
+- `cap` 削除後に stale mapping が残る経路を排除。
+- DMA 移譲直後の CPU 側アクセス無効化が即時反映。
+- 複数 CR3 環境でも PTE/TLB 不整合を抑制できる。
+
+## 即時無効化デモ
+`debug_trigger_dma_unmap_verify_demo = true` のとき、次を実行して検証できる。
+
+1. `start_dma` 対象ページを事前に `user_dma_verify_va(0x510000)` へ map
+2. `start_dma(paddr)` を実行（Process0 cap が消える）
+3. ring3 で `*(u32*)0x510000 = ...` を実行
+
+期待:
+- `start_dma` 直後に PTE が unmap + user CR3 側 `invlpg` 済み
+- ring3 最初の書き込みで即 `#PF`（`CR2=0x510000`）
+
+# Memory Capability Step11: Per-Process CR3 Separation
+
+## 目的
+`Process0` だけでなく、各プロセスが独立した user CR3 を持つ構成へ拡張する。
+
+## 実装
+1. `PrincipalId` に `Process1` を追加。
+2. 各プロセス用に独立 `UserAddressSpace`（`pml4/pdp/pd/pt/cr3`）を保持。
+3. 起動時に `Process0` と `Process1` の user address space を個別構築。
+4. `mapUserPageFromCapability / dropPresent / syncPageTableRightsForPaddr` は
+   principal 指定で対象プロセス空間を操作する。
+5. `#PF` 復帰判断も current process の fault capability を根拠に処理する。
+
+## Kernel direct mapping について（現段階）
+- user CR3 から広域 identity map を削除し、次のみ残す:
+  - user page / user stack
+  - 例外・syscall 入口に必要な最小 supervisor bridge（stub, IDT/GDT/TSS, ring0 stack 等）
+- これにより、従来の「0..1GiB 全体を supervisor で鏡写し」状態を縮退した。
+
+## 備考
+- `int80/#PF` トランポリン導入により、user CR3 は最小 supervisor bridge 方式で運用可能になった。
+
+# Memory Capability Step12: #PF Recover 標準化 + Process1 同一シナリオ
+
+## 目的
+- `#PF` 回復をデバッグ専用分岐ではなく、通常経路の標準動作にする。
+- 同一の recovery シナリオを `Process0` だけでなく `Process1` でも実行して確認する。
+
+## 実装
+1. 通常ブート時の user テストコードを recovery ベースに変更。
+2. `sys_switch_process(0x5)` を追加。
+   - 引数: `RDI=target process id` (`0`=`Process0`, `1`=`Process1`)
+   - 動作:
+     - `current_user_principal` を切替
+     - `user_cr3_value` を対象 process の CR3 に切替
+     - `TrapFrame.rip/rsp` を `user_va/user_stack_top` に差し替え
+     - `iretq` 復帰先を次プロセスへ切替
+3. 標準デモを2段構成にした。
+   - `Process0`: `sys_alloc -> sys_map -> sys_drop_present -> write(#PF recover) -> sys_switch_process(1)`
+   - `Process1`: 同じ recovery シーケンスを実行後、最終 fatal `#PF` で停止
+
+## 期待ログ
+```text
+enter ring3 with iretq (std #PF recover: Process0 then Process1)
+PAGE FAULT RESOLVED
+  CR2=...
+PAGE FAULT RESOLVED
+  CR2=...
+PAGE FAULT
+  CR2=...
+```
+
+## 意味
+- `capability` が残っている not-present fault は復帰可能。
+- capability 根拠がない fault は停止（安全側）。
+- recovery ロジックが process 固有 CR3 分離と整合した状態で動作する。

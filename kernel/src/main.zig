@@ -1,18 +1,23 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
+const interrupts = @import("interrupts.zig");
+const serial = @import("serial.zig");
+const user_programs = @import("user_programs.zig");
 const uefi = std.os.uefi;
+const TrapFrame = interrupts.TrapFrame;
+const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
-const serial_port: u16 = 0x3F8;
 const page_entries: usize = 512;
 const four_gib: u64 = 4 * 1024 * 1024 * 1024;
 const two_mib: u64 = 2 * 1024 * 1024;
 const pd_table_count: usize = 4; // 4 * 1GiB = 4GiB
-const user_va: u64 = 0x400000;
-const user_stack_top: u64 = 0x402000;
+const user_va: u64 = 0x20000000;
+const user_stack_top: u64 = 0x20002000;
 const user_stack_page_va: u64 = user_stack_top - 0x1000;
-const user_unmapped_test_va: u64 = 0x500000;
-const user_recovery_stop_va: u64 = 0x600000;
-const reserved_low_mem_end: u64 = 16 * 1024 * 1024;
+const user_unmapped_test_va: u64 = 0x20100000;
+const user_dma_verify_va: u64 = 0x20110000;
+const user_recovery_stop_va: u64 = 0x20200000;
+const reserved_low_mem_end: u64 = 64 * 1024 * 1024;
 const page_addr_mask: u64 = 0x000F_FFFF_FFFF_F000;
 const canonical_user_limit_exclusive: u64 = 0x0000_8000_0000_0000;
 const gdt_kernel_code_selector: u16 = 0x08;
@@ -30,17 +35,24 @@ const debug_skip_exit_boot_services = false;
 const debug_skip_cr3_switch = false;
 const debug_trigger_page_fault_test = false;
 const debug_trigger_general_protection_test = false;
-const debug_trigger_pf_recovery_demo = true;
+const debug_trigger_pf_recovery_demo = false;
+const debug_trigger_dma_unmap_verify_demo = false;
+const user_process_count: usize = 2;
+
+const UserAddressSpace = struct {
+    pml4: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
+    pdp: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
+    pd: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
+    pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
+    cr3: u64 = 0,
+};
 
 var pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pd_tables: [pd_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** pd_table_count;
-var user_pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
-var user_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
-var user_pd_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
-var user_pt_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
+var user_spaces: [user_process_count]UserAddressSpace = .{ .{}, .{} };
 var global_free_list: kernel.FreePageList = .{};
-var idt: [256]IdtEntry align(16) = [_]IdtEntry{zeroIdtEntry()} ** 256;
+var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
 var gdt: [7]u64 align(16) = .{
     0x0000000000000000, // 0x00 null
     0x00AF9A000000FFFF, // 0x08 kernel code (DPL=0)
@@ -54,13 +66,42 @@ var ring0_stack: [64 * 1024]u8 align(16) = [_]u8{0} ** (64 * 1024);
 var tss: Tss = std.mem.zeroes(Tss);
 var kernel_state_global: kernel.KernelState = undefined;
 var kernel_state_ready = false;
+var int80_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var pf_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var gp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var df_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var ud_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var ts_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var np_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var ss_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var int80_trampoline_entry: usize = 0;
+var pf_trampoline_entry: usize = 0;
+var gp_trampoline_entry: usize = 0;
+var df_trampoline_entry: usize = 0;
+var ud_trampoline_entry: usize = 0;
+var ts_trampoline_entry: usize = 0;
+var np_trampoline_entry: usize = 0;
+var ss_trampoline_entry: usize = 0;
 export var kernel_cr3_value: u64 = 0;
 export var user_cr3_value: u64 = 0;
+var current_user_principal: kernel.PrincipalId = .Process0;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_move_cap: u64 = 0x3;
 const syscall_drop_present: u64 = 0x4;
+const syscall_switch_process: u64 = 0x5;
+
+const user_program_cfg: user_programs.Config = .{
+    .syscall_alloc_page = syscall_alloc_page,
+    .syscall_map_page = syscall_map_page,
+    .syscall_move_cap = syscall_move_cap,
+    .syscall_drop_present = syscall_drop_present,
+    .syscall_switch_process = syscall_switch_process,
+    .user_unmapped_test_va = user_unmapped_test_va,
+    .user_dma_verify_va = user_dma_verify_va,
+    .user_recovery_stop_va = user_recovery_stop_va,
+};
 
 const syscall_ok: u64 = 0;
 const syscall_err_invalid = 1;
@@ -78,21 +119,6 @@ const MemoryStats = struct {
 const ReservedRange = struct {
     start: u64,
     end: u64, // exclusive
-};
-
-const IdtEntry = packed struct {
-    offset_low: u16,
-    selector: u16,
-    ist: u8,
-    type_attr: u8,
-    offset_mid: u16,
-    offset_high: u32,
-    zero: u32,
-};
-
-const IdtPtr = packed struct {
-    limit: u16,
-    base: u64,
 };
 
 const GdtPtr = packed struct {
@@ -118,67 +144,6 @@ const Tss = packed struct {
     iomap_base: u16 = 0,
 };
 
-const TrapFrame = extern struct {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rbp: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
-    // CPU-pushed on ring transition (int 0x80 from ring3 -> ring0)
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
-};
-
-comptime {
-    if (@offsetOf(TrapFrame, "rax") != 112) @compileError("TrapFrame layout mismatch: rax offset");
-    if (@offsetOf(TrapFrame, "rip") != 120) @compileError("TrapFrame layout mismatch: rip offset");
-    if (@offsetOf(TrapFrame, "ss") != 152) @compileError("TrapFrame layout mismatch: ss offset");
-}
-
-const ExceptionTrapFrame = extern struct {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rbp: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
-    error_code: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
-};
-
-comptime {
-    if (@offsetOf(ExceptionTrapFrame, "rax") != 112) @compileError("ExceptionTrapFrame layout mismatch: rax offset");
-    if (@offsetOf(ExceptionTrapFrame, "error_code") != 120) @compileError("ExceptionTrapFrame layout mismatch: error_code offset");
-    if (@offsetOf(ExceptionTrapFrame, "rip") != 128) @compileError("ExceptionTrapFrame layout mismatch: rip offset");
-    if (@offsetOf(ExceptionTrapFrame, "ss") != 160) @compileError("ExceptionTrapFrame layout mismatch: ss offset");
-}
-
 const PageFaultCapability = struct {
     principal: kernel.PrincipalId,
     fault_va: u64,
@@ -190,61 +155,66 @@ const PageFaultCapability = struct {
     candidate_paddr: ?u64,
 };
 
-fn zeroIdtEntry() IdtEntry {
-    return .{
-        .offset_low = 0,
-        .selector = 0,
-        .ist = 0,
-        .type_attr = 0,
-        .offset_mid = 0,
-        .offset_high = 0,
-        .zero = 0,
-    };
-}
-
-fn outb(port: u16, value: u8) void {
-    asm volatile ("outb %[value], %[port]"
-        :
-        : [value] "{al}" (value),
-          [port] "{dx}" (port),
-    );
-}
-
 fn serialInit() void {
-    outb(serial_port + 1, 0x00);
-    outb(serial_port + 3, 0x80);
-    outb(serial_port + 0, 0x03);
-    outb(serial_port + 1, 0x00);
-    outb(serial_port + 3, 0x03);
-    outb(serial_port + 2, 0xC7);
-    outb(serial_port + 4, 0x0B);
-}
-
-fn serialWriteByte(b: u8) void {
-    outb(serial_port, b);
+    serial.init();
 }
 
 fn serialWrite(text: []const u8) void {
-    for (text) |ch| {
-        if (ch == '\n') serialWriteByte('\r');
-        serialWriteByte(ch);
-    }
+    serial.write(text);
 }
 
 fn serialWriteHexRaw(value: u64) void {
-    const hex = "0123456789abcdef";
-    serialWrite("0x");
-    var shift: u6 = 60;
-    while (true) {
-        const nibble: u4 = @intCast((value >> shift) & 0xF);
-        serialWriteByte(hex[nibble]);
-        if (shift == 0) break;
-        shift -= 4;
-    }
+    serial.writeHexRaw(value);
 }
 
 fn serialWriteBool01(value: bool) void {
-    serialWriteByte(if (value) '1' else '0');
+    serial.writeBool01(value);
+}
+
+fn writeU64LEBytes(ptr: [*]u8, offset: usize, value: u64) void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        ptr[offset + i] = @intCast((value >> @intCast(i * 8)) & 0xFF);
+    }
+}
+
+fn buildCr3SwitchTrampoline(page: *[4096]u8, target: usize) usize {
+    @memset(page[0..], 0x90);
+    const out: [*]u8 = @ptrCast(page);
+    var off: usize = 0;
+
+    out[off] = 0x50; // push rax
+    off += 1;
+    out[off] = 0x48; // mov rax, imm64
+    out[off + 1] = 0xB8;
+    writeU64LEBytes(out, off + 2, kernel_cr3_value);
+    off += 10;
+    out[off] = 0x0F; // mov cr3, rax
+    out[off + 1] = 0x22;
+    out[off + 2] = 0xD8;
+    off += 3;
+    out[off] = 0x58; // pop rax
+    off += 1;
+    out[off] = 0xFF; // jmp qword ptr [rip+0]
+    out[off + 1] = 0x25;
+    out[off + 2] = 0x00;
+    out[off + 3] = 0x00;
+    out[off + 4] = 0x00;
+    out[off + 5] = 0x00;
+    off += 6;
+    writeU64LEBytes(out, off, target);
+    return @intFromPtr(page);
+}
+
+fn installInterruptTrampolines() void {
+    int80_trampoline_entry = buildCr3SwitchTrampoline(&int80_trampoline_page, @intFromPtr(&syscallHandlerStub));
+    pf_trampoline_entry = buildCr3SwitchTrampoline(&pf_trampoline_page, @intFromPtr(&pageFaultHandlerStub));
+    gp_trampoline_entry = buildCr3SwitchTrampoline(&gp_trampoline_page, @intFromPtr(&generalProtectionHandlerStub));
+    df_trampoline_entry = buildCr3SwitchTrampoline(&df_trampoline_page, @intFromPtr(&doubleFaultHandlerStub));
+    ud_trampoline_entry = buildCr3SwitchTrampoline(&ud_trampoline_page, @intFromPtr(&invalidOpcodeHandlerStub));
+    ts_trampoline_entry = buildCr3SwitchTrampoline(&ts_trampoline_page, @intFromPtr(&invalidTssHandlerStub));
+    np_trampoline_entry = buildCr3SwitchTrampoline(&np_trampoline_page, @intFromPtr(&segmentNotPresentHandlerStub));
+    ss_trampoline_entry = buildCr3SwitchTrampoline(&ss_trampoline_page, @intFromPtr(&stackSegmentFaultHandlerStub));
 }
 
 fn readCr2() u64 {
@@ -263,11 +233,29 @@ fn exceptionName(vec: u64) []const u8 {
     };
 }
 
+fn processIndex(principal: kernel.PrincipalId) ?usize {
+    return switch (principal) {
+        .Process0 => 0,
+        .Process1 => 1,
+        else => null,
+    };
+}
+
+fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
+    const idx = processIndex(principal) orelse return null;
+    return &user_spaces[idx];
+}
+
+fn currentUserSpace() *UserAddressSpace {
+    return getUserSpace(current_user_principal).?;
+}
+
 fn isUserCanonicalVa(va: u64) bool {
     return va < canonical_user_limit_exclusive;
 }
 
-fn lookupUserMappedPaddrForVa(va: u64) ?u64 {
+fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
+    const space = getUserSpace(principal) orelse return null;
     const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
     const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
     const pd_index: usize = @intCast((va >> 21) & 0x1FF);
@@ -278,7 +266,7 @@ fn lookupUserMappedPaddrForVa(va: u64) ?u64 {
     // Current stage maps only one PT under the user_va PD slot.
     if (pml4_index != 0 or pdp_index != user_pdp_index or pd_index != user_pd_index) return null;
 
-    const entry = user_pt_table[pt_index];
+    const entry = space.pt[pt_index];
     const paddr = entry & page_addr_mask;
     if (paddr == 0) return null;
     return paddr;
@@ -292,14 +280,14 @@ fn issuePageFaultCapability(frame: *const ExceptionTrapFrame, cr2: u64) ?PageFau
 
     const fault_page_va = pageAlignDown(cr2);
     return .{
-        .principal = .Process0,
+        .principal = current_user_principal,
         .fault_va = cr2,
         .fault_page_va = fault_page_va,
         .fault_rip = frame.rip,
         .present_violation = (ec & (1 << 0)) != 0,
         .write_access = (ec & (1 << 1)) != 0,
         .instruction_fetch = (ec & (1 << 4)) != 0,
-        .candidate_paddr = lookupUserMappedPaddrForVa(fault_page_va),
+        .candidate_paddr = lookupUserMappedPaddrForVa(current_user_principal, fault_page_va),
     };
 }
 
@@ -357,7 +345,7 @@ fn logPageFaultStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
 
     const has_cap = kernel_state_global.getTableConst(pf_cap.principal).find(candidate_paddr) != null;
     serialWrite("  CAP_LOOKUP=");
-    serialWrite(if (has_cap) "found(Process0)\n" else "none(Process0)\n");
+    serialWrite(if (has_cap) "found(current)\n" else "none(current)\n");
 }
 
 pub export fn pageFaultDispatch(frame: *const ExceptionTrapFrame) callconv(.c) u64 {
@@ -456,6 +444,7 @@ fn mapUserPageFromCapability(
     paddr: u64,
     writable: bool,
 ) bool {
+    const space = getUserSpace(principal) orelse return false;
     if ((va & 0xFFF) != 0) return false;
     if ((paddr & 0xFFF) != 0) return false;
     if (paddr >= four_gib) return false;
@@ -474,8 +463,20 @@ fn mapUserPageFromCapability(
     if (!cap.rights.cpu_read) return false;
     if (writable and !cap.rights.cpu_write) return false;
 
-    user_pt_table[pt_index] = paddr | page_present | page_user | (if (writable) page_rw else 0);
-    invlpg(va);
+    // Strict 1:1 mapping: clear alias mappings of the same paddr first.
+    var i: usize = 0;
+    while (i < page_entries) : (i += 1) {
+        if (i == pt_index) continue;
+        const entry = space.pt[i];
+        if ((entry & page_addr_mask) != paddr) continue;
+        if (entry == 0) continue;
+        space.pt[i] = 0;
+        const alias_va = (user_va & ~@as(u64, 0x1F_FFFF)) + (@as(u64, i) * 4096);
+        flushUserTlbForPrincipalVa(principal, alias_va);
+    }
+
+    space.pt[pt_index] = paddr | page_present | page_user | (if (writable) page_rw else 0);
+    flushUserTlbForPrincipalVa(principal, va);
     return true;
 }
 
@@ -484,16 +485,17 @@ fn dropPresentForUserMappedPaddr(
     principal: kernel.PrincipalId,
     paddr: u64,
 ) bool {
+    const space = getUserSpace(principal) orelse return false;
     _ = state.getTableConst(principal).find(paddr) orelse return false;
     const user_pt_base_va = user_va & ~@as(u64, 0x1F_FFFF);
 
     var i: usize = 0;
     while (i < page_entries) : (i += 1) {
-        const entry = user_pt_table[i];
+        const entry = space.pt[i];
         if ((entry & page_addr_mask) != paddr) continue;
         if ((entry & page_present) == 0) continue;
-        user_pt_table[i] = entry & ~page_present;
-        invlpg(user_pt_base_va + (@as(u64, i) * 4096));
+        space.pt[i] = entry & ~page_present;
+        flushUserTlbForPrincipalVa(principal, user_pt_base_va + (@as(u64, i) * 4096));
         return true;
     }
     return false;
@@ -501,36 +503,52 @@ fn dropPresentForUserMappedPaddr(
 
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
     if (!kernel_state_ready) return syscall_err_not_ready;
+    serialWrite("INT80 dispatch\n");
     const state = &kernel_state_global;
+    const proc = current_user_principal;
 
     switch (frame.rax) {
         syscall_alloc_page => {
-            const cap = state.allocPageTo(.Process0, &global_free_list) catch return syscall_err_alloc;
+            const cap = state.allocPageTo(proc, &global_free_list) catch return syscall_err_alloc;
             return cap.paddr;
         },
         syscall_map_page => {
             const writable = (frame.rdx & 0x1) != 0;
-            if (mapUserPageFromCapability(state, .Process0, frame.rdi, frame.rsi, writable)) {
+            if (mapUserPageFromCapability(state, proc, frame.rdi, frame.rsi, writable)) {
                 return syscall_ok;
             }
             return syscall_err_map;
         },
         syscall_move_cap => {
             const to = switch (frame.rsi) {
-                0 => kernel.PrincipalId.Process0,
+                0 => proc,
                 1 => kernel.PrincipalId.Device0,
                 else => return syscall_err_invalid,
             };
-            const from = if (to == .Process0) kernel.PrincipalId.Device0 else kernel.PrincipalId.Process0;
+            const from = if (to == proc) kernel.PrincipalId.Device0 else proc;
             const rights = parseRights(frame.rdx);
             state.moveCap(from, to, frame.rdi, rights) catch return syscall_err_move;
             return syscall_ok;
         },
         syscall_drop_present => {
-            if (dropPresentForUserMappedPaddr(state, .Process0, frame.rdi)) {
+            if (dropPresentForUserMappedPaddr(state, proc, frame.rdi)) {
                 return syscall_ok;
             }
             return syscall_err_drop_present;
+        },
+        syscall_switch_process => {
+            const target = switch (frame.rdi) {
+                0 => kernel.PrincipalId.Process0,
+                1 => kernel.PrincipalId.Process1,
+                else => return syscall_err_invalid,
+            };
+            if (target == proc) return syscall_ok;
+
+            current_user_principal = target;
+            user_cr3_value = currentUserSpace().cr3;
+            frame.rip = user_va;
+            frame.rsp = user_stack_top;
+            return syscall_ok;
         },
         else => return syscall_err_invalid,
     }
@@ -601,6 +619,10 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
 
 pub export fn doubleFaultHandlerStub() callconv(.naked) noreturn {
     asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\mov (%rsp), %rdi
         \\mov %rdi, %rcx
         \\and $-16, %rsp
@@ -665,6 +687,10 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
 
 pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
     asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\push %rax
         \\push %rbx
         \\push %rcx
@@ -692,6 +718,10 @@ pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
 
 pub export fn invalidTssHandlerStub() callconv(.naked) noreturn {
     asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\mov (%rsp), %rdi
         \\mov %rdi, %rcx
         \\and $-16, %rsp
@@ -702,6 +732,10 @@ pub export fn invalidTssHandlerStub() callconv(.naked) noreturn {
 
 pub export fn segmentNotPresentHandlerStub() callconv(.naked) noreturn {
     asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\mov (%rsp), %rdi
         \\mov %rdi, %rcx
         \\and $-16, %rsp
@@ -712,6 +746,10 @@ pub export fn segmentNotPresentHandlerStub() callconv(.naked) noreturn {
 
 pub export fn stackSegmentFaultHandlerStub() callconv(.naked) noreturn {
     asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\mov (%rsp), %rdi
         \\mov %rdi, %rcx
         \\and $-16, %rsp
@@ -722,6 +760,10 @@ pub export fn stackSegmentFaultHandlerStub() callconv(.naked) noreturn {
 
 pub export fn invalidOpcodeHandlerStub() callconv(.naked) noreturn {
     asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
         \\and $-16, %rsp
         \\sub $8, %rsp
         \\jmp invalidOpcodeHandlerCommon
@@ -772,45 +814,18 @@ fn loadGdtAndReloadSegments() void {
         : .{ .memory = true });
 }
 
-fn setIdtEntry(vec: usize, handler: usize) void {
-    setIdtEntryWithAttr(vec, handler, 0x8E);
-}
-
-fn setIdtEntryWithAttr(vec: usize, handler: usize, type_attr: u8) void {
-    idt[vec] = .{
-        .offset_low = @as(u16, @truncate(handler & 0xFFFF)),
-        .selector = gdt_kernel_code_selector,
-        .ist = 0,
-        .type_attr = type_attr,
-        .offset_mid = @as(u16, @truncate((handler >> 16) & 0xFFFF)),
-        .offset_high = @as(u32, @truncate(handler >> 32)),
-        .zero = 0,
-    };
-}
-
-fn loadIdt() void {
-    const idt_ptr = IdtPtr{
-        .limit = @as(u16, @intCast(@sizeOf(@TypeOf(idt)) - 1)),
-        .base = @intFromPtr(&idt),
-    };
-    asm volatile ("lidt (%[ptr])"
-        :
-        : [ptr] "r" (&idt_ptr),
-        : .{ .memory = true });
-}
-
 fn initIdtPageFaultOnly() void {
-    @memset(idt[0..], zeroIdtEntry());
-    setIdtEntry(6, @intFromPtr(&invalidOpcodeHandlerStub)); // #UD
-    setIdtEntry(10, @intFromPtr(&invalidTssHandlerStub)); // #TS
-    setIdtEntry(11, @intFromPtr(&segmentNotPresentHandlerStub)); // #NP
-    setIdtEntry(12, @intFromPtr(&stackSegmentFaultHandlerStub)); // #SS
-    setIdtEntry(13, @intFromPtr(&generalProtectionHandlerStub)); // #GP
-    setIdtEntry(14, @intFromPtr(&pageFaultHandlerStub)); // #PF
-    setIdtEntry(8, @intFromPtr(&doubleFaultHandlerStub)); // #DF
+    interrupts.clearIdt(&idt);
+    interrupts.setIdtEntry(&idt, 6, gdt_kernel_code_selector, ud_trampoline_entry, 0x8E); // #UD
+    interrupts.setIdtEntry(&idt, 10, gdt_kernel_code_selector, ts_trampoline_entry, 0x8E); // #TS
+    interrupts.setIdtEntry(&idt, 11, gdt_kernel_code_selector, np_trampoline_entry, 0x8E); // #NP
+    interrupts.setIdtEntry(&idt, 12, gdt_kernel_code_selector, ss_trampoline_entry, 0x8E); // #SS
+    interrupts.setIdtEntry(&idt, 13, gdt_kernel_code_selector, gp_trampoline_entry, 0x8E); // #GP
+    interrupts.setIdtEntry(&idt, 14, gdt_kernel_code_selector, pf_trampoline_entry, 0x8E); // #PF
+    interrupts.setIdtEntry(&idt, 8, gdt_kernel_code_selector, df_trampoline_entry, 0x8E); // #DF
     // DPL=3 trap gate to allow ring3 software syscall entry.
-    setIdtEntryWithAttr(0x80, @intFromPtr(&syscallHandlerStub), 0xEF);
-    loadIdt();
+    interrupts.setIdtEntry(&idt, 0x80, gdt_kernel_code_selector, int80_trampoline_entry, 0xEF);
+    interrupts.loadIdt(&idt);
 }
 
 fn triggerPageFaultTest() noreturn {
@@ -823,15 +838,11 @@ fn triggerPageFaultTest() noreturn {
 }
 
 fn printNumber(value: anytype) void {
-    var num_buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch "err";
-    serialWrite(s);
+    serial.printNumber(value);
 }
 
 fn printHex(value: u64) void {
-    var num_buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&num_buf, "0x{x}", .{value}) catch "err";
-    serialWrite(s);
+    serial.printHex(value);
 }
 
 fn dumpPrincipalCaps(state: *const kernel.KernelState, principal: kernel.PrincipalId, label: []const u8) void {
@@ -858,6 +869,7 @@ fn dumpPrincipalCaps(state: *const kernel.KernelState, principal: kernel.Princip
 
 fn dumpCapabilityView(state: *const kernel.KernelState) void {
     dumpPrincipalCaps(state, .Process0, "Process0");
+    dumpPrincipalCaps(state, .Process1, "Process1");
     dumpPrincipalCaps(state, .Device0, "Device0");
 }
 
@@ -906,11 +918,37 @@ fn writeCr3(value: u64) void {
         : .{ .memory = true });
 }
 
+fn readCr3() u64 {
+    var value: u64 = 0;
+    asm volatile ("mov %%cr3, %[out]"
+        : [out] "=r" (value),
+    );
+    return value;
+}
+
 fn invlpg(addr: u64) void {
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (addr),
         : .{ .memory = true });
+}
+
+fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
+    if (target_cr3 == 0) return;
+    const current_cr3 = readCr3();
+    if (current_cr3 == target_cr3) {
+        invlpg(va);
+        return;
+    }
+
+    writeCr3(target_cr3);
+    invlpg(va);
+    writeCr3(current_cr3);
+}
+
+fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {
+    const space = getUserSpace(principal) orelse return;
+    flushTlbForCr3Va(space.cr3, va);
 }
 
 fn installIdentityPageTables0To1GiB() bool {
@@ -965,23 +1003,19 @@ fn hardenKernelMappingsSupervisorOnly() void {
     }
 }
 
-fn buildUserAddressSpace(user_page_paddr: u64, user_stack_paddr: u64) bool {
-    @memset(user_pml4_table[0..], 0);
-    @memset(user_pdp_table[0..], 0);
-    @memset(user_pd_table[0..], 0);
-    @memset(user_pt_table[0..], 0);
+fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64, user_stack_paddr: u64) bool {
+    const space = getUserSpace(principal) orelse return false;
+    @memset(space.pml4[0..], 0);
+    @memset(space.pdp[0..], 0);
+    @memset(space.pd[0..], 0);
+    @memset(space.pt[0..], 0);
 
-    const user_pml4_pa: u64 = @intFromPtr(&user_pml4_table);
-    const user_pdp_pa: u64 = @intFromPtr(&user_pdp_table);
-    const user_pd_pa: u64 = @intFromPtr(&user_pd_table);
-    const user_pt_pa: u64 = @intFromPtr(&user_pt_table);
+    const user_pml4_pa: u64 = @intFromPtr(&space.pml4);
+    const user_pdp_pa: u64 = @intFromPtr(&space.pdp);
+    const user_pd_pa: u64 = @intFromPtr(&space.pd);
+    const user_pt_pa: u64 = @intFromPtr(&space.pt);
     if (user_pml4_pa >= four_gib or user_pdp_pa >= four_gib or user_pd_pa >= four_gib or user_pt_pa >= four_gib) return false;
     if (user_page_paddr >= four_gib or user_stack_paddr >= four_gib) return false;
-
-    var i: usize = 256;
-    while (i < page_entries) : (i += 1) {
-        user_pml4_table[i] = pml4_table[i] & ~page_user;
-    }
 
     const pdp_index: usize = @intCast((user_va >> 30) & 0x1FF);
     const pd_index: usize = @intCast((user_va >> 21) & 0x1FF);
@@ -990,22 +1024,57 @@ fn buildUserAddressSpace(user_page_paddr: u64, user_stack_paddr: u64) bool {
     const stack_pd_index: usize = @intCast((user_stack_page_va >> 21) & 0x1FF);
     if (stack_pd_index != pd_index) return false;
 
-    // low-half は kernel identity map を土台にし、対象2ページだけ user 可視にする。
-    user_pml4_table[0] = user_pdp_pa | page_present | page_rw | page_user;
-    i = 0;
-    while (i < pd_table_count) : (i += 1) {
-        const pd_pa: u64 = @intFromPtr(&pd_tables[i]);
-        user_pdp_table[i] = pd_pa | page_present | page_rw;
+    // user CR3 は最小構成: user mapping + 例外/割り込み入口に必要な supervisor bridge のみ。
+    space.pml4[0] = user_pdp_pa | page_present | page_rw | page_user;
+
+    space.pdp[pdp_index] = user_pd_pa | page_present | page_rw | page_user;
+    space.pd[pd_index] = user_pt_pa | page_present | page_rw | page_user;
+    space.pt[user_pt_index] = user_page_paddr | page_present | page_rw | page_user;
+    space.pt[stack_pt_index] = user_stack_paddr | page_present | page_rw | page_user;
+
+    const bridge_ranges = [_]struct { start: u64, len: usize }{
+        .{ .start = @intFromPtr(&int80_trampoline_page), .len = @sizeOf(@TypeOf(int80_trampoline_page)) },
+        .{ .start = @intFromPtr(&pf_trampoline_page), .len = @sizeOf(@TypeOf(pf_trampoline_page)) },
+        .{ .start = @intFromPtr(&gp_trampoline_page), .len = @sizeOf(@TypeOf(gp_trampoline_page)) },
+        .{ .start = @intFromPtr(&df_trampoline_page), .len = @sizeOf(@TypeOf(df_trampoline_page)) },
+        .{ .start = @intFromPtr(&ud_trampoline_page), .len = @sizeOf(@TypeOf(ud_trampoline_page)) },
+        .{ .start = @intFromPtr(&ts_trampoline_page), .len = @sizeOf(@TypeOf(ts_trampoline_page)) },
+        .{ .start = @intFromPtr(&np_trampoline_page), .len = @sizeOf(@TypeOf(np_trampoline_page)) },
+        .{ .start = @intFromPtr(&ss_trampoline_page), .len = @sizeOf(@TypeOf(ss_trampoline_page)) },
+        .{ .start = @intFromPtr(&enterUserModeIretq), .len = 1 },
+        .{ .start = @intFromPtr(&syscallHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&pageFaultHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&generalProtectionHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&doubleFaultHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&invalidOpcodeHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&invalidTssHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&segmentNotPresentHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&stackSegmentFaultHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&idt), .len = @sizeOf(@TypeOf(idt)) },
+        .{ .start = @intFromPtr(&gdt), .len = @sizeOf(@TypeOf(gdt)) },
+        .{ .start = @intFromPtr(&tss), .len = @sizeOf(@TypeOf(tss)) },
+        .{ .start = @intFromPtr(&ring0_stack), .len = ring0_stack.len },
+    };
+    for (bridge_ranges) |r| {
+        const start = pageAlignDown(r.start);
+        const end = pageAlignUp(r.start + r.len);
+        var va = start;
+        while (va < end) : (va += 4096) {
+            if (va >= four_gib) return false;
+            const b_pdp_idx: usize = @intCast((va >> 30) & 0x1FF);
+            const b_pd_idx: usize = @intCast((va >> 21) & 0x1FF);
+            const b_pt_idx: usize = @intCast((va >> 12) & 0x1FF);
+            if (b_pdp_idx != pdp_index) return false;
+            if (b_pd_idx == pd_index) {
+                if (b_pt_idx == user_pt_index or b_pt_idx == stack_pt_index) continue;
+                space.pt[b_pt_idx] = va | page_present | page_rw;
+            } else {
+                space.pd[b_pd_idx] = pd_tables[0][b_pd_idx] & ~page_user;
+            }
+        }
     }
 
-    i = 0;
-    while (i < page_entries) : (i += 1) {
-        user_pd_table[i] = pd_tables[0][i] & ~page_user;
-    }
-    user_pdp_table[pdp_index] = user_pd_pa | page_present | page_rw | page_user;
-    user_pd_table[pd_index] = user_pt_pa | page_present | page_rw | page_user;
-    user_pt_table[user_pt_index] = user_page_paddr | page_present | page_rw | page_user;
-    user_pt_table[stack_pt_index] = user_stack_paddr | page_present | page_rw | page_user;
+    space.cr3 = user_pml4_pa;
     return true;
 }
 
@@ -1020,220 +1089,44 @@ fn buildUserAddressSpaceFromCapabilities(
     const stack_cap = table.find(user_stack_page.paddr) orelse return false;
     if (!user_cap.rights.cpu_read or !user_cap.rights.cpu_write) return false;
     if (!stack_cap.rights.cpu_read or !stack_cap.rights.cpu_write) return false;
-    return buildUserAddressSpace(user_cap.paddr, stack_cap.paddr);
-}
-
-fn writeU64LE(ptr: [*]volatile u8, offset: usize, value: u64) void {
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        ptr[offset + i] = @intCast((value >> @intCast(i * 8)) & 0xFF);
-    }
+    return buildUserAddressSpace(principal, user_cap.paddr, stack_cap.paddr);
 }
 
 fn installUserMemoryWritePfTestCode(user_page_paddr: u64) void {
-    // ring3 test code:
-    // 1) sys_alloc_page -> RAX (new paddr)
-    // 2) sys_map_page(user_unmapped_test_va, paddr, writable=1)
-    // 3) mapped write to user_unmapped_test_va (should succeed)
-    // 4) sys_move_cap(paddr, to=Device0, rights=dma-only)
-    // 5) same write again (Present dropped by sync hook -> #PF expected)
-    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
-    var off: usize = 0;
-
-    // sys_alloc_page
-    code[off] = 0x48; // mov rax, imm64
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, syscall_alloc_page);
-    off += 10;
-    code[off] = 0xCD; // int 0x80
-    code[off + 1] = 0x80;
-    off += 2;
-    code[off] = 0x48; // mov rbx, rax (keep new paddr)
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xC3;
-    off += 3;
-
-    // sys_map_page(va=user_unmapped_test_va, paddr=rbx, flags=1 writable)
-    code[off] = 0x48; // mov rax, imm64
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, syscall_map_page);
-    off += 10;
-    code[off] = 0x48; // mov rdi, imm64
-    code[off + 1] = 0xBF;
-    writeU64LE(code, off + 2, user_unmapped_test_va);
-    off += 10;
-    code[off] = 0x48; // mov rsi, rbx
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xDE;
-    off += 3;
-    code[off] = 0x48; // mov rdx, imm64
-    code[off + 1] = 0xBA;
-    writeU64LE(code, off + 2, 0x1);
-    off += 10;
-    code[off] = 0xCD; // int 0x80
-    code[off + 1] = 0x80;
-    off += 2;
-
-    // first mapped write should succeed
-    code[off] = 0x48; // mov rax, imm64
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, user_unmapped_test_va);
-    off += 10;
-    code[off] = 0xC7; // mov dword ptr [rax], imm32
-    code[off + 1] = 0x00;
-    code[off + 2] = 0xDD;
-    code[off + 3] = 0xCC;
-    code[off + 4] = 0xBB;
-    code[off + 5] = 0xAA;
-    off += 6;
-
-    // sys_move_cap(paddr=rbx, to=Device0, rights=dma-only=0x4)
-    code[off] = 0x48; // mov rax, imm64
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, syscall_move_cap);
-    off += 10;
-    code[off] = 0x48; // mov rdi, rbx
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xDF;
-    off += 3;
-    code[off] = 0x48; // mov rsi, imm64 (to Device0)
-    code[off + 1] = 0xBE;
-    writeU64LE(code, off + 2, 0x1);
-    off += 10;
-    code[off] = 0x48; // mov rdx, imm64 (dma-only rights bits)
-    code[off + 1] = 0xBA;
-    writeU64LE(code, off + 2, 0x4);
-    off += 10;
-    code[off] = 0xCD; // int 0x80
-    code[off + 1] = 0x80;
-    off += 2;
-
-    // second write should #PF after Present is dropped by pte_sync_hook
-    code[off] = 0x48; // mov rax, imm64
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, user_unmapped_test_va);
-    off += 10;
-    code[off] = 0xC7;
-    code[off + 1] = 0x00;
-    code[off + 2] = 0x78;
-    code[off + 3] = 0x56;
-    code[off + 4] = 0x34;
-    code[off + 5] = 0x12;
-    off += 6;
-
-    // fallback: jmp $
-    code[off] = 0xEB;
-    code[off + 1] = 0xFE;
+    user_programs.installMemoryWritePfTestCode(user_program_cfg, user_page_paddr);
 }
 
 fn installUserGeneralProtectionTestCode(user_page_paddr: u64) void {
-    // ring3 privileged instruction test:
-    // CLI in CPL3 must raise #GP(0).
-    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
-    code[0] = 0xFA; // cli
-    code[1] = 0xEB; // jmp $
-    code[2] = 0xFE;
+    user_programs.installGeneralProtectionTestCode(user_page_paddr);
 }
 
 fn installUserPfRecoveryDemoCode(user_page_paddr: u64) void {
-    // ring3 recovery demo:
-    // 1) sys_alloc_page -> paddr
-    // 2) sys_map_page(user_unmapped_test_va, paddr, writable=1)
-    // 3) sys_drop_present(paddr) with capability kept in Process0
-    // 4) write user_unmapped_test_va (first access #PF, then auto-recovered and retried)
-    // 5) write user_recovery_stop_va (no capability -> fatal #PF to stop demo)
-    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
-    var off: usize = 0;
+    user_programs.installPfRecoveryDemoCode(user_program_cfg, user_page_paddr);
+}
 
-    // sys_alloc_page
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, syscall_alloc_page);
-    off += 10;
-    code[off] = 0xCD;
-    code[off + 1] = 0x80;
-    off += 2;
-    code[off] = 0x48; // mov rbx, rax
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xC3;
-    off += 3;
+fn installUserPfRecoveryThenSwitchCode(user_page_paddr: u64, target_process: u64) void {
+    user_programs.installPfRecoveryThenSwitchCode(user_program_cfg, user_page_paddr, target_process);
+}
 
-    // sys_map_page(va=user_unmapped_test_va, paddr=rbx, flags=1 writable)
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, syscall_map_page);
-    off += 10;
-    code[off] = 0x48;
-    code[off + 1] = 0xBF;
-    writeU64LE(code, off + 2, user_unmapped_test_va);
-    off += 10;
-    code[off] = 0x48; // mov rsi, rbx
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xDE;
-    off += 3;
-    code[off] = 0x48;
-    code[off + 1] = 0xBA;
-    writeU64LE(code, off + 2, 0x1);
-    off += 10;
-    code[off] = 0xCD;
-    code[off + 1] = 0x80;
-    off += 2;
-
-    // sys_drop_present(paddr=rbx)
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, syscall_drop_present);
-    off += 10;
-    code[off] = 0x48; // mov rdi, rbx
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xDF;
-    off += 3;
-    code[off] = 0xCD;
-    code[off + 1] = 0x80;
-    off += 2;
-
-    // this write should #PF once, then be recovered and retried successfully
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, user_unmapped_test_va);
-    off += 10;
-    code[off] = 0xC7;
-    code[off + 1] = 0x00;
-    code[off + 2] = 0x44;
-    code[off + 3] = 0x33;
-    code[off + 4] = 0x22;
-    code[off + 5] = 0x11;
-    off += 6;
-
-    // stop with a fatal PF (no mapping/capability for this VA)
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, user_recovery_stop_va);
-    off += 10;
-    code[off] = 0xC7;
-    code[off + 1] = 0x00;
-    code[off + 2] = 0x88;
-    code[off + 3] = 0x77;
-    code[off + 4] = 0x66;
-    code[off + 5] = 0x55;
-    off += 6;
-
-    // fallback: jmp $
-    code[off] = 0xEB;
-    code[off + 1] = 0xFE;
+fn installUserDmaUnmapVerifyCode(user_page_paddr: u64) void {
+    user_programs.installDmaUnmapVerifyCode(user_program_cfg, user_page_paddr);
 }
 
 fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
     const user_cs: u64 = gdt_user_code_selector | 0x3;
     const user_ss: u64 = gdt_user_data_selector | 0x3;
     const user_rflags: u64 = 0x2; // IF=0 で外部割り込みを抑止
+    const kernel_transition_rsp: u64 = @intFromPtr(&ring0_stack) + ring0_stack.len;
 
     asm volatile (
+        \\mov %[k_rsp], %%rsp
         \\pushq %[ss]
         \\pushq %[rsp]
         \\pushq %[rflags]
         \\pushq %[cs]
         \\pushq %[rip]
+        \\mov %[ucr3], %%rax
+        \\mov %%rax, %%cr3
         \\iretq
         :
         : [ss] "r" (user_ss),
@@ -1241,33 +1134,40 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
           [rflags] "r" (user_rflags),
           [cs] "r" (user_cs),
           [rip] "r" (user_entry_va),
+          [k_rsp] "r" (kernel_transition_rsp),
+          [ucr3] "r" (user_cr3_value),
         : .{ .memory = true });
     unreachable;
 }
 
-fn syncPageTableRightsForPaddr(paddr: u64, rights: kernel.Rights) void {
+fn syncPageTableRightsForPaddr(state: *const kernel.KernelState, paddr: u64) void {
     const user_pt_base_va = user_va & ~@as(u64, 0x1F_FFFF);
-    var i: usize = 0;
-    while (i < page_entries) : (i += 1) {
-        var entry = user_pt_table[i];
-        if ((entry & page_present) == 0) continue;
-        const mapped_paddr = entry & page_addr_mask;
-        if (mapped_paddr != paddr) continue;
+    const principals = [_]kernel.PrincipalId{ .Process0, .Process1 };
+    for (principals) |principal| {
+        const space = getUserSpace(principal) orelse continue;
+        const cap = state.getTableConst(principal).find(paddr);
+        var kept_one = false;
 
-        if (!rights.cpu_read and !rights.cpu_write) {
-            entry &= ~page_present;
-        } else {
-            entry |= page_present;
-            if (rights.cpu_write) {
-                entry |= page_rw;
-            } else {
-                entry &= ~page_rw;
+        var i: usize = 0;
+        while (i < page_entries) : (i += 1) {
+            const old_entry = space.pt[i];
+            const mapped_paddr = old_entry & page_addr_mask;
+            if (mapped_paddr != paddr) continue;
+
+            var new_entry: u64 = 0;
+            if (cap) |c| {
+                if (c.rights.cpu_read and !kept_one) {
+                    new_entry = paddr | page_user | page_present;
+                    if (c.rights.cpu_write) new_entry |= page_rw;
+                    kept_one = true;
+                }
             }
-        }
 
-        user_pt_table[i] = entry;
-        const va = user_pt_base_va + (@as(u64, i) * 4096);
-        invlpg(va);
+            if (new_entry == old_entry) continue;
+            space.pt[i] = new_entry;
+            const va = user_pt_base_va + (@as(u64, i) * 4096);
+            flushUserTlbForPrincipalVa(principal, va);
+        }
     }
 }
 
@@ -1302,14 +1202,22 @@ fn collectMemoryStatsAndFreePages(
     const pdp_end = pageAlignUp(@intFromPtr(&pdp_table) + @sizeOf(@TypeOf(pdp_table)));
     const pd_start = pageAlignDown(@intFromPtr(&pd_tables));
     const pd_end = pageAlignUp(@intFromPtr(&pd_tables) + @sizeOf(@TypeOf(pd_tables)));
-    const user_pml4_start = pageAlignDown(@intFromPtr(&user_pml4_table));
-    const user_pml4_end = pageAlignUp(@intFromPtr(&user_pml4_table) + @sizeOf(@TypeOf(user_pml4_table)));
-    const user_pdp_start = pageAlignDown(@intFromPtr(&user_pdp_table));
-    const user_pdp_end = pageAlignUp(@intFromPtr(&user_pdp_table) + @sizeOf(@TypeOf(user_pdp_table)));
-    const user_pd_start = pageAlignDown(@intFromPtr(&user_pd_table));
-    const user_pd_end = pageAlignUp(@intFromPtr(&user_pd_table) + @sizeOf(@TypeOf(user_pd_table)));
-    const user_pt_start = pageAlignDown(@intFromPtr(&user_pt_table));
-    const user_pt_end = pageAlignUp(@intFromPtr(&user_pt_table) + @sizeOf(@TypeOf(user_pt_table)));
+    const user_spaces_start = pageAlignDown(@intFromPtr(&user_spaces));
+    const user_spaces_end = pageAlignUp(@intFromPtr(&user_spaces) + @sizeOf(@TypeOf(user_spaces)));
+    const free_list_start = pageAlignDown(@intFromPtr(&global_free_list));
+    const free_list_end = pageAlignUp(@intFromPtr(&global_free_list) + @sizeOf(@TypeOf(global_free_list)));
+    const kernel_state_start = pageAlignDown(@intFromPtr(&kernel_state_global));
+    const kernel_state_end = pageAlignUp(@intFromPtr(&kernel_state_global) + @sizeOf(@TypeOf(kernel_state_global)));
+    const ring0_stack_start = pageAlignDown(@intFromPtr(&ring0_stack));
+    const ring0_stack_end = pageAlignUp(@intFromPtr(&ring0_stack) + @sizeOf(@TypeOf(ring0_stack)));
+    const gdt_start = pageAlignDown(@intFromPtr(&gdt));
+    const gdt_end = pageAlignUp(@intFromPtr(&gdt) + @sizeOf(@TypeOf(gdt)));
+    const idt_start = pageAlignDown(@intFromPtr(&idt));
+    const idt_end = pageAlignUp(@intFromPtr(&idt) + @sizeOf(@TypeOf(idt)));
+    const tss_start = pageAlignDown(@intFromPtr(&tss));
+    const tss_end = pageAlignUp(@intFromPtr(&tss) + @sizeOf(@TypeOf(tss)));
+    const tramp_start = pageAlignDown(@intFromPtr(&int80_trampoline_page));
+    const tramp_end = pageAlignUp(@intFromPtr(&ss_trampoline_page) + @sizeOf(@TypeOf(ss_trampoline_page)));
     const mmap_start = pageAlignDown(@intFromPtr(&mmap_buffer));
     const mmap_end = pageAlignUp(@intFromPtr(&mmap_buffer) + mmap_buffer.len);
     // カーネル自身が使う最低限の領域は free list から除外する。
@@ -1318,10 +1226,14 @@ fn collectMemoryStatsAndFreePages(
         .{ .start = pml4_start, .end = pml4_end },
         .{ .start = pdp_start, .end = pdp_end },
         .{ .start = pd_start, .end = pd_end },
-        .{ .start = user_pml4_start, .end = user_pml4_end },
-        .{ .start = user_pdp_start, .end = user_pdp_end },
-        .{ .start = user_pd_start, .end = user_pd_end },
-        .{ .start = user_pt_start, .end = user_pt_end },
+        .{ .start = user_spaces_start, .end = user_spaces_end },
+        .{ .start = free_list_start, .end = free_list_end },
+        .{ .start = kernel_state_start, .end = kernel_state_end },
+        .{ .start = ring0_stack_start, .end = ring0_stack_end },
+        .{ .start = gdt_start, .end = gdt_end },
+        .{ .start = idt_start, .end = idt_end },
+        .{ .start = tss_start, .end = tss_end },
+        .{ .start = tramp_start, .end = tramp_end },
         .{ .start = mmap_start, .end = mmap_end },
     };
 
@@ -1399,6 +1311,7 @@ pub fn main() void {
             while (true) asm volatile ("hlt");
         }
         hardenKernelMappingsSupervisorOnly();
+        installInterruptTrampolines();
         serialWrite("CR3 switched to custom PML4\n");
     }
     initIdtPageFaultOnly();
@@ -1431,7 +1344,25 @@ pub fn main() void {
         serialWrite("user page table build failed\n");
         while (true) asm volatile ("hlt");
     }
-    user_cr3_value = @intFromPtr(&user_pml4_table);
+    const user_page_p1 = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+        serialWrite("allocPageTo for user map p1 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    const user_stack_page_p1 = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+        serialWrite("allocPageTo for user stack p1 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    if (!buildUserAddressSpaceFromCapabilities(&state, .Process1, user_page_p1, user_stack_page_p1)) {
+        serialWrite("user page table build failed (p1)\n");
+        while (true) asm volatile ("hlt");
+    }
+
+    current_user_principal = .Process0;
+    user_cr3_value = currentUserSpace().cr3;
     serialWrite("user page table ready\n");
     serialWrite("  user_va=");
     printHex(user_va);
@@ -1445,12 +1376,27 @@ pub fn main() void {
     serialWrite("  user_stack_pa=");
     printHex(user_stack_page.paddr);
     serialWrite("\n");
+    serialWrite("  process_count=");
+    printNumber(user_process_count);
+    serialWrite("\n");
+    serialWrite("  process0_cr3=");
+    printHex(user_spaces[0].cr3);
+    serialWrite("\n");
+    serialWrite("  process1_cr3=");
+    printHex(user_spaces[1].cr3);
+    serialWrite("\n");
     if (debug_trigger_general_protection_test) {
         installUserGeneralProtectionTestCode(user_page.paddr);
+    } else if (debug_trigger_dma_unmap_verify_demo) {
+        installUserDmaUnmapVerifyCode(user_page.paddr);
     } else if (debug_trigger_pf_recovery_demo) {
         installUserPfRecoveryDemoCode(user_page.paddr);
     } else {
-        installUserMemoryWritePfTestCode(user_page.paddr);
+        // 標準フロー:
+        // Process0 で #PF recover を確認し、syscall で Process1 へ切替、
+        // Process1 でも同シナリオを実行して最終 fatal #PF で停止する。
+        installUserPfRecoveryThenSwitchCode(user_page.paddr, 1);
+        installUserPfRecoveryDemoCode(user_page_p1.paddr);
     }
 
     var allocated: [3]u64 = undefined;
@@ -1471,6 +1417,18 @@ pub fn main() void {
     printHex(allocated[1]);
     serialWrite("\n\n");
 
+    if (debug_trigger_dma_unmap_verify_demo) {
+        if (!mapUserPageFromCapability(&state, .Process0, user_dma_verify_va, allocated[1], true)) {
+            serialWrite("dma verify map setup failed\n");
+            while (true) asm volatile ("hlt");
+        }
+        serialWrite("dma verify map prepared: ");
+        printHex(user_dma_verify_va);
+        serialWrite(" -> ");
+        printHex(allocated[1]);
+        serialWrite("\n");
+    }
+
     state.startDma(allocated[1]) catch |err| {
         serialWrite("DMA start failed: ");
         serialWrite(@errorName(err));
@@ -1482,11 +1440,12 @@ pub fn main() void {
     kernel_state_ready = true;
     if (debug_trigger_general_protection_test) {
         serialWrite("\nenter ring3 with iretq (expected #GP by user CLI)\n");
+    } else if (debug_trigger_dma_unmap_verify_demo) {
+        serialWrite("\nenter ring3 with iretq (expected immediate #PF after start_dma unmap)\n");
     } else if (debug_trigger_pf_recovery_demo) {
         serialWrite("\nenter ring3 with iretq (expected #PF recover + final fatal #PF)\n");
     } else {
-        serialWrite("\nenter ring3 with iretq (sys_alloc/map/move + expected #PF)\n");
+        serialWrite("\nenter ring3 with iretq (std #PF recover: Process0 then Process1)\n");
     }
-    writeCr3(user_cr3_value);
     enterUserModeIretq(user_va, user_stack_top);
 }

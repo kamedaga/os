@@ -268,3 +268,64 @@ const PageFaultCapability = struct {
 ## 効果
 - #PF 復帰条件が `PageFaultCapability` に集約され、例外処理の境界が明確化。
 - 将来、FaultCap をユーザー空間 pager へ委譲する設計に拡張しやすい。
+
+---
+
+# IDT Step8: int80/#PF 専用トランポリン（常時マップ最小コード）
+
+## 目的
+user CR3 をより強く分離しても、`int 0x80` / `#PF` を確実に kernel 側へ遷移させる。
+
+## 実装
+1. 4KB ページ単位のトランポリンコード領域を用意。
+   - `int80`, `#PF`, `#GP`, `#DF`, `#UD`, `#TS`, `#NP`, `#SS`
+2. 各トランポリンは最小命令のみ:
+   - `push rax`
+   - `mov rax, kernel_cr3_value`
+   - `mov cr3, rax`
+   - `pop rax`
+   - `jmp [rip+0]`（実ハンドラアドレス）
+3. IDT は実ハンドラ直参照をやめ、トランポリン先を登録する。
+
+## 意味
+- 例外/割り込み入口で必ず kernel CR3 へ切替してから本体処理へ入る。
+- user CR3 から kernel 本体マッピングを縮退する段階でも、入口の安全性を保てる。
+
+## 現段階の位置づけ
+- user CR3 は広域 kernel direct map を持たず、トランポリン + 例外入口に必要な最小 supervisor bridge のみを常時マップする。
+- これにより、入口の安全性を維持したまま per-process CR3 分離を進められる。
+
+---
+
+# IDT Step9: #PF Recover 標準フロー化と Process1 実行
+
+## 目的
+- `#PF` 回復を通常運用に組み込み、capability 根拠がある fault を自動復帰させる。
+- 同一フローを `Process1` にも適用し、per-process CR3 分離下で再現する。
+
+## 実装
+1. 通常デモを `#PF recover` ベースへ変更。
+2. `int 0x80` syscall に `sys_switch_process(0x5)` を追加。
+   - `RDI=0/1` で target process を指定。
+   - kernel 側で `current_user_principal` / `user_cr3_value` を切替。
+   - TrapFrame の `rip/rsp` を対象 process の user 入口へ差し替え、`iretq` で継続。
+3. 実行順:
+   - Process0 で `sys_drop_present` 後アクセスし `PAGE FAULT RESOLVED`
+   - syscall で Process1 へ切替
+   - Process1 でも同様に recover
+   - 最後は capability 根拠なし fault で停止
+
+## 判定ルール（標準）
+- `P=0` かつ user fault で、candidate `paddr` の capability があれば復帰。
+- それ以外（capability なし / protection violation 等）は停止ログへフォールバック。
+
+## 期待ログ
+```text
+enter ring3 with iretq (std #PF recover: Process0 then Process1)
+PAGE FAULT RESOLVED
+  CR2=...
+PAGE FAULT RESOLVED
+  CR2=...
+PAGE FAULT
+  CR2=...
+```
