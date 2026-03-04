@@ -1,6 +1,10 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
+const capability = @import("capability.zig");
+const elf_loader = @import("elf_loader.zig");
 const interrupts = @import("interrupts.zig");
+const lapic = @import("lapic.zig");
+const virtio_probe = @import("virtio_probe.zig");
 const serial = @import("serial.zig");
 const user_programs = @import("user_programs.zig");
 const uefi = std.os.uefi;
@@ -9,11 +13,29 @@ const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
 const page_entries: usize = 512;
 const four_gib: u64 = 4 * 1024 * 1024 * 1024;
+const one_tib: u64 = 1024 * 1024 * 1024 * 1024;
 const two_mib: u64 = 2 * 1024 * 1024;
-const pd_table_count: usize = 4; // 4 * 1GiB = 4GiB
+const pd_table_count: usize = 16; // 16 * 1GiB = 16GiB
+const high_mmio_pml4_index: usize = 1; // 512GiB..1024GiB window
+const high_mmio_pdp_table_count: usize = page_entries; // 512 * 1GiB = 512GiB
 const user_va: u64 = 0x20000000;
+const user_elf_base_va: u64 = user_va; // PIE base is chosen by kernel.
 const user_stack_top: u64 = 0x20002000;
 const user_stack_page_va: u64 = user_stack_top - 0x1000;
+const user_entry_rsp: u64 = user_stack_top - 8; // mimic normal call ABI stack alignment at function entry
+const boot_log_console_stack_page_va: u64 = user_stack_page_va + 0x1000;
+const boot_log_console_stack_top: u64 = boot_log_console_stack_page_va + 0x1000;
+const boot_log_console_entry_rsp: u64 = boot_log_console_stack_top - 8;
+const boot_log_user_va: u64 = user_va + 0x3000;
+const mouse_driver_config_va: u64 = user_va + 0x3000;
+const mouse_shared_driver_va: u64 = user_va + 0xA000;
+const mouse_shared_draw_va: u64 = user_va + 0x3000;
+const framebuffer_user_va: u64 = user_va + 0x4000;
+const framebuffer_window_bytes: u64 = two_mib - 0x4000;
+const enable_framebuffer_server_step1 = true;
+const enable_boot_log_console_process = true;
+const enable_virtio_input_mouse = true;
+const user_entry_rflags: u64 = 0x202;
 const user_unmapped_test_va: u64 = 0x20100000;
 const user_dma_verify_va: u64 = 0x20110000;
 const user_recovery_stop_va: u64 = 0x20200000;
@@ -30,27 +52,73 @@ const page_present: u64 = 1 << 0;
 const page_rw: u64 = 1 << 1;
 const page_user: u64 = 1 << 2;
 const page_ps: u64 = 1 << 7;
+const lapic_timer_vector: u8 = 0x40;
+const lapic_timer_initial_count: u32 = 50_000;
+const scheduler_quantum_ticks: u64 = 1;
+const scheduler_log_switch = false;
+const scheduler_switch_log_max_lines: u64 = 96;
+const scheduler_log_int80 = false;
+const scheduler_int80_log_max_lines: u64 = 192;
+const scheduler_race_log_max_lines: u64 = 128;
+const user_log_max_bytes: usize = 256;
+const user_elf_max_size: usize = 64 * 1024;
+const user_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'U', 'S', 'E', 'R', 'A', 'P', 'P', '.', 'E', 'L', 'F',
+};
+const user_elf_disk_path_log = "\\EFI\\BOOT\\USERAPP.ELF";
+const framebuffer_server_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'F', 'B', 'S', 'R', 'V', '.', 'E', 'L', 'F',
+};
+const framebuffer_server_elf_disk_path_log = "\\EFI\\BOOT\\FBSRV.ELF";
+const draw_client_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'D', 'R', 'A', 'W', 'C', 'L', 'I', '.', 'E', 'L', 'F',
+};
+const draw_client_elf_disk_path_log = "\\EFI\\BOOT\\DRAWCLI.ELF";
+const boot_log_console_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'B', 'O', 'O', 'T', 'L', 'O', 'G', '.', 'E', 'L', 'F',
+};
+const boot_log_console_elf_disk_path_log = "\\EFI\\BOOT\\BOOTLOG.ELF";
+const mouse_driver_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'M', 'O', 'U', 'S', 'E', 'D', 'R', 'V', '.', 'E', 'L', 'F',
+};
+const mouse_driver_elf_disk_path_log = "\\EFI\\BOOT\\MOUSEDRV.ELF";
+const compositor_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'C', 'O', 'M', 'P', 'O', 'S', '.', 'E', 'L', 'F',
+};
+const compositor_elf_disk_path_log = "\\EFI\\BOOT\\COMPOS.ELF";
+const boot_log_max_bytes: usize = 32 * 1024;
+const boot_log_page_header_bytes: usize = 8;
+const boot_log_page_payload_bytes: usize = 4096 - boot_log_page_header_bytes;
+const mouse_shared_header_bytes: usize = 128;
+const mouse_shared_log_max_bytes: usize = 4096 - mouse_shared_header_bytes;
+const mouse_driver_config_magic: u64 = 0x4D4F5553; // "MOUS"
+const mouse_shared_magic: u64 = 0x4D534852; // "MSHR"
 
 const debug_skip_exit_boot_services = false;
 const debug_skip_cr3_switch = false;
 const debug_trigger_page_fault_test = false;
-const debug_trigger_general_protection_test = false;
-const debug_trigger_pf_recovery_demo = false;
-const debug_trigger_dma_unmap_verify_demo = false;
 const user_process_count: usize = 2;
+const user_thread_count: usize = 2;
+const UserAddressSpace = capability.UserAddressSpace;
 
-const UserAddressSpace = struct {
-    pml4: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
-    pdp: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
-    pd: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
-    pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries,
+const ThreadContext = struct {
+    id: u32 = 0,
+    owner_process: kernel.PrincipalId,
     cr3: u64 = 0,
+    ready: bool = false,
+    frame: TrapFrame = std.mem.zeroes(TrapFrame),
 };
 
 var pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pd_tables: [pd_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** pd_table_count;
-var user_spaces: [user_process_count]UserAddressSpace = .{ .{}, .{} };
+var high_mmio_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
+var high_mmio_pd_tables: [high_mmio_pdp_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_mmio_pdp_table_count;
+var user_spaces: [user_process_count]UserAddressSpace = [_]UserAddressSpace{.{}} ** user_process_count;
+var thread_contexts: [user_thread_count]ThreadContext = .{
+    .{ .id = 0, .owner_process = .Process0 },
+    .{ .id = 1, .owner_process = .Process1 },
+};
 var global_free_list: kernel.FreePageList = .{};
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
 var gdt: [7]u64 align(16) = .{
@@ -74,6 +142,7 @@ var ud_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var ts_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var np_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var ss_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var timer_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var int80_trampoline_entry: usize = 0;
 var pf_trampoline_entry: usize = 0;
 var gp_trampoline_entry: usize = 0;
@@ -82,22 +151,49 @@ var ud_trampoline_entry: usize = 0;
 var ts_trampoline_entry: usize = 0;
 var np_trampoline_entry: usize = 0;
 var ss_trampoline_entry: usize = 0;
+var timer_trampoline_entry: usize = 0;
 export var kernel_cr3_value: u64 = 0;
 export var user_cr3_value: u64 = 0;
 var current_user_principal: kernel.PrincipalId = .Process0;
+var current_thread_index: usize = 0;
+var lapic_tick_count: u64 = 0;
+var scheduler_tick_accum: u64 = 0;
+var scheduler_switch_count: u64 = 0;
+var scheduler_int80_log_count: u64 = 0;
+var scheduler_race_log_count: u64 = 0;
+var user_log_scratch: [user_log_max_bytes]u8 align(16) = undefined;
+var user_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var framebuffer_server_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var draw_client_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var boot_log_console_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var mouse_driver_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var compositor_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var user_elf_load_window: [8192]u8 align(16) = undefined;
+var boot_log_buffer: [boot_log_max_bytes]u8 = [_]u8{0} ** boot_log_max_bytes;
+var boot_log_len: usize = 0;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_move_cap: u64 = 0x3;
 const syscall_drop_present: u64 = 0x4;
-const syscall_switch_process: u64 = 0x5;
+const syscall_switch_thread: u64 = 0x5;
+const syscall_send_cap: u64 = 0x6;
+const syscall_revoke_tree: u64 = 0x7;
+const syscall_grant_cap: u64 = 0x8;
+const syscall_log: u64 = 0x9;
+const syscall_recv_cap: u64 = 0xA;
+const syscall_map_mmio: u64 = 0xB;
 
 const user_program_cfg: user_programs.Config = .{
     .syscall_alloc_page = syscall_alloc_page,
     .syscall_map_page = syscall_map_page,
     .syscall_move_cap = syscall_move_cap,
     .syscall_drop_present = syscall_drop_present,
-    .syscall_switch_process = syscall_switch_process,
+    .syscall_switch_thread = syscall_switch_thread,
+    .syscall_send_cap = syscall_send_cap,
+    .syscall_revoke_tree = syscall_revoke_tree,
+    .syscall_grant_cap = syscall_grant_cap,
+    .syscall_log = syscall_log,
     .user_unmapped_test_va = user_unmapped_test_va,
     .user_dma_verify_va = user_dma_verify_va,
     .user_recovery_stop_va = user_recovery_stop_va,
@@ -110,10 +206,39 @@ const syscall_err_alloc = 4;
 const syscall_err_map = 5;
 const syscall_err_move = 6;
 const syscall_err_drop_present = 7;
+const syscall_err_send = 8;
+const syscall_err_endpoint = 9;
+const syscall_err_revoke = 10;
+const syscall_err_grant = 11;
+const syscall_err_log = 12;
+const syscall_err_empty = 13;
 
 const MemoryStats = struct {
     detected_regions: usize,
     total_usable_bytes: u64,
+};
+
+const FramebufferInfo = struct {
+    paddr: u64,
+    size_bytes: usize,
+    width: u32,
+    height: u32,
+    pixels_per_scan_line: u32,
+    pixel_format: u32,
+    mode: u32,
+};
+
+const MmioPageWithOffset = struct {
+    page_paddr: u64,
+    page_offset: u64,
+};
+
+const MouseDriverConfig = struct {
+    common: MmioPageWithOffset,
+    notify: MmioPageWithOffset,
+    isr: MmioPageWithOffset,
+    device: MmioPageWithOffset,
+    notify_off_multiplier: u64,
 };
 
 const ReservedRange = struct {
@@ -144,31 +269,89 @@ const Tss = packed struct {
     iomap_base: u16 = 0,
 };
 
-const PageFaultCapability = struct {
-    principal: kernel.PrincipalId,
-    fault_va: u64,
-    fault_page_va: u64,
-    fault_rip: u64,
-    present_violation: bool,
-    write_access: bool,
-    instruction_fetch: bool,
-    candidate_paddr: ?u64,
-};
-
 fn serialInit() void {
     serial.init();
 }
 
+fn appendBootLog(text: []const u8) void {
+    if (text.len == 0) return;
+    if (boot_log_len >= boot_log_buffer.len) return;
+    const remaining = boot_log_buffer.len - boot_log_len;
+    const copy_len = if (text.len > remaining) remaining else text.len;
+    @memcpy(boot_log_buffer[boot_log_len .. boot_log_len + copy_len], text[0..copy_len]);
+    boot_log_len += copy_len;
+}
+
 fn serialWrite(text: []const u8) void {
     serial.write(text);
+    appendBootLog(text);
 }
 
 fn serialWriteHexRaw(value: u64) void {
     serial.writeHexRaw(value);
+    var buf: [16]u8 = undefined;
+    const s = std.fmt.bufPrint(buf[0..], "{x:0>16}", .{value}) catch return;
+    appendBootLog(s);
 }
 
 fn serialWriteBool01(value: bool) void {
     serial.writeBool01(value);
+    appendBootLog(if (value) "1" else "0");
+}
+
+fn framebufferBytesForModeInfo(info: *const uefi.protocol.GraphicsOutput.Mode.Info) u64 {
+    return @as(u64, info.pixels_per_scan_line) * @as(u64, info.vertical_resolution) * 4;
+}
+
+fn selectFramebufferMode(
+    gop: *uefi.protocol.GraphicsOutput,
+    max_bytes: u64,
+) ?u32 {
+    var best_mode: ?u32 = null;
+    var best_bytes: u64 = 0;
+
+    var mode_id: u32 = 0;
+    while (mode_id < gop.mode.max_mode) : (mode_id += 1) {
+        const info = gop.queryMode(mode_id) catch continue;
+        if (info.pixel_format == .blt_only) continue;
+
+        const mode_bytes = framebufferBytesForModeInfo(info);
+        if (mode_bytes > max_bytes) continue;
+        if (mode_bytes >= best_bytes) {
+            best_bytes = mode_bytes;
+            best_mode = mode_id;
+        }
+    }
+    return best_mode;
+}
+
+fn acquireFramebufferInfo(bs: *uefi.tables.BootServices) ?FramebufferInfo {
+    const gop = bs.locateProtocol(uefi.protocol.GraphicsOutput, null) catch return null;
+    const graphics = gop orelse return null;
+
+    const chosen_mode = selectFramebufferMode(graphics, framebuffer_window_bytes) orelse graphics.mode.mode;
+    if (chosen_mode != graphics.mode.mode) {
+        graphics.setMode(chosen_mode) catch return null;
+    }
+
+    const mode = graphics.mode;
+    const info = mode.info;
+    if (info.pixel_format == .blt_only) return null;
+
+    const size_bytes_u64 = framebufferBytesForModeInfo(info);
+    if (size_bytes_u64 == 0 or size_bytes_u64 > framebuffer_window_bytes) return null;
+    if (mode.frame_buffer_base >= four_gib) return null;
+    if ((mode.frame_buffer_base & 0xFFF) != 0) return null;
+
+    return .{
+        .paddr = mode.frame_buffer_base,
+        .size_bytes = @intCast(size_bytes_u64),
+        .width = info.horizontal_resolution,
+        .height = info.vertical_resolution,
+        .pixels_per_scan_line = info.pixels_per_scan_line,
+        .pixel_format = @intFromEnum(info.pixel_format),
+        .mode = mode.mode,
+    };
 }
 
 fn writeU64LEBytes(ptr: [*]u8, offset: usize, value: u64) void {
@@ -215,6 +398,7 @@ fn installInterruptTrampolines() void {
     ts_trampoline_entry = buildCr3SwitchTrampoline(&ts_trampoline_page, @intFromPtr(&invalidTssHandlerStub));
     np_trampoline_entry = buildCr3SwitchTrampoline(&np_trampoline_page, @intFromPtr(&segmentNotPresentHandlerStub));
     ss_trampoline_entry = buildCr3SwitchTrampoline(&ss_trampoline_page, @intFromPtr(&stackSegmentFaultHandlerStub));
+    timer_trampoline_entry = buildCr3SwitchTrampoline(&timer_trampoline_page, @intFromPtr(&timerInterruptHandlerStub));
 }
 
 fn readCr2() u64 {
@@ -241,8 +425,158 @@ fn processIndex(principal: kernel.PrincipalId) ?usize {
     };
 }
 
+fn principalLabel(principal: kernel.PrincipalId) []const u8 {
+    return switch (principal) {
+        .Process0 => "Process0",
+        .Process1 => "Process1",
+        .Device0 => "Device0",
+    };
+}
+
+fn threadLabel(thread_index: usize) []const u8 {
+    return switch (thread_index) {
+        0 => "Thread0",
+        1 => "Thread1",
+        else => "Thread?",
+    };
+}
+
+fn tryBeginSchedulerRaceLog() bool {
+    if (scheduler_race_log_count >= scheduler_race_log_max_lines) return false;
+    scheduler_race_log_count +%= 1;
+    serialWrite("SCHED race ");
+    return true;
+}
+
+fn logSchedulerRaceSendCap(
+    from: kernel.PrincipalId,
+    to: ?kernel.PrincipalId,
+    endpoint_id: u64,
+    paddr: u64,
+    reason: []const u8,
+) void {
+    if (!tryBeginSchedulerRaceLog()) return;
+    serialWrite("send_cap from=");
+    serialWrite(principalLabel(from));
+    serialWrite(" to=");
+    if (to) |target| {
+        serialWrite(principalLabel(target));
+    } else {
+        serialWrite("unknown");
+    }
+    serialWrite(" ep=");
+    printHex(endpoint_id);
+    serialWrite(" paddr=");
+    printHex(paddr);
+    serialWrite(" reason=");
+    serialWrite(reason);
+    serialWrite("\n");
+}
+
+fn logSchedulerRaceSwitch(current_thread: usize, target_thread: usize, reason: []const u8) void {
+    if (!tryBeginSchedulerRaceLog()) return;
+    serialWrite("switch_thread from=");
+    serialWrite(threadLabel(current_thread));
+    serialWrite(" to=");
+    serialWrite(threadLabel(target_thread));
+    serialWrite(" reason=");
+    serialWrite(reason);
+    serialWrite("\n");
+}
+
+fn getThreadContext(thread_index: usize) ?*ThreadContext {
+    if (thread_index >= user_thread_count) return null;
+    return &thread_contexts[thread_index];
+}
+
+fn getThreadContextConst(thread_index: usize) ?*const ThreadContext {
+    if (thread_index >= user_thread_count) return null;
+    return &thread_contexts[thread_index];
+}
+
+fn buildInitialUserTrapFrame() TrapFrame {
+    var frame: TrapFrame = std.mem.zeroes(TrapFrame);
+    frame.rip = user_va;
+    frame.cs = @as(u64, gdt_user_code_selector) | 0x3;
+    frame.rflags = user_entry_rflags;
+    frame.rsp = user_entry_rsp;
+    frame.ss = @as(u64, gdt_user_data_selector) | 0x3;
+    return frame;
+}
+
+fn initThreadContext(thread_index: usize, owner_process: kernel.PrincipalId) bool {
+    const space = getUserSpace(owner_process) orelse return false;
+    const ctx = getThreadContext(thread_index) orelse return false;
+    ctx.id = @intCast(thread_index);
+    ctx.owner_process = owner_process;
+    ctx.cr3 = space.cr3;
+    ctx.ready = true;
+    ctx.frame = buildInitialUserTrapFrame();
+    return true;
+}
+
+fn activateThread(thread_index: usize) bool {
+    const ctx = getThreadContextConst(thread_index) orelse return false;
+    if (!ctx.ready) return false;
+    current_thread_index = thread_index;
+    current_user_principal = ctx.owner_process;
+    user_cr3_value = ctx.cr3;
+    return true;
+}
+
+fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
+    const ctx = getThreadContext(current_thread_index) orelse return;
+    ctx.frame = frame.*;
+    ctx.cr3 = user_cr3_value;
+    ctx.ready = true;
+}
+
+fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
+    const ctx = getThreadContextConst(thread_index) orelse return false;
+    if (!ctx.ready) return false;
+    frame.* = ctx.frame;
+    return true;
+}
+
+fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bool {
+    if (next_thread >= user_thread_count) return false;
+    const current_thread = current_thread_index;
+    if (next_thread == current_thread) {
+        if (saved_rax) |value| frame.rax = value;
+        return true;
+    }
+
+    var saved = frame.*;
+    if (saved_rax) |value| saved.rax = value;
+    saveCurrentThreadContextFromFrame(&saved);
+
+    if (!activateThread(next_thread)) return false;
+    if (!loadThreadContextToFrame(next_thread, frame)) {
+        _ = activateThread(current_thread);
+        _ = loadThreadContextToFrame(current_thread, frame);
+        return false;
+    }
+    return true;
+}
+
+fn isUserTrapFrame(frame: *const TrapFrame) bool {
+    return ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
+}
+
+fn pickNextReadyThreadIndex(current_index: usize) usize {
+    if (current_index >= user_thread_count) return 0;
+    var step: usize = 1;
+    while (step <= user_thread_count) : (step += 1) {
+        const idx = (current_index + step) % user_thread_count;
+        const ctx = getThreadContextConst(idx) orelse continue;
+        if (ctx.ready) return idx;
+    }
+    return current_index;
+}
+
 fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
     const idx = processIndex(principal) orelse return null;
+    if (idx >= user_spaces.len) return null;
     return &user_spaces[idx];
 }
 
@@ -250,70 +584,47 @@ fn currentUserSpace() *UserAddressSpace {
     return getUserSpace(current_user_principal).?;
 }
 
-fn isUserCanonicalVa(va: u64) bool {
-    return va < canonical_user_limit_exclusive;
-}
+fn mapUserLinearRegion(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddr_start: u64,
+    size_bytes: usize,
+    writable: bool,
+) bool {
+    const space = getUserSpace(principal) orelse return false;
+    if (size_bytes == 0) return false;
+    if ((va_start & 0xFFF) != 0 or (paddr_start & 0xFFF) != 0) return false;
 
-fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
-    const space = getUserSpace(principal) orelse return null;
-    const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
-    const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
-    const pd_index: usize = @intCast((va >> 21) & 0x1FF);
-    const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+    const map_end_va = va_start + size_bytes - 1;
+    const map_end_pa = paddr_start + size_bytes - 1;
+    if (map_end_pa >= four_gib) return false;
+
     const user_pdp_index: usize = @intCast((user_va >> 30) & 0x1FF);
     const user_pd_index: usize = @intCast((user_va >> 21) & 0x1FF);
+    const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);
+    const start_pdp: usize = @intCast((va_start >> 30) & 0x1FF);
+    const start_pd: usize = @intCast((va_start >> 21) & 0x1FF);
+    const end_pml4: usize = @intCast((map_end_va >> 39) & 0x1FF);
+    const end_pdp: usize = @intCast((map_end_va >> 30) & 0x1FF);
+    const end_pd: usize = @intCast((map_end_va >> 21) & 0x1FF);
+    if (start_pml4 != 0 or end_pml4 != 0) return false;
+    if (start_pdp != user_pdp_index or end_pdp != user_pdp_index) return false;
+    if (start_pd != user_pd_index or end_pd != user_pd_index) return false;
 
-    // Current stage maps only one PT under the user_va PD slot.
-    if (pml4_index != 0 or pdp_index != user_pdp_index or pd_index != user_pd_index) return null;
+    var offset: u64 = 0;
+    while (offset < size_bytes) : (offset += 4096) {
+        const va = va_start + offset;
+        const paddr = paddr_start + offset;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        space.pt[pt_index] = paddr | page_present | page_user | (if (writable) page_rw else 0);
+    }
 
-    const entry = space.pt[pt_index];
-    const paddr = entry & page_addr_mask;
-    if (paddr == 0) return null;
-    return paddr;
-}
-
-fn issuePageFaultCapability(frame: *const ExceptionTrapFrame, cr2: u64) ?PageFaultCapability {
-    const ec = frame.error_code;
-    const user_mode = (ec & (1 << 2)) != 0;
-    if (!user_mode) return null;
-    if (!isUserCanonicalVa(cr2)) return null;
-
-    const fault_page_va = pageAlignDown(cr2);
-    return .{
-        .principal = current_user_principal,
-        .fault_va = cr2,
-        .fault_page_va = fault_page_va,
-        .fault_rip = frame.rip,
-        .present_violation = (ec & (1 << 0)) != 0,
-        .write_access = (ec & (1 << 1)) != 0,
-        .instruction_fetch = (ec & (1 << 4)) != 0,
-        .candidate_paddr = lookupUserMappedPaddrForVa(current_user_principal, fault_page_va),
-    };
-}
-
-fn resolvePageFaultCapability(pf_cap: PageFaultCapability) bool {
-    // Step3 policy: only user-mode not-present faults are recoverable.
-    if (pf_cap.present_violation) return false;
-    if (!kernel_state_ready) return false;
-
-    const candidate_paddr = pf_cap.candidate_paddr orelse return false;
-    const cap = kernel_state_global.getTableConst(pf_cap.principal).find(candidate_paddr) orelse return false;
-    if (!cap.rights.cpu_read) return false;
-    if (pf_cap.write_access and !cap.rights.cpu_write) return false;
-    if (pf_cap.instruction_fetch) return false;
-
-    return mapUserPageFromCapability(
-        &kernel_state_global,
-        pf_cap.principal,
-        pf_cap.fault_page_va,
-        candidate_paddr,
-        cap.rights.cpu_write,
-    );
+    return true;
 }
 
 fn logPageFaultStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     const ec_user = (frame.error_code & (1 << 2)) != 0;
-    const va_user = isUserCanonicalVa(cr2);
+    const va_user = capability.isUserCanonicalVa(cr2);
 
     serialWrite("  USER_MODE=");
     serialWriteBool01(ec_user);
@@ -322,7 +633,7 @@ fn logPageFaultStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     serialWriteBool01(va_user);
     serialWrite("\n");
 
-    const pf_cap = issuePageFaultCapability(frame, cr2) orelse {
+    const pf_cap = capability.issuePageFaultCapability(current_user_principal, frame, cr2) orelse {
         serialWrite("  PF_CAP=none\n");
         serialWrite("  CAP_LOOKUP=skip\n");
         return;
@@ -350,8 +661,9 @@ fn logPageFaultStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
 
 pub export fn pageFaultDispatch(frame: *const ExceptionTrapFrame) callconv(.c) u64 {
     const cr2 = readCr2();
-    const pf_cap = issuePageFaultCapability(frame, cr2) orelse return 0;
-    if (!resolvePageFaultCapability(pf_cap)) return 0;
+    const pf_cap = capability.issuePageFaultCapability(current_user_principal, frame, cr2) orelse return 0;
+    if (!kernel_state_ready) return 0;
+    if (!capability.resolvePageFaultCapability(&kernel_state_global, pf_cap)) return 0;
 
     serialWrite("PAGE FAULT RESOLVED\n");
     serialWrite("  CR2=");
@@ -396,6 +708,42 @@ fn haltLoop() noreturn {
     while (true) asm volatile ("hlt");
 }
 
+fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
+    if (dest.len == 0) return true;
+
+    var copied: usize = 0;
+    while (copied < dest.len) {
+        const copied_u64: u64 = @intCast(copied);
+        const cur_va, const va_overflow = @addWithOverflow(src_user_va, copied_u64);
+        if (va_overflow != 0) return false;
+
+        const page_va = cur_va & ~@as(u64, 0xFFF);
+        const page_off: usize = @intCast(cur_va & 0xFFF);
+        const page_paddr = capability.lookupUserMappedPaddrForVa(principal, page_va) orelse return false;
+        if (page_paddr >= four_gib) return false;
+
+        const page_remaining: usize = 4096 - page_off;
+        const total_remaining: usize = dest.len - copied;
+        const chunk_len: usize = if (total_remaining < page_remaining) total_remaining else page_remaining;
+
+        const page_off_u64: u64 = @intCast(page_off);
+        const src_paddr, const paddr_overflow = @addWithOverflow(page_paddr, page_off_u64);
+        if (paddr_overflow != 0) return false;
+        if (src_paddr >= four_gib) return false;
+        if (chunk_len == 0) return false;
+        const last_paddr, const last_overflow = @addWithOverflow(src_paddr, @as(u64, @intCast(chunk_len - 1)));
+        if (last_overflow != 0 or last_paddr >= four_gib) return false;
+
+        const src: [*]const u8 = @ptrFromInt(src_paddr);
+        var i: usize = 0;
+        while (i < chunk_len) : (i += 1) {
+            dest[copied + i] = src[i];
+        }
+        copied += chunk_len;
+    }
+    return true;
+}
+
 pub export fn invalidTssHandlerCommon(error_code: u64) callconv(.c) noreturn {
     asm volatile ("cli");
     serialWrite("INVALID TSS\n");
@@ -429,83 +777,20 @@ pub export fn invalidOpcodeHandlerCommon() callconv(.c) noreturn {
     haltLoop();
 }
 
-fn parseRights(bits: u64) kernel.Rights {
-    return .{
-        .cpu_read = (bits & 0x1) != 0,
-        .cpu_write = (bits & 0x2) != 0,
-        .dma = (bits & 0x4) != 0,
-    };
-}
-
-fn mapUserPageFromCapability(
-    state: *const kernel.KernelState,
-    principal: kernel.PrincipalId,
-    va: u64,
-    paddr: u64,
-    writable: bool,
-) bool {
-    const space = getUserSpace(principal) orelse return false;
-    if ((va & 0xFFF) != 0) return false;
-    if ((paddr & 0xFFF) != 0) return false;
-    if (paddr >= four_gib) return false;
-
-    const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
-    const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
-    const pd_index: usize = @intCast((va >> 21) & 0x1FF);
-    const pt_index: usize = @intCast((va >> 12) & 0x1FF);
-    const user_pdp_index: usize = @intCast((user_va >> 30) & 0x1FF);
-    const user_pd_index: usize = @intCast((user_va >> 21) & 0x1FF);
-
-    // 現段階は user_pt_table (1本) の範囲に限定する。
-    if (pml4_index != 0 or pdp_index != user_pdp_index or pd_index != user_pd_index) return false;
-
-    const cap = state.getTableConst(principal).find(paddr) orelse return false;
-    if (!cap.rights.cpu_read) return false;
-    if (writable and !cap.rights.cpu_write) return false;
-
-    // Strict 1:1 mapping: clear alias mappings of the same paddr first.
-    var i: usize = 0;
-    while (i < page_entries) : (i += 1) {
-        if (i == pt_index) continue;
-        const entry = space.pt[i];
-        if ((entry & page_addr_mask) != paddr) continue;
-        if (entry == 0) continue;
-        space.pt[i] = 0;
-        const alias_va = (user_va & ~@as(u64, 0x1F_FFFF)) + (@as(u64, i) * 4096);
-        flushUserTlbForPrincipalVa(principal, alias_va);
-    }
-
-    space.pt[pt_index] = paddr | page_present | page_user | (if (writable) page_rw else 0);
-    flushUserTlbForPrincipalVa(principal, va);
-    return true;
-}
-
-fn dropPresentForUserMappedPaddr(
-    state: *const kernel.KernelState,
-    principal: kernel.PrincipalId,
-    paddr: u64,
-) bool {
-    const space = getUserSpace(principal) orelse return false;
-    _ = state.getTableConst(principal).find(paddr) orelse return false;
-    const user_pt_base_va = user_va & ~@as(u64, 0x1F_FFFF);
-
-    var i: usize = 0;
-    while (i < page_entries) : (i += 1) {
-        const entry = space.pt[i];
-        if ((entry & page_addr_mask) != paddr) continue;
-        if ((entry & page_present) == 0) continue;
-        space.pt[i] = entry & ~page_present;
-        flushUserTlbForPrincipalVa(principal, user_pt_base_va + (@as(u64, i) * 4096));
-        return true;
-    }
-    return false;
-}
-
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
     if (!kernel_state_ready) return syscall_err_not_ready;
-    serialWrite("INT80 dispatch\n");
     const state = &kernel_state_global;
     const proc = current_user_principal;
+    if (scheduler_log_int80 and scheduler_int80_log_count < scheduler_int80_log_max_lines) {
+        serialWrite("INT80 dispatch ");
+        serialWrite(threadLabel(current_thread_index));
+        serialWrite("/");
+        serialWrite(principalLabel(proc));
+        serialWrite(" SYS=");
+        printHex(frame.rax);
+        serialWrite("\n");
+        scheduler_int80_log_count +%= 1;
+    }
 
     switch (frame.rax) {
         syscall_alloc_page => {
@@ -514,7 +799,14 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_map_page => {
             const writable = (frame.rdx & 0x1) != 0;
-            if (mapUserPageFromCapability(state, proc, frame.rdi, frame.rsi, writable)) {
+            if (capability.mapUserPageFromCapability(state, proc, frame.rdi, frame.rsi, writable)) {
+                return syscall_ok;
+            }
+            return syscall_err_map;
+        },
+        syscall_map_mmio => {
+            const writable = (frame.rdx & 0x1) != 0;
+            if (capability.mapUserPageFromCapability(state, proc, frame.rdi, frame.rsi, writable)) {
                 return syscall_ok;
             }
             return syscall_err_map;
@@ -526,31 +818,164 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 else => return syscall_err_invalid,
             };
             const from = if (to == proc) kernel.PrincipalId.Device0 else proc;
-            const rights = parseRights(frame.rdx);
+            const rights = capability.parseRights(frame.rdx);
             state.moveCap(from, to, frame.rdi, rights) catch return syscall_err_move;
             return syscall_ok;
         },
-        syscall_drop_present => {
-            if (dropPresentForUserMappedPaddr(state, proc, frame.rdi)) {
-                return syscall_ok;
-            }
-            return syscall_err_drop_present;
-        },
-        syscall_switch_process => {
-            const target = switch (frame.rdi) {
+        syscall_grant_cap => {
+            const to = switch (frame.rsi) {
                 0 => kernel.PrincipalId.Process0,
                 1 => kernel.PrincipalId.Process1,
                 else => return syscall_err_invalid,
             };
-            if (target == proc) return syscall_ok;
+            const rights = capability.parseRights(frame.rdx);
+            state.grantCap(proc, to, frame.rdi, rights) catch return syscall_err_grant;
+            serialWrite("grant_cap from=");
+            serialWrite(principalLabel(proc));
+            serialWrite(" to=");
+            serialWrite(principalLabel(to));
+            serialWrite(" paddr=");
+            printHex(frame.rdi);
+            serialWrite("\n");
+            capability.dumpPrincipalCaps(state, .Process0, "Process0");
+            capability.dumpPrincipalCaps(state, .Process1, "Process1");
+            return syscall_ok;
+        },
+        syscall_send_cap => {
+            const endpoint_id = frame.rsi;
+            const to = state.endpointTargetFor(proc, endpoint_id) orelse {
+                logSchedulerRaceSendCap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
+                return syscall_err_endpoint;
+            };
+            state.sendCapOnEndpoint(proc, endpoint_id, frame.rdi) catch |err| switch (err) {
+                kernel.KernelError.EndpointNotFound => {
+                    logSchedulerRaceSendCap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
+                    return syscall_err_endpoint;
+                },
+                kernel.KernelError.CapabilityNotFound => {
+                    logSchedulerRaceSendCap(proc, to, endpoint_id, frame.rdi, "cap_missing");
+                    return syscall_err_send;
+                },
+                else => {
+                    logSchedulerRaceSendCap(proc, to, endpoint_id, frame.rdi, @errorName(err));
+                    return syscall_err_send;
+                },
+            };
+            serialWrite("send_cap from=");
+            serialWrite(principalLabel(proc));
+            serialWrite(" to=");
+            serialWrite(principalLabel(to));
+            serialWrite(" ep=");
+            printHex(endpoint_id);
+            serialWrite(" paddr=");
+            printHex(frame.rdi);
+            serialWrite("\n");
+            capability.dumpPrincipalCaps(state, .Process0, "Process0");
+            capability.dumpPrincipalCaps(state, .Process1, "Process1");
+            return syscall_ok;
+        },
+        syscall_recv_cap => {
+            return state.recvCap(proc) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => syscall_err_empty,
+                else => syscall_err_send,
+            };
+        },
+        syscall_revoke_tree => {
+            state.revokeCapTree(proc, frame.rdi) catch return syscall_err_revoke;
+            serialWrite("revoke_tree by=");
+            serialWrite(principalLabel(proc));
+            serialWrite(" paddr=");
+            printHex(frame.rdi);
+            serialWrite("\n");
+            capability.dumpPrincipalCaps(state, .Process0, "Process0");
+            capability.dumpPrincipalCaps(state, .Process1, "Process1");
+            return syscall_ok;
+        },
+        syscall_drop_present => {
+            if (capability.dropPresentForUserMappedPaddr(state, proc, frame.rdi)) {
+                return syscall_ok;
+            }
+            return syscall_err_drop_present;
+        },
+        syscall_switch_thread => {
+            const target_thread: usize = @intCast(frame.rdi);
+            if (target_thread >= user_thread_count) {
+                serialWrite("switch_thread invalid target=");
+                printHex(frame.rdi);
+                serialWrite("\n");
+                return syscall_err_invalid;
+            }
+            const current_thread = current_thread_index;
+            const target_ctx = getThreadContextConst(target_thread).?;
+            if (!target_ctx.ready) {
+                logSchedulerRaceSwitch(current_thread, target_thread, "target_not_ready");
+                return syscall_err_not_ready;
+            }
+            if (!switchToThread(target_thread, frame, syscall_ok)) {
+                logSchedulerRaceSwitch(current_thread, target_thread, "context_switch_failed");
+                return syscall_err_not_ready;
+            }
+            serialWrite("switch_thread ok from=");
+            serialWrite(threadLabel(current_thread));
+            serialWrite(" to=");
+            serialWrite(threadLabel(target_thread));
+            serialWrite("\n");
+            return syscall_ok;
+        },
+        syscall_log => {
+            const req_len_u64 = frame.rsi;
+            if (req_len_u64 == 0) return syscall_ok;
+            if (req_len_u64 > user_log_scratch.len) return syscall_err_log;
 
-            current_user_principal = target;
-            user_cr3_value = currentUserSpace().cr3;
-            frame.rip = user_va;
-            frame.rsp = user_stack_top;
+            const req_len: usize = @intCast(req_len_u64);
+            if (!copyUserBytesFromVa(proc, frame.rdi, user_log_scratch[0..req_len])) return syscall_err_log;
+
+            serialWrite("userlog ");
+            serialWrite(threadLabel(current_thread_index));
+            serialWrite(": ");
+            serialWrite(user_log_scratch[0..req_len]);
+            if (user_log_scratch[req_len - 1] != '\n') {
+                serialWrite("\n");
+            }
             return syscall_ok;
         },
         else => return syscall_err_invalid,
+    }
+}
+
+pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
+    lapic_tick_count +%= 1;
+    lapic.eoi();
+    if (!kernel_state_ready) return;
+    if (scheduler_quantum_ticks == 0) return;
+    if (!isUserTrapFrame(frame)) return;
+
+    scheduler_tick_accum +%= 1;
+    if (scheduler_tick_accum < scheduler_quantum_ticks) return;
+    scheduler_tick_accum = 0;
+
+    const current_thread = current_thread_index;
+    const next_thread = pickNextReadyThreadIndex(current_thread);
+    if (next_thread == current_thread) return;
+
+    if (!switchToThread(next_thread, frame, null)) {
+        logSchedulerRaceSwitch(current_thread, next_thread, "timer_preempt_switch_failed");
+        return;
+    }
+
+    scheduler_switch_count +%= 1;
+    if (scheduler_log_switch and scheduler_switch_count <= scheduler_switch_log_max_lines) {
+        serialWrite("SCHED switch ");
+        const current_ctx = getThreadContextConst(current_thread).?;
+        const next_ctx = getThreadContextConst(next_thread).?;
+        serialWrite(threadLabel(current_thread));
+        serialWrite("/");
+        serialWrite(principalLabel(current_ctx.owner_process));
+        serialWrite(" -> ");
+        serialWrite(threadLabel(next_thread));
+        serialWrite("/");
+        serialWrite(principalLabel(next_ctx.owner_process));
+        serialWrite("\n");
     }
 }
 
@@ -677,6 +1102,55 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
         \\pop %rbx
         \\pop %rax
         // kernel -> ring3 return: r10 を壊さず user CR3 を復帰して iretq する。
+        \\push %r10
+        \\mov user_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
+        \\iretq
+    );
+}
+
+pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
+    asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
+        \\push %rax
+        \\push %rbx
+        \\push %rcx
+        \\push %rdx
+        \\push %rsi
+        \\push %rdi
+        \\push %rbp
+        \\push %r8
+        \\push %r9
+        \\push %r10
+        \\push %r11
+        \\push %r12
+        \\push %r13
+        \\push %r14
+        \\push %r15
+        \\sub $32, %rsp
+        \\lea 32(%rsp), %rdi
+        \\mov %rdi, %rcx
+        \\call timerInterruptDispatch
+        \\add $32, %rsp
+        \\pop %r15
+        \\pop %r14
+        \\pop %r13
+        \\pop %r12
+        \\pop %r11
+        \\pop %r10
+        \\pop %r9
+        \\pop %r8
+        \\pop %rbp
+        \\pop %rdi
+        \\pop %rsi
+        \\pop %rdx
+        \\pop %rcx
+        \\pop %rbx
+        \\pop %rax
         \\push %r10
         \\mov user_cr3_value(%rip), %r10
         \\mov %r10, %cr3
@@ -823,8 +1297,9 @@ fn initIdtPageFaultOnly() void {
     interrupts.setIdtEntry(&idt, 13, gdt_kernel_code_selector, gp_trampoline_entry, 0x8E); // #GP
     interrupts.setIdtEntry(&idt, 14, gdt_kernel_code_selector, pf_trampoline_entry, 0x8E); // #PF
     interrupts.setIdtEntry(&idt, 8, gdt_kernel_code_selector, df_trampoline_entry, 0x8E); // #DF
-    // DPL=3 trap gate to allow ring3 software syscall entry.
-    interrupts.setIdtEntry(&idt, 0x80, gdt_kernel_code_selector, int80_trampoline_entry, 0xEF);
+    interrupts.setIdtEntry(&idt, lapic_timer_vector, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E); // LAPIC timer
+    // DPL=3 interrupt gate: syscall 中の割り込みネストを抑止する。
+    interrupts.setIdtEntry(&idt, 0x80, gdt_kernel_code_selector, int80_trampoline_entry, 0xEE);
     interrupts.loadIdt(&idt);
 }
 
@@ -839,38 +1314,16 @@ fn triggerPageFaultTest() noreturn {
 
 fn printNumber(value: anytype) void {
     serial.printNumber(value);
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(buf[0..], "{}", .{value}) catch return;
+    appendBootLog(s);
 }
 
 fn printHex(value: u64) void {
     serial.printHex(value);
-}
-
-fn dumpPrincipalCaps(state: *const kernel.KernelState, principal: kernel.PrincipalId, label: []const u8) void {
-    serialWrite(label);
-    serialWrite(" caps:\n");
-
-    const table = state.getTableConst(principal);
-    if (table.len == 0) {
-        serialWrite("  none\n");
-        return;
-    }
-
-    var i: usize = 0;
-    while (i < table.len) : (i += 1) {
-        const cap = table.caps[i];
-        serialWrite("  ");
-        printHex(cap.paddr);
-        if (!cap.rights.cpu_read and !cap.rights.cpu_write and cap.rights.dma) {
-            serialWrite(" (dma)");
-        }
-        serialWrite("\n");
-    }
-}
-
-fn dumpCapabilityView(state: *const kernel.KernelState) void {
-    dumpPrincipalCaps(state, .Process0, "Process0");
-    dumpPrincipalCaps(state, .Process1, "Process1");
-    dumpPrincipalCaps(state, .Device0, "Device0");
+    var buf: [18]u8 = undefined;
+    const s = std.fmt.bufPrint(buf[0..], "0x{x}", .{value}) catch return;
+    appendBootLog(s);
 }
 
 const ExitBootResult = enum {
@@ -958,13 +1411,20 @@ fn installIdentityPageTables0To1GiB() bool {
     while (pd_idx < pd_table_count) : (pd_idx += 1) {
         @memset(pd_tables[pd_idx][0..], 0);
     }
+    @memset(high_mmio_pdp_table[0..], 0);
+    pd_idx = 0;
+    while (pd_idx < high_mmio_pdp_table_count) : (pd_idx += 1) {
+        @memset(high_mmio_pd_tables[pd_idx][0..], 0);
+    }
 
     const pml4_pa: u64 = @intFromPtr(&pml4_table);
     const pdp_pa: u64 = @intFromPtr(&pdp_table);
     const pd0_pa: u64 = @intFromPtr(&pd_tables[0]);
+    const high_pdp_pa: u64 = @intFromPtr(&high_mmio_pdp_table);
+    const high_pd0_pa: u64 = @intFromPtr(&high_mmio_pd_tables[0]);
 
     // この段階では 0..4GiB を identity map する。テーブル実体も 4GiB 未満前提。
-    if (pml4_pa >= four_gib or pdp_pa >= four_gib or pd0_pa >= four_gib) return false;
+    if (pml4_pa >= four_gib or pdp_pa >= four_gib or pd0_pa >= four_gib or high_pdp_pa >= four_gib or high_pd0_pa >= four_gib) return false;
 
     const kernel_table_flags = page_present | page_rw;
     const kernel_large_page_flags = page_present | page_rw | page_ps;
@@ -982,6 +1442,19 @@ fn installIdentityPageTables0To1GiB() bool {
             pd_tables[pd_idx][i] = base | kernel_large_page_flags;
         }
     }
+    pml4_table[high_mmio_pml4_index] = high_pdp_pa | kernel_table_flags;
+    var high_pdp_idx: usize = 0;
+    while (high_pdp_idx < high_mmio_pdp_table_count) : (high_pdp_idx += 1) {
+        const high_pd_pa: u64 = @intFromPtr(&high_mmio_pd_tables[high_pdp_idx]);
+        high_mmio_pdp_table[high_pdp_idx] = high_pd_pa | kernel_table_flags;
+
+        const region_base = (@as(u64, @intCast(high_mmio_pml4_index)) << 39) + (@as(u64, @intCast(high_pdp_idx)) << 30);
+        var i: usize = 0;
+        while (i < page_entries) : (i += 1) {
+            const base = region_base + (@as(u64, @intCast(i)) * two_mib);
+            high_mmio_pd_tables[high_pdp_idx][i] = base | kernel_large_page_flags;
+        }
+    }
 
     writeCr3(pml4_pa);
     kernel_cr3_value = pml4_pa;
@@ -991,6 +1464,7 @@ fn installIdentityPageTables0To1GiB() bool {
 fn hardenKernelMappingsSupervisorOnly() void {
     // kernel の既存 map は ring3 から見えないよう User ビットを強制的に落とす。
     pml4_table[0] &= ~page_user;
+    pml4_table[high_mmio_pml4_index] &= ~page_user;
 
     var pdp_idx: usize = 0;
     while (pdp_idx < pd_table_count) : (pdp_idx += 1) {
@@ -999,6 +1473,14 @@ fn hardenKernelMappingsSupervisorOnly() void {
         var pd_idx: usize = 0;
         while (pd_idx < page_entries) : (pd_idx += 1) {
             pd_tables[pdp_idx][pd_idx] &= ~page_user;
+        }
+    }
+    var high_pdp_idx: usize = 0;
+    while (high_pdp_idx < high_mmio_pdp_table_count) : (high_pdp_idx += 1) {
+        high_mmio_pdp_table[high_pdp_idx] &= ~page_user;
+        var pd_idx2: usize = 0;
+        while (pd_idx2 < page_entries) : (pd_idx2 += 1) {
+            high_mmio_pd_tables[high_pdp_idx][pd_idx2] &= ~page_user;
         }
     }
 }
@@ -1041,8 +1523,10 @@ fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64, us
         .{ .start = @intFromPtr(&ts_trampoline_page), .len = @sizeOf(@TypeOf(ts_trampoline_page)) },
         .{ .start = @intFromPtr(&np_trampoline_page), .len = @sizeOf(@TypeOf(np_trampoline_page)) },
         .{ .start = @intFromPtr(&ss_trampoline_page), .len = @sizeOf(@TypeOf(ss_trampoline_page)) },
+        .{ .start = @intFromPtr(&timer_trampoline_page), .len = @sizeOf(@TypeOf(timer_trampoline_page)) },
         .{ .start = @intFromPtr(&enterUserModeIretq), .len = 1 },
         .{ .start = @intFromPtr(&syscallHandlerStub), .len = 1 },
+        .{ .start = @intFromPtr(&timerInterruptHandlerStub), .len = 1 },
         .{ .start = @intFromPtr(&pageFaultHandlerStub), .len = 1 },
         .{ .start = @intFromPtr(&generalProtectionHandlerStub), .len = 1 },
         .{ .start = @intFromPtr(&doubleFaultHandlerStub), .len = 1 },
@@ -1096,6 +1580,159 @@ fn installUserMemoryWritePfTestCode(user_page_paddr: u64) void {
     user_programs.installMemoryWritePfTestCode(user_program_cfg, user_page_paddr);
 }
 
+fn installUserIdleTaskCode(user_page_paddr: u64) void {
+    user_programs.installIdleTaskCode(user_page_paddr);
+}
+
+fn loadElfFromDisk(
+    bs: *uefi.tables.BootServices,
+    path: [*:0]const u16,
+    staging: []u8,
+) ?[]const u8 {
+    const loaded_image = (bs.handleProtocol(uefi.protocol.LoadedImage, uefi.handle) catch return null) orelse return null;
+    const device_handle = loaded_image.device_handle orelse return null;
+    const fs = (bs.handleProtocol(uefi.protocol.SimpleFileSystem, device_handle) catch return null) orelse return null;
+
+    var root = fs.openVolume() catch return null;
+    defer root.close() catch {};
+
+    var user_file = root.open(path, .read, .{}) catch return null;
+    defer user_file.close() catch {};
+
+    var info_buffer: [512]u8 align(8) = undefined;
+    const info = user_file.getInfo(.file, info_buffer[0..]) catch return null;
+    if (info.file_size == 0 or info.file_size > staging.len) return null;
+
+    const read_len: usize = @intCast(info.file_size);
+    const read_bytes = user_file.read(staging[0..read_len]) catch return null;
+    if (read_bytes != read_len) return null;
+    return staging[0..read_len];
+}
+
+fn loadUserElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, user_elf_disk_path, user_elf_staging[0..]);
+}
+
+fn loadFramebufferServerElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, framebuffer_server_elf_disk_path, framebuffer_server_elf_staging[0..]);
+}
+
+fn loadDrawClientElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, draw_client_elf_disk_path, draw_client_elf_staging[0..]);
+}
+
+fn loadBootLogConsoleElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, boot_log_console_elf_disk_path, boot_log_console_elf_staging[0..]);
+}
+
+fn loadMouseDriverElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, mouse_driver_elf_disk_path, mouse_driver_elf_staging[0..]);
+}
+
+fn loadCompositorElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, compositor_elf_disk_path, compositor_elf_staging[0..]);
+}
+
+fn publishBootLogToUserPage(user_page_paddr: u64) void {
+    const page: [*]volatile u8 = @ptrFromInt(user_page_paddr);
+    var zero_i: usize = 0;
+    while (zero_i < 4096) : (zero_i += 1) {
+        page[zero_i] = 0;
+    }
+
+    const copy_len: usize = if (boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else boot_log_len;
+    const len_u32: u32 = @intCast(copy_len);
+    page[0] = @intCast(len_u32 & 0xFF);
+    page[1] = @intCast((len_u32 >> 8) & 0xFF);
+    page[2] = @intCast((len_u32 >> 16) & 0xFF);
+    page[3] = @intCast((len_u32 >> 24) & 0xFF);
+    var i: usize = 0;
+    while (i < copy_len) : (i += 1) {
+        page[boot_log_page_header_bytes + i] = boot_log_buffer[i];
+    }
+}
+
+fn mmioPageWithOffset(addr: u64) MmioPageWithOffset {
+    if (addr == 0) {
+        return .{ .page_paddr = 0, .page_offset = 0 };
+    }
+    return .{
+        .page_paddr = pageAlignDown(addr),
+        .page_offset = addr & 0xFFF,
+    };
+}
+
+fn publishMouseDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig) void {
+    const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        words[i] = 0;
+    }
+
+    words[0] = mouse_driver_config_magic;
+    words[1] = cfg.common.page_paddr;
+    words[2] = cfg.notify.page_paddr;
+    words[3] = cfg.isr.page_paddr;
+    words[4] = cfg.device.page_paddr;
+    words[5] = cfg.common.page_offset;
+    words[6] = cfg.notify.page_offset;
+    words[7] = cfg.isr.page_offset;
+    words[8] = cfg.device.page_offset;
+    words[9] = cfg.notify_off_multiplier;
+}
+
+fn publishMouseSharedPage(user_page_paddr: u64, fb: FramebufferInfo) void {
+    const bytes: [*]volatile u8 = @ptrFromInt(user_page_paddr);
+    const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        words[i] = 0;
+    }
+
+    words[0] = mouse_shared_magic;
+    words[1] = fb.width;
+    words[2] = fb.height;
+    words[3] = fb.pixels_per_scan_line;
+    words[4] = fb.width / 2;
+    words[5] = fb.height / 2;
+    words[6] = 0;
+    words[7] = 1; // seq
+    words[8] = 0; // wheel
+    const text_len: usize = if (boot_log_len > mouse_shared_log_max_bytes) mouse_shared_log_max_bytes else boot_log_len;
+    words[9] = @intCast(text_len);
+    var j: usize = 0;
+    while (j < text_len) : (j += 1) {
+        bytes[mouse_shared_header_bytes + j] = boot_log_buffer[j];
+    }
+}
+
+fn loadUserElfIntoUserPage(user_page_paddr: u64, image_bytes: []const u8) ?elf_loader.Image {
+    if ((user_page_paddr & 0xFFF) != 0) return null;
+    const page: [*]u8 = @ptrFromInt(user_page_paddr);
+    return elf_loader.loadToSinglePage(image_bytes, user_elf_base_va, page[0..4096]) catch null;
+}
+
+fn loadUserElfIntoTwoPages(page0_paddr: u64, page1_paddr: u64, image_bytes: []const u8) ?elf_loader.Image {
+    if ((page0_paddr & 0xFFF) != 0 or (page1_paddr & 0xFFF) != 0) return null;
+    @memset(user_elf_load_window[0..], 0);
+    const loaded = elf_loader.loadToSinglePage(image_bytes, user_elf_base_va, user_elf_load_window[0..]) catch return null;
+
+    const page0: [*]u8 = @ptrFromInt(page0_paddr);
+    const page1: [*]u8 = @ptrFromInt(page1_paddr);
+    @memcpy(page0[0..4096], user_elf_load_window[0..4096]);
+    @memcpy(page1[0..4096], user_elf_load_window[4096..8192]);
+    return loaded;
+}
+
+fn installUserFramebufferFillCode(
+    user_page_paddr: u64,
+    framebuffer_va: u64,
+    pixel_count: u64,
+    color: u32,
+) void {
+    user_programs.installFramebufferFillCode(user_page_paddr, framebuffer_va, pixel_count, color);
+}
+
 fn installUserGeneralProtectionTestCode(user_page_paddr: u64) void {
     user_programs.installGeneralProtectionTestCode(user_page_paddr);
 }
@@ -1104,18 +1741,41 @@ fn installUserPfRecoveryDemoCode(user_page_paddr: u64) void {
     user_programs.installPfRecoveryDemoCode(user_program_cfg, user_page_paddr);
 }
 
-fn installUserPfRecoveryThenSwitchCode(user_page_paddr: u64, target_process: u64) void {
-    user_programs.installPfRecoveryThenSwitchCode(user_program_cfg, user_page_paddr, target_process);
+fn installUserPfRecoveryThenSwitchCode(user_page_paddr: u64, target_thread: u64) void {
+    user_programs.installPfRecoveryThenSwitchCode(user_program_cfg, user_page_paddr, target_thread);
 }
 
 fn installUserDmaUnmapVerifyCode(user_page_paddr: u64) void {
     user_programs.installDmaUnmapVerifyCode(user_program_cfg, user_page_paddr);
 }
 
+fn installUserSchedulerProbeCode(user_page_paddr: u64, syscall_no: u64) void {
+    user_programs.installSchedulerProbeCode(user_page_paddr, syscall_no);
+}
+
+fn installUserSchedulerProbeWithSendCapCode(user_page_paddr: u64, probe_syscall_no: u64, endpoint_id: u64) void {
+    user_programs.installSchedulerProbeWithSendCapCode(user_program_cfg, user_page_paddr, probe_syscall_no, endpoint_id);
+}
+
+fn installUserCapSendTransferDemoCode(
+    user_page_paddr: u64,
+    paddr_to_send: u64,
+    send_endpoint_id: u64,
+    switch_to_thread: u64,
+) void {
+    user_programs.installCapSendTransferDemoCode(
+        user_program_cfg,
+        user_page_paddr,
+        paddr_to_send,
+        send_endpoint_id,
+        switch_to_thread,
+    );
+}
+
 fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
     const user_cs: u64 = gdt_user_code_selector | 0x3;
     const user_ss: u64 = gdt_user_data_selector | 0x3;
-    const user_rflags: u64 = 0x2; // IF=0 で外部割り込みを抑止
+    const user_rflags: u64 = user_entry_rflags; // IF=1 で ring3 中の LAPIC timer 割り込みを許可
     const kernel_transition_rsp: u64 = @intFromPtr(&ring0_stack) + ring0_stack.len;
 
     asm volatile (
@@ -1138,37 +1798,6 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
           [ucr3] "r" (user_cr3_value),
         : .{ .memory = true });
     unreachable;
-}
-
-fn syncPageTableRightsForPaddr(state: *const kernel.KernelState, paddr: u64) void {
-    const user_pt_base_va = user_va & ~@as(u64, 0x1F_FFFF);
-    const principals = [_]kernel.PrincipalId{ .Process0, .Process1 };
-    for (principals) |principal| {
-        const space = getUserSpace(principal) orelse continue;
-        const cap = state.getTableConst(principal).find(paddr);
-        var kept_one = false;
-
-        var i: usize = 0;
-        while (i < page_entries) : (i += 1) {
-            const old_entry = space.pt[i];
-            const mapped_paddr = old_entry & page_addr_mask;
-            if (mapped_paddr != paddr) continue;
-
-            var new_entry: u64 = 0;
-            if (cap) |c| {
-                if (c.rights.cpu_read and !kept_one) {
-                    new_entry = paddr | page_user | page_present;
-                    if (c.rights.cpu_write) new_entry |= page_rw;
-                    kept_one = true;
-                }
-            }
-
-            if (new_entry == old_entry) continue;
-            space.pt[i] = new_entry;
-            const va = user_pt_base_va + (@as(u64, i) * 4096);
-            flushUserTlbForPrincipalVa(principal, va);
-        }
-    }
 }
 
 fn pageAlignDown(addr: u64) u64 {
@@ -1202,8 +1831,14 @@ fn collectMemoryStatsAndFreePages(
     const pdp_end = pageAlignUp(@intFromPtr(&pdp_table) + @sizeOf(@TypeOf(pdp_table)));
     const pd_start = pageAlignDown(@intFromPtr(&pd_tables));
     const pd_end = pageAlignUp(@intFromPtr(&pd_tables) + @sizeOf(@TypeOf(pd_tables)));
+    const high_mmio_pdp_start = pageAlignDown(@intFromPtr(&high_mmio_pdp_table));
+    const high_mmio_pdp_end = pageAlignUp(@intFromPtr(&high_mmio_pdp_table) + @sizeOf(@TypeOf(high_mmio_pdp_table)));
+    const high_mmio_pd_start = pageAlignDown(@intFromPtr(&high_mmio_pd_tables));
+    const high_mmio_pd_end = pageAlignUp(@intFromPtr(&high_mmio_pd_tables) + @sizeOf(@TypeOf(high_mmio_pd_tables)));
     const user_spaces_start = pageAlignDown(@intFromPtr(&user_spaces));
     const user_spaces_end = pageAlignUp(@intFromPtr(&user_spaces) + @sizeOf(@TypeOf(user_spaces)));
+    const thread_contexts_start = pageAlignDown(@intFromPtr(&thread_contexts));
+    const thread_contexts_end = pageAlignUp(@intFromPtr(&thread_contexts) + @sizeOf(@TypeOf(thread_contexts)));
     const free_list_start = pageAlignDown(@intFromPtr(&global_free_list));
     const free_list_end = pageAlignUp(@intFromPtr(&global_free_list) + @sizeOf(@TypeOf(global_free_list)));
     const kernel_state_start = pageAlignDown(@intFromPtr(&kernel_state_global));
@@ -1217,7 +1852,7 @@ fn collectMemoryStatsAndFreePages(
     const tss_start = pageAlignDown(@intFromPtr(&tss));
     const tss_end = pageAlignUp(@intFromPtr(&tss) + @sizeOf(@TypeOf(tss)));
     const tramp_start = pageAlignDown(@intFromPtr(&int80_trampoline_page));
-    const tramp_end = pageAlignUp(@intFromPtr(&ss_trampoline_page) + @sizeOf(@TypeOf(ss_trampoline_page)));
+    const tramp_end = pageAlignUp(@intFromPtr(&timer_trampoline_page) + @sizeOf(@TypeOf(timer_trampoline_page)));
     const mmap_start = pageAlignDown(@intFromPtr(&mmap_buffer));
     const mmap_end = pageAlignUp(@intFromPtr(&mmap_buffer) + mmap_buffer.len);
     // カーネル自身が使う最低限の領域は free list から除外する。
@@ -1226,7 +1861,10 @@ fn collectMemoryStatsAndFreePages(
         .{ .start = pml4_start, .end = pml4_end },
         .{ .start = pdp_start, .end = pdp_end },
         .{ .start = pd_start, .end = pd_end },
+        .{ .start = high_mmio_pdp_start, .end = high_mmio_pdp_end },
+        .{ .start = high_mmio_pd_start, .end = high_mmio_pd_end },
         .{ .start = user_spaces_start, .end = user_spaces_end },
+        .{ .start = thread_contexts_start, .end = thread_contexts_end },
         .{ .start = free_list_start, .end = free_list_end },
         .{ .start = kernel_state_start, .end = kernel_state_end },
         .{ .start = ring0_stack_start, .end = ring0_stack_end },
@@ -1269,6 +1907,112 @@ pub fn main() void {
         serialWrite("boot services missing\n");
         while (true) asm volatile ("hlt");
     };
+    const framebuffer_info: ?FramebufferInfo = if (enable_framebuffer_server_step1)
+        (acquireFramebufferInfo(bs) orelse {
+            serialWrite("GraphicsOutput unavailable or mode unsupported for framebuffer server\n");
+            while (true) asm volatile ("hlt");
+        })
+    else
+        null;
+    const disk_framebuffer_server_elf: ?[]const u8 = if (enable_framebuffer_server_step1)
+        (if (enable_boot_log_console_process)
+            null
+        else
+            (loadFramebufferServerElfFromDisk(bs) orelse {
+                serialWrite("disk framebuffer server ELF load failed\n");
+                while (true) asm volatile ("hlt");
+            }))
+    else
+        null;
+    const disk_draw_client_elf: ?[]const u8 = if (enable_framebuffer_server_step1)
+        (if (enable_boot_log_console_process)
+            null
+        else
+            (loadDrawClientElfFromDisk(bs) orelse {
+                serialWrite("disk draw client ELF load failed\n");
+                while (true) asm volatile ("hlt");
+            }))
+    else
+        null;
+    const disk_boot_log_console_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process)
+        (loadBootLogConsoleElfFromDisk(bs) orelse {
+            serialWrite("disk boot log console ELF load failed\n");
+            while (true) asm volatile ("hlt");
+        })
+    else
+        null;
+    const disk_mouse_driver_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process and enable_virtio_input_mouse)
+        (loadMouseDriverElfFromDisk(bs) orelse {
+            serialWrite("disk mouse driver ELF load failed\n");
+            while (true) asm volatile ("hlt");
+        })
+    else
+        null;
+    const disk_compositor_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process and enable_virtio_input_mouse)
+        (loadCompositorElfFromDisk(bs) orelse {
+            serialWrite("disk compositor ELF load failed\n");
+            while (true) asm volatile ("hlt");
+        })
+    else
+        null;
+    const disk_user_elf: ?[]const u8 = if (enable_framebuffer_server_step1)
+        null
+    else
+        (loadUserElfFromDisk(bs) orelse {
+            serialWrite("disk user ELF load failed\n");
+            while (true) asm volatile ("hlt");
+        });
+    if (enable_framebuffer_server_step1) {
+        if (enable_boot_log_console_process) {
+            if (enable_virtio_input_mouse) {
+                serialWrite("mouse driver ELF loaded from disk\n");
+                serialWrite("  path=");
+                serialWrite(mouse_driver_elf_disk_path_log);
+                serialWrite("\n");
+                serialWrite("  size=");
+                printNumber(disk_mouse_driver_elf.?.len);
+                serialWrite(" bytes\n");
+                serialWrite("compositor ELF loaded from disk\n");
+                serialWrite("  path=");
+                serialWrite(compositor_elf_disk_path_log);
+                serialWrite("\n");
+                serialWrite("  size=");
+                printNumber(disk_compositor_elf.?.len);
+                serialWrite(" bytes\n");
+            } else {
+                serialWrite("boot log console ELF loaded from disk\n");
+                serialWrite("  path=");
+                serialWrite(boot_log_console_elf_disk_path_log);
+                serialWrite("\n");
+                serialWrite("  size=");
+                printNumber(disk_boot_log_console_elf.?.len);
+                serialWrite(" bytes\n");
+            }
+        } else {
+            serialWrite("draw client ELF loaded from disk\n");
+            serialWrite("  path=");
+            serialWrite(draw_client_elf_disk_path_log);
+            serialWrite("\n");
+            serialWrite("  size=");
+            printNumber(disk_draw_client_elf.?.len);
+            serialWrite(" bytes\n");
+            serialWrite("framebuffer server ELF loaded from disk\n");
+            serialWrite("  path=");
+            serialWrite(framebuffer_server_elf_disk_path_log);
+            serialWrite("\n");
+            serialWrite("  size=");
+            printNumber(disk_framebuffer_server_elf.?.len);
+            serialWrite(" bytes\n");
+        }
+    } else {
+        serialWrite("user ELF loaded from disk\n");
+        serialWrite("  path=");
+        serialWrite(user_elf_disk_path_log);
+        serialWrite("\n");
+        serialWrite("  size=");
+        printNumber(disk_user_elf.?.len);
+        serialWrite(" bytes\n");
+    }
     const memory_stats = collectMemoryStatsAndFreePages(bs, &global_free_list) orelse {
         serialWrite("memory map parse failed\n");
         while (true) asm volatile ("hlt");
@@ -1305,7 +2049,9 @@ pub fn main() void {
     if (debug_skip_cr3_switch) {
         serialWrite("[debug] skip CR3 switch\n");
     } else {
-        serialWrite("build page tables (identity 0..4GiB)\n");
+        serialWrite("build page tables (identity 0..");
+        printNumber(pd_table_count);
+        serialWrite("GiB, plus 512..1024GiB mmio)\n");
         if (!installIdentityPageTables0To1GiB()) {
             serialWrite("page table install failed\n");
             while (true) asm volatile ("hlt");
@@ -1315,11 +2061,37 @@ pub fn main() void {
         serialWrite("CR3 switched to custom PML4\n");
     }
     initIdtPageFaultOnly();
-    serialWrite("IDT loaded (#PF/#GP/#DF/#INT80)\n");
+    serialWrite("IDT loaded (#PF/#GP/#DF/#INT80/#LAPIC-TIMER)\n");
+    asm volatile ("cli");
+    if (!lapic.initTimer(lapic_timer_vector, lapic_timer_initial_count)) {
+        serialWrite("LAPIC timer init failed\n");
+        while (true) asm volatile ("hlt");
+    }
+    serialWrite("LAPIC timer enabled\n");
+    if (!elf_loader.probe()) {
+        serialWrite("ELF loader probe failed\n");
+        while (true) asm volatile ("hlt");
+    }
+    serialWrite("ELF loader PIE+RELATIVE ready\n");
     if (debug_trigger_page_fault_test) {
         triggerPageFaultTest();
     }
-    serialWrite("enter bare-metal capability demo\n");
+    serialWrite("enter bare-metal capability kernel\n");
+    capability.init(.{
+        .user_spaces = user_spaces[0..],
+        .user_va = user_va,
+        .physical_map_limit = one_tib,
+        .page_entries = page_entries,
+        .page_addr_mask = page_addr_mask,
+        .page_present = page_present,
+        .page_rw = page_rw,
+        .page_user = page_user,
+        .canonical_user_limit_exclusive = canonical_user_limit_exclusive,
+        .serial_write = serialWrite,
+        .print_hex = printHex,
+        .principal_label = principalLabel,
+        .flush_user_tlb_for_principal_va = flushUserTlbForPrincipalVa,
+    });
 
     var state = kernel.KernelState.initFromDetectedRegions(memory_stats.detected_regions) catch |err| {
         serialWrite("region init failed: ");
@@ -1327,125 +2099,583 @@ pub fn main() void {
         serialWrite("\n");
         while (true) asm volatile ("hlt");
     };
-    state.pte_sync_hook = syncPageTableRightsForPaddr;
-    const user_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
-        serialWrite("allocPageTo for user map failed: ");
-        serialWrite(@errorName(err));
-        serialWrite("\n");
-        while (true) asm volatile ("hlt");
-    };
-    const user_stack_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
-        serialWrite("allocPageTo for user stack failed: ");
-        serialWrite(@errorName(err));
-        serialWrite("\n");
-        while (true) asm volatile ("hlt");
-    };
-    if (!buildUserAddressSpaceFromCapabilities(&state, .Process0, user_page, user_stack_page)) {
-        serialWrite("user page table build failed\n");
-        while (true) asm volatile ("hlt");
-    }
-    const user_page_p1 = state.allocPageTo(.Process1, &global_free_list) catch |err| {
-        serialWrite("allocPageTo for user map p1 failed: ");
-        serialWrite(@errorName(err));
-        serialWrite("\n");
-        while (true) asm volatile ("hlt");
-    };
-    const user_stack_page_p1 = state.allocPageTo(.Process1, &global_free_list) catch |err| {
-        serialWrite("allocPageTo for user stack p1 failed: ");
-        serialWrite(@errorName(err));
-        serialWrite("\n");
-        while (true) asm volatile ("hlt");
-    };
-    if (!buildUserAddressSpaceFromCapabilities(&state, .Process1, user_page_p1, user_stack_page_p1)) {
-        serialWrite("user page table build failed (p1)\n");
-        while (true) asm volatile ("hlt");
+    state.pte_sync_hook = capability.syncPageTableRightsForPaddr;
+    var process0_user_page: ?kernel.PageCapability = null;
+    var process0_user_stack_page: ?kernel.PageCapability = null;
+    var framebuffer_server_user_page: ?kernel.PageCapability = null;
+    var framebuffer_server_user_stack_page: ?kernel.PageCapability = null;
+    var boot_log_console_page: ?kernel.PageCapability = null;
+    var boot_log_console_stack_page: ?kernel.PageCapability = null;
+    var mouse_driver_runtime_stack_page: ?kernel.PageCapability = null;
+    var mouse_driver_config_page: ?kernel.PageCapability = null;
+    var mouse_shared_page: ?kernel.PageCapability = null;
+    var mouse_modern_info: ?virtio_probe.MouseModernInfo = null;
+    var mouse_driver_cfg: ?MouseDriverConfig = null;
+
+    if (enable_virtio_input_mouse and enable_framebuffer_server_step1 and enable_boot_log_console_process) {
+        mouse_modern_info = virtio_probe.probeMouseModern(serialWrite);
+        if (mouse_modern_info) |info| {
+            mouse_driver_cfg = .{
+                .common = mmioPageWithOffset(info.common_cfg),
+                .notify = mmioPageWithOffset(info.notify_cfg),
+                .isr = mmioPageWithOffset(info.isr_cfg),
+                .device = mmioPageWithOffset(info.device_cfg),
+                .notify_off_multiplier = info.notify_off_multiplier,
+            };
+            serialWrite("virtio-input: modern probe ready for MouseDriverProcess\n");
+            serialWrite("  pci=");
+            printHex(@as(u64, info.location.bus));
+            serialWrite(":");
+            printHex(@as(u64, info.location.device));
+            serialWrite(".");
+            printHex(@as(u64, info.location.function));
+            serialWrite("\n");
+            serialWrite("  common=");
+            printHex(info.common_cfg);
+            serialWrite("\n");
+            serialWrite("  notify=");
+            printHex(info.notify_cfg);
+            serialWrite("\n");
+            serialWrite("  isr=");
+            printHex(info.isr_cfg);
+            serialWrite("\n");
+            serialWrite("  device=");
+            printHex(info.device_cfg);
+            serialWrite("\n");
+            serialWrite("  notify_off_multiplier=");
+            printNumber(info.notify_off_multiplier);
+            serialWrite("\n");
+        } else {
+            serialWrite("virtio-input: MouseDriverProcess disabled (modern input not found)\n");
+        }
     }
 
-    current_user_principal = .Process0;
-    user_cr3_value = currentUserSpace().cr3;
+    if (enable_framebuffer_server_step1) {
+        if (enable_boot_log_console_process) {
+            if (enable_virtio_input_mouse and mouse_driver_cfg != null) {
+                process0_user_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+                    serialWrite("allocPageTo for mouse driver user map failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                process0_user_stack_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+                    serialWrite("allocPageTo for mouse driver user stack failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                mouse_driver_runtime_stack_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+                    serialWrite("allocPageTo for mouse driver runtime stack failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                mouse_driver_config_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+                    serialWrite("allocPageTo for mouse driver config failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                mouse_shared_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+                    serialWrite("allocPageTo for mouse shared page failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                if (!buildUserAddressSpaceFromCapabilities(&state, .Process0, process0_user_page.?, process0_user_stack_page.?)) {
+                    serialWrite("mouse driver process page table build failed\n");
+                    while (true) asm volatile ("hlt");
+                }
+                if (!mapUserLinearRegion(.Process0, mouse_driver_config_va, mouse_driver_config_page.?.paddr, 4096, true)) {
+                    serialWrite("mouse driver config page map failed\n");
+                    while (true) asm volatile ("hlt");
+                }
+                if (!mapUserLinearRegion(.Process0, mouse_shared_driver_va, mouse_shared_page.?.paddr, 4096, true)) {
+                    serialWrite("mouse shared page map failed (Process0)\n");
+                    while (true) asm volatile ("hlt");
+                }
+                if (!mapUserLinearRegion(.Process0, boot_log_console_stack_page_va, mouse_driver_runtime_stack_page.?.paddr, 4096, true)) {
+                    serialWrite("mouse driver runtime stack map failed\n");
+                    while (true) asm volatile ("hlt");
+                }
+
+                const cfg = mouse_driver_cfg.?;
+                const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false };
+                const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false };
+                state.installCap(.Process1, mouse_shared_page.?.paddr, .{
+                    .cpu_read = true,
+                    .cpu_write = true,
+                    .dma = false,
+                }) catch |err| {
+                    serialWrite("mouse shared page cap install for Process1 failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                state.installCap(.Process0, cfg.common.page_paddr, mmio_rw_rights) catch |err| {
+                    serialWrite("mouse driver install common cap failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                state.installCap(.Process0, cfg.notify.page_paddr, mmio_rw_rights) catch |err| {
+                    serialWrite("mouse driver install notify cap failed: ");
+                    serialWrite(@errorName(err));
+                    serialWrite("\n");
+                    while (true) asm volatile ("hlt");
+                };
+                if (cfg.isr.page_paddr != 0) {
+                    state.installCap(.Process0, cfg.isr.page_paddr, mmio_ro_rights) catch |err| {
+                        serialWrite("mouse driver install isr cap failed: ");
+                        serialWrite(@errorName(err));
+                        serialWrite("\n");
+                        while (true) asm volatile ("hlt");
+                    };
+                }
+                if (cfg.device.page_paddr != 0) {
+                    state.installCap(.Process0, cfg.device.page_paddr, mmio_ro_rights) catch |err| {
+                        serialWrite("mouse driver install device cap failed: ");
+                        serialWrite(@errorName(err));
+                        serialWrite("\n");
+                        while (true) asm volatile ("hlt");
+                    };
+                }
+                publishMouseDriverConfigPage(mouse_driver_config_page.?.paddr, cfg);
+                if (!initThreadContext(0, .Process0)) {
+                    serialWrite("mouse driver thread context init failed\n");
+                    while (true) asm volatile ("hlt");
+                }
+            }
+
+            framebuffer_server_user_page = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for boot log console user map failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            framebuffer_server_user_stack_page = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for boot log console user stack failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            boot_log_console_page = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for boot log page failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            boot_log_console_stack_page = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for boot log console stack page failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            if (!buildUserAddressSpaceFromCapabilities(
+                &state,
+                .Process1,
+                framebuffer_server_user_page.?,
+                framebuffer_server_user_stack_page.?,
+            )) {
+                serialWrite("boot log console process page table build failed\n");
+                while (true) asm volatile ("hlt");
+            }
+            if (mouse_shared_page) |shared| {
+                if (!mapUserLinearRegion(.Process1, mouse_shared_draw_va, shared.paddr, 4096, true)) {
+                    serialWrite("mouse shared page map failed (Process1)\n");
+                    while (true) asm volatile ("hlt");
+                }
+            }
+            if (!initThreadContext(1, .Process1)) {
+                serialWrite("boot log console thread context init failed\n");
+                while (true) asm volatile ("hlt");
+            }
+            if (enable_virtio_input_mouse and process0_user_page != null) {
+                if (!activateThread(0)) {
+                    serialWrite("activate Thread0 failed\n");
+                    while (true) asm volatile ("hlt");
+                }
+            } else if (!activateThread(1)) {
+                serialWrite("activate Thread1 failed\n");
+                while (true) asm volatile ("hlt");
+            }
+        } else {
+            process0_user_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for draw client user map failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            process0_user_stack_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for draw client user stack failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            if (!buildUserAddressSpaceFromCapabilities(&state, .Process0, process0_user_page.?, process0_user_stack_page.?)) {
+                serialWrite("draw client process page table build failed\n");
+                while (true) asm volatile ("hlt");
+            }
+            if (!initThreadContext(0, .Process0)) {
+                serialWrite("draw client thread context init failed\n");
+                while (true) asm volatile ("hlt");
+            }
+
+            framebuffer_server_user_page = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for framebuffer user map failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            framebuffer_server_user_stack_page = state.allocPageTo(.Process1, &global_free_list) catch |err| {
+                serialWrite("allocPageTo for framebuffer user stack failed: ");
+                serialWrite(@errorName(err));
+                serialWrite("\n");
+                while (true) asm volatile ("hlt");
+            };
+            if (!buildUserAddressSpaceFromCapabilities(
+                &state,
+                .Process1,
+                framebuffer_server_user_page.?,
+                framebuffer_server_user_stack_page.?,
+            )) {
+                serialWrite("framebuffer process page table build failed\n");
+                while (true) asm volatile ("hlt");
+            }
+            if (!initThreadContext(1, .Process1)) {
+                serialWrite("framebuffer thread context init failed\n");
+                while (true) asm volatile ("hlt");
+            }
+            if (!activateThread(1)) {
+                serialWrite("activate Thread1 failed\n");
+                while (true) asm volatile ("hlt");
+            }
+        }
+    } else {
+        process0_user_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+            serialWrite("allocPageTo for user map failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+        process0_user_stack_page = state.allocPageTo(.Process0, &global_free_list) catch |err| {
+            serialWrite("allocPageTo for user stack failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+        if (!buildUserAddressSpaceFromCapabilities(&state, .Process0, process0_user_page.?, process0_user_stack_page.?)) {
+            serialWrite("user page table build failed\n");
+            while (true) asm volatile ("hlt");
+        }
+
+        if (!initThreadContext(0, .Process0)) {
+            serialWrite("thread context init failed\n");
+            while (true) asm volatile ("hlt");
+        }
+        if (!activateThread(0)) {
+            serialWrite("activate Thread0 failed\n");
+            while (true) asm volatile ("hlt");
+        }
+    }
+    scheduler_tick_accum = 0;
+    scheduler_switch_count = 0;
+    scheduler_int80_log_count = 0;
+    scheduler_race_log_count = 0;
     serialWrite("user page table ready\n");
     serialWrite("  user_va=");
     printHex(user_va);
     serialWrite("\n");
     serialWrite("  user_pa=");
-    printHex(user_page.paddr);
+    if (enable_framebuffer_server_step1) {
+        if (enable_boot_log_console_process) {
+            if (process0_user_page) |cap| {
+                printHex(cap.paddr);
+            } else {
+                printHex(framebuffer_server_user_page.?.paddr);
+            }
+        } else {
+            printHex(process0_user_page.?.paddr);
+        }
+    } else {
+        printHex(process0_user_page.?.paddr);
+    }
     serialWrite("\n");
     serialWrite("  user_stack_top=");
-    printHex(user_stack_top);
+    if (enable_framebuffer_server_step1 and enable_boot_log_console_process and mouse_driver_runtime_stack_page != null) {
+        printHex(boot_log_console_stack_top);
+    } else {
+        printHex(user_stack_top);
+    }
     serialWrite("\n");
     serialWrite("  user_stack_pa=");
-    printHex(user_stack_page.paddr);
+    if (enable_framebuffer_server_step1) {
+        if (enable_boot_log_console_process) {
+            if (mouse_driver_runtime_stack_page) |cap| {
+                printHex(cap.paddr);
+            } else if (process0_user_stack_page) |cap2| {
+                printHex(cap2.paddr);
+            } else {
+                printHex(boot_log_console_stack_page.?.paddr);
+            }
+        } else {
+            printHex(process0_user_stack_page.?.paddr);
+        }
+    } else {
+        printHex(process0_user_stack_page.?.paddr);
+    }
     serialWrite("\n");
     serialWrite("  process_count=");
     printNumber(user_process_count);
     serialWrite("\n");
-    serialWrite("  process0_cr3=");
-    printHex(user_spaces[0].cr3);
+    serialWrite("  thread_count=");
+    printNumber(user_thread_count);
     serialWrite("\n");
-    serialWrite("  process1_cr3=");
-    printHex(user_spaces[1].cr3);
-    serialWrite("\n");
-    if (debug_trigger_general_protection_test) {
-        installUserGeneralProtectionTestCode(user_page.paddr);
-    } else if (debug_trigger_dma_unmap_verify_demo) {
-        installUserDmaUnmapVerifyCode(user_page.paddr);
-    } else if (debug_trigger_pf_recovery_demo) {
-        installUserPfRecoveryDemoCode(user_page.paddr);
-    } else {
-        // 標準フロー:
-        // Process0 で #PF recover を確認し、syscall で Process1 へ切替、
-        // Process1 でも同シナリオを実行して最終 fatal #PF で停止する。
-        installUserPfRecoveryThenSwitchCode(user_page.paddr, 1);
-        installUserPfRecoveryDemoCode(user_page_p1.paddr);
-    }
-
-    var allocated: [3]u64 = undefined;
-    var i: usize = 0;
-    while (i < 3) : (i += 1) {
-        // free list から Process0 へ 3ページ配布する。
-        const cap = state.allocPageTo(.Process0, &global_free_list) catch |err| {
-            serialWrite("allocPageTo failed: ");
-            serialWrite(@errorName(err));
+    if (enable_framebuffer_server_step1) {
+        if (enable_boot_log_console_process) {
+            if (process0_user_page != null) {
+                serialWrite("  mouse_owner=Process0\n");
+                serialWrite("  process0_cr3=");
+                printHex(user_spaces[0].cr3);
+                serialWrite("\n");
+            }
+            if (enable_virtio_input_mouse) {
+                serialWrite("  compositor_owner=Process1\n");
+            } else {
+                serialWrite("  console_owner=Process1\n");
+            }
+        } else {
+            serialWrite("  process0_cr3=");
+            printHex(user_spaces[0].cr3);
             serialWrite("\n");
+            serialWrite("  server_owner=Process1\n");
+        }
+        serialWrite("  process1_cr3=");
+        printHex(user_spaces[1].cr3);
+        serialWrite("\n");
+        if (!enable_boot_log_console_process or thread_contexts[0].ready) {
+            serialWrite("  thread0_owner=");
+            serialWrite(principalLabel(thread_contexts[0].owner_process));
+            serialWrite("\n");
+            serialWrite("  thread0_ctx_rip=");
+            printHex(thread_contexts[0].frame.rip);
+            serialWrite("\n");
+        }
+        serialWrite("  thread1_owner=");
+        serialWrite(principalLabel(thread_contexts[1].owner_process));
+        serialWrite("\n");
+        serialWrite("  thread1_ctx_rip=");
+        printHex(thread_contexts[1].frame.rip);
+    } else {
+        serialWrite("  process0_cr3=");
+        printHex(user_spaces[0].cr3);
+        serialWrite("\n");
+        serialWrite("  thread0_owner=");
+        serialWrite(principalLabel(thread_contexts[0].owner_process));
+        serialWrite("\n");
+        serialWrite("  thread0_ctx_rip=");
+        printHex(thread_contexts[0].frame.rip);
+    }
+    serialWrite("\n");
+    serialWrite("  scheduler_quantum_ticks=");
+    printNumber(scheduler_quantum_ticks);
+    serialWrite("\n");
+    var loaded_elf: ?elf_loader.Image = null;
+    if (enable_framebuffer_server_step1) {
+        const info = framebuffer_info.?;
+        const framebuffer_cap = kernel.FramebufferCapability{
+            .paddr = info.paddr,
+            .size_bytes = info.size_bytes,
+            .width = info.width,
+            .height = info.height,
+            .pixels_per_scan_line = info.pixels_per_scan_line,
+            .pixel_format = info.pixel_format,
+            .allow_draw = true,
+        };
+        state.grantFramebufferCap(.Process1, framebuffer_cap) catch {
+            serialWrite("framebuffer capability grant failed\n");
             while (true) asm volatile ("hlt");
         };
-        allocated[i] = cap.paddr;
-    }
-
-    dumpCapabilityView(&state);
-    serialWrite("\nstart_dma ");
-    printHex(allocated[1]);
-    serialWrite("\n\n");
-
-    if (debug_trigger_dma_unmap_verify_demo) {
-        if (!mapUserPageFromCapability(&state, .Process0, user_dma_verify_va, allocated[1], true)) {
-            serialWrite("dma verify map setup failed\n");
+        if (!state.canDrawToFramebuffer(.Process1, framebuffer_cap.paddr, framebuffer_cap.size_bytes, true)) {
+            serialWrite("framebuffer capability check failed\n");
             while (true) asm volatile ("hlt");
         }
-        serialWrite("dma verify map prepared: ");
-        printHex(user_dma_verify_va);
-        serialWrite(" -> ");
-        printHex(allocated[1]);
+        if (!mapUserLinearRegion(.Process1, framebuffer_user_va, framebuffer_cap.paddr, framebuffer_cap.size_bytes, true)) {
+            serialWrite("framebuffer user mapping failed\n");
+            while (true) asm volatile ("hlt");
+        }
+        serialWrite("framebuffer server ready\n");
+        serialWrite("  draw_cap=Process1\n");
+        serialWrite("  mode=");
+        printNumber(info.mode);
+        serialWrite("\n");
+        serialWrite("  fb_paddr=");
+        printHex(framebuffer_cap.paddr);
+        serialWrite("\n");
+        serialWrite("  fb_size=");
+        printNumber(framebuffer_cap.size_bytes);
+        serialWrite(" bytes\n");
+        serialWrite("  fb_va=");
+        printHex(framebuffer_user_va);
+        serialWrite("\n");
+        serialWrite("  fb_resolution=");
+        printNumber(framebuffer_cap.width);
+        serialWrite("x");
+        printNumber(framebuffer_cap.height);
+        serialWrite("\n");
+        serialWrite("  fb_pitch=");
+        printNumber(framebuffer_cap.pixels_per_scan_line);
+        serialWrite("\n");
+        if (enable_boot_log_console_process) {
+            if (enable_virtio_input_mouse and mouse_driver_cfg != null) {
+                const loaded_mouse = loadUserElfIntoTwoPages(process0_user_page.?.paddr, process0_user_stack_page.?.paddr, disk_mouse_driver_elf.?) orelse {
+                    serialWrite("mouse driver ELF load into user page failed\n");
+                    while (true) asm volatile ("hlt");
+                };
+                const ctx0 = getThreadContext(0).?;
+                ctx0.frame.rip = loaded_mouse.entry;
+                ctx0.frame.rsp = boot_log_console_entry_rsp;
+                serialWrite("MouseDriver ELF mapped\n");
+                serialWrite("  base=");
+                printHex(user_elf_base_va);
+                serialWrite("\n");
+                serialWrite("  entry=");
+                printHex(loaded_mouse.entry);
+                serialWrite("\n");
+                serialWrite("  load_segments=");
+                printNumber(loaded_mouse.load_segment_len);
+                serialWrite("\n");
+                serialWrite("  cfg_va=");
+                printHex(mouse_driver_config_va);
+                serialWrite("\n");
+
+                publishMouseSharedPage(mouse_shared_page.?.paddr, info);
+                loaded_elf = loadUserElfIntoTwoPages(framebuffer_server_user_page.?.paddr, framebuffer_server_user_stack_page.?.paddr, disk_compositor_elf.?) orelse {
+                    serialWrite("compositor ELF load into user page failed\n");
+                    while (true) asm volatile ("hlt");
+                };
+                const ctx1 = getThreadContext(1).?;
+                ctx1.frame.rip = loaded_elf.?.entry;
+                ctx1.frame.rsp = user_entry_rsp;
+                serialWrite("Compositor ELF mapped\n");
+                serialWrite("  base=");
+                printHex(user_elf_base_va);
+                serialWrite("\n");
+                serialWrite("  entry=");
+                printHex(loaded_elf.?.entry);
+                serialWrite("\n");
+                serialWrite("  load_segments=");
+                printNumber(loaded_elf.?.load_segment_len);
+                serialWrite("\n");
+                serialWrite("  shared_va=");
+                printHex(mouse_shared_draw_va);
+                serialWrite("\n");
+                serialWrite("  fb_va=");
+                printHex(framebuffer_user_va);
+                serialWrite("\n");
+            } else {
+                if (!mapUserLinearRegion(.Process1, boot_log_console_stack_page_va, boot_log_console_stack_page.?.paddr, 4096, true)) {
+                    serialWrite("boot log console stack page map failed\n");
+                    while (true) asm volatile ("hlt");
+                }
+                if (!mapUserLinearRegion(.Process1, boot_log_user_va, boot_log_console_page.?.paddr, 4096, false)) {
+                    serialWrite("boot log page map failed\n");
+                    while (true) asm volatile ("hlt");
+                }
+                publishBootLogToUserPage(boot_log_console_page.?.paddr);
+                loaded_elf = loadUserElfIntoTwoPages(framebuffer_server_user_page.?.paddr, framebuffer_server_user_stack_page.?.paddr, disk_boot_log_console_elf.?) orelse {
+                    serialWrite("boot log console ELF load into user page failed\n");
+                    while (true) asm volatile ("hlt");
+                };
+                const ctx1 = getThreadContext(1).?;
+                ctx1.frame.rip = loaded_elf.?.entry;
+                ctx1.frame.rsp = boot_log_console_entry_rsp;
+                serialWrite("BootLogConsole ELF mapped\n");
+                serialWrite("  base=");
+                printHex(user_elf_base_va);
+                serialWrite("\n");
+                serialWrite("  entry=");
+                printHex(loaded_elf.?.entry);
+                serialWrite("\n");
+                serialWrite("  load_segments=");
+                printNumber(loaded_elf.?.load_segment_len);
+                serialWrite("\n");
+                serialWrite("  log_va=");
+                printHex(boot_log_user_va);
+                serialWrite("\n");
+                serialWrite("  log_bytes=");
+                printNumber(if (boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else boot_log_len);
+                serialWrite("\n");
+            }
+        } else {
+            const loaded_draw_client = loadUserElfIntoUserPage(process0_user_page.?.paddr, disk_draw_client_elf.?) orelse {
+                serialWrite("draw client ELF load into user page failed\n");
+                while (true) asm volatile ("hlt");
+            };
+            const ctx0 = getThreadContext(0).?;
+            ctx0.frame.rip = loaded_draw_client.entry;
+            serialWrite("DrawClient ELF mapped\n");
+            serialWrite("  base=");
+            printHex(user_elf_base_va);
+            serialWrite("\n");
+            serialWrite("  entry=");
+            printHex(loaded_draw_client.entry);
+            serialWrite("\n");
+            serialWrite("  load_segments=");
+            printNumber(loaded_draw_client.load_segment_len);
+            serialWrite("\n");
+            loaded_elf = loadUserElfIntoUserPage(framebuffer_server_user_page.?.paddr, disk_framebuffer_server_elf.?) orelse {
+                serialWrite("framebuffer server ELF load into user page failed\n");
+                while (true) asm volatile ("hlt");
+            };
+            const ctx1 = getThreadContext(1).?;
+            ctx1.frame.rip = loaded_elf.?.entry;
+            serialWrite("FramebufferServer ELF mapped\n");
+            serialWrite("  base=");
+            printHex(user_elf_base_va);
+            serialWrite("\n");
+            serialWrite("  entry=");
+            printHex(loaded_elf.?.entry);
+            serialWrite("\n");
+            serialWrite("  load_segments=");
+            printNumber(loaded_elf.?.load_segment_len);
+            serialWrite("\n");
+        }
+    } else {
+        loaded_elf = loadUserElfIntoUserPage(process0_user_page.?.paddr, disk_user_elf.?) orelse {
+            serialWrite("disk ELF load into user page failed\n");
+            while (true) asm volatile ("hlt");
+        };
+        const ctx0 = getThreadContext(0).?;
+        ctx0.frame.rip = loaded_elf.?.entry;
+        serialWrite("ELF image loaded\n");
+        serialWrite("  base=");
+        printHex(user_elf_base_va);
+        serialWrite("\n");
+        serialWrite("  entry=");
+        printHex(loaded_elf.?.entry);
+        serialWrite("\n");
+        serialWrite("  load_segments=");
+        printNumber(loaded_elf.?.load_segment_len);
         serialWrite("\n");
     }
 
-    state.startDma(allocated[1]) catch |err| {
-        serialWrite("DMA start failed: ");
-        serialWrite(@errorName(err));
-        serialWrite("\n");
-        return;
-    };
-    dumpCapabilityView(&state);
     kernel_state_global = state;
     kernel_state_ready = true;
-    if (debug_trigger_general_protection_test) {
-        serialWrite("\nenter ring3 with iretq (expected #GP by user CLI)\n");
-    } else if (debug_trigger_dma_unmap_verify_demo) {
-        serialWrite("\nenter ring3 with iretq (expected immediate #PF after start_dma unmap)\n");
-    } else if (debug_trigger_pf_recovery_demo) {
-        serialWrite("\nenter ring3 with iretq (expected #PF recover + final fatal #PF)\n");
+    if (enable_framebuffer_server_step1) {
+        if (enable_boot_log_console_process) {
+            if (process0_user_page != null and enable_virtio_input_mouse) {
+                serialWrite("\nenter ring3 with iretq (mouse driver + compositor)\n");
+            } else {
+                serialWrite("\nenter ring3 with iretq (boot log console)\n");
+            }
+        } else {
+            serialWrite("\nenter ring3 with iretq (framebuffer IPC mode)\n");
+        }
     } else {
-        serialWrite("\nenter ring3 with iretq (std #PF recover: Process0 then Process1)\n");
+        serialWrite("\nenter ring3 with iretq (disk PIE ELF)\n");
     }
-    enterUserModeIretq(user_va, user_stack_top);
+    const boot_ctx = getThreadContextConst(current_thread_index).?;
+    enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
 }

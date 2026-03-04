@@ -329,3 +329,37 @@ PAGE FAULT RESOLVED
 PAGE FAULT
   CR2=...
 ```
+
+---
+
+# IDT Step10: LAPIC Timer 導入（ring3 実行中の周期割り込み）
+
+## 目的
+- 外部割り込み経路を追加し、将来のプリエンプト型マルチタスクに必要な土台を作る。
+- user CR3 分離下でも、`int 0x80/#PF` と同じく安全に kernel へ遷移できるようにする。
+
+## 実装
+1. `kernel/src/lapic.zig` を追加。
+   - `IA32_APIC_BASE` MSR の read/write
+   - legacy PIC 全マスク
+   - LAPIC timer の periodic 設定
+   - `eoi()` 提供
+2. timer vector を `0x40` として IDT に登録。
+3. timer 用 CR3 切替トランポリンを追加し、user CR3 の bridge 範囲へ常時マップ。
+4. `timerInterruptHandlerStub` を追加。
+   - 入口で `kernel_cr3` へ切替
+   - `TrapFrame` 互換でレジスタ保存
+   - `timerInterruptDispatch()` 呼び出し
+   - 復帰前に `user_cr3` へ戻して `iretq`
+5. `timerInterruptDispatch()` で tick カウンタを更新し `LAPIC EOI` を発行。
+6. `int 0x80` は DPL3 interrupt gate (`0xEE`) に変更。
+   - syscall 中の IF クリアにより timer 割り込みのネストを防止。
+7. user への `iretq` で `RFLAGS.IF=1`（`0x202`）を設定し、ring3 実行中に timer 割り込みを許可。
+
+## 起動シーケンス上の位置
+- `IDT loaded` 後に `cli` で kernel 中断を抑止したまま `lapic.initTimer(...)` を実行。
+- ring3 へ入るまでは IF=0、ring3 開始時に IF=1 となる。
+
+## 注意
+- 現段階では scheduler 未実装のため、timer 割り込みは tick 更新のみ。
+- まだ「時分割で別プロセスへ切替」は行わない（次ステップ）。
