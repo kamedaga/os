@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const syscall_alloc_page: u64 = 0x1;
-const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
@@ -15,8 +13,10 @@ const isr_page_va: usize = 0x2000_6000;
 const device_page_va: usize = 0x2000_7000;
 const queue_page0_va: usize = 0x2000_8000;
 const queue_page1_va: usize = 0x2000_9000;
+const shared_page_va: usize = 0x3C00_6000;
 
 const config_magic: u64 = 0x4B455942; // "KEYB"
+const shared_magic: u64 = 0x4B534852; // "KSHR"
 
 const common_device_feature_select: usize = 0x00;
 const common_device_feature: usize = 0x04;
@@ -38,6 +38,9 @@ const status_driver_ok: u8 = 0x04;
 const event_type_syn: u16 = 0x00;
 const event_type_key: u16 = 0x01;
 const syn_report: u16 = 0x00;
+
+const key_left_shift: u16 = 0x2A;
+const key_right_shift: u16 = 0x36;
 
 const queue_index_event: u16 = 0;
 const queue_size: u16 = 8;
@@ -76,25 +79,6 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true });
-}
-
-fn allocPage() u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_alloc_page),
-        : .{ .memory = true });
-}
-
-fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_map_page),
-          [arg0] "{rdi}" (va),
-          [arg1] "{rsi}" (paddr),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
         : .{ .memory = true });
 }
 
@@ -195,6 +179,62 @@ fn queuePushAvail(desc_id: u16) void {
     avail_idx_ptr.* = avail_idx +% 1;
 }
 
+fn keycodeToAscii(code: u16, shift: bool) ?u8 {
+    return switch (code) {
+        0x02 => if (shift) '!' else '1',
+        0x03 => if (shift) '@' else '2',
+        0x04 => if (shift) '#' else '3',
+        0x05 => if (shift) '$' else '4',
+        0x06 => if (shift) '%' else '5',
+        0x07 => if (shift) '^' else '6',
+        0x08 => if (shift) '&' else '7',
+        0x09 => if (shift) '*' else '8',
+        0x0A => if (shift) '(' else '9',
+        0x0B => if (shift) ')' else '0',
+        0x0C => if (shift) '_' else '-',
+        0x0D => if (shift) '+' else '=',
+        0x0F => '\t',
+        0x10 => if (shift) 'Q' else 'q',
+        0x11 => if (shift) 'W' else 'w',
+        0x12 => if (shift) 'E' else 'e',
+        0x13 => if (shift) 'R' else 'r',
+        0x14 => if (shift) 'T' else 't',
+        0x15 => if (shift) 'Y' else 'y',
+        0x16 => if (shift) 'U' else 'u',
+        0x17 => if (shift) 'I' else 'i',
+        0x18 => if (shift) 'O' else 'o',
+        0x19 => if (shift) 'P' else 'p',
+        0x1A => if (shift) '{' else '[',
+        0x1B => if (shift) '}' else ']',
+        0x1C => '\n',
+        0x1E => if (shift) 'A' else 'a',
+        0x1F => if (shift) 'S' else 's',
+        0x20 => if (shift) 'D' else 'd',
+        0x21 => if (shift) 'F' else 'f',
+        0x22 => if (shift) 'G' else 'g',
+        0x23 => if (shift) 'H' else 'h',
+        0x24 => if (shift) 'J' else 'j',
+        0x25 => if (shift) 'K' else 'k',
+        0x26 => if (shift) 'L' else 'l',
+        0x27 => if (shift) ':' else ';',
+        0x28 => if (shift) '"' else '\'',
+        0x29 => if (shift) '~' else '`',
+        0x2B => if (shift) '|' else '\\',
+        0x2C => if (shift) 'Z' else 'z',
+        0x2D => if (shift) 'X' else 'x',
+        0x2E => if (shift) 'C' else 'c',
+        0x2F => if (shift) 'V' else 'v',
+        0x30 => if (shift) 'B' else 'b',
+        0x31 => if (shift) 'N' else 'n',
+        0x32 => if (shift) 'M' else 'm',
+        0x33 => if (shift) '<' else ',',
+        0x34 => if (shift) '>' else '.',
+        0x35 => if (shift) '?' else '/',
+        0x39 => ' ',
+        else => null,
+    };
+}
+
 pub export fn _start() noreturn {
     _ = userLog("KeyboardDriver: started\n");
     if (readCfgU64(0) != config_magic) {
@@ -212,6 +252,12 @@ pub export fn _start() noreturn {
     const _device_off: usize = @intCast(readCfgU64(8));
     _ = _device_off;
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
+    const shared_page_paddr = readCfgU64(10);
+
+    if (shared_page_paddr < 0x1000) {
+        _ = userLog("KeyboardDriver: invalid shared page paddr\n");
+        while (true) asm volatile ("pause");
+    }
 
     if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
         _ = userLog("KeyboardDriver: map common mmio failed\n");
@@ -294,10 +340,19 @@ pub export fn _start() noreturn {
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     _ = userLog("KeyboardDriver: queue ready\n");
 
+    const shared: [*]volatile u64 = @ptrFromInt(shared_page_va);
+    if (shared[0] != shared_magic) {
+        _ = userLog("KeyboardDriver: shared magic mismatch\n");
+        while (true) asm volatile ("pause");
+    }
+
     var last_used_idx: u16 = 0;
     var pending_code: u16 = 0;
     var pending_value: u32 = 0;
     var has_pending_key = false;
+    var pending_ascii: u8 = '?';
+    var has_pending_ascii = false;
+    var shift_down = false;
 
     while (true) {
         if (isr_base != 0) {
@@ -313,9 +368,18 @@ pub export fn _start() noreturn {
                 const ev = queueEventPtr(desc_id).*;
                 switch (ev.event_type) {
                     event_type_key => {
+                        if (ev.code == key_left_shift or ev.code == key_right_shift) {
+                            shift_down = ev.value != 0;
+                        }
                         pending_code = ev.code;
                         pending_value = ev.value;
                         has_pending_key = true;
+                        if (ev.value != 0) {
+                            if (keycodeToAscii(ev.code, shift_down)) |ascii| {
+                                pending_ascii = ascii;
+                                has_pending_ascii = true;
+                            }
+                        }
                     },
                     event_type_syn => {
                         if (ev.code == syn_report and has_pending_key) {
@@ -326,7 +390,14 @@ pub export fn _start() noreturn {
                                 .{ pending_code, pending_value },
                             ) catch "";
                             _ = userLog(msg);
+                            if (has_pending_ascii and pending_value != 0) {
+                                shared[2] = pending_ascii;
+                                shared[3] = pending_code;
+                                shared[4] = pending_value;
+                                shared[1] +%= 1;
+                            }
                             has_pending_key = false;
+                            has_pending_ascii = false;
                         }
                     },
                     else => {},

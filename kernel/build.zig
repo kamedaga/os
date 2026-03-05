@@ -165,6 +165,48 @@ pub fn build(b: *std.Build) void {
     const bootlog_sender_step = b.step("bootlog-sender-elf", "Build bootlog sender PIE ELF");
     bootlog_sender_step.dependOn(&install_bootlog_sender.step);
 
+    const mouse_button_demo_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/mouse_button_demo.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+    });
+    mouse_button_demo_mod.strip = true;
+    const mouse_button_demo_app = b.addExecutable(.{
+        .name = "MBTNDEMO",
+        .root_module = mouse_button_demo_mod,
+    });
+    mouse_button_demo_app.pie = true;
+    mouse_button_demo_app.entry = .{ .symbol_name = "_start" };
+    mouse_button_demo_app.link_z_common_page_size = 0x10;
+    mouse_button_demo_app.link_z_max_page_size = 0x10;
+    const install_mouse_button_demo = b.addInstallArtifact(mouse_button_demo_app, .{
+        .dest_sub_path = "EFI/BOOT/MBTNDEMO.ELF",
+    });
+    const mouse_button_demo_step = b.step("mouse-button-demo-elf", "Build mouse button demo PIE ELF");
+    mouse_button_demo_step.dependOn(&install_mouse_button_demo.step);
+
+    const keyboard_ascii_demo_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/keyboard_ascii_demo.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+    });
+    keyboard_ascii_demo_mod.strip = true;
+    const keyboard_ascii_demo_app = b.addExecutable(.{
+        .name = "KEYBDEMO",
+        .root_module = keyboard_ascii_demo_mod,
+    });
+    keyboard_ascii_demo_app.pie = true;
+    keyboard_ascii_demo_app.entry = .{ .symbol_name = "_start" };
+    keyboard_ascii_demo_app.link_z_common_page_size = 0x10;
+    keyboard_ascii_demo_app.link_z_max_page_size = 0x10;
+    const install_keyboard_ascii_demo = b.addInstallArtifact(keyboard_ascii_demo_app, .{
+        .dest_sub_path = "EFI/BOOT/KEYBDEMO.ELF",
+    });
+    const keyboard_ascii_demo_step = b.step("keyboard-ascii-demo-elf", "Build keyboard ASCII demo PIE ELF");
+    keyboard_ascii_demo_step.dependOn(&install_keyboard_ascii_demo.step);
+
     const mouse_draw_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/mouse_draw.zig"),
         .target = user_target,
@@ -237,6 +279,8 @@ pub fn build(b: *std.Build) void {
     install_efi.step.dependOn(&install_mouse_driver.step);
     install_efi.step.dependOn(&install_keyboard_driver.step);
     install_efi.step.dependOn(&install_bootlog_sender.step);
+    install_efi.step.dependOn(&install_mouse_button_demo.step);
+    install_efi.step.dependOn(&install_keyboard_ascii_demo.step);
     install_efi.step.dependOn(&install_mouse_draw.step);
     install_efi.step.dependOn(&install_compositor.step);
     install_efi.step.dependOn(&install_framebuffer_server.step);

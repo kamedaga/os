@@ -55,6 +55,7 @@ fn processIndex(principal: kernel.PrincipalId) ?usize {
         .Process1 => 1,
         .Process2 => 2,
         .Process3 => 3,
+        .Process4 => 4,
         else => null,
     };
 }
@@ -65,6 +66,7 @@ fn principalFromProcessIndex(index: usize) ?kernel.PrincipalId {
         1 => .Process1,
         2 => .Process2,
         3 => .Process3,
+        4 => .Process4,
         else => null,
     };
 }
@@ -347,6 +349,7 @@ pub fn dumpCapabilityView(state: *const kernel.KernelState) void {
     dumpPrincipalCaps(state, .Process1, "Process1");
     dumpPrincipalCaps(state, .Process2, "Process2");
     dumpPrincipalCaps(state, .Process3, "Process3");
+    dumpPrincipalCaps(state, .Process4, "Process4");
     dumpPrincipalCaps(state, .Device0, "Device0");
 }
 

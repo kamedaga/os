@@ -29,15 +29,7 @@ sudo mount ${LOOP}p1 /mnt/esp
 # 7) EFIコピー
 sudo mkdir -p /mnt/esp/EFI/BOOT
 sudo cp kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/USERAPP.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/DRAWCLI.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/BOOTLOG.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/MOUSEDRV.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/KEYBDRV.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/BLOGSND.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/COMPOS.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/MDRAW.ELF /mnt/esp/EFI/BOOT/
-sudo cp kernel/zig-out/bin/EFI/BOOT/FBSRV.ELF /mnt/esp/EFI/BOOT/
+sudo cp kernel/zig-out/bin/EFI/BOOT/*.ELF /mnt/esp/EFI/BOOT/
 
 # 8) 後処理
 sudo umount /mnt/esp

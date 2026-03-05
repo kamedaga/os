@@ -1,0 +1,218 @@
+const syscall_log: u64 = 0x9;
+const window_client = @import("window_client.zig");
+
+const keyboard_shared_page_va: usize = 0x3C00_6000;
+const virtual_framebuffer_va: usize = 0x3C00_4000;
+const window_meta_shared_va: usize = 0x3C00_7000;
+const window_cap_tmp_va: u64 = 0x201F_F000;
+
+const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
+const vfb_width: usize = 16;
+const vfb_height: usize = 32;
+const vfb_pitch: usize = 16;
+
+const panel_x: usize = 0;
+const panel_y: usize = 0;
+const panel_w: usize = 16;
+const panel_h: usize = 32;
+
+const glyph_w: usize = 5;
+const glyph_h: usize = 7;
+
+const history_capacity: usize = 6;
+const history_cols: usize = 2;
+const history_rows: usize = 3;
+const history_cell_w: usize = 6;
+const history_cell_h: usize = 8;
+
+fn userLog(message: []const u8) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_log),
+          [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
+          [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
+        : .{ .memory = true });
+}
+
+fn fillRect(vfb: [*]volatile u32, x: usize, y: usize, w: usize, h: usize, color: u32) void {
+    if (w == 0 or h == 0) return;
+    var yy: usize = y;
+    while (yy < y + h and yy < vfb_height) : (yy += 1) {
+        const row = yy * vfb_pitch;
+        var xx: usize = x;
+        while (xx < x + w and xx < vfb_width) : (xx += 1) {
+            vfb[row + xx] = color;
+        }
+    }
+}
+
+fn glyphRows(raw: u8) [glyph_h]u8 {
+    const ch: u8 = if (raw >= 'a' and raw <= 'z') raw - 32 else raw;
+    return switch (ch) {
+        'A' => .{ 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+        'B' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E },
+        'C' => .{ 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E },
+        'D' => .{ 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E },
+        'E' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F },
+        'F' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 },
+        'G' => .{ 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E },
+        'H' => .{ 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+        'I' => .{ 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F },
+        'J' => .{ 0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E },
+        'K' => .{ 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },
+        'L' => .{ 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F },
+        'M' => .{ 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 },
+        'N' => .{ 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 },
+        'O' => .{ 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+        'P' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 },
+        'Q' => .{ 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D },
+        'R' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 },
+        'S' => .{ 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E },
+        'T' => .{ 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        'U' => .{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+        'V' => .{ 0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04 },
+        'W' => .{ 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A },
+        'X' => .{ 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 },
+        'Y' => .{ 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 },
+        'Z' => .{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F },
+        '0' => .{ 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E },
+        '1' => .{ 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E },
+        '2' => .{ 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F },
+        '3' => .{ 0x1E, 0x01, 0x01, 0x06, 0x01, 0x01, 0x1E },
+        '4' => .{ 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 },
+        '5' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E },
+        '6' => .{ 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E },
+        '7' => .{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+        '8' => .{ 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E },
+        '9' => .{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x1C },
+        ' ' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        '.' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04 },
+        ',' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08 },
+        ':' => .{ 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00 },
+        ';' => .{ 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08 },
+        '-' => .{ 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00 },
+        '_' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F },
+        '/' => .{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00 },
+        '\\' => .{ 0x10, 0x08, 0x04, 0x02, 0x01, 0x00, 0x00 },
+        '[' => .{ 0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E },
+        ']' => .{ 0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E },
+        '(' => .{ 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 },
+        ')' => .{ 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 },
+        '+' => .{ 0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00 },
+        '=' => .{ 0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00 },
+        '*' => .{ 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00 },
+        '#' => .{ 0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A },
+        '!' => .{ 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04 },
+        '?' => .{ 0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04 },
+        '|' => .{ 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        '<' => .{ 0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02 },
+        '>' => .{ 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08 },
+        '\'' => .{ 0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00 },
+        '"' => .{ 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        '`' => .{ 0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00 },
+        '~' => .{ 0x00, 0x09, 0x16, 0x00, 0x00, 0x00, 0x00 },
+        else => .{ 0x0E, 0x11, 0x01, 0x06, 0x04, 0x00, 0x04 },
+    };
+}
+
+fn drawGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) void {
+    const glyph = glyphRows(ch);
+    var gy: usize = 0;
+    while (gy < glyph_h) : (gy += 1) {
+        const bits = glyph[gy];
+        const py = y + gy;
+        if (py >= vfb_height) continue;
+        const row = py * vfb_pitch;
+        var gx: usize = 0;
+        while (gx < glyph_w) : (gx += 1) {
+            if ((bits & (@as(u8, 1) << @intCast((glyph_w - 1) - gx))) == 0) continue;
+            const px = x + gx;
+            if (px >= vfb_width) continue;
+            vfb[row + px] = color;
+        }
+    }
+}
+
+fn normalizeHistoryChar(ch: u8) u8 {
+    if (ch == ' ') return '_';
+    if (ch == '\n') return 'E';
+    if (ch == '\t') return 'T';
+    if (ch < 0x20 or ch > 0x7E) return '?';
+    return ch;
+}
+
+fn pushAsciiHistory(history: *[history_capacity]u8, history_len: *usize, ch: u8) void {
+    if (history_len.* < history_capacity) {
+        history[history_len.*] = ch;
+        history_len.* += 1;
+        return;
+    }
+
+    var i: usize = 1;
+    while (i < history_capacity) : (i += 1) {
+        history[i - 1] = history[i];
+    }
+    history[history_capacity - 1] = ch;
+}
+
+fn drawKeyboardHistoryPanel(vfb: [*]volatile u32, history: []const u8) void {
+    fillRect(vfb, panel_x, panel_y, panel_w, panel_h, 0x00FD_FDFD);
+    fillRect(vfb, panel_x + 1, 1, 14, 30, 0x0060_6060);
+    fillRect(vfb, panel_x + 2, 2, 12, 28, 0x00EE_EEEE);
+
+    var i: usize = 0;
+    while (i < history.len) : (i += 1) {
+        const row = i / history_cols;
+        if (row >= history_rows) break;
+        const col = i % history_cols;
+        const x = panel_x + 2 + col * history_cell_w;
+        const y = 4 + row * history_cell_h;
+        drawGlyph(vfb, x, y, normalizeHistoryChar(history[i]), 0x0010_1010);
+    }
+}
+
+pub export fn _start() noreturn {
+    _ = userLog("KeyboardAsciiDemo: started\n");
+
+    const keyboard_shared: [*]const volatile u64 = @ptrFromInt(keyboard_shared_page_va);
+    if (keyboard_shared[0] != keyboard_shared_magic) {
+        _ = userLog("KeyboardAsciiDemo: keyboard shared magic mismatch\n");
+        while (true) asm volatile ("pause");
+    }
+
+    const window_created = window_client.createAndPublishWindow(
+        @intCast(vfb_width),
+        @intCast(vfb_height),
+        0,
+        window_cap_tmp_va,
+        virtual_framebuffer_va,
+        window_meta_shared_va,
+    );
+    if (!window_created) {
+        _ = userLog("KeyboardAsciiDemo: create window failed\n");
+        while (true) asm volatile ("pause");
+    }
+    window_client.setWindowTitle(window_meta_shared_va, "Keyboard Demo");
+
+    const vfb: [*]volatile u32 = @ptrFromInt(virtual_framebuffer_va);
+    var last_kbd_seq: u64 = 0;
+    var ascii_history: [history_capacity]u8 = [_]u8{' '} ** history_capacity;
+    var ascii_history_len: usize = 0;
+
+    drawKeyboardHistoryPanel(vfb, ascii_history[0..ascii_history_len]);
+
+    while (true) {
+        const kbd_seq = keyboard_shared[1];
+        if (kbd_seq != last_kbd_seq) {
+            last_kbd_seq = kbd_seq;
+            const key_value = keyboard_shared[4];
+            if (key_value != 0) {
+                const ascii: u8 = @intCast(keyboard_shared[2] & 0xFF);
+                pushAsciiHistory(&ascii_history, &ascii_history_len, ascii);
+            }
+            drawKeyboardHistoryPanel(vfb, ascii_history[0..ascii_history_len]);
+        }
+        asm volatile ("pause");
+    }
+}

@@ -5,6 +5,7 @@ pub const PrincipalId = enum(u8) {
     Process1,
     Process2,
     Process3,
+    Process4,
     Device0,
 };
 
@@ -14,7 +15,7 @@ pub const endpoint_to_process2: u64 = 0x12;
 
 fn isProcessPrincipal(principal: PrincipalId) bool {
     return switch (principal) {
-        .Process0, .Process1, .Process2, .Process3 => true,
+        .Process0, .Process1, .Process2, .Process3, .Process4 => true,
         .Device0 => false,
     };
 }
@@ -320,6 +321,72 @@ pub const VirtualFramebufferCapability = struct {
     allow_write: bool = false,
 };
 
+pub const WindowRights = packed struct(u16) {
+    read_meta: bool = false,
+    write_meta: bool = false,
+    write_pixels: bool = false,
+    control: bool = false,
+    _reserved: u12 = 0,
+};
+
+pub const WindowCap = packed struct {
+    magic: u32, // 'WCAP'
+    version: u16,
+    rights_bits: u16,
+    window_id: u32,
+    owner_pid: u32,
+    vfb_cap_paddr: u64,
+    meta_cap_paddr: u64,
+    vfb_size_bytes: u32,
+    vfb_page_count: u16,
+    pixels_per_scan_line: u16,
+    pixel_format: u32,
+    evt_cap_paddr: u64,
+    width: u16,
+    height: u16,
+    min_width: u16,
+    min_height: u16,
+    flags: u32,
+    z_hint: i32,
+    reserved0: u32,
+};
+
+pub const WindowMeta = extern struct {
+    magic: u32, // 'WMTA'
+    version: u16,
+    state: u16,
+    seq: u64,
+    pos_x: i32,
+    pos_y: i32,
+    width: u16,
+    height: u16,
+    title_len: u16,
+    title: [64]u8,
+};
+
+pub const WindowRecord = struct {
+    active: bool = false,
+    window_id: u32 = 0,
+    owner: PrincipalId = .Process0,
+    cap_paddr: u64 = 0,
+    vfb_paddr: u64 = 0,
+    meta_paddr: u64 = 0,
+    vfb_size_bytes: u32 = 0,
+    vfb_page_count: u16 = 0,
+    pixels_per_scan_line: u16 = 0,
+    width: u16 = 0,
+    height: u16 = 0,
+    flags: u32 = 0,
+    z_hint: i32 = 0,
+};
+
+pub const CreateWindowResult = struct {
+    window_cap_paddr: u64,
+    meta_paddr: u64,
+    vfb_first_paddr: u64,
+    vfb_page_count: u16,
+};
+
 pub const OwnershipView = enum {
     Process0,
     Device0,
@@ -329,25 +396,166 @@ pub const OwnershipView = enum {
 
 pub const KernelState = struct {
     pub const max_regions = 256;
-    const principal_count = 5;
+    const principal_count = 6;
     const max_total_caps = principal_count * CNode.max_caps;
+    pub const max_windows = 64;
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
-    cap_tables: [principal_count]CNode = .{ .{}, .{}, .{}, .{}, .{} },
-    endpoint_tables: [principal_count]EndpointCNode = .{ .{}, .{}, .{}, .{}, .{} },
-    cap_mailboxes: [principal_count]CapMailbox = .{ .{}, .{}, .{}, .{}, .{} },
-    framebuffer_caps: [principal_count]?FramebufferCapability = .{ null, null, null, null, null },
-    virtual_framebuffer_caps: [principal_count]?VirtualFramebufferCapability = .{ null, null, null, null, null },
+    cap_tables: [principal_count]CNode = [_]CNode{.{}} ** principal_count,
+    endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
+    cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
+    framebuffer_caps: [principal_count]?FramebufferCapability = [_]?FramebufferCapability{null} ** principal_count,
+    virtual_framebuffer_caps: [principal_count]?VirtualFramebufferCapability = [_]?VirtualFramebufferCapability{null} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
     next_cap_id: u64 = 1,
+    windows: [max_windows]WindowRecord = [_]WindowRecord{.{}} ** max_windows,
+    next_window_id: u32 = 1,
 
     fn allocCapId(self: *KernelState) u64 {
         const id = self.next_cap_id;
         self.next_cap_id +%= 1;
         return id;
+    }
+
+    fn pageAlignUp(value: u64) u64 {
+        return (value + 4095) & ~@as(u64, 4095);
+    }
+
+    pub fn allocWindowSlot(self: *KernelState) ?usize {
+        var i: usize = 0;
+        while (i < self.windows.len) : (i += 1) {
+            if (!self.windows[i].active) return i;
+        }
+        return null;
+    }
+
+    pub fn allocWindowId(self: *KernelState) u32 {
+        const id = self.next_window_id;
+        self.next_window_id +%= 1;
+        return id;
+    }
+
+    pub fn createWindow(
+        self: *KernelState,
+        owner: PrincipalId,
+        compositor: PrincipalId,
+        free_list: *FreePageList,
+        width: u16,
+        height: u16,
+        flags: u32,
+    ) KernelError!CreateWindowResult {
+        if (!isProcessPrincipal(owner) or !isProcessPrincipal(compositor)) return KernelError.InvalidState;
+        if (width == 0 or height == 0) return KernelError.InvalidState;
+        if (width > 2048 or height > 2048) return KernelError.InvalidState;
+
+        const slot = self.allocWindowSlot() orelse return KernelError.TableFull;
+
+        const pitch: u16 = width;
+        const pixel_count = @as(u64, width) * @as(u64, height);
+        const bytes_unaligned = pixel_count * 4;
+        if (bytes_unaligned == 0 or bytes_unaligned > (16 * 1024 * 1024)) return KernelError.InvalidState;
+        const bytes_aligned = pageAlignUp(bytes_unaligned);
+        const page_count_u64 = bytes_aligned / 4096;
+        if (page_count_u64 == 0 or page_count_u64 > 1024) return KernelError.InvalidState;
+        const page_count: usize = @intCast(page_count_u64);
+
+        const window_cap_page = try self.allocPageTo(owner, free_list);
+        const meta_page = try self.allocPageTo(owner, free_list);
+
+        var vfb_first_paddr: u64 = 0;
+        var i: usize = 0;
+        while (i < page_count) : (i += 1) {
+            const p = try self.allocPageTo(owner, free_list);
+            if (i == 0) vfb_first_paddr = p.paddr;
+            try self.grantCap(owner, compositor, p.paddr, .{
+                .cpu_read = true,
+                .cpu_write = false,
+                .dma = false,
+            });
+            const page_words: [*]volatile u64 = @ptrFromInt(p.paddr);
+            var w: usize = 0;
+            while (w < 512) : (w += 1) page_words[w] = 0;
+        }
+
+        try self.grantCap(owner, compositor, meta_page.paddr, .{
+            .cpu_read = true,
+            .cpu_write = false,
+            .dma = false,
+        });
+
+        const window_id = self.allocWindowId();
+        const rights = WindowRights{
+            .read_meta = true,
+            .write_meta = true,
+            .write_pixels = true,
+            .control = true,
+        };
+        const cap_bytes: [*]volatile u8 = @ptrFromInt(window_cap_page.paddr);
+        @memset(cap_bytes[0..4096], 0);
+        const cap_view: *volatile WindowCap = @ptrFromInt(window_cap_page.paddr);
+        cap_view.* = .{
+            .magic = 0x57434150, // 'WCAP'
+            .version = 1,
+            .rights_bits = @bitCast(rights),
+            .window_id = window_id,
+            .owner_pid = @intFromEnum(owner),
+            .vfb_cap_paddr = vfb_first_paddr,
+            .meta_cap_paddr = meta_page.paddr,
+            .vfb_size_bytes = @intCast(bytes_aligned),
+            .vfb_page_count = @intCast(page_count),
+            .pixels_per_scan_line = pitch,
+            .pixel_format = 0,
+            .evt_cap_paddr = 0,
+            .width = width,
+            .height = height,
+            .min_width = 16,
+            .min_height = 16,
+            .flags = flags,
+            .z_hint = 0,
+            .reserved0 = 0,
+        };
+
+        const meta_bytes: [*]volatile u8 = @ptrFromInt(meta_page.paddr);
+        @memset(meta_bytes[0..4096], 0);
+        const meta_view: *volatile WindowMeta = @ptrFromInt(meta_page.paddr);
+        meta_view.* = .{
+            .magic = 0x574D5441, // 'WMTA'
+            .version = 1,
+            .state = 1,
+            .seq = 1,
+            .pos_x = 64,
+            .pos_y = 64,
+            .width = width,
+            .height = height,
+            .title_len = 0,
+            .title = [_]u8{0} ** 64,
+        };
+
+        self.windows[slot] = .{
+            .active = true,
+            .window_id = window_id,
+            .owner = owner,
+            .cap_paddr = window_cap_page.paddr,
+            .vfb_paddr = vfb_first_paddr,
+            .meta_paddr = meta_page.paddr,
+            .vfb_size_bytes = @intCast(bytes_aligned),
+            .vfb_page_count = @intCast(page_count),
+            .pixels_per_scan_line = pitch,
+            .width = width,
+            .height = height,
+            .flags = flags,
+            .z_hint = 0,
+        };
+
+        return .{
+            .window_cap_paddr = window_cap_page.paddr,
+            .meta_paddr = meta_page.paddr,
+            .vfb_first_paddr = vfb_first_paddr,
+            .vfb_page_count = @intCast(page_count),
+        };
     }
 
     fn isRightsSubset(child: Rights, parent: Rights) bool {
@@ -368,16 +576,19 @@ pub const KernelState = struct {
         state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Process2)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Process3)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process4)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process1)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process2)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process3)] = .{};
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process4)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process1)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process2)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process3)] = .{};
+        state.cap_mailboxes[@intFromEnum(PrincipalId.Process4)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Device0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process0)].add(.{
             .endpoint_id = endpoint_to_process1,
@@ -392,6 +603,10 @@ pub const KernelState = struct {
             .target = .Process1,
         }) catch unreachable;
         state.endpoint_tables[@intFromEnum(PrincipalId.Process3)].add(.{
+            .endpoint_id = endpoint_to_process1,
+            .target = .Process1,
+        }) catch unreachable;
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process4)].add(.{
             .endpoint_id = endpoint_to_process1,
             .target = .Process1,
         }) catch unreachable;
@@ -419,16 +634,19 @@ pub const KernelState = struct {
         state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Process2)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Process3)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process4)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process1)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process2)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process3)] = .{};
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process4)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process1)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process2)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process3)] = .{};
+        state.cap_mailboxes[@intFromEnum(PrincipalId.Process4)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Device0)] = .{};
         try state.endpoint_tables[@intFromEnum(PrincipalId.Process0)].add(.{
             .endpoint_id = endpoint_to_process1,
@@ -443,6 +661,10 @@ pub const KernelState = struct {
             .target = .Process1,
         });
         try state.endpoint_tables[@intFromEnum(PrincipalId.Process3)].add(.{
+            .endpoint_id = endpoint_to_process1,
+            .target = .Process1,
+        });
+        try state.endpoint_tables[@intFromEnum(PrincipalId.Process4)].add(.{
             .endpoint_id = endpoint_to_process1,
             .target = .Process1,
         });

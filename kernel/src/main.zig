@@ -37,6 +37,9 @@ const mouse_shared_draw_va: u64 = user_aux_base_va + 0x3000;
 const virtual_framebuffer_app_va: u64 = user_aux_base_va + 0x4000;
 const virtual_framebuffer_compositor_va: u64 = user_aux_base_va + 0x4000;
 const framebuffer_user_va: u64 = user_aux_base_va + 0x5000;
+const keyboard_shared_driver_va: u64 = user_aux_base_va + 0x6000;
+const keyboard_shared_draw_va: u64 = user_aux_base_va + 0x6000;
+const window_meta_shared_va: u64 = user_aux_base_va + 0x7000;
 const framebuffer_window_bytes: u64 = two_mib - 0x5000; // reserve one page for compositor IPC mapping
 const virtual_framebuffer_width: u32 = 32;
 const virtual_framebuffer_height: u32 = 32;
@@ -109,6 +112,14 @@ const compositor_elf_disk_path: [*:0]const u16 = &[_:0]u16{
     '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'C', 'O', 'M', 'P', 'O', 'S', '.', 'E', 'L', 'F',
 };
 const compositor_elf_disk_path_log = "\\EFI\\BOOT\\COMPOS.ELF";
+const mouse_button_demo_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'M', 'B', 'T', 'N', 'D', 'E', 'M', 'O', '.', 'E', 'L', 'F',
+};
+const mouse_button_demo_elf_disk_path_log = "\\EFI\\BOOT\\MBTNDEMO.ELF";
+const keyboard_ascii_demo_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'K', 'E', 'Y', 'B', 'D', 'E', 'M', 'O', '.', 'E', 'L', 'F',
+};
+const keyboard_ascii_demo_elf_disk_path_log = "\\EFI\\BOOT\\KEYBDEMO.ELF";
 const boot_log_max_bytes: usize = 32 * 1024;
 const boot_log_page_header_bytes: usize = 8;
 const boot_log_page_payload_bytes: usize = 4096 - boot_log_page_header_bytes;
@@ -120,12 +131,16 @@ const mouse_shared_log_max_bytes: usize = 4096 - mouse_shared_header_bytes;
 const mouse_driver_config_magic: u64 = 0x4D4F5553; // "MOUS"
 const keyboard_driver_config_magic: u64 = 0x4B455942; // "KEYB"
 const mouse_shared_magic: u64 = 0x4D534852; // "MSHR"
+const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
+const window_meta_magic: u64 = 0x574D455441; // "WMETA"
+const window_meta_title_offset: usize = 16;
+const window_meta_title_max_bytes: usize = 64;
 
 const debug_skip_exit_boot_services = false;
 const debug_skip_cr3_switch = false;
 const debug_trigger_page_fault_test = false;
-const user_process_count: usize = 4;
-const user_thread_count: usize = 4;
+const user_process_count: usize = 5;
+const user_thread_count: usize = 5;
 const UserAddressSpace = capability.UserAddressSpace;
 
 const ThreadContext = struct {
@@ -147,6 +162,7 @@ var thread_contexts: [user_thread_count]ThreadContext = .{
     .{ .id = 1, .owner_process = .Process1 },
     .{ .id = 2, .owner_process = .Process2 },
     .{ .id = 3, .owner_process = .Process3 },
+    .{ .id = 4, .owner_process = .Process4 },
 };
 var global_free_list: kernel.FreePageList = .{};
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
@@ -199,6 +215,8 @@ var mouse_driver_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
 var keyboard_driver_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
 var bootlog_sender_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
 var compositor_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var mouse_button_demo_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
+var keyboard_ascii_demo_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
 var user_elf_load_window: [user_elf_max_size]u8 align(16) = undefined;
 var boot_log_buffer: [boot_log_max_bytes]u8 = [_]u8{0} ** boot_log_max_bytes;
 var boot_log_len: usize = 0;
@@ -215,6 +233,8 @@ var bootlog_gate_input_start_armed = false;
 var bootlog_gate_input_start_tick: u64 = 0;
 var bootlog_gate_start_thread0 = false;
 var bootlog_gate_start_thread3 = false;
+var bootlog_gate_start_thread2 = false;
+var bootlog_gate_start_thread4 = false;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -228,6 +248,7 @@ const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_create_window: u64 = 0xD;
 const syscall_batch_max_pages: usize = 64;
 
 const user_program_cfg: user_programs.Config = .{
@@ -275,6 +296,7 @@ const MouseDriverProcessSetup = struct {
     config_page: kernel.PageCapability,
     shared_page: kernel.PageCapability,
     virtual_framebuffer_page: kernel.PageCapability,
+    window_meta_page: kernel.PageCapability,
 };
 
 const BootLogConsoleProcessSetup = struct {
@@ -283,13 +305,18 @@ const BootLogConsoleProcessSetup = struct {
     boot_log_stack_page: kernel.PageCapability,
 };
 
-const BootLogSenderProcessSetup = struct {
+const MouseButtonDemoProcessSetup = struct {
     process: CreatedUserProcess,
 };
 
 const KeyboardDriverProcessSetup = struct {
     process: CreatedUserProcess,
     config_page: kernel.PageCapability,
+    shared_page: kernel.PageCapability,
+};
+
+const KeyboardAsciiDemoProcessSetup = struct {
+    process: CreatedUserProcess,
 };
 
 const BootRuntimeMode = enum {
@@ -309,13 +336,17 @@ const UserBootProcessSetup = struct {
     process2_user_stack_page: ?kernel.PageCapability = null,
     process3_user_page: ?kernel.PageCapability = null,
     process3_user_stack_page: ?kernel.PageCapability = null,
+    process4_user_page: ?kernel.PageCapability = null,
+    process4_user_stack_page: ?kernel.PageCapability = null,
     boot_log_console_page: ?kernel.PageCapability = null,
     boot_log_console_stack_page: ?kernel.PageCapability = null,
     mouse_driver_runtime_stack_page: ?kernel.PageCapability = null,
     mouse_driver_config_page: ?kernel.PageCapability = null,
     keyboard_driver_config_page: ?kernel.PageCapability = null,
     mouse_shared_page: ?kernel.PageCapability = null,
+    keyboard_shared_page: ?kernel.PageCapability = null,
     virtual_framebuffer_page: ?kernel.PageCapability = null,
+    window_meta_page: ?kernel.PageCapability = null,
 };
 
 const FramebufferInfo = struct {
@@ -539,6 +570,7 @@ fn processIndex(principal: kernel.PrincipalId) ?usize {
         .Process1 => 1,
         .Process2 => 2,
         .Process3 => 3,
+        .Process4 => 4,
         else => null,
     };
 }
@@ -549,6 +581,7 @@ fn principalLabel(principal: kernel.PrincipalId) []const u8 {
         .Process1 => "Process1",
         .Process2 => "Process2",
         .Process3 => "Process3",
+        .Process4 => "Process4",
         .Device0 => "Device0",
     };
 }
@@ -559,6 +592,7 @@ fn threadLabel(thread_index: usize) []const u8 {
         1 => "Thread1",
         2 => "Thread2",
         3 => "Thread3",
+        4 => "Thread4",
         else => "Thread?",
     };
 }
@@ -1050,6 +1084,20 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             }
             return syscall_ok;
         },
+        syscall_create_window => {
+            if (frame.rdi == 0 or frame.rsi == 0) return syscall_err_invalid;
+            if (frame.rdi > std.math.maxInt(u16) or frame.rsi > std.math.maxInt(u16)) return syscall_err_invalid;
+            const width: u16 = @intCast(frame.rdi);
+            const height: u16 = @intCast(frame.rsi);
+            const flags: u32 = @truncate(frame.rdx);
+            const created = state.createWindow(proc, .Process1, &global_free_list, width, height, flags) catch |err| switch (err) {
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                kernel.KernelError.OutOfFreePages => return syscall_err_alloc,
+                else => return syscall_err_alloc,
+            };
+            return created.window_cap_paddr;
+        },
         syscall_move_cap => {
             const to = switch (frame.rsi) {
                 0 => proc,
@@ -1067,6 +1115,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 1 => kernel.PrincipalId.Process1,
                 2 => kernel.PrincipalId.Process2,
                 3 => kernel.PrincipalId.Process3,
+                4 => kernel.PrincipalId.Process4,
                 else => return syscall_err_invalid,
             };
             const rights = capability.parseRights(frame.rdx);
@@ -1083,6 +1132,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 capability.dumpPrincipalCaps(state, .Process1, "Process1");
                 capability.dumpPrincipalCaps(state, .Process2, "Process2");
                 capability.dumpPrincipalCaps(state, .Process3, "Process3");
+                capability.dumpPrincipalCaps(state, .Process4, "Process4");
             }
             return syscall_ok;
         },
@@ -1118,6 +1168,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 capability.dumpPrincipalCaps(state, .Process1, "Process1");
                 capability.dumpPrincipalCaps(state, .Process2, "Process2");
                 capability.dumpPrincipalCaps(state, .Process3, "Process3");
+                capability.dumpPrincipalCaps(state, .Process4, "Process4");
             }
             return syscall_ok;
         },
@@ -1139,6 +1190,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 capability.dumpPrincipalCaps(state, .Process1, "Process1");
                 capability.dumpPrincipalCaps(state, .Process2, "Process2");
                 capability.dumpPrincipalCaps(state, .Process3, "Process3");
+                capability.dumpPrincipalCaps(state, .Process4, "Process4");
             }
             return syscall_ok;
         },
@@ -1888,6 +1940,7 @@ fn setupMouseDriverProcess(state: *kernel.KernelState, cfg: MouseDriverConfig) M
     const config_page = allocPageForProcessOrHalt(state, .Process0, "mouse driver", "config page");
     const shared_page = allocPageForProcessOrHalt(state, .Process0, "mouse driver", "shared page");
     const virtual_framebuffer_page = allocPageForProcessOrHalt(state, .Process0, "virtual framebuffer", "page");
+    const window_meta_page = allocPageForProcessOrHalt(state, .Process0, "window meta", "page");
 
     mapUserLinearRegionOrHalt(.Process0, mouse_driver_config_va, config_page.paddr, 4096, true, "mouse driver config page map failed");
     mapUserLinearRegionOrHalt(.Process0, mouse_shared_driver_va, shared_page.paddr, 4096, true, "mouse shared page map failed (Process0)");
@@ -1924,6 +1977,7 @@ fn setupMouseDriverProcess(state: *kernel.KernelState, cfg: MouseDriverConfig) M
         };
     }
     publishMouseDriverConfigPage(config_page.paddr, cfg, shared_page.paddr);
+    publishWindowMetaSharedPage(window_meta_page.paddr, "Input Demo");
 
     return .{
         .process = process,
@@ -1931,13 +1985,16 @@ fn setupMouseDriverProcess(state: *kernel.KernelState, cfg: MouseDriverConfig) M
         .config_page = config_page,
         .shared_page = shared_page,
         .virtual_framebuffer_page = virtual_framebuffer_page,
+        .window_meta_page = window_meta_page,
     };
 }
 
 fn setupKeyboardDriverProcess(state: *kernel.KernelState, cfg: MouseDriverConfig) KeyboardDriverProcessSetup {
     const process = createUserProcess(state, .Process3, 3, "keyboard driver");
     const config_page = allocPageForProcessOrHalt(state, .Process3, "keyboard driver", "config page");
+    const shared_page = allocPageForProcessOrHalt(state, .Process3, "keyboard driver", "shared page");
     mapUserLinearRegionOrHalt(.Process3, keyboard_driver_config_va, config_page.paddr, 4096, true, "keyboard driver config page map failed");
+    mapUserLinearRegionOrHalt(.Process3, keyboard_shared_driver_va, shared_page.paddr, 4096, true, "keyboard shared page map failed (Process3)");
 
     const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false };
     const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false };
@@ -1969,11 +2026,13 @@ fn setupKeyboardDriverProcess(state: *kernel.KernelState, cfg: MouseDriverConfig
             while (true) asm volatile ("hlt");
         };
     }
-    publishKeyboardDriverConfigPage(config_page.paddr, cfg);
+    publishKeyboardDriverConfigPage(config_page.paddr, cfg, shared_page.paddr);
+    publishKeyboardSharedPage(shared_page.paddr);
 
     return .{
         .process = process,
         .config_page = config_page,
+        .shared_page = shared_page,
     };
 }
 
@@ -1988,12 +2047,12 @@ fn setupBootLogConsoleProcess(state: *kernel.KernelState) BootLogConsoleProcessS
     };
 }
 
-fn setupBootLogSenderProcess(
+fn setupMouseButtonDemoProcess(
     state: *kernel.KernelState,
-    shared_page: kernel.PageCapability,
-) BootLogSenderProcessSetup {
-    const process = createUserProcess(state, .Process2, 2, "bootlog sender");
-    state.installCap(.Process2, shared_page.paddr, .{
+    mouse_shared_page: kernel.PageCapability,
+) MouseButtonDemoProcessSetup {
+    const process = createUserProcess(state, .Process2, 2, "mouse button demo");
+    state.installCap(.Process2, mouse_shared_page.paddr, .{
         .cpu_read = true,
         .cpu_write = false,
         .dma = false,
@@ -2003,11 +2062,42 @@ fn setupBootLogSenderProcess(
         serialWrite("\n");
         while (true) asm volatile ("hlt");
     };
-    mapUserLinearRegionOrHalt(.Process2, mouse_shared_draw_va, shared_page.paddr, 4096, false, "mouse shared page map failed (Process2)");
+    mapUserLinearRegionOrHalt(.Process2, mouse_shared_draw_va, mouse_shared_page.paddr, 4096, false, "mouse shared page map failed (Process2)");
     return .{ .process = process };
 }
 
-fn setupVirtualFramebufferSharing(state: *kernel.KernelState, vfb_page: kernel.PageCapability) void {
+fn setupKeyboardAsciiDemoProcess(
+    state: *kernel.KernelState,
+    keyboard_shared_page: ?kernel.PageCapability,
+) KeyboardAsciiDemoProcessSetup {
+    const process = createUserProcess(state, .Process4, 4, "keyboard ascii demo");
+    if (keyboard_shared_page) |shared_page| {
+        state.grantCap(.Process3, .Process4, shared_page.paddr, .{
+            .cpu_read = true,
+            .cpu_write = false,
+            .dma = false,
+        }) catch |err| {
+            serialWrite("keyboard shared page cap grant to Process4 failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+        mapUserLinearRegionOrHalt(.Process4, keyboard_shared_draw_va, shared_page.paddr, 4096, false, "keyboard shared page map failed (Process4)");
+    } else {
+        const fallback_page = allocPageForProcessOrHalt(state, .Process4, "keyboard ascii demo", "keyboard fallback shared page");
+        publishKeyboardSharedPage(fallback_page.paddr);
+        mapUserLinearRegionOrHalt(.Process4, keyboard_shared_draw_va, fallback_page.paddr, 4096, true, "keyboard fallback shared page map failed (Process4)");
+    }
+    return .{ .process = process };
+}
+
+fn setupVirtualFramebufferSharing(
+    state: *kernel.KernelState,
+    vfb_page: kernel.PageCapability,
+    window_meta_page: kernel.PageCapability,
+    include_process3: bool,
+    include_process4: bool,
+) void {
     state.grantCap(.Process0, .Process1, vfb_page.paddr, .{
         .cpu_read = true,
         .cpu_write = true,
@@ -2018,6 +2108,72 @@ fn setupVirtualFramebufferSharing(state: *kernel.KernelState, vfb_page: kernel.P
         serialWrite("\n");
         while (true) asm volatile ("hlt");
     };
+    state.grantCap(.Process0, .Process2, vfb_page.paddr, .{
+        .cpu_read = true,
+        .cpu_write = true,
+        .dma = false,
+    }) catch |err| {
+        serialWrite("virtual framebuffer cap grant to Process2 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    if (include_process3) {
+        state.grantCap(.Process0, .Process3, vfb_page.paddr, .{
+            .cpu_read = true,
+            .cpu_write = true,
+            .dma = false,
+        }) catch |err| {
+            serialWrite("virtual framebuffer cap grant to Process3 failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+    }
+    if (include_process4) {
+        state.grantCap(.Process0, .Process4, vfb_page.paddr, .{
+            .cpu_read = true,
+            .cpu_write = true,
+            .dma = false,
+        }) catch |err| {
+            serialWrite("virtual framebuffer cap grant to Process4 failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+    }
+    state.grantCap(.Process0, .Process1, window_meta_page.paddr, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = false,
+    }) catch |err| {
+        serialWrite("window meta cap grant to Process1 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    state.grantCap(.Process0, .Process2, window_meta_page.paddr, .{
+        .cpu_read = true,
+        .cpu_write = true,
+        .dma = false,
+    }) catch |err| {
+        serialWrite("window meta cap grant to Process2 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    if (include_process4) {
+        state.grantCap(.Process0, .Process4, window_meta_page.paddr, .{
+            .cpu_read = true,
+            .cpu_write = true,
+            .dma = false,
+        }) catch |err| {
+            serialWrite("window meta cap grant to Process4 failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+    }
 
     const vfb_cap = kernel.VirtualFramebufferCapability{
         .paddr = vfb_page.paddr,
@@ -2041,6 +2197,28 @@ fn setupVirtualFramebufferSharing(state: *kernel.KernelState, vfb_page: kernel.P
         serialWrite("\n");
         while (true) asm volatile ("hlt");
     };
+    state.grantVirtualFramebufferCap(.Process2, vfb_cap) catch |err| {
+        serialWrite("virtual framebuffer cap grant to Process2 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    if (include_process3) {
+        state.grantVirtualFramebufferCap(.Process3, vfb_cap) catch |err| {
+            serialWrite("virtual framebuffer cap grant to Process3 failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+    }
+    if (include_process4) {
+        state.grantVirtualFramebufferCap(.Process4, vfb_cap) catch |err| {
+            serialWrite("virtual framebuffer cap grant to Process4 failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+    }
 
     if (!state.canAccessVirtualFramebuffer(.Process0, vfb_page.paddr, 4096, true)) {
         serialWrite("virtual framebuffer cap check failed (Process0)\n");
@@ -2050,9 +2228,33 @@ fn setupVirtualFramebufferSharing(state: *kernel.KernelState, vfb_page: kernel.P
         serialWrite("virtual framebuffer cap check failed (Process1)\n");
         while (true) asm volatile ("hlt");
     }
+    if (!state.canAccessVirtualFramebuffer(.Process2, vfb_page.paddr, 4096, true)) {
+        serialWrite("virtual framebuffer cap check failed (Process2)\n");
+        while (true) asm volatile ("hlt");
+    }
+    if (include_process3 and !state.canAccessVirtualFramebuffer(.Process3, vfb_page.paddr, 4096, true)) {
+        serialWrite("virtual framebuffer cap check failed (Process3)\n");
+        while (true) asm volatile ("hlt");
+    }
+    if (include_process4 and !state.canAccessVirtualFramebuffer(.Process4, vfb_page.paddr, 4096, true)) {
+        serialWrite("virtual framebuffer cap check failed (Process4)\n");
+        while (true) asm volatile ("hlt");
+    }
 
     mapUserLinearRegionOrHalt(.Process0, virtual_framebuffer_app_va, vfb_page.paddr, 4096, true, "virtual framebuffer map failed (Process0)");
     mapUserLinearRegionOrHalt(.Process1, virtual_framebuffer_compositor_va, vfb_page.paddr, 4096, true, "virtual framebuffer map failed (Process1)");
+    mapUserLinearRegionOrHalt(.Process2, virtual_framebuffer_app_va, vfb_page.paddr, 4096, true, "virtual framebuffer map failed (Process2)");
+    if (include_process3) {
+        mapUserLinearRegionOrHalt(.Process3, virtual_framebuffer_app_va, vfb_page.paddr, 4096, true, "virtual framebuffer map failed (Process3)");
+    }
+    if (include_process4) {
+        mapUserLinearRegionOrHalt(.Process4, virtual_framebuffer_app_va, vfb_page.paddr, 4096, true, "virtual framebuffer map failed (Process4)");
+    }
+    mapUserLinearRegionOrHalt(.Process1, window_meta_shared_va, window_meta_page.paddr, 4096, false, "window meta map failed (Process1)");
+    mapUserLinearRegionOrHalt(.Process2, window_meta_shared_va, window_meta_page.paddr, 4096, true, "window meta map failed (Process2)");
+    if (include_process4) {
+        mapUserLinearRegionOrHalt(.Process4, window_meta_shared_va, window_meta_page.paddr, 4096, true, "window meta map failed (Process4)");
+    }
 
     const vfb_words: [*]volatile u64 = @ptrFromInt(vfb_page.paddr);
     var w: usize = 0;
@@ -2095,10 +2297,12 @@ fn activateThreadOrHalt(thread_index: usize) void {
     }
 }
 
-fn armBootLogGateDeferredInputStart(start_thread0: bool, start_thread3: bool) void {
+fn armBootLogGateDeferredInputStart(start_thread0: bool, start_thread3: bool, start_thread2: bool, start_thread4: bool) void {
     bootlog_gate_input_start_armed = false;
     bootlog_gate_start_thread0 = false;
     bootlog_gate_start_thread3 = false;
+    bootlog_gate_start_thread2 = false;
+    bootlog_gate_start_thread4 = false;
 
     if (start_thread0) {
         if (getThreadContext(0)) |ctx| {
@@ -2112,7 +2316,19 @@ fn armBootLogGateDeferredInputStart(start_thread0: bool, start_thread3: bool) vo
             bootlog_gate_start_thread3 = true;
         }
     }
-    if (!bootlog_gate_start_thread0 and !bootlog_gate_start_thread3) return;
+    if (start_thread2) {
+        if (getThreadContext(2)) |ctx| {
+            ctx.ready = false;
+            bootlog_gate_start_thread2 = true;
+        }
+    }
+    if (start_thread4) {
+        if (getThreadContext(4)) |ctx| {
+            ctx.ready = false;
+            bootlog_gate_start_thread4 = true;
+        }
+    }
+    if (!bootlog_gate_start_thread0 and !bootlog_gate_start_thread3 and !bootlog_gate_start_thread2 and !bootlog_gate_start_thread4) return;
 
     bootlog_gate_input_start_tick = lapic_tick_count + bootlog_gate_input_start_delay_ticks;
     bootlog_gate_input_start_armed = true;
@@ -2120,17 +2336,34 @@ fn armBootLogGateDeferredInputStart(start_thread0: bool, start_thread3: bool) vo
 
 fn tryStartBootLogGateDeferredInput() void {
     if (!bootlog_gate_input_start_armed) return;
-    if (lapic_tick_count < bootlog_gate_input_start_tick) return;
+    const mouse_ready = (boot_log_status_flags & boot_log_status_mouse_queue_ready) != 0;
+    const keyboard_ready = (boot_log_status_flags & boot_log_status_keyboard_queue_ready) != 0;
 
-    if (bootlog_gate_start_thread0) {
-        if (getThreadContext(0)) |ctx| ctx.ready = true;
+    if (lapic_tick_count >= bootlog_gate_input_start_tick) {
+        if (bootlog_gate_start_thread0) {
+            if (getThreadContext(0)) |ctx| ctx.ready = true;
+            bootlog_gate_start_thread0 = false;
+        }
+        if (bootlog_gate_start_thread3) {
+            if (getThreadContext(3)) |ctx| ctx.ready = true;
+            bootlog_gate_start_thread3 = false;
+        }
     }
-    if (bootlog_gate_start_thread3) {
-        if (getThreadContext(3)) |ctx| ctx.ready = true;
+
+    if (bootlog_gate_start_thread2 and mouse_ready) {
+        if (getThreadContext(2)) |ctx| ctx.ready = true;
+        bootlog_gate_start_thread2 = false;
     }
-    bootlog_gate_input_start_armed = false;
-    bootlog_gate_start_thread0 = false;
-    bootlog_gate_start_thread3 = false;
+    if (bootlog_gate_start_thread4 and keyboard_ready) {
+        if (getThreadContext(4)) |ctx| ctx.ready = true;
+        bootlog_gate_start_thread4 = false;
+    }
+
+    bootlog_gate_input_start_armed =
+        bootlog_gate_start_thread0 or
+        bootlog_gate_start_thread3 or
+        bootlog_gate_start_thread2 or
+        bootlog_gate_start_thread4;
 }
 
 fn setupUserProcessesForMode(
@@ -2169,6 +2402,7 @@ fn setupUserProcessesForMode(
                 result.process3_user_page = keyboard_driver_setup.process.user_page;
                 result.process3_user_stack_page = keyboard_driver_setup.process.user_stack_page;
                 result.keyboard_driver_config_page = keyboard_driver_setup.config_page;
+                result.keyboard_shared_page = keyboard_driver_setup.shared_page;
                 activateThreadOrHalt(3);
             }
         },
@@ -2180,6 +2414,7 @@ fn setupUserProcessesForMode(
             result.mouse_driver_config_page = mouse_driver_setup.config_page;
             result.mouse_shared_page = mouse_driver_setup.shared_page;
             result.virtual_framebuffer_page = mouse_driver_setup.virtual_framebuffer_page;
+            result.window_meta_page = mouse_driver_setup.window_meta_page;
 
             const boot_log_console_setup = setupBootLogConsoleProcess(state);
             result.framebuffer_server_user_page = boot_log_console_setup.process.user_page;
@@ -2187,13 +2422,28 @@ fn setupUserProcessesForMode(
             result.boot_log_console_page = boot_log_console_setup.boot_log_page;
             result.boot_log_console_stack_page = boot_log_console_setup.boot_log_stack_page;
 
-            setupVirtualFramebufferSharing(state, result.virtual_framebuffer_page.?);
+            var keyboard_shared_page_for_demo: ?kernel.PageCapability = null;
             if (keyboard_driver_cfg) |cfg| {
                 const keyboard_driver_setup = setupKeyboardDriverProcess(state, cfg);
                 result.process3_user_page = keyboard_driver_setup.process.user_page;
                 result.process3_user_stack_page = keyboard_driver_setup.process.user_stack_page;
                 result.keyboard_driver_config_page = keyboard_driver_setup.config_page;
+                result.keyboard_shared_page = keyboard_driver_setup.shared_page;
+                keyboard_shared_page_for_demo = keyboard_driver_setup.shared_page;
             }
+            const mouse_button_demo_setup = setupMouseButtonDemoProcess(
+                state,
+                result.mouse_shared_page.?,
+            );
+            result.process2_user_page = mouse_button_demo_setup.process.user_page;
+            result.process2_user_stack_page = mouse_button_demo_setup.process.user_stack_page;
+            if (keyboard_driver_cfg != null) {
+                const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, keyboard_shared_page_for_demo);
+                result.process4_user_page = keyboard_ascii_demo_setup.process.user_page;
+                result.process4_user_stack_page = keyboard_ascii_demo_setup.process.user_stack_page;
+            }
+
+            setupVirtualFramebufferSharing(state, result.virtual_framebuffer_page.?, result.window_meta_page.?, false, keyboard_driver_cfg != null);
             activateThreadOrHalt(1);
         },
         .MouseCompositor => {
@@ -2204,6 +2454,7 @@ fn setupUserProcessesForMode(
             result.mouse_driver_config_page = mouse_driver_setup.config_page;
             result.mouse_shared_page = mouse_driver_setup.shared_page;
             result.virtual_framebuffer_page = mouse_driver_setup.virtual_framebuffer_page;
+            result.window_meta_page = mouse_driver_setup.window_meta_page;
 
             const boot_log_console_setup = setupBootLogConsoleProcess(state);
             result.framebuffer_server_user_page = boot_log_console_setup.process.user_page;
@@ -2211,17 +2462,29 @@ fn setupUserProcessesForMode(
             result.boot_log_console_page = boot_log_console_setup.boot_log_page;
             result.boot_log_console_stack_page = boot_log_console_setup.boot_log_stack_page;
 
-            setupVirtualFramebufferSharing(state, result.virtual_framebuffer_page.?);
-            const bootlog_sender_setup = setupBootLogSenderProcess(state, result.mouse_shared_page.?);
-            result.process2_user_page = bootlog_sender_setup.process.user_page;
-            result.process2_user_stack_page = bootlog_sender_setup.process.user_stack_page;
+            var keyboard_shared_page_for_demo: ?kernel.PageCapability = null;
             if (keyboard_driver_cfg) |cfg| {
                 const keyboard_driver_setup = setupKeyboardDriverProcess(state, cfg);
                 result.process3_user_page = keyboard_driver_setup.process.user_page;
                 result.process3_user_stack_page = keyboard_driver_setup.process.user_stack_page;
                 result.keyboard_driver_config_page = keyboard_driver_setup.config_page;
+                result.keyboard_shared_page = keyboard_driver_setup.shared_page;
+                keyboard_shared_page_for_demo = keyboard_driver_setup.shared_page;
                 activateThreadOrHalt(3);
             }
+            const mouse_button_demo_setup = setupMouseButtonDemoProcess(
+                state,
+                result.mouse_shared_page.?,
+            );
+            result.process2_user_page = mouse_button_demo_setup.process.user_page;
+            result.process2_user_stack_page = mouse_button_demo_setup.process.user_stack_page;
+            if (keyboard_driver_cfg != null) {
+                const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, keyboard_shared_page_for_demo);
+                result.process4_user_page = keyboard_ascii_demo_setup.process.user_page;
+                result.process4_user_stack_page = keyboard_ascii_demo_setup.process.user_stack_page;
+            }
+
+            setupVirtualFramebufferSharing(state, result.virtual_framebuffer_page.?, result.window_meta_page.?, false, keyboard_driver_cfg != null);
             activateThreadOrHalt(0);
         },
     }
@@ -2347,6 +2610,14 @@ fn loadCompositorElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
     return loadElfFromDisk(bs, compositor_elf_disk_path, compositor_elf_staging[0..]);
 }
 
+fn loadMouseButtonDemoElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, mouse_button_demo_elf_disk_path, mouse_button_demo_elf_staging[0..]);
+}
+
+fn loadKeyboardAsciiDemoElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, keyboard_ascii_demo_elf_disk_path, keyboard_ascii_demo_elf_staging[0..]);
+}
+
 fn writeBootLogStatusToUserPage(user_page_paddr: u64) void {
     if (user_page_paddr < 0x1000) return;
     const page: [*]volatile u8 = @ptrFromInt(user_page_paddr);
@@ -2421,7 +2692,7 @@ fn publishMouseDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, sh
     words[10] = shared_page_paddr;
 }
 
-fn publishKeyboardDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig) void {
+fn publishKeyboardDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, shared_page_paddr: u64) void {
     const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
     var i: usize = 0;
     while (i < 512) : (i += 1) {
@@ -2438,6 +2709,37 @@ fn publishKeyboardDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig)
     words[7] = cfg.isr.page_offset;
     words[8] = cfg.device.page_offset;
     words[9] = cfg.notify_off_multiplier;
+    words[10] = shared_page_paddr;
+}
+
+fn publishKeyboardSharedPage(user_page_paddr: u64) void {
+    const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        words[i] = 0;
+    }
+    words[0] = keyboard_shared_magic;
+    words[1] = 1; // seq
+    words[2] = '?'; // ascii
+    words[3] = 0; // key code
+    words[4] = 0; // key value
+}
+
+fn publishWindowMetaSharedPage(user_page_paddr: u64, title: []const u8) void {
+    const bytes: [*]volatile u8 = @ptrFromInt(user_page_paddr);
+    const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        words[i] = 0;
+    }
+    words[0] = window_meta_magic;
+    words[1] = 1; // seq
+    const copy_len: usize = if (title.len < (window_meta_title_max_bytes - 1)) title.len else (window_meta_title_max_bytes - 1);
+    var j: usize = 0;
+    while (j < copy_len) : (j += 1) {
+        bytes[window_meta_title_offset + j] = title[j];
+    }
+    bytes[window_meta_title_offset + copy_len] = 0;
 }
 
 fn publishMouseSharedPage(user_page_paddr: u64, fb: FramebufferInfo) void {
@@ -2867,9 +3169,16 @@ pub fn main() void {
         })
     else
         null;
-    const disk_bootlog_sender_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process and enable_virtio_input_mouse)
-        (loadBootLogSenderElfFromDisk(bs) orelse {
-            serialWrite("disk bootlog sender ELF load failed\n");
+    const disk_mouse_button_demo_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process and enable_virtio_input_mouse)
+        (loadMouseButtonDemoElfFromDisk(bs) orelse {
+            serialWrite("disk mouse button demo ELF load failed\n");
+            while (true) asm volatile ("hlt");
+        })
+    else
+        null;
+    const disk_keyboard_ascii_demo_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process and enable_virtio_input_mouse and enable_virtio_input_keyboard)
+        (loadKeyboardAsciiDemoElfFromDisk(bs) orelse {
+            serialWrite("disk keyboard ascii demo ELF load failed\n");
             while (true) asm volatile ("hlt");
         })
     else
@@ -2898,12 +3207,12 @@ pub fn main() void {
                 serialWrite("  size=");
                 printNumber(disk_mouse_driver_elf.?.len);
                 serialWrite(" bytes\n");
-                serialWrite("bootlog sender ELF loaded from disk\n");
+                serialWrite("mouse button demo ELF loaded from disk\n");
                 serialWrite("  path=");
-                serialWrite(bootlog_sender_elf_disk_path_log);
+                serialWrite(mouse_button_demo_elf_disk_path_log);
                 serialWrite("\n");
                 serialWrite("  size=");
-                printNumber(disk_bootlog_sender_elf.?.len);
+                printNumber(disk_mouse_button_demo_elf.?.len);
                 serialWrite(" bytes\n");
                 serialWrite("compositor ELF loaded from disk\n");
                 serialWrite("  path=");
@@ -2927,6 +3236,13 @@ pub fn main() void {
                         serialWrite("\n");
                         serialWrite("  size=");
                         printNumber(disk_keyboard_driver_elf.?.len);
+                        serialWrite(" bytes\n");
+                        serialWrite("keyboard ascii demo ELF loaded from disk\n");
+                        serialWrite("  path=");
+                        serialWrite(keyboard_ascii_demo_elf_disk_path_log);
+                        serialWrite("\n");
+                        serialWrite("  size=");
+                        printNumber(disk_keyboard_ascii_demo_elf.?.len);
                         serialWrite(" bytes\n");
                     }
                 }
@@ -3072,6 +3388,8 @@ pub fn main() void {
     var process2_user_stack_page: ?kernel.PageCapability = null;
     var process3_user_page: ?kernel.PageCapability = null;
     var process3_user_stack_page: ?kernel.PageCapability = null;
+    var process4_user_page: ?kernel.PageCapability = null;
+    var process4_user_stack_page: ?kernel.PageCapability = null;
     var boot_log_console_page: ?kernel.PageCapability = null;
     var boot_log_console_stack_page: ?kernel.PageCapability = null;
     var mouse_driver_runtime_stack_page: ?kernel.PageCapability = null;
@@ -3170,6 +3488,8 @@ pub fn main() void {
     process2_user_stack_page = process_setup.process2_user_stack_page;
     process3_user_page = process_setup.process3_user_page;
     process3_user_stack_page = process_setup.process3_user_stack_page;
+    process4_user_page = process_setup.process4_user_page;
+    process4_user_stack_page = process_setup.process4_user_stack_page;
     boot_log_console_page = process_setup.boot_log_console_page;
     boot_log_console_stack_page = process_setup.boot_log_console_stack_page;
     mouse_driver_runtime_stack_page = process_setup.mouse_driver_runtime_stack_page;
@@ -3249,14 +3569,21 @@ pub fn main() void {
                     }
                 } else if (boot_runtime_mode == .BootLogGateCompositor) {
                     serialWrite("  console_owner=Process1\n");
+                    if (thread_contexts[2].ready) serialWrite("  mouse_button_demo_owner=Process2\n");
                     if (keyboard_driver_cfg != null and thread_contexts[3].ready) {
                         serialWrite("  keyboard_owner=Process3\n");
                     }
+                    if (thread_contexts[4].ready) {
+                        serialWrite("  keyboard_ascii_demo_owner=Process4\n");
+                    }
                 } else if (boot_runtime_mode == .MouseCompositor) {
                     serialWrite("  compositor_owner=Process1\n");
-                    if (thread_contexts[2].ready) serialWrite("  bootlog_sender_owner=Process2\n");
+                    if (thread_contexts[2].ready) serialWrite("  mouse_button_demo_owner=Process2\n");
                     if (keyboard_driver_cfg != null and thread_contexts[3].ready) {
                         serialWrite("  keyboard_owner=Process3\n");
+                    }
+                    if (thread_contexts[4].ready) {
+                        serialWrite("  keyboard_ascii_demo_owner=Process4\n");
                     }
                 }
 
@@ -3271,6 +3598,11 @@ pub fn main() void {
                 if (thread_contexts[3].ready) {
                     serialWrite("  process3_cr3=");
                     printHex(user_spaces[3].cr3);
+                    serialWrite("\n");
+                }
+                if (thread_contexts[4].ready) {
+                    serialWrite("  process4_cr3=");
+                    printHex(user_spaces[4].cr3);
                     serialWrite("\n");
                 }
                 if (boot_runtime_mode == .FramebufferIpc or thread_contexts[0].ready) {
@@ -3301,6 +3633,14 @@ pub fn main() void {
                     serialWrite("\n");
                     serialWrite("  thread3_ctx_rip=");
                     printHex(thread_contexts[3].frame.rip);
+                    serialWrite("\n");
+                }
+                if (thread_contexts[4].ready) {
+                    serialWrite("  thread4_owner=");
+                    serialWrite(principalLabel(thread_contexts[4].owner_process));
+                    serialWrite("\n");
+                    serialWrite("  thread4_ctx_rip=");
+                    printHex(thread_contexts[4].frame.rip);
                 }
             },
         }
@@ -3386,6 +3726,30 @@ pub fn main() void {
                     serialWrite("\n");
                 }
             }
+            if (process2_user_page != null and process2_user_stack_page != null) {
+                const loaded_mouse_button_demo = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process2,
+                    process2_user_page.?.paddr,
+                    process2_user_stack_page.?.paddr,
+                    disk_mouse_button_demo_elf.?,
+                    "mouse button demo ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(2, loaded_mouse_button_demo.entry, user_entry_rsp);
+                logElfLoadSummary("MouseButtonDemo ELF mapped", loaded_mouse_button_demo);
+            }
+            if (process4_user_page != null and process4_user_stack_page != null and disk_keyboard_ascii_demo_elf != null) {
+                const loaded_keyboard_ascii_demo = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process4,
+                    process4_user_page.?.paddr,
+                    process4_user_stack_page.?.paddr,
+                    disk_keyboard_ascii_demo_elf.?,
+                    "keyboard ascii demo ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(4, loaded_keyboard_ascii_demo.entry, user_entry_rsp);
+                logElfLoadSummary("KeyboardAsciiDemo ELF mapped", loaded_keyboard_ascii_demo);
+            }
             if (disk_compositor_elf) |compositor_image| {
                 armDeferredCompositorLaunch(
                     compositor_image,
@@ -3414,16 +3778,16 @@ pub fn main() void {
             }
 
             publishMouseSharedPage(mouse_shared_page.?.paddr, info);
-            const loaded_bootlog_sender = loadUserElfIntoProcessPagesOrHalt(
+            const loaded_mouse_button_demo = loadUserElfIntoProcessPagesOrHalt(
                 state,
                 .Process2,
                 process2_user_page.?.paddr,
                 process2_user_stack_page.?.paddr,
-                disk_bootlog_sender_elf.?,
-                "bootlog sender ELF load into user page failed\n",
+                disk_mouse_button_demo_elf.?,
+                "mouse button demo ELF load into user page failed\n",
             );
-            setThreadEntryIfReady(2, loaded_bootlog_sender.entry, user_entry_rsp);
-            logElfLoadSummary("BootLogSender ELF mapped", loaded_bootlog_sender);
+            setThreadEntryIfReady(2, loaded_mouse_button_demo.entry, user_entry_rsp);
+            logElfLoadSummary("MouseButtonDemo ELF mapped", loaded_mouse_button_demo);
 
             loaded_elf = loadUserElfIntoProcessPagesOrHalt(
                 state,
@@ -3459,6 +3823,18 @@ pub fn main() void {
                     printHex(keyboard_driver_config_va);
                     serialWrite("\n");
                 }
+            }
+            if (process4_user_page != null and process4_user_stack_page != null and disk_keyboard_ascii_demo_elf != null) {
+                const loaded_keyboard_ascii_demo = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process4,
+                    process4_user_page.?.paddr,
+                    process4_user_stack_page.?.paddr,
+                    disk_keyboard_ascii_demo_elf.?,
+                    "keyboard ascii demo ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(4, loaded_keyboard_ascii_demo.entry, user_entry_rsp);
+                logElfLoadSummary("KeyboardAsciiDemo ELF mapped", loaded_keyboard_ascii_demo);
             }
         },
         .BootLogConsole => {
@@ -3548,9 +3924,13 @@ pub fn main() void {
     switch (boot_runtime_mode) {
         .MouseCompositor => {
             if (keyboard_driver_cfg != null and thread_contexts[3].ready) {
-                serialWrite("\nenter ring3 with iretq (mouse driver + compositor + bootlog sender + keyboard driver)\n");
+                if (thread_contexts[4].ready) {
+                    serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse demo + keyboard driver + keyboard demo)\n");
+                } else {
+                    serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse demo + keyboard driver)\n");
+                }
             } else {
-                serialWrite("\nenter ring3 with iretq (mouse driver + compositor + bootlog sender)\n");
+                serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse demo)\n");
             }
         },
         .BootLogConsole => {
@@ -3562,9 +3942,13 @@ pub fn main() void {
         },
         .BootLogGateCompositor => {
             if (keyboard_driver_cfg != null and thread_contexts[3].ready) {
-                serialWrite("\nenter ring3 with iretq (boot log console + mouse + keyboard; Enter to launch compositor)\n");
+                if (thread_contexts[4].ready) {
+                    serialWrite("\nenter ring3 with iretq (boot log console + mouse demo + keyboard demo + mouse + keyboard; Enter to launch compositor)\n");
+                } else {
+                    serialWrite("\nenter ring3 with iretq (boot log console + mouse demo + mouse + keyboard; Enter to launch compositor)\n");
+                }
             } else {
-                serialWrite("\nenter ring3 with iretq (boot log console + mouse; Enter to launch compositor)\n");
+                serialWrite("\nenter ring3 with iretq (boot log console + mouse demo + mouse; Enter to launch compositor)\n");
             }
         },
         .FramebufferIpc => serialWrite("\nenter ring3 with iretq (framebuffer IPC mode)\n"),
@@ -3579,6 +3963,8 @@ pub fn main() void {
         armBootLogGateDeferredInputStart(
             thread_contexts[0].ready,
             keyboard_driver_cfg != null and thread_contexts[3].ready,
+            thread_contexts[2].ready,
+            thread_contexts[4].ready,
         );
     }
     const boot_ctx = getThreadContextConst(current_thread_index).?;
