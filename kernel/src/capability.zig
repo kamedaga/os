@@ -2,10 +2,15 @@ const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 
 pub const UserAddressSpace = struct {
+    pub const max_dynamic_pt_pages: usize = 512;
+    pub const no_pd_index: u16 = 0xFFFF;
+
     pml4: [512]u64 align(4096) = [_]u64{0} ** 512,
     pdp: [512]u64 align(4096) = [_]u64{0} ** 512,
     pd: [512]u64 align(4096) = [_]u64{0} ** 512,
-    pt: [512]u64 align(4096) = [_]u64{0} ** 512,
+    pt_pages: [max_dynamic_pt_pages][512]u64 align(4096) = [_][512]u64{[_]u64{0} ** 512} ** max_dynamic_pt_pages,
+    pt_page_pd_index: [max_dynamic_pt_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pt_pages,
+    pt_page_used_len: u16 = 0,
     cr3: u64 = 0,
 };
 
@@ -48,6 +53,8 @@ fn processIndex(principal: kernel.PrincipalId) ?usize {
     return switch (principal) {
         .Process0 => 0,
         .Process1 => 1,
+        .Process2 => 2,
+        .Process3 => 3,
         else => null,
     };
 }
@@ -56,6 +63,8 @@ fn principalFromProcessIndex(index: usize) ?kernel.PrincipalId {
     return switch (index) {
         0 => .Process0,
         1 => .Process1,
+        2 => .Process2,
+        3 => .Process3,
         else => null,
     };
 }
@@ -74,16 +83,10 @@ pub fn isUserCanonicalVa(va: u64) bool {
 
 pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     const space = getUserSpace(principal) orelse return null;
-    const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
-    const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
-    const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+    const pd_index = userPdIndexForVa(va) orelse return null;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
-    const user_pdp_index: usize = @intCast((runtime.user_va >> 30) & 0x1FF);
-    const user_pd_index: usize = @intCast((runtime.user_va >> 21) & 0x1FF);
-
-    if (pml4_index != 0 or pdp_index != user_pdp_index or pd_index != user_pd_index) return null;
-
-    const entry = space.pt[pt_index];
+    const slot = findPtSlotForPd(space, pd_index) orelse return null;
+    const entry = space.pt_pages[slot][pt_index];
     const paddr = entry & runtime.page_addr_mask;
     if (paddr == 0) return null;
     return paddr;
@@ -99,6 +102,49 @@ pub fn parseRights(bits: u64) kernel.Rights {
 
 fn pageAlignDown(addr: u64) u64 {
     return addr & ~@as(u64, 4095);
+}
+
+fn userPdIndexForVa(va: u64) ?usize {
+    const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
+    const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
+    const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+    const user_pdp_index: usize = @intCast((runtime.user_va >> 30) & 0x1FF);
+
+    if (pml4_index != 0 or pdp_index != user_pdp_index) return null;
+    return pd_index;
+}
+
+fn aliasVaForPdPt(pd_index: usize, pt_index: usize) u64 {
+    const user_pdp_index: u64 = (runtime.user_va >> 30) & 0x1FF;
+    return (user_pdp_index << 30) |
+        (@as(u64, @intCast(pd_index)) << 21) |
+        (@as(u64, @intCast(pt_index)) << 12);
+}
+
+fn findPtSlotForPd(space: *const UserAddressSpace, pd_index: usize) ?usize {
+    var slot: usize = 0;
+    const used_len: usize = @intCast(space.pt_page_used_len);
+    while (slot < used_len) : (slot += 1) {
+        if (space.pt_page_pd_index[slot] == pd_index) return slot;
+    }
+    return null;
+}
+
+fn ensurePtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
+    if (pd_index >= 512) return null;
+    if (findPtSlotForPd(space, pd_index)) |existing| return existing;
+
+    var used_len: usize = @intCast(space.pt_page_used_len);
+    if (used_len >= UserAddressSpace.max_dynamic_pt_pages) return null;
+
+    const slot = used_len;
+    space.pt_page_pd_index[slot] = @intCast(pd_index);
+    @memset(space.pt_pages[slot][0..], 0);
+    const pt_pa = @intFromPtr(&space.pt_pages[slot]);
+    space.pd[pd_index] = pt_pa | runtime.page_present | runtime.page_rw | runtime.page_user;
+    used_len += 1;
+    space.pt_page_used_len = @intCast(used_len);
+    return slot;
 }
 
 pub fn issuePageFaultCapability(
@@ -154,30 +200,32 @@ pub fn mapUserPageFromCapability(
     if ((paddr & 0xFFF) != 0) return false;
     if (paddr >= runtime.physical_map_limit) return false;
 
-    const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
-    const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
-    const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+    const pd_index = userPdIndexForVa(va) orelse return false;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
-    const user_pdp_index: usize = @intCast((runtime.user_va >> 30) & 0x1FF);
-    const user_pd_index: usize = @intCast((runtime.user_va >> 21) & 0x1FF);
-    if (pml4_index != 0 or pdp_index != user_pdp_index or pd_index != user_pd_index) return false;
+    const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
 
     const cap = state.getTableConst(principal).find(paddr) orelse return false;
     if (!cap.rights.cpu_read) return false;
     if (writable and !cap.rights.cpu_write) return false;
 
-    var i: usize = 0;
-    while (i < runtime.page_entries) : (i += 1) {
-        if (i == pt_index) continue;
-        const entry = space.pt[i];
-        if ((entry & runtime.page_addr_mask) != paddr) continue;
-        if (entry == 0) continue;
-        space.pt[i] = 0;
-        const alias_va = (runtime.user_va & ~@as(u64, 0x1F_FFFF)) + (@as(u64, i) * 4096);
-        runtime.flush_user_tlb_for_principal_va(principal, alias_va);
+    var slot: usize = 0;
+    const used_len: usize = @intCast(space.pt_page_used_len);
+    while (slot < used_len) : (slot += 1) {
+        const slot_pd_index_u16 = space.pt_page_pd_index[slot];
+        const slot_pd_index: usize = @intCast(slot_pd_index_u16);
+        var i: usize = 0;
+        while (i < runtime.page_entries) : (i += 1) {
+            if (slot == map_slot and i == pt_index) continue;
+            const entry = space.pt_pages[slot][i];
+            if ((entry & runtime.page_addr_mask) != paddr) continue;
+            if (entry == 0) continue;
+            space.pt_pages[slot][i] = 0;
+            const alias_va = aliasVaForPdPt(slot_pd_index, i);
+            runtime.flush_user_tlb_for_principal_va(principal, alias_va);
+        }
     }
 
-    space.pt[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     runtime.flush_user_tlb_for_principal_va(principal, va);
     return true;
 }
@@ -190,34 +238,42 @@ pub fn dropPresentForUserMappedPaddr(
     if (!runtime_ready) return false;
     const space = getUserSpace(principal) orelse return false;
     _ = state.getTableConst(principal).find(paddr) orelse return false;
-    const user_pt_base_va = runtime.user_va & ~@as(u64, 0x1F_FFFF);
-
-    var i: usize = 0;
-    while (i < runtime.page_entries) : (i += 1) {
-        const entry = space.pt[i];
-        if ((entry & runtime.page_addr_mask) != paddr) continue;
-        if ((entry & runtime.page_present) == 0) continue;
-        space.pt[i] = entry & ~runtime.page_present;
-        runtime.flush_user_tlb_for_principal_va(principal, user_pt_base_va + (@as(u64, i) * 4096));
-        return true;
+    var slot: usize = 0;
+    const used_len: usize = @intCast(space.pt_page_used_len);
+    while (slot < used_len) : (slot += 1) {
+        const slot_pd_index_u16 = space.pt_page_pd_index[slot];
+        const slot_pd_index: usize = @intCast(slot_pd_index_u16);
+        var i: usize = 0;
+        while (i < runtime.page_entries) : (i += 1) {
+            const entry = space.pt_pages[slot][i];
+            if ((entry & runtime.page_addr_mask) != paddr) continue;
+            if ((entry & runtime.page_present) == 0) continue;
+            space.pt_pages[slot][i] = entry & ~runtime.page_present;
+            runtime.flush_user_tlb_for_principal_va(principal, aliasVaForPdPt(slot_pd_index, i));
+            return true;
+        }
     }
     return false;
 }
 
-pub fn syncPageTableRightsForPaddr(state: *const kernel.KernelState, paddr: u64) void {
+pub fn syncPageTableRightsForPrincipalPaddr(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    paddr: u64,
+) void {
     if (!runtime_ready) return;
-    const user_pt_base_va = runtime.user_va & ~@as(u64, 0x1F_FFFF);
+    const space = getUserSpace(principal) orelse return;
+    const cap = state.getTableConst(principal).find(paddr);
+    var kept_one = false;
 
-    var process_index: usize = 0;
-    while (process_index < runtime.user_spaces.len) : (process_index += 1) {
-        const principal = principalFromProcessIndex(process_index) orelse continue;
-        const space = &runtime.user_spaces[process_index];
-        const cap = state.getTableConst(principal).find(paddr);
-        var kept_one = false;
-
+    var slot: usize = 0;
+    const used_len: usize = @intCast(space.pt_page_used_len);
+    while (slot < used_len) : (slot += 1) {
+        const slot_pd_index_u16 = space.pt_page_pd_index[slot];
+        const slot_pd_index: usize = @intCast(slot_pd_index_u16);
         var i: usize = 0;
         while (i < runtime.page_entries) : (i += 1) {
-            const old_entry = space.pt[i];
+            const old_entry = space.pt_pages[slot][i];
             const mapped_paddr = old_entry & runtime.page_addr_mask;
             if (mapped_paddr != paddr) continue;
 
@@ -231,10 +287,20 @@ pub fn syncPageTableRightsForPaddr(state: *const kernel.KernelState, paddr: u64)
             }
 
             if (new_entry == old_entry) continue;
-            space.pt[i] = new_entry;
-            const va = user_pt_base_va + (@as(u64, i) * 4096);
+            space.pt_pages[slot][i] = new_entry;
+            const va = aliasVaForPdPt(slot_pd_index, i);
             runtime.flush_user_tlb_for_principal_va(principal, va);
         }
+    }
+}
+
+pub fn syncPageTableRightsForPaddr(state: *const kernel.KernelState, paddr: u64) void {
+    if (!runtime_ready) return;
+
+    var process_index: usize = 0;
+    while (process_index < runtime.user_spaces.len) : (process_index += 1) {
+        const principal = principalFromProcessIndex(process_index) orelse continue;
+        syncPageTableRightsForPrincipalPaddr(state, principal, paddr);
     }
 }
 
@@ -279,6 +345,8 @@ pub fn dumpPrincipalCaps(state: *const kernel.KernelState, principal: kernel.Pri
 pub fn dumpCapabilityView(state: *const kernel.KernelState) void {
     dumpPrincipalCaps(state, .Process0, "Process0");
     dumpPrincipalCaps(state, .Process1, "Process1");
+    dumpPrincipalCaps(state, .Process2, "Process2");
+    dumpPrincipalCaps(state, .Process3, "Process3");
     dumpPrincipalCaps(state, .Device0, "Device0");
 }
 

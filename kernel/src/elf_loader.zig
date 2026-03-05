@@ -53,6 +53,18 @@ pub const LoadToPageError = Error || error{
     RelocationOverflow,
 };
 
+pub const StreamReadError = error{
+    SourceReadFailed,
+    SourceOutOfRange,
+};
+
+pub const Reader = struct {
+    context: *anyopaque,
+    read_at: *const fn (context: *anyopaque, offset: u64, out: []u8) StreamReadError!void,
+};
+
+pub const StreamLoadToPageError = LoadToPageError || StreamReadError;
+
 const elf_magic = [_]u8{ 0x7F, 'E', 'L', 'F' };
 const elf_class_64 = 2;
 const elf_data_lsb = 1;
@@ -70,6 +82,7 @@ const dt_relaent: u64 = 9;
 const dt_relacount: u64 = 0x6FFF_FFF9;
 const rela_entry_bytes: u64 = 24;
 const r_x86_64_relative: u32 = 8;
+const stream_chunk_bytes: usize = 512;
 
 pub const demo_idle_base_va: u64 = 0x2000_0000;
 pub const demo_idle_entry_offset: u64 = 0x100;
@@ -121,6 +134,115 @@ fn writeU64Le(bytes: []u8, off: usize, value: u64) void {
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         bytes[off + i] = @intCast((value >> @intCast(i * 8)) & 0xFF);
+    }
+}
+
+const SliceReaderContext = struct {
+    bytes: []const u8,
+};
+
+fn readSliceAt(context: *anyopaque, offset: u64, out: []u8) StreamReadError!void {
+    const ctx: *const SliceReaderContext = @ptrCast(@alignCast(context));
+    if (offset > std.math.maxInt(usize)) return error.SourceOutOfRange;
+    const off: usize = @intCast(offset);
+    if (off > ctx.bytes.len) return error.SourceOutOfRange;
+    if (out.len > ctx.bytes.len - off) return error.SourceOutOfRange;
+    @memcpy(out, ctx.bytes[off .. off + out.len]);
+}
+
+fn parseFromReader(reader: Reader) (Error || StreamReadError)!Image {
+    var ehdr: [64]u8 = undefined;
+    reader.read_at(reader.context, 0, ehdr[0..]) catch |err| switch (err) {
+        error.SourceOutOfRange => return Error.ImageTooSmall,
+        error.SourceReadFailed => return err,
+    };
+
+    if (!std.mem.eql(u8, ehdr[0..4], &elf_magic)) return Error.BadMagic;
+    if (ehdr[4] != elf_class_64) return Error.UnsupportedClass;
+    if (ehdr[5] != elf_data_lsb) return Error.UnsupportedEndian;
+    if (ehdr[6] != elf_version_current) return Error.BadVersion;
+
+    const e_type = try readU16Le(ehdr[0..], 16);
+    if (e_type != elf_type_exec and e_type != elf_type_dyn) return Error.UnsupportedType;
+
+    const e_machine = try readU16Le(ehdr[0..], 18);
+    if (e_machine != elf_machine_x86_64) return Error.UnsupportedMachine;
+
+    const e_version = try readU32Le(ehdr[0..], 20);
+    if (e_version != elf_version_current) return Error.BadVersion;
+
+    const entry = try readU64Le(ehdr[0..], 24);
+    const phoff = try readU64Le(ehdr[0..], 32);
+    const phentsize = try readU16Le(ehdr[0..], 54);
+    const phnum = try readU16Le(ehdr[0..], 56);
+    if (phnum == 0) return Error.NoLoadSegment;
+    if (phentsize < elf_phdr_size) return Error.ProgramHeaderOutOfRange;
+
+    var parsed = Image{ .entry = entry };
+    var phdr: [elf_phdr_size]u8 = undefined;
+
+    var i: u16 = 0;
+    while (i < phnum) : (i += 1) {
+        const ph_stride = @as(u64, i) * @as(u64, phentsize);
+        const ph_off_u64, const ph_off_overflow = @addWithOverflow(phoff, ph_stride);
+        if (ph_off_overflow != 0) return Error.ProgramHeaderOutOfRange;
+        reader.read_at(reader.context, ph_off_u64, phdr[0..]) catch |err| switch (err) {
+            error.SourceOutOfRange => return Error.ProgramHeaderOutOfRange,
+            error.SourceReadFailed => return err,
+        };
+
+        const p_type = try readU32Le(phdr[0..], 0);
+        const p_flags = try readU32Le(phdr[0..], 4);
+        const p_offset = try readU64Le(phdr[0..], 8);
+        const p_vaddr = try readU64Le(phdr[0..], 16);
+        const p_filesz = try readU64Le(phdr[0..], 32);
+        const p_memsz = try readU64Le(phdr[0..], 40);
+        const p_align = try readU64Le(phdr[0..], 48);
+
+        if (p_memsz < p_filesz) return Error.SegmentSizeInvalid;
+        if (p_offset > std.math.maxInt(usize)) return Error.SegmentOutOfRange;
+        if (p_filesz > std.math.maxInt(usize)) return Error.SegmentOutOfRange;
+        const seg_end, const seg_end_overflow = @addWithOverflow(p_offset, p_filesz);
+        _ = seg_end;
+        if (seg_end_overflow != 0) return Error.SegmentOutOfRange;
+
+        if (p_type == pt_load) {
+            if (parsed.load_segment_len >= parsed.load_segments.len) return Error.TooManyLoadSegments;
+            parsed.load_segments[parsed.load_segment_len] = .{
+                .vaddr = p_vaddr,
+                .file_offset = p_offset,
+                .file_size = p_filesz,
+                .mem_size = p_memsz,
+                .flags = p_flags,
+                .align_bytes = p_align,
+            };
+            parsed.load_segment_len += 1;
+        } else if (p_type == pt_dynamic) {
+            if (parsed.dynamic_segment != null) return Error.TooManyDynamicSegments;
+            parsed.dynamic_segment = .{
+                .vaddr = p_vaddr,
+                .mem_size = p_memsz,
+            };
+        }
+    }
+
+    if (parsed.load_segment_len == 0) return Error.NoLoadSegment;
+    return parsed;
+}
+
+fn copyFromReader(reader: Reader, src_offset: u64, dst: []u8) StreamLoadToPageError!void {
+    var copied: usize = 0;
+    var chunk: [stream_chunk_bytes]u8 = undefined;
+    while (copied < dst.len) {
+        const remaining = dst.len - copied;
+        const step = if (remaining > chunk.len) chunk.len else remaining;
+        const src = try checkedAddU64(src_offset, @as(u64, @intCast(copied)));
+        reader.read_at(reader.context, src, chunk[0..step]) catch |err| switch (err) {
+            error.SourceOutOfRange => return Error.SegmentOutOfRange,
+            error.SourceReadFailed => return err,
+        };
+        @memcpy(dst[copied .. copied + step], chunk[0..step]);
+        copied += step;
     }
 }
 
@@ -350,9 +472,21 @@ fn applyRelativeRelocations(parsed: Image, load_base_va: u64, mapped_bytes: []u8
 }
 
 pub fn loadToSinglePage(image_bytes: []const u8, load_base_va: u64, dest_page: []u8) LoadToPageError!Image {
+    var ctx = SliceReaderContext{ .bytes = image_bytes };
+    const reader = Reader{
+        .context = @ptrCast(&ctx),
+        .read_at = readSliceAt,
+    };
+    return loadToSinglePageStreaming(reader, load_base_va, dest_page) catch |err| switch (err) {
+        error.SourceReadFailed, error.SourceOutOfRange => Error.SegmentOutOfRange,
+        else => @errorCast(err),
+    };
+}
+
+pub fn loadToSinglePageStreaming(reader: Reader, load_base_va: u64, dest_page: []u8) StreamLoadToPageError!Image {
     if (dest_page.len < 4096) return error.DestinationTooSmall;
 
-    const parsed = try parse(image_bytes);
+    const parsed = try parseFromReader(reader);
     var loaded = parsed;
     loaded.entry = try checkedAddU64(load_base_va, parsed.entry);
     @memset(dest_page, 0);
@@ -366,18 +500,15 @@ pub fn loadToSinglePage(image_bytes: []const u8, load_base_va: u64, dest_page: [
         const runtime_end = try checkedAddU64(runtime_start, seg.mem_size);
         const seg_off_u64 = runtime_start - load_base_va;
         if (seg_off_u64 > std.math.maxInt(usize)) return error.SegmentTooLarge;
-        if (seg.file_offset > std.math.maxInt(usize)) return error.SegmentTooLarge;
         if (seg.file_size > std.math.maxInt(usize)) return error.SegmentTooLarge;
         if (seg.mem_size > std.math.maxInt(usize)) return error.SegmentTooLarge;
 
         const seg_off: usize = @intCast(seg_off_u64);
-        const file_off: usize = @intCast(seg.file_offset);
         const file_size: usize = @intCast(seg.file_size);
         const mem_size: usize = @intCast(seg.mem_size);
         if (seg_off + mem_size > dest_page.len) return error.SegmentOutsideMappedRange;
-        if (file_off + file_size > image_bytes.len) return error.SegmentOutOfRange;
 
-        @memcpy(dest_page[seg_off .. seg_off + file_size], image_bytes[file_off .. file_off + file_size]);
+        try copyFromReader(reader, seg.file_offset, dest_page[seg_off .. seg_off + file_size]);
 
         if (loaded.entry >= runtime_start and loaded.entry < runtime_end) {
             entry_in_segment = true;

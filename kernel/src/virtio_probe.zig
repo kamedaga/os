@@ -13,7 +13,29 @@ const virtio_pci_cap_notify_cfg: u8 = 2;
 const virtio_pci_cap_isr_cfg: u8 = 3;
 const virtio_pci_cap_device_cfg: u8 = 4;
 
-pub const MouseModernInfo = struct {
+const input_cfg_select: usize = 0;
+const input_cfg_subsel: usize = 1;
+const input_cfg_size: usize = 2;
+const input_cfg_payload: usize = 8;
+
+const virtio_input_cfg_select_ev_bits: u8 = 0x11;
+const virtio_input_ev_key: u8 = 0x01;
+const virtio_input_ev_rel: u8 = 0x02;
+const virtio_input_ev_abs: u8 = 0x03;
+
+const input_code_rel_x: u16 = 0x00;
+const input_code_rel_y: u16 = 0x01;
+const input_code_abs_x: u16 = 0x00;
+const input_code_abs_y: u16 = 0x01;
+const input_code_key_a: u16 = 0x1E;
+const input_code_btn_left: u16 = 0x110;
+
+const InputKind = enum {
+    mouse,
+    keyboard,
+};
+
+pub const InputModernInfo = struct {
     location: pci.Location,
     device_id: u16,
     subsystem_id: u16,
@@ -23,6 +45,9 @@ pub const MouseModernInfo = struct {
     device_cfg: u64,
     notify_off_multiplier: u32,
 };
+
+pub const MouseModernInfo = InputModernInfo;
+pub const KeyboardModernInfo = InputModernInfo;
 
 fn emit(write_log: *const fn ([]const u8) void, text: []const u8) void {
     write_log(text);
@@ -58,11 +83,67 @@ fn readMemBarBase(loc: pci.Location, bar_index: u8) ?u64 {
     return null;
 }
 
-fn looksLikeVirtioMouse(device_id: u16, subsystem_id: u16) bool {
+fn looksLikeVirtioInput(device_id: u16, subsystem_id: u16) bool {
     return device_id == virtio_input_device_modern or subsystem_id == virtio_input_subsystem_id;
 }
 
-pub fn probeMouseModern(write_log: *const fn ([]const u8) void) ?MouseModernInfo {
+fn mmioReadU8(addr: u64) u8 {
+    const p: *volatile u8 = @ptrFromInt(addr);
+    return p.*;
+}
+
+fn mmioWriteU8(addr: u64, value: u8) void {
+    const p: *volatile u8 = @ptrFromInt(addr);
+    p.* = value;
+}
+
+fn readInputBitmapBit(device_cfg: u64, ev_type: u8, code: u16) bool {
+    if (device_cfg == 0) return false;
+    mmioWriteU8(device_cfg + input_cfg_select, virtio_input_cfg_select_ev_bits);
+    mmioWriteU8(device_cfg + input_cfg_subsel, ev_type);
+    const size = mmioReadU8(device_cfg + input_cfg_size);
+    if (size == 0) return false;
+
+    const byte_index: usize = @intCast(code / 8);
+    if (byte_index >= size or byte_index >= 128) return false;
+    const bit_index: u3 = @intCast(code & 7);
+    const bits = mmioReadU8(device_cfg + input_cfg_payload + byte_index);
+    return ((bits >> bit_index) & 1) != 0;
+}
+
+fn matchInputKind(device_cfg: u64, want: InputKind, write_log: *const fn ([]const u8) void) bool {
+    if (device_cfg == 0) {
+        emit(write_log, "virtio-probe: skip candidate (device cfg missing for input classify)\n");
+        return false;
+    }
+
+    const has_rel_x = readInputBitmapBit(device_cfg, virtio_input_ev_rel, input_code_rel_x);
+    const has_rel_y = readInputBitmapBit(device_cfg, virtio_input_ev_rel, input_code_rel_y);
+    const has_abs_x = readInputBitmapBit(device_cfg, virtio_input_ev_abs, input_code_abs_x);
+    const has_abs_y = readInputBitmapBit(device_cfg, virtio_input_ev_abs, input_code_abs_y);
+    const has_key_a = readInputBitmapBit(device_cfg, virtio_input_ev_key, input_code_key_a);
+    const has_btn_left = readInputBitmapBit(device_cfg, virtio_input_ev_key, input_code_btn_left);
+
+    const pointer_like = (has_rel_x and has_rel_y) or (has_abs_x and has_abs_y and has_btn_left);
+    const keyboard_like = has_key_a and !has_rel_x and !has_rel_y and !has_abs_x and !has_abs_y;
+
+    emitFmt(
+        write_log,
+        "virtio-probe: classify rel_xy={d} abs_xy={d} key_a={d} btn_left={d}\n",
+        .{
+            if (has_rel_x and has_rel_y) @as(u8, 1) else @as(u8, 0),
+            if (has_abs_x and has_abs_y) @as(u8, 1) else @as(u8, 0),
+            if (has_key_a) @as(u8, 1) else @as(u8, 0),
+            if (has_btn_left) @as(u8, 1) else @as(u8, 0),
+        },
+    );
+    return switch (want) {
+        .mouse => pointer_like,
+        .keyboard => keyboard_like,
+    };
+}
+
+fn probeInputModern(write_log: *const fn ([]const u8) void, want: InputKind) ?InputModernInfo {
     var bus: u16 = 0;
     while (bus < 256) : (bus += 1) {
         var device: u16 = 0;
@@ -88,7 +169,7 @@ pub fn probeMouseModern(write_log: *const fn ([]const u8) void) ?MouseModernInfo
 
                 const device_id = pci.readDeviceId(loc);
                 const subsystem_id = pci.readSubsystemId(loc);
-                if (!looksLikeVirtioMouse(device_id, subsystem_id)) continue;
+                if (!looksLikeVirtioInput(device_id, subsystem_id)) continue;
 
                 emitFmt(
                     write_log,
@@ -168,6 +249,7 @@ pub fn probeMouseModern(write_log: *const fn ([]const u8) void) ?MouseModernInfo
                     );
                     continue;
                 }
+                if (!matchInputKind(device_cfg, want, write_log)) continue;
 
                 return .{
                     .location = loc,
@@ -184,4 +266,12 @@ pub fn probeMouseModern(write_log: *const fn ([]const u8) void) ?MouseModernInfo
     }
 
     return null;
+}
+
+pub fn probeMouseModern(write_log: *const fn ([]const u8) void) ?MouseModernInfo {
+    return probeInputModern(write_log, .mouse);
+}
+
+pub fn probeKeyboardModern(write_log: *const fn ([]const u8) void) ?KeyboardModernInfo {
+    return probeInputModern(write_log, .keyboard);
 }

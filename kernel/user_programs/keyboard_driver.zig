@@ -2,8 +2,6 @@ const std = @import("std");
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
-const syscall_switch_thread: u64 = 0x5;
-const syscall_send_cap: u64 = 0x6;
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
@@ -17,11 +15,8 @@ const isr_page_va: usize = 0x2000_6000;
 const device_page_va: usize = 0x2000_7000;
 const queue_page0_va: usize = 0x2000_8000;
 const queue_page1_va: usize = 0x2000_9000;
-const shared_page_va: usize = 0x3C00_3000;
 
-const config_magic: u64 = 0x4D4F5553; // "MOUS"
-const shared_magic: u64 = 0x4D534852; // "MSHR"
-const endpoint_to_process1: u64 = 0x11;
+const config_magic: u64 = 0x4B455942; // "KEYB"
 
 const common_device_feature_select: usize = 0x00;
 const common_device_feature: usize = 0x04;
@@ -42,17 +37,7 @@ const status_driver_ok: u8 = 0x04;
 
 const event_type_syn: u16 = 0x00;
 const event_type_key: u16 = 0x01;
-const event_type_rel: u16 = 0x02;
-const event_type_abs: u16 = 0x03;
 const syn_report: u16 = 0x00;
-const rel_x: u16 = 0x00;
-const rel_y: u16 = 0x01;
-const rel_wheel: u16 = 0x08;
-const abs_x: u16 = 0x00;
-const abs_y: u16 = 0x01;
-const btn_left: u16 = 0x110;
-const btn_right: u16 = 0x111;
-const btn_middle: u16 = 0x112;
 
 const queue_index_event: u16 = 0;
 const queue_size: u16 = 8;
@@ -60,7 +45,6 @@ const queue_region_bytes: usize = 8192;
 const queue_used_offset: usize = 4096;
 const queue_buffers_offset: usize = 4176;
 const desc_flag_write: u16 = 1 << 1;
-const log_mouse_events = false;
 
 const VirtqDesc = extern struct {
     addr: u64,
@@ -122,25 +106,6 @@ fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .memory = true });
-}
-
-fn sendCap(paddr: u64, endpoint_id: u64) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_send_cap),
-          [arg0] "{rdi}" (paddr),
-          [arg1] "{rsi}" (endpoint_id),
-        : .{ .memory = true });
-}
-
-fn switchThread(thread_index: u64) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_switch_thread),
-          [arg0] "{rdi}" (thread_index),
         : .{ .memory = true });
 }
 
@@ -230,24 +195,10 @@ fn queuePushAvail(desc_id: u16) void {
     avail_idx_ptr.* = avail_idx +% 1;
 }
 
-fn clampI32(v: i32, lo: i32, hi: i32) i32 {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
-
-fn mapAbsToScreen(abs_value: i32, screen_extent: i32) i32 {
-    if (screen_extent <= 1) return 0;
-    const v = clampI32(abs_value, 0, 32767);
-    const scaled: i64 = @divTrunc(@as(i64, v) * @as(i64, screen_extent - 1), 32767);
-    return @intCast(scaled);
-}
-
 pub export fn _start() noreturn {
-    _ = userLog("MouseDriver: started\n");
-
+    _ = userLog("KeyboardDriver: started\n");
     if (readCfgU64(0) != config_magic) {
-        _ = userLog("MouseDriver: config magic mismatch\n");
+        _ = userLog("KeyboardDriver: config magic mismatch\n");
         while (true) asm volatile ("pause");
     }
 
@@ -261,28 +212,18 @@ pub export fn _start() noreturn {
     const _device_off: usize = @intCast(readCfgU64(8));
     _ = _device_off;
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
-    const shared_page_paddr = readCfgU64(10);
-
-    if (shared_page_paddr < 0x1000) {
-        _ = userLog("MouseDriver: invalid shared page paddr\n");
-        while (true) asm volatile ("pause");
-    }
-    if (sendCap(shared_page_paddr, endpoint_to_process1) != syscall_ok) {
-        _ = userLog("MouseDriver: send shared cap failed\n");
-        while (true) asm volatile ("pause");
-    }
 
     if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
-        _ = userLog("MouseDriver: map common mmio failed\n");
+        _ = userLog("KeyboardDriver: map common mmio failed\n");
         while (true) asm volatile ("pause");
     }
     if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
-        _ = userLog("MouseDriver: map notify mmio failed\n");
+        _ = userLog("KeyboardDriver: map notify mmio failed\n");
         while (true) asm volatile ("pause");
     }
     if (isr_page_paddr != 0) {
         if (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) {
-            _ = userLog("MouseDriver: map isr mmio failed\n");
+            _ = userLog("KeyboardDriver: map isr mmio failed\n");
             while (true) asm volatile ("pause");
         }
     }
@@ -296,13 +237,13 @@ pub export fn _start() noreturn {
 
     var queue_paddrs: [2]u64 = .{ 0, 0 };
     if (allocMapPages(queue_page0_va, 2, true, @intFromPtr(&queue_paddrs)) != syscall_ok) {
-        _ = userLog("MouseDriver: alloc/map queue pages failed\n");
+        _ = userLog("KeyboardDriver: alloc/map queue pages failed\n");
         while (true) asm volatile ("pause");
     }
     const queue_paddr0 = queue_paddrs[0];
     const queue_paddr1 = queue_paddrs[1];
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
-        _ = userLog("MouseDriver: alloc queue pages failed\n");
+        _ = userLog("KeyboardDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
     }
     const queue_bytes: [*]volatile u8 = @ptrFromInt(queue_page0_va);
@@ -323,7 +264,7 @@ pub export fn _start() noreturn {
     mmioWriteU16(common_base + common_queue_select, queue_index_event);
     const max_size = mmioReadU16(common_base + common_queue_size);
     if (max_size == 0 or max_size < queue_size) {
-        _ = userLog("MouseDriver: queue_size unsupported\n");
+        _ = userLog("KeyboardDriver: queue_size unsupported\n");
         while (true) asm volatile ("pause");
     }
 
@@ -351,40 +292,12 @@ pub export fn _start() noreturn {
     }
     mmioWriteU16(notify_addr, queue_index_event);
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
-    _ = userLog("MouseDriver: queue ready\n");
-    var wait_grant_spin: usize = 0;
-    while (mapPage(shared_page_va, shared_page_paddr, true) != syscall_ok) : (wait_grant_spin +%= 1) {
-        if ((wait_grant_spin & 0xFFFFF) == 0xFFFFF) {
-            _ = userLog("MouseDriver: waiting shared cap grant-back\n");
-        }
-        asm volatile ("pause");
-    }
-    _ = userLog("MouseDriver: shared page handshake ok\n");
-
-    const shared: [*]volatile u64 = @ptrFromInt(shared_page_va);
-    if (shared[0] != shared_magic) {
-        _ = userLog("MouseDriver: shared magic mismatch\n");
-        while (true) asm volatile ("pause");
-    }
-    const screen_w: i32 = @intCast(shared[1]);
-    const screen_h: i32 = @intCast(shared[2]);
-    var cursor_x: i32 = @intCast(shared[4]);
-    var cursor_y: i32 = @intCast(shared[5]);
-    if (screen_w <= 0 or screen_h <= 0) {
-        _ = userLog("MouseDriver: invalid shared framebuffer size\n");
-        while (true) asm volatile ("pause");
-    }
+    _ = userLog("KeyboardDriver: queue ready\n");
 
     var last_used_idx: u16 = 0;
-    var buttons_mask: u8 = 0;
-    var reported_buttons_mask: u8 = 0;
-    var accum_dx: i32 = 0;
-    var accum_dy: i32 = 0;
-    var accum_wheel: i32 = 0;
-    var wheel_total: i32 = 0;
-    var abs_pos_x: i32 = 0;
-    var abs_pos_y: i32 = 0;
-    var abs_dirty = false;
+    var pending_code: u16 = 0;
+    var pending_value: u32 = 0;
+    var has_pending_key = false;
 
     while (true) {
         if (isr_base != 0) {
@@ -398,87 +311,22 @@ pub export fn _start() noreturn {
             const desc_id: u16 = @intCast(used_elem.id & 0xFFFF);
             if (desc_id < queue_size) {
                 const ev = queueEventPtr(desc_id).*;
-                const value_signed: i32 = @bitCast(ev.value);
                 switch (ev.event_type) {
-                    event_type_rel => switch (ev.code) {
-                        rel_x => accum_dx +%= value_signed,
-                        rel_y => accum_dy +%= value_signed,
-                        rel_wheel => accum_wheel +%= value_signed,
-                        else => {},
-                    },
-                    event_type_abs => switch (ev.code) {
-                        abs_x => {
-                            abs_pos_x = value_signed;
-                            abs_dirty = true;
-                        },
-                        abs_y => {
-                            abs_pos_y = value_signed;
-                            abs_dirty = true;
-                        },
-                        else => {},
-                    },
                     event_type_key => {
-                        const down = ev.value != 0;
-                        switch (ev.code) {
-                            btn_left => {
-                                if (down) buttons_mask |= 1 else buttons_mask &= ~@as(u8, 1);
-                            },
-                            btn_right => {
-                                if (down) buttons_mask |= 2 else buttons_mask &= ~@as(u8, 2);
-                            },
-                            btn_middle => {
-                                if (down) buttons_mask |= 4 else buttons_mask &= ~@as(u8, 4);
-                            },
-                            else => {},
-                        }
+                        pending_code = ev.code;
+                        pending_value = ev.value;
+                        has_pending_key = true;
                     },
                     event_type_syn => {
-                        if (ev.code == syn_report) {
-                            var abs_dx: i32 = 0;
-                            var abs_dy: i32 = 0;
-                            if (abs_dirty) {
-                                const abs_target_x = if (abs_pos_x >= 0 and abs_pos_x < screen_w)
-                                    abs_pos_x
-                                else
-                                    mapAbsToScreen(abs_pos_x, screen_w);
-                                const abs_target_y = if (abs_pos_y >= 0 and abs_pos_y < screen_h)
-                                    abs_pos_y
-                                else
-                                    mapAbsToScreen(abs_pos_y, screen_h);
-                                // For absolute devices (tablet), absolute position is authoritative.
-                                abs_dx = abs_target_x - cursor_x;
-                                abs_dy = abs_target_y - cursor_y;
-                                accum_dx = abs_dx;
-                                accum_dy = abs_dy;
-                            }
-
-                            const moved = accum_dx != 0 or accum_dy != 0 or accum_wheel != 0;
-                            const button_changed = buttons_mask != reported_buttons_mask;
-                            if (moved or button_changed or abs_dirty) {
-                                cursor_x = clampI32(cursor_x +% accum_dx, 0, screen_w - 1);
-                                cursor_y = clampI32(cursor_y +% accum_dy, 0, screen_h - 1);
-                                wheel_total +%= accum_wheel;
-                                shared[4] = @intCast(cursor_x);
-                                shared[5] = @intCast(cursor_y);
-                                shared[6] = buttons_mask;
-                                shared[8] = @as(u32, @bitCast(wheel_total));
-                                shared[7] +%= 1;
-
-                                if (log_mouse_events) {
-                                    var buf: [128]u8 = undefined;
-                                    const msg = std.fmt.bufPrint(
-                                        buf[0..],
-                                        "mouse x={d} y={d} dx={d} dy={d} wheel_d={d} wheel_t={d} btn={d} absdx={d} absdy={d}\n",
-                                        .{ cursor_x, cursor_y, accum_dx, accum_dy, accum_wheel, wheel_total, buttons_mask, abs_dx, abs_dy },
-                                    ) catch "";
-                                    _ = userLog(msg);
-                                }
-                                accum_dx = 0;
-                                accum_dy = 0;
-                                accum_wheel = 0;
-                                reported_buttons_mask = buttons_mask;
-                                abs_dirty = false;
-                            }
+                        if (ev.code == syn_report and has_pending_key) {
+                            var buf: [96]u8 = undefined;
+                            const msg = std.fmt.bufPrint(
+                                buf[0..],
+                                "key code=0x{x} value={d}\n",
+                                .{ pending_code, pending_value },
+                            ) catch "";
+                            _ = userLog(msg);
+                            has_pending_key = false;
                         }
                     },
                     else => {},

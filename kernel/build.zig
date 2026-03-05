@@ -123,6 +123,48 @@ pub fn build(b: *std.Build) void {
     const mouse_driver_step = b.step("mouse-driver-elf", "Build mouse driver PIE ELF");
     mouse_driver_step.dependOn(&install_mouse_driver.step);
 
+    const keyboard_driver_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/keyboard_driver.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+    });
+    keyboard_driver_mod.strip = true;
+    const keyboard_driver_app = b.addExecutable(.{
+        .name = "KEYBDRV",
+        .root_module = keyboard_driver_mod,
+    });
+    keyboard_driver_app.pie = true;
+    keyboard_driver_app.entry = .{ .symbol_name = "_start" };
+    keyboard_driver_app.link_z_common_page_size = 0x10;
+    keyboard_driver_app.link_z_max_page_size = 0x10;
+    const install_keyboard_driver = b.addInstallArtifact(keyboard_driver_app, .{
+        .dest_sub_path = "EFI/BOOT/KEYBDRV.ELF",
+    });
+    const keyboard_driver_step = b.step("keyboard-driver-elf", "Build keyboard driver PIE ELF");
+    keyboard_driver_step.dependOn(&install_keyboard_driver.step);
+
+    const bootlog_sender_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/bootlog_sender.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+    });
+    bootlog_sender_mod.strip = true;
+    const bootlog_sender_app = b.addExecutable(.{
+        .name = "BLOGSND",
+        .root_module = bootlog_sender_mod,
+    });
+    bootlog_sender_app.pie = true;
+    bootlog_sender_app.entry = .{ .symbol_name = "_start" };
+    bootlog_sender_app.link_z_common_page_size = 0x10;
+    bootlog_sender_app.link_z_max_page_size = 0x10;
+    const install_bootlog_sender = b.addInstallArtifact(bootlog_sender_app, .{
+        .dest_sub_path = "EFI/BOOT/BLOGSND.ELF",
+    });
+    const bootlog_sender_step = b.step("bootlog-sender-elf", "Build bootlog sender PIE ELF");
+    bootlog_sender_step.dependOn(&install_bootlog_sender.step);
+
     const mouse_draw_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/mouse_draw.zig"),
         .target = user_target,
@@ -193,6 +235,8 @@ pub fn build(b: *std.Build) void {
     install_efi.step.dependOn(&install_draw_client.step);
     install_efi.step.dependOn(&install_boot_log_console.step);
     install_efi.step.dependOn(&install_mouse_driver.step);
+    install_efi.step.dependOn(&install_keyboard_driver.step);
+    install_efi.step.dependOn(&install_bootlog_sender.step);
     install_efi.step.dependOn(&install_mouse_draw.step);
     install_efi.step.dependOn(&install_compositor.step);
     install_efi.step.dependOn(&install_framebuffer_server.step);

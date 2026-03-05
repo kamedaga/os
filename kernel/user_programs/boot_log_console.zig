@@ -1,5 +1,5 @@
-const framebuffer_va: usize = 0x2000_4000;
-const boot_log_page_va: usize = 0x2000_3000;
+const framebuffer_va: usize = 0x3C00_5000;
+const boot_log_page_va: usize = 0x3C00_1000;
 
 const fb_width: usize = 832;
 const fb_height: usize = 624;
@@ -16,6 +16,8 @@ const log_payload_bytes: usize = 4096 - log_header_bytes;
 
 const default_fg_color: u32 = 0x00FF_FFFF;
 const default_bg_color: u32 = 0x0000_0000;
+const prompt_fg_color: u32 = 0x00FF_FF55;
+const enter_prompt_text = "Press Enter to launch compositor.\n";
 
 const ParserState = enum {
     normal,
@@ -426,23 +428,31 @@ fn glyphRows(raw: u8) [glyph_h]u8 {
     };
 }
 
-pub export fn _start() noreturn {
-    const fb: [*]volatile u32 = @ptrFromInt(framebuffer_va);
-    const log: [*]const volatile u8 = @ptrFromInt(boot_log_page_va);
-
-    var c = Console{ .fb = fb };
+fn renderBootLogAndPrompt(c: *Console, log: [*]const volatile u8) void {
     c.clear();
-
     var parser = AnsiParser{};
     var text_len: usize = @intCast(readU32LE(log, 0));
     if (text_len > log_payload_bytes) text_len = log_payload_bytes;
 
     var i: usize = 0;
     while (i < text_len) : (i += 1) {
-        parser.feed(&c, log[log_header_bytes + i]);
-
+        parser.feed(c, log[log_header_bytes + i]);
     }
 
+    c.newline();
+    c.fg = prompt_fg_color;
+    for (enter_prompt_text) |ch| {
+        c.putChar(ch);
+    }
+    c.fg = default_fg_color;
+}
+
+pub export fn _start() noreturn {
+    const fb: [*]volatile u32 = @ptrFromInt(framebuffer_va);
+    const log: [*]const volatile u8 = @ptrFromInt(boot_log_page_va);
+
+    var c = Console{ .fb = fb };
+    renderBootLogAndPrompt(&c, log);
     while (true) {
         asm volatile ("pause");
     }

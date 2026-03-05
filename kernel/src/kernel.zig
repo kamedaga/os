@@ -3,15 +3,18 @@ const std = @import("std");
 pub const PrincipalId = enum(u8) {
     Process0,
     Process1,
+    Process2,
+    Process3,
     Device0,
 };
 
 pub const endpoint_to_process0: u64 = 0x10;
 pub const endpoint_to_process1: u64 = 0x11;
+pub const endpoint_to_process2: u64 = 0x12;
 
 fn isProcessPrincipal(principal: PrincipalId) bool {
     return switch (principal) {
-        .Process0, .Process1 => true,
+        .Process0, .Process1, .Process2, .Process3 => true,
         .Device0 => false,
     };
 }
@@ -56,7 +59,7 @@ pub const KernelError = error{
 };
 
 pub const CNode = struct {
-    pub const max_caps = 16;
+    pub const max_caps = 1024;
 
     caps: [max_caps]Capability = undefined,
     len: usize = 0,
@@ -273,6 +276,23 @@ pub const FreePageList = struct {
 
         return paddr;
     }
+
+    pub fn popBack(self: *FreePageList) KernelError!u64 {
+        if (self.len == 0) return KernelError.OutOfFreePages;
+
+        const paddr = self.pages[self.len - 1];
+        self.len -= 1;
+
+        if (self.range_len > 0) {
+            const last = &self.ranges[self.range_len - 1];
+            if (last.len > 0) last.len -= 1;
+            if (last.len == 0) {
+                self.range_len -= 1;
+            }
+        }
+
+        return paddr;
+    }
 };
 
 pub const PageCapability = struct {
@@ -289,6 +309,17 @@ pub const FramebufferCapability = struct {
     allow_draw: bool = false,
 };
 
+pub const VirtualFramebufferCapability = struct {
+    paddr: u64,
+    size_bytes: usize,
+    width: u32,
+    height: u32,
+    pixels_per_scan_line: u32,
+    pixel_format: u32,
+    allow_read: bool = true,
+    allow_write: bool = false,
+};
+
 pub const OwnershipView = enum {
     Process0,
     Device0,
@@ -298,16 +329,19 @@ pub const OwnershipView = enum {
 
 pub const KernelState = struct {
     pub const max_regions = 256;
-    const principal_count = 3;
+    const principal_count = 5;
     const max_total_caps = principal_count * CNode.max_caps;
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
-    cap_tables: [principal_count]CNode = .{ .{}, .{}, .{} },
-    endpoint_tables: [principal_count]EndpointCNode = .{ .{}, .{}, .{} },
-    cap_mailboxes: [principal_count]CapMailbox = .{ .{}, .{}, .{} },
-    framebuffer_caps: [principal_count]?FramebufferCapability = .{ null, null, null },
-    pte_sync_hook: ?*const fn (state: *const KernelState, paddr: u64) void = null,
+    cap_tables: [principal_count]CNode = .{ .{}, .{}, .{}, .{}, .{} },
+    endpoint_tables: [principal_count]EndpointCNode = .{ .{}, .{}, .{}, .{}, .{} },
+    cap_mailboxes: [principal_count]CapMailbox = .{ .{}, .{}, .{}, .{}, .{} },
+    framebuffer_caps: [principal_count]?FramebufferCapability = .{ null, null, null, null, null },
+    virtual_framebuffer_caps: [principal_count]?VirtualFramebufferCapability = .{ null, null, null, null, null },
+    pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
+    revoke_queue: [max_total_caps]u64 = undefined,
+    revoke_subtree: [max_total_caps]u64 = undefined,
     next_cap_id: u64 = 1,
 
     fn allocCapId(self: *KernelState) u64 {
@@ -332,12 +366,18 @@ pub const KernelState = struct {
 
         state.cap_tables[@intFromEnum(PrincipalId.Process0)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process2)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process3)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process1)] = .{};
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process2)] = .{};
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process3)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process1)] = .{};
+        state.cap_mailboxes[@intFromEnum(PrincipalId.Process2)] = .{};
+        state.cap_mailboxes[@intFromEnum(PrincipalId.Process3)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Device0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process0)].add(.{
             .endpoint_id = endpoint_to_process1,
@@ -346,6 +386,14 @@ pub const KernelState = struct {
         state.endpoint_tables[@intFromEnum(PrincipalId.Process1)].add(.{
             .endpoint_id = endpoint_to_process0,
             .target = .Process0,
+        }) catch unreachable;
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process2)].add(.{
+            .endpoint_id = endpoint_to_process1,
+            .target = .Process1,
+        }) catch unreachable;
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process3)].add(.{
+            .endpoint_id = endpoint_to_process1,
+            .target = .Process1,
         }) catch unreachable;
 
         // Process0 initially owns region0 and has read + dma.
@@ -369,12 +417,18 @@ pub const KernelState = struct {
         state.next_cap_id = 1;
         state.cap_tables[@intFromEnum(PrincipalId.Process0)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process2)] = .{};
+        state.cap_tables[@intFromEnum(PrincipalId.Process3)] = .{};
         state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process0)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Process1)] = .{};
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process2)] = .{};
+        state.endpoint_tables[@intFromEnum(PrincipalId.Process3)] = .{};
         state.endpoint_tables[@intFromEnum(PrincipalId.Device0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process0)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Process1)] = .{};
+        state.cap_mailboxes[@intFromEnum(PrincipalId.Process2)] = .{};
+        state.cap_mailboxes[@intFromEnum(PrincipalId.Process3)] = .{};
         state.cap_mailboxes[@intFromEnum(PrincipalId.Device0)] = .{};
         try state.endpoint_tables[@intFromEnum(PrincipalId.Process0)].add(.{
             .endpoint_id = endpoint_to_process1,
@@ -383,6 +437,14 @@ pub const KernelState = struct {
         try state.endpoint_tables[@intFromEnum(PrincipalId.Process1)].add(.{
             .endpoint_id = endpoint_to_process0,
             .target = .Process0,
+        });
+        try state.endpoint_tables[@intFromEnum(PrincipalId.Process2)].add(.{
+            .endpoint_id = endpoint_to_process1,
+            .target = .Process1,
+        });
+        try state.endpoint_tables[@intFromEnum(PrincipalId.Process3)].add(.{
+            .endpoint_id = endpoint_to_process1,
+            .target = .Process1,
         });
 
         var i: usize = 0;
@@ -512,6 +574,54 @@ pub const KernelState = struct {
         return paddr >= framebuffer.paddr and map_end <= fb_end;
     }
 
+    pub fn grantVirtualFramebufferCap(
+        self: *KernelState,
+        to: PrincipalId,
+        virtual_framebuffer: VirtualFramebufferCapability,
+    ) KernelError!void {
+        if (!isProcessPrincipal(to)) return KernelError.InvalidState;
+        if (virtual_framebuffer.size_bytes == 0) return KernelError.InvalidState;
+        if (virtual_framebuffer.width == 0 or virtual_framebuffer.height == 0) return KernelError.InvalidState;
+        if (virtual_framebuffer.pixels_per_scan_line < virtual_framebuffer.width) return KernelError.InvalidState;
+
+        const size_minus_one = virtual_framebuffer.size_bytes - 1;
+        const paddr_overflow = @addWithOverflow(virtual_framebuffer.paddr, @as(u64, @intCast(size_minus_one)))[1];
+        if (paddr_overflow != 0) return KernelError.InvalidState;
+
+        const required_bytes = @as(u64, virtual_framebuffer.pixels_per_scan_line) *
+            @as(u64, virtual_framebuffer.height) *
+            @as(u64, 4);
+        if (required_bytes > virtual_framebuffer.size_bytes) return KernelError.InvalidState;
+
+        self.virtual_framebuffer_caps[@intFromEnum(to)] = virtual_framebuffer;
+    }
+
+    pub fn getVirtualFramebufferCap(self: *const KernelState, principal: PrincipalId) ?VirtualFramebufferCapability {
+        if (!isProcessPrincipal(principal)) return null;
+        return self.virtual_framebuffer_caps[@intFromEnum(principal)];
+    }
+
+    pub fn canAccessVirtualFramebuffer(
+        self: *const KernelState,
+        principal: PrincipalId,
+        paddr: u64,
+        size_bytes: usize,
+        writable: bool,
+    ) bool {
+        if (size_bytes == 0) return false;
+
+        const virtual_framebuffer = self.getVirtualFramebufferCap(principal) orelse return false;
+        if (!virtual_framebuffer.allow_read) return false;
+        if (writable and !virtual_framebuffer.allow_write) return false;
+
+        const map_end, const map_overflow = @addWithOverflow(paddr, @as(u64, @intCast(size_bytes - 1)));
+        if (map_overflow != 0) return false;
+        const vfb_end, const vfb_overflow = @addWithOverflow(virtual_framebuffer.paddr, @as(u64, @intCast(virtual_framebuffer.size_bytes - 1)));
+        if (vfb_overflow != 0) return false;
+
+        return paddr >= virtual_framebuffer.paddr and map_end <= vfb_end;
+    }
+
     pub fn scanCapTables(self: *const KernelState, paddr: u64) OwnershipView {
         // デバッグ用: capability 走査から論理的な保持者ビューを作る。
         const p0_has = self.getTableConst(.Process0).find(paddr) != null;
@@ -531,7 +641,7 @@ pub const KernelState = struct {
         _ = self;
         _ = requester;
         return .{
-            .paddr = try free_list.popFront(),
+            .paddr = try free_list.popBack(),
         };
     }
 
@@ -553,9 +663,7 @@ pub const KernelState = struct {
             .root_cap_id = root_id,
             .parent_cap_id = 0,
         });
-        if (self.pte_sync_hook) |hook| {
-            hook(self, cap.paddr);
-        }
+        // Freshly allocated pages are not mapped yet, so no PTE rights sync is needed here.
         return cap;
     }
 
@@ -575,7 +683,7 @@ pub const KernelState = struct {
             .parent_cap_id = 0,
         });
         if (self.pte_sync_hook) |hook| {
-            hook(self, paddr);
+            hook(self, owner, paddr);
         }
     }
 
@@ -597,7 +705,8 @@ pub const KernelState = struct {
         _ = src.removeByPaddr(paddr);
         try self.getTable(to).add(moved);
         if (self.pte_sync_hook) |hook| {
-            hook(self, paddr);
+            hook(self, from, paddr);
+            hook(self, to, paddr);
         }
     }
 
@@ -624,7 +733,7 @@ pub const KernelState = struct {
             .parent_cap_id = src_cap.cap_id,
         });
         if (self.pte_sync_hook) |hook| {
-            hook(self, paddr);
+            hook(self, to, paddr);
         }
     }
 
@@ -667,13 +776,13 @@ pub const KernelState = struct {
         const start_cap = self.getTableConst(owner).find(paddr) orelse return KernelError.CapabilityNotFound;
         const start_id = start_cap.cap_id;
 
-        var queue: [max_total_caps]u64 = undefined;
+        const queue = &self.revoke_queue;
         var queue_len: usize = 0;
         var queue_head: usize = 0;
         queue[0] = start_id;
         queue_len = 1;
 
-        var subtree: [max_total_caps]u64 = undefined;
+        const subtree = &self.revoke_subtree;
         var subtree_len: usize = 0;
 
         while (queue_head < queue_len) : (queue_head += 1) {
@@ -687,7 +796,7 @@ pub const KernelState = struct {
                 }
             }
             if (already_in_subtree) continue;
-            if (subtree_len >= subtree.len) return KernelError.RevokeOverflow;
+            if (subtree_len >= self.revoke_subtree.len) return KernelError.RevokeOverflow;
             subtree[subtree_len] = current_id;
             subtree_len += 1;
 
@@ -707,7 +816,7 @@ pub const KernelState = struct {
                         }
                     }
                     if (known) continue;
-                    if (queue_len >= queue.len) return KernelError.RevokeOverflow;
+                    if (queue_len >= self.revoke_queue.len) return KernelError.RevokeOverflow;
                     queue[queue_len] = cap.cap_id;
                     queue_len += 1;
                 }
@@ -724,7 +833,7 @@ pub const KernelState = struct {
                 const removed_paddr = cap.paddr;
                 _ = table.removeByCapId(cap_id);
                 if (self.pte_sync_hook) |hook| {
-                    hook(self, removed_paddr);
+                    hook(self, @enumFromInt(pidx), removed_paddr);
                 }
                 break;
             }
@@ -923,4 +1032,52 @@ test "framebuffer capability grants draw right only to owner process" {
     try std.testing.expect(!s.canDrawToFramebuffer(.Process1, 0x8000_1000, 0x1000, true));
     try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x7FFF_F000, 0x2000, true));
     try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x8000_1000, 0x1000, false));
+}
+
+test "virtual framebuffer capability grants shared access to configured processes" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    const vfb_cap_owner = VirtualFramebufferCapability{
+        .paddr = 0x9000_0000,
+        .size_bytes = 4096,
+        .width = 32,
+        .height = 32,
+        .pixels_per_scan_line = 32,
+        .pixel_format = 0,
+        .allow_read = true,
+        .allow_write = true,
+    };
+    const vfb_cap_compositor = VirtualFramebufferCapability{
+        .paddr = 0x9000_0000,
+        .size_bytes = 4096,
+        .width = 32,
+        .height = 32,
+        .pixels_per_scan_line = 32,
+        .pixel_format = 0,
+        .allow_read = true,
+        .allow_write = true,
+    };
+    try s.grantVirtualFramebufferCap(.Process0, vfb_cap_owner);
+    try s.grantVirtualFramebufferCap(.Process1, vfb_cap_compositor);
+
+    try std.testing.expect(s.canAccessVirtualFramebuffer(.Process0, 0x9000_0000, 4096, true));
+    try std.testing.expect(s.canAccessVirtualFramebuffer(.Process1, 0x9000_0080, 128, true));
+    try std.testing.expect(!s.canAccessVirtualFramebuffer(.Process2, 0x9000_0000, 4096, false));
+    try std.testing.expect(!s.canAccessVirtualFramebuffer(.Process0, 0x8FFF_F000, 4096, true));
+}
+
+test "virtual framebuffer capability rejects write when allow_write is false" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    try s.grantVirtualFramebufferCap(.Process1, .{
+        .paddr = 0x9100_0000,
+        .size_bytes = 4096,
+        .width = 32,
+        .height = 32,
+        .pixels_per_scan_line = 32,
+        .pixel_format = 0,
+        .allow_read = true,
+        .allow_write = false,
+    });
+
+    try std.testing.expect(s.canAccessVirtualFramebuffer(.Process1, 0x9100_0000, 64, false));
+    try std.testing.expect(!s.canAccessVirtualFramebuffer(.Process1, 0x9100_0000, 64, true));
 }

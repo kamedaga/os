@@ -5,7 +5,7 @@ const syscall_recv_cap: u64 = 0xA;
 const syscall_ok: u64 = 0;
 const syscall_err_empty: u64 = 13;
 
-const framebuffer_user_va: usize = 0x2000_4000;
+const framebuffer_user_va: usize = 0x3C00_5000;
 const request_page_va: usize = 0x2000_3000;
 const fb_width: usize = 832;
 const fb_height: usize = 624;
@@ -24,8 +24,7 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
@@ -36,8 +35,7 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 fn recvCap() u64 {
@@ -45,8 +43,7 @@ fn recvCap() u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_recv_cap),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 fn clampRectToFramebuffer(

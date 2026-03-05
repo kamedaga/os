@@ -1,7 +1,7 @@
 const syscall_log: u64 = 0x9;
 
-const shared_page_va: usize = 0x2000_3000;
-const framebuffer_va: usize = 0x2000_4000;
+const shared_page_va: usize = 0x3C00_3000;
+const framebuffer_va: usize = 0x3C00_5000;
 
 const shared_magic: u64 = 0x4D534852; // "MSHR"
 const cursor_size: i32 = 9;
@@ -14,8 +14,7 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 fn clampI32(v: i32, lo: i32, hi: i32) i32 {
