@@ -1,48 +1,18 @@
 const syscall_create_window: u64 = 0xD;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
+const syscall_grant_cap: u64 = 0x8;
+const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_log: u64 = 0x9;
+const protocol = @import("window_protocol.zig");
 
 const syscall_ok: u64 = 0;
 pub const endpoint_to_process1: u64 = 0x11;
-
-pub const window_cap_magic: u32 = 0x57434150; // 'WCAP'
-pub const window_meta_magic: u32 = 0x574D5441; // 'WMTA'
-
-pub const WindowCap = packed struct {
-    magic: u32,
-    version: u16,
-    rights_bits: u16,
-    window_id: u32,
-    owner_pid: u32,
-    vfb_cap_paddr: u64,
-    meta_cap_paddr: u64,
-    vfb_size_bytes: u32,
-    vfb_page_count: u16,
-    pixels_per_scan_line: u16,
-    pixel_format: u32,
-    evt_cap_paddr: u64,
-    width: u16,
-    height: u16,
-    min_width: u16,
-    min_height: u16,
-    flags: u32,
-    z_hint: i32,
-    reserved0: u32,
-};
-
-pub const WindowMeta = extern struct {
-    magic: u32,
-    version: u16,
-    state: u16,
-    seq: u64,
-    pos_x: i32,
-    pos_y: i32,
-    width: u16,
-    height: u16,
-    title_len: u16,
-    title: [64]u8,
-};
+pub const window_cap_magic = protocol.window_cap_magic;
+pub const window_meta_magic = protocol.window_meta_magic;
+pub const window_flag_allow_pixels_dma = protocol.window_flag_allow_pixels_dma;
+pub const WindowCap = protocol.WindowCap;
+pub const WindowMeta = protocol.WindowMeta;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -51,7 +21,7 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
@@ -62,7 +32,7 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn sendCap(paddr: u64, endpoint_id: u64) u64 {
@@ -72,7 +42,30 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         : [nr] "{rax}" (syscall_send_cap),
           [arg0] "{rdi}" (paddr),
           [arg1] "{rsi}" (endpoint_id),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn grantCap(paddr: u64, to: u64, rights_bits: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_grant_cap),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (to),
+          [arg2] "{rdx}" (rights_bits),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_alloc_map_pages),
+          [arg0] "{rdi}" (base_va),
+          [arg1] "{rsi}" (page_count),
+          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+          [arg3] "{rcx}" (out_paddr_list_va),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn createWindowSys(width: u16, height: u16, flags: u32) u64 {
@@ -83,7 +76,7 @@ fn createWindowSys(width: u16, height: u16, flags: u32) u64 {
           [arg0] "{rdi}" (@as(u64, width)),
           [arg1] "{rsi}" (@as(u64, height)),
           [arg2] "{rdx}" (@as(u64, flags)),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 pub fn createAndPublishWindow(
@@ -91,31 +84,48 @@ pub fn createAndPublishWindow(
     height: u16,
     flags: u32,
     cap_tmp_va: u64,
-    vfb_map_va: u64,
+    pixel_map_va: u64,
     meta_map_va: u64,
 ) bool {
-    const cap_paddr = createWindowSys(width, height, flags);
+    const effective_flags = flags | window_flag_allow_pixels_dma;
+    const cap_paddr = createWindowSys(width, height, effective_flags);
     if (cap_paddr < 0x1000) {
         _ = userLog("window_client: create_window failed\n");
         return false;
     }
-    if (mapPage(cap_tmp_va, cap_paddr, false) != syscall_ok) {
+    if (mapPage(cap_tmp_va, cap_paddr, true) != syscall_ok) {
         _ = userLog("window_client: map cap page failed\n");
         return false;
     }
-    const cap: *const volatile WindowCap = @ptrFromInt(cap_tmp_va);
+    const cap: *volatile WindowCap = @ptrFromInt(cap_tmp_va);
     if (cap.magic != window_cap_magic or cap.version != 1) {
         _ = userLog("window_client: bad window cap magic\n");
         return false;
     }
-    if (cap.vfb_page_count != 1) {
-        _ = userLog("window_client: vfb_page_count != 1 unsupported\n");
+    if (cap.pixels_page_count != 1) {
+        _ = userLog("window_client: pixels_page_count != 1 unsupported\n");
         return false;
     }
-    if (mapPage(vfb_map_va, cap.vfb_cap_paddr, true) != syscall_ok) {
-        _ = userLog("window_client: map vfb failed\n");
+    var pixel_paddrs: [1]u64 = [_]u64{0};
+    if (allocMapPages(pixel_map_va, 1, true, @intFromPtr(&pixel_paddrs)) != syscall_ok) {
+        _ = userLog("window_client: alloc/map pixels failed\n");
         return false;
     }
+    const pixel_paddr = pixel_paddrs[0];
+    if (pixel_paddr < 0x1000) {
+        _ = userLog("window_client: bad pixels paddr\n");
+        return false;
+    }
+
+    var grant_rights: u64 = 0x1; // cpu_read
+    if ((effective_flags & window_flag_allow_pixels_dma) != 0) {
+        grant_rights |= 0x4; // dma
+    }
+    if (grantCap(pixel_paddr, 1, grant_rights) != syscall_ok) {
+        _ = userLog("window_client: grant pixels cap failed\n");
+        return false;
+    }
+    cap.pixels_cap_paddr = pixel_paddr;
     if (mapPage(meta_map_va, cap.meta_cap_paddr, true) != syscall_ok) {
         _ = userLog("window_client: map meta failed\n");
         return false;
@@ -125,6 +135,23 @@ pub fn createAndPublishWindow(
         return false;
     }
     return true;
+}
+
+pub fn createAndPublishWindowWithDma(
+    width: u16,
+    height: u16,
+    cap_tmp_va: u64,
+    pixel_map_va: u64,
+    meta_map_va: u64,
+) bool {
+    return createAndPublishWindow(
+        width,
+        height,
+        window_flag_allow_pixels_dma,
+        cap_tmp_va,
+        pixel_map_va,
+        meta_map_va,
+    );
 }
 
 pub fn setWindowTitle(meta_va: u64, title: []const u8) void {

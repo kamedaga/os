@@ -232,6 +232,29 @@ pub fn mapUserPageFromCapability(
     return true;
 }
 
+pub fn mapFreshUserPage(
+    principal: kernel.PrincipalId,
+    va: u64,
+    paddr: u64,
+    writable: bool,
+) bool {
+    if (!runtime_ready) return false;
+    const space = getUserSpace(principal) orelse return false;
+    if ((va & 0xFFF) != 0) return false;
+    if ((paddr & 0xFFF) != 0) return false;
+    if (paddr >= runtime.physical_map_limit) return false;
+
+    const pd_index = userPdIndexForVa(va) orelse return false;
+    const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+    const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
+    const old_entry = space.pt_pages[map_slot][pt_index];
+    if ((old_entry & runtime.page_present) != 0) return false;
+
+    space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    runtime.flush_user_tlb_for_principal_va(principal, va);
+    return true;
+}
+
 pub fn dropPresentForUserMappedPaddr(
     state: *const kernel.KernelState,
     principal: kernel.PrincipalId,

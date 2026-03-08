@@ -20,8 +20,7 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true }
-    );
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn allocPage() u64 {
@@ -29,8 +28,7 @@ fn allocPage() u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_alloc_page),
-        : .{ .memory = true }
-    );
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
@@ -41,8 +39,7 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .memory = true }
-    );
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn sendCap(paddr: u64, endpoint_id: u64) u64 {
@@ -52,8 +49,7 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         : [nr] "{rax}" (syscall_send_cap),
           [arg0] "{rdi}" (paddr),
           [arg1] "{rsi}" (endpoint_id),
-        : .{ .memory = true }
-    );
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn sendFillRect(dst_x: u64, dst_y: u64, width: u64, height: u64, color: u64) bool {

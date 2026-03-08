@@ -1,4 +1,4 @@
-# Sakura Capability OS
+# Capability OS
 ## Phase 1: UEFI最小カーネル仕様
 
 ## 1. 目的

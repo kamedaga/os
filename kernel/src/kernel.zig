@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const PrincipalId = enum(u8) {
     Process0,
@@ -310,24 +311,16 @@ pub const FramebufferCapability = struct {
     allow_draw: bool = false,
 };
 
-pub const VirtualFramebufferCapability = struct {
-    paddr: u64,
-    size_bytes: usize,
-    width: u32,
-    height: u32,
-    pixels_per_scan_line: u32,
-    pixel_format: u32,
-    allow_read: bool = true,
-    allow_write: bool = false,
-};
-
 pub const WindowRights = packed struct(u16) {
     read_meta: bool = false,
     write_meta: bool = false,
     write_pixels: bool = false,
     control: bool = false,
-    _reserved: u12 = 0,
+    dma_pixels: bool = false,
+    _reserved: u11 = 0,
 };
+
+pub const window_flag_allow_pixels_dma: u32 = 1 << 0;
 
 pub const WindowCap = packed struct {
     magic: u32, // 'WCAP'
@@ -335,10 +328,10 @@ pub const WindowCap = packed struct {
     rights_bits: u16,
     window_id: u32,
     owner_pid: u32,
-    vfb_cap_paddr: u64,
+    pixels_cap_paddr: u64,
     meta_cap_paddr: u64,
-    vfb_size_bytes: u32,
-    vfb_page_count: u16,
+    pixels_size_bytes: u32,
+    pixels_page_count: u16,
     pixels_per_scan_line: u16,
     pixel_format: u32,
     evt_cap_paddr: u64,
@@ -364,15 +357,21 @@ pub const WindowMeta = extern struct {
     title: [64]u8,
 };
 
+const DmaRestoreEntry = struct {
+    valid: bool = false,
+    paddr: u64 = 0,
+    rights: Rights = .{ .cpu_read = false, .cpu_write = false, .dma = false },
+};
+
 pub const WindowRecord = struct {
     active: bool = false,
     window_id: u32 = 0,
     owner: PrincipalId = .Process0,
     cap_paddr: u64 = 0,
-    vfb_paddr: u64 = 0,
+    pixels_paddr: u64 = 0,
     meta_paddr: u64 = 0,
-    vfb_size_bytes: u32 = 0,
-    vfb_page_count: u16 = 0,
+    pixels_size_bytes: u32 = 0,
+    pixels_page_count: u16 = 0,
     pixels_per_scan_line: u16 = 0,
     width: u16 = 0,
     height: u16 = 0,
@@ -383,8 +382,8 @@ pub const WindowRecord = struct {
 pub const CreateWindowResult = struct {
     window_cap_paddr: u64,
     meta_paddr: u64,
-    vfb_first_paddr: u64,
-    vfb_page_count: u16,
+    pixels_first_paddr: u64,
+    pixels_page_count: u16,
 };
 
 pub const OwnershipView = enum {
@@ -406,10 +405,10 @@ pub const KernelState = struct {
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     framebuffer_caps: [principal_count]?FramebufferCapability = [_]?FramebufferCapability{null} ** principal_count,
-    virtual_framebuffer_caps: [principal_count]?VirtualFramebufferCapability = [_]?VirtualFramebufferCapability{null} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
+    dma_restore: [max_total_caps]DmaRestoreEntry = [_]DmaRestoreEntry{.{}} ** max_total_caps,
     next_cap_id: u64 = 1,
     windows: [max_windows]WindowRecord = [_]WindowRecord{.{}} ** max_windows,
     next_window_id: u32 = 1,
@@ -422,6 +421,37 @@ pub const KernelState = struct {
 
     fn pageAlignUp(value: u64) u64 {
         return (value + 4095) & ~@as(u64, 4095);
+    }
+
+    fn findDmaRestoreIndex(self: *const KernelState, paddr: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.dma_restore.len) : (i += 1) {
+            if (self.dma_restore[i].valid and self.dma_restore[i].paddr == paddr) return i;
+        }
+        return null;
+    }
+
+    fn saveDmaRestoreRights(self: *KernelState, paddr: u64, rights: Rights) KernelError!void {
+        if (self.findDmaRestoreIndex(paddr) != null) return KernelError.InvalidState;
+
+        var i: usize = 0;
+        while (i < self.dma_restore.len) : (i += 1) {
+            if (self.dma_restore[i].valid) continue;
+            self.dma_restore[i] = .{
+                .valid = true,
+                .paddr = paddr,
+                .rights = rights,
+            };
+            return;
+        }
+        return KernelError.TableFull;
+    }
+
+    fn takeDmaRestoreRights(self: *KernelState, paddr: u64) ?Rights {
+        const index = self.findDmaRestoreIndex(paddr) orelse return null;
+        const rights = self.dma_restore[index].rights;
+        self.dma_restore[index] = .{};
+        return rights;
     }
 
     pub fn allocWindowSlot(self: *KernelState) ?usize {
@@ -452,6 +482,7 @@ pub const KernelState = struct {
         if (width > 2048 or height > 2048) return KernelError.InvalidState;
 
         const slot = self.allocWindowSlot() orelse return KernelError.TableFull;
+        const allow_pixel_dma = (flags & window_flag_allow_pixels_dma) != 0;
 
         const pitch: u16 = width;
         const pixel_count = @as(u64, width) * @as(u64, height);
@@ -465,20 +496,7 @@ pub const KernelState = struct {
         const window_cap_page = try self.allocPageTo(owner, free_list);
         const meta_page = try self.allocPageTo(owner, free_list);
 
-        var vfb_first_paddr: u64 = 0;
-        var i: usize = 0;
-        while (i < page_count) : (i += 1) {
-            const p = try self.allocPageTo(owner, free_list);
-            if (i == 0) vfb_first_paddr = p.paddr;
-            try self.grantCap(owner, compositor, p.paddr, .{
-                .cpu_read = true,
-                .cpu_write = false,
-                .dma = false,
-            });
-            const page_words: [*]volatile u64 = @ptrFromInt(p.paddr);
-            var w: usize = 0;
-            while (w < 512) : (w += 1) page_words[w] = 0;
-        }
+        const pixels_first_paddr: u64 = 0;
 
         try self.grantCap(owner, compositor, meta_page.paddr, .{
             .cpu_read = true,
@@ -492,6 +510,7 @@ pub const KernelState = struct {
             .write_meta = true,
             .write_pixels = true,
             .control = true,
+            .dma_pixels = allow_pixel_dma,
         };
         const cap_bytes: [*]volatile u8 = @ptrFromInt(window_cap_page.paddr);
         @memset(cap_bytes[0..4096], 0);
@@ -502,10 +521,10 @@ pub const KernelState = struct {
             .rights_bits = @bitCast(rights),
             .window_id = window_id,
             .owner_pid = @intFromEnum(owner),
-            .vfb_cap_paddr = vfb_first_paddr,
+            .pixels_cap_paddr = pixels_first_paddr,
             .meta_cap_paddr = meta_page.paddr,
-            .vfb_size_bytes = @intCast(bytes_aligned),
-            .vfb_page_count = @intCast(page_count),
+            .pixels_size_bytes = @intCast(bytes_aligned),
+            .pixels_page_count = @intCast(page_count),
             .pixels_per_scan_line = pitch,
             .pixel_format = 0,
             .evt_cap_paddr = 0,
@@ -539,10 +558,10 @@ pub const KernelState = struct {
             .window_id = window_id,
             .owner = owner,
             .cap_paddr = window_cap_page.paddr,
-            .vfb_paddr = vfb_first_paddr,
+            .pixels_paddr = pixels_first_paddr,
             .meta_paddr = meta_page.paddr,
-            .vfb_size_bytes = @intCast(bytes_aligned),
-            .vfb_page_count = @intCast(page_count),
+            .pixels_size_bytes = @intCast(bytes_aligned),
+            .pixels_page_count = @intCast(page_count),
             .pixels_per_scan_line = pitch,
             .width = width,
             .height = height,
@@ -553,8 +572,8 @@ pub const KernelState = struct {
         return .{
             .window_cap_paddr = window_cap_page.paddr,
             .meta_paddr = meta_page.paddr,
-            .vfb_first_paddr = vfb_first_paddr,
-            .vfb_page_count = @intCast(page_count),
+            .pixels_first_paddr = pixels_first_paddr,
+            .pixels_page_count = @intCast(page_count),
         };
     }
 
@@ -684,6 +703,7 @@ pub const KernelState = struct {
         const p0_table = self.getTable(.Process0);
         const p0_cap = p0_table.find(paddr) orelse return KernelError.CapabilityNotFound;
         if (!p0_cap.rights.dma) return KernelError.NoDmaRight;
+        try self.saveDmaRestoreRights(paddr, p0_cap.rights);
 
         // DMA 開始時は moveCap 経由で Device0 へ委譲する。
         try self.moveCap(
@@ -704,18 +724,17 @@ pub const KernelState = struct {
         const dev_table = self.getTable(.Device0);
         const dev_cap = dev_table.find(paddr) orelse return KernelError.CapabilityNotFound;
         if (!dev_cap.rights.dma) return KernelError.NoDmaRight;
+        const restore_rights = self.takeDmaRestoreRights(paddr) orelse return KernelError.InvalidState;
+        if (self.getTable(.Process0).find(paddr) != null) return KernelError.InvalidState;
 
-        // DMA 完了時も moveCap 経由で Process0 に戻す。
-        try self.moveCap(
-            .Device0,
-            .Process0,
-            paddr,
-            .{
-                .cpu_read = true,
-                .cpu_write = true,
-                .dma = true,
-            },
-        );
+        var restored = dev_cap.*;
+        restored.rights = restore_rights;
+        _ = dev_table.removeByPaddr(paddr);
+        try self.getTable(.Process0).add(restored);
+        if (self.pte_sync_hook) |hook| {
+            hook(self, .Device0, paddr);
+            hook(self, .Process0, paddr);
+        }
     }
 
     pub fn getRegion(self: *KernelState, region_id: u64) ?*Region {
@@ -796,54 +815,6 @@ pub const KernelState = struct {
         return paddr >= framebuffer.paddr and map_end <= fb_end;
     }
 
-    pub fn grantVirtualFramebufferCap(
-        self: *KernelState,
-        to: PrincipalId,
-        virtual_framebuffer: VirtualFramebufferCapability,
-    ) KernelError!void {
-        if (!isProcessPrincipal(to)) return KernelError.InvalidState;
-        if (virtual_framebuffer.size_bytes == 0) return KernelError.InvalidState;
-        if (virtual_framebuffer.width == 0 or virtual_framebuffer.height == 0) return KernelError.InvalidState;
-        if (virtual_framebuffer.pixels_per_scan_line < virtual_framebuffer.width) return KernelError.InvalidState;
-
-        const size_minus_one = virtual_framebuffer.size_bytes - 1;
-        const paddr_overflow = @addWithOverflow(virtual_framebuffer.paddr, @as(u64, @intCast(size_minus_one)))[1];
-        if (paddr_overflow != 0) return KernelError.InvalidState;
-
-        const required_bytes = @as(u64, virtual_framebuffer.pixels_per_scan_line) *
-            @as(u64, virtual_framebuffer.height) *
-            @as(u64, 4);
-        if (required_bytes > virtual_framebuffer.size_bytes) return KernelError.InvalidState;
-
-        self.virtual_framebuffer_caps[@intFromEnum(to)] = virtual_framebuffer;
-    }
-
-    pub fn getVirtualFramebufferCap(self: *const KernelState, principal: PrincipalId) ?VirtualFramebufferCapability {
-        if (!isProcessPrincipal(principal)) return null;
-        return self.virtual_framebuffer_caps[@intFromEnum(principal)];
-    }
-
-    pub fn canAccessVirtualFramebuffer(
-        self: *const KernelState,
-        principal: PrincipalId,
-        paddr: u64,
-        size_bytes: usize,
-        writable: bool,
-    ) bool {
-        if (size_bytes == 0) return false;
-
-        const virtual_framebuffer = self.getVirtualFramebufferCap(principal) orelse return false;
-        if (!virtual_framebuffer.allow_read) return false;
-        if (writable and !virtual_framebuffer.allow_write) return false;
-
-        const map_end, const map_overflow = @addWithOverflow(paddr, @as(u64, @intCast(size_bytes - 1)));
-        if (map_overflow != 0) return false;
-        const vfb_end, const vfb_overflow = @addWithOverflow(virtual_framebuffer.paddr, @as(u64, @intCast(virtual_framebuffer.size_bytes - 1)));
-        if (vfb_overflow != 0) return false;
-
-        return paddr >= virtual_framebuffer.paddr and map_end <= vfb_end;
-    }
-
     pub fn scanCapTables(self: *const KernelState, paddr: u64) OwnershipView {
         // デバッグ用: capability 走査から論理的な保持者ビューを作る。
         const p0_has = self.getTableConst(.Process0).find(paddr) != null;
@@ -873,6 +844,10 @@ pub const KernelState = struct {
         free_list: *FreePageList,
     ) KernelError!PageCapability {
         const cap = try self.allocPage(requester, free_list);
+        if (!builtin.is_test) {
+            const page_bytes: [*]u8 = @ptrFromInt(cap.paddr);
+            @memset(page_bytes[0..4096], 0);
+        }
         const root_id = self.allocCapId();
         try self.getTable(requester).add(.{
             .paddr = cap.paddr,
@@ -917,9 +892,11 @@ pub const KernelState = struct {
         rights: Rights,
     ) KernelError!void {
         if (from == to) return KernelError.InvalidState;
+        if (to == .Device0 and (rights.cpu_read or rights.cpu_write or !rights.dma)) return KernelError.InvalidState;
 
         const src = self.getTable(from);
         const src_cap = src.find(paddr) orelse return KernelError.CapabilityNotFound;
+        if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
         if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
 
         var moved = src_cap.*;
@@ -1104,6 +1081,28 @@ test "complete dma returns owner and capabilities" {
     try std.testing.expect(p0_cap.rights.dma);
 }
 
+test "complete dma restores original rights" {
+    var s = KernelState.initPhase1();
+    try s.moveCap(.Process0, .Process1, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = true,
+    });
+    try s.moveCap(.Process1, .Process0, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = true,
+    });
+
+    try s.startDma(0x1000);
+    try s.completeDma(0x1000);
+
+    const p0_cap = s.getTableConst(.Process0).find(0x1000).?;
+    try std.testing.expect(p0_cap.rights.cpu_read);
+    try std.testing.expect(!p0_cap.rights.cpu_write);
+    try std.testing.expect(p0_cap.rights.dma);
+}
+
 test "invalid transition rejected" {
     var s = KernelState.initPhase1();
     try std.testing.expectError(KernelError.InvalidState, s.completeDma(0x1000));
@@ -1167,6 +1166,29 @@ test "moveCap enforces single holder" {
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) == null);
     try std.testing.expect(s.getTableConst(.Device0).find(0x1000) != null);
     try std.testing.expectEqual(OwnershipView.Device0, s.scanCapTables(0x1000));
+}
+
+test "moveCap rejects rights escalation" {
+    var s = KernelState.initPhase1();
+    try s.moveCap(.Process0, .Process1, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = false,
+    });
+    try std.testing.expectError(KernelError.InvalidState, s.moveCap(.Process1, .Device0, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = true,
+    }));
+}
+
+test "moveCap rejects cpu rights when moving to Device0" {
+    var s = KernelState.initPhase1();
+    try std.testing.expectError(KernelError.InvalidState, s.moveCap(.Process0, .Device0, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = true,
+    }));
 }
 
 test "sendCap moves capability process to process with rights preserved" {
@@ -1254,52 +1276,4 @@ test "framebuffer capability grants draw right only to owner process" {
     try std.testing.expect(!s.canDrawToFramebuffer(.Process1, 0x8000_1000, 0x1000, true));
     try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x7FFF_F000, 0x2000, true));
     try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x8000_1000, 0x1000, false));
-}
-
-test "virtual framebuffer capability grants shared access to configured processes" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    const vfb_cap_owner = VirtualFramebufferCapability{
-        .paddr = 0x9000_0000,
-        .size_bytes = 4096,
-        .width = 32,
-        .height = 32,
-        .pixels_per_scan_line = 32,
-        .pixel_format = 0,
-        .allow_read = true,
-        .allow_write = true,
-    };
-    const vfb_cap_compositor = VirtualFramebufferCapability{
-        .paddr = 0x9000_0000,
-        .size_bytes = 4096,
-        .width = 32,
-        .height = 32,
-        .pixels_per_scan_line = 32,
-        .pixel_format = 0,
-        .allow_read = true,
-        .allow_write = true,
-    };
-    try s.grantVirtualFramebufferCap(.Process0, vfb_cap_owner);
-    try s.grantVirtualFramebufferCap(.Process1, vfb_cap_compositor);
-
-    try std.testing.expect(s.canAccessVirtualFramebuffer(.Process0, 0x9000_0000, 4096, true));
-    try std.testing.expect(s.canAccessVirtualFramebuffer(.Process1, 0x9000_0080, 128, true));
-    try std.testing.expect(!s.canAccessVirtualFramebuffer(.Process2, 0x9000_0000, 4096, false));
-    try std.testing.expect(!s.canAccessVirtualFramebuffer(.Process0, 0x8FFF_F000, 4096, true));
-}
-
-test "virtual framebuffer capability rejects write when allow_write is false" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    try s.grantVirtualFramebufferCap(.Process1, .{
-        .paddr = 0x9100_0000,
-        .size_bytes = 4096,
-        .width = 32,
-        .height = 32,
-        .pixels_per_scan_line = 32,
-        .pixel_format = 0,
-        .allow_read = true,
-        .allow_write = false,
-    });
-
-    try std.testing.expect(s.canAccessVirtualFramebuffer(.Process1, 0x9100_0000, 64, false));
-    try std.testing.expect(!s.canAccessVirtualFramebuffer(.Process1, 0x9100_0000, 64, true));
 }

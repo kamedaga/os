@@ -1,3 +1,5 @@
+const virtgpu = @import("virtgpu.zig");
+
 const framebuffer_va: usize = 0x3C00_5000;
 const boot_log_page_va: usize = 0x3C00_1000;
 
@@ -17,7 +19,7 @@ const log_payload_bytes: usize = 4096 - log_header_bytes;
 const default_fg_color: u32 = 0x00FF_FFFF;
 const default_bg_color: u32 = 0x0000_0000;
 const prompt_fg_color: u32 = 0x00FF_FF55;
-const enter_prompt_text = "Press Enter to launch compositor.\n";
+const enter_prompt_text = "Launching compositor...\n";
 
 const ParserState = enum {
     normal,
@@ -309,22 +311,32 @@ const AnsiParser = struct {
         }
     }
 
-    fn feed(self: *AnsiParser, c: *Console, ch: u8) void {
+    fn feedSlice(self: *AnsiParser, c: *Console, text: []const volatile u8, index: *usize) void {
+        const ch = text[index.*];
         switch (self.state) {
             .normal => {
                 if (ch == 0x1B) {
                     self.state = .esc;
+                    index.* += 1;
+                    return;
+                }
+                if (ch < 0x20 or ch == 0x7F) {
+                    c.putChar(ch);
+                    index.* += 1;
                     return;
                 }
                 c.putChar(ch);
+                index.* += 1;
             },
             .esc => {
                 if (ch == '[') {
                     self.resetCsi();
                     self.state = .csi;
+                    index.* += 1;
                     return;
                 }
                 self.state = .normal;
+                index.* += 1;
             },
             .csi => {
                 if (ch >= '0' and ch <= '9') {
@@ -332,6 +344,7 @@ const AnsiParser = struct {
                     const next: u16 = self.current * 10 + digit;
                     self.current = if (next > 999) 999 else next;
                     self.saw_digit = true;
+                    index.* += 1;
                     return;
                 }
 
@@ -339,6 +352,7 @@ const AnsiParser = struct {
                     self.pushParam();
                     self.current = 0;
                     self.saw_digit = false;
+                    index.* += 1;
                     return;
                 }
 
@@ -349,6 +363,7 @@ const AnsiParser = struct {
                     self.applyCsi(c, ch);
                 }
                 self.state = .normal;
+                index.* += 1;
             },
         }
     }
@@ -424,6 +439,8 @@ fn glyphRows(raw: u8) [glyph_h]u8 {
         '>' => .{ 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08 },
         '\'' => .{ 0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00 },
         '"' => .{ 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        '`' => .{ 0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00 },
+        '~' => .{ 0x00, 0x09, 0x16, 0x00, 0x00, 0x00, 0x00 },
         else => .{ 0x0E, 0x11, 0x01, 0x06, 0x04, 0x00, 0x04 },
     };
 }
@@ -433,17 +450,16 @@ fn renderBootLogAndPrompt(c: *Console, log: [*]const volatile u8) void {
     var parser = AnsiParser{};
     var text_len: usize = @intCast(readU32LE(log, 0));
     if (text_len > log_payload_bytes) text_len = log_payload_bytes;
+    const payload: []const volatile u8 = log[log_header_bytes .. log_header_bytes + text_len];
 
     var i: usize = 0;
-    while (i < text_len) : (i += 1) {
-        parser.feed(c, log[log_header_bytes + i]);
+    while (i < text_len) {
+        parser.feedSlice(c, payload, &i);
     }
 
     c.newline();
     c.fg = prompt_fg_color;
-    for (enter_prompt_text) |ch| {
-        c.putChar(ch);
-    }
+    for (enter_prompt_text) |ch| c.putChar(ch);
     c.fg = default_fg_color;
 }
 
@@ -453,6 +469,7 @@ pub export fn _start() noreturn {
 
     var c = Console{ .fb = fb };
     renderBootLogAndPrompt(&c, log);
+    _ = virtgpu.virtgpu_prewarm();
     while (true) {
         asm volatile ("pause");
     }

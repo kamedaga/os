@@ -1,15 +1,18 @@
 const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
+const window_client = @import("window_client.zig");
 
 const syscall_ok: u64 = 0;
 const syscall_err_empty: u64 = 13;
 
-const framebuffer_user_va: usize = 0x3C00_5000;
+const window_pixels_va: usize = 0x3C00_4000;
+const window_meta_shared_va: usize = 0x3C00_7000;
+const window_cap_tmp_va: u64 = 0x2000_4000;
 const request_page_va: usize = 0x2000_3000;
-const fb_width: usize = 832;
-const fb_height: usize = 624;
-const fb_pitch: usize = 832;
+const fb_width: usize = 32;
+const fb_height: usize = 32;
+const fb_pitch: usize = 32;
 const request_header_qwords: usize = 8;
 const request_payload_offset: usize = request_header_qwords * @sizeOf(u64);
 const request_payload_bytes: usize = 4096 - request_payload_offset;
@@ -24,7 +27,7 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
@@ -35,7 +38,7 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn recvCap() u64 {
@@ -43,7 +46,7 @@ fn recvCap() u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_recv_cap),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn clampRectToFramebuffer(
@@ -71,7 +74,19 @@ fn clampRectToFramebuffer(
 
 pub export fn _start() noreturn {
     _ = userLog("FramebufferServer: started\n");
-    const fb: [*]volatile u32 = @ptrFromInt(framebuffer_user_va);
+    const window_created = window_client.createAndPublishWindowWithDma(
+        @intCast(fb_width),
+        @intCast(fb_height),
+        window_cap_tmp_va,
+        window_pixels_va,
+        window_meta_shared_va,
+    );
+    if (!window_created) {
+        _ = userLog("FramebufferServer: create window failed\n");
+        while (true) asm volatile ("pause");
+    }
+    window_client.setWindowTitle(window_meta_shared_va, "FramebufferSrv");
+    const fb: [*]volatile u32 = @ptrFromInt(window_pixels_va);
     while (true) {
         const paddr = recvCap();
         if (paddr == syscall_err_empty) {

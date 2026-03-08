@@ -7,6 +7,8 @@ const pci_cap_id_vendor: u8 = 0x09;
 const virtio_vendor_id: u16 = 0x1AF4;
 const virtio_input_device_modern: u16 = 0x1052;
 const virtio_input_subsystem_id: u16 = 0x0012;
+const virtio_gpu_device_modern: u16 = 0x1050;
+const virtio_gpu_subsystem_id: u16 = 0x0010;
 
 const virtio_pci_cap_common_cfg: u8 = 1;
 const virtio_pci_cap_notify_cfg: u8 = 2;
@@ -48,6 +50,7 @@ pub const InputModernInfo = struct {
 
 pub const MouseModernInfo = InputModernInfo;
 pub const KeyboardModernInfo = InputModernInfo;
+pub const GpuModernInfo = InputModernInfo;
 
 fn emit(write_log: *const fn ([]const u8) void, text: []const u8) void {
     write_log(text);
@@ -85,6 +88,10 @@ fn readMemBarBase(loc: pci.Location, bar_index: u8) ?u64 {
 
 fn looksLikeVirtioInput(device_id: u16, subsystem_id: u16) bool {
     return device_id == virtio_input_device_modern or subsystem_id == virtio_input_subsystem_id;
+}
+
+fn looksLikeVirtioGpu(device_id: u16, subsystem_id: u16) bool {
+    return device_id == virtio_gpu_device_modern or subsystem_id == virtio_gpu_subsystem_id;
 }
 
 fn mmioReadU8(addr: u64) u8 {
@@ -143,6 +150,103 @@ fn matchInputKind(device_cfg: u64, want: InputKind, write_log: *const fn ([]cons
     };
 }
 
+fn collectModernCaps(
+    write_log: *const fn ([]const u8) void,
+    loc: pci.Location,
+    device_id: u16,
+    subsystem_id: u16,
+) ?InputModernInfo {
+    emitFmt(
+        write_log,
+        "virtio-probe: candidate {x:0>2}:{x:0>2}.{x} did=0x{x} subsys=0x{x}\n",
+        .{ loc.bus, loc.device, loc.function, device_id, subsystem_id },
+    );
+
+    const status = pci.readConfigU16(loc, 0x06);
+    if ((status & pci_status_cap_list) == 0) {
+        emit(write_log, "virtio-probe: no PCI capability list\n");
+        return null;
+    }
+
+    var common_cfg: u64 = 0;
+    var notify_cfg: u64 = 0;
+    var isr_cfg: u64 = 0;
+    var device_cfg: u64 = 0;
+    var notify_off_multiplier: u32 = 0;
+
+    var cap_ptr: u8 = pci.readConfigU8(loc, 0x34) & 0xFC;
+    var iter: usize = 0;
+    while (cap_ptr != 0 and iter < 64) : (iter += 1) {
+        const cap_id = pci.readConfigU8(loc, cap_ptr + 0);
+        const next_ptr = pci.readConfigU8(loc, cap_ptr + 1) & 0xFC;
+
+        if (cap_id == pci_cap_id_vendor) {
+            const cfg_type = pci.readConfigU8(loc, cap_ptr + 3);
+            const bar_index = pci.readConfigU8(loc, cap_ptr + 4);
+            const cap_offset = pci.readConfigU32(loc, cap_ptr + 8);
+            const cap_length = pci.readConfigU32(loc, cap_ptr + 12);
+            emitFmt(
+                write_log,
+                "virtio-probe: cap cfg_type={d} bar={d} off=0x{x} len=0x{x}\n",
+                .{ cfg_type, bar_index, cap_offset, cap_length },
+            );
+            if (cap_length != 0 and bar_index < 6) {
+                const bar_base = readMemBarBase(loc, bar_index) orelse {
+                    emit(write_log, "virtio-probe:   skip cap (BAR base unavailable)\n");
+                    if (next_ptr == cap_ptr) break;
+                    cap_ptr = next_ptr;
+                    continue;
+                };
+                const start = addU64(bar_base, cap_offset) orelse {
+                    emit(write_log, "virtio-probe:   skip cap (address overflow)\n");
+                    if (next_ptr == cap_ptr) break;
+                    cap_ptr = next_ptr;
+                    continue;
+                };
+                _ = addU64(start, @as(u64, cap_length - 1)) orelse {
+                    emit(write_log, "virtio-probe:   skip cap (length overflow)\n");
+                    if (next_ptr == cap_ptr) break;
+                    cap_ptr = next_ptr;
+                    continue;
+                };
+                switch (cfg_type) {
+                    virtio_pci_cap_common_cfg => common_cfg = start,
+                    virtio_pci_cap_notify_cfg => {
+                        notify_cfg = start;
+                        notify_off_multiplier = pci.readConfigU32(loc, cap_ptr + 16);
+                    },
+                    virtio_pci_cap_isr_cfg => isr_cfg = start,
+                    virtio_pci_cap_device_cfg => device_cfg = start,
+                    else => {},
+                }
+            }
+        }
+
+        if (next_ptr == cap_ptr) break;
+        cap_ptr = next_ptr;
+    }
+
+    if (common_cfg == 0 or notify_cfg == 0) {
+        emitFmt(
+            write_log,
+            "virtio-probe: modern caps missing common={d} notify={d}\n",
+            .{ if (common_cfg != 0) @as(u8, 1) else @as(u8, 0), if (notify_cfg != 0) @as(u8, 1) else @as(u8, 0) },
+        );
+        return null;
+    }
+
+    return .{
+        .location = loc,
+        .device_id = device_id,
+        .subsystem_id = subsystem_id,
+        .common_cfg = common_cfg,
+        .notify_cfg = notify_cfg,
+        .isr_cfg = isr_cfg,
+        .device_cfg = device_cfg,
+        .notify_off_multiplier = notify_off_multiplier,
+    };
+}
+
 fn probeInputModern(write_log: *const fn ([]const u8) void, want: InputKind) ?InputModernInfo {
     var bus: u16 = 0;
     while (bus < 256) : (bus += 1) {
@@ -171,96 +275,9 @@ fn probeInputModern(write_log: *const fn ([]const u8) void, want: InputKind) ?In
                 const subsystem_id = pci.readSubsystemId(loc);
                 if (!looksLikeVirtioInput(device_id, subsystem_id)) continue;
 
-                emitFmt(
-                    write_log,
-                    "virtio-probe: candidate {x:0>2}:{x:0>2}.{x} did=0x{x} subsys=0x{x}\n",
-                    .{ loc.bus, loc.device, loc.function, device_id, subsystem_id },
-                );
-
-                const status = pci.readConfigU16(loc, 0x06);
-                if ((status & pci_status_cap_list) == 0) {
-                    emit(write_log, "virtio-probe: no PCI capability list\n");
-                    continue;
-                }
-
-                var common_cfg: u64 = 0;
-                var notify_cfg: u64 = 0;
-                var isr_cfg: u64 = 0;
-                var device_cfg: u64 = 0;
-                var notify_off_multiplier: u32 = 0;
-
-                var cap_ptr: u8 = pci.readConfigU8(loc, 0x34) & 0xFC;
-                var iter: usize = 0;
-                while (cap_ptr != 0 and iter < 64) : (iter += 1) {
-                    const cap_id = pci.readConfigU8(loc, cap_ptr + 0);
-                    const next_ptr = pci.readConfigU8(loc, cap_ptr + 1) & 0xFC;
-
-                    if (cap_id == pci_cap_id_vendor) {
-                        const cfg_type = pci.readConfigU8(loc, cap_ptr + 3);
-                        const bar_index = pci.readConfigU8(loc, cap_ptr + 4);
-                        const cap_offset = pci.readConfigU32(loc, cap_ptr + 8);
-                        const cap_length = pci.readConfigU32(loc, cap_ptr + 12);
-                        emitFmt(
-                            write_log,
-                            "virtio-probe: cap cfg_type={d} bar={d} off=0x{x} len=0x{x}\n",
-                            .{ cfg_type, bar_index, cap_offset, cap_length },
-                        );
-                        if (cap_length != 0 and bar_index < 6) {
-                            const bar_base = readMemBarBase(loc, bar_index) orelse {
-                                emit(write_log, "virtio-probe:   skip cap (BAR base unavailable)\n");
-                                if (next_ptr == cap_ptr) break;
-                                cap_ptr = next_ptr;
-                                continue;
-                            };
-                            const start = addU64(bar_base, cap_offset) orelse {
-                                emit(write_log, "virtio-probe:   skip cap (address overflow)\n");
-                                if (next_ptr == cap_ptr) break;
-                                cap_ptr = next_ptr;
-                                continue;
-                            };
-                            _ = addU64(start, @as(u64, cap_length - 1)) orelse {
-                                emit(write_log, "virtio-probe:   skip cap (length overflow)\n");
-                                if (next_ptr == cap_ptr) break;
-                                cap_ptr = next_ptr;
-                                continue;
-                            };
-                            switch (cfg_type) {
-                                virtio_pci_cap_common_cfg => common_cfg = start,
-                                virtio_pci_cap_notify_cfg => {
-                                    notify_cfg = start;
-                                    notify_off_multiplier = pci.readConfigU32(loc, cap_ptr + 16);
-                                },
-                                virtio_pci_cap_isr_cfg => isr_cfg = start,
-                                virtio_pci_cap_device_cfg => device_cfg = start,
-                                else => {},
-                            }
-                        }
-                    }
-
-                    if (next_ptr == cap_ptr) break;
-                    cap_ptr = next_ptr;
-                }
-
-                if (common_cfg == 0 or notify_cfg == 0) {
-                    emitFmt(
-                        write_log,
-                        "virtio-probe: modern caps missing common={d} notify={d}\n",
-                        .{ if (common_cfg != 0) @as(u8, 1) else @as(u8, 0), if (notify_cfg != 0) @as(u8, 1) else @as(u8, 0) },
-                    );
-                    continue;
-                }
-                if (!matchInputKind(device_cfg, want, write_log)) continue;
-
-                return .{
-                    .location = loc,
-                    .device_id = device_id,
-                    .subsystem_id = subsystem_id,
-                    .common_cfg = common_cfg,
-                    .notify_cfg = notify_cfg,
-                    .isr_cfg = isr_cfg,
-                    .device_cfg = device_cfg,
-                    .notify_off_multiplier = notify_off_multiplier,
-                };
+                const info = collectModernCaps(write_log, loc, device_id, subsystem_id) orelse continue;
+                if (!matchInputKind(info.device_cfg, want, write_log)) continue;
+                return info;
             }
         }
     }
@@ -274,4 +291,40 @@ pub fn probeMouseModern(write_log: *const fn ([]const u8) void) ?MouseModernInfo
 
 pub fn probeKeyboardModern(write_log: *const fn ([]const u8) void) ?KeyboardModernInfo {
     return probeInputModern(write_log, .keyboard);
+}
+
+pub fn probeGpuModern(write_log: *const fn ([]const u8) void) ?GpuModernInfo {
+    var bus: u16 = 0;
+    while (bus < 256) : (bus += 1) {
+        var device: u16 = 0;
+        while (device < 32) : (device += 1) {
+            const func0 = pci.Location{
+                .bus = @intCast(bus),
+                .device = @intCast(device),
+                .function = 0,
+            };
+            if (pci.readVendorId(func0) == 0xFFFF) continue;
+            const header0 = pci.readHeaderType(func0);
+            const function_count: u8 = if ((header0 & 0x80) != 0) 8 else 1;
+
+            var function: u8 = 0;
+            while (function < function_count) : (function += 1) {
+                const loc = pci.Location{
+                    .bus = @intCast(bus),
+                    .device = @intCast(device),
+                    .function = function,
+                };
+                const vendor_id = pci.readVendorId(loc);
+                if (vendor_id == 0xFFFF or vendor_id != virtio_vendor_id) continue;
+
+                const device_id = pci.readDeviceId(loc);
+                const subsystem_id = pci.readSubsystemId(loc);
+                if (!looksLikeVirtioGpu(device_id, subsystem_id)) continue;
+
+                return collectModernCaps(write_log, loc, device_id, subsystem_id);
+            }
+        }
+    }
+
+    return null;
 }

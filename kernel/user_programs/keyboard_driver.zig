@@ -79,7 +79,7 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
@@ -90,7 +90,7 @@ fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64) u64 {
@@ -102,7 +102,7 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_v
           [arg1] "{rsi}" (page_count),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
           [arg3] "{rcx}" (out_paddr_list_va),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn mmioReadU8(addr: usize) u8 {
@@ -245,14 +245,17 @@ pub export fn _start() noreturn {
     const common_page_paddr = readCfgU64(1);
     const notify_page_paddr = readCfgU64(2);
     const isr_page_paddr = readCfgU64(3);
-    const device_page_paddr = readCfgU64(4);
+    const _device_page_paddr = readCfgU64(4);
     const common_off: usize = @intCast(readCfgU64(5));
     const notify_off: usize = @intCast(readCfgU64(6));
     const isr_off: usize = @intCast(readCfgU64(7));
     const _device_off: usize = @intCast(readCfgU64(8));
+    _ = _device_page_paddr;
     _ = _device_off;
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
     const shared_page_paddr = readCfgU64(10);
+    var queue_paddr0 = readCfgU64(11);
+    var queue_paddr1 = readCfgU64(12);
 
     if (shared_page_paddr < 0x1000) {
         _ = userLog("KeyboardDriver: invalid shared page paddr\n");
@@ -273,35 +276,27 @@ pub export fn _start() noreturn {
             while (true) asm volatile ("pause");
         }
     }
-    if (device_page_paddr != 0) {
-        _ = mapMmioPage(device_page_va, device_page_paddr, false);
-    }
 
     const common_base = common_page_va + common_off;
     const notify_base = notify_page_va + notify_off;
     const isr_base = if (isr_page_paddr != 0) isr_page_va + isr_off else 0;
 
-    var queue_paddrs: [2]u64 = .{ 0, 0 };
-    if (allocMapPages(queue_page0_va, 2, true, @intFromPtr(&queue_paddrs)) != syscall_ok) {
-        _ = userLog("KeyboardDriver: alloc/map queue pages failed\n");
-        while (true) asm volatile ("pause");
+    if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
+        var queue_paddrs: [2]u64 = .{ 0, 0 };
+        if (allocMapPages(queue_page0_va, 2, true, @intFromPtr(&queue_paddrs)) != syscall_ok) {
+            _ = userLog("KeyboardDriver: alloc/map queue pages failed\n");
+            while (true) asm volatile ("pause");
+        }
+        queue_paddr0 = queue_paddrs[0];
+        queue_paddr1 = queue_paddrs[1];
     }
-    const queue_paddr0 = queue_paddrs[0];
-    const queue_paddr1 = queue_paddrs[1];
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
         _ = userLog("KeyboardDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
     }
-    const queue_bytes: [*]volatile u8 = @ptrFromInt(queue_page0_va);
-    var i: usize = 0;
-    while (i < queue_region_bytes) : (i += 1) {
-        queue_bytes[i] = 0;
-    }
-
     mmioWriteU8(common_base + common_device_status, 0);
     mmioWriteU8(common_base + common_device_status, status_acknowledge | status_driver);
     mmioWriteU32(common_base + common_device_feature_select, 0);
-    _ = mmioReadU32(common_base + common_device_feature);
     mmioWriteU32(common_base + common_driver_feature_select, 0);
     mmioWriteU32(common_base + common_driver_feature, 0);
     mmioWriteU32(common_base + common_driver_feature_select, 1);

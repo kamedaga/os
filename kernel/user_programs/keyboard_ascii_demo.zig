@@ -1,26 +1,27 @@
 const syscall_log: u64 = 0x9;
+const font = @import("font.zig");
 const window_client = @import("window_client.zig");
 
 const keyboard_shared_page_va: usize = 0x3C00_6000;
-const virtual_framebuffer_va: usize = 0x3C00_4000;
+const window_pixels_va: usize = 0x3C00_4000;
 const window_meta_shared_va: usize = 0x3C00_7000;
 const window_cap_tmp_va: u64 = 0x201F_F000;
 
 const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
-const vfb_width: usize = 16;
-const vfb_height: usize = 32;
-const vfb_pitch: usize = 16;
+const pixel_width: usize = 32;
+const pixel_height: usize = 32;
+const pixel_pitch: usize = 32;
 
 const panel_x: usize = 0;
 const panel_y: usize = 0;
-const panel_w: usize = 16;
+const panel_w: usize = 32;
 const panel_h: usize = 32;
 
 const glyph_w: usize = 5;
 const glyph_h: usize = 7;
 
-const history_capacity: usize = 6;
-const history_cols: usize = 2;
+const history_capacity: usize = 12;
+const history_cols: usize = 4;
 const history_rows: usize = 3;
 const history_cell_w: usize = 6;
 const history_cell_h: usize = 8;
@@ -32,19 +33,28 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
-        : .{ .memory = true });
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn fillRect(vfb: [*]volatile u32, x: usize, y: usize, w: usize, h: usize, color: u32) void {
     if (w == 0 or h == 0) return;
     var yy: usize = y;
-    while (yy < y + h and yy < vfb_height) : (yy += 1) {
-        const row = yy * vfb_pitch;
+    while (yy < y + h and yy < pixel_height) : (yy += 1) {
+        const row = yy * pixel_pitch;
         var xx: usize = x;
-        while (xx < x + w and xx < vfb_width) : (xx += 1) {
+        while (xx < x + w and xx < pixel_width) : (xx += 1) {
             vfb[row + xx] = color;
         }
     }
+}
+
+fn setVfbPixel(vfb: [*]volatile u32, x: i32, y: i32, color: u32, alpha: u8) void {
+    if (x < 0 or y < 0) return;
+    if (x >= pixel_width or y >= pixel_height) return;
+    const ux: usize = @intCast(x);
+    const uy: usize = @intCast(y);
+    const index = uy * pixel_pitch + ux;
+    vfb[index] = font.blendColor(vfb[index], color, alpha);
 }
 
 fn glyphRows(raw: u8) [glyph_h]u8 {
@@ -116,19 +126,19 @@ fn glyphRows(raw: u8) [glyph_h]u8 {
     };
 }
 
-fn drawGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) void {
+fn drawTinyGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) void {
     const glyph = glyphRows(ch);
     var gy: usize = 0;
     while (gy < glyph_h) : (gy += 1) {
         const bits = glyph[gy];
         const py = y + gy;
-        if (py >= vfb_height) continue;
-        const row = py * vfb_pitch;
+        if (py >= pixel_height) continue;
+        const row = py * pixel_pitch;
         var gx: usize = 0;
         while (gx < glyph_w) : (gx += 1) {
             if ((bits & (@as(u8, 1) << @intCast((glyph_w - 1) - gx))) == 0) continue;
             const px = x + gx;
-            if (px >= vfb_width) continue;
+            if (px >= pixel_width) continue;
             vfb[row + px] = color;
         }
     }
@@ -158,17 +168,17 @@ fn pushAsciiHistory(history: *[history_capacity]u8, history_len: *usize, ch: u8)
 
 fn drawKeyboardHistoryPanel(vfb: [*]volatile u32, history: []const u8) void {
     fillRect(vfb, panel_x, panel_y, panel_w, panel_h, 0x00FD_FDFD);
-    fillRect(vfb, panel_x + 1, 1, 14, 30, 0x0060_6060);
-    fillRect(vfb, panel_x + 2, 2, 12, 28, 0x00EE_EEEE);
+    fillRect(vfb, panel_x + 1, 1, 30, 30, 0x0060_6060);
+    fillRect(vfb, panel_x + 2, 2, 28, 28, 0x00EE_EEEE);
 
     var i: usize = 0;
     while (i < history.len) : (i += 1) {
         const row = i / history_cols;
         if (row >= history_rows) break;
         const col = i % history_cols;
-        const x = panel_x + 2 + col * history_cell_w;
-        const y = 4 + row * history_cell_h;
-        drawGlyph(vfb, x, y, normalizeHistoryChar(history[i]), 0x0010_1010);
+        const x = panel_x + 4 + col * history_cell_w;
+        const y = panel_y + 4 + row * history_cell_h;
+        drawTinyGlyph(vfb, x, y, normalizeHistoryChar(history[i]), 0x0010_1010);
     }
 }
 
@@ -181,21 +191,23 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
 
+    _ = userLog("KeyboardAsciiDemo: createAndPublishWindow before\n");
     const window_created = window_client.createAndPublishWindow(
-        @intCast(vfb_width),
-        @intCast(vfb_height),
+        @intCast(pixel_width),
+        @intCast(pixel_height),
         0,
         window_cap_tmp_va,
-        virtual_framebuffer_va,
+        window_pixels_va,
         window_meta_shared_va,
     );
     if (!window_created) {
         _ = userLog("KeyboardAsciiDemo: create window failed\n");
         while (true) asm volatile ("pause");
     }
+    _ = userLog("KeyboardAsciiDemo: createAndPublishWindow after\n");
     window_client.setWindowTitle(window_meta_shared_va, "Keyboard Demo");
 
-    const vfb: [*]volatile u32 = @ptrFromInt(virtual_framebuffer_va);
+    const vfb: [*]volatile u32 = @ptrFromInt(window_pixels_va);
     var last_kbd_seq: u64 = 0;
     var ascii_history: [history_capacity]u8 = [_]u8{' '} ** history_capacity;
     var ascii_history_len: usize = 0;

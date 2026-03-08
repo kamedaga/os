@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     user_mod.strip = true;
     const user_app = b.addExecutable(.{
@@ -65,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     draw_client_mod.strip = true;
     const draw_client_app = b.addExecutable(.{
@@ -86,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     boot_log_console_mod.strip = true;
     const boot_log_console_app = b.addExecutable(.{
@@ -107,6 +110,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     mouse_driver_mod.strip = true;
     const mouse_driver_app = b.addExecutable(.{
@@ -128,6 +132,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     keyboard_driver_mod.strip = true;
     const keyboard_driver_app = b.addExecutable(.{
@@ -149,6 +154,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     bootlog_sender_mod.strip = true;
     const bootlog_sender_app = b.addExecutable(.{
@@ -170,6 +176,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     mouse_button_demo_mod.strip = true;
     const mouse_button_demo_app = b.addExecutable(.{
@@ -191,6 +198,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     keyboard_ascii_demo_mod.strip = true;
     const keyboard_ascii_demo_app = b.addExecutable(.{
@@ -212,6 +220,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     mouse_draw_mod.strip = true;
     const mouse_draw_app = b.addExecutable(.{
@@ -233,6 +242,7 @@ pub fn build(b: *std.Build) void {
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     compositor_mod.strip = true;
     const compositor_app = b.addExecutable(.{
@@ -249,11 +259,34 @@ pub fn build(b: *std.Build) void {
     const compositor_step = b.step("compositor-elf", "Build compositor PIE ELF");
     compositor_step.dependOn(&install_compositor.step);
 
+    const gpu_compositor_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/gpu_compositor.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    gpu_compositor_mod.strip = true;
+    const gpu_compositor_app = b.addExecutable(.{
+        .name = "GPUCOMP",
+        .root_module = gpu_compositor_mod,
+    });
+    gpu_compositor_app.pie = true;
+    gpu_compositor_app.entry = .{ .symbol_name = "_start" };
+    gpu_compositor_app.link_z_common_page_size = 0x10;
+    gpu_compositor_app.link_z_max_page_size = 0x10;
+    const install_gpu_compositor = b.addInstallArtifact(gpu_compositor_app, .{
+        .dest_sub_path = "EFI/BOOT/GPUCOMP.ELF",
+    });
+    const gpu_compositor_step = b.step("gpu-compositor-elf", "Build GPU compositor PIE ELF");
+    gpu_compositor_step.dependOn(&install_gpu_compositor.step);
+
     const framebuffer_server_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/framebuffer_server.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .red_zone = false,
     });
     framebuffer_server_mod.strip = true;
     const framebuffer_server_app = b.addExecutable(.{
@@ -283,6 +316,7 @@ pub fn build(b: *std.Build) void {
     install_efi.step.dependOn(&install_keyboard_ascii_demo.step);
     install_efi.step.dependOn(&install_mouse_draw.step);
     install_efi.step.dependOn(&install_compositor.step);
+    install_efi.step.dependOn(&install_gpu_compositor.step);
     install_efi.step.dependOn(&install_framebuffer_server.step);
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
