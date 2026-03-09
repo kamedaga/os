@@ -2,7 +2,8 @@ const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 
 pub const UserAddressSpace = struct {
-    pub const max_dynamic_pt_pages: usize = 512;
+    // The current user VA window is below 512 MiB, so 256 PT pages are sufficient.
+    pub const max_dynamic_pt_pages: usize = 256;
     pub const no_pd_index: u16 = 0xFFFF;
 
     pml4: [512]u64 align(4096) = [_]u64{0} ** 512,
@@ -50,25 +51,11 @@ pub fn init(config: RuntimeConfig) void {
 }
 
 fn processIndex(principal: kernel.PrincipalId) ?usize {
-    return switch (principal) {
-        .Process0 => 0,
-        .Process1 => 1,
-        .Process2 => 2,
-        .Process3 => 3,
-        .Process4 => 4,
-        else => null,
-    };
+    return kernel.processIndexFromPrincipal(principal);
 }
 
 fn principalFromProcessIndex(index: usize) ?kernel.PrincipalId {
-    return switch (index) {
-        0 => .Process0,
-        1 => .Process1,
-        2 => .Process2,
-        3 => .Process3,
-        4 => .Process4,
-        else => null,
-    };
+    return kernel.processPrincipalFromIndex(index);
 }
 
 fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
@@ -232,6 +219,68 @@ pub fn mapUserPageFromCapability(
     return true;
 }
 
+fn mapUserPageFromCapabilityNoAlias(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    va: u64,
+    paddr: u64,
+    writable: bool,
+) bool {
+    if (!runtime_ready) return false;
+    const space = getUserSpace(principal) orelse return false;
+    if ((va & 0xFFF) != 0) return false;
+    if ((paddr & 0xFFF) != 0) return false;
+    if (paddr >= runtime.physical_map_limit) return false;
+
+    const pd_index = userPdIndexForVa(va) orelse return false;
+    const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+    const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
+
+    const cap = state.getTableConst(principal).find(paddr) orelse return false;
+    if (!cap.rights.cpu_read) return false;
+    if (writable and !cap.rights.cpu_write) return false;
+
+    space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    runtime.flush_user_tlb_for_principal_va(principal, va);
+    return true;
+}
+
+pub fn mapUserPagesFromCapabilityBatch(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    base_va: u64,
+    paddrs: []const u64,
+    writable: bool,
+) bool {
+    if (!runtime_ready) return false;
+    if ((base_va & 0xFFF) != 0) return false;
+
+    var i: usize = 0;
+    while (i < paddrs.len) : (i += 1) {
+        const paddr = paddrs[i];
+        if ((paddr & 0xFFF) != 0) return false;
+        if (paddr >= runtime.physical_map_limit) return false;
+
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            if (paddrs[j] == paddr) return false;
+        }
+
+        const cap = state.getTableConst(principal).find(paddr) orelse return false;
+        if (!cap.rights.cpu_read) return false;
+        if (writable and !cap.rights.cpu_write) return false;
+    }
+
+    i = 0;
+    while (i < paddrs.len) : (i += 1) {
+        const offset: u64 = @intCast(i * 4096);
+        const va, const va_overflow = @addWithOverflow(base_va, offset);
+        if (va_overflow != 0) return false;
+        if (!mapUserPageFromCapabilityNoAlias(state, principal, va, paddrs[i], writable)) return false;
+    }
+    return true;
+}
+
 pub fn mapFreshUserPage(
     principal: kernel.PrincipalId,
     va: u64,
@@ -368,11 +417,11 @@ pub fn dumpPrincipalCaps(state: *const kernel.KernelState, principal: kernel.Pri
 }
 
 pub fn dumpCapabilityView(state: *const kernel.KernelState) void {
-    dumpPrincipalCaps(state, .Process0, "Process0");
-    dumpPrincipalCaps(state, .Process1, "Process1");
-    dumpPrincipalCaps(state, .Process2, "Process2");
-    dumpPrincipalCaps(state, .Process3, "Process3");
-    dumpPrincipalCaps(state, .Process4, "Process4");
+    var i: usize = 0;
+    while (i < kernel.process_count) : (i += 1) {
+        const principal = kernel.processPrincipalFromIndex(i) orelse unreachable;
+        dumpPrincipalCaps(state, principal, kernel.principalLabel(principal));
+    }
     dumpPrincipalCaps(state, .Device0, "Device0");
 }
 

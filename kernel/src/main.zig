@@ -1,6 +1,7 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
+const untyped_memory = @import("untyped_memory.zig");
 const elf_loader = @import("elf_loader.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
@@ -10,6 +11,15 @@ const user_programs = @import("user_programs.zig");
 const uefi = std.os.uefi;
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
+
+pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
+    _ = trace;
+    _ = ret_addr;
+    earlyUefiWrite(&[_:0]u16{ 'P', 'A', 'N', 'I', 'C', ':', ' ', 0 });
+    earlyUefiWriteAscii(msg);
+    earlyUefiWrite(&[_:0]u16{ '\r', '\n', 0 });
+    while (true) asm volatile ("hlt");
+}
 
 const page_entries: usize = 512;
 const four_gib: u64 = 4 * 1024 * 1024 * 1024;
@@ -48,6 +58,8 @@ const enable_virtio_input_keyboard = true;
 const enable_bootlog_wait_for_enter = false;
 const enable_title_only_ready_logs = true;
 const enable_cap_table_dump_logs = false;
+const enable_iommu_no_cap_driver = true;
+const enforce_iommu_no_cap_driver = false;
 const user_entry_rflags: u64 = 0x202;
 const user_unmapped_test_va: u64 = 0x20100000;
 const user_dma_verify_va: u64 = 0x20110000;
@@ -67,7 +79,7 @@ const page_user: u64 = 1 << 2;
 const page_ps: u64 = 1 << 7;
 const lapic_timer_vector: u8 = 0x40;
 const lapic_timer_initial_count: u32 = 50_000;
-const scheduler_quantum_ticks: u64 = 1;
+const scheduler_quantum_ticks: u64 = 4;
 const bootlog_gate_input_start_delay_ticks: u64 = 8;
 const bootlog_gate_auto_input_start_delay_ticks: u64 = 1;
 const deferred_compositor_auto_launch_delay_ticks: u64 = 1;
@@ -79,7 +91,6 @@ const scheduler_int80_log_max_lines: u64 = 192;
 const scheduler_race_log_max_lines: u64 = 128;
 const enable_switch_thread_syscall_log = false;
 const user_log_max_bytes: usize = 256;
-const user_elf_max_size: usize = 8 * 1024 * 1024;
 const fx_state_bytes: usize = 512;
 const user_elf_disk_path: [*:0]const u16 = &[_:0]u16{
     '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'U', 'S', 'E', 'R', 'A', 'P', 'P', '.', 'E', 'L', 'F',
@@ -125,6 +136,10 @@ const keyboard_ascii_demo_elf_disk_path: [*:0]const u16 = &[_:0]u16{
     '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'K', 'E', 'Y', 'B', 'D', 'E', 'M', 'O', '.', 'E', 'L', 'F',
 };
 const keyboard_ascii_demo_elf_disk_path_log = "\\EFI\\BOOT\\KEYBDEMO.ELF";
+const terminal_window_elf_disk_path: [*:0]const u16 = &[_:0]u16{
+    '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'T', 'E', 'R', 'M', 'W', 'I', 'N', '.', 'E', 'L', 'F',
+};
+const terminal_window_elf_disk_path_log = "\\EFI\\BOOT\\TERMWIN.ELF";
 const boot_log_max_bytes: usize = 32 * 1024;
 const boot_log_page_header_bytes: usize = 8;
 const boot_log_page_payload_bytes: usize = 4096 - boot_log_page_header_bytes;
@@ -142,8 +157,8 @@ const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
 const debug_skip_exit_boot_services = false;
 const debug_skip_cr3_switch = false;
 const debug_trigger_page_fault_test = false;
-const user_process_count: usize = 5;
-const user_thread_count: usize = 5;
+const user_process_count: usize = kernel.process_count;
+const user_thread_count: usize = user_process_count;
 const UserAddressSpace = capability.UserAddressSpace;
 
 const ThreadContext = struct {
@@ -155,19 +170,25 @@ const ThreadContext = struct {
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
 };
 
+fn buildInitialThreadContexts() [user_thread_count]ThreadContext {
+    var contexts: [user_thread_count]ThreadContext = undefined;
+    inline for (0..user_thread_count) |i| {
+        contexts[i] = .{
+            .id = @intCast(i),
+            .owner_process = kernel.processPrincipalFromIndex(i) orelse unreachable,
+        };
+    }
+    return contexts;
+}
+
 var pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pd_tables: [pd_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** pd_table_count;
 var high_mmio_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var high_mmio_pd_tables: [high_mmio_pdp_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_mmio_pdp_table_count;
-var user_spaces: [user_process_count]UserAddressSpace = [_]UserAddressSpace{.{}} ** user_process_count;
-var thread_contexts: [user_thread_count]ThreadContext = .{
-    .{ .id = 0, .owner_process = .Process0 },
-    .{ .id = 1, .owner_process = .Process1 },
-    .{ .id = 2, .owner_process = .Process2 },
-    .{ .id = 3, .owner_process = .Process3 },
-    .{ .id = 4, .owner_process = .Process4 },
-};
+var user_spaces_backing: ?[]align(4096) uefi.Page = null;
+var user_spaces: []UserAddressSpace = &.{};
+var thread_contexts: [user_thread_count]ThreadContext = buildInitialThreadContexts();
 var global_free_list: kernel.FreePageList = .{};
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
 var gdt: [7]u64 align(16) = .{
@@ -180,6 +201,8 @@ var gdt: [7]u64 align(16) = .{
     0x0000000000000000, // 0x30 TSS high
 };
 var ring0_stack: [64 * 1024]u8 align(16) = [_]u8{0} ** (64 * 1024);
+var pf_ist_stack: [16 * 1024]u8 align(16) = [_]u8{0} ** (16 * 1024);
+var df_ist_stack: [16 * 1024]u8 align(16) = [_]u8{0} ** (16 * 1024);
 var tss: Tss = std.mem.zeroes(Tss);
 var kernel_state_global: kernel.KernelState = undefined;
 var kernel_state_ready = false;
@@ -204,11 +227,17 @@ var ss_trampoline_entry: usize = 0;
 var timer_trampoline_entry: usize = 0;
 export var kernel_cr3_value: u64 = 0;
 export var user_cr3_value: u64 = 0;
-var current_user_principal: kernel.PrincipalId = .Process0;
+var current_user_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
 var current_thread_index: usize = 0;
 var lapic_tick_count: u64 = 0;
 var scheduler_tick_accum: u64 = 0;
 var scheduler_switch_count: u64 = 0;
+const scheduler_perf_report_interval_ticks: u64 = 256;
+var scheduler_perf_user_ticks: u64 = 0;
+var scheduler_perf_process1_ticks: u64 = 0;
+var scheduler_perf_thread1_ticks: u64 = 0;
+const compositor_thread1_priority_hold_quanta: u64 = 1;
+var compositor_thread1_priority_streak: u64 = 0;
 var scheduler_int80_log_count: u64 = 0;
 var scheduler_race_log_count: u64 = 0;
 const BootTimingState = struct {
@@ -254,20 +283,10 @@ var boot_timing: BootTimingState = .{};
 var boot_timing_trace: [16]BootTimingTraceEvent = undefined;
 var boot_timing_trace_len: usize = 0;
 var boot_timing_trace_flushed = false;
+var uefi_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
+var uefi_exitbs_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
 var compositor_thread1_priority_active = false;
 var user_log_scratch: [user_log_max_bytes]u8 align(16) = undefined;
-var user_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var framebuffer_server_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var draw_client_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var boot_log_console_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var mouse_driver_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var keyboard_driver_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var bootlog_sender_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var compositor_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var gpu_compositor_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var mouse_button_demo_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var keyboard_ascii_demo_elf_staging: [user_elf_max_size]u8 align(16) = undefined;
-var user_elf_load_window: [user_elf_max_size]u8 align(16) = undefined;
 var boot_log_buffer: [boot_log_max_bytes]u8 = [_]u8{0} ** boot_log_max_bytes;
 var boot_log_len: usize = 0;
 var deferred_compositor_launch_armed = false;
@@ -279,6 +298,8 @@ var deferred_compositor_auto_launch_tick: u64 = 0;
 var bootlog_entered_user_tick: u64 = 0;
 var deferred_compositor_wait_mouse_queue_ready = false;
 var deferred_compositor_wait_keyboard_queue_ready = false;
+var deferred_compositor_auto_debug_last_mask: u32 = 0xFFFF_FFFF;
+var deferred_compositor_auto_debug_last_tick: u64 = 0;
 const DeferredCompositorKind = enum {
     classic,
     gpu,
@@ -296,6 +317,11 @@ var bootlog_gate_start_thread0 = false;
 var bootlog_gate_start_thread3 = false;
 var bootlog_gate_start_thread2 = false;
 var bootlog_gate_start_thread4 = false;
+var bootlog_gate_start_thread5 = false;
+var boot_services_cache: ?*uefi.tables.BootServices = null;
+var kernel_image_base_paddr: u64 = 0;
+var kernel_image_size_bytes: usize = 0;
+var post_exit_load_scratch: [8 * 1024 * 1024]u8 align(4096) = [_]u8{0} ** (8 * 1024 * 1024);
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -310,6 +336,14 @@ const syscall_recv_cap: u64 = 0xA;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_create_window: u64 = 0xD;
+const syscall_queue_submit: u64 = 0xE;
+const syscall_queue_notify: u64 = 0xF;
+const syscall_untyped_alloc: u64 = 0x10;
+const syscall_untyped_retype_pages: u64 = 0x11;
+const syscall_untyped_reset: u64 = 0x12;
+const syscall_untyped_alloc_map_pages: u64 = 0x13;
+const syscall_grant_caps_batch: u64 = 0x14;
+const syscall_map_pages_batch: u64 = 0x15;
 const syscall_batch_max_pages: usize = 64;
 
 const user_program_cfg: user_programs.Config = .{
@@ -399,6 +433,8 @@ const UserBootProcessSetup = struct {
     process3_user_stack_page: ?kernel.PageCapability = null,
     process4_user_page: ?kernel.PageCapability = null,
     process4_user_stack_page: ?kernel.PageCapability = null,
+    process5_user_page: ?kernel.PageCapability = null,
+    process5_user_stack_page: ?kernel.PageCapability = null,
     boot_log_console_page: ?kernel.PageCapability = null,
     boot_log_console_stack_page: ?kernel.PageCapability = null,
     mouse_driver_runtime_stack_page: ?kernel.PageCapability = null,
@@ -468,6 +504,27 @@ fn serialInit() void {
     serial.init();
 }
 
+fn earlyUefiWrite(msg: [*:0]const u16) void {
+    const st = uefi.system_table;
+    const con_out = st.con_out orelse return;
+    _ = con_out.outputString(msg) catch {};
+}
+
+fn earlyUefiWriteAscii(msg: []const u8) void {
+    var buf: [160:0]u16 = [_:0]u16{0} ** 160;
+    var i: usize = 0;
+    while (i < msg.len and i + 1 < buf.len) : (i += 1) {
+        const ch = msg[i];
+        buf[i] = if (ch == '\n') '\r' else ch;
+        if (ch == '\n' and i + 2 < buf.len) {
+            buf[i + 1] = '\n';
+            i += 1;
+        }
+    }
+    buf[@min(i, buf.len - 1)] = 0;
+    earlyUefiWrite(&buf);
+}
+
 fn appendBootLog(text: []const u8) void {
     if (text.len == 0) return;
     if (boot_log_len >= boot_log_buffer.len) return;
@@ -508,6 +565,45 @@ fn serialWriteHexRaw(value: u64) void {
 fn serialWriteBool01(value: bool) void {
     serial.writeBool01(value);
     appendBootLog(if (value) "1" else "0");
+}
+
+fn dumpPageWalkForVa(cr3: u64, va: u64) void {
+    const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
+    const pdpt_index: usize = @intCast((va >> 30) & 0x1FF);
+    const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+    const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+
+    const pml4_ptr: *const [page_entries]u64 = @ptrFromInt(cr3 & page_addr_mask);
+    const pml4e = pml4_ptr[pml4_index];
+    serialWrite("  WALK.CR3=");
+    serialWriteHexRaw(cr3);
+    serialWrite("\n");
+    serialWrite("  WALK.PML4E=");
+    serialWriteHexRaw(pml4e);
+    serialWrite("\n");
+    if ((pml4e & page_present) == 0) return;
+
+    const pdpt_ptr: *const [page_entries]u64 = @ptrFromInt(pml4e & page_addr_mask);
+    const pdpte = pdpt_ptr[pdpt_index];
+    serialWrite("  WALK.PDPTE=");
+    serialWriteHexRaw(pdpte);
+    serialWrite("\n");
+    if ((pdpte & page_present) == 0) return;
+    if ((pdpte & page_ps) != 0) return;
+
+    const pd_ptr: *const [page_entries]u64 = @ptrFromInt(pdpte & page_addr_mask);
+    const pde = pd_ptr[pd_index];
+    serialWrite("  WALK.PDE=");
+    serialWriteHexRaw(pde);
+    serialWrite("\n");
+    if ((pde & page_present) == 0) return;
+    if ((pde & page_ps) != 0) return;
+
+    const pt_ptr: *const [page_entries]u64 = @ptrFromInt(pde & page_addr_mask);
+    const pte = pt_ptr[pt_index];
+    serialWrite("  WALK.PTE=");
+    serialWriteHexRaw(pte);
+    serialWrite("\n");
 }
 
 fn framebufferBytesForModeInfo(info: *const uefi.protocol.GraphicsOutput.Mode.Info) u64 {
@@ -629,36 +725,65 @@ fn exceptionName(vec: u64) []const u8 {
 }
 
 fn processIndex(principal: kernel.PrincipalId) ?usize {
-    return switch (principal) {
-        .Process0 => 0,
-        .Process1 => 1,
-        .Process2 => 2,
-        .Process3 => 3,
-        .Process4 => 4,
-        else => null,
-    };
+    return kernel.processIndexFromPrincipal(principal);
 }
 
 fn principalLabel(principal: kernel.PrincipalId) []const u8 {
-    return switch (principal) {
-        .Process0 => "Process0",
-        .Process1 => "Process1",
-        .Process2 => "Process2",
-        .Process3 => "Process3",
-        .Process4 => "Process4",
-        .Device0 => "Device0",
+    return kernel.principalLabel(principal);
+}
+
+fn principalFromProcessSlot(raw: u64) ?kernel.PrincipalId {
+    const idx = std.math.cast(usize, raw) orelse return null;
+    return kernel.processPrincipalFromIndex(idx);
+}
+
+fn dumpAllProcessCaps(state: *const kernel.KernelState) void {
+    var i: usize = 0;
+    while (i < user_process_count) : (i += 1) {
+        const principal = kernel.processPrincipalFromIndex(i) orelse unreachable;
+        capability.dumpPrincipalCaps(state, principal, principalLabel(principal));
+    }
+}
+
+fn iommuReasonLabel(reason: kernel.IommuSyncReason) []const u8 {
+    return switch (reason) {
+        .grant_dma => "grant_dma",
+        .grant_no_dma => "grant_no_dma",
+        .move_from => "move_from",
+        .move_to => "move_to",
+        .revoke => "revoke",
     };
 }
 
+fn iommuAuditHook(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    paddr: u64,
+    mapped: bool,
+    reason: kernel.IommuSyncReason,
+) void {
+    _ = state;
+    serialWriteFmt(
+        "iommu_audit action={s} principal={s} paddr=0x{x} reason={s}\n",
+        .{
+            if (mapped) "map" else "unmap",
+            principalLabel(principal),
+            paddr,
+            iommuReasonLabel(reason),
+        },
+    );
+}
+
 fn threadLabel(thread_index: usize) []const u8 {
-    return switch (thread_index) {
-        0 => "Thread0",
-        1 => "Thread1",
-        2 => "Thread2",
-        3 => "Thread3",
-        4 => "Thread4",
-        else => "Thread?",
+    const labels = comptime blk: {
+        var items: [user_thread_count][]const u8 = undefined;
+        for (0..user_thread_count) |i| {
+            items[i] = std.fmt.comptimePrint("Thread{}", .{i});
+        }
+        break :blk items;
     };
+    if (thread_index < labels.len) return labels[thread_index];
+    return "Thread?";
 }
 
 fn recordBootTimingEvent(label: []const u8, tick: u64, delta: ?u64) void {
@@ -813,6 +938,14 @@ fn updateBootTimingFromUserLog(proc: kernel.PrincipalId, message: []const u8) vo
             );
         }
     }
+    if (proc == .Process1 and containsBytes(message, "Compositor: drag boost on")) {
+        compositor_thread1_priority_active = true;
+        compositor_thread1_priority_streak = 0;
+    }
+    if (proc == .Process1 and containsBytes(message, "Compositor: drag boost off")) {
+        compositor_thread1_priority_active = false;
+        compositor_thread1_priority_streak = 0;
+    }
     if (proc == .Process1 and containsBytes(message, "Compositor: present transfer done")) {
         if (!boot_timing.compositor_present_transfer_done) {
             boot_timing.compositor_present_transfer_done = true;
@@ -881,6 +1014,38 @@ fn logSchedulerRaceSwitch(current_thread: usize, target_thread: usize, reason: [
     serialWrite("\n");
 }
 
+fn queueCapOpLabel(op: kernel.QueueOperation) []const u8 {
+    return switch (op) {
+        .submit => "submit",
+        .notify => "notify",
+    };
+}
+
+fn logQueueCapDeny(
+    proc: kernel.PrincipalId,
+    token: u64,
+    device: kernel.DmaDeviceId,
+    queue_index: u16,
+    op: kernel.QueueOperation,
+    err: anyerror,
+) void {
+    serialWrite("queue_cap deny proc=");
+    serialWrite(principalLabel(proc));
+    serialWrite(" op=");
+    serialWrite(queueCapOpLabel(op));
+    serialWrite(" device=");
+    serialWrite(switch (device) {
+        .virtio_gpu => "virtio_gpu",
+        .virtio_input => "virtio_input",
+    });
+    serialWrite(" q=");
+    printNumber(queue_index);
+    serialWrite(" token=");
+    printHex(token);
+    serialWrite(" err=");
+    serialWrite(@errorName(err));
+    serialWrite("\n");
+}
 fn getThreadContext(thread_index: usize) ?*ThreadContext {
     if (thread_index >= user_thread_count) return null;
     return &thread_contexts[thread_index];
@@ -1033,7 +1198,9 @@ fn pickNextReadyThreadIndex(current_index: usize) usize {
     if (current_index >= user_thread_count) return 0;
     if (compositor_thread1_priority_active) {
         const compositor_ctx = getThreadContextConst(1) orelse return current_index;
-        if (compositor_ctx.ready) return 1;
+        // Prefer compositor when another thread is running, but avoid
+        // permanently pinning execution on Thread1.
+        if (current_index != 1 and compositor_ctx.ready) return 1;
     }
     var step: usize = 1;
     while (step <= user_thread_count) : (step += 1) {
@@ -1174,11 +1341,18 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
     asm volatile ("cli");
     serialWrite(exceptionName(vec));
     serialWrite("\n");
+    serialWrite("  THREAD=");
+    serialWrite(threadLabel(current_thread_index));
+    serialWrite("\n");
+    serialWrite("  PRINCIPAL=");
+    serialWrite(principalLabel(current_user_principal));
+    serialWrite("\n");
     if (vec == 14) {
         serialWrite("  CR2=");
         const cr2 = readCr2();
         serialWriteHexRaw(cr2);
         serialWrite("\n");
+        dumpPageWalkForVa(readCr3(), cr2);
         logPageFaultStep2(cr2, frame);
     }
     serialWrite("  EC=");
@@ -1283,6 +1457,12 @@ fn writeUserU64(principal: kernel.PrincipalId, dest_user_va: u64, value: u64) bo
     return copyBytesToUserVa(principal, dest_user_va, buf[0..]);
 }
 
+fn readUserU64(principal: kernel.PrincipalId, src_user_va: u64) ?u64 {
+    var buf: [8]u8 = undefined;
+    if (!copyUserBytesFromVa(principal, src_user_va, buf[0..])) return null;
+    return std.mem.readInt(u64, buf[0..], .little);
+}
+
 pub export fn invalidTssHandlerCommon(error_code: u64) callconv(.c) noreturn {
     asm volatile ("cli");
     serialWrite("INVALID TSS\n");
@@ -1351,7 +1531,31 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_map_page => {
             const writable = (frame.rdx & 0x1) != 0;
+            var is_window_cap_page = false;
+            for (state.windows) |window| {
+                if (!window.active) continue;
+                if (window.cap_paddr == frame.rsi) {
+                    is_window_cap_page = true;
+                    break;
+                }
+            }
             if (capability.mapUserPageFromCapability(state, proc, frame.rdi, frame.rsi, writable)) {
+                if (is_window_cap_page) {
+                    logWindowCapPageDiag("window_cap map_page", proc, frame.rsi, frame.rdi);
+                }
+                return syscall_ok;
+            }
+            return syscall_err_map;
+        },
+        syscall_map_pages_batch => {
+            const page_count_u64 = frame.rdx;
+            if (page_count_u64 == 0) return syscall_err_invalid;
+            if (page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
+            var paddrs: [syscall_batch_max_pages]u64 = undefined;
+            const page_count: usize = @intCast(page_count_u64);
+            const buf = std.mem.sliceAsBytes(paddrs[0..page_count]);
+            if (!copyUserBytesFromVa(proc, frame.rsi, buf)) return syscall_err_invalid;
+            if (capability.mapUserPagesFromCapabilityBatch(state, proc, frame.rdi, paddrs[0..page_count], (frame.rcx & 0x1) != 0)) {
                 return syscall_ok;
             }
             return syscall_err_map;
@@ -1364,44 +1568,123 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return syscall_err_map;
         },
         syscall_alloc_map_pages => {
-            const base_va = frame.rdi;
             const page_count_u64 = frame.rsi;
-            const writable = (frame.rdx & 0x1) != 0;
-            const drop_cap_after_map = (frame.rdx & syscall_alloc_map_drop_cap_flag) != 0;
-            const out_paddr_list_va = frame.rcx;
-
-            if ((base_va & 0xFFF) != 0) return syscall_err_invalid;
             if (page_count_u64 == 0) return syscall_err_invalid;
             if (page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
-
-            const page_count: usize = @intCast(page_count_u64);
-            var i: usize = 0;
-            while (i < page_count) : (i += 1) {
-                const cap = state.allocPageTo(proc, &global_free_list) catch return syscall_err_alloc;
-
-                const i_u64: u64 = @intCast(i);
-                const offset_4k, const mul_overflow = @mulWithOverflow(i_u64, @as(u64, 4096));
-                if (mul_overflow != 0) return syscall_err_map;
-                const map_va, const va_overflow = @addWithOverflow(base_va, offset_4k);
-                if (va_overflow != 0) return syscall_err_map;
-
-                if (!capability.mapFreshUserPage(proc, map_va, cap.paddr, writable)) {
+            untyped_memory.allocMapPages(.{
+                .state = state,
+                .proc = proc,
+                .free_list = &global_free_list,
+                .base_va = frame.rdi,
+                .page_count = @intCast(page_count_u64),
+                .writable = (frame.rdx & 0x1) != 0,
+                .drop_cap_after_map = (frame.rdx & syscall_alloc_map_drop_cap_flag) != 0,
+                .out_paddr_list_va = frame.rcx,
+                .write_user_u64 = writeUserU64,
+            }) catch |err| switch (err) {
+                error.InvalidArgument => {
+                    serialWrite("sys_alloc_map_pages invalid proc=");
+                    serialWrite(principalLabel(proc));
+                    serialWrite(" base_va=");
+                    printHex(frame.rdi);
+                    serialWrite(" pages=");
+                    printNumber(page_count_u64);
+                    serialWrite(" out_va=");
+                    printHex(frame.rcx);
+                    serialWrite("\n");
+                    return syscall_err_invalid;
+                },
+                error.AllocationFailed => {
+                    serialWrite("sys_alloc_map_pages alloc failed proc=");
+                    serialWrite(principalLabel(proc));
+                    serialWrite(" base_va=");
+                    printHex(frame.rdi);
+                    serialWrite(" pages=");
+                    printNumber(page_count_u64);
+                    serialWrite(" caps=");
+                    printNumber(state.getTableConst(proc).len);
+                    serialWrite("/");
+                    printNumber(kernel.CNode.max_caps);
+                    serialWrite(" free_pages=");
+                    printNumber(global_free_list.len);
+                    serialWrite("\n");
+                    return syscall_err_alloc;
+                },
+                error.MapFailed => {
+                    serialWrite("sys_alloc_map_pages map failed proc=");
+                    serialWrite(principalLabel(proc));
+                    serialWrite(" base_va=");
+                    printHex(frame.rdi);
+                    serialWrite(" pages=");
+                    printNumber(page_count_u64);
+                    serialWrite(" out_va=");
+                    printHex(frame.rcx);
+                    serialWrite("\n");
                     return syscall_err_map;
-                }
-
-                if (out_paddr_list_va != 0) {
-                    const offset_8, const list_mul_overflow = @mulWithOverflow(i_u64, @as(u64, 8));
-                    if (list_mul_overflow != 0) return syscall_err_invalid;
-                    const list_va, const list_va_overflow = @addWithOverflow(out_paddr_list_va, offset_8);
-                    if (list_va_overflow != 0) return syscall_err_invalid;
-                    if (!writeUserU64(proc, list_va, cap.paddr)) {
-                        return syscall_err_map;
-                    }
-                }
-                if (drop_cap_after_map) {
-                    _ = state.getTable(proc).removeByPaddr(cap.paddr);
-                }
-            }
+                },
+            };
+            return syscall_ok;
+        },
+        syscall_untyped_alloc => {
+            const token = untyped_memory.allocUntyped(
+                state,
+                proc,
+                &global_free_list,
+                frame.rdi,
+                frame.rsi,
+                @bitCast(frame.rdx),
+            ) catch |err| switch (err) {
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.OutOfFreePages, kernel.KernelError.TooManyFreeRanges, kernel.KernelError.TooManyUntypedBlocks, kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_alloc,
+            };
+            return token;
+        },
+        syscall_untyped_retype_pages => {
+            const page_count_u64 = frame.rdx;
+            if (page_count_u64 == 0) return syscall_err_invalid;
+            if (page_count_u64 > kernel.max_retype_page_batch) return syscall_err_invalid;
+            untyped_memory.retypeMapPages(
+                state,
+                proc,
+                frame.rdi,
+                frame.rsi,
+                @intCast(page_count_u64),
+                frame.r10,
+                frame.r8,
+                writeUserU64,
+            ) catch |err| switch (err) {
+                error.InvalidArgument => return syscall_err_invalid,
+                error.AllocationFailed => return syscall_err_alloc,
+                error.MapFailed => return syscall_err_map,
+            };
+            return syscall_ok;
+        },
+        syscall_untyped_reset => {
+            untyped_memory.resetUntyped(state, proc, frame.rdi) catch |err| switch (err) {
+                kernel.KernelError.InvalidState, kernel.KernelError.UntypedNotFound => return syscall_err_invalid,
+                kernel.KernelError.UntypedHasChildren => return syscall_err_not_ready,
+                else => return syscall_err_revoke,
+            };
+            return syscall_ok;
+        },
+        syscall_untyped_alloc_map_pages => {
+            const page_count_u64 = frame.rsi;
+            if (page_count_u64 == 0) return syscall_err_invalid;
+            if (page_count_u64 > kernel.max_retype_page_batch) return syscall_err_invalid;
+            untyped_memory.allocOwnedUntypedMapPages(
+                state,
+                proc,
+                frame.rdi,
+                @intCast(page_count_u64),
+                frame.rdx,
+                frame.rcx,
+                writeUserU64,
+            ) catch |err| switch (err) {
+                error.InvalidArgument => return syscall_err_invalid,
+                error.AllocationFailed => return syscall_err_alloc,
+                error.MapFailed => return syscall_err_map,
+            };
             return syscall_ok;
         },
         syscall_create_window => {
@@ -1416,7 +1699,36 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 kernel.KernelError.OutOfFreePages => return syscall_err_alloc,
                 else => return syscall_err_alloc,
             };
+            logWindowCapPageDiag("window_cap create", proc, created.window_cap_paddr, null);
             return created.window_cap_paddr;
+        },
+        syscall_queue_submit => {
+            const queue_token = frame.rdi;
+            const device: kernel.DmaDeviceId = switch (frame.rsi) {
+                0 => .virtio_gpu,
+                1 => .virtio_input,
+                else => return syscall_err_invalid,
+            };
+            const queue_index: u16 = @truncate(frame.rdx);
+            state.queueCapAuthorizeStage2(proc, queue_token, device, queue_index, .submit) catch |err| {
+                logQueueCapDeny(proc, queue_token, device, queue_index, .submit, err);
+                return syscall_err_invalid;
+            };
+            return syscall_ok;
+        },
+        syscall_queue_notify => {
+            const queue_token = frame.rdi;
+            const device: kernel.DmaDeviceId = switch (frame.rsi) {
+                0 => .virtio_gpu,
+                1 => .virtio_input,
+                else => return syscall_err_invalid,
+            };
+            const queue_index: u16 = @truncate(frame.rdx);
+            state.queueCapAuthorizeStage2(proc, queue_token, device, queue_index, .notify) catch |err| {
+                logQueueCapDeny(proc, queue_token, device, queue_index, .notify, err);
+                return syscall_err_invalid;
+            };
+            return syscall_ok;
         },
         syscall_move_cap => {
             const to = switch (frame.rsi) {
@@ -1430,22 +1742,38 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return syscall_ok;
         },
         syscall_grant_cap => {
-            const to = switch (frame.rsi) {
-                0 => kernel.PrincipalId.Process0,
-                1 => kernel.PrincipalId.Process1,
-                2 => kernel.PrincipalId.Process2,
-                3 => kernel.PrincipalId.Process3,
-                4 => kernel.PrincipalId.Process4,
-                else => return syscall_err_invalid,
-            };
+            const to = principalFromProcessSlot(frame.rsi) orelse return syscall_err_invalid;
             const rights = capability.parseRights(frame.rdx);
             state.grantCap(proc, to, frame.rdi, rights) catch return syscall_err_grant;
             if (enable_cap_table_dump_logs) {
-                capability.dumpPrincipalCaps(state, .Process0, "Process0");
-                capability.dumpPrincipalCaps(state, .Process1, "Process1");
-                capability.dumpPrincipalCaps(state, .Process2, "Process2");
-                capability.dumpPrincipalCaps(state, .Process3, "Process3");
-                capability.dumpPrincipalCaps(state, .Process4, "Process4");
+                dumpAllProcessCaps(state);
+            }
+            return syscall_ok;
+        },
+        syscall_grant_caps_batch => {
+            const page_count_u64 = frame.rsi;
+            if (page_count_u64 == 0) return syscall_err_invalid;
+            if (page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
+            const to = principalFromProcessSlot(frame.rdx) orelse return syscall_err_invalid;
+            const rights = capability.parseRights(frame.rcx);
+            var paddrs: [syscall_batch_max_pages]u64 = undefined;
+            var i: u64 = 0;
+            while (i < page_count_u64) : (i += 1) {
+                const list_va = frame.rdi + i * 8;
+                paddrs[@intCast(i)] = readUserU64(proc, list_va) orelse return syscall_err_invalid;
+            }
+            state.grantCapsBatch(proc, to, paddrs[0..@intCast(page_count_u64)], rights) catch return syscall_err_grant;
+            if (rights.dma and to == .Process1 and page_count_u64 > 1) {
+                serialWrite("grant_caps_batch dma to=Process1 pages=");
+                printNumber(page_count_u64);
+                serialWrite(" first=");
+                printHex(paddrs[0]);
+                serialWrite(" last=");
+                printHex(paddrs[@intCast(page_count_u64 - 1)]);
+                serialWrite("\n");
+            }
+            if (enable_cap_table_dump_logs) {
+                dumpAllProcessCaps(state);
             }
             return syscall_ok;
         },
@@ -1472,15 +1800,15 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                     return syscall_err_send;
                 },
             };
-            if ((proc == .Process2 or proc == .Process4) and to == .Process1 and endpoint_id == kernel.endpoint_to_process1) {
+            if (deferred_compositor_launched and
+                (proc == .Process2 or proc == .Process4 or proc == .Process5) and
+                to == .Process1 and
+                endpoint_id == kernel.endpoint_to_process1)
+            {
                 compositor_thread1_priority_active = true;
             }
             if (enable_cap_table_dump_logs) {
-                capability.dumpPrincipalCaps(state, .Process0, "Process0");
-                capability.dumpPrincipalCaps(state, .Process1, "Process1");
-                capability.dumpPrincipalCaps(state, .Process2, "Process2");
-                capability.dumpPrincipalCaps(state, .Process3, "Process3");
-                capability.dumpPrincipalCaps(state, .Process4, "Process4");
+                dumpAllProcessCaps(state);
             }
             return syscall_ok;
         },
@@ -1502,11 +1830,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             printHex(frame.rdi);
             serialWrite("\n");
             if (enable_cap_table_dump_logs) {
-                capability.dumpPrincipalCaps(state, .Process0, "Process0");
-                capability.dumpPrincipalCaps(state, .Process1, "Process1");
-                capability.dumpPrincipalCaps(state, .Process2, "Process2");
-                capability.dumpPrincipalCaps(state, .Process3, "Process3");
-                capability.dumpPrincipalCaps(state, .Process4, "Process4");
+                dumpAllProcessCaps(state);
             }
             return syscall_ok;
         },
@@ -1567,12 +1891,47 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
     }
 }
 
+fn maybeLogSchedulerPerfTick() void {
+    if (scheduler_perf_user_ticks < scheduler_perf_report_interval_ticks) return;
+    serialWrite("SCHED perf user_ticks=");
+    printNumber(scheduler_perf_user_ticks);
+    serialWrite(" process1_ticks=");
+    printNumber(scheduler_perf_process1_ticks);
+    serialWrite(" process1_pct=");
+    if (scheduler_perf_user_ticks > 0) {
+        printNumber((scheduler_perf_process1_ticks * 100) / scheduler_perf_user_ticks);
+    } else {
+        printNumber(0);
+    }
+    serialWrite(" thread1_ticks=");
+    printNumber(scheduler_perf_thread1_ticks);
+    serialWrite(" thread1_pct=");
+    if (scheduler_perf_user_ticks > 0) {
+        printNumber((scheduler_perf_thread1_ticks * 100) / scheduler_perf_user_ticks);
+    } else {
+        printNumber(0);
+    }
+    serialWrite(" lapic_tick=");
+    printNumber(lapic_tick_count);
+    serialWrite("\n");
+    scheduler_perf_user_ticks = 0;
+    scheduler_perf_process1_ticks = 0;
+    scheduler_perf_thread1_ticks = 0;
+}
+
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     lapic_tick_count +%= 1;
+    lapic.eoiLegacyPicMaster();
     lapic.eoi();
     if (!kernel_state_ready) return;
     if (scheduler_quantum_ticks == 0) return;
     if (!isUserTrapFrame(frame)) return;
+    scheduler_perf_user_ticks +%= 1;
+    if (getThreadContextConst(current_thread_index)) |ctx| {
+        if (ctx.owner_process == .Process1) scheduler_perf_process1_ticks +%= 1;
+    }
+    if (current_thread_index == 1) scheduler_perf_thread1_ticks +%= 1;
+    maybeLogSchedulerPerfTick();
     tryStartBootLogGateDeferredInput();
     tryAutoLaunchDeferredCompositor(frame);
 
@@ -1581,6 +1940,18 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     scheduler_tick_accum = 0;
 
     const current_thread = current_thread_index;
+    if (!compositor_thread1_priority_active) {
+        compositor_thread1_priority_streak = 0;
+    } else if (current_thread == 1) {
+        const compositor_ctx = getThreadContextConst(1) orelse null;
+        if (compositor_ctx != null and compositor_ctx.?.ready and compositor_thread1_priority_streak + 1 < compositor_thread1_priority_hold_quanta) {
+            compositor_thread1_priority_streak +%= 1;
+            return;
+        }
+        compositor_thread1_priority_streak = 0;
+    } else {
+        compositor_thread1_priority_streak = 0;
+    }
     const next_thread = pickNextReadyThreadIndex(current_thread);
     if (next_thread == current_thread) return;
 
@@ -1816,7 +2187,15 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
         \\pop %rbx
         \\pop %rax
         \\push %r10
+        \\mov 16(%rsp), %r10
+        \\and $0x3, %r10
+        \\cmp $0x3, %r10
+        \\jne 2f
         \\mov user_cr3_value(%rip), %r10
+        \\jmp 3f
+        \\2:
+        \\mov kernel_cr3_value(%rip), %r10
+        \\3:
         \\mov %r10, %cr3
         \\pop %r10
         \\iretq
@@ -1912,6 +2291,8 @@ fn loadGdtAndReloadSegments() void {
     const tss_base = @intFromPtr(&tss);
     const tss_limit: u64 = @sizeOf(Tss) - 1;
     tss.rsp0 = @intFromPtr(&ring0_stack) + ring0_stack.len;
+    tss.ist1 = @intFromPtr(&pf_ist_stack) + pf_ist_stack.len;
+    tss.ist2 = @intFromPtr(&df_ist_stack) + df_ist_stack.len;
     tss.iomap_base = @sizeOf(Tss);
     gdt[5] =
         (tss_limit & 0xFFFF) |
@@ -1959,8 +2340,9 @@ fn initIdtPageFaultOnly() void {
     interrupts.setIdtEntry(&idt, 11, gdt_kernel_code_selector, np_trampoline_entry, 0x8E); // #NP
     interrupts.setIdtEntry(&idt, 12, gdt_kernel_code_selector, ss_trampoline_entry, 0x8E); // #SS
     interrupts.setIdtEntry(&idt, 13, gdt_kernel_code_selector, gp_trampoline_entry, 0x8E); // #GP
-    interrupts.setIdtEntry(&idt, 14, gdt_kernel_code_selector, pf_trampoline_entry, 0x8E); // #PF
-    interrupts.setIdtEntry(&idt, 8, gdt_kernel_code_selector, df_trampoline_entry, 0x8E); // #DF
+    interrupts.setIdtEntryWithIst(&idt, 14, gdt_kernel_code_selector, pf_trampoline_entry, 1, 0x8E); // #PF on IST1
+    interrupts.setIdtEntryWithIst(&idt, 8, gdt_kernel_code_selector, df_trampoline_entry, 2, 0x8E); // #DF on IST2
+    interrupts.setIdtEntry(&idt, 0x20, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E); // legacy PIC timer IRQ0
     interrupts.setIdtEntry(&idt, lapic_timer_vector, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E); // LAPIC timer
     // DPL=3 interrupt gate: syscall 中の割り込みネストを抑止する。
     interrupts.setIdtEntry(&idt, 0x80, gdt_kernel_code_selector, int80_trampoline_entry, 0xEE);
@@ -2007,14 +2389,12 @@ const ExitBootResult = enum {
 };
 
 fn exitBootServicesWithRetry() ExitBootResult {
-    var mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
-
     const st = uefi.system_table;
     const bs = st.boot_services orelse return .failed;
 
     var attempt: usize = 0;
     while (attempt < 8) : (attempt += 1) {
-        const mmap = bs.getMemoryMap(mmap_buffer[0..]) catch return .failed;
+        const mmap = bs.getMemoryMap(uefi_exitbs_mmap_buffer[0..]) catch return .failed;
         bs.exitBootServices(uefi.handle, mmap.info.key) catch |err| switch (err) {
             // map key 競合は再取得で回復可能。
             error.InvalidParameter => continue,
@@ -2337,7 +2717,19 @@ fn setupMouseDriverProcess(state: *kernel.KernelState, cfg: MouseDriverConfig) M
     var runtime_cfg = cfg;
     runtime_cfg.queue_paddr0 = queue_page0.paddr;
     runtime_cfg.queue_paddr1 = queue_page1.paddr;
-    publishMouseDriverConfigPage(config_page.paddr, runtime_cfg, shared_page.paddr);
+    const mouse_queue_submit_token = state.queueCapGrantStage2(.Process0, .virtio_input, 0, true, false) catch |err| {
+        serialWrite("mouse driver queue submit cap grant failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    const mouse_queue_notify_token = state.queueCapGrantStage2(.Process0, .virtio_input, 0, false, true) catch |err| {
+        serialWrite("mouse driver queue notify cap grant failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    publishMouseDriverConfigPage(config_page.paddr, runtime_cfg, shared_page.paddr, mouse_queue_submit_token, mouse_queue_notify_token);
 
     return .{
         .process = process,
@@ -2391,7 +2783,19 @@ fn setupKeyboardDriverProcess(state: *kernel.KernelState, cfg: MouseDriverConfig
     var runtime_cfg = cfg;
     runtime_cfg.queue_paddr0 = queue_page0.paddr;
     runtime_cfg.queue_paddr1 = queue_page1.paddr;
-    publishKeyboardDriverConfigPage(config_page.paddr, runtime_cfg, shared_page.paddr);
+    const keyboard_queue_submit_token = state.queueCapGrantStage2(.Process3, .virtio_input, 0, true, false) catch |err| {
+        serialWrite("keyboard driver queue submit cap grant failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    const keyboard_queue_notify_token = state.queueCapGrantStage2(.Process3, .virtio_input, 0, false, true) catch |err| {
+        serialWrite("keyboard driver queue notify cap grant failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    publishKeyboardDriverConfigPage(config_page.paddr, runtime_cfg, shared_page.paddr, keyboard_queue_submit_token, keyboard_queue_notify_token);
     publishKeyboardSharedPage(shared_page.paddr);
 
     return .{
@@ -2410,6 +2814,10 @@ fn setupBootLogConsoleProcess(state: *kernel.KernelState, gpu_cfg: ?VirtioGpuDri
 
     const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false };
     const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false };
+    var gpu_control_submit_token: u64 = 0;
+    var gpu_control_notify_token: u64 = 0;
+    var gpu_cursor_submit_token: u64 = 0;
+    var gpu_cursor_notify_token: u64 = 0;
     if (gpu_cfg) |cfg| {
         state.installCap(.Process1, cfg.common.page_paddr, mmio_rw_rights) catch |err| {
             serialWrite("compositor install common cap failed: ");
@@ -2439,8 +2847,32 @@ fn setupBootLogConsoleProcess(state: *kernel.KernelState, gpu_cfg: ?VirtioGpuDri
                 while (true) asm volatile ("hlt");
             };
         }
+        gpu_control_submit_token = state.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, false) catch |err| {
+            serialWrite("compositor queue control submit cap grant failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+        gpu_control_notify_token = state.queueCapGrantStage2(.Process1, .virtio_gpu, 0, false, true) catch |err| {
+            serialWrite("compositor queue control notify cap grant failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+        gpu_cursor_submit_token = state.queueCapGrantStage2(.Process1, .virtio_gpu, 1, true, false) catch |err| {
+            serialWrite("compositor queue cursor submit cap grant failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
+        gpu_cursor_notify_token = state.queueCapGrantStage2(.Process1, .virtio_gpu, 1, false, true) catch |err| {
+            serialWrite("compositor queue cursor notify cap grant failed: ");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            while (true) asm volatile ("hlt");
+        };
     }
-    publishVirtioGpuConfigPage(compositor_gpu_config_page.paddr, gpu_cfg);
+    publishVirtioGpuConfigPage(compositor_gpu_config_page.paddr, gpu_cfg, gpu_control_submit_token, gpu_control_notify_token, gpu_cursor_submit_token, gpu_cursor_notify_token);
     return .{
         .process = process,
         .boot_log_page = boot_log_page,
@@ -2465,6 +2897,30 @@ fn setupMouseButtonDemoProcess(
         while (true) asm volatile ("hlt");
     };
     mapUserLinearRegionOrHalt(.Process2, mouse_shared_draw_va, mouse_shared_page.paddr, 4096, false, "mouse shared page map failed (Process2)");
+    return .{ .process = process };
+}
+
+fn setupPieUserProcess(state: *kernel.KernelState) MouseButtonDemoProcessSetup {
+    const process = createUserProcess(state, .Process2, 2, "pie user");
+    return .{ .process = process };
+}
+
+fn setupTerminalWindowProcess(
+    state: *kernel.KernelState,
+    keyboard_shared_page: kernel.PageCapability,
+) KeyboardAsciiDemoProcessSetup {
+    const process = createUserProcess(state, .Process5, 5, "terminal window");
+    state.grantCap(.Process3, .Process5, keyboard_shared_page.paddr, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = false,
+    }) catch |err| {
+        serialWrite("keyboard shared page cap grant to Process5 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    mapUserLinearRegionOrHalt(.Process5, keyboard_shared_draw_va, keyboard_shared_page.paddr, 4096, false, "keyboard shared page map failed (Process5)");
     return .{ .process = process };
 }
 
@@ -2517,6 +2973,7 @@ fn armBootLogGateDeferredInputStart(
     start_thread3: bool,
     start_thread2: bool,
     start_thread4: bool,
+    start_thread5: bool,
     delay_ticks: u64,
 ) void {
     bootlog_gate_input_start_armed = false;
@@ -2524,6 +2981,7 @@ fn armBootLogGateDeferredInputStart(
     bootlog_gate_start_thread3 = false;
     bootlog_gate_start_thread2 = false;
     bootlog_gate_start_thread4 = false;
+    bootlog_gate_start_thread5 = false;
 
     if (start_thread0) {
         if (getThreadContext(0)) |ctx| {
@@ -2549,7 +3007,13 @@ fn armBootLogGateDeferredInputStart(
             bootlog_gate_start_thread4 = true;
         }
     }
-    if (!bootlog_gate_start_thread0 and !bootlog_gate_start_thread3 and !bootlog_gate_start_thread2 and !bootlog_gate_start_thread4) return;
+    if (start_thread5) {
+        if (getThreadContext(5)) |ctx| {
+            ctx.ready = false;
+            bootlog_gate_start_thread5 = true;
+        }
+    }
+    if (!bootlog_gate_start_thread0 and !bootlog_gate_start_thread3 and !bootlog_gate_start_thread2 and !bootlog_gate_start_thread4 and !bootlog_gate_start_thread5) return;
 
     bootlog_gate_input_start_tick = lapic_tick_count + delay_ticks;
     bootlog_gate_input_start_armed = true;
@@ -2579,12 +3043,17 @@ fn tryStartBootLogGateDeferredInput() void {
         if (getThreadContext(4)) |ctx| ctx.ready = true;
         bootlog_gate_start_thread4 = false;
     }
+    if (bootlog_gate_start_thread5 and deferred_compositor_launched and keyboard_ready) {
+        if (getThreadContext(5)) |ctx| ctx.ready = true;
+        bootlog_gate_start_thread5 = false;
+    }
 
     bootlog_gate_input_start_armed =
         bootlog_gate_start_thread0 or
         bootlog_gate_start_thread3 or
         bootlog_gate_start_thread2 or
-        bootlog_gate_start_thread4;
+        bootlog_gate_start_thread4 or
+        bootlog_gate_start_thread5;
 }
 
 fn setupUserProcessesForMode(
@@ -2620,6 +3089,10 @@ fn setupUserProcessesForMode(
             result.boot_log_console_stack_page = boot_log_console_setup.boot_log_stack_page;
             result.compositor_gpu_config_page = boot_log_console_setup.compositor_gpu_config_page;
             activateThreadOrHalt(1);
+            const pie_user_setup = setupPieUserProcess(state);
+            result.process2_user_page = pie_user_setup.process.user_page;
+            result.process2_user_stack_page = pie_user_setup.process.user_stack_page;
+            activateThreadOrHalt(2);
             if (keyboard_driver_cfg) |cfg| {
                 const keyboard_driver_setup = setupKeyboardDriverProcess(state, cfg);
                 result.process3_user_page = keyboard_driver_setup.process.user_page;
@@ -2627,6 +3100,14 @@ fn setupUserProcessesForMode(
                 result.keyboard_driver_config_page = keyboard_driver_setup.config_page;
                 result.keyboard_shared_page = keyboard_driver_setup.shared_page;
                 activateThreadOrHalt(3);
+                const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, keyboard_driver_setup.shared_page);
+                result.process4_user_page = keyboard_ascii_demo_setup.process.user_page;
+                result.process4_user_stack_page = keyboard_ascii_demo_setup.process.user_stack_page;
+                activateThreadOrHalt(4);
+                const terminal_window_setup = setupTerminalWindowProcess(state, keyboard_driver_setup.shared_page);
+                result.process5_user_page = terminal_window_setup.process.user_page;
+                result.process5_user_stack_page = terminal_window_setup.process.user_stack_page;
+                activateThreadOrHalt(5);
             }
         },
         .BootLogGateCompositor => {
@@ -2659,10 +3140,15 @@ fn setupUserProcessesForMode(
             );
             result.process2_user_page = mouse_button_demo_setup.process.user_page;
             result.process2_user_stack_page = mouse_button_demo_setup.process.user_stack_page;
-            if (keyboard_driver_cfg != null) {
-                const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, keyboard_shared_page_for_demo);
+            if (keyboard_shared_page_for_demo) |shared_page| {
+                const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, shared_page);
                 result.process4_user_page = keyboard_ascii_demo_setup.process.user_page;
                 result.process4_user_stack_page = keyboard_ascii_demo_setup.process.user_stack_page;
+                activateThreadOrHalt(4);
+                const terminal_window_setup = setupTerminalWindowProcess(state, shared_page);
+                result.process5_user_page = terminal_window_setup.process.user_page;
+                result.process5_user_stack_page = terminal_window_setup.process.user_stack_page;
+                activateThreadOrHalt(5);
             }
 
             activateThreadOrHalt(1);
@@ -2698,10 +3184,15 @@ fn setupUserProcessesForMode(
             );
             result.process2_user_page = mouse_button_demo_setup.process.user_page;
             result.process2_user_stack_page = mouse_button_demo_setup.process.user_stack_page;
-            if (keyboard_driver_cfg != null) {
-                const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, keyboard_shared_page_for_demo);
+            if (keyboard_shared_page_for_demo) |shared_page| {
+                const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, shared_page);
                 result.process4_user_page = keyboard_ascii_demo_setup.process.user_page;
                 result.process4_user_stack_page = keyboard_ascii_demo_setup.process.user_stack_page;
+                activateThreadOrHalt(4);
+                const terminal_window_setup = setupTerminalWindowProcess(state, shared_page);
+                result.process5_user_page = terminal_window_setup.process.user_page;
+                result.process5_user_stack_page = terminal_window_setup.process.user_stack_page;
+                activateThreadOrHalt(5);
             }
 
             activateThreadOrHalt(0);
@@ -2775,7 +3266,6 @@ fn installUserIdleTaskCode(user_page_paddr: u64) void {
 fn loadElfFromDisk(
     bs: *uefi.tables.BootServices,
     path: [*:0]const u16,
-    staging: []u8,
 ) ?[]const u8 {
     const loaded_image = (bs.handleProtocol(uefi.protocol.LoadedImage, uefi.handle) catch return null) orelse return null;
     const device_handle = loaded_image.device_handle orelse return null;
@@ -2789,56 +3279,63 @@ fn loadElfFromDisk(
 
     var info_buffer: [512]u8 align(8) = undefined;
     const info = user_file.getInfo(.file, info_buffer[0..]) catch return null;
-    if (info.file_size == 0 or info.file_size > staging.len) return null;
-
     const read_len: usize = @intCast(info.file_size);
+    if (read_len == 0) return null;
+
+    const staging = bs.allocatePool(.loader_data, read_len) catch return null;
+    errdefer bs.freePool(staging.ptr) catch {};
+
     const read_bytes = user_file.read(staging[0..read_len]) catch return null;
     if (read_bytes != read_len) return null;
     return staging[0..read_len];
 }
 
 fn loadUserElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, user_elf_disk_path, user_elf_staging[0..]);
+    return loadElfFromDisk(bs, user_elf_disk_path);
 }
 
 fn loadFramebufferServerElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, framebuffer_server_elf_disk_path, framebuffer_server_elf_staging[0..]);
+    return loadElfFromDisk(bs, framebuffer_server_elf_disk_path);
 }
 
 fn loadDrawClientElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, draw_client_elf_disk_path, draw_client_elf_staging[0..]);
+    return loadElfFromDisk(bs, draw_client_elf_disk_path);
 }
 
 fn loadBootLogConsoleElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, boot_log_console_elf_disk_path, boot_log_console_elf_staging[0..]);
+    return loadElfFromDisk(bs, boot_log_console_elf_disk_path);
 }
 
 fn loadMouseDriverElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, mouse_driver_elf_disk_path, mouse_driver_elf_staging[0..]);
+    return loadElfFromDisk(bs, mouse_driver_elf_disk_path);
 }
 
 fn loadKeyboardDriverElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, keyboard_driver_elf_disk_path, keyboard_driver_elf_staging[0..]);
+    return loadElfFromDisk(bs, keyboard_driver_elf_disk_path);
 }
 
 fn loadBootLogSenderElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, bootlog_sender_elf_disk_path, bootlog_sender_elf_staging[0..]);
+    return loadElfFromDisk(bs, bootlog_sender_elf_disk_path);
 }
 
 fn loadCompositorElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, compositor_elf_disk_path, compositor_elf_staging[0..]);
+    return loadElfFromDisk(bs, compositor_elf_disk_path);
 }
 
 fn loadGpuCompositorElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, gpu_compositor_elf_disk_path, gpu_compositor_elf_staging[0..]);
+    return loadElfFromDisk(bs, gpu_compositor_elf_disk_path);
 }
 
 fn loadMouseButtonDemoElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, mouse_button_demo_elf_disk_path, mouse_button_demo_elf_staging[0..]);
+    return loadElfFromDisk(bs, mouse_button_demo_elf_disk_path);
 }
 
 fn loadKeyboardAsciiDemoElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
-    return loadElfFromDisk(bs, keyboard_ascii_demo_elf_disk_path, keyboard_ascii_demo_elf_staging[0..]);
+    return loadElfFromDisk(bs, keyboard_ascii_demo_elf_disk_path);
+}
+
+fn loadTerminalWindowElfFromDisk(bs: *uefi.tables.BootServices) ?[]const u8 {
+    return loadElfFromDisk(bs, terminal_window_elf_disk_path);
 }
 
 fn writeBootLogStatusToUserPage(user_page_paddr: u64) void {
@@ -2895,7 +3392,7 @@ fn mmioPageWithOffset(addr: u64) MmioPageWithOffset {
     };
 }
 
-fn publishMouseDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, shared_page_paddr: u64) void {
+fn publishMouseDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, shared_page_paddr: u64, queue_submit_token: u64, queue_notify_token: u64) void {
     const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
     var i: usize = 0;
     while (i < 512) : (i += 1) {
@@ -2915,9 +3412,16 @@ fn publishMouseDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, sh
     words[10] = shared_page_paddr;
     words[11] = cfg.queue_paddr0;
     words[12] = cfg.queue_paddr1;
+    words[13] = queue_submit_token;
+    words[14] = queue_notify_token;
+    serialWrite("mouse config tokens submit=");
+    printHex(queue_submit_token);
+    serialWrite(" notify=");
+    printHex(queue_notify_token);
+    serialWrite("\n");
 }
 
-fn publishKeyboardDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, shared_page_paddr: u64) void {
+fn publishKeyboardDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, shared_page_paddr: u64, queue_submit_token: u64, queue_notify_token: u64) void {
     const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
     var i: usize = 0;
     while (i < 512) : (i += 1) {
@@ -2937,9 +3441,11 @@ fn publishKeyboardDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig,
     words[10] = shared_page_paddr;
     words[11] = cfg.queue_paddr0;
     words[12] = cfg.queue_paddr1;
+    words[13] = queue_submit_token;
+    words[14] = queue_notify_token;
 }
 
-fn publishVirtioGpuConfigPage(user_page_paddr: u64, cfg: ?VirtioGpuDriverConfig) void {
+fn publishVirtioGpuConfigPage(user_page_paddr: u64, cfg: ?VirtioGpuDriverConfig, control_submit_token: u64, control_notify_token: u64, cursor_submit_token: u64, cursor_notify_token: u64) void {
     const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
     var i: usize = 0;
     while (i < 512) : (i += 1) {
@@ -2958,6 +3464,10 @@ fn publishVirtioGpuConfigPage(user_page_paddr: u64, cfg: ?VirtioGpuDriverConfig)
         words[8] = gpu_cfg.device.page_offset;
         words[9] = gpu_cfg.notify_off_multiplier;
         words[10] = 0; // default scanout id
+        words[21] = control_submit_token;
+        words[22] = control_notify_token;
+        words[23] = cursor_submit_token;
+        words[24] = cursor_notify_token;
     }
 }
 
@@ -3021,6 +3531,75 @@ fn computeUserElfRequiredBytes(image_bytes: []const u8) ?usize {
     return @intCast(aligned_end);
 }
 
+fn allocateBootScratch(bytes: usize) ?[]align(8) u8 {
+    if (boot_services_cache) |bs| {
+        return bs.allocatePool(.loader_data, bytes) catch null;
+    }
+    if (bytes > post_exit_load_scratch.len) return null;
+    return post_exit_load_scratch[0..bytes];
+}
+
+fn logDeferredCompositorLoadFailure(image_bytes: []const u8) void {
+    serialWrite("deferred compositor load diag\n");
+    const required_bytes = computeUserElfRequiredBytes(image_bytes) orelse {
+        serialWrite("  required_bytes=parse_failed\n");
+        return;
+    };
+    serialWrite("  required_bytes=");
+    printNumber(required_bytes);
+    serialWrite("\n");
+    serialWrite("  scratch_bytes=");
+    printNumber(post_exit_load_scratch.len);
+    serialWrite("\n");
+    serialWrite("  max_load_bytes=");
+    printNumber(user_program_max_load_bytes);
+    serialWrite("\n");
+}
+
+fn logWindowCapPageDiag(prefix: []const u8, proc: kernel.PrincipalId, paddr: u64, va: ?u64) void {
+    const cap_words: *const [2]u64 = @ptrFromInt(paddr);
+    serialWrite(prefix);
+    serialWrite(" proc=");
+    serialWrite(principalLabel(proc));
+    serialWrite(" paddr=");
+    printHex(paddr);
+    if (va) |mapped_va| {
+        serialWrite(" va=");
+        printHex(mapped_va);
+    }
+    serialWrite(" q0=");
+    printHex(cap_words[0]);
+    serialWrite(" q1=");
+    printHex(cap_words[1]);
+    serialWrite("\n");
+}
+
+fn freeBootScratch(buf: []align(8) u8) void {
+    const bs = boot_services_cache orelse return;
+    bs.freePool(buf.ptr) catch {};
+}
+
+fn allocateUserSpaces(bs: *uefi.tables.BootServices) bool {
+    const bytes = @sizeOf(UserAddressSpace) * user_process_count;
+    const pages = (bytes + 4095) / 4096;
+    const max_addr: [*]align(4096) uefi.Page = @ptrFromInt(four_gib - 4096);
+    const backing = bs.allocatePages(.{ .max_address = max_addr }, .loader_data, pages) catch return false;
+    user_spaces_backing = backing;
+
+    const ptr: [*]align(@alignOf(UserAddressSpace)) UserAddressSpace = @ptrCast(backing.ptr);
+    user_spaces = ptr[0..user_process_count];
+    for (user_spaces) |*space| {
+        space.* = .{};
+    }
+    return true;
+}
+
+fn captureKernelImageRange(bs: *uefi.tables.BootServices) void {
+    const loaded_image = (bs.handleProtocol(uefi.protocol.LoadedImage, uefi.handle) catch return) orelse return;
+    kernel_image_base_paddr = @intFromPtr(loaded_image.image_base);
+    kernel_image_size_bytes = @intCast(loaded_image.image_size);
+}
+
 fn loadUserElfIntoProcessPages(
     state: *kernel.KernelState,
     principal: kernel.PrincipalId,
@@ -3031,14 +3610,16 @@ fn loadUserElfIntoProcessPages(
     if ((page0_paddr & 0xFFF) != 0 or (page1_paddr & 0xFFF) != 0) return null;
     const required_bytes = computeUserElfRequiredBytes(image_bytes) orelse return null;
     if (required_bytes > user_program_max_load_bytes) return null;
-    if (required_bytes > user_elf_load_window.len) return null;
 
-    @memset(user_elf_load_window[0..required_bytes], 0);
-    const loaded = elf_loader.loadToSinglePage(image_bytes, user_elf_base_va, user_elf_load_window[0..required_bytes]) catch return null;
+    const load_window = allocateBootScratch(required_bytes) orelse return null;
+    defer freeBootScratch(load_window);
+
+    @memset(load_window[0..required_bytes], 0);
+    const loaded = elf_loader.loadToSinglePage(image_bytes, user_elf_base_va, load_window[0..required_bytes]) catch return null;
 
     const required_pages = required_bytes / 4096;
     const page0: [*]u8 = @ptrFromInt(page0_paddr);
-    @memcpy(page0[0..4096], user_elf_load_window[0..4096]);
+    @memcpy(page0[0..4096], load_window[0..4096]);
 
     var page_index: usize = 1;
     while (page_index < required_pages) : (page_index += 1) {
@@ -3047,7 +3628,7 @@ fn loadUserElfIntoProcessPages(
         if (!mapUserLinearRegion(principal, map_va, extra_page.paddr, 4096, true)) return null;
         const page_bytes: [*]u8 = @ptrFromInt(extra_page.paddr);
         const off = page_index * 4096;
-        @memcpy(page_bytes[0..4096], user_elf_load_window[off .. off + 4096]);
+        @memcpy(page_bytes[0..4096], load_window[off .. off + 4096]);
     }
 
     return loaded;
@@ -3166,6 +3747,11 @@ fn launchDeferredCompositor(frame: *TrapFrame, reason: []const u8) void {
         deferred_compositor_user_stack_page_paddr,
         image,
     ) orelse {
+        deferred_compositor_launch_armed = false;
+        deferred_compositor_auto_launch_armed = false;
+        deferred_compositor_wait_mouse_queue_ready = false;
+        deferred_compositor_wait_keyboard_queue_ready = false;
+        logDeferredCompositorLoadFailure(image);
         serialWrite("deferred compositor launch failed: ELF load\n");
         return;
     };
@@ -3226,10 +3812,26 @@ fn tryAutoLaunchDeferredCompositor(frame: *TrapFrame) void {
         deferred_compositor_auto_launch_armed = false;
         return;
     }
-    if (deferred_compositor_wait_mouse_queue_ready and (boot_log_status_flags & boot_log_status_mouse_queue_ready) == 0) return;
-    if (deferred_compositor_wait_keyboard_queue_ready and (boot_log_status_flags & boot_log_status_keyboard_queue_ready) == 0) return;
-    if (lapic_tick_count < bootlog_entered_user_tick + bootlog_auto_min_visible_ticks) return;
-    if (lapic_tick_count < deferred_compositor_auto_launch_tick) return;
+    var block_mask: u32 = 0;
+    if (deferred_compositor_wait_mouse_queue_ready and (boot_log_status_flags & boot_log_status_mouse_queue_ready) == 0) {
+        block_mask |= 1 << 0;
+    }
+    if (deferred_compositor_wait_keyboard_queue_ready and (boot_log_status_flags & boot_log_status_keyboard_queue_ready) == 0) {
+        block_mask |= 1 << 1;
+    }
+    if (lapic_tick_count < bootlog_entered_user_tick + bootlog_auto_min_visible_ticks) {
+        block_mask |= 1 << 2;
+    }
+    if (lapic_tick_count < deferred_compositor_auto_launch_tick) {
+        block_mask |= 1 << 3;
+    }
+    if (block_mask != 0) {
+        deferred_compositor_auto_debug_last_mask = block_mask;
+        deferred_compositor_auto_debug_last_tick = lapic_tick_count;
+        return;
+    }
+    deferred_compositor_auto_debug_last_mask = 0;
+    deferred_compositor_auto_debug_last_tick = lapic_tick_count;
     launchDeferredCompositor(frame, "auto");
 }
 
@@ -3330,60 +3932,37 @@ fn collectMemoryStatsAndFreePages(
     bs: *uefi.tables.BootServices,
     free_list: *kernel.FreePageList,
 ) ?MemoryStats {
-    var mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
-    const mmap = bs.getMemoryMap(mmap_buffer[0..]) catch return null;
+    serialWrite("[stage] collectMemoryStats begin\n");
+    const mmap = bs.getMemoryMap(uefi_mmap_buffer[0..]) catch |err| {
+        serialWrite("getMemoryMap failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        return null;
+    };
+    serialWrite("[stage] collectMemoryStats got map\n");
 
     free_list.* = .{};
     var detected_regions: usize = 0;
     var total_usable_bytes: u64 = 0;
-    const pml4_start = pageAlignDown(@intFromPtr(&pml4_table));
-    const pml4_end = pageAlignUp(@intFromPtr(&pml4_table) + @sizeOf(@TypeOf(pml4_table)));
-    const pdp_start = pageAlignDown(@intFromPtr(&pdp_table));
-    const pdp_end = pageAlignUp(@intFromPtr(&pdp_table) + @sizeOf(@TypeOf(pdp_table)));
-    const pd_start = pageAlignDown(@intFromPtr(&pd_tables));
-    const pd_end = pageAlignUp(@intFromPtr(&pd_tables) + @sizeOf(@TypeOf(pd_tables)));
-    const high_mmio_pdp_start = pageAlignDown(@intFromPtr(&high_mmio_pdp_table));
-    const high_mmio_pdp_end = pageAlignUp(@intFromPtr(&high_mmio_pdp_table) + @sizeOf(@TypeOf(high_mmio_pdp_table)));
-    const high_mmio_pd_start = pageAlignDown(@intFromPtr(&high_mmio_pd_tables));
-    const high_mmio_pd_end = pageAlignUp(@intFromPtr(&high_mmio_pd_tables) + @sizeOf(@TypeOf(high_mmio_pd_tables)));
-    const user_spaces_start = pageAlignDown(@intFromPtr(&user_spaces));
-    const user_spaces_end = pageAlignUp(@intFromPtr(&user_spaces) + @sizeOf(@TypeOf(user_spaces)));
-    const thread_contexts_start = pageAlignDown(@intFromPtr(&thread_contexts));
-    const thread_contexts_end = pageAlignUp(@intFromPtr(&thread_contexts) + @sizeOf(@TypeOf(thread_contexts)));
-    const free_list_start = pageAlignDown(@intFromPtr(&global_free_list));
-    const free_list_end = pageAlignUp(@intFromPtr(&global_free_list) + @sizeOf(@TypeOf(global_free_list)));
-    const kernel_state_start = pageAlignDown(@intFromPtr(&kernel_state_global));
-    const kernel_state_end = pageAlignUp(@intFromPtr(&kernel_state_global) + @sizeOf(@TypeOf(kernel_state_global)));
-    const ring0_stack_start = pageAlignDown(@intFromPtr(&ring0_stack));
-    const ring0_stack_end = pageAlignUp(@intFromPtr(&ring0_stack) + @sizeOf(@TypeOf(ring0_stack)));
-    const gdt_start = pageAlignDown(@intFromPtr(&gdt));
-    const gdt_end = pageAlignUp(@intFromPtr(&gdt) + @sizeOf(@TypeOf(gdt)));
-    const idt_start = pageAlignDown(@intFromPtr(&idt));
-    const idt_end = pageAlignUp(@intFromPtr(&idt) + @sizeOf(@TypeOf(idt)));
-    const tss_start = pageAlignDown(@intFromPtr(&tss));
-    const tss_end = pageAlignUp(@intFromPtr(&tss) + @sizeOf(@TypeOf(tss)));
-    const tramp_start = pageAlignDown(@intFromPtr(&int80_trampoline_page));
-    const tramp_end = pageAlignUp(@intFromPtr(&timer_trampoline_page) + @sizeOf(@TypeOf(timer_trampoline_page)));
-    const mmap_start = pageAlignDown(@intFromPtr(&mmap_buffer));
-    const mmap_end = pageAlignUp(@intFromPtr(&mmap_buffer) + mmap_buffer.len);
+    const fallback_kernel_start = pageAlignDown(@min(@intFromPtr(&main), @intFromPtr(&pml4_table)));
+    const image_start = if (kernel_image_base_paddr != 0)
+        pageAlignDown(kernel_image_base_paddr)
+    else
+        fallback_kernel_start;
+    const image_end = if (kernel_image_base_paddr != 0 and kernel_image_size_bytes != 0)
+        pageAlignUp(kernel_image_base_paddr + kernel_image_size_bytes)
+    else
+        fallback_kernel_start;
+    const kernel_static_end = pageAlignUp(@intFromPtr(&post_exit_load_scratch) + @sizeOf(@TypeOf(post_exit_load_scratch)));
+    const kernel_reserved_start = @min(image_start, fallback_kernel_start);
+    const kernel_reserved_end = @max(image_end, kernel_static_end);
+    const user_spaces_start = if (user_spaces.len == 0) 0 else pageAlignDown(@intFromPtr(user_spaces.ptr));
+    const user_spaces_end = if (user_spaces.len == 0) 0 else pageAlignUp(@intFromPtr(user_spaces.ptr) + (user_spaces.len * @sizeOf(UserAddressSpace)));
     // カーネル自身が使う最低限の領域は free list から除外する。
     const reserved = [_]ReservedRange{
         .{ .start = 0, .end = reserved_low_mem_end },
-        .{ .start = pml4_start, .end = pml4_end },
-        .{ .start = pdp_start, .end = pdp_end },
-        .{ .start = pd_start, .end = pd_end },
-        .{ .start = high_mmio_pdp_start, .end = high_mmio_pdp_end },
-        .{ .start = high_mmio_pd_start, .end = high_mmio_pd_end },
+        .{ .start = kernel_reserved_start, .end = kernel_reserved_end },
         .{ .start = user_spaces_start, .end = user_spaces_end },
-        .{ .start = thread_contexts_start, .end = thread_contexts_end },
-        .{ .start = free_list_start, .end = free_list_end },
-        .{ .start = kernel_state_start, .end = kernel_state_end },
-        .{ .start = ring0_stack_start, .end = ring0_stack_end },
-        .{ .start = gdt_start, .end = gdt_end },
-        .{ .start = idt_start, .end = idt_end },
-        .{ .start = tss_start, .end = tss_end },
-        .{ .start = tramp_start, .end = tramp_end },
-        .{ .start = mmap_start, .end = mmap_end },
     };
 
     var it = mmap.iterator();
@@ -3407,8 +3986,14 @@ fn collectMemoryStatsAndFreePages(
     };
 }
 
-pub fn main() void {
+fn kernelMain() void {
+    asm volatile ("cli");
+    lapic.maskLegacyPic();
+    serial.writeRaw("RAW ENTER MAIN\n");
+    earlyUefiWrite(&[_:0]u16{ 'E', 'N', 'T', 'E', 'R', ' ', 'M', 'A', 'I', 'N', '\r', '\n' });
     serialInit();
+    serial.writeRaw("RAW SERIAL INIT DONE\n");
+    earlyUefiWrite(&[_:0]u16{ 'S', 'E', 'R', 'I', 'A', 'L', ' ', 'O', 'K', '\r', '\n' });
     deferred_compositor_launch_armed = false;
     deferred_compositor_launched = false;
     deferred_compositor_user_page_paddr = 0;
@@ -3425,6 +4010,9 @@ pub fn main() void {
     bootlog_gate_input_start_armed = false;
     bootlog_gate_start_thread0 = false;
     bootlog_gate_start_thread3 = false;
+    bootlog_gate_start_thread2 = false;
+    bootlog_gate_start_thread4 = false;
+    bootlog_gate_start_thread5 = false;
     serialWrite("[stage] boot entry\n");
     serialWrite("MicroKernel Phase1 boot\n");
     _ = gdt_user_code_selector;
@@ -3434,6 +4022,18 @@ pub fn main() void {
         serialWrite("boot services missing\n");
         while (true) asm volatile ("hlt");
     };
+    boot_services_cache = bs;
+    captureKernelImageRange(bs);
+    if (kernel_image_base_paddr != 0 and kernel_image_size_bytes != 0) {
+        serialWriteFmt(
+            "kernel image range base=0x{x} size={} bytes\n",
+            .{ kernel_image_base_paddr, kernel_image_size_bytes },
+        );
+    }
+    if (!allocateUserSpaces(bs)) {
+        serialWrite("user address space backing alloc failed\n");
+        while (true) asm volatile ("hlt");
+    }
     const framebuffer_info: ?FramebufferInfo = if (enable_framebuffer_server_step1)
         (acquireFramebufferInfo(bs) orelse {
             serialWrite("GraphicsOutput unavailable or mode unsupported for framebuffer server\n");
@@ -3497,6 +4097,13 @@ pub fn main() void {
         })
     else
         null;
+    const disk_terminal_window_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process and enable_virtio_input_keyboard)
+        (loadTerminalWindowElfFromDisk(bs) orelse {
+            serialWrite("disk terminal window ELF load failed\n");
+            while (true) asm volatile ("hlt");
+        })
+    else
+        null;
     const disk_compositor_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process and enable_virtio_input_mouse)
         (loadCompositorElfFromDisk(bs) orelse {
             serialWrite("disk compositor ELF load failed\n");
@@ -3511,13 +4118,10 @@ pub fn main() void {
         })
     else
         null;
-    const disk_user_elf: ?[]const u8 = if (enable_framebuffer_server_step1)
-        null
-    else
-        (loadUserElfFromDisk(bs) orelse {
-            serialWrite("disk user ELF load failed\n");
-            while (true) asm volatile ("hlt");
-        });
+    const disk_user_elf: ?[]const u8 = loadUserElfFromDisk(bs) orelse {
+        serialWrite("disk user ELF load failed\n");
+        while (true) asm volatile ("hlt");
+    };
     if (enable_framebuffer_server_step1) {
         if (enable_boot_log_console_process) {
             if (enable_virtio_input_mouse) {
@@ -3617,6 +4221,7 @@ pub fn main() void {
         printNumber(disk_user_elf.?.len);
         serialWrite(" bytes\n");
     }
+    serialWrite("[stage] before memory stats collect\n");
     const memory_stats = collectMemoryStatsAndFreePages(bs, &global_free_list) orelse {
         serialWrite("memory map parse failed\n");
         while (true) asm volatile ("hlt");
@@ -3647,6 +4252,7 @@ pub fn main() void {
         }
         serialWrite("UEFI services terminated\n");
     }
+    boot_services_cache = null;
     loadGdtAndReloadSegments();
     initFxStateSupport();
     serialWrite("GDT loaded (kernel/user segments)\n");
@@ -3708,7 +4314,62 @@ pub fn main() void {
         while (true) asm volatile ("hlt");
     };
     const state = &kernel_state_global;
+    if (enable_iommu_no_cap_driver) {
+        state.setIommuNoCapDriverMode(if (enforce_iommu_no_cap_driver) .enforce else .shadow);
+        state.iommu_audit_hook = iommuAuditHook;
+        serialWrite("iommu: no-cap-driver mode=");
+        serialWrite(if (enforce_iommu_no_cap_driver) "enforce\n" else "shadow\n");
+    } else {
+        state.setIommuNoCapDriverMode(.off);
+        state.iommu_audit_hook = null;
+        serialWrite("iommu: no-cap-driver mode=off\n");
+    }
     state.pte_sync_hook = null;
+    const untyped_bootstrap = untyped_memory.bootstrapProcess0Untyped(state, &global_free_list) catch |err| {
+        serialWrite("untyped bootstrap failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    serialWrite("untyped blocks: ");
+    printNumber(untyped_bootstrap.block_count);
+    serialWrite(" bytes=");
+    printNumber(untyped_bootstrap.total_bytes);
+    serialWrite("\n");
+    const gpu_untyped_grants = untyped_memory.grantProcess0UntypedTo(state, .Process1) catch |err| {
+        serialWrite("untyped grant to Process1 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    serialWrite("untyped grants to Process1: ");
+    printNumber(gpu_untyped_grants);
+    serialWrite("\n");
+    const process2_untyped_grants = untyped_memory.grantProcess0UntypedTo(state, .Process2) catch |err| {
+        serialWrite("untyped grant to Process2 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    const process4_untyped_grants = untyped_memory.grantProcess0UntypedTo(state, .Process4) catch |err| {
+        serialWrite("untyped grant to Process4 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    const process5_untyped_grants = untyped_memory.grantProcess0UntypedTo(state, .Process5) catch |err| {
+        serialWrite("untyped grant to Process5 failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+    serialWrite("untyped grants to Process2/4/5: ");
+    printNumber(process2_untyped_grants);
+    serialWrite("/");
+    printNumber(process4_untyped_grants);
+    serialWrite("/");
+    printNumber(process5_untyped_grants);
+    serialWrite("\n");
     var process0_user_page: ?kernel.PageCapability = null;
     var process0_user_stack_page: ?kernel.PageCapability = null;
     var framebuffer_server_user_page: ?kernel.PageCapability = null;
@@ -3719,6 +4380,8 @@ pub fn main() void {
     var process3_user_stack_page: ?kernel.PageCapability = null;
     var process4_user_page: ?kernel.PageCapability = null;
     var process4_user_stack_page: ?kernel.PageCapability = null;
+    var process5_user_page: ?kernel.PageCapability = null;
+    var process5_user_stack_page: ?kernel.PageCapability = null;
     var boot_log_console_page: ?kernel.PageCapability = null;
     var boot_log_console_stack_page: ?kernel.PageCapability = null;
     var mouse_driver_runtime_stack_page: ?kernel.PageCapability = null;
@@ -3859,6 +4522,8 @@ pub fn main() void {
     process3_user_stack_page = process_setup.process3_user_stack_page;
     process4_user_page = process_setup.process4_user_page;
     process4_user_stack_page = process_setup.process4_user_stack_page;
+    process5_user_page = process_setup.process5_user_page;
+    process5_user_stack_page = process_setup.process5_user_stack_page;
     boot_log_console_page = process_setup.boot_log_console_page;
     boot_log_console_stack_page = process_setup.boot_log_console_stack_page;
     mouse_driver_runtime_stack_page = process_setup.mouse_driver_runtime_stack_page;
@@ -3946,7 +4611,10 @@ pub fn main() void {
                         serialWrite("  keyboard_owner=Process3\n");
                     }
                     if (thread_contexts[4].ready) {
-                        serialWrite("  keyboard_ascii_demo_owner=Process4\n");
+                        serialWrite("  keyboard_log_owner=Process4\n");
+                    }
+                    if (thread_contexts[5].ready) {
+                        serialWrite("  terminal_owner=Process5\n");
                     }
                 } else if (boot_runtime_mode == .MouseCompositor) {
                     serialWrite("  compositor_owner=Process1\n");
@@ -3955,7 +4623,10 @@ pub fn main() void {
                         serialWrite("  keyboard_owner=Process3\n");
                     }
                     if (thread_contexts[4].ready) {
-                        serialWrite("  keyboard_ascii_demo_owner=Process4\n");
+                        serialWrite("  keyboard_log_owner=Process4\n");
+                    }
+                    if (thread_contexts[5].ready) {
+                        serialWrite("  terminal_owner=Process5\n");
                     }
                 }
 
@@ -3975,6 +4646,11 @@ pub fn main() void {
                 if (thread_contexts[4].ready) {
                     serialWrite("  process4_cr3=");
                     printHex(user_spaces[4].cr3);
+                    serialWrite("\n");
+                }
+                if (thread_contexts[5].ready) {
+                    serialWrite("  process5_cr3=");
+                    printHex(user_spaces[5].cr3);
                     serialWrite("\n");
                 }
                 if (boot_runtime_mode == .FramebufferIpc or thread_contexts[0].ready) {
@@ -4013,6 +4689,14 @@ pub fn main() void {
                     serialWrite("\n");
                     serialWrite("  thread4_ctx_rip=");
                     printHex(thread_contexts[4].frame.rip);
+                    serialWrite("\n");
+                }
+                if (thread_contexts[5].ready) {
+                    serialWrite("  thread5_owner=");
+                    serialWrite(principalLabel(thread_contexts[5].owner_process));
+                    serialWrite("\n");
+                    serialWrite("  thread5_ctx_rip=");
+                    printHex(thread_contexts[5].frame.rip);
                 }
             },
         }
@@ -4122,6 +4806,18 @@ pub fn main() void {
                 setThreadEntryIfReady(4, loaded_keyboard_ascii_demo.entry, user_entry_rsp);
                 logElfLoadSummary("KeyboardAsciiDemo ELF mapped", loaded_keyboard_ascii_demo);
             }
+            if (process5_user_page != null and process5_user_stack_page != null and disk_terminal_window_elf != null) {
+                const loaded_terminal_window = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process5,
+                    process5_user_page.?.paddr,
+                    process5_user_stack_page.?.paddr,
+                    disk_terminal_window_elf.?,
+                    "terminal window ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(5, loaded_terminal_window.entry, user_entry_rsp);
+                logElfLoadSummary("TerminalWindow ELF mapped", loaded_terminal_window);
+            }
             if (disk_compositor_elf) |compositor_image| {
                 armDeferredCompositorLaunch(
                     compositor_image,
@@ -4215,6 +4911,18 @@ pub fn main() void {
                 setThreadEntryIfReady(4, loaded_keyboard_ascii_demo.entry, user_entry_rsp);
                 logElfLoadSummary("KeyboardAsciiDemo ELF mapped", loaded_keyboard_ascii_demo);
             }
+            if (process5_user_page != null and process5_user_stack_page != null and disk_terminal_window_elf != null) {
+                const loaded_terminal_window = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process5,
+                    process5_user_page.?.paddr,
+                    process5_user_stack_page.?.paddr,
+                    disk_terminal_window_elf.?,
+                    "terminal window ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(5, loaded_terminal_window.entry, user_entry_rsp);
+                logElfLoadSummary("TerminalWindow ELF mapped", loaded_terminal_window);
+            }
         },
         .BootLogConsole => {
             mapUserLinearRegionOrHalt(
@@ -4269,6 +4977,42 @@ pub fn main() void {
                     serialWrite("\n");
                 }
             }
+            if (process2_user_page != null and process2_user_stack_page != null and disk_user_elf != null) {
+                const loaded_pie_user = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process2,
+                    process2_user_page.?.paddr,
+                    process2_user_stack_page.?.paddr,
+                    disk_user_elf.?,
+                    "pie user ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(2, loaded_pie_user.entry, user_entry_rsp);
+                logElfLoadSummary("PieUser ELF mapped", loaded_pie_user);
+            }
+            if (process4_user_page != null and process4_user_stack_page != null and disk_keyboard_ascii_demo_elf != null) {
+                const loaded_keyboard_ascii_demo = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process4,
+                    process4_user_page.?.paddr,
+                    process4_user_stack_page.?.paddr,
+                    disk_keyboard_ascii_demo_elf.?,
+                    "keyboard ascii demo ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(4, loaded_keyboard_ascii_demo.entry, user_entry_rsp);
+                logElfLoadSummary("KeyboardAsciiDemo ELF mapped", loaded_keyboard_ascii_demo);
+            }
+            if (process5_user_page != null and process5_user_stack_page != null and disk_terminal_window_elf != null) {
+                const loaded_terminal_window = loadUserElfIntoProcessPagesOrHalt(
+                    state,
+                    .Process5,
+                    process5_user_page.?.paddr,
+                    process5_user_stack_page.?.paddr,
+                    disk_terminal_window_elf.?,
+                    "terminal window ELF load into user page failed\n",
+                );
+                setThreadEntryIfReady(5, loaded_terminal_window.entry, user_entry_rsp);
+                logElfLoadSummary("TerminalWindow ELF mapped", loaded_terminal_window);
+            }
         },
         .FramebufferIpc => {
             const loaded_draw_client = loadUserElfIntoUserPageOrHalt(
@@ -4303,13 +5047,15 @@ pub fn main() void {
     switch (boot_runtime_mode) {
         .MouseCompositor => {
             if (keyboard_driver_cfg != null and thread_contexts[3].ready) {
-                if (thread_contexts[4].ready) {
-                    serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse demo + keyboard driver + keyboard demo)\n");
+                if (thread_contexts[4].ready and thread_contexts[5].ready) {
+                    serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse window + keyboard driver + keyboard log + terminal)\n");
+                } else if (thread_contexts[4].ready) {
+                    serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse window + keyboard driver + keyboard log)\n");
                 } else {
-                    serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse demo + keyboard driver)\n");
+                    serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse window + keyboard driver)\n");
                 }
             } else {
-                serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse demo)\n");
+                serialWrite("\nenter ring3 with iretq (mouse driver + compositor + mouse window)\n");
             }
         },
         .BootLogConsole => {
@@ -4321,13 +5067,15 @@ pub fn main() void {
         },
         .BootLogGateCompositor => {
             if (keyboard_driver_cfg != null and thread_contexts[3].ready) {
-                if (thread_contexts[4].ready) {
-                    serialWrite("\nenter ring3 with iretq (boot log console + mouse demo + keyboard demo + mouse + keyboard; auto compositor)\n");
+                if (thread_contexts[4].ready and thread_contexts[5].ready) {
+                    serialWrite("\nenter ring3 with iretq (boot log console + mouse window + keyboard log + terminal + mouse + keyboard; auto compositor)\n");
+                } else if (thread_contexts[4].ready) {
+                    serialWrite("\nenter ring3 with iretq (boot log console + mouse window + keyboard log + mouse + keyboard; auto compositor)\n");
                 } else {
-                    serialWrite("\nenter ring3 with iretq (boot log console + mouse demo + mouse + keyboard; auto compositor)\n");
+                    serialWrite("\nenter ring3 with iretq (boot log console + mouse window + mouse + keyboard; auto compositor)\n");
                 }
             } else {
-                serialWrite("\nenter ring3 with iretq (boot log console + mouse demo + mouse; auto compositor)\n");
+                serialWrite("\nenter ring3 with iretq (boot log console + mouse window + mouse; auto compositor)\n");
             }
         },
         .FramebufferIpc => serialWrite("\nenter ring3 with iretq (framebuffer IPC mode)\n"),
@@ -4345,6 +5093,7 @@ pub fn main() void {
             gate_drivers and keyboard_driver_cfg != null and thread_contexts[3].ready,
             thread_contexts[2].ready,
             thread_contexts[4].ready,
+            false,
             if (enable_bootlog_wait_for_enter) bootlog_gate_input_start_delay_ticks else bootlog_gate_auto_input_start_delay_ticks,
         );
     }
@@ -4353,4 +5102,17 @@ pub fn main() void {
     recordBootTimingEvent("user_enter", boot_timing.user_enter_tick, null);
     const boot_ctx = getThreadContextConst(current_thread_index).?;
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
+}
+
+pub fn main() void {
+    const boot_stack_top = (@intFromPtr(&ring0_stack) + ring0_stack.len) & ~@as(usize, 0xF);
+    asm volatile (
+        \\mov %[stack_top], %%rsp
+        \\mov %[target], %%rax
+        \\call *%%rax
+        :
+        : [stack_top] "r" (boot_stack_top),
+          [target] "r" (&kernelMain),
+        : .{ .memory = true, .rax = true });
+    unreachable;
 }

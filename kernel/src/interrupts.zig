@@ -90,10 +90,14 @@ pub fn clearIdt(idt: *[256]IdtEntry) void {
 }
 
 pub fn setIdtEntry(idt: *[256]IdtEntry, vec: usize, selector: u16, handler: usize, type_attr: u8) void {
+    setIdtEntryWithIst(idt, vec, selector, handler, 0, type_attr);
+}
+
+pub fn setIdtEntryWithIst(idt: *[256]IdtEntry, vec: usize, selector: u16, handler: usize, ist: u8, type_attr: u8) void {
     idt[vec] = .{
         .offset_low = @as(u16, @truncate(handler & 0xFFFF)),
         .selector = selector,
-        .ist = 0,
+        .ist = ist & 0x7,
         .type_attr = type_attr,
         .offset_mid = @as(u16, @truncate((handler >> 16) & 0xFFFF)),
         .offset_high = @as(u32, @truncate(handler >> 32)),

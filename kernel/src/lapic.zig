@@ -51,7 +51,7 @@ fn mmioWrite(offset: u32, value: u32) void {
     reg.* = value;
 }
 
-fn maskLegacyPic() void {
+pub fn maskLegacyPic() void {
     // Mask all legacy PIC IRQ lines to avoid stray IRQ while using LAPIC timer.
     outb(0x21, 0xFF);
     outb(0xA1, 0xFF);
@@ -82,4 +82,8 @@ pub fn initTimer(timer_vector: u8, initial_count: u32) bool {
 pub fn eoi() void {
     if (lapic_base_pa == 0) return;
     mmioWrite(lapic_reg_eoi, 0);
+}
+
+pub fn eoiLegacyPicMaster() void {
+    outb(0x20, 0x20);
 }

@@ -8,6 +8,7 @@ const syscall_map_page: u64 = 0x2;
 const syscall_grant_cap: u64 = 0x8;
 const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
+const syscall_map_pages_batch: u64 = 0x15;
 
 const syscall_ok: u64 = 0;
 const syscall_err_empty: u64 = 13;
@@ -18,6 +19,7 @@ const ipc_rx_page_va: usize = 0x3C10_8000;
 const shared_magic = protocol.mouse_shared_magic;
 const window_cap_magic = protocol.window_cap_magic;
 const window_meta_magic = protocol.window_meta_magic;
+const window_flag_low_scale = protocol.window_flag_low_scale;
 const process0_id: u64 = 0;
 const rights_read_write: u64 = 0x3;
 
@@ -31,7 +33,6 @@ const fb_height_i32: i32 = @as(i32, @intCast(fb_height));
 const pixel_width: usize = 32;
 const pixel_height: usize = 32;
 const pixel_pitch: usize = 32;
-const pixel_pixels: usize = pixel_pitch * pixel_height;
 
 const max_windows: usize = 4;
 
@@ -54,7 +55,8 @@ const window_shadow_color: u32 = 0x0000_0000;
 const window_shadow_right_extent: i32 = 2;
 const window_shadow_bottom_extent: i32 = 3;
 
-const window_scale: usize = 10;
+const default_window_scale: usize = 10;
+const low_window_scale: usize = 1;
 const window_border: usize = 1;
 const window_header_h: usize = 27;
 const window_close_size: usize = 16;
@@ -66,12 +68,14 @@ const window_border_i32: i32 = @as(i32, @intCast(window_border));
 const window_header_h_i32: i32 = @as(i32, @intCast(window_header_h));
 const window_close_size_i32: i32 = @as(i32, @intCast(window_close_size));
 const window_close_margin_i32: i32 = @as(i32, @intCast(window_close_margin));
-const window_scale_i32: i32 = @as(i32, @intCast(window_scale));
 
 const window_title_offset: usize = 16;
 const window_title_max_bytes = protocol.window_title_max_bytes;
 const window_map_base_va: usize = 0x3C11_0000;
-const window_map_stride_va: usize = 0x3000;
+const max_window_pixel_pages: usize = 128;
+const max_window_pixel_bytes: usize = max_window_pixel_pages * 4096;
+const max_window_shadow_pixels: usize = max_window_pixel_bytes / @sizeOf(u32);
+const window_map_stride_va: usize = (2 + max_window_pixel_pages) * 4096;
 const WindowCap = protocol.WindowCap;
 const WindowMeta = protocol.WindowMeta;
 const MouseSharedPage = protocol.MouseSharedPage;
@@ -83,6 +87,7 @@ const WindowCapSnapshot = struct {
     width: usize,
     height: usize,
     pitch: usize,
+    flags: u32,
 };
 const Rect = model.Rect;
 const SourceRegion = model.SourceRegion;
@@ -93,13 +98,32 @@ const WindowStore = model.WindowStore(max_windows);
 
 var back_buffer_storage: [fb_pixels]u32 align(64) = [_]u32{0} ** fb_pixels;
 var window_store: WindowStore = .{};
-var window_shadow_storage: [max_windows][pixel_pixels]u32 align(64) = [_][pixel_pixels]u32{([_]u32{0} ** pixel_pixels)} ** max_windows;
+var window_shadow_storage: [max_windows][max_window_shadow_pixels]u32 align(64) =
+    [_][max_window_shadow_pixels]u32{([_]u32{0} ** max_window_shadow_pixels)} ** max_windows;
 var window_shadow_valid: [max_windows]bool = [_]bool{false} ** max_windows;
 var window_gpu_resources: [max_windows]?*virtgpu.Resource = [_]?*virtgpu.Resource{null} ** max_windows;
 var first_compose_logged = false;
 var first_present_transfer_logged = false;
 var first_present_flush_logged = false;
 var perf_frame_counter: u64 = 0;
+var logged_invalid_gpu_slot: ?usize = null;
+var logged_first_gpu_sync_slot: bool = false;
+const compositor_perf_report_min_wall_tsc: u64 = 1_000_000_000;
+const CompositorPerfReport = struct {
+    start_tsc: u64 = 0,
+    total_tsc: u64 = 0,
+    sync_tsc: u64 = 0,
+    compose_tsc: u64 = 0,
+    submit_tsc: u64 = 0,
+    frames: u64 = 0,
+    presents: u64 = 0,
+    idle_loops: u64 = 0,
+    no_window_loops: u64 = 0,
+    full_frames: u64 = 0,
+    dirty_frames: u64 = 0,
+    present_area_sum: u64 = 0,
+};
+var compositor_perf_report: CompositorPerfReport = .{};
 var mouse_state_storage: MouseState = .{
     .x = @as(i32, @intCast(fb_width / 2)),
     .y = @as(i32, @intCast(fb_height / 2)),
@@ -162,6 +186,77 @@ fn userLog(message: []const u8) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn appendDiagText(buf: []u8, idx: *usize, text: []const u8) void {
+    if (idx.* >= buf.len) return;
+    const remaining = buf.len - idx.*;
+    const copy_len = if (text.len < remaining) text.len else remaining;
+    @memcpy(buf[idx.* .. idx.* + copy_len], text[0..copy_len]);
+    idx.* += copy_len;
+}
+
+fn appendDiagU64Decimal(buf: []u8, idx: *usize, value: u64) void {
+    if (idx.* >= buf.len) return;
+    const text = std.fmt.bufPrint(buf[idx.*..], "{}", .{value}) catch return;
+    idx.* += text.len;
+}
+
+fn appendDiagBoolDigit(buf: []u8, idx: *usize, value: bool) void {
+    appendDiagText(buf, idx, if (value) "1" else "0");
+}
+
+fn logInvalidGpuSlot(slot: usize) void {
+    if (logged_invalid_gpu_slot != null and logged_invalid_gpu_slot.? == slot) return;
+    logged_invalid_gpu_slot = slot;
+    var buf: [96]u8 = undefined;
+    var idx: usize = 0;
+    appendDiagText(buf[0..], &idx, "Compositor: invalid gpu slot=");
+    appendDiagU64Decimal(buf[0..], &idx, slot);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
+fn logFirstGpuSyncSlot(slot: usize, source: *const WindowSource, frame: *const WindowState) void {
+    if (logged_first_gpu_sync_slot) return;
+    logged_first_gpu_sync_slot = true;
+    var buf: [192]u8 = undefined;
+    var idx: usize = 0;
+    appendDiagText(buf[0..], &idx, "Compositor: gpu sync slot=");
+    appendDiagU64Decimal(buf[0..], &idx, slot);
+    appendDiagText(buf[0..], &idx, " window_id=");
+    appendDiagU64Decimal(buf[0..], &idx, source.window_id);
+    appendDiagText(buf[0..], &idx, " width=");
+    appendDiagU64Decimal(buf[0..], &idx, source.width);
+    appendDiagText(buf[0..], &idx, " height=");
+    appendDiagU64Decimal(buf[0..], &idx, source.height);
+    appendDiagText(buf[0..], &idx, " pitch=");
+    appendDiagU64Decimal(buf[0..], &idx, source.pitch);
+    appendDiagText(buf[0..], &idx, " src_active=");
+    appendDiagBoolDigit(buf[0..], &idx, source.active);
+    appendDiagText(buf[0..], &idx, " frame_active=");
+    appendDiagBoolDigit(buf[0..], &idx, frame.active);
+    appendDiagText(buf[0..], &idx, " frame_visible=");
+    appendDiagBoolDigit(buf[0..], &idx, frame.visible);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
+fn logWindowShadowOverflow(slot: usize, needed_pixels: usize) void {
+    var buf: [128]u8 = undefined;
+    var idx: usize = 0;
+    appendDiagText(buf[0..], &idx, "Compositor: shadow overflow slot=");
+    appendDiagU64Decimal(buf[0..], &idx, slot);
+    appendDiagText(buf[0..], &idx, " needed_pixels=");
+    appendDiagU64Decimal(buf[0..], &idx, needed_pixels);
+    appendDiagText(buf[0..], &idx, " capacity=");
+    appendDiagU64Decimal(buf[0..], &idx, max_window_shadow_pixels);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
+fn invalidateWindowBodyCache(slot: usize) void {
+    _ = slot;
+}
+
 fn snapshotWindowCap(cap: *const volatile WindowCap) WindowCapSnapshot {
     return .{
         .window_id = cap.window_id,
@@ -171,6 +266,7 @@ fn snapshotWindowCap(cap: *const volatile WindowCap) WindowCapSnapshot {
         .width = cap.width,
         .height = cap.height,
         .pitch = cap.pixels_per_scan_line,
+        .flags = cap.flags,
     };
 }
 
@@ -182,6 +278,18 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn mapPagesBatch(base_va: u64, paddr_list_va: u64, page_count: u64, writable: bool) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_map_pages_batch),
+          [arg0] "{rdi}" (base_va),
+          [arg1] "{rsi}" (paddr_list_va),
+          [arg2] "{rdx}" (page_count),
+          [arg3] "{rcx}" (@as(u64, if (writable) 1 else 0)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -584,12 +692,20 @@ fn textPixelWidth(text: []const u8) i32 {
     return font.measureUtf8Text(text, 1);
 }
 
+fn windowScale(win: *const WindowState) usize {
+    return if (win.content_scale > 0) win.content_scale else default_window_scale;
+}
+
+fn windowScaleI32(win: *const WindowState) i32 {
+    return @as(i32, @intCast(windowScale(win)));
+}
+
 fn windowContentW(win: *const WindowState) i32 {
-    return @as(i32, @intCast(win.src.w * window_scale));
+    return @as(i32, @intCast(win.src.w * windowScale(win)));
 }
 
 fn windowContentH(win: *const WindowState) i32 {
-    return @as(i32, @intCast(win.src.h * window_scale));
+    return @as(i32, @intCast(win.src.h * windowScale(win)));
 }
 
 fn windowWidth(win: *const WindowState) i32 {
@@ -676,6 +792,48 @@ fn logComposePerf(compose_ticks: u64, present_submit_ticks: u64, present_rect: R
     appendU64Decimal(buf[0..], &idx, area);
     appendText(buf[0..], &idx, "\n");
     _ = userLog(buf[0..idx]);
+}
+
+fn resetCompositorPerfReport(now_tsc: u64) void {
+    compositor_perf_report = .{ .start_tsc = now_tsc };
+}
+
+fn maybeLogCompositorPerf(now_tsc: u64) void {
+    if (compositor_perf_report.start_tsc == 0) {
+        resetCompositorPerfReport(now_tsc);
+        return;
+    }
+    if (compositor_perf_report.total_tsc < compositor_perf_report_min_wall_tsc) return;
+
+    const busy_tsc = compositor_perf_report.sync_tsc + compositor_perf_report.compose_tsc + compositor_perf_report.submit_tsc;
+    const wall_tsc = compositor_perf_report.total_tsc;
+    const busy_pct = if (wall_tsc > 0) (busy_tsc * 100) / wall_tsc else 0;
+    const sync_pct = if (wall_tsc > 0) (compositor_perf_report.sync_tsc * 100) / wall_tsc else 0;
+    const compose_pct = if (wall_tsc > 0) (compositor_perf_report.compose_tsc * 100) / wall_tsc else 0;
+    const submit_pct = if (wall_tsc > 0) (compositor_perf_report.submit_tsc * 100) / wall_tsc else 0;
+    const avg_area = if (compositor_perf_report.presents > 0) compositor_perf_report.present_area_sum / compositor_perf_report.presents else 0;
+
+    var buf: [320]u8 = undefined;
+    const text = std.fmt.bufPrint(
+        buf[0..],
+        "Compositor: perf2 wall_tsc={} busy_pct={} sync_pct={} compose_pct={} submit_pct={} frames={} presents={} full_frames={} dirty_frames={} idle_loops={} no_window_loops={} avg_present_area={}\n",
+        .{
+            wall_tsc,
+            busy_pct,
+            sync_pct,
+            compose_pct,
+            submit_pct,
+            compositor_perf_report.frames,
+            compositor_perf_report.presents,
+            compositor_perf_report.full_frames,
+            compositor_perf_report.dirty_frames,
+            compositor_perf_report.idle_loops,
+            compositor_perf_report.no_window_loops,
+            avg_area,
+        },
+    ) catch return;
+    _ = userLog(text);
+    resetCompositorPerfReport(now_tsc);
 }
 
 fn fitTextWithEllipsis(text: []const u8, max_width: i32, scratch: []u8) []const u8 {
@@ -1008,29 +1166,33 @@ fn drawWindowChromeSurface(
 }
 
 fn blitScaledPixelToWindow(back: [*]u32, win: *const WindowState, local_vx: usize, local_vy: usize, color: u32) Rect {
-    const x0 = contentOriginX(win) + @as(i32, @intCast(local_vx * window_scale));
-    const y0 = contentOriginY(win) + @as(i32, @intCast(local_vy * window_scale));
+    const scale = windowScale(win);
+    const scale_i32 = windowScaleI32(win);
+    const x0 = contentOriginX(win) + @as(i32, @intCast(local_vx * scale));
+    const y0 = contentOriginY(win) + @as(i32, @intCast(local_vy * scale));
     var sy: i32 = 0;
-    while (sy < window_scale_i32) : (sy += 1) {
+    while (sy < scale_i32) : (sy += 1) {
         var sx: i32 = 0;
-        while (sx < window_scale_i32) : (sx += 1) {
+        while (sx < scale_i32) : (sx += 1) {
             setBackPixel(back, x0 + sx, y0 + sy, color);
         }
     }
-    return .{ .x0 = x0, .y0 = y0, .x1 = x0 + window_scale_i32, .y1 = y0 + window_scale_i32 };
+    return .{ .x0 = x0, .y0 = y0, .x1 = x0 + scale_i32, .y1 = y0 + scale_i32 };
 }
 
 fn blitScaledPixelToWindowSurface(surface: *const DrawSurface, win: *const WindowState, local_vx: usize, local_vy: usize, color: u32) Rect {
-    const x0 = contentOriginX(win) + @as(i32, @intCast(local_vx * window_scale));
-    const y0 = contentOriginY(win) + @as(i32, @intCast(local_vy * window_scale));
+    const scale = windowScale(win);
+    const scale_i32 = windowScaleI32(win);
+    const x0 = contentOriginX(win) + @as(i32, @intCast(local_vx * scale));
+    const y0 = contentOriginY(win) + @as(i32, @intCast(local_vy * scale));
     var sy: i32 = 0;
-    while (sy < window_scale_i32) : (sy += 1) {
+    while (sy < scale_i32) : (sy += 1) {
         var sx: i32 = 0;
-        while (sx < window_scale_i32) : (sx += 1) {
+        while (sx < scale_i32) : (sx += 1) {
             setSurfacePixel(surface, x0 + sx, y0 + sy, color);
         }
     }
-    return .{ .x0 = x0, .y0 = y0, .x1 = x0 + window_scale_i32, .y1 = y0 + window_scale_i32 };
+    return .{ .x0 = x0, .y0 = y0, .x1 = x0 + scale_i32, .y1 = y0 + scale_i32 };
 }
 
 fn blitShadowRegionToWindow(back: [*]u32, shadow: [*]u32, win: *const WindowState) void {
@@ -1137,23 +1299,49 @@ fn findFreeWindowSlot() ?usize {
     return window_store.findFree();
 }
 
-fn updateWindowTitleFromMeta(slot: usize) void {
-    if (slot >= max_windows) return;
+fn updateWindowTitleFromMeta(slot: usize) bool {
+    if (slot >= max_windows) return false;
     const slot_ref = &window_store.slots[slot];
-    if (!slot_ref.source.active) return;
+    if (!slot_ref.source.active) return false;
     const meta_va = slot_ref.source.meta_va;
     const map_lo = window_map_base_va;
     const map_hi = window_map_base_va + max_windows * window_map_stride_va;
-    if (meta_va < map_lo or meta_va >= map_hi) return;
+    if (meta_va < map_lo or meta_va >= map_hi) return false;
     const meta: *const volatile WindowMeta = @ptrFromInt(meta_va);
-    if (meta.magic != window_meta_magic) return;
-    if (meta.version != protocol.window_protocol_version) return;
+    if (meta.magic != window_meta_magic) return false;
+    if (meta.version != protocol.window_protocol_version) return false;
     const requested_len: usize = if (meta.title_len < window_title_max_bytes) meta.title_len else window_title_max_bytes;
+    const title_changed = slot_ref.frame.title_len != requested_len;
     var i: usize = 0;
     while (i < requested_len) : (i += 1) {
-        slot_ref.frame.title[i] = sanitizeTitleByte(meta.title[i]);
+        const next = sanitizeTitleByte(meta.title[i]);
+        if (!title_changed and slot_ref.frame.title[i] != next) {
+            slot_ref.frame.title_len = requested_len;
+            slot_ref.frame.title[i] = next;
+            i += 1;
+            while (i < requested_len) : (i += 1) {
+                slot_ref.frame.title[i] = sanitizeTitleByte(meta.title[i]);
+            }
+            return true;
+        }
+        slot_ref.frame.title[i] = next;
     }
     slot_ref.frame.title_len = requested_len;
+    return title_changed;
+}
+
+fn readWindowMetaSeq(slot: usize) ?u64 {
+    if (slot >= max_windows) return null;
+    const slot_ref = &window_store.slots[slot];
+    if (!slot_ref.source.active) return null;
+    const meta_va = slot_ref.source.meta_va;
+    const map_lo = window_map_base_va;
+    const map_hi = window_map_base_va + max_windows * window_map_stride_va;
+    if (meta_va < map_lo or meta_va >= map_hi) return null;
+    const meta: *const volatile WindowMeta = @ptrFromInt(meta_va);
+    if (meta.magic != window_meta_magic) return null;
+    if (meta.version != protocol.window_protocol_version) return null;
+    return meta.seq;
 }
 
 fn windowBounds(win: *const WindowState) Rect {
@@ -1166,10 +1354,11 @@ fn windowBounds(win: *const WindowState) Rect {
 }
 
 fn screenRectForSourceRegion(win: *const WindowState, region: SourceRegion) Rect {
-    const x0 = contentOriginX(win) + @as(i32, @intCast(region.x * window_scale));
-    const y0 = contentOriginY(win) + @as(i32, @intCast(region.y * window_scale));
-    const x1 = x0 + @as(i32, @intCast(region.w * window_scale));
-    const y1 = y0 + @as(i32, @intCast(region.h * window_scale));
+    const scale = windowScale(win);
+    const x0 = contentOriginX(win) + @as(i32, @intCast(region.x * scale));
+    const y0 = contentOriginY(win) + @as(i32, @intCast(region.y * scale));
+    const x1 = x0 + @as(i32, @intCast(region.w * scale));
+    const y1 = y0 + @as(i32, @intCast(region.h * scale));
     return clipRectToScreen(.{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 });
 }
 
@@ -1182,8 +1371,19 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
         return null;
     }
     if (cap.width == 0 or cap.height == 0) return null;
-    if (cap.pixels_page_count != 1) {
-        _ = userLog("Compositor: pixels_page_count!=1 unsupported\n");
+    if (cap.pixels_page_count == 0) {
+        _ = userLog("Compositor: pixels_page_count==0\n");
+        return null;
+    }
+    const page_count: usize = @intCast(cap.pixels_page_count);
+    if (page_count > max_window_pixel_pages) {
+        _ = userLog("Compositor: pixels_page_count too large\n");
+        return null;
+    }
+    const cap_size = @sizeOf(WindowCap);
+    const list_capacity = (4096 - cap_size) / @sizeOf(u64);
+    if (page_count > list_capacity) {
+        _ = userLog("Compositor: cap paddr list overflow\n");
         return null;
     }
     if (cap.pixels_cap_paddr < 0x1000 or cap.meta_cap_paddr < 0x1000) return null;
@@ -1196,8 +1396,15 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     const map_meta_va = slot_base + 0x1000;
     const map_pixel_va = slot_base + 0x2000;
 
+    _ = userLog("Compositor: registerWindowCap map begin\n");
     if (mapPage(map_meta_va, cap_snapshot.meta_cap_paddr, false) != syscall_ok) return null;
-    if (mapPage(map_pixel_va, cap_snapshot.pixels_cap_paddr, false) != syscall_ok) return null;
+    const paddr_list: [*]const volatile u64 = @ptrFromInt(ipc_rx_page_va + cap_size);
+    var i: usize = 0;
+    while (i < page_count) : (i += 1) {
+        if (paddr_list[i] < 0x1000) return null;
+    }
+    if (mapPagesBatch(map_pixel_va, ipc_rx_page_va + cap_size, cap_snapshot.pixels_page_count, false) != syscall_ok) return null;
+    _ = userLog("Compositor: registerWindowCap map done\n");
 
     const slot_ref = &window_store.slots[slot];
     slot_ref.reset();
@@ -1211,6 +1418,7 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
         .width = cap_snapshot.width,
         .height = cap_snapshot.height,
         .pitch = cap_snapshot.pitch,
+        .flags = cap_snapshot.flags,
     };
 
     const frame_ptr: *volatile WindowState = &slot_ref.frame;
@@ -1220,6 +1428,7 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     frame_ptr.src.y = 0;
     frame_ptr.src.w = cap_snapshot.width;
     frame_ptr.src.h = cap_snapshot.height;
+    frame_ptr.content_scale = @intCast(if ((cap_snapshot.flags & window_flag_low_scale) != 0) low_window_scale else default_window_scale);
     frame_ptr.x = @as(i32, @intCast(72 + (slot % 2) * 220));
     frame_ptr.y = @as(i32, @intCast(110 + (slot / 2) * 230));
     frame_ptr.drag_off_x = 0;
@@ -1227,9 +1436,10 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     frame_ptr.prev_close_hover = false;
     frame_ptr.prev_close_down = false;
     frame_ptr.title_len = 0;
-    updateWindowTitleFromMeta(slot);
+    _ = updateWindowTitleFromMeta(slot);
     window_shadow_valid[slot] = false;
     window_gpu_resources[slot] = null;
+    invalidateWindowBodyCache(slot);
     _ = userLog("Compositor: registerWindowCap done\n");
 
     _ = page_paddr;
@@ -1262,35 +1472,53 @@ fn windowPixelsPtr(slot: usize) [*]const volatile u32 {
     return @ptrFromInt(window_store.slots[slot].source.pixel_va);
 }
 
-fn blitWindowSourceToWindowSurface(surface: *const DrawSurface, slot: usize) void {
+fn blitWindowSourceToSurface(surface: *const DrawSurface, slot: usize, win: *const WindowState) void {
     const slot_ref = &window_store.slots[slot];
     const src = &slot_ref.source;
     if (!src.active) return;
-    const win = &slot_ref.frame;
     if (!win.active or !win.visible) return;
+    const scale = windowScale(win);
 
     const content_x0 = contentOriginX(win);
     const content_y0 = contentOriginY(win);
     const content_rect: Rect = .{
         .x0 = content_x0,
         .y0 = content_y0,
-        .x1 = content_x0 + @as(i32, @intCast(src.width * window_scale)),
-        .y1 = content_y0 + @as(i32, @intCast(src.height * window_scale)),
+        .x1 = content_x0 + @as(i32, @intCast(src.width * scale)),
+        .y1 = content_y0 + @as(i32, @intCast(src.height * scale)),
     };
     const clipped = intersectRect(content_rect, surface.clip) orelse return;
+    const src_pixels = windowPixelsPtr(slot);
 
-    const vx_start: i32 = clampI32(@divFloor(clipped.x0 - content_x0, window_scale_i32), 0, @intCast(src.width));
-    const vy_start: i32 = clampI32(@divFloor(clipped.y0 - content_y0, window_scale_i32), 0, @intCast(src.height));
-    const vx_end: i32 = clampI32(@divFloor((clipped.x1 - 1) - content_x0, window_scale_i32) + 1, 0, @intCast(src.width));
-    const vy_end: i32 = clampI32(@divFloor((clipped.y1 - 1) - content_y0, window_scale_i32) + 1, 0, @intCast(src.height));
+    if (scale == 1) {
+        const src_x0: usize = @intCast(clipped.x0 - content_x0);
+        const src_y0: usize = @intCast(clipped.y0 - content_y0);
+        const copy_w: usize = @intCast(clipped.x1 - clipped.x0);
+        const copy_h: usize = @intCast(clipped.y1 - clipped.y0);
+        var row: usize = 0;
+        while (row < copy_h) : (row += 1) {
+            const src_row = (src_y0 + row) * src.pitch + src_x0;
+            const dst_row = (@as(usize, @intCast(clipped.y0)) + row) * fb_pitch + @as(usize, @intCast(clipped.x0));
+            var col: usize = 0;
+            while (col < copy_w) : (col += 1) {
+                surface.pixels[dst_row + col] = src_pixels[src_row + col];
+            }
+        }
+        return;
+    }
+
+    const scale_i32 = windowScaleI32(win);
+    const vx_start: i32 = clampI32(@divFloor(clipped.x0 - content_x0, scale_i32), 0, @intCast(src.width));
+    const vy_start: i32 = clampI32(@divFloor(clipped.y0 - content_y0, scale_i32), 0, @intCast(src.height));
+    const vx_end: i32 = clampI32(@divFloor((clipped.x1 - 1) - content_x0, scale_i32) + 1, 0, @intCast(src.width));
+    const vy_end: i32 = clampI32(@divFloor((clipped.y1 - 1) - content_y0, scale_i32) + 1, 0, @intCast(src.height));
     if (vx_start >= vx_end or vy_start >= vy_end) return;
 
-    const src_pixels = windowPixelsPtr(slot);
     var vy: i32 = vy_start;
     while (vy < vy_end) : (vy += 1) {
         const vy_u: usize = @intCast(vy);
-        const row_start_y = content_y0 + vy * window_scale_i32;
-        const row_end_y = row_start_y + window_scale_i32;
+        const row_start_y = content_y0 + vy * scale_i32;
+        const row_end_y = row_start_y + scale_i32;
         const py0 = if (row_start_y > clipped.y0) row_start_y else clipped.y0;
         const py1 = if (row_end_y < clipped.y1) row_end_y else clipped.y1;
         if (py0 >= py1) continue;
@@ -1300,8 +1528,8 @@ fn blitWindowSourceToWindowSurface(surface: *const DrawSurface, slot: usize) voi
             const vx_u: usize = @intCast(vx);
             const src_index = vy_u * src.pitch + vx_u;
             const color = src_pixels[src_index];
-            const col_start_x = content_x0 + vx * window_scale_i32;
-            const col_end_x = col_start_x + window_scale_i32;
+            const col_start_x = content_x0 + vx * scale_i32;
+            const col_end_x = col_start_x + scale_i32;
             const px0 = if (col_start_x > clipped.x0) col_start_x else clipped.x0;
             const px1 = if (col_end_x < clipped.x1) col_end_x else clipped.x1;
             if (px0 >= px1) continue;
@@ -1316,6 +1544,10 @@ fn blitWindowSourceToWindowSurface(surface: *const DrawSurface, slot: usize) voi
             }
         }
     }
+}
+
+fn blitWindowSourceToWindowSurface(surface: *const DrawSurface, slot: usize) void {
+    blitWindowSourceToSurface(surface, slot, &window_store.slots[slot].frame);
 }
 
 fn redrawSceneBackgroundHud(surface: *const DrawSurface, mouse_x: i32, mouse_y: i32) void {
@@ -1337,8 +1569,8 @@ fn redrawSceneWindowsLayered(surface: *const DrawSurface, store: *const WindowSt
         const win = &slot.frame;
         if (!win.active or !win.visible) continue;
         if (intersectRect(windowBounds(win), surface.clip) == null) continue;
+        drawWindowShadowSurface(surface, win);
         const title = if (win.title_len > 0) win.title[0..win.title_len] else "Window";
-        // Keep per-window ordering (chrome -> content) to preserve layer correctness.
         drawWindowChromeSurface(surface, win, title, slot.close_hover, slot.close_down);
         blitWindowSourceToWindowSurface(surface, i);
     }
@@ -1350,16 +1582,25 @@ fn redrawSceneSurface(
     mouse_x: i32,
     mouse_y: i32,
     draw_cursor: bool,
+    dragging_slot: ?usize,
 ) void {
+    _ = dragging_slot;
     redrawSceneBackgroundHud(surface, mouse_x, mouse_y);
     redrawSceneWindowsLayered(surface, store);
     if (draw_cursor) drawCursorSurface(surface, mouse_x, mouse_y);
 }
 
 fn ensureWindowGpuResource(slot: usize) ?*virtgpu.Resource {
-    if (slot >= max_windows) return null;
+    if (slot >= max_windows) {
+        logInvalidGpuSlot(slot);
+        return null;
+    }
     const slot_ref = &window_store.slots[slot];
     if (!slot_ref.source.active) return null;
+    if (slot >= window_gpu_resources.len) {
+        logInvalidGpuSlot(slot);
+        return null;
+    }
     if (window_gpu_resources[slot]) |resource| {
         if (resource.ready and resource.width == slot_ref.source.width and resource.height == slot_ref.source.height) return resource;
     }
@@ -1376,11 +1617,24 @@ fn ensureWindowGpuResource(slot: usize) ?*virtgpu.Resource {
 }
 
 fn syncWindowGpuContent(slot: usize) ?Rect {
-    if (slot >= max_windows) return null;
+    if (slot >= max_windows) {
+        logInvalidGpuSlot(slot);
+        return null;
+    }
     const slot_ref = &window_store.slots[slot];
     if (!slot_ref.source.active or !slot_ref.frame.active or !slot_ref.frame.visible) return null;
+    if (slot >= window_shadow_storage.len or slot >= window_shadow_valid.len or slot >= window_gpu_resources.len) {
+        logInvalidGpuSlot(slot);
+        return null;
+    }
 
     const src = &slot_ref.source;
+    logFirstGpuSyncSlot(slot, src, &slot_ref.frame);
+    const needed_pixels = src.pitch * src.height;
+    if (needed_pixels > max_window_shadow_pixels) {
+        logWindowShadowOverflow(slot, needed_pixels);
+        return null;
+    }
     const src_pixels: [*]const volatile u32 = @ptrFromInt(src.pixel_va);
     const resource = ensureWindowGpuResource(slot);
     const shadow = &window_shadow_storage[slot];
@@ -1423,6 +1677,22 @@ fn syncWindowGpuContent(slot: usize) ?Rect {
     return screenRectForSourceRegion(&slot_ref.frame, dirty_region);
 }
 
+fn syncWindow(slot: usize) ?Rect {
+    if (slot >= max_windows) return null;
+    const seq = readWindowMetaSeq(slot) orelse return null;
+    const slot_ref = &window_store.slots[slot];
+    if (seq == slot_ref.source.observed_meta_seq and window_shadow_valid[slot]) return null;
+    slot_ref.source.observed_meta_seq = seq;
+
+    const title_changed = updateWindowTitleFromMeta(slot);
+    const content_rect = syncWindowGpuContent(slot);
+    if (title_changed or content_rect != null) invalidateWindowBodyCache(slot);
+    if (title_changed) {
+        return windowBounds(&slot_ref.frame);
+    }
+    return content_rect;
+}
+
 pub fn run(comptime gpu_mode: bool) noreturn {
     if (!gpu_mode) {
         _ = userLog("Compositor: non-gpu mode disabled\n");
@@ -1436,6 +1706,8 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     window_store = .{};
     window_shadow_valid = [_]bool{false} ** max_windows;
     window_gpu_resources = [_]?*virtgpu.Resource{null} ** max_windows;
+    logged_invalid_gpu_slot = null;
+    logged_first_gpu_sync_slot = false;
     var last_cursor_rect = cursorRect(mouse_state_storage.x, mouse_state_storage.y);
     var i: usize = 0;
 
@@ -1443,9 +1715,11 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     var first_compose_wait_loops: u32 = 0;
 
     var dragging_index: ?usize = null;
+    var drag_boost_logged = false;
     var prev_left_down = false;
     var force_full = true;
     var virtgpu_init_ok = false;
+    resetCompositorPerfReport(readTsc());
 
     if (gpu_mode) {
         virtgpu_init_ok = virtgpu.virtgpu_init();
@@ -1486,11 +1760,15 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     var virtgpu_active = false;
     var hardware_cursor_active = false;
     if (virtgpu_init_ok) {
+        _ = userLog("Compositor: create_fb begin\n");
         gpu_resource = virtgpu.virtgpu_create_fb(fb_width, fb_height);
+        _ = userLog("Compositor: create_fb returned\n");
         if (gpu_resource) |resource| {
+            _ = userLog("Compositor: set_scanout begin\n");
             if (virtgpu.virtgpu_set_scanout(resource)) {
                 virtgpu_active = true;
                 hardware_cursor_active = initHardwareCursor(mouse_state_storage.x, mouse_state_storage.y);
+                _ = userLog("Compositor: set_scanout done\n");
             } else {
                 _ = userLog("GpuCompositor: virtgpu set_scanout failed\n");
                 while (true) asm volatile ("pause");
@@ -1505,6 +1783,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     }
 
     while (true) {
+        const iter_start_tsc = readTsc();
         var dirty_any = false;
         var dirty_rect = fullScreenRect();
         var old_bounds: [max_windows]Rect = undefined;
@@ -1544,6 +1823,11 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         // expensive compose/present path and keep polling mailbox quickly.
         if (recomputeWindowCount() == 0) {
             force_full = false;
+            compositor_perf_report.no_window_loops +%= 1;
+            compositor_perf_report.idle_loops +%= 1;
+            const iter_end_tsc = readTsc();
+            compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
+            maybeLogCompositorPerf(iter_end_tsc);
             asm volatile ("pause");
             continue;
         }
@@ -1609,6 +1893,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             slot_ref.close_hover = pointInCloseButton(mouse_state_storage.x, mouse_state_storage.y, close_rect);
             slot_ref.close_down = slot_ref.close_hover and left_down;
             if (slot_ref.close_hover != win.prev_close_hover or slot_ref.close_down != win.prev_close_down) {
+                invalidateWindowBodyCache(i);
                 const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_bounds[i]);
                 dirty_any = merged.any;
                 dirty_rect = merged.rect;
@@ -1647,11 +1932,17 @@ pub fn run(comptime gpu_mode: bool) noreturn {
                     const hx1 = win.x + windowWidth(win) - window_border_i32;
                     const hy1 = win.y + window_header_h_i32;
                     if (!(mouse_state_storage.x >= hx0 and mouse_state_storage.x < hx1 and mouse_state_storage.y >= hy0 and mouse_state_storage.y < hy1)) {
-                        continue;
+                        // Click landed inside the window but outside the draggable title bar.
+                        // Keep the frame pipeline running so button-edge state stays coherent.
+                    } else {
+                        win.drag_off_x = mouse_state_storage.x - win.x;
+                        win.drag_off_y = mouse_state_storage.y - win.y;
+                        dragging_index = idx;
+                        const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_bounds[idx]);
+                        dirty_any = merged.any;
+                        dirty_rect = merged.rect;
+                        drag_boost_logged = true;
                     }
-                    win.drag_off_x = mouse_state_storage.x - win.x;
-                    win.drag_off_y = mouse_state_storage.y - win.y;
-                    dragging_index = idx;
                 }
             }
         }
@@ -1680,6 +1971,9 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         }
 
         if (!left_down) dragging_index = null;
+        if (dragging_index == null and drag_boost_logged) {
+            drag_boost_logged = false;
+        }
         prev_left_down = left_down;
 
         i = 0;
@@ -1688,25 +1982,35 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             window_store.slots[i].frame.prev_close_down = window_store.slots[i].close_down;
         }
 
+        const sync_start_tsc = readTsc();
         i = 0;
         while (i < safe_window_count) : (i += 1) {
-            if (syncWindowGpuContent(i)) |changed_rect| {
+            if (syncWindow(i)) |changed_rect| {
                 const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), changed_rect);
                 dirty_any = merged.any;
                 dirty_rect = merged.rect;
             }
         }
+        compositor_perf_report.sync_tsc +%= readTsc() - sync_start_tsc;
 
         const present_rect = if (force_full) fullScreenRect() else clipRectToScreen(dirty_rect);
         if (force_full or dirty_any) {
             if (rectIsEmpty(present_rect)) {
                 force_full = false;
                 last_cursor_rect = cursorRect(mouse_state_storage.x, mouse_state_storage.y);
+                compositor_perf_report.idle_loops +%= 1;
+                const iter_end_tsc = readTsc();
+                compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
+                maybeLogCompositorPerf(iter_end_tsc);
                 asm volatile ("pause");
                 continue;
             }
         } else {
             last_cursor_rect = cursorRect(mouse_state_storage.x, mouse_state_storage.y);
+            compositor_perf_report.idle_loops +%= 1;
+            const iter_end_tsc = readTsc();
+            compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
+            maybeLogCompositorPerf(iter_end_tsc);
             asm volatile ("pause");
             continue;
         }
@@ -1723,6 +2027,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
                 mouse_state_storage.x,
                 mouse_state_storage.y,
                 !hardware_cursor_active,
+                dragging_index,
             );
             const compose_end = readTsc();
             const transfer_rect: virtgpu.Rect = .{
@@ -1739,6 +2044,16 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             }
             const flush_ok = transfer_ok and virtgpu.virtgpu_flush_rect(gpu_resource.?, transfer_rect);
             const submit_end = readTsc();
+            compositor_perf_report.compose_tsc +%= compose_end - compose_start;
+            compositor_perf_report.submit_tsc +%= submit_end - submit_start;
+            compositor_perf_report.frames +%= 1;
+            compositor_perf_report.presents +%= 1;
+            compositor_perf_report.present_area_sum +%= @as(u64, transfer_rect.width) * @as(u64, transfer_rect.height);
+            if (force_full) {
+                compositor_perf_report.full_frames +%= 1;
+            } else {
+                compositor_perf_report.dirty_frames +%= 1;
+            }
             logComposePerf(compose_end - compose_start, submit_end - submit_start, present_rect);
             if (flush_ok and !first_present_flush_logged) {
                 first_present_flush_logged = true;
@@ -1759,6 +2074,9 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             first_compose_logged = true;
             _ = userLog("Compositor: first compose done\n");
         }
+        const iter_end_tsc = readTsc();
+        compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
+        maybeLogCompositorPerf(iter_end_tsc);
         asm volatile ("pause");
     }
 }

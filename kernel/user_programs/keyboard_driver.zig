@@ -3,8 +3,11 @@ const std = @import("std");
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_queue_submit: u64 = 0xE;
+const syscall_queue_notify: u64 = 0xF;
 
 const syscall_ok: u64 = 0;
+const queue_cap_device_input: u64 = 1;
 
 const config_page_va: usize = 0x3C00_2000;
 const common_page_va: usize = 0x2000_4000;
@@ -102,6 +105,28 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_v
           [arg1] "{rsi}" (page_count),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
           [arg3] "{rcx}" (out_paddr_list_va),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn queueSubmit(token: u64, device: u64, queue_index: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_queue_submit),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (device),
+          [arg2] "{rdx}" (queue_index),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_queue_notify),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (device),
+          [arg2] "{rdx}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -256,6 +281,8 @@ pub export fn _start() noreturn {
     const shared_page_paddr = readCfgU64(10);
     var queue_paddr0 = readCfgU64(11);
     var queue_paddr1 = readCfgU64(12);
+    const queue_submit_token = readCfgU64(13);
+    const queue_notify_token = readCfgU64(14);
 
     if (shared_page_paddr < 0x1000) {
         _ = userLog("KeyboardDriver: invalid shared page paddr\n");
@@ -294,6 +321,10 @@ pub export fn _start() noreturn {
         _ = userLog("KeyboardDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
     }
+    if (queue_submit_token == 0 or queue_notify_token == 0) {
+        _ = userLog("KeyboardDriver: queue cap token missing\n");
+        while (true) asm volatile ("pause");
+    }
     mmioWriteU8(common_base + common_device_status, 0);
     mmioWriteU8(common_base + common_device_status, status_acknowledge | status_driver);
     mmioWriteU32(common_base + common_device_feature_select, 0);
@@ -330,6 +361,14 @@ pub export fn _start() noreturn {
             .next = 0,
         };
         queuePushAvail(d);
+    }
+    if (queueSubmit(queue_submit_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
+        _ = userLog("KeyboardDriver: queue submit cap denied\n");
+        while (true) asm volatile ("pause");
+    }
+    if (queueNotify(queue_notify_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
+        _ = userLog("KeyboardDriver: queue notify cap denied\n");
+        while (true) asm volatile ("pause");
     }
     mmioWriteU16(notify_addr, queue_index_event);
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);

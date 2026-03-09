@@ -8,8 +8,12 @@ const syscall_send_cap: u64 = 0x6;
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_queue_submit: u64 = 0xE;
+const syscall_queue_notify: u64 = 0xF;
 
 const syscall_ok: u64 = 0;
+const queue_cap_device_input: u64 = 1;
+const force_invalid_queue_cap_token = false;
 
 const config_page_va: usize = 0x3C00_2000;
 const common_page_va: usize = 0x2000_4000;
@@ -97,6 +101,30 @@ fn userLog(message: []const u8) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn userLogHex(label: []const u8, value: u64) void {
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    while (len < label.len and len < buf.len) : (len += 1) {
+        buf[len] = label[len];
+    }
+    if (len + 3 >= buf.len) return;
+    buf[len] = '0';
+    buf[len + 1] = 'x';
+    len += 2;
+
+    var shift: u6 = 60;
+    while (true) {
+        const nibble: u8 = @intCast((value >> shift) & 0xF);
+        buf[len] = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
+        len += 1;
+        if (shift == 0) break;
+        shift -= 4;
+    }
+    buf[len] = '\n';
+    len += 1;
+    _ = userLog(buf[0..len]);
+}
+
 fn allocPage() u64 {
     return asm volatile (
         \\int $0x80
@@ -155,6 +183,28 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_v
           [arg1] "{rsi}" (page_count),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
           [arg3] "{rcx}" (out_paddr_list_va),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn queueSubmit(token: u64, device: u64, queue_index: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_queue_submit),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (device),
+          [arg2] "{rdx}" (queue_index),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_queue_notify),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (device),
+          [arg2] "{rdx}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -267,6 +317,12 @@ pub export fn _start() noreturn {
     const shared_page_paddr = readCfgU64(10);
     var queue_paddr0 = readCfgU64(11);
     var queue_paddr1 = readCfgU64(12);
+    const queue_submit_token_raw = readCfgU64(13);
+    const queue_notify_token_raw = readCfgU64(14);
+    const queue_submit_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_submit_token_raw;
+    const queue_notify_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_notify_token_raw;
+    userLogHex("MouseDriver: cfg[13]=", queue_submit_token_raw);
+    userLogHex("MouseDriver: cfg[14]=", queue_notify_token_raw);
 
     if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
         _ = userLog("MouseDriver: map common mmio failed\n");
@@ -300,6 +356,12 @@ pub export fn _start() noreturn {
         _ = userLog("MouseDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
     }
+    _ = userLog("MouseDriver: queue pages ready\n");
+    if (queue_submit_token == 0 or queue_notify_token == 0) {
+        _ = userLog("MouseDriver: queue cap token missing\n");
+        while (true) asm volatile ("pause");
+    }
+    _ = userLog("MouseDriver: queue tokens ready\n");
     mmioWriteU8(common_base + common_device_status, 0);
     mmioWriteU8(common_base + common_device_status, status_acknowledge | status_driver);
     mmioWriteU32(common_base + common_device_feature_select, 0);
@@ -337,6 +399,17 @@ pub export fn _start() noreturn {
         };
         queuePushAvail(d);
     }
+    _ = userLog("MouseDriver: queue descriptors ready\n");
+    if (queueSubmit(queue_submit_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
+        _ = userLog("MouseDriver: queue submit cap denied\n");
+        while (true) asm volatile ("pause");
+    }
+    _ = userLog("MouseDriver: queue submit ok\n");
+    if (queueNotify(queue_notify_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
+        _ = userLog("MouseDriver: queue notify cap denied\n");
+        while (true) asm volatile ("pause");
+    }
+    _ = userLog("MouseDriver: queue notify ok\n");
     mmioWriteU16(notify_addr, queue_index_event);
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     _ = userLog("MouseDriver: queue ready\n");

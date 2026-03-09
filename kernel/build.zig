@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
     const efi_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = efi_target,
-        .optimize = optimize,
+        .optimize = .ReleaseSmall,
         .code_model = .small,
     });
     const efi_app = b.addExecutable(.{
@@ -50,6 +50,15 @@ pub fn build(b: *std.Build) void {
     const user_app = b.addExecutable(.{
         .name = "USERAPP",
         .root_module = user_mod,
+    });
+    user_app.addIncludePath(b.path("../user/libcapc"));
+    user_app.addCSourceFile(.{
+        .file = b.path("../user/libcapc/capc.c"),
+        .flags = &.{},
+    });
+    user_app.addCSourceFile(.{
+        .file = b.path("../user/libcapc/cap_errno.c"),
+        .flags = &.{},
     });
     user_app.pie = true;
     user_app.entry = .{ .symbol_name = "_start" };
@@ -215,6 +224,28 @@ pub fn build(b: *std.Build) void {
     const keyboard_ascii_demo_step = b.step("keyboard-ascii-demo-elf", "Build keyboard ASCII demo PIE ELF");
     keyboard_ascii_demo_step.dependOn(&install_keyboard_ascii_demo.step);
 
+    const terminal_window_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/terminal_window.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    terminal_window_mod.strip = true;
+    const terminal_window_app = b.addExecutable(.{
+        .name = "TERMWIN",
+        .root_module = terminal_window_mod,
+    });
+    terminal_window_app.pie = true;
+    terminal_window_app.entry = .{ .symbol_name = "_start" };
+    terminal_window_app.link_z_common_page_size = 0x10;
+    terminal_window_app.link_z_max_page_size = 0x10;
+    const install_terminal_window = b.addInstallArtifact(terminal_window_app, .{
+        .dest_sub_path = "EFI/BOOT/TERMWIN.ELF",
+    });
+    const terminal_window_step = b.step("terminal-window-elf", "Build terminal window PIE ELF");
+    terminal_window_step.dependOn(&install_terminal_window.step);
+
     const mouse_draw_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/mouse_draw.zig"),
         .target = user_target,
@@ -303,6 +334,31 @@ pub fn build(b: *std.Build) void {
     const framebuffer_server_step = b.step("framebuffer-server-elf", "Build framebuffer server PIE ELF");
     framebuffer_server_step.dependOn(&install_framebuffer_server.step);
 
+    const capc_hello_cmd = b.addSystemCommand(&[_][]const u8{
+        b.graph.zig_exe,
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-ffreestanding",
+        "-fno-stack-protector",
+        "-fPIE",
+        "-I",
+        "../user/libcapc",
+        "../user/libcapc/crt0.S",
+        "../user/libcapc/capc.c",
+        "../user/libcapc/cap_errno.c",
+        "../user/libcapc/hello_capc.c",
+        "-Wl,-e,_start",
+        "-Wl,-z,common-page-size=0x10",
+        "-Wl,-z,max-page-size=0x10",
+    });
+    capc_hello_cmd.addArg("-o");
+    const capc_hello_out = capc_hello_cmd.addOutputFileArg("CAPCHEL.ELF");
+    const install_capc_hello = b.addInstallFile(capc_hello_out, "EFI/BOOT/CAPCHEL.ELF");
+    const capc_hello_step = b.step("capc-hello-elf", "Build libcapc C hello PIE ELF");
+    capc_hello_step.dependOn(&install_capc_hello.step);
+
     const install_efi = b.addInstallArtifact(efi_app, .{
         .dest_sub_path = "EFI/BOOT/BOOTX64.EFI",
     });
@@ -314,10 +370,12 @@ pub fn build(b: *std.Build) void {
     install_efi.step.dependOn(&install_bootlog_sender.step);
     install_efi.step.dependOn(&install_mouse_button_demo.step);
     install_efi.step.dependOn(&install_keyboard_ascii_demo.step);
+    install_efi.step.dependOn(&install_terminal_window.step);
     install_efi.step.dependOn(&install_mouse_draw.step);
     install_efi.step.dependOn(&install_compositor.step);
     install_efi.step.dependOn(&install_gpu_compositor.step);
     install_efi.step.dependOn(&install_framebuffer_server.step);
+    install_efi.step.dependOn(&install_capc_hello.step);
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
 }

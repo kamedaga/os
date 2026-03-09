@@ -5,7 +5,7 @@ const window_client = @import("window_client.zig");
 const mouse_shared_page_va: usize = 0x3C00_3000;
 const window_pixels_va: usize = 0x3C00_4000;
 const window_meta_shared_va: usize = 0x3C00_7000;
-const window_cap_tmp_va: u64 = 0x201F_F000;
+const window_cap_tmp_va: u64 = 0x3C10_0000;
 
 const mouse_shared_magic = protocol.mouse_shared_magic;
 const pixel_width: usize = 16;
@@ -83,6 +83,7 @@ pub export fn _start() noreturn {
     window_client.setWindowTitle(window_meta_shared_va, "Mouse Demo");
 
     drawMousePanel(vfb, 0);
+    window_client.markWindowDirty(window_meta_shared_va);
 
     while (true) {
         const mouse_seq = mouse_shared.seq;
@@ -91,6 +92,7 @@ pub export fn _start() noreturn {
             last_mouse_seq = mouse_seq;
             last_buttons = buttons;
             drawMousePanel(vfb, buttons);
+            window_client.markWindowDirty(window_meta_shared_va);
         }
 
         asm volatile ("pause");

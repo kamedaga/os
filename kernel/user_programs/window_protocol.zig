@@ -4,6 +4,7 @@ pub const mouse_shared_magic: u64 = 0x4D534852; // "MSHR"
 pub const window_protocol_version: u16 = 1;
 pub const window_title_max_bytes: usize = 64;
 pub const window_flag_allow_pixels_dma: u32 = 1 << 0;
+pub const window_flag_low_scale: u32 = 1 << 1;
 
 pub const WindowRights = packed struct(u16) {
     read_meta: bool = false,

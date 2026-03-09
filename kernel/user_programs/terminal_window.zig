@@ -1,30 +1,31 @@
-const syscall_log: u64 = 0x9;
-const font = @import("font.zig");
 const window_client = @import("window_client.zig");
 
+const syscall_log: u64 = 0x9;
+const syscall_switch_thread: u64 = 0x5;
+const syscall_ok: u64 = 0;
+
 const keyboard_shared_page_va: usize = 0x3C00_6000;
-const window_pixels_va: usize = 0x3C00_4000;
+const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
+
+const window_pixels_va: usize = 0x2020_0000;
 const window_meta_shared_va: usize = 0x3C00_7000;
 const window_cap_tmp_va: u64 = 0x3C10_0000;
+const window_flags: u32 = window_client.window_flag_low_scale;
 
-const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
-const pixel_width: usize = 32;
-const pixel_height: usize = 32;
-const pixel_pitch: usize = 32;
-
-const panel_x: usize = 0;
-const panel_y: usize = 0;
-const panel_w: usize = 32;
-const panel_h: usize = 32;
-
+const pixel_width: usize = 320;
+const pixel_height: usize = 160;
+const pixel_pitch: usize = 320;
 const glyph_w: usize = 5;
 const glyph_h: usize = 7;
+const cell_w: usize = 6;
+const cell_h: usize = 8;
+const cols: usize = pixel_width / cell_w;
+const rows: usize = pixel_height / cell_h;
 
-const history_capacity: usize = 12;
-const history_cols: usize = 4;
-const history_rows: usize = 3;
-const history_cell_w: usize = 6;
-const history_cell_h: usize = 8;
+const bg_color: u32 = 0x0011_1116;
+const fg_color: u32 = 0x00D7_D7D7;
+const title_color: u32 = 0x0084_D6B0;
+const prompt_color: u32 = 0x00E0_E05A;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -33,6 +34,15 @@ fn userLog(message: []const u8) u64 {
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn switchThread(target_thread: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_switch_thread),
+          [arg0] "{rdi}" (target_thread),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -46,15 +56,6 @@ fn fillRect(vfb: [*]volatile u32, x: usize, y: usize, w: usize, h: usize, color:
             vfb[row + xx] = color;
         }
     }
-}
-
-fn setVfbPixel(vfb: [*]volatile u32, x: i32, y: i32, color: u32, alpha: u8) void {
-    if (x < 0 or y < 0) return;
-    if (x >= pixel_width or y >= pixel_height) return;
-    const ux: usize = @intCast(x);
-    const uy: usize = @intCast(y);
-    const index = uy * pixel_pitch + ux;
-    vfb[index] = font.blendColor(vfb[index], color, alpha);
 }
 
 fn glyphRows(raw: u8) [glyph_h]u8 {
@@ -126,7 +127,7 @@ fn glyphRows(raw: u8) [glyph_h]u8 {
     };
 }
 
-fn drawTinyGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) void {
+fn drawGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) void {
     const glyph = glyphRows(ch);
     var gy: usize = 0;
     while (gy < glyph_h) : (gy += 1) {
@@ -144,77 +145,161 @@ fn drawTinyGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) v
     }
 }
 
-fn normalizeHistoryChar(ch: u8) u8 {
-    if (ch == ' ') return '_';
-    if (ch == '\n') return 'E';
-    if (ch == '\t') return 'T';
-    if (ch < 0x20 or ch > 0x7E) return '?';
+fn asciiLower(ch: u8) u8 {
+    if (ch >= 'A' and ch <= 'Z') return ch + 32;
     return ch;
 }
 
-fn pushAsciiHistory(history: *[history_capacity]u8, history_len: *usize, ch: u8) void {
-    if (history_len.* < history_capacity) {
-        history[history_len.*] = ch;
-        history_len.* += 1;
-        return;
-    }
-
-    var i: usize = 1;
-    while (i < history_capacity) : (i += 1) {
-        history[i - 1] = history[i];
-    }
-    history[history_capacity - 1] = ch;
+fn trimSpaces(text: []const u8) []const u8 {
+    var s: usize = 0;
+    var e: usize = text.len;
+    while (s < e and (text[s] == ' ' or text[s] == '\t')) : (s += 1) {}
+    while (e > s and (text[e - 1] == ' ' or text[e - 1] == '\t')) : (e -= 1) {}
+    return text[s..e];
 }
 
-fn drawKeyboardHistoryPanel(vfb: [*]volatile u32, history: []const u8) void {
-    fillRect(vfb, panel_x, panel_y, panel_w, panel_h, 0x00FD_FDFD);
-    fillRect(vfb, panel_x + 1, 1, 30, 30, 0x0060_6060);
-    fillRect(vfb, panel_x + 2, 2, 28, 28, 0x00EE_EEEE);
-
+fn eqAsciiNoCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
     var i: usize = 0;
-    while (i < history.len) : (i += 1) {
-        const row = i / history_cols;
-        if (row >= history_rows) break;
-        const col = i % history_cols;
-        const x = panel_x + 4 + col * history_cell_w;
-        const y = panel_y + 4 + row * history_cell_h;
-        drawTinyGlyph(vfb, x, y, normalizeHistoryChar(history[i]), 0x0010_1010);
+    while (i < a.len) : (i += 1) {
+        if (asciiLower(a[i]) != asciiLower(b[i])) return false;
     }
+    return true;
+}
+
+const TerminalState = struct {
+    lines: [rows][cols]u8 = [_][cols]u8{[_]u8{' '} ** cols} ** rows,
+    line_len: [rows]usize = [_]usize{0} ** rows,
+    cur_row: usize = 1,
+    cmd: [64]u8 = undefined,
+    cmd_len: usize = 0,
+
+    fn clearRow(self: *TerminalState, row: usize) void {
+        self.lines[row] = [_]u8{' '} ** cols;
+        self.line_len[row] = 0;
+    }
+
+    fn scroll(self: *TerminalState) void {
+        var r: usize = 2;
+        while (r < rows) : (r += 1) {
+            self.lines[r - 1] = self.lines[r];
+            self.line_len[r - 1] = self.line_len[r];
+        }
+        self.clearRow(rows - 1);
+        self.cur_row = rows - 1;
+    }
+
+    fn writeLine(self: *TerminalState, text: []const u8) void {
+        if (self.cur_row >= rows) self.scroll();
+        self.clearRow(self.cur_row);
+        const n: usize = if (text.len < cols) text.len else cols;
+        if (n > 0) {
+            @memcpy(self.lines[self.cur_row][0..n], text[0..n]);
+        }
+        self.line_len[self.cur_row] = n;
+        self.cur_row += 1;
+        if (self.cur_row >= rows) self.scroll();
+    }
+};
+
+fn drawLine(vfb: [*]volatile u32, row: usize, text: []const u8, color: u32) void {
+    var i: usize = 0;
+    while (i < text.len and i < cols) : (i += 1) {
+        drawGlyph(vfb, i * cell_w, row * cell_h, text[i], color);
+    }
+}
+
+fn clearRow(vfb: [*]volatile u32, row: usize, color: u32) void {
+    fillRect(vfb, 0, row * cell_h, pixel_width, cell_h, color);
+}
+
+fn renderPrompt(vfb: [*]volatile u32, st: *const TerminalState) void {
+    clearRow(vfb, rows - 1, bg_color);
+    fillRect(vfb, 0, (rows - 1) * cell_h, pixel_width, 1, 0x0030_3038);
+
+    var prompt_buf: [cols]u8 = [_]u8{' '} ** cols;
+    prompt_buf[0] = '>';
+    prompt_buf[1] = ' ';
+    var i: usize = 0;
+    while (i < st.cmd_len and i + 2 < cols) : (i += 1) {
+        prompt_buf[i + 2] = st.cmd[i];
+    }
+    drawLine(vfb, rows - 1, prompt_buf[0..], prompt_color);
+    window_client.markWindowDirty(window_meta_shared_va);
+}
+
+fn render(vfb: [*]volatile u32, st: *const TerminalState) void {
+    fillRect(vfb, 0, 0, pixel_width, pixel_height, bg_color);
+    fillRect(vfb, 0, cell_h, pixel_width, 1, 0x0030_3038);
+    fillRect(vfb, 0, (rows - 1) * cell_h, pixel_width, 1, 0x0030_3038);
+
+    drawLine(vfb, 0, "terminal  commands: help pie clear", title_color);
+
+    var r: usize = 1;
+    while (r + 1 < rows) : (r += 1) {
+        const n = st.line_len[r];
+        drawLine(vfb, r, st.lines[r][0..n], fg_color);
+    }
+
+    renderPrompt(vfb, st);
+}
+
+fn executeCommand(st: *TerminalState, cmd_text: []const u8) void {
+    const cmd = trimSpaces(cmd_text);
+    if (cmd.len == 0) return;
+
+    if (eqAsciiNoCase(cmd, "help")) {
+        st.writeLine("help pie pie_user clear");
+        return;
+    }
+    if (eqAsciiNoCase(cmd, "clear")) {
+        var r: usize = 1;
+        while (r < rows - 1) : (r += 1) {
+            st.clearRow(r);
+        }
+        st.cur_row = 1;
+        return;
+    }
+    if (eqAsciiNoCase(cmd, "pie") or eqAsciiNoCase(cmd, "pie_user")) {
+        if (switchThread(2) == syscall_ok) {
+            st.writeLine("launch pie_user ok");
+        } else {
+            st.writeLine("launch pie_user failed");
+        }
+        return;
+    }
+    st.writeLine("unknown command");
 }
 
 pub export fn _start() noreturn {
-    _ = userLog("KeyboardAsciiDemo: started\n");
+    _ = userLog("TerminalWindow: started\n");
 
     const keyboard_shared: [*]const volatile u64 = @ptrFromInt(keyboard_shared_page_va);
     if (keyboard_shared[0] != keyboard_shared_magic) {
-        _ = userLog("KeyboardAsciiDemo: keyboard shared magic mismatch\n");
+        _ = userLog("TerminalWindow: keyboard shared magic mismatch\n");
         while (true) asm volatile ("pause");
     }
 
-    _ = userLog("KeyboardAsciiDemo: createAndPublishWindow before\n");
     const window_created = window_client.createAndPublishWindow(
         @intCast(pixel_width),
         @intCast(pixel_height),
-        0,
+        window_flags,
         window_cap_tmp_va,
         window_pixels_va,
         window_meta_shared_va,
     );
     if (!window_created) {
-        _ = userLog("KeyboardAsciiDemo: create window failed\n");
+        _ = userLog("TerminalWindow: create window failed\n");
         while (true) asm volatile ("pause");
     }
-    _ = userLog("KeyboardAsciiDemo: createAndPublishWindow after\n");
-    window_client.setWindowTitle(window_meta_shared_va, "Keyboard Demo");
+    window_client.setWindowTitle(window_meta_shared_va, "Terminal");
 
     const vfb: [*]volatile u32 = @ptrFromInt(window_pixels_va);
-    var last_kbd_seq: u64 = 0;
-    var ascii_history: [history_capacity]u8 = [_]u8{' '} ** history_capacity;
-    var ascii_history_len: usize = 0;
+    var st = TerminalState{};
+    st.writeLine("ready");
+    render(vfb, &st);
 
-    drawKeyboardHistoryPanel(vfb, ascii_history[0..ascii_history_len]);
-    window_client.markWindowDirty(window_meta_shared_va);
-
+    var last_kbd_seq: u64 = keyboard_shared[1];
     while (true) {
         const kbd_seq = keyboard_shared[1];
         if (kbd_seq != last_kbd_seq) {
@@ -222,10 +307,27 @@ pub export fn _start() noreturn {
             const key_value = keyboard_shared[4];
             if (key_value != 0) {
                 const ascii: u8 = @intCast(keyboard_shared[2] & 0xFF);
-                pushAsciiHistory(&ascii_history, &ascii_history_len, ascii);
+                switch (ascii) {
+                    '\n', '\r' => {
+                        executeCommand(&st, st.cmd[0..st.cmd_len]);
+                        st.cmd_len = 0;
+                        render(vfb, &st);
+                    },
+                    '\x08' => {
+                        if (st.cmd_len > 0) {
+                            st.cmd_len -= 1;
+                            renderPrompt(vfb, &st);
+                        }
+                    },
+                    else => {
+                        if (ascii >= 0x20 and ascii <= 0x7E and st.cmd_len < st.cmd.len) {
+                            st.cmd[st.cmd_len] = ascii;
+                            st.cmd_len += 1;
+                            renderPrompt(vfb, &st);
+                        }
+                    },
+                }
             }
-            drawKeyboardHistoryPanel(vfb, ascii_history[0..ascii_history_len]);
-            window_client.markWindowDirty(window_meta_shared_va);
         }
         asm volatile ("pause");
     }

@@ -4,6 +4,9 @@ cp /usr/share/OVMF/OVMF_VARS_4M.fd OVMF_VARS.fd
 qemu-system-x86_64 \
   -machine q35 \
   -m 512M \
+  -monitor none \
+  -d int,guest_errors,cpu_reset \
+  -D qemu.log \
   -display gtk,grab-on-hover=off \
   -vga none \
   -device virtio-vga \

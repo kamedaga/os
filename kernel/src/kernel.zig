@@ -1,24 +1,72 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const dma_mapping_manager = @import("dma_mapping_manager.zig");
 
-pub const PrincipalId = enum(u8) {
-    Process0,
-    Process1,
-    Process2,
-    Process3,
-    Process4,
-    Device0,
+pub const process_count: usize = 6;
+pub const device_count: usize = 1;
+pub const principal_count: usize = process_count + device_count;
+
+comptime {
+    if (process_count < 6) @compileError("process_count must be >= 6 for current boot role assignment");
+    if (principal_count > std.math.maxInt(u8)) @compileError("principal_count must fit in u8");
+}
+
+fn PrincipalIdType(comptime process_slots: usize) type {
+    var fields: [process_slots + device_count]std.builtin.Type.EnumField = undefined;
+    inline for (0..process_slots) |i| {
+        fields[i] = .{
+            .name = std.fmt.comptimePrint("Process{}", .{i}),
+            .value = i,
+        };
+    }
+    fields[process_slots] = .{
+        .name = "Device0",
+        .value = process_slots,
+    };
+
+    return @Type(.{ .@"enum" = .{
+        .tag_type = u8,
+        .fields = &fields,
+        .decls = &.{},
+        .is_exhaustive = true,
+    } });
+}
+
+pub const PrincipalId = PrincipalIdType(process_count);
+
+const process_labels = blk: {
+    var labels: [process_count][]const u8 = undefined;
+    for (0..process_count) |i| {
+        labels[i] = std.fmt.comptimePrint("Process{}", .{i});
+    }
+    break :blk labels;
 };
+
+pub fn processPrincipalFromIndex(index: usize) ?PrincipalId {
+    if (index >= process_count) return null;
+    return @enumFromInt(index);
+}
+
+pub fn processIndexFromPrincipal(principal: PrincipalId) ?usize {
+    const index: usize = @intFromEnum(principal);
+    if (index >= process_count) return null;
+    return index;
+}
+
+pub fn principalLabel(principal: PrincipalId) []const u8 {
+    if (processIndexFromPrincipal(principal)) |index| {
+        return process_labels[index];
+    }
+    if (principal == .Device0) return "Device0";
+    return "Unknown";
+}
 
 pub const endpoint_to_process0: u64 = 0x10;
 pub const endpoint_to_process1: u64 = 0x11;
 pub const endpoint_to_process2: u64 = 0x12;
 
 fn isProcessPrincipal(principal: PrincipalId) bool {
-    return switch (principal) {
-        .Process0, .Process1, .Process2, .Process3, .Process4 => true,
-        .Device0 => false,
-    };
+    return processIndexFromPrincipal(principal) != null;
 }
 
 pub const Rights = struct {
@@ -58,10 +106,13 @@ pub const KernelError = error{
     TooManyFreePages,
     TooManyFreeRanges,
     OutOfFreePages,
+    TooManyUntypedBlocks,
+    UntypedNotFound,
+    UntypedHasChildren,
 };
 
 pub const CNode = struct {
-    pub const max_caps = 1024;
+    pub const max_caps = 4096;
 
     caps: [max_caps]Capability = undefined,
     len: usize = 0,
@@ -188,16 +239,13 @@ pub const CapMailbox = struct {
 
 pub const RegionFreeRange = struct {
     region_id: u64,
-    start_index: usize,
     len: usize,
     physical_start: u64,
 };
 
 pub const FreePageList = struct {
-    pub const max_pages = 262_144;
     pub const max_ranges = 256;
 
-    pages: [max_pages]u64 = undefined,
     len: usize = 0,
     ranges: [max_ranges]RegionFreeRange = undefined,
     range_len: usize = 0,
@@ -215,14 +263,11 @@ pub const FreePageList = struct {
     }
 
     pub fn appendPage(self: *FreePageList, region_id: u64, paddr: u64) KernelError!void {
-        if (self.len >= self.pages.len) return KernelError.TooManyFreePages;
-
         // 直前 range と「同じ region かつ物理的に連続」の場合は range を延長する。
         if (self.range_len > 0) {
             const last = &self.ranges[self.range_len - 1];
             const expected_next = last.physical_start + (@as(u64, last.len) * 4096);
             if (last.region_id == region_id and paddr == expected_next) {
-                self.pages[self.len] = paddr;
                 self.len += 1;
                 last.len += 1;
                 return;
@@ -231,66 +276,45 @@ pub const FreePageList = struct {
 
         if (self.range_len >= self.ranges.len) return KernelError.TooManyFreeRanges;
 
-        const start_index = self.len;
-        self.pages[self.len] = paddr;
-        self.len += 1;
-
         self.ranges[self.range_len] = .{
             .region_id = region_id,
-            .start_index = start_index,
             .len = 1,
             .physical_start = paddr,
         };
         self.range_len += 1;
+        self.len += 1;
     }
 
     pub fn popFront(self: *FreePageList) KernelError!u64 {
-        if (self.len == 0) return KernelError.OutOfFreePages;
+        if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
 
-        // 単純な FIFO。起動初期段階なので O(n) シフトで実装する。
-        const paddr = self.pages[0];
-
-        var i: usize = 1;
-        while (i < self.len) : (i += 1) {
-            self.pages[i - 1] = self.pages[i];
-        }
+        const first = &self.ranges[0];
+        const paddr = first.physical_start;
+        first.physical_start += 4096;
+        first.len -= 1;
         self.len -= 1;
 
-        if (self.range_len > 0) {
-            self.ranges[0].start_index = 0;
-            if (self.ranges[0].len > 0) self.ranges[0].len -= 1;
-
-            if (self.ranges[0].len == 0) {
-                var r: usize = 1;
-                while (r < self.range_len) : (r += 1) {
-                    self.ranges[r - 1] = self.ranges[r];
-                    self.ranges[r - 1].start_index -= 1;
-                }
-                self.range_len -= 1;
-            } else {
-                self.ranges[0].physical_start += 4096;
-                var r: usize = 1;
-                while (r < self.range_len) : (r += 1) {
-                    self.ranges[r].start_index -= 1;
-                }
+        if (first.len == 0) {
+            var r: usize = 1;
+            while (r < self.range_len) : (r += 1) {
+                self.ranges[r - 1] = self.ranges[r];
             }
+            self.range_len -= 1;
         }
 
         return paddr;
     }
 
     pub fn popBack(self: *FreePageList) KernelError!u64 {
-        if (self.len == 0) return KernelError.OutOfFreePages;
+        if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
 
-        const paddr = self.pages[self.len - 1];
+        const last = &self.ranges[self.range_len - 1];
+        const paddr = last.physical_start + (@as(u64, last.len - 1) * 4096);
+        last.len -= 1;
         self.len -= 1;
 
-        if (self.range_len > 0) {
-            const last = &self.ranges[self.range_len - 1];
-            if (last.len > 0) last.len -= 1;
-            if (last.len == 0) {
-                self.range_len -= 1;
-            }
+        if (last.len == 0) {
+            self.range_len -= 1;
         }
 
         return paddr;
@@ -299,6 +323,140 @@ pub const FreePageList = struct {
 
 pub const PageCapability = struct {
     paddr: u64,
+};
+
+pub const max_retype_page_batch: usize = 64;
+
+pub const UntypedFlags = packed struct(u8) {
+    contiguous_only: bool = false,
+    dma_ok: bool = false,
+    _reserved: u6 = 0,
+};
+
+pub const UntypedBlock = struct {
+    active: bool = false,
+    base_paddr: u64 = 0,
+    size_bytes: u64 = 0,
+    used_bytes: u64 = 0,
+    flags: UntypedFlags = .{},
+};
+
+pub const UntypedCapability = struct {
+    block_id: u32,
+    cap_id: u64,
+    root_cap_id: u64,
+    parent_cap_id: u64,
+};
+
+pub const UntypedCNode = struct {
+    pub const max_caps = 256;
+
+    caps: [max_caps]UntypedCapability = undefined,
+    len: usize = 0,
+
+    pub fn add(self: *UntypedCNode, cap: UntypedCapability) KernelError!void {
+        if (self.findIndex(cap.block_id) != null) return KernelError.InvalidState;
+        if (self.len >= self.caps.len) return KernelError.TableFull;
+        self.caps[self.len] = cap;
+        self.len += 1;
+    }
+
+    pub fn find(self: *const UntypedCNode, block_id: u32) ?*const UntypedCapability {
+        if (self.findIndex(block_id)) |index| {
+            return &self.caps[index];
+        }
+        return null;
+    }
+
+    pub fn findByCapId(self: *const UntypedCNode, cap_id: u64) ?*const UntypedCapability {
+        if (self.findIndexByCapId(cap_id)) |index| {
+            return &self.caps[index];
+        }
+        return null;
+    }
+
+    pub fn removeByBlockId(self: *UntypedCNode, block_id: u32) bool {
+        if (self.findIndex(block_id)) |index| {
+            var i = index;
+            while (i + 1 < self.len) : (i += 1) {
+                self.caps[i] = self.caps[i + 1];
+            }
+            self.len -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeByCapId(self: *UntypedCNode, cap_id: u64) bool {
+        if (self.findIndexByCapId(cap_id)) |index| {
+            var i = index;
+            while (i + 1 < self.len) : (i += 1) {
+                self.caps[i] = self.caps[i + 1];
+            }
+            self.len -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn findIndex(self: *const UntypedCNode, block_id: u32) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.caps[i].block_id == block_id) return i;
+        }
+        return null;
+    }
+
+    fn findIndexByCapId(self: *const UntypedCNode, cap_id: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.caps[i].cap_id == cap_id) return i;
+        }
+        return null;
+    }
+};
+
+pub const UntypedPool = struct {
+    pub const max_blocks = 256;
+
+    blocks: [max_blocks]UntypedBlock = [_]UntypedBlock{.{}} ** max_blocks,
+    len: usize = 0,
+
+    pub fn allocBlock(
+        self: *UntypedPool,
+        base_paddr: u64,
+        size_bytes: u64,
+        flags: UntypedFlags,
+    ) KernelError!u32 {
+        if ((base_paddr & 0xFFF) != 0 or size_bytes == 0 or (size_bytes & 0xFFF) != 0) {
+            return KernelError.InvalidState;
+        }
+        if (self.len >= self.blocks.len) return KernelError.TooManyUntypedBlocks;
+        const block_id: u32 = @intCast(self.len);
+        self.blocks[self.len] = .{
+            .active = true,
+            .base_paddr = base_paddr,
+            .size_bytes = size_bytes,
+            .used_bytes = 0,
+            .flags = flags,
+        };
+        self.len += 1;
+        return block_id;
+    }
+
+    pub fn getBlock(self: *UntypedPool, block_id: u32) ?*UntypedBlock {
+        const index: usize = @intCast(block_id);
+        if (index >= self.len) return null;
+        if (!self.blocks[index].active) return null;
+        return &self.blocks[index];
+    }
+
+    pub fn getBlockConst(self: *const UntypedPool, block_id: u32) ?*const UntypedBlock {
+        const index: usize = @intCast(block_id);
+        if (index >= self.len) return null;
+        if (!self.blocks[index].active) return null;
+        return &self.blocks[index];
+    }
 };
 
 pub const FramebufferCapability = struct {
@@ -321,6 +479,7 @@ pub const WindowRights = packed struct(u16) {
 };
 
 pub const window_flag_allow_pixels_dma: u32 = 1 << 0;
+pub const window_flag_low_scale: u32 = 1 << 1;
 
 pub const WindowCap = packed struct {
     magic: u32, // 'WCAP'
@@ -393,23 +552,70 @@ pub const OwnershipView = enum {
     None,
 };
 
+pub const IommuNoCapDriverMode = enum(u8) {
+    off,
+    shadow,
+    enforce,
+};
+
+pub const IommuSyncReason = enum(u8) {
+    grant_dma,
+    grant_no_dma,
+    move_from,
+    move_to,
+    revoke,
+};
+
+pub const DmaDeviceId = dma_mapping_manager.DmaDeviceId;
+pub const DmaDirection = dma_mapping_manager.DmaDirection;
+pub const DmaMappingState = dma_mapping_manager.DmaMappingState;
+pub const DmaMapping = dma_mapping_manager.DmaMapping;
+pub const QueueOperation = dma_mapping_manager.QueueOperation;
+pub const QueueCapability = dma_mapping_manager.QueueCapability;
+
+const IommuDevice = enum(u8) {
+    virtio_gpu,
+    virtio_input,
+};
+
+const IommuMapEntry = struct {
+    valid: bool = false,
+    device: IommuDevice = .virtio_gpu,
+    paddr: u64 = 0,
+};
+
+const IommuNoCapDriverState = struct {
+    const max_mappings = 512;
+
+    mode: IommuNoCapDriverMode = .off,
+    mappings: [max_mappings]IommuMapEntry = [_]IommuMapEntry{.{}} ** max_mappings,
+};
+
 pub const KernelState = struct {
     pub const max_regions = 256;
-    const principal_count = 6;
     const max_total_caps = principal_count * CNode.max_caps;
     pub const max_windows = 64;
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
     cap_tables: [principal_count]CNode = [_]CNode{.{}} ** principal_count,
+    untyped_tables: [principal_count]UntypedCNode = [_]UntypedCNode{.{}} ** principal_count,
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     framebuffer_caps: [principal_count]?FramebufferCapability = [_]?FramebufferCapability{null} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
+    iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
+    untyped_revoke_queue: [max_total_caps]u64 = undefined,
+    untyped_revoke_subtree: [max_total_caps]u64 = undefined,
     dma_restore: [max_total_caps]DmaRestoreEntry = [_]DmaRestoreEntry{.{}} ** max_total_caps,
+    dma_mappings: dma_mapping_manager.DmaMappingTable = .{},
+    dma_device_domains: dma_mapping_manager.DeviceDomainTable = .{},
+    queue_caps: dma_mapping_manager.QueueCapabilityTable = .{},
+    iommu: IommuNoCapDriverState = .{},
     next_cap_id: u64 = 1,
+    untyped_pool: UntypedPool = .{},
     windows: [max_windows]WindowRecord = [_]WindowRecord{.{}} ** max_windows,
     next_window_id: u32 = 1,
 
@@ -454,6 +660,84 @@ pub const KernelState = struct {
         return rights;
     }
 
+    pub fn setIommuNoCapDriverMode(self: *KernelState, mode: IommuNoCapDriverMode) void {
+        self.iommu.mode = mode;
+        if (mode == .off) {
+            self.iommu.mappings = [_]IommuMapEntry{.{}} ** IommuNoCapDriverState.max_mappings;
+        }
+    }
+
+    pub fn getIommuNoCapDriverMode(self: *const KernelState) IommuNoCapDriverMode {
+        return self.iommu.mode;
+    }
+
+    fn iommuDeviceForPrincipal(principal: PrincipalId) ?IommuDevice {
+        return switch (principal) {
+            .Process1 => .virtio_gpu,
+            .Process0, .Process3 => .virtio_input,
+            else => null,
+        };
+    }
+
+    fn iommuFindMappingIndex(self: *const KernelState, device: IommuDevice, paddr: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.iommu.mappings.len) : (i += 1) {
+            const entry = self.iommu.mappings[i];
+            if (!entry.valid) continue;
+            if (entry.device == device and entry.paddr == paddr) return i;
+        }
+        return null;
+    }
+
+    fn iommuMap(self: *KernelState, device: IommuDevice, paddr: u64) KernelError!void {
+        if (self.iommuFindMappingIndex(device, paddr) != null) return;
+        var i: usize = 0;
+        while (i < self.iommu.mappings.len) : (i += 1) {
+            if (self.iommu.mappings[i].valid) continue;
+            self.iommu.mappings[i] = .{
+                .valid = true,
+                .device = device,
+                .paddr = paddr,
+            };
+            return;
+        }
+        return KernelError.TableFull;
+    }
+
+    fn iommuUnmap(self: *KernelState, device: IommuDevice, paddr: u64) void {
+        const index = self.iommuFindMappingIndex(device, paddr) orelse return;
+        self.iommu.mappings[index] = .{};
+    }
+
+    fn syncIommuForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64, reason: IommuSyncReason) KernelError!void {
+        if (self.iommu.mode == .off) return;
+        const device = iommuDeviceForPrincipal(principal) orelse return;
+        const had_mapping = self.iommuFindMappingIndex(device, paddr) != null;
+        const cap = self.getTableConst(principal).find(paddr);
+        if (cap) |c| {
+            if (c.rights.dma) {
+                try self.iommuMap(device, paddr);
+                if (!had_mapping) {
+                    if (self.iommu_audit_hook) |hook| {
+                        hook(self, principal, paddr, true, reason);
+                    }
+                }
+                return;
+            }
+        }
+        self.iommuUnmap(device, paddr);
+        if (had_mapping) {
+            if (self.iommu_audit_hook) |hook| {
+                hook(self, principal, paddr, false, reason);
+            }
+        }
+    }
+
+    pub fn iommuHasMappingForPrincipalForTest(self: *const KernelState, principal: PrincipalId, paddr: u64) bool {
+        const device = iommuDeviceForPrincipal(principal) orelse return false;
+        return self.iommuFindMappingIndex(device, paddr) != null;
+    }
+
     pub fn allocWindowSlot(self: *KernelState) ?usize {
         var i: usize = 0;
         while (i < self.windows.len) : (i += 1) {
@@ -493,8 +777,15 @@ pub const KernelState = struct {
         if (page_count_u64 == 0 or page_count_u64 > 1024) return KernelError.InvalidState;
         const page_count: usize = @intCast(page_count_u64);
 
-        const window_cap_page = try self.allocPageTo(owner, free_list);
-        const meta_page = try self.allocPageTo(owner, free_list);
+        var bookkeeping_pages: [2]PageCapability = undefined;
+        if (self.findOwnedUntypedForPages(owner, 2, true)) |block_id| {
+            try self.retypeUntypedToPages(owner, block_id, 2, true, bookkeeping_pages[0..]);
+        } else {
+            bookkeeping_pages[0] = try self.allocPageTo(owner, free_list);
+            bookkeeping_pages[1] = try self.allocPageTo(owner, free_list);
+        }
+        const window_cap_page = bookkeeping_pages[0];
+        const meta_page = bookkeeping_pages[1];
 
         const pixels_first_paddr: u64 = 0;
 
@@ -583,6 +874,41 @@ pub const KernelState = struct {
             (!child.dma or parent.dma);
     }
 
+    fn processPrincipal(index: usize) PrincipalId {
+        return processPrincipalFromIndex(index) orelse unreachable;
+    }
+
+    fn initPrincipalState(self: *KernelState) void {
+        var i: usize = 0;
+        while (i < principal_count) : (i += 1) {
+            self.cap_tables[i] = .{};
+            self.endpoint_tables[i] = .{};
+            self.cap_mailboxes[i] = .{};
+        }
+    }
+
+    fn installDefaultEndpoints(self: *KernelState) KernelError!void {
+        const p0 = processPrincipal(0);
+        const p1 = processPrincipal(1);
+        try self.endpoint_tables[@intFromEnum(p0)].add(.{
+            .endpoint_id = endpoint_to_process1,
+            .target = p1,
+        });
+        try self.endpoint_tables[@intFromEnum(p1)].add(.{
+            .endpoint_id = endpoint_to_process0,
+            .target = p0,
+        });
+
+        var i: usize = 2;
+        while (i < process_count) : (i += 1) {
+            const proc = processPrincipal(i);
+            try self.endpoint_tables[@intFromEnum(proc)].add(.{
+                .endpoint_id = endpoint_to_process1,
+                .target = p1,
+            });
+        }
+    }
+
     pub fn initPhase1() KernelState {
         var state = KernelState{};
         state.next_cap_id = 1;
@@ -590,49 +916,13 @@ pub const KernelState = struct {
             .id = 0,
         };
         state.region_len = 1;
-
-        state.cap_tables[@intFromEnum(PrincipalId.Process0)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process2)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process3)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process4)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process0)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process1)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process2)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process3)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process4)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Device0)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process0)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process1)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process2)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process3)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process4)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Device0)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process0)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        }) catch unreachable;
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process1)].add(.{
-            .endpoint_id = endpoint_to_process0,
-            .target = .Process0,
-        }) catch unreachable;
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process2)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        }) catch unreachable;
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process3)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        }) catch unreachable;
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process4)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        }) catch unreachable;
+        state.initPrincipalState();
+        state.installDefaultEndpoints() catch unreachable;
 
         // Process0 initially owns region0 and has read + dma.
+        const p0 = processPrincipal(0);
         const root_id = state.allocCapId();
-        state.cap_tables[@intFromEnum(PrincipalId.Process0)].add(.{
+        state.cap_tables[@intFromEnum(p0)].add(.{
             .paddr = 0x1000,
             .rights = .{ .cpu_read = true, .cpu_write = true, .dma = true },
             .cap_id = root_id,
@@ -649,44 +939,8 @@ pub const KernelState = struct {
 
         var state = KernelState{};
         state.next_cap_id = 1;
-        state.cap_tables[@intFromEnum(PrincipalId.Process0)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process1)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process2)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process3)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Process4)] = .{};
-        state.cap_tables[@intFromEnum(PrincipalId.Device0)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process0)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process1)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process2)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process3)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Process4)] = .{};
-        state.endpoint_tables[@intFromEnum(PrincipalId.Device0)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process0)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process1)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process2)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process3)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Process4)] = .{};
-        state.cap_mailboxes[@intFromEnum(PrincipalId.Device0)] = .{};
-        try state.endpoint_tables[@intFromEnum(PrincipalId.Process0)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        });
-        try state.endpoint_tables[@intFromEnum(PrincipalId.Process1)].add(.{
-            .endpoint_id = endpoint_to_process0,
-            .target = .Process0,
-        });
-        try state.endpoint_tables[@intFromEnum(PrincipalId.Process2)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        });
-        try state.endpoint_tables[@intFromEnum(PrincipalId.Process3)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        });
-        try state.endpoint_tables[@intFromEnum(PrincipalId.Process4)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = .Process1,
-        });
+        state.initPrincipalState();
+        try state.installDefaultEndpoints();
 
         var i: usize = 0;
         while (i < region_count) : (i += 1) {
@@ -737,6 +991,117 @@ pub const KernelState = struct {
         }
     }
 
+    // Stage1: hold DMA mapping metadata before wiring full syscall/IOMMU flow.
+    pub fn dmaMapCreateStage1(
+        self: *KernelState,
+        owner: PrincipalId,
+        device: DmaDeviceId,
+        paddr_start: u64,
+        length: u64,
+        direction: DmaDirection,
+    ) KernelError!u64 {
+        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        return self.dma_mappings.alloc(
+            @intFromEnum(owner),
+            device,
+            paddr_start,
+            length,
+            direction,
+        ) catch |err| switch (err) {
+            error.InvalidState => KernelError.InvalidState,
+            error.TableFull => KernelError.TableFull,
+            else => KernelError.InvalidState,
+        };
+    }
+
+    pub fn dmaMapFindStage1(self: *const KernelState, token: u64) ?*const DmaMapping {
+        return self.dma_mappings.findByToken(token);
+    }
+
+    pub fn dmaMapSetStateStage1(
+        self: *KernelState,
+        token: u64,
+        state: DmaMappingState,
+    ) KernelError!void {
+        self.dma_mappings.setState(token, state) catch |err| switch (err) {
+            error.NotFound => return KernelError.CapabilityNotFound,
+            error.InvalidState => return KernelError.InvalidState,
+            error.TableFull => return KernelError.TableFull,
+            error.Denied => return KernelError.InvalidState,
+        };
+    }
+
+    pub fn dmaMapReleaseStage1(self: *KernelState, token: u64) KernelError!void {
+        self.dma_mappings.release(token) catch |err| switch (err) {
+            error.NotFound => return KernelError.CapabilityNotFound,
+            error.InvalidState => return KernelError.InvalidState,
+            error.TableFull => return KernelError.TableFull,
+            error.Denied => return KernelError.InvalidState,
+        };
+    }
+
+    pub fn dmaBindDeviceDomainStage1(
+        self: *KernelState,
+        device: DmaDeviceId,
+        domain_id: u32,
+    ) KernelError!void {
+        self.dma_device_domains.bind(device, domain_id) catch |err| switch (err) {
+            error.TableFull => return KernelError.TableFull,
+            error.Denied => return KernelError.InvalidState,
+            error.InvalidState => return KernelError.InvalidState,
+            error.NotFound => return KernelError.CapabilityNotFound,
+        };
+    }
+
+    pub fn dmaDeviceDomainStage1(self: *const KernelState, device: DmaDeviceId) ?u32 {
+        return self.dma_device_domains.domainFor(device);
+    }
+
+    pub fn queueCapGrantStage2(
+        self: *KernelState,
+        owner: PrincipalId,
+        device: DmaDeviceId,
+        queue_index: u16,
+        allow_submit: bool,
+        allow_notify: bool,
+    ) KernelError!u64 {
+        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        return self.queue_caps.alloc(
+            @intFromEnum(owner),
+            device,
+            queue_index,
+            allow_submit,
+            allow_notify,
+        ) catch |err| switch (err) {
+            error.InvalidState => KernelError.InvalidState,
+            error.TableFull => KernelError.TableFull,
+            else => KernelError.InvalidState,
+        };
+    }
+
+    pub fn queueCapAuthorizeStage2(
+        self: *const KernelState,
+        owner: PrincipalId,
+        token: u64,
+        device: DmaDeviceId,
+        queue_index: u16,
+        op: QueueOperation,
+    ) KernelError!void {
+        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        self.queue_caps.authorize(
+            @intFromEnum(owner),
+            token,
+            device,
+            queue_index,
+            op,
+        ) catch |err| switch (err) {
+            error.NotFound => return KernelError.CapabilityNotFound,
+            error.Denied => return KernelError.InvalidState,
+            error.InvalidState => return KernelError.InvalidState,
+            error.TableFull => return KernelError.TableFull,
+        };
+    }
+
     pub fn getRegion(self: *KernelState, region_id: u64) ?*Region {
         var i: usize = 0;
         while (i < self.region_len) : (i += 1) {
@@ -759,6 +1124,14 @@ pub const KernelState = struct {
 
     pub fn getTableConst(self: *const KernelState, principal: PrincipalId) *const CNode {
         return &self.cap_tables[@intFromEnum(principal)];
+    }
+
+    pub fn getUntypedTable(self: *KernelState, principal: PrincipalId) *UntypedCNode {
+        return &self.untyped_tables[@intFromEnum(principal)];
+    }
+
+    pub fn getUntypedTableConst(self: *const KernelState, principal: PrincipalId) *const UntypedCNode {
+        return &self.untyped_tables[@intFromEnum(principal)];
     }
 
     pub fn getEndpointTable(self: *KernelState, principal: PrincipalId) *EndpointCNode {
@@ -826,16 +1199,39 @@ pub const KernelState = struct {
         return .None;
     }
 
+    fn anyPrincipalHasPageCap(self: *const KernelState, paddr: u64) bool {
+        var pidx: usize = 0;
+        while (pidx < principal_count) : (pidx += 1) {
+            if (self.cap_tables[pidx].find(paddr) != null) return true;
+        }
+        return false;
+    }
+
+    fn paddrFallsInsideActiveUntypedBlock(self: *const KernelState, paddr: u64) bool {
+        var i: usize = 0;
+        while (i < self.untyped_pool.len) : (i += 1) {
+            const block = self.untyped_pool.blocks[i];
+            if (!block.active) continue;
+            const block_end = block.base_paddr + block.size_bytes;
+            if (paddr >= block.base_paddr and paddr < block_end) return true;
+        }
+        return false;
+    }
+
     pub fn allocPage(
         self: *KernelState,
         requester: PrincipalId,
         free_list: *FreePageList,
     ) KernelError!PageCapability {
-        _ = self;
         _ = requester;
-        return .{
-            .paddr = try free_list.popBack(),
-        };
+        while (true) {
+            const paddr = try free_list.popBack();
+            if (self.anyPrincipalHasPageCap(paddr)) continue;
+            if (self.paddrFallsInsideActiveUntypedBlock(paddr)) continue;
+            return .{
+                .paddr = paddr,
+            };
+        }
     }
 
     pub fn allocPageTo(
@@ -862,6 +1258,252 @@ pub const KernelState = struct {
         });
         // Freshly allocated pages are not mapped yet, so no PTE rights sync is needed here.
         return cap;
+    }
+
+    pub fn createUntypedBlock(
+        self: *KernelState,
+        owner: PrincipalId,
+        base_paddr: u64,
+        size_bytes: u64,
+        flags: UntypedFlags,
+    ) KernelError!u32 {
+        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        const block_id = try self.untyped_pool.allocBlock(base_paddr, size_bytes, flags);
+        const root_id = self.allocCapId();
+        try self.getUntypedTable(owner).add(.{
+            .block_id = block_id,
+            .cap_id = root_id,
+            .root_cap_id = root_id,
+            .parent_cap_id = 0,
+        });
+        return block_id;
+    }
+
+    pub fn findOwnedUntypedForPages(
+        self: *const KernelState,
+        owner: PrincipalId,
+        page_count: usize,
+        contiguous: bool,
+    ) ?u32 {
+        if (!isProcessPrincipal(owner)) return null;
+        const bytes_needed, const overflow = @mulWithOverflow(@as(u64, @intCast(page_count)), @as(u64, 4096));
+        if (overflow != 0) return null;
+        const table = self.getUntypedTableConst(owner);
+        var i: usize = 0;
+        while (i < table.len) : (i += 1) {
+            const cap = table.caps[i];
+            const block = self.untyped_pool.getBlockConst(cap.block_id) orelse continue;
+            if (contiguous and !block.flags.contiguous_only) continue;
+            const used_aligned = pageAlignUp(block.used_bytes);
+            if (used_aligned > block.size_bytes) continue;
+            if ((block.size_bytes - used_aligned) >= bytes_needed) return cap.block_id;
+        }
+        return null;
+    }
+
+    pub fn retypeUntypedToPages(
+        self: *KernelState,
+        owner: PrincipalId,
+        block_id: u32,
+        page_count: usize,
+        contiguous: bool,
+        out_caps: []PageCapability,
+    ) KernelError!void {
+        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        if (page_count == 0 or out_caps.len < page_count) return KernelError.InvalidState;
+        const untyped_cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
+        const block = self.untyped_pool.getBlock(block_id) orelse return KernelError.UntypedNotFound;
+        if (contiguous and !block.flags.contiguous_only) return KernelError.InvalidState;
+
+        const bytes_needed, const overflow = @mulWithOverflow(@as(u64, @intCast(page_count)), @as(u64, 4096));
+        if (overflow != 0) return KernelError.InvalidState;
+        const used_aligned = pageAlignUp(block.used_bytes);
+        if (used_aligned > block.size_bytes or (block.size_bytes - used_aligned) < bytes_needed) {
+            return KernelError.OutOfFreePages;
+        }
+
+        var i: usize = 0;
+        while (i < page_count) : (i += 1) {
+            const paddr = block.base_paddr + used_aligned + (@as(u64, @intCast(i)) * 4096);
+            if (!builtin.is_test) {
+                const page_bytes: [*]u8 = @ptrFromInt(paddr);
+                @memset(page_bytes[0..4096], 0);
+            }
+        }
+        i = 0;
+        while (i < page_count) : (i += 1) {
+            const paddr = block.base_paddr + used_aligned + (@as(u64, @intCast(i)) * 4096);
+            const cap_id = self.allocCapId();
+            try self.getTable(owner).add(.{
+                .paddr = paddr,
+                .rights = .{
+                    .cpu_read = true,
+                    .cpu_write = true,
+                    .dma = block.flags.dma_ok,
+                },
+                .cap_id = cap_id,
+                .root_cap_id = untyped_cap.root_cap_id,
+                .parent_cap_id = untyped_cap.cap_id,
+            });
+            out_caps[i] = .{ .paddr = paddr };
+        }
+        block.used_bytes = used_aligned + bytes_needed;
+    }
+
+    pub fn grantUntypedCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        block_id: u32,
+    ) KernelError!void {
+        if (from == to) return KernelError.InvalidState;
+        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        const src_cap = self.getUntypedTableConst(from).find(block_id) orelse return KernelError.UntypedNotFound;
+        if (self.getUntypedTableConst(to).find(block_id) != null) return KernelError.InvalidState;
+        const child_id = self.allocCapId();
+        try self.getUntypedTable(to).add(.{
+            .block_id = block_id,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
+    }
+
+    pub fn moveUntypedCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        block_id: u32,
+    ) KernelError!void {
+        if (from == to) return KernelError.InvalidState;
+        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        const src = self.getUntypedTable(from);
+        const src_cap = src.find(block_id) orelse return KernelError.UntypedNotFound;
+        if (self.getUntypedTableConst(to).find(block_id) != null) return KernelError.InvalidState;
+        const moved = src_cap.*;
+        _ = src.removeByBlockId(block_id);
+        try self.getUntypedTable(to).add(moved);
+    }
+
+    fn hasUntypedChildren(self: *const KernelState, cap_id: u64) bool {
+        var pidx: usize = 0;
+        while (pidx < principal_count) : (pidx += 1) {
+            const table = &self.untyped_tables[pidx];
+            var i: usize = 0;
+            while (i < table.len) : (i += 1) {
+                if (table.caps[i].parent_cap_id == cap_id) return true;
+            }
+        }
+        return false;
+    }
+
+    fn hasPageChildren(self: *const KernelState, cap_id: u64) bool {
+        var pidx: usize = 0;
+        while (pidx < principal_count) : (pidx += 1) {
+            const table = &self.cap_tables[pidx];
+            var i: usize = 0;
+            while (i < table.len) : (i += 1) {
+                if (table.caps[i].parent_cap_id == cap_id) return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn resetUntyped(
+        self: *KernelState,
+        owner: PrincipalId,
+        block_id: u32,
+    ) KernelError!void {
+        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        const cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
+        if (cap.parent_cap_id != 0) return KernelError.InvalidState;
+        if (self.hasUntypedChildren(cap.cap_id) or self.hasPageChildren(cap.cap_id)) {
+            return KernelError.UntypedHasChildren;
+        }
+        const block = self.untyped_pool.getBlock(block_id) orelse return KernelError.UntypedNotFound;
+        block.used_bytes = 0;
+    }
+
+    pub fn revokeUntypedCapTree(
+        self: *KernelState,
+        owner: PrincipalId,
+        block_id: u32,
+    ) KernelError!void {
+        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        const start_cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
+        const start_id = start_cap.cap_id;
+        const is_root = start_cap.parent_cap_id == 0;
+
+        const queue = &self.untyped_revoke_queue;
+        var queue_len: usize = 0;
+        var queue_head: usize = 0;
+        queue[0] = start_id;
+        queue_len = 1;
+
+        const subtree = &self.untyped_revoke_subtree;
+        var subtree_len: usize = 0;
+
+        while (queue_head < queue_len) : (queue_head += 1) {
+            const current_id = queue[queue_head];
+            if (containsCapId(subtree[0..subtree_len], current_id)) continue;
+            if (subtree_len >= subtree.len) return KernelError.RevokeOverflow;
+            subtree[subtree_len] = current_id;
+            subtree_len += 1;
+
+            var pidx: usize = 0;
+            while (pidx < principal_count) : (pidx += 1) {
+                const page_table = &self.cap_tables[pidx];
+                var i: usize = 0;
+                while (i < page_table.len) : (i += 1) {
+                    const cap = page_table.caps[i];
+                    if (cap.parent_cap_id != current_id) continue;
+                    if (containsCapId(queue[0..queue_len], cap.cap_id)) continue;
+                    if (queue_len >= queue.len) return KernelError.RevokeOverflow;
+                    queue[queue_len] = cap.cap_id;
+                    queue_len += 1;
+                }
+
+                const untyped_table = &self.untyped_tables[pidx];
+                i = 0;
+                while (i < untyped_table.len) : (i += 1) {
+                    const cap = untyped_table.caps[i];
+                    if (cap.parent_cap_id != current_id) continue;
+                    if (containsCapId(queue[0..queue_len], cap.cap_id)) continue;
+                    if (queue_len >= queue.len) return KernelError.RevokeOverflow;
+                    queue[queue_len] = cap.cap_id;
+                    queue_len += 1;
+                }
+            }
+        }
+
+        var s: usize = 0;
+        while (s < subtree_len) : (s += 1) {
+            const cap_id = subtree[s];
+            var pidx: usize = 0;
+            while (pidx < principal_count) : (pidx += 1) {
+                const page_table = &self.cap_tables[pidx];
+                if (page_table.findByCapId(cap_id)) |page_cap| {
+                    const removed_paddr = page_cap.paddr;
+                    _ = page_table.removeByCapId(cap_id);
+                    try self.syncIommuForPrincipalPaddr(@enumFromInt(pidx), removed_paddr, .revoke);
+                    if (self.pte_sync_hook) |hook| {
+                        hook(self, @enumFromInt(pidx), removed_paddr);
+                    }
+                    break;
+                }
+
+                const untyped_table = &self.untyped_tables[pidx];
+                if (untyped_table.findByCapId(cap_id) != null) {
+                    _ = untyped_table.removeByCapId(cap_id);
+                    break;
+                }
+            }
+        }
+
+        if (is_root) {
+            const block = self.untyped_pool.getBlock(block_id) orelse return KernelError.UntypedNotFound;
+            block.used_bytes = 0;
+        }
     }
 
     pub fn installCap(
@@ -903,6 +1545,8 @@ pub const KernelState = struct {
         moved.rights = rights;
         _ = src.removeByPaddr(paddr);
         try self.getTable(to).add(moved);
+        try self.syncIommuForPrincipalPaddr(from, paddr, .move_from);
+        try self.syncIommuForPrincipalPaddr(to, paddr, .move_to);
         if (self.pte_sync_hook) |hook| {
             hook(self, from, paddr);
             hook(self, to, paddr);
@@ -931,8 +1575,45 @@ pub const KernelState = struct {
             .root_cap_id = src_cap.root_cap_id,
             .parent_cap_id = src_cap.cap_id,
         });
-        if (self.pte_sync_hook) |hook| {
-            hook(self, to, paddr);
+        try self.syncIommuForPrincipalPaddr(to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
+    }
+
+    pub fn grantCapsBatch(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        paddrs: []const u64,
+        rights: Rights,
+    ) KernelError!void {
+        if (from == to) return KernelError.InvalidState;
+        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        if (paddrs.len == 0) return KernelError.InvalidState;
+        var i: usize = 0;
+        while (i < paddrs.len) : (i += 1) {
+            const paddr = paddrs[i];
+            const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
+            if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+            if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
+        }
+        const saved_audit_hook = self.iommu_audit_hook;
+        self.iommu_audit_hook = null;
+        defer {
+            self.iommu_audit_hook = saved_audit_hook;
+        }
+
+        i = 0;
+        while (i < paddrs.len) : (i += 1) {
+            const paddr = paddrs[i];
+            const src_cap = self.getTableConst(from).find(paddr).?;
+            const child_id = self.allocCapId();
+            try self.getTable(to).add(.{
+                .paddr = paddr,
+                .rights = rights,
+                .cap_id = child_id,
+                .root_cap_id = src_cap.root_cap_id,
+                .parent_cap_id = src_cap.cap_id,
+            });
+            try self.syncIommuForPrincipalPaddr(to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
         }
     }
 
@@ -1031,6 +1712,7 @@ pub const KernelState = struct {
                 const cap = table.findByCapId(cap_id) orelse continue;
                 const removed_paddr = cap.paddr;
                 _ = table.removeByCapId(cap_id);
+                try self.syncIommuForPrincipalPaddr(@enumFromInt(pidx), removed_paddr, .revoke);
                 if (self.pte_sync_hook) |hook| {
                     hook(self, @enumFromInt(pidx), removed_paddr);
                 }
@@ -1040,6 +1722,89 @@ pub const KernelState = struct {
     }
 };
 
+fn containsCapId(ids: []const u64, target: u64) bool {
+    for (ids) |id| {
+        if (id == target) return true;
+    }
+    return false;
+}
+
+test "dma mapping manager stage1 create state and release" {
+    var s = KernelState.initPhase1();
+    const token = try s.dmaMapCreateStage1(
+        .Process0,
+        .virtio_gpu,
+        0x4000,
+        4096,
+        .bidirectional,
+    );
+    const mapping = s.dmaMapFindStage1(token).?;
+    try std.testing.expectEqual(@as(u64, 0x4000), mapping.paddr_start);
+    try std.testing.expectEqual(@as(u64, 4096), mapping.length);
+    try std.testing.expectEqual(DmaMappingState.mapped, mapping.state);
+
+    try s.dmaMapSetStateStage1(token, .in_flight);
+    try std.testing.expectEqual(DmaMappingState.in_flight, s.dmaMapFindStage1(token).?.state);
+    try s.dmaMapSetStateStage1(token, .completed);
+    try std.testing.expectEqual(DmaMappingState.completed, s.dmaMapFindStage1(token).?.state);
+
+    try s.dmaMapReleaseStage1(token);
+    try std.testing.expect(s.dmaMapFindStage1(token) == null);
+}
+
+test "dma mapping manager stage1 device domain bind" {
+    var s = KernelState.initPhase1();
+    try s.dmaBindDeviceDomainStage1(.virtio_gpu, 1);
+    try std.testing.expectEqual(@as(?u32, 1), s.dmaDeviceDomainStage1(.virtio_gpu));
+}
+
+test "queue cap stage2 authorize submit and notify" {
+    var s = KernelState.initPhase1();
+    const submit_token = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, false);
+    const notify_token = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, false, true);
+
+    try s.queueCapAuthorizeStage2(.Process1, submit_token, .virtio_gpu, 0, .submit);
+    try s.queueCapAuthorizeStage2(.Process1, notify_token, .virtio_gpu, 0, .notify);
+
+    try std.testing.expectError(KernelError.InvalidState, s.queueCapAuthorizeStage2(.Process1, submit_token, .virtio_gpu, 0, .notify));
+    try std.testing.expectError(KernelError.InvalidState, s.queueCapAuthorizeStage2(.Process1, notify_token, .virtio_gpu, 0, .submit));
+}
+
+test "queue cap stage2 rejects owner mismatch" {
+    var s = KernelState.initPhase1();
+    const token = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, true);
+    try std.testing.expectError(KernelError.InvalidState, s.queueCapAuthorizeStage2(.Process0, token, .virtio_gpu, 0, .submit));
+}
+test "dma mapping manager stage1 rejects invalid transition" {
+    var s = KernelState.initPhase1();
+    const token = try s.dmaMapCreateStage1(
+        .Process0,
+        .virtio_gpu,
+        0x5000,
+        4096,
+        .bidirectional,
+    );
+
+    try std.testing.expectError(KernelError.InvalidState, s.dmaMapSetStateStage1(token, .completed));
+    try std.testing.expectEqual(DmaMappingState.mapped, s.dmaMapFindStage1(token).?.state);
+}
+
+test "dma mapping manager stage1 release requires completed" {
+    var s = KernelState.initPhase1();
+    const token = try s.dmaMapCreateStage1(
+        .Process0,
+        .virtio_gpu,
+        0x6000,
+        4096,
+        .bidirectional,
+    );
+
+    try std.testing.expectError(KernelError.InvalidState, s.dmaMapReleaseStage1(token));
+    try s.dmaMapSetStateStage1(token, .in_flight);
+    try s.dmaMapSetStateStage1(token, .completed);
+    try s.dmaMapReleaseStage1(token);
+    try std.testing.expect(s.dmaMapFindStage1(token) == null);
+}
 test "phase1 init state" {
     const s = KernelState.initPhase1();
 
@@ -1123,9 +1888,9 @@ test "free page list append region" {
 
     try std.testing.expectEqual(@as(usize, 3), free_list.len);
     try std.testing.expectEqual(@as(usize, 1), free_list.range_len);
-    try std.testing.expectEqual(@as(u64, 0x1000), free_list.pages[0]);
-    try std.testing.expectEqual(@as(u64, 0x2000), free_list.pages[1]);
-    try std.testing.expectEqual(@as(u64, 0x3000), free_list.pages[2]);
+    try std.testing.expectEqual(@as(u64, 0), free_list.ranges[0].region_id);
+    try std.testing.expectEqual(@as(u64, 0x1000), free_list.ranges[0].physical_start);
+    try std.testing.expectEqual(@as(usize, 3), free_list.ranges[0].len);
 }
 
 test "free page list splits range when non-contiguous" {
@@ -1157,6 +1922,94 @@ test "alloc page to principal installs capability by paddr" {
     const cap = try s.allocPageTo(.Process0, &free_list);
     try std.testing.expectEqual(@as(u64, 0x9000), cap.paddr);
     try std.testing.expect(s.getTableConst(.Process0).find(0x9000) != null);
+}
+
+test "allocPageTo skips paddr already covered by active untyped block" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    var free_list = FreePageList{};
+    try free_list.appendPage(0, 0x1000);
+    try free_list.appendPage(0, 0x2000);
+    _ = try s.createUntypedBlock(.Process0, 0x2000, 0x1000, .{
+        .contiguous_only = true,
+        .dma_ok = true,
+    });
+
+    const cap = try s.allocPageTo(.Process1, &free_list);
+    try std.testing.expectEqual(@as(u64, 0x1000), cap.paddr);
+    try std.testing.expect(s.getTableConst(.Process1).find(0x1000) != null);
+}
+
+test "allocPageTo skips paddr that already exists in another cap table" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    var free_list = FreePageList{};
+    try free_list.appendPage(0, 0x1000);
+    try free_list.appendPage(0, 0x3000);
+    try s.installCap(.Process1, 0x3000, .{
+        .cpu_read = true,
+        .cpu_write = true,
+        .dma = true,
+    });
+
+    const cap = try s.allocPageTo(.Process0, &free_list);
+    try std.testing.expectEqual(@as(u64, 0x1000), cap.paddr);
+    try std.testing.expect(s.getTableConst(.Process0).find(0x1000) != null);
+}
+
+test "untyped retype installs page caps under untyped root" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    const block_id = try s.createUntypedBlock(.Process0, 0x20_0000, 0x4000, .{
+        .contiguous_only = true,
+        .dma_ok = true,
+    });
+    var caps: [2]PageCapability = undefined;
+    try s.retypeUntypedToPages(.Process0, block_id, 2, true, caps[0..]);
+
+    try std.testing.expectEqual(@as(u64, 0x20_0000), caps[0].paddr);
+    try std.testing.expectEqual(@as(u64, 0x20_1000), caps[1].paddr);
+    try std.testing.expect(s.getTableConst(.Process0).find(caps[0].paddr) != null);
+    try std.testing.expect(s.getTableConst(.Process0).find(caps[1].paddr) != null);
+}
+
+test "untyped grant allows child owner to retype" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    const block_id = try s.createUntypedBlock(.Process0, 0x30_0000, 0x4000, .{
+        .contiguous_only = true,
+        .dma_ok = true,
+    });
+    try s.grantUntypedCap(.Process0, .Process1, block_id);
+
+    var caps: [1]PageCapability = undefined;
+    try s.retypeUntypedToPages(.Process1, block_id, 1, true, caps[0..]);
+    try std.testing.expectEqual(@as(u64, 0x30_0000), caps[0].paddr);
+    try std.testing.expect(s.getTableConst(.Process1).find(caps[0].paddr) != null);
+}
+
+test "findOwnedUntypedForPages sees granted block for Process1" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    const block_id = try s.createUntypedBlock(.Process0, 0x35_0000, 0x8000, .{
+        .contiguous_only = true,
+        .dma_ok = true,
+    });
+    try s.grantUntypedCap(.Process0, .Process1, block_id);
+
+    try std.testing.expectEqual(block_id, s.findOwnedUntypedForPages(.Process1, 2, true).?);
+}
+
+test "untyped revoke tree removes descendant pages and resets root block" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    const block_id = try s.createUntypedBlock(.Process0, 0x40_0000, 0x4000, .{
+        .contiguous_only = true,
+        .dma_ok = true,
+    });
+    try s.grantUntypedCap(.Process0, .Process1, block_id);
+    var caps: [1]PageCapability = undefined;
+    try s.retypeUntypedToPages(.Process1, block_id, 1, true, caps[0..]);
+
+    try s.revokeUntypedCapTree(.Process0, block_id);
+    try std.testing.expectEqual(@as(usize, 0), s.getUntypedTableConst(.Process0).len);
+    try std.testing.expectEqual(@as(usize, 0), s.getUntypedTableConst(.Process1).len);
+    try std.testing.expect(s.getTableConst(.Process1).find(caps[0].paddr) == null);
+    try std.testing.expectEqual(@as(u64, 0), s.untyped_pool.getBlockConst(block_id).?.used_bytes);
 }
 
 test "moveCap enforces single holder" {
@@ -1213,6 +2066,33 @@ test "sendCapOnEndpoint requires endpoint capability" {
     try s.sendCapOnEndpoint(.Process0, endpoint_to_process1, 0x1000);
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) == null);
     try std.testing.expect(s.getTableConst(.Process1).find(0x1000) != null);
+}
+
+test "iommu no-cap-driver shadow maps dma grant to compositor" {
+    var s = KernelState.initPhase1();
+    s.setIommuNoCapDriverMode(.shadow);
+
+    try s.grantCap(.Process0, .Process1, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = true,
+    });
+    try std.testing.expect(s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+
+    try s.revokeCapTree(.Process1, 0x1000);
+    try std.testing.expect(!s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+}
+
+test "iommu no-cap-driver does not map non-dma grant" {
+    var s = KernelState.initPhase1();
+    s.setIommuNoCapDriverMode(.shadow);
+
+    try s.grantCap(.Process0, .Process1, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = false,
+    });
+    try std.testing.expect(!s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
 }
 
 test "sendCapOnEndpoint rejects missing endpoint" {

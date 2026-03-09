@@ -6,7 +6,7 @@ const syscall_log: u64 = 0x9;
 const shared_page_va: usize = 0x3C00_3000;
 const window_pixels_va: usize = 0x3C00_4000;
 const window_meta_shared_va: usize = 0x3C00_7000;
-const window_cap_tmp_va: u64 = 0x201F_F000;
+const window_cap_tmp_va: u64 = 0x3C10_0000;
 const pixel_width: i32 = 32;
 const pixel_height: i32 = 32;
 const pixel_pitch: i32 = 32;
@@ -108,6 +108,7 @@ pub export fn _start() noreturn {
             fb[row_off + @as(usize, @intCast(x))] = 0x00000000;
         }
     }
+    window_client.markWindowDirty(window_meta_shared_va);
 
     var prev_x: i32 = -1;
     var prev_y: i32 = -1;
@@ -135,5 +136,6 @@ pub export fn _start() noreturn {
         drawRect(fb, pixel_width, pixel_height, pixel_pitch, x - cursor_half, y2 - cursor_half, cursor_size, cursor_size, color);
         prev_x = x;
         prev_y = y2;
+        window_client.markWindowDirty(window_meta_shared_va);
     }
 }

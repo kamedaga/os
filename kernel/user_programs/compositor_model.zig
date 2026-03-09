@@ -31,9 +31,11 @@ pub const WindowSource = struct {
     pixels_paddr: u64 = 0,
     pixels_page_count: usize = 0,
     meta_va: usize = 0,
+    observed_meta_seq: u64 = 0,
     width: usize = 0,
     height: usize = 0,
     pitch: usize = 0,
+    flags: u32 = 0,
 };
 
 pub const WindowFrame = struct {
@@ -46,6 +48,7 @@ pub const WindowFrame = struct {
     drag_off_y: i32 = 0,
     prev_close_hover: bool = false,
     prev_close_down: bool = false,
+    content_scale: u8 = 1,
     title: [window_title_max_bytes]u8 = [_]u8{0} ** window_title_max_bytes,
     title_len: usize = 0,
 };

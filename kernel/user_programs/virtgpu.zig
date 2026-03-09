@@ -1,9 +1,16 @@
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
-const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_queue_submit: u64 = 0xE;
+const syscall_queue_notify: u64 = 0xF;
+const syscall_untyped_reset: u64 = 0x12;
+const syscall_untyped_alloc_map_pages: u64 = 0x13;
 
 const syscall_ok: u64 = 0;
-const syscall_alloc_map_drop_cap_flag: u64 = 0x2;
+const queue_cap_device_gpu: u64 = 0;
+const untyped_alloc_map_writable_flag: u64 = 1 << 0;
+const untyped_alloc_map_drop_cap_after_map_flag: u64 = 1 << 1;
+const untyped_alloc_map_contiguous_flag: u64 = 1 << 2;
+const untyped_alloc_map_dma_ok_flag: u64 = 1 << 3;
 
 const config_page_va: usize = 0x3C00_2000;
 const common_page_va: usize = 0x2200_4000;
@@ -68,6 +75,10 @@ const cfg_cursor_queue_paddr0_index: usize = 17;
 const cfg_cursor_queue_paddr1_index: usize = 18;
 const cfg_queue_size_index: usize = 19;
 const cfg_cursor_queue_size_index: usize = 20;
+const cfg_control_submit_token_index: usize = 21;
+const cfg_control_notify_token_index: usize = 22;
+const cfg_cursor_submit_token_index: usize = 23;
+const cfg_cursor_notify_token_index: usize = 24;
 
 const desc_flag_next: u16 = 1 << 0;
 const desc_flag_write: u16 = 1 << 1;
@@ -207,6 +218,10 @@ const State = struct {
     cursor_resource: ?*Resource = null,
     cursor_hot_x: u32 = 0,
     cursor_hot_y: u32 = 0,
+    control_submit_token: u64 = 0,
+    control_notify_token: u64 = 0,
+    cursor_submit_token: u64 = 0,
+    cursor_notify_token: u64 = 0,
 };
 
 var state: State = .{};
@@ -233,15 +248,49 @@ fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64, drop_cap_after_map: bool) u64 {
+fn allocUntypedMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64, drop_cap_after_map: bool) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_alloc_map_pages),
+        : [nr] "{rax}" (syscall_untyped_alloc_map_pages),
           [arg0] "{rdi}" (base_va),
           [arg1] "{rsi}" (page_count),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0) | @as(u64, if (drop_cap_after_map) syscall_alloc_map_drop_cap_flag else 0)),
+          [arg2] "{rdx}" (@as(u64, if (writable) untyped_alloc_map_writable_flag else 0) |
+            @as(u64, if (drop_cap_after_map) untyped_alloc_map_drop_cap_after_map_flag else 0) |
+            untyped_alloc_map_contiguous_flag |
+            untyped_alloc_map_dma_ok_flag),
           [arg3] "{rcx}" (out_paddr_list_va),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn resetUntyped(token: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_untyped_reset),
+          [arg0] "{rdi}" (token),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn queueSubmit(token: u64, queue_index: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_queue_submit),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (queue_cap_device_gpu),
+          [arg2] "{rdx}" (queue_index),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn queueNotify(token: u64, queue_index: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_queue_notify),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (queue_cap_device_gpu),
+          [arg2] "{rdx}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -376,6 +425,10 @@ fn logText(text: []const u8) void {
     _ = userLog(text);
 }
 
+fn isSyscallError(value: u64) bool {
+    return value != 0 and value <= 13;
+}
+
 fn queuePushAvail(head_desc: u16) void {
     const avail_idx_ptr = queueAvailIdxPtr();
     const avail_idx = avail_idx_ptr.*;
@@ -456,6 +509,14 @@ fn submitCommand(req_len: usize, extra_len: usize, expected_resp_type: u32) bool
     }
 
     queuePushAvail(0);
+    if (queueSubmit(state.control_submit_token, queue_index_control) != syscall_ok) {
+        logText("Compositor: queue control submit cap denied\n");
+        return false;
+    }
+    if (queueNotify(state.control_notify_token, queue_index_control) != syscall_ok) {
+        logText("Compositor: queue control notify cap denied\n");
+        return false;
+    }
     mmioWriteU16(state.notify_addr, queue_index_control);
 
     var spin: usize = 0;
@@ -493,6 +554,14 @@ fn submitCursorCommand(req_len: usize) bool {
     };
 
     cursorQueuePushAvail(0);
+    if (queueSubmit(state.cursor_submit_token, queue_index_cursor) != syscall_ok) {
+        logText("Compositor: queue cursor submit cap denied\n");
+        return false;
+    }
+    if (queueNotify(state.cursor_notify_token, queue_index_cursor) != syscall_ok) {
+        logText("Compositor: queue cursor notify cap denied\n");
+        return false;
+    }
     mmioWriteU16(state.cursor_notify_addr, queue_index_cursor);
 
     var spin: usize = 0;
@@ -592,8 +661,13 @@ fn tryRestoreWarmState() bool {
     state.notify_base = notify_page_va + @as(usize, @intCast(readCfgU64(6)));
     state.notify_off_multiplier = @as(usize, @intCast(readCfgU64(9)));
     state.default_scanout_id = @intCast(readCfgU64(10));
+    state.control_submit_token = readCfgU64(cfg_control_submit_token_index);
+    state.control_notify_token = readCfgU64(cfg_control_notify_token_index);
+    state.cursor_submit_token = readCfgU64(cfg_cursor_submit_token_index);
+    state.cursor_notify_token = readCfgU64(cfg_cursor_notify_token_index);
     if (state.notify_off_multiplier == 0) return false;
 
+    if (state.control_submit_token == 0 or state.control_notify_token == 0 or state.cursor_submit_token == 0 or state.cursor_notify_token == 0) return false;
     if (!loadPreallocatedQueuePaddrs()) return false;
     state.queue_size = @intCast(readCfgU64(cfg_queue_size_index));
     state.cursor_queue_size = @intCast(readCfgU64(cfg_cursor_queue_size_index));
@@ -635,6 +709,10 @@ fn initInternal(prewarm: bool) bool {
     const _device_off: usize = @intCast(readCfgU64(8));
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
     state.default_scanout_id = @intCast(readCfgU64(10));
+    state.control_submit_token = readCfgU64(cfg_control_submit_token_index);
+    state.control_notify_token = readCfgU64(cfg_control_notify_token_index);
+    state.cursor_submit_token = readCfgU64(cfg_cursor_submit_token_index);
+    state.cursor_notify_token = readCfgU64(cfg_cursor_notify_token_index);
     if (common_page_paddr < 0x1000 or notify_page_paddr < 0x1000) return false;
 
     state.common_base = common_page_va + common_off;
@@ -645,12 +723,13 @@ fn initInternal(prewarm: bool) bool {
     _ = _isr_off;
     _ = _device_off;
     if (notify_off_multiplier == 0) return false;
+    if (state.control_submit_token == 0 or state.control_notify_token == 0 or state.cursor_submit_token == 0 or state.cursor_notify_token == 0) return false;
     if (!loadPreallocatedQueuePaddrs()) {
         if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return false;
         if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) return false;
 
         var init_paddrs: [init_alloc_page_count]u64 = [_]u64{0} ** init_alloc_page_count;
-        if (allocMapPages(queue_page0_va, init_alloc_page_count, true, @intFromPtr(&init_paddrs), false) != syscall_ok) return false;
+        if (allocUntypedMapPages(queue_page0_va, init_alloc_page_count, true, @intFromPtr(&init_paddrs), false) != syscall_ok) return false;
         inline for (0..init_alloc_page_count) |i| {
             if (init_paddrs[i] < 0x1000) return false;
         }
@@ -717,13 +796,16 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
         zeroResource(resource, allocation.slot_index);
         return null;
     }
+    if (page_count >= 128) {
+        logText("Compositor: create_fb backing alloc begin\n");
+    }
 
     var page_index: usize = 0;
     while (page_index < page_count) {
         const remaining = page_count - page_index;
         const chunk_pages: usize = if (remaining > max_alloc_chunk_pages) max_alloc_chunk_pages else remaining;
         const chunk_base_va = resource.base_va + page_index * 4096;
-        if (allocMapPages(
+        if (allocUntypedMapPages(
             @intCast(chunk_base_va),
             @intCast(chunk_pages),
             true,
@@ -741,6 +823,9 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
             }
         }
         page_index += chunk_pages;
+    }
+    if (page_count >= 128) {
+        logText("Compositor: create_fb backing alloc done\n");
     }
 
     resource.resource_id = state.next_resource_id;
@@ -766,6 +851,9 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
             zeroResource(resource, allocation.slot_index);
             return null;
         }
+    }
+    if (page_count >= 128) {
+        logText("Compositor: create_fb resource_create done\n");
     }
 
     {
@@ -795,6 +883,9 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
             zeroResource(resource, allocation.slot_index);
             return null;
         }
+    }
+    if (page_count >= 128) {
+        logText("Compositor: create_fb attach_backing done\n");
     }
 
     resource.ready = true;

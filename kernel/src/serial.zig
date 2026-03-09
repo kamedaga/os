@@ -14,6 +14,13 @@ fn writeByteInternal(b: u8) void {
     outb(serial_port, b);
 }
 
+pub fn writeRaw(text: []const u8) void {
+    for (text) |ch| {
+        if (ch == '\n') writeByteInternal('\r');
+        writeByteInternal(ch);
+    }
+}
+
 pub fn init() void {
     outb(serial_port + 1, 0x00);
     outb(serial_port + 3, 0x80);
@@ -25,10 +32,7 @@ pub fn init() void {
 }
 
 pub fn write(text: []const u8) void {
-    for (text) |ch| {
-        if (ch == '\n') writeByteInternal('\r');
-        writeByteInternal(ch);
-    }
+    writeRaw(text);
 }
 
 pub fn writeHexRaw(value: u64) void {
