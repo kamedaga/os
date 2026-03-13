@@ -30,6 +30,7 @@ pub const WindowSource = struct {
     pixel_va: usize = 0,
     pixels_paddr: u64 = 0,
     pixels_page_count: usize = 0,
+    dma_pixels: bool = false,
     meta_va: usize = 0,
     observed_meta_seq: u64 = 0,
     width: usize = 0,
@@ -56,8 +57,13 @@ pub const WindowFrame = struct {
 pub const WindowSlot = struct {
     source: WindowSource = .{},
     frame: WindowFrame = .{},
+    z_order: u32 = 0,
     close_hover: bool = false,
     close_down: bool = false,
+    title_draw_x_off: i32 = 0,
+    title_clip_right_off: i32 = 0,
+    title_cache_len: usize = 0,
+    title_cache: [window_title_max_bytes + 3]u8 = [_]u8{0} ** (window_title_max_bytes + 3),
 
     pub fn reset(self: *WindowSlot) void {
         self.* = .{};

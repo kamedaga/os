@@ -127,7 +127,7 @@ pub export fn _start() noreturn {
                     fb[fb_row + x] = color;
                 }
             }
-            window_client.markWindowDirty(window_meta_shared_va);
+            window_client.markWindowDirtyRect(window_meta_shared_va, rect.x, rect.y, rect.width, rect.height);
             _ = userLog("FramebufferServer: rect fill done\n");
             asm volatile ("pause");
             continue;
@@ -158,7 +158,7 @@ pub export fn _start() noreturn {
                     fb[fb_row + x] = src[src_row + x];
                 }
             }
-            window_client.markWindowDirty(window_meta_shared_va);
+            window_client.markWindowDirtyRect(window_meta_shared_va, rect.x, rect.y, rect.width, rect.height);
             _ = userLog("FramebufferServer: rect blit done\n");
             asm volatile ("pause");
             continue;

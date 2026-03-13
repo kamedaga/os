@@ -1,5 +1,28 @@
 const generated = @import("generated_font.zig");
 
+// Keep font data in writable storage so user programs do not depend on direct
+// reads from generated .rodata.
+fn buildRuntimeGlyphs() [generated.glyphs.len]generated.Glyph {
+    @setEvalBranchQuota(generated.glyphs.len * 4);
+    var data: [generated.glyphs.len]generated.Glyph = undefined;
+    inline for (generated.glyphs, 0..) |glyph_data, i| {
+        data[i] = glyph_data;
+    }
+    return data;
+}
+
+fn buildRuntimeGlyphMaskBytes() [generated.glyph_mask_bytes.len]u8 {
+    @setEvalBranchQuota(generated.glyph_mask_bytes.len * 4);
+    var data: [generated.glyph_mask_bytes.len]u8 = undefined;
+    inline for (generated.glyph_mask_bytes, 0..) |byte, i| {
+        data[i] = byte;
+    }
+    return data;
+}
+
+var runtime_glyphs = buildRuntimeGlyphs();
+var runtime_glyph_mask_bytes = buildRuntimeGlyphMaskBytes();
+
 pub const glyph_width: usize = generated.cell_width;
 pub const glyph_height: usize = generated.cell_height;
 pub const glyph_advance: usize = generated.console_advance;
@@ -152,12 +175,11 @@ pub fn measureUtf8Text(text: []const u8, scale: i32) i32 {
 }
 
 fn glyphIndex(codepoint: u21) usize {
-    const glyphs = generated.glyphs[0..];
     var lo: usize = 0;
-    var hi: usize = glyphs.len;
+    var hi: usize = runtime_glyphs.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const candidate = glyphs[mid].codepoint;
+        const candidate = runtime_glyphs[mid].codepoint;
         if (candidate == codepoint) return mid;
         if (candidate < codepoint) {
             lo = mid + 1;
@@ -169,7 +191,7 @@ fn glyphIndex(codepoint: u21) usize {
 }
 
 fn glyph(codepoint: u21) Glyph {
-    const raw = generated.glyphs[glyphIndex(codepoint)];
+    const raw = runtime_glyphs[glyphIndex(codepoint)];
     return .{
         .advance = raw.advance,
         .bearing_x = raw.bearing_x,
@@ -178,6 +200,10 @@ fn glyph(codepoint: u21) Glyph {
         .height = raw.height,
         .mask_offset = raw.mask_offset,
     };
+}
+
+fn glyphMaskByte(offset: usize) u8 {
+    return runtime_glyph_mask_bytes[offset];
 }
 
 pub fn glyphAdvance(codepoint: u21, scale: i32) i32 {
@@ -197,14 +223,13 @@ pub fn drawGlyph(
     const g = glyph(codepoint);
     if (g.width == 0 or g.height == 0) return;
     const scale_px = normalizedScale(scale);
-    const mask = generated.glyph_mask_bytes[g.mask_offset .. g.mask_offset + g.width * g.height];
 
     var gy: usize = 0;
     while (gy < g.height) : (gy += 1) {
         const row_y = y + g.top_offset * scale_px + @as(i32, @intCast(gy)) * scale_px;
         var gx: usize = 0;
         while (gx < g.width) : (gx += 1) {
-            const alpha = mask[gy * g.width + gx];
+            const alpha = glyphMaskByte(g.mask_offset + gy * g.width + gx);
             if (alpha == 0) continue;
 
             const col_x = x + g.bearing_x * scale_px + @as(i32, @intCast(gx)) * scale_px;
@@ -236,18 +261,18 @@ pub fn drawGlyphSubpixel(
     const g = glyph(codepoint);
     if (g.width == 0 or g.height == 0) return;
     const scale_px = normalizedScale(scale);
-    const mask = generated.glyph_mask_bytes[g.mask_offset .. g.mask_offset + g.width * g.height];
 
     var gy: usize = 0;
     while (gy < g.height) : (gy += 1) {
         const row_y = y + g.top_offset * scale_px + @as(i32, @intCast(gy)) * scale_px;
         var gx: usize = 0;
         while (gx < g.width) : (gx += 1) {
-            const alpha_g = mask[gy * g.width + gx];
+            const mask_index = g.mask_offset + gy * g.width + gx;
+            const alpha_g = glyphMaskByte(mask_index);
             if (alpha_g == 0) continue;
 
-            const alpha_r = subpixelAlpha(alpha_g, if (gx > 0) mask[gy * g.width + gx - 1] else 0);
-            const alpha_b = subpixelAlpha(alpha_g, if (gx + 1 < g.width) mask[gy * g.width + gx + 1] else 0);
+            const alpha_r = subpixelAlpha(alpha_g, if (gx > 0) glyphMaskByte(mask_index - 1) else 0);
+            const alpha_b = subpixelAlpha(alpha_g, if (gx + 1 < g.width) glyphMaskByte(mask_index + 1) else 0);
             const col_x = x + g.bearing_x * scale_px + @as(i32, @intCast(gx)) * scale_px;
 
             var sy: i32 = 0;

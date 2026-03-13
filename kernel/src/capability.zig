@@ -2,8 +2,8 @@ const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 
 pub const UserAddressSpace = struct {
-    // The current user VA window is below 512 MiB, so 256 PT pages are sufficient.
-    pub const max_dynamic_pt_pages: usize = 256;
+    // Includes user VA mappings plus supervisor-only helper PTs for return stacks.
+    pub const max_dynamic_pt_pages: usize = 320;
     pub const no_pd_index: u16 = 0xFFFF;
 
     pml4: [512]u64 align(4096) = [_]u64{0} ** 512,
@@ -44,6 +44,131 @@ pub const PageFaultCapability = struct {
 
 var runtime_ready = false;
 var runtime: RuntimeConfig = undefined;
+var lookup_diag_count: u64 = 0;
+const process5_meta_head_bytes: usize = 32;
+const process5_meta_tail_bytes: usize = 16;
+var process5_meta_head_shadow: [process5_meta_head_bytes]u8 = [_]u8{0} ** process5_meta_head_bytes;
+var process5_meta_tail_shadow: [process5_meta_tail_bytes]u8 = [_]u8{0} ** process5_meta_tail_bytes;
+var process5_meta_shadow_valid = false;
+
+fn shouldLogLookupDiag(principal: kernel.PrincipalId) bool {
+    _ = principal;
+    return false;
+}
+
+fn logLookupSpaceDiag(prefix: []const u8, principal: kernel.PrincipalId, space: *const UserAddressSpace) void {
+    runtime.serial_write(prefix);
+    runtime.serial_write(" proc=");
+    runtime.serial_write(runtime.principal_label(principal));
+    runtime.serial_write(" space=");
+    runtime.print_hex(@intFromPtr(space));
+    runtime.serial_write(" used=");
+    runtime.print_hex(space.pt_page_used_len);
+    runtime.serial_write(" cr3=");
+    runtime.print_hex(space.cr3);
+    runtime.serial_write(" pd256=");
+    runtime.print_hex(space.pd[256]);
+    runtime.serial_write(" pd257=");
+    runtime.print_hex(space.pd[257]);
+    runtime.serial_write(" pd479=");
+    runtime.print_hex(space.pd[479]);
+    runtime.serial_write(" pd480=");
+    runtime.print_hex(space.pd[480]);
+    runtime.serial_write(" meta0=");
+    runtime.print_hex(space.pt_page_pd_index[0]);
+    runtime.serial_write(" meta1=");
+    runtime.print_hex(space.pt_page_pd_index[1]);
+    runtime.serial_write(" meta2=");
+    runtime.print_hex(space.pt_page_pd_index[2]);
+    runtime.serial_write(" meta130=");
+    runtime.print_hex(space.pt_page_pd_index[130]);
+    runtime.serial_write("\n");
+}
+
+fn logProcess5Diag(prefix: []const u8) void {
+    if (!runtime_ready) return;
+    const index = processIndex(.Process5) orelse return;
+    if (index >= runtime.user_spaces.len) return;
+    logLookupSpaceDiag(prefix, .Process5, &runtime.user_spaces[index]);
+}
+
+fn process5MetaHeadPtr() ?[*]const u8 {
+    const space = getUserSpace(.Process5) orelse return null;
+    return @ptrCast(&space.pt_page_pd_index[0]);
+}
+
+fn process5MetaTailPtr() ?[*]const u8 {
+    const space = getUserSpace(.Process5) orelse return null;
+    return @ptrCast(&space.pt_page_used_len);
+}
+
+fn logByteWindow(prefix: []const u8, bytes: []const u8) void {
+    runtime.serial_write(prefix);
+    runtime.serial_write("=");
+    for (bytes, 0..) |b, i| {
+        if (i != 0) runtime.serial_write(" ");
+        runtime.print_hex(b);
+    }
+    runtime.serial_write("\n");
+}
+
+fn snapshotProcess5MetaWindows() void {
+    const head = process5MetaHeadPtr() orelse return;
+    const tail = process5MetaTailPtr() orelse return;
+    @memcpy(process5_meta_head_shadow[0..], head[0..process5_meta_head_bytes]);
+    @memcpy(process5_meta_tail_shadow[0..], tail[0..process5_meta_tail_bytes]);
+    process5_meta_shadow_valid = true;
+}
+
+fn logProcess5MetaWindows(prefix: []const u8) void {
+    const head = process5MetaHeadPtr() orelse return;
+    const tail = process5MetaTailPtr() orelse return;
+    runtime.serial_write(prefix);
+    runtime.serial_write("\n");
+    logByteWindow("  head", head[0..process5_meta_head_bytes]);
+    logByteWindow("  tail", tail[0..process5_meta_tail_bytes]);
+}
+
+fn logProcess5MetaWindowChanges(prefix: []const u8) void {
+    const head = process5MetaHeadPtr() orelse return;
+    const tail = process5MetaTailPtr() orelse return;
+    if (!process5_meta_shadow_valid) {
+        runtime.serial_write(prefix);
+        runtime.serial_write(" shadow=unset\n");
+        return;
+    }
+
+    var changed = false;
+    runtime.serial_write(prefix);
+    runtime.serial_write("\n");
+    for (head[0..process5_meta_head_bytes], 0..) |b, i| {
+        const old = process5_meta_head_shadow[i];
+        if (b == old) continue;
+        changed = true;
+        runtime.serial_write("  head[");
+        runtime.print_hex(@intCast(i));
+        runtime.serial_write("] ");
+        runtime.print_hex(old);
+        runtime.serial_write(" -> ");
+        runtime.print_hex(b);
+        runtime.serial_write("\n");
+    }
+    for (tail[0..process5_meta_tail_bytes], 0..) |b, i| {
+        const old = process5_meta_tail_shadow[i];
+        if (b == old) continue;
+        changed = true;
+        runtime.serial_write("  tail[");
+        runtime.print_hex(@intCast(i));
+        runtime.serial_write("] ");
+        runtime.print_hex(old);
+        runtime.serial_write(" -> ");
+        runtime.print_hex(b);
+        runtime.serial_write("\n");
+    }
+    if (!changed) {
+        runtime.serial_write("  unchanged\n");
+    }
+}
 
 pub fn init(config: RuntimeConfig) void {
     runtime = config;
@@ -72,11 +197,32 @@ pub fn isUserCanonicalVa(va: u64) bool {
 
 pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     const space = getUserSpace(principal) orelse return null;
+    if (shouldLogLookupDiag(principal)) {
+        lookup_diag_count +%= 1;
+        runtime.serial_write("lookup enter va=");
+        runtime.print_hex(va);
+        runtime.serial_write("\n");
+        logLookupSpaceDiag("lookup pre", principal, space);
+    }
     const pd_index = userPdIndexForVa(va) orelse return null;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
     const slot = findPtSlotForPd(space, pd_index) orelse return null;
     const entry = space.pt_pages[slot][pt_index];
     const paddr = entry & runtime.page_addr_mask;
+    if (shouldLogLookupDiag(principal)) {
+        runtime.serial_write("lookup mid pd=");
+        runtime.print_hex(@intCast(pd_index));
+        runtime.serial_write(" slot=");
+        runtime.print_hex(@intCast(slot));
+        runtime.serial_write(" pt=");
+        runtime.print_hex(@intCast(pt_index));
+        runtime.serial_write(" entry=");
+        runtime.print_hex(entry);
+        runtime.serial_write(" paddr=");
+        runtime.print_hex(paddr);
+        runtime.serial_write("\n");
+        logLookupSpaceDiag("lookup post", principal, space);
+    }
     if (paddr == 0) return null;
     return paddr;
 }
@@ -110,11 +256,98 @@ fn aliasVaForPdPt(pd_index: usize, pt_index: usize) u64 {
         (@as(u64, @intCast(pt_index)) << 12);
 }
 
-fn findPtSlotForPd(space: *const UserAddressSpace, pd_index: usize) ?usize {
-    var slot: usize = 0;
-    const used_len: usize = @intCast(space.pt_page_used_len);
-    while (slot < used_len) : (slot += 1) {
-        if (space.pt_page_pd_index[slot] == pd_index) return slot;
+fn slotPtPa(space: *const UserAddressSpace, slot: usize) u64 {
+    return @intFromPtr(&space.pt_pages[slot]);
+}
+
+fn slotHasAnyMappedPaddr(space: *const UserAddressSpace, slot: usize) bool {
+    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return true;
+    var i: usize = 0;
+    while (i < runtime.page_entries) : (i += 1) {
+        if ((space.pt_pages[slot][i] & runtime.page_addr_mask) != 0) return true;
+    }
+    return false;
+}
+
+fn pdIndexForPtSlot(space: *const UserAddressSpace, slot: usize) ?usize {
+    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return null;
+    const pt_pa = slotPtPa(space, slot);
+    var pd_index: usize = 0;
+    while (pd_index < 512) : (pd_index += 1) {
+        const pde = space.pd[pd_index];
+        if ((pde & runtime.page_present) == 0) continue;
+        if ((pde & (@as(u64, 1) << 7)) != 0) continue; // huge page
+        if ((pde & runtime.page_addr_mask) == pt_pa) return pd_index;
+    }
+    return null;
+}
+
+fn findPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
+    if (pd_index >= 512) return null;
+
+    const principal = blk: {
+        var i: usize = 0;
+        while (i < runtime.user_spaces.len) : (i += 1) {
+            if (&runtime.user_spaces[i] == space) {
+                break :blk principalFromProcessIndex(i);
+            }
+        }
+        break :blk null;
+    };
+    if (principal) |proc| {
+        if (shouldLogLookupDiag(proc)) {
+            runtime.serial_write("findPtSlot enter pd=");
+            runtime.print_hex(@intCast(pd_index));
+            runtime.serial_write("\n");
+            logLookupSpaceDiag("findPtSlot pre", proc, space);
+        }
+    }
+
+    const pde = space.pd[pd_index];
+    if ((pde & runtime.page_present) != 0 and (pde & (@as(u64, 1) << 7)) == 0) {
+        const pt_pa = pde & runtime.page_addr_mask;
+        var slot_by_pd: usize = 0;
+        while (slot_by_pd < UserAddressSpace.max_dynamic_pt_pages) : (slot_by_pd += 1) {
+            if (slotPtPa(space, slot_by_pd) == pt_pa) {
+                if (principal) |proc| {
+                    if (shouldLogLookupDiag(proc)) {
+                        runtime.serial_write("findPtSlot pde_match slot=");
+                        runtime.print_hex(@intCast(slot_by_pd));
+                        runtime.serial_write(" pt_pa=");
+                        runtime.print_hex(pt_pa);
+                        runtime.serial_write("\n");
+                        logLookupSpaceDiag("findPtSlot pde_post", proc, space);
+                    }
+                }
+                return slot_by_pd;
+            }
+        }
+    }
+
+    // Fallback to metadata if pd entry was not initialized yet.
+    var slot_meta: usize = 0;
+    while (slot_meta < UserAddressSpace.max_dynamic_pt_pages) : (slot_meta += 1) {
+        if (space.pt_page_pd_index[slot_meta] == UserAddressSpace.no_pd_index) continue;
+        if (space.pt_page_pd_index[slot_meta] == pd_index) {
+            // Self-heal stale/missing PD entry from metadata.
+            const pt_pa = slotPtPa(space, slot_meta);
+            space.pd[pd_index] = pt_pa | runtime.page_present | runtime.page_rw | runtime.page_user;
+            const next_len = slot_meta + 1;
+            if (next_len > space.pt_page_used_len) {
+                space.pt_page_used_len = @intCast(next_len);
+            }
+            if (principal) |proc| {
+                if (shouldLogLookupDiag(proc)) {
+                    runtime.serial_write("findPtSlot meta_match slot=");
+                    runtime.print_hex(@intCast(slot_meta));
+                    runtime.serial_write(" pt_pa=");
+                    runtime.print_hex(pt_pa);
+                    runtime.serial_write("\n");
+                    logLookupSpaceDiag("findPtSlot meta_post", proc, space);
+                }
+            }
+            return slot_meta;
+        }
     }
     return null;
 }
@@ -123,17 +356,94 @@ fn ensurePtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     if (pd_index >= 512) return null;
     if (findPtSlotForPd(space, pd_index)) |existing| return existing;
 
-    var used_len: usize = @intCast(space.pt_page_used_len);
-    if (used_len >= UserAddressSpace.max_dynamic_pt_pages) return null;
-
-    const slot = used_len;
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        if (space.pt_page_pd_index[slot] != UserAddressSpace.no_pd_index) continue;
+        if (pdIndexForPtSlot(space, slot) != null) continue;
+        if (slotHasAnyMappedPaddr(space, slot)) continue;
+        break;
+    }
+    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return null;
     space.pt_page_pd_index[slot] = @intCast(pd_index);
     @memset(space.pt_pages[slot][0..], 0);
     const pt_pa = @intFromPtr(&space.pt_pages[slot]);
     space.pd[pd_index] = pt_pa | runtime.page_present | runtime.page_rw | runtime.page_user;
-    used_len += 1;
-    space.pt_page_used_len = @intCast(used_len);
+    const next_len = slot + 1;
+    if (next_len > space.pt_page_used_len) {
+        space.pt_page_used_len = @intCast(next_len);
+    }
     return slot;
+}
+
+fn shouldLogMapMmioDiag(principal: kernel.PrincipalId, va: u64) bool {
+    _ = principal;
+    _ = va;
+    return false;
+}
+
+noinline fn logMapMmioDiagEnter(va: u64, paddr: u64) void {
+    runtime.serial_write("map_mmio_diag enter va=");
+    runtime.print_hex(va);
+    runtime.serial_write(" paddr=");
+    runtime.print_hex(paddr);
+    runtime.serial_write("\n");
+    logProcess5MetaWindows("map_mmio_diag proc5 pre");
+    snapshotProcess5MetaWindows();
+}
+
+noinline fn logMapMmioDiagPostEnsure(pd_index: usize, pt_index: usize, map_slot: usize) void {
+    runtime.serial_write("map_mmio_diag slot=");
+    runtime.print_hex(@intCast(map_slot));
+    runtime.serial_write(" pd=");
+    runtime.print_hex(@intCast(pd_index));
+    runtime.serial_write(" pt=");
+    runtime.print_hex(@intCast(pt_index));
+    runtime.serial_write("\n");
+    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_ensure");
+    snapshotProcess5MetaWindows();
+}
+
+noinline fn logMapMmioDiagPostAliasLoop(space: *UserAddressSpace, map_slot: usize, pt_index: usize) void {
+    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_alias_loop");
+    runtime.serial_write("map_mmio_diag dst_pte=");
+    runtime.print_hex(@intFromPtr(&space.pt_pages[map_slot][pt_index]));
+    runtime.serial_write(" proc5_meta0=");
+    runtime.print_hex(@intFromPtr(&runtime.user_spaces[5].pt_page_pd_index[0]));
+    runtime.serial_write("\n");
+    snapshotProcess5MetaWindows();
+}
+
+noinline fn logMapMmioDiagPostPteWrite() void {
+    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_pte_write");
+    snapshotProcess5MetaWindows();
+}
+
+noinline fn logMapMmioDiagPostMap() void {
+    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_map");
+}
+
+noinline fn clearAliasMappings(
+    space: *UserAddressSpace,
+    principal: kernel.PrincipalId,
+    paddr: u64,
+    map_slot: usize,
+    pt_index: usize,
+) void {
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
+        const pt_page = &space.pt_pages[slot];
+        var i: usize = 0;
+        while (i < runtime.page_entries) : (i += 1) {
+            if (slot == map_slot and i == pt_index) continue;
+            const entry = pt_page[i];
+            if ((entry & runtime.page_addr_mask) != paddr) continue;
+            if (entry == 0) continue;
+            pt_page[i] = 0;
+            const alias_va = aliasVaForPdPt(slot_pd_index, i);
+            runtime.flush_user_tlb_for_principal_va(principal, alias_va);
+        }
+    }
 }
 
 pub fn issuePageFaultCapability(
@@ -185,6 +495,8 @@ pub fn mapUserPageFromCapability(
 ) bool {
     if (!runtime_ready) return false;
     const space = getUserSpace(principal) orelse return false;
+    const diag = shouldLogMapMmioDiag(principal, va);
+    if (diag) logMapMmioDiagEnter(va, paddr);
     if ((va & 0xFFF) != 0) return false;
     if ((paddr & 0xFFF) != 0) return false;
     if (paddr >= runtime.physical_map_limit) return false;
@@ -192,30 +504,19 @@ pub fn mapUserPageFromCapability(
     const pd_index = userPdIndexForVa(va) orelse return false;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
     const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
+    if (diag) logMapMmioDiagPostEnsure(pd_index, pt_index, map_slot);
 
     const cap = state.getTableConst(principal).find(paddr) orelse return false;
     if (!cap.rights.cpu_read) return false;
     if (writable and !cap.rights.cpu_write) return false;
 
-    var slot: usize = 0;
-    const used_len: usize = @intCast(space.pt_page_used_len);
-    while (slot < used_len) : (slot += 1) {
-        const slot_pd_index_u16 = space.pt_page_pd_index[slot];
-        const slot_pd_index: usize = @intCast(slot_pd_index_u16);
-        var i: usize = 0;
-        while (i < runtime.page_entries) : (i += 1) {
-            if (slot == map_slot and i == pt_index) continue;
-            const entry = space.pt_pages[slot][i];
-            if ((entry & runtime.page_addr_mask) != paddr) continue;
-            if (entry == 0) continue;
-            space.pt_pages[slot][i] = 0;
-            const alias_va = aliasVaForPdPt(slot_pd_index, i);
-            runtime.flush_user_tlb_for_principal_va(principal, alias_va);
-        }
-    }
+    clearAliasMappings(space, principal, paddr, map_slot, pt_index);
+    if (diag) logMapMmioDiagPostAliasLoop(space, map_slot, pt_index);
 
     space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    if (diag) logMapMmioDiagPostPteWrite();
     runtime.flush_user_tlb_for_principal_va(principal, va);
+    if (diag) logMapMmioDiagPostMap();
     return true;
 }
 
@@ -293,11 +594,42 @@ pub fn mapFreshUserPage(
     if ((paddr & 0xFFF) != 0) return false;
     if (paddr >= runtime.physical_map_limit) return false;
 
-    const pd_index = userPdIndexForVa(va) orelse return false;
+    const pd_index = userPdIndexForVa(va) orelse {
+        runtime.serial_write("mapFreshUserPage fail: bad user VA proc=");
+        runtime.serial_write(runtime.principal_label(principal));
+        runtime.serial_write(" va=");
+        runtime.print_hex(va);
+        runtime.serial_write("\n");
+        return false;
+    };
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
-    const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
+    const map_slot = ensurePtSlotForPd(space, pd_index) orelse {
+        runtime.serial_write("mapFreshUserPage fail: ensurePtSlot proc=");
+        runtime.serial_write(runtime.principal_label(principal));
+        runtime.serial_write(" va=");
+        runtime.print_hex(va);
+        runtime.serial_write(" pd=");
+        runtime.print_hex(@intCast(pd_index));
+        runtime.serial_write(" used=");
+        runtime.print_hex(space.pt_page_used_len);
+        runtime.serial_write("\n");
+        return false;
+    };
     const old_entry = space.pt_pages[map_slot][pt_index];
-    if ((old_entry & runtime.page_present) != 0) return false;
+    if ((old_entry & runtime.page_present) != 0) {
+        runtime.serial_write("mapFreshUserPage fail: already_present proc=");
+        runtime.serial_write(runtime.principal_label(principal));
+        runtime.serial_write(" va=");
+        runtime.print_hex(va);
+        runtime.serial_write(" paddr=");
+        runtime.print_hex(paddr);
+        runtime.serial_write(" slot=");
+        runtime.print_hex(@intCast(map_slot));
+        runtime.serial_write(" old=");
+        runtime.print_hex(old_entry);
+        runtime.serial_write("\n");
+        return false;
+    }
 
     space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     runtime.flush_user_tlb_for_principal_va(principal, va);
@@ -313,10 +645,8 @@ pub fn dropPresentForUserMappedPaddr(
     const space = getUserSpace(principal) orelse return false;
     _ = state.getTableConst(principal).find(paddr) orelse return false;
     var slot: usize = 0;
-    const used_len: usize = @intCast(space.pt_page_used_len);
-    while (slot < used_len) : (slot += 1) {
-        const slot_pd_index_u16 = space.pt_page_pd_index[slot];
-        const slot_pd_index: usize = @intCast(slot_pd_index_u16);
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
         var i: usize = 0;
         while (i < runtime.page_entries) : (i += 1) {
             const entry = space.pt_pages[slot][i];
@@ -330,21 +660,16 @@ pub fn dropPresentForUserMappedPaddr(
     return false;
 }
 
-pub fn syncPageTableRightsForPrincipalPaddr(
-    state: *const kernel.KernelState,
+noinline fn syncPageTableRightsScan(
+    space: *UserAddressSpace,
     principal: kernel.PrincipalId,
     paddr: u64,
+    cap: ?*const kernel.Capability,
 ) void {
-    if (!runtime_ready) return;
-    const space = getUserSpace(principal) orelse return;
-    const cap = state.getTableConst(principal).find(paddr);
     var kept_one = false;
-
     var slot: usize = 0;
-    const used_len: usize = @intCast(space.pt_page_used_len);
-    while (slot < used_len) : (slot += 1) {
-        const slot_pd_index_u16 = space.pt_page_pd_index[slot];
-        const slot_pd_index: usize = @intCast(slot_pd_index_u16);
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
         var i: usize = 0;
         while (i < runtime.page_entries) : (i += 1) {
             const old_entry = space.pt_pages[slot][i];
@@ -366,6 +691,17 @@ pub fn syncPageTableRightsForPrincipalPaddr(
             runtime.flush_user_tlb_for_principal_va(principal, va);
         }
     }
+}
+
+pub fn syncPageTableRightsForPrincipalPaddr(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    paddr: u64,
+) void {
+    if (!runtime_ready) return;
+    const space = getUserSpace(principal) orelse return;
+    const cap = state.getTableConst(principal).find(paddr);
+    syncPageTableRightsScan(space, principal, paddr, cap);
 }
 
 pub fn syncPageTableRightsForPaddr(state: *const kernel.KernelState, paddr: u64) void {

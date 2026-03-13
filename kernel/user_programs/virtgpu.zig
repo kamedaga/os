@@ -65,6 +65,8 @@ const mem_entries_region_bytes: usize = mem_entries_page1_va + 4096 - mem_entrie
 const wait_poll_limit: usize = 100_000;
 const cursor_dim: usize = 64;
 const warm_state_magic: u64 = 0x56475057; // "VGPW"
+const state_canary_magic: u64 = 0x5653544154453031; // "VSTATE01"
+const resource_canary_magic: u64 = 0x5652535243303031; // "VRSRC001"
 const cfg_warm_state_index: usize = 11;
 const cfg_queue_paddr0_index: usize = 12;
 const cfg_queue_paddr1_index: usize = 13;
@@ -180,6 +182,7 @@ const VirtioGpuUpdateCursor = extern struct {
 };
 
 pub const Resource = struct {
+    canary: u64 = resource_canary_magic,
     in_use: bool = false,
     ready: bool = false,
     slot_index: usize = 0,
@@ -191,10 +194,12 @@ pub const Resource = struct {
     bytes_len: usize = 0,
     page_count: usize = 0,
     pixels: [*]volatile u32 = @ptrFromInt(backing_base_va),
-    backing_paddrs: [max_backing_pages]u64 = [_]u64{0} ** max_backing_pages,
 };
 
+pub const ResourceHandle = usize;
+
 const State = struct {
+    canary: u64 = state_canary_magic,
     init_attempted: bool = false,
     ready: bool = false,
     common_base: usize = 0,
@@ -215,7 +220,7 @@ const State = struct {
     mem_entries_paddr1: u64 = 0,
     next_resource_id: u32 = 1,
     default_scanout_id: u32 = 0,
-    cursor_resource: ?*Resource = null,
+    cursor_resource: ?ResourceHandle = null,
     cursor_hot_x: u32 = 0,
     cursor_hot_y: u32 = 0,
     control_submit_token: u64 = 0,
@@ -226,6 +231,7 @@ const State = struct {
 
 var state: State = .{};
 var resources: [max_resources]Resource = [_]Resource{.{}} ** max_resources;
+var resource_backing_paddrs_scratch: [max_backing_pages]u64 = [_]u64{0} ** max_backing_pages;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -425,6 +431,38 @@ fn logText(text: []const u8) void {
     _ = userLog(text);
 }
 
+fn stateLooksValid() bool {
+    if (state.canary != state_canary_magic) return false;
+    if (state.ready) {
+        if (state.common_base < common_page_va or state.common_base >= common_page_va + 4096) return false;
+        if (state.notify_base < notify_page_va or state.notify_base >= notify_page_va + 4096) return false;
+        if (state.notify_addr < notify_page_va or state.notify_addr >= notify_page_va + 4096) return false;
+        if (state.cursor_notify_addr < notify_page_va or state.cursor_notify_addr >= notify_page_va + 4096) return false;
+        if (state.queue_size < 4 or state.queue_size > requested_queue_size) return false;
+        if (state.cursor_queue_size < 2 or state.cursor_queue_size > requested_queue_size) return false;
+    }
+    return true;
+}
+
+fn resourceLooksValid(resource: *const Resource) bool {
+    if (resource.canary != resource_canary_magic) return false;
+    if (resource.slot_index >= max_resources) return false;
+    const expected_base = resourceBaseVa(resource.slot_index);
+    const pixels_addr = @intFromPtr(resource.pixels);
+    if (resource.base_va != expected_base) return false;
+    if (pixels_addr != expected_base) return false;
+    if (resource.page_count > max_backing_pages) return false;
+    if (resource.bytes_len > resource_backing_span) return false;
+    return true;
+}
+
+fn requireStateHealthy(context: []const u8) bool {
+    if (stateLooksValid()) return true;
+    logText(context);
+    logText(": virtgpu state corrupt\n");
+    return false;
+}
+
 fn isSyscallError(value: u64) bool {
     return value != 0 and value <= 13;
 }
@@ -450,6 +488,7 @@ fn cursorQueuePushAvail(head_desc: u16) void {
 }
 
 fn submitCommand(req_len: usize, extra_len: usize, expected_resp_type: u32) bool {
+    if (!requireStateHealthy("submitCommand")) return false;
     if (!state.ready) return false;
 
     clearBytes(control_page_va + control_response_offset, @sizeOf(VirtioGpuCtrlHdr));
@@ -536,6 +575,7 @@ fn submitCommand(req_len: usize, extra_len: usize, expected_resp_type: u32) bool
 }
 
 fn submitCursorCommand(req_len: usize) bool {
+    if (!requireStateHealthy("submitCursorCommand")) return false;
     if (!state.ready or state.cursor_queue_size < 2) return false;
 
     var desc = cursorQueueDescPtr(0);
@@ -657,8 +697,18 @@ fn recordWarmState() void {
 fn tryRestoreWarmState() bool {
     if (readCfgU64(cfg_warm_state_index) != warm_state_magic) return false;
 
-    state.common_base = common_page_va + @as(usize, @intCast(readCfgU64(5)));
-    state.notify_base = notify_page_va + @as(usize, @intCast(readCfgU64(6)));
+    const common_page_paddr = readCfgU64(1);
+    const notify_page_paddr = readCfgU64(2);
+    if (common_page_paddr < 0x1000 or notify_page_paddr < 0x1000) return false;
+    const common_off_raw = readCfgU64(5);
+    const notify_off_raw = readCfgU64(6);
+    if (common_off_raw >= 4096 or notify_off_raw >= 4096) {
+        logText("Compositor: virtgpu warm restore rejected (bad cfg offset)\n");
+        return false;
+    }
+
+    state.common_base = common_page_va + @as(usize, @intCast(common_off_raw));
+    state.notify_base = notify_page_va + @as(usize, @intCast(notify_off_raw));
     state.notify_off_multiplier = @as(usize, @intCast(readCfgU64(9)));
     state.default_scanout_id = @intCast(readCfgU64(10));
     state.control_submit_token = readCfgU64(cfg_control_submit_token_index);
@@ -672,6 +722,8 @@ fn tryRestoreWarmState() bool {
     state.queue_size = @intCast(readCfgU64(cfg_queue_size_index));
     state.cursor_queue_size = @intCast(readCfgU64(cfg_cursor_queue_size_index));
     if (state.queue_size < 4 or state.cursor_queue_size < 2) return false;
+    if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return false;
+    if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) return false;
 
     mmioWriteU16(state.common_base + common_queue_select, queue_index_control);
     state.notify_addr = state.notify_base +
@@ -689,11 +741,8 @@ fn tryRestoreWarmState() bool {
 }
 
 fn initInternal(prewarm: bool) bool {
+    if (!requireStateHealthy("initInternal-pre")) return false;
     if (state.ready) return true;
-    if (!prewarm and tryRestoreWarmState()) {
-        logText("Compositor: virtgpu queue ready\n");
-        return true;
-    }
     if (state.init_attempted) return false;
     state.init_attempted = true;
     logText(if (prewarm) "BootLogConsole: virtgpu prewarm start\n" else "Compositor: virtgpu init start\n");
@@ -703,8 +752,14 @@ fn initInternal(prewarm: bool) bool {
     const notify_page_paddr = readCfgU64(2);
     const _isr_page_paddr = readCfgU64(3);
     const _device_page_paddr = readCfgU64(4);
-    const common_off: usize = @intCast(readCfgU64(5));
-    const notify_off: usize = @intCast(readCfgU64(6));
+    const common_off_raw = readCfgU64(5);
+    const notify_off_raw = readCfgU64(6);
+    if (common_off_raw >= 4096 or notify_off_raw >= 4096) {
+        logText("Compositor: virtgpu init rejected (bad cfg offset)\n");
+        return false;
+    }
+    const common_off: usize = @intCast(common_off_raw);
+    const notify_off: usize = @intCast(notify_off_raw);
     const _isr_off: usize = @intCast(readCfgU64(7));
     const _device_off: usize = @intCast(readCfgU64(8));
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
@@ -724,26 +779,31 @@ fn initInternal(prewarm: bool) bool {
     _ = _device_off;
     if (notify_off_multiplier == 0) return false;
     if (state.control_submit_token == 0 or state.control_notify_token == 0 or state.cursor_submit_token == 0 or state.cursor_notify_token == 0) return false;
-    if (!loadPreallocatedQueuePaddrs()) {
-        if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return false;
-        if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) return false;
+    // Queue/control backing pages are process-local mappings. Reusing physical
+    // addresses recorded by a different process corrupts the virtqueue state.
+    if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return false;
+    if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) return false;
 
-        var init_paddrs: [init_alloc_page_count]u64 = [_]u64{0} ** init_alloc_page_count;
-        if (allocUntypedMapPages(queue_page0_va, init_alloc_page_count, true, @intFromPtr(&init_paddrs), false) != syscall_ok) return false;
-        inline for (0..init_alloc_page_count) |i| {
-            if (init_paddrs[i] < 0x1000) return false;
-        }
-        state.queue_paddr0 = init_paddrs[0];
-        state.queue_paddr1 = init_paddrs[1];
-        state.control_page_paddr = init_paddrs[2];
-        state.mem_entries_paddr0 = init_paddrs[3];
-        state.mem_entries_paddr1 = init_paddrs[4];
-        state.cursor_queue_paddr0 = init_paddrs[5];
-        state.cursor_queue_paddr1 = init_paddrs[6];
+    var init_paddrs: [init_alloc_page_count]u64 = [_]u64{0} ** init_alloc_page_count;
+    if (allocUntypedMapPages(queue_page0_va, init_alloc_page_count, true, @intFromPtr(&init_paddrs), false) != syscall_ok) return false;
+    inline for (0..init_alloc_page_count) |i| {
+        if (init_paddrs[i] < 0x1000) return false;
     }
+    state.queue_paddr0 = init_paddrs[0];
+    state.queue_paddr1 = init_paddrs[1];
+    state.control_page_paddr = init_paddrs[2];
+    state.mem_entries_paddr0 = init_paddrs[3];
+    state.mem_entries_paddr1 = init_paddrs[4];
+    state.cursor_queue_paddr0 = init_paddrs[5];
+    state.cursor_queue_paddr1 = init_paddrs[6];
+    clearBytes(queue_page0_va, queue_region_bytes);
+    clearBytes(cursor_queue_page0_va, cursor_queue_region_bytes);
+    clearBytes(control_page_va, 4096);
+    clearBytes(mem_entries_page0_va, mem_entries_region_bytes);
     if (!initQueue()) return false;
 
     state.ready = true;
+    if (!requireStateHealthy("initInternal-post")) return false;
     recordWarmState();
     logText(if (prewarm) "BootLogConsole: virtgpu prewarm ready\n" else "Compositor: virtgpu queue ready\n");
     return true;
@@ -761,11 +821,28 @@ fn resourceBaseVa(slot_index: usize) usize {
     return backing_base_va + slot_index * resource_backing_span;
 }
 
+fn resourcePixelsLooksValid(resource: *const Resource) bool {
+    return resourceLooksValid(resource);
+}
+
 fn zeroResource(resource: *Resource, slot_index: usize) void {
     resource.* = .{};
+    resource.canary = resource_canary_magic;
     resource.slot_index = slot_index;
     resource.base_va = resourceBaseVa(slot_index);
     resource.pixels = @ptrFromInt(resource.base_va);
+}
+
+fn getResource(handle: ResourceHandle) ?*Resource {
+    if (!requireStateHealthy("getResource")) return null;
+    if (handle >= resources.len) return null;
+    const resource = &resources[handle];
+    if (!resource.in_use or !resource.ready) return null;
+    if (!resourcePixelsLooksValid(resource)) {
+        logText("Compositor: virtgpu resource pointer rejected\n");
+        return null;
+    }
+    return resource;
 }
 
 fn allocResourceSlot() ?struct { resource: *Resource, slot_index: usize } {
@@ -783,12 +860,14 @@ fn allocResourceSlot() ?struct { resource: *Resource, slot_index: usize } {
     return null;
 }
 
-fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource {
+fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceHandle {
+    if (!requireStateHealthy("createResourceWithFormat")) return null;
     if (!state.ready and !virtgpu_init()) return null;
     if (width == 0 or height == 0) return null;
 
     const allocation = allocResourceSlot() orelse return null;
     const resource = allocation.resource;
+    const backing_paddrs = resource_backing_paddrs_scratch[0..];
     const stride_bytes = width * 4;
     const total_bytes = stride_bytes * height;
     const page_count = (total_bytes + 4095) / 4096;
@@ -809,7 +888,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
             @intCast(chunk_base_va),
             @intCast(chunk_pages),
             true,
-            @intFromPtr(&resource.backing_paddrs[page_index]),
+            @intFromPtr(&backing_paddrs[page_index]),
             true,
         ) != syscall_ok) {
             zeroResource(resource, allocation.slot_index);
@@ -817,7 +896,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
         }
         var i: usize = 0;
         while (i < chunk_pages) : (i += 1) {
-            if (resource.backing_paddrs[page_index + i] < 0x1000) {
+            if (backing_paddrs[page_index + i] < 0x1000) {
                 zeroResource(resource, allocation.slot_index);
                 return null;
             }
@@ -862,7 +941,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
         while (i < page_count) : (i += 1) {
             const entry: *VirtioGpuMemEntry = @ptrFromInt(mem_entries_page0_va + i * @sizeOf(VirtioGpuMemEntry));
             entry.* = .{
-                .addr = resource.backing_paddrs[i],
+                .addr = backing_paddrs[i],
                 .length = 4096,
                 .padding = 0,
             };
@@ -889,10 +968,10 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?*Resource
     }
 
     resource.ready = true;
-    return resource;
+    return allocation.slot_index;
 }
 
-pub fn virtgpu_create_resource(width: usize, height: usize) ?*Resource {
+pub fn virtgpu_create_resource(width: usize, height: usize) ?ResourceHandle {
     return createResourceWithFormat(width, height, virtio_gpu_format_b8g8r8x8_unorm);
 }
 
@@ -901,7 +980,7 @@ pub fn virtgpu_create_resource_from_single_page(
     height: usize,
     backing_paddr: u64,
     pixels_va: usize,
-) ?*Resource {
+) ?ResourceHandle {
     if (!state.ready and !virtgpu_init()) return null;
     if (width == 0 or height == 0) return null;
     if (backing_paddr < 0x1000) return null;
@@ -919,7 +998,6 @@ pub fn virtgpu_create_resource_from_single_page(
     resource.stride_bytes = @intCast(stride_bytes);
     resource.bytes_len = total_bytes;
     resource.page_count = 1;
-    resource.backing_paddrs[0] = backing_paddr;
     resource.pixels = @ptrFromInt(pixels_va);
 
     {
@@ -965,14 +1043,16 @@ pub fn virtgpu_create_resource_from_single_page(
     }
 
     resource.ready = true;
-    return resource;
+    return allocation.slot_index;
 }
 
-pub fn virtgpu_create_fb(width: usize, height: usize) ?*Resource {
+pub fn virtgpu_create_fb(width: usize, height: usize) ?ResourceHandle {
     return virtgpu_create_resource(width, height);
 }
 
-pub fn virtgpu_set_scanout(resource: *const Resource) bool {
+pub fn virtgpu_set_scanout(handle: ResourceHandle) bool {
+    if (!requireStateHealthy("virtgpu_set_scanout")) return false;
+    const resource = getResource(handle) orelse return false;
     if (!state.ready or !resource.ready) return false;
     const req: *VirtioGpuSetScanout = @ptrFromInt(control_page_va + control_request_offset);
     req.* = .{
@@ -991,7 +1071,9 @@ pub fn virtgpu_set_scanout(resource: *const Resource) bool {
     return ok;
 }
 
-pub fn virtgpu_transfer(resource: *const Resource, rect: Rect) bool {
+pub fn virtgpu_transfer(handle: ResourceHandle, rect: Rect) bool {
+    if (!requireStateHealthy("virtgpu_transfer")) return false;
+    const resource = getResource(handle) orelse return false;
     if (!state.ready or !resource.ready) return false;
     if (rect.x >= resource.width or rect.y >= resource.height) return true;
 
@@ -1012,7 +1094,9 @@ pub fn virtgpu_transfer(resource: *const Resource, rect: Rect) bool {
     return submitCommand(@sizeOf(VirtioGpuTransferToHost2d), 0, virtio_gpu_resp_ok_nodata);
 }
 
-pub fn virtgpu_flush_rect(resource: *const Resource, rect: Rect) bool {
+pub fn virtgpu_flush_rect(handle: ResourceHandle, rect: Rect) bool {
+    if (!requireStateHealthy("virtgpu_flush_rect")) return false;
+    const resource = getResource(handle) orelse return false;
     if (!state.ready or !resource.ready) return false;
     if (rect.x >= resource.width or rect.y >= resource.height) return true;
     var clipped = rect;
@@ -1029,8 +1113,9 @@ pub fn virtgpu_flush_rect(resource: *const Resource, rect: Rect) bool {
     return submitCommand(@sizeOf(VirtioGpuResourceFlush), 0, virtio_gpu_resp_ok_nodata);
 }
 
-pub fn virtgpu_flush(resource: *const Resource) bool {
-    return virtgpu_flush_rect(resource, .{
+pub fn virtgpu_flush(handle: ResourceHandle) bool {
+    const resource = getResource(handle) orelse return false;
+    return virtgpu_flush_rect(handle, .{
         .x = 0,
         .y = 0,
         .width = resource.width,
@@ -1038,17 +1123,24 @@ pub fn virtgpu_flush(resource: *const Resource) bool {
     });
 }
 
-pub fn virtgpu_cursor_resource() ?*Resource {
+pub fn virtgpu_cursor_resource() ?ResourceHandle {
+    if (!requireStateHealthy("virtgpu_cursor_resource")) return null;
     if (!state.ready and !virtgpu_init()) return null;
-    if (state.cursor_resource) |resource| {
-        if (resource.ready) return resource;
+    if (state.cursor_resource) |resource_handle| {
+        const resource = getResource(resource_handle) orelse {
+            state.cursor_resource = null;
+            return null;
+        };
+        if (resource.ready) return resource_handle;
     }
     const resource = createResourceWithFormat(cursor_dim, cursor_dim, virtio_gpu_format_b8g8r8a8_unorm) orelse return null;
     state.cursor_resource = resource;
     return resource;
 }
 
-pub fn virtgpu_update_cursor(resource: *const Resource, hot_x: u32, hot_y: u32, x: i32, y: i32) bool {
+pub fn virtgpu_update_cursor(handle: ResourceHandle, hot_x: u32, hot_y: u32, x: i32, y: i32) bool {
+    if (!requireStateHealthy("virtgpu_update_cursor")) return false;
+    const resource = getResource(handle) orelse return false;
     if (!state.ready or !resource.ready) return false;
     state.cursor_hot_x = hot_x;
     state.cursor_hot_y = hot_y;
@@ -1070,7 +1162,9 @@ pub fn virtgpu_update_cursor(resource: *const Resource, hot_x: u32, hot_y: u32, 
 }
 
 pub fn virtgpu_move_cursor(x: i32, y: i32) bool {
-    const resource = state.cursor_resource orelse return false;
+    if (!requireStateHealthy("virtgpu_move_cursor")) return false;
+    const handle = state.cursor_resource orelse return false;
+    const resource = getResource(handle) orelse return false;
     if (!resource.ready) return false;
     const req: *VirtioGpuUpdateCursor = @ptrFromInt(control_page_va + control_request_offset);
     req.* = .{
@@ -1087,6 +1181,18 @@ pub fn virtgpu_move_cursor(x: i32, y: i32) bool {
         .padding = 0,
     };
     return submitCursorCommand(@sizeOf(VirtioGpuUpdateCursor));
+}
+
+pub fn virtgpu_pixels(handle: ResourceHandle) ?[*]volatile u32 {
+    if (!requireStateHealthy("virtgpu_pixels")) return null;
+    const resource = getResource(handle) orelse return null;
+    return resource.pixels;
+}
+
+pub fn virtgpu_dimensions(handle: ResourceHandle) ?struct { width: u32, height: u32 } {
+    if (!requireStateHealthy("virtgpu_dimensions")) return null;
+    const resource = getResource(handle) orelse return null;
+    return .{ .width = resource.width, .height = resource.height };
 }
 
 pub fn logInitFailureOnce() void {

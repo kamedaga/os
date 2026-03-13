@@ -321,9 +321,6 @@ pub export fn _start() noreturn {
     const queue_notify_token_raw = readCfgU64(14);
     const queue_submit_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_submit_token_raw;
     const queue_notify_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_notify_token_raw;
-    userLogHex("MouseDriver: cfg[13]=", queue_submit_token_raw);
-    userLogHex("MouseDriver: cfg[14]=", queue_notify_token_raw);
-
     if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
         _ = userLog("MouseDriver: map common mmio failed\n");
         while (true) asm volatile ("pause");
@@ -356,12 +353,10 @@ pub export fn _start() noreturn {
         _ = userLog("MouseDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
     }
-    _ = userLog("MouseDriver: queue pages ready\n");
     if (queue_submit_token == 0 or queue_notify_token == 0) {
         _ = userLog("MouseDriver: queue cap token missing\n");
         while (true) asm volatile ("pause");
     }
-    _ = userLog("MouseDriver: queue tokens ready\n");
     mmioWriteU8(common_base + common_device_status, 0);
     mmioWriteU8(common_base + common_device_status, status_acknowledge | status_driver);
     mmioWriteU32(common_base + common_device_feature_select, 0);
@@ -399,17 +394,14 @@ pub export fn _start() noreturn {
         };
         queuePushAvail(d);
     }
-    _ = userLog("MouseDriver: queue descriptors ready\n");
     if (queueSubmit(queue_submit_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
         _ = userLog("MouseDriver: queue submit cap denied\n");
         while (true) asm volatile ("pause");
     }
-    _ = userLog("MouseDriver: queue submit ok\n");
     if (queueNotify(queue_notify_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
         _ = userLog("MouseDriver: queue notify cap denied\n");
         while (true) asm volatile ("pause");
     }
-    _ = userLog("MouseDriver: queue notify ok\n");
     mmioWriteU16(notify_addr, queue_index_event);
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     _ = userLog("MouseDriver: queue ready\n");
@@ -464,14 +456,15 @@ pub export fn _start() noreturn {
             if (desc_id < queue_size) {
                 const ev = queueEventPtr(desc_id).*;
                 const value_signed: i32 = @bitCast(ev.value);
-                switch (ev.event_type) {
-                    event_type_rel => switch (ev.code) {
+                if (ev.event_type == event_type_rel) {
+                    switch (ev.code) {
                         rel_x => accum_dx +%= value_signed,
                         rel_y => accum_dy +%= value_signed,
                         rel_wheel => accum_wheel +%= value_signed,
                         else => {},
-                    },
-                    event_type_abs => switch (ev.code) {
+                    }
+                } else if (ev.event_type == event_type_abs) {
+                    switch (ev.code) {
                         abs_x => {
                             abs_pos_x = value_signed;
                             abs_dirty = true;
@@ -481,8 +474,9 @@ pub export fn _start() noreturn {
                             abs_dirty = true;
                         },
                         else => {},
-                    },
-                    event_type_key => {
+                    }
+                } else if (ev.event_type == event_type_key) {
+                    {
                         const down = ev.value != 0;
                         switch (ev.code) {
                             btn_left => {
@@ -496,57 +490,55 @@ pub export fn _start() noreturn {
                             },
                             else => {},
                         }
-                    },
-                    event_type_syn => {
-                        if (ev.code == syn_report) {
-                            var abs_dx: i32 = 0;
-                            var abs_dy: i32 = 0;
-                            if (abs_dirty) {
-                                const abs_target_x = if (abs_pos_x >= 0 and abs_pos_x < screen_w)
-                                    abs_pos_x
-                                else
-                                    mapAbsToScreen(abs_pos_x, screen_w);
-                                const abs_target_y = if (abs_pos_y >= 0 and abs_pos_y < screen_h)
-                                    abs_pos_y
-                                else
-                                    mapAbsToScreen(abs_pos_y, screen_h);
-                                // For absolute devices (tablet), absolute position is authoritative.
-                                abs_dx = abs_target_x - cursor_x;
-                                abs_dy = abs_target_y - cursor_y;
-                                accum_dx = abs_dx;
-                                accum_dy = abs_dy;
-                            }
-
-                            const moved = accum_dx != 0 or accum_dy != 0 or accum_wheel != 0;
-                            const button_changed = buttons_mask != reported_buttons_mask;
-                            if (moved or button_changed or abs_dirty) {
-                                cursor_x = clampI32(cursor_x +% accum_dx, 0, screen_w - 1);
-                                cursor_y = clampI32(cursor_y +% accum_dy, 0, screen_h - 1);
-                                wheel_total +%= accum_wheel;
-                                shared.cursor_x = @intCast(cursor_x);
-                                shared.cursor_y = @intCast(cursor_y);
-                                shared.buttons = buttons_mask;
-                                shared.wheel = @as(u64, @as(u32, @bitCast(wheel_total)));
-                                shared.seq = shared.seq +% 1;
-
-                                if (log_mouse_events) {
-                                    var buf: [128]u8 = undefined;
-                                    const msg = std.fmt.bufPrint(
-                                        buf[0..],
-                                        "mouse x={d} y={d} dx={d} dy={d} wheel_d={d} wheel_t={d} btn={d} absdx={d} absdy={d}\n",
-                                        .{ cursor_x, cursor_y, accum_dx, accum_dy, accum_wheel, wheel_total, buttons_mask, abs_dx, abs_dy },
-                                    ) catch "";
-                                    _ = userLog(msg);
-                                }
-                                accum_dx = 0;
-                                accum_dy = 0;
-                                accum_wheel = 0;
-                                reported_buttons_mask = buttons_mask;
-                                abs_dirty = false;
-                            }
+                    }
+                } else if (ev.event_type == event_type_syn) {
+                    if (ev.code == syn_report) {
+                        var abs_dx: i32 = 0;
+                        var abs_dy: i32 = 0;
+                        if (abs_dirty) {
+                            const abs_target_x = if (abs_pos_x >= 0 and abs_pos_x < screen_w)
+                                abs_pos_x
+                            else
+                                mapAbsToScreen(abs_pos_x, screen_w);
+                            const abs_target_y = if (abs_pos_y >= 0 and abs_pos_y < screen_h)
+                                abs_pos_y
+                            else
+                                mapAbsToScreen(abs_pos_y, screen_h);
+                            // For absolute devices (tablet), absolute position is authoritative.
+                            abs_dx = abs_target_x - cursor_x;
+                            abs_dy = abs_target_y - cursor_y;
+                            accum_dx = abs_dx;
+                            accum_dy = abs_dy;
                         }
-                    },
-                    else => {},
+
+                        const moved = accum_dx != 0 or accum_dy != 0 or accum_wheel != 0;
+                        const button_changed = buttons_mask != reported_buttons_mask;
+                        if (moved or button_changed or abs_dirty) {
+                            cursor_x = clampI32(cursor_x +% accum_dx, 0, screen_w - 1);
+                            cursor_y = clampI32(cursor_y +% accum_dy, 0, screen_h - 1);
+                            wheel_total +%= accum_wheel;
+                            shared.cursor_x = @intCast(cursor_x);
+                            shared.cursor_y = @intCast(cursor_y);
+                            shared.buttons = buttons_mask;
+                            shared.wheel = @as(u64, @as(u32, @bitCast(wheel_total)));
+                            shared.seq = shared.seq +% 1;
+
+                            if (log_mouse_events) {
+                                var buf: [128]u8 = undefined;
+                                const msg = std.fmt.bufPrint(
+                                    buf[0..],
+                                    "mouse x={d} y={d} dx={d} dy={d} wheel_d={d} wheel_t={d} btn={d} absdx={d} absdy={d}\n",
+                                    .{ cursor_x, cursor_y, accum_dx, accum_dy, accum_wheel, wheel_total, buttons_mask, abs_dx, abs_dy },
+                                ) catch "";
+                                _ = userLog(msg);
+                            }
+                            accum_dx = 0;
+                            accum_dy = 0;
+                            accum_wheel = 0;
+                            reported_buttons_mask = buttons_mask;
+                            abs_dirty = false;
+                        }
+                    }
                 }
             }
 

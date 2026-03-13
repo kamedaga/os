@@ -3,14 +3,36 @@ const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 const untyped_memory = @import("untyped_memory.zig");
 const elf_loader = @import("elf_loader.zig");
+const boot_timing = @import("boot_timing.zig");
+const deferred_compositor = @import("deferred_compositor.zig");
+const kernel_log = @import("kernel_log.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
+const scheduler = @import("scheduler.zig");
 const virtio_probe = @import("virtio_probe.zig");
 const serial = @import("serial.zig");
 const user_programs = @import("user_programs.zig");
 const uefi = std.os.uefi;
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
+const serialWrite = kernel_log.write;
+const serialWriteFmt = kernel_log.writeFmt;
+const serialWriteHexRaw = kernel_log.writeHexRaw;
+const serialWriteBool01 = kernel_log.writeBool01;
+const serialWriteThreadIndexLabel = kernel_log.writeThreadIndexLabel;
+const serialOnlyWrite = kernel_log.writeOnly;
+const serialOnlyWriteBool01 = kernel_log.writeOnlyBool01;
+const serialOnlyWriteThreadIndexLabel = kernel_log.writeOnlyThreadIndexLabel;
+const getThreadContext = scheduler.getThreadContext;
+const getThreadContextConst = scheduler.getThreadContextConst;
+const activateThread = scheduler.activateThread;
+const switchToThread = scheduler.switchToThread;
+const blockCurrentThreadForEvent = scheduler.blockCurrentThreadForEvent;
+const wakeWaitingThreadForPrincipal = scheduler.wakeWaitingThreadForPrincipal;
+const wakeThreadsForTimer = scheduler.wakeThreadsForTimer;
+const pickNextReadyThreadIndex = scheduler.pickNextReadyThreadIndex;
+const threadContextLooksCorrupted = scheduler.threadContextLooksCorrupted;
+const thread_contexts = &scheduler.thread_contexts;
 
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     _ = trace;
@@ -25,9 +47,16 @@ const page_entries: usize = 512;
 const four_gib: u64 = 4 * 1024 * 1024 * 1024;
 const one_tib: u64 = 1024 * 1024 * 1024 * 1024;
 const two_mib: u64 = 2 * 1024 * 1024;
+const stack_region_bytes: usize = 8 * 1024 * 1024;
+const stack_region_align: u64 = 2 * 1024 * 1024;
+const stack_region_raw_bytes: usize = stack_region_bytes + @as(usize, @intCast(stack_region_align));
+const stack_region_chunk_count: usize = stack_region_bytes / @as(usize, @intCast(two_mib));
 const pd_table_count: usize = 16; // 16 * 1GiB = 16GiB
 const high_mmio_pml4_index: usize = 1; // 512GiB..1024GiB window
 const high_mmio_pdp_table_count: usize = page_entries; // 512 * 1GiB = 512GiB
+const guard_page_bytes: usize = 4096;
+const ring0_stack_bytes: usize = stack_region_bytes - (2 * guard_page_bytes);
+const ist_stack_bytes: usize = 2 * 1024 * 1024;
 const user_va: u64 = 0x20000000;
 const user_elf_base_va: u64 = user_va; // PIE base is chosen by kernel.
 const user_stack_top: u64 = 0x3C00_0000;
@@ -79,19 +108,24 @@ const page_user: u64 = 1 << 2;
 const page_ps: u64 = 1 << 7;
 const lapic_timer_vector: u8 = 0x40;
 const lapic_timer_initial_count: u32 = 50_000;
-const scheduler_quantum_ticks: u64 = 4;
+const scheduler_quantum_ticks: u64 = 2;
 const bootlog_gate_input_start_delay_ticks: u64 = 8;
 const bootlog_gate_auto_input_start_delay_ticks: u64 = 1;
 const deferred_compositor_auto_launch_delay_ticks: u64 = 1;
 const bootlog_auto_min_visible_ticks: u64 = 8;
+const startup_client_settle_ticks: u64 = 16;
 const scheduler_log_switch = false;
 const scheduler_switch_log_max_lines: u64 = 96;
 const scheduler_log_int80 = false;
 const scheduler_int80_log_max_lines: u64 = 192;
 const scheduler_race_log_max_lines: u64 = 128;
+const phys_copy_window_va: u64 = (@as(u64, @intCast(high_mmio_pml4_index)) << 39);
+const scheduler_probe_log_max_lines: u64 = 64;
 const enable_switch_thread_syscall_log = false;
 const user_log_max_bytes: usize = 256;
 const fx_state_bytes: usize = 512;
+const debug_skip_syscall_fx_state = true;
+const debug_skip_timer_fx_state = true;
 const user_elf_disk_path: [*:0]const u16 = &[_:0]u16{
     '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'U', 'S', 'E', 'R', 'A', 'P', 'P', '.', 'E', 'L', 'F',
 };
@@ -161,34 +195,14 @@ const user_process_count: usize = kernel.process_count;
 const user_thread_count: usize = user_process_count;
 const UserAddressSpace = capability.UserAddressSpace;
 
-const ThreadContext = struct {
-    id: u32 = 0,
-    owner_process: kernel.PrincipalId,
-    cr3: u64 = 0,
-    ready: bool = false,
-    frame: TrapFrame = std.mem.zeroes(TrapFrame),
-    fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
-};
-
-fn buildInitialThreadContexts() [user_thread_count]ThreadContext {
-    var contexts: [user_thread_count]ThreadContext = undefined;
-    inline for (0..user_thread_count) |i| {
-        contexts[i] = .{
-            .id = @intCast(i),
-            .owner_process = kernel.processPrincipalFromIndex(i) orelse unreachable,
-        };
-    }
-    return contexts;
-}
-
 var pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pd_tables: [pd_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** pd_table_count;
 var high_mmio_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var high_mmio_pd_tables: [high_mmio_pdp_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_mmio_pdp_table_count;
-var user_spaces_backing: ?[]align(4096) uefi.Page = null;
-var user_spaces: []UserAddressSpace = &.{};
-var thread_contexts: [user_thread_count]ThreadContext = buildInitialThreadContexts();
+var phys_copy_window_pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
+var user_spaces_storage: [user_process_count]UserAddressSpace align(4096) = [_]UserAddressSpace{.{}} ** user_process_count;
+var user_spaces: []UserAddressSpace = user_spaces_storage[0..];
 var global_free_list: kernel.FreePageList = .{};
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
 var gdt: [7]u64 align(16) = .{
@@ -200,13 +214,17 @@ var gdt: [7]u64 align(16) = .{
     0x0000000000000000, // 0x28 TSS low
     0x0000000000000000, // 0x30 TSS high
 };
-var ring0_stack: [64 * 1024]u8 align(16) = [_]u8{0} ** (64 * 1024);
-var pf_ist_stack: [16 * 1024]u8 align(16) = [_]u8{0} ** (16 * 1024);
-var df_ist_stack: [16 * 1024]u8 align(16) = [_]u8{0} ** (16 * 1024);
+// Keep kernel stacks in dedicated 2 MiB regions so the identity huge-page map
+// can be replaced with 4 KiB PTEs and guard holes.
+var ring0_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
+var pf_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
+var df_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
+var ring0_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
+var pf_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
+var df_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var tss: Tss = std.mem.zeroes(Tss);
 var kernel_state_global: kernel.KernelState = undefined;
 var kernel_state_ready = false;
-var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 var int80_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var pf_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var gp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
@@ -226,89 +244,18 @@ var np_trampoline_entry: usize = 0;
 var ss_trampoline_entry: usize = 0;
 var timer_trampoline_entry: usize = 0;
 export var kernel_cr3_value: u64 = 0;
-export var user_cr3_value: u64 = 0;
-var current_user_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
-var current_thread_index: usize = 0;
-var lapic_tick_count: u64 = 0;
-var scheduler_tick_accum: u64 = 0;
-var scheduler_switch_count: u64 = 0;
+export var user_return_saved_r10: u64 = 0;
 const scheduler_perf_report_interval_ticks: u64 = 256;
-var scheduler_perf_user_ticks: u64 = 0;
-var scheduler_perf_process1_ticks: u64 = 0;
-var scheduler_perf_thread1_ticks: u64 = 0;
-const compositor_thread1_priority_hold_quanta: u64 = 1;
-var compositor_thread1_priority_streak: u64 = 0;
-var scheduler_int80_log_count: u64 = 0;
-var scheduler_race_log_count: u64 = 0;
-const BootTimingState = struct {
-    user_enter_tick: u64 = 0,
-    mouse_started: bool = false,
-    mouse_start_tick: u64 = 0,
-    mouse_queue_ready: bool = false,
-    mouse_queue_ready_tick: u64 = 0,
-    keyboard_started: bool = false,
-    keyboard_start_tick: u64 = 0,
-    keyboard_queue_ready: bool = false,
-    keyboard_queue_ready_tick: u64 = 0,
-    compositor_launch: bool = false,
-    compositor_launch_tick: u64 = 0,
-    virtgpu_init_started: bool = false,
-    virtgpu_init_start_tick: u64 = 0,
-    virtgpu_queue_ready: bool = false,
-    virtgpu_queue_ready_tick: u64 = 0,
-    mouse_demo_window_publish_after: bool = false,
-    mouse_demo_window_publish_after_tick: u64 = 0,
-    keyboard_demo_window_publish_after: bool = false,
-    keyboard_demo_window_publish_after_tick: u64 = 0,
-    compositor_window_cap_recv: bool = false,
-    compositor_window_cap_recv_tick: u64 = 0,
-    compositor_register_window_cap_done: bool = false,
-    compositor_register_window_cap_done_tick: u64 = 0,
-    compositor_first_compose_done: bool = false,
-    compositor_first_compose_done_tick: u64 = 0,
-    compositor_present_transfer_done: bool = false,
-    compositor_present_transfer_done_tick: u64 = 0,
-    compositor_present_flush_done: bool = false,
-    compositor_present_flush_done_tick: u64 = 0,
-};
-
-const BootTimingTraceEvent = struct {
-    label: []const u8,
-    tick: u64,
-    has_delta: bool,
-    delta: u64,
-};
-
-var boot_timing: BootTimingState = .{};
-var boot_timing_trace: [16]BootTimingTraceEvent = undefined;
-var boot_timing_trace_len: usize = 0;
-var boot_timing_trace_flushed = false;
+const compositor_thread1_priority_hold_quanta: u64 = 6;
+var syscall_identity_diag_count: u64 = 0;
+var syscall_entry_diag_count: u64 = 0;
+var scheduler_perf_last_switch_count: u64 = 0;
 var uefi_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
 var uefi_exitbs_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
-var compositor_thread1_priority_active = false;
 var user_log_scratch: [user_log_max_bytes]u8 align(16) = undefined;
-var boot_log_buffer: [boot_log_max_bytes]u8 = [_]u8{0} ** boot_log_max_bytes;
-var boot_log_len: usize = 0;
-var deferred_compositor_launch_armed = false;
-var deferred_compositor_launched = false;
-var deferred_compositor_user_page_paddr: u64 = 0;
-var deferred_compositor_user_stack_page_paddr: u64 = 0;
-var deferred_compositor_auto_launch_armed = false;
-var deferred_compositor_auto_launch_tick: u64 = 0;
+export var user_return_iret_frame: [5]u64 align(16) = [_]u64{0} ** 5;
 var bootlog_entered_user_tick: u64 = 0;
-var deferred_compositor_wait_mouse_queue_ready = false;
-var deferred_compositor_wait_keyboard_queue_ready = false;
-var deferred_compositor_auto_debug_last_mask: u32 = 0xFFFF_FFFF;
-var deferred_compositor_auto_debug_last_tick: u64 = 0;
-const DeferredCompositorKind = enum {
-    classic,
-    gpu,
-};
-var deferred_compositor_image_classic: ?[]const u8 = null;
-var deferred_compositor_image_gpu: ?[]const u8 = null;
-var deferred_compositor_selected_kind: DeferredCompositorKind = .classic;
 var runtime_framebuffer_info: ?FramebufferInfo = null;
-var runtime_framebuffer_log_before_send_cap_done = false;
 var boot_log_status_flags: u32 = 0;
 var boot_log_status_page_paddr: u64 = 0;
 var bootlog_gate_input_start_armed = false;
@@ -318,10 +265,20 @@ var bootlog_gate_start_thread3 = false;
 var bootlog_gate_start_thread2 = false;
 var bootlog_gate_start_thread4 = false;
 var bootlog_gate_start_thread5 = false;
+var startup_process0_shared_sent = false;
+var startup_process2_window_sent = false;
+var startup_process3_shared_sent = false;
+var startup_process4_window_sent = false;
+var startup_process5_window_sent = false;
+var startup_last_client_cap_tick: u64 = 0;
 var boot_services_cache: ?*uefi.tables.BootServices = null;
 var kernel_image_base_paddr: u64 = 0;
 var kernel_image_size_bytes: usize = 0;
 var post_exit_load_scratch: [8 * 1024 * 1024]u8 align(4096) = [_]u8{0} ** (8 * 1024 * 1024);
+var pie_user_launch_thread_available = false;
+var pie_user_process6_initialized = false;
+var pie_user_disk_image: ?[]const u8 = null;
+var compositor_runtime_priority_requested = false;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -344,6 +301,8 @@ const syscall_untyped_reset: u64 = 0x12;
 const syscall_untyped_alloc_map_pages: u64 = 0x13;
 const syscall_grant_caps_batch: u64 = 0x14;
 const syscall_map_pages_batch: u64 = 0x15;
+const syscall_launch_pie_user: u64 = 0x16;
+const syscall_wait_event: u64 = 0x17;
 const syscall_batch_max_pages: usize = 64;
 
 const user_program_cfg: user_programs.Config = .{
@@ -525,26 +484,6 @@ fn earlyUefiWriteAscii(msg: []const u8) void {
     earlyUefiWrite(&buf);
 }
 
-fn appendBootLog(text: []const u8) void {
-    if (text.len == 0) return;
-    if (boot_log_len >= boot_log_buffer.len) return;
-    const remaining = boot_log_buffer.len - boot_log_len;
-    const copy_len = if (text.len > remaining) remaining else text.len;
-    @memcpy(boot_log_buffer[boot_log_len .. boot_log_len + copy_len], text[0..copy_len]);
-    boot_log_len += copy_len;
-}
-
-fn serialWrite(text: []const u8) void {
-    serial.write(text);
-    appendBootLog(text);
-}
-
-fn serialWriteFmt(comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(buf[0..], fmt, args) catch return;
-    serialWrite(s);
-}
-
 fn probeWriteLog(text: []const u8) void {
     if (enable_title_only_ready_logs and std.mem.startsWith(u8, text, "virtio-probe:")) return;
     serialWrite(text);
@@ -553,18 +492,6 @@ fn probeWriteLog(text: []const u8) void {
 fn logReadyTitle(title: []const u8) void {
     serialWrite(title);
     serialWrite("\n");
-}
-
-fn serialWriteHexRaw(value: u64) void {
-    serial.writeHexRaw(value);
-    var buf: [16]u8 = undefined;
-    const s = std.fmt.bufPrint(buf[0..], "{x:0>16}", .{value}) catch return;
-    appendBootLog(s);
-}
-
-fn serialWriteBool01(value: bool) void {
-    serial.writeBool01(value);
-    appendBootLog(if (value) "1" else "0");
 }
 
 fn dumpPageWalkForVa(cr3: u64, va: u64) void {
@@ -763,15 +690,10 @@ fn iommuAuditHook(
     reason: kernel.IommuSyncReason,
 ) void {
     _ = state;
-    serialWriteFmt(
-        "iommu_audit action={s} principal={s} paddr=0x{x} reason={s}\n",
-        .{
-            if (mapped) "map" else "unmap",
-            principalLabel(principal),
-            paddr,
-            iommuReasonLabel(reason),
-        },
-    );
+    _ = principal;
+    _ = paddr;
+    _ = mapped;
+    _ = reason;
 }
 
 fn threadLabel(thread_index: usize) []const u8 {
@@ -786,194 +708,41 @@ fn threadLabel(thread_index: usize) []const u8 {
     return "Thread?";
 }
 
-fn recordBootTimingEvent(label: []const u8, tick: u64, delta: ?u64) void {
-    if (boot_timing_trace_len >= boot_timing_trace.len) return;
-    boot_timing_trace[boot_timing_trace_len] = .{
-        .label = label,
-        .tick = tick,
-        .has_delta = delta != null,
-        .delta = delta orelse 0,
-    };
-    boot_timing_trace_len += 1;
-}
-
-fn flushBootTimingTrace() void {
-    if (boot_timing_trace_flushed) return;
-    if (boot_timing_trace_len == 0) return;
-    var i: usize = 0;
-    while (i < boot_timing_trace_len) : (i += 1) {
-        const event = boot_timing_trace[i];
-        var line_buf: [160]u8 = undefined;
-        const line = if (event.has_delta)
-            std.fmt.bufPrint(
-                line_buf[0..],
-                "boot_timing {s} tick={} since_user={} delta={}\n",
-                .{ event.label, event.tick, event.tick - boot_timing.user_enter_tick, event.delta },
-            ) catch break
-        else
-            std.fmt.bufPrint(
-                line_buf[0..],
-                "boot_timing {s} tick={} since_user={}\n",
-                .{ event.label, event.tick, event.tick - boot_timing.user_enter_tick },
-            ) catch break;
-        serialWrite(line);
+fn logReadyThreadsSummary(current_thread: usize, next_thread: usize) void {
+    if (scheduler.scheduler_probe_log_count >= scheduler_probe_log_max_lines) return;
+    scheduler.scheduler_probe_log_count +%= 1;
+    serialWrite("READY current=");
+    printNumber(current_thread);
+    serialWrite(" next=");
+    printNumber(next_thread);
+    serialWrite(" threads=");
+    var idx: usize = 0;
+    var first = true;
+    while (idx < user_thread_count) : (idx += 1) {
+        const ctx = getThreadContextConst(idx) orelse continue;
+        if (!ctx.ready) continue;
+        if (!first) serialWrite(",");
+        first = false;
+        printNumber(idx);
+        serialWrite(":");
+        serialWrite(principalLabel(ctx.owner_process));
     }
-    boot_timing_trace_flushed = true;
+    if (first) serialWrite("none");
+    serialWrite("\n");
+    serialWrite("SWITCH ");
+    serialWrite(threadLabel(current_thread));
+    serialWrite(" -> ");
+    serialWrite(threadLabel(next_thread));
+    serialWrite("\n");
 }
 
 fn updateBootTimingFromUserLog(proc: kernel.PrincipalId, message: []const u8) void {
-    if (proc == .Process0 and containsBytes(message, "MouseDriver: started")) {
-        if (!boot_timing.mouse_started) {
-            boot_timing.mouse_started = true;
-            boot_timing.mouse_start_tick = lapic_tick_count;
-            recordBootTimingEvent("mouse_started", boot_timing.mouse_start_tick, null);
-        }
-    }
-    if (proc == .Process0 and containsBytes(message, "MouseDriver: queue ready")) {
-        if (!boot_timing.mouse_queue_ready) {
-            boot_timing.mouse_queue_ready = true;
-            boot_timing.mouse_queue_ready_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "mouse_queue_ready",
-                boot_timing.mouse_queue_ready_tick,
-                if (boot_timing.mouse_started) boot_timing.mouse_queue_ready_tick - boot_timing.mouse_start_tick else null,
-            );
-        }
-    }
-    if (proc == .Process3 and containsBytes(message, "KeyboardDriver: started")) {
-        if (!boot_timing.keyboard_started) {
-            boot_timing.keyboard_started = true;
-            boot_timing.keyboard_start_tick = lapic_tick_count;
-            recordBootTimingEvent("keyboard_started", boot_timing.keyboard_start_tick, null);
-        }
-    }
-    if (proc == .Process3 and containsBytes(message, "KeyboardDriver: queue ready")) {
-        if (!boot_timing.keyboard_queue_ready) {
-            boot_timing.keyboard_queue_ready = true;
-            boot_timing.keyboard_queue_ready_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "keyboard_queue_ready",
-                boot_timing.keyboard_queue_ready_tick,
-                if (boot_timing.keyboard_started) boot_timing.keyboard_queue_ready_tick - boot_timing.keyboard_start_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: virtgpu init start")) {
-        if (!boot_timing.virtgpu_init_started) {
-            boot_timing.virtgpu_init_started = true;
-            boot_timing.virtgpu_init_start_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "virtgpu_init_start",
-                boot_timing.virtgpu_init_start_tick,
-                if (boot_timing.compositor_launch) boot_timing.virtgpu_init_start_tick - boot_timing.compositor_launch_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: virtgpu queue ready")) {
-        if (!boot_timing.virtgpu_queue_ready) {
-            boot_timing.virtgpu_queue_ready = true;
-            boot_timing.virtgpu_queue_ready_tick = lapic_tick_count;
-            compositor_thread1_priority_active = false;
-            recordBootTimingEvent(
-                "virtgpu_queue_ready",
-                boot_timing.virtgpu_queue_ready_tick,
-                if (boot_timing.virtgpu_init_started) boot_timing.virtgpu_queue_ready_tick - boot_timing.virtgpu_init_start_tick else null,
-            );
-        }
-    }
-    if (proc == .Process2 and containsBytes(message, "MouseButtonDemo: createAndPublishWindow after")) {
-        if (!boot_timing.mouse_demo_window_publish_after) {
-            boot_timing.mouse_demo_window_publish_after = true;
-            boot_timing.mouse_demo_window_publish_after_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "mouse_demo_window_publish_after",
-                boot_timing.mouse_demo_window_publish_after_tick,
-                if (boot_timing.virtgpu_queue_ready) boot_timing.mouse_demo_window_publish_after_tick - boot_timing.virtgpu_queue_ready_tick else null,
-            );
-        }
-    }
-    if (proc == .Process4 and containsBytes(message, "KeyboardAsciiDemo: createAndPublishWindow after")) {
-        if (!boot_timing.keyboard_demo_window_publish_after) {
-            boot_timing.keyboard_demo_window_publish_after = true;
-            boot_timing.keyboard_demo_window_publish_after_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "keyboard_demo_window_publish_after",
-                boot_timing.keyboard_demo_window_publish_after_tick,
-                if (boot_timing.virtgpu_queue_ready) boot_timing.keyboard_demo_window_publish_after_tick - boot_timing.virtgpu_queue_ready_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: window cap recv")) {
-        if (!boot_timing.compositor_window_cap_recv) {
-            boot_timing.compositor_window_cap_recv = true;
-            boot_timing.compositor_window_cap_recv_tick = lapic_tick_count;
-            compositor_thread1_priority_active = true;
-            recordBootTimingEvent(
-                "compositor_window_cap_recv",
-                boot_timing.compositor_window_cap_recv_tick,
-                if (boot_timing.keyboard_demo_window_publish_after) boot_timing.compositor_window_cap_recv_tick - boot_timing.keyboard_demo_window_publish_after_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: registerWindowCap done")) {
-        if (!boot_timing.compositor_register_window_cap_done) {
-            boot_timing.compositor_register_window_cap_done = true;
-            boot_timing.compositor_register_window_cap_done_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "compositor_register_window_cap_done",
-                boot_timing.compositor_register_window_cap_done_tick,
-                if (boot_timing.compositor_window_cap_recv) boot_timing.compositor_register_window_cap_done_tick - boot_timing.compositor_window_cap_recv_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: first compose done")) {
-        if (!boot_timing.compositor_first_compose_done) {
-            boot_timing.compositor_first_compose_done = true;
-            boot_timing.compositor_first_compose_done_tick = lapic_tick_count;
-            compositor_thread1_priority_active = false;
-            recordBootTimingEvent(
-                "compositor_first_compose_done",
-                boot_timing.compositor_first_compose_done_tick,
-                if (boot_timing.compositor_register_window_cap_done) boot_timing.compositor_first_compose_done_tick - boot_timing.compositor_register_window_cap_done_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: drag boost on")) {
-        compositor_thread1_priority_active = true;
-        compositor_thread1_priority_streak = 0;
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: drag boost off")) {
-        compositor_thread1_priority_active = false;
-        compositor_thread1_priority_streak = 0;
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: present transfer done")) {
-        if (!boot_timing.compositor_present_transfer_done) {
-            boot_timing.compositor_present_transfer_done = true;
-            boot_timing.compositor_present_transfer_done_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "compositor_present_transfer_done",
-                boot_timing.compositor_present_transfer_done_tick,
-                if (boot_timing.compositor_first_compose_done) boot_timing.compositor_present_transfer_done_tick - boot_timing.compositor_first_compose_done_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: present flush done")) {
-        if (!boot_timing.compositor_present_flush_done) {
-            boot_timing.compositor_present_flush_done = true;
-            boot_timing.compositor_present_flush_done_tick = lapic_tick_count;
-            recordBootTimingEvent(
-                "compositor_present_flush_done",
-                boot_timing.compositor_present_flush_done_tick,
-                if (boot_timing.compositor_present_transfer_done) boot_timing.compositor_present_flush_done_tick - boot_timing.compositor_present_transfer_done_tick else null,
-            );
-            flushBootTimingTrace();
-        }
-    }
+    boot_timing.updateFromUserLog(proc, message, scheduler.lapic_tick_count, serialWrite);
 }
 
 fn tryBeginSchedulerRaceLog() bool {
-    if (scheduler_race_log_count >= scheduler_race_log_max_lines) return false;
-    scheduler_race_log_count +%= 1;
+    if (scheduler.scheduler_race_log_count >= scheduler_race_log_max_lines) return false;
+    scheduler.scheduler_race_log_count +%= 1;
     serialWrite("SCHED race ");
     return true;
 }
@@ -1046,16 +815,6 @@ fn logQueueCapDeny(
     serialWrite(@errorName(err));
     serialWrite("\n");
 }
-fn getThreadContext(thread_index: usize) ?*ThreadContext {
-    if (thread_index >= user_thread_count) return null;
-    return &thread_contexts[thread_index];
-}
-
-fn getThreadContextConst(thread_index: usize) ?*const ThreadContext {
-    if (thread_index >= user_thread_count) return null;
-    return &thread_contexts[thread_index];
-}
-
 fn buildInitialUserTrapFrame() TrapFrame {
     var frame: TrapFrame = std.mem.zeroes(TrapFrame);
     frame.rip = user_va;
@@ -1067,15 +826,29 @@ fn buildInitialUserTrapFrame() TrapFrame {
 }
 
 fn initThreadContext(thread_index: usize, owner_process: kernel.PrincipalId) bool {
-    const space = getUserSpace(owner_process) orelse return false;
-    const ctx = getThreadContext(thread_index) orelse return false;
-    ctx.id = @intCast(thread_index);
-    ctx.owner_process = owner_process;
-    ctx.cr3 = space.cr3;
-    ctx.ready = true;
-    ctx.frame = buildInitialUserTrapFrame();
-    ctx.fx_state = initial_fx_state;
-    return true;
+    return scheduler.initThreadContextWithSpaces(thread_index, owner_process, user_spaces, buildInitialUserTrapFrame());
+}
+
+fn repairThreadContext(thread_index: usize) bool {
+    return scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, buildInitialUserTrapFrame());
+}
+
+fn sanitizeAllThreadContexts() void {
+    scheduler.sanitizeAllThreadContextsWithSpaces(user_spaces, buildInitialUserTrapFrame());
+}
+
+fn rawOwnerTag(ctx: *const scheduler.ThreadContext) u8 {
+    const raw: *const u8 = @ptrCast(&ctx.owner_process);
+    return raw.*;
+}
+
+fn principalFromRawTag(raw: u8) ?kernel.PrincipalId {
+    if (raw >= kernel.principal_count) return null;
+    return @enumFromInt(raw);
+}
+
+fn expectedPrincipalForThread(thread_index: usize) ?kernel.PrincipalId {
+    return kernel.processPrincipalFromIndex(thread_index);
 }
 
 fn readCr0() u64 {
@@ -1122,13 +895,13 @@ fn initFxStateSupport() void {
     asm volatile ("fninit");
     asm volatile ("fxsave64 (%[ptr])"
         :
-        : [ptr] "r" (&initial_fx_state),
+        : [ptr] "r" (&scheduler.initial_fx_state),
         : .{ .memory = true });
 }
 
 pub export fn saveCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
-    const ctx = getThreadContext(current_thread_index) orelse return;
+    const ctx = getThreadContext(scheduler.current_thread_index) orelse return;
     if (!ctx.ready) return;
     asm volatile ("fxsave64 (%[ptr])"
         :
@@ -1138,7 +911,7 @@ pub export fn saveCurrentThreadFxState() callconv(.c) void {
 
 pub export fn restoreCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
-    const ctx = getThreadContext(current_thread_index) orelse return;
+    const ctx = getThreadContext(scheduler.current_thread_index) orelse return;
     if (!ctx.ready) return;
     asm volatile ("fxrstor64 (%[ptr])"
         :
@@ -1146,69 +919,34 @@ pub export fn restoreCurrentThreadFxState() callconv(.c) void {
         : .{ .memory = true });
 }
 
-fn activateThread(thread_index: usize) bool {
-    const ctx = getThreadContextConst(thread_index) orelse return false;
-    if (!ctx.ready) return false;
-    current_thread_index = thread_index;
-    current_user_principal = ctx.owner_process;
-    user_cr3_value = ctx.cr3;
-    return true;
+pub export fn saveKernelInterruptFxState() callconv(.c) void {
+    asm volatile ("fxsave64 (%[ptr])"
+        :
+        : [ptr] "r" (&scheduler.kernel_interrupt_fx_state),
+        : .{ .memory = true });
 }
 
-fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
-    const ctx = getThreadContext(current_thread_index) orelse return;
-    ctx.frame = frame.*;
-    ctx.cr3 = user_cr3_value;
-    ctx.ready = true;
+pub export fn restoreKernelInterruptFxState() callconv(.c) void {
+    asm volatile ("fxrstor64 (%[ptr])"
+        :
+        : [ptr] "r" (&scheduler.kernel_interrupt_fx_state),
+        : .{ .memory = true });
 }
 
-fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
-    const ctx = getThreadContextConst(thread_index) orelse return false;
-    if (!ctx.ready) return false;
-    frame.* = ctx.frame;
-    return true;
-}
-
-fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bool {
-    if (next_thread >= user_thread_count) return false;
-    const current_thread = current_thread_index;
-    if (next_thread == current_thread) {
-        if (saved_rax) |value| frame.rax = value;
-        return true;
+fn launchPieUserThread(frame: *TrapFrame) u64 {
+    if (!preparePieUserLaunchThread()) return syscall_err_invalid;
+    if (!pie_user_launch_thread_available) return syscall_err_invalid;
+    const target_thread: usize = 6;
+    const target_ctx = getThreadContext(target_thread) orelse return syscall_err_invalid;
+    target_ctx.ready = true;
+    if (!switchToThread(target_thread, frame, syscall_ok)) {
+        return syscall_err_not_ready;
     }
-
-    var saved = frame.*;
-    if (saved_rax) |value| saved.rax = value;
-    saveCurrentThreadContextFromFrame(&saved);
-
-    if (!activateThread(next_thread)) return false;
-    if (!loadThreadContextToFrame(next_thread, frame)) {
-        _ = activateThread(current_thread);
-        _ = loadThreadContextToFrame(current_thread, frame);
-        return false;
-    }
-    return true;
+    return syscall_ok;
 }
 
 fn isUserTrapFrame(frame: *const TrapFrame) bool {
     return ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
-}
-
-fn pickNextReadyThreadIndex(current_index: usize) usize {
-    if (current_index >= user_thread_count) return 0;
-    if (compositor_thread1_priority_active) {
-        const compositor_ctx = getThreadContextConst(1) orelse return current_index;
-        // Prefer compositor when another thread is running, but avoid
-        // permanently pinning execution on Thread1.
-        if (current_index != 1 and compositor_ctx.ready) return 1;
-    }
-    var step: usize = 1;
-    while (step <= user_thread_count) : (step += 1) {
-        const idx = (current_index + step) % user_thread_count;
-        const ctx = getThreadContextConst(idx) orelse continue;
-        if (ctx.ready) return idx;
-    }
-    return current_index;
 }
 
 fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
@@ -1218,13 +956,13 @@ fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
 }
 
 fn currentUserSpace() *UserAddressSpace {
-    return getUserSpace(current_user_principal).?;
+    return getUserSpace(scheduler.current_user_principal).?;
 }
 
 fn findUserPtSlotForPd(space: *const UserAddressSpace, pd_index: usize) ?usize {
     var slot: usize = 0;
-    const used_len: usize = @intCast(space.pt_page_used_len);
-    while (slot < used_len) : (slot += 1) {
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        if (space.pt_page_pd_index[slot] == UserAddressSpace.no_pd_index) continue;
         if (space.pt_page_pd_index[slot] == pd_index) return slot;
     }
     return null;
@@ -1234,17 +972,18 @@ fn ensureUserPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     if (pd_index >= page_entries) return null;
     if (findUserPtSlotForPd(space, pd_index)) |slot| return slot;
 
-    var used_len: usize = @intCast(space.pt_page_used_len);
-    if (used_len >= UserAddressSpace.max_dynamic_pt_pages) return null;
-
-    const slot = used_len;
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages and space.pt_page_pd_index[slot] != UserAddressSpace.no_pd_index) : (slot += 1) {}
+    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return null;
     space.pt_page_pd_index[slot] = @intCast(pd_index);
     @memset(space.pt_pages[slot][0..], 0);
     const pt_pa: u64 = @intFromPtr(&space.pt_pages[slot]);
     if (pt_pa >= four_gib) return null;
     space.pd[pd_index] = pt_pa | page_present | page_rw | page_user;
-    used_len += 1;
-    space.pt_page_used_len = @intCast(used_len);
+    const next_len = slot + 1;
+    if (next_len > space.pt_page_used_len) {
+        space.pt_page_used_len = @intCast(next_len);
+    }
     return slot;
 }
 
@@ -1297,7 +1036,7 @@ fn logPageFaultStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     serialWriteBool01(va_user);
     serialWrite("\n");
 
-    const pf_cap = capability.issuePageFaultCapability(current_user_principal, frame, cr2) orelse {
+    const pf_cap = capability.issuePageFaultCapability(scheduler.current_user_principal, frame, cr2) orelse {
         serialWrite("  PF_CAP=none\n");
         serialWrite("  CAP_LOOKUP=skip\n");
         return;
@@ -1325,7 +1064,7 @@ fn logPageFaultStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
 
 pub export fn pageFaultDispatch(frame: *const ExceptionTrapFrame) callconv(.c) u64 {
     const cr2 = readCr2();
-    const pf_cap = capability.issuePageFaultCapability(current_user_principal, frame, cr2) orelse return 0;
+    const pf_cap = capability.issuePageFaultCapability(scheduler.current_user_principal, frame, cr2) orelse return 0;
     if (!kernel_state_ready) return 0;
     if (!capability.resolvePageFaultCapability(&kernel_state_global, pf_cap)) return 0;
 
@@ -1342,10 +1081,10 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
     serialWrite(exceptionName(vec));
     serialWrite("\n");
     serialWrite("  THREAD=");
-    serialWrite(threadLabel(current_thread_index));
+    serialWrite(threadLabel(scheduler.current_thread_index));
     serialWrite("\n");
     serialWrite("  PRINCIPAL=");
-    serialWrite(principalLabel(current_user_principal));
+    serialWrite(principalLabel(scheduler.current_user_principal));
     serialWrite("\n");
     if (vec == 14) {
         serialWrite("  CR2=");
@@ -1382,6 +1121,16 @@ fn haltLoop() noreturn {
 fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
     if (dest.len == 0) return true;
 
+    const original_cr3 = readCr3();
+    if (original_cr3 != kernel_cr3_value) {
+        writeCr3(kernel_cr3_value);
+    }
+    defer {
+        if (original_cr3 != kernel_cr3_value) {
+            writeCr3(original_cr3);
+        }
+    }
+
     var copied: usize = 0;
     while (copied < dest.len) {
         const copied_u64: u64 = @intCast(copied);
@@ -1405,7 +1154,8 @@ fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []
         const last_paddr, const last_overflow = @addWithOverflow(src_paddr, @as(u64, @intCast(chunk_len - 1)));
         if (last_overflow != 0 or last_paddr >= four_gib) return false;
 
-        const src: [*]const u8 = @ptrFromInt(src_paddr);
+        const src_page = mapPhysPageForKernelCopy(src_paddr) orelse return false;
+        const src: [*]const u8 = @ptrCast(src_page + page_off);
         var i: usize = 0;
         while (i < chunk_len) : (i += 1) {
             dest[copied + i] = src[i];
@@ -1417,6 +1167,16 @@ fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []
 
 fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: []const u8) bool {
     if (src.len == 0) return true;
+
+    const original_cr3 = readCr3();
+    if (original_cr3 != kernel_cr3_value) {
+        writeCr3(kernel_cr3_value);
+    }
+    defer {
+        if (original_cr3 != kernel_cr3_value) {
+            writeCr3(original_cr3);
+        }
+    }
 
     var copied: usize = 0;
     while (copied < src.len) {
@@ -1441,7 +1201,8 @@ fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: []co
         const last_paddr, const last_overflow = @addWithOverflow(dst_paddr, @as(u64, @intCast(chunk_len - 1)));
         if (last_overflow != 0 or last_paddr >= four_gib) return false;
 
-        const dst: [*]u8 = @ptrFromInt(dst_paddr);
+        const dst_page = mapPhysPageForKernelCopy(dst_paddr) orelse return false;
+        const dst: [*]u8 = @ptrCast(dst_page + page_off);
         var i: usize = 0;
         while (i < chunk_len) : (i += 1) {
             dst[i] = src[copied + i];
@@ -1499,16 +1260,16 @@ pub export fn invalidOpcodeHandlerCommon() callconv(.c) noreturn {
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
     if (!kernel_state_ready) return syscall_err_not_ready;
     const state = &kernel_state_global;
-    const proc = current_user_principal;
-    if (scheduler_log_int80 and scheduler_int80_log_count < scheduler_int80_log_max_lines) {
+    const proc = scheduler.current_user_principal;
+    if (scheduler_log_int80 and scheduler.scheduler_int80_log_count < scheduler_int80_log_max_lines) {
         serialWrite("INT80 dispatch ");
-        serialWrite(threadLabel(current_thread_index));
+        serialWrite(threadLabel(scheduler.current_thread_index));
         serialWrite("/");
         serialWrite(principalLabel(proc));
         serialWrite(" SYS=");
         printHex(frame.rax);
         serialWrite("\n");
-        scheduler_int80_log_count +%= 1;
+        scheduler.scheduler_int80_log_count +%= 1;
     }
 
     switch (frame.rax) {
@@ -1531,18 +1292,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_map_page => {
             const writable = (frame.rdx & 0x1) != 0;
-            var is_window_cap_page = false;
-            for (state.windows) |window| {
-                if (!window.active) continue;
-                if (window.cap_paddr == frame.rsi) {
-                    is_window_cap_page = true;
-                    break;
-                }
-            }
             if (capability.mapUserPageFromCapability(state, proc, frame.rdi, frame.rsi, writable)) {
-                if (is_window_cap_page) {
-                    logWindowCapPageDiag("window_cap map_page", proc, frame.rsi, frame.rdi);
-                }
                 return syscall_ok;
             }
             return syscall_err_map;
@@ -1611,6 +1361,19 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                     return syscall_err_alloc;
                 },
                 error.MapFailed => {
+                    var existing_idx: ?usize = null;
+                    var existing_paddr: u64 = 0;
+                    var scan_i: usize = 0;
+                    const scan_pages: usize = @intCast(page_count_u64);
+                    while (scan_i < scan_pages) : (scan_i += 1) {
+                        const offset = @as(u64, @intCast(scan_i)) * 4096;
+                        const va = frame.rdi + offset;
+                        if (capability.lookupUserMappedPaddrForVa(proc, va)) |paddr| {
+                            existing_idx = scan_i;
+                            existing_paddr = paddr;
+                            break;
+                        }
+                    }
                     serialWrite("sys_alloc_map_pages map failed proc=");
                     serialWrite(principalLabel(proc));
                     serialWrite(" base_va=");
@@ -1619,6 +1382,14 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                     printNumber(page_count_u64);
                     serialWrite(" out_va=");
                     printHex(frame.rcx);
+                    if (existing_idx) |idx| {
+                        serialWrite(" first_existing_idx=");
+                        printNumber(idx);
+                        serialWrite(" first_existing_va=");
+                        printHex(frame.rdi + (@as(u64, @intCast(idx)) * 4096));
+                        serialWrite(" first_existing_paddr=");
+                        printHex(existing_paddr);
+                    }
                     serialWrite("\n");
                     return syscall_err_map;
                 },
@@ -1699,7 +1470,6 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 kernel.KernelError.OutOfFreePages => return syscall_err_alloc,
                 else => return syscall_err_alloc,
             };
-            logWindowCapPageDiag("window_cap create", proc, created.window_cap_paddr, null);
             return created.window_cap_paddr;
         },
         syscall_queue_submit => {
@@ -1783,9 +1553,6 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 logSchedulerRaceSendCap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
                 return syscall_err_endpoint;
             };
-            if (proc == .Process0) {
-                logRuntimeFramebufferSummaryBeforeSendCap();
-            }
             state.sendCapOnEndpoint(proc, endpoint_id, frame.rdi) catch |err| switch (err) {
                 kernel.KernelError.EndpointNotFound => {
                     logSchedulerRaceSendCap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
@@ -1800,12 +1567,14 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                     return syscall_err_send;
                 },
             };
-            if (deferred_compositor_launched and
+            wakeWaitingThreadForPrincipal(to);
+            noteStartupClientCapSent(proc, to, endpoint_id);
+            if (deferred_compositor.launched and
                 (proc == .Process2 or proc == .Process4 or proc == .Process5) and
                 to == .Process1 and
                 endpoint_id == kernel.endpoint_to_process1)
             {
-                compositor_thread1_priority_active = true;
+                scheduler.compositor_thread1_priority_active = true;
             }
             if (enable_cap_table_dump_logs) {
                 dumpAllProcessCaps(state);
@@ -1817,10 +1586,30 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 kernel.KernelError.MailboxEmpty => syscall_err_empty,
                 else => syscall_err_send,
             };
-            if (proc == .Process1 and received >= 0x1000) {
-                compositor_thread1_priority_active = false;
+            if (proc == .Process1 and received >= 0x1000 and !compositor_runtime_priority_requested) {
+                refreshCompositorPriorityActive();
             }
             return received;
+        },
+        syscall_wait_event => {
+            const wait_mailbox = (frame.rdi & 0x1) != 0;
+            const timeout_ticks = frame.rsi;
+            if (wait_mailbox) {
+                const received = state.recvCap(proc) catch |err| switch (err) {
+                    kernel.KernelError.MailboxEmpty => 0,
+                    else => return syscall_err_send,
+                };
+                if (received >= 0x1000) {
+                    if (proc == .Process1 and !compositor_runtime_priority_requested) {
+                        refreshCompositorPriorityActive();
+                    }
+                    return received;
+                }
+            }
+            if (!blockCurrentThreadForEvent(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
+                return syscall_err_not_ready;
+            }
+            return syscall_ok;
         },
         syscall_revoke_tree => {
             state.revokeCapTree(proc, frame.rdi) catch return syscall_err_revoke;
@@ -1848,7 +1637,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 serialWrite("\n");
                 return syscall_err_invalid;
             }
-            const current_thread = current_thread_index;
+            const current_thread = scheduler.current_thread_index;
             const target_ctx = getThreadContextConst(target_thread).?;
             if (!target_ctx.ready) {
                 logSchedulerRaceSwitch(current_thread, target_thread, "target_not_ready");
@@ -1867,24 +1656,29 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             }
             return syscall_ok;
         },
+        syscall_launch_pie_user => {
+            return launchPieUserThread(frame);
+        },
         syscall_log => {
             const req_len_u64 = frame.rsi;
             if (req_len_u64 == 0) return syscall_ok;
-            if (req_len_u64 > user_log_scratch.len) return syscall_err_log;
+            if (req_len_u64 > user_log_max_bytes) return syscall_err_invalid;
 
             const req_len: usize = @intCast(req_len_u64);
-            if (!copyUserBytesFromVa(proc, frame.rdi, user_log_scratch[0..req_len])) return syscall_err_log;
+            var buf: [user_log_max_bytes]u8 = undefined;
+            const msg = buf[0..req_len];
+            if (!copyUserBytesFromVa(proc, frame.rdi, msg)) return syscall_err_invalid;
 
-            serialWrite("userlog ");
-            serialWrite(threadLabel(current_thread_index));
-            serialWrite(": ");
-            serialWrite(user_log_scratch[0..req_len]);
-            if (user_log_scratch[req_len - 1] != '\n') {
+            if (!shouldSuppressSerialUserLog(msg)) {
+                serialWrite("userlog ");
+                serialWrite(threadLabel(scheduler.current_thread_index));
+                serialWrite(": ");
+                serialWrite(msg);
                 serialWrite("\n");
             }
-            updateBootLogQueueReadyStatusFromUserLog(proc, user_log_scratch[0..req_len]);
-            updateBootTimingFromUserLog(proc, user_log_scratch[0..req_len]);
-            tryLaunchDeferredCompositorFromLog(frame, proc, user_log_scratch[0..req_len]);
+            updateCompositorPriorityFromUserLog(proc, msg);
+            updateBootLogQueueReadyStatusFromUserLog(proc, msg);
+            tryLaunchDeferredCompositorFromLog(frame, proc, msg);
             return syscall_ok;
         },
         else => return syscall_err_invalid,
@@ -1892,76 +1686,97 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
 }
 
 fn maybeLogSchedulerPerfTick() void {
-    if (scheduler_perf_user_ticks < scheduler_perf_report_interval_ticks) return;
-    serialWrite("SCHED perf user_ticks=");
-    printNumber(scheduler_perf_user_ticks);
-    serialWrite(" process1_ticks=");
-    printNumber(scheduler_perf_process1_ticks);
-    serialWrite(" process1_pct=");
-    if (scheduler_perf_user_ticks > 0) {
-        printNumber((scheduler_perf_process1_ticks * 100) / scheduler_perf_user_ticks);
-    } else {
-        printNumber(0);
-    }
-    serialWrite(" thread1_ticks=");
-    printNumber(scheduler_perf_thread1_ticks);
-    serialWrite(" thread1_pct=");
-    if (scheduler_perf_user_ticks > 0) {
-        printNumber((scheduler_perf_thread1_ticks * 100) / scheduler_perf_user_ticks);
-    } else {
-        printNumber(0);
-    }
-    serialWrite(" lapic_tick=");
-    printNumber(lapic_tick_count);
+    if (scheduler.scheduler_perf_user_ticks < scheduler_perf_report_interval_ticks) return;
+    const switch_delta = scheduler.scheduler_switch_count - scheduler_perf_last_switch_count;
+    scheduler_perf_last_switch_count = scheduler.scheduler_switch_count;
+    serialWrite("SCHED perf ticks=");
+    printNumber(scheduler.scheduler_perf_user_ticks);
+    serialWrite(" proc1=");
+    printNumber(scheduler.scheduler_perf_process1_ticks);
+    serialWrite(" thread1=");
+    printNumber(scheduler.scheduler_perf_thread1_ticks);
+    serialWrite(" switches=");
+    printNumber(switch_delta);
+    serialWrite(" active=");
+    serialWrite(if (scheduler.compositor_thread1_priority_active) "1" else "0");
+    serialWrite(" streak=");
+    printNumber(scheduler.compositor_thread1_priority_streak);
     serialWrite("\n");
-    scheduler_perf_user_ticks = 0;
-    scheduler_perf_process1_ticks = 0;
-    scheduler_perf_thread1_ticks = 0;
+    scheduler.scheduler_perf_user_ticks = 0;
+    scheduler.scheduler_perf_process1_ticks = 0;
+    scheduler.scheduler_perf_thread1_ticks = 0;
+}
+
+fn bootlogGateHasPendingStartupThreads() bool {
+    return bootlog_gate_start_thread0 or
+        bootlog_gate_start_thread3 or
+        bootlog_gate_start_thread2 or
+        bootlog_gate_start_thread4 or
+        bootlog_gate_start_thread5;
+}
+
+fn refreshCompositorPriorityActive() void {
+    scheduler.compositor_thread1_priority_active =
+        compositor_runtime_priority_requested and !bootlogGateHasPendingStartupThreads();
+    if (!scheduler.compositor_thread1_priority_active) {
+        scheduler.compositor_thread1_priority_streak = 0;
+    }
+}
+
+fn updateCompositorPriorityFromUserLog(proc: kernel.PrincipalId, message: []const u8) void {
+    if (proc != .Process1) return;
+    if (std.mem.eql(u8, message, "Compositor: drag boost on\n")) {
+        compositor_runtime_priority_requested = true;
+        refreshCompositorPriorityActive();
+    } else if (std.mem.eql(u8, message, "Compositor: drag boost off\n")) {
+        compositor_runtime_priority_requested = false;
+        refreshCompositorPriorityActive();
+    }
 }
 
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
-    lapic_tick_count +%= 1;
+    scheduler.lapic_tick_count +%= 1;
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
     if (!kernel_state_ready) return;
+    wakeThreadsForTimer(scheduler.lapic_tick_count);
     if (scheduler_quantum_ticks == 0) return;
     if (!isUserTrapFrame(frame)) return;
-    scheduler_perf_user_ticks +%= 1;
-    if (getThreadContextConst(current_thread_index)) |ctx| {
-        if (ctx.owner_process == .Process1) scheduler_perf_process1_ticks +%= 1;
+    scheduler.scheduler_perf_user_ticks +%= 1;
+    if (getThreadContextConst(scheduler.current_thread_index)) |ctx| {
+        if (ctx.owner_process == .Process1) scheduler.scheduler_perf_process1_ticks +%= 1;
     }
-    if (current_thread_index == 1) scheduler_perf_thread1_ticks +%= 1;
+    if (scheduler.current_thread_index == 1) scheduler.scheduler_perf_thread1_ticks +%= 1;
     maybeLogSchedulerPerfTick();
     tryStartBootLogGateDeferredInput();
     tryAutoLaunchDeferredCompositor(frame);
 
-    scheduler_tick_accum +%= 1;
-    if (scheduler_tick_accum < scheduler_quantum_ticks) return;
-    scheduler_tick_accum = 0;
+    scheduler.scheduler_tick_accum +%= 1;
+    if (scheduler.scheduler_tick_accum < scheduler_quantum_ticks) return;
+    scheduler.scheduler_tick_accum = 0;
 
-    const current_thread = current_thread_index;
-    if (!compositor_thread1_priority_active) {
-        compositor_thread1_priority_streak = 0;
+    const current_thread = scheduler.current_thread_index;
+    if (!scheduler.compositor_thread1_priority_active) {
+        scheduler.compositor_thread1_priority_streak = 0;
     } else if (current_thread == 1) {
         const compositor_ctx = getThreadContextConst(1) orelse null;
-        if (compositor_ctx != null and compositor_ctx.?.ready and compositor_thread1_priority_streak + 1 < compositor_thread1_priority_hold_quanta) {
-            compositor_thread1_priority_streak +%= 1;
+        if (compositor_ctx != null and compositor_ctx.?.ready and scheduler.compositor_thread1_priority_streak + 1 < compositor_thread1_priority_hold_quanta) {
+            scheduler.compositor_thread1_priority_streak +%= 1;
             return;
         }
-        compositor_thread1_priority_streak = 0;
+        scheduler.compositor_thread1_priority_streak = 0;
     } else {
-        compositor_thread1_priority_streak = 0;
+        scheduler.compositor_thread1_priority_streak = 0;
     }
     const next_thread = pickNextReadyThreadIndex(current_thread);
     if (next_thread == current_thread) return;
-
     if (!switchToThread(next_thread, frame, null)) {
         logSchedulerRaceSwitch(current_thread, next_thread, "timer_preempt_switch_failed");
         return;
     }
 
-    scheduler_switch_count +%= 1;
-    if (scheduler_log_switch and scheduler_switch_count <= scheduler_switch_log_max_lines) {
+    scheduler.scheduler_switch_count +%= 1;
+    if (scheduler_log_switch and scheduler.scheduler_switch_count <= scheduler_switch_log_max_lines) {
         serialWrite("SCHED switch ");
         const current_ctx = getThreadContextConst(current_thread).?;
         const next_ctx = getThreadContextConst(next_thread).?;
@@ -2022,6 +1837,16 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
         \\call restoreCurrentThreadFxState
         \\add $32, %rsp
         \\2:
+        \\mov 128(%rsp), %r10
+        \\mov %r10, user_return_iret_frame(%rip)
+        \\mov 136(%rsp), %r10
+        \\mov %r10, user_return_iret_frame+8(%rip)
+        \\mov 144(%rsp), %r10
+        \\mov %r10, user_return_iret_frame+16(%rip)
+        \\mov 152(%rsp), %r10
+        \\mov %r10, user_return_iret_frame+24(%rip)
+        \\mov 160(%rsp), %r10
+        \\mov %r10, user_return_iret_frame+32(%rip)
         \\pop %r15
         \\pop %r14
         \\pop %r13
@@ -2037,12 +1862,11 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
         \\pop %rcx
         \\pop %rbx
         \\pop %rax
-        \\push %r10
+        \\mov %r10, user_return_saved_r10(%rip)
+        \\lea user_return_iret_frame(%rip), %rsp
         \\mov user_cr3_value(%rip), %r10
         \\mov %r10, %cr3
-        \\pop %r10
-        // #PF has error_code on stack; remove it before iretq.
-        \\add $8, %rsp
+        \\mov user_return_saved_r10(%rip), %r10
         \\iretq
         \\1:
         \\mov %rsp, %rdx
@@ -2070,136 +1894,285 @@ pub export fn doubleFaultHandlerStub() callconv(.naked) noreturn {
 }
 
 pub export fn syscallHandlerStub() callconv(.naked) noreturn {
-    asm volatile (
-    // ring3 -> kernel entry: scratch 利用前に r10 を退避し、完全保存を維持する。
-        \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
-        \\mov %r10, %cr3
-        \\pop %r10
-        \\push %rax
-        \\push %rbx
-        \\push %rcx
-        \\push %rdx
-        \\push %rsi
-        \\push %rdi
-        \\push %rbp
-        \\push %r8
-        \\push %r9
-        \\push %r10
-        \\push %r11
-        \\push %r12
-        \\push %r13
-        \\push %r14
-        \\push %r15
-        \\sub $32, %rsp
-        \\call saveCurrentThreadFxState
-        \\add $32, %rsp
-        // Win64: 32-byte shadow space を確保しつつ call 前 16-byte alignment を維持する。
-        \\sub $32, %rsp
-        \\lea 32(%rsp), %rdi
-        \\mov %rdi, %rcx
-        \\call syscallDispatch
-        \\add $32, %rsp
-        // TrapFrame.rax へ戻り値を書き戻す（offsetは comptime で検証済み）
-        \\mov %rax, 112(%rsp)
-        \\sub $32, %rsp
-        \\call restoreCurrentThreadFxState
-        \\add $32, %rsp
-        \\pop %r15
-        \\pop %r14
-        \\pop %r13
-        \\pop %r12
-        \\pop %r11
-        \\pop %r10
-        \\pop %r9
-        \\pop %r8
-        \\pop %rbp
-        \\pop %rdi
-        \\pop %rsi
-        \\pop %rdx
-        \\pop %rcx
-        \\pop %rbx
-        \\pop %rax
-        // kernel -> ring3 return: r10 を壊さず user CR3 を復帰して iretq する。
-        \\push %r10
-        \\mov user_cr3_value(%rip), %r10
-        \\mov %r10, %cr3
-        \\pop %r10
-        \\iretq
-    );
+    if (debug_skip_syscall_fx_state) {
+        asm volatile (
+        // ring3 -> kernel entry: scratch 利用前に r10 を退避し、完全保存を維持する。
+            \\push %r10
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\pop %r10
+            \\push %rax
+            \\push %rbx
+            \\push %rcx
+            \\push %rdx
+            \\push %rsi
+            \\push %rdi
+            \\push %rbp
+            \\push %r8
+            \\push %r9
+            \\push %r10
+            \\push %r11
+            \\push %r12
+            \\push %r13
+            \\push %r14
+            \\push %r15
+            \\sub $32, %rsp
+            \\lea 32(%rsp), %rdi
+            \\mov %rdi, %rcx
+            \\call syscallDispatch
+            \\add $32, %rsp
+            \\mov %rax, 112(%rsp)
+            \\mov 120(%rsp), %r10
+            \\mov %r10, user_return_iret_frame(%rip)
+            \\mov 128(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+8(%rip)
+            \\mov 136(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+16(%rip)
+            \\mov 144(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+24(%rip)
+            \\mov 152(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+32(%rip)
+            \\pop %r15
+            \\pop %r14
+            \\pop %r13
+            \\pop %r12
+            \\pop %r11
+            \\pop %r10
+            \\pop %r9
+            \\pop %r8
+            \\pop %rbp
+            \\pop %rdi
+            \\pop %rsi
+            \\pop %rdx
+            \\pop %rcx
+            \\pop %rbx
+            \\pop %rax
+            \\mov %r10, user_return_saved_r10(%rip)
+            \\lea user_return_iret_frame(%rip), %rsp
+            \\mov user_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\mov user_return_saved_r10(%rip), %r10
+            \\iretq
+        );
+    } else {
+        asm volatile (
+        // ring3 -> kernel entry: scratch 利用前に r10 を退避し、完全保存を維持する。
+            \\push %r10
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\pop %r10
+            \\push %rax
+            \\push %rbx
+            \\push %rcx
+            \\push %rdx
+            \\push %rsi
+            \\push %rdi
+            \\push %rbp
+            \\push %r8
+            \\push %r9
+            \\push %r10
+            \\push %r11
+            \\push %r12
+            \\push %r13
+            \\push %r14
+            \\push %r15
+            \\sub $32, %rsp
+            \\call saveCurrentThreadFxState
+            \\add $32, %rsp
+            \\sub $32, %rsp
+            \\lea 32(%rsp), %rdi
+            \\mov %rdi, %rcx
+            \\call syscallDispatch
+            \\add $32, %rsp
+            \\mov %rax, 112(%rsp)
+            \\sub $32, %rsp
+            \\call restoreCurrentThreadFxState
+            \\add $32, %rsp
+            \\mov 120(%rsp), %r10
+            \\mov %r10, user_return_iret_frame(%rip)
+            \\mov 128(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+8(%rip)
+            \\mov 136(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+16(%rip)
+            \\mov 144(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+24(%rip)
+            \\mov 152(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+32(%rip)
+            \\pop %r15
+            \\pop %r14
+            \\pop %r13
+            \\pop %r12
+            \\pop %r11
+            \\pop %r10
+            \\pop %r9
+            \\pop %r8
+            \\pop %rbp
+            \\pop %rdi
+            \\pop %rsi
+            \\pop %rdx
+            \\pop %rcx
+            \\pop %rbx
+            \\pop %rax
+            \\mov %r10, user_return_saved_r10(%rip)
+            \\lea user_return_iret_frame(%rip), %rsp
+            \\mov user_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\mov user_return_saved_r10(%rip), %r10
+            \\iretq
+        );
+    }
 }
 
 pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
-    asm volatile (
-        \\push %r10
-        \\mov kernel_cr3_value(%rip), %r10
-        \\mov %r10, %cr3
-        \\pop %r10
-        \\push %rax
-        \\push %rbx
-        \\push %rcx
-        \\push %rdx
-        \\push %rsi
-        \\push %rdi
-        \\push %rbp
-        \\push %r8
-        \\push %r9
-        \\push %r10
-        \\push %r11
-        \\push %r12
-        \\push %r13
-        \\push %r14
-        \\push %r15
-        \\mov 128(%rsp), %rax
-        \\and $0x3, %rax
-        \\cmp $0x3, %rax
-        \\jne 0f
-        \\sub $32, %rsp
-        \\call saveCurrentThreadFxState
-        \\add $32, %rsp
-        \\0:
-        \\sub $32, %rsp
-        \\lea 32(%rsp), %rdi
-        \\mov %rdi, %rcx
-        \\call timerInterruptDispatch
-        \\add $32, %rsp
-        \\mov 128(%rsp), %rax
-        \\and $0x3, %rax
-        \\cmp $0x3, %rax
-        \\jne 1f
-        \\sub $32, %rsp
-        \\call restoreCurrentThreadFxState
-        \\add $32, %rsp
-        \\1:
-        \\pop %r15
-        \\pop %r14
-        \\pop %r13
-        \\pop %r12
-        \\pop %r11
-        \\pop %r10
-        \\pop %r9
-        \\pop %r8
-        \\pop %rbp
-        \\pop %rdi
-        \\pop %rsi
-        \\pop %rdx
-        \\pop %rcx
-        \\pop %rbx
-        \\pop %rax
-        \\push %r10
-        \\mov 16(%rsp), %r10
-        \\and $0x3, %r10
-        \\cmp $0x3, %r10
-        \\jne 2f
-        \\mov user_cr3_value(%rip), %r10
-        \\jmp 3f
-        \\2:
-        \\mov kernel_cr3_value(%rip), %r10
-        \\3:
-        \\mov %r10, %cr3
-        \\pop %r10
-        \\iretq
-    );
+    if (debug_skip_timer_fx_state) {
+        asm volatile (
+            \\push %r10
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\pop %r10
+            \\push %rax
+            \\push %rbx
+            \\push %rcx
+            \\push %rdx
+            \\push %rsi
+            \\push %rdi
+            \\push %rbp
+            \\push %r8
+            \\push %r9
+            \\push %r10
+            \\push %r11
+            \\push %r12
+            \\push %r13
+            \\push %r14
+            \\push %r15
+            \\sub $32, %rsp
+            \\lea 32(%rsp), %rdi
+            \\mov %rdi, %rcx
+            \\call timerInterruptDispatch
+            \\add $32, %rsp
+            \\mov 120(%rsp), %r10
+            \\mov %r10, user_return_iret_frame(%rip)
+            \\mov 128(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+8(%rip)
+            \\mov 136(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+16(%rip)
+            \\mov 144(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+24(%rip)
+            \\mov 152(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+32(%rip)
+            \\pop %r15
+            \\pop %r14
+            \\pop %r13
+            \\pop %r12
+            \\pop %r11
+            \\pop %r10
+            \\pop %r9
+            \\pop %r8
+            \\pop %rbp
+            \\pop %rdi
+            \\pop %rsi
+            \\pop %rdx
+            \\pop %rcx
+            \\pop %rbx
+            \\pop %rax
+            \\mov %r10, user_return_saved_r10(%rip)
+            \\mov 8(%rsp), %r10
+            \\and $0x3, %r10
+            \\cmp $0x3, %r10
+            \\jne 2f
+            \\lea user_return_iret_frame(%rip), %rsp
+            \\mov user_cr3_value(%rip), %r10
+            \\jmp 3f
+            \\2:
+            \\mov kernel_cr3_value(%rip), %r10
+            \\3:
+            \\mov %r10, %cr3
+            \\mov user_return_saved_r10(%rip), %r10
+            \\iretq
+        );
+    } else {
+        asm volatile (
+            \\push %r10
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\pop %r10
+            \\push %rax
+            \\push %rbx
+            \\push %rcx
+            \\push %rdx
+            \\push %rsi
+            \\push %rdi
+            \\push %rbp
+            \\push %r8
+            \\push %r9
+            \\push %r10
+            \\push %r11
+            \\push %r12
+            \\push %r13
+            \\push %r14
+            \\push %r15
+            \\mov 128(%rsp), %rax
+            \\and $0x3, %rax
+            \\cmp $0x3, %rax
+            \\jne 0f
+            \\sub $32, %rsp
+            \\call saveCurrentThreadFxState
+            \\add $32, %rsp
+            \\0:
+            \\sub $32, %rsp
+            \\lea 32(%rsp), %rdi
+            \\mov %rdi, %rcx
+            \\call timerInterruptDispatch
+            \\add $32, %rsp
+            \\mov 128(%rsp), %rax
+            \\and $0x3, %rax
+            \\cmp $0x3, %rax
+            \\jne 1f
+            \\sub $32, %rsp
+            \\call restoreCurrentThreadFxState
+            \\add $32, %rsp
+            \\1:
+            \\mov 120(%rsp), %r10
+            \\mov %r10, user_return_iret_frame(%rip)
+            \\mov 128(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+8(%rip)
+            \\mov 136(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+16(%rip)
+            \\mov 144(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+24(%rip)
+            \\mov 152(%rsp), %r10
+            \\mov %r10, user_return_iret_frame+32(%rip)
+            \\pop %r15
+            \\pop %r14
+            \\pop %r13
+            \\pop %r12
+            \\pop %r11
+            \\pop %r10
+            \\pop %r9
+            \\pop %r8
+            \\pop %rbp
+            \\pop %rdi
+            \\pop %rsi
+            \\pop %rdx
+            \\pop %rcx
+            \\pop %rbx
+            \\pop %rax
+            \\mov %r10, user_return_saved_r10(%rip)
+            \\mov 8(%rsp), %r10
+            \\and $0x3, %r10
+            \\cmp $0x3, %r10
+            \\jne 2f
+            \\lea user_return_iret_frame(%rip), %rsp
+            \\mov user_cr3_value(%rip), %r10
+            \\jmp 3f
+            \\2:
+            \\mov kernel_cr3_value(%rip), %r10
+            \\3:
+            \\mov %r10, %cr3
+            \\mov user_return_saved_r10(%rip), %r10
+            \\iretq
+        );
+    }
 }
 
 pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
@@ -2290,9 +2263,9 @@ pub export fn invalidOpcodeHandlerStub() callconv(.naked) noreturn {
 fn loadGdtAndReloadSegments() void {
     const tss_base = @intFromPtr(&tss);
     const tss_limit: u64 = @sizeOf(Tss) - 1;
-    tss.rsp0 = @intFromPtr(&ring0_stack) + ring0_stack.len;
-    tss.ist1 = @intFromPtr(&pf_ist_stack) + pf_ist_stack.len;
-    tss.ist2 = @intFromPtr(&df_ist_stack) + df_ist_stack.len;
+    tss.rsp0 = stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes);
+    tss.ist1 = stackTop(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes);
+    tss.ist2 = stackTop(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes);
     tss.iomap_base = @sizeOf(Tss);
     gdt[5] =
         (tss_limit & 0xFFFF) |
@@ -2362,25 +2335,25 @@ fn printNumber(value: anytype) void {
     serial.printNumber(value);
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(buf[0..], "{}", .{value}) catch return;
-    appendBootLog(s);
+    kernel_log.appendText(s);
 }
 
 fn printHex(value: u64) void {
-    serial.printHex(value);
-    var buf: [18]u8 = undefined;
-    const s = std.fmt.bufPrint(buf[0..], "0x{x}", .{value}) catch return;
-    appendBootLog(s);
-}
-
-fn logRuntimeFramebufferSummaryBeforeSendCap() void {
-    if (runtime_framebuffer_log_before_send_cap_done) return;
-    const info = runtime_framebuffer_info orelse return;
-    runtime_framebuffer_log_before_send_cap_done = true;
-
-    serialWriteFmt(
-        "framebuffer before send_cap\n  fb_paddr=0x{x}\n  fb_size={} bytes\n  fb_resolution={}x{}\n  fb_pitch={}\n",
-        .{ info.paddr, info.size_bytes, info.width, info.height, info.pixels_per_scan_line },
-    );
+    const hex = "0123456789abcdef";
+    serial.write("0x");
+    kernel_log.appendText("0x");
+    var started = false;
+    var shift: u6 = 60;
+    while (true) {
+        const nibble: u4 = @intCast((value >> shift) & 0xF);
+        if (started or nibble != 0 or shift == 0) {
+            serial.writeByte(hex[nibble]);
+            kernel_log.appendByte(hex[nibble]);
+            started = true;
+        }
+        if (shift == 0) break;
+        shift -= 4;
+    }
 }
 
 const ExitBootResult = enum {
@@ -2441,6 +2414,14 @@ fn invlpg(addr: u64) void {
         : .{ .memory = true });
 }
 
+fn mapPhysPageForKernelCopy(page_paddr: u64) ?[*]u8 {
+    const page_base = page_paddr & ~@as(u64, 0xFFF);
+    if (page_base >= four_gib) return null;
+    phys_copy_window_pt[0] = page_base | page_present | page_rw;
+    invlpg(phys_copy_window_va);
+    return @ptrFromInt(phys_copy_window_va);
+}
+
 fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
     if (target_cr3 == 0) return;
     const current_cr3 = readCr3();
@@ -2462,6 +2443,87 @@ fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {
     _ = va;
 }
 
+fn stackTop(region: []u8, usable_bytes: usize) u64 {
+    _ = usable_bytes;
+    return @intFromPtr(region.ptr) + region.len - guard_page_bytes;
+}
+
+fn stackBottom(region: []u8, usable_bytes: usize) u64 {
+    return stackTop(region, usable_bytes) - usable_bytes;
+}
+
+fn alignedStackRegion(raw: []u8) []u8 {
+    const base = @intFromPtr(raw.ptr);
+    const aligned_base = (base + (stack_region_align - 1)) & ~(stack_region_align - 1);
+    const start: usize = @intCast(aligned_base - base);
+    return raw[start .. start + stack_region_bytes];
+}
+
+fn installGuardedIdentityStackRegion(region: []u8, usable_bytes: usize, pt_tables: *[stack_region_chunk_count][page_entries]u64) bool {
+    if (region.len != stack_region_bytes) {
+        serialWrite("guard map fail: bad region len\n");
+        return false;
+    }
+    if (usable_bytes == 0) {
+        serialWrite("guard map fail: zero usable bytes\n");
+        return false;
+    }
+    if (usable_bytes + (2 * guard_page_bytes) > region.len) {
+        serialWrite("guard map fail: usable exceeds region\n");
+        return false;
+    }
+
+    const region_base = @intFromPtr(region.ptr);
+    if ((region_base & (stack_region_align - 1)) != 0) {
+        serialWrite("guard map fail: unaligned region base=");
+        printHex(region_base);
+        serialWrite("\n");
+        return false;
+    }
+
+    const usable_start = stackBottom(region, usable_bytes);
+    const usable_end = stackTop(region, usable_bytes);
+    const pml4_index: usize = @intCast((region_base >> 39) & 0x1FF);
+    const pdp_index: usize = @intCast((region_base >> 30) & 0x1FF);
+    const pd_index: usize = @intCast((region_base >> 21) & 0x1FF);
+    if (pml4_index != 0 or pdp_index >= pd_table_count or (pd_index + stack_region_chunk_count) > page_entries) {
+        serialWrite("guard map fail: region outside identity map base=");
+        printHex(region_base);
+        serialWrite(" pml4=");
+        printHex(pml4_index);
+        serialWrite(" pdp=");
+        printHex(pdp_index);
+        serialWrite(" pd=");
+        printHex(pd_index);
+        serialWrite("\n");
+        return false;
+    }
+
+    var chunk_index: usize = 0;
+    while (chunk_index < stack_region_chunk_count) : (chunk_index += 1) {
+        const chunk_base = region_base + (@as(u64, @intCast(chunk_index)) * two_mib);
+        const pt = &pt_tables[chunk_index];
+        @memset(pt[0..], 0);
+
+        var page_index: usize = 0;
+        while (page_index < page_entries) : (page_index += 1) {
+            const page_base = chunk_base + (@as(u64, @intCast(page_index)) * 4096);
+            if (page_base < usable_start or page_base >= usable_end) continue;
+            pt[page_index] = page_base | page_present | page_rw;
+        }
+
+        const pt_pa = @intFromPtr(pt);
+        if (pt_pa >= four_gib) {
+            serialWrite("guard map fail: pt above 4GiB pt_pa=");
+            printHex(pt_pa);
+            serialWrite("\n");
+            return false;
+        }
+        pd_tables[pdp_index][pd_index + chunk_index] = pt_pa | page_present | page_rw;
+    }
+    return true;
+}
+
 fn installIdentityPageTables0To1GiB() bool {
     @memset(pml4_table[0..], 0);
     @memset(pdp_table[0..], 0);
@@ -2480,9 +2542,10 @@ fn installIdentityPageTables0To1GiB() bool {
     const pd0_pa: u64 = @intFromPtr(&pd_tables[0]);
     const high_pdp_pa: u64 = @intFromPtr(&high_mmio_pdp_table);
     const high_pd0_pa: u64 = @intFromPtr(&high_mmio_pd_tables[0]);
+    const phys_copy_window_pt_pa: u64 = @intFromPtr(&phys_copy_window_pt);
 
     // この段階では 0..4GiB を identity map する。テーブル実体も 4GiB 未満前提。
-    if (pml4_pa >= four_gib or pdp_pa >= four_gib or pd0_pa >= four_gib or high_pdp_pa >= four_gib or high_pd0_pa >= four_gib) return false;
+    if (pml4_pa >= four_gib or pdp_pa >= four_gib or pd0_pa >= four_gib or high_pdp_pa >= four_gib or high_pd0_pa >= four_gib or phys_copy_window_pt_pa >= four_gib) return false;
 
     const kernel_table_flags = page_present | page_rw;
     const kernel_large_page_flags = page_present | page_rw | page_ps;
@@ -2501,6 +2564,7 @@ fn installIdentityPageTables0To1GiB() bool {
         }
     }
     pml4_table[high_mmio_pml4_index] = high_pdp_pa | kernel_table_flags;
+    @memset(phys_copy_window_pt[0..], 0);
     var high_pdp_idx: usize = 0;
     while (high_pdp_idx < high_mmio_pdp_table_count) : (high_pdp_idx += 1) {
         const high_pd_pa: u64 = @intFromPtr(&high_mmio_pd_tables[high_pdp_idx]);
@@ -2513,6 +2577,11 @@ fn installIdentityPageTables0To1GiB() bool {
             high_mmio_pd_tables[high_pdp_idx][i] = base | kernel_large_page_flags;
         }
     }
+    high_mmio_pd_tables[0][0] = phys_copy_window_pt_pa | kernel_table_flags;
+
+    if (!installGuardedIdentityStackRegion(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes, &ring0_stack_guard_pt)) return false;
+    if (!installGuardedIdentityStackRegion(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes, &pf_ist_stack_guard_pt)) return false;
+    if (!installGuardedIdentityStackRegion(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes, &df_ist_stack_guard_pt)) return false;
 
     writeCr3(pml4_pa);
     kernel_cr3_value = pml4_pa;
@@ -2551,6 +2620,7 @@ fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64, us
     var pt_slot_init: usize = 0;
     while (pt_slot_init < UserAddressSpace.max_dynamic_pt_pages) : (pt_slot_init += 1) {
         space.pt_page_pd_index[pt_slot_init] = UserAddressSpace.no_pd_index;
+        @memset(space.pt_pages[pt_slot_init][0..], 0);
     }
     space.pt_page_used_len = 0;
 
@@ -2582,6 +2652,7 @@ fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64, us
     space.pt_pages[stack_slot][stack_pt_index] = user_stack_paddr | page_present | page_rw | page_user;
 
     space.cr3 = user_pml4_pa;
+    if (principal == .Process5) {}
     return true;
 }
 
@@ -2599,19 +2670,19 @@ fn buildUserAddressSpaceFromCapabilities(
     return buildUserAddressSpace(principal, user_cap.paddr, stack_cap.paddr);
 }
 
-fn createUserProcess(
+fn tryCreateUserProcess(
     state: *kernel.KernelState,
     principal: kernel.PrincipalId,
     thread_index: usize,
     role_label: []const u8,
-) CreatedUserProcess {
+) ?CreatedUserProcess {
     const user_page = state.allocPageTo(principal, &global_free_list) catch |err| {
         serialWrite("allocPageTo for ");
         serialWrite(role_label);
         serialWrite(" user map failed: ");
         serialWrite(@errorName(err));
         serialWrite("\n");
-        while (true) asm volatile ("hlt");
+        return null;
     };
     const user_stack_page = state.allocPageTo(principal, &global_free_list) catch |err| {
         serialWrite("allocPageTo for ");
@@ -2619,21 +2690,32 @@ fn createUserProcess(
         serialWrite(" user stack failed: ");
         serialWrite(@errorName(err));
         serialWrite("\n");
-        while (true) asm volatile ("hlt");
+        return null;
     };
     if (!buildUserAddressSpaceFromCapabilities(state, principal, user_page, user_stack_page)) {
         serialWrite(role_label);
         serialWrite(" process page table build failed\n");
-        while (true) asm volatile ("hlt");
+        return null;
     }
     if (!initThreadContext(thread_index, principal)) {
         serialWrite(role_label);
         serialWrite(" thread context init failed\n");
-        while (true) asm volatile ("hlt");
+        return null;
     }
     return .{
         .user_page = user_page,
         .user_stack_page = user_stack_page,
+    };
+}
+
+fn createUserProcess(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    thread_index: usize,
+    role_label: []const u8,
+) CreatedUserProcess {
+    return tryCreateUserProcess(state, principal, thread_index, role_label) orelse {
+        while (true) asm volatile ("hlt");
     };
 }
 
@@ -2900,11 +2982,6 @@ fn setupMouseButtonDemoProcess(
     return .{ .process = process };
 }
 
-fn setupPieUserProcess(state: *kernel.KernelState) MouseButtonDemoProcessSetup {
-    const process = createUserProcess(state, .Process2, 2, "pie user");
-    return .{ .process = process };
-}
-
 fn setupTerminalWindowProcess(
     state: *kernel.KernelState,
     keyboard_shared_page: kernel.PageCapability,
@@ -2960,12 +3037,58 @@ fn determineBootRuntimeMode(mouse_driver_cfg: ?MouseDriverConfig, keyboard_drive
 }
 
 fn activateThreadOrHalt(thread_index: usize) void {
-    if (!activateThread(thread_index)) {
-        serialWrite("activate Thread");
-        printNumber(thread_index);
-        serialWrite(" failed\n");
-        while (true) asm volatile ("hlt");
+    if (threadContextLooksCorrupted(thread_index)) {
+        if (repairThreadContext(thread_index)) {
+            serialOnlyWrite("activate Thread REPAIR idx=");
+            serialOnlyWriteThreadIndexLabel(thread_index);
+            serialOnlyWrite(" ok\n");
+        }
     }
+    if (activateThread(thread_index)) return;
+    // Retry once after repair, even if fast corruption check did not trigger.
+    if (repairThreadContext(thread_index) and activateThread(thread_index)) {
+        serialOnlyWrite("activate Thread REPAIR idx=");
+        serialOnlyWriteThreadIndexLabel(thread_index);
+        serialOnlyWrite(" retry-ok\n");
+        return;
+    }
+
+    // Prevent timer IRQ preemption while emitting failure diagnostics.
+    asm volatile ("cli");
+    serialOnlyWrite("activate Thread DIAG3 idx=");
+    serialOnlyWriteThreadIndexLabel(thread_index);
+    serialOnlyWrite(" failed");
+    if (getThreadContextConst(thread_index)) |ctx| {
+        serialOnlyWrite(" ready=");
+        serialOnlyWriteBool01(ctx.ready);
+        const owner_raw = rawOwnerTag(ctx);
+        serialOnlyWrite(" owner_raw=0x");
+        const hex = "0123456789abcdef";
+        serial.writeByte(hex[(owner_raw >> 4) & 0xF]);
+        serial.writeByte(hex[owner_raw & 0xF]);
+        serialOnlyWrite(" owner=");
+        if (principalFromRawTag(owner_raw)) |owner| {
+            serialOnlyWrite(principalLabel(owner));
+        } else {
+            serialOnlyWrite("invalid");
+        }
+        serialOnlyWrite(" cr3=");
+        serial.writeHexRaw(ctx.cr3);
+    } else {
+        serialOnlyWrite(" ctx=none");
+    }
+    if (expectedPrincipalForThread(thread_index)) |expected| {
+        serialOnlyWrite(" expected_owner=");
+        serialOnlyWrite(principalLabel(expected));
+        if (getUserSpace(expected)) |space| {
+            serialOnlyWrite(" space_cr3=");
+            serial.writeHexRaw(space.cr3);
+        } else {
+            serialOnlyWrite(" space=none");
+        }
+    }
+    serialOnlyWrite("\n");
+    while (true) asm volatile ("hlt");
 }
 
 fn armBootLogGateDeferredInputStart(
@@ -2982,6 +3105,12 @@ fn armBootLogGateDeferredInputStart(
     bootlog_gate_start_thread2 = false;
     bootlog_gate_start_thread4 = false;
     bootlog_gate_start_thread5 = false;
+    startup_process0_shared_sent = false;
+    startup_process2_window_sent = false;
+    startup_process3_shared_sent = false;
+    startup_process4_window_sent = false;
+    startup_process5_window_sent = false;
+    startup_last_client_cap_tick = 0;
 
     if (start_thread0) {
         if (getThreadContext(0)) |ctx| {
@@ -3015,8 +3144,9 @@ fn armBootLogGateDeferredInputStart(
     }
     if (!bootlog_gate_start_thread0 and !bootlog_gate_start_thread3 and !bootlog_gate_start_thread2 and !bootlog_gate_start_thread4 and !bootlog_gate_start_thread5) return;
 
-    bootlog_gate_input_start_tick = lapic_tick_count + delay_ticks;
+    bootlog_gate_input_start_tick = scheduler.lapic_tick_count + delay_ticks;
     bootlog_gate_input_start_armed = true;
+    refreshCompositorPriorityActive();
 }
 
 fn tryStartBootLogGateDeferredInput() void {
@@ -3024,7 +3154,7 @@ fn tryStartBootLogGateDeferredInput() void {
     const mouse_ready = (boot_log_status_flags & boot_log_status_mouse_queue_ready) != 0;
     const keyboard_ready = (boot_log_status_flags & boot_log_status_keyboard_queue_ready) != 0;
 
-    if (lapic_tick_count >= bootlog_gate_input_start_tick) {
+    if (scheduler.lapic_tick_count >= bootlog_gate_input_start_tick) {
         if (bootlog_gate_start_thread0) {
             if (getThreadContext(0)) |ctx| ctx.ready = true;
             bootlog_gate_start_thread0 = false;
@@ -3035,25 +3165,21 @@ fn tryStartBootLogGateDeferredInput() void {
         }
     }
 
-    if (bootlog_gate_start_thread2 and deferred_compositor_launched and mouse_ready) {
+    if (bootlog_gate_start_thread2 and mouse_ready) {
         if (getThreadContext(2)) |ctx| ctx.ready = true;
         bootlog_gate_start_thread2 = false;
     }
-    if (bootlog_gate_start_thread4 and deferred_compositor_launched and keyboard_ready) {
+    if (bootlog_gate_start_thread4 and keyboard_ready) {
         if (getThreadContext(4)) |ctx| ctx.ready = true;
         bootlog_gate_start_thread4 = false;
     }
-    if (bootlog_gate_start_thread5 and deferred_compositor_launched and keyboard_ready) {
+    if (bootlog_gate_start_thread5 and keyboard_ready) {
         if (getThreadContext(5)) |ctx| ctx.ready = true;
         bootlog_gate_start_thread5 = false;
     }
 
-    bootlog_gate_input_start_armed =
-        bootlog_gate_start_thread0 or
-        bootlog_gate_start_thread3 or
-        bootlog_gate_start_thread2 or
-        bootlog_gate_start_thread4 or
-        bootlog_gate_start_thread5;
+    bootlog_gate_input_start_armed = bootlogGateHasPendingStartupThreads();
+    refreshCompositorPriorityActive();
 }
 
 fn setupUserProcessesForMode(
@@ -3089,10 +3215,6 @@ fn setupUserProcessesForMode(
             result.boot_log_console_stack_page = boot_log_console_setup.boot_log_stack_page;
             result.compositor_gpu_config_page = boot_log_console_setup.compositor_gpu_config_page;
             activateThreadOrHalt(1);
-            const pie_user_setup = setupPieUserProcess(state);
-            result.process2_user_page = pie_user_setup.process.user_page;
-            result.process2_user_stack_page = pie_user_setup.process.user_stack_page;
-            activateThreadOrHalt(2);
             if (keyboard_driver_cfg) |cfg| {
                 const keyboard_driver_setup = setupKeyboardDriverProcess(state, cfg);
                 result.process3_user_page = keyboard_driver_setup.process.user_page;
@@ -3140,6 +3262,7 @@ fn setupUserProcessesForMode(
             );
             result.process2_user_page = mouse_button_demo_setup.process.user_page;
             result.process2_user_stack_page = mouse_button_demo_setup.process.user_stack_page;
+            activateThreadOrHalt(2);
             if (keyboard_shared_page_for_demo) |shared_page| {
                 const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, shared_page);
                 result.process4_user_page = keyboard_ascii_demo_setup.process.user_page;
@@ -3150,7 +3273,6 @@ fn setupUserProcessesForMode(
                 result.process5_user_stack_page = terminal_window_setup.process.user_stack_page;
                 activateThreadOrHalt(5);
             }
-
             activateThreadOrHalt(1);
         },
         .MouseCompositor => {
@@ -3184,6 +3306,7 @@ fn setupUserProcessesForMode(
             );
             result.process2_user_page = mouse_button_demo_setup.process.user_page;
             result.process2_user_stack_page = mouse_button_demo_setup.process.user_stack_page;
+            activateThreadOrHalt(2);
             if (keyboard_shared_page_for_demo) |shared_page| {
                 const keyboard_ascii_demo_setup = setupKeyboardAsciiDemoProcess(state, shared_page);
                 result.process4_user_page = keyboard_ascii_demo_setup.process.user_page;
@@ -3194,7 +3317,6 @@ fn setupUserProcessesForMode(
                 result.process5_user_stack_page = terminal_window_setup.process.user_stack_page;
                 activateThreadOrHalt(5);
             }
-
             activateThreadOrHalt(0);
         },
     }
@@ -3361,6 +3483,19 @@ fn updateBootLogQueueReadyStatusFromUserLog(proc: kernel.PrincipalId, message: [
     writeBootLogStatusToUserPage(boot_log_status_page_paddr);
 }
 
+fn noteStartupClientCapSent(from: kernel.PrincipalId, to: kernel.PrincipalId, endpoint_id: u64) void {
+    if (to != .Process1 or endpoint_id != kernel.endpoint_to_process1) return;
+    switch (from) {
+        .Process0 => startup_process0_shared_sent = true,
+        .Process2 => startup_process2_window_sent = true,
+        .Process3 => startup_process3_shared_sent = true,
+        .Process4 => startup_process4_window_sent = true,
+        .Process5 => startup_process5_window_sent = true,
+        else => return,
+    }
+    startup_last_client_cap_tick = scheduler.lapic_tick_count;
+}
+
 fn publishBootLogToUserPage(user_page_paddr: u64) void {
     const page: [*]volatile u8 = @ptrFromInt(user_page_paddr);
     var zero_i: usize = 0;
@@ -3368,8 +3503,8 @@ fn publishBootLogToUserPage(user_page_paddr: u64) void {
         page[zero_i] = 0;
     }
 
-    const copy_len: usize = if (boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else boot_log_len;
-    const start_index: usize = if (boot_log_len > copy_len) boot_log_len - copy_len else 0;
+    const copy_len: usize = if (kernel_log.boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else kernel_log.boot_log_len;
+    const start_index: usize = if (kernel_log.boot_log_len > copy_len) kernel_log.boot_log_len - copy_len else 0;
     const len_u32: u32 = @intCast(copy_len);
     page[0] = @intCast(len_u32 & 0xFF);
     page[1] = @intCast((len_u32 >> 8) & 0xFF);
@@ -3378,7 +3513,7 @@ fn publishBootLogToUserPage(user_page_paddr: u64) void {
     writeBootLogStatusToUserPage(user_page_paddr);
     var i: usize = 0;
     while (i < copy_len) : (i += 1) {
-        page[boot_log_page_header_bytes + i] = boot_log_buffer[start_index + i];
+        page[boot_log_page_header_bytes + i] = kernel_log.boot_log_buffer[start_index + i];
     }
 }
 
@@ -3414,11 +3549,6 @@ fn publishMouseDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, sh
     words[12] = cfg.queue_paddr1;
     words[13] = queue_submit_token;
     words[14] = queue_notify_token;
-    serialWrite("mouse config tokens submit=");
-    printHex(queue_submit_token);
-    serialWrite(" notify=");
-    printHex(queue_notify_token);
-    serialWrite("\n");
 }
 
 fn publishKeyboardDriverConfigPage(user_page_paddr: u64, cfg: MouseDriverConfig, shared_page_paddr: u64, queue_submit_token: u64, queue_notify_token: u64) void {
@@ -3501,11 +3631,11 @@ fn publishMouseSharedPage(user_page_paddr: u64, fb: FramebufferInfo) void {
     words[6] = 0;
     words[7] = 1; // seq
     words[8] = 0; // wheel
-    const text_len: usize = if (boot_log_len > mouse_shared_log_max_bytes) mouse_shared_log_max_bytes else boot_log_len;
+    const text_len: usize = if (kernel_log.boot_log_len > mouse_shared_log_max_bytes) mouse_shared_log_max_bytes else kernel_log.boot_log_len;
     words[9] = @intCast(text_len);
     var j: usize = 0;
     while (j < text_len) : (j += 1) {
-        bytes[mouse_shared_header_bytes + j] = boot_log_buffer[j];
+        bytes[mouse_shared_header_bytes + j] = kernel_log.boot_log_buffer[j];
     }
 }
 
@@ -3556,38 +3686,13 @@ fn logDeferredCompositorLoadFailure(image_bytes: []const u8) void {
     serialWrite("\n");
 }
 
-fn logWindowCapPageDiag(prefix: []const u8, proc: kernel.PrincipalId, paddr: u64, va: ?u64) void {
-    const cap_words: *const [2]u64 = @ptrFromInt(paddr);
-    serialWrite(prefix);
-    serialWrite(" proc=");
-    serialWrite(principalLabel(proc));
-    serialWrite(" paddr=");
-    printHex(paddr);
-    if (va) |mapped_va| {
-        serialWrite(" va=");
-        printHex(mapped_va);
-    }
-    serialWrite(" q0=");
-    printHex(cap_words[0]);
-    serialWrite(" q1=");
-    printHex(cap_words[1]);
-    serialWrite("\n");
-}
-
 fn freeBootScratch(buf: []align(8) u8) void {
     const bs = boot_services_cache orelse return;
     bs.freePool(buf.ptr) catch {};
 }
 
-fn allocateUserSpaces(bs: *uefi.tables.BootServices) bool {
-    const bytes = @sizeOf(UserAddressSpace) * user_process_count;
-    const pages = (bytes + 4095) / 4096;
-    const max_addr: [*]align(4096) uefi.Page = @ptrFromInt(four_gib - 4096);
-    const backing = bs.allocatePages(.{ .max_address = max_addr }, .loader_data, pages) catch return false;
-    user_spaces_backing = backing;
-
-    const ptr: [*]align(@alignOf(UserAddressSpace)) UserAddressSpace = @ptrCast(backing.ptr);
-    user_spaces = ptr[0..user_process_count];
+fn allocateUserSpaces() bool {
+    user_spaces = user_spaces_storage[0..];
     for (user_spaces) |*space| {
         space.* = .{};
     }
@@ -3655,6 +3760,33 @@ fn loadUserElfIntoProcessPagesOrHalt(
     };
 }
 
+fn preparePieUserLaunchThread() bool {
+    if (pie_user_launch_thread_available) return true;
+    if (pie_user_process6_initialized) return false;
+    const image = pie_user_disk_image orelse return false;
+
+    pie_user_process6_initialized = true;
+    const process = tryCreateUserProcess(&kernel_state_global, .Process6, 6, "pie user") orelse return false;
+    if (getThreadContext(6)) |ctx| {
+        ctx.ready = false;
+    }
+
+    const loaded = loadUserElfIntoProcessPages(
+        &kernel_state_global,
+        .Process6,
+        process.user_page.paddr,
+        process.user_stack_page.paddr,
+        image,
+    ) orelse return false;
+    setThreadEntry(6, loaded.entry, user_entry_rsp);
+    if (getThreadContext(6)) |ctx| {
+        ctx.ready = false;
+    }
+    pie_user_launch_thread_available = true;
+    logElfLoadSummary("PieUser ELF mapped", loaded);
+    return true;
+}
+
 fn setThreadEntry(thread_index: usize, entry: u64, rsp: ?u64) void {
     const ctx = getThreadContext(thread_index).?;
     ctx.frame.rip = entry;
@@ -3694,90 +3826,72 @@ fn armDeferredCompositorLaunch(
     wait_mouse_queue_ready: bool,
     wait_keyboard_queue_ready: bool,
 ) void {
-    deferred_compositor_image_classic = classic_image;
-    deferred_compositor_image_gpu = gpu_image;
-    deferred_compositor_user_page_paddr = process1_user_page_paddr;
-    deferred_compositor_user_stack_page_paddr = process1_user_stack_paddr;
-    deferred_compositor_launch_armed = true;
-    deferred_compositor_launched = false;
-    deferred_compositor_selected_kind = if (gpu_image != null) .gpu else .classic;
-    deferred_compositor_auto_launch_armed = !enable_bootlog_wait_for_enter;
-    deferred_compositor_auto_launch_tick = lapic_tick_count + deferred_compositor_auto_launch_delay_ticks;
-    deferred_compositor_wait_mouse_queue_ready = wait_mouse_queue_ready;
-    deferred_compositor_wait_keyboard_queue_ready = wait_keyboard_queue_ready;
+    deferred_compositor.arm(
+        classic_image,
+        gpu_image,
+        process1_user_page_paddr,
+        process1_user_stack_paddr,
+        !enable_bootlog_wait_for_enter,
+        scheduler.lapic_tick_count + deferred_compositor_auto_launch_delay_ticks,
+        wait_mouse_queue_ready,
+        wait_keyboard_queue_ready,
+    );
 }
 
 fn containsBytes(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
 
-fn isKeyboardEnterPressLog(message: []const u8) bool {
-    // KEY_ENTER=0x1c, KEY_KPENTER=0x60
-    return containsBytes(message, "key code=0x1c value=1") or
-        containsBytes(message, "key code=0x60 value=1");
-}
-
-fn isKeyboardClassicCompositorSelectLog(message: []const u8) bool {
-    return containsBytes(message, "key code=0x21 value=1"); // KEY_F
-}
-
-fn isKeyboardGpuCompositorSelectLog(message: []const u8) bool {
-    return containsBytes(message, "key code=0x22 value=1"); // KEY_G
-}
-
-fn deferredCompositorLabel(kind: DeferredCompositorKind) []const u8 {
-    return switch (kind) {
-        .classic => "classic",
-        .gpu => "gpu",
-    };
+fn shouldSuppressSerialUserLog(message: []const u8) bool {
+    return std.mem.eql(u8, message, "Compositor: drag boost on\n") or
+        std.mem.eql(u8, message, "Compositor: drag boost off\n");
 }
 
 fn launchDeferredCompositor(frame: *TrapFrame, reason: []const u8) void {
-    if (!deferred_compositor_launch_armed or deferred_compositor_launched) return;
+    if (!deferred_compositor.launch_armed or deferred_compositor.launched) return;
 
-    const image = switch (deferred_compositor_selected_kind) {
-        .classic => deferred_compositor_image_classic orelse deferred_compositor_image_gpu orelse return,
-        .gpu => deferred_compositor_image_gpu orelse deferred_compositor_image_classic orelse return,
-    };
+    const image = deferred_compositor.currentImage() orelse return;
 
     const loaded = loadUserElfIntoProcessPages(
         &kernel_state_global,
         .Process1,
-        deferred_compositor_user_page_paddr,
-        deferred_compositor_user_stack_page_paddr,
+        deferred_compositor.user_page_paddr,
+        deferred_compositor.user_stack_page_paddr,
         image,
     ) orelse {
-        deferred_compositor_launch_armed = false;
-        deferred_compositor_auto_launch_armed = false;
-        deferred_compositor_wait_mouse_queue_ready = false;
-        deferred_compositor_wait_keyboard_queue_ready = false;
+        deferred_compositor.markLoadFailed();
         logDeferredCompositorLoadFailure(image);
         serialWrite("deferred compositor launch failed: ELF load\n");
         return;
     };
     setThreadEntry(1, loaded.entry, user_entry_rsp);
-    if (!boot_timing.compositor_launch) {
-        boot_timing.compositor_launch = true;
-        boot_timing.compositor_launch_tick = lapic_tick_count;
-        recordBootTimingEvent("compositor_launch", boot_timing.compositor_launch_tick, null);
+    if (!boot_timing.state.compositor_launch) {
+        boot_timing.state.compositor_launch = true;
+        boot_timing.state.compositor_launch_tick = scheduler.lapic_tick_count;
+        boot_timing.recordEvent("compositor_launch", boot_timing.state.compositor_launch_tick, null);
     }
-    deferred_compositor_launched = true;
-    deferred_compositor_launch_armed = false;
-    deferred_compositor_auto_launch_armed = false;
-    deferred_compositor_wait_mouse_queue_ready = false;
-    deferred_compositor_wait_keyboard_queue_ready = false;
-    compositor_thread1_priority_active = deferred_compositor_selected_kind == .gpu;
+    deferred_compositor.markLaunched();
+    compositor_runtime_priority_requested = deferred_compositor.selected_kind == .gpu;
+    refreshCompositorPriorityActive();
     serialWrite("deferred compositor launch: ");
     serialWrite(reason);
     serialWrite("\n");
     serialWrite("  selected_mode=");
-    serialWrite(deferredCompositorLabel(deferred_compositor_selected_kind));
+    serialWrite(deferred_compositor.label(deferred_compositor.selected_kind));
     serialWrite("\n");
     logElfLoadSummary("Compositor ELF remapped", loaded);
 
-    if (current_thread_index == 1) {
+    if (scheduler.current_thread_index == 1) {
         frame.rip = loaded.entry;
         frame.rsp = user_entry_rsp;
+        return;
+    }
+    if (bootlogGateHasPendingStartupThreads()) {
+        serialWrite("deferred compositor launch: startup threads pending, no immediate switch\n");
+        return;
+    }
+    if (std.mem.eql(u8, reason, "auto")) {
+        serialWrite("deferred compositor launch: auto, no immediate switch\n");
         return;
     }
     if (switchToThread(1, frame, syscall_ok)) {
@@ -3786,52 +3900,25 @@ fn launchDeferredCompositor(frame: *TrapFrame, reason: []const u8) void {
 }
 
 fn tryLaunchDeferredCompositorFromLog(frame: *TrapFrame, proc: kernel.PrincipalId, message: []const u8) void {
-    if (!deferred_compositor_launch_armed or deferred_compositor_launched) return;
-    if (proc != .Process3) return;
-    if (isKeyboardClassicCompositorSelectLog(message)) {
-        deferred_compositor_selected_kind = .classic;
-        serialWrite("deferred compositor mode: classic\n");
-        return;
-    }
-    if (isKeyboardGpuCompositorSelectLog(message)) {
-        if (deferred_compositor_image_gpu != null) {
-            deferred_compositor_selected_kind = .gpu;
-            serialWrite("deferred compositor mode: gpu\n");
-        } else {
-            serialWrite("deferred compositor mode: gpu unavailable\n");
-        }
-        return;
-    }
-    if (!isKeyboardEnterPressLog(message)) return;
+    if (!deferred_compositor.handleKeyboardLog(proc, message, serialWrite)) return;
     launchDeferredCompositor(frame, "keyboard enter");
 }
 
 fn tryAutoLaunchDeferredCompositor(frame: *TrapFrame) void {
-    if (!deferred_compositor_auto_launch_armed) return;
-    if (!deferred_compositor_launch_armed or deferred_compositor_launched) {
-        deferred_compositor_auto_launch_armed = false;
-        return;
-    }
-    var block_mask: u32 = 0;
-    if (deferred_compositor_wait_mouse_queue_ready and (boot_log_status_flags & boot_log_status_mouse_queue_ready) == 0) {
-        block_mask |= 1 << 0;
-    }
-    if (deferred_compositor_wait_keyboard_queue_ready and (boot_log_status_flags & boot_log_status_keyboard_queue_ready) == 0) {
-        block_mask |= 1 << 1;
-    }
-    if (lapic_tick_count < bootlog_entered_user_tick + bootlog_auto_min_visible_ticks) {
-        block_mask |= 1 << 2;
-    }
-    if (lapic_tick_count < deferred_compositor_auto_launch_tick) {
-        block_mask |= 1 << 3;
-    }
-    if (block_mask != 0) {
-        deferred_compositor_auto_debug_last_mask = block_mask;
-        deferred_compositor_auto_debug_last_tick = lapic_tick_count;
-        return;
-    }
-    deferred_compositor_auto_debug_last_mask = 0;
-    deferred_compositor_auto_debug_last_tick = lapic_tick_count;
+    const startup_clients_ready = startup_process0_shared_sent and
+        startup_process2_window_sent and
+        startup_process4_window_sent and
+        startup_process5_window_sent;
+    if (!startup_clients_ready) return;
+    if (scheduler.lapic_tick_count < startup_last_client_cap_tick + startup_client_settle_ticks) return;
+    if (!deferred_compositor.shouldAutoLaunch(
+        scheduler.lapic_tick_count,
+        bootlog_entered_user_tick,
+        bootlog_auto_min_visible_ticks,
+        boot_log_status_flags,
+        boot_log_status_mouse_queue_ready,
+        boot_log_status_keyboard_queue_ready,
+    )) return;
     launchDeferredCompositor(frame, "auto");
 }
 
@@ -3887,28 +3974,40 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
     const user_cs: u64 = gdt_user_code_selector | 0x3;
     const user_ss: u64 = gdt_user_data_selector | 0x3;
     const user_rflags: u64 = user_entry_rflags; // IF=1 で ring3 中の LAPIC timer 割り込みを許可
-    const kernel_transition_rsp: u64 = @intFromPtr(&ring0_stack) + ring0_stack.len;
+    const kernel_transition_rsp = stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes);
+
+    serialWrite("IRET precheck");
+    serialWrite(" gdt_base=");
+    printHex(@intFromPtr(&gdt));
+    serialWrite(" gdt_user_cs_desc=");
+    printHex(gdt[3]);
+    serialWrite(" gdt_user_ss_desc=");
+    printHex(gdt[4]);
+    serialWrite(" user_cr3=");
+    printHex(scheduler.user_cr3_value);
+    serialWrite(" rip=");
+    printHex(user_entry_va);
+    serialWrite(" rsp=");
+    printHex(user_rsp);
+    serialWrite("\n");
 
     restoreCurrentThreadFxState();
 
+    user_return_iret_frame[0] = user_entry_va;
+    user_return_iret_frame[1] = user_cs;
+    user_return_iret_frame[2] = user_rflags;
+    user_return_iret_frame[3] = user_rsp;
+    user_return_iret_frame[4] = user_ss;
+
     asm volatile (
         \\mov %[k_rsp], %%rsp
-        \\pushq %[ss]
-        \\pushq %[rsp]
-        \\pushq %[rflags]
-        \\pushq %[cs]
-        \\pushq %[rip]
+        \\lea user_return_iret_frame(%rip), %%rsp
         \\mov %[ucr3], %%rax
         \\mov %%rax, %%cr3
         \\iretq
         :
-        : [ss] "r" (user_ss),
-          [rsp] "r" (user_rsp),
-          [rflags] "r" (user_rflags),
-          [cs] "r" (user_cs),
-          [rip] "r" (user_entry_va),
-          [k_rsp] "r" (kernel_transition_rsp),
-          [ucr3] "r" (user_cr3_value),
+        : [k_rsp] "r" (kernel_transition_rsp),
+          [ucr3] "r" (scheduler.user_cr3_value),
         : .{ .memory = true });
     unreachable;
 }
@@ -3992,27 +4091,28 @@ fn kernelMain() void {
     serial.writeRaw("RAW ENTER MAIN\n");
     earlyUefiWrite(&[_:0]u16{ 'E', 'N', 'T', 'E', 'R', ' ', 'M', 'A', 'I', 'N', '\r', '\n' });
     serialInit();
+    kernel_log.reset();
     serial.writeRaw("RAW SERIAL INIT DONE\n");
     earlyUefiWrite(&[_:0]u16{ 'S', 'E', 'R', 'I', 'A', 'L', ' ', 'O', 'K', '\r', '\n' });
-    deferred_compositor_launch_armed = false;
-    deferred_compositor_launched = false;
-    deferred_compositor_user_page_paddr = 0;
-    deferred_compositor_user_stack_page_paddr = 0;
-    deferred_compositor_image_classic = null;
-    deferred_compositor_image_gpu = null;
-    deferred_compositor_selected_kind = .classic;
+    deferred_compositor.reset();
     runtime_framebuffer_info = null;
-    runtime_framebuffer_log_before_send_cap_done = false;
     boot_log_status_flags = 0;
     boot_log_status_page_paddr = 0;
-    deferred_compositor_auto_launch_armed = false;
-    deferred_compositor_auto_launch_tick = 0;
     bootlog_gate_input_start_armed = false;
     bootlog_gate_start_thread0 = false;
     bootlog_gate_start_thread3 = false;
     bootlog_gate_start_thread2 = false;
     bootlog_gate_start_thread4 = false;
     bootlog_gate_start_thread5 = false;
+    startup_process0_shared_sent = false;
+    startup_process2_window_sent = false;
+    startup_process3_shared_sent = false;
+    startup_process4_window_sent = false;
+    startup_process5_window_sent = false;
+    startup_last_client_cap_tick = 0;
+    pie_user_launch_thread_available = false;
+    pie_user_process6_initialized = false;
+    pie_user_disk_image = null;
     serialWrite("[stage] boot entry\n");
     serialWrite("MicroKernel Phase1 boot\n");
     _ = gdt_user_code_selector;
@@ -4030,7 +4130,7 @@ fn kernelMain() void {
             .{ kernel_image_base_paddr, kernel_image_size_bytes },
         );
     }
-    if (!allocateUserSpaces(bs)) {
+    if (!allocateUserSpaces()) {
         serialWrite("user address space backing alloc failed\n");
         while (true) asm volatile ("hlt");
     }
@@ -4122,6 +4222,7 @@ fn kernelMain() void {
         serialWrite("disk user ELF load failed\n");
         while (true) asm volatile ("hlt");
     };
+    pie_user_disk_image = disk_user_elf;
     if (enable_framebuffer_server_step1) {
         if (enable_boot_log_console_process) {
             if (enable_virtio_input_mouse) {
@@ -4307,7 +4408,7 @@ fn kernelMain() void {
         .flush_user_tlb_for_principal_va = flushUserTlbForPrincipalVa,
     });
 
-    kernel_state_global = kernel.KernelState.initFromDetectedRegions(memory_stats.detected_regions) catch |err| {
+    kernel_state_global.initFromDetectedRegionsInPlace(memory_stats.detected_regions) catch |err| {
         serialWrite("region init failed: ");
         serialWrite(@errorName(err));
         serialWrite("\n");
@@ -4324,6 +4425,8 @@ fn kernelMain() void {
         state.iommu_audit_hook = null;
         serialWrite("iommu: no-cap-driver mode=off\n");
     }
+    state.debug_window_hook = null;
+    state.debug_alloc_page_hook = null;
     state.pte_sync_hook = null;
     const untyped_bootstrap = untyped_memory.bootstrapProcess0Untyped(state, &global_free_list) catch |err| {
         serialWrite("untyped bootstrap failed: ");
@@ -4531,16 +4634,16 @@ fn kernelMain() void {
     keyboard_driver_config_page = process_setup.keyboard_driver_config_page;
     compositor_gpu_config_page = process_setup.compositor_gpu_config_page;
     mouse_shared_page = process_setup.mouse_shared_page;
+    sanitizeAllThreadContexts();
     if (boot_log_console_page) |page| {
         boot_log_status_page_paddr = page.paddr;
     }
-    scheduler_tick_accum = 0;
-    scheduler_switch_count = 0;
-    boot_timing = .{};
-    boot_timing_trace_len = 0;
-    boot_timing_trace_flushed = false;
-    scheduler_int80_log_count = 0;
-    scheduler_race_log_count = 0;
+    scheduler.scheduler_tick_accum = 0;
+    scheduler.scheduler_switch_count = 0;
+    boot_timing.reset();
+    scheduler.scheduler_int80_log_count = 0;
+    scheduler.scheduler_race_log_count = 0;
+    scheduler.scheduler_probe_log_count = 0;
     if (enable_title_only_ready_logs) {
         logReadyTitle("USER_PAGE_READY");
     } else {
@@ -4761,7 +4864,7 @@ fn kernelMain() void {
                 printHex(boot_log_user_va);
                 serialWrite("\n");
                 serialWrite("  log_bytes=");
-                printNumber(if (boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else boot_log_len);
+                printNumber(if (kernel_log.boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else kernel_log.boot_log_len);
                 serialWrite("\n");
             }
 
@@ -4957,7 +5060,7 @@ fn kernelMain() void {
                 printHex(boot_log_user_va);
                 serialWrite("\n");
                 serialWrite("  log_bytes=");
-                printNumber(if (boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else boot_log_len);
+                printNumber(if (kernel_log.boot_log_len > boot_log_page_payload_bytes) boot_log_page_payload_bytes else kernel_log.boot_log_len);
                 serialWrite("\n");
             }
             if (process3_user_page != null and process3_user_stack_page != null and keyboard_driver_config_page != null and keyboard_driver_cfg != null) {
@@ -4976,18 +5079,6 @@ fn kernelMain() void {
                     printHex(keyboard_driver_config_va);
                     serialWrite("\n");
                 }
-            }
-            if (process2_user_page != null and process2_user_stack_page != null and disk_user_elf != null) {
-                const loaded_pie_user = loadUserElfIntoProcessPagesOrHalt(
-                    state,
-                    .Process2,
-                    process2_user_page.?.paddr,
-                    process2_user_stack_page.?.paddr,
-                    disk_user_elf.?,
-                    "pie user ELF load into user page failed\n",
-                );
-                setThreadEntryIfReady(2, loaded_pie_user.entry, user_entry_rsp);
-                logElfLoadSummary("PieUser ELF mapped", loaded_pie_user);
             }
             if (process4_user_page != null and process4_user_stack_page != null and disk_keyboard_ascii_demo_elf != null) {
                 const loaded_keyboard_ascii_demo = loadUserElfIntoProcessPagesOrHalt(
@@ -5043,7 +5134,6 @@ fn kernelMain() void {
 
     state.pte_sync_hook = capability.syncPageTableRightsForPrincipalPaddr;
     kernel_state_ready = true;
-    logRuntimeFramebufferSummaryBeforeSendCap();
     switch (boot_runtime_mode) {
         .MouseCompositor => {
             if (keyboard_driver_cfg != null and thread_contexts[3].ready) {
@@ -5097,15 +5187,15 @@ fn kernelMain() void {
             if (enable_bootlog_wait_for_enter) bootlog_gate_input_start_delay_ticks else bootlog_gate_auto_input_start_delay_ticks,
         );
     }
-    bootlog_entered_user_tick = lapic_tick_count;
-    boot_timing.user_enter_tick = lapic_tick_count;
-    recordBootTimingEvent("user_enter", boot_timing.user_enter_tick, null);
-    const boot_ctx = getThreadContextConst(current_thread_index).?;
+    bootlog_entered_user_tick = scheduler.lapic_tick_count;
+    boot_timing.state.user_enter_tick = scheduler.lapic_tick_count;
+    boot_timing.recordEvent("user_enter", boot_timing.state.user_enter_tick, null);
+    const boot_ctx = getThreadContextConst(scheduler.current_thread_index).?;
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
 }
 
 pub fn main() void {
-    const boot_stack_top = (@intFromPtr(&ring0_stack) + ring0_stack.len) & ~@as(usize, 0xF);
+    const boot_stack_top = @as(usize, @intCast(stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes))) & ~@as(usize, 0xF);
     asm volatile (
         \\mov %[stack_top], %%rsp
         \\mov %[target], %%rax

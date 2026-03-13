@@ -218,6 +218,7 @@ fn keycodeToAscii(code: u16, shift: bool) ?u8 {
         0x0B => if (shift) ')' else '0',
         0x0C => if (shift) '_' else '-',
         0x0D => if (shift) '+' else '=',
+        0x0E => '\x08',
         0x0F => '\t',
         0x10 => if (shift) 'Q' else 'q',
         0x11 => if (shift) 'W' else 'w',
@@ -256,6 +257,8 @@ fn keycodeToAscii(code: u16, shift: bool) ?u8 {
         0x34 => if (shift) '>' else '.',
         0x35 => if (shift) '?' else '/',
         0x39 => ' ',
+        0x53 => '\x7F',
+        0x6F => '\x7F',
         else => null,
     };
 }

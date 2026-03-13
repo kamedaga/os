@@ -1,13 +1,15 @@
 const window_client = @import("window_client.zig");
 
 const syscall_log: u64 = 0x9;
-const syscall_switch_thread: u64 = 0x5;
+const syscall_launch_pie_user: u64 = 0x16;
 const syscall_ok: u64 = 0;
 
 const keyboard_shared_page_va: usize = 0x3C00_6000;
 const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
 
-const window_pixels_va: usize = 0x2020_0000;
+// Terminal uses a larger backing store than the tiny demo windows, so keep it
+// away from the aux/shared-page area and from the PF recovery test VA.
+const window_pixels_va: usize = 0x2030_0000;
 const window_meta_shared_va: usize = 0x3C00_7000;
 const window_cap_tmp_va: u64 = 0x3C10_0000;
 const window_flags: u32 = window_client.window_flag_low_scale;
@@ -17,15 +19,19 @@ const pixel_height: usize = 160;
 const pixel_pitch: usize = 320;
 const glyph_w: usize = 5;
 const glyph_h: usize = 7;
-const cell_w: usize = 6;
-const cell_h: usize = 8;
+const glyph_scale: usize = 2;
+const cell_w: usize = glyph_w * glyph_scale + 2;
+const cell_h: usize = glyph_h * glyph_scale + 2;
 const cols: usize = pixel_width / cell_w;
 const rows: usize = pixel_height / cell_h;
 
-const bg_color: u32 = 0x0011_1116;
-const fg_color: u32 = 0x00D7_D7D7;
-const title_color: u32 = 0x0084_D6B0;
-const prompt_color: u32 = 0x00E0_E05A;
+const bg_color: u32 = 0x00F5_EFDF;
+const header_bg_color: u32 = 0x00E3_D8C4;
+const prompt_bg_color: u32 = 0x00F0_E5D4;
+const border_color: u32 = 0x0095_8875;
+const fg_color: u32 = 0x002A_241E;
+const title_color: u32 = 0x001E_6170;
+const prompt_color: u32 = 0x00A0_4A00;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -37,12 +43,11 @@ fn userLog(message: []const u8) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn switchThread(target_thread: u64) u64 {
+fn launchPieUser() u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_switch_thread),
-          [arg0] "{rdi}" (target_thread),
+        : [nr] "{rax}" (syscall_launch_pie_user),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -132,15 +137,19 @@ fn drawGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) void 
     var gy: usize = 0;
     while (gy < glyph_h) : (gy += 1) {
         const bits = glyph[gy];
-        const py = y + gy;
-        if (py >= pixel_height) continue;
-        const row = py * pixel_pitch;
         var gx: usize = 0;
         while (gx < glyph_w) : (gx += 1) {
             if ((bits & (@as(u8, 1) << @intCast((glyph_w - 1) - gx))) == 0) continue;
-            const px = x + gx;
-            if (px >= pixel_width) continue;
-            vfb[row + px] = color;
+            const px = x + gx * glyph_scale;
+            const py = y + gy * glyph_scale;
+            var sy: usize = 0;
+            while (sy < glyph_scale and py + sy < pixel_height) : (sy += 1) {
+                const row = (py + sy) * pixel_pitch;
+                var sx: usize = 0;
+                while (sx < glyph_scale and px + sx < pixel_width) : (sx += 1) {
+                    vfb[row + px + sx] = color;
+                }
+            }
         }
     }
 }
@@ -213,9 +222,13 @@ fn clearRow(vfb: [*]volatile u32, row: usize, color: u32) void {
     fillRect(vfb, 0, row * cell_h, pixel_width, cell_h, color);
 }
 
+fn markPromptDirty() void {
+    window_client.markWindowDirtyRect(window_meta_shared_va, 0, (rows - 1) * cell_h, pixel_width, cell_h);
+}
+
 fn renderPrompt(vfb: [*]volatile u32, st: *const TerminalState) void {
-    clearRow(vfb, rows - 1, bg_color);
-    fillRect(vfb, 0, (rows - 1) * cell_h, pixel_width, 1, 0x0030_3038);
+    clearRow(vfb, rows - 1, prompt_bg_color);
+    fillRect(vfb, 0, (rows - 1) * cell_h, pixel_width, 1, border_color);
 
     var prompt_buf: [cols]u8 = [_]u8{' '} ** cols;
     prompt_buf[0] = '>';
@@ -225,15 +238,20 @@ fn renderPrompt(vfb: [*]volatile u32, st: *const TerminalState) void {
         prompt_buf[i + 2] = st.cmd[i];
     }
     drawLine(vfb, rows - 1, prompt_buf[0..], prompt_color);
-    window_client.markWindowDirty(window_meta_shared_va);
 }
 
 fn render(vfb: [*]volatile u32, st: *const TerminalState) void {
     fillRect(vfb, 0, 0, pixel_width, pixel_height, bg_color);
-    fillRect(vfb, 0, cell_h, pixel_width, 1, 0x0030_3038);
-    fillRect(vfb, 0, (rows - 1) * cell_h, pixel_width, 1, 0x0030_3038);
+    fillRect(vfb, 0, 0, pixel_width, cell_h, header_bg_color);
+    fillRect(vfb, 0, (rows - 1) * cell_h, pixel_width, cell_h, prompt_bg_color);
+    fillRect(vfb, 0, 0, pixel_width, 2, border_color);
+    fillRect(vfb, 0, pixel_height - 2, pixel_width, 2, border_color);
+    fillRect(vfb, 0, 0, 2, pixel_height, border_color);
+    fillRect(vfb, pixel_width - 2, 0, 2, pixel_height, border_color);
+    fillRect(vfb, 0, cell_h, pixel_width, 1, border_color);
+    fillRect(vfb, 0, (rows - 1) * cell_h, pixel_width, 1, border_color);
 
-    drawLine(vfb, 0, "terminal  commands: help pie clear", title_color);
+    drawLine(vfb, 0, "terminal  help clear", title_color);
 
     var r: usize = 1;
     while (r + 1 < rows) : (r += 1) {
@@ -261,8 +279,9 @@ fn executeCommand(st: *TerminalState, cmd_text: []const u8) void {
         return;
     }
     if (eqAsciiNoCase(cmd, "pie") or eqAsciiNoCase(cmd, "pie_user")) {
-        if (switchThread(2) == syscall_ok) {
+        if (launchPieUser() == syscall_ok) {
             st.writeLine("launch pie_user ok");
+            st.writeLine("see serial userlog");
         } else {
             st.writeLine("launch pie_user failed");
         }
@@ -297,7 +316,9 @@ pub export fn _start() noreturn {
     const vfb: [*]volatile u32 = @ptrFromInt(window_pixels_va);
     var st = TerminalState{};
     st.writeLine("ready");
+    st.writeLine("type help");
     render(vfb, &st);
+    window_client.markWindowDirty(window_meta_shared_va);
 
     var last_kbd_seq: u64 = keyboard_shared[1];
     while (true) {
@@ -312,11 +333,13 @@ pub export fn _start() noreturn {
                         executeCommand(&st, st.cmd[0..st.cmd_len]);
                         st.cmd_len = 0;
                         render(vfb, &st);
+                        window_client.markWindowDirty(window_meta_shared_va);
                     },
-                    '\x08' => {
+                    '\x08', '\x7f' => {
                         if (st.cmd_len > 0) {
                             st.cmd_len -= 1;
                             renderPrompt(vfb, &st);
+                            markPromptDirty();
                         }
                     },
                     else => {
@@ -324,6 +347,7 @@ pub export fn _start() noreturn {
                             st.cmd[st.cmd_len] = ascii;
                             st.cmd_len += 1;
                             renderPrompt(vfb, &st);
+                            markPromptDirty();
                         }
                     },
                 }

@@ -9,6 +9,7 @@ const syscall_grant_cap: u64 = 0x8;
 const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
 const syscall_map_pages_batch: u64 = 0x15;
+const syscall_wait_event: u64 = 0x17;
 
 const syscall_ok: u64 = 0;
 const syscall_err_empty: u64 = 13;
@@ -74,7 +75,6 @@ const window_title_max_bytes = protocol.window_title_max_bytes;
 const window_map_base_va: usize = 0x3C11_0000;
 const max_window_pixel_pages: usize = 128;
 const max_window_pixel_bytes: usize = max_window_pixel_pages * 4096;
-const max_window_shadow_pixels: usize = max_window_pixel_bytes / @sizeOf(u32);
 const window_map_stride_va: usize = (2 + max_window_pixel_pages) * 4096;
 const WindowCap = protocol.WindowCap;
 const WindowMeta = protocol.WindowMeta;
@@ -92,20 +92,22 @@ const WindowCapSnapshot = struct {
 const Rect = model.Rect;
 const SourceRegion = model.SourceRegion;
 const MouseState = model.MouseState;
+const WindowSlot = model.WindowSlot;
 const WindowState = model.WindowFrame;
 const WindowSource = model.WindowSource;
 const WindowStore = model.WindowStore(max_windows);
 
 var back_buffer_storage: [fb_pixels]u32 align(64) = [_]u32{0} ** fb_pixels;
 var window_store: WindowStore = .{};
-var window_shadow_storage: [max_windows][max_window_shadow_pixels]u32 align(64) =
-    [_][max_window_shadow_pixels]u32{([_]u32{0} ** max_window_shadow_pixels)} ** max_windows;
 var window_shadow_valid: [max_windows]bool = [_]bool{false} ** max_windows;
-var window_gpu_resources: [max_windows]?*virtgpu.Resource = [_]?*virtgpu.Resource{null} ** max_windows;
+var window_gpu_resources: [max_windows]?virtgpu.ResourceHandle = [_]?virtgpu.ResourceHandle{null} ** max_windows;
+var next_window_z_order: u32 = 1;
+var window_paint_order_cache: [max_windows]usize = [_]usize{0} ** max_windows;
+var window_paint_order_count: usize = 0;
+var window_paint_order_dirty = true;
 var first_compose_logged = false;
 var first_present_transfer_logged = false;
 var first_present_flush_logged = false;
-var perf_frame_counter: u64 = 0;
 var logged_invalid_gpu_slot: ?usize = null;
 var logged_first_gpu_sync_slot: bool = false;
 const compositor_perf_report_min_wall_tsc: u64 = 1_000_000_000;
@@ -147,6 +149,7 @@ fn readTsc() u64 {
 const cursor_width: usize = 15;
 const cursor_height: usize = 24;
 const cursor_dim: usize = 64;
+const startup_settle_loops: u32 = 8;
 const cursor_width_i32: i32 = 15;
 const cursor_height_i32: i32 = 24;
 const cursor_shape = [cursor_height][cursor_width]u8{
@@ -200,6 +203,12 @@ fn appendDiagU64Decimal(buf: []u8, idx: *usize, value: u64) void {
     idx.* += text.len;
 }
 
+fn appendDiagHexU64(buf: []u8, idx: *usize, value: u64) void {
+    if (idx.* >= buf.len) return;
+    const text = std.fmt.bufPrint(buf[idx.*..], "0x{x}", .{value}) catch return;
+    idx.* += text.len;
+}
+
 fn appendDiagBoolDigit(buf: []u8, idx: *usize, value: bool) void {
     appendDiagText(buf, idx, if (value) "1" else "0");
 }
@@ -218,8 +227,17 @@ fn logInvalidGpuSlot(slot: usize) void {
 fn logFirstGpuSyncSlot(slot: usize, source: *const WindowSource, frame: *const WindowState) void {
     if (logged_first_gpu_sync_slot) return;
     logged_first_gpu_sync_slot = true;
-    var buf: [192]u8 = undefined;
+    var buf: [256]u8 = undefined;
     var idx: usize = 0;
+    var src0: u32 = 0;
+    var src_center: u32 = 0;
+    if (source.pixel_va != 0 and source.width > 0 and source.height > 0) {
+        const src_pixels: [*]const volatile u32 = @ptrFromInt(source.pixel_va);
+        src0 = src_pixels[0];
+        const center_x = source.width / 2;
+        const center_y = source.height / 2;
+        src_center = src_pixels[center_y * source.pitch + center_x];
+    }
     appendDiagText(buf[0..], &idx, "Compositor: gpu sync slot=");
     appendDiagU64Decimal(buf[0..], &idx, slot);
     appendDiagText(buf[0..], &idx, " window_id=");
@@ -236,21 +254,22 @@ fn logFirstGpuSyncSlot(slot: usize, source: *const WindowSource, frame: *const W
     appendDiagBoolDigit(buf[0..], &idx, frame.active);
     appendDiagText(buf[0..], &idx, " frame_visible=");
     appendDiagBoolDigit(buf[0..], &idx, frame.visible);
+    appendDiagText(buf[0..], &idx, " src0=");
+    appendDiagHexU64(buf[0..], &idx, src0);
+    appendDiagText(buf[0..], &idx, " src_center=");
+    appendDiagHexU64(buf[0..], &idx, src_center);
     appendDiagText(buf[0..], &idx, "\n");
     _ = userLog(buf[0..idx]);
 }
 
-fn logWindowShadowOverflow(slot: usize, needed_pixels: usize) void {
-    var buf: [128]u8 = undefined;
-    var idx: usize = 0;
-    appendDiagText(buf[0..], &idx, "Compositor: shadow overflow slot=");
-    appendDiagU64Decimal(buf[0..], &idx, slot);
-    appendDiagText(buf[0..], &idx, " needed_pixels=");
-    appendDiagU64Decimal(buf[0..], &idx, needed_pixels);
-    appendDiagText(buf[0..], &idx, " capacity=");
-    appendDiagU64Decimal(buf[0..], &idx, max_window_shadow_pixels);
-    appendDiagText(buf[0..], &idx, "\n");
-    _ = userLog(buf[0..idx]);
+fn invalidateWindowPaintOrderCache() void {
+    window_paint_order_dirty = true;
+}
+
+fn setSchedulerBoost(active: bool, state: *bool) void {
+    if (state.* == active) return;
+    state.* = active;
+    _ = userLog(if (active) "Compositor: drag boost on\n" else "Compositor: drag boost off\n");
 }
 
 fn invalidateWindowBodyCache(slot: usize) void {
@@ -298,6 +317,16 @@ fn recvCap() u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_recv_cap),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_wait_event),
+          [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
+          [arg1] "{rsi}" (timeout_ticks),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -425,6 +454,13 @@ fn intersectRect(a: Rect, b: Rect) ?Rect {
     return rect;
 }
 
+fn rectContainsRect(outer: Rect, inner: Rect) bool {
+    return inner.x0 >= outer.x0 and
+        inner.y0 >= outer.y0 and
+        inner.x1 <= outer.x1 and
+        inner.y1 <= outer.y1;
+}
+
 fn fullScreenRect() Rect {
     return .{ .x0 = 0, .y0 = 0, .x1 = fb_width_i32, .y1 = fb_height_i32 };
 }
@@ -526,16 +562,25 @@ fn drawWindowHeaderBackgroundSurface(surface: *const DrawSurface, win: *const Wi
     const header_w = windowWidth(win) - window_border_i32 * 2;
     const header_h = window_header_h_i32 - window_border_i32;
     if (header_w <= 0 or header_h <= 0) return;
+    const header_rect: Rect = .{
+        .x0 = header_x,
+        .y0 = header_y,
+        .x1 = header_x + header_w,
+        .y1 = header_y + header_h,
+    };
+    const clipped = intersectRect(header_rect, surface.clip) orelse return;
 
-    var row: i32 = 0;
-    while (row < header_h) : (row += 1) {
+    var row = clipped.y0 - header_y;
+    while (row < clipped.y1 - header_y) : (row += 1) {
         drawSolidRectSurface(surface, header_x, header_y + row, header_w, 1, headerGradientColorAt(row, header_h));
     }
 
-    if (header_h > 2 and header_w > 2) {
+    if (header_h > 2 and header_w > 2 and clipped.y0 <= header_y + 1 and clipped.y1 > header_y) {
         drawSolidRectSurface(surface, header_x + 1, header_y, header_w - 2, 1, window_header_highlight_color);
-        var x = header_x + 1;
-        while (x < header_x + header_w - 1) : (x += 1) {
+        const x0 = if (clipped.x0 > header_x + 1) clipped.x0 else header_x + 1;
+        const x1 = if (clipped.x1 < header_x + header_w - 1) clipped.x1 else header_x + header_w - 1;
+        var x = x0;
+        while (x < x1) : (x += 1) {
             blendSurfacePixel(surface, x, header_y + 1, window_header_highlight_color, 72);
         }
     }
@@ -558,9 +603,11 @@ fn drawWindowHeaderDividerSurface(surface: *const DrawSurface, win: *const Windo
     const y = contentOriginY(win) - 1;
     const w = windowContentW(win);
     if (w <= 0) return;
+    if (intersectRect(.{ .x0 = x, .y0 = y, .x1 = x + w, .y1 = y + 2 }, surface.clip) == null) return;
     drawSolidRectSurface(surface, x, y, w, 1, window_header_divider_soft_color);
-    var xx = x;
-    while (xx < x + w) : (xx += 1) {
+    const clipped = intersectRect(.{ .x0 = x, .y0 = y + 1, .x1 = x + w, .y1 = y + 2 }, surface.clip) orelse return;
+    var xx = clipped.x0;
+    while (xx < clipped.x1) : (xx += 1) {
         blendSurfacePixel(surface, xx, y + 1, window_shadow_color, 18);
     }
 }
@@ -592,16 +639,27 @@ fn drawWindowShadowSurface(surface: *const DrawSurface, win: *const WindowState)
     const w = windowWidth(win);
     const h = windowHeight(win);
     if (w <= 0 or h <= 0) return;
+    const shadow_rect: Rect = .{
+        .x0 = x,
+        .y0 = y,
+        .x1 = x + w + window_shadow_right_extent,
+        .y1 = y + h + window_shadow_bottom_extent,
+    };
+    if (intersectRect(shadow_rect, surface.clip) == null) return;
 
-    var xx = x + 3;
-    while (xx < x + w - 2) : (xx += 1) {
+    const bottom_x0 = if (surface.clip.x0 > x + 3) surface.clip.x0 else x + 3;
+    const bottom_x1 = if (surface.clip.x1 < x + w - 2) surface.clip.x1 else x + w - 2;
+    var xx = bottom_x0;
+    while (xx < bottom_x1) : (xx += 1) {
         blendSurfacePixel(surface, xx, y + h, window_shadow_color, 24);
         blendSurfacePixel(surface, xx, y + h + 1, window_shadow_color, 13);
         blendSurfacePixel(surface, xx, y + h + 2, window_shadow_color, 6);
     }
 
-    var yy = y + window_header_h_i32;
-    while (yy < y + h) : (yy += 1) {
+    const side_y0 = if (surface.clip.y0 > y + window_header_h_i32) surface.clip.y0 else y + window_header_h_i32;
+    const side_y1 = if (surface.clip.y1 < y + h) surface.clip.y1 else y + h;
+    var yy = side_y0;
+    while (yy < side_y1) : (yy += 1) {
         blendSurfacePixel(surface, x + w, yy, window_shadow_color, 12);
         blendSurfacePixel(surface, x + w + 1, yy, window_shadow_color, 6);
     }
@@ -632,10 +690,11 @@ fn drawCursorSurface(surface: *const DrawSurface, cx: i32, cy: i32) void {
 }
 
 fn initHardwareCursor(mouse_x: i32, mouse_y: i32) bool {
-    const resource = virtgpu.virtgpu_cursor_resource() orelse return false;
+    const resource_handle = virtgpu.virtgpu_cursor_resource() orelse return false;
+    const pixels = virtgpu.virtgpu_pixels(resource_handle) orelse return false;
     var i: usize = 0;
     while (i < cursor_dim * cursor_dim) : (i += 1) {
-        resource.pixels[i] = 0;
+        pixels[i] = 0;
     }
 
     var bit_y: usize = 0;
@@ -645,7 +704,7 @@ fn initHardwareCursor(mouse_x: i32, mouse_y: i32) bool {
             const ch = cursor_shape[bit_y][bit_x];
             if (ch == ' ') continue;
             const color: u32 = if (ch == '@') 0xFF00_0000 else 0xFFFF_FFFF;
-            resource.pixels[bit_y * cursor_dim + bit_x] = color;
+            pixels[bit_y * cursor_dim + bit_x] = color;
         }
     }
 
@@ -655,9 +714,9 @@ fn initHardwareCursor(mouse_x: i32, mouse_y: i32) bool {
         .width = cursor_dim,
         .height = cursor_dim,
     };
-    if (!virtgpu.virtgpu_transfer(resource, full_rect)) return false;
-    if (!virtgpu.virtgpu_flush_rect(resource, full_rect)) return false;
-    return virtgpu.virtgpu_update_cursor(resource, 0, 0, mouse_x, mouse_y);
+    if (!virtgpu.virtgpu_transfer(resource_handle, full_rect)) return false;
+    if (!virtgpu.virtgpu_flush_rect(resource_handle, full_rect)) return false;
+    return virtgpu.virtgpu_update_cursor(resource_handle, 0, 0, mouse_x, mouse_y);
 }
 
 fn clearBackBuffer(back: [*]u32, color: u32) void {
@@ -775,23 +834,9 @@ fn appendU64Decimal(buf: []u8, index: *usize, value: u64) void {
 }
 
 fn logComposePerf(compose_ticks: u64, present_submit_ticks: u64, present_rect: Rect) void {
-    perf_frame_counter +%= 1;
-    if (perf_frame_counter != 1 and (perf_frame_counter % 120) != 0) return;
-
-    const width: i32 = if (present_rect.x1 > present_rect.x0) present_rect.x1 - present_rect.x0 else 0;
-    const height: i32 = if (present_rect.y1 > present_rect.y0) present_rect.y1 - present_rect.y0 else 0;
-    const area: u64 = @as(u64, @intCast(width)) * @as(u64, @intCast(height));
-
-    var buf: [160]u8 = undefined;
-    var idx: usize = 0;
-    appendText(buf[0..], &idx, "Compositor: perf compose_cpu_ticks=");
-    appendU64Decimal(buf[0..], &idx, compose_ticks);
-    appendText(buf[0..], &idx, " present_submit_ticks=");
-    appendU64Decimal(buf[0..], &idx, present_submit_ticks);
-    appendText(buf[0..], &idx, " present_rect_area=");
-    appendU64Decimal(buf[0..], &idx, area);
-    appendText(buf[0..], &idx, "\n");
-    _ = userLog(buf[0..idx]);
+    _ = compose_ticks;
+    _ = present_submit_ticks;
+    _ = present_rect;
 }
 
 fn resetCompositorPerfReport(now_tsc: u64) void {
@@ -804,35 +849,35 @@ fn maybeLogCompositorPerf(now_tsc: u64) void {
         return;
     }
     if (compositor_perf_report.total_tsc < compositor_perf_report_min_wall_tsc) return;
-
-    const busy_tsc = compositor_perf_report.sync_tsc + compositor_perf_report.compose_tsc + compositor_perf_report.submit_tsc;
-    const wall_tsc = compositor_perf_report.total_tsc;
-    const busy_pct = if (wall_tsc > 0) (busy_tsc * 100) / wall_tsc else 0;
-    const sync_pct = if (wall_tsc > 0) (compositor_perf_report.sync_tsc * 100) / wall_tsc else 0;
-    const compose_pct = if (wall_tsc > 0) (compositor_perf_report.compose_tsc * 100) / wall_tsc else 0;
-    const submit_pct = if (wall_tsc > 0) (compositor_perf_report.submit_tsc * 100) / wall_tsc else 0;
-    const avg_area = if (compositor_perf_report.presents > 0) compositor_perf_report.present_area_sum / compositor_perf_report.presents else 0;
-
-    var buf: [320]u8 = undefined;
-    const text = std.fmt.bufPrint(
-        buf[0..],
-        "Compositor: perf2 wall_tsc={} busy_pct={} sync_pct={} compose_pct={} submit_pct={} frames={} presents={} full_frames={} dirty_frames={} idle_loops={} no_window_loops={} avg_present_area={}\n",
-        .{
-            wall_tsc,
-            busy_pct,
-            sync_pct,
-            compose_pct,
-            submit_pct,
-            compositor_perf_report.frames,
-            compositor_perf_report.presents,
-            compositor_perf_report.full_frames,
-            compositor_perf_report.dirty_frames,
-            compositor_perf_report.idle_loops,
-            compositor_perf_report.no_window_loops,
-            avg_area,
-        },
-    ) catch return;
-    _ = userLog(text);
+    var buf: [256]u8 = undefined;
+    var idx: usize = 0;
+    const frames = compositor_perf_report.frames;
+    const presents = compositor_perf_report.presents;
+    const avg_compose = if (frames != 0) compositor_perf_report.compose_tsc / frames else 0;
+    const avg_submit = if (presents != 0) compositor_perf_report.submit_tsc / presents else 0;
+    const avg_area = if (presents != 0) compositor_perf_report.present_area_sum / presents else 0;
+    appendDiagText(buf[0..], &idx, "Compositor: perf frames=");
+    appendDiagU64Decimal(buf[0..], &idx, frames);
+    appendDiagText(buf[0..], &idx, " presents=");
+    appendDiagU64Decimal(buf[0..], &idx, presents);
+    appendDiagText(buf[0..], &idx, " avg_compose_tsc=");
+    appendDiagU64Decimal(buf[0..], &idx, avg_compose);
+    appendDiagText(buf[0..], &idx, " avg_submit_tsc=");
+    appendDiagU64Decimal(buf[0..], &idx, avg_submit);
+    appendDiagText(buf[0..], &idx, " idle=");
+    appendDiagU64Decimal(buf[0..], &idx, compositor_perf_report.idle_loops);
+    appendDiagText(buf[0..], &idx, " no_window=");
+    appendDiagU64Decimal(buf[0..], &idx, compositor_perf_report.no_window_loops);
+    appendDiagText(buf[0..], &idx, " full=");
+    appendDiagU64Decimal(buf[0..], &idx, compositor_perf_report.full_frames);
+    appendDiagText(buf[0..], &idx, " dirty=");
+    appendDiagU64Decimal(buf[0..], &idx, compositor_perf_report.dirty_frames);
+    appendDiagText(buf[0..], &idx, " avg_area=");
+    appendDiagU64Decimal(buf[0..], &idx, avg_area);
+    appendDiagText(buf[0..], &idx, " sync_tsc=");
+    appendDiagU64Decimal(buf[0..], &idx, compositor_perf_report.sync_tsc);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
     resetCompositorPerfReport(now_tsc);
 }
 
@@ -860,6 +905,31 @@ fn fitTextWithEllipsis(text: []const u8, max_width: i32, scratch: []u8) []const 
     if (dst_index == 0) return "";
     _ = appendBytesBounded(scratch, &dst_index, ellipsis);
     return scratch[0..dst_index];
+}
+
+fn refreshWindowTitleCache(slot_ref: *WindowSlot) void {
+    slot_ref.title_cache_len = 0;
+    slot_ref.title_draw_x_off = 8;
+    slot_ref.title_clip_right_off = windowWidth(&slot_ref.frame) - window_close_margin_i32 - window_close_size_i32 - 6;
+
+    const title = slot_ref.frame.title[0..slot_ref.frame.title_len];
+    if (title.len == 0) return;
+
+    const title_left = 8;
+    const title_right = windowWidth(&slot_ref.frame) - 8;
+    const title_width = textPixelWidth(title);
+    const centered_title_x = title_left + @divTrunc((title_right - title_left) - title_width, 2);
+    const title_x = if (centered_title_x > title_left) centered_title_x else title_left;
+    const title_clip_right = windowWidth(&slot_ref.frame) - window_close_margin_i32 - window_close_size_i32 - 6;
+    slot_ref.title_draw_x_off = title_x;
+    slot_ref.title_clip_right_off = title_clip_right;
+    if (title_x >= title_clip_right) return;
+
+    var scratch: [window_title_max_bytes + 3]u8 = undefined;
+    const fitted_title = fitTextWithEllipsis(title, title_clip_right - title_x, scratch[0..]);
+    if (fitted_title.len == 0) return;
+    @memcpy(slot_ref.title_cache[0..fitted_title.len], fitted_title);
+    slot_ref.title_cache_len = fitted_title.len;
 }
 
 fn buildMouseCoordText(buf: *[32]u8, mouse_x: i32, mouse_y: i32) []const u8 {
@@ -1085,11 +1155,9 @@ fn applyRoundedCornerCutSurface(surface: *const DrawSurface, win: *const WindowS
 
 fn drawWindowChrome(
     back: [*]u32,
-    win: *const WindowState,
-    title: []const u8,
-    close_hover: bool,
-    close_down: bool,
+    slot_ref: *const WindowSlot,
 ) void {
+    const win = &slot_ref.frame;
     drawWindowShadow(back, win);
     drawSolidRect(back, win.x, win.y, windowWidth(win), windowHeight(win), window_border_color);
     drawWindowHeaderBackground(back, win);
@@ -1105,37 +1173,57 @@ fn drawWindowChrome(
         .x1 = close_right,
         .y1 = close_top + window_close_size_i32,
     };
-    const title_left = win.x + 8;
-    const title_right = win.x + windowWidth(win) - 8;
-    const title_width = textPixelWidth(title);
-    const centered_title_x = title_left + @divTrunc((title_right - title_left) - title_width, 2);
-    const title_x = if (centered_title_x > title_left) centered_title_x else title_left;
-    const title_clip_right = close_left - 6;
+    const title_x = win.x + slot_ref.title_draw_x_off;
+    const title_clip_right = win.x + slot_ref.title_clip_right_off;
     const title_y = win.y + @divTrunc(window_header_h_i32 - font.lineHeight(1), 2) + window_title_y_bias;
-    if (title.len > 0 and title_x < title_clip_right) {
-        var title_buf: [window_title_max_bytes + 3]u8 = undefined;
-        const fitted_title = fitTextWithEllipsis(title, title_clip_right - title_x, title_buf[0..]);
-        if (fitted_title.len > 0) {
-            drawTextSubpixelClipped(back, title_x, title_y, fitted_title, window_header_text_color, title_clip_right);
-            drawTextSubpixelClipped(back, title_x + 1, title_y, fitted_title, window_header_text_color, title_clip_right);
-        }
+    const fitted_title = slot_ref.title_cache[0..slot_ref.title_cache_len];
+    if (fitted_title.len > 0 and title_x < title_clip_right) {
+        drawTextSubpixelClipped(back, title_x, title_y, fitted_title, window_header_text_color, title_clip_right);
+        drawTextSubpixelClipped(back, title_x + 1, title_y, fitted_title, window_header_text_color, title_clip_right);
     }
-    drawCloseButton(back, close_rect, close_hover, close_down);
+    drawCloseButton(back, close_rect, slot_ref.close_hover, slot_ref.close_down);
     applyRoundedCornerCut(back, win);
 }
 
 fn drawWindowChromeSurface(
     surface: *const DrawSurface,
-    win: *const WindowState,
-    title: []const u8,
-    close_hover: bool,
-    close_down: bool,
+    slot_ref: *const WindowSlot,
 ) void {
+    const win = &slot_ref.frame;
+    const bounds = windowBounds(win);
+    const clipped = intersectRect(bounds, surface.clip) orelse return;
+    _ = clipped;
+    const frame_rect: Rect = .{
+        .x0 = win.x,
+        .y0 = win.y,
+        .x1 = win.x + windowWidth(win),
+        .y1 = win.y + windowHeight(win),
+    };
+    const content_rect: Rect = .{
+        .x0 = contentOriginX(win),
+        .y0 = contentOriginY(win),
+        .x1 = contentOriginX(win) + windowContentW(win),
+        .y1 = contentOriginY(win) + windowContentH(win),
+    };
+    if (rectContainsRect(content_rect, surface.clip)) return;
+    const header_rect: Rect = .{
+        .x0 = win.x + window_border_i32,
+        .y0 = win.y + window_border_i32,
+        .x1 = win.x + windowWidth(win) - window_border_i32,
+        .y1 = win.y + window_header_h_i32,
+    };
+
     drawWindowShadowSurface(surface, win);
-    drawSolidRectSurface(surface, win.x, win.y, windowWidth(win), windowHeight(win), window_border_color);
-    drawWindowHeaderBackgroundSurface(surface, win);
-    drawSolidRectSurface(surface, contentOriginX(win), contentOriginY(win), windowContentW(win), windowContentH(win), window_content_bg_color);
-    drawWindowHeaderDividerSurface(surface, win);
+    if (intersectRect(frame_rect, surface.clip) != null) {
+        drawSolidRectSurface(surface, win.x, win.y, windowWidth(win), windowHeight(win), window_border_color);
+    }
+    if (intersectRect(header_rect, surface.clip) != null) {
+        drawWindowHeaderBackgroundSurface(surface, win);
+        drawWindowHeaderDividerSurface(surface, win);
+    }
+    if (intersectRect(content_rect, surface.clip) != null) {
+        drawSolidRectSurface(surface, contentOriginX(win), contentOriginY(win), windowContentW(win), windowContentH(win), window_content_bg_color);
+    }
 
     const close_right = win.x + windowWidth(win) - window_close_margin_i32;
     const close_left = close_right - window_close_size_i32;
@@ -1146,23 +1234,26 @@ fn drawWindowChromeSurface(
         .x1 = close_right,
         .y1 = close_top + window_close_size_i32,
     };
-    const title_left = win.x + 8;
-    const title_right = win.x + windowWidth(win) - 8;
-    const title_width = textPixelWidth(title);
-    const centered_title_x = title_left + @divTrunc((title_right - title_left) - title_width, 2);
-    const title_x = if (centered_title_x > title_left) centered_title_x else title_left;
-    const title_clip_right = close_left - 6;
+    const title_x = win.x + slot_ref.title_draw_x_off;
+    const title_clip_right = win.x + slot_ref.title_clip_right_off;
     const title_y = win.y + @divTrunc(window_header_h_i32 - font.lineHeight(1), 2) + window_title_y_bias;
-    if (title.len > 0 and title_x < title_clip_right) {
-        var title_buf: [window_title_max_bytes + 3]u8 = undefined;
-        const fitted_title = fitTextWithEllipsis(title, title_clip_right - title_x, title_buf[0..]);
-        if (fitted_title.len > 0) {
-            drawTextSubpixelClippedSurface(surface, title_x, title_y, fitted_title, window_header_text_color, title_clip_right);
-            drawTextSubpixelClippedSurface(surface, title_x + 1, title_y, fitted_title, window_header_text_color, title_clip_right);
-        }
+    const fitted_title = slot_ref.title_cache[0..slot_ref.title_cache_len];
+    const title_rect: Rect = .{
+        .x0 = title_x,
+        .y0 = title_y,
+        .x1 = title_clip_right,
+        .y1 = title_y + font.lineHeight(1),
+    };
+    if (fitted_title.len > 0 and title_x < title_clip_right and intersectRect(title_rect, surface.clip) != null) {
+        drawTextSubpixelClippedSurface(surface, title_x, title_y, fitted_title, window_header_text_color, title_clip_right);
+        drawTextSubpixelClippedSurface(surface, title_x + 1, title_y, fitted_title, window_header_text_color, title_clip_right);
     }
-    drawCloseButtonSurface(surface, close_rect, close_hover, close_down);
-    applyRoundedCornerCutSurface(surface, win);
+    if (intersectRect(close_rect, surface.clip) != null) {
+        drawCloseButtonSurface(surface, close_rect, slot_ref.close_hover, slot_ref.close_down);
+    }
+    if (surface.clip.y0 < win.y + @as(i32, @intCast(window_corner_cut)) and surface.clip.y1 > win.y) {
+        applyRoundedCornerCutSurface(surface, win);
+    }
 }
 
 fn blitScaledPixelToWindow(back: [*]u32, win: *const WindowState, local_vx: usize, local_vy: usize, color: u32) Rect {
@@ -1274,21 +1365,105 @@ fn redrawScene(
 ) void {
     clearBackBuffer(back, background_color);
 
-    const safe_count = max_windows;
+    const order = currentWindowPaintOrder(store);
     var i: usize = 0;
-    while (i < safe_count) : (i += 1) {
-        const slot = &store.slots[i];
+    while (i < order.len) : (i += 1) {
+        const slot_index = order[i];
+        const slot = &store.slots[slot_index];
         const win = &slot.frame;
         if (!win.active or !win.visible) continue;
-        const title = if (win.title_len > 0) win.title[0..win.title_len] else "Window";
-        drawWindowChrome(back, win, title, slot.close_hover, slot.close_down);
-        blitWindowSourceToWindow(back, i);
+        drawWindowChrome(back, slot);
+        blitWindowSourceToWindow(back, slot_index);
     }
     drawMouseCoordHud(back, mouse_x, mouse_y);
 }
 
 fn recomputeWindowCount() usize {
     return window_store.visibleCount();
+}
+
+fn allocWindowZOrder() u32 {
+    const z = if (next_window_z_order == 0) @as(u32, 1) else next_window_z_order;
+    next_window_z_order +%= 1;
+    if (next_window_z_order == 0) next_window_z_order = 1;
+    return z;
+}
+
+fn currentWindowPaintOrder(store: *const WindowStore) []const usize {
+    if (!window_paint_order_dirty) return window_paint_order_cache[0..window_paint_order_count];
+
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < max_windows) : (i += 1) {
+        const slot = &store.slots[i];
+        if (!slot.frame.active or !slot.frame.visible) continue;
+        window_paint_order_cache[count] = i;
+        count += 1;
+    }
+
+    var scan: usize = 1;
+    while (scan < count) : (scan += 1) {
+        const idx = window_paint_order_cache[scan];
+        const z = store.slots[idx].z_order;
+        var pos = scan;
+        while (pos > 0) {
+            const prev = window_paint_order_cache[pos - 1];
+            const prev_z = store.slots[prev].z_order;
+            if (prev_z < z or (prev_z == z and prev < idx)) break;
+            window_paint_order_cache[pos] = prev;
+            pos -= 1;
+        }
+        window_paint_order_cache[pos] = idx;
+    }
+
+    window_paint_order_count = count;
+    window_paint_order_dirty = false;
+    return window_paint_order_cache[0..window_paint_order_count];
+}
+
+fn findTopWindowAt(x: i32, y: i32) ?usize {
+    const order = currentWindowPaintOrder(&window_store);
+    var i = order.len;
+    while (i > 0) {
+        const idx = order[i - 1];
+        const bounds = windowBounds(&window_store.slots[idx].frame);
+        if (x >= bounds.x0 and x < bounds.x1 and y >= bounds.y0 and y < bounds.y1) return idx;
+        i -= 1;
+    }
+    return null;
+}
+
+fn bringWindowToFront(slot: usize) bool {
+    if (slot >= max_windows) return false;
+    if (!window_store.slots[slot].frame.active or !window_store.slots[slot].frame.visible) return false;
+    const order = currentWindowPaintOrder(&window_store);
+    if (order.len == 0 or order[order.len - 1] == slot) return false;
+    window_store.slots[slot].z_order = allocWindowZOrder();
+    invalidateWindowPaintOrderCache();
+    return true;
+}
+
+fn sendWindowToBack(slot: usize) bool {
+    if (slot >= max_windows) return false;
+    if (!window_store.slots[slot].frame.active or !window_store.slots[slot].frame.visible) return false;
+    const order = currentWindowPaintOrder(&window_store);
+    if (order.len <= 1 or order[0] == slot) return false;
+
+    var next_z: u32 = 1;
+    window_store.slots[slot].z_order = next_z;
+    next_z += 1;
+
+    var i: usize = 0;
+    while (i < order.len) : (i += 1) {
+        const idx = order[i];
+        if (idx == slot) continue;
+        window_store.slots[idx].z_order = next_z;
+        next_z += 1;
+    }
+    next_window_z_order = next_z;
+    if (next_window_z_order == 0) next_window_z_order = 1;
+    invalidateWindowPaintOrderCache();
+    return true;
 }
 
 fn findWindowSlotById(window_id: u32) ?usize {
@@ -1299,38 +1474,7 @@ fn findFreeWindowSlot() ?usize {
     return window_store.findFree();
 }
 
-fn updateWindowTitleFromMeta(slot: usize) bool {
-    if (slot >= max_windows) return false;
-    const slot_ref = &window_store.slots[slot];
-    if (!slot_ref.source.active) return false;
-    const meta_va = slot_ref.source.meta_va;
-    const map_lo = window_map_base_va;
-    const map_hi = window_map_base_va + max_windows * window_map_stride_va;
-    if (meta_va < map_lo or meta_va >= map_hi) return false;
-    const meta: *const volatile WindowMeta = @ptrFromInt(meta_va);
-    if (meta.magic != window_meta_magic) return false;
-    if (meta.version != protocol.window_protocol_version) return false;
-    const requested_len: usize = if (meta.title_len < window_title_max_bytes) meta.title_len else window_title_max_bytes;
-    const title_changed = slot_ref.frame.title_len != requested_len;
-    var i: usize = 0;
-    while (i < requested_len) : (i += 1) {
-        const next = sanitizeTitleByte(meta.title[i]);
-        if (!title_changed and slot_ref.frame.title[i] != next) {
-            slot_ref.frame.title_len = requested_len;
-            slot_ref.frame.title[i] = next;
-            i += 1;
-            while (i < requested_len) : (i += 1) {
-                slot_ref.frame.title[i] = sanitizeTitleByte(meta.title[i]);
-            }
-            return true;
-        }
-        slot_ref.frame.title[i] = next;
-    }
-    slot_ref.frame.title_len = requested_len;
-    return title_changed;
-}
-
-fn readWindowMetaSeq(slot: usize) ?u64 {
+fn windowMetaPtr(slot: usize) ?*const volatile WindowMeta {
     if (slot >= max_windows) return null;
     const slot_ref = &window_store.slots[slot];
     if (!slot_ref.source.active) return null;
@@ -1341,7 +1485,46 @@ fn readWindowMetaSeq(slot: usize) ?u64 {
     const meta: *const volatile WindowMeta = @ptrFromInt(meta_va);
     if (meta.magic != window_meta_magic) return null;
     if (meta.version != protocol.window_protocol_version) return null;
-    return meta.seq;
+    return meta;
+}
+
+fn updateWindowTitleFromMeta(slot_ref: *WindowSlot, meta: *const volatile WindowMeta) bool {
+    const requested_len: usize = if (meta.title_len < window_title_max_bytes) meta.title_len else window_title_max_bytes;
+    var title_changed = slot_ref.frame.title_len != requested_len;
+    var i: usize = 0;
+    while (i < requested_len) : (i += 1) {
+        const next = sanitizeTitleByte(meta.title[i]);
+        if (!title_changed and slot_ref.frame.title[i] != next) title_changed = true;
+        slot_ref.frame.title[i] = next;
+    }
+    slot_ref.frame.title_len = requested_len;
+    if (title_changed) refreshWindowTitleCache(slot_ref);
+    return title_changed;
+}
+
+fn readWindowDirtyRegion(src: *const WindowSource, meta: *const volatile WindowMeta) SourceRegion {
+    if (src.width == 0 or src.height == 0) return .{};
+
+    const x0 = @as(usize, meta.dirty_x);
+    const y0 = @as(usize, meta.dirty_y);
+    const w = @as(usize, meta.dirty_w);
+    const h = @as(usize, meta.dirty_h);
+    if (x0 >= src.width or y0 >= src.height or w == 0 or h == 0) {
+        return .{ .x = 0, .y = 0, .w = src.width, .h = src.height };
+    }
+
+    const clamped_w = if (w < src.width - x0) w else src.width - x0;
+    const clamped_h = if (h < src.height - y0) h else src.height - y0;
+    if (clamped_w == 0 or clamped_h == 0) {
+        return .{ .x = 0, .y = 0, .w = src.width, .h = src.height };
+    }
+
+    return .{
+        .x = x0,
+        .y = y0,
+        .w = clamped_w,
+        .h = clamped_h,
+    };
 }
 
 fn windowBounds(win: *const WindowState) Rect {
@@ -1362,14 +1545,14 @@ fn screenRectForSourceRegion(win: *const WindowState, region: SourceRegion) Rect
     return clipRectToScreen(.{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 });
 }
 
+fn windowSourceUsesDma(src: *const WindowSource) bool {
+    return src.dma_pixels;
+}
+
 fn registerWindowCap(page_paddr: u64) ?Rect {
     const cap: *const volatile WindowCap = @ptrFromInt(ipc_rx_page_va);
     if (cap.magic != window_cap_magic or cap.version != 1) return null;
     const rights = protocol.decodeWindowRights(cap.rights_bits);
-    if (!rights.dma_pixels) {
-        _ = userLog("Compositor: reject window cap (dma_pixels=0)\n");
-        return null;
-    }
     if (cap.width == 0 or cap.height == 0) return null;
     if (cap.pixels_page_count == 0) {
         _ = userLog("Compositor: pixels_page_count==0\n");
@@ -1392,11 +1575,12 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
 
     const existing = findWindowSlotById(cap_snapshot.window_id);
     const slot = existing orelse (findFreeWindowSlot() orelse return null);
+    const prior_z = if (existing != null) window_store.slots[slot].z_order else 0;
     const slot_base = window_map_base_va + slot * window_map_stride_va;
     const map_meta_va = slot_base + 0x1000;
     const map_pixel_va = slot_base + 0x2000;
+    const dma_pixels = rights.dma_pixels and ((cap_snapshot.flags & protocol.window_flag_allow_pixels_dma) != 0);
 
-    _ = userLog("Compositor: registerWindowCap map begin\n");
     if (mapPage(map_meta_va, cap_snapshot.meta_cap_paddr, false) != syscall_ok) return null;
     const paddr_list: [*]const volatile u64 = @ptrFromInt(ipc_rx_page_va + cap_size);
     var i: usize = 0;
@@ -1404,16 +1588,17 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
         if (paddr_list[i] < 0x1000) return null;
     }
     if (mapPagesBatch(map_pixel_va, ipc_rx_page_va + cap_size, cap_snapshot.pixels_page_count, false) != syscall_ok) return null;
-    _ = userLog("Compositor: registerWindowCap map done\n");
 
     const slot_ref = &window_store.slots[slot];
     slot_ref.reset();
+    slot_ref.z_order = if (prior_z != 0) prior_z else allocWindowZOrder();
     slot_ref.source = .{
         .active = true,
         .window_id = cap_snapshot.window_id,
         .pixel_va = map_pixel_va,
         .pixels_paddr = cap_snapshot.pixels_cap_paddr,
         .pixels_page_count = cap_snapshot.pixels_page_count,
+        .dma_pixels = dma_pixels,
         .meta_va = map_meta_va,
         .width = cap_snapshot.width,
         .height = cap_snapshot.height,
@@ -1436,12 +1621,13 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     frame_ptr.prev_close_hover = false;
     frame_ptr.prev_close_down = false;
     frame_ptr.title_len = 0;
-    _ = updateWindowTitleFromMeta(slot);
+    if (windowMetaPtr(slot)) |meta| {
+        _ = updateWindowTitleFromMeta(slot_ref, meta);
+    }
     window_shadow_valid[slot] = false;
     window_gpu_resources[slot] = null;
+    invalidateWindowPaintOrderCache();
     invalidateWindowBodyCache(slot);
-    _ = userLog("Compositor: registerWindowCap done\n");
-
     _ = page_paddr;
     return windowBounds(&slot_ref.frame);
 }
@@ -1464,11 +1650,6 @@ fn blitWindowSourceToWindow(back: [*]u32, slot: usize) void {
 }
 
 fn windowPixelsPtr(slot: usize) [*]const volatile u32 {
-    if (slot < max_windows) {
-        if (window_gpu_resources[slot]) |resource| {
-            if (resource.ready) return resource.pixels;
-        }
-    }
     return @ptrFromInt(window_store.slots[slot].source.pixel_va);
 }
 
@@ -1502,6 +1683,43 @@ fn blitWindowSourceToSurface(surface: *const DrawSurface, slot: usize, win: *con
             var col: usize = 0;
             while (col < copy_w) : (col += 1) {
                 surface.pixels[dst_row + col] = src_pixels[src_row + col];
+            }
+        }
+        return;
+    }
+
+    if (scale == 2) {
+        const dst_pixels = surface.pixels;
+        const vx_start: i32 = clampI32(@divFloor(clipped.x0 - content_x0, 2), 0, @intCast(src.width));
+        const vy_start: i32 = clampI32(@divFloor(clipped.y0 - content_y0, 2), 0, @intCast(src.height));
+        const vx_end: i32 = clampI32(@divFloor((clipped.x1 - 1) - content_x0, 2) + 1, 0, @intCast(src.width));
+        const vy_end: i32 = clampI32(@divFloor((clipped.y1 - 1) - content_y0, 2) + 1, 0, @intCast(src.height));
+        if (vx_start >= vx_end or vy_start >= vy_end) return;
+
+        var vy: i32 = vy_start;
+        while (vy < vy_end) : (vy += 1) {
+            const vy_u: usize = @intCast(vy);
+            const src_row = vy_u * src.pitch;
+            const row_y = content_y0 + vy * 2;
+            const py0 = if (row_y > clipped.y0) row_y else clipped.y0;
+            const py1 = if (row_y + 2 < clipped.y1) row_y + 2 else clipped.y1;
+            if (py0 >= py1) continue;
+
+            var py = py0;
+            while (py < py1) : (py += 1) {
+                const dst_row = @as(usize, @intCast(py)) * fb_pitch;
+                var vx: i32 = vx_start;
+                while (vx < vx_end) : (vx += 1) {
+                    const vx_u: usize = @intCast(vx);
+                    const color = src_pixels[src_row + vx_u];
+                    const col_x = content_x0 + vx * 2;
+                    const px0 = if (col_x > clipped.x0) col_x else clipped.x0;
+                    const px1 = if (col_x + 2 < clipped.x1) col_x + 2 else clipped.x1;
+                    var px = px0;
+                    while (px < px1) : (px += 1) {
+                        dst_pixels[dst_row + @as(usize, @intCast(px))] = color;
+                    }
+                }
             }
         }
         return;
@@ -1563,16 +1781,16 @@ fn redrawSceneBackgroundHud(surface: *const DrawSurface, mouse_x: i32, mouse_y: 
 }
 
 fn redrawSceneWindowsLayered(surface: *const DrawSurface, store: *const WindowStore) void {
+    const order = currentWindowPaintOrder(store);
     var i: usize = 0;
-    while (i < max_windows) : (i += 1) {
-        const slot = &store.slots[i];
+    while (i < order.len) : (i += 1) {
+        const slot_index = order[i];
+        const slot = &store.slots[slot_index];
         const win = &slot.frame;
         if (!win.active or !win.visible) continue;
         if (intersectRect(windowBounds(win), surface.clip) == null) continue;
-        drawWindowShadowSurface(surface, win);
-        const title = if (win.title_len > 0) win.title[0..win.title_len] else "Window";
-        drawWindowChromeSurface(surface, win, title, slot.close_hover, slot.close_down);
-        blitWindowSourceToWindowSurface(surface, i);
+        drawWindowChromeSurface(surface, slot);
+        blitWindowSourceToWindowSurface(surface, slot_index);
     }
 }
 
@@ -1590,7 +1808,7 @@ fn redrawSceneSurface(
     if (draw_cursor) drawCursorSurface(surface, mouse_x, mouse_y);
 }
 
-fn ensureWindowGpuResource(slot: usize) ?*virtgpu.Resource {
+fn ensureWindowGpuResource(slot: usize) ?virtgpu.ResourceHandle {
     if (slot >= max_windows) {
         logInvalidGpuSlot(slot);
         return null;
@@ -1601,8 +1819,10 @@ fn ensureWindowGpuResource(slot: usize) ?*virtgpu.Resource {
         logInvalidGpuSlot(slot);
         return null;
     }
-    if (window_gpu_resources[slot]) |resource| {
-        if (resource.ready and resource.width == slot_ref.source.width and resource.height == slot_ref.source.height) return resource;
+    if (window_gpu_resources[slot]) |resource_handle| {
+        if (virtgpu.virtgpu_dimensions(resource_handle)) |dims| {
+            if (dims.width == slot_ref.source.width and dims.height == slot_ref.source.height) return resource_handle;
+        }
     }
     const source = &slot_ref.source;
     const created = virtgpu.virtgpu_create_resource_from_single_page(
@@ -1616,76 +1836,51 @@ fn ensureWindowGpuResource(slot: usize) ?*virtgpu.Resource {
     return created;
 }
 
-fn syncWindowGpuContent(slot: usize) ?Rect {
+fn syncWindowGpuContent(slot: usize, dirty_region: SourceRegion) ?Rect {
     if (slot >= max_windows) {
         logInvalidGpuSlot(slot);
         return null;
     }
     const slot_ref = &window_store.slots[slot];
     if (!slot_ref.source.active or !slot_ref.frame.active or !slot_ref.frame.visible) return null;
-    if (slot >= window_shadow_storage.len or slot >= window_shadow_valid.len or slot >= window_gpu_resources.len) {
+    if (slot >= window_shadow_valid.len or slot >= window_gpu_resources.len) {
         logInvalidGpuSlot(slot);
         return null;
     }
+    if (dirty_region.w == 0 or dirty_region.h == 0) return null;
 
     const src = &slot_ref.source;
     logFirstGpuSyncSlot(slot, src, &slot_ref.frame);
-    const needed_pixels = src.pitch * src.height;
-    if (needed_pixels > max_window_shadow_pixels) {
-        logWindowShadowOverflow(slot, needed_pixels);
-        return null;
+    if (windowSourceUsesDma(src)) {
+        // DMA-backed windows already expose their pixel pages directly to the compositor.
+        window_shadow_valid[slot] = true;
+        return screenRectForSourceRegion(&slot_ref.frame, dirty_region);
     }
-    const src_pixels: [*]const volatile u32 = @ptrFromInt(src.pixel_va);
-    const resource = ensureWindowGpuResource(slot);
-    const shadow = &window_shadow_storage[slot];
-    var dirty_any = false;
-    var dirty_region: SourceRegion = .{};
-
-    var vy: usize = 0;
-    while (vy < src.height) : (vy += 1) {
-        var vx: usize = 0;
-        while (vx < src.width) : (vx += 1) {
-            const index = vy * src.pitch + vx;
-            const color = src_pixels[index];
-            if (window_shadow_valid[slot] and shadow[index] == color) continue;
-            shadow[index] = color;
-            if (!dirty_any) {
-                dirty_any = true;
-                dirty_region = .{ .x = vx, .y = vy, .w = 1, .h = 1 };
-            } else {
-                const x0 = if (vx < dirty_region.x) vx else dirty_region.x;
-                const y0 = if (vy < dirty_region.y) vy else dirty_region.y;
-                const x1 = if (vx + 1 > dirty_region.x + dirty_region.w) vx + 1 else dirty_region.x + dirty_region.w;
-                const y1 = if (vy + 1 > dirty_region.y + dirty_region.h) vy + 1 else dirty_region.y + dirty_region.h;
-                dirty_region = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
-            }
-        }
-    }
-
+    // CPU-backed windows are also composed directly from their mapped source pages.
+    // Keeping this branch explicit documents that there is no staging copy for either path.
     window_shadow_valid[slot] = true;
-    if (!dirty_any) return null;
-    if (resource) |res| {
-        const rect: virtgpu.Rect = .{
-            .x = @intCast(dirty_region.x),
-            .y = @intCast(dirty_region.y),
-            .width = @intCast(dirty_region.w),
-            .height = @intCast(dirty_region.h),
-        };
-        _ = virtgpu.virtgpu_transfer(res, rect);
-        _ = virtgpu.virtgpu_flush_rect(res, rect);
-    }
     return screenRectForSourceRegion(&slot_ref.frame, dirty_region);
 }
 
 fn syncWindow(slot: usize) ?Rect {
     if (slot >= max_windows) return null;
-    const seq = readWindowMetaSeq(slot) orelse return null;
     const slot_ref = &window_store.slots[slot];
+    const meta = windowMetaPtr(slot) orelse return null;
+    const seq = meta.seq;
     if (seq == slot_ref.source.observed_meta_seq and window_shadow_valid[slot]) return null;
     slot_ref.source.observed_meta_seq = seq;
 
-    const title_changed = updateWindowTitleFromMeta(slot);
-    const content_rect = syncWindowGpuContent(slot);
+    const title_changed = updateWindowTitleFromMeta(slot_ref, meta);
+    var dirty_region = readWindowDirtyRegion(&slot_ref.source, meta);
+    if (!window_shadow_valid[slot]) {
+        dirty_region = .{
+            .x = 0,
+            .y = 0,
+            .w = slot_ref.source.width,
+            .h = slot_ref.source.height,
+        };
+    }
+    const content_rect = syncWindowGpuContent(slot, dirty_region);
     if (title_changed or content_rect != null) invalidateWindowBodyCache(slot);
     if (title_changed) {
         return windowBounds(&slot_ref.frame);
@@ -1705,7 +1900,10 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     };
     window_store = .{};
     window_shadow_valid = [_]bool{false} ** max_windows;
-    window_gpu_resources = [_]?*virtgpu.Resource{null} ** max_windows;
+    window_gpu_resources = [_]?virtgpu.ResourceHandle{null} ** max_windows;
+    next_window_z_order = 1;
+    window_paint_order_count = 0;
+    window_paint_order_dirty = true;
     logged_invalid_gpu_slot = null;
     logged_first_gpu_sync_slot = false;
     var last_cursor_rect = cursorRect(mouse_state_storage.x, mouse_state_storage.y);
@@ -1713,10 +1911,13 @@ pub fn run(comptime gpu_mode: bool) noreturn {
 
     var window_count: usize = 0;
     var first_compose_wait_loops: u32 = 0;
+    var startup_settle_loops_remaining: u32 = 0;
 
     var dragging_index: ?usize = null;
     var drag_boost_logged = false;
+    var scheduler_boost_active = false;
     var prev_left_down = false;
+    var prev_right_down = false;
     var force_full = true;
     var virtgpu_init_ok = false;
     resetCompositorPerfReport(readTsc());
@@ -1734,9 +1935,9 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         const msg_words: [*]const volatile u64 = @ptrFromInt(ipc_rx_page_va);
         const magic32: u32 = @truncate(msg_words[0]);
         if (magic32 == window_cap_magic) {
-            _ = userLog("Compositor: window cap recv\n");
             if (registerWindowCap(page_paddr) != null) {
                 force_full = true;
+                if (!first_compose_logged) startup_settle_loops_remaining = startup_settle_loops;
             }
             continue;
         }
@@ -1756,16 +1957,14 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         force_full = true;
     }
 
-    var gpu_resource: ?*virtgpu.Resource = null;
+    var gpu_resource: ?virtgpu.ResourceHandle = null;
     var virtgpu_active = false;
     var hardware_cursor_active = false;
     if (virtgpu_init_ok) {
-        _ = userLog("Compositor: create_fb begin\n");
         gpu_resource = virtgpu.virtgpu_create_fb(fb_width, fb_height);
         _ = userLog("Compositor: create_fb returned\n");
-        if (gpu_resource) |resource| {
-            _ = userLog("Compositor: set_scanout begin\n");
-            if (virtgpu.virtgpu_set_scanout(resource)) {
+        if (gpu_resource) |resource_handle| {
+            if (virtgpu.virtgpu_set_scanout(resource_handle)) {
                 virtgpu_active = true;
                 hardware_cursor_active = initHardwareCursor(mouse_state_storage.x, mouse_state_storage.y);
                 _ = userLog("Compositor: set_scanout done\n");
@@ -1798,9 +1997,9 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             const msg_words: [*]const volatile u64 = @ptrFromInt(ipc_rx_page_va);
             const magic32: u32 = @truncate(msg_words[0]);
             if (magic32 == window_cap_magic) {
-                _ = userLog("Compositor: window cap recv\n");
                 if (registerWindowCap(page_paddr) != null) {
                     force_full = true;
+                    if (!first_compose_logged) startup_settle_loops_remaining = startup_settle_loops;
                 }
                 continue;
             }
@@ -1822,13 +2021,14 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         // Boot fast-path: until at least one window is registered, avoid the
         // expensive compose/present path and keep polling mailbox quickly.
         if (recomputeWindowCount() == 0) {
+            setSchedulerBoost(false, &scheduler_boost_active);
             force_full = false;
             compositor_perf_report.no_window_loops +%= 1;
             compositor_perf_report.idle_loops +%= 1;
             const iter_end_tsc = readTsc();
             compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
             maybeLogCompositorPerf(iter_end_tsc);
-            asm volatile ("pause");
+            _ = waitEvent(true, 1);
             continue;
         }
 
@@ -1861,12 +2061,19 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         window_count = recomputeWindowCount();
         if (window_count > max_windows) window_count = max_windows;
         const left_down = (mouse_state_storage.buttons & 0x1) != 0;
+        const right_down = (mouse_state_storage.buttons & 0x2) != 0;
         const safe_window_count = max_windows;
 
         if (!first_compose_logged and window_count < 2 and first_compose_wait_loops < 96) {
             first_compose_wait_loops += 1;
             force_full = true;
-            asm volatile ("pause");
+            _ = waitEvent(true, 1);
+            continue;
+        }
+        if (!first_compose_logged and startup_settle_loops_remaining != 0) {
+            startup_settle_loops_remaining -= 1;
+            force_full = true;
+            _ = waitEvent(true, 1);
             continue;
         }
 
@@ -1876,11 +2083,13 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             window_store.slots[i].close_down = false;
         }
 
+        const hovered_slot = findTopWindowAt(mouse_state_storage.x, mouse_state_storage.y);
         i = 0;
         while (i < safe_window_count) : (i += 1) {
             const slot_ref = &window_store.slots[i];
             const win = &slot_ref.frame;
             if (!win.active or !win.visible) continue;
+            const hover_target = hovered_slot != null and hovered_slot.? == i;
             const close_right = win.x + windowWidth(win) - window_close_margin_i32;
             const close_left = close_right - window_close_size_i32;
             const close_top = win.y + @divTrunc(window_header_h_i32 - window_close_size_i32, 2);
@@ -1890,7 +2099,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
                 .x1 = close_right,
                 .y1 = close_top + window_close_size_i32,
             };
-            slot_ref.close_hover = pointInCloseButton(mouse_state_storage.x, mouse_state_storage.y, close_rect);
+            slot_ref.close_hover = hover_target and pointInCloseButton(mouse_state_storage.x, mouse_state_storage.y, close_rect);
             slot_ref.close_down = slot_ref.close_hover and left_down;
             if (slot_ref.close_hover != win.prev_close_hover or slot_ref.close_down != win.prev_close_down) {
                 invalidateWindowBodyCache(i);
@@ -1900,28 +2109,35 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             }
         }
 
-        if (!prev_left_down and left_down) {
-            var hit: ?usize = null;
-            var j: usize = safe_window_count;
-            while (j > 0) {
-                const idx = j - 1;
-                const win = &window_store.slots[idx].frame;
-                const wx0 = win.x;
-                const wy0 = win.y;
-                const wx1 = win.x + windowWidth(win);
-                const wy1 = win.y + windowHeight(win);
-                if (win.active and win.visible and mouse_state_storage.x >= wx0 and mouse_state_storage.x < wx1 and mouse_state_storage.y >= wy0 and mouse_state_storage.y < wy1) {
-                    hit = idx;
-                    break;
+        if (!prev_right_down and right_down) {
+            if (hovered_slot) |idx| {
+                const old_rect = windowBounds(&window_store.slots[idx].frame);
+                if (sendWindowToBack(idx)) {
+                    if (dragging_index != null and dragging_index.? == idx) dragging_index = null;
+                    const new_rect = windowBounds(&window_store.slots[idx].frame);
+                    var merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_rect);
+                    merged = includeRect(merged.any, merged.rect, new_rect);
+                    dirty_any = merged.any;
+                    dirty_rect = merged.rect;
                 }
-                j -= 1;
             }
+        }
 
-            if (hit) |idx| {
+        if (!prev_left_down and left_down) {
+            if (hovered_slot) |idx| {
                 const slot_ref = &window_store.slots[idx];
                 var win = &slot_ref.frame;
+                const old_rect = windowBounds(win);
+                if (bringWindowToFront(idx)) {
+                    const new_rect = windowBounds(win);
+                    var merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_rect);
+                    merged = includeRect(merged.any, merged.rect, new_rect);
+                    dirty_any = merged.any;
+                    dirty_rect = merged.rect;
+                }
                 if (slot_ref.close_hover) {
                     win.visible = false;
+                    invalidateWindowPaintOrderCache();
                     if (dragging_index != null and dragging_index.? == idx) dragging_index = null;
                     const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_bounds[idx]);
                     dirty_any = merged.any;
@@ -1975,6 +2191,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             drag_boost_logged = false;
         }
         prev_left_down = left_down;
+        prev_right_down = right_down;
 
         i = 0;
         while (i < safe_window_count) : (i += 1) {
@@ -1996,28 +2213,35 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         const present_rect = if (force_full) fullScreenRect() else clipRectToScreen(dirty_rect);
         if (force_full or dirty_any) {
             if (rectIsEmpty(present_rect)) {
+                setSchedulerBoost(false, &scheduler_boost_active);
                 force_full = false;
                 last_cursor_rect = cursorRect(mouse_state_storage.x, mouse_state_storage.y);
                 compositor_perf_report.idle_loops +%= 1;
                 const iter_end_tsc = readTsc();
                 compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
                 maybeLogCompositorPerf(iter_end_tsc);
-                asm volatile ("pause");
+                _ = waitEvent(true, 1);
                 continue;
             }
         } else {
+            setSchedulerBoost(false, &scheduler_boost_active);
             last_cursor_rect = cursorRect(mouse_state_storage.x, mouse_state_storage.y);
             compositor_perf_report.idle_loops +%= 1;
             const iter_end_tsc = readTsc();
             compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
             maybeLogCompositorPerf(iter_end_tsc);
-            asm volatile ("pause");
+            _ = waitEvent(true, 1);
             continue;
         }
 
+        setSchedulerBoost(true, &scheduler_boost_active);
         if (virtgpu_active and gpu_resource != null) {
+            const gpu_pixels = virtgpu.virtgpu_pixels(gpu_resource.?) orelse {
+                _ = userLog("GpuCompositor: virtgpu pixels lost\n");
+                while (true) asm volatile ("pause");
+            };
             const surface = DrawSurface{
-                .pixels = gpu_resource.?.pixels,
+                .pixels = gpu_pixels,
                 .clip = present_rect,
             };
             const compose_start = readTsc();
@@ -2040,7 +2264,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             const transfer_ok = virtgpu.virtgpu_transfer(gpu_resource.?, transfer_rect);
             if (transfer_ok and !first_present_transfer_logged) {
                 first_present_transfer_logged = true;
-                _ = userLog("Compositor: present transfer done\n");
             }
             const flush_ok = transfer_ok and virtgpu.virtgpu_flush_rect(gpu_resource.?, transfer_rect);
             const submit_end = readTsc();
@@ -2057,7 +2280,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             logComposePerf(compose_end - compose_start, submit_end - submit_start, present_rect);
             if (flush_ok and !first_present_flush_logged) {
                 first_present_flush_logged = true;
-                _ = userLog("Compositor: present flush done\n");
             }
             if (!flush_ok) {
                 _ = userLog("GpuCompositor: virtgpu present failed\n");
@@ -2077,6 +2299,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         const iter_end_tsc = readTsc();
         compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
         maybeLogCompositorPerf(iter_end_tsc);
-        asm volatile ("pause");
+        _ = waitEvent(true, 1);
     }
 }

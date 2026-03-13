@@ -35,6 +35,10 @@ pub fn write(text: []const u8) void {
     writeRaw(text);
 }
 
+pub fn writeByte(value: u8) void {
+    writeByteInternal(value);
+}
+
 pub fn writeHexRaw(value: u64) void {
     const hex = "0123456789abcdef";
     write("0x");

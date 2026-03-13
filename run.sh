@@ -1,4 +1,5 @@
 rm -f OVMF_VARS.fd
+rm -f qemu.log
 cp /usr/share/OVMF/OVMF_VARS_4M.fd OVMF_VARS.fd
 
 qemu-system-x86_64 \

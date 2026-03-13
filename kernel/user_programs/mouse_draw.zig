@@ -75,6 +75,44 @@ fn drawRect(
     }
 }
 
+fn includeDirtyRect(x0: *i32, y0: *i32, x1: *i32, y1: *i32, x: i32, y: i32, w: i32, h: i32) void {
+    if (w <= 0 or h <= 0) return;
+    var rx0 = x;
+    var ry0 = y;
+    var rx1 = x + w;
+    var ry1 = y + h;
+    if (rx0 < 0) rx0 = 0;
+    if (ry0 < 0) ry0 = 0;
+    if (rx1 > pixel_width) rx1 = pixel_width;
+    if (ry1 > pixel_height) ry1 = pixel_height;
+    if (rx0 >= rx1 or ry0 >= ry1) return;
+    if (rx0 < x0.*) x0.* = rx0;
+    if (ry0 < y0.*) y0.* = ry0;
+    if (rx1 > x1.*) x1.* = rx1;
+    if (ry1 > y1.*) y1.* = ry1;
+}
+
+fn markCursorDirty(prev_x: i32, prev_y: i32, next_x: i32, next_y: i32) void {
+    var dirty_x0 = pixel_width;
+    var dirty_y0 = pixel_height;
+    var dirty_x1: i32 = 0;
+    var dirty_y1: i32 = 0;
+
+    if (prev_x >= 0 and prev_y >= 0) {
+        includeDirtyRect(&dirty_x0, &dirty_y0, &dirty_x1, &dirty_y1, prev_x - cursor_half, prev_y - cursor_half, cursor_size, cursor_size);
+    }
+    includeDirtyRect(&dirty_x0, &dirty_y0, &dirty_x1, &dirty_y1, next_x - cursor_half, next_y - cursor_half, cursor_size, cursor_size);
+    if (dirty_x0 < dirty_x1 and dirty_y0 < dirty_y1) {
+        window_client.markWindowDirtyRect(
+            window_meta_shared_va,
+            @intCast(dirty_x0),
+            @intCast(dirty_y0),
+            @intCast(dirty_x1 - dirty_x0),
+            @intCast(dirty_y1 - dirty_y0),
+        );
+    }
+}
+
 pub export fn _start() noreturn {
     _ = userLog("MouseDraw: started\n");
 
@@ -134,8 +172,8 @@ pub export fn _start() noreturn {
 
         const color: u32 = if ((buttons & 0x1) != 0) 0x000000FF else 0x00FFFFFF;
         drawRect(fb, pixel_width, pixel_height, pixel_pitch, x - cursor_half, y2 - cursor_half, cursor_size, cursor_size, color);
+        markCursorDirty(prev_x, prev_y, x, y2);
         prev_x = x;
         prev_y = y2;
-        window_client.markWindowDirty(window_meta_shared_va);
     }
 }

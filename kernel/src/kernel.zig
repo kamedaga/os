@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
+const debug_window_force_free_list = true;
 
-pub const process_count: usize = 6;
+pub const process_count: usize = 7;
 pub const device_count: usize = 1;
 pub const principal_count: usize = process_count + device_count;
 
@@ -512,6 +513,10 @@ pub const WindowMeta = extern struct {
     pos_y: i32,
     width: u16,
     height: u16,
+    dirty_x: u16,
+    dirty_y: u16,
+    dirty_w: u16,
+    dirty_h: u16,
     title_len: u16,
     title: [64]u8,
 };
@@ -543,6 +548,20 @@ pub const CreateWindowResult = struct {
     meta_paddr: u64,
     pixels_first_paddr: u64,
     pixels_page_count: u16,
+};
+
+pub const DebugWindowStage = enum(u8) {
+    after_alloc,
+    after_grant_meta,
+    after_cap_init,
+    after_meta_init,
+    after_record_write,
+};
+
+pub const DebugAllocPageStage = enum(u8) {
+    after_pop,
+    after_memset,
+    after_cap_add,
 };
 
 pub const OwnershipView = enum {
@@ -605,6 +624,8 @@ pub const KernelState = struct {
     framebuffer_caps: [principal_count]?FramebufferCapability = [_]?FramebufferCapability{null} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
+    debug_window_hook: ?*const fn (state: *const KernelState, owner: PrincipalId, stage: DebugWindowStage, slot: usize, cap_paddr: u64, meta_paddr: u64) void = null,
+    debug_alloc_page_hook: ?*const fn (state: *const KernelState, requester: PrincipalId, stage: DebugAllocPageStage, paddr: u64) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
     untyped_revoke_queue: [max_total_caps]u64 = undefined,
@@ -709,7 +730,27 @@ pub const KernelState = struct {
         self.iommu.mappings[index] = .{};
     }
 
-    fn syncIommuForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64, reason: IommuSyncReason) KernelError!void {
+    noinline fn callIommuAuditHook(
+        hook: *const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void,
+        self: *const KernelState,
+        principal: PrincipalId,
+        paddr: u64,
+        mapped: bool,
+        reason: IommuSyncReason,
+    ) void {
+        hook(self, principal, paddr, mapped, reason);
+    }
+
+    noinline fn callPteSyncHook(
+        hook: *const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void,
+        self: *const KernelState,
+        principal: PrincipalId,
+        paddr: u64,
+    ) void {
+        hook(self, principal, paddr);
+    }
+
+    noinline fn syncIommuForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64, reason: IommuSyncReason) KernelError!void {
         if (self.iommu.mode == .off) return;
         const device = iommuDeviceForPrincipal(principal) orelse return;
         const had_mapping = self.iommuFindMappingIndex(device, paddr) != null;
@@ -719,7 +760,7 @@ pub const KernelState = struct {
                 try self.iommuMap(device, paddr);
                 if (!had_mapping) {
                     if (self.iommu_audit_hook) |hook| {
-                        hook(self, principal, paddr, true, reason);
+                        callIommuAuditHook(hook, self, principal, paddr, true, reason);
                     }
                 }
                 return;
@@ -728,7 +769,7 @@ pub const KernelState = struct {
         self.iommuUnmap(device, paddr);
         if (had_mapping) {
             if (self.iommu_audit_hook) |hook| {
-                hook(self, principal, paddr, false, reason);
+                callIommuAuditHook(hook, self, principal, paddr, false, reason);
             }
         }
     }
@@ -750,6 +791,119 @@ pub const KernelState = struct {
         const id = self.next_window_id;
         self.next_window_id +%= 1;
         return id;
+    }
+
+    noinline fn callDebugWindowHook(
+        hook: *const fn (state: *const KernelState, owner: PrincipalId, stage: DebugWindowStage, slot: usize, cap_paddr: u64, meta_paddr: u64) void,
+        self: *const KernelState,
+        owner: PrincipalId,
+        stage: DebugWindowStage,
+        slot: usize,
+        cap_paddr: u64,
+        meta_paddr: u64,
+    ) void {
+        hook(self, owner, stage, slot, cap_paddr, meta_paddr);
+    }
+
+    noinline fn initWindowCapPage(
+        window_cap_paddr: u64,
+        owner: PrincipalId,
+        meta_paddr: u64,
+        pixels_first_paddr: u64,
+        bytes_aligned: u64,
+        page_count: usize,
+        pitch: u16,
+        width: u16,
+        height: u16,
+        flags: u32,
+        window_id: u32,
+        allow_pixel_dma: bool,
+    ) void {
+        const rights = WindowRights{
+            .read_meta = true,
+            .write_meta = true,
+            .write_pixels = true,
+            .control = true,
+            .dma_pixels = allow_pixel_dma,
+        };
+        const cap_bytes: [*]volatile u8 = @ptrFromInt(window_cap_paddr);
+        @memset(cap_bytes[0..4096], 0);
+        const cap_view: *volatile WindowCap = @ptrFromInt(window_cap_paddr);
+        cap_view.* = .{
+            .magic = 0x57434150, // 'WCAP'
+            .version = 1,
+            .rights_bits = @bitCast(rights),
+            .window_id = window_id,
+            .owner_pid = @intFromEnum(owner),
+            .pixels_cap_paddr = pixels_first_paddr,
+            .meta_cap_paddr = meta_paddr,
+            .pixels_size_bytes = @intCast(bytes_aligned),
+            .pixels_page_count = @intCast(page_count),
+            .pixels_per_scan_line = pitch,
+            .pixel_format = 0,
+            .evt_cap_paddr = 0,
+            .width = width,
+            .height = height,
+            .min_width = 16,
+            .min_height = 16,
+            .flags = flags,
+            .z_hint = 0,
+            .reserved0 = 0,
+        };
+    }
+
+    noinline fn initWindowMetaPage(meta_paddr: u64, width: u16, height: u16) void {
+        const meta_bytes: [*]volatile u8 = @ptrFromInt(meta_paddr);
+        @memset(meta_bytes[0..4096], 0);
+        const meta_view: *volatile WindowMeta = @ptrFromInt(meta_paddr);
+        meta_view.* = .{
+            .magic = 0x574D5441, // 'WMTA'
+            .version = 2,
+            .state = 1,
+            .seq = 1,
+            .pos_x = 64,
+            .pos_y = 64,
+            .width = width,
+            .height = height,
+            .dirty_x = 0,
+            .dirty_y = 0,
+            .dirty_w = width,
+            .dirty_h = height,
+            .title_len = 0,
+            .title = [_]u8{0} ** 64,
+        };
+    }
+
+    noinline fn writeWindowRecord(
+        self: *KernelState,
+        slot: usize,
+        owner: PrincipalId,
+        window_id: u32,
+        cap_paddr: u64,
+        meta_paddr: u64,
+        pixels_first_paddr: u64,
+        bytes_aligned: u64,
+        page_count: usize,
+        pitch: u16,
+        width: u16,
+        height: u16,
+        flags: u32,
+    ) void {
+        self.windows[slot] = .{
+            .active = true,
+            .window_id = window_id,
+            .owner = owner,
+            .cap_paddr = cap_paddr,
+            .pixels_paddr = pixels_first_paddr,
+            .meta_paddr = meta_paddr,
+            .pixels_size_bytes = @intCast(bytes_aligned),
+            .pixels_page_count = @intCast(page_count),
+            .pixels_per_scan_line = pitch,
+            .width = width,
+            .height = height,
+            .flags = flags,
+            .z_hint = 0,
+        };
     }
 
     pub fn createWindow(
@@ -778,14 +932,22 @@ pub const KernelState = struct {
         const page_count: usize = @intCast(page_count_u64);
 
         var bookkeeping_pages: [2]PageCapability = undefined;
-        if (self.findOwnedUntypedForPages(owner, 2, true)) |block_id| {
-            try self.retypeUntypedToPages(owner, block_id, 2, true, bookkeeping_pages[0..]);
+        if (!debug_window_force_free_list) {
+            if (self.findOwnedUntypedForPages(owner, 2, true)) |block_id| {
+                try self.retypeUntypedToPages(owner, block_id, 2, true, bookkeeping_pages[0..]);
+            } else {
+                bookkeeping_pages[0] = try self.allocPageTo(owner, free_list);
+                bookkeeping_pages[1] = try self.allocPageTo(owner, free_list);
+            }
         } else {
             bookkeeping_pages[0] = try self.allocPageTo(owner, free_list);
             bookkeeping_pages[1] = try self.allocPageTo(owner, free_list);
         }
         const window_cap_page = bookkeeping_pages[0];
         const meta_page = bookkeeping_pages[1];
+        if (self.debug_window_hook) |hook| {
+            callDebugWindowHook(hook, self, owner, .after_alloc, slot, window_cap_page.paddr, meta_page.paddr);
+        }
 
         const pixels_first_paddr: u64 = 0;
 
@@ -794,71 +956,52 @@ pub const KernelState = struct {
             .cpu_write = false,
             .dma = false,
         });
+        if (self.debug_window_hook) |hook| {
+            callDebugWindowHook(hook, self, owner, .after_grant_meta, slot, window_cap_page.paddr, meta_page.paddr);
+        }
 
         const window_id = self.allocWindowId();
-        const rights = WindowRights{
-            .read_meta = true,
-            .write_meta = true,
-            .write_pixels = true,
-            .control = true,
-            .dma_pixels = allow_pixel_dma,
-        };
-        const cap_bytes: [*]volatile u8 = @ptrFromInt(window_cap_page.paddr);
-        @memset(cap_bytes[0..4096], 0);
-        const cap_view: *volatile WindowCap = @ptrFromInt(window_cap_page.paddr);
-        cap_view.* = .{
-            .magic = 0x57434150, // 'WCAP'
-            .version = 1,
-            .rights_bits = @bitCast(rights),
-            .window_id = window_id,
-            .owner_pid = @intFromEnum(owner),
-            .pixels_cap_paddr = pixels_first_paddr,
-            .meta_cap_paddr = meta_page.paddr,
-            .pixels_size_bytes = @intCast(bytes_aligned),
-            .pixels_page_count = @intCast(page_count),
-            .pixels_per_scan_line = pitch,
-            .pixel_format = 0,
-            .evt_cap_paddr = 0,
-            .width = width,
-            .height = height,
-            .min_width = 16,
-            .min_height = 16,
-            .flags = flags,
-            .z_hint = 0,
-            .reserved0 = 0,
-        };
+        initWindowCapPage(
+            window_cap_page.paddr,
+            owner,
+            meta_page.paddr,
+            pixels_first_paddr,
+            bytes_aligned,
+            page_count,
+            pitch,
+            width,
+            height,
+            flags,
+            window_id,
+            allow_pixel_dma,
+        );
+        if (self.debug_window_hook) |hook| {
+            callDebugWindowHook(hook, self, owner, .after_cap_init, slot, window_cap_page.paddr, meta_page.paddr);
+        }
 
-        const meta_bytes: [*]volatile u8 = @ptrFromInt(meta_page.paddr);
-        @memset(meta_bytes[0..4096], 0);
-        const meta_view: *volatile WindowMeta = @ptrFromInt(meta_page.paddr);
-        meta_view.* = .{
-            .magic = 0x574D5441, // 'WMTA'
-            .version = 1,
-            .state = 1,
-            .seq = 1,
-            .pos_x = 64,
-            .pos_y = 64,
-            .width = width,
-            .height = height,
-            .title_len = 0,
-            .title = [_]u8{0} ** 64,
-        };
+        initWindowMetaPage(meta_page.paddr, width, height);
+        if (self.debug_window_hook) |hook| {
+            callDebugWindowHook(hook, self, owner, .after_meta_init, slot, window_cap_page.paddr, meta_page.paddr);
+        }
 
-        self.windows[slot] = .{
-            .active = true,
-            .window_id = window_id,
-            .owner = owner,
-            .cap_paddr = window_cap_page.paddr,
-            .pixels_paddr = pixels_first_paddr,
-            .meta_paddr = meta_page.paddr,
-            .pixels_size_bytes = @intCast(bytes_aligned),
-            .pixels_page_count = @intCast(page_count),
-            .pixels_per_scan_line = pitch,
-            .width = width,
-            .height = height,
-            .flags = flags,
-            .z_hint = 0,
-        };
+        writeWindowRecord(
+            self,
+            slot,
+            owner,
+            window_id,
+            window_cap_page.paddr,
+            meta_page.paddr,
+            pixels_first_paddr,
+            bytes_aligned,
+            page_count,
+            pitch,
+            width,
+            height,
+            flags,
+        );
+        if (self.debug_window_hook) |hook| {
+            callDebugWindowHook(hook, self, owner, .after_record_write, slot, window_cap_page.paddr, meta_page.paddr);
+        }
 
         return .{
             .window_cap_paddr = window_cap_page.paddr,
@@ -909,47 +1052,56 @@ pub const KernelState = struct {
         }
     }
 
-    pub fn initPhase1() KernelState {
-        var state = KernelState{};
-        state.next_cap_id = 1;
-        state.regions[0] = .{
+    pub fn initPhase1InPlace(self: *KernelState) void {
+        self.* = .{};
+        self.next_cap_id = 1;
+        self.next_window_id = 1;
+        self.regions[0] = .{
             .id = 0,
         };
-        state.region_len = 1;
-        state.initPrincipalState();
-        state.installDefaultEndpoints() catch unreachable;
+        self.region_len = 1;
+        self.initPrincipalState();
+        self.installDefaultEndpoints() catch unreachable;
 
-        // Process0 initially owns region0 and has read + dma.
         const p0 = processPrincipal(0);
-        const root_id = state.allocCapId();
-        state.cap_tables[@intFromEnum(p0)].add(.{
+        const root_id = self.allocCapId();
+        self.cap_tables[@intFromEnum(p0)].add(.{
             .paddr = 0x1000,
             .rights = .{ .cpu_read = true, .cpu_write = true, .dma = true },
             .cap_id = root_id,
             .root_cap_id = root_id,
             .parent_cap_id = 0,
         }) catch unreachable;
+    }
 
+    pub fn initPhase1() KernelState {
+        var state: KernelState = undefined;
+        state.initPhase1InPlace();
         return state;
     }
 
-    pub fn initFromDetectedRegions(region_count: usize) KernelError!KernelState {
+    pub fn initFromDetectedRegionsInPlace(self: *KernelState, region_count: usize) KernelError!void {
         if (region_count == 0) return KernelError.EmptyRegionSet;
         if (region_count > max_regions) return KernelError.TooManyRegions;
 
-        var state = KernelState{};
-        state.next_cap_id = 1;
-        state.initPrincipalState();
-        try state.installDefaultEndpoints();
+        self.* = .{};
+        self.next_cap_id = 1;
+        self.next_window_id = 1;
+        self.initPrincipalState();
+        try self.installDefaultEndpoints();
 
         var i: usize = 0;
         while (i < region_count) : (i += 1) {
-            state.regions[i] = .{
+            self.regions[i] = .{
                 .id = i,
             };
         }
-        state.region_len = region_count;
+        self.region_len = region_count;
+    }
 
+    pub fn initFromDetectedRegions(region_count: usize) KernelError!KernelState {
+        var state: KernelState = undefined;
+        try state.initFromDetectedRegionsInPlace(region_count);
         return state;
     }
 
@@ -986,8 +1138,8 @@ pub const KernelState = struct {
         _ = dev_table.removeByPaddr(paddr);
         try self.getTable(.Process0).add(restored);
         if (self.pte_sync_hook) |hook| {
-            hook(self, .Device0, paddr);
-            hook(self, .Process0, paddr);
+            callPteSyncHook(hook, self, .Device0, paddr);
+            callPteSyncHook(hook, self, .Process0, paddr);
         }
     }
 
@@ -1240,9 +1392,15 @@ pub const KernelState = struct {
         free_list: *FreePageList,
     ) KernelError!PageCapability {
         const cap = try self.allocPage(requester, free_list);
+        if (self.debug_alloc_page_hook) |hook| {
+            hook(self, requester, .after_pop, cap.paddr);
+        }
         if (!builtin.is_test) {
             const page_bytes: [*]u8 = @ptrFromInt(cap.paddr);
             @memset(page_bytes[0..4096], 0);
+        }
+        if (self.debug_alloc_page_hook) |hook| {
+            hook(self, requester, .after_memset, cap.paddr);
         }
         const root_id = self.allocCapId();
         try self.getTable(requester).add(.{
@@ -1256,6 +1414,9 @@ pub const KernelState = struct {
             .root_cap_id = root_id,
             .parent_cap_id = 0,
         });
+        if (self.debug_alloc_page_hook) |hook| {
+            hook(self, requester, .after_cap_add, cap.paddr);
+        }
         // Freshly allocated pages are not mapped yet, so no PTE rights sync is needed here.
         return cap;
     }
@@ -1487,7 +1648,7 @@ pub const KernelState = struct {
                     _ = page_table.removeByCapId(cap_id);
                     try self.syncIommuForPrincipalPaddr(@enumFromInt(pidx), removed_paddr, .revoke);
                     if (self.pte_sync_hook) |hook| {
-                        hook(self, @enumFromInt(pidx), removed_paddr);
+                        callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);
                     }
                     break;
                 }
@@ -1522,7 +1683,7 @@ pub const KernelState = struct {
             .parent_cap_id = 0,
         });
         if (self.pte_sync_hook) |hook| {
-            hook(self, owner, paddr);
+            callPteSyncHook(hook, self, owner, paddr);
         }
     }
 
@@ -1548,8 +1709,8 @@ pub const KernelState = struct {
         try self.syncIommuForPrincipalPaddr(from, paddr, .move_from);
         try self.syncIommuForPrincipalPaddr(to, paddr, .move_to);
         if (self.pte_sync_hook) |hook| {
-            hook(self, from, paddr);
-            hook(self, to, paddr);
+            callPteSyncHook(hook, self, from, paddr);
+            callPteSyncHook(hook, self, to, paddr);
         }
     }
 
@@ -1714,7 +1875,7 @@ pub const KernelState = struct {
                 _ = table.removeByCapId(cap_id);
                 try self.syncIommuForPrincipalPaddr(@enumFromInt(pidx), removed_paddr, .revoke);
                 if (self.pte_sync_hook) |hook| {
-                    hook(self, @enumFromInt(pidx), removed_paddr);
+                    callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);
                 }
                 break;
             }

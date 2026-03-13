@@ -1,7 +1,7 @@
 pub const window_cap_magic: u32 = 0x57434150; // 'WCAP'
 pub const window_meta_magic: u32 = 0x574D5441; // 'WMTA'
 pub const mouse_shared_magic: u64 = 0x4D534852; // "MSHR"
-pub const window_protocol_version: u16 = 1;
+pub const window_protocol_version: u16 = 2;
 pub const window_title_max_bytes: usize = 64;
 pub const window_flag_allow_pixels_dma: u32 = 1 << 0;
 pub const window_flag_low_scale: u32 = 1 << 1;
@@ -50,6 +50,10 @@ pub const WindowMeta = extern struct {
     pos_y: i32,
     width: u16,
     height: u16,
+    dirty_x: u16,
+    dirty_y: u16,
+    dirty_w: u16,
+    dirty_h: u16,
     title_len: u16,
     title: [window_title_max_bytes]u8,
 };

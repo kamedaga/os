@@ -191,7 +191,6 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
 
-    _ = userLog("KeyboardAsciiDemo: createAndPublishWindow before\n");
     const window_created = window_client.createAndPublishWindow(
         @intCast(pixel_width),
         @intCast(pixel_height),
@@ -204,7 +203,6 @@ pub export fn _start() noreturn {
         _ = userLog("KeyboardAsciiDemo: create window failed\n");
         while (true) asm volatile ("pause");
     }
-    _ = userLog("KeyboardAsciiDemo: createAndPublishWindow after\n");
     window_client.setWindowTitle(window_meta_shared_va, "Keyboard Demo");
 
     const vfb: [*]volatile u32 = @ptrFromInt(window_pixels_va);

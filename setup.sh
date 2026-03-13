@@ -1,5 +1,8 @@
 set -e
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
+
 # 1) 古いもの削除
 rm -f disk.img
 sudo umount /mnt/esp 2>/dev/null || true

@@ -145,7 +145,7 @@ pub fn createAndPublishWindow(
     pixel_map_va: u64,
     meta_map_va: u64,
 ) bool {
-    const effective_flags = flags | window_flag_allow_pixels_dma;
+    const effective_flags = flags;
     const cap_paddr = createWindowSys(width, height, effective_flags);
     if (cap_paddr < 0x1000) {
         _ = userLog("window_client: create_window failed\n");
@@ -180,7 +180,7 @@ pub fn createAndPublishWindow(
     }
 
     var pixel_paddrs: [max_window_pixel_pages]u64 = [_]u64{0} ** max_window_pixel_pages;
-    const use_untyped = (effective_flags & window_flag_allow_pixels_dma) != 0 or page_count >= large_window_pixel_pages_threshold;
+    const use_untyped = (effective_flags & window_flag_allow_pixels_dma) != 0;
     const alloc_result = if (use_untyped)
         allocUntypedMapPages(pixel_map_va, @intCast(page_count), true, (effective_flags & window_flag_allow_pixels_dma) != 0, @intFromPtr(&pixel_paddrs))
     else
@@ -247,9 +247,15 @@ pub fn createAndPublishWindowWithDma(
     );
 }
 
-pub fn setWindowTitle(meta_va: u64, title: []const u8) void {
+fn windowMetaPtr(meta_va: u64) ?*volatile WindowMeta {
     const meta: *volatile WindowMeta = @ptrFromInt(meta_va);
-    if (meta.magic != window_meta_magic) return;
+    if (meta.magic != window_meta_magic) return null;
+    if (meta.version != protocol.window_protocol_version) return null;
+    return meta;
+}
+
+pub fn setWindowTitle(meta_va: u64, title: []const u8) void {
+    const meta = windowMetaPtr(meta_va) orelse return;
     const copy_len: usize = if (title.len < 63) title.len else 63;
     var i: usize = 0;
     while (i < 64) : (i += 1) {
@@ -263,8 +269,26 @@ pub fn setWindowTitle(meta_va: u64, title: []const u8) void {
     markWindowDirty(meta_va);
 }
 
-pub fn markWindowDirty(meta_va: u64) void {
-    const meta: *volatile WindowMeta = @ptrFromInt(meta_va);
-    if (meta.magic != window_meta_magic) return;
+pub fn markWindowDirtyRect(meta_va: u64, x: usize, y: usize, w: usize, h: usize) void {
+    const meta = windowMetaPtr(meta_va) orelse return;
+    const max_w: usize = meta.width;
+    const max_h: usize = meta.height;
+    if (max_w == 0 or max_h == 0) return;
+
+    const x0 = if (x < max_w) x else max_w;
+    const y0 = if (y < max_h) y else max_h;
+    const x1 = x0 + (if (w < max_w - x0) w else max_w - x0);
+    const y1 = y0 + (if (h < max_h - y0) h else max_h - y0);
+    if (x1 <= x0 or y1 <= y0) return;
+
+    meta.dirty_x = @intCast(x0);
+    meta.dirty_y = @intCast(y0);
+    meta.dirty_w = @intCast(x1 - x0);
+    meta.dirty_h = @intCast(y1 - y0);
     meta.seq +%= 1;
+}
+
+pub fn markWindowDirty(meta_va: u64) void {
+    const meta = windowMetaPtr(meta_va) orelse return;
+    markWindowDirtyRect(meta_va, 0, 0, meta.width, meta.height);
 }
