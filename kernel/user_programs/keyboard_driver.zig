@@ -1,5 +1,3 @@
-const std = @import("std");
-
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
@@ -204,6 +202,63 @@ fn queuePushAvail(desc_id: u16) void {
     avail_idx_ptr.* = avail_idx +% 1;
 }
 
+fn appendText(buf: []u8, idx: *usize, text: []const u8) void {
+    if (idx.* >= buf.len) return;
+    const remaining = buf.len - idx.*;
+    const copy_len = if (text.len < remaining) text.len else remaining;
+    @memcpy(buf[idx.* .. idx.* + copy_len], text[0..copy_len]);
+    idx.* += copy_len;
+}
+
+fn appendHexU16(buf: []u8, idx: *usize, value: u16) void {
+    if (idx.* >= buf.len) return;
+    const hex = "0123456789abcdef";
+    var started = false;
+    var shift: usize = 12;
+    while (true) {
+        const nibble: u8 = @intCast((value >> @as(u4, @intCast(shift))) & 0xF);
+        if (nibble != 0 or started or shift == 0) {
+            if (idx.* < buf.len) {
+                buf[idx.*] = hex[nibble];
+                idx.* += 1;
+            }
+            started = true;
+        }
+        if (shift == 0) break;
+        shift -= 4;
+    }
+}
+
+fn appendU32Decimal(buf: []u8, idx: *usize, value: u32) void {
+    var tmp: [10]u8 = undefined;
+    var n: usize = 0;
+    var v = value;
+    if (v == 0) {
+        appendText(buf, idx, "0");
+        return;
+    }
+    while (v > 0 and n < tmp.len) : (n += 1) {
+        tmp[n] = @as(u8, @intCast('0' + (v % 10)));
+        v /= 10;
+    }
+    while (n > 0 and idx.* < buf.len) {
+        n -= 1;
+        buf[idx.*] = tmp[n];
+        idx.* += 1;
+    }
+}
+
+fn logKeyEvent(code: u16, value: u32) void {
+    var buf: [96]u8 = undefined;
+    var idx: usize = 0;
+    appendText(buf[0..], &idx, "key code=0x");
+    appendHexU16(buf[0..], &idx, code);
+    appendText(buf[0..], &idx, " value=");
+    appendU32Decimal(buf[0..], &idx, value);
+    appendText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
 fn keycodeToAscii(code: u16, shift: bool) ?u8 {
     return switch (code) {
         0x02 => if (shift) '!' else '1',
@@ -401,44 +456,42 @@ pub export fn _start() noreturn {
             const slot: usize = @intCast(last_used_idx % queue_size);
             const used_elem = queueUsedRingPtr()[slot];
             const desc_id: u16 = @intCast(used_elem.id & 0xFFFF);
-            if (desc_id < queue_size) {
-                const ev = queueEventPtr(desc_id).*;
-                switch (ev.event_type) {
-                    event_type_key => {
-                        if (ev.code == key_left_shift or ev.code == key_right_shift) {
-                            shift_down = ev.value != 0;
+            if (desc_id >= queue_size) {
+                _ = userLog("KeyboardDriver: invalid used desc_id\n");
+                last_used_idx +%= 1;
+                continue;
+            }
+
+            const ev = queueEventPtr(desc_id).*;
+            switch (ev.event_type) {
+                event_type_key => {
+                    if (ev.code == key_left_shift or ev.code == key_right_shift) {
+                        shift_down = ev.value != 0;
+                    }
+                    pending_code = ev.code;
+                    pending_value = ev.value;
+                    has_pending_key = true;
+                    if (ev.value != 0) {
+                        if (keycodeToAscii(ev.code, shift_down)) |ascii| {
+                            pending_ascii = ascii;
+                            has_pending_ascii = true;
                         }
-                        pending_code = ev.code;
-                        pending_value = ev.value;
-                        has_pending_key = true;
-                        if (ev.value != 0) {
-                            if (keycodeToAscii(ev.code, shift_down)) |ascii| {
-                                pending_ascii = ascii;
-                                has_pending_ascii = true;
-                            }
+                    }
+                },
+                event_type_syn => {
+                    if (ev.code == syn_report and has_pending_key) {
+                        logKeyEvent(pending_code, pending_value);
+                        if (has_pending_ascii and pending_value != 0) {
+                            shared[2] = pending_ascii;
+                            shared[3] = pending_code;
+                            shared[4] = pending_value;
+                            shared[1] +%= 1;
                         }
-                    },
-                    event_type_syn => {
-                        if (ev.code == syn_report and has_pending_key) {
-                            var buf: [96]u8 = undefined;
-                            const msg = std.fmt.bufPrint(
-                                buf[0..],
-                                "key code=0x{x} value={d}\n",
-                                .{ pending_code, pending_value },
-                            ) catch "";
-                            _ = userLog(msg);
-                            if (has_pending_ascii and pending_value != 0) {
-                                shared[2] = pending_ascii;
-                                shared[3] = pending_code;
-                                shared[4] = pending_value;
-                                shared[1] +%= 1;
-                            }
-                            has_pending_key = false;
-                            has_pending_ascii = false;
-                        }
-                    },
-                    else => {},
-                }
+                        has_pending_key = false;
+                        has_pending_ascii = false;
+                    }
+                },
+                else => {},
             }
 
             queuePushAvail(desc_id);

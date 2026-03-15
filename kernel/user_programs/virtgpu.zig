@@ -1,9 +1,11 @@
+const std = @import("std");
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_untyped_reset: u64 = 0x12;
 const syscall_untyped_alloc_map_pages: u64 = 0x13;
+const syscall_wait_event: u64 = 0x17;
 
 const syscall_ok: u64 = 0;
 const queue_cap_device_gpu: u64 = 0;
@@ -62,7 +64,8 @@ const max_resources: usize = 8;
 const init_alloc_page_count: u64 = 7;
 const mem_entry_page_count: u64 = 2;
 const mem_entries_region_bytes: usize = mem_entries_page1_va + 4096 - mem_entries_page0_va;
-const wait_poll_limit: usize = 100_000;
+const wait_spin_limit: usize = 256;
+const wait_sleep_limit: usize = 1024;
 const cursor_dim: usize = 64;
 const warm_state_magic: u64 = 0x56475057; // "VGPW"
 const state_canary_magic: u64 = 0x5653544154453031; // "VSTATE01"
@@ -300,6 +303,16 @@ fn queueNotify(token: u64, queue_index: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_wait_event),
+          [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
+          [arg1] "{rsi}" (timeout_ticks),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn readCfgU64(index: usize) u64 {
     const cfg: [*]const volatile u64 = @ptrFromInt(config_page_va);
     return cfg[index];
@@ -338,6 +351,48 @@ fn mmioReadU32(addr: usize) u32 {
 fn mmioWriteU32(addr: usize, value: u32) void {
     const p: *volatile u32 = @ptrFromInt(addr);
     p.* = value;
+}
+
+fn appendText(buf: []u8, idx: *usize, text: []const u8) void {
+    if (idx.* >= buf.len) return;
+    const remaining = buf.len - idx.*;
+    const copy_len = if (text.len < remaining) text.len else remaining;
+    @memcpy(buf[idx.* .. idx.* + copy_len], text[0..copy_len]);
+    idx.* += copy_len;
+}
+
+fn appendU64Decimal(buf: []u8, idx: *usize, value: u64) void {
+    if (idx.* >= buf.len) return;
+    const text = std.fmt.bufPrint(buf[idx.*..], "{}", .{value}) catch return;
+    idx.* += text.len;
+}
+
+fn appendU64Hex(buf: []u8, idx: *usize, value: u64) void {
+    if (idx.* >= buf.len) return;
+    const text = std.fmt.bufPrint(buf[idx.*..], "0x{x}", .{value}) catch return;
+    idx.* += text.len;
+}
+
+fn logCommandWaitState(label: []const u8, stage: []const u8, expected_resp_type: u32) void {
+    var buf: [256]u8 = undefined;
+    var idx: usize = 0;
+    const resp: *const VirtioGpuCtrlHdr = @ptrFromInt(control_page_va + control_response_offset);
+    appendText(buf[0..], &idx, "Compositor: virtgpu ");
+    appendText(buf[0..], &idx, stage);
+    appendText(buf[0..], &idx, " label=");
+    appendText(buf[0..], &idx, label);
+    appendText(buf[0..], &idx, " used_seen=");
+    appendU64Decimal(buf[0..], &idx, state.used_idx_seen);
+    appendText(buf[0..], &idx, " used_idx=");
+    appendU64Decimal(buf[0..], &idx, queueUsedIdxPtr().*);
+    appendText(buf[0..], &idx, " avail_idx=");
+    appendU64Decimal(buf[0..], &idx, queueAvailIdxPtr().*);
+    appendText(buf[0..], &idx, " resp=");
+    appendU64Hex(buf[0..], &idx, resp.type);
+    appendText(buf[0..], &idx, " expect=");
+    appendU64Hex(buf[0..], &idx, expected_resp_type);
+    appendText(buf[0..], &idx, "\n");
+    logText(buf[0..idx]);
 }
 
 fn mmioWriteU64(addr: usize, value: u64) void {
@@ -403,6 +458,46 @@ fn controlReqPaddr() u64 {
 
 fn controlRespPaddr() u64 {
     return state.control_page_paddr + control_response_offset;
+}
+
+fn waitForUsedRing(expected_seen: u16, cursor: bool) bool {
+    const used_ptr: *volatile u16 = if (cursor) cursorQueueUsedIdxPtr() else queueUsedIdxPtr();
+
+    var spin: usize = 0;
+    while (spin < wait_spin_limit) : (spin += 1) {
+        if (used_ptr.* != expected_seen) return true;
+        asm volatile ("pause");
+    }
+
+    var sleeps: usize = 0;
+    while (sleeps < wait_sleep_limit) : (sleeps += 1) {
+        if (used_ptr.* != expected_seen) return true;
+        _ = waitEvent(false, 1);
+    }
+    return used_ptr.* != expected_seen;
+}
+
+fn waitForResponseType() u32 {
+    const resp: *volatile VirtioGpuCtrlHdr = @ptrFromInt(control_page_va + control_response_offset);
+
+    var spin: usize = 0;
+    while (spin < wait_spin_limit) : (spin += 1) {
+        memoryBarrier();
+        const resp_type = resp.type;
+        if (resp_type != 0) return resp_type;
+        asm volatile ("pause");
+    }
+
+    var sleeps: usize = 0;
+    while (sleeps < wait_sleep_limit) : (sleeps += 1) {
+        memoryBarrier();
+        const resp_type = resp.type;
+        if (resp_type != 0) return resp_type;
+        _ = waitEvent(false, 1);
+    }
+
+    memoryBarrier();
+    return resp.type;
 }
 
 fn clearBytes(base_va: usize, len: usize) void {
@@ -487,11 +582,12 @@ fn cursorQueuePushAvail(head_desc: u16) void {
     memoryBarrier();
 }
 
-fn submitCommand(req_len: usize, extra_len: usize, expected_resp_type: u32) bool {
+fn submitCommand(req_len: usize, extra_len: usize, expected_resp_type: u32, timeout_label: ?[]const u8) bool {
     if (!requireStateHealthy("submitCommand")) return false;
     if (!state.ready) return false;
 
     clearBytes(control_page_va + control_response_offset, @sizeOf(VirtioGpuCtrlHdr));
+    memoryBarrier();
 
     var desc_count: u16 = 0;
     {
@@ -556,21 +652,39 @@ fn submitCommand(req_len: usize, extra_len: usize, expected_resp_type: u32) bool
         logText("Compositor: queue control notify cap denied\n");
         return false;
     }
-    mmioWriteU16(state.notify_addr, queue_index_control);
+    const notify_addr = state.notify_addr;
+    if (notify_addr < notify_page_va or notify_addr >= notify_page_va + 4096) {
+        logText("Compositor: virtgpu notify_addr invalid\n");
+        return false;
+    }
+    memoryBarrier();
+    mmioWriteU16(notify_addr, queue_index_control);
 
-    var spin: usize = 0;
-    while (spin < wait_poll_limit) : (spin += 1) {
-        if (queueUsedIdxPtr().* != state.used_idx_seen) {
-            const used = queueUsedRingPtr()[@as(usize, @intCast(state.used_idx_seen % state.queue_size))];
-            state.used_idx_seen +%= 1;
-            if (used.id != 0) return false;
-            const resp: *const VirtioGpuCtrlHdr = @ptrFromInt(control_page_va + control_response_offset);
-            return resp.type == expected_resp_type;
+    if (waitForUsedRing(state.used_idx_seen, false)) {
+        memoryBarrier();
+        const used = queueUsedRingPtr()[@as(usize, @intCast(state.used_idx_seen % state.queue_size))];
+        state.used_idx_seen +%= 1;
+        if (used.id != 0) {
+            if (timeout_label) |label| logCommandWaitState(label, "used-id", expected_resp_type);
+            return false;
         }
-        asm volatile ("pause");
+        const resp_type = waitForResponseType();
+        if (resp_type != expected_resp_type) {
+            if (timeout_label) |label| logCommandWaitState(label, "bad-resp", expected_resp_type);
+            return false;
+        }
+        return true;
     }
 
-    logText("Compositor: virtgpu command timeout\n");
+    logText("Compositor: virtgpu command timeout");
+    if (timeout_label) |label| {
+        logText(" ");
+        logText(label);
+        logText("\n");
+        logCommandWaitState(label, "timeout", expected_resp_type);
+        return false;
+    }
+    logText("\n");
     return false;
 }
 
@@ -578,6 +692,7 @@ fn submitCursorCommand(req_len: usize) bool {
     if (!requireStateHealthy("submitCursorCommand")) return false;
     if (!state.ready or state.cursor_queue_size < 2) return false;
 
+    memoryBarrier();
     var desc = cursorQueueDescPtr(0);
     desc.* = .{
         .addr = controlReqPaddr(),
@@ -602,16 +717,14 @@ fn submitCursorCommand(req_len: usize) bool {
         logText("Compositor: queue cursor notify cap denied\n");
         return false;
     }
+    memoryBarrier();
     mmioWriteU16(state.cursor_notify_addr, queue_index_cursor);
 
-    var spin: usize = 0;
-    while (spin < wait_poll_limit) : (spin += 1) {
-        if (cursorQueueUsedIdxPtr().* != state.cursor_used_idx_seen) {
-            const used = cursorQueueUsedRingPtr()[@as(usize, @intCast(state.cursor_used_idx_seen % state.cursor_queue_size))];
-            state.cursor_used_idx_seen +%= 1;
-            return used.id == 0;
-        }
-        asm volatile ("pause");
+    if (waitForUsedRing(state.cursor_used_idx_seen, true)) {
+        memoryBarrier();
+        const used = cursorQueueUsedRingPtr()[@as(usize, @intCast(state.cursor_used_idx_seen % state.cursor_queue_size))];
+        state.cursor_used_idx_seen +%= 1;
+        return used.id == 0;
     }
 
     logText("Compositor: virtgpu cursor command timeout\n");
@@ -870,7 +983,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
     const backing_paddrs = resource_backing_paddrs_scratch[0..];
     const stride_bytes = width * 4;
     const total_bytes = stride_bytes * height;
-    const page_count = (total_bytes + 4095) / 4096;
+    const page_count = ((total_bytes + 4095) / 4096) + 1;
     if (page_count == 0 or page_count > max_backing_pages) {
         zeroResource(resource, allocation.slot_index);
         return null;
@@ -925,7 +1038,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
             .width = @intCast(width),
             .height = @intCast(height),
         };
-        if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, virtio_gpu_resp_ok_nodata)) {
+        if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, virtio_gpu_resp_ok_nodata, "resource_create")) {
             logText("Compositor: virtgpu resource_create failed\n");
             zeroResource(resource, allocation.slot_index);
             return null;
@@ -957,6 +1070,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
             @sizeOf(VirtioGpuResourceAttachBacking),
             page_count * @sizeOf(VirtioGpuMemEntry),
             virtio_gpu_resp_ok_nodata,
+            "attach_backing",
         )) {
             logText("Compositor: virtgpu attach_backing failed\n");
             zeroResource(resource, allocation.slot_index);
@@ -1009,7 +1123,7 @@ pub fn virtgpu_create_resource_from_single_page(
             .width = @intCast(width),
             .height = @intCast(height),
         };
-        if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, virtio_gpu_resp_ok_nodata)) {
+        if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, virtio_gpu_resp_ok_nodata, "resource_create_single_page")) {
             logText("Compositor: virtgpu resource_create failed\n");
             zeroResource(resource, allocation.slot_index);
             return null;
@@ -1035,6 +1149,7 @@ pub fn virtgpu_create_resource_from_single_page(
             @sizeOf(VirtioGpuResourceAttachBacking),
             @sizeOf(VirtioGpuMemEntry),
             virtio_gpu_resp_ok_nodata,
+            "attach_backing_single_page",
         )) {
             logText("Compositor: virtgpu attach_backing failed\n");
             zeroResource(resource, allocation.slot_index);
@@ -1066,7 +1181,7 @@ pub fn virtgpu_set_scanout(handle: ResourceHandle) bool {
         .scanout_id = state.default_scanout_id,
         .resource_id = resource.resource_id,
     };
-    const ok = submitCommand(@sizeOf(VirtioGpuSetScanout), 0, virtio_gpu_resp_ok_nodata);
+    const ok = submitCommand(@sizeOf(VirtioGpuSetScanout), 0, virtio_gpu_resp_ok_nodata, "set_scanout");
     if (!ok) logText("Compositor: virtgpu set_scanout command failed\n");
     return ok;
 }
@@ -1091,7 +1206,7 @@ pub fn virtgpu_transfer(handle: ResourceHandle, rect: Rect) bool {
         .resource_id = resource.resource_id,
         .padding = 0,
     };
-    return submitCommand(@sizeOf(VirtioGpuTransferToHost2d), 0, virtio_gpu_resp_ok_nodata);
+    return submitCommand(@sizeOf(VirtioGpuTransferToHost2d), 0, virtio_gpu_resp_ok_nodata, "transfer");
 }
 
 pub fn virtgpu_flush_rect(handle: ResourceHandle, rect: Rect) bool {
@@ -1110,7 +1225,7 @@ pub fn virtgpu_flush_rect(handle: ResourceHandle, rect: Rect) bool {
         .resource_id = resource.resource_id,
         .padding = 0,
     };
-    return submitCommand(@sizeOf(VirtioGpuResourceFlush), 0, virtio_gpu_resp_ok_nodata);
+    return submitCommand(@sizeOf(VirtioGpuResourceFlush), 0, virtio_gpu_resp_ok_nodata, "flush");
 }
 
 pub fn virtgpu_flush(handle: ResourceHandle) bool {

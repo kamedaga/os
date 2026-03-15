@@ -33,6 +33,9 @@ sudo mount ${LOOP}p1 /mnt/esp
 sudo mkdir -p /mnt/esp/EFI/BOOT
 sudo cp kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI /mnt/esp/EFI/BOOT/
 sudo cp kernel/zig-out/bin/EFI/BOOT/*.ELF /mnt/esp/EFI/BOOT/
+if [ -f kernel/zig-out/bin/EFI/BOOT/BOOTFS.IMG ]; then
+  sudo cp kernel/zig-out/bin/EFI/BOOT/BOOTFS.IMG /mnt/esp/EFI/BOOT/
+fi
 if [ -f kernel/zig-out/EFI/BOOT/CAPCHEL.ELF ]; then
   sudo cp kernel/zig-out/EFI/BOOT/CAPCHEL.ELF /mnt/esp/EFI/BOOT/
 fi

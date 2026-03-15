@@ -693,6 +693,25 @@ noinline fn syncPageTableRightsScan(
     }
 }
 
+pub fn principalHasMappedPaddr(principal: kernel.PrincipalId, paddr: u64) bool {
+    if (!runtime_ready) return false;
+    const space = getUserSpace(principal) orelse return false;
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        const slot_pd_index = pdIndexForPtSlot(space, slot) orelse {
+            continue;
+        };
+        _ = slot_pd_index;
+        var i: usize = 0;
+        while (i < runtime.page_entries) : (i += 1) {
+            const entry = space.pt_pages[slot][i];
+            if ((entry & runtime.page_present) == 0) continue;
+            if ((entry & runtime.page_addr_mask) == paddr) return true;
+        }
+    }
+    return false;
+}
+
 pub fn syncPageTableRightsForPrincipalPaddr(
     state: *const kernel.KernelState,
     principal: kernel.PrincipalId,

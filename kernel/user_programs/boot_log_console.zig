@@ -28,15 +28,20 @@ const ParserState = enum {
 };
 
 const Console = struct {
-    fb: [*]volatile u32,
     cursor_x: usize = 0,
     cursor_y: usize = 0,
     fg: u32 = default_fg_color,
     bg: u32 = default_bg_color,
 
+    fn framebuffer() [*]volatile u32 {
+        return @ptrFromInt(framebuffer_va);
+    }
+
     fn fillRectPx(self: *Console, x0: usize, y0: usize, width: usize, height: usize, color: u32) void {
+        _ = self;
         if (width == 0 or height == 0) return;
         if (x0 >= fb_width or y0 >= fb_height) return;
+        const fb = framebuffer();
 
         const end_x = if (x0 + width > fb_width) fb_width else x0 + width;
         const end_y = if (y0 + height > fb_height) fb_height else y0 + height;
@@ -46,7 +51,7 @@ const Console = struct {
             const row = y * fb_pitch;
             var x: usize = x0;
             while (x < end_x) : (x += 1) {
-                self.fb[row + x] = color;
+                fb[row + x] = color;
             }
         }
     }
@@ -70,13 +75,14 @@ const Console = struct {
     }
 
     fn scrollUp(self: *Console) void {
+        const fb = framebuffer();
         var y: usize = 0;
         while (y < fb_height - cell_h) : (y += 1) {
             const dst_row = y * fb_pitch;
             const src_row = (y + cell_h) * fb_pitch;
             var x: usize = 0;
             while (x < fb_width) : (x += 1) {
-                self.fb[dst_row + x] = self.fb[src_row + x];
+                fb[dst_row + x] = fb[src_row + x];
             }
         }
         self.fillRectPx(0, fb_height - cell_h, fb_width, cell_h, self.bg);
@@ -97,6 +103,7 @@ const Console = struct {
     }
 
     fn drawGlyph(self: *Console, ch: u8) void {
+        const fb = framebuffer();
         const glyph = glyphRows(ch);
         const px = self.cursor_x * cell_w + 2;
         const py = self.cursor_y * cell_h + 1;
@@ -114,7 +121,7 @@ const Console = struct {
                     const row = (base_y + sy) * fb_pitch;
                     var sx: usize = 0;
                     while (sx < glyph_scale) : (sx += 1) {
-                        self.fb[row + base_x + sx] = self.fg;
+                        fb[row + base_x + sx] = self.fg;
                     }
                 }
             }
@@ -464,10 +471,9 @@ fn renderBootLogAndPrompt(c: *Console, log: [*]const volatile u8) void {
 }
 
 pub export fn _start() noreturn {
-    const fb: [*]volatile u32 = @ptrFromInt(framebuffer_va);
     const log: [*]const volatile u8 = @ptrFromInt(boot_log_page_va);
 
-    var c = Console{ .fb = fb };
+    var c = Console{};
     renderBootLogAndPrompt(&c, log);
     _ = virtgpu.virtgpu_prewarm();
     while (true) {

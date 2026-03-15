@@ -1,10 +1,18 @@
 pub const window_cap_magic: u32 = 0x57434150; // 'WCAP'
 pub const window_meta_magic: u32 = 0x574D5441; // 'WMTA'
 pub const mouse_shared_magic: u64 = 0x4D534852; // "MSHR"
+pub const taskbar_state_magic: u32 = 0x54425354; // "TBST"
+pub const taskbar_command_magic: u32 = 0x5442434D; // "TBCM"
 pub const window_protocol_version: u16 = 2;
+pub const taskbar_protocol_version: u16 = 1;
 pub const window_title_max_bytes: usize = 64;
+pub const taskbar_entry_max: usize = 5;
 pub const window_flag_allow_pixels_dma: u32 = 1 << 0;
 pub const window_flag_low_scale: u32 = 1 << 1;
+pub const window_flag_frameless: u32 = 1 << 2;
+pub const taskbar_entry_flag_visible: u32 = 1 << 0;
+pub const taskbar_command_none: u16 = 0;
+pub const taskbar_command_activate: u16 = 1;
 
 pub const WindowRights = packed struct(u16) {
     read_meta: bool = false,
@@ -69,4 +77,29 @@ pub const MouseSharedPage = extern struct {
     seq: u64,
     wheel: u64,
     log_len: u64,
+};
+
+pub const TaskbarEntry = extern struct {
+    window_id: u32,
+    flags: u32,
+    title_len: u16,
+    reserved0: u16 = 0,
+    title: [window_title_max_bytes]u8,
+};
+
+pub const TaskbarStatePage = extern struct {
+    magic: u32,
+    version: u16,
+    entry_count: u16,
+    seq: u64,
+    entries: [taskbar_entry_max]TaskbarEntry,
+};
+
+pub const TaskbarCommandPage = extern struct {
+    magic: u32,
+    version: u16,
+    command: u16,
+    seq: u64,
+    window_id: u32,
+    reserved0: u32 = 0,
 };

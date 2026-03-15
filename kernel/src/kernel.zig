@@ -1,39 +1,49 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const capability = @import("capability.zig");
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
 const debug_window_force_free_list = true;
 
-pub const process_count: usize = 7;
+pub const initial_process_count: usize = 8;
+pub const process_count: usize = 32;
+pub const max_thread_slots: usize = 16;
 pub const device_count: usize = 1;
 pub const principal_count: usize = process_count + device_count;
 
 comptime {
-    if (process_count < 6) @compileError("process_count must be >= 6 for current boot role assignment");
+    if (initial_process_count < 8) @compileError("initial_process_count must be >= 8 for current boot role assignment");
     if (principal_count > std.math.maxInt(u8)) @compileError("principal_count must fit in u8");
 }
 
-fn PrincipalIdType(comptime process_slots: usize) type {
-    var fields: [process_slots + device_count]std.builtin.Type.EnumField = undefined;
-    inline for (0..process_slots) |i| {
+fn PrincipalIdType(comptime named_process_slots: usize) type {
+    var fields: [named_process_slots + device_count]std.builtin.Type.EnumField = undefined;
+    inline for (0..named_process_slots) |i| {
         fields[i] = .{
             .name = std.fmt.comptimePrint("Process{}", .{i}),
             .value = i,
         };
     }
-    fields[process_slots] = .{
+    fields[named_process_slots] = .{
         .name = "Device0",
-        .value = process_slots,
+        .value = process_count,
     };
 
     return @Type(.{ .@"enum" = .{
         .tag_type = u8,
         .fields = &fields,
         .decls = &.{},
-        .is_exhaustive = true,
+        .is_exhaustive = false,
     } });
 }
 
-pub const PrincipalId = PrincipalIdType(process_count);
+pub const PrincipalId = PrincipalIdType(initial_process_count);
+pub const vfs_process_index: usize = 8;
+pub const vfs_principal: PrincipalId = @enumFromInt(vfs_process_index);
+
+comptime {
+    if (vfs_process_index >= process_count) @compileError("vfs_process_index must be < process_count");
+    if (vfs_process_index < initial_process_count) @compileError("vfs_process_index must stay outside the initial boot role set");
+}
 
 const process_labels = blk: {
     var labels: [process_count][]const u8 = undefined;
@@ -55,6 +65,7 @@ pub fn processIndexFromPrincipal(principal: PrincipalId) ?usize {
 }
 
 pub fn principalLabel(principal: PrincipalId) []const u8 {
+    if (isVfsPrincipal(principal)) return "VFS";
     if (processIndexFromPrincipal(principal)) |index| {
         return process_labels[index];
     }
@@ -65,9 +76,14 @@ pub fn principalLabel(principal: PrincipalId) []const u8 {
 pub const endpoint_to_process0: u64 = 0x10;
 pub const endpoint_to_process1: u64 = 0x11;
 pub const endpoint_to_process2: u64 = 0x12;
+pub const endpoint_to_vfs: u64 = 0x13;
 
 fn isProcessPrincipal(principal: PrincipalId) bool {
     return processIndexFromPrincipal(principal) != null;
+}
+
+pub fn isVfsPrincipal(principal: PrincipalId) bool {
+    return @intFromEnum(principal) == vfs_process_index;
 }
 
 pub const Rights = struct {
@@ -93,11 +109,21 @@ pub const Region = struct {
     id: u64,
 };
 
+pub const ProcessDescriptor = struct {
+    active: bool = false,
+    principal: PrincipalId = @enumFromInt(0),
+    label: []const u8 = "",
+};
+
 pub const KernelError = error{
     RegionNotFound,
     CapabilityNotFound,
+    FsCapabilityNotFound,
+    VmObjectCapabilityNotFound,
+    ExecImageCapabilityNotFound,
     EndpointNotFound,
     MailboxEmpty,
+    FsMailboxEmpty,
     RevokeOverflow,
     NoDmaRight,
     InvalidState,
@@ -238,6 +264,217 @@ pub const CapMailbox = struct {
     }
 };
 
+pub const FsObjectKind = enum(u8) {
+    none = 0,
+    mount = 1,
+    vnode_dir = 2,
+    vnode_file = 3,
+    open_file = 4,
+    exec = 5,
+};
+
+pub const FsRights = packed struct(u32) {
+    lookup: bool = false,
+    read: bool = false,
+    write: bool = false,
+    readdir: bool = false,
+    stat: bool = false,
+    create: bool = false,
+    unlink: bool = false,
+    rename: bool = false,
+    exec: bool = false,
+    mount: bool = false,
+    grant: bool = false,
+    admin: bool = false,
+    _reserved: u20 = 0,
+};
+
+pub const FsCapability = struct {
+    object_id: u64,
+    kind: FsObjectKind,
+    rights: FsRights,
+    cap_id: u64,
+    root_cap_id: u64,
+    parent_cap_id: u64,
+};
+
+pub const FsCNode = struct {
+    pub const max_caps = 256;
+
+    caps: [max_caps]FsCapability = undefined,
+    len: usize = 0,
+
+    pub fn add(self: *FsCNode, cap: FsCapability) KernelError!void {
+        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
+        if (self.len >= self.caps.len) return KernelError.TableFull;
+        self.caps[self.len] = cap;
+        self.len += 1;
+    }
+
+    pub fn findByCapId(self: *const FsCNode, cap_id: u64) ?*const FsCapability {
+        if (self.findIndexByCapId(cap_id)) |index| {
+            return &self.caps[index];
+        }
+        return null;
+    }
+
+    pub fn removeByCapId(self: *FsCNode, cap_id: u64) bool {
+        if (self.findIndexByCapId(cap_id)) |index| {
+            var i = index;
+            while (i + 1 < self.len) : (i += 1) {
+                self.caps[i] = self.caps[i + 1];
+            }
+            self.len -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn findIndexByCapId(self: *const FsCNode, cap_id: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.caps[i].cap_id == cap_id) return i;
+        }
+        return null;
+    }
+};
+
+pub const FsMailbox = struct {
+    const max_items = 8;
+
+    items: [max_items]u64 = undefined,
+    len: usize = 0,
+
+    pub fn push(self: *FsMailbox, cap_id: u64) KernelError!void {
+        if (self.len >= self.items.len) return KernelError.TableFull;
+        self.items[self.len] = cap_id;
+        self.len += 1;
+    }
+
+    pub fn pop(self: *FsMailbox) ?u64 {
+        if (self.len == 0) return null;
+        const cap_id = self.items[0];
+        var i: usize = 1;
+        while (i < self.len) : (i += 1) {
+            self.items[i - 1] = self.items[i];
+        }
+        self.len -= 1;
+        return cap_id;
+    }
+};
+
+pub const max_image_backing_pages: usize = 128;
+
+pub const VmObjectRights = packed struct(u32) {
+    read: bool = false,
+    map: bool = false,
+    grant: bool = false,
+    _reserved: u29 = 0,
+};
+
+pub const ExecImageRights = packed struct(u32) {
+    exec: bool = false,
+    grant: bool = false,
+    _reserved: u30 = 0,
+};
+
+pub const ImageBacking = struct {
+    page_offset_bytes: u16 = 0,
+    page_count: u16 = 0,
+    _reserved0: u32 = 0,
+    size_bytes: u64 = 0,
+    page_paddrs: [max_image_backing_pages]u64 = [_]u64{0} ** max_image_backing_pages,
+
+    fn init(page_paddrs: []const u64, page_offset_bytes: u16, size_bytes: u64) ?ImageBacking {
+        if (page_paddrs.len == 0 or page_paddrs.len > max_image_backing_pages) return null;
+        if (size_bytes == 0) return null;
+        const first_page_bytes = @as(u64, 4096 - page_offset_bytes);
+        const total_capacity = first_page_bytes + (@as(u64, @intCast(page_paddrs.len - 1)) * 4096);
+        if (total_capacity < size_bytes) return null;
+
+        var backing = ImageBacking{
+            .page_offset_bytes = page_offset_bytes,
+            .page_count = @intCast(page_paddrs.len),
+            .size_bytes = size_bytes,
+        };
+        for (page_paddrs, 0..) |paddr, i| {
+            if ((paddr & 0xFFF) != 0) return null;
+            backing.page_paddrs[i] = paddr;
+        }
+        return backing;
+    }
+};
+
+pub const VmObjectCapability = struct {
+    backing: ImageBacking,
+    rights: VmObjectRights,
+    cap_id: u64,
+    root_cap_id: u64,
+    parent_cap_id: u64,
+};
+
+pub const ExecImageCapability = struct {
+    backing: ImageBacking,
+    rights: ExecImageRights,
+    cap_id: u64,
+    root_cap_id: u64,
+    parent_cap_id: u64,
+};
+
+pub const VmObjectCNode = struct {
+    pub const max_caps = 64;
+
+    caps: [max_caps]VmObjectCapability = undefined,
+    len: usize = 0,
+
+    pub fn add(self: *VmObjectCNode, cap: VmObjectCapability) KernelError!void {
+        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
+        if (self.len >= self.caps.len) return KernelError.TableFull;
+        self.caps[self.len] = cap;
+        self.len += 1;
+    }
+
+    pub fn findByCapId(self: *const VmObjectCNode, cap_id: u64) ?*const VmObjectCapability {
+        if (self.findIndexByCapId(cap_id)) |index| return &self.caps[index];
+        return null;
+    }
+
+    fn findIndexByCapId(self: *const VmObjectCNode, cap_id: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.caps[i].cap_id == cap_id) return i;
+        }
+        return null;
+    }
+};
+
+pub const ExecImageCNode = struct {
+    pub const max_caps = 64;
+
+    caps: [max_caps]ExecImageCapability = undefined,
+    len: usize = 0,
+
+    pub fn add(self: *ExecImageCNode, cap: ExecImageCapability) KernelError!void {
+        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
+        if (self.len >= self.caps.len) return KernelError.TableFull;
+        self.caps[self.len] = cap;
+        self.len += 1;
+    }
+
+    pub fn findByCapId(self: *const ExecImageCNode, cap_id: u64) ?*const ExecImageCapability {
+        if (self.findIndexByCapId(cap_id)) |index| return &self.caps[index];
+        return null;
+    }
+
+    fn findIndexByCapId(self: *const ExecImageCNode, cap_id: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.caps[i].cap_id == cap_id) return i;
+        }
+        return null;
+    }
+};
+
 pub const RegionFreeRange = struct {
     region_id: u64,
     len: usize,
@@ -304,6 +541,34 @@ pub const FreePageList = struct {
         }
 
         return paddr;
+    }
+
+    pub fn popFrontBelow(self: *FreePageList, limit_exclusive: u64) KernelError!u64 {
+        if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
+
+        var range_index: usize = 0;
+        while (range_index < self.range_len) : (range_index += 1) {
+            const range = &self.ranges[range_index];
+            if (range.len == 0) continue;
+            if (range.physical_start >= limit_exclusive) continue;
+
+            const paddr = range.physical_start;
+            range.physical_start += 4096;
+            range.len -= 1;
+            self.len -= 1;
+
+            if (range.len == 0) {
+                var r: usize = range_index + 1;
+                while (r < self.range_len) : (r += 1) {
+                    self.ranges[r - 1] = self.ranges[r];
+                }
+                self.range_len -= 1;
+            }
+
+            return paddr;
+        }
+
+        return KernelError.OutOfFreePages;
     }
 
     pub fn popBack(self: *FreePageList) KernelError!u64 {
@@ -617,11 +882,17 @@ pub const KernelState = struct {
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
+    process_descriptors: [process_count]ProcessDescriptor = [_]ProcessDescriptor{.{}} ** process_count,
+    active_process_count: usize = 0,
     cap_tables: [principal_count]CNode = [_]CNode{.{}} ** principal_count,
     untyped_tables: [principal_count]UntypedCNode = [_]UntypedCNode{.{}} ** principal_count,
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     framebuffer_caps: [principal_count]?FramebufferCapability = [_]?FramebufferCapability{null} ** principal_count,
+    fs_tables: [principal_count]FsCNode = [_]FsCNode{.{}} ** principal_count,
+    fs_mailboxes: [principal_count]FsMailbox = [_]FsMailbox{.{}} ** principal_count,
+    vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
+    exec_image_tables: [principal_count]ExecImageCNode = [_]ExecImageCNode{.{}} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     debug_window_hook: ?*const fn (state: *const KernelState, owner: PrincipalId, stage: DebugWindowStage, slot: usize, cap_paddr: u64, meta_paddr: u64) void = null,
@@ -1017,16 +1288,127 @@ pub const KernelState = struct {
             (!child.dma or parent.dma);
     }
 
+    fn isFsRightsSubset(child: FsRights, parent: FsRights) bool {
+        const child_bits: u32 = @bitCast(child);
+        const parent_bits: u32 = @bitCast(parent);
+        return (child_bits & ~parent_bits) == 0;
+    }
+
+    fn isVmObjectRightsSubset(child: VmObjectRights, parent: VmObjectRights) bool {
+        const child_bits: u32 = @bitCast(child);
+        const parent_bits: u32 = @bitCast(parent);
+        return (child_bits & ~parent_bits) == 0;
+    }
+
+    fn isExecImageRightsSubset(child: ExecImageRights, parent: ExecImageRights) bool {
+        const child_bits: u32 = @bitCast(child);
+        const parent_bits: u32 = @bitCast(parent);
+        return (child_bits & ~parent_bits) == 0;
+    }
+
     fn processPrincipal(index: usize) PrincipalId {
         return processPrincipalFromIndex(index) orelse unreachable;
+    }
+
+    pub fn isActiveProcess(self: *const KernelState, principal: PrincipalId) bool {
+        const index = processIndexFromPrincipal(principal) orelse return false;
+        return self.process_descriptors[index].active;
+    }
+
+    pub fn processDescriptor(self: *const KernelState, principal: PrincipalId) ?*const ProcessDescriptor {
+        const index = processIndexFromPrincipal(principal) orelse return null;
+        if (!self.process_descriptors[index].active) return null;
+        return &self.process_descriptors[index];
+    }
+
+    pub fn hasActivePrincipal(self: *const KernelState, principal: PrincipalId) bool {
+        if (processIndexFromPrincipal(principal)) |index| {
+            return self.process_descriptors[index].active;
+        }
+        return principal == .Device0;
+    }
+
+    fn requireActiveProcess(self: *const KernelState, principal: PrincipalId) KernelError!void {
+        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
+        if (!self.process_descriptors[index].active) return KernelError.InvalidState;
+    }
+
+    fn principalStorageIndex(self: *const KernelState, principal: PrincipalId) usize {
+        if (processIndexFromPrincipal(principal)) |index| {
+            std.debug.assert(self.process_descriptors[index].active);
+            return index;
+        }
+        std.debug.assert(principal == .Device0);
+        return @intFromEnum(principal);
+    }
+
+    pub fn createProcessDescriptor(self: *KernelState, label: []const u8) ?PrincipalId {
+        var i: usize = 0;
+        while (i < self.process_descriptors.len) : (i += 1) {
+            if (self.process_descriptors[i].active) continue;
+            const principal = processPrincipal(i);
+            self.process_descriptors[i] = .{
+                .active = true,
+                .principal = principal,
+                .label = label,
+            };
+            self.active_process_count += 1;
+            return principal;
+        }
+        return null;
+    }
+
+    pub fn ensureProcessDescriptor(self: *KernelState, principal: PrincipalId, label: []const u8) bool {
+        const index = processIndexFromPrincipal(principal) orelse return false;
+        if (self.process_descriptors[index].active) return true;
+        self.process_descriptors[index] = .{
+            .active = true,
+            .principal = principal,
+            .label = label,
+        };
+        self.active_process_count += 1;
+        return true;
+    }
+
+    pub fn removeProcessDescriptor(self: *KernelState, principal: PrincipalId) bool {
+        const index = processIndexFromPrincipal(principal) orelse return false;
+        if (!self.process_descriptors[index].active) return false;
+        self.process_descriptors[index] = .{};
+        if (self.active_process_count > 0) self.active_process_count -= 1;
+        return true;
+    }
+
+    pub fn ensureVfsProcess(self: *KernelState) bool {
+        return self.ensureProcessDescriptor(vfs_principal, principalLabel(vfs_principal));
     }
 
     fn initPrincipalState(self: *KernelState) void {
         var i: usize = 0;
         while (i < principal_count) : (i += 1) {
             self.cap_tables[i] = .{};
+            self.untyped_tables[i] = .{};
             self.endpoint_tables[i] = .{};
             self.cap_mailboxes[i] = .{};
+            self.framebuffer_caps[i] = null;
+            self.fs_tables[i] = .{};
+            self.fs_mailboxes[i] = .{};
+            self.vm_object_tables[i] = .{};
+            self.exec_image_tables[i] = .{};
+        }
+        i = 0;
+        while (i < self.process_descriptors.len) : (i += 1) {
+            self.process_descriptors[i] = .{};
+        }
+        self.active_process_count = 0;
+        i = 0;
+        while (i < initial_process_count) : (i += 1) {
+            const principal = processPrincipal(i);
+            self.process_descriptors[i] = .{
+                .active = true,
+                .principal = principal,
+                .label = principalLabel(principal),
+            };
+            self.active_process_count += 1;
         }
     }
 
@@ -1043,7 +1425,7 @@ pub const KernelState = struct {
         });
 
         var i: usize = 2;
-        while (i < process_count) : (i += 1) {
+        while (i < self.active_process_count) : (i += 1) {
             const proc = processPrincipal(i);
             try self.endpoint_tables[@intFromEnum(proc)].add(.{
                 .endpoint_id = endpoint_to_process1,
@@ -1152,7 +1534,7 @@ pub const KernelState = struct {
         length: u64,
         direction: DmaDirection,
     ) KernelError!u64 {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         return self.dma_mappings.alloc(
             @intFromEnum(owner),
             device,
@@ -1217,7 +1599,7 @@ pub const KernelState = struct {
         allow_submit: bool,
         allow_notify: bool,
     ) KernelError!u64 {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         return self.queue_caps.alloc(
             @intFromEnum(owner),
             device,
@@ -1239,7 +1621,7 @@ pub const KernelState = struct {
         queue_index: u16,
         op: QueueOperation,
     ) KernelError!void {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         self.queue_caps.authorize(
             @intFromEnum(owner),
             token,
@@ -1271,30 +1653,84 @@ pub const KernelState = struct {
     }
 
     pub fn getTable(self: *KernelState, principal: PrincipalId) *CNode {
-        return &self.cap_tables[@intFromEnum(principal)];
+        return &self.cap_tables[self.principalStorageIndex(principal)];
     }
 
     pub fn getTableConst(self: *const KernelState, principal: PrincipalId) *const CNode {
-        return &self.cap_tables[@intFromEnum(principal)];
+        return &self.cap_tables[self.principalStorageIndex(principal)];
     }
 
     pub fn getUntypedTable(self: *KernelState, principal: PrincipalId) *UntypedCNode {
-        return &self.untyped_tables[@intFromEnum(principal)];
+        return &self.untyped_tables[self.principalStorageIndex(principal)];
     }
 
     pub fn getUntypedTableConst(self: *const KernelState, principal: PrincipalId) *const UntypedCNode {
-        return &self.untyped_tables[@intFromEnum(principal)];
+        return &self.untyped_tables[self.principalStorageIndex(principal)];
     }
 
     pub fn getEndpointTable(self: *KernelState, principal: PrincipalId) *EndpointCNode {
-        return &self.endpoint_tables[@intFromEnum(principal)];
+        return &self.endpoint_tables[self.principalStorageIndex(principal)];
     }
 
     pub fn getEndpointTableConst(self: *const KernelState, principal: PrincipalId) *const EndpointCNode {
-        return &self.endpoint_tables[@intFromEnum(principal)];
+        return &self.endpoint_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn installEndpoint(
+        self: *KernelState,
+        owner: PrincipalId,
+        endpoint_id: u64,
+        target: PrincipalId,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        try self.requireActiveProcess(target);
+        try self.getEndpointTable(owner).add(.{
+            .endpoint_id = endpoint_id,
+            .target = target,
+        });
+    }
+
+    pub fn installServiceEndpointForActiveProcesses(
+        self: *KernelState,
+        endpoint_id: u64,
+        target: PrincipalId,
+    ) KernelError!void {
+        try self.requireActiveProcess(target);
+        var i: usize = 0;
+        while (i < self.process_descriptors.len) : (i += 1) {
+            const desc = self.process_descriptors[i];
+            if (!desc.active) continue;
+            if (desc.principal == target) continue;
+            try self.installEndpoint(desc.principal, endpoint_id, target);
+        }
+    }
+
+    pub fn getFsTable(self: *KernelState, principal: PrincipalId) *FsCNode {
+        return &self.fs_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn getFsTableConst(self: *const KernelState, principal: PrincipalId) *const FsCNode {
+        return &self.fs_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn getVmObjectTable(self: *KernelState, principal: PrincipalId) *VmObjectCNode {
+        return &self.vm_object_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn getVmObjectTableConst(self: *const KernelState, principal: PrincipalId) *const VmObjectCNode {
+        return &self.vm_object_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn getExecImageTable(self: *KernelState, principal: PrincipalId) *ExecImageCNode {
+        return &self.exec_image_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn getExecImageTableConst(self: *const KernelState, principal: PrincipalId) *const ExecImageCNode {
+        return &self.exec_image_tables[self.principalStorageIndex(principal)];
     }
 
     pub fn endpointTargetFor(self: *const KernelState, owner: PrincipalId, endpoint_id: u64) ?PrincipalId {
+        if (!self.hasActivePrincipal(owner)) return null;
         const ep = self.getEndpointTableConst(owner).find(endpoint_id) orelse return null;
         return ep.target;
     }
@@ -1304,7 +1740,7 @@ pub const KernelState = struct {
         to: PrincipalId,
         framebuffer: FramebufferCapability,
     ) KernelError!void {
-        if (!isProcessPrincipal(to)) return KernelError.InvalidState;
+        try self.requireActiveProcess(to);
         if (framebuffer.size_bytes == 0) return KernelError.InvalidState;
 
         const size_minus_one = framebuffer.size_bytes - 1;
@@ -1314,8 +1750,208 @@ pub const KernelState = struct {
         self.framebuffer_caps[@intFromEnum(to)] = framebuffer;
     }
 
+    pub fn installFsCap(
+        self: *KernelState,
+        owner: PrincipalId,
+        object_id: u64,
+        kind: FsObjectKind,
+        rights: FsRights,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(owner);
+        if (kind == .none) return KernelError.InvalidState;
+
+        const root_id = self.allocCapId();
+        try self.getFsTable(owner).add(.{
+            .object_id = object_id,
+            .kind = kind,
+            .rights = rights,
+            .cap_id = root_id,
+            .root_cap_id = root_id,
+            .parent_cap_id = 0,
+        });
+        return root_id;
+    }
+
+    pub fn grantFsCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        cap_id: u64,
+        rights: FsRights,
+    ) KernelError!u64 {
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+
+        const src_cap = self.getFsTableConst(from).findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
+        if (!isFsRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+
+        const child_id = self.allocCapId();
+        try self.getFsTable(to).add(.{
+            .object_id = src_cap.object_id,
+            .kind = src_cap.kind,
+            .rights = rights,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
+        return child_id;
+    }
+
+    pub fn moveFsCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        cap_id: u64,
+        rights: FsRights,
+    ) KernelError!u64 {
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+
+        const src = self.getFsTable(from);
+        const src_cap = src.findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
+        if (!isFsRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+
+        var moved = src_cap.*;
+        moved.rights = rights;
+        _ = src.removeByCapId(cap_id);
+        try self.getFsTable(to).add(moved);
+        return moved.cap_id;
+    }
+
+    pub fn sendFsCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        cap_id: u64,
+    ) KernelError!u64 {
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+
+        const src_cap = self.getFsTableConst(from).findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
+        return self.moveFsCap(from, to, cap_id, src_cap.rights);
+    }
+
+    pub fn sendFsCapOnEndpoint(
+        self: *KernelState,
+        from: PrincipalId,
+        endpoint_id: u64,
+        cap_id: u64,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(from);
+        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
+        const src_cap = self.getFsTableConst(from).findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
+        const child_id = try self.grantFsCap(from, target, cap_id, src_cap.rights);
+        try self.fs_mailboxes[@intFromEnum(target)].push(child_id);
+        return child_id;
+    }
+
+    pub fn recvFsCap(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
+        try self.requireActiveProcess(receiver);
+        return self.fs_mailboxes[@intFromEnum(receiver)].pop() orelse KernelError.FsMailboxEmpty;
+    }
+
+    pub fn installVmObjectCap(
+        self: *KernelState,
+        owner: PrincipalId,
+        page_paddrs: []const u64,
+        page_offset_bytes: u16,
+        size_bytes: u64,
+        rights: VmObjectRights,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(owner);
+        const backing = ImageBacking.init(page_paddrs, page_offset_bytes, size_bytes) orelse return KernelError.InvalidState;
+
+        const root_id = self.allocCapId();
+        try self.getVmObjectTable(owner).add(.{
+            .backing = backing,
+            .rights = rights,
+            .cap_id = root_id,
+            .root_cap_id = root_id,
+            .parent_cap_id = 0,
+        });
+        return root_id;
+    }
+
+    pub fn grantVmObjectCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        cap_id: u64,
+        rights: VmObjectRights,
+    ) KernelError!u64 {
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+
+        const src_cap = self.getVmObjectTableConst(from).findByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
+        if (!isVmObjectRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+
+        const child_id = self.allocCapId();
+        try self.getVmObjectTable(to).add(.{
+            .backing = src_cap.backing,
+            .rights = rights,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
+        return child_id;
+    }
+
+    pub fn installExecImageCap(
+        self: *KernelState,
+        owner: PrincipalId,
+        vm_cap_id: u64,
+        rights: ExecImageRights,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(owner);
+
+        const vm_cap = self.getVmObjectTableConst(owner).findByCapId(vm_cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
+        if (!vm_cap.rights.read) return KernelError.InvalidState;
+
+        const root_id = self.allocCapId();
+        try self.getExecImageTable(owner).add(.{
+            .backing = vm_cap.backing,
+            .rights = rights,
+            .cap_id = root_id,
+            .root_cap_id = root_id,
+            .parent_cap_id = 0,
+        });
+        return root_id;
+    }
+
+    pub fn grantExecImageCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        cap_id: u64,
+        rights: ExecImageRights,
+    ) KernelError!u64 {
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+
+        const src_cap = self.getExecImageTableConst(from).findByCapId(cap_id) orelse return KernelError.ExecImageCapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
+        if (!isExecImageRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+
+        const child_id = self.allocCapId();
+        try self.getExecImageTable(to).add(.{
+            .backing = src_cap.backing,
+            .rights = rights,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
+        return child_id;
+    }
+
     pub fn getFramebufferCap(self: *const KernelState, principal: PrincipalId) ?FramebufferCapability {
-        if (!isProcessPrincipal(principal)) return null;
+        if (!self.hasActivePrincipal(principal)) return null;
         return self.framebuffer_caps[@intFromEnum(principal)];
     }
 
@@ -1376,8 +2012,9 @@ pub const KernelState = struct {
         free_list: *FreePageList,
     ) KernelError!PageCapability {
         _ = requester;
+        const user_mappable_paddr_limit: u64 = 4 * 1024 * 1024 * 1024;
         while (true) {
-            const paddr = try free_list.popBack();
+            const paddr = try free_list.popFrontBelow(user_mappable_paddr_limit);
             if (self.anyPrincipalHasPageCap(paddr)) continue;
             if (self.paddrFallsInsideActiveUntypedBlock(paddr)) continue;
             return .{
@@ -1391,6 +2028,7 @@ pub const KernelState = struct {
         requester: PrincipalId,
         free_list: *FreePageList,
     ) KernelError!PageCapability {
+        try self.requireActiveProcess(requester);
         const cap = try self.allocPage(requester, free_list);
         if (self.debug_alloc_page_hook) |hook| {
             hook(self, requester, .after_pop, cap.paddr);
@@ -1428,7 +2066,7 @@ pub const KernelState = struct {
         size_bytes: u64,
         flags: UntypedFlags,
     ) KernelError!u32 {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         const block_id = try self.untyped_pool.allocBlock(base_paddr, size_bytes, flags);
         const root_id = self.allocCapId();
         try self.getUntypedTable(owner).add(.{
@@ -1446,7 +2084,7 @@ pub const KernelState = struct {
         page_count: usize,
         contiguous: bool,
     ) ?u32 {
-        if (!isProcessPrincipal(owner)) return null;
+        self.requireActiveProcess(owner) catch return null;
         const bytes_needed, const overflow = @mulWithOverflow(@as(u64, @intCast(page_count)), @as(u64, 4096));
         if (overflow != 0) return null;
         const table = self.getUntypedTableConst(owner);
@@ -1470,7 +2108,7 @@ pub const KernelState = struct {
         contiguous: bool,
         out_caps: []PageCapability,
     ) KernelError!void {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         if (page_count == 0 or out_caps.len < page_count) return KernelError.InvalidState;
         const untyped_cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
         const block = self.untyped_pool.getBlock(block_id) orelse return KernelError.UntypedNotFound;
@@ -1518,7 +2156,8 @@ pub const KernelState = struct {
         block_id: u32,
     ) KernelError!void {
         if (from == to) return KernelError.InvalidState;
-        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
         const src_cap = self.getUntypedTableConst(from).find(block_id) orelse return KernelError.UntypedNotFound;
         if (self.getUntypedTableConst(to).find(block_id) != null) return KernelError.InvalidState;
         const child_id = self.allocCapId();
@@ -1537,7 +2176,8 @@ pub const KernelState = struct {
         block_id: u32,
     ) KernelError!void {
         if (from == to) return KernelError.InvalidState;
-        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
         const src = self.getUntypedTable(from);
         const src_cap = src.find(block_id) orelse return KernelError.UntypedNotFound;
         if (self.getUntypedTableConst(to).find(block_id) != null) return KernelError.InvalidState;
@@ -1575,7 +2215,7 @@ pub const KernelState = struct {
         owner: PrincipalId,
         block_id: u32,
     ) KernelError!void {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         const cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
         if (cap.parent_cap_id != 0) return KernelError.InvalidState;
         if (self.hasUntypedChildren(cap.cap_id) or self.hasPageChildren(cap.cap_id)) {
@@ -1590,7 +2230,7 @@ pub const KernelState = struct {
         owner: PrincipalId,
         block_id: u32,
     ) KernelError!void {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         const start_cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
         const start_id = start_cap.cap_id;
         const is_root = start_cap.parent_cap_id == 0;
@@ -1673,6 +2313,7 @@ pub const KernelState = struct {
         paddr: u64,
         rights: Rights,
     ) KernelError!void {
+        if (!self.hasActivePrincipal(owner)) return KernelError.InvalidState;
         if (self.getTableConst(owner).find(paddr) != null) return;
         const root_id = self.allocCapId();
         try self.getTable(owner).add(.{
@@ -1696,6 +2337,7 @@ pub const KernelState = struct {
     ) KernelError!void {
         if (from == to) return KernelError.InvalidState;
         if (to == .Device0 and (rights.cpu_read or rights.cpu_write or !rights.dma)) return KernelError.InvalidState;
+        if (!self.hasActivePrincipal(from) or !self.hasActivePrincipal(to)) return KernelError.InvalidState;
 
         const src = self.getTable(from);
         const src_cap = src.find(paddr) orelse return KernelError.CapabilityNotFound;
@@ -1722,7 +2364,8 @@ pub const KernelState = struct {
         rights: Rights,
     ) KernelError!void {
         if (from == to) return KernelError.InvalidState;
-        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
 
         const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
         if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
@@ -1737,6 +2380,10 @@ pub const KernelState = struct {
             .parent_cap_id = src_cap.cap_id,
         });
         try self.syncIommuForPrincipalPaddr(to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
+        if (self.pte_sync_hook) |hook| {
+            if (!capability.principalHasMappedPaddr(to, paddr)) return;
+            callPteSyncHook(hook, self, to, paddr);
+        }
     }
 
     pub fn grantCapsBatch(
@@ -1747,7 +2394,8 @@ pub const KernelState = struct {
         rights: Rights,
     ) KernelError!void {
         if (from == to) return KernelError.InvalidState;
-        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
         if (paddrs.len == 0) return KernelError.InvalidState;
         var i: usize = 0;
         while (i < paddrs.len) : (i += 1) {
@@ -1785,7 +2433,8 @@ pub const KernelState = struct {
         paddr: u64,
     ) KernelError!void {
         if (from == to) return KernelError.InvalidState;
-        if (!isProcessPrincipal(from) or !isProcessPrincipal(to)) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
 
         const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
         try self.moveCap(from, to, paddr, src_cap.rights);
@@ -1797,14 +2446,15 @@ pub const KernelState = struct {
         endpoint_id: u64,
         paddr: u64,
     ) KernelError!void {
-        if (!isProcessPrincipal(from)) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
         const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        try self.sendCap(from, target, paddr);
+        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
+        try self.grantCap(from, target, paddr, src_cap.rights);
         try self.cap_mailboxes[@intFromEnum(target)].push(paddr);
     }
 
     pub fn recvCap(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
-        if (!isProcessPrincipal(receiver)) return KernelError.InvalidState;
+        try self.requireActiveProcess(receiver);
         return self.cap_mailboxes[@intFromEnum(receiver)].pop() orelse KernelError.MailboxEmpty;
     }
 
@@ -1813,7 +2463,7 @@ pub const KernelState = struct {
         owner: PrincipalId,
         paddr: u64,
     ) KernelError!void {
-        if (!isProcessPrincipal(owner)) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
         const start_cap = self.getTableConst(owner).find(paddr) orelse return KernelError.CapabilityNotFound;
         const start_id = start_cap.cap_id;
 
@@ -2317,4 +2967,69 @@ test "framebuffer capability grants draw right only to owner process" {
     try std.testing.expect(!s.canDrawToFramebuffer(.Process1, 0x8000_1000, 0x1000, true));
     try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x7FFF_F000, 0x2000, true));
     try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x8000_1000, 0x1000, false));
+}
+
+test "ensureVfsProcess activates reserved VFS principal" {
+    var s = KernelState.initPhase1();
+    try std.testing.expect(!s.isActiveProcess(vfs_principal));
+    try std.testing.expect(s.ensureVfsProcess());
+    try std.testing.expect(s.isActiveProcess(vfs_principal));
+    const desc = s.processDescriptor(vfs_principal).?;
+    try std.testing.expectEqualStrings("VFS", desc.label);
+}
+
+test "filesystem capability grant preserves object and lineage" {
+    var s = KernelState.initPhase1();
+    try std.testing.expect(s.ensureVfsProcess());
+
+    const root_token = try s.installFsCap(vfs_principal, 0x100, .mount, .{
+        .lookup = true,
+        .read = true,
+        .readdir = true,
+        .stat = true,
+        .mount = true,
+        .grant = true,
+    });
+    const child_token = try s.grantFsCap(vfs_principal, .Process0, root_token, .{
+        .lookup = true,
+        .read = true,
+        .readdir = true,
+        .stat = true,
+    });
+
+    const root_cap = s.getFsTableConst(vfs_principal).findByCapId(root_token).?;
+    const child_cap = s.getFsTableConst(.Process0).findByCapId(child_token).?;
+    try std.testing.expectEqual(@as(u64, 0x100), child_cap.object_id);
+    try std.testing.expectEqual(FsObjectKind.mount, child_cap.kind);
+    try std.testing.expectEqual(root_cap.root_cap_id, child_cap.root_cap_id);
+    try std.testing.expectEqual(root_cap.cap_id, child_cap.parent_cap_id);
+}
+
+test "filesystem capability grant requires grant right" {
+    var s = KernelState.initPhase1();
+    try std.testing.expect(s.ensureVfsProcess());
+
+    const root_token = try s.installFsCap(vfs_principal, 0x180, .vnode_dir, .{
+        .lookup = true,
+        .readdir = true,
+        .stat = true,
+    });
+    try std.testing.expectError(KernelError.InvalidState, s.grantFsCap(vfs_principal, .Process0, root_token, .{
+        .lookup = true,
+    }));
+}
+
+test "filesystem capability send on endpoint enqueues granted token" {
+    var s = KernelState.initPhase1();
+    const root_token = try s.installFsCap(.Process0, 0x200, .vnode_dir, .{
+        .lookup = true,
+        .readdir = true,
+        .stat = true,
+    });
+
+    const recv_token = try s.sendFsCapOnEndpoint(.Process0, endpoint_to_process1, root_token);
+    try std.testing.expectEqual(recv_token, try s.recvFsCap(.Process1));
+    const recv_cap = s.getFsTableConst(.Process1).findByCapId(recv_token).?;
+    try std.testing.expectEqual(@as(u64, 0x200), recv_cap.object_id);
+    try std.testing.expectEqual(FsObjectKind.vnode_dir, recv_cap.kind);
 }

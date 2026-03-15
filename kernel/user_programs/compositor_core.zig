@@ -15,12 +15,21 @@ const syscall_ok: u64 = 0;
 const syscall_err_empty: u64 = 13;
 
 const shared_page_va: usize = 0x3C00_3000;
+const taskbar_state_shared_va: usize = 0x3C00_4000;
+const taskbar_command_shared_va: usize = 0x3C00_6000;
 const ipc_rx_page_va: usize = 0x3C10_8000;
 
 const shared_magic = protocol.mouse_shared_magic;
+const taskbar_state_magic = protocol.taskbar_state_magic;
+const taskbar_command_magic = protocol.taskbar_command_magic;
+const taskbar_protocol_version = protocol.taskbar_protocol_version;
+const taskbar_entry_flag_visible = protocol.taskbar_entry_flag_visible;
+const taskbar_command_none = protocol.taskbar_command_none;
+const taskbar_command_activate = protocol.taskbar_command_activate;
 const window_cap_magic = protocol.window_cap_magic;
 const window_meta_magic = protocol.window_meta_magic;
 const window_flag_low_scale = protocol.window_flag_low_scale;
+const window_flag_frameless = protocol.window_flag_frameless;
 const process0_id: u64 = 0;
 const rights_read_write: u64 = 0x3;
 
@@ -35,22 +44,26 @@ const pixel_width: usize = 32;
 const pixel_height: usize = 32;
 const pixel_pitch: usize = 32;
 
-const max_windows: usize = 4;
+const max_windows: usize = 5;
 
 const background_color: u32 = 0x00FD_FDFD;
 const window_border_color: u32 = 0x0087_837E;
-const window_header_top_color: u32 = 0x00DA_D6D2;
-const window_header_bottom_color: u32 = 0x00E1_DDDA;
-const window_header_fill_color: u32 = 0x00DE_DAD7;
+const window_header_top_color: u32 = 0x009A_B6_D2;
+const window_header_bottom_color: u32 = 0x00C2_D7_ED;
+const window_header_fill_color: u32 = 0x00B1_C6_DC;
 const window_header_text_color: u32 = 0x0033_383A;
 const window_header_divider_color: u32 = 0x00B8_B4AF;
 const window_header_divider_soft_color: u32 = 0x00CC_C7C3;
+const window_inner_frame_color: u32 = 0x00D7_E4_F3;
 const window_content_bg_color: u32 = 0x00FF_FFFF;
-const close_btn_color: u32 = window_header_fill_color;
-const close_btn_glow_color: u32 = 0x00F3_F3F2;
-const close_btn_hover_color: u32 = 0x00FF_FFFF;
-const close_btn_down_color: u32 = 0x00F1_F0EE;
-const close_btn_cross_color: u32 = 0x0054_5A5D;
+const minimize_btn_top_color: u32 = 0x0099_A7_B7;
+const minimize_btn_bottom_color: u32 = 0x008D_9AAA;
+const minimize_btn_border_color: u32 = 0x0055_606B;
+const minimize_btn_symbol_color: u32 = 0x00F2_F5_F8;
+const close_btn_top_color: u32 = 0x00C9_66_53;
+const close_btn_bottom_color: u32 = 0x00C5_62_4E;
+const close_btn_border_color: u32 = 0x007E_49_4D;
+const close_btn_cross_color: u32 = 0x00F7_ED_EA;
 const window_header_highlight_color: u32 = 0x00FF_FFFF;
 const window_shadow_color: u32 = 0x0000_0000;
 const window_shadow_right_extent: i32 = 2;
@@ -60,15 +73,39 @@ const default_window_scale: usize = 10;
 const low_window_scale: usize = 1;
 const window_border: usize = 1;
 const window_header_h: usize = 27;
-const window_close_size: usize = 16;
+const window_minimize_width: usize = 22;
+const window_minimize_height: usize = 14;
+const window_close_width: usize = 22;
+const window_close_height: usize = 14;
+const window_button_gap: usize = 4;
 const window_close_margin: usize = 8;
 const window_corner_cut: usize = 5;
-const close_btn_circle_padding: i32 = 2;
 const window_title_y_bias: i32 = 1;
 const window_border_i32: i32 = @as(i32, @intCast(window_border));
 const window_header_h_i32: i32 = @as(i32, @intCast(window_header_h));
-const window_close_size_i32: i32 = @as(i32, @intCast(window_close_size));
+const window_minimize_width_i32: i32 = @as(i32, @intCast(window_minimize_width));
+const window_minimize_height_i32: i32 = @as(i32, @intCast(window_minimize_height));
+const window_close_width_i32: i32 = @as(i32, @intCast(window_close_width));
+const window_close_height_i32: i32 = @as(i32, @intCast(window_close_height));
+const window_button_gap_i32: i32 = @as(i32, @intCast(window_button_gap));
 const window_close_margin_i32: i32 = @as(i32, @intCast(window_close_margin));
+
+const taskbar_window_height: i32 = 32;
+const taskbar_process_left_pad: i32 = 8;
+const taskbar_process_top_pad: i32 = 0;
+const taskbar_process_button_gap: i32 = 6;
+const taskbar_process_button_max_width: i32 = 164;
+const taskbar_process_right_reserved: i32 = 96;
+const taskbar_process_bg: u32 = 0x00AE_C5_DF;
+const taskbar_process_grad_start: u32 = 0x00DE_E7_F2;
+const taskbar_process_border: u32 = 0x0022_27_2D;
+const taskbar_process_border_left_bottom: u32 = 0x006A_79_89;
+const taskbar_process_inner_highlight: u32 = 0x00F3_F3_F3;
+const taskbar_process_hover_glow_color: u32 = 0x00CE_E2_F0;
+const taskbar_process_hidden_text: u32 = 0x00F2_F6_FA;
+const taskbar_process_text: u32 = 0x0022_27_2D;
+const taskbar_process_radius: i32 = 3;
+const taskbar_process_gradient_width: i32 = 48;
 
 const window_title_offset: usize = 16;
 const window_title_max_bytes = protocol.window_title_max_bytes;
@@ -79,6 +116,8 @@ const window_map_stride_va: usize = (2 + max_window_pixel_pages) * 4096;
 const WindowCap = protocol.WindowCap;
 const WindowMeta = protocol.WindowMeta;
 const MouseSharedPage = protocol.MouseSharedPage;
+const TaskbarStatePage = protocol.TaskbarStatePage;
+const TaskbarCommandPage = protocol.TaskbarCommandPage;
 const WindowCapSnapshot = struct {
     window_id: u32,
     pixels_cap_paddr: u64,
@@ -101,6 +140,7 @@ var back_buffer_storage: [fb_pixels]u32 align(64) = [_]u32{0} ** fb_pixels;
 var window_store: WindowStore = .{};
 var window_shadow_valid: [max_windows]bool = [_]bool{false} ** max_windows;
 var window_gpu_resources: [max_windows]?virtgpu.ResourceHandle = [_]?virtgpu.ResourceHandle{null} ** max_windows;
+var logged_invalid_window_source: [max_windows]bool = [_]bool{false} ** max_windows;
 var next_window_z_order: u32 = 1;
 var window_paint_order_cache: [max_windows]usize = [_]usize{0} ** max_windows;
 var window_paint_order_count: usize = 0;
@@ -110,6 +150,9 @@ var first_present_transfer_logged = false;
 var first_present_flush_logged = false;
 var logged_invalid_gpu_slot: ?usize = null;
 var logged_first_gpu_sync_slot: bool = false;
+var debug_recent_window_slot: ?usize = null;
+var debug_recent_window_sync_logged = false;
+var debug_recent_window_draw_logged = false;
 const compositor_perf_report_min_wall_tsc: u64 = 1_000_000_000;
 const CompositorPerfReport = struct {
     start_tsc: u64 = 0,
@@ -133,8 +176,19 @@ var mouse_state_storage: MouseState = .{
 
 const DrawSurface = struct {
     pixels: [*]volatile u32,
+    pixel_capacity: usize,
     clip: Rect,
 };
+
+fn surfaceIndex(surface: *const DrawSurface, x: i32, y: i32) ?usize {
+    if (x < surface.clip.x0 or x >= surface.clip.x1 or y < surface.clip.y0 or y >= surface.clip.y1) return null;
+    if (x < 0 or y < 0 or x >= fb_width_i32 or y >= fb_height_i32) return null;
+    const ux: usize = @intCast(x);
+    const uy: usize = @intCast(y);
+    const index = uy * fb_pitch + ux;
+    if (index >= surface.pixel_capacity) return null;
+    return index;
+}
 
 fn readTsc() u64 {
     var lo: u32 = 0;
@@ -224,6 +278,63 @@ fn logInvalidGpuSlot(slot: usize) void {
     _ = userLog(buf[0..idx]);
 }
 
+fn logInvalidWindowSource(slot: usize, src: *const WindowSource, reason: []const u8) void {
+    if (slot < logged_invalid_window_source.len and logged_invalid_window_source[slot]) return;
+    if (slot < logged_invalid_window_source.len) logged_invalid_window_source[slot] = true;
+    var buf: [256]u8 = undefined;
+    var idx: usize = 0;
+    appendDiagText(buf[0..], &idx, "Compositor: invalid window source slot=");
+    appendDiagU64Decimal(buf[0..], &idx, slot);
+    appendDiagText(buf[0..], &idx, " window_id=");
+    appendDiagU64Decimal(buf[0..], &idx, src.window_id);
+    appendDiagText(buf[0..], &idx, " reason=");
+    appendDiagText(buf[0..], &idx, reason);
+    appendDiagText(buf[0..], &idx, " width=");
+    appendDiagU64Decimal(buf[0..], &idx, src.width);
+    appendDiagText(buf[0..], &idx, " height=");
+    appendDiagU64Decimal(buf[0..], &idx, src.height);
+    appendDiagText(buf[0..], &idx, " pitch=");
+    appendDiagU64Decimal(buf[0..], &idx, src.pitch);
+    appendDiagText(buf[0..], &idx, " pages=");
+    appendDiagU64Decimal(buf[0..], &idx, src.pixels_page_count);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
+fn windowSourcePixelsReadable(slot: usize, src: *const WindowSource) bool {
+    if (!src.active or src.pixel_va == 0) {
+        logInvalidWindowSource(slot, src, "inactive");
+        return false;
+    }
+    if (src.width == 0 or src.height == 0 or src.pitch == 0) {
+        logInvalidWindowSource(slot, src, "zero_dim");
+        return false;
+    }
+    if (src.pitch < src.width) {
+        logInvalidWindowSource(slot, src, "pitch_lt_width");
+        return false;
+    }
+    if (src.pixels_page_count == 0) {
+        logInvalidWindowSource(slot, src, "zero_pages");
+        return false;
+    }
+
+    const capacity_pixels = (src.pixels_page_count * 4096) / @sizeOf(u32);
+    const row_base = std.math.mul(usize, src.height - 1, src.pitch) catch {
+        logInvalidWindowSource(slot, src, "row_overflow");
+        return false;
+    };
+    const last_index = std.math.add(usize, row_base, src.width - 1) catch {
+        logInvalidWindowSource(slot, src, "index_overflow");
+        return false;
+    };
+    if (last_index >= capacity_pixels) {
+        logInvalidWindowSource(slot, src, "out_of_range");
+        return false;
+    }
+    return true;
+}
+
 fn logFirstGpuSyncSlot(slot: usize, source: *const WindowSource, frame: *const WindowState) void {
     if (logged_first_gpu_sync_slot) return;
     logged_first_gpu_sync_slot = true;
@@ -231,7 +342,7 @@ fn logFirstGpuSyncSlot(slot: usize, source: *const WindowSource, frame: *const W
     var idx: usize = 0;
     var src0: u32 = 0;
     var src_center: u32 = 0;
-    if (source.pixel_va != 0 and source.width > 0 and source.height > 0) {
+    if (windowSourcePixelsReadable(slot, source)) {
         const src_pixels: [*]const volatile u32 = @ptrFromInt(source.pixel_va);
         src0 = src_pixels[0];
         const center_x = source.width / 2;
@@ -258,6 +369,46 @@ fn logFirstGpuSyncSlot(slot: usize, source: *const WindowSource, frame: *const W
     appendDiagHexU64(buf[0..], &idx, src0);
     appendDiagText(buf[0..], &idx, " src_center=");
     appendDiagHexU64(buf[0..], &idx, src_center);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
+fn logWindowRegistered(slot: usize, window_id: u32, width: usize, height: usize, flags: u32) void {
+    var buf: [160]u8 = undefined;
+    var idx: usize = 0;
+    appendDiagText(buf[0..], &idx, "Compositor: window registered slot=");
+    appendDiagU64Decimal(buf[0..], &idx, slot);
+    appendDiagText(buf[0..], &idx, " id=");
+    appendDiagU64Decimal(buf[0..], &idx, window_id);
+    appendDiagText(buf[0..], &idx, " width=");
+    appendDiagU64Decimal(buf[0..], &idx, width);
+    appendDiagText(buf[0..], &idx, " height=");
+    appendDiagU64Decimal(buf[0..], &idx, height);
+    appendDiagText(buf[0..], &idx, " flags=");
+    appendDiagHexU64(buf[0..], &idx, flags);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
+fn logRecentWindowStage(slot: usize, stage: []const u8) void {
+    if (debug_recent_window_slot == null or debug_recent_window_slot.? != slot) return;
+    var buf: [96]u8 = undefined;
+    var idx: usize = 0;
+    appendDiagText(buf[0..], &idx, "Compositor: recent window slot=");
+    appendDiagU64Decimal(buf[0..], &idx, slot);
+    appendDiagText(buf[0..], &idx, " stage=");
+    appendDiagText(buf[0..], &idx, stage);
+    appendDiagText(buf[0..], &idx, "\n");
+    _ = userLog(buf[0..idx]);
+}
+
+fn logWindowRegisterRejected(reason: []const u8, page_paddr: u64) void {
+    var buf: [160]u8 = undefined;
+    var idx: usize = 0;
+    appendDiagText(buf[0..], &idx, "Compositor: window rejected reason=");
+    appendDiagText(buf[0..], &idx, reason);
+    appendDiagText(buf[0..], &idx, " paddr=");
+    appendDiagHexU64(buf[0..], &idx, page_paddr);
     appendDiagText(buf[0..], &idx, "\n");
     _ = userLog(buf[0..idx]);
 }
@@ -470,28 +621,17 @@ fn hudRect() Rect {
 }
 
 fn setSurfacePixel(surface: *const DrawSurface, x: i32, y: i32, color: u32) void {
-    if (x < surface.clip.x0 or x >= surface.clip.x1 or y < surface.clip.y0 or y >= surface.clip.y1) return;
-    if (x < 0 or y < 0 or x >= fb_width_i32 or y >= fb_height_i32) return;
-    const ux: usize = @intCast(x);
-    const uy: usize = @intCast(y);
-    surface.pixels[uy * fb_pitch + ux] = color;
+    const index = surfaceIndex(surface, x, y) orelse return;
+    surface.pixels[index] = color;
 }
 
 fn blendSurfacePixel(surface: *const DrawSurface, x: i32, y: i32, color: u32, alpha: u8) void {
-    if (x < surface.clip.x0 or x >= surface.clip.x1 or y < surface.clip.y0 or y >= surface.clip.y1) return;
-    if (x < 0 or y < 0 or x >= fb_width_i32 or y >= fb_height_i32) return;
-    const ux: usize = @intCast(x);
-    const uy: usize = @intCast(y);
-    const index = uy * fb_pitch + ux;
+    const index = surfaceIndex(surface, x, y) orelse return;
     surface.pixels[index] = font.blendColor(surface.pixels[index], color, alpha);
 }
 
 fn blendSurfacePixelSubpixel(surface: *const DrawSurface, x: i32, y: i32, color: u32, alpha_r: u8, alpha_g: u8, alpha_b: u8) void {
-    if (x < surface.clip.x0 or x >= surface.clip.x1 or y < surface.clip.y0 or y >= surface.clip.y1) return;
-    if (x < 0 or y < 0 or x >= fb_width_i32 or y >= fb_height_i32) return;
-    const ux: usize = @intCast(x);
-    const uy: usize = @intCast(y);
-    const index = uy * fb_pitch + ux;
+    const index = surfaceIndex(surface, x, y) orelse return;
     surface.pixels[index] = font.blendSubpixelColor(surface.pixels[index], color, alpha_r, alpha_g, alpha_b);
 }
 
@@ -504,7 +644,9 @@ fn drawSolidRectSurface(surface: *const DrawSurface, x: i32, y: i32, w: i32, h: 
         const row: usize = @as(usize, @intCast(yy)) * fb_pitch;
         var xx = clipped.x0;
         while (xx < clipped.x1) : (xx += 1) {
-            surface.pixels[row + @as(usize, @intCast(xx))] = color;
+            const index = row + @as(usize, @intCast(xx));
+            if (index >= surface.pixel_capacity) continue;
+            surface.pixels[index] = color;
         }
     }
 }
@@ -610,6 +752,33 @@ fn drawWindowHeaderDividerSurface(surface: *const DrawSurface, win: *const Windo
     while (xx < clipped.x1) : (xx += 1) {
         blendSurfacePixel(surface, xx, y + 1, window_shadow_color, 18);
     }
+}
+
+fn drawWindowInnerFrame(back: [*]u32, win: *const WindowState) void {
+    const x = win.x + window_border_i32;
+    const y = win.y + window_border_i32;
+    const w = windowWidth(win) - window_border_i32 * 2;
+    const h = windowHeight(win) - window_border_i32 * 2;
+    const thickness: i32 = 2;
+    if (w <= thickness * 2 or h <= thickness) return;
+
+    drawSolidRect(back, x, y, thickness, h, window_inner_frame_color);
+    drawSolidRect(back, x + w - thickness, y, thickness, h, window_inner_frame_color);
+    drawSolidRect(back, x, y + h - thickness, w, thickness, window_inner_frame_color);
+}
+
+fn drawWindowInnerFrameSurface(surface: *const DrawSurface, win: *const WindowState) void {
+    const x = win.x + window_border_i32;
+    const y = win.y + window_border_i32;
+    const w = windowWidth(win) - window_border_i32 * 2;
+    const h = windowHeight(win) - window_border_i32 * 2;
+    const thickness: i32 = 2;
+    if (w <= thickness * 2 or h <= thickness) return;
+    if (intersectRect(.{ .x0 = x, .y0 = y, .x1 = x + w, .y1 = y + h }, surface.clip) == null) return;
+
+    drawSolidRectSurface(surface, x, y, thickness, h, window_inner_frame_color);
+    drawSolidRectSurface(surface, x + w - thickness, y, thickness, h, window_inner_frame_color);
+    drawSolidRectSurface(surface, x, y + h - thickness, w, thickness, window_inner_frame_color);
 }
 
 fn drawWindowShadow(back: [*]u32, win: *const WindowState) void {
@@ -767,11 +936,17 @@ fn windowContentH(win: *const WindowState) i32 {
     return @as(i32, @intCast(win.src.h * windowScale(win)));
 }
 
+fn windowHasFrame(win: *const WindowState) bool {
+    return (win.flags & window_flag_frameless) == 0;
+}
+
 fn windowWidth(win: *const WindowState) i32 {
+    if (!windowHasFrame(win)) return windowContentW(win);
     return windowContentW(win) + window_border_i32 * 2;
 }
 
 fn windowHeight(win: *const WindowState) i32 {
+    if (!windowHasFrame(win)) return windowContentH(win);
     return window_header_h_i32 + windowContentH(win) + window_border_i32;
 }
 
@@ -910,17 +1085,13 @@ fn fitTextWithEllipsis(text: []const u8, max_width: i32, scratch: []u8) []const 
 fn refreshWindowTitleCache(slot_ref: *WindowSlot) void {
     slot_ref.title_cache_len = 0;
     slot_ref.title_draw_x_off = 8;
-    slot_ref.title_clip_right_off = windowWidth(&slot_ref.frame) - window_close_margin_i32 - window_close_size_i32 - 6;
+    slot_ref.title_clip_right_off = windowWidth(&slot_ref.frame) - window_close_margin_i32 - window_close_width_i32 - window_button_gap_i32 - window_minimize_width_i32 - 6;
 
     const title = slot_ref.frame.title[0..slot_ref.frame.title_len];
     if (title.len == 0) return;
 
-    const title_left = 8;
-    const title_right = windowWidth(&slot_ref.frame) - 8;
-    const title_width = textPixelWidth(title);
-    const centered_title_x = title_left + @divTrunc((title_right - title_left) - title_width, 2);
-    const title_x = if (centered_title_x > title_left) centered_title_x else title_left;
-    const title_clip_right = windowWidth(&slot_ref.frame) - window_close_margin_i32 - window_close_size_i32 - 6;
+    const title_x = 8;
+    const title_clip_right = windowWidth(&slot_ref.frame) - window_close_margin_i32 - window_close_width_i32 - window_button_gap_i32 - window_minimize_width_i32 - 6;
     slot_ref.title_draw_x_off = title_x;
     slot_ref.title_clip_right_off = title_clip_right;
     if (title_x >= title_clip_right) return;
@@ -965,6 +1136,237 @@ fn drawMouseCoordHudSurface(surface: *const DrawSurface, mouse_x: i32, mouse_y: 
     drawTextClippedSurface(surface, hud_x + 5, text_y, text, 0x0030_3030, hud_x + hud_w - 4);
 }
 
+fn windowTaskbarLabel(slot_ref: *const WindowSlot, max_width: i32, scratch: []u8) []const u8 {
+    const raw_title = slot_ref.frame.title[0..slot_ref.frame.title_len];
+    const title = if (raw_title.len == 0) "Window" else raw_title;
+    return fitTextWithEllipsis(title, max_width, scratch);
+}
+
+fn insideRoundedRectI32(x: i32, y: i32, w: i32, h: i32, radius: i32, inset: i32) bool {
+    if (w <= inset * 2 or h <= inset * 2) return false;
+    const left = inset;
+    const top = inset;
+    const right = w - inset;
+    const bottom = h - inset;
+    if (x < left or x >= right or y < top or y >= bottom) return false;
+
+    const r = radius - inset;
+    if (r <= 0) return true;
+
+    const inner_left = left + r;
+    const inner_right = right - r;
+    const inner_top = top + r;
+    const inner_bottom = bottom - r;
+    if ((x >= inner_left and x < inner_right) or (y >= inner_top and y < inner_bottom)) return true;
+
+    var cx = inner_left;
+    if (x >= inner_right) cx = inner_right - 1;
+    var cy = inner_top;
+    if (y >= inner_bottom) cy = inner_bottom - 1;
+
+    const dx = x - cx;
+    const dy = y - cy;
+    const rr = r - 1;
+    return dx * dx + dy * dy <= rr * rr;
+}
+
+const TaskbarProcessStyle = struct {
+    bg: u32,
+    grad_start: u32,
+    border: u32,
+    border_left_bottom: u32,
+    inner_highlight: u32,
+    text: u32,
+};
+
+fn taskbarProcessStyle(hidden: bool) TaskbarProcessStyle {
+    if (!hidden) {
+        return .{
+            .bg = taskbar_process_bg,
+            .grad_start = taskbar_process_grad_start,
+            .border = taskbar_process_border,
+            .border_left_bottom = taskbar_process_border_left_bottom,
+            .inner_highlight = taskbar_process_inner_highlight,
+            .text = taskbar_process_text,
+        };
+    }
+    return .{
+        .bg = font.blendColor(taskbar_process_bg, 0x0000_0000, 36),
+        .grad_start = font.blendColor(taskbar_process_grad_start, 0x0000_0000, 48),
+        .border = taskbar_process_border,
+        .border_left_bottom = font.blendColor(taskbar_process_border_left_bottom, 0x0000_0000, 28),
+        .inner_highlight = font.blendColor(taskbar_process_inner_highlight, 0x0000_0000, 22),
+        .text = taskbar_process_hidden_text,
+    };
+}
+
+fn drawTaskbarProcessHoverGlow(back: [*]u32, rect: Rect) void {
+    const cx = @divTrunc(rect.x0 + rect.x1, 2);
+    const rx = @max(18, @divTrunc(rect.x1 - rect.x0, 3));
+    const ry = @max(8, @divTrunc(rect.y1 - rect.y0, 3));
+    const cy = rect.y1 + @divTrunc(ry, 2);
+    const rx2 = rx * rx;
+    const ry2 = ry * ry;
+    const limit = rx2 * ry2;
+
+    var y = rect.y1 - ry;
+    while (y < rect.y1 + ry) : (y += 1) {
+        var x = cx - rx;
+        while (x < cx + rx) : (x += 1) {
+            const dx = x - cx;
+            const dy = y - cy;
+            const dist = dx * dx * ry2 + dy * dy * rx2;
+            if (dist >= limit) continue;
+            const alpha = @as(u8, @intCast(@min(72, @divFloor((limit - dist) * 72, limit))));
+            if (alpha == 0) continue;
+            blendBackPixel(back, x, y, taskbar_process_hover_glow_color, alpha);
+        }
+    }
+}
+
+fn drawTaskbarProcessHoverGlowSurface(surface: *const DrawSurface, rect: Rect) void {
+    const cx = @divTrunc(rect.x0 + rect.x1, 2);
+    const rx = @max(18, @divTrunc(rect.x1 - rect.x0, 3));
+    const ry = @max(8, @divTrunc(rect.y1 - rect.y0, 3));
+    const cy = rect.y1 + @divTrunc(ry, 2);
+    const rx2 = rx * rx;
+    const ry2 = ry * ry;
+    const limit = rx2 * ry2;
+
+    var y = rect.y1 - ry;
+    while (y < rect.y1 + ry) : (y += 1) {
+        var x = cx - rx;
+        while (x < cx + rx) : (x += 1) {
+            const dx = x - cx;
+            const dy = y - cy;
+            const dist = dx * dx * ry2 + dy * dy * rx2;
+            if (dist >= limit) continue;
+            const alpha = @as(u8, @intCast(@min(72, @divFloor((limit - dist) * 72, limit))));
+            if (alpha == 0) continue;
+            blendSurfacePixel(surface, x, y, taskbar_process_hover_glow_color, alpha);
+        }
+    }
+}
+
+fn drawTaskbarProcessButton(back: [*]u32, rect: Rect, title: []const u8, hidden: bool, hovered: bool) void {
+    const style = taskbarProcessStyle(hidden);
+    const w = rect.x1 - rect.x0;
+    const h = rect.y1 - rect.y0;
+    if (w <= 0 or h <= 0) return;
+
+    if (hovered) drawTaskbarProcessHoverGlow(back, rect);
+
+    var yy: i32 = 0;
+    while (yy < h) : (yy += 1) {
+        var xx: i32 = 0;
+        while (xx < w) : (xx += 1) {
+            if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 0)) continue;
+            const color = if (xx < taskbar_process_gradient_width)
+                lerpColor(style.grad_start, style.bg, @min(xx + yy, taskbar_process_gradient_width - 1), taskbar_process_gradient_width - 1)
+            else
+                style.bg;
+            setBackPixel(back, rect.x0 + xx, rect.y0 + yy, color);
+        }
+    }
+
+    yy = 0;
+    while (yy < h) : (yy += 1) {
+        var xx: i32 = 0;
+        while (xx < w) : (xx += 1) {
+            if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 0)) continue;
+            const x = rect.x0 + xx;
+            const y = rect.y0 + yy;
+            if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 1)) {
+                setBackPixel(back, x, y, if (xx == 0)
+                    lerpColor(style.border, style.border_left_bottom, yy, h - 1)
+                else
+                    style.border);
+            } else if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 2)) {
+                setBackPixel(back, x, y, style.inner_highlight);
+            }
+        }
+    }
+
+    const text_y = rect.y0 + @divTrunc(h - font.lineHeight(1), 2);
+    drawTextClipped(back, rect.x0 + 14, text_y, title, style.text, rect.x1 - 8);
+}
+
+fn drawTaskbarProcessButtonSurface(surface: *const DrawSurface, rect: Rect, title: []const u8, hidden: bool, hovered: bool) void {
+    const style = taskbarProcessStyle(hidden);
+    const w = rect.x1 - rect.x0;
+    const h = rect.y1 - rect.y0;
+    if (w <= 0 or h <= 0) return;
+
+    if (hovered) drawTaskbarProcessHoverGlowSurface(surface, rect);
+
+    var yy: i32 = 0;
+    while (yy < h) : (yy += 1) {
+        var xx: i32 = 0;
+        while (xx < w) : (xx += 1) {
+            if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 0)) continue;
+            const color = if (xx < taskbar_process_gradient_width)
+                lerpColor(style.grad_start, style.bg, @min(xx + yy, taskbar_process_gradient_width - 1), taskbar_process_gradient_width - 1)
+            else
+                style.bg;
+            setSurfacePixel(surface, rect.x0 + xx, rect.y0 + yy, color);
+        }
+    }
+
+    yy = 0;
+    while (yy < h) : (yy += 1) {
+        var xx: i32 = 0;
+        while (xx < w) : (xx += 1) {
+            if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 0)) continue;
+            const x = rect.x0 + xx;
+            const y = rect.y0 + yy;
+            if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 1)) {
+                setSurfacePixel(surface, x, y, if (xx == 0)
+                    lerpColor(style.border, style.border_left_bottom, yy, h - 1)
+                else
+                    style.border);
+            } else if (!insideRoundedRectI32(xx, yy, w, h, taskbar_process_radius, 2)) {
+                setSurfacePixel(surface, x, y, style.inner_highlight);
+            }
+        }
+    }
+
+    const text_y = rect.y0 + @divTrunc(h - font.lineHeight(1), 2);
+    drawTextClippedSurface(surface, rect.x0 + 14, text_y, title, style.text, rect.x1 - 8);
+}
+
+fn drawTaskbarProcessList(back: [*]u32, store: *const WindowStore, hovered_slot: ?usize) void {
+    const taskbar_slot = findTaskbarVisibleSlot() orelse return;
+    const taskbar_rect = taskbarRectForSlot(&store.slots[taskbar_slot]);
+    var slots: [max_windows]usize = undefined;
+    const count = collectTaskbarProcessSlots(&slots);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const button_rect = taskbarProcessButtonRect(taskbar_rect, i, count) orelse continue;
+        const slot_ref = &store.slots[slots[i]];
+        var label_buf: [window_title_max_bytes + 3]u8 = undefined;
+        const label = windowTaskbarLabel(slot_ref, button_rect.x1 - button_rect.x0 - 18, label_buf[0..]);
+        drawTaskbarProcessButton(back, button_rect, label, !slot_ref.frame.visible, hovered_slot != null and hovered_slot.? == slots[i]);
+    }
+}
+
+fn drawTaskbarProcessListSurface(surface: *const DrawSurface, store: *const WindowStore, hovered_slot: ?usize) void {
+    const taskbar_slot = findTaskbarVisibleSlot() orelse return;
+    const taskbar_rect = taskbarRectForSlot(&store.slots[taskbar_slot]);
+    if (intersectRect(taskbar_rect, surface.clip) == null) return;
+
+    var slots: [max_windows]usize = undefined;
+    const count = collectTaskbarProcessSlots(&slots);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const button_rect = taskbarProcessButtonRect(taskbar_rect, i, count) orelse continue;
+        if (intersectRect(button_rect, surface.clip) == null) continue;
+        const slot_ref = &store.slots[slots[i]];
+        var label_buf: [window_title_max_bytes + 3]u8 = undefined;
+        const label = windowTaskbarLabel(slot_ref, button_rect.x1 - button_rect.x0 - 18, label_buf[0..]);
+        drawTaskbarProcessButtonSurface(surface, button_rect, label, !slot_ref.frame.visible, hovered_slot != null and hovered_slot.? == slots[i]);
+    }
+}
+
 fn clampWindowX(win: *const WindowState, x: i32) i32 {
     return clampI32(x, 0, fb_width_i32 - windowWidth(win));
 }
@@ -974,11 +1376,11 @@ fn clampWindowY(win: *const WindowState, y: i32) i32 {
 }
 
 fn contentOriginX(win: *const WindowState) i32 {
-    return win.x + window_border_i32;
+    return if (windowHasFrame(win)) win.x + window_border_i32 else win.x;
 }
 
 fn contentOriginY(win: *const WindowState) i32 {
-    return win.y + window_header_h_i32;
+    return if (windowHasFrame(win)) win.y + window_header_h_i32 else win.y;
 }
 
 fn pointInCircle(px: i32, py: i32, cx: i32, cy: i32, r: i32) bool {
@@ -988,84 +1390,129 @@ fn pointInCircle(px: i32, py: i32, cx: i32, cy: i32, r: i32) bool {
 }
 
 fn pointInCloseButton(px: i32, py: i32, rect: Rect) bool {
-    if (!pointInRect(px, py, rect)) return false;
-    const cx = @divTrunc(rect.x0 + rect.x1 - 1, 2);
-    const cy = @divTrunc(rect.y0 + rect.y1 - 1, 2);
-    const r = @divTrunc(rect.x1 - rect.x0, 2);
-    return pointInCircle(px, py, cx, cy, r);
+    return pointInRect(px, py, rect);
 }
 
-fn drawCloseButton(back: [*]u32, rect: Rect, hover: bool, down: bool) void {
-    const cx = @divTrunc(rect.x0 + rect.x1 - 1, 2);
-    const cy = @divTrunc(rect.y0 + rect.y1 - 1, 2);
-    const outer_r = @divTrunc(rect.x1 - rect.x0, 2);
-    const inner_r = outer_r - close_btn_circle_padding;
-    if (inner_r <= 0) return;
-    const outer_r2 = outer_r * outer_r;
-    const inner_r2 = inner_r * inner_r;
-    const bg = if (down) close_btn_down_color else if (hover) close_btn_hover_color else close_btn_color;
+fn pointInMinimizeButton(px: i32, py: i32, rect: Rect) bool {
+    return pointInRect(px, py, rect);
+}
+
+fn windowCloseButtonRect(win: *const WindowState) Rect {
+    const close_right = win.x + windowWidth(win) - window_close_margin_i32;
+    const close_left = close_right - window_close_width_i32;
+    const close_top = win.y + @divTrunc(window_header_h_i32 - window_close_height_i32, 2);
+    return .{
+        .x0 = close_left,
+        .y0 = close_top,
+        .x1 = close_right,
+        .y1 = close_top + window_close_height_i32,
+    };
+}
+
+fn windowMinimizeButtonRect(win: *const WindowState) Rect {
+    const close_rect = windowCloseButtonRect(win);
+    const minimize_right = close_rect.x0 - window_button_gap_i32;
+    const minimize_left = minimize_right - window_minimize_width_i32;
+    const minimize_top = win.y + @divTrunc(window_header_h_i32 - window_minimize_height_i32, 2);
+    return .{
+        .x0 = minimize_left,
+        .y0 = minimize_top,
+        .x1 = minimize_right,
+        .y1 = minimize_top + window_minimize_height_i32,
+    };
+}
+
+fn drawMinimizeButton(back: [*]u32, rect: Rect, hover: bool, down: bool) void {
+    const top_color = if (hover) font.blendColor(minimize_btn_top_color, 0x00FF_FFFF, 24) else if (down) font.blendColor(minimize_btn_top_color, 0x0000_0000, 18) else minimize_btn_top_color;
+    const bottom_color = if (hover) font.blendColor(minimize_btn_bottom_color, 0x00FF_FFFF, 18) else if (down) font.blendColor(minimize_btn_bottom_color, 0x0000_0000, 18) else minimize_btn_bottom_color;
+    const line_y = rect.y0 + @divTrunc(rect.y1 - rect.y0, 2) + 1;
 
     var y = rect.y0;
     while (y < rect.y1) : (y += 1) {
+        const bg = if (y - rect.y0 < @divTrunc(rect.y1 - rect.y0, 2)) top_color else bottom_color;
         var x = rect.x0;
         while (x < rect.x1) : (x += 1) {
-            const dx = x - cx;
-            const dy = y - cy;
-            const d2 = dx * dx + dy * dy;
-            if (hover and d2 <= outer_r2) {
-                setBackPixel(back, x, y, close_btn_glow_color);
-            }
-            if (d2 <= inner_r2) {
-                setBackPixel(back, x, y, bg);
-            }
+            const is_border = y == rect.y0 or y == rect.y1 - 1 or x == rect.x0 or x == rect.x1 - 1;
+            setBackPixel(back, x, y, if (is_border) minimize_btn_border_color else bg);
         }
     }
 
-    const cross_r = inner_r - 3;
-    if (cross_r <= 0) return;
-    var i: i32 = -cross_r;
-    while (i <= cross_r) : (i += 1) {
+    var x = rect.x0 + 5;
+    while (x < rect.x1 - 5) : (x += 1) {
+        setBackPixel(back, x, line_y, minimize_btn_symbol_color);
+        setBackPixel(back, x, line_y + 1, minimize_btn_symbol_color);
+    }
+}
+
+fn drawMinimizeButtonSurface(surface: *const DrawSurface, rect: Rect, hover: bool, down: bool) void {
+    const top_color = if (hover) font.blendColor(minimize_btn_top_color, 0x00FF_FFFF, 24) else if (down) font.blendColor(minimize_btn_top_color, 0x0000_0000, 18) else minimize_btn_top_color;
+    const bottom_color = if (hover) font.blendColor(minimize_btn_bottom_color, 0x00FF_FFFF, 18) else if (down) font.blendColor(minimize_btn_bottom_color, 0x0000_0000, 18) else minimize_btn_bottom_color;
+    const line_y = rect.y0 + @divTrunc(rect.y1 - rect.y0, 2) + 1;
+
+    var y = rect.y0;
+    while (y < rect.y1) : (y += 1) {
+        const bg = if (y - rect.y0 < @divTrunc(rect.y1 - rect.y0, 2)) top_color else bottom_color;
+        var x = rect.x0;
+        while (x < rect.x1) : (x += 1) {
+            const is_border = y == rect.y0 or y == rect.y1 - 1 or x == rect.x0 or x == rect.x1 - 1;
+            setSurfacePixel(surface, x, y, if (is_border) minimize_btn_border_color else bg);
+        }
+    }
+
+    var x = rect.x0 + 5;
+    while (x < rect.x1 - 5) : (x += 1) {
+        setSurfacePixel(surface, x, line_y, minimize_btn_symbol_color);
+        setSurfacePixel(surface, x, line_y + 1, minimize_btn_symbol_color);
+    }
+}
+
+fn drawCloseButton(back: [*]u32, rect: Rect, hover: bool, down: bool) void {
+    const top_color = if (hover) font.blendColor(close_btn_top_color, 0x00FF_FFFF, 24) else if (down) font.blendColor(close_btn_top_color, 0x0000_0000, 18) else close_btn_top_color;
+    const bottom_color = if (hover) font.blendColor(close_btn_bottom_color, 0x00FF_FFFF, 18) else if (down) font.blendColor(close_btn_bottom_color, 0x0000_0000, 18) else close_btn_bottom_color;
+    const cx = @divTrunc(rect.x0 + rect.x1 - 1, 2);
+    const cy = @divTrunc(rect.y0 + rect.y1 - 1, 2);
+
+    var y = rect.y0;
+    while (y < rect.y1) : (y += 1) {
+        const bg = if (y - rect.y0 < @divTrunc(rect.y1 - rect.y0, 2)) top_color else bottom_color;
+        var x = rect.x0;
+        while (x < rect.x1) : (x += 1) {
+            const is_border = y == rect.y0 or y == rect.y1 - 1 or x == rect.x0 or x == rect.x1 - 1;
+            setBackPixel(back, x, y, if (is_border) close_btn_border_color else bg);
+        }
+    }
+
+    var i: i32 = -2;
+    while (i <= 2) : (i += 1) {
         setBackPixel(back, cx + i, cy + i, close_btn_cross_color);
-        setBackPixel(back, cx + i + 1, cy + i, close_btn_cross_color);
+        setBackPixel(back, cx + i, cy + i + 1, close_btn_cross_color);
         setBackPixel(back, cx - i, cy + i, close_btn_cross_color);
-        setBackPixel(back, cx - i - 1, cy + i, close_btn_cross_color);
+        setBackPixel(back, cx - i, cy + i + 1, close_btn_cross_color);
     }
 }
 
 fn drawCloseButtonSurface(surface: *const DrawSurface, rect: Rect, hover: bool, down: bool) void {
+    const top_color = if (hover) font.blendColor(close_btn_top_color, 0x00FF_FFFF, 24) else if (down) font.blendColor(close_btn_top_color, 0x0000_0000, 18) else close_btn_top_color;
+    const bottom_color = if (hover) font.blendColor(close_btn_bottom_color, 0x00FF_FFFF, 18) else if (down) font.blendColor(close_btn_bottom_color, 0x0000_0000, 18) else close_btn_bottom_color;
     const cx = @divTrunc(rect.x0 + rect.x1 - 1, 2);
     const cy = @divTrunc(rect.y0 + rect.y1 - 1, 2);
-    const outer_r = @divTrunc(rect.x1 - rect.x0, 2);
-    const inner_r = outer_r - close_btn_circle_padding;
-    if (inner_r <= 0) return;
-    const outer_r2 = outer_r * outer_r;
-    const inner_r2 = inner_r * inner_r;
-    const bg = if (down) close_btn_down_color else if (hover) close_btn_hover_color else close_btn_color;
 
     var y = rect.y0;
     while (y < rect.y1) : (y += 1) {
+        const bg = if (y - rect.y0 < @divTrunc(rect.y1 - rect.y0, 2)) top_color else bottom_color;
         var x = rect.x0;
         while (x < rect.x1) : (x += 1) {
-            const dx = x - cx;
-            const dy = y - cy;
-            const d2 = dx * dx + dy * dy;
-            if (hover and d2 <= outer_r2) {
-                setSurfacePixel(surface, x, y, close_btn_glow_color);
-            }
-            if (d2 <= inner_r2) {
-                setSurfacePixel(surface, x, y, bg);
-            }
+            const is_border = y == rect.y0 or y == rect.y1 - 1 or x == rect.x0 or x == rect.x1 - 1;
+            setSurfacePixel(surface, x, y, if (is_border) close_btn_border_color else bg);
         }
     }
 
-    const cross_r = inner_r - 3;
-    if (cross_r <= 0) return;
-    var i: i32 = -cross_r;
-    while (i <= cross_r) : (i += 1) {
+    var i: i32 = -2;
+    while (i <= 2) : (i += 1) {
         setSurfacePixel(surface, cx + i, cy + i, close_btn_cross_color);
-        setSurfacePixel(surface, cx + i + 1, cy + i, close_btn_cross_color);
+        setSurfacePixel(surface, cx + i, cy + i + 1, close_btn_cross_color);
         setSurfacePixel(surface, cx - i, cy + i, close_btn_cross_color);
-        setSurfacePixel(surface, cx - i - 1, cy + i, close_btn_cross_color);
+        setSurfacePixel(surface, cx - i, cy + i + 1, close_btn_cross_color);
     }
 }
 
@@ -1158,21 +1605,16 @@ fn drawWindowChrome(
     slot_ref: *const WindowSlot,
 ) void {
     const win = &slot_ref.frame;
+    if (!windowHasFrame(win)) return;
     drawWindowShadow(back, win);
     drawSolidRect(back, win.x, win.y, windowWidth(win), windowHeight(win), window_border_color);
     drawWindowHeaderBackground(back, win);
+    drawWindowInnerFrame(back, win);
     drawSolidRect(back, contentOriginX(win), contentOriginY(win), windowContentW(win), windowContentH(win), window_content_bg_color);
     drawWindowHeaderDivider(back, win);
 
-    const close_right = win.x + windowWidth(win) - window_close_margin_i32;
-    const close_left = close_right - window_close_size_i32;
-    const close_top = win.y + @divTrunc(window_header_h_i32 - window_close_size_i32, 2);
-    const close_rect: Rect = .{
-        .x0 = close_left,
-        .y0 = close_top,
-        .x1 = close_right,
-        .y1 = close_top + window_close_size_i32,
-    };
+    const minimize_rect = windowMinimizeButtonRect(win);
+    const close_rect = windowCloseButtonRect(win);
     const title_x = win.x + slot_ref.title_draw_x_off;
     const title_clip_right = win.x + slot_ref.title_clip_right_off;
     const title_y = win.y + @divTrunc(window_header_h_i32 - font.lineHeight(1), 2) + window_title_y_bias;
@@ -1181,6 +1623,7 @@ fn drawWindowChrome(
         drawTextSubpixelClipped(back, title_x, title_y, fitted_title, window_header_text_color, title_clip_right);
         drawTextSubpixelClipped(back, title_x + 1, title_y, fitted_title, window_header_text_color, title_clip_right);
     }
+    drawMinimizeButton(back, minimize_rect, slot_ref.minimize_hover, slot_ref.minimize_down);
     drawCloseButton(back, close_rect, slot_ref.close_hover, slot_ref.close_down);
     applyRoundedCornerCut(back, win);
 }
@@ -1190,6 +1633,7 @@ fn drawWindowChromeSurface(
     slot_ref: *const WindowSlot,
 ) void {
     const win = &slot_ref.frame;
+    if (!windowHasFrame(win)) return;
     const bounds = windowBounds(win);
     const clipped = intersectRect(bounds, surface.clip) orelse return;
     _ = clipped;
@@ -1216,6 +1660,7 @@ fn drawWindowChromeSurface(
     drawWindowShadowSurface(surface, win);
     if (intersectRect(frame_rect, surface.clip) != null) {
         drawSolidRectSurface(surface, win.x, win.y, windowWidth(win), windowHeight(win), window_border_color);
+        drawWindowInnerFrameSurface(surface, win);
     }
     if (intersectRect(header_rect, surface.clip) != null) {
         drawWindowHeaderBackgroundSurface(surface, win);
@@ -1225,15 +1670,8 @@ fn drawWindowChromeSurface(
         drawSolidRectSurface(surface, contentOriginX(win), contentOriginY(win), windowContentW(win), windowContentH(win), window_content_bg_color);
     }
 
-    const close_right = win.x + windowWidth(win) - window_close_margin_i32;
-    const close_left = close_right - window_close_size_i32;
-    const close_top = win.y + @divTrunc(window_header_h_i32 - window_close_size_i32, 2);
-    const close_rect: Rect = .{
-        .x0 = close_left,
-        .y0 = close_top,
-        .x1 = close_right,
-        .y1 = close_top + window_close_size_i32,
-    };
+    const minimize_rect = windowMinimizeButtonRect(win);
+    const close_rect = windowCloseButtonRect(win);
     const title_x = win.x + slot_ref.title_draw_x_off;
     const title_clip_right = win.x + slot_ref.title_clip_right_off;
     const title_y = win.y + @divTrunc(window_header_h_i32 - font.lineHeight(1), 2) + window_title_y_bias;
@@ -1247,6 +1685,9 @@ fn drawWindowChromeSurface(
     if (fitted_title.len > 0 and title_x < title_clip_right and intersectRect(title_rect, surface.clip) != null) {
         drawTextSubpixelClippedSurface(surface, title_x, title_y, fitted_title, window_header_text_color, title_clip_right);
         drawTextSubpixelClippedSurface(surface, title_x + 1, title_y, fitted_title, window_header_text_color, title_clip_right);
+    }
+    if (intersectRect(minimize_rect, surface.clip) != null) {
+        drawMinimizeButtonSurface(surface, minimize_rect, slot_ref.minimize_hover, slot_ref.minimize_down);
     }
     if (intersectRect(close_rect, surface.clip) != null) {
         drawCloseButtonSurface(surface, close_rect, slot_ref.close_hover, slot_ref.close_down);
@@ -1382,6 +1823,243 @@ fn recomputeWindowCount() usize {
     return window_store.visibleCount();
 }
 
+fn isTaskbarWindowSlot(slot_ref: *const WindowSlot) bool {
+    if (!slot_ref.source.active or !slot_ref.frame.active) return false;
+    if (windowHasFrame(&slot_ref.frame)) return false;
+    return slot_ref.frame.x == 0 and
+        windowWidth(&slot_ref.frame) == fb_width_i32 and
+        windowHeight(&slot_ref.frame) == taskbar_window_height and
+        slot_ref.frame.y >= fb_height_i32 - taskbar_window_height;
+}
+
+fn taskbarRectForSlot(slot_ref: *const WindowSlot) Rect {
+    const win = &slot_ref.frame;
+    return clipRectToScreen(.{
+        .x0 = win.x,
+        .y0 = win.y,
+        .x1 = win.x + windowWidth(win),
+        .y1 = win.y + windowHeight(win),
+    });
+}
+
+fn findTaskbarVisibleSlot() ?usize {
+    var i: usize = 0;
+    while (i < max_windows) : (i += 1) {
+        const slot_ref = &window_store.slots[i];
+        if (!slot_ref.frame.visible) continue;
+        if (isTaskbarWindowSlot(slot_ref)) return i;
+    }
+    return null;
+}
+
+fn collectTaskbarProcessSlots(out: *[max_windows]usize) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < max_windows) : (i += 1) {
+        const slot_ref = &window_store.slots[i];
+        if (!slot_ref.source.active or !slot_ref.frame.active) continue;
+        if (!windowHasFrame(&slot_ref.frame)) continue;
+        out[count] = i;
+        count += 1;
+    }
+
+    var scan: usize = 1;
+    while (scan < count) : (scan += 1) {
+        const idx = out[scan];
+        const z = window_store.slots[idx].z_order;
+        var pos = scan;
+        while (pos > 0 and window_store.slots[out[pos - 1]].z_order > z) : (pos -= 1) {
+            out[pos] = out[pos - 1];
+        }
+        out[pos] = idx;
+    }
+    return count;
+}
+
+fn taskbarProcessButtonRect(taskbar_rect: Rect, button_index: usize, button_count: usize) ?Rect {
+    if (button_count == 0) return null;
+    const usable_w = taskbar_rect.x1 - taskbar_rect.x0 - taskbar_process_left_pad - taskbar_process_right_reserved;
+    const usable_h = taskbar_rect.y1 - taskbar_rect.y0 - taskbar_process_top_pad * 2;
+    if (usable_w <= 0 or usable_h <= 0) return null;
+
+    const gap_total = taskbar_process_button_gap * @as(i32, @intCast(button_count - 1));
+    const max_per_button = @divFloor(usable_w - gap_total, @as(i32, @intCast(button_count)));
+    if (max_per_button <= 0) return null;
+    const button_w = if (max_per_button < taskbar_process_button_max_width) max_per_button else taskbar_process_button_max_width;
+    const step = button_w + taskbar_process_button_gap;
+    const x0 = taskbar_rect.x0 + taskbar_process_left_pad + @as(i32, @intCast(button_index)) * step;
+    const x1 = x0 + button_w;
+    const limit_x = taskbar_rect.x1 - taskbar_process_right_reserved;
+    if (x0 >= limit_x) return null;
+
+    return .{
+        .x0 = x0,
+        .y0 = taskbar_rect.y0 + taskbar_process_top_pad,
+        .x1 = if (x1 < limit_x) x1 else limit_x,
+        .y1 = taskbar_rect.y1 - taskbar_process_top_pad,
+    };
+}
+
+fn taskbarProcessListRect() ?Rect {
+    const taskbar_slot = findTaskbarVisibleSlot() orelse return null;
+    var slots: [max_windows]usize = undefined;
+    const count = collectTaskbarProcessSlots(&slots);
+    if (count == 0) return taskbarRectForSlot(&window_store.slots[taskbar_slot]);
+
+    const taskbar_rect = taskbarRectForSlot(&window_store.slots[taskbar_slot]);
+    var rect = taskbarRectForSlot(&window_store.slots[taskbar_slot]);
+    var any = false;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const button_rect = taskbarProcessButtonRect(taskbar_rect, i, count) orelse continue;
+        const merged = includeRect(any, rect, button_rect);
+        any = merged.any;
+        rect = merged.rect;
+    }
+    return if (any) rect else taskbar_rect;
+}
+
+fn taskbarProcessHitSlot(x: i32, y: i32) ?usize {
+    const taskbar_slot = findTaskbarVisibleSlot() orelse return null;
+    const taskbar_rect = taskbarRectForSlot(&window_store.slots[taskbar_slot]);
+    if (!pointInRect(x, y, taskbar_rect)) return null;
+
+    var slots: [max_windows]usize = undefined;
+    const count = collectTaskbarProcessSlots(&slots);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const button_rect = taskbarProcessButtonRect(taskbar_rect, i, count) orelse continue;
+        if (pointInRect(x, y, button_rect)) return slots[i];
+    }
+    return null;
+}
+
+fn closeWindowSlot(slot: usize) bool {
+    if (slot >= max_windows) return false;
+    const slot_ref = &window_store.slots[slot];
+    if (!slot_ref.source.active or !slot_ref.frame.active) return false;
+    slot_ref.reset();
+    window_shadow_valid[slot] = false;
+    window_gpu_resources[slot] = null;
+    logged_invalid_window_source[slot] = false;
+    if (debug_recent_window_slot != null and debug_recent_window_slot.? == slot) {
+        debug_recent_window_slot = null;
+        debug_recent_window_sync_logged = false;
+        debug_recent_window_draw_logged = false;
+    }
+    invalidateWindowPaintOrderCache();
+    invalidateWindowBodyCache(slot);
+    return true;
+}
+
+fn minimizeWindowSlot(slot: usize) bool {
+    if (slot >= max_windows) return false;
+    const slot_ref = &window_store.slots[slot];
+    if (!slot_ref.source.active or !slot_ref.frame.active or !slot_ref.frame.visible) return false;
+    slot_ref.frame.visible = false;
+    slot_ref.minimize_hover = false;
+    slot_ref.minimize_down = false;
+    slot_ref.close_hover = false;
+    slot_ref.close_down = false;
+    slot_ref.frame.prev_minimize_hover = false;
+    slot_ref.frame.prev_minimize_down = false;
+    slot_ref.frame.prev_close_hover = false;
+    slot_ref.frame.prev_close_down = false;
+    invalidateWindowPaintOrderCache();
+    invalidateWindowBodyCache(slot);
+    return true;
+}
+
+fn activateWindowSlot(slot: usize) bool {
+    if (slot >= max_windows) return false;
+    const slot_ref = &window_store.slots[slot];
+    if (!slot_ref.source.active or !slot_ref.frame.active) return false;
+
+    const was_visible = slot_ref.frame.visible;
+    const order = currentWindowPaintOrder(&window_store);
+    const already_top = was_visible and order.len != 0 and order[order.len - 1] == slot;
+    if (was_visible and already_top) return false;
+
+    slot_ref.frame.visible = true;
+    slot_ref.z_order = allocWindowZOrder();
+    invalidateWindowPaintOrderCache();
+    invalidateWindowBodyCache(slot);
+    return true;
+}
+
+fn taskbarStatePagePtr() ?*volatile TaskbarStatePage {
+    const page: *volatile TaskbarStatePage = @ptrFromInt(taskbar_state_shared_va);
+    if (page.magic != taskbar_state_magic or page.version != taskbar_protocol_version) return null;
+    return page;
+}
+
+fn taskbarCommandPagePtr() ?*volatile TaskbarCommandPage {
+    const page: *volatile TaskbarCommandPage = @ptrFromInt(taskbar_command_shared_va);
+    if (page.magic != taskbar_command_magic or page.version != taskbar_protocol_version) return null;
+    return page;
+}
+
+fn syncTaskbarStatePage() void {
+    const page = taskbarStatePagePtr() orelse return;
+    var slots: [max_windows]usize = undefined;
+    const count = collectTaskbarProcessSlots(&slots);
+
+    var changed = @as(usize, page.entry_count) != count;
+    var i: usize = 0;
+    while (i < protocol.taskbar_entry_max) : (i += 1) {
+        const src_slot = if (i < count) &window_store.slots[slots[i]] else null;
+        const dst = &page.entries[i];
+        const next_window_id: u32 = if (src_slot) |slot_ref| slot_ref.source.window_id else 0;
+        const next_flags: u32 = if (src_slot != null and src_slot.?.frame.visible) taskbar_entry_flag_visible else 0;
+        const next_title_len: u16 = if (src_slot) |slot_ref| @intCast(slot_ref.frame.title_len) else 0;
+        if (!changed and (dst.window_id != next_window_id or dst.flags != next_flags or dst.title_len != next_title_len)) {
+            changed = true;
+        }
+        if (src_slot) |slot_ref| {
+            var title_i: usize = 0;
+            while (title_i < window_title_max_bytes) : (title_i += 1) {
+                const next = if (title_i < slot_ref.frame.title_len) slot_ref.frame.title[title_i] else 0;
+                if (!changed and dst.title[title_i] != next) changed = true;
+                dst.title[title_i] = next;
+            }
+        } else {
+            var title_i: usize = 0;
+            while (title_i < window_title_max_bytes) : (title_i += 1) {
+                if (!changed and dst.title[title_i] != 0) changed = true;
+                dst.title[title_i] = 0;
+            }
+        }
+        dst.window_id = next_window_id;
+        dst.flags = next_flags;
+        dst.title_len = next_title_len;
+    }
+
+    if (changed) {
+        page.entry_count = @intCast(count);
+        page.seq +%= 1;
+    }
+}
+
+fn processTaskbarCommand(observed_seq: *u64) ?Rect {
+    const page = taskbarCommandPagePtr() orelse return null;
+    if (page.seq == observed_seq.*) return null;
+    observed_seq.* = page.seq;
+    if (page.command == taskbar_command_none) return null;
+    if (page.command != taskbar_command_activate) return null;
+
+    const slot = findWindowSlotById(page.window_id) orelse return null;
+    const was_visible = window_store.slots[slot].frame.visible;
+    const old_rect = if (was_visible) windowBounds(&window_store.slots[slot].frame) else fullScreenRect();
+    if (!activateWindowSlot(slot)) return if (was_visible) windowBounds(&window_store.slots[slot].frame) else null;
+
+    if (!was_visible) {
+        return windowBounds(&window_store.slots[slot].frame);
+    }
+    var merged = includeRect(false, fullScreenRect(), old_rect);
+    merged = includeRect(merged.any, merged.rect, windowBounds(&window_store.slots[slot].frame));
+    return merged.rect;
+}
+
 fn allocWindowZOrder() u32 {
     const z = if (next_window_z_order == 0) @as(u32, 1) else next_window_z_order;
     next_window_z_order +%= 1;
@@ -1416,17 +2094,42 @@ fn currentWindowPaintOrder(store: *const WindowStore) []const usize {
         window_paint_order_cache[pos] = idx;
     }
 
+    var taskbar_slot: ?usize = null;
+    i = 0;
+    while (i < count) : (i += 1) {
+        if (isTaskbarWindowSlot(&store.slots[window_paint_order_cache[i]])) {
+            taskbar_slot = i;
+            break;
+        }
+    }
+    if (taskbar_slot) |slot_pos| {
+        const idx = window_paint_order_cache[slot_pos];
+        i = slot_pos;
+        while (i + 1 < count) : (i += 1) {
+            window_paint_order_cache[i] = window_paint_order_cache[i + 1];
+        }
+        window_paint_order_cache[count - 1] = idx;
+    }
+
     window_paint_order_count = count;
     window_paint_order_dirty = false;
     return window_paint_order_cache[0..window_paint_order_count];
 }
 
 fn findTopWindowAt(x: i32, y: i32) ?usize {
+    if (findTaskbarVisibleSlot()) |taskbar_slot| {
+        if (pointInRect(x, y, taskbarRectForSlot(&window_store.slots[taskbar_slot]))) return null;
+    }
     const order = currentWindowPaintOrder(&window_store);
     var i = order.len;
     while (i > 0) {
         const idx = order[i - 1];
-        const bounds = windowBounds(&window_store.slots[idx].frame);
+        const win = &window_store.slots[idx].frame;
+        if (!windowHasFrame(win)) {
+            i -= 1;
+            continue;
+        }
+        const bounds = windowBounds(win);
         if (x >= bounds.x0 and x < bounds.x1 and y >= bounds.y0 and y < bounds.y1) return idx;
         i -= 1;
     }
@@ -1502,6 +2205,15 @@ fn updateWindowTitleFromMeta(slot_ref: *WindowSlot, meta: *const volatile Window
     return title_changed;
 }
 
+fn syncWindowPositionFromMeta(win: *WindowState, meta: *const volatile WindowMeta) bool {
+    const next_x = clampWindowX(win, meta.pos_x);
+    const next_y = clampWindowY(win, meta.pos_y);
+    if (win.x == next_x and win.y == next_y) return false;
+    win.x = next_x;
+    win.y = next_y;
+    return true;
+}
+
 fn readWindowDirtyRegion(src: *const WindowSource, meta: *const volatile WindowMeta) SourceRegion {
     if (src.width == 0 or src.height == 0) return .{};
 
@@ -1528,11 +2240,13 @@ fn readWindowDirtyRegion(src: *const WindowSource, meta: *const volatile WindowM
 }
 
 fn windowBounds(win: *const WindowState) Rect {
+    const shadow_right = if (windowHasFrame(win)) window_shadow_right_extent else 0;
+    const shadow_bottom = if (windowHasFrame(win)) window_shadow_bottom_extent else 0;
     return clipRectToScreen(.{
         .x0 = win.x,
         .y0 = win.y,
-        .x1 = win.x + windowWidth(win) + window_shadow_right_extent,
-        .y1 = win.y + windowHeight(win) + window_shadow_bottom_extent,
+        .x1 = win.x + windowWidth(win) + shadow_right,
+        .y1 = win.y + windowHeight(win) + shadow_bottom,
     });
 }
 
@@ -1551,9 +2265,19 @@ fn windowSourceUsesDma(src: *const WindowSource) bool {
 
 fn registerWindowCap(page_paddr: u64) ?Rect {
     const cap: *const volatile WindowCap = @ptrFromInt(ipc_rx_page_va);
-    if (cap.magic != window_cap_magic or cap.version != 1) return null;
+    if (cap.magic != window_cap_magic) {
+        logWindowRegisterRejected("bad_magic", page_paddr);
+        return null;
+    }
+    if (cap.version != 1) {
+        logWindowRegisterRejected("bad_version", page_paddr);
+        return null;
+    }
     const rights = protocol.decodeWindowRights(cap.rights_bits);
-    if (cap.width == 0 or cap.height == 0) return null;
+    if (cap.width == 0 or cap.height == 0) {
+        logWindowRegisterRejected("bad_size", page_paddr);
+        return null;
+    }
     if (cap.pixels_page_count == 0) {
         _ = userLog("Compositor: pixels_page_count==0\n");
         return null;
@@ -1569,7 +2293,10 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
         _ = userLog("Compositor: cap paddr list overflow\n");
         return null;
     }
-    if (cap.pixels_cap_paddr < 0x1000 or cap.meta_cap_paddr < 0x1000) return null;
+    if (cap.pixels_cap_paddr < 0x1000 or cap.meta_cap_paddr < 0x1000) {
+        logWindowRegisterRejected("bad_cap_paddr", page_paddr);
+        return null;
+    }
 
     const cap_snapshot = snapshotWindowCap(cap);
 
@@ -1581,13 +2308,22 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     const map_pixel_va = slot_base + 0x2000;
     const dma_pixels = rights.dma_pixels and ((cap_snapshot.flags & protocol.window_flag_allow_pixels_dma) != 0);
 
-    if (mapPage(map_meta_va, cap_snapshot.meta_cap_paddr, false) != syscall_ok) return null;
+    if (mapPage(map_meta_va, cap_snapshot.meta_cap_paddr, false) != syscall_ok) {
+        logWindowRegisterRejected("map_meta_failed", page_paddr);
+        return null;
+    }
     const paddr_list: [*]const volatile u64 = @ptrFromInt(ipc_rx_page_va + cap_size);
     var i: usize = 0;
     while (i < page_count) : (i += 1) {
-        if (paddr_list[i] < 0x1000) return null;
+        if (paddr_list[i] < 0x1000) {
+            logWindowRegisterRejected("bad_pixel_paddr", page_paddr);
+            return null;
+        }
     }
-    if (mapPagesBatch(map_pixel_va, ipc_rx_page_va + cap_size, cap_snapshot.pixels_page_count, false) != syscall_ok) return null;
+    if (mapPagesBatch(map_pixel_va, ipc_rx_page_va + cap_size, cap_snapshot.pixels_page_count, false) != syscall_ok) {
+        logWindowRegisterRejected("map_pixels_failed", page_paddr);
+        return null;
+    }
 
     const slot_ref = &window_store.slots[slot];
     slot_ref.reset();
@@ -1614,10 +2350,13 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     frame_ptr.src.w = cap_snapshot.width;
     frame_ptr.src.h = cap_snapshot.height;
     frame_ptr.content_scale = @intCast(if ((cap_snapshot.flags & window_flag_low_scale) != 0) low_window_scale else default_window_scale);
+    frame_ptr.flags = cap_snapshot.flags;
     frame_ptr.x = @as(i32, @intCast(72 + (slot % 2) * 220));
     frame_ptr.y = @as(i32, @intCast(110 + (slot / 2) * 230));
     frame_ptr.drag_off_x = 0;
     frame_ptr.drag_off_y = 0;
+    frame_ptr.prev_minimize_hover = false;
+    frame_ptr.prev_minimize_down = false;
     frame_ptr.prev_close_hover = false;
     frame_ptr.prev_close_down = false;
     frame_ptr.title_len = 0;
@@ -1626,9 +2365,13 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     }
     window_shadow_valid[slot] = false;
     window_gpu_resources[slot] = null;
+    logged_invalid_window_source[slot] = false;
+    debug_recent_window_slot = slot;
+    debug_recent_window_sync_logged = false;
+    debug_recent_window_draw_logged = false;
     invalidateWindowPaintOrderCache();
     invalidateWindowBodyCache(slot);
-    _ = page_paddr;
+    logWindowRegistered(slot, cap_snapshot.window_id, cap_snapshot.width, cap_snapshot.height, cap_snapshot.flags);
     return windowBounds(&slot_ref.frame);
 }
 
@@ -1638,6 +2381,7 @@ fn blitWindowSourceToWindow(back: [*]u32, slot: usize) void {
     if (!src.active) return;
     const win = &slot_ref.frame;
     if (!win.active or !win.visible) return;
+    if (!windowSourcePixelsReadable(slot, src)) return;
     const src_pixels: [*]const volatile u32 = @ptrFromInt(src.pixel_va);
     var vy: usize = 0;
     while (vy < src.height) : (vy += 1) {
@@ -1658,6 +2402,7 @@ fn blitWindowSourceToSurface(surface: *const DrawSurface, slot: usize, win: *con
     const src = &slot_ref.source;
     if (!src.active) return;
     if (!win.active or !win.visible) return;
+    if (!windowSourcePixelsReadable(slot, src)) return;
     const scale = windowScale(win);
 
     const content_x0 = contentOriginX(win);
@@ -1682,7 +2427,9 @@ fn blitWindowSourceToSurface(surface: *const DrawSurface, slot: usize, win: *con
             const dst_row = (@as(usize, @intCast(clipped.y0)) + row) * fb_pitch + @as(usize, @intCast(clipped.x0));
             var col: usize = 0;
             while (col < copy_w) : (col += 1) {
-                surface.pixels[dst_row + col] = src_pixels[src_row + col];
+                const index = dst_row + col;
+                if (index >= surface.pixel_capacity) continue;
+                surface.pixels[index] = src_pixels[src_row + col];
             }
         }
         return;
@@ -1717,7 +2464,9 @@ fn blitWindowSourceToSurface(surface: *const DrawSurface, slot: usize, win: *con
                     const px1 = if (col_x + 2 < clipped.x1) col_x + 2 else clipped.x1;
                     var px = px0;
                     while (px < px1) : (px += 1) {
-                        dst_pixels[dst_row + @as(usize, @intCast(px))] = color;
+                        const index = dst_row + @as(usize, @intCast(px));
+                        if (index >= surface.pixel_capacity) continue;
+                        dst_pixels[index] = color;
                     }
                 }
             }
@@ -1757,7 +2506,9 @@ fn blitWindowSourceToSurface(surface: *const DrawSurface, slot: usize, win: *con
                 const row: usize = @as(usize, @intCast(py)) * fb_pitch;
                 var px: i32 = px0;
                 while (px < px1) : (px += 1) {
-                    surface.pixels[row + @as(usize, @intCast(px))] = color;
+                    const index = row + @as(usize, @intCast(px));
+                    if (index >= surface.pixel_capacity) continue;
+                    surface.pixels[index] = color;
                 }
             }
         }
@@ -1765,6 +2516,10 @@ fn blitWindowSourceToSurface(surface: *const DrawSurface, slot: usize, win: *con
 }
 
 fn blitWindowSourceToWindowSurface(surface: *const DrawSurface, slot: usize) void {
+    if (debug_recent_window_slot != null and debug_recent_window_slot.? == slot and !debug_recent_window_draw_logged) {
+        debug_recent_window_draw_logged = true;
+        logRecentWindowStage(slot, "draw");
+    }
     blitWindowSourceToSurface(surface, slot, &window_store.slots[slot].frame);
 }
 
@@ -1864,12 +2619,18 @@ fn syncWindowGpuContent(slot: usize, dirty_region: SourceRegion) ?Rect {
 
 fn syncWindow(slot: usize) ?Rect {
     if (slot >= max_windows) return null;
+    if (debug_recent_window_slot != null and debug_recent_window_slot.? == slot and !debug_recent_window_sync_logged) {
+        debug_recent_window_sync_logged = true;
+        logRecentWindowStage(slot, "sync");
+    }
     const slot_ref = &window_store.slots[slot];
     const meta = windowMetaPtr(slot) orelse return null;
     const seq = meta.seq;
     if (seq == slot_ref.source.observed_meta_seq and window_shadow_valid[slot]) return null;
     slot_ref.source.observed_meta_seq = seq;
 
+    const old_bounds = windowBounds(&slot_ref.frame);
+    const position_changed = syncWindowPositionFromMeta(&slot_ref.frame, meta);
     const title_changed = updateWindowTitleFromMeta(slot_ref, meta);
     var dirty_region = readWindowDirtyRegion(&slot_ref.source, meta);
     if (!window_shadow_valid[slot]) {
@@ -1881,8 +2642,20 @@ fn syncWindow(slot: usize) ?Rect {
         };
     }
     const content_rect = syncWindowGpuContent(slot, dirty_region);
-    if (title_changed or content_rect != null) invalidateWindowBodyCache(slot);
+    if (position_changed or title_changed or content_rect != null) invalidateWindowBodyCache(slot);
+    if (position_changed) {
+        var merged = includeRect(false, fullScreenRect(), old_bounds);
+        merged = includeRect(merged.any, merged.rect, windowBounds(&slot_ref.frame));
+        return merged.rect;
+    }
     if (title_changed) {
+        if (windowHasFrame(&slot_ref.frame)) {
+            var merged = includeRect(false, fullScreenRect(), windowBounds(&slot_ref.frame));
+            if (taskbarProcessListRect()) |taskbar_rect| {
+                merged = includeRect(merged.any, merged.rect, taskbar_rect);
+            }
+            return merged.rect;
+        }
         return windowBounds(&slot_ref.frame);
     }
     return content_rect;
@@ -1901,11 +2674,15 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     window_store = .{};
     window_shadow_valid = [_]bool{false} ** max_windows;
     window_gpu_resources = [_]?virtgpu.ResourceHandle{null} ** max_windows;
+    logged_invalid_window_source = [_]bool{false} ** max_windows;
     next_window_z_order = 1;
     window_paint_order_count = 0;
     window_paint_order_dirty = true;
     logged_invalid_gpu_slot = null;
     logged_first_gpu_sync_slot = false;
+    debug_recent_window_slot = null;
+    debug_recent_window_sync_logged = false;
+    debug_recent_window_draw_logged = false;
     var last_cursor_rect = cursorRect(mouse_state_storage.x, mouse_state_storage.y);
     var i: usize = 0;
 
@@ -1918,6 +2695,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     var scheduler_boost_active = false;
     var prev_left_down = false;
     var prev_right_down = false;
+    var observed_taskbar_command_seq: u64 = 0;
     var force_full = true;
     var virtgpu_init_ok = false;
     resetCompositorPerfReport(readTsc());
@@ -1949,11 +2727,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
 
         mouse_state_storage.ready = true;
         syncMouseState(true);
-
-        if (grantCap(process0_id, page_paddr, rights_read_write) != syscall_ok) {
-            _ = userLog("Compositor: grant shared cap back failed\n");
-            while (true) asm volatile ("pause");
-        }
         force_full = true;
     }
 
@@ -2011,10 +2784,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
 
             mouse_state_storage.ready = true;
             syncMouseState(true);
-            if (grantCap(process0_id, page_paddr, rights_read_write) != syscall_ok) {
-                _ = userLog("Compositor: grant shared cap back failed\n");
-                while (true) asm volatile ("pause");
-            }
             force_full = true;
         }
 
@@ -2064,6 +2833,12 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         const right_down = (mouse_state_storage.buttons & 0x2) != 0;
         const safe_window_count = max_windows;
 
+        if (processTaskbarCommand(&observed_taskbar_command_seq)) |changed_rect| {
+            const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), changed_rect);
+            dirty_any = merged.any;
+            dirty_rect = merged.rect;
+        }
+
         if (!first_compose_logged and window_count < 2 and first_compose_wait_loops < 96) {
             first_compose_wait_loops += 1;
             force_full = true;
@@ -2079,6 +2854,8 @@ pub fn run(comptime gpu_mode: bool) noreturn {
 
         i = 0;
         while (i < max_windows) : (i += 1) {
+            window_store.slots[i].minimize_hover = false;
+            window_store.slots[i].minimize_down = false;
             window_store.slots[i].close_hover = false;
             window_store.slots[i].close_down = false;
         }
@@ -2089,19 +2866,25 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             const slot_ref = &window_store.slots[i];
             const win = &slot_ref.frame;
             if (!win.active or !win.visible) continue;
+            if (!windowHasFrame(win)) {
+                slot_ref.minimize_hover = false;
+                slot_ref.minimize_down = false;
+                slot_ref.close_hover = false;
+                slot_ref.close_down = false;
+                continue;
+            }
             const hover_target = hovered_slot != null and hovered_slot.? == i;
-            const close_right = win.x + windowWidth(win) - window_close_margin_i32;
-            const close_left = close_right - window_close_size_i32;
-            const close_top = win.y + @divTrunc(window_header_h_i32 - window_close_size_i32, 2);
-            const close_rect: Rect = .{
-                .x0 = close_left,
-                .y0 = close_top,
-                .x1 = close_right,
-                .y1 = close_top + window_close_size_i32,
-            };
+            const minimize_rect = windowMinimizeButtonRect(win);
+            const close_rect = windowCloseButtonRect(win);
+            slot_ref.minimize_hover = hover_target and pointInMinimizeButton(mouse_state_storage.x, mouse_state_storage.y, minimize_rect);
+            slot_ref.minimize_down = slot_ref.minimize_hover and left_down;
             slot_ref.close_hover = hover_target and pointInCloseButton(mouse_state_storage.x, mouse_state_storage.y, close_rect);
             slot_ref.close_down = slot_ref.close_hover and left_down;
-            if (slot_ref.close_hover != win.prev_close_hover or slot_ref.close_down != win.prev_close_down) {
+            if (slot_ref.minimize_hover != win.prev_minimize_hover or
+                slot_ref.minimize_down != win.prev_minimize_down or
+                slot_ref.close_hover != win.prev_close_hover or
+                slot_ref.close_down != win.prev_close_down)
+            {
                 invalidateWindowBodyCache(i);
                 const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_bounds[i]);
                 dirty_any = merged.any;
@@ -2128,36 +2911,45 @@ pub fn run(comptime gpu_mode: bool) noreturn {
                 const slot_ref = &window_store.slots[idx];
                 var win = &slot_ref.frame;
                 const old_rect = windowBounds(win);
-                if (bringWindowToFront(idx)) {
-                    const new_rect = windowBounds(win);
-                    var merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_rect);
-                    merged = includeRect(merged.any, merged.rect, new_rect);
-                    dirty_any = merged.any;
-                    dirty_rect = merged.rect;
-                }
                 if (slot_ref.close_hover) {
-                    win.visible = false;
-                    invalidateWindowPaintOrderCache();
-                    if (dragging_index != null and dragging_index.? == idx) dragging_index = null;
-                    const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_bounds[idx]);
-                    dirty_any = merged.any;
-                    dirty_rect = merged.rect;
-                } else {
-                    const hx0 = win.x + window_border_i32;
-                    const hy0 = win.y + window_border_i32;
-                    const hx1 = win.x + windowWidth(win) - window_border_i32;
-                    const hy1 = win.y + window_header_h_i32;
-                    if (!(mouse_state_storage.x >= hx0 and mouse_state_storage.x < hx1 and mouse_state_storage.y >= hy0 and mouse_state_storage.y < hy1)) {
-                        // Click landed inside the window but outside the draggable title bar.
-                        // Keep the frame pipeline running so button-edge state stays coherent.
-                    } else {
-                        win.drag_off_x = mouse_state_storage.x - win.x;
-                        win.drag_off_y = mouse_state_storage.y - win.y;
-                        dragging_index = idx;
-                        const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_bounds[idx]);
+                    if (closeWindowSlot(idx)) {
+                        if (dragging_index != null and dragging_index.? == idx) dragging_index = null;
+                        const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_rect);
                         dirty_any = merged.any;
                         dirty_rect = merged.rect;
-                        drag_boost_logged = true;
+                    }
+                } else if (slot_ref.minimize_hover) {
+                    if (minimizeWindowSlot(idx)) {
+                        if (dragging_index != null and dragging_index.? == idx) dragging_index = null;
+                        const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_rect);
+                        dirty_any = merged.any;
+                        dirty_rect = merged.rect;
+                    }
+                } else {
+                    if (bringWindowToFront(idx)) {
+                        const new_rect = windowBounds(win);
+                        var merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_rect);
+                        merged = includeRect(merged.any, merged.rect, new_rect);
+                        dirty_any = merged.any;
+                        dirty_rect = merged.rect;
+                    }
+                    if (windowHasFrame(win)) {
+                        const hx0 = win.x + window_border_i32;
+                        const hy0 = win.y + window_border_i32;
+                        const hx1 = win.x + windowWidth(win) - window_border_i32;
+                        const hy1 = win.y + window_header_h_i32;
+                        if (!(mouse_state_storage.x >= hx0 and mouse_state_storage.x < hx1 and mouse_state_storage.y >= hy0 and mouse_state_storage.y < hy1)) {
+                            // Click landed inside the window but outside the draggable title bar.
+                            // Keep the frame pipeline running so button-edge state stays coherent.
+                        } else {
+                            win.drag_off_x = mouse_state_storage.x - win.x;
+                            win.drag_off_y = mouse_state_storage.y - win.y;
+                            dragging_index = idx;
+                            const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), old_bounds[idx]);
+                            dirty_any = merged.any;
+                            dirty_rect = merged.rect;
+                            drag_boost_logged = true;
+                        }
                     }
                 }
             }
@@ -2195,6 +2987,8 @@ pub fn run(comptime gpu_mode: bool) noreturn {
 
         i = 0;
         while (i < safe_window_count) : (i += 1) {
+            window_store.slots[i].frame.prev_minimize_hover = window_store.slots[i].minimize_hover;
+            window_store.slots[i].frame.prev_minimize_down = window_store.slots[i].minimize_down;
             window_store.slots[i].frame.prev_close_hover = window_store.slots[i].close_hover;
             window_store.slots[i].frame.prev_close_down = window_store.slots[i].close_down;
         }
@@ -2208,6 +3002,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
                 dirty_rect = merged.rect;
             }
         }
+        syncTaskbarStatePage();
         compositor_perf_report.sync_tsc +%= readTsc() - sync_start_tsc;
 
         const present_rect = if (force_full) fullScreenRect() else clipRectToScreen(dirty_rect);
@@ -2242,6 +3037,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             };
             const surface = DrawSurface{
                 .pixels = gpu_pixels,
+                .pixel_capacity = fb_pixels,
                 .clip = present_rect,
             };
             const compose_start = readTsc();
@@ -2283,7 +3079,13 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             }
             if (!flush_ok) {
                 _ = userLog("GpuCompositor: virtgpu present failed\n");
-                while (true) asm volatile ("pause");
+                setSchedulerBoost(false, &scheduler_boost_active);
+                compositor_perf_report.idle_loops +%= 1;
+                const iter_end_tsc = readTsc();
+                compositor_perf_report.total_tsc +%= iter_end_tsc - iter_start_tsc;
+                maybeLogCompositorPerf(iter_end_tsc);
+                _ = waitEvent(true, 1);
+                continue;
             }
         } else {
             _ = userLog("GpuCompositor: virtgpu inactive\n");

@@ -14,6 +14,7 @@ pub const window_cap_magic = protocol.window_cap_magic;
 pub const window_meta_magic = protocol.window_meta_magic;
 pub const window_flag_allow_pixels_dma = protocol.window_flag_allow_pixels_dma;
 pub const window_flag_low_scale = protocol.window_flag_low_scale;
+pub const window_flag_frameless = protocol.window_flag_frameless;
 pub const WindowCap = protocol.WindowCap;
 pub const WindowMeta = protocol.WindowMeta;
 const max_window_pixel_pages: usize = 128;
@@ -54,6 +55,34 @@ fn userLogHex(label: []const u8, value: u64) void {
     buf[len] = '\n';
     len += 1;
     _ = userLog(buf[0..len]);
+}
+
+fn userLogWindowPublished(cap_paddr: u64) void {
+    var buf: [96]u8 = undefined;
+    var len: usize = 0;
+    const prefix = "window_client: publish ok cap=";
+    while (len < prefix.len and len < buf.len) : (len += 1) {
+        buf[len] = prefix[len];
+    }
+    if (len + 18 >= buf.len) return;
+    buf[len] = '0';
+    buf[len + 1] = 'x';
+    len += 2;
+    var shift: u6 = 60;
+    while (true) {
+        const nibble: u8 = @intCast((cap_paddr >> shift) & 0xF);
+        buf[len] = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
+        len += 1;
+        if (shift == 0) break;
+        shift -= 4;
+    }
+    buf[len] = '\n';
+    len += 1;
+    _ = userLog(buf[0..len]);
+}
+
+fn userLogStep(step: []const u8) void {
+    _ = userLog(step);
 }
 
 fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
@@ -146,15 +175,18 @@ pub fn createAndPublishWindow(
     meta_map_va: u64,
 ) bool {
     const effective_flags = flags;
+    userLogStep("window_client: create begin\n");
     const cap_paddr = createWindowSys(width, height, effective_flags);
     if (cap_paddr < 0x1000) {
         _ = userLog("window_client: create_window failed\n");
         return false;
     }
+    userLogStep("window_client: create_window ok\n");
     if (mapPage(cap_tmp_va, cap_paddr, true) != syscall_ok) {
         _ = userLog("window_client: map cap page failed\n");
         return false;
     }
+    userLogStep("window_client: map cap page ok\n");
     const cap: *volatile WindowCap = @ptrFromInt(cap_tmp_va);
     if (cap.magic != window_cap_magic or cap.version != 1) {
         _ = userLog("window_client: bad window cap magic\n");
@@ -192,6 +224,7 @@ pub fn createAndPublishWindow(
         userLogHex("window_client: use_untyped=", if (use_untyped) 1 else 0);
         return false;
     }
+    userLogStep("window_client: alloc/map pixels ok\n");
     var i: usize = 0;
     while (i < page_count) : (i += 1) {
         const pixel_paddr = pixel_paddrs[i];
@@ -213,6 +246,7 @@ pub fn createAndPublishWindow(
             }
         }
     }
+    userLogStep("window_client: grant pixels ok\n");
     cap.pixels_cap_paddr = pixel_paddrs[0];
     const paddr_list: [*]volatile u64 = @ptrFromInt(cap_tmp_va + cap_size);
     i = 0;
@@ -223,10 +257,13 @@ pub fn createAndPublishWindow(
         _ = userLog("window_client: map meta failed\n");
         return false;
     }
+    userLogStep("window_client: map meta ok\n");
     if (sendCap(cap_paddr, endpoint_to_process1) != syscall_ok) {
         _ = userLog("window_client: send window cap failed\n");
         return false;
     }
+    userLogStep("window_client: send cap ok\n");
+    userLogWindowPublished(cap_paddr);
     return true;
 }
 
@@ -267,6 +304,13 @@ pub fn setWindowTitle(meta_va: u64, title: []const u8) void {
     }
     meta.title_len = @intCast(copy_len);
     markWindowDirty(meta_va);
+}
+
+pub fn setWindowPosition(meta_va: u64, x: i32, y: i32) void {
+    const meta = windowMetaPtr(meta_va) orelse return;
+    meta.pos_x = x;
+    meta.pos_y = y;
+    meta.seq +%= 1;
 }
 
 pub fn markWindowDirtyRect(meta_va: u64, x: usize, y: usize, w: usize, h: usize) void {

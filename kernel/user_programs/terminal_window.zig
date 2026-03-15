@@ -43,11 +43,12 @@ fn userLog(message: []const u8) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn launchPieUser() u64 {
+fn launchUserProgram(selector: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_launch_pie_user),
+          [arg0] "{rdi}" (selector),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -267,7 +268,7 @@ fn executeCommand(st: *TerminalState, cmd_text: []const u8) void {
     if (cmd.len == 0) return;
 
     if (eqAsciiNoCase(cmd, "help")) {
-        st.writeLine("help pie pie_user clear");
+        st.writeLine("help pie pie_user mouse mouse_demo keyboard keyboard_demo clear");
         return;
     }
     if (eqAsciiNoCase(cmd, "clear")) {
@@ -279,11 +280,29 @@ fn executeCommand(st: *TerminalState, cmd_text: []const u8) void {
         return;
     }
     if (eqAsciiNoCase(cmd, "pie") or eqAsciiNoCase(cmd, "pie_user")) {
-        if (launchPieUser() == syscall_ok) {
+        if (launchUserProgram(0) == syscall_ok) {
             st.writeLine("launch pie_user ok");
             st.writeLine("see serial userlog");
         } else {
             st.writeLine("launch pie_user failed");
+        }
+        return;
+    }
+    if (eqAsciiNoCase(cmd, "mouse") or eqAsciiNoCase(cmd, "mouse_demo")) {
+        if (launchUserProgram(1) == syscall_ok) {
+            st.writeLine("launch mouse_demo ok");
+            st.writeLine("see serial userlog");
+        } else {
+            st.writeLine("launch mouse_demo failed");
+        }
+        return;
+    }
+    if (eqAsciiNoCase(cmd, "keyboard") or eqAsciiNoCase(cmd, "keyboard_demo")) {
+        if (launchUserProgram(2) == syscall_ok) {
+            st.writeLine("launch keyboard_demo ok");
+            st.writeLine("see serial userlog");
+        } else {
+            st.writeLine("launch keyboard_demo failed");
         }
         return;
     }

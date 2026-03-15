@@ -7,11 +7,15 @@ const TrapFrame = interrupts.TrapFrame;
 const UserAddressSpace = capability.UserAddressSpace;
 
 const fx_state_bytes: usize = 512;
-const user_thread_count: usize = kernel.process_count;
+pub const max_thread_slots: usize = kernel.max_thread_slots;
+const enable_process5_context_debug_logs = false;
+var proc5_ctx_log_count: u64 = 0;
+const proc5_ctx_log_max: u64 = 48;
 
 pub const ThreadContext = struct {
     id: u32 = 0,
-    owner_process: kernel.PrincipalId,
+    allocated: bool = false,
+    owner_process: kernel.PrincipalId = .Process0,
     cr3: u64 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
@@ -20,18 +24,16 @@ pub const ThreadContext = struct {
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
 };
 
-pub fn buildInitialThreadContexts() [user_thread_count]ThreadContext {
-    var contexts: [user_thread_count]ThreadContext = undefined;
-    inline for (0..user_thread_count) |i| {
-        contexts[i] = .{
-            .id = @intCast(i),
-            .owner_process = kernel.processPrincipalFromIndex(i) orelse unreachable,
-        };
+pub fn buildInitialThreadContexts() [max_thread_slots]ThreadContext {
+    var contexts: [max_thread_slots]ThreadContext = undefined;
+    inline for (0..max_thread_slots) |i| {
+        contexts[i] = .{ .id = @intCast(i) };
     }
     return contexts;
 }
 
-pub var thread_contexts: [user_thread_count]ThreadContext = buildInitialThreadContexts();
+pub var thread_contexts: [max_thread_slots]ThreadContext = buildInitialThreadContexts();
+pub var process_thread_slots: [kernel.process_count]?usize = [_]?usize{null} ** kernel.process_count;
 pub export var user_cr3_value: u64 = 0;
 pub var current_user_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
 pub var current_thread_index: usize = 0;
@@ -49,6 +51,84 @@ pub var compositor_thread1_priority_active = false;
 pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 
+pub const RaceLogHooks = struct {
+    write: *const fn ([]const u8) void,
+    print_hex: *const fn (u64) void,
+};
+
+pub const PerfReport = struct {
+    ticks: u64,
+    process1_ticks: u64,
+    thread1_ticks: u64,
+    switch_delta: u64,
+    compositor_priority_active: bool,
+    compositor_priority_streak: u64,
+};
+
+pub fn noteUserTimerTick() void {
+    scheduler_perf_user_ticks +%= 1;
+    if (getThreadContextConst(current_thread_index)) |ctx| {
+        if (ctx.allocated and ctx.owner_process == .Process1) scheduler_perf_process1_ticks +%= 1;
+    }
+    if (threadSlotForPrincipal(.Process1)) |slot| {
+        if (current_thread_index == slot) scheduler_perf_thread1_ticks +%= 1;
+    }
+}
+
+pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, compositor_hold_quanta: u64) ?usize {
+    if (quantum_ticks == 0) return null;
+
+    scheduler_tick_accum +%= 1;
+    if (scheduler_tick_accum < quantum_ticks) return null;
+    scheduler_tick_accum = 0;
+
+    const current_thread = current_thread_index;
+    if (!compositor_thread1_priority_active) {
+        compositor_thread1_priority_streak = 0;
+    } else if (threadSlotForPrincipal(.Process1)) |compositor_slot| {
+        if (current_thread != compositor_slot) {
+            compositor_thread1_priority_streak = 0;
+        } else {
+            const compositor_ctx = getThreadContextConst(compositor_slot) orelse null;
+            if (compositor_ctx != null and compositor_ctx.?.allocated and compositor_ctx.?.ready and compositor_thread1_priority_streak + 1 < compositor_hold_quanta) {
+                compositor_thread1_priority_streak +%= 1;
+                return null;
+            }
+            compositor_thread1_priority_streak = 0;
+        }
+    } else {
+        compositor_thread1_priority_streak = 0;
+    }
+
+    const next_thread = pickNextReadyThreadIndex(current_thread);
+    if (next_thread == current_thread) return null;
+    return next_thread;
+}
+
+pub fn takePerfReport(report_interval_ticks: u64, last_switch_count: *u64) ?PerfReport {
+    if (scheduler_perf_user_ticks < report_interval_ticks) return null;
+    const report: PerfReport = .{
+        .ticks = scheduler_perf_user_ticks,
+        .process1_ticks = scheduler_perf_process1_ticks,
+        .thread1_ticks = scheduler_perf_thread1_ticks,
+        .switch_delta = scheduler_switch_count - last_switch_count.*,
+        .compositor_priority_active = compositor_thread1_priority_active,
+        .compositor_priority_streak = compositor_thread1_priority_streak,
+    };
+    last_switch_count.* = scheduler_switch_count;
+    scheduler_perf_user_ticks = 0;
+    scheduler_perf_process1_ticks = 0;
+    scheduler_perf_thread1_ticks = 0;
+    return report;
+}
+
+pub fn refreshCompositorPriorityActive(requested: bool, allow_active: bool) void {
+    compositor_thread1_priority_active = requested and allow_active;
+    if (!compositor_thread1_priority_active) {
+        compositor_thread1_priority_streak = 0;
+    }
+}
+
 fn getUserSpace(user_spaces: []UserAddressSpace, principal: kernel.PrincipalId) ?*UserAddressSpace {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return null;
     if (idx >= user_spaces.len) return null;
@@ -56,13 +136,105 @@ fn getUserSpace(user_spaces: []UserAddressSpace, principal: kernel.PrincipalId) 
 }
 
 pub fn getThreadContext(thread_index: usize) ?*ThreadContext {
-    if (thread_index >= user_thread_count) return null;
+    if (thread_index >= max_thread_slots) return null;
     return &thread_contexts[thread_index];
 }
 
 pub fn getThreadContextConst(thread_index: usize) ?*const ThreadContext {
-    if (thread_index >= user_thread_count) return null;
+    if (thread_index >= max_thread_slots) return null;
     return &thread_contexts[thread_index];
+}
+
+fn threadLabel(thread_index: usize) []const u8 {
+    const labels = comptime blk: {
+        var items: [max_thread_slots][]const u8 = undefined;
+        for (0..max_thread_slots) |i| {
+            items[i] = std.fmt.comptimePrint("Thread{}", .{i});
+        }
+        break :blk items;
+    };
+    if (thread_index < labels.len) return labels[thread_index];
+    return "Thread?";
+}
+
+fn maybeLogProcess5Context(stage: []const u8, thread_index: usize, frame: *const TrapFrame) void {
+    if (!enable_process5_context_debug_logs) return;
+    if (proc5_ctx_log_count >= proc5_ctx_log_max) return;
+    const ctx = getThreadContextConst(thread_index) orelse return;
+    if (!ctx.allocated or ctx.owner_process != .Process5) return;
+    if (frame.rip < 0x200017e1 or frame.rip > 0x20001832) return;
+    proc5_ctx_log_count +%= 1;
+
+    const serial = @import("serial.zig");
+    serial.write("PROC5 ctx ");
+    serial.write(stage);
+    serial.write(" thread=");
+    serial.write(threadLabel(thread_index));
+    serial.write(" rip=");
+    serial.writeHexRaw(frame.rip);
+    serial.write(" rax=");
+    serial.writeHexRaw(frame.rax);
+    serial.write(" rsp=");
+    serial.writeHexRaw(frame.rsp);
+    serial.write("\n");
+}
+
+fn tryBeginSchedulerRaceLog(hooks: RaceLogHooks, max_lines: u64) bool {
+    if (scheduler_race_log_count >= max_lines) return false;
+    scheduler_race_log_count +%= 1;
+    hooks.write("SCHED race ");
+    return true;
+}
+
+pub fn logRaceSendCap(
+    hooks: RaceLogHooks,
+    max_lines: u64,
+    from: kernel.PrincipalId,
+    to: ?kernel.PrincipalId,
+    endpoint_id: u64,
+    paddr: u64,
+    reason: []const u8,
+) void {
+    if (!tryBeginSchedulerRaceLog(hooks, max_lines)) return;
+    hooks.write("send_cap from=");
+    hooks.write(kernel.principalLabel(from));
+    hooks.write(" to=");
+    if (to) |target| {
+        hooks.write(kernel.principalLabel(target));
+    } else {
+        hooks.write("unknown");
+    }
+    hooks.write(" ep=");
+    hooks.print_hex(endpoint_id);
+    hooks.write(" paddr=");
+    hooks.print_hex(paddr);
+    hooks.write(" reason=");
+    hooks.write(reason);
+    hooks.write("\n");
+}
+
+pub fn logRaceSwitch(
+    hooks: RaceLogHooks,
+    max_lines: u64,
+    current_thread: usize,
+    target_thread: usize,
+    reason: []const u8,
+) void {
+    if (!tryBeginSchedulerRaceLog(hooks, max_lines)) return;
+    hooks.write("switch_thread from=");
+    hooks.write(threadLabel(current_thread));
+    hooks.write(" to=");
+    hooks.write(threadLabel(target_thread));
+    hooks.write(" reason=");
+    hooks.write(reason);
+    hooks.write("\n");
+}
+
+pub fn setThreadReady(thread_index: usize, ready: bool) bool {
+    const ctx = getThreadContext(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.ready = ready;
+    return true;
 }
 
 pub fn initThreadContextWithSpaces(
@@ -73,7 +245,13 @@ pub fn initThreadContextWithSpaces(
 ) bool {
     const space = getUserSpace(user_spaces, owner_process) orelse return false;
     const ctx = getThreadContext(thread_index) orelse return false;
+    if (kernel.processIndexFromPrincipal(owner_process)) |owner_index| {
+        process_thread_slots[owner_index] = thread_index;
+    } else {
+        return false;
+    }
     ctx.id = @intCast(thread_index);
+    ctx.allocated = true;
     ctx.owner_process = owner_process;
     ctx.cr3 = space.cr3;
     ctx.ready = true;
@@ -84,8 +262,33 @@ pub fn initThreadContextWithSpaces(
     return true;
 }
 
-fn expectedPrincipalForThread(thread_index: usize) ?kernel.PrincipalId {
-    return kernel.processPrincipalFromIndex(thread_index);
+pub fn threadSlotForPrincipal(principal: kernel.PrincipalId) ?usize {
+    const idx = kernel.processIndexFromPrincipal(principal) orelse return null;
+    return process_thread_slots[idx];
+}
+
+pub fn allocateThreadSlot(owner_process: kernel.PrincipalId, user_spaces: []UserAddressSpace, initial_frame: TrapFrame) ?usize {
+    if (threadSlotForPrincipal(owner_process)) |existing| return existing;
+    var i: usize = 0;
+    while (i < max_thread_slots) : (i += 1) {
+        const ctx = getThreadContextConst(i) orelse continue;
+        if (ctx.allocated) continue;
+        if (!initThreadContextWithSpaces(i, owner_process, user_spaces, initial_frame)) return null;
+        return i;
+    }
+    return null;
+}
+
+pub fn releaseThreadSlot(thread_index: usize) bool {
+    const ctx = getThreadContext(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    if (kernel.processIndexFromPrincipal(ctx.owner_process)) |owner_index| {
+        if (process_thread_slots[owner_index] == thread_index) {
+            process_thread_slots[owner_index] = null;
+        }
+    }
+    ctx.* = .{ .id = @intCast(thread_index) };
+    return true;
 }
 
 fn rawOwnerTag(ctx: *const ThreadContext) u8 {
@@ -100,24 +303,33 @@ fn principalFromRawTag(raw: u8) ?kernel.PrincipalId {
 
 pub fn threadContextLooksCorrupted(thread_index: usize) bool {
     const ctx = getThreadContextConst(thread_index) orelse return true;
-    const expected = expectedPrincipalForThread(thread_index) orelse return true;
+    if (!ctx.allocated) return false;
     const owner_raw = rawOwnerTag(ctx);
     const owner = principalFromRawTag(owner_raw) orelse return true;
-    if (owner != expected) return true;
+    if (owner != ctx.owner_process) return true;
+    if (threadSlotForPrincipal(owner) != thread_index) return true;
     if ((ctx.cr3 & 0xFFF) != 0) return true;
     if (ctx.cr3 == 0) return true;
     return false;
 }
 
 pub fn repairThreadContextWithSpaces(thread_index: usize, user_spaces: []UserAddressSpace, initial_frame: TrapFrame) bool {
-    const expected = expectedPrincipalForThread(thread_index) orelse return false;
-    return initThreadContextWithSpaces(thread_index, expected, user_spaces, initial_frame);
+    const ctx = getThreadContextConst(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    const owner = ctx.owner_process;
+    const was_ready = ctx.ready;
+    const ok = initThreadContextWithSpaces(thread_index, owner, user_spaces, initial_frame);
+    if (ok and !was_ready) {
+        if (getThreadContext(thread_index)) |mutable| mutable.ready = false;
+    }
+    return ok;
 }
 
 pub fn sanitizeAllThreadContextsWithSpaces(user_spaces: []UserAddressSpace, initial_frame: TrapFrame) void {
     var i: usize = 0;
-    while (i < user_thread_count) : (i += 1) {
+    while (i < max_thread_slots) : (i += 1) {
         const ctx = getThreadContext(i) orelse continue;
+        if (!ctx.allocated) continue;
         const was_ready = ctx.ready;
         if (!repairThreadContextWithSpaces(i, user_spaces, initial_frame)) continue;
         if (!was_ready) ctx.ready = false;
@@ -126,6 +338,7 @@ pub fn sanitizeAllThreadContextsWithSpaces(user_spaces: []UserAddressSpace, init
 
 pub fn activateThread(thread_index: usize) bool {
     const ctx = getThreadContextConst(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
     if (!ctx.ready) return false;
     current_thread_index = thread_index;
     current_user_principal = ctx.owner_process;
@@ -135,8 +348,11 @@ pub fn activateThread(thread_index: usize) bool {
 
 pub fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
     const ctx = getThreadContext(current_thread_index) orelse return;
+    if (!ctx.allocated) return;
+    maybeLogProcess5Context("save-before", current_thread_index, frame);
     ctx.frame = frame.*;
     ctx.cr3 = user_cr3_value;
+    maybeLogProcess5Context("save-after", current_thread_index, &ctx.frame);
     if (!ctx.wait_mailbox and ctx.wake_tick == 0) {
         ctx.ready = true;
     }
@@ -144,13 +360,16 @@ pub fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
 
 pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
     const ctx = getThreadContextConst(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
     if (!ctx.ready) return false;
+    maybeLogProcess5Context("load-src", thread_index, &ctx.frame);
     frame.* = ctx.frame;
+    maybeLogProcess5Context("load-dst", thread_index, frame);
     return true;
 }
 
 pub fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bool {
-    if (next_thread >= user_thread_count) return false;
+    if (next_thread >= max_thread_slots) return false;
     const current_thread = current_thread_index;
     if (next_thread == current_thread) {
         if (saved_rax) |value| frame.rax = value;
@@ -171,15 +390,18 @@ pub fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bo
 }
 
 pub fn pickNextReadyThreadIndex(current_index: usize) usize {
-    if (current_index >= user_thread_count) return 0;
+    if (current_index >= max_thread_slots) return 0;
     if (compositor_thread1_priority_active) {
-        const compositor_ctx = getThreadContextConst(1) orelse return current_index;
-        if (current_index != 1 and compositor_ctx.ready) return 1;
+        if (threadSlotForPrincipal(.Process1)) |compositor_slot| {
+            const compositor_ctx = getThreadContextConst(compositor_slot) orelse return current_index;
+            if (current_index != compositor_slot and compositor_ctx.allocated and compositor_ctx.ready) return compositor_slot;
+        }
     }
     var step: usize = 1;
-    while (step <= user_thread_count) : (step += 1) {
-        const idx = (current_index + step) % user_thread_count;
+    while (step <= max_thread_slots) : (step += 1) {
+        const idx = (current_index + step) % max_thread_slots;
         const ctx = getThreadContextConst(idx) orelse continue;
+        if (!ctx.allocated) continue;
         if (ctx.ready) return idx;
     }
     return current_index;
@@ -187,13 +409,14 @@ pub fn pickNextReadyThreadIndex(current_index: usize) usize {
 
 pub fn wakeThreadIfWaiting(thread_index: usize) void {
     const ctx = getThreadContext(thread_index) orelse return;
+    if (!ctx.allocated) return;
     ctx.wait_mailbox = false;
     ctx.wake_tick = 0;
     ctx.ready = true;
 }
 
 pub fn wakeWaitingThreadForPrincipal(principal: kernel.PrincipalId) void {
-    const thread_index = kernel.processIndexFromPrincipal(principal) orelse return;
+    const thread_index = threadSlotForPrincipal(principal) orelse return;
     const ctx = getThreadContext(thread_index) orelse return;
     if (!ctx.wait_mailbox) return;
     wakeThreadIfWaiting(thread_index);
@@ -201,8 +424,9 @@ pub fn wakeWaitingThreadForPrincipal(principal: kernel.PrincipalId) void {
 
 pub fn wakeThreadsForTimer(now_tick: u64) void {
     var i: usize = 0;
-    while (i < user_thread_count) : (i += 1) {
+    while (i < max_thread_slots) : (i += 1) {
         const ctx = getThreadContext(i) orelse continue;
+        if (!ctx.allocated) continue;
         if (ctx.ready) continue;
         if (ctx.wake_tick == 0 or now_tick < ctx.wake_tick) continue;
         wakeThreadIfWaiting(i);
