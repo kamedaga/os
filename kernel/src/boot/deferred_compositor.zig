@@ -1,4 +1,5 @@
 const std = @import("std");
+const kernel = @import("../kernel.zig");
 
 pub const Kind = enum {
     classic,
@@ -7,6 +8,7 @@ pub const Kind = enum {
 
 pub var launch_armed = false;
 pub var launched = false;
+pub var target_principal: ?kernel.PrincipalId = null;
 pub var user_page_paddr: u64 = 0;
 pub var user_stack_page_paddr: u64 = 0;
 pub var auto_launch_armed = false;
@@ -15,8 +17,8 @@ pub var wait_mouse_queue_ready = false;
 pub var wait_keyboard_queue_ready = false;
 pub var auto_debug_last_mask: u32 = 0xFFFF_FFFF;
 pub var auto_debug_last_tick: u64 = 0;
-pub var image_classic: ?[]const u8 = null;
-pub var image_gpu: ?[]const u8 = null;
+pub var backing_classic: ?kernel.ImageBacking = null;
+pub var backing_gpu: ?kernel.ImageBacking = null;
 pub var selected_kind: Kind = .classic;
 
 fn containsBytes(haystack: []const u8, needle: []const u8) bool {
@@ -26,6 +28,7 @@ fn containsBytes(haystack: []const u8, needle: []const u8) bool {
 pub fn reset() void {
     launch_armed = false;
     launched = false;
+    target_principal = null;
     user_page_paddr = 0;
     user_stack_page_paddr = 0;
     auto_launch_armed = false;
@@ -34,14 +37,15 @@ pub fn reset() void {
     wait_keyboard_queue_ready = false;
     auto_debug_last_mask = 0xFFFF_FFFF;
     auto_debug_last_tick = 0;
-    image_classic = null;
-    image_gpu = null;
+    backing_classic = null;
+    backing_gpu = null;
     selected_kind = .classic;
 }
 
 pub fn arm(
-    classic_image: ?[]const u8,
-    gpu_image: ?[]const u8,
+    classic_backing: ?kernel.ImageBacking,
+    gpu_backing: ?kernel.ImageBacking,
+    launch_target_principal: kernel.PrincipalId,
     process1_user_page_paddr: u64,
     process1_user_stack_paddr: u64,
     auto_launch: bool,
@@ -49,13 +53,14 @@ pub fn arm(
     wait_mouse_ready: bool,
     wait_keyboard_ready: bool,
 ) void {
-    image_classic = classic_image;
-    image_gpu = gpu_image;
+    backing_classic = classic_backing;
+    backing_gpu = gpu_backing;
+    target_principal = launch_target_principal;
     user_page_paddr = process1_user_page_paddr;
     user_stack_page_paddr = process1_user_stack_paddr;
     launch_armed = true;
     launched = false;
-    selected_kind = if (gpu_image != null) .gpu else .classic;
+    selected_kind = if (gpu_backing != null) .gpu else .classic;
     auto_launch_armed = auto_launch;
     auto_launch_tick = auto_launch_tick_value;
     wait_mouse_queue_ready = wait_mouse_ready;
@@ -69,10 +74,10 @@ pub fn label(kind: Kind) []const u8 {
     };
 }
 
-pub fn currentImage() ?[]const u8 {
+pub fn currentImage() ?kernel.ImageBacking {
     return switch (selected_kind) {
-        .classic => image_classic orelse image_gpu,
-        .gpu => image_gpu orelse image_classic,
+        .classic => backing_classic orelse backing_gpu,
+        .gpu => backing_gpu orelse backing_classic,
     };
 }
 
@@ -100,7 +105,7 @@ pub fn handleKeyboardLog(proc: anytype, message: []const u8, writeFn: fn ([]cons
         return false;
     }
     if (containsBytes(message, "key code=0x22 value=1")) {
-        if (image_gpu != null) {
+        if (backing_gpu != null) {
             selected_kind = .gpu;
             writeFn("deferred compositor mode: gpu\n");
         } else {

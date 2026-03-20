@@ -3,23 +3,27 @@ set -e
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
+ARTIFACT_DIR="$SCRIPT_DIR/.artifacts"
+DISK_IMG="$ARTIFACT_DIR/disk.img"
+mkdir -p "$ARTIFACT_DIR"
+
 # 1) 古いもの削除
-rm -f disk.img
+rm -f "$DISK_IMG"
 sudo umount /mnt/esp 2>/dev/null || true
 sudo losetup -D
 
 # 2) 128MB ディスク作成
-dd if=/dev/zero of=disk.img bs=1M count=128
+dd if=/dev/zero of="$DISK_IMG" bs=1M count=128
 
 # 3) GPT + EFI System パーティション作成
-sudo sgdisk -og disk.img
-sudo sgdisk -n 1:2048:0 -t 1:ef00 -c 1:"EFI System" disk.img
+sudo sgdisk -og "$DISK_IMG"
+sudo sgdisk -n 1:2048:0 -t 1:ef00 -c 1:"EFI System" "$DISK_IMG"
 
 # 4) ループバック接続
-sudo losetup -Pf disk.img
+sudo losetup -Pf "$DISK_IMG"
 
 # loopデバイス取得
-LOOP=$(losetup -j disk.img | cut -d: -f1)
+LOOP=$(losetup -j "$DISK_IMG" | cut -d: -f1)
 echo "Loop device: $LOOP"
 
 # 5) FATフォーマット
@@ -44,4 +48,4 @@ fi
 sudo umount /mnt/esp
 sudo losetup -d $LOOP
 
-echo "disk.img ready."
+echo "$DISK_IMG ready."

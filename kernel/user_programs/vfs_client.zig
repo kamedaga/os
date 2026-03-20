@@ -1,6 +1,7 @@
 const std = @import("std");
 const fs_abi = @import("fs_abi.zig");
 const image_abi = @import("image_abi.zig");
+const service_registry_abi = @import("service_registry_abi.zig");
 const vfs_protocol = @import("vfs_protocol.zig");
 
 const syscall_alloc_page: u64 = 0x1;
@@ -130,6 +131,19 @@ pub const Client = struct {
         if (sendCap(request_paddr, options.endpoint_id) != 0) return error.ConnectSendFailed;
         _ = try client.finishRequestOk(1, .connect);
         return client;
+    }
+
+    pub fn connectFromServiceRegistry(request_va: u64, response_va: u64, client_process_slot: u64) Error!Client {
+        const entry = service_registry_abi.findService(service_registry_abi.page_va, .vfs) orelse return error.NotFound;
+        if (entry.process_slot == 0 or entry.endpoint_id == 0) return error.Invalid;
+        if (installEndpoint(entry.endpoint_id, entry.process_slot) != 0) return error.Invalid;
+        return connect(.{
+            .request_va = request_va,
+            .response_va = response_va,
+            .client_process_slot = client_process_slot,
+            .endpoint_id = entry.endpoint_id,
+            .server_process_slot = entry.process_slot,
+        });
     }
 
     pub fn lookup(self: *Client, object_token: u64, path: []const u8) Error!LookupResult {
@@ -363,6 +377,17 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
         : [nr] "{rax}" (syscall_wait_event),
           [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
           [arg1] "{rsi}" (timeout_ticks),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (@as(u64, 0x26)),
+          [arg0] "{rdi}" (@as(u64, 0)),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (target_process_slot),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 

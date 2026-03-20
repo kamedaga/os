@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const syscall_spawn_exec: u64 = 0x1D;
 pub const syscall_arm_deferred_compositor: u64 = 0x22;
 pub const spawn_result_tag: u64 = 1 << 63;
@@ -50,9 +52,21 @@ pub fn auxPageVa(page_index: u64) u64 {
     return aux_base_va + page_index * aux_page_bytes;
 }
 
+pub fn encodeSpawnedProcessSlot(process_slot: u64) u64 {
+    std.debug.assert(process_slot != 0);
+    std.debug.assert((process_slot & spawn_result_tag) == 0);
+    return spawn_result_tag | process_slot;
+}
+
 pub fn decodeSpawnedProcessSlot(value: u64) ?u64 {
     if ((value & spawn_result_tag) == 0) return null;
     const process_slot = value & ~spawn_result_tag;
     if (process_slot == 0) return null;
     return process_slot;
+}
+
+test "spawned process slot round-trips" {
+    const encoded = encodeSpawnedProcessSlot(10);
+    try std.testing.expectEqual(@as(?u64, 10), decodeSpawnedProcessSlot(encoded));
+    try std.testing.expectEqual(@as(?u64, null), decodeSpawnedProcessSlot(10));
 }

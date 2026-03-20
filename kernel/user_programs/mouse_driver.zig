@@ -1,4 +1,6 @@
 const std = @import("std");
+const device_abi = @import("device_abi.zig");
+const input_bootstrap = @import("input_driver_bootstrap_abi.zig");
 const protocol = @import("window_protocol.zig");
 
 const syscall_alloc_page: u64 = 0x1;
@@ -10,6 +12,7 @@ const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
+const syscall_wait_event: u64 = 0x17;
 
 const syscall_ok: u64 = 0;
 const queue_cap_device_input: u64 = 1;
@@ -22,11 +25,12 @@ const isr_page_va: usize = 0x2000_6000;
 const device_page_va: usize = 0x2000_7000;
 const queue_page0_va: usize = 0x2000_8000;
 const queue_page1_va: usize = 0x2000_9000;
-const shared_page_va: usize = 0x3C00_3000;
+const default_shared_page_va: usize = 0x3C00_3000;
 
-const config_magic: u64 = 0x4D4F5553; // "MOUS"
+const config_magic = input_bootstrap.mouse_config_magic;
 const shared_magic = protocol.mouse_shared_magic;
 const endpoint_to_process1: u64 = 0x11;
+const endpoint_to_spawn_parent: u64 = 0x14;
 const MouseSharedPage = protocol.MouseSharedPage;
 
 const common_device_feature_select: usize = 0x00;
@@ -165,6 +169,16 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_wait_event),
+          [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
+          [arg1] "{rsi}" (timeout_ticks),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn switchThread(thread_index: u64) u64 {
     return asm volatile (
         \\int $0x80
@@ -208,6 +222,15 @@ fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn registerIommuDriver(device: device_abi.DeviceId) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (device_abi.syscall_register_iommu_driver),
+          [arg0] "{rdi}" (@intFromEnum(device)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn mmioReadU8(addr: usize) u8 {
     const p: *volatile u8 = @ptrFromInt(addr);
     return p.*;
@@ -246,6 +269,37 @@ fn mmioWriteU64(addr: usize, value: u64) void {
 fn readCfgU64(index: usize) u64 {
     const cfg: [*]const volatile u64 = @ptrFromInt(config_page_va);
     return cfg[index];
+}
+
+fn writeCfgU64(index: usize, value: u64) void {
+    const cfg: [*]volatile u64 = @ptrFromInt(config_page_va);
+    cfg[index] = value;
+}
+
+fn clearSharedPage(bytes: []volatile u8) void {
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        bytes[i] = 0;
+    }
+}
+
+fn initializeSharedPage(shared: *volatile MouseSharedPage, width: u64, height: u64, pitch: u64) void {
+    const shared_target_va_u64 = readCfgU64(input_bootstrap.shared_target_va_index);
+    const shared_page_va: usize = @intCast(if (shared_target_va_u64 != 0) shared_target_va_u64 else default_shared_page_va);
+    const shared_bytes: [*]volatile u8 = @ptrFromInt(shared_page_va);
+    clearSharedPage(shared_bytes[0..protocol.mouse_shared_page_bytes]);
+    shared.* = .{
+        .magic = shared_magic,
+        .width = width,
+        .height = height,
+        .pitch = pitch,
+        .cursor_x = width / 2,
+        .cursor_y = height / 2,
+        .buttons = 0,
+        .seq = 1,
+        .wheel = 0,
+        .log_len = 0,
+    };
 }
 
 fn queueDescPtr(index: u16) *volatile VirtqDesc {
@@ -314,31 +368,39 @@ pub export fn _start() noreturn {
     _ = _device_page_paddr;
     _ = _device_off;
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
-    const shared_page_paddr = readCfgU64(10);
+    var shared_page_paddr = readCfgU64(10);
+    const shared_target_va_u64 = readCfgU64(input_bootstrap.shared_target_va_index);
+    const shared_page_va: usize = @intCast(if (shared_target_va_u64 != 0) shared_target_va_u64 else default_shared_page_va);
     var queue_paddr0 = readCfgU64(11);
     var queue_paddr1 = readCfgU64(12);
-    const queue_submit_token_raw = readCfgU64(13);
-    const queue_notify_token_raw = readCfgU64(14);
-    const queue_submit_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_submit_token_raw;
-    const queue_notify_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_notify_token_raw;
-    if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
-        _ = userLog("MouseDriver: map common mmio failed\n");
-        while (true) asm volatile ("pause");
+    var queue_submit_token_raw = readCfgU64(13);
+    var queue_notify_token_raw = readCfgU64(14);
+    const screen_w_u64 = readCfgU64(15);
+    const screen_h_u64 = readCfgU64(16);
+    const screen_pitch_u64 = readCfgU64(17);
+    while (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
+        _ = waitEvent(false, 1);
+        asm volatile ("pause");
     }
-    if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
-        _ = userLog("MouseDriver: map notify mmio failed\n");
-        while (true) asm volatile ("pause");
+    while (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
+        _ = waitEvent(false, 1);
+        asm volatile ("pause");
     }
     if (isr_page_paddr != 0) {
-        if (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) {
-            _ = userLog("MouseDriver: map isr mmio failed\n");
-            while (true) asm volatile ("pause");
+        while (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) {
+            _ = waitEvent(false, 1);
+            asm volatile ("pause");
         }
     }
 
     const common_base = common_page_va + common_off;
     const notify_base = notify_page_va + notify_off;
     const isr_base = if (isr_page_paddr != 0) isr_page_va + isr_off else 0;
+
+    if (registerIommuDriver(.virtio_input) != syscall_ok) {
+        _ = userLog("MouseDriver: register iommu driver failed\n");
+        while (true) asm volatile ("pause");
+    }
 
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
         var queue_paddrs: [2]u64 = .{ 0, 0 };
@@ -348,11 +410,21 @@ pub export fn _start() noreturn {
         }
         queue_paddr0 = queue_paddrs[0];
         queue_paddr1 = queue_paddrs[1];
+        writeCfgU64(11, queue_paddr0);
+        writeCfgU64(12, queue_paddr1);
     }
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
         _ = userLog("MouseDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
     }
+    while (queue_submit_token_raw == 0 or queue_notify_token_raw == 0) {
+        _ = waitEvent(false, 1);
+        queue_submit_token_raw = readCfgU64(13);
+        queue_notify_token_raw = readCfgU64(14);
+        asm volatile ("pause");
+    }
+    const queue_submit_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_submit_token_raw;
+    const queue_notify_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_notify_token_raw;
     if (queue_submit_token == 0 or queue_notify_token == 0) {
         _ = userLog("MouseDriver: queue cap token missing\n");
         while (true) asm volatile ("pause");
@@ -406,31 +478,35 @@ pub export fn _start() noreturn {
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     _ = userLog("MouseDriver: queue ready\n");
     if (shared_page_paddr < 0x1000) {
-        _ = userLog("MouseDriver: invalid shared page paddr\n");
-        while (true) asm volatile ("pause");
-    }
-    if (sendCap(shared_page_paddr, endpoint_to_process1) != syscall_ok) {
-        _ = userLog("MouseDriver: send shared cap failed\n");
-        while (true) asm volatile ("pause");
+        shared_page_paddr = allocPage();
+        if (shared_page_paddr < 0x1000) {
+            _ = userLog("MouseDriver: alloc shared page failed\n");
+            while (true) asm volatile ("pause");
+        }
+        writeCfgU64(10, shared_page_paddr);
     }
     var wait_grant_spin: usize = 0;
     while (mapPage(shared_page_va, shared_page_paddr, true) != syscall_ok) : (wait_grant_spin +%= 1) {
+        _ = waitEvent(false, 1);
         asm volatile ("pause");
     }
 
     const shared: *volatile MouseSharedPage = @ptrFromInt(shared_page_va);
-    if (shared.magic != shared_magic) {
-        _ = userLog("MouseDriver: shared magic mismatch\n");
+    if (screen_w_u64 == 0 or screen_h_u64 == 0) {
+        _ = userLog("MouseDriver: invalid config framebuffer size\n");
         while (true) asm volatile ("pause");
     }
-    const screen_w: i32 = @intCast(shared.width);
-    const screen_h: i32 = @intCast(shared.height);
+    initializeSharedPage(shared, screen_w_u64, screen_h_u64, screen_pitch_u64);
+    if (sendCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok and
+        sendCap(shared_page_paddr, endpoint_to_process1) != syscall_ok)
+    {
+        _ = userLog("MouseDriver: send shared cap failed\n");
+        while (true) asm volatile ("pause");
+    }
+    const screen_w: i32 = @intCast(screen_w_u64);
+    const screen_h: i32 = @intCast(screen_h_u64);
     var cursor_x: i32 = @intCast(shared.cursor_x);
     var cursor_y: i32 = @intCast(shared.cursor_y);
-    if (screen_w <= 0 or screen_h <= 0) {
-        _ = userLog("MouseDriver: invalid shared framebuffer size\n");
-        while (true) asm volatile ("pause");
-    }
 
     var last_used_idx: u16 = 0;
     var buttons_mask: u8 = 0;

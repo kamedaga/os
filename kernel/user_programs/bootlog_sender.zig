@@ -1,3 +1,5 @@
+const mouse_shared_abi = @import("mouse_shared_abi.zig");
+
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
@@ -8,9 +10,9 @@ const syscall_ok: u64 = 0;
 const shared_page_va: usize = 0x3C00_3000;
 const ipc_page_va: usize = 0x2000_B000;
 
-const shared_magic: u64 = 0x4D534852; // "MSHR"
-const shared_header_bytes: usize = 128;
-const shared_log_max_bytes: usize = 4096 - shared_header_bytes;
+const shared_magic: u64 = mouse_shared_abi.magic;
+const shared_header_bytes: usize = mouse_shared_abi.header_bytes;
+const shared_log_max_bytes: usize = mouse_shared_abi.log_capacity_bytes;
 
 const endpoint_to_process1: u64 = 0x11;
 const bootlog_ipc_magic: u64 = 0x424C4F47; // "BLOG"

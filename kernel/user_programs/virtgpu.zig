@@ -1,4 +1,5 @@
 const std = @import("std");
+const device_abi = @import("device_abi.zig");
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_queue_submit: u64 = 0xE;
@@ -300,6 +301,15 @@ fn queueNotify(token: u64, queue_index: u64) u64 {
           [arg0] "{rdi}" (token),
           [arg1] "{rsi}" (queue_cap_device_gpu),
           [arg2] "{rdx}" (queue_index),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn registerIommuDriver(device: device_abi.DeviceId) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (device_abi.syscall_register_iommu_driver),
+          [arg0] "{rdi}" (@intFromEnum(device)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -892,6 +902,7 @@ fn initInternal(prewarm: bool) bool {
     _ = _device_off;
     if (notify_off_multiplier == 0) return false;
     if (state.control_submit_token == 0 or state.control_notify_token == 0 or state.cursor_submit_token == 0 or state.cursor_notify_token == 0) return false;
+    if (registerIommuDriver(.virtio_gpu) != syscall_ok) return false;
     // Queue/control backing pages are process-local mappings. Reusing physical
     // addresses recorded by a different process corrupts the virtqueue state.
     if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return false;

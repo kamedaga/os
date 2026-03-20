@@ -7,6 +7,7 @@ pub const button_left: u64 = 0x1;
 pub const button_right: u64 = 0x2;
 pub const button_middle: u64 = 0x4;
 const max_coord_limit: u64 = 0x7FFF_FFFF;
+var current_shared_page_va: usize = shared_page_va;
 
 pub const Snapshot = struct {
     seq: u64,
@@ -122,8 +123,13 @@ fn decodeLimit(raw: u64) i32 {
     return @intCast(raw);
 }
 
+pub fn setSharedPageVa(va: u64) void {
+    if (va == 0) return;
+    current_shared_page_va = @intCast(va);
+}
+
 pub fn sharedPage() ?*const volatile MouseSharedPage {
-    const page: *const volatile MouseSharedPage = @ptrFromInt(shared_page_va);
+    const page: *const volatile MouseSharedPage = @ptrFromInt(current_shared_page_va);
     if (page.magic != shared_magic) return null;
     return page;
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
-const kernel = @import("kernel.zig");
-const scheduler = @import("scheduler.zig");
+const kernel = @import("../kernel.zig");
+const scheduler = @import("../scheduler.zig");
 
 pub const State = struct {
     user_enter_tick: u64 = 0,
@@ -20,8 +20,6 @@ pub const State = struct {
     virtgpu_queue_ready_tick: u64 = 0,
     mouse_demo_window_publish_after: bool = false,
     mouse_demo_window_publish_after_tick: u64 = 0,
-    keyboard_demo_window_publish_after: bool = false,
-    keyboard_demo_window_publish_after_tick: u64 = 0,
     compositor_window_cap_recv: bool = false,
     compositor_window_cap_recv_tick: u64 = 0,
     compositor_register_window_cap_done: bool = false,
@@ -92,14 +90,15 @@ pub fn flushTrace(writeFn: fn ([]const u8) void) void {
 }
 
 pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick: u64, writeFn: fn ([]const u8) void) void {
-    if (proc == .Process0 and containsBytes(message, "MouseDriver: started")) {
+    _ = proc;
+    if (containsBytes(message, "MouseDriver: started")) {
         if (!state.mouse_started) {
             state.mouse_started = true;
             state.mouse_start_tick = now_tick;
             recordEvent("mouse_started", state.mouse_start_tick, null);
         }
     }
-    if (proc == .Process0 and containsBytes(message, "MouseDriver: queue ready")) {
+    if (containsBytes(message, "MouseDriver: queue ready")) {
         if (!state.mouse_queue_ready) {
             state.mouse_queue_ready = true;
             state.mouse_queue_ready_tick = now_tick;
@@ -110,14 +109,14 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process3 and containsBytes(message, "KeyboardDriver: started")) {
+    if (containsBytes(message, "KeyboardDriver: started")) {
         if (!state.keyboard_started) {
             state.keyboard_started = true;
             state.keyboard_start_tick = now_tick;
             recordEvent("keyboard_started", state.keyboard_start_tick, null);
         }
     }
-    if (proc == .Process3 and containsBytes(message, "KeyboardDriver: queue ready")) {
+    if (containsBytes(message, "KeyboardDriver: queue ready")) {
         if (!state.keyboard_queue_ready) {
             state.keyboard_queue_ready = true;
             state.keyboard_queue_ready_tick = now_tick;
@@ -128,7 +127,7 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: virtgpu init start")) {
+    if (containsBytes(message, "Compositor: virtgpu init start")) {
         if (!state.virtgpu_init_started) {
             state.virtgpu_init_started = true;
             state.virtgpu_init_start_tick = now_tick;
@@ -139,7 +138,7 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: virtgpu queue ready")) {
+    if (containsBytes(message, "Compositor: virtgpu queue ready")) {
         if (!state.virtgpu_queue_ready) {
             state.virtgpu_queue_ready = true;
             state.virtgpu_queue_ready_tick = now_tick;
@@ -151,7 +150,7 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process2 and containsBytes(message, "MouseButtonDemo: createAndPublishWindow after")) {
+    if (containsBytes(message, "MouseButtonDemo: createAndPublishWindow after")) {
         if (!state.mouse_demo_window_publish_after) {
             state.mouse_demo_window_publish_after = true;
             state.mouse_demo_window_publish_after_tick = now_tick;
@@ -162,18 +161,7 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process4 and containsBytes(message, "KeyboardAsciiDemo: createAndPublishWindow after")) {
-        if (!state.keyboard_demo_window_publish_after) {
-            state.keyboard_demo_window_publish_after = true;
-            state.keyboard_demo_window_publish_after_tick = now_tick;
-            recordEvent(
-                "keyboard_demo_window_publish_after",
-                state.keyboard_demo_window_publish_after_tick,
-                if (state.virtgpu_queue_ready) state.keyboard_demo_window_publish_after_tick - state.virtgpu_queue_ready_tick else null,
-            );
-        }
-    }
-    if (proc == .Process1 and containsBytes(message, "Compositor: window cap recv")) {
+    if (containsBytes(message, "Compositor: window cap recv")) {
         if (!state.compositor_window_cap_recv) {
             state.compositor_window_cap_recv = true;
             state.compositor_window_cap_recv_tick = now_tick;
@@ -181,11 +169,11 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             recordEvent(
                 "compositor_window_cap_recv",
                 state.compositor_window_cap_recv_tick,
-                if (state.keyboard_demo_window_publish_after) state.compositor_window_cap_recv_tick - state.keyboard_demo_window_publish_after_tick else null,
+                if (state.mouse_demo_window_publish_after) state.compositor_window_cap_recv_tick - state.mouse_demo_window_publish_after_tick else null,
             );
         }
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: registerWindowCap done")) {
+    if (containsBytes(message, "Compositor: registerWindowCap done")) {
         if (!state.compositor_register_window_cap_done) {
             state.compositor_register_window_cap_done = true;
             state.compositor_register_window_cap_done_tick = now_tick;
@@ -196,7 +184,7 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: first compose done")) {
+    if (containsBytes(message, "Compositor: first compose done")) {
         if (!state.compositor_first_compose_done) {
             state.compositor_first_compose_done = true;
             state.compositor_first_compose_done_tick = now_tick;
@@ -208,15 +196,15 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: drag boost on")) {
+    if (containsBytes(message, "Compositor: drag boost on")) {
         scheduler.compositor_thread1_priority_active = true;
         scheduler.compositor_thread1_priority_streak = 0;
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: drag boost off")) {
+    if (containsBytes(message, "Compositor: drag boost off")) {
         scheduler.compositor_thread1_priority_active = false;
         scheduler.compositor_thread1_priority_streak = 0;
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: present transfer done")) {
+    if (containsBytes(message, "Compositor: present transfer done")) {
         if (!state.compositor_present_transfer_done) {
             state.compositor_present_transfer_done = true;
             state.compositor_present_transfer_done_tick = now_tick;
@@ -227,7 +215,7 @@ pub fn updateFromUserLog(proc: kernel.PrincipalId, message: []const u8, now_tick
             );
         }
     }
-    if (proc == .Process1 and containsBytes(message, "Compositor: present flush done")) {
+    if (containsBytes(message, "Compositor: present flush done")) {
         if (!state.compositor_present_flush_done) {
             state.compositor_present_flush_done = true;
             state.compositor_present_flush_done_tick = now_tick;

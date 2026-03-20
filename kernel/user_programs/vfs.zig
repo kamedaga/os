@@ -14,11 +14,13 @@ const page_right_cpu_write: u64 = 0x2;
 
 const vfs_config_va: usize = 0x3C00_2000;
 const vfs_boot_config_magic: u64 = 0x5646_5343; // "VFSC"
-const vfs_boot_config_version: u64 = 1;
+const vfs_boot_config_version: u64 = 2;
 const vfs_boot_config_flag_bootfs_present: u64 = 1 << 0;
 const fs_cap_token_tag: u64 = 1 << 63;
 const bootfs_root_object_id: u64 = 1;
 const bootfs_image_va: usize = 0x3C08_0000;
+const bootfs_probe_va: usize = 0x3C02_0000;
+const bootfs_read_window_va: usize = 0x3C03_0000;
 const session_base_va: u64 = 0x3C01_0000;
 const session_va_stride: u64 = 0x2000;
 const session_poll_timeout_ticks: u64 = 1;
@@ -33,7 +35,7 @@ const ResolvedKind = enum(u8) {
 const BootState = struct {
     endpoint_id: u64 = 0,
     root_mount_token: u64 = 0,
-    bootfs_paddr: u64 = 0,
+    bootfs_vm_token: u64 = 0,
     bootfs_size_bytes: u64 = 0,
     flags: u64 = 0,
 };
@@ -91,6 +93,7 @@ const Session = struct {
 
 var boot_state: BootState = .{};
 var boot_state_ready = false;
+var bootfs_mapped_prefix_bytes: u64 = 0;
 var sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions;
 
 fn userLog(message: []const u8) u64 {
@@ -101,6 +104,29 @@ fn userLog(message: []const u8) u64 {
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn userLogHex(label: []const u8, value: u64) void {
+    var buf: [96]u8 = undefined;
+    var len: usize = 0;
+    while (len < label.len and len < buf.len) : (len += 1) {
+        buf[len] = label[len];
+    }
+    if (len + 19 >= buf.len) return;
+    buf[len] = '0';
+    buf[len + 1] = 'x';
+    len += 2;
+    var shift: u6 = 60;
+    while (true) {
+        const nibble: u8 = @intCast((value >> shift) & 0xF);
+        buf[len] = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
+        len += 1;
+        if (shift == 0) break;
+        shift -= 4;
+    }
+    buf[len] = '\n';
+    len += 1;
+    _ = userLog(buf[0..len]);
 }
 
 fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
@@ -121,6 +147,28 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn mapVmObject(token: u64, target_va: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (image_abi.syscall_map_vm_object),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (target_va),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn sliceVmObject(token: u64, offset_bytes: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (image_abi.syscall_slice_vm_object),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (offset_bytes),
+          [arg2] "{rdx}" (size_bytes),
+          [arg3] "{rcx}" (image_abi.vmObjectRightsToBits(rights)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -194,11 +242,10 @@ fn parseBootState() ?BootState {
     const cfg: [*]const volatile u64 = @ptrFromInt(vfs_config_va);
     if (cfg[0] != vfs_boot_config_magic) return null;
     if (cfg[1] != vfs_boot_config_version) return null;
-    if (!isFsCapToken(cfg[3])) return null;
     return .{
         .endpoint_id = cfg[2],
         .root_mount_token = cfg[3],
-        .bootfs_paddr = cfg[4],
+        .bootfs_vm_token = cfg[4],
         .bootfs_size_bytes = cfg[5],
         .flags = cfg[6],
     };
@@ -227,6 +274,69 @@ fn bootfsHeader() ?*const bootfs_format.BootFsHeader {
     if (header.string_table_offset + header.string_table_bytes > header.image_bytes) return null;
     if (header.data_offset + header.data_bytes > header.image_bytes) return null;
     return header;
+}
+
+fn alignUpToPageBytes(size_bytes: u64) u64 {
+    return (size_bytes + vfs_protocol.page_bytes - 1) & ~@as(u64, vfs_protocol.page_bytes - 1);
+}
+
+fn ensureBootFsPrefixMapped(required_end_bytes: u64) bool {
+    if ((boot_state.flags & vfs_boot_config_flag_bootfs_present) == 0) return true;
+    const vm_token = boot_state.bootfs_vm_token;
+    _ = image_abi.decodeVmObjectToken(vm_token) orelse {
+        _ = userLog("VFS: bootfs prefix decode failed\n");
+        return false;
+    };
+    const capped_end = @min(required_end_bytes, boot_state.bootfs_size_bytes);
+    if (capped_end == 0) {
+        _ = userLog("VFS: bootfs prefix zero bytes\n");
+        return false;
+    }
+    if (capped_end <= bootfs_mapped_prefix_bytes) return true;
+    const prefix_token = sliceVmObject(vm_token, 0, capped_end, .{ .read = true, .map = true });
+    if (image_abi.decodeVmObjectToken(prefix_token) == null) {
+        _ = userLog("VFS: bootfs prefix slice failed\n");
+        userLogHex("VFS: bootfs prefix slice ret=", prefix_token);
+        return false;
+    }
+    const map_ret = mapVmObject(prefix_token, bootfs_image_va);
+    if (map_ret != syscall_ok) {
+        _ = userLog("VFS: bootfs prefix map failed\n");
+        userLogHex("VFS: bootfs prefix map ret=", map_ret);
+        return false;
+    }
+    bootfs_mapped_prefix_bytes = capped_end;
+    return true;
+}
+
+fn ensureBootFsMetadataMapped() bool {
+    if (!ensureBootFsPrefixMapped(vfs_protocol.page_bytes)) return false;
+    const header = bootfsHeader() orelse {
+        _ = userLog("VFS: bootfs header invalid after prefix map\n");
+        return false;
+    };
+    var metadata_end = @as(u64, @sizeOf(bootfs_format.BootFsHeader));
+    metadata_end = @max(metadata_end, header.entry_table_offset + header.entry_bytes);
+    metadata_end = @max(metadata_end, header.string_table_offset + header.string_table_bytes);
+    if (!ensureBootFsPrefixMapped(metadata_end)) {
+        _ = userLog("VFS: bootfs metadata prefix map failed\n");
+        return false;
+    }
+    return true;
+}
+
+fn mapBootFsWindow(file_offset: u64, length: usize, target_va: usize) ?[]const u8 {
+    if (length == 0) return &[_]u8{};
+    const vm_token = boot_state.bootfs_vm_token;
+    _ = image_abi.decodeVmObjectToken(vm_token) orelse return null;
+    const aligned_offset = file_offset & ~@as(u64, 0xFFF);
+    const in_page_offset: usize = @intCast(file_offset - aligned_offset);
+    const window_bytes = @as(u64, @intCast(in_page_offset + length));
+    const window_token = sliceVmObject(vm_token, aligned_offset, window_bytes, .{ .read = true, .map = true });
+    if (image_abi.decodeVmObjectToken(window_token) == null) return null;
+    if (mapVmObject(window_token, target_va) != syscall_ok) return null;
+    const src: [*]const u8 = @ptrFromInt(target_va + in_page_offset);
+    return src[0..length];
 }
 
 fn bootfsEntries(header: *const bootfs_format.BootFsHeader) []const bootfs_format.BootFsEntry {
@@ -409,10 +519,100 @@ fn runBootSelfTest(state: *const BootState) bool {
     }
     _ = userLog("VFS: self-test stat / dir ok\n");
 
-    if ((state.flags & vfs_boot_config_flag_bootfs_present) != 0) {
+    if ((state.flags & vfs_boot_config_flag_bootfs_present) != 0 and bootfsHeader() != null) {
         _ = userLog("VFS: bootfs handoff present\n");
     } else {
         _ = userLog("VFS: bootfs handoff absent\n");
+    }
+    return true;
+}
+
+fn bootfsExpectedPageCount(state: *const BootState) usize {
+    if ((state.flags & vfs_boot_config_flag_bootfs_present) == 0) return 0;
+    if (state.bootfs_size_bytes == 0) return 0;
+    return @intCast((state.bootfs_size_bytes + vfs_protocol.page_bytes - 1) / vfs_protocol.page_bytes);
+}
+
+fn waitForBootResources() bool {
+    var root_ready = false;
+    var bootfs_ready = (boot_state.flags & vfs_boot_config_flag_bootfs_present) == 0;
+    var bootfs_token_ready = false;
+
+    if (isFsCapToken(boot_state.root_mount_token)) {
+        root_ready = true;
+        _ = userLog("VFS: root mount token ready\n");
+    } else {
+        _ = userLog("VFS: root mount token pending\n");
+    }
+    if ((boot_state.flags & vfs_boot_config_flag_bootfs_present) != 0 and image_abi.decodeVmObjectToken(boot_state.bootfs_vm_token) != null) {
+        bootfs_token_ready = true;
+        _ = userLog("VFS: bootfs vm token ready\n");
+        _ = userLog("VFS: bootfs metadata map begin\n");
+        if (!ensureBootFsMetadataMapped()) {
+            _ = userLog("VFS: bootfs metadata map failed\n");
+            return false;
+        }
+        _ = userLog("VFS: bootfs metadata map done\n");
+        bootfs_ready = bootfsHeader() != null;
+    }
+    if ((boot_state.flags & vfs_boot_config_flag_bootfs_present) != 0 and bootfs_ready) {
+        _ = userLog("VFS: bootfs handoff present\n");
+    } else if ((boot_state.flags & vfs_boot_config_flag_bootfs_present) == 0) {
+        _ = userLog("VFS: bootfs handoff absent\n");
+    }
+
+    var spin: usize = 0;
+    while (spin < 200000 and (!root_ready or !bootfs_ready)) : (spin += 1) {
+        asm volatile ("pause");
+        boot_state = parseBootState() orelse continue;
+        if (!root_ready and isFsCapToken(boot_state.root_mount_token)) {
+            root_ready = true;
+            _ = userLog("VFS: root mount token ready\n");
+        }
+        if (!bootfs_ready and (boot_state.flags & vfs_boot_config_flag_bootfs_present) != 0 and image_abi.decodeVmObjectToken(boot_state.bootfs_vm_token) != null) {
+            if (!bootfs_token_ready) {
+                bootfs_token_ready = true;
+                _ = userLog("VFS: bootfs vm token ready\n");
+            }
+            _ = userLog("VFS: bootfs metadata map begin\n");
+            if (!ensureBootFsMetadataMapped()) {
+                _ = userLog("VFS: bootfs metadata map failed\n");
+                return false;
+            }
+            _ = userLog("VFS: bootfs metadata map done\n");
+            if (bootfsHeader() != null) {
+                bootfs_ready = true;
+                _ = userLog("VFS: bootfs handoff present\n");
+            }
+        }
+    }
+
+    while (!root_ready or !bootfs_ready) {
+        _ = waitEvent(false, session_poll_timeout_ticks);
+        boot_state = parseBootState() orelse {
+            _ = userLog("VFS: config lost during bootstrap\n");
+            return false;
+        };
+        if (!root_ready and isFsCapToken(boot_state.root_mount_token)) {
+            root_ready = true;
+            _ = userLog("VFS: root mount token ready\n");
+        }
+        if (!bootfs_ready and (boot_state.flags & vfs_boot_config_flag_bootfs_present) != 0 and image_abi.decodeVmObjectToken(boot_state.bootfs_vm_token) != null) {
+            if (!bootfs_token_ready) {
+                bootfs_token_ready = true;
+                _ = userLog("VFS: bootfs vm token ready\n");
+            }
+            _ = userLog("VFS: bootfs metadata map begin\n");
+            if (!ensureBootFsMetadataMapped()) {
+                _ = userLog("VFS: bootfs metadata map failed\n");
+                return false;
+            }
+            _ = userLog("VFS: bootfs metadata map done\n");
+            if (bootfsHeader() != null) {
+                bootfs_ready = true;
+                _ = userLog("VFS: bootfs handoff present\n");
+            }
+        }
     }
     return true;
 }
@@ -731,8 +931,9 @@ fn grantOpenFileToken(session: *Session, node: ResolvedNode) ?u64 {
 
 fn grantExecToken(session: *Session, node: ResolvedNode) ?u64 {
     const file_data = bootfsFileData(node.abs_path) orelse return null;
-    const server_vm_token = installVmObject(
-        bootfs_image_va + file_data.data_offset,
+    const server_vm_token = sliceVmObject(
+        boot_state.bootfs_vm_token,
+        file_data.data_offset,
         file_data.data_bytes,
         .{ .read = true },
     );
@@ -747,7 +948,7 @@ fn grantExecToken(session: *Session, node: ResolvedNode) ?u64 {
 fn bootfsFileHasElfMagic(node: ResolvedNode) bool {
     const file_data = bootfsFileData(node.abs_path) orelse return false;
     if (file_data.data_bytes < 4) return false;
-    const src: [*]const u8 = @ptrFromInt(bootfs_image_va + @as(usize, @intCast(file_data.data_offset)));
+    const src = mapBootFsWindow(file_data.data_offset, 4, bootfs_probe_va) orelse return false;
     return src[0] == 0x7F and src[1] == 'E' and src[2] == 'L' and src[3] == 'F';
 }
 
@@ -898,8 +1099,11 @@ fn handleRead(session: *Session, request_seq: u64) void {
         @min(remaining, @as(u64, @intCast(vfs_protocol.response_payload_bytes))),
     );
     const copy_len: usize = @intCast(copy_len_u64);
-    const src: [*]const u8 = @ptrFromInt(bootfs_image_va + @as(usize, @intCast(file_data.data_offset + read_offset)));
-    replyRead(session, request_seq, request.offset, file_data.data_bytes, src[0..copy_len]);
+    const src = mapBootFsWindow(file_data.data_offset + read_offset, copy_len, bootfs_read_window_va) orelse {
+        replyStatus(session, .read, request_seq, .io_error);
+        return;
+    };
+    replyRead(session, request_seq, request.offset, file_data.data_bytes, src);
 }
 
 fn handleReaddir(session: *Session, request_seq: u64) void {
@@ -1032,9 +1236,10 @@ pub export fn _start() noreturn {
     if (boot_state.endpoint_id != 0) {
         _ = userLog("VFS: endpoint ready\n");
     }
-    if (isFsCapToken(boot_state.root_mount_token)) {
-        _ = userLog("VFS: root mount token ready\n");
-    } else {
+    if (!waitForBootResources()) {
+        haltForever();
+    }
+    if (!isFsCapToken(boot_state.root_mount_token)) {
         _ = userLog("VFS: root mount token missing\n");
         haltForever();
     }

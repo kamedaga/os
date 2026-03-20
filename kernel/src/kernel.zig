@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const capability = @import("capability.zig");
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
+const device_abi = @import("abi/device_abi.zig");
 const debug_window_force_free_list = true;
 
 pub const initial_process_count: usize = 8;
@@ -74,9 +75,11 @@ pub fn principalLabel(principal: PrincipalId) []const u8 {
 }
 
 pub const endpoint_to_process0: u64 = 0x10;
-pub const endpoint_to_process1: u64 = 0x11;
+pub const endpoint_to_boot_display: u64 = 0x11;
+pub const endpoint_to_process1: u64 = endpoint_to_boot_display;
 pub const endpoint_to_process2: u64 = 0x12;
 pub const endpoint_to_vfs: u64 = 0x13;
+pub const endpoint_to_spawn_parent: u64 = 0x14;
 
 fn isProcessPrincipal(principal: PrincipalId) bool {
     return processIndexFromPrincipal(principal) != null;
@@ -402,6 +405,30 @@ pub const ImageBacking = struct {
             backing.page_paddrs[i] = paddr;
         }
         return backing;
+    }
+
+    fn slice(self: *const ImageBacking, offset_bytes: u64, size_bytes: u64) ?ImageBacking {
+        if (size_bytes == 0) return null;
+        const end_bytes, const overflow = @addWithOverflow(offset_bytes, size_bytes);
+        if (overflow != 0 or end_bytes > self.size_bytes) return null;
+
+        const absolute_start = @as(u64, self.page_offset_bytes) + offset_bytes;
+        const start_page_index: usize = @intCast(absolute_start / 4096);
+        const start_page_offset: u16 = @intCast(absolute_start % 4096);
+        if (start_page_index >= self.page_count) return null;
+
+        const first_page_bytes = @as(u64, 4096 - start_page_offset);
+        const remaining_after_first = if (size_bytes > first_page_bytes) size_bytes - first_page_bytes else 0;
+        const extra_pages: usize = if (remaining_after_first == 0) 0 else @intCast((remaining_after_first + 4095) / 4096);
+        const page_count = 1 + extra_pages;
+        if (start_page_index + page_count > self.page_count) return null;
+
+        var page_paddrs: [max_image_backing_pages]u64 = [_]u64{0} ** max_image_backing_pages;
+        var i: usize = 0;
+        while (i < page_count) : (i += 1) {
+            page_paddrs[i] = self.page_paddrs[start_page_index + i];
+        }
+        return ImageBacking.init(page_paddrs[0..page_count], start_page_offset, size_bytes);
     }
 };
 
@@ -873,6 +900,7 @@ const IommuNoCapDriverState = struct {
 
     mode: IommuNoCapDriverMode = .off,
     mappings: [max_mappings]IommuMapEntry = [_]IommuMapEntry{.{}} ** max_mappings,
+    principal_devices: [principal_count]?IommuDevice = [_]?IommuDevice{null} ** principal_count,
 };
 
 pub const KernelState = struct {
@@ -956,6 +984,7 @@ pub const KernelState = struct {
         self.iommu.mode = mode;
         if (mode == .off) {
             self.iommu.mappings = [_]IommuMapEntry{.{}} ** IommuNoCapDriverState.max_mappings;
+            self.iommu.principal_devices = [_]?IommuDevice{null} ** principal_count;
         }
     }
 
@@ -963,12 +992,21 @@ pub const KernelState = struct {
         return self.iommu.mode;
     }
 
-    fn iommuDeviceForPrincipal(principal: PrincipalId) ?IommuDevice {
-        return switch (principal) {
-            .Process1 => .virtio_gpu,
-            .Process0, .Process3 => .virtio_input,
-            else => null,
+    fn iommuDeviceFromDmaDeviceId(device: DmaDeviceId) IommuDevice {
+        const abi_device: device_abi.DeviceId = switch (device) {
+            .virtio_gpu => .virtio_gpu,
+            .virtio_input => .virtio_input,
         };
+        return switch (abi_device) {
+            .virtio_gpu => .virtio_gpu,
+            .virtio_input => .virtio_input,
+        };
+    }
+
+    fn iommuDeviceForPrincipal(self: *const KernelState, principal: PrincipalId) ?IommuDevice {
+        const index = @intFromEnum(principal);
+        if (index >= self.iommu.principal_devices.len) return null;
+        return self.iommu.principal_devices[index];
     }
 
     fn iommuFindMappingIndex(self: *const KernelState, device: IommuDevice, paddr: u64) ?usize {
@@ -1023,7 +1061,7 @@ pub const KernelState = struct {
 
     noinline fn syncIommuForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64, reason: IommuSyncReason) KernelError!void {
         if (self.iommu.mode == .off) return;
-        const device = iommuDeviceForPrincipal(principal) orelse return;
+        const device = self.iommuDeviceForPrincipal(principal) orelse return;
         const had_mapping = self.iommuFindMappingIndex(device, paddr) != null;
         const cap = self.getTableConst(principal).find(paddr);
         if (cap) |c| {
@@ -1046,8 +1084,38 @@ pub const KernelState = struct {
     }
 
     pub fn iommuHasMappingForPrincipalForTest(self: *const KernelState, principal: PrincipalId, paddr: u64) bool {
-        const device = iommuDeviceForPrincipal(principal) orelse return false;
+        const device = self.iommuDeviceForPrincipal(principal) orelse return false;
         return self.iommuFindMappingIndex(device, paddr) != null;
+    }
+
+    fn unmapAllIommuForPrincipalDevice(self: *KernelState, principal: PrincipalId, device: IommuDevice) void {
+        const table = self.getTableConst(principal);
+        var i: usize = 0;
+        while (i < table.len) : (i += 1) {
+            const cap = table.caps[i];
+            if (!cap.rights.dma) continue;
+            self.iommuUnmap(device, cap.paddr);
+        }
+    }
+
+    fn syncAllIommuForPrincipal(self: *KernelState, principal: PrincipalId, reason: IommuSyncReason) KernelError!void {
+        const table = self.getTableConst(principal);
+        var i: usize = 0;
+        while (i < table.len) : (i += 1) {
+            try self.syncIommuForPrincipalPaddr(principal, table.caps[i].paddr, reason);
+        }
+    }
+
+    pub fn registerIommuNoCapDriver(self: *KernelState, principal: PrincipalId, device: DmaDeviceId) KernelError!void {
+        try self.requireActiveProcess(principal);
+        const index = @intFromEnum(principal);
+        const new_device = iommuDeviceFromDmaDeviceId(device);
+        const old_device = self.iommu.principal_devices[index];
+        if (old_device != null and old_device.? != new_device) {
+            self.unmapAllIommuForPrincipalDevice(principal, old_device.?);
+        }
+        self.iommu.principal_devices[index] = new_device;
+        try self.syncAllIommuForPrincipal(principal, .grant_dma);
     }
 
     pub fn allocWindowSlot(self: *KernelState) ?usize {
@@ -1636,6 +1704,26 @@ pub const KernelState = struct {
         };
     }
 
+    pub fn grantQueueCapStage2(
+        self: *KernelState,
+        owner: PrincipalId,
+        child: PrincipalId,
+        token: u64,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(owner);
+        try self.requireActiveProcess(child);
+        return self.queue_caps.grant(
+            @intFromEnum(owner),
+            @intFromEnum(child),
+            token,
+        ) catch |err| switch (err) {
+            error.NotFound => return KernelError.CapabilityNotFound,
+            error.Denied => return KernelError.InvalidState,
+            error.InvalidState => return KernelError.InvalidState,
+            error.TableFull => return KernelError.TableFull,
+        };
+    }
+
     pub fn getRegion(self: *KernelState, region_id: u64) ?*Region {
         var i: usize = 0;
         while (i < self.region_len) : (i += 1) {
@@ -1711,6 +1799,15 @@ pub const KernelState = struct {
 
     pub fn getFsTableConst(self: *const KernelState, principal: PrincipalId) *const FsCNode {
         return &self.fs_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn hasFsAdminCap(self: *const KernelState, principal: PrincipalId) bool {
+        const table = self.getFsTableConst(principal);
+        var i: usize = 0;
+        while (i < table.len) : (i += 1) {
+            if (table.caps[i].rights.admin) return true;
+        }
+        return false;
     }
 
     pub fn getVmObjectTable(self: *KernelState, principal: PrincipalId) *VmObjectCNode {
@@ -1894,6 +1991,31 @@ pub const KernelState = struct {
         const child_id = self.allocCapId();
         try self.getVmObjectTable(to).add(.{
             .backing = src_cap.backing,
+            .rights = rights,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
+        return child_id;
+    }
+
+    pub fn deriveVmObjectCap(
+        self: *KernelState,
+        owner: PrincipalId,
+        cap_id: u64,
+        offset_bytes: u64,
+        size_bytes: u64,
+        rights: VmObjectRights,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(owner);
+
+        const src_cap = self.getVmObjectTableConst(owner).findByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
+        if (!isVmObjectRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+        const backing = src_cap.backing.slice(offset_bytes, size_bytes) orelse return KernelError.InvalidState;
+
+        const child_id = self.allocCapId();
+        try self.getVmObjectTable(owner).add(.{
+            .backing = backing,
             .rights = rights,
             .cap_id = child_id,
             .root_cap_id = src_cap.root_cap_id,
@@ -2426,6 +2548,30 @@ pub const KernelState = struct {
         }
     }
 
+    pub fn grantCapOnEndpoint(
+        self: *KernelState,
+        from: PrincipalId,
+        endpoint_id: u64,
+        paddr: u64,
+        rights: Rights,
+    ) KernelError!void {
+        try self.requireActiveProcess(from);
+        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
+        try self.grantCap(from, target, paddr, rights);
+    }
+
+    pub fn grantCapsBatchOnEndpoint(
+        self: *KernelState,
+        from: PrincipalId,
+        endpoint_id: u64,
+        paddrs: []const u64,
+        rights: Rights,
+    ) KernelError!void {
+        try self.requireActiveProcess(from);
+        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
+        try self.grantCapsBatch(from, target, paddrs, rights);
+    }
+
     pub fn sendCap(
         self: *KernelState,
         from: PrincipalId,
@@ -2882,6 +3028,7 @@ test "sendCapOnEndpoint requires endpoint capability" {
 test "iommu no-cap-driver shadow maps dma grant to compositor" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
+    try s.registerIommuNoCapDriver(.Process1, .virtio_gpu);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
@@ -2897,6 +3044,7 @@ test "iommu no-cap-driver shadow maps dma grant to compositor" {
 test "iommu no-cap-driver does not map non-dma grant" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
+    try s.registerIommuNoCapDriver(.Process1, .virtio_gpu);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
@@ -2904,6 +3052,21 @@ test "iommu no-cap-driver does not map non-dma grant" {
         .dma = false,
     });
     try std.testing.expect(!s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+}
+
+test "iommu driver registration syncs existing dma grant" {
+    var s = KernelState.initPhase1();
+    s.setIommuNoCapDriverMode(.shadow);
+
+    try s.grantCap(.Process0, .Process1, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = true,
+    });
+    try std.testing.expect(!s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+
+    try s.registerIommuNoCapDriver(.Process1, .virtio_gpu);
+    try std.testing.expect(s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
 }
 
 test "sendCapOnEndpoint rejects missing endpoint" {

@@ -10,7 +10,6 @@ const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
 const debug_skip_syscall_fx_state = true;
 const debug_skip_timer_fx_state = true;
-const enable_process5_frame_debug_logs = false;
 const trap_frame_qword_count = @sizeOf(TrapFrame) / @sizeOf(u64);
 const exception_trap_frame_qword_count = @sizeOf(ExceptionTrapFrame) / @sizeOf(u64);
 const user_return_gpr_qword_count = @offsetOf(TrapFrame, "rip") / @sizeOf(u64);
@@ -43,8 +42,6 @@ pub const Hooks = struct {
 };
 
 var hooks: ?Hooks = null;
-var process5_frame_log_count: u64 = 0;
-const process5_frame_log_max: u64 = 128;
 pub export var timer_entry_saved_rax: u64 = 0;
 pub export var timer_entry_pushed_rax: u64 = 0;
 pub export var timer_stack_rax_post_dispatch: u64 = 0;
@@ -147,150 +144,9 @@ fn writeByteHex(h: *const Hooks, byte: u8) void {
     h.write(buf[0..]);
 }
 
-fn logProcess5RipBytes(h: *const Hooks, rip: u64, label: []const u8, before: usize, after: usize) void {
-    if (rip < 0x20000000) return;
-    const rip_page_va = rip & ~@as(u64, 0xFFF);
-    const rip_page_paddr = capability.lookupUserMappedPaddrForVa(.Process5, rip_page_va);
-    if (rip_page_paddr) |page_paddr| {
-        const page_bytes: [*]const u8 = @ptrFromInt(page_paddr);
-        const rip_off: usize = @intCast(rip & 0xFFF);
-        const start_off: usize = rip_off -| before;
-        const end_off: usize = @min(rip_off + after, 4095);
+pub export fn logTimerReturnFrame(_: *const TrapFrame) callconv(.c) void {}
 
-        h.write("  ");
-        h.write(label);
-        h.write("=");
-        var off: usize = start_off;
-        while (off <= end_off) : (off += 1) {
-            if (off != start_off) h.write(" ");
-            writeByteHex(h, page_bytes[off]);
-        }
-        h.write("\n");
-    }
-}
-
-fn logProcess5StackQwords(h: *const Hooks, rsp: u64, label: []const u8, max_qwords: usize) void {
-    const stack_page_va = rsp & ~@as(u64, 0xFFF);
-    const stack_page_paddr = capability.lookupUserMappedPaddrForVa(.Process5, stack_page_va);
-    h.write("  ");
-    h.write(label);
-    h.write("_PAGE=");
-    if (stack_page_paddr) |paddr| {
-        h.write_hex_raw(paddr);
-        h.write("\n");
-
-        const page_words: [*]const u64 = @ptrFromInt(paddr);
-        const word_off: usize = @intCast((rsp & 0xFFF) / @sizeOf(u64));
-        const words_left = 512 - word_off;
-        const count: usize = @min(max_qwords, words_left);
-
-        h.write("  ");
-        h.write(label);
-        h.write("=");
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            if (i != 0) h.write(" ");
-            h.write_hex_raw(page_words[word_off + i]);
-        }
-        h.write("\n");
-    } else {
-        h.write("none\n");
-    }
-}
-
-fn logProcess5FaultBytes(h: *const Hooks, frame: *const ExceptionTrapFrame) void {
-    if (scheduler.current_user_principal != .Process5) return;
-    if (frame.rip < 0x20000000) return;
-
-    const rip_page_va = frame.rip & ~@as(u64, 0xFFF);
-    const rip_page_paddr = capability.lookupUserMappedPaddrForVa(.Process5, rip_page_va);
-    const vfb_page_paddr = capability.lookupUserMappedPaddrForVa(.Process5, 0x2030_0000);
-
-    h.write("  PROC5.RIP_PAGE=");
-    if (rip_page_paddr) |paddr| {
-        h.write_hex_raw(paddr);
-    } else {
-        h.write("none");
-    }
-    h.write("\n");
-
-    h.write("  PROC5.VFB_PAGE=");
-    if (vfb_page_paddr) |paddr| {
-        h.write_hex_raw(paddr);
-    } else {
-        h.write("none");
-    }
-    h.write("\n");
-
-    logProcess5RipBytes(h, frame.rip, "PROC5.RIP_BYTES", 8, 8);
-    logProcess5RipBytes(h, frame.rip, "PROC5.RIP_BYTES_WIDE", 24, 8);
-}
-
-fn maybeLogProcess5Frame(stage: []const u8, principal: kernel.PrincipalId, frame: *const TrapFrame) void {
-    if (!enable_process5_frame_debug_logs) return;
-    if (principal != .Process5) return;
-    if (frame.rip < 0x20001810 or frame.rip > 0x20001832) return;
-    if (process5_frame_log_count >= process5_frame_log_max) return;
-    if (!std.mem.eql(u8, stage, "timer-ret") and !std.mem.eql(u8, stage, "staged-ret")) return;
-    process5_frame_log_count +%= 1;
-
-    const h = getHooks();
-    h.write("PROC5 frame ");
-    h.write(stage);
-    h.write("\n");
-    writeReg(h, "RIP", frame.rip);
-    writeReg(h, "ENTRY_RAX", timer_entry_saved_rax);
-    writeReg(h, "PUSHED_RAX", timer_entry_pushed_rax);
-    writeReg(h, "STACK_RAX_POST_DISPATCH", timer_stack_rax_post_dispatch);
-    writeReg(h, "STACK_RAX_PRE_LOG", timer_stack_rax_pre_log);
-    writeReg(h, "STAGE_SRC_RIP", last_stage_source_rip);
-    writeReg(h, "STAGE_SRC_RAX", last_stage_source_rax);
-    writeReg(h, "STAGE_SAVED_RIP", last_stage_saved_rip);
-    writeReg(h, "STAGE_SAVED_RAX", last_stage_saved_rax);
-    writeReg(h, "LAST_IRET_RIP", last_user_return_rip);
-    writeReg(h, "LAST_IRET_RAX", last_user_return_rax);
-    writeReg(h, "RAX", frame.rax);
-    writeReg(h, "RDI", frame.rdi);
-    writeReg(h, "RSI", frame.rsi);
-    writeReg(h, "RDX", frame.rdx);
-    writeReg(h, "RCX", frame.rcx);
-    writeReg(h, "R8", frame.r8);
-    writeReg(h, "R9", frame.r9);
-    writeReg(h, "RSP", frame.rsp);
-    if (frame.rax == 0) {
-        logProcess5RipBytes(h, frame.rip, "PROC5.TIMER_RIP_BYTES_WIDE", 24, 8);
-        logProcess5StackQwords(h, frame.rsp, "PROC5.STACK_QWORDS", 8);
-    }
-}
-
-pub export fn logTimerReturnFrame(frame: *const TrapFrame) callconv(.c) void {
-    maybeLogProcess5Frame("timer-ret", scheduler.current_user_principal, frame);
-}
-
-pub export fn logCurrentStagedUserReturnFrame() callconv(.c) void {
-    var frame: TrapFrame = std.mem.zeroes(TrapFrame);
-    frame.r15 = user_return_saved_gprs[0];
-    frame.r14 = user_return_saved_gprs[1];
-    frame.r13 = user_return_saved_gprs[2];
-    frame.r12 = user_return_saved_gprs[3];
-    frame.r11 = user_return_saved_gprs[4];
-    frame.r10 = user_return_saved_gprs[5];
-    frame.r9 = user_return_saved_gprs[6];
-    frame.r8 = user_return_saved_gprs[7];
-    frame.rbp = user_return_saved_gprs[8];
-    frame.rdi = user_return_saved_gprs[9];
-    frame.rsi = user_return_saved_gprs[10];
-    frame.rdx = user_return_saved_gprs[11];
-    frame.rcx = user_return_saved_gprs[12];
-    frame.rbx = user_return_saved_gprs[13];
-    frame.rax = user_return_saved_gprs[14];
-    frame.rip = user_return_iret_frame[0];
-    frame.cs = user_return_iret_frame[1];
-    frame.rflags = user_return_iret_frame[2];
-    frame.rsp = user_return_iret_frame[3];
-    frame.ss = user_return_iret_frame[4];
-    maybeLogProcess5Frame("staged-ret", scheduler.current_user_principal, &frame);
-}
+pub export fn logCurrentStagedUserReturnFrame() callconv(.c) void {}
 
 pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
     asm volatile (
@@ -370,12 +226,6 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
     writeReg(h, "R9", frame.r9);
     writeReg(h, "RBP", frame.rbp);
     writeReg(h, "RSP", frame.rsp);
-    if (vec == 14) {
-        logProcess5FaultBytes(h, frame);
-        if (scheduler.current_user_principal == .Process5 and frame.rax == 0) {
-            logProcess5StackQwords(h, frame.rsp, "PROC5.STACK_QWORDS", 8);
-        }
-    }
     h.halt_loop();
 }
 

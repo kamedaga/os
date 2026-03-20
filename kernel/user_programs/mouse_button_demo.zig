@@ -1,5 +1,7 @@
+const mouse_demo_bootstrap = @import("mouse_demo_bootstrap_abi.zig");
 const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
+const process_abi = @import("process_abi.zig");
 const mouse_input = @import("mouse_input.zig");
 const window_client = @import("window_client.zig");
 
@@ -71,6 +73,16 @@ fn drawMousePanel(vfb: [*]volatile u32, buttons: u64) void {
 }
 
 pub export fn _start() noreturn {
+    const cfg: [*]const volatile u64 = @ptrFromInt(process_abi.standard_config_target_va);
+    if (cfg[0] != mouse_demo_bootstrap.config_magic or cfg[1] != mouse_demo_bootstrap.config_version) {
+        _ = userLog("MouseButtonDemo: config magic mismatch\n");
+        while (true) asm volatile ("pause");
+    }
+    mouse_input.setSharedPageVa(cfg[3]);
+    if (!window_client.initServiceBindingFromRegistryPage(cfg[2])) {
+        _ = userLog("MouseButtonDemo: window service bind failed\n");
+        while (true) asm volatile ("pause");
+    }
     _ = userLog("MouseButtonDemo: started\n");
 
     if (mouse_input.sharedPage() == null) {

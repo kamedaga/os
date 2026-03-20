@@ -1,0 +1,9 @@
+# role path
+vfs /boot/vfs.elf
+keyboard_driver /bin/keyboard_driver.elf
+mouse_driver /bin/mouse_driver.elf
+terminal_window /bin/terminal_window.elf
+taskbar /bin/taskbar.elf
+mouse_button_demo /bin/mouse_button_demo.elf
+compositor /bin/compositor.elf
+gpu_compositor /bin/gpu_compositor.elf

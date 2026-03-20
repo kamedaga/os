@@ -3,7 +3,6 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/kernel.zig"),
         .target = target,
@@ -39,37 +38,6 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
         .abi = .none,
     });
-    const user_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/pie_user.zig"),
-        .target = user_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    user_mod.strip = true;
-    const user_app = b.addExecutable(.{
-        .name = "USERAPP",
-        .root_module = user_mod,
-    });
-    user_app.addIncludePath(b.path("../user/libcapc"));
-    user_app.addCSourceFile(.{
-        .file = b.path("../user/libcapc/capc.c"),
-        .flags = &.{},
-    });
-    user_app.addCSourceFile(.{
-        .file = b.path("../user/libcapc/cap_errno.c"),
-        .flags = &.{},
-    });
-    user_app.pie = true;
-    user_app.entry = .{ .symbol_name = "_start" };
-    user_app.link_z_common_page_size = 0x10;
-    user_app.link_z_max_page_size = 0x10;
-    const install_user = b.addInstallArtifact(user_app, .{
-        .dest_sub_path = "EFI/BOOT/USERAPP.ELF",
-    });
-    const user_step = b.step("user-elf", "Build PIE user ELF");
-    user_step.dependOn(&install_user.step);
-
     const init_app_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/init_app.zig"),
         .target = user_target,
@@ -91,28 +59,6 @@ pub fn build(b: *std.Build) void {
     });
     const init_step = b.step("init-elf", "Build init PIE ELF");
     init_step.dependOn(&install_init.step);
-
-    const draw_client_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/draw_client.zig"),
-        .target = user_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    draw_client_mod.strip = true;
-    const draw_client_app = b.addExecutable(.{
-        .name = "DRAWCLI",
-        .root_module = draw_client_mod,
-    });
-    draw_client_app.pie = true;
-    draw_client_app.entry = .{ .symbol_name = "_start" };
-    draw_client_app.link_z_common_page_size = 0x10;
-    draw_client_app.link_z_max_page_size = 0x10;
-    const install_draw_client = b.addInstallArtifact(draw_client_app, .{
-        .dest_sub_path = "EFI/BOOT/DRAWCLI.ELF",
-    });
-    const draw_client_step = b.step("draw-client-elf", "Build draw client PIE ELF");
-    draw_client_step.dependOn(&install_draw_client.step);
 
     const boot_log_console_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/boot_log_console.zig"),
@@ -223,28 +169,6 @@ pub fn build(b: *std.Build) void {
     });
     const mouse_button_demo_step = b.step("mouse-button-demo-elf", "Build mouse button demo PIE ELF");
     mouse_button_demo_step.dependOn(&install_mouse_button_demo.step);
-
-    const keyboard_ascii_demo_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/keyboard_ascii_demo.zig"),
-        .target = user_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    keyboard_ascii_demo_mod.strip = true;
-    const keyboard_ascii_demo_app = b.addExecutable(.{
-        .name = "KEYBDEMO",
-        .root_module = keyboard_ascii_demo_mod,
-    });
-    keyboard_ascii_demo_app.pie = true;
-    keyboard_ascii_demo_app.entry = .{ .symbol_name = "_start" };
-    keyboard_ascii_demo_app.link_z_common_page_size = 0x10;
-    keyboard_ascii_demo_app.link_z_max_page_size = 0x10;
-    const install_keyboard_ascii_demo = b.addInstallArtifact(keyboard_ascii_demo_app, .{
-        .dest_sub_path = "EFI/BOOT/KEYBDEMO.ELF",
-    });
-    const keyboard_ascii_demo_step = b.step("keyboard-ascii-demo-elf", "Build keyboard ASCII demo PIE ELF");
-    keyboard_ascii_demo_step.dependOn(&install_keyboard_ascii_demo.step);
 
     const terminal_window_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/terminal_window.zig"),
@@ -378,28 +302,6 @@ pub fn build(b: *std.Build) void {
     const gpu_compositor_step = b.step("gpu-compositor-elf", "Build GPU compositor PIE ELF");
     gpu_compositor_step.dependOn(&install_gpu_compositor.step);
 
-    const framebuffer_server_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/framebuffer_server.zig"),
-        .target = user_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    framebuffer_server_mod.strip = true;
-    const framebuffer_server_app = b.addExecutable(.{
-        .name = "FBSRV",
-        .root_module = framebuffer_server_mod,
-    });
-    framebuffer_server_app.pie = true;
-    framebuffer_server_app.entry = .{ .symbol_name = "_start" };
-    framebuffer_server_app.link_z_common_page_size = 0x10;
-    framebuffer_server_app.link_z_max_page_size = 0x10;
-    const install_framebuffer_server = b.addInstallArtifact(framebuffer_server_app, .{
-        .dest_sub_path = "EFI/BOOT/FBSRV.ELF",
-    });
-    const framebuffer_server_step = b.step("framebuffer-server-elf", "Build framebuffer server PIE ELF");
-    framebuffer_server_step.dependOn(&install_framebuffer_server.step);
-
     const vfs_mod = b.createModule(.{
         .root_source_file = b.path("user_programs/vfs.zig"),
         .target = user_target,
@@ -433,30 +335,20 @@ pub fn build(b: *std.Build) void {
     });
     const bootfs_builder_run = b.addRunArtifact(bootfs_builder_app);
     const bootfs_image_out = bootfs_builder_run.addOutputFileArg("BOOTFS.IMG");
+    bootfs_builder_run.addArg("/boot/startup_manifest.txt");
+    bootfs_builder_run.addFileArg(b.path("bootfs/startup_manifest.txt"));
     bootfs_builder_run.addArg("/boot/init.elf");
     bootfs_builder_run.addFileArg(init_app.getEmittedBin());
     bootfs_builder_run.addArg("/boot/vfs.elf");
     bootfs_builder_run.addFileArg(vfs_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/bootlog_console.elf");
-    bootfs_builder_run.addFileArg(boot_log_console_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/bootlog_sender.elf");
-    bootfs_builder_run.addFileArg(bootlog_sender_app.getEmittedBin());
     bootfs_builder_run.addArg("/bin/compositor.elf");
     bootfs_builder_run.addFileArg(compositor_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/draw_client.elf");
-    bootfs_builder_run.addFileArg(draw_client_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/framebuffer_server.elf");
-    bootfs_builder_run.addFileArg(framebuffer_server_app.getEmittedBin());
     bootfs_builder_run.addArg("/bin/gpu_compositor.elf");
     bootfs_builder_run.addFileArg(gpu_compositor_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/keyboard_ascii_demo.elf");
-    bootfs_builder_run.addFileArg(keyboard_ascii_demo_app.getEmittedBin());
     bootfs_builder_run.addArg("/bin/keyboard_driver.elf");
     bootfs_builder_run.addFileArg(keyboard_driver_app.getEmittedBin());
     bootfs_builder_run.addArg("/bin/mouse_button_demo.elf");
     bootfs_builder_run.addFileArg(mouse_button_demo_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/mouse_draw.elf");
-    bootfs_builder_run.addFileArg(mouse_draw_app.getEmittedBin());
     bootfs_builder_run.addArg("/bin/mouse_driver.elf");
     bootfs_builder_run.addFileArg(mouse_driver_app.getEmittedBin());
     bootfs_builder_run.addArg("/bin/taskbar.elf");
@@ -496,20 +388,16 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = "EFI/BOOT/BOOTX64.EFI",
     });
     install_efi.step.dependOn(&install_init.step);
-    install_efi.step.dependOn(&install_user.step);
-    install_efi.step.dependOn(&install_draw_client.step);
     install_efi.step.dependOn(&install_boot_log_console.step);
     install_efi.step.dependOn(&install_mouse_driver.step);
     install_efi.step.dependOn(&install_keyboard_driver.step);
     install_efi.step.dependOn(&install_bootlog_sender.step);
     install_efi.step.dependOn(&install_mouse_button_demo.step);
-    install_efi.step.dependOn(&install_keyboard_ascii_demo.step);
     install_efi.step.dependOn(&install_terminal_window.step);
     install_efi.step.dependOn(&install_taskbar.step);
     install_efi.step.dependOn(&install_mouse_draw.step);
     install_efi.step.dependOn(&install_compositor.step);
     install_efi.step.dependOn(&install_gpu_compositor.step);
-    install_efi.step.dependOn(&install_framebuffer_server.step);
     install_efi.step.dependOn(&install_vfs.step);
     install_efi.step.dependOn(&install_bootfs_image.step);
     install_efi.step.dependOn(&install_capc_hello.step);

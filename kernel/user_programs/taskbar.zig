@@ -2,13 +2,12 @@ const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
 const font = @import("font.zig");
 const mouse_input = @import("mouse_input.zig");
+const process_abi = @import("process_abi.zig");
 const protocol = @import("window_protocol.zig");
+const taskbar_bootstrap = @import("taskbar_bootstrap_abi.zig");
 const vfs_client = @import("vfs_client.zig");
 const window_client = @import("window_client.zig");
 
-const config_page_va: usize = 0x3C00_2000;
-const taskbar_state_shared_va: usize = 0x3C00_4000;
-const taskbar_command_shared_va: usize = 0x3C00_6000;
 const window_pixels_va: usize = 0x2030_0000;
 const window_meta_shared_va: usize = 0x3C00_7000;
 const window_cap_tmp_va: u64 = 0x3C10_0000;
@@ -17,7 +16,7 @@ const TaskbarStatePage = protocol.TaskbarStatePage;
 const TaskbarCommandPage = protocol.TaskbarCommandPage;
 const TaskbarEntry = protocol.TaskbarEntry;
 
-const taskbar_config_magic: u64 = 0x54424152; // "TBAR"
+const taskbar_config_magic = taskbar_bootstrap.config_magic;
 const taskbar_state_magic = protocol.taskbar_state_magic;
 const taskbar_command_magic = protocol.taskbar_command_magic;
 const taskbar_protocol_version = protocol.taskbar_protocol_version;
@@ -90,11 +89,11 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
 
 fn runVfsSmokeTest(taskbar_process_slot: u64) void {
     if (taskbar_process_slot == 0) return;
-    var client = vfs_client.Client.connect(.{
-        .request_va = vfs_request_va,
-        .response_va = vfs_response_va,
-        .client_process_slot = taskbar_process_slot,
-    }) catch {
+    var client = vfs_client.Client.connectFromServiceRegistry(
+        vfs_request_va,
+        vfs_response_va,
+        taskbar_process_slot,
+    ) catch {
         _ = userLog("Taskbar: VFS connect failed\n");
         return;
     };
@@ -610,14 +609,21 @@ fn sendActivateCommand(command_page: *volatile TaskbarCommandPage, window_id: u3
 }
 
 pub export fn _start() noreturn {
-    _ = userLog("Taskbar: started\n");
-
-    const cfg: [*]const volatile u64 = @ptrFromInt(config_page_va);
-    if (cfg[0] != taskbar_config_magic) {
+    const cfg: [*]const volatile u64 = @ptrFromInt(process_abi.standard_config_target_va);
+    if (cfg[0] != taskbar_config_magic or cfg[1] != taskbar_bootstrap.config_version) {
         _ = userLog("Taskbar: config magic mismatch\n");
         while (true) asm volatile ("pause");
     }
 
+    if (!window_client.initServiceBindingFromRegistryPage(cfg[taskbar_bootstrap.service_registry_va_index])) {
+        _ = userLog("Taskbar: window service bind failed\n");
+        while (true) asm volatile ("pause");
+    }
+    mouse_input.setSharedPageVa(cfg[taskbar_bootstrap.pointer_shared_va_index]);
+    _ = userLog("Taskbar: started\n");
+
+    const taskbar_state_shared_va: usize = @intCast(cfg[taskbar_bootstrap.state_page_va_index]);
+    const taskbar_command_shared_va: usize = @intCast(cfg[taskbar_bootstrap.command_page_va_index]);
     const state_page: *const volatile TaskbarStatePage = @ptrFromInt(taskbar_state_shared_va);
     const command_page: *volatile TaskbarCommandPage = @ptrFromInt(taskbar_command_shared_va);
     if (mouse_input.sharedPage() == null) {
@@ -633,9 +639,9 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
 
-    const screen_width: usize = @intCast(cfg[1]);
-    const screen_height: usize = @intCast(cfg[2]);
-    const taskbar_process_slot = cfg[3];
+    const screen_width: usize = @intCast(cfg[2]);
+    const screen_height: usize = @intCast(cfg[3]);
+    const taskbar_process_slot = cfg[taskbar_bootstrap.self_process_slot_index];
     if (screen_width == 0 or screen_height < taskbar_height) {
         _ = userLog("Taskbar: invalid screen size\n");
         while (true) asm volatile ("pause");

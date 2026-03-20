@@ -1,10 +1,11 @@
+const process_abi = @import("process_abi.zig");
+const terminal_bootstrap = @import("terminal_bootstrap_abi.zig");
 const window_client = @import("window_client.zig");
 
 const syscall_log: u64 = 0x9;
 const syscall_launch_pie_user: u64 = 0x16;
 const syscall_ok: u64 = 0;
 
-const keyboard_shared_page_va: usize = 0x3C00_6000;
 const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
 
 // Terminal uses a larger backing store than the tiny demo windows, so keep it
@@ -310,8 +311,18 @@ fn executeCommand(st: *TerminalState, cmd_text: []const u8) void {
 }
 
 pub export fn _start() noreturn {
+    const cfg: [*]const volatile u64 = @ptrFromInt(process_abi.standard_config_target_va);
+    if (cfg[0] != terminal_bootstrap.config_magic or cfg[1] != terminal_bootstrap.config_version) {
+        _ = userLog("TerminalWindow: config magic mismatch\n");
+        while (true) asm volatile ("pause");
+    }
+    if (!window_client.initServiceBindingFromRegistryPage(cfg[2])) {
+        _ = userLog("TerminalWindow: window service bind failed\n");
+        while (true) asm volatile ("pause");
+    }
     _ = userLog("TerminalWindow: started\n");
 
+    const keyboard_shared_page_va: usize = @intCast(cfg[3]);
     const keyboard_shared: [*]const volatile u64 = @ptrFromInt(keyboard_shared_page_va);
     if (keyboard_shared[0] != keyboard_shared_magic) {
         _ = userLog("TerminalWindow: keyboard shared magic mismatch\n");

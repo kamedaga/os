@@ -1,9 +1,12 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
-const fs_abi = @import("fs_abi.zig");
-const image_abi = @import("image_abi.zig");
-const process_abi = @import("process_abi.zig");
+const device_abi = @import("abi/device_abi.zig");
+const fs_abi = @import("abi/fs_abi.zig");
+const image_abi = @import("abi/image_abi.zig");
+const user_vm = @import("memory/user_vm.zig");
+const process_abi = @import("abi/process_abi.zig");
+const queue_abi = @import("abi/queue_abi.zig");
 const untyped_memory = @import("untyped_memory.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
@@ -33,6 +36,10 @@ const syscall_grant_caps_batch: u64 = 0x14;
 const syscall_map_pages_batch: u64 = 0x15;
 const syscall_launch_pie_user: u64 = 0x16;
 const syscall_wait_event: u64 = 0x17;
+const syscall_grant_cap_on_endpoint: u64 = 0x24;
+const syscall_grant_caps_batch_on_endpoint: u64 = 0x25;
+const syscall_install_endpoint: u64 = 0x26;
+const syscall_register_iommu_driver: u64 = 0x27;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -70,6 +77,7 @@ pub const Hooks = struct {
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
     launch_pie_user_thread: *const fn (*TrapFrame) u64,
     spawn_exec: *const fn (*TrapFrame) u64,
+    arm_deferred_compositor: *const fn (*TrapFrame) u64,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64) bool,
@@ -113,6 +121,14 @@ fn parseFsRights(bits: u64) kernel.FsRights {
 fn parseVmObjectRights(bits: u64) kernel.VmObjectRights {
     const abi_rights = image_abi.vmObjectRightsFromBits(bits);
     return @bitCast(abi_rights);
+}
+
+fn parseDmaDeviceId(value: u64) ?kernel.DmaDeviceId {
+    const abi_device = std.meta.intToEnum(device_abi.DeviceId, @as(u8, @truncate(value))) catch return null;
+    return switch (abi_device) {
+        .virtio_gpu => .virtio_gpu,
+        .virtio_input => .virtio_input,
+    };
 }
 
 fn parseExecImageRights(bits: u64) kernel.ExecImageRights {
@@ -337,7 +353,8 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const width: u16 = @intCast(frame.rdi);
             const height: u16 = @intCast(frame.rsi);
             const flags: u32 = @truncate(frame.rdx);
-            const created = state.createWindow(proc, .Process1, h.free_list, width, height, flags) catch |err| switch (err) {
+            const compositor = state.endpointTargetFor(proc, frame.r8) orelse return syscall_err_endpoint;
+            const created = state.createWindow(proc, compositor, h.free_list, width, height, flags) catch |err| switch (err) {
                 kernel.KernelError.InvalidState => return syscall_err_invalid,
                 kernel.KernelError.TableFull => return syscall_err_alloc,
                 kernel.KernelError.OutOfFreePages => return syscall_err_alloc,
@@ -361,7 +378,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return syscall_ok;
         },
         fs_abi.syscall_install_cap => {
-            if (proc != kernel.vfs_principal) return syscall_err_invalid;
+            if (!state.hasFsAdminCap(proc)) return syscall_err_invalid;
             const kind = parseFsObjectKind(frame.rsi) orelse return syscall_err_invalid;
             const rights = parseFsRights(frame.rdx);
             const cap_id = state.installFsCap(proc, frame.rdi, kind, rights) catch |err| switch (err) {
@@ -435,12 +452,65 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
             return syscall_ok;
         },
+        syscall_grant_cap_on_endpoint => {
+            const endpoint_id = frame.rsi;
+            const rights = capability.parseRights(frame.rdx);
+            state.grantCapOnEndpoint(proc, endpoint_id, frame.rdi, rights) catch |err| switch (err) {
+                kernel.KernelError.EndpointNotFound => return syscall_err_endpoint,
+                else => return syscall_err_grant,
+            };
+            if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
+            return syscall_ok;
+        },
+        syscall_grant_caps_batch_on_endpoint => {
+            const page_count_u64 = frame.rsi;
+            if (page_count_u64 == 0 or page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
+            const endpoint_id = frame.rdx;
+            const rights = capability.parseRights(frame.rcx);
+            var paddrs: [syscall_batch_max_pages]u64 = undefined;
+            var i: u64 = 0;
+            while (i < page_count_u64) : (i += 1) {
+                const list_va = frame.rdi + i * 8;
+                paddrs[@intCast(i)] = h.read_user_u64(proc, list_va) orelse return syscall_err_invalid;
+            }
+            state.grantCapsBatchOnEndpoint(proc, endpoint_id, paddrs[0..@intCast(page_count_u64)], rights) catch |err| switch (err) {
+                kernel.KernelError.EndpointNotFound => return syscall_err_endpoint,
+                else => return syscall_err_grant,
+            };
+            if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
+            return syscall_ok;
+        },
+        syscall_install_endpoint => {
+            const target = h.principal_from_process_slot(frame.rdx) orelse return syscall_err_invalid;
+            state.installEndpoint(proc, frame.rsi, target) catch |err| switch (err) {
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_endpoint,
+            };
+            return syscall_ok;
+        },
+        syscall_register_iommu_driver => {
+            const device = parseDmaDeviceId(frame.rdi) orelse return syscall_err_invalid;
+            state.registerIommuNoCapDriver(proc, device) catch return syscall_err_invalid;
+            return syscall_ok;
+        },
         syscall_send_cap => {
             const endpoint_id = frame.rsi;
             const to = state.endpointTargetFor(proc, endpoint_id) orelse {
                 h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
                 return syscall_err_endpoint;
             };
+            if (endpoint_id >= 0x80 or endpoint_id == kernel.endpoint_to_boot_display) {
+                h.write("send_cap begin from=");
+                h.write(h.principal_label(proc));
+                h.write(" to=");
+                h.write(h.principal_label(to));
+                h.write(" ep=");
+                h.print_hex(endpoint_id);
+                h.write(" paddr=");
+                h.print_hex(frame.rdi);
+                h.write("\n");
+            }
             state.sendCapOnEndpoint(proc, endpoint_id, frame.rdi) catch |err| switch (err) {
                 kernel.KernelError.EndpointNotFound => {
                     h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
@@ -457,6 +527,17 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             };
             h.wake_waiting_thread_for_principal(to);
             h.post_send_cap(proc, to, endpoint_id);
+            if (endpoint_id >= 0x80 or endpoint_id == kernel.endpoint_to_boot_display) {
+                h.write("send_cap done from=");
+                h.write(h.principal_label(proc));
+                h.write(" to=");
+                h.write(h.principal_label(to));
+                h.write(" ep=");
+                h.print_hex(endpoint_id);
+                h.write(" paddr=");
+                h.print_hex(frame.rdi);
+                h.write("\n");
+            }
             if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
             return syscall_ok;
         },
@@ -505,6 +586,82 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const child_id = state.grantVmObjectCap(proc, to, cap_id, parseVmObjectRights(frame.rdx)) catch return syscall_err_grant;
             return image_abi.encodeVmObjectToken(child_id);
         },
+        image_abi.syscall_slice_vm_object => {
+            const cap_id = image_abi.decodeVmObjectToken(frame.rdi) orelse return syscall_err_invalid;
+            const child_id = state.deriveVmObjectCap(proc, cap_id, frame.rsi, frame.rdx, parseVmObjectRights(frame.rcx)) catch return syscall_err_grant;
+            return image_abi.encodeVmObjectToken(child_id);
+        },
+        image_abi.syscall_map_vm_object => {
+            const cap_id = image_abi.decodeVmObjectToken(frame.rdi) orelse {
+                h.write("map_vm_object invalid token token=");
+                h.print_hex(frame.rdi);
+                h.write("\n");
+                return syscall_err_invalid;
+            };
+            const target_va = frame.rsi;
+            if ((target_va & 0xFFF) != 0) {
+                h.write("map_vm_object target va unaligned va=");
+                h.print_hex(target_va);
+                h.write("\n");
+                return syscall_err_invalid;
+            }
+            const vm_cap = state.getVmObjectTableConst(proc).findByCapId(cap_id) orelse {
+                h.write("map_vm_object cap missing proc=");
+                h.write(h.principal_label(proc));
+                h.write(" cap=");
+                h.print_hex(cap_id);
+                h.write("\n");
+                return syscall_err_invalid;
+            };
+            if (!vm_cap.rights.read or !vm_cap.rights.map) {
+                h.write("map_vm_object rights invalid cap=");
+                h.print_hex(cap_id);
+                h.write(" rights=");
+                h.print_hex(@as(u64, @as(u32, @bitCast(vm_cap.rights))));
+                h.write("\n");
+                return syscall_err_invalid;
+            }
+            if (vm_cap.backing.page_offset_bytes != 0) {
+                h.write("map_vm_object page_offset invalid cap=");
+                h.print_hex(cap_id);
+                h.write(" page_offset=");
+                h.print_hex(vm_cap.backing.page_offset_bytes);
+                h.write(" size=");
+                h.print_hex(vm_cap.backing.size_bytes);
+                h.write("\n");
+                return syscall_err_invalid;
+            }
+            var i: usize = 0;
+            while (i < vm_cap.backing.page_count) {
+                const run_start = i;
+                const run_paddr = vm_cap.backing.page_paddrs[run_start];
+                var run_len: usize = 1;
+                while (run_start + run_len < vm_cap.backing.page_count) : (run_len += 1) {
+                    const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
+                    if (vm_cap.backing.page_paddrs[run_start + run_len] != expected) break;
+                }
+                if (!user_vm.mapUserLinearRegion(
+                    proc,
+                    target_va + @as(u64, @intCast(run_start)) * 4096,
+                    run_paddr,
+                    @as(u64, @intCast(run_len)) * 4096,
+                    false,
+                )) {
+                    h.write("map_vm_object user map failed proc=");
+                    h.write(h.principal_label(proc));
+                    h.write(" va=");
+                    h.print_hex(target_va + @as(u64, @intCast(run_start)) * 4096);
+                    h.write(" paddr=");
+                    h.print_hex(run_paddr);
+                    h.write(" bytes=");
+                    h.print_hex(@as(u64, @intCast(run_len)) * 4096);
+                    h.write("\n");
+                    return syscall_err_map;
+                }
+                i = run_start + run_len;
+            }
+            return syscall_ok;
+        },
         image_abi.syscall_install_exec_image => {
             const vm_cap_id = image_abi.decodeVmObjectToken(frame.rdi) orelse return syscall_err_invalid;
             const cap_id = state.installExecImageCap(proc, vm_cap_id, parseExecImageRights(frame.rsi)) catch return syscall_err_grant;
@@ -515,6 +672,12 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
             const child_id = state.grantExecImageCap(proc, to, cap_id, parseExecImageRights(frame.rdx)) catch return syscall_err_grant;
             return image_abi.encodeExecImageToken(child_id);
+        },
+        queue_abi.syscall_grant_cap => {
+            const token = queue_abi.decodeQueueCapToken(frame.rdi) orelse return syscall_err_invalid;
+            const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
+            const child_token = state.grantQueueCapStage2(proc, to, token) catch return syscall_err_grant;
+            return queue_abi.encodeQueueCapToken(child_token);
         },
         syscall_wait_event => {
             const wait_mailbox = (frame.rdi & 0x1) != 0;
@@ -584,6 +747,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_launch_pie_user => return h.launch_pie_user_thread(frame),
         process_abi.syscall_spawn_exec => return h.spawn_exec(frame),
+        process_abi.syscall_arm_deferred_compositor => return h.arm_deferred_compositor(frame),
         syscall_log => {
             const req_len_u64 = frame.rsi;
             if (req_len_u64 == 0) return syscall_ok;

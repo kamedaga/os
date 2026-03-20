@@ -8,9 +8,6 @@ const UserAddressSpace = capability.UserAddressSpace;
 
 const fx_state_bytes: usize = 512;
 pub const max_thread_slots: usize = kernel.max_thread_slots;
-const enable_process5_context_debug_logs = false;
-var proc5_ctx_log_count: u64 = 0;
-const proc5_ctx_log_max: u64 = 48;
 
 pub const ThreadContext = struct {
     id: u32 = 0,
@@ -155,28 +152,6 @@ fn threadLabel(thread_index: usize) []const u8 {
     };
     if (thread_index < labels.len) return labels[thread_index];
     return "Thread?";
-}
-
-fn maybeLogProcess5Context(stage: []const u8, thread_index: usize, frame: *const TrapFrame) void {
-    if (!enable_process5_context_debug_logs) return;
-    if (proc5_ctx_log_count >= proc5_ctx_log_max) return;
-    const ctx = getThreadContextConst(thread_index) orelse return;
-    if (!ctx.allocated or ctx.owner_process != .Process5) return;
-    if (frame.rip < 0x200017e1 or frame.rip > 0x20001832) return;
-    proc5_ctx_log_count +%= 1;
-
-    const serial = @import("serial.zig");
-    serial.write("PROC5 ctx ");
-    serial.write(stage);
-    serial.write(" thread=");
-    serial.write(threadLabel(thread_index));
-    serial.write(" rip=");
-    serial.writeHexRaw(frame.rip);
-    serial.write(" rax=");
-    serial.writeHexRaw(frame.rax);
-    serial.write(" rsp=");
-    serial.writeHexRaw(frame.rsp);
-    serial.write("\n");
 }
 
 fn tryBeginSchedulerRaceLog(hooks: RaceLogHooks, max_lines: u64) bool {
@@ -349,10 +324,8 @@ pub fn activateThread(thread_index: usize) bool {
 pub fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
     const ctx = getThreadContext(current_thread_index) orelse return;
     if (!ctx.allocated) return;
-    maybeLogProcess5Context("save-before", current_thread_index, frame);
     ctx.frame = frame.*;
     ctx.cr3 = user_cr3_value;
-    maybeLogProcess5Context("save-after", current_thread_index, &ctx.frame);
     if (!ctx.wait_mailbox and ctx.wake_tick == 0) {
         ctx.ready = true;
     }
@@ -362,9 +335,7 @@ pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
     const ctx = getThreadContextConst(thread_index) orelse return false;
     if (!ctx.allocated) return false;
     if (!ctx.ready) return false;
-    maybeLogProcess5Context("load-src", thread_index, &ctx.frame);
     frame.* = ctx.frame;
-    maybeLogProcess5Context("load-dst", thread_index, frame);
     return true;
 }
 

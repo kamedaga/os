@@ -3,13 +3,18 @@ const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
 const syscall_grant_cap: u64 = 0x8;
 const syscall_grant_caps_batch: u64 = 0x14;
+const syscall_grant_cap_on_endpoint: u64 = 0x24;
+const syscall_grant_caps_batch_on_endpoint: u64 = 0x25;
+const syscall_install_endpoint: u64 = 0x26;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_log: u64 = 0x9;
 const syscall_untyped_alloc_map_pages: u64 = 0x13;
 const protocol = @import("window_protocol.zig");
+const service_registry_abi = @import("service_registry_abi.zig");
 
 const syscall_ok: u64 = 0;
-pub const endpoint_to_process1: u64 = 0x11;
+pub const endpoint_to_boot_display: u64 = 0x11;
+pub const endpoint_to_process1: u64 = endpoint_to_boot_display;
 pub const window_cap_magic = protocol.window_cap_magic;
 pub const window_meta_magic = protocol.window_meta_magic;
 pub const window_flag_allow_pixels_dma = protocol.window_flag_allow_pixels_dma;
@@ -23,6 +28,14 @@ const untyped_alloc_map_writable_flag: u64 = 1 << 0;
 const untyped_alloc_map_drop_cap_after_map_flag: u64 = 1 << 1;
 const untyped_alloc_map_contiguous_flag: u64 = 1 << 2;
 const untyped_alloc_map_dma_ok_flag: u64 = 1 << 3;
+
+const WindowServiceBinding = struct {
+    endpoint_id: u64,
+};
+
+var service_binding = WindowServiceBinding{
+    .endpoint_id = endpoint_to_boot_display,
+};
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -129,6 +142,29 @@ fn grantCapsBatch(paddr_list_va: u64, page_count: u64, to: u64, rights_bits: u64
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn grantCapOnEndpoint(paddr: u64, endpoint_id: u64, rights_bits: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_grant_cap_on_endpoint),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (rights_bits),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn grantCapsBatchOnEndpoint(paddr_list_va: u64, page_count: u64, endpoint_id: u64, rights_bits: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_grant_caps_batch_on_endpoint),
+          [arg0] "{rdi}" (paddr_list_va),
+          [arg1] "{rsi}" (page_count),
+          [arg2] "{rdx}" (endpoint_id),
+          [arg3] "{rcx}" (rights_bits),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64) u64 {
     return asm volatile (
         \\int $0x80
@@ -155,7 +191,64 @@ fn allocUntypedMapPages(base_va: u64, page_count: u64, writable: bool, dma_ok: b
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn createWindowSys(width: u16, height: u16, flags: u32) u64 {
+pub fn initServiceBindingFromRegistryPage(registry_page_va: u64) bool {
+    if (registry_page_va == 0) {
+        _ = userLog("window_client: service registry missing\n");
+        return false;
+    }
+    const page: *const volatile service_registry_abi.RegistryPage = @ptrFromInt(registry_page_va);
+    if (page.magic != service_registry_abi.magic or page.version != service_registry_abi.version or page.entry_count == 0) {
+        _ = userLog("window_client: service registry missing\n");
+        return false;
+    }
+    var i: usize = 0;
+    while (i < page.entry_count and i < service_registry_abi.max_entries) : (i += 1) {
+        const entry = page.entries[i];
+        if (entry.kind != @intFromEnum(service_registry_abi.ServiceKind.window)) continue;
+        if (entry.process_slot == 0 or entry.endpoint_id == 0) {
+            _ = userLog("window_client: bad service registry entry\n");
+            return false;
+        }
+        const install_result = asm volatile (
+            \\int $0x80
+            : [ret] "={rax}" (-> u64),
+            : [nr] "{rax}" (syscall_install_endpoint),
+              [arg0] "{rdi}" (@as(u64, 0)),
+              [arg1] "{rsi}" (entry.endpoint_id),
+              [arg2] "{rdx}" (entry.process_slot),
+            : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+        if (install_result != syscall_ok) {
+            _ = userLog("window_client: install endpoint failed\n");
+            userLogHex("window_client: install_result=", install_result);
+            userLogHex("window_client: service_slot=", entry.process_slot);
+            userLogHex("window_client: service_endpoint=", entry.endpoint_id);
+            return false;
+        }
+        service_binding = .{
+            .endpoint_id = entry.endpoint_id,
+        };
+        return true;
+    }
+    _ = userLog("window_client: window service missing\n");
+    return false;
+}
+
+pub fn initServiceBindingFromConfigPage() bool {
+    return initServiceBindingFromRegistryPage(service_registry_abi.page_va);
+}
+
+pub fn setServiceBinding(endpoint_id: u64) void {
+    if (endpoint_id == 0) return;
+    service_binding = .{
+        .endpoint_id = endpoint_id,
+    };
+}
+
+fn windowServiceBinding() WindowServiceBinding {
+    return service_binding;
+}
+
+fn createWindowSys(width: u16, height: u16, flags: u32, service_endpoint_id: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
@@ -163,6 +256,7 @@ fn createWindowSys(width: u16, height: u16, flags: u32) u64 {
           [arg0] "{rdi}" (@as(u64, width)),
           [arg1] "{rsi}" (@as(u64, height)),
           [arg2] "{rdx}" (@as(u64, flags)),
+          [arg3] "{r8}" (service_endpoint_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -175,8 +269,9 @@ pub fn createAndPublishWindow(
     meta_map_va: u64,
 ) bool {
     const effective_flags = flags;
+    const service = windowServiceBinding();
     userLogStep("window_client: create begin\n");
-    const cap_paddr = createWindowSys(width, height, effective_flags);
+    const cap_paddr = createWindowSys(width, height, effective_flags, service.endpoint_id);
     if (cap_paddr < 0x1000) {
         _ = userLog("window_client: create_window failed\n");
         return false;
@@ -237,10 +332,10 @@ pub fn createAndPublishWindow(
     if ((effective_flags & window_flag_allow_pixels_dma) != 0) {
         grant_rights |= 0x4; // dma
     }
-    if (grantCapsBatch(@intFromPtr(&pixel_paddrs), @intCast(page_count), 1, grant_rights) != syscall_ok) {
+    if (grantCapsBatchOnEndpoint(@intFromPtr(&pixel_paddrs), @intCast(page_count), service.endpoint_id, grant_rights) != syscall_ok) {
         i = 0;
         while (i < page_count) : (i += 1) {
-            if (grantCap(pixel_paddrs[i], 1, grant_rights) != syscall_ok) {
+            if (grantCapOnEndpoint(pixel_paddrs[i], service.endpoint_id, grant_rights) != syscall_ok) {
                 _ = userLog("window_client: grant pixels cap failed\n");
                 return false;
             }
@@ -258,7 +353,8 @@ pub fn createAndPublishWindow(
         return false;
     }
     userLogStep("window_client: map meta ok\n");
-    if (sendCap(cap_paddr, endpoint_to_process1) != syscall_ok) {
+    userLogStep("window_client: send cap begin\n");
+    if (sendCap(cap_paddr, service.endpoint_id) != syscall_ok) {
         _ = userLog("window_client: send window cap failed\n");
         return false;
     }

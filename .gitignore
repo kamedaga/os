@@ -1,12 +1,22 @@
 # Zig build artifacts
 kernel/.zig-cache/
 kernel/zig-out/
+.zig-cache/
+.zig-cache-global/
+.zig-cache-local/
+.zig-global-cache/
 *.pdb
+*.o
+*.obj
 
-# UEFI/QEMU artifacts
-BOOTX64.EFI
+
+# Runtime / emulator artifacts
+.artifacts/
+_disk_bootx64.efi
 *.img
 *.fd
+*.qcow2
+*.log
 
 # TLA+ state dumps
 tla/states/
@@ -15,4 +25,3 @@ states/
 # OS/editor noise
 .DS_Store
 Thumbs.db
-

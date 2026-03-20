@@ -239,4 +239,21 @@ pub const QueueCapabilityTable = struct {
             .notify => if (!cap.allow_notify) return DmaMappingError.Denied,
         }
     }
+
+    pub fn grant(
+        self: *QueueCapabilityTable,
+        owner_principal_raw: u8,
+        child_owner_principal_raw: u8,
+        token: u64,
+    ) DmaMappingError!u64 {
+        const cap = self.findByToken(token) orelse return DmaMappingError.NotFound;
+        if (cap.owner_principal_raw != owner_principal_raw) return DmaMappingError.Denied;
+        return self.alloc(
+            child_owner_principal_raw,
+            cap.device,
+            cap.queue_index,
+            cap.allow_submit,
+            cap.allow_notify,
+        );
+    }
 };

@@ -1,6 +1,8 @@
+const mouse_shared_abi = @import("mouse_shared_abi.zig");
+
 pub const window_cap_magic: u32 = 0x57434150; // 'WCAP'
 pub const window_meta_magic: u32 = 0x574D5441; // 'WMTA'
-pub const mouse_shared_magic: u64 = 0x4D534852; // "MSHR"
+pub const mouse_shared_magic: u64 = mouse_shared_abi.magic;
 pub const taskbar_state_magic: u32 = 0x54425354; // "TBST"
 pub const taskbar_command_magic: u32 = 0x5442434D; // "TBCM"
 pub const window_protocol_version: u16 = 2;
@@ -66,18 +68,11 @@ pub const WindowMeta = extern struct {
     title: [window_title_max_bytes]u8,
 };
 
-pub const MouseSharedPage = extern struct {
-    magic: u64,
-    width: u64,
-    height: u64,
-    pitch: u64,
-    cursor_x: u64,
-    cursor_y: u64,
-    buttons: u64,
-    seq: u64,
-    wheel: u64,
-    log_len: u64,
-};
+pub const mouse_shared_page_bytes: usize = mouse_shared_abi.page_bytes;
+pub const mouse_shared_header_bytes: usize = mouse_shared_abi.header_bytes;
+pub const mouse_shared_log_offset_bytes: usize = mouse_shared_abi.log_offset_bytes;
+pub const mouse_shared_log_capacity_bytes: usize = mouse_shared_abi.log_capacity_bytes;
+pub const MouseSharedPage = mouse_shared_abi.MouseSharedPage;
 
 pub const TaskbarEntry = extern struct {
     window_id: u32,

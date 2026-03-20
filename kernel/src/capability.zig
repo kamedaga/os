@@ -45,11 +45,6 @@ pub const PageFaultCapability = struct {
 var runtime_ready = false;
 var runtime: RuntimeConfig = undefined;
 var lookup_diag_count: u64 = 0;
-const process5_meta_head_bytes: usize = 32;
-const process5_meta_tail_bytes: usize = 16;
-var process5_meta_head_shadow: [process5_meta_head_bytes]u8 = [_]u8{0} ** process5_meta_head_bytes;
-var process5_meta_tail_shadow: [process5_meta_tail_bytes]u8 = [_]u8{0} ** process5_meta_tail_bytes;
-var process5_meta_shadow_valid = false;
 
 fn shouldLogLookupDiag(principal: kernel.PrincipalId) bool {
     _ = principal;
@@ -85,23 +80,6 @@ fn logLookupSpaceDiag(prefix: []const u8, principal: kernel.PrincipalId, space: 
     runtime.serial_write("\n");
 }
 
-fn logProcess5Diag(prefix: []const u8) void {
-    if (!runtime_ready) return;
-    const index = processIndex(.Process5) orelse return;
-    if (index >= runtime.user_spaces.len) return;
-    logLookupSpaceDiag(prefix, .Process5, &runtime.user_spaces[index]);
-}
-
-fn process5MetaHeadPtr() ?[*]const u8 {
-    const space = getUserSpace(.Process5) orelse return null;
-    return @ptrCast(&space.pt_page_pd_index[0]);
-}
-
-fn process5MetaTailPtr() ?[*]const u8 {
-    const space = getUserSpace(.Process5) orelse return null;
-    return @ptrCast(&space.pt_page_used_len);
-}
-
 fn logByteWindow(prefix: []const u8, bytes: []const u8) void {
     runtime.serial_write(prefix);
     runtime.serial_write("=");
@@ -110,64 +88,6 @@ fn logByteWindow(prefix: []const u8, bytes: []const u8) void {
         runtime.print_hex(b);
     }
     runtime.serial_write("\n");
-}
-
-fn snapshotProcess5MetaWindows() void {
-    const head = process5MetaHeadPtr() orelse return;
-    const tail = process5MetaTailPtr() orelse return;
-    @memcpy(process5_meta_head_shadow[0..], head[0..process5_meta_head_bytes]);
-    @memcpy(process5_meta_tail_shadow[0..], tail[0..process5_meta_tail_bytes]);
-    process5_meta_shadow_valid = true;
-}
-
-fn logProcess5MetaWindows(prefix: []const u8) void {
-    const head = process5MetaHeadPtr() orelse return;
-    const tail = process5MetaTailPtr() orelse return;
-    runtime.serial_write(prefix);
-    runtime.serial_write("\n");
-    logByteWindow("  head", head[0..process5_meta_head_bytes]);
-    logByteWindow("  tail", tail[0..process5_meta_tail_bytes]);
-}
-
-fn logProcess5MetaWindowChanges(prefix: []const u8) void {
-    const head = process5MetaHeadPtr() orelse return;
-    const tail = process5MetaTailPtr() orelse return;
-    if (!process5_meta_shadow_valid) {
-        runtime.serial_write(prefix);
-        runtime.serial_write(" shadow=unset\n");
-        return;
-    }
-
-    var changed = false;
-    runtime.serial_write(prefix);
-    runtime.serial_write("\n");
-    for (head[0..process5_meta_head_bytes], 0..) |b, i| {
-        const old = process5_meta_head_shadow[i];
-        if (b == old) continue;
-        changed = true;
-        runtime.serial_write("  head[");
-        runtime.print_hex(@intCast(i));
-        runtime.serial_write("] ");
-        runtime.print_hex(old);
-        runtime.serial_write(" -> ");
-        runtime.print_hex(b);
-        runtime.serial_write("\n");
-    }
-    for (tail[0..process5_meta_tail_bytes], 0..) |b, i| {
-        const old = process5_meta_tail_shadow[i];
-        if (b == old) continue;
-        changed = true;
-        runtime.serial_write("  tail[");
-        runtime.print_hex(@intCast(i));
-        runtime.serial_write("] ");
-        runtime.print_hex(old);
-        runtime.serial_write(" -> ");
-        runtime.print_hex(b);
-        runtime.serial_write("\n");
-    }
-    if (!changed) {
-        runtime.serial_write("  unchanged\n");
-    }
 }
 
 pub fn init(config: RuntimeConfig) void {
@@ -387,8 +307,6 @@ noinline fn logMapMmioDiagEnter(va: u64, paddr: u64) void {
     runtime.serial_write(" paddr=");
     runtime.print_hex(paddr);
     runtime.serial_write("\n");
-    logProcess5MetaWindows("map_mmio_diag proc5 pre");
-    snapshotProcess5MetaWindows();
 }
 
 noinline fn logMapMmioDiagPostEnsure(pd_index: usize, pt_index: usize, map_slot: usize) void {
@@ -399,27 +317,20 @@ noinline fn logMapMmioDiagPostEnsure(pd_index: usize, pt_index: usize, map_slot:
     runtime.serial_write(" pt=");
     runtime.print_hex(@intCast(pt_index));
     runtime.serial_write("\n");
-    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_ensure");
-    snapshotProcess5MetaWindows();
 }
 
 noinline fn logMapMmioDiagPostAliasLoop(space: *UserAddressSpace, map_slot: usize, pt_index: usize) void {
-    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_alias_loop");
     runtime.serial_write("map_mmio_diag dst_pte=");
     runtime.print_hex(@intFromPtr(&space.pt_pages[map_slot][pt_index]));
-    runtime.serial_write(" proc5_meta0=");
-    runtime.print_hex(@intFromPtr(&runtime.user_spaces[5].pt_page_pd_index[0]));
     runtime.serial_write("\n");
-    snapshotProcess5MetaWindows();
 }
 
 noinline fn logMapMmioDiagPostPteWrite() void {
-    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_pte_write");
-    snapshotProcess5MetaWindows();
+    runtime.serial_write("map_mmio_diag pte write done\n");
 }
 
 noinline fn logMapMmioDiagPostMap() void {
-    logProcess5MetaWindowChanges("map_mmio_diag proc5 post_map");
+    runtime.serial_write("map_mmio_diag map done\n");
 }
 
 noinline fn clearAliasMappings(

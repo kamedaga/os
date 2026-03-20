@@ -1,8 +1,14 @@
+const device_abi = @import("device_abi.zig");
+const input_bootstrap = @import("input_driver_bootstrap_abi.zig");
+const syscall_alloc_page: u64 = 0x1;
+const syscall_map_page: u64 = 0x2;
+const syscall_send_cap: u64 = 0x6;
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
+const syscall_wait_event: u64 = 0x17;
 
 const syscall_ok: u64 = 0;
 const queue_cap_device_input: u64 = 1;
@@ -14,10 +20,11 @@ const isr_page_va: usize = 0x2000_6000;
 const device_page_va: usize = 0x2000_7000;
 const queue_page0_va: usize = 0x2000_8000;
 const queue_page1_va: usize = 0x2000_9000;
-const shared_page_va: usize = 0x3C00_6000;
+const default_shared_page_va: usize = 0x3C00_6000;
 
-const config_magic: u64 = 0x4B455942; // "KEYB"
+const config_magic = input_bootstrap.keyboard_config_magic;
 const shared_magic: u64 = 0x4B534852; // "KSHR"
+const endpoint_to_spawn_parent: u64 = 0x14;
 
 const common_device_feature_select: usize = 0x00;
 const common_device_feature: usize = 0x04;
@@ -83,6 +90,25 @@ fn userLog(message: []const u8) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn allocPage() u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_alloc_page),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_map_page),
+          [arg0] "{rdi}" (va),
+          [arg1] "{rsi}" (paddr),
+          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
     return asm volatile (
         \\int $0x80
@@ -91,6 +117,16 @@ fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn sendCap(paddr: u64, endpoint_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_send_cap),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (endpoint_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -103,6 +139,16 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_v
           [arg1] "{rsi}" (page_count),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
           [arg3] "{rcx}" (out_paddr_list_va),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_wait_event),
+          [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
+          [arg1] "{rsi}" (timeout_ticks),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -125,6 +171,15 @@ fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
           [arg0] "{rdi}" (token),
           [arg1] "{rsi}" (device),
           [arg2] "{rdx}" (queue_index),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn registerIommuDriver(device: device_abi.DeviceId) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (device_abi.syscall_register_iommu_driver),
+          [arg0] "{rdi}" (@intFromEnum(device)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -166,6 +221,23 @@ fn mmioWriteU64(addr: usize, value: u64) void {
 fn readCfgU64(index: usize) u64 {
     const cfg: [*]const volatile u64 = @ptrFromInt(config_page_va);
     return cfg[index];
+}
+
+fn writeCfgU64(index: usize, value: u64) void {
+    const cfg: [*]volatile u64 = @ptrFromInt(config_page_va);
+    cfg[index] = value;
+}
+
+fn initializeSharedPage(shared: [*]volatile u64) void {
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        shared[i] = 0;
+    }
+    shared[0] = shared_magic;
+    shared[1] = 1;
+    shared[2] = '?';
+    shared[3] = 0;
+    shared[4] = 0;
 }
 
 fn queueDescPtr(index: u16) *volatile VirtqDesc {
@@ -336,35 +408,37 @@ pub export fn _start() noreturn {
     _ = _device_page_paddr;
     _ = _device_off;
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
-    const shared_page_paddr = readCfgU64(10);
+    var shared_page_paddr = readCfgU64(10);
+    const shared_target_va_u64 = readCfgU64(input_bootstrap.shared_target_va_index);
+    const shared_page_va: usize = @intCast(if (shared_target_va_u64 != 0) shared_target_va_u64 else default_shared_page_va);
     var queue_paddr0 = readCfgU64(11);
     var queue_paddr1 = readCfgU64(12);
-    const queue_submit_token = readCfgU64(13);
-    const queue_notify_token = readCfgU64(14);
+    var queue_submit_token = readCfgU64(13);
+    var queue_notify_token = readCfgU64(14);
 
-    if (shared_page_paddr < 0x1000) {
-        _ = userLog("KeyboardDriver: invalid shared page paddr\n");
-        while (true) asm volatile ("pause");
+    while (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
+        _ = waitEvent(false, 1);
+        asm volatile ("pause");
     }
-
-    if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
-        _ = userLog("KeyboardDriver: map common mmio failed\n");
-        while (true) asm volatile ("pause");
-    }
-    if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
-        _ = userLog("KeyboardDriver: map notify mmio failed\n");
-        while (true) asm volatile ("pause");
+    while (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
+        _ = waitEvent(false, 1);
+        asm volatile ("pause");
     }
     if (isr_page_paddr != 0) {
-        if (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) {
-            _ = userLog("KeyboardDriver: map isr mmio failed\n");
-            while (true) asm volatile ("pause");
+        while (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) {
+            _ = waitEvent(false, 1);
+            asm volatile ("pause");
         }
     }
 
     const common_base = common_page_va + common_off;
     const notify_base = notify_page_va + notify_off;
     const isr_base = if (isr_page_paddr != 0) isr_page_va + isr_off else 0;
+
+    if (registerIommuDriver(.virtio_input) != syscall_ok) {
+        _ = userLog("KeyboardDriver: register iommu driver failed\n");
+        while (true) asm volatile ("pause");
+    }
 
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
         var queue_paddrs: [2]u64 = .{ 0, 0 };
@@ -374,10 +448,18 @@ pub export fn _start() noreturn {
         }
         queue_paddr0 = queue_paddrs[0];
         queue_paddr1 = queue_paddrs[1];
+        writeCfgU64(11, queue_paddr0);
+        writeCfgU64(12, queue_paddr1);
     }
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
         _ = userLog("KeyboardDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
+    }
+    while (queue_submit_token == 0 or queue_notify_token == 0) {
+        _ = waitEvent(false, 1);
+        queue_submit_token = readCfgU64(13);
+        queue_notify_token = readCfgU64(14);
+        asm volatile ("pause");
     }
     if (queue_submit_token == 0 or queue_notify_token == 0) {
         _ = userLog("KeyboardDriver: queue cap token missing\n");
@@ -432,9 +514,22 @@ pub export fn _start() noreturn {
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     _ = userLog("KeyboardDriver: queue ready\n");
 
+    if (shared_page_paddr < 0x1000) {
+        shared_page_paddr = allocPage();
+        if (shared_page_paddr < 0x1000) {
+            _ = userLog("KeyboardDriver: alloc shared page failed\n");
+            while (true) asm volatile ("pause");
+        }
+        writeCfgU64(10, shared_page_paddr);
+    }
+    while (mapPage(shared_page_va, shared_page_paddr, true) != syscall_ok) {
+        _ = waitEvent(false, 1);
+        asm volatile ("pause");
+    }
     const shared: [*]volatile u64 = @ptrFromInt(shared_page_va);
-    if (shared[0] != shared_magic) {
-        _ = userLog("KeyboardDriver: shared magic mismatch\n");
+    initializeSharedPage(shared);
+    if (sendCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok) {
+        _ = userLog("KeyboardDriver: send shared cap failed\n");
         while (true) asm volatile ("pause");
     }
 
