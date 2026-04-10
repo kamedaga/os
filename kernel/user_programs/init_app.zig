@@ -36,6 +36,7 @@ const mouse_shared_magic: u64 = mouse_shared_abi.magic;
 const startup_manifest_path = "/boot/startup_manifest.txt";
 const startup_manifest_max_bytes: usize = 1024;
 const vfs_boot_config_magic: u64 = 0x5646_5343; // "VFSC"
+const persistent_fs_start_block: u64 = 395264;
 const vfs_boot_config_version: u64 = 2;
 const vfs_boot_config_flag_bootfs_present: u64 = 1 << 0;
 const input_shared_page_paddr_index: usize = 10;
@@ -1526,7 +1527,7 @@ const LaunchContext = struct {
             while (true) asm volatile ("pause");
         };
         const config_source_va = self.allocWritableBootstrapPage("Init: alloc persistent fs config page failed\n");
-        persistent_fs_bootstrap.writeConfigPage(config_source_va, endpoint_id);
+        persistent_fs_bootstrap.writeConfigPage(config_source_va, endpoint_id, persistent_fs_start_block);
         persistent_fs_bootstrap_pages_storage[0] = .{
             .source_va = config_source_va,
             .target_va = process_abi.standard_config_target_va,

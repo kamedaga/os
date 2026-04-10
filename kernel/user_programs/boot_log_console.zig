@@ -84,6 +84,7 @@ const block_response_va: u64 = 0x3C10_5000;
 const persistent_fs_request_va: u64 = 0x3C10_6000;
 const persistent_fs_response_va: u64 = 0x3C10_7000;
 const block_demo_magic: u64 = 0x424C_4B44_454D_4F31;
+const pie_user_rootfs_name = "pie_user.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 
 const VirtqDesc = extern struct {
@@ -207,6 +208,18 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
         : [nr] "{rax}" (syscall_wait_event),
           [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
           [arg1] "{rsi}" (timeout_ticks),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn spawnExec(exec_token: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (process_abi.syscall_spawn_exec),
+          [arg0] "{rdi}" (exec_token),
+          [arg1] "{rsi}" (@as(u64, 0)),
+          [arg2] "{rdx}" (@as(u64, 0)),
+          [arg3] "{rcx}" (@as(u64, 0)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -1047,12 +1060,58 @@ fn runPersistentFsDemo(st: *ShellState) bool {
     return true;
 }
 
+fn runPersistentFsPieUser(st: *ShellState) bool {
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
+        st.writeLine("persistent fs unavailable");
+        shellLogLine("persistent fs unavailable");
+        st.persistent_fs_client_ready = false;
+        return false;
+    }
+    shellLogLine("pie_user start");
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = client.lookup(client.mount_token, ".") catch |err| {
+        st.writeLine("pie root lookup failed");
+        shellLogLine("pie root lookup failed");
+        _ = userLog(@errorName(err));
+        _ = userLog("\n");
+        st.persistent_fs_client_ready = false;
+        return false;
+    };
+    const file = client.lookup(root.token, pie_user_rootfs_name) catch |err| {
+        st.writeLine("pie_user.elf missing");
+        shellLogLine("pie_user.elf missing");
+        _ = userLog(@errorName(err));
+        _ = userLog("\n");
+        st.persistent_fs_client_ready = false;
+        return false;
+    };
+    const exec = client.openExec(file.token) catch |err| {
+        st.writeLine("pie open_exec failed");
+        shellLogLine("pie open_exec failed");
+        _ = userLog(@errorName(err));
+        _ = userLog("\n");
+        st.persistent_fs_client_ready = false;
+        return false;
+    };
+    const spawned = spawnExec(exec.token);
+    const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+        st.writeLine("pie spawn failed");
+        shellLogLine("pie spawn failed");
+        return false;
+    };
+    var line_buf: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "pie_user spawned slot={d}", .{child_slot}) catch return false;
+    st.writeLine(line);
+    shellLogLine("pie_user done");
+    return true;
+}
+
 fn executeCommand(st: *ShellState) RenderAction {
     const cmd = trimSpaces(st.cmd[0..st.cmd_len]);
     if (cmd.len == 0) return .prompt;
 
     if (eqAsciiNoCase(cmd, "help")) {
-        st.writeLine("commands: help clear block_demo fs_demo");
+        st.writeLine("commands: help clear block_demo fs_demo pie_user");
         st.writeLine("clear resets screen");
         return .full;
     }
@@ -1084,6 +1143,19 @@ fn executeCommand(st: *ShellState) RenderAction {
             st.writeLine("fs demo ok");
         } else {
             st.writeLine("fs demo failed");
+        }
+        return .full;
+    }
+    if (eqAsciiNoCase(cmd, "pie") or eqAsciiNoCase(cmd, "pie_user")) {
+        if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
+            st.writeLine(persistentFsUnavailableReason());
+            shellLogLine(persistentFsUnavailableReason());
+            return .full;
+        }
+        if (runPersistentFsPieUser(st)) {
+            st.writeLine("pie_user ok");
+        } else {
+            st.writeLine("pie_user failed");
         }
         return .full;
     }

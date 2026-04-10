@@ -21,6 +21,9 @@ pub fn build(b: *std.Build) void {
         .os_tag = .uefi,
         .abi = .msvc,
     });
+    const persistent_fs_layout_mod = b.createModule(.{
+        .root_source_file = b.path("shared/persistent_fs_layout.zig"),
+    });
 
     const efi_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -375,6 +378,7 @@ pub fn build(b: *std.Build) void {
         .code_model = .small,
         .red_zone = false,
     });
+    persistent_fs_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
     persistent_fs_mod.strip = true;
     const persistent_fs_app = b.addExecutable(.{
         .name = "PERSFS",
@@ -389,6 +393,40 @@ pub fn build(b: *std.Build) void {
     });
     const persistent_fs_step = b.step("persistent-fs-elf", "Build persistent fs PIE ELF");
     persistent_fs_step.dependOn(&install_persistent_fs.step);
+
+    const pie_user_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/pie_user.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    pie_user_mod.strip = true;
+    pie_user_mod.addIncludePath(b.path("../user/libcapc"));
+    pie_user_mod.addCSourceFiles(.{
+        .root = b.path("../user/libcapc"),
+        .files = &.{
+            "capc.c",
+            "cap_errno.c",
+        },
+        .flags = &.{
+            "-ffreestanding",
+            "-fno-stack-protector",
+        },
+    });
+    const pie_user_app = b.addExecutable(.{
+        .name = "USERAPP",
+        .root_module = pie_user_mod,
+    });
+    pie_user_app.pie = true;
+    pie_user_app.entry = .{ .symbol_name = "_start" };
+    pie_user_app.link_z_common_page_size = 0x10;
+    pie_user_app.link_z_max_page_size = 0x10;
+    const install_pie_user = b.addInstallArtifact(pie_user_app, .{
+        .dest_sub_path = "EFI/BOOT/USERAPP.ELF",
+    });
+    const pie_user_step = b.step("pie-user-elf", "Build pie_user PIE ELF");
+    pie_user_step.dependOn(&install_pie_user.step);
 
     const bootfs_builder_mod = b.createModule(.{
         .root_source_file = b.path("tools/bootfs_builder.zig"),
@@ -410,6 +448,20 @@ pub fn build(b: *std.Build) void {
     const install_bootfs_image = b.addInstallBinFile(bootfs_image_out, "EFI/BOOT/BOOTFS.IMG");
     const bootfs_step = b.step("bootfs-img", "Build bootfs image");
     bootfs_step.dependOn(&install_bootfs_image.step);
+
+    const rootfs_put_mod = b.createModule(.{
+        .root_source_file = b.path("tools/rootfs_put.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    rootfs_put_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
+    const rootfs_put_app = b.addExecutable(.{
+        .name = "rootfs_put",
+        .root_module = rootfs_put_mod,
+    });
+    const install_rootfs_put = b.addInstallArtifact(rootfs_put_app, .{});
+    const rootfs_put_step = b.step("rootfs-put-tool", "Build host-side rootfs_put tool");
+    rootfs_put_step.dependOn(&install_rootfs_put.step);
 
     const capc_hello_cmd = b.addSystemCommand(&[_][]const u8{
         b.graph.zig_exe,
@@ -442,7 +494,9 @@ pub fn build(b: *std.Build) void {
     install_efi.step.dependOn(&install_init.step);
     install_efi.step.dependOn(&install_boot_log_console.step);
     install_efi.step.dependOn(&install_persistent_fs.step);
+    install_efi.step.dependOn(&install_pie_user.step);
     install_efi.step.dependOn(&install_bootfs_image.step);
+    install_efi.step.dependOn(&install_rootfs_put.step);
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
 }

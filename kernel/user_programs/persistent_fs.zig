@@ -4,6 +4,7 @@ const cap_transfer_abi = @import("cap_transfer_abi.zig");
 const fs_abi = @import("fs_abi.zig");
 const fs_protocol = @import("fs_protocol.zig");
 const image_abi = @import("image_abi.zig");
+const layout = @import("persistent_fs_layout");
 const persistent_fs_bootstrap = @import("persistent_fs_bootstrap_abi.zig");
 const process_abi = @import("process_abi.zig");
 
@@ -24,23 +25,19 @@ const reply_endpoint_id_base: u64 = 0xD0;
 const max_sessions: usize = 4;
 const max_session_objects: usize = 16;
 const max_block_bytes: usize = 4096;
-const max_dir_entries: usize = 64;
-const max_name_bytes: usize = 32;
+const max_dir_entries: usize = layout.max_dir_entries;
+const max_name_bytes: usize = layout.max_name_bytes;
 const max_exec_file_bytes: usize = 256 * 1024;
 const max_exec_slots: usize = 16;
 const page_bytes: usize = 4096;
 const exec_slot_base_va: u64 = 0x3C20_0000;
 const exec_slot_va_stride: u64 = max_exec_file_bytes;
-const fs_region_start_block: u64 = 2048;
-const volume_magic: u64 = 0x3153_4650; // "PFS1"
-const volume_version: u64 = 1;
 const root_mount_object_id: u64 = 0x5053_4653; // "PSFS"
 const root_dir_object_id: u64 = 0x5053_4654; // "PSFT"
 const vnode_file_object_id_base: u64 = 0x5053_4700;
 const open_file_object_id_base: u64 = 0x5053_4800;
-const dir_entry_flag_used: u32 = 1;
-const dir_mode_bits: u32 = 0x4000;
-const file_mode_bits: u32 = 0x8000;
+const dir_mode_bits: u32 = layout.dir_mode_bits;
+const file_mode_bits: u32 = layout.file_mode_bits;
 
 const SessionObjectKind = enum {
     mount,
@@ -67,27 +64,8 @@ const Session = struct {
     objects: [max_session_objects]SessionObject = [_]SessionObject{.{}} ** max_session_objects,
 };
 
-const VolumeSuperblock = extern struct {
-    magic: u64 = volume_magic,
-    version: u64 = volume_version,
-    block_size: u64 = 0,
-    fs_start_block: u64 = fs_region_start_block,
-    dir_start_block: u64 = 0,
-    dir_block_count: u64 = 0,
-    data_start_block: u64 = 0,
-    next_free_block: u64 = 0,
-};
-
-const VolumeDirEntry = extern struct {
-    flags: u32 = 0,
-    name_bytes: u16 = 0,
-    reserved0: u16 = 0,
-    file_size: u64 = 0,
-    start_block: u64 = 0,
-    block_count: u32 = 0,
-    reserved1: u32 = 0,
-    name: [max_name_bytes]u8 = [_]u8{0} ** max_name_bytes,
-};
+const VolumeSuperblock = layout.VolumeSuperblock;
+const VolumeDirEntry = layout.VolumeDirEntry;
 
 const ExecImageSlot = struct {
     active: bool = false,
@@ -97,14 +75,13 @@ const ExecImageSlot = struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(VolumeSuperblock) == 64);
-    std.debug.assert(@sizeOf(VolumeDirEntry) == 64);
     std.debug.assert(max_exec_file_bytes % page_bytes == 0);
 }
 
 var endpoint_id: u64 = 0;
 var admin_token: u64 = 0;
 var process_slot: u64 = 0;
+var volume_region_start_block: u64 = 0;
 var block_size: u64 = 0;
 var capacity_blocks: u64 = 0;
 var root_mount_server_token: u64 = 0;
@@ -389,8 +366,9 @@ fn parseConfig() bool {
     if (words[0] != persistent_fs_bootstrap.config_magic) return false;
     if (words[1] != persistent_fs_bootstrap.config_version) return false;
     endpoint_id = words[persistent_fs_bootstrap.endpoint_id_index];
+    volume_region_start_block = words[persistent_fs_bootstrap.fs_start_block_index];
     admin_token = words[persistent_fs_bootstrap.admin_token_index];
-    return endpoint_id != 0 and fs_abi.isCapToken(admin_token);
+    return endpoint_id != 0 and volume_region_start_block >= 2048 and fs_abi.isCapToken(admin_token);
 }
 
 fn blockSlice(buffer: []u8) []u8 {
@@ -435,39 +413,31 @@ fn dirEntryBytesMut(entry: *VolumeDirEntry) []u8 {
 }
 
 fn requiredDirBlockCount() u64 {
-    const bytes: u64 = max_dir_entries * @sizeOf(VolumeDirEntry);
-    return (bytes + block_size - 1) / block_size;
+    return layout.requiredDirBlockCount(block_size);
 }
 
 fn expectedDirStartBlock() u64 {
-    return fs_region_start_block + 1;
+    return layout.expectedDirStartBlock(volume_region_start_block);
 }
 
 fn expectedDataStartBlock() u64 {
-    return expectedDirStartBlock() + requiredDirBlockCount();
+    return layout.expectedDataStartBlock(volume_region_start_block, block_size);
 }
 
 fn validateSuperblock(sb: *const VolumeSuperblock) bool {
-    if (sb.magic != volume_magic or sb.version != volume_version) return false;
-    if (sb.block_size != block_size) return false;
-    if (sb.fs_start_block != fs_region_start_block) return false;
-    if (sb.dir_start_block != expectedDirStartBlock()) return false;
-    if (sb.dir_block_count != requiredDirBlockCount()) return false;
-    if (sb.data_start_block != expectedDataStartBlock()) return false;
-    if (sb.next_free_block < sb.data_start_block or sb.next_free_block > capacity_blocks) return false;
-    return true;
+    return layout.validateSuperblock(sb, volume_region_start_block, block_size, capacity_blocks);
 }
 
 fn persistSuperblock() bool {
     const block = blockSlice(block_buffer[0..]);
     @memset(block, 0);
     @memcpy(block[0..@sizeOf(VolumeSuperblock)], std.mem.asBytes(&volume_superblock));
-    return writeBlock(fs_region_start_block, block);
+    return writeBlock(volume_region_start_block, block);
 }
 
 fn loadSuperblock() bool {
     const block = blockSlice(block_buffer[0..]);
-    if (!readBlock(fs_region_start_block, block)) return false;
+    if (!readBlock(volume_region_start_block, block)) return false;
     @memcpy(std.mem.asBytes(&volume_superblock), block[0..@sizeOf(VolumeSuperblock)]);
     return validateSuperblock(&volume_superblock);
 }
@@ -495,7 +465,7 @@ fn persistDirectory() bool {
 }
 
 fn loadDirectory() bool {
-    volume_dir_entries = [_]VolumeDirEntry{.{}} ** max_dir_entries;
+    layout.clearDirectory(&volume_dir_entries);
     const entries_per_block: usize = @intCast(block_size / @sizeOf(VolumeDirEntry));
     if (entries_per_block == 0) return false;
     var entry_index: usize = 0;
@@ -517,20 +487,9 @@ fn loadDirectory() bool {
 }
 
 fn formatVolume() bool {
-    const dir_block_count = requiredDirBlockCount();
-    const data_start_block = fs_region_start_block + 1 + dir_block_count;
-    if (capacity_blocks <= data_start_block + 16) return false;
-    volume_superblock = .{
-        .magic = volume_magic,
-        .version = volume_version,
-        .block_size = block_size,
-        .fs_start_block = fs_region_start_block,
-        .dir_start_block = fs_region_start_block + 1,
-        .dir_block_count = dir_block_count,
-        .data_start_block = data_start_block,
-        .next_free_block = data_start_block,
-    };
-    volume_dir_entries = [_]VolumeDirEntry{.{}} ** max_dir_entries;
+    if (!layout.canFormatVolume(volume_region_start_block, block_size, capacity_blocks)) return false;
+    volume_superblock = layout.initSuperblock(volume_region_start_block, block_size);
+    layout.clearDirectory(&volume_dir_entries);
     if (!persistSuperblock()) return false;
     if (!persistDirectory()) return false;
     if (!flushBlocks()) return false;
@@ -557,11 +516,11 @@ fn initRootCaps() bool {
 }
 
 fn dirEntryUsed(entry: *const VolumeDirEntry) bool {
-    return (entry.flags & dir_entry_flag_used) != 0;
+    return layout.dirEntryUsed(entry);
 }
 
 fn dirEntryName(entry: *const VolumeDirEntry) []const u8 {
-    return entry.name[0..entry.name_bytes];
+    return layout.dirEntryName(entry);
 }
 
 fn namesEqualVolatile(bytes: [*]volatile u8, len: usize, expected: []const u8) bool {
@@ -605,9 +564,8 @@ fn allocDirEntry(name: []const u8) ?usize {
     for (&volume_dir_entries, 0..) |*entry, index| {
         if (dirEntryUsed(entry)) continue;
         entry.* = .{};
-        entry.flags = dir_entry_flag_used;
-        entry.name_bytes = @intCast(name.len);
-        @memcpy(entry.name[0..name.len], name);
+        entry.flags = layout.dir_entry_flag_used;
+        layout.setDirEntryName(entry, name);
         return index;
     }
     return null;
@@ -961,33 +919,80 @@ fn readFileBytes(entry: *const VolumeDirEntry, offset: u64, out: []u8) ?usize {
     return copied;
 }
 
-fn writeFileBytes(entry: *VolumeDirEntry, file_index: usize, data: []const u8) fs_protocol.Status {
-    const needed_blocks: u64 = if (data.len == 0) 0 else (@as(u64, @intCast(data.len)) + block_size - 1) / block_size;
-    const current_blocks: u64 = if (entry.start_block == 0) 0 else entry.block_count;
-    const target_start: u64 = blk: {
-        if (needed_blocks == 0) break :blk 0;
-        if (current_blocks != 0 and needed_blocks <= current_blocks) break :blk entry.start_block;
-        break :blk findFreeExtent(needed_blocks, file_index) orelse return .too_big;
-    };
+fn blocksForSize(size_bytes: u64) u64 {
+    return layout.blocksForSize(block_size, size_bytes);
+}
 
-    if (needed_blocks > 0) {
-        var remaining = data;
-        var block_index = target_start;
-        var written_blocks: u64 = 0;
-        while (written_blocks < needed_blocks) : (written_blocks += 1) {
-            const block = blockSlice(block_buffer[0..]);
-            @memset(block, 0);
-            const chunk = @min(remaining.len, @as(usize, @intCast(block_size)));
-            @memcpy(block[0..chunk], remaining[0..chunk]);
-            if (!writeBlock(block_index, block)) return .io_error;
-            remaining = remaining[chunk..];
-            block_index += 1;
+fn zeroBlocks(start_block: u64, block_count: u64) bool {
+    if (start_block == 0 or block_count == 0) return true;
+    var block_index: u64 = 0;
+    while (block_index < block_count) : (block_index += 1) {
+        const block = blockSlice(block_buffer[0..]);
+        @memset(block, 0);
+        if (!writeBlock(start_block + block_index, block)) return false;
+    }
+    return true;
+}
+
+fn copyBlocks(src_start_block: u64, dst_start_block: u64, block_count: u64) bool {
+    if (src_start_block == 0 or dst_start_block == 0 or block_count == 0) return true;
+    if (src_start_block == dst_start_block) return true;
+    var block_index: u64 = 0;
+    while (block_index < block_count) : (block_index += 1) {
+        const block = blockSlice(block_buffer[0..]);
+        if (!readBlock(src_start_block + block_index, block)) return false;
+        if (!writeBlock(dst_start_block + block_index, block)) return false;
+    }
+    return true;
+}
+
+fn writeFileBytes(entry: *VolumeDirEntry, file_index: usize, offset: u64, data: []const u8) fs_protocol.Status {
+    if (data.len == 0) return .ok;
+    const write_end = offset + @as(u64, @intCast(data.len));
+    const needed_blocks = blocksForSize(write_end);
+    const current_blocks: u64 = if (entry.start_block == 0) 0 else entry.block_count;
+
+    if (needed_blocks > 0 and entry.start_block == 0) {
+        const start_block = findFreeExtent(needed_blocks, file_index) orelse return .too_big;
+        if (!zeroBlocks(start_block, needed_blocks)) return .io_error;
+        entry.start_block = start_block;
+        entry.block_count = @intCast(needed_blocks);
+    } else if (needed_blocks > current_blocks) {
+        const start_block = findFreeExtent(needed_blocks, file_index) orelse return .too_big;
+        if (!copyBlocks(entry.start_block, start_block, current_blocks)) return .io_error;
+        if (needed_blocks > current_blocks) {
+            if (!zeroBlocks(start_block + current_blocks, needed_blocks - current_blocks)) return .io_error;
         }
+        entry.start_block = start_block;
+        entry.block_count = @intCast(needed_blocks);
     }
 
-    entry.start_block = target_start;
-    entry.block_count = @intCast(needed_blocks);
-    entry.file_size = @intCast(data.len);
+    var remaining = data;
+    var write_offset = offset;
+    while (remaining.len > 0) {
+        const relative_block = write_offset / block_size;
+        const block_index = entry.start_block + relative_block;
+        const block_offset: usize = @intCast(write_offset % block_size);
+        const chunk = @min(remaining.len, @as(usize, @intCast(block_size)) - block_offset);
+        const whole_block = block_offset == 0 and chunk == @as(usize, @intCast(block_size));
+        const block = blockSlice(block_buffer[0..]);
+
+        if (whole_block) {
+            @memcpy(block[0..chunk], remaining[0..chunk]);
+        } else {
+            if (relative_block < current_blocks) {
+                if (!readBlock(block_index, block)) return .io_error;
+            } else {
+                @memset(block, 0);
+            }
+            @memcpy(block[block_offset .. block_offset + chunk], remaining[0..chunk]);
+        }
+        if (!writeBlock(block_index, block)) return .io_error;
+        remaining = remaining[chunk..];
+        write_offset += chunk;
+    }
+
+    if (write_end > entry.file_size) entry.file_size = write_end;
     recomputeNextFreeBlock();
     if (!persistDirectory()) return .io_error;
     if (!persistSuperblock()) return .io_error;
@@ -1154,10 +1159,6 @@ fn handleWrite(session: *Session, request_seq: u64) void {
         replyStatus(session, .write, request_seq, .invalid);
         return;
     }
-    if (request.offset != 0) {
-        replyStatus(session, .write, request_seq, .not_supported);
-        return;
-    }
     const entry = &volume_dir_entries[object.file_index];
     if (!dirEntryUsed(entry)) {
         replyStatus(session, .write, request_seq, .not_found);
@@ -1167,7 +1168,7 @@ fn handleWrite(session: *Session, request_seq: u64) void {
         replyStatus(session, .write, request_seq, .too_big);
         return;
     };
-    const status = writeFileBytes(entry, object.file_index, payload);
+    const status = writeFileBytes(entry, object.file_index, request.offset, payload);
     if (status != .ok) {
         replyStatus(session, .write, request_seq, status);
         return;
@@ -1240,9 +1241,7 @@ fn handleRename(session: *Session, request_seq: u64) void {
             }
         }
         const entry = &volume_dir_entries[file_index];
-        @memset(entry.name[0..], 0);
-        @memcpy(entry.name[0..new_name.len], new_name);
-        entry.name_bytes = @intCast(new_name.len);
+        layout.setDirEntryName(entry, new_name);
         if (!persistDirectory() or !flushBlocks()) {
             replyStatus(session, .rename, request_seq, .io_error);
             return;
