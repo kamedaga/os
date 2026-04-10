@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
     });
     boot_log_console_mod.strip = true;
     const boot_log_console_app = b.addExecutable(.{
-        .name = "BOOTLOG",
+        .name = "SHELL",
         .root_module = boot_log_console_mod,
     });
     boot_log_console_app.pie = true;
@@ -77,9 +77,9 @@ pub fn build(b: *std.Build) void {
     boot_log_console_app.link_z_common_page_size = 0x10;
     boot_log_console_app.link_z_max_page_size = 0x10;
     const install_boot_log_console = b.addInstallArtifact(boot_log_console_app, .{
-        .dest_sub_path = "EFI/BOOT/BOOTLOG.ELF",
+        .dest_sub_path = "EFI/BOOT/SHELL.ELF",
     });
-    const boot_log_console_step = b.step("boot-log-console-elf", "Build boot log console PIE ELF");
+    const boot_log_console_step = b.step("shell-elf", "Build shell PIE ELF");
     boot_log_console_step.dependOn(&install_boot_log_console.step);
 
     const mouse_driver_mod = b.createModule(.{
@@ -324,6 +324,72 @@ pub fn build(b: *std.Build) void {
     const vfs_step = b.step("vfs-elf", "Build VFS PIE ELF");
     vfs_step.dependOn(&install_vfs.step);
 
+    const virtio_blk_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/virtio_blk.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    virtio_blk_mod.strip = true;
+    const virtio_blk_app = b.addExecutable(.{
+        .name = "VBLKDRV",
+        .root_module = virtio_blk_mod,
+    });
+    virtio_blk_app.pie = true;
+    virtio_blk_app.entry = .{ .symbol_name = "_start" };
+    virtio_blk_app.link_z_common_page_size = 0x10;
+    virtio_blk_app.link_z_max_page_size = 0x10;
+    const install_virtio_blk = b.addInstallArtifact(virtio_blk_app, .{
+        .dest_sub_path = "EFI/BOOT/VBLKDRV.ELF",
+    });
+    const virtio_blk_step = b.step("virtio-blk-elf", "Build virtio-blk PIE ELF");
+    virtio_blk_step.dependOn(&install_virtio_blk.step);
+
+    const block_demo_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/block_demo.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    block_demo_mod.strip = true;
+    const block_demo_app = b.addExecutable(.{
+        .name = "BLKDEMO",
+        .root_module = block_demo_mod,
+    });
+    block_demo_app.pie = true;
+    block_demo_app.entry = .{ .symbol_name = "_start" };
+    block_demo_app.link_z_common_page_size = 0x10;
+    block_demo_app.link_z_max_page_size = 0x10;
+    const install_block_demo = b.addInstallArtifact(block_demo_app, .{
+        .dest_sub_path = "EFI/BOOT/BLKDEMO.ELF",
+    });
+    const block_demo_step = b.step("block-demo-elf", "Build block demo PIE ELF");
+    block_demo_step.dependOn(&install_block_demo.step);
+
+    const persistent_fs_mod = b.createModule(.{
+        .root_source_file = b.path("user_programs/persistent_fs.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    persistent_fs_mod.strip = true;
+    const persistent_fs_app = b.addExecutable(.{
+        .name = "PERSFS",
+        .root_module = persistent_fs_mod,
+    });
+    persistent_fs_app.pie = true;
+    persistent_fs_app.entry = .{ .symbol_name = "_start" };
+    persistent_fs_app.link_z_common_page_size = 0x10;
+    persistent_fs_app.link_z_max_page_size = 0x10;
+    const install_persistent_fs = b.addInstallArtifact(persistent_fs_app, .{
+        .dest_sub_path = "EFI/BOOT/PERSFS.ELF",
+    });
+    const persistent_fs_step = b.step("persistent-fs-elf", "Build persistent fs PIE ELF");
+    persistent_fs_step.dependOn(&install_persistent_fs.step);
+
     const bootfs_builder_mod = b.createModule(.{
         .root_source_file = b.path("tools/bootfs_builder.zig"),
         .target = b.graph.host,
@@ -337,24 +403,10 @@ pub fn build(b: *std.Build) void {
     const bootfs_image_out = bootfs_builder_run.addOutputFileArg("BOOTFS.IMG");
     bootfs_builder_run.addArg("/boot/startup_manifest.txt");
     bootfs_builder_run.addFileArg(b.path("bootfs/startup_manifest.txt"));
-    bootfs_builder_run.addArg("/boot/init.elf");
-    bootfs_builder_run.addFileArg(init_app.getEmittedBin());
-    bootfs_builder_run.addArg("/boot/vfs.elf");
-    bootfs_builder_run.addFileArg(vfs_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/compositor.elf");
-    bootfs_builder_run.addFileArg(compositor_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/gpu_compositor.elf");
-    bootfs_builder_run.addFileArg(gpu_compositor_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/keyboard_driver.elf");
-    bootfs_builder_run.addFileArg(keyboard_driver_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/mouse_button_demo.elf");
-    bootfs_builder_run.addFileArg(mouse_button_demo_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/mouse_driver.elf");
-    bootfs_builder_run.addFileArg(mouse_driver_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/taskbar.elf");
-    bootfs_builder_run.addFileArg(taskbar_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/terminal_window.elf");
-    bootfs_builder_run.addFileArg(terminal_window_app.getEmittedBin());
+    bootfs_builder_run.addArg("/bin/virtio_blk.elf");
+    bootfs_builder_run.addFileArg(virtio_blk_app.getEmittedBin());
+    bootfs_builder_run.addArg("/bin/persistent_fs.elf");
+    bootfs_builder_run.addFileArg(persistent_fs_app.getEmittedBin());
     const install_bootfs_image = b.addInstallBinFile(bootfs_image_out, "EFI/BOOT/BOOTFS.IMG");
     const bootfs_step = b.step("bootfs-img", "Build bootfs image");
     bootfs_step.dependOn(&install_bootfs_image.step);
@@ -389,18 +441,8 @@ pub fn build(b: *std.Build) void {
     });
     install_efi.step.dependOn(&install_init.step);
     install_efi.step.dependOn(&install_boot_log_console.step);
-    install_efi.step.dependOn(&install_mouse_driver.step);
-    install_efi.step.dependOn(&install_keyboard_driver.step);
-    install_efi.step.dependOn(&install_bootlog_sender.step);
-    install_efi.step.dependOn(&install_mouse_button_demo.step);
-    install_efi.step.dependOn(&install_terminal_window.step);
-    install_efi.step.dependOn(&install_taskbar.step);
-    install_efi.step.dependOn(&install_mouse_draw.step);
-    install_efi.step.dependOn(&install_compositor.step);
-    install_efi.step.dependOn(&install_gpu_compositor.step);
-    install_efi.step.dependOn(&install_vfs.step);
+    install_efi.step.dependOn(&install_persistent_fs.step);
     install_efi.step.dependOn(&install_bootfs_image.step);
-    install_efi.step.dependOn(&install_capc_hello.step);
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
 }

@@ -14,7 +14,7 @@ const shared_magic: u64 = mouse_shared_abi.magic;
 const shared_header_bytes: usize = mouse_shared_abi.header_bytes;
 const shared_log_max_bytes: usize = mouse_shared_abi.log_capacity_bytes;
 
-const endpoint_to_process1: u64 = 0x11;
+const endpoint_to_boot_display: u64 = 0x11;
 const bootlog_ipc_magic: u64 = 0x424C4F47; // "BLOG"
 const bootlog_ipc_header_bytes: usize = 16;
 
@@ -92,7 +92,7 @@ pub export fn _start() noreturn {
         msg_bytes[bootlog_ipc_header_bytes + i] = shared_bytes[shared_header_bytes + i];
     }
 
-    if (sendCap(page_paddr, endpoint_to_process1) != syscall_ok) {
+    if (sendCap(page_paddr, endpoint_to_boot_display) != syscall_ok) {
         _ = userLog("BootLogSender: send_cap failed\n");
         while (true) asm volatile ("pause");
     }

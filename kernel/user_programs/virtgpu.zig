@@ -1,5 +1,6 @@
 const std = @import("std");
 const device_abi = @import("device_abi.zig");
+const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_queue_submit: u64 = 0xE;
@@ -60,7 +61,7 @@ const cursor_queue_region_bytes: usize = cursor_queue_page1_va + 4096 - cursor_q
 const queue_used_offset: usize = 4096;
 const requested_queue_size: u16 = 8;
 const max_backing_pages: usize = 512;
-const max_alloc_chunk_pages: usize = 16;
+const max_alloc_chunk_pages: usize = 64;
 const max_resources: usize = 8;
 const init_alloc_page_count: u64 = 7;
 const mem_entry_page_count: u64 = 2;
@@ -69,6 +70,7 @@ const wait_spin_limit: usize = 256;
 const wait_sleep_limit: usize = 1024;
 const cursor_dim: usize = 64;
 const warm_state_magic: u64 = 0x56475057; // "VGPW"
+const warm_scanout_magic: u64 = 0x56475343; // "VGSC"
 const state_canary_magic: u64 = 0x5653544154453031; // "VSTATE01"
 const resource_canary_magic: u64 = 0x5652535243303031; // "VRSRC001"
 const cfg_warm_state_index: usize = 11;
@@ -85,6 +87,14 @@ const cfg_control_submit_token_index: usize = 21;
 const cfg_control_notify_token_index: usize = 22;
 const cfg_cursor_submit_token_index: usize = 23;
 const cfg_cursor_notify_token_index: usize = 24;
+const cfg_warm_scanout_index: usize = 25;
+const cfg_warm_scanout_slot_index: usize = 26;
+const cfg_warm_scanout_resource_id_index: usize = 27;
+const cfg_warm_scanout_width_index: usize = 28;
+const cfg_warm_scanout_height_index: usize = 29;
+const cfg_warm_scanout_stride_bytes_index: usize = 30;
+const cfg_warm_scanout_page_count_index: usize = 31;
+const cfg_warm_scanout_bytes_len_index: usize = 32;
 
 const desc_flag_next: u16 = 1 << 0;
 const desc_flag_write: u16 = 1 << 1;
@@ -252,6 +262,17 @@ fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_map_mmio),
+          [arg0] "{rdi}" (va),
+          [arg1] "{rsi}" (paddr),
+          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_map_page),
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
@@ -536,6 +557,15 @@ fn logText(text: []const u8) void {
     _ = userLog(text);
 }
 
+fn logTaggedStage(tag: []const u8, stage: []const u8) void {
+    var buf: [160]u8 = undefined;
+    var idx: usize = 0;
+    appendText(buf[0..], &idx, tag);
+    appendText(buf[0..], &idx, stage);
+    appendText(buf[0..], &idx, "\n");
+    logText(buf[0..idx]);
+}
+
 fn stateLooksValid() bool {
     if (state.canary != state_canary_magic) return false;
     if (state.ready) {
@@ -804,6 +834,25 @@ fn loadPreallocatedQueuePaddrs() bool {
         state.cursor_queue_paddr1 >= 0x1000;
 }
 
+fn logWarmRestoreFailure(reason: []const u8) void {
+    var buf: [80]u8 = undefined;
+    var idx: usize = 0;
+    appendText(buf[0..], &idx, "Compositor: virtgpu warm restore rejected (");
+    appendText(buf[0..], &idx, reason);
+    appendText(buf[0..], &idx, ")\n");
+    logText(buf[0..idx]);
+}
+
+fn remapStoredWarmPages() bool {
+    return mapPage(queue_page0_va, state.queue_paddr0, true) == syscall_ok and
+        mapPage(queue_page1_va, state.queue_paddr1, true) == syscall_ok and
+        mapPage(control_page_va, state.control_page_paddr, true) == syscall_ok and
+        mapPage(mem_entries_page0_va, state.mem_entries_paddr0, true) == syscall_ok and
+        mapPage(mem_entries_page1_va, state.mem_entries_paddr1, true) == syscall_ok and
+        mapPage(cursor_queue_page0_va, state.cursor_queue_paddr0, true) == syscall_ok and
+        mapPage(cursor_queue_page1_va, state.cursor_queue_paddr1, true) == syscall_ok;
+}
+
 fn recordWarmState() void {
     writeCfgU64(cfg_warm_state_index, warm_state_magic);
     writeCfgU64(cfg_queue_paddr0_index, state.queue_paddr0);
@@ -817,16 +866,96 @@ fn recordWarmState() void {
     writeCfgU64(cfg_cursor_queue_size_index, state.cursor_queue_size);
 }
 
+fn clearWarmScanout() void {
+    writeCfgU64(cfg_warm_scanout_index, 0);
+    writeCfgU64(cfg_warm_scanout_slot_index, 0);
+    writeCfgU64(cfg_warm_scanout_resource_id_index, 0);
+    writeCfgU64(cfg_warm_scanout_width_index, 0);
+    writeCfgU64(cfg_warm_scanout_height_index, 0);
+    writeCfgU64(cfg_warm_scanout_stride_bytes_index, 0);
+    writeCfgU64(cfg_warm_scanout_page_count_index, 0);
+    writeCfgU64(cfg_warm_scanout_bytes_len_index, 0);
+}
+
+fn recordWarmScanout(resource: *const Resource) void {
+    writeCfgU64(cfg_warm_scanout_index, warm_scanout_magic);
+    writeCfgU64(cfg_warm_scanout_slot_index, @as(u64, @intCast(resource.slot_index)));
+    writeCfgU64(cfg_warm_scanout_resource_id_index, @as(u64, resource.resource_id));
+    writeCfgU64(cfg_warm_scanout_width_index, @as(u64, resource.width));
+    writeCfgU64(cfg_warm_scanout_height_index, @as(u64, resource.height));
+    writeCfgU64(cfg_warm_scanout_stride_bytes_index, @as(u64, resource.stride_bytes));
+    writeCfgU64(cfg_warm_scanout_page_count_index, @as(u64, @intCast(resource.page_count)));
+    writeCfgU64(cfg_warm_scanout_bytes_len_index, @as(u64, @intCast(resource.bytes_len)));
+}
+
+fn tryRestoreWarmScanout(width: usize, height: usize) ?ResourceHandle {
+    if (readCfgU64(cfg_warm_scanout_index) != warm_scanout_magic) return null;
+
+    const slot_index_raw = readCfgU64(cfg_warm_scanout_slot_index);
+    const resource_id_raw = readCfgU64(cfg_warm_scanout_resource_id_index);
+    const stored_width_raw = readCfgU64(cfg_warm_scanout_width_index);
+    const stored_height_raw = readCfgU64(cfg_warm_scanout_height_index);
+    const stride_bytes_raw = readCfgU64(cfg_warm_scanout_stride_bytes_index);
+    const page_count_raw = readCfgU64(cfg_warm_scanout_page_count_index);
+    const bytes_len_raw = readCfgU64(cfg_warm_scanout_bytes_len_index);
+
+    if (slot_index_raw >= @as(u64, @intCast(max_resources)) or
+        resource_id_raw == 0 or
+        stored_width_raw != @as(u64, @intCast(width)) or
+        stored_height_raw != @as(u64, @intCast(height)))
+    {
+        return null;
+    }
+
+    const expected_stride_bytes: u64 = @intCast(width * 4);
+    const expected_bytes_len: u64 = @intCast((width * 4) * height);
+    if (stride_bytes_raw != expected_stride_bytes or
+        bytes_len_raw != expected_bytes_len or
+        page_count_raw == 0 or
+        page_count_raw > @as(u64, @intCast(max_backing_pages)) or
+        page_count_raw * 4096 < bytes_len_raw)
+    {
+        return null;
+    }
+
+    const slot_index: usize = @intCast(slot_index_raw);
+    const resource = &resources[slot_index];
+    zeroResource(resource, slot_index);
+    resource.in_use = true;
+    resource.ready = true;
+    resource.resource_id = @intCast(resource_id_raw);
+    resource.width = @intCast(stored_width_raw);
+    resource.height = @intCast(stored_height_raw);
+    resource.stride_bytes = @intCast(stride_bytes_raw);
+    resource.page_count = @intCast(page_count_raw);
+    resource.bytes_len = @intCast(bytes_len_raw);
+    resource.pixels = @ptrFromInt(resource.base_va);
+    if (!resourceLooksValid(resource)) {
+        zeroResource(resource, slot_index);
+        return null;
+    }
+    if (state.next_resource_id <= resource.resource_id) {
+        state.next_resource_id = resource.resource_id + 1;
+    }
+    return slot_index;
+}
+
 fn tryRestoreWarmState() bool {
-    if (readCfgU64(cfg_warm_state_index) != warm_state_magic) return false;
+    if (readCfgU64(cfg_warm_state_index) != warm_state_magic) {
+        logWarmRestoreFailure("missing magic");
+        return false;
+    }
 
     const common_page_paddr = readCfgU64(1);
     const notify_page_paddr = readCfgU64(2);
-    if (common_page_paddr < 0x1000 or notify_page_paddr < 0x1000) return false;
+    if (common_page_paddr < 0x1000 or notify_page_paddr < 0x1000) {
+        logWarmRestoreFailure("missing mmio paddr");
+        return false;
+    }
     const common_off_raw = readCfgU64(5);
     const notify_off_raw = readCfgU64(6);
     if (common_off_raw >= 4096 or notify_off_raw >= 4096) {
-        logText("Compositor: virtgpu warm restore rejected (bad cfg offset)\n");
+        logWarmRestoreFailure("bad cfg offset");
         return false;
     }
 
@@ -838,15 +967,37 @@ fn tryRestoreWarmState() bool {
     state.control_notify_token = readCfgU64(cfg_control_notify_token_index);
     state.cursor_submit_token = readCfgU64(cfg_cursor_submit_token_index);
     state.cursor_notify_token = readCfgU64(cfg_cursor_notify_token_index);
-    if (state.notify_off_multiplier == 0) return false;
+    if (state.notify_off_multiplier == 0) {
+        logWarmRestoreFailure("notify multiplier zero");
+        return false;
+    }
 
-    if (state.control_submit_token == 0 or state.control_notify_token == 0 or state.cursor_submit_token == 0 or state.cursor_notify_token == 0) return false;
-    if (!loadPreallocatedQueuePaddrs()) return false;
+    if (state.control_submit_token == 0 or state.control_notify_token == 0 or state.cursor_submit_token == 0 or state.cursor_notify_token == 0) {
+        logWarmRestoreFailure("missing queue tokens");
+        return false;
+    }
+    if (!loadPreallocatedQueuePaddrs()) {
+        logWarmRestoreFailure("missing queue paddr");
+        return false;
+    }
     state.queue_size = @intCast(readCfgU64(cfg_queue_size_index));
     state.cursor_queue_size = @intCast(readCfgU64(cfg_cursor_queue_size_index));
-    if (state.queue_size < 4 or state.cursor_queue_size < 2) return false;
-    if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return false;
-    if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) return false;
+    if (state.queue_size < 4 or state.cursor_queue_size < 2) {
+        logWarmRestoreFailure("bad queue size");
+        return false;
+    }
+    if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
+        logWarmRestoreFailure("map common mmio failed");
+        return false;
+    }
+    if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
+        logWarmRestoreFailure("map notify mmio failed");
+        return false;
+    }
+    if (!remapStoredWarmPages()) {
+        logWarmRestoreFailure("remap backing failed");
+        return false;
+    }
 
     mmioWriteU16(state.common_base + common_queue_select, queue_index_control);
     state.notify_addr = state.notify_base +
@@ -867,9 +1018,14 @@ fn initInternal(prewarm: bool) bool {
     if (!requireStateHealthy("initInternal-pre")) return false;
     if (state.ready) return true;
     if (state.init_attempted) return false;
-    state.init_attempted = true;
     logText(if (prewarm) "BootLogConsole: virtgpu prewarm start\n" else "Compositor: virtgpu init start\n");
     if (readCfgU64(0) != config_magic) return false;
+    if (!prewarm and tryRestoreWarmState()) {
+        logText("Compositor: virtgpu warm restore ready\n");
+        logText("Compositor: virtgpu queue ready\n");
+        return true;
+    }
+    state.init_attempted = true;
 
     const common_page_paddr = readCfgU64(1);
     const notify_page_paddr = readCfgU64(2);
@@ -984,7 +1140,7 @@ fn allocResourceSlot() ?struct { resource: *Resource, slot_index: usize } {
     return null;
 }
 
-fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceHandle {
+fn createResourceWithFormat(width: usize, height: usize, format: u32, label: []const u8) ?ResourceHandle {
     if (!requireStateHealthy("createResourceWithFormat")) return null;
     if (!state.ready and !virtgpu_init()) return null;
     if (width == 0 or height == 0) return null;
@@ -1000,7 +1156,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
         return null;
     }
     if (page_count >= 128) {
-        logText("Compositor: create_fb backing alloc begin\n");
+        logTaggedStage(label, " backing alloc begin");
     }
 
     var page_index: usize = 0;
@@ -1028,7 +1184,7 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
         page_index += chunk_pages;
     }
     if (page_count >= 128) {
-        logText("Compositor: create_fb backing alloc done\n");
+        logTaggedStage(label, " backing alloc done");
     }
 
     resource.resource_id = state.next_resource_id;
@@ -1050,13 +1206,13 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
             .height = @intCast(height),
         };
         if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, virtio_gpu_resp_ok_nodata, "resource_create")) {
-            logText("Compositor: virtgpu resource_create failed\n");
+            logTaggedStage(label, " resource_create failed");
             zeroResource(resource, allocation.slot_index);
             return null;
         }
     }
     if (page_count >= 128) {
-        logText("Compositor: create_fb resource_create done\n");
+        logTaggedStage(label, " resource_create done");
     }
 
     {
@@ -1083,13 +1239,13 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
             virtio_gpu_resp_ok_nodata,
             "attach_backing",
         )) {
-            logText("Compositor: virtgpu attach_backing failed\n");
+            logTaggedStage(label, " attach_backing failed");
             zeroResource(resource, allocation.slot_index);
             return null;
         }
     }
     if (page_count >= 128) {
-        logText("Compositor: create_fb attach_backing done\n");
+        logTaggedStage(label, " attach_backing done");
     }
 
     resource.ready = true;
@@ -1097,7 +1253,23 @@ fn createResourceWithFormat(width: usize, height: usize, format: u32) ?ResourceH
 }
 
 pub fn virtgpu_create_resource(width: usize, height: usize) ?ResourceHandle {
-    return createResourceWithFormat(width, height, virtio_gpu_format_b8g8r8x8_unorm);
+    return createResourceWithFormat(width, height, virtio_gpu_format_b8g8r8x8_unorm, "Compositor: create_resource");
+}
+
+pub fn virtgpu_prewarm_scanout(width: usize, height: usize) bool {
+    logText("BootLogConsole: virtgpu scanout prewarm start\n");
+    clearWarmScanout();
+    const handle = createResourceWithFormat(width, height, virtio_gpu_format_b8g8r8x8_unorm, "BootLogConsole: scanout prewarm") orelse {
+        logText("BootLogConsole: virtgpu scanout prewarm failed\n");
+        return false;
+    };
+    const resource = getResource(handle) orelse {
+        logText("BootLogConsole: virtgpu scanout prewarm failed\n");
+        return false;
+    };
+    recordWarmScanout(resource);
+    logText("BootLogConsole: virtgpu scanout prewarm ready\n");
+    return true;
 }
 
 pub fn virtgpu_create_resource_from_single_page(
@@ -1173,7 +1345,12 @@ pub fn virtgpu_create_resource_from_single_page(
 }
 
 pub fn virtgpu_create_fb(width: usize, height: usize) ?ResourceHandle {
-    return virtgpu_create_resource(width, height);
+    if (!state.ready and !virtgpu_init()) return null;
+    if (tryRestoreWarmScanout(width, height)) |handle| {
+        logText("Compositor: create_fb warm restore ready\n");
+        return handle;
+    }
+    return createResourceWithFormat(width, height, virtio_gpu_format_b8g8r8x8_unorm, "Compositor: create_fb");
 }
 
 pub fn virtgpu_set_scanout(handle: ResourceHandle) bool {
@@ -1259,7 +1436,7 @@ pub fn virtgpu_cursor_resource() ?ResourceHandle {
         };
         if (resource.ready) return resource_handle;
     }
-    const resource = createResourceWithFormat(cursor_dim, cursor_dim, virtio_gpu_format_b8g8r8a8_unorm) orelse return null;
+    const resource = createResourceWithFormat(cursor_dim, cursor_dim, virtio_gpu_format_b8g8r8a8_unorm, "Compositor: cursor create") orelse return null;
     state.cursor_resource = resource;
     return resource;
 }

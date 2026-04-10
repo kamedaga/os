@@ -1,4 +1,5 @@
 const std = @import("std");
+const cap_transfer_abi = @import("cap_transfer_abi.zig");
 const font = @import("font.zig");
 const protocol = @import("window_protocol.zig");
 const model = @import("compositor_model.zig");
@@ -203,7 +204,6 @@ fn readTsc() u64 {
 const cursor_width: usize = 15;
 const cursor_height: usize = 24;
 const cursor_dim: usize = 64;
-const startup_settle_loops: u32 = 8;
 const cursor_width_i32: i32 = 15;
 const cursor_height_i32: i32 = 24;
 const cursor_shape = [cursor_height][cursor_width]u8{
@@ -241,6 +241,10 @@ fn userLog(message: []const u8) u64 {
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+pub fn earlyStartLog() void {
+    _ = userLog("Compositor: _start\n");
 }
 
 fn appendDiagText(buf: []u8, idx: *usize, text: []const u8) void {
@@ -464,10 +468,25 @@ fn mapPagesBatch(base_va: u64, paddr_list_va: u64, page_count: u64, writable: bo
 }
 
 fn recvCap() u64 {
+    const transfer = recvCapTransfer();
+    if (transfer < cap_transfer_abi.transfer_id_min) return transfer;
+    return acceptCapTransfer(transfer);
+}
+
+fn recvCapTransfer() u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_recv_cap),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn acceptCapTransfer(transfer_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (cap_transfer_abi.syscall_accept_cap_transfer),
+          [arg0] "{rdi}" (transfer_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -2687,8 +2706,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     var i: usize = 0;
 
     var window_count: usize = 0;
-    var first_compose_wait_loops: u32 = 0;
-    var startup_settle_loops_remaining: u32 = 0;
 
     var dragging_index: ?usize = null;
     var drag_boost_logged = false;
@@ -2715,7 +2732,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         if (magic32 == window_cap_magic) {
             if (registerWindowCap(page_paddr) != null) {
                 force_full = true;
-                if (!first_compose_logged) startup_settle_loops_remaining = startup_settle_loops;
             }
             continue;
         }
@@ -2734,6 +2750,7 @@ pub fn run(comptime gpu_mode: bool) noreturn {
     var virtgpu_active = false;
     var hardware_cursor_active = false;
     if (virtgpu_init_ok) {
+        _ = userLog("Compositor: create_fb start\n");
         gpu_resource = virtgpu.virtgpu_create_fb(fb_width, fb_height);
         _ = userLog("Compositor: create_fb returned\n");
         if (gpu_resource) |resource_handle| {
@@ -2772,7 +2789,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             if (magic32 == window_cap_magic) {
                 if (registerWindowCap(page_paddr) != null) {
                     force_full = true;
-                    if (!first_compose_logged) startup_settle_loops_remaining = startup_settle_loops;
                 }
                 continue;
             }
@@ -2837,19 +2853,6 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             const merged = includeRect(dirty_any, if (dirty_any) dirty_rect else fullScreenRect(), changed_rect);
             dirty_any = merged.any;
             dirty_rect = merged.rect;
-        }
-
-        if (!first_compose_logged and window_count < 2 and first_compose_wait_loops < 96) {
-            first_compose_wait_loops += 1;
-            force_full = true;
-            _ = waitEvent(true, 1);
-            continue;
-        }
-        if (!first_compose_logged and startup_settle_loops_remaining != 0) {
-            startup_settle_loops_remaining -= 1;
-            force_full = true;
-            _ = waitEvent(true, 1);
-            continue;
         }
 
         i = 0;

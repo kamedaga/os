@@ -5,7 +5,6 @@ const mouse_input = @import("mouse_input.zig");
 const process_abi = @import("process_abi.zig");
 const protocol = @import("window_protocol.zig");
 const taskbar_bootstrap = @import("taskbar_bootstrap_abi.zig");
-const vfs_client = @import("vfs_client.zig");
 const window_client = @import("window_client.zig");
 
 const window_pixels_va: usize = 0x2030_0000;
@@ -28,8 +27,6 @@ const taskbar_height_i32: i32 = 32;
 const window_flags: u32 = window_client.window_flag_low_scale | window_client.window_flag_frameless;
 const clock_color: u32 = 0x00EA_E9EC;
 const clock_timeout_ticks: u64 = 20;
-const vfs_request_va: u64 = 0x3C10_4000;
-const vfs_response_va: u64 = 0x3C10_5000;
 const button_width: usize = 11;
 const button_height: usize = taskbar_height;
 const button_margin_right: usize = 0;
@@ -85,145 +82,6 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
           [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
           [arg1] "{rsi}" (timeout_ticks),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn runVfsSmokeTest(taskbar_process_slot: u64) void {
-    if (taskbar_process_slot == 0) return;
-    var client = vfs_client.Client.connectFromServiceRegistry(
-        vfs_request_va,
-        vfs_response_va,
-        taskbar_process_slot,
-    ) catch {
-        _ = userLog("Taskbar: VFS connect failed\n");
-        return;
-    };
-    _ = userLog("Taskbar: VFS connect ok\n");
-
-    const root_dir = client.lookup(0, "/") catch {
-        _ = userLog("Taskbar: VFS lookup failed\n");
-        return;
-    };
-    if (root_dir.object_kind != .vnode_dir) {
-        _ = userLog("Taskbar: VFS lookup bad token\n");
-        return;
-    }
-    _ = userLog("Taskbar: VFS lookup / ok\n");
-
-    const root_stat = client.stat(root_dir.token) catch {
-        _ = userLog("Taskbar: VFS stat failed\n");
-        return;
-    };
-    if (root_stat.object_kind != .vnode_dir or root_stat.size_bytes != 0) {
-        _ = userLog("Taskbar: VFS stat mismatch\n");
-        return;
-    }
-    _ = userLog("Taskbar: VFS stat / ok\n");
-
-    var root_name_buf: [64]u8 = undefined;
-    const root_dirent = client.readdirOne(root_dir.token, 0, root_name_buf[0..]) catch {
-        _ = userLog("Taskbar: VFS readdir failed\n");
-        return;
-    };
-    switch (root_dirent) {
-        .end => {
-            _ = userLog("Taskbar: VFS readdir / end\n");
-            return;
-        },
-        .entry => |entry| {
-            if (entry.name.len == 0) {
-                _ = userLog("Taskbar: VFS readdir empty name\n");
-                return;
-            }
-        },
-    }
-    _ = userLog("Taskbar: VFS readdir / ok\n");
-
-    const bin_dir = client.lookup(root_dir.token, "bin") catch {
-        _ = userLog("Taskbar: VFS lookup bin failed\n");
-        return;
-    };
-    if (bin_dir.object_kind != .vnode_dir) {
-        _ = userLog("Taskbar: VFS lookup bin bad token\n");
-        return;
-    }
-    _ = userLog("Taskbar: VFS lookup bin ok\n");
-
-    var bin_name_buf: [64]u8 = undefined;
-    const bin_dirent = client.readdirOne(bin_dir.token, 0, bin_name_buf[0..]) catch {
-        _ = userLog("Taskbar: VFS readdir /bin failed\n");
-        return;
-    };
-    switch (bin_dirent) {
-        .end => {
-            _ = userLog("Taskbar: VFS readdir /bin end\n");
-            return;
-        },
-        .entry => |entry| {
-            if (entry.name.len == 0) {
-                _ = userLog("Taskbar: VFS readdir /bin empty\n");
-                return;
-            }
-        },
-    }
-    _ = userLog("Taskbar: VFS readdir /bin ok\n");
-
-    const taskbar_file = client.lookup(root_dir.token, "bin/taskbar.elf") catch {
-        _ = userLog("Taskbar: VFS lookup bin/taskbar.elf failed\n");
-        return;
-    };
-    if (taskbar_file.object_kind != .vnode_file) {
-        _ = userLog("Taskbar: VFS lookup bin/taskbar.elf bad token\n");
-        return;
-    }
-    _ = userLog("Taskbar: VFS lookup bin/taskbar.elf ok\n");
-
-    const taskbar_stat = client.stat(taskbar_file.token) catch {
-        _ = userLog("Taskbar: VFS stat /bin/taskbar.elf failed\n");
-        return;
-    };
-    if (taskbar_stat.object_kind != .vnode_file or taskbar_stat.size_bytes == 0) {
-        _ = userLog("Taskbar: VFS stat /bin/taskbar.elf mismatch\n");
-        return;
-    }
-    const taskbar_file_size = taskbar_stat.size_bytes;
-    _ = userLog("Taskbar: VFS stat /bin/taskbar.elf ok\n");
-
-    _ = client.openExec(taskbar_file.token) catch {
-        _ = userLog("Taskbar: VFS open_exec /bin/taskbar.elf failed\n");
-        return;
-    };
-    _ = userLog("Taskbar: VFS open_exec /bin/taskbar.elf ok\n");
-
-    const open_file = client.open(taskbar_file.token) catch {
-        _ = userLog("Taskbar: VFS open /bin/taskbar.elf failed\n");
-        return;
-    };
-    _ = userLog("Taskbar: VFS open /bin/taskbar.elf ok\n");
-
-    var read_buf: [16]u8 = undefined;
-    const read_result = client.read(open_file.token, 0, read_buf[0..]) catch {
-        _ = userLog("Taskbar: VFS read /bin/taskbar.elf failed\n");
-        return;
-    };
-    if (read_result.bytes_read < 4) {
-        _ = userLog("Taskbar: VFS read /bin/taskbar.elf short\n");
-        return;
-    }
-    if (read_result.file_bytes == 0 or read_result.file_bytes != taskbar_file_size) {
-        _ = userLog("Taskbar: VFS read /bin/taskbar.elf size mismatch\n");
-        return;
-    }
-    if (read_buf[0] != 0x7F or read_buf[1] != 'E' or read_buf[2] != 'L' or read_buf[3] != 'F') {
-        _ = userLog("Taskbar: VFS read /bin/taskbar.elf bad elf\n");
-        return;
-    }
-    _ = userLog("Taskbar: VFS read /bin/taskbar.elf ok\n");
-
-    client.close(open_file.token) catch {
-        _ = userLog("Taskbar: VFS close /bin/taskbar.elf failed\n");
-        return;
-    };
-    _ = userLog("Taskbar: VFS close /bin/taskbar.elf ok\n");
 }
 
 fn fillRect(vfb: [*]volatile u32, pitch: usize, width: usize, height: usize, x: usize, y: usize, w: usize, h: usize, color: u32) void {
@@ -609,6 +467,7 @@ fn sendActivateCommand(command_page: *volatile TaskbarCommandPage, window_id: u3
 }
 
 pub export fn _start() noreturn {
+    _ = userLog("Taskbar: entry\n");
     const cfg: [*]const volatile u64 = @ptrFromInt(process_abi.standard_config_target_va);
     if (cfg[0] != taskbar_config_magic or cfg[1] != taskbar_bootstrap.config_version) {
         _ = userLog("Taskbar: config magic mismatch\n");
@@ -641,7 +500,6 @@ pub export fn _start() noreturn {
 
     const screen_width: usize = @intCast(cfg[2]);
     const screen_height: usize = @intCast(cfg[3]);
-    const taskbar_process_slot = cfg[taskbar_bootstrap.self_process_slot_index];
     if (screen_width == 0 or screen_height < taskbar_height) {
         _ = userLog("Taskbar: invalid screen size\n");
         while (true) asm volatile ("pause");
@@ -675,7 +533,6 @@ pub export fn _start() noreturn {
 
     redrawAll(vfb, screen_width, state_page, null, elapsed_seconds);
     window_client.markWindowDirty(window_meta_shared_va);
-    runVfsSmokeTest(taskbar_process_slot);
 
     while (true) {
         _ = waitEvent(false, 1);

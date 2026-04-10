@@ -28,6 +28,7 @@ pub const ObjectKind = enum(u8) {
     vnode_file = 3,
     open_file = 4,
     exec = 5,
+    block_device = 6,
 };
 
 pub const Rights = packed struct(u32) {

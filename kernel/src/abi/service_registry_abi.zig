@@ -3,13 +3,15 @@ const process_abi = @import("process_abi.zig");
 pub const magic: u64 = 0x53525643; // "SRVC"
 pub const version: u64 = 1;
 pub const page_va: u64 = process_abi.auxPageVa(5);
-pub const max_entries: usize = 4;
+pub const max_entries: usize = 6;
 pub const dynamic_endpoint_id_base: u64 = 0x80;
 pub const init_window_service_endpoint_id: u64 = dynamic_endpoint_id_base;
 
 pub const ServiceKind = enum(u64) {
     window = 1,
     vfs = 2,
+    block = 3,
+    persistent_fs = 4,
 };
 
 pub const ServiceEntry = extern struct {

@@ -311,6 +311,7 @@ fn executeCommand(st: *TerminalState, cmd_text: []const u8) void {
 }
 
 pub export fn _start() noreturn {
+    _ = userLog("TerminalWindow: entry\n");
     const cfg: [*]const volatile u64 = @ptrFromInt(process_abi.standard_config_target_va);
     if (cfg[0] != terminal_bootstrap.config_magic or cfg[1] != terminal_bootstrap.config_version) {
         _ = userLog("TerminalWindow: config magic mismatch\n");

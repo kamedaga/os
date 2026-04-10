@@ -1,6 +1,7 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
+const cap_transfer_abi = @import("abi/cap_transfer_abi.zig");
 const device_abi = @import("abi/device_abi.zig");
 const fs_abi = @import("abi/fs_abi.zig");
 const image_abi = @import("abi/image_abi.zig");
@@ -40,6 +41,11 @@ const syscall_grant_cap_on_endpoint: u64 = 0x24;
 const syscall_grant_caps_batch_on_endpoint: u64 = 0x25;
 const syscall_install_endpoint: u64 = 0x26;
 const syscall_register_iommu_driver: u64 = 0x27;
+const syscall_share_cap: u64 = 0x2B;
+const syscall_signal_endpoint: u64 = 0x2C;
+const syscall_get_tick_count: u64 = 0x2D;
+const syscall_get_process_slot: u64 = 0x2E;
+const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -79,6 +85,8 @@ pub const Hooks = struct {
     spawn_exec: *const fn (*TrapFrame) u64,
     arm_deferred_compositor: *const fn (*TrapFrame) u64,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
+    wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
+    consume_pending_signal_for_principal: *const fn (kernel.PrincipalId) bool,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64) bool,
     log_queue_cap_deny: *const fn (kernel.PrincipalId, u64, kernel.DmaDeviceId, u16, kernel.QueueOperation, anyerror) void,
@@ -110,6 +118,7 @@ fn parseFsObjectKind(value: u64) ?kernel.FsObjectKind {
         .vnode_file => .vnode_file,
         .open_file => .open_file,
         .exec => .exec,
+        .block_device => .block_device,
     };
 }
 
@@ -128,6 +137,7 @@ fn parseDmaDeviceId(value: u64) ?kernel.DmaDeviceId {
     return switch (abi_device) {
         .virtio_gpu => .virtio_gpu,
         .virtio_input => .virtio_input,
+        .virtio_blk => .virtio_blk,
     };
 }
 
@@ -367,6 +377,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const device: kernel.DmaDeviceId = switch (frame.rsi) {
                 0 => .virtio_gpu,
                 1 => .virtio_input,
+                2 => .virtio_blk,
                 else => return syscall_err_invalid,
             };
             const queue_index: u16 = @truncate(frame.rdx);
@@ -440,8 +451,10 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 paddrs[@intCast(i)] = h.read_user_u64(proc, list_va) orelse return syscall_err_invalid;
             }
             state.grantCapsBatch(proc, to, paddrs[0..@intCast(page_count_u64)], rights) catch return syscall_err_grant;
-            if (rights.dma and to == .Process1 and page_count_u64 > 1) {
-                h.write("grant_caps_batch dma to=Process1 pages=");
+            if (rights.dma and page_count_u64 > 1) {
+                h.write("grant_caps_batch dma to=");
+                h.write(h.principal_label(to));
+                h.write(" pages=");
                 h.print_number(page_count_u64);
                 h.write(" first=");
                 h.print_hex(paddrs[0]);
@@ -488,6 +501,18 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 else => return syscall_err_endpoint,
             };
             return syscall_ok;
+        },
+        syscall_signal_endpoint => {
+            const to = state.endpointTargetFor(proc, frame.rdi) orelse return syscall_err_endpoint;
+            h.wake_blocked_thread_for_principal(to);
+            return syscall_ok;
+        },
+        syscall_get_tick_count => {
+            return scheduler.lapic_tick_count;
+        },
+        syscall_get_process_slot => {
+            const slot = kernel.processIndexFromPrincipal(proc) orelse return syscall_err_invalid;
+            return @intCast(slot);
         },
         syscall_register_iommu_driver => {
             const device = parseDmaDeviceId(frame.rdi) orelse return syscall_err_invalid;
@@ -541,6 +566,31 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
             return syscall_ok;
         },
+        syscall_share_cap => {
+            const endpoint_id = frame.rsi;
+            const to = state.endpointTargetFor(proc, endpoint_id) orelse {
+                h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
+                return syscall_err_endpoint;
+            };
+            state.shareCapOnEndpoint(proc, endpoint_id, frame.rdi) catch |err| switch (err) {
+                kernel.KernelError.EndpointNotFound => {
+                    h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
+                    return syscall_err_endpoint;
+                },
+                kernel.KernelError.CapabilityNotFound => {
+                    h.log_race_send_cap(proc, to, endpoint_id, frame.rdi, "cap_missing");
+                    return syscall_err_send;
+                },
+                else => {
+                    h.log_race_send_cap(proc, to, endpoint_id, frame.rdi, @errorName(err));
+                    return syscall_err_send;
+                },
+            };
+            h.wake_waiting_thread_for_principal(to);
+            h.post_send_cap(proc, to, endpoint_id);
+            if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
+            return syscall_ok;
+        },
         fs_abi.syscall_send_cap => {
             const endpoint_id = frame.rsi;
             const cap_id = fs_abi.decodeCapToken(frame.rdi) orelse return syscall_err_invalid;
@@ -556,6 +606,16 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         syscall_recv_cap => {
             const received = state.recvCap(proc) catch |err| switch (err) {
                 kernel.KernelError.MailboxEmpty => syscall_err_empty,
+                else => syscall_err_send,
+            };
+            return received;
+        },
+        syscall_accept_cap_transfer => {
+            const received = state.acceptCapTransfer(proc, frame.rdi) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => syscall_err_empty,
+                kernel.KernelError.InvalidState => syscall_err_invalid,
+                kernel.KernelError.CapabilityNotFound => syscall_err_send,
+                kernel.KernelError.TableFull => syscall_err_alloc,
                 else => syscall_err_send,
             };
             h.on_mailbox_receive(proc, received);
@@ -687,8 +747,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                     kernel.KernelError.MailboxEmpty => 0,
                     else => return syscall_err_send,
                 };
-                if (received >= 0x1000) {
-                    h.on_mailbox_receive(proc, received);
+                if (received >= cap_transfer_abi.transfer_id_min) {
                     return received;
                 }
                 const received_fs = state.recvFsCap(proc) catch |err| switch (err) {
@@ -698,6 +757,9 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 if (received_fs != 0) {
                     return fs_abi.encodeCapToken(received_fs);
                 }
+            }
+            if (h.consume_pending_signal_for_principal(proc)) {
+                return syscall_ok;
             }
             if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
                 return syscall_err_not_ready;

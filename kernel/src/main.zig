@@ -4,6 +4,7 @@ const capability = @import("capability.zig");
 const untyped_memory = @import("untyped_memory.zig");
 const elf_loader = @import("elf_loader.zig");
 const boot_manifest_abi = @import("abi/boot_manifest_abi.zig");
+const cap_transfer_abi = @import("abi/cap_transfer_abi.zig");
 const fs_abi = @import("abi/fs_abi.zig");
 const image_abi = @import("abi/image_abi.zig");
 const init_bootstrap_abi = @import("abi/init_bootstrap_abi.zig");
@@ -12,6 +13,7 @@ const init_bootstrap_layout = @import("boot/init_bootstrap_layout.zig");
 const boot_images = @import("boot/boot_images.zig");
 const boot_layout = @import("boot/boot_layout.zig");
 const boot_policy = @import("boot/boot_policy.zig");
+const bootfs_format = @import("boot/bootfs_format.zig");
 const process_abi = @import("abi/process_abi.zig");
 const boot_timing = @import("boot/boot_timing.zig");
 const deferred_compositor = @import("boot/deferred_compositor.zig");
@@ -54,7 +56,6 @@ const setThreadReady = scheduler.setThreadReady;
 const thread_contexts = &scheduler.thread_contexts;
 
 const four_gib = boot_layout.four_gib;
-const one_tib = boot_layout.one_tib;
 const page_entries = boot_layout.page_entries;
 const user_va = boot_layout.user_va;
 const user_elf_base_va = boot_layout.user_elf_base_va;
@@ -83,7 +84,9 @@ const enable_scheduler_perf_logs = boot_policy.enable_scheduler_perf_logs;
 const suppress_compositor_perf_user_logs = boot_policy.suppress_compositor_perf_user_logs;
 const enable_iommu_no_cap_driver = boot_policy.enable_iommu_no_cap_driver;
 const enforce_iommu_no_cap_driver = boot_policy.enforce_iommu_no_cap_driver;
+const bootstrap_resource_owner_process_index = boot_policy.bootstrap_resource_owner_process_index;
 const boot_display_process_index = boot_policy.boot_display_process_index;
+const deferred_compositor_keyboard_source_process_index = boot_policy.deferred_compositor_keyboard_source_process_index;
 const user_entry_rflags = boot_policy.user_entry_rflags;
 const reserved_low_mem_end = boot_policy.reserved_low_mem_end;
 const canonical_user_limit_exclusive = boot_policy.canonical_user_limit_exclusive;
@@ -101,6 +104,7 @@ const user_unmapped_test_va: u64 = 0x20100000;
 const user_dma_verify_va: u64 = 0x20110000;
 const user_recovery_stop_va: u64 = 0x20200000;
 const page_addr_mask: u64 = 0x000F_FFFF_FFFF_F000;
+const physical_map_limit_exclusive: u64 = page_addr_mask + 0x1000;
 const gdt_kernel_code_selector: u16 = x86_platform.gdt_kernel_code_selector;
 const gdt_kernel_data_selector: u16 = x86_platform.gdt_kernel_data_selector;
 const gdt_user_code_selector: u16 = x86_platform.gdt_user_code_selector;
@@ -133,11 +137,21 @@ const boot_log_page_payload_bytes: usize = 4096 - boot_log_page_header_bytes;
 const boot_log_status_offset: usize = 4;
 const boot_log_status_mouse_queue_ready: u32 = 1 << 0;
 const boot_log_status_keyboard_queue_ready: u32 = 1 << 1;
+const boot_log_status_init_started: u32 = 1 << 2;
+const boot_log_status_init_manifest_begin: u32 = 1 << 3;
+const boot_log_status_init_keyboard_spawn_done: u32 = 1 << 4;
+const boot_log_status_init_mouse_spawn_done: u32 = 1 << 5;
+const boot_log_status_init_keyboard_shared_ready: u32 = 1 << 6;
+const boot_log_status_init_mouse_shared_ready: u32 = 1 << 7;
+const boot_log_status_init_compositor_arm_done: u32 = 1 << 8;
+const boot_log_status_init_first_window_spawn_done: u32 = 1 << 9;
+const keyboard_input_config_magic: u64 = 0x4B455942; // "KEYB"
 const virtio_gpu_config_magic: u64 = 0x56475055; // "VGPU"
 const vfs_boot_config_magic: u64 = 0x5646_5343; // "VFSC"
 const vfs_boot_config_version: u64 = 1;
 const vfs_boot_config_flag_bootfs_present: u64 = 1 << 0;
 const vfs_bootfs_root_object_id: u64 = 1;
+const raw_block_root_object_id: u64 = 2;
 
 const debug_skip_exit_boot_services = false;
 const debug_skip_cr3_switch = false;
@@ -153,6 +167,8 @@ comptime {
     if (init_process_index >= kernel.process_count) @compileError("init process index must fit process table");
     if (dynamic_spawn_first_process_index >= kernel.process_count) @compileError("spawnable process range must not be empty");
     if (boot_display_process_index >= kernel.process_count) @compileError("boot display process index must fit process table");
+    if (bootstrap_resource_owner_process_index >= kernel.process_count) @compileError("bootstrap resource owner process index must fit process table");
+    if (deferred_compositor_keyboard_source_process_index >= kernel.process_count) @compileError("deferred compositor keyboard source process index must fit process table");
 }
 
 var user_spaces_storage: [user_process_count]UserAddressSpace align(4096) = [_]UserAddressSpace{.{}} ** user_process_count;
@@ -167,6 +183,9 @@ const compositor_thread1_priority_hold_quanta: u64 = 6;
 var syscall_identity_diag_count: u64 = 0;
 var syscall_entry_diag_count: u64 = 0;
 var scheduler_perf_last_switch_count: u64 = 0;
+var compositor_pre_log_timer_probe_emitted = false;
+var compositor_user_return_probe_emitted = false;
+var dynamic_user_return_logged: [scheduler.max_thread_slots]bool = [_]bool{false} ** scheduler.max_thread_slots;
 var uefi_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
 var uefi_exitbs_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
 var user_log_scratch: [user_log_max_bytes]u8 align(16) = undefined;
@@ -181,6 +200,8 @@ var kernel_image_size_bytes: usize = 0;
 var post_exit_load_scratch: [8 * 1024 * 1024]u8 align(4096) = [_]u8{0} ** (8 * 1024 * 1024);
 var post_exit_load_scratch_used: usize = 0;
 var boot_display_principal: ?kernel.PrincipalId = null;
+var bootlog_virtgpu_prewarm_ready = false;
+var bootlog_virtgpu_scanout_prewarm_done = false;
 var compositor_runtime_priority_requested = false;
 
 const syscall_alloc_page: u64 = 0x1;
@@ -334,6 +355,11 @@ const DetectedInputBootstrap = struct {
     config: MouseDriverConfig,
 };
 
+const DetectedBlockBootstrap = struct {
+    descriptor: init_bootstrap_abi.BlockDeviceDescriptor,
+    config: VirtioBlkDriverConfig,
+};
+
 const MouseDriverConfig = struct {
     common: MmioPageWithOffset,
     notify: MmioPageWithOffset,
@@ -345,9 +371,25 @@ const MouseDriverConfig = struct {
 };
 
 const VirtioGpuDriverConfig = MouseDriverConfig;
+const VirtioBlkDriverConfig = struct {
+    common: MmioPageWithOffset,
+    notify: MmioPageWithOffset,
+    isr: MmioPageWithOffset,
+    device: MmioPageWithOffset,
+    notify_off_multiplier: u64,
+    capacity_sectors: u64,
+    logical_block_size: u64,
+};
 
 fn inputDeviceDescriptorForKind(kind: init_bootstrap_abi.InputDeviceKind) init_bootstrap_abi.InputDeviceDescriptor {
     inline for (init_bootstrap_layout.builtin_input_devices) |descriptor| {
+        if (descriptor.kind == @intFromEnum(kind)) return descriptor;
+    }
+    unreachable;
+}
+
+fn blockDeviceDescriptorForKind(kind: init_bootstrap_abi.BlockDeviceKind) init_bootstrap_abi.BlockDeviceDescriptor {
+    inline for (init_bootstrap_layout.builtin_block_devices) |descriptor| {
         if (descriptor.kind == @intFromEnum(kind)) return descriptor;
     }
     unreachable;
@@ -387,6 +429,22 @@ fn hasDetectedInputBootstrap(
     kind: init_bootstrap_abi.InputDeviceKind,
 ) bool {
     return detectedInputBootstrapForKind(devices, kind) != null;
+}
+
+fn detectedBlockKindFromDescriptor(descriptor: init_bootstrap_abi.BlockDeviceDescriptor) init_bootstrap_abi.BlockDeviceKind {
+    return std.meta.intToEnum(init_bootstrap_abi.BlockDeviceKind, descriptor.kind) catch unreachable;
+}
+
+fn blockDeviceLabel(kind: init_bootstrap_abi.BlockDeviceKind) []const u8 {
+    return switch (kind) {
+        .virtio_blk => "virtio-blk",
+    };
+}
+
+fn blockDeviceConfigPageLabel(kind: init_bootstrap_abi.BlockDeviceKind) []const u8 {
+    return switch (kind) {
+        .virtio_blk => "virtio-blk config page",
+    };
 }
 
 fn serialInit() void {
@@ -678,6 +736,7 @@ fn logQueueCapDeny(
     serialWrite(switch (device) {
         .virtio_gpu => "virtio_gpu",
         .virtio_input => "virtio_input",
+        .virtio_blk => "virtio_blk",
     });
     serialWrite(" q=");
     printNumber(queue_index);
@@ -830,16 +889,58 @@ fn maybeLogSchedulerPerfTick() void {
     const report = scheduler.takePerfReport(scheduler_perf_report_interval_ticks, &scheduler_perf_last_switch_count) orelse return;
     serialWrite("SCHED perf ticks=");
     printNumber(report.ticks);
-    serialWrite(" proc1=");
-    printNumber(report.process1_ticks);
-    serialWrite(" thread1=");
-    printNumber(report.thread1_ticks);
+    serialWrite(" priority_owner=");
+    printNumber(report.priority_owner_ticks);
+    serialWrite(" priority_thread=");
+    printNumber(report.priority_thread_ticks);
     serialWrite(" switches=");
     printNumber(report.switch_delta);
     serialWrite(" active=");
-    serialWrite(if (report.compositor_priority_active) "1" else "0");
+    serialWrite(if (report.runtime_priority_active) "1" else "0");
     serialWrite(" streak=");
-    printNumber(report.compositor_priority_streak);
+    printNumber(report.runtime_priority_streak);
+    serialWrite("\n");
+}
+
+fn noteUserTimerTick(frame: *TrapFrame) void {
+    if (compositor_pre_log_timer_probe_emitted) return;
+    if (boot_timing.state.virtgpu_init_started) return;
+    if (!deferred_compositor.launched) return;
+    const compositor_principal = currentCompositorPrincipal() orelse return;
+    if (scheduler.current_user_principal != compositor_principal) return;
+    compositor_pre_log_timer_probe_emitted = true;
+    serialWrite("compositor pre-log timer tick=");
+    printNumber(scheduler.lapic_tick_count);
+    serialWrite(" rip=");
+    printHex(frame.rip);
+    serialWrite("\n");
+}
+
+fn logStagedUserReturn() void {
+    const current_thread = scheduler.current_thread_index;
+    if (current_thread < dynamic_user_return_logged.len and !dynamic_user_return_logged[current_thread]) {
+        if (scheduler.getThreadContextConst(current_thread)) |ctx| {
+            if (ctx.allocated and isDynamicSpawnPrincipal(ctx.owner_process)) {
+                dynamic_user_return_logged[current_thread] = true;
+                serialWrite("dynamic user return thread=");
+                serialWrite(threadLabel(current_thread));
+                serialWrite(" proc=");
+                serialWrite(principalLabel(ctx.owner_process));
+                serialWrite(" rip=");
+                printHex(traps.last_stage_saved_rip);
+                serialWrite("\n");
+            }
+        }
+    }
+    if (compositor_user_return_probe_emitted) return;
+    if (boot_timing.state.virtgpu_init_started) return;
+    const compositor_principal = currentCompositorPrincipal() orelse return;
+    if (scheduler.current_user_principal != compositor_principal) return;
+    compositor_user_return_probe_emitted = true;
+    serialWrite("compositor staged user return thread=");
+    serialWrite(threadLabel(scheduler.current_thread_index));
+    serialWrite(" rip=");
+    printHex(traps.last_stage_saved_rip);
     serialWrite("\n");
 }
 
@@ -865,13 +966,22 @@ fn configuredBootDisplayPrincipal() kernel.PrincipalId {
     return @enumFromInt(boot_display_process_index);
 }
 
+fn configuredBootstrapResourceOwnerPrincipal() kernel.PrincipalId {
+    return @enumFromInt(bootstrap_resource_owner_process_index);
+}
+
+fn configuredDeferredCompositorKeyboardSourcePrincipal() kernel.PrincipalId {
+    return @enumFromInt(deferred_compositor_keyboard_source_process_index);
+}
+
 fn currentCompositorPrincipal() ?kernel.PrincipalId {
     if (deferred_compositor.target_principal) |principal| return principal;
     return boot_display_principal;
 }
 
 fn refreshCompositorPriorityActive() void {
-    scheduler.refreshCompositorPriorityActive(
+    scheduler.setRuntimePriorityPrincipal(currentCompositorPrincipal());
+    scheduler.refreshRuntimePriorityActive(
         compositor_runtime_priority_requested,
         true,
     );
@@ -886,6 +996,9 @@ fn updateCompositorPriorityFromUserLog(proc: kernel.PrincipalId, message: []cons
     } else if (std.mem.eql(u8, message, "Compositor: drag boost off\n")) {
         compositor_runtime_priority_requested = false;
         refreshCompositorPriorityActive();
+    } else if (std.mem.eql(u8, message, "Compositor: first compose done\n")) {
+        compositor_runtime_priority_requested = false;
+        refreshCompositorPriorityActive();
     }
 }
 
@@ -893,21 +1006,37 @@ fn syscallPostSendCap(from: kernel.PrincipalId, to: kernel.PrincipalId, endpoint
     _ = endpoint_id;
     const compositor_principal = currentCompositorPrincipal() orelse return;
     if (deferred_compositor.launched and isDynamicSpawnPrincipal(from) and to == compositor_principal) {
-        scheduler.compositor_thread1_priority_active = true;
+        if (!compositor_runtime_priority_requested) {
+            compositor_runtime_priority_requested = true;
+            refreshCompositorPriorityActive();
+        }
     }
 }
 
 fn syscallOnMailboxReceive(proc: kernel.PrincipalId, received: u64) void {
     const compositor_principal = currentCompositorPrincipal() orelse return;
-    if (proc == compositor_principal and received >= 0x1000 and !compositor_runtime_priority_requested) {
+    if (proc == compositor_principal and received >= cap_transfer_abi.transfer_id_min and !compositor_runtime_priority_requested) {
         refreshCompositorPriorityActive();
     }
 }
 
 fn syscallHandleUserLog(frame: *TrapFrame, proc: kernel.PrincipalId, msg: []const u8) void {
+    if (containsBytes(msg, "BootLogConsole: virtgpu prewarm ready")) {
+        bootlog_virtgpu_prewarm_ready = true;
+    }
+    if (containsBytes(msg, "BootLogConsole: virtgpu scanout prewarm ready") or
+        containsBytes(msg, "BootLogConsole: virtgpu scanout prewarm failed"))
+    {
+        bootlog_virtgpu_scanout_prewarm_done = true;
+    }
+    updateBootTimingFromUserLog(proc, msg);
     updateCompositorPriorityFromUserLog(proc, msg);
     updateBootLogQueueReadyStatusFromUserLog(proc, msg);
     tryLaunchDeferredCompositorFromLog(frame, proc, msg);
+    tryAutoLaunchDeferredCompositor(frame);
+    if (boot_log_status_page_paddr >= 0x1000) {
+        publishBootLogToUserPage(boot_log_status_page_paddr);
+    }
 }
 
 fn haltLoopTrapHook() noreturn {
@@ -1002,6 +1131,12 @@ fn writeCr3(value: u64) void {
 
 fn readCr3() u64 {
     return kernel_vm.readCr3();
+}
+
+fn userCr3ForPrincipal(principal: kernel.PrincipalId) u64 {
+    const idx = kernel.processIndexFromPrincipal(principal) orelse return 0;
+    if (idx >= user_spaces.len) return 0;
+    return user_spaces[idx].cr3;
 }
 
 fn invlpg(addr: u64) void {
@@ -1135,7 +1270,16 @@ fn mapUserLinearRegionOrHalt(
     }
 }
 
-fn userPageRights(writable: bool) kernel.Rights {
+fn ownedUserPageRights(writable: bool) kernel.Rights {
+    return .{
+        .cpu_read = true,
+        .cpu_write = writable,
+        .dma = false,
+        .grant = true,
+    };
+}
+
+fn derivedUserPageRights(writable: bool) kernel.Rights {
     return .{
         .cpu_read = true,
         .cpu_write = writable,
@@ -1151,7 +1295,7 @@ fn installPageForProcessOrHalt(
     role_label: []const u8,
     page_label: []const u8,
 ) void {
-    state.installCap(principal, page.paddr, userPageRights(writable)) catch |err| {
+    state.installCap(principal, page.paddr, ownedUserPageRights(writable)) catch |err| {
         serialWrite(role_label);
         serialWrite(" ");
         serialWrite(page_label);
@@ -1171,7 +1315,7 @@ fn grantPageForProcessOrHalt(
     role_label: []const u8,
     page_label: []const u8,
 ) void {
-    state.grantCap(from_principal, to_principal, page.paddr, userPageRights(writable)) catch |err| {
+    state.grantCap(from_principal, to_principal, page.paddr, derivedUserPageRights(writable)) catch |err| {
         serialWrite(role_label);
         serialWrite(" ");
         serialWrite(page_label);
@@ -1221,7 +1365,21 @@ fn installVfsEndpointsOrHalt(state: *kernel.KernelState) void {
     };
 }
 
+fn installBootDisplayEndpointsOrHalt(state: *kernel.KernelState, target: kernel.PrincipalId) void {
+    state.installServiceEndpointForActiveProcesses(kernel.endpoint_to_boot_display, target) catch |err| {
+        serialWrite("boot display endpoint install failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        while (true) asm volatile ("hlt");
+    };
+}
+
 fn installSpawnCompatibilityEndpoints(state: *kernel.KernelState, principal: kernel.PrincipalId) !void {
+    if (boot_display_principal) |display_principal| {
+        if (display_principal != principal and state.hasActivePrincipal(display_principal)) {
+            try state.installEndpoint(principal, kernel.endpoint_to_boot_display, display_principal);
+        }
+    }
     if (state.hasActivePrincipal(kernel.vfs_principal)) {
         try state.installEndpoint(principal, kernel.endpoint_to_vfs, kernel.vfs_principal);
     }
@@ -1453,39 +1611,102 @@ fn setupVfsProcess(state: *kernel.KernelState, bootfs_image: ?[]const u8) VfsPro
     };
 }
 
+fn findRegularFileInBootFsImage(image: []const u8, abs_path: []const u8) ?[]const u8 {
+    if (image.len < @sizeOf(bootfs_format.BootFsHeader)) return null;
+    const base = @intFromPtr(image.ptr);
+    const header: *align(1) const bootfs_format.BootFsHeader = @ptrFromInt(base);
+    if (header.magic != bootfs_format.magic) return null;
+    if (header.version != bootfs_format.version) return null;
+    if (header.header_bytes != @sizeOf(bootfs_format.BootFsHeader)) return null;
+    if (header.image_bytes == 0 or header.image_bytes > image.len) return null;
+    if (header.entry_table_offset + header.entry_bytes > header.image_bytes) return null;
+    if (header.string_table_offset + header.string_table_bytes > header.image_bytes) return null;
+    if (header.data_offset + header.data_bytes > header.image_bytes) return null;
+
+    const string_begin: usize = @intCast(header.string_table_offset);
+    const string_end: usize = @intCast(header.string_table_offset + header.string_table_bytes);
+    const string_table = image[string_begin..string_end];
+    const entries: [*]align(1) const bootfs_format.BootFsEntry = @ptrFromInt(base + header.entry_table_offset);
+    var i: usize = 0;
+    while (i < header.entry_count) : (i += 1) {
+        const entry = entries[i];
+        if (entry.kind != bootfs_format.kind_regular) continue;
+        const path_begin: usize = entry.path_offset;
+        const path_end = path_begin + entry.path_bytes;
+        if (path_end > string_table.len) continue;
+        if (!std.mem.eql(u8, string_table[path_begin..path_end], abs_path)) continue;
+        if (entry.data_offset > header.image_bytes) return null;
+        if (entry.data_bytes > header.image_bytes - entry.data_offset) return null;
+        const data_begin: usize = @intCast(entry.data_offset);
+        const data_end: usize = @intCast(entry.data_offset + entry.data_bytes);
+        return image[data_begin..data_end];
+    }
+    return null;
+}
+
+fn publishShellKeyboardConfigPage(
+    user_page_paddr: u64,
+    cfg: ?MouseDriverConfig,
+    queue_submit_token: u64,
+    queue_notify_token: u64,
+) void {
+    const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        words[i] = 0;
+    }
+
+    if (cfg) |keyboard_cfg| {
+        words[0] = keyboard_input_config_magic;
+        words[1] = keyboard_cfg.common.page_paddr;
+        words[2] = keyboard_cfg.notify.page_paddr;
+        words[3] = keyboard_cfg.isr.page_paddr;
+        words[4] = keyboard_cfg.device.page_paddr;
+        words[5] = keyboard_cfg.common.page_offset;
+        words[6] = keyboard_cfg.notify.page_offset;
+        words[7] = keyboard_cfg.isr.page_offset;
+        words[8] = keyboard_cfg.device.page_offset;
+        words[9] = keyboard_cfg.notify_off_multiplier;
+        words[10] = 0;
+        words[11] = 0;
+        words[12] = 0;
+        words[13] = queue_submit_token;
+        words[14] = queue_notify_token;
+        words[18] = 0;
+    }
+}
+
 fn setupBootLogConsoleProcess(
     state: *kernel.KernelState,
     principal: kernel.PrincipalId,
-    gpu_cfg: ?VirtioGpuDriverConfig,
+    keyboard_cfg: ?MouseDriverConfig,
 ) BootLogConsoleProcessSetup {
-    const process = createUserProcess(state, principal, "boot log console");
+    const process = createUserProcess(state, principal, "shell");
     const boot_log_page = allocPageForProcessOrHalt(state, principal, "boot log", "page");
-    const boot_log_stack_page = allocPageForProcessOrHalt(state, principal, "boot log console", "stack page");
-    const compositor_gpu_config_page = allocPageForProcessOrHalt(state, principal, "compositor", "virtio gpu config page");
-    mapUserLinearRegionOrHalt(principal, process_abi.standard_config_target_va, compositor_gpu_config_page.paddr, 4096, true, "compositor gpu config page map failed");
+    const boot_log_stack_page = allocPageForProcessOrHalt(state, principal, "shell", "stack page");
+    const compositor_gpu_config_page = allocPageForProcessOrHalt(state, principal, "shell", "keyboard config page");
+    mapUserLinearRegionOrHalt(principal, process_abi.standard_config_target_va, compositor_gpu_config_page.paddr, 4096, true, "shell keyboard config page map failed");
 
-    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false };
-    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false };
-    var gpu_control_submit_token: u64 = 0;
-    var gpu_control_notify_token: u64 = 0;
-    var gpu_cursor_submit_token: u64 = 0;
-    var gpu_cursor_notify_token: u64 = 0;
-    if (gpu_cfg) |cfg| {
+    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true };
+    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false, .grant = true };
+    var keyboard_submit_token: u64 = 0;
+    var keyboard_notify_token: u64 = 0;
+    if (keyboard_cfg) |cfg| {
         state.installCap(principal, cfg.common.page_paddr, mmio_rw_rights) catch |err| {
-            serialWrite("compositor install common cap failed: ");
+            serialWrite("shell install keyboard common cap failed: ");
             serialWrite(@errorName(err));
             serialWrite("\n");
             while (true) asm volatile ("hlt");
         };
         state.installCap(principal, cfg.notify.page_paddr, mmio_rw_rights) catch |err| {
-            serialWrite("compositor install notify cap failed: ");
+            serialWrite("shell install keyboard notify cap failed: ");
             serialWrite(@errorName(err));
             serialWrite("\n");
             while (true) asm volatile ("hlt");
         };
         if (cfg.isr.page_paddr != 0) {
             state.installCap(principal, cfg.isr.page_paddr, mmio_ro_rights) catch |err| {
-                serialWrite("compositor install isr cap failed: ");
+                serialWrite("shell install keyboard isr cap failed: ");
                 serialWrite(@errorName(err));
                 serialWrite("\n");
                 while (true) asm volatile ("hlt");
@@ -1493,38 +1714,32 @@ fn setupBootLogConsoleProcess(
         }
         if (cfg.device.page_paddr != 0) {
             state.installCap(principal, cfg.device.page_paddr, mmio_ro_rights) catch |err| {
-                serialWrite("compositor install device cap failed: ");
+                serialWrite("shell install keyboard device cap failed: ");
                 serialWrite(@errorName(err));
                 serialWrite("\n");
                 while (true) asm volatile ("hlt");
             };
         }
-        gpu_control_submit_token = state.queueCapGrantStage2(principal, .virtio_gpu, 0, true, false) catch |err| {
-            serialWrite("compositor queue control submit cap grant failed: ");
+        keyboard_submit_token = state.queueCapGrantStage2(principal, .virtio_input, 0, true, false) catch |err| {
+            serialWrite("shell keyboard queue submit cap grant failed: ");
             serialWrite(@errorName(err));
             serialWrite("\n");
             while (true) asm volatile ("hlt");
         };
-        gpu_control_notify_token = state.queueCapGrantStage2(principal, .virtio_gpu, 0, false, true) catch |err| {
-            serialWrite("compositor queue control notify cap grant failed: ");
-            serialWrite(@errorName(err));
-            serialWrite("\n");
-            while (true) asm volatile ("hlt");
-        };
-        gpu_cursor_submit_token = state.queueCapGrantStage2(principal, .virtio_gpu, 1, true, false) catch |err| {
-            serialWrite("compositor queue cursor submit cap grant failed: ");
-            serialWrite(@errorName(err));
-            serialWrite("\n");
-            while (true) asm volatile ("hlt");
-        };
-        gpu_cursor_notify_token = state.queueCapGrantStage2(principal, .virtio_gpu, 1, false, true) catch |err| {
-            serialWrite("compositor queue cursor notify cap grant failed: ");
+        keyboard_notify_token = state.queueCapGrantStage2(principal, .virtio_input, 0, false, true) catch |err| {
+            serialWrite("shell keyboard queue notify cap grant failed: ");
             serialWrite(@errorName(err));
             serialWrite("\n");
             while (true) asm volatile ("hlt");
         };
     }
-    publishVirtioGpuConfigPage(compositor_gpu_config_page.paddr, gpu_cfg, gpu_control_submit_token, gpu_control_notify_token, gpu_cursor_submit_token, gpu_cursor_notify_token);
+
+    publishShellKeyboardConfigPage(
+        compositor_gpu_config_page.paddr,
+        keyboard_cfg,
+        keyboard_submit_token,
+        keyboard_notify_token,
+    );
     return .{
         .principal = principal,
         .process = process,
@@ -1649,22 +1864,49 @@ fn mirrorKernelBackedInitSpawnPages(
     }
 }
 
-fn publishInitWindowServiceRegistryPage(
+const InitServiceDescriptorSet = struct {
+    count: usize = 0,
+    descriptors: [service_registry_abi.max_entries]service_registry_abi.ServiceEntry =
+        [_]service_registry_abi.ServiceEntry{.{
+            .kind = 0,
+            .process_slot = 0,
+            .endpoint_id = 0,
+            .flags = 0,
+        }} ** service_registry_abi.max_entries,
+};
+
+fn buildInitServiceDescriptors(boot_display_process: ?kernel.PrincipalId) InitServiceDescriptorSet {
+    var services = InitServiceDescriptorSet{};
+    const principal = boot_display_process orelse return services;
+    const process_index = kernel.processIndexFromPrincipal(principal) orelse
+        haltInitBootstrapDescriptor("boot display principal index missing");
+    services.descriptors[0] = .{
+        .kind = @intFromEnum(service_registry_abi.ServiceKind.window),
+        .process_slot = @intCast(process_index),
+        .endpoint_id = service_registry_abi.init_window_service_endpoint_id,
+        .flags = 0,
+    };
+    services.count = 1;
+    return services;
+}
+
+fn publishInitServiceRegistryPage(
     pages: []const ?KernelBackedInitSpawnPage,
-    boot_display_process: ?kernel.PrincipalId,
+    services: []const service_registry_abi.ServiceEntry,
 ) void {
     const page = findKernelBackedInitSpawnPage(pages, init_bootstrap_layout.sourceVa(.window_service_config)) orelse
         haltInitBootstrapDescriptor("missing window service config page");
     service_registry_abi.initPage(page.page.paddr);
-    const principal = boot_display_process orelse return;
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse
-        haltInitBootstrapDescriptor("boot display principal index missing");
-    service_registry_abi.addService(
-        page.page.paddr,
-        .window,
-        @intCast(process_index),
-        service_registry_abi.init_window_service_endpoint_id,
-    );
+    for (services) |descriptor| {
+        const kind = std.meta.intToEnum(service_registry_abi.ServiceKind, descriptor.kind) catch
+            haltInitBootstrapDescriptor("invalid init service descriptor kind");
+        service_registry_abi.addService(
+            page.page.paddr,
+            kind,
+            descriptor.process_slot,
+            descriptor.endpoint_id,
+        );
+    }
 }
 
 fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64) void {
@@ -1678,6 +1920,7 @@ fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64)
 fn publishInitBootstrapDescriptorPage(
     user_page_paddr: u64,
     input_devices: []const ?DetectedInputBootstrap,
+    block_device: ?DetectedBlockBootstrap,
     bootfs_setup: ?BootFsImageSetup,
     root_mount_token: u64,
 ) void {
@@ -1788,9 +2031,53 @@ fn publishInitBootstrapDescriptorPage(
         input_count += 1;
     }
     page.input_device_count = input_count;
+
+    var block_idx: usize = 0;
+    while (block_idx < init_bootstrap_abi.max_block_device_descriptors) : (block_idx += 1) {
+        page.block_devices[block_idx] = .{
+            .kind = 0,
+            .flags = 0,
+            .config_source_va = 0,
+            .config_target_va = 0,
+            .config_spawn_flags = 0,
+            .common_page_paddr = 0,
+            .notify_page_paddr = 0,
+            .isr_page_paddr = 0,
+            .device_page_paddr = 0,
+            .common_page_offset = 0,
+            .notify_page_offset = 0,
+            .isr_page_offset = 0,
+            .device_page_offset = 0,
+            .notify_off_multiplier = 0,
+            .capacity_sectors = 0,
+            .logical_block_size = 0,
+            .init_queue_submit_token = 0,
+            .init_queue_notify_token = 0,
+            .init_root_token = 0,
+        };
+    }
+    if (block_device) |device| {
+        var descriptor = device.descriptor;
+        descriptor.flags |= init_bootstrap_abi.block_device_flag_present;
+        page.block_devices[0] = descriptor;
+        page.block_device_count = 1;
+    } else {
+        page.block_device_count = 0;
+    }
 }
 
 fn haltInitInputBootstrapError(label: []const u8, step: []const u8, err: anyerror) noreturn {
+    serialWrite("init ");
+    serialWrite(label);
+    serialWrite(" ");
+    serialWrite(step);
+    serialWrite(" failed: ");
+    serialWrite(@errorName(err));
+    serialWrite("\n");
+    while (true) asm volatile ("hlt");
+}
+
+fn haltInitBlockBootstrapError(label: []const u8, step: []const u8, err: anyerror) noreturn {
     serialWrite("init ");
     serialWrite(label);
     serialWrite(" ");
@@ -1842,8 +2129,8 @@ fn setupInputDriverBootstrapForInit(
         device.descriptor.config_source_va,
         true,
     );
-    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false };
-    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false };
+    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true };
+    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false, .grant = true };
     const cfg = device.config;
     installInitInputMmioCapOrHalt(state, init_process_principal, label, "install common cap", cfg.common.page_paddr, mmio_rw_rights);
     installInitInputMmioCapOrHalt(state, init_process_principal, label, "install notify cap", cfg.notify.page_paddr, mmio_rw_rights);
@@ -1870,11 +2157,92 @@ fn setupInputDriverBootstrapForInit(
     return updated;
 }
 
+fn installInitBlockMmioCapOrHalt(
+    state: *kernel.KernelState,
+    init_process_principal: kernel.PrincipalId,
+    label: []const u8,
+    cap_label: []const u8,
+    paddr: u64,
+    rights: kernel.Rights,
+) void {
+    state.installCap(init_process_principal, paddr, rights) catch |err| {
+        haltInitBlockBootstrapError(label, cap_label, err);
+    };
+}
+
+fn grantInitBlockQueueTokenOrHalt(
+    state: *kernel.KernelState,
+    init_process_principal: kernel.PrincipalId,
+    label: []const u8,
+    step_label: []const u8,
+    submit: bool,
+    notify: bool,
+) u64 {
+    return state.queueCapGrantStage2(init_process_principal, .virtio_blk, 0, submit, notify) catch |err| {
+        haltInitBlockBootstrapError(label, step_label, err);
+    };
+}
+
+fn setupBlockDriverBootstrapForInit(
+    state: *kernel.KernelState,
+    init_process_principal: kernel.PrincipalId,
+    device: DetectedBlockBootstrap,
+) DetectedBlockBootstrap {
+    const kind = detectedBlockKindFromDescriptor(device.descriptor);
+    const label = blockDeviceLabel(kind);
+    _ = allocAndMapOwnedPageForProcessOrHalt(
+        state,
+        init_process_principal,
+        "init",
+        blockDeviceConfigPageLabel(kind),
+        device.descriptor.config_source_va,
+        true,
+    );
+    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true };
+    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false, .grant = true };
+    const cfg = device.config;
+    installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install common cap", cfg.common.page_paddr, mmio_rw_rights);
+    installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install notify cap", cfg.notify.page_paddr, mmio_rw_rights);
+    if (cfg.isr.page_paddr != 0) {
+        installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install isr cap", cfg.isr.page_paddr, mmio_ro_rights);
+    }
+    if (cfg.device.page_paddr != 0) {
+        installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install device cap", cfg.device.page_paddr, mmio_ro_rights);
+    }
+    const init_submit_token = grantInitBlockQueueTokenOrHalt(state, init_process_principal, label, "queue submit grant", true, false);
+    const init_notify_token = grantInitBlockQueueTokenOrHalt(state, init_process_principal, label, "queue notify grant", false, true);
+    const root_cap_id = state.installFsCap(init_process_principal, raw_block_root_object_id, .block_device, .{
+        .read = true,
+        .write = true,
+        .grant = true,
+        .admin = true,
+    }) catch |err| {
+        haltInitBlockBootstrapError(label, "install root block cap", err);
+    };
+    var updated = device;
+    updated.descriptor.common_page_paddr = cfg.common.page_paddr;
+    updated.descriptor.notify_page_paddr = cfg.notify.page_paddr;
+    updated.descriptor.isr_page_paddr = cfg.isr.page_paddr;
+    updated.descriptor.device_page_paddr = cfg.device.page_paddr;
+    updated.descriptor.common_page_offset = cfg.common.page_offset;
+    updated.descriptor.notify_page_offset = cfg.notify.page_offset;
+    updated.descriptor.isr_page_offset = cfg.isr.page_offset;
+    updated.descriptor.device_page_offset = cfg.device.page_offset;
+    updated.descriptor.notify_off_multiplier = cfg.notify_off_multiplier;
+    updated.descriptor.capacity_sectors = cfg.capacity_sectors;
+    updated.descriptor.logical_block_size = cfg.logical_block_size;
+    updated.descriptor.init_queue_submit_token = init_submit_token;
+    updated.descriptor.init_queue_notify_token = init_notify_token;
+    updated.descriptor.init_root_token = fs_abi.encodeCapToken(root_cap_id);
+    return updated;
+}
+
 fn setupInitBootstrapResources(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
     boot_display_process: ?kernel.PrincipalId,
     input_devices: []?DetectedInputBootstrap,
+    block_device: *?DetectedBlockBootstrap,
     bootfs_image: ?[]const u8,
 ) void {
     const config_page = allocAndMapOwnedPageForProcessOrHalt(
@@ -1894,8 +2262,24 @@ fn setupInitBootstrapResources(
         false,
     );
     const kernel_backed_pages = allocKernelBackedInitSpawnPages(state, init_process_principal);
+    const init_services = buildInitServiceDescriptors(boot_display_process);
     mirrorKernelBackedInitSpawnPages(state, boot_display_process, kernel_backed_pages[0..]);
-    publishInitWindowServiceRegistryPage(kernel_backed_pages[0..], boot_display_process);
+    publishInitServiceRegistryPage(kernel_backed_pages[0..], init_services.descriptors[0..init_services.count]);
+    if (boot_display_process) |shell_principal| {
+        const registry_page = findKernelBackedInitSpawnPage(
+            kernel_backed_pages[0..],
+            init_bootstrap_layout.sourceVa(.window_service_config),
+        ) orelse haltInitBootstrapDescriptor("missing window service config page");
+        installAndMapPageForProcessOrHalt(
+            state,
+            shell_principal,
+            registry_page.page,
+            process_abi.service_registry_shadow_va,
+            false,
+            "shell",
+            "shared service registry page",
+        );
+    }
     const bootfs_setup = if (bootfs_image) |image|
         mapBootFsImageIntoProcessOrHalt(state, init_process_principal, "init", init_bootstrap_layout.bootfs_image_va, image)
     else
@@ -1919,22 +2303,24 @@ fn setupInitBootstrapResources(
         const device = entry.* orelse continue;
         entry.* = setupInputDriverBootstrapForInit(state, init_process_principal, device);
     }
+    if (block_device.*) |device| {
+        block_device.* = setupBlockDriverBootstrapForInit(state, init_process_principal, device);
+    }
     publishInitBootstrapConfigPage(config_page.paddr, init_bootstrap_layout.descriptor_page_va);
     publishInitBootstrapDescriptorPage(
         descriptor_page.paddr,
         input_devices,
+        block_device.*,
         bootfs_setup,
         fs_abi.encodeCapToken(root_mount_cap),
     );
 }
 
 fn determineBootRuntimeMode(input_devices: []const ?DetectedInputBootstrap) BootRuntimeMode {
+    _ = input_devices;
     if (!enable_framebuffer_server_step1 or !enable_boot_log_console_process) {
-        serialWrite("legacy direct boot modes removed; enable boot log console path\n");
+        serialWrite("legacy direct boot modes removed; enable shell path\n");
         while (true) asm volatile ("hlt");
-    }
-    if (enable_virtio_input_mouse and hasDetectedInputBootstrap(input_devices, .pointer)) {
-        return .BootLogGateCompositor;
     }
     return .BootLogConsole;
 }
@@ -2008,20 +2394,23 @@ fn setupUserProcessesForMode(
     state: *kernel.KernelState,
     mode: BootRuntimeMode,
     input_devices: []?DetectedInputBootstrap,
+    block_device: *?DetectedBlockBootstrap,
     gpu_cfg: ?VirtioGpuDriverConfig,
     bootfs_image: ?[]const u8,
 ) UserBootProcessSetup {
+    _ = gpu_cfg;
     var result = UserBootProcessSetup{};
     switch (mode) {
         .BootLogConsole, .BootLogGateCompositor => {
             const display_principal = configuredBootDisplayPrincipal();
-            const setup = setupBootLogConsoleProcess(state, display_principal, gpu_cfg);
+            const keyboard_cfg = if (detectedInputBootstrapForKind(input_devices, .keyboard)) |device| device.config else null;
+            const setup = setupBootLogConsoleProcess(state, display_principal, keyboard_cfg);
             result.setBootLogConsole(setup);
             activateThreadOrHalt(setup.process.thread_slot);
             if (enable_init_process) {
                 const process = createUserProcess(state, init_principal, "init");
                 result.setProcess(init_principal, process);
-                setupInitBootstrapResources(state, init_principal, result.boot_display_principal, input_devices, bootfs_image);
+                setupInitBootstrapResources(state, init_principal, result.boot_display_principal, input_devices, block_device, bootfs_image);
                 activateThreadOrHalt(process.thread_slot);
             }
         },
@@ -2145,6 +2534,30 @@ fn updateBootLogQueueReadyStatusFromUserLog(_: kernel.PrincipalId, message: []co
     if (containsBytes(message, "KeyboardDriver: queue ready")) {
         new_status |= boot_log_status_keyboard_queue_ready;
     }
+    if (containsBytes(message, "Init: started")) {
+        new_status |= boot_log_status_init_started;
+    }
+    if (containsBytes(message, "Init: startup manifest begin")) {
+        new_status |= boot_log_status_init_manifest_begin;
+    }
+    if (containsBytes(message, "Init: keyboard spawn done")) {
+        new_status |= boot_log_status_init_keyboard_spawn_done;
+    }
+    if (containsBytes(message, "Init: mouse spawn done")) {
+        new_status |= boot_log_status_init_mouse_spawn_done;
+    }
+    if (containsBytes(message, "Init: keyboard shared ready")) {
+        new_status |= boot_log_status_init_keyboard_shared_ready;
+    }
+    if (containsBytes(message, "Init: mouse shared ready")) {
+        new_status |= boot_log_status_init_mouse_shared_ready;
+    }
+    if (containsBytes(message, "Init: arm deferred compositor ok")) {
+        new_status |= boot_log_status_init_compositor_arm_done;
+    }
+    if (containsBytes(message, "Init: first window spawn done")) {
+        new_status |= boot_log_status_init_first_window_spawn_done;
+    }
     if (new_status == boot_log_status_flags) return;
     boot_log_status_flags = new_status;
     writeBootLogStatusToUserPage(boot_log_status_page_paddr);
@@ -2212,6 +2625,7 @@ fn initMemoryModules() void {
         .user_spaces = user_spaces,
         .current_user_principal = &scheduler.current_user_principal,
         .four_gib = four_gib,
+        .physical_map_limit = physical_map_limit_exclusive,
         .user_va = user_va,
         .user_stack_page_va = user_stack_page_va,
         .page_entries = page_entries,
@@ -2347,8 +2761,7 @@ fn loadUserElfIntoUserPage(user_page_paddr: u64, image_bytes: []const u8) ?elf_l
     return elf_loader.loadToSinglePage(image_bytes, user_elf_base_va, page[0..4096]) catch null;
 }
 
-fn computeUserElfRequiredBytes(image_bytes: []const u8) ?usize {
-    const parsed = elf_loader.parse(image_bytes) catch return null;
+fn computeUserElfRequiredBytesFromParsed(parsed: elf_loader.Image) ?usize {
     var max_end: u64 = 0;
     var i: usize = 0;
     while (i < parsed.load_segment_len) : (i += 1) {
@@ -2361,6 +2774,11 @@ fn computeUserElfRequiredBytes(image_bytes: []const u8) ?usize {
     const aligned_end = kernel_vm.pageAlignUp(max_end);
     if (aligned_end > std.math.maxInt(usize)) return null;
     return @intCast(aligned_end);
+}
+
+fn computeUserElfRequiredBytes(image_bytes: []const u8) ?usize {
+    const parsed = elf_loader.parse(image_bytes) catch return null;
+    return computeUserElfRequiredBytesFromParsed(parsed);
 }
 
 fn allocateBootScratch(bytes: usize) ?[]align(8) u8 {
@@ -2516,6 +2934,118 @@ fn loadUserElfIntoProcessPagesOrHalt(
     };
 }
 
+const ImageBackingReaderContext = struct {
+    backing: kernel.ImageBacking,
+};
+
+fn readImageBackingAt(context: *anyopaque, offset: u64, out: []u8) elf_loader.StreamReadError!void {
+    const ctx: *const ImageBackingReaderContext = @ptrCast(@alignCast(context));
+    if (offset > ctx.backing.size_bytes) return error.SourceOutOfRange;
+    if (@as(u64, @intCast(out.len)) > ctx.backing.size_bytes - offset) return error.SourceOutOfRange;
+
+    var copied: usize = 0;
+    const start_absolute = @as(u64, ctx.backing.page_offset_bytes) + offset;
+    while (copied < out.len) {
+        const absolute = start_absolute + @as(u64, @intCast(copied));
+        const page_index: usize = @intCast(absolute / 4096);
+        if (page_index >= ctx.backing.page_count) return error.SourceOutOfRange;
+        const page_offset: usize = @intCast(absolute % 4096);
+        const page_paddr = ctx.backing.page_paddrs[page_index];
+        if ((page_paddr & 0xFFF) != 0) return error.SourceOutOfRange;
+        const page: [*]const u8 = @ptrFromInt(page_paddr);
+        const available = 4096 - page_offset;
+        const remaining = out.len - copied;
+        const chunk_len: usize = if (remaining < available) remaining else available;
+        @memcpy(out[copied .. copied + chunk_len], page[page_offset .. page_offset + chunk_len]);
+        copied += chunk_len;
+    }
+}
+
+fn loadUserElfIntoProcessPagesFromBacking(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    page0_paddr: u64,
+    page1_paddr: u64,
+    backing: kernel.ImageBacking,
+) ?elf_loader.Image {
+    if ((page0_paddr & 0xFFF) != 0 or (page1_paddr & 0xFFF) != 0) {
+        serialWrite("loadUserElfIntoProcessPagesFromBacking: unaligned base pages\n");
+        return null;
+    }
+
+    var reader_ctx = ImageBackingReaderContext{ .backing = backing };
+    const reader = elf_loader.Reader{
+        .context = @ptrCast(&reader_ctx),
+        .read_at = readImageBackingAt,
+    };
+    const parsed = elf_loader.parseStreaming(reader) catch |err| {
+        serialWrite("loadUserElfIntoProcessPagesFromBacking: parse failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        return null;
+    };
+    const required_bytes = computeUserElfRequiredBytesFromParsed(parsed) orelse {
+        serialWrite("loadUserElfIntoProcessPagesFromBacking: required_bytes failed\n");
+        return null;
+    };
+    if (required_bytes > user_program_max_load_bytes) {
+        serialWrite("loadUserElfIntoProcessPagesFromBacking: image too large required=");
+        printNumber(required_bytes);
+        serialWrite(" max=");
+        printNumber(user_program_max_load_bytes);
+        serialWrite("\n");
+        return null;
+    }
+
+    const load_window = allocateBootScratch(required_bytes) orelse {
+        serialWrite("loadUserElfIntoProcessPagesFromBacking: scratch alloc failed bytes=");
+        printNumber(required_bytes);
+        serialWrite("\n");
+        return null;
+    };
+    defer freeBootScratch(load_window);
+
+    @memset(load_window[0..required_bytes], 0);
+    const loaded = elf_loader.loadToSinglePageStreaming(reader, user_elf_base_va, load_window[0..required_bytes]) catch |err| {
+        serialWrite("loadUserElfIntoProcessPagesFromBacking: load failed: ");
+        serialWrite(@errorName(err));
+        serialWrite("\n");
+        return null;
+    };
+
+    const required_pages = required_bytes / 4096;
+    const page0: [*]u8 = @ptrFromInt(page0_paddr);
+    @memcpy(page0[0..4096], load_window[0..4096]);
+
+    var page_index: usize = 1;
+    while (page_index < required_pages) : (page_index += 1) {
+        const extra_page = state.allocPageTo(principal, &global_free_list) catch |err| {
+            serialWrite("loadUserElfIntoProcessPagesFromBacking: allocPageTo failed idx=");
+            printNumber(page_index);
+            serialWrite(" err=");
+            serialWrite(@errorName(err));
+            serialWrite("\n");
+            return null;
+        };
+        const map_va = user_va + (@as(u64, @intCast(page_index)) * 4096);
+        if (!user_vm.mapUserLinearRegion(principal, map_va, extra_page.paddr, 4096, true)) {
+            serialWrite("loadUserElfIntoProcessPagesFromBacking: map failed idx=");
+            printNumber(page_index);
+            serialWrite(" va=");
+            printHex(map_va);
+            serialWrite(" paddr=");
+            printHex(extra_page.paddr);
+            serialWrite("\n");
+            return null;
+        }
+        const page_bytes: [*]u8 = @ptrFromInt(extra_page.paddr);
+        const off = page_index * 4096;
+        @memcpy(page_bytes[0..4096], load_window[off .. off + 4096]);
+    }
+
+    return loaded;
+}
+
 fn copyImageBackingBytes(backing: kernel.ImageBacking, dest: []u8) bool {
     if (dest.len < backing.size_bytes) return false;
     if (backing.page_count == 0 or backing.page_count > kernel.max_image_backing_pages) return false;
@@ -2580,9 +3110,7 @@ fn armDeferredCompositorFromSyscall(frame: *TrapFrame) u64 {
         false,
         false,
     );
-    if (!enable_bootlog_wait_for_enter) {
-        launchDeferredCompositor(frame, "auto");
-    }
+    tryAutoLaunchDeferredCompositor(frame);
     return syscall_ok;
 }
 
@@ -2661,25 +3189,18 @@ fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
         }
     }
 
-    const image_bytes = allocateBootScratch(@intCast(exec_cap.backing.size_bytes)) orelse return syscall_err_alloc;
-    defer freeBootScratch(image_bytes);
-    if (!copyImageBackingBytes(exec_cap.backing, image_bytes)) return syscall_err_invalid;
-    if (image_bytes.len < 4 or image_bytes[0] != 0x7F or image_bytes[1] != 'E' or image_bytes[2] != 'L' or image_bytes[3] != 'F') {
-        return syscall_err_invalid;
-    }
-
     const created = tryCreateDynamicUserProcess(&kernel_state_global, dynamic_spawn_first_process_index, "spawned exec") orelse return syscall_err_alloc;
     _ = setThreadReady(created.process.thread_slot, false);
 
     installSpawnCompatibilityEndpoints(&kernel_state_global, created.principal) catch return syscall_err_endpoint;
     installSpawnParentEndpoint(&kernel_state_global, created.principal, caller) catch return syscall_err_endpoint;
 
-    const loaded = loadUserElfIntoProcessPages(
+    const loaded = loadUserElfIntoProcessPagesFromBacking(
         &kernel_state_global,
         created.principal,
         created.process.user_page.paddr,
         created.process.user_stack_page.paddr,
-        image_bytes,
+        exec_cap.backing,
     ) orelse {
         serialWrite("spawn_exec ELF load failed\n");
         return syscall_err_invalid;
@@ -2706,8 +3227,26 @@ fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
     }
     setThreadEntry(created.process.thread_slot, loaded.entry, user_entry_rsp);
     if (!setThreadReady(created.process.thread_slot, true)) return syscall_err_not_ready;
+    if (caller == init_principal) {
+        serialWrite("spawn_exec ready child=");
+        printNumber(@as(u64, @intCast(kernel.processIndexFromPrincipal(created.principal).?)));
+        serialWrite(" thread=");
+        printNumber(@as(u64, @intCast(created.process.thread_slot)));
+        serialWrite(" flags=");
+        printHex(bootstrap_flags);
+        serialWrite(" desc=");
+        serialWrite(if (descriptor_mode) "1" else "0");
+        serialWrite(" ext=");
+        serialWrite(if (extended_descriptor_mode) "1" else "0");
+        serialWrite(" boot_pages=");
+        printNumber(@as(u64, @intCast(bootstrap_descriptor_count)));
+        serialWrite("\n");
+    }
 
-    return process_abi.encodeSpawnedProcessSlot(@intCast(kernel.processIndexFromPrincipal(created.principal).?));
+    return process_abi.encodeSpawnedProcess(
+        @intCast(kernel.processIndexFromPrincipal(created.principal).?),
+        @intCast(created.process.thread_slot),
+    );
 }
 
 fn setThreadEntry(thread_index: usize, entry: u64, rsp: ?u64) void {
@@ -2763,18 +3302,17 @@ fn armDeferredCompositorLaunch(
     wait_mouse_queue_ready: bool,
     wait_keyboard_queue_ready: bool,
 ) void {
-    _ = wait_mouse_queue_ready;
-    _ = wait_keyboard_queue_ready;
     deferred_compositor.arm(
         classic_backing,
         gpu_backing,
         target_principal,
+        configuredDeferredCompositorKeyboardSourcePrincipal(),
         target_user_page_paddr,
         target_user_stack_paddr,
-        false,
-        0,
-        false,
-        false,
+        !enable_bootlog_wait_for_enter,
+        scheduler.lapic_tick_count,
+        wait_mouse_queue_ready,
+        wait_keyboard_queue_ready,
     );
 }
 
@@ -2794,23 +3332,26 @@ fn launchDeferredCompositor(frame: *TrapFrame, reason: []const u8) void {
     const compositor_principal = deferred_compositor.target_principal orelse return;
 
     const image_backing = deferred_compositor.currentImage() orelse return;
-    const image = copyImageBackingToBootScratch(image_backing) orelse {
-        deferred_compositor.markLoadFailed();
-        serialWrite("deferred compositor launch failed: image backing copy\n");
-        return;
-    };
-    defer freeBootScratch(image);
     const compositor_thread = threadSlotForPrincipalOrHalt(compositor_principal, "deferred compositor");
 
-    const loaded = loadUserElfIntoProcessPages(
+    const loaded = loadUserElfIntoProcessPagesFromBacking(
         &kernel_state_global,
         compositor_principal,
         deferred_compositor.user_page_paddr,
         deferred_compositor.user_stack_page_paddr,
-        image,
+        image_backing,
     ) orelse {
         deferred_compositor.markLoadFailed();
-        logDeferredCompositorLoadFailure(image);
+        serialWrite("deferred compositor load diag\n");
+        serialWrite("  backing_size=");
+        printNumber(image_backing.size_bytes);
+        serialWrite("\n");
+        serialWrite("  scratch_bytes=");
+        printNumber(post_exit_load_scratch.len);
+        serialWrite("\n");
+        serialWrite("  max_load_bytes=");
+        printNumber(user_program_max_load_bytes);
+        serialWrite("\n");
         serialWrite("deferred compositor launch failed: ELF load\n");
         return;
     };
@@ -2822,7 +3363,13 @@ fn launchDeferredCompositor(frame: *TrapFrame, reason: []const u8) void {
         boot_timing.recordEvent("compositor_launch", boot_timing.state.compositor_launch_tick, null);
     }
     deferred_compositor.markLaunched();
-    compositor_runtime_priority_requested = deferred_compositor.selected_kind == .gpu;
+    compositor_pre_log_timer_probe_emitted = false;
+    compositor_user_return_probe_emitted = false;
+    // Delay runtime-priority activation until the first dynamic client actually
+    // sends a window capability to the compositor. Otherwise the freshly
+    // launched GPU compositor can outrun the window clients that need to create
+    // that first window.
+    compositor_runtime_priority_requested = false;
     refreshCompositorPriorityActive();
     serialWrite("deferred compositor launch: ");
     serialWrite(reason);
@@ -2842,10 +3389,6 @@ fn launchDeferredCompositor(frame: *TrapFrame, reason: []const u8) void {
         serialWrite("deferred compositor launch: startup threads pending, no immediate switch\n");
         return;
     }
-    if (std.mem.eql(u8, reason, "auto")) {
-        serialWrite("deferred compositor launch: auto, no immediate switch\n");
-        return;
-    }
     if (switchToThread(compositor_thread, frame, syscall_ok)) {
         serialWrite("deferred compositor switch to compositor thread\n");
     }
@@ -2857,7 +3400,20 @@ fn tryLaunchDeferredCompositorFromLog(frame: *TrapFrame, proc: kernel.PrincipalI
 }
 
 fn tryAutoLaunchDeferredCompositor(frame: *TrapFrame) void {
-    _ = frame;
+    if (deferred_compositor.selected_kind == .gpu and boot_display_principal != null and
+        (!bootlog_virtgpu_prewarm_ready or !bootlog_virtgpu_scanout_prewarm_done))
+    {
+        return;
+    }
+    if (!deferred_compositor.shouldAutoLaunch(
+        scheduler.lapic_tick_count,
+        bootlog_entered_user_tick,
+        if (enable_bootlog_wait_for_enter) bootlog_gate_input_start_delay_ticks else bootlog_gate_auto_input_start_delay_ticks,
+        boot_log_status_flags,
+        boot_log_status_mouse_queue_ready,
+        boot_log_status_keyboard_queue_ready,
+    )) return;
+    launchDeferredCompositor(frame, "auto");
 }
 
 fn installUserFramebufferFillCode(
@@ -2965,6 +3521,8 @@ fn kernelMain() void {
     boot_log_status_page_paddr = 0;
     resetStartupClientPublishState();
     boot_display_principal = null;
+    bootlog_virtgpu_prewarm_ready = false;
+    bootlog_virtgpu_scanout_prewarm_done = false;
     serialWrite("[stage] boot entry\n");
     serialWrite("MicroKernel Phase1 boot\n");
     _ = gdt_user_code_selector;
@@ -2984,7 +3542,7 @@ fn kernelMain() void {
     runtime_framebuffer_info = framebuffer_info;
     const disk_boot_log_console_elf: ?[]const u8 = if (enable_framebuffer_server_step1 and enable_boot_log_console_process)
         (loadBootDiskFileFromDisk(bs, boot_images.fileFor(.boot_log_console)) orelse {
-            serialWrite("disk boot log console ELF load failed\n");
+            serialWrite("disk shell ELF load failed\n");
             while (true) asm volatile ("hlt");
         })
     else
@@ -3022,25 +3580,13 @@ fn kernelMain() void {
         serialWrite(" bytes\n");
     }
     if (enable_framebuffer_server_step1 and enable_boot_log_console_process) {
-        if (enable_virtio_input_mouse) {
-            if (enable_bootlog_wait_for_enter) {
-                serialWrite("boot log console ELF loaded from disk\n");
-                serialWrite("  path=");
-                serialWrite(boot_images.fileFor(.boot_log_console).log_path);
-                serialWrite("\n");
-                serialWrite("  size=");
-                printNumber(disk_boot_log_console_elf.?.len);
-                serialWrite(" bytes\n");
-            }
-        } else {
-            serialWrite("boot log console ELF loaded from disk\n");
-            serialWrite("  path=");
-            serialWrite(boot_images.fileFor(.boot_log_console).log_path);
-            serialWrite("\n");
-            serialWrite("  size=");
-            printNumber(disk_boot_log_console_elf.?.len);
-            serialWrite(" bytes\n");
-        }
+        serialWrite("shell ELF loaded from disk\n");
+        serialWrite("  path=");
+        serialWrite(boot_images.fileFor(.boot_log_console).log_path);
+        serialWrite("\n");
+        serialWrite("  size=");
+        printNumber(disk_boot_log_console_elf.?.len);
+        serialWrite(" bytes\n");
     }
     const memory_stats = collectBootMemoryStatsOrHalt(bs);
     exitBootServicesOrHalt();
@@ -3049,7 +3595,7 @@ fn kernelMain() void {
     capability.init(.{
         .user_spaces = user_spaces[0..],
         .user_va = user_va,
-        .physical_map_limit = one_tib,
+        .physical_map_limit = physical_map_limit_exclusive,
         .page_entries = page_entries,
         .page_addr_mask = page_addr_mask,
         .page_present = page_present,
@@ -3062,11 +3608,12 @@ fn kernelMain() void {
         .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
     });
     user_copy.init(.{
-        .four_gib = four_gib,
+        .physical_map_limit = physical_map_limit_exclusive,
         .phys_copy_window_va = phys_copy_window_va,
         .page_present = page_present,
         .page_rw = page_rw,
         .kernel_cr3_value = &x86_platform.kernel_cr3_value,
+        .user_space_cr3_for_principal = userCr3ForPrincipal,
         .phys_copy_window_pt = &x86_platform.phys_copy_window_pt,
         .read_cr3 = readCr3,
         .write_cr3 = writeCr3,
@@ -3105,7 +3652,7 @@ fn kernelMain() void {
     state.debug_window_hook = null;
     state.debug_alloc_page_hook = null;
     state.pte_sync_hook = null;
-    const untyped_bootstrap = untyped_memory.bootstrapProcess0Untyped(state, &global_free_list) catch |err| {
+    const untyped_bootstrap = untyped_memory.bootstrapUntypedForOwner(state, &global_free_list, configuredBootstrapResourceOwnerPrincipal()) catch |err| {
         serialWrite("untyped bootstrap failed: ");
         serialWrite(@errorName(err));
         serialWrite("\n");
@@ -3116,7 +3663,7 @@ fn kernelMain() void {
     serialWrite(" bytes=");
     printNumber(untyped_bootstrap.total_bytes);
     serialWrite("\n");
-    const boot_display_untyped_grants = untyped_memory.grantProcess0UntypedTo(state, configuredBootDisplayPrincipal()) catch |err| {
+    const boot_display_untyped_grants = untyped_memory.grantUntypedFromOwnerTo(state, configuredBootstrapResourceOwnerPrincipal(), configuredBootDisplayPrincipal()) catch |err| {
         serialWrite("untyped grant to boot display failed: ");
         serialWrite(@errorName(err));
         serialWrite("\n");
@@ -3135,11 +3682,13 @@ fn kernelMain() void {
     var mouse_modern_info: ?virtio_probe.InputModernInfo = null;
     var keyboard_modern_info: ?virtio_probe.InputModernInfo = null;
     var gpu_modern_info: ?virtio_probe.GpuModernInfo = null;
+    var blk_modern_info: ?virtio_probe.BlkModernInfo = null;
     var detected_input_devices: [init_bootstrap_abi.max_input_device_descriptors]?DetectedInputBootstrap =
         [_]?DetectedInputBootstrap{null} ** init_bootstrap_abi.max_input_device_descriptors;
+    var detected_block_device: ?DetectedBlockBootstrap = null;
     var gpu_driver_cfg: ?VirtioGpuDriverConfig = null;
 
-    if (enable_virtio_input_mouse and enable_framebuffer_server_step1 and enable_boot_log_console_process) {
+    if (enable_init_process and enable_virtio_input_mouse and enable_framebuffer_server_step1 and enable_boot_log_console_process) {
         mouse_modern_info = virtio_probe.probeMouseModern(probeWriteLog);
         if (mouse_modern_info) |info| {
             const config: MouseDriverConfig = .{
@@ -3217,7 +3766,7 @@ fn kernelMain() void {
         }
     }
 
-    if (enable_framebuffer_server_step1 and enable_boot_log_console_process) {
+    if (enable_init_process and enable_framebuffer_server_step1 and enable_boot_log_console_process) {
         gpu_modern_info = virtio_probe.probeGpuModern(probeWriteLog);
         if (gpu_modern_info) |info| {
             gpu_driver_cfg = .{
@@ -3255,14 +3804,64 @@ fn kernelMain() void {
         }
     }
 
+    if (enable_init_process) {
+        blk_modern_info = virtio_probe.probeBlkModern(probeWriteLog);
+        if (blk_modern_info) |info| {
+            const config: VirtioBlkDriverConfig = .{
+                .common = mmioPageWithOffset(info.common_cfg),
+                .notify = mmioPageWithOffset(info.notify_cfg),
+                .isr = mmioPageWithOffset(info.isr_cfg),
+                .device = mmioPageWithOffset(info.device_cfg),
+                .notify_off_multiplier = info.notify_off_multiplier,
+                .capacity_sectors = info.capacity_sectors,
+                .logical_block_size = info.logical_block_size,
+            };
+            detected_block_device = .{
+                .descriptor = blockDeviceDescriptorForKind(.virtio_blk),
+                .config = config,
+            };
+            serialWrite("virtio-blk: modern probe ready for init bootstrap\n");
+            serialWrite("  pci=");
+            printHex(@as(u64, info.location.bus));
+            serialWrite(":");
+            printHex(@as(u64, info.location.device));
+            serialWrite(".");
+            printHex(@as(u64, info.location.function));
+            serialWrite("\n");
+            serialWrite("  common=");
+            printHex(info.common_cfg);
+            serialWrite("\n");
+            serialWrite("  notify=");
+            printHex(info.notify_cfg);
+            serialWrite("\n");
+            serialWrite("  isr=");
+            printHex(info.isr_cfg);
+            serialWrite("\n");
+            serialWrite("  device=");
+            printHex(info.device_cfg);
+            serialWrite("\n");
+            serialWrite("  capacity_sectors=");
+            printNumber(info.capacity_sectors);
+            serialWrite("\n");
+            serialWrite("  logical_block_size=");
+            printNumber(info.logical_block_size);
+            serialWrite("\n");
+        } else {
+            serialWrite("virtio-blk: block bootstrap disabled (modern blk not found)\n");
+        }
+    }
+
     const boot_runtime_mode = determineBootRuntimeMode(detected_input_devices[0..]);
-    const process_setup = setupUserProcessesForMode(state, boot_runtime_mode, detected_input_devices[0..], gpu_driver_cfg, disk_bootfs_image);
+    const process_setup = setupUserProcessesForMode(state, boot_runtime_mode, detected_input_devices[0..], &detected_block_device, gpu_driver_cfg, disk_bootfs_image);
     process_user_pages = process_setup.user_pages;
     process_user_stack_pages = process_setup.user_stack_pages;
     boot_display_principal = process_setup.boot_display_principal;
     boot_log_console_page = process_setup.boot_log_console_page;
     boot_log_console_stack_page = process_setup.boot_log_console_stack_page;
     compositor_gpu_config_page = process_setup.compositor_gpu_config_page;
+    if (process_setup.boot_display_principal) |display_principal| {
+        installBootDisplayEndpointsOrHalt(state, display_principal);
+    }
     sanitizeAllThreadContexts();
     if (boot_log_console_page) |page| {
         boot_log_status_page_paddr = page.paddr;
@@ -3283,7 +3882,7 @@ fn kernelMain() void {
         serialWrite("  user_pa=");
         switch (boot_runtime_mode) {
             .BootLogConsole, .BootLogGateCompositor => printHex(processPageForPrincipal(process_user_pages[0..], bootDisplayPrincipalOrHalt()).?.paddr),
-            else => printHex(processPageForPrincipal(process_user_pages[0..], .Process0).?.paddr),
+            else => printHex(processPageForPrincipal(process_user_pages[0..], configuredBootstrapResourceOwnerPrincipal()).?.paddr),
         }
         serialWrite("\n");
         serialWrite("  user_stack_top=");
@@ -3297,7 +3896,7 @@ fn kernelMain() void {
         switch (boot_runtime_mode) {
             .BootLogConsole => printHex(boot_log_console_stack_page.?.paddr),
             .BootLogGateCompositor => printHex(boot_log_console_stack_page.?.paddr),
-            else => printHex(processPageForPrincipal(process_user_stack_pages[0..], .Process0).?.paddr),
+            else => printHex(processPageForPrincipal(process_user_stack_pages[0..], configuredBootstrapResourceOwnerPrincipal()).?.paddr),
         }
         serialWrite("\n");
         serialWrite("  process_count=");
@@ -3309,7 +3908,9 @@ fn kernelMain() void {
         switch (boot_runtime_mode) {
             .BootLogConsole, .BootLogGateCompositor => {
                 if (boot_runtime_mode == .BootLogGateCompositor) {
-                    serialWrite("  mouse_owner=Process0\n");
+                    serialWrite("  mouse_owner=");
+                    serialWrite(kernel.principalLabel(configuredBootstrapResourceOwnerPrincipal()));
+                    serialWrite("\n");
                     serialWrite("  process0_cr3=");
                     printHex(user_spaces[0].cr3);
                     serialWrite("\n");
@@ -3324,7 +3925,9 @@ fn kernelMain() void {
                     serialWrite(kernel.principalLabel(bootDisplayPrincipalOrHalt()));
                     serialWrite("\n");
                     if (thread_contexts[5].ready) {
-                        serialWrite("  terminal_owner=Process5\n");
+                        serialWrite("  terminal_owner=");
+                        serialWrite(principalLabel(thread_contexts[5].owner_process));
+                        serialWrite("\n");
                     }
                 }
 
@@ -3415,7 +4018,7 @@ fn kernelMain() void {
                 boot_log_console_stack_page.?.paddr,
                 4096,
                 true,
-                "boot log console stack page map failed",
+                "shell stack page map failed",
             );
             mapUserLinearRegionOrHalt(
                 display_principal,
@@ -3432,10 +4035,10 @@ fn kernelMain() void {
                 processPageForPrincipal(process_user_pages[0..], display_principal).?.paddr,
                 processPageForPrincipal(process_user_stack_pages[0..], display_principal).?.paddr,
                 disk_boot_log_console_elf.?,
-                "boot log console ELF load into user page failed\n",
+                "shell ELF load into user page failed\n",
             );
-            setThreadEntryForPrincipal(display_principal, "boot log console", loaded_elf.?.entry, boot_log_console_entry_rsp);
-            logElfLoadSummary("BootLogConsole ELF mapped", loaded_elf.?);
+            setThreadEntryForPrincipal(display_principal, "shell", loaded_elf.?.entry, boot_log_console_entry_rsp);
+            logElfLoadSummary("Shell ELF mapped", loaded_elf.?);
             if (!enable_title_only_ready_logs) {
                 serialWrite("  log_va=");
                 printHex(boot_log_user_va);
@@ -3466,7 +4069,7 @@ fn kernelMain() void {
                 boot_log_console_stack_page.?.paddr,
                 4096,
                 true,
-                "boot log console stack page map failed",
+                "shell stack page map failed",
             );
             mapUserLinearRegionOrHalt(
                 display_principal,
@@ -3483,10 +4086,10 @@ fn kernelMain() void {
                 processPageForPrincipal(process_user_pages[0..], display_principal).?.paddr,
                 processPageForPrincipal(process_user_stack_pages[0..], display_principal).?.paddr,
                 disk_boot_log_console_elf.?,
-                "boot log console ELF load into user page failed\n",
+                "shell ELF load into user page failed\n",
             );
-            setThreadEntryForPrincipal(display_principal, "boot log console", loaded_elf.?.entry, boot_log_console_entry_rsp);
-            logElfLoadSummary("BootLogConsole ELF mapped", loaded_elf.?);
+            setThreadEntryForPrincipal(display_principal, "shell", loaded_elf.?.entry, boot_log_console_entry_rsp);
+            logElfLoadSummary("Shell ELF mapped", loaded_elf.?);
             if (!enable_title_only_ready_logs) {
                 serialWrite("  log_va=");
                 printHex(boot_log_user_va);
@@ -3534,6 +4137,8 @@ fn kernelMain() void {
         .spawn_exec = spawnExecFromSyscall,
         .arm_deferred_compositor = armDeferredCompositorFromSyscall,
         .wake_waiting_thread_for_principal = wakeWaitingThreadForPrincipal,
+        .wake_blocked_thread_for_principal = scheduler.wakeBlockedThreadForPrincipal,
+        .consume_pending_signal_for_principal = scheduler.consumePendingSignalForPrincipal,
         .switch_to_thread = switchToThread,
         .block_current_thread_for_event = blockCurrentThreadForEvent,
         .log_queue_cap_deny = logQueueCapDeny,
@@ -3562,14 +4167,16 @@ fn kernelMain() void {
         .log_page_fault_step2 = page_fault_log.logStep2,
         .halt_loop = haltLoopTrapHook,
         .maybe_log_scheduler_perf_tick = maybeLogSchedulerPerfTick,
+        .note_user_timer_tick = noteUserTimerTick,
+        .log_staged_user_return = logStagedUserReturn,
         .try_start_bootlog_gate_deferred_input = tryStartBootLogGateDeferredInput,
         .try_auto_launch_deferred_compositor = tryAutoLaunchDeferredCompositor,
         .switch_to_thread = switchToThread,
         .log_race_switch = logSchedulerRaceSwitch,
     });
     switch (boot_runtime_mode) {
-        .BootLogConsole => serialWrite("\nenter ring3 with iretq (boot log console + init)\n"),
-        .BootLogGateCompositor => serialWrite("\nenter ring3 with iretq (boot log console + init; auto compositor)\n"),
+        .BootLogConsole => serialWrite("\nenter ring3 with iretq (shell)\n"),
+        .BootLogGateCompositor => serialWrite("\nenter ring3 with iretq (shell; auto compositor)\n"),
     }
     if (boot_runtime_mode == .BootLogConsole or boot_runtime_mode == .BootLogGateCompositor) {
         if (boot_log_console_page) |page| {

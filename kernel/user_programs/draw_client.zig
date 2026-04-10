@@ -4,7 +4,7 @@ const syscall_send_cap: u64 = 0x6;
 const syscall_log: u64 = 0x9;
 
 const syscall_ok: u64 = 0;
-const endpoint_to_process1: u64 = 0x11;
+const endpoint_to_boot_display: u64 = 0x11;
 
 const request_page_va: usize = 0x2000_3000;
 const request_header_qwords: usize = 8;
@@ -67,7 +67,7 @@ fn sendFillRect(dst_x: u64, dst_y: u64, width: u64, height: u64, color: u64) boo
     req[6] = 0;
     req[7] = 0;
 
-    return sendCap(paddr, endpoint_to_process1) == syscall_ok;
+    return sendCap(paddr, endpoint_to_boot_display) == syscall_ok;
 }
 
 fn sendBlitRect(dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) bool {
@@ -104,7 +104,7 @@ fn sendBlitRect(dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) bo
         }
     }
 
-    return sendCap(paddr, endpoint_to_process1) == syscall_ok;
+    return sendCap(paddr, endpoint_to_boot_display) == syscall_ok;
 }
 
 pub export fn _start() noreturn {

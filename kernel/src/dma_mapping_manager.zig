@@ -1,6 +1,7 @@
 pub const DmaDeviceId = enum(u8) {
     virtio_gpu,
     virtio_input,
+    virtio_blk,
 };
 
 pub const DmaDirection = enum(u8) {

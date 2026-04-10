@@ -318,6 +318,10 @@ pub fn parse(image: []const u8) Error!Image {
     return parsed;
 }
 
+pub fn parseStreaming(reader: Reader) (Error || StreamReadError)!Image {
+    return parseFromReader(reader);
+}
+
 const probe_pie_elf = blk: {
     var image = [_]u8{0} ** 0x200;
 

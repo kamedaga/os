@@ -7,6 +7,7 @@ pub const Hooks = struct {
     user_spaces: []UserAddressSpace,
     current_user_principal: *kernel.PrincipalId,
     four_gib: u64,
+    physical_map_limit: u64,
     user_va: u64,
     user_stack_page_va: u64,
     page_entries: usize,
@@ -77,7 +78,7 @@ pub fn mapUserLinearRegion(
 
     const map_end_va = va_start + size_bytes - 1;
     const map_end_pa = paddr_start + size_bytes - 1;
-    if (map_end_pa >= h.four_gib) return false;
+    if (map_end_pa >= h.physical_map_limit) return false;
 
     const user_pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
     const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);

@@ -1,6 +1,11 @@
 pub const syscall_spawn_exec: u64 = 0x1D;
 pub const syscall_arm_deferred_compositor: u64 = 0x22;
 pub const spawn_result_tag: u64 = 1 << 63;
+pub const spawn_result_process_bits: u6 = 32;
+pub const spawn_result_thread_bits: u6 = 16;
+pub const spawn_result_process_mask: u64 = (@as(u64, 1) << spawn_result_process_bits) - 1;
+pub const spawn_result_thread_mask: u64 = (@as(u64, 1) << spawn_result_thread_bits) - 1;
+pub const spawn_result_thread_shift: u6 = spawn_result_process_bits;
 pub const spawn_flag_bootstrap_page_writable: u64 = 1 << 0;
 pub const spawn_flag_bootstrap_descriptor_table: u64 = 1 << 1;
 pub const spawn_flag_bootstrap_extended_descriptor_table: u64 = 1 << 2;
@@ -9,6 +14,7 @@ pub const max_bootstrap_cap_descriptors: usize = 8;
 pub const aux_base_va: u64 = 0x3C00_0000;
 pub const aux_page_bytes: u64 = 0x1000;
 pub const standard_config_target_va: u64 = auxPageVa(2);
+pub const service_registry_shadow_va: u64 = 0x3C2C_0000;
 
 pub const BootstrapPageDescriptor = extern struct {
     source_va: u64,
@@ -52,7 +58,12 @@ pub fn auxPageVa(page_index: u64) u64 {
 
 pub fn decodeSpawnedProcessSlot(value: u64) ?u64 {
     if ((value & spawn_result_tag) == 0) return null;
-    const process_slot = value & ~spawn_result_tag;
+    const process_slot = value & spawn_result_process_mask;
     if (process_slot == 0) return null;
     return process_slot;
+}
+
+pub fn decodeSpawnedThreadSlot(value: u64) ?u64 {
+    if ((value & spawn_result_tag) == 0) return null;
+    return (value >> spawn_result_thread_shift) & spawn_result_thread_mask;
 }

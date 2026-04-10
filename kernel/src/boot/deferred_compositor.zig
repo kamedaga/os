@@ -20,6 +20,7 @@ pub var auto_debug_last_tick: u64 = 0;
 pub var backing_classic: ?kernel.ImageBacking = null;
 pub var backing_gpu: ?kernel.ImageBacking = null;
 pub var selected_kind: Kind = .classic;
+pub var keyboard_source_principal: ?kernel.PrincipalId = null;
 
 fn containsBytes(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
@@ -40,14 +41,16 @@ pub fn reset() void {
     backing_classic = null;
     backing_gpu = null;
     selected_kind = .classic;
+    keyboard_source_principal = null;
 }
 
 pub fn arm(
     classic_backing: ?kernel.ImageBacking,
     gpu_backing: ?kernel.ImageBacking,
     launch_target_principal: kernel.PrincipalId,
-    process1_user_page_paddr: u64,
-    process1_user_stack_paddr: u64,
+    launch_keyboard_source_principal: ?kernel.PrincipalId,
+    target_user_page_paddr: u64,
+    target_user_stack_paddr: u64,
     auto_launch: bool,
     auto_launch_tick_value: u64,
     wait_mouse_ready: bool,
@@ -56,8 +59,9 @@ pub fn arm(
     backing_classic = classic_backing;
     backing_gpu = gpu_backing;
     target_principal = launch_target_principal;
-    user_page_paddr = process1_user_page_paddr;
-    user_stack_page_paddr = process1_user_stack_paddr;
+    keyboard_source_principal = launch_keyboard_source_principal;
+    user_page_paddr = target_user_page_paddr;
+    user_stack_page_paddr = target_user_stack_paddr;
     launch_armed = true;
     launched = false;
     selected_kind = if (gpu_backing != null) .gpu else .classic;
@@ -98,7 +102,9 @@ pub fn markLaunched() void {
 
 pub fn handleKeyboardLog(proc: anytype, message: []const u8, writeFn: fn ([]const u8) void) bool {
     if (!launch_armed or launched) return false;
-    if (proc != .Process3) return false;
+    if (keyboard_source_principal) |principal| {
+        if (proc != principal) return false;
+    }
     if (containsBytes(message, "key code=0x21 value=1")) {
         selected_kind = .classic;
         writeFn("deferred compositor mode: classic\n");

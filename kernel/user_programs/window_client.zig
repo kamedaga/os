@@ -14,7 +14,6 @@ const service_registry_abi = @import("service_registry_abi.zig");
 
 const syscall_ok: u64 = 0;
 pub const endpoint_to_boot_display: u64 = 0x11;
-pub const endpoint_to_process1: u64 = endpoint_to_boot_display;
 pub const window_cap_magic = protocol.window_cap_magic;
 pub const window_meta_magic = protocol.window_meta_magic;
 pub const window_flag_allow_pixels_dma = protocol.window_flag_allow_pixels_dma;
@@ -34,7 +33,7 @@ const WindowServiceBinding = struct {
 };
 
 var service_binding = WindowServiceBinding{
-    .endpoint_id = endpoint_to_boot_display,
+    .endpoint_id = 0,
 };
 
 fn userLog(message: []const u8) u64 {
@@ -237,6 +236,13 @@ pub fn initServiceBindingFromConfigPage() bool {
     return initServiceBindingFromRegistryPage(service_registry_abi.page_va);
 }
 
+// Transitional compatibility path for programs that still rely on the boot display endpoint.
+pub fn initCompatBootDisplayBinding() void {
+    service_binding = .{
+        .endpoint_id = endpoint_to_boot_display,
+    };
+}
+
 pub fn setServiceBinding(endpoint_id: u64) void {
     if (endpoint_id == 0) return;
     service_binding = .{
@@ -270,6 +276,10 @@ pub fn createAndPublishWindow(
 ) bool {
     const effective_flags = flags;
     const service = windowServiceBinding();
+    if (service.endpoint_id == 0) {
+        _ = userLog("window_client: window service unbound\n");
+        return false;
+    }
     userLogStep("window_client: create begin\n");
     const cap_paddr = createWindowSys(width, height, effective_flags, service.endpoint_id);
     if (cap_paddr < 0x1000) {

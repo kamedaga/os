@@ -1,9 +1,5 @@
-# role path
-vfs /boot/vfs.elf
-keyboard_driver /bin/keyboard_driver.elf
-mouse_driver /bin/mouse_driver.elf
-terminal_window /bin/terminal_window.elf
-taskbar /bin/taskbar.elf
-mouse_button_demo /bin/mouse_button_demo.elf
-compositor /bin/compositor.elf
-gpu_compositor /bin/gpu_compositor.elf
+# default boot is intentionally small
+# shell and init are loaded directly from disk
+block_driver /bin/virtio_blk.elf
+persistent_fs /bin/persistent_fs.elf
+# block_demo is a shell builtin that connects to the registered block service

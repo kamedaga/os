@@ -3,11 +3,12 @@ const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 
 pub const Hooks = struct {
-    four_gib: u64,
+    physical_map_limit: u64,
     phys_copy_window_va: u64,
     page_present: u64,
     page_rw: u64,
     kernel_cr3_value: *const u64,
+    user_space_cr3_for_principal: *const fn (principal: kernel.PrincipalId) u64,
     phys_copy_window_pt: *[512]u64,
     read_cr3: *const fn () u64,
     write_cr3: *const fn (u64) void,
@@ -24,13 +25,49 @@ fn getHooks() *const Hooks {
     return &(hooks orelse unreachable);
 }
 
-fn mapPhysPageForKernelCopy(page_paddr: u64) ?[*]u8 {
+fn mapPhysPageForKernelAccess(page_paddr: u64) ?[*]u8 {
     const h = getHooks();
     const page_base = page_paddr & ~@as(u64, 0xFFF);
-    if (page_base >= h.four_gib) return null;
+    if (page_base >= h.physical_map_limit) return null;
     h.phys_copy_window_pt[0] = page_base | h.page_present | h.page_rw;
     h.invlpg(h.phys_copy_window_va);
     return @ptrFromInt(h.phys_copy_window_va);
+}
+
+fn physWindowAddr(addr: u64, access_len: usize) ?u64 {
+    const h = getHooks();
+    if (access_len == 0 or access_len > 4096) return null;
+    const offset: usize = @intCast(addr & 0xFFF);
+    if (offset + access_len > 4096) return null;
+    const last_addr, const overflow = @addWithOverflow(addr, @as(u64, @intCast(access_len - 1)));
+    if (overflow != 0 or last_addr >= h.physical_map_limit) return null;
+    const page = mapPhysPageForKernelAccess(addr) orelse return null;
+    return @intFromPtr(page) + offset;
+}
+
+pub fn readPhysU8(addr: u64) ?u8 {
+    const window_addr = physWindowAddr(addr, @sizeOf(u8)) orelse return null;
+    const ptr: *volatile u8 = @ptrFromInt(window_addr);
+    return ptr.*;
+}
+
+pub fn readPhysU32(addr: u64) ?u32 {
+    const window_addr = physWindowAddr(addr, @sizeOf(u32)) orelse return null;
+    const ptr: *volatile u32 = @ptrFromInt(window_addr);
+    return ptr.*;
+}
+
+pub fn readPhysU64(addr: u64) ?u64 {
+    const window_addr = physWindowAddr(addr, @sizeOf(u64)) orelse return null;
+    const ptr: *volatile u64 = @ptrFromInt(window_addr);
+    return ptr.*;
+}
+
+pub fn writePhysU8(addr: u64, value: u8) bool {
+    const window_addr = physWindowAddr(addr, @sizeOf(u8)) orelse return false;
+    const ptr: *volatile u8 = @ptrFromInt(window_addr);
+    ptr.* = value;
+    return true;
 }
 
 pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
@@ -56,7 +93,7 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
         const page_va = cur_va & ~@as(u64, 0xFFF);
         const page_off: usize = @intCast(cur_va & 0xFFF);
         const page_paddr = capability.lookupUserMappedPaddrForVa(principal, page_va) orelse return false;
-        if (page_paddr >= h.four_gib) return false;
+        if (page_paddr >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
         const total_remaining: usize = dest.len - copied;
@@ -64,12 +101,12 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
 
         const page_off_u64: u64 = @intCast(page_off);
         const src_paddr, const paddr_overflow = @addWithOverflow(page_paddr, page_off_u64);
-        if (paddr_overflow != 0 or src_paddr >= h.four_gib) return false;
+        if (paddr_overflow != 0 or src_paddr >= h.physical_map_limit) return false;
         if (chunk_len == 0) return false;
         const last_paddr, const last_overflow = @addWithOverflow(src_paddr, @as(u64, @intCast(chunk_len - 1)));
-        if (last_overflow != 0 or last_paddr >= h.four_gib) return false;
+        if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
 
-        const src_page = mapPhysPageForKernelCopy(src_paddr) orelse return false;
+        const src_page = mapPhysPageForKernelAccess(src_paddr) orelse return false;
         const src: [*]const u8 = @ptrCast(src_page + page_off);
         var i: usize = 0;
         while (i < chunk_len) : (i += 1) {
@@ -103,7 +140,7 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
         const page_va = cur_va & ~@as(u64, 0xFFF);
         const page_off: usize = @intCast(cur_va & 0xFFF);
         const page_paddr = capability.lookupUserMappedPaddrForVa(principal, page_va) orelse return false;
-        if (page_paddr >= h.four_gib) return false;
+        if (page_paddr >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
         const total_remaining: usize = src.len - copied;
@@ -112,11 +149,11 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
 
         const page_off_u64: u64 = @intCast(page_off);
         const dst_paddr, const paddr_overflow = @addWithOverflow(page_paddr, page_off_u64);
-        if (paddr_overflow != 0 or dst_paddr >= h.four_gib) return false;
+        if (paddr_overflow != 0 or dst_paddr >= h.physical_map_limit) return false;
         const last_paddr, const last_overflow = @addWithOverflow(dst_paddr, @as(u64, @intCast(chunk_len - 1)));
-        if (last_overflow != 0 or last_paddr >= h.four_gib) return false;
+        if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
 
-        const dst_page = mapPhysPageForKernelCopy(dst_paddr) orelse return false;
+        const dst_page = mapPhysPageForKernelAccess(dst_paddr) orelse return false;
         const dst: [*]u8 = @ptrCast(dst_page + page_off);
         var i: usize = 0;
         while (i < chunk_len) : (i += 1) {
@@ -154,6 +191,7 @@ pub fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
 }
 
 pub fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {
-    _ = principal;
-    _ = va;
+    const h = getHooks();
+    const target_cr3 = h.user_space_cr3_for_principal(principal);
+    flushTlbForCr3Va(target_cr3, va);
 }

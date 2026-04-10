@@ -14,6 +14,7 @@ pub const SourceSlot = enum(u64) {
     pointer_input_config = 4,
     keyboard_input_config = 5,
     window_service_config = 6,
+    block_device_config = 7,
 };
 
 pub fn sourceVa(slot: SourceSlot) u64 {
@@ -116,9 +117,34 @@ pub const builtin_input_devices = [_]init_bootstrap_abi.InputDeviceDescriptor{
     },
 };
 
+pub const builtin_block_devices = [_]init_bootstrap_abi.BlockDeviceDescriptor{
+    .{
+        .kind = @intFromEnum(init_bootstrap_abi.BlockDeviceKind.virtio_blk),
+        .flags = 0,
+        .config_source_va = sourceVa(.block_device_config),
+        .config_target_va = process_abi.standard_config_target_va,
+        .config_spawn_flags = process_abi.spawn_flag_bootstrap_page_writable,
+        .common_page_paddr = 0,
+        .notify_page_paddr = 0,
+        .isr_page_paddr = 0,
+        .device_page_paddr = 0,
+        .common_page_offset = 0,
+        .notify_page_offset = 0,
+        .isr_page_offset = 0,
+        .device_page_offset = 0,
+        .notify_off_multiplier = 0,
+        .capacity_sectors = 0,
+        .logical_block_size = 0,
+        .init_queue_submit_token = 0,
+        .init_queue_notify_token = 0,
+        .init_root_token = 0,
+    },
+};
+
 test "init bootstrap layout uses aux page space" {
     try std.testing.expectEqual(process_abi.auxPageVa(7), descriptor_page_va);
     try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index), sourceVa(.primary_panel_config));
     try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index + 5), sourceVa(.keyboard_input_config));
     try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index + 6), sourceVa(.window_service_config));
+    try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index + 7), sourceVa(.block_device_config));
 }

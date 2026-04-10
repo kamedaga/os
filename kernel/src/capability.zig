@@ -152,6 +152,7 @@ pub fn parseRights(bits: u64) kernel.Rights {
         .cpu_read = (bits & 0x1) != 0,
         .cpu_write = (bits & 0x2) != 0,
         .dma = (bits & 0x4) != 0,
+        .grant = (bits & 0x8) != 0,
     };
 }
 
@@ -675,9 +676,11 @@ pub fn dumpPrincipalCaps(state: *const kernel.KernelState, principal: kernel.Pri
         logHex(cap.root_cap_id);
         logWrite(" parent=");
         logHex(cap.parent_cap_id);
-        if (!cap.rights.cpu_read and !cap.rights.cpu_write and cap.rights.dma) {
-            logWrite(" (dma)");
-        }
+        logWrite(" rights=");
+        if (cap.rights.cpu_read) logWrite("r");
+        if (cap.rights.cpu_write) logWrite("w");
+        if (cap.rights.dma) logWrite("d");
+        if (cap.rights.grant) logWrite("g");
         logWrite("\n");
     }
 }

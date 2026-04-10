@@ -5,6 +5,7 @@ const interrupts = @import("interrupts.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const UserAddressSpace = capability.UserAddressSpace;
+const default_process_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
 
 const fx_state_bytes: usize = 512;
 pub const max_thread_slots: usize = kernel.max_thread_slots;
@@ -12,10 +13,11 @@ pub const max_thread_slots: usize = kernel.max_thread_slots;
 pub const ThreadContext = struct {
     id: u32 = 0,
     allocated: bool = false,
-    owner_process: kernel.PrincipalId = .Process0,
+    owner_process: kernel.PrincipalId = default_process_principal,
     cr3: u64 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
+    signal_pending: bool = false,
     wake_tick: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
@@ -38,13 +40,14 @@ pub var lapic_tick_count: u64 = 0;
 pub var scheduler_tick_accum: u64 = 0;
 pub var scheduler_switch_count: u64 = 0;
 pub var scheduler_perf_user_ticks: u64 = 0;
-pub var scheduler_perf_process1_ticks: u64 = 0;
-pub var scheduler_perf_thread1_ticks: u64 = 0;
+pub var scheduler_perf_priority_owner_ticks: u64 = 0;
+pub var scheduler_perf_priority_thread_ticks: u64 = 0;
 pub var scheduler_probe_log_count: u64 = 0;
-pub var compositor_thread1_priority_streak: u64 = 0;
+pub var runtime_priority_streak: u64 = 0;
 pub var scheduler_int80_log_count: u64 = 0;
 pub var scheduler_race_log_count: u64 = 0;
-pub var compositor_thread1_priority_active = false;
+pub var runtime_priority_active = false;
+pub var runtime_priority_principal: ?kernel.PrincipalId = null;
 pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 
@@ -55,20 +58,22 @@ pub const RaceLogHooks = struct {
 
 pub const PerfReport = struct {
     ticks: u64,
-    process1_ticks: u64,
-    thread1_ticks: u64,
+    priority_owner_ticks: u64,
+    priority_thread_ticks: u64,
     switch_delta: u64,
-    compositor_priority_active: bool,
-    compositor_priority_streak: u64,
+    runtime_priority_active: bool,
+    runtime_priority_streak: u64,
 };
 
 pub fn noteUserTimerTick() void {
     scheduler_perf_user_ticks +%= 1;
-    if (getThreadContextConst(current_thread_index)) |ctx| {
-        if (ctx.allocated and ctx.owner_process == .Process1) scheduler_perf_process1_ticks +%= 1;
-    }
-    if (threadSlotForPrincipal(.Process1)) |slot| {
-        if (current_thread_index == slot) scheduler_perf_thread1_ticks +%= 1;
+    if (runtime_priority_principal) |principal| {
+        if (getThreadContextConst(current_thread_index)) |ctx| {
+            if (ctx.allocated and ctx.owner_process == principal) scheduler_perf_priority_owner_ticks +%= 1;
+        }
+        if (threadSlotForPrincipal(principal)) |slot| {
+            if (current_thread_index == slot) scheduler_perf_priority_thread_ticks +%= 1;
+        }
     }
 }
 
@@ -80,21 +85,25 @@ pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, compositor_hold_quant
     scheduler_tick_accum = 0;
 
     const current_thread = current_thread_index;
-    if (!compositor_thread1_priority_active) {
-        compositor_thread1_priority_streak = 0;
-    } else if (threadSlotForPrincipal(.Process1)) |compositor_slot| {
-        if (current_thread != compositor_slot) {
-            compositor_thread1_priority_streak = 0;
-        } else {
-            const compositor_ctx = getThreadContextConst(compositor_slot) orelse null;
-            if (compositor_ctx != null and compositor_ctx.?.allocated and compositor_ctx.?.ready and compositor_thread1_priority_streak + 1 < compositor_hold_quanta) {
-                compositor_thread1_priority_streak +%= 1;
-                return null;
+    if (!runtime_priority_active) {
+        runtime_priority_streak = 0;
+    } else if (runtime_priority_principal) |priority_principal| {
+        if (threadSlotForPrincipal(priority_principal)) |priority_slot| {
+            if (current_thread != priority_slot) {
+                runtime_priority_streak = 0;
+            } else {
+                const priority_ctx = getThreadContextConst(priority_slot) orelse null;
+                if (priority_ctx != null and priority_ctx.?.allocated and priority_ctx.?.ready and runtime_priority_streak + 1 < compositor_hold_quanta) {
+                    runtime_priority_streak +%= 1;
+                    return null;
+                }
+                runtime_priority_streak = 0;
             }
-            compositor_thread1_priority_streak = 0;
+        } else {
+            runtime_priority_streak = 0;
         }
     } else {
-        compositor_thread1_priority_streak = 0;
+        runtime_priority_streak = 0;
     }
 
     const next_thread = pickNextReadyThreadIndex(current_thread);
@@ -106,23 +115,31 @@ pub fn takePerfReport(report_interval_ticks: u64, last_switch_count: *u64) ?Perf
     if (scheduler_perf_user_ticks < report_interval_ticks) return null;
     const report: PerfReport = .{
         .ticks = scheduler_perf_user_ticks,
-        .process1_ticks = scheduler_perf_process1_ticks,
-        .thread1_ticks = scheduler_perf_thread1_ticks,
+        .priority_owner_ticks = scheduler_perf_priority_owner_ticks,
+        .priority_thread_ticks = scheduler_perf_priority_thread_ticks,
         .switch_delta = scheduler_switch_count - last_switch_count.*,
-        .compositor_priority_active = compositor_thread1_priority_active,
-        .compositor_priority_streak = compositor_thread1_priority_streak,
+        .runtime_priority_active = runtime_priority_active,
+        .runtime_priority_streak = runtime_priority_streak,
     };
     last_switch_count.* = scheduler_switch_count;
     scheduler_perf_user_ticks = 0;
-    scheduler_perf_process1_ticks = 0;
-    scheduler_perf_thread1_ticks = 0;
+    scheduler_perf_priority_owner_ticks = 0;
+    scheduler_perf_priority_thread_ticks = 0;
     return report;
 }
 
-pub fn refreshCompositorPriorityActive(requested: bool, allow_active: bool) void {
-    compositor_thread1_priority_active = requested and allow_active;
-    if (!compositor_thread1_priority_active) {
-        compositor_thread1_priority_streak = 0;
+pub fn setRuntimePriorityPrincipal(principal: ?kernel.PrincipalId) void {
+    runtime_priority_principal = principal;
+    if (principal == null) {
+        runtime_priority_active = false;
+        runtime_priority_streak = 0;
+    }
+}
+
+pub fn refreshRuntimePriorityActive(requested: bool, allow_active: bool) void {
+    runtime_priority_active = requested and allow_active and runtime_priority_principal != null;
+    if (!runtime_priority_active) {
+        runtime_priority_streak = 0;
     }
 }
 
@@ -231,6 +248,7 @@ pub fn initThreadContextWithSpaces(
     ctx.cr3 = space.cr3;
     ctx.ready = true;
     ctx.wait_mailbox = false;
+    ctx.signal_pending = false;
     ctx.wake_tick = 0;
     ctx.frame = initial_frame;
     ctx.fx_state = initial_fx_state;
@@ -362,10 +380,12 @@ pub fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bo
 
 pub fn pickNextReadyThreadIndex(current_index: usize) usize {
     if (current_index >= max_thread_slots) return 0;
-    if (compositor_thread1_priority_active) {
-        if (threadSlotForPrincipal(.Process1)) |compositor_slot| {
-            const compositor_ctx = getThreadContextConst(compositor_slot) orelse return current_index;
-            if (current_index != compositor_slot and compositor_ctx.allocated and compositor_ctx.ready) return compositor_slot;
+    if (runtime_priority_active) {
+        if (runtime_priority_principal) |priority_principal| {
+            if (threadSlotForPrincipal(priority_principal)) |priority_slot| {
+                const priority_ctx = getThreadContextConst(priority_slot) orelse return current_index;
+                if (current_index != priority_slot and priority_ctx.allocated and priority_ctx.ready) return priority_slot;
+            }
         }
     }
     var step: usize = 1;
@@ -391,6 +411,25 @@ pub fn wakeWaitingThreadForPrincipal(principal: kernel.PrincipalId) void {
     const ctx = getThreadContext(thread_index) orelse return;
     if (!ctx.wait_mailbox) return;
     wakeThreadIfWaiting(thread_index);
+}
+
+pub fn wakeBlockedThreadForPrincipal(principal: kernel.PrincipalId) void {
+    const thread_index = threadSlotForPrincipal(principal) orelse return;
+    const ctx = getThreadContext(thread_index) orelse return;
+    if (!ctx.allocated) return;
+    if (!ctx.ready) {
+        wakeThreadIfWaiting(thread_index);
+        return;
+    }
+    ctx.signal_pending = true;
+}
+
+pub fn consumePendingSignalForPrincipal(principal: kernel.PrincipalId) bool {
+    const thread_index = threadSlotForPrincipal(principal) orelse return false;
+    const ctx = getThreadContext(thread_index) orelse return false;
+    if (!ctx.allocated or !ctx.signal_pending) return false;
+    ctx.signal_pending = false;
+    return true;
 }
 
 pub fn wakeThreadsForTimer(now_tick: u64) void {

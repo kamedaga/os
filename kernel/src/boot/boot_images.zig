@@ -7,9 +7,9 @@ pub const DiskFile = struct {
 
 pub const boot_log_console = DiskFile{
     .uefi_path = &[_:0]u16{
-        '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'B', 'O', 'O', 'T', 'L', 'O', 'G', '.', 'E', 'L', 'F',
+        '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'S', 'H', 'E', 'L', 'L', '.', 'E', 'L', 'F',
     },
-    .log_path = "\\EFI\\BOOT\\BOOTLOG.ELF",
+    .log_path = "\\EFI\\BOOT\\SHELL.ELF",
 };
 
 pub const vfs = DiskFile{

@@ -62,9 +62,10 @@ const bootstrap_min_untyped_pages: usize = 256;
 const bootstrap_reserved_free_pages: usize = 2048;
 const untyped_token_base: u64 = 0x1000;
 
-pub fn bootstrapProcess0Untyped(
+pub fn bootstrapUntypedForOwner(
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
+    owner: kernel.PrincipalId,
 ) kernel.KernelError!BootstrapStats {
     var stats: BootstrapStats = .{};
     var index = free_list.range_len;
@@ -76,7 +77,7 @@ pub fn bootstrapProcess0Untyped(
         if ((free_list.len - range.len) < bootstrap_reserved_free_pages) continue;
 
         _ = try state.createUntypedBlock(
-            .Process0,
+            owner,
             range.physical_start,
             @as(u64, range.len) * 4096,
             .{
@@ -91,16 +92,17 @@ pub fn bootstrapProcess0Untyped(
     return stats;
 }
 
-pub fn grantProcess0UntypedTo(
+pub fn grantUntypedFromOwnerTo(
     state: *kernel.KernelState,
+    owner: kernel.PrincipalId,
     target: kernel.PrincipalId,
 ) kernel.KernelError!usize {
     var granted: usize = 0;
-    const process0_table = state.getUntypedTableConst(.Process0);
+    const owner_table = state.getUntypedTableConst(owner);
     var i: usize = 0;
-    while (i < process0_table.len) : (i += 1) {
-        const block_id = process0_table.caps[i].block_id;
-        try state.grantUntypedCap(.Process0, target, block_id);
+    while (i < owner_table.len) : (i += 1) {
+        const block_id = owner_table.caps[i].block_id;
+        try state.grantUntypedCap(owner, target, block_id);
         granted += 1;
     }
     return granted;

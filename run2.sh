@@ -29,6 +29,8 @@ rm -f "$QEMU_LOG"
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$OVMF_VARS"
 
 qemu-system-x86_64 \
+  -enable-kvm \
+  -cpu host \
   -machine q35 \
   -m 512M \
   -monitor none \

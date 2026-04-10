@@ -73,6 +73,7 @@ fn drawMousePanel(vfb: [*]volatile u32, buttons: u64) void {
 }
 
 pub export fn _start() noreturn {
+    _ = userLog("MouseButtonDemo: entry\n");
     const cfg: [*]const volatile u64 = @ptrFromInt(process_abi.standard_config_target_va);
     if (cfg[0] != mouse_demo_bootstrap.config_magic or cfg[1] != mouse_demo_bootstrap.config_version) {
         _ = userLog("MouseButtonDemo: config magic mismatch\n");

@@ -9,6 +9,7 @@ const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_wait_event: u64 = 0x17;
+const syscall_share_cap: u64 = 0x2B;
 
 const syscall_ok: u64 = 0;
 const queue_cap_device_input: u64 = 1;
@@ -125,6 +126,16 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_send_cap),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (endpoint_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn shareCap(paddr: u64, endpoint_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_share_cap),
           [arg0] "{rdi}" (paddr),
           [arg1] "{rsi}" (endpoint_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
@@ -528,7 +539,7 @@ pub export fn _start() noreturn {
     }
     const shared: [*]volatile u64 = @ptrFromInt(shared_page_va);
     initializeSharedPage(shared);
-    if (sendCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok) {
+    if (shareCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok) {
         _ = userLog("KeyboardDriver: send shared cap failed\n");
         while (true) asm volatile ("pause");
     }

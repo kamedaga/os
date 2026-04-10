@@ -1,5 +1,6 @@
 const std = @import("std");
 const pci = @import("pci.zig");
+const user_copy = @import("user_copy.zig");
 
 const pci_status_cap_list: u16 = 1 << 4;
 const pci_cap_id_vendor: u8 = 0x09;
@@ -9,6 +10,8 @@ const virtio_input_device_modern: u16 = 0x1052;
 const virtio_input_subsystem_id: u16 = 0x0012;
 const virtio_gpu_device_modern: u16 = 0x1050;
 const virtio_gpu_subsystem_id: u16 = 0x0010;
+const virtio_blk_device_modern: u16 = 0x1042;
+const virtio_blk_subsystem_id: u16 = 0x0002;
 
 const virtio_pci_cap_common_cfg: u8 = 1;
 const virtio_pci_cap_notify_cfg: u8 = 2;
@@ -51,6 +54,18 @@ pub const InputModernInfo = struct {
 pub const MouseModernInfo = InputModernInfo;
 pub const KeyboardModernInfo = InputModernInfo;
 pub const GpuModernInfo = InputModernInfo;
+pub const BlkModernInfo = struct {
+    location: pci.Location,
+    device_id: u16,
+    subsystem_id: u16,
+    common_cfg: u64,
+    notify_cfg: u64,
+    isr_cfg: u64,
+    device_cfg: u64,
+    notify_off_multiplier: u32,
+    capacity_sectors: u64,
+    logical_block_size: u32,
+};
 
 fn emit(write_log: *const fn ([]const u8) void, text: []const u8) void {
     write_log(text);
@@ -94,14 +109,24 @@ fn looksLikeVirtioGpu(device_id: u16, subsystem_id: u16) bool {
     return device_id == virtio_gpu_device_modern or subsystem_id == virtio_gpu_subsystem_id;
 }
 
+fn looksLikeVirtioBlk(device_id: u16, subsystem_id: u16) bool {
+    return device_id == virtio_blk_device_modern or subsystem_id == virtio_blk_subsystem_id;
+}
+
 fn mmioReadU8(addr: u64) u8 {
-    const p: *volatile u8 = @ptrFromInt(addr);
-    return p.*;
+    return user_copy.readPhysU8(addr) orelse 0;
+}
+
+fn mmioReadU32(addr: u64) u32 {
+    return user_copy.readPhysU32(addr) orelse 0;
+}
+
+fn mmioReadU64(addr: u64) u64 {
+    return user_copy.readPhysU64(addr) orelse 0;
 }
 
 fn mmioWriteU8(addr: u64, value: u8) void {
-    const p: *volatile u8 = @ptrFromInt(addr);
-    p.* = value;
+    _ = user_copy.writePhysU8(addr, value);
 }
 
 fn readInputBitmapBit(device_cfg: u64, ev_type: u8, code: u16) bool {
@@ -322,6 +347,63 @@ pub fn probeGpuModern(write_log: *const fn ([]const u8) void) ?GpuModernInfo {
                 if (!looksLikeVirtioGpu(device_id, subsystem_id)) continue;
 
                 return collectModernCaps(write_log, loc, device_id, subsystem_id);
+            }
+        }
+    }
+
+    return null;
+}
+
+pub fn probeBlkModern(write_log: *const fn ([]const u8) void) ?BlkModernInfo {
+    var bus: u16 = 0;
+    while (bus < 256) : (bus += 1) {
+        var device: u16 = 0;
+        while (device < 32) : (device += 1) {
+            const func0 = pci.Location{
+                .bus = @intCast(bus),
+                .device = @intCast(device),
+                .function = 0,
+            };
+            if (pci.readVendorId(func0) == 0xFFFF) continue;
+            const header0 = pci.readHeaderType(func0);
+            const function_count: u8 = if ((header0 & 0x80) != 0) 8 else 1;
+
+            var function: u8 = 0;
+            while (function < function_count) : (function += 1) {
+                const loc = pci.Location{
+                    .bus = @intCast(bus),
+                    .device = @intCast(device),
+                    .function = function,
+                };
+                const vendor_id = pci.readVendorId(loc);
+                if (vendor_id == 0xFFFF or vendor_id != virtio_vendor_id) continue;
+
+                const device_id = pci.readDeviceId(loc);
+                const subsystem_id = pci.readSubsystemId(loc);
+                if (!looksLikeVirtioBlk(device_id, subsystem_id)) continue;
+
+                const info = collectModernCaps(write_log, loc, device_id, subsystem_id) orelse continue;
+                if (info.device_cfg == 0) {
+                    emit(write_log, "virtio-probe: blk skip candidate (device cfg missing)\n");
+                    continue;
+                }
+                const capacity_sectors = mmioReadU64(info.device_cfg + 0x00);
+                const logical_block_size = blk: {
+                    const blk_size = mmioReadU32(info.device_cfg + 0x14);
+                    break :blk if (blk_size != 0) blk_size else @as(u32, 512);
+                };
+                return .{
+                    .location = info.location,
+                    .device_id = info.device_id,
+                    .subsystem_id = info.subsystem_id,
+                    .common_cfg = info.common_cfg,
+                    .notify_cfg = info.notify_cfg,
+                    .isr_cfg = info.isr_cfg,
+                    .device_cfg = info.device_cfg,
+                    .notify_off_multiplier = info.notify_off_multiplier,
+                    .capacity_sectors = capacity_sectors,
+                    .logical_block_size = logical_block_size,
+                };
             }
         }
     }

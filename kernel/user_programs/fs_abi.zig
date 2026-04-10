@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const syscall_install_cap: u64 = 0x18;
 pub const syscall_grant_cap: u64 = 0x19;
 pub const syscall_move_cap: u64 = 0x1A;
@@ -13,6 +15,7 @@ pub const ObjectKind = enum(u8) {
     vnode_file = 3,
     open_file = 4,
     exec = 5,
+    block_device = 6,
 };
 
 pub const Rights = packed struct(u32) {
@@ -33,6 +36,16 @@ pub const Rights = packed struct(u32) {
 
 pub fn rightsToBits(rights: Rights) u64 {
     return @as(u64, @as(u32, @bitCast(rights)));
+}
+
+pub fn rightsFromBits(bits: u64) Rights {
+    return @bitCast(@as(u32, @truncate(bits)));
+}
+
+pub fn encodeCapToken(cap_id: u64) u64 {
+    std.debug.assert(cap_id != 0);
+    std.debug.assert((cap_id & cap_token_tag) == 0);
+    return cap_token_tag | cap_id;
 }
 
 pub fn decodeCapToken(token: u64) ?u64 {

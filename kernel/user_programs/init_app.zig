@@ -1,5 +1,7 @@
 const std = @import("std");
 const bootfs_format = @import("bootfs_format.zig");
+const cap_transfer_abi = @import("cap_transfer_abi.zig");
+const mouse_shared_abi = @import("mouse_shared_abi.zig");
 const process_abi = @import("process_abi.zig");
 const boot_manifest_abi = @import("boot_manifest_abi.zig");
 const fs_abi = @import("fs_abi.zig");
@@ -8,6 +10,9 @@ const startup_plan_abi = @import("startup_plan_abi.zig");
 const queue_abi = @import("queue_abi.zig");
 const init_bootstrap_abi = @import("init_bootstrap_abi.zig");
 const input_bootstrap = @import("input_driver_bootstrap_abi.zig");
+const block_bootstrap = @import("block_bootstrap_abi.zig");
+const block_demo_bootstrap = @import("block_demo_bootstrap_abi.zig");
+const persistent_fs_bootstrap = @import("persistent_fs_bootstrap_abi.zig");
 const terminal_bootstrap = @import("terminal_bootstrap_abi.zig");
 const mouse_demo_bootstrap = @import("mouse_demo_bootstrap_abi.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
@@ -17,18 +22,23 @@ const vfs_client = @import("vfs_client.zig");
 const syscall_log: u64 = 0x9;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_send_cap: u64 = 0x6;
+const syscall_share_cap: u64 = 0x2B;
+const syscall_switch_thread: u64 = 0x5;
 const syscall_install_endpoint: u64 = 0x26;
+const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_fs_send_cap: u64 = 0x1B;
 const init_process_slot: u64 = 9;
 const vfs_request_va: u64 = 0x3C10_4000;
 const vfs_response_va: u64 = 0x3C10_5000;
 const dynamic_bootstrap_source_base_va: u64 = 0x3C10_6000;
 const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
+const mouse_shared_magic: u64 = mouse_shared_abi.magic;
 const startup_manifest_path = "/boot/startup_manifest.txt";
 const startup_manifest_max_bytes: usize = 1024;
 const vfs_boot_config_magic: u64 = 0x5646_5343; // "VFSC"
 const vfs_boot_config_version: u64 = 2;
 const vfs_boot_config_flag_bootfs_present: u64 = 1 << 0;
+const input_shared_page_paddr_index: usize = 10;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -61,6 +71,24 @@ fn userLogHex(label: []const u8, value: u64) void {
     buf[len] = '\n';
     len += 1;
     _ = userLog(buf[0..len]);
+}
+
+fn switchThread(thread_index: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_switch_thread),
+          [arg0] "{rdi}" (thread_index),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn signalEndpoint(endpoint_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_signal_endpoint),
+          [arg0] "{rdi}" (endpoint_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn spawnExec(exec_token: u64, bootstrap_source_va: u64, bootstrap_target_va: u64, bootstrap_flags: u64) u64 {
@@ -142,6 +170,18 @@ fn findInputDeviceDescriptor(kind: init_bootstrap_abi.InputDeviceKind) ?init_boo
     return null;
 }
 
+fn findBlockDeviceDescriptor(kind: init_bootstrap_abi.BlockDeviceKind) ?init_bootstrap_abi.BlockDeviceDescriptor {
+    const page = descriptorPage() orelse return null;
+    var i: usize = 0;
+    while (i < page.block_device_count and i < init_bootstrap_abi.max_block_device_descriptors) : (i += 1) {
+        const descriptor = page.block_devices[i];
+        if (descriptor.kind != @intFromEnum(kind)) continue;
+        if ((descriptor.flags & init_bootstrap_abi.block_device_flag_present) == 0) continue;
+        return descriptor;
+    }
+    return null;
+}
+
 fn findBootImageDescriptor(kind: boot_manifest_abi.ImageKind) ?boot_manifest_abi.BootImageDescriptor {
     const page = descriptorPage() orelse return null;
     var i: usize = 0;
@@ -180,6 +220,16 @@ fn requireInputDeviceDescriptor(
     failure_message: []const u8,
 ) init_bootstrap_abi.InputDeviceDescriptor {
     return findInputDeviceDescriptor(kind) orelse {
+        _ = userLog(failure_message);
+        while (true) asm volatile ("pause");
+    };
+}
+
+fn requireBlockDeviceDescriptor(
+    kind: init_bootstrap_abi.BlockDeviceKind,
+    failure_message: []const u8,
+) init_bootstrap_abi.BlockDeviceDescriptor {
+    return findBlockDeviceDescriptor(kind) orelse {
         _ = userLog(failure_message);
         while (true) asm volatile ("pause");
     };
@@ -279,6 +329,16 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn shareCap(paddr: u64, endpoint_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_share_cap),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (endpoint_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn sendFsCap(token: u64, endpoint_id: u64) u64 {
     return asm volatile (
         \\int $0x80
@@ -312,10 +372,25 @@ fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
 }
 
 fn recvCap() u64 {
+    const transfer = recvCapTransfer();
+    if (transfer < cap_transfer_abi.transfer_id_min) return transfer;
+    return acceptCapTransfer(transfer);
+}
+
+fn recvCapTransfer() u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (@as(u64, 0xA)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn acceptCapTransfer(transfer_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (cap_transfer_abi.syscall_accept_cap_transfer),
+          [arg0] "{rdi}" (transfer_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -446,8 +521,9 @@ fn sendFsCapRetry(token: u64, endpoint_id: u64) bool {
 
 fn waitRecvCap() u64 {
     while (true) {
-        _ = waitEvent(true, 0);
-        const cap = recvCap();
+        const received = waitEvent(true, 0);
+        if (received >= cap_transfer_abi.transfer_id_min) return acceptCapTransfer(received);
+        const cap = if (received != 0) received else recvCap();
         if (cap >= 0x1000) return cap;
         pauseLoop(1024);
     }
@@ -462,17 +538,92 @@ fn grantInputDriverResources(descriptor: init_bootstrap_abi.InputDeviceDescripto
     const device_paddr = descriptor.device_page_paddr;
     const submit_source_token = descriptor.init_queue_submit_token;
     const notify_source_token = descriptor.init_queue_notify_token;
+    var grant_paddrs: [4]u64 = [_]u64{0} ** 4;
+    var grant_rights: [4]u64 = [_]u64{0} ** 4;
+    var grant_count: usize = 0;
     if (common_paddr == 0 or notify_paddr == 0 or submit_source_token == 0 or notify_source_token == 0) return false;
-    if (grantCap(child_process_slot, common_paddr, page_right_cpu_read | page_right_cpu_write) != 0) return false;
-    if (grantCap(child_process_slot, notify_paddr, page_right_cpu_read | page_right_cpu_write) != 0) return false;
-    if (isr_paddr != 0 and grantCap(child_process_slot, isr_paddr, page_right_cpu_read) != 0) return false;
-    if (device_paddr != 0 and grantCap(child_process_slot, device_paddr, page_right_cpu_read) != 0) return false;
+
+    const collectGrant = struct {
+        fn append(grant_paddrs_buf: *[4]u64, grant_rights_buf: *[4]u64, count: *usize, paddr: u64, rights_bits: u64) bool {
+            if (paddr == 0) return true;
+            var i: usize = 0;
+            while (i < count.*) : (i += 1) {
+                if (grant_paddrs_buf[i] != paddr) continue;
+                grant_rights_buf[i] |= rights_bits;
+                return true;
+            }
+            if (count.* >= grant_paddrs_buf.len) return false;
+            grant_paddrs_buf[count.*] = paddr;
+            grant_rights_buf[count.*] = rights_bits;
+            count.* += 1;
+            return true;
+        }
+    };
+
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, common_paddr, page_right_cpu_read | page_right_cpu_write)) return false;
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, notify_paddr, page_right_cpu_read | page_right_cpu_write)) return false;
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, isr_paddr, page_right_cpu_read)) return false;
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, device_paddr, page_right_cpu_read)) return false;
+
+    var grant_idx: usize = 0;
+    while (grant_idx < grant_count) : (grant_idx += 1) {
+        if (grantCap(child_process_slot, grant_paddrs[grant_idx], grant_rights[grant_idx]) != 0) return false;
+    }
 
     const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(submit_source_token), child_process_slot);
     const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(notify_source_token), child_process_slot);
     const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse return false;
     const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse return false;
     input_bootstrap.writeGrantedQueueTokens(descriptor.config_source_va, submit_child, notify_child);
+    return true;
+}
+
+fn grantBlockDriverResources(descriptor: init_bootstrap_abi.BlockDeviceDescriptor, child_process_slot: u64) bool {
+    const page_right_cpu_read: u64 = 0x1;
+    const page_right_cpu_write: u64 = 0x2;
+    const common_paddr = descriptor.common_page_paddr;
+    const notify_paddr = descriptor.notify_page_paddr;
+    const isr_paddr = descriptor.isr_page_paddr;
+    const device_paddr = descriptor.device_page_paddr;
+    const submit_source_token = descriptor.init_queue_submit_token;
+    const notify_source_token = descriptor.init_queue_notify_token;
+    var grant_paddrs: [4]u64 = [_]u64{0} ** 4;
+    var grant_rights: [4]u64 = [_]u64{0} ** 4;
+    var grant_count: usize = 0;
+    if (common_paddr == 0 or notify_paddr == 0 or submit_source_token == 0 or notify_source_token == 0) return false;
+
+    const collectGrant = struct {
+        fn append(grant_paddrs_buf: *[4]u64, grant_rights_buf: *[4]u64, count: *usize, paddr: u64, rights_bits: u64) bool {
+            if (paddr == 0) return true;
+            var i: usize = 0;
+            while (i < count.*) : (i += 1) {
+                if (grant_paddrs_buf[i] != paddr) continue;
+                grant_rights_buf[i] |= rights_bits;
+                return true;
+            }
+            if (count.* >= grant_paddrs_buf.len) return false;
+            grant_paddrs_buf[count.*] = paddr;
+            grant_rights_buf[count.*] = rights_bits;
+            count.* += 1;
+            return true;
+        }
+    };
+
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, common_paddr, page_right_cpu_read | page_right_cpu_write)) return false;
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, notify_paddr, page_right_cpu_read | page_right_cpu_write)) return false;
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, isr_paddr, page_right_cpu_read)) return false;
+    if (!collectGrant.append(&grant_paddrs, &grant_rights, &grant_count, device_paddr, page_right_cpu_read)) return false;
+
+    var grant_idx: usize = 0;
+    while (grant_idx < grant_count) : (grant_idx += 1) {
+        if (grantCap(child_process_slot, grant_paddrs[grant_idx], grant_rights[grant_idx]) != 0) return false;
+    }
+
+    const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(submit_source_token), child_process_slot);
+    const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(notify_source_token), child_process_slot);
+    const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse return false;
+    const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse return false;
+    block_bootstrap.writeGrantedQueueTokens(descriptor.config_source_va, submit_child, notify_child);
     return true;
 }
 
@@ -496,6 +647,11 @@ const StartupManifest = struct {
     fn slice(self: *const StartupManifest) []const u8 {
         return self.bytes[0..self.len];
     }
+};
+
+const StartupManifestLine = struct {
+    role: startup_plan_abi.StartupProgramRole,
+    path: []const u8,
 };
 
 const BootFsArchiveView = struct {
@@ -564,6 +720,10 @@ var startup_manifest_storage = StartupManifest{
 };
 var vfs_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
 var vfs_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
+var block_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
+var block_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
+var persistent_fs_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
+var persistent_fs_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 var bootfs_vm_token_cache: u64 = 0;
 
 fn loadStartupManifestFromBootFs(bootfs: *const BootFsArchiveView) ?*const StartupManifest {
@@ -574,6 +734,34 @@ fn loadStartupManifestFromBootFs(bootfs: *const BootFsArchiveView) ?*const Start
     @memcpy(startup_manifest_storage.bytes[0..copy_len], bytes[0..copy_len]);
     startup_manifest_storage.len = copy_len;
     return &startup_manifest_storage;
+}
+
+fn parseStartupManifestLine(raw_line: []const u8) ?StartupManifestLine {
+    const line = std.mem.trim(u8, raw_line, " \t\r");
+    if (line.len == 0 or line[0] == '#') return null;
+
+    var split_at: usize = 0;
+    while (split_at < line.len and line[split_at] != ' ' and line[split_at] != '\t') : (split_at += 1) {}
+    if (split_at == 0 or split_at >= line.len) {
+        _ = userLog("Init: malformed startup manifest line\n");
+        while (true) asm volatile ("pause");
+    }
+
+    const key = line[0..split_at];
+    const path = std.mem.trimLeft(u8, line[split_at..], " \t");
+    if (path.len == 0) {
+        _ = userLog("Init: empty startup manifest path\n");
+        while (true) asm volatile ("pause");
+    }
+
+    const role = startup_plan_abi.roleFromKey(key) orelse {
+        _ = userLog("Init: unknown startup manifest role\n");
+        while (true) asm volatile ("pause");
+    };
+    return .{
+        .role = role,
+        .path = path,
+    };
 }
 
 var next_dynamic_service_endpoint_id: u64 = service_registry_abi.init_window_service_endpoint_id + 1;
@@ -595,6 +783,10 @@ fn allocChildServiceRegistryPage(
     window_service: service_registry_abi.ServiceEntry,
     vfs_process_slot: ?u64,
     vfs_endpoint_id: ?u64,
+    block_process_slot: ?u64,
+    block_endpoint_id: ?u64,
+    persistent_fs_process_slot: ?u64,
+    persistent_fs_endpoint_id: ?u64,
 ) ?u64 {
     const source_va = allocDynamicBootstrapSourceVa();
     var registry_paddr: u64 = 0;
@@ -608,12 +800,25 @@ fn allocChildServiceRegistryPage(
             service_registry_abi.addService(source_va, .vfs, slot, endpoint_id);
         }
     }
+    if (block_process_slot) |slot| {
+        if (block_endpoint_id) |endpoint_id| {
+            service_registry_abi.addService(source_va, .block, slot, endpoint_id);
+        }
+    }
+    if (persistent_fs_process_slot) |slot| {
+        if (persistent_fs_endpoint_id) |endpoint_id| {
+            service_registry_abi.addService(source_va, .persistent_fs, slot, endpoint_id);
+        }
+    }
     return source_va;
 }
 
 const StartupAction = enum {
     bootstrap_vfs,
     input_driver,
+    block_driver,
+    persistent_fs_server,
+    block_client,
     window_client,
     deferred_compositor,
 };
@@ -640,6 +845,7 @@ const StartupRoleSpec = struct {
     action: StartupAction,
     needs_boot_display: bool = false,
     input_kind: ?init_bootstrap_abi.InputDeviceKind = null,
+    block_kind: ?init_bootstrap_abi.BlockDeviceKind = null,
     window_flags: u64 = 0,
     window_config_kind: ?WindowBootstrapConfigKind = null,
     compositor_variant: ?CompositorVariant = null,
@@ -663,6 +869,22 @@ const startup_role_specs = [_]StartupRoleSpec{
         .action = .input_driver,
         .needs_boot_display = true,
         .input_kind = .pointer,
+    },
+    .{
+        .role = .block_driver,
+        .label = "block driver",
+        .action = .block_driver,
+        .block_kind = .virtio_blk,
+    },
+    .{
+        .role = .persistent_fs,
+        .label = "persistent fs",
+        .action = .persistent_fs_server,
+    },
+    .{
+        .role = .block_demo,
+        .label = "block demo",
+        .action = .block_client,
     },
     .{
         .role = .terminal_window,
@@ -711,6 +933,15 @@ fn findStartupRoleSpec(role: startup_plan_abi.StartupProgramRole) ?StartupRoleSp
     return null;
 }
 
+const PendingWindowClient = struct {
+    line: StartupManifestLine,
+    launched: bool = false,
+};
+
+const PendingLateRole = struct {
+    line: StartupManifestLine,
+};
+
 const LaunchContext = struct {
     client: ?vfs_client.Client,
     has_boot_display: bool,
@@ -722,14 +953,22 @@ const LaunchContext = struct {
     keyboard_shared_page: init_bootstrap_abi.SpawnPageDescriptor,
     pointer_input: init_bootstrap_abi.InputDeviceDescriptor,
     pointer_shared_page: init_bootstrap_abi.SpawnPageDescriptor,
+    block_device: init_bootstrap_abi.BlockDeviceDescriptor,
     primary_panel_config_page: init_bootstrap_abi.SpawnPageDescriptor,
     primary_panel_state_page: init_bootstrap_abi.SpawnPageDescriptor,
     primary_panel_command_page: init_bootstrap_abi.SpawnPageDescriptor,
     window_service_page: init_bootstrap_abi.SpawnPageDescriptor,
     vfs_process_slot: ?u64 = null,
     vfs_endpoint_id: ?u64 = null,
-    compositor_path: ?[]const u8 = null,
-    gpu_compositor_path: ?[]const u8 = null,
+    block_process_slot: ?u64 = null,
+    block_endpoint_id: ?u64 = null,
+    persistent_fs_process_slot: ?u64 = null,
+    persistent_fs_endpoint_id: ?u64 = null,
+    keyboard_spawned: bool = false,
+    keyboard_shared_ready: bool = false,
+    pointer_spawned: bool = false,
+    pointer_shared_ready: bool = false,
+    first_window_spawn_logged: bool = false,
 
     fn logRoleLine(_: *LaunchContext, action: []const u8, label: []const u8, result: []const u8) void {
         var buf: [96]u8 = undefined;
@@ -743,11 +982,67 @@ const LaunchContext = struct {
         userLogHex(prefix, value);
     }
 
-    fn requireLookup(self: *LaunchContext, path: []const u8, failed_message: []const u8, ok_message: []const u8) vfs_client.LookupResult {
-        const client = if (self.client) |*client| client else {
-            _ = userLog("Init: VFS client unavailable\n");
+    fn logClientError(_: *LaunchContext, prefix: []const u8, err: anyerror) void {
+        var buf: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "{s}{s}\n", .{ prefix, @errorName(err) }) catch return;
+        _ = userLog(message);
+    }
+
+    fn ensureVfsClient(self: *LaunchContext) *vfs_client.Client {
+        if (self.client) |*client| return client;
+        const child_slot = self.vfs_process_slot orelse {
+            _ = userLog("Init: VFS process slot unavailable\n");
             while (true) asm volatile ("pause");
         };
+        const endpoint_id = self.vfs_endpoint_id orelse {
+            _ = userLog("Init: VFS endpoint unavailable\n");
+            while (true) asm volatile ("pause");
+        };
+        const client = vfs_client.Client.connect(.{
+            .request_va = vfs_request_va,
+            .response_va = vfs_response_va,
+            .client_process_slot = init_process_slot,
+            .endpoint_id = endpoint_id,
+            .server_process_slot = child_slot,
+            .response_poll_limit = 8192,
+        }) catch {
+            _ = userLog("Init: VFS connect failed\n");
+            while (true) asm volatile ("pause");
+        };
+        self.client = client;
+        _ = userLog("Init: VFS connect done\n");
+        return &(self.client.?);
+    }
+
+    fn requireExecFromBootFs(self: *LaunchContext, path: []const u8, label: []const u8) vfs_client.OpenResult {
+        const image = self.bootfs.findRegularFile(path) orelse {
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Init: bootfs exec {s} missing\n", .{label}) catch "Init: bootfs exec missing\n";
+            _ = userLog(msg);
+            while (true) asm volatile ("pause");
+        };
+        const vm_token = installVmObject(@intFromPtr(image.ptr), image.len, .{ .read = true });
+        if (image_abi.decodeVmObjectToken(vm_token) == null) {
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Init: bootfs vm install {s} failed\n", .{label}) catch "Init: bootfs vm install failed\n";
+            _ = userLog(msg);
+            while (true) asm volatile ("pause");
+        }
+        const exec_token = installExecImage(vm_token, .{ .exec = true });
+        if (image_abi.decodeExecImageToken(exec_token) == null) {
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Init: bootfs exec install {s} failed\n", .{label}) catch "Init: bootfs exec install failed\n";
+            _ = userLog(msg);
+            while (true) asm volatile ("pause");
+        }
+        return .{
+            .token = exec_token,
+            .file_bytes = image.len,
+        };
+    }
+
+    fn requireLookup(self: *LaunchContext, path: []const u8, failed_message: []const u8, ok_message: []const u8) vfs_client.LookupResult {
+        const client = self.ensureVfsClient();
         const file = lookupFileWithRetry(client, path) orelse {
             _ = userLog(failed_message);
             while (true) asm volatile ("pause");
@@ -757,12 +1052,10 @@ const LaunchContext = struct {
     }
 
     fn requireOpenExec(self: *LaunchContext, token: u64, failed_message: []const u8, ok_message: []const u8) vfs_client.OpenResult {
-        const client = if (self.client) |*client| client else {
-            _ = userLog("Init: VFS client unavailable\n");
-            while (true) asm volatile ("pause");
-        };
-        const exec = client.openExec(token) catch {
+        const client = self.ensureVfsClient();
+        const exec = client.openExec(token) catch |err| {
             _ = userLog(failed_message);
+            self.logClientError("Init: open_exec err=", err);
             while (true) asm volatile ("pause");
         };
         _ = userLog(ok_message);
@@ -780,6 +1073,11 @@ const LaunchContext = struct {
             .keyboard => self.keyboard_input,
             .pointer => self.pointer_input,
         };
+    }
+
+    fn blockDescriptorForKind(self: *LaunchContext, kind: init_bootstrap_abi.BlockDeviceKind) init_bootstrap_abi.BlockDeviceDescriptor {
+        _ = kind;
+        return self.block_device;
     }
 
     fn inputSharedPageForKind(self: *LaunchContext, kind: init_bootstrap_abi.InputDeviceKind) init_bootstrap_abi.SpawnPageDescriptor {
@@ -835,11 +1133,75 @@ const LaunchContext = struct {
 
     fn validateInputSharedPage(self: *LaunchContext, kind: init_bootstrap_abi.InputDeviceKind, shared_desc: init_bootstrap_abi.SpawnPageDescriptor) void {
         _ = self;
-        if (kind != .keyboard) return;
-        const keyboard_shared: [*]const volatile u64 = @ptrFromInt(shared_desc.source_va);
-        if (keyboard_shared[0] != keyboard_shared_magic) {
-            _ = userLog("Init: keyboard shared magic mismatch\n");
+        const words: [*]const volatile u64 = @ptrFromInt(shared_desc.source_va);
+        switch (kind) {
+            .keyboard => if (words[0] != keyboard_shared_magic) {
+                _ = userLog("Init: keyboard shared magic mismatch\n");
+                while (true) asm volatile ("pause");
+            },
+            .pointer => if (words[0] != mouse_shared_magic) {
+                _ = userLog("Init: mouse shared magic mismatch\n");
+                while (true) asm volatile ("pause");
+            },
+        }
+    }
+
+    fn inputSharedPaddrFromConfig(self: *LaunchContext, kind: init_bootstrap_abi.InputDeviceKind) u64 {
+        const descriptor = self.inputDescriptorForKind(kind);
+        const words: [*]const volatile u64 = @ptrFromInt(descriptor.config_source_va);
+        return words[input_shared_page_paddr_index];
+    }
+
+    fn finishInputSharedPage(self: *LaunchContext, kind: init_bootstrap_abi.InputDeviceKind, shared_paddr: u64) void {
+        const shared_desc = self.inputSharedPageForKind(kind);
+        if (mapPage(shared_desc.source_va, shared_paddr, false) != 0) {
+            _ = userLog("Init: input shared page map failed\n");
             while (true) asm volatile ("pause");
+        }
+        self.validateInputSharedPage(kind, shared_desc);
+        switch (kind) {
+            .keyboard => {
+                self.keyboard_shared_ready = true;
+                _ = userLog("Init: keyboard shared ready\n");
+            },
+            .pointer => {
+                self.pointer_shared_ready = true;
+                _ = userLog("Init: mouse shared ready\n");
+                if (installEndpoint(self.window_service.endpoint_id, self.window_service.process_slot) != 0) {
+                    _ = userLog("Init: install boot display endpoint failed\n");
+                    while (true) asm volatile ("pause");
+                }
+                if (shareCap(shared_paddr, self.window_service.endpoint_id) != 0) {
+                    _ = userLog("Init: send mouse shared page to boot display failed\n");
+                    while (true) asm volatile ("pause");
+                }
+                _ = userLog("Init: send mouse shared page to boot display ok\n");
+            },
+        }
+    }
+
+    fn tryFinishInputSharedFromPaddr(self: *LaunchContext, shared_paddr: u64) bool {
+        if (self.keyboard_spawned and !self.keyboard_shared_ready and self.inputSharedPaddrFromConfig(.keyboard) == shared_paddr) {
+            self.finishInputSharedPage(.keyboard, shared_paddr);
+            return true;
+        }
+        if (self.pointer_spawned and !self.pointer_shared_ready and self.inputSharedPaddrFromConfig(.pointer) == shared_paddr) {
+            self.finishInputSharedPage(.pointer, shared_paddr);
+            return true;
+        }
+        return false;
+    }
+
+    fn finishPendingInputSharedCaps(self: *LaunchContext) void {
+        while ((self.keyboard_spawned and !self.keyboard_shared_ready) or
+            (self.pointer_spawned and !self.pointer_shared_ready))
+        {
+            const shared_paddr = waitRecvCap();
+            if (shared_paddr < cap_transfer_abi.transfer_id_min) continue;
+            if (!self.tryFinishInputSharedFromPaddr(shared_paddr)) {
+                _ = userLog("Init: unexpected input shared page\n");
+                while (true) asm volatile ("pause");
+            }
         }
     }
 
@@ -869,7 +1231,15 @@ const LaunchContext = struct {
         var registry_source_va: u64 = 0;
         if ((spec.window_flags & window_bootstrap_flag_taskbar_panel) != 0) {
             if ((spec.window_flags & window_bootstrap_flag_service_registry) != 0 and registry_source_va == 0) {
-                registry_source_va = allocChildServiceRegistryPage(self.window_service, self.vfs_process_slot, self.vfs_endpoint_id) orelse {
+                registry_source_va = allocChildServiceRegistryPage(
+                    self.window_service,
+                    self.vfs_process_slot,
+                    self.vfs_endpoint_id,
+                    self.block_process_slot,
+                    self.block_endpoint_id,
+                    self.persistent_fs_process_slot,
+                    self.persistent_fs_endpoint_id,
+                ) orelse {
                     self.logRoleLine("alloc", spec.label, "window service registry failed");
                     while (true) asm volatile ("pause");
                 };
@@ -898,7 +1268,15 @@ const LaunchContext = struct {
         }
         if ((spec.window_flags & window_bootstrap_flag_service_registry) != 0) {
             if (registry_source_va == 0) {
-                registry_source_va = allocChildServiceRegistryPage(self.window_service, self.vfs_process_slot, self.vfs_endpoint_id) orelse {
+                registry_source_va = allocChildServiceRegistryPage(
+                    self.window_service,
+                    self.vfs_process_slot,
+                    self.vfs_endpoint_id,
+                    self.block_process_slot,
+                    self.block_endpoint_id,
+                    self.persistent_fs_process_slot,
+                    self.persistent_fs_endpoint_id,
+                ) orelse {
                     self.logRoleLine("alloc", spec.label, "window service registry failed");
                     while (true) asm volatile ("pause");
                 };
@@ -1019,34 +1397,21 @@ const LaunchContext = struct {
             while (true) asm volatile ("pause");
         };
         self.logRoleLine("spawn", spec.label, "ok");
+        _ = userLog("Init: VFS spawn done\n");
         self.vfs_process_slot = child_slot;
         self.vfs_endpoint_id = vfs_endpoint_id;
         if (installEndpoint(vfs_endpoint_id, child_slot) != 0) {
             _ = userLog("Init: install VFS endpoint failed\n");
             while (true) asm volatile ("pause");
         }
-        const client = vfs_client.Client.connect(.{
-            .request_va = vfs_request_va,
-            .response_va = vfs_response_va,
-            .client_process_slot = init_process_slot,
-            .endpoint_id = vfs_endpoint_id,
-            .server_process_slot = child_slot,
-        }) catch {
-            _ = userLog("Init: VFS connect failed\n");
-            while (true) asm volatile ("pause");
-        };
-        self.client = client;
-        _ = userLog("Init: VFS connect ok\n");
     }
 
     fn launchInputDriverForSpec(self: *LaunchContext, spec: StartupRoleSpec, path: []const u8) void {
         if (spec.needs_boot_display) self.requireBootDisplay();
         const input_kind = spec.input_kind orelse unreachable;
-        const file = self.requireLookup(path, "Init: lookup input driver failed\n", "Init: lookup input driver ok\n");
-        const exec = self.requireOpenExec(file.token, "Init: open_exec input driver failed\n", "Init: open_exec input driver ok\n");
+        const exec = self.requireExecFromBootFs(path, spec.label);
 
         const input_desc = self.inputDescriptorForKind(input_kind);
-        const shared_desc = self.inputSharedPageForKind(input_kind);
         self.writeInputConfigForKind(input_kind, input_desc);
 
         const spawned = spawnExec(exec.token, input_desc.config_source_va, input_desc.config_target_va, input_desc.config_spawn_flags);
@@ -1056,36 +1421,196 @@ const LaunchContext = struct {
             while (true) asm volatile ("pause");
         };
         self.logRoleLine("spawn", spec.label, "ok");
+        switch (input_kind) {
+            .keyboard => {
+                self.keyboard_spawned = true;
+                _ = userLog("Init: keyboard spawn done\n");
+            },
+            .pointer => {
+                self.pointer_spawned = true;
+                _ = userLog("Init: mouse spawn done\n");
+            },
+        }
         if (!grantInputDriverResources(input_desc, child_slot)) {
             self.logRoleLine("grant", spec.label, "resources failed");
             while (true) asm volatile ("pause");
         }
         self.logRoleLine("grant", spec.label, "resources ok");
+    }
 
-        const shared_paddr = waitRecvCap();
-        if (mapPage(shared_desc.source_va, shared_paddr, false) != 0) {
-            self.logRoleLine("map", spec.label, "shared page failed");
+    fn launchBlockDriverForSpec(self: *LaunchContext, spec: StartupRoleSpec, path: []const u8) void {
+        const block_kind = spec.block_kind orelse unreachable;
+        const exec = self.requireExecFromBootFs(path, spec.label);
+        const block_desc = self.blockDescriptorForKind(block_kind);
+        if (!fs_abi.isCapToken(block_desc.init_root_token)) {
+            self.logRoleLine("bootstrap", spec.label, "root token missing");
             while (true) asm volatile ("pause");
         }
-        self.validateInputSharedPage(input_kind, shared_desc);
-        self.logRoleLine("recv", spec.label, "shared page ok");
-        if (input_kind != .pointer) return;
 
-        if (installEndpoint(self.window_service.endpoint_id, self.window_service.process_slot) != 0) {
-            _ = userLog("Init: install boot display endpoint failed\n");
+        const endpoint_id = allocDynamicServiceEndpointId();
+        block_bootstrap.writeConfigPage(block_desc.config_source_va, .{
+            .endpoint_id = endpoint_id,
+            .common_page_paddr = block_desc.common_page_paddr,
+            .notify_page_paddr = block_desc.notify_page_paddr,
+            .isr_page_paddr = block_desc.isr_page_paddr,
+            .device_page_paddr = block_desc.device_page_paddr,
+            .common_page_offset = block_desc.common_page_offset,
+            .notify_page_offset = block_desc.notify_page_offset,
+            .isr_page_offset = block_desc.isr_page_offset,
+            .device_page_offset = block_desc.device_page_offset,
+            .notify_off_multiplier = block_desc.notify_off_multiplier,
+            .capacity_sectors = block_desc.capacity_sectors,
+            .logical_block_size = block_desc.logical_block_size,
+        });
+
+        block_bootstrap_pages_storage[0] = .{
+            .source_va = block_desc.config_source_va,
+            .target_va = block_desc.config_target_va,
+            .flags = block_desc.config_spawn_flags,
+        };
+        block_bootstrap_table_storage = .{};
+        block_bootstrap_table_storage.page_count = 1;
+        block_bootstrap_table_storage.cap_count = 1;
+        block_bootstrap_table_storage.page_descriptors[0] = block_bootstrap_pages_storage[0];
+        block_bootstrap_table_storage.cap_descriptors[0] = .{
+            .source_token = block_desc.init_root_token,
+            .target_token_va = block_desc.config_target_va + block_bootstrap.root_token_index * 8,
+            .rights_bits = fs_abi.rightsToBits(.{
+                .read = true,
+                .write = true,
+                .grant = true,
+                .admin = true,
+            }),
+            .kind = .fs,
+        };
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &block_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", spec.label, "failed");
+            self.logRoleHex(spec.label, " spawn ret=", spawned);
+            while (true) asm volatile ("pause");
+        };
+        self.logRoleLine("spawn", spec.label, "ok");
+        if (installEndpoint(endpoint_id, child_slot) != 0) {
+            self.logRoleLine("endpoint", spec.label, "install failed");
             while (true) asm volatile ("pause");
         }
-        if (sendCap(shared_paddr, self.window_service.endpoint_id) != 0) {
-            _ = userLog("Init: send mouse shared page to boot display failed\n");
+        if (!grantBlockDriverResources(block_desc, child_slot)) {
+            self.logRoleLine("grant", spec.label, "resources failed");
             while (true) asm volatile ("pause");
         }
-        _ = userLog("Init: send mouse shared page to boot display ok\n");
+        self.logRoleLine("grant", spec.label, "resources ok");
+        _ = signalEndpoint(endpoint_id);
+        service_registry_abi.addService(self.window_service_page.source_va, .block, child_slot, endpoint_id);
+        self.block_process_slot = child_slot;
+        self.block_endpoint_id = endpoint_id;
+    }
+
+    fn launchPersistentFsForSpec(self: *LaunchContext, spec: StartupRoleSpec, path: []const u8) void {
+        if (self.block_process_slot == null or self.block_endpoint_id == null) {
+            self.logRoleLine("bootstrap", spec.label, "block service missing");
+            while (true) asm volatile ("pause");
+        }
+        const exec = self.requireExecFromBootFs(path, spec.label);
+        const endpoint_id = allocDynamicServiceEndpointId();
+        const registry_source_va = allocChildServiceRegistryPage(
+            self.window_service,
+            self.vfs_process_slot,
+            self.vfs_endpoint_id,
+            self.block_process_slot,
+            self.block_endpoint_id,
+            null,
+            null,
+        ) orelse {
+            self.logRoleLine("alloc", spec.label, "service registry failed");
+            while (true) asm volatile ("pause");
+        };
+        const config_source_va = self.allocWritableBootstrapPage("Init: alloc persistent fs config page failed\n");
+        persistent_fs_bootstrap.writeConfigPage(config_source_va, endpoint_id);
+        persistent_fs_bootstrap_pages_storage[0] = .{
+            .source_va = config_source_va,
+            .target_va = process_abi.standard_config_target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        persistent_fs_bootstrap_pages_storage[1] = .{
+            .source_va = registry_source_va,
+            .target_va = self.window_service_page.target_va,
+            .flags = self.window_service_page.spawn_flags,
+        };
+        persistent_fs_bootstrap_table_storage = .{};
+        persistent_fs_bootstrap_table_storage.page_count = 2;
+        persistent_fs_bootstrap_table_storage.cap_count = 1;
+        persistent_fs_bootstrap_table_storage.page_descriptors[0] = persistent_fs_bootstrap_pages_storage[0];
+        persistent_fs_bootstrap_table_storage.page_descriptors[1] = persistent_fs_bootstrap_pages_storage[1];
+        persistent_fs_bootstrap_table_storage.cap_descriptors[0] = .{
+            .source_token = self.root_mount_token,
+            .target_token_va = process_abi.standard_config_target_va + persistent_fs_bootstrap.admin_token_index * 8,
+            .rights_bits = fs_abi.rightsToBits(.{
+                .admin = true,
+            }),
+            .kind = .fs,
+        };
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &persistent_fs_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", spec.label, "failed");
+            self.logRoleHex(spec.label, " spawn ret=", spawned);
+            while (true) asm volatile ("pause");
+        };
+        self.logRoleLine("spawn", spec.label, "ok");
+        if (installEndpoint(endpoint_id, child_slot) != 0) {
+            self.logRoleLine("endpoint", spec.label, "install failed");
+            while (true) asm volatile ("pause");
+        }
+        service_registry_abi.addService(self.window_service_page.source_va, .persistent_fs, child_slot, endpoint_id);
+        self.persistent_fs_process_slot = child_slot;
+        self.persistent_fs_endpoint_id = endpoint_id;
+    }
+
+    fn launchBlockDemoForSpec(self: *LaunchContext, spec: StartupRoleSpec, path: []const u8) void {
+        if (self.block_process_slot == null or self.block_endpoint_id == null) {
+            self.logRoleLine("bootstrap", spec.label, "block service missing");
+            while (true) asm volatile ("pause");
+        }
+        const exec = self.requireExecFromBootFs(path, spec.label);
+        const registry_source_va = allocChildServiceRegistryPage(
+            self.window_service,
+            self.vfs_process_slot,
+            self.vfs_endpoint_id,
+            self.block_process_slot,
+            self.block_endpoint_id,
+            self.persistent_fs_process_slot,
+            self.persistent_fs_endpoint_id,
+        ) orelse {
+            self.logRoleLine("alloc", spec.label, "service registry failed");
+            while (true) asm volatile ("pause");
+        };
+        const config_source_va = self.allocWritableBootstrapPage("Init: alloc block demo config page failed\n");
+        block_demo_bootstrap.writeConfigPage(config_source_va, 0);
+
+        var bootstrap_pages: [2]process_abi.BootstrapPageDescriptor = undefined;
+        bootstrap_pages[0] = .{
+            .source_va = config_source_va,
+            .target_va = process_abi.standard_config_target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        bootstrap_pages[1] = .{
+            .source_va = registry_source_va,
+            .target_va = self.window_service_page.target_va,
+            .flags = self.window_service_page.spawn_flags,
+        };
+        const spawned = spawnExecWithBootstrapPages(exec.token, bootstrap_pages[0..]);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", spec.label, "failed");
+            self.logRoleHex(spec.label, " spawn ret=", spawned);
+            while (true) asm volatile ("pause");
+        };
+        block_demo_bootstrap.writeProcessSlot(config_source_va, child_slot);
+        self.logRoleLine("spawn", spec.label, "ok");
     }
 
     fn launchWindowClientForSpec(self: *LaunchContext, spec: StartupRoleSpec, path: []const u8) void {
         if (spec.needs_boot_display) self.requireBootDisplay();
-        const file = self.requireLookup(path, "Init: lookup window client failed\n", "Init: lookup window client ok\n");
-        const exec = self.requireOpenExec(file.token, "Init: open_exec window client failed\n", "Init: open_exec window client ok\n");
+        const exec = self.requireExecFromBootFs(path, spec.label);
 
         var bootstrap_pages: [5]process_abi.BootstrapPageDescriptor = undefined;
         const bootstrap_slice = self.prepareWindowBootstrapForSpec(spec, bootstrap_pages[0..]);
@@ -1095,31 +1620,27 @@ const LaunchContext = struct {
             self.logRoleHex(spec.label, " spawn ret=", spawned);
             while (true) asm volatile ("pause");
         }
+        const child_thread = process_abi.decodeSpawnedThreadSlot(spawned);
+        const is_first_window = !self.first_window_spawn_logged;
         self.logRoleLine("spawn", spec.label, "ok");
-    }
-
-    fn noteCompositorPathForSpec(self: *LaunchContext, spec: StartupRoleSpec, path: []const u8) void {
-        switch (spec.compositor_variant orelse unreachable) {
-            .classic => self.compositor_path = path,
-            .gpu => self.gpu_compositor_path = path,
+        if (is_first_window) {
+            self.first_window_spawn_logged = true;
+            _ = userLog("Init: first window spawn done\n");
+            return;
+        }
+        if (child_thread) |thread_index| {
+            _ = switchThread(thread_index);
         }
     }
 
-    fn armCompositor(self: *LaunchContext) void {
+    fn armCompositor(self: *LaunchContext, classic_path: ?[]const u8, gpu_path: ?[]const u8) void {
+        if (classic_path == null or gpu_path == null) return;
         self.requireBootDisplay();
-        const classic_path = self.compositor_path orelse {
-            _ = userLog("Init: compositor manifest path missing\n");
-            while (true) asm volatile ("pause");
-        };
-        const gpu_path = self.gpu_compositor_path orelse {
-            _ = userLog("Init: gpu compositor manifest path missing\n");
-            while (true) asm volatile ("pause");
-        };
+        const classic = classic_path.?;
+        const gpu = gpu_path.?;
 
-        const compositor_file = self.requireLookup(classic_path, "Init: lookup compositor failed\n", "Init: lookup compositor ok\n");
-        const compositor_exec = self.requireOpenExec(compositor_file.token, "Init: open_exec compositor failed\n", "Init: open_exec compositor ok\n");
-        const gpu_compositor_file = self.requireLookup(gpu_path, "Init: lookup gpu compositor failed\n", "Init: lookup gpu compositor ok\n");
-        const gpu_compositor_exec = self.requireOpenExec(gpu_compositor_file.token, "Init: open_exec gpu compositor failed\n", "Init: open_exec gpu compositor ok\n");
+        const compositor_exec = self.requireExecFromBootFs(classic, "compositor");
+        const gpu_compositor_exec = self.requireExecFromBootFs(gpu, "gpu compositor");
 
         const ret = armDeferredCompositor(compositor_exec.token, gpu_compositor_exec.token, self.window_service.process_slot);
         if (ret != 0) {
@@ -1138,41 +1659,108 @@ const LaunchContext = struct {
         switch (spec.action) {
             .bootstrap_vfs => self.launchVfsForSpec(spec, path),
             .input_driver => self.launchInputDriverForSpec(spec, path),
+            .block_driver => self.launchBlockDriverForSpec(spec, path),
+            .persistent_fs_server => self.launchPersistentFsForSpec(spec, path),
+            .block_client => self.launchBlockDemoForSpec(spec, path),
             .window_client => self.launchWindowClientForSpec(spec, path),
-            .deferred_compositor => self.noteCompositorPathForSpec(spec, path),
+            .deferred_compositor => {},
         }
     }
 };
 
+fn windowClientReadyForLaunch(ctx: *const LaunchContext, spec: StartupRoleSpec) bool {
+    if ((spec.window_flags & window_bootstrap_flag_keyboard_shared) != 0 and !ctx.keyboard_shared_ready) return false;
+    if ((spec.window_flags & window_bootstrap_flag_pointer_shared) != 0 and !ctx.pointer_shared_ready) return false;
+    return true;
+}
+
+fn tryLaunchReadyWindowClients(ctx: *LaunchContext, pending: []PendingWindowClient) usize {
+    var launched_count: usize = 0;
+    for (pending) |*entry| {
+        if (entry.launched) continue;
+        const spec = findStartupRoleSpec(entry.line.role) orelse {
+            _ = userLog("Init: startup role spec missing\n");
+            while (true) asm volatile ("pause");
+        };
+        if (spec.action != .window_client) continue;
+        if (!windowClientReadyForLaunch(ctx, spec)) continue;
+        ctx.launchWindowClientForSpec(spec, entry.line.path);
+        entry.launched = true;
+        launched_count += 1;
+    }
+    return launched_count;
+}
+
+fn allWindowClientsLaunched(pending: []const PendingWindowClient) bool {
+    for (pending) |entry| {
+        if (!entry.launched) return false;
+    }
+    return true;
+}
+
 var launch_ctx_storage: LaunchContext = undefined;
 
 fn runStartupManifest(ctx: *LaunchContext, manifest: *const StartupManifest) void {
+    _ = userLog("Init: startup manifest begin\n");
+    var compositor_path: ?[]const u8 = null;
+    var gpu_compositor_path: ?[]const u8 = null;
+    var pending_window_clients: [startup_plan_abi.max_startup_program_descriptors]PendingWindowClient = undefined;
+    var pending_window_count: usize = 0;
+    var pending_late_roles: [startup_plan_abi.max_startup_program_descriptors]PendingLateRole = undefined;
+    var pending_late_count: usize = 0;
     var lines = std.mem.tokenizeScalar(u8, manifest.slice(), '\n');
     while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-
-        var split_at: usize = 0;
-        while (split_at < line.len and line[split_at] != ' ' and line[split_at] != '\t') : (split_at += 1) {}
-        if (split_at == 0 or split_at >= line.len) {
-            _ = userLog("Init: malformed startup manifest line\n");
-            while (true) asm volatile ("pause");
-        }
-
-        const key = line[0..split_at];
-        const path = std.mem.trimLeft(u8, line[split_at..], " \t");
-        if (path.len == 0) {
-            _ = userLog("Init: empty startup manifest path\n");
-            while (true) asm volatile ("pause");
-        }
-
-        const role = startup_plan_abi.roleFromKey(key) orelse {
-            _ = userLog("Init: unknown startup manifest role\n");
+        const parsed = parseStartupManifestLine(raw_line) orelse continue;
+        const spec = findStartupRoleSpec(parsed.role) orelse {
+            _ = userLog("Init: startup role spec missing\n");
             while (true) asm volatile ("pause");
         };
-        ctx.launchRole(role, path);
+        switch (spec.action) {
+            .input_driver => ctx.launchRole(parsed.role, parsed.path),
+            .deferred_compositor => switch (spec.compositor_variant orelse unreachable) {
+                .classic => compositor_path = parsed.path,
+                .gpu => gpu_compositor_path = parsed.path,
+            },
+            .bootstrap_vfs, .block_driver, .persistent_fs_server, .block_client => {
+                if (pending_late_count >= pending_late_roles.len) {
+                    _ = userLog("Init: too many late startup roles\n");
+                    while (true) asm volatile ("pause");
+                }
+                pending_late_roles[pending_late_count] = .{
+                    .line = parsed,
+                };
+                pending_late_count += 1;
+            },
+            .window_client => {
+                if (pending_window_count >= pending_window_clients.len) {
+                    _ = userLog("Init: too many startup window clients\n");
+                    while (true) asm volatile ("pause");
+                }
+                pending_window_clients[pending_window_count] = .{
+                    .line = parsed,
+                };
+                pending_window_count += 1;
+            },
+        }
     }
-    ctx.armCompositor();
+    ctx.armCompositor(compositor_path, gpu_compositor_path);
+    const pending_slice = pending_window_clients[0..pending_window_count];
+    while (!allWindowClientsLaunched(pending_slice)) {
+        if (tryLaunchReadyWindowClients(ctx, pending_slice) != 0) continue;
+        const shared_paddr = waitRecvCap();
+        if (shared_paddr < cap_transfer_abi.transfer_id_min) continue;
+        if (!ctx.tryFinishInputSharedFromPaddr(shared_paddr)) {
+            _ = userLog("Init: unexpected input shared page\n");
+            while (true) asm volatile ("pause");
+        }
+    }
+    ctx.finishPendingInputSharedCaps();
+    var late_index: usize = 0;
+    while (late_index < pending_late_count) : (late_index += 1) {
+        const entry = pending_late_roles[late_index];
+        ctx.launchRole(entry.line.role, entry.line.path);
+    }
+    _ = userLog("Init: startup manifest done\n");
 }
 
 pub export fn _start() noreturn {
@@ -1190,6 +1778,7 @@ pub export fn _start() noreturn {
     const keyboard_shared_page = requireSpawnPageDescriptor(.input_shared, .keyboard, "Init: keyboard shared descriptor missing\n");
     const pointer_input = requireInputDeviceDescriptor(.pointer, "Init: pointer input descriptor missing\n");
     const pointer_shared_page = requireSpawnPageDescriptor(.input_shared, .pointer, "Init: pointer shared descriptor missing\n");
+    const block_device = requireBlockDeviceDescriptor(.virtio_blk, "Init: block device descriptor missing\n");
     const primary_panel_config_page = requireSpawnPageDescriptor(.ui_config, .primary_panel, "Init: primary panel config descriptor missing\n");
     const primary_panel_state_page = requireSpawnPageDescriptor(.ui_state, .primary_panel, "Init: primary panel state descriptor missing\n");
     const primary_panel_command_page = requireSpawnPageDescriptor(.ui_command, .primary_panel, "Init: primary panel command descriptor missing\n");
@@ -1213,6 +1802,7 @@ pub export fn _start() noreturn {
         .keyboard_shared_page = keyboard_shared_page,
         .pointer_input = pointer_input,
         .pointer_shared_page = pointer_shared_page,
+        .block_device = block_device,
         .primary_panel_config_page = primary_panel_config_page,
         .primary_panel_state_page = primary_panel_state_page,
         .primary_panel_command_page = primary_panel_command_page,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const capability = @import("capability.zig");
+const cap_transfer_abi = @import("abi/cap_transfer_abi.zig");
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
 const device_abi = @import("abi/device_abi.zig");
 const debug_window_force_free_list = true;
@@ -38,6 +39,7 @@ fn PrincipalIdType(comptime named_process_slots: usize) type {
 }
 
 pub const PrincipalId = PrincipalIdType(initial_process_count);
+const default_process_principal: PrincipalId = processPrincipalFromIndex(0) orelse unreachable;
 pub const vfs_process_index: usize = 8;
 pub const vfs_principal: PrincipalId = @enumFromInt(vfs_process_index);
 
@@ -74,10 +76,7 @@ pub fn principalLabel(principal: PrincipalId) []const u8 {
     return "Unknown";
 }
 
-pub const endpoint_to_process0: u64 = 0x10;
 pub const endpoint_to_boot_display: u64 = 0x11;
-pub const endpoint_to_process1: u64 = endpoint_to_boot_display;
-pub const endpoint_to_process2: u64 = 0x12;
 pub const endpoint_to_vfs: u64 = 0x13;
 pub const endpoint_to_spawn_parent: u64 = 0x14;
 
@@ -93,6 +92,7 @@ pub const Rights = struct {
     cpu_read: bool,
     cpu_write: bool,
     dma: bool,
+    grant: bool = false,
 };
 
 pub const Capability = struct {
@@ -106,6 +106,15 @@ pub const Capability = struct {
 pub const EndpointCapability = struct {
     endpoint_id: u64,
     target: PrincipalId,
+};
+
+pub const PendingCapTransfer = struct {
+    transfer_id: u64,
+    sender: PrincipalId,
+    endpoint_id: u64,
+    paddr: u64,
+    rights: Rights,
+    retain_sender: bool = false,
 };
 
 pub const Region = struct {
@@ -246,24 +255,24 @@ pub const EndpointCNode = struct {
 pub const CapMailbox = struct {
     const max_items = 8;
 
-    items: [max_items]u64 = undefined,
+    items: [max_items]PendingCapTransfer = undefined,
     len: usize = 0,
 
-    pub fn push(self: *CapMailbox, paddr: u64) KernelError!void {
+    pub fn push(self: *CapMailbox, transfer: PendingCapTransfer) KernelError!void {
         if (self.len >= self.items.len) return KernelError.TableFull;
-        self.items[self.len] = paddr;
+        self.items[self.len] = transfer;
         self.len += 1;
     }
 
-    pub fn pop(self: *CapMailbox) ?u64 {
+    pub fn pop(self: *CapMailbox) ?PendingCapTransfer {
         if (self.len == 0) return null;
-        const paddr = self.items[0];
+        const transfer = self.items[0];
         var i: usize = 1;
         while (i < self.len) : (i += 1) {
             self.items[i - 1] = self.items[i];
         }
         self.len -= 1;
-        return paddr;
+        return transfer;
     }
 };
 
@@ -274,6 +283,7 @@ pub const FsObjectKind = enum(u8) {
     vnode_file = 3,
     open_file = 4,
     exec = 5,
+    block_device = 6,
 };
 
 pub const FsRights = packed struct(u32) {
@@ -816,13 +826,14 @@ pub const WindowMeta = extern struct {
 const DmaRestoreEntry = struct {
     valid: bool = false,
     paddr: u64 = 0,
+    owner: PrincipalId = default_process_principal,
     rights: Rights = .{ .cpu_read = false, .cpu_write = false, .dma = false },
 };
 
 pub const WindowRecord = struct {
     active: bool = false,
     window_id: u32 = 0,
-    owner: PrincipalId = .Process0,
+    owner: PrincipalId = default_process_principal,
     cap_paddr: u64 = 0,
     pixels_paddr: u64 = 0,
     meta_paddr: u64 = 0,
@@ -856,11 +867,10 @@ pub const DebugAllocPageStage = enum(u8) {
     after_cap_add,
 };
 
-pub const OwnershipView = enum {
-    Process0,
-    Device0,
-    Shared,
-    None,
+pub const OwnershipView = union(enum) {
+    owner: PrincipalId,
+    shared: void,
+    none: void,
 };
 
 pub const IommuNoCapDriverMode = enum(u8) {
@@ -887,6 +897,7 @@ pub const QueueCapability = dma_mapping_manager.QueueCapability;
 const IommuDevice = enum(u8) {
     virtio_gpu,
     virtio_input,
+    virtio_blk,
 };
 
 const IommuMapEntry = struct {
@@ -916,6 +927,7 @@ pub const KernelState = struct {
     untyped_tables: [principal_count]UntypedCNode = [_]UntypedCNode{.{}} ** principal_count,
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
+    pending_page_transfers: [principal_count]?PendingCapTransfer = [_]?PendingCapTransfer{null} ** principal_count,
     framebuffer_caps: [principal_count]?FramebufferCapability = [_]?FramebufferCapability{null} ** principal_count,
     fs_tables: [principal_count]FsCNode = [_]FsCNode{.{}} ** principal_count,
     fs_mailboxes: [principal_count]FsMailbox = [_]FsMailbox{.{}} ** principal_count,
@@ -935,6 +947,7 @@ pub const KernelState = struct {
     queue_caps: dma_mapping_manager.QueueCapabilityTable = .{},
     iommu: IommuNoCapDriverState = .{},
     next_cap_id: u64 = 1,
+    next_transfer_id: u64 = cap_transfer_abi.transfer_id_min,
     untyped_pool: UntypedPool = .{},
     windows: [max_windows]WindowRecord = [_]WindowRecord{.{}} ** max_windows,
     next_window_id: u32 = 1,
@@ -942,6 +955,16 @@ pub const KernelState = struct {
     fn allocCapId(self: *KernelState) u64 {
         const id = self.next_cap_id;
         self.next_cap_id +%= 1;
+        return id;
+    }
+
+    fn allocTransferId(self: *KernelState) u64 {
+        var id = self.next_transfer_id;
+        self.next_transfer_id +%= 1;
+        if (id < cap_transfer_abi.transfer_id_min) {
+            id = cap_transfer_abi.transfer_id_min;
+            self.next_transfer_id = id + 1;
+        }
         return id;
     }
 
@@ -957,7 +980,7 @@ pub const KernelState = struct {
         return null;
     }
 
-    fn saveDmaRestoreRights(self: *KernelState, paddr: u64, rights: Rights) KernelError!void {
+    fn saveDmaRestoreEntry(self: *KernelState, owner: PrincipalId, paddr: u64, rights: Rights) KernelError!void {
         if (self.findDmaRestoreIndex(paddr) != null) return KernelError.InvalidState;
 
         var i: usize = 0;
@@ -966,6 +989,7 @@ pub const KernelState = struct {
             self.dma_restore[i] = .{
                 .valid = true,
                 .paddr = paddr,
+                .owner = owner,
                 .rights = rights,
             };
             return;
@@ -973,11 +997,11 @@ pub const KernelState = struct {
         return KernelError.TableFull;
     }
 
-    fn takeDmaRestoreRights(self: *KernelState, paddr: u64) ?Rights {
+    fn takeDmaRestoreEntry(self: *KernelState, paddr: u64) ?DmaRestoreEntry {
         const index = self.findDmaRestoreIndex(paddr) orelse return null;
-        const rights = self.dma_restore[index].rights;
+        const entry = self.dma_restore[index];
         self.dma_restore[index] = .{};
-        return rights;
+        return entry;
     }
 
     pub fn setIommuNoCapDriverMode(self: *KernelState, mode: IommuNoCapDriverMode) void {
@@ -996,10 +1020,12 @@ pub const KernelState = struct {
         const abi_device: device_abi.DeviceId = switch (device) {
             .virtio_gpu => .virtio_gpu,
             .virtio_input => .virtio_input,
+            .virtio_blk => .virtio_blk,
         };
         return switch (abi_device) {
             .virtio_gpu => .virtio_gpu,
             .virtio_input => .virtio_input,
+            .virtio_blk => .virtio_blk,
         };
     }
 
@@ -1353,7 +1379,8 @@ pub const KernelState = struct {
     fn isRightsSubset(child: Rights, parent: Rights) bool {
         return (!child.cpu_read or parent.cpu_read) and
             (!child.cpu_write or parent.cpu_write) and
-            (!child.dma or parent.dma);
+            (!child.dma or parent.dma) and
+            (!child.grant or parent.grant);
     }
 
     fn isFsRightsSubset(child: FsRights, parent: FsRights) bool {
@@ -1457,6 +1484,7 @@ pub const KernelState = struct {
             self.untyped_tables[i] = .{};
             self.endpoint_tables[i] = .{};
             self.cap_mailboxes[i] = .{};
+            self.pending_page_transfers[i] = null;
             self.framebuffer_caps[i] = null;
             self.fs_tables[i] = .{};
             self.fs_mailboxes[i] = .{};
@@ -1480,28 +1508,6 @@ pub const KernelState = struct {
         }
     }
 
-    fn installDefaultEndpoints(self: *KernelState) KernelError!void {
-        const p0 = processPrincipal(0);
-        const p1 = processPrincipal(1);
-        try self.endpoint_tables[@intFromEnum(p0)].add(.{
-            .endpoint_id = endpoint_to_process1,
-            .target = p1,
-        });
-        try self.endpoint_tables[@intFromEnum(p1)].add(.{
-            .endpoint_id = endpoint_to_process0,
-            .target = p0,
-        });
-
-        var i: usize = 2;
-        while (i < self.active_process_count) : (i += 1) {
-            const proc = processPrincipal(i);
-            try self.endpoint_tables[@intFromEnum(proc)].add(.{
-                .endpoint_id = endpoint_to_process1,
-                .target = p1,
-            });
-        }
-    }
-
     pub fn initPhase1InPlace(self: *KernelState) void {
         self.* = .{};
         self.next_cap_id = 1;
@@ -1511,13 +1517,10 @@ pub const KernelState = struct {
         };
         self.region_len = 1;
         self.initPrincipalState();
-        self.installDefaultEndpoints() catch unreachable;
-
-        const p0 = processPrincipal(0);
         const root_id = self.allocCapId();
-        self.cap_tables[@intFromEnum(p0)].add(.{
+        self.cap_tables[@intFromEnum(default_process_principal)].add(.{
             .paddr = 0x1000,
-            .rights = .{ .cpu_read = true, .cpu_write = true, .dma = true },
+            .rights = .{ .cpu_read = true, .cpu_write = true, .dma = true, .grant = true },
             .cap_id = root_id,
             .root_cap_id = root_id,
             .parent_cap_id = 0,
@@ -1538,7 +1541,6 @@ pub const KernelState = struct {
         self.next_cap_id = 1;
         self.next_window_id = 1;
         self.initPrincipalState();
-        try self.installDefaultEndpoints();
 
         var i: usize = 0;
         while (i < region_count) : (i += 1) {
@@ -1555,15 +1557,16 @@ pub const KernelState = struct {
         return state;
     }
 
-    pub fn startDma(self: *KernelState, paddr: u64) KernelError!void {
-        const p0_table = self.getTable(.Process0);
-        const p0_cap = p0_table.find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!p0_cap.rights.dma) return KernelError.NoDmaRight;
-        try self.saveDmaRestoreRights(paddr, p0_cap.rights);
+    pub fn startDma(self: *KernelState, owner: PrincipalId, paddr: u64) KernelError!void {
+        try self.requireActiveProcess(owner);
+        const owner_table = self.getTable(owner);
+        const owner_cap = owner_table.find(paddr) orelse return KernelError.CapabilityNotFound;
+        if (!owner_cap.rights.dma) return KernelError.NoDmaRight;
+        try self.saveDmaRestoreEntry(owner, paddr, owner_cap.rights);
 
         // DMA 開始時は moveCap 経由で Device0 へ委譲する。
         try self.moveCap(
-            .Process0,
+            owner,
             .Device0,
             paddr,
             .{
@@ -1575,21 +1578,19 @@ pub const KernelState = struct {
     }
 
     pub fn completeDma(self: *KernelState, paddr: u64) KernelError!void {
-        if (self.getTable(.Process0).find(paddr) != null) return KernelError.InvalidState;
-
         const dev_table = self.getTable(.Device0);
         const dev_cap = dev_table.find(paddr) orelse return KernelError.CapabilityNotFound;
         if (!dev_cap.rights.dma) return KernelError.NoDmaRight;
-        const restore_rights = self.takeDmaRestoreRights(paddr) orelse return KernelError.InvalidState;
-        if (self.getTable(.Process0).find(paddr) != null) return KernelError.InvalidState;
+        const restore = self.takeDmaRestoreEntry(paddr) orelse return KernelError.InvalidState;
+        if (self.getTable(restore.owner).find(paddr) != null) return KernelError.InvalidState;
 
         var restored = dev_cap.*;
-        restored.rights = restore_rights;
+        restored.rights = restore.rights;
         _ = dev_table.removeByPaddr(paddr);
-        try self.getTable(.Process0).add(restored);
+        try self.getTable(restore.owner).add(restored);
         if (self.pte_sync_hook) |hook| {
             callPteSyncHook(hook, self, .Device0, paddr);
-            callPteSyncHook(hook, self, .Process0, paddr);
+            callPteSyncHook(hook, self, restore.owner, paddr);
         }
     }
 
@@ -2100,13 +2101,16 @@ pub const KernelState = struct {
 
     pub fn scanCapTables(self: *const KernelState, paddr: u64) OwnershipView {
         // デバッグ用: capability 走査から論理的な保持者ビューを作る。
-        const p0_has = self.getTableConst(.Process0).find(paddr) != null;
-        const dev_has = self.getTableConst(.Device0).find(paddr) != null;
-
-        if (p0_has and dev_has) return .Shared;
-        if (p0_has) return .Process0;
-        if (dev_has) return .Device0;
-        return .None;
+        var owner: ?PrincipalId = null;
+        var pidx: usize = 0;
+        while (pidx < principal_count) : (pidx += 1) {
+            const principal: PrincipalId = @enumFromInt(pidx);
+            if (self.cap_tables[pidx].find(paddr) == null) continue;
+            if (owner != null) return .{ .shared = {} };
+            owner = principal;
+        }
+        if (owner) |principal| return .{ .owner = principal };
+        return .{ .none = {} };
     }
 
     fn anyPrincipalHasPageCap(self: *const KernelState, paddr: u64) bool {
@@ -2169,6 +2173,7 @@ pub const KernelState = struct {
                 .cpu_read = true,
                 .cpu_write = true,
                 .dma = true,
+                .grant = true,
             },
             .cap_id = root_id,
             .root_cap_id = root_id,
@@ -2261,6 +2266,7 @@ pub const KernelState = struct {
                     .cpu_read = true,
                     .cpu_write = true,
                     .dma = block.flags.dma_ok,
+                    .grant = true,
                 },
                 .cap_id = cap_id,
                 .root_cap_id = untyped_cap.root_cap_id,
@@ -2490,6 +2496,7 @@ pub const KernelState = struct {
         try self.requireActiveProcess(to);
 
         const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
         if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
         if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
 
@@ -2523,6 +2530,7 @@ pub const KernelState = struct {
         while (i < paddrs.len) : (i += 1) {
             const paddr = paddrs[i];
             const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
+            if (!src_cap.rights.grant) return KernelError.InvalidState;
             if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
             if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
         }
@@ -2595,13 +2603,59 @@ pub const KernelState = struct {
         try self.requireActiveProcess(from);
         const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
         const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-        try self.grantCap(from, target, paddr, src_cap.rights);
-        try self.cap_mailboxes[@intFromEnum(target)].push(paddr);
+        try self.cap_mailboxes[@intFromEnum(target)].push(.{
+            .transfer_id = self.allocTransferId(),
+            .sender = from,
+            .endpoint_id = endpoint_id,
+            .paddr = paddr,
+            .rights = src_cap.rights,
+            .retain_sender = false,
+        });
+    }
+
+    pub fn shareCapOnEndpoint(
+        self: *KernelState,
+        from: PrincipalId,
+        endpoint_id: u64,
+        paddr: u64,
+    ) KernelError!void {
+        try self.requireActiveProcess(from);
+        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
+        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
+        try self.cap_mailboxes[@intFromEnum(target)].push(.{
+            .transfer_id = self.allocTransferId(),
+            .sender = from,
+            .endpoint_id = endpoint_id,
+            .paddr = paddr,
+            .rights = src_cap.rights,
+            .retain_sender = true,
+        });
     }
 
     pub fn recvCap(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
         try self.requireActiveProcess(receiver);
-        return self.cap_mailboxes[@intFromEnum(receiver)].pop() orelse KernelError.MailboxEmpty;
+        const storage_index = @intFromEnum(receiver);
+        if (self.pending_page_transfers[storage_index]) |pending| {
+            return pending.transfer_id;
+        }
+        const received = self.cap_mailboxes[storage_index].pop() orelse return KernelError.MailboxEmpty;
+        self.pending_page_transfers[storage_index] = received;
+        return received.transfer_id;
+    }
+
+    pub fn acceptCapTransfer(self: *KernelState, receiver: PrincipalId, transfer_id: u64) KernelError!u64 {
+        try self.requireActiveProcess(receiver);
+        const storage_index = @intFromEnum(receiver);
+        const pending = self.pending_page_transfers[storage_index] orelse return KernelError.MailboxEmpty;
+        if (pending.transfer_id != transfer_id) return KernelError.InvalidState;
+        if (pending.retain_sender) {
+            try self.grantCap(pending.sender, receiver, pending.paddr, pending.rights);
+        } else {
+            try self.moveCap(pending.sender, receiver, pending.paddr, pending.rights);
+        }
+        self.pending_page_transfers[storage_index] = null;
+        return pending.paddr;
     }
 
     pub fn revokeCapTree(
@@ -2766,13 +2820,14 @@ test "phase1 init state" {
     const s = KernelState.initPhase1();
 
     try std.testing.expectEqual(@as(usize, 1), s.region_len);
-    try std.testing.expectEqual(OwnershipView.Process0, s.scanCapTables(0x1000));
+    try std.testing.expectEqualDeep(OwnershipView{ .owner = default_process_principal }, s.scanCapTables(0x1000));
 
     const p0 = s.getTableConst(.Process0);
     try std.testing.expectEqual(@as(usize, 1), p0.len);
     try std.testing.expect(p0.find(0x1000).?.rights.cpu_read);
     try std.testing.expect(p0.find(0x1000).?.rights.cpu_write);
     try std.testing.expect(p0.find(0x1000).?.rights.dma);
+    try std.testing.expect(p0.find(0x1000).?.rights.grant);
 
     const dev = s.getTableConst(.Device0);
     try std.testing.expectEqual(@as(usize, 0), dev.len);
@@ -2780,9 +2835,9 @@ test "phase1 init state" {
 
 test "start dma moves owner and capabilities" {
     var s = KernelState.initPhase1();
-    try s.startDma(0x1000);
+    try s.startDma(default_process_principal, 0x1000);
 
-    try std.testing.expectEqual(OwnershipView.Device0, s.scanCapTables(0x1000));
+    try std.testing.expectEqualDeep(OwnershipView{ .owner = .Device0 }, s.scanCapTables(0x1000));
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) == null);
     const dev_cap = s.getTableConst(.Device0).find(0x1000).?;
     try std.testing.expect(dev_cap.rights.dma);
@@ -2792,10 +2847,10 @@ test "start dma moves owner and capabilities" {
 
 test "complete dma returns owner and capabilities" {
     var s = KernelState.initPhase1();
-    try s.startDma(0x1000);
+    try s.startDma(default_process_principal, 0x1000);
     try s.completeDma(0x1000);
 
-    try std.testing.expectEqual(OwnershipView.Process0, s.scanCapTables(0x1000));
+    try std.testing.expectEqualDeep(OwnershipView{ .owner = default_process_principal }, s.scanCapTables(0x1000));
     try std.testing.expect(s.getTableConst(.Device0).find(0x1000) == null);
     const p0_cap = s.getTableConst(.Process0).find(0x1000).?;
     try std.testing.expect(p0_cap.rights.cpu_read);
@@ -2816,7 +2871,7 @@ test "complete dma restores original rights" {
         .dma = true,
     });
 
-    try s.startDma(0x1000);
+    try s.startDma(default_process_principal, 0x1000);
     try s.completeDma(0x1000);
 
     const p0_cap = s.getTableConst(.Process0).find(0x1000).?;
@@ -2828,14 +2883,14 @@ test "complete dma restores original rights" {
 test "invalid transition rejected" {
     var s = KernelState.initPhase1();
     try std.testing.expectError(KernelError.InvalidState, s.completeDma(0x1000));
-    try s.startDma(0x1000);
-    try std.testing.expectError(KernelError.CapabilityNotFound, s.startDma(0x1000));
+    try s.startDma(default_process_principal, 0x1000);
+    try std.testing.expectError(KernelError.CapabilityNotFound, s.startDma(default_process_principal, 0x1000));
 }
 
 test "init from detected regions" {
     const s = try KernelState.initFromDetectedRegions(3);
     try std.testing.expectEqual(@as(usize, 3), s.region_len);
-    try std.testing.expectEqual(OwnershipView.None, s.scanCapTables(0x3000));
+    try std.testing.expectEqualDeep(OwnershipView{ .none = {} }, s.scanCapTables(0x3000));
     try std.testing.expectEqual(@as(usize, 0), s.getTableConst(.Process0).len);
 }
 
@@ -2878,7 +2933,8 @@ test "alloc page to principal installs capability by paddr" {
     try free_list.appendPage(0, 0x9000);
     const cap = try s.allocPageTo(.Process0, &free_list);
     try std.testing.expectEqual(@as(u64, 0x9000), cap.paddr);
-    try std.testing.expect(s.getTableConst(.Process0).find(0x9000) != null);
+    const installed = s.getTableConst(.Process0).find(0x9000).?;
+    try std.testing.expect(installed.rights.grant);
 }
 
 test "allocPageTo skips paddr already covered by active untyped block" {
@@ -2923,8 +2979,8 @@ test "untyped retype installs page caps under untyped root" {
 
     try std.testing.expectEqual(@as(u64, 0x20_0000), caps[0].paddr);
     try std.testing.expectEqual(@as(u64, 0x20_1000), caps[1].paddr);
-    try std.testing.expect(s.getTableConst(.Process0).find(caps[0].paddr) != null);
-    try std.testing.expect(s.getTableConst(.Process0).find(caps[1].paddr) != null);
+    try std.testing.expect(s.getTableConst(.Process0).find(caps[0].paddr).?.rights.grant);
+    try std.testing.expect(s.getTableConst(.Process0).find(caps[1].paddr).?.rights.grant);
 }
 
 test "untyped grant allows child owner to retype" {
@@ -2975,7 +3031,7 @@ test "moveCap enforces single holder" {
 
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) == null);
     try std.testing.expect(s.getTableConst(.Device0).find(0x1000) != null);
-    try std.testing.expectEqual(OwnershipView.Device0, s.scanCapTables(0x1000));
+    try std.testing.expectEqualDeep(OwnershipView{ .owner = .Device0 }, s.scanCapTables(0x1000));
 }
 
 test "moveCap rejects rights escalation" {
@@ -3010,6 +3066,7 @@ test "sendCap moves capability process to process with rights preserved" {
     try std.testing.expect(p1_cap.rights.cpu_read);
     try std.testing.expect(p1_cap.rights.cpu_write);
     try std.testing.expect(p1_cap.rights.dma);
+    try std.testing.expect(p1_cap.rights.grant);
 }
 
 test "sendCap rejects non-process endpoints" {
@@ -3020,7 +3077,13 @@ test "sendCap rejects non-process endpoints" {
 
 test "sendCapOnEndpoint requires endpoint capability" {
     var s = KernelState.initPhase1();
-    try s.sendCapOnEndpoint(.Process0, endpoint_to_process1, 0x1000);
+    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
+    try s.sendCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    try std.testing.expect(s.getTableConst(.Process0).find(0x1000) != null);
+    try std.testing.expect(s.getTableConst(.Process1).find(0x1000) == null);
+    const transfer_id = try s.recvCap(.Process1);
+    try std.testing.expect(transfer_id >= 0x1000);
+    try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process1, transfer_id));
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) == null);
     try std.testing.expect(s.getTableConst(.Process1).find(0x1000) != null);
 }
@@ -3076,8 +3139,25 @@ test "sendCapOnEndpoint rejects missing endpoint" {
 
 test "sendCapOnEndpoint enqueues mailbox for target" {
     var s = KernelState.initPhase1();
-    try s.sendCapOnEndpoint(.Process0, endpoint_to_process1, 0x1000);
-    try std.testing.expectEqual(@as(u64, 0x1000), try s.recvCap(.Process1));
+    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
+    try s.sendCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    const transfer_id = try s.recvCap(.Process1);
+    try std.testing.expect(transfer_id >= cap_transfer_abi.transfer_id_min);
+    try std.testing.expectEqual(transfer_id, try s.recvCap(.Process1));
+    try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process1, transfer_id));
+}
+
+test "acceptCapTransfer rejects mismatched transfer token" {
+    var s = KernelState.initPhase1();
+    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
+    try s.sendCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    const transfer_id = try s.recvCap(.Process1);
+    try std.testing.expect(transfer_id >= cap_transfer_abi.transfer_id_min);
+    try std.testing.expectError(KernelError.InvalidState, s.acceptCapTransfer(.Process1, transfer_id + 1));
+    try std.testing.expect(s.getTableConst(.Process0).find(0x1000) != null);
+    try std.testing.expect(s.getTableConst(.Process1).find(0x1000) == null);
+    try std.testing.expectEqual(transfer_id, try s.recvCap(.Process1));
+    try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process1, transfer_id));
 }
 
 test "recvCap returns MailboxEmpty when queue is empty" {
@@ -3098,6 +3178,56 @@ test "grantCap creates child and revokeCapTree at root removes descendants" {
     try s.revokeCapTree(.Process0, 0x1000);
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) == null);
     try std.testing.expect(s.getTableConst(.Process1).find(0x1000) == null);
+}
+
+test "grantCap requires grant right on source page capability" {
+    var s = KernelState.initPhase1();
+    try s.grantCap(.Process0, .Process1, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = false,
+    });
+
+    try std.testing.expectError(KernelError.InvalidState, s.grantCap(.Process1, .Process2, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = false,
+    }));
+}
+
+test "sendCapOnEndpoint moves derived page capability after receiver accepts" {
+    var s = KernelState.initPhase1();
+    try s.grantCap(.Process0, .Process1, 0x1000, .{
+        .cpu_read = true,
+        .cpu_write = false,
+        .dma = false,
+    });
+    try s.installEndpoint(.Process1, endpoint_to_boot_display, .Process2);
+
+    try s.sendCapOnEndpoint(.Process1, endpoint_to_boot_display, 0x1000);
+    const transfer_id = try s.recvCap(.Process2);
+    try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process2, transfer_id));
+    try std.testing.expect(s.getTableConst(.Process1).find(0x1000) == null);
+    const received = s.getTableConst(.Process2).find(0x1000).?;
+    try std.testing.expect(received.rights.cpu_read);
+    try std.testing.expect(!received.rights.cpu_write);
+    try std.testing.expect(!received.rights.grant);
+}
+
+test "shareCapOnEndpoint keeps sender capability after receiver accepts" {
+    var s = KernelState.initPhase1();
+    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
+    try s.shareCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    const transfer_id = try s.recvCap(.Process1);
+    try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process1, transfer_id));
+    const sender = s.getTableConst(.Process0).find(0x1000).?;
+    const receiver = s.getTableConst(.Process1).find(0x1000).?;
+    try std.testing.expect(sender.rights.cpu_read);
+    try std.testing.expect(sender.rights.cpu_write);
+    try std.testing.expect(sender.rights.grant);
+    try std.testing.expect(receiver.rights.cpu_read);
+    try std.testing.expect(receiver.rights.cpu_write);
+    try std.testing.expect(receiver.rights.grant);
 }
 
 test "revokeCapTree from child only removes child subtree" {
@@ -3190,7 +3320,8 @@ test "filesystem capability send on endpoint enqueues granted token" {
         .stat = true,
     });
 
-    const recv_token = try s.sendFsCapOnEndpoint(.Process0, endpoint_to_process1, root_token);
+    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
+    const recv_token = try s.sendFsCapOnEndpoint(.Process0, endpoint_to_boot_display, root_token);
     try std.testing.expectEqual(recv_token, try s.recvFsCap(.Process1));
     const recv_cap = s.getFsTableConst(.Process1).findByCapId(recv_token).?;
     try std.testing.expectEqual(@as(u64, 0x200), recv_cap.object_id);

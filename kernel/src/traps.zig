@@ -35,6 +35,8 @@ pub const Hooks = struct {
     log_page_fault_step2: *const fn (u64, *const ExceptionTrapFrame) void,
     halt_loop: *const fn () noreturn,
     maybe_log_scheduler_perf_tick: *const fn () void,
+    note_user_timer_tick: *const fn (*TrapFrame) void,
+    log_staged_user_return: *const fn () void,
     try_start_bootlog_gate_deferred_input: *const fn () void,
     try_auto_launch_deferred_compositor: *const fn (*TrapFrame) void,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
@@ -146,7 +148,10 @@ fn writeByteHex(h: *const Hooks, byte: u8) void {
 
 pub export fn logTimerReturnFrame(_: *const TrapFrame) callconv(.c) void {}
 
-pub export fn logCurrentStagedUserReturnFrame() callconv(.c) void {}
+pub export fn logCurrentStagedUserReturnFrame() callconv(.c) void {
+    const h = getHooks();
+    h.log_staged_user_return();
+}
 
 pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
     asm volatile (
@@ -204,10 +209,11 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
     h.write("\n");
     if (vec == 14) {
         const cr2 = h.read_cr2();
+        const user_mode = (frame.error_code & (1 << 2)) != 0;
         h.write("  CR2=");
         h.write_hex_raw(cr2);
         h.write("\n");
-        h.dump_page_walk_for_va(h.read_cr3(), cr2);
+        h.dump_page_walk_for_va(if (user_mode) user_cr3_value else h.read_cr3(), cr2);
         h.log_page_fault_step2(cr2, frame);
     }
     h.write("  EC=");
@@ -287,6 +293,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!user_mode) return;
     scheduler.noteUserTimerTick();
+    h.note_user_timer_tick(frame);
     h.maybe_log_scheduler_perf_tick();
     h.try_start_bootlog_gate_deferred_input();
     h.try_auto_launch_deferred_compositor(frame);
@@ -467,6 +474,9 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\mov %rax, syscall_interrupt_work_frame+112(%rip)
             \\7:
         ++ asmStageUserReturnFromWorkFrame("syscall_interrupt_work_frame", trap_frame_iret_offset) ++
+            \\sub $32, %rsp
+            \\call logCurrentStagedUserReturnFrame
+            \\add $32, %rsp
             \\jmp userReturnToSavedFrame
         );
     } else {
@@ -506,6 +516,9 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\call restoreCurrentThreadFxState
             \\add $32, %rsp
         ++ asmStageUserReturnFromWorkFrame("syscall_interrupt_work_frame", trap_frame_iret_offset) ++
+            \\sub $32, %rsp
+            \\call logCurrentStagedUserReturnFrame
+            \\add $32, %rsp
             \\jmp userReturnToSavedFrame
         );
     }

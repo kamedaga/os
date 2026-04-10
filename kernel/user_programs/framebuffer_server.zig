@@ -1,3 +1,4 @@
+const cap_transfer_abi = @import("cap_transfer_abi.zig");
 const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
@@ -42,10 +43,25 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
 }
 
 fn recvCap() u64 {
+    const transfer = recvCapTransfer();
+    if (transfer < cap_transfer_abi.transfer_id_min) return transfer;
+    return acceptCapTransfer(transfer);
+}
+
+fn recvCapTransfer() u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_recv_cap),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn acceptCapTransfer(transfer_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (cap_transfer_abi.syscall_accept_cap_transfer),
+          [arg0] "{rdi}" (transfer_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 

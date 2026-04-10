@@ -13,6 +13,7 @@ const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_wait_event: u64 = 0x17;
+const syscall_share_cap: u64 = 0x2B;
 
 const syscall_ok: u64 = 0;
 const queue_cap_device_input: u64 = 1;
@@ -29,7 +30,7 @@ const default_shared_page_va: usize = 0x3C00_3000;
 
 const config_magic = input_bootstrap.mouse_config_magic;
 const shared_magic = protocol.mouse_shared_magic;
-const endpoint_to_process1: u64 = 0x11;
+const endpoint_to_boot_display: u64 = 0x11;
 const endpoint_to_spawn_parent: u64 = 0x14;
 const MouseSharedPage = protocol.MouseSharedPage;
 
@@ -164,6 +165,16 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_send_cap),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (endpoint_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn shareCap(paddr: u64, endpoint_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_share_cap),
           [arg0] "{rdi}" (paddr),
           [arg1] "{rsi}" (endpoint_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
@@ -497,8 +508,8 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
     initializeSharedPage(shared, screen_w_u64, screen_h_u64, screen_pitch_u64);
-    if (sendCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok and
-        sendCap(shared_page_paddr, endpoint_to_process1) != syscall_ok)
+    if (shareCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok and
+        shareCap(shared_page_paddr, endpoint_to_boot_display) != syscall_ok)
     {
         _ = userLog("MouseDriver: send shared cap failed\n");
         while (true) asm volatile ("pause");

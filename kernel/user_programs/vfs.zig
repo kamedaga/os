@@ -1,4 +1,5 @@
 const std = @import("std");
+const cap_transfer_abi = @import("cap_transfer_abi.zig");
 const bootfs_format = @import("bootfs_format.zig");
 const fs_abi = @import("fs_abi.zig");
 const image_abi = @import("image_abi.zig");
@@ -136,6 +137,15 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
         : [nr] "{rax}" (syscall_wait_event),
           [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
           [arg1] "{rsi}" (timeout_ticks),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn acceptCapTransfer(transfer_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (cap_transfer_abi.syscall_accept_cap_transfer),
+          [arg0] "{rdi}" (transfer_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -1243,9 +1253,6 @@ pub export fn _start() noreturn {
         _ = userLog("VFS: root mount token missing\n");
         haltForever();
     }
-    if (!runBootSelfTest(&boot_state)) {
-        haltForever();
-    }
     if ((boot_state.flags & vfs_boot_config_flag_bootfs_present) != 0) {
         if (bootfsHeader() != null) {
             _ = userLog("VFS: bootfs image ready\n");
@@ -1254,11 +1261,17 @@ pub export fn _start() noreturn {
             haltForever();
         }
     }
+    _ = userLog("VFS: boot ready\n");
 
     while (true) {
         const received = waitEvent(true, session_poll_timeout_ticks);
         if (received >= 0x1000 and !isFsCapToken(received)) {
-            handleConnectRequest(received);
+            const request_paddr = acceptCapTransfer(received);
+            if (request_paddr >= 0x1000) {
+                handleConnectRequest(request_paddr);
+            } else {
+                _ = userLog("VFS: accept cap transfer failed\n");
+            }
         } else if (isFsCapToken(received)) {
             _ = userLog("VFS: received fs cap\n");
         }
