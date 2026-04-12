@@ -36,7 +36,6 @@ pub fn logQueueCapDeny(
     hooks: Hooks,
     proc: kernel.PrincipalId,
     token: u64,
-    device: kernel.DmaDeviceId,
     queue_index: u16,
     op: kernel.QueueOperation,
     err: anyerror,
@@ -45,12 +44,6 @@ pub fn logQueueCapDeny(
     hooks.write(hooks.principal_label(proc));
     hooks.write(" op=");
     hooks.write(queueCapOpLabel(op));
-    hooks.write(" device=");
-    hooks.write(switch (device) {
-        .virtio_gpu => "virtio_gpu",
-        .virtio_input => "virtio_input",
-        .virtio_blk => "virtio_blk",
-    });
     hooks.write(" q=");
     hooks.print_number(queue_index);
     hooks.write(" token=");

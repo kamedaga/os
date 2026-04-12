@@ -6,15 +6,17 @@ pub const syscall_install_exec_image: u64 = 0x20;
 pub const syscall_grant_exec_image: u64 = 0x21;
 pub const syscall_map_vm_object: u64 = 0x28;
 pub const syscall_slice_vm_object: u64 = 0x29;
+pub const syscall_install_vm_object_mmio_range: u64 = 0x31;
 
 pub const vm_object_token_tag: u64 = 1 << 62;
 pub const exec_image_token_tag: u64 = (1 << 62) | (1 << 61);
 
 pub const VmObjectRights = packed struct(u32) {
     read: bool = false,
+    write: bool = false,
     map: bool = false,
     grant: bool = false,
-    _reserved: u29 = 0,
+    _reserved: u28 = 0,
 };
 
 pub const ExecImageRights = packed struct(u32) {

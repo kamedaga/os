@@ -13,7 +13,6 @@ const protocol = @import("window_protocol.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
 
 const syscall_ok: u64 = 0;
-pub const endpoint_to_boot_display: u64 = 0x11;
 pub const window_cap_magic = protocol.window_cap_magic;
 pub const window_meta_magic = protocol.window_meta_magic;
 pub const window_flag_allow_pixels_dma = protocol.window_flag_allow_pixels_dma;
@@ -236,18 +235,15 @@ pub fn initServiceBindingFromConfigPage() bool {
     return initServiceBindingFromRegistryPage(service_registry_abi.page_va);
 }
 
-// Transitional compatibility path for programs that still rely on the boot display endpoint.
-pub fn initCompatBootDisplayBinding() void {
-    service_binding = .{
-        .endpoint_id = endpoint_to_boot_display,
-    };
-}
-
 pub fn setServiceBinding(endpoint_id: u64) void {
     if (endpoint_id == 0) return;
     service_binding = .{
         .endpoint_id = endpoint_id,
     };
+}
+
+pub fn currentServiceEndpointId() u64 {
+    return service_binding.endpoint_id;
 }
 
 fn windowServiceBinding() WindowServiceBinding {

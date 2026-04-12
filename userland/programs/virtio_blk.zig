@@ -2,7 +2,6 @@ const std = @import("std");
 const cap_transfer_abi = @import("support_root").cap_transfer_abi;
 const block_bootstrap = @import("support_root").block_bootstrap_abi;
 const block_protocol = @import("support_root").block_protocol;
-const device_abi = @import("support_root").device_abi;
 const fs_abi = @import("support_root").fs_abi;
 
 const syscall_alloc_map_pages: u64 = 0xC;
@@ -16,7 +15,6 @@ const syscall_install_endpoint: u64 = 0x26;
 const syscall_signal_endpoint: u64 = 0x2C;
 
 const syscall_ok: u64 = 0;
-const queue_cap_device_blk: u64 = 2;
 const reply_endpoint_id_base: u64 = 0xC0;
 
 const config_page_va: usize = 0x3C00_2000;
@@ -205,34 +203,23 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueSubmit(token: u64, device: u64, queue_index: u64) u64 {
+fn queueSubmit(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_submit),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
+fn queueNotify(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_notify),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn registerIommuDriver(device: device_abi.DeviceId) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (device_abi.syscall_register_iommu_driver),
-          [arg0] "{rdi}" (@intFromEnum(device)),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -436,7 +423,6 @@ fn initVirtio() bool {
         }
     }
 
-    if (registerIommuDriver(.virtio_blk) != syscall_ok) return false;
     if (!initQueueMemory()) return false;
 
     common_base = common_page_va + @as(usize, @intCast(boot_state.common_page_offset));
@@ -486,8 +472,8 @@ fn initVirtio() bool {
     const queue_notify_off = mmioReadU16(common_base + common_queue_notify_off);
     notify_addr = notify_base + @as(usize, queue_notify_off) * @as(usize, @intCast(boot_state.notify_off_multiplier));
     mmioWriteU16(common_base + common_queue_enable, 1);
-    if (queueSubmit(boot_state.queue_submit_token, queue_cap_device_blk, queue_index_request) != syscall_ok) return false;
-    if (queueNotify(boot_state.queue_notify_token, queue_cap_device_blk, queue_index_request) != syscall_ok) return false;
+    if (queueSubmit(boot_state.queue_submit_token, queue_index_request) != syscall_ok) return false;
+    if (queueNotify(boot_state.queue_notify_token, queue_index_request) != syscall_ok) return false;
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     return true;
 }
@@ -749,8 +735,7 @@ fn handleConnectRequest(request_paddr: u64) void {
             request.version != block_protocol.version or
             request.op != block_protocol.opcodeRaw(.connect) or
             request.request_seq == 0 or
-            request.arg0 < 0x1000 or
-            request.arg1 == 0)
+            request.arg0 < 0x1000)
         {
             _ = userLog("VirtioBlk: invalid connect request\n");
             return;

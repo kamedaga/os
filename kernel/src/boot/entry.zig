@@ -95,12 +95,11 @@ fn bootDebugHooks() boot_debug.Hooks {
 fn logQueueCapDeny(
     proc: kernel.PrincipalId,
     token: u64,
-    device: kernel.DmaDeviceId,
     queue_index: u16,
     op: kernel.QueueOperation,
     err: anyerror,
 ) void {
-    boot_debug.logQueueCapDeny(bootDebugHooks(), proc, token, device, queue_index, op, err);
+    boot_debug.logQueueCapDeny(bootDebugHooks(), proc, token, queue_index, op, err);
 }
 
 fn logSchedulerRaceSendCap(
@@ -325,45 +324,6 @@ fn initMemoryModules() void {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Process setup helpers
-// ---------------------------------------------------------------------------
-
-fn setupBootLogConsoleProcess(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    keyboard_cfg: ?init_setup.MouseDriverConfig,
-) struct {
-    process: process_factory.CreatedUserProcess,
-    boot_log_page: kernel.PageCapability,
-    boot_log_stack_page: kernel.PageCapability,
-} {
-    const process = process_factory.createUserProcess(state, principal, "boot_display", &global_free_list, user_spaces);
-    const boot_log_page = process_factory.allocPageForProcessOrHalt(state, principal, "boot log", "page", &global_free_list);
-    const boot_log_stack_page = process_factory.allocPageForProcessOrHalt(state, principal, "boot_display", "stack page", &global_free_list);
-    const keyboard_config_page = process_factory.allocPageForProcessOrHalt(state, principal, "boot_display", "keyboard config page", &global_free_list);
-    process_factory.mapUserLinearRegionOrHalt(principal, boot_abi.process_abi.standard_config_target_va, keyboard_config_page.paddr, 4096, true, "shell keyboard config page map failed");
-
-    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true };
-    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false, .grant = true };
-    var keyboard_submit_token: u64 = 0;
-    var keyboard_notify_token: u64 = 0;
-    if (keyboard_cfg) |cfg| {
-        state.installCap(principal, cfg.common.page_paddr, mmio_rw_rights) catch |err| halt.haltWithError("shell install keyboard common cap failed: ", err);
-        state.installCap(principal, cfg.notify.page_paddr, mmio_rw_rights) catch |err| halt.haltWithError("shell install keyboard notify cap failed: ", err);
-        if (cfg.isr.page_paddr != 0) state.installCap(principal, cfg.isr.page_paddr, mmio_ro_rights) catch |err| halt.haltWithError("shell install keyboard isr cap failed: ", err);
-        if (cfg.device.page_paddr != 0) state.installCap(principal, cfg.device.page_paddr, mmio_ro_rights) catch |err| halt.haltWithError("shell install keyboard device cap failed: ", err);
-        keyboard_submit_token = state.queueCapGrantStage2(principal, .virtio_input, 0, true, false) catch |err| halt.haltWithError("shell keyboard queue submit cap grant failed: ", err);
-        keyboard_notify_token = state.queueCapGrantStage2(principal, .virtio_input, 0, false, true) catch |err| halt.haltWithError("shell keyboard queue notify cap grant failed: ", err);
-    }
-    init_setup.publishShellKeyboardConfigPage(keyboard_config_page.paddr, keyboard_cfg, keyboard_submit_token, keyboard_notify_token);
-    return .{
-        .process = process,
-        .boot_log_page = boot_log_page,
-        .boot_log_stack_page = boot_log_stack_page,
-    };
-}
-
 fn activateThreadOrHalt(thread_index: usize) void {
     if (scheduler.threadContextLooksCorrupted(thread_index)) {
         _ = scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame());
@@ -421,15 +381,13 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
 
 const BootResources = struct {
     framebuffer_info: uefi_services.FramebufferInfo,
-    disk_boot_log_console_elf: []const u8,
     disk_init_elf: []const u8,
     disk_bootfs_image: []const u8,
     memory_stats: boot_static.MemoryStats,
 };
 
 const DetectedDevices = struct {
-    input: [boot_abi.init_bootstrap_abi.max_input_device_descriptors]?init_setup.DetectedInputBootstrap,
-    block: ?init_setup.DetectedBlockBootstrap,
+    devices: [boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
 };
 
 // ---------------------------------------------------------------------------
@@ -444,9 +402,6 @@ fn runBootServicesPhase() BootResources {
     const framebuffer_info = uefi_services.acquireFramebufferInfo(bs) orelse {
         halt.haltWithMessage("GraphicsOutput unavailable or mode unsupported");
     };
-    const disk_boot_log_console_elf = uefi_services.loadBootDiskFile(bs, boot_images.boot_log_console) orelse {
-        halt.haltWithMessage("disk shell ELF load failed");
-    };
     const disk_init_elf = uefi_services.loadBootDiskFile(bs, boot_images.init_app) orelse {
         halt.haltWithMessage("disk init ELF load failed");
     };
@@ -460,7 +415,6 @@ fn runBootServicesPhase() BootResources {
 
     return .{
         .framebuffer_info = framebuffer_info,
-        .disk_boot_log_console_elf = disk_boot_log_console_elf,
         .disk_init_elf = disk_init_elf,
         .disk_bootfs_image = disk_bootfs_image,
         .memory_stats = memory_stats,
@@ -526,11 +480,6 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
     state.debug_alloc_page_hook = null;
     state.pte_sync_hook = null;
 
-    const untyped_bootstrap = untyped_memory.bootstrapUntypedForOwner(state, &global_free_list, .Process0) catch |err| {
-        halt.haltWithError("untyped bootstrap failed: ", err);
-    };
-    _ = untyped_bootstrap;
-
     return state;
 }
 
@@ -540,41 +489,18 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
 
 fn discoverDevices() DetectedDevices {
     var result: DetectedDevices = .{
-        .input = [_]?init_setup.DetectedInputBootstrap{null} ** boot_abi.init_bootstrap_abi.max_input_device_descriptors,
-        .block = null,
+        .devices = [_]?init_setup.DetectedDeviceBootstrap{null} ** boot_abi.init_bootstrap_abi.max_device_descriptors,
     };
 
-    if (virtio_probe.probeMouseModern(noopLog)) |info| {
-        appendDetectedInput(&result.input, .pointer, .{
-            .common = mmioPageWithOffset(info.common_cfg),
-            .notify = mmioPageWithOffset(info.notify_cfg),
-            .isr = mmioPageWithOffset(info.isr_cfg),
-            .device = mmioPageWithOffset(info.device_cfg),
-            .notify_off_multiplier = info.notify_off_multiplier,
+    const probed = virtio_probe.probeModernDevices(noopLog);
+    for (probed, 0..) |entry, index| {
+        const info = entry orelse continue;
+        if (index >= boot_abi.init_bootstrap_abi.max_device_descriptors) break;
+        const dma_device = dmaDeviceForModernDevice(info) orelse continue;
+        appendDetectedDevice(&result.devices, .{
+            .descriptor = descriptorFromModernDevice(info, init_bootstrap_layout.deviceConfigSourceVa(index)),
+            .dma_device = dma_device,
         });
-    }
-    if (virtio_probe.probeKeyboardModern(noopLog)) |info| {
-        appendDetectedInput(&result.input, .keyboard, .{
-            .common = mmioPageWithOffset(info.common_cfg),
-            .notify = mmioPageWithOffset(info.notify_cfg),
-            .isr = mmioPageWithOffset(info.isr_cfg),
-            .device = mmioPageWithOffset(info.device_cfg),
-            .notify_off_multiplier = info.notify_off_multiplier,
-        });
-    }
-    if (virtio_probe.probeBlkModern(noopLog)) |info| {
-        result.block = .{
-            .descriptor = blockDeviceDescriptorForKind(.virtio_blk),
-            .config = .{
-                .common = mmioPageWithOffset(info.common_cfg),
-                .notify = mmioPageWithOffset(info.notify_cfg),
-                .isr = mmioPageWithOffset(info.isr_cfg),
-                .device = mmioPageWithOffset(info.device_cfg),
-                .notify_off_multiplier = info.notify_off_multiplier,
-                .capacity_sectors = info.capacity_sectors,
-                .logical_block_size = info.logical_block_size,
-            },
-        };
     }
 
     return result;
@@ -585,43 +511,26 @@ fn discoverDevices() DetectedDevices {
 // ---------------------------------------------------------------------------
 
 fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
-    const display_principal = state.createProcessDescriptor("boot_display") orelse
-        halt.haltWithMessage("boot_display process descriptor alloc failed");
-
-    const keyboard_cfg = blk: {
-        for (devs.input) |entry| {
-            if (entry) |device| {
-                if (device.descriptor.kind == @intFromEnum(boot_abi.init_bootstrap_abi.InputDeviceKind.keyboard)) {
-                    break :blk device.config;
-                }
-            }
-        }
-        break :blk null;
-    };
-
-    const shell_setup = setupBootLogConsoleProcess(state, display_principal, keyboard_cfg);
-    activateThreadOrHalt(shell_setup.process.thread_slot);
-
     const init_principal = state.createProcessDescriptor("init") orelse
         halt.haltWithMessage("init process descriptor alloc failed");
+    state.setBootstrapOwner(init_principal, true) catch |err| {
+        halt.haltWithError("init bootstrap owner mark failed: ", err);
+    };
     boot_init_principal = init_principal;
+    const untyped_bootstrap = untyped_memory.bootstrapUntypedForOwner(state, &global_free_list, init_principal) catch |err| {
+        halt.haltWithError("untyped bootstrap failed: ", err);
+    };
+    _ = untyped_bootstrap;
     const init_process = process_factory.createUserProcess(state, init_principal, "init", &global_free_list, user_spaces);
     init_setup.setupInitBootstrapResources(
         state,
         init_principal,
-        display_principal,
-        devs.input[0..],
-        &devs.block,
+        devs.devices[0..],
         res.disk_bootfs_image,
         res.framebuffer_info,
         &global_free_list,
     );
     activateThreadOrHalt(init_process.thread_slot);
-
-    const boot_display_untyped_grants = untyped_memory.grantUntypedFromOwnerTo(state, .Process0, display_principal) catch |err| {
-        halt.haltWithError("untyped grant to boot display failed: ", err);
-    };
-    _ = boot_display_untyped_grants;
 
     scheduler.sanitizeAllThreadContextsWithSpaces(user_spaces, process_factory.buildInitialUserTrapFrame());
 
@@ -631,40 +540,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     scheduler.scheduler_race_log_count = 0;
     scheduler.scheduler_probe_log_count = 0;
     boot_debug.logReadyTitle(bootDebugHooks(), "USER_PAGE_READY");
-
-    process_factory.mapUserLinearRegionOrHalt(display_principal, boot_abi.process_abi.auxPageVa(5), res.framebuffer_info.paddr, res.framebuffer_info.size_bytes, true, "framebuffer user mapping failed");
-    boot_debug.logReadyTitle(bootDebugHooks(), "FRAMEBUFFER_SERVER_READY");
-
-    process_factory.mapUserLinearRegionOrHalt(
-        display_principal,
-        boot_static.boot_log_console_stack_page_va,
-        shell_setup.boot_log_stack_page.paddr,
-        4096,
-        true,
-        "shell stack page map failed",
-    );
-    process_factory.mapUserLinearRegionOrHalt(
-        display_principal,
-        boot_static.boot_log_user_va,
-        shell_setup.boot_log_page.paddr,
-        4096,
-        false,
-        "boot log page map failed",
-    );
-
-    const loaded_shell = elf_load.loadUserElfIntoProcessPagesOrHalt(
-        state,
-        display_principal,
-        shell_setup.process.user_page.paddr,
-        shell_setup.process.user_stack_page.paddr,
-        res.disk_boot_log_console_elf,
-        "shell ELF load failed\n",
-        &global_free_list,
-    );
-    const shell_thread = scheduler.threadSlotForPrincipal(display_principal).?;
-    const shell_ctx = scheduler.getThreadContext(shell_thread).?;
-    shell_ctx.frame.rip = loaded_shell.entry;
-    shell_ctx.frame.rsp = boot_static.boot_log_console_entry_rsp;
 
     const loaded_init = elf_load.loadUserElfIntoProcessPagesOrHalt(
         state,
@@ -775,36 +650,57 @@ pub fn kernelMain() void {
 fn noopLog(_: []const u8) void {}
 
 // ---------------------------------------------------------------------------
-// Helper: virtio device descriptor lookup
+// Helper: generic virtio device export
 // ---------------------------------------------------------------------------
 
-fn blockDeviceDescriptorForKind(kind: boot_abi.init_bootstrap_abi.BlockDeviceKind) boot_abi.init_bootstrap_abi.BlockDeviceDescriptor {
-    inline for (init_bootstrap_layout.builtin_block_devices) |descriptor| {
-        if (descriptor.kind == @intFromEnum(kind)) return descriptor;
-    }
-    unreachable;
+fn dmaDeviceForModernDevice(info: virtio_probe.ModernDeviceInfo) ?kernel.DmaDeviceId {
+    if (virtio_probe.isVirtioInputDeviceId(info.device_id, info.subsystem_id)) return .virtio_input;
+    if (virtio_probe.isVirtioGpuDeviceId(info.device_id, info.subsystem_id)) return .virtio_gpu;
+    if (virtio_probe.isVirtioBlkDeviceId(info.device_id, info.subsystem_id)) return .virtio_blk;
+    return null;
 }
 
-fn appendDetectedInput(
-    devices: *[boot_abi.init_bootstrap_abi.max_input_device_descriptors]?init_setup.DetectedInputBootstrap,
-    kind: boot_abi.init_bootstrap_abi.InputDeviceKind,
-    config: init_setup.MouseDriverConfig,
+fn descriptorFromModernDevice(
+    info: virtio_probe.ModernDeviceInfo,
+    bootstrap_source_va: u64,
+) boot_abi.init_bootstrap_abi.DeviceDescriptor {
+    const common = mmioPageWithOffset(info.common_cfg);
+    const notify = mmioPageWithOffset(info.notify_cfg);
+    const isr = mmioPageWithOffset(info.isr_cfg);
+    const device = mmioPageWithOffset(info.device_cfg);
+    return .{
+        .transport = @intFromEnum(boot_abi.init_bootstrap_abi.DeviceTransport.virtio_pci_modern),
+        .flags = 0,
+        .bootstrap_source_va = bootstrap_source_va,
+        .vendor_id = info.vendor_id,
+        .device_id = info.device_id,
+        .subsystem_id = info.subsystem_id,
+        .pci_bus = info.location.bus,
+        .pci_device = info.location.device,
+        .pci_function = info.location.function,
+        .common_page_paddr = common.page_paddr,
+        .notify_page_paddr = notify.page_paddr,
+        .isr_page_paddr = isr.page_paddr,
+        .device_page_paddr = device.page_paddr,
+        .common_page_offset = common.page_offset,
+        .notify_page_offset = notify.page_offset,
+        .isr_page_offset = isr.page_offset,
+        .device_page_offset = device.page_offset,
+        .notify_off_multiplier = info.notify_off_multiplier,
+        .init_queue_submit_token = 0,
+        .init_queue_notify_token = 0,
+    };
+}
+
+fn appendDetectedDevice(
+    devices: *[boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
+    detected: init_setup.DetectedDeviceBootstrap,
 ) void {
     for (devices) |*entry| {
         if (entry.* == null) {
-            entry.* = .{
-                .descriptor = inputDeviceDescriptorForKind(kind),
-                .config = config,
-            };
+            entry.* = detected;
             return;
         }
     }
-    halt.haltWithMessage("init bootstrap input device table full");
-}
-
-fn inputDeviceDescriptorForKind(kind: boot_abi.init_bootstrap_abi.InputDeviceKind) boot_abi.init_bootstrap_abi.InputDeviceDescriptor {
-    inline for (init_bootstrap_layout.builtin_input_devices) |descriptor| {
-        if (descriptor.kind == @intFromEnum(kind)) return descriptor;
-    }
-    unreachable;
+    halt.haltWithMessage("init bootstrap device table full");
 }

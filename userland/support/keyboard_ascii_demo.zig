@@ -184,7 +184,10 @@ fn drawKeyboardHistoryPanel(vfb: [*]volatile u32, history: []const u8) void {
 
 pub export fn _start() noreturn {
     _ = userLog("KeyboardAsciiDemo: started\n");
-    window_client.initCompatBootDisplayBinding();
+    if (!window_client.initServiceBindingFromConfigPage()) {
+        _ = userLog("KeyboardAsciiDemo: window service bind failed\n");
+        while (true) asm volatile ("pause");
+    }
 
     const keyboard_shared: [*]const volatile u64 = @ptrFromInt(keyboard_shared_page_va);
     if (keyboard_shared[0] != keyboard_shared_magic) {

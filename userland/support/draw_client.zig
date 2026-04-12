@@ -2,9 +2,9 @@ const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
 const syscall_log: u64 = 0x9;
+const window_client = @import("window_client.zig");
 
 const syscall_ok: u64 = 0;
-const endpoint_to_boot_display: u64 = 0x11;
 
 const request_page_va: usize = 0x2000_3000;
 const request_header_qwords: usize = 8;
@@ -12,6 +12,7 @@ const request_payload_offset: usize = request_header_qwords * @sizeOf(u64);
 const request_payload_pixels: usize = (4096 - request_payload_offset) / @sizeOf(u32);
 const request_op_fill_rect: u64 = 1;
 const request_op_blit_rect: u64 = 2;
+var window_endpoint_id: u64 = 0;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -52,6 +53,15 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn ensureWindowEndpoint() ?u64 {
+    if (window_endpoint_id != 0) return window_endpoint_id;
+    if (!window_client.initServiceBindingFromConfigPage()) return null;
+    const endpoint_id = window_client.currentServiceEndpointId();
+    if (endpoint_id == 0) return null;
+    window_endpoint_id = endpoint_id;
+    return endpoint_id;
+}
+
 fn sendFillRect(dst_x: u64, dst_y: u64, width: u64, height: u64, color: u64) bool {
     const paddr = allocPage();
     if (paddr < 0x1000) return false;
@@ -67,7 +77,8 @@ fn sendFillRect(dst_x: u64, dst_y: u64, width: u64, height: u64, color: u64) boo
     req[6] = 0;
     req[7] = 0;
 
-    return sendCap(paddr, endpoint_to_boot_display) == syscall_ok;
+    const endpoint_id = ensureWindowEndpoint() orelse return false;
+    return sendCap(paddr, endpoint_id) == syscall_ok;
 }
 
 fn sendBlitRect(dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) bool {
@@ -104,7 +115,8 @@ fn sendBlitRect(dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) bo
         }
     }
 
-    return sendCap(paddr, endpoint_to_boot_display) == syscall_ok;
+    const endpoint_id = ensureWindowEndpoint() orelse return false;
+    return sendCap(paddr, endpoint_id) == syscall_ok;
 }
 
 pub export fn _start() noreturn {

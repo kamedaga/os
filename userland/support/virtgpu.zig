@@ -1,7 +1,6 @@
 const std = @import("std");
 const boot_status_abi = @import("boot_status_abi.zig");
 const boot_status_client = @import("boot_status_client.zig");
-const device_abi = @import("device_abi.zig");
 const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
@@ -12,7 +11,6 @@ const syscall_untyped_alloc_map_pages: u64 = 0x13;
 const syscall_wait_event: u64 = 0x17;
 
 const syscall_ok: u64 = 0;
-const queue_cap_device_gpu: u64 = 0;
 const untyped_alloc_map_writable_flag: u64 = 1 << 0;
 const untyped_alloc_map_drop_cap_after_map_flag: u64 = 1 << 1;
 const untyped_alloc_map_contiguous_flag: u64 = 1 << 2;
@@ -315,8 +313,7 @@ fn queueSubmit(token: u64, queue_index: u64) u64 {
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_submit),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (queue_cap_device_gpu),
-          [arg2] "{rdx}" (queue_index),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -326,17 +323,7 @@ fn queueNotify(token: u64, queue_index: u64) u64 {
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_notify),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (queue_cap_device_gpu),
-          [arg2] "{rdx}" (queue_index),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn registerIommuDriver(device: device_abi.DeviceId) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (device_abi.syscall_register_iommu_driver),
-          [arg0] "{rdi}" (@intFromEnum(device)),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -1064,7 +1051,6 @@ fn initInternal(prewarm: bool) bool {
     _ = _device_off;
     if (notify_off_multiplier == 0) return false;
     if (state.control_submit_token == 0 or state.control_notify_token == 0 or state.cursor_submit_token == 0 or state.cursor_notify_token == 0) return false;
-    if (registerIommuDriver(.virtio_gpu) != syscall_ok) return false;
     // Queue/control backing pages are process-local mappings. Reusing physical
     // addresses recorded by a different process corrupts the virtqueue state.
     if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return false;

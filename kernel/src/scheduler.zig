@@ -78,7 +78,7 @@ pub fn noteUserTimerTick() void {
     }
 }
 
-pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, compositor_hold_quanta: u64) ?usize {
+pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, priority_hold_quanta: u64) ?usize {
     if (quantum_ticks == 0) return null;
 
     scheduler_tick_accum +%= 1;
@@ -94,7 +94,7 @@ pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, compositor_hold_quant
                 runtime_priority_streak = 0;
             } else {
                 const priority_ctx = getThreadContextConst(priority_slot) orelse null;
-                if (priority_ctx != null and priority_ctx.?.allocated and priority_ctx.?.ready and runtime_priority_streak + 1 < compositor_hold_quanta) {
+                if (priority_ctx != null and priority_ctx.?.allocated and priority_ctx.?.ready and runtime_priority_streak + 1 < priority_hold_quanta) {
                     runtime_priority_streak +%= 1;
                     return null;
                 }

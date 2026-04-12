@@ -1,9 +1,11 @@
+/// Bootstrap shell displayed on the primary framebuffer until the windowed UI takes over.
 const std = @import("std");
 const block_client = @import("support_root").block_client;
-const device_abi = @import("support_root").device_abi;
 const fs_abi = @import("support_root").fs_abi;
 const fs_client = @import("support_root").fs_client;
+const fs_protocol = @import("support_root").fs_protocol;
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
+const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
 const process_abi = @import("support_root").process_abi;
 const service_registry_abi = @import("support_root").service_registry_abi;
 
@@ -12,12 +14,16 @@ const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
+const syscall_map_pages_batch: u64 = 0x15;
 const syscall_wait_event: u64 = 0x17;
 const syscall_get_process_slot: u64 = 0x2E;
+const syscall_map_vm_object: u64 = 0x28;
+const config_framebuffer_paddr_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_paddr_index);
+const config_framebuffer_size_bytes_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_size_bytes_index);
+const config_framebuffer_vm_token_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_vm_token_index);
+const syscall_batch_max_pages: usize = 64;
 
 const syscall_ok: u64 = 0;
-const queue_cap_device_input: u64 = 1;
-
 const framebuffer_va: usize = 0x3C00_5000;
 const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
 const runtime_page_base_va: usize = 0x2100_0000;
@@ -28,7 +34,7 @@ const queue_page0_va: usize = runtime_page_base_va + 0x8000;
 const queue_page1_va: usize = runtime_page_base_va + 0x9000;
 
 const fb_width: usize = 832;
-const fb_height: usize = 624;
+const fb_height: usize = @intCast(init_bootstrap_abi.boot_display_shell_height);
 const fb_pitch: usize = 832;
 const glyph_w: usize = 5;
 const glyph_h: usize = 7;
@@ -79,11 +85,14 @@ const queue_buffers_offset: usize = 4176;
 const desc_flag_write: u16 = 1 << 1;
 const shell_idle_poll_ticks: u64 = 4;
 const service_registry_page_va: u64 = process_abi.service_registry_shadow_va;
+const shell_stack_extension_pages: u64 = 8;
+const shell_stack_extension_base_va: u64 = process_abi.aux_base_va - ((shell_stack_extension_pages + 1) * 4096);
 const block_request_va: u64 = 0x3C10_4000;
 const block_response_va: u64 = 0x3C10_5000;
 const persistent_fs_request_va: u64 = 0x3C10_6000;
 const persistent_fs_response_va: u64 = 0x3C10_7000;
 const block_demo_magic: u64 = 0x424C_4B44_454D_4F31;
+const shell_cat_display_limit_bytes: usize = 2048;
 const pie_user_rootfs_name = "pie_user.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 
@@ -134,13 +143,15 @@ const ShellState = struct {
     splash_line_count: usize = 0,
     rendered_rows: usize = 0,
     frame_initialized: bool = false,
-    cmd: [64]u8 = undefined,
+    cmd: [128]u8 = undefined,
     cmd_len: usize = 0,
     keyboard_ready: bool = false,
     block_client_ready: bool = false,
     block_client_state: block_client.Client = undefined,
     persistent_fs_client_ready: bool = false,
     persistent_fs_client_state: fs_client.Client = undefined,
+    cwd_path_buf: [fs_protocol.max_path_bytes]u8 = [_]u8{0} ** fs_protocol.max_path_bytes,
+    cwd_path_len: usize = 0,
 
     fn clearBody(self: *ShellState) void {
         var r: usize = 0;
@@ -223,6 +234,28 @@ fn spawnExec(exec_token: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn mapPagesBatch(base_va: u64, paddr_list_va: u64, page_count: u64, writable: bool) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_map_pages_batch),
+          [arg0] "{rdi}" (base_va),
+          [arg1] "{rsi}" (paddr_list_va),
+          [arg2] "{rdx}" (page_count),
+          [arg3] "{rcx}" (@as(u64, if (writable) 1 else 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn mapVmObject(token: u64, target_va: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_map_vm_object),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (target_va),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
     return asm volatile (
         \\int $0x80
@@ -246,34 +279,23 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_v
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueSubmit(token: u64, device: u64, queue_index: u64) u64 {
+fn queueSubmit(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_submit),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
+fn queueNotify(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_notify),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn registerIommuDriver(device: device_abi.DeviceId) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (device_abi.syscall_register_iommu_driver),
-          [arg0] "{rdi}" (@intFromEnum(device)),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -498,6 +520,155 @@ fn eqAsciiNoCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+const CommandSplit = struct {
+    head: []const u8,
+    tail: []const u8,
+};
+
+fn splitCommand(text: []const u8) CommandSplit {
+    const trimmed = trimSpaces(text);
+    if (trimmed.len == 0) {
+        return .{ .head = "", .tail = "" };
+    }
+    var end: usize = 0;
+    while (end < trimmed.len and trimmed[end] != ' ' and trimmed[end] != '\t') : (end += 1) {}
+    return .{
+        .head = trimmed[0..end],
+        .tail = trimSpaces(trimmed[end..]),
+    };
+}
+
+fn writeWrappedText(st: *ShellState, text: []const u8) void {
+    if (text.len == 0) {
+        st.writeLine("");
+        return;
+    }
+    var remaining = text;
+    while (remaining.len != 0) {
+        const newline_index = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+        var line = remaining[0..newline_index];
+        if (line.len == 0) {
+            st.writeLine("");
+        } else {
+            while (line.len > cols) {
+                st.writeLine(line[0..cols]);
+                line = line[cols..];
+            }
+            if (line.len != 0) st.writeLine(line);
+        }
+        if (newline_index == remaining.len) break;
+        remaining = remaining[newline_index + 1 ..];
+        if (remaining.len == 0) st.writeLine("");
+    }
+}
+
+fn rootfsUnavailableReason() []const u8 {
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
+        return "rootfs unavailable: persistent fs not ready";
+    }
+    return "rootfs unavailable";
+}
+
+fn currentRootfsPath(st: *const ShellState) []const u8 {
+    return st.cwd_path_buf[0..st.cwd_path_len];
+}
+
+fn resetRootfsPath(st: *ShellState) void {
+    @memset(st.cwd_path_buf[0..], 0);
+    st.cwd_path_buf[0] = '/';
+    st.cwd_path_len = 1;
+}
+
+fn setRootfsPath(st: *ShellState, path: []const u8) void {
+    @memset(st.cwd_path_buf[0..], 0);
+    if (path.len != 0) @memcpy(st.cwd_path_buf[0..path.len], path);
+    st.cwd_path_len = path.len;
+}
+
+fn copyCurrentRootfsPath(st: *const ShellState, out: *[fs_protocol.max_path_bytes]u8) []const u8 {
+    @memset(out[0..], 0);
+    if (st.cwd_path_len != 0) @memcpy(out[0..st.cwd_path_len], st.cwd_path_buf[0..st.cwd_path_len]);
+    return out[0..st.cwd_path_len];
+}
+
+fn popNormalizedRootfsPath(path: []u8, len: *usize) void {
+    if (len.* <= 1) {
+        path[0] = '/';
+        len.* = 1;
+        return;
+    }
+    var idx = len.* - 1;
+    while (idx > 0 and path[idx] != '/') : (idx -= 1) {}
+    len.* = if (idx == 0) 1 else idx;
+}
+
+fn normalizeRootfsPath(st: *const ShellState, raw: []const u8, out: *[fs_protocol.max_path_bytes]u8) ?[]const u8 {
+    const trimmed = trimSpaces(raw);
+    if (trimmed.len == 0) return null;
+
+    @memset(out[0..], 0);
+    var out_len: usize = 0;
+    if (trimmed[0] == '/') {
+        out[0] = '/';
+        out_len = 1;
+    } else {
+        if (st.cwd_path_len == 0) return null;
+        @memcpy(out[0..st.cwd_path_len], st.cwd_path_buf[0..st.cwd_path_len]);
+        out_len = st.cwd_path_len;
+    }
+
+    var pos: usize = 0;
+    while (pos < trimmed.len) {
+        while (pos < trimmed.len and trimmed[pos] == '/') : (pos += 1) {}
+        if (pos >= trimmed.len) break;
+
+        const start = pos;
+        while (pos < trimmed.len and trimmed[pos] != '/') : (pos += 1) {}
+        const component = trimmed[start..pos];
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            popNormalizedRootfsPath(out[0..], &out_len);
+            continue;
+        }
+        if (out_len > 1) {
+            if (out_len >= out.len) return null;
+            out[out_len] = '/';
+            out_len += 1;
+        }
+        if (out_len + component.len > out.len) return null;
+        @memcpy(out[out_len .. out_len + component.len], component);
+        out_len += component.len;
+    }
+
+    if (out_len == 0) {
+        out[0] = '/';
+        out_len = 1;
+    }
+    return out[0..out_len];
+}
+
+fn requireRootfsPath(st: *ShellState, raw: []const u8, out: *[fs_protocol.max_path_bytes]u8) ?[]const u8 {
+    if (trimSpaces(raw).len == 0) {
+        st.writeLine("path required");
+        shellLogLine("path required");
+        return null;
+    }
+    return normalizeRootfsPath(st, raw, out) orelse {
+        st.writeLine("path too long");
+        shellLogLine("path too long");
+        return null;
+    };
+}
+
+fn resolveRootfsPathOrCwd(st: *ShellState, raw: []const u8, out: *[fs_protocol.max_path_bytes]u8) ?[]const u8 {
+    if (trimSpaces(raw).len == 0) return copyCurrentRootfsPath(st, out);
+    return normalizeRootfsPath(st, raw, out) orelse {
+        st.writeLine("path too long");
+        shellLogLine("path too long");
+        return null;
+    };
+}
+
 fn keycodeToAscii(code: u16, shift: bool) ?u8 {
     return switch (code) {
         0x02 => if (shift) '!' else '1',
@@ -561,7 +732,16 @@ fn renderHeader(vfb: [*]volatile u32, st: *const ShellState) void {
     clearRow(vfb, 0, panel_color);
     fillRect(vfb, 0, 0, fb_width, 2, border_color);
     fillRect(vfb, 0, cell_h, fb_width, 1, border_color);
-    drawLine(vfb, 0, if (st.keyboard_ready) "shell  help clear block" else "shell  keyboard offline", if (st.keyboard_ready) title_color else warn_color);
+    var header_buf: [cols]u8 = [_]u8{' '} ** cols;
+    var idx: usize = 0;
+    appendText(header_buf[0..], &idx, "shell ");
+    appendText(header_buf[0..], &idx, currentRootfsPath(st));
+    appendText(
+        header_buf[0..],
+        &idx,
+        if (st.keyboard_ready) "  help ls cd mkdir" else "  keyboard offline",
+    );
+    drawLine(vfb, 0, header_buf[0..idx], if (st.keyboard_ready) title_color else warn_color);
 }
 
 fn renderBody(vfb: [*]volatile u32, st: *ShellState) void {
@@ -702,6 +882,274 @@ fn ensurePersistentFsClient(st: *ShellState) ?*fs_client.Client {
     return &st.persistent_fs_client_state;
 }
 
+fn reportPersistentFsError(st: *ShellState, message: []const u8, err: anyerror, reset_client: bool) void {
+    st.writeLine(message);
+    shellLogLine(message);
+    _ = userLog(@errorName(err));
+    _ = userLog("\n");
+    if (reset_client) st.persistent_fs_client_ready = false;
+}
+
+fn lookupPersistentFsRoot(st: *ShellState, client: *fs_client.Client) ?fs_client.LookupResult {
+    const root = client.lookup(client.mount_token, ".") catch |err| {
+        reportPersistentFsError(st, "fs root lookup failed", err, true);
+        return null;
+    };
+    if (root.object_kind != .vnode_dir or !fs_abi.isCapToken(root.token)) {
+        st.writeLine("fs root invalid");
+        shellLogLine("fs root invalid");
+        st.persistent_fs_client_ready = false;
+        return null;
+    }
+    return root;
+}
+
+fn runPersistentFsList(st: *ShellState, path: []const u8) bool {
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
+        st.writeLine(rootfsUnavailableReason());
+        shellLogLine(rootfsUnavailableReason());
+        return false;
+    }
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    const target = client.lookup(root.token, path) catch |err| {
+        reportPersistentFsError(st, "ls lookup failed", err, false);
+        return false;
+    };
+    defer client.close(target.token) catch {};
+    if (target.object_kind != .vnode_dir) {
+        st.writeLine(path);
+        return true;
+    }
+    var cursor: u64 = 0;
+    var name_buf: [48]u8 = undefined;
+    var count: usize = 0;
+    while (true) {
+        const entry = client.readdirOne(target.token, cursor, name_buf[0..]) catch |err| {
+            reportPersistentFsError(st, "ls failed", err, true);
+            return false;
+        };
+        switch (entry) {
+            .end => break,
+            .entry => |dirent| {
+                if (dirent.object_kind == .vnode_dir) {
+                    var line_buf: [64]u8 = undefined;
+                    const line = std.fmt.bufPrint(&line_buf, "{s}/", .{dirent.name}) catch {
+                        st.writeLine(dirent.name);
+                        cursor = dirent.next_cursor;
+                        count += 1;
+                        continue;
+                    };
+                    st.writeLine(line);
+                } else {
+                    st.writeLine(dirent.name);
+                }
+                cursor = dirent.next_cursor;
+                count += 1;
+            },
+        }
+    }
+    if (count == 0) st.writeLine("directory empty");
+    return true;
+}
+
+fn runPersistentFsStat(st: *ShellState, path: []const u8) bool {
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    const file = client.lookup(root.token, path) catch |err| {
+        reportPersistentFsError(st, "stat lookup failed", err, false);
+        return false;
+    };
+    defer client.close(file.token) catch {};
+    const stat = client.stat(file.token) catch |err| {
+        reportPersistentFsError(st, "stat failed", err, true);
+        return false;
+    };
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &line_buf,
+        "{s} type={s} size={d}",
+        .{
+            path,
+            switch (stat.object_kind) {
+                .mount => "mount",
+                .vnode_dir => "dir",
+                .vnode_file => "file",
+                .open_file => "open",
+                .exec => "exec",
+                else => "unknown",
+            },
+            stat.size_bytes,
+        },
+    ) catch return false;
+    st.writeLine(line);
+    return true;
+}
+
+fn runPersistentFsCat(st: *ShellState, path: []const u8) bool {
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    const file = client.lookup(root.token, path) catch |err| {
+        reportPersistentFsError(st, "cat lookup failed", err, false);
+        return false;
+    };
+    defer client.close(file.token) catch {};
+    const open_file = client.open(file.token) catch |err| {
+        reportPersistentFsError(st, "cat open failed", err, true);
+        return false;
+    };
+    defer client.close(open_file.token) catch {};
+
+    if (file.file_bytes == 0) {
+        st.writeLine("empty file");
+        return true;
+    }
+
+    var read_buf: [256]u8 = undefined;
+    var print_buf: [256]u8 = undefined;
+    var offset: u64 = 0;
+    var displayed: usize = 0;
+    while (displayed < shell_cat_display_limit_bytes) {
+        const max_chunk = @min(read_buf.len, shell_cat_display_limit_bytes - displayed);
+        const read_result = client.read(open_file.token, offset, read_buf[0..max_chunk]) catch |err| {
+            reportPersistentFsError(st, "cat read failed", err, true);
+            return false;
+        };
+        if (read_result.bytes_read == 0) break;
+        var out_len: usize = 0;
+        for (read_buf[0..read_result.bytes_read]) |byte| {
+            if (byte == '\r') continue;
+            print_buf[out_len] = switch (byte) {
+                '\n' => '\n',
+                '\t' => ' ',
+                0x20...0x7E => byte,
+                else => '.',
+            };
+            out_len += 1;
+        }
+        if (out_len != 0) writeWrappedText(st, print_buf[0..out_len]);
+        displayed += read_result.bytes_read;
+        offset = read_result.next_offset;
+        if (offset >= read_result.file_bytes) break;
+    }
+    if (file.file_bytes > shell_cat_display_limit_bytes) st.writeLine("cat truncated");
+    return true;
+}
+
+fn runPersistentFsTouch(st: *ShellState, path: []const u8) bool {
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    const existing = client.lookup(root.token, path) catch |err| switch (err) {
+        error.NotFound => {
+            const file = client.create(root.token, path) catch |create_err| {
+                reportPersistentFsError(st, "touch create failed", create_err, true);
+                return false;
+            };
+            defer client.close(file.token) catch {};
+            var line_buf: [80]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "created {s}", .{path}) catch return false;
+            st.writeLine(line);
+            return true;
+        },
+        else => {
+            reportPersistentFsError(st, "touch lookup failed", err, false);
+            return false;
+        },
+    };
+    defer client.close(existing.token) catch {};
+    if (existing.object_kind == .vnode_dir) {
+        st.writeLine("touch target is a directory");
+        shellLogLine("touch target is a directory");
+        return false;
+    }
+    var line_buf: [80]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{s} already exists", .{path}) catch return false;
+    st.writeLine(line);
+    return true;
+}
+
+fn runPersistentFsWrite(st: *ShellState, path: []const u8, text: []const u8) bool {
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    if (!removePersistentFsFileIfPresent(st, client, root.token, path)) return false;
+    const file = client.create(root.token, path) catch |err| {
+        reportPersistentFsError(st, "write create failed", err, true);
+        return false;
+    };
+    defer client.close(file.token) catch {};
+    const open_file = client.open(file.token) catch |err| {
+        reportPersistentFsError(st, "write open failed", err, true);
+        return false;
+    };
+    defer client.close(open_file.token) catch {};
+
+    if (text.len != 0) {
+        _ = client.write(open_file.token, 0, text) catch |err| {
+            reportPersistentFsError(st, "write failed", err, true);
+            return false;
+        };
+    }
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "wrote {d} bytes to {s}", .{ text.len, path }) catch return false;
+    st.writeLine(line);
+    return true;
+}
+
+fn runPersistentFsRename(st: *ShellState, old_path: []const u8, new_path: []const u8) bool {
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    client.rename(root.token, old_path, new_path) catch |err| {
+        reportPersistentFsError(st, "rename failed", err, true);
+        return false;
+    };
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "renamed {s} to {s}", .{ old_path, new_path }) catch return false;
+    st.writeLine(line);
+    return true;
+}
+
+fn runPersistentFsUnlink(st: *ShellState, path: []const u8) bool {
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    client.unlink(root.token, path) catch |err| {
+        reportPersistentFsError(st, "rm failed", err, false);
+        return false;
+    };
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "removed {s}", .{path}) catch return false;
+    st.writeLine(line);
+    return true;
+}
+
+fn runPersistentFsExecFile(st: *ShellState, path: []const u8) bool {
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
+        st.writeLine(rootfsUnavailableReason());
+        shellLogLine(rootfsUnavailableReason());
+        return false;
+    }
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    const file = client.lookup(root.token, path) catch |err| {
+        reportPersistentFsError(st, "exec lookup failed", err, false);
+        return false;
+    };
+    defer client.close(file.token) catch {};
+    const exec = client.openExec(file.token) catch |err| {
+        reportPersistentFsError(st, "open_exec failed", err, true);
+        return false;
+    };
+    const spawned = spawnExec(exec.token);
+    const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+        st.writeLine("spawn failed");
+        shellLogLine("spawn failed");
+        return false;
+    };
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "spawned {s} slot={d}", .{ path, child_slot }) catch return false;
+    st.writeLine(line);
+    return true;
+}
+
 fn removePersistentFsFileIfPresent(st: *ShellState, client: *fs_client.Client, root_token: u64, path: []const u8) bool {
     const file = client.lookup(root_token, path) catch |err| switch (err) {
         error.NotFound => return true,
@@ -714,6 +1162,12 @@ fn removePersistentFsFileIfPresent(st: *ShellState, client: *fs_client.Client, r
             return false;
         },
     };
+    if (file.object_kind == .vnode_dir) {
+        client.close(file.token) catch {};
+        st.writeLine("write target is a directory");
+        shellLogLine("write target is a directory");
+        return false;
+    }
     client.close(file.token) catch {};
     client.unlink(root_token, path) catch |err| {
         st.writeLine("fs cleanup unlink failed");
@@ -723,6 +1177,65 @@ fn removePersistentFsFileIfPresent(st: *ShellState, client: *fs_client.Client, r
         st.persistent_fs_client_ready = false;
         return false;
     };
+    return true;
+}
+
+fn runPersistentFsMkdir(st: *ShellState, path: []const u8) bool {
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    const existing = client.lookup(root.token, path) catch |err| switch (err) {
+        error.NotFound => {
+            const dir = client.createDir(root.token, path) catch |create_err| {
+                reportPersistentFsError(st, "mkdir failed", create_err, true);
+                return false;
+            };
+            defer client.close(dir.token) catch {};
+            var line_buf: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "created dir {s}", .{path}) catch return false;
+            st.writeLine(line);
+            return true;
+        },
+        else => {
+            reportPersistentFsError(st, "mkdir lookup failed", err, false);
+            return false;
+        },
+    };
+    defer client.close(existing.token) catch {};
+    if (existing.object_kind != .vnode_dir) {
+        st.writeLine("mkdir target already exists as file");
+        shellLogLine("mkdir target already exists as file");
+        return false;
+    }
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{s} already exists", .{path}) catch return false;
+    st.writeLine(line);
+    return true;
+}
+
+fn runPersistentFsCd(st: *ShellState, path: []const u8) bool {
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
+        st.writeLine(rootfsUnavailableReason());
+        shellLogLine(rootfsUnavailableReason());
+        return false;
+    }
+    const client = ensurePersistentFsClient(st) orelse return false;
+    const root = lookupPersistentFsRoot(st, client) orelse return false;
+    const dir = client.lookup(root.token, path) catch |err| {
+        reportPersistentFsError(st, "cd lookup failed", err, false);
+        return false;
+    };
+    defer client.close(dir.token) catch {};
+    if (dir.object_kind != .vnode_dir) {
+        st.writeLine("cd target is not a directory");
+        shellLogLine("cd target is not a directory");
+        return false;
+    }
+    setRootfsPath(st, path);
+    return true;
+}
+
+fn runPersistentFsPwd(st: *ShellState) bool {
+    st.writeLine(currentRootfsPath(st));
     return true;
 }
 
@@ -1064,66 +1577,103 @@ fn runPersistentFsDemo(st: *ShellState) bool {
 }
 
 fn runPersistentFsPieUser(st: *ShellState) bool {
-    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
-        st.writeLine("persistent fs unavailable");
-        shellLogLine("persistent fs unavailable");
-        st.persistent_fs_client_ready = false;
-        return false;
-    }
     shellLogLine("pie_user start");
-    const client = ensurePersistentFsClient(st) orelse return false;
-    const root = client.lookup(client.mount_token, ".") catch |err| {
-        st.writeLine("pie root lookup failed");
-        shellLogLine("pie root lookup failed");
-        _ = userLog(@errorName(err));
-        _ = userLog("\n");
-        st.persistent_fs_client_ready = false;
-        return false;
-    };
-    const file = client.lookup(root.token, pie_user_rootfs_name) catch |err| {
-        st.writeLine("pie_user.elf missing");
-        shellLogLine("pie_user.elf missing");
-        _ = userLog(@errorName(err));
-        _ = userLog("\n");
-        st.persistent_fs_client_ready = false;
-        return false;
-    };
-    const exec = client.openExec(file.token) catch |err| {
-        st.writeLine("pie open_exec failed");
-        shellLogLine("pie open_exec failed");
-        _ = userLog(@errorName(err));
-        _ = userLog("\n");
-        st.persistent_fs_client_ready = false;
-        return false;
-    };
-    const spawned = spawnExec(exec.token);
-    const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
-        st.writeLine("pie spawn failed");
-        shellLogLine("pie spawn failed");
-        return false;
-    };
-    var line_buf: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "pie_user spawned slot={d}", .{child_slot}) catch return false;
-    st.writeLine(line);
-    shellLogLine("pie_user done");
-    return true;
+    const ok = runPersistentFsExecFile(st, pie_user_rootfs_name);
+    if (ok) shellLogLine("pie_user done");
+    return ok;
 }
 
 fn executeCommand(st: *ShellState) RenderAction {
     const cmd = trimSpaces(st.cmd[0..st.cmd_len]);
     if (cmd.len == 0) return .prompt;
+    const parsed = splitCommand(cmd);
 
-    if (eqAsciiNoCase(cmd, "help")) {
-        st.writeLine("commands: help clear block_demo fs_demo pie_user");
-        st.writeLine("clear resets screen");
+    if (eqAsciiNoCase(parsed.head, "help")) {
+        st.writeLine("commands: help clear pwd cd mkdir ls stat");
+        st.writeLine("cat exec touch write rm mv block_demo");
+        st.writeLine("fs_demo pie_user  exec <path>  write <path> <text>");
         return .full;
     }
-    if (eqAsciiNoCase(cmd, "clear")) {
+    if (eqAsciiNoCase(parsed.head, "clear")) {
         st.clearBody();
         st.writeLine("screen cleared");
         return .full;
     }
-    if (eqAsciiNoCase(cmd, "block") or eqAsciiNoCase(cmd, "block_demo")) {
+    if (eqAsciiNoCase(parsed.head, "pwd")) {
+        _ = runPersistentFsPwd(st);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "cd")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const target_path = if (trimSpaces(parsed.tail).len == 0)
+            blk: {
+                path_buf[0] = '/';
+                break :blk path_buf[0..1];
+            }
+        else
+            requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsCd(st, target_path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "mkdir")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsMkdir(st, path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "ls")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = resolveRootfsPathOrCwd(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsList(st, path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "stat")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsStat(st, path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "cat")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsCat(st, path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "touch")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsTouch(st, path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "write")) {
+        const args = splitCommand(parsed.tail);
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = requireRootfsPath(st, args.head, &path_buf) orelse return .full;
+        _ = runPersistentFsWrite(st, path, args.tail);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "rm")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsUnlink(st, path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "mv")) {
+        const args = splitCommand(parsed.tail);
+        var old_path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        var new_path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const old_path = requireRootfsPath(st, args.head, &old_path_buf) orelse return .full;
+        const new_path = requireRootfsPath(st, args.tail, &new_path_buf) orelse return .full;
+        _ = runPersistentFsRename(st, old_path, new_path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "exec") or eqAsciiNoCase(parsed.head, "run")) {
+        var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+        const path = requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        _ = runPersistentFsExecFile(st, path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "block") or eqAsciiNoCase(parsed.head, "block_demo")) {
         if (service_registry_abi.findService(service_registry_page_va, .block) == null) {
             st.writeLine(blockLaunchUnavailableReason());
             shellLogLine(blockLaunchUnavailableReason());
@@ -1136,7 +1686,7 @@ fn executeCommand(st: *ShellState) RenderAction {
         }
         return .full;
     }
-    if (eqAsciiNoCase(cmd, "fs") or eqAsciiNoCase(cmd, "fs_demo")) {
+    if (eqAsciiNoCase(parsed.head, "fs") or eqAsciiNoCase(parsed.head, "fs_demo")) {
         if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
             st.writeLine(persistentFsUnavailableReason());
             shellLogLine(persistentFsUnavailableReason());
@@ -1149,7 +1699,7 @@ fn executeCommand(st: *ShellState) RenderAction {
         }
         return .full;
     }
-    if (eqAsciiNoCase(cmd, "pie") or eqAsciiNoCase(cmd, "pie_user")) {
+    if (eqAsciiNoCase(parsed.head, "pie") or eqAsciiNoCase(parsed.head, "pie_user")) {
         if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
             st.writeLine(persistentFsUnavailableReason());
             shellLogLine(persistentFsUnavailableReason());
@@ -1184,10 +1734,17 @@ fn initKeyboard() ?KeyboardState {
     var queue_notify_token = readCfgU64(14);
 
     if (common_page_paddr < 0x1000 or notify_page_paddr < 0x1000) return null;
-    if (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) return null;
-    if (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) return null;
-    if (isr_page_paddr != 0 and mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) return null;
-    if (registerIommuDriver(.virtio_input) != syscall_ok) return null;
+    while (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
+        _ = waitEvent(false, 1);
+    }
+    while (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
+        _ = waitEvent(false, 1);
+    }
+    if (isr_page_paddr != 0) {
+        while (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) {
+            _ = waitEvent(false, 1);
+        }
+    }
 
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
         var queue_paddrs: [2]u64 = .{ 0, 0 };
@@ -1242,8 +1799,8 @@ fn initKeyboard() ?KeyboardState {
         queuePushAvail(d);
     }
 
-    if (queueSubmit(queue_submit_token, queue_cap_device_input, queue_index_event) != syscall_ok) return null;
-    if (queueNotify(queue_notify_token, queue_cap_device_input, queue_index_event) != syscall_ok) return null;
+    if (queueSubmit(queue_submit_token, queue_index_event) != syscall_ok) return null;
+    if (queueNotify(queue_notify_token, queue_index_event) != syscall_ok) return null;
     mmioWriteU16(notify_addr, queue_index_event);
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     return .{ .notify_addr = notify_addr, .isr_base = isr_base };
@@ -1328,7 +1885,48 @@ fn pumpKeyboard(keyboard: *KeyboardState, st: *ShellState) RenderAction {
 }
 
 pub export fn _start() noreturn {
+    if (allocMapPages(shell_stack_extension_base_va, shell_stack_extension_pages, true, 0) != syscall_ok) {
+        _ = userLog("Shell: stack extend failed\n");
+        while (true) {
+            _ = waitEvent(false, 1);
+        }
+    }
     var shell = ShellState{};
+    resetRootfsPath(&shell);
+    const fb_vm_token = readCfgU64(config_framebuffer_vm_token_index);
+    if (fb_vm_token != 0) {
+        if (mapVmObject(fb_vm_token, framebuffer_va) != syscall_ok) {
+            _ = userLog("Shell: framebuffer map failed\n");
+            while (true) {
+                _ = waitEvent(false, 1);
+            }
+        }
+    } else {
+    // Map framebuffer MMIO pages granted by init in batches.
+        const fb_paddr = readCfgU64(config_framebuffer_paddr_index);
+        const fb_size = readCfgU64(config_framebuffer_size_bytes_index);
+        if (fb_paddr == 0 or fb_size == 0) {
+            _ = userLog("Shell: framebuffer config missing\n");
+            while (true) {
+                _ = waitEvent(false, 1);
+            }
+        }
+        const fb_page_count: usize = @intCast((fb_size + 4095) / 4096);
+        var fb_paddrs: [syscall_batch_max_pages]u64 = undefined;
+        var fb_page_base: usize = 0;
+        while (fb_page_base < fb_page_count) : (fb_page_base += syscall_batch_max_pages) {
+            const batch_count = @min(fb_page_count - fb_page_base, syscall_batch_max_pages);
+            var batch_i: usize = 0;
+            while (batch_i < batch_count) : (batch_i += 1) {
+                fb_paddrs[batch_i] = fb_paddr + (@as(u64, @intCast(fb_page_base + batch_i)) * 4096);
+            }
+            const target_va = framebuffer_va + fb_page_base * 4096;
+            while (mapPagesBatch(target_va, @intFromPtr(&fb_paddrs), batch_count, true) != syscall_ok) {
+                _ = waitEvent(false, 1);
+            }
+        }
+    }
+
     const vfb: [*]volatile u32 = @ptrFromInt(framebuffer_va);
 
     _ = userLog("Shell: started\n");

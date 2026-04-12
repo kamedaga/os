@@ -76,28 +76,28 @@ pub fn build(b: *std.Build) void {
     const init_step = b.step("init-elf", "Build init PIE ELF");
     init_step.dependOn(&install_init.step);
 
-    const boot_log_console_mod = b.createModule(.{
-        .root_source_file = b.path("../bootstrap/programs/boot_log_console.zig"),
+    const shell_mod = b.createModule(.{
+        .root_source_file = b.path("../bootstrap/programs/shell.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
-    boot_log_console_mod.addImport("support_root", support_root_mod);
-    boot_log_console_mod.strip = true;
-    const boot_log_console_app = b.addExecutable(.{
+    shell_mod.addImport("support_root", support_root_mod);
+    shell_mod.strip = true;
+    const shell_app = b.addExecutable(.{
         .name = "SHELL",
-        .root_module = boot_log_console_mod,
+        .root_module = shell_mod,
     });
-    boot_log_console_app.pie = true;
-    boot_log_console_app.entry = .{ .symbol_name = "_start" };
-    boot_log_console_app.link_z_common_page_size = 0x10;
-    boot_log_console_app.link_z_max_page_size = 0x10;
-    const install_boot_log_console = b.addInstallArtifact(boot_log_console_app, .{
+    shell_app.pie = true;
+    shell_app.entry = .{ .symbol_name = "_start" };
+    shell_app.link_z_common_page_size = 0x10;
+    shell_app.link_z_max_page_size = 0x10;
+    const install_shell = b.addInstallArtifact(shell_app, .{
         .dest_sub_path = "EFI/BOOT/SHELL.ELF",
     });
-    const boot_log_console_step = b.step("shell-elf", "Build shell PIE ELF");
-    boot_log_console_step.dependOn(&install_boot_log_console.step);
+    const shell_step = b.step("shell-elf", "Build shell PIE ELF");
+    shell_step.dependOn(&install_shell.step);
 
     const mouse_driver_mod = b.createModule(.{
         .root_source_file = b.path("../userland/programs/mouse_driver.zig"),
@@ -496,6 +496,8 @@ pub fn build(b: *std.Build) void {
     bootfs_builder_run.addFileArg(b.path("../bootstrap/bootfs/startup_manifest.txt"));
     bootfs_builder_run.addArg("/bin/bootstrap_fs.elf");
     bootfs_builder_run.addFileArg(bootstrap_fs_app.getEmittedBin());
+    bootfs_builder_run.addArg("/bin/shell.elf");
+    bootfs_builder_run.addFileArg(shell_app.getEmittedBin());
     const install_bootfs_image = b.addInstallBinFile(bootfs_image_out, "EFI/BOOT/BOOTFS.IMG");
     const bootfs_step = b.step("bootfs-img", "Build bootfs image");
     bootfs_step.dependOn(&install_bootfs_image.step);
@@ -578,7 +580,7 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = "EFI/BOOT/BOOTX64.EFI",
     });
     install_efi.step.dependOn(&install_init.step);
-    install_efi.step.dependOn(&install_boot_log_console.step);
+    install_efi.step.dependOn(&install_shell.step);
     install_efi.step.dependOn(&install_bootstrap_fs.step);
     install_efi.step.dependOn(&install_virtio_blk.step);
     install_efi.step.dependOn(&install_persistent_fs.step);

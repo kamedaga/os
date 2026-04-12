@@ -1,7 +1,5 @@
 const std = @import("std");
 const pci = @import("pci.zig");
-const user_copy = @import("user_copy.zig");
-
 const pci_status_cap_list: u16 = 1 << 4;
 const pci_cap_id_vendor: u8 = 0x09;
 
@@ -18,30 +16,9 @@ const virtio_pci_cap_notify_cfg: u8 = 2;
 const virtio_pci_cap_isr_cfg: u8 = 3;
 const virtio_pci_cap_device_cfg: u8 = 4;
 
-const input_cfg_select: usize = 0;
-const input_cfg_subsel: usize = 1;
-const input_cfg_size: usize = 2;
-const input_cfg_payload: usize = 8;
-
-const virtio_input_cfg_select_ev_bits: u8 = 0x11;
-const virtio_input_ev_key: u8 = 0x01;
-const virtio_input_ev_rel: u8 = 0x02;
-const virtio_input_ev_abs: u8 = 0x03;
-
-const input_code_rel_x: u16 = 0x00;
-const input_code_rel_y: u16 = 0x01;
-const input_code_abs_x: u16 = 0x00;
-const input_code_abs_y: u16 = 0x01;
-const input_code_key_a: u16 = 0x1E;
-const input_code_btn_left: u16 = 0x110;
-
-const InputKind = enum {
-    mouse,
-    keyboard,
-};
-
-pub const InputModernInfo = struct {
+pub const ModernDeviceInfo = struct {
     location: pci.Location,
+    vendor_id: u16,
     device_id: u16,
     subsystem_id: u16,
     common_cfg: u64,
@@ -50,22 +27,7 @@ pub const InputModernInfo = struct {
     device_cfg: u64,
     notify_off_multiplier: u32,
 };
-
-pub const MouseModernInfo = InputModernInfo;
-pub const KeyboardModernInfo = InputModernInfo;
-pub const GpuModernInfo = InputModernInfo;
-pub const BlkModernInfo = struct {
-    location: pci.Location,
-    device_id: u16,
-    subsystem_id: u16,
-    common_cfg: u64,
-    notify_cfg: u64,
-    isr_cfg: u64,
-    device_cfg: u64,
-    notify_off_multiplier: u32,
-    capacity_sectors: u64,
-    logical_block_size: u32,
-};
+pub const max_modern_devices: usize = 8;
 
 fn emit(write_log: *const fn ([]const u8) void, text: []const u8) void {
     write_log(text);
@@ -101,86 +63,25 @@ fn readMemBarBase(loc: pci.Location, bar_index: u8) ?u64 {
     return null;
 }
 
-fn looksLikeVirtioInput(device_id: u16, subsystem_id: u16) bool {
+pub fn isVirtioInputDeviceId(device_id: u16, subsystem_id: u16) bool {
     return device_id == virtio_input_device_modern or subsystem_id == virtio_input_subsystem_id;
 }
 
-fn looksLikeVirtioGpu(device_id: u16, subsystem_id: u16) bool {
+pub fn isVirtioGpuDeviceId(device_id: u16, subsystem_id: u16) bool {
     return device_id == virtio_gpu_device_modern or subsystem_id == virtio_gpu_subsystem_id;
 }
 
-fn looksLikeVirtioBlk(device_id: u16, subsystem_id: u16) bool {
+pub fn isVirtioBlkDeviceId(device_id: u16, subsystem_id: u16) bool {
     return device_id == virtio_blk_device_modern or subsystem_id == virtio_blk_subsystem_id;
-}
-
-fn mmioReadU8(addr: u64) u8 {
-    return user_copy.readPhysU8(addr) orelse 0;
-}
-
-fn mmioReadU32(addr: u64) u32 {
-    return user_copy.readPhysU32(addr) orelse 0;
-}
-
-fn mmioReadU64(addr: u64) u64 {
-    return user_copy.readPhysU64(addr) orelse 0;
-}
-
-fn mmioWriteU8(addr: u64, value: u8) void {
-    _ = user_copy.writePhysU8(addr, value);
-}
-
-fn readInputBitmapBit(device_cfg: u64, ev_type: u8, code: u16) bool {
-    if (device_cfg == 0) return false;
-    mmioWriteU8(device_cfg + input_cfg_select, virtio_input_cfg_select_ev_bits);
-    mmioWriteU8(device_cfg + input_cfg_subsel, ev_type);
-    const size = mmioReadU8(device_cfg + input_cfg_size);
-    if (size == 0) return false;
-
-    const byte_index: usize = @intCast(code / 8);
-    if (byte_index >= size or byte_index >= 128) return false;
-    const bit_index: u3 = @intCast(code & 7);
-    const bits = mmioReadU8(device_cfg + input_cfg_payload + byte_index);
-    return ((bits >> bit_index) & 1) != 0;
-}
-
-fn matchInputKind(device_cfg: u64, want: InputKind, write_log: *const fn ([]const u8) void) bool {
-    if (device_cfg == 0) {
-        emit(write_log, "virtio-probe: skip candidate (device cfg missing for input classify)\n");
-        return false;
-    }
-
-    const has_rel_x = readInputBitmapBit(device_cfg, virtio_input_ev_rel, input_code_rel_x);
-    const has_rel_y = readInputBitmapBit(device_cfg, virtio_input_ev_rel, input_code_rel_y);
-    const has_abs_x = readInputBitmapBit(device_cfg, virtio_input_ev_abs, input_code_abs_x);
-    const has_abs_y = readInputBitmapBit(device_cfg, virtio_input_ev_abs, input_code_abs_y);
-    const has_key_a = readInputBitmapBit(device_cfg, virtio_input_ev_key, input_code_key_a);
-    const has_btn_left = readInputBitmapBit(device_cfg, virtio_input_ev_key, input_code_btn_left);
-
-    const pointer_like = (has_rel_x and has_rel_y) or (has_abs_x and has_abs_y and has_btn_left);
-    const keyboard_like = has_key_a and !has_rel_x and !has_rel_y and !has_abs_x and !has_abs_y;
-
-    emitFmt(
-        write_log,
-        "virtio-probe: classify rel_xy={d} abs_xy={d} key_a={d} btn_left={d}\n",
-        .{
-            if (has_rel_x and has_rel_y) @as(u8, 1) else @as(u8, 0),
-            if (has_abs_x and has_abs_y) @as(u8, 1) else @as(u8, 0),
-            if (has_key_a) @as(u8, 1) else @as(u8, 0),
-            if (has_btn_left) @as(u8, 1) else @as(u8, 0),
-        },
-    );
-    return switch (want) {
-        .mouse => pointer_like,
-        .keyboard => keyboard_like,
-    };
 }
 
 fn collectModernCaps(
     write_log: *const fn ([]const u8) void,
     loc: pci.Location,
+    vendor_id: u16,
     device_id: u16,
     subsystem_id: u16,
-) ?InputModernInfo {
+) ?ModernDeviceInfo {
     emitFmt(
         write_log,
         "virtio-probe: candidate {x:0>2}:{x:0>2}.{x} did=0x{x} subsys=0x{x}\n",
@@ -262,6 +163,7 @@ fn collectModernCaps(
 
     return .{
         .location = loc,
+        .vendor_id = vendor_id,
         .device_id = device_id,
         .subsystem_id = subsystem_id,
         .common_cfg = common_cfg,
@@ -272,7 +174,9 @@ fn collectModernCaps(
     };
 }
 
-fn probeInputModern(write_log: *const fn ([]const u8) void, want: InputKind) ?InputModernInfo {
+pub fn probeModernDevices(write_log: *const fn ([]const u8) void) [max_modern_devices]?ModernDeviceInfo {
+    var result = [_]?ModernDeviceInfo{null} ** max_modern_devices;
+    var result_count: usize = 0;
     var bus: u16 = 0;
     while (bus < 256) : (bus += 1) {
         var device: u16 = 0;
@@ -298,115 +202,20 @@ fn probeInputModern(write_log: *const fn ([]const u8) void, want: InputKind) ?In
 
                 const device_id = pci.readDeviceId(loc);
                 const subsystem_id = pci.readSubsystemId(loc);
-                if (!looksLikeVirtioInput(device_id, subsystem_id)) continue;
-
-                const info = collectModernCaps(write_log, loc, device_id, subsystem_id) orelse continue;
-                if (!matchInputKind(info.device_cfg, want, write_log)) continue;
-                return info;
-            }
-        }
-    }
-
-    return null;
-}
-
-pub fn probeMouseModern(write_log: *const fn ([]const u8) void) ?MouseModernInfo {
-    return probeInputModern(write_log, .mouse);
-}
-
-pub fn probeKeyboardModern(write_log: *const fn ([]const u8) void) ?KeyboardModernInfo {
-    return probeInputModern(write_log, .keyboard);
-}
-
-pub fn probeGpuModern(write_log: *const fn ([]const u8) void) ?GpuModernInfo {
-    var bus: u16 = 0;
-    while (bus < 256) : (bus += 1) {
-        var device: u16 = 0;
-        while (device < 32) : (device += 1) {
-            const func0 = pci.Location{
-                .bus = @intCast(bus),
-                .device = @intCast(device),
-                .function = 0,
-            };
-            if (pci.readVendorId(func0) == 0xFFFF) continue;
-            const header0 = pci.readHeaderType(func0);
-            const function_count: u8 = if ((header0 & 0x80) != 0) 8 else 1;
-
-            var function: u8 = 0;
-            while (function < function_count) : (function += 1) {
-                const loc = pci.Location{
-                    .bus = @intCast(bus),
-                    .device = @intCast(device),
-                    .function = function,
-                };
-                const vendor_id = pci.readVendorId(loc);
-                if (vendor_id == 0xFFFF or vendor_id != virtio_vendor_id) continue;
-
-                const device_id = pci.readDeviceId(loc);
-                const subsystem_id = pci.readSubsystemId(loc);
-                if (!looksLikeVirtioGpu(device_id, subsystem_id)) continue;
-
-                return collectModernCaps(write_log, loc, device_id, subsystem_id);
-            }
-        }
-    }
-
-    return null;
-}
-
-pub fn probeBlkModern(write_log: *const fn ([]const u8) void) ?BlkModernInfo {
-    var bus: u16 = 0;
-    while (bus < 256) : (bus += 1) {
-        var device: u16 = 0;
-        while (device < 32) : (device += 1) {
-            const func0 = pci.Location{
-                .bus = @intCast(bus),
-                .device = @intCast(device),
-                .function = 0,
-            };
-            if (pci.readVendorId(func0) == 0xFFFF) continue;
-            const header0 = pci.readHeaderType(func0);
-            const function_count: u8 = if ((header0 & 0x80) != 0) 8 else 1;
-
-            var function: u8 = 0;
-            while (function < function_count) : (function += 1) {
-                const loc = pci.Location{
-                    .bus = @intCast(bus),
-                    .device = @intCast(device),
-                    .function = function,
-                };
-                const vendor_id = pci.readVendorId(loc);
-                if (vendor_id == 0xFFFF or vendor_id != virtio_vendor_id) continue;
-
-                const device_id = pci.readDeviceId(loc);
-                const subsystem_id = pci.readSubsystemId(loc);
-                if (!looksLikeVirtioBlk(device_id, subsystem_id)) continue;
-
-                const info = collectModernCaps(write_log, loc, device_id, subsystem_id) orelse continue;
-                if (info.device_cfg == 0) {
-                    emit(write_log, "virtio-probe: blk skip candidate (device cfg missing)\n");
+                if (!isVirtioInputDeviceId(device_id, subsystem_id) and
+                    !isVirtioGpuDeviceId(device_id, subsystem_id) and
+                    !isVirtioBlkDeviceId(device_id, subsystem_id))
+                {
                     continue;
                 }
-                const capacity_sectors = mmioReadU64(info.device_cfg + 0x00);
-                const logical_block_size = blk: {
-                    const blk_size = mmioReadU32(info.device_cfg + 0x14);
-                    break :blk if (blk_size != 0) blk_size else @as(u32, 512);
-                };
-                return .{
-                    .location = info.location,
-                    .device_id = info.device_id,
-                    .subsystem_id = info.subsystem_id,
-                    .common_cfg = info.common_cfg,
-                    .notify_cfg = info.notify_cfg,
-                    .isr_cfg = info.isr_cfg,
-                    .device_cfg = info.device_cfg,
-                    .notify_off_multiplier = info.notify_off_multiplier,
-                    .capacity_sectors = capacity_sectors,
-                    .logical_block_size = logical_block_size,
-                };
+
+                const info = collectModernCaps(write_log, loc, vendor_id, device_id, subsystem_id) orelse continue;
+                if (result_count >= result.len) return result;
+                result[result_count] = info;
+                result_count += 1;
             }
         }
     }
 
-    return null;
+    return result;
 }

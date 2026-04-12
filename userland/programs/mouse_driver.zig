@@ -1,7 +1,6 @@
 const std = @import("std");
 const boot_status_abi = @import("support_root").boot_status_abi;
 const boot_status_client = @import("support_root").boot_status_client;
-const device_abi = @import("support_root").device_abi;
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
 const protocol = @import("support_root").window_protocol;
 
@@ -18,7 +17,6 @@ const syscall_wait_event: u64 = 0x17;
 const syscall_share_cap: u64 = 0x2B;
 
 const syscall_ok: u64 = 0;
-const queue_cap_device_input: u64 = 1;
 const force_invalid_queue_cap_token = false;
 
 const config_page_va: usize = 0x3C00_2000;
@@ -32,7 +30,6 @@ const default_shared_page_va: usize = 0x3C00_3000;
 
 const config_magic = input_bootstrap.mouse_config_magic;
 const shared_magic = protocol.mouse_shared_magic;
-const endpoint_to_boot_display: u64 = 0x11;
 const endpoint_to_spawn_parent: u64 = 0x14;
 const MouseSharedPage = protocol.MouseSharedPage;
 
@@ -213,34 +210,23 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_v
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueSubmit(token: u64, device: u64, queue_index: u64) u64 {
+fn queueSubmit(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_submit),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
+fn queueNotify(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_notify),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn registerIommuDriver(device: device_abi.DeviceId) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (device_abi.syscall_register_iommu_driver),
-          [arg0] "{rdi}" (@intFromEnum(device)),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -410,11 +396,6 @@ pub export fn _start() noreturn {
     const notify_base = notify_page_va + notify_off;
     const isr_base = if (isr_page_paddr != 0) isr_page_va + isr_off else 0;
 
-    if (registerIommuDriver(.virtio_input) != syscall_ok) {
-        _ = userLog("MouseDriver: register iommu driver failed\n");
-        while (true) asm volatile ("pause");
-    }
-
     if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
         var queue_paddrs: [2]u64 = .{ 0, 0 };
         if (allocMapPages(queue_page0_va, 2, true, @intFromPtr(&queue_paddrs)) != syscall_ok) {
@@ -479,11 +460,11 @@ pub export fn _start() noreturn {
         };
         queuePushAvail(d);
     }
-    if (queueSubmit(queue_submit_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
+    if (queueSubmit(queue_submit_token, queue_index_event) != syscall_ok) {
         _ = userLog("MouseDriver: queue submit cap denied\n");
         while (true) asm volatile ("pause");
     }
-    if (queueNotify(queue_notify_token, queue_cap_device_input, queue_index_event) != syscall_ok) {
+    if (queueNotify(queue_notify_token, queue_index_event) != syscall_ok) {
         _ = userLog("MouseDriver: queue notify cap denied\n");
         while (true) asm volatile ("pause");
     }
@@ -510,9 +491,7 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
     initializeSharedPage(shared, screen_w_u64, screen_h_u64, screen_pitch_u64);
-    if (shareCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok and
-        shareCap(shared_page_paddr, endpoint_to_boot_display) != syscall_ok)
-    {
+    if (shareCap(shared_page_paddr, endpoint_to_spawn_parent) != syscall_ok) {
         _ = userLog("MouseDriver: send shared cap failed\n");
         while (true) asm volatile ("pause");
     }

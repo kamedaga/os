@@ -4,6 +4,51 @@ pub const max_startup_program_descriptors: usize = 12;
 pub const path_max_bytes: usize = 96;
 pub const program_flag_present: u64 = 1 << 0;
 
+pub const StartupAction = enum(u8) {
+    vfs = 1,
+    bootstrap_fs_server = 2,
+    input_driver = 3,
+    block_driver = 4,
+    persistent_fs_server = 5,
+    block_client = 6,
+    window_client = 7,
+    deferred_compositor = 8,
+};
+
+pub const StartupExecSource = enum(u8) {
+    startup_path = 1,
+    bootfs = 2,
+};
+
+pub const StartupInputSelector = enum(u8) {
+    keyboard = 1,
+    pointer = 2,
+};
+
+pub const StartupBlockSelector = enum(u8) {
+    virtio_blk = 1,
+};
+
+pub const StartupWindowConfig = enum(u8) {
+    terminal = 1,
+    taskbar = 2,
+    mouse_demo = 3,
+};
+
+pub const StartupCompositorVariant = enum(u8) {
+    classic = 1,
+    gpu = 2,
+};
+
+pub const ensure_flag_boot_display: u64 = 1 << 0;
+
+pub const require_flag_keyboard_shared: u64 = 1 << 0;
+pub const require_flag_pointer_shared: u64 = 1 << 1;
+pub const require_flag_block_service: u64 = 1 << 2;
+pub const require_flag_bootstrap_fs_service: u64 = 1 << 3;
+pub const require_flag_persistent_fs_service: u64 = 1 << 4;
+pub const require_flag_compositor_armed: u64 = 1 << 5;
+
 pub const StartupProgramRole = enum(u64) {
     vfs = 1,
     keyboard_driver = 2,
@@ -73,6 +118,80 @@ pub fn roleFromKey(key: []const u8) ?StartupProgramRole {
     return null;
 }
 
+pub fn actionFromKey(key: []const u8) ?StartupAction {
+    if (std.mem.eql(u8, key, "vfs")) return .vfs;
+    if (std.mem.eql(u8, key, "bootstrap_fs")) return .bootstrap_fs_server;
+    if (std.mem.eql(u8, key, "input_driver")) return .input_driver;
+    if (std.mem.eql(u8, key, "block_driver")) return .block_driver;
+    if (std.mem.eql(u8, key, "persistent_fs")) return .persistent_fs_server;
+    if (std.mem.eql(u8, key, "block_client") or std.mem.eql(u8, key, "block_demo")) return .block_client;
+    if (std.mem.eql(u8, key, "window_client")) return .window_client;
+    if (std.mem.eql(u8, key, "deferred_compositor")) return .deferred_compositor;
+    return null;
+}
+
+pub fn execSourceFromKey(key: []const u8) ?StartupExecSource {
+    if (std.mem.eql(u8, key, "startup_path") or
+        std.mem.eql(u8, key, "startup_fs") or
+        std.mem.eql(u8, key, "default") or
+        std.mem.eql(u8, key, "fs"))
+    {
+        return .startup_path;
+    }
+    if (std.mem.eql(u8, key, "bootfs")) return .bootfs;
+    return null;
+}
+
+pub fn inputSelectorFromKey(key: []const u8) ?StartupInputSelector {
+    if (std.mem.eql(u8, key, "keyboard")) return .keyboard;
+    if (std.mem.eql(u8, key, "pointer") or std.mem.eql(u8, key, "mouse")) return .pointer;
+    return null;
+}
+
+pub fn blockSelectorFromKey(key: []const u8) ?StartupBlockSelector {
+    if (std.mem.eql(u8, key, "virtio_blk")) return .virtio_blk;
+    return null;
+}
+
+pub fn windowConfigFromKey(key: []const u8) ?StartupWindowConfig {
+    if (std.mem.eql(u8, key, "terminal")) return .terminal;
+    if (std.mem.eql(u8, key, "taskbar")) return .taskbar;
+    if (std.mem.eql(u8, key, "mouse_demo")) return .mouse_demo;
+    return null;
+}
+
+pub fn compositorVariantFromKey(key: []const u8) ?StartupCompositorVariant {
+    if (std.mem.eql(u8, key, "classic")) return .classic;
+    if (std.mem.eql(u8, key, "gpu")) return .gpu;
+    return null;
+}
+
+pub fn ensureBitFromKey(key: []const u8) ?u64 {
+    if (std.mem.eql(u8, key, "boot_display")) return ensure_flag_boot_display;
+    return null;
+}
+
+pub fn requirementBitFromKey(key: []const u8) ?u64 {
+    if (std.mem.eql(u8, key, "keyboard_shared")) return require_flag_keyboard_shared;
+    if (std.mem.eql(u8, key, "pointer_shared")) return require_flag_pointer_shared;
+    if (std.mem.eql(u8, key, "block_service")) return require_flag_block_service;
+    if (std.mem.eql(u8, key, "bootstrap_fs_service")) return require_flag_bootstrap_fs_service;
+    if (std.mem.eql(u8, key, "persistent_fs_service")) return require_flag_persistent_fs_service;
+    if (std.mem.eql(u8, key, "compositor_armed")) return require_flag_compositor_armed;
+    return null;
+}
+
 test "descriptor size stays bounded" {
     try std.testing.expect(@sizeOf(StartupProgramDescriptor) <= 128);
+}
+
+test "policy token helpers parse expected keys" {
+    try std.testing.expect(actionFromKey("bootstrap_fs") == .bootstrap_fs_server);
+    try std.testing.expect(execSourceFromKey("bootfs") == .bootfs);
+    try std.testing.expect(inputSelectorFromKey("mouse") == .pointer);
+    try std.testing.expect(blockSelectorFromKey("virtio_blk") == .virtio_blk);
+    try std.testing.expect(windowConfigFromKey("taskbar") == .taskbar);
+    try std.testing.expect(compositorVariantFromKey("gpu") == .gpu);
+    try std.testing.expectEqual(ensure_flag_boot_display, ensureBitFromKey("boot_display").?);
+    try std.testing.expectEqual(require_flag_compositor_armed, requirementBitFromKey("compositor_armed").?);
 }

@@ -27,6 +27,7 @@ const max_session_objects: usize = 16;
 const max_block_bytes: usize = 4096;
 const max_dir_entries: usize = layout.max_dir_entries;
 const max_name_bytes: usize = layout.max_name_bytes;
+const max_path_bytes: usize = fs_protocol.max_path_bytes;
 const max_exec_file_bytes: usize = 256 * 1024;
 const max_exec_slots: usize = 16;
 const page_bytes: usize = 4096;
@@ -43,6 +44,7 @@ const file_mode_bits: u32 = layout.file_mode_bits;
 const SessionObjectKind = enum {
     mount,
     root_dir,
+    vnode_dir,
     vnode_file,
     open_file,
 };
@@ -516,6 +518,26 @@ fn dirEntryName(entry: *const VolumeDirEntry) []const u8 {
     return layout.dirEntryName(entry);
 }
 
+fn dirEntryIsDirectory(entry: *const VolumeDirEntry) bool {
+    return layout.dirEntryIsDirectory(entry);
+}
+
+fn dirEntryParentIndex(entry: *const VolumeDirEntry) ?usize {
+    return layout.dirEntryParentIndex(entry);
+}
+
+fn entrySize(entry: *const VolumeDirEntry) u64 {
+    return if (dirEntryIsDirectory(entry)) 0 else entry.file_size;
+}
+
+fn entryModeBits(entry: *const VolumeDirEntry) u32 {
+    return if (dirEntryIsDirectory(entry)) dir_mode_bits else file_mode_bits;
+}
+
+fn entryParentMatches(entry: *const VolumeDirEntry, parent_index: ?usize) bool {
+    return dirEntryParentIndex(entry) == parent_index;
+}
+
 fn namesEqualVolatile(bytes: [*]volatile u8, len: usize, expected: []const u8) bool {
     if (len != expected.len) return false;
     var i: usize = 0;
@@ -531,37 +553,12 @@ fn requestPathIsRootAlias(session: *const Session) bool {
     return namesEqualVolatile(requestPayload(session), request.path_bytes, ".") or namesEqualVolatile(requestPayload(session), request.path_bytes, "/");
 }
 
-fn extractRequestName(session: *const Session, out: *[max_name_bytes]u8) ?[]const u8 {
+fn requestPathBytes(session: *const Session, out: *[max_path_bytes]u8) ?[]const u8 {
     const request = requestHeader(session);
     const len: usize = request.path_bytes;
-    if (len == 0 or len > max_name_bytes or len > fs_protocol.request_payload_bytes) return null;
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        const byte = requestPayload(session)[i];
-        if (byte == '/' or byte == 0) return null;
-        out[i] = byte;
-    }
-    if (len == 1 and out[0] == '.') return null;
+    if (len > out.len or len > fs_protocol.request_payload_bytes) return null;
+    copyVolatileBytes(requestPayload(session), out[0..len]);
     return out[0..len];
-}
-
-fn findDirEntryByName(name: []const u8) ?usize {
-    for (&volume_dir_entries, 0..) |*entry, index| {
-        if (!dirEntryUsed(entry)) continue;
-        if (std.mem.eql(u8, dirEntryName(entry), name)) return index;
-    }
-    return null;
-}
-
-fn allocDirEntry(name: []const u8) ?usize {
-    for (&volume_dir_entries, 0..) |*entry, index| {
-        if (dirEntryUsed(entry)) continue;
-        entry.* = .{};
-        entry.flags = layout.dir_entry_flag_used;
-        layout.setDirEntryName(entry, name);
-        return index;
-    }
-    return null;
 }
 
 fn requestInlineBytes(session: *const Session, out: []u8) ?[]const u8 {
@@ -574,19 +571,163 @@ fn requestInlineBytes(session: *const Session, out: []u8) ?[]const u8 {
     return out[0..inline_len];
 }
 
-fn extractInlineName(session: *const Session, out: *[max_name_bytes]u8) ?[]const u8 {
+fn requestInlinePath(session: *const Session, out: *[max_path_bytes]u8) ?[]const u8 {
     const request = requestHeader(session);
     const len: usize = request.inline_bytes;
     const path_len: usize = request.path_bytes;
-    if (len == 0 or len > max_name_bytes or path_len + len > fs_protocol.request_payload_bytes) return null;
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        const byte = requestPayload(session)[path_len + i];
-        if (byte == '/' or byte == 0) return null;
-        out[i] = byte;
-    }
-    if (len == 1 and out[0] == '.') return null;
+    if (len > out.len or path_len + len > fs_protocol.request_payload_bytes) return null;
+    copyVolatileBytes(requestPayload(session) + path_len, out[0..len]);
     return out[0..len];
+}
+
+const ResolvedEntry = union(enum) {
+    root,
+    entry: usize,
+};
+
+const ResolvePathResult = union(enum) {
+    node: ResolvedEntry,
+    invalid,
+    not_found,
+    not_dir,
+};
+
+const CreateTarget = struct {
+    parent: ResolvedEntry,
+    name: []const u8,
+};
+
+const SplitPathResult = union(enum) {
+    target: CreateTarget,
+    invalid,
+    not_found,
+    not_dir,
+};
+
+fn findChildEntryByName(parent_index: ?usize, name: []const u8) ?usize {
+    for (&volume_dir_entries, 0..) |*entry, index| {
+        if (!dirEntryUsed(entry)) continue;
+        if (!entryParentMatches(entry, parent_index)) continue;
+        if (std.mem.eql(u8, dirEntryName(entry), name)) return index;
+    }
+    return null;
+}
+
+fn allocDirEntry(parent_index: ?usize, name: []const u8, is_directory: bool) ?usize {
+    for (&volume_dir_entries, 0..) |*entry, index| {
+        if (dirEntryUsed(entry)) continue;
+        entry.* = .{};
+        entry.flags = layout.dir_entry_flag_used;
+        layout.setDirEntryName(entry, name);
+        layout.setDirEntryParentIndex(entry, parent_index);
+        layout.setDirEntryDirectory(entry, is_directory);
+        return index;
+    }
+    return null;
+}
+
+fn resolvedEntryIsDirectory(node: ResolvedEntry) bool {
+    return switch (node) {
+        .root => true,
+        .entry => |entry_index| dirEntryIsDirectory(&volume_dir_entries[entry_index]),
+    };
+}
+
+fn resolvedEntryParentIndex(node: ResolvedEntry) ?usize {
+    return switch (node) {
+        .root => null,
+        .entry => |entry_index| entry_index,
+    };
+}
+
+fn resolvedEntryObjectKind(node: ResolvedEntry) fs_abi.ObjectKind {
+    return switch (node) {
+        .root => .vnode_dir,
+        .entry => |entry_index| if (dirEntryIsDirectory(&volume_dir_entries[entry_index])) .vnode_dir else .vnode_file,
+    };
+}
+
+fn resolvedEntrySize(node: ResolvedEntry) u64 {
+    return switch (node) {
+        .root => 0,
+        .entry => |entry_index| entrySize(&volume_dir_entries[entry_index]),
+    };
+}
+
+fn parentOfResolvedEntry(node: ResolvedEntry) ResolvedEntry {
+    return switch (node) {
+        .root => .root,
+        .entry => |entry_index| if (dirEntryParentIndex(&volume_dir_entries[entry_index])) |parent_index|
+            .{ .entry = parent_index }
+        else
+            .root,
+    };
+}
+
+fn skipSlashes(path: []const u8, pos: *usize) void {
+    while (pos.* < path.len and path[pos.*] == '/') : (pos.* += 1) {}
+}
+
+fn resolvePath(base: ResolvedEntry, path: []const u8) ResolvePathResult {
+    var current: ResolvedEntry = if (path.len != 0 and path[0] == '/') .root else base;
+    var pos: usize = 0;
+    skipSlashes(path, &pos);
+    if (pos >= path.len) return .{ .node = current };
+    while (pos < path.len) {
+        const start = pos;
+        while (pos < path.len and path[pos] != '/') : (pos += 1) {}
+        const component = path[start..pos];
+        if (component.len == 0 or component.len > max_name_bytes) return .invalid;
+        if (std.mem.eql(u8, component, ".")) {
+            skipSlashes(path, &pos);
+            continue;
+        }
+        if (std.mem.eql(u8, component, "..")) {
+            current = parentOfResolvedEntry(current);
+            skipSlashes(path, &pos);
+            continue;
+        }
+        if (!resolvedEntryIsDirectory(current)) return .not_dir;
+        const child_index = findChildEntryByName(resolvedEntryParentIndex(current), component) orelse return .not_found;
+        current = .{ .entry = child_index };
+        skipSlashes(path, &pos);
+    }
+    return .{ .node = current };
+}
+
+fn splitPathForCreate(base: ResolvedEntry, path: []const u8) SplitPathResult {
+    var current: ResolvedEntry = if (path.len != 0 and path[0] == '/') .root else base;
+    var pos: usize = 0;
+    skipSlashes(path, &pos);
+    if (pos >= path.len) return .invalid;
+    while (true) {
+        const start = pos;
+        while (pos < path.len and path[pos] != '/') : (pos += 1) {}
+        const component = path[start..pos];
+        if (component.len == 0 or component.len > max_name_bytes) return .invalid;
+        var next = pos;
+        skipSlashes(path, &next);
+        const last_component = next >= path.len;
+        if (last_component) {
+            if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return .invalid;
+            if (!resolvedEntryIsDirectory(current)) return .not_dir;
+            return .{ .target = .{ .parent = current, .name = component } };
+        }
+        if (std.mem.eql(u8, component, ".")) {
+            pos = next;
+            continue;
+        }
+        if (std.mem.eql(u8, component, "..")) {
+            current = parentOfResolvedEntry(current);
+            pos = next;
+            continue;
+        }
+        if (!resolvedEntryIsDirectory(current)) return .not_dir;
+        const child_index = findChildEntryByName(resolvedEntryParentIndex(current), component) orelse return .not_found;
+        if (!dirEntryIsDirectory(&volume_dir_entries[child_index])) return .not_dir;
+        current = .{ .entry = child_index };
+        pos = next;
+    }
 }
 
 const Extent = struct {
@@ -648,18 +789,79 @@ fn findFreeExtent(required_blocks: u64, exclude_file_index: ?usize) ?u64 {
     return null;
 }
 
-fn fileBusy(file_index: usize) bool {
+fn entryBusy(entry_index: usize) bool {
     for (&sessions) |*session| {
         if (!session.active) continue;
         for (&session.objects) |*object| {
             if (!object.active) continue;
             switch (object.kind) {
-                .vnode_file, .open_file => if (object.file_index == file_index) return true,
+                .vnode_dir, .vnode_file, .open_file => if (object.file_index == entry_index) return true,
                 else => {},
             }
         }
     }
     return false;
+}
+
+fn entryHasChildren(entry_index: usize) bool {
+    for (&volume_dir_entries) |*entry| {
+        if (!dirEntryUsed(entry)) continue;
+        if (dirEntryParentIndex(entry) == entry_index) return true;
+    }
+    return false;
+}
+
+fn resolvedEntriesEqual(a: ResolvedEntry, b: ResolvedEntry) bool {
+    return switch (a) {
+        .root => switch (b) {
+            .root => true,
+            .entry => false,
+        },
+        .entry => |a_index| switch (b) {
+            .root => false,
+            .entry => |b_index| a_index == b_index,
+        },
+    };
+}
+
+fn resolvedEntryContains(node: ResolvedEntry, ancestor_index: usize) bool {
+    var current = node;
+    while (true) {
+        switch (current) {
+            .root => return false,
+            .entry => |entry_index| {
+                if (entry_index == ancestor_index) return true;
+                if (dirEntryParentIndex(&volume_dir_entries[entry_index])) |parent_index| {
+                    current = .{ .entry = parent_index };
+                } else {
+                    return false;
+                }
+            },
+        }
+    }
+}
+
+fn baseDirectoryForObject(object: *const SessionObject) ?ResolvedEntry {
+    return switch (object.kind) {
+        .mount, .root_dir => .root,
+        .vnode_dir => blk: {
+            const entry_index: usize = object.file_index;
+            const entry = &volume_dir_entries[entry_index];
+            if (!dirEntryUsed(entry) or !dirEntryIsDirectory(entry)) return null;
+            break :blk .{ .entry = entry_index };
+        },
+        else => null,
+    };
+}
+
+fn ensureResolvedEntryToken(session: *Session, node: ResolvedEntry) ?u64 {
+    return switch (node) {
+        .root => ensureRootDirToken(session),
+        .entry => |entry_index| if (dirEntryIsDirectory(&volume_dir_entries[entry_index]))
+            ensureDirVnodeToken(session, entry_index)
+        else
+            ensureFileVnodeToken(session, entry_index),
+    };
 }
 
 fn fileHasElfMagic(entry: *const VolumeDirEntry) bool {
@@ -743,7 +945,7 @@ fn findSessionObjectByKind(session: *Session, kind: SessionObjectKind, file_inde
     for (&session.objects) |*object| {
         if (!object.active or object.kind != kind) continue;
         if (kind == .mount or kind == .root_dir or object.file_index == file_index) return object.client_token;
-    }
+        }
     return null;
 }
 
@@ -765,6 +967,13 @@ fn ensureRootDirToken(session: *Session) ?u64 {
     if (findSessionObjectByKind(session, .root_dir, 0)) |token| return token;
     const client_token = allocFsToken();
     if (!storeSessionObject(session, .root_dir, 0, client_token)) return null;
+    return client_token;
+}
+
+fn ensureDirVnodeToken(session: *Session, file_index: usize) ?u64 {
+    if (findSessionObjectByKind(session, .vnode_dir, @intCast(file_index))) |token| return token;
+    const client_token = allocFsToken();
+    if (!storeSessionObject(session, .vnode_dir, @intCast(file_index), client_token)) return null;
     return client_token;
 }
 
@@ -822,6 +1031,7 @@ fn responseObjectKind(kind: SessionObjectKind) fs_abi.ObjectKind {
     return switch (kind) {
         .mount => .mount,
         .root_dir => .vnode_dir,
+        .vnode_dir => .vnode_dir,
         .vnode_file => .vnode_file,
         .open_file => .open_file,
     };
@@ -829,7 +1039,7 @@ fn responseObjectKind(kind: SessionObjectKind) fs_abi.ObjectKind {
 
 fn modeBitsForKind(kind: SessionObjectKind) u32 {
     return switch (kind) {
-        .mount, .root_dir => dir_mode_bits,
+        .mount, .root_dir, .vnode_dir => dir_mode_bits,
         .vnode_file, .open_file => file_mode_bits,
     };
 }
@@ -854,11 +1064,11 @@ fn replyReaddirEnd(session: *Session, request_seq: u64) void {
     writeResponseHeader(session, .readdir, request_seq, .end_of_dir, 0, 0, 0, .vnode_dir, 0);
 }
 
-fn replyReaddirEntry(session: *Session, request_seq: u64, next_cursor: u64, name: []const u8) void {
+fn replyReaddirEntry(session: *Session, request_seq: u64, next_cursor: u64, object_kind: fs_abi.ObjectKind, name: []const u8) void {
     clearPage(session.response_va);
     const record: *volatile fs_protocol.FsDirentRecord = @ptrFromInt(session.response_va + fs_protocol.response_header_bytes);
     record.next_cursor = next_cursor;
-    record.object_kind = fs_protocol.objectKindRaw(.vnode_file);
+    record.object_kind = fs_protocol.objectKindRaw(object_kind);
     record.name_bytes = @intCast(name.len);
     copyBytesToVolatile(responsePayload(session) + fs_protocol.dirent_record_bytes, name);
     writeResponseHeader(
@@ -869,7 +1079,7 @@ fn replyReaddirEntry(session: *Session, request_seq: u64, next_cursor: u64, name
         0,
         0,
         next_cursor,
-        .vnode_file,
+        object_kind,
         @intCast(fs_protocol.dirent_record_bytes + name.len),
     );
 }
@@ -992,33 +1202,35 @@ fn handleLookup(session: *Session, request_seq: u64) void {
         replyStatus(session, .lookup, request_seq, .not_found);
         return;
     };
-    switch (object.kind) {
-        .mount, .root_dir => {
-            if (requestPathIsRootAlias(session)) {
-                const client_token = ensureRootDirToken(session) orelse {
-                    replyStatus(session, .lookup, request_seq, .busy);
-                    return;
-                };
-                replyLookup(session, .lookup, request_seq, client_token, .vnode_dir, 0);
-                return;
-            }
-            var name_buf: [max_name_bytes]u8 = undefined;
-            const name = extractRequestName(session, &name_buf) orelse {
-                replyStatus(session, .lookup, request_seq, .invalid);
-                return;
-            };
-            const file_index = findDirEntryByName(name) orelse {
-                replyStatus(session, .lookup, request_seq, .not_found);
-                return;
-            };
-            const client_token = ensureFileVnodeToken(session, file_index) orelse {
-                replyStatus(session, .lookup, request_seq, .busy);
-                return;
-            };
-            replyLookup(session, .lookup, request_seq, client_token, .vnode_file, volume_dir_entries[file_index].file_size);
+    const base = baseDirectoryForObject(object) orelse {
+        replyStatus(session, .lookup, request_seq, if (object.kind == .vnode_dir) .not_found else .not_dir);
+        return;
+    };
+    var path_buf: [max_path_bytes]u8 = undefined;
+    const path = requestPathBytes(session, &path_buf) orelse {
+        replyStatus(session, .lookup, request_seq, .invalid);
+        return;
+    };
+    const resolved = switch (resolvePath(base, path)) {
+        .invalid => {
+            replyStatus(session, .lookup, request_seq, .invalid);
+            return;
         },
-        else => replyStatus(session, .lookup, request_seq, .not_dir),
-    }
+        .not_found => {
+            replyStatus(session, .lookup, request_seq, .not_found);
+            return;
+        },
+        .not_dir => {
+            replyStatus(session, .lookup, request_seq, .not_dir);
+            return;
+        },
+        .node => |node| node,
+    };
+    const client_token = ensureResolvedEntryToken(session, resolved) orelse {
+        replyStatus(session, .lookup, request_seq, .busy);
+        return;
+    };
+    replyLookup(session, .lookup, request_seq, client_token, resolvedEntryObjectKind(resolved), resolvedEntrySize(resolved));
 }
 
 fn handleStat(session: *Session, request_seq: u64) void {
@@ -1029,13 +1241,13 @@ fn handleStat(session: *Session, request_seq: u64) void {
     };
     switch (object.kind) {
         .mount, .root_dir => replyStat(session, request_seq, responseObjectKind(object.kind), 0, modeBitsForKind(object.kind)),
-        .vnode_file, .open_file => {
+        .vnode_dir, .vnode_file, .open_file => {
             const entry = &volume_dir_entries[object.file_index];
             if (!dirEntryUsed(entry)) {
                 replyStatus(session, .stat, request_seq, .not_found);
                 return;
             }
-            replyStat(session, request_seq, responseObjectKind(object.kind), entry.file_size, modeBitsForKind(object.kind));
+            replyStat(session, request_seq, responseObjectKind(object.kind), entrySize(entry), modeBitsForKind(object.kind));
         },
     }
 }
@@ -1046,15 +1258,37 @@ fn handleReaddir(session: *Session, request_seq: u64) void {
         replyStatus(session, .readdir, request_seq, .not_found);
         return;
     };
-    if (object.kind != .root_dir) {
-        replyStatus(session, .readdir, request_seq, .not_dir);
-        return;
-    }
+    const parent_index: ?usize = switch (object.kind) {
+        .mount, .root_dir => null,
+        .vnode_dir => blk: {
+            const entry = &volume_dir_entries[object.file_index];
+            if (!dirEntryUsed(entry)) {
+                replyStatus(session, .readdir, request_seq, .not_found);
+                return;
+            }
+            if (!dirEntryIsDirectory(entry)) {
+                replyStatus(session, .readdir, request_seq, .not_dir);
+                return;
+            }
+            break :blk object.file_index;
+        },
+        else => {
+            replyStatus(session, .readdir, request_seq, .not_dir);
+            return;
+        },
+    };
     var cursor: usize = @intCast(request.offset);
     while (cursor < max_dir_entries) : (cursor += 1) {
         const entry = &volume_dir_entries[cursor];
         if (!dirEntryUsed(entry)) continue;
-        replyReaddirEntry(session, request_seq, cursor + 1, dirEntryName(entry));
+        if (!entryParentMatches(entry, parent_index)) continue;
+        replyReaddirEntry(
+            session,
+            request_seq,
+            cursor + 1,
+            if (dirEntryIsDirectory(entry)) .vnode_dir else .vnode_file,
+            dirEntryName(entry),
+        );
         return;
     }
     replyReaddirEnd(session, request_seq);
@@ -1066,28 +1300,53 @@ fn handleCreate(session: *Session, request_seq: u64) void {
         replyStatus(session, .create, request_seq, .not_found);
         return;
     };
-    if (object.kind != .root_dir and object.kind != .mount) {
-        replyStatus(session, .create, request_seq, .not_dir);
+    const base = baseDirectoryForObject(object) orelse {
+        replyStatus(session, .create, request_seq, if (object.kind == .vnode_dir) .not_found else .not_dir);
         return;
-    }
-    var name_buf: [max_name_bytes]u8 = undefined;
-    const name = extractRequestName(session, &name_buf) orelse {
+    };
+    var path_buf: [max_path_bytes]u8 = undefined;
+    const path = requestPathBytes(session, &path_buf) orelse {
         replyStatus(session, .create, request_seq, .invalid);
         return;
     };
-    const file_index = findDirEntryByName(name) orelse allocDirEntry(name) orelse {
+    const create_dir = (request.flags & fs_protocol.create_flag_directory) != 0;
+    const target = switch (splitPathForCreate(base, path)) {
+        .invalid => {
+            replyStatus(session, .create, request_seq, .invalid);
+            return;
+        },
+        .not_found => {
+            replyStatus(session, .create, request_seq, .not_found);
+            return;
+        },
+        .not_dir => {
+            replyStatus(session, .create, request_seq, .not_dir);
+            return;
+        },
+        .target => |resolved| resolved,
+    };
+    const parent_index = resolvedEntryParentIndex(target.parent);
+    const file_index = if (findChildEntryByName(parent_index, target.name)) |existing_index|
+        existing_index
+    else
+        allocDirEntry(parent_index, target.name, create_dir) orelse {
         replyStatus(session, .create, request_seq, .busy);
         return;
     };
+    const entry = &volume_dir_entries[file_index];
+    if (dirEntryIsDirectory(entry) != create_dir) {
+        replyStatus(session, .create, request_seq, if (dirEntryIsDirectory(entry)) .is_dir else .not_dir);
+        return;
+    }
     if (!persistDirectory() or !flushBlocks()) {
         replyStatus(session, .create, request_seq, .io_error);
         return;
     }
-    const client_token = ensureFileVnodeToken(session, file_index) orelse {
+    const client_token = ensureResolvedEntryToken(session, .{ .entry = file_index }) orelse {
         replyStatus(session, .create, request_seq, .busy);
         return;
     };
-    replyLookup(session, .create, request_seq, client_token, .vnode_file, volume_dir_entries[file_index].file_size);
+    replyLookup(session, .create, request_seq, client_token, if (create_dir) .vnode_dir else .vnode_file, entrySize(entry));
 }
 
 fn handleOpen(session: *Session, request_seq: u64) void {
@@ -1096,13 +1355,24 @@ fn handleOpen(session: *Session, request_seq: u64) void {
         replyStatus(session, .open, request_seq, .not_found);
         return;
     };
-    if (object.kind != .vnode_file) {
-        replyStatus(session, .open, request_seq, .is_dir);
-        return;
+    switch (object.kind) {
+        .mount, .root_dir, .vnode_dir => {
+            replyStatus(session, .open, request_seq, .is_dir);
+            return;
+        },
+        .vnode_file => {},
+        .open_file => {
+            replyStatus(session, .open, request_seq, .invalid);
+            return;
+        },
     }
     const entry = &volume_dir_entries[object.file_index];
     if (!dirEntryUsed(entry)) {
         replyStatus(session, .open, request_seq, .not_found);
+        return;
+    }
+    if (dirEntryIsDirectory(entry)) {
+        replyStatus(session, .open, request_seq, .is_dir);
         return;
     }
     const client_token = ensureOpenFileToken(session, object.file_index) orelse {
@@ -1150,6 +1420,10 @@ fn handleWrite(session: *Session, request_seq: u64) void {
         replyStatus(session, .write, request_seq, .not_found);
         return;
     }
+    if (dirEntryIsDirectory(entry)) {
+        replyStatus(session, .write, request_seq, .is_dir);
+        return;
+    }
     const payload = requestInlineBytes(session, io_buffer[0..]) orelse {
         replyStatus(session, .write, request_seq, .too_big);
         return;
@@ -1169,20 +1443,40 @@ fn handleUnlink(session: *Session, request_seq: u64) void {
         replyStatus(session, .unlink, request_seq, .not_found);
         return;
     };
-    if (object.kind != .root_dir and object.kind != .mount) {
-        replyStatus(session, .unlink, request_seq, .not_dir);
+    const base = baseDirectoryForObject(object) orelse {
+        replyStatus(session, .unlink, request_seq, if (object.kind == .vnode_dir) .not_found else .not_dir);
         return;
-    }
-    var name_buf: [max_name_bytes]u8 = undefined;
-    const name = extractRequestName(session, &name_buf) orelse {
+    };
+    var path_buf: [max_path_bytes]u8 = undefined;
+    const path = requestPathBytes(session, &path_buf) orelse {
         replyStatus(session, .unlink, request_seq, .invalid);
         return;
     };
-    const file_index = findDirEntryByName(name) orelse {
+    const target = switch (splitPathForCreate(base, path)) {
+        .invalid => {
+            replyStatus(session, .unlink, request_seq, .invalid);
+            return;
+        },
+        .not_found => {
+            replyStatus(session, .unlink, request_seq, .not_found);
+            return;
+        },
+        .not_dir => {
+            replyStatus(session, .unlink, request_seq, .not_dir);
+            return;
+        },
+        .target => |resolved| resolved,
+    };
+    const file_index = findChildEntryByName(resolvedEntryParentIndex(target.parent), target.name) orelse {
         replyStatus(session, .unlink, request_seq, .not_found);
         return;
     };
-    if (fileBusy(file_index)) {
+    const entry = &volume_dir_entries[file_index];
+    if (dirEntryIsDirectory(entry) and entryHasChildren(file_index)) {
+        replyStatus(session, .unlink, request_seq, .busy);
+        return;
+    }
+    if (entryBusy(file_index)) {
         replyStatus(session, .unlink, request_seq, .busy);
         return;
     }
@@ -1201,37 +1495,74 @@ fn handleRename(session: *Session, request_seq: u64) void {
         replyStatus(session, .rename, request_seq, .not_found);
         return;
     };
-    if (object.kind != .root_dir and object.kind != .mount) {
-        replyStatus(session, .rename, request_seq, .not_dir);
+    const base = baseDirectoryForObject(object) orelse {
+        replyStatus(session, .rename, request_seq, if (object.kind == .vnode_dir) .not_found else .not_dir);
         return;
-    }
-    var old_name_buf: [max_name_bytes]u8 = undefined;
-    const old_name = extractRequestName(session, &old_name_buf) orelse {
+    };
+    var old_path_buf: [max_path_bytes]u8 = undefined;
+    const old_path = requestPathBytes(session, &old_path_buf) orelse {
         replyStatus(session, .rename, request_seq, .invalid);
         return;
     };
-    var new_name_buf: [max_name_bytes]u8 = undefined;
-    const new_name = extractInlineName(session, &new_name_buf) orelse {
+    var new_path_buf: [max_path_bytes]u8 = undefined;
+    const new_path = requestInlinePath(session, &new_path_buf) orelse {
         replyStatus(session, .rename, request_seq, .invalid);
         return;
     };
-    const file_index = findDirEntryByName(old_name) orelse {
+    const source = switch (splitPathForCreate(base, old_path)) {
+        .invalid => {
+            replyStatus(session, .rename, request_seq, .invalid);
+            return;
+        },
+        .not_found => {
+            replyStatus(session, .rename, request_seq, .not_found);
+            return;
+        },
+        .not_dir => {
+            replyStatus(session, .rename, request_seq, .not_dir);
+            return;
+        },
+        .target => |resolved| resolved,
+    };
+    const destination = switch (splitPathForCreate(base, new_path)) {
+        .invalid => {
+            replyStatus(session, .rename, request_seq, .invalid);
+            return;
+        },
+        .not_found => {
+            replyStatus(session, .rename, request_seq, .not_found);
+            return;
+        },
+        .not_dir => {
+            replyStatus(session, .rename, request_seq, .not_dir);
+            return;
+        },
+        .target => |resolved| resolved,
+    };
+    const file_index = findChildEntryByName(resolvedEntryParentIndex(source.parent), source.name) orelse {
         replyStatus(session, .rename, request_seq, .not_found);
         return;
     };
-    if (!std.mem.eql(u8, old_name, new_name)) {
-        if (findDirEntryByName(new_name)) |existing_index| {
-            if (existing_index != file_index) {
-                replyStatus(session, .rename, request_seq, .busy);
-                return;
-            }
-        }
-        const entry = &volume_dir_entries[file_index];
-        layout.setDirEntryName(entry, new_name);
-        if (!persistDirectory() or !flushBlocks()) {
-            replyStatus(session, .rename, request_seq, .io_error);
+    if (resolvedEntriesEqual(source.parent, destination.parent) and std.mem.eql(u8, source.name, destination.name)) {
+        replyStatus(session, .rename, request_seq, .ok);
+        return;
+    }
+    const entry = &volume_dir_entries[file_index];
+    if (dirEntryIsDirectory(entry) and resolvedEntryContains(destination.parent, file_index)) {
+        replyStatus(session, .rename, request_seq, .invalid);
+        return;
+    }
+    if (findChildEntryByName(resolvedEntryParentIndex(destination.parent), destination.name)) |existing_index| {
+        if (existing_index != file_index) {
+            replyStatus(session, .rename, request_seq, .busy);
             return;
         }
+    }
+    layout.setDirEntryName(entry, destination.name);
+    layout.setDirEntryParentIndex(entry, resolvedEntryParentIndex(destination.parent));
+    if (!persistDirectory() or !flushBlocks()) {
+        replyStatus(session, .rename, request_seq, .io_error);
+        return;
     }
     replyStatus(session, .rename, request_seq, .ok);
 }
@@ -1242,17 +1573,24 @@ fn handleOpenExec(session: *Session, request_seq: u64) void {
         replyStatus(session, .open_exec, request_seq, .not_found);
         return;
     };
-    if (object.kind == .mount or object.kind == .root_dir) {
-        replyStatus(session, .open_exec, request_seq, .is_dir);
-        return;
-    }
-    if (object.kind != .vnode_file) {
-        replyStatus(session, .open_exec, request_seq, .invalid);
-        return;
+    switch (object.kind) {
+        .mount, .root_dir, .vnode_dir => {
+            replyStatus(session, .open_exec, request_seq, .is_dir);
+            return;
+        },
+        .vnode_file => {},
+        .open_file => {
+            replyStatus(session, .open_exec, request_seq, .invalid);
+            return;
+        },
     }
     const entry = &volume_dir_entries[object.file_index];
     if (!dirEntryUsed(entry)) {
         replyStatus(session, .open_exec, request_seq, .not_found);
+        return;
+    }
+    if (dirEntryIsDirectory(entry)) {
+        replyStatus(session, .open_exec, request_seq, .is_dir);
         return;
     }
     if (!fileHasElfMagic(entry)) {
@@ -1274,7 +1612,7 @@ fn handleClose(session: *Session, request_seq: u64) void {
     };
     switch (object.kind) {
         .mount, .root_dir => {},
-        .vnode_file, .open_file => object.active = false,
+        .vnode_dir, .vnode_file, .open_file => object.active = false,
     }
     replyStatus(session, .close, request_seq, .ok);
 }
@@ -1317,8 +1655,7 @@ fn handleConnectRequest(request_paddr: u64) void {
             request.version != fs_protocol.version or
             request.op != fs_protocol.opcodeRaw(.connect) or
             request.request_seq == 0 or
-            request.arg0 < 0x1000 or
-            request.arg1 == 0)
+            request.arg0 < 0x1000)
         {
             _ = userLog("PersistentFs: invalid connect request\n");
             return;

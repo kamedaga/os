@@ -6,6 +6,7 @@ pub const minimum_data_blocks: u64 = 16;
 pub const volume_magic: u64 = 0x3153_4650; // "PFS1"
 pub const volume_version: u64 = 1;
 pub const dir_entry_flag_used: u32 = 1;
+pub const dir_entry_flag_directory: u32 = 1 << 1;
 pub const dir_mode_bits: u32 = 0x4000;
 pub const file_mode_bits: u32 = 0x8000;
 
@@ -86,6 +87,15 @@ pub fn dirEntryName(entry: *const VolumeDirEntry) []const u8 {
     return entry.name[0..entry.name_bytes];
 }
 
+pub fn dirEntryIsDirectory(entry: *const VolumeDirEntry) bool {
+    return (entry.flags & dir_entry_flag_directory) != 0;
+}
+
+pub fn dirEntryParentIndex(entry: *const VolumeDirEntry) ?usize {
+    if (entry.reserved0 == 0) return null;
+    return entry.reserved0 - 1;
+}
+
 pub fn clearDirectory(entries: *[max_dir_entries]VolumeDirEntry) void {
     entries.* = [_]VolumeDirEntry{.{}} ** max_dir_entries;
 }
@@ -95,6 +105,17 @@ pub fn setDirEntryName(entry: *VolumeDirEntry, name: []const u8) void {
     @memset(entry.name[0..], 0);
     @memcpy(entry.name[0..name.len], name);
     entry.name_bytes = @intCast(name.len);
+}
+
+pub fn setDirEntryParentIndex(entry: *VolumeDirEntry, parent_index: ?usize) void {
+    entry.reserved0 = if (parent_index) |index| @intCast(index + 1) else 0;
+}
+
+pub fn setDirEntryDirectory(entry: *VolumeDirEntry, is_directory: bool) void {
+    if (is_directory)
+        entry.flags |= dir_entry_flag_directory
+    else
+        entry.flags &= ~dir_entry_flag_directory;
 }
 
 pub fn blocksForSize(block_size: u64, size_bytes: u64) u64 {

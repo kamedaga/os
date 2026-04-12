@@ -4,55 +4,24 @@
 const std = @import("std");
 const kernel = @import("../kernel.zig");
 const boot_abi = @import("abi.zig");
-const boot_static = @import("main_static.zig");
 const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
 const uefi_services = @import("uefi_services.zig");
 const halt = @import("../halt.zig");
-const log_util = @import("../log_util.zig");
 
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
 const service_registry_abi = boot_abi.service_registry_abi;
 const boot_manifest_abi = boot_abi.boot_manifest_abi;
 
 
-// ---------------------------------------------------------------------------
-// Driver device config types (kept here since they are only used during init setup)
-// ---------------------------------------------------------------------------
-
 pub const MmioPageWithOffset = struct {
     page_paddr: u64,
     page_offset: u64,
 };
 
-pub const MouseDriverConfig = struct {
-    common: MmioPageWithOffset,
-    notify: MmioPageWithOffset,
-    isr: MmioPageWithOffset,
-    device: MmioPageWithOffset,
-    notify_off_multiplier: u64,
-    queue_paddr0: u64 = 0,
-    queue_paddr1: u64 = 0,
-};
-
-pub const VirtioBlkDriverConfig = struct {
-    common: MmioPageWithOffset,
-    notify: MmioPageWithOffset,
-    isr: MmioPageWithOffset,
-    device: MmioPageWithOffset,
-    notify_off_multiplier: u64,
-    capacity_sectors: u64,
-    logical_block_size: u64,
-};
-
-pub const DetectedInputBootstrap = struct {
-    descriptor: init_bootstrap_abi.InputDeviceDescriptor,
-    config: MouseDriverConfig,
-};
-
-pub const DetectedBlockBootstrap = struct {
-    descriptor: init_bootstrap_abi.BlockDeviceDescriptor,
-    config: VirtioBlkDriverConfig,
+pub const DetectedDeviceBootstrap = struct {
+    descriptor: init_bootstrap_abi.DeviceDescriptor,
+    dma_device: kernel.DmaDeviceId,
 };
 
 pub const BootFsImageSetup = struct {
@@ -75,11 +44,7 @@ fn haltInitBootstrapDescriptor(message: []const u8) noreturn {
     halt.haltWithLabelMessage("init bootstrap descriptor invalid:", message);
 }
 
-fn haltInitInputBootstrapError(label: []const u8, step: []const u8, err: anyerror) noreturn {
-    halt.haltWithStepError("init ", label, step, err);
-}
-
-fn haltInitBlockBootstrapError(label: []const u8, step: []const u8, err: anyerror) noreturn {
+fn haltInitDeviceBootstrapError(label: []const u8, step: []const u8, err: anyerror) noreturn {
     halt.haltWithStepError("init ", label, step, err);
 }
 
@@ -103,25 +68,11 @@ fn initSpawnPageLabel(_: init_bootstrap_abi.SpawnPageDescriptor) []const u8 {
     return "spawn page";
 }
 
-// ---------------------------------------------------------------------------
-// Input/block device descriptor helpers
-// ---------------------------------------------------------------------------
-
-fn inputDeviceKindFromDescriptor(descriptor: init_bootstrap_abi.InputDeviceDescriptor) init_bootstrap_abi.InputDeviceKind {
-    return @enumFromInt(descriptor.kind);
-}
-
-fn inputDeviceLabel(kind: init_bootstrap_abi.InputDeviceKind) []const u8 {
-    return switch (kind) {
-        .pointer => "pointer input",
-        .keyboard => "keyboard input",
-    };
-}
-
-fn inputDeviceConfigPageLabel(kind: init_bootstrap_abi.InputDeviceKind) []const u8 {
-    return switch (kind) {
-        .pointer => "pointer input config page",
-        .keyboard => "keyboard input config page",
+fn deviceLabel(device: kernel.DmaDeviceId) []const u8 {
+    return switch (device) {
+        .virtio_input => "virtio input device",
+        .virtio_gpu => "virtio gpu device",
+        .virtio_blk => "virtio block device",
     };
 }
 
@@ -203,27 +154,6 @@ fn findKernelBackedInitSpawnPage(
     return null;
 }
 
-fn mirrorKernelBackedInitSpawnPages(
-    state: *kernel.KernelState,
-    boot_display_process: kernel.PrincipalId,
-    pages: []const ?KernelBackedInitSpawnPage,
-) void {
-    inline for (init_bootstrap_layout.builtin_spawn_pages) |descriptor| {
-        if ((descriptor.flags & init_bootstrap_abi.spawn_page_flag_mirror_to_boot_display) == 0) continue;
-        const page = findKernelBackedInitSpawnPage(pages, descriptor.source_va) orelse
-            haltInitBootstrapDescriptor("missing kernel-backed spawn page for mirror");
-        process_factory.installAndMapPageForProcessOrHalt(
-            state,
-            boot_display_process,
-            page.page,
-            descriptor.target_va,
-            spawnPageMirrorWritable(descriptor),
-            "compositor",
-            initSpawnPageLabel(descriptor),
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Service registry
 // ---------------------------------------------------------------------------
@@ -239,18 +169,10 @@ const InitServiceDescriptorSet = struct {
         }} ** service_registry_abi.max_entries,
 };
 
-fn buildInitServiceDescriptors(boot_display_process: kernel.PrincipalId) InitServiceDescriptorSet {
-    var services = InitServiceDescriptorSet{};
-    const process_index = kernel.processIndexFromPrincipal(boot_display_process) orelse
-        haltInitBootstrapDescriptor("boot display principal index missing");
-    services.descriptors[0] = .{
-        .kind = @intFromEnum(service_registry_abi.ServiceKind.window),
-        .process_slot = @intCast(process_index),
-        .endpoint_id = service_registry_abi.init_window_service_endpoint_id,
-        .flags = 0,
-    };
-    services.count = 1;
-    return services;
+fn buildInitServiceDescriptors() InitServiceDescriptorSet {
+    // boot_display is now spawned by userland init, not pre-created by kernel.
+    // The service registry will be populated by init once boot_display is running.
+    return InitServiceDescriptorSet{};
 }
 
 fn publishInitServiceRegistryPage(
@@ -286,8 +208,7 @@ fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64)
 
 pub fn publishInitBootstrapDescriptorPage(
     user_page_paddr: u64,
-    input_devices: []const ?DetectedInputBootstrap,
-    block_device: ?DetectedBlockBootstrap,
+    devices: []const ?DetectedDeviceBootstrap,
     bootfs_setup: BootFsImageSetup,
     framebuffer_info: ?uefi_services.FramebufferInfo,
 ) void {
@@ -302,12 +223,14 @@ pub fn publishInitBootstrapDescriptorPage(
         .size_bytes = bootfs_setup.size_bytes,
         .page_count = bootfs_setup.page_count,
     };
-    page.primary_display = .{ .flags = 0, .width = 0, .height = 0, .pitch = 0 };
+    page.primary_display = .{ .flags = 0, .width = 0, .height = 0, .pitch = 0, .framebuffer_paddr = 0, .framebuffer_size_bytes = 0 };
     if (framebuffer_info) |info| {
         page.primary_display.flags = init_bootstrap_abi.display_flag_present;
         page.primary_display.width = info.width;
         page.primary_display.height = info.height;
         page.primary_display.pitch = info.pixels_per_scan_line;
+        page.primary_display.framebuffer_paddr = info.paddr;
+        page.primary_display.framebuffer_size_bytes = info.size_bytes;
     }
 
     var i: usize = 0;
@@ -334,7 +257,8 @@ pub fn publishInitBootstrapDescriptorPage(
         var updated = descriptor;
         const kind: boot_manifest_abi.ImageKind = @enumFromInt(updated.kind);
         const present = switch (kind) {
-            .boot_log_console => true,
+            // boot_display is now spawned by userland init from bootfs, not kernel-loaded
+            .boot_log_console => false,
             .vfs => false,
             .init_app => true,
             .bootfs_image => true,
@@ -345,14 +269,18 @@ pub fn publishInitBootstrapDescriptorPage(
         page.boot_images[idx] = updated;
     }
 
-    var input_count: usize = 0;
-    while (input_count < init_bootstrap_abi.max_input_device_descriptors) : (input_count += 1) {
-        page.input_devices[input_count] = .{
-            .kind = 0,
+    var device_count: usize = 0;
+    while (device_count < init_bootstrap_abi.max_device_descriptors) : (device_count += 1) {
+        page.devices[device_count] = .{
+            .transport = 0,
             .flags = 0,
-            .config_source_va = 0,
-            .config_target_va = 0,
-            .config_spawn_flags = 0,
+            .bootstrap_source_va = 0,
+            .vendor_id = 0,
+            .device_id = 0,
+            .subsystem_id = 0,
+            .pci_bus = 0,
+            .pci_device = 0,
+            .pci_function = 0,
             .common_page_paddr = 0,
             .notify_page_paddr = 0,
             .isr_page_paddr = 0,
@@ -366,192 +294,73 @@ pub fn publishInitBootstrapDescriptorPage(
             .init_queue_notify_token = 0,
         };
     }
-    input_count = 0;
-    for (input_devices) |entry| {
+    device_count = 0;
+    for (devices) |entry| {
         const device = entry orelse continue;
-        if (input_count >= init_bootstrap_abi.max_input_device_descriptors) break;
+        if (device_count >= init_bootstrap_abi.max_device_descriptors) break;
         var descriptor = device.descriptor;
-        descriptor.flags |= init_bootstrap_abi.input_device_flag_present;
-        page.input_devices[input_count] = descriptor;
-        input_count += 1;
+        descriptor.flags |= init_bootstrap_abi.device_flag_present;
+        page.devices[device_count] = descriptor;
+        device_count += 1;
     }
-    page.input_device_count = input_count;
-
-    var block_idx: usize = 0;
-    while (block_idx < init_bootstrap_abi.max_block_device_descriptors) : (block_idx += 1) {
-        page.block_devices[block_idx] = .{
-            .kind = 0,
-            .flags = 0,
-            .config_source_va = 0,
-            .config_target_va = 0,
-            .config_spawn_flags = 0,
-            .common_page_paddr = 0,
-            .notify_page_paddr = 0,
-            .isr_page_paddr = 0,
-            .device_page_paddr = 0,
-            .common_page_offset = 0,
-            .notify_page_offset = 0,
-            .isr_page_offset = 0,
-            .device_page_offset = 0,
-            .notify_off_multiplier = 0,
-            .capacity_sectors = 0,
-            .logical_block_size = 0,
-            .init_queue_submit_token = 0,
-            .init_queue_notify_token = 0,
-            .init_root_token = 0,
-        };
-    }
-    if (block_device) |device| {
-        var descriptor = device.descriptor;
-        descriptor.flags |= init_bootstrap_abi.block_device_flag_present;
-        page.block_devices[0] = descriptor;
-        page.block_device_count = 1;
-    } else {
-        page.block_device_count = 0;
-    }
+    page.device_count = device_count;
 }
 
 // ---------------------------------------------------------------------------
-// Input driver bootstrap for init
+// Generic device bootstrap for init
 // ---------------------------------------------------------------------------
 
-fn installInitInputMmioCapOrHalt(
+fn grantInitDeviceQueueTokenOrHalt(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
-    label: []const u8,
-    cap_label: []const u8,
-    paddr: u64,
-    rights: kernel.Rights,
-) void {
-    state.installCap(init_process_principal, paddr, rights) catch |err| {
-        haltInitInputBootstrapError(label, cap_label, err);
-    };
-}
-
-fn grantInitInputQueueTokenOrHalt(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
+    device: kernel.DmaDeviceId,
     label: []const u8,
     step_label: []const u8,
     submit: bool,
     notify: bool,
 ) u64 {
-    return state.queueCapGrantStage2(init_process_principal, .virtio_input, 0, submit, notify) catch |err| {
-        haltInitInputBootstrapError(label, step_label, err);
+    return state.queueCapGrantStage2(init_process_principal, device, 0, submit, notify) catch |err| {
+        haltInitDeviceBootstrapError(label, step_label, err);
     };
 }
 
-pub fn setupInputDriverBootstrapForInit(
+pub fn setupDeviceBootstrapForInit(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
-    device: DetectedInputBootstrap,
+    device: DetectedDeviceBootstrap,
     free_list: *kernel.FreePageList,
-) DetectedInputBootstrap {
-    const kind = inputDeviceKindFromDescriptor(device.descriptor);
-    const label = inputDeviceLabel(kind);
+) DetectedDeviceBootstrap {
+    const label = deviceLabel(device.dma_device);
     _ = process_factory.allocAndMapOwnedPageForProcessOrHalt(
         state,
         init_process_principal,
         "init",
-        inputDeviceConfigPageLabel(kind),
-        device.descriptor.config_source_va,
+        "device bootstrap page",
+        device.descriptor.bootstrap_source_va,
         true,
         free_list,
     );
-    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true };
-    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false, .grant = true };
-    const cfg = device.config;
-    installInitInputMmioCapOrHalt(state, init_process_principal, label, "install common cap", cfg.common.page_paddr, mmio_rw_rights);
-    installInitInputMmioCapOrHalt(state, init_process_principal, label, "install notify cap", cfg.notify.page_paddr, mmio_rw_rights);
-    if (cfg.isr.page_paddr != 0) installInitInputMmioCapOrHalt(state, init_process_principal, label, "install isr cap", cfg.isr.page_paddr, mmio_ro_rights);
-    if (cfg.device.page_paddr != 0) installInitInputMmioCapOrHalt(state, init_process_principal, label, "install device cap", cfg.device.page_paddr, mmio_ro_rights);
-    const init_submit_token = grantInitInputQueueTokenOrHalt(state, init_process_principal, label, "queue submit grant", true, false);
-    const init_notify_token = grantInitInputQueueTokenOrHalt(state, init_process_principal, label, "queue notify grant", false, true);
-    var updated = device;
-    updated.descriptor.common_page_paddr = cfg.common.page_paddr;
-    updated.descriptor.notify_page_paddr = cfg.notify.page_paddr;
-    updated.descriptor.isr_page_paddr = cfg.isr.page_paddr;
-    updated.descriptor.device_page_paddr = cfg.device.page_paddr;
-    updated.descriptor.common_page_offset = cfg.common.page_offset;
-    updated.descriptor.notify_page_offset = cfg.notify.page_offset;
-    updated.descriptor.isr_page_offset = cfg.isr.page_offset;
-    updated.descriptor.device_page_offset = cfg.device.page_offset;
-    updated.descriptor.notify_off_multiplier = cfg.notify_off_multiplier;
-    updated.descriptor.init_queue_submit_token = init_submit_token;
-    updated.descriptor.init_queue_notify_token = init_notify_token;
-    return updated;
-}
-
-// ---------------------------------------------------------------------------
-// Block driver bootstrap for init
-// ---------------------------------------------------------------------------
-
-fn installInitBlockMmioCapOrHalt(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    label: []const u8,
-    cap_label: []const u8,
-    paddr: u64,
-    rights: kernel.Rights,
-) void {
-    state.installCap(init_process_principal, paddr, rights) catch |err| {
-        haltInitBlockBootstrapError(label, cap_label, err);
-    };
-}
-
-fn grantInitBlockQueueTokenOrHalt(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    label: []const u8,
-    step_label: []const u8,
-    submit: bool,
-    notify: bool,
-) u64 {
-    return state.queueCapGrantStage2(init_process_principal, .virtio_blk, 0, submit, notify) catch |err| {
-        haltInitBlockBootstrapError(label, step_label, err);
-    };
-}
-
-pub fn setupBlockDriverBootstrapForInit(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    device: DetectedBlockBootstrap,
-    free_list: *kernel.FreePageList,
-) DetectedBlockBootstrap {
-    const label = "block device";
-    _ = process_factory.allocAndMapOwnedPageForProcessOrHalt(
+    const init_submit_token = grantInitDeviceQueueTokenOrHalt(
         state,
         init_process_principal,
-        "init",
-        "block device config page",
-        device.descriptor.config_source_va,
+        device.dma_device,
+        label,
+        "queue submit grant",
         true,
-        free_list,
+        false,
     );
-    const mmio_rw_rights = kernel.Rights{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true };
-    const mmio_ro_rights = kernel.Rights{ .cpu_read = true, .cpu_write = false, .dma = false, .grant = true };
-    const cfg = device.config;
-    installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install common cap", cfg.common.page_paddr, mmio_rw_rights);
-    installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install notify cap", cfg.notify.page_paddr, mmio_rw_rights);
-    if (cfg.isr.page_paddr != 0) installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install isr cap", cfg.isr.page_paddr, mmio_ro_rights);
-    if (cfg.device.page_paddr != 0) installInitBlockMmioCapOrHalt(state, init_process_principal, label, "install device cap", cfg.device.page_paddr, mmio_ro_rights);
-    const init_submit_token = grantInitBlockQueueTokenOrHalt(state, init_process_principal, label, "queue submit grant", true, false);
-    const init_notify_token = grantInitBlockQueueTokenOrHalt(state, init_process_principal, label, "queue notify grant", false, true);
+    const init_notify_token = grantInitDeviceQueueTokenOrHalt(
+        state,
+        init_process_principal,
+        device.dma_device,
+        label,
+        "queue notify grant",
+        false,
+        true,
+    );
     var updated = device;
-    updated.descriptor.common_page_paddr = cfg.common.page_paddr;
-    updated.descriptor.notify_page_paddr = cfg.notify.page_paddr;
-    updated.descriptor.isr_page_paddr = cfg.isr.page_paddr;
-    updated.descriptor.device_page_paddr = cfg.device.page_paddr;
-    updated.descriptor.common_page_offset = cfg.common.page_offset;
-    updated.descriptor.notify_page_offset = cfg.notify.page_offset;
-    updated.descriptor.isr_page_offset = cfg.isr.page_offset;
-    updated.descriptor.device_page_offset = cfg.device.page_offset;
-    updated.descriptor.notify_off_multiplier = cfg.notify_off_multiplier;
-    updated.descriptor.capacity_sectors = cfg.capacity_sectors;
-    updated.descriptor.logical_block_size = cfg.logical_block_size;
     updated.descriptor.init_queue_submit_token = init_submit_token;
     updated.descriptor.init_queue_notify_token = init_notify_token;
-    updated.descriptor.init_root_token = 0;
     return updated;
 }
 
@@ -562,9 +371,7 @@ pub fn setupBlockDriverBootstrapForInit(
 pub fn setupInitBootstrapResources(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
-    boot_display_process: kernel.PrincipalId,
-    input_devices: []?DetectedInputBootstrap,
-    block_device: *?DetectedBlockBootstrap,
+    devices: []?DetectedDeviceBootstrap,
     bootfs_image: []const u8,
     framebuffer_info: ?uefi_services.FramebufferInfo,
     free_list: *kernel.FreePageList,
@@ -588,22 +395,12 @@ pub fn setupInitBootstrapResources(
         free_list,
     );
     const kernel_backed_pages = allocKernelBackedInitSpawnPages(state, init_process_principal, free_list);
-    const init_services = buildInitServiceDescriptors(boot_display_process);
-    mirrorKernelBackedInitSpawnPages(state, boot_display_process, kernel_backed_pages[0..]);
+    const init_services = buildInitServiceDescriptors();
     publishInitServiceRegistryPage(kernel_backed_pages[0..], init_services.descriptors[0..init_services.count]);
-    const registry_page = findKernelBackedInitSpawnPage(
-        kernel_backed_pages[0..],
-        init_bootstrap_layout.sourceVa(.window_service_config),
-    ) orelse haltInitBootstrapDescriptor("missing window service config page");
-    process_factory.installAndMapPageForProcessOrHalt(
-        state,
-        boot_display_process,
-        registry_page.page,
-        boot_abi.process_abi.service_registry_shadow_va,
-        false,
-        "boot_display",
-        "shared service registry page",
-    );
+
+    // Framebuffer and MMIO caps are now installed by init itself via install-mmio syscalls.
+    // Kernel only provides physical addresses in the descriptor page.
+
     const bootfs_setup = mapBootFsImageIntoProcessOrHalt(
         state,
         init_process_principal,
@@ -612,54 +409,15 @@ pub fn setupInitBootstrapResources(
         bootfs_image,
         free_list,
     );
-    for (input_devices) |*entry| {
+    for (devices) |*entry| {
         const device = entry.* orelse continue;
-        entry.* = setupInputDriverBootstrapForInit(state, init_process_principal, device, free_list);
-    }
-    if (block_device.*) |device| {
-        block_device.* = setupBlockDriverBootstrapForInit(state, init_process_principal, device, free_list);
+        entry.* = setupDeviceBootstrapForInit(state, init_process_principal, device, free_list);
     }
     publishInitBootstrapConfigPage(config_page.paddr, init_bootstrap_layout.descriptor_page_va);
     publishInitBootstrapDescriptorPage(
         descriptor_page.paddr,
-        input_devices,
-        block_device.*,
+        devices,
         bootfs_setup,
         framebuffer_info,
     );
-}
-
-// ---------------------------------------------------------------------------
-// Shell keyboard config page
-// ---------------------------------------------------------------------------
-
-pub fn publishShellKeyboardConfigPage(
-    user_page_paddr: u64,
-    cfg: ?MouseDriverConfig,
-    queue_submit_token: u64,
-    queue_notify_token: u64,
-) void {
-    const words: [*]volatile u64 = @ptrFromInt(user_page_paddr);
-    var i: usize = 0;
-    while (i < 512) : (i += 1) {
-        words[i] = 0;
-    }
-    if (cfg) |keyboard_cfg| {
-        words[0] = 0x4B455942; // keyboard input config magic
-        words[1] = keyboard_cfg.common.page_paddr;
-        words[2] = keyboard_cfg.notify.page_paddr;
-        words[3] = keyboard_cfg.isr.page_paddr;
-        words[4] = keyboard_cfg.device.page_paddr;
-        words[5] = keyboard_cfg.common.page_offset;
-        words[6] = keyboard_cfg.notify.page_offset;
-        words[7] = keyboard_cfg.isr.page_offset;
-        words[8] = keyboard_cfg.device.page_offset;
-        words[9] = keyboard_cfg.notify_off_multiplier;
-        words[10] = 0;
-        words[11] = 0;
-        words[12] = 0;
-        words[13] = queue_submit_token;
-        words[14] = queue_notify_token;
-        words[18] = 0;
-    }
 }

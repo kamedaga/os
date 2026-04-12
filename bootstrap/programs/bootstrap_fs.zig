@@ -44,7 +44,6 @@ const root_dir_object_id: u64 = 0x4254_4654; // "BTFT"
 const vnode_dir_hash_salt: u64 = 0x4254_4449_5231;
 const vnode_file_hash_salt: u64 = 0x4254_4649_4C31;
 const open_file_hash_salt: u64 = 0x4254_4F50_4E31;
-const queue_cap_device_blk: u64 = 2;
 const queue_index_request: u16 = 0;
 const queue_size: u16 = 8;
 const queue_used_offset: usize = 4096;
@@ -344,25 +343,23 @@ fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueSubmit(token: u64, device: u64, queue_index: u64) u64 {
+fn queueSubmit(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_submit),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn queueNotify(token: u64, device: u64, queue_index: u64) u64 {
+fn queueNotify(token: u64, queue_index: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_notify),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (device),
-          [arg2] "{rdx}" (queue_index),
+          [arg1] "{rsi}" (queue_index),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -601,8 +598,8 @@ fn initBlockDevice() bool {
     const queue_notify_off = mmioReadU16(common_base + common_queue_notify_off);
     notify_addr = notify_base + @as(usize, queue_notify_off) * @as(usize, @intCast(block_state.notify_off_multiplier));
     mmioWriteU16(common_base + common_queue_enable, 1);
-    if (queueSubmit(block_state.queue_submit_token, queue_cap_device_blk, queue_index_request) != 0) return false;
-    if (queueNotify(block_state.queue_notify_token, queue_cap_device_blk, queue_index_request) != 0) return false;
+    if (queueSubmit(block_state.queue_submit_token, queue_index_request) != 0) return false;
+    if (queueNotify(block_state.queue_notify_token, queue_index_request) != 0) return false;
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     return true;
 }
@@ -1311,8 +1308,7 @@ fn handleConnectRequest(request_paddr: u64) void {
             request.version != fs_protocol.version or
             request.op != fs_protocol.opcodeRaw(.connect) or
             request.request_seq == 0 or
-            request.arg0 < 0x1000 or
-            request.arg1 == 0)
+            request.arg0 < 0x1000)
         {
             _ = userLog("BootstrapFs: invalid connect request\n");
             return;

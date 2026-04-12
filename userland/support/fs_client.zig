@@ -221,7 +221,15 @@ pub const Client = struct {
     }
 
     pub fn create(self: *Client, dir_token: u64, path: []const u8) Error!LookupResult {
-        const seq = try self.beginRequest(.create, dir_token, 0, 0, 0, path, &[_]u8{});
+        return self.createWithFlags(dir_token, path, 0);
+    }
+
+    pub fn createDir(self: *Client, dir_token: u64, path: []const u8) Error!LookupResult {
+        return self.createWithFlags(dir_token, path, fs_protocol.create_flag_directory);
+    }
+
+    pub fn createWithFlags(self: *Client, dir_token: u64, path: []const u8, flags: u32) Error!LookupResult {
+        const seq = try self.beginRequest(.create, dir_token, 0, 0, flags, path, &[_]u8{});
         const response = try self.finishRequestOk(seq, .create);
         return self.lookupResultFromResponse(response);
     }

@@ -3,7 +3,6 @@ const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 const abi_root = @import("kernel_abi_root");
 const cap_transfer_abi = abi_root.cap_transfer_abi;
-const device_abi = abi_root.device_abi;
 const image_abi = abi_root.image_abi;
 const user_vm = @import("memory/user_vm.zig");
 const process_abi = abi_root.process_abi;
@@ -44,6 +43,7 @@ const syscall_share_cap: u64 = 0x2B;
 const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
+const syscall_install_mmio_cap: u64 = 0x2F;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
 
 const syscall_batch_max_pages: usize = 64;
@@ -87,7 +87,7 @@ pub const Hooks = struct {
     consume_pending_signal_for_principal: *const fn (kernel.PrincipalId) bool,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64) bool,
-    log_queue_cap_deny: *const fn (kernel.PrincipalId, u64, kernel.DmaDeviceId, u16, kernel.QueueOperation, anyerror) void,
+    log_queue_cap_deny: *const fn (kernel.PrincipalId, u64, u16, kernel.QueueOperation, anyerror) void,
     log_race_send_cap: *const fn (kernel.PrincipalId, ?kernel.PrincipalId, u64, u64, []const u8) void,
     log_race_switch: *const fn (usize, usize, []const u8) void,
 };
@@ -106,15 +106,6 @@ fn getHooks() *const Hooks {
 fn parseVmObjectRights(bits: u64) kernel.VmObjectRights {
     const abi_rights = image_abi.vmObjectRightsFromBits(bits);
     return @bitCast(abi_rights);
-}
-
-fn parseDmaDeviceId(value: u64) ?kernel.DmaDeviceId {
-    const abi_device = std.meta.intToEnum(device_abi.DeviceId, @as(u8, @truncate(value))) catch return null;
-    return switch (abi_device) {
-        .virtio_gpu => .virtio_gpu,
-        .virtio_input => .virtio_input,
-        .virtio_blk => .virtio_blk,
-    };
 }
 
 fn parseExecImageRights(bits: u64) kernel.ExecImageRights {
@@ -425,16 +416,10 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_queue_submit, syscall_queue_notify => {
             const queue_token = frame.rdi;
-            const device: kernel.DmaDeviceId = switch (frame.rsi) {
-                0 => .virtio_gpu,
-                1 => .virtio_input,
-                2 => .virtio_blk,
-                else => return syscall_err_invalid,
-            };
-            const queue_index: u16 = @truncate(frame.rdx);
+            const queue_index: u16 = @truncate(frame.rsi);
             const op: kernel.QueueOperation = if (frame.rax == syscall_queue_submit) .submit else .notify;
-            state.queueCapAuthorizeStage2(proc, queue_token, device, queue_index, op) catch |err| {
-                h.log_queue_cap_deny(proc, queue_token, device, queue_index, op, err);
+            state.queueCapAuthorizeStage2(proc, queue_token, queue_index, op) catch |err| {
+                h.log_queue_cap_deny(proc, queue_token, queue_index, op, err);
                 return syscall_err_invalid;
             };
             return syscall_ok;
@@ -525,8 +510,6 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return @intCast(slot);
         },
         syscall_register_iommu_driver => {
-            const device = parseDmaDeviceId(frame.rdi) orelse return syscall_err_invalid;
-            state.registerIommuNoCapDriver(proc, device) catch return syscall_err_invalid;
             return syscall_ok;
         },
         syscall_send_cap => {
@@ -541,6 +524,13 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 else => syscall_err_send,
             };
             return received;
+        },
+        syscall_install_mmio_cap => {
+            if (!state.isBootstrapOwner(proc)) return syscall_err_invalid;
+            const paddr = frame.rdi;
+            const rights = capability.parseRights(frame.rsi);
+            state.installCap(proc, paddr, rights) catch return syscall_err_grant;
+            return syscall_ok;
         },
         syscall_accept_cap_transfer => {
             const received = state.acceptCapTransfer(proc, frame.rdi) catch |err| switch (err) {
@@ -562,6 +552,31 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 frame.rsi,
                 parseVmObjectRights(frame.rdx),
             ) catch return syscall_err_grant;
+            return image_abi.encodeVmObjectToken(cap_id);
+        },
+        image_abi.syscall_install_vm_object_mmio_range => {
+            if (!state.isBootstrapOwner(proc)) return syscall_err_invalid;
+            const base_paddr = frame.rdi;
+            const size_bytes = frame.rsi;
+            if (size_bytes == 0 or (base_paddr & 0xFFF) != 0) return syscall_err_invalid;
+            const span_bytes = (size_bytes + 4095) & ~@as(u64, 4095);
+            const page_count_u64 = span_bytes / 4096;
+            if (page_count_u64 == 0 or page_count_u64 > kernel.max_image_backing_pages) return syscall_err_invalid;
+            var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;
+            var i: usize = 0;
+            while (i < page_count_u64) : (i += 1) {
+                page_paddrs[i] = base_paddr + (@as(u64, @intCast(i)) * 4096);
+            }
+            const cap_id = state.installVmObjectCap(
+                proc,
+                page_paddrs[0..@intCast(page_count_u64)],
+                0,
+                size_bytes,
+                parseVmObjectRights(frame.rdx),
+            ) catch |err| switch (err) {
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                else => return syscall_err_grant,
+            };
             return image_abi.encodeVmObjectToken(cap_id);
         },
         image_abi.syscall_grant_vm_object => {
@@ -629,7 +644,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                     target_va + @as(u64, @intCast(run_start)) * 4096,
                     run_paddr,
                     @as(u64, @intCast(run_len)) * 4096,
-                    false,
+                    vm_cap.rights.write,
                 )) {
                     h.write("map_vm_object user map failed proc=");
                     h.write(h.principal_label(proc));

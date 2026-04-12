@@ -1,4 +1,5 @@
 const mouse_shared_abi = @import("support_root").mouse_shared_abi;
+const window_client = @import("support_root").window_client;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -14,7 +15,6 @@ const shared_magic: u64 = mouse_shared_abi.magic;
 const shared_header_bytes: usize = mouse_shared_abi.header_bytes;
 const shared_log_max_bytes: usize = mouse_shared_abi.log_capacity_bytes;
 
-const endpoint_to_boot_display: u64 = 0x11;
 const bootlog_ipc_magic: u64 = 0x424C4F47; // "BLOG"
 const bootlog_ipc_header_bytes: usize = 16;
 
@@ -59,6 +59,15 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
 
 pub export fn _start() noreturn {
     _ = userLog("BootLogSender: started\n");
+    if (!window_client.initServiceBindingFromConfigPage()) {
+        _ = userLog("BootLogSender: window service bind failed\n");
+        while (true) asm volatile ("pause");
+    }
+    const endpoint_id = window_client.currentServiceEndpointId();
+    if (endpoint_id == 0) {
+        _ = userLog("BootLogSender: window service endpoint missing\n");
+        while (true) asm volatile ("pause");
+    }
     const shared_words: [*]const volatile u64 = @ptrFromInt(shared_page_va);
     if (shared_words[0] != shared_magic) {
         _ = userLog("BootLogSender: shared magic mismatch\n");
@@ -92,7 +101,7 @@ pub export fn _start() noreturn {
         msg_bytes[bootlog_ipc_header_bytes + i] = shared_bytes[shared_header_bytes + i];
     }
 
-    if (sendCap(page_paddr, endpoint_to_boot_display) != syscall_ok) {
+    if (sendCap(page_paddr, endpoint_id) != syscall_ok) {
         _ = userLog("BootLogSender: send_cap failed\n");
         while (true) asm volatile ("pause");
     }
