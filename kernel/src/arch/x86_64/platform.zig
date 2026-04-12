@@ -195,7 +195,8 @@ pub fn writeCr3(value: u64) void {
     asm volatile ("mov %[value], %%cr3"
         :
         : [value] "r" (value),
-        : .{ .memory = true });
+        : .{ .memory = true }
+    );
 }
 
 pub fn readCr3() u64 {
@@ -210,7 +211,8 @@ pub fn invlpg(addr: u64) void {
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (addr),
-        : .{ .memory = true });
+        : .{ .memory = true }
+    );
 }
 
 pub fn stackTop(region: []u8, usable_bytes: usize) u64 {
@@ -377,7 +379,8 @@ pub fn loadGdtAndReloadSegments() void {
     asm volatile ("lgdt (%[ptr])"
         :
         : [ptr] "r" (&gdt_ptr),
-        : .{ .memory = true });
+        : .{ .memory = true }
+    );
 
     asm volatile (
         \\pushq %[kcs]
@@ -391,13 +394,15 @@ pub fn loadGdtAndReloadSegments() void {
         :
         : [kcs] "i" (@as(u64, gdt_kernel_code_selector)),
           [kds] "i" (gdt_kernel_data_selector),
-        : .{ .memory = true });
+        : .{ .memory = true }
+    );
     asm volatile (
         \\mov %[tss_sel], %%ax
         \\ltr %%ax
         :
         : [tss_sel] "i" (gdt_tss_selector),
-        : .{ .memory = true });
+        : .{ .memory = true }
+    );
 }
 
 pub fn ring0StackTop() u64 {

@@ -1,0 +1,3 @@
+# default boot is intentionally small
+# shell and init are loaded directly from disk
+bootstrap_fs /bin/bootstrap_fs.elf

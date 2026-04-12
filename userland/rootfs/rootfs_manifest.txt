@@ -1,0 +1,5 @@
+# CapabilityOS rootfs manifest
+/startup_manifest.txt=./startup_manifest.txt
+/pie_user.elf=../../kernel/zig-out/bin/EFI/BOOT/USERAPP.ELF
+/virtio_blk.elf=../../kernel/zig-out/bin/EFI/BOOT/VBLKDRV.ELF
+/persistent_fs.elf=../../kernel/zig-out/bin/EFI/BOOT/PERSFS.ELF

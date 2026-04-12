@@ -1,0 +1,3 @@
+# stage2 startup is loaded from rootfs through bootstrap_fs
+block_driver /virtio_blk.elf
+persistent_fs /persistent_fs.elf

@@ -21,9 +21,13 @@ pub fn build(b: *std.Build) void {
         .os_tag = .uefi,
         .abi = .msvc,
     });
-    const persistent_fs_layout_mod = b.createModule(.{
-        .root_source_file = b.path("shared/persistent_fs_layout.zig"),
+    const kernel_abi_root_mod = b.createModule(.{
+        .root_source_file = b.path("../userland/support/kernel_abi_root.zig"),
     });
+    const persistent_fs_layout_mod = b.createModule(.{
+        .root_source_file = b.path("../userland/support/persistent_fs_layout.zig"),
+    });
+    test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
 
     const efi_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -31,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .code_model = .small,
     });
+    efi_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     const efi_app = b.addExecutable(.{
         .name = "BOOTX64",
         .root_module = efi_mod,
@@ -41,13 +46,21 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
         .abi = .none,
     });
-    const init_app_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/init_app.zig"),
+    const support_root_mod = b.createModule(.{
+        .root_source_file = b.path("../userland/support/support_root.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    const init_app_mod = b.createModule(.{
+        .root_source_file = b.path("../bootstrap/programs/init_app.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    init_app_mod.addImport("support_root", support_root_mod);
     init_app_mod.strip = true;
     const init_app = b.addExecutable(.{
         .name = "INITAPP",
@@ -64,12 +77,13 @@ pub fn build(b: *std.Build) void {
     init_step.dependOn(&install_init.step);
 
     const boot_log_console_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/boot_log_console.zig"),
+        .root_source_file = b.path("../bootstrap/programs/boot_log_console.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    boot_log_console_mod.addImport("support_root", support_root_mod);
     boot_log_console_mod.strip = true;
     const boot_log_console_app = b.addExecutable(.{
         .name = "SHELL",
@@ -86,12 +100,13 @@ pub fn build(b: *std.Build) void {
     boot_log_console_step.dependOn(&install_boot_log_console.step);
 
     const mouse_driver_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/mouse_driver.zig"),
+        .root_source_file = b.path("../userland/programs/mouse_driver.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    mouse_driver_mod.addImport("support_root", support_root_mod);
     mouse_driver_mod.strip = true;
     const mouse_driver_app = b.addExecutable(.{
         .name = "MOUSEDRV",
@@ -108,12 +123,13 @@ pub fn build(b: *std.Build) void {
     mouse_driver_step.dependOn(&install_mouse_driver.step);
 
     const keyboard_driver_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/keyboard_driver.zig"),
+        .root_source_file = b.path("../userland/programs/keyboard_driver.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    keyboard_driver_mod.addImport("support_root", support_root_mod);
     keyboard_driver_mod.strip = true;
     const keyboard_driver_app = b.addExecutable(.{
         .name = "KEYBDRV",
@@ -130,12 +146,13 @@ pub fn build(b: *std.Build) void {
     keyboard_driver_step.dependOn(&install_keyboard_driver.step);
 
     const bootlog_sender_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/bootlog_sender.zig"),
+        .root_source_file = b.path("../userland/programs/bootlog_sender.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    bootlog_sender_mod.addImport("support_root", support_root_mod);
     bootlog_sender_mod.strip = true;
     const bootlog_sender_app = b.addExecutable(.{
         .name = "BLOGSND",
@@ -152,12 +169,13 @@ pub fn build(b: *std.Build) void {
     bootlog_sender_step.dependOn(&install_bootlog_sender.step);
 
     const mouse_button_demo_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/mouse_button_demo.zig"),
+        .root_source_file = b.path("../userland/programs/mouse_button_demo.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    mouse_button_demo_mod.addImport("support_root", support_root_mod);
     mouse_button_demo_mod.strip = true;
     const mouse_button_demo_app = b.addExecutable(.{
         .name = "MBTNDEMO",
@@ -174,12 +192,13 @@ pub fn build(b: *std.Build) void {
     mouse_button_demo_step.dependOn(&install_mouse_button_demo.step);
 
     const terminal_window_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/terminal_window.zig"),
+        .root_source_file = b.path("../userland/programs/terminal_window.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    terminal_window_mod.addImport("support_root", support_root_mod);
     terminal_window_mod.strip = true;
     const terminal_window_app = b.addExecutable(.{
         .name = "TERMWIN",
@@ -196,12 +215,13 @@ pub fn build(b: *std.Build) void {
     terminal_window_step.dependOn(&install_terminal_window.step);
 
     const taskbar_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/taskbar.zig"),
+        .root_source_file = b.path("../userland/programs/taskbar.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    taskbar_mod.addImport("support_root", support_root_mod);
     taskbar_mod.strip = true;
     const taskbar_app = b.addExecutable(.{
         .name = "TASKBAR",
@@ -218,12 +238,13 @@ pub fn build(b: *std.Build) void {
     taskbar_step.dependOn(&install_taskbar.step);
 
     const launcher_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/launcher.zig"),
+        .root_source_file = b.path("../userland/programs/launcher.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    launcher_mod.addImport("support_root", support_root_mod);
     launcher_mod.strip = true;
     const launcher_app = b.addExecutable(.{
         .name = "LAUNCHER",
@@ -240,12 +261,13 @@ pub fn build(b: *std.Build) void {
     launcher_step.dependOn(&install_launcher.step);
 
     const mouse_draw_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/mouse_draw.zig"),
+        .root_source_file = b.path("../userland/programs/mouse_draw.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    mouse_draw_mod.addImport("support_root", support_root_mod);
     mouse_draw_mod.strip = true;
     const mouse_draw_app = b.addExecutable(.{
         .name = "MDRAW",
@@ -262,12 +284,13 @@ pub fn build(b: *std.Build) void {
     mouse_draw_step.dependOn(&install_mouse_draw.step);
 
     const compositor_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/compositor.zig"),
+        .root_source_file = b.path("../userland/programs/compositor.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    compositor_mod.addImport("support_root", support_root_mod);
     compositor_mod.strip = true;
     const compositor_app = b.addExecutable(.{
         .name = "COMPOS",
@@ -284,12 +307,13 @@ pub fn build(b: *std.Build) void {
     compositor_step.dependOn(&install_compositor.step);
 
     const gpu_compositor_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/gpu_compositor.zig"),
+        .root_source_file = b.path("../userland/programs/gpu_compositor.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    gpu_compositor_mod.addImport("support_root", support_root_mod);
     gpu_compositor_mod.strip = true;
     const gpu_compositor_app = b.addExecutable(.{
         .name = "GPUCOMP",
@@ -306,12 +330,13 @@ pub fn build(b: *std.Build) void {
     gpu_compositor_step.dependOn(&install_gpu_compositor.step);
 
     const vfs_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/vfs.zig"),
+        .root_source_file = b.path("../userland/programs/vfs.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    vfs_mod.addImport("support_root", support_root_mod);
     vfs_mod.strip = true;
     const vfs_app = b.addExecutable(.{
         .name = "VFS",
@@ -328,12 +353,13 @@ pub fn build(b: *std.Build) void {
     vfs_step.dependOn(&install_vfs.step);
 
     const virtio_blk_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/virtio_blk.zig"),
+        .root_source_file = b.path("../userland/programs/virtio_blk.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    virtio_blk_mod.addImport("support_root", support_root_mod);
     virtio_blk_mod.strip = true;
     const virtio_blk_app = b.addExecutable(.{
         .name = "VBLKDRV",
@@ -349,13 +375,38 @@ pub fn build(b: *std.Build) void {
     const virtio_blk_step = b.step("virtio-blk-elf", "Build virtio-blk PIE ELF");
     virtio_blk_step.dependOn(&install_virtio_blk.step);
 
-    const block_demo_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/block_demo.zig"),
+    const bootstrap_fs_mod = b.createModule(.{
+        .root_source_file = b.path("../bootstrap/programs/bootstrap_fs.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    bootstrap_fs_mod.addImport("support_root", support_root_mod);
+    bootstrap_fs_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
+    bootstrap_fs_mod.strip = true;
+    const bootstrap_fs_app = b.addExecutable(.{
+        .name = "BOOTFSRV",
+        .root_module = bootstrap_fs_mod,
+    });
+    bootstrap_fs_app.pie = true;
+    bootstrap_fs_app.entry = .{ .symbol_name = "_start" };
+    bootstrap_fs_app.link_z_common_page_size = 0x10;
+    bootstrap_fs_app.link_z_max_page_size = 0x10;
+    const install_bootstrap_fs = b.addInstallArtifact(bootstrap_fs_app, .{
+        .dest_sub_path = "EFI/BOOT/BOOTFSRV.ELF",
+    });
+    const bootstrap_fs_step = b.step("bootstrap-fs-elf", "Build bootstrap fs PIE ELF");
+    bootstrap_fs_step.dependOn(&install_bootstrap_fs.step);
+
+    const block_demo_mod = b.createModule(.{
+        .root_source_file = b.path("../userland/programs/block_demo.zig"),
+        .target = user_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .small,
+        .red_zone = false,
+    });
+    block_demo_mod.addImport("support_root", support_root_mod);
     block_demo_mod.strip = true;
     const block_demo_app = b.addExecutable(.{
         .name = "BLKDEMO",
@@ -372,12 +423,13 @@ pub fn build(b: *std.Build) void {
     block_demo_step.dependOn(&install_block_demo.step);
 
     const persistent_fs_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/persistent_fs.zig"),
+        .root_source_file = b.path("../userland/programs/persistent_fs.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    persistent_fs_mod.addImport("support_root", support_root_mod);
     persistent_fs_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
     persistent_fs_mod.strip = true;
     const persistent_fs_app = b.addExecutable(.{
@@ -395,12 +447,13 @@ pub fn build(b: *std.Build) void {
     persistent_fs_step.dependOn(&install_persistent_fs.step);
 
     const pie_user_mod = b.createModule(.{
-        .root_source_file = b.path("user_programs/pie_user.zig"),
+        .root_source_file = b.path("../userland/programs/pie_user.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
+    pie_user_mod.addImport("support_root", support_root_mod);
     pie_user_mod.strip = true;
     pie_user_mod.addIncludePath(b.path("../user/libcapc"));
     pie_user_mod.addCSourceFiles(.{
@@ -429,7 +482,7 @@ pub fn build(b: *std.Build) void {
     pie_user_step.dependOn(&install_pie_user.step);
 
     const bootfs_builder_mod = b.createModule(.{
-        .root_source_file = b.path("tools/bootfs_builder.zig"),
+        .root_source_file = b.path("../tools/bootfs_builder.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
@@ -440,21 +493,26 @@ pub fn build(b: *std.Build) void {
     const bootfs_builder_run = b.addRunArtifact(bootfs_builder_app);
     const bootfs_image_out = bootfs_builder_run.addOutputFileArg("BOOTFS.IMG");
     bootfs_builder_run.addArg("/boot/startup_manifest.txt");
-    bootfs_builder_run.addFileArg(b.path("bootfs/startup_manifest.txt"));
-    bootfs_builder_run.addArg("/bin/virtio_blk.elf");
-    bootfs_builder_run.addFileArg(virtio_blk_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/persistent_fs.elf");
-    bootfs_builder_run.addFileArg(persistent_fs_app.getEmittedBin());
+    bootfs_builder_run.addFileArg(b.path("../bootstrap/bootfs/startup_manifest.txt"));
+    bootfs_builder_run.addArg("/bin/bootstrap_fs.elf");
+    bootfs_builder_run.addFileArg(bootstrap_fs_app.getEmittedBin());
     const install_bootfs_image = b.addInstallBinFile(bootfs_image_out, "EFI/BOOT/BOOTFS.IMG");
     const bootfs_step = b.step("bootfs-img", "Build bootfs image");
     bootfs_step.dependOn(&install_bootfs_image.step);
 
-    const rootfs_put_mod = b.createModule(.{
-        .root_source_file = b.path("tools/rootfs_put.zig"),
+    const rootfs_host_mod = b.createModule(.{
+        .root_source_file = b.path("../tools/rootfs_host.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
-    rootfs_put_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
+    rootfs_host_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
+
+    const rootfs_put_mod = b.createModule(.{
+        .root_source_file = b.path("../tools/rootfs_put.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    rootfs_put_mod.addImport("rootfs_host", rootfs_host_mod);
     const rootfs_put_app = b.addExecutable(.{
         .name = "rootfs_put",
         .root_module = rootfs_put_mod,
@@ -462,6 +520,34 @@ pub fn build(b: *std.Build) void {
     const install_rootfs_put = b.addInstallArtifact(rootfs_put_app, .{});
     const rootfs_put_step = b.step("rootfs-put-tool", "Build host-side rootfs_put tool");
     rootfs_put_step.dependOn(&install_rootfs_put.step);
+
+    const rootfs_builder_mod = b.createModule(.{
+        .root_source_file = b.path("../tools/rootfs_builder.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    rootfs_builder_mod.addImport("rootfs_host", rootfs_host_mod);
+    const rootfs_builder_app = b.addExecutable(.{
+        .name = "rootfs_builder",
+        .root_module = rootfs_builder_mod,
+    });
+    const install_rootfs_builder = b.addInstallArtifact(rootfs_builder_app, .{});
+    const rootfs_builder_step = b.step("rootfs-builder-tool", "Build host-side rootfs_builder tool");
+    rootfs_builder_step.dependOn(&install_rootfs_builder.step);
+
+    const esp_builder_mod = b.createModule(.{
+        .root_source_file = b.path("../tools/esp_builder.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    esp_builder_mod.addImport("rootfs_host", rootfs_host_mod);
+    const esp_builder_app = b.addExecutable(.{
+        .name = "esp_builder",
+        .root_module = esp_builder_mod,
+    });
+    const install_esp_builder = b.addInstallArtifact(esp_builder_app, .{});
+    const esp_builder_step = b.step("esp-builder-tool", "Build host-side esp_builder tool");
+    esp_builder_step.dependOn(&install_esp_builder.step);
 
     const capc_hello_cmd = b.addSystemCommand(&[_][]const u8{
         b.graph.zig_exe,
@@ -493,10 +579,14 @@ pub fn build(b: *std.Build) void {
     });
     install_efi.step.dependOn(&install_init.step);
     install_efi.step.dependOn(&install_boot_log_console.step);
+    install_efi.step.dependOn(&install_bootstrap_fs.step);
+    install_efi.step.dependOn(&install_virtio_blk.step);
     install_efi.step.dependOn(&install_persistent_fs.step);
     install_efi.step.dependOn(&install_pie_user.step);
     install_efi.step.dependOn(&install_bootfs_image.step);
     install_efi.step.dependOn(&install_rootfs_put.step);
+    install_efi.step.dependOn(&install_rootfs_builder.step);
+    install_efi.step.dependOn(&install_esp_builder.step);
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
 }

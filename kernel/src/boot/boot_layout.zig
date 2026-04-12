@@ -1,4 +1,5 @@
-const process_abi = @import("../abi/process_abi.zig");
+const abi_root = @import("kernel_abi_root");
+const process_abi = abi_root.process_abi;
 const kernel_vm = @import("../memory/kernel_vm.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 
@@ -20,7 +21,6 @@ pub const boot_log_console_stack_page_va: u64 = process_abi.auxPageVa(0);
 pub const boot_log_console_stack_top: u64 = boot_log_console_stack_page_va + 0x1000;
 pub const boot_log_console_entry_rsp: u64 = boot_log_console_stack_top - 8;
 pub const boot_log_user_va: u64 = process_abi.auxPageVa(1);
-pub const vfs_bootfs_image_va: u64 = 0x3C08_0000;
 
 pub const framebuffer_window_bytes: u64 =
     two_mib - (process_abi.auxPageVa(5) - user_aux_base_va);

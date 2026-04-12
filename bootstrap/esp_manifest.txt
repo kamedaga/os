@@ -1,0 +1,5 @@
+# EFI system partition contents
+/EFI/BOOT/BOOTX64.EFI=../kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI
+/EFI/BOOT/SHELL.ELF=../kernel/zig-out/bin/EFI/BOOT/SHELL.ELF
+/EFI/BOOT/INITAPP.ELF=../kernel/zig-out/bin/EFI/BOOT/INITAPP.ELF
+/EFI/BOOT/BOOTFS.IMG=../kernel/zig-out/bin/EFI/BOOT/BOOTFS.IMG

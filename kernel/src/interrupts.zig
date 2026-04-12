@@ -113,5 +113,6 @@ pub fn loadIdt(idt: *const [256]IdtEntry) void {
     asm volatile ("lidt (%[ptr])"
         :
         : [ptr] "r" (&idt_ptr),
-        : .{ .memory = true });
+        : .{ .memory = true }
+    );
 }

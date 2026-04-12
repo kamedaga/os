@@ -54,6 +54,7 @@ pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx
 pub const RaceLogHooks = struct {
     write: *const fn ([]const u8) void,
     print_hex: *const fn (u64) void,
+    principal_label: *const fn (kernel.PrincipalId) []const u8,
 };
 
 pub const PerfReport = struct {
@@ -189,10 +190,10 @@ pub fn logRaceSendCap(
 ) void {
     if (!tryBeginSchedulerRaceLog(hooks, max_lines)) return;
     hooks.write("send_cap from=");
-    hooks.write(kernel.principalLabel(from));
+    hooks.write(hooks.principal_label(from));
     hooks.write(" to=");
     if (to) |target| {
-        hooks.write(kernel.principalLabel(target));
+        hooks.write(hooks.principal_label(target));
     } else {
         hooks.write("unknown");
     }

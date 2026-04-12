@@ -1,13 +1,13 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
-const cap_transfer_abi = @import("abi/cap_transfer_abi.zig");
-const device_abi = @import("abi/device_abi.zig");
-const fs_abi = @import("abi/fs_abi.zig");
-const image_abi = @import("abi/image_abi.zig");
+const abi_root = @import("kernel_abi_root");
+const cap_transfer_abi = abi_root.cap_transfer_abi;
+const device_abi = abi_root.device_abi;
+const image_abi = abi_root.image_abi;
 const user_vm = @import("memory/user_vm.zig");
-const process_abi = @import("abi/process_abi.zig");
-const queue_abi = @import("abi/queue_abi.zig");
+const process_abi = abi_root.process_abi;
+const queue_abi = abi_root.queue_abi;
 const untyped_memory = @import("untyped_memory.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
@@ -26,7 +26,6 @@ const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
-const syscall_create_window: u64 = 0xD;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_untyped_alloc: u64 = 0x10;
@@ -83,7 +82,6 @@ pub const Hooks = struct {
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
     launch_pie_user_thread: *const fn (*TrapFrame) u64,
     spawn_exec: *const fn (*TrapFrame) u64,
-    arm_deferred_compositor: *const fn (*TrapFrame) u64,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
     wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
     consume_pending_signal_for_principal: *const fn (kernel.PrincipalId) bool,
@@ -92,10 +90,6 @@ pub const Hooks = struct {
     log_queue_cap_deny: *const fn (kernel.PrincipalId, u64, kernel.DmaDeviceId, u16, kernel.QueueOperation, anyerror) void,
     log_race_send_cap: *const fn (kernel.PrincipalId, ?kernel.PrincipalId, u64, u64, []const u8) void,
     log_race_switch: *const fn (usize, usize, []const u8) void,
-    post_send_cap: *const fn (kernel.PrincipalId, kernel.PrincipalId, u64) void,
-    on_mailbox_receive: *const fn (kernel.PrincipalId, u64) void,
-    should_suppress_serial_user_log: *const fn ([]const u8) bool,
-    handle_user_log: *const fn (*TrapFrame, kernel.PrincipalId, []const u8) void,
 };
 
 var hooks: ?Hooks = null;
@@ -107,24 +101,6 @@ pub fn init(new_hooks: Hooks) void {
 
 fn getHooks() *const Hooks {
     return &(hooks orelse unreachable);
-}
-
-fn parseFsObjectKind(value: u64) ?kernel.FsObjectKind {
-    const abi_kind = std.meta.intToEnum(fs_abi.ObjectKind, @as(u8, @truncate(value))) catch return null;
-    return switch (abi_kind) {
-        .none => .none,
-        .mount => .mount,
-        .vnode_dir => .vnode_dir,
-        .vnode_file => .vnode_file,
-        .open_file => .open_file,
-        .exec => .exec,
-        .block_device => .block_device,
-    };
-}
-
-fn parseFsRights(bits: u64) kernel.FsRights {
-    const abi_rights = fs_abi.rightsFromBits(bits);
-    return @bitCast(abi_rights);
 }
 
 fn parseVmObjectRights(bits: u64) kernel.VmObjectRights {
@@ -177,6 +153,96 @@ fn collectMappedPagesForRange(
         .page_count = page_count,
         .page_offset_bytes = page_offset_bytes,
     };
+}
+
+fn readUserPaddrBatch(
+    h: *const Hooks,
+    proc: kernel.PrincipalId,
+    list_va: u64,
+    page_count_u64: u64,
+    out_paddrs: *[syscall_batch_max_pages]u64,
+) bool {
+    var i: u64 = 0;
+    while (i < page_count_u64) : (i += 1) {
+        const entry_va = list_va + i * 8;
+        out_paddrs[@intCast(i)] = h.read_user_u64(proc, entry_va) orelse return false;
+    }
+    return true;
+}
+
+fn shouldLogEndpointTransfer(endpoint_id: u64) bool {
+    return endpoint_id >= 0x80;
+}
+
+fn logEndpointTransfer(
+    h: *const Hooks,
+    phase: []const u8,
+    from: kernel.PrincipalId,
+    to: kernel.PrincipalId,
+    endpoint_id: u64,
+    paddr: u64,
+) void {
+    if (!shouldLogEndpointTransfer(endpoint_id)) return;
+    h.write(phase);
+    h.write(" from=");
+    h.write(h.principal_label(from));
+    h.write(" to=");
+    h.write(h.principal_label(to));
+    h.write(" ep=");
+    h.print_hex(endpoint_id);
+    h.write(" paddr=");
+    h.print_hex(paddr);
+    h.write("\n");
+}
+
+fn transferPageCapOnEndpoint(
+    state: *kernel.KernelState,
+    h: *const Hooks,
+    proc: kernel.PrincipalId,
+    endpoint_id: u64,
+    paddr: u64,
+    retain_sender: bool,
+) u64 {
+    const to = state.endpointTargetFor(proc, endpoint_id) orelse {
+        h.log_race_send_cap(proc, null, endpoint_id, paddr, "endpoint_not_found");
+        return syscall_err_endpoint;
+    };
+    logEndpointTransfer(h, if (retain_sender) "share_cap begin" else "send_cap begin", proc, to, endpoint_id, paddr);
+    if (retain_sender) {
+        state.shareCapOnEndpoint(proc, endpoint_id, paddr) catch |err| switch (err) {
+            kernel.KernelError.EndpointNotFound => {
+                h.log_race_send_cap(proc, null, endpoint_id, paddr, "endpoint_not_found");
+                return syscall_err_endpoint;
+            },
+            kernel.KernelError.CapabilityNotFound => {
+                h.log_race_send_cap(proc, to, endpoint_id, paddr, "cap_missing");
+                return syscall_err_send;
+            },
+            else => {
+                h.log_race_send_cap(proc, to, endpoint_id, paddr, @errorName(err));
+                return syscall_err_send;
+            },
+        };
+    } else {
+        state.sendCapOnEndpoint(proc, endpoint_id, paddr) catch |err| switch (err) {
+            kernel.KernelError.EndpointNotFound => {
+                h.log_race_send_cap(proc, null, endpoint_id, paddr, "endpoint_not_found");
+                return syscall_err_endpoint;
+            },
+            kernel.KernelError.CapabilityNotFound => {
+                h.log_race_send_cap(proc, to, endpoint_id, paddr, "cap_missing");
+                return syscall_err_send;
+            },
+            else => {
+                h.log_race_send_cap(proc, to, endpoint_id, paddr, @errorName(err));
+                return syscall_err_send;
+            },
+        };
+    }
+    h.wake_waiting_thread_for_principal(to);
+    logEndpointTransfer(h, if (retain_sender) "share_cap done" else "send_cap done", proc, to, endpoint_id, paddr);
+    if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
+    return syscall_ok;
 }
 
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
@@ -357,21 +423,6 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             };
             return syscall_ok;
         },
-        syscall_create_window => {
-            if (frame.rdi == 0 or frame.rsi == 0) return syscall_err_invalid;
-            if (frame.rdi > std.math.maxInt(u16) or frame.rsi > std.math.maxInt(u16)) return syscall_err_invalid;
-            const width: u16 = @intCast(frame.rdi);
-            const height: u16 = @intCast(frame.rsi);
-            const flags: u32 = @truncate(frame.rdx);
-            const compositor = state.endpointTargetFor(proc, frame.r8) orelse return syscall_err_endpoint;
-            const created = state.createWindow(proc, compositor, h.free_list, width, height, flags) catch |err| switch (err) {
-                kernel.KernelError.InvalidState => return syscall_err_invalid,
-                kernel.KernelError.TableFull => return syscall_err_alloc,
-                kernel.KernelError.OutOfFreePages => return syscall_err_alloc,
-                else => return syscall_err_alloc,
-            };
-            return created.window_cap_paddr;
-        },
         syscall_queue_submit, syscall_queue_notify => {
             const queue_token = frame.rdi;
             const device: kernel.DmaDeviceId = switch (frame.rsi) {
@@ -387,39 +438,6 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 return syscall_err_invalid;
             };
             return syscall_ok;
-        },
-        fs_abi.syscall_install_cap => {
-            if (!state.hasFsAdminCap(proc)) return syscall_err_invalid;
-            const kind = parseFsObjectKind(frame.rsi) orelse return syscall_err_invalid;
-            const rights = parseFsRights(frame.rdx);
-            const cap_id = state.installFsCap(proc, frame.rdi, kind, rights) catch |err| switch (err) {
-                kernel.KernelError.InvalidState => return syscall_err_invalid,
-                kernel.KernelError.TableFull => return syscall_err_alloc,
-                else => return syscall_err_alloc,
-            };
-            return fs_abi.encodeCapToken(cap_id);
-        },
-        fs_abi.syscall_grant_cap => {
-            const cap_id = fs_abi.decodeCapToken(frame.rdi) orelse return syscall_err_invalid;
-            const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
-            const rights = parseFsRights(frame.rdx);
-            const child_id = state.grantFsCap(proc, to, cap_id, rights) catch |err| switch (err) {
-                kernel.KernelError.InvalidState, kernel.KernelError.FsCapabilityNotFound => return syscall_err_grant,
-                kernel.KernelError.TableFull => return syscall_err_alloc,
-                else => return syscall_err_grant,
-            };
-            return fs_abi.encodeCapToken(child_id);
-        },
-        fs_abi.syscall_move_cap => {
-            const cap_id = fs_abi.decodeCapToken(frame.rdi) orelse return syscall_err_invalid;
-            const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
-            const rights = parseFsRights(frame.rdx);
-            const moved_id = state.moveFsCap(proc, to, cap_id, rights) catch |err| switch (err) {
-                kernel.KernelError.InvalidState, kernel.KernelError.FsCapabilityNotFound => return syscall_err_move,
-                kernel.KernelError.TableFull => return syscall_err_alloc,
-                else => return syscall_err_move,
-            };
-            return fs_abi.encodeCapToken(moved_id);
         },
         syscall_move_cap => {
             const to = switch (frame.rsi) {
@@ -445,11 +463,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const to = h.principal_from_process_slot(frame.rdx) orelse return syscall_err_invalid;
             const rights = capability.parseRights(frame.rcx);
             var paddrs: [syscall_batch_max_pages]u64 = undefined;
-            var i: u64 = 0;
-            while (i < page_count_u64) : (i += 1) {
-                const list_va = frame.rdi + i * 8;
-                paddrs[@intCast(i)] = h.read_user_u64(proc, list_va) orelse return syscall_err_invalid;
-            }
+            if (!readUserPaddrBatch(h, proc, frame.rdi, page_count_u64, &paddrs)) return syscall_err_invalid;
             state.grantCapsBatch(proc, to, paddrs[0..@intCast(page_count_u64)], rights) catch return syscall_err_grant;
             if (rights.dma and page_count_u64 > 1) {
                 h.write("grant_caps_batch dma to=");
@@ -481,11 +495,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const endpoint_id = frame.rdx;
             const rights = capability.parseRights(frame.rcx);
             var paddrs: [syscall_batch_max_pages]u64 = undefined;
-            var i: u64 = 0;
-            while (i < page_count_u64) : (i += 1) {
-                const list_va = frame.rdi + i * 8;
-                paddrs[@intCast(i)] = h.read_user_u64(proc, list_va) orelse return syscall_err_invalid;
-            }
+            if (!readUserPaddrBatch(h, proc, frame.rdi, page_count_u64, &paddrs)) return syscall_err_invalid;
             state.grantCapsBatchOnEndpoint(proc, endpoint_id, paddrs[0..@intCast(page_count_u64)], rights) catch |err| switch (err) {
                 kernel.KernelError.EndpointNotFound => return syscall_err_endpoint,
                 else => return syscall_err_grant,
@@ -520,88 +530,10 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return syscall_ok;
         },
         syscall_send_cap => {
-            const endpoint_id = frame.rsi;
-            const to = state.endpointTargetFor(proc, endpoint_id) orelse {
-                h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
-                return syscall_err_endpoint;
-            };
-            if (endpoint_id >= 0x80 or endpoint_id == kernel.endpoint_to_boot_display) {
-                h.write("send_cap begin from=");
-                h.write(h.principal_label(proc));
-                h.write(" to=");
-                h.write(h.principal_label(to));
-                h.write(" ep=");
-                h.print_hex(endpoint_id);
-                h.write(" paddr=");
-                h.print_hex(frame.rdi);
-                h.write("\n");
-            }
-            state.sendCapOnEndpoint(proc, endpoint_id, frame.rdi) catch |err| switch (err) {
-                kernel.KernelError.EndpointNotFound => {
-                    h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
-                    return syscall_err_endpoint;
-                },
-                kernel.KernelError.CapabilityNotFound => {
-                    h.log_race_send_cap(proc, to, endpoint_id, frame.rdi, "cap_missing");
-                    return syscall_err_send;
-                },
-                else => {
-                    h.log_race_send_cap(proc, to, endpoint_id, frame.rdi, @errorName(err));
-                    return syscall_err_send;
-                },
-            };
-            h.wake_waiting_thread_for_principal(to);
-            h.post_send_cap(proc, to, endpoint_id);
-            if (endpoint_id >= 0x80 or endpoint_id == kernel.endpoint_to_boot_display) {
-                h.write("send_cap done from=");
-                h.write(h.principal_label(proc));
-                h.write(" to=");
-                h.write(h.principal_label(to));
-                h.write(" ep=");
-                h.print_hex(endpoint_id);
-                h.write(" paddr=");
-                h.print_hex(frame.rdi);
-                h.write("\n");
-            }
-            if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
-            return syscall_ok;
+            return transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, false);
         },
         syscall_share_cap => {
-            const endpoint_id = frame.rsi;
-            const to = state.endpointTargetFor(proc, endpoint_id) orelse {
-                h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
-                return syscall_err_endpoint;
-            };
-            state.shareCapOnEndpoint(proc, endpoint_id, frame.rdi) catch |err| switch (err) {
-                kernel.KernelError.EndpointNotFound => {
-                    h.log_race_send_cap(proc, null, endpoint_id, frame.rdi, "endpoint_not_found");
-                    return syscall_err_endpoint;
-                },
-                kernel.KernelError.CapabilityNotFound => {
-                    h.log_race_send_cap(proc, to, endpoint_id, frame.rdi, "cap_missing");
-                    return syscall_err_send;
-                },
-                else => {
-                    h.log_race_send_cap(proc, to, endpoint_id, frame.rdi, @errorName(err));
-                    return syscall_err_send;
-                },
-            };
-            h.wake_waiting_thread_for_principal(to);
-            h.post_send_cap(proc, to, endpoint_id);
-            if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
-            return syscall_ok;
-        },
-        fs_abi.syscall_send_cap => {
-            const endpoint_id = frame.rsi;
-            const cap_id = fs_abi.decodeCapToken(frame.rdi) orelse return syscall_err_invalid;
-            const to = state.endpointTargetFor(proc, endpoint_id) orelse return syscall_err_endpoint;
-            _ = state.sendFsCapOnEndpoint(proc, endpoint_id, cap_id) catch |err| switch (err) {
-                kernel.KernelError.EndpointNotFound => return syscall_err_endpoint,
-                kernel.KernelError.FsCapabilityNotFound => return syscall_err_send,
-                else => return syscall_err_send,
-            };
-            h.wake_waiting_thread_for_principal(to);
-            return syscall_ok;
+            return transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, true);
         },
         syscall_recv_cap => {
             const received = state.recvCap(proc) catch |err| switch (err) {
@@ -618,15 +550,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 kernel.KernelError.TableFull => syscall_err_alloc,
                 else => syscall_err_send,
             };
-            h.on_mailbox_receive(proc, received);
             return received;
-        },
-        fs_abi.syscall_recv_cap => {
-            const received = state.recvFsCap(proc) catch |err| switch (err) {
-                kernel.KernelError.FsMailboxEmpty => syscall_err_empty,
-                else => syscall_err_send,
-            };
-            return fs_abi.encodeCapToken(received);
         },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;
@@ -750,13 +674,6 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 if (received >= cap_transfer_abi.transfer_id_min) {
                     return received;
                 }
-                const received_fs = state.recvFsCap(proc) catch |err| switch (err) {
-                    kernel.KernelError.FsMailboxEmpty => 0,
-                    else => return syscall_err_send,
-                };
-                if (received_fs != 0) {
-                    return fs_abi.encodeCapToken(received_fs);
-                }
             }
             if (h.consume_pending_signal_for_principal(proc)) {
                 return syscall_ok;
@@ -809,7 +726,6 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_launch_pie_user => return h.launch_pie_user_thread(frame),
         process_abi.syscall_spawn_exec => return h.spawn_exec(frame),
-        process_abi.syscall_arm_deferred_compositor => return h.arm_deferred_compositor(frame),
         syscall_log => {
             const req_len_u64 = frame.rsi;
             if (req_len_u64 == 0) return syscall_ok;
@@ -818,14 +734,10 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             var buf: [user_log_max_bytes]u8 = undefined;
             const msg = buf[0..req_len];
             if (!h.copy_user_bytes_from_va(proc, frame.rdi, msg)) return syscall_err_invalid;
-            if (!h.should_suppress_serial_user_log(msg)) {
-                h.write("userlog ");
-                h.write(h.thread_label(scheduler.current_thread_index));
-                h.write(": ");
-                h.write(msg);
-                h.write("\n");
-            }
-            h.handle_user_log(frame, proc, msg);
+            h.write("userlog ");
+            h.write(h.thread_label(scheduler.current_thread_index));
+            h.write(": ");
+            h.write(msg);
             return syscall_ok;
         },
         else => return syscall_err_invalid,

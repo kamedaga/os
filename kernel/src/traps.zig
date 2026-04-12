@@ -21,7 +21,7 @@ pub const Hooks = struct {
     kernel_state_ready: *const bool,
     state: *kernel.KernelState,
     scheduler_quantum_ticks: u64,
-    compositor_hold_quanta: u64,
+    priority_hold_quanta: u64,
     scheduler_log_switch: bool,
     scheduler_switch_log_max_lines: u64,
     write: *const fn ([]const u8) void,
@@ -34,11 +34,6 @@ pub const Hooks = struct {
     dump_page_walk_for_va: *const fn (u64, u64) void,
     log_page_fault_step2: *const fn (u64, *const ExceptionTrapFrame) void,
     halt_loop: *const fn () noreturn,
-    maybe_log_scheduler_perf_tick: *const fn () void,
-    note_user_timer_tick: *const fn (*TrapFrame) void,
-    log_staged_user_return: *const fn () void,
-    try_start_bootlog_gate_deferred_input: *const fn () void,
-    try_auto_launch_deferred_compositor: *const fn (*TrapFrame) void,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     log_race_switch: *const fn (usize, usize, []const u8) void,
 };
@@ -148,10 +143,7 @@ fn writeByteHex(h: *const Hooks, byte: u8) void {
 
 pub export fn logTimerReturnFrame(_: *const TrapFrame) callconv(.c) void {}
 
-pub export fn logCurrentStagedUserReturnFrame() callconv(.c) void {
-    const h = getHooks();
-    h.log_staged_user_return();
-}
+pub export fn logCurrentStagedUserReturnFrame() callconv(.c) void {}
 
 pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
     asm volatile (
@@ -293,15 +285,11 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!user_mode) return;
     scheduler.noteUserTimerTick();
-    h.note_user_timer_tick(frame);
-    h.maybe_log_scheduler_perf_tick();
-    h.try_start_bootlog_gate_deferred_input();
-    h.try_auto_launch_deferred_compositor(frame);
 
     const current_thread = scheduler.current_thread_index;
     const next_thread = scheduler.chooseNextThreadForTimerPreempt(
         h.scheduler_quantum_ticks,
-        h.compositor_hold_quanta,
+        h.priority_hold_quanta,
     ) orelse return;
     if (!h.switch_to_thread(next_thread, frame, null)) {
         h.log_race_switch(current_thread, next_thread, "timer_preempt_switch_failed");

@@ -1,11 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const capability = @import("capability.zig");
-const cap_transfer_abi = @import("abi/cap_transfer_abi.zig");
+const abi_root = @import("kernel_abi_root");
+const cap_transfer_abi = abi_root.cap_transfer_abi;
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
-const device_abi = @import("abi/device_abi.zig");
-const debug_window_force_free_list = true;
-
+const device_abi = abi_root.device_abi;
 pub const initial_process_count: usize = 8;
 pub const process_count: usize = 32;
 pub const max_thread_slots: usize = 16;
@@ -40,13 +39,6 @@ fn PrincipalIdType(comptime named_process_slots: usize) type {
 
 pub const PrincipalId = PrincipalIdType(initial_process_count);
 const default_process_principal: PrincipalId = processPrincipalFromIndex(0) orelse unreachable;
-pub const vfs_process_index: usize = 8;
-pub const vfs_principal: PrincipalId = @enumFromInt(vfs_process_index);
-
-comptime {
-    if (vfs_process_index >= process_count) @compileError("vfs_process_index must be < process_count");
-    if (vfs_process_index < initial_process_count) @compileError("vfs_process_index must stay outside the initial boot role set");
-}
 
 const process_labels = blk: {
     var labels: [process_count][]const u8 = undefined;
@@ -68,7 +60,6 @@ pub fn processIndexFromPrincipal(principal: PrincipalId) ?usize {
 }
 
 pub fn principalLabel(principal: PrincipalId) []const u8 {
-    if (isVfsPrincipal(principal)) return "VFS";
     if (processIndexFromPrincipal(principal)) |index| {
         return process_labels[index];
     }
@@ -76,16 +67,8 @@ pub fn principalLabel(principal: PrincipalId) []const u8 {
     return "Unknown";
 }
 
-pub const endpoint_to_boot_display: u64 = 0x11;
-pub const endpoint_to_vfs: u64 = 0x13;
-pub const endpoint_to_spawn_parent: u64 = 0x14;
-
 fn isProcessPrincipal(principal: PrincipalId) bool {
     return processIndexFromPrincipal(principal) != null;
-}
-
-pub fn isVfsPrincipal(principal: PrincipalId) bool {
-    return @intFromEnum(principal) == vfs_process_index;
 }
 
 pub const Rights = struct {
@@ -117,6 +100,7 @@ pub const PendingCapTransfer = struct {
     retain_sender: bool = false,
 };
 
+
 pub const Region = struct {
     id: u64,
 };
@@ -130,12 +114,10 @@ pub const ProcessDescriptor = struct {
 pub const KernelError = error{
     RegionNotFound,
     CapabilityNotFound,
-    FsCapabilityNotFound,
     VmObjectCapabilityNotFound,
     ExecImageCapabilityNotFound,
     EndpointNotFound,
     MailboxEmpty,
-    FsMailboxEmpty,
     RevokeOverflow,
     NoDmaRight,
     InvalidState,
@@ -273,106 +255,6 @@ pub const CapMailbox = struct {
         }
         self.len -= 1;
         return transfer;
-    }
-};
-
-pub const FsObjectKind = enum(u8) {
-    none = 0,
-    mount = 1,
-    vnode_dir = 2,
-    vnode_file = 3,
-    open_file = 4,
-    exec = 5,
-    block_device = 6,
-};
-
-pub const FsRights = packed struct(u32) {
-    lookup: bool = false,
-    read: bool = false,
-    write: bool = false,
-    readdir: bool = false,
-    stat: bool = false,
-    create: bool = false,
-    unlink: bool = false,
-    rename: bool = false,
-    exec: bool = false,
-    mount: bool = false,
-    grant: bool = false,
-    admin: bool = false,
-    _reserved: u20 = 0,
-};
-
-pub const FsCapability = struct {
-    object_id: u64,
-    kind: FsObjectKind,
-    rights: FsRights,
-    cap_id: u64,
-    root_cap_id: u64,
-    parent_cap_id: u64,
-};
-
-pub const FsCNode = struct {
-    pub const max_caps = 256;
-
-    caps: [max_caps]FsCapability = undefined,
-    len: usize = 0,
-
-    pub fn add(self: *FsCNode, cap: FsCapability) KernelError!void {
-        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
-        if (self.len >= self.caps.len) return KernelError.TableFull;
-        self.caps[self.len] = cap;
-        self.len += 1;
-    }
-
-    pub fn findByCapId(self: *const FsCNode, cap_id: u64) ?*const FsCapability {
-        if (self.findIndexByCapId(cap_id)) |index| {
-            return &self.caps[index];
-        }
-        return null;
-    }
-
-    pub fn removeByCapId(self: *FsCNode, cap_id: u64) bool {
-        if (self.findIndexByCapId(cap_id)) |index| {
-            var i = index;
-            while (i + 1 < self.len) : (i += 1) {
-                self.caps[i] = self.caps[i + 1];
-            }
-            self.len -= 1;
-            return true;
-        }
-        return false;
-    }
-
-    fn findIndexByCapId(self: *const FsCNode, cap_id: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            if (self.caps[i].cap_id == cap_id) return i;
-        }
-        return null;
-    }
-};
-
-pub const FsMailbox = struct {
-    const max_items = 8;
-
-    items: [max_items]u64 = undefined,
-    len: usize = 0,
-
-    pub fn push(self: *FsMailbox, cap_id: u64) KernelError!void {
-        if (self.len >= self.items.len) return KernelError.TableFull;
-        self.items[self.len] = cap_id;
-        self.len += 1;
-    }
-
-    pub fn pop(self: *FsMailbox) ?u64 {
-        if (self.len == 0) return null;
-        const cap_id = self.items[0];
-        var i: usize = 1;
-        while (i < self.len) : (i += 1) {
-            self.items[i - 1] = self.items[i];
-        }
-        self.len -= 1;
-        return cap_id;
     }
 };
 
@@ -762,103 +644,11 @@ pub const UntypedPool = struct {
     }
 };
 
-pub const FramebufferCapability = struct {
-    paddr: u64,
-    size_bytes: usize,
-    width: u32,
-    height: u32,
-    pixels_per_scan_line: u32,
-    pixel_format: u32,
-    allow_draw: bool = false,
-};
-
-pub const WindowRights = packed struct(u16) {
-    read_meta: bool = false,
-    write_meta: bool = false,
-    write_pixels: bool = false,
-    control: bool = false,
-    dma_pixels: bool = false,
-    _reserved: u11 = 0,
-};
-
-pub const window_flag_allow_pixels_dma: u32 = 1 << 0;
-pub const window_flag_low_scale: u32 = 1 << 1;
-
-pub const WindowCap = packed struct {
-    magic: u32, // 'WCAP'
-    version: u16,
-    rights_bits: u16,
-    window_id: u32,
-    owner_pid: u32,
-    pixels_cap_paddr: u64,
-    meta_cap_paddr: u64,
-    pixels_size_bytes: u32,
-    pixels_page_count: u16,
-    pixels_per_scan_line: u16,
-    pixel_format: u32,
-    evt_cap_paddr: u64,
-    width: u16,
-    height: u16,
-    min_width: u16,
-    min_height: u16,
-    flags: u32,
-    z_hint: i32,
-    reserved0: u32,
-};
-
-pub const WindowMeta = extern struct {
-    magic: u32, // 'WMTA'
-    version: u16,
-    state: u16,
-    seq: u64,
-    pos_x: i32,
-    pos_y: i32,
-    width: u16,
-    height: u16,
-    dirty_x: u16,
-    dirty_y: u16,
-    dirty_w: u16,
-    dirty_h: u16,
-    title_len: u16,
-    title: [64]u8,
-};
-
 const DmaRestoreEntry = struct {
     valid: bool = false,
     paddr: u64 = 0,
     owner: PrincipalId = default_process_principal,
     rights: Rights = .{ .cpu_read = false, .cpu_write = false, .dma = false },
-};
-
-pub const WindowRecord = struct {
-    active: bool = false,
-    window_id: u32 = 0,
-    owner: PrincipalId = default_process_principal,
-    cap_paddr: u64 = 0,
-    pixels_paddr: u64 = 0,
-    meta_paddr: u64 = 0,
-    pixels_size_bytes: u32 = 0,
-    pixels_page_count: u16 = 0,
-    pixels_per_scan_line: u16 = 0,
-    width: u16 = 0,
-    height: u16 = 0,
-    flags: u32 = 0,
-    z_hint: i32 = 0,
-};
-
-pub const CreateWindowResult = struct {
-    window_cap_paddr: u64,
-    meta_paddr: u64,
-    pixels_first_paddr: u64,
-    pixels_page_count: u16,
-};
-
-pub const DebugWindowStage = enum(u8) {
-    after_alloc,
-    after_grant_meta,
-    after_cap_init,
-    after_meta_init,
-    after_record_write,
 };
 
 pub const DebugAllocPageStage = enum(u8) {
@@ -917,7 +707,6 @@ const IommuNoCapDriverState = struct {
 pub const KernelState = struct {
     pub const max_regions = 256;
     const max_total_caps = principal_count * CNode.max_caps;
-    pub const max_windows = 64;
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
@@ -928,14 +717,10 @@ pub const KernelState = struct {
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     pending_page_transfers: [principal_count]?PendingCapTransfer = [_]?PendingCapTransfer{null} ** principal_count,
-    framebuffer_caps: [principal_count]?FramebufferCapability = [_]?FramebufferCapability{null} ** principal_count,
-    fs_tables: [principal_count]FsCNode = [_]FsCNode{.{}} ** principal_count,
-    fs_mailboxes: [principal_count]FsMailbox = [_]FsMailbox{.{}} ** principal_count,
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
     exec_image_tables: [principal_count]ExecImageCNode = [_]ExecImageCNode{.{}} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
-    debug_window_hook: ?*const fn (state: *const KernelState, owner: PrincipalId, stage: DebugWindowStage, slot: usize, cap_paddr: u64, meta_paddr: u64) void = null,
     debug_alloc_page_hook: ?*const fn (state: *const KernelState, requester: PrincipalId, stage: DebugAllocPageStage, paddr: u64) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
@@ -949,8 +734,6 @@ pub const KernelState = struct {
     next_cap_id: u64 = 1,
     next_transfer_id: u64 = cap_transfer_abi.transfer_id_min,
     untyped_pool: UntypedPool = .{},
-    windows: [max_windows]WindowRecord = [_]WindowRecord{.{}} ** max_windows,
-    next_window_id: u32 = 1,
 
     fn allocCapId(self: *KernelState) u64 {
         const id = self.next_cap_id;
@@ -1144,249 +927,11 @@ pub const KernelState = struct {
         try self.syncAllIommuForPrincipal(principal, .grant_dma);
     }
 
-    pub fn allocWindowSlot(self: *KernelState) ?usize {
-        var i: usize = 0;
-        while (i < self.windows.len) : (i += 1) {
-            if (!self.windows[i].active) return i;
-        }
-        return null;
-    }
-
-    pub fn allocWindowId(self: *KernelState) u32 {
-        const id = self.next_window_id;
-        self.next_window_id +%= 1;
-        return id;
-    }
-
-    noinline fn callDebugWindowHook(
-        hook: *const fn (state: *const KernelState, owner: PrincipalId, stage: DebugWindowStage, slot: usize, cap_paddr: u64, meta_paddr: u64) void,
-        self: *const KernelState,
-        owner: PrincipalId,
-        stage: DebugWindowStage,
-        slot: usize,
-        cap_paddr: u64,
-        meta_paddr: u64,
-    ) void {
-        hook(self, owner, stage, slot, cap_paddr, meta_paddr);
-    }
-
-    noinline fn initWindowCapPage(
-        window_cap_paddr: u64,
-        owner: PrincipalId,
-        meta_paddr: u64,
-        pixels_first_paddr: u64,
-        bytes_aligned: u64,
-        page_count: usize,
-        pitch: u16,
-        width: u16,
-        height: u16,
-        flags: u32,
-        window_id: u32,
-        allow_pixel_dma: bool,
-    ) void {
-        const rights = WindowRights{
-            .read_meta = true,
-            .write_meta = true,
-            .write_pixels = true,
-            .control = true,
-            .dma_pixels = allow_pixel_dma,
-        };
-        const cap_bytes: [*]volatile u8 = @ptrFromInt(window_cap_paddr);
-        @memset(cap_bytes[0..4096], 0);
-        const cap_view: *volatile WindowCap = @ptrFromInt(window_cap_paddr);
-        cap_view.* = .{
-            .magic = 0x57434150, // 'WCAP'
-            .version = 1,
-            .rights_bits = @bitCast(rights),
-            .window_id = window_id,
-            .owner_pid = @intFromEnum(owner),
-            .pixels_cap_paddr = pixels_first_paddr,
-            .meta_cap_paddr = meta_paddr,
-            .pixels_size_bytes = @intCast(bytes_aligned),
-            .pixels_page_count = @intCast(page_count),
-            .pixels_per_scan_line = pitch,
-            .pixel_format = 0,
-            .evt_cap_paddr = 0,
-            .width = width,
-            .height = height,
-            .min_width = 16,
-            .min_height = 16,
-            .flags = flags,
-            .z_hint = 0,
-            .reserved0 = 0,
-        };
-    }
-
-    noinline fn initWindowMetaPage(meta_paddr: u64, width: u16, height: u16) void {
-        const meta_bytes: [*]volatile u8 = @ptrFromInt(meta_paddr);
-        @memset(meta_bytes[0..4096], 0);
-        const meta_view: *volatile WindowMeta = @ptrFromInt(meta_paddr);
-        meta_view.* = .{
-            .magic = 0x574D5441, // 'WMTA'
-            .version = 2,
-            .state = 1,
-            .seq = 1,
-            .pos_x = 64,
-            .pos_y = 64,
-            .width = width,
-            .height = height,
-            .dirty_x = 0,
-            .dirty_y = 0,
-            .dirty_w = width,
-            .dirty_h = height,
-            .title_len = 0,
-            .title = [_]u8{0} ** 64,
-        };
-    }
-
-    noinline fn writeWindowRecord(
-        self: *KernelState,
-        slot: usize,
-        owner: PrincipalId,
-        window_id: u32,
-        cap_paddr: u64,
-        meta_paddr: u64,
-        pixels_first_paddr: u64,
-        bytes_aligned: u64,
-        page_count: usize,
-        pitch: u16,
-        width: u16,
-        height: u16,
-        flags: u32,
-    ) void {
-        self.windows[slot] = .{
-            .active = true,
-            .window_id = window_id,
-            .owner = owner,
-            .cap_paddr = cap_paddr,
-            .pixels_paddr = pixels_first_paddr,
-            .meta_paddr = meta_paddr,
-            .pixels_size_bytes = @intCast(bytes_aligned),
-            .pixels_page_count = @intCast(page_count),
-            .pixels_per_scan_line = pitch,
-            .width = width,
-            .height = height,
-            .flags = flags,
-            .z_hint = 0,
-        };
-    }
-
-    pub fn createWindow(
-        self: *KernelState,
-        owner: PrincipalId,
-        compositor: PrincipalId,
-        free_list: *FreePageList,
-        width: u16,
-        height: u16,
-        flags: u32,
-    ) KernelError!CreateWindowResult {
-        if (!isProcessPrincipal(owner) or !isProcessPrincipal(compositor)) return KernelError.InvalidState;
-        if (width == 0 or height == 0) return KernelError.InvalidState;
-        if (width > 2048 or height > 2048) return KernelError.InvalidState;
-
-        const slot = self.allocWindowSlot() orelse return KernelError.TableFull;
-        const allow_pixel_dma = (flags & window_flag_allow_pixels_dma) != 0;
-
-        const pitch: u16 = width;
-        const pixel_count = @as(u64, width) * @as(u64, height);
-        const bytes_unaligned = pixel_count * 4;
-        if (bytes_unaligned == 0 or bytes_unaligned > (16 * 1024 * 1024)) return KernelError.InvalidState;
-        const bytes_aligned = pageAlignUp(bytes_unaligned);
-        const page_count_u64 = bytes_aligned / 4096;
-        if (page_count_u64 == 0 or page_count_u64 > 1024) return KernelError.InvalidState;
-        const page_count: usize = @intCast(page_count_u64);
-
-        var bookkeeping_pages: [2]PageCapability = undefined;
-        if (!debug_window_force_free_list) {
-            if (self.findOwnedUntypedForPages(owner, 2, true)) |block_id| {
-                try self.retypeUntypedToPages(owner, block_id, 2, true, bookkeeping_pages[0..]);
-            } else {
-                bookkeeping_pages[0] = try self.allocPageTo(owner, free_list);
-                bookkeeping_pages[1] = try self.allocPageTo(owner, free_list);
-            }
-        } else {
-            bookkeeping_pages[0] = try self.allocPageTo(owner, free_list);
-            bookkeeping_pages[1] = try self.allocPageTo(owner, free_list);
-        }
-        const window_cap_page = bookkeeping_pages[0];
-        const meta_page = bookkeeping_pages[1];
-        if (self.debug_window_hook) |hook| {
-            callDebugWindowHook(hook, self, owner, .after_alloc, slot, window_cap_page.paddr, meta_page.paddr);
-        }
-
-        const pixels_first_paddr: u64 = 0;
-
-        try self.grantCap(owner, compositor, meta_page.paddr, .{
-            .cpu_read = true,
-            .cpu_write = false,
-            .dma = false,
-        });
-        if (self.debug_window_hook) |hook| {
-            callDebugWindowHook(hook, self, owner, .after_grant_meta, slot, window_cap_page.paddr, meta_page.paddr);
-        }
-
-        const window_id = self.allocWindowId();
-        initWindowCapPage(
-            window_cap_page.paddr,
-            owner,
-            meta_page.paddr,
-            pixels_first_paddr,
-            bytes_aligned,
-            page_count,
-            pitch,
-            width,
-            height,
-            flags,
-            window_id,
-            allow_pixel_dma,
-        );
-        if (self.debug_window_hook) |hook| {
-            callDebugWindowHook(hook, self, owner, .after_cap_init, slot, window_cap_page.paddr, meta_page.paddr);
-        }
-
-        initWindowMetaPage(meta_page.paddr, width, height);
-        if (self.debug_window_hook) |hook| {
-            callDebugWindowHook(hook, self, owner, .after_meta_init, slot, window_cap_page.paddr, meta_page.paddr);
-        }
-
-        writeWindowRecord(
-            self,
-            slot,
-            owner,
-            window_id,
-            window_cap_page.paddr,
-            meta_page.paddr,
-            pixels_first_paddr,
-            bytes_aligned,
-            page_count,
-            pitch,
-            width,
-            height,
-            flags,
-        );
-        if (self.debug_window_hook) |hook| {
-            callDebugWindowHook(hook, self, owner, .after_record_write, slot, window_cap_page.paddr, meta_page.paddr);
-        }
-
-        return .{
-            .window_cap_paddr = window_cap_page.paddr,
-            .meta_paddr = meta_page.paddr,
-            .pixels_first_paddr = pixels_first_paddr,
-            .pixels_page_count = @intCast(page_count),
-        };
-    }
-
     fn isRightsSubset(child: Rights, parent: Rights) bool {
         return (!child.cpu_read or parent.cpu_read) and
             (!child.cpu_write or parent.cpu_write) and
             (!child.dma or parent.dma) and
             (!child.grant or parent.grant);
-    }
-
-    fn isFsRightsSubset(child: FsRights, parent: FsRights) bool {
-        const child_bits: u32 = @bitCast(child);
-        const parent_bits: u32 = @bitCast(parent);
-        return (child_bits & ~parent_bits) == 0;
     }
 
     fn isVmObjectRightsSubset(child: VmObjectRights, parent: VmObjectRights) bool {
@@ -1455,7 +1000,10 @@ pub const KernelState = struct {
 
     pub fn ensureProcessDescriptor(self: *KernelState, principal: PrincipalId, label: []const u8) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
-        if (self.process_descriptors[index].active) return true;
+        if (self.process_descriptors[index].active) {
+            self.process_descriptors[index].label = label;
+            return true;
+        }
         self.process_descriptors[index] = .{
             .active = true,
             .principal = principal,
@@ -1473,10 +1021,6 @@ pub const KernelState = struct {
         return true;
     }
 
-    pub fn ensureVfsProcess(self: *KernelState) bool {
-        return self.ensureProcessDescriptor(vfs_principal, principalLabel(vfs_principal));
-    }
-
     fn initPrincipalState(self: *KernelState) void {
         var i: usize = 0;
         while (i < principal_count) : (i += 1) {
@@ -1485,9 +1029,6 @@ pub const KernelState = struct {
             self.endpoint_tables[i] = .{};
             self.cap_mailboxes[i] = .{};
             self.pending_page_transfers[i] = null;
-            self.framebuffer_caps[i] = null;
-            self.fs_tables[i] = .{};
-            self.fs_mailboxes[i] = .{};
             self.vm_object_tables[i] = .{};
             self.exec_image_tables[i] = .{};
         }
@@ -1511,7 +1052,6 @@ pub const KernelState = struct {
     pub fn initPhase1InPlace(self: *KernelState) void {
         self.* = .{};
         self.next_cap_id = 1;
-        self.next_window_id = 1;
         self.regions[0] = .{
             .id = 0,
         };
@@ -1539,7 +1079,6 @@ pub const KernelState = struct {
 
         self.* = .{};
         self.next_cap_id = 1;
-        self.next_window_id = 1;
         self.initPrincipalState();
 
         var i: usize = 0;
@@ -1794,23 +1333,6 @@ pub const KernelState = struct {
         }
     }
 
-    pub fn getFsTable(self: *KernelState, principal: PrincipalId) *FsCNode {
-        return &self.fs_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getFsTableConst(self: *const KernelState, principal: PrincipalId) *const FsCNode {
-        return &self.fs_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn hasFsAdminCap(self: *const KernelState, principal: PrincipalId) bool {
-        const table = self.getFsTableConst(principal);
-        var i: usize = 0;
-        while (i < table.len) : (i += 1) {
-            if (table.caps[i].rights.admin) return true;
-        }
-        return false;
-    }
-
     pub fn getVmObjectTable(self: *KernelState, principal: PrincipalId) *VmObjectCNode {
         return &self.vm_object_tables[self.principalStorageIndex(principal)];
     }
@@ -1831,125 +1353,6 @@ pub const KernelState = struct {
         if (!self.hasActivePrincipal(owner)) return null;
         const ep = self.getEndpointTableConst(owner).find(endpoint_id) orelse return null;
         return ep.target;
-    }
-
-    pub fn grantFramebufferCap(
-        self: *KernelState,
-        to: PrincipalId,
-        framebuffer: FramebufferCapability,
-    ) KernelError!void {
-        try self.requireActiveProcess(to);
-        if (framebuffer.size_bytes == 0) return KernelError.InvalidState;
-
-        const size_minus_one = framebuffer.size_bytes - 1;
-        const paddr_overflow = @addWithOverflow(framebuffer.paddr, @as(u64, @intCast(size_minus_one)))[1];
-        if (paddr_overflow != 0) return KernelError.InvalidState;
-
-        self.framebuffer_caps[@intFromEnum(to)] = framebuffer;
-    }
-
-    pub fn installFsCap(
-        self: *KernelState,
-        owner: PrincipalId,
-        object_id: u64,
-        kind: FsObjectKind,
-        rights: FsRights,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-        if (kind == .none) return KernelError.InvalidState;
-
-        const root_id = self.allocCapId();
-        try self.getFsTable(owner).add(.{
-            .object_id = object_id,
-            .kind = kind,
-            .rights = rights,
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        return root_id;
-    }
-
-    pub fn grantFsCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        cap_id: u64,
-        rights: FsRights,
-    ) KernelError!u64 {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getFsTableConst(from).findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        if (!isFsRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-
-        const child_id = self.allocCapId();
-        try self.getFsTable(to).add(.{
-            .object_id = src_cap.object_id,
-            .kind = src_cap.kind,
-            .rights = rights,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-        return child_id;
-    }
-
-    pub fn moveFsCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        cap_id: u64,
-        rights: FsRights,
-    ) KernelError!u64 {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src = self.getFsTable(from);
-        const src_cap = src.findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
-        if (!isFsRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-
-        var moved = src_cap.*;
-        moved.rights = rights;
-        _ = src.removeByCapId(cap_id);
-        try self.getFsTable(to).add(moved);
-        return moved.cap_id;
-    }
-
-    pub fn sendFsCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        cap_id: u64,
-    ) KernelError!u64 {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getFsTableConst(from).findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
-        return self.moveFsCap(from, to, cap_id, src_cap.rights);
-    }
-
-    pub fn sendFsCapOnEndpoint(
-        self: *KernelState,
-        from: PrincipalId,
-        endpoint_id: u64,
-        cap_id: u64,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(from);
-        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        const src_cap = self.getFsTableConst(from).findByCapId(cap_id) orelse return KernelError.FsCapabilityNotFound;
-        const child_id = try self.grantFsCap(from, target, cap_id, src_cap.rights);
-        try self.fs_mailboxes[@intFromEnum(target)].push(child_id);
-        return child_id;
-    }
-
-    pub fn recvFsCap(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
-        try self.requireActiveProcess(receiver);
-        return self.fs_mailboxes[@intFromEnum(receiver)].pop() orelse KernelError.FsMailboxEmpty;
     }
 
     pub fn installVmObjectCap(
@@ -2071,32 +1474,6 @@ pub const KernelState = struct {
             .parent_cap_id = src_cap.cap_id,
         });
         return child_id;
-    }
-
-    pub fn getFramebufferCap(self: *const KernelState, principal: PrincipalId) ?FramebufferCapability {
-        if (!self.hasActivePrincipal(principal)) return null;
-        return self.framebuffer_caps[@intFromEnum(principal)];
-    }
-
-    pub fn canDrawToFramebuffer(
-        self: *const KernelState,
-        principal: PrincipalId,
-        paddr: u64,
-        size_bytes: usize,
-        writable: bool,
-    ) bool {
-        if (!writable) return false;
-        if (size_bytes == 0) return false;
-
-        const framebuffer = self.getFramebufferCap(principal) orelse return false;
-        if (!framebuffer.allow_draw) return false;
-
-        const map_end, const map_overflow = @addWithOverflow(paddr, @as(u64, @intCast(size_bytes - 1)));
-        if (map_overflow != 0) return false;
-        const fb_end, const fb_overflow = @addWithOverflow(framebuffer.paddr, @as(u64, @intCast(framebuffer.size_bytes - 1)));
-        if (fb_overflow != 0) return false;
-
-        return paddr >= framebuffer.paddr and map_end <= fb_end;
     }
 
     pub fn scanCapTables(self: *const KernelState, paddr: u64) OwnershipView {
@@ -3077,8 +2454,8 @@ test "sendCap rejects non-process endpoints" {
 
 test "sendCapOnEndpoint requires endpoint capability" {
     var s = KernelState.initPhase1();
-    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
-    try s.sendCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    try s.installEndpoint(.Process0, 0x11, .Process1);
+    try s.sendCapOnEndpoint(.Process0, 0x11, 0x1000);
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) != null);
     try std.testing.expect(s.getTableConst(.Process1).find(0x1000) == null);
     const transfer_id = try s.recvCap(.Process1);
@@ -3139,8 +2516,8 @@ test "sendCapOnEndpoint rejects missing endpoint" {
 
 test "sendCapOnEndpoint enqueues mailbox for target" {
     var s = KernelState.initPhase1();
-    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
-    try s.sendCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    try s.installEndpoint(.Process0, 0x11, .Process1);
+    try s.sendCapOnEndpoint(.Process0, 0x11, 0x1000);
     const transfer_id = try s.recvCap(.Process1);
     try std.testing.expect(transfer_id >= cap_transfer_abi.transfer_id_min);
     try std.testing.expectEqual(transfer_id, try s.recvCap(.Process1));
@@ -3149,8 +2526,8 @@ test "sendCapOnEndpoint enqueues mailbox for target" {
 
 test "acceptCapTransfer rejects mismatched transfer token" {
     var s = KernelState.initPhase1();
-    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
-    try s.sendCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    try s.installEndpoint(.Process0, 0x11, .Process1);
+    try s.sendCapOnEndpoint(.Process0, 0x11, 0x1000);
     const transfer_id = try s.recvCap(.Process1);
     try std.testing.expect(transfer_id >= cap_transfer_abi.transfer_id_min);
     try std.testing.expectError(KernelError.InvalidState, s.acceptCapTransfer(.Process1, transfer_id + 1));
@@ -3202,9 +2579,9 @@ test "sendCapOnEndpoint moves derived page capability after receiver accepts" {
         .cpu_write = false,
         .dma = false,
     });
-    try s.installEndpoint(.Process1, endpoint_to_boot_display, .Process2);
+    try s.installEndpoint(.Process1, 0x11, .Process2);
 
-    try s.sendCapOnEndpoint(.Process1, endpoint_to_boot_display, 0x1000);
+    try s.sendCapOnEndpoint(.Process1, 0x11, 0x1000);
     const transfer_id = try s.recvCap(.Process2);
     try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process2, transfer_id));
     try std.testing.expect(s.getTableConst(.Process1).find(0x1000) == null);
@@ -3216,8 +2593,8 @@ test "sendCapOnEndpoint moves derived page capability after receiver accepts" {
 
 test "shareCapOnEndpoint keeps sender capability after receiver accepts" {
     var s = KernelState.initPhase1();
-    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
-    try s.shareCapOnEndpoint(.Process0, endpoint_to_boot_display, 0x1000);
+    try s.installEndpoint(.Process0, 0x11, .Process1);
+    try s.shareCapOnEndpoint(.Process0, 0x11, 0x1000);
     const transfer_id = try s.recvCap(.Process1);
     try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process1, transfer_id));
     const sender = s.getTableConst(.Process0).find(0x1000).?;
@@ -3243,87 +2620,14 @@ test "revokeCapTree from child only removes child subtree" {
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) != null);
 }
 
-test "framebuffer capability grants draw right only to owner process" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    const fb_cap = FramebufferCapability{
-        .paddr = 0x8000_0000,
-        .size_bytes = 0x20_0000,
-        .width = 1024,
-        .height = 768,
-        .pixels_per_scan_line = 1024,
-        .pixel_format = 0,
-        .allow_draw = true,
-    };
-
-    try s.grantFramebufferCap(.Process0, fb_cap);
-    try std.testing.expect(s.canDrawToFramebuffer(.Process0, 0x8000_1000, 0x1000, true));
-    try std.testing.expect(!s.canDrawToFramebuffer(.Process1, 0x8000_1000, 0x1000, true));
-    try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x7FFF_F000, 0x2000, true));
-    try std.testing.expect(!s.canDrawToFramebuffer(.Process0, 0x8000_1000, 0x1000, false));
-}
-
-test "ensureVfsProcess activates reserved VFS principal" {
+test "ensureProcessDescriptor updates label for reserved slot" {
     var s = KernelState.initPhase1();
-    try std.testing.expect(!s.isActiveProcess(vfs_principal));
-    try std.testing.expect(s.ensureVfsProcess());
-    try std.testing.expect(s.isActiveProcess(vfs_principal));
-    const desc = s.processDescriptor(vfs_principal).?;
-    try std.testing.expectEqualStrings("VFS", desc.label);
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+    try std.testing.expect(!s.isActiveProcess(fs_owner));
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    try std.testing.expect(s.isActiveProcess(fs_owner));
+    try std.testing.expectEqualStrings("bootstrap-fs", s.processDescriptor(fs_owner).?.label);
+    try std.testing.expect(s.ensureProcessDescriptor(.Process0, "bootstrap-owner"));
+    try std.testing.expectEqualStrings("bootstrap-owner", s.processDescriptor(.Process0).?.label);
 }
 
-test "filesystem capability grant preserves object and lineage" {
-    var s = KernelState.initPhase1();
-    try std.testing.expect(s.ensureVfsProcess());
-
-    const root_token = try s.installFsCap(vfs_principal, 0x100, .mount, .{
-        .lookup = true,
-        .read = true,
-        .readdir = true,
-        .stat = true,
-        .mount = true,
-        .grant = true,
-    });
-    const child_token = try s.grantFsCap(vfs_principal, .Process0, root_token, .{
-        .lookup = true,
-        .read = true,
-        .readdir = true,
-        .stat = true,
-    });
-
-    const root_cap = s.getFsTableConst(vfs_principal).findByCapId(root_token).?;
-    const child_cap = s.getFsTableConst(.Process0).findByCapId(child_token).?;
-    try std.testing.expectEqual(@as(u64, 0x100), child_cap.object_id);
-    try std.testing.expectEqual(FsObjectKind.mount, child_cap.kind);
-    try std.testing.expectEqual(root_cap.root_cap_id, child_cap.root_cap_id);
-    try std.testing.expectEqual(root_cap.cap_id, child_cap.parent_cap_id);
-}
-
-test "filesystem capability grant requires grant right" {
-    var s = KernelState.initPhase1();
-    try std.testing.expect(s.ensureVfsProcess());
-
-    const root_token = try s.installFsCap(vfs_principal, 0x180, .vnode_dir, .{
-        .lookup = true,
-        .readdir = true,
-        .stat = true,
-    });
-    try std.testing.expectError(KernelError.InvalidState, s.grantFsCap(vfs_principal, .Process0, root_token, .{
-        .lookup = true,
-    }));
-}
-
-test "filesystem capability send on endpoint enqueues granted token" {
-    var s = KernelState.initPhase1();
-    const root_token = try s.installFsCap(.Process0, 0x200, .vnode_dir, .{
-        .lookup = true,
-        .readdir = true,
-        .stat = true,
-    });
-
-    try s.installEndpoint(.Process0, endpoint_to_boot_display, .Process1);
-    const recv_token = try s.sendFsCapOnEndpoint(.Process0, endpoint_to_boot_display, root_token);
-    try std.testing.expectEqual(recv_token, try s.recvFsCap(.Process1));
-    const recv_cap = s.getFsTableConst(.Process1).findByCapId(recv_token).?;
-    try std.testing.expectEqual(@as(u64, 0x200), recv_cap.object_id);
-    try std.testing.expectEqual(FsObjectKind.vnode_dir, recv_cap.kind);
-}

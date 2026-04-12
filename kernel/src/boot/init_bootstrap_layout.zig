@@ -1,6 +1,7 @@
 const std = @import("std");
-const init_bootstrap_abi = @import("../abi/init_bootstrap_abi.zig");
-const process_abi = @import("../abi/process_abi.zig");
+const abi_root = @import("kernel_abi_root");
+const init_bootstrap_abi = abi_root.init_bootstrap_abi;
+const process_abi = abi_root.process_abi;
 
 pub const descriptor_page_va: u64 = process_abi.auxPageVa(7);
 pub const source_base_page_index: u64 = 8;
