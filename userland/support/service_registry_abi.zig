@@ -9,7 +9,6 @@ pub const dynamic_endpoint_id_base: u64 = 0x80;
 pub const ServiceKind = enum(u64) {
     window = 1,
     vfs = 2,
-    bootstrap_fs = 3,
     block = 4,
     persistent_fs = 5,
 };

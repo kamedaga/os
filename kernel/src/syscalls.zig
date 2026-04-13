@@ -43,6 +43,7 @@ const syscall_share_cap: u64 = 0x2B;
 const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
+const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
 const syscall_install_mmio_cap: u64 = 0x2F;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
 
@@ -101,6 +102,19 @@ pub fn init(new_hooks: Hooks) void {
 
 fn getHooks() *const Hooks {
     return &(hooks orelse unreachable);
+}
+
+fn hasExplicitUserLogLabel(message: []const u8) bool {
+    if (message.len < 3 or message[0] != '[') return false;
+    const close_index = std.mem.indexOfScalar(u8, message, ']') orelse return false;
+    if (close_index <= 1) return false;
+    return close_index + 1 == message.len or message[close_index + 1] == ' ';
+}
+
+fn writeThreadUserLogPrefix(h: *const Hooks, thread_index: usize) void {
+    h.write("[Thread ");
+    h.print_number(@intCast(thread_index));
+    h.write("] ");
 }
 
 fn parseVmObjectRights(bits: u64) kernel.VmObjectRights {
@@ -509,6 +523,17 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const slot = kernel.processIndexFromPrincipal(proc) orelse return syscall_err_invalid;
             return @intCast(slot);
         },
+        syscall_get_process_status => {
+            const target = h.principal_from_process_slot(frame.rdi) orelse return syscall_err_invalid;
+            const status = state.processStatus(target);
+            const kind: process_abi.ProcessStatusKind = if (status.active)
+                .active
+            else if (status.faulted)
+                .faulted
+            else
+                .inactive;
+            return process_abi.encodeProcessStatus(kind, status.fault_vector);
+        },
         syscall_register_iommu_driver => {
             return syscall_ok;
         },
@@ -749,12 +774,20 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             var buf: [user_log_max_bytes]u8 = undefined;
             const msg = buf[0..req_len];
             if (!h.copy_user_bytes_from_va(proc, frame.rdi, msg)) return syscall_err_invalid;
-            h.write("userlog ");
-            h.write(h.thread_label(scheduler.current_thread_index));
-            h.write(": ");
+            if (!hasExplicitUserLogLabel(msg)) {
+                writeThreadUserLogPrefix(h, scheduler.current_thread_index);
+            }
             h.write(msg);
             return syscall_ok;
         },
         else => return syscall_err_invalid,
     }
+}
+
+test "explicit userlog label detection" {
+    try std.testing.expect(hasExplicitUserLogLabel("[seed] ready\n"));
+    try std.testing.expect(hasExplicitUserLogLabel("[seed]"));
+    try std.testing.expect(!hasExplicitUserLogLabel("seed ready\n"));
+    try std.testing.expect(!hasExplicitUserLogLabel("[seed"));
+    try std.testing.expect(!hasExplicitUserLogLabel("[] bad\n"));
 }

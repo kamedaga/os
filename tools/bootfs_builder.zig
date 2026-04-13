@@ -85,8 +85,8 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len < 4 or ((args.len - 2) % 2) != 0) {
-        std.debug.print("usage: {s} <out> <image_path> <source_path> [...]\n", .{args[0]});
+    if (args.len < 2 or ((args.len - 2) % 2) != 0) {
+        std.debug.print("usage: {s} <out> [<image_path> <source_path> ...]\n", .{args[0]});
         return error.InvalidArgument;
     }
 

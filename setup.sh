@@ -10,6 +10,8 @@ ROOTFS_BUILDER_BIN="$SCRIPT_DIR/kernel/zig-out/bin/rootfs_builder"
 ESP_BUILDER_EXE="$SCRIPT_DIR/kernel/zig-out/bin/esp_builder.exe"
 ESP_BUILDER_BIN="$SCRIPT_DIR/kernel/zig-out/bin/esp_builder"
 ROOTFS_MANIFEST="$SCRIPT_DIR/userland/rootfs/rootfs_manifest.txt"
+SEED_INIT_DIR="$SCRIPT_DIR/userland/seed_init"
+SEED_INIT_OUT="$SEED_INIT_DIR/zig-out/bin/seed.elf"
 ESP_MANIFEST="$SCRIPT_DIR/bootstrap/esp_manifest.txt"
 mkdir -p "$ARTIFACT_DIR"
 
@@ -39,6 +41,19 @@ if command -v pwsh.exe >/dev/null 2>&1; then
   PS_EXE=pwsh.exe
 else
   PS_EXE=powershell.exe
+fi
+
+build_seed_init() {
+  local seed_init_win
+  seed_init_win=$(wslpath -w "$SEED_INIT_DIR")
+  "$PS_EXE" -NoLogo -NoProfile -Command "Set-Location '$seed_init_win'; zig build seed-elf -Doptimize=ReleaseSmall"
+}
+
+build_seed_init
+
+if [ ! -f "$SEED_INIT_OUT" ]; then
+  echo "missing seed init artifact: $SEED_INIT_OUT" >&2
+  exit 1
 fi
 
 run_disk_builder() {

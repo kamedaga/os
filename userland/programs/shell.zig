@@ -1,4 +1,4 @@
-/// Bootstrap shell displayed on the primary framebuffer until the windowed UI takes over.
+/// Rootfs shell displayed on the primary framebuffer until the windowed UI takes over.
 const std = @import("std");
 const block_client = @import("support_root").block_client;
 const fs_abi = @import("support_root").fs_abi;
@@ -46,7 +46,6 @@ const rows: usize = fb_height / cell_h;
 
 const bg_color: u32 = 0x000B_0E12;
 const panel_color: u32 = 0x0011_1820;
-const prompt_color: u32 = 0x0015_1E28;
 const border_color: u32 = 0x0022_3444;
 const fg_color: u32 = 0x00F4_F1E8;
 const title_color: u32 = 0x0079_D7FF;
@@ -93,7 +92,7 @@ const persistent_fs_request_va: u64 = 0x3C10_6000;
 const persistent_fs_response_va: u64 = 0x3C10_7000;
 const block_demo_magic: u64 = 0x424C_4B44_454D_4F31;
 const shell_cat_display_limit_bytes: usize = 2048;
-const pie_user_rootfs_name = "pie_user.elf";
+const pie_user_rootfs_name = "cmd/pie_user.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 
 const VirtqDesc = extern struct {
@@ -141,8 +140,6 @@ const ShellState = struct {
     line_len: [rows - 2]usize = [_]usize{0} ** (rows - 2),
     cur_row: usize = 0,
     splash_line_count: usize = 0,
-    rendered_rows: usize = 0,
-    frame_initialized: bool = false,
     cmd: [128]u8 = undefined,
     cmd_len: usize = 0,
     keyboard_ready: bool = false,
@@ -175,13 +172,12 @@ const ShellState = struct {
     }
 
     fn writeLine(self: *ShellState, text: []const u8) void {
-        if (self.cur_row >= self.lines.len) self.scroll();
+        if (self.cur_row == self.lines.len) self.scroll();
         self.lines[self.cur_row] = [_]u8{' '} ** cols;
         const copy_len = if (text.len < cols) text.len else cols;
         if (copy_len > 0) @memcpy(self.lines[self.cur_row][0..copy_len], text[0..copy_len]);
         self.line_len[self.cur_row] = copy_len;
         self.cur_row += 1;
-        if (self.cur_row >= self.lines.len) self.scroll();
     }
 
     fn writeSplashLine(self: *ShellState, text: []const u8) void {
@@ -734,8 +730,7 @@ fn renderHeader(vfb: [*]volatile u32, st: *const ShellState) void {
     fillRect(vfb, 0, cell_h, fb_width, 1, border_color);
     var header_buf: [cols]u8 = [_]u8{' '} ** cols;
     var idx: usize = 0;
-    appendText(header_buf[0..], &idx, "shell ");
-    appendText(header_buf[0..], &idx, currentRootfsPath(st));
+    appendText(header_buf[0..], &idx, "shell");
     appendText(
         header_buf[0..],
         &idx,
@@ -745,16 +740,8 @@ fn renderHeader(vfb: [*]volatile u32, st: *const ShellState) void {
 }
 
 fn renderBody(vfb: [*]volatile u32, st: *ShellState) void {
-    const rows_to_clear = if (st.rendered_rows == 0)
-        st.lines.len
-    else if (st.rendered_rows > st.cur_row)
-        st.rendered_rows
-    else
-        st.cur_row;
     var row: usize = 0;
-    while (row < rows_to_clear and row < st.lines.len) : (row += 1) {
-        clearRow(vfb, row + 1, bg_color);
-        if (row >= st.cur_row) continue;
+    while (row < st.cur_row and row < st.lines.len) : (row += 1) {
         const color = if (row < st.splash_line_count)
             switch (row) {
                 0, 4 => splash_bar_color,
@@ -767,33 +754,42 @@ fn renderBody(vfb: [*]volatile u32, st: *ShellState) void {
             fg_color;
         drawLine(vfb, row + 1, st.lines[row][0..st.line_len[row]], color);
     }
-    st.rendered_rows = st.cur_row;
+}
+
+fn promptRow(st: *const ShellState) usize {
+    return @min(st.cur_row + 1, rows - 1);
 }
 
 fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
-    clearRow(vfb, rows - 1, prompt_color);
-    fillRect(vfb, 0, (rows - 1) * cell_h, fb_width, 1, border_color);
-    fillRect(vfb, 0, fb_height - 2, fb_width, 2, border_color);
+    const row = promptRow(st);
+    clearRow(vfb, row, bg_color);
     var prompt_buf: [cols]u8 = [_]u8{' '} ** cols;
-    prompt_buf[0] = '>';
-    prompt_buf[1] = ' ';
-    const cmd_slice = if (st.cmd_len + 2 <= cols)
-        st.cmd[0..st.cmd_len]
+    var prefix_buf: [fs_protocol.max_path_bytes + 3]u8 = undefined;
+    var prefix_len: usize = 0;
+    appendText(prefix_buf[0..], &prefix_len, currentRootfsPath(st));
+    appendText(prefix_buf[0..], &prefix_len, " > ");
+    const prefix = if (prefix_len <= cols)
+        prefix_buf[0..prefix_len]
     else
-        st.cmd[st.cmd_len - (cols - 2) .. st.cmd_len];
-    if (cmd_slice.len > 0) @memcpy(prompt_buf[2 .. 2 + cmd_slice.len], cmd_slice);
-    drawLine(vfb, rows - 1, prompt_buf[0..], prompt_fg_color);
+        prefix_buf[prefix_len - cols .. prefix_len];
+    if (prefix.len > 0) @memcpy(prompt_buf[0..prefix.len], prefix);
+    if (prefix.len < cols) {
+        const cmd_space = cols - prefix.len;
+        const cmd_slice = if (st.cmd_len <= cmd_space)
+            st.cmd[0..st.cmd_len]
+        else
+            st.cmd[st.cmd_len - cmd_space .. st.cmd_len];
+        if (cmd_slice.len > 0) @memcpy(prompt_buf[prefix.len .. prefix.len + cmd_slice.len], cmd_slice);
+    }
+    drawLine(vfb, row, prompt_buf[0..], prompt_fg_color);
 }
 
 fn renderFull(vfb: [*]volatile u32, st: *ShellState) void {
-    if (!st.frame_initialized) {
-        fillRect(vfb, 0, 0, fb_width, fb_height, bg_color);
-        fillRect(vfb, 0, 0, fb_width, 2, border_color);
-        fillRect(vfb, 0, fb_height - 2, fb_width, 2, border_color);
-        fillRect(vfb, 0, 0, 2, fb_height, border_color);
-        fillRect(vfb, fb_width - 2, 0, 2, fb_height, border_color);
-        st.frame_initialized = true;
-    }
+    fillRect(vfb, 0, 0, fb_width, fb_height, bg_color);
+    fillRect(vfb, 0, 0, fb_width, 2, border_color);
+    fillRect(vfb, 0, fb_height - 2, fb_width, 2, border_color);
+    fillRect(vfb, 0, 0, 2, fb_height, border_color);
+    fillRect(vfb, fb_width - 2, 0, 2, fb_height, border_color);
     renderHeader(vfb, st);
     renderBody(vfb, st);
     renderPrompt(vfb, st);
@@ -809,11 +805,6 @@ fn shellLogLine(text: []const u8) void {
 }
 
 fn seedBootSplash(st: *ShellState) void {
-    st.writeSplashLine("ELF loader PIE+RELATIVE ready");
-    st.writeSplashLine("========================================");
-    st.writeSplashLine("  MicroKernel");
-    st.writeSplashLine("  enter bare-metal capability kernel");
-    st.writeSplashLine("========================================");
     st.writeLine("shell fast path online");
 }
 

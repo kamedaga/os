@@ -41,7 +41,6 @@ fn loadManifestSpecs(allocator: std.mem.Allocator, manifest_path: []const u8) !s
     errdefer {
         for (specs.items) |spec| {
             allocator.free(spec.image_path);
-            allocator.free(spec.root_name);
             allocator.free(spec.source_path);
             allocator.free(spec.data);
         }
@@ -63,21 +62,29 @@ fn loadManifestSpecs(allocator: std.mem.Allocator, manifest_path: []const u8) !s
         if (parsed == null) continue;
         const image_path = parsed.?.image_path;
         const source_path = parsed.?.source_path;
-        const root_name = try rootfs_host.validateRootImagePath(image_path);
-        const resolved_source_path = try resolveManifestSourcePath(allocator, manifest_path, source_path);
-        defer allocator.free(resolved_source_path);
-        const data = try cwd.readFileAlloc(allocator, resolved_source_path, std.math.maxInt(usize));
+        try rootfs_host.validateImagePath(image_path);
         const image_path_copy = try allocator.dupe(u8, image_path);
         errdefer allocator.free(image_path_copy);
-        const root_name_copy = try allocator.dupe(u8, root_name);
-        errdefer allocator.free(root_name_copy);
-        const source_path_copy = try allocator.dupe(u8, resolved_source_path);
+        const is_directory = std.mem.eql(u8, source_path, rootfs_host.directory_source_token);
+        const resolved_source_path = if (is_directory)
+            try allocator.dupe(u8, rootfs_host.directory_source_token)
+        else blk: {
+            const resolved = try resolveManifestSourcePath(allocator, manifest_path, source_path);
+            defer allocator.free(resolved);
+            break :blk try allocator.dupe(u8, resolved);
+        };
+        errdefer allocator.free(resolved_source_path);
+        const data = if (is_directory)
+            try allocator.alloc(u8, 0)
+        else
+            try cwd.readFileAlloc(allocator, resolved_source_path, std.math.maxInt(usize));
+        const source_path_copy = resolved_source_path;
         errdefer allocator.free(source_path_copy);
         try specs.append(allocator, .{
             .image_path = image_path_copy,
-            .root_name = root_name_copy,
             .source_path = source_path_copy,
             .data = data,
+            .kind = if (is_directory) .directory else .file,
         });
     }
 
@@ -111,7 +118,6 @@ pub fn main() !void {
     defer {
         for (specs.items) |spec| {
             allocator.free(spec.image_path);
-            allocator.free(spec.root_name);
             allocator.free(spec.source_path);
             allocator.free(spec.data);
         }
@@ -123,8 +129,16 @@ pub fn main() !void {
 
     const target = try rootfs_host.preparePartition(&disk, partition_index);
     var state = try rootfs_host.formatVolume(&disk, target.region, target.capacity_blocks);
-    for (specs.items) |*spec| try rootfs_host.upsertFile(&disk, &state, target.capacity_blocks, spec);
+    var file_count: usize = 0;
+    var dir_count: usize = 0;
+    for (specs.items) |*spec| {
+        try rootfs_host.upsertFile(&disk, &state, target.capacity_blocks, spec);
+        switch (spec.kind) {
+            .file => file_count += 1,
+            .directory => dir_count += 1,
+        }
+    }
     try disk.sync();
 
-    std.debug.print("rootfs_builder: wrote {d} file(s) into partition {d} from {s}\n", .{ specs.items.len, partition_index, args[3] });
+    std.debug.print("rootfs_builder: wrote {d} file(s) and {d} dir(s) into partition {d} from {s}\n", .{ file_count, dir_count, partition_index, args[3] });
 }

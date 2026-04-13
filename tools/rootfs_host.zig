@@ -2,6 +2,7 @@ const std = @import("std");
 const layout = @import("persistent_fs_layout");
 
 pub const sector_bytes: usize = 512;
+pub const directory_source_token = "@dir";
 
 const GptHeader = struct {
     partition_entry_lba: u64,
@@ -20,16 +21,26 @@ pub const PartitionRegion = struct {
     last_lba: u64,
 };
 
+pub const EntryKind = enum {
+    file,
+    directory,
+};
+
 pub const FileSpec = struct {
     image_path: []const u8,
-    root_name: []const u8,
     source_path: []const u8,
     data: []const u8,
+    kind: EntryKind = .file,
 };
 
 const Extent = struct {
     start: u64,
     end: u64,
+};
+
+const PathTarget = struct {
+    parent_path: ?[]const u8,
+    name: []const u8,
 };
 
 pub const VolumeState = struct {
@@ -108,13 +119,32 @@ pub fn diskCapacityBlocks(file: *std.fs.File) !u64 {
     return bytes / @as(u64, sector_bytes);
 }
 
-pub fn validateRootImagePath(path: []const u8) ![]const u8 {
+pub fn validateImagePath(path: []const u8) !void {
     if (path.len < 2 or path[0] != '/') return error.InvalidImagePath;
     if (path[path.len - 1] == '/') return error.InvalidImagePath;
-    const root_name = path[1..];
-    if (std.mem.indexOfScalar(u8, root_name, '/')) |_| return error.DirectoriesUnsupported;
-    if (root_name.len > layout.max_name_bytes) return error.ImagePathTooLong;
-    return root_name;
+
+    var pos: usize = 1;
+    while (pos < path.len) {
+        const start = pos;
+        while (pos < path.len and path[pos] != '/') : (pos += 1) {}
+        const component = path[start..pos];
+        if (component.len == 0) return error.InvalidImagePath;
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidImagePath;
+        if (component.len > layout.max_name_bytes) return error.ImagePathTooLong;
+        if (pos < path.len) pos += 1;
+    }
+}
+
+fn splitPathTarget(abs_path: []const u8) PathTarget {
+    const last_slash = std.mem.lastIndexOfScalar(u8, abs_path, '/') orelse unreachable;
+    return .{
+        .parent_path = if (last_slash == 0) null else abs_path[0..last_slash],
+        .name = abs_path[last_slash + 1 ..],
+    };
+}
+
+fn entryParentMatches(entry: *const layout.VolumeDirEntry, parent_index: ?usize) bool {
+    return layout.dirEntryParentIndex(entry) == parent_index;
 }
 
 fn readBlock(file: *std.fs.File, block_index: u64, out: []u8) !void {
@@ -201,23 +231,58 @@ pub fn loadOrInitializeVolume(file: *std.fs.File, region: PartitionRegion, capac
     return try formatVolume(file, region, capacity_blocks);
 }
 
-fn findDirEntryByName(entries: []const layout.VolumeDirEntry, name: []const u8) ?usize {
+fn findChildEntryByName(entries: []const layout.VolumeDirEntry, parent_index: ?usize, name: []const u8) ?usize {
     for (entries, 0..) |*entry, index| {
         if (!layout.dirEntryUsed(entry)) continue;
+        if (!entryParentMatches(entry, parent_index)) continue;
         if (std.mem.eql(u8, layout.dirEntryName(entry), name)) return index;
     }
     return null;
 }
 
-fn allocDirEntry(entries: *[layout.max_dir_entries]layout.VolumeDirEntry, name: []const u8) !usize {
+fn allocDirEntry(
+    entries: *[layout.max_dir_entries]layout.VolumeDirEntry,
+    parent_index: ?usize,
+    name: []const u8,
+    is_directory: bool,
+) !usize {
     for (entries, 0..) |*entry, index| {
         if (layout.dirEntryUsed(entry)) continue;
         entry.* = .{};
         entry.flags = layout.dir_entry_flag_used;
         layout.setDirEntryName(entry, name);
+        layout.setDirEntryParentIndex(entry, parent_index);
+        layout.setDirEntryDirectory(entry, is_directory);
         return index;
     }
     return error.DirectoryFull;
+}
+
+fn ensureDirectoryPath(entries: *[layout.max_dir_entries]layout.VolumeDirEntry, abs_path: []const u8) !?usize {
+    if (abs_path.len == 0) return null;
+    try validateImagePath(abs_path);
+
+    var current_parent: ?usize = null;
+    var pos: usize = 1;
+    while (pos < abs_path.len) {
+        const start = pos;
+        while (pos < abs_path.len and abs_path[pos] != '/') : (pos += 1) {}
+        const component = abs_path[start..pos];
+        const child_index = findChildEntryByName(entries[0..], current_parent, component) orelse blk: {
+            break :blk try allocDirEntry(entries, current_parent, component, true);
+        };
+        const child = &entries[child_index];
+        if (!layout.dirEntryIsDirectory(child)) return error.NotDirectory;
+        current_parent = child_index;
+        if (pos < abs_path.len) pos += 1;
+    }
+    return current_parent;
+}
+
+fn ensureParentDirectories(entries: *[layout.max_dir_entries]layout.VolumeDirEntry, abs_path: []const u8) !?usize {
+    const target = splitPathTarget(abs_path);
+    if (target.parent_path) |parent_path| return try ensureDirectoryPath(entries, parent_path);
+    return null;
 }
 
 fn buildUsedExtents(entries: []const layout.VolumeDirEntry, exclude_file_index: ?usize, out: *[layout.max_dir_entries]Extent) usize {
@@ -287,9 +352,32 @@ fn writeFileData(file: *std.fs.File, start_block: u64, data: []const u8) !void {
     }
 }
 
+fn upsertDirectory(file: *std.fs.File, state: *VolumeState) !void {
+    recomputeNextFreeBlock(state);
+    try persistDirectory(file, state);
+    try persistSuperblock(file, state);
+}
+
 pub fn upsertFile(file: *std.fs.File, state: *VolumeState, capacity_blocks: u64, spec: *const FileSpec) !void {
-    const file_index = findDirEntryByName(state.dir_entries[0..], spec.root_name) orelse try allocDirEntry(&state.dir_entries, spec.root_name);
+    try validateImagePath(spec.image_path);
+
+    if (spec.kind == .directory) {
+        _ = try ensureDirectoryPath(&state.dir_entries, spec.image_path);
+        try upsertDirectory(file, state);
+        return;
+    }
+
+    const target = splitPathTarget(spec.image_path);
+    const parent_index = try ensureParentDirectories(&state.dir_entries, spec.image_path);
+    const file_index = findChildEntryByName(state.dir_entries[0..], parent_index, target.name) orelse
+        try allocDirEntry(&state.dir_entries, parent_index, target.name, false);
     const entry = &state.dir_entries[file_index];
+    if (layout.dirEntryIsDirectory(entry)) return error.IsDirectory;
+
+    layout.setDirEntryName(entry, target.name);
+    layout.setDirEntryParentIndex(entry, parent_index);
+    layout.setDirEntryDirectory(entry, false);
+
     const needed_blocks = layout.blocksForSize(@as(u64, sector_bytes), @intCast(spec.data.len));
     if (needed_blocks == 0) {
         entry.start_block = 0;
@@ -316,4 +404,3 @@ pub fn preparePartition(file: *std.fs.File, partition_index: u32) !struct { regi
         .capacity_blocks = region.last_lba + 1,
     };
 }
-

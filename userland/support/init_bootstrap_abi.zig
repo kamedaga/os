@@ -9,6 +9,11 @@ pub const max_spawn_page_descriptors: usize = 8;
 pub const max_device_descriptors: usize = 6;
 pub const max_boot_archive_pages: usize = 128;
 pub const boot_display_shell_height: u64 = 624;
+pub const boot_log_user_page_va: u64 = process_abi.auxPageVa(1);
+pub const boot_log_page_header_bytes: usize = 8;
+pub const boot_log_page_payload_bytes: usize = 4096 - boot_log_page_header_bytes;
+pub const boot_log_page_length_offset: usize = 0;
+pub const boot_log_page_status_offset: usize = 4;
 
 /// Indices (in u64 words) within boot_display's config page for framebuffer metadata.
 pub const boot_display_config_fb_paddr_index: u64 = 20;

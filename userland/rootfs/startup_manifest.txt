@@ -1,3 +1,3 @@
-# stage2 startup is loaded from rootfs through bootstrap_fs
-action=block_driver path=/virtio_blk.elf label=block_driver block=virtio_blk ensure=boot_display
-action=persistent_fs path=/persistent_fs.elf label=persistent_fs requires=block_service
+# init startup is loaded from rootfs by manager_init
+action=block_driver name=block path=/srv/virtio_blk.elf label=block_driver block=virtio_blk ensure=boot_display provides=block_service
+action=persistent_fs name=persistent_fs path=/srv/persistent_fs.elf label=persistent_fs after=block requires=block_service provides=rootfs_fs

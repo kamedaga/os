@@ -48,6 +48,7 @@ pub var kernel_state_global: kernel.KernelState = undefined;
 pub var kernel_state_ready: bool = false;
 
 var boot_init_principal: ?kernel.PrincipalId = null;
+const spawn_parent_endpoint_id: u64 = 0x14;
 
 // ---------------------------------------------------------------------------
 // Thread label helper (used in Hooks)
@@ -334,6 +335,119 @@ fn activateThreadOrHalt(thread_index: usize) void {
     halt.haltWithMessage("activate thread failed");
 }
 
+fn scrubMailboxSender(mailbox: *kernel.CapMailbox, sender: kernel.PrincipalId) bool {
+    var out: usize = 0;
+    var changed = false;
+    var i: usize = 0;
+    while (i < mailbox.len) : (i += 1) {
+        const item = mailbox.items[i];
+        if (item.sender == sender) {
+            changed = true;
+            continue;
+        }
+        mailbox.items[out] = item;
+        out += 1;
+    }
+    mailbox.len = out;
+    return changed;
+}
+
+fn scrubEndpointTargets(table: *kernel.EndpointCNode, target: kernel.PrincipalId) bool {
+    var out: usize = 0;
+    var changed = false;
+    var i: usize = 0;
+    while (i < table.len) : (i += 1) {
+        const entry = table.caps[i];
+        if (entry.target == target) {
+            changed = true;
+            continue;
+        }
+        table.caps[out] = entry;
+        out += 1;
+    }
+    table.len = out;
+    return changed;
+}
+
+fn nextReadyThreadAfter(current_thread: usize) ?usize {
+    var step: usize = 1;
+    while (step <= scheduler.max_thread_slots) : (step += 1) {
+        const thread_index = (current_thread + step) % scheduler.max_thread_slots;
+        const ctx = scheduler.getThreadContextConst(thread_index) orelse continue;
+        if (!ctx.allocated or !ctx.ready) continue;
+        return thread_index;
+    }
+    return null;
+}
+
+fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
+    while (true) {
+        const current_thread = scheduler.current_thread_index;
+        if (nextReadyThreadAfter(current_thread)) |thread_index| {
+            if (scheduler.threadContextLooksCorrupted(thread_index)) {
+                _ = scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame());
+            }
+            if (scheduler.activateThread(thread_index) and scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
+            if (scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame()) and
+                scheduler.activateThread(thread_index) and
+                scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
+            halt.haltWithMessage("fault reschedule failed");
+        }
+        asm volatile ("sti\nhlt\ncli" ::: .{ .memory = true });
+    }
+}
+
+fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
+    const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
+    const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
+
+    if (scheduler.runtime_priority_principal) |priority_principal| {
+        if (priority_principal == principal) scheduler.setRuntimePriorityPrincipal(null);
+    }
+
+    if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
+        _ = scheduler.releaseThreadSlot(thread_index);
+    }
+
+    user_spaces[process_index] = .{};
+    kernel_state_global.cap_tables[process_index] = .{};
+    kernel_state_global.untyped_tables[process_index] = .{};
+    kernel_state_global.endpoint_tables[process_index] = .{};
+    kernel_state_global.cap_mailboxes[process_index] = .{};
+    kernel_state_global.pending_page_transfers[process_index] = null;
+    kernel_state_global.vm_object_tables[process_index] = .{};
+    kernel_state_global.exec_image_tables[process_index] = .{};
+
+    var storage_index: usize = 0;
+    while (storage_index < kernel.principal_count) : (storage_index += 1) {
+        var wake_owner = false;
+        if (storage_index < kernel.process_count) {
+            wake_owner = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+        }
+        if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
+            wake_owner = true;
+        }
+        if (kernel_state_global.pending_page_transfers[storage_index]) |pending| {
+            if (pending.sender == principal) {
+                kernel_state_global.pending_page_transfers[storage_index] = null;
+                wake_owner = true;
+            }
+        }
+        if (!wake_owner) continue;
+        if (storage_index >= kernel.process_count) continue;
+        const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
+        scheduler.wakeBlockedThreadForPrincipal(owner);
+    }
+
+    _ = kernel_state_global.markProcessFaulted(principal, fault_vector);
+    if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
+}
+
+fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) void {
+    teardownFaultedProcess(principal, fault_vector);
+    loadRunnableThreadOrIdle(out_frame);
+}
+
 fn mmioPageWithOffset(addr: u64) init_setup.MmioPageWithOffset {
     if (addr == 0) return .{ .page_paddr = 0, .page_offset = 0 };
     return .{
@@ -511,8 +625,8 @@ fn discoverDevices() DetectedDevices {
 // ---------------------------------------------------------------------------
 
 fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
-    const init_principal = state.createProcessDescriptor("init") orelse
-        halt.haltWithMessage("init process descriptor alloc failed");
+    const init_principal = state.createProcessDescriptor("bootseed") orelse
+        halt.haltWithMessage("bootseed process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
         halt.haltWithError("init bootstrap owner mark failed: ", err);
     };
@@ -540,6 +654,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     scheduler.scheduler_race_log_count = 0;
     scheduler.scheduler_probe_log_count = 0;
     boot_debug.logReadyTitle(bootDebugHooks(), "USER_PAGE_READY");
+    init_setup.refreshInitBootLogSnapshot(state, init_principal);
 
     const loaded_init = elf_load.loadUserElfIntoProcessPagesOrHalt(
         state,
@@ -615,6 +730,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState) void {
         .dump_page_walk_for_va = page_fault_log.dumpPageWalkForVa,
         .log_page_fault_step2 = page_fault_log.logStep2,
         .halt_loop = halt.haltLoop,
+        .resume_after_fatal_user_exception = resumeAfterFatalUserException,
         .switch_to_thread = scheduler.switchToThread,
         .log_race_switch = logSchedulerRaceSwitch,
     });
@@ -627,10 +743,12 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState) void {
 pub fn kernelMain() void {
     asm volatile ("cli");
     lapic.maskLegacyPic();
-    serial.writeRaw("RAW ENTER MAIN\n");
-    uefi_services.earlyUefiWrite(&[_:0]u16{ 'E', 'N', 'T', 'E', 'R', ' ', 'M', 'A', 'I', 'N', '\r', '\n' });
-    serial.init();
     kernel_log.reset();
+    serial.writeRaw("RAW ENTER MAIN\n");
+    kernel_log.appendText("RAW ENTER MAIN\n");
+    uefi_services.earlyUefiWrite(&[_:0]u16{ 'E', 'N', 'T', 'E', 'R', ' ', 'M', 'A', 'I', 'N', '\r', '\n' });
+    kernel_log.appendText("ENTER MAIN\n");
+    serial.init();
     boot_init_principal = null;
 
     const resources = runBootServicesPhase();

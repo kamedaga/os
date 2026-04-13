@@ -108,6 +108,14 @@ pub const ProcessDescriptor = struct {
     principal: PrincipalId = @enumFromInt(0),
     label: []const u8 = "",
     bootstrap_owner: bool = false,
+    faulted: bool = false,
+    fault_vector: u8 = 0,
+};
+
+pub const ProcessStatus = struct {
+    active: bool = false,
+    faulted: bool = false,
+    fault_vector: u8 = 0,
 };
 
 pub const KernelError = error{
@@ -938,6 +946,16 @@ pub const KernelState = struct {
         return &self.process_descriptors[index];
     }
 
+    pub fn processStatus(self: *const KernelState, principal: PrincipalId) ProcessStatus {
+        const index = processIndexFromPrincipal(principal) orelse return .{};
+        const desc = self.process_descriptors[index];
+        return .{
+            .active = desc.active,
+            .faulted = desc.faulted,
+            .fault_vector = desc.fault_vector,
+        };
+    }
+
     pub fn isBootstrapOwner(self: *const KernelState, principal: PrincipalId) bool {
         const desc = self.processDescriptor(principal) orelse return false;
         return desc.bootstrap_owner;
@@ -999,6 +1017,17 @@ pub const KernelState = struct {
         const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
         if (!self.process_descriptors[index].active) return KernelError.InvalidState;
         self.process_descriptors[index].bootstrap_owner = enabled;
+    }
+
+    pub fn markProcessFaulted(self: *KernelState, principal: PrincipalId, fault_vector: u8) bool {
+        const index = processIndexFromPrincipal(principal) orelse return false;
+        if (!self.process_descriptors[index].active) return false;
+        self.process_descriptors[index].active = false;
+        self.process_descriptors[index].bootstrap_owner = false;
+        self.process_descriptors[index].faulted = true;
+        self.process_descriptors[index].fault_vector = fault_vector;
+        if (self.active_process_count > 0) self.active_process_count -= 1;
+        return true;
     }
 
     pub fn removeProcessDescriptor(self: *KernelState, principal: PrincipalId) bool {
@@ -1350,6 +1379,7 @@ pub const KernelState = struct {
     pub fn endpointTargetFor(self: *const KernelState, owner: PrincipalId, endpoint_id: u64) ?PrincipalId {
         if (!self.hasActivePrincipal(owner)) return null;
         const ep = self.getEndpointTableConst(owner).find(endpoint_id) orelse return null;
+        if (!self.hasActivePrincipal(ep.target)) return null;
         return ep.target;
     }
 
@@ -2627,4 +2657,23 @@ test "ensureProcessDescriptor updates label for reserved slot" {
     try std.testing.expectEqualStrings("bootstrap-fs", s.processDescriptor(fs_owner).?.label);
     try std.testing.expect(s.ensureProcessDescriptor(.Process0, "bootstrap-owner"));
     try std.testing.expectEqualStrings("bootstrap-owner", s.processDescriptor(.Process0).?.label);
+}
+
+test "markProcessFaulted records fault status" {
+    var s = KernelState.initPhase1();
+
+    try std.testing.expect(s.markProcessFaulted(.Process1, 14));
+    const status = s.processStatus(.Process1);
+    try std.testing.expect(!status.active);
+    try std.testing.expect(status.faulted);
+    try std.testing.expectEqual(@as(u8, 14), status.fault_vector);
+}
+
+test "endpointTargetFor ignores inactive faulted target" {
+    var s = KernelState.initPhase1();
+
+    try s.installEndpoint(.Process0, 0x11, .Process1);
+    try std.testing.expectEqual(@as(?PrincipalId, .Process1), s.endpointTargetFor(.Process0, 0x11));
+    try std.testing.expect(s.markProcessFaulted(.Process1, 13));
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.endpointTargetFor(.Process0, 0x11));
 }

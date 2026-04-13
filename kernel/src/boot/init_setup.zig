@@ -2,7 +2,9 @@
 /// Sets up the init process's bootstrap descriptor page, spawn pages, service
 /// registry, and virtio device capability grants.
 const std = @import("std");
+const capability = @import("../capability.zig");
 const kernel = @import("../kernel.zig");
+const kernel_log = @import("../kernel_log.zig");
 const boot_abi = @import("abi.zig");
 const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
@@ -206,6 +208,25 @@ fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64)
     page.reserved0 = 0;
 }
 
+pub fn refreshInitBootLogSnapshot(state: *kernel.KernelState, init_process_principal: kernel.PrincipalId) void {
+    _ = state;
+    const page_paddr = capability.lookupUserMappedPaddrForVa(init_process_principal, init_bootstrap_abi.boot_log_user_page_va) orelse
+        haltInitBootstrapDescriptor("missing boot log snapshot page");
+    const page: [*]u8 = @ptrFromInt(page_paddr);
+    @memset(page[0..4096], 0);
+    const copy_len: usize = @min(kernel_log.boot_log_len, init_bootstrap_abi.boot_log_page_payload_bytes);
+    const length_ptr: *volatile u32 = @ptrFromInt(page_paddr + init_bootstrap_abi.boot_log_page_length_offset);
+    const status_ptr: *volatile u32 = @ptrFromInt(page_paddr + init_bootstrap_abi.boot_log_page_status_offset);
+    length_ptr.* = @intCast(copy_len);
+    status_ptr.* = 1;
+    if (copy_len != 0) {
+        @memcpy(
+            page[init_bootstrap_abi.boot_log_page_header_bytes .. init_bootstrap_abi.boot_log_page_header_bytes + copy_len],
+            kernel_log.boot_log_buffer[0..copy_len],
+        );
+    }
+}
+
 pub fn publishInitBootstrapDescriptorPage(
     user_page_paddr: u64,
     devices: []const ?DetectedDeviceBootstrap,
@@ -394,6 +415,15 @@ pub fn setupInitBootstrapResources(
         false,
         free_list,
     );
+    _ = process_factory.allocAndMapOwnedPageForProcessOrHalt(
+        state,
+        init_process_principal,
+        "init",
+        "boot log snapshot page",
+        init_bootstrap_abi.boot_log_user_page_va,
+        false,
+        free_list,
+    );
     const kernel_backed_pages = allocKernelBackedInitSpawnPages(state, init_process_principal, free_list);
     const init_services = buildInitServiceDescriptors();
     publishInitServiceRegistryPage(kernel_backed_pages[0..], init_services.descriptors[0..init_services.count]);
@@ -420,4 +450,5 @@ pub fn setupInitBootstrapResources(
         bootfs_setup,
         framebuffer_info,
     );
+    refreshInitBootLogSnapshot(state, init_process_principal);
 }

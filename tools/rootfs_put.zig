@@ -26,13 +26,17 @@ pub fn main() !void {
     while (arg_i < args.len) : (arg_i += 2) {
         const image_path = args[arg_i];
         const source_path = args[arg_i + 1];
-        const root_name = try rootfs_host.validateRootImagePath(image_path);
-        const data = try cwd.readFileAlloc(allocator, source_path, std.math.maxInt(usize));
+        try rootfs_host.validateImagePath(image_path);
+        const is_directory = std.mem.eql(u8, source_path, rootfs_host.directory_source_token);
+        const data = if (is_directory)
+            try allocator.alloc(u8, 0)
+        else
+            try cwd.readFileAlloc(allocator, source_path, std.math.maxInt(usize));
         try specs.append(allocator, .{
             .image_path = image_path,
-            .root_name = root_name,
             .source_path = source_path,
             .data = data,
+            .kind = if (is_directory) .directory else .file,
         });
     }
 
@@ -45,6 +49,10 @@ pub fn main() !void {
     try disk.sync();
 
     for (specs.items) |spec| {
-        std.debug.print("rootfs_put: wrote {s} from {s} into partition {d}\n", .{ spec.image_path, spec.source_path, partition_index });
+        if (spec.kind == .directory) {
+            std.debug.print("rootfs_put: created dir {s} in partition {d}\n", .{ spec.image_path, partition_index });
+        } else {
+            std.debug.print("rootfs_put: wrote {s} from {s} into partition {d}\n", .{ spec.image_path, spec.source_path, partition_index });
+        }
     }
 }

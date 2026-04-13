@@ -6,7 +6,6 @@ pub const program_flag_present: u64 = 1 << 0;
 
 pub const StartupAction = enum(u8) {
     vfs = 1,
-    bootstrap_fs_server = 2,
     input_driver = 3,
     block_driver = 4,
     persistent_fs_server = 5,
@@ -45,7 +44,6 @@ pub const ensure_flag_boot_display: u64 = 1 << 0;
 pub const require_flag_keyboard_shared: u64 = 1 << 0;
 pub const require_flag_pointer_shared: u64 = 1 << 1;
 pub const require_flag_block_service: u64 = 1 << 2;
-pub const require_flag_bootstrap_fs_service: u64 = 1 << 3;
 pub const require_flag_persistent_fs_service: u64 = 1 << 4;
 pub const require_flag_compositor_armed: u64 = 1 << 5;
 
@@ -61,7 +59,6 @@ pub const StartupProgramRole = enum(u64) {
     block_driver = 9,
     block_demo = 10,
     persistent_fs = 11,
-    bootstrap_fs = 12,
 };
 
 pub const StartupProgramDescriptor = extern struct {
@@ -89,7 +86,6 @@ pub fn roleLabel(role: StartupProgramRole) []const u8 {
         .block_driver => "block driver",
         .block_demo => "block demo",
         .persistent_fs => "persistent fs",
-        .bootstrap_fs => "bootstrap fs",
     };
 }
 
@@ -106,7 +102,6 @@ pub fn roleKey(role: StartupProgramRole) []const u8 {
         .block_driver => "block_driver",
         .block_demo => "block_demo",
         .persistent_fs => "persistent_fs",
-        .bootstrap_fs => "bootstrap_fs",
     };
 }
 
@@ -120,7 +115,6 @@ pub fn roleFromKey(key: []const u8) ?StartupProgramRole {
 
 pub fn actionFromKey(key: []const u8) ?StartupAction {
     if (std.mem.eql(u8, key, "vfs")) return .vfs;
-    if (std.mem.eql(u8, key, "bootstrap_fs")) return .bootstrap_fs_server;
     if (std.mem.eql(u8, key, "input_driver")) return .input_driver;
     if (std.mem.eql(u8, key, "block_driver")) return .block_driver;
     if (std.mem.eql(u8, key, "persistent_fs")) return .persistent_fs_server;
@@ -175,7 +169,6 @@ pub fn requirementBitFromKey(key: []const u8) ?u64 {
     if (std.mem.eql(u8, key, "keyboard_shared")) return require_flag_keyboard_shared;
     if (std.mem.eql(u8, key, "pointer_shared")) return require_flag_pointer_shared;
     if (std.mem.eql(u8, key, "block_service")) return require_flag_block_service;
-    if (std.mem.eql(u8, key, "bootstrap_fs_service")) return require_flag_bootstrap_fs_service;
     if (std.mem.eql(u8, key, "persistent_fs_service")) return require_flag_persistent_fs_service;
     if (std.mem.eql(u8, key, "compositor_armed")) return require_flag_compositor_armed;
     return null;
@@ -186,7 +179,6 @@ test "descriptor size stays bounded" {
 }
 
 test "policy token helpers parse expected keys" {
-    try std.testing.expect(actionFromKey("bootstrap_fs") == .bootstrap_fs_server);
     try std.testing.expect(execSourceFromKey("bootfs") == .bootfs);
     try std.testing.expect(inputSelectorFromKey("mouse") == .pointer);
     try std.testing.expect(blockSelectorFromKey("virtio_blk") == .virtio_blk);

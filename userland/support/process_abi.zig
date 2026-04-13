@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const syscall_spawn_exec: u64 = 0x1D;
 pub const syscall_arm_deferred_compositor: u64 = 0x22;
+pub const syscall_get_process_status: u64 = 0x30;
 pub const spawn_result_tag: u64 = 1 << 63;
 pub const spawn_result_process_bits: u6 = 32;
 pub const spawn_result_thread_bits: u6 = 16;
@@ -54,6 +55,12 @@ pub const BootstrapDescriptorTable = extern struct {
     }} ** max_bootstrap_cap_descriptors,
 };
 
+pub const ProcessStatusKind = enum(u8) {
+    inactive = 0,
+    active = 1,
+    faulted = 2,
+};
+
 pub fn auxPageVa(page_index: u64) u64 {
     return aux_base_va + page_index * aux_page_bytes;
 }
@@ -83,10 +90,30 @@ pub fn decodeSpawnedThreadSlot(value: u64) ?u64 {
     return (value >> spawn_result_thread_shift) & spawn_result_thread_mask;
 }
 
+pub fn encodeProcessStatus(kind: ProcessStatusKind, fault_vector: u8) u64 {
+    return @as(u64, @intFromEnum(kind)) |
+        (@as(u64, fault_vector) << 8);
+}
+
+pub fn decodeProcessStatusKind(value: u64) ProcessStatusKind {
+    const raw: u8 = @truncate(value & 0xFF);
+    return std.meta.intToEnum(ProcessStatusKind, raw) catch .inactive;
+}
+
+pub fn decodeProcessStatusFaultVector(value: u64) u8 {
+    return @truncate((value >> 8) & 0xFF);
+}
+
 test "spawned process slot round-trips" {
     const encoded = encodeSpawnedProcess(10, 7);
     try std.testing.expectEqual(@as(?u64, 10), decodeSpawnedProcessSlot(encoded));
     try std.testing.expectEqual(@as(?u64, 7), decodeSpawnedThreadSlot(encoded));
     try std.testing.expectEqual(@as(?u64, null), decodeSpawnedProcessSlot(10));
     try std.testing.expectEqual(@as(?u64, null), decodeSpawnedThreadSlot(10));
+}
+
+test "process status round-trips" {
+    const encoded = encodeProcessStatus(.faulted, 14);
+    try std.testing.expectEqual(ProcessStatusKind.faulted, decodeProcessStatusKind(encoded));
+    try std.testing.expectEqual(@as(u8, 14), decodeProcessStatusFaultVector(encoded));
 }

@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .code_model = .small,
         .red_zone = false,
     });
+    support_root_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
     const init_app_mod = b.createModule(.{
         .root_source_file = b.path("../bootstrap/programs/init_app.zig"),
         .target = user_target,
@@ -77,7 +78,7 @@ pub fn build(b: *std.Build) void {
     init_step.dependOn(&install_init.step);
 
     const shell_mod = b.createModule(.{
-        .root_source_file = b.path("../bootstrap/programs/shell.zig"),
+        .root_source_file = b.path("../userland/programs/shell.zig"),
         .target = user_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
@@ -190,29 +191,6 @@ pub fn build(b: *std.Build) void {
     });
     const mouse_button_demo_step = b.step("mouse-button-demo-elf", "Build mouse button demo PIE ELF");
     mouse_button_demo_step.dependOn(&install_mouse_button_demo.step);
-
-    const terminal_window_mod = b.createModule(.{
-        .root_source_file = b.path("../userland/programs/terminal_window.zig"),
-        .target = user_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    terminal_window_mod.addImport("support_root", support_root_mod);
-    terminal_window_mod.strip = true;
-    const terminal_window_app = b.addExecutable(.{
-        .name = "TERMWIN",
-        .root_module = terminal_window_mod,
-    });
-    terminal_window_app.pie = true;
-    terminal_window_app.entry = .{ .symbol_name = "_start" };
-    terminal_window_app.link_z_common_page_size = 0x10;
-    terminal_window_app.link_z_max_page_size = 0x10;
-    const install_terminal_window = b.addInstallArtifact(terminal_window_app, .{
-        .dest_sub_path = "EFI/BOOT/TERMWIN.ELF",
-    });
-    const terminal_window_step = b.step("terminal-window-elf", "Build terminal window PIE ELF");
-    terminal_window_step.dependOn(&install_terminal_window.step);
 
     const taskbar_mod = b.createModule(.{
         .root_source_file = b.path("../userland/programs/taskbar.zig"),
@@ -375,30 +353,6 @@ pub fn build(b: *std.Build) void {
     const virtio_blk_step = b.step("virtio-blk-elf", "Build virtio-blk PIE ELF");
     virtio_blk_step.dependOn(&install_virtio_blk.step);
 
-    const bootstrap_fs_mod = b.createModule(.{
-        .root_source_file = b.path("../bootstrap/programs/bootstrap_fs.zig"),
-        .target = user_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    bootstrap_fs_mod.addImport("support_root", support_root_mod);
-    bootstrap_fs_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
-    bootstrap_fs_mod.strip = true;
-    const bootstrap_fs_app = b.addExecutable(.{
-        .name = "BOOTFSRV",
-        .root_module = bootstrap_fs_mod,
-    });
-    bootstrap_fs_app.pie = true;
-    bootstrap_fs_app.entry = .{ .symbol_name = "_start" };
-    bootstrap_fs_app.link_z_common_page_size = 0x10;
-    bootstrap_fs_app.link_z_max_page_size = 0x10;
-    const install_bootstrap_fs = b.addInstallArtifact(bootstrap_fs_app, .{
-        .dest_sub_path = "EFI/BOOT/BOOTFSRV.ELF",
-    });
-    const bootstrap_fs_step = b.step("bootstrap-fs-elf", "Build bootstrap fs PIE ELF");
-    bootstrap_fs_step.dependOn(&install_bootstrap_fs.step);
-
     const block_demo_mod = b.createModule(.{
         .root_source_file = b.path("../userland/programs/block_demo.zig"),
         .target = user_target,
@@ -492,12 +446,6 @@ pub fn build(b: *std.Build) void {
     });
     const bootfs_builder_run = b.addRunArtifact(bootfs_builder_app);
     const bootfs_image_out = bootfs_builder_run.addOutputFileArg("BOOTFS.IMG");
-    bootfs_builder_run.addArg("/boot/startup_manifest.txt");
-    bootfs_builder_run.addFileArg(b.path("../bootstrap/bootfs/startup_manifest.txt"));
-    bootfs_builder_run.addArg("/bin/bootstrap_fs.elf");
-    bootfs_builder_run.addFileArg(bootstrap_fs_app.getEmittedBin());
-    bootfs_builder_run.addArg("/bin/shell.elf");
-    bootfs_builder_run.addFileArg(shell_app.getEmittedBin());
     const install_bootfs_image = b.addInstallBinFile(bootfs_image_out, "EFI/BOOT/BOOTFS.IMG");
     const bootfs_step = b.step("bootfs-img", "Build bootfs image");
     bootfs_step.dependOn(&install_bootfs_image.step);
@@ -581,7 +529,6 @@ pub fn build(b: *std.Build) void {
     });
     install_efi.step.dependOn(&install_init.step);
     install_efi.step.dependOn(&install_shell.step);
-    install_efi.step.dependOn(&install_bootstrap_fs.step);
     install_efi.step.dependOn(&install_virtio_blk.step);
     install_efi.step.dependOn(&install_persistent_fs.step);
     install_efi.step.dependOn(&install_pie_user.step);
