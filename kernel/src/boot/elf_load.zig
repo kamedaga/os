@@ -1,6 +1,7 @@
 /// ELF loading into user process pages.
 /// Uses uefi_services for scratch allocation, so safe to call both before and
 /// after ExitBootServices.
+const std = @import("std");
 const kernel = @import("../kernel.zig");
 const boot_static = @import("main_static.zig");
 const elf_loader = @import("../elf_loader.zig");
@@ -133,6 +134,165 @@ fn readImageBackingAt(context: *anyopaque, offset: u64, out: []u8) elf_loader.St
     }
 }
 
+fn checkedAddU64(a: u64, b: u64) elf_loader.LoadToPageError!u64 {
+    const sum, const overflow = @addWithOverflow(a, b);
+    if (overflow != 0) return error.AddressOverflow;
+    return sum;
+}
+
+const ProcessImagePages = struct {
+    scratch: []align(8) u8,
+    page_paddrs: []u64,
+};
+
+fn allocProcessImagePages(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    page0_paddr: u64,
+    required_pages: usize,
+    free_list: *kernel.FreePageList,
+) ?ProcessImagePages {
+    if (required_pages == 0) return null;
+    const scratch = uefi_services.allocateBootScratch(required_pages * @sizeOf(u64)) orelse {
+        log_util.logRequiredBytes("loadUserElfIntoProcessPagesFromBacking: page table alloc failed bytes=", required_pages * @sizeOf(u64));
+        return null;
+    };
+    const page_paddrs = std.mem.bytesAsSlice(u64, scratch);
+    page_paddrs[0] = page0_paddr;
+
+    var page_index: usize = 1;
+    while (page_index < required_pages) : (page_index += 1) {
+        const extra_page = state.allocPageTo(principal, free_list) catch |err| {
+            log_util.logIndexedError("loadUserElfIntoProcessPagesFromBacking: allocPageTo failed idx=", page_index, err);
+            uefi_services.freeBootScratch(scratch);
+            return null;
+        };
+        const map_va = boot_static.user_va + (@as(u64, @intCast(page_index)) * 4096);
+        if (!user_vm.mapUserLinearRegion(principal, map_va, extra_page.paddr, 4096, true)) {
+            log_util.logIndexedMapFailure("loadUserElfIntoProcessPagesFromBacking: map failed idx=", page_index, map_va, extra_page.paddr);
+            uefi_services.freeBootScratch(scratch);
+            return null;
+        }
+        page_paddrs[page_index] = extra_page.paddr;
+    }
+
+    return .{
+        .scratch = scratch,
+        .page_paddrs = page_paddrs[0..required_pages],
+    };
+}
+
+fn zeroProcessImagePages(page_paddrs: []const u64) void {
+    for (page_paddrs) |page_paddr| {
+        const page: [*]u8 = @ptrFromInt(page_paddr);
+        @memset(page[0..4096], 0);
+    }
+}
+
+fn readProcessImageBytes(page_paddrs: []const u64, image_bytes: usize, offset: u64, out: []u8) elf_loader.LoadToPageError!void {
+    if (offset > std.math.maxInt(usize)) return error.SegmentTooLarge;
+    const start: usize = @intCast(offset);
+    if (start > image_bytes or out.len > image_bytes - start) return error.SegmentOutsideMappedRange;
+
+    var copied: usize = 0;
+    while (copied < out.len) {
+        const absolute = start + copied;
+        const page_index = absolute / 4096;
+        if (page_index >= page_paddrs.len) return error.SegmentOutsideMappedRange;
+        const page_offset = absolute % 4096;
+        const remaining = out.len - copied;
+        const step: usize = @min(remaining, 4096 - page_offset);
+        const page: [*]const u8 = @ptrFromInt(page_paddrs[page_index]);
+        @memcpy(out[copied .. copied + step], page[page_offset .. page_offset + step]);
+        copied += step;
+    }
+}
+
+fn writeProcessImageBytes(page_paddrs: []const u64, image_bytes: usize, offset: u64, bytes: []const u8) elf_loader.LoadToPageError!void {
+    if (offset > std.math.maxInt(usize)) return error.RelocationOutOfRange;
+    const start: usize = @intCast(offset);
+    if (start > image_bytes or bytes.len > image_bytes - start) return error.RelocationOutOfRange;
+
+    var copied: usize = 0;
+    while (copied < bytes.len) {
+        const absolute = start + copied;
+        const page_index = absolute / 4096;
+        if (page_index >= page_paddrs.len) return error.RelocationOutOfRange;
+        const page_offset = absolute % 4096;
+        const remaining = bytes.len - copied;
+        const step: usize = @min(remaining, 4096 - page_offset);
+        const page: [*]u8 = @ptrFromInt(page_paddrs[page_index]);
+        @memcpy(page[page_offset .. page_offset + step], bytes[copied .. copied + step]);
+        copied += step;
+    }
+}
+
+fn readU64Le(bytes: []const u8) u64 {
+    var value: u64 = 0;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) value |= @as(u64, bytes[i]) << @intCast(i * 8);
+    return value;
+}
+
+fn writeU64Le(bytes: []u8, value: u64) void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) bytes[i] = @intCast((value >> @intCast(i * 8)) & 0xFF);
+}
+
+const ProcessImageRelocationAccess = struct {
+    page_paddrs: []const u64,
+    image_bytes: usize,
+};
+
+fn readProcessImageU64At(context: *anyopaque, offset: u64) elf_loader.LoadToPageError!u64 {
+    const access: *const ProcessImageRelocationAccess = @ptrCast(@alignCast(context));
+    var buf: [8]u8 = undefined;
+    try readProcessImageBytes(access.page_paddrs, access.image_bytes, offset, buf[0..]);
+    return readU64Le(buf[0..]);
+}
+
+fn writeProcessImageU64At(context: *anyopaque, offset: u64, value: u64) elf_loader.LoadToPageError!void {
+    const access: *const ProcessImageRelocationAccess = @ptrCast(@alignCast(context));
+    var buf: [8]u8 = undefined;
+    writeU64Le(buf[0..], value);
+    try writeProcessImageBytes(access.page_paddrs, access.image_bytes, offset, buf[0..]);
+}
+
+fn copyReaderIntoProcessImage(
+    reader: elf_loader.Reader,
+    page_paddrs: []const u64,
+    image_bytes: usize,
+    src_offset: u64,
+    dest_offset: u64,
+    byte_count: u64,
+) elf_loader.StreamLoadToPageError!void {
+    if (byte_count > std.math.maxInt(usize)) return error.SegmentTooLarge;
+    const total: usize = @intCast(byte_count);
+
+    var copied: usize = 0;
+    while (copied < total) {
+        const dst_u64 = try checkedAddU64(dest_offset, @as(u64, @intCast(copied)));
+        if (dst_u64 > std.math.maxInt(usize)) return error.SegmentTooLarge;
+        const dst: usize = @intCast(dst_u64);
+        if (dst > image_bytes) return error.SegmentOutsideMappedRange;
+        const page_index = dst / 4096;
+        if (page_index >= page_paddrs.len) return error.SegmentOutsideMappedRange;
+        const page_offset = dst % 4096;
+        const remaining = total - copied;
+        const in_page = 4096 - page_offset;
+        const in_image = image_bytes - dst;
+        const step: usize = @min(remaining, @min(in_page, in_image));
+        if (step == 0) return error.SegmentOutsideMappedRange;
+        const src = try checkedAddU64(src_offset, @as(u64, @intCast(copied)));
+        const page: [*]u8 = @ptrFromInt(page_paddrs[page_index]);
+        reader.read_at(reader.context, src, page[page_offset .. page_offset + step]) catch |err| switch (err) {
+            error.SourceOutOfRange => return error.SegmentOutOfRange,
+            error.SourceReadFailed => return err,
+        };
+        copied += step;
+    }
+}
+
 pub fn loadUserElfIntoProcessPagesFromBacking(
     state: *kernel.KernelState,
     principal: kernel.PrincipalId,
@@ -165,36 +325,56 @@ pub fn loadUserElfIntoProcessPagesFromBacking(
         return null;
     }
 
-    const load_window = uefi_services.allocateBootScratch(required_bytes) orelse {
-        log_util.logRequiredBytes("loadUserElfIntoProcessPagesFromBacking: scratch alloc failed bytes=", required_bytes);
-        return null;
-    };
-    defer uefi_services.freeBootScratch(load_window);
-
-    @memset(load_window[0..required_bytes], 0);
-    const loaded = elf_loader.loadToSinglePageStreaming(reader, boot_static.user_elf_base_va, load_window[0..required_bytes]) catch |err| {
-        log_util.logError("loadUserElfIntoProcessPagesFromBacking: load failed: ", err);
-        return null;
-    };
-
     const required_pages = required_bytes / 4096;
-    const page0: [*]u8 = @ptrFromInt(page0_paddr);
-    @memcpy(page0[0..4096], load_window[0..4096]);
+    const process_pages = allocProcessImagePages(state, principal, page0_paddr, required_pages, free_list) orelse return null;
+    defer uefi_services.freeBootScratch(process_pages.scratch);
+    zeroProcessImagePages(process_pages.page_paddrs);
 
-    var page_index: usize = 1;
-    while (page_index < required_pages) : (page_index += 1) {
-        const extra_page = state.allocPageTo(principal, free_list) catch |err| {
-            log_util.logIndexedError("loadUserElfIntoProcessPagesFromBacking: allocPageTo failed idx=", page_index, err);
+    var loaded = parsed;
+    loaded.entry = checkedAddU64(boot_static.user_elf_base_va, parsed.entry) catch |err| {
+        log_util.logError("loadUserElfIntoProcessPagesFromBacking: entry overflow: ", err);
+        return null;
+    };
+
+    var entry_in_segment = false;
+    var segment_index: usize = 0;
+    while (segment_index < parsed.load_segment_len) : (segment_index += 1) {
+        const seg = parsed.load_segments[segment_index];
+        const runtime_start = checkedAddU64(boot_static.user_elf_base_va, seg.vaddr) catch |err| {
+            log_util.logError("loadUserElfIntoProcessPagesFromBacking: segment start overflow: ", err);
             return null;
         };
-        const map_va = boot_static.user_va + (@as(u64, @intCast(page_index)) * 4096);
-        if (!user_vm.mapUserLinearRegion(principal, map_va, extra_page.paddr, 4096, true)) {
-            log_util.logIndexedMapFailure("loadUserElfIntoProcessPagesFromBacking: map failed idx=", page_index, map_va, extra_page.paddr);
+        const runtime_end = checkedAddU64(runtime_start, seg.mem_size) catch |err| {
+            log_util.logError("loadUserElfIntoProcessPagesFromBacking: segment end overflow: ", err);
+            return null;
+        };
+        if (seg.file_size > std.math.maxInt(usize) or seg.mem_size > std.math.maxInt(usize)) {
+            log_util.logMessage("loadUserElfIntoProcessPagesFromBacking: segment too large");
             return null;
         }
-        const page_bytes: [*]u8 = @ptrFromInt(extra_page.paddr);
-        const off = page_index * 4096;
-        @memcpy(page_bytes[0..4096], load_window[off .. off + 4096]);
+        copyReaderIntoProcessImage(reader, process_pages.page_paddrs, required_bytes, seg.file_offset, seg.vaddr, seg.file_size) catch |err| {
+            log_util.logError("loadUserElfIntoProcessPagesFromBacking: segment load failed: ", err);
+            return null;
+        };
+        if (loaded.entry >= runtime_start and loaded.entry < runtime_end) entry_in_segment = true;
+    }
+
+    var relocation_access = ProcessImageRelocationAccess{
+        .page_paddrs = process_pages.page_paddrs,
+        .image_bytes = required_bytes,
+    };
+    elf_loader.applyRelativeRelocationsWithAccess(parsed, boot_static.user_elf_base_va, .{
+        .context = @ptrCast(&relocation_access),
+        .max_len = required_bytes,
+        .read_u64_at = readProcessImageU64At,
+        .write_u64_at = writeProcessImageU64At,
+    }) catch |err| {
+        log_util.logError("loadUserElfIntoProcessPagesFromBacking: relocation failed: ", err);
+        return null;
+    };
+    if (!entry_in_segment) {
+        log_util.logMessage("loadUserElfIntoProcessPagesFromBacking: entry outside mapped range");
+        return null;
     }
 
     return loaded;

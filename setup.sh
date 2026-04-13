@@ -9,11 +9,55 @@ ROOTFS_BUILDER_EXE="$SCRIPT_DIR/kernel/zig-out/bin/rootfs_builder.exe"
 ROOTFS_BUILDER_BIN="$SCRIPT_DIR/kernel/zig-out/bin/rootfs_builder"
 ESP_BUILDER_EXE="$SCRIPT_DIR/kernel/zig-out/bin/esp_builder.exe"
 ESP_BUILDER_BIN="$SCRIPT_DIR/kernel/zig-out/bin/esp_builder"
+BOOTFS_BUILDER_EXE="$SCRIPT_DIR/kernel/zig-out/bin/bootfs_builder.exe"
+BOOTFS_BUILDER_BIN="$SCRIPT_DIR/kernel/zig-out/bin/bootfs_builder"
+BOOTFS_IMAGE_OUT="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/BOOTFS.IMG"
 ROOTFS_MANIFEST="$SCRIPT_DIR/userland/rootfs/rootfs_manifest.txt"
 SEED_INIT_DIR="$SCRIPT_DIR/userland/seed_init"
 SEED_INIT_OUT="$SEED_INIT_DIR/zig-out/bin/seed.elf"
+SHELL_BOOTFS_SRC="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/SHELL.ELF"
+BLOCK_BOOTFS_SRC="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/VBLKDRV.ELF"
+PERSISTENT_FS_BOOTFS_SRC="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/PERSFS.ELF"
+STARTUP_MANIFEST_BOOTFS_SRC="$SCRIPT_DIR/userland/rootfs/startup_manifest.txt"
 ESP_MANIFEST="$SCRIPT_DIR/bootstrap/esp_manifest.txt"
 mkdir -p "$ARTIFACT_DIR"
+
+require_nonempty_file() {
+  local path="$1"
+  local label="$2"
+  if [ ! -f "$path" ]; then
+    echo "missing $label: $path" >&2
+    exit 1
+  fi
+  if [ ! -s "$path" ]; then
+    echo "empty $label: $path" >&2
+    echo "rebuild the artifact before running ./setup.sh" >&2
+    exit 1
+  fi
+}
+
+repair_bootx64_efi_if_needed() {
+  local target="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI"
+  if [ -s "$target" ]; then
+    return 0
+  fi
+  local cache_dir="$SCRIPT_DIR/kernel/.zig-cache/o"
+  if [ ! -d "$cache_dir" ]; then
+    return 1
+  fi
+  local candidate
+  candidate=$(find "$cache_dir" -type f -name 'BOOTX64.efi' -size +0c -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)
+  if [ -z "$candidate" ]; then
+    return 1
+  fi
+  mkdir -p "$(dirname "$target")"
+  cp "$candidate" "$target"
+  if [ -s "$target" ]; then
+    echo "restored EFI boot image from cache: $candidate"
+    return 0
+  fi
+  return 1
+}
 
 # 1) 古いもの削除
 rm -f "$DISK_IMG"
@@ -51,10 +95,68 @@ build_seed_init() {
 
 build_seed_init
 
+build_bootfs_image() {
+  local out_path="$1"
+  shift
+  if [ $(( $# % 2 )) -ne 0 ]; then
+    echo "bootfs image pairs must be <image_path> <source_path>" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$out_path")"
+  if [ -f "$BOOTFS_BUILDER_EXE" ]; then
+    local exe_win
+    exe_win=$(wslpath -w "$BOOTFS_BUILDER_EXE")
+    local out_win
+    out_win=$(wslpath -w "$out_path")
+    local ps_cmd
+    ps_cmd="& '$exe_win' '$out_win'"
+    while [ $# -gt 0 ]; do
+      local image_path="$1"
+      local source_path="$2"
+      shift 2
+      local source_win
+      source_win=$(wslpath -w "$source_path")
+      ps_cmd="$ps_cmd '$image_path' '$source_win'"
+    done
+    "$PS_EXE" -NoLogo -NoProfile -Command "$ps_cmd"
+  elif [ -x "$BOOTFS_BUILDER_BIN" ]; then
+    "$BOOTFS_BUILDER_BIN" "$out_path" "$@"
+  else
+    local script_dir_win
+    script_dir_win=$(wslpath -w "$SCRIPT_DIR")
+    local out_win
+    out_win=$(wslpath -w "$out_path")
+    local ps_cmd
+    ps_cmd="Set-Location '$script_dir_win'; zig run .\\tools\\bootfs_builder.zig -- '$out_win'"
+    while [ $# -gt 0 ]; do
+      local image_path="$1"
+      local source_path="$2"
+      shift 2
+      local source_win
+      source_win=$(wslpath -w "$source_path")
+      ps_cmd="$ps_cmd '$image_path' '$source_win'"
+    done
+    "$PS_EXE" -NoLogo -NoProfile -Command "$ps_cmd"
+  fi
+}
+
 if [ ! -f "$SEED_INIT_OUT" ]; then
   echo "missing seed init artifact: $SEED_INIT_OUT" >&2
   exit 1
 fi
+
+build_bootfs_image "$BOOTFS_IMAGE_OUT" \
+  /srv/seed.elf "$SEED_INIT_OUT" \
+  /cmd/shell.elf "$SHELL_BOOTFS_SRC" \
+  /srv/virtio_blk.elf "$BLOCK_BOOTFS_SRC" \
+  /srv/persistent_fs.elf "$PERSISTENT_FS_BOOTFS_SRC" \
+  /sys/startup_manifest.txt "$STARTUP_MANIFEST_BOOTFS_SRC"
+
+repair_bootx64_efi_if_needed || true
+require_nonempty_file "$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI" "EFI boot image"
+require_nonempty_file "$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/SHELL.ELF" "shell image"
+require_nonempty_file "$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/INITAPP.ELF" "init image"
+require_nonempty_file "$BOOTFS_IMAGE_OUT" "bootfs image"
 
 run_disk_builder() {
   local exe_path="$1"

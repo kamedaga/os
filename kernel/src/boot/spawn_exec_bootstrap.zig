@@ -20,6 +20,7 @@ pub const Hooks = struct {
 
 pub const Request = struct {
     requested: bool = false,
+    child_bootstrap_owner: bool = false,
     descriptor_mode: bool = false,
     extended_descriptor_mode: bool = false,
     page_descriptors: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined,
@@ -37,14 +38,21 @@ pub fn parseRequest(
     out: *Request,
 ) u64 {
     out.* = .{};
-    out.requested = bootstrap_source_va != 0 or bootstrap_target_va != 0 or bootstrap_flags != 0;
+    const child_bootstrap_owner = (bootstrap_flags & process_abi.spawn_flag_child_bootstrap_owner) != 0;
+    const request_flags = bootstrap_flags & ~process_abi.spawn_flag_child_bootstrap_owner;
+    out.child_bootstrap_owner = child_bootstrap_owner;
+    if (child_bootstrap_owner and !hooks.state.isBootstrapOwner(caller)) {
+        hooks.write("spawn_exec child bootstrap owner denied\n");
+        return hooks.syscall_err_invalid;
+    }
+    out.requested = bootstrap_source_va != 0 or bootstrap_target_va != 0 or request_flags != 0;
     if (!out.requested) return hooks.syscall_ok;
 
-    out.descriptor_mode = (bootstrap_flags & process_abi.spawn_flag_bootstrap_descriptor_table) != 0;
-    out.extended_descriptor_mode = (bootstrap_flags & process_abi.spawn_flag_bootstrap_extended_descriptor_table) != 0;
+    out.descriptor_mode = (request_flags & process_abi.spawn_flag_bootstrap_descriptor_table) != 0;
+    out.extended_descriptor_mode = (request_flags & process_abi.spawn_flag_bootstrap_extended_descriptor_table) != 0;
 
     if (out.extended_descriptor_mode) {
-        if ((bootstrap_flags & ~process_abi.spawn_flag_bootstrap_extended_descriptor_table) != 0) {
+        if ((request_flags & ~process_abi.spawn_flag_bootstrap_extended_descriptor_table) != 0) {
             hooks.write("spawn_exec bootstrap bad flags\n");
             return hooks.syscall_err_invalid;
         }
@@ -78,7 +86,7 @@ pub fn parseRequest(
     }
 
     if (out.descriptor_mode) {
-        if ((bootstrap_flags & ~process_abi.spawn_flag_bootstrap_descriptor_table) != 0) {
+        if ((request_flags & ~process_abi.spawn_flag_bootstrap_descriptor_table) != 0) {
             hooks.write("spawn_exec bootstrap bad flags\n");
             return hooks.syscall_err_invalid;
         }

@@ -7,6 +7,7 @@ const font = @import("support_root").font;
 const image_abi = @import("support_root").image_abi;
 const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
 const manager_init_bootstrap_abi = @import("support_root").manager_init_bootstrap_abi;
+const bootfs_format = @import("support_root").bootfs_format;
 const process_abi = @import("support_root").process_abi;
 const queue_abi = @import("support_root").queue_abi;
 const rootfs_core = @import("support_root").rootfs_core;
@@ -14,6 +15,7 @@ const rootfs_core = @import("support_root").rootfs_core;
 const syscall_log: u64 = 0x9;
 const syscall_map_page: u64 = 0x2;
 const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_grant_caps_batch: u64 = 0x14;
 const syscall_install_endpoint: u64 = 0x26;
 const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_install_mmio_cap: u64 = 0x2F;
@@ -57,6 +59,7 @@ const boot_log_min_rows_after_logo: i32 = 6;
 const boot_log_scale: i32 = 1;
 const boot_banner_title = "MICROKERNEL";
 const boot_banner_subtitle = "ENTER BARE-METAL CAPABILITY BASED KERNEL";
+const seed_exec_bootfs_path = "/srv/seed.elf";
 
 const BlockGeometry = struct {
     capacity_sectors: u64,
@@ -68,15 +71,33 @@ const InputDeviceKind = enum {
     keyboard,
 };
 
+fn inputDeviceHintValue(kind: InputDeviceKind) u64 {
+    return switch (kind) {
+        .pointer => @intFromEnum(manager_init_bootstrap_abi.InputDeviceHint.pointer),
+        .keyboard => @intFromEnum(manager_init_bootstrap_abi.InputDeviceHint.keyboard),
+    };
+}
+
 const DeviceMmioPageSet = struct {
     paddrs: [4]u64 = [_]u64{0} ** 4,
     rights: [4]u64 = [_]u64{0} ** 4,
     count: usize = 0,
 };
 
+const MmioCapCache = struct {
+    paddrs: [init_bootstrap_abi.max_device_descriptors * 4]u64 = [_]u64{0} ** (init_bootstrap_abi.max_device_descriptors * 4),
+    rights: [init_bootstrap_abi.max_device_descriptors * 4]u64 = [_]u64{0} ** (init_bootstrap_abi.max_device_descriptors * 4),
+    count: usize = 0,
+};
+
 var next_inspect_mmio_page_va: u64 = inspect_mmio_base_va;
 var manager_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
 var manager_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
+var manager_bootstrap_handoff_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var manager_bootstrap_handoff_source_va: u64 = 0;
+var manager_device_needed_cache: [init_bootstrap_abi.max_device_descriptors]bool = [_]bool{false} ** init_bootstrap_abi.max_device_descriptors;
+var manager_device_input_hint_cache: [init_bootstrap_abi.max_device_descriptors]u64 = [_]u64{0} ** init_bootstrap_abi.max_device_descriptors;
+var mmio_cap_cache = MmioCapCache{};
 
 const BootLogFramebuffer = struct {
     enabled: bool = false,
@@ -447,6 +468,18 @@ fn grantCap(to_process_slot: u64, paddr: u64, rights_bits: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn grantCapsBatch(paddr_list_va: u64, page_count: u64, to_process_slot: u64, rights_bits: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_grant_caps_batch),
+          [arg0] "{rdi}" (paddr_list_va),
+          [arg1] "{rsi}" (page_count),
+          [arg2] "{rdx}" (to_process_slot),
+          [arg3] "{rcx}" (rights_bits),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn grantQueueCap(token: u64, to_process_slot: u64) u64 {
     return asm volatile (
         \\int $0x80
@@ -465,7 +498,7 @@ fn spawnExecWithExtendedBootstrapTable(exec_token: u64, table: *const process_ab
           [arg0] "{rdi}" (exec_token),
           [arg1] "{rsi}" (@as(u64, @intFromPtr(table))),
           [arg2] "{rdx}" (@as(u64, 0)),
-          [arg3] "{rcx}" (process_abi.spawn_flag_bootstrap_extended_descriptor_table),
+          [arg3] "{rcx}" (process_abi.spawn_flag_bootstrap_extended_descriptor_table | process_abi.spawn_flag_child_bootstrap_owner),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -477,6 +510,27 @@ fn installVmObjectMmioRange(base_paddr: u64, size_bytes: u64, rights: image_abi.
           [arg0] "{rdi}" (base_paddr),
           [arg1] "{rsi}" (size_bytes),
           [arg2] "{rdx}" (image_abi.vmObjectRightsToBits(rights)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (image_abi.syscall_install_vm_object),
+          [arg0] "{rdi}" (base_va),
+          [arg1] "{rsi}" (size_bytes),
+          [arg2] "{rdx}" (image_abi.vmObjectRightsToBits(rights)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn installExecImage(vm_token: u64, rights: image_abi.ExecImageRights) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (image_abi.syscall_install_exec_image),
+          [arg0] "{rdi}" (vm_token),
+          [arg1] "{rsi}" (image_abi.execImageRightsToBits(rights)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -601,31 +655,75 @@ fn collectDeviceMmioPages(descriptor: init_bootstrap_abi.DeviceDescriptor, writa
     return set;
 }
 
+fn ensureMmioCapInstalled(paddr: u64, rights_bits: u64) bool {
+    if (paddr == 0) return true;
+    var i: usize = 0;
+    while (i < mmio_cap_cache.count) : (i += 1) {
+        if (mmio_cap_cache.paddrs[i] != paddr) continue;
+        if ((mmio_cap_cache.rights[i] & rights_bits) == rights_bits) return true;
+        const merged_rights = mmio_cap_cache.rights[i] | rights_bits;
+        if (installMmioCap(paddr, merged_rights) != 0) return false;
+        mmio_cap_cache.rights[i] = merged_rights;
+        return true;
+    }
+    if (installMmioCap(paddr, rights_bits) != 0) return false;
+    if (mmio_cap_cache.count >= mmio_cap_cache.paddrs.len) return false;
+    mmio_cap_cache.paddrs[mmio_cap_cache.count] = paddr;
+    mmio_cap_cache.rights[mmio_cap_cache.count] = rights_bits;
+    mmio_cap_cache.count += 1;
+    return true;
+}
+
 fn ensureDeviceMmioCapsInstalled(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
     const page_right_grant: u64 = 0x8;
     const set = collectDeviceMmioPages(descriptor, true) orelse return false;
     var i: usize = 0;
     while (i < set.count) : (i += 1) {
-        if (installMmioCap(set.paddrs[i], set.rights[i] | page_right_grant) != 0) return false;
+        if (!ensureMmioCapInstalled(set.paddrs[i], set.rights[i] | page_right_grant)) return false;
     }
     return true;
 }
 
 fn grantDeviceMmioPages(descriptor: init_bootstrap_abi.DeviceDescriptor, child_process_slot: u64) bool {
     const set = collectDeviceMmioPages(descriptor, false) orelse return false;
+    var processed_rights: [4]u64 = undefined;
+    var processed_len: usize = 0;
+    var grouped_paddrs: [4]u64 = undefined;
     var i: usize = 0;
     while (i < set.count) : (i += 1) {
-        if (grantCap(child_process_slot, set.paddrs[i], set.rights[i]) != 0) return false;
-    }
-    return true;
-}
-
-fn grantDeviceMmioPagesWithGrant(descriptor: init_bootstrap_abi.DeviceDescriptor, child_process_slot: u64) bool {
-    const page_right_grant: u64 = 0x8;
-    const set = collectDeviceMmioPages(descriptor, true) orelse return false;
-    var i: usize = 0;
-    while (i < set.count) : (i += 1) {
-        if (grantCap(child_process_slot, set.paddrs[i], set.rights[i] | page_right_grant) != 0) return false;
+        var group_len: usize = 0;
+        const rights_bits = set.rights[i];
+        var already_processed = false;
+        var processed_index: usize = 0;
+        while (processed_index < processed_len) : (processed_index += 1) {
+            if (processed_rights[processed_index] == rights_bits) {
+                already_processed = true;
+                break;
+            }
+        }
+        if (already_processed) continue;
+        var j: usize = 0;
+        while (j < set.count) : (j += 1) {
+            if (set.rights[j] != rights_bits) continue;
+            var duplicate = false;
+            var k: usize = 0;
+            while (k < group_len) : (k += 1) {
+                if (grouped_paddrs[k] == set.paddrs[j]) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            grouped_paddrs[group_len] = set.paddrs[j];
+            group_len += 1;
+        }
+        processed_rights[processed_len] = rights_bits;
+        processed_len += 1;
+        if (group_len == 1) {
+            if (grantCap(child_process_slot, grouped_paddrs[0], rights_bits) != 0) return false;
+        } else {
+            if (grantCapsBatch(@intFromPtr(&grouped_paddrs), group_len, child_process_slot, rights_bits) != 0) return false;
+        }
     }
     return true;
 }
@@ -644,7 +742,7 @@ fn deviceCfgInspectVaForClassification(descriptor: init_bootstrap_abi.DeviceDesc
     const page_right_grant: u64 = 0x8;
     if (descriptor.device_page_paddr == 0) return null;
     const rights = page_right_cpu_read | if (writable) page_right_cpu_write else @as(u64, 0);
-    if (installMmioCap(descriptor.device_page_paddr, rights | page_right_grant) != 0) return null;
+    if (!ensureMmioCapInstalled(descriptor.device_page_paddr, rights | page_right_grant)) return null;
     const page_va = mapInspectMmioPage(descriptor.device_page_paddr, writable) orelse return null;
     return page_va + descriptor.device_page_offset;
 }
@@ -702,11 +800,30 @@ fn classifyInputDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor
     return null;
 }
 
-fn managerNeedsDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
-    if (isVirtioBlockDeviceDescriptor(descriptor)) return true;
-    if (!isVirtioInputDeviceDescriptor(descriptor)) return false;
-    const kind = classifyInputDeviceDescriptor(descriptor) orelse return true;
-    return kind == .keyboard;
+fn rebuildManagerDeviceNeedCache(page: *const volatile init_bootstrap_abi.DescriptorPage) void {
+    var i: usize = 0;
+    while (i < manager_device_needed_cache.len) : (i += 1) {
+        manager_device_needed_cache[i] = false;
+        manager_device_input_hint_cache[i] = 0;
+    }
+    i = 0;
+    while (i < page.device_count and i < init_bootstrap_abi.max_device_descriptors) : (i += 1) {
+        const descriptor = page.devices[i];
+        if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
+        if (isVirtioBlockDeviceDescriptor(descriptor)) {
+            manager_device_needed_cache[i] = true;
+            continue;
+        }
+        if (!isVirtioInputDeviceDescriptor(descriptor)) continue;
+        const kind = classifyInputDeviceDescriptor(descriptor) orelse continue;
+        manager_device_input_hint_cache[i] = inputDeviceHintValue(kind);
+        manager_device_needed_cache[i] = kind == .keyboard;
+    }
+}
+
+fn isManagerBootstrapSpawnPageNeeded(descriptor: init_bootstrap_abi.SpawnPageDescriptor) bool {
+    return descriptor.kind == @intFromEnum(init_bootstrap_abi.SpawnPageKind.service_config) and
+        descriptor.subject == @intFromEnum(init_bootstrap_abi.SpawnPageSubject.window_service);
 }
 
 fn readBlockGeometry(descriptor: init_bootstrap_abi.DeviceDescriptor) ?BlockGeometry {
@@ -719,6 +836,80 @@ fn readBlockGeometry(descriptor: init_bootstrap_abi.DeviceDescriptor) ?BlockGeom
         .capacity_sectors = mmioReadU64(device_cfg_va + virtio_blk_capacity_offset),
         .logical_block_size = logical_block_size,
     };
+}
+
+fn bootfsArchiveHeader() ?*const bootfs_format.BootFsHeader {
+    const page = descriptorPage() orelse return null;
+    const archive = page.bootfs_archive;
+    if ((archive.flags & init_bootstrap_abi.boot_archive_flag_present) == 0) return null;
+    if (archive.image_va == 0 or archive.size_bytes < @sizeOf(bootfs_format.BootFsHeader)) return null;
+    const header: *const bootfs_format.BootFsHeader = @ptrFromInt(archive.image_va);
+    if (header.magic != bootfs_format.magic or header.version != bootfs_format.version) return null;
+    if (header.image_bytes > archive.size_bytes) return null;
+    const entry_table_end = header.entry_table_offset + @as(u64, header.entry_count) * @sizeOf(bootfs_format.BootFsEntry);
+    if (header.entry_table_offset < header.header_bytes or entry_table_end > header.image_bytes) return null;
+    if (header.string_table_offset + header.string_table_bytes > header.image_bytes) return null;
+    if (header.data_offset + header.data_bytes > header.image_bytes) return null;
+    return header;
+}
+
+fn bootfsPathBytes(header: *const bootfs_format.BootFsHeader, entry: bootfs_format.BootFsEntry) ?[]const u8 {
+    const path_offset = header.string_table_offset + entry.path_offset;
+    const path_end = path_offset + entry.path_bytes;
+    if (path_end > header.image_bytes) return null;
+    const path_ptr: [*]const u8 = @ptrFromInt(@intFromPtr(header) + path_offset);
+    return path_ptr[0..entry.path_bytes];
+}
+
+fn openExecFromBootFs(path: []const u8) ?rootfs_core.OpenExecResult {
+    const header = bootfsArchiveHeader() orelse return null;
+    const entry_ptr: [*]const bootfs_format.BootFsEntry = @ptrFromInt(@intFromPtr(header) + header.entry_table_offset);
+    var entry_index: usize = 0;
+    while (entry_index < header.entry_count) : (entry_index += 1) {
+        const entry = entry_ptr[entry_index];
+        if (entry.kind != bootfs_format.kind_regular) continue;
+        const entry_path = bootfsPathBytes(header, entry) orelse continue;
+        if (!std.mem.eql(u8, entry_path, path)) continue;
+        const data_end = entry.data_offset + entry.data_bytes;
+        if (entry.data_offset < header.data_offset or data_end > header.image_bytes) return null;
+        const data_va = @intFromPtr(header) + entry.data_offset;
+        const vm_token = installVmObject(data_va, entry.data_bytes, .{ .read = true });
+        if (image_abi.decodeVmObjectToken(vm_token) == null) return null;
+        const exec_token = installExecImage(vm_token, .{ .exec = true });
+        if (image_abi.decodeExecImageToken(exec_token) == null) return null;
+        return .{
+            .token = exec_token,
+            .file_bytes = entry.data_bytes,
+        };
+    }
+    return null;
+}
+
+fn openSeedExec() rootfs_core.OpenExecResult {
+    if (openExecFromBootFs(seed_exec_bootfs_path)) |exec| {
+        _ = userLog("BootInit: bootfs seed exec ready\n");
+        return exec;
+    }
+
+    const block_desc = requireBlockDeviceDescriptor("BootInit: block device descriptor missing\n");
+    const block_geometry = readBlockGeometry(block_desc) orelse bootFail("BootInit: block geometry failed\n");
+    if (!ensureDeviceMmioCapsInstalled(block_desc)) bootFail("BootInit: block MMIO install failed\n");
+    if (!rootfs_core.init(.{
+        .rootfs_start_block = persistent_fs_start_block,
+        .capacity_sectors = block_geometry.capacity_sectors,
+        .logical_block_size = block_geometry.logical_block_size,
+        .common_page_paddr = block_desc.common_page_paddr,
+        .notify_page_paddr = block_desc.notify_page_paddr,
+        .isr_page_paddr = block_desc.isr_page_paddr,
+        .common_page_offset = block_desc.common_page_offset,
+        .notify_page_offset = block_desc.notify_page_offset,
+        .isr_page_offset = block_desc.isr_page_offset,
+        .notify_off_multiplier = block_desc.notify_off_multiplier,
+        .queue_submit_token = block_desc.init_queue_submit_token,
+        .queue_notify_token = block_desc.init_queue_notify_token,
+    })) bootFail("BootInit: rootfs init failed\n");
+    _ = userLog("BootInit: rootfs ready\n");
+    return rootfs_core.openExec(seed_exec_path) orelse bootFail("BootInit: seed open_exec failed\n");
 }
 
 fn allocWritableBootstrapPageAt(source_va: u64, label: []const u8) u64 {
@@ -742,11 +933,9 @@ fn appendManagerBootstrapPage(source_va: u64, target_va: u64, flags: u64) void {
 }
 
 fn prepareManagerBootstrapHandoffPage() u64 {
-    const source_va = allocWritableBootstrapPageAt(
-        manager_init_bootstrap_abi.config_target_va,
-        "BootInit: alloc manager handoff page failed\n",
-    );
+    const source_va = @intFromPtr(&manager_bootstrap_handoff_page);
     manager_init_bootstrap_abi.writePendingConfigPage(source_va);
+    manager_bootstrap_handoff_source_va = source_va;
     return source_va;
 }
 
@@ -755,6 +944,8 @@ fn buildManagerBootstrapTable() *const process_abi.BootstrapDescriptorTable {
     const cfg = configPage() orelse bootFail("BootInit: config page missing\n");
     const page = descriptorPage() orelse bootFail("BootInit: descriptor page missing\n");
     const manager_handoff_source_va = prepareManagerBootstrapHandoffPage();
+    rebuildManagerDeviceNeedCache(page);
+    _ = userLog("BootInit: manager bootstrap cache ready\n");
 
     appendManagerBootstrapPage(process_abi.standard_config_target_va, process_abi.standard_config_target_va, 0);
     appendManagerBootstrapPage(cfg.descriptor_page_va, cfg.descriptor_page_va, 0);
@@ -764,25 +955,15 @@ fn buildManagerBootstrapTable() *const process_abi.BootstrapDescriptorTable {
     while (spawn_index < page.spawn_page_count and spawn_index < init_bootstrap_abi.max_spawn_page_descriptors) : (spawn_index += 1) {
         const descriptor = page.spawn_pages[spawn_index];
         if ((descriptor.flags & init_bootstrap_abi.spawn_page_flag_kernel_backed) == 0) continue;
+        if (!isManagerBootstrapSpawnPageNeeded(descriptor)) continue;
         const flags = if ((descriptor.flags & init_bootstrap_abi.spawn_page_flag_init_writable) != 0)
             process_abi.spawn_flag_bootstrap_page_writable
         else
             @as(u64, 0);
         appendManagerBootstrapPage(descriptor.source_va, descriptor.source_va, flags);
     }
+    _ = userLog("BootInit: manager bootstrap spawn pages ready\n");
 
-    var device_index: usize = 0;
-    while (device_index < page.device_count and device_index < init_bootstrap_abi.max_device_descriptors) : (device_index += 1) {
-        const descriptor = page.devices[device_index];
-        if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
-        if (!managerNeedsDeviceDescriptor(descriptor)) continue;
-        if (descriptor.bootstrap_source_va == 0) continue;
-        appendManagerBootstrapPage(
-            descriptor.bootstrap_source_va,
-            descriptor.bootstrap_source_va,
-            process_abi.spawn_flag_bootstrap_page_writable,
-        );
-    }
     if ((page.primary_display.flags & init_bootstrap_abi.display_flag_present) != 0 and
         page.primary_display.framebuffer_paddr != 0 and
         page.primary_display.framebuffer_size_bytes != 0)
@@ -793,8 +974,9 @@ fn buildManagerBootstrapTable() *const process_abi.BootstrapDescriptorTable {
             .{ .read = true, .write = true, .map = true, .grant = true },
         );
         if (image_abi.decodeVmObjectToken(fb_vm_token) == null) bootFail("BootInit: framebuffer vm install failed\n");
-        manager_bootstrap_table_storage.cap_count = 1;
-        manager_bootstrap_table_storage.cap_descriptors[0] = .{
+        const cap_index = manager_bootstrap_table_storage.cap_count;
+        manager_bootstrap_table_storage.cap_count += 1;
+        manager_bootstrap_table_storage.cap_descriptors[cap_index] = .{
             .source_token = fb_vm_token,
             .target_token_va = manager_init_bootstrap_abi.config_target_va +
                 @offsetOf(manager_init_bootstrap_abi.ConfigPage, "framebuffer_vm_token"),
@@ -802,6 +984,29 @@ fn buildManagerBootstrapTable() *const process_abi.BootstrapDescriptorTable {
             .kind = .vm_object,
         };
     }
+    _ = userLog("BootInit: manager bootstrap framebuffer ready\n");
+    if ((page.bootfs_archive.flags & init_bootstrap_abi.boot_archive_flag_present) != 0 and
+        page.bootfs_archive.image_va != 0 and
+        page.bootfs_archive.size_bytes != 0)
+    {
+        const bootfs_vm_token = installVmObject(
+            page.bootfs_archive.image_va,
+            page.bootfs_archive.size_bytes,
+            .{ .read = true, .map = true, .grant = true },
+        );
+        if (image_abi.decodeVmObjectToken(bootfs_vm_token) == null) bootFail("BootInit: bootfs vm install failed\n");
+        const cap_index = manager_bootstrap_table_storage.cap_count;
+        if (cap_index >= process_abi.max_bootstrap_cap_descriptors) bootFail("BootInit: manager bootstrap cap table full\n");
+        manager_bootstrap_table_storage.cap_count += 1;
+        manager_bootstrap_table_storage.cap_descriptors[cap_index] = .{
+            .source_token = bootfs_vm_token,
+            .target_token_va = manager_init_bootstrap_abi.config_target_va +
+                @offsetOf(manager_init_bootstrap_abi.ConfigPage, "bootfs_vm_token"),
+            .rights_bits = image_abi.vmObjectRightsToBits(.{ .read = true, .map = true }),
+            .kind = .vm_object,
+        };
+    }
+    _ = userLog("BootInit: manager bootstrap bootfs ready\n");
     return &manager_bootstrap_table_storage;
 }
 
@@ -812,11 +1017,8 @@ fn grantManagerDeviceResources(manager_slot: u64) void {
     while (device_index < page.device_count and device_index < init_bootstrap_abi.max_device_descriptors) : (device_index += 1) {
         const descriptor = page.devices[device_index];
         if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
-        if (!managerNeedsDeviceDescriptor(descriptor)) continue;
+        if (!manager_device_needed_cache[device_index]) continue;
         logManagerGrantDeviceStep(device_index, descriptor, "begin");
-        if (!ensureDeviceMmioCapsInstalled(descriptor) or !grantDeviceMmioPagesWithGrant(descriptor, manager_slot)) {
-            bootFail("BootInit: manager MMIO grant failed\n");
-        }
         logManagerGrantDeviceStep(device_index, descriptor, "mmio ready");
         const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(descriptor.init_queue_submit_token), manager_slot);
         const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(descriptor.init_queue_notify_token), manager_slot);
@@ -824,15 +1026,16 @@ fn grantManagerDeviceResources(manager_slot: u64) void {
         const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse bootFail("BootInit: manager notify grant failed\n");
         logManagerGrantDeviceStep(device_index, descriptor, "queue ready");
         manager_init_bootstrap_abi.writeDeviceGrant(
-            manager_init_bootstrap_abi.config_target_va,
+            manager_bootstrap_handoff_source_va,
             handoff_index,
-            descriptor.bootstrap_source_va,
+            descriptor.device_page_paddr,
             submit_child,
             notify_child,
+            manager_device_input_hint_cache[device_index],
         );
         handoff_index += 1;
     }
-    manager_init_bootstrap_abi.markReady(manager_init_bootstrap_abi.config_target_va, handoff_index);
+    manager_init_bootstrap_abi.markReady(manager_bootstrap_handoff_source_va, handoff_index);
 }
 
 fn bootMain() noreturn {
@@ -848,26 +1051,7 @@ fn bootMain() noreturn {
         .window_service,
         "BootInit: window service descriptor missing\n",
     );
-    const block_desc = requireBlockDeviceDescriptor("BootInit: block device descriptor missing\n");
-    const block_geometry = readBlockGeometry(block_desc) orelse bootFail("BootInit: block geometry failed\n");
-    if (!ensureDeviceMmioCapsInstalled(block_desc)) bootFail("BootInit: block MMIO install failed\n");
-    if (!rootfs_core.init(.{
-        .rootfs_start_block = persistent_fs_start_block,
-        .capacity_sectors = block_geometry.capacity_sectors,
-        .logical_block_size = block_geometry.logical_block_size,
-        .common_page_paddr = block_desc.common_page_paddr,
-        .notify_page_paddr = block_desc.notify_page_paddr,
-        .isr_page_paddr = block_desc.isr_page_paddr,
-        .common_page_offset = block_desc.common_page_offset,
-        .notify_page_offset = block_desc.notify_page_offset,
-        .isr_page_offset = block_desc.isr_page_offset,
-        .notify_off_multiplier = block_desc.notify_off_multiplier,
-        .queue_submit_token = block_desc.init_queue_submit_token,
-        .queue_notify_token = block_desc.init_queue_notify_token,
-    })) bootFail("BootInit: rootfs init failed\n");
-    _ = userLog("BootInit: rootfs ready\n");
-
-    const manager_exec = rootfs_core.openExec(seed_exec_path) orelse bootFail("BootInit: seed open_exec failed\n");
+    const manager_exec = openSeedExec();
     _ = userLog("BootInit: seed exec ready\n");
 
     const manager_bootstrap_table = buildManagerBootstrapTable();

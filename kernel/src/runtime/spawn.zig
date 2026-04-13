@@ -109,6 +109,9 @@ pub fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
             if (rc != boot_static.syscall_ok) return rc;
         }
     }
+    if (bootstrap_request.child_bootstrap_owner) {
+        state_ptr.setBootstrapOwner(created.principal, true) catch return boot_static.syscall_err_invalid;
+    }
 
     const ctx = scheduler.getThreadContext(created.process.thread_slot).?;
     ctx.frame.rip = loaded.entry;

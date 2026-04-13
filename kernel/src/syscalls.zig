@@ -45,6 +45,7 @@ const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
 const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
 const syscall_install_mmio_cap: u64 = 0x2F;
+const syscall_install_caps_batch: u64 = 0x32;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
 
 const syscall_batch_max_pages: usize = 64;
@@ -474,6 +475,20 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 h.write(" last=");
                 h.print_hex(paddrs[@intCast(page_count_u64 - 1)]);
                 h.write("\n");
+            }
+            if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
+            return syscall_ok;
+        },
+        syscall_install_caps_batch => {
+            if (!state.isBootstrapOwner(proc)) return syscall_err_invalid;
+            const page_count_u64 = frame.rsi;
+            if (page_count_u64 == 0 or page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
+            const rights = capability.parseRights(frame.rdx);
+            var paddrs: [syscall_batch_max_pages]u64 = undefined;
+            if (!readUserPaddrBatch(h, proc, frame.rdi, page_count_u64, &paddrs)) return syscall_err_invalid;
+            var i: usize = 0;
+            while (i < page_count_u64) : (i += 1) {
+                state.installCap(proc, paddrs[i], rights) catch return syscall_err_grant;
             }
             if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
             return syscall_ok;

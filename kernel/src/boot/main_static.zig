@@ -90,6 +90,7 @@ pub const syscall_grant_caps_batch: u64 = 0x14;
 pub const syscall_map_pages_batch: u64 = 0x15;
 pub const syscall_launch_pie_user: u64 = 0x16;
 pub const syscall_wait_event: u64 = 0x17;
+pub const syscall_install_caps_batch: u64 = 0x32;
 pub const syscall_batch_max_pages: usize = 64;
 
 pub const user_program_cfg: user_programs.Config = .{

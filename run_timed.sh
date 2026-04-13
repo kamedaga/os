@@ -27,6 +27,12 @@ fi
 
 for f in "$EFI_DIR"/BOOTX64.EFI "$EFI_DIR"/*.ELF "$EFI_DIR"/BOOTFS.IMG; do
   [ -e "$f" ] || continue
+  if [ ! -s "$f" ]; then
+    echo "broken EFI artifact detected:"
+    echo "  $f is empty"
+    echo "rebuild the artifact and run ./setup.sh again"
+    exit 1
+  fi
   if [ "$f" -nt "$DISK_IMG" ]; then
     echo "stale disk image detected:"
     echo "  $f is newer than $DISK_IMG"

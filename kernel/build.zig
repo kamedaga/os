@@ -1,6 +1,44 @@
 const std = @import("std");
 
+fn pruneZeroSizedBootx64Artifacts() bool {
+    const cwd = std.fs.cwd();
+    var repaired = false;
+    const installed_bootx64 = "zig-out/bin/EFI/BOOT/BOOTX64.EFI";
+    if (cwd.statFile(installed_bootx64)) |stat| {
+        if (stat.size == 0) {
+            cwd.deleteFile(installed_bootx64) catch |err| {
+                std.debug.print("build.zig: failed to remove zero-byte zig-out BOOTX64.EFI: {s}\n", .{@errorName(err)});
+            };
+            std.debug.print("build.zig: removed zero-byte zig-out BOOTX64.EFI\n", .{});
+            repaired = true;
+        }
+    } else |_| {}
+
+    var cache_dir = cwd.openDir(".zig-cache/o", .{ .iterate = true }) catch return repaired;
+    defer cache_dir.close();
+
+    var walker = cache_dir.walk(std.heap.page_allocator) catch return repaired;
+    defer walker.deinit();
+
+    var removed_count: usize = 0;
+    while (walker.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(entry.path), "BOOTX64.efi")) continue;
+        const stat = cache_dir.statFile(entry.path) catch continue;
+        if (stat.size != 0) continue;
+        cache_dir.deleteFile(entry.path) catch continue;
+        removed_count += 1;
+        repaired = true;
+    }
+    if (removed_count != 0) {
+        std.debug.print("build.zig: removed {d} zero-byte BOOTX64 cache artifact(s)\n", .{removed_count});
+    }
+    return repaired;
+}
+
 pub fn build(b: *std.Build) void {
+    const bootx64_cache_repaired = pruneZeroSizedBootx64Artifacts();
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_mod = b.createModule(.{
@@ -35,6 +73,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .code_model = .small,
     });
+    const build_workarounds = b.addOptions();
+    build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
+    efi_mod.addOptions("build_workarounds", build_workarounds);
     efi_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     const efi_app = b.addExecutable(.{
         .name = "BOOTX64",

@@ -1751,6 +1751,7 @@ fn initKeyboard() ?KeyboardState {
         queue_submit_token = readCfgU64(13);
         queue_notify_token = readCfgU64(14);
     }
+    shellLogLine("keyboard queue tokens ready");
 
     const common_base = common_page_va + common_off;
     const notify_base = notify_page_va + notify_off;
@@ -1794,6 +1795,7 @@ fn initKeyboard() ?KeyboardState {
     if (queueNotify(queue_notify_token, queue_index_event) != syscall_ok) return null;
     mmioWriteU16(notify_addr, queue_index_event);
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
+    shellLogLine("keyboard init done");
     return .{ .notify_addr = notify_addr, .isr_base = isr_base };
 }
 
@@ -1922,6 +1924,7 @@ pub export fn _start() noreturn {
 
     _ = userLog("Shell: started\n");
     seedBootSplash(&shell);
+    shellLogLine("splash ready");
     var keyboard = initKeyboard();
     shell.keyboard_ready = keyboard != null;
     if (shell.keyboard_ready) {
@@ -1932,6 +1935,7 @@ pub export fn _start() noreturn {
         shell.writeLine("keyboard unavailable");
         _ = userLog("Shell: keyboard unavailable\n");
     }
+    shellLogLine("render begin");
     renderFull(vfb, &shell);
     _ = userLog("Shell: ui ready\n");
 

@@ -12,6 +12,7 @@ pub const spawn_result_thread_shift: u6 = spawn_result_process_bits;
 pub const spawn_flag_bootstrap_page_writable: u64 = 1 << 0;
 pub const spawn_flag_bootstrap_descriptor_table: u64 = 1 << 1;
 pub const spawn_flag_bootstrap_extended_descriptor_table: u64 = 1 << 2;
+pub const spawn_flag_child_bootstrap_owner: u64 = 1 << 3;
 pub const max_bootstrap_page_descriptors: usize = 136;
 pub const max_bootstrap_cap_descriptors: usize = 8;
 pub const aux_base_va: u64 = 0x3C00_0000;

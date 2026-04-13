@@ -65,6 +65,13 @@ pub const Reader = struct {
 
 pub const StreamLoadToPageError = LoadToPageError || StreamReadError;
 
+pub const RelocationAccess = struct {
+    context: *anyopaque,
+    max_len: usize,
+    read_u64_at: *const fn (context: *anyopaque, offset: u64) LoadToPageError!u64,
+    write_u64_at: *const fn (context: *anyopaque, offset: u64, value: u64) LoadToPageError!void,
+};
+
 const elf_magic = [_]u8{ 0x7F, 'E', 'L', 'F' };
 const elf_class_64 = 2;
 const elf_data_lsb = 1;
@@ -416,9 +423,25 @@ fn checkedOffAndLen(offset_u64: u64, len_u64: u64, max_len: usize) LoadToPageErr
     return .{ .off = off, .len = len };
 }
 
-fn applyRelativeRelocations(parsed: Image, load_base_va: u64, mapped_bytes: []u8) LoadToPageError!void {
+const SliceRelocationContext = struct {
+    bytes: []u8,
+};
+
+fn readSliceRelocationU64At(context: *anyopaque, offset: u64) LoadToPageError!u64 {
+    const ctx: *const SliceRelocationContext = @ptrCast(@alignCast(context));
+    const range = try checkedOffAndLen(offset, 8, ctx.bytes.len);
+    return readU64Le(ctx.bytes, range.off);
+}
+
+fn writeSliceRelocationU64At(context: *anyopaque, offset: u64, value: u64) LoadToPageError!void {
+    const ctx: *SliceRelocationContext = @ptrCast(@alignCast(context));
+    const range = try checkedOffAndLen(offset, 8, ctx.bytes.len);
+    writeU64Le(ctx.bytes, range.off, value);
+}
+
+pub fn applyRelativeRelocationsWithAccess(parsed: Image, load_base_va: u64, access: RelocationAccess) LoadToPageError!void {
     const dynamic = parsed.dynamic_segment orelse return;
-    const dyn_range = try checkedOffAndLen(dynamic.vaddr, dynamic.mem_size, mapped_bytes.len);
+    const dyn_range = try checkedOffAndLen(dynamic.vaddr, dynamic.mem_size, access.max_len);
     if ((dynamic.mem_size % 16) != 0) return error.InvalidDynamicTable;
 
     var rela_vaddr: ?u64 = null;
@@ -428,8 +451,9 @@ fn applyRelativeRelocations(parsed: Image, load_base_va: u64, mapped_bytes: []u8
 
     var dyn_cursor: usize = 0;
     while (dyn_cursor + 16 <= dyn_range.len) : (dyn_cursor += 16) {
-        const tag = try readU64Le(mapped_bytes, dyn_range.off + dyn_cursor);
-        const value = try readU64Le(mapped_bytes, dyn_range.off + dyn_cursor + 8);
+        const dyn_entry_off: u64 = @intCast(dyn_range.off + dyn_cursor);
+        const tag = try access.read_u64_at(access.context, dyn_entry_off);
+        const value = try access.read_u64_at(access.context, dyn_entry_off + 8);
         if (tag == dt_null) break;
         switch (tag) {
             dt_rela => rela_vaddr = value,
@@ -456,23 +480,30 @@ fn applyRelativeRelocations(parsed: Image, load_base_va: u64, mapped_bytes: []u8
     while (idx < total_entries) : (idx += 1) {
         const rela_stride = try checkedMulU64(idx, rela_ent);
         const rela_va = try checkedAddU64(rela_base_va, rela_stride);
-        const rela_range = try checkedOffAndLen(rela_va, rela_entry_bytes, mapped_bytes.len);
+        const rela_range = try checkedOffAndLen(rela_va, rela_entry_bytes, access.max_len);
+        const rela_off: u64 = @intCast(rela_range.off);
 
-        const r_offset = try readU64Le(mapped_bytes, rela_range.off + 0);
-        const r_info = try readU64Le(mapped_bytes, rela_range.off + 8);
-        const r_addend = try readI64Le(mapped_bytes, rela_range.off + 16);
+        const r_offset = try access.read_u64_at(access.context, rela_off + 0);
+        const r_info = try access.read_u64_at(access.context, rela_off + 8);
+        const r_addend: i64 = @bitCast(try access.read_u64_at(access.context, rela_off + 16));
 
         const reloc_type: u32 = @intCast(r_info & 0xFFFF_FFFF);
         const reloc_sym = r_info >> 32;
         if (reloc_type != r_x86_64_relative or reloc_sym != 0) return error.UnsupportedRelocationType;
 
-        if (r_offset > std.math.maxInt(usize)) return error.RelocationOutOfRange;
-        const target_off: usize = @intCast(r_offset);
-        if (target_off + 8 > mapped_bytes.len) return error.RelocationOutOfRange;
-
         const relocated = try checkedAddSigned(load_base_va, r_addend);
-        writeU64Le(mapped_bytes, target_off, relocated);
+        try access.write_u64_at(access.context, r_offset, relocated);
     }
+}
+
+fn applyRelativeRelocations(parsed: Image, load_base_va: u64, mapped_bytes: []u8) LoadToPageError!void {
+    var ctx = SliceRelocationContext{ .bytes = mapped_bytes };
+    return applyRelativeRelocationsWithAccess(parsed, load_base_va, .{
+        .context = @ptrCast(&ctx),
+        .max_len = mapped_bytes.len,
+        .read_u64_at = readSliceRelocationU64At,
+        .write_u64_at = writeSliceRelocationU64At,
+    });
 }
 
 pub fn loadToSinglePage(image_bytes: []const u8, load_base_va: u64, dest_page: []u8) LoadToPageError!Image {
