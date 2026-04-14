@@ -21,12 +21,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt_io"
+version = "0.1.0"
+dependencies = [
+ "rt_core",
+ "rt_handle",
+]
+
+[[package]]
+name = "rust_fs_demo"
+version = "0.1.0"
+dependencies = [
+ "rt_alloc",
+ "rt_core",
+ "rt_handle",
+ "rt_io",
+]
+
+[[package]]
+name = "rust_fs_mut_demo"
+version = "0.1.0"
+dependencies = [
+ "rt_alloc",
+ "rt_core",
+ "rt_handle",
+ "rt_io",
+]
+
+[[package]]
 name = "rust_hello"
 version = "0.1.0"
 dependencies = [
  "rt_alloc",
  "rt_core",
  "rt_handle",
+]
+
+[[package]]
+name = "rust_open_exec_demo"
+version = "0.1.0"
+dependencies = [
+ "rt_alloc",
+ "rt_core",
+ "rt_handle",
+ "rt_io",
 ]
 
 [[package]]

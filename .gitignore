@@ -5,6 +5,7 @@ kernel/zig-out/
 .zig-cache-global/
 .zig-cache-local/
 .zig-global-cache/
+.cargo/
 *.pdb
 *.o
 *.obj
@@ -27,3 +28,5 @@ states/
 Thumbs.db
 
 .claude
+
+README-neta.md

@@ -12,13 +12,8 @@ use rt_alloc as _;
 use rt_core::entry_point;
 use rt_core::{SyscallError, syscall};
 use rt_handle::{
-    ExecImageRights,
-    ExecImageToken,
-    SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE,
-    SpawnBuilder,
-    VmObjectRights,
-    VmObjectToken,
-    fixed_va,
+    ExecImageRights, ExecImageToken, SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE, SpawnBuilder,
+    VmObjectRights, VmObjectToken, fixed_va,
 };
 
 const CONFIG_MAGIC: u64 = 0x5253_5044_454D_4F31;
@@ -78,7 +73,10 @@ fn load_demo_config(va: u64) -> Option<DemoConfig> {
             state: read_config_word(va, CONFIG_IDX_STATE),
             remaining_depth: read_config_word(va, CONFIG_IDX_REMAINING_DEPTH),
             lineage: read_config_word(va, CONFIG_IDX_LINEAGE),
-            vm_object_token: VmObjectToken::from_raw(read_config_word(va, CONFIG_IDX_VM_OBJECT_TOKEN)),
+            vm_object_token: VmObjectToken::from_raw(read_config_word(
+                va,
+                CONFIG_IDX_VM_OBJECT_TOKEN,
+            )),
         })
     }
 }
@@ -89,7 +87,7 @@ fn wait_for_demo_config() -> Result<DemoConfig, &'static str> {
             match config.state {
                 CONFIG_STATE_READY => return Ok(config),
                 CONFIG_STATE_FAILED => return Err("config failed"),
-                _ => {},
+                _ => {}
             }
         }
         spin_loop();
@@ -97,7 +95,13 @@ fn wait_for_demo_config() -> Result<DemoConfig, &'static str> {
     Err("config timeout")
 }
 
-fn init_demo_config_page(va: u64, state: u64, remaining_depth: u64, vm_token_raw: u64, lineage: u64) {
+fn init_demo_config_page(
+    va: u64,
+    state: u64,
+    remaining_depth: u64,
+    vm_token_raw: u64,
+    lineage: u64,
+) {
     // SAFETY: `va` comes from a successfully mapped owned page in the current process.
     unsafe {
         write_config_word(va, CONFIG_IDX_MAGIC, CONFIG_MAGIC);
@@ -140,8 +144,7 @@ fn main() -> ! {
     let _ = write!(
         &mut message,
         " depth={} lineage={}",
-        config.remaining_depth,
-        config.lineage
+        config.remaining_depth, config.lineage
     );
 
     let self_vm_object = match config.vm_object_token {
@@ -149,18 +152,16 @@ fn main() -> ! {
         None => {
             message.push_str(" missing_vm_object_token");
             log_and_abort(message);
-        },
+        }
     };
-    let self_exec = match ExecImageToken::install_from_vm_object(
-        self_vm_object,
-        ExecImageRights::EXEC,
-    ) {
-        Ok(token) => token,
-        Err(err) => {
-            let _ = write!(&mut message, " install_exec_failed={err:?}");
-            log_and_abort(message);
-        },
-    };
+    let self_exec =
+        match ExecImageToken::install_from_vm_object(self_vm_object, ExecImageRights::EXEC) {
+            Ok(token) => token,
+            Err(err) => {
+                let _ = write!(&mut message, " install_exec_failed={err:?}");
+                log_and_abort(message);
+            }
+        };
 
     if config.remaining_depth == 0 {
         message.push_str(" leaf");
@@ -174,7 +175,7 @@ fn main() -> ! {
         Err(err) => {
             let _ = write!(&mut message, " alloc_config_failed={err:?}");
             log_and_abort(message);
-        },
+        }
     };
     init_demo_config_page(
         child_config_source_va,
@@ -207,7 +208,7 @@ fn main() -> ! {
         Err(err) => {
             let _ = write!(&mut message, " spawn_failed={err:?}");
             log_and_abort(message);
-        },
+        }
     };
     let _ = write!(&mut message, " spawned_child={}", child.process_slot());
     log_and_abort(message)

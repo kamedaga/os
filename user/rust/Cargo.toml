@@ -3,7 +3,11 @@ members = [
     "rt_core",
     "rt_alloc",
     "rt_handle",
+    "rt_io",
     "rust_hello",
+    "rust_fs_demo",
+    "rust_fs_mut_demo",
+    "rust_open_exec_demo",
     "rust_spawn_demo",
 ]
 resolver = "2"

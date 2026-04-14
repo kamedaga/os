@@ -33,6 +33,7 @@ pub const MAX_SERVICE_ENTRIES: usize = 6;
 
 const VM_OBJECT_TOKEN_TAG: u64 = 1 << 62;
 const EXEC_IMAGE_TOKEN_TAG: u64 = (1 << 62) | (1 << 61);
+const FS_CAP_TOKEN_TAG: u64 = 1 << 63;
 const SPAWN_RESULT_TAG: u64 = 1 << 63;
 const SPAWN_RESULT_PROCESS_BITS: u32 = 32;
 const SPAWN_RESULT_THREAD_BITS: u32 = 16;
@@ -91,14 +92,18 @@ pub struct VmObjectToken(u64);
 
 impl VmObjectToken {
     pub fn encode(cap_id: u64) -> Option<Self> {
-        if cap_id == 0 || (cap_id & VM_OBJECT_TOKEN_TAG) != 0 || (cap_id & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG {
+        if cap_id == 0
+            || (cap_id & VM_OBJECT_TOKEN_TAG) != 0
+            || (cap_id & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG
+        {
             return None;
         }
         Some(Self(VM_OBJECT_TOKEN_TAG | cap_id))
     }
 
     pub fn from_raw(raw: u64) -> Option<Self> {
-        if (raw & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG || (raw & VM_OBJECT_TOKEN_TAG) == 0 {
+        if (raw & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG || (raw & VM_OBJECT_TOKEN_TAG) == 0
+        {
             return None;
         }
         let cap_id = raw & !VM_OBJECT_TOKEN_TAG;
@@ -116,7 +121,11 @@ impl VmObjectToken {
         self.0 & !VM_OBJECT_TOKEN_TAG
     }
 
-    pub fn install_from_mapped_range(base_va: u64, size_bytes: u64, rights: VmObjectRights) -> Result<Self, SyscallError> {
+    pub fn install_from_mapped_range(
+        base_va: u64,
+        size_bytes: u64,
+        rights: VmObjectRights,
+    ) -> Result<Self, SyscallError> {
         vm_object_result(syscall::call3(
             syscall::INSTALL_VM_OBJECT,
             base_va,
@@ -125,7 +134,11 @@ impl VmObjectToken {
         ))
     }
 
-    pub fn grant_to_process(self, process_slot: u64, rights: VmObjectRights) -> Result<Self, SyscallError> {
+    pub fn grant_to_process(
+        self,
+        process_slot: u64,
+        rights: VmObjectRights,
+    ) -> Result<Self, SyscallError> {
         vm_object_result(syscall::call3(
             syscall::GRANT_VM_OBJECT,
             self.raw(),
@@ -135,10 +148,19 @@ impl VmObjectToken {
     }
 
     pub fn map_into(self, target_va: u64) -> Result<(), SyscallError> {
-        unit_result(syscall::call2(syscall::MAP_VM_OBJECT, self.raw(), target_va))
+        unit_result(syscall::call2(
+            syscall::MAP_VM_OBJECT,
+            self.raw(),
+            target_va,
+        ))
     }
 
-    pub fn slice(self, offset_bytes: u64, size_bytes: u64, rights: VmObjectRights) -> Result<Self, SyscallError> {
+    pub fn slice(
+        self,
+        offset_bytes: u64,
+        size_bytes: u64,
+        rights: VmObjectRights,
+    ) -> Result<Self, SyscallError> {
         vm_object_result(syscall::call4(
             syscall::SLICE_VM_OBJECT,
             self.raw(),
@@ -203,7 +225,10 @@ impl ExecImageToken {
         self.0 & !EXEC_IMAGE_TOKEN_TAG
     }
 
-    pub fn install_from_vm_object(vm_object: VmObjectToken, rights: ExecImageRights) -> Result<Self, SyscallError> {
+    pub fn install_from_vm_object(
+        vm_object: VmObjectToken,
+        rights: ExecImageRights,
+    ) -> Result<Self, SyscallError> {
         exec_image_result(syscall::call2(
             syscall::INSTALL_EXEC_IMAGE,
             vm_object.raw(),
@@ -211,7 +236,11 @@ impl ExecImageToken {
         ))
     }
 
-    pub fn grant_to_process(self, process_slot: u64, rights: ExecImageRights) -> Result<Self, SyscallError> {
+    pub fn grant_to_process(
+        self,
+        process_slot: u64,
+        rights: ExecImageRights,
+    ) -> Result<Self, SyscallError> {
         exec_image_result(syscall::call3(
             syscall::GRANT_EXEC_IMAGE,
             self.raw(),
@@ -331,7 +360,12 @@ impl BootstrapBuilder {
         self.table_ref().cap_count as usize
     }
 
-    pub fn push_page(&mut self, source_va: u64, target_va: u64, flags: u64) -> Result<(), BootstrapBuildError> {
+    pub fn push_page(
+        &mut self,
+        source_va: u64,
+        target_va: u64,
+        flags: u64,
+    ) -> Result<(), BootstrapBuildError> {
         let table = self.table_mut();
         let index = table.page_count as usize;
         if index >= MAX_BOOTSTRAP_PAGE_DESCRIPTORS {
@@ -406,7 +440,12 @@ impl SpawnBuilder {
         &mut self.bootstrap
     }
 
-    pub fn push_page(&mut self, source_va: u64, target_va: u64, flags: u64) -> Result<(), BootstrapBuildError> {
+    pub fn push_page(
+        &mut self,
+        source_va: u64,
+        target_va: u64,
+        flags: u64,
+    ) -> Result<(), BootstrapBuildError> {
         self.bootstrap.push_page(source_va, target_va, flags)
     }
 
@@ -416,7 +455,8 @@ impl SpawnBuilder {
         target_token_va: u64,
         rights: VmObjectRights,
     ) -> Result<(), BootstrapBuildError> {
-        self.bootstrap.push_vm_object_cap(token, target_token_va, rights)
+        self.bootstrap
+            .push_vm_object_cap(token, target_token_va, rights)
     }
 
     pub fn set_child_bootstrap_owner(&mut self, enabled: bool) {
@@ -449,7 +489,253 @@ impl SpawnBuilder {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FsConnectionId(u32);
+
+impl FsConnectionId {
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        let value = u32::try_from(raw).ok()?;
+        if value == 0 {
+            return None;
+        }
+        Some(Self(value))
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FsRights(u32);
+
+impl FsRights {
+    pub const LOOKUP: Self = Self(1 << 0);
+    pub const READ: Self = Self(1 << 1);
+    pub const WRITE: Self = Self(1 << 2);
+    pub const READDIR: Self = Self(1 << 3);
+    pub const STAT: Self = Self(1 << 4);
+    pub const CREATE: Self = Self(1 << 5);
+    pub const UNLINK: Self = Self(1 << 6);
+    pub const RENAME: Self = Self(1 << 7);
+    pub const EXEC: Self = Self(1 << 8);
+    pub const MOUNT: Self = Self(1 << 9);
+    pub const GRANT: Self = Self(1 << 10);
+    pub const ADMIN: Self = Self(1 << 11);
+
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits as u32)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0 as u64
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FsObjectKind {
+    None,
+    Mount,
+    VnodeDir,
+    VnodeFile,
+    OpenFile,
+    Exec,
+    BlockDevice,
+    Unknown(u8),
+}
+
+impl FsObjectKind {
+    pub const fn from_raw(raw: u64) -> Self {
+        match raw as u8 {
+            0 => Self::None,
+            1 => Self::Mount,
+            2 => Self::VnodeDir,
+            3 => Self::VnodeFile,
+            4 => Self::OpenFile,
+            5 => Self::Exec,
+            6 => Self::BlockDevice,
+            value => Self::Unknown(value),
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Mount => 1,
+            Self::VnodeDir => 2,
+            Self::VnodeFile => 3,
+            Self::OpenFile => 4,
+            Self::Exec => 5,
+            Self::BlockDevice => 6,
+            Self::Unknown(value) => value as u64,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Mount => "mount",
+            Self::VnodeDir => "vnode_dir",
+            Self::VnodeFile => "vnode_file",
+            Self::OpenFile => "open_file",
+            Self::Exec => "exec",
+            Self::BlockDevice => "block_device",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FsObjectToken(u64);
+
+impl FsObjectToken {
+    pub fn encode(cap_id: u64) -> Option<Self> {
+        if cap_id == 0 || (cap_id & FS_CAP_TOKEN_TAG) != 0 {
+            return None;
+        }
+        Some(Self(FS_CAP_TOKEN_TAG | cap_id))
+    }
+
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        if (raw & FS_CAP_TOKEN_TAG) == 0 {
+            return None;
+        }
+        let cap_id = raw & !FS_CAP_TOKEN_TAG;
+        if cap_id == 0 {
+            return None;
+        }
+        Some(Self(raw))
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn cap_id(self) -> u64 {
+        self.0 & !FS_CAP_TOKEN_TAG
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct DirToken(FsObjectToken);
+
+impl DirToken {
+    pub const fn from_fs_token(token: FsObjectToken) -> Self {
+        Self(token)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0.raw()
+    }
+
+    pub const fn fs_token(self) -> FsObjectToken {
+        self.0
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VnodeFileToken(FsObjectToken);
+
+impl VnodeFileToken {
+    pub const fn from_fs_token(token: FsObjectToken) -> Self {
+        Self(token)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0.raw()
+    }
+
+    pub const fn fs_token(self) -> FsObjectToken {
+        self.0
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct OpenFileToken(FsObjectToken);
+
+impl OpenFileToken {
+    pub const fn from_fs_token(token: FsObjectToken) -> Self {
+        Self(token)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0.raw()
+    }
+
+    pub const fn fs_token(self) -> FsObjectToken {
+        self.0
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ClockKind {
+    Monotonic,
+    Wall,
+}
+
+impl ClockKind {
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::Monotonic => 1,
+            Self::Wall => 2,
+        }
+    }
+
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Monotonic),
+            2 => Some(Self::Wall),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Monotonic => "monotonic",
+            Self::Wall => "wall",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RandomKind {
+    Default,
+}
+
+impl RandomKind {
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::Default => 1,
+        }
+    }
+
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Default),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ServiceKind {
     Window,
     Vfs,
@@ -478,6 +764,14 @@ impl ServiceKind {
             Self::Unknown(_) => "unknown",
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ServiceBinding {
+    pub kind: ServiceKind,
+    pub process_slot: u64,
+    pub endpoint_id: u64,
+    pub flags: u64,
 }
 
 #[repr(C)]
@@ -529,6 +823,20 @@ impl ServiceRegistrySnapshot {
     pub fn entries(&self) -> &[ServiceEntry] {
         &self.entries[..self.count]
     }
+
+    pub fn find_kind(&self, kind: ServiceKind) -> Option<ServiceBinding> {
+        for entry in self.entries() {
+            if entry.kind_enum() == kind {
+                return Some(ServiceBinding {
+                    kind,
+                    process_slot: entry.process_slot,
+                    endpoint_id: entry.endpoint_id,
+                    flags: entry.flags,
+                });
+            }
+        }
+        None
+    }
 }
 
 pub unsafe fn snapshot_service_registry(va: usize) -> Option<ServiceRegistrySnapshot> {
@@ -569,12 +877,41 @@ pub enum HandleKind {
     ServiceRegistryPage,
     VmObject,
     ExecImage,
+    Dir,
+    VnodeFile,
+    OpenFile,
+    Clock,
+    Random,
+}
+
+impl HandleKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ServiceRegistryPage => "service_registry_page",
+            Self::VmObject => "vm_object",
+            Self::ExecImage => "exec_image",
+            Self::Dir => "dir",
+            Self::VnodeFile => "vnode_file",
+            Self::OpenFile => "open_file",
+            Self::Clock => "clock",
+            Self::Random => "random",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HandleRights(u64);
 
 impl HandleRights {
+    pub const LOOKUP: Self = Self(1 << 5);
+    pub const READDIR: Self = Self(1 << 6);
+    pub const STAT: Self = Self(1 << 7);
+    pub const CREATE: Self = Self(1 << 8);
+    pub const UNLINK: Self = Self(1 << 9);
+    pub const RENAME: Self = Self(1 << 10);
+    pub const MOUNT: Self = Self(1 << 11);
+    pub const ADMIN: Self = Self(1 << 12);
+
     pub const READ: Self = Self(1 << 0);
     pub const WRITE: Self = Self(1 << 1);
     pub const MAP: Self = Self(1 << 2);
@@ -620,6 +957,47 @@ impl HandleRights {
         }
         Self(bits)
     }
+
+    pub const fn from_fs(rights: FsRights) -> Self {
+        let mut bits = 0;
+        if rights.contains(FsRights::LOOKUP) {
+            bits |= Self::LOOKUP.0;
+        }
+        if rights.contains(FsRights::READ) {
+            bits |= Self::READ.0;
+        }
+        if rights.contains(FsRights::WRITE) {
+            bits |= Self::WRITE.0;
+        }
+        if rights.contains(FsRights::READDIR) {
+            bits |= Self::READDIR.0;
+        }
+        if rights.contains(FsRights::STAT) {
+            bits |= Self::STAT.0;
+        }
+        if rights.contains(FsRights::CREATE) {
+            bits |= Self::CREATE.0;
+        }
+        if rights.contains(FsRights::UNLINK) {
+            bits |= Self::UNLINK.0;
+        }
+        if rights.contains(FsRights::RENAME) {
+            bits |= Self::RENAME.0;
+        }
+        if rights.contains(FsRights::EXEC) {
+            bits |= Self::EXEC.0;
+        }
+        if rights.contains(FsRights::MOUNT) {
+            bits |= Self::MOUNT.0;
+        }
+        if rights.contains(FsRights::GRANT) {
+            bits |= Self::GRANT.0;
+        }
+        if rights.contains(FsRights::ADMIN) {
+            bits |= Self::ADMIN.0;
+        }
+        Self(bits)
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -629,6 +1007,7 @@ pub struct HandleEntry {
     rights: HandleRights,
     primary: u64,
     secondary: u64,
+    tertiary: u64,
 }
 
 impl HandleEntry {
@@ -679,8 +1058,83 @@ impl HandleEntry {
         }
     }
 
+    pub fn fs_connection_id(self) -> Option<FsConnectionId> {
+        match self.kind {
+            HandleKind::Dir | HandleKind::VnodeFile | HandleKind::OpenFile => {
+                FsConnectionId::from_raw(self.tertiary)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn fs_object_token(self) -> Option<FsObjectToken> {
+        match self.kind {
+            HandleKind::Dir | HandleKind::VnodeFile | HandleKind::OpenFile => {
+                FsObjectToken::from_raw(self.primary)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn fs_rights(self) -> Option<FsRights> {
+        match self.kind {
+            HandleKind::Dir | HandleKind::VnodeFile | HandleKind::OpenFile => {
+                Some(FsRights::from_bits(self.secondary))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn fs_object_kind(self) -> Option<FsObjectKind> {
+        match self.kind {
+            HandleKind::Dir => Some(FsObjectKind::VnodeDir),
+            HandleKind::VnodeFile => Some(FsObjectKind::VnodeFile),
+            HandleKind::OpenFile => Some(FsObjectKind::OpenFile),
+            _ => None,
+        }
+    }
+
+    pub fn dir_token(self) -> Option<DirToken> {
+        match self.kind {
+            HandleKind::Dir => self.fs_object_token().map(DirToken::from_fs_token),
+            _ => None,
+        }
+    }
+
+    pub fn vnode_file_token(self) -> Option<VnodeFileToken> {
+        match self.kind {
+            HandleKind::VnodeFile => self.fs_object_token().map(VnodeFileToken::from_fs_token),
+            _ => None,
+        }
+    }
+
+    pub fn open_file_token(self) -> Option<OpenFileToken> {
+        match self.kind {
+            HandleKind::OpenFile => self.fs_object_token().map(OpenFileToken::from_fs_token),
+            _ => None,
+        }
+    }
+
+    pub fn clock_kind(self) -> Option<ClockKind> {
+        match self.kind {
+            HandleKind::Clock => ClockKind::from_raw(self.primary),
+            _ => None,
+        }
+    }
+
+    pub fn random_kind(self) -> Option<RandomKind> {
+        match self.kind {
+            HandleKind::Random => RandomKind::from_raw(self.primary),
+            _ => None,
+        }
+    }
+
     pub const fn secondary(self) -> u64 {
         self.secondary
+    }
+
+    pub const fn tertiary(self) -> u64 {
+        self.tertiary
     }
 }
 
@@ -706,19 +1160,100 @@ impl HandleTable {
     }
 
     pub fn insert_service_registry_shadow(&mut self) -> HandleId {
-        self.insert_entry(HandleKind::ServiceRegistryPage, HandleRights::READ, fixed_va::SERVICE_REGISTRY_SHADOW_VA, 0)
+        self.insert_entry(
+            HandleKind::ServiceRegistryPage,
+            HandleRights::READ,
+            fixed_va::SERVICE_REGISTRY_SHADOW_VA,
+            0,
+            0,
+        )
     }
 
     pub fn insert_service_registry_va(&mut self, va: u64) -> HandleId {
-        self.insert_entry(HandleKind::ServiceRegistryPage, HandleRights::READ, va, 0)
+        self.insert_entry(
+            HandleKind::ServiceRegistryPage,
+            HandleRights::READ,
+            va,
+            0,
+            0,
+        )
     }
 
     pub fn insert_vm_object(&mut self, token: VmObjectToken, rights: VmObjectRights) -> HandleId {
-        self.insert_entry(HandleKind::VmObject, HandleRights::from_vm_object(rights), token.raw(), rights.bits())
+        self.insert_entry(
+            HandleKind::VmObject,
+            HandleRights::from_vm_object(rights),
+            token.raw(),
+            rights.bits(),
+            0,
+        )
     }
 
-    pub fn insert_exec_image(&mut self, token: ExecImageToken, rights: ExecImageRights) -> HandleId {
-        self.insert_entry(HandleKind::ExecImage, HandleRights::from_exec_image(rights), token.raw(), rights.bits())
+    pub fn insert_exec_image(
+        &mut self,
+        token: ExecImageToken,
+        rights: ExecImageRights,
+    ) -> HandleId {
+        self.insert_entry(
+            HandleKind::ExecImage,
+            HandleRights::from_exec_image(rights),
+            token.raw(),
+            rights.bits(),
+            0,
+        )
+    }
+
+    pub fn insert_dir(
+        &mut self,
+        connection_id: FsConnectionId,
+        token: DirToken,
+        rights: FsRights,
+    ) -> HandleId {
+        self.insert_entry(
+            HandleKind::Dir,
+            HandleRights::from_fs(rights),
+            token.raw(),
+            rights.bits(),
+            connection_id.raw() as u64,
+        )
+    }
+
+    pub fn insert_vnode_file(
+        &mut self,
+        connection_id: FsConnectionId,
+        token: VnodeFileToken,
+        rights: FsRights,
+    ) -> HandleId {
+        self.insert_entry(
+            HandleKind::VnodeFile,
+            HandleRights::from_fs(rights),
+            token.raw(),
+            rights.bits(),
+            connection_id.raw() as u64,
+        )
+    }
+
+    pub fn insert_open_file(
+        &mut self,
+        connection_id: FsConnectionId,
+        token: OpenFileToken,
+        rights: FsRights,
+    ) -> HandleId {
+        self.insert_entry(
+            HandleKind::OpenFile,
+            HandleRights::from_fs(rights),
+            token.raw(),
+            rights.bits(),
+            connection_id.raw() as u64,
+        )
+    }
+
+    pub fn insert_clock(&mut self, kind: ClockKind) -> HandleId {
+        self.insert_entry(HandleKind::Clock, HandleRights::READ, kind.raw(), 0, 0)
+    }
+
+    pub fn insert_random(&mut self, kind: RandomKind) -> HandleId {
+        self.insert_entry(HandleKind::Random, HandleRights::READ, kind.raw(), 0, 0)
     }
 
     pub fn get(&self, id: HandleId) -> Option<&HandleEntry> {
@@ -729,7 +1264,14 @@ impl HandleTable {
         self.entries.iter()
     }
 
-    fn insert_entry(&mut self, kind: HandleKind, rights: HandleRights, primary: u64, secondary: u64) -> HandleId {
+    fn insert_entry(
+        &mut self,
+        kind: HandleKind,
+        rights: HandleRights,
+        primary: u64,
+        secondary: u64,
+        tertiary: u64,
+    ) -> HandleId {
         let id = HandleId(self.next_id);
         self.next_id += 1;
         self.entries.push(HandleEntry {
@@ -738,6 +1280,7 @@ impl HandleTable {
             rights,
             primary,
             secondary,
+            tertiary,
         });
         id
     }

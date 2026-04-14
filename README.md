@@ -68,14 +68,27 @@ kernel はできるだけ小さく保ち、driver、filesystem、compositor ま�
 
 ## Build / Run
 
-```bash
-cd kernel
-zig build efi
-cd ..
-./setup.sh
-./run.sh
-# or ./run2.sh
+通常の開発ループは `pactl` を使います。
+
+```powershell
+pactl plan
+pactl setup
+pactl run
 ```
+
+- `pactl setup`: 通常の差分 setup。kernel build、disk image の確認、bootfs/rootfs の同期をまとめて行います。
+- `pactl setup full`: `disk.img` を作り直してから full setup を行います。
+- `pactl run --timed`: QEMU を起動しつつ boot timing を記録します。
+- `pactl run --no-kvm`: KVM を無効にして QEMU を起動します。
+- `pactl build userland <app-id> --fresh`: 特定 app の artifact を明示的に更新します。
+
+kernel だけを確認したい時は、従来どおり `kernel/` で `zig build efi` を使えます。
+
+設定の source of truth は次です。
+
+- workspace 全体: `pactl.conf`
+- userland app ごとの定義: `userland/apps/<app-id>/app.conf`
+- 生成物: `.artifacts/`
 
 ## Technical Notes
 

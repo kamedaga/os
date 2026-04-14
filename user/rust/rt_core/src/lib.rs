@@ -3,20 +3,29 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 
+const USER_LOG_MAX_BYTES: usize = 256;
+
 pub mod syscall {
     use core::arch::asm;
 
     pub const ALLOC_PAGE: u64 = 0x1;
     pub const MAP_PAGE: u64 = 0x2;
+    pub const GRANT_CAP: u64 = 0x8;
     pub const LOG: u64 = 0x9;
     pub const ALLOC_MAP_PAGES: u64 = 0xC;
+    pub const WAIT_EVENT: u64 = 0x17;
     pub const SPAWN_EXEC: u64 = 0x1D;
     pub const INSTALL_VM_OBJECT: u64 = 0x1E;
     pub const GRANT_VM_OBJECT: u64 = 0x1F;
     pub const INSTALL_EXEC_IMAGE: u64 = 0x20;
     pub const GRANT_EXEC_IMAGE: u64 = 0x21;
+    pub const INSTALL_ENDPOINT: u64 = 0x26;
     pub const MAP_VM_OBJECT: u64 = 0x28;
     pub const SLICE_VM_OBJECT: u64 = 0x29;
+    pub const SHARE_CAP: u64 = 0x2B;
+    pub const SIGNAL_ENDPOINT: u64 = 0x2C;
+    pub const GET_TICK_COUNT: u64 = 0x2D;
+    pub const GET_PROCESS_SLOT: u64 = 0x2E;
     pub const OK: u64 = 0;
     pub const ERR_INVALID: u64 = 1;
     pub const ERR_NOT_READY: u64 = 2;
@@ -194,7 +203,13 @@ pub fn log_bytes(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let _ = syscall::call2(syscall::LOG, bytes.as_ptr() as u64, bytes.len() as u64);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = usize::min(offset + USER_LOG_MAX_BYTES, bytes.len());
+        let chunk = &bytes[offset..end];
+        let _ = syscall::call2(syscall::LOG, chunk.as_ptr() as u64, chunk.len() as u64);
+        offset = end;
+    }
 }
 
 pub fn log(message: &str) {

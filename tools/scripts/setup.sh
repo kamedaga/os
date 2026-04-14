@@ -22,6 +22,40 @@ STARTUP_MANIFEST_BOOTFS_SRC="$SCRIPT_DIR/userland/rootfs/startup_manifest.txt"
 ESP_MANIFEST="$SCRIPT_DIR/bootstrap/esp_manifest.txt"
 mkdir -p "$ARTIFACT_DIR"
 
+usage() {
+  cat <<'EOF'
+usage: ./setup.sh [--refresh-rootfs] [--fresh]
+
+  --refresh-rootfs  Rebuild the persistent/rootfs partition from the manifest.
+  --fresh           Recreate the whole disk image and rebuild rootfs.
+EOF
+}
+
+REFRESH_ROOTFS=0
+RECREATE_DISK=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --refresh-rootfs)
+      REFRESH_ROOTFS=1
+      ;;
+    --fresh)
+      RECREATE_DISK=1
+      REFRESH_ROOTFS=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
 require_nonempty_file() {
   local path="$1"
   local label="$2"
@@ -59,16 +93,25 @@ repair_bootx64_efi_if_needed() {
   return 1
 }
 
-# 1) 古いもの削除
-rm -f "$DISK_IMG"
+create_disk_image() {
+  rm -f "$DISK_IMG"
+  dd if=/dev/zero of="$DISK_IMG" bs=1M count=512
+  sgdisk -og "$DISK_IMG"
+  sgdisk -n 1:2048:+192M -t 1:ef00 -c 1:"EFI System" "$DISK_IMG"
+  sgdisk -n 2:395264:0 -t 2:8300 -c 2:"CapabilityOS Persistent" "$DISK_IMG"
+}
 
-# 2) 512MB ディスク作成
-dd if=/dev/zero of="$DISK_IMG" bs=1M count=512
+if [ ! -f "$DISK_IMG" ]; then
+  RECREATE_DISK=1
+  REFRESH_ROOTFS=1
+fi
 
-# 3) GPT + EFI System パーティション作成
-sgdisk -og "$DISK_IMG"
-sgdisk -n 1:2048:+192M -t 1:ef00 -c 1:"EFI System" "$DISK_IMG"
-sgdisk -n 2:395264:0 -t 2:8300 -c 2:"CapabilityOS Persistent" "$DISK_IMG"
+if [ "$RECREATE_DISK" -eq 1 ]; then
+  echo "creating fresh disk image: $DISK_IMG"
+  create_disk_image
+else
+  echo "preserving existing disk image: $DISK_IMG"
+fi
 
 # 4) ESP 初期化
 if [ ! -f "$ESP_MANIFEST" ]; then
@@ -182,7 +225,11 @@ run_disk_builder() {
 
 run_disk_builder "$ESP_BUILDER_EXE" "$ESP_BUILDER_BIN" "$DISK_IMG" 1 "$ESP_MANIFEST"
 
-# 5) rootfs 初期化
-run_disk_builder "$ROOTFS_BUILDER_EXE" "$ROOTFS_BUILDER_BIN" "$DISK_IMG" 2 "$ROOTFS_MANIFEST"
+if [ "$REFRESH_ROOTFS" -eq 1 ]; then
+  echo "refreshing persistent/rootfs partition from manifest"
+  run_disk_builder "$ROOTFS_BUILDER_EXE" "$ROOTFS_BUILDER_BIN" "$DISK_IMG" 2 "$ROOTFS_MANIFEST"
+else
+  echo "preserving persistent/rootfs partition (pass --refresh-rootfs or --fresh to rebuild it)"
+fi
 
 echo "$DISK_IMG ready."
