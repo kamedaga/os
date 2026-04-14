@@ -9,5 +9,7 @@
 /cmd/shell.elf=../../kernel/zig-out/bin/EFI/BOOT/SHELL.ELF
 /sys/startup_manifest.txt=./startup_manifest.txt
 /cmd/pie_user.elf=../../kernel/zig-out/bin/EFI/BOOT/USERAPP.ELF
+/cmd/rust_hello.elf=../../kernel/zig-out/bin/EFI/BOOT/RUSTHEL.ELF
+/cmd/rust_spawn_demo.elf=../../kernel/zig-out/bin/EFI/BOOT/RSPAWN.ELF
 /srv/virtio_blk.elf=../../kernel/zig-out/bin/EFI/BOOT/VBLKDRV.ELF
 /srv/persistent_fs.elf=../../kernel/zig-out/bin/EFI/BOOT/PERSFS.ELF

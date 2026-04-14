@@ -476,6 +476,36 @@ pub fn build(b: *std.Build) void {
     const pie_user_step = b.step("pie-user-elf", "Build pie_user PIE ELF");
     pie_user_step.dependOn(&install_pie_user.step);
 
+    const rust_hello_cmd = b.addSystemCommand(&[_][]const u8{
+        "cargo",
+        "build",
+        "--manifest-path",
+        "../user/rust/Cargo.toml",
+        "-p",
+        "rust_hello",
+        "-p",
+        "rust_spawn_demo",
+        "--release",
+        "--target",
+        "x86_64-unknown-none",
+        "--target-dir",
+        "../.artifacts/cargo-target",
+    });
+    const install_rust_hello = b.addInstallBinFile(
+        b.path("../.artifacts/cargo-target/x86_64-unknown-none/release/rust_hello"),
+        "EFI/BOOT/RUSTHEL.ELF",
+    );
+    install_rust_hello.step.dependOn(&rust_hello_cmd.step);
+    const rust_hello_step = b.step("rust-hello-elf", "Build rust hello PIE ELF");
+    rust_hello_step.dependOn(&install_rust_hello.step);
+    const install_rust_spawn_demo = b.addInstallBinFile(
+        b.path("../.artifacts/cargo-target/x86_64-unknown-none/release/rust_spawn_demo"),
+        "EFI/BOOT/RSPAWN.ELF",
+    );
+    install_rust_spawn_demo.step.dependOn(&rust_hello_cmd.step);
+    const rust_spawn_demo_step = b.step("rust-spawn-demo-elf", "Build rust spawn demo PIE ELF");
+    rust_spawn_demo_step.dependOn(&install_rust_spawn_demo.step);
+
     const bootfs_builder_mod = b.createModule(.{
         .root_source_file = b.path("../tools/bootfs_builder.zig"),
         .target = b.graph.host,
@@ -573,6 +603,8 @@ pub fn build(b: *std.Build) void {
     install_efi.step.dependOn(&install_virtio_blk.step);
     install_efi.step.dependOn(&install_persistent_fs.step);
     install_efi.step.dependOn(&install_pie_user.step);
+    install_efi.step.dependOn(&install_rust_hello.step);
+    install_efi.step.dependOn(&install_rust_spawn_demo.step);
     install_efi.step.dependOn(&install_bootfs_image.step);
     install_efi.step.dependOn(&install_rootfs_put.step);
     install_efi.step.dependOn(&install_rootfs_builder.step);

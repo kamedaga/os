@@ -1,0 +1,10 @@
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=pie",
+    "-C", "no-redzone=y",
+    "-C", "link-arg=--entry=_start",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=common-page-size=0x10",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=max-page-size=0x10",
+]

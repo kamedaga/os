@@ -4,6 +4,7 @@ const block_client = @import("support_root").block_client;
 const fs_abi = @import("support_root").fs_abi;
 const fs_client = @import("support_root").fs_client;
 const fs_protocol = @import("support_root").fs_protocol;
+const image_abi = @import("support_root").image_abi;
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
 const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
 const process_abi = @import("support_root").process_abi;
@@ -18,6 +19,7 @@ const syscall_map_pages_batch: u64 = 0x15;
 const syscall_wait_event: u64 = 0x17;
 const syscall_get_process_slot: u64 = 0x2E;
 const syscall_map_vm_object: u64 = 0x28;
+const syscall_install_vm_object: u64 = image_abi.syscall_install_vm_object;
 const config_framebuffer_paddr_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_paddr_index);
 const config_framebuffer_size_bytes_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_size_bytes_index);
 const config_framebuffer_vm_token_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_vm_token_index);
@@ -84,6 +86,32 @@ const queue_buffers_offset: usize = 4176;
 const desc_flag_write: u16 = 1 << 1;
 const shell_idle_poll_ticks: u64 = 4;
 const service_registry_page_va: u64 = process_abi.service_registry_shadow_va;
+const spawn_registry_copy_candidates = [_]u64{
+    0x3F00_0000,
+    0x3F00_1000,
+    0x3F00_2000,
+    0x3F00_3000,
+    0x3F00_4000,
+    0x3F00_5000,
+    0x3F00_6000,
+    0x3F00_7000,
+};
+const spawn_demo_config_candidates = [_]u64{
+    0x3F00_8000,
+    0x3F00_9000,
+    0x3F00_A000,
+    0x3F00_B000,
+    0x3F00_C000,
+    0x3F00_D000,
+    0x3F00_E000,
+    0x3F00_F000,
+};
+const spawn_demo_vm_source_candidates = [_]u64{
+    0x3F01_0000,
+    0x3F02_0000,
+    0x3F03_0000,
+    0x3F04_0000,
+};
 const shell_stack_extension_pages: u64 = 8;
 const shell_stack_extension_base_va: u64 = process_abi.aux_base_va - ((shell_stack_extension_pages + 1) * 4096);
 const block_request_va: u64 = 0x3C10_4000;
@@ -94,6 +122,21 @@ const block_demo_magic: u64 = 0x424C_4B44_454D_4F31;
 const shell_cat_display_limit_bytes: usize = 2048;
 const pie_user_rootfs_name = "cmd/pie_user.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
+var spawn_registry_copy_source_va: u64 = 0;
+var spawn_demo_config_source_va: u64 = 0;
+var spawn_demo_vm_object_token: u64 = 0;
+
+const rust_spawn_demo_magic: u64 = 0x5253_5044_454D_4F31;
+const rust_spawn_demo_version: u64 = 1;
+const rust_spawn_demo_state_ready: u64 = 1;
+const rust_spawn_demo_initial_depth: u64 = 1;
+const rust_spawn_demo_config_magic_index: usize = 0;
+const rust_spawn_demo_config_version_index: usize = 1;
+const rust_spawn_demo_config_state_index: usize = 2;
+const rust_spawn_demo_config_remaining_depth_index: usize = 3;
+const rust_spawn_demo_config_vm_token_index: usize = 4;
+const rust_spawn_demo_config_lineage_index: usize = 5;
+const page_bytes: usize = 4096;
 
 const VirtqDesc = extern struct {
     addr: u64,
@@ -218,16 +261,162 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn spawnExec(exec_token: u64) u64 {
+fn spawnExec(exec_token: u64, config_source_va: ?u64, vm_object_token: ?u64) u64 {
+    var table = process_abi.BootstrapDescriptorTable{};
+    if (config_source_va) |source_va| {
+        table.page_descriptors[table.page_count] = .{
+            .source_va = source_va,
+            .target_va = process_abi.standard_config_target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        table.page_count += 1;
+    }
+    if (copyServiceRegistryShadowForSpawn()) |registry_source_va| {
+        table.page_descriptors[table.page_count] = .{
+            .source_va = registry_source_va,
+            .target_va = service_registry_page_va,
+            .flags = 0,
+        };
+        table.page_count += 1;
+    }
+    if (vm_object_token) |token| {
+        table.cap_descriptors[table.cap_count] = .{
+            .source_token = token,
+            .target_token_va = process_abi.standard_config_target_va + rust_spawn_demo_config_vm_token_index * 8,
+            .rights_bits = image_abi.vmObjectRightsToBits(.{ .read = true, .grant = true }),
+            .kind = .vm_object,
+        };
+        table.cap_count += 1;
+    }
+    const requested = table.page_count != 0 or table.cap_count != 0;
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (process_abi.syscall_spawn_exec),
           [arg0] "{rdi}" (exec_token),
-          [arg1] "{rsi}" (@as(u64, 0)),
+          [arg1] "{rsi}" (@as(u64, if (requested) @intFromPtr(&table) else 0)),
           [arg2] "{rdx}" (@as(u64, 0)),
-          [arg3] "{rcx}" (@as(u64, 0)),
+          [arg3] "{rcx}" (@as(u64, if (requested) process_abi.spawn_flag_bootstrap_extended_descriptor_table else 0)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn ensureSpawnRegistryCopyPage() bool {
+    if (spawn_registry_copy_source_va != 0) return true;
+    for (spawn_registry_copy_candidates) |candidate_va| {
+        if (allocMapPages(candidate_va, 1, true, 0) == syscall_ok) {
+            spawn_registry_copy_source_va = candidate_va;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn copyServiceRegistryShadowForSpawn() ?u64 {
+    if (!ensureSpawnRegistryCopyPage()) return null;
+    const src: [*]const volatile u64 = @ptrFromInt(service_registry_page_va);
+    const dst: [*]volatile u64 = @ptrFromInt(spawn_registry_copy_source_va);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        dst[i] = src[i];
+    }
+    return spawn_registry_copy_source_va;
+}
+
+fn ensureSpawnDemoConfigPage() bool {
+    if (spawn_demo_config_source_va != 0) return true;
+    for (spawn_demo_config_candidates) |candidate_va| {
+        if (allocMapPages(candidate_va, 1, true, 0) == syscall_ok) {
+            spawn_demo_config_source_va = candidate_va;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn writeRustSpawnDemoConfigPage(state: u64, remaining_depth: u64, lineage: u64) void {
+    const words: [*]volatile u64 = @ptrFromInt(spawn_demo_config_source_va);
+    words[rust_spawn_demo_config_magic_index] = rust_spawn_demo_magic;
+    words[rust_spawn_demo_config_version_index] = rust_spawn_demo_version;
+    words[rust_spawn_demo_config_remaining_depth_index] = remaining_depth;
+    words[rust_spawn_demo_config_vm_token_index] = 0;
+    words[rust_spawn_demo_config_lineage_index] = lineage;
+    words[rust_spawn_demo_config_state_index] = state;
+}
+
+fn prepareRustSpawnDemoConfigPage() ?u64 {
+    if (!ensureSpawnDemoConfigPage()) return null;
+    writeRustSpawnDemoConfigPage(rust_spawn_demo_state_ready, rust_spawn_demo_initial_depth, 0);
+    return spawn_demo_config_source_va;
+}
+
+fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_install_vm_object),
+          [arg0] "{rdi}" (base_va),
+          [arg1] "{rsi}" (size_bytes),
+          [arg2] "{rdx}" (image_abi.vmObjectRightsToBits(rights)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn isRustSpawnDemoPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, "rust_spawn_demo.elf");
+}
+
+fn ensureRustSpawnDemoVmObject(st: *ShellState, client: *fs_client.Client, vnode_file_token: u64) ?u64 {
+    if (image_abi.decodeVmObjectToken(spawn_demo_vm_object_token) != null) return spawn_demo_vm_object_token;
+
+    const open_file = client.open(vnode_file_token) catch |err| {
+        reportPersistentFsError(st, "spawn demo open failed", err, true);
+        return null;
+    };
+    defer client.close(open_file.token) catch {};
+
+    const file_bytes: usize = @intCast(open_file.file_bytes);
+    if (file_bytes == 0) {
+        st.writeLine("spawn demo empty file");
+        shellLogLine("spawn demo empty file");
+        return null;
+    }
+    const needed_pages = (file_bytes + page_bytes - 1) / page_bytes;
+
+    var source_base_va: ?u64 = null;
+    for (spawn_demo_vm_source_candidates) |candidate_va| {
+        if (allocMapPages(candidate_va, needed_pages, true, 0) == syscall_ok) {
+            source_base_va = candidate_va;
+            break;
+        }
+    }
+    const base_va = source_base_va orelse {
+        st.writeLine("spawn demo vm map failed");
+        shellLogLine("spawn demo vm map failed");
+        return null;
+    };
+
+    const target: [*]u8 = @ptrFromInt(base_va);
+    var offset: usize = 0;
+    while (offset < file_bytes) {
+        const read_result = client.read(open_file.token, offset, target[offset..file_bytes]) catch |err| {
+            reportPersistentFsError(st, "spawn demo read failed", err, true);
+            return null;
+        };
+        if (read_result.bytes_read == 0) {
+            st.writeLine("spawn demo short read");
+            shellLogLine("spawn demo short read");
+            return null;
+        }
+        offset += read_result.bytes_read;
+    }
+
+    const vm_token = installVmObject(base_va, file_bytes, .{ .read = true, .grant = true });
+    if (image_abi.decodeVmObjectToken(vm_token) == null) {
+        st.writeLine("spawn demo vm install failed");
+        shellLogLine("spawn demo vm install failed");
+        return null;
+    }
+    spawn_demo_vm_object_token = vm_token;
+    return vm_token;
 }
 
 fn mapPagesBatch(base_va: u64, paddr_list_va: u64, page_count: u64, writable: bool) u64 {
@@ -1129,7 +1318,18 @@ fn runPersistentFsExecFile(st: *ShellState, path: []const u8) bool {
         reportPersistentFsError(st, "open_exec failed", err, true);
         return false;
     };
-    const spawned = spawnExec(exec.token);
+    const is_spawn_demo = isRustSpawnDemoPath(path);
+    const demo_config_source_va = if (is_spawn_demo) prepareRustSpawnDemoConfigPage() else null;
+    if (is_spawn_demo and demo_config_source_va == null) {
+        st.writeLine("spawn demo config failed");
+        shellLogLine("spawn demo config failed");
+        return false;
+    }
+    const demo_vm_object_token = if (is_spawn_demo) ensureRustSpawnDemoVmObject(st, client, file.token) else null;
+    if (is_spawn_demo and demo_vm_object_token == null) {
+        return false;
+    }
+    const spawned = spawnExec(exec.token, demo_config_source_va, demo_vm_object_token);
     const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
         st.writeLine("spawn failed");
         shellLogLine("spawn failed");

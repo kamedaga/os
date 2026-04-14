@@ -1,0 +1,10 @@
+[package]
+name = "rt_handle"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rt_core = { path = "../rt_core" }

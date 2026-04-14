@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "rt_core",
+    "rt_alloc",
+    "rt_handle",
+    "rust_hello",
+    "rust_spawn_demo",
+]
+resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = false
+codegen-units = 1
+strip = "symbols"
