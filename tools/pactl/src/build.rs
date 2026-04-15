@@ -80,7 +80,9 @@ pub fn build_userland(
             SourceConfig::Cargo(src) => {
                 build_cargo_app(workspace_root, workspace, &app, src, &output_path, options)?
             }
-            SourceConfig::File(src) => build_file_app(workspace_root, workspace, &app, src, &output_path)?,
+            SourceConfig::File(src) => {
+                build_file_app(workspace_root, workspace, &app, src, &output_path, options)?
+            }
             SourceConfig::Capc(_) => {
                 return Err(format!(
                     "capc build is not implemented yet for app {}",
@@ -208,16 +210,16 @@ fn build_cargo_app(
     output_path: &Path,
     options: BuildOptions,
 ) -> Result<(), String> {
-    if output_is_usable(output_path)? && !options.force {
-        if options.warn_stale_cargo && cargo_inputs_newer_than_output(workspace_root, src, output_path)? {
-            eprintln!(
-                "pactl: cargo artifact for '{}' is stale; using existing {}\n       run `pactl build userland {} --fresh` to refresh",
-                app.app.id,
-                output_path.display(),
-                app.app.id
-            );
-        }
-        return Ok(());
+    if output_is_usable(output_path)?
+        && !options.force
+        && options.warn_stale_cargo
+        && cargo_inputs_newer_than_output(workspace_root, src, output_path)?
+    {
+        eprintln!(
+            "pactl: cargo artifact for '{}' is stale; rebuilding {}",
+            app.app.id,
+            output_path.display()
+        );
     }
 
     let cargo = tool_or_default(&workspace.toolchain.cargo, "cargo");
@@ -244,6 +246,10 @@ fn build_cargo_app(
         cmd.arg("--release");
     }
     cmd.arg("--target-dir").arg(&target_dir);
+
+    // Always defer freshness decisions to Cargo itself. A fast no-op cargo build
+    // is cheaper and more correct than trying to approximate the dependency graph
+    // here and accidentally publishing a stale ELF into rootfs.
     run_command(&format!("cargo build for app {}", app.app.id), &mut cmd)?;
 
     let executable_name = if src.bin.is_empty() {
@@ -272,8 +278,13 @@ fn build_file_app(
     app: &AppConfig,
     src: &FileSource,
     output_path: &Path,
+    options: BuildOptions,
 ) -> Result<(), String> {
-    if !src.rebuild_tool.is_empty() {
+    let source_path = workspace_root.join(&src.path);
+    let should_rebuild = !src.rebuild_tool.is_empty()
+        && (options.force || !output_is_usable(&source_path)?);
+
+    if should_rebuild {
         let mut cmd = Command::new(resolve_tool(workspace, &src.rebuild_tool));
         let rebuild_dir = if src.rebuild_dir.is_empty() {
             workspace_root.to_path_buf()
@@ -287,7 +298,6 @@ fn build_file_app(
         run_command(&format!("rebuild file source for app {}", app.app.id), &mut cmd)?;
     }
 
-    let source_path = workspace_root.join(&src.path);
     if !source_path.is_file() {
         return Err(format!(
             "prebuilt source for app {} does not exist: {}",
@@ -323,7 +333,7 @@ fn cargo_inputs_newer_than_output(
         manifest_dir.join("Cargo.lock"),
         manifest_dir.join(&src.package),
     ];
-    for shared in ["rt_core", "rt_alloc", "rt_handle", "rt_io"] {
+    for shared in ["rt_core", "rt_alloc", "rt_handle", "rt_io", "cap_std"] {
         candidates.push(manifest_dir.join(shared));
     }
 

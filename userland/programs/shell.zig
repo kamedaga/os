@@ -1,6 +1,7 @@
 /// Rootfs shell displayed on the primary framebuffer until the windowed UI takes over.
 const std = @import("std");
 const block_client = @import("support_root").block_client;
+const font = @import("support_root").font;
 const fs_abi = @import("support_root").fs_abi;
 const fs_client = @import("support_root").fs_client;
 const fs_protocol = @import("support_root").fs_protocol;
@@ -8,7 +9,10 @@ const image_abi = @import("support_root").image_abi;
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
 const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
 const process_abi = @import("support_root").process_abi;
+const process_args_env_bootstrap_abi = @import("support_root").process_args_env_bootstrap_abi;
+const process_exit_bootstrap_abi = @import("support_root").process_exit_bootstrap_abi;
 const service_registry_abi = @import("support_root").service_registry_abi;
+const stdio_bootstrap_abi = @import("support_root").stdio_bootstrap_abi;
 
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
@@ -17,6 +21,10 @@ const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_map_pages_batch: u64 = 0x15;
 const syscall_wait_event: u64 = 0x17;
+const syscall_install_endpoint: u64 = 0x26;
+const syscall_share_cap: u64 = 0x2B;
+const syscall_signal_endpoint: u64 = 0x2C;
+const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
 const syscall_get_process_slot: u64 = 0x2E;
 const syscall_map_vm_object: u64 = 0x28;
 const syscall_install_vm_object: u64 = image_abi.syscall_install_vm_object;
@@ -38,12 +46,13 @@ const queue_page1_va: usize = runtime_page_base_va + 0x9000;
 const fb_width: usize = 832;
 const fb_height: usize = @intCast(init_bootstrap_abi.boot_display_shell_height);
 const fb_pitch: usize = 832;
-const glyph_w: usize = 5;
-const glyph_h: usize = 7;
-const glyph_scale: usize = 2;
-const cell_w: usize = glyph_w * glyph_scale + 6;
-const cell_h: usize = glyph_h * glyph_scale + 6;
-const cols: usize = fb_width / cell_w;
+const font_scale_num: i32 = 3;
+const font_scale_den: i32 = 2;
+const text_margin_x: usize = 4;
+const text_margin_y: usize = 2;
+const cell_w: usize = @as(usize, @intCast(font.scaledGlyphWidthRatio(font_scale_num, font_scale_den)));
+const cell_h: usize = @as(usize, @intCast(font.lineHeightRatio(font_scale_num, font_scale_den))) + text_margin_y * 2;
+const cols: usize = (fb_width - text_margin_x * 2) / cell_w;
 const rows: usize = fb_height / cell_h;
 
 const bg_color: u32 = 0x000B_0E12;
@@ -112,6 +121,28 @@ const spawn_demo_vm_source_candidates = [_]u64{
     0x3F03_0000,
     0x3F04_0000,
 };
+const spawn_child_text_stream_candidates = [_]u64{
+    0x3F05_0000,
+    0x3F05_1000,
+    0x3F05_2000,
+    0x3F05_3000,
+    0x3F05_4000,
+    0x3F05_5000,
+    0x3F05_6000,
+    0x3F05_7000,
+};
+const spawn_stdio_zero_page_candidate: u64 = 0x3F05_8000;
+const spawn_exit_status_zero_page_candidate: u64 = 0x3F05_9000;
+const spawn_child_args_env_candidates = [_]u64{
+    0x3F05_A000,
+    0x3F05_B000,
+    0x3F05_C000,
+    0x3F05_D000,
+    0x3F05_E000,
+    0x3F05_F000,
+    0x3F06_0000,
+    0x3F06_1000,
+};
 const shell_stack_extension_pages: u64 = 8;
 const shell_stack_extension_base_va: u64 = process_abi.aux_base_va - ((shell_stack_extension_pages + 1) * 4096);
 const block_request_va: u64 = 0x3C10_4000;
@@ -125,6 +156,9 @@ var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 var spawn_registry_copy_source_va: u64 = 0;
 var spawn_demo_config_source_va: u64 = 0;
 var spawn_demo_vm_object_token: u64 = 0;
+var spawn_stdio_zero_page_source_va: u64 = 0;
+var spawn_exit_status_zero_page_source_va: u64 = 0;
+var shell_process_slot_cache: u64 = 0;
 
 const rust_spawn_demo_magic: u64 = 0x5253_5044_454D_4F31;
 const rust_spawn_demo_version: u64 = 1;
@@ -137,6 +171,28 @@ const rust_spawn_demo_config_remaining_depth_index: usize = 3;
 const rust_spawn_demo_config_vm_token_index: usize = 4;
 const rust_spawn_demo_config_lineage_index: usize = 5;
 const page_bytes: usize = 4096;
+
+const ChildTextStreamSlot = struct {
+    source_va: u64 = 0,
+    source_paddr: u64 = 0,
+    child_process_slot: u64 = 0,
+    active: bool = false,
+    partial_kind: u64 = stdio_bootstrap_abi.stream_kind_log,
+    partial_len: usize = 0,
+    partial_buf: [stdio_bootstrap_abi.payload_bytes]u8 = [_]u8{0} ** stdio_bootstrap_abi.payload_bytes,
+};
+
+var child_text_stream_slots: [spawn_child_text_stream_candidates.len]ChildTextStreamSlot =
+    [_]ChildTextStreamSlot{.{}} ** spawn_child_text_stream_candidates.len;
+
+const ChildArgsEnvSlot = struct {
+    source_va: u64 = 0,
+    child_process_slot: u64 = 0,
+    active: bool = false,
+};
+
+var child_args_env_slots: [spawn_child_args_env_candidates.len]ChildArgsEnvSlot =
+    [_]ChildArgsEnvSlot{.{}} ** spawn_child_args_env_candidates.len;
 
 const VirtqDesc = extern struct {
     addr: u64,
@@ -251,6 +307,15 @@ fn getProcessSlot() u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn getProcessStatus(process_slot: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_get_process_status),
+          [arg0] "{rdi}" (process_slot),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
     return asm volatile (
         \\int $0x80
@@ -261,7 +326,49 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn spawnExec(exec_token: u64, config_source_va: ?u64, vm_object_token: ?u64) u64 {
+fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_install_endpoint),
+          [arg0] "{rdi}" (@as(u64, 0)),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (target_process_slot),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn signalEndpoint(endpoint_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_signal_endpoint),
+          [arg0] "{rdi}" (endpoint_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn shareCap(paddr: u64, endpoint_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_share_cap),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (endpoint_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn compilerBarrier() void {
+    asm volatile ("" ::: .{ .memory = true });
+}
+
+fn spawnExec(
+    exec_token: u64,
+    config_source_va: ?u64,
+    vm_object_token: ?u64,
+    stdio_source_va: u64,
+    stdio_flags: u64,
+    exit_status_source_va: u64,
+    args_env_source_va: u64,
+) u64 {
     var table = process_abi.BootstrapDescriptorTable{};
     if (config_source_va) |source_va| {
         table.page_descriptors[table.page_count] = .{
@@ -279,6 +386,24 @@ fn spawnExec(exec_token: u64, config_source_va: ?u64, vm_object_token: ?u64) u64
         };
         table.page_count += 1;
     }
+    table.page_descriptors[table.page_count] = .{
+        .source_va = stdio_source_va,
+        .target_va = stdio_bootstrap_abi.target_va,
+        .flags = stdio_flags,
+    };
+    table.page_count += 1;
+    table.page_descriptors[table.page_count] = .{
+        .source_va = exit_status_source_va,
+        .target_va = process_exit_bootstrap_abi.target_va,
+        .flags = process_abi.spawn_flag_bootstrap_page_writable,
+    };
+    table.page_count += 1;
+    table.page_descriptors[table.page_count] = .{
+        .source_va = args_env_source_va,
+        .target_va = process_args_env_bootstrap_abi.target_va,
+        .flags = 0,
+    };
+    table.page_count += 1;
     if (vm_object_token) |token| {
         table.cap_descriptors[table.cap_count] = .{
             .source_token = token,
@@ -320,6 +445,278 @@ fn copyServiceRegistryShadowForSpawn() ?u64 {
         dst[i] = src[i];
     }
     return spawn_registry_copy_source_va;
+}
+
+fn ensureSpawnStdioZeroPage() bool {
+    if (spawn_stdio_zero_page_source_va != 0) return true;
+    if (allocMapPages(spawn_stdio_zero_page_candidate, 1, true, 0) != syscall_ok) return false;
+    spawn_stdio_zero_page_source_va = spawn_stdio_zero_page_candidate;
+    stdio_bootstrap_abi.initZeroPage(spawn_stdio_zero_page_source_va);
+    return true;
+}
+
+fn ensureSpawnExitStatusZeroPage() bool {
+    if (spawn_exit_status_zero_page_source_va != 0) return true;
+    if (allocMapPages(spawn_exit_status_zero_page_candidate, 1, true, 0) != syscall_ok) return false;
+    spawn_exit_status_zero_page_source_va = spawn_exit_status_zero_page_candidate;
+    process_exit_bootstrap_abi.initZeroPage(spawn_exit_status_zero_page_source_va);
+    return true;
+}
+
+fn ensureChildTextStreamSourcePage(slot_index: usize) bool {
+    const slot = &child_text_stream_slots[slot_index];
+    if (slot.source_va != 0) return true;
+    const candidate_va = spawn_child_text_stream_candidates[slot_index];
+    var paddr: u64 = 0;
+    if (allocMapPages(candidate_va, 1, true, @intFromPtr(&paddr)) != syscall_ok or paddr < 0x1000) return false;
+    slot.source_va = candidate_va;
+    slot.source_paddr = paddr;
+    return true;
+}
+
+fn resetChildTextStreamSlot(slot: *ChildTextStreamSlot) void {
+    slot.child_process_slot = 0;
+    slot.active = false;
+    slot.partial_kind = stdio_bootstrap_abi.stream_kind_log;
+    slot.partial_len = 0;
+    @memset(slot.partial_buf[0..], 0);
+    if (slot.source_va != 0) stdio_bootstrap_abi.initZeroPage(slot.source_va);
+}
+
+fn findChildTextStreamSlotByPaddr(paddr: u64) ?*ChildTextStreamSlot {
+    var i: usize = 0;
+    while (i < child_text_stream_slots.len) : (i += 1) {
+        const slot = &child_text_stream_slots[i];
+        if (slot.source_paddr == paddr and slot.source_va != 0) return slot;
+    }
+    return null;
+}
+
+fn prepareChildTextStreamSlot() ?*ChildTextStreamSlot {
+    var i: usize = 0;
+    while (i < child_text_stream_slots.len) : (i += 1) {
+        const slot = &child_text_stream_slots[i];
+        if (slot.active) continue;
+        if (!ensureChildTextStreamSourcePage(i)) continue;
+        stdio_bootstrap_abi.initShellSinkPage(slot.source_va, shell_process_slot_cache);
+        slot.partial_kind = stdio_bootstrap_abi.stream_kind_log;
+        slot.partial_len = 0;
+        @memset(slot.partial_buf[0..], 0);
+        return slot;
+    }
+    return null;
+}
+
+fn ensureChildArgsEnvSourcePage(slot_index: usize) bool {
+    const slot = &child_args_env_slots[slot_index];
+    if (slot.source_va != 0) return true;
+    const candidate_va = spawn_child_args_env_candidates[slot_index];
+    if (allocMapPages(candidate_va, 1, true, 0) != syscall_ok) return false;
+    slot.source_va = candidate_va;
+    return true;
+}
+
+fn resetChildArgsEnvSlot(slot: *ChildArgsEnvSlot) void {
+    slot.child_process_slot = 0;
+    slot.active = false;
+    if (slot.source_va != 0) process_args_env_bootstrap_abi.initZeroPage(slot.source_va);
+}
+
+fn appendCommandArgsToWriter(writer: *process_args_env_bootstrap_abi.Writer, arg_text: []const u8) bool {
+    var rest = trimSpaces(arg_text);
+    while (rest.len != 0) {
+        const split = splitCommand(rest);
+        if (split.head.len == 0) break;
+        if (!writer.pushArg(split.head)) return false;
+        rest = split.tail;
+    }
+    return true;
+}
+
+fn prepareChildArgsEnvSlot(st: *ShellState, path: []const u8, arg_text: []const u8) ?*ChildArgsEnvSlot {
+    var i: usize = 0;
+    while (i < child_args_env_slots.len) : (i += 1) {
+        const slot = &child_args_env_slots[i];
+        if (slot.active) continue;
+        if (!ensureChildArgsEnvSourcePage(i)) continue;
+        var writer = process_args_env_bootstrap_abi.Writer.init(slot.source_va);
+        if (!writer.pushArg(path)) return null;
+        if (!appendCommandArgsToWriter(&writer, arg_text)) return null;
+        if (!writer.pushEnv("PWD", currentRootfsPath(st))) return null;
+        return slot;
+    }
+    return null;
+}
+
+fn pumpChildArgsEnvSlots() void {
+    for (&child_args_env_slots) |*slot| {
+        if (!slot.active or slot.child_process_slot == 0) continue;
+        if (process_abi.decodeProcessStatusKind(getProcessStatus(slot.child_process_slot)) != .active) {
+            resetChildArgsEnvSlot(slot);
+        }
+    }
+}
+
+fn childTextStreamSlotProcessKind(slot: *const ChildTextStreamSlot) process_abi.ProcessStatusKind {
+    if (!slot.active or slot.child_process_slot == 0) return .inactive;
+    return process_abi.decodeProcessStatusKind(getProcessStatus(slot.child_process_slot));
+}
+
+fn childTextStreamKindPrefix(kind: u64) []const u8 {
+    return switch (kind) {
+        stdio_bootstrap_abi.stream_kind_stderr => " stderr",
+        stdio_bootstrap_abi.stream_kind_stdout => "",
+        else => " log",
+    };
+}
+
+fn emitChildTextLine(st: *ShellState, process_slot: u64, kind: u64, text: []const u8) void {
+    var line_buf: [640]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "[{d}{s}] {s}", .{
+        process_slot,
+        childTextStreamKindPrefix(kind),
+        text,
+    }) catch return;
+    writeWrappedText(st, line);
+}
+
+fn flushChildTextPartial(st: *ShellState, slot: *ChildTextStreamSlot) bool {
+    if (slot.partial_len == 0) return false;
+    emitChildTextLine(st, slot.child_process_slot, slot.partial_kind, slot.partial_buf[0..slot.partial_len]);
+    slot.partial_len = 0;
+    return true;
+}
+
+fn sanitizeChildTextByte(byte: u8) ?u8 {
+    return switch (byte) {
+        '\r' => null,
+        '\n' => '\n',
+        '\t' => ' ',
+        0x20...0x7E => byte,
+        else => '?',
+    };
+}
+
+fn readChildTextControlWord(bytes: []const u8, index: usize) ?u64 {
+    const start = index * 8;
+    const end = start + 8;
+    if (end > bytes.len) return null;
+    var word: [8]u8 = undefined;
+    @memcpy(word[0..], bytes[start..end]);
+    return std.mem.readInt(u64, &word, .little);
+}
+
+fn handleChildTextControlRequest(slot: *ChildTextStreamSlot, bytes: []const u8) void {
+    const magic = readChildTextControlWord(bytes, 0) orelse return;
+    if (magic != stdio_bootstrap_abi.control_magic) return;
+    const version = readChildTextControlWord(bytes, 1) orelse return;
+    if (version != stdio_bootstrap_abi.control_version) return;
+    const op = readChildTextControlWord(bytes, 2) orelse return;
+    switch (op) {
+        stdio_bootstrap_abi.control_op_allocate_inherited => {
+            const response_endpoint_id = readChildTextControlWord(bytes, 3) orelse return;
+            if (response_endpoint_id == 0 or slot.child_process_slot == 0) return;
+            const inherited_slot = prepareChildTextStreamSlot() orelse {
+                shellLogLine("stdio inherit slot exhausted");
+                return;
+            };
+            inherited_slot.child_process_slot = slot.child_process_slot;
+            inherited_slot.active = true;
+            if (installEndpoint(response_endpoint_id, slot.child_process_slot) != syscall_ok) {
+                resetChildTextStreamSlot(inherited_slot);
+                shellLogLine("stdio inherit install failed");
+                return;
+            }
+            if (shareCap(inherited_slot.source_paddr, response_endpoint_id) != syscall_ok) {
+                resetChildTextStreamSlot(inherited_slot);
+                shellLogLine("stdio inherit share failed");
+                return;
+            }
+            _ = signalEndpoint(response_endpoint_id);
+        },
+        stdio_bootstrap_abi.control_op_bind_inherited => {
+            const source_paddr = readChildTextControlWord(bytes, 3) orelse return;
+            const child_process_slot = readChildTextControlWord(bytes, 4) orelse return;
+            const inherited_slot = findChildTextStreamSlotByPaddr(source_paddr) orelse return;
+            inherited_slot.child_process_slot = child_process_slot;
+            inherited_slot.active = true;
+        },
+        else => {},
+    }
+}
+
+fn processChildTextBytes(st: *ShellState, slot: *ChildTextStreamSlot, kind: u64, bytes: []const u8) bool {
+    var changed = false;
+    if (slot.partial_len != 0 and slot.partial_kind != kind) {
+        changed = flushChildTextPartial(st, slot) or changed;
+    }
+    slot.partial_kind = kind;
+    for (bytes) |raw_byte| {
+        const maybe_byte = sanitizeChildTextByte(raw_byte);
+        if (maybe_byte == null) continue;
+        const byte = maybe_byte.?;
+        if (byte == '\n') {
+            if (slot.partial_len == 0) {
+                emitChildTextLine(st, slot.child_process_slot, slot.partial_kind, "");
+                changed = true;
+            } else {
+                changed = flushChildTextPartial(st, slot) or changed;
+            }
+            continue;
+        }
+        if (slot.partial_len == slot.partial_buf.len) {
+            changed = flushChildTextPartial(st, slot) or changed;
+        }
+        slot.partial_buf[slot.partial_len] = byte;
+        slot.partial_len += 1;
+    }
+    return changed;
+}
+
+fn consumeChildTextStreamPage(st: *ShellState, slot: *ChildTextStreamSlot) bool {
+    if (!slot.active or slot.source_va == 0) return false;
+    const page: *volatile stdio_bootstrap_abi.Page = @ptrFromInt(slot.source_va);
+    if (page.header.magic != stdio_bootstrap_abi.magic or
+        page.header.version != stdio_bootstrap_abi.version or
+        page.header.state != stdio_bootstrap_abi.state_ready)
+    {
+        return false;
+    }
+    const payload_len: usize = @intCast(@min(page.header.byte_len, stdio_bootstrap_abi.payload_bytes));
+    const stream_kind = page.header.stream_kind;
+    var payload: [stdio_bootstrap_abi.payload_bytes]u8 = undefined;
+    var i: usize = 0;
+    while (i < payload_len) : (i += 1) {
+        payload[i] = page.payload[i];
+    }
+    compilerBarrier();
+    page.header.byte_len = 0;
+    page.header.state = stdio_bootstrap_abi.state_idle;
+    if (stream_kind == stdio_bootstrap_abi.stream_kind_control) {
+        handleChildTextControlRequest(slot, payload[0..payload_len]);
+        return false;
+    }
+    return processChildTextBytes(st, slot, stream_kind, payload[0..payload_len]);
+}
+
+fn reclaimChildTextStreamSlot(st: *ShellState, slot: *ChildTextStreamSlot) bool {
+    var changed = false;
+    changed = consumeChildTextStreamPage(st, slot) or changed;
+    changed = flushChildTextPartial(st, slot) or changed;
+    resetChildTextStreamSlot(slot);
+    return changed;
+}
+
+fn pumpChildTextStreams(st: *ShellState) bool {
+    var changed = false;
+    for (&child_text_stream_slots) |*slot| {
+        if (!slot.active) continue;
+        changed = consumeChildTextStreamPage(st, slot) or changed;
+        if (childTextStreamSlotProcessKind(slot) != .active) {
+            changed = reclaimChildTextStreamSlot(st, slot) or changed;
+        }
+    }
+    return changed;
 }
 
 fn ensureSpawnDemoConfigPage() bool {
@@ -581,102 +978,33 @@ fn fillRect(vfb: [*]volatile u32, x: usize, y: usize, w: usize, h: usize, color:
     }
 }
 
-fn glyphRows(raw: u8) [glyph_h]u8 {
-    const ch: u8 = if (raw >= 'a' and raw <= 'z') raw - 32 else raw;
-    return switch (ch) {
-        'A' => .{ 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
-        'B' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E },
-        'C' => .{ 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E },
-        'D' => .{ 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E },
-        'E' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F },
-        'F' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 },
-        'G' => .{ 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E },
-        'H' => .{ 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
-        'I' => .{ 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F },
-        'J' => .{ 0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E },
-        'K' => .{ 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },
-        'L' => .{ 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F },
-        'M' => .{ 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 },
-        'N' => .{ 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 },
-        'O' => .{ 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
-        'P' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 },
-        'Q' => .{ 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D },
-        'R' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 },
-        'S' => .{ 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E },
-        'T' => .{ 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
-        'U' => .{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
-        'V' => .{ 0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04 },
-        'W' => .{ 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A },
-        'X' => .{ 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 },
-        'Y' => .{ 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 },
-        'Z' => .{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F },
-        '0' => .{ 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E },
-        '1' => .{ 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E },
-        '2' => .{ 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F },
-        '3' => .{ 0x1E, 0x01, 0x01, 0x06, 0x01, 0x01, 0x1E },
-        '4' => .{ 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 },
-        '5' => .{ 0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E },
-        '6' => .{ 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E },
-        '7' => .{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
-        '8' => .{ 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E },
-        '9' => .{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x1C },
-        ' ' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-        '.' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04 },
-        ',' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08 },
-        ':' => .{ 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00 },
-        ';' => .{ 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08 },
-        '-' => .{ 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00 },
-        '_' => .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F },
-        '/' => .{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00 },
-        '\\' => .{ 0x10, 0x08, 0x04, 0x02, 0x01, 0x00, 0x00 },
-        '[' => .{ 0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E },
-        ']' => .{ 0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E },
-        '(' => .{ 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 },
-        ')' => .{ 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 },
-        '+' => .{ 0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00 },
-        '=' => .{ 0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00 },
-        '*' => .{ 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00 },
-        '#' => .{ 0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A },
-        '!' => .{ 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04 },
-        '?' => .{ 0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04 },
-        '|' => .{ 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
-        '<' => .{ 0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02 },
-        '>' => .{ 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08 },
-        '\'' => .{ 0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00 },
-        '"' => .{ 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00 },
-        '`' => .{ 0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00 },
-        '~' => .{ 0x00, 0x09, 0x16, 0x00, 0x00, 0x00, 0x00 },
-        else => .{ 0x0E, 0x11, 0x01, 0x06, 0x04, 0x00, 0x04 },
-    };
+fn blendPixel(vfb: [*]volatile u32, x: i32, y: i32, color: u32, alpha: u8) void {
+    if (x < 0 or y < 0) return;
+    const ux: usize = @intCast(x);
+    const uy: usize = @intCast(y);
+    if (ux >= fb_width or uy >= fb_height) return;
+    const index = uy * fb_pitch + ux;
+    vfb[index] = font.blendColor(vfb[index], color, alpha);
 }
 
-fn drawGlyph(vfb: [*]volatile u32, x: usize, y: usize, ch: u8, color: u32) void {
-    const glyph = glyphRows(ch);
-    var gy: usize = 0;
-    while (gy < glyph_h) : (gy += 1) {
-        const bits = glyph[gy];
-        var gx: usize = 0;
-        while (gx < glyph_w) : (gx += 1) {
-            if ((bits & (@as(u8, 1) << @intCast((glyph_w - 1) - gx))) == 0) continue;
-            const px = x + gx * glyph_scale;
-            const py = y + gy * glyph_scale;
-            var sy: usize = 0;
-            while (sy < glyph_scale and py + sy < fb_height) : (sy += 1) {
-                const row = (py + sy) * fb_pitch;
-                var sx: usize = 0;
-                while (sx < glyph_scale and px + sx < fb_width) : (sx += 1) {
-                    vfb[row + px + sx] = color;
-                }
-            }
-        }
-    }
+fn textRowY(row: usize) i32 {
+    return @intCast(row * cell_h + text_margin_y);
 }
 
 fn drawLine(vfb: [*]volatile u32, row: usize, text: []const u8, color: u32) void {
-    var i: usize = 0;
-    while (i < text.len and i < cols) : (i += 1) {
-        drawGlyph(vfb, i * cell_w + 4, row * cell_h + 4, text[i], color);
-    }
+    if (text.len == 0) return;
+    font.drawAsciiTextClippedRatio(
+        [*]volatile u32,
+        blendPixel,
+        vfb,
+        @intCast(text_margin_x),
+        textRowY(row),
+        text,
+        color,
+        font_scale_num,
+        font_scale_den,
+        @intCast(fb_width - text_margin_x),
+    );
 }
 
 fn clearRow(vfb: [*]volatile u32, row: usize, color: u32) void {
@@ -962,15 +1290,19 @@ fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
     else
         prefix_buf[prefix_len - cols .. prefix_len];
     if (prefix.len > 0) @memcpy(prompt_buf[0..prefix.len], prefix);
+    var prompt_len: usize = prefix.len;
     if (prefix.len < cols) {
         const cmd_space = cols - prefix.len;
         const cmd_slice = if (st.cmd_len <= cmd_space)
             st.cmd[0..st.cmd_len]
         else
             st.cmd[st.cmd_len - cmd_space .. st.cmd_len];
-        if (cmd_slice.len > 0) @memcpy(prompt_buf[prefix.len .. prefix.len + cmd_slice.len], cmd_slice);
+        if (cmd_slice.len > 0) {
+            @memcpy(prompt_buf[prefix.len .. prefix.len + cmd_slice.len], cmd_slice);
+            prompt_len += cmd_slice.len;
+        }
     }
-    drawLine(vfb, row, prompt_buf[0..], prompt_fg_color);
+    drawLine(vfb, row, prompt_buf[0..prompt_len], prompt_fg_color);
 }
 
 fn renderFull(vfb: [*]volatile u32, st: *ShellState) void {
@@ -1046,11 +1378,14 @@ fn ensurePersistentFsClient(st: *ShellState) ?*fs_client.Client {
         shellLogLine("fs process slot unavailable");
         return null;
     }
-    st.persistent_fs_client_state = fs_client.Client.connectFromRegistryPage(
+    st.persistent_fs_client_state = fs_client.Client.connectFromRegistryPageOptions(
         service_registry_page_va,
         persistent_fs_request_va,
         persistent_fs_response_va,
         process_slot,
+        .{
+            .response_poll_limit = 65536,
+        },
     ) catch |err| {
         st.writeLine("fs connect failed");
         shellLogLine("fs connect failed");
@@ -1301,7 +1636,7 @@ fn runPersistentFsUnlink(st: *ShellState, path: []const u8) bool {
     return true;
 }
 
-fn runPersistentFsExecFile(st: *ShellState, path: []const u8) bool {
+fn runPersistentFsExecFile(st: *ShellState, path: []const u8, arg_text: []const u8) bool {
     if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
         st.writeLine(rootfsUnavailableReason());
         shellLogLine(rootfsUnavailableReason());
@@ -1329,12 +1664,58 @@ fn runPersistentFsExecFile(st: *ShellState, path: []const u8) bool {
     if (is_spawn_demo and demo_vm_object_token == null) {
         return false;
     }
-    const spawned = spawnExec(exec.token, demo_config_source_va, demo_vm_object_token);
+    if (!ensureSpawnExitStatusZeroPage()) {
+        st.writeLine("exit status bootstrap failed");
+        shellLogLine("exit status bootstrap failed");
+        return false;
+    }
+    const args_env_slot = prepareChildArgsEnvSlot(st, path, arg_text) orelse {
+        st.writeLine("args env bootstrap failed");
+        shellLogLine("args env bootstrap failed");
+        return false;
+    };
+    const text_stream_slot = prepareChildTextStreamSlot();
+    if (text_stream_slot == null and !ensureSpawnStdioZeroPage()) {
+        resetChildArgsEnvSlot(args_env_slot);
+        st.writeLine("stdio bootstrap failed");
+        shellLogLine("stdio bootstrap failed");
+        return false;
+    }
+    if (text_stream_slot) |slot| {
+        var diag_buf: [96]u8 = undefined;
+        const diag = std.fmt.bufPrint(&diag_buf, "stdio slot va=0x{x} shell_slot={d}", .{
+            slot.source_va,
+            shell_process_slot_cache,
+        }) catch "";
+        if (diag.len != 0) shellLogLine(diag);
+    } else {
+        shellLogLine("stdio zero page fallback");
+    }
+    const stdio_source_va = if (text_stream_slot) |slot| slot.source_va else spawn_stdio_zero_page_source_va;
+    const stdio_flags = if (text_stream_slot != null) process_abi.spawn_flag_bootstrap_page_writable else @as(u64, 0);
+    const args_env_source_va = args_env_slot.source_va;
+    const spawned = spawnExec(
+        exec.token,
+        demo_config_source_va,
+        demo_vm_object_token,
+        stdio_source_va,
+        stdio_flags,
+        spawn_exit_status_zero_page_source_va,
+        args_env_source_va,
+    );
     const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+        if (text_stream_slot) |slot| resetChildTextStreamSlot(slot);
+        resetChildArgsEnvSlot(args_env_slot);
         st.writeLine("spawn failed");
         shellLogLine("spawn failed");
         return false;
     };
+    args_env_slot.child_process_slot = child_slot;
+    args_env_slot.active = true;
+    if (text_stream_slot) |slot| {
+        slot.child_process_slot = child_slot;
+        slot.active = true;
+    }
     var line_buf: [160]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "spawned {s} slot={d}", .{ path, child_slot }) catch return false;
     st.writeLine(line);
@@ -1769,7 +2150,7 @@ fn runPersistentFsDemo(st: *ShellState) bool {
 
 fn runPersistentFsPieUser(st: *ShellState) bool {
     shellLogLine("pie_user start");
-    const ok = runPersistentFsExecFile(st, pie_user_rootfs_name);
+    const ok = runPersistentFsExecFile(st, pie_user_rootfs_name, "");
     if (ok) shellLogLine("pie_user done");
     return ok;
 }
@@ -1796,13 +2177,10 @@ fn executeCommand(st: *ShellState) RenderAction {
     }
     if (eqAsciiNoCase(parsed.head, "cd")) {
         var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
-        const target_path = if (trimSpaces(parsed.tail).len == 0)
-            blk: {
-                path_buf[0] = '/';
-                break :blk path_buf[0..1];
-            }
-        else
-            requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
+        const target_path = if (trimSpaces(parsed.tail).len == 0) blk: {
+            path_buf[0] = '/';
+            break :blk path_buf[0..1];
+        } else requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
         _ = runPersistentFsCd(st, target_path);
         return .full;
     }
@@ -1859,9 +2237,10 @@ fn executeCommand(st: *ShellState) RenderAction {
         return .full;
     }
     if (eqAsciiNoCase(parsed.head, "exec") or eqAsciiNoCase(parsed.head, "run")) {
+        const exec_args = splitCommand(parsed.tail);
         var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
-        const path = requireRootfsPath(st, parsed.tail, &path_buf) orelse return .full;
-        _ = runPersistentFsExecFile(st, path);
+        const path = requireRootfsPath(st, exec_args.head, &path_buf) orelse return .full;
+        _ = runPersistentFsExecFile(st, path, exec_args.tail);
         return .full;
     }
     if (eqAsciiNoCase(parsed.head, "block") or eqAsciiNoCase(parsed.head, "block_demo")) {
@@ -2084,6 +2463,7 @@ pub export fn _start() noreturn {
             _ = waitEvent(false, 1);
         }
     }
+    shell_process_slot_cache = getProcessSlot();
     var shell = ShellState{};
     resetRootfsPath(&shell);
     const fb_vm_token = readCfgU64(config_framebuffer_vm_token_index);
@@ -2095,7 +2475,7 @@ pub export fn _start() noreturn {
             }
         }
     } else {
-    // Map framebuffer MMIO pages granted by init in batches.
+        // Map framebuffer MMIO pages granted by init in batches.
         const fb_paddr = readCfgU64(config_framebuffer_paddr_index);
         const fb_size = readCfgU64(config_framebuffer_size_bytes_index);
         if (fb_paddr == 0 or fb_size == 0) {
@@ -2144,6 +2524,10 @@ pub export fn _start() noreturn {
         if (keyboard) |*kbd| {
             action = pumpKeyboard(kbd, &shell);
         }
+        if (pumpChildTextStreams(&shell)) {
+            action = RenderAction.merge(action, .full);
+        }
+        pumpChildArgsEnvSlots();
         switch (action) {
             .none => {},
             .prompt => renderPrompt(vfb, &shell),

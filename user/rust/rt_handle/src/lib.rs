@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
-use core::ptr::{addr_of, read_volatile};
+use core::ptr::{addr_of, copy_nonoverlapping, read_volatile, write_bytes};
 use rt_core::{SyscallError, syscall};
 
 pub mod fixed_va {
@@ -14,6 +14,9 @@ pub mod fixed_va {
     pub const STANDARD_CONFIG_TARGET_VA: u64 = aux_page_va(2);
     pub const SERVICE_REGISTRY_PAGE_VA: u64 = aux_page_va(5);
     pub const SERVICE_REGISTRY_SHADOW_VA: u64 = 0x3C2C_0000;
+    pub const STDIO_BOOTSTRAP_TARGET_VA: u64 = aux_page_va(34);
+    pub const PROCESS_EXIT_STATUS_TARGET_VA: u64 = aux_page_va(35);
+    pub const PROCESS_ARGS_ENV_TARGET_VA: u64 = aux_page_va(36);
 
     pub const fn aux_page_va(page_index: u64) -> u64 {
         AUX_BASE_VA + page_index * AUX_PAGE_BYTES
@@ -30,6 +33,47 @@ pub const MAX_BOOTSTRAP_CAP_DESCRIPTORS: usize = 8;
 pub const SERVICE_REGISTRY_MAGIC: u64 = 0x5352_5643;
 pub const SERVICE_REGISTRY_VERSION: u64 = 1;
 pub const MAX_SERVICE_ENTRIES: usize = 6;
+const STDIO_BOOTSTRAP_SOURCE_CANDIDATES: [u64; 6] = [
+    0x3F20_2000,
+    0x3F20_3000,
+    0x3F20_4000,
+    0x3F20_5000,
+    0x3F20_6000,
+    0x3F20_7000,
+];
+const INHERITED_STDIO_BOOTSTRAP_SOURCE_CANDIDATES: [u64; 6] = [
+    0x3F20_8000,
+    0x3F20_9000,
+    0x3F20_A000,
+    0x3F20_B000,
+    0x3F20_C000,
+    0x3F20_D000,
+];
+const PROCESS_EXIT_STATUS_SOURCE_CANDIDATES: [u64; 4] =
+    [0x3F20_E000, 0x3F20_F000, 0x3F21_0000, 0x3F21_1000];
+const PROCESS_ARGS_ENV_SOURCE_CANDIDATES: [u64; 4] =
+    [0x3F21_A000, 0x3F21_B000, 0x3F21_C000, 0x3F21_D000];
+const PAGE_BYTES: usize = fixed_va::AUX_PAGE_BYTES as usize;
+const STDIO_BOOTSTRAP_MAGIC: u64 = 0x5354_4449_4F53_4831;
+const STDIO_BOOTSTRAP_VERSION: u64 = 1;
+const STDIO_BOOTSTRAP_STATE_IDLE: u64 = 0;
+const STDIO_BOOTSTRAP_STREAM_KIND_LOG: u64 = 0;
+const STDIO_BOOTSTRAP_MODE_INHERIT: u64 = 0;
+const STDIO_BOOTSTRAP_MODE_KERNEL_LOG: u64 = 1;
+const STDIO_BOOTSTRAP_MODE_NULL: u64 = 2;
+const STDIO_BOOTSTRAP_MODE_MASK: u64 = 0x3;
+const STDIO_BOOTSTRAP_LOG_MODE_SHIFT: u64 = 0;
+const STDIO_BOOTSTRAP_STDOUT_MODE_SHIFT: u64 = 2;
+const STDIO_BOOTSTRAP_STDERR_MODE_SHIFT: u64 = 4;
+const PROCESS_EXIT_STATUS_MAGIC: u64 = 0x5052_5845_5449_5431;
+const PROCESS_EXIT_STATUS_VERSION: u64 = 1;
+const PROCESS_EXIT_STATUS_STATE_IDLE: u64 = 0;
+const PROCESS_ARGS_ENV_MAGIC: u64 = 0x5052_4147_4556_3131;
+const PROCESS_ARGS_ENV_VERSION: u64 = 1;
+
+static mut DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA: u64 = 0;
+static mut DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA: u64 = 0;
+static mut DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA: u64 = 0;
 
 const VM_OBJECT_TOKEN_TAG: u64 = 1 << 62;
 const EXEC_IMAGE_TOKEN_TAG: u64 = (1 << 62) | (1 << 61);
@@ -59,6 +103,245 @@ fn exec_image_result(raw: u64) -> Result<ExecImageToken, SyscallError> {
 
 fn spawned_process_result(raw: u64) -> Result<SpawnedProcess, SyscallError> {
     SpawnedProcess::from_raw(raw).ok_or_else(|| SyscallError::from_error_raw(raw))
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StdioMode {
+    Inherit,
+    KernelLog,
+    Null,
+}
+
+impl StdioMode {
+    const fn encode(self) -> u64 {
+        match self {
+            Self::Inherit => STDIO_BOOTSTRAP_MODE_INHERIT,
+            Self::KernelLog => STDIO_BOOTSTRAP_MODE_KERNEL_LOG,
+            Self::Null => STDIO_BOOTSTRAP_MODE_NULL,
+        }
+    }
+
+    const fn fallback(self) -> Self {
+        match self {
+            Self::Inherit => Self::KernelLog,
+            value => value,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct SpawnStdio {
+    pub log: StdioMode,
+    pub stdout: StdioMode,
+    pub stderr: StdioMode,
+}
+
+impl SpawnStdio {
+    pub const fn new(log: StdioMode, stdout: StdioMode, stderr: StdioMode) -> Self {
+        Self {
+            log,
+            stdout,
+            stderr,
+        }
+    }
+
+    pub const fn inherited() -> Self {
+        Self::new(StdioMode::Inherit, StdioMode::Inherit, StdioMode::Inherit)
+    }
+
+    pub const fn kernel_log() -> Self {
+        Self::new(
+            StdioMode::KernelLog,
+            StdioMode::KernelLog,
+            StdioMode::KernelLog,
+        )
+    }
+
+    pub const fn null() -> Self {
+        Self::new(StdioMode::Null, StdioMode::Null, StdioMode::Null)
+    }
+
+    pub const fn with_log(mut self, mode: StdioMode) -> Self {
+        self.log = mode;
+        self
+    }
+
+    pub const fn with_stdout(mut self, mode: StdioMode) -> Self {
+        self.stdout = mode;
+        self
+    }
+
+    pub const fn with_stderr(mut self, mode: StdioMode) -> Self {
+        self.stderr = mode;
+        self
+    }
+
+    const fn needs_inherited_sink(self) -> bool {
+        match self.log {
+            StdioMode::Inherit => true,
+            _ => match self.stdout {
+                StdioMode::Inherit => true,
+                _ => match self.stderr {
+                    StdioMode::Inherit => true,
+                    _ => false,
+                },
+            },
+        }
+    }
+
+    const fn fallback(self) -> Self {
+        Self::new(
+            self.log.fallback(),
+            self.stdout.fallback(),
+            self.stderr.fallback(),
+        )
+    }
+
+    const fn encode_flags(self) -> u64 {
+        ((self.log.encode() & STDIO_BOOTSTRAP_MODE_MASK) << STDIO_BOOTSTRAP_LOG_MODE_SHIFT)
+            | ((self.stdout.encode() & STDIO_BOOTSTRAP_MODE_MASK)
+                << STDIO_BOOTSTRAP_STDOUT_MODE_SHIFT)
+            | ((self.stderr.encode() & STDIO_BOOTSTRAP_MODE_MASK)
+                << STDIO_BOOTSTRAP_STDERR_MODE_SHIFT)
+    }
+}
+
+impl Default for SpawnStdio {
+    fn default() -> Self {
+        Self::inherited()
+    }
+}
+
+fn init_stdio_bootstrap_source_va(
+    source_va: u64,
+    stdio: SpawnStdio,
+    endpoint_id: u64,
+    shell_process_slot: u64,
+) {
+    // SAFETY: `source_va` points at a process-owned scratch page selected from
+    // fixed candidates solely for spawn bootstrap source use.
+    unsafe {
+        write_bytes(source_va as *mut u8, 0, PAGE_BYTES);
+        let words = source_va as *mut u64;
+        words.add(0).write(STDIO_BOOTSTRAP_MAGIC);
+        words.add(1).write(STDIO_BOOTSTRAP_VERSION);
+        words.add(2).write(STDIO_BOOTSTRAP_STATE_IDLE);
+        words.add(3).write(endpoint_id);
+        words.add(4).write(shell_process_slot);
+        words.add(5).write(STDIO_BOOTSTRAP_STREAM_KIND_LOG);
+        words.add(6).write(0);
+        words.add(7).write(stdio.encode_flags());
+    }
+}
+
+fn ensure_default_stdio_bootstrap_source_va(stdio: SpawnStdio) -> Result<u64, SyscallError> {
+    // SAFETY: CapabilityOS user processes are single-threaded today, so a single
+    // process-local cached source VA is sufficient here.
+    unsafe {
+        if DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA == 0 {
+            for candidate in STDIO_BOOTSTRAP_SOURCE_CANDIDATES {
+                let status = syscall::call4(syscall::ALLOC_MAP_PAGES, candidate, 1, 1, 0);
+                if status != syscall::OK {
+                    continue;
+                }
+                DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA = candidate;
+                break;
+            }
+        }
+
+        if DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA == 0 {
+            return Err(SyscallError::Alloc);
+        }
+
+        init_stdio_bootstrap_source_va(DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA, stdio, 0, 0);
+        return Ok(DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA);
+    }
+}
+
+fn map_inherited_stdio_bootstrap_source(paddr: u64) -> Result<u64, SyscallError> {
+    for candidate in INHERITED_STDIO_BOOTSTRAP_SOURCE_CANDIDATES {
+        let status = syscall::call3(syscall::MAP_PAGE, candidate, paddr, 1);
+        if status == syscall::OK {
+            return Ok(candidate);
+        }
+    }
+    Err(SyscallError::Map)
+}
+
+fn init_process_exit_status_source_va(source_va: u64) {
+    // SAFETY: `source_va` points at a process-owned scratch page selected from
+    // fixed candidates solely for exit-status bootstrap source use.
+    unsafe {
+        write_bytes(source_va as *mut u8, 0, PAGE_BYTES);
+        let words = source_va as *mut u64;
+        words.add(0).write(PROCESS_EXIT_STATUS_MAGIC);
+        words.add(1).write(PROCESS_EXIT_STATUS_VERSION);
+        words.add(2).write(PROCESS_EXIT_STATUS_STATE_IDLE);
+        words.add(3).write(0);
+    }
+}
+
+fn ensure_default_process_exit_status_source_va() -> Result<u64, SyscallError> {
+    // SAFETY: CapabilityOS user processes are single-threaded today, so a single
+    // process-local cached source VA is sufficient here.
+    unsafe {
+        if DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA == 0 {
+            for candidate in PROCESS_EXIT_STATUS_SOURCE_CANDIDATES {
+                let status = syscall::call4(syscall::ALLOC_MAP_PAGES, candidate, 1, 1, 0);
+                if status != syscall::OK {
+                    continue;
+                }
+                DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA = candidate;
+                break;
+            }
+        }
+
+        if DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA == 0 {
+            return Err(SyscallError::Alloc);
+        }
+
+        init_process_exit_status_source_va(DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA);
+        Ok(DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA)
+    }
+}
+
+fn init_process_args_env_source_va(source_va: u64) {
+    // SAFETY: `source_va` points at a process-owned scratch page selected from
+    // fixed candidates solely for args/env bootstrap source use.
+    unsafe {
+        write_bytes(source_va as *mut u8, 0, PAGE_BYTES);
+        let words = source_va as *mut u64;
+        words.add(0).write(PROCESS_ARGS_ENV_MAGIC);
+        words.add(1).write(PROCESS_ARGS_ENV_VERSION);
+        words.add(2).write(0);
+        words.add(3).write(0);
+        words.add(4).write(0);
+        words.add(5).write(0);
+    }
+}
+
+fn ensure_default_process_args_env_source_va() -> Result<u64, SyscallError> {
+    // SAFETY: CapabilityOS user processes are single-threaded today, so a single
+    // process-local cached source VA is sufficient here.
+    unsafe {
+        if DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA == 0 {
+            for candidate in PROCESS_ARGS_ENV_SOURCE_CANDIDATES {
+                let status = syscall::call4(syscall::ALLOC_MAP_PAGES, candidate, 1, 1, 0);
+                if status != syscall::OK {
+                    continue;
+                }
+                DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA = candidate;
+                break;
+            }
+        }
+
+        if DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA == 0 {
+            return Err(SyscallError::Alloc);
+        }
+
+        init_process_args_env_source_va(DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA);
+        Ok(DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA)
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -405,6 +688,21 @@ impl BootstrapBuilder {
     pub fn table(&self) -> &BootstrapDescriptorTable {
         self.table_ref()
     }
+
+    fn has_page_target(&self, target_va: u64) -> bool {
+        let table = self.table_ref();
+        let count = table.page_count as usize;
+        table.page_descriptors[..count]
+            .iter()
+            .any(|descriptor| descriptor.target_va == target_va)
+    }
+
+    fn copy_from(&mut self, other: &BootstrapBuilder) {
+        // SAFETY: Both tables are valid, non-overlapping descriptor tables.
+        unsafe {
+            copy_nonoverlapping(other.table(), self.table_mut(), 1);
+        }
+    }
 }
 
 impl Default for BootstrapBuilder {
@@ -417,6 +715,7 @@ pub struct SpawnBuilder {
     exec: ExecImageToken,
     bootstrap: BootstrapBuilder,
     child_bootstrap_owner: bool,
+    stdio: SpawnStdio,
 }
 
 impl SpawnBuilder {
@@ -425,6 +724,7 @@ impl SpawnBuilder {
             exec,
             bootstrap: BootstrapBuilder::new(),
             child_bootstrap_owner: false,
+            stdio: SpawnStdio::default(),
         }
     }
 
@@ -468,10 +768,125 @@ impl SpawnBuilder {
         self
     }
 
+    pub const fn stdio(&self) -> SpawnStdio {
+        self.stdio
+    }
+
+    pub fn set_stdio(&mut self, stdio: SpawnStdio) {
+        self.stdio = stdio;
+    }
+
+    pub fn with_stdio(mut self, stdio: SpawnStdio) -> Self {
+        self.stdio = stdio;
+        self
+    }
+
+    pub fn set_log_mode(&mut self, mode: StdioMode) {
+        self.stdio.log = mode;
+    }
+
+    pub fn with_log_mode(mut self, mode: StdioMode) -> Self {
+        self.stdio.log = mode;
+        self
+    }
+
+    pub fn set_stdout_mode(&mut self, mode: StdioMode) {
+        self.stdio.stdout = mode;
+    }
+
+    pub fn with_stdout_mode(mut self, mode: StdioMode) -> Self {
+        self.stdio.stdout = mode;
+        self
+    }
+
+    pub fn set_stderr_mode(&mut self, mode: StdioMode) {
+        self.stdio.stderr = mode;
+    }
+
+    pub fn with_stderr_mode(mut self, mode: StdioMode) -> Self {
+        self.stdio.stderr = mode;
+        self
+    }
+
     pub fn spawn(&self) -> Result<SpawnedProcess, SyscallError> {
         let mut flags = 0;
         let mut bootstrap_source_va = 0;
-        if !self.bootstrap.is_empty() {
+        let needs_default_stdio = !self
+            .bootstrap
+            .has_page_target(fixed_va::STDIO_BOOTSTRAP_TARGET_VA);
+        let needs_default_exit_status = !self
+            .bootstrap
+            .has_page_target(fixed_va::PROCESS_EXIT_STATUS_TARGET_VA);
+        let needs_default_args_env = !self
+            .bootstrap
+            .has_page_target(fixed_va::PROCESS_ARGS_ENV_TARGET_VA);
+        let mut owned_bootstrap = None;
+        let mut inherited_stdio_paddr = None;
+
+        if needs_default_stdio || needs_default_exit_status || needs_default_args_env {
+            let mut bootstrap = BootstrapBuilder::new();
+            bootstrap.copy_from(&self.bootstrap);
+            if needs_default_stdio {
+                if self.stdio.needs_inherited_sink() {
+                    if let Some(inherited_paddr) = rt_core::request_inherited_stdio_page()? {
+                        let source_va = map_inherited_stdio_bootstrap_source(inherited_paddr)?;
+                        // SAFETY: The mapped page is a freshly shared shell-owned stdio
+                        // bootstrap page at a process-local scratch VA.
+                        let (endpoint_id, shell_process_slot) = unsafe {
+                            let words = source_va as *const u64;
+                            (read_volatile(words.add(3)), read_volatile(words.add(4)))
+                        };
+                        init_stdio_bootstrap_source_va(
+                            source_va,
+                            self.stdio,
+                            endpoint_id,
+                            shell_process_slot,
+                        );
+                        bootstrap
+                            .push_page(
+                                source_va,
+                                fixed_va::STDIO_BOOTSTRAP_TARGET_VA,
+                                SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE,
+                            )
+                            .map_err(|_| SyscallError::Invalid)?;
+                        inherited_stdio_paddr = Some(inherited_paddr);
+                    } else {
+                        let source_va =
+                            ensure_default_stdio_bootstrap_source_va(self.stdio.fallback())?;
+                        bootstrap
+                            .push_page(source_va, fixed_va::STDIO_BOOTSTRAP_TARGET_VA, 0)
+                            .map_err(|_| SyscallError::Invalid)?;
+                    }
+                } else {
+                    let source_va = ensure_default_stdio_bootstrap_source_va(self.stdio)?;
+                    bootstrap
+                        .push_page(source_va, fixed_va::STDIO_BOOTSTRAP_TARGET_VA, 0)
+                        .map_err(|_| SyscallError::Invalid)?;
+                }
+            }
+            if needs_default_exit_status {
+                let source_va = ensure_default_process_exit_status_source_va()?;
+                bootstrap
+                    .push_page(
+                        source_va,
+                        fixed_va::PROCESS_EXIT_STATUS_TARGET_VA,
+                        SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE,
+                    )
+                    .map_err(|_| SyscallError::Invalid)?;
+            }
+            if needs_default_args_env {
+                let source_va = ensure_default_process_args_env_source_va()?;
+                bootstrap
+                    .push_page(source_va, fixed_va::PROCESS_ARGS_ENV_TARGET_VA, 0)
+                    .map_err(|_| SyscallError::Invalid)?;
+            }
+            owned_bootstrap = Some(bootstrap);
+        }
+
+        if let Some(bootstrap) = owned_bootstrap.as_ref() {
+            bootstrap_source_va = bootstrap.table() as *const BootstrapDescriptorTable as u64;
+            flags |= SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE;
+        } else if !self.bootstrap.is_empty() {
             bootstrap_source_va = self.bootstrap.table() as *const BootstrapDescriptorTable as u64;
             flags |= SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE;
         }
@@ -479,13 +894,17 @@ impl SpawnBuilder {
             flags |= SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER;
         }
 
-        spawned_process_result(syscall::call4(
+        let spawned = spawned_process_result(syscall::call4(
             syscall::SPAWN_EXEC,
             self.exec.raw(),
             bootstrap_source_va,
             0,
             flags,
-        ))
+        ))?;
+        if let Some(inherited_paddr) = inherited_stdio_paddr {
+            let _ = rt_core::bind_inherited_stdio_page(inherited_paddr, spawned.process_slot());
+        }
+        Ok(spawned)
     }
 }
 

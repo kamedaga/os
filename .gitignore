@@ -6,6 +6,7 @@ kernel/zig-out/
 .zig-cache-local/
 .zig-global-cache/
 .cargo/
+tools/wasmtime_artifact_builder/target
 *.pdb
 *.o
 *.obj

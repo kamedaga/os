@@ -1,0 +1,16 @@
+[package]
+name = "rt_wasmtime_platform"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+custom-native-signals = []
+custom-sync-primitives = []
+custom-virtual-memory = []
+
+[dependencies]
+rt_core = { path = "../rt_core" }

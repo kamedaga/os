@@ -44,6 +44,7 @@ const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
 const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
+const syscall_process_exit: u64 = process_abi.syscall_process_exit;
 const syscall_install_mmio_cap: u64 = 0x2F;
 const syscall_install_caps_batch: u64 = 0x32;
 const syscall_publish_service_endpoint: u64 = 0x33;
@@ -93,6 +94,7 @@ pub const Hooks = struct {
     log_queue_cap_deny: *const fn (kernel.PrincipalId, u64, u16, kernel.QueueOperation, anyerror) void,
     log_race_send_cap: *const fn (kernel.PrincipalId, ?kernel.PrincipalId, u64, u64, []const u8) void,
     log_race_switch: *const fn (usize, usize, []const u8) void,
+    exit_current_process: *const fn (kernel.PrincipalId, u8, *TrapFrame) void,
 };
 
 var hooks: ?Hooks = null;
@@ -522,6 +524,10 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             else
                 .inactive;
             return process_abi.encodeProcessStatus(kind, status.fault_vector);
+        },
+        syscall_process_exit => {
+            h.exit_current_process(proc, @truncate(frame.rdi), frame);
+            return syscall_ok;
         },
         syscall_register_iommu_driver => {
             return syscall_ok;

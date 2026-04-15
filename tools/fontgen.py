@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 DEFAULT_TTF = Path("tools/Cantarell-Regular.ttf")
-DEFAULT_OUTPUT = Path("kernel/user_programs/generated_font.zig")
+DEFAULT_OUTPUT = Path("userland/support/generated_font.zig")
 DEFAULT_FIRST = 0x20
 DEFAULT_LAST = 0x7E
 
@@ -72,7 +72,7 @@ def rasterize_glyphs(
         height_hi = max(0, bottom - top)
         advance_lo = math.ceil(font.getlength(ch) / supersample)
         bearing_x_lo = math.floor(left / supersample)
-        top_offset_lo = max(0, math.floor((top + ascent_hi) / supersample))
+        line_bottom_lo = max(0, min(line_height_lo, math.ceil((bottom + ascent_hi) / supersample)))
 
         if width_hi == 0 or height_hi == 0:
             glyphs.append(
@@ -80,7 +80,7 @@ def rasterize_glyphs(
                     "codepoint": codepoint,
                     "advance": advance_lo,
                     "bearing_x": bearing_x_lo,
-                    "top_offset": top_offset_lo,
+                    "top_offset": line_bottom_lo,
                     "width": 0,
                     "height": 0,
                     "mask": [],
@@ -101,7 +101,7 @@ def rasterize_glyphs(
                     "codepoint": codepoint,
                     "advance": advance_lo,
                     "bearing_x": bearing_x_lo,
-                    "top_offset": top_offset_lo,
+                    "top_offset": line_bottom_lo,
                     "width": 0,
                     "height": 0,
                     "mask": [],
@@ -116,7 +116,9 @@ def rasterize_glyphs(
                 "codepoint": codepoint,
                 "advance": advance_lo,
                 "bearing_x": bearing_x_lo + crop_left,
-                "top_offset": min(line_height_lo, top_offset_lo + crop_top),
+                # Keep glyph bottoms stable across codepoints by deriving the
+                # final top from the line-relative bottom after crop.
+                "top_offset": max(0, min(line_height_lo, line_bottom_lo - (crop_bottom - crop_top))),
                 "width": crop_right - crop_left,
                 "height": crop_bottom - crop_top,
                 "mask": list(glyph.tobytes()),

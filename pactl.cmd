@@ -2,7 +2,7 @@
 setlocal
 
 set "ROOT=%~dp0"
-set "CARGO_TARGET_DIR=%ROOT%.artifacts\pactl-target"
+set "CARGO_TARGET_DIR=%ROOT%.artifacts\pactl-target-v2"
 set "MANIFEST_PATH=%ROOT%tools\pactl\Cargo.toml"
 set "PACTL_EXE=%CARGO_TARGET_DIR%\debug\pactl.exe"
 set "BUILD_NEEDED=0"

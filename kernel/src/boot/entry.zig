@@ -444,8 +444,61 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
 }
 
+fn teardownExitedProcess(principal: kernel.PrincipalId) void {
+    const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
+    const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
+
+    if (scheduler.runtime_priority_principal) |priority_principal| {
+        if (priority_principal == principal) scheduler.setRuntimePriorityPrincipal(null);
+    }
+
+    if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
+        _ = scheduler.releaseThreadSlot(thread_index);
+    }
+
+    user_spaces[process_index] = .{};
+    kernel_state_global.cap_tables[process_index] = .{};
+    kernel_state_global.untyped_tables[process_index] = .{};
+    kernel_state_global.endpoint_tables[process_index] = .{};
+    kernel_state_global.cap_mailboxes[process_index] = .{};
+    kernel_state_global.pending_page_transfers[process_index] = null;
+    kernel_state_global.vm_object_tables[process_index] = .{};
+    kernel_state_global.exec_image_tables[process_index] = .{};
+    _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
+
+    var storage_index: usize = 0;
+    while (storage_index < kernel.principal_count) : (storage_index += 1) {
+        var wake_owner = false;
+        if (storage_index < kernel.process_count) {
+            wake_owner = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+        }
+        if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
+            wake_owner = true;
+        }
+        if (kernel_state_global.pending_page_transfers[storage_index]) |pending| {
+            if (pending.sender == principal) {
+                kernel_state_global.pending_page_transfers[storage_index] = null;
+                wake_owner = true;
+            }
+        }
+        if (!wake_owner) continue;
+        if (storage_index >= kernel.process_count) continue;
+        const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
+        scheduler.wakeBlockedThreadForPrincipal(owner);
+    }
+
+    _ = kernel_state_global.markProcessExited(principal);
+    if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
+}
+
 fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) void {
     teardownFaultedProcess(principal, fault_vector);
+    loadRunnableThreadOrIdle(out_frame);
+}
+
+fn exitCurrentProcess(principal: kernel.PrincipalId, exit_code: u8, out_frame: *TrapFrame) void {
+    _ = exit_code;
+    teardownExitedProcess(principal);
     loadRunnableThreadOrIdle(out_frame);
 }
 
@@ -712,6 +765,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState) void {
         .log_queue_cap_deny = logQueueCapDeny,
         .log_race_send_cap = logSchedulerRaceSendCap,
         .log_race_switch = logSchedulerRaceSwitch,
+        .exit_current_process = exitCurrentProcess,
     });
 
     traps.init(.{

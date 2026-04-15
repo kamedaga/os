@@ -11,10 +11,13 @@ const manager_init_bootstrap_abi = @import("support_root").manager_init_bootstra
 const block_bootstrap = @import("support_root").block_bootstrap_abi;
 const persistent_fs_bootstrap = @import("support_root").persistent_fs_bootstrap_abi;
 const process_abi = @import("support_root").process_abi;
+const process_args_env_bootstrap_abi = @import("support_root").process_args_env_bootstrap_abi;
+const process_exit_bootstrap_abi = @import("support_root").process_exit_bootstrap_abi;
 const service_registry_abi = @import("support_root").service_registry_abi;
+const stdio_bootstrap_abi = @import("support_root").stdio_bootstrap_abi;
 const rootfs_core = @import("support_root").rootfs_core;
 
-const syscall_log: u64 = 0x9; 
+const syscall_log: u64 = 0x9;
 const syscall_map_page: u64 = 0x2;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_wait_event: u64 = 0x17;
@@ -1048,10 +1051,10 @@ fn allocChildServiceRegistryPage(
 }
 
 const LaunchContext = struct {
-const QueueGrant = struct {
-    submit_token: u64,
-    notify_token: u64,
-};
+    const QueueGrant = struct {
+        submit_token: u64,
+        notify_token: u64,
+    };
 
     has_boot_display: bool = false,
     bootfs_ready: bool = false,
@@ -1063,6 +1066,9 @@ const QueueGrant = struct {
     window_service_page: init_bootstrap_abi.SpawnPageDescriptor,
     window_service: ?service_registry_abi.ServiceEntry = null,
     shared_service_registry_source_va: ?u64 = null,
+    shared_stdio_bootstrap_source_va: ?u64 = null,
+    shared_process_args_env_bootstrap_source_va: ?u64 = null,
+    shared_process_exit_bootstrap_source_va: ?u64 = null,
     block_process_slot: ?u64 = null,
     block_endpoint_id: ?u64 = null,
     persistent_fs_process_slot: ?u64 = null,
@@ -1233,6 +1239,30 @@ const QueueGrant = struct {
         return source_va;
     }
 
+    fn ensureSharedStdioBootstrapPage(self: *LaunchContext) u64 {
+        if (self.shared_stdio_bootstrap_source_va) |source_va| return source_va;
+        const source_va = self.allocWritableBootstrapPage("ManagerInit: alloc stdio bootstrap page failed\n");
+        stdio_bootstrap_abi.initZeroPage(source_va);
+        self.shared_stdio_bootstrap_source_va = source_va;
+        return source_va;
+    }
+
+    fn ensureSharedProcessArgsEnvPage(self: *LaunchContext) u64 {
+        if (self.shared_process_args_env_bootstrap_source_va) |source_va| return source_va;
+        const source_va = self.allocWritableBootstrapPage("ManagerInit: alloc process args env bootstrap page failed\n");
+        process_args_env_bootstrap_abi.initZeroPage(source_va);
+        self.shared_process_args_env_bootstrap_source_va = source_va;
+        return source_va;
+    }
+
+    fn ensureSharedProcessExitStatusPage(self: *LaunchContext) u64 {
+        if (self.shared_process_exit_bootstrap_source_va) |source_va| return source_va;
+        const source_va = self.allocWritableBootstrapPage("ManagerInit: alloc process exit bootstrap page failed\n");
+        process_exit_bootstrap_abi.initZeroPage(source_va);
+        self.shared_process_exit_bootstrap_source_va = source_va;
+        return source_va;
+    }
+
     fn grantInputResources(self: *LaunchContext, config_source_va: u64, descriptor: init_bootstrap_abi.DeviceDescriptor, child_process_slot: u64) bool {
         const queue_grant = self.findQueueGrant(descriptor) orelse return false;
         if (!ensureDeviceMmioCapsInstalled(descriptor)) return false;
@@ -1258,6 +1288,9 @@ const QueueGrant = struct {
         const fb_vm_token = self.bootstrap_handoff.framebuffer_vm_token;
         if (image_abi.decodeVmObjectToken(fb_vm_token) == null) fail("ManagerInit: framebuffer vm object missing\n");
         const registry_source_va = self.ensureSharedServiceRegistryPage();
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
 
         const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc shell config page failed\n");
         input_bootstrap.writeKeyboardConfigPage(config_source_va, .{
@@ -1277,7 +1310,7 @@ const QueueGrant = struct {
         config_words[init_bootstrap_abi.boot_display_config_fb_vm_token_index] = fb_vm_token;
 
         boot_display_bootstrap_table_storage = .{};
-        boot_display_bootstrap_table_storage.page_count = 2;
+        boot_display_bootstrap_table_storage.page_count = 5;
         boot_display_bootstrap_table_storage.cap_count = 1;
         boot_display_bootstrap_table_storage.page_descriptors[0] = .{
             .source_va = config_source_va,
@@ -1288,6 +1321,21 @@ const QueueGrant = struct {
             .source_va = registry_source_va,
             .target_va = process_abi.service_registry_shadow_va,
             .flags = 0,
+        };
+        boot_display_bootstrap_table_storage.page_descriptors[2] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        boot_display_bootstrap_table_storage.page_descriptors[3] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        boot_display_bootstrap_table_storage.page_descriptors[4] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
         };
         boot_display_bootstrap_table_storage.cap_descriptors[0] = .{
             .source_token = fb_vm_token,
@@ -1373,6 +1421,9 @@ const QueueGrant = struct {
         const block_geometry = readBlockGeometry(block_desc) orelse fail("ManagerInit: block geometry failed\n");
         const endpoint_id = allocDynamicServiceEndpointId();
         const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc block driver config page failed\n");
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
         block_bootstrap.writeConfigPage(config_source_va, .{
             .endpoint_id = endpoint_id,
             .common_page_paddr = block_desc.common_page_paddr,
@@ -1392,9 +1443,27 @@ const QueueGrant = struct {
             .target_va = process_abi.standard_config_target_va,
             .flags = process_abi.spawn_flag_bootstrap_page_writable,
         };
+        block_bootstrap_pages_storage[1] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        block_bootstrap_pages_storage[2] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        block_bootstrap_pages_storage[3] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
         block_bootstrap_table_storage = .{};
-        block_bootstrap_table_storage.page_count = 1;
+        block_bootstrap_table_storage.page_count = 4;
         block_bootstrap_table_storage.page_descriptors[0] = block_bootstrap_pages_storage[0];
+        block_bootstrap_table_storage.page_descriptors[1] = block_bootstrap_pages_storage[1];
+        block_bootstrap_table_storage.page_descriptors[2] = block_bootstrap_pages_storage[2];
+        block_bootstrap_table_storage.page_descriptors[3] = block_bootstrap_pages_storage[3];
 
         const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &block_bootstrap_table_storage);
         const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
@@ -1431,6 +1500,9 @@ const QueueGrant = struct {
             self.persistent_fs_endpoint_id,
         ) orelse fail("ManagerInit: alloc persistent fs registry failed\n");
         const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc persistent fs config page failed\n");
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
         persistent_fs_bootstrap.writeConfigPage(config_source_va, endpoint_id, persistent_fs_start_block);
 
         persistent_fs_bootstrap_pages_storage[0] = .{
@@ -1443,10 +1515,28 @@ const QueueGrant = struct {
             .target_va = self.window_service_page.target_va,
             .flags = self.window_service_page.spawn_flags,
         };
+        persistent_fs_bootstrap_pages_storage[2] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        persistent_fs_bootstrap_pages_storage[3] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        persistent_fs_bootstrap_pages_storage[4] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
         persistent_fs_bootstrap_table_storage = .{};
-        persistent_fs_bootstrap_table_storage.page_count = 2;
+        persistent_fs_bootstrap_table_storage.page_count = 5;
         persistent_fs_bootstrap_table_storage.page_descriptors[0] = persistent_fs_bootstrap_pages_storage[0];
         persistent_fs_bootstrap_table_storage.page_descriptors[1] = persistent_fs_bootstrap_pages_storage[1];
+        persistent_fs_bootstrap_table_storage.page_descriptors[2] = persistent_fs_bootstrap_pages_storage[2];
+        persistent_fs_bootstrap_table_storage.page_descriptors[3] = persistent_fs_bootstrap_pages_storage[3];
+        persistent_fs_bootstrap_table_storage.page_descriptors[4] = persistent_fs_bootstrap_pages_storage[4];
 
         const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &persistent_fs_bootstrap_table_storage);
         const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
@@ -1531,11 +1621,19 @@ fn managerMain() noreturn {
         .has_boot_display = window_service != null,
     };
     launch_ctx_storage.ensureBootFsArchive();
-    const startup_manifest = loadStartupManifestFromBootFs(rootfs_startup_manifest_path) orelse blk: {
+    var startup_manifest_from_rootfs = false;
+    const startup_manifest = blk: {
         launch_ctx_storage.ensureRootFsReader();
-        break :blk loadStartupManifestFromRootFs(rootfs_startup_manifest_path) orelse fail("ManagerInit: load rootfs startup manifest failed\n");
+        if (loadStartupManifestFromRootFs(rootfs_startup_manifest_path)) |manifest| {
+            startup_manifest_from_rootfs = true;
+            break :blk manifest;
+        }
+        break :blk loadStartupManifestFromBootFs(rootfs_startup_manifest_path) orelse fail("ManagerInit: load startup manifest failed\n");
     };
-    _ = userLog("ManagerInit: rootfs startup manifest ready\n");
+    _ = userLog(if (startup_manifest_from_rootfs)
+        "ManagerInit: rootfs startup manifest ready\n"
+    else
+        "ManagerInit: bootfs startup manifest ready\n");
     if (!launch_ctx_storage.has_boot_display) {
         _ = launch_ctx_storage.requireShellExec();
     }

@@ -41,24 +41,117 @@ fn normalizedScale(scale: i32) i32 {
     return if (scale <= 0) 1 else scale;
 }
 
+const ScaleRatio = struct {
+    num: i64,
+    den: i64,
+};
+
+fn normalizedScaleRatio(scale_num: i32, scale_den: i32) ScaleRatio {
+    const den: i64 = if (scale_den <= 0) 1 else scale_den;
+    const num: i64 = if (scale_num <= 0) den else scale_num;
+    return .{ .num = num, .den = den };
+}
+
+fn divFloorI64(numer: i64, denom: i64) i64 {
+    var q = @divTrunc(numer, denom);
+    const r = @rem(numer, denom);
+    if (r != 0 and ((r < 0) != (denom < 0))) q -= 1;
+    return q;
+}
+
+fn divCeilI64(numer: i64, denom: i64) i64 {
+    var q = @divTrunc(numer, denom);
+    const r = @rem(numer, denom);
+    if (r != 0 and ((r < 0) == (denom < 0))) q += 1;
+    return q;
+}
+
+fn scalePositiveCeil(value: usize, scale: ScaleRatio) usize {
+    if (value == 0) return 0;
+    const scaled = divCeilI64(@as(i64, @intCast(value)) * scale.num, scale.den);
+    const out: usize = @intCast(scaled);
+    return if (out == 0) 1 else out;
+}
+
+fn scaleSignedFloor(value: i32, scale: ScaleRatio) i32 {
+    return @intCast(divFloorI64(@as(i64, value) * scale.num, scale.den));
+}
+
+fn scaleSignedCeil(value: i32, scale: ScaleRatio) i32 {
+    return @intCast(divCeilI64(@as(i64, value) * scale.num, scale.den));
+}
+
+const ScaledGlyph = struct {
+    advance: i32,
+    bearing_x: i32,
+    top_offset: i32,
+    width: usize,
+    height: usize,
+};
+
+fn scaledGlyph(g: Glyph, scale: ScaleRatio) ScaledGlyph {
+    const advance = scaleSignedCeil(g.advance, scale);
+    if (g.width == 0 or g.height == 0) {
+        return .{
+            .advance = advance,
+            .bearing_x = scaleSignedFloor(g.bearing_x, scale),
+            .top_offset = scaleSignedFloor(g.top_offset, scale),
+            .width = 0,
+            .height = 0,
+        };
+    }
+
+    const width = scalePositiveCeil(g.width, scale);
+    const right = scaleSignedCeil(g.bearing_x + @as(i32, @intCast(g.width)), scale);
+    const height = scalePositiveCeil(g.height, scale);
+    const bottom = scaleSignedCeil(g.top_offset + @as(i32, @intCast(g.height)), scale);
+    return .{
+        .advance = advance,
+        .bearing_x = right - @as(i32, @intCast(width)),
+        .top_offset = bottom - @as(i32, @intCast(height)),
+        .width = width,
+        .height = height,
+    };
+}
+
 pub fn scaledGlyphWidth(scale: i32) i32 {
     return @as(i32, @intCast(glyph_width)) * normalizedScale(scale);
+}
+
+pub fn scaledGlyphWidthRatio(scale_num: i32, scale_den: i32) i32 {
+    return @intCast(scalePositiveCeil(glyph_width, normalizedScaleRatio(scale_num, scale_den)));
 }
 
 pub fn scaledGlyphHeight(scale: i32) i32 {
     return @as(i32, @intCast(glyph_height)) * normalizedScale(scale);
 }
 
+pub fn scaledGlyphHeightRatio(scale_num: i32, scale_den: i32) i32 {
+    return @intCast(scalePositiveCeil(glyph_height, normalizedScaleRatio(scale_num, scale_den)));
+}
+
 pub fn scaledAdvance(scale: i32) i32 {
     return @as(i32, @intCast(glyph_advance)) * normalizedScale(scale);
+}
+
+pub fn scaledAdvanceRatio(scale_num: i32, scale_den: i32) i32 {
+    return @intCast(scalePositiveCeil(glyph_advance, normalizedScaleRatio(scale_num, scale_den)));
 }
 
 pub fn lineHeight(scale: i32) i32 {
     return @as(i32, @intCast(generated.line_height)) * normalizedScale(scale);
 }
 
+pub fn lineHeightRatio(scale_num: i32, scale_den: i32) i32 {
+    return @intCast(scalePositiveCeil(generated.line_height, normalizedScaleRatio(scale_num, scale_den)));
+}
+
 pub fn consoleAdvance(scale: i32) i32 {
     return @as(i32, @intCast(generated.console_advance)) * normalizedScale(scale);
+}
+
+pub fn consoleAdvanceRatio(scale_num: i32, scale_den: i32) i32 {
+    return @intCast(scalePositiveCeil(generated.console_advance, normalizedScaleRatio(scale_num, scale_den)));
 }
 
 pub fn blendColor(dst: u32, src: u32, alpha: u8) u32 {
@@ -210,6 +303,10 @@ pub fn glyphAdvance(codepoint: u21, scale: i32) i32 {
     return glyph(codepoint).advance * normalizedScale(scale);
 }
 
+pub fn glyphAdvanceRatio(codepoint: u21, scale_num: i32, scale_den: i32) i32 {
+    return scaledGlyph(glyph(codepoint), normalizedScaleRatio(scale_num, scale_den)).advance;
+}
+
 pub fn drawGlyph(
     comptime Context: type,
     comptime blendPixel: fn (ctx: Context, x: i32, y: i32, color: u32, alpha: u8) void,
@@ -240,6 +337,37 @@ pub fn drawGlyph(
                     blendPixel(ctx, col_x + sx, row_y + sy, color, alpha);
                 }
             }
+        }
+    }
+}
+
+pub fn drawGlyphRatio(
+    comptime Context: type,
+    comptime blendPixel: fn (ctx: Context, x: i32, y: i32, color: u32, alpha: u8) void,
+    ctx: Context,
+    x: i32,
+    y: i32,
+    codepoint: u21,
+    color: u32,
+    scale_num: i32,
+    scale_den: i32,
+) void {
+    const scale = normalizedScaleRatio(scale_num, scale_den);
+    const g = glyph(codepoint);
+    const scaled = scaledGlyph(g, scale);
+    if (scaled.width == 0 or scaled.height == 0) return;
+
+    var gy: usize = 0;
+    while (gy < scaled.height) : (gy += 1) {
+        const src_y: usize = @intCast(@divTrunc(@as(i64, @intCast(gy)) * scale.den, scale.num));
+        const row_y = y + scaled.top_offset + @as(i32, @intCast(gy));
+        var gx: usize = 0;
+        while (gx < scaled.width) : (gx += 1) {
+            const src_x: usize = @intCast(@divTrunc(@as(i64, @intCast(gx)) * scale.den, scale.num));
+            const alpha = glyphMaskByte(g.mask_offset + src_y * g.width + src_x);
+            if (alpha == 0) continue;
+            const col_x = x + scaled.bearing_x + @as(i32, @intCast(gx));
+            blendPixel(ctx, col_x, row_y, color, alpha);
         }
     }
 }
@@ -303,6 +431,28 @@ pub fn drawAsciiTextClipped(
         const advance = glyphAdvance(ch, scale);
         if (pen_x + advance > max_x) break;
         drawGlyph(Context, blendPixel, ctx, pen_x, y, ch, color, scale);
+        pen_x += advance;
+    }
+}
+
+pub fn drawAsciiTextClippedRatio(
+    comptime Context: type,
+    comptime blendPixel: fn (ctx: Context, x: i32, y: i32, color: u32, alpha: u8) void,
+    ctx: Context,
+    x: i32,
+    y: i32,
+    text: []const u8,
+    color: u32,
+    scale_num: i32,
+    scale_den: i32,
+    max_x: i32,
+) void {
+    var pen_x = x;
+
+    for (text) |ch| {
+        const advance = glyphAdvanceRatio(ch, scale_num, scale_den);
+        if (pen_x + advance > max_x) break;
+        drawGlyphRatio(Context, blendPixel, ctx, pen_x, y, ch, color, scale_num, scale_den);
         pen_x += advance;
     }
 }

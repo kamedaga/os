@@ -1080,6 +1080,17 @@ pub const KernelState = struct {
         return true;
     }
 
+    pub fn markProcessExited(self: *KernelState, principal: PrincipalId) bool {
+        const index = processIndexFromPrincipal(principal) orelse return false;
+        if (!self.process_descriptors[index].active) return false;
+        self.process_descriptors[index].active = false;
+        self.process_descriptors[index].bootstrap_owner = false;
+        self.process_descriptors[index].faulted = false;
+        self.process_descriptors[index].fault_vector = 0;
+        if (self.active_process_count > 0) self.active_process_count -= 1;
+        return true;
+    }
+
     pub fn removeProcessDescriptor(self: *KernelState, principal: PrincipalId) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;

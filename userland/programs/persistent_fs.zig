@@ -28,10 +28,10 @@ const max_block_bytes: usize = 4096;
 const max_dir_entries: usize = layout.max_dir_entries;
 const max_name_bytes: usize = layout.max_name_bytes;
 const max_path_bytes: usize = fs_protocol.max_path_bytes;
-const max_exec_file_bytes: usize = 256 * 1024;
-const max_exec_slots: usize = 16;
+const max_exec_file_bytes: usize = 768 * 1024;
+const max_exec_slots: usize = 64;
 const page_bytes: usize = 4096;
-const exec_slot_base_va: u64 = 0x3C20_0000;
+const exec_slot_base_va: u64 = 0x3D00_0000;
 const exec_slot_va_stride: u64 = max_exec_file_bytes;
 const block_connect_poll_limit: u64 = 65536;
 const root_mount_object_id: u64 = 0x5053_4653; // "PSFS"
@@ -74,11 +74,13 @@ const ExecImageSlot = struct {
     active: bool = false,
     page_count: u16 = 0,
     file_index: u16 = 0,
-    _reserved: u32 = 0,
+    file_generation: u32 = 0,
+    server_exec_token: u64 = 0,
 };
 
 comptime {
     std.debug.assert(max_exec_file_bytes % page_bytes == 0);
+    std.debug.assert(exec_slot_base_va + (max_exec_slots * exec_slot_va_stride) <= 0x4000_0000);
 }
 
 const fs_token_tag: u64 = 1 << 63;
@@ -99,6 +101,7 @@ var block_state: block_client.Client = undefined;
 var block_ready = false;
 var volume_superblock = VolumeSuperblock{};
 var volume_dir_entries: [max_dir_entries]VolumeDirEntry = [_]VolumeDirEntry{.{}} ** max_dir_entries;
+var file_generations: [max_dir_entries]u32 = [_]u32{0} ** max_dir_entries;
 var sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions;
 var block_buffer: [max_block_bytes]u8 align(16) = [_]u8{0} ** max_block_bytes;
 var io_buffer: [max_block_bytes]u8 align(16) = [_]u8{0} ** max_block_bytes;
@@ -617,6 +620,7 @@ fn allocDirEntry(parent_index: ?usize, name: []const u8, is_directory: bool) ?us
     for (&volume_dir_entries, 0..) |*entry, index| {
         if (dirEntryUsed(entry)) continue;
         entry.* = .{};
+        bumpFileGeneration(index);
         entry.flags = layout.dir_entry_flag_used;
         layout.setDirEntryName(entry, name);
         layout.setDirEntryParentIndex(entry, parent_index);
@@ -803,6 +807,15 @@ fn entryBusy(entry_index: usize) bool {
     return false;
 }
 
+fn fileGeneration(entry_index: usize) u32 {
+    return file_generations[entry_index];
+}
+
+fn bumpFileGeneration(entry_index: usize) void {
+    file_generations[entry_index] +%= 1;
+    if (file_generations[entry_index] == 0) file_generations[entry_index] = 1;
+}
+
 fn entryHasChildren(entry_index: usize) bool {
     for (&volume_dir_entries) |*entry| {
         if (!dirEntryUsed(entry)) continue;
@@ -894,6 +907,16 @@ fn grantExecToken(session: *Session, file_index: usize, entry: *const VolumeDirE
     const file_bytes: usize = @intCast(entry.file_size);
     if (file_bytes == 0 or file_bytes > max_exec_file_bytes) return null;
     const needed_pages = (file_bytes + page_bytes - 1) / page_bytes;
+    const generation = fileGeneration(file_index);
+
+    for (&exec_slots) |*slot| {
+        if (!slot.active) continue;
+        if (slot.file_index != @as(u16, @intCast(file_index))) continue;
+        if (slot.file_generation != generation) continue;
+        const client_token = grantExecImage(slot.server_exec_token, session.client_process_slot, .{ .exec = true });
+        if (image_abi.decodeExecImageToken(client_token) == null) return null;
+        return client_token;
+    }
 
     var slot_index: usize = 0;
     while (slot_index < max_exec_slots) : (slot_index += 1) {
@@ -919,6 +942,8 @@ fn grantExecToken(session: *Session, file_index: usize, entry: *const VolumeDirE
             .active = true,
             .page_count = @intCast(needed_pages),
             .file_index = @intCast(file_index),
+            .file_generation = generation,
+            .server_exec_token = server_exec_token,
         };
         return client_token;
     }
@@ -1189,6 +1214,7 @@ fn writeFileBytes(entry: *VolumeDirEntry, file_index: usize, offset: u64, data: 
     }
 
     if (write_end > entry.file_size) entry.file_size = write_end;
+    bumpFileGeneration(file_index);
     recomputeNextFreeBlock();
     if (!persistDirectory()) return .io_error;
     if (!persistSuperblock()) return .io_error;
@@ -1480,6 +1506,7 @@ fn handleUnlink(session: *Session, request_seq: u64) void {
         replyStatus(session, .unlink, request_seq, .busy);
         return;
     }
+    bumpFileGeneration(file_index);
     volume_dir_entries[file_index] = .{};
     recomputeNextFreeBlock();
     if (!persistDirectory() or !persistSuperblock() or !flushBlocks()) {

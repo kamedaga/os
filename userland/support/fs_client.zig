@@ -185,6 +185,23 @@ pub const Client = struct {
         return connectFromRegistryPageKind(registry_page_va, .persistent_fs, request_va, response_va, client_process_slot);
     }
 
+    pub fn connectFromRegistryPageOptions(
+        registry_page_va: u64,
+        request_va: u64,
+        response_va: u64,
+        client_process_slot: u64,
+        options: RegistryConnectOptions,
+    ) Error!Client {
+        return connectFromRegistryPageKindOptions(
+            registry_page_va,
+            .persistent_fs,
+            request_va,
+            response_va,
+            client_process_slot,
+            options,
+        );
+    }
+
     pub fn connectFromServiceRegistryKindOptions(
         service_kind: service_registry_abi.ServiceKind,
         request_va: u64,

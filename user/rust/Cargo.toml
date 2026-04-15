@@ -1,14 +1,24 @@
 [workspace]
 members = [
+    "cap_std",
+    "cap_std_child_exit_demo",
+    "cap_std_exec_demo",
+    "cap_std_fs_demo",
+    "cap_std_wait_demo",
     "rt_core",
     "rt_alloc",
     "rt_handle",
     "rt_io",
+    "rt_wasmtime_platform",
+    "wasmtime_host",
     "rust_hello",
     "rust_fs_demo",
     "rust_fs_mut_demo",
     "rust_open_exec_demo",
     "rust_spawn_demo",
+    "rust_wasmtime_platform_demo",
+    "rust_wasmtime_host_demo",
+    "rust_wasmtime_loader_demo",
 ]
 resolver = "2"
 

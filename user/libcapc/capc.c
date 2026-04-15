@@ -7,10 +7,40 @@
 #define CAP_HEAP_BASE_VA ((uintptr_t)0x30000000ull)
 #define CAP_PAGE_SIZE ((uintptr_t)4096u)
 #define CAP_ALIGN ((size_t)16u)
+#define CAP_USER_LOG_MAX_BYTES ((size_t)256u)
+#define CAP_STDIO_SINK_TARGET_VA ((uintptr_t)0x3C022000ull)
+#define CAP_STDIO_SINK_MAGIC ((uint64_t)0x535444494F534831ull)
+#define CAP_STDIO_SINK_VERSION ((uint64_t)1u)
+#define CAP_STDIO_SINK_STATE_IDLE ((uint64_t)0u)
+#define CAP_STDIO_SINK_STATE_READY ((uint64_t)1u)
+#define CAP_STDIO_SINK_STREAM_LOG ((uint64_t)0u)
+#define CAP_STDIO_SINK_STREAM_STDOUT ((uint64_t)1u)
+#define CAP_STDIO_SINK_STREAM_STDERR ((uint64_t)2u)
+#define CAP_STDIO_SINK_PAYLOAD_BYTES ((size_t)512u)
+#define CAP_STDIO_MODE_INHERIT ((uint64_t)0u)
+#define CAP_STDIO_MODE_KERNEL_LOG ((uint64_t)1u)
+#define CAP_STDIO_MODE_NULL ((uint64_t)2u)
+#define CAP_STDIO_MODE_MASK ((uint64_t)0x3u)
+#define CAP_STDIO_LOG_MODE_SHIFT ((unsigned int)0u)
+#define CAP_STDIO_STDOUT_MODE_SHIFT ((unsigned int)2u)
+#define CAP_STDIO_STDERR_MODE_SHIFT ((unsigned int)4u)
 
 static uintptr_t cap_heap_cur = CAP_HEAP_BASE_VA;
 static uintptr_t cap_heap_end = CAP_HEAP_BASE_VA;
 static uintptr_t cap_heap_next_map_va = CAP_HEAP_BASE_VA;
+
+struct cap_stdio_sink_page {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t state;
+    uint64_t endpoint_id;
+    uint64_t shell_process_slot;
+    uint64_t stream_kind;
+    uint64_t byte_len;
+    uint64_t reserved0;
+    unsigned char payload[CAP_STDIO_SINK_PAYLOAD_BYTES];
+    unsigned char reserved[CAP_PAGE_SIZE - 64u - CAP_STDIO_SINK_PAYLOAD_BYTES];
+};
 
 struct cap_block {
     size_t size;
@@ -20,6 +50,15 @@ struct cap_block {
 
 static struct cap_block *cap_heap_head = 0;
 static struct cap_block *cap_heap_tail = 0;
+static int cap_stdio_endpoint_installed = 0;
+
+static volatile struct cap_stdio_sink_page *cap_stdio_sink_page(void) {
+    return (volatile struct cap_stdio_sink_page *)CAP_STDIO_SINK_TARGET_VA;
+}
+
+static void cap_compiler_barrier(void) {
+    __asm__ volatile("" ::: "memory");
+}
 
 static size_t cap_align_up(size_t value, size_t align) {
     size_t rem = value & (align - 1u);
@@ -123,31 +162,134 @@ static void cap_coalesce_forward(struct cap_block *blk) {
     }
 }
 
+static long cap_log_fallback_chunks(const char *buf, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk_len = len - offset;
+        uint64_t status;
+        if (chunk_len > CAP_USER_LOG_MAX_BYTES) {
+            chunk_len = CAP_USER_LOG_MAX_BYTES;
+        }
+        status = cap_syscall2(
+            CAP_SYSCALL_LOG,
+            (uint64_t)(uintptr_t)(buf + offset),
+            (uint64_t)chunk_len);
+        if (status != CAP_SYSCALL_OK) {
+            cap_errno = cap_sys_status_to_errno(status);
+            return -1;
+        }
+        offset += chunk_len;
+    }
+    return (long)len;
+}
+
+static int cap_install_endpoint(uint64_t endpoint_id, uint64_t target_process_slot) {
+    uint64_t status = cap_syscall3(
+        CAP_SYSCALL_INSTALL_ENDPOINT,
+        0u,
+        endpoint_id,
+        target_process_slot);
+    if (status != CAP_SYSCALL_OK) {
+        cap_errno = cap_sys_status_to_errno(status);
+        return -1;
+    }
+    return 0;
+}
+
+static void cap_copy_to_sink_payload(volatile unsigned char *dst, const char *src, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        dst[i] = (unsigned char)src[i];
+        i += 1;
+    }
+}
+
+static uint64_t cap_stdio_mode_for_stream(volatile const struct cap_stdio_sink_page *page, uint64_t stream_kind) {
+    uint64_t shift = CAP_STDIO_LOG_MODE_SHIFT;
+    if (stream_kind == CAP_STDIO_SINK_STREAM_STDOUT) {
+        shift = CAP_STDIO_STDOUT_MODE_SHIFT;
+    } else if (stream_kind == CAP_STDIO_SINK_STREAM_STDERR) {
+        shift = CAP_STDIO_STDERR_MODE_SHIFT;
+    }
+    return (page->reserved0 >> shift) & CAP_STDIO_MODE_MASK;
+}
+
+static int cap_try_stdio_sink_chunk(uint64_t stream_kind, const char *buf, size_t len) {
+    volatile struct cap_stdio_sink_page *page = cap_stdio_sink_page();
+    if (page->magic != CAP_STDIO_SINK_MAGIC || page->version != CAP_STDIO_SINK_VERSION) {
+        return 0;
+    }
+    {
+        uint64_t mode = cap_stdio_mode_for_stream(page, stream_kind);
+        if (mode == CAP_STDIO_MODE_NULL) {
+            return 1;
+        }
+        if (mode == CAP_STDIO_MODE_KERNEL_LOG) {
+            return 0;
+        }
+    }
+    if (page->endpoint_id == 0 || page->shell_process_slot == 0) {
+        return 0;
+    }
+    if (!cap_stdio_endpoint_installed) {
+        if (cap_install_endpoint(page->endpoint_id, page->shell_process_slot) != 0) {
+            return 0;
+        }
+        cap_stdio_endpoint_installed = 1;
+    }
+    if (page->state != CAP_STDIO_SINK_STATE_IDLE) {
+        return 0;
+    }
+
+    page->stream_kind = stream_kind;
+    page->byte_len = (uint64_t)len;
+    cap_copy_to_sink_payload(page->payload, buf, len);
+    cap_compiler_barrier();
+    page->state = CAP_STDIO_SINK_STATE_READY;
+    cap_compiler_barrier();
+    (void)cap_syscall1(CAP_SYSCALL_SIGNAL_ENDPOINT, page->endpoint_id);
+    return 1;
+}
+
+static long cap_log_with_stream(uint64_t stream_kind, const char *buf, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk_len = len - offset;
+        if (chunk_len > CAP_STDIO_SINK_PAYLOAD_BYTES) {
+            chunk_len = CAP_STDIO_SINK_PAYLOAD_BYTES;
+        }
+        if (!cap_try_stdio_sink_chunk(stream_kind, buf + offset, chunk_len)) {
+            if (cap_log_fallback_chunks(buf + offset, chunk_len) < 0) {
+                return -1;
+            }
+        }
+        offset += chunk_len;
+    }
+    return (long)len;
+}
+
 long cap_log(const char *buf, size_t len) {
     if (buf == 0 && len != 0) {
         cap_errno = CAP_EFAULT;
         return -1;
     }
-
-    {
-        uint64_t status = cap_syscall2(
-            CAP_SYSCALL_LOG,
-            (uint64_t)(uintptr_t)buf,
-            (uint64_t)len);
-        if (status != CAP_SYSCALL_OK) {
-            cap_errno = cap_sys_status_to_errno(status);
-            return -1;
-        }
-    }
-    return (long)len;
+    if (len == 0) return 0;
+    return cap_log_with_stream(CAP_STDIO_SINK_STREAM_LOG, buf, len);
 }
 
 long cap_write(int fd, const void *buf, size_t len) {
+    uint64_t stream_kind;
     if (fd != 1 && fd != 2) {
         cap_errno = CAP_EBADF;
         return -1;
     }
-    return cap_log((const char *)buf, len);
+    if (buf == 0 && len != 0) {
+        cap_errno = CAP_EFAULT;
+        return -1;
+    }
+    if (len == 0) return 0;
+    stream_kind = (fd == 2) ? CAP_STDIO_SINK_STREAM_STDERR : CAP_STDIO_SINK_STREAM_STDOUT;
+    return cap_log_with_stream(stream_kind, (const char *)buf, len);
 }
 
 int cap_untyped_alloc(size_t bytes, size_t align, uint64_t flags, uint64_t *out_token) {
