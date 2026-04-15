@@ -46,6 +46,7 @@ const syscall_get_process_slot: u64 = 0x2E;
 const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
 const syscall_install_mmio_cap: u64 = 0x2F;
 const syscall_install_caps_batch: u64 = 0x32;
+const syscall_publish_service_endpoint: u64 = 0x33;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
 
 const syscall_batch_max_pages: usize = 64;
@@ -176,31 +177,6 @@ fn readUserPaddrBatch(
     return true;
 }
 
-fn shouldLogEndpointTransfer(endpoint_id: u64) bool {
-    return endpoint_id >= 0x80;
-}
-
-fn logEndpointTransfer(
-    h: *const Hooks,
-    phase: []const u8,
-    from: kernel.PrincipalId,
-    to: kernel.PrincipalId,
-    endpoint_id: u64,
-    paddr: u64,
-) void {
-    if (!shouldLogEndpointTransfer(endpoint_id)) return;
-    h.write(phase);
-    h.write(" from=");
-    h.write(h.principal_label(from));
-    h.write(" to=");
-    h.write(h.principal_label(to));
-    h.write(" ep=");
-    h.print_hex(endpoint_id);
-    h.write(" paddr=");
-    h.print_hex(paddr);
-    h.write("\n");
-}
-
 fn transferPageCapOnEndpoint(
     state: *kernel.KernelState,
     h: *const Hooks,
@@ -213,7 +189,6 @@ fn transferPageCapOnEndpoint(
         h.log_race_send_cap(proc, null, endpoint_id, paddr, "endpoint_not_found");
         return syscall_err_endpoint;
     };
-    logEndpointTransfer(h, if (retain_sender) "share_cap begin" else "send_cap begin", proc, to, endpoint_id, paddr);
     if (retain_sender) {
         state.shareCapOnEndpoint(proc, endpoint_id, paddr) catch |err| switch (err) {
             kernel.KernelError.EndpointNotFound => {
@@ -246,7 +221,6 @@ fn transferPageCapOnEndpoint(
         };
     }
     h.wake_waiting_thread_for_principal(to);
-    logEndpointTransfer(h, if (retain_sender) "share_cap done" else "send_cap done", proc, to, endpoint_id, paddr);
     if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
     return syscall_ok;
 }
@@ -581,6 +555,16 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 else => syscall_err_send,
             };
             return received;
+        },
+        syscall_publish_service_endpoint => {
+            if (!state.isBootstrapOwner(proc)) return syscall_err_invalid;
+            const target = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
+            state.publishServiceEndpoint(frame.rdi, target) catch |err| switch (err) {
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_endpoint,
+            };
+            return syscall_ok;
         },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;

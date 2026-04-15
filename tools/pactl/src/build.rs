@@ -1,6 +1,6 @@
 use crate::config::{
-    app_kind_is_skipped, discover_apps, AppConfig, CargoSource, SourceConfig, WorkspaceConfig,
-    ZigSource,
+    app_kind_is_skipped, discover_apps, AppConfig, CargoSource, FileSource, SourceConfig,
+    WorkspaceConfig, ZigSource,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,17 +80,7 @@ pub fn build_userland(
             SourceConfig::Cargo(src) => {
                 build_cargo_app(workspace_root, workspace, &app, src, &output_path, options)?
             }
-            SourceConfig::File(src) => {
-                let source_path = workspace_root.join(&src.path);
-                if !source_path.is_file() {
-                    return Err(format!(
-                        "prebuilt source for app {} does not exist: {}",
-                        app.app.id,
-                        source_path.display()
-                    ));
-                }
-                copy_if_changed(&source_path, &output_path)?;
-            }
+            SourceConfig::File(src) => build_file_app(workspace_root, workspace, &app, src, &output_path)?,
             SourceConfig::Capc(_) => {
                 return Err(format!(
                     "capc build is not implemented yet for app {}",
@@ -276,6 +266,38 @@ fn build_cargo_app(
     copy_if_changed(&built_path, output_path)
 }
 
+fn build_file_app(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+    app: &AppConfig,
+    src: &FileSource,
+    output_path: &Path,
+) -> Result<(), String> {
+    if !src.rebuild_tool.is_empty() {
+        let mut cmd = Command::new(resolve_tool(workspace, &src.rebuild_tool));
+        let rebuild_dir = if src.rebuild_dir.is_empty() {
+            workspace_root.to_path_buf()
+        } else {
+            workspace_root.join(&src.rebuild_dir)
+        };
+        cmd.current_dir(&rebuild_dir);
+        for arg in &src.rebuild_args {
+            cmd.arg(arg);
+        }
+        run_command(&format!("rebuild file source for app {}", app.app.id), &mut cmd)?;
+    }
+
+    let source_path = workspace_root.join(&src.path);
+    if !source_path.is_file() {
+        return Err(format!(
+            "prebuilt source for app {} does not exist: {}",
+            app.app.id,
+            source_path.display()
+        ));
+    }
+    copy_if_changed(&source_path, output_path)
+}
+
 fn output_is_usable(path: &Path) -> Result<bool, String> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
@@ -339,6 +361,15 @@ fn modified_time(path: &Path) -> Result<SystemTime, String> {
 
 fn tool_or_default<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     if value.is_empty() { fallback } else { value }
+}
+
+fn resolve_tool<'a>(workspace: &'a WorkspaceConfig, tool: &'a str) -> &'a str {
+    match tool {
+        "zig" => tool_or_default(&workspace.toolchain.zig, "zig"),
+        "cargo" => tool_or_default(&workspace.toolchain.cargo, "cargo"),
+        "pwsh" | "pwsh.exe" => tool_or_default(&workspace.toolchain.pwsh, "pwsh.exe"),
+        _ => tool,
+    }
 }
 
 fn binary_stem(output_name: &str) -> String {

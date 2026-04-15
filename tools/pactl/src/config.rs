@@ -170,6 +170,9 @@ pub struct CapcSource {
 #[derive(Debug, Clone, Default)]
 pub struct FileSource {
     pub path: String,
+    pub rebuild_tool: String,
+    pub rebuild_dir: String,
+    pub rebuild_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -462,6 +465,12 @@ fn validate_app_config(config: &AppConfig) -> Result<(), String> {
         }
         SourceConfig::File(src) if src.path.is_empty() => {
             return Err(format!("{}: missing [source.file].path", config.config_path.display()));
+        }
+        SourceConfig::File(src) if !src.rebuild_tool.is_empty() && src.rebuild_dir.is_empty() => {
+            return Err(format!(
+                "{}: [source.file].rebuild_dir is required when rebuild_tool is set",
+                config.config_path.display()
+            ));
         }
         _ => {}
     }
@@ -872,6 +881,15 @@ fn assign_app_value(config: &mut AppConfig, section: &SectionPath, key: &str, va
             value.into_string_array("[source.capc].include_dirs")?;
     } else if section_eq(section, false, &["source", "file"]) && key == "path" {
         ensure_file_source(&mut config.source).path = value.into_string("[source.file].path")?;
+    } else if section_eq(section, false, &["source", "file"]) && key == "rebuild_tool" {
+        ensure_file_source(&mut config.source).rebuild_tool =
+            value.into_string("[source.file].rebuild_tool")?;
+    } else if section_eq(section, false, &["source", "file"]) && key == "rebuild_dir" {
+        ensure_file_source(&mut config.source).rebuild_dir =
+            value.into_string("[source.file].rebuild_dir")?;
+    } else if section_eq(section, false, &["source", "file"]) && key == "rebuild_args" {
+        ensure_file_source(&mut config.source).rebuild_args =
+            value.into_string_array("[source.file].rebuild_args")?;
     } else if section_eq(section, true, &["publish"]) && key == "id" {
         last_publish_mut(config)?.id = value.into_string("[[publish]].id")?;
     } else if section_eq(section, true, &["publish"]) && key == "fs" {

@@ -6,11 +6,14 @@ const service_registry_abi = @import("service_registry_abi.zig");
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
-const syscall_grant_cap: u64 = 0x8;
+const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
+const syscall_grant_cap_on_endpoint: u64 = 0x24;
 const syscall_install_endpoint: u64 = 0x26;
 const syscall_share_cap: u64 = 0x2B;
 const syscall_signal_endpoint: u64 = 0x2C;
+const syscall_ok: u64 = 0;
+const syscall_err_endpoint: u64 = 9;
 
 const page_right_cpu_read: u64 = 0x1;
 const page_right_cpu_write: u64 = 0x2;
@@ -21,9 +24,10 @@ pub const Error = error{
     RequestMapFailed,
     ResponseAllocFailed,
     ResponseMapFailed,
+    EndpointNotFound,
+    EndpointInstallFailed,
     ResponseGrantFailed,
     ConnectSendFailed,
-    EndpointInstallFailed,
     Timeout,
     InvalidResponse,
     BufferTooSmall,
@@ -40,12 +44,14 @@ pub const ConnectOptions = struct {
     response_va: u64,
     client_process_slot: u64,
     endpoint_id: u64,
-    server_process_slot: u64,
     response_poll_limit: u64 = default_response_poll_limit,
+    compat_process_slot: u64 = 0,
+    allow_process_slot_compat: bool = false,
 };
 
 pub const RegistryConnectOptions = struct {
     response_poll_limit: u64 = default_response_poll_limit,
+    allow_process_slot_compat: bool = true,
 };
 
 pub const IdentifyResult = struct {
@@ -73,9 +79,8 @@ pub const Client = struct {
         const response_paddr = allocPage();
         if (response_paddr < 0x1000) return error.ResponseAllocFailed;
         if (mapPage(options.response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
-        if (grantCap(response_paddr, options.server_process_slot, page_right_cpu_read | page_right_cpu_write) != 0) {
-            return error.ResponseGrantFailed;
-        }
+        var compat_installed = false;
+        try grantResponseCapForConnect(response_paddr, options, &compat_installed);
 
         var client = Client{
             .request_va = options.request_va,
@@ -106,7 +111,7 @@ pub const Client = struct {
         compilerBarrier();
         request.request_seq = 1;
 
-        if (shareCap(request_paddr, options.endpoint_id) != 0) return error.ConnectSendFailed;
+        try shareConnectRequest(request_paddr, options, &compat_installed);
         const response = try client.finishRequestOk(1, .connect);
         client.root_token = response.result_token;
         if (!fs_abi.isCapToken(client.root_token)) return error.InvalidResponse;
@@ -128,16 +133,21 @@ pub const Client = struct {
         options: RegistryConnectOptions,
     ) Error!Client {
         const entry = service_registry_abi.findService(registry_page_va, .block) orelse return error.NotFound;
-        if (entry.process_slot == 0 or entry.endpoint_id == 0) return error.Invalid;
-        if (installEndpoint(entry.endpoint_id, entry.process_slot) != 0) return error.EndpointInstallFailed;
+        if (entry.endpoint_id == 0) return error.Invalid;
+        const compat_allowed = service_registry_abi.allowsProcessSlotCompat(entry);
+        const allow_process_slot_compat = options.allow_process_slot_compat and compat_allowed;
         return connect(.{
             .request_va = request_va,
             .response_va = response_va,
             .client_process_slot = client_process_slot,
             .endpoint_id = entry.endpoint_id,
-            .server_process_slot = entry.process_slot,
             .response_poll_limit = options.response_poll_limit,
-        });
+            .compat_process_slot = if (compat_allowed) entry.process_slot else 0,
+            .allow_process_slot_compat = allow_process_slot_compat,
+        }) catch |err| {
+            logRegistryConnectFailure(registry_page_va, entry, compat_allowed, allow_process_slot_compat, err);
+            return err;
+        };
     }
 
     pub fn connectFromServiceRegistry(request_va: u64, response_va: u64, client_process_slot: u64) Error!Client {
@@ -323,15 +333,54 @@ fn signalEndpoint(endpoint_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn grantCap(paddr: u64, target_process_slot: u64, rights: u64) u64 {
+fn grantCapOnEndpoint(paddr: u64, endpoint_id: u64, rights: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_grant_cap),
+        : [nr] "{rax}" (syscall_grant_cap_on_endpoint),
           [arg0] "{rdi}" (paddr),
-          [arg1] "{rsi}" (target_process_slot),
+          [arg1] "{rsi}" (endpoint_id),
           [arg2] "{rdx}" (rights),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn grantResponseCapForConnect(paddr: u64, options: ConnectOptions, compat_installed: *bool) Error!void {
+    const result = grantCapOnEndpoint(paddr, options.endpoint_id, page_right_cpu_read | page_right_cpu_write);
+    if (result == syscall_ok) return;
+    if (result != syscall_err_endpoint) return error.ResponseGrantFailed;
+
+    if (!compat_installed.* and try attemptCompatEndpointInstall(options)) {
+        compat_installed.* = true;
+        const retry = grantCapOnEndpoint(paddr, options.endpoint_id, page_right_cpu_read | page_right_cpu_write);
+        if (retry == syscall_ok) return;
+        if (retry == syscall_err_endpoint) return error.EndpointNotFound;
+        return error.ResponseGrantFailed;
+    }
+    return error.EndpointNotFound;
+}
+
+fn shareConnectRequest(paddr: u64, options: ConnectOptions, compat_installed: *bool) Error!void {
+    const result = shareCap(paddr, options.endpoint_id);
+    if (result == syscall_ok) return;
+    if (result != syscall_err_endpoint) return error.ConnectSendFailed;
+
+    if (!compat_installed.* and try attemptCompatEndpointInstall(options)) {
+        compat_installed.* = true;
+        const retry = shareCap(paddr, options.endpoint_id);
+        if (retry == syscall_ok) return;
+        if (retry == syscall_err_endpoint) return error.EndpointNotFound;
+        return error.ConnectSendFailed;
+    }
+    return error.EndpointNotFound;
+}
+
+fn attemptCompatEndpointInstall(options: ConnectOptions) Error!bool {
+    if (!options.allow_process_slot_compat or options.compat_process_slot == 0) return false;
+    _ = userLog("block_client: process-slot compat fallback\n");
+    return switch (installEndpoint(options.endpoint_id, options.compat_process_slot)) {
+        syscall_ok => true,
+        else => error.EndpointInstallFailed,
+    };
 }
 
 fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
@@ -342,6 +391,48 @@ fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
           [arg0] "{rdi}" (@as(u64, 0)),
           [arg1] "{rsi}" (endpoint_id),
           [arg2] "{rdx}" (target_process_slot),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn logRegistryConnectFailure(
+    registry_page_va: u64,
+    entry: service_registry_abi.ServiceEntry,
+    compat_allowed: bool,
+    allow_process_slot_compat: bool,
+    err: Error,
+) void {
+    switch (err) {
+        error.EndpointNotFound,
+        error.EndpointInstallFailed,
+        error.ResponseGrantFailed,
+        error.ConnectSendFailed,
+        => {},
+        else => return,
+    }
+    var buf: [192]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "block_client: registry=0x{x} ep=0x{x} slot={} flags=0x{x} compat={} allow={} err={s}\n",
+        .{
+            registry_page_va,
+            entry.endpoint_id,
+            entry.process_slot,
+            entry.flags,
+            @intFromBool(compat_allowed),
+            @intFromBool(allow_process_slot_compat),
+            @errorName(err),
+        },
+    ) catch return;
+    _ = userLog(line);
+}
+
+fn userLog(message: []const u8) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_log),
+          [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
+          [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 

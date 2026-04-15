@@ -171,6 +171,35 @@ fn bootLogClearCurrentRow(ctx: *BootLogFramebuffer) void {
     bootLogFillRect(ctx, x0, y, w, h, boot_log_bg_color);
 }
 
+fn bootLogScrollUp(ctx: *BootLogFramebuffer) void {
+    if (!ctx.enabled or ctx.max_rows == 0) return;
+
+    const scroll_h: usize = @intCast(ctx.line_height);
+    const x0: usize = if (boot_log_margin_x > 0) @intCast(boot_log_margin_x) else 0;
+    const w = ctx.width -| x0;
+    const y0: usize = @intCast(ctx.text_origin_y);
+    const text_h = ctx.max_rows * scroll_h;
+    if (w == 0 or text_h == 0) return;
+
+    if (text_h > scroll_h) {
+        const copy_h = text_h - scroll_h;
+        const pixels = ctx.pixels();
+        var row: usize = 0;
+        while (row < copy_h and y0 + row + scroll_h < ctx.height and y0 + row < ctx.height) : (row += 1) {
+            const dst_row = (y0 + row) * ctx.pitch + x0;
+            const src_row = (y0 + row + scroll_h) * ctx.pitch + x0;
+            var col: usize = 0;
+            while (col < w and x0 + col < ctx.width) : (col += 1) {
+                pixels[dst_row + col] = pixels[src_row + col];
+            }
+        }
+    }
+
+    const clear_y = y0 + text_h - scroll_h;
+    const clear_h = @min(scroll_h, ctx.height -| clear_y);
+    if (clear_h != 0) bootLogFillRect(ctx, x0, clear_y, w, clear_h, boot_log_bg_color);
+}
+
 fn bootLogRenderCurrentLine(ctx: *BootLogFramebuffer) void {
     if (!ctx.enabled) return;
     bootLogClearCurrentRow(ctx);
@@ -198,6 +227,8 @@ fn bootLogAdvanceLine(ctx: *BootLogFramebuffer) void {
     if (!ctx.enabled) return;
     if (ctx.cursor_row + 1 < ctx.max_rows) {
         ctx.cursor_row += 1;
+    } else {
+        bootLogScrollUp(ctx);
     }
     ctx.cursor_len = 0;
     @memset(ctx.current_line[0..], 0);

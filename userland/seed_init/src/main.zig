@@ -248,6 +248,16 @@ fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn publishServiceEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (service_registry_abi.syscall_publish_service_endpoint),
+          [arg0] "{rdi}" (endpoint_id),
+          [arg1] "{rsi}" (target_process_slot),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn signalEndpoint(endpoint_id: u64) u64 {
     return asm volatile (
         \\int $0x80
@@ -1027,12 +1037,12 @@ fn allocChildServiceRegistryPage(
     if (allocMapPages(source_va, 1, true, @intFromPtr(&registry_paddr)) != 0) return null;
     if (registry_paddr < 0x1000) return null;
     service_registry_abi.initPage(source_va);
-    if (window_service) |entry| service_registry_abi.addService(source_va, .window, entry.process_slot, entry.endpoint_id);
-    if (block_process_slot) |slot| {
-        if (block_endpoint_id) |endpoint_id| service_registry_abi.addService(source_va, .block, slot, endpoint_id);
+    if (window_service) |entry| service_registry_abi.addServiceEntry(source_va, entry);
+    if (block_process_slot != null and block_endpoint_id != null) {
+        service_registry_abi.addServiceWithProcessSlot(source_va, .block, block_process_slot.?, block_endpoint_id.?);
     }
-    if (persistent_fs_process_slot) |slot| {
-        if (persistent_fs_endpoint_id) |endpoint_id| service_registry_abi.addService(source_va, .persistent_fs, slot, endpoint_id);
+    if (persistent_fs_process_slot != null and persistent_fs_endpoint_id != null) {
+        service_registry_abi.addServiceWithProcessSlot(source_va, .persistent_fs, persistent_fs_process_slot.?, persistent_fs_endpoint_id.?);
     }
     return source_va;
 }
@@ -1300,9 +1310,10 @@ const QueueGrant = struct {
             .kind = @intFromEnum(service_registry_abi.ServiceKind.window),
             .process_slot = child_slot,
             .endpoint_id = endpoint_id,
-            .flags = 0,
+            .flags = service_registry_abi.service_flag_process_slot_compat,
         };
-        service_registry_abi.addService(registry_source_va, .window, child_slot, endpoint_id);
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: window endpoint publish failed\n");
+        service_registry_abi.addServiceWithProcessSlot(registry_source_va, .window, child_slot, endpoint_id);
         self.has_boot_display = true;
         _ = userLog("ManagerInit: shell spawned\n");
         noteBootStatus(boot_status_abi.status_init_first_window_spawn_done);
@@ -1393,6 +1404,7 @@ const QueueGrant = struct {
         };
         self.logRoleLine("spawn", policy.label, "ok");
         if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: block endpoint install failed\n");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: block endpoint publish failed\n");
         if (!ensureDeviceMmioCapsInstalled(block_desc)) fail("ManagerInit: block MMIO install failed\n");
         if (!grantDeviceMmioPages(block_desc, child_slot)) fail("ManagerInit: block MMIO grant failed\n");
         const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.submit_token), child_slot);
@@ -1401,8 +1413,8 @@ const QueueGrant = struct {
         const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse fail("ManagerInit: block notify grant failed\n");
         block_bootstrap.writeGrantedQueueTokens(config_source_va, submit_child, notify_child);
         _ = signalEndpoint(endpoint_id);
-        service_registry_abi.addService(self.window_service_page.source_va, .block, child_slot, endpoint_id);
-        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.addService(source_va, .block, child_slot, endpoint_id);
+        service_registry_abi.addServiceWithProcessSlot(self.window_service_page.source_va, .block, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.addServiceWithProcessSlot(source_va, .block, child_slot, endpoint_id);
         self.block_process_slot = child_slot;
         self.block_endpoint_id = endpoint_id;
     }
@@ -1444,8 +1456,9 @@ const QueueGrant = struct {
         };
         self.logRoleLine("spawn", policy.label, "ok");
         if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: persistent fs endpoint install failed\n");
-        service_registry_abi.addService(self.window_service_page.source_va, .persistent_fs, child_slot, endpoint_id);
-        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.addService(source_va, .persistent_fs, child_slot, endpoint_id);
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: persistent fs endpoint publish failed\n");
+        service_registry_abi.addServiceWithProcessSlot(self.window_service_page.source_va, .persistent_fs, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.addServiceWithProcessSlot(source_va, .persistent_fs, child_slot, endpoint_id);
         self.persistent_fs_process_slot = child_slot;
         self.persistent_fs_endpoint_id = endpoint_id;
     }

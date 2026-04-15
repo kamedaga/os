@@ -190,7 +190,6 @@ fn publishInitServiceRegistryPage(
         service_registry_abi.addService(
             page.page.paddr,
             kind,
-            descriptor.process_slot,
             descriptor.endpoint_id,
         );
     }

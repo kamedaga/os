@@ -417,6 +417,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_state_global.pending_page_transfers[process_index] = null;
     kernel_state_global.vm_object_tables[process_index] = .{};
     kernel_state_global.exec_image_tables[process_index] = .{};
+    _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var storage_index: usize = 0;
     while (storage_index < kernel.principal_count) : (storage_index += 1) {

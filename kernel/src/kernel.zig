@@ -241,6 +241,55 @@ pub const EndpointCNode = struct {
     }
 };
 
+pub const PublishedEndpointTable = struct {
+    const max_caps = 64;
+
+    caps: [max_caps]EndpointCapability = undefined,
+    len: usize = 0,
+
+    pub fn publish(self: *PublishedEndpointTable, cap: EndpointCapability) KernelError!void {
+        if (self.findIndex(cap.endpoint_id)) |index| {
+            self.caps[index] = cap;
+            return;
+        }
+        if (self.len >= self.caps.len) return KernelError.TableFull;
+        self.caps[self.len] = cap;
+        self.len += 1;
+    }
+
+    pub fn find(self: *const PublishedEndpointTable, endpoint_id: u64) ?*const EndpointCapability {
+        if (self.findIndex(endpoint_id)) |index| {
+            return &self.caps[index];
+        }
+        return null;
+    }
+
+    pub fn removeTarget(self: *PublishedEndpointTable, target: PrincipalId) bool {
+        var removed = false;
+        var read_index: usize = 0;
+        var write_index: usize = 0;
+        while (read_index < self.len) : (read_index += 1) {
+            const cap = self.caps[read_index];
+            if (cap.target == target) {
+                removed = true;
+                continue;
+            }
+            if (write_index != read_index) self.caps[write_index] = cap;
+            write_index += 1;
+        }
+        self.len = write_index;
+        return removed;
+    }
+
+    fn findIndex(self: *const PublishedEndpointTable, endpoint_id: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.caps[i].endpoint_id == endpoint_id) return i;
+        }
+        return null;
+    }
+};
+
 pub const CapMailbox = struct {
     const max_items = 8;
 
@@ -718,6 +767,7 @@ pub const KernelState = struct {
     cap_tables: [principal_count]CNode = [_]CNode{.{}} ** principal_count,
     untyped_tables: [principal_count]UntypedCNode = [_]UntypedCNode{.{}} ** principal_count,
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
+    published_service_endpoints: PublishedEndpointTable = .{},
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     pending_page_transfers: [principal_count]?PendingCapTransfer = [_]?PendingCapTransfer{null} ** principal_count,
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
@@ -1049,6 +1099,7 @@ pub const KernelState = struct {
             self.vm_object_tables[i] = .{};
             self.exec_image_tables[i] = .{};
         }
+        self.published_service_endpoints = .{};
         i = 0;
         while (i < self.process_descriptors.len) : (i += 1) {
             self.process_descriptors[i] = .{};
@@ -1360,6 +1411,22 @@ pub const KernelState = struct {
         }
     }
 
+    pub fn publishServiceEndpoint(
+        self: *KernelState,
+        endpoint_id: u64,
+        target: PrincipalId,
+    ) KernelError!void {
+        try self.requireActiveProcess(target);
+        try self.published_service_endpoints.publish(.{
+            .endpoint_id = endpoint_id,
+            .target = target,
+        });
+    }
+
+    pub fn unpublishServiceEndpointsForTarget(self: *KernelState, target: PrincipalId) bool {
+        return self.published_service_endpoints.removeTarget(target);
+    }
+
     pub fn getVmObjectTable(self: *KernelState, principal: PrincipalId) *VmObjectCNode {
         return &self.vm_object_tables[self.principalStorageIndex(principal)];
     }
@@ -1378,9 +1445,15 @@ pub const KernelState = struct {
 
     pub fn endpointTargetFor(self: *const KernelState, owner: PrincipalId, endpoint_id: u64) ?PrincipalId {
         if (!self.hasActivePrincipal(owner)) return null;
-        const ep = self.getEndpointTableConst(owner).find(endpoint_id) orelse return null;
-        if (!self.hasActivePrincipal(ep.target)) return null;
-        return ep.target;
+        if (self.getEndpointTableConst(owner).find(endpoint_id)) |ep| {
+            if (!self.hasActivePrincipal(ep.target)) return null;
+            return ep.target;
+        }
+        if (self.published_service_endpoints.find(endpoint_id)) |ep| {
+            if (!self.hasActivePrincipal(ep.target)) return null;
+            return ep.target;
+        }
+        return null;
     }
 
     pub fn installVmObjectCap(
@@ -2676,4 +2749,19 @@ test "endpointTargetFor ignores inactive faulted target" {
     try std.testing.expectEqual(@as(?PrincipalId, .Process1), s.endpointTargetFor(.Process0, 0x11));
     try std.testing.expect(s.markProcessFaulted(.Process1, 13));
     try std.testing.expectEqual(@as(?PrincipalId, null), s.endpointTargetFor(.Process0, 0x11));
+}
+
+test "endpointTargetFor falls back to published service endpoint" {
+    var s = KernelState.initPhase1();
+
+    try s.publishServiceEndpoint(0x80, .Process1);
+    try std.testing.expectEqual(@as(?PrincipalId, .Process1), s.endpointTargetFor(.Process0, 0x80));
+}
+
+test "unpublishServiceEndpointsForTarget removes published endpoint" {
+    var s = KernelState.initPhase1();
+
+    try s.publishServiceEndpoint(0x80, .Process1);
+    try std.testing.expect(s.unpublishServiceEndpointsForTarget(.Process1));
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.endpointTargetFor(.Process0, 0x80));
 }
