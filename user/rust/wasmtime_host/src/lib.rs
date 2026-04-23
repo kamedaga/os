@@ -18,11 +18,12 @@ use cap_std::io::Read;
 use cap_std::path::{Path, PathBuf};
 use cap_std::{Error, ErrorKind, Result};
 use core::fmt::Write;
+use core::str;
 
 pub use wasmtime;
 
 pub const WASMTIME_FEATURE_POLICY: &str = "default-features=false,runtime,pulley";
-pub const WASMTIME_TARGET_TRIPLE: &str = "pulley64";
+pub use wasmtime_config::WASMTIME_TARGET_TRIPLE;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PrecompiledKind {
@@ -115,21 +116,9 @@ pub fn smoke_config() -> wasmtime::Config {
     wasmtime::Config::new()
 }
 
-fn configure_capabilityos_target(
-    config: &mut wasmtime::Config,
-) -> core::result::Result<(), wasmtime::Error> {
-    config.target(WASMTIME_TARGET_TRIPLE)?;
-    config.signals_based_traps(false);
-    config.memory_guard_size(0);
-    config.memory_reservation(0);
-    config.memory_reservation_for_growth(1 << 20);
-    config.memory_init_cow(false);
-    Ok(())
-}
-
 pub fn default_engine() -> Result<wasmtime::Engine> {
     let mut config = smoke_config();
-    configure_capabilityos_target(&mut config)
+    wasmtime_config::configure_capabilityos_target(&mut config)
         .map_err(|err| map_wasmtime_error("config.prepare", err))?;
     wasmtime::Engine::new(&config).map_err(|err| map_wasmtime_error("engine.new", err))
 }
@@ -147,6 +136,197 @@ pub fn call_zero_arg_i32_export(
         .map_err(|err| map_wasmtime_error("instance.get_typed_func", err))?;
     func.call(&mut store, ())
         .map_err(|err| map_wasmtime_error("typed_func.call", err))
+}
+
+pub fn call_zero_arg_i32_export_with_host_log(
+    engine: &wasmtime::Engine,
+    module: &wasmtime::Module,
+    export_name: &str,
+) -> Result<i32> {
+    let mut store = wasmtime::Store::new(engine, ());
+    let host_log = wasmtime::Func::wrap(&mut store, |value: i32| {
+        let mut line = String::from("wasmtime_host: host_log_i32 value=");
+        let _ = write!(&mut line, "{value}\n");
+        cap_std::rt_core::log(&line);
+    });
+    let imports = [host_log.into()];
+    let instance = wasmtime::Instance::new(&mut store, module, &imports)
+        .map_err(|err| map_wasmtime_error("instance.new", err))?;
+    let func = instance
+        .get_typed_func::<(), i32>(&mut store, export_name)
+        .map_err(|err| map_wasmtime_error("instance.get_typed_func", err))?;
+    func.call(&mut store, ())
+        .map_err(|err| map_wasmtime_error("typed_func.call", err))
+}
+
+pub fn call_zero_arg_i32_export_with_host_log_memory(
+    engine: &wasmtime::Engine,
+    module: &wasmtime::Module,
+    export_name: &str,
+) -> Result<i32> {
+    let mut store = wasmtime::Store::new(engine, ());
+    let host_log = wasmtime::Func::wrap(
+        &mut store,
+        |mut caller: wasmtime::Caller<'_, ()>, ptr: i32, len: i32| {
+            let Some(memory) = caller
+                .get_export("memory")
+                .and_then(|export| export.into_memory())
+            else {
+                cap_std::rt_core::log("wasmtime_host: host_log memory export missing\n");
+                return;
+            };
+            let Ok(ptr) = usize::try_from(ptr) else {
+                cap_std::rt_core::log("wasmtime_host: host_log ptr invalid\n");
+                return;
+            };
+            let Ok(len) = usize::try_from(len) else {
+                cap_std::rt_core::log("wasmtime_host: host_log len invalid\n");
+                return;
+            };
+            let data = memory.data(&caller);
+            let Some(end) = ptr.checked_add(len) else {
+                cap_std::rt_core::log("wasmtime_host: host_log range overflow\n");
+                return;
+            };
+            if end > data.len() {
+                cap_std::rt_core::log("wasmtime_host: host_log range out of bounds\n");
+                return;
+            }
+            let bytes = &data[ptr..end];
+            match str::from_utf8(bytes) {
+                Ok(message) => {
+                    let mut line = String::from("wasmtime_host: host_log bytes=");
+                    let _ = write!(&mut line, "{} message={}\n", len, message);
+                    cap_std::rt_core::log(&line);
+                }
+                Err(_) => {
+                    let mut line = String::from("wasmtime_host: host_log invalid utf8 bytes=");
+                    let _ = write!(&mut line, "{}\n", len);
+                    cap_std::rt_core::log(&line);
+                }
+            }
+        },
+    );
+    let imports = [host_log.into()];
+    let instance = wasmtime::Instance::new(&mut store, module, &imports)
+        .map_err(|err| map_wasmtime_error("instance.new", err))?;
+    let func = instance
+        .get_typed_func::<(), i32>(&mut store, export_name)
+        .map_err(|err| map_wasmtime_error("instance.get_typed_func", err))?;
+    func.call(&mut store, ())
+        .map_err(|err| map_wasmtime_error("typed_func.call", err))
+}
+
+pub fn call_zero_arg_i32_export_with_host_fill_memory(
+    engine: &wasmtime::Engine,
+    module: &wasmtime::Module,
+    export_name: &str,
+) -> Result<i32> {
+    let mut store = wasmtime::Store::new(engine, ());
+    let host_log = wasmtime::Func::wrap(
+        &mut store,
+        |mut caller: wasmtime::Caller<'_, ()>, ptr: i32, len: i32| {
+            log_memory_message(&mut caller, ptr, len);
+        },
+    );
+    let host_fill = wasmtime::Func::wrap(
+        &mut store,
+        |mut caller: wasmtime::Caller<'_, ()>, ptr: i32, len: i32| -> i32 {
+            fill_memory_message(&mut caller, ptr, len)
+        },
+    );
+    let imports = [host_log.into(), host_fill.into()];
+    let instance = wasmtime::Instance::new(&mut store, module, &imports)
+        .map_err(|err| map_wasmtime_error("instance.new", err))?;
+    let func = instance
+        .get_typed_func::<(), i32>(&mut store, export_name)
+        .map_err(|err| map_wasmtime_error("instance.get_typed_func", err))?;
+    func.call(&mut store, ())
+        .map_err(|err| map_wasmtime_error("typed_func.call", err))
+}
+
+fn log_memory_message(caller: &mut wasmtime::Caller<'_, ()>, ptr: i32, len: i32) {
+    let Some(bytes) = read_memory_range(caller, ptr, len) else {
+        return;
+    };
+    match str::from_utf8(bytes) {
+        Ok(message) => {
+            let mut line = String::from("wasmtime_host: host_log bytes=");
+            let _ = write!(&mut line, "{} message={}\n", bytes.len(), message);
+            cap_std::rt_core::log(&line);
+        }
+        Err(_) => {
+            let mut line = String::from("wasmtime_host: host_log invalid utf8 bytes=");
+            let _ = write!(&mut line, "{}\n", bytes.len());
+            cap_std::rt_core::log(&line);
+        }
+    }
+}
+
+fn fill_memory_message(caller: &mut wasmtime::Caller<'_, ()>, ptr: i32, len: i32) -> i32 {
+    const MESSAGE: &[u8] = b"pong from host!";
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+    else {
+        cap_std::rt_core::log("wasmtime_host: host_fill memory export missing\n");
+        return 0;
+    };
+    let Ok(ptr) = usize::try_from(ptr) else {
+        cap_std::rt_core::log("wasmtime_host: host_fill ptr invalid\n");
+        return 0;
+    };
+    let Ok(len) = usize::try_from(len) else {
+        cap_std::rt_core::log("wasmtime_host: host_fill len invalid\n");
+        return 0;
+    };
+    let data = memory.data_mut(caller);
+    let Some(end) = ptr.checked_add(len) else {
+        cap_std::rt_core::log("wasmtime_host: host_fill range overflow\n");
+        return 0;
+    };
+    if end > data.len() {
+        cap_std::rt_core::log("wasmtime_host: host_fill range out of bounds\n");
+        return 0;
+    }
+    let write_len = core::cmp::min(len, MESSAGE.len());
+    data[ptr..ptr + write_len].copy_from_slice(&MESSAGE[..write_len]);
+    let mut line = String::from("wasmtime_host: host_fill bytes=");
+    let _ = write!(&mut line, "{}\n", write_len);
+    cap_std::rt_core::log(&line);
+    i32::try_from(write_len).unwrap_or(0)
+}
+
+fn read_memory_range<'a>(
+    caller: &'a mut wasmtime::Caller<'_, ()>,
+    ptr: i32,
+    len: i32,
+) -> Option<&'a [u8]> {
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+    else {
+        cap_std::rt_core::log("wasmtime_host: host_log memory export missing\n");
+        return None;
+    };
+    let Ok(ptr) = usize::try_from(ptr) else {
+        cap_std::rt_core::log("wasmtime_host: host_log ptr invalid\n");
+        return None;
+    };
+    let Ok(len) = usize::try_from(len) else {
+        cap_std::rt_core::log("wasmtime_host: host_log len invalid\n");
+        return None;
+    };
+    let data = memory.data(caller);
+    let Some(end) = ptr.checked_add(len) else {
+        cap_std::rt_core::log("wasmtime_host: host_log range overflow\n");
+        return None;
+    };
+    if end > data.len() {
+        cap_std::rt_core::log("wasmtime_host: host_log range out of bounds\n");
+        return None;
+    }
+    Some(&data[ptr..end])
 }
 
 fn detect_precompiled_kind(bytes: &[u8]) -> Result<PrecompiledKind> {

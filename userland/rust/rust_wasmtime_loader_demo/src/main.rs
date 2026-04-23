@@ -1,0 +1,40 @@
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::string::String;
+use cap_std::path::Path;
+use rt_alloc as _;
+
+const DEFAULT_ARTIFACT_PATH: &str = "/sys/wasmtime_minimal_module.cwasm";
+
+fn main() -> cap_std::Result<()> {
+    let artifact_path = cap_std::env::arg(1).unwrap_or_else(|| String::from(DEFAULT_ARTIFACT_PATH));
+    cap_std::println!("rust wasmtime loader demo stage=load")?;
+    let artifact =
+        wasmtime_host::SerializedModuleArtifact::load_from_root(Path::new(artifact_path.as_str()))?;
+    cap_std::println!(
+        "rust wasmtime loader demo stage=artifact_ready path={} bytes={} kind={}",
+        artifact.path().as_str(),
+        artifact.len(),
+        artifact.precompiled_kind_name()
+    )?;
+    cap_std::println!("rust wasmtime loader demo stage=engine")?;
+    let engine = wasmtime_host::default_engine()?;
+    cap_std::println!("rust wasmtime loader demo stage=deserialize")?;
+    let module = artifact.deserialize_module(&engine)?;
+    cap_std::println!("rust wasmtime loader demo stage=instantiate")?;
+    let run_result = wasmtime_host::call_zero_arg_i32_export(&engine, &module, "run")?;
+    cap_std::println!(
+        "rust wasmtime loader demo path={} bytes={} kind={} module_size={} run_result={}",
+        artifact.path().as_str(),
+        artifact.len(),
+        artifact.precompiled_kind_name(),
+        core::mem::size_of_val(&module),
+        run_result
+    )?;
+    Ok(())
+}
+
+cap_std::entry_point!(main);

@@ -6,26 +6,27 @@ extern crate alloc;
 use cap_std::path::Path;
 use rt_alloc as _;
 
-const ARTIFACT_PATH: &str = "/sys/wasmtime_minimal_module.cwasm";
+const ARTIFACT_PATH: &str = "/sys/wasmtime_hostcall_module.cwasm";
 
 fn main() -> cap_std::Result<()> {
-    cap_std::println!("rust wasmtime loader demo stage=load")?;
+    cap_std::println!("rust wasmtime hostcall demo stage=load")?;
     let artifact =
         wasmtime_host::SerializedModuleArtifact::load_from_root(Path::new(ARTIFACT_PATH))?;
     cap_std::println!(
-        "rust wasmtime loader demo stage=artifact_ready path={} bytes={} kind={}",
+        "rust wasmtime hostcall demo stage=artifact_ready path={} bytes={} kind={}",
         artifact.path().as_str(),
         artifact.len(),
         artifact.precompiled_kind_name()
     )?;
-    cap_std::println!("rust wasmtime loader demo stage=engine")?;
+    cap_std::println!("rust wasmtime hostcall demo stage=engine")?;
     let engine = wasmtime_host::default_engine()?;
-    cap_std::println!("rust wasmtime loader demo stage=deserialize")?;
+    cap_std::println!("rust wasmtime hostcall demo stage=deserialize")?;
     let module = artifact.deserialize_module(&engine)?;
-    cap_std::println!("rust wasmtime loader demo stage=instantiate")?;
-    let run_result = wasmtime_host::call_zero_arg_i32_export(&engine, &module, "run")?;
+    cap_std::println!("rust wasmtime hostcall demo stage=instantiate")?;
+    let run_result =
+        wasmtime_host::call_zero_arg_i32_export_with_host_log(&engine, &module, "run")?;
     cap_std::println!(
-        "rust wasmtime loader demo path={} bytes={} kind={} module_size={} run_result={}",
+        "rust wasmtime hostcall demo path={} bytes={} kind={} module_size={} run_result={}",
         artifact.path().as_str(),
         artifact.len(),
         artifact.precompiled_kind_name(),

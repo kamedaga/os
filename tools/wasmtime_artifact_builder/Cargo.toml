@@ -4,4 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+wasmtime_config = { path = "../../user/rust/wasmtime_config" }
 wasmtime = { version = "=40.0.4", default-features = false, features = ["cranelift", "std", "pulley"] }

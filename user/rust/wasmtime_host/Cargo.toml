@@ -9,4 +9,5 @@ path = "src/lib.rs"
 [dependencies]
 cap_std = { path = "../cap_std" }
 rt_wasmtime_platform = { path = "../rt_wasmtime_platform" }
+wasmtime_config = { path = "../wasmtime_config" }
 wasmtime = { version = "=40.0.4", default-features = false, features = ["runtime", "pulley"] }

@@ -1,0 +1,13 @@
+[package]
+name = "rust_wasmtime_platform_demo"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rust_wasmtime_platform_demo"
+path = "src/main.rs"
+
+[dependencies]
+rt_alloc = { path = "../../../user/rust/rt_alloc" }
+rt_core = { path = "../../../user/rust/rt_core" }
+rt_wasmtime_platform = { path = "../../../user/rust/rt_wasmtime_platform" }

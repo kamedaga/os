@@ -151,6 +151,13 @@ const persistent_fs_request_va: u64 = 0x3C10_6000;
 const persistent_fs_response_va: u64 = 0x3C10_7000;
 const block_demo_magic: u64 = 0x424C_4B44_454D_4F31;
 const shell_cat_display_limit_bytes: usize = 2048;
+const shell_fs_probe_auto = false;
+const shell_fs_probe_commands = [_][]const u8{
+    "ls /",
+    "ls /cmd",
+    "stat /cmd/pie_user.elf",
+    "cat /sys/startup_manifest.txt",
+};
 const pie_user_rootfs_name = "cmd/pie_user.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 var spawn_registry_copy_source_va: u64 = 0;
@@ -246,6 +253,7 @@ const ShellState = struct {
     block_client_state: block_client.Client = undefined,
     persistent_fs_client_ready: bool = false,
     persistent_fs_client_state: fs_client.Client = undefined,
+    auto_fs_probe_pending: bool = true,
     cwd_path_buf: [fs_protocol.max_path_bytes]u8 = [_]u8{0} ** fs_protocol.max_path_bytes,
     cwd_path_len: usize = 0,
 
@@ -1325,6 +1333,12 @@ fn shellLogLine(text: []const u8) void {
     _ = userLog(buf[0..idx]);
 }
 
+fn shellLogFmt(comptime fmt: []const u8, args: anytype) void {
+    var buf: [192]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    shellLogLine(line);
+}
+
 fn seedBootSplash(st: *ShellState) void {
     st.writeLine("shell fast path online");
 }
@@ -1378,6 +1392,7 @@ fn ensurePersistentFsClient(st: *ShellState) ?*fs_client.Client {
         shellLogLine("fs process slot unavailable");
         return null;
     }
+    shellLogFmt("fs client connect begin slot={d}", .{process_slot});
     st.persistent_fs_client_state = fs_client.Client.connectFromRegistryPageOptions(
         service_registry_page_va,
         persistent_fs_request_va,
@@ -1394,6 +1409,7 @@ fn ensurePersistentFsClient(st: *ShellState) ?*fs_client.Client {
         return null;
     };
     st.persistent_fs_client_ready = true;
+    shellLogFmt("fs client connect ok mount={d}", .{st.persistent_fs_client_state.mount_token});
     return &st.persistent_fs_client_state;
 }
 
@@ -1406,6 +1422,7 @@ fn reportPersistentFsError(st: *ShellState, message: []const u8, err: anyerror, 
 }
 
 fn lookupPersistentFsRoot(st: *ShellState, client: *fs_client.Client) ?fs_client.LookupResult {
+    shellLogLine("fs root lookup begin");
     const root = client.lookup(client.mount_token, ".") catch |err| {
         reportPersistentFsError(st, "fs root lookup failed", err, true);
         return null;
@@ -1416,10 +1433,12 @@ fn lookupPersistentFsRoot(st: *ShellState, client: *fs_client.Client) ?fs_client
         st.persistent_fs_client_ready = false;
         return null;
     }
+    shellLogFmt("fs root lookup ok token={d}", .{root.token});
     return root;
 }
 
 fn runPersistentFsList(st: *ShellState, path: []const u8) bool {
+    shellLogFmt("fsop ls begin path={s}", .{path});
     if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
         st.writeLine(rootfsUnavailableReason());
         shellLogLine(rootfsUnavailableReason());
@@ -1432,21 +1451,34 @@ fn runPersistentFsList(st: *ShellState, path: []const u8) bool {
         return false;
     };
     defer client.close(target.token) catch {};
+    shellLogFmt(
+        "fsop ls lookup ok path={s} kind={s} token={d}",
+        .{ path, @tagName(target.object_kind), target.token },
+    );
     if (target.object_kind != .vnode_dir) {
         st.writeLine(path);
+        shellLogFmt("fsop ls done path={s} count=1", .{path});
         return true;
     }
     var cursor: u64 = 0;
     var name_buf: [48]u8 = undefined;
     var count: usize = 0;
     while (true) {
+        shellLogFmt("fsop ls readdir begin path={s} cursor={d}", .{ path, cursor });
         const entry = client.readdirOne(target.token, cursor, name_buf[0..]) catch |err| {
             reportPersistentFsError(st, "ls failed", err, true);
             return false;
         };
         switch (entry) {
-            .end => break,
+            .end => {
+                shellLogFmt("fsop ls readdir end path={s} count={d}", .{ path, count });
+                break;
+            },
             .entry => |dirent| {
+                shellLogFmt(
+                    "fsop ls readdir ok path={s} name={s} kind={s} next={d}",
+                    .{ path, dirent.name, @tagName(dirent.object_kind), dirent.next_cursor },
+                );
                 if (dirent.object_kind == .vnode_dir) {
                     var line_buf: [64]u8 = undefined;
                     const line = std.fmt.bufPrint(&line_buf, "{s}/", .{dirent.name}) catch {
@@ -1465,10 +1497,12 @@ fn runPersistentFsList(st: *ShellState, path: []const u8) bool {
         }
     }
     if (count == 0) st.writeLine("directory empty");
+    shellLogFmt("fsop ls done path={s} count={d}", .{ path, count });
     return true;
 }
 
 fn runPersistentFsStat(st: *ShellState, path: []const u8) bool {
+    shellLogFmt("fsop stat begin path={s}", .{path});
     const client = ensurePersistentFsClient(st) orelse return false;
     const root = lookupPersistentFsRoot(st, client) orelse return false;
     const file = client.lookup(root.token, path) catch |err| {
@@ -1476,10 +1510,18 @@ fn runPersistentFsStat(st: *ShellState, path: []const u8) bool {
         return false;
     };
     defer client.close(file.token) catch {};
+    shellLogFmt(
+        "fsop stat lookup ok path={s} kind={s} token={d}",
+        .{ path, @tagName(file.object_kind), file.token },
+    );
     const stat = client.stat(file.token) catch |err| {
         reportPersistentFsError(st, "stat failed", err, true);
         return false;
     };
+    shellLogFmt(
+        "fsop stat ok path={s} kind={s} size={d}",
+        .{ path, @tagName(stat.object_kind), stat.size_bytes },
+    );
     var line_buf: [160]u8 = undefined;
     const line = std.fmt.bufPrint(
         &line_buf,
@@ -1502,6 +1544,7 @@ fn runPersistentFsStat(st: *ShellState, path: []const u8) bool {
 }
 
 fn runPersistentFsCat(st: *ShellState, path: []const u8) bool {
+    shellLogFmt("fsop cat begin path={s}", .{path});
     const client = ensurePersistentFsClient(st) orelse return false;
     const root = lookupPersistentFsRoot(st, client) orelse return false;
     const file = client.lookup(root.token, path) catch |err| {
@@ -1509,14 +1552,20 @@ fn runPersistentFsCat(st: *ShellState, path: []const u8) bool {
         return false;
     };
     defer client.close(file.token) catch {};
+    shellLogFmt(
+        "fsop cat lookup ok path={s} kind={s} token={d} bytes={d}",
+        .{ path, @tagName(file.object_kind), file.token, file.file_bytes },
+    );
     const open_file = client.open(file.token) catch |err| {
         reportPersistentFsError(st, "cat open failed", err, true);
         return false;
     };
     defer client.close(open_file.token) catch {};
+    shellLogFmt("fsop cat open ok path={s} token={d}", .{ path, open_file.token });
 
     if (file.file_bytes == 0) {
         st.writeLine("empty file");
+        shellLogFmt("fsop cat done path={s} displayed=0", .{path});
         return true;
     }
 
@@ -1526,10 +1575,18 @@ fn runPersistentFsCat(st: *ShellState, path: []const u8) bool {
     var displayed: usize = 0;
     while (displayed < shell_cat_display_limit_bytes) {
         const max_chunk = @min(read_buf.len, shell_cat_display_limit_bytes - displayed);
+        shellLogFmt(
+            "fsop cat read begin path={s} offset={d} max={d}",
+            .{ path, offset, max_chunk },
+        );
         const read_result = client.read(open_file.token, offset, read_buf[0..max_chunk]) catch |err| {
             reportPersistentFsError(st, "cat read failed", err, true);
             return false;
         };
+        shellLogFmt(
+            "fsop cat read ok path={s} bytes={d} next={d} file={d}",
+            .{ path, read_result.bytes_read, read_result.next_offset, read_result.file_bytes },
+        );
         if (read_result.bytes_read == 0) break;
         var out_len: usize = 0;
         for (read_buf[0..read_result.bytes_read]) |byte| {
@@ -1548,10 +1605,12 @@ fn runPersistentFsCat(st: *ShellState, path: []const u8) bool {
         if (offset >= read_result.file_bytes) break;
     }
     if (file.file_bytes > shell_cat_display_limit_bytes) st.writeLine("cat truncated");
+    shellLogFmt("fsop cat done path={s} displayed={d}", .{ path, displayed });
     return true;
 }
 
 fn runPersistentFsTouch(st: *ShellState, path: []const u8) bool {
+    shellLogFmt("fsop touch begin path={s}", .{path});
     const client = ensurePersistentFsClient(st) orelse return false;
     const root = lookupPersistentFsRoot(st, client) orelse return false;
     const existing = client.lookup(root.token, path) catch |err| switch (err) {
@@ -1561,9 +1620,11 @@ fn runPersistentFsTouch(st: *ShellState, path: []const u8) bool {
                 return false;
             };
             defer client.close(file.token) catch {};
+            shellLogFmt("fsop touch create ok path={s} token={d}", .{ path, file.token });
             var line_buf: [80]u8 = undefined;
             const line = std.fmt.bufPrint(&line_buf, "created {s}", .{path}) catch return false;
             st.writeLine(line);
+            shellLogFmt("fsop touch done path={s} created=yes", .{path});
             return true;
         },
         else => {
@@ -1580,10 +1641,12 @@ fn runPersistentFsTouch(st: *ShellState, path: []const u8) bool {
     var line_buf: [80]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{s} already exists", .{path}) catch return false;
     st.writeLine(line);
+    shellLogFmt("fsop touch done path={s} created=no", .{path});
     return true;
 }
 
 fn runPersistentFsWrite(st: *ShellState, path: []const u8, text: []const u8) bool {
+    shellLogFmt("fsop write begin path={s} bytes={d}", .{ path, text.len });
     const client = ensurePersistentFsClient(st) orelse return false;
     const root = lookupPersistentFsRoot(st, client) orelse return false;
     if (!removePersistentFsFileIfPresent(st, client, root.token, path)) return false;
@@ -1603,14 +1666,17 @@ fn runPersistentFsWrite(st: *ShellState, path: []const u8, text: []const u8) boo
             reportPersistentFsError(st, "write failed", err, true);
             return false;
         };
+        shellLogFmt("fsop write payload ok path={s} bytes={d}", .{ path, text.len });
     }
     var line_buf: [160]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "wrote {d} bytes to {s}", .{ text.len, path }) catch return false;
     st.writeLine(line);
+    shellLogFmt("fsop write done path={s} bytes={d}", .{ path, text.len });
     return true;
 }
 
 fn runPersistentFsRename(st: *ShellState, old_path: []const u8, new_path: []const u8) bool {
+    shellLogFmt("fsop mv begin old={s} new={s}", .{ old_path, new_path });
     const client = ensurePersistentFsClient(st) orelse return false;
     const root = lookupPersistentFsRoot(st, client) orelse return false;
     client.rename(root.token, old_path, new_path) catch |err| {
@@ -1620,10 +1686,12 @@ fn runPersistentFsRename(st: *ShellState, old_path: []const u8, new_path: []cons
     var line_buf: [160]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "renamed {s} to {s}", .{ old_path, new_path }) catch return false;
     st.writeLine(line);
+    shellLogFmt("fsop mv done old={s} new={s}", .{ old_path, new_path });
     return true;
 }
 
 fn runPersistentFsUnlink(st: *ShellState, path: []const u8) bool {
+    shellLogFmt("fsop rm begin path={s}", .{path});
     const client = ensurePersistentFsClient(st) orelse return false;
     const root = lookupPersistentFsRoot(st, client) orelse return false;
     client.unlink(root.token, path) catch |err| {
@@ -1633,6 +1701,7 @@ fn runPersistentFsUnlink(st: *ShellState, path: []const u8) bool {
     var line_buf: [160]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "removed {s}", .{path}) catch return false;
     st.writeLine(line);
+    shellLogFmt("fsop rm done path={s}", .{path});
     return true;
 }
 
@@ -1753,6 +1822,7 @@ fn removePersistentFsFileIfPresent(st: *ShellState, client: *fs_client.Client, r
 }
 
 fn runPersistentFsMkdir(st: *ShellState, path: []const u8) bool {
+    shellLogFmt("fsop mkdir begin path={s}", .{path});
     const client = ensurePersistentFsClient(st) orelse return false;
     const root = lookupPersistentFsRoot(st, client) orelse return false;
     const existing = client.lookup(root.token, path) catch |err| switch (err) {
@@ -1762,9 +1832,11 @@ fn runPersistentFsMkdir(st: *ShellState, path: []const u8) bool {
                 return false;
             };
             defer client.close(dir.token) catch {};
+            shellLogFmt("fsop mkdir create ok path={s} token={d}", .{ path, dir.token });
             var line_buf: [160]u8 = undefined;
             const line = std.fmt.bufPrint(&line_buf, "created dir {s}", .{path}) catch return false;
             st.writeLine(line);
+            shellLogFmt("fsop mkdir done path={s} created=yes", .{path});
             return true;
         },
         else => {
@@ -1781,10 +1853,12 @@ fn runPersistentFsMkdir(st: *ShellState, path: []const u8) bool {
     var line_buf: [160]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{s} already exists", .{path}) catch return false;
     st.writeLine(line);
+    shellLogFmt("fsop mkdir done path={s} created=no", .{path});
     return true;
 }
 
 fn runPersistentFsCd(st: *ShellState, path: []const u8) bool {
+    shellLogFmt("fsop cd begin path={s}", .{path});
     if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
         st.writeLine(rootfsUnavailableReason());
         shellLogLine(rootfsUnavailableReason());
@@ -1803,12 +1877,41 @@ fn runPersistentFsCd(st: *ShellState, path: []const u8) bool {
         return false;
     }
     setRootfsPath(st, path);
+    shellLogFmt("fsop cd done path={s}", .{path});
     return true;
 }
 
 fn runPersistentFsPwd(st: *ShellState) bool {
     st.writeLine(currentRootfsPath(st));
+    shellLogFmt("fsop pwd path={s}", .{currentRootfsPath(st)});
     return true;
+}
+
+fn runScriptedCommand(st: *ShellState, command: []const u8) RenderAction {
+    if (command.len == 0 or command.len > st.cmd.len) return .none;
+    shellLogFmt("auto command begin text={s}", .{command});
+    var line_buf: [144]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "> {s}", .{command}) catch command;
+    st.writeLine(line);
+    @memcpy(st.cmd[0..command.len], command);
+    st.cmd_len = command.len;
+    const action = executeCommand(st);
+    st.cmd_len = 0;
+    shellLogFmt("auto command end text={s}", .{command});
+    return action;
+}
+
+fn maybeRunAutoFsProbe(st: *ShellState) RenderAction {
+    if (!shell_fs_probe_auto or !st.auto_fs_probe_pending) return .none;
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) return .none;
+    st.auto_fs_probe_pending = false;
+    shellLogLine("auto fs probe start");
+    var action: RenderAction = .none;
+    for (shell_fs_probe_commands) |command| {
+        action = RenderAction.merge(action, runScriptedCommand(st, command));
+    }
+    shellLogLine("auto fs probe done");
+    return action;
 }
 
 fn runBlockDemo(st: *ShellState) bool {
@@ -2524,6 +2627,7 @@ pub export fn _start() noreturn {
         if (keyboard) |*kbd| {
             action = pumpKeyboard(kbd, &shell);
         }
+        action = RenderAction.merge(action, maybeRunAutoFsProbe(&shell));
         if (pumpChildTextStreams(&shell)) {
             action = RenderAction.merge(action, .full);
         }

@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 const OVMF_CODE_PATH: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 const OVMF_VARS_TEMPLATE_PATH: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
+const QEMU_DEBUG_FLAGS: &str = "guest_errors,cpu_reset";
 
 pub struct RunOptions {
     pub timed: bool,
@@ -152,26 +153,40 @@ fn build_wsl_script(
 ) -> Result<String, String> {
     let workspace_wsl = windows_path_to_wsl(workspace_root)?;
     let disk_wsl = windows_path_to_wsl(disk_image)?;
-    let ovmf_vars_wsl = windows_path_to_wsl(ovmf_vars)?;
-    let qemu_log_wsl = windows_path_to_wsl(qemu_log)?;
     let artifact_dir_wsl = windows_path_to_wsl(
         ovmf_vars
             .parent()
             .ok_or_else(|| format!("missing artifact directory for {}", ovmf_vars.display()))?,
     )?;
+    let ovmf_vars_wsl = windows_path_to_wsl(ovmf_vars)?;
+    let qemu_log_wsl = windows_path_to_wsl(qemu_log)?;
     let serial_log_wsl = serial_log.map(windows_path_to_wsl).transpose()?;
     let summary_log_wsl = summary_log.map(windows_path_to_wsl).transpose()?;
     let timestamp_stream = windows_path_to_wsl(&workspace_root.join("tools/timestamp_stream.py"))?;
     let summarize_script =
         windows_path_to_wsl(&workspace_root.join("tools/summarize_boot_timed_log.py"))?;
+    let launcher_script = windows_path_to_wsl(&workspace_root.join("tools/wsl_launcher.py"))?;
+    let runtime_dir_wsl = format!("/tmp/capabilityos-qemu-{}", runtime_slug(workspace_root));
+    let launcher_socket_wsl = format!("{runtime_dir_wsl}/launcher.sock");
+    let launcher_log_wsl = format!("{runtime_dir_wsl}/launcher.log");
+    let runtime_ovmf_vars_wsl = format!("{runtime_dir_wsl}/OVMF_VARS.fd");
+    let runtime_qemu_log_wsl = format!("{runtime_dir_wsl}/qemu.log");
+    let runtime_serial_log_wsl = serial_log
+        .as_ref()
+        .map(|_| format!("{runtime_dir_wsl}/serial-timed.log"));
+    let runtime_summary_log_wsl = summary_log
+        .as_ref()
+        .map(|_| format!("{runtime_dir_wsl}/boot-timing-summary.txt"));
+    let cache_dir_wsl = format!("${{XDG_CACHE_HOME:-$HOME/.cache}}/capabilityos-qemu/{}", runtime_slug(workspace_root));
+    let overlay_disk_wsl = format!("{runtime_dir_wsl}/disk-overlay.qcow2");
 
     let mut qemu_parts = vec![
         "qemu-system-x86_64".to_string(),
         "-machine q35".to_string(),
         "-m 512M".to_string(),
         "-monitor none".to_string(),
-        "-d int,guest_errors,cpu_reset".to_string(),
-        format!("-D {}", bash_quote(&qemu_log_wsl)),
+        format!("-d {QEMU_DEBUG_FLAGS}"),
+        format!("-D {}", bash_quote(&runtime_qemu_log_wsl)),
         "-display gtk,grab-on-hover=off".to_string(),
         "-vga none".to_string(),
         "-device virtio-vga".to_string(),
@@ -183,11 +198,11 @@ fn build_wsl_script(
         ),
         format!(
             "-drive if=pflash,format=raw,file={}",
-            bash_quote(&ovmf_vars_wsl)
+            bash_quote(&runtime_ovmf_vars_wsl)
         ),
         format!(
-            "-drive if=none,file={},format=raw,id=bootdisk",
-            bash_quote(&disk_wsl)
+            "-drive if=none,file={},format=qcow2,id=bootdisk",
+            bash_quote(&overlay_disk_wsl)
         ),
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
         "-serial stdio".to_string(),
@@ -202,40 +217,124 @@ fn build_wsl_script(
     script.push_str("set -euo pipefail\n");
     script.push_str(&format!("cd {}\n", bash_quote(&workspace_wsl)));
     script.push_str(&format!("ARTIFACT_DIR={}\n", bash_quote(&artifact_dir_wsl)));
+    script.push_str(&format!("RUNTIME_DIR={}\n", bash_quote(&runtime_dir_wsl)));
+    script.push_str(&format!(
+        "LAUNCHER_SOCKET={}\n",
+        bash_quote(&launcher_socket_wsl)
+    ));
+    script.push_str(&format!("LAUNCHER_LOG={}\n", bash_quote(&launcher_log_wsl)));
     script.push_str(&format!("DISK_IMG={}\n", bash_quote(&disk_wsl)));
     script.push_str(&format!("OVMF_VARS={}\n", bash_quote(&ovmf_vars_wsl)));
     script.push_str(&format!("QEMU_LOG={}\n", bash_quote(&qemu_log_wsl)));
+    script.push_str(&format!(
+        "RUNTIME_OVMF_VARS={}\n",
+        bash_quote(&runtime_ovmf_vars_wsl)
+    ));
+    script.push_str(&format!(
+        "RUNTIME_QEMU_LOG={}\n",
+        bash_quote(&runtime_qemu_log_wsl)
+    ));
     if let Some(serial_log_wsl) = &serial_log_wsl {
         script.push_str(&format!("SERIAL_LOG={}\n", bash_quote(serial_log_wsl)));
     }
     if let Some(summary_log_wsl) = &summary_log_wsl {
         script.push_str(&format!("SUMMARY_LOG={}\n", bash_quote(summary_log_wsl)));
     }
-    script.push_str("mkdir -p \"$ARTIFACT_DIR\"\n");
-    if options.timed {
-        script.push_str("if ! command -v python3 >/dev/null 2>&1; then echo 'missing python3'; exit 1; fi\n");
+    if let Some(runtime_serial_log_wsl) = &runtime_serial_log_wsl {
+        script.push_str(&format!(
+            "RUNTIME_SERIAL_LOG={}\n",
+            bash_quote(runtime_serial_log_wsl)
+        ));
     }
-    script.push_str("rm -f \"$OVMF_VARS\" \"$QEMU_LOG\"");
+    if let Some(runtime_summary_log_wsl) = &runtime_summary_log_wsl {
+        script.push_str(&format!(
+            "RUNTIME_SUMMARY_LOG={}\n",
+            bash_quote(runtime_summary_log_wsl)
+        ));
+    }
+    script.push_str(&format!("CACHE_DIR={cache_dir_wsl}\n"));
+    script.push_str("CACHE_LOCK=\"$CACHE_DIR/run.lock\"\n");
+    script.push_str("CACHE_DISK=\"$CACHE_DIR/disk.img\"\n");
+    script.push_str("CACHE_META=\"$CACHE_DIR/disk.meta\"\n");
+    script.push_str("CACHE_DIRTY=\"$CACHE_DIR/disk.dirty\"\n");
+    script.push_str(&format!(
+        "OVERLAY_DISK={}\n",
+        bash_quote(&overlay_disk_wsl)
+    ));
+    script.push_str("mkdir -p \"$ARTIFACT_DIR\"\n");
+    script.push_str("mkdir -p \"$RUNTIME_DIR\"\n");
+    script.push_str("mkdir -p \"$CACHE_DIR\"\n");
+    script.push_str("if ! command -v python3 >/dev/null 2>&1; then echo 'missing python3'; exit 1; fi\n");
+    script.push_str("if ! command -v qemu-img >/dev/null 2>&1; then echo 'missing qemu-img'; exit 1; fi\n");
+    script.push_str("if ! command -v flock >/dev/null 2>&1; then echo 'missing flock'; exit 1; fi\n");
+    script.push_str(&format!(
+        "python3 {} ensure --socket \"$LAUNCHER_SOCKET\" --log \"$LAUNCHER_LOG\"\n",
+        bash_quote(&launcher_script)
+    ));
+    script.push_str("source_disk_sig() {\n");
+    script.push_str("  stat -c '%s:%Y' \"$DISK_IMG\"\n");
+    script.push_str("}\n");
+    script.push_str("cached_disk_sig() {\n");
+    script.push_str("  [ -f \"$CACHE_META\" ] && cat \"$CACHE_META\"\n");
+    script.push_str("}\n");
+    script.push_str("refresh_cache_disk() {\n");
+    script.push_str("  cp \"$DISK_IMG\" \"$CACHE_DISK.tmp\"\n");
+    script.push_str("  mv \"$CACHE_DISK.tmp\" \"$CACHE_DISK\"\n");
+    script.push_str("  source_disk_sig > \"$CACHE_META\"\n");
+    script.push_str("  rm -f \"$CACHE_DIRTY\"\n");
+    script.push_str("}\n");
+    script.push_str("schedule_writeback() {\n");
+    script.push_str("  : > \"$CACHE_DIRTY\"\n");
+    script.push_str("  flock -u 9\n");
+    script.push_str(&format!(
+        "  python3 {} spawn-writeback --lock \"$CACHE_LOCK\" --source \"$CACHE_DISK\" --dest \"$DISK_IMG\" --meta \"$CACHE_META\" --dirty \"$CACHE_DIRTY\" --log \"$LAUNCHER_LOG\"\n",
+        bash_quote(&launcher_script)
+    ));
+    script.push_str("}\n");
+    script.push_str("sync_logs() {\n");
+    script.push_str("  [ ! -f \"$RUNTIME_OVMF_VARS\" ] || cp \"$RUNTIME_OVMF_VARS\" \"$OVMF_VARS\"\n");
+    script.push_str("  [ ! -f \"$RUNTIME_QEMU_LOG\" ] || cp \"$RUNTIME_QEMU_LOG\" \"$QEMU_LOG\"\n");
     if options.timed {
-        script.push_str(" \"$SERIAL_LOG\" \"$SUMMARY_LOG\"");
+        script.push_str("  [ ! -f \"$RUNTIME_SERIAL_LOG\" ] || cp \"$RUNTIME_SERIAL_LOG\" \"$SERIAL_LOG\"\n");
+        script.push_str("  [ ! -f \"$RUNTIME_SUMMARY_LOG\" ] || cp \"$RUNTIME_SUMMARY_LOG\" \"$SUMMARY_LOG\"\n");
+    }
+    script.push_str("}\n");
+    script.push_str("trap sync_logs EXIT\n");
+    script.push_str("exec 9>\"$CACHE_LOCK\"\n");
+    script.push_str("flock 9\n");
+    script.push_str("rm -f \"$OVMF_VARS\" \"$QEMU_LOG\" \"$RUNTIME_OVMF_VARS\" \"$RUNTIME_QEMU_LOG\" \"$OVERLAY_DISK\"");
+    if options.timed {
+        script.push_str(" \"$SERIAL_LOG\" \"$SUMMARY_LOG\" \"$RUNTIME_SERIAL_LOG\" \"$RUNTIME_SUMMARY_LOG\"");
     }
     script.push('\n');
+    script.push_str("if [ -f \"$CACHE_DIRTY\" ]; then\n");
+    script.push_str("  if [ \"$(cached_disk_sig)\" != \"$(source_disk_sig)\" ]; then\n");
+    script.push_str("    echo 'disk cache is dirty and the Windows disk image changed outside WSL'\n");
+    script.push_str("    echo 'resolve the disk image divergence before running again'\n");
+    script.push_str("    exit 1\n");
+    script.push_str("  fi\n");
+    script.push_str("elif [ ! -f \"$CACHE_DISK\" ] || [ \"$(cached_disk_sig)\" != \"$(source_disk_sig)\" ]; then\n");
+    script.push_str("  refresh_cache_disk\n");
+    script.push_str("fi\n");
     script.push_str(&format!(
-        "cp {} \"$OVMF_VARS\"\n",
+        "cp {} \"$RUNTIME_OVMF_VARS\"\n",
         bash_quote(OVMF_VARS_TEMPLATE_PATH)
     ));
+    script.push_str("qemu-img create -f qcow2 -F raw -b \"$CACHE_DISK\" \"$OVERLAY_DISK\" >/dev/null\n");
 
     if options.timed {
         script.push_str("set +e\n");
         script.push_str(&qemu_cmd);
         script.push_str(&format!(
-            " | python3 {} | tee \"$SERIAL_LOG\"\n",
+            " | python3 {} | tee \"$RUNTIME_SERIAL_LOG\"\n",
             bash_quote(&timestamp_stream)
         ));
         script.push_str("qemu_status=${PIPESTATUS[0]}\n");
         script.push_str("set -e\n");
+        script.push_str("qemu-img commit -f qcow2 \"$OVERLAY_DISK\" >/dev/null\n");
+        script.push_str("schedule_writeback\n");
         script.push_str(&format!(
-            "python3 {} \"$SERIAL_LOG\" | tee \"$SUMMARY_LOG\"\n",
+            "python3 {} \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
             bash_quote(&summarize_script)
         ));
         script.push_str("echo\n");
@@ -243,8 +342,14 @@ fn build_wsl_script(
         script.push_str("echo \"summary: $SUMMARY_LOG\"\n");
         script.push_str("exit \"$qemu_status\"\n");
     } else {
+        script.push_str("set +e\n");
         script.push_str(&qemu_cmd);
         script.push('\n');
+        script.push_str("qemu_status=$?\n");
+        script.push_str("set -e\n");
+        script.push_str("qemu-img commit -f qcow2 \"$OVERLAY_DISK\" >/dev/null\n");
+        script.push_str("schedule_writeback\n");
+        script.push_str("exit \"$qemu_status\"\n");
     }
 
     Ok(script)
@@ -293,4 +398,22 @@ fn windows_path_to_wsl(path: &Path) -> Result<String, String> {
 fn bash_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     format!("'{escaped}'")
+}
+
+fn runtime_slug(path: &Path) -> String {
+    let mut slug = String::with_capacity(64);
+    for ch in path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+        .chars()
+    {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if slug.is_empty() || !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
 }

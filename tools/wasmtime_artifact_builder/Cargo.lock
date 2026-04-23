@@ -765,6 +765,14 @@ name = "wasmtime_artifact_builder"
 version = "0.1.0"
 dependencies = [
  "wasmtime",
+ "wasmtime_config",
+]
+
+[[package]]
+name = "wasmtime_config"
+version = "0.1.0"
+dependencies = [
+ "wasmtime",
 ]
 
 [[package]]
