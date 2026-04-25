@@ -62,6 +62,8 @@ pub const Response = extern struct {
     block_endpoint_id: u64,
     status_flags: u64,
     block_profile: u64,
+    gpu_process_slot: u64,
+    gpu_endpoint_id: u64,
 };
 
 pub fn opcodeRaw(opcode: Opcode) u64 {

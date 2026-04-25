@@ -37,9 +37,19 @@ pub fn setup_workspace(
             SetupMode::Full => DiskEnsureMode::Always,
         },
     )?;
-    let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::setup())?;
-    let bootfs = sync_bootfs_generated(workspace_root, workspace, &inputs.disk_image, &inputs.manifests)?;
-    let rootfs = sync_rootfs_generated(workspace_root, workspace, &inputs.disk_image, &inputs.manifests)?;
+    let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::fresh())?;
+    let bootfs = sync_bootfs_generated(
+        workspace_root,
+        workspace,
+        &inputs.disk_image,
+        &inputs.manifests,
+    )?;
+    let rootfs = sync_rootfs_generated(
+        workspace_root,
+        workspace,
+        &inputs.disk_image,
+        &inputs.manifests,
+    )?;
     invalidate_run_cache(workspace_root)?;
 
     Ok(SetupOutputs {

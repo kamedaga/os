@@ -71,6 +71,7 @@ const wait_sleep_limit: usize = 2048;
 
 const virtio_gpu_cmd_get_display_info: u32 = 0x0100;
 const virtio_gpu_cmd_resource_create_2d: u32 = 0x0101;
+const virtio_gpu_cmd_resource_unref: u32 = 0x0102;
 const virtio_gpu_cmd_set_scanout: u32 = 0x0103;
 const virtio_gpu_cmd_resource_flush: u32 = 0x0104;
 const virtio_gpu_cmd_transfer_to_host_2d: u32 = 0x0105;
@@ -78,6 +79,7 @@ const virtio_gpu_cmd_resource_attach_backing: u32 = 0x0106;
 const virtio_gpu_cmd_get_capset_info: u32 = 0x0108;
 const virtio_gpu_cmd_ctx_create: u32 = 0x0200;
 const virtio_gpu_cmd_ctx_attach_resource: u32 = 0x0202;
+const virtio_gpu_cmd_ctx_detach_resource: u32 = 0x0203;
 const virtio_gpu_cmd_resource_create_3d: u32 = 0x0204;
 const virtio_gpu_cmd_submit_3d: u32 = 0x0207;
 const virtio_gpu_resp_ok_nodata: u32 = 0x1100;
@@ -89,6 +91,7 @@ const virgl_format_r8_unorm: u32 = 64;
 const pipe_buffer: u32 = 0;
 const pipe_texture_2d: u32 = 2;
 const pipe_bind_render_target: u32 = 2;
+const pipe_bind_sampler_view: u32 = 1 << 3;
 const pipe_bind_vertex_buffer: u32 = 1 << 4;
 const pipe_bind_display_target: u32 = 1 << 7;
 const pipe_bind_scanout: u32 = 1 << 18;
@@ -97,6 +100,7 @@ const virtio_gpu_capset_virgl2: u32 = 2;
 const default_context_id: u32 = 1;
 const virgl_object_null: u32 = 0;
 const virgl_ccmd_nop: u32 = 0;
+const virgl_ccmd_resource_inline_write: u32 = 9;
 
 const BootState = struct {
     endpoint_id: u64 = 0,
@@ -271,11 +275,14 @@ const GpuState = struct {
     context_id: u32 = default_context_id,
     virgl_resource_id: u32 = gpu_protocol.default_virgl_resource_id,
     virgl_vertex_buffer_id: u32 = gpu_protocol.default_virgl_vertex_buffer_id,
+    next_virgl_texture_resource_id: u32 = gpu_protocol.first_virgl_texture_resource_id,
     virgl_render_target_ready: bool = false,
     virgl_vertex_buffer_ready: bool = false,
     next_virgl_surface_id: u32 = 1,
     submit_3d_logged: bool = false,
     present_3d_logged: bool = false,
+    texture_upload_logged: bool = false,
+    app_surface_logged: bool = false,
 };
 
 var boot_state: BootState = .{};
@@ -989,6 +996,45 @@ fn attachVirglResourceToContext(resource_id: u32) bool {
     return true;
 }
 
+fn detachVirglResourceFromContext(resource_id: u32) bool {
+    if (!gpu_state.virgl_supported or gpu_state.capset_id == 0 or resource_id == 0) return false;
+    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(control_page_va + control_request_offset);
+    req.* = .{
+        .hdr = controlHdr(virtio_gpu_cmd_ctx_detach_resource),
+        .resource_id = resource_id,
+        .padding = 0,
+    };
+    req.hdr.ctx_id = gpu_state.context_id;
+    if (!submitCommand(@sizeOf(VirtioGpuCtxResource), 0, 0, .gpu_virgl_resource, virtio_gpu_resp_ok_nodata)) {
+        _ = userLog("VirtioGpuGl: ctx_detach_resource failed\n");
+        return false;
+    }
+    _ = userLog("VirtioGpuGl: ctx_detach_resource ready\n");
+    return true;
+}
+
+fn unrefVirglResource(resource_id: u32) bool {
+    if (resource_id == 0) return false;
+    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(control_page_va + control_request_offset);
+    req.* = .{
+        .hdr = controlHdr(virtio_gpu_cmd_resource_unref),
+        .resource_id = resource_id,
+        .padding = 0,
+    };
+    if (!submitCommand(@sizeOf(VirtioGpuCtxResource), 0, 0, .gpu_virgl_resource, virtio_gpu_resp_ok_nodata)) {
+        _ = userLog("VirtioGpuGl: resource_unref failed\n");
+        return false;
+    }
+    _ = userLog("VirtioGpuGl: resource_unref ready\n");
+    return true;
+}
+
+fn deleteVirglTexture2d(resource_id: u32) bool {
+    if (resource_id == 0) return false;
+    if (!detachVirglResourceFromContext(resource_id)) return false;
+    return unrefVirglResource(resource_id);
+}
+
 fn ensureVirglRenderTarget() bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
     if (gpu_state.width == 0 or gpu_state.height == 0) {
@@ -1069,6 +1115,108 @@ fn submitVirglCommandBuffer(command_bytes: usize) bool {
     if (!gpu_state.submit_3d_logged) {
         _ = userLog("VirtioGpuGl: submit_3d ready\n");
         gpu_state.submit_3d_logged = true;
+    }
+    return true;
+}
+
+fn submitVirglTextureInlineWrite(resource_id: u32, x: u32, y: u32, width: u32, height: u32, payload_bytes: usize) bool {
+    if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
+    if (width == 0 or height == 0 or payload_bytes == 0 or payload_bytes > gpu_protocol.request_payload_bytes) return false;
+    const expected_bytes = @as(usize, width) * @as(usize, height) * 4;
+    if (payload_bytes != expected_bytes) return false;
+    const padded_bytes = (payload_bytes + 3) & ~@as(usize, 3);
+    const command_bytes = 48 + padded_bytes;
+    if (command_bytes > 4096) return false;
+
+    clearBytes(mem_entries_page0_va, command_bytes);
+    const commands: [*]volatile u32 = @ptrFromInt(mem_entries_page0_va);
+    commands[0] = virglCmd0(virgl_ccmd_resource_inline_write, virgl_object_null, 11 + @as(u32, @intCast(padded_bytes / 4)));
+    commands[1] = resource_id;
+    commands[2] = 0;
+    commands[3] = 0;
+    commands[4] = width * 4;
+    commands[5] = @intCast(payload_bytes);
+    commands[6] = x;
+    commands[7] = y;
+    commands[8] = 0;
+    commands[9] = width;
+    commands[10] = height;
+    commands[11] = 1;
+
+    const dest: [*]volatile u8 = @ptrFromInt(mem_entries_page0_va + 48);
+    const src: [*]const volatile u8 = @ptrFromInt(gpu_request_page_va + gpu_protocol.request_header_bytes);
+    copyVolatileBytes(dest, src, payload_bytes);
+    return submitVirglCommandBuffer(command_bytes);
+}
+
+fn uploadVirglTexture2d(resource_id_hint: u32, width: u32, height: u32, payload_bytes: usize) ?u32 {
+    if (!ensureVirglRenderTarget()) return null;
+    if (width == 0 or height == 0) return null;
+    if (width > 1024 or height > 1024) return null;
+    const expected_bytes = @as(usize, width) * @as(usize, height) * 4;
+    if (payload_bytes != expected_bytes or payload_bytes > gpu_protocol.request_payload_bytes) return null;
+
+    const resource_id = if (resource_id_hint >= gpu_protocol.first_virgl_texture_resource_id) resource_id_hint else blk: {
+        const allocated = gpu_state.next_virgl_texture_resource_id;
+        gpu_state.next_virgl_texture_resource_id +%= 1;
+        if (gpu_state.next_virgl_texture_resource_id < gpu_protocol.first_virgl_texture_resource_id) {
+            gpu_state.next_virgl_texture_resource_id = gpu_protocol.first_virgl_texture_resource_id;
+        }
+        if (!createVirglResource3d(
+            allocated,
+            pipe_texture_2d,
+            virgl_format_b8g8r8a8_unorm,
+            pipe_bind_sampler_view,
+            width,
+            height,
+        )) return null;
+        if (!attachVirglResourceToContext(allocated)) return null;
+        break :blk allocated;
+    };
+    if (!submitVirglTextureInlineWrite(resource_id, 0, 0, width, height, payload_bytes)) return null;
+    if (!gpu_state.texture_upload_logged) {
+        _ = userLog("VirtioGpuGl: texture_upload ready\n");
+        gpu_state.texture_upload_logged = true;
+    }
+    return resource_id;
+}
+
+fn createVirglAppSurface(width: u32, height: u32) ?u64 {
+    if (!ensureVirglRenderTarget()) return null;
+    if (width == 0 or height == 0) return null;
+    if (width > 2048 or height > 2048) return null;
+
+    const resource_id = gpu_state.next_virgl_texture_resource_id;
+    gpu_state.next_virgl_texture_resource_id +%= 1;
+    if (gpu_state.next_virgl_texture_resource_id < gpu_protocol.first_virgl_texture_resource_id) {
+        gpu_state.next_virgl_texture_resource_id = gpu_protocol.first_virgl_texture_resource_id;
+    }
+    const surface_id = nextVirglSurfaceId();
+    if (!createVirglResource3d(
+        resource_id,
+        pipe_texture_2d,
+        virgl_format_b8g8r8a8_unorm,
+        pipe_bind_sampler_view | pipe_bind_render_target,
+        width,
+        height,
+    )) return null;
+    if (!attachVirglResourceToContext(resource_id)) return null;
+    if (!gpu_state.app_surface_logged) {
+        _ = userLog("VirtioGpuGl: app_surface ready\n");
+        gpu_state.app_surface_logged = true;
+    }
+    return @as(u64, resource_id) | (@as(u64, surface_id) << 32);
+}
+
+fn updateVirglTexture2d(resource_id: u32, x: u32, y: u32, width: u32, height: u32, payload_bytes: usize) bool {
+    if (resource_id < gpu_protocol.first_virgl_texture_resource_id) return false;
+    if (!ensureVirglRenderTarget()) return false;
+    if (width == 0 or height == 0) return false;
+    if (payload_bytes != @as(usize, width) * @as(usize, height) * 4) return false;
+    if (!submitVirglTextureInlineWrite(resource_id, x, y, width, height, payload_bytes)) return false;
+    if (!gpu_state.texture_upload_logged) {
+        _ = userLog("VirtioGpuGl: texture_upload ready\n");
+        gpu_state.texture_upload_logged = true;
     }
     return true;
 }
@@ -1214,6 +1362,8 @@ fn gpuFeatureFlags() u64 {
         flags |= gpu_protocol.feature_virgl;
         flags |= gpu_protocol.feature_submit_3d;
         flags |= gpu_protocol.feature_present_3d;
+        flags |= gpu_protocol.feature_texture_2d;
+        flags |= gpu_protocol.feature_app_surface;
     }
     flags |= gpu_protocol.feature_present_2d;
     return flags;
@@ -1387,6 +1537,79 @@ fn processMappedGpuRequest() void {
                 return;
             }
             writeGpuResponse(.present_3d, seq, .ok, gpu_state.width, gpu_state.height, gpu_state.virgl_resource_id);
+        },
+        .upload_texture_2d => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_texture_2d) == 0) {
+                writeGpuResponse(.upload_texture_2d, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const resource_id_hint: u32 = @intCast(request.arg0);
+            const width: u32 = @intCast(request.arg1 & 0xffff_ffff);
+            const height: u32 = @intCast(request.arg1 >> 32);
+            const inline_bytes: usize = request.inline_bytes;
+            if (inline_bytes == 0 or inline_bytes > gpu_protocol.request_payload_bytes) {
+                writeGpuResponse(.upload_texture_2d, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            const resource_id = uploadVirglTexture2d(resource_id_hint, width, height, inline_bytes) orelse {
+                writeGpuResponse(.upload_texture_2d, seq, .io_error, 0, 0, 0);
+                return;
+            };
+            writeGpuResponse(.upload_texture_2d, seq, .ok, resource_id, width, height);
+        },
+        .update_texture_2d => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_texture_2d) == 0) {
+                writeGpuResponse(.update_texture_2d, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const resource_id: u32 = @intCast(request.arg0 & 0xffff_ffff);
+            const x: u32 = @intCast(request.arg0 >> 32);
+            const y: u32 = @intCast(request.arg1 & 0xffff);
+            const width: u32 = @intCast((request.arg1 >> 16) & 0xffff);
+            const height: u32 = @intCast((request.arg1 >> 32) & 0xffff);
+            const inline_bytes: usize = request.inline_bytes;
+            if (inline_bytes == 0 or inline_bytes > gpu_protocol.request_payload_bytes) {
+                writeGpuResponse(.update_texture_2d, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            if (!updateVirglTexture2d(resource_id, x, y, width, height, inline_bytes)) {
+                writeGpuResponse(.update_texture_2d, seq, .io_error, 0, 0, 0);
+                return;
+            }
+            writeGpuResponse(.update_texture_2d, seq, .ok, resource_id, width, height);
+        },
+        .delete_texture_2d => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_texture_2d) == 0) {
+                writeGpuResponse(.delete_texture_2d, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const resource_id: u32 = @intCast(request.arg0);
+            if (resource_id == 0 or request.inline_bytes != 0) {
+                writeGpuResponse(.delete_texture_2d, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            if (!deleteVirglTexture2d(resource_id)) {
+                writeGpuResponse(.delete_texture_2d, seq, .io_error, 0, 0, 0);
+                return;
+            }
+            writeGpuResponse(.delete_texture_2d, seq, .ok, resource_id, 0, 0);
+        },
+        .create_app_surface => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_app_surface) == 0) {
+                writeGpuResponse(.create_app_surface, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const width: u32 = @intCast(request.arg0 & 0xffff_ffff);
+            const height: u32 = @intCast(request.arg0 >> 32);
+            if (width == 0 or height == 0 or request.inline_bytes != 0) {
+                writeGpuResponse(.create_app_surface, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            const packed_handles = createVirglAppSurface(width, height) orelse {
+                writeGpuResponse(.create_app_surface, seq, .io_error, 0, 0, 0);
+                return;
+            };
+            writeGpuResponse(.create_app_surface, seq, .ok, width, height, packed_handles);
         },
         .present_test_pattern => {
             if (!presentTestPattern()) {

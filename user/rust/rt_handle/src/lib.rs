@@ -1160,6 +1160,8 @@ pub enum ServiceKind {
     Vfs,
     Block,
     PersistentFs,
+    Capctl,
+    Gpu,
     Unknown(u64),
 }
 
@@ -1170,6 +1172,8 @@ impl ServiceKind {
             2 => Self::Vfs,
             4 => Self::Block,
             5 => Self::PersistentFs,
+            6 => Self::Capctl,
+            7 => Self::Gpu,
             _ => Self::Unknown(raw),
         }
     }
@@ -1180,6 +1184,8 @@ impl ServiceKind {
             Self::Vfs => "vfs",
             Self::Block => "block",
             Self::PersistentFs => "persistent_fs",
+            Self::Capctl => "capctl",
+            Self::Gpu => "gpu",
             Self::Unknown(_) => "unknown",
         }
     }

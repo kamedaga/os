@@ -100,8 +100,16 @@ pub fn ensure_disk_image(
         .checked_sub(1)
         .ok_or_else(|| format!("disk is too small for GPT: {} sectors", total_sectors))?;
 
-    write_at(&mut file, GPT_PRIMARY_ENTRIES_LBA * SECTOR_BYTES, &primary_entries)?;
-    write_at(&mut file, backup_entries_lba * SECTOR_BYTES, &backup_entries)?;
+    write_at(
+        &mut file,
+        GPT_PRIMARY_ENTRIES_LBA * SECTOR_BYTES,
+        &primary_entries,
+    )?;
+    write_at(
+        &mut file,
+        backup_entries_lba * SECTOR_BYTES,
+        &backup_entries,
+    )?;
 
     let primary_header = build_gpt_header(
         GPT_PRIMARY_HEADER_LBA,
@@ -122,8 +130,16 @@ pub fn ensure_disk_image(
         &backup_entries,
     );
 
-    write_at(&mut file, GPT_PRIMARY_HEADER_LBA * SECTOR_BYTES, &primary_header)?;
-    write_at(&mut file, (total_sectors - 1) * SECTOR_BYTES, &backup_header)?;
+    write_at(
+        &mut file,
+        GPT_PRIMARY_HEADER_LBA * SECTOR_BYTES,
+        &primary_header,
+    )?;
+    write_at(
+        &mut file,
+        (total_sectors - 1) * SECTOR_BYTES,
+        &backup_header,
+    )?;
     file.flush()
         .map_err(|err| format!("failed to flush {}: {err}", disk_image.display()))?;
 
@@ -142,17 +158,28 @@ fn create_truncated_file(path: &Path, size_bytes: u64) -> Result<File, String> {
         .write(true)
         .open(path)
         .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
-    file.set_len(size_bytes)
-        .map_err(|err| format!("failed to resize {} to {} bytes: {err}", path.display(), size_bytes))?;
+    file.set_len(size_bytes).map_err(|err| {
+        format!(
+            "failed to resize {} to {} bytes: {err}",
+            path.display(),
+            size_bytes
+        )
+    })?;
     Ok(file)
 }
 
-fn plan_partitions(workspace: &WorkspaceConfig, total_sectors: u64) -> Result<Vec<PlannedPartition>, String> {
+fn plan_partitions(
+    workspace: &WorkspaceConfig,
+    total_sectors: u64,
+) -> Result<Vec<PlannedPartition>, String> {
     if workspace.disk.partitions.is_empty() {
         return Err("no [[disk.partition]] entries configured".to_string());
     }
     if total_sectors <= (GPT_PRIMARY_ENTRIES_LBA + GPT_ENTRY_SECTORS) * 2 {
-        return Err(format!("disk is too small for GPT: {} sectors", total_sectors));
+        return Err(format!(
+            "disk is too small for GPT: {} sectors",
+            total_sectors
+        ));
     }
 
     let mut partitions = workspace.disk.partitions.clone();
@@ -185,7 +212,10 @@ fn plan_partitions(workspace: &WorkspaceConfig, total_sectors: u64) -> Result<Ve
                 .checked_mul(MIB_BYTES / SECTOR_BYTES)
                 .ok_or_else(|| format!("partition '{}' size is too large", partition.id))?;
             if length_sectors == 0 {
-                return Err(format!("partition '{}' has invalid size 0 MiB", partition.id));
+                return Err(format!(
+                    "partition '{}' has invalid size 0 MiB",
+                    partition.id
+                ));
             }
             first_lba
                 .checked_add(length_sectors - 1)
@@ -280,7 +310,11 @@ fn write_protective_mbr(file: &mut File, total_sectors: u64) -> Result<(), Strin
     entry[4] = 0xEE;
     entry[5..8].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
     write_u32_le(entry, 8, 1);
-    write_u32_le(entry, 12, u32::try_from(total_sectors.saturating_sub(1)).unwrap_or(u32::MAX));
+    write_u32_le(
+        entry,
+        12,
+        u32::try_from(total_sectors.saturating_sub(1)).unwrap_or(u32::MAX),
+    );
     sector[510] = 0x55;
     sector[511] = 0xAA;
     write_at(file, 0, &sector)
@@ -295,7 +329,11 @@ fn write_at(file: &mut File, offset: u64, bytes: &[u8]) -> Result<(), String> {
 
 fn write_utf16_name(entry: &mut [u8], offset: usize, name: &str) {
     let mut out = [0u8; PARTITION_NAME_MAX_CHARS * 2];
-    for (index, unit) in name.encode_utf16().take(PARTITION_NAME_MAX_CHARS).enumerate() {
+    for (index, unit) in name
+        .encode_utf16()
+        .take(PARTITION_NAME_MAX_CHARS)
+        .enumerate()
+    {
         let start = index * 2;
         out[start..start + 2].copy_from_slice(&unit.to_le_bytes());
     }

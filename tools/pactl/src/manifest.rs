@@ -1,6 +1,7 @@
 use crate::build::planned_artifact_path;
 use crate::config::{
-    app_kind_is_skipped, discover_apps, AppConfig, PublishEntry, SourceConfig, WorkspaceConfig,
+    app_is_skipped, discover_apps, include_skipped_artifacts_in_manifests, AppConfig, PublishEntry,
+    SourceConfig, WorkspaceConfig,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -34,7 +35,10 @@ struct StartupNode {
     block: Vec<String>,
 }
 
-pub fn generate_manifests(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<GeneratedManifestPaths, String> {
+pub fn generate_manifests(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<GeneratedManifestPaths, String> {
     let apps = discover_manifest_apps(workspace_root, workspace)?;
 
     let bootfs_path = workspace_root.join(&workspace.manifests.bootfs);
@@ -48,22 +52,12 @@ pub fn generate_manifests(workspace_root: &Path, workspace: &WorkspaceConfig) ->
     let startup_contents = render_startup_manifest(&apps)?;
     write_if_changed(&startup_path, &startup_contents)?;
 
-    let bootfs_contents = render_fs_manifest(
-        "bootfs",
-        workspace_root,
-        workspace,
-        &apps,
-        &startup_path,
-    )?;
+    let bootfs_contents =
+        render_fs_manifest("bootfs", workspace_root, workspace, &apps, &startup_path)?;
     write_if_changed(&bootfs_path, &bootfs_contents)?;
 
-    let rootfs_contents = render_fs_manifest(
-        "rootfs",
-        workspace_root,
-        workspace,
-        &apps,
-        &startup_path,
-    )?;
+    let rootfs_contents =
+        render_fs_manifest("rootfs", workspace_root, workspace, &apps, &startup_path)?;
     write_if_changed(&rootfs_path, &rootfs_contents)?;
 
     Ok(GeneratedManifestPaths {
@@ -73,11 +67,19 @@ pub fn generate_manifests(workspace_root: &Path, workspace: &WorkspaceConfig) ->
     })
 }
 
-fn discover_manifest_apps(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<Vec<AppConfig>, String> {
+fn discover_manifest_apps(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<Vec<AppConfig>, String> {
     let apps = discover_apps(workspace_root, workspace)?;
     let mut selected = Vec::with_capacity(apps.len());
+    let mut omitted_skipped_count = 0usize;
     for app in apps {
-        if app_kind_is_skipped(workspace, &app.app.kind) {
+        if app_is_skipped(workspace, &app) {
+            if !include_skipped_artifacts_in_manifests(workspace) {
+                omitted_skipped_count += 1;
+                continue;
+            }
             let artifact = planned_artifact_path(workspace_root, workspace, &app);
             if !artifact_is_usable(&artifact)? {
                 eprintln!(
@@ -88,6 +90,9 @@ fn discover_manifest_apps(workspace_root: &Path, workspace: &WorkspaceConfig) ->
             }
         }
         selected.push(app);
+    }
+    if omitted_skipped_count > 0 {
+        eprintln!("pactl: omitted {omitted_skipped_count} skipped app(s) from generated manifests");
     }
     Ok(selected)
 }
@@ -155,7 +160,10 @@ fn render_fs_manifest(
     let mut seen_paths = BTreeSet::new();
     for entry in &entries {
         if !seen_paths.insert(entry.image_path.clone()) {
-            return Err(format!("duplicate {fs_name} publish path: {}", entry.image_path));
+            return Err(format!(
+                "duplicate {fs_name} publish path: {}",
+                entry.image_path
+            ));
         }
     }
 
@@ -168,7 +176,10 @@ fn render_fs_manifest(
         } else if let Some(source_path) = entry.source_path {
             out.push_str(&source_path.display().to_string());
         } else {
-            return Err(format!("missing source path for {} entry {}", fs_name, entry.image_path));
+            return Err(format!(
+                "missing source path for {} entry {}",
+                fs_name, entry.image_path
+            ));
         }
         out.push('\n');
     }
@@ -232,8 +243,12 @@ fn order_startup_nodes(apps: &[AppConfig]) -> Result<Vec<StartupNode>, String> {
         let Some(startup) = &app.startup else {
             continue;
         };
-        let publish = find_publish(app, &startup.publish)
-            .ok_or_else(|| format!("startup.publish '{}' missing for app {}", startup.publish, app.app.id))?;
+        let publish = find_publish(app, &startup.publish).ok_or_else(|| {
+            format!(
+                "startup.publish '{}' missing for app {}",
+                startup.publish, app.app.id
+            )
+        })?;
         let node = StartupNode {
             app_id: app.app.id.clone(),
             action: startup.action.clone(),
@@ -247,7 +262,11 @@ fn order_startup_nodes(apps: &[AppConfig]) -> Result<Vec<StartupNode>, String> {
             ensure: startup.ensure.clone(),
             block: startup.block.clone(),
         };
-        if node.action.is_empty() || node.name.is_empty() || node.path.is_empty() || node.load.is_empty() {
+        if node.action.is_empty()
+            || node.name.is_empty()
+            || node.path.is_empty()
+            || node.load.is_empty()
+        {
             return Err(format!("startup fields missing for app {}", app.app.id));
         }
         if !names.insert(node.name.clone()) {
@@ -301,9 +320,10 @@ fn resolve_app_source_path(
     app: &AppConfig,
 ) -> Result<PathBuf, String> {
     match &app.source {
-        SourceConfig::File(_) | SourceConfig::Zig(_) | SourceConfig::Cargo(_) | SourceConfig::Capc(_) => {
-            Ok(planned_artifact_path(workspace_root, workspace, app))
-        }
+        SourceConfig::File(_)
+        | SourceConfig::Zig(_)
+        | SourceConfig::Cargo(_)
+        | SourceConfig::Capc(_) => Ok(planned_artifact_path(workspace_root, workspace, app)),
         SourceConfig::None => Err(format!("no source configured for app {}", app.app.id)),
     }
 }

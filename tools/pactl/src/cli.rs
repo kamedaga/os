@@ -9,12 +9,16 @@ use std::env;
 use std::path::Path;
 
 pub fn run(args: Vec<String>) -> Result<(), String> {
-    if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) {
         print_help();
         return Ok(());
     }
 
-    let cwd = env::current_dir().map_err(|err| format!("failed to get current directory: {err}"))?;
+    let cwd =
+        env::current_dir().map_err(|err| format!("failed to get current directory: {err}"))?;
     let workspace_root = find_workspace_root(&cwd)
         .ok_or_else(|| format!("could not find pactl.conf from {}", cwd.display()))?;
     let workspace = load_workspace_config(&workspace_root)?;
@@ -26,23 +30,33 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             println!("{}", workspace_root.join("pactl.conf").display());
             Ok(())
         }
-        [section, sub] if section == "app" && sub == "list" => cmd_app_list(&workspace_root, &workspace),
+        [section, sub] if section == "app" && sub == "list" => {
+            cmd_app_list(&workspace_root, &workspace)
+        }
         [section, sub, app_id] if section == "app" && sub == "show" => {
             cmd_app_show(&workspace_root, &workspace, app_id)
         }
         [section, sub] if section == "build" && sub == "userland" => {
             cmd_build_userland(&workspace_root, &workspace, None, BuildOptions::default())
         }
-        [section, sub, app_id] if section == "build" && sub == "userland" => {
-            cmd_build_userland(&workspace_root, &workspace, Some(app_id), BuildOptions::default())
-        }
+        [section, sub, app_id] if section == "build" && sub == "userland" => cmd_build_userland(
+            &workspace_root,
+            &workspace,
+            Some(app_id),
+            BuildOptions::default(),
+        ),
         [section, sub, flag] if section == "build" && sub == "userland" && flag == "--fresh" => {
             cmd_build_userland(&workspace_root, &workspace, None, BuildOptions::fresh())
         }
         [section, sub, app_id, flag]
             if section == "build" && sub == "userland" && flag == "--fresh" =>
         {
-            cmd_build_userland(&workspace_root, &workspace, Some(app_id), BuildOptions::fresh())
+            cmd_build_userland(
+                &workspace_root,
+                &workspace,
+                Some(app_id),
+                BuildOptions::fresh(),
+            )
         }
         [section, sub] if section == "sync" && sub == "rootfs" => {
             cmd_sync_rootfs(&workspace_root, &workspace)
@@ -97,14 +111,16 @@ fn print_help() {
     println!("  pactl gen manifests");
 }
 
-fn cmd_plan(workspace_root: &Path, workspace: &crate::config::WorkspaceConfig) -> Result<(), String> {
+fn cmd_plan(
+    workspace_root: &Path,
+    workspace: &crate::config::WorkspaceConfig,
+) -> Result<(), String> {
     let apps = discover_apps(workspace_root, workspace)?;
     println!("workspace: {}", workspace.workspace.name);
     println!("root: {}", workspace_root.display());
     println!(
         "kernel: {} (step: {})",
-        workspace.kernel.dir,
-        workspace.kernel.default_step
+        workspace.kernel.dir, workspace.kernel.default_step
     );
     println!(
         "disk image: {} ({} MiB)",
@@ -113,6 +129,9 @@ fn cmd_plan(workspace_root: &Path, workspace: &crate::config::WorkspaceConfig) -
     );
     if !workspace.userland.skip_kinds.is_empty() {
         println!("skip kinds: {}", workspace.userland.skip_kinds.join(", "));
+    }
+    if !workspace.userland.skip_apps.is_empty() {
+        println!("skip apps: {}", workspace.userland.skip_apps.join(", "));
     }
     println!("apps dir: {}", workspace.userland.apps_dir);
     println!("apps: {}", apps.len());
@@ -141,7 +160,10 @@ fn cmd_plan(workspace_root: &Path, workspace: &crate::config::WorkspaceConfig) -
     Ok(())
 }
 
-fn cmd_app_list(workspace_root: &Path, workspace: &crate::config::WorkspaceConfig) -> Result<(), String> {
+fn cmd_app_list(
+    workspace_root: &Path,
+    workspace: &crate::config::WorkspaceConfig,
+) -> Result<(), String> {
     let apps = discover_apps(workspace_root, workspace)?;
     for app in apps {
         println!(
@@ -169,7 +191,10 @@ fn cmd_app_show(
     Ok(())
 }
 
-fn cmd_gen_manifests(workspace_root: &Path, workspace: &crate::config::WorkspaceConfig) -> Result<(), String> {
+fn cmd_gen_manifests(
+    workspace_root: &Path,
+    workspace: &crate::config::WorkspaceConfig,
+) -> Result<(), String> {
     let outputs = generate_manifests(workspace_root, workspace)?;
     println!("bootfs: {}", outputs.bootfs.display());
     println!("rootfs: {}", outputs.rootfs.display());
@@ -263,7 +288,10 @@ fn cmd_disk_ensure(
     let outputs = ensure_disk_image(workspace_root, workspace, mode)?;
     println!("disk: {}", outputs.disk_image.display());
     println!("size: {} bytes", outputs.size_bytes);
-    println!("recreated: {}", if outputs.recreated { "yes" } else { "no" });
+    println!(
+        "recreated: {}",
+        if outputs.recreated { "yes" } else { "no" }
+    );
     Ok(())
 }
 
@@ -280,9 +308,16 @@ fn cmd_setup(
             SetupMode::Full => "full",
         }
     );
-    println!("kernel: {} ({})", outputs.kernel.build_dir.display(), outputs.kernel.step);
+    println!(
+        "kernel: {} ({})",
+        outputs.kernel.build_dir.display(),
+        outputs.kernel.step
+    );
     println!("disk: {}", outputs.disk.disk_image.display());
-    println!("disk recreated: {}", if outputs.disk.recreated { "yes" } else { "no" });
+    println!(
+        "disk recreated: {}",
+        if outputs.disk.recreated { "yes" } else { "no" }
+    );
     println!("bootfs image: {}", outputs.bootfs.bootfs_image.display());
     println!("esp manifest: {}", outputs.bootfs.esp_manifest.display());
     println!("rootfs manifest: {}", outputs.rootfs.manifest.display());

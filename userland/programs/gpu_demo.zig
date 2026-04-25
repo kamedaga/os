@@ -1,82 +1,26 @@
 const std = @import("std");
-const gpu_client = @import("support_root").gpu_client;
+const gl_client = @import("support_root").gl_client;
 const gpu_protocol = @import("support_root").gpu_protocol;
 
 const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
 const request_va: u64 = 0x3C11_4000;
 const response_va: u64 = 0x3C11_5000;
-const virgl_object_null: u32 = 0;
-const virgl_object_blend: u32 = 1;
-const virgl_object_rasterizer: u32 = 2;
-const virgl_object_dsa: u32 = 3;
-const virgl_object_shader: u32 = 4;
-const virgl_object_vertex_elements: u32 = 5;
-const virgl_object_surface: u32 = 8;
-const virgl_ccmd_create_object: u32 = 1;
-const virgl_ccmd_bind_object: u32 = 2;
-const virgl_ccmd_set_viewport_state: u32 = 4;
-const virgl_ccmd_set_framebuffer_state: u32 = 5;
-const virgl_ccmd_set_vertex_buffers: u32 = 6;
-const virgl_ccmd_clear: u32 = 7;
-const virgl_ccmd_draw_vbo: u32 = 8;
-const virgl_ccmd_resource_inline_write: u32 = 9;
-const virgl_ccmd_bind_shader: u32 = 31;
-const virgl_format_b8g8r8a8_unorm: u32 = 1;
-const virgl_format_r32g32b32a32_float: u32 = 31;
-const virgl_obj_surface_size: u32 = 5;
-const virgl_obj_blend_size: u32 = 11;
-const virgl_obj_dsa_size: u32 = 5;
-const virgl_obj_rasterizer_size: u32 = 9;
-const virgl_obj_shader_base_size: u32 = 5;
-const virgl_obj_vertex_elements_size_2: u32 = 9;
-const virgl_set_viewport_state_size_1: u32 = 7;
-const virgl_set_framebuffer_state_size_1: u32 = 3;
-const virgl_set_vertex_buffers_size_1: u32 = 3;
-const virgl_obj_clear_size: u32 = 8;
-const virgl_draw_vbo_size: u32 = 12;
-const pipe_clear_color0: u32 = 1 << 2;
-const pipe_mask_rgba: u32 = 0xf;
-const pipe_shader_vertex: u32 = 0;
-const pipe_shader_fragment: u32 = 1;
-const pipe_prim_triangles: u32 = 4;
-const vertex_stride: u32 = 32;
 const cube_face_vertex_count: usize = 36;
 const cube_edge_vertex_count: usize = 72;
 const cube_vertex_count: usize = cube_face_vertex_count + cube_edge_vertex_count;
-const cube_vertex_float_count: usize = cube_vertex_count * 8;
-const cube_vertex_bytes: u32 = cube_vertex_float_count * @sizeOf(f32);
-const frame_command_overhead_bytes: usize = 52 + 48 + 52;
 const frame_command_storage_bytes: usize = 4096;
 const frame_count: usize = 180;
 const edge_width: f32 = 0.014;
 
 comptime {
-    const frame_command_bytes = @as(usize, cube_vertex_bytes) + frame_command_overhead_bytes;
-    if (frame_command_bytes > gpu_protocol.request_payload_bytes) {
+    if (gl_client.frameCommandBytesForVertices(cube_vertex_count) > gpu_protocol.request_payload_bytes) {
         @compileError("gpu_demo frame command exceeds gpu IPC payload");
     }
-    if (frame_command_bytes > frame_command_storage_bytes) {
+    if (gl_client.frameCommandBytesForVertices(cube_vertex_count) > frame_command_storage_bytes) {
         @compileError("gpu_demo frame command exceeds local command storage");
     }
 }
-
-const vertex_shader =
-    "VERT\n" ++
-    "DCL IN[0]\n" ++
-    "DCL IN[1]\n" ++
-    "DCL OUT[0], POSITION\n" ++
-    "DCL OUT[1], COLOR\n" ++
-    " 0: MOV OUT[1], IN[1]\n" ++
-    " 1: MOV OUT[0], IN[0]\n" ++
-    " 2: END\n";
-
-const fragment_shader =
-    "FRAG\n" ++
-    "DCL IN[0], COLOR, LINEAR\n" ++
-    "DCL OUT[0], COLOR\n" ++
-    " 0: MOV OUT[0], IN[0]\n" ++
-    " 1: END\n";
 
 const Vec3 = struct {
     x: f32,
@@ -131,7 +75,7 @@ const cube_edges = [_][2]usize{
 
 var setup_commands_storage: [1024]u8 = undefined;
 var frame_commands_storage: [frame_command_storage_bytes]u8 = undefined;
-var cube_vertices_storage: [cube_vertex_float_count]f32 = undefined;
+var cube_vertices_storage: [cube_vertex_count]gl_client.Vertex = undefined;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -163,30 +107,6 @@ fn userLogHex(label: []const u8, value: u64) void {
     var buf: [96]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "{s}0x{X}\n", .{ label, value }) catch return;
     _ = userLog(msg);
-}
-
-fn virglCmd0(command: u32, object: u32, len: u32) u32 {
-    return command | (object << 8) | (len << 16);
-}
-
-fn f32Bits(value: f32) u32 {
-    return @bitCast(value);
-}
-
-fn appendU32(buffer: []u8, index: *usize, value: u32) void {
-    const start = index.*;
-    std.mem.writeInt(u32, buffer[start..][0..4], value, .little);
-    index.* += 4;
-}
-
-fn appendF32(buffer: []u8, index: *usize, value: f32) void {
-    appendU32(buffer, index, f32Bits(value));
-}
-
-fn appendVertexData(buffer: []u8, index: *usize, vertices: []const f32) void {
-    for (vertices) |value| {
-        appendF32(buffer, index, value);
-    }
 }
 
 fn rotatePoint(point: Vec3, sin_x: f32, cos_x: f32, sin_y: f32, cos_y: f32) Vec3 {
@@ -227,19 +147,21 @@ fn sortedFaces(rotated: *const [cube_points.len]Vec3) [cube_faces.len]usize {
     return order;
 }
 
-fn emitVertex(out: *[cube_vertex_float_count]f32, index: *usize, position: Vec3, r: f32, g: f32, b: f32) void {
-    out[index.* + 0] = position.x;
-    out[index.* + 1] = position.y;
-    out[index.* + 2] = position.z;
-    out[index.* + 3] = 1.0;
-    out[index.* + 4] = r;
-    out[index.* + 5] = g;
-    out[index.* + 6] = b;
-    out[index.* + 7] = 1.0;
-    index.* += 8;
+fn emitVertex(out: *[cube_vertex_count]gl_client.Vertex, index: *usize, position: Vec3, r: f32, g: f32, b: f32) void {
+    out[index.*] = .{
+        .x = position.x,
+        .y = position.y,
+        .z = position.z,
+        .w = 1.0,
+        .r = r,
+        .g = g,
+        .b = b,
+        .a = 1.0,
+    };
+    index.* += 1;
 }
 
-fn emitCubeVertex(out: *[cube_vertex_float_count]f32, index: *usize, point: Vec3, face: Face, shade: f32) void {
+fn emitCubeVertex(out: *[cube_vertex_count]gl_client.Vertex, index: *usize, point: Vec3, face: Face, shade: f32) void {
     const projected = projectPoint(point);
     emitVertex(out, index, projected, face.r * shade, face.g * shade, face.bcol * shade);
 }
@@ -260,7 +182,7 @@ fn edgeQuadPoints(a: Vec3, b: Vec3) [4]Vec3 {
     };
 }
 
-fn emitEdge(out: *[cube_vertex_float_count]f32, index: *usize, a: Vec3, b: Vec3) void {
+fn emitEdge(out: *[cube_vertex_count]gl_client.Vertex, index: *usize, a: Vec3, b: Vec3) void {
     const quad = edgeQuadPoints(a, b);
     emitVertex(out, index, quad[0], 0.015, 0.018, 0.024);
     emitVertex(out, index, quad[1], 0.015, 0.018, 0.024);
@@ -270,7 +192,7 @@ fn emitEdge(out: *[cube_vertex_float_count]f32, index: *usize, a: Vec3, b: Vec3)
     emitVertex(out, index, quad[3], 0.015, 0.018, 0.024);
 }
 
-fn buildCubeVertices(out: *[cube_vertex_float_count]f32, sin_x: f32, cos_x: f32, sin_y: f32, cos_y: f32) void {
+fn buildCubeVertices(out: *[cube_vertex_count]gl_client.Vertex, sin_x: f32, cos_x: f32, sin_y: f32, cos_y: f32) void {
     var rotated: [cube_points.len]Vec3 = undefined;
     var projected: [cube_points.len]Vec3 = undefined;
     for (cube_points, 0..) |point, i| {
@@ -296,223 +218,27 @@ fn buildCubeVertices(out: *[cube_vertex_float_count]f32, sin_x: f32, cos_x: f32,
     }
 }
 
-fn appendBindObject(buffer: []u8, index: *usize, object: u32, handle: u32) void {
-    appendU32(buffer, index, virglCmd0(virgl_ccmd_bind_object, object, 1));
-    appendU32(buffer, index, handle);
-}
-
-fn appendShader(buffer: []u8, index: *usize, handle: u32, shader_type: u32, source: []const u8) void {
-    const shader_len: u32 = @intCast(source.len + 1);
-    const padded_dwords = (shader_len + 3) / 4;
-    appendU32(buffer, index, virglCmd0(virgl_ccmd_create_object, virgl_object_shader, virgl_obj_shader_base_size + padded_dwords));
-    appendU32(buffer, index, handle);
-    appendU32(buffer, index, shader_type);
-    appendU32(buffer, index, shader_len);
-    appendU32(buffer, index, 300);
-    appendU32(buffer, index, 0);
-    var i: usize = 0;
-    while (i < source.len) : (i += 1) {
-        buffer[index.*] = source[i];
-        index.* += 1;
-    }
-    buffer[index.*] = 0;
-    index.* += 1;
-    while ((index.* & 0x3) != 0) {
-        buffer[index.*] = 0;
-        index.* += 1;
-    }
-}
-
-fn appendBindShader(buffer: []u8, index: *usize, handle: u32, shader_type: u32) void {
-    appendU32(buffer, index, virglCmd0(virgl_ccmd_bind_shader, virgl_object_null, 2));
-    appendU32(buffer, index, handle);
-    appendU32(buffer, index, shader_type);
-}
-
-fn appendFramebufferAndClear(buffer: []u8, index: *usize, target: gpu_client.RenderTarget) void {
-    appendU32(buffer, index, virglCmd0(virgl_ccmd_set_framebuffer_state, virgl_object_null, virgl_set_framebuffer_state_size_1));
-    appendU32(buffer, index, 1);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, target.surface_id);
-
-    appendU32(buffer, index, virglCmd0(virgl_ccmd_clear, virgl_object_null, virgl_obj_clear_size));
-    appendU32(buffer, index, pipe_clear_color0);
-    appendU32(buffer, index, f32Bits(0.03));
-    appendU32(buffer, index, f32Bits(0.045));
-    appendU32(buffer, index, f32Bits(0.065));
-    appendU32(buffer, index, f32Bits(1.0));
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-}
-
-fn appendVertexBufferWrite(buffer: []u8, index: *usize, target: gpu_client.RenderTarget, vertices: []const f32) void {
-    appendU32(buffer, index, virglCmd0(virgl_ccmd_resource_inline_write, virgl_object_null, 11 + ((cube_vertex_bytes + 3) / 4)));
-    appendU32(buffer, index, target.vertex_buffer_id);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, cube_vertex_bytes);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, cube_vertex_bytes);
-    appendU32(buffer, index, 1);
-    appendU32(buffer, index, 1);
-    appendVertexData(buffer, index, vertices);
-}
-
-fn appendDraw(buffer: []u8, index: *usize, vertex_count: u32) void {
-    appendU32(buffer, index, virglCmd0(virgl_ccmd_draw_vbo, virgl_object_null, virgl_draw_vbo_size));
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, vertex_count);
-    appendU32(buffer, index, pipe_prim_triangles);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, 0);
-    appendU32(buffer, index, vertex_count - 1);
-    appendU32(buffer, index, 0);
-}
-
-fn buildSetupCommands(buffer: []u8, target: gpu_client.RenderTarget) []const u8 {
-    var index: usize = 0;
-    const ve_handle = target.surface_id + 1;
-    const vs_handle = target.surface_id + 2;
-    const fs_handle = target.surface_id + 3;
-    const blend_handle = target.surface_id + 4;
-    const dsa_handle = target.surface_id + 5;
-    const rasterizer_handle = target.surface_id + 6;
-
-    appendU32(buffer, &index, virglCmd0(virgl_ccmd_create_object, virgl_object_surface, virgl_obj_surface_size));
-    appendU32(buffer, &index, target.surface_id);
-    appendU32(buffer, &index, target.resource_id);
-    appendU32(buffer, &index, virgl_format_b8g8r8a8_unorm);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-
-    appendU32(buffer, &index, virglCmd0(virgl_ccmd_create_object, virgl_object_vertex_elements, virgl_obj_vertex_elements_size_2));
-    appendU32(buffer, &index, ve_handle);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, virgl_format_r32g32b32a32_float);
-    appendU32(buffer, &index, 16);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, virgl_format_r32g32b32a32_float);
-    appendBindObject(buffer, &index, virgl_object_vertex_elements, ve_handle);
-
-    appendU32(buffer, &index, virglCmd0(virgl_ccmd_set_vertex_buffers, virgl_object_null, virgl_set_vertex_buffers_size_1));
-    appendU32(buffer, &index, vertex_stride);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, target.vertex_buffer_id);
-
-    appendShader(buffer, &index, vs_handle, pipe_shader_vertex, vertex_shader);
-    appendBindShader(buffer, &index, vs_handle, pipe_shader_vertex);
-    appendShader(buffer, &index, fs_handle, pipe_shader_fragment, fragment_shader);
-    appendBindShader(buffer, &index, fs_handle, pipe_shader_fragment);
-
-    appendU32(buffer, &index, virglCmd0(virgl_ccmd_create_object, virgl_object_blend, virgl_obj_blend_size));
-    appendU32(buffer, &index, blend_handle);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, pipe_mask_rgba << 27);
-    var blend_pad: usize = 1;
-    while (blend_pad < 8) : (blend_pad += 1) appendU32(buffer, &index, 0);
-    appendBindObject(buffer, &index, virgl_object_blend, blend_handle);
-
-    appendU32(buffer, &index, virglCmd0(virgl_ccmd_create_object, virgl_object_dsa, virgl_obj_dsa_size));
-    appendU32(buffer, &index, dsa_handle);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendBindObject(buffer, &index, virgl_object_dsa, dsa_handle);
-
-    appendU32(buffer, &index, virglCmd0(virgl_ccmd_create_object, virgl_object_rasterizer, virgl_obj_rasterizer_size));
-    appendU32(buffer, &index, rasterizer_handle);
-    appendU32(buffer, &index, (1 << 1) | (1 << 29) | (1 << 30));
-    appendF32(buffer, &index, 1.0);
-    appendU32(buffer, &index, 0);
-    appendU32(buffer, &index, 0);
-    appendF32(buffer, &index, 1.0);
-    appendF32(buffer, &index, 0.0);
-    appendF32(buffer, &index, 0.0);
-    appendF32(buffer, &index, 0.0);
-    appendBindObject(buffer, &index, virgl_object_rasterizer, rasterizer_handle);
-
-    appendU32(buffer, &index, virglCmd0(virgl_ccmd_set_viewport_state, virgl_object_null, virgl_set_viewport_state_size_1));
-    appendU32(buffer, &index, 0);
-    appendF32(buffer, &index, @as(f32, @floatFromInt(target.width)) / 2.0);
-    appendF32(buffer, &index, @as(f32, @floatFromInt(target.height)) / 2.0);
-    appendF32(buffer, &index, 0.5);
-    appendF32(buffer, &index, @as(f32, @floatFromInt(target.width)) / 2.0);
-    appendF32(buffer, &index, @as(f32, @floatFromInt(target.height)) / 2.0);
-    appendF32(buffer, &index, 0.5);
-
-    return buffer[0..index];
-}
-
-fn buildFrameCommands(buffer: []u8, target: gpu_client.RenderTarget, vertices: []const f32) []const u8 {
-    var index: usize = 0;
-    appendFramebufferAndClear(buffer, &index, target);
-    appendVertexBufferWrite(buffer, &index, target, vertices);
-    appendDraw(buffer, &index, cube_vertex_count);
-    return buffer[0..index];
-}
-
 pub export fn _start() noreturn {
     _ = userLog("GpuDemo: started\n");
-    var client = gpu_client.Client.connect(.{
+    var gl = gl_client.Context.connect(.{
         .request_va = request_va,
         .response_va = response_va,
         .endpoint_id = gpu_protocol.endpoint_id,
-    }) catch |err| {
-        _ = userLog("GpuDemo: gpu connect failed\n");
+    }, setup_commands_storage[0..]) catch |err| {
+        _ = userLog("GpuDemo: gl connect failed\n");
         _ = userLog(@errorName(err));
         _ = userLog("\n");
         while (true) asm volatile ("pause");
     };
-    _ = userLog("GpuDemo: gpu connect ok\n");
-
-    const caps = client.queryCaps() catch |err| {
-        _ = userLog("GpuDemo: query_caps failed\n");
-        _ = userLog(@errorName(err));
-        _ = userLog("\n");
-        while (true) asm volatile ("pause");
-    };
-    userLogHex("GpuDemo: features=", caps.features);
-    userLogNum("GpuDemo: capset_id=", caps.capset_id);
-    userLogNum("GpuDemo: capset_max_version=", caps.capset_max_version);
-    if ((caps.features & gpu_protocol.feature_submit_3d) == 0 or
-        (caps.features & gpu_protocol.feature_present_3d) == 0)
-    {
-        _ = userLog("GpuDemo: 3d render unavailable\n");
-        while (true) asm volatile ("pause");
-    }
-
-    const target = client.prepare3d() catch |err| {
-        _ = userLog("GpuDemo: prepare_3d failed\n");
-        _ = userLog(@errorName(err));
-        _ = userLog("\n");
-        while (true) asm volatile ("pause");
-    };
-    userLogNum("GpuDemo: render_width=", target.width);
-    userLogNum("GpuDemo: render_height=", target.height);
-    userLogNum("GpuDemo: resource_id=", target.resource_id);
-    userLogNum("GpuDemo: surface_id=", target.surface_id);
-    userLogNum("GpuDemo: vertex_buffer_id=", target.vertex_buffer_id);
-
-    client.submit3d(buildSetupCommands(setup_commands_storage[0..], target)) catch |err| {
-        _ = userLog("GpuDemo: submit_3d failed\n");
-        _ = userLog(@errorName(err));
-        _ = userLog("\n");
-        while (true) asm volatile ("pause");
-    };
+    _ = userLog("GpuDemo: gl connect ok\n");
+    userLogHex("GpuDemo: features=", gl.caps.features);
+    userLogNum("GpuDemo: capset_id=", gl.caps.capset_id);
+    userLogNum("GpuDemo: capset_max_version=", gl.caps.capset_max_version);
+    userLogNum("GpuDemo: render_width=", gl.target.width);
+    userLogNum("GpuDemo: render_height=", gl.target.height);
+    userLogNum("GpuDemo: resource_id=", gl.target.resource_id);
+    userLogNum("GpuDemo: surface_id=", gl.target.surface_id);
+    userLogNum("GpuDemo: vertex_buffer_id=", gl.target.vertex_buffer_id);
     _ = userLog("GpuDemo: setup_3d ok\n");
 
     var sin_x: f32 = 0.0;
@@ -523,18 +249,13 @@ pub export fn _start() noreturn {
     const step_x_cos: f32 = 0.999455;
     const step_y_sin: f32 = 0.052;
     const step_y_cos: f32 = 0.998647;
+    const clear_color: gl_client.Color = .{ .r = 0.03, .g = 0.045, .b = 0.065, .a = 1.0 };
 
     var frame: usize = 0;
     while (frame < frame_count) : (frame += 1) {
         buildCubeVertices(&cube_vertices_storage, sin_x, cos_x, sin_y, cos_y);
-        client.submit3d(buildFrameCommands(frame_commands_storage[0..], target, cube_vertices_storage[0..])) catch |err| {
-            _ = userLog("GpuDemo: frame submit failed\n");
-            _ = userLog(@errorName(err));
-            _ = userLog("\n");
-            while (true) asm volatile ("pause");
-        };
-        client.present3d() catch |err| {
-            _ = userLog("GpuDemo: present failed\n");
+        gl.drawTrianglesAndPresent(cube_vertices_storage[0..], clear_color, frame_commands_storage[0..]) catch |err| {
+            _ = userLog("GpuDemo: frame draw failed\n");
             _ = userLog(@errorName(err));
             _ = userLog("\n");
             while (true) asm volatile ("pause");

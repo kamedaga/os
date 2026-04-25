@@ -7,7 +7,10 @@ pub struct KernelBuildOutputs {
     pub step: String,
 }
 
-pub fn build_kernel(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<KernelBuildOutputs, String> {
+pub fn build_kernel(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<KernelBuildOutputs, String> {
     let zig = if workspace.toolchain.zig.is_empty() {
         "zig"
     } else {

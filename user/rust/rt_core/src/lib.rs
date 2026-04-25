@@ -96,6 +96,7 @@ pub mod syscall {
     pub const GRANT_VM_OBJECT: u64 = 0x1F;
     pub const INSTALL_EXEC_IMAGE: u64 = 0x20;
     pub const GRANT_EXEC_IMAGE: u64 = 0x21;
+    pub const GRANT_CAP_ON_ENDPOINT: u64 = 0x24;
     pub const INSTALL_ENDPOINT: u64 = 0x26;
     pub const MAP_VM_OBJECT: u64 = 0x28;
     pub const SLICE_VM_OBJECT: u64 = 0x29;

@@ -75,6 +75,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "caplibgl"
+version = "0.1.0"
+dependencies = [
+ "rt_core",
+ "rt_handle",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"

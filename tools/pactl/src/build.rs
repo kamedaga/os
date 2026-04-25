@@ -1,5 +1,5 @@
 use crate::config::{
-    app_kind_is_skipped, discover_apps, AppConfig, CargoSource, FileSource, SourceConfig,
+    app_is_skipped, discover_apps, AppConfig, CargoSource, FileSource, SourceConfig,
     WorkspaceConfig, ZigSource,
 };
 use std::fs;
@@ -35,14 +35,6 @@ impl BuildOptions {
             ignore_skip_kinds: false,
         }
     }
-
-    pub const fn setup() -> Self {
-        Self {
-            force: true,
-            warn_stale_cargo: false,
-            ignore_skip_kinds: true,
-        }
-    }
 }
 
 pub fn build_userland(
@@ -71,7 +63,7 @@ pub fn build_userland(
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
 
-        if !allow_skipped_kind_build && app_kind_is_skipped(workspace, &app.app.kind) {
+        if !allow_skipped_kind_build && app_is_skipped(workspace, &app) {
             if output_is_usable(&output_path)? {
                 built.push(BuildArtifact {
                     app_id: app.app.id,
@@ -87,7 +79,9 @@ pub fn build_userland(
         }
 
         match &app.source {
-            SourceConfig::Zig(src) => build_zig_app(workspace_root, workspace, &app, src, &output_path)?,
+            SourceConfig::Zig(src) => {
+                build_zig_app(workspace_root, workspace, &app, src, &output_path)?
+            }
             SourceConfig::Cargo(src) => {
                 build_cargo_app(workspace_root, workspace, &app, src, &output_path, options)?
             }
@@ -134,7 +128,9 @@ fn build_zig_app(
     output_path: &Path,
 ) -> Result<(), String> {
     let zig = tool_or_default(&workspace.toolchain.zig, "zig");
-    let cache_root = workspace_root.join(&workspace.artifacts.dir).join("zig-cache");
+    let cache_root = workspace_root
+        .join(&workspace.artifacts.dir)
+        .join("zig-cache");
     let local_cache = cache_root.join("local");
     let global_cache = cache_root.join("global");
     fs::create_dir_all(&local_cache)
@@ -189,7 +185,10 @@ fn build_zig_app(
         cmd.arg("--dep").arg("persistent_fs_layout");
         cmd.arg("-Msupport_root=userland/support/support_root.zig");
     }
-    if imports.iter().any(|item| item == "support_root" || item == "persistent_fs_layout") {
+    if imports
+        .iter()
+        .any(|item| item == "support_root" || item == "persistent_fs_layout")
+    {
         cmd.arg("-Mpersistent_fs_layout=userland/support/persistent_fs_layout.zig");
     }
 
@@ -236,7 +235,9 @@ fn build_cargo_app(
     let cargo = tool_or_default(&workspace.toolchain.cargo, "cargo");
     let manifest_path = workspace_root.join(&src.manifest);
     let target_dir = if src.target_dir.is_empty() {
-        workspace_root.join(&workspace.artifacts.dir).join("cargo-target")
+        workspace_root
+            .join(&workspace.artifacts.dir)
+            .join("cargo-target")
     } else {
         workspace_root.join(&src.target_dir)
     };
@@ -271,7 +272,10 @@ fn build_cargo_app(
     let built_path = if src.target.is_empty() {
         target_dir.join(profile_dir).join(executable_name)
     } else {
-        target_dir.join(&src.target).join(profile_dir).join(executable_name)
+        target_dir
+            .join(&src.target)
+            .join(profile_dir)
+            .join(executable_name)
     };
     if !built_path.is_file() {
         return Err(format!(
@@ -292,8 +296,8 @@ fn build_file_app(
     options: BuildOptions,
 ) -> Result<(), String> {
     let source_path = workspace_root.join(&src.path);
-    let should_rebuild = !src.rebuild_tool.is_empty()
-        && (options.force || !output_is_usable(&source_path)?);
+    let should_rebuild =
+        !src.rebuild_tool.is_empty() && (options.force || !output_is_usable(&source_path)?);
 
     if should_rebuild {
         let mut cmd = Command::new(resolve_tool(workspace, &src.rebuild_tool));
@@ -306,7 +310,10 @@ fn build_file_app(
         for arg in &src.rebuild_args {
             cmd.arg(arg);
         }
-        run_command(&format!("rebuild file source for app {}", app.app.id), &mut cmd)?;
+        run_command(
+            &format!("rebuild file source for app {}", app.app.id),
+            &mut cmd,
+        )?;
     }
 
     if !source_path.is_file() {
@@ -360,8 +367,11 @@ fn path_has_newer_files(path: &Path, cutoff: SystemTime) -> Result<bool, String>
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(modified_time(path)? > cutoff),
         Ok(metadata) if metadata.is_dir() => {
-            for entry in fs::read_dir(path).map_err(|err| format!("failed to read {}: {err}", path.display()))? {
-                let entry = entry.map_err(|err| format!("failed to read entry in {}: {err}", path.display()))?;
+            for entry in fs::read_dir(path)
+                .map_err(|err| format!("failed to read {}: {err}", path.display()))?
+            {
+                let entry = entry
+                    .map_err(|err| format!("failed to read entry in {}: {err}", path.display()))?;
                 if path_has_newer_files(&entry.path(), cutoff)? {
                     return Ok(true);
                 }
@@ -381,7 +391,11 @@ fn modified_time(path: &Path) -> Result<SystemTime, String> {
 }
 
 fn tool_or_default<'a>(value: &'a str, fallback: &'a str) -> &'a str {
-    if value.is_empty() { fallback } else { value }
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
 }
 
 fn resolve_tool<'a>(workspace: &'a WorkspaceConfig, tool: &'a str) -> &'a str {

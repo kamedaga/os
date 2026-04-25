@@ -41,7 +41,9 @@ pub fn ensure_host_tool(
     workspace: &WorkspaceConfig,
     tool: HostTool,
 ) -> Result<PathBuf, String> {
-    let output_dir = workspace_root.join(&workspace.artifacts.dir).join("host-tools");
+    let output_dir = workspace_root
+        .join(&workspace.artifacts.dir)
+        .join("host-tools");
     fs::create_dir_all(&output_dir)
         .map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
     let output_path = output_dir.join(tool.output_file_name());
@@ -55,7 +57,9 @@ pub fn ensure_host_tool(
     } else {
         workspace.toolchain.zig.as_str()
     };
-    let cache_root = workspace_root.join(&workspace.artifacts.dir).join("zig-cache");
+    let cache_root = workspace_root
+        .join(&workspace.artifacts.dir)
+        .join("zig-cache");
     let local_cache = cache_root.join("local");
     let global_cache = cache_root.join("global");
     fs::create_dir_all(&local_cache)
@@ -101,7 +105,11 @@ pub fn ensure_host_tool(
     Ok(output_path)
 }
 
-fn needs_rebuild(workspace_root: &Path, output_path: &Path, tool: HostTool) -> Result<bool, String> {
+fn needs_rebuild(
+    workspace_root: &Path,
+    output_path: &Path,
+    tool: HostTool,
+) -> Result<bool, String> {
     let output_time = match fs::metadata(output_path).and_then(|meta| meta.modified()) {
         Ok(time) => time,
         Err(_) => return Ok(true),

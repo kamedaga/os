@@ -192,6 +192,8 @@ var spawn_demo_vm_object_token: u64 = 0;
 var spawn_stdio_zero_page_source_va: u64 = 0;
 var spawn_exit_status_zero_page_source_va: u64 = 0;
 var shell_process_slot_cache: u64 = 0;
+var gpu_service_process_slot_cache: u64 = 0;
+var gpu_service_endpoint_id_cache: u64 = 0;
 
 const rust_spawn_demo_magic: u64 = 0x5253_5044_454D_4F31;
 const rust_spawn_demo_version: u64 = 1;
@@ -498,6 +500,14 @@ fn copyServiceRegistryShadowForSpawn() ?u64 {
     var i: usize = 0;
     while (i < 512) : (i += 1) {
         dst[i] = src[i];
+    }
+    if (gpu_service_process_slot_cache != 0 and gpu_service_endpoint_id_cache != 0) {
+        service_registry_abi.setServiceWithProcessSlot(
+            spawn_registry_copy_source_va,
+            .gpu,
+            gpu_service_process_slot_cache,
+            gpu_service_endpoint_id_cache,
+        );
     }
     return spawn_registry_copy_source_va;
 }
@@ -2429,6 +2439,8 @@ fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_pr
                 .block_endpoint_id = response.block_endpoint_id,
                 .status_flags = response.status_flags,
                 .block_profile = response.block_profile,
+                .gpu_process_slot = response.gpu_process_slot,
+                .gpu_endpoint_id = response.gpu_endpoint_id,
             };
         }
         _ = waitEvent(false, 1);
@@ -2465,11 +2477,13 @@ fn runGpuDriverExec(st: *ShellState) bool {
     };
     switch (status) {
         .ok => {
+            updateGpuServiceRegistry(response);
             st.writeLine("gpu driver spawned");
             shellLogLine("gpu driver spawned");
             return true;
         },
         .already => {
+            updateGpuServiceRegistry(response);
             st.writeLine("gpu driver already running");
             shellLogLine("gpu driver already running");
             return true;
@@ -2485,6 +2499,12 @@ fn runGpuDriverExec(st: *ShellState) bool {
             return false;
         },
     }
+}
+
+fn updateGpuServiceRegistry(response: capctl_protocol.Response) void {
+    if (response.gpu_process_slot == 0 or response.gpu_endpoint_id == 0) return;
+    gpu_service_process_slot_cache = response.gpu_process_slot;
+    gpu_service_endpoint_id_cache = response.gpu_endpoint_id;
 }
 
 fn resetServiceClients(st: *ShellState) void {
@@ -2512,8 +2532,6 @@ fn runCapBlkCommand(st: *ShellState, text: []const u8) bool {
         const target = trimSpaces(parsed.tail);
         const opcode: capctl_protocol.Opcode = if (eqAsciiNoCase(target, "iommu"))
             .revoke_iommu
-        else if (eqAsciiNoCase(target, "virtqueue") or eqAsciiNoCase(target, "queue"))
-            .revoke_virtqueue
         else if (eqAsciiNoCase(target, "command"))
             .revoke_command
         else {

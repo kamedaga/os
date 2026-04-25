@@ -28,14 +28,30 @@ struct ManifestPair {
     source_path: String,
 }
 
-pub fn sync_rootfs(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<RootfsSyncOutputs, String> {
+pub fn sync_rootfs(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<RootfsSyncOutputs, String> {
     let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::default())?;
-    sync_rootfs_generated(workspace_root, workspace, &inputs.disk_image, &inputs.manifests)
+    sync_rootfs_generated(
+        workspace_root,
+        workspace,
+        &inputs.disk_image,
+        &inputs.manifests,
+    )
 }
 
-pub fn sync_bootfs(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<BootfsSyncOutputs, String> {
+pub fn sync_bootfs(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<BootfsSyncOutputs, String> {
     let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::default())?;
-    sync_bootfs_generated(workspace_root, workspace, &inputs.disk_image, &inputs.manifests)
+    sync_bootfs_generated(
+        workspace_root,
+        workspace,
+        &inputs.disk_image,
+        &inputs.manifests,
+    )
 }
 
 pub fn prepare_sync_inputs(
@@ -52,7 +68,10 @@ pub fn prepare_sync_inputs(
 
     build_userland(workspace_root, workspace, None, build_options)?;
     let manifests = generate_manifests(workspace_root, workspace)?;
-    Ok(PreparedSyncInputs { disk_image, manifests })
+    Ok(PreparedSyncInputs {
+        disk_image,
+        manifests,
+    })
 }
 
 pub fn sync_rootfs_generated(
@@ -88,7 +107,12 @@ pub fn sync_bootfs_generated(
         .iter()
         .find(|entry| entry.image_path == "/cmd/shell.elf")
         .map(|entry| PathBuf::from(&entry.source_path))
-        .ok_or_else(|| format!("bootfs manifest is missing /cmd/shell.elf: {}", manifests.bootfs.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "bootfs manifest is missing /cmd/shell.elf: {}",
+                manifests.bootfs.display()
+            )
+        })?;
 
     let bootfs_image = workspace_root
         .join(&workspace.artifacts.dir)
@@ -109,7 +133,8 @@ pub fn sync_bootfs_generated(
     }
     run_command("build bootfs image", &mut bootfs_cmd)?;
 
-    let esp_manifest = generate_esp_manifest(workspace_root, workspace, &bootfs_image, &shell_source)?;
+    let esp_manifest =
+        generate_esp_manifest(workspace_root, workspace, &bootfs_image, &shell_source)?;
     let esp_builder = ensure_host_tool(workspace_root, workspace, HostTool::EspBuilder)?;
     let esp_partition = find_partition(workspace, "esp")?;
 
@@ -128,7 +153,10 @@ pub fn sync_bootfs_generated(
     })
 }
 
-fn find_partition<'a>(workspace: &'a WorkspaceConfig, partition_id: &str) -> Result<&'a DiskPartition, String> {
+fn find_partition<'a>(
+    workspace: &'a WorkspaceConfig,
+    partition_id: &str,
+) -> Result<&'a DiskPartition, String> {
     workspace
         .disk
         .partitions
@@ -137,7 +165,10 @@ fn find_partition<'a>(workspace: &'a WorkspaceConfig, partition_id: &str) -> Res
         .ok_or_else(|| format!("missing [[disk.partition]] id = '{}'", partition_id))
 }
 
-fn load_manifest_pairs(manifest_path: &Path, allow_dirs: bool) -> Result<Vec<ManifestPair>, String> {
+fn load_manifest_pairs(
+    manifest_path: &Path,
+    allow_dirs: bool,
+) -> Result<Vec<ManifestPair>, String> {
     let contents = fs::read_to_string(manifest_path)
         .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
     let mut pairs = Vec::new();
@@ -149,12 +180,18 @@ fn load_manifest_pairs(manifest_path: &Path, allow_dirs: bool) -> Result<Vec<Man
             continue;
         }
         let Some((image_path, source_path)) = line.split_once('=') else {
-            return Err(format!("{}:{line_number}: invalid manifest line", manifest_path.display()));
+            return Err(format!(
+                "{}:{line_number}: invalid manifest line",
+                manifest_path.display()
+            ));
         };
         let image_path = image_path.trim();
         let source_path = source_path.trim();
         if image_path.is_empty() || source_path.is_empty() {
-            return Err(format!("{}:{line_number}: invalid manifest line", manifest_path.display()));
+            return Err(format!(
+                "{}:{line_number}: invalid manifest line",
+                manifest_path.display()
+            ));
         }
         if source_path == "@dir" {
             if allow_dirs {
@@ -197,19 +234,39 @@ fn generate_esp_manifest(
         .join("BOOT")
         .join("BOOTX64.EFI");
 
-    require_nonempty_file(&bootx64, "EFI boot image", "run zig build efi in kernel first")?;
-    require_nonempty_file(&init_image, "init image", "run zig build efi in kernel first")?;
+    require_nonempty_file(
+        &bootx64,
+        "EFI boot image",
+        "run zig build efi in kernel first",
+    )?;
+    require_nonempty_file(
+        &init_image,
+        "init image",
+        "run zig build efi in kernel first",
+    )?;
 
     let shell_output = if let Some(shell_app) = apps.iter().find(|app| app.app.id == "shell") {
         let output_path = planned_artifact_path(workspace_root, workspace, shell_app);
-        require_nonempty_file(&output_path, "shell image", "run pactl build userland first")?;
+        require_nonempty_file(
+            &output_path,
+            "shell image",
+            "run pactl build userland first",
+        )?;
         output_path
     } else {
-        require_nonempty_file(shell_source, "shell image", "run pactl build userland first")?;
+        require_nonempty_file(
+            shell_source,
+            "shell image",
+            "run pactl build userland first",
+        )?;
         shell_source.to_path_buf()
     };
 
-    require_nonempty_file(bootfs_image, "bootfs image", "run pactl sync bootfs again after userland build")?;
+    require_nonempty_file(
+        bootfs_image,
+        "bootfs image",
+        "run pactl sync bootfs again after userland build",
+    )?;
 
     let manifest_path = workspace_root
         .join(&workspace.manifests.dir)

@@ -10,9 +10,12 @@ pub const feature_virgl: u64 = 1 << 0;
 pub const feature_submit_3d: u64 = 1 << 1;
 pub const feature_present_2d: u64 = 1 << 2;
 pub const feature_present_3d: u64 = 1 << 3;
+pub const feature_texture_2d: u64 = 1 << 4;
+pub const feature_app_surface: u64 = 1 << 5;
 
 pub const default_virgl_resource_id: u32 = 2;
 pub const default_virgl_vertex_buffer_id: u32 = 3;
+pub const first_virgl_texture_resource_id: u32 = 4;
 
 pub const Opcode = enum(u16) {
     query_caps = 1,
@@ -21,6 +24,10 @@ pub const Opcode = enum(u16) {
     present_test_pattern = 4,
     prepare_3d = 5,
     present_3d = 6,
+    upload_texture_2d = 7,
+    update_texture_2d = 8,
+    delete_texture_2d = 9,
+    create_app_surface = 10,
 };
 
 pub const Status = enum(i32) {

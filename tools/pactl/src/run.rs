@@ -83,7 +83,10 @@ pub fn run_qemu(
             .status()
             .map_err(|err| format!("failed to launch WSL QEMU command: {err}"))?;
         if !status.success() {
-            return Err(format!("QEMU run failed with exit code {:?}", status.code()));
+            return Err(format!(
+                "QEMU run failed with exit code {:?}",
+                status.code()
+            ));
         }
     }
 
@@ -132,7 +135,9 @@ fn validate_run_inputs(
     require_nonempty_file(&bootfs_image, "bootfs image", "run pactl sync bootfs first")?;
 
     let disk_time = modified_time(disk_image)?;
-    for stale_path in stale_candidates(workspace_root, workspace, &bootx64, &initapp, &bootfs_image)? {
+    for stale_path in
+        stale_candidates(workspace_root, workspace, &bootx64, &initapp, &bootfs_image)?
+    {
         if let Ok(path_time) = modified_time(&stale_path) {
             if path_time > disk_time {
                 return Err(format!(
@@ -154,7 +159,11 @@ fn stale_candidates(
     initapp: &Path,
     bootfs_image: &Path,
 ) -> Result<Vec<PathBuf>, String> {
-    let mut paths = vec![bootx64.to_path_buf(), initapp.to_path_buf(), bootfs_image.to_path_buf()];
+    let mut paths = vec![
+        bootx64.to_path_buf(),
+        initapp.to_path_buf(),
+        bootfs_image.to_path_buf(),
+    ];
     for app in discover_apps(workspace_root, workspace)? {
         let artifact = planned_artifact_path(workspace_root, workspace, &app);
         if artifact.exists() {
@@ -199,8 +208,10 @@ fn build_wsl_script(
     let runtime_summary_log_wsl = summary_log
         .as_ref()
         .map(|_| format!("{runtime_dir_wsl}/boot-timing-summary.txt"));
-    let cache_dir_wsl = format!("${{XDG_CACHE_HOME:-$HOME/.cache}}/capabilityos-qemu/{}", runtime_slug(workspace_root));
-    let overlay_disk_wsl = format!("{runtime_dir_wsl}/disk-overlay.qcow2");
+    let cache_dir_wsl = format!(
+        "${{XDG_CACHE_HOME:-$HOME/.cache}}/capabilityos-qemu/{}",
+        runtime_slug(workspace_root)
+    );
 
     let mut qemu_parts = vec![
         "qemu-system-x86_64".to_string(),
@@ -222,10 +233,7 @@ fn build_wsl_script(
             "-drive if=pflash,format=raw,file={}",
             bash_quote(&runtime_ovmf_vars_wsl)
         ),
-        format!(
-            "-drive if=none,file={},format=qcow2,id=bootdisk",
-            bash_quote(&overlay_disk_wsl)
-        ),
+        "-drive if=none,file=\"$CACHE_DISK\",format=raw,id=bootdisk".to_string(),
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
         "-serial stdio".to_string(),
     ];
@@ -279,16 +287,14 @@ fn build_wsl_script(
     script.push_str("CACHE_DISK=\"$CACHE_DIR/disk.img\"\n");
     script.push_str("CACHE_META=\"$CACHE_DIR/disk.meta\"\n");
     script.push_str("CACHE_DIRTY=\"$CACHE_DIR/disk.dirty\"\n");
-    script.push_str(&format!(
-        "OVERLAY_DISK={}\n",
-        bash_quote(&overlay_disk_wsl)
-    ));
     script.push_str("mkdir -p \"$ARTIFACT_DIR\"\n");
     script.push_str("mkdir -p \"$RUNTIME_DIR\"\n");
     script.push_str("mkdir -p \"$CACHE_DIR\"\n");
-    script.push_str("if ! command -v python3 >/dev/null 2>&1; then echo 'missing python3'; exit 1; fi\n");
-    script.push_str("if ! command -v qemu-img >/dev/null 2>&1; then echo 'missing qemu-img'; exit 1; fi\n");
-    script.push_str("if ! command -v flock >/dev/null 2>&1; then echo 'missing flock'; exit 1; fi\n");
+    script.push_str(
+        "if ! command -v python3 >/dev/null 2>&1; then echo 'missing python3'; exit 1; fi\n",
+    );
+    script
+        .push_str("if ! command -v flock >/dev/null 2>&1; then echo 'missing flock'; exit 1; fi\n");
     script.push_str(&format!(
         "python3 {} ensure --socket \"$LAUNCHER_SOCKET\" --log \"$LAUNCHER_LOG\"\n",
         bash_quote(&launcher_script)
@@ -314,24 +320,36 @@ fn build_wsl_script(
     ));
     script.push_str("}\n");
     script.push_str("sync_logs() {\n");
-    script.push_str("  [ ! -f \"$RUNTIME_OVMF_VARS\" ] || cp \"$RUNTIME_OVMF_VARS\" \"$OVMF_VARS\"\n");
+    script.push_str(
+        "  [ ! -f \"$RUNTIME_OVMF_VARS\" ] || cp \"$RUNTIME_OVMF_VARS\" \"$OVMF_VARS\"\n",
+    );
     script.push_str("  [ ! -f \"$RUNTIME_QEMU_LOG\" ] || cp \"$RUNTIME_QEMU_LOG\" \"$QEMU_LOG\"\n");
     if options.timed {
-        script.push_str("  [ ! -f \"$RUNTIME_SERIAL_LOG\" ] || cp \"$RUNTIME_SERIAL_LOG\" \"$SERIAL_LOG\"\n");
-        script.push_str("  [ ! -f \"$RUNTIME_SUMMARY_LOG\" ] || cp \"$RUNTIME_SUMMARY_LOG\" \"$SUMMARY_LOG\"\n");
+        script.push_str(
+            "  [ ! -f \"$RUNTIME_SERIAL_LOG\" ] || cp \"$RUNTIME_SERIAL_LOG\" \"$SERIAL_LOG\"\n",
+        );
+        script.push_str(
+            "  [ ! -f \"$RUNTIME_SUMMARY_LOG\" ] || cp \"$RUNTIME_SUMMARY_LOG\" \"$SUMMARY_LOG\"\n",
+        );
     }
     script.push_str("}\n");
     script.push_str("trap sync_logs EXIT\n");
     script.push_str("exec 9>\"$CACHE_LOCK\"\n");
     script.push_str("flock 9\n");
-    script.push_str("rm -f \"$OVMF_VARS\" \"$QEMU_LOG\" \"$RUNTIME_OVMF_VARS\" \"$RUNTIME_QEMU_LOG\" \"$OVERLAY_DISK\"");
+    script.push_str(
+        "rm -f \"$OVMF_VARS\" \"$QEMU_LOG\" \"$RUNTIME_OVMF_VARS\" \"$RUNTIME_QEMU_LOG\"",
+    );
     if options.timed {
-        script.push_str(" \"$SERIAL_LOG\" \"$SUMMARY_LOG\" \"$RUNTIME_SERIAL_LOG\" \"$RUNTIME_SUMMARY_LOG\"");
+        script.push_str(
+            " \"$SERIAL_LOG\" \"$SUMMARY_LOG\" \"$RUNTIME_SERIAL_LOG\" \"$RUNTIME_SUMMARY_LOG\"",
+        );
     }
     script.push('\n');
     script.push_str("if [ -f \"$CACHE_DIRTY\" ]; then\n");
     script.push_str("  if [ \"$(cached_disk_sig)\" != \"$(source_disk_sig)\" ]; then\n");
-    script.push_str("    echo 'disk cache is dirty and the Windows disk image changed outside WSL'\n");
+    script.push_str(
+        "    echo 'disk cache is dirty and the Windows disk image changed outside WSL'\n",
+    );
     script.push_str("    echo 'resolve the disk image divergence before running again'\n");
     script.push_str("    exit 1\n");
     script.push_str("  fi\n");
@@ -342,7 +360,6 @@ fn build_wsl_script(
         "cp {} \"$RUNTIME_OVMF_VARS\"\n",
         bash_quote(OVMF_VARS_TEMPLATE_PATH)
     ));
-    script.push_str("qemu-img create -f qcow2 -F raw -b \"$CACHE_DISK\" \"$OVERLAY_DISK\" >/dev/null\n");
 
     if options.timed {
         script.push_str("set +e\n");
@@ -353,7 +370,6 @@ fn build_wsl_script(
         ));
         script.push_str("qemu_status=${PIPESTATUS[0]}\n");
         script.push_str("set -e\n");
-        script.push_str("qemu-img commit -f qcow2 \"$OVERLAY_DISK\" >/dev/null\n");
         script.push_str("schedule_writeback\n");
         script.push_str(&format!(
             "python3 {} \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
@@ -369,7 +385,6 @@ fn build_wsl_script(
         script.push('\n');
         script.push_str("qemu_status=$?\n");
         script.push_str("set -e\n");
-        script.push_str("qemu-img commit -f qcow2 \"$OVERLAY_DISK\" >/dev/null\n");
         script.push_str("schedule_writeback\n");
         script.push_str("exit \"$qemu_status\"\n");
     }
@@ -413,7 +428,10 @@ fn windows_path_to_wsl(path: &Path) -> Result<String, String> {
     } else if path_str.starts_with('/') {
         Ok(path_str)
     } else {
-        Err(format!("cannot convert path to WSL path: {}", path.display()))
+        Err(format!(
+            "cannot convert path to WSL path: {}",
+            path.display()
+        ))
     }
 }
 

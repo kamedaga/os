@@ -39,6 +39,8 @@ pub struct KernelSection {
 pub struct UserlandSection {
     pub apps_dir: String,
     pub skip_kinds: Vec<String>,
+    pub skip_apps: Vec<String>,
+    pub include_skipped_artifacts_in_manifests: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -264,7 +266,10 @@ pub fn load_workspace_config(workspace_root: &Path) -> Result<WorkspaceConfig, S
     Ok(config)
 }
 
-pub fn discover_apps(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<Vec<AppConfig>, String> {
+pub fn discover_apps(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<Vec<AppConfig>, String> {
     let apps_root = workspace_root.join(&workspace.userland.apps_dir);
     let mut config_paths = Vec::new();
     collect_named_files(&apps_root, "app.conf", &mut config_paths)?;
@@ -288,7 +293,9 @@ fn collect_named_files(root: &Path, file_name: &str, out: &mut Vec<PathBuf>) -> 
     if !root.exists() {
         return Ok(());
     }
-    for entry in fs::read_dir(root).map_err(|err| format!("failed to read {}: {err}", root.display()))? {
+    for entry in
+        fs::read_dir(root).map_err(|err| format!("failed to read {}: {err}", root.display()))?
+    {
         let entry = entry.map_err(|err| format!("failed to read directory entry: {err}"))?;
         let path = entry.path();
         let file_type = entry
@@ -296,7 +303,9 @@ fn collect_named_files(root: &Path, file_name: &str, out: &mut Vec<PathBuf>) -> 
             .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
         if file_type.is_dir() {
             collect_named_files(&path, file_name, out)?;
-        } else if file_type.is_file() && path.file_name().and_then(|name| name.to_str()) == Some(file_name) {
+        } else if file_type.is_file()
+            && path.file_name().and_then(|name| name.to_str()) == Some(file_name)
+        {
             out.push(path);
         }
     }
@@ -310,7 +319,9 @@ fn load_app_config(config_path: &Path) -> Result<AppConfig, String> {
         config_path: config_path.to_path_buf(),
         ..AppConfig::default()
     };
-    parse_document(&contents, |section, key, value| assign_app_value(&mut config, section, key, value))?;
+    parse_document(&contents, |section, key, value| {
+        assign_app_value(&mut config, section, key, value)
+    })?;
     validate_app_config(&config)?;
     Ok(config)
 }
@@ -324,23 +335,35 @@ fn validate_workspace_config(config: &WorkspaceConfig, config_path: &Path) -> Re
         ));
     }
     if config.workspace.name.is_empty() {
-        return Err(format!("{}: missing [workspace].name", config_path.display()));
+        return Err(format!(
+            "{}: missing [workspace].name",
+            config_path.display()
+        ));
     }
     if config.kernel.dir.is_empty() {
         return Err(format!("{}: missing [kernel].dir", config_path.display()));
     }
     if config.kernel.default_step.is_empty() {
-        return Err(format!("{}: missing [kernel].default_step", config_path.display()));
+        return Err(format!(
+            "{}: missing [kernel].default_step",
+            config_path.display()
+        ));
     }
     if config.userland.apps_dir.is_empty() {
-        return Err(format!("{}: missing [userland].apps_dir", config_path.display()));
+        return Err(format!(
+            "{}: missing [userland].apps_dir",
+            config_path.display()
+        ));
     }
     if config.disk.image.is_empty() {
         return Err(format!("{}: missing [disk].image", config_path.display()));
     }
     if let Some(size_mib) = config.disk.size_mib {
         if size_mib == 0 {
-            return Err(format!("{}: [disk].size_mib must be greater than 0", config_path.display()));
+            return Err(format!(
+                "{}: [disk].size_mib must be greater than 0",
+                config_path.display()
+            ));
         }
     }
     match config.disk.recreate.as_str() {
@@ -435,10 +458,16 @@ fn validate_app_config(config: &AppConfig) -> Result<(), String> {
         ));
     }
     if config.app.id.is_empty() {
-        return Err(format!("{}: missing [app].id", config.config_path.display()));
+        return Err(format!(
+            "{}: missing [app].id",
+            config.config_path.display()
+        ));
     }
     if config.app.kind.is_empty() {
-        return Err(format!("{}: missing [app].kind", config.config_path.display()));
+        return Err(format!(
+            "{}: missing [app].kind",
+            config.config_path.display()
+        ));
     }
     if config.build.output_name.is_empty() {
         return Err(format!(
@@ -449,7 +478,10 @@ fn validate_app_config(config: &AppConfig) -> Result<(), String> {
     match &config.source {
         SourceConfig::None => {}
         SourceConfig::Zig(src) if src.entry.is_empty() => {
-            return Err(format!("{}: missing [source.zig].entry", config.config_path.display()));
+            return Err(format!(
+                "{}: missing [source.zig].entry",
+                config.config_path.display()
+            ));
         }
         SourceConfig::Cargo(src) if src.manifest.is_empty() || src.package.is_empty() => {
             return Err(format!(
@@ -464,7 +496,10 @@ fn validate_app_config(config: &AppConfig) -> Result<(), String> {
             ));
         }
         SourceConfig::File(src) if src.path.is_empty() => {
-            return Err(format!("{}: missing [source.file].path", config.config_path.display()));
+            return Err(format!(
+                "{}: missing [source.file].path",
+                config.config_path.display()
+            ));
         }
         SourceConfig::File(src) if !src.rebuild_tool.is_empty() && src.rebuild_dir.is_empty() => {
             return Err(format!(
@@ -491,7 +526,11 @@ fn validate_app_config(config: &AppConfig) -> Result<(), String> {
         }
     }
     if let Some(startup) = &config.startup {
-        let Some(publish) = config.publish.iter().find(|entry| entry.id == startup.publish) else {
+        let Some(publish) = config
+            .publish
+            .iter()
+            .find(|entry| entry.id == startup.publish)
+        else {
             return Err(format!(
                 "{}: startup.publish references missing publish entry '{}'",
                 config.config_path.display(),
@@ -542,7 +581,8 @@ where
                 .map_err(|err| format!("line {line_number}: {err}"))?;
             continue;
         }
-        let (key, value_src) = split_key_value(&line).map_err(|err| format!("line {line_number}: {err}"))?;
+        let (key, value_src) =
+            split_key_value(&line).map_err(|err| format!("line {line_number}: {err}"))?;
         let value = parse_value(value_src).map_err(|err| format!("line {line_number}: {err}"))?;
         assign(&current, key, value)?;
     }
@@ -719,7 +759,12 @@ fn section_eq(section: &SectionPath, is_array: bool, parts: &[&str]) -> bool {
         .all(|(lhs, rhs)| lhs == rhs)
 }
 
-fn assign_workspace_value(config: &mut WorkspaceConfig, section: &SectionPath, key: &str, value: Value) -> Result<(), String> {
+fn assign_workspace_value(
+    config: &mut WorkspaceConfig,
+    section: &SectionPath,
+    key: &str,
+    value: Value,
+) -> Result<(), String> {
     if section_eq(section, true, &["disk", "partition"]) && key.is_empty() {
         config.disk.partitions.push(DiskPartition::default());
         return Ok(());
@@ -746,6 +791,13 @@ fn assign_workspace_value(config: &mut WorkspaceConfig, section: &SectionPath, k
         config.userland.apps_dir = value.into_string("[userland].apps_dir")?;
     } else if section_eq(section, false, &["userland"]) && key == "skip_kinds" {
         config.userland.skip_kinds = value.into_string_array("[userland].skip_kinds")?;
+    } else if section_eq(section, false, &["userland"]) && key == "skip_apps" {
+        config.userland.skip_apps = value.into_string_array("[userland].skip_apps")?;
+    } else if section_eq(section, false, &["userland"])
+        && key == "include_skipped_artifacts_in_manifests"
+    {
+        config.userland.include_skipped_artifacts_in_manifests =
+            Some(value.into_bool("[userland].include_skipped_artifacts_in_manifests")?);
     } else if section_eq(section, false, &["disk"]) && key == "image" {
         config.disk.image = value.into_string("[disk].image")?;
     } else if section_eq(section, false, &["disk"]) && key == "size_mib" {
@@ -792,16 +844,24 @@ fn assign_workspace_value(config: &mut WorkspaceConfig, section: &SectionPath, k
         && section.parts[1] == "profile"
         && key == "kind"
     {
-        config.run.profiles.entry(section.parts[2].clone()).or_default().kind =
-            value.into_string("[run.profile.*].kind")?;
+        config
+            .run
+            .profiles
+            .entry(section.parts[2].clone())
+            .or_default()
+            .kind = value.into_string("[run.profile.*].kind")?;
     } else if !section.is_array
         && section.parts.len() == 3
         && section.parts[0] == "run"
         && section.parts[1] == "profile"
         && key == "path"
     {
-        config.run.profiles.entry(section.parts[2].clone()).or_default().path =
-            value.into_string("[run.profile.*].path")?;
+        config
+            .run
+            .profiles
+            .entry(section.parts[2].clone())
+            .or_default()
+            .path = value.into_string("[run.profile.*].path")?;
     }
     Ok(())
 }
@@ -814,7 +874,31 @@ pub fn app_kind_is_skipped(workspace: &WorkspaceConfig, kind: &str) -> bool {
         .any(|item| item.eq_ignore_ascii_case(kind))
 }
 
-fn assign_app_value(config: &mut AppConfig, section: &SectionPath, key: &str, value: Value) -> Result<(), String> {
+pub fn app_id_is_skipped(workspace: &WorkspaceConfig, app_id: &str) -> bool {
+    workspace
+        .userland
+        .skip_apps
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case(app_id))
+}
+
+pub fn app_is_skipped(workspace: &WorkspaceConfig, app: &AppConfig) -> bool {
+    app_kind_is_skipped(workspace, &app.app.kind) || app_id_is_skipped(workspace, &app.app.id)
+}
+
+pub fn include_skipped_artifacts_in_manifests(workspace: &WorkspaceConfig) -> bool {
+    workspace
+        .userland
+        .include_skipped_artifacts_in_manifests
+        .unwrap_or(true)
+}
+
+fn assign_app_value(
+    config: &mut AppConfig,
+    section: &SectionPath,
+    key: &str,
+    value: Value,
+) -> Result<(), String> {
     if section_eq(section, true, &["publish"]) && key.is_empty() {
         config.publish.push(PublishEntry::default());
         return Ok(());

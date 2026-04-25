@@ -65,8 +65,8 @@ const manager_stack_extension_pages: u64 = 8;
 const manager_stack_extension_base_va: u64 = process_abi.aux_base_va - ((manager_stack_extension_pages + 1) * 4096);
 const startup_manifest_max_bytes: usize = 4096;
 const startup_named_dependency_max: usize = 8;
-const capctl_request_va: u64 = process_abi.auxPageVa(6);
-const capctl_response_va: u64 = process_abi.auxPageVa(7);
+const capctl_request_va: u64 = 0x3C0E_0000;
+const capctl_response_va: u64 = 0x3C0E_1000;
 const startup_ready_name_max: usize = startup_plan_abi.max_startup_program_descriptors * (startup_named_dependency_max + 1);
 
 const InputDeviceKind = startup_plan_abi.StartupInputSelector;
@@ -1450,6 +1450,8 @@ const LaunchContext = struct {
         response.block_endpoint_id = self.block_endpoint_id orelse 0;
         response.status_flags = self.capctlStatusFlags();
         response.block_profile = capctl_protocol.blockProfileRaw(self.block_profile);
+        response.gpu_process_slot = self.gpu_process_slot orelse 0;
+        response.gpu_endpoint_id = self.gpu_endpoint_id orelse 0;
         response.response_seq = request_seq;
     }
 
@@ -1516,7 +1518,7 @@ const LaunchContext = struct {
             .path = rootfs_gpu_driver_path,
             .name = "gpu",
             .label = "gpu_driver",
-            .exec_source = .bootfs,
+            .exec_source = .startup_path,
         };
         self.launchGpuDriverForPolicy(policy);
         self.markReadyName("gpu");
@@ -1644,7 +1646,7 @@ const LaunchContext = struct {
     fn requireBootDisplay(self: *LaunchContext) void {
         if (self.has_boot_display) return;
         const exec = self.requireShellExec();
-        _ = userLog("ManagerInit: spawning shell from rootfs\n");
+        _ = userLog("ManagerInit: spawning shell\n");
 
         const fb_paddr = self.primary_display.framebuffer_paddr;
         const fb_size = self.primary_display.framebuffer_size_bytes;
@@ -2115,8 +2117,15 @@ fn managerMain() noreturn {
         .has_boot_display = window_service != null,
     };
     launch_ctx_storage.ensureBootFsArchive();
-    if (openExecFromBootFs(rootfs_gpu_driver_path, launch_ctx_storage.bootstrap_handoff.bootfs_vm_token)) |exec| {
-        launch_ctx_storage.storeCachedExec(.bootfs, rootfs_gpu_driver_path, exec);
+    if (gpu_device != null) {
+        const gpu_exec_policy = StartupPolicy{
+            .action = .gpu_driver,
+            .path = rootfs_gpu_driver_path,
+            .name = "gpu",
+            .label = "gpu_driver",
+            .exec_source = .startup_path,
+        };
+        launch_ctx_storage.cacheExecForPolicy(gpu_exec_policy);
     }
     var startup_manifest_from_rootfs = false;
     const startup_manifest = blk: {
