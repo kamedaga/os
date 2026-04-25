@@ -6,6 +6,7 @@ pub const queue_submit_token_index: usize = 14;
 pub const queue_notify_token_index: usize = 15;
 pub const command_token_index: usize = 16;
 pub const shared_target_va_index: usize = 20;
+pub const pointer_shared_target_va: u64 = 0x3C00_3000;
 
 pub const ConfigPageDescriptor = struct {
     common_page_paddr: u64,

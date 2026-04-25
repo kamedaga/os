@@ -111,6 +111,7 @@ const StartupPolicy = struct {
     provide_count: usize = 0,
     provide_names: [startup_named_dependency_max][]const u8 = [_][]const u8{""} ** startup_named_dependency_max,
     block_kind: ?BlockDeviceKind = null,
+    input_kind: ?InputDeviceKind = null,
 };
 
 const StartupNode = struct {
@@ -144,6 +145,7 @@ var gpu_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]pro
 var gpu_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 var persistent_fs_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
 var persistent_fs_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
+var generic_service_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 var boot_display_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 
 const seed_log_prefix = "[seed] ";
@@ -718,7 +720,7 @@ fn findBootstrapQueueGrant(
     while (i < bootstrap_handoff.device_count and i < manager_init_bootstrap_abi.max_device_grants) : (i += 1) {
         const grant = bootstrap_handoff.device_grants[i];
         if (grant.device_page_paddr != descriptor.device_page_paddr) continue;
-        if (grant.submit_token == 0 or grant.notify_token == 0) return null;
+        if (grant.queue_grant_count == 0) return null;
         return grant;
     }
     return null;
@@ -973,9 +975,11 @@ fn parseStartupNamedDependencyList(
 
 fn defaultStartupPolicyLabel(policy: *const StartupPolicy) []const u8 {
     return switch (policy.action) {
+        .input_driver => "input driver",
         .block_driver => "block driver",
         .gpu_driver => "gpu driver",
         .persistent_fs_server => "persistent fs",
+        .window_service => "window service",
         else => "service",
     };
 }
@@ -990,9 +994,11 @@ fn normalizeStartupPolicy(policy: *StartupPolicy) void {
 fn validateStartupPolicy(policy: *StartupPolicy) void {
     normalizeStartupPolicy(policy);
     switch (policy.action) {
+        .input_driver => if (policy.input_kind == null) startupManifestFail("ManagerInit: startup input driver missing selector\n"),
         .block_driver => if (policy.block_kind == null) startupManifestFail("ManagerInit: startup block driver missing selector\n"),
         .gpu_driver => {},
         .persistent_fs_server => {},
+        .window_service => {},
         else => startupManifestFail("ManagerInit: unsupported startup action\n"),
     }
     if (policy.name.len == 0) startupManifestFail("ManagerInit: startup manifest name missing\n");
@@ -1046,6 +1052,10 @@ fn parseStartupPolicyToken(policy: *StartupPolicy, token: []const u8, has_action
     }
     if (std.mem.eql(u8, key, "block")) {
         policy.block_kind = startup_plan_abi.blockSelectorFromKey(value) orelse startupManifestFail("ManagerInit: unknown startup block selector\n");
+        return;
+    }
+    if (std.mem.eql(u8, key, "input")) {
+        policy.input_kind = startup_plan_abi.inputSelectorFromKey(value) orelse startupManifestFail("ManagerInit: unknown startup input selector\n");
         return;
     }
     startupManifestFail("ManagerInit: unknown startup manifest key\n");
@@ -1134,6 +1144,7 @@ fn allocChildServiceRegistryPage(
 const LaunchContext = struct {
     const QueueGrant = struct {
         iommu_token: u64,
+        queue_index: u64,
         submit_token: u64,
         notify_token: u64,
         command_token: u64,
@@ -1147,6 +1158,7 @@ const LaunchContext = struct {
     bootstrap_handoff: manager_init_bootstrap_abi.ConfigPage,
     primary_display: init_bootstrap_abi.DisplayDescriptor,
     keyboard_input: init_bootstrap_abi.DeviceDescriptor,
+    pointer_input: ?init_bootstrap_abi.DeviceDescriptor = null,
     block_device: init_bootstrap_abi.DeviceDescriptor,
     gpu_device: ?init_bootstrap_abi.DeviceDescriptor = null,
     window_service_page: init_bootstrap_abi.SpawnPageDescriptor,
@@ -1155,6 +1167,8 @@ const LaunchContext = struct {
     shared_stdio_bootstrap_source_va: ?u64 = null,
     shared_process_args_env_bootstrap_source_va: ?u64 = null,
     shared_process_exit_bootstrap_source_va: ?u64 = null,
+    pointer_shared_source_va: ?u64 = null,
+    pointer_shared_paddr: u64 = 0,
     capctl_endpoint_id: ?u64 = null,
     block_process_slot: ?u64 = null,
     block_endpoint_id: ?u64 = null,
@@ -1194,7 +1208,7 @@ const LaunchContext = struct {
 
     fn ensureRootFsReader(self: *LaunchContext) void {
         if (self.rootfs_ready) return;
-        const queue_grant = self.findQueueGrant(self.block_device) orelse fail("ManagerInit: block queue grant missing\n");
+        const queue_grant = self.findQueueGrant(self.block_device, 0) orelse fail("ManagerInit: block queue grant missing\n");
         const block_geometry = readBlockGeometry(self.block_device) orelse fail("ManagerInit: block geometry failed\n");
         if (!rootfs_core.init(.{
             .rootfs_start_block = persistent_fs_start_block,
@@ -1315,18 +1329,40 @@ const LaunchContext = struct {
         return source_va;
     }
 
-    fn findQueueGrant(self: *const LaunchContext, descriptor: init_bootstrap_abi.DeviceDescriptor) ?QueueGrant {
+    fn ensurePointerSharedPage(self: *LaunchContext) u64 {
+        if (self.pointer_shared_source_va) |source_va| return source_va;
+        const source_va = allocDynamicBootstrapSourceVa();
+        var paddr: u64 = 0;
+        if (allocMapPages(source_va, 1, true, @intFromPtr(&paddr)) != 0 or paddr < 0x1000) {
+            fail("ManagerInit: alloc pointer shared page failed\n");
+        }
+        const bytes: [*]volatile u8 = @ptrFromInt(source_va);
+        var i: usize = 0;
+        while (i < 4096) : (i += 1) bytes[i] = 0;
+        self.pointer_shared_source_va = source_va;
+        self.pointer_shared_paddr = paddr;
+        return source_va;
+    }
+
+    fn findQueueGrant(self: *const LaunchContext, descriptor: init_bootstrap_abi.DeviceDescriptor, queue_index: u64) ?QueueGrant {
         var i: usize = 0;
         while (i < self.bootstrap_handoff.device_count and i < manager_init_bootstrap_abi.max_device_grants) : (i += 1) {
             const grant = self.bootstrap_handoff.device_grants[i];
             if (grant.device_page_paddr != descriptor.device_page_paddr) continue;
-            if (grant.iommu_token == 0 or grant.submit_token == 0 or grant.notify_token == 0 or grant.command_token == 0) return null;
-            return .{
-                .iommu_token = grant.iommu_token,
-                .submit_token = grant.submit_token,
-                .notify_token = grant.notify_token,
-                .command_token = grant.command_token,
-            };
+            if (grant.iommu_token == 0 or grant.command_token == 0) return null;
+            var queue_grant_index: usize = 0;
+            while (@as(u64, @intCast(queue_grant_index)) < grant.queue_grant_count and queue_grant_index < manager_init_bootstrap_abi.max_device_queue_grants) : (queue_grant_index += 1) {
+                const queue_grant = grant.queue_grants[queue_grant_index];
+                if (queue_grant.queue_index != queue_index) continue;
+                if (queue_grant.submit_token == 0 or queue_grant.notify_token == 0) return null;
+                return .{
+                    .iommu_token = grant.iommu_token,
+                    .queue_index = queue_grant.queue_index,
+                    .submit_token = queue_grant.submit_token,
+                    .notify_token = queue_grant.notify_token,
+                    .command_token = grant.command_token,
+                };
+            }
         }
         return null;
     }
@@ -1452,7 +1488,26 @@ const LaunchContext = struct {
         response.block_profile = capctl_protocol.blockProfileRaw(self.block_profile);
         response.gpu_process_slot = self.gpu_process_slot orelse 0;
         response.gpu_endpoint_id = self.gpu_endpoint_id orelse 0;
+        response.service_kind = 0;
+        response.service_process_slot = 0;
+        response.service_endpoint_id = 0;
         response.response_seq = request_seq;
+    }
+
+    fn writeCapCtlServiceResponse(
+        self: *const LaunchContext,
+        response: *volatile capctl_protocol.Response,
+        request_seq: u64,
+        status: capctl_protocol.ResponseStatus,
+        detail: u64,
+        kind: service_registry_abi.ServiceKind,
+        process_slot: u64,
+        endpoint_id: u64,
+    ) void {
+        self.writeCapCtlResponse(response, .launch_service, request_seq, status, detail);
+        response.service_kind = @intFromEnum(kind);
+        response.service_process_slot = process_slot;
+        response.service_endpoint_id = endpoint_id;
     }
 
     fn revokeBlockIommu(self: *LaunchContext) u64 {
@@ -1524,6 +1579,144 @@ const LaunchContext = struct {
         self.markReadyName("gpu");
         self.markReadyName("gpu_service");
         return .ok;
+    }
+
+    const LaunchServiceResult = struct {
+        status: capctl_protocol.ResponseStatus,
+        process_slot: u64 = 0,
+        endpoint_id: u64 = 0,
+    };
+
+    fn openRootFsExecForCapCtl(self: *LaunchContext, path: []const u8, label: []const u8) ?rootfs_core.OpenExecResult {
+        self.ensureRootFsReader();
+        const exec = rootfs_core.openExec(path) orelse {
+            self.logRoleLine("open_exec", label, "failed");
+            return null;
+        };
+        self.logRoleLine("open_exec", label, "ok");
+        return exec;
+    }
+
+    fn launchRootFsWindowServiceFromCapCtl(self: *LaunchContext, path: []const u8) LaunchServiceResult {
+        if (self.window_service) |entry| {
+            return .{
+                .status = .already,
+                .process_slot = entry.process_slot,
+                .endpoint_id = entry.endpoint_id,
+            };
+        }
+        _ = userLog("ManagerInit: capctl launch window service begin\n");
+        const exec = self.openRootFsExecForCapCtl(path, "window_service") orelse return .{ .status = .unavailable };
+        const endpoint_id = allocDynamicServiceEndpointId();
+        const registry_source_va = self.ensureSharedServiceRegistryPage();
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+        const pointer_shared_source_va = self.pointer_shared_source_va;
+
+        generic_service_bootstrap_table_storage = .{};
+        generic_service_bootstrap_table_storage.page_count = if (pointer_shared_source_va != null) 5 else 4;
+        generic_service_bootstrap_table_storage.page_descriptors[0] = .{
+            .source_va = registry_source_va,
+            .target_va = process_abi.service_registry_shadow_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[1] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[2] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[3] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        if (pointer_shared_source_va) |source_va| {
+            generic_service_bootstrap_table_storage.page_descriptors[4] = .{
+                .source_va = source_va,
+                .target_va = input_bootstrap.pointer_shared_target_va,
+                .flags = 0,
+            };
+        }
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &generic_service_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", "window_service", "failed");
+            self.logRoleHex("window_service", " spawn ret=", spawned);
+            return .{ .status = .kernel_error, .endpoint_id = endpoint_id };
+        };
+        self.logRoleLine("spawn", "window_service", "ok");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) {
+            return .{ .status = .kernel_error, .process_slot = child_slot, .endpoint_id = endpoint_id };
+        }
+
+        self.window_service = .{
+            .kind = @intFromEnum(service_registry_abi.ServiceKind.window),
+            .process_slot = child_slot,
+            .endpoint_id = endpoint_id,
+            .flags = service_registry_abi.service_flag_process_slot_compat,
+        };
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .window, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| {
+            service_registry_abi.setServiceWithProcessSlot(source_va, .window, child_slot, endpoint_id);
+        }
+        self.has_boot_display = true;
+        _ = userLog("ManagerInit: window service ready\n");
+        return .{ .status = .ok, .process_slot = child_slot, .endpoint_id = endpoint_id };
+    }
+
+    fn launchRootFsServiceFromCapCtl(self: *LaunchContext, kind: service_registry_abi.ServiceKind, path: []const u8) LaunchServiceResult {
+        return switch (kind) {
+            .window => self.launchRootFsWindowServiceFromCapCtl(path),
+            else => .{ .status = .unsupported },
+        };
+    }
+
+    fn publishSpawnedServiceFromCapCtl(self: *LaunchContext, kind: service_registry_abi.ServiceKind, child_slot: u64) LaunchServiceResult {
+        if (child_slot == 0) return .{ .status = .invalid };
+        switch (kind) {
+            .window => {
+                if (self.window_service) |entry| {
+                    return .{
+                        .status = .already,
+                        .process_slot = entry.process_slot,
+                        .endpoint_id = entry.endpoint_id,
+                    };
+                }
+                const endpoint_id = allocDynamicServiceEndpointId();
+                if (publishServiceEndpoint(endpoint_id, child_slot) != 0) {
+                    return .{ .status = .kernel_error, .process_slot = child_slot, .endpoint_id = endpoint_id };
+                }
+                self.window_service = .{
+                    .kind = @intFromEnum(service_registry_abi.ServiceKind.window),
+                    .process_slot = child_slot,
+                    .endpoint_id = endpoint_id,
+                    .flags = service_registry_abi.service_flag_process_slot_compat,
+                };
+                service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .window, child_slot, endpoint_id);
+                if (self.shared_service_registry_source_va) |source_va| {
+                    service_registry_abi.setServiceWithProcessSlot(source_va, .window, child_slot, endpoint_id);
+                }
+                self.has_boot_display = true;
+                _ = userLog("ManagerInit: window service published\n");
+                return .{ .status = .ok, .process_slot = child_slot, .endpoint_id = endpoint_id };
+            },
+            else => return .{ .status = .unsupported },
+        }
+    }
+
+    fn copyCapCtlRequestPayloadPath(path_len_raw: u64, out: *[startup_plan_abi.path_max_bytes]u8) ?[]const u8 {
+        if (path_len_raw == 0 or path_len_raw > capctl_protocol.request_payload_bytes or path_len_raw > out.len) return null;
+        const path_len: usize = @intCast(path_len_raw);
+        const payload: [*]const volatile u8 = @ptrFromInt(capctl_request_va + capctl_protocol.request_header_bytes);
+        var i: usize = 0;
+        while (i < path_len) : (i += 1) out[i] = payload[i];
+        return out[0..path_len];
     }
 
     fn handleCapCtlRequest(self: *LaunchContext, request_paddr: u64) void {
@@ -1600,6 +1793,39 @@ const LaunchContext = struct {
                 const status = self.launchGpuDriverFromExecRequest();
                 self.writeCapCtlResponse(response, .launch_gpu, request.request_seq, status, 0);
             },
+            .launch_service => {
+                const kind = std.meta.intToEnum(service_registry_abi.ServiceKind, request.arg0) catch {
+                    self.writeCapCtlResponse(response, .launch_service, request.request_seq, .invalid, request.arg0);
+                    return;
+                };
+                var path_buf: [startup_plan_abi.path_max_bytes]u8 = undefined;
+                const path = copyCapCtlRequestPayloadPath(request.arg1, &path_buf) orelse {
+                    self.writeCapCtlResponse(response, .launch_service, request.request_seq, .invalid, request.arg1);
+                    return;
+                };
+                const result = self.launchRootFsServiceFromCapCtl(kind, path);
+                _ = userLog("ManagerInit: capctl launch service response\n");
+                self.writeCapCtlServiceResponse(
+                    response,
+                    request.request_seq,
+                    result.status,
+                    0,
+                    kind,
+                    result.process_slot,
+                    result.endpoint_id,
+                );
+            },
+            .publish_service => {
+                const kind = std.meta.intToEnum(service_registry_abi.ServiceKind, request.arg0) catch {
+                    self.writeCapCtlResponse(response, .publish_service, request.request_seq, .invalid, request.arg0);
+                    return;
+                };
+                const result = self.publishSpawnedServiceFromCapCtl(kind, request.arg1);
+                self.writeCapCtlResponse(response, .publish_service, request.request_seq, result.status, 0);
+                response.service_kind = @intFromEnum(kind);
+                response.service_process_slot = result.process_slot;
+                response.service_endpoint_id = result.endpoint_id;
+            },
         }
     }
 
@@ -1628,7 +1854,7 @@ const LaunchContext = struct {
     }
 
     fn grantInputResources(self: *LaunchContext, config_source_va: u64, descriptor: init_bootstrap_abi.DeviceDescriptor, child_process_slot: u64) bool {
-        const queue_grant = self.findQueueGrant(descriptor) orelse return false;
+        const queue_grant = self.findQueueGrant(descriptor, 0) orelse return false;
         if (!ensureDeviceMmioCapsInstalled(descriptor)) return false;
         if (!grantDeviceMmioPages(descriptor, child_process_slot)) return false;
         const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.submit_token), child_process_slot);
@@ -1721,15 +1947,6 @@ const LaunchContext = struct {
         if (!self.grantInputResources(config_source_va, self.keyboard_input, child_slot)) {
             fail("ManagerInit: shell keyboard grant failed\n");
         }
-        const endpoint_id = allocDynamicServiceEndpointId();
-        self.window_service = .{
-            .kind = @intFromEnum(service_registry_abi.ServiceKind.window),
-            .process_slot = child_slot,
-            .endpoint_id = endpoint_id,
-            .flags = service_registry_abi.service_flag_process_slot_compat,
-        };
-        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: window endpoint publish failed\n");
-        service_registry_abi.addServiceWithProcessSlot(registry_source_va, .window, child_slot, endpoint_id);
         self.has_boot_display = true;
         _ = userLog("ManagerInit: shell spawned\n");
         noteBootStatus(boot_status_abi.status_init_first_window_spawn_done);
@@ -1743,6 +1960,7 @@ const LaunchContext = struct {
         var flags: u64 = 0;
         if (self.block_process_slot != null and self.block_endpoint_id != null) flags |= startup_plan_abi.require_flag_block_service;
         if (self.persistent_fs_process_slot != null and self.persistent_fs_endpoint_id != null) flags |= startup_plan_abi.require_flag_persistent_fs_service;
+        if (self.pointer_shared_source_va != null) flags |= startup_plan_abi.require_flag_pointer_shared;
         return flags;
     }
 
@@ -1796,10 +2014,99 @@ const LaunchContext = struct {
         return self.namedDependenciesReady(policy);
     }
 
+    fn launchInputDriverForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
+        const input_kind = policy.input_kind orelse fail("ManagerInit: input selector missing\n");
+        const input_desc = switch (input_kind) {
+            .keyboard => self.keyboard_input,
+            .pointer => self.pointer_input orelse fail("ManagerInit: pointer input descriptor missing\n"),
+        };
+        const exec = self.requireExecForPolicy(policy);
+        const endpoint_id = allocDynamicServiceEndpointId();
+        const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc input driver config page failed\n");
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+        const pointer_shared_source_va = if (input_kind == .pointer) self.ensurePointerSharedPage() else @as(u64, 0);
+
+        switch (input_kind) {
+            .keyboard => input_bootstrap.writeKeyboardConfigPage(config_source_va, .{
+                .common_page_paddr = input_desc.common_page_paddr,
+                .notify_page_paddr = input_desc.notify_page_paddr,
+                .isr_page_paddr = input_desc.isr_page_paddr,
+                .device_page_paddr = input_desc.device_page_paddr,
+                .common_page_offset = input_desc.common_page_offset,
+                .notify_page_offset = input_desc.notify_page_offset,
+                .isr_page_offset = input_desc.isr_page_offset,
+                .device_page_offset = input_desc.device_page_offset,
+                .notify_off_multiplier = input_desc.notify_off_multiplier,
+            }),
+            .pointer => input_bootstrap.writeMouseConfigPage(config_source_va, .{
+                .common_page_paddr = input_desc.common_page_paddr,
+                .notify_page_paddr = input_desc.notify_page_paddr,
+                .isr_page_paddr = input_desc.isr_page_paddr,
+                .device_page_paddr = input_desc.device_page_paddr,
+                .common_page_offset = input_desc.common_page_offset,
+                .notify_page_offset = input_desc.notify_page_offset,
+                .isr_page_offset = input_desc.isr_page_offset,
+                .device_page_offset = input_desc.device_page_offset,
+                .notify_off_multiplier = input_desc.notify_off_multiplier,
+                .screen_width = self.primary_display.width,
+                .screen_height = self.primary_display.height,
+                .screen_pitch = self.primary_display.pitch,
+                .shared_target_va = input_bootstrap.pointer_shared_target_va,
+            }),
+        }
+
+        generic_service_bootstrap_table_storage = .{};
+        generic_service_bootstrap_table_storage.page_count = if (input_kind == .pointer) 5 else 4;
+        generic_service_bootstrap_table_storage.page_descriptors[0] = .{
+            .source_va = config_source_va,
+            .target_va = process_abi.standard_config_target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[1] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[2] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[3] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        if (input_kind == .pointer) {
+            generic_service_bootstrap_table_storage.page_descriptors[4] = .{
+                .source_va = pointer_shared_source_va,
+                .target_va = input_bootstrap.pointer_shared_target_va,
+                .flags = process_abi.spawn_flag_bootstrap_page_writable,
+            };
+        }
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &generic_service_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", policy.label, "failed");
+            self.logRoleHex(policy.label, " spawn ret=", spawned);
+            fail("ManagerInit: input driver spawn failed\n");
+        };
+        self.logRoleLine("spawn", policy.label, "ok");
+        if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: input endpoint install failed\n");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: input endpoint publish failed\n");
+        if (!self.grantInputResources(config_source_va, input_desc, child_slot)) fail("ManagerInit: input grant failed\n");
+        if (input_kind == .pointer) {
+            service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .pointer, child_slot, endpoint_id);
+            if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .pointer, child_slot, endpoint_id);
+        }
+    }
+
     fn launchBlockDriverForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
         const exec = self.requireExecForPolicy(policy);
         const block_desc = self.block_device;
-        const queue_grant = self.findQueueGrant(block_desc) orelse fail("ManagerInit: block queue grant missing\n");
+        const queue_grant = self.findQueueGrant(block_desc, 0) orelse fail("ManagerInit: block queue grant missing\n");
         if (self.block_iommu_base_token == 0) self.block_iommu_base_token = queue_grant.iommu_token;
         if (self.block_submit_base_token == 0) self.block_submit_base_token = queue_grant.submit_token;
         if (self.block_notify_base_token == 0) self.block_notify_base_token = queue_grant.notify_token;
@@ -1902,7 +2209,8 @@ const LaunchContext = struct {
     fn launchGpuDriverForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
         const gpu_desc = self.gpu_device orelse fail("ManagerInit: gpu device descriptor missing\n");
         const exec = self.requireExecForPolicy(policy);
-        const queue_grant = self.findQueueGrant(gpu_desc) orelse fail("ManagerInit: gpu queue grant missing\n");
+        const queue_grant = self.findQueueGrant(gpu_desc, 0) orelse fail("ManagerInit: gpu queue grant missing\n");
+        const cursor_queue_grant = self.findQueueGrant(gpu_desc, gpu_bootstrap.cursor_queue_index);
         const endpoint_id = gpu_protocol.endpoint_id;
         const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc gpu driver config page failed\n");
         const stdio_source_va = self.ensureSharedStdioBootstrapPage();
@@ -1961,18 +2269,95 @@ const LaunchContext = struct {
         const iommu_child_encoded = grantQueueCap(queue_abi.encodeIommuCapToken(queue_grant.iommu_token), child_slot);
         const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.submit_token), child_slot);
         const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.notify_token), child_slot);
+        const cursor_submit_child_encoded = if (cursor_queue_grant) |grant|
+            grantQueueCap(queue_abi.encodeQueueCapToken(grant.submit_token), child_slot)
+        else
+            @as(u64, 0);
+        const cursor_notify_child_encoded = if (cursor_queue_grant) |grant|
+            grantQueueCap(queue_abi.encodeQueueCapToken(grant.notify_token), child_slot)
+        else
+            @as(u64, 0);
         const command_child_encoded = grantQueueCap(queue_abi.encodeCommandCapToken(queue_grant.command_token), child_slot);
         const iommu_child = queue_abi.decodeIommuCapToken(iommu_child_encoded) orelse fail("ManagerInit: gpu iommu grant failed\n");
         const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse fail("ManagerInit: gpu submit grant failed\n");
         const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse fail("ManagerInit: gpu notify grant failed\n");
+        const cursor_submit_child = if (cursor_queue_grant != null)
+            (queue_abi.decodeQueueCapToken(cursor_submit_child_encoded) orelse fail("ManagerInit: gpu cursor queue submit grant failed\n"))
+        else
+            @as(u64, 0);
+        const cursor_notify_child = if (cursor_queue_grant != null)
+            (queue_abi.decodeQueueCapToken(cursor_notify_child_encoded) orelse fail("ManagerInit: gpu cursor queue notify grant failed\n"))
+        else
+            @as(u64, 0);
         const command_child = queue_abi.decodeCommandCapToken(command_child_encoded) orelse fail("ManagerInit: gpu command grant failed\n");
-        gpu_bootstrap.writeGrantedCapabilityTokens(config_source_va, iommu_child, submit_child, notify_child, 0, 0, command_child);
+        gpu_bootstrap.writeGrantedCapabilityTokens(config_source_va, iommu_child, submit_child, notify_child, cursor_submit_child, cursor_notify_child, command_child);
         _ = signalEndpoint(endpoint_id);
         service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .gpu, child_slot, endpoint_id);
         if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .gpu, child_slot, endpoint_id);
         self.gpu_process_slot = child_slot;
         self.gpu_endpoint_id = endpoint_id;
         self.gpu_policy = policy;
+    }
+
+    fn launchWindowServiceForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
+        const exec = self.requireExecForPolicy(policy);
+        const endpoint_id = allocDynamicServiceEndpointId();
+        const registry_source_va = self.ensureSharedServiceRegistryPage();
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+        const pointer_shared_source_va = self.pointer_shared_source_va;
+
+        generic_service_bootstrap_table_storage = .{};
+        generic_service_bootstrap_table_storage.page_count = if (pointer_shared_source_va != null) 5 else 4;
+        generic_service_bootstrap_table_storage.page_descriptors[0] = .{
+            .source_va = registry_source_va,
+            .target_va = process_abi.service_registry_shadow_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[1] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[2] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[3] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        if (pointer_shared_source_va) |source_va| {
+            generic_service_bootstrap_table_storage.page_descriptors[4] = .{
+                .source_va = source_va,
+                .target_va = input_bootstrap.pointer_shared_target_va,
+                .flags = 0,
+            };
+        }
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &generic_service_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", policy.label, "failed");
+            self.logRoleHex(policy.label, " spawn ret=", spawned);
+            fail("ManagerInit: window service spawn failed\n");
+        };
+        self.logRoleLine("spawn", policy.label, "ok");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: window service endpoint publish failed\n");
+
+        self.window_service = .{
+            .kind = @intFromEnum(service_registry_abi.ServiceKind.window),
+            .process_slot = child_slot,
+            .endpoint_id = endpoint_id,
+            .flags = service_registry_abi.service_flag_process_slot_compat,
+        };
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .window, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| {
+            service_registry_abi.setServiceWithProcessSlot(source_va, .window, child_slot, endpoint_id);
+        }
+        _ = userLog("ManagerInit: window service ready\n");
     }
 
     fn launchPersistentFsForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
@@ -2049,8 +2434,10 @@ const LaunchContext = struct {
     fn launchPolicy(self: *LaunchContext, policy: StartupPolicy) void {
         self.ensurePolicyResources(policy);
         switch (policy.action) {
+            .input_driver => self.launchInputDriverForPolicy(policy),
             .block_driver => self.launchBlockDriverForPolicy(policy),
             .gpu_driver => self.launchGpuDriverForPolicy(policy),
+            .window_service => self.launchWindowServiceForPolicy(policy),
             .persistent_fs_server => self.launchPersistentFsForPolicy(policy),
             else => startupManifestFail("ManagerInit: unsupported policy action\n"),
         }
@@ -2100,6 +2487,7 @@ fn managerMain() noreturn {
     const bootstrap_handoff = waitForBootstrapHandoff();
     const primary_display = requirePrimaryDisplayDescriptor();
     const keyboard_input = requireInputDeviceDescriptor(bootstrap_handoff, .keyboard, "ManagerInit: keyboard input descriptor missing\n");
+    const pointer_input = findInputDeviceDescriptor(bootstrap_handoff, .pointer);
     const block_device = requireBlockDeviceDescriptor(bootstrap_handoff, .virtio_blk, "ManagerInit: block device descriptor missing\n");
     const gpu_device = findGpuDeviceDescriptor(bootstrap_handoff);
     const window_service_page = requireSpawnPageDescriptor(.service_config, .window_service, "ManagerInit: window service descriptor missing\n");
@@ -2110,6 +2498,7 @@ fn managerMain() noreturn {
         .bootstrap_handoff = bootstrap_handoff,
         .primary_display = primary_display,
         .keyboard_input = keyboard_input,
+        .pointer_input = pointer_input,
         .block_device = block_device,
         .gpu_device = gpu_device,
         .window_service_page = window_service_page,

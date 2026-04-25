@@ -184,6 +184,8 @@ const shell_fs_probe_commands = [_][]const u8{
 };
 const pie_user_rootfs_name = "cmd/pie_user.elf";
 const virtio_gpu_gl_rootfs_path = "/srv/virtio_gpu_gl.elf";
+const pachaland_rootfs_path = "/srv/pachaland.elf";
+const pachafetch_rootfs_path = "/cmd/pachafetch.elf";
 const gpu_demo_rootfs_path = "/cmd/gpu_demo.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 var spawn_registry_copy_source_va: u64 = 0;
@@ -194,6 +196,8 @@ var spawn_exit_status_zero_page_source_va: u64 = 0;
 var shell_process_slot_cache: u64 = 0;
 var gpu_service_process_slot_cache: u64 = 0;
 var gpu_service_endpoint_id_cache: u64 = 0;
+var service_registry_overlay_entries = [_]service_registry_abi.ServiceEntry{.{ .kind = 0, .process_slot = 0, .endpoint_id = 0, .flags = 0 }} ** service_registry_abi.max_entries;
+var service_registry_overlay_count: usize = 0;
 
 const rust_spawn_demo_magic: u64 = 0x5253_5044_454D_4F31;
 const rust_spawn_demo_version: u64 = 1;
@@ -509,7 +513,40 @@ fn copyServiceRegistryShadowForSpawn() ?u64 {
             gpu_service_endpoint_id_cache,
         );
     }
+    applyServiceRegistryOverlay(spawn_registry_copy_source_va);
     return spawn_registry_copy_source_va;
+}
+
+fn updateServiceRegistryOverlay(kind: service_registry_abi.ServiceKind, process_slot: u64, endpoint_id: u64) void {
+    if (process_slot == 0 or endpoint_id == 0) return;
+    var i: usize = 0;
+    while (i < service_registry_overlay_count and i < service_registry_overlay_entries.len) : (i += 1) {
+        if (service_registry_overlay_entries[i].kind != @intFromEnum(kind)) continue;
+        service_registry_overlay_entries[i] = .{
+            .kind = @intFromEnum(kind),
+            .process_slot = process_slot,
+            .endpoint_id = endpoint_id,
+            .flags = service_registry_abi.service_flag_process_slot_compat,
+        };
+        return;
+    }
+    if (service_registry_overlay_count >= service_registry_overlay_entries.len) return;
+    service_registry_overlay_entries[service_registry_overlay_count] = .{
+        .kind = @intFromEnum(kind),
+        .process_slot = process_slot,
+        .endpoint_id = endpoint_id,
+        .flags = service_registry_abi.service_flag_process_slot_compat,
+    };
+    service_registry_overlay_count += 1;
+}
+
+fn applyServiceRegistryOverlay(base_va: u64) void {
+    var i: usize = 0;
+    while (i < service_registry_overlay_count and i < service_registry_overlay_entries.len) : (i += 1) {
+        const entry = service_registry_overlay_entries[i];
+        const kind = std.meta.intToEnum(service_registry_abi.ServiceKind, entry.kind) catch continue;
+        service_registry_abi.setServiceWithProcessSlot(base_va, kind, entry.process_slot, entry.endpoint_id);
+    }
 }
 
 fn ensureSpawnStdioZeroPage() bool {
@@ -1777,9 +1814,83 @@ fn runPersistentFsUnlink(st: *ShellState, path: []const u8) bool {
     return true;
 }
 
+fn spawnPersistentFsPlainExecFile(st: *ShellState, path: []const u8, arg_text: []const u8) ?u64 {
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
+        st.writeLine(rootfsUnavailableReason());
+        shellLogLine(rootfsUnavailableReason());
+        return null;
+    }
+    const client = ensurePersistentFsClient(st) orelse return null;
+    const root = lookupPersistentFsRoot(st, client) orelse return null;
+    const file = client.lookup(root.token, path) catch |err| {
+        reportPersistentFsError(st, "exec lookup failed", err, false);
+        return null;
+    };
+    defer client.close(file.token) catch {};
+    const exec = client.openExec(file.token) catch |err| {
+        reportPersistentFsError(st, "open_exec failed", err, true);
+        return null;
+    };
+    if (!ensureSpawnExitStatusZeroPage()) {
+        st.writeLine("exit status bootstrap failed");
+        shellLogLine("exit status bootstrap failed");
+        return null;
+    }
+    const args_env_slot = prepareChildArgsEnvSlot(st, path, arg_text) orelse {
+        st.writeLine("args env bootstrap failed");
+        shellLogLine("args env bootstrap failed");
+        return null;
+    };
+    const text_stream_slot = prepareChildTextStreamSlot();
+    if (text_stream_slot == null and !ensureSpawnStdioZeroPage()) {
+        resetChildArgsEnvSlot(args_env_slot);
+        st.writeLine("stdio bootstrap failed");
+        shellLogLine("stdio bootstrap failed");
+        return null;
+    }
+    if (text_stream_slot) |slot| {
+        var diag_buf: [96]u8 = undefined;
+        const diag = std.fmt.bufPrint(&diag_buf, "stdio slot va=0x{x} shell_slot={d}", .{
+            slot.source_va,
+            shell_process_slot_cache,
+        }) catch "";
+        if (diag.len != 0) shellLogLine(diag);
+    } else {
+        shellLogLine("stdio zero page fallback");
+    }
+    const stdio_source_va = if (text_stream_slot) |slot| slot.source_va else spawn_stdio_zero_page_source_va;
+    const stdio_flags = if (text_stream_slot != null) process_abi.spawn_flag_bootstrap_page_writable else @as(u64, 0);
+    const spawned = spawnExec(
+        exec.token,
+        null,
+        null,
+        stdio_source_va,
+        stdio_flags,
+        spawn_exit_status_zero_page_source_va,
+        args_env_slot.source_va,
+    );
+    const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+        if (text_stream_slot) |slot| resetChildTextStreamSlot(slot);
+        resetChildArgsEnvSlot(args_env_slot);
+        st.writeLine("spawn failed");
+        shellLogLine("spawn failed");
+        return null;
+    };
+    args_env_slot.child_process_slot = child_slot;
+    args_env_slot.active = true;
+    if (text_stream_slot) |slot| {
+        slot.child_process_slot = child_slot;
+        slot.active = true;
+    }
+    return child_slot;
+}
+
 fn runPersistentFsExecFile(st: *ShellState, path: []const u8, arg_text: []const u8) bool {
     if (std.mem.eql(u8, path, virtio_gpu_gl_rootfs_path)) {
         return runGpuDriverExec(st);
+    }
+    if (std.mem.eql(u8, path, pachaland_rootfs_path)) {
+        return runPachalandExecRequest(st, path, arg_text);
     }
     if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
         st.writeLine(rootfsUnavailableReason());
@@ -2342,7 +2453,8 @@ const CapCtlRequestPages = struct {
 
 fn allocCapCtlRequestPages(st: *ShellState) ?CapCtlRequestPages {
     if (st.capctl_page_slot_next >= capctl_request_page_candidates.len or
-        st.capctl_page_slot_next >= capctl_response_page_candidates.len) {
+        st.capctl_page_slot_next >= capctl_response_page_candidates.len)
+    {
         st.writeLine("capctl page slots exhausted");
         shellLogLine("capctl page slots exhausted");
         return null;
@@ -2390,11 +2502,37 @@ fn capctlBlockProfileText(profile: capctl_protocol.BlockProfile) []const u8 {
     };
 }
 
-fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_protocol.Response {
+fn copyCapCtlRequestPayload(request_va: u64, payload: []const u8) bool {
+    if (payload.len > capctl_protocol.request_payload_bytes) return false;
+    const dst: [*]volatile u8 = @ptrFromInt(request_va + capctl_protocol.request_header_bytes);
+    var i: usize = 0;
+    while (i < payload.len) : (i += 1) dst[i] = payload[i];
+    return true;
+}
+
+fn capctlPollLimit(opcode: capctl_protocol.Opcode) u64 {
+    return switch (opcode) {
+        .launch_service => 8192,
+        else => 256,
+    };
+}
+
+fn sendCapCtlRequestWithPayload(
+    st: *ShellState,
+    opcode: capctl_protocol.Opcode,
+    arg0: u64,
+    arg1: u64,
+    payload: []const u8,
+) ?capctl_protocol.Response {
     const endpoint_id = capctl_protocol.endpoint_id;
     const pages = allocCapCtlRequestPages(st) orelse return null;
     clearPage(pages.request_va);
     clearPage(pages.response_va);
+    if (!copyCapCtlRequestPayload(pages.request_va, payload)) {
+        st.writeLine("capctl payload too large");
+        shellLogLine("capctl payload too large");
+        return null;
+    }
     const seq = st.capctl_next_seq;
     st.capctl_next_seq +%= 1;
     if (st.capctl_next_seq == 0) st.capctl_next_seq = 1;
@@ -2403,8 +2541,8 @@ fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_pr
     request.version = capctl_protocol.version;
     request.opcode = capctl_protocol.opcodeRaw(opcode);
     request.response_paddr = pages.response_paddr;
-    request.arg0 = 0;
-    request.arg1 = 0;
+    request.arg0 = arg0;
+    request.arg1 = arg1;
     request.reserved0 = 0;
     compilerBarrier();
     request.request_seq = seq;
@@ -2426,7 +2564,7 @@ fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_pr
     }
     const response: *volatile capctl_protocol.Response = @ptrFromInt(pages.response_va);
     var poll_count: u64 = 0;
-    while (poll_count < 256) : (poll_count += 1) {
+    while (poll_count < capctlPollLimit(opcode)) : (poll_count += 1) {
         if (response.response_seq == seq) {
             return .{
                 .magic = response.magic,
@@ -2441,6 +2579,9 @@ fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_pr
                 .block_profile = response.block_profile,
                 .gpu_process_slot = response.gpu_process_slot,
                 .gpu_endpoint_id = response.gpu_endpoint_id,
+                .service_kind = response.service_kind,
+                .service_process_slot = response.service_process_slot,
+                .service_endpoint_id = response.service_endpoint_id,
             };
         }
         _ = waitEvent(false, 1);
@@ -2448,6 +2589,10 @@ fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_pr
     st.writeLine("capctl response timeout");
     shellLogLine("capctl response timeout");
     return null;
+}
+
+fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_protocol.Response {
+    return sendCapCtlRequestWithPayload(st, opcode, 0, 0, &[_]u8{});
 }
 
 fn printCapBlkStatus(st: *ShellState, response: capctl_protocol.Response) void {
@@ -2505,11 +2650,108 @@ fn updateGpuServiceRegistry(response: capctl_protocol.Response) void {
     if (response.gpu_process_slot == 0 or response.gpu_endpoint_id == 0) return;
     gpu_service_process_slot_cache = response.gpu_process_slot;
     gpu_service_endpoint_id_cache = response.gpu_endpoint_id;
+    updateServiceRegistryOverlay(.gpu, response.gpu_process_slot, response.gpu_endpoint_id);
 }
 
 fn resetServiceClients(st: *ShellState) void {
     st.block_client_ready = false;
     st.persistent_fs_client_ready = false;
+}
+
+fn serviceKindName(kind: service_registry_abi.ServiceKind) []const u8 {
+    return switch (kind) {
+        .window => "window",
+        .vfs => "vfs",
+        .block => "block",
+        .persistent_fs => "persistent_fs",
+        .capctl => "capctl",
+        .gpu => "gpu",
+        .pointer => "pointer",
+    };
+}
+
+fn parseServiceKind(text: []const u8) ?service_registry_abi.ServiceKind {
+    if (eqAsciiNoCase(text, "window")) return .window;
+    if (eqAsciiNoCase(text, "vfs")) return .vfs;
+    if (eqAsciiNoCase(text, "block")) return .block;
+    if (eqAsciiNoCase(text, "persistent_fs") or eqAsciiNoCase(text, "persistent-fs") or eqAsciiNoCase(text, "fs")) return .persistent_fs;
+    if (eqAsciiNoCase(text, "capctl")) return .capctl;
+    if (eqAsciiNoCase(text, "gpu")) return .gpu;
+    if (eqAsciiNoCase(text, "pointer")) return .pointer;
+    return null;
+}
+
+fn updateServiceRegistryFromCapCtlResponse(response: capctl_protocol.Response) ?service_registry_abi.ServiceKind {
+    if (response.service_process_slot == 0 or response.service_endpoint_id == 0) return null;
+    const kind = std.meta.intToEnum(service_registry_abi.ServiceKind, response.service_kind) catch return null;
+    updateServiceRegistryOverlay(kind, response.service_process_slot, response.service_endpoint_id);
+    return kind;
+}
+
+fn publishSpawnedServiceRequest(st: *ShellState, kind: service_registry_abi.ServiceKind, child_slot: u64) bool {
+    const response = sendCapCtlRequestWithPayload(
+        st,
+        .publish_service,
+        @intFromEnum(kind),
+        child_slot,
+        &[_]u8{},
+    ) orelse return false;
+    const status = capctl_protocol.decodeResponseStatus(response.status) orelse {
+        st.writeLine("capctl invalid response");
+        shellLogLine("capctl invalid response");
+        return false;
+    };
+    switch (status) {
+        .ok, .already => {
+            const response_kind = updateServiceRegistryFromCapCtlResponse(response) orelse kind;
+            var line_buf: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "service {s} process={d} endpoint={d}", .{
+                serviceKindName(response_kind),
+                response.service_process_slot,
+                response.service_endpoint_id,
+            }) catch return false;
+            st.writeLine(line);
+            shellLogLine(line);
+            return true;
+        },
+        else => {
+            st.writeLine(capctlResponseStatusText(status));
+            shellLogLine("service exec failed");
+            return false;
+        },
+    }
+}
+
+fn runServiceExecRequest(st: *ShellState, kind: service_registry_abi.ServiceKind, path: []const u8, arg_text: []const u8) bool {
+    if (kind == .window and gpu_service_endpoint_id_cache == 0) {
+        if (!runGpuDriverExec(st)) return false;
+    }
+    const child_slot = spawnPersistentFsPlainExecFile(st, path, arg_text) orelse return false;
+    return publishSpawnedServiceRequest(st, kind, child_slot);
+}
+
+fn runPachalandExecRequest(st: *ShellState, path: []const u8, arg_text: []const u8) bool {
+    if (!runServiceExecRequest(st, .window, path, arg_text)) return false;
+    const child_slot = spawnPersistentFsPlainExecFile(st, pachafetch_rootfs_path, "") orelse {
+        shellLogFmt("pachaland autostart failed path={s}", .{pachafetch_rootfs_path});
+        return true;
+    };
+    shellLogFmt("pachaland autostart spawned path={s} process={d}", .{
+        pachafetch_rootfs_path,
+        child_slot,
+    });
+    return true;
+}
+
+fn runServiceCommand(st: *ShellState, text: []const u8) bool {
+    const args = splitCommand(text);
+    const kind = parseServiceKind(args.head) orelse {
+        st.writeLine("usage: service <kind> <path>");
+        return false;
+    };
+    var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
+    const path = requireRootfsPath(st, args.tail, &path_buf) orelse return false;
+    return runServiceExecRequest(st, kind, path, "");
 }
 
 fn runCapBlkCommand(st: *ShellState, text: []const u8) bool {
@@ -2616,7 +2858,8 @@ fn executeCommand(st: *ShellState) RenderAction {
     if (eqAsciiNoCase(parsed.head, "help")) {
         st.writeLine("commands: help clear pwd cd mkdir ls stat");
         st.writeLine("cat exec touch write rm mv block_demo");
-        st.writeLine("fs_demo pie_user gpu gpu_demo cap  exec <path>  write <path> <text>");
+        st.writeLine("fs_demo pie_user gpu gpu_demo cap service");
+        st.writeLine("exec <path> | exec --service <kind> <path>");
         return .full;
     }
     if (eqAsciiNoCase(parsed.head, "clear")) {
@@ -2689,10 +2932,21 @@ fn executeCommand(st: *ShellState) RenderAction {
         _ = runPersistentFsRename(st, old_path, new_path);
         return .full;
     }
+    if (eqAsciiNoCase(parsed.head, "service") or eqAsciiNoCase(parsed.head, "svc") or eqAsciiNoCase(parsed.head, "exec-service")) {
+        _ = runServiceCommand(st, parsed.tail);
+        return .full;
+    }
     if (eqAsciiNoCase(parsed.head, "exec") or eqAsciiNoCase(parsed.head, "run")) {
         const exec_args = splitCommand(parsed.tail);
+        if (eqAsciiNoCase(exec_args.head, "--service") or eqAsciiNoCase(exec_args.head, "service")) {
+            _ = runServiceCommand(st, exec_args.tail);
+            return .full;
+        }
         var path_buf: [fs_protocol.max_path_bytes]u8 = undefined;
-        const path = requireRootfsPath(st, exec_args.head, &path_buf) orelse return .full;
+        const path = if (eqAsciiNoCase(exec_args.head, "pachaland.elf"))
+            pachaland_rootfs_path
+        else
+            requireRootfsPath(st, exec_args.head, &path_buf) orelse return .full;
         _ = runPersistentFsExecFile(st, path, exec_args.tail);
         return .full;
     }

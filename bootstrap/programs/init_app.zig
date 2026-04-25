@@ -654,6 +654,23 @@ fn isVirtioGpuDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) 
         (descriptor.device_id == virtio_gpu_device_modern or descriptor.subsystem_id == virtio_gpu_subsystem_id);
 }
 
+fn findDeviceQueueGrant(descriptor: init_bootstrap_abi.DeviceDescriptor, queue_index: u64) ?init_bootstrap_abi.DeviceQueueGrant {
+    var i: usize = 0;
+    while (@as(u64, @intCast(i)) < descriptor.init_queue_grant_count and i < init_bootstrap_abi.max_device_queue_grants) : (i += 1) {
+        const grant = descriptor.init_queue_grants[i];
+        if (grant.queue_index == queue_index and grant.submit_token != 0 and grant.notify_token != 0) return grant;
+    }
+    return null;
+}
+
+fn requireDeviceQueueGrant(
+    descriptor: init_bootstrap_abi.DeviceDescriptor,
+    queue_index: u64,
+    failure_message: []const u8,
+) init_bootstrap_abi.DeviceQueueGrant {
+    return findDeviceQueueGrant(descriptor, queue_index) orelse bootFail(failure_message);
+}
+
 fn requireBlockDeviceDescriptor(failure_message: []const u8) init_bootstrap_abi.DeviceDescriptor {
     const page = descriptorPage() orelse bootFail("BootInit: descriptor page missing\n");
     var i: usize = 0;
@@ -860,7 +877,7 @@ fn rebuildManagerDeviceNeedCache(page: *const volatile init_bootstrap_abi.Descri
         if (!isVirtioInputDeviceDescriptor(descriptor)) continue;
         const kind = classifyInputDeviceDescriptor(descriptor) orelse continue;
         manager_device_input_hint_cache[i] = inputDeviceHintValue(kind);
-        manager_device_needed_cache[i] = kind == .keyboard;
+        manager_device_needed_cache[i] = kind == .keyboard or kind == .pointer;
     }
 }
 
@@ -935,6 +952,7 @@ fn openSeedExec() rootfs_core.OpenExecResult {
     }
 
     const block_desc = requireBlockDeviceDescriptor("BootInit: block device descriptor missing\n");
+    const block_queue = requireDeviceQueueGrant(block_desc, 0, "BootInit: block queue grant missing\n");
     const block_geometry = readBlockGeometry(block_desc) orelse bootFail("BootInit: block geometry failed\n");
     if (!ensureDeviceMmioCapsInstalled(block_desc)) bootFail("BootInit: block MMIO install failed\n");
     if (!rootfs_core.init(.{
@@ -948,8 +966,8 @@ fn openSeedExec() rootfs_core.OpenExecResult {
         .notify_page_offset = block_desc.notify_page_offset,
         .isr_page_offset = block_desc.isr_page_offset,
         .notify_off_multiplier = block_desc.notify_off_multiplier,
-        .queue_submit_token = block_desc.init_queue_submit_token,
-        .queue_notify_token = block_desc.init_queue_notify_token,
+        .queue_submit_token = block_queue.submit_token,
+        .queue_notify_token = block_queue.notify_token,
     })) bootFail("BootInit: rootfs init failed\n");
     _ = userLog("BootInit: rootfs ready\n");
     return rootfs_core.openExec(seed_exec_path) orelse bootFail("BootInit: seed open_exec failed\n");
@@ -1064,21 +1082,31 @@ fn grantManagerDeviceResources(manager_slot: u64) void {
         logManagerGrantDeviceStep(device_index, descriptor, "begin");
         logManagerGrantDeviceStep(device_index, descriptor, "mmio ready");
         const iommu_child_encoded = grantQueueCap(queue_abi.encodeIommuCapToken(descriptor.init_iommu_token), manager_slot);
-        const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(descriptor.init_queue_submit_token), manager_slot);
-        const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(descriptor.init_queue_notify_token), manager_slot);
         const command_child_encoded = grantQueueCap(queue_abi.encodeCommandCapToken(descriptor.init_command_token), manager_slot);
         const iommu_child = queue_abi.decodeIommuCapToken(iommu_child_encoded) orelse bootFail("BootInit: manager iommu grant failed\n");
-        const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse bootFail("BootInit: manager submit grant failed\n");
-        const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse bootFail("BootInit: manager notify grant failed\n");
         const command_child = queue_abi.decodeCommandCapToken(command_child_encoded) orelse bootFail("BootInit: manager command grant failed\n");
+        var queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants;
+        var queue_grant_count: usize = 0;
+        while (@as(u64, @intCast(queue_grant_count)) < descriptor.init_queue_grant_count and queue_grant_count < init_bootstrap_abi.max_device_queue_grants) : (queue_grant_count += 1) {
+            const source_grant = descriptor.init_queue_grants[queue_grant_count];
+            const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(source_grant.submit_token), manager_slot);
+            const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(source_grant.notify_token), manager_slot);
+            const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse bootFail("BootInit: manager submit grant failed\n");
+            const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse bootFail("BootInit: manager notify grant failed\n");
+            queue_grants[queue_grant_count] = .{
+                .queue_index = source_grant.queue_index,
+                .submit_token = submit_child,
+                .notify_token = notify_child,
+            };
+        }
         logManagerGrantDeviceStep(device_index, descriptor, "queue ready");
         manager_init_bootstrap_abi.writeDeviceGrant(
             manager_bootstrap_handoff_source_va,
             handoff_index,
             descriptor.device_page_paddr,
             iommu_child,
-            submit_child,
-            notify_child,
+            @intCast(queue_grant_count),
+            queue_grants,
             command_child,
             manager_device_input_hint_cache[device_index],
         );

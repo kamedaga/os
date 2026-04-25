@@ -12,6 +12,7 @@ pub const feature_present_2d: u64 = 1 << 2;
 pub const feature_present_3d: u64 = 1 << 3;
 pub const feature_texture_2d: u64 = 1 << 4;
 pub const feature_app_surface: u64 = 1 << 5;
+pub const feature_cursor: u64 = 1 << 6;
 
 pub const default_virgl_resource_id: u32 = 2;
 pub const default_virgl_vertex_buffer_id: u32 = 3;
@@ -28,6 +29,7 @@ pub const Opcode = enum(u16) {
     update_texture_2d = 8,
     delete_texture_2d = 9,
     create_app_surface = 10,
+    set_cursor_position = 11,
 };
 
 pub const Status = enum(i32) {

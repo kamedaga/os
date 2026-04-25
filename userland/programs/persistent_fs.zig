@@ -189,7 +189,6 @@ fn signalEndpoint(endpoint: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-
 fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
     return asm volatile (
         \\int $0x80
@@ -970,7 +969,7 @@ fn findSessionObjectByKind(session: *Session, kind: SessionObjectKind, file_inde
     for (&session.objects) |*object| {
         if (!object.active or object.kind != kind) continue;
         if (kind == .mount or kind == .root_dir or object.file_index == file_index) return object.client_token;
-        }
+    }
     return null;
 }
 
@@ -1118,6 +1117,23 @@ fn replyRead(session: *Session, request_seq: u64, file_bytes: u64, next_offset: 
 fn replyOpenExec(session: *Session, request_seq: u64, client_token: u64, file_bytes: u64) void {
     clearPage(session.response_va);
     writeResponseHeader(session, .open_exec, request_seq, .ok, client_token, file_bytes, 0, .exec, 0);
+}
+
+fn storageUsedBlocks() u64 {
+    var used = volume_superblock.data_start_block;
+    var i: usize = 0;
+    while (i < volume_dir_entries.len) : (i += 1) {
+        const entry = &volume_dir_entries[i];
+        if (!dirEntryUsed(entry)) continue;
+        if (entry.block_count == 0 or entry.start_block == 0) continue;
+        used += entry.block_count;
+    }
+    return @min(used, capacity_blocks);
+}
+
+fn replyStatFs(session: *Session, request_seq: u64) void {
+    clearPage(session.response_va);
+    writeResponseHeader(session, .statfs, request_seq, .ok, 0, storageUsedBlocks(), 0, .mount, 0);
 }
 
 fn readFileBytes(entry: *const VolumeDirEntry, offset: u64, out: []u8) ?usize {
@@ -1356,9 +1372,9 @@ fn handleCreate(session: *Session, request_seq: u64) void {
         existing_index
     else
         allocDirEntry(parent_index, target.name, create_dir) orelse {
-        replyStatus(session, .create, request_seq, .busy);
-        return;
-    };
+            replyStatus(session, .create, request_seq, .busy);
+            return;
+        };
     const entry = &volume_dir_entries[file_index];
     if (dirEntryIsDirectory(entry) != create_dir) {
         replyStatus(session, .create, request_seq, if (dirEntryIsDirectory(entry)) .is_dir else .not_dir);
@@ -1666,6 +1682,7 @@ fn processSessionRequest(session: *Session) void {
         .write => handleWrite(session, request_seq),
         .unlink => handleUnlink(session, request_seq),
         .rename => handleRename(session, request_seq),
+        .statfs => replyStatFs(session, request_seq),
         .open_exec => handleOpenExec(session, request_seq),
     }
     session.last_completed_seq = request_seq;

@@ -75,11 +75,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "capgl_shader_wave"
+version = "0.1.0"
+dependencies = [
+ "cap_std",
+ "caplibgl",
+ "capwm_client",
+ "rt_alloc",
+ "rt_core",
+]
+
+[[package]]
 name = "caplibgl"
 version = "0.1.0"
 dependencies = [
  "rt_core",
  "rt_handle",
+]
+
+[[package]]
+name = "capwm_client"
+version = "0.1.0"
+dependencies = [
+ "cap_std",
+ "caplibgl",
+ "rt_core",
+ "rt_handle",
+]
+
+[[package]]
+name = "capwm_smoke"
+version = "0.1.0"
+dependencies = [
+ "cap_std",
+ "caplibgl",
+ "capwm_client",
+ "rt_alloc",
+ "rt_core",
 ]
 
 [[package]]
@@ -258,6 +290,27 @@ checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "pachafetch"
+version = "0.1.0"
+dependencies = [
+ "cap_std",
+ "caplibgl",
+ "capwm_client",
+ "pachaland_assets",
+ "pitty_assets",
+ "rt_alloc",
+ "rt_core",
+]
+
+[[package]]
+name = "pachaland_assets"
+version = "0.1.0"
+
+[[package]]
+name = "pitty_assets"
+version = "0.1.0"
 
 [[package]]
 name = "postcard"

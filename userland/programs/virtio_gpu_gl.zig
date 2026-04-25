@@ -29,9 +29,13 @@ const queue_page1_va: usize = 0x2100_9000;
 const control_page_va: usize = 0x2100_A000;
 const mem_entries_page0_va: usize = 0x2100_B000;
 const mem_entries_page1_va: usize = 0x2100_C000;
+const cursor_queue_page0_va: usize = 0x2100_D000;
+const cursor_queue_page1_va: usize = 0x2100_E000;
+const cursor_pixels_va: usize = 0x2100_F000;
 const backing_base_va: usize = 0x2140_0000;
-const gpu_request_page_va: usize = 0x3C01_0000;
-const gpu_response_page_va: usize = 0x3C01_1000;
+const gpu_session_base_va: usize = 0x3C01_0000;
+const gpu_session_stride_bytes: usize = 0x2000;
+const max_gpu_sessions: usize = 8;
 
 const control_request_offset: usize = 0x000;
 const control_response_offset: usize = 0x800;
@@ -58,14 +62,15 @@ const feature_virgl: u32 = 1 << 0;
 const feature_version_1: u32 = 1 << 0;
 
 const queue_index_control: u16 = 0;
+const queue_index_cursor: u16 = 1;
 const queue_size_requested: u16 = 8;
 const queue_used_offset: usize = 4096;
 const desc_flag_next: u16 = 1 << 0;
 const desc_flag_write: u16 = 1 << 1;
 const max_backing_pages: usize = 512;
 const max_alloc_chunk_pages: usize = 64;
-const scanout_width_cap: u32 = 800;
-const scanout_height_cap: u32 = 600;
+const scanout_width_cap: u32 = 1920;
+const scanout_height_cap: u32 = 1080;
 const wait_spin_limit: usize = 400_000;
 const wait_sleep_limit: usize = 2048;
 
@@ -82,9 +87,12 @@ const virtio_gpu_cmd_ctx_attach_resource: u32 = 0x0202;
 const virtio_gpu_cmd_ctx_detach_resource: u32 = 0x0203;
 const virtio_gpu_cmd_resource_create_3d: u32 = 0x0204;
 const virtio_gpu_cmd_submit_3d: u32 = 0x0207;
+const virtio_gpu_cmd_update_cursor: u32 = 0x0300;
+const virtio_gpu_cmd_move_cursor: u32 = 0x0301;
 const virtio_gpu_resp_ok_nodata: u32 = 0x1100;
 const virtio_gpu_resp_ok_display_info: u32 = 0x1101;
 const virtio_gpu_resp_ok_capset_info: u32 = 0x1102;
+const virtio_gpu_format_b8g8r8a8_unorm: u32 = 1;
 const virtio_gpu_format_b8g8r8x8_unorm: u32 = 2;
 const virgl_format_b8g8r8a8_unorm: u32 = 1;
 const virgl_format_r8_unorm: u32 = 64;
@@ -98,6 +106,38 @@ const pipe_bind_scanout: u32 = 1 << 18;
 const virtio_gpu_capset_virgl: u32 = 1;
 const virtio_gpu_capset_virgl2: u32 = 2;
 const default_context_id: u32 = 1;
+const cursor_dim: u32 = 64;
+const cursor_pixel_pages: usize = 4;
+const cursor_pixel_bytes: usize = @as(usize, cursor_dim) * @as(usize, cursor_dim) * 4;
+const cursor_shape_width: usize = 15;
+const cursor_shape_height: usize = 24;
+const cursor_resource_id: u32 = 0x8000;
+const cursor_shape = [cursor_shape_height][cursor_shape_width]u8{
+    "@              ".*,
+    "@@             ".*,
+    "@.@            ".*,
+    "@..@           ".*,
+    "@...@          ".*,
+    "@....@         ".*,
+    "@.....@        ".*,
+    "@......@       ".*,
+    "@.......@      ".*,
+    "@........@     ".*,
+    "@.........@    ".*,
+    "@..........@   ".*,
+    "@...........@  ".*,
+    "@............@ ".*,
+    "@......@@@@@@@@".*,
+    "@......@       ".*,
+    "@....@@.@      ".*,
+    "@...@ @.@      ".*,
+    "@..@   @.@     ".*,
+    "@.@    @.@     ".*,
+    "@@      @.@    ".*,
+    "@       @.@    ".*,
+    "         @.@   ".*,
+    "         @@@   ".*,
+};
 const virgl_object_null: u32 = 0;
 const virgl_ccmd_nop: u32 = 0;
 const virgl_ccmd_resource_inline_write: u32 = 9;
@@ -244,6 +284,22 @@ const VirtioGpuCmdSubmit = extern struct {
     padding: u32,
 };
 
+const VirtioGpuCursorPos = extern struct {
+    scanout_id: u32,
+    x: u32,
+    y: u32,
+    padding: u32,
+};
+
+const VirtioGpuUpdateCursor = extern struct {
+    hdr: VirtioGpuCtrlHdr,
+    pos: VirtioGpuCursorPos,
+    resource_id: u32,
+    hot_x: u32,
+    hot_y: u32,
+    padding: u32,
+};
+
 const VirtioGpuMemEntry = extern struct {
     addr: u64,
     length: u32,
@@ -254,14 +310,20 @@ const GpuState = struct {
     common_base: usize = 0,
     notify_base: usize = 0,
     notify_addr: usize = 0,
+    cursor_notify_addr: usize = 0,
     notify_off_multiplier: usize = 0,
     queue_size: u16 = 0,
+    cursor_queue_size: u16 = 0,
     used_idx_seen: u16 = 0,
+    cursor_used_idx_seen: u16 = 0,
     queue_paddr0: u64 = 0,
     queue_paddr1: u64 = 0,
+    cursor_queue_paddr0: u64 = 0,
+    cursor_queue_paddr1: u64 = 0,
     control_page_paddr: u64 = 0,
     mem_entries_paddr0: u64 = 0,
     mem_entries_paddr1: u64 = 0,
+    cursor_pixels_paddrs: [cursor_pixel_pages]u64 = [_]u64{0} ** cursor_pixel_pages,
     backing_page_count: usize = 0,
     backing_bytes_len: usize = 0,
     resource_id: u32 = 1,
@@ -283,14 +345,25 @@ const GpuState = struct {
     present_3d_logged: bool = false,
     texture_upload_logged: bool = false,
     app_surface_logged: bool = false,
+    cursor_ready: bool = false,
+    cursor_logged: bool = false,
+};
+
+const GpuSession = struct {
+    request_paddr: u64 = 0,
+    response_paddr: u64 = 0,
+    request_va: usize = 0,
+    response_va: usize = 0,
+    last_request_seq: u64 = 0,
+    active: bool = false,
 };
 
 var boot_state: BootState = .{};
 var gpu_state: GpuState = .{};
 var backing_paddrs: [max_backing_pages]u64 = [_]u64{0} ** max_backing_pages;
-var request_page_paddr_seen: u64 = 0;
-var response_page_paddr_seen: u64 = 0;
-var last_request_seq_seen: u64 = 0;
+var gpu_sessions: [max_gpu_sessions]GpuSession = [_]GpuSession{.{}} ** max_gpu_sessions;
+var active_request_page_va: usize = 0;
+var active_response_page_va: usize = 0;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -595,6 +668,11 @@ fn queueRegionPhys(offset: usize) u64 {
     return gpu_state.queue_paddr1 + @as(u64, @intCast(offset - 4096));
 }
 
+fn cursorQueueRegionPhys(offset: usize) u64 {
+    if (offset < 4096) return gpu_state.cursor_queue_paddr0 + @as(u64, @intCast(offset));
+    return gpu_state.cursor_queue_paddr1 + @as(u64, @intCast(offset - 4096));
+}
+
 fn queueDescPtr(index: u16) *volatile VirtqDesc {
     const offset = @as(usize, index) * @sizeOf(VirtqDesc);
     return @ptrFromInt(queue_page0_va + offset);
@@ -616,11 +694,42 @@ fn queueUsedRingPtr() [*]volatile VirtqUsedElem {
     return @ptrFromInt(queue_page0_va + queue_used_offset + 4);
 }
 
+fn cursorQueueDescPtr(index: u16) *volatile VirtqDesc {
+    const offset = @as(usize, index) * @sizeOf(VirtqDesc);
+    return @ptrFromInt(cursor_queue_page0_va + offset);
+}
+
+fn cursorQueueAvailIdxPtr() *volatile u16 {
+    return @ptrFromInt(cursor_queue_page0_va + @as(usize, gpu_state.cursor_queue_size) * @sizeOf(VirtqDesc) + 2);
+}
+
+fn cursorQueueAvailRingPtr() [*]volatile u16 {
+    return @ptrFromInt(cursor_queue_page0_va + @as(usize, gpu_state.cursor_queue_size) * @sizeOf(VirtqDesc) + 4);
+}
+
+fn cursorQueueUsedIdxPtr() *volatile u16 {
+    return @ptrFromInt(cursor_queue_page0_va + queue_used_offset + 2);
+}
+
+fn cursorQueueUsedRingPtr() [*]volatile VirtqUsedElem {
+    return @ptrFromInt(cursor_queue_page0_va + queue_used_offset + 4);
+}
+
 fn queuePushAvail(head_desc: u16) void {
     const avail_idx_ptr = queueAvailIdxPtr();
     const avail_idx = avail_idx_ptr.*;
     const slot: usize = @intCast(avail_idx % gpu_state.queue_size);
     queueAvailRingPtr()[slot] = head_desc;
+    memoryBarrier();
+    avail_idx_ptr.* = avail_idx +% 1;
+    memoryBarrier();
+}
+
+fn cursorQueuePushAvail(head_desc: u16) void {
+    const avail_idx_ptr = cursorQueueAvailIdxPtr();
+    const avail_idx = avail_idx_ptr.*;
+    const slot: usize = @intCast(avail_idx % gpu_state.cursor_queue_size);
+    cursorQueueAvailRingPtr()[slot] = head_desc;
     memoryBarrier();
     avail_idx_ptr.* = avail_idx +% 1;
     memoryBarrier();
@@ -635,7 +744,7 @@ fn controlRespPaddr() u64 {
 }
 
 fn initQueueMemory() bool {
-    var init_paddrs: [5]u64 = .{ 0, 0, 0, 0, 0 };
+    var init_paddrs: [7 + cursor_pixel_pages]u64 = [_]u64{0} ** (7 + cursor_pixel_pages);
     if (allocMapPages(queue_page0_va, init_paddrs.len, true, @intFromPtr(&init_paddrs)) != syscall_ok) {
         _ = userLog("VirtioGpuGl: alloc queue pages failed\n");
         return false;
@@ -648,9 +757,17 @@ fn initQueueMemory() bool {
     gpu_state.control_page_paddr = init_paddrs[2];
     gpu_state.mem_entries_paddr0 = init_paddrs[3];
     gpu_state.mem_entries_paddr1 = init_paddrs[4];
+    gpu_state.cursor_queue_paddr0 = init_paddrs[5];
+    gpu_state.cursor_queue_paddr1 = init_paddrs[6];
+    var cursor_page: usize = 0;
+    while (cursor_page < cursor_pixel_pages) : (cursor_page += 1) {
+        gpu_state.cursor_pixels_paddrs[cursor_page] = init_paddrs[7 + cursor_page];
+    }
     clearBytes(queue_page0_va, 8192);
+    clearBytes(cursor_queue_page0_va, 8192);
     clearBytes(control_page_va, 4096);
     clearBytes(mem_entries_page0_va, 8192);
+    clearBytes(cursor_pixels_va, cursor_pixel_bytes);
     return true;
 }
 
@@ -701,6 +818,23 @@ fn initVirtio() bool {
     mmioWriteU16(gpu_state.common_base + common_queue_enable, 1);
     gpu_state.notify_addr = gpu_state.notify_base + @as(usize, queue_notify_off) * gpu_state.notify_off_multiplier;
     gpu_state.used_idx_seen = 0;
+
+    mmioWriteU16(gpu_state.common_base + common_queue_select, queue_index_cursor);
+    const cursor_device_queue_size = mmioReadU16(gpu_state.common_base + common_queue_size);
+    if (cursor_device_queue_size < 2) {
+        _ = userLog("VirtioGpuGl: cursor queue too small\n");
+        return false;
+    }
+    gpu_state.cursor_queue_size = if (cursor_device_queue_size < queue_size_requested) cursor_device_queue_size else queue_size_requested;
+    const cursor_queue_notify_off = mmioReadU16(gpu_state.common_base + common_queue_notify_off);
+    mmioWriteU16(gpu_state.common_base + common_queue_size, gpu_state.cursor_queue_size);
+    mmioWriteU64(gpu_state.common_base + common_queue_desc, cursorQueueRegionPhys(0));
+    mmioWriteU64(gpu_state.common_base + common_queue_avail, cursorQueueRegionPhys(@as(usize, gpu_state.cursor_queue_size) * @sizeOf(VirtqDesc)));
+    mmioWriteU64(gpu_state.common_base + common_queue_used, cursorQueueRegionPhys(queue_used_offset));
+    mmioWriteU16(gpu_state.common_base + common_queue_enable, 1);
+    gpu_state.cursor_notify_addr = gpu_state.notify_base + @as(usize, cursor_queue_notify_off) * gpu_state.notify_off_multiplier;
+    gpu_state.cursor_used_idx_seen = 0;
+
     mmioWriteU8(gpu_state.common_base + common_device_status, status_acknowledge | status_driver | status_features_ok | status_driver_ok);
     return true;
 }
@@ -838,6 +972,63 @@ fn submitCommand(
         return false;
     }
     return releaseMapping(req_mapping) and releaseMapping(resp_mapping) and releaseMapping(extra0_mapping) and releaseMapping(extra1_mapping);
+}
+
+fn submitCursorCommand(req_len: usize) bool {
+    if (gpu_state.cursor_queue_size < 2 or gpu_state.cursor_notify_addr == 0) return false;
+    if (commandAuthorize(boot_state.command_token, .virtio_gpu, .gpu_cursor) != syscall_ok) {
+        _ = userLog("VirtioGpuGl: cursor command denied\n");
+        return false;
+    }
+
+    const req_mapping = createControlMapping(controlReqPaddr(), req_len, .read, .map_read);
+    const resp_mapping = createControlMapping(controlRespPaddr(), @sizeOf(VirtioGpuCtrlHdr), .write, .map_write);
+    if (req_mapping == 0 or resp_mapping == 0) return false;
+    clearBytes(control_page_va + control_response_offset, @sizeOf(VirtioGpuCtrlHdr));
+    memoryBarrier();
+
+    cursorQueueDescPtr(0).* = .{
+        .addr = controlReqPaddr(),
+        .len = @intCast(req_len),
+        .flags = desc_flag_next,
+        .next = 1,
+    };
+    cursorQueueDescPtr(1).* = .{
+        .addr = controlRespPaddr(),
+        .len = @sizeOf(VirtioGpuCtrlHdr),
+        .flags = desc_flag_write,
+        .next = 0,
+    };
+
+    if (!setMappingState(req_mapping, .in_flight) or !setMappingState(resp_mapping, .in_flight)) return false;
+    if (queueSubmit(boot_state.cursor_queue_submit_token, queue_index_cursor) != syscall_ok) return false;
+    cursorQueuePushAvail(0);
+    if (queueNotify(boot_state.cursor_queue_notify_token, queue_index_cursor) != syscall_ok) return false;
+    memoryBarrier();
+    mmioWriteU16(gpu_state.cursor_notify_addr, queue_index_cursor);
+
+    var spin: usize = 0;
+    while (spin < wait_spin_limit) : (spin += 1) {
+        if (cursorQueueUsedIdxPtr().* != gpu_state.cursor_used_idx_seen) break;
+        asm volatile ("pause");
+    }
+    var sleeps: usize = 0;
+    while (cursorQueueUsedIdxPtr().* == gpu_state.cursor_used_idx_seen and sleeps < wait_sleep_limit) : (sleeps += 1) {
+        _ = waitEvent(false, 1);
+    }
+    if (cursorQueueUsedIdxPtr().* == gpu_state.cursor_used_idx_seen) {
+        _ = userLog("VirtioGpuGl: cursor command timeout\n");
+        return false;
+    }
+
+    const used = cursorQueueUsedRingPtr()[@intCast(gpu_state.cursor_used_idx_seen % gpu_state.cursor_queue_size)];
+    gpu_state.cursor_used_idx_seen +%= 1;
+    if (used.id != 0) return false;
+    memoryBarrier();
+    const resp: *const volatile VirtioGpuCtrlHdr = @ptrFromInt(control_page_va + control_response_offset);
+    if (resp.type != virtio_gpu_resp_ok_nodata) return false;
+    if (!setMappingState(req_mapping, .completed) or !setMappingState(resp_mapping, .completed)) return false;
+    return releaseMapping(req_mapping) and releaseMapping(resp_mapping);
 }
 
 fn controlHdr(command_type: u32) VirtioGpuCtrlHdr {
@@ -1088,10 +1279,11 @@ fn submitVirglNoop() bool {
 
 fn submitVirglInlineCommands(inline_bytes: usize) bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
+    if (active_request_page_va == 0) return false;
     if (inline_bytes == 0 or inline_bytes > gpu_protocol.request_payload_bytes or (inline_bytes & 0x3) != 0) return false;
     clearBytes(mem_entries_page0_va, inline_bytes);
     const dest: [*]volatile u8 = @ptrFromInt(mem_entries_page0_va);
-    const src: [*]const volatile u8 = @ptrFromInt(gpu_request_page_va + gpu_protocol.request_header_bytes);
+    const src: [*]const volatile u8 = @ptrFromInt(active_request_page_va + gpu_protocol.request_header_bytes);
     copyVolatileBytes(dest, src, inline_bytes);
     return submitVirglCommandBuffer(inline_bytes);
 }
@@ -1121,6 +1313,7 @@ fn submitVirglCommandBuffer(command_bytes: usize) bool {
 
 fn submitVirglTextureInlineWrite(resource_id: u32, x: u32, y: u32, width: u32, height: u32, payload_bytes: usize) bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
+    if (active_request_page_va == 0) return false;
     if (width == 0 or height == 0 or payload_bytes == 0 or payload_bytes > gpu_protocol.request_payload_bytes) return false;
     const expected_bytes = @as(usize, width) * @as(usize, height) * 4;
     if (payload_bytes != expected_bytes) return false;
@@ -1144,7 +1337,7 @@ fn submitVirglTextureInlineWrite(resource_id: u32, x: u32, y: u32, width: u32, h
     commands[11] = 1;
 
     const dest: [*]volatile u8 = @ptrFromInt(mem_entries_page0_va + 48);
-    const src: [*]const volatile u8 = @ptrFromInt(gpu_request_page_va + gpu_protocol.request_header_bytes);
+    const src: [*]const volatile u8 = @ptrFromInt(active_request_page_va + gpu_protocol.request_header_bytes);
     copyVolatileBytes(dest, src, payload_bytes);
     return submitVirglCommandBuffer(command_bytes);
 }
@@ -1206,6 +1399,112 @@ fn createVirglAppSurface(width: u32, height: u32) ?u64 {
         gpu_state.app_surface_logged = true;
     }
     return @as(u64, resource_id) | (@as(u64, surface_id) << 32);
+}
+
+fn paintCursorPixels() void {
+    const pixels: [*]volatile u32 = @ptrFromInt(cursor_pixels_va);
+    var i: usize = 0;
+    while (i < @as(usize, cursor_dim) * @as(usize, cursor_dim)) : (i += 1) {
+        pixels[i] = 0x0000_0000;
+    }
+    var y: usize = 0;
+    while (y < cursor_shape_height) : (y += 1) {
+        var x: usize = 0;
+        while (x < cursor_shape_width) : (x += 1) {
+            const ch = cursor_shape[y][x];
+            if (ch == '@') {
+                pixels[y * @as(usize, cursor_dim) + x] = 0xff00_0000;
+            } else if (ch == '.') {
+                pixels[y * @as(usize, cursor_dim) + x] = 0xffff_ffff;
+            }
+        }
+    }
+}
+
+fn ensureCursorResource() bool {
+    if (gpu_state.cursor_ready) return true;
+    if (gpu_state.width == 0 or gpu_state.height == 0) {
+        if (!getDisplayInfo()) return false;
+    }
+    paintCursorPixels();
+
+    {
+        const req: *volatile VirtioGpuResourceCreate2d = @ptrFromInt(control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_resource_create_2d),
+            .resource_id = cursor_resource_id,
+            .format = virtio_gpu_format_b8g8r8a8_unorm,
+            .width = cursor_dim,
+            .height = cursor_dim,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, 0, .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) return false;
+    }
+    {
+        clearBytes(mem_entries_page0_va, cursor_pixel_pages * @sizeOf(VirtioGpuMemEntry));
+        var page_index: usize = 0;
+        while (page_index < cursor_pixel_pages) : (page_index += 1) {
+            const entry: *volatile VirtioGpuMemEntry = @ptrFromInt(mem_entries_page0_va + page_index * @sizeOf(VirtioGpuMemEntry));
+            entry.* = .{
+                .addr = gpu_state.cursor_pixels_paddrs[page_index],
+                .length = 4096,
+                .padding = 0,
+            };
+        }
+        const req: *volatile VirtioGpuResourceAttachBacking = @ptrFromInt(control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_resource_attach_backing),
+            .resource_id = cursor_resource_id,
+            .nr_entries = cursor_pixel_pages,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuResourceAttachBacking), gpu_state.mem_entries_paddr0, cursor_pixel_pages * @sizeOf(VirtioGpuMemEntry), .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) return false;
+    }
+    {
+        const req: *volatile VirtioGpuTransferToHost2d = @ptrFromInt(control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_transfer_to_host_2d),
+            .rect = .{ .x = 0, .y = 0, .width = cursor_dim, .height = cursor_dim },
+            .offset = 0,
+            .resource_id = cursor_resource_id,
+            .padding = 0,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuTransferToHost2d), 0, 0, .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) return false;
+    }
+    {
+        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_resource_flush),
+            .rect = .{ .x = 0, .y = 0, .width = cursor_dim, .height = cursor_dim },
+            .resource_id = cursor_resource_id,
+            .padding = 0,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuResourceFlush), 0, 0, .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) return false;
+    }
+    gpu_state.cursor_ready = true;
+    if (!gpu_state.cursor_logged) {
+        _ = userLog("VirtioGpuGl: cursor ready\n");
+        gpu_state.cursor_logged = true;
+    }
+    return true;
+}
+
+fn setHardwareCursor(x: i32, y: i32) bool {
+    const already_ready = gpu_state.cursor_ready;
+    if (!ensureCursorResource()) return false;
+    const req: *volatile VirtioGpuUpdateCursor = @ptrFromInt(control_page_va + control_request_offset);
+    req.* = .{
+        .hdr = controlHdr(if (already_ready) virtio_gpu_cmd_move_cursor else virtio_gpu_cmd_update_cursor),
+        .pos = .{
+            .scanout_id = gpu_state.scanout_id,
+            .x = @intCast(if (x < 0) 0 else x),
+            .y = @intCast(if (y < 0) 0 else y),
+            .padding = 0,
+        },
+        .resource_id = cursor_resource_id,
+        .hot_x = 0,
+        .hot_y = 0,
+        .padding = 0,
+    };
+    return submitCursorCommand(@sizeOf(VirtioGpuUpdateCursor));
 }
 
 fn updateVirglTexture2d(resource_id: u32, x: u32, y: u32, width: u32, height: u32, payload_bytes: usize) bool {
@@ -1365,6 +1664,9 @@ fn gpuFeatureFlags() u64 {
         flags |= gpu_protocol.feature_texture_2d;
         flags |= gpu_protocol.feature_app_surface;
     }
+    if (boot_state.cursor_queue_submit_token != 0 and boot_state.cursor_queue_notify_token != 0) {
+        flags |= gpu_protocol.feature_cursor;
+    }
     flags |= gpu_protocol.feature_present_2d;
     return flags;
 }
@@ -1413,38 +1715,68 @@ fn presentVirglRenderTarget() bool {
     return true;
 }
 
-fn mapGpuRequestPage(request_paddr: u64) bool {
-    if (request_paddr < 0x1000) return false;
-    if (request_page_paddr_seen == request_paddr) return true;
-    if (request_page_paddr_seen != 0) {
-        _ = userLog("VirtioGpuGl: request page changed\n");
-        return false;
-    }
-    if (mapPage(gpu_request_page_va, request_paddr, false) != syscall_ok) {
-        _ = userLog("VirtioGpuGl: map request page failed\n");
-        return false;
-    }
-    request_page_paddr_seen = request_paddr;
-    return true;
+fn gpuSessionRequestVa(index: usize) usize {
+    return gpu_session_base_va + index * gpu_session_stride_bytes;
 }
 
-fn mapGpuResponsePage(response_paddr: u64) bool {
+fn gpuSessionResponseVa(index: usize) usize {
+    return gpuSessionRequestVa(index) + 0x1000;
+}
+
+fn findGpuSession(request_paddr: u64) ?usize {
+    var index: usize = 0;
+    while (index < gpu_sessions.len) : (index += 1) {
+        if (gpu_sessions[index].active and gpu_sessions[index].request_paddr == request_paddr) return index;
+    }
+    return null;
+}
+
+fn acceptGpuSession(request_paddr: u64) ?usize {
+    if (request_paddr < 0x1000) return null;
+    if (findGpuSession(request_paddr)) |index| return index;
+
+    var index: usize = 0;
+    while (index < gpu_sessions.len) : (index += 1) {
+        if (gpu_sessions[index].active) continue;
+        const request_va = gpuSessionRequestVa(index);
+        const response_va = gpuSessionResponseVa(index);
+        if (mapPage(request_va, request_paddr, false) != syscall_ok) {
+            _ = userLog("VirtioGpuGl: map request page failed\n");
+            return null;
+        }
+        gpu_sessions[index] = .{
+            .request_paddr = request_paddr,
+            .response_paddr = 0,
+            .request_va = request_va,
+            .response_va = response_va,
+            .last_request_seq = 0,
+            .active = true,
+        };
+        return index;
+    }
+    _ = userLog("VirtioGpuGl: session table full\n");
+    return null;
+}
+
+fn mapGpuResponsePage(session_index: usize, response_paddr: u64) bool {
+    if (session_index >= gpu_sessions.len or !gpu_sessions[session_index].active) return false;
     if (response_paddr < 0x1000) return false;
-    if (response_page_paddr_seen == response_paddr) return true;
-    if (response_page_paddr_seen != 0) {
+    if (gpu_sessions[session_index].response_paddr == response_paddr) return true;
+    if (gpu_sessions[session_index].response_paddr != 0) {
         _ = userLog("VirtioGpuGl: response page changed\n");
         return false;
     }
-    if (mapPage(gpu_response_page_va, response_paddr, true) != syscall_ok) {
+    if (mapPage(gpu_sessions[session_index].response_va, response_paddr, true) != syscall_ok) {
         _ = userLog("VirtioGpuGl: map response page failed\n");
         return false;
     }
-    response_page_paddr_seen = response_paddr;
+    gpu_sessions[session_index].response_paddr = response_paddr;
     return true;
 }
 
 fn writeGpuResponse(op: gpu_protocol.Opcode, seq: u64, status: gpu_protocol.Status, arg0: u64, arg1: u64, arg2: u64) void {
-    const response: *volatile gpu_protocol.ResponseHeader = @ptrFromInt(gpu_response_page_va);
+    if (active_response_page_va == 0) return;
+    const response: *volatile gpu_protocol.ResponseHeader = @ptrFromInt(active_response_page_va);
     response.magic = gpu_protocol.response_magic;
     response.version = gpu_protocol.version;
     response.op = gpu_protocol.opcodeRaw(op);
@@ -1459,10 +1791,13 @@ fn writeGpuResponse(op: gpu_protocol.Opcode, seq: u64, status: gpu_protocol.Stat
     response.response_seq = seq;
 }
 
-fn processMappedGpuRequest() void {
-    const request: *const volatile gpu_protocol.RequestHeader = @ptrFromInt(gpu_request_page_va);
+fn processMappedGpuRequest(session_index: usize) void {
+    if (session_index >= gpu_sessions.len or !gpu_sessions[session_index].active) return;
+    active_request_page_va = gpu_sessions[session_index].request_va;
+    active_response_page_va = gpu_sessions[session_index].response_va;
+    const request: *const volatile gpu_protocol.RequestHeader = @ptrFromInt(active_request_page_va);
     const seq = request.request_seq;
-    if (seq == 0 or seq == last_request_seq_seen) return;
+    if (seq == 0 or seq == gpu_sessions[session_index].last_request_seq) return;
     if (request.magic != gpu_protocol.request_magic or
         request.version != gpu_protocol.version or
         request.response_paddr < 0x1000)
@@ -1470,12 +1805,13 @@ fn processMappedGpuRequest() void {
         _ = userLog("VirtioGpuGl: invalid request\n");
         return;
     }
-    if (!mapGpuResponsePage(request.response_paddr)) return;
+    if (!mapGpuResponsePage(session_index, request.response_paddr)) return;
+    active_response_page_va = gpu_sessions[session_index].response_va;
     const op = std.meta.intToEnum(gpu_protocol.Opcode, request.op) catch {
         writeGpuResponse(.query_caps, seq, .invalid, 0, 0, 0);
         return;
     };
-    last_request_seq_seen = seq;
+    gpu_sessions[session_index].last_request_seq = seq;
     switch (op) {
         .query_caps => {
             writeGpuResponse(
@@ -1611,6 +1947,19 @@ fn processMappedGpuRequest() void {
             };
             writeGpuResponse(.create_app_surface, seq, .ok, width, height, packed_handles);
         },
+        .set_cursor_position => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_cursor) == 0 or request.inline_bytes != 0) {
+                writeGpuResponse(.set_cursor_position, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const x: i32 = @bitCast(@as(u32, @truncate(request.arg0)));
+            const y: i32 = @bitCast(@as(u32, @truncate(request.arg0 >> 32)));
+            if (!setHardwareCursor(x, y)) {
+                writeGpuResponse(.set_cursor_position, seq, .io_error, 0, 0, 0);
+                return;
+            }
+            writeGpuResponse(.set_cursor_position, seq, .ok, @intCast(if (x < 0) 0 else x), @intCast(if (y < 0) 0 else y), cursor_resource_id);
+        },
         .present_test_pattern => {
             if (!presentTestPattern()) {
                 writeGpuResponse(.present_test_pattern, seq, .io_error, 0, 0, 0);
@@ -1622,8 +1971,15 @@ fn processMappedGpuRequest() void {
 }
 
 fn handleGpuRequest(request_paddr: u64) void {
-    if (!mapGpuRequestPage(request_paddr)) return;
-    processMappedGpuRequest();
+    const session_index = acceptGpuSession(request_paddr) orelse return;
+    processMappedGpuRequest(session_index);
+}
+
+fn processGpuSessions() void {
+    var index: usize = 0;
+    while (index < gpu_sessions.len) : (index += 1) {
+        if (gpu_sessions[index].active) processMappedGpuRequest(index);
+    }
 }
 
 fn initGpuService() bool {
@@ -1661,8 +2017,8 @@ pub export fn _start() noreturn {
             } else {
                 _ = userLog("VirtioGpuGl: accept cap transfer failed\n");
             }
-        } else if (request_page_paddr_seen != 0) {
-            processMappedGpuRequest();
+        } else {
+            processGpuSessions();
         }
     }
 }

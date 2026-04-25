@@ -735,7 +735,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 // Group 2b — kernel subsystem wiring (post-process, after kernel_state_ready)
 // ---------------------------------------------------------------------------
 
-fn wireRuntimeSubsystems(state: *kernel.KernelState) void {
+fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
     spawn.init(state, &global_free_list, user_spaces, boot_init_principal);
 
     syscalls.init(.{
@@ -767,6 +767,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState) void {
         .log_race_send_cap = logSchedulerRaceSendCap,
         .log_race_switch = logSchedulerRaceSwitch,
         .exit_current_process = exitCurrentProcess,
+        .total_usable_memory_bytes = memory_stats.total_usable_bytes,
     });
 
     traps.init(.{
@@ -811,7 +812,7 @@ pub fn kernelMain() void {
     const state = initKernelSubsystems(resources.memory_stats);
     var devices = discoverDevices();
     constructBootProcesses(state, resources, &devices);
-    wireRuntimeSubsystems(state);
+    wireRuntimeSubsystems(state, resources.memory_stats);
 
     const boot_ctx = scheduler.getThreadContextConst(scheduler.current_thread_index).?;
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
@@ -862,8 +863,8 @@ fn descriptorFromModernDevice(
         .device_page_offset = device.page_offset,
         .notify_off_multiplier = info.notify_off_multiplier,
         .init_iommu_token = 0,
-        .init_queue_submit_token = 0,
-        .init_queue_notify_token = 0,
+        .init_queue_grant_count = 0,
+        .init_queue_grants = [_]boot_abi.init_bootstrap_abi.DeviceQueueGrant{.{}} ** boot_abi.init_bootstrap_abi.max_device_queue_grants,
         .init_command_token = 0,
     };
 }

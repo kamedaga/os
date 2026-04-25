@@ -180,6 +180,17 @@ pub const DmaMappingTable = struct {
         }
         return DmaMappingError.NotFound;
     }
+
+    pub fn remove(self: *DmaMappingTable, token: u64) bool {
+        var i: usize = 0;
+        while (i < self.entries.len) : (i += 1) {
+            if (!self.entries[i].valid) continue;
+            if (self.entries[i].token != token) continue;
+            self.entries[i] = .{};
+            return true;
+        }
+        return false;
+    }
 };
 
 pub const IommuCapabilityTable = struct {

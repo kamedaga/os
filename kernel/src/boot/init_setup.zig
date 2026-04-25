@@ -311,8 +311,8 @@ pub fn publishInitBootstrapDescriptorPage(
             .device_page_offset = 0,
             .notify_off_multiplier = 0,
             .init_iommu_token = 0,
-            .init_queue_submit_token = 0,
-            .init_queue_notify_token = 0,
+            .init_queue_grant_count = 0,
+            .init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants,
             .init_command_token = 0,
         };
     }
@@ -338,11 +338,19 @@ fn grantInitDeviceQueueTokenOrHalt(
     device: kernel.DmaDeviceId,
     label: []const u8,
     step_label: []const u8,
+    queue_index: u16,
     submit: bool,
     notify: bool,
 ) u64 {
-    return device_capabilities.queueCapGrantStage2(state, init_process_principal, device, 0, submit, notify) catch |err| {
+    return device_capabilities.queueCapGrantStage2(state, init_process_principal, device, queue_index, submit, notify) catch |err| {
         haltInitDeviceBootstrapError(label, step_label, err);
+    };
+}
+
+fn bootstrapQueueGrantCountForDevice(device: kernel.DmaDeviceId) usize {
+    return switch (device) {
+        .virtio_gpu => 2,
+        .virtio_input, .virtio_blk => 1,
     };
 }
 
@@ -421,24 +429,37 @@ pub fn setupDeviceBootstrapForInit(
         true,
         free_list,
     );
-    const init_submit_token = grantInitDeviceQueueTokenOrHalt(
-        state,
-        init_process_principal,
-        device.dma_device,
-        label,
-        "queue submit grant",
-        true,
-        false,
-    );
-    const init_notify_token = grantInitDeviceQueueTokenOrHalt(
-        state,
-        init_process_principal,
-        device.dma_device,
-        label,
-        "queue notify grant",
-        false,
-        true,
-    );
+    var init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants;
+    const queue_grant_count = bootstrapQueueGrantCountForDevice(device.dma_device);
+    var queue_index: usize = 0;
+    while (queue_index < queue_grant_count and queue_index < init_bootstrap_abi.max_device_queue_grants) : (queue_index += 1) {
+        const queue_index_u16: u16 = @intCast(queue_index);
+        const init_submit_token = grantInitDeviceQueueTokenOrHalt(
+            state,
+            init_process_principal,
+            device.dma_device,
+            label,
+            "queue submit grant",
+            queue_index_u16,
+            true,
+            false,
+        );
+        const init_notify_token = grantInitDeviceQueueTokenOrHalt(
+            state,
+            init_process_principal,
+            device.dma_device,
+            label,
+            "queue notify grant",
+            queue_index_u16,
+            false,
+            true,
+        );
+        init_queue_grants[queue_index] = .{
+            .queue_index = @intCast(queue_index),
+            .submit_token = init_submit_token,
+            .notify_token = init_notify_token,
+        };
+    }
     const init_iommu_token = grantInitDeviceIommuTokenOrHalt(
         state,
         init_process_principal,
@@ -455,8 +476,8 @@ pub fn setupDeviceBootstrapForInit(
     );
     var updated = device;
     updated.descriptor.init_iommu_token = init_iommu_token;
-    updated.descriptor.init_queue_submit_token = init_submit_token;
-    updated.descriptor.init_queue_notify_token = init_notify_token;
+    updated.descriptor.init_queue_grant_count = @intCast(queue_grant_count);
+    updated.descriptor.init_queue_grants = init_queue_grants;
     updated.descriptor.init_command_token = init_command_token;
     return updated;
 }

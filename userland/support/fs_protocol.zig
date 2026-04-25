@@ -19,6 +19,7 @@ pub const Opcode = enum(u16) {
     write = 23,
     unlink = 24,
     rename = 25,
+    statfs = 26,
     open_exec = 32,
 };
 

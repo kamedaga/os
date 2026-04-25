@@ -13,6 +13,7 @@ pub const StartupAction = enum(u8) {
     window_client = 7,
     deferred_compositor = 8,
     gpu_driver = 9,
+    window_service = 10,
 };
 
 pub const StartupExecSource = enum(u8) {
@@ -123,6 +124,7 @@ pub fn actionFromKey(key: []const u8) ?StartupAction {
     if (std.mem.eql(u8, key, "block_driver")) return .block_driver;
     if (std.mem.eql(u8, key, "persistent_fs")) return .persistent_fs_server;
     if (std.mem.eql(u8, key, "gpu_driver")) return .gpu_driver;
+    if (std.mem.eql(u8, key, "window_service")) return .window_service;
     if (std.mem.eql(u8, key, "block_client") or std.mem.eql(u8, key, "block_demo")) return .block_client;
     if (std.mem.eql(u8, key, "window_client")) return .window_client;
     if (std.mem.eql(u8, key, "deferred_compositor")) return .deferred_compositor;
@@ -132,6 +134,7 @@ pub fn actionFromKey(key: []const u8) ?StartupAction {
 pub fn execSourceFromKey(key: []const u8) ?StartupExecSource {
     if (std.mem.eql(u8, key, "startup_path") or
         std.mem.eql(u8, key, "startup_fs") or
+        std.mem.eql(u8, key, "rootfs") or
         std.mem.eql(u8, key, "default") or
         std.mem.eql(u8, key, "fs"))
     {

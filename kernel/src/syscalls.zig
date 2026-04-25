@@ -57,6 +57,7 @@ const syscall_install_mmio_cap: u64 = 0x2F;
 const syscall_install_caps_batch: u64 = 0x32;
 const syscall_publish_service_endpoint: u64 = 0x33;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
+const syscall_get_memory_stats: u64 = 0x3C;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -103,6 +104,7 @@ pub const Hooks = struct {
     log_race_send_cap: *const fn (kernel.PrincipalId, ?kernel.PrincipalId, u64, u64, []const u8) void,
     log_race_switch: *const fn (usize, usize, []const u8) void,
     exit_current_process: *const fn (kernel.PrincipalId, u8, *TrapFrame) void,
+    total_usable_memory_bytes: u64,
 };
 
 var hooks: ?Hooks = null;
@@ -594,6 +596,18 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             else
                 .inactive;
             return process_abi.encodeProcessStatus(kind, status.fault_vector);
+        },
+        syscall_get_memory_stats => {
+            const out_va = frame.rdi;
+            if ((out_va & 0x7) != 0) return syscall_err_invalid;
+            const free_bytes = @as(u64, @intCast(h.free_list.len)) * 4096;
+            const total_bytes = h.total_usable_memory_bytes;
+            const used_bytes = if (total_bytes >= free_bytes) total_bytes - free_bytes else 0;
+            if (!h.write_user_u64(proc, out_va + 0, total_bytes)) return syscall_err_invalid;
+            if (!h.write_user_u64(proc, out_va + 8, used_bytes)) return syscall_err_invalid;
+            if (!h.write_user_u64(proc, out_va + 16, free_bytes)) return syscall_err_invalid;
+            if (!h.write_user_u64(proc, out_va + 24, 4096)) return syscall_err_invalid;
+            return syscall_ok;
         },
         syscall_process_exit => {
             h.exit_current_process(proc, @truncate(frame.rdi), frame);

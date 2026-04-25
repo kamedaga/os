@@ -7,6 +7,9 @@ kernel/zig-out/
 .zig-global-cache/
 .cargo/
 tools/wasmtime_artifact_builder/target
+target/
+**/target/
+**/zig-out/
 *.pdb
 *.o
 *.obj
@@ -27,6 +30,9 @@ states/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 .claude
 

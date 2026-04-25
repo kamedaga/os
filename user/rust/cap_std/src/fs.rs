@@ -113,6 +113,13 @@ pub struct Metadata {
     modified: SystemTime,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct StorageStats {
+    block_size: u64,
+    capacity_blocks: u64,
+    used_blocks: u64,
+}
+
 impl Metadata {
     fn from_stat(stat: rt_io::StatResult) -> Self {
         Self {
@@ -140,6 +147,36 @@ impl Metadata {
 
     pub fn is_file(self) -> bool {
         self.file_type.is_file()
+    }
+}
+
+impl StorageStats {
+    fn from_statfs(stat: rt_io::StatFsResult) -> Self {
+        Self {
+            block_size: stat.block_size,
+            capacity_blocks: stat.capacity_blocks,
+            used_blocks: stat.used_blocks,
+        }
+    }
+
+    pub fn block_size(self) -> u64 {
+        self.block_size
+    }
+
+    pub fn capacity_blocks(self) -> u64 {
+        self.capacity_blocks
+    }
+
+    pub fn used_blocks(self) -> u64 {
+        self.used_blocks
+    }
+
+    pub fn capacity_bytes(self) -> u64 {
+        self.capacity_blocks.saturating_mul(self.block_size)
+    }
+
+    pub fn used_bytes(self) -> u64 {
+        self.used_blocks.saturating_mul(self.block_size)
     }
 }
 
@@ -233,6 +270,15 @@ impl RootDir {
         P: AsRef<Path>,
     {
         metadata_path(&self.session, self.raw()?, path.as_ref())
+    }
+
+    pub fn storage_stats(&self) -> Result<StorageStats> {
+        self.session
+            .client
+            .borrow_mut()
+            .statfs()
+            .map(StorageStats::from_statfs)
+            .map_err(Error::from)
     }
 
     pub fn open_dir<P>(&self, path: P) -> Result<Dir>

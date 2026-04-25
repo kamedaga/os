@@ -33,6 +33,7 @@ struct StartupNode {
     provides: Vec<String>,
     ensure: Vec<String>,
     block: Vec<String>,
+    input: Vec<String>,
 }
 
 pub fn generate_manifests(
@@ -216,6 +217,17 @@ fn render_startup_manifest(apps: &[AppConfig]) -> Result<String, String> {
             out.push_str("block=");
             out.push_str(&node.block[0]);
         }
+        if !node.input.is_empty() {
+            if node.input.len() != 1 {
+                return Err(format!(
+                    "startup input selector must have exactly one value for app {}",
+                    node.app_id
+                ));
+            }
+            out.push(' ');
+            out.push_str("input=");
+            out.push_str(&node.input[0]);
+        }
         append_list_field(&mut out, "after", &node.after);
         append_list_field(&mut out, "requires", &node.requires);
         append_list_field(&mut out, "ensure", &node.ensure);
@@ -261,6 +273,7 @@ fn order_startup_nodes(apps: &[AppConfig]) -> Result<Vec<StartupNode>, String> {
             provides: startup.provides.clone(),
             ensure: startup.ensure.clone(),
             block: startup.block.clone(),
+            input: startup.input.clone(),
         };
         if node.action.is_empty()
             || node.name.is_empty()

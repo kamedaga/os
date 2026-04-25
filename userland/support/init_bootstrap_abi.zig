@@ -2,11 +2,12 @@ const boot_manifest_abi = @import("boot_manifest_abi.zig");
 const process_abi = @import("process_abi.zig");
 
 pub const magic: u64 = 0x49425453; // "IBTS"
-pub const version: u64 = 14;
+pub const version: u64 = 15;
 pub const config_magic: u64 = 0x49425443; // "IBTC"
 pub const config_version: u64 = 1;
 pub const max_spawn_page_descriptors: usize = 8;
 pub const max_device_descriptors: usize = 6;
+pub const max_device_queue_grants: usize = 4;
 pub const max_boot_archive_pages: usize = 128;
 pub const boot_display_shell_height: u64 = 624;
 pub const boot_log_user_page_va: u64 = process_abi.auxPageVa(1);
@@ -55,6 +56,12 @@ pub const SpawnPageDescriptor = extern struct {
     spawn_flags: u64,
 };
 
+pub const DeviceQueueGrant = extern struct {
+    queue_index: u64 = 0,
+    submit_token: u64 = 0,
+    notify_token: u64 = 0,
+};
+
 pub const DeviceDescriptor = extern struct {
     transport: u64,
     flags: u64,
@@ -75,8 +82,8 @@ pub const DeviceDescriptor = extern struct {
     device_page_offset: u64,
     notify_off_multiplier: u64,
     init_iommu_token: u64,
-    init_queue_submit_token: u64,
-    init_queue_notify_token: u64,
+    init_queue_grant_count: u64,
+    init_queue_grants: [max_device_queue_grants]DeviceQueueGrant,
     init_command_token: u64,
 };
 

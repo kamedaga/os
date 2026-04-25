@@ -32,7 +32,7 @@ pub const MAX_BOOTSTRAP_PAGE_DESCRIPTORS: usize = 136;
 pub const MAX_BOOTSTRAP_CAP_DESCRIPTORS: usize = 8;
 pub const SERVICE_REGISTRY_MAGIC: u64 = 0x5352_5643;
 pub const SERVICE_REGISTRY_VERSION: u64 = 1;
-pub const MAX_SERVICE_ENTRIES: usize = 6;
+pub const MAX_SERVICE_ENTRIES: usize = 8;
 const STDIO_BOOTSTRAP_SOURCE_CANDIDATES: [u64; 6] = [
     0x3F20_2000,
     0x3F20_3000,
@@ -1162,6 +1162,7 @@ pub enum ServiceKind {
     PersistentFs,
     Capctl,
     Gpu,
+    Pointer,
     Unknown(u64),
 }
 
@@ -1174,6 +1175,7 @@ impl ServiceKind {
             5 => Self::PersistentFs,
             6 => Self::Capctl,
             7 => Self::Gpu,
+            8 => Self::Pointer,
             _ => Self::Unknown(raw),
         }
     }
@@ -1186,6 +1188,7 @@ impl ServiceKind {
             Self::PersistentFs => "persistent_fs",
             Self::Capctl => "capctl",
             Self::Gpu => "gpu",
+            Self::Pointer => "pointer",
             Self::Unknown(_) => "unknown",
         }
     }

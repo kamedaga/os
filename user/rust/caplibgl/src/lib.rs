@@ -35,6 +35,7 @@ pub const FEATURE_PRESENT_2D: u64 = 1 << 2;
 pub const FEATURE_PRESENT_3D: u64 = 1 << 3;
 pub const FEATURE_TEXTURE_2D: u64 = 1 << 4;
 pub const FEATURE_APP_SURFACE: u64 = 1 << 5;
+pub const FEATURE_CURSOR: u64 = 1 << 6;
 pub const DEFAULT_VIRGL_VERTEX_BUFFER_ID: u32 = 3;
 pub const GL_FALSE: u32 = 0;
 pub const GL_TRUE: u32 = 1;
@@ -105,6 +106,8 @@ const MAX_GL_NAME_BYTES: usize = 64;
 const MAX_GL_DRAW_VERTICES: usize = 96;
 const MAX_MODELVIEW_STACK_DEPTH: usize = 16;
 const MAX_PROJECTION_STACK_DEPTH: usize = 4;
+const DEBUG_GRID_COLUMNS: usize = 16;
+const DEBUG_GRID_ROWS: usize = 10;
 pub const FRAMEBUFFER_CLEAR_COMMAND_BYTES: usize = 52;
 pub const VERTEX_UPLOAD_COMMAND_OVERHEAD_BYTES: usize = 48;
 pub const DRAW_ARRAYS_COMMAND_BYTES: usize = 52;
@@ -204,6 +207,22 @@ DCL OUT[0], COLOR\n\
  0: MOV OUT[0], IN[0]\n\
  1: END\n";
 
+const LOADING_GLOSS_FRAGMENT_SHADER: &[u8] = b"FRAG\n\
+DCL IN[0], COLOR, LINEAR\n\
+DCL IN[1], GENERIC[0], LINEAR\n\
+DCL OUT[0], COLOR\n\
+DCL TEMP[0]\n\
+DCL TEMP[1]\n\
+ 0: ADD TEMP[0].x, IN[1].xxxx, IN[1].zzzz\n\
+ 1: FRC TEMP[0].x, TEMP[0].xxxx\n\
+ 2: ADD TEMP[0].x, TEMP[0].xxxx, IN[1].yyyy\n\
+ 3: ABS TEMP[0].x, TEMP[0].xxxx\n\
+ 4: MUL TEMP[0].x, TEMP[0].xxxx, IN[1].wwww\n\
+ 5: ADD TEMP[0].x, TEMP[0].xxxx, IN[0].wwww\n\
+ 6: MUL TEMP[1], IN[0], TEMP[0].xxxx\n\
+ 7: MOV OUT[0], TEMP[1]\n\
+ 8: END\n";
+
 static mut GLOBAL_CONTEXT: MaybeUninit<Context> = MaybeUninit::uninit();
 static mut GLOBAL_CONTEXT_READY: bool = false;
 static mut GLOBAL_CAPGL_CONTEXTS: [CapglContextState; MAX_CAPGL_CONTEXTS] =
@@ -278,6 +297,7 @@ enum Opcode {
     UpdateTexture2d = 8,
     DeleteTexture2d = 9,
     CreateAppSurface = 10,
+    SetCursorPosition = 11,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -849,6 +869,13 @@ impl Client {
         })
     }
 
+    pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<(), Error> {
+        let arg0 = (x as u32 as u64) | ((y as u32 as u64) << 32);
+        let seq = self.begin_request(Opcode::SetCursorPosition, arg0, 0, &[])?;
+        self.finish_request_ok(seq, Opcode::SetCursorPosition)?;
+        Ok(())
+    }
+
     pub fn present_test_pattern(&mut self) -> Result<PresentInfo, Error> {
         let seq = self.begin_request(Opcode::PresentTestPattern, 0, 0, &[])?;
         let response = self.finish_request_ok(seq, Opcode::PresentTestPattern)?;
@@ -871,6 +898,7 @@ impl Client {
             default_target: target,
             target,
             pipeline_ready: false,
+            loading_gloss_shader_ready: false,
             next_object_handle: target.surface_id + 16,
             viewport: Viewport::from_target(target),
             clear_color: Color {
@@ -1019,6 +1047,7 @@ pub struct Context {
     default_target: RenderTarget,
     target: RenderTarget,
     pipeline_ready: bool,
+    loading_gloss_shader_ready: bool,
     next_object_handle: u32,
     viewport: Viewport,
     clear_color: Color,
@@ -1049,10 +1078,14 @@ impl Context {
     }
 
     pub fn make_surface_current(&mut self, target: RenderTarget) {
+        if self.target == target {
+            return;
+        }
         self.target = target;
         self.viewport = Viewport::from_target(target);
         self.scissor_box = ScissorBox::from_target(target);
         self.pipeline_ready = false;
+        self.loading_gloss_shader_ready = false;
         if self.next_object_handle < target.surface_id + 16 {
             self.next_object_handle = target.surface_id + 16;
         }
@@ -1178,6 +1211,24 @@ impl Context {
         Ok(())
     }
 
+    pub fn gl_draw_vertices(
+        &mut self,
+        primitive: Primitive,
+        vertices: &[Vertex],
+        texture_resource_id: Option<u32>,
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
+        let mut commands = CommandBuffer::new(scratch);
+        self.append_pipeline_if_needed(&mut commands)?;
+        self.append_draw_binding(&mut commands, texture_resource_id)?;
+        self.append_draw_common_state(&mut commands)?;
+        commands.append_vertex_upload(self.target, vertices)?;
+        commands.append_draw_arrays(primitive, 0, vertices.len() as u32)?;
+        self.client.submit_3d(commands.bytes())?;
+        self.pipeline_ready = true;
+        Ok(())
+    }
+
     pub fn gl_draw_arrays(
         &mut self,
         primitive: Primitive,
@@ -1188,23 +1239,90 @@ impl Context {
     ) -> Result<(), Error> {
         let mut commands = CommandBuffer::new(scratch);
         self.append_pipeline_if_needed(&mut commands)?;
-        if let Some(texture_resource_id) = texture_resource_id {
-            commands
-                .append_bind_shader(self.textured_fragment_shader_handle(), PIPE_SHADER_FRAGMENT)?;
-            let sampler_view_handle = self.alloc_object_handle();
-            let sampler_state_handle = self.alloc_object_handle();
-            commands.append_texture_binding(
-                texture_resource_id,
-                sampler_view_handle,
-                sampler_state_handle,
-            )?;
-        } else {
-            commands
-                .append_bind_shader(self.solid_fragment_shader_handle(), PIPE_SHADER_FRAGMENT)?;
-        }
+        self.append_draw_binding(&mut commands, texture_resource_id)?;
+        self.append_draw_common_state(&mut commands)?;
         commands.append_draw_arrays(primitive, first, count)?;
         self.client.submit_3d(commands.bytes())?;
         self.pipeline_ready = true;
+        Ok(())
+    }
+
+    pub fn draw_loading_gloss_overlay(
+        &mut self,
+        vertices: &[Vertex],
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
+        if vertices.len() != 4 {
+            return Err(Error::Invalid);
+        }
+        self.gl_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, scratch)?;
+        self.gl_enable(GL_BLEND, scratch)?;
+
+        let mut commands = CommandBuffer::new(scratch);
+        self.append_pipeline_if_needed(&mut commands)?;
+        if !self.loading_gloss_shader_ready {
+            commands.append_shader(
+                self.loading_gloss_fragment_shader_handle(),
+                PIPE_SHADER_FRAGMENT,
+                LOADING_GLOSS_FRAGMENT_SHADER,
+            )?;
+        }
+        commands.append_bind_shader(
+            self.loading_gloss_fragment_shader_handle(),
+            PIPE_SHADER_FRAGMENT,
+        )?;
+        self.append_draw_common_state(&mut commands)?;
+        commands.append_vertex_upload(self.target, vertices)?;
+        commands.append_draw_arrays(Primitive::TriangleStrip, 0, vertices.len() as u32)?;
+        self.client.submit_3d(commands.bytes())?;
+        self.pipeline_ready = true;
+        self.loading_gloss_shader_ready = true;
+        Ok(())
+    }
+
+    pub fn draw_loading_placeholder_preview(
+        &mut self,
+        phase: f32,
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
+        self.draw_loading_grid_preview(scratch)?;
+        let vertices = loading_gloss_overlay_vertices(phase);
+        self.draw_loading_gloss_overlay(&vertices, scratch)
+    }
+
+    fn draw_loading_grid_preview(&mut self, scratch: &mut [u8]) -> Result<(), Error> {
+        let mut row_vertices = [Vertex::ZERO; DEBUG_GRID_COLUMNS * 4];
+        let cell_width = 2.0 / DEBUG_GRID_COLUMNS as f32;
+        let cell_height = 2.0 / DEBUG_GRID_ROWS as f32;
+
+        for row in 0..DEBUG_GRID_ROWS {
+            let top = 1.0 - row as f32 * cell_height;
+            let bottom = top - cell_height;
+            let mut vertex_count = 0;
+            for col in 0..DEBUG_GRID_COLUMNS {
+                let left = -1.0 + col as f32 * cell_width;
+                let right = left + cell_width;
+                let color = debug_grid_color(col, row);
+                row_vertices[vertex_count] = solid_vertex(left, top, color);
+                row_vertices[vertex_count + 1] = solid_vertex(left, bottom, color);
+                row_vertices[vertex_count + 2] = solid_vertex(right, top, color);
+                row_vertices[vertex_count + 3] = solid_vertex(right, bottom, color);
+                vertex_count += 4;
+            }
+
+            let mut commands = CommandBuffer::new(scratch);
+            self.append_pipeline_if_needed(&mut commands)?;
+            self.append_draw_binding(&mut commands, None)?;
+            self.append_draw_common_state(&mut commands)?;
+            commands.append_vertex_upload(self.target, &row_vertices[..vertex_count])?;
+            let mut first = 0;
+            while first < vertex_count as u32 {
+                commands.append_draw_arrays(Primitive::TriangleStrip, first, 4)?;
+                first += 4;
+            }
+            self.client.submit_3d(commands.bytes())?;
+            self.pipeline_ready = true;
+        }
         Ok(())
     }
 
@@ -1267,6 +1385,8 @@ impl Context {
         let mut commands = CommandBuffer::new(scratch);
         self.append_pipeline_if_needed(&mut commands)?;
         commands.append_framebuffer_clear(self.target, clear_color)?;
+        self.append_draw_binding(&mut commands, None)?;
+        self.append_draw_common_state(&mut commands)?;
         commands.append_vertex_upload(self.target, vertices)?;
         commands.append_draw_arrays(Primitive::Triangles, 0, vertices.len() as u32)?;
         self.client.submit_3d(commands.bytes())?;
@@ -1306,6 +1426,49 @@ impl Context {
 
     fn solid_fragment_shader_handle(&self) -> u32 {
         self.target.surface_id + 7
+    }
+
+    fn loading_gloss_fragment_shader_handle(&self) -> u32 {
+        self.target.surface_id + 8
+    }
+
+    fn append_draw_binding(
+        &mut self,
+        commands: &mut CommandBuffer<'_>,
+        texture_resource_id: Option<u32>,
+    ) -> Result<(), Error> {
+        if let Some(texture_resource_id) = texture_resource_id {
+            commands
+                .append_bind_shader(self.textured_fragment_shader_handle(), PIPE_SHADER_FRAGMENT)?;
+            let sampler_view_handle = self.alloc_object_handle();
+            let sampler_state_handle = self.alloc_object_handle();
+            commands.append_texture_binding(
+                texture_resource_id,
+                sampler_view_handle,
+                sampler_state_handle,
+            )?;
+        } else {
+            commands
+                .append_bind_shader(self.solid_fragment_shader_handle(), PIPE_SHADER_FRAGMENT)?;
+        }
+        Ok(())
+    }
+
+    fn append_draw_common_state(&mut self, commands: &mut CommandBuffer<'_>) -> Result<(), Error> {
+        commands.append_framebuffer_state(self.target)?;
+        commands.append_bind_object(VIRGL_OBJECT_VERTEX_ELEMENTS, self.target.surface_id + 1)?;
+        commands.append_vertex_buffer_binding(self.target)?;
+        commands.append_bind_shader(self.target.surface_id + 2, PIPE_SHADER_VERTEX)?;
+        commands.append_viewport_state(self.viewport)?;
+
+        let blend_handle = self.alloc_object_handle();
+        commands.append_blend_state(blend_handle, self.blend_state)?;
+        let rasterizer_handle = self.alloc_object_handle();
+        commands.append_rasterizer_state(rasterizer_handle, self.scissor_enabled)?;
+        if self.scissor_enabled {
+            commands.append_scissor_state(self.scissor_box)?;
+        }
+        Ok(())
     }
 
     fn sync_blend_state(&mut self, scratch: &mut [u8]) -> Result<(), Error> {
@@ -1557,7 +1720,7 @@ impl<'a> CommandBuffer<'a> {
         ))?;
         self.append_u32(0)?;
         self.append_f32(viewport.width as f32 / 2.0)?;
-        self.append_f32(viewport.height as f32 / 2.0)?;
+        self.append_f32(-(viewport.height as f32) / 2.0)?;
         self.append_f32(0.5)?;
         self.append_f32(viewport.x as f32 + viewport.width as f32 / 2.0)?;
         self.append_f32(viewport.y as f32 + viewport.height as f32 / 2.0)?;
@@ -1584,14 +1747,7 @@ impl<'a> CommandBuffer<'a> {
         target: RenderTarget,
         color: Color,
     ) -> Result<(), Error> {
-        self.append_u32(virgl_cmd0(
-            VIRGL_CCMD_SET_FRAMEBUFFER_STATE,
-            VIRGL_OBJECT_NULL,
-            VIRGL_SET_FRAMEBUFFER_STATE_SIZE_1,
-        ))?;
-        self.append_u32(1)?;
-        self.append_u32(0)?;
-        self.append_u32(target.surface_id)?;
+        self.append_framebuffer_state(target)?;
 
         self.append_u32(virgl_cmd0(
             VIRGL_CCMD_CLEAR,
@@ -1607,6 +1763,28 @@ impl<'a> CommandBuffer<'a> {
         self.append_u32(0)?;
         self.append_u32(0)?;
         Ok(())
+    }
+
+    fn append_framebuffer_state(&mut self, target: RenderTarget) -> Result<(), Error> {
+        self.append_u32(virgl_cmd0(
+            VIRGL_CCMD_SET_FRAMEBUFFER_STATE,
+            VIRGL_OBJECT_NULL,
+            VIRGL_SET_FRAMEBUFFER_STATE_SIZE_1,
+        ))?;
+        self.append_u32(1)?;
+        self.append_u32(0)?;
+        self.append_u32(target.surface_id)
+    }
+
+    fn append_vertex_buffer_binding(&mut self, target: RenderTarget) -> Result<(), Error> {
+        self.append_u32(virgl_cmd0(
+            VIRGL_CCMD_SET_VERTEX_BUFFERS,
+            VIRGL_OBJECT_NULL,
+            VIRGL_SET_VERTEX_BUFFERS_SIZE_1,
+        ))?;
+        self.append_u32(VERTEX_STRIDE)?;
+        self.append_u32(0)?;
+        self.append_u32(target.vertex_buffer_id)
     }
 
     pub fn append_vertex_upload(
@@ -1752,6 +1930,82 @@ fn primitive_raw(primitive: Primitive) -> u32 {
     match primitive {
         Primitive::Triangles => PIPE_PRIM_TRIANGLES,
         Primitive::TriangleStrip => PIPE_PRIM_TRIANGLE_STRIP,
+    }
+}
+
+fn solid_vertex(x: f32, y: f32, color: [f32; 4]) -> Vertex {
+    Vertex {
+        x,
+        y,
+        z: 0.0,
+        w: 1.0,
+        r: color[0],
+        g: color[1],
+        b: color[2],
+        a: color[3],
+        u: 0.0,
+        v: 0.0,
+        s: 0.0,
+        t: 1.0,
+    }
+}
+
+fn gloss_vertex(x: f32, y: f32, u: f32, phase: f32, strength: f32) -> Vertex {
+    Vertex {
+        x,
+        y,
+        z: 0.0,
+        w: 1.0,
+        r: 0.92,
+        g: 0.98,
+        b: 1.0,
+        a: 0.42,
+        u,
+        v: -0.5,
+        s: phase,
+        t: strength,
+    }
+}
+
+fn loading_gloss_overlay_vertices(phase: f32) -> [Vertex; 4] {
+    let strength = -0.78;
+    let cycles = 1.0;
+    [
+        gloss_vertex(-1.0, 1.0, 0.0, phase, strength),
+        gloss_vertex(-1.0, -1.0, 0.0, phase, strength),
+        gloss_vertex(1.0, 1.0, cycles, phase, strength),
+        gloss_vertex(1.0, -1.0, cycles, phase, strength),
+    ]
+}
+
+fn debug_grid_color(col: usize, row: usize) -> [f32; 4] {
+    let x = ratio_usize(col, DEBUG_GRID_COLUMNS - 1);
+    let y = ratio_usize(row, DEBUG_GRID_ROWS - 1);
+    let parity = if ((col ^ row) & 1) == 0 { 0.58 } else { 0.96 };
+    let vertical = 1.0 - y * 0.28;
+    let shade = parity * vertical;
+
+    let red = clamp_f32(0.02 + y * 0.92 + x * 0.18);
+    let green = clamp_f32(0.88 - y * 0.30 + (1.0 - x) * 0.18);
+    let blue = clamp_f32(0.06 + x * 0.86 + y * 0.42);
+    [red * shade, green * shade, blue * shade, 1.0]
+}
+
+fn ratio_usize(value: usize, max: usize) -> f32 {
+    if max == 0 {
+        0.0
+    } else {
+        value as f32 / max as f32
+    }
+}
+
+fn clamp_f32(value: f32) -> f32 {
+    if value < 0.0 {
+        0.0
+    } else if value > 1.0 {
+        1.0
+    } else {
+        value
     }
 }
 
@@ -3388,16 +3642,7 @@ pub extern "C" fn glDrawArrays(mode: u32, first: i32, count: i32) {
         Ok(ctx) => {
             let vertices = draw_vertices_slice(vertex_count);
             let scratch = global_scratch();
-            ctx.gl_buffer_data_vertices(vertices, scratch)
-                .and_then(|_| {
-                    ctx.gl_draw_arrays(
-                        primitive,
-                        0,
-                        vertex_count as u32,
-                        current_texture_resource_id(),
-                        scratch,
-                    )
-                })
+            ctx.gl_draw_vertices(primitive, vertices, current_texture_resource_id(), scratch)
         }
         Err(err) => Err(err),
     };
@@ -3443,16 +3688,7 @@ pub extern "C" fn glDrawElements(mode: u32, count: i32, type_: u32, indices: *co
         Ok(ctx) => {
             let vertices = draw_vertices_slice(vertex_count);
             let scratch = global_scratch();
-            ctx.gl_buffer_data_vertices(vertices, scratch)
-                .and_then(|_| {
-                    ctx.gl_draw_arrays(
-                        primitive,
-                        0,
-                        vertex_count as u32,
-                        current_texture_resource_id(),
-                        scratch,
-                    )
-                })
+            ctx.gl_draw_vertices(primitive, vertices, current_texture_resource_id(), scratch)
         }
         Err(err) => Err(err),
     };

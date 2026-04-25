@@ -107,6 +107,7 @@ pub mod syscall {
     pub const GET_PROCESS_SLOT: u64 = 0x2E;
     pub const GET_PROCESS_STATUS: u64 = 0x30;
     pub const PROCESS_EXIT: u64 = 0x34;
+    pub const GET_MEMORY_STATS: u64 = 0x3C;
     pub const OK: u64 = 0;
     pub const ERR_INVALID: u64 = 1;
     pub const ERR_NOT_READY: u64 = 2;
@@ -255,6 +256,15 @@ pub enum ProcessStatusKind {
 pub struct ProcessStatus {
     kind: ProcessStatusKind,
     fault_vector: u8,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemoryStats {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub page_bytes: u64,
 }
 
 impl ProcessStatus {
@@ -569,6 +579,19 @@ pub fn bind_inherited_stdio_page(
 
 pub fn get_process_status(process_slot: u64) -> ProcessStatus {
     decode_process_status(syscall::call1(syscall::GET_PROCESS_STATUS, process_slot))
+}
+
+pub fn memory_stats() -> Result<MemoryStats, SyscallError> {
+    let mut stats = MemoryStats::default();
+    let status = syscall::call1(
+        syscall::GET_MEMORY_STATS,
+        (&mut stats as *mut MemoryStats) as u64,
+    );
+    if status == syscall::OK {
+        Ok(stats)
+    } else {
+        Err(SyscallError::from_error_raw(status))
+    }
 }
 
 fn record_process_exit(code: u8) {

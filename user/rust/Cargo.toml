@@ -9,6 +9,12 @@ members = [
     # Public facade
     "cap_std",
     "caplibgl",
+    "capgl_shader_wave",
+    "capwm_client",
+    "capwm_smoke",
+    "pachafetch",
+    "pachaland_assets",
+    "pitty_assets",
 
     # Wasmtime support
     "rt_wasmtime_platform",

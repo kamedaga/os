@@ -62,6 +62,7 @@ enum Opcode {
     Write = 23,
     Unlink = 24,
     Rename = 25,
+    StatFs = 26,
     OpenExec = 32,
 }
 
@@ -158,6 +159,13 @@ pub struct StatResult {
     pub size_bytes: u64,
     pub mode_bits: u32,
     pub mtime_unix_sec: u64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct StatFsResult {
+    pub block_size: u64,
+    pub capacity_blocks: u64,
+    pub used_blocks: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -515,6 +523,16 @@ impl PersistentFsClient {
     pub fn stat_open_file(&mut self, file: OpenFile) -> Result<StatResult, Error> {
         self.ensure_connection(file.connection_id())?;
         self.stat_raw(file.token().fs_token())
+    }
+
+    pub fn statfs(&mut self) -> Result<StatFsResult, Error> {
+        let seq = self.begin_request(Opcode::StatFs, self.mount_token.raw(), 0, 0, 0, "", &[])?;
+        let response = self.finish_request_ok(seq, Opcode::StatFs)?;
+        Ok(StatFsResult {
+            block_size: response.arg0,
+            capacity_blocks: response.arg1,
+            used_blocks: response.file_bytes,
+        })
     }
 
     pub fn readdir_one<'a>(

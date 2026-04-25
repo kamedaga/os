@@ -196,6 +196,7 @@ pub struct StartupConfig {
     pub provides: Vec<String>,
     pub ensure: Vec<String>,
     pub block: Vec<String>,
+    pub input: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -548,6 +549,12 @@ fn validate_app_config(config: &AppConfig) -> Result<(), String> {
         if startup.action == "block_driver" && startup.block.len() != 1 {
             return Err(format!(
                 "{}: block_driver startup requires exactly one block selector",
+                config.config_path.display()
+            ));
+        }
+        if startup.action == "input_driver" && startup.input.len() != 1 {
+            return Err(format!(
+                "{}: input_driver startup requires exactly one input selector",
                 config.config_path.display()
             ));
         }
@@ -1000,6 +1007,8 @@ fn assign_app_value(
         ensure_startup(config).ensure = value.into_string_array("[startup].ensure")?;
     } else if section_eq(section, false, &["startup"]) && key == "block" {
         ensure_startup(config).block = value.into_string_array("[startup].block")?;
+    } else if section_eq(section, false, &["startup"]) && key == "input" {
+        ensure_startup(config).input = value.into_string_array("[startup].input")?;
     }
     Ok(())
 }

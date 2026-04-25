@@ -222,7 +222,7 @@ fn build_wsl_script(
         format!("-D {}", bash_quote(&runtime_qemu_log_wsl)),
         "-display gtk,gl=on,grab-on-hover=off".to_string(),
         "-vga none".to_string(),
-        "-device virtio-vga-gl".to_string(),
+        "-device virtio-vga-gl,xres=1920,yres=1080".to_string(),
         "-device virtio-tablet-pci".to_string(),
         "-device virtio-keyboard-pci".to_string(),
         format!(

@@ -1,0 +1,25 @@
+[package]
+name = "pachaland"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pachaland"
+path = "src/main.rs"
+
+[dependencies]
+cap_std = { path = "../../user/rust/cap_std" }
+caplibgl = { path = "../../user/rust/caplibgl" }
+capwm_client = { path = "../../user/rust/capwm_client" }
+rt_alloc = { path = "../../user/rust/rt_alloc" }
+rt_core = { path = "../../user/rust/rt_core" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = false
+codegen-units = 1
+strip = "symbols"

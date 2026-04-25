@@ -5,6 +5,7 @@ const service_registry_abi = @import("service_registry_abi.zig");
 pub const magic: u64 = 0x4C54_5043; // "CPTL"
 pub const version: u64 = 1;
 pub const endpoint_id: u64 = service_registry_abi.dynamic_endpoint_id_base + 0x10;
+pub const page_bytes: usize = 4096;
 
 pub const status_flag_block_present: u64 = 1 << 0;
 pub const status_flag_iommu_active: u64 = 1 << 1;
@@ -22,6 +23,8 @@ pub const Opcode = enum(u64) {
     profile_no_iommu = 7,
     profile_no_virtqueue = 8,
     launch_gpu = 9,
+    launch_service = 10,
+    publish_service = 11,
 };
 
 pub const BlockProfile = enum(u64) {
@@ -51,6 +54,9 @@ pub const Request = extern struct {
     reserved0: u64,
 };
 
+pub const request_header_bytes: usize = @sizeOf(Request);
+pub const request_payload_bytes: usize = page_bytes - request_header_bytes;
+
 pub const Response = extern struct {
     magic: u64,
     version: u64,
@@ -64,6 +70,9 @@ pub const Response = extern struct {
     block_profile: u64,
     gpu_process_slot: u64,
     gpu_endpoint_id: u64,
+    service_kind: u64,
+    service_process_slot: u64,
+    service_endpoint_id: u64,
 };
 
 pub fn opcodeRaw(opcode: Opcode) u64 {

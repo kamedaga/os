@@ -13,7 +13,17 @@ pub const CommandCapabilityTable = dma_mapping_manager.CommandCapabilityTable;
 
 const iommu_devices = [_]kernel.DmaDeviceId{ .virtio_gpu, .virtio_input, .virtio_blk };
 
-fn principalHasQueueCapForDevice(state: *const kernel.KernelState, principal: kernel.PrincipalId, device: kernel.DmaDeviceId) bool {
+pub fn principalHasIommuCapForDevice(state: *const kernel.KernelState, principal: kernel.PrincipalId, device: kernel.DmaDeviceId) bool {
+    const owner_raw: u8 = @intCast(@intFromEnum(principal));
+    for (state.iommu_caps.entries) |cap| {
+        if (!cap.valid) continue;
+        if (cap.owner_principal_raw != owner_raw) continue;
+        if (cap.device == device) return true;
+    }
+    return false;
+}
+
+pub fn principalHasQueueCapForDevice(state: *const kernel.KernelState, principal: kernel.PrincipalId, device: kernel.DmaDeviceId) bool {
     const owner_raw: u8 = @intCast(@intFromEnum(principal));
     for (state.queue_caps.entries) |cap| {
         if (!cap.valid) continue;
@@ -33,7 +43,11 @@ fn syncIommuForPrincipalDevicePaddr(
     const had_mapping = state.iommuFindMappingIndex(principal, device, paddr) != null;
     const cap = state.getTableConst(principal).find(paddr);
     if (cap) |c| {
-        if (c.rights.dma and principalHasQueueCapForDevice(state, principal, device)) {
+        if (c.rights.dma and
+            principalHasIommuCapForDevice(state, principal, device) and
+            principalHasQueueCapForDevice(state, principal, device) and
+            state.hasActiveDmaMappingForPrincipalDevicePaddr(principal, device, paddr))
+        {
             try state.iommuMap(principal, device, paddr);
             if (!had_mapping) {
                 if (state.iommu_audit_hook) |hook| {
@@ -289,20 +303,26 @@ pub fn revokeDeviceCapStage2(
     try state.requireActiveProcess(owner);
     switch (kind) {
         .iommu => {
+            const cap = state.iommu_caps.findByToken(token) orelse return kernel.KernelError.CapabilityNotFound;
+            const device = cap.device;
             _ = state.iommu_caps.revokeSubtree(@intFromEnum(owner), token) catch |err| switch (err) {
                 error.NotFound => return kernel.KernelError.CapabilityNotFound,
                 error.Denied => return kernel.KernelError.InvalidState,
                 error.InvalidState => return kernel.KernelError.InvalidState,
                 error.TableFull => return kernel.KernelError.TableFull,
             };
+            state.removeDmaMappingsForPrincipalDevice(owner, device);
         },
         .virtqueue => {
+            const cap = state.queue_caps.findByToken(token) orelse return kernel.KernelError.CapabilityNotFound;
+            const device = cap.device;
             _ = state.queue_caps.revokeSubtree(@intFromEnum(owner), token) catch |err| switch (err) {
                 error.NotFound => return kernel.KernelError.CapabilityNotFound,
                 error.Denied => return kernel.KernelError.InvalidState,
                 error.InvalidState => return kernel.KernelError.InvalidState,
                 error.TableFull => return kernel.KernelError.TableFull,
             };
+            state.removeDmaMappingsForPrincipalDevice(owner, device);
         },
         .command => {
             _ = state.command_caps.revokeSubtree(@intFromEnum(owner), token) catch |err| switch (err) {
@@ -313,4 +333,5 @@ pub fn revokeDeviceCapStage2(
             };
         },
     }
+    try syncAllIommuForPrincipal(state, owner, .revoke);
 }

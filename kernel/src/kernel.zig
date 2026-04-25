@@ -814,6 +814,78 @@ pub const KernelState = struct {
         return (value + 4095) & ~@as(u64, 4095);
     }
 
+    fn pageAlignDown(value: u64) u64 {
+        return value & ~@as(u64, 4095);
+    }
+
+    fn dmaMappingEndExclusive(paddr_start: u64, length: u64) KernelError!u64 {
+        if (length == 0) return KernelError.InvalidState;
+        if (paddr_start > std.math.maxInt(u64) - length) return KernelError.InvalidState;
+        if (paddr_start + length > std.math.maxInt(u64) - 4095) return KernelError.InvalidState;
+        return pageAlignUp(paddr_start + length);
+    }
+
+    fn validateDmaMappingPages(self: *const KernelState, owner: PrincipalId, paddr_start: u64, length: u64) KernelError!void {
+        const end = try dmaMappingEndExclusive(paddr_start, length);
+        var paddr = pageAlignDown(paddr_start);
+        while (paddr < end) : (paddr += 4096) {
+            const cap = self.getTableConst(owner).find(paddr) orelse return KernelError.CapabilityNotFound;
+            if (!cap.rights.dma) return KernelError.NoDmaRight;
+        }
+    }
+
+    fn syncIommuForDmaMapping(self: *KernelState, mapping: DmaMapping, reason: IommuSyncReason) KernelError!void {
+        const principal: PrincipalId = @enumFromInt(mapping.owner_principal_raw);
+        const end = try dmaMappingEndExclusive(mapping.paddr_start, mapping.length);
+        var paddr = pageAlignDown(mapping.paddr_start);
+        while (paddr < end) : (paddr += 4096) {
+            try device_capabilities.syncIommuForPrincipalPaddr(self, principal, paddr, reason);
+        }
+    }
+
+    pub fn hasActiveDmaMappingForPrincipalDevicePaddr(self: *const KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) bool {
+        const owner_raw: u8 = @intCast(@intFromEnum(principal));
+        const page = pageAlignDown(paddr);
+        for (self.dma_mappings.entries) |mapping| {
+            if (!mapping.valid) continue;
+            if (mapping.owner_principal_raw != owner_raw) continue;
+            if (mapping.device != device) continue;
+            const end = dmaMappingEndExclusive(mapping.paddr_start, mapping.length) catch continue;
+            if (page >= pageAlignDown(mapping.paddr_start) and page < end) return true;
+        }
+        return false;
+    }
+
+    fn dmaMappingContainsPage(mapping: DmaMapping, paddr: u64) bool {
+        const page = pageAlignDown(paddr);
+        const end = dmaMappingEndExclusive(mapping.paddr_start, mapping.length) catch return false;
+        return page >= pageAlignDown(mapping.paddr_start) and page < end;
+    }
+
+    pub fn removeDmaMappingsForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64) void {
+        const owner_raw: u8 = @intCast(@intFromEnum(principal));
+        var i: usize = 0;
+        while (i < self.dma_mappings.entries.len) : (i += 1) {
+            const mapping = self.dma_mappings.entries[i];
+            if (!mapping.valid) continue;
+            if (mapping.owner_principal_raw != owner_raw) continue;
+            if (!dmaMappingContainsPage(mapping, paddr)) continue;
+            self.dma_mappings.entries[i] = .{};
+        }
+    }
+
+    pub fn removeDmaMappingsForPrincipalDevice(self: *KernelState, principal: PrincipalId, device: DmaDeviceId) void {
+        const owner_raw: u8 = @intCast(@intFromEnum(principal));
+        var i: usize = 0;
+        while (i < self.dma_mappings.entries.len) : (i += 1) {
+            const mapping = self.dma_mappings.entries[i];
+            if (!mapping.valid) continue;
+            if (mapping.owner_principal_raw != owner_raw) continue;
+            if (mapping.device != device) continue;
+            self.dma_mappings.entries[i] = .{};
+        }
+    }
+
     fn findDmaRestoreIndex(self: *const KernelState, paddr: u64) ?usize {
         var i: usize = 0;
         while (i < self.dma_restore.len) : (i += 1) {
@@ -1169,17 +1241,26 @@ pub const KernelState = struct {
         direction: DmaDirection,
     ) KernelError!u64 {
         try self.requireActiveProcess(owner);
-        return self.dma_mappings.alloc(
+        try self.validateDmaMappingPages(owner, paddr_start, length);
+        const token = self.dma_mappings.alloc(
             @intFromEnum(owner),
             device,
             paddr_start,
             length,
             direction,
-        ) catch |err| switch (err) {
-            error.InvalidState => KernelError.InvalidState,
-            error.TableFull => KernelError.TableFull,
-            else => KernelError.InvalidState,
+        ) catch |err| {
+            return switch (err) {
+                error.InvalidState => KernelError.InvalidState,
+                error.TableFull => KernelError.TableFull,
+                else => KernelError.InvalidState,
+            };
         };
+        const mapping = self.dma_mappings.findByToken(token) orelse return KernelError.InvalidState;
+        self.syncIommuForDmaMapping(mapping.*, .grant_dma) catch |err| {
+            _ = self.dma_mappings.remove(token);
+            return err;
+        };
+        return token;
     }
 
     pub fn dmaMapFindStage1(self: *const KernelState, token: u64) ?*const DmaMapping {
@@ -1200,12 +1281,14 @@ pub const KernelState = struct {
     }
 
     pub fn dmaMapReleaseStage1(self: *KernelState, token: u64) KernelError!void {
+        const mapping = (self.dma_mappings.findByToken(token) orelse return KernelError.CapabilityNotFound).*;
         self.dma_mappings.release(token) catch |err| switch (err) {
             error.NotFound => return KernelError.CapabilityNotFound,
             error.InvalidState => return KernelError.InvalidState,
             error.TableFull => return KernelError.TableFull,
             error.Denied => return KernelError.InvalidState,
         };
+        try self.syncIommuForDmaMapping(mapping, .revoke);
     }
 
     pub fn dmaBindDeviceDomainStage1(
@@ -1775,6 +1858,7 @@ pub const KernelState = struct {
                 if (page_table.findByCapId(cap_id)) |page_cap| {
                     const removed_paddr = page_cap.paddr;
                     _ = page_table.removeByCapId(cap_id);
+                    self.removeDmaMappingsForPrincipalPaddr(@enumFromInt(pidx), removed_paddr);
                     try device_capabilities.syncIommuForPrincipalPaddr(self, @enumFromInt(pidx), removed_paddr, .revoke);
                     if (self.pte_sync_hook) |hook| {
                         callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);
@@ -1837,6 +1921,7 @@ pub const KernelState = struct {
         moved.rights = rights;
         _ = src.removeByPaddr(paddr);
         try self.getTable(to).add(moved);
+        self.removeDmaMappingsForPrincipalPaddr(from, paddr);
         try device_capabilities.syncIommuForPrincipalPaddr(self, from, paddr, .move_from);
         try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, .move_to);
         if (self.pte_sync_hook) |hook| {
@@ -2114,6 +2199,7 @@ pub const KernelState = struct {
                 const cap = table.findByCapId(cap_id) orelse continue;
                 const removed_paddr = cap.paddr;
                 _ = table.removeByCapId(cap_id);
+                self.removeDmaMappingsForPrincipalPaddr(@enumFromInt(pidx), removed_paddr);
                 try device_capabilities.syncIommuForPrincipalPaddr(self, @enumFromInt(pidx), removed_paddr, .revoke);
                 if (self.pte_sync_hook) |hook| {
                     callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);
@@ -2535,9 +2621,10 @@ test "sendCapOnEndpoint requires endpoint capability" {
     try std.testing.expect(s.getTableConst(.Process1).find(0x1000) != null);
 }
 
-test "iommu no-cap-driver shadow maps dma grant to compositor" {
+test "iommu no-cap-driver shadow maps active dma mapping" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
+    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, .virtio_gpu, true, true, true);
     _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
@@ -2545,15 +2632,27 @@ test "iommu no-cap-driver shadow maps dma grant to compositor" {
         .cpu_write = false,
         .dma = true,
     });
+    try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
+
+    const mapping = try s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read);
     try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
+    try s.dmaMapSetStateStage1(mapping, .in_flight);
+    try s.dmaMapSetStateStage1(mapping, .completed);
+    try s.dmaMapReleaseStage1(mapping);
+    try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
+
+    const mapping2 = try s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read);
+    try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
     try s.revokeCapTree(.Process1, 0x1000);
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
+    try std.testing.expect(s.dmaMapFindStage1(mapping2) == null);
 }
 
 test "iommu no-cap-driver does not map non-dma grant" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
+    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, .virtio_gpu, true, true, true);
     _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
@@ -2561,22 +2660,29 @@ test "iommu no-cap-driver does not map non-dma grant" {
         .cpu_write = false,
         .dma = false,
     });
+    try std.testing.expectError(KernelError.NoDmaRight, s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read));
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 }
 
-test "queue cap grant syncs existing dma grant" {
+test "queue cap grant syncs existing dma mapping" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
+    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, .virtio_gpu, true, true, true);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
         .cpu_write = false,
         .dma = true,
     });
+    const mapping = try s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read);
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
-    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
+    const queue_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
     try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
+
+    try device_capabilities.revokeDeviceCapStage2(&s, .Process1, .virtqueue, queue_token);
+    try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
+    try std.testing.expect(s.dmaMapFindStage1(mapping) == null);
 }
 
 test "sendCapOnEndpoint rejects missing endpoint" {
