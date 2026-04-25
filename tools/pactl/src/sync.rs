@@ -29,16 +29,20 @@ struct ManifestPair {
 }
 
 pub fn sync_rootfs(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<RootfsSyncOutputs, String> {
-    let inputs = prepare_sync_inputs(workspace_root, workspace)?;
+    let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::default())?;
     sync_rootfs_generated(workspace_root, workspace, &inputs.disk_image, &inputs.manifests)
 }
 
 pub fn sync_bootfs(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<BootfsSyncOutputs, String> {
-    let inputs = prepare_sync_inputs(workspace_root, workspace)?;
+    let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::default())?;
     sync_bootfs_generated(workspace_root, workspace, &inputs.disk_image, &inputs.manifests)
 }
 
-pub fn prepare_sync_inputs(workspace_root: &Path, workspace: &WorkspaceConfig) -> Result<PreparedSyncInputs, String> {
+pub fn prepare_sync_inputs(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+    build_options: BuildOptions,
+) -> Result<PreparedSyncInputs, String> {
     let disk_image = workspace_root.join(&workspace.disk.image);
     require_nonempty_file(
         &disk_image,
@@ -46,7 +50,7 @@ pub fn prepare_sync_inputs(workspace_root: &Path, workspace: &WorkspaceConfig) -
         "run pactl disk ensure or create the disk image before syncing",
     )?;
 
-    build_userland(workspace_root, workspace, None, BuildOptions::default())?;
+    build_userland(workspace_root, workspace, None, build_options)?;
     let manifests = generate_manifests(workspace_root, workspace)?;
     Ok(PreparedSyncInputs { disk_image, manifests })
 }
@@ -252,6 +256,7 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<(), String> {
 
 fn run_command(label: &str, cmd: &mut Command) -> Result<(), String> {
     let debug = format!("{cmd:?}");
+    eprintln!("pactl: running {label}: {debug}");
     let status = cmd
         .status()
         .map_err(|err| format!("failed to run {label}: {err}"))?;

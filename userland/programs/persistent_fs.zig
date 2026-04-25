@@ -1747,6 +1747,7 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
     _ = userLog("PersistentFs: block ready\n");
+    persistent_fs_bootstrap.writeServerStatus(config_page_va, persistent_fs_bootstrap.server_status_ready);
     _ = userLog("PersistentFs: endpoint ready\n");
 
     while (true) {

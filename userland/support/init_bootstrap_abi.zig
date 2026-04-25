@@ -74,8 +74,10 @@ pub const DeviceDescriptor = extern struct {
     isr_page_offset: u64,
     device_page_offset: u64,
     notify_off_multiplier: u64,
+    init_iommu_token: u64,
     init_queue_submit_token: u64,
     init_queue_notify_token: u64,
+    init_command_token: u64,
 };
 
 pub const DisplayDescriptor = extern struct {

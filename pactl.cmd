@@ -2,7 +2,7 @@
 setlocal
 
 set "ROOT=%~dp0"
-set "CARGO_TARGET_DIR=%ROOT%.artifacts\pactl-target-v2"
+set "CARGO_TARGET_DIR=%ROOT%tools\pactl\target"
 set "MANIFEST_PATH=%ROOT%tools\pactl\Cargo.toml"
 set "PACTL_EXE=%CARGO_TARGET_DIR%\debug\pactl.exe"
 set "BUILD_NEEDED=0"
@@ -24,8 +24,8 @@ for /f %%I in ('
 ') do set "BUILD_NEEDED=%%I"
 
 if "%BUILD_NEEDED%"=="1" (
-    cargo build --quiet --manifest-path "%MANIFEST_PATH%"
-    if errorlevel 1 exit /b %ERRORLEVEL%
+    cargo run --manifest-path "%MANIFEST_PATH%" -- %*
+    exit /b %ERRORLEVEL%
 )
 
 "%PACTL_EXE%" %*

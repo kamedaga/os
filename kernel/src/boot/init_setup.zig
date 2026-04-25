@@ -3,6 +3,7 @@
 /// registry, and virtio device capability grants.
 const std = @import("std");
 const capability = @import("../capability.zig");
+const device_capabilities = @import("../device_capabilities.zig");
 const kernel = @import("../kernel.zig");
 const kernel_log = @import("../kernel_log.zig");
 const boot_abi = @import("abi.zig");
@@ -14,7 +15,6 @@ const halt = @import("../halt.zig");
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
 const service_registry_abi = boot_abi.service_registry_abi;
 const boot_manifest_abi = boot_abi.boot_manifest_abi;
-
 
 pub const MmioPageWithOffset = struct {
     page_paddr: u64,
@@ -310,8 +310,10 @@ pub fn publishInitBootstrapDescriptorPage(
             .isr_page_offset = 0,
             .device_page_offset = 0,
             .notify_off_multiplier = 0,
+            .init_iommu_token = 0,
             .init_queue_submit_token = 0,
             .init_queue_notify_token = 0,
+            .init_command_token = 0,
         };
     }
     device_count = 0;
@@ -339,7 +341,66 @@ fn grantInitDeviceQueueTokenOrHalt(
     submit: bool,
     notify: bool,
 ) u64 {
-    return state.queueCapGrantStage2(init_process_principal, device, 0, submit, notify) catch |err| {
+    return device_capabilities.queueCapGrantStage2(state, init_process_principal, device, 0, submit, notify) catch |err| {
+        haltInitDeviceBootstrapError(label, step_label, err);
+    };
+}
+
+fn grantInitDeviceIommuTokenOrHalt(
+    state: *kernel.KernelState,
+    init_process_principal: kernel.PrincipalId,
+    device: kernel.DmaDeviceId,
+    label: []const u8,
+    step_label: []const u8,
+) u64 {
+    return device_capabilities.iommuCapGrantStage2(state, init_process_principal, device, true, true, true) catch |err| {
+        haltInitDeviceBootstrapError(label, step_label, err);
+    };
+}
+
+fn blkCommandMask() u64 {
+    return commandOpcodeBit(.blk_read) |
+        commandOpcodeBit(.blk_write) |
+        commandOpcodeBit(.blk_flush) |
+        commandOpcodeBit(.blk_identify);
+}
+
+fn gpuCommandMask() u64 {
+    return commandOpcodeBit(.gpu_admin) |
+        commandOpcodeBit(.gpu_resource_2d) |
+        commandOpcodeBit(.gpu_scanout) |
+        commandOpcodeBit(.gpu_cursor) |
+        commandOpcodeBit(.gpu_virgl_context) |
+        commandOpcodeBit(.gpu_virgl_resource) |
+        commandOpcodeBit(.gpu_virgl_submit) |
+        commandOpcodeBit(.gpu_fence);
+}
+
+fn commandOpcodeBit(opcode: device_capabilities.CommandOpcodeClass) u64 {
+    return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(opcode)));
+}
+
+fn defaultCommandMaskForDevice(device: kernel.DmaDeviceId) u64 {
+    return switch (device) {
+        .virtio_blk => blkCommandMask(),
+        .virtio_gpu => gpuCommandMask(),
+        .virtio_input => commandOpcodeBit(.gpu_admin),
+    };
+}
+
+fn grantInitDeviceCommandTokenOrHalt(
+    state: *kernel.KernelState,
+    init_process_principal: kernel.PrincipalId,
+    device: kernel.DmaDeviceId,
+    label: []const u8,
+    step_label: []const u8,
+) u64 {
+    return device_capabilities.commandCapGrantStage2(
+        state,
+        init_process_principal,
+        device,
+        defaultCommandMaskForDevice(device),
+    ) catch |err| {
         haltInitDeviceBootstrapError(label, step_label, err);
     };
 }
@@ -378,9 +439,25 @@ pub fn setupDeviceBootstrapForInit(
         false,
         true,
     );
+    const init_iommu_token = grantInitDeviceIommuTokenOrHalt(
+        state,
+        init_process_principal,
+        device.dma_device,
+        label,
+        "iommu grant",
+    );
+    const init_command_token = grantInitDeviceCommandTokenOrHalt(
+        state,
+        init_process_principal,
+        device.dma_device,
+        label,
+        "command grant",
+    );
     var updated = device;
+    updated.descriptor.init_iommu_token = init_iommu_token;
     updated.descriptor.init_queue_submit_token = init_submit_token;
     updated.descriptor.init_queue_notify_token = init_notify_token;
+    updated.descriptor.init_command_token = init_command_token;
     return updated;
 }
 

@@ -182,13 +182,6 @@ fn allocProcessImagePages(
     };
 }
 
-fn zeroProcessImagePages(page_paddrs: []const u64) void {
-    for (page_paddrs) |page_paddr| {
-        const page: [*]u8 = @ptrFromInt(page_paddr);
-        @memset(page[0..4096], 0);
-    }
-}
-
 fn readProcessImageBytes(page_paddrs: []const u64, image_bytes: usize, offset: u64, out: []u8) elf_loader.LoadToPageError!void {
     if (offset > std.math.maxInt(usize)) return error.SegmentTooLarge;
     const start: usize = @intCast(offset);
@@ -328,7 +321,6 @@ pub fn loadUserElfIntoProcessPagesFromBacking(
     const required_pages = required_bytes / 4096;
     const process_pages = allocProcessImagePages(state, principal, page0_paddr, required_pages, free_list) orelse return null;
     defer uefi_services.freeBootScratch(process_pages.scratch);
-    zeroProcessImagePages(process_pages.page_paddrs);
 
     var loaded = parsed;
     loaded.entry = checkedAddU64(boot_static.user_elf_base_va, parsed.entry) catch |err| {

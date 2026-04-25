@@ -12,6 +12,7 @@ pub const StartupAction = enum(u8) {
     block_client = 6,
     window_client = 7,
     deferred_compositor = 8,
+    gpu_driver = 9,
 };
 
 pub const StartupExecSource = enum(u8) {
@@ -59,6 +60,7 @@ pub const StartupProgramRole = enum(u64) {
     block_driver = 9,
     block_demo = 10,
     persistent_fs = 11,
+    gpu_driver = 12,
 };
 
 pub const StartupProgramDescriptor = extern struct {
@@ -86,6 +88,7 @@ pub fn roleLabel(role: StartupProgramRole) []const u8 {
         .block_driver => "block driver",
         .block_demo => "block demo",
         .persistent_fs => "persistent fs",
+        .gpu_driver => "gpu driver",
     };
 }
 
@@ -102,6 +105,7 @@ pub fn roleKey(role: StartupProgramRole) []const u8 {
         .block_driver => "block_driver",
         .block_demo => "block_demo",
         .persistent_fs => "persistent_fs",
+        .gpu_driver => "gpu_driver",
     };
 }
 
@@ -118,6 +122,7 @@ pub fn actionFromKey(key: []const u8) ?StartupAction {
     if (std.mem.eql(u8, key, "input_driver")) return .input_driver;
     if (std.mem.eql(u8, key, "block_driver")) return .block_driver;
     if (std.mem.eql(u8, key, "persistent_fs")) return .persistent_fs_server;
+    if (std.mem.eql(u8, key, "gpu_driver")) return .gpu_driver;
     if (std.mem.eql(u8, key, "block_client") or std.mem.eql(u8, key, "block_demo")) return .block_client;
     if (std.mem.eql(u8, key, "window_client")) return .window_client;
     if (std.mem.eql(u8, key, "deferred_compositor")) return .deferred_compositor;

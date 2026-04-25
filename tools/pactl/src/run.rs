@@ -24,6 +24,28 @@ pub struct RunPlan {
     pub script: String,
 }
 
+pub fn invalidate_run_cache(workspace_root: &Path) -> Result<(), String> {
+    let slug = runtime_slug(workspace_root);
+    let script = format!(
+        "set -e\nCACHE_DIR=${{XDG_CACHE_HOME:-$HOME/.cache}}/capabilityos-qemu/{slug}\nrm -f \"$CACHE_DIR/disk.dirty\" \"$CACHE_DIR/disk.meta\" \"$CACHE_DIR/disk.img\"\n"
+    );
+    let status = Command::new("wsl")
+        .arg("-e")
+        .arg("bash")
+        .arg("-lc")
+        .arg(&script)
+        .status()
+        .map_err(|err| format!("failed to invalidate WSL run cache: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "failed to invalidate WSL run cache for {}: exit code {:?}",
+            workspace_root.display(),
+            status.code()
+        ));
+    }
+    Ok(())
+}
+
 pub fn run_qemu(
     workspace_root: &Path,
     workspace: &WorkspaceConfig,
@@ -187,9 +209,9 @@ fn build_wsl_script(
         "-monitor none".to_string(),
         format!("-d {QEMU_DEBUG_FLAGS}"),
         format!("-D {}", bash_quote(&runtime_qemu_log_wsl)),
-        "-display gtk,grab-on-hover=off".to_string(),
+        "-display gtk,gl=on,grab-on-hover=off".to_string(),
         "-vga none".to_string(),
-        "-device virtio-vga".to_string(),
+        "-device virtio-vga-gl".to_string(),
         "-device virtio-tablet-pci".to_string(),
         "-device virtio-keyboard-pci".to_string(),
         format!(

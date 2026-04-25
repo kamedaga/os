@@ -2,6 +2,8 @@ const std = @import("std");
 const boot_status_abi = @import("support_root").boot_status_abi;
 const boot_status_client = @import("support_root").boot_status_client;
 const bootfs_format = @import("support_root").bootfs_format;
+const cap_transfer_abi = @import("support_root").cap_transfer_abi;
+const capctl_protocol = @import("support_root").capctl_protocol;
 const image_abi = @import("support_root").image_abi;
 const startup_plan_abi = @import("support_root").startup_plan_abi;
 const queue_abi = @import("support_root").queue_abi;
@@ -9,6 +11,8 @@ const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
 const manager_init_bootstrap_abi = @import("support_root").manager_init_bootstrap_abi;
 const block_bootstrap = @import("support_root").block_bootstrap_abi;
+const gpu_bootstrap = @import("support_root").gpu_bootstrap_abi;
+const gpu_protocol = @import("support_root").gpu_protocol;
 const persistent_fs_bootstrap = @import("support_root").persistent_fs_bootstrap_abi;
 const process_abi = @import("support_root").process_abi;
 const process_args_env_bootstrap_abi = @import("support_root").process_args_env_bootstrap_abi;
@@ -35,6 +39,8 @@ const virtio_input_device_modern: u64 = 0x1052;
 const virtio_input_subsystem_id: u64 = 0x0012;
 const virtio_blk_device_modern: u64 = 0x1042;
 const virtio_blk_subsystem_id: u64 = 0x0002;
+const virtio_gpu_device_modern: u64 = 0x1050;
+const virtio_gpu_subsystem_id: u64 = 0x0010;
 const input_cfg_select: u64 = 0;
 const input_cfg_subsel: u64 = 1;
 const input_cfg_size: u64 = 2;
@@ -53,11 +59,14 @@ const virtio_blk_capacity_offset: u64 = 0x00;
 const virtio_blk_block_size_offset: u64 = 0x14;
 const rootfs_startup_manifest_path = "/sys/startup_manifest.txt";
 const rootfs_shell_path = "/cmd/shell.elf";
+const rootfs_gpu_driver_path = "/srv/virtio_gpu_gl.elf";
 const persistent_fs_start_block: u64 = 395264;
 const manager_stack_extension_pages: u64 = 8;
 const manager_stack_extension_base_va: u64 = process_abi.aux_base_va - ((manager_stack_extension_pages + 1) * 4096);
 const startup_manifest_max_bytes: usize = 4096;
 const startup_named_dependency_max: usize = 8;
+const capctl_request_va: u64 = process_abi.auxPageVa(6);
+const capctl_response_va: u64 = process_abi.auxPageVa(7);
 const startup_ready_name_max: usize = startup_plan_abi.max_startup_program_descriptors * (startup_named_dependency_max + 1);
 
 const InputDeviceKind = startup_plan_abi.StartupInputSelector;
@@ -131,6 +140,8 @@ var next_inspect_mmio_page_va: u64 = inspect_mmio_base_va;
 var mmio_cap_cache = MmioCapCache{};
 var block_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
 var block_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
+var gpu_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
+var gpu_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 var persistent_fs_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
 var persistent_fs_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 var boot_display_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
@@ -240,6 +251,15 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn acceptCapTransfer(transfer_id: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (cap_transfer_abi.syscall_accept_cap_transfer),
+          [arg0] "{rdi}" (transfer_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
     return asm volatile (
         \\int $0x80
@@ -267,6 +287,14 @@ fn signalEndpoint(endpoint_id: u64) u64 {
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_signal_endpoint),
           [arg0] "{rdi}" (endpoint_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn getProcessSlot() u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_get_process_slot),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -321,6 +349,25 @@ fn grantQueueCap(token: u64, to_process_slot: u64) u64 {
         : [nr] "{rax}" (queue_abi.syscall_grant_cap),
           [arg0] "{rdi}" (token),
           [arg1] "{rsi}" (to_process_slot),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn revokeQueueCap(token: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (queue_abi.syscall_revoke_cap),
+          [arg0] "{rdi}" (token),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn deriveCommandCap(token: u64, opcode_mask: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (queue_abi.syscall_derive_command_cap),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (opcode_mask),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -443,6 +490,12 @@ fn isVirtioBlockDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor
     return descriptor.transport == @intFromEnum(init_bootstrap_abi.DeviceTransport.virtio_pci_modern) and
         descriptor.vendor_id == virtio_vendor_id and
         (descriptor.device_id == virtio_blk_device_modern or descriptor.subsystem_id == virtio_blk_subsystem_id);
+}
+
+fn isVirtioGpuDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
+    return descriptor.transport == @intFromEnum(init_bootstrap_abi.DeviceTransport.virtio_pci_modern) and
+        descriptor.vendor_id == virtio_vendor_id and
+        (descriptor.device_id == virtio_gpu_device_modern or descriptor.subsystem_id == virtio_gpu_subsystem_id);
 }
 
 fn appendDeviceMmioPage(set: *DeviceMmioPageSet, paddr: u64, rights_bits: u64) bool {
@@ -701,7 +754,8 @@ fn findInputDeviceDescriptor(
         if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
         if (!isVirtioInputDeviceDescriptor(descriptor)) continue;
         if (!deviceHasBootstrapQueueGrant(bootstrap_handoff, descriptor)) continue;
-        const classified = hintedInputDeviceKind(bootstrap_handoff, descriptor) orelse classifyInputDeviceDescriptor(descriptor) orelse continue;
+        const classified = hintedInputDeviceKind(bootstrap_handoff, descriptor) orelse classifyInputDeviceDescriptor(descriptor) orelse null;
+        if (classified == null) continue;
         if (classified != kind) continue;
         return descriptor;
     }
@@ -719,6 +773,21 @@ fn findBlockDeviceDescriptor(
         const descriptor = page.devices[i];
         if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
         if (!isVirtioBlockDeviceDescriptor(descriptor)) continue;
+        if (!deviceHasBootstrapQueueGrant(bootstrap_handoff, descriptor)) continue;
+        return descriptor;
+    }
+    return null;
+}
+
+fn findGpuDeviceDescriptor(
+    bootstrap_handoff: manager_init_bootstrap_abi.ConfigPage,
+) ?init_bootstrap_abi.DeviceDescriptor {
+    const page = descriptorPage() orelse return null;
+    var i: usize = 0;
+    while (i < page.device_count and i < init_bootstrap_abi.max_device_descriptors) : (i += 1) {
+        const descriptor = page.devices[i];
+        if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
+        if (!isVirtioGpuDeviceDescriptor(descriptor)) continue;
         if (!deviceHasBootstrapQueueGrant(bootstrap_handoff, descriptor)) continue;
         return descriptor;
     }
@@ -905,6 +974,7 @@ fn parseStartupNamedDependencyList(
 fn defaultStartupPolicyLabel(policy: *const StartupPolicy) []const u8 {
     return switch (policy.action) {
         .block_driver => "block driver",
+        .gpu_driver => "gpu driver",
         .persistent_fs_server => "persistent fs",
         else => "service",
     };
@@ -921,6 +991,7 @@ fn validateStartupPolicy(policy: *StartupPolicy) void {
     normalizeStartupPolicy(policy);
     switch (policy.action) {
         .block_driver => if (policy.block_kind == null) startupManifestFail("ManagerInit: startup block driver missing selector\n"),
+        .gpu_driver => {},
         .persistent_fs_server => {},
         else => startupManifestFail("ManagerInit: unsupported startup action\n"),
     }
@@ -1030,8 +1101,12 @@ fn waitForBootstrapHandoff() manager_init_bootstrap_abi.ConfigPage {
 
 fn allocChildServiceRegistryPage(
     window_service: ?service_registry_abi.ServiceEntry,
+    capctl_process_slot: ?u64,
+    capctl_endpoint_id: ?u64,
     block_process_slot: ?u64,
     block_endpoint_id: ?u64,
+    gpu_process_slot: ?u64,
+    gpu_endpoint_id: ?u64,
     persistent_fs_process_slot: ?u64,
     persistent_fs_endpoint_id: ?u64,
 ) ?u64 {
@@ -1041,8 +1116,14 @@ fn allocChildServiceRegistryPage(
     if (registry_paddr < 0x1000) return null;
     service_registry_abi.initPage(source_va);
     if (window_service) |entry| service_registry_abi.addServiceEntry(source_va, entry);
+    if (capctl_process_slot != null and capctl_endpoint_id != null) {
+        service_registry_abi.addServiceWithProcessSlot(source_va, .capctl, capctl_process_slot.?, capctl_endpoint_id.?);
+    }
     if (block_process_slot != null and block_endpoint_id != null) {
         service_registry_abi.addServiceWithProcessSlot(source_va, .block, block_process_slot.?, block_endpoint_id.?);
+    }
+    if (gpu_process_slot != null and gpu_endpoint_id != null) {
+        service_registry_abi.addServiceWithProcessSlot(source_va, .gpu, gpu_process_slot.?, gpu_endpoint_id.?);
     }
     if (persistent_fs_process_slot != null and persistent_fs_endpoint_id != null) {
         service_registry_abi.addServiceWithProcessSlot(source_va, .persistent_fs, persistent_fs_process_slot.?, persistent_fs_endpoint_id.?);
@@ -1052,9 +1133,13 @@ fn allocChildServiceRegistryPage(
 
 const LaunchContext = struct {
     const QueueGrant = struct {
+        iommu_token: u64,
         submit_token: u64,
         notify_token: u64,
+        command_token: u64,
     };
+
+    const BlockProfile = capctl_protocol.BlockProfile;
 
     has_boot_display: bool = false,
     bootfs_ready: bool = false,
@@ -1063,16 +1148,34 @@ const LaunchContext = struct {
     primary_display: init_bootstrap_abi.DisplayDescriptor,
     keyboard_input: init_bootstrap_abi.DeviceDescriptor,
     block_device: init_bootstrap_abi.DeviceDescriptor,
+    gpu_device: ?init_bootstrap_abi.DeviceDescriptor = null,
     window_service_page: init_bootstrap_abi.SpawnPageDescriptor,
     window_service: ?service_registry_abi.ServiceEntry = null,
     shared_service_registry_source_va: ?u64 = null,
     shared_stdio_bootstrap_source_va: ?u64 = null,
     shared_process_args_env_bootstrap_source_va: ?u64 = null,
     shared_process_exit_bootstrap_source_va: ?u64 = null,
+    capctl_endpoint_id: ?u64 = null,
     block_process_slot: ?u64 = null,
     block_endpoint_id: ?u64 = null,
+    block_iommu_source_token: u64 = 0,
+    block_submit_source_token: u64 = 0,
+    block_notify_source_token: u64 = 0,
+    block_command_source_token: u64 = 0,
+    block_iommu_base_token: u64 = 0,
+    block_submit_base_token: u64 = 0,
+    block_notify_base_token: u64 = 0,
+    block_command_base_token: u64 = 0,
+    block_profile: BlockProfile = .full,
+    block_policy: ?StartupPolicy = null,
+    gpu_process_slot: ?u64 = null,
+    gpu_endpoint_id: ?u64 = null,
+    gpu_policy: ?StartupPolicy = null,
     persistent_fs_process_slot: ?u64 = null,
     persistent_fs_endpoint_id: ?u64 = null,
+    persistent_fs_policy: ?StartupPolicy = null,
+    capctl_request_paddr: u64 = 0,
+    capctl_response_paddr: u64 = 0,
     ready_name_count: usize = 0,
     ready_names: [startup_ready_name_max][]const u8 = [_][]const u8{""} ** startup_ready_name_max,
     cached_execs: [startup_plan_abi.max_startup_program_descriptors]CachedStartupExec = [_]CachedStartupExec{.{}} ** startup_plan_abi.max_startup_program_descriptors,
@@ -1217,10 +1320,12 @@ const LaunchContext = struct {
         while (i < self.bootstrap_handoff.device_count and i < manager_init_bootstrap_abi.max_device_grants) : (i += 1) {
             const grant = self.bootstrap_handoff.device_grants[i];
             if (grant.device_page_paddr != descriptor.device_page_paddr) continue;
-            if (grant.submit_token == 0 or grant.notify_token == 0) return null;
+            if (grant.iommu_token == 0 or grant.submit_token == 0 or grant.notify_token == 0 or grant.command_token == 0) return null;
             return .{
+                .iommu_token = grant.iommu_token,
                 .submit_token = grant.submit_token,
                 .notify_token = grant.notify_token,
+                .command_token = grant.command_token,
             };
         }
         return null;
@@ -1230,13 +1335,270 @@ const LaunchContext = struct {
         if (self.shared_service_registry_source_va) |source_va| return source_va;
         const source_va = allocChildServiceRegistryPage(
             self.window_service,
+            getProcessSlot(),
+            self.capctl_endpoint_id,
             self.block_process_slot,
             self.block_endpoint_id,
+            self.gpu_process_slot,
+            self.gpu_endpoint_id,
             self.persistent_fs_process_slot,
             self.persistent_fs_endpoint_id,
         ) orelse fail("ManagerInit: alloc shared service registry failed\n");
         self.shared_service_registry_source_va = source_va;
         return source_va;
+    }
+
+    fn capctlStatusFlags(self: *const LaunchContext) u64 {
+        var flags: u64 = 0;
+        if (self.block_process_slot != null and self.block_endpoint_id != null) {
+            flags |= capctl_protocol.status_flag_block_present;
+        }
+        if (self.gpu_process_slot != null and self.gpu_endpoint_id != null) {
+            flags |= capctl_protocol.status_flag_gpu_present;
+        }
+        if (self.block_iommu_source_token != 0) flags |= capctl_protocol.status_flag_iommu_active;
+        if (self.block_submit_source_token != 0 and self.block_notify_source_token != 0) {
+            flags |= capctl_protocol.status_flag_virtqueue_active;
+        }
+        if (self.block_command_source_token != 0) flags |= capctl_protocol.status_flag_command_active;
+        return flags;
+    }
+
+    fn commandMaskForProfile(profile: BlockProfile) u64 {
+        const read_bit: u64 = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(queue_abi.CommandOpcodeClass.blk_read)));
+        const write_bit: u64 = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(queue_abi.CommandOpcodeClass.blk_write)));
+        const flush_bit: u64 = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(queue_abi.CommandOpcodeClass.blk_flush)));
+        const identify_bit: u64 = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(queue_abi.CommandOpcodeClass.blk_identify)));
+        return switch (profile) {
+            .full => read_bit | write_bit | flush_bit | identify_bit,
+            .read_only => read_bit,
+            .no_iommu, .no_virtqueue => read_bit | write_bit | flush_bit | identify_bit,
+        };
+    }
+
+    fn prepareCommandProfileSource(self: *LaunchContext, profile: BlockProfile) bool {
+        if (self.block_command_source_token != 0 and self.block_command_source_token != self.block_command_base_token) {
+            const status = revokeQueueCap(queue_abi.encodeCommandCapToken(self.block_command_source_token));
+            if (status != 0) return false;
+            self.block_command_source_token = 0;
+        }
+        const mask = commandMaskForProfile(profile);
+        const derived_encoded = deriveCommandCap(queue_abi.encodeCommandCapToken(self.block_command_base_token), mask);
+        const derived = queue_abi.decodeCommandCapToken(derived_encoded) orelse return false;
+        self.block_command_source_token = derived;
+        return true;
+    }
+
+    fn refreshBlockProfileSources(self: *LaunchContext, profile: BlockProfile) bool {
+        switch (profile) {
+            .full, .read_only => {
+                self.block_iommu_source_token = self.block_iommu_base_token;
+                self.block_submit_source_token = self.block_submit_base_token;
+                self.block_notify_source_token = self.block_notify_base_token;
+            },
+            .no_iommu => {
+                self.block_iommu_source_token = 0;
+                self.block_submit_source_token = self.block_submit_base_token;
+                self.block_notify_source_token = self.block_notify_base_token;
+            },
+            .no_virtqueue => {
+                self.block_iommu_source_token = self.block_iommu_base_token;
+                self.block_submit_source_token = 0;
+                self.block_notify_source_token = 0;
+            },
+        }
+        return self.prepareCommandProfileSource(profile);
+    }
+
+    fn publishCapCtlService(self: *LaunchContext) void {
+        if (self.capctl_endpoint_id != null) return;
+        const endpoint_id = capctl_protocol.endpoint_id;
+        const process_slot = getProcessSlot();
+        if (installEndpoint(endpoint_id, process_slot) != 0) fail("ManagerInit: capctl endpoint install failed\n");
+        if (publishServiceEndpoint(endpoint_id, process_slot) != 0) fail("ManagerInit: capctl endpoint publish failed\n");
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .capctl, process_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| {
+            service_registry_abi.setServiceWithProcessSlot(source_va, .capctl, process_slot, endpoint_id);
+        }
+        self.capctl_endpoint_id = endpoint_id;
+        _ = userLog("ManagerInit: capctl ready\n");
+    }
+
+    fn ensureCapCtlMap(self: *LaunchContext, target_va: u64, paddr: u64, writable: bool, last_paddr: *u64) bool {
+        _ = self;
+        if (paddr < 0x1000) return false;
+        if (last_paddr.* == paddr) return true;
+        if (mapPage(target_va, paddr, writable) != 0) return false;
+        last_paddr.* = paddr;
+        return true;
+    }
+
+    fn writeCapCtlResponse(
+        self: *const LaunchContext,
+        response: *volatile capctl_protocol.Response,
+        opcode: capctl_protocol.Opcode,
+        request_seq: u64,
+        status: capctl_protocol.ResponseStatus,
+        detail: u64,
+    ) void {
+        response.magic = capctl_protocol.magic;
+        response.version = capctl_protocol.version;
+        response.opcode = capctl_protocol.opcodeRaw(opcode);
+        response.status = capctl_protocol.responseStatusRaw(status);
+        response.detail = detail;
+        response.block_process_slot = self.block_process_slot orelse 0;
+        response.block_endpoint_id = self.block_endpoint_id orelse 0;
+        response.status_flags = self.capctlStatusFlags();
+        response.block_profile = capctl_protocol.blockProfileRaw(self.block_profile);
+        response.response_seq = request_seq;
+    }
+
+    fn revokeBlockIommu(self: *LaunchContext) u64 {
+        if (self.block_iommu_source_token == 0) return 0;
+        const status = revokeQueueCap(queue_abi.encodeIommuCapToken(self.block_iommu_source_token));
+        if (status == 0) self.block_iommu_source_token = 0;
+        return status;
+    }
+
+    fn revokeBlockVirtqueue(self: *LaunchContext) u64 {
+        var first_error: u64 = 0;
+        if (self.block_submit_source_token != 0) {
+            const status = revokeQueueCap(queue_abi.encodeVirtqueueCapToken(self.block_submit_source_token));
+            if (status == 0) {
+                self.block_submit_source_token = 0;
+            } else if (first_error == 0) {
+                first_error = status;
+            }
+        }
+        if (self.block_notify_source_token != 0) {
+            const status = revokeQueueCap(queue_abi.encodeVirtqueueCapToken(self.block_notify_source_token));
+            if (status == 0) {
+                self.block_notify_source_token = 0;
+            } else if (first_error == 0) {
+                first_error = status;
+            }
+        }
+        return first_error;
+    }
+
+    fn revokeBlockCommand(self: *LaunchContext) u64 {
+        if (self.block_command_source_token == 0) return 0;
+        const status = revokeQueueCap(queue_abi.encodeCommandCapToken(self.block_command_source_token));
+        if (status == 0) self.block_command_source_token = 0;
+        return status;
+    }
+
+    fn applyBlockProfile(self: *LaunchContext, profile: BlockProfile) capctl_protocol.ResponseStatus {
+        const block_policy = self.block_policy orelse return .unsupported;
+        const persistent_fs_policy = self.persistent_fs_policy orelse return .unsupported;
+        if (!self.refreshBlockProfileSources(profile)) return .kernel_error;
+        self.block_profile = profile;
+        self.launchBlockDriverForPolicy(block_policy);
+        switch (profile) {
+            .full, .read_only => self.launchPersistentFsForPolicy(persistent_fs_policy),
+            .no_iommu, .no_virtqueue => {
+                service_registry_abi.removeService(self.window_service_page.source_va, .persistent_fs);
+                if (self.shared_service_registry_source_va) |source_va| {
+                    service_registry_abi.removeService(source_va, .persistent_fs);
+                }
+                self.persistent_fs_process_slot = null;
+                self.persistent_fs_endpoint_id = null;
+            },
+        }
+        return .ok;
+    }
+
+    fn launchGpuDriverFromExecRequest(self: *LaunchContext) capctl_protocol.ResponseStatus {
+        if (self.gpu_process_slot != null and self.gpu_endpoint_id != null) return .already;
+        if (self.gpu_device == null) return .unavailable;
+        const policy = StartupPolicy{
+            .action = .gpu_driver,
+            .path = rootfs_gpu_driver_path,
+            .name = "gpu",
+            .label = "gpu_driver",
+            .exec_source = .bootfs,
+        };
+        self.launchGpuDriverForPolicy(policy);
+        self.markReadyName("gpu");
+        self.markReadyName("gpu_service");
+        return .ok;
+    }
+
+    fn handleCapCtlRequest(self: *LaunchContext, request_paddr: u64) void {
+        if (!self.ensureCapCtlMap(capctl_request_va, request_paddr, false, &self.capctl_request_paddr)) return;
+        const request: *volatile capctl_protocol.Request = @ptrFromInt(capctl_request_va);
+        if (request.magic != capctl_protocol.magic or
+            request.version != capctl_protocol.version or
+            request.request_seq == 0 or
+            request.response_paddr < 0x1000)
+        {
+            return;
+        }
+        if (!self.ensureCapCtlMap(capctl_response_va, request.response_paddr, true, &self.capctl_response_paddr)) return;
+        const response: *volatile capctl_protocol.Response = @ptrFromInt(capctl_response_va);
+        const opcode = capctl_protocol.decodeOpcode(request.opcode) orelse {
+            self.writeCapCtlResponse(response, .status, request.request_seq, .invalid, request.opcode);
+            return;
+        };
+        switch (opcode) {
+            .status => self.writeCapCtlResponse(response, .status, request.request_seq, .ok, 0),
+            .revoke_iommu => {
+                if (self.block_process_slot == null) {
+                    self.writeCapCtlResponse(response, .revoke_iommu, request.request_seq, .unavailable, 0);
+                    return;
+                }
+                if (self.block_iommu_source_token == 0) {
+                    self.writeCapCtlResponse(response, .revoke_iommu, request.request_seq, .already, 0);
+                    return;
+                }
+                const status = self.revokeBlockIommu();
+                self.writeCapCtlResponse(response, .revoke_iommu, request.request_seq, if (status == 0) .ok else .kernel_error, status);
+            },
+            .revoke_virtqueue => {
+                if (self.block_process_slot == null) {
+                    self.writeCapCtlResponse(response, .revoke_virtqueue, request.request_seq, .unavailable, 0);
+                    return;
+                }
+                if (self.block_submit_source_token == 0 and self.block_notify_source_token == 0) {
+                    self.writeCapCtlResponse(response, .revoke_virtqueue, request.request_seq, .already, 0);
+                    return;
+                }
+                const status = self.revokeBlockVirtqueue();
+                self.writeCapCtlResponse(response, .revoke_virtqueue, request.request_seq, if (status == 0) .ok else .kernel_error, status);
+            },
+            .revoke_command => {
+                if (self.block_process_slot == null) {
+                    self.writeCapCtlResponse(response, .revoke_command, request.request_seq, .unavailable, 0);
+                    return;
+                }
+                if (self.block_command_source_token == 0) {
+                    self.writeCapCtlResponse(response, .revoke_command, request.request_seq, .already, 0);
+                    return;
+                }
+                const status = self.revokeBlockCommand();
+                self.writeCapCtlResponse(response, .revoke_command, request.request_seq, if (status == 0) .ok else .kernel_error, status);
+            },
+            .profile_full => {
+                const status = self.applyBlockProfile(.full);
+                self.writeCapCtlResponse(response, .profile_full, request.request_seq, status, 0);
+            },
+            .profile_read_only => {
+                const status = self.applyBlockProfile(.read_only);
+                self.writeCapCtlResponse(response, .profile_read_only, request.request_seq, status, 0);
+            },
+            .profile_no_iommu => {
+                const status = self.applyBlockProfile(.no_iommu);
+                self.writeCapCtlResponse(response, .profile_no_iommu, request.request_seq, status, 0);
+            },
+            .profile_no_virtqueue => {
+                const status = self.applyBlockProfile(.no_virtqueue);
+                self.writeCapCtlResponse(response, .profile_no_virtqueue, request.request_seq, status, 0);
+            },
+            .launch_gpu => {
+                const status = self.launchGpuDriverFromExecRequest();
+                self.writeCapCtlResponse(response, .launch_gpu, request.request_seq, status, 0);
+            },
+        }
     }
 
     fn ensureSharedStdioBootstrapPage(self: *LaunchContext) u64 {
@@ -1271,7 +1633,11 @@ const LaunchContext = struct {
         const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.notify_token), child_process_slot);
         const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse return false;
         const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse return false;
-        input_bootstrap.writeGrantedQueueTokens(config_source_va, submit_child, notify_child);
+        const iommu_child_encoded = grantQueueCap(queue_abi.encodeIommuCapToken(queue_grant.iommu_token), child_process_slot);
+        const command_child_encoded = grantQueueCap(queue_abi.encodeCommandCapToken(queue_grant.command_token), child_process_slot);
+        const iommu_child = queue_abi.decodeIommuCapToken(iommu_child_encoded) orelse return false;
+        const command_child = queue_abi.decodeCommandCapToken(command_child_encoded) orelse return false;
+        input_bootstrap.writeGrantedCapabilityTokens(config_source_va, iommu_child, submit_child, notify_child, command_child);
         return true;
     }
 
@@ -1400,6 +1766,20 @@ const LaunchContext = struct {
         while (i < policy.provide_count) : (i += 1) self.markReadyName(policy.provide_names[i]);
     }
 
+    fn waitForConfigWord(self: *LaunchContext, base_va: u64, index: usize, expected: u64) void {
+        _ = self;
+        const words: [*]volatile u64 = @ptrFromInt(base_va);
+        var spin_count: usize = 0;
+        while (words[index] != expected) {
+            if (spin_count < 4096) {
+                spin_count += 1;
+                asm volatile ("pause");
+                continue;
+            }
+            _ = waitEvent(false, 1);
+        }
+    }
+
     fn namedDependenciesReady(self: *const LaunchContext, policy: StartupPolicy) bool {
         var i: usize = 0;
         while (i < policy.after_count) : (i += 1) {
@@ -1418,6 +1798,11 @@ const LaunchContext = struct {
         const exec = self.requireExecForPolicy(policy);
         const block_desc = self.block_device;
         const queue_grant = self.findQueueGrant(block_desc) orelse fail("ManagerInit: block queue grant missing\n");
+        if (self.block_iommu_base_token == 0) self.block_iommu_base_token = queue_grant.iommu_token;
+        if (self.block_submit_base_token == 0) self.block_submit_base_token = queue_grant.submit_token;
+        if (self.block_notify_base_token == 0) self.block_notify_base_token = queue_grant.notify_token;
+        if (self.block_command_base_token == 0) self.block_command_base_token = queue_grant.command_token;
+        if (!self.refreshBlockProfileSources(self.block_profile)) fail("ManagerInit: block profile source prepare failed\n");
         const block_geometry = readBlockGeometry(block_desc) orelse fail("ManagerInit: block geometry failed\n");
         const endpoint_id = allocDynamicServiceEndpointId();
         const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc block driver config page failed\n");
@@ -1476,16 +1861,116 @@ const LaunchContext = struct {
         if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: block endpoint publish failed\n");
         if (!ensureDeviceMmioCapsInstalled(block_desc)) fail("ManagerInit: block MMIO install failed\n");
         if (!grantDeviceMmioPages(block_desc, child_slot)) fail("ManagerInit: block MMIO grant failed\n");
-        const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.submit_token), child_slot);
-        const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.notify_token), child_slot);
-        const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse fail("ManagerInit: block submit grant failed\n");
-        const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse fail("ManagerInit: block notify grant failed\n");
-        block_bootstrap.writeGrantedQueueTokens(config_source_va, submit_child, notify_child);
+        const iommu_child_encoded = if (self.block_iommu_source_token != 0)
+            grantQueueCap(queue_abi.encodeIommuCapToken(self.block_iommu_source_token), child_slot)
+        else
+            @as(u64, 0);
+        const submit_child_encoded = if (self.block_submit_source_token != 0)
+            grantQueueCap(queue_abi.encodeQueueCapToken(self.block_submit_source_token), child_slot)
+        else
+            @as(u64, 0);
+        const notify_child_encoded = if (self.block_notify_source_token != 0)
+            grantQueueCap(queue_abi.encodeQueueCapToken(self.block_notify_source_token), child_slot)
+        else
+            @as(u64, 0);
+        const command_child_encoded = grantQueueCap(queue_abi.encodeCommandCapToken(self.block_command_source_token), child_slot);
+        const iommu_child = if (self.block_iommu_source_token != 0)
+            (queue_abi.decodeIommuCapToken(iommu_child_encoded) orelse fail("ManagerInit: block iommu grant failed\n"))
+        else
+            @as(u64, 0);
+        const submit_child = if (self.block_submit_source_token != 0)
+            (queue_abi.decodeQueueCapToken(submit_child_encoded) orelse fail("ManagerInit: block submit grant failed\n"))
+        else
+            @as(u64, 0);
+        const notify_child = if (self.block_notify_source_token != 0)
+            (queue_abi.decodeQueueCapToken(notify_child_encoded) orelse fail("ManagerInit: block notify grant failed\n"))
+        else
+            @as(u64, 0);
+        const command_child = queue_abi.decodeCommandCapToken(command_child_encoded) orelse fail("ManagerInit: block command grant failed\n");
+        block_bootstrap.writeGrantedCapabilityTokens(config_source_va, iommu_child, submit_child, notify_child, command_child);
         _ = signalEndpoint(endpoint_id);
-        service_registry_abi.addServiceWithProcessSlot(self.window_service_page.source_va, .block, child_slot, endpoint_id);
-        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.addServiceWithProcessSlot(source_va, .block, child_slot, endpoint_id);
+        self.waitForConfigWord(config_source_va, block_bootstrap.driver_status_index, block_bootstrap.driver_status_ready);
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .block, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .block, child_slot, endpoint_id);
         self.block_process_slot = child_slot;
         self.block_endpoint_id = endpoint_id;
+        self.block_policy = policy;
+    }
+
+    fn launchGpuDriverForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
+        const gpu_desc = self.gpu_device orelse fail("ManagerInit: gpu device descriptor missing\n");
+        const exec = self.requireExecForPolicy(policy);
+        const queue_grant = self.findQueueGrant(gpu_desc) orelse fail("ManagerInit: gpu queue grant missing\n");
+        const endpoint_id = gpu_protocol.endpoint_id;
+        const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc gpu driver config page failed\n");
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+        gpu_bootstrap.writeConfigPage(config_source_va, .{
+            .endpoint_id = endpoint_id,
+            .common_page_paddr = gpu_desc.common_page_paddr,
+            .notify_page_paddr = gpu_desc.notify_page_paddr,
+            .isr_page_paddr = gpu_desc.isr_page_paddr,
+            .device_page_paddr = gpu_desc.device_page_paddr,
+            .common_page_offset = gpu_desc.common_page_offset,
+            .notify_page_offset = gpu_desc.notify_page_offset,
+            .isr_page_offset = gpu_desc.isr_page_offset,
+            .device_page_offset = gpu_desc.device_page_offset,
+            .notify_off_multiplier = gpu_desc.notify_off_multiplier,
+        });
+        gpu_bootstrap_pages_storage[0] = .{
+            .source_va = config_source_va,
+            .target_va = process_abi.standard_config_target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        gpu_bootstrap_pages_storage[1] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        gpu_bootstrap_pages_storage[2] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        gpu_bootstrap_pages_storage[3] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        gpu_bootstrap_table_storage = .{};
+        gpu_bootstrap_table_storage.page_count = 4;
+        gpu_bootstrap_table_storage.page_descriptors[0] = gpu_bootstrap_pages_storage[0];
+        gpu_bootstrap_table_storage.page_descriptors[1] = gpu_bootstrap_pages_storage[1];
+        gpu_bootstrap_table_storage.page_descriptors[2] = gpu_bootstrap_pages_storage[2];
+        gpu_bootstrap_table_storage.page_descriptors[3] = gpu_bootstrap_pages_storage[3];
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &gpu_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", policy.label, "failed");
+            self.logRoleHex(policy.label, " spawn ret=", spawned);
+            fail("ManagerInit: gpu driver spawn failed\n");
+        };
+        self.logRoleLine("spawn", policy.label, "ok");
+        if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: gpu endpoint install failed\n");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: gpu endpoint publish failed\n");
+        if (!ensureDeviceMmioCapsInstalled(gpu_desc)) fail("ManagerInit: gpu MMIO install failed\n");
+        if (!grantDeviceMmioPages(gpu_desc, child_slot)) fail("ManagerInit: gpu MMIO grant failed\n");
+        const iommu_child_encoded = grantQueueCap(queue_abi.encodeIommuCapToken(queue_grant.iommu_token), child_slot);
+        const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.submit_token), child_slot);
+        const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(queue_grant.notify_token), child_slot);
+        const command_child_encoded = grantQueueCap(queue_abi.encodeCommandCapToken(queue_grant.command_token), child_slot);
+        const iommu_child = queue_abi.decodeIommuCapToken(iommu_child_encoded) orelse fail("ManagerInit: gpu iommu grant failed\n");
+        const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse fail("ManagerInit: gpu submit grant failed\n");
+        const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse fail("ManagerInit: gpu notify grant failed\n");
+        const command_child = queue_abi.decodeCommandCapToken(command_child_encoded) orelse fail("ManagerInit: gpu command grant failed\n");
+        gpu_bootstrap.writeGrantedCapabilityTokens(config_source_va, iommu_child, submit_child, notify_child, 0, 0, command_child);
+        _ = signalEndpoint(endpoint_id);
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .gpu, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .gpu, child_slot, endpoint_id);
+        self.gpu_process_slot = child_slot;
+        self.gpu_endpoint_id = endpoint_id;
+        self.gpu_policy = policy;
     }
 
     fn launchPersistentFsForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
@@ -1494,8 +1979,12 @@ const LaunchContext = struct {
         const endpoint_id = allocDynamicServiceEndpointId();
         const registry_source_va = allocChildServiceRegistryPage(
             self.window_service,
+            getProcessSlot(),
+            self.capctl_endpoint_id,
             self.block_process_slot,
             self.block_endpoint_id,
+            self.gpu_process_slot,
+            self.gpu_endpoint_id,
             self.persistent_fs_process_slot,
             self.persistent_fs_endpoint_id,
         ) orelse fail("ManagerInit: alloc persistent fs registry failed\n");
@@ -1547,16 +2036,19 @@ const LaunchContext = struct {
         self.logRoleLine("spawn", policy.label, "ok");
         if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: persistent fs endpoint install failed\n");
         if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: persistent fs endpoint publish failed\n");
-        service_registry_abi.addServiceWithProcessSlot(self.window_service_page.source_va, .persistent_fs, child_slot, endpoint_id);
-        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.addServiceWithProcessSlot(source_va, .persistent_fs, child_slot, endpoint_id);
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .persistent_fs, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .persistent_fs, child_slot, endpoint_id);
+        self.waitForConfigWord(config_source_va, persistent_fs_bootstrap.server_status_index, persistent_fs_bootstrap.server_status_ready);
         self.persistent_fs_process_slot = child_slot;
         self.persistent_fs_endpoint_id = endpoint_id;
+        self.persistent_fs_policy = policy;
     }
 
     fn launchPolicy(self: *LaunchContext, policy: StartupPolicy) void {
         self.ensurePolicyResources(policy);
         switch (policy.action) {
             .block_driver => self.launchBlockDriverForPolicy(policy),
+            .gpu_driver => self.launchGpuDriverForPolicy(policy),
             .persistent_fs_server => self.launchPersistentFsForPolicy(policy),
             else => startupManifestFail("ManagerInit: unsupported policy action\n"),
         }
@@ -1607,6 +2099,7 @@ fn managerMain() noreturn {
     const primary_display = requirePrimaryDisplayDescriptor();
     const keyboard_input = requireInputDeviceDescriptor(bootstrap_handoff, .keyboard, "ManagerInit: keyboard input descriptor missing\n");
     const block_device = requireBlockDeviceDescriptor(bootstrap_handoff, .virtio_blk, "ManagerInit: block device descriptor missing\n");
+    const gpu_device = findGpuDeviceDescriptor(bootstrap_handoff);
     const window_service_page = requireSpawnPageDescriptor(.service_config, .window_service, "ManagerInit: window service descriptor missing\n");
 
     const window_service = service_registry_abi.findService(window_service_page.source_va, .window);
@@ -1616,30 +2109,42 @@ fn managerMain() noreturn {
         .primary_display = primary_display,
         .keyboard_input = keyboard_input,
         .block_device = block_device,
+        .gpu_device = gpu_device,
         .window_service_page = window_service_page,
         .window_service = window_service,
         .has_boot_display = window_service != null,
     };
     launch_ctx_storage.ensureBootFsArchive();
+    if (openExecFromBootFs(rootfs_gpu_driver_path, launch_ctx_storage.bootstrap_handoff.bootfs_vm_token)) |exec| {
+        launch_ctx_storage.storeCachedExec(.bootfs, rootfs_gpu_driver_path, exec);
+    }
     var startup_manifest_from_rootfs = false;
     const startup_manifest = blk: {
+        if (loadStartupManifestFromBootFs(rootfs_startup_manifest_path)) |manifest| break :blk manifest;
         launch_ctx_storage.ensureRootFsReader();
         if (loadStartupManifestFromRootFs(rootfs_startup_manifest_path)) |manifest| {
             startup_manifest_from_rootfs = true;
             break :blk manifest;
         }
-        break :blk loadStartupManifestFromBootFs(rootfs_startup_manifest_path) orelse fail("ManagerInit: load startup manifest failed\n");
+        fail("ManagerInit: load startup manifest failed\n");
     };
     _ = userLog(if (startup_manifest_from_rootfs)
         "ManagerInit: rootfs startup manifest ready\n"
     else
         "ManagerInit: bootfs startup manifest ready\n");
-    if (!launch_ctx_storage.has_boot_display) {
-        _ = launch_ctx_storage.requireShellExec();
-    }
     runStartupManifest(&launch_ctx_storage, startup_manifest);
+    if (!launch_ctx_storage.has_boot_display) {
+        launch_ctx_storage.requireBootDisplay();
+    }
+    launch_ctx_storage.publishCapCtlService();
 
-    while (true) asm volatile ("pause");
+    while (true) {
+        const received = waitEvent(true, 1);
+        if (received >= cap_transfer_abi.transfer_id_min) {
+            const request_paddr = acceptCapTransfer(received);
+            if (request_paddr >= 0x1000) launch_ctx_storage.handleCapCtlRequest(request_paddr);
+        }
+    }
 }
 
 pub export fn _start() noreturn {

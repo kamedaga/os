@@ -13,6 +13,7 @@ pactl run
 ```
 
 - `pactl setup` is the normal incremental path.
+- `pactl setup` now forces a userland rebuild before syncing, including kinds that are otherwise skipped during normal incremental `build userland`.
 - `pactl setup full` recreates `disk.img` and rebuilds the runtime image from scratch.
 - `pactl run --timed` records boot timing.
 - `pactl run --no-kvm` disables KVM.

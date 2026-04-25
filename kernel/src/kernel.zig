@@ -4,6 +4,7 @@ const capability = @import("capability.zig");
 const abi_root = @import("kernel_abi_root");
 const cap_transfer_abi = abi_root.cap_transfer_abi;
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
+const device_capabilities = @import("device_capabilities.zig");
 pub const initial_process_count: usize = 8;
 pub const process_count: usize = 32;
 pub const max_thread_slots: usize = 16;
@@ -98,7 +99,6 @@ pub const PendingCapTransfer = struct {
     retain_sender: bool = false,
 };
 
-
 pub const Region = struct {
     id: u64,
 };
@@ -147,6 +147,14 @@ pub const CNode = struct {
 
     pub fn add(self: *CNode, cap: Capability) KernelError!void {
         if (self.findIndex(cap.paddr) != null) return KernelError.InvalidState;
+        if (self.len >= self.caps.len) {
+            return KernelError.TableFull;
+        }
+        self.caps[self.len] = cap;
+        self.len += 1;
+    }
+
+    pub fn addAssumeFresh(self: *CNode, cap: Capability) KernelError!void {
         if (self.len >= self.caps.len) {
             return KernelError.TableFull;
         }
@@ -738,10 +746,6 @@ pub const DmaDeviceId = dma_mapping_manager.DmaDeviceId;
 pub const DmaDirection = dma_mapping_manager.DmaDirection;
 pub const DmaMappingState = dma_mapping_manager.DmaMappingState;
 pub const DmaMapping = dma_mapping_manager.DmaMapping;
-pub const QueueOperation = dma_mapping_manager.QueueOperation;
-pub const QueueCapability = dma_mapping_manager.QueueCapability;
-const iommu_devices = [_]DmaDeviceId{ .virtio_gpu, .virtio_input, .virtio_blk };
-
 const IommuMapEntry = struct {
     valid: bool = false,
     principal: PrincipalId = default_process_principal,
@@ -782,7 +786,9 @@ pub const KernelState = struct {
     dma_restore: [max_total_caps]DmaRestoreEntry = [_]DmaRestoreEntry{.{}} ** max_total_caps,
     dma_mappings: dma_mapping_manager.DmaMappingTable = .{},
     dma_device_domains: dma_mapping_manager.DeviceDomainTable = .{},
-    queue_caps: dma_mapping_manager.QueueCapabilityTable = .{},
+    iommu_caps: device_capabilities.IommuCapabilityTable = .{},
+    queue_caps: device_capabilities.QueueCapabilityTable = .{},
+    command_caps: device_capabilities.CommandCapabilityTable = .{},
     iommu: IommuNoCapDriverState = .{},
     next_cap_id: u64 = 1,
     next_transfer_id: u64 = cap_transfer_abi.transfer_id_min,
@@ -851,17 +857,7 @@ pub const KernelState = struct {
         return self.iommu.mode;
     }
 
-    fn principalHasQueueCapForDevice(self: *const KernelState, principal: PrincipalId, device: DmaDeviceId) bool {
-        const owner_raw: u8 = @intCast(@intFromEnum(principal));
-        for (self.queue_caps.entries) |cap| {
-            if (!cap.valid) continue;
-            if (cap.owner_principal_raw != owner_raw) continue;
-            if (cap.device == device) return true;
-        }
-        return false;
-    }
-
-    fn iommuFindMappingIndex(self: *const KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) ?usize {
+    pub fn iommuFindMappingIndex(self: *const KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) ?usize {
         var i: usize = 0;
         while (i < self.iommu.mappings.len) : (i += 1) {
             const entry = self.iommu.mappings[i];
@@ -871,7 +867,7 @@ pub const KernelState = struct {
         return null;
     }
 
-    fn iommuMap(self: *KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) KernelError!void {
+    pub fn iommuMap(self: *KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) KernelError!void {
         if (self.iommuFindMappingIndex(principal, device, paddr) != null) return;
         var i: usize = 0;
         while (i < self.iommu.mappings.len) : (i += 1) {
@@ -887,20 +883,9 @@ pub const KernelState = struct {
         return KernelError.TableFull;
     }
 
-    fn iommuUnmap(self: *KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) void {
+    pub fn iommuUnmap(self: *KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) void {
         const index = self.iommuFindMappingIndex(principal, device, paddr) orelse return;
         self.iommu.mappings[index] = .{};
-    }
-
-    noinline fn callIommuAuditHook(
-        hook: *const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void,
-        self: *const KernelState,
-        principal: PrincipalId,
-        paddr: u64,
-        mapped: bool,
-        reason: IommuSyncReason,
-    ) void {
-        hook(self, principal, paddr, mapped, reason);
     }
 
     noinline fn callPteSyncHook(
@@ -910,56 +895,6 @@ pub const KernelState = struct {
         paddr: u64,
     ) void {
         hook(self, principal, paddr);
-    }
-
-    fn syncIommuForPrincipalDevicePaddr(
-        self: *KernelState,
-        principal: PrincipalId,
-        device: DmaDeviceId,
-        paddr: u64,
-        reason: IommuSyncReason,
-    ) KernelError!void {
-        const had_mapping = self.iommuFindMappingIndex(principal, device, paddr) != null;
-        const cap = self.getTableConst(principal).find(paddr);
-        if (cap) |c| {
-            if (c.rights.dma and self.principalHasQueueCapForDevice(principal, device)) {
-                try self.iommuMap(principal, device, paddr);
-                if (!had_mapping) {
-                    if (self.iommu_audit_hook) |hook| {
-                        callIommuAuditHook(hook, self, principal, paddr, true, reason);
-                    }
-                }
-                return;
-            }
-        }
-        self.iommuUnmap(principal, device, paddr);
-        if (had_mapping) {
-            if (self.iommu_audit_hook) |hook| {
-                callIommuAuditHook(hook, self, principal, paddr, false, reason);
-            }
-        }
-    }
-
-    noinline fn syncIommuForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64, reason: IommuSyncReason) KernelError!void {
-        if (self.iommu.mode == .off) return;
-        inline for (iommu_devices) |device| {
-            try self.syncIommuForPrincipalDevicePaddr(principal, device, paddr, reason);
-        }
-    }
-
-    pub fn iommuHasMappingForPrincipalForTest(self: *const KernelState, principal: PrincipalId, paddr: u64) bool {
-        inline for (iommu_devices) |device| {
-            if (self.iommuFindMappingIndex(principal, device, paddr) != null) return true;
-        }
-        return false;
-    }
-
-    fn syncAllIommuForPrincipal(self: *KernelState, principal: PrincipalId, reason: IommuSyncReason) KernelError!void {
-        const table = self.getTableConst(principal);
-        var i: usize = 0;
-        while (i < table.len) : (i += 1) {
-            try self.syncIommuForPrincipalPaddr(principal, table.caps[i].paddr, reason);
-        }
     }
 
     fn isRightsSubset(child: Rights, parent: Rights) bool {
@@ -1018,7 +953,7 @@ pub const KernelState = struct {
         return principal == .Device0;
     }
 
-    fn requireActiveProcess(self: *const KernelState, principal: PrincipalId) KernelError!void {
+    pub fn requireActiveProcess(self: *const KernelState, principal: PrincipalId) KernelError!void {
         const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
         if (!self.process_descriptors[index].active) return KernelError.InvalidState;
     }
@@ -1288,69 +1223,6 @@ pub const KernelState = struct {
 
     pub fn dmaDeviceDomainStage1(self: *const KernelState, device: DmaDeviceId) ?u32 {
         return self.dma_device_domains.domainFor(device);
-    }
-
-    pub fn queueCapGrantStage2(
-        self: *KernelState,
-        owner: PrincipalId,
-        device: DmaDeviceId,
-        queue_index: u16,
-        allow_submit: bool,
-        allow_notify: bool,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-        const token = self.queue_caps.alloc(
-            @intFromEnum(owner),
-            device,
-            queue_index,
-            allow_submit,
-            allow_notify,
-        ) catch |err| switch (err) {
-            error.InvalidState => KernelError.InvalidState,
-            error.TableFull => KernelError.TableFull,
-            else => KernelError.InvalidState,
-        };
-        try self.syncAllIommuForPrincipal(owner, .grant_dma);
-        return token;
-    }
-
-    pub fn queueCapAuthorizeStage2(
-        self: *const KernelState,
-        owner: PrincipalId,
-        token: u64,
-        queue_index: u16,
-        op: QueueOperation,
-    ) KernelError!void {
-        try self.requireActiveProcess(owner);
-        const cap = self.queue_caps.findByToken(token) orelse return KernelError.CapabilityNotFound;
-        if (cap.owner_principal_raw != @intFromEnum(owner)) return KernelError.InvalidState;
-        if (cap.queue_index != queue_index) return KernelError.InvalidState;
-        switch (op) {
-            .submit => if (!cap.allow_submit) return KernelError.InvalidState,
-            .notify => if (!cap.allow_notify) return KernelError.InvalidState,
-        }
-    }
-
-    pub fn grantQueueCapStage2(
-        self: *KernelState,
-        owner: PrincipalId,
-        child: PrincipalId,
-        token: u64,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-        try self.requireActiveProcess(child);
-        const child_token = self.queue_caps.grant(
-            @intFromEnum(owner),
-            @intFromEnum(child),
-            token,
-        ) catch |err| switch (err) {
-            error.NotFound => return KernelError.CapabilityNotFound,
-            error.Denied => return KernelError.InvalidState,
-            error.InvalidState => return KernelError.InvalidState,
-            error.TableFull => return KernelError.TableFull,
-        };
-        try self.syncAllIommuForPrincipal(child, .grant_dma);
-        return child_token;
     }
 
     pub fn getRegion(self: *KernelState, region_id: u64) ?*Region {
@@ -1656,7 +1528,7 @@ pub const KernelState = struct {
             hook(self, requester, .after_memset, cap.paddr);
         }
         const root_id = self.allocCapId();
-        try self.getTable(requester).add(.{
+        try self.getTable(requester).addAssumeFresh(.{
             .paddr = cap.paddr,
             .rights = .{
                 .cpu_read = true,
@@ -1903,7 +1775,7 @@ pub const KernelState = struct {
                 if (page_table.findByCapId(cap_id)) |page_cap| {
                     const removed_paddr = page_cap.paddr;
                     _ = page_table.removeByCapId(cap_id);
-                    try self.syncIommuForPrincipalPaddr(@enumFromInt(pidx), removed_paddr, .revoke);
+                    try device_capabilities.syncIommuForPrincipalPaddr(self, @enumFromInt(pidx), removed_paddr, .revoke);
                     if (self.pte_sync_hook) |hook| {
                         callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);
                     }
@@ -1965,8 +1837,8 @@ pub const KernelState = struct {
         moved.rights = rights;
         _ = src.removeByPaddr(paddr);
         try self.getTable(to).add(moved);
-        try self.syncIommuForPrincipalPaddr(from, paddr, .move_from);
-        try self.syncIommuForPrincipalPaddr(to, paddr, .move_to);
+        try device_capabilities.syncIommuForPrincipalPaddr(self, from, paddr, .move_from);
+        try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, .move_to);
         if (self.pte_sync_hook) |hook| {
             callPteSyncHook(hook, self, from, paddr);
             callPteSyncHook(hook, self, to, paddr);
@@ -1990,18 +1862,48 @@ pub const KernelState = struct {
         if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
 
         const child_id = self.allocCapId();
-        try self.getTable(to).add(.{
+        try self.getTable(to).addAssumeFresh(.{
             .paddr = paddr,
             .rights = rights,
             .cap_id = child_id,
             .root_cap_id = src_cap.root_cap_id,
             .parent_cap_id = src_cap.cap_id,
         });
-        try self.syncIommuForPrincipalPaddr(to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
+        try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
         if (self.pte_sync_hook) |hook| {
             if (!capability.principalHasMappedPaddr(to, paddr)) return;
             callPteSyncHook(hook, self, to, paddr);
         }
+    }
+
+    pub fn grantCapToFreshUnmappedProcess(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        paddr: u64,
+        rights: Rights,
+    ) KernelError!void {
+        // For spawn-time bootstrap pages the child has just been created and the
+        // target paddr is not mapped yet, so non-DMA grants do not need IOMMU or
+        // PTE synchronization scans.
+        if (rights.dma) return KernelError.InvalidState;
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+
+        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
+        if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+        if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
+
+        const child_id = self.allocCapId();
+        try self.getTable(to).addAssumeFresh(.{
+            .paddr = paddr,
+            .rights = rights,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
     }
 
     pub fn grantCapsBatch(
@@ -2041,7 +1943,7 @@ pub const KernelState = struct {
                 .root_cap_id = src_cap.root_cap_id,
                 .parent_cap_id = src_cap.cap_id,
             });
-            try self.syncIommuForPrincipalPaddr(to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
+            try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
         }
     }
 
@@ -2212,7 +2114,7 @@ pub const KernelState = struct {
                 const cap = table.findByCapId(cap_id) orelse continue;
                 const removed_paddr = cap.paddr;
                 _ = table.removeByCapId(cap_id);
-                try self.syncIommuForPrincipalPaddr(@enumFromInt(pidx), removed_paddr, .revoke);
+                try device_capabilities.syncIommuForPrincipalPaddr(self, @enumFromInt(pidx), removed_paddr, .revoke);
                 if (self.pte_sync_hook) |hook| {
                     callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);
                 }
@@ -2260,21 +2162,77 @@ test "dma mapping manager stage1 device domain bind" {
 
 test "queue cap stage2 authorize submit and notify" {
     var s = KernelState.initPhase1();
-    const submit_token = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, false);
-    const notify_token = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, false, true);
+    const submit_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
+    const notify_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, false, true);
 
-    try s.queueCapAuthorizeStage2(.Process1, submit_token, 0, .submit);
-    try s.queueCapAuthorizeStage2(.Process1, notify_token, 0, .notify);
+    try device_capabilities.queueCapAuthorizeStage2(&s, .Process1, submit_token, 0, .submit);
+    try device_capabilities.queueCapAuthorizeStage2(&s, .Process1, notify_token, 0, .notify);
 
-    try std.testing.expectError(KernelError.InvalidState, s.queueCapAuthorizeStage2(.Process1, submit_token, 0, .notify));
-    try std.testing.expectError(KernelError.InvalidState, s.queueCapAuthorizeStage2(.Process1, notify_token, 0, .submit));
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.queueCapAuthorizeStage2(&s, .Process1, submit_token, 0, .notify));
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.queueCapAuthorizeStage2(&s, .Process1, notify_token, 0, .submit));
 }
 
 test "queue cap stage2 rejects owner mismatch" {
     var s = KernelState.initPhase1();
-    const token = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, true);
-    try std.testing.expectError(KernelError.InvalidState, s.queueCapAuthorizeStage2(.Process0, token, 0, .submit));
+    const token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, true);
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.queueCapAuthorizeStage2(&s, .Process0, token, 0, .submit));
 }
+
+test "device queue cap revoke removes descendants" {
+    var s = KernelState.initPhase1();
+    const root = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, true);
+    const child = try device_capabilities.grantQueueCapStage2(&s, .Process1, .Process2, root);
+
+    try device_capabilities.queueCapAuthorizeStage2(&s, .Process2, child, 0, .submit);
+    try device_capabilities.revokeDeviceCapStage2(&s, .Process1, .virtqueue, root);
+
+    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.queueCapAuthorizeStage2(&s, .Process1, root, 0, .submit));
+    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.queueCapAuthorizeStage2(&s, .Process2, child, 0, .submit));
+}
+
+test "command cap derive subset preserves lineage and revoke" {
+    var s = KernelState.initPhase1();
+    const full_mask = commandOpcodeBitForTest(.blk_read) |
+        commandOpcodeBitForTest(.blk_write) |
+        commandOpcodeBitForTest(.blk_flush);
+    const read_mask = commandOpcodeBitForTest(.blk_read);
+    const root = try device_capabilities.commandCapGrantStage2(&s, .Process1, .virtio_blk, full_mask);
+    const subset = try device_capabilities.deriveCommandCapStage2(&s, .Process1, root, read_mask);
+    const child = try device_capabilities.grantCommandCapStage2(&s, .Process1, .Process2, subset);
+
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, .virtio_blk, .blk_read);
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, .virtio_blk, .blk_write));
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process2, child, .virtio_blk, .blk_read);
+
+    try device_capabilities.revokeDeviceCapStage2(&s, .Process1, .command, subset);
+
+    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, .virtio_blk, .blk_read));
+    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.commandCapAuthorizeStage2(&s, .Process2, child, .virtio_blk, .blk_read));
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, root, .virtio_blk, .blk_write);
+}
+
+test "gpu command cap isolates virgl submit from scanout" {
+    var s = KernelState.initPhase1();
+    const full_mask = commandOpcodeBitForTest(.gpu_admin) |
+        commandOpcodeBitForTest(.gpu_virgl_context) |
+        commandOpcodeBitForTest(.gpu_virgl_resource) |
+        commandOpcodeBitForTest(.gpu_virgl_submit) |
+        commandOpcodeBitForTest(.gpu_fence);
+    const submit_mask = commandOpcodeBitForTest(.gpu_virgl_submit) |
+        commandOpcodeBitForTest(.gpu_fence);
+    const root = try device_capabilities.commandCapGrantStage2(&s, .Process1, .virtio_gpu, full_mask);
+    const submit_only = try device_capabilities.deriveCommandCapStage2(&s, .Process1, root, submit_mask);
+
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_gpu, .gpu_virgl_submit);
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_gpu, .gpu_fence);
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_gpu, .gpu_scanout));
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_blk, .gpu_virgl_submit));
+}
+
+fn commandOpcodeBitForTest(opcode: device_capabilities.CommandOpcodeClass) u64 {
+    return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(opcode)));
+}
+
 test "dma mapping manager stage1 rejects invalid transition" {
     var s = KernelState.initPhase1();
     const token = try s.dmaMapCreateStage1(
@@ -2580,30 +2538,30 @@ test "sendCapOnEndpoint requires endpoint capability" {
 test "iommu no-cap-driver shadow maps dma grant to compositor" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
-    _ = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, false);
+    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
         .cpu_write = false,
         .dma = true,
     });
-    try std.testing.expect(s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+    try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
     try s.revokeCapTree(.Process1, 0x1000);
-    try std.testing.expect(!s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+    try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 }
 
 test "iommu no-cap-driver does not map non-dma grant" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
-    _ = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, false);
+    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
         .cpu_write = false,
         .dma = false,
     });
-    try std.testing.expect(!s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+    try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 }
 
 test "queue cap grant syncs existing dma grant" {
@@ -2615,10 +2573,10 @@ test "queue cap grant syncs existing dma grant" {
         .cpu_write = false,
         .dma = true,
     });
-    try std.testing.expect(!s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+    try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
-    _ = try s.queueCapGrantStage2(.Process1, .virtio_gpu, 0, true, false);
-    try std.testing.expect(s.iommuHasMappingForPrincipalForTest(.Process1, 0x1000));
+    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
+    try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 }
 
 test "sendCapOnEndpoint rejects missing endpoint" {

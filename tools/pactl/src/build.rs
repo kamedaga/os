@@ -16,6 +16,7 @@ pub struct BuildArtifact {
 pub struct BuildOptions {
     pub force: bool,
     pub warn_stale_cargo: bool,
+    pub ignore_skip_kinds: bool,
 }
 
 impl BuildOptions {
@@ -23,6 +24,7 @@ impl BuildOptions {
         Self {
             force: false,
             warn_stale_cargo: true,
+            ignore_skip_kinds: false,
         }
     }
 
@@ -30,6 +32,15 @@ impl BuildOptions {
         Self {
             force: true,
             warn_stale_cargo: false,
+            ignore_skip_kinds: false,
+        }
+    }
+
+    pub const fn setup() -> Self {
+        Self {
+            force: true,
+            warn_stale_cargo: false,
+            ignore_skip_kinds: true,
         }
     }
 }
@@ -50,7 +61,7 @@ pub fn build_userland(
     } else {
         apps
     };
-    let allow_skipped_kind_build = app_filter.is_some();
+    let allow_skipped_kind_build = app_filter.is_some() || options.ignore_skip_kinds;
 
     let mut built = Vec::with_capacity(selected.len());
     for app in selected {
@@ -432,6 +443,7 @@ fn normalize_slashes(path: &str) -> String {
 
 fn run_command(label: &str, cmd: &mut Command) -> Result<(), String> {
     let command_debug = format!("{cmd:?}");
+    eprintln!("pactl: running {label}: {command_debug}");
     let status = cmd
         .status()
         .map_err(|err| format!("failed to run {label}: {err}"))?;

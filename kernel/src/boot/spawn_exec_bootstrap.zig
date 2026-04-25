@@ -150,7 +150,7 @@ pub fn installPage(
         hooks.write("spawn_exec bootstrap no write right\n");
         return hooks.syscall_err_invalid;
     }
-    hooks.state.grantCap(caller, child, bootstrap_paddr, .{
+    hooks.state.grantCapToFreshUnmappedProcess(caller, child, bootstrap_paddr, .{
         .cpu_read = true,
         .cpu_write = writable,
         .dma = false,

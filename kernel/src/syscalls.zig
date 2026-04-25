@@ -1,6 +1,7 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
+const device_capabilities = @import("device_capabilities.zig");
 const abi_root = @import("kernel_abi_root");
 const cap_transfer_abi = abi_root.cap_transfer_abi;
 const image_abi = abi_root.image_abi;
@@ -45,6 +46,13 @@ const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
 const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
 const syscall_process_exit: u64 = process_abi.syscall_process_exit;
+const syscall_iommu_authorize: u64 = queue_abi.syscall_iommu_authorize;
+const syscall_command_authorize: u64 = queue_abi.syscall_command_authorize;
+const syscall_dma_map_create: u64 = queue_abi.syscall_dma_map_create;
+const syscall_dma_map_set_state: u64 = queue_abi.syscall_dma_map_set_state;
+const syscall_dma_map_release: u64 = queue_abi.syscall_dma_map_release;
+const syscall_revoke_device_cap: u64 = queue_abi.syscall_revoke_cap;
+const syscall_derive_command_cap: u64 = queue_abi.syscall_derive_command_cap;
 const syscall_install_mmio_cap: u64 = 0x2F;
 const syscall_install_caps_batch: u64 = 0x32;
 const syscall_publish_service_endpoint: u64 = 0x33;
@@ -91,7 +99,7 @@ pub const Hooks = struct {
     consume_pending_signal_for_principal: *const fn (kernel.PrincipalId) bool,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64) bool,
-    log_queue_cap_deny: *const fn (kernel.PrincipalId, u64, u16, kernel.QueueOperation, anyerror) void,
+    log_queue_cap_deny: *const fn (kernel.PrincipalId, u64, u16, device_capabilities.QueueOperation, anyerror) void,
     log_race_send_cap: *const fn (kernel.PrincipalId, ?kernel.PrincipalId, u64, u64, []const u8) void,
     log_race_switch: *const fn (usize, usize, []const u8) void,
     exit_current_process: *const fn (kernel.PrincipalId, u8, *TrapFrame) void,
@@ -408,12 +416,74 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         syscall_queue_submit, syscall_queue_notify => {
             const queue_token = frame.rdi;
             const queue_index: u16 = @truncate(frame.rsi);
-            const op: kernel.QueueOperation = if (frame.rax == syscall_queue_submit) .submit else .notify;
-            state.queueCapAuthorizeStage2(proc, queue_token, queue_index, op) catch |err| {
+            const op: device_capabilities.QueueOperation = if (frame.rax == syscall_queue_submit) .submit else .notify;
+            device_capabilities.queueCapAuthorizeStage2(state, proc, queue_token, queue_index, op) catch |err| {
                 h.log_queue_cap_deny(proc, queue_token, queue_index, op, err);
                 return syscall_err_invalid;
             };
             return syscall_ok;
+        },
+        syscall_iommu_authorize => {
+            const device: kernel.DmaDeviceId = std.meta.intToEnum(kernel.DmaDeviceId, @as(u8, @truncate(frame.rsi))) catch return syscall_err_invalid;
+            const op: device_capabilities.IommuOperation = std.meta.intToEnum(device_capabilities.IommuOperation, @as(u8, @truncate(frame.rdx))) catch return syscall_err_invalid;
+            device_capabilities.iommuCapAuthorizeStage2(state, proc, frame.rdi, device, op) catch return syscall_err_invalid;
+            return syscall_ok;
+        },
+        syscall_command_authorize => {
+            const device: kernel.DmaDeviceId = std.meta.intToEnum(kernel.DmaDeviceId, @as(u8, @truncate(frame.rsi))) catch return syscall_err_invalid;
+            const opcode: device_capabilities.CommandOpcodeClass = std.meta.intToEnum(device_capabilities.CommandOpcodeClass, @as(u8, @truncate(frame.rdx))) catch return syscall_err_invalid;
+            device_capabilities.commandCapAuthorizeStage2(state, proc, frame.rdi, device, opcode) catch return syscall_err_invalid;
+            return syscall_ok;
+        },
+        syscall_dma_map_create => {
+            const device: kernel.DmaDeviceId = std.meta.intToEnum(kernel.DmaDeviceId, @as(u8, @truncate(frame.rdi))) catch return syscall_err_invalid;
+            const direction: kernel.DmaDirection = std.meta.intToEnum(kernel.DmaDirection, @as(u8, @truncate(frame.r8))) catch return syscall_err_invalid;
+            const token = state.dmaMapCreateStage1(proc, device, frame.rsi, frame.rdx, direction) catch |err| switch (err) {
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_invalid,
+            };
+            return queue_abi.encodeDmaMappingToken(token);
+        },
+        syscall_dma_map_set_state => {
+            const mapping = state.dmaMapFindStage1(frame.rdi) orelse return syscall_err_invalid;
+            if (mapping.owner_principal_raw != @intFromEnum(proc)) return syscall_err_invalid;
+            const next_state: kernel.DmaMappingState = std.meta.intToEnum(kernel.DmaMappingState, @as(u8, @truncate(frame.rsi))) catch return syscall_err_invalid;
+            state.dmaMapSetStateStage1(frame.rdi, next_state) catch |err| switch (err) {
+                kernel.KernelError.CapabilityNotFound => return syscall_err_invalid,
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                else => return syscall_err_invalid,
+            };
+            return syscall_ok;
+        },
+        syscall_dma_map_release => {
+            const mapping = state.dmaMapFindStage1(frame.rdi) orelse return syscall_err_invalid;
+            if (mapping.owner_principal_raw != @intFromEnum(proc)) return syscall_err_invalid;
+            state.dmaMapReleaseStage1(frame.rdi) catch |err| switch (err) {
+                kernel.KernelError.CapabilityNotFound => return syscall_err_invalid,
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                else => return syscall_err_invalid,
+            };
+            return syscall_ok;
+        },
+        syscall_revoke_device_cap => {
+            const decoded = queue_abi.decodeCapToken(frame.rdi) orelse return syscall_err_invalid;
+            device_capabilities.revokeDeviceCapStage2(state, proc, decoded.kind, decoded.token) catch |err| switch (err) {
+                kernel.KernelError.CapabilityNotFound => return syscall_err_invalid,
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                else => return syscall_err_revoke,
+            };
+            return syscall_ok;
+        },
+        syscall_derive_command_cap => {
+            const token = queue_abi.decodeCommandCapToken(frame.rdi) orelse return syscall_err_invalid;
+            const child_token = device_capabilities.deriveCommandCapStage2(state, proc, token, frame.rsi) catch |err| switch (err) {
+                kernel.KernelError.CapabilityNotFound => return syscall_err_invalid,
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_grant,
+            };
+            return queue_abi.encodeCommandCapToken(child_token);
         },
         syscall_move_cap => {
             const to = switch (frame.rsi) {
@@ -703,10 +773,22 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return image_abi.encodeExecImageToken(child_id);
         },
         queue_abi.syscall_grant_cap => {
-            const token = queue_abi.decodeQueueCapToken(frame.rdi) orelse return syscall_err_invalid;
             const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
-            const child_token = state.grantQueueCapStage2(proc, to, token) catch return syscall_err_grant;
-            return queue_abi.encodeQueueCapToken(child_token);
+            const decoded = queue_abi.decodeCapToken(frame.rdi) orelse return syscall_err_invalid;
+            switch (decoded.kind) {
+                .iommu => {
+                    const child_token = device_capabilities.grantIommuCapStage2(state, proc, to, decoded.token) catch return syscall_err_grant;
+                    return queue_abi.encodeIommuCapToken(child_token);
+                },
+                .virtqueue => {
+                    const child_token = device_capabilities.grantQueueCapStage2(state, proc, to, decoded.token) catch return syscall_err_grant;
+                    return queue_abi.encodeVirtqueueCapToken(child_token);
+                },
+                .command => {
+                    const child_token = device_capabilities.grantCommandCapStage2(state, proc, to, decoded.token) catch return syscall_err_grant;
+                    return queue_abi.encodeCommandCapToken(child_token);
+                },
+            }
         },
         syscall_wait_event => {
             const wait_mailbox = (frame.rdi & 0x1) != 0;

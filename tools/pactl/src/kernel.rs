@@ -28,6 +28,7 @@ pub fn build_kernel(workspace_root: &Path, workspace: &WorkspaceConfig) -> Resul
 
 fn run_command(label: &str, cmd: &mut Command) -> Result<(), String> {
     let debug = format!("{cmd:?}");
+    eprintln!("pactl: running {label}: {debug}");
     let status = cmd
         .status()
         .map_err(|err| format!("failed to run {label}: {err}"))?;

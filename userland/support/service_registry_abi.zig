@@ -3,7 +3,7 @@ const process_abi = @import("process_abi.zig");
 pub const magic: u64 = 0x53525643; // "SRVC"
 pub const version: u64 = 1;
 pub const page_va: u64 = process_abi.auxPageVa(5);
-pub const max_entries: usize = 6;
+pub const max_entries: usize = 7;
 pub const dynamic_endpoint_id_base: u64 = 0x80;
 pub const syscall_publish_service_endpoint: u64 = 0x33;
 pub const service_flag_process_slot_compat: u64 = 1 << 0;
@@ -13,6 +13,8 @@ pub const ServiceKind = enum(u64) {
     vfs = 2,
     block = 4,
     persistent_fs = 5,
+    capctl = 6,
+    gpu = 7,
 };
 
 pub const ServiceEntry = extern struct {
@@ -68,6 +70,39 @@ pub fn addServiceWithProcessSlot(base_va: u64, kind: ServiceKind, process_slot: 
         .endpoint_id = endpoint_id,
         .flags = service_flag_process_slot_compat,
     });
+}
+
+pub fn setServiceWithProcessSlot(base_va: u64, kind: ServiceKind, process_slot: u64, endpoint_id: u64) void {
+    const page: *volatile RegistryPage = @ptrFromInt(base_va);
+    if (page.magic != magic or page.version != version) initPage(base_va);
+    var i: usize = 0;
+    while (i < page.entry_count and i < max_entries) : (i += 1) {
+        const entry = &page.entries[i];
+        if (entry.kind != @intFromEnum(kind)) continue;
+        entry.process_slot = process_slot;
+        entry.endpoint_id = endpoint_id;
+        entry.flags = service_flag_process_slot_compat;
+        return;
+    }
+    addServiceWithProcessSlot(base_va, kind, process_slot, endpoint_id);
+}
+
+pub fn removeService(base_va: u64, kind: ServiceKind) void {
+    const page: *volatile RegistryPage = @ptrFromInt(base_va);
+    if (page.magic != magic or page.version != version) return;
+    var i: usize = 0;
+    while (i < page.entry_count and i < max_entries) : (i += 1) {
+        if (page.entries[i].kind != @intFromEnum(kind)) continue;
+        var j: usize = i;
+        while (j + 1 < page.entry_count and j + 1 < max_entries) : (j += 1) {
+            page.entries[j] = page.entries[j + 1];
+        }
+        if (page.entry_count != 0) {
+            page.entry_count -= 1;
+            page.entries[page.entry_count] = .{ .kind = 0, .process_slot = 0, .endpoint_id = 0, .flags = 0 };
+        }
+        return;
+    }
 }
 
 pub fn addServiceEntry(base_va: u64, entry: ServiceEntry) void {

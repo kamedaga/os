@@ -1,4 +1,4 @@
-pub const config_magic: u64 = 0x424C_4B43; // "BLKC"
+pub const config_magic: u64 = 0x4750_5547; // "GPUG"
 pub const config_version: u64 = 1;
 
 pub const endpoint_id_index: usize = 2;
@@ -12,13 +12,19 @@ pub const isr_page_offset_index: usize = 9;
 pub const device_page_offset_index: usize = 10;
 pub const notify_off_multiplier_index: usize = 11;
 pub const iommu_token_index: usize = 12;
-pub const queue_submit_token_index: usize = 13;
-pub const queue_notify_token_index: usize = 14;
-pub const command_token_index: usize = 15;
-pub const root_token_index: usize = 16;
-pub const capacity_sectors_index: usize = 17;
-pub const logical_block_size_index: usize = 18;
-pub const driver_status_index: usize = 19;
+pub const control_queue_submit_token_index: usize = 13;
+pub const control_queue_notify_token_index: usize = 14;
+pub const cursor_queue_submit_token_index: usize = 15;
+pub const cursor_queue_notify_token_index: usize = 16;
+pub const command_token_index: usize = 17;
+pub const root_token_index: usize = 18;
+pub const device_features_low_index: usize = 19;
+pub const device_features_high_index: usize = 20;
+pub const driver_status_index: usize = 21;
+
+pub const control_queue_index: u16 = 0;
+pub const cursor_queue_index: u16 = 1;
+
 pub const driver_status_ready: u64 = 0x4452_4459; // "DRDY"
 
 pub const ConfigPageDescriptor = struct {
@@ -33,12 +39,14 @@ pub const ConfigPageDescriptor = struct {
     device_page_offset: u64,
     notify_off_multiplier: u64,
     iommu_token: u64 = 0,
-    queue_submit_token: u64 = 0,
-    queue_notify_token: u64 = 0,
+    control_queue_submit_token: u64 = 0,
+    control_queue_notify_token: u64 = 0,
+    cursor_queue_submit_token: u64 = 0,
+    cursor_queue_notify_token: u64 = 0,
     command_token: u64 = 0,
     root_token: u64 = 0,
-    capacity_sectors: u64 = 0,
-    logical_block_size: u64 = 0,
+    device_features_low: u64 = 0,
+    device_features_high: u64 = 0,
 };
 
 pub fn writeConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
@@ -61,25 +69,43 @@ pub fn writeConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
     words[device_page_offset_index] = descriptor.device_page_offset;
     words[notify_off_multiplier_index] = descriptor.notify_off_multiplier;
     words[iommu_token_index] = descriptor.iommu_token;
-    words[queue_submit_token_index] = descriptor.queue_submit_token;
-    words[queue_notify_token_index] = descriptor.queue_notify_token;
+    words[control_queue_submit_token_index] = descriptor.control_queue_submit_token;
+    words[control_queue_notify_token_index] = descriptor.control_queue_notify_token;
+    words[cursor_queue_submit_token_index] = descriptor.cursor_queue_submit_token;
+    words[cursor_queue_notify_token_index] = descriptor.cursor_queue_notify_token;
     words[command_token_index] = descriptor.command_token;
     words[root_token_index] = descriptor.root_token;
-    words[capacity_sectors_index] = descriptor.capacity_sectors;
-    words[logical_block_size_index] = descriptor.logical_block_size;
+    words[device_features_low_index] = descriptor.device_features_low;
+    words[device_features_high_index] = descriptor.device_features_high;
 }
 
-pub fn writeGrantedQueueTokens(base_va: u64, submit_token: u64, notify_token: u64) void {
+pub fn writeGrantedControlQueueTokens(base_va: u64, submit_token: u64, notify_token: u64) void {
     const words: [*]volatile u64 = @ptrFromInt(base_va);
-    words[queue_submit_token_index] = submit_token;
-    words[queue_notify_token_index] = notify_token;
+    words[control_queue_submit_token_index] = submit_token;
+    words[control_queue_notify_token_index] = notify_token;
 }
 
-pub fn writeGrantedCapabilityTokens(base_va: u64, iommu_token: u64, submit_token: u64, notify_token: u64, command_token: u64) void {
+pub fn writeGrantedCursorQueueTokens(base_va: u64, submit_token: u64, notify_token: u64) void {
+    const words: [*]volatile u64 = @ptrFromInt(base_va);
+    words[cursor_queue_submit_token_index] = submit_token;
+    words[cursor_queue_notify_token_index] = notify_token;
+}
+
+pub fn writeGrantedCapabilityTokens(
+    base_va: u64,
+    iommu_token: u64,
+    control_submit_token: u64,
+    control_notify_token: u64,
+    cursor_submit_token: u64,
+    cursor_notify_token: u64,
+    command_token: u64,
+) void {
     const words: [*]volatile u64 = @ptrFromInt(base_va);
     words[iommu_token_index] = iommu_token;
-    words[queue_submit_token_index] = submit_token;
-    words[queue_notify_token_index] = notify_token;
+    words[control_queue_submit_token_index] = control_submit_token;
+    words[control_queue_notify_token_index] = control_notify_token;
+    words[cursor_queue_submit_token_index] = cursor_submit_token;
+    words[cursor_queue_notify_token_index] = cursor_notify_token;
     words[command_token_index] = command_token;
 }
 

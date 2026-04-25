@@ -144,6 +144,7 @@ fn workspace_path_flag(path_root: &Path, prefix: &str, path: &Path) -> String {
 
 fn run_command(label: &str, cmd: &mut Command) -> Result<(), String> {
     let debug = format!("{cmd:?}");
+    eprintln!("pactl: running {label}: {debug}");
     let status = cmd
         .status()
         .map_err(|err| format!("failed to run {label}: {err}"))?;

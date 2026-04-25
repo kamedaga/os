@@ -3,6 +3,7 @@
 const std = @import("std");
 const kernel = @import("../kernel.zig");
 const capability = @import("../capability.zig");
+const device_capabilities = @import("../device_capabilities.zig");
 const untyped_memory = @import("../untyped_memory.zig");
 const elf_loader = @import("../elf_loader.zig");
 const scheduler = @import("../scheduler.zig");
@@ -97,7 +98,7 @@ fn logQueueCapDeny(
     proc: kernel.PrincipalId,
     token: u64,
     queue_index: u16,
-    op: kernel.QueueOperation,
+    op: device_capabilities.QueueOperation,
     err: anyerror,
 ) void {
     boot_debug.logQueueCapDeny(bootDebugHooks(), proc, token, queue_index, op, err);
@@ -860,8 +861,10 @@ fn descriptorFromModernDevice(
         .isr_page_offset = isr.page_offset,
         .device_page_offset = device.page_offset,
         .notify_off_multiplier = info.notify_off_multiplier,
+        .init_iommu_token = 0,
         .init_queue_submit_token = 0,
         .init_queue_notify_token = 0,
+        .init_command_token = 0,
     };
 }
 

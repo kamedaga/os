@@ -1,5 +1,6 @@
 const kernel = @import("../kernel.zig");
 const capability = @import("../capability.zig");
+const device_capabilities = @import("../device_capabilities.zig");
 
 pub const Hooks = struct {
     write: *const fn ([]const u8) void,
@@ -25,7 +26,7 @@ pub fn dumpAllProcessCaps(
     }
 }
 
-fn queueCapOpLabel(op: kernel.QueueOperation) []const u8 {
+fn queueCapOpLabel(op: device_capabilities.QueueOperation) []const u8 {
     return switch (op) {
         .submit => "submit",
         .notify => "notify",
@@ -37,7 +38,7 @@ pub fn logQueueCapDeny(
     proc: kernel.PrincipalId,
     token: u64,
     queue_index: u16,
-    op: kernel.QueueOperation,
+    op: device_capabilities.QueueOperation,
     err: anyerror,
 ) void {
     hooks.write("queue_cap deny proc=");

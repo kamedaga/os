@@ -22,8 +22,10 @@ pub fn inputDeviceHintFromRaw(raw: u64) InputDeviceHint {
 
 pub const DeviceGrant = extern struct {
     device_page_paddr: u64 = 0,
+    iommu_token: u64 = 0,
     submit_token: u64 = 0,
     notify_token: u64 = 0,
+    command_token: u64 = 0,
     input_kind_hint: u64 = 0,
 };
 
@@ -59,16 +61,20 @@ pub fn writeDeviceGrant(
     config_source_va: u64,
     index: usize,
     device_page_paddr: u64,
+    iommu_token: u64,
     submit_token: u64,
     notify_token: u64,
+    command_token: u64,
     input_kind_hint: u64,
 ) void {
     if (index >= max_device_grants) return;
     const page: *volatile ConfigPage = @ptrFromInt(config_source_va);
     page.device_grants[index] = .{
         .device_page_paddr = device_page_paddr,
+        .iommu_token = iommu_token,
         .submit_token = submit_token,
         .notify_token = notify_token,
+        .command_token = command_token,
         .input_kind_hint = input_kind_hint,
     };
 }

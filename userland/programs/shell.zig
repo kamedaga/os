@@ -1,6 +1,7 @@
 /// Rootfs shell displayed on the primary framebuffer until the windowed UI takes over.
 const std = @import("std");
 const block_client = @import("support_root").block_client;
+const capctl_protocol = @import("support_root").capctl_protocol;
 const font = @import("support_root").font;
 const fs_abi = @import("support_root").fs_abi;
 const fs_client = @import("support_root").fs_client;
@@ -21,6 +22,7 @@ const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_map_pages_batch: u64 = 0x15;
 const syscall_wait_event: u64 = 0x17;
+const syscall_grant_cap_on_endpoint: u64 = 0x24;
 const syscall_install_endpoint: u64 = 0x26;
 const syscall_share_cap: u64 = 0x2B;
 const syscall_signal_endpoint: u64 = 0x2C;
@@ -34,6 +36,7 @@ const config_framebuffer_vm_token_index: usize = @intCast(init_bootstrap_abi.boo
 const syscall_batch_max_pages: usize = 64;
 
 const syscall_ok: u64 = 0;
+const syscall_err_endpoint: u64 = 9;
 const framebuffer_va: usize = 0x3C00_5000;
 const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
 const runtime_page_base_va: usize = 0x2100_0000;
@@ -42,29 +45,50 @@ const notify_page_va: usize = runtime_page_base_va + 0x5000;
 const isr_page_va: usize = runtime_page_base_va + 0x6000;
 const queue_page0_va: usize = runtime_page_base_va + 0x8000;
 const queue_page1_va: usize = runtime_page_base_va + 0x9000;
+const capctl_request_page_candidates = [_]u64{
+    0x3F06_2000,
+    0x3F06_4000,
+    0x3F06_6000,
+    0x3F06_8000,
+    0x3F06_A000,
+    0x3F06_C000,
+    0x3F06_E000,
+    0x3F07_0000,
+};
+const capctl_response_page_candidates = [_]u64{
+    0x3F06_3000,
+    0x3F06_5000,
+    0x3F06_7000,
+    0x3F06_9000,
+    0x3F06_B000,
+    0x3F06_D000,
+    0x3F06_F000,
+    0x3F07_1000,
+};
 
 const fb_width: usize = 832;
 const fb_height: usize = @intCast(init_bootstrap_abi.boot_display_shell_height);
 const fb_pitch: usize = 832;
-const font_scale_num: i32 = 3;
-const font_scale_den: i32 = 2;
-const text_margin_x: usize = 4;
-const text_margin_y: usize = 2;
+const font_scale_num: i32 = 1;
+const font_scale_den: i32 = 1;
+const text_margin_x: usize = 2;
+const text_margin_y: usize = 1;
 const cell_w: usize = @as(usize, @intCast(font.scaledGlyphWidthRatio(font_scale_num, font_scale_den)));
 const cell_h: usize = @as(usize, @intCast(font.lineHeightRatio(font_scale_num, font_scale_den))) + text_margin_y * 2;
 const cols: usize = (fb_width - text_margin_x * 2) / cell_w;
 const rows: usize = fb_height / cell_h;
 
-const bg_color: u32 = 0x000B_0E12;
-const panel_color: u32 = 0x0011_1820;
-const border_color: u32 = 0x0022_3444;
+const bg_color: u32 = 0x0005_0608;
+const panel_color: u32 = 0x000B_0C0E;
+const border_color: u32 = 0x0033_3538;
 const fg_color: u32 = 0x00F4_F1E8;
-const title_color: u32 = 0x0079_D7FF;
-const prompt_fg_color: u32 = 0x00FF_D166;
+const title_color: u32 = 0x00E6_E6E6;
+const prompt_fg_color: u32 = 0x00F7_F7F5;
+const cursor_color: u32 = 0x00FF_FFFF;
 const warn_color: u32 = 0x00FF_8A65;
-const splash_bar_color: u32 = 0x0035_C2FF;
-const splash_core_color: u32 = 0x00FF_F1BF;
-const splash_sub_color: u32 = 0x0095_B7CC;
+const splash_bar_color: u32 = 0x0058_5B60;
+const splash_core_color: u32 = 0x00E8_E3D8;
+const splash_sub_color: u32 = 0x00A4_A7AC;
 
 const common_device_feature_select: usize = 0x00;
 const common_driver_feature_select: usize = 0x08;
@@ -159,6 +183,8 @@ const shell_fs_probe_commands = [_][]const u8{
     "cat /sys/startup_manifest.txt",
 };
 const pie_user_rootfs_name = "cmd/pie_user.elf";
+const virtio_gpu_gl_rootfs_path = "/srv/virtio_gpu_gl.elf";
+const gpu_demo_rootfs_path = "/cmd/gpu_demo.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 var spawn_registry_copy_source_va: u64 = 0;
 var spawn_demo_config_source_va: u64 = 0;
@@ -242,8 +268,8 @@ const KeyboardState = struct {
 };
 
 const ShellState = struct {
-    lines: [rows - 2][cols]u8 = [_][cols]u8{[_]u8{' '} ** cols} ** (rows - 2),
-    line_len: [rows - 2]usize = [_]usize{0} ** (rows - 2),
+    lines: [rows - 1][cols]u8 = [_][cols]u8{[_]u8{' '} ** cols} ** (rows - 1),
+    line_len: [rows - 1]usize = [_]usize{0} ** (rows - 1),
     cur_row: usize = 0,
     splash_line_count: usize = 0,
     cmd: [128]u8 = undefined,
@@ -251,6 +277,8 @@ const ShellState = struct {
     keyboard_ready: bool = false,
     block_client_ready: bool = false,
     block_client_state: block_client.Client = undefined,
+    capctl_next_seq: u64 = 1,
+    capctl_page_slot_next: usize = 0,
     persistent_fs_client_ready: bool = false,
     persistent_fs_client_state: fs_client.Client = undefined,
     auto_fs_probe_pending: bool = true,
@@ -364,8 +392,27 @@ fn shareCap(paddr: u64, endpoint_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn grantCapOnEndpoint(paddr: u64, endpoint_id: u64, rights: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_grant_cap_on_endpoint),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (rights),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn compilerBarrier() void {
     asm volatile ("" ::: .{ .memory = true });
+}
+
+fn clearPage(base_va: u64) void {
+    const words: [*]volatile u64 = @ptrFromInt(base_va);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        words[i] = 0;
+    }
 }
 
 fn spawnExec(
@@ -1015,6 +1062,14 @@ fn drawLine(vfb: [*]volatile u32, row: usize, text: []const u8, color: u32) void
     );
 }
 
+fn textAdvanceRatio(text: []const u8) i32 {
+    var advance: i32 = 0;
+    for (text) |ch| {
+        advance += font.glyphAdvanceRatio(ch, font_scale_num, font_scale_den);
+    }
+    return advance;
+}
+
 fn clearRow(vfb: [*]volatile u32, row: usize, color: u32) void {
     fillRect(vfb, 2, row * cell_h, fb_width - 4, cell_h, color);
 }
@@ -1250,18 +1305,8 @@ fn keycodeToAscii(code: u16, shift: bool) ?u8 {
 }
 
 fn renderHeader(vfb: [*]volatile u32, st: *const ShellState) void {
-    clearRow(vfb, 0, panel_color);
-    fillRect(vfb, 0, 0, fb_width, 2, border_color);
-    fillRect(vfb, 0, cell_h, fb_width, 1, border_color);
-    var header_buf: [cols]u8 = [_]u8{' '} ** cols;
-    var idx: usize = 0;
-    appendText(header_buf[0..], &idx, "shell");
-    appendText(
-        header_buf[0..],
-        &idx,
-        if (st.keyboard_ready) "  help ls cd mkdir" else "  keyboard offline",
-    );
-    drawLine(vfb, 0, header_buf[0..idx], if (st.keyboard_ready) title_color else warn_color);
+    _ = vfb;
+    _ = st;
 }
 
 fn renderBody(vfb: [*]volatile u32, st: *ShellState) void {
@@ -1277,12 +1322,21 @@ fn renderBody(vfb: [*]volatile u32, st: *ShellState) void {
             }
         else
             fg_color;
-        drawLine(vfb, row + 1, st.lines[row][0..st.line_len[row]], color);
+        drawLine(vfb, row, st.lines[row][0..st.line_len[row]], color);
     }
 }
 
 fn promptRow(st: *const ShellState) usize {
-    return @min(st.cur_row + 1, rows - 1);
+    return @min(st.cur_row, rows - 1);
+}
+
+fn writePromptHistoryLine(st: *ShellState) void {
+    var line_buf: [cols]u8 = undefined;
+    var line_len: usize = 0;
+    appendText(line_buf[0..], &line_len, currentRootfsPath(st));
+    appendText(line_buf[0..], &line_len, " $ ");
+    appendText(line_buf[0..], &line_len, st.cmd[0..st.cmd_len]);
+    st.writeLine(line_buf[0..line_len]);
 }
 
 fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
@@ -1292,7 +1346,7 @@ fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
     var prefix_buf: [fs_protocol.max_path_bytes + 3]u8 = undefined;
     var prefix_len: usize = 0;
     appendText(prefix_buf[0..], &prefix_len, currentRootfsPath(st));
-    appendText(prefix_buf[0..], &prefix_len, " > ");
+    appendText(prefix_buf[0..], &prefix_len, " $ ");
     const prefix = if (prefix_len <= cols)
         prefix_buf[0..prefix_len]
     else
@@ -1310,7 +1364,15 @@ fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
             prompt_len += cmd_slice.len;
         }
     }
-    drawLine(vfb, row, prompt_buf[0..prompt_len], prompt_fg_color);
+    const visible_prompt = prompt_buf[0..prompt_len];
+    drawLine(vfb, row, visible_prompt, prompt_fg_color);
+    const prompt_x: i32 = @intCast(text_margin_x);
+    const prompt_advance = textAdvanceRatio(visible_prompt);
+    const cursor_x = @as(usize, @intCast(@max(prompt_x, prompt_x + prompt_advance)));
+    const cursor_y = row * cell_h + 2;
+    const cursor_w: usize = 2;
+    const cursor_h = if (cell_h > 4) cell_h - 4 else cell_h;
+    fillRect(vfb, cursor_x, cursor_y, cursor_w, cursor_h, cursor_color);
 }
 
 fn renderFull(vfb: [*]volatile u32, st: *ShellState) void {
@@ -1706,6 +1768,9 @@ fn runPersistentFsUnlink(st: *ShellState, path: []const u8) bool {
 }
 
 fn runPersistentFsExecFile(st: *ShellState, path: []const u8, arg_text: []const u8) bool {
+    if (std.mem.eql(u8, path, virtio_gpu_gl_rootfs_path)) {
+        return runGpuDriverExec(st);
+    }
     if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
         st.writeLine(rootfsUnavailableReason());
         shellLogLine(rootfsUnavailableReason());
@@ -2258,6 +2323,273 @@ fn runPersistentFsPieUser(st: *ShellState) bool {
     return ok;
 }
 
+const CapCtlRequestPages = struct {
+    request_va: u64,
+    request_paddr: u64,
+    response_va: u64,
+    response_paddr: u64,
+};
+
+fn allocCapCtlRequestPages(st: *ShellState) ?CapCtlRequestPages {
+    if (st.capctl_page_slot_next >= capctl_request_page_candidates.len or
+        st.capctl_page_slot_next >= capctl_response_page_candidates.len) {
+        st.writeLine("capctl page slots exhausted");
+        shellLogLine("capctl page slots exhausted");
+        return null;
+    }
+    const request_va = capctl_request_page_candidates[st.capctl_page_slot_next];
+    const response_va = capctl_response_page_candidates[st.capctl_page_slot_next];
+    st.capctl_page_slot_next += 1;
+    var request_paddr: u64 = 0;
+    var response_paddr: u64 = 0;
+    if (allocMapPages(request_va, 1, true, @intFromPtr(&request_paddr)) != syscall_ok or request_paddr < 0x1000) {
+        st.writeLine("capctl request page failed");
+        shellLogLine("capctl request page failed");
+        return null;
+    }
+    if (allocMapPages(response_va, 1, true, @intFromPtr(&response_paddr)) != syscall_ok or response_paddr < 0x1000) {
+        st.writeLine("capctl response page failed");
+        shellLogLine("capctl response page failed");
+        return null;
+    }
+    return .{
+        .request_va = request_va,
+        .request_paddr = request_paddr,
+        .response_va = response_va,
+        .response_paddr = response_paddr,
+    };
+}
+
+fn capctlResponseStatusText(status: capctl_protocol.ResponseStatus) []const u8 {
+    return switch (status) {
+        .ok => "ok",
+        .invalid => "invalid request",
+        .unsupported => "unsupported",
+        .unavailable => "unavailable",
+        .already => "already applied",
+        .kernel_error => "kernel error",
+    };
+}
+
+fn capctlBlockProfileText(profile: capctl_protocol.BlockProfile) []const u8 {
+    return switch (profile) {
+        .full => "full",
+        .read_only => "read-only",
+        .no_iommu => "no-iommu",
+        .no_virtqueue => "no-virtqueue",
+    };
+}
+
+fn sendCapCtlRequest(st: *ShellState, opcode: capctl_protocol.Opcode) ?capctl_protocol.Response {
+    const endpoint_id = capctl_protocol.endpoint_id;
+    const pages = allocCapCtlRequestPages(st) orelse return null;
+    clearPage(pages.request_va);
+    clearPage(pages.response_va);
+    const seq = st.capctl_next_seq;
+    st.capctl_next_seq +%= 1;
+    if (st.capctl_next_seq == 0) st.capctl_next_seq = 1;
+    const request: *volatile capctl_protocol.Request = @ptrFromInt(pages.request_va);
+    request.magic = capctl_protocol.magic;
+    request.version = capctl_protocol.version;
+    request.opcode = capctl_protocol.opcodeRaw(opcode);
+    request.response_paddr = pages.response_paddr;
+    request.arg0 = 0;
+    request.arg1 = 0;
+    request.reserved0 = 0;
+    compilerBarrier();
+    request.request_seq = seq;
+    const grant_status = grantCapOnEndpoint(pages.response_paddr, endpoint_id, 0x1 | 0x2);
+    if (grant_status != syscall_ok) {
+        if (grant_status == syscall_err_endpoint) {
+            st.writeLine("capctl response endpoint missing");
+            shellLogLine("capctl response endpoint missing");
+        } else {
+            st.writeLine("capctl response grant failed");
+            shellLogLine("capctl response grant failed");
+        }
+        return null;
+    }
+    if (shareCap(pages.request_paddr, endpoint_id) != syscall_ok) {
+        st.writeLine("capctl request send failed");
+        shellLogLine("capctl request send failed");
+        return null;
+    }
+    const response: *volatile capctl_protocol.Response = @ptrFromInt(pages.response_va);
+    var poll_count: u64 = 0;
+    while (poll_count < 256) : (poll_count += 1) {
+        if (response.response_seq == seq) {
+            return .{
+                .magic = response.magic,
+                .version = response.version,
+                .opcode = response.opcode,
+                .status = response.status,
+                .response_seq = response.response_seq,
+                .detail = response.detail,
+                .block_process_slot = response.block_process_slot,
+                .block_endpoint_id = response.block_endpoint_id,
+                .status_flags = response.status_flags,
+                .block_profile = response.block_profile,
+            };
+        }
+        _ = waitEvent(false, 1);
+    }
+    st.writeLine("capctl response timeout");
+    shellLogLine("capctl response timeout");
+    return null;
+}
+
+fn printCapBlkStatus(st: *ShellState, response: capctl_protocol.Response) void {
+    const flags = response.status_flags;
+    const profile = capctl_protocol.decodeBlockProfile(response.block_profile) orelse capctl_protocol.BlockProfile.full;
+    if ((flags & capctl_protocol.status_flag_block_present) == 0) {
+        st.writeLine("blk service unavailable");
+        return;
+    }
+    var line_buf: [96]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "blk process={d} endpoint={d}", .{ response.block_process_slot, response.block_endpoint_id }) catch return;
+    st.writeLine(line);
+    var profile_buf: [48]u8 = undefined;
+    const profile_line = std.fmt.bufPrint(&profile_buf, "profile={s}", .{capctlBlockProfileText(profile)}) catch return;
+    st.writeLine(profile_line);
+    st.writeLine(if ((flags & capctl_protocol.status_flag_iommu_active) != 0) "iommu=active" else "iommu=revoked");
+    st.writeLine(if ((flags & capctl_protocol.status_flag_virtqueue_active) != 0) "virtqueue=active" else "virtqueue=revoked");
+    st.writeLine(if ((flags & capctl_protocol.status_flag_command_active) != 0) "command=active" else "command=revoked");
+}
+
+fn runGpuDriverExec(st: *ShellState) bool {
+    const response = sendCapCtlRequest(st, .launch_gpu) orelse return false;
+    const status = capctl_protocol.decodeResponseStatus(response.status) orelse {
+        st.writeLine("capctl invalid response");
+        shellLogLine("capctl invalid response");
+        return false;
+    };
+    switch (status) {
+        .ok => {
+            st.writeLine("gpu driver spawned");
+            shellLogLine("gpu driver spawned");
+            return true;
+        },
+        .already => {
+            st.writeLine("gpu driver already running");
+            shellLogLine("gpu driver already running");
+            return true;
+        },
+        .unavailable => {
+            st.writeLine("gpu device unavailable");
+            shellLogLine("gpu device unavailable");
+            return false;
+        },
+        else => {
+            st.writeLine(capctlResponseStatusText(status));
+            shellLogLine("gpu driver spawn failed");
+            return false;
+        },
+    }
+}
+
+fn resetServiceClients(st: *ShellState) void {
+    st.block_client_ready = false;
+    st.persistent_fs_client_ready = false;
+}
+
+fn runCapBlkCommand(st: *ShellState, text: []const u8) bool {
+    const parsed = splitCommand(text);
+    if (eqAsciiNoCase(parsed.head, "status")) {
+        const response = sendCapCtlRequest(st, .status) orelse return false;
+        const status = capctl_protocol.decodeResponseStatus(response.status) orelse {
+            st.writeLine("capctl invalid response");
+            shellLogLine("capctl invalid response");
+            return false;
+        };
+        if (status != .ok) {
+            st.writeLine(capctlResponseStatusText(status));
+            return false;
+        }
+        printCapBlkStatus(st, response);
+        return true;
+    }
+    if (eqAsciiNoCase(parsed.head, "revoke")) {
+        const target = trimSpaces(parsed.tail);
+        const opcode: capctl_protocol.Opcode = if (eqAsciiNoCase(target, "iommu"))
+            .revoke_iommu
+        else if (eqAsciiNoCase(target, "virtqueue") or eqAsciiNoCase(target, "queue"))
+            .revoke_virtqueue
+        else if (eqAsciiNoCase(target, "command"))
+            .revoke_command
+        else {
+            st.writeLine("usage: cap blk revoke <iommu|virtqueue|command>");
+            return false;
+        };
+        const response = sendCapCtlRequest(st, opcode) orelse return false;
+        const status = capctl_protocol.decodeResponseStatus(response.status) orelse {
+            st.writeLine("capctl invalid response");
+            shellLogLine("capctl invalid response");
+            return false;
+        };
+        if (status == .ok or status == .already) {
+            const target_name = switch (opcode) {
+                .revoke_iommu => "iommu",
+                .revoke_virtqueue => "virtqueue",
+                .revoke_command => "command",
+                else => "unknown",
+            };
+            var line_buf: [96]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "blk {s}: {s}", .{ target_name, capctlResponseStatusText(status) }) catch return false;
+            st.writeLine(line);
+            printCapBlkStatus(st, response);
+            return true;
+        }
+        st.writeLine(capctlResponseStatusText(status));
+        if (status == .kernel_error) {
+            var line_buf: [64]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "kernel detail={d}", .{response.detail}) catch return false;
+            st.writeLine(line);
+        }
+        return false;
+    }
+    if (eqAsciiNoCase(parsed.head, "profile")) {
+        const target = trimSpaces(parsed.tail);
+        const opcode: capctl_protocol.Opcode = if (eqAsciiNoCase(target, "full"))
+            .profile_full
+        else if (eqAsciiNoCase(target, "read-only") or eqAsciiNoCase(target, "readonly"))
+            .profile_read_only
+        else if (eqAsciiNoCase(target, "no-iommu"))
+            .profile_no_iommu
+        else if (eqAsciiNoCase(target, "no-virtqueue") or eqAsciiNoCase(target, "no-queue"))
+            .profile_no_virtqueue
+        else {
+            st.writeLine("usage: cap blk profile <full|read-only|no-iommu|no-virtqueue>");
+            return false;
+        };
+        const response = sendCapCtlRequest(st, opcode) orelse return false;
+        const status = capctl_protocol.decodeResponseStatus(response.status) orelse {
+            st.writeLine("capctl invalid response");
+            shellLogLine("capctl invalid response");
+            return false;
+        };
+        if (status == .ok or status == .already) {
+            resetServiceClients(st);
+            var line_buf: [96]u8 = undefined;
+            const applied = capctl_protocol.decodeBlockProfile(response.block_profile) orelse capctl_protocol.BlockProfile.full;
+            const line = std.fmt.bufPrint(&line_buf, "blk profile: {s}", .{capctlBlockProfileText(applied)}) catch return false;
+            st.writeLine(line);
+            printCapBlkStatus(st, response);
+            return true;
+        }
+        st.writeLine(capctlResponseStatusText(status));
+        return false;
+    }
+    st.writeLine("usage: cap blk status | cap blk revoke <iommu|virtqueue|command> | cap blk profile <full|read-only|no-iommu|no-virtqueue>");
+    return false;
+}
+
+fn runCapCommand(st: *ShellState, text: []const u8) bool {
+    const parsed = splitCommand(text);
+    if (eqAsciiNoCase(parsed.head, "blk")) return runCapBlkCommand(st, parsed.tail);
+    st.writeLine("usage: cap blk status | cap blk revoke <iommu|virtqueue|command>");
+    return false;
+}
+
 fn executeCommand(st: *ShellState) RenderAction {
     const cmd = trimSpaces(st.cmd[0..st.cmd_len]);
     if (cmd.len == 0) return .prompt;
@@ -2266,7 +2598,7 @@ fn executeCommand(st: *ShellState) RenderAction {
     if (eqAsciiNoCase(parsed.head, "help")) {
         st.writeLine("commands: help clear pwd cd mkdir ls stat");
         st.writeLine("cat exec touch write rm mv block_demo");
-        st.writeLine("fs_demo pie_user  exec <path>  write <path> <text>");
+        st.writeLine("fs_demo pie_user gpu gpu_demo cap  exec <path>  write <path> <text>");
         return .full;
     }
     if (eqAsciiNoCase(parsed.head, "clear")) {
@@ -2385,6 +2717,19 @@ fn executeCommand(st: *ShellState) RenderAction {
         }
         return .full;
     }
+    if (eqAsciiNoCase(parsed.head, "gpu") or eqAsciiNoCase(parsed.head, "gpu_driver")) {
+        _ = runGpuDriverExec(st);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "gpu_demo")) {
+        _ = runGpuDriverExec(st);
+        _ = runPersistentFsExecFile(st, gpu_demo_rootfs_path, "");
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "cap")) {
+        _ = runCapCommand(st, parsed.tail);
+        return .full;
+    }
 
     st.writeLine("unknown command");
     shellLogLine("unknown command");
@@ -2403,8 +2748,8 @@ fn initKeyboard() ?KeyboardState {
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
     var queue_paddr0 = readCfgU64(11);
     var queue_paddr1 = readCfgU64(12);
-    var queue_submit_token = readCfgU64(13);
-    var queue_notify_token = readCfgU64(14);
+    var queue_submit_token = readCfgU64(input_bootstrap.queue_submit_token_index);
+    var queue_notify_token = readCfgU64(input_bootstrap.queue_notify_token_index);
 
     if (common_page_paddr < 0x1000 or notify_page_paddr < 0x1000) return null;
     while (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
@@ -2430,8 +2775,8 @@ fn initKeyboard() ?KeyboardState {
 
     while (queue_submit_token == 0 or queue_notify_token == 0) {
         _ = waitEvent(false, 1);
-        queue_submit_token = readCfgU64(13);
-        queue_notify_token = readCfgU64(14);
+        queue_submit_token = readCfgU64(input_bootstrap.queue_submit_token_index);
+        queue_notify_token = readCfgU64(input_bootstrap.queue_notify_token_index);
     }
     shellLogLine("keyboard queue tokens ready");
 
@@ -2484,6 +2829,7 @@ fn initKeyboard() ?KeyboardState {
 fn handleAscii(st: *ShellState, ascii: u8) RenderAction {
     switch (ascii) {
         '\n', '\r' => {
+            writePromptHistoryLine(st);
             const action = executeCommand(st);
             st.cmd_len = 0;
             return RenderAction.merge(action, .prompt);

@@ -7,6 +7,7 @@ const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
 const syscall_log: u64 = 0x9;
+const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_wait_event: u64 = 0x17;
 const syscall_grant_cap_on_endpoint: u64 = 0x24;
 const syscall_install_endpoint: u64 = 0x26;
@@ -72,13 +73,9 @@ pub const Client = struct {
     response_poll_limit: u64 = default_response_poll_limit,
 
     pub fn connect(options: ConnectOptions) Error!Client {
-        const request_paddr = allocPage();
-        if (request_paddr < 0x1000) return error.RequestAllocFailed;
-        if (mapPage(options.request_va, request_paddr, true) != 0) return error.RequestMapFailed;
-
-        const response_paddr = allocPage();
-        if (response_paddr < 0x1000) return error.ResponseAllocFailed;
-        if (mapPage(options.response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
+        const pages = try allocConnectPages(options.request_va, options.response_va);
+        const request_paddr = pages[0];
+        const response_paddr = pages[1];
         var compat_installed = false;
         try grantResponseCapForConnect(response_paddr, options, &compat_installed);
 
@@ -285,6 +282,26 @@ pub const Client = struct {
     }
 };
 
+fn allocConnectPages(request_va: u64, response_va: u64) Error![2]u64 {
+    if (response_va == request_va + 4096) {
+        var paddrs: [2]u64 = .{ 0, 0 };
+        if (allocMapPages(request_va, 2, true, @intFromPtr(&paddrs)) == syscall_ok and
+            paddrs[0] >= 0x1000 and paddrs[1] >= 0x1000)
+        {
+            return paddrs;
+        }
+    }
+
+    const request_paddr = allocPage();
+    if (request_paddr < 0x1000) return error.RequestAllocFailed;
+    if (mapPage(request_va, request_paddr, true) != 0) return error.RequestMapFailed;
+
+    const response_paddr = allocPage();
+    if (response_paddr < 0x1000) return error.ResponseAllocFailed;
+    if (mapPage(response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
+    return .{ request_paddr, response_paddr };
+}
+
 fn allocPage() u64 {
     return asm volatile (
         \\int $0x80
@@ -301,6 +318,18 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_alloc_map_pages),
+          [arg0] "{rdi}" (base_va),
+          [arg1] "{rsi}" (page_count),
+          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
+          [arg3] "{rcx}" (out_paddr_list_va),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 

@@ -26,6 +26,8 @@ const virtio_input_device_modern: u64 = 0x1052;
 const virtio_input_subsystem_id: u64 = 0x0012;
 const virtio_blk_device_modern: u64 = 0x1042;
 const virtio_blk_subsystem_id: u64 = 0x0002;
+const virtio_gpu_device_modern: u64 = 0x1050;
+const virtio_gpu_subsystem_id: u64 = 0x0010;
 const input_cfg_select: u64 = 0;
 const input_cfg_subsel: u64 = 1;
 const input_cfg_size: u64 = 2;
@@ -646,6 +648,12 @@ fn isVirtioInputDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor
         (descriptor.device_id == virtio_input_device_modern or descriptor.subsystem_id == virtio_input_subsystem_id);
 }
 
+fn isVirtioGpuDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
+    return descriptor.transport == @intFromEnum(init_bootstrap_abi.DeviceTransport.virtio_pci_modern) and
+        descriptor.vendor_id == virtio_vendor_id and
+        (descriptor.device_id == virtio_gpu_device_modern or descriptor.subsystem_id == virtio_gpu_subsystem_id);
+}
+
 fn requireBlockDeviceDescriptor(failure_message: []const u8) init_bootstrap_abi.DeviceDescriptor {
     const page = descriptorPage() orelse bootFail("BootInit: descriptor page missing\n");
     var i: usize = 0;
@@ -842,6 +850,10 @@ fn rebuildManagerDeviceNeedCache(page: *const volatile init_bootstrap_abi.Descri
         const descriptor = page.devices[i];
         if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
         if (isVirtioBlockDeviceDescriptor(descriptor)) {
+            manager_device_needed_cache[i] = true;
+            continue;
+        }
+        if (isVirtioGpuDeviceDescriptor(descriptor)) {
             manager_device_needed_cache[i] = true;
             continue;
         }
@@ -1051,17 +1063,23 @@ fn grantManagerDeviceResources(manager_slot: u64) void {
         if (!manager_device_needed_cache[device_index]) continue;
         logManagerGrantDeviceStep(device_index, descriptor, "begin");
         logManagerGrantDeviceStep(device_index, descriptor, "mmio ready");
+        const iommu_child_encoded = grantQueueCap(queue_abi.encodeIommuCapToken(descriptor.init_iommu_token), manager_slot);
         const submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(descriptor.init_queue_submit_token), manager_slot);
         const notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(descriptor.init_queue_notify_token), manager_slot);
+        const command_child_encoded = grantQueueCap(queue_abi.encodeCommandCapToken(descriptor.init_command_token), manager_slot);
+        const iommu_child = queue_abi.decodeIommuCapToken(iommu_child_encoded) orelse bootFail("BootInit: manager iommu grant failed\n");
         const submit_child = queue_abi.decodeQueueCapToken(submit_child_encoded) orelse bootFail("BootInit: manager submit grant failed\n");
         const notify_child = queue_abi.decodeQueueCapToken(notify_child_encoded) orelse bootFail("BootInit: manager notify grant failed\n");
+        const command_child = queue_abi.decodeCommandCapToken(command_child_encoded) orelse bootFail("BootInit: manager command grant failed\n");
         logManagerGrantDeviceStep(device_index, descriptor, "queue ready");
         manager_init_bootstrap_abi.writeDeviceGrant(
             manager_bootstrap_handoff_source_va,
             handoff_index,
             descriptor.device_page_paddr,
+            iommu_child,
             submit_child,
             notify_child,
+            command_child,
             manager_device_input_hint_cache[device_index],
         );
         handoff_index += 1;

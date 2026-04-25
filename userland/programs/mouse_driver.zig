@@ -372,11 +372,15 @@ pub export fn _start() noreturn {
     const shared_page_va: usize = @intCast(if (shared_target_va_u64 != 0) shared_target_va_u64 else default_shared_page_va);
     var queue_paddr0 = readCfgU64(11);
     var queue_paddr1 = readCfgU64(12);
-    var queue_submit_token_raw = readCfgU64(13);
-    var queue_notify_token_raw = readCfgU64(14);
-    const screen_w_u64 = readCfgU64(15);
-    const screen_h_u64 = readCfgU64(16);
-    const screen_pitch_u64 = readCfgU64(17);
+    var iommu_token = readCfgU64(input_bootstrap.iommu_token_index);
+    var queue_submit_token_raw = readCfgU64(input_bootstrap.queue_submit_token_index);
+    var queue_notify_token_raw = readCfgU64(input_bootstrap.queue_notify_token_index);
+    var command_token = readCfgU64(input_bootstrap.command_token_index);
+    const screen_w_u64 = readCfgU64(17);
+    const screen_h_u64 = readCfgU64(18);
+    const screen_pitch_u64 = readCfgU64(19);
+    _ = iommu_token;
+    _ = command_token;
     while (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
         _ = waitEvent(false, 1);
         asm volatile ("pause");
@@ -411,10 +415,12 @@ pub export fn _start() noreturn {
         _ = userLog("MouseDriver: alloc queue pages failed\n");
         while (true) asm volatile ("pause");
     }
-    while (queue_submit_token_raw == 0 or queue_notify_token_raw == 0) {
+    while (iommu_token == 0 or queue_submit_token_raw == 0 or queue_notify_token_raw == 0 or command_token == 0) {
         _ = waitEvent(false, 1);
-        queue_submit_token_raw = readCfgU64(13);
-        queue_notify_token_raw = readCfgU64(14);
+        iommu_token = readCfgU64(input_bootstrap.iommu_token_index);
+        queue_submit_token_raw = readCfgU64(input_bootstrap.queue_submit_token_index);
+        queue_notify_token_raw = readCfgU64(input_bootstrap.queue_notify_token_index);
+        command_token = readCfgU64(input_bootstrap.command_token_index);
         asm volatile ("pause");
     }
     const queue_submit_token = if (force_invalid_queue_cap_token) @as(u64, 0) else queue_submit_token_raw;

@@ -3,12 +3,18 @@ const cap_transfer_abi = @import("support_root").cap_transfer_abi;
 const block_bootstrap = @import("support_root").block_bootstrap_abi;
 const block_protocol = @import("support_root").block_protocol;
 const fs_abi = @import("support_root").fs_abi;
+const queue_abi = @import("support_root").queue_abi;
 
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_map_page: u64 = 0x2;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
+const syscall_iommu_authorize: u64 = queue_abi.syscall_iommu_authorize;
+const syscall_command_authorize: u64 = queue_abi.syscall_command_authorize;
+const syscall_dma_map_create: u64 = queue_abi.syscall_dma_map_create;
+const syscall_dma_map_set_state: u64 = queue_abi.syscall_dma_map_set_state;
+const syscall_dma_map_release: u64 = queue_abi.syscall_dma_map_release;
 const syscall_wait_event: u64 = 0x17;
 const syscall_log: u64 = 0x9;
 const syscall_install_endpoint: u64 = 0x26;
@@ -93,8 +99,10 @@ const BootState = struct {
     isr_page_offset: u64 = 0,
     device_page_offset: u64 = 0,
     notify_off_multiplier: u64 = 0,
+    iommu_token: u64 = 0,
     queue_submit_token: u64 = 0,
     queue_notify_token: u64 = 0,
+    command_token: u64 = 0,
     queue_paddr0: u64 = 0,
     queue_paddr1: u64 = 0,
     dma_data_paddr: u64 = 0,
@@ -119,6 +127,7 @@ var common_base: usize = 0;
 var notify_addr: usize = 0;
 var isr_base: usize = 0;
 var last_used_idx: u16 = 0;
+var request_control_mapping_token: u64 = 0;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -223,6 +232,60 @@ fn queueNotify(token: u64, queue_index: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn iommuAuthorize(token: u64, device: queue_abi.DeviceId, op: queue_abi.IommuOperation) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_iommu_authorize),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (@as(u64, @intFromEnum(device))),
+          [arg2] "{rdx}" (@as(u64, @intFromEnum(op))),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn commandAuthorize(token: u64, device: queue_abi.DeviceId, opcode: queue_abi.CommandOpcodeClass) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_command_authorize),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (@as(u64, @intFromEnum(device))),
+          [arg2] "{rdx}" (@as(u64, @intFromEnum(opcode))),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn dmaMapCreate(device: queue_abi.DeviceId, paddr_start: u64, length: u64, direction: queue_abi.DmaDirection) u64 {
+    const raw = asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_dma_map_create),
+          [arg0] "{rdi}" (@as(u64, @intFromEnum(device))),
+          [arg1] "{rsi}" (paddr_start),
+          [arg2] "{rdx}" (length),
+          [arg3] "{r8}" (@as(u64, @intFromEnum(direction))),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+    return queue_abi.decodeDmaMappingToken(raw) orelse 0;
+}
+
+fn dmaMapSetState(token: u64, state: queue_abi.DmaMappingState) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_dma_map_set_state),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (@as(u64, @intFromEnum(state))),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn dmaMapRelease(token: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_dma_map_release),
+          [arg0] "{rdi}" (token),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 const fs_token_tag: u64 = 1 << 63;
 var next_fs_token: u64 = 1;
 
@@ -310,8 +373,20 @@ fn reqHeaderPtr() *volatile VirtioBlkReqHeader {
     return @ptrFromInt(queue_page0_va + queue_buffers_offset);
 }
 
+fn reqHeaderPaddr() u64 {
+    return queueRegionPhys(boot_state.queue_paddr0, boot_state.queue_paddr1, queue_buffers_offset);
+}
+
 fn reqStatusPtr() *volatile u8 {
     return @ptrFromInt(queue_page0_va + queue_buffers_offset + @sizeOf(VirtioBlkReqHeader));
+}
+
+fn reqStatusPaddr() u64 {
+    return reqHeaderPaddr() + @sizeOf(VirtioBlkReqHeader);
+}
+
+fn reqControlBytes() u64 {
+    return @sizeOf(VirtioBlkReqHeader) + 1;
 }
 
 fn sessionRequestVa(slot: usize) u64 {
@@ -372,8 +447,10 @@ fn parseBootState() ?BootState {
         .isr_page_offset = readCfgU64(block_bootstrap.isr_page_offset_index),
         .device_page_offset = readCfgU64(block_bootstrap.device_page_offset_index),
         .notify_off_multiplier = readCfgU64(block_bootstrap.notify_off_multiplier_index),
+        .iommu_token = readCfgU64(block_bootstrap.iommu_token_index),
         .queue_submit_token = readCfgU64(block_bootstrap.queue_submit_token_index),
         .queue_notify_token = readCfgU64(block_bootstrap.queue_notify_token_index),
+        .command_token = readCfgU64(block_bootstrap.command_token_index),
     };
 }
 
@@ -385,8 +462,7 @@ fn waitForBootResources() void {
             continue;
         };
         if (boot_state.endpoint_id != 0 and
-            boot_state.queue_submit_token != 0 and
-            boot_state.queue_notify_token != 0 and
+            boot_state.command_token != 0 and
             boot_state.capacity_blocks != 0)
         {
             return;
@@ -468,12 +544,17 @@ fn initVirtio() bool {
         .flags = desc_flag_write,
         .next = 0,
     };
+    if (boot_state.iommu_token != 0) {
+        if (iommuAuthorize(boot_state.iommu_token, .virtio_blk, .map_status) != syscall_ok) return false;
+        request_control_mapping_token = dmaMapCreate(.virtio_blk, reqHeaderPaddr(), reqControlBytes(), .bidirectional);
+        if (request_control_mapping_token == 0) return false;
+    } else {
+        request_control_mapping_token = 0;
+    }
 
     const queue_notify_off = mmioReadU16(common_base + common_queue_notify_off);
     notify_addr = notify_base + @as(usize, queue_notify_off) * @as(usize, @intCast(boot_state.notify_off_multiplier));
     mmioWriteU16(common_base + common_queue_enable, 1);
-    if (queueSubmit(boot_state.queue_submit_token, queue_index_request) != syscall_ok) return false;
-    if (queueNotify(boot_state.queue_notify_token, queue_index_request) != syscall_ok) return false;
     mmioWriteU8(common_base + common_device_status, mmioReadU8(common_base + common_device_status) | status_driver_ok);
     return true;
 }
@@ -537,9 +618,46 @@ fn replyStatus(session: *Session, op: block_protocol.Opcode, request_seq: u64, s
     writeResponseHeader(session, op, request_seq, status, 0, .none, 0, boot_state.logical_block_size, boot_state.capacity_blocks);
 }
 
+fn createBlkDataMapping(byte_count: usize, write: bool) u64 {
+    const device: queue_abi.DeviceId = .virtio_blk;
+    if (byte_count == 0) return 0;
+    const direction: queue_abi.DmaDirection = if (write) .read else .write;
+    return dmaMapCreate(device, boot_state.dma_data_paddr, @intCast(byte_count), direction);
+}
+
+fn setOptionalDmaMappingState(token: u64, state: queue_abi.DmaMappingState) bool {
+    if (token == 0) return true;
+    return dmaMapSetState(token, state) == syscall_ok;
+}
+
+fn releaseOptionalDmaMapping(token: u64) bool {
+    if (token == 0) return true;
+    return dmaMapRelease(token) == syscall_ok;
+}
+
+fn authorizeBlkRequest(request_type: u32, write: bool) bool {
+    const device: queue_abi.DeviceId = .virtio_blk;
+    const command = switch (request_type) {
+        request_type_in => queue_abi.CommandOpcodeClass.blk_read,
+        request_type_out => queue_abi.CommandOpcodeClass.blk_write,
+        request_type_flush => queue_abi.CommandOpcodeClass.blk_flush,
+        else => return false,
+    };
+    if (commandAuthorize(boot_state.command_token, device, command) != syscall_ok) return false;
+    if (request_type != request_type_flush) {
+        const data_op: queue_abi.IommuOperation = if (write) .map_write else .map_read;
+        if (iommuAuthorize(boot_state.iommu_token, device, data_op) != syscall_ok) return false;
+    }
+    return iommuAuthorize(boot_state.iommu_token, device, .map_status) == syscall_ok;
+}
+
 fn executeBlockRequest(request_type: u32, block_index: u64, block_count: u32, write: bool) bool {
     const byte_count = @as(usize, block_count) * @as(usize, @intCast(boot_state.logical_block_size));
     if (byte_count > 4096) return false;
+    if (!authorizeBlkRequest(request_type, write)) return false;
+    if (boot_state.iommu_token != 0 and request_control_mapping_token == 0) return false;
+    const data_mapping_token = createBlkDataMapping(byte_count, write);
+    if (request_type != request_type_flush and data_mapping_token == 0) return false;
     const sectors = block_index * boot_state.sectors_per_block;
     const header = reqHeaderPtr();
     header.* = .{
@@ -562,7 +680,18 @@ fn executeBlockRequest(request_type: u32, block_index: u64, block_count: u32, wr
         desc1.flags = desc_flag_next | if (!write) desc_flag_write else @as(u16, 0);
         desc1.next = 2;
     }
+    if (!setOptionalDmaMappingState(data_mapping_token, .in_flight)) return false;
+    if (queueSubmit(boot_state.queue_submit_token, queue_index_request) != syscall_ok) {
+        _ = setOptionalDmaMappingState(data_mapping_token, .completed);
+        _ = releaseOptionalDmaMapping(data_mapping_token);
+        return false;
+    }
     queuePushAvail(0);
+    if (queueNotify(boot_state.queue_notify_token, queue_index_request) != syscall_ok) {
+        _ = setOptionalDmaMappingState(data_mapping_token, .completed);
+        _ = releaseOptionalDmaMapping(data_mapping_token);
+        return false;
+    }
     mmioWriteU16(notify_addr, queue_index_request);
 
     var spins: usize = 0;
@@ -571,11 +700,15 @@ fn executeBlockRequest(request_type: u32, block_index: u64, block_count: u32, wr
             if (isr_base != 0) _ = mmioReadU8(isr_base);
             _ = queueUsedRingPtr()[@intCast(last_used_idx % queue_size)];
             last_used_idx +%= 1;
+            if (!setOptionalDmaMappingState(data_mapping_token, .completed)) return false;
+            if (!releaseOptionalDmaMapping(data_mapping_token)) return false;
             return status.* == request_status_ok;
         }
         if (isr_base != 0 and (spins & 0xFF) == 0) _ = mmioReadU8(isr_base);
         asm volatile ("pause");
     }
+    _ = setOptionalDmaMappingState(data_mapping_token, .completed);
+    _ = releaseOptionalDmaMapping(data_mapping_token);
     return false;
 }
 
