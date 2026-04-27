@@ -6,6 +6,8 @@ use core::fmt;
 
 use crate::Result;
 
+const READ_TO_END_CHUNK_BYTES: usize = 3840;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SeekFrom {
     Start(u64),
@@ -14,6 +16,11 @@ pub enum SeekFrom {
 }
 
 pub trait Read {
+    /// Blocking read.
+    ///
+    /// Implementations return only after data, EOF, or an error is available.
+    /// A short read is allowed; callers that need an exact byte count must use
+    /// `read_exact`.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
     fn read_exact(&mut self, mut buf: &mut [u8]) -> Result<()> {
@@ -29,9 +36,35 @@ pub trait Read {
 
     fn read_to_end(&mut self, out: &mut Vec<u8>) -> Result<usize> {
         let mut total = 0usize;
-        let mut chunk = [0u8; 256];
+        let mut chunk = [0u8; READ_TO_END_CHUNK_BYTES];
         loop {
             let read = self.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..read]);
+            total += read;
+        }
+        Ok(total)
+    }
+
+    fn read_to_end_bounded(&mut self, out: &mut Vec<u8>, max_bytes: usize) -> Result<usize> {
+        let mut total = 0usize;
+        let mut chunk = [0u8; READ_TO_END_CHUNK_BYTES];
+        loop {
+            let remaining = max_bytes
+                .checked_sub(total)
+                .ok_or_else(|| crate::Error::new(crate::ErrorKind::BufferTooSmall))?;
+            if remaining == 0 {
+                let mut probe = [0u8; 1];
+                if self.read(&mut probe)? == 0 {
+                    return Ok(total);
+                }
+                return Err(crate::Error::new(crate::ErrorKind::BufferTooSmall));
+            }
+
+            let read_len = cmp::min(chunk.len(), remaining);
+            let read = self.read(&mut chunk[..read_len])?;
             if read == 0 {
                 break;
             }
@@ -43,6 +76,11 @@ pub trait Read {
 }
 
 pub trait Write {
+    /// Blocking write.
+    ///
+    /// Implementations return after accepting at least part of the buffer or
+    /// reporting an error. A short write is allowed; callers that need the
+    /// whole buffer committed must use `write_all`.
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
 
     fn flush(&mut self) -> Result<()> {

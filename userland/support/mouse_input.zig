@@ -1,13 +1,12 @@
 const protocol = @import("window_protocol.zig");
 
-pub const shared_page_va: usize = 0x3C00_3000;
 pub const MouseSharedPage = protocol.MouseSharedPage;
 const shared_magic = protocol.mouse_shared_magic;
 pub const button_left: u64 = 0x1;
 pub const button_right: u64 = 0x2;
 pub const button_middle: u64 = 0x4;
 const max_coord_limit: u64 = 0x7FFF_FFFF;
-var current_shared_page_va: usize = shared_page_va;
+var current_shared_page_va: usize = 0;
 
 pub const Snapshot = struct {
     seq: u64,
@@ -129,6 +128,7 @@ pub fn setSharedPageVa(va: u64) void {
 }
 
 pub fn sharedPage() ?*const volatile MouseSharedPage {
+    if (current_shared_page_va == 0) return null;
     const page: *const volatile MouseSharedPage = @ptrFromInt(current_shared_page_va);
     if (page.magic != shared_magic) return null;
     return page;

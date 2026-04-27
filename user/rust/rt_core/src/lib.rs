@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
-use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, compiler_fence};
 
 const USER_LOG_MAX_BYTES: usize = 256;
@@ -108,6 +108,7 @@ pub mod syscall {
     pub const GET_PROCESS_STATUS: u64 = 0x30;
     pub const PROCESS_EXIT: u64 = 0x34;
     pub const GET_MEMORY_STATS: u64 = 0x3C;
+    pub const IPC_CALL_REPLY_RECV: u64 = 0x40;
     pub const OK: u64 = 0;
     pub const ERR_INVALID: u64 = 1;
     pub const ERR_NOT_READY: u64 = 2;
@@ -124,10 +125,10 @@ pub mod syscall {
     #[inline]
     pub fn call0(nr: u64) -> u64 {
         let ret: u64;
-        // SAFETY: Uses the current CapabilityOS int 0x80 syscall ABI.
+        // SAFETY: Uses the CapabilityOS syscall/sysret ABI.
         unsafe {
             asm!(
-                "int 0x80",
+                "syscall",
                 inlateout("rax") nr => ret,
                 lateout("rdx") _,
                 lateout("rcx") _,
@@ -144,10 +145,10 @@ pub mod syscall {
     #[inline]
     pub fn call1(nr: u64, arg0: u64) -> u64 {
         let ret: u64;
-        // SAFETY: Uses the current CapabilityOS int 0x80 syscall ABI.
+        // SAFETY: Uses the CapabilityOS syscall/sysret ABI.
         unsafe {
             asm!(
-                "int 0x80",
+                "syscall",
                 inlateout("rax") nr => ret,
                 in("rdi") arg0,
                 lateout("rdx") _,
@@ -165,10 +166,10 @@ pub mod syscall {
     #[inline]
     pub fn call2(nr: u64, arg0: u64, arg1: u64) -> u64 {
         let ret: u64;
-        // SAFETY: Uses the current CapabilityOS int 0x80 syscall ABI.
+        // SAFETY: Uses the CapabilityOS syscall/sysret ABI.
         unsafe {
             asm!(
-                "int 0x80",
+                "syscall",
                 inlateout("rax") nr => ret,
                 in("rdi") arg0,
                 in("rsi") arg1,
@@ -187,10 +188,10 @@ pub mod syscall {
     #[inline]
     pub fn call3(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
         let ret: u64;
-        // SAFETY: Uses the current CapabilityOS int 0x80 syscall ABI.
+        // SAFETY: Uses the CapabilityOS syscall/sysret ABI.
         unsafe {
             asm!(
-                "int 0x80",
+                "syscall",
                 inlateout("rax") nr => ret,
                 in("rdi") arg0,
                 in("rsi") arg1,
@@ -209,23 +210,110 @@ pub mod syscall {
     #[inline]
     pub fn call4(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         let ret: u64;
-        // SAFETY: Uses the current CapabilityOS int 0x80 syscall ABI.
+        // SAFETY: Uses the CapabilityOS syscall/sysret ABI.
         unsafe {
             asm!(
-                "int 0x80",
+                "syscall",
                 inlateout("rax") nr => ret,
                 in("rdi") arg0,
                 in("rsi") arg1,
                 inlateout("rdx") arg2 => _,
-                inlateout("rcx") arg3 => _,
+                inlateout("r10") arg3 => _,
+                lateout("rcx") _,
                 lateout("r8") _,
                 lateout("r9") _,
-                lateout("r10") _,
                 lateout("r11") _,
                 options(nostack),
             );
         }
         ret
+    }
+}
+
+pub mod vm {
+    use super::{SyscallError, syscall};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    pub const PAGE_BYTES: usize = 4096;
+
+    const DYNAMIC_MAP_BASE_VA: usize = 0x3800_0000;
+    const DYNAMIC_MAP_END_VA: usize = 0x3A00_0000;
+    static NEXT_DYNAMIC_MAP_VA: AtomicUsize = AtomicUsize::new(DYNAMIC_MAP_BASE_VA);
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct MappedPage {
+        va: u64,
+        paddr: u64,
+    }
+
+    impl MappedPage {
+        pub const fn va(self) -> u64 {
+            self.va
+        }
+
+        pub const fn paddr(self) -> u64 {
+            self.paddr
+        }
+    }
+
+    fn reserve_region(page_count: usize) -> Result<u64, SyscallError> {
+        if page_count == 0 {
+            return Err(SyscallError::Invalid);
+        }
+        let bytes = page_count
+            .checked_mul(PAGE_BYTES)
+            .ok_or(SyscallError::Invalid)?;
+        let base = NEXT_DYNAMIC_MAP_VA.fetch_add(bytes, Ordering::SeqCst);
+        let end = base.checked_add(bytes).ok_or(SyscallError::Invalid)?;
+        if end > DYNAMIC_MAP_END_VA {
+            return Err(SyscallError::Alloc);
+        }
+        Ok(base as u64)
+    }
+
+    pub fn alloc_map_page(writable: bool) -> Result<MappedPage, SyscallError> {
+        let paddr = syscall::call0(syscall::ALLOC_PAGE);
+        if paddr < 0x1000 {
+            return Err(SyscallError::from_error_raw(paddr));
+        }
+        map_page_at_dynamic_va(paddr, writable)
+    }
+
+    pub fn map_page_at_dynamic_va(paddr: u64, writable: bool) -> Result<MappedPage, SyscallError> {
+        if paddr < 0x1000 {
+            return Err(SyscallError::Invalid);
+        }
+        let va = reserve_region(1)?;
+        let flags = if writable { 1 } else { 0 };
+        let status = syscall::call3(syscall::MAP_PAGE, va, paddr, flags);
+        if status != syscall::OK {
+            return Err(SyscallError::from_error_raw(status));
+        }
+        Ok(MappedPage { va, paddr })
+    }
+
+    pub fn alloc_map_pages_into(
+        page_count: usize,
+        writable: bool,
+        paddrs: &mut [u64],
+    ) -> Result<u64, SyscallError> {
+        if page_count == 0 || page_count > paddrs.len() {
+            return Err(SyscallError::Invalid);
+        }
+        paddrs.fill(0);
+        let va = reserve_region(page_count)?;
+        let flags = if writable { 1 } else { 0 };
+        let status = syscall::call4(
+            syscall::ALLOC_MAP_PAGES,
+            va,
+            page_count as u64,
+            flags,
+            paddrs.as_mut_ptr() as u64,
+        );
+        if status != syscall::OK {
+            return Err(SyscallError::from_error_raw(status));
+        }
+        Ok(va)
     }
 }
 
@@ -337,6 +425,32 @@ fn log_kernel_bytes(bytes: &[u8]) {
     }
 }
 
+fn copy_volatile_bytes(dst: *mut u8, src: *const u8, len: usize) {
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: Callers pass valid byte ranges inside mapped bootstrap pages.
+        unsafe {
+            write_volatile(dst.add(offset), read_volatile(src.add(offset)));
+        }
+        offset += 1;
+    }
+}
+
+fn log_u64_decimal(mut value: u64) {
+    let mut buf = [0_u8; 20];
+    let mut pos = buf.len();
+    if value == 0 {
+        log_bytes(b"0");
+        return;
+    }
+    while value != 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    log_bytes(&buf[pos..]);
+}
+
 fn log_stdio_diag_once(bit: u32, message: &str) {
     // SAFETY: CapabilityOS user processes are single-threaded today.
     unsafe {
@@ -427,7 +541,7 @@ fn try_stdio_sink_chunk(kind: StdioStreamKind, chunk: &[u8]) -> bool {
 
         write_volatile(&mut page.stream_kind, kind as u64);
         write_volatile(&mut page.byte_len, chunk.len() as u64);
-        copy_nonoverlapping(chunk.as_ptr(), page.payload.as_mut_ptr(), chunk.len());
+        copy_volatile_bytes(page.payload.as_mut_ptr(), chunk.as_ptr(), chunk.len());
         compiler_fence(Ordering::Release);
         write_volatile(&mut page.state, STDIO_SINK_STATE_READY);
         compiler_fence(Ordering::Release);
@@ -497,9 +611,9 @@ fn try_send_stdio_control(packet: &StdioControlPacket) -> Result<bool, SyscallEr
         }
 
         let packet_bytes = core::mem::size_of::<StdioControlPacket>();
-        copy_nonoverlapping(
-            packet as *const StdioControlPacket as *const u8,
+        copy_volatile_bytes(
             page.payload.as_mut_ptr(),
+            packet as *const StdioControlPacket as *const u8,
             packet_bytes,
         );
         write_volatile(&mut page.stream_kind, STDIO_SINK_STREAM_CONTROL);
@@ -648,8 +762,15 @@ pub fn abort() -> ! {
     }
 }
 
-pub fn panic_abort(_info: &PanicInfo<'_>) -> ! {
-    log("rt_core: panic\n");
+pub fn panic_abort(info: &PanicInfo<'_>) -> ! {
+    log("rt_core: panic");
+    if let Some(location) = info.location() {
+        log(" at ");
+        log(location.file());
+        log(":");
+        log_u64_decimal(location.line() as u64);
+    }
+    log("\n");
     abort()
 }
 

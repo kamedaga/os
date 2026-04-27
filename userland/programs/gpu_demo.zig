@@ -1,11 +1,10 @@
 const std = @import("std");
 const gl_client = @import("support_root").gl_client;
 const gpu_protocol = @import("support_root").gpu_protocol;
+const user_vm = @import("support_root").user_vm;
 
 const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
-const request_va: u64 = 0x3C11_4000;
-const response_va: u64 = 0x3C11_5000;
 const cube_face_vertex_count: usize = 36;
 const cube_edge_vertex_count: usize = 72;
 const cube_vertex_count: usize = cube_face_vertex_count + cube_edge_vertex_count;
@@ -220,9 +219,13 @@ fn buildCubeVertices(out: *[cube_vertex_count]gl_client.Vertex, sin_x: f32, cos_
 
 pub export fn _start() noreturn {
     _ = userLog("GpuDemo: started\n");
+    const ipc_va = user_vm.reservePages(2) orelse {
+        _ = userLog("GpuDemo: ipc va unavailable\n");
+        while (true) asm volatile ("pause");
+    };
     var gl = gl_client.Context.connect(.{
-        .request_va = request_va,
-        .response_va = response_va,
+        .request_va = @intCast(ipc_va),
+        .response_va = @intCast(ipc_va + user_vm.page_bytes),
         .endpoint_id = gpu_protocol.endpoint_id,
     }, setup_commands_storage[0..]) catch |err| {
         _ = userLog("GpuDemo: gl connect failed\n");

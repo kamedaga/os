@@ -2,6 +2,7 @@ const cap_transfer_abi = @import("cap_transfer_abi.zig");
 const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
+const user_vm = @import("user_vm.zig");
 const window_client = @import("window_client.zig");
 
 const syscall_ok: u64 = 0;
@@ -9,8 +10,6 @@ const syscall_err_empty: u64 = 13;
 
 const window_pixels_va: usize = 0x3C00_4000;
 const window_meta_shared_va: usize = 0x3C00_7000;
-const window_cap_tmp_va: u64 = 0x2000_4000;
-const request_page_va: usize = 0x2000_3000;
 const fb_width: usize = 32;
 const fb_height: usize = 32;
 const fb_pitch: usize = 32;
@@ -20,6 +19,7 @@ const request_payload_bytes: usize = 4096 - request_payload_offset;
 const request_payload_pixels: usize = request_payload_bytes / @sizeOf(u32);
 const request_op_fill_rect: u64 = 1;
 const request_op_blit_rect: u64 = 2;
+var request_page_va: usize = 0;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -65,6 +65,12 @@ fn acceptCapTransfer(transfer_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn ensureRequestPageVa() ?usize {
+    if (request_page_va != 0) return request_page_va;
+    request_page_va = user_vm.reservePages(1) orelse return null;
+    return request_page_va;
+}
+
 fn clampRectToFramebuffer(
     dst_x: usize,
     dst_y: usize,
@@ -90,6 +96,10 @@ fn clampRectToFramebuffer(
 
 pub export fn _start() noreturn {
     _ = userLog("FramebufferServer: started\n");
+    const window_cap_tmp_va: u64 = @intCast(user_vm.reservePages(1) orelse {
+        _ = userLog("FramebufferServer: reserve cap tmp failed\n");
+        while (true) asm volatile ("pause");
+    });
     const window_created = window_client.createAndPublishWindowWithDma(
         @intCast(fb_width),
         @intCast(fb_height),
@@ -113,13 +123,18 @@ pub export fn _start() noreturn {
             asm volatile ("pause");
             continue;
         }
-        if (mapPage(request_page_va, paddr, false) != syscall_ok) {
+        const request_va = ensureRequestPageVa() orelse {
+            _ = userLog("FramebufferServer: reserve request page failed\n");
+            asm volatile ("pause");
+            continue;
+        };
+        if (mapPage(request_va, paddr, false) != syscall_ok) {
             _ = userLog("FramebufferServer: map request failed\n");
             asm volatile ("pause");
             continue;
         }
 
-        const req: [*]volatile u64 = @ptrFromInt(request_page_va);
+        const req: [*]volatile u64 = @ptrFromInt(request_va);
         const op = req[0];
         const dst_x: usize = @intCast(req[1]);
         const dst_y: usize = @intCast(req[2]);
@@ -164,7 +179,7 @@ pub export fn _start() noreturn {
                 continue;
             }
 
-            const src: [*]volatile u32 = @ptrFromInt(request_page_va + request_payload_offset);
+            const src: [*]volatile u32 = @ptrFromInt(request_va + request_payload_offset);
             var y: usize = 0;
             while (y < rect.height) : (y += 1) {
                 const fb_row = (rect.y + y) * fb_pitch + rect.x;

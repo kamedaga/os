@@ -1588,12 +1588,21 @@ const LaunchContext = struct {
     };
 
     fn openRootFsExecForCapCtl(self: *LaunchContext, path: []const u8, label: []const u8) ?rootfs_core.OpenExecResult {
+        if (self.findCachedExec(.bootfs, path)) |exec| return exec;
+        if (self.findCachedExec(.startup_path, path)) |exec| return exec;
+        self.ensureBootFsArchive();
+        if (openExecFromBootFs(path, self.bootstrap_handoff.bootfs_vm_token)) |exec| {
+            self.logRoleLine("open_exec", label, "bootfs");
+            self.storeCachedExec(.bootfs, path, exec);
+            return exec;
+        }
         self.ensureRootFsReader();
         const exec = rootfs_core.openExec(path) orelse {
             self.logRoleLine("open_exec", label, "failed");
             return null;
         };
         self.logRoleLine("open_exec", label, "ok");
+        self.storeCachedExec(.startup_path, path, exec);
         return exec;
     }
 
@@ -1885,6 +1894,7 @@ const LaunchContext = struct {
         const stdio_source_va = self.ensureSharedStdioBootstrapPage();
         const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
         const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+        const pointer_shared_source_va = self.pointer_shared_source_va;
 
         const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc shell config page failed\n");
         input_bootstrap.writeKeyboardConfigPage(config_source_va, .{
@@ -1899,12 +1909,17 @@ const LaunchContext = struct {
             .notify_off_multiplier = self.keyboard_input.notify_off_multiplier,
         });
         const config_words: [*]volatile u64 = @ptrFromInt(config_source_va);
+        config_words[init_bootstrap_abi.boot_display_config_width_index] = self.primary_display.width;
+        config_words[init_bootstrap_abi.boot_display_config_height_index] = shell_fb_height;
+        config_words[init_bootstrap_abi.boot_display_config_pitch_index] = self.primary_display.pitch;
         config_words[init_bootstrap_abi.boot_display_config_fb_paddr_index] = fb_paddr;
         config_words[init_bootstrap_abi.boot_display_config_fb_size_bytes_index] = shell_fb_size;
         config_words[init_bootstrap_abi.boot_display_config_fb_vm_token_index] = fb_vm_token;
+        config_words[init_bootstrap_abi.boot_display_config_pointer_shared_va_index] =
+            if (pointer_shared_source_va != null) input_bootstrap.pointer_shared_target_va else 0;
 
         boot_display_bootstrap_table_storage = .{};
-        boot_display_bootstrap_table_storage.page_count = 5;
+        boot_display_bootstrap_table_storage.page_count = if (pointer_shared_source_va != null) 6 else 5;
         boot_display_bootstrap_table_storage.cap_count = 1;
         boot_display_bootstrap_table_storage.page_descriptors[0] = .{
             .source_va = config_source_va,
@@ -1931,6 +1946,13 @@ const LaunchContext = struct {
             .target_va = process_exit_bootstrap_abi.target_va,
             .flags = process_abi.spawn_flag_bootstrap_page_writable,
         };
+        if (pointer_shared_source_va) |source_va| {
+            boot_display_bootstrap_table_storage.page_descriptors[5] = .{
+                .source_va = source_va,
+                .target_va = input_bootstrap.pointer_shared_target_va,
+                .flags = 0,
+            };
+        }
         boot_display_bootstrap_table_storage.cap_descriptors[0] = .{
             .source_token = fb_vm_token,
             .target_token_va = process_abi.standard_config_target_va + init_bootstrap_abi.boot_display_config_fb_vm_token_index * 8,
@@ -2050,15 +2072,15 @@ const LaunchContext = struct {
                 .isr_page_offset = input_desc.isr_page_offset,
                 .device_page_offset = input_desc.device_page_offset,
                 .notify_off_multiplier = input_desc.notify_off_multiplier,
+                .shared_page_paddr = self.pointer_shared_paddr,
                 .screen_width = self.primary_display.width,
                 .screen_height = self.primary_display.height,
                 .screen_pitch = self.primary_display.pitch,
-                .shared_target_va = input_bootstrap.pointer_shared_target_va,
             }),
         }
 
         generic_service_bootstrap_table_storage = .{};
-        generic_service_bootstrap_table_storage.page_count = if (input_kind == .pointer) 5 else 4;
+        generic_service_bootstrap_table_storage.page_count = 4;
         generic_service_bootstrap_table_storage.page_descriptors[0] = .{
             .source_va = config_source_va,
             .target_va = process_abi.standard_config_target_va,
@@ -2079,13 +2101,7 @@ const LaunchContext = struct {
             .target_va = process_exit_bootstrap_abi.target_va,
             .flags = process_abi.spawn_flag_bootstrap_page_writable,
         };
-        if (input_kind == .pointer) {
-            generic_service_bootstrap_table_storage.page_descriptors[4] = .{
-                .source_va = pointer_shared_source_va,
-                .target_va = input_bootstrap.pointer_shared_target_va,
-                .flags = process_abi.spawn_flag_bootstrap_page_writable,
-            };
-        }
+        _ = pointer_shared_source_va;
 
         const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &generic_service_bootstrap_table_storage);
         const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {

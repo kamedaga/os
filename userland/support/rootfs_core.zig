@@ -2,20 +2,13 @@ const std = @import("std");
 const image_abi = @import("image_abi.zig");
 const layout = @import("persistent_fs_layout");
 const queue_abi = @import("queue_abi.zig");
+const user_vm = @import("user_vm.zig");
 
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_wait_event: u64 = 0x17;
-
-const mmio_common_page_va: usize = 0x2100_4000;
-const mmio_notify_page_va: usize = 0x2100_5000;
-const mmio_isr_page_va: usize = 0x2100_6000;
-const queue_page0_va: usize = 0x2100_8000;
-const dma_data_page_va: usize = 0x2100_A000;
-const exec_slot_base_va: u64 = 0x3C20_0000;
-const exec_slot_va_stride: u64 = 0x40000;
 
 const max_exec_slots: usize = 8;
 const max_exec_file_bytes: usize = 256 * 1024;
@@ -105,6 +98,8 @@ var block_state = BlockState{};
 var common_base: usize = 0;
 var notify_addr: usize = 0;
 var isr_base: usize = 0;
+var queue_base_va: usize = 0;
+var dma_data_va: usize = 0;
 var last_used_idx: u16 = 0;
 var rootfs_ready = false;
 var rootfs_superblock = layout.VolumeSuperblock{};
@@ -138,6 +133,8 @@ pub fn init(config: Config) bool {
     common_base = 0;
     notify_addr = 0;
     isr_base = 0;
+    queue_base_va = 0;
+    dma_data_va = 0;
     last_used_idx = 0;
     rootfs_ready = false;
     layout.clearDirectory(&rootfs_entries);
@@ -253,6 +250,17 @@ fn waitMapMmioPage(va: u64, paddr: u64, writable: bool) bool {
     return false;
 }
 
+fn waitMapMmioPageDynamic(paddr: u64, writable: bool) ?usize {
+    if (paddr == 0) return null;
+    const va = user_vm.reservePages(1) orelse return null;
+    var attempt: usize = 0;
+    while (attempt < 4096) : (attempt += 1) {
+        if (user_vm.mapMmioPageAtVa(va, paddr, writable)) return va;
+        _ = waitEvent(false, 1);
+    }
+    return null;
+}
+
 fn mmioReadU8(addr: usize) u8 {
     const ptr: *const volatile u8 = @ptrFromInt(addr);
     return ptr.*;
@@ -285,23 +293,23 @@ fn queueRegionPhys(queue_paddr0: u64, queue_paddr1: u64, offset: usize) u64 {
 
 fn queueDescPtr(index: u16) *volatile VirtqDesc {
     const offset = @as(usize, index) * @sizeOf(VirtqDesc);
-    return @ptrFromInt(queue_page0_va + offset);
+    return @ptrFromInt(queue_base_va + offset);
 }
 
 fn queueAvailIdxPtr() *volatile u16 {
-    return @ptrFromInt(queue_page0_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 2);
+    return @ptrFromInt(queue_base_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 2);
 }
 
 fn queueAvailRingPtr() [*]volatile u16 {
-    return @ptrFromInt(queue_page0_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 4);
+    return @ptrFromInt(queue_base_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 4);
 }
 
 fn queueUsedIdxPtr() *volatile u16 {
-    return @ptrFromInt(queue_page0_va + queue_used_offset + 2);
+    return @ptrFromInt(queue_base_va + queue_used_offset + 2);
 }
 
 fn queueUsedRingPtr() [*]volatile VirtqUsedElem {
-    return @ptrFromInt(queue_page0_va + queue_used_offset + 4);
+    return @ptrFromInt(queue_base_va + queue_used_offset + 4);
 }
 
 fn queuePushAvail(desc_id: u16) void {
@@ -313,29 +321,40 @@ fn queuePushAvail(desc_id: u16) void {
 }
 
 fn reqHeaderPtr() *volatile VirtioBlkReqHeader {
-    return @ptrFromInt(queue_page0_va + queue_buffers_offset);
+    return @ptrFromInt(queue_base_va + queue_buffers_offset);
 }
 
 fn reqStatusPtr() *volatile u8 {
-    return @ptrFromInt(queue_page0_va + queue_buffers_offset + @sizeOf(VirtioBlkReqHeader));
+    return @ptrFromInt(queue_base_va + queue_buffers_offset + @sizeOf(VirtioBlkReqHeader));
 }
 
 fn requestDataPtr() [*]volatile u8 {
-    return @ptrFromInt(dma_data_page_va);
+    return @ptrFromInt(dma_data_va);
 }
 
 fn initBlockDevice() bool {
-    if (!waitMapMmioPage(mmio_common_page_va, block_state.common_page_paddr, true)) return false;
-    if (!waitMapMmioPage(mmio_notify_page_va, block_state.notify_page_paddr, true)) return false;
-    if (block_state.isr_page_paddr != 0 and !waitMapMmioPage(mmio_isr_page_va, block_state.isr_page_paddr, false)) return false;
+    const common_page_va = waitMapMmioPageDynamic(block_state.common_page_paddr, true) orelse return false;
+    const notify_page_va = if (block_state.notify_page_paddr == block_state.common_page_paddr)
+        common_page_va
+    else
+        waitMapMmioPageDynamic(block_state.notify_page_paddr, true) orelse return false;
+    const isr_page_va = if (block_state.isr_page_paddr == 0)
+        0
+    else if (block_state.isr_page_paddr == block_state.common_page_paddr)
+        common_page_va
+    else if (block_state.isr_page_paddr == block_state.notify_page_paddr)
+        notify_page_va
+    else
+        waitMapMmioPageDynamic(block_state.isr_page_paddr, false) orelse return false;
 
     var queue_paddrs: [3]u64 = .{ 0, 0, 0 };
-    if (allocMapPages(queue_page0_va, 3, true, @intFromPtr(&queue_paddrs)) != 0) return false;
+    queue_base_va = user_vm.allocMapPagesInto(3, true, queue_paddrs[0..]) orelse return false;
     if (queue_paddrs[0] < 0x1000 or queue_paddrs[1] < 0x1000 or queue_paddrs[2] < 0x1000) return false;
+    dma_data_va = queue_base_va + page_bytes * 2;
 
-    common_base = mmio_common_page_va + @as(usize, @intCast(block_state.common_page_offset));
-    const notify_base = mmio_notify_page_va + @as(usize, @intCast(block_state.notify_page_offset));
-    isr_base = if (block_state.isr_page_paddr != 0) mmio_isr_page_va + @as(usize, @intCast(block_state.isr_page_offset)) else 0;
+    common_base = common_page_va + @as(usize, @intCast(block_state.common_page_offset));
+    const notify_base = notify_page_va + @as(usize, @intCast(block_state.notify_page_offset));
+    isr_base = if (block_state.isr_page_paddr != 0) isr_page_va + @as(usize, @intCast(block_state.isr_page_offset)) else 0;
 
     mmioWriteU8(common_base + common_device_status, 0);
     mmioWriteU8(common_base + common_device_status, status_acknowledge | status_driver);
@@ -504,17 +523,14 @@ fn allocExecSlot(file_size: u64) ?struct { base_va: u64 } {
     if (file_size == 0 or file_size > max_exec_file_bytes) return null;
     const page_count_u64 = (file_size + page_bytes - 1) / page_bytes;
     const page_count: u16 = @intCast(page_count_u64);
-    for (&exec_slots, 0..) |*slot, index| {
+    for (&exec_slots) |*slot| {
         if (slot.active) continue;
-        const base_va = exec_slot_base_va + @as(u64, @intCast(index)) * exec_slot_va_stride;
-        var paddrs: [64]u64 = [_]u64{0} ** 64;
-        if (page_count > paddrs.len) return null;
-        if (allocMapPages(base_va, page_count, true, @intFromPtr(&paddrs)) != 0) return null;
+        const base_va = user_vm.allocMapPages(page_count, true) orelse return null;
         slot.* = .{
             .active = true,
             .page_count = page_count,
         };
-        return .{ .base_va = base_va };
+        return .{ .base_va = @intCast(base_va) };
     }
     return null;
 }

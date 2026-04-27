@@ -2,6 +2,7 @@
 
 import argparse
 import math
+import struct
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -11,20 +12,36 @@ DEFAULT_TTF = Path("tools/Cantarell-Regular.ttf")
 DEFAULT_OUTPUT = Path(".artifacts/font-atlas/font_atlas.rs")
 DEFAULT_FIRST = 0x20
 DEFAULT_LAST = 0x7E
+CAPFONT_MAGIC = b"CAPFNT1\0"
+CAPFONT_RAW_VERSION = 1
+CAPFONT_RAW_HEADER_SIZE = 64
+CAPFONT_RLE_VERSION = 2
+CAPFONT_RLE_HEADER_SIZE = 80
+CAPFONT_GLYPH_RECORD_SIZE = 20
+CAPFONT_ATLAS_ENCODING_ATLAS_RLE16 = 1
+CAPFONT_ATLAS_ENCODING_GLYPH_RLE16 = 2
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a fixed-cell alpha font atlas as a Rust module.")
     parser.add_argument("--ttf", type=Path, default=DEFAULT_TTF, help="Path to the source TTF file.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output Rust file path.")
+    parser.add_argument("--capfont-output", type=Path, default=None, help="Optional output .capfont atlas file path.")
     parser.add_argument("--font-name", default=None, help="Logical font name to write into the generated module.")
     parser.add_argument("--cell-width", type=int, default=16, help="Per-glyph cell width in pixels.")
     parser.add_argument("--cell-height", type=int, default=24, help="Per-glyph cell height in pixels.")
     parser.add_argument("--columns", type=int, default=16, help="Atlas cell columns.")
+    parser.add_argument("--cell-padding", type=int, default=0, help="Transparent padding around each atlas cell.")
     parser.add_argument("--supersample", type=int, default=3, help="Render glyphs at N times target size before downsampling.")
     parser.add_argument("--first", type=lambda value: int(value, 0), default=DEFAULT_FIRST, help="First codepoint to include.")
     parser.add_argument("--last", type=lambda value: int(value, 0), default=DEFAULT_LAST, help="Last codepoint to include.")
     parser.add_argument("--chars", default=None, help="Explicit characters to include instead of a contiguous codepoint range.")
+    parser.add_argument(
+        "--capfont-format",
+        choices=("raw", "rle"),
+        default="raw",
+        help="Atlas storage for --capfont-output. raw is larger but avoids runtime decode.",
+    )
     return parser.parse_args()
 
 
@@ -123,15 +140,18 @@ def build_atlas(
     cell_width: int,
     cell_height: int,
     columns: int,
+    cell_padding: int,
 ) -> tuple[list[int], int, int]:
     rows = math.ceil(len(glyphs) / columns)
-    atlas_width = cell_width * columns
-    atlas_height = cell_height * rows
+    cell_stride_x = cell_width + cell_padding * 2
+    cell_stride_y = cell_height + cell_padding * 2
+    atlas_width = cell_stride_x * columns
+    atlas_height = cell_stride_y * rows
     atlas = [0] * (atlas_width * atlas_height)
 
     for index, glyph in enumerate(glyphs):
-        cell_x = (index % columns) * cell_width
-        cell_y = (index // columns) * cell_height
+        cell_x = (index % columns) * cell_stride_x + cell_padding
+        cell_y = (index // columns) * cell_stride_y + cell_padding
         glyph["atlas_x"] = cell_x
         glyph["atlas_y"] = cell_y
 
@@ -159,6 +179,7 @@ def emit_rust(
     cell_height: int,
     columns: int,
     supersample: int,
+    cell_padding: int,
     font_size: int,
     line_height: int,
     glyphs: list[dict[str, int | list[int]]],
@@ -180,6 +201,7 @@ def emit_rust(
     lines.append(f"pub const CELL_ADVANCE: u32 = {cell_advance};")
     lines.append(f"pub const LINE_HEIGHT: u32 = {line_height};")
     lines.append(f"pub const COLUMNS: u32 = {columns};")
+    lines.append(f"pub const CELL_PADDING: u32 = {cell_padding};")
     lines.append(f"pub const SUPERSAMPLE: u32 = {supersample};")
     lines.append(f"pub const ATLAS_WIDTH: u32 = {atlas_width};")
     lines.append(f"pub const ATLAS_HEIGHT: u32 = {atlas_height};")
@@ -225,6 +247,110 @@ def emit_rust(
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def emit_capfont(
+    output_path: Path,
+    capfont_format: str,
+    cell_width: int,
+    cell_height: int,
+    columns: int,
+    supersample: int,
+    cell_padding: int,
+    font_size: int,
+    line_height: int,
+    glyphs: list[dict[str, int | list[int]]],
+    atlas: list[int],
+    atlas_width: int,
+    atlas_height: int,
+) -> None:
+    fallback_index = next(index for index, glyph in enumerate(glyphs) if glyph["codepoint"] == ord("?"))
+    advances = sorted(int(glyph["advance"]) for glyph in glyphs)
+    cell_advance = advances[(len(advances) * 9) // 10]
+    if capfont_format == "raw":
+        header = struct.pack(
+            "<8s14I",
+            CAPFONT_MAGIC,
+            CAPFONT_RAW_VERSION,
+            CAPFONT_RAW_HEADER_SIZE,
+            len(glyphs),
+            CAPFONT_GLYPH_RECORD_SIZE,
+            cell_width,
+            cell_height,
+            cell_advance,
+            line_height,
+            columns,
+            supersample,
+            atlas_width,
+            atlas_height,
+            fallback_index,
+            0,
+        )
+        atlas_bytes = bytes(atlas)
+    else:
+        encoded_atlas = encode_rle16(atlas)
+        header = struct.pack(
+            "<8s18I",
+            CAPFONT_MAGIC,
+            CAPFONT_RLE_VERSION,
+            CAPFONT_RLE_HEADER_SIZE,
+            len(glyphs),
+            CAPFONT_GLYPH_RECORD_SIZE,
+            cell_width,
+            cell_height,
+            cell_advance,
+            line_height,
+            columns,
+            supersample,
+            atlas_width,
+            atlas_height,
+            fallback_index,
+            font_size,
+            CAPFONT_ATLAS_ENCODING_ATLAS_RLE16,
+            len(encoded_atlas),
+            len(atlas),
+            0,
+        )
+        atlas_bytes = encoded_atlas
+    records = bytearray()
+    for glyph in glyphs:
+        records.extend(
+            struct.pack(
+                "<IHhhHHHHH",
+                int(glyph["codepoint"]),
+                int(glyph["advance"]),
+                int(glyph["bearing_x"]),
+                int(glyph["top_offset"]),
+                int(glyph["width"]),
+                int(glyph["height"]),
+                int(glyph["atlas_x"]),
+                int(glyph["atlas_y"]),
+                0,
+            )
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(header + records + atlas_bytes)
+
+
+def encode_rle16(values: list[int]) -> bytes:
+    out = bytearray()
+    index = 0
+    while index < len(values):
+        value = values[index]
+        run = 1
+        while index + run < len(values) and values[index + run] == value and run < 0xFFFF:
+            run += 1
+        out.extend(struct.pack("<HB", run, value))
+        index += run
+    return bytes(out)
+
+
+def encode_glyph_rle16(glyphs: list[dict[str, int | list[int]]]) -> bytes:
+    out = bytearray()
+    for glyph in glyphs:
+        out.extend(encode_rle16(glyph["mask"]))
+    return bytes(out)
+
+
 def selected_codepoints(args: argparse.Namespace) -> list[int]:
     if args.chars is None:
         if args.first > args.last:
@@ -253,6 +379,8 @@ def main() -> int:
         raise ValueError("--supersample must be >= 1")
     if args.columns <= 0:
         raise ValueError("--columns must be >= 1")
+    if args.cell_padding < 0:
+        raise ValueError("--cell-padding must be >= 0")
 
     codepoints = selected_codepoints(args)
 
@@ -271,7 +399,13 @@ def main() -> int:
         union_bbox,
         codepoints,
     )
-    atlas, atlas_width, atlas_height = build_atlas(glyphs, args.cell_width, args.cell_height, args.columns)
+    atlas, atlas_width, atlas_height = build_atlas(
+        glyphs,
+        args.cell_width,
+        args.cell_height,
+        args.columns,
+        args.cell_padding,
+    )
     font_name = args.font_name if args.font_name is not None else args.ttf.stem
     emit_rust(
         args.output,
@@ -281,6 +415,7 @@ def main() -> int:
         args.cell_height,
         args.columns,
         args.supersample,
+        args.cell_padding,
         font_size,
         line_height,
         glyphs,
@@ -288,6 +423,22 @@ def main() -> int:
         atlas_width,
         atlas_height,
     )
+    if args.capfont_output is not None:
+        emit_capfont(
+            args.capfont_output,
+            args.capfont_format,
+            args.cell_width,
+            args.cell_height,
+            args.columns,
+            args.supersample,
+            args.cell_padding,
+            font_size,
+            line_height,
+            glyphs,
+            atlas,
+            atlas_width,
+            atlas_height,
+        )
     return 0
 
 

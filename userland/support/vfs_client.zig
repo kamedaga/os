@@ -3,6 +3,7 @@ const fs_abi = @import("fs_abi.zig");
 const image_abi = @import("image_abi.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
 const vfs_protocol = @import("vfs_protocol.zig");
+const user_vm = @import("user_vm.zig");
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -46,8 +47,8 @@ pub const Error = error{
 };
 
 pub const ConnectOptions = struct {
-    request_va: u64,
-    response_va: u64,
+    request_va: u64 = 0,
+    response_va: u64 = 0,
     client_process_slot: u64,
     endpoint_id: u64 = endpoint_to_vfs,
     response_poll_limit: u64 = default_response_poll_limit,
@@ -104,21 +105,15 @@ pub const Client = struct {
     response_poll_limit: u64 = default_response_poll_limit,
 
     pub fn connect(options: ConnectOptions) Error!Client {
-        const request_paddr = allocPage();
-        if (request_paddr < 0x1000) return error.RequestAllocFailed;
-        if (mapPage(options.request_va, request_paddr, true) != 0) return error.RequestMapFailed;
-
-        const response_paddr = allocPage();
-        if (response_paddr < 0x1000) return error.ResponseAllocFailed;
-        if (mapPage(options.response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
+        const pages = try allocConnectPages(options.request_va, options.response_va);
         var compat_installed = false;
-        try grantResponseCapForConnect(response_paddr, options, &compat_installed);
+        try grantResponseCapForConnect(pages.response_paddr, options, &compat_installed);
 
         var client = Client{
-            .request_va = options.request_va,
-            .response_va = options.response_va,
-            .request_paddr = request_paddr,
-            .response_paddr = response_paddr,
+            .request_va = pages.request_va,
+            .response_va = pages.response_va,
+            .request_paddr = pages.request_paddr,
+            .response_paddr = pages.response_paddr,
             .response_poll_limit = options.response_poll_limit,
         };
 
@@ -134,12 +129,12 @@ pub const Client = struct {
         request.path_bytes = 0;
         request.inline_bytes = 0;
         request.reserved0 = 0;
-        request.arg0 = response_paddr;
+        request.arg0 = pages.response_paddr;
         request.arg1 = options.client_process_slot;
         compilerBarrier();
         request.request_seq = 1;
 
-        try shareConnectRequest(request_paddr, options, &compat_installed);
+        try shareConnectRequest(pages.request_paddr, options, &compat_installed);
         _ = try client.finishRequestOk(1, .connect);
         return client;
     }
@@ -351,6 +346,41 @@ pub const Client = struct {
         };
     }
 };
+
+const ConnectPages = struct {
+    request_va: u64,
+    response_va: u64,
+    request_paddr: u64,
+    response_paddr: u64,
+};
+
+fn allocConnectPages(request_va: u64, response_va: u64) Error!ConnectPages {
+    if (request_va == 0 and response_va == 0) {
+        var paddrs: [2]u64 = .{ 0, 0 };
+        const base_va = user_vm.allocMapPagesInto(2, true, paddrs[0..]) orelse return error.RequestAllocFailed;
+        if (paddrs[0] < 0x1000 or paddrs[1] < 0x1000) return error.RequestAllocFailed;
+        return .{
+            .request_va = @intCast(base_va),
+            .response_va = @intCast(base_va + user_vm.page_bytes),
+            .request_paddr = paddrs[0],
+            .response_paddr = paddrs[1],
+        };
+    }
+    if (request_va == 0 or response_va == 0) return error.Invalid;
+    const request_paddr = allocPage();
+    if (request_paddr < 0x1000) return error.RequestAllocFailed;
+    if (mapPage(request_va, request_paddr, true) != 0) return error.RequestMapFailed;
+
+    const response_paddr = allocPage();
+    if (response_paddr < 0x1000) return error.ResponseAllocFailed;
+    if (mapPage(response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
+    return .{
+        .request_va = request_va,
+        .response_va = response_va,
+        .request_paddr = request_paddr,
+        .response_paddr = response_paddr,
+    };
+}
 
 fn allocPage() u64 {
     return asm volatile (

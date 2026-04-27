@@ -1,12 +1,13 @@
 const std = @import("std");
-const block_client = @import("support_root").block_client;
 const cap_transfer_abi = @import("support_root").cap_transfer_abi;
 const fs_abi = @import("support_root").fs_abi;
 const fs_protocol = @import("support_root").fs_protocol;
 const image_abi = @import("support_root").image_abi;
 const layout = @import("persistent_fs_layout");
 const persistent_fs_bootstrap = @import("support_root").persistent_fs_bootstrap_abi;
+const persistent_volume_store = @import("support_root").persistent_volume_store;
 const process_abi = @import("support_root").process_abi;
+const user_vm = @import("support_root").user_vm;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_log: u64 = 0x9;
@@ -17,23 +18,18 @@ const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_get_process_slot: u64 = 0x2E;
 
 const config_page_va: u64 = process_abi.standard_config_target_va;
-const block_request_va: u64 = 0x3C10_4000;
-const block_response_va: u64 = 0x3C10_5000;
-const session_base_va: u64 = 0x3C11_0000;
-const session_va_stride: u64 = 0x2000;
 const reply_endpoint_id_base: u64 = 0xD0;
-const max_sessions: usize = 4;
+const max_sessions: usize = 32;
 const max_session_objects: usize = 16;
 const max_block_bytes: usize = 4096;
+const block_cache_entries: usize = 384;
 const max_dir_entries: usize = layout.max_dir_entries;
 const max_name_bytes: usize = layout.max_name_bytes;
 const max_path_bytes: usize = fs_protocol.max_path_bytes;
 const max_exec_file_bytes: usize = 768 * 1024;
 const max_exec_slots: usize = 64;
 const page_bytes: usize = 4096;
-const exec_slot_base_va: u64 = 0x3D00_0000;
-const exec_slot_va_stride: u64 = max_exec_file_bytes;
-const block_connect_poll_limit: u64 = 65536;
+const store_connect_poll_limit: u64 = 65536;
 const root_mount_object_id: u64 = 0x5053_4653; // "PSFS"
 const root_dir_object_id: u64 = 0x5053_4654; // "PSFT"
 const vnode_file_object_id_base: u64 = 0x5053_4700;
@@ -59,10 +55,13 @@ const SessionObject = struct {
 
 const Session = struct {
     active: bool = false,
+    request_paddr: u64 = 0,
     client_process_slot: u64 = 0,
     request_va: u64 = 0,
     response_va: u64 = 0,
+    response_paddr: u64 = 0,
     reply_endpoint_id: u64 = 0,
+    session_nonce: u64 = 0,
     last_completed_seq: u64 = 0,
     objects: [max_session_objects]SessionObject = [_]SessionObject{.{}} ** max_session_objects,
 };
@@ -72,6 +71,7 @@ const VolumeDirEntry = layout.VolumeDirEntry;
 
 const ExecImageSlot = struct {
     active: bool = false,
+    source_va: u64 = 0,
     page_count: u16 = 0,
     file_index: u16 = 0,
     file_generation: u32 = 0,
@@ -80,7 +80,7 @@ const ExecImageSlot = struct {
 
 comptime {
     std.debug.assert(max_exec_file_bytes % page_bytes == 0);
-    std.debug.assert(exec_slot_base_va + (max_exec_slots * exec_slot_va_stride) <= 0x4000_0000);
+    std.debug.assert(block_cache_entries * @sizeOf(u64) <= page_bytes);
 }
 
 const fs_token_tag: u64 = 1 << 63;
@@ -97,19 +97,18 @@ var process_slot: u64 = 0;
 var volume_region_start_block: u64 = 0;
 var block_size: u64 = 0;
 var capacity_blocks: u64 = 0;
-var block_state: block_client.Client = undefined;
-var block_ready = false;
+var volume_store = persistent_volume_store.Store{};
 var volume_superblock = VolumeSuperblock{};
+var block_buffer_va: u64 = 0;
+var io_buffer_va: u64 = 0;
 var volume_dir_entries: [max_dir_entries]VolumeDirEntry = [_]VolumeDirEntry{.{}} ** max_dir_entries;
 var file_generations: [max_dir_entries]u32 = [_]u32{0} ** max_dir_entries;
 var sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions;
-var block_buffer: [max_block_bytes]u8 align(16) = [_]u8{0} ** max_block_bytes;
-var io_buffer: [max_block_bytes]u8 align(16) = [_]u8{0} ** max_block_bytes;
 var exec_slots: [max_exec_slots]ExecImageSlot = [_]ExecImageSlot{.{}} ** max_exec_slots;
-
+var reply_endpoint_unavailable_logged: bool = false;
 fn userLog(message: []const u8) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
@@ -123,9 +122,15 @@ fn userLogError(prefix: []const u8, err: anyerror) void {
     _ = userLog(msg);
 }
 
+fn userLogFmt(comptime fmt: []const u8, args: anytype) void {
+    var buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    _ = userLog(msg);
+}
+
 fn allocPage() u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_alloc_page),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
@@ -133,7 +138,7 @@ fn allocPage() u64 {
 
 fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_wait_event),
           [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
@@ -143,7 +148,7 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
 
 fn getProcessSlot() u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_get_process_slot),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
@@ -151,7 +156,7 @@ fn getProcessSlot() u64 {
 
 fn acceptCapTransfer(transfer_id: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (cap_transfer_abi.syscall_accept_cap_transfer),
           [arg0] "{rdi}" (transfer_id),
@@ -160,7 +165,7 @@ fn acceptCapTransfer(transfer_id: u64) u64 {
 
 fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_map_page),
           [arg0] "{rdi}" (va),
@@ -171,7 +176,7 @@ fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
 
 fn installEndpoint(endpoint: u64, target_process_slot: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_install_endpoint),
           [arg0] "{rdi}" (@as(u64, 0)),
@@ -182,7 +187,7 @@ fn installEndpoint(endpoint: u64, target_process_slot: u64) u64 {
 
 fn signalEndpoint(endpoint: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_signal_endpoint),
           [arg0] "{rdi}" (endpoint),
@@ -191,7 +196,7 @@ fn signalEndpoint(endpoint: u64) u64 {
 
 fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (image_abi.syscall_install_vm_object),
           [arg0] "{rdi}" (base_va),
@@ -202,7 +207,7 @@ fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRigh
 
 fn installExecImage(vm_token: u64, rights: image_abi.ExecImageRights) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (image_abi.syscall_install_exec_image),
           [arg0] "{rdi}" (vm_token),
@@ -212,7 +217,7 @@ fn installExecImage(vm_token: u64, rights: image_abi.ExecImageRights) u64 {
 
 fn grantExecImage(token: u64, to_process_slot: u64, rights: image_abi.ExecImageRights) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (image_abi.syscall_grant_exec_image),
           [arg0] "{rdi}" (token),
@@ -247,14 +252,6 @@ fn requestPayload(session: *const Session) [*]volatile u8 {
 
 fn responsePayload(session: *const Session) [*]volatile u8 {
     return @ptrFromInt(session.response_va + fs_protocol.response_header_bytes);
-}
-
-fn sessionRequestVa(slot: usize) u64 {
-    return session_base_va + @as(u64, @intCast(slot)) * session_va_stride;
-}
-
-fn sessionResponseVa(slot: usize) u64 {
-    return sessionRequestVa(slot) + 0x1000;
 }
 
 fn serverMountRights() fs_abi.Rights {
@@ -366,42 +363,76 @@ fn parseConfig() bool {
     return endpoint_id != 0 and volume_region_start_block >= 2048;
 }
 
-fn blockSlice(buffer: []u8) []u8 {
-    return buffer[0..@as(usize, @intCast(block_size))];
+fn validBlockSize() ?usize {
+    const size: usize = @intCast(block_size);
+    if (size == 0 or size > max_block_bytes) return null;
+    return size;
 }
 
-fn initBlockService() bool {
+fn blockSlice(buffer: []u8) ?[]u8 {
+    const size = validBlockSize() orelse return null;
+    if (buffer.len < size) return null;
+    return buffer[0..size];
+}
+
+fn mapScratchPage(va: u64) bool {
+    const paddr = allocPage();
+    if (paddr < 0x1000) return false;
+    if (mapPage(va, paddr, true) != 0) return false;
+    clearPage(va);
+    return true;
+}
+
+fn initScratchPages() bool {
+    const block_page = user_vm.allocMapPage(true) orelse return false;
+    const io_page = user_vm.allocMapPage(true) orelse return false;
+    block_buffer_va = @intCast(block_page.va);
+    io_buffer_va = @intCast(io_page.va);
+    clearPage(block_buffer_va);
+    clearPage(io_buffer_va);
+    return true;
+}
+
+fn blockBuffer() []u8 {
+    const ptr: [*]u8 = @ptrFromInt(block_buffer_va);
+    return ptr[0..max_block_bytes];
+}
+
+fn ioBuffer() []u8 {
+    const ptr: [*]u8 = @ptrFromInt(io_buffer_va);
+    return ptr[0..max_block_bytes];
+}
+
+fn initVolumeStore() bool {
     process_slot = getProcessSlot();
     if (process_slot == 0) return false;
-    block_state = block_client.Client.connectFromServiceRegistryOptions(block_request_va, block_response_va, process_slot, .{
-        .response_poll_limit = block_connect_poll_limit,
-    }) catch |err| {
-        userLogError("PersistentFs: block connect err=", err);
-        return false;
-    };
-    block_size = block_state.block_size;
-    capacity_blocks = block_state.capacity_blocks;
-    if (block_size == 0 or block_size > max_block_bytes or capacity_blocks == 0) return false;
-    block_ready = true;
+    const store_pages_va = user_vm.reservePages(2) orelse return false;
+    const cache_tags_va = user_vm.reservePages(1) orelse return false;
+    const cache_data_base_va = user_vm.reservePages(block_cache_entries) orelse return false;
+    if (!volume_store.init(process_slot, .{
+        .request_va = @intCast(store_pages_va),
+        .response_va = @intCast(store_pages_va + user_vm.page_bytes),
+        .cache_tags_va = @intCast(cache_tags_va),
+        .cache_data_base_va = @intCast(cache_data_base_va),
+        .max_block_bytes = max_block_bytes,
+        .cache_entries = block_cache_entries,
+        .response_poll_limit = store_connect_poll_limit,
+    })) return false;
+    block_size = volume_store.block_size;
+    capacity_blocks = volume_store.capacity_blocks;
     return true;
 }
 
 fn readBlock(block_index: u64, out: []u8) bool {
-    if (!block_ready or out.len < block_size) return false;
-    _ = block_state.readBlocks(block_index, out[0..@as(usize, @intCast(block_size))]) catch return false;
-    return true;
+    return volume_store.readBlock(block_index, out);
 }
 
 fn writeBlock(block_index: u64, bytes: []const u8) bool {
-    if (!block_ready or bytes.len < block_size) return false;
-    block_state.writeBlocks(block_index, bytes[0..@as(usize, @intCast(block_size))]) catch return false;
-    return true;
+    return volume_store.writeBlock(block_index, bytes);
 }
 
 fn flushBlocks() bool {
-    if (!block_ready) return false;
-    block_state.flush() catch return false;
-    return true;
+    return volume_store.flush();
 }
 
 fn dirEntryBytes(entry: *const VolumeDirEntry) []const u8 {
@@ -429,14 +460,14 @@ fn validateSuperblock(sb: *const VolumeSuperblock) bool {
 }
 
 fn persistSuperblock() bool {
-    const block = blockSlice(block_buffer[0..]);
+    const block = blockSlice(blockBuffer()) orelse return false;
     @memset(block, 0);
     @memcpy(block[0..@sizeOf(VolumeSuperblock)], std.mem.asBytes(&volume_superblock));
     return writeBlock(volume_region_start_block, block);
 }
 
 fn loadSuperblock() bool {
-    const block = blockSlice(block_buffer[0..]);
+    const block = blockSlice(blockBuffer()) orelse return false;
     if (!readBlock(volume_region_start_block, block)) return false;
     @memcpy(std.mem.asBytes(&volume_superblock), block[0..@sizeOf(VolumeSuperblock)]);
     return validateSuperblock(&volume_superblock);
@@ -448,7 +479,7 @@ fn persistDirectory() bool {
     var entry_index: usize = 0;
     var block_offset: u64 = 0;
     while (block_offset < volume_superblock.dir_block_count) : (block_offset += 1) {
-        const block = blockSlice(block_buffer[0..]);
+        const block = blockSlice(blockBuffer()) orelse return false;
         @memset(block, 0);
         var slot: usize = 0;
         while (slot < entries_per_block and entry_index < max_dir_entries) : ({
@@ -471,7 +502,7 @@ fn loadDirectory() bool {
     var entry_index: usize = 0;
     var block_offset: u64 = 0;
     while (block_offset < volume_superblock.dir_block_count) : (block_offset += 1) {
-        const block = blockSlice(block_buffer[0..]);
+        const block = blockSlice(blockBuffer()) orelse return false;
         if (!readBlock(volume_superblock.dir_start_block + block_offset, block)) return false;
         var slot: usize = 0;
         while (slot < entries_per_block and entry_index < max_dir_entries) : ({
@@ -538,6 +569,17 @@ fn entryModeBits(entry: *const VolumeDirEntry) u32 {
 
 fn entryParentMatches(entry: *const VolumeDirEntry, parent_index: ?usize) bool {
     return dirEntryParentIndex(entry) == parent_index;
+}
+
+fn hasDirEntryFrom(parent_index: ?usize, start_cursor: usize) bool {
+    var cursor = start_cursor;
+    while (cursor < max_dir_entries) : (cursor += 1) {
+        const entry = &volume_dir_entries[cursor];
+        if (!dirEntryUsed(entry)) continue;
+        if (!entryParentMatches(entry, parent_index)) continue;
+        return true;
+    }
+    return false;
 }
 
 fn namesEqualVolatile(bytes: [*]volatile u8, len: usize, expected: []const u8) bool {
@@ -883,16 +925,12 @@ fn fileHasElfMagic(entry: *const VolumeDirEntry) bool {
     return bytes_read == 4 and header[0] == 0x7F and header[1] == 'E' and header[2] == 'L' and header[3] == 'F';
 }
 
-fn execSlotBaseVa(slot: usize) u64 {
-    return exec_slot_base_va + @as(u64, @intCast(slot)) * exec_slot_va_stride;
-}
-
-fn loadFileIntoExecSlot(slot: usize, entry: *const VolumeDirEntry) bool {
+fn loadFileIntoExecSlot(base_va: u64, entry: *const VolumeDirEntry) bool {
     const file_bytes: usize = @intCast(entry.file_size);
     var offset: usize = 0;
     var page_index: usize = 0;
     while (offset < file_bytes) : (page_index += 1) {
-        const page: [*]u8 = @ptrFromInt(execSlotBaseVa(slot) + @as(u64, @intCast(page_index * page_bytes)));
+        const page: [*]u8 = @ptrFromInt(base_va + @as(u64, @intCast(page_index * page_bytes)));
         @memset(page[0..page_bytes], 0);
         const chunk = @min(page_bytes, file_bytes - offset);
         const bytes_read = readFileBytes(entry, offset, page[0..chunk]) orelse return false;
@@ -904,8 +942,12 @@ fn loadFileIntoExecSlot(slot: usize, entry: *const VolumeDirEntry) bool {
 
 fn grantExecToken(session: *Session, file_index: usize, entry: *const VolumeDirEntry) ?u64 {
     const file_bytes: usize = @intCast(entry.file_size);
-    if (file_bytes == 0 or file_bytes > max_exec_file_bytes) return null;
+    if (file_bytes == 0 or file_bytes > max_exec_file_bytes) {
+        userLogFmt("PersistentFs: open_exec size rejected file_index={d} bytes={d}", .{ file_index, file_bytes });
+        return null;
+    }
     const needed_pages = (file_bytes + page_bytes - 1) / page_bytes;
+    const source_pages = needed_pages + 1;
     const generation = fileGeneration(file_index);
 
     for (&exec_slots) |*slot| {
@@ -913,7 +955,10 @@ fn grantExecToken(session: *Session, file_index: usize, entry: *const VolumeDirE
         if (slot.file_index != @as(u16, @intCast(file_index))) continue;
         if (slot.file_generation != generation) continue;
         const client_token = grantExecImage(slot.server_exec_token, session.client_process_slot, .{ .exec = true });
-        if (image_abi.decodeExecImageToken(client_token) == null) return null;
+        if (image_abi.decodeExecImageToken(client_token) == null) {
+            userLogFmt("PersistentFs: open_exec cached grant failed file_index={d} client_slot={d}", .{ file_index, session.client_process_slot });
+            return null;
+        }
         return client_token;
     }
 
@@ -921,25 +966,35 @@ fn grantExecToken(session: *Session, file_index: usize, entry: *const VolumeDirE
     while (slot_index < max_exec_slots) : (slot_index += 1) {
         if (exec_slots[slot_index].active) continue;
 
-        var page_index: usize = 0;
-        while (page_index < needed_pages) : (page_index += 1) {
-            const paddr = allocPage();
-            if (paddr < 0x1000) return null;
-            const page_va = execSlotBaseVa(slot_index) + @as(u64, @intCast(page_index * page_bytes));
-            if (mapPage(page_va, paddr, true) != 0) return null;
+        const source_va: u64 = @intCast(user_vm.allocMapPages(source_pages, true) orelse {
+            userLogFmt("PersistentFs: open_exec alloc failed file_index={d} pages={d}", .{ file_index, source_pages });
+            return null;
+        });
+        if (!loadFileIntoExecSlot(source_va, entry)) {
+            userLogFmt("PersistentFs: open_exec load failed file_index={d} slot={d} bytes={d}", .{ file_index, slot_index, file_bytes });
+            return null;
         }
-        if (!loadFileIntoExecSlot(slot_index, entry)) return null;
 
-        const server_vm_token = installVmObject(execSlotBaseVa(slot_index), entry.file_size, .{ .read = true });
-        if (image_abi.decodeVmObjectToken(server_vm_token) == null) return null;
+        const server_vm_token = installVmObject(source_va, entry.file_size, .{ .read = true });
+        if (image_abi.decodeVmObjectToken(server_vm_token) == null) {
+            userLogFmt("PersistentFs: open_exec vm install failed file_index={d} slot={d} raw=0x{x}", .{ file_index, slot_index, server_vm_token });
+            return null;
+        }
         const server_exec_token = installExecImage(server_vm_token, .{ .exec = true, .grant = true });
-        if (image_abi.decodeExecImageToken(server_exec_token) == null) return null;
+        if (image_abi.decodeExecImageToken(server_exec_token) == null) {
+            userLogFmt("PersistentFs: open_exec image install failed file_index={d} slot={d} raw=0x{x}", .{ file_index, slot_index, server_exec_token });
+            return null;
+        }
         const client_token = grantExecImage(server_exec_token, session.client_process_slot, .{ .exec = true });
-        if (image_abi.decodeExecImageToken(client_token) == null) return null;
+        if (image_abi.decodeExecImageToken(client_token) == null) {
+            userLogFmt("PersistentFs: open_exec grant failed file_index={d} slot={d} client_slot={d} raw=0x{x}", .{ file_index, slot_index, session.client_process_slot, client_token });
+            return null;
+        }
 
         exec_slots[slot_index] = .{
             .active = true,
-            .page_count = @intCast(needed_pages),
+            .source_va = source_va,
+            .page_count = @intCast(source_pages),
             .file_index = @intCast(file_index),
             .file_generation = generation,
             .server_exec_token = server_exec_token,
@@ -1139,15 +1194,26 @@ fn replyStatFs(session: *Session, request_seq: u64) void {
 fn readFileBytes(entry: *const VolumeDirEntry, offset: u64, out: []u8) ?usize {
     if (offset >= entry.file_size or out.len == 0) return 0;
     if (entry.block_count == 0 or entry.start_block == 0) return 0;
-    var remaining: usize = @min(out.len, @as(usize, @intCast(entry.file_size - offset)));
+    const block_size_usize = validBlockSize() orelse return null;
+    const first_relative_block = offset / block_size;
+    if (first_relative_block >= entry.block_count) return 0;
+    const readable_from_extent = entry.block_count * block_size - offset;
+    const readable_from_file = entry.file_size - offset;
+    var remaining: usize = @min(out.len, @as(usize, @intCast(@min(readable_from_file, readable_from_extent))));
     var copied: usize = 0;
-    var block_index = entry.start_block + offset / block_size;
+    var block_index = entry.start_block + first_relative_block;
     var block_offset: usize = @intCast(offset % block_size);
     while (remaining > 0) {
-        const block = blockSlice(block_buffer[0..]);
+        const block_buffer = blockBuffer();
+        const block = block_buffer[0..block_size_usize];
         if (!readBlock(block_index, block)) return null;
-        const chunk = @min(remaining, @as(usize, @intCast(block_size)) - block_offset);
-        @memcpy(out[copied .. copied + chunk], block[block_offset .. block_offset + chunk]);
+        if (block_offset >= block_size_usize) return null;
+        const chunk = @min(remaining, block_size_usize - block_offset);
+        if (copied + chunk > out.len or block_offset + chunk > block.len) return null;
+        var i: usize = 0;
+        while (i < chunk) : (i += 1) {
+            out[copied + i] = block[block_offset + i];
+        }
         copied += chunk;
         remaining -= chunk;
         block_index += 1;
@@ -1164,7 +1230,7 @@ fn zeroBlocks(start_block: u64, block_count: u64) bool {
     if (start_block == 0 or block_count == 0) return true;
     var block_index: u64 = 0;
     while (block_index < block_count) : (block_index += 1) {
-        const block = blockSlice(block_buffer[0..]);
+        const block = blockSlice(blockBuffer()) orelse return false;
         @memset(block, 0);
         if (!writeBlock(start_block + block_index, block)) return false;
     }
@@ -1176,7 +1242,7 @@ fn copyBlocks(src_start_block: u64, dst_start_block: u64, block_count: u64) bool
     if (src_start_block == dst_start_block) return true;
     var block_index: u64 = 0;
     while (block_index < block_count) : (block_index += 1) {
-        const block = blockSlice(block_buffer[0..]);
+        const block = blockSlice(blockBuffer()) orelse return false;
         if (!readBlock(src_start_block + block_index, block)) return false;
         if (!writeBlock(dst_start_block + block_index, block)) return false;
     }
@@ -1206,13 +1272,16 @@ fn writeFileBytes(entry: *VolumeDirEntry, file_index: usize, offset: u64, data: 
 
     var remaining = data;
     var write_offset = offset;
+    const block_size_usize = validBlockSize() orelse return .io_error;
     while (remaining.len > 0) {
         const relative_block = write_offset / block_size;
         const block_index = entry.start_block + relative_block;
         const block_offset: usize = @intCast(write_offset % block_size);
-        const chunk = @min(remaining.len, @as(usize, @intCast(block_size)) - block_offset);
-        const whole_block = block_offset == 0 and chunk == @as(usize, @intCast(block_size));
-        const block = blockSlice(block_buffer[0..]);
+        if (block_offset >= block_size_usize) return .io_error;
+        const chunk = @min(remaining.len, block_size_usize - block_offset);
+        const whole_block = block_offset == 0 and chunk == block_size_usize;
+        const block_buffer = blockBuffer();
+        const block = block_buffer[0..block_size_usize];
 
         if (whole_block) {
             @memcpy(block[0..chunk], remaining[0..chunk]);
@@ -1440,6 +1509,7 @@ fn handleRead(session: *Session, request_seq: u64) void {
         return;
     }
     const requested_len: usize = @min(@as(usize, request.length), fs_protocol.response_payload_bytes);
+    const io_buffer = ioBuffer();
     const bytes_read = readFileBytes(entry, request.offset, io_buffer[0..requested_len]) orelse {
         replyStatus(session, .read, request_seq, .io_error);
         return;
@@ -1466,7 +1536,8 @@ fn handleWrite(session: *Session, request_seq: u64) void {
         replyStatus(session, .write, request_seq, .is_dir);
         return;
     }
-    const payload = requestInlineBytes(session, io_buffer[0..]) orelse {
+    const io_buffer = ioBuffer();
+    const payload = requestInlineBytes(session, io_buffer) orelse {
         replyStatus(session, .write, request_seq, .too_big);
         return;
     };
@@ -1665,6 +1736,7 @@ fn processSessionRequest(session: *Session) void {
     if (request.magic != fs_protocol.request_magic or request.version != fs_protocol.version) return;
     const request_seq = request.request_seq;
     if (request_seq == 0 or request_seq <= session.last_completed_seq) return;
+    if (request.session_nonce != session.session_nonce) return;
     const op = std.meta.intToEnum(fs_protocol.Opcode, request.op) catch {
         replyStatus(session, .connect, request_seq, .invalid);
         session.last_completed_seq = request_seq;
@@ -1675,7 +1747,9 @@ fn processSessionRequest(session: *Session) void {
         .lookup => handleLookup(session, request_seq),
         .open => handleOpen(session, request_seq),
         .read => handleRead(session, request_seq),
+        .read_bulk => replyStatus(session, .read_bulk, request_seq, .not_supported),
         .readdir => handleReaddir(session, request_seq),
+        .readdir_bulk => replyStatus(session, .readdir_bulk, request_seq, .not_supported),
         .stat => handleStat(session, request_seq),
         .close => handleClose(session, request_seq),
         .create => handleCreate(session, request_seq),
@@ -1689,31 +1763,49 @@ fn processSessionRequest(session: *Session) void {
 }
 
 fn handleConnectRequest(request_paddr: u64) void {
+    for (&sessions) |*session| {
+        if (session.active and session.request_paddr == request_paddr) {
+            session.active = false;
+        }
+    }
     for (&sessions, 0..) |*session, slot| {
-        if (session.active) continue;
-        const req_va = sessionRequestVa(slot);
-        const resp_va = sessionResponseVa(slot);
-        if (mapPage(req_va, request_paddr, false) != 0) return;
+        if (session.request_va != 0) continue;
+        const request_page = user_vm.mapPageAtDynamicVa(request_paddr, false) orelse return;
+        const req_va: u64 = @intCast(request_page.va);
+        session.request_paddr = request_paddr;
+        session.request_va = req_va;
         const request: *volatile fs_protocol.FsRequestHeader = @ptrFromInt(req_va);
         if (request.magic != fs_protocol.request_magic or
             request.version != fs_protocol.version or
             request.op != fs_protocol.opcodeRaw(.connect) or
             request.request_seq == 0 or
-            request.arg0 < 0x1000)
+            request.arg0 < 0x1000 or
+            request.session_nonce == 0)
         {
             _ = userLog("PersistentFs: invalid connect request\n");
             return;
         }
-        if (mapPage(resp_va, request.arg0, true) != 0) return;
-        const reply_endpoint_id = reply_endpoint_id_base + @as(u64, @intCast(slot));
-        if (installEndpoint(reply_endpoint_id, request.arg1) != 0) return;
+        const response_page = user_vm.mapPageAtDynamicVa(request.arg0, true) orelse return;
+        const resp_va: u64 = @intCast(response_page.va);
+        session.response_va = resp_va;
+        var reply_endpoint_id = reply_endpoint_id_base + @as(u64, @intCast(slot));
+        if (installEndpoint(reply_endpoint_id, request.arg1) != 0) {
+            reply_endpoint_id = 0;
+            if (!reply_endpoint_unavailable_logged) {
+                reply_endpoint_unavailable_logged = true;
+                _ = userLog("PersistentFs: reply endpoint unavailable; using poll-only replies\n");
+            }
+        }
         const mount_client_token = allocFsToken();
         session.* = .{
             .active = true,
+            .request_paddr = request_paddr,
             .client_process_slot = request.arg1,
             .request_va = req_va,
             .response_va = resp_va,
+            .response_paddr = request.arg0,
             .reply_endpoint_id = reply_endpoint_id,
+            .session_nonce = request.session_nonce,
             .last_completed_seq = 0,
         };
         if (!storeSessionObject(session, .mount, 0, mount_client_token)) return;
@@ -1751,8 +1843,12 @@ pub export fn _start() noreturn {
         _ = userLog("PersistentFs: config invalid\n");
         while (true) asm volatile ("pause");
     }
-    if (!initBlockService()) {
-        _ = userLog("PersistentFs: block service init failed\n");
+    if (!initVolumeStore()) {
+        _ = userLog("PersistentFs: volume store init failed\n");
+        while (true) asm volatile ("pause");
+    }
+    if (!initScratchPages()) {
+        _ = userLog("PersistentFs: scratch init failed\n");
         while (true) asm volatile ("pause");
     }
     if (!loadOrInitializeVolume()) {

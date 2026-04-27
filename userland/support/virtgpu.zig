@@ -1,6 +1,8 @@
 const std = @import("std");
 const boot_status_abi = @import("boot_status_abi.zig");
 const boot_status_client = @import("boot_status_client.zig");
+const process_abi = @import("process_abi.zig");
+const user_vm = @import("user_vm.zig");
 const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_map_mmio: u64 = 0xB;
@@ -16,19 +18,7 @@ const untyped_alloc_map_drop_cap_after_map_flag: u64 = 1 << 1;
 const untyped_alloc_map_contiguous_flag: u64 = 1 << 2;
 const untyped_alloc_map_dma_ok_flag: u64 = 1 << 3;
 
-const config_page_va: usize = 0x3C00_2000;
-const common_page_va: usize = 0x2200_4000;
-const notify_page_va: usize = 0x2200_5000;
-const isr_page_va: usize = 0x2200_6000;
-const device_page_va: usize = 0x2200_7000;
-const queue_page0_va: usize = 0x2200_8000;
-const queue_page1_va: usize = 0x2200_9000;
-const control_page_va: usize = 0x2200_A000;
-const mem_entries_page0_va: usize = 0x2200_B000;
-const mem_entries_page1_va: usize = 0x2200_C000;
-const cursor_queue_page0_va: usize = 0x2200_D000;
-const cursor_queue_page1_va: usize = 0x2200_E000;
-const backing_base_va: usize = 0x2240_0000;
+const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
 const resource_backing_span: usize = 0x0040_0000;
 
 const config_magic: u64 = 0x56475055; // "VGPU"
@@ -56,8 +46,8 @@ const feature_version_1: u32 = 1 << 0;
 
 const queue_index_control: u16 = 0;
 const queue_index_cursor: u16 = 1;
-const queue_region_bytes: usize = queue_page1_va + 4096 - queue_page0_va;
-const cursor_queue_region_bytes: usize = cursor_queue_page1_va + 4096 - cursor_queue_page0_va;
+const queue_region_bytes: usize = 8192;
+const cursor_queue_region_bytes: usize = 8192;
 const queue_used_offset: usize = 4096;
 const requested_queue_size: u16 = 8;
 const max_backing_pages: usize = 512;
@@ -65,7 +55,7 @@ const max_alloc_chunk_pages: usize = 64;
 const max_resources: usize = 8;
 const init_alloc_page_count: u64 = 7;
 const mem_entry_page_count: u64 = 2;
-const mem_entries_region_bytes: usize = mem_entries_page1_va + 4096 - mem_entries_page0_va;
+const mem_entries_region_bytes: usize = 8192;
 const wait_spin_limit: usize = 256;
 const wait_sleep_limit: usize = 1024;
 const cursor_dim: usize = 64;
@@ -200,14 +190,14 @@ pub const Resource = struct {
     in_use: bool = false,
     ready: bool = false,
     slot_index: usize = 0,
-    base_va: usize = backing_base_va,
+    base_va: usize = 0,
     resource_id: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
     stride_bytes: u32 = 0,
     bytes_len: usize = 0,
     page_count: usize = 0,
-    pixels: [*]volatile u32 = @ptrFromInt(backing_base_va),
+    pixels: [*]volatile u32 = undefined,
 };
 
 pub const ResourceHandle = usize;
@@ -246,6 +236,18 @@ const State = struct {
 var state: State = .{};
 var resources: [max_resources]Resource = [_]Resource{.{}} ** max_resources;
 var resource_backing_paddrs_scratch: [max_backing_pages]u64 = [_]u64{0} ** max_backing_pages;
+var common_page_va: usize = 0;
+var notify_page_va: usize = 0;
+var isr_page_va: usize = 0;
+var device_page_va: usize = 0;
+var queue_page0_va: usize = 0;
+var queue_page1_va: usize = 0;
+var control_page_va: usize = 0;
+var mem_entries_page0_va: usize = 0;
+var mem_entries_page1_va: usize = 0;
+var cursor_queue_page0_va: usize = 0;
+var cursor_queue_page1_va: usize = 0;
+var backing_base_va: usize = 0;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -340,6 +342,29 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
 fn readCfgU64(index: usize) u64 {
     const cfg: [*]const volatile u64 = @ptrFromInt(config_page_va);
     return cfg[index];
+}
+
+fn reserveVirtgpuTargetVas() bool {
+    if (common_page_va != 0) return true;
+
+    const mmio_base = user_vm.reservePages(4) orelse return false;
+    common_page_va = mmio_base;
+    notify_page_va = mmio_base + user_vm.page_bytes;
+    isr_page_va = mmio_base + 2 * user_vm.page_bytes;
+    device_page_va = mmio_base + 3 * user_vm.page_bytes;
+
+    const queue_base = user_vm.reservePages(@intCast(init_alloc_page_count)) orelse return false;
+    queue_page0_va = queue_base;
+    queue_page1_va = queue_base + user_vm.page_bytes;
+    control_page_va = queue_base + 2 * user_vm.page_bytes;
+    mem_entries_page0_va = queue_base + 3 * user_vm.page_bytes;
+    mem_entries_page1_va = queue_base + 4 * user_vm.page_bytes;
+    cursor_queue_page0_va = queue_base + 5 * user_vm.page_bytes;
+    cursor_queue_page1_va = queue_base + 6 * user_vm.page_bytes;
+
+    const backing_pages = max_resources * (resource_backing_span / user_vm.page_bytes);
+    backing_base_va = user_vm.reservePages(backing_pages) orelse return false;
+    return true;
 }
 
 fn writeCfgU64(index: usize, value: u64) void {
@@ -1013,6 +1038,10 @@ fn initInternal(prewarm: bool) bool {
     if (state.init_attempted) return false;
     logText(if (prewarm) "BootLogConsole: virtgpu prewarm start\n" else "Compositor: virtgpu init start\n");
     if (readCfgU64(0) != config_magic) return false;
+    if (!reserveVirtgpuTargetVas()) {
+        logText("Compositor: virtgpu reserve target VAs failed\n");
+        return false;
+    }
     if (!prewarm and tryRestoreWarmState()) {
         logText("Compositor: virtgpu warm restore ready\n");
         logText("Compositor: virtgpu queue ready\n");

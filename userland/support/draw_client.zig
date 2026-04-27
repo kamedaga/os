@@ -2,17 +2,18 @@ const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
 const syscall_log: u64 = 0x9;
+const user_vm = @import("user_vm.zig");
 const window_client = @import("window_client.zig");
 
 const syscall_ok: u64 = 0;
 
-const request_page_va: usize = 0x2000_3000;
 const request_header_qwords: usize = 8;
 const request_payload_offset: usize = request_header_qwords * @sizeOf(u64);
 const request_payload_pixels: usize = (4096 - request_payload_offset) / @sizeOf(u32);
 const request_op_fill_rect: u64 = 1;
 const request_op_blit_rect: u64 = 2;
 var window_endpoint_id: u64 = 0;
+var request_page_va: usize = 0;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -53,6 +54,12 @@ fn sendCap(paddr: u64, endpoint_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn ensureRequestPageVa() ?usize {
+    if (request_page_va != 0) return request_page_va;
+    request_page_va = user_vm.reservePages(1) orelse return null;
+    return request_page_va;
+}
+
 fn ensureWindowEndpoint() ?u64 {
     if (window_endpoint_id != 0) return window_endpoint_id;
     if (!window_client.initServiceBindingFromConfigPage()) return null;
@@ -65,9 +72,10 @@ fn ensureWindowEndpoint() ?u64 {
 fn sendFillRect(dst_x: u64, dst_y: u64, width: u64, height: u64, color: u64) bool {
     const paddr = allocPage();
     if (paddr < 0x1000) return false;
-    if (mapPage(request_page_va, paddr, true) != syscall_ok) return false;
+    const request_va = ensureRequestPageVa() orelse return false;
+    if (mapPage(request_va, paddr, true) != syscall_ok) return false;
 
-    const req: [*]volatile u64 = @ptrFromInt(request_page_va);
+    const req: [*]volatile u64 = @ptrFromInt(request_va);
     req[0] = request_op_fill_rect;
     req[1] = dst_x;
     req[2] = dst_y;
@@ -93,9 +101,10 @@ fn sendBlitRect(dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) bo
 
     const paddr = allocPage();
     if (paddr < 0x1000) return false;
-    if (mapPage(request_page_va, paddr, true) != syscall_ok) return false;
+    const request_va = ensureRequestPageVa() orelse return false;
+    if (mapPage(request_va, paddr, true) != syscall_ok) return false;
 
-    const req: [*]volatile u64 = @ptrFromInt(request_page_va);
+    const req: [*]volatile u64 = @ptrFromInt(request_va);
     req[0] = request_op_blit_rect;
     req[1] = dst_x;
     req[2] = dst_y;
@@ -105,7 +114,7 @@ fn sendBlitRect(dst_x: u64, dst_y: u64, width: u64, height: u64, stride: u64) bo
     req[6] = 0;
     req[7] = 0;
 
-    const pixels: [*]volatile u32 = @ptrFromInt(request_page_va + request_payload_offset);
+    const pixels: [*]volatile u32 = @ptrFromInt(request_va + request_payload_offset);
     var y: usize = 0;
     while (y < h) : (y += 1) {
         var x: usize = 0;

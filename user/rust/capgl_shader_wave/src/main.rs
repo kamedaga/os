@@ -14,10 +14,10 @@ const FRAME_COUNT: u32 = 96;
 
 fn main() -> cap_std::Result<()> {
     let mut line = String::from("CapglShaderWave: ");
-    let mut client = match capwm_client::Client::connect_from_registry_shadow() {
+    let mut client = match cap_window::Client::connect_from_registry_shadow() {
         Ok(client) => client,
         Err(err) => {
-            if matches!(err, capwm_client::Error::MissingService) {
+            if matches!(err, cap_window::Error::MissingService) {
                 return run_direct_gpu(line);
             }
             let _ = write!(&mut line, "window connect failed: {:?}", err);
@@ -41,7 +41,7 @@ fn main() -> cap_std::Result<()> {
         }
     };
 
-    let mut context = match capwm_client::connect_gl_for_window(window) {
+    let mut context = match cap_window::connect_gl_for_window(window) {
         Ok(context) => context,
         Err(err) => {
             let _ = write!(
@@ -96,8 +96,8 @@ fn main() -> cap_std::Result<()> {
         window.surface_id,
         window.gpu_resource_id,
         window.gpu_surface_id,
-        window.size.width,
-        window.size.height,
+        window.content_size.width,
+        window.content_size.height,
         rendered
     );
     cap_std::println!("{}", line)?;

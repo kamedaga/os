@@ -10,7 +10,7 @@ use rt_alloc as _;
 
 fn main() -> cap_std::Result<()> {
     let mut line = String::from("CapwmSmoke: ");
-    let mut client = match capwm_client::Client::connect_from_registry_shadow() {
+    let mut client = match cap_window::Client::connect_from_registry_shadow() {
         Ok(client) => client,
         Err(err) => {
             let _ = write!(&mut line, "connect failed: {:?}", err);
@@ -71,51 +71,6 @@ fn main() -> cap_std::Result<()> {
         return Ok(());
     }
 
-    let geometry_a = Geometry {
-        x: 42,
-        y: 54,
-        width: 360,
-        height: 240,
-    };
-    let geometry_b = Geometry {
-        x: 190,
-        y: 128,
-        width: 300,
-        height: 120,
-    };
-
-    if let Err(err) = client.set_geometry(
-        window_a,
-        geometry_a.x,
-        geometry_a.y,
-        geometry_a.width,
-        geometry_a.height,
-    ) {
-        let _ = write!(
-            &mut line,
-            "set_geometry failed window={} surface={}: {:?}",
-            window_a.id, window_a.surface_id, err
-        );
-        cap_std::println!("{}", line)?;
-        return Ok(());
-    }
-
-    if let Err(err) = client.set_geometry(
-        window_b,
-        geometry_b.x,
-        geometry_b.y,
-        geometry_b.width,
-        geometry_b.height,
-    ) {
-        let _ = write!(
-            &mut line,
-            "set_geometry failed window={} surface={}: {:?}",
-            window_b.id, window_b.surface_id, err
-        );
-        cap_std::println!("{}", line)?;
-        return Ok(());
-    }
-
     if let Err(err) = client.present(window_a) {
         let _ = write!(
             &mut line,
@@ -158,25 +113,17 @@ fn main() -> cap_std::Result<()> {
 
     let _ = write!(
         &mut line,
-        "ok windows=({}, {}) surfaces=({}, {}) gpu_resources=({}, {}) surfaces={}x{},{}x{} geometry=({},{} {}x{}),({},{} {}x{})",
+        "ok windows=({}, {}) surfaces=({}, {}) gpu_resources=({}, {}) content={}x{},{}x{}",
         window_a.id,
         window_b.id,
         window_a.surface_id,
         window_b.surface_id,
         window_a.gpu_resource_id,
         window_b.gpu_resource_id,
-        window_a.size.width,
-        window_a.size.height,
-        window_b.size.width,
-        window_b.size.height,
-        geometry_a.x,
-        geometry_a.y,
-        geometry_a.width,
-        geometry_a.height,
-        geometry_b.x,
-        geometry_b.y,
-        geometry_b.width,
-        geometry_b.height
+        window_a.content_size.width,
+        window_a.content_size.height,
+        window_b.content_size.width,
+        window_b.content_size.height
     );
     cap_std::println!("{}", line)?;
     Ok(())
@@ -190,19 +137,11 @@ enum Palette {
     Cool,
 }
 
-#[derive(Copy, Clone)]
-struct Geometry {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-}
-
 fn draw_window_surface(
-    window: capwm_client::protocol::Window,
+    window: cap_window::protocol::Window,
     palette: Palette,
-) -> Result<(), capwm_client::Error> {
-    let mut context = capwm_client::connect_gl_for_window(window)?;
+) -> Result<(), cap_window::Error> {
+    let mut context = cap_window::connect_gl_for_window(window)?;
     let mut scratch = [0_u8; caplibgl::FRAME_SCRATCH_BYTES];
     let (top_left, bottom_left, top_right, bottom_right) = palette.colors();
     let vertices = [
@@ -221,7 +160,7 @@ fn draw_window_surface(
             },
             &mut scratch,
         )
-        .map_err(|_| capwm_client::Error::GpuUnavailable)?;
+        .map_err(|_| cap_window::Error::GpuUnavailable)?;
     context
         .gl_draw_vertices(
             caplibgl::Primitive::TriangleStrip,
@@ -229,7 +168,7 @@ fn draw_window_surface(
             None,
             &mut scratch,
         )
-        .map_err(|_| capwm_client::Error::GpuUnavailable)?;
+        .map_err(|_| cap_window::Error::GpuUnavailable)?;
     Ok(())
 }
 

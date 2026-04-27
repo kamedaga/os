@@ -1,6 +1,8 @@
 const boot_status_abi = @import("support_root").boot_status_abi;
 const boot_status_client = @import("support_root").boot_status_client;
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
+const process_abi = @import("support_root").process_abi;
+const user_vm = @import("support_root").user_vm;
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
@@ -13,14 +15,7 @@ const syscall_wait_event: u64 = 0x17;
 const syscall_share_cap: u64 = 0x2B;
 
 const syscall_ok: u64 = 0;
-const config_page_va: usize = 0x3C00_2000;
-const common_page_va: usize = 0x2000_4000;
-const notify_page_va: usize = 0x2000_5000;
-const isr_page_va: usize = 0x2000_6000;
-const device_page_va: usize = 0x2000_7000;
-const queue_page0_va: usize = 0x2000_8000;
-const queue_page1_va: usize = 0x2000_9000;
-const default_shared_page_va: usize = 0x3C00_6000;
+const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
 
 const config_magic = input_bootstrap.keyboard_config_magic;
 const shared_magic: u64 = 0x4B534852; // "KSHR"
@@ -56,6 +51,12 @@ const queue_region_bytes: usize = 8192;
 const queue_used_offset: usize = 4096;
 const queue_buffers_offset: usize = 4176;
 const desc_flag_write: u16 = 1 << 1;
+var common_page_va: usize = 0;
+var notify_page_va: usize = 0;
+var isr_page_va: usize = 0;
+var device_page_va: usize = 0;
+var queue_page0_va: usize = 0;
+var queue_page1_va: usize = 0;
 
 const VirtqDesc = extern struct {
     addr: u64,
@@ -78,6 +79,19 @@ const VirtioInputEvent = extern struct {
 fn queueRegionPhys(queue_paddr0: u64, queue_paddr1: u64, offset: usize) u64 {
     if (offset < 4096) return queue_paddr0 + @as(u64, @intCast(offset));
     return queue_paddr1 + @as(u64, @intCast(offset - 4096));
+}
+
+fn reserveVirtioTargetVas() bool {
+    if (common_page_va != 0) return true;
+    const mmio_base = user_vm.reservePages(4) orelse return false;
+    common_page_va = mmio_base;
+    notify_page_va = mmio_base + user_vm.page_bytes;
+    isr_page_va = mmio_base + 2 * user_vm.page_bytes;
+    device_page_va = mmio_base + 3 * user_vm.page_bytes;
+    const queue_base = user_vm.reservePages(2) orelse return false;
+    queue_page0_va = queue_base;
+    queue_page1_va = queue_base + user_vm.page_bytes;
+    return true;
 }
 
 fn userLog(message: []const u8) u64 {
@@ -225,6 +239,14 @@ fn readCfgU64(index: usize) u64 {
 fn writeCfgU64(index: usize, value: u64) void {
     const cfg: [*]volatile u64 = @ptrFromInt(config_page_va);
     cfg[index] = value;
+}
+
+fn resolveSharedPageVa() ?usize {
+    const shared_target_va_u64 = readCfgU64(input_bootstrap.shared_target_va_index);
+    if (shared_target_va_u64 != 0) return @intCast(shared_target_va_u64);
+    const shared_page_va = user_vm.reservePages(1) orelse return null;
+    writeCfgU64(input_bootstrap.shared_target_va_index, @intCast(shared_page_va));
+    return shared_page_va;
 }
 
 fn initializeSharedPage(shared: [*]volatile u64) void {
@@ -395,6 +417,10 @@ pub export fn _start() noreturn {
         _ = userLog("KeyboardDriver: config magic mismatch\n");
         while (true) asm volatile ("pause");
     }
+    if (!reserveVirtioTargetVas()) {
+        _ = userLog("KeyboardDriver: reserve target VAs failed\n");
+        while (true) asm volatile ("pause");
+    }
 
     const common_page_paddr = readCfgU64(1);
     const notify_page_paddr = readCfgU64(2);
@@ -408,17 +434,16 @@ pub export fn _start() noreturn {
     _ = _device_off;
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
     var shared_page_paddr = readCfgU64(10);
-    const shared_target_va_u64 = readCfgU64(input_bootstrap.shared_target_va_index);
-    const shared_page_va: usize = @intCast(if (shared_target_va_u64 != 0) shared_target_va_u64 else default_shared_page_va);
+    const shared_page_va = resolveSharedPageVa() orelse {
+        _ = userLog("KeyboardDriver: reserve shared page VA failed\n");
+        while (true) asm volatile ("pause");
+    };
     var queue_paddr0 = readCfgU64(11);
     var queue_paddr1 = readCfgU64(12);
     var iommu_token = readCfgU64(input_bootstrap.iommu_token_index);
     var queue_submit_token = readCfgU64(input_bootstrap.queue_submit_token_index);
     var queue_notify_token = readCfgU64(input_bootstrap.queue_notify_token_index);
     var command_token = readCfgU64(input_bootstrap.command_token_index);
-    _ = iommu_token;
-    _ = command_token;
-
     while (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
         _ = waitEvent(false, 1);
         asm volatile ("pause");

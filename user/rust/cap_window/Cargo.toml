@@ -1,0 +1,13 @@
+[package]
+name = "cap_window"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cap_std = { path = "../cap_std" }
+caplibgl = { path = "../caplibgl" }
+rt_core = { path = "../rt_core" }
+rt_handle = { path = "../rt_handle" }

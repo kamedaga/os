@@ -26,6 +26,11 @@ pub const DynamicUserProcess = struct {
     process: CreatedUserProcess,
 };
 
+pub const SuspendedUserProcess = struct {
+    principal: kernel.PrincipalId,
+    thread_slot: usize,
+};
+
 pub const CreateUserProcessError = error{CreateFailed};
 pub const CreateDynamicUserProcessError = error{ CreateFailed, NoFreeProcess };
 
@@ -141,6 +146,27 @@ pub fn tryCreateDynamicUserProcess(
     return .{
         .principal = principal,
         .process = process,
+    };
+}
+
+pub fn tryCreateSuspendedUserProcess(
+    state: *kernel.KernelState,
+    role_label: []const u8,
+    user_spaces: []boot_static.UserAddressSpace,
+) CreateDynamicUserProcessError!SuspendedUserProcess {
+    const principal = state.createProcessDescriptor(role_label) orelse return error.NoFreeProcess;
+    if (!user_vm.buildEmptyUserAddressSpace(principal)) {
+        _ = state.removeProcessDescriptor(principal);
+        return error.CreateFailed;
+    }
+    const thread_slot = scheduler.allocateThreadSlot(principal, user_spaces, buildInitialUserTrapFrame()) orelse {
+        _ = state.removeProcessDescriptor(principal);
+        return error.CreateFailed;
+    };
+    if (!scheduler.setThreadReady(thread_slot, false)) return error.CreateFailed;
+    return .{
+        .principal = principal,
+        .thread_slot = thread_slot,
     };
 }
 

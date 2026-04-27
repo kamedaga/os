@@ -1,6 +1,7 @@
 const std = @import("std");
 const gpu_protocol = @import("gpu_protocol.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
+const user_vm = @import("user_vm.zig");
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -35,8 +36,8 @@ pub const Error = error{
 };
 
 pub const ConnectOptions = struct {
-    request_va: u64,
-    response_va: u64,
+    request_va: u64 = 0,
+    response_va: u64 = 0,
     endpoint_id: u64,
     response_poll_limit: u64 = default_response_poll_limit,
     compat_process_slot: u64 = 0,
@@ -63,34 +64,39 @@ pub const RenderTarget = struct {
     vertex_buffer_id: u32 = gpu_protocol.default_virgl_vertex_buffer_id,
 };
 
+pub const ShellFramebuffer = struct {
+    paddr: u64,
+    byte_len: u64,
+    width: u32,
+    height: u32,
+    pitch: u32,
+};
+
 pub const Client = struct {
     request_va: u64,
     response_va: u64,
     request_paddr: u64,
     response_paddr: u64,
     server_endpoint_id: u64,
+    session_nonce: u64,
     request_shared: bool = false,
     next_seq: u64 = 1,
     response_poll_limit: u64 = default_response_poll_limit,
 
     pub fn connect(options: ConnectOptions) Error!Client {
-        const request_paddr = allocPage();
-        if (request_paddr < 0x1000) return error.RequestAllocFailed;
-        if (mapPage(options.request_va, request_paddr, true) != syscall_ok) return error.RequestMapFailed;
-
-        const response_paddr = allocPage();
-        if (response_paddr < 0x1000) return error.ResponseAllocFailed;
-        if (mapPage(options.response_va, response_paddr, true) != syscall_ok) return error.ResponseMapFailed;
+        const pages = try allocConnectPages(options.request_va, options.response_va);
 
         var compat_installed = false;
-        try grantResponseCap(response_paddr, options, &compat_installed);
+        try grantResponseCap(pages.response_paddr, options, &compat_installed);
+        const session_nonce = makeSessionNonce(pages.request_paddr, pages.response_paddr, options.endpoint_id);
 
         var client = Client{
-            .request_va = options.request_va,
-            .response_va = options.response_va,
-            .request_paddr = request_paddr,
-            .response_paddr = response_paddr,
+            .request_va = pages.request_va,
+            .response_va = pages.response_va,
+            .request_paddr = pages.request_paddr,
+            .response_paddr = pages.response_paddr,
             .server_endpoint_id = options.endpoint_id,
+            .session_nonce = session_nonce,
             .response_poll_limit = options.response_poll_limit,
         };
         client.clearMappedPages();
@@ -174,6 +180,29 @@ pub const Client = struct {
         _ = try self.finishRequestOk(seq, .present_test_pattern);
     }
 
+    pub fn presentShellFramebuffer(self: *Client, framebuffer: ShellFramebuffer) Error!void {
+        if (framebuffer.paddr < @as(u64, gpu_protocol.page_bytes) or
+            framebuffer.byte_len == 0 or
+            framebuffer.width == 0 or
+            framebuffer.height == 0 or
+            framebuffer.pitch == 0)
+        {
+            return error.Invalid;
+        }
+        const payload = gpu_protocol.ShellFramebufferPayload{
+            .paddr = framebuffer.paddr,
+            .byte_len = framebuffer.byte_len,
+        };
+        const arg0 = @as(u64, framebuffer.width) | (@as(u64, framebuffer.height) << 32);
+        const seq = try self.beginRequest(
+            .present_shell_framebuffer,
+            arg0,
+            framebuffer.pitch,
+            std.mem.asBytes(&payload),
+        );
+        _ = try self.finishRequestOk(seq, .present_shell_framebuffer);
+    }
+
     fn requestHeader(self: *const Client) *volatile gpu_protocol.RequestHeader {
         return @ptrFromInt(self.request_va);
     }
@@ -203,6 +232,7 @@ pub const Client = struct {
         request.arg1 = arg1;
         request.inline_bytes = @intCast(payload.len);
         request.reserved0 = 0;
+        request.session_nonce = self.session_nonce;
         copyBytesToVolatile(self.requestPayload(), payload);
         const seq = self.next_seq;
         self.next_seq +%= 1;
@@ -248,6 +278,46 @@ pub const Client = struct {
         return false;
     }
 };
+
+fn makeSessionNonce(request_paddr: u64, response_paddr: u64, endpoint_id: u64) u64 {
+    const nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ 0xa24b_aed4_963e_e407;
+    return if (nonce == 0) 1 else nonce;
+}
+
+const ConnectPages = struct {
+    request_va: u64,
+    response_va: u64,
+    request_paddr: u64,
+    response_paddr: u64,
+};
+
+fn allocConnectPages(request_va: u64, response_va: u64) Error!ConnectPages {
+    if (request_va == 0 and response_va == 0) {
+        var paddrs: [2]u64 = .{ 0, 0 };
+        const base_va = user_vm.allocMapPagesInto(2, true, paddrs[0..]) orelse return error.RequestAllocFailed;
+        if (paddrs[0] < 0x1000 or paddrs[1] < 0x1000) return error.RequestAllocFailed;
+        return .{
+            .request_va = @intCast(base_va),
+            .response_va = @intCast(base_va + user_vm.page_bytes),
+            .request_paddr = paddrs[0],
+            .response_paddr = paddrs[1],
+        };
+    }
+    if (request_va == 0 or response_va == 0) return error.Invalid;
+    const request_paddr = allocPage();
+    if (request_paddr < 0x1000) return error.RequestAllocFailed;
+    if (mapPage(request_va, request_paddr, true) != syscall_ok) return error.RequestMapFailed;
+
+    const response_paddr = allocPage();
+    if (response_paddr < 0x1000) return error.ResponseAllocFailed;
+    if (mapPage(response_va, response_paddr, true) != syscall_ok) return error.ResponseMapFailed;
+    return .{
+        .request_va = request_va,
+        .response_va = response_va,
+        .request_paddr = request_paddr,
+        .response_paddr = response_paddr,
+    };
+}
 
 fn allocPage() u64 {
     return asm volatile (

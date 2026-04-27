@@ -13,6 +13,8 @@ pub const feature_present_3d: u64 = 1 << 3;
 pub const feature_texture_2d: u64 = 1 << 4;
 pub const feature_app_surface: u64 = 1 << 5;
 pub const feature_cursor: u64 = 1 << 6;
+pub const feature_texture_bulk: u64 = 1 << 7;
+pub const feature_shell_framebuffer: u64 = 1 << 8;
 
 pub const default_virgl_resource_id: u32 = 2;
 pub const default_virgl_vertex_buffer_id: u32 = 3;
@@ -30,6 +32,10 @@ pub const Opcode = enum(u16) {
     delete_texture_2d = 9,
     create_app_surface = 10,
     set_cursor_position = 11,
+    create_alpha_texture_2d = 12,
+    update_texture_alpha_2d = 13,
+    update_texture_alpha_2d_bulk = 14,
+    present_shell_framebuffer = 15,
 };
 
 pub const Status = enum(i32) {
@@ -49,6 +55,7 @@ pub const RequestHeader = extern struct {
     arg1: u64 = 0,
     inline_bytes: u32 = 0,
     reserved0: u32 = 0,
+    session_nonce: u64 = 0,
 };
 
 pub const ResponseHeader = extern struct {
@@ -63,6 +70,11 @@ pub const ResponseHeader = extern struct {
     arg2: u64 = 0,
     inline_bytes: u32 = 0,
     reserved0: u32 = 0,
+};
+
+pub const ShellFramebufferPayload = extern struct {
+    paddr: u64 = 0,
+    byte_len: u64 = 0,
 };
 
 pub const request_header_bytes = @sizeOf(RequestHeader);

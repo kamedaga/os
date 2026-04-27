@@ -1,5 +1,7 @@
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
 const mouse_shared_abi = @import("support_root").mouse_shared_abi;
+const process_abi = @import("support_root").process_abi;
+const user_vm = @import("support_root").user_vm;
 
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
@@ -9,12 +11,7 @@ const syscall_wait_event: u64 = 0x17;
 const syscall_log: u64 = 0x9;
 const syscall_ok: u64 = 0;
 
-const config_page_va: usize = 0x3C00_2000;
-const common_page_va: usize = 0x2000_4000;
-const notify_page_va: usize = 0x2000_5000;
-const isr_page_va: usize = 0x2000_6000;
-const queue_page0_va: usize = 0x2000_8000;
-const queue_page1_va: usize = 0x2000_9000;
+const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
 
 const common_device_feature_select: usize = 0x00;
 const common_device_feature: usize = 0x04;
@@ -47,11 +44,23 @@ const btn_left: u16 = 0x110;
 const btn_right: u16 = 0x111;
 const btn_middle: u16 = 0x112;
 
+const input_cfg_select: usize = 0;
+const input_cfg_subsel: usize = 1;
+const input_cfg_size: usize = 2;
+const input_cfg_payload: usize = 8;
+const input_cfg_select_abs_info: u8 = 0x12;
+
 const queue_index_event: u16 = 0;
 const queue_size: u16 = 8;
 const queue_used_offset: usize = 4096;
 const queue_buffers_offset: usize = 4176;
 const desc_flag_write: u16 = 1 << 1;
+var common_page_va: usize = 0;
+var notify_page_va: usize = 0;
+var isr_page_va: usize = 0;
+var device_page_va: usize = 0;
+var queue_page0_va: usize = 0;
+var queue_page1_va: usize = 0;
 
 const MouseSharedPage = mouse_shared_abi.MouseSharedPage;
 
@@ -71,6 +80,11 @@ const VirtioInputEvent = extern struct {
     event_type: u16,
     code: u16,
     value: u32,
+};
+
+const AbsAxisRange = struct {
+    min: i32,
+    max: i32,
 };
 
 fn userLog(message: []const u8) u64 {
@@ -151,6 +165,11 @@ fn mmioReadU16(addr: usize) u16 {
     return p.*;
 }
 
+fn mmioReadU32(addr: usize) u32 {
+    const p: *volatile u32 = @ptrFromInt(addr);
+    return p.*;
+}
+
 fn mmioWriteU16(addr: usize, value: u16) void {
     const p: *volatile u16 = @ptrFromInt(addr);
     p.* = value;
@@ -174,6 +193,19 @@ fn readCfgU64(index: usize) u64 {
 fn queueRegionPhys(queue_paddr0: u64, queue_paddr1: u64, offset: usize) u64 {
     if (offset < 4096) return queue_paddr0 + @as(u64, @intCast(offset));
     return queue_paddr1 + @as(u64, @intCast(offset - 4096));
+}
+
+fn reserveVirtioTargetVas() bool {
+    if (common_page_va != 0) return true;
+    const mmio_base = user_vm.reservePages(4) orelse return false;
+    common_page_va = mmio_base;
+    notify_page_va = mmio_base + user_vm.page_bytes;
+    isr_page_va = mmio_base + 2 * user_vm.page_bytes;
+    device_page_va = mmio_base + 3 * user_vm.page_bytes;
+    const queue_base = user_vm.reservePages(2) orelse return false;
+    queue_page0_va = queue_base;
+    queue_page1_va = queue_base + user_vm.page_bytes;
+    return true;
 }
 
 fn queueDescPtr(index: u16) *volatile VirtqDesc {
@@ -220,6 +252,32 @@ fn mapAbsToScreen(abs_value: i32, screen_extent: i32) i32 {
     return @intCast(@divTrunc(@as(i64, v) * @as(i64, screen_extent - 1), 32767));
 }
 
+fn mapAbsRangeToScreen(abs_value: i32, range: AbsAxisRange, screen_extent: i32) i32 {
+    if (screen_extent <= 1) return 0;
+    if (range.max <= range.min) return clampI32(abs_value, 0, screen_extent - 1);
+    const v = clampI32(abs_value, range.min, range.max);
+    const numerator = @as(i64, v - range.min) * @as(i64, screen_extent - 1);
+    const denominator = @as(i64, range.max - range.min);
+    return @intCast(@divTrunc(numerator, denominator));
+}
+
+fn growFallbackAbsMax(current: i32, observed: i32) i32 {
+    if (observed <= current) return current;
+    if (observed <= 65535) return 65535;
+    return observed;
+}
+
+fn readAbsAxisRange(device_cfg_base: usize, code: u16) ?AbsAxisRange {
+    if (device_cfg_base == 0) return null;
+    mmioWriteU8(device_cfg_base + input_cfg_select, input_cfg_select_abs_info);
+    mmioWriteU8(device_cfg_base + input_cfg_subsel, @intCast(code & 0xFF));
+    if (mmioReadU8(device_cfg_base + input_cfg_size) < 8) return null;
+    const min: i32 = @bitCast(mmioReadU32(device_cfg_base + input_cfg_payload));
+    const max: i32 = @bitCast(mmioReadU32(device_cfg_base + input_cfg_payload + 4));
+    if (max <= min) return null;
+    return .{ .min = min, .max = max };
+}
+
 fn setButton(mask: *u8, bit: u8, down: bool) void {
     if (down) {
         mask.* |= bit;
@@ -252,13 +310,19 @@ pub export fn _start() noreturn {
         _ = userLog("VirtioPointer: config magic mismatch\n");
         while (true) asm volatile ("pause");
     }
+    if (!reserveVirtioTargetVas()) {
+        _ = userLog("VirtioPointer: reserve target VAs failed\n");
+        while (true) asm volatile ("pause");
+    }
 
     const common_page_paddr = readCfgU64(1);
     const notify_page_paddr = readCfgU64(2);
     const isr_page_paddr = readCfgU64(3);
+    const device_page_paddr = readCfgU64(4);
     const common_off: usize = @intCast(readCfgU64(5));
     const notify_off: usize = @intCast(readCfgU64(6));
     const isr_off: usize = @intCast(readCfgU64(7));
+    const device_off: usize = @intCast(readCfgU64(8));
     const notify_off_multiplier: usize = @intCast(readCfgU64(9));
     var iommu_token = readCfgU64(input_bootstrap.iommu_token_index);
     var queue_submit_token = readCfgU64(input_bootstrap.queue_submit_token_index);
@@ -270,6 +334,10 @@ pub export fn _start() noreturn {
     if (isr_page_paddr != 0) {
         while (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) _ = waitEvent(false, 1);
     }
+    const device_cfg_base: usize = if (device_page_paddr != 0) blk: {
+        while (mapMmioPage(device_page_va, device_page_paddr, true) != syscall_ok) _ = waitEvent(false, 1);
+        break :blk device_page_va + device_off;
+    } else 0;
 
     var queue_paddrs: [2]u64 = .{ 0, 0 };
     if (allocMapPages(queue_page0_va, 2, true, @intFromPtr(&queue_paddrs)) != syscall_ok) {
@@ -343,6 +411,8 @@ pub export fn _start() noreturn {
 
     const screen_w: i32 = @intCast(screen_w_u64);
     const screen_h: i32 = @intCast(screen_h_u64);
+    const abs_x_range = readAbsAxisRange(device_cfg_base, abs_x);
+    const abs_y_range = readAbsAxisRange(device_cfg_base, abs_y);
     var cursor_x: i32 = @intCast(shared.cursor_x);
     var cursor_y: i32 = @intCast(shared.cursor_y);
     var last_used_idx: u16 = 0;
@@ -354,7 +424,10 @@ pub export fn _start() noreturn {
     var wheel_total: i32 = 0;
     var abs_pos_x: i32 = 0;
     var abs_pos_y: i32 = 0;
-    var abs_dirty = false;
+    var abs_dirty_x = false;
+    var abs_dirty_y = false;
+    var fallback_abs_x_max: i32 = 32767;
+    var fallback_abs_y_max: i32 = 32767;
 
     while (true) {
         if (isr_base != 0) _ = mmioReadU8(isr_base);
@@ -368,7 +441,7 @@ pub export fn _start() noreturn {
                 if (ev.event_type == event_type_rel) {
                     switch (ev.code) {
                         rel_x => accum_dx +%= value_signed,
-                        rel_y => accum_dy -%= value_signed,
+                        rel_y => accum_dy +%= value_signed,
                         rel_wheel => accum_wheel +%= value_signed,
                         else => {},
                     }
@@ -376,11 +449,11 @@ pub export fn _start() noreturn {
                     switch (ev.code) {
                         abs_x => {
                             abs_pos_x = value_signed;
-                            abs_dirty = true;
+                            abs_dirty_x = true;
                         },
                         abs_y => {
                             abs_pos_y = value_signed;
-                            abs_dirty = true;
+                            abs_dirty_y = true;
                         },
                         else => {},
                     }
@@ -393,10 +466,28 @@ pub export fn _start() noreturn {
                         else => {},
                     }
                 } else if (ev.event_type == event_type_syn and ev.code == syn_report) {
+                    const abs_dirty = abs_dirty_x or abs_dirty_y;
                     if (abs_dirty) {
-                        const abs_target_x = if (abs_pos_x >= 0 and abs_pos_x < screen_w) abs_pos_x else mapAbsToScreen(abs_pos_x, screen_w);
-                        const raw_abs_target_y = if (abs_pos_y >= 0 and abs_pos_y < screen_h) abs_pos_y else mapAbsToScreen(abs_pos_y, screen_h);
-                        const abs_target_y = screen_h - 1 - raw_abs_target_y;
+                        if (abs_pos_x >= screen_w) fallback_abs_x_max = growFallbackAbsMax(fallback_abs_x_max, abs_pos_x);
+                        if (abs_pos_y >= screen_h) fallback_abs_y_max = growFallbackAbsMax(fallback_abs_y_max, abs_pos_y);
+                        const abs_target_x = if (abs_dirty_x)
+                            if (abs_x_range) |range|
+                                mapAbsRangeToScreen(abs_pos_x, range, screen_w)
+                            else if (abs_pos_x >= 0 and abs_pos_x < screen_w)
+                                abs_pos_x
+                            else
+                                mapAbsRangeToScreen(abs_pos_x, .{ .min = 0, .max = fallback_abs_x_max }, screen_w)
+                        else
+                            cursor_x;
+                        const abs_target_y = if (abs_dirty_y)
+                            if (abs_y_range) |range|
+                                mapAbsRangeToScreen(abs_pos_y, range, screen_h)
+                            else if (abs_pos_y >= 0 and abs_pos_y < screen_h)
+                                abs_pos_y
+                            else
+                                mapAbsRangeToScreen(abs_pos_y, .{ .min = 0, .max = fallback_abs_y_max }, screen_h)
+                        else
+                            cursor_y;
                         accum_dx = abs_target_x - cursor_x;
                         accum_dy = abs_target_y - cursor_y;
                     }
@@ -415,7 +506,8 @@ pub export fn _start() noreturn {
                         accum_dy = 0;
                         accum_wheel = 0;
                         reported_buttons_mask = buttons_mask;
-                        abs_dirty = false;
+                        abs_dirty_x = false;
+                        abs_dirty_y = false;
                     }
                 }
             }

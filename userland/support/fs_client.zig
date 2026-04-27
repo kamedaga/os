@@ -3,6 +3,7 @@ const fs_abi = @import("fs_abi.zig");
 const fs_protocol = @import("fs_protocol.zig");
 const image_abi = @import("image_abi.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
+const user_vm = @import("user_vm.zig");
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -12,8 +13,10 @@ const syscall_grant_cap_on_endpoint: u64 = 0x24;
 const syscall_install_endpoint: u64 = 0x26;
 const syscall_share_cap: u64 = 0x2B;
 const syscall_signal_endpoint: u64 = 0x2C;
+const syscall_ipc_call_reply_recv: u64 = 0x40;
 const syscall_ok: u64 = 0;
 const syscall_err_endpoint: u64 = 9;
+const ipc_call_flag_signal_only: u64 = 0x2;
 
 const page_right_cpu_read: u64 = 0x1;
 const page_right_cpu_write: u64 = 0x2;
@@ -44,8 +47,8 @@ pub const Error = error{
 };
 
 pub const ConnectOptions = struct {
-    request_va: u64,
-    response_va: u64,
+    request_va: u64 = 0,
+    response_va: u64 = 0,
     client_process_slot: u64,
     endpoint_id: u64,
     response_poll_limit: u64 = default_response_poll_limit,
@@ -87,6 +90,12 @@ pub const ReaddirResult = union(enum) {
     end,
 };
 
+pub const ReaddirManyResult = struct {
+    entries: []DirEntry,
+    next_cursor: u64,
+    end: bool,
+};
+
 pub const ReadResult = struct {
     bytes_read: usize,
     file_bytes: u64,
@@ -99,27 +108,24 @@ pub const Client = struct {
     request_paddr: u64,
     response_paddr: u64,
     server_endpoint_id: u64,
+    session_nonce: u64,
     mount_token: u64,
     next_seq: u64 = 2,
     response_poll_limit: u64 = default_response_poll_limit,
 
     pub fn connect(options: ConnectOptions) Error!Client {
-        const request_paddr = allocPage();
-        if (request_paddr < 0x1000) return error.RequestAllocFailed;
-        if (mapPage(options.request_va, request_paddr, true) != 0) return error.RequestMapFailed;
-
-        const response_paddr = allocPage();
-        if (response_paddr < 0x1000) return error.ResponseAllocFailed;
-        if (mapPage(options.response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
+        const pages = try allocConnectPages(options.request_va, options.response_va);
         var compat_installed = false;
-        try grantResponseCapForConnect(response_paddr, options, &compat_installed);
+        try grantResponseCapForConnect(pages.response_paddr, options, &compat_installed);
+        const session_nonce = makeSessionNonce(pages.request_paddr, pages.response_paddr, options.endpoint_id, options.client_process_slot);
 
         var client = Client{
-            .request_va = options.request_va,
-            .response_va = options.response_va,
-            .request_paddr = request_paddr,
-            .response_paddr = response_paddr,
+            .request_va = pages.request_va,
+            .response_va = pages.response_va,
+            .request_paddr = pages.request_paddr,
+            .response_paddr = pages.response_paddr,
             .server_endpoint_id = options.endpoint_id,
+            .session_nonce = session_nonce,
             .mount_token = 0,
             .response_poll_limit = options.response_poll_limit,
         };
@@ -136,12 +142,13 @@ pub const Client = struct {
         request.path_bytes = 0;
         request.inline_bytes = 0;
         request.reserved0 = 0;
-        request.arg0 = response_paddr;
+        request.arg0 = pages.response_paddr;
         request.arg1 = options.client_process_slot;
+        request.session_nonce = session_nonce;
         compilerBarrier();
         request.request_seq = 1;
 
-        try shareConnectRequest(request_paddr, options, &compat_installed);
+        try shareConnectRequest(pages.request_paddr, options, &compat_installed);
         const response = try client.finishRequestOk(1, .connect);
         client.mount_token = response.result_token;
         if (!fs_abi.isCapToken(client.mount_token)) return error.InvalidResponse;
@@ -269,6 +276,47 @@ pub const Client = struct {
         };
     }
 
+    pub fn readdirMany(
+        self: *Client,
+        dir_token: u64,
+        cursor: u64,
+        entries: []DirEntry,
+        name_storage: []u8,
+    ) Error!ReaddirManyResult {
+        if (entries.len == 0) return error.BufferTooSmall;
+
+        var next_cursor = cursor;
+        var name_offset: usize = 0;
+        var count: usize = 0;
+        var end = false;
+        while (count < entries.len) : (count += 1) {
+            const name_buf = name_storage[name_offset..];
+            const result = try self.readdirOne(dir_token, next_cursor, name_buf);
+            switch (result) {
+                .end => {
+                    end = true;
+                    break;
+                },
+                .entry => |entry| {
+                    const name_len = entry.name.len;
+                    entries[count] = .{
+                        .next_cursor = entry.next_cursor,
+                        .object_kind = entry.object_kind,
+                        .name = name_storage[name_offset .. name_offset + name_len],
+                    };
+                    next_cursor = entry.next_cursor;
+                    name_offset += name_len;
+                },
+            }
+        }
+
+        return .{
+            .entries = entries[0..count],
+            .next_cursor = next_cursor,
+            .end = end,
+        };
+    }
+
     pub fn create(self: *Client, dir_token: u64, path: []const u8) Error!LookupResult {
         return self.createWithFlags(dir_token, path, 0);
     }
@@ -379,13 +427,15 @@ pub const Client = struct {
         request.reserved0 = 0;
         request.arg0 = 0;
         request.arg1 = 0;
+        request.session_nonce = self.session_nonce;
         if (path.len != 0) copyBytesToVolatile(self.requestPayload(), path);
         if (inline_payload.len != 0) copyBytesToVolatile(self.requestPayload() + path.len, inline_payload);
         const seq = self.next_seq;
         self.next_seq += 1;
         compilerBarrier();
         request.request_seq = seq;
-        _ = signalEndpoint(self.server_endpoint_id);
+        const wake_status = ipcCallReplyRecvSignalOnly(self.server_endpoint_id);
+        if (wake_status != syscall_ok) _ = signalEndpoint(self.server_endpoint_id);
         return seq;
     }
 
@@ -444,6 +494,46 @@ pub const Client = struct {
         };
     }
 };
+
+fn makeSessionNonce(request_paddr: u64, response_paddr: u64, endpoint_id: u64, tag: u64) u64 {
+    const nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ tag ^ 0x9e37_79b9_7f4a_7c15;
+    return if (nonce == 0) 1 else nonce;
+}
+
+const ConnectPages = struct {
+    request_va: u64,
+    response_va: u64,
+    request_paddr: u64,
+    response_paddr: u64,
+};
+
+fn allocConnectPages(request_va: u64, response_va: u64) Error!ConnectPages {
+    if (request_va == 0 and response_va == 0) {
+        var paddrs: [2]u64 = .{ 0, 0 };
+        const base_va = user_vm.allocMapPagesInto(2, true, paddrs[0..]) orelse return error.RequestAllocFailed;
+        if (paddrs[0] < 0x1000 or paddrs[1] < 0x1000) return error.RequestAllocFailed;
+        return .{
+            .request_va = @intCast(base_va),
+            .response_va = @intCast(base_va + user_vm.page_bytes),
+            .request_paddr = paddrs[0],
+            .response_paddr = paddrs[1],
+        };
+    }
+    if (request_va == 0 or response_va == 0) return error.Invalid;
+    const request_paddr = allocPage();
+    if (request_paddr < 0x1000) return error.RequestAllocFailed;
+    if (mapPage(request_va, request_paddr, true) != 0) return error.RequestMapFailed;
+
+    const response_paddr = allocPage();
+    if (response_paddr < 0x1000) return error.ResponseAllocFailed;
+    if (mapPage(response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
+    return .{
+        .request_va = request_va,
+        .response_va = response_va,
+        .request_paddr = request_paddr,
+        .response_paddr = response_paddr,
+    };
+}
 
 fn allocPage() u64 {
     return asm volatile (
@@ -562,6 +652,17 @@ fn signalEndpoint(endpoint_id: u64) u64 {
         : [nr] "{rax}" (syscall_signal_endpoint),
           [arg0] "{rdi}" (endpoint_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn ipcCallReplyRecvSignalOnly(endpoint_id: u64) u64 {
+    return asm volatile (
+        \\syscall
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_ipc_call_reply_recv),
+          [arg0] "{rdi}" (@as(u64, 0)),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (ipc_call_flag_signal_only),
+        : .{ .rcx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn compilerBarrier() void {

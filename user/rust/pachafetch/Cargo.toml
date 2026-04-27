@@ -5,10 +5,9 @@ edition = "2024"
 
 [dependencies]
 cap_std = { path = "../cap_std" }
+capfont = { path = "../capfont" }
 caplibgl = { path = "../caplibgl" }
-capwm_client = { path = "../capwm_client" }
-pachaland_assets = { path = "../pachaland_assets" }
-pitty_assets = { path = "../pitty_assets" }
+cap_window = { path = "../cap_window" }
 rt_alloc = { path = "../rt_alloc" }
 rt_core = { path = "../rt_core" }
 

@@ -20,6 +20,10 @@ pub const Opcode = enum(u16) {
     unlink = 24,
     rename = 25,
     statfs = 26,
+    // Reserved legacy opcodes. PersistentFs replies not_supported; the
+    // supported FS contract is blocking inline read/write.
+    read_bulk = 27,
+    readdir_bulk = 28,
     open_exec = 32,
 };
 
@@ -53,6 +57,7 @@ pub const FsRequestHeader = extern struct {
     reserved0: u32 = 0,
     arg0: u64 = 0,
     arg1: u64 = 0,
+    session_nonce: u64 = 0,
 };
 
 pub const FsResponseHeader = extern struct {

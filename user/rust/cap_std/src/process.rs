@@ -7,31 +7,13 @@ use core::ptr::{read_volatile, write_bytes};
 
 use crate::{Error, ErrorKind, Result};
 
-const CHILD_EXIT_STATUS_SLOT_CANDIDATES: [u64; 8] = [
-    0x3F21_2000,
-    0x3F21_3000,
-    0x3F21_4000,
-    0x3F21_5000,
-    0x3F21_6000,
-    0x3F21_7000,
-    0x3F21_8000,
-    0x3F21_9000,
-];
+const CHILD_EXIT_STATUS_SLOT_COUNT: usize = 8;
 const PROCESS_EXIT_STATUS_MAGIC: u64 = 0x5052_5845_5449_5431;
 const PROCESS_EXIT_STATUS_VERSION: u64 = 1;
 const PROCESS_EXIT_STATUS_STATE_IDLE: u64 = 0;
 const PROCESS_EXIT_STATUS_STATE_EXITED: u64 = 1;
 const PROCESS_EXIT_STATUS_PAGE_BYTES: usize = 4096;
-const CHILD_ARGS_ENV_SLOT_CANDIDATES: [u64; 8] = [
-    0x3F21_A000,
-    0x3F21_B000,
-    0x3F21_C000,
-    0x3F21_D000,
-    0x3F21_E000,
-    0x3F21_F000,
-    0x3F22_0000,
-    0x3F22_1000,
-];
+const CHILD_ARGS_ENV_SLOT_COUNT: usize = 8;
 const PROCESS_ARGS_ENV_MAGIC: u64 = 0x5052_4147_4556_3131;
 const PROCESS_ARGS_ENV_VERSION: u64 = 1;
 const PROCESS_ARGS_ENV_MAX_ARGS: usize = 32;
@@ -109,19 +91,19 @@ struct ChildArgsEnvSlot {
     in_use: bool,
 }
 
-static mut CHILD_EXIT_STATUS_SLOTS: [ChildExitStatusSlot; CHILD_EXIT_STATUS_SLOT_CANDIDATES.len()] =
+static mut CHILD_EXIT_STATUS_SLOTS: [ChildExitStatusSlot; CHILD_EXIT_STATUS_SLOT_COUNT] =
     [ChildExitStatusSlot {
         source_va: 0,
         allocated: false,
         in_use: false,
-    }; CHILD_EXIT_STATUS_SLOT_CANDIDATES.len()];
+    }; CHILD_EXIT_STATUS_SLOT_COUNT];
 
-static mut CHILD_ARGS_ENV_SLOTS: [ChildArgsEnvSlot; CHILD_ARGS_ENV_SLOT_CANDIDATES.len()] =
+static mut CHILD_ARGS_ENV_SLOTS: [ChildArgsEnvSlot; CHILD_ARGS_ENV_SLOT_COUNT] =
     [ChildArgsEnvSlot {
         source_va: 0,
         allocated: false,
         in_use: false,
-    }; CHILD_ARGS_ENV_SLOT_CANDIDATES.len()];
+    }; CHILD_ARGS_ENV_SLOT_COUNT];
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Child {
@@ -479,17 +461,21 @@ fn acquire_child_exit_status_slot() -> Result<(usize, u64)> {
     unsafe {
         let slots = &raw mut CHILD_EXIT_STATUS_SLOTS;
         let mut index = 0;
-        while index < CHILD_EXIT_STATUS_SLOT_CANDIDATES.len() {
+        while index < CHILD_EXIT_STATUS_SLOT_COUNT {
             let slot = &mut (*slots)[index];
             if slot.in_use {
                 index += 1;
                 continue;
             }
             if !slot.allocated {
-                let source_va = CHILD_EXIT_STATUS_SLOT_CANDIDATES[index];
-                let status =
-                    rt_core::syscall::call4(rt_core::syscall::ALLOC_MAP_PAGES, source_va, 1, 1, 0);
-                if status != rt_core::syscall::OK {
+                let source_va = match rt_core::vm::alloc_map_page(true) {
+                    Ok(page) => page.va(),
+                    Err(_) => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                if source_va == 0 {
                     index += 1;
                     continue;
                 }
@@ -505,7 +491,7 @@ fn acquire_child_exit_status_slot() -> Result<(usize, u64)> {
 }
 
 fn release_child_exit_status_slot(index: usize) {
-    if index >= CHILD_EXIT_STATUS_SLOT_CANDIDATES.len() {
+    if index >= CHILD_EXIT_STATUS_SLOT_COUNT {
         return;
     }
     // SAFETY: CapabilityOS user processes are single-threaded today, and the
@@ -540,17 +526,21 @@ fn acquire_child_args_env_slot() -> Result<(usize, u64)> {
     unsafe {
         let slots = &raw mut CHILD_ARGS_ENV_SLOTS;
         let mut index = 0;
-        while index < CHILD_ARGS_ENV_SLOT_CANDIDATES.len() {
+        while index < CHILD_ARGS_ENV_SLOT_COUNT {
             let slot = &mut (*slots)[index];
             if slot.in_use {
                 index += 1;
                 continue;
             }
             if !slot.allocated {
-                let source_va = CHILD_ARGS_ENV_SLOT_CANDIDATES[index];
-                let status =
-                    rt_core::syscall::call4(rt_core::syscall::ALLOC_MAP_PAGES, source_va, 1, 1, 0);
-                if status != rt_core::syscall::OK {
+                let source_va = match rt_core::vm::alloc_map_page(true) {
+                    Ok(page) => page.va(),
+                    Err(_) => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                if source_va == 0 {
                     index += 1;
                     continue;
                 }
@@ -566,7 +556,7 @@ fn acquire_child_args_env_slot() -> Result<(usize, u64)> {
 }
 
 fn release_child_args_env_slot(index: usize) {
-    if index >= CHILD_ARGS_ENV_SLOT_CANDIDATES.len() {
+    if index >= CHILD_ARGS_ENV_SLOT_COUNT {
         return;
     }
     // SAFETY: CapabilityOS user processes are single-threaded today, and the

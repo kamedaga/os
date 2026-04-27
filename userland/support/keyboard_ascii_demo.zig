@@ -1,11 +1,11 @@
 const syscall_log: u64 = 0x9;
 const font = @import("font.zig");
+const user_vm = @import("user_vm.zig");
 const window_client = @import("window_client.zig");
 
 const keyboard_shared_page_va: usize = 0x3C00_6000;
 const window_pixels_va: usize = 0x3C00_4000;
 const window_meta_shared_va: usize = 0x3C00_7000;
-const window_cap_tmp_va: u64 = 0x3C10_0000;
 
 const keyboard_shared_magic: u64 = 0x4B534852; // "KSHR"
 const pixel_width: usize = 32;
@@ -194,6 +194,10 @@ pub export fn _start() noreturn {
         _ = userLog("KeyboardAsciiDemo: keyboard shared magic mismatch\n");
         while (true) asm volatile ("pause");
     }
+    const window_cap_tmp_va: u64 = @intCast(user_vm.reservePages(1) orelse {
+        _ = userLog("KeyboardAsciiDemo: reserve cap tmp failed\n");
+        while (true) asm volatile ("pause");
+    });
 
     const window_created = window_client.createAndPublishWindow(
         @intCast(pixel_width),

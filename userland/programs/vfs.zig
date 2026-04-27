@@ -3,6 +3,8 @@ const cap_transfer_abi = @import("support_root").cap_transfer_abi;
 const bootfs_format = @import("support_root").bootfs_format;
 const fs_abi = @import("support_root").fs_abi;
 const image_abi = @import("support_root").image_abi;
+const process_abi = @import("support_root").process_abi;
+const user_vm = @import("support_root").user_vm;
 const vfs_protocol = @import("support_root").vfs_protocol;
 
 const syscall_map_page: u64 = 0x2;
@@ -13,17 +15,12 @@ const syscall_ok: u64 = 0;
 const page_right_cpu_read: u64 = 0x1;
 const page_right_cpu_write: u64 = 0x2;
 
-const vfs_config_va: usize = 0x3C00_2000;
+const vfs_config_va: usize = @intCast(process_abi.standard_config_target_va);
 const vfs_boot_config_magic: u64 = 0x5646_5343; // "VFSC"
 const vfs_boot_config_version: u64 = 2;
 const vfs_boot_config_flag_bootfs_present: u64 = 1 << 0;
 const fs_cap_token_tag: u64 = 1 << 63;
 const bootfs_root_object_id: u64 = 1;
-const bootfs_image_va: usize = 0x3C08_0000;
-const bootfs_probe_va: usize = 0x3C02_0000;
-const bootfs_read_window_va: usize = 0x3C03_0000;
-const session_base_va: u64 = 0x3C01_0000;
-const session_va_stride: u64 = 0x2000;
 const session_poll_timeout_ticks: u64 = 1;
 const max_sessions: usize = 4;
 const max_session_objects: usize = 8;
@@ -96,6 +93,9 @@ const Session = struct {
 var boot_state: BootState = .{};
 var boot_state_ready = false;
 var bootfs_mapped_prefix_bytes: u64 = 0;
+var bootfs_image_va: usize = 0;
+var bootfs_probe_va: usize = 0;
+var bootfs_read_window_va: usize = 0;
 var sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions;
 
 fn userLog(message: []const u8) u64 {
@@ -183,7 +183,6 @@ fn sliceVmObject(token: u64, offset_bytes: u64, size_bytes: u64, rights: image_a
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-
 fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
     return asm volatile (
         \\int $0x80
@@ -244,6 +243,21 @@ fn parseBootState() ?BootState {
     };
 }
 
+fn ensureBootFsImageVa() bool {
+    if (bootfs_image_va != 0) return true;
+    if (boot_state.bootfs_size_bytes == 0) return false;
+    const page_count: usize = @intCast((boot_state.bootfs_size_bytes + vfs_protocol.page_bytes - 1) / vfs_protocol.page_bytes);
+    bootfs_image_va = user_vm.reservePages(page_count) orelse return false;
+    return true;
+}
+
+fn ensureBootFsWindowVas() bool {
+    if (bootfs_probe_va != 0 and bootfs_read_window_va != 0) return true;
+    bootfs_probe_va = user_vm.reservePages(2) orelse return false;
+    bootfs_read_window_va = user_vm.reservePages(2) orelse return false;
+    return true;
+}
+
 fn rootNode(_: *const BootState) ResolvedNode {
     return .{
         .source_mount_token = bootfs_mount_token,
@@ -256,6 +270,7 @@ fn rootNode(_: *const BootState) ResolvedNode {
 
 fn bootfsHeader() ?*const bootfs_format.BootFsHeader {
     if (!boot_state_ready) return null;
+    if (bootfs_image_va == 0) return null;
     if ((boot_state.flags & vfs_boot_config_flag_bootfs_present) == 0) return null;
     if (boot_state.bootfs_size_bytes < @sizeOf(bootfs_format.BootFsHeader)) return null;
     const header: *const bootfs_format.BootFsHeader = @ptrFromInt(bootfs_image_va);
@@ -275,6 +290,10 @@ fn alignUpToPageBytes(size_bytes: u64) u64 {
 
 fn ensureBootFsPrefixMapped(required_end_bytes: u64) bool {
     if ((boot_state.flags & vfs_boot_config_flag_bootfs_present) == 0) return true;
+    if (!ensureBootFsImageVa()) {
+        _ = userLog("VFS: bootfs image VA reserve failed\n");
+        return false;
+    }
     const vm_token = boot_state.bootfs_vm_token;
     _ = image_abi.decodeVmObjectToken(vm_token) orelse {
         _ = userLog("VFS: bootfs prefix decode failed\n");
@@ -320,6 +339,7 @@ fn ensureBootFsMetadataMapped() bool {
 
 fn mapBootFsWindow(file_offset: u64, length: usize, target_va: usize) ?[]const u8 {
     if (length == 0) return &[_]u8{};
+    if (target_va == 0) return null;
     const vm_token = boot_state.bootfs_vm_token;
     _ = image_abi.decodeVmObjectToken(vm_token) orelse return null;
     const aligned_offset = file_offset & ~@as(u64, 0xFFF);
@@ -920,6 +940,7 @@ fn grantExecToken(session: *Session, node: ResolvedNode) ?u64 {
 fn bootfsFileHasElfMagic(node: ResolvedNode) bool {
     const file_data = bootfsFileData(node.abs_path) orelse return false;
     if (file_data.data_bytes < 4) return false;
+    if (!ensureBootFsWindowVas()) return false;
     const src = mapBootFsWindow(file_data.data_offset, 4, bootfs_probe_va) orelse return false;
     return src[0] == 0x7F and src[1] == 'E' and src[2] == 'L' and src[3] == 'F';
 }
@@ -1071,6 +1092,10 @@ fn handleRead(session: *Session, request_seq: u64) void {
         @min(remaining, @as(u64, @intCast(vfs_protocol.response_payload_bytes))),
     );
     const copy_len: usize = @intCast(copy_len_u64);
+    if (!ensureBootFsWindowVas()) {
+        replyStatus(session, .read, request_seq, .io_error);
+        return;
+    }
     const src = mapBootFsWindow(file_data.data_offset + read_offset, copy_len, bootfs_read_window_va) orelse {
         replyStatus(session, .read, request_seq, .io_error);
         return;
@@ -1139,23 +1164,14 @@ fn processSessionRequest(session: *Session) void {
     session.last_completed_seq = request_seq;
 }
 
-fn sessionRequestVa(slot: usize) u64 {
-    return session_base_va + @as(u64, @intCast(slot)) * session_va_stride;
-}
-
-fn sessionResponseVa(slot: usize) u64 {
-    return sessionRequestVa(slot) + 0x1000;
-}
-
 fn handleConnectRequest(request_paddr: u64) void {
-    for (&sessions, 0..) |*session, slot| {
+    for (&sessions) |*session| {
         if (session.active) continue;
-        const req_va = sessionRequestVa(slot);
-        const resp_va = sessionResponseVa(slot);
-        if (mapPage(req_va, request_paddr, false) != syscall_ok) {
+        const request_page = user_vm.mapPageAtDynamicVa(request_paddr, false) orelse {
             _ = userLog("VFS: session request map failed\n");
             return;
-        }
+        };
+        const req_va: u64 = @intCast(request_page.va);
         const request: *volatile vfs_protocol.VfsRequestHeader = @ptrFromInt(req_va);
         if (request.magic != vfs_protocol.request_magic or
             request.version != vfs_protocol.version or
@@ -1166,10 +1182,11 @@ fn handleConnectRequest(request_paddr: u64) void {
             _ = userLog("VFS: connect request invalid\n");
             return;
         }
-        if (mapPage(resp_va, request.arg0, true) != syscall_ok) {
+        const response_page = user_vm.mapPageAtDynamicVa(request.arg0, true) orelse {
             _ = userLog("VFS: session response map failed\n");
             return;
-        }
+        };
+        const resp_va: u64 = @intCast(response_page.va);
         session.* = .{
             .active = true,
             .client_process_slot = request.arg1,

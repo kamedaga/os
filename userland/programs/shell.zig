@@ -6,6 +6,7 @@ const font = @import("support_root").font;
 const fs_abi = @import("support_root").fs_abi;
 const fs_client = @import("support_root").fs_client;
 const fs_protocol = @import("support_root").fs_protocol;
+const gpu_client = @import("support_root").gpu_client;
 const image_abi = @import("support_root").image_abi;
 const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
 const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
@@ -14,9 +15,9 @@ const process_args_env_bootstrap_abi = @import("support_root").process_args_env_
 const process_exit_bootstrap_abi = @import("support_root").process_exit_bootstrap_abi;
 const service_registry_abi = @import("support_root").service_registry_abi;
 const stdio_bootstrap_abi = @import("support_root").stdio_bootstrap_abi;
+const user_vm = @import("support_root").user_vm;
 
 const syscall_log: u64 = 0x9;
-const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
@@ -33,50 +34,34 @@ const syscall_install_vm_object: u64 = image_abi.syscall_install_vm_object;
 const config_framebuffer_paddr_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_paddr_index);
 const config_framebuffer_size_bytes_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_size_bytes_index);
 const config_framebuffer_vm_token_index: usize = @intCast(init_bootstrap_abi.boot_display_config_fb_vm_token_index);
+const config_framebuffer_width_index: usize = @intCast(init_bootstrap_abi.boot_display_config_width_index);
+const config_framebuffer_height_index: usize = @intCast(init_bootstrap_abi.boot_display_config_height_index);
+const config_framebuffer_pitch_index: usize = @intCast(init_bootstrap_abi.boot_display_config_pitch_index);
 const syscall_batch_max_pages: usize = 64;
 
 const syscall_ok: u64 = 0;
 const syscall_err_endpoint: u64 = 9;
-const framebuffer_va: usize = 0x3C00_5000;
 const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
-const runtime_page_base_va: usize = 0x2100_0000;
-const common_page_va: usize = runtime_page_base_va + 0x4000;
-const notify_page_va: usize = runtime_page_base_va + 0x5000;
-const isr_page_va: usize = runtime_page_base_va + 0x6000;
-const queue_page0_va: usize = runtime_page_base_va + 0x8000;
-const queue_page1_va: usize = runtime_page_base_va + 0x9000;
-const capctl_request_page_candidates = [_]u64{
-    0x3F06_2000,
-    0x3F06_4000,
-    0x3F06_6000,
-    0x3F06_8000,
-    0x3F06_A000,
-    0x3F06_C000,
-    0x3F06_E000,
-    0x3F07_0000,
-};
-const capctl_response_page_candidates = [_]u64{
-    0x3F06_3000,
-    0x3F06_5000,
-    0x3F06_7000,
-    0x3F06_9000,
-    0x3F06_B000,
-    0x3F06_D000,
-    0x3F06_F000,
-    0x3F07_1000,
-};
 
-const fb_width: usize = 832;
-const fb_height: usize = @intCast(init_bootstrap_abi.boot_display_shell_height);
-const fb_pitch: usize = 832;
+const fallback_fb_width: usize = 832;
+const fallback_fb_height: usize = @intCast(init_bootstrap_abi.boot_display_shell_height);
+const fallback_fb_pitch: usize = 832;
+const max_fb_width: usize = 1920;
+const max_fb_height: usize = @intCast(init_bootstrap_abi.boot_display_shell_height);
 const font_scale_num: i32 = 1;
 const font_scale_den: i32 = 1;
 const text_margin_x: usize = 2;
 const text_margin_y: usize = 1;
-const cell_w: usize = @as(usize, @intCast(font.scaledGlyphWidthRatio(font_scale_num, font_scale_den)));
 const cell_h: usize = @as(usize, @intCast(font.lineHeightRatio(font_scale_num, font_scale_den))) + text_margin_y * 2;
-const cols: usize = (fb_width - text_margin_x * 2) / cell_w;
-const rows: usize = fb_height / cell_h;
+const shell_column_advance: usize = 8;
+const max_cols: usize = 256;
+const max_rows: usize = max_fb_height / cell_h;
+var fb_width: usize = fallback_fb_width;
+var fb_height: usize = fallback_fb_height;
+var fb_pitch: usize = fallback_fb_pitch;
+var framebuffer_va: usize = 0;
+var screen_cols: usize = (fallback_fb_width - text_margin_x * 2) / shell_column_advance;
+var screen_rows: usize = fallback_fb_height / cell_h;
 
 const bg_color: u32 = 0x0005_0608;
 const panel_color: u32 = 0x000B_0C0E;
@@ -109,73 +94,26 @@ const status_driver_ok: u8 = 0x04;
 const event_type_syn: u16 = 0x00;
 const event_type_key: u16 = 0x01;
 const syn_report: u16 = 0x00;
+const key_q: u16 = 0x10;
+const key_left_ctrl: u16 = 0x1D;
 const key_left_shift: u16 = 0x2A;
 const key_right_shift: u16 = 0x36;
+const key_right_ctrl: u16 = 0x61;
 
 const queue_index_event: u16 = 0;
 const queue_size: u16 = 8;
 const queue_used_offset: usize = 4096;
 const queue_buffers_offset: usize = 4176;
 const desc_flag_write: u16 = 1 << 1;
-const shell_idle_poll_ticks: u64 = 4;
+const shell_idle_poll_ticks: u64 = 1;
 const service_registry_page_va: u64 = process_abi.service_registry_shadow_va;
-const spawn_registry_copy_candidates = [_]u64{
-    0x3F00_0000,
-    0x3F00_1000,
-    0x3F00_2000,
-    0x3F00_3000,
-    0x3F00_4000,
-    0x3F00_5000,
-    0x3F00_6000,
-    0x3F00_7000,
-};
-const spawn_demo_config_candidates = [_]u64{
-    0x3F00_8000,
-    0x3F00_9000,
-    0x3F00_A000,
-    0x3F00_B000,
-    0x3F00_C000,
-    0x3F00_D000,
-    0x3F00_E000,
-    0x3F00_F000,
-};
-const spawn_demo_vm_source_candidates = [_]u64{
-    0x3F01_0000,
-    0x3F02_0000,
-    0x3F03_0000,
-    0x3F04_0000,
-};
-const spawn_child_text_stream_candidates = [_]u64{
-    0x3F05_0000,
-    0x3F05_1000,
-    0x3F05_2000,
-    0x3F05_3000,
-    0x3F05_4000,
-    0x3F05_5000,
-    0x3F05_6000,
-    0x3F05_7000,
-};
-const spawn_stdio_zero_page_candidate: u64 = 0x3F05_8000;
-const spawn_exit_status_zero_page_candidate: u64 = 0x3F05_9000;
-const spawn_child_args_env_candidates = [_]u64{
-    0x3F05_A000,
-    0x3F05_B000,
-    0x3F05_C000,
-    0x3F05_D000,
-    0x3F05_E000,
-    0x3F05_F000,
-    0x3F06_0000,
-    0x3F06_1000,
-};
+const child_bootstrap_slot_count: usize = 32;
 const shell_stack_extension_pages: u64 = 8;
 const shell_stack_extension_base_va: u64 = process_abi.aux_base_va - ((shell_stack_extension_pages + 1) * 4096);
-const block_request_va: u64 = 0x3C10_4000;
-const block_response_va: u64 = 0x3C10_5000;
-const persistent_fs_request_va: u64 = 0x3C10_6000;
-const persistent_fs_response_va: u64 = 0x3C10_7000;
 const block_demo_magic: u64 = 0x424C_4B44_454D_4F31;
 const shell_cat_display_limit_bytes: usize = 2048;
 const shell_fs_probe_auto = false;
+const shell_ipc_pair_bench_auto = false;
 const shell_fs_probe_commands = [_][]const u8{
     "ls /",
     "ls /cmd",
@@ -186,13 +124,20 @@ const pie_user_rootfs_name = "cmd/pie_user.elf";
 const virtio_gpu_gl_rootfs_path = "/srv/virtio_gpu_gl.elf";
 const pachaland_rootfs_path = "/srv/pachaland.elf";
 const pachafetch_rootfs_path = "/cmd/pachafetch.elf";
+const pitty_rootfs_path = "/cmd/pitty.elf";
 const gpu_demo_rootfs_path = "/cmd/gpu_demo.elf";
+const ipc_pair_bench_server_rootfs_path = "/cmd/ipc_pair_bench_server.elf";
+const ipc_pair_bench_client_rootfs_path = "/cmd/ipc_pair_bench_client.elf";
 var fs_demo_scratch: [1536]u8 = [_]u8{0} ** 1536;
 var spawn_registry_copy_source_va: u64 = 0;
 var spawn_demo_config_source_va: u64 = 0;
 var spawn_demo_vm_object_token: u64 = 0;
 var spawn_stdio_zero_page_source_va: u64 = 0;
 var spawn_exit_status_zero_page_source_va: u64 = 0;
+var keyboard_common_page_va: usize = 0;
+var keyboard_notify_page_va: usize = 0;
+var keyboard_isr_page_va: usize = 0;
+var keyboard_queue_base_va: usize = 0;
 var shell_process_slot_cache: u64 = 0;
 var gpu_service_process_slot_cache: u64 = 0;
 var gpu_service_endpoint_id_cache: u64 = 0;
@@ -221,8 +166,8 @@ const ChildTextStreamSlot = struct {
     partial_buf: [stdio_bootstrap_abi.payload_bytes]u8 = [_]u8{0} ** stdio_bootstrap_abi.payload_bytes,
 };
 
-var child_text_stream_slots: [spawn_child_text_stream_candidates.len]ChildTextStreamSlot =
-    [_]ChildTextStreamSlot{.{}} ** spawn_child_text_stream_candidates.len;
+var child_text_stream_slots: [child_bootstrap_slot_count]ChildTextStreamSlot =
+    [_]ChildTextStreamSlot{.{}} ** child_bootstrap_slot_count;
 
 const ChildArgsEnvSlot = struct {
     source_va: u64 = 0,
@@ -230,8 +175,8 @@ const ChildArgsEnvSlot = struct {
     active: bool = false,
 };
 
-var child_args_env_slots: [spawn_child_args_env_candidates.len]ChildArgsEnvSlot =
-    [_]ChildArgsEnvSlot{.{}} ** spawn_child_args_env_candidates.len;
+var child_args_env_slots: [child_bootstrap_slot_count]ChildArgsEnvSlot =
+    [_]ChildArgsEnvSlot{.{}} ** child_bootstrap_slot_count;
 
 const VirtqDesc = extern struct {
     addr: u64,
@@ -254,7 +199,8 @@ const VirtioInputEvent = extern struct {
 const RenderAction = enum(u2) {
     none = 0,
     prompt = 1,
-    full = 2,
+    body = 2,
+    full = 3,
 
     fn merge(current: RenderAction, next: RenderAction) RenderAction {
         return if (@intFromEnum(next) > @intFromEnum(current)) next else current;
@@ -270,12 +216,20 @@ const KeyboardState = struct {
     has_pending_key: bool = false,
     pending_ascii: u8 = 0,
     has_pending_ascii: bool = false,
+    pending_launch_pitty: bool = false,
+    pending_switch_shell: bool = false,
     shift_down: bool = false,
+    ctrl_down: bool = false,
+};
+
+const KeyboardPollResult = struct {
+    action: RenderAction = .none,
+    saw_event: bool = false,
 };
 
 const ShellState = struct {
-    lines: [rows - 1][cols]u8 = [_][cols]u8{[_]u8{' '} ** cols} ** (rows - 1),
-    line_len: [rows - 1]usize = [_]usize{0} ** (rows - 1),
+    lines: [max_rows - 1][max_cols]u8 = [_][max_cols]u8{[_]u8{' '} ** max_cols} ** (max_rows - 1),
+    line_len: [max_rows - 1]usize = [_]usize{0} ** (max_rows - 1),
     cur_row: usize = 0,
     splash_line_count: usize = 0,
     cmd: [128]u8 = undefined,
@@ -283,22 +237,56 @@ const ShellState = struct {
     keyboard_ready: bool = false,
     block_client_ready: bool = false,
     block_client_state: block_client.Client = undefined,
+    gpu_client_ready: bool = false,
+    gpu_client_state: gpu_client.Client = undefined,
+    shell_scanout_active: bool = false,
     capctl_next_seq: u64 = 1,
-    capctl_page_slot_next: usize = 0,
     persistent_fs_client_ready: bool = false,
     persistent_fs_client_state: fs_client.Client = undefined,
     auto_fs_probe_pending: bool = true,
+    auto_ipc_pair_bench_pending: bool = true,
     cwd_path_buf: [fs_protocol.max_path_bytes]u8 = [_]u8{0} ** fs_protocol.max_path_bytes,
     cwd_path_len: usize = 0,
+    prompt_cache: [max_cols]u8 = [_]u8{' '} ** max_cols,
+    prompt_cache_len: usize = 0,
+    prompt_cache_row: usize = 0,
+    prompt_cache_end_x: usize = 0,
+    prompt_cache_valid: bool = false,
+    dirty_body_start: usize = max_rows,
+    dirty_body_end: usize = 0,
+    force_full_render: bool = false,
+
+    fn markBodyRowDirty(self: *ShellState, row: usize) void {
+        if (row >= self.lines.len) return;
+        if (self.dirty_body_start > row) self.dirty_body_start = row;
+        const end = row + 1;
+        if (self.dirty_body_end < end) self.dirty_body_end = end;
+    }
+
+    fn markAllBodyDirty(self: *ShellState) void {
+        self.dirty_body_start = 0;
+        self.dirty_body_end = self.lines.len;
+    }
+
+    fn hasDirtyBody(self: *const ShellState) bool {
+        return self.dirty_body_start < self.dirty_body_end;
+    }
+
+    fn clearDirtyBody(self: *ShellState) void {
+        self.dirty_body_start = max_rows;
+        self.dirty_body_end = 0;
+    }
 
     fn clearBody(self: *ShellState) void {
         var r: usize = 0;
         while (r < self.lines.len) : (r += 1) {
-            self.lines[r] = [_]u8{' '} ** cols;
+            self.lines[r] = [_]u8{' '} ** max_cols;
             self.line_len[r] = 0;
         }
         self.cur_row = 0;
         self.splash_line_count = 0;
+        self.markAllBodyDirty();
+        self.force_full_render = true;
     }
 
     fn scroll(self: *ShellState) void {
@@ -307,18 +295,21 @@ const ShellState = struct {
             self.lines[r - 1] = self.lines[r];
             self.line_len[r - 1] = self.line_len[r];
         }
-        self.lines[self.lines.len - 1] = [_]u8{' '} ** cols;
+        self.lines[self.lines.len - 1] = [_]u8{' '} ** max_cols;
         self.line_len[self.lines.len - 1] = 0;
         self.cur_row = self.lines.len - 1;
+        self.markAllBodyDirty();
     }
 
     fn writeLine(self: *ShellState, text: []const u8) void {
         if (self.cur_row == self.lines.len) self.scroll();
-        self.lines[self.cur_row] = [_]u8{' '} ** cols;
-        const copy_len = if (text.len < cols) text.len else cols;
+        const row = self.cur_row;
+        self.lines[self.cur_row] = [_]u8{' '} ** max_cols;
+        const copy_len = if (text.len < screen_cols) text.len else screen_cols;
         if (copy_len > 0) @memcpy(self.lines[self.cur_row][0..copy_len], text[0..copy_len]);
         self.line_len[self.cur_row] = copy_len;
         self.cur_row += 1;
+        self.markBodyRowDirty(row);
     }
 
     fn writeSplashLine(self: *ShellState, text: []const u8) void {
@@ -329,11 +320,12 @@ const ShellState = struct {
     }
 };
 
+var shell_state_storage = ShellState{};
 var block_storage: [4096]u8 align(16) = [_]u8{0} ** 4096;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_log),
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
@@ -343,7 +335,7 @@ fn userLog(message: []const u8) u64 {
 
 fn getProcessSlot() u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_get_process_slot),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
@@ -351,7 +343,7 @@ fn getProcessSlot() u64 {
 
 fn getProcessStatus(process_slot: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_get_process_status),
           [arg0] "{rdi}" (process_slot),
@@ -360,7 +352,7 @@ fn getProcessStatus(process_slot: u64) u64 {
 
 fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_wait_event),
           [arg0] "{rdi}" (@as(u64, if (wait_mailbox) 1 else 0)),
@@ -370,7 +362,7 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
 
 fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_install_endpoint),
           [arg0] "{rdi}" (@as(u64, 0)),
@@ -381,7 +373,7 @@ fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
 
 fn signalEndpoint(endpoint_id: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_signal_endpoint),
           [arg0] "{rdi}" (endpoint_id),
@@ -390,7 +382,7 @@ fn signalEndpoint(endpoint_id: u64) u64 {
 
 fn shareCap(paddr: u64, endpoint_id: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_share_cap),
           [arg0] "{rdi}" (paddr),
@@ -400,7 +392,7 @@ fn shareCap(paddr: u64, endpoint_id: u64) u64 {
 
 fn grantCapOnEndpoint(paddr: u64, endpoint_id: u64, rights: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_grant_cap_on_endpoint),
           [arg0] "{rdi}" (paddr),
@@ -476,25 +468,21 @@ fn spawnExec(
     }
     const requested = table.page_count != 0 or table.cap_count != 0;
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (process_abi.syscall_spawn_exec),
           [arg0] "{rdi}" (exec_token),
           [arg1] "{rsi}" (@as(u64, if (requested) @intFromPtr(&table) else 0)),
           [arg2] "{rdx}" (@as(u64, 0)),
-          [arg3] "{rcx}" (@as(u64, if (requested) process_abi.spawn_flag_bootstrap_extended_descriptor_table else 0)),
+          [arg3] "{r10}" (@as(u64, if (requested) process_abi.spawn_flag_bootstrap_extended_descriptor_table else 0)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn ensureSpawnRegistryCopyPage() bool {
     if (spawn_registry_copy_source_va != 0) return true;
-    for (spawn_registry_copy_candidates) |candidate_va| {
-        if (allocMapPages(candidate_va, 1, true, 0) == syscall_ok) {
-            spawn_registry_copy_source_va = candidate_va;
-            return true;
-        }
-    }
-    return false;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    spawn_registry_copy_source_va = @intCast(page.va);
+    return true;
 }
 
 fn copyServiceRegistryShadowForSpawn() ?u64 {
@@ -551,16 +539,16 @@ fn applyServiceRegistryOverlay(base_va: u64) void {
 
 fn ensureSpawnStdioZeroPage() bool {
     if (spawn_stdio_zero_page_source_va != 0) return true;
-    if (allocMapPages(spawn_stdio_zero_page_candidate, 1, true, 0) != syscall_ok) return false;
-    spawn_stdio_zero_page_source_va = spawn_stdio_zero_page_candidate;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    spawn_stdio_zero_page_source_va = @intCast(page.va);
     stdio_bootstrap_abi.initZeroPage(spawn_stdio_zero_page_source_va);
     return true;
 }
 
 fn ensureSpawnExitStatusZeroPage() bool {
     if (spawn_exit_status_zero_page_source_va != 0) return true;
-    if (allocMapPages(spawn_exit_status_zero_page_candidate, 1, true, 0) != syscall_ok) return false;
-    spawn_exit_status_zero_page_source_va = spawn_exit_status_zero_page_candidate;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    spawn_exit_status_zero_page_source_va = @intCast(page.va);
     process_exit_bootstrap_abi.initZeroPage(spawn_exit_status_zero_page_source_va);
     return true;
 }
@@ -568,11 +556,9 @@ fn ensureSpawnExitStatusZeroPage() bool {
 fn ensureChildTextStreamSourcePage(slot_index: usize) bool {
     const slot = &child_text_stream_slots[slot_index];
     if (slot.source_va != 0) return true;
-    const candidate_va = spawn_child_text_stream_candidates[slot_index];
-    var paddr: u64 = 0;
-    if (allocMapPages(candidate_va, 1, true, @intFromPtr(&paddr)) != syscall_ok or paddr < 0x1000) return false;
-    slot.source_va = candidate_va;
-    slot.source_paddr = paddr;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    slot.source_va = @intCast(page.va);
+    slot.source_paddr = page.paddr;
     return true;
 }
 
@@ -612,9 +598,8 @@ fn prepareChildTextStreamSlot() ?*ChildTextStreamSlot {
 fn ensureChildArgsEnvSourcePage(slot_index: usize) bool {
     const slot = &child_args_env_slots[slot_index];
     if (slot.source_va != 0) return true;
-    const candidate_va = spawn_child_args_env_candidates[slot_index];
-    if (allocMapPages(candidate_va, 1, true, 0) != syscall_ok) return false;
-    slot.source_va = candidate_va;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    slot.source_va = @intCast(page.va);
     return true;
 }
 
@@ -823,13 +808,9 @@ fn pumpChildTextStreams(st: *ShellState) bool {
 
 fn ensureSpawnDemoConfigPage() bool {
     if (spawn_demo_config_source_va != 0) return true;
-    for (spawn_demo_config_candidates) |candidate_va| {
-        if (allocMapPages(candidate_va, 1, true, 0) == syscall_ok) {
-            spawn_demo_config_source_va = candidate_va;
-            return true;
-        }
-    }
-    return false;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    spawn_demo_config_source_va = @intCast(page.va);
+    return true;
 }
 
 fn writeRustSpawnDemoConfigPage(state: u64, remaining_depth: u64, lineage: u64) void {
@@ -850,7 +831,7 @@ fn prepareRustSpawnDemoConfigPage() ?u64 {
 
 fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_install_vm_object),
           [arg0] "{rdi}" (base_va),
@@ -861,6 +842,10 @@ fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRigh
 
 fn isRustSpawnDemoPath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, "rust_spawn_demo.elf");
+}
+
+fn isPachalandPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, pachaland_rootfs_path) or std.mem.endsWith(u8, path, "/pachaland.elf") or std.mem.eql(u8, path, "pachaland.elf");
 }
 
 fn ensureRustSpawnDemoVmObject(st: *ShellState, client: *fs_client.Client, vnode_file_token: u64) ?u64 {
@@ -880,18 +865,11 @@ fn ensureRustSpawnDemoVmObject(st: *ShellState, client: *fs_client.Client, vnode
     }
     const needed_pages = (file_bytes + page_bytes - 1) / page_bytes;
 
-    var source_base_va: ?u64 = null;
-    for (spawn_demo_vm_source_candidates) |candidate_va| {
-        if (allocMapPages(candidate_va, needed_pages, true, 0) == syscall_ok) {
-            source_base_va = candidate_va;
-            break;
-        }
-    }
-    const base_va = source_base_va orelse {
+    const base_va: u64 = @intCast(user_vm.allocMapPages(needed_pages, true) orelse {
         st.writeLine("spawn demo vm map failed");
         shellLogLine("spawn demo vm map failed");
         return null;
-    };
+    });
 
     const target: [*]u8 = @ptrFromInt(base_va);
     var offset: usize = 0;
@@ -920,19 +898,19 @@ fn ensureRustSpawnDemoVmObject(st: *ShellState, client: *fs_client.Client, vnode
 
 fn mapPagesBatch(base_va: u64, paddr_list_va: u64, page_count: u64, writable: bool) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_map_pages_batch),
           [arg0] "{rdi}" (base_va),
           [arg1] "{rsi}" (paddr_list_va),
           [arg2] "{rdx}" (page_count),
-          [arg3] "{rcx}" (@as(u64, if (writable) 1 else 0)),
+          [arg3] "{r10}" (@as(u64, if (writable) 1 else 0)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn mapVmObject(token: u64, target_va: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_map_vm_object),
           [arg0] "{rdi}" (token),
@@ -940,32 +918,29 @@ fn mapVmObject(token: u64, target_va: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_map_mmio),
-          [arg0] "{rdi}" (va),
-          [arg1] "{rsi}" (paddr),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+fn ensureFramebufferVa(size_bytes: u64) bool {
+    if (framebuffer_va != 0) return true;
+    if (size_bytes == 0) return false;
+    const page_count: usize = @intCast((size_bytes + 4095) / 4096);
+    framebuffer_va = user_vm.reservePages(page_count) orelse return false;
+    return true;
 }
 
 fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_alloc_map_pages),
           [arg0] "{rdi}" (base_va),
           [arg1] "{rsi}" (page_count),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-          [arg3] "{rcx}" (out_paddr_list_va),
+          [arg3] "{r10}" (out_paddr_list_va),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
 fn queueSubmit(token: u64, queue_index: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_submit),
           [arg0] "{rdi}" (token),
@@ -975,7 +950,7 @@ fn queueSubmit(token: u64, queue_index: u64) u64 {
 
 fn queueNotify(token: u64, queue_index: u64) u64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_queue_notify),
           [arg0] "{rdi}" (token),
@@ -1018,9 +993,48 @@ fn readCfgU64(index: usize) u64 {
     return cfg[index];
 }
 
+fn configureFramebufferFromConfig() void {
+    const raw_width = readCfgU64(config_framebuffer_width_index);
+    const raw_height = readCfgU64(config_framebuffer_height_index);
+    const raw_pitch = readCfgU64(config_framebuffer_pitch_index);
+
+    var width = fallback_fb_width;
+    if (raw_width >= 64) {
+        width = @intCast(@min(raw_width, max_fb_width));
+    }
+    var height = fallback_fb_height;
+    if (raw_height >= cell_h) {
+        height = @intCast(@min(raw_height, max_fb_height));
+    }
+    var pitch = fallback_fb_pitch;
+    if (raw_pitch >= raw_width and raw_pitch >= 64) {
+        pitch = @intCast(raw_pitch);
+    } else if (width > pitch) {
+        pitch = width;
+    }
+
+    fb_width = width;
+    fb_height = height;
+    fb_pitch = pitch;
+    if (fb_width > text_margin_x * 2 + shell_column_advance) {
+        screen_cols = @min(max_cols, (fb_width - text_margin_x * 2) / shell_column_advance);
+    } else {
+        screen_cols = 1;
+    }
+    screen_rows = @max(@as(usize, 2), @min(max_rows, fb_height / cell_h));
+}
+
 fn writeCfgU64(index: usize, value: u64) void {
     const cfg: [*]volatile u64 = @ptrFromInt(config_page_va);
     cfg[index] = value;
+}
+
+fn reserveAndMapMmioPage(paddr: u64, writable: bool) ?usize {
+    const va = user_vm.reservePages(1) orelse return null;
+    while (!user_vm.mapMmioPageAtVa(va, paddr, writable)) {
+        _ = waitEvent(false, 1);
+    }
+    return va;
 }
 
 fn queueRegionPhys(queue_paddr0: u64, queue_paddr1: u64, offset: usize) u64 {
@@ -1029,27 +1043,27 @@ fn queueRegionPhys(queue_paddr0: u64, queue_paddr1: u64, offset: usize) u64 {
 }
 
 fn queueDescPtr(index: u16) *volatile VirtqDesc {
-    return @ptrFromInt(queue_page0_va + @as(usize, index) * @sizeOf(VirtqDesc));
+    return @ptrFromInt(keyboard_queue_base_va + @as(usize, index) * @sizeOf(VirtqDesc));
 }
 
 fn queueAvailIdxPtr() *volatile u16 {
-    return @ptrFromInt(queue_page0_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 2);
+    return @ptrFromInt(keyboard_queue_base_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 2);
 }
 
 fn queueAvailRingPtr() [*]volatile u16 {
-    return @ptrFromInt(queue_page0_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 4);
+    return @ptrFromInt(keyboard_queue_base_va + @as(usize, queue_size) * @sizeOf(VirtqDesc) + 4);
 }
 
 fn queueUsedIdxPtr() *volatile u16 {
-    return @ptrFromInt(queue_page0_va + queue_used_offset + 2);
+    return @ptrFromInt(keyboard_queue_base_va + queue_used_offset + 2);
 }
 
 fn queueUsedRingPtr() [*]volatile VirtqUsedElem {
-    return @ptrFromInt(queue_page0_va + queue_used_offset + 4);
+    return @ptrFromInt(keyboard_queue_base_va + queue_used_offset + 4);
 }
 
 fn queueEventPtr(desc_id: u16) *volatile VirtioInputEvent {
-    return @ptrFromInt(queue_page0_va + queue_buffers_offset + @as(usize, desc_id) * @sizeOf(VirtioInputEvent));
+    return @ptrFromInt(keyboard_queue_base_va + queue_buffers_offset + @as(usize, desc_id) * @sizeOf(VirtioInputEvent));
 }
 
 fn queuePushAvail(desc_id: u16) void {
@@ -1070,11 +1084,13 @@ fn appendText(buf: []u8, idx: *usize, text: []const u8) void {
 
 fn fillRect(vfb: [*]volatile u32, x: usize, y: usize, w: usize, h: usize, color: u32) void {
     if (w == 0 or h == 0) return;
+    const y_end = @min(fb_height, y + h);
+    const x_end = @min(fb_width, x + w);
     var yy: usize = y;
-    while (yy < y + h and yy < fb_height) : (yy += 1) {
+    while (yy < y_end) : (yy += 1) {
         const row = yy * fb_pitch;
         var xx: usize = x;
-        while (xx < x + w and xx < fb_width) : (xx += 1) {
+        while (xx < x_end) : (xx += 1) {
             vfb[row + xx] = color;
         }
     }
@@ -1095,12 +1111,17 @@ fn textRowY(row: usize) i32 {
 
 fn drawLine(vfb: [*]volatile u32, row: usize, text: []const u8, color: u32) void {
     if (text.len == 0) return;
+    drawTextAt(vfb, @intCast(text_margin_x), textRowY(row), text, color);
+}
+
+fn drawTextAt(vfb: [*]volatile u32, x: i32, y: i32, text: []const u8, color: u32) void {
+    if (text.len == 0) return;
     font.drawAsciiTextClippedRatio(
         [*]volatile u32,
         blendPixel,
         vfb,
-        @intCast(text_margin_x),
-        textRowY(row),
+        x,
+        y,
         text,
         color,
         font_scale_num,
@@ -1119,6 +1140,13 @@ fn textAdvanceRatio(text: []const u8) i32 {
 
 fn clearRow(vfb: [*]volatile u32, row: usize, color: u32) void {
     fillRect(vfb, 2, row * cell_h, fb_width - 4, cell_h, color);
+}
+
+fn clearRowSpan(vfb: [*]volatile u32, row: usize, start_x: usize, end_x: usize, color: u32) void {
+    const x0 = @min(start_x, fb_width);
+    const x1 = @min(end_x, fb_width);
+    if (x1 <= x0) return;
+    fillRect(vfb, x0, row * cell_h, x1 - x0, cell_h, color);
 }
 
 fn asciiLower(ch: u8) u8 {
@@ -1173,9 +1201,9 @@ fn writeWrappedText(st: *ShellState, text: []const u8) void {
         if (line.len == 0) {
             st.writeLine("");
         } else {
-            while (line.len > cols) {
-                st.writeLine(line[0..cols]);
-                line = line[cols..];
+            while (line.len > screen_cols) {
+                st.writeLine(line[0..screen_cols]);
+                line = line[screen_cols..];
             }
             if (line.len != 0) st.writeLine(line);
         }
@@ -1358,7 +1386,8 @@ fn renderHeader(vfb: [*]volatile u32, st: *const ShellState) void {
 
 fn renderBody(vfb: [*]volatile u32, st: *ShellState) void {
     var row: usize = 0;
-    while (row < st.cur_row and row < st.lines.len) : (row += 1) {
+    const body_rows = if (screen_rows > 0) @min(st.lines.len, screen_rows - 1) else @as(usize, 0);
+    while (row < st.cur_row and row < body_rows) : (row += 1) {
         const color = if (row < st.splash_line_count)
             switch (row) {
                 0, 4 => splash_bar_color,
@@ -1373,12 +1402,36 @@ fn renderBody(vfb: [*]volatile u32, st: *ShellState) void {
     }
 }
 
+fn renderDirtyBody(vfb: [*]volatile u32, st: *ShellState) void {
+    if (!st.hasDirtyBody()) return;
+    const body_rows = if (screen_rows > 0) @min(st.lines.len, screen_rows - 1) else @as(usize, 0);
+    const start = @min(st.dirty_body_start, body_rows);
+    const end = @min(st.dirty_body_end, body_rows);
+    var row = start;
+    while (row < end) : (row += 1) {
+        clearRow(vfb, row, bg_color);
+        if (row >= st.cur_row) continue;
+        const color = if (row < st.splash_line_count)
+            switch (row) {
+                0, 4 => splash_bar_color,
+                1 => splash_sub_color,
+                2 => splash_core_color,
+                3 => title_color,
+                else => fg_color,
+            }
+        else
+            fg_color;
+        drawLine(vfb, row, st.lines[row][0..st.line_len[row]], color);
+    }
+    st.clearDirtyBody();
+}
+
 fn promptRow(st: *const ShellState) usize {
-    return @min(st.cur_row, rows - 1);
+    return @min(st.cur_row, screen_rows - 1);
 }
 
 fn writePromptHistoryLine(st: *ShellState) void {
-    var line_buf: [cols]u8 = undefined;
+    var line_buf: [max_cols]u8 = undefined;
     var line_len: usize = 0;
     appendText(line_buf[0..], &line_len, currentRootfsPath(st));
     appendText(line_buf[0..], &line_len, " $ ");
@@ -1386,22 +1439,20 @@ fn writePromptHistoryLine(st: *ShellState) void {
     st.writeLine(line_buf[0..line_len]);
 }
 
-fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
-    const row = promptRow(st);
-    clearRow(vfb, row, bg_color);
-    var prompt_buf: [cols]u8 = [_]u8{' '} ** cols;
+fn buildVisiblePrompt(st: *const ShellState, prompt_buf: *[max_cols]u8) []const u8 {
+    prompt_buf.* = [_]u8{' '} ** max_cols;
     var prefix_buf: [fs_protocol.max_path_bytes + 3]u8 = undefined;
     var prefix_len: usize = 0;
     appendText(prefix_buf[0..], &prefix_len, currentRootfsPath(st));
     appendText(prefix_buf[0..], &prefix_len, " $ ");
-    const prefix = if (prefix_len <= cols)
+    const prefix = if (prefix_len <= screen_cols)
         prefix_buf[0..prefix_len]
     else
-        prefix_buf[prefix_len - cols .. prefix_len];
+        prefix_buf[prefix_len - screen_cols .. prefix_len];
     if (prefix.len > 0) @memcpy(prompt_buf[0..prefix.len], prefix);
     var prompt_len: usize = prefix.len;
-    if (prefix.len < cols) {
-        const cmd_space = cols - prefix.len;
+    if (prefix.len < screen_cols) {
+        const cmd_space = screen_cols - prefix.len;
         const cmd_slice = if (st.cmd_len <= cmd_space)
             st.cmd[0..st.cmd_len]
         else
@@ -1411,8 +1462,54 @@ fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
             prompt_len += cmd_slice.len;
         }
     }
-    const visible_prompt = prompt_buf[0..prompt_len];
-    drawLine(vfb, row, visible_prompt, prompt_fg_color);
+    return prompt_buf[0..prompt_len];
+}
+
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const limit = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < limit and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+fn nonNegativeUsize(value: i32) usize {
+    return if (value <= 0) 0 else @as(usize, @intCast(value));
+}
+
+fn promptEndX(visible_prompt: []const u8) usize {
+    const prompt_x: i32 = @intCast(text_margin_x);
+    const prompt_advance = textAdvanceRatio(visible_prompt);
+    const cursor_x = @max(prompt_x, prompt_x + prompt_advance);
+    return @min(fb_width - 2, nonNegativeUsize(cursor_x) + 4);
+}
+
+fn renderPrompt(vfb: [*]volatile u32, st: *ShellState) void {
+    const row = promptRow(st);
+    var prompt_buf: [max_cols]u8 = undefined;
+    const visible_prompt = buildVisiblePrompt(st, &prompt_buf);
+    const new_end_x = promptEndX(visible_prompt);
+
+    const can_diff = st.prompt_cache_valid and st.prompt_cache_row == row;
+    const common_len = if (can_diff)
+        commonPrefixLen(st.prompt_cache[0..st.prompt_cache_len], visible_prompt)
+    else
+        0;
+    const common_advance = textAdvanceRatio(visible_prompt[0..common_len]);
+    const dirty_start_i32 = @as(i32, @intCast(text_margin_x)) + common_advance;
+    const dirty_start = @max(@as(usize, 2), nonNegativeUsize(dirty_start_i32));
+    const old_end_x = if (can_diff) st.prompt_cache_end_x else @as(usize, 2);
+    const dirty_end = @max(old_end_x, new_end_x);
+    if (can_diff) {
+        clearRowSpan(vfb, row, dirty_start, dirty_end + 4, bg_color);
+    } else {
+        clearRow(vfb, row, bg_color);
+    }
+
+    const suffix = visible_prompt[common_len..];
+    if (suffix.len != 0) {
+        const x = @as(i32, @intCast(text_margin_x)) + common_advance;
+        drawTextAt(vfb, x, textRowY(row), suffix, prompt_fg_color);
+    }
     const prompt_x: i32 = @intCast(text_margin_x);
     const prompt_advance = textAdvanceRatio(visible_prompt);
     const cursor_x = @as(usize, @intCast(@max(prompt_x, prompt_x + prompt_advance)));
@@ -1420,9 +1517,19 @@ fn renderPrompt(vfb: [*]volatile u32, st: *const ShellState) void {
     const cursor_w: usize = 2;
     const cursor_h = if (cell_h > 4) cell_h - 4 else cell_h;
     fillRect(vfb, cursor_x, cursor_y, cursor_w, cursor_h, cursor_color);
+
+    st.prompt_cache = [_]u8{' '} ** max_cols;
+    if (visible_prompt.len != 0) @memcpy(st.prompt_cache[0..visible_prompt.len], visible_prompt);
+    st.prompt_cache_len = visible_prompt.len;
+    st.prompt_cache_row = row;
+    st.prompt_cache_end_x = new_end_x;
+    st.prompt_cache_valid = true;
 }
 
 fn renderFull(vfb: [*]volatile u32, st: *ShellState) void {
+    st.prompt_cache_valid = false;
+    st.force_full_render = false;
+    st.clearDirtyBody();
     fillRect(vfb, 0, 0, fb_width, fb_height, bg_color);
     fillRect(vfb, 0, 0, fb_width, 2, border_color);
     fillRect(vfb, 0, fb_height - 2, fb_width, 2, border_color);
@@ -1474,10 +1581,15 @@ fn ensureBlockClient(st: *ShellState) ?*block_client.Client {
         shellLogLine("block process slot unavailable");
         return null;
     }
+    const ipc_va = user_vm.reservePages(2) orelse {
+        st.writeLine("block ipc va unavailable");
+        shellLogLine("block ipc va unavailable");
+        return null;
+    };
     st.block_client_state = block_client.Client.connectFromRegistryPageOptions(
         service_registry_page_va,
-        block_request_va,
-        block_response_va,
+        @intCast(ipc_va),
+        @intCast(ipc_va + user_vm.page_bytes),
         process_slot,
         .{
             .response_poll_limit = 65536,
@@ -1502,10 +1614,15 @@ fn ensurePersistentFsClient(st: *ShellState) ?*fs_client.Client {
         return null;
     }
     shellLogFmt("fs client connect begin slot={d}", .{process_slot});
+    const ipc_va = user_vm.reservePages(2) orelse {
+        st.writeLine("fs ipc va unavailable");
+        shellLogLine("fs ipc va unavailable");
+        return null;
+    };
     st.persistent_fs_client_state = fs_client.Client.connectFromRegistryPageOptions(
         service_registry_page_va,
-        persistent_fs_request_va,
-        persistent_fs_response_va,
+        @intCast(ipc_va),
+        @intCast(ipc_va + user_vm.page_bytes),
         process_slot,
         .{
             .response_poll_limit = 65536,
@@ -1570,39 +1687,41 @@ fn runPersistentFsList(st: *ShellState, path: []const u8) bool {
         return true;
     }
     var cursor: u64 = 0;
-    var name_buf: [48]u8 = undefined;
+    var entry_buf: [16]fs_client.DirEntry = undefined;
+    var name_buf: [entry_buf.len * 32]u8 = undefined;
     var count: usize = 0;
     while (true) {
-        shellLogFmt("fsop ls readdir begin path={s} cursor={d}", .{ path, cursor });
-        const entry = client.readdirOne(target.token, cursor, name_buf[0..]) catch |err| {
+        shellLogFmt("fsop ls readdir batch begin path={s} cursor={d}", .{ path, cursor });
+        const batch = client.readdirMany(target.token, cursor, entry_buf[0..], name_buf[0..]) catch |err| {
             reportPersistentFsError(st, "ls failed", err, true);
             return false;
         };
-        switch (entry) {
-            .end => {
-                shellLogFmt("fsop ls readdir end path={s} count={d}", .{ path, count });
-                break;
-            },
-            .entry => |dirent| {
-                shellLogFmt(
-                    "fsop ls readdir ok path={s} name={s} kind={s} next={d}",
-                    .{ path, dirent.name, @tagName(dirent.object_kind), dirent.next_cursor },
-                );
-                if (dirent.object_kind == .vnode_dir) {
-                    var line_buf: [64]u8 = undefined;
-                    const line = std.fmt.bufPrint(&line_buf, "{s}/", .{dirent.name}) catch {
-                        st.writeLine(dirent.name);
-                        cursor = dirent.next_cursor;
-                        count += 1;
-                        continue;
-                    };
-                    st.writeLine(line);
-                } else {
+        shellLogFmt(
+            "fsop ls readdir batch ok path={s} batch={d} next={d} end={d}",
+            .{ path, batch.entries.len, batch.next_cursor, @intFromBool(batch.end) },
+        );
+        for (batch.entries) |dirent| {
+            if (dirent.object_kind == .vnode_dir) {
+                var line_buf: [64]u8 = undefined;
+                const line = std.fmt.bufPrint(&line_buf, "{s}/", .{dirent.name}) catch {
                     st.writeLine(dirent.name);
-                }
-                cursor = dirent.next_cursor;
-                count += 1;
-            },
+                    count += 1;
+                    continue;
+                };
+                st.writeLine(line);
+            } else {
+                st.writeLine(dirent.name);
+            }
+            count += 1;
+        }
+        cursor = batch.next_cursor;
+        if (batch.end) {
+            shellLogFmt("fsop ls readdir end path={s} count={d}", .{ path, count });
+            break;
+        }
+        if (batch.entries.len == 0) {
+            shellLogFmt("fsop ls readdir stalled path={s} cursor={d}", .{ path, cursor });
+            break;
         }
     }
     if (count == 0) st.writeLine("directory empty");
@@ -1815,6 +1934,7 @@ fn runPersistentFsUnlink(st: *ShellState, path: []const u8) bool {
 }
 
 fn spawnPersistentFsPlainExecFile(st: *ShellState, path: []const u8, arg_text: []const u8) ?u64 {
+    shellLogFmt("spawn exec begin path={s}", .{path});
     if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
         st.writeLine(rootfsUnavailableReason());
         shellLogLine(rootfsUnavailableReason());
@@ -1889,7 +2009,8 @@ fn runPersistentFsExecFile(st: *ShellState, path: []const u8, arg_text: []const 
     if (std.mem.eql(u8, path, virtio_gpu_gl_rootfs_path)) {
         return runGpuDriverExec(st);
     }
-    if (std.mem.eql(u8, path, pachaland_rootfs_path)) {
+    if (isPachalandPath(path)) {
+        shellLogLine("pachaland exec routed to window service");
         return runPachalandExecRequest(st, path, arg_text);
     }
     if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) {
@@ -2098,6 +2219,28 @@ fn maybeRunAutoFsProbe(st: *ShellState) RenderAction {
     }
     shellLogLine("auto fs probe done");
     return action;
+}
+
+fn maybeRunAutoIpcPairBench(st: *ShellState) RenderAction {
+    if (!shell_ipc_pair_bench_auto or !st.auto_ipc_pair_bench_pending) return .none;
+    if (service_registry_abi.findService(service_registry_page_va, .persistent_fs) == null) return .none;
+    st.auto_ipc_pair_bench_pending = false;
+    shellLogLine("auto ipc pair bench start");
+    const server_slot = spawnPersistentFsPlainExecFile(st, ipc_pair_bench_server_rootfs_path, "") orelse {
+        shellLogLine("auto ipc pair bench server spawn failed");
+        return .body;
+    };
+    var arg_buf: [32]u8 = undefined;
+    const arg_text = std.fmt.bufPrint(&arg_buf, "{d}", .{server_slot}) catch {
+        shellLogLine("auto ipc pair bench arg format failed");
+        return .body;
+    };
+    const client_slot = spawnPersistentFsPlainExecFile(st, ipc_pair_bench_client_rootfs_path, arg_text) orelse {
+        shellLogLine("auto ipc pair bench client spawn failed");
+        return .body;
+    };
+    shellLogFmt("auto ipc pair bench spawned server={d} client={d}", .{ server_slot, client_slot });
+    return .body;
 }
 
 fn runBlockDemo(st: *ShellState) bool {
@@ -2452,33 +2595,21 @@ const CapCtlRequestPages = struct {
 };
 
 fn allocCapCtlRequestPages(st: *ShellState) ?CapCtlRequestPages {
-    if (st.capctl_page_slot_next >= capctl_request_page_candidates.len or
-        st.capctl_page_slot_next >= capctl_response_page_candidates.len)
-    {
-        st.writeLine("capctl page slots exhausted");
-        shellLogLine("capctl page slots exhausted");
-        return null;
-    }
-    const request_va = capctl_request_page_candidates[st.capctl_page_slot_next];
-    const response_va = capctl_response_page_candidates[st.capctl_page_slot_next];
-    st.capctl_page_slot_next += 1;
-    var request_paddr: u64 = 0;
-    var response_paddr: u64 = 0;
-    if (allocMapPages(request_va, 1, true, @intFromPtr(&request_paddr)) != syscall_ok or request_paddr < 0x1000) {
+    const request_page = user_vm.allocMapPage(true) orelse {
         st.writeLine("capctl request page failed");
         shellLogLine("capctl request page failed");
         return null;
-    }
-    if (allocMapPages(response_va, 1, true, @intFromPtr(&response_paddr)) != syscall_ok or response_paddr < 0x1000) {
+    };
+    const response_page = user_vm.allocMapPage(true) orelse {
         st.writeLine("capctl response page failed");
         shellLogLine("capctl response page failed");
         return null;
-    }
+    };
     return .{
-        .request_va = request_va,
-        .request_paddr = request_paddr,
-        .response_va = response_va,
-        .response_paddr = response_paddr,
+        .request_va = @intCast(request_page.va),
+        .request_paddr = request_page.paddr,
+        .response_va = @intCast(response_page.va),
+        .response_paddr = response_page.paddr,
     };
 }
 
@@ -2653,6 +2784,71 @@ fn updateGpuServiceRegistry(response: capctl_protocol.Response) void {
     updateServiceRegistryOverlay(.gpu, response.gpu_process_slot, response.gpu_endpoint_id);
 }
 
+fn ensureShellGpuClient(st: *ShellState) ?*gpu_client.Client {
+    if (st.gpu_client_ready) return &st.gpu_client_state;
+    if (service_registry_abi.findService(service_registry_page_va, .gpu) == null) {
+        if (!runGpuDriverExec(st)) return null;
+    }
+    const ipc_va = user_vm.reservePages(2) orelse return null;
+    st.gpu_client_state = gpu_client.Client.connectFromRegistryPage(
+        service_registry_page_va,
+        @intCast(ipc_va),
+        @intCast(ipc_va + user_vm.page_bytes),
+    ) catch |err| {
+        shellLogFmt("shell gpu connect failed: {s}", .{@errorName(err)});
+        return null;
+    };
+    st.gpu_client_ready = true;
+    return &st.gpu_client_state;
+}
+
+fn presentShellFramebuffer(st: *ShellState) bool {
+    const fb_paddr = readCfgU64(config_framebuffer_paddr_index);
+    const fb_size = readCfgU64(config_framebuffer_size_bytes_index);
+    if (fb_paddr == 0 or fb_size == 0) {
+        shellLogLine("shell framebuffer present failed: missing fb paddr");
+        return false;
+    }
+    const client = ensureShellGpuClient(st) orelse return false;
+    client.presentShellFramebuffer(.{
+        .paddr = fb_paddr,
+        .byte_len = fb_size,
+        .width = @intCast(fb_width),
+        .height = @intCast(fb_height),
+        .pitch = @intCast(fb_pitch),
+    }) catch |err| {
+        shellLogFmt("shell framebuffer present failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
+fn flushShellFramebufferIfActive(st: *ShellState) void {
+    if (!st.shell_scanout_active) return;
+    if (!presentShellFramebuffer(st)) {
+        st.shell_scanout_active = false;
+    }
+}
+
+fn switchToShellHotkey(st: *ShellState) RenderAction {
+    st.shell_scanout_active = true;
+    st.force_full_render = true;
+    shellLogLine("shell scanout requested hotkey=Ctrl+Shift+Q");
+    return .full;
+}
+
+fn activatePachaland(st: *ShellState) bool {
+    if (service_registry_abi.findService(service_registry_page_va, .window) == null) return false;
+    const client = ensureShellGpuClient(st) orelse return false;
+    client.present3d() catch |err| {
+        shellLogFmt("pachaland resume failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    st.shell_scanout_active = false;
+    shellLogLine("pachaland resumed");
+    return true;
+}
+
 fn resetServiceClients(st: *ShellState) void {
     st.block_client_ready = false;
     st.persistent_fs_client_ready = false;
@@ -2722,16 +2918,62 @@ fn publishSpawnedServiceRequest(st: *ShellState, kind: service_registry_abi.Serv
     }
 }
 
+fn launchServiceRequest(st: *ShellState, kind: service_registry_abi.ServiceKind, path: []const u8) bool {
+    shellLogFmt("service launch begin kind={s} path={s}", .{ serviceKindName(kind), path });
+    const response = sendCapCtlRequestWithPayload(
+        st,
+        .launch_service,
+        @intFromEnum(kind),
+        path.len,
+        path,
+    ) orelse return false;
+    const status = capctl_protocol.decodeResponseStatus(response.status) orelse {
+        st.writeLine("capctl invalid response");
+        shellLogLine("service launch failed");
+        return false;
+    };
+    switch (status) {
+        .ok, .already => {
+            const response_kind = updateServiceRegistryFromCapCtlResponse(response) orelse kind;
+            var line_buf: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "service {s} process={d} endpoint={d}", .{
+                serviceKindName(response_kind),
+                response.service_process_slot,
+                response.service_endpoint_id,
+            }) catch return false;
+            st.writeLine(line);
+            shellLogLine(line);
+            return true;
+        },
+        else => {
+            st.writeLine(capctlResponseStatusText(status));
+            shellLogLine("service launch failed");
+            return false;
+        },
+    }
+}
+
 fn runServiceExecRequest(st: *ShellState, kind: service_registry_abi.ServiceKind, path: []const u8, arg_text: []const u8) bool {
     if (kind == .window and gpu_service_endpoint_id_cache == 0) {
         if (!runGpuDriverExec(st)) return false;
+    }
+    if (kind == .window) {
+        return launchServiceRequest(st, kind, path);
     }
     const child_slot = spawnPersistentFsPlainExecFile(st, path, arg_text) orelse return false;
     return publishSpawnedServiceRequest(st, kind, child_slot);
 }
 
 fn runPachalandExecRequest(st: *ShellState, path: []const u8, arg_text: []const u8) bool {
-    if (!runServiceExecRequest(st, .window, path, arg_text)) return false;
+    shellLogLine("pachaland launch begin");
+    if (service_registry_abi.findService(service_registry_page_va, .window) != null) {
+        if (activatePachaland(st)) return true;
+        st.writeLine("pachaland resume failed");
+        return false;
+    }
+    const service_path = if (isPachalandPath(path)) pachaland_rootfs_path else path;
+    if (!runServiceExecRequest(st, .window, service_path, arg_text)) return false;
+    st.shell_scanout_active = false;
     const child_slot = spawnPersistentFsPlainExecFile(st, pachafetch_rootfs_path, "") orelse {
         shellLogFmt("pachaland autostart failed path={s}", .{pachafetch_rootfs_path});
         return true;
@@ -2741,6 +2983,23 @@ fn runPachalandExecRequest(st: *ShellState, path: []const u8, arg_text: []const 
         child_slot,
     });
     return true;
+}
+
+fn runPittyHotkey(st: *ShellState) RenderAction {
+    if (service_registry_abi.findService(service_registry_page_va, .window) == null) {
+        st.writeLine("pitty needs Pachaland");
+        shellLogLine("pitty hotkey ignored: window service missing");
+        return .full;
+    }
+    const child_slot = spawnPersistentFsPlainExecFile(st, pitty_rootfs_path, "") orelse {
+        shellLogFmt("pitty hotkey failed path={s}", .{pitty_rootfs_path});
+        return .full;
+    };
+    shellLogFmt("pitty hotkey spawned path={s} process={d}", .{
+        pitty_rootfs_path,
+        child_slot,
+    });
+    return .full;
 }
 
 fn runServiceCommand(st: *ShellState, text: []const u8) bool {
@@ -2860,6 +3119,7 @@ fn executeCommand(st: *ShellState) RenderAction {
         st.writeLine("cat exec touch write rm mv block_demo");
         st.writeLine("fs_demo pie_user gpu gpu_demo cap service");
         st.writeLine("exec <path> | exec --service <kind> <path>");
+        st.writeLine("hotkeys: Ctrl+Q pitty, Ctrl+Shift+Q shell");
         return .full;
     }
     if (eqAsciiNoCase(parsed.head, "clear")) {
@@ -3024,25 +3284,21 @@ fn initKeyboard() ?KeyboardState {
     var queue_notify_token = readCfgU64(input_bootstrap.queue_notify_token_index);
 
     if (common_page_paddr < 0x1000 or notify_page_paddr < 0x1000) return null;
-    while (mapMmioPage(common_page_va, common_page_paddr, true) != syscall_ok) {
-        _ = waitEvent(false, 1);
-    }
-    while (mapMmioPage(notify_page_va, notify_page_paddr, true) != syscall_ok) {
-        _ = waitEvent(false, 1);
-    }
+    keyboard_common_page_va = reserveAndMapMmioPage(common_page_paddr, true) orelse return null;
+    keyboard_notify_page_va = reserveAndMapMmioPage(notify_page_paddr, true) orelse return null;
     if (isr_page_paddr != 0) {
-        while (mapMmioPage(isr_page_va, isr_page_paddr, false) != syscall_ok) {
-            _ = waitEvent(false, 1);
-        }
+        keyboard_isr_page_va = reserveAndMapMmioPage(isr_page_paddr, false) orelse return null;
     }
 
-    if (queue_paddr0 < 0x1000 or queue_paddr1 < 0x1000) {
-        var queue_paddrs: [2]u64 = .{ 0, 0 };
-        if (allocMapPages(queue_page0_va, 2, true, @intFromPtr(&queue_paddrs)) != syscall_ok) return null;
+    var queue_paddrs: [2]u64 = .{ queue_paddr0, queue_paddr1 };
+    if (queue_paddrs[0] < 0x1000 or queue_paddrs[1] < 0x1000) {
+        keyboard_queue_base_va = user_vm.allocMapPagesInto(2, true, queue_paddrs[0..]) orelse return null;
         queue_paddr0 = queue_paddrs[0];
         queue_paddr1 = queue_paddrs[1];
         writeCfgU64(11, queue_paddr0);
         writeCfgU64(12, queue_paddr1);
+    } else {
+        keyboard_queue_base_va = user_vm.mapPagesAtDynamicVa(queue_paddrs[0..], true) orelse return null;
     }
 
     while (queue_submit_token == 0 or queue_notify_token == 0) {
@@ -3052,9 +3308,9 @@ fn initKeyboard() ?KeyboardState {
     }
     shellLogLine("keyboard queue tokens ready");
 
-    const common_base = common_page_va + common_off;
-    const notify_base = notify_page_va + notify_off;
-    const isr_base = if (isr_page_paddr != 0) isr_page_va + isr_off else 0;
+    const common_base = keyboard_common_page_va + common_off;
+    const notify_base = keyboard_notify_page_va + notify_off;
+    const isr_base = if (isr_page_paddr != 0) keyboard_isr_page_va + isr_off else 0;
 
     mmioWriteU8(common_base + common_device_status, 0);
     mmioWriteU8(common_base + common_device_status, status_acknowledge | status_driver);
@@ -3124,12 +3380,16 @@ fn handleAscii(st: *ShellState, ascii: u8) RenderAction {
     }
 }
 
-fn pumpKeyboard(keyboard: *KeyboardState, st: *ShellState) RenderAction {
+fn pumpKeyboard(keyboard: *KeyboardState, st: *ShellState) KeyboardPollResult {
+    if (keyboard.last_used_idx == queueUsedIdxPtr().*) {
+        return .{};
+    }
     if (keyboard.isr_base != 0) _ = mmioReadU8(keyboard.isr_base);
-
     var action: RenderAction = .none;
     var needs_notify = false;
+    var saw_event = false;
     while (keyboard.last_used_idx != queueUsedIdxPtr().*) {
+        saw_event = true;
         const slot: usize = @intCast(keyboard.last_used_idx % queue_size);
         const used_elem = queueUsedRingPtr()[slot];
         const desc_id: u16 = @intCast(used_elem.id & 0xFFFF);
@@ -3143,14 +3403,28 @@ fn pumpKeyboard(keyboard: *KeyboardState, st: *ShellState) RenderAction {
             event_type_key => {
                 if (ev.code == key_left_shift or ev.code == key_right_shift) {
                     keyboard.shift_down = ev.value != 0;
+                } else if (ev.code == key_left_ctrl or ev.code == key_right_ctrl) {
+                    keyboard.ctrl_down = ev.value != 0;
                 }
                 keyboard.pending_code = ev.code;
                 keyboard.pending_value = ev.value;
                 keyboard.has_pending_key = true;
+                keyboard.pending_launch_pitty = false;
+                keyboard.pending_switch_shell = false;
                 if (ev.value != 0) {
-                    if (keycodeToAscii(ev.code, keyboard.shift_down)) |ascii| {
-                        keyboard.pending_ascii = ascii;
-                        keyboard.has_pending_ascii = true;
+                    if (keyboard.ctrl_down and keyboard.shift_down and ev.code == key_q) {
+                        keyboard.pending_switch_shell = ev.value == 1;
+                        keyboard.has_pending_ascii = false;
+                    } else if (keyboard.ctrl_down and ev.code == key_q) {
+                        keyboard.pending_launch_pitty = ev.value == 1;
+                        keyboard.has_pending_ascii = false;
+                    } else if (!keyboard.ctrl_down) {
+                        if (keycodeToAscii(ev.code, keyboard.shift_down)) |ascii| {
+                            keyboard.pending_ascii = ascii;
+                            keyboard.has_pending_ascii = true;
+                        } else {
+                            keyboard.has_pending_ascii = false;
+                        }
                     } else {
                         keyboard.has_pending_ascii = false;
                     }
@@ -3158,11 +3432,17 @@ fn pumpKeyboard(keyboard: *KeyboardState, st: *ShellState) RenderAction {
             },
             event_type_syn => {
                 if (ev.code == syn_report and keyboard.has_pending_key) {
-                    if (keyboard.pending_value != 0 and keyboard.has_pending_ascii) {
+                    if (keyboard.pending_value != 0 and keyboard.pending_switch_shell) {
+                        action = RenderAction.merge(action, switchToShellHotkey(st));
+                    } else if (keyboard.pending_value != 0 and keyboard.pending_launch_pitty) {
+                        action = RenderAction.merge(action, runPittyHotkey(st));
+                    } else if (keyboard.pending_value != 0 and keyboard.has_pending_ascii) {
                         action = RenderAction.merge(action, handleAscii(st, keyboard.pending_ascii));
                     }
                     keyboard.has_pending_key = false;
                     keyboard.has_pending_ascii = false;
+                    keyboard.pending_launch_pitty = false;
+                    keyboard.pending_switch_shell = false;
                 }
             },
             else => {},
@@ -3174,7 +3454,7 @@ fn pumpKeyboard(keyboard: *KeyboardState, st: *ShellState) RenderAction {
     }
 
     if (needs_notify) mmioWriteU16(keyboard.notify_addr, queue_index_event);
-    return action;
+    return .{ .action = action, .saw_event = saw_event };
 }
 
 pub export fn _start() noreturn {
@@ -3185,9 +3465,17 @@ pub export fn _start() noreturn {
         }
     }
     shell_process_slot_cache = getProcessSlot();
-    var shell = ShellState{};
-    resetRootfsPath(&shell);
+    configureFramebufferFromConfig();
+    const shell = &shell_state_storage;
+    resetRootfsPath(shell);
     const fb_vm_token = readCfgU64(config_framebuffer_vm_token_index);
+    const configured_fb_size = readCfgU64(config_framebuffer_size_bytes_index);
+    if (!ensureFramebufferVa(configured_fb_size)) {
+        _ = userLog("Shell: framebuffer VA reserve failed\n");
+        while (true) {
+            _ = waitEvent(false, 1);
+        }
+    }
     if (fb_vm_token != 0) {
         if (mapVmObject(fb_vm_token, framebuffer_va) != syscall_ok) {
             _ = userLog("Shell: framebuffer map failed\n");
@@ -3198,7 +3486,7 @@ pub export fn _start() noreturn {
     } else {
         // Map framebuffer MMIO pages granted by init in batches.
         const fb_paddr = readCfgU64(config_framebuffer_paddr_index);
-        const fb_size = readCfgU64(config_framebuffer_size_bytes_index);
+        const fb_size = configured_fb_size;
         if (fb_paddr == 0 or fb_size == 0) {
             _ = userLog("Shell: framebuffer config missing\n");
             while (true) {
@@ -3224,7 +3512,14 @@ pub export fn _start() noreturn {
     const vfb: [*]volatile u32 = @ptrFromInt(framebuffer_va);
 
     _ = userLog("Shell: started\n");
-    seedBootSplash(&shell);
+    shellLogFmt("display width={d} height={d} pitch={d} cols={d} colw={d}", .{
+        fb_width,
+        fb_height,
+        fb_pitch,
+        screen_cols,
+        shell_column_advance,
+    });
+    seedBootSplash(shell);
     shellLogLine("splash ready");
     var keyboard = initKeyboard();
     shell.keyboard_ready = keyboard != null;
@@ -3237,24 +3532,43 @@ pub export fn _start() noreturn {
         _ = userLog("Shell: keyboard unavailable\n");
     }
     shellLogLine("render begin");
-    renderFull(vfb, &shell);
+    renderFull(vfb, shell);
     _ = userLog("Shell: ui ready\n");
 
     while (true) {
         var action: RenderAction = .none;
         if (keyboard) |*kbd| {
-            action = pumpKeyboard(kbd, &shell);
+            const keyboard_poll = pumpKeyboard(kbd, shell);
+            action = keyboard_poll.action;
         }
-        action = RenderAction.merge(action, maybeRunAutoFsProbe(&shell));
-        if (pumpChildTextStreams(&shell)) {
-            action = RenderAction.merge(action, .full);
+        action = RenderAction.merge(action, maybeRunAutoFsProbe(shell));
+        action = RenderAction.merge(action, maybeRunAutoIpcPairBench(shell));
+        const child_text_changed = pumpChildTextStreams(shell);
+        if (child_text_changed) {
+            action = RenderAction.merge(action, .body);
         }
         pumpChildArgsEnvSlots();
+        if (shell.hasDirtyBody() and action != .full) {
+            action = RenderAction.merge(action, .body);
+        }
+        if (action == .full and !shell.force_full_render) {
+            action = if (shell.hasDirtyBody()) .body else .prompt;
+        }
+        const should_wait = action == .none and keyboard == null;
         switch (action) {
             .none => {},
-            .prompt => renderPrompt(vfb, &shell),
-            .full => renderFull(vfb, &shell),
+            .prompt => renderPrompt(vfb, shell),
+            .body => {
+                renderDirtyBody(vfb, shell);
+                renderPrompt(vfb, shell);
+            },
+            .full => renderFull(vfb, shell),
         }
-        _ = waitEvent(false, shell_idle_poll_ticks);
+        if (action != .none) {
+            flushShellFramebufferIfActive(shell);
+        }
+        if (should_wait) {
+            _ = waitEvent(false, shell_idle_poll_ticks);
+        }
     }
 }

@@ -2,13 +2,11 @@
 
 use core::ffi::{c_char, c_void};
 use core::mem::{MaybeUninit, size_of};
-use core::ptr::{
-    addr_of, addr_of_mut, copy_nonoverlapping, read_volatile, write_bytes, write_volatile,
-};
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_bytes, write_volatile};
 use core::slice;
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use rt_core::syscall;
+use rt_core::{SyscallError, syscall, vm};
 use rt_handle::{ServiceKind, snapshot_service_registry_shadow};
 
 const PAGE_BYTES: usize = 4096;
@@ -16,14 +14,12 @@ const REQUEST_MAGIC: u32 = 0x5147_5047;
 const RESPONSE_MAGIC: u32 = 0x5247_5047;
 const VERSION: u16 = 1;
 const DEFAULT_ENDPOINT_ID: u64 = 0x80 + 0x20;
-const DEFAULT_RESPONSE_POLL_LIMIT: u64 = 4096;
+const DEFAULT_RESPONSE_POLL_LIMIT: u64 = 65_536;
 const SERVICE_FLAG_PROCESS_SLOT_COMPAT: u64 = 1 << 0;
 const PAGE_RIGHT_CPU_READ: u64 = 0x1;
 const PAGE_RIGHT_CPU_WRITE: u64 = 0x2;
-const DEFAULT_REQUEST_VA: u64 = 0x3C11_4000;
-const DEFAULT_RESPONSE_VA: u64 = 0x3C11_5000;
-const CAPCTL_REQUEST_VA: u64 = 0x3C11_2000;
-const CAPCTL_RESPONSE_VA: u64 = 0x3C11_3000;
+const BULK_TEXTURE_UPLOAD_PAGES: usize = 16;
+pub const TEXTURE_BULK_UPLOAD_BYTES: usize = BULK_TEXTURE_UPLOAD_PAGES * PAGE_BYTES;
 const CAPCTL_MAGIC: u64 = 0x4C54_5043;
 const CAPCTL_VERSION: u64 = 1;
 const CAPCTL_OPCODE_LAUNCH_GPU: u64 = 9;
@@ -36,6 +32,8 @@ pub const FEATURE_PRESENT_3D: u64 = 1 << 3;
 pub const FEATURE_TEXTURE_2D: u64 = 1 << 4;
 pub const FEATURE_APP_SURFACE: u64 = 1 << 5;
 pub const FEATURE_CURSOR: u64 = 1 << 6;
+pub const FEATURE_TEXTURE_BULK: u64 = 1 << 7;
+pub const FEATURE_SHELL_FRAMEBUFFER: u64 = 1 << 8;
 pub const DEFAULT_VIRGL_VERTEX_BUFFER_ID: u32 = 3;
 pub const GL_FALSE: u32 = 0;
 pub const GL_TRUE: u32 = 1;
@@ -136,6 +134,7 @@ const VIRGL_CCMD_SET_SCISSOR_STATE: u32 = 15;
 const VIRGL_CCMD_BIND_SAMPLER_STATES: u32 = 18;
 const VIRGL_CCMD_BIND_SHADER: u32 = 31;
 const VIRGL_FORMAT_B8G8R8A8_UNORM: u32 = 1;
+const VIRGL_FORMAT_R8_UNORM: u32 = 64;
 const VIRGL_FORMAT_R32G32B32A32_FLOAT: u32 = 31;
 const VIRGL_OBJ_SURFACE_SIZE: u32 = 5;
 const VIRGL_OBJ_BLEND_SIZE: u32 = 11;
@@ -168,6 +167,9 @@ const PIPE_BLENDFACTOR_INV_DST_ALPHA: u32 = 0x14;
 const PIPE_BLENDFACTOR_INV_DST_COLOR: u32 = 0x15;
 const PIPE_SHADER_VERTEX: u32 = 0;
 const PIPE_SHADER_FRAGMENT: u32 = 1;
+const PIPE_TEX_WRAP_CLAMP_TO_EDGE: u32 = 2;
+const PIPE_TEX_FILTER_LINEAR: u32 = 1;
+const PIPE_TEX_MIPFILTER_NONE: u32 = 2;
 const PIPE_PRIM_TRIANGLES: u32 = 4;
 const PIPE_PRIM_TRIANGLE_STRIP: u32 = 5;
 const VERTEX_STRIDE: u32 = size_of::<Vertex>() as u32;
@@ -177,6 +179,15 @@ const IDENTITY_MATRIX: [f32; 16] = [
     0.0, 0.0, 1.0, 0.0, //
     0.0, 0.0, 0.0, 1.0,
 ];
+
+const LINEAR_CLAMP_SAMPLER_S0: u32 = PIPE_TEX_WRAP_CLAMP_TO_EDGE
+    | (PIPE_TEX_WRAP_CLAMP_TO_EDGE << 3)
+    | (PIPE_TEX_WRAP_CLAMP_TO_EDGE << 6)
+    | (PIPE_TEX_FILTER_LINEAR << 9)
+    | (PIPE_TEX_MIPFILTER_NONE << 11)
+    | (PIPE_TEX_FILTER_LINEAR << 13);
+const SAMPLER_SWIZZLE_RGBA: u32 = 0x688;
+const SAMPLER_SWIZZLE_R_TO_ALPHA: u32 = 0x16d;
 
 const VERTEX_SHADER: &[u8] = b"VERT\n\
 DCL IN[0]\n\
@@ -275,6 +286,8 @@ pub enum Error {
     EndpointInstallFailed,
     ResponseGrantFailed,
     RequestSendFailed,
+    BulkBufferAllocFailed,
+    BulkBufferGrantFailed,
     Timeout,
     InvalidResponse,
     BufferTooSmall,
@@ -298,6 +311,11 @@ enum Opcode {
     DeleteTexture2d = 9,
     CreateAppSurface = 10,
     SetCursorPosition = 11,
+    CreateAlphaTexture2d = 12,
+    UpdateTextureAlpha2d = 13,
+    UpdateTextureAlpha2dBulk = 14,
+    #[allow(dead_code)]
+    PresentShellFramebuffer = 15,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -323,6 +341,31 @@ pub struct RenderTarget {
     pub resource_id: u32,
     pub surface_id: u32,
     pub vertex_buffer_id: u32,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct TextureBinding {
+    resource_id: u32,
+    view_format: u32,
+    swizzle: u32,
+}
+
+impl TextureBinding {
+    const fn bgra8(resource_id: u32) -> Self {
+        Self {
+            resource_id,
+            view_format: VIRGL_FORMAT_B8G8R8A8_UNORM,
+            swizzle: SAMPLER_SWIZZLE_RGBA,
+        }
+    }
+
+    const fn alpha8(resource_id: u32) -> Self {
+        Self {
+            resource_id,
+            view_format: VIRGL_FORMAT_R8_UNORM,
+            swizzle: SAMPLER_SWIZZLE_R_TO_ALPHA,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -616,6 +659,7 @@ struct RequestHeader {
     arg1: u64,
     inline_bytes: u32,
     reserved0: u32,
+    session_nonce: u64,
 }
 
 #[repr(C)]
@@ -638,15 +682,20 @@ pub struct Client {
     response_va: u64,
     request_paddr: u64,
     response_paddr: u64,
+    session_nonce: u64,
     server_endpoint_id: u64,
+    server_process_slot: u64,
     request_shared: bool,
     next_seq: u64,
     response_poll_limit: u64,
+    bulk_upload_ready: bool,
+    bulk_upload_va: u64,
+    bulk_upload_paddrs: [u64; BULK_TEXTURE_UPLOAD_PAGES],
 }
 
 impl Client {
     pub fn connect_from_registry_shadow() -> Result<Self, Error> {
-        Self::connect_from_registry_shadow_at(DEFAULT_REQUEST_VA, DEFAULT_RESPONSE_VA)
+        Self::connect_from_registry_shadow_at(0, 0)
     }
 
     pub fn connect_from_registry_shadow_at(
@@ -665,6 +714,7 @@ impl Client {
                 response_va,
                 endpoint_id: binding.endpoint_id,
                 response_poll_limit: DEFAULT_RESPONSE_POLL_LIMIT,
+                server_process_slot: binding.process_slot,
                 compat_process_slot: binding.process_slot,
                 allow_process_slot_compat: allow_compat,
             });
@@ -679,6 +729,7 @@ impl Client {
                 response_va,
                 endpoint_id: gpu.endpoint_id,
                 response_poll_limit: DEFAULT_RESPONSE_POLL_LIMIT,
+                server_process_slot: gpu.process_slot,
                 compat_process_slot: gpu.process_slot,
                 allow_process_slot_compat: gpu.process_slot != 0,
             });
@@ -696,28 +747,62 @@ impl Client {
     }
 
     fn connect_mapped(options: ConnectOptions) -> Result<Self, Error> {
-        let request_paddr = alloc_page().ok_or(Error::RequestAllocFailed)?;
-        if syscall::call3(syscall::MAP_PAGE, options.request_va, request_paddr, 1) != syscall::OK {
-            return Err(Error::RequestMapFailed);
-        }
+        let (request_va, request_paddr, response_va, response_paddr) =
+            if options.request_va == 0 && options.response_va == 0 {
+                let request = vm::alloc_map_page(true).map_err(map_request_page_error)?;
+                let response = vm::alloc_map_page(true).map_err(map_response_page_error)?;
+                (
+                    request.va(),
+                    request.paddr(),
+                    response.va(),
+                    response.paddr(),
+                )
+            } else if options.request_va != 0 && options.response_va != 0 {
+                let request_paddr = alloc_page().ok_or(Error::RequestAllocFailed)?;
+                if syscall::call3(syscall::MAP_PAGE, options.request_va, request_paddr, 1)
+                    != syscall::OK
+                {
+                    return Err(Error::RequestMapFailed);
+                }
 
-        let response_paddr = alloc_page().ok_or(Error::ResponseAllocFailed)?;
-        if syscall::call3(syscall::MAP_PAGE, options.response_va, response_paddr, 1) != syscall::OK
-        {
-            return Err(Error::ResponseMapFailed);
-        }
+                let response_paddr = alloc_page().ok_or(Error::ResponseAllocFailed)?;
+                if syscall::call3(syscall::MAP_PAGE, options.response_va, response_paddr, 1)
+                    != syscall::OK
+                {
+                    return Err(Error::ResponseMapFailed);
+                }
+                (
+                    options.request_va,
+                    request_paddr,
+                    options.response_va,
+                    response_paddr,
+                )
+            } else {
+                return Err(Error::Invalid);
+            };
 
         grant_response_cap(response_paddr, &options)?;
-
-        let client = Self {
-            request_va: options.request_va,
-            response_va: options.response_va,
+        let session_nonce = make_session_nonce(
             request_paddr,
             response_paddr,
+            options.endpoint_id,
+            options.server_process_slot,
+        );
+
+        let client = Self {
+            request_va,
+            response_va,
+            request_paddr,
+            response_paddr,
+            session_nonce,
             server_endpoint_id: options.endpoint_id,
+            server_process_slot: options.server_process_slot,
             request_shared: false,
             next_seq: 1,
             response_poll_limit: options.response_poll_limit,
+            bulk_upload_ready: false,
+            bulk_upload_va: 0,
+            bulk_upload_paddrs: [0; BULK_TEXTURE_UPLOAD_PAGES],
         };
         client.clear_mapped_pages();
         Ok(client)
@@ -841,6 +926,81 @@ impl Client {
         Ok(())
     }
 
+    pub fn create_alpha_texture_2d(&mut self, width: u32, height: u32) -> Result<u32, Error> {
+        if width == 0 || height == 0 {
+            return Err(Error::Invalid);
+        }
+        let arg0 = width as u64 | ((height as u64) << 32);
+        let seq = self.begin_request(Opcode::CreateAlphaTexture2d, arg0, 0, &[])?;
+        let response = self.finish_request_ok(seq, Opcode::CreateAlphaTexture2d)?;
+        Ok(unsafe { read_volatile(addr_of!((*response).arg0)) } as u32)
+    }
+
+    pub fn update_texture_alpha_2d(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        alpha: &[u8],
+    ) -> Result<(), Error> {
+        if alpha.len() > PAGE_BYTES - size_of::<RequestHeader>() {
+            return self.update_texture_alpha_2d_bulk(resource_id, x, y, width, height, alpha);
+        }
+        if resource_id == 0
+            || width == 0
+            || height == 0
+            || alpha.len() != width as usize * height as usize
+            || y > 0xffff
+            || width > 0xffff
+            || height > 0xffff
+        {
+            return Err(Error::Invalid);
+        }
+        let arg0 = resource_id as u64 | ((x as u64) << 32);
+        let arg1 = y as u64 | ((width as u64) << 16) | ((height as u64) << 32);
+        let seq = self.begin_request(Opcode::UpdateTextureAlpha2d, arg0, arg1, alpha)?;
+        self.finish_request_ok(seq, Opcode::UpdateTextureAlpha2d)?;
+        Ok(())
+    }
+
+    fn update_texture_alpha_2d_bulk(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        alpha: &[u8],
+    ) -> Result<(), Error> {
+        if resource_id == 0
+            || width == 0
+            || height == 0
+            || alpha.len() != width as usize * height as usize
+            || alpha.len() > TEXTURE_BULK_UPLOAD_BYTES
+            || y > 0xffff
+            || width > 0xffff
+            || height > 0xffff
+        {
+            return Err(Error::Invalid);
+        }
+        self.ensure_bulk_texture_upload_buffer()?;
+        copy_bytes_to_volatile(self.bulk_upload_va as *mut u8, alpha);
+        let page_count = (alpha.len() + PAGE_BYTES - 1) / PAGE_BYTES;
+        let payload = unsafe {
+            slice::from_raw_parts(
+                self.bulk_upload_paddrs.as_ptr() as *const u8,
+                page_count * size_of::<u64>(),
+            )
+        };
+        let arg0 = resource_id as u64 | ((x as u64) << 32);
+        let arg1 = y as u64 | ((width as u64) << 16) | ((height as u64) << 32);
+        let seq = self.begin_request(Opcode::UpdateTextureAlpha2dBulk, arg0, arg1, payload)?;
+        self.finish_request_ok(seq, Opcode::UpdateTextureAlpha2dBulk)?;
+        Ok(())
+    }
+
     pub fn delete_texture_2d(&mut self, resource_id: u32) -> Result<(), Error> {
         if resource_id == 0 {
             return Ok(());
@@ -930,6 +1090,41 @@ impl Client {
         clear_page(self.response_va);
     }
 
+    fn ensure_bulk_texture_upload_buffer(&mut self) -> Result<(), Error> {
+        if self.bulk_upload_ready {
+            return Ok(());
+        }
+        if self.server_process_slot == 0 {
+            return Err(Error::MissingService);
+        }
+        let bulk_upload_va = match vm::alloc_map_pages_into(
+            BULK_TEXTURE_UPLOAD_PAGES,
+            true,
+            &mut self.bulk_upload_paddrs,
+        ) {
+            Ok(va) => va,
+            Err(_) => return Err(Error::BulkBufferAllocFailed),
+        };
+        self.bulk_upload_va = bulk_upload_va;
+        if self.bulk_upload_va == 0 {
+            return Err(Error::BulkBufferAllocFailed);
+        }
+        for paddr in self.bulk_upload_paddrs {
+            if paddr < 0x1000
+                || syscall::call3(
+                    syscall::GRANT_CAP,
+                    paddr,
+                    self.server_process_slot,
+                    PAGE_RIGHT_CPU_READ,
+                ) != syscall::OK
+            {
+                return Err(Error::BulkBufferGrantFailed);
+            }
+        }
+        self.bulk_upload_ready = true;
+        Ok(())
+    }
+
     fn begin_request(
         &mut self,
         op: Opcode,
@@ -952,6 +1147,7 @@ impl Client {
             write_volatile(addr_of_mut!((*request).arg1), arg1);
             write_volatile(addr_of_mut!((*request).inline_bytes), payload.len() as u32);
             write_volatile(addr_of_mut!((*request).reserved0), 0);
+            write_volatile(addr_of_mut!((*request).session_nonce), self.session_nonce);
         }
         copy_bytes_to_volatile(self.request_payload(), payload);
 
@@ -1218,9 +1414,38 @@ impl Context {
         texture_resource_id: Option<u32>,
         scratch: &mut [u8],
     ) -> Result<(), Error> {
+        let texture = texture_resource_id.map(TextureBinding::bgra8);
+        self.gl_draw_vertices_with_texture(primitive, vertices, texture, scratch)
+    }
+
+    pub fn gl_draw_alpha_texture_vertices(
+        &mut self,
+        primitive: Primitive,
+        vertices: &[Vertex],
+        texture_resource_id: u32,
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
+        if texture_resource_id == 0 {
+            return Err(Error::Invalid);
+        }
+        self.gl_draw_vertices_with_texture(
+            primitive,
+            vertices,
+            Some(TextureBinding::alpha8(texture_resource_id)),
+            scratch,
+        )
+    }
+
+    fn gl_draw_vertices_with_texture(
+        &mut self,
+        primitive: Primitive,
+        vertices: &[Vertex],
+        texture: Option<TextureBinding>,
+        scratch: &mut [u8],
+    ) -> Result<(), Error> {
         let mut commands = CommandBuffer::new(scratch);
         self.append_pipeline_if_needed(&mut commands)?;
-        self.append_draw_binding(&mut commands, texture_resource_id)?;
+        self.append_draw_binding(&mut commands, texture)?;
         self.append_draw_common_state(&mut commands)?;
         commands.append_vertex_upload(self.target, vertices)?;
         commands.append_draw_arrays(primitive, 0, vertices.len() as u32)?;
@@ -1239,7 +1464,10 @@ impl Context {
     ) -> Result<(), Error> {
         let mut commands = CommandBuffer::new(scratch);
         self.append_pipeline_if_needed(&mut commands)?;
-        self.append_draw_binding(&mut commands, texture_resource_id)?;
+        self.append_draw_binding(
+            &mut commands,
+            texture_resource_id.map(TextureBinding::bgra8),
+        )?;
         self.append_draw_common_state(&mut commands)?;
         commands.append_draw_arrays(primitive, first, count)?;
         self.client.submit_3d(commands.bytes())?;
@@ -1350,6 +1578,23 @@ impl Context {
             .update_texture_2d(resource_id, x, y, width, height, pixels)
     }
 
+    pub fn create_alpha_texture_2d(&mut self, width: u32, height: u32) -> Result<u32, Error> {
+        self.client.create_alpha_texture_2d(width, height)
+    }
+
+    pub fn update_texture_alpha_2d(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        alpha: &[u8],
+    ) -> Result<(), Error> {
+        self.client
+            .update_texture_alpha_2d(resource_id, x, y, width, height, alpha)
+    }
+
     pub fn delete_texture_2d(&mut self, resource_id: u32) -> Result<(), Error> {
         self.client.delete_texture_2d(resource_id)
     }
@@ -1435,17 +1680,19 @@ impl Context {
     fn append_draw_binding(
         &mut self,
         commands: &mut CommandBuffer<'_>,
-        texture_resource_id: Option<u32>,
+        texture: Option<TextureBinding>,
     ) -> Result<(), Error> {
-        if let Some(texture_resource_id) = texture_resource_id {
+        if let Some(texture) = texture {
             commands
                 .append_bind_shader(self.textured_fragment_shader_handle(), PIPE_SHADER_FRAGMENT)?;
             let sampler_view_handle = self.alloc_object_handle();
             let sampler_state_handle = self.alloc_object_handle();
             commands.append_texture_binding(
-                texture_resource_id,
+                texture.resource_id,
                 sampler_view_handle,
                 sampler_state_handle,
+                texture.view_format,
+                texture.swizzle,
             )?;
         } else {
             commands
@@ -1657,6 +1904,8 @@ impl<'a> CommandBuffer<'a> {
         texture_resource_id: u32,
         sampler_view_handle: u32,
         sampler_state_handle: u32,
+        view_format: u32,
+        swizzle: u32,
     ) -> Result<(), Error> {
         if texture_resource_id == 0 {
             return Err(Error::Invalid);
@@ -1669,10 +1918,10 @@ impl<'a> CommandBuffer<'a> {
         ))?;
         self.append_u32(sampler_view_handle)?;
         self.append_u32(texture_resource_id)?;
-        self.append_u32(VIRGL_FORMAT_B8G8R8A8_UNORM)?;
+        self.append_u32(view_format)?;
         self.append_u32(0)?;
         self.append_u32(0)?;
-        self.append_u32(0x688)?;
+        self.append_u32(swizzle)?;
 
         self.append_u32(virgl_cmd0(
             VIRGL_CCMD_CREATE_OBJECT,
@@ -1680,7 +1929,7 @@ impl<'a> CommandBuffer<'a> {
             VIRGL_OBJ_SAMPLER_STATE_SIZE,
         ))?;
         self.append_u32(sampler_state_handle)?;
-        self.append_u32(0)?;
+        self.append_u32(LINEAR_CLAMP_SAMPLER_S0)?;
         self.append_f32(0.0)?;
         self.append_f32(0.0)?;
         self.append_f32(1000.0)?;
@@ -2807,7 +3056,7 @@ pub extern "C" fn glTexImage2D(
         if pixels.is_null() {
             write_bytes(dst, 0, byte_len);
         } else {
-            copy_nonoverlapping(pixels.cast::<u8>(), dst, byte_len);
+            copy_raw_bytes(dst, pixels.cast::<u8>(), byte_len);
         }
         write_volatile(addr_of_mut!((*texture).width), width);
         write_volatile(addr_of_mut!((*texture).height), height);
@@ -2950,8 +3199,8 @@ pub extern "C" fn glTexSubImage2D(
             let texture_row = texture_data
                 .add(((yoffset as usize + row) * tex_width as usize + xoffset as usize) * 4);
             let upload_row = upload.add(row * row_bytes);
-            copy_nonoverlapping(src_row, texture_row, row_bytes);
-            copy_nonoverlapping(src_row, upload_row, row_bytes);
+            copy_raw_bytes(texture_row, src_row, row_bytes);
+            copy_raw_bytes(upload_row, src_row, row_bytes);
         }
     }
 
@@ -3023,7 +3272,7 @@ pub extern "C" fn glBufferData(target: u32, size: isize, data: *const c_void, us
             if data.is_null() {
                 write_bytes(dst, 0, byte_len);
             } else {
-                copy_nonoverlapping(data.cast::<u8>(), dst, byte_len);
+                copy_raw_bytes(dst, data.cast::<u8>(), byte_len);
             }
         }
         write_volatile(addr_of_mut!((*buffer).len), byte_len);
@@ -3074,7 +3323,7 @@ pub extern "C" fn glBufferSubData(target: u32, offset: isize, size: isize, data:
         }
         if byte_len > 0 {
             let dst = (addr_of_mut!((*buffer).data) as *mut u8).add(offset);
-            copy_nonoverlapping(data.cast::<u8>(), dst, byte_len);
+            copy_raw_bytes(dst, data.cast::<u8>(), byte_len);
         }
     }
 }
@@ -3275,7 +3524,7 @@ pub extern "C" fn glShaderSource(
         }
         unsafe {
             let dst = (addr_of_mut!((*shader_ptr).source) as *mut u8).add(total_len);
-            copy_nonoverlapping(source_ptr.cast::<u8>(), dst, source_len);
+            copy_raw_bytes(dst, source_ptr.cast::<u8>(), source_len);
         }
         total_len = new_total_len;
     }
@@ -4598,7 +4847,9 @@ fn error_to_gl_error(error: Error) -> u32 {
     match error {
         Error::Invalid => GL_INVALID_VALUE,
         Error::BufferTooSmall => GL_OUT_OF_MEMORY,
-        Error::RequestAllocFailed | Error::ResponseAllocFailed => GL_OUT_OF_MEMORY,
+        Error::RequestAllocFailed | Error::ResponseAllocFailed | Error::BulkBufferAllocFailed => {
+            GL_OUT_OF_MEMORY
+        }
         Error::Unavailable
         | Error::MissingService
         | Error::EndpointNotFound
@@ -4607,6 +4858,7 @@ fn error_to_gl_error(error: Error) -> u32 {
         | Error::RequestMapFailed
         | Error::ResponseMapFailed
         | Error::RequestSendFailed
+        | Error::BulkBufferGrantFailed
         | Error::Timeout
         | Error::InvalidResponse
         | Error::IoError => GL_INVALID_OPERATION,
@@ -4654,28 +4906,27 @@ fn launch_gpu_from_capctl() -> Result<GpuService, Error> {
     }
     .ok_or(Error::MissingService)?;
 
-    let request_paddr = alloc_page().ok_or(Error::RequestAllocFailed)?;
-    if syscall::call3(syscall::MAP_PAGE, CAPCTL_REQUEST_VA, request_paddr, 1) != syscall::OK {
-        return Err(Error::RequestMapFailed);
-    }
-    let response_paddr = alloc_page().ok_or(Error::ResponseAllocFailed)?;
-    if syscall::call3(syscall::MAP_PAGE, CAPCTL_RESPONSE_VA, response_paddr, 1) != syscall::OK {
-        return Err(Error::ResponseMapFailed);
-    }
+    let request_page = vm::alloc_map_page(true).map_err(map_request_page_error)?;
+    let response_page = vm::alloc_map_page(true).map_err(map_response_page_error)?;
+    let request_va = request_page.va();
+    let response_va = response_page.va();
+    let request_paddr = request_page.paddr();
+    let response_paddr = response_page.paddr();
 
     let options = ConnectOptions {
-        request_va: CAPCTL_REQUEST_VA,
-        response_va: CAPCTL_RESPONSE_VA,
+        request_va,
+        response_va,
         endpoint_id: binding.endpoint_id,
         response_poll_limit: DEFAULT_RESPONSE_POLL_LIMIT,
+        server_process_slot: binding.process_slot,
         compat_process_slot: binding.process_slot,
         allow_process_slot_compat: binding.process_slot != 0,
     };
     grant_response_cap(response_paddr, &options)?;
 
-    clear_page(CAPCTL_REQUEST_VA);
-    clear_page(CAPCTL_RESPONSE_VA);
-    let request = CAPCTL_REQUEST_VA as *mut CapctlRequest;
+    clear_page(request_va);
+    clear_page(response_va);
+    let request = request_va as *mut CapctlRequest;
     unsafe {
         write_volatile(addr_of_mut!((*request).magic), CAPCTL_MAGIC);
         write_volatile(addr_of_mut!((*request).version), CAPCTL_VERSION);
@@ -4698,7 +4949,7 @@ fn launch_gpu_from_capctl() -> Result<GpuService, Error> {
         return Err(Error::RequestSendFailed);
     }
 
-    let response = CAPCTL_RESPONSE_VA as *mut CapctlResponse;
+    let response = response_va as *mut CapctlResponse;
     let mut poll_count = 0;
     while poll_count < DEFAULT_RESPONSE_POLL_LIMIT {
         if unsafe { read_volatile(addr_of!((*response).response_seq)) } == 1 {
@@ -4741,6 +4992,7 @@ pub struct ConnectOptions {
     pub response_va: u64,
     pub endpoint_id: u64,
     pub response_poll_limit: u64,
+    pub server_process_slot: u64,
     pub compat_process_slot: u64,
     pub allow_process_slot_compat: bool,
 }
@@ -4748,10 +5000,11 @@ pub struct ConnectOptions {
 impl Default for ConnectOptions {
     fn default() -> Self {
         Self {
-            request_va: DEFAULT_REQUEST_VA,
-            response_va: DEFAULT_RESPONSE_VA,
+            request_va: 0,
+            response_va: 0,
             endpoint_id: DEFAULT_ENDPOINT_ID,
             response_poll_limit: DEFAULT_RESPONSE_POLL_LIMIT,
+            server_process_slot: 0,
             compat_process_slot: 0,
             allow_process_slot_compat: false,
         }
@@ -4799,9 +5052,34 @@ fn grant_response_cap(response_paddr: u64, options: &ConnectOptions) -> Result<(
     Err(Error::ResponseGrantFailed)
 }
 
+fn make_session_nonce(request_paddr: u64, response_paddr: u64, endpoint_id: u64, tag: u64) -> u64 {
+    let nonce = request_paddr
+        ^ response_paddr.rotate_left(17)
+        ^ endpoint_id.rotate_left(7)
+        ^ tag
+        ^ 0xa24b_aed4_963e_e407;
+    if nonce == 0 { 1 } else { nonce }
+}
+
 fn alloc_page() -> Option<u64> {
     let raw = syscall::call0(syscall::ALLOC_PAGE);
     if raw < 0x1000 { None } else { Some(raw) }
+}
+
+fn map_request_page_error(err: SyscallError) -> Error {
+    match err {
+        SyscallError::Alloc => Error::RequestAllocFailed,
+        SyscallError::Map => Error::RequestMapFailed,
+        _ => Error::RequestMapFailed,
+    }
+}
+
+fn map_response_page_error(err: SyscallError) -> Error {
+    match err {
+        SyscallError::Alloc => Error::ResponseAllocFailed,
+        SyscallError::Map => Error::ResponseMapFailed,
+        _ => Error::ResponseMapFailed,
+    }
 }
 
 fn clear_page(va: u64) {
@@ -4817,6 +5095,16 @@ fn copy_bytes_to_volatile(dst: *mut u8, src: &[u8]) {
     let mut index = 0;
     while index < src.len() {
         unsafe { write_volatile(dst.add(index), src[index]) };
+        index += 1;
+    }
+}
+
+fn copy_raw_bytes(dst: *mut u8, src: *const u8, len: usize) {
+    let mut index = 0;
+    while index < len {
+        unsafe {
+            write_volatile(dst.add(index), read_volatile(src.add(index)));
+        }
         index += 1;
     }
 }

@@ -11,6 +11,7 @@ pub const Opcode = enum(u16) {
     read_blocks = 3,
     write_blocks = 4,
     flush = 5,
+    read_blocks_bulk = 6,
 };
 
 pub const Status = enum(i32) {
@@ -37,6 +38,7 @@ pub const BlockRequestHeader = extern struct {
     reserved1: u32 = 0,
     arg0: u64 = 0,
     arg1: u64 = 0,
+    session_nonce: u64 = 0,
 };
 
 pub const BlockResponseHeader = extern struct {

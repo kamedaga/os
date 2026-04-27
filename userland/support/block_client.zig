@@ -2,10 +2,12 @@ const std = @import("std");
 const fs_abi = @import("fs_abi.zig");
 const block_protocol = @import("block_protocol.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
+const user_vm = @import("user_vm.zig");
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
+const syscall_grant_cap: u64 = 0x8;
 const syscall_log: u64 = 0x9;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_wait_event: u64 = 0x17;
@@ -19,12 +21,18 @@ const syscall_err_endpoint: u64 = 9;
 const page_right_cpu_read: u64 = 0x1;
 const page_right_cpu_write: u64 = 0x2;
 const default_response_poll_limit: u64 = 256;
+const default_bulk_read_va_gap: u64 = 0x20_000;
+const page_bytes: usize = block_protocol.page_bytes;
+const bulk_read_pages: usize = 16;
+const bulk_read_bytes: usize = bulk_read_pages * page_bytes;
 
 pub const Error = error{
     RequestAllocFailed,
     RequestMapFailed,
     ResponseAllocFailed,
     ResponseMapFailed,
+    BulkBufferAllocFailed,
+    BulkBufferGrantFailed,
     EndpointNotFound,
     EndpointInstallFailed,
     ResponseGrantFailed,
@@ -41,18 +49,21 @@ pub const Error = error{
 };
 
 pub const ConnectOptions = struct {
-    request_va: u64,
-    response_va: u64,
+    request_va: u64 = 0,
+    response_va: u64 = 0,
     client_process_slot: u64,
     endpoint_id: u64,
+    server_process_slot: u64 = 0,
     response_poll_limit: u64 = default_response_poll_limit,
     compat_process_slot: u64 = 0,
     allow_process_slot_compat: bool = false,
+    bulk_read_va: u64 = 0,
 };
 
 pub const RegistryConnectOptions = struct {
     response_poll_limit: u64 = default_response_poll_limit,
     allow_process_slot_compat: bool = true,
+    bulk_read_va: u64 = 0,
 };
 
 pub const IdentifyResult = struct {
@@ -65,26 +76,34 @@ pub const Client = struct {
     response_va: u64,
     request_paddr: u64,
     response_paddr: u64,
+    bulk_read_va: u64,
     server_endpoint_id: u64,
+    server_process_slot: u64,
+    session_nonce: u64,
     root_token: u64,
     block_size: u64,
     capacity_blocks: u64,
     next_seq: u64 = 2,
     response_poll_limit: u64 = default_response_poll_limit,
+    bulk_read_ready: bool = false,
+    bulk_read_disabled: bool = false,
+    bulk_read_paddrs: [bulk_read_pages]u64 = [_]u64{0} ** bulk_read_pages,
 
     pub fn connect(options: ConnectOptions) Error!Client {
         const pages = try allocConnectPages(options.request_va, options.response_va);
-        const request_paddr = pages[0];
-        const response_paddr = pages[1];
         var compat_installed = false;
-        try grantResponseCapForConnect(response_paddr, options, &compat_installed);
+        try grantResponseCapForConnect(pages.response_paddr, options, &compat_installed);
+        const session_nonce = makeSessionNonce(pages.request_paddr, pages.response_paddr, options.endpoint_id, options.client_process_slot);
 
         var client = Client{
-            .request_va = options.request_va,
-            .response_va = options.response_va,
-            .request_paddr = request_paddr,
-            .response_paddr = response_paddr,
+            .request_va = pages.request_va,
+            .response_va = pages.response_va,
+            .request_paddr = pages.request_paddr,
+            .response_paddr = pages.response_paddr,
+            .bulk_read_va = options.bulk_read_va,
             .server_endpoint_id = options.endpoint_id,
+            .server_process_slot = options.server_process_slot,
+            .session_nonce = session_nonce,
             .root_token = 0,
             .block_size = 0,
             .capacity_blocks = 0,
@@ -103,12 +122,13 @@ pub const Client = struct {
         request.inline_bytes = 0;
         request.reserved0 = 0;
         request.reserved1 = 0;
-        request.arg0 = response_paddr;
+        request.arg0 = pages.response_paddr;
         request.arg1 = options.client_process_slot;
+        request.session_nonce = session_nonce;
         compilerBarrier();
         request.request_seq = 1;
 
-        try shareConnectRequest(request_paddr, options, &compat_installed);
+        try shareConnectRequest(pages.request_paddr, options, &compat_installed);
         const response = try client.finishRequestOk(1, .connect);
         client.root_token = response.result_token;
         if (!fs_abi.isCapToken(client.root_token)) return error.InvalidResponse;
@@ -138,9 +158,11 @@ pub const Client = struct {
             .response_va = response_va,
             .client_process_slot = client_process_slot,
             .endpoint_id = entry.endpoint_id,
+            .server_process_slot = entry.process_slot,
             .response_poll_limit = options.response_poll_limit,
             .compat_process_slot = if (compat_allowed) entry.process_slot else 0,
             .allow_process_slot_compat = allow_process_slot_compat,
+            .bulk_read_va = options.bulk_read_va,
         }) catch |err| {
             logRegistryConnectFailure(registry_page_va, entry, compat_allowed, allow_process_slot_compat, err);
             return err;
@@ -177,12 +199,85 @@ pub const Client = struct {
         if ((out.len % self.block_size) != 0) return error.BufferTooSmall;
         const block_count: usize = out.len / @as(usize, @intCast(self.block_size));
         if (block_count == 0 or block_count > std.math.maxInt(u32)) return error.BufferTooSmall;
+        if (out.len > block_protocol.response_payload_bytes and self.server_process_slot != 0 and !self.bulk_read_disabled) {
+            return self.readBlocksBulk(block_index, out) catch {
+                self.bulk_read_disabled = true;
+                self.bulk_read_ready = false;
+                return self.readBlocksInlineLoop(block_index, out);
+            };
+        }
+        return self.readBlocksInlineLoop(block_index, out);
+    }
+
+    fn readBlocksInlineLoop(self: *Client, block_index: u64, out: []u8) Error!usize {
+        const block_bytes: usize = @intCast(self.block_size);
+        const max_inline_bytes = (block_protocol.response_payload_bytes / block_bytes) * block_bytes;
+        if (max_inline_bytes == 0) return error.BufferTooSmall;
+        var copied: usize = 0;
+        var current_block = block_index;
+        while (copied < out.len) {
+            const remaining = out.len - copied;
+            const chunk_bytes = @min(remaining, max_inline_bytes);
+            const aligned_chunk_bytes = chunk_bytes - (chunk_bytes % block_bytes);
+            if (aligned_chunk_bytes == 0) return error.BufferTooSmall;
+            const chunk_blocks: u32 = @intCast(aligned_chunk_bytes / block_bytes);
+            const bytes_read = try self.readBlocksInline(current_block, chunk_blocks, out[copied .. copied + aligned_chunk_bytes]);
+            if (bytes_read != aligned_chunk_bytes) return error.InvalidResponse;
+            copied += aligned_chunk_bytes;
+            current_block += chunk_blocks;
+        }
+        return copied;
+    }
+
+    fn readBlocksInline(self: *Client, block_index: u64, block_count: u32, out: []u8) Error!usize {
         const seq = try self.beginRequest(.read_blocks, self.root_token, block_index, @intCast(block_count), 0, &[_]u8{});
         const response = try self.finishRequestOk(seq, .read_blocks);
         const inline_bytes: usize = response.inline_bytes;
         if (inline_bytes != out.len or inline_bytes > block_protocol.response_payload_bytes) return error.InvalidResponse;
         copyVolatileBytes(self.responsePayload(), out[0..inline_bytes]);
         return inline_bytes;
+    }
+
+    fn readBlocksBulk(self: *Client, block_index: u64, out: []u8) Error!usize {
+        try self.ensureBulkReadBuffer();
+        const block_bytes: usize = @intCast(self.block_size);
+        var copied: usize = 0;
+        var current_block = block_index;
+        while (copied < out.len) {
+            const remaining = out.len - copied;
+            const chunk_bytes = @min(remaining, bulk_read_bytes);
+            const aligned_chunk_bytes = chunk_bytes - (chunk_bytes % block_bytes);
+            if (aligned_chunk_bytes == 0) return error.BufferTooSmall;
+            const page_count = (aligned_chunk_bytes + page_bytes - 1) / page_bytes;
+            const payload = std.mem.sliceAsBytes(self.bulk_read_paddrs[0..page_count]);
+            const chunk_blocks: u32 = @intCast(aligned_chunk_bytes / block_bytes);
+            const seq = try self.beginRequest(.read_blocks_bulk, self.root_token, current_block, chunk_blocks, @intCast(page_count), payload);
+            const response = try self.finishRequestOk(seq, .read_blocks_bulk);
+            const bytes_read: usize = @intCast(response.arg0);
+            if (bytes_read != aligned_chunk_bytes) return error.InvalidResponse;
+            copyPlainBytes(@ptrFromInt(self.bulk_read_va), out[copied .. copied + aligned_chunk_bytes]);
+            copied += aligned_chunk_bytes;
+            current_block += chunk_blocks;
+        }
+        return copied;
+    }
+
+    fn ensureBulkReadBuffer(self: *Client) Error!void {
+        if (self.bulk_read_ready) return;
+        if (self.server_process_slot == 0) return error.Invalid;
+        if (self.bulk_read_va == 0) {
+            self.bulk_read_va = @intCast(user_vm.allocMapPagesInto(bulk_read_pages, true, self.bulk_read_paddrs[0..]) orelse {
+                return error.BulkBufferAllocFailed;
+            });
+        } else if (allocMapPages(self.bulk_read_va, bulk_read_pages, true, @intFromPtr(&self.bulk_read_paddrs)) != syscall_ok) {
+            return error.BulkBufferAllocFailed;
+        }
+        for (self.bulk_read_paddrs) |paddr| {
+            if (paddr < 0x1000 or grantCap(paddr, self.server_process_slot, page_right_cpu_write) != syscall_ok) {
+                return error.BulkBufferGrantFailed;
+            }
+        }
+        self.bulk_read_ready = true;
     }
 
     pub fn writeBlocks(self: *Client, block_index: u64, bytes: []const u8) Error!void {
@@ -246,6 +341,7 @@ pub const Client = struct {
         request.reserved1 = 0;
         request.arg0 = 0;
         request.arg1 = 0;
+        request.session_nonce = self.session_nonce;
         copyBytesToVolatile(self.requestPayload(), payload);
         const seq = self.next_seq;
         self.next_seq += 1;
@@ -282,13 +378,42 @@ pub const Client = struct {
     }
 };
 
-fn allocConnectPages(request_va: u64, response_va: u64) Error![2]u64 {
+fn makeSessionNonce(request_paddr: u64, response_paddr: u64, endpoint_id: u64, tag: u64) u64 {
+    const nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ tag ^ 0x517c_c1b7_2722_0a95;
+    return if (nonce == 0) 1 else nonce;
+}
+
+const ConnectPages = struct {
+    request_va: u64,
+    response_va: u64,
+    request_paddr: u64,
+    response_paddr: u64,
+};
+
+fn allocConnectPages(request_va: u64, response_va: u64) Error!ConnectPages {
+    if (request_va == 0 and response_va == 0) {
+        var paddrs: [2]u64 = .{ 0, 0 };
+        const base_va = user_vm.allocMapPagesInto(2, true, paddrs[0..]) orelse return error.RequestAllocFailed;
+        if (paddrs[0] < 0x1000 or paddrs[1] < 0x1000) return error.RequestAllocFailed;
+        return .{
+            .request_va = @intCast(base_va),
+            .response_va = @intCast(base_va + user_vm.page_bytes),
+            .request_paddr = paddrs[0],
+            .response_paddr = paddrs[1],
+        };
+    }
+    if (request_va == 0 or response_va == 0) return error.Invalid;
     if (response_va == request_va + 4096) {
         var paddrs: [2]u64 = .{ 0, 0 };
         if (allocMapPages(request_va, 2, true, @intFromPtr(&paddrs)) == syscall_ok and
             paddrs[0] >= 0x1000 and paddrs[1] >= 0x1000)
         {
-            return paddrs;
+            return .{
+                .request_va = request_va,
+                .response_va = response_va,
+                .request_paddr = paddrs[0],
+                .response_paddr = paddrs[1],
+            };
         }
     }
 
@@ -299,7 +424,12 @@ fn allocConnectPages(request_va: u64, response_va: u64) Error![2]u64 {
     const response_paddr = allocPage();
     if (response_paddr < 0x1000) return error.ResponseAllocFailed;
     if (mapPage(response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
-    return .{ request_paddr, response_paddr };
+    return .{
+        .request_va = request_va,
+        .response_va = response_va,
+        .request_paddr = request_paddr,
+        .response_paddr = response_paddr,
+    };
 }
 
 fn allocPage() u64 {
@@ -369,6 +499,17 @@ fn grantCapOnEndpoint(paddr: u64, endpoint_id: u64, rights: u64) u64 {
         : [nr] "{rax}" (syscall_grant_cap_on_endpoint),
           [arg0] "{rdi}" (paddr),
           [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (rights),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn grantCap(paddr: u64, to_process_slot: u64, rights: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_grant_cap),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (to_process_slot),
           [arg2] "{rdx}" (rights),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
@@ -495,6 +636,10 @@ fn copyVolatileBytes(src: [*]volatile u8, dest: []u8) void {
     while (i < dest.len) : (i += 1) {
         dest[i] = src[i];
     }
+}
+
+fn copyPlainBytes(src: [*]const u8, dest: []u8) void {
+    @memcpy(dest, src[0..dest.len]);
 }
 
 fn compilerBarrier() void {

@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::ptr::{addr_of, copy_nonoverlapping, read_volatile, write_bytes};
-use rt_core::{SyscallError, syscall};
+use rt_core::{SyscallError, syscall, vm};
 
 pub mod fixed_va {
     pub const AUX_BASE_VA: u64 = 0x3C00_0000;
@@ -33,26 +33,6 @@ pub const MAX_BOOTSTRAP_CAP_DESCRIPTORS: usize = 8;
 pub const SERVICE_REGISTRY_MAGIC: u64 = 0x5352_5643;
 pub const SERVICE_REGISTRY_VERSION: u64 = 1;
 pub const MAX_SERVICE_ENTRIES: usize = 8;
-const STDIO_BOOTSTRAP_SOURCE_CANDIDATES: [u64; 6] = [
-    0x3F20_2000,
-    0x3F20_3000,
-    0x3F20_4000,
-    0x3F20_5000,
-    0x3F20_6000,
-    0x3F20_7000,
-];
-const INHERITED_STDIO_BOOTSTRAP_SOURCE_CANDIDATES: [u64; 6] = [
-    0x3F20_8000,
-    0x3F20_9000,
-    0x3F20_A000,
-    0x3F20_B000,
-    0x3F20_C000,
-    0x3F20_D000,
-];
-const PROCESS_EXIT_STATUS_SOURCE_CANDIDATES: [u64; 4] =
-    [0x3F20_E000, 0x3F20_F000, 0x3F21_0000, 0x3F21_1000];
-const PROCESS_ARGS_ENV_SOURCE_CANDIDATES: [u64; 4] =
-    [0x3F21_A000, 0x3F21_B000, 0x3F21_C000, 0x3F21_D000];
 const PAGE_BYTES: usize = fixed_va::AUX_PAGE_BYTES as usize;
 const STDIO_BOOTSTRAP_MAGIC: u64 = 0x5354_4449_4F53_4831;
 const STDIO_BOOTSTRAP_VERSION: u64 = 1;
@@ -218,8 +198,8 @@ fn init_stdio_bootstrap_source_va(
     endpoint_id: u64,
     shell_process_slot: u64,
 ) {
-    // SAFETY: `source_va` points at a process-owned scratch page selected from
-    // fixed candidates solely for spawn bootstrap source use.
+    // SAFETY: `source_va` points at a process-owned scratch page reserved
+    // solely for spawn bootstrap source use.
     unsafe {
         write_bytes(source_va as *mut u8, 0, PAGE_BYTES);
         let words = source_va as *mut u64;
@@ -239,14 +219,7 @@ fn ensure_default_stdio_bootstrap_source_va(stdio: SpawnStdio) -> Result<u64, Sy
     // process-local cached source VA is sufficient here.
     unsafe {
         if DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA == 0 {
-            for candidate in STDIO_BOOTSTRAP_SOURCE_CANDIDATES {
-                let status = syscall::call4(syscall::ALLOC_MAP_PAGES, candidate, 1, 1, 0);
-                if status != syscall::OK {
-                    continue;
-                }
-                DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA = candidate;
-                break;
-            }
+            DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA = vm::alloc_map_page(true)?.va();
         }
 
         if DEFAULT_STDIO_BOOTSTRAP_SOURCE_VA == 0 {
@@ -259,18 +232,12 @@ fn ensure_default_stdio_bootstrap_source_va(stdio: SpawnStdio) -> Result<u64, Sy
 }
 
 fn map_inherited_stdio_bootstrap_source(paddr: u64) -> Result<u64, SyscallError> {
-    for candidate in INHERITED_STDIO_BOOTSTRAP_SOURCE_CANDIDATES {
-        let status = syscall::call3(syscall::MAP_PAGE, candidate, paddr, 1);
-        if status == syscall::OK {
-            return Ok(candidate);
-        }
-    }
-    Err(SyscallError::Map)
+    Ok(vm::map_page_at_dynamic_va(paddr, true)?.va())
 }
 
 fn init_process_exit_status_source_va(source_va: u64) {
-    // SAFETY: `source_va` points at a process-owned scratch page selected from
-    // fixed candidates solely for exit-status bootstrap source use.
+    // SAFETY: `source_va` points at a process-owned scratch page reserved
+    // solely for exit-status bootstrap source use.
     unsafe {
         write_bytes(source_va as *mut u8, 0, PAGE_BYTES);
         let words = source_va as *mut u64;
@@ -286,14 +253,7 @@ fn ensure_default_process_exit_status_source_va() -> Result<u64, SyscallError> {
     // process-local cached source VA is sufficient here.
     unsafe {
         if DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA == 0 {
-            for candidate in PROCESS_EXIT_STATUS_SOURCE_CANDIDATES {
-                let status = syscall::call4(syscall::ALLOC_MAP_PAGES, candidate, 1, 1, 0);
-                if status != syscall::OK {
-                    continue;
-                }
-                DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA = candidate;
-                break;
-            }
+            DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA = vm::alloc_map_page(true)?.va();
         }
 
         if DEFAULT_PROCESS_EXIT_STATUS_SOURCE_VA == 0 {
@@ -306,8 +266,8 @@ fn ensure_default_process_exit_status_source_va() -> Result<u64, SyscallError> {
 }
 
 fn init_process_args_env_source_va(source_va: u64) {
-    // SAFETY: `source_va` points at a process-owned scratch page selected from
-    // fixed candidates solely for args/env bootstrap source use.
+    // SAFETY: `source_va` points at a process-owned scratch page reserved
+    // solely for args/env bootstrap source use.
     unsafe {
         write_bytes(source_va as *mut u8, 0, PAGE_BYTES);
         let words = source_va as *mut u64;
@@ -325,14 +285,7 @@ fn ensure_default_process_args_env_source_va() -> Result<u64, SyscallError> {
     // process-local cached source VA is sufficient here.
     unsafe {
         if DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA == 0 {
-            for candidate in PROCESS_ARGS_ENV_SOURCE_CANDIDATES {
-                let status = syscall::call4(syscall::ALLOC_MAP_PAGES, candidate, 1, 1, 0);
-                if status != syscall::OK {
-                    continue;
-                }
-                DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA = candidate;
-                break;
-            }
+            DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA = vm::alloc_map_page(true)?.va();
         }
 
         if DEFAULT_PROCESS_ARGS_ENV_SOURCE_VA == 0 {

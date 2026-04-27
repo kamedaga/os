@@ -30,6 +30,7 @@ const process_factory = @import("process_factory.zig");
 const elf_load = @import("elf_load.zig");
 const init_setup = @import("init_setup.zig");
 const spawn = @import("../runtime/spawn.zig");
+const process_builder = @import("../runtime/process_builder.zig");
 const halt = @import("../halt.zig");
 const log_util = @import("../log_util.zig");
 
@@ -199,7 +200,7 @@ fn writeCr4(value: u64) void {
 fn userCr3ForPrincipal(principal: kernel.PrincipalId) u64 {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return 0;
     if (idx >= user_spaces.len) return 0;
-    return user_spaces[idx].cr3;
+    return x86_platform.cr3WithUserPcid(user_spaces[idx].cr3, @intCast(idx + 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +230,7 @@ fn initFxStateSupport() void {
 pub export fn saveCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
     const ctx = scheduler.getThreadContext(scheduler.current_thread_index) orelse return;
-    if (!ctx.ready) return;
+    if (!scheduler.isThreadReady(scheduler.current_thread_index)) return;
     asm volatile ("fxsave64 (%[ptr])"
         :
         : [ptr] "r" (&ctx.fx_state),
@@ -239,7 +240,7 @@ pub export fn saveCurrentThreadFxState() callconv(.c) void {
 pub export fn restoreCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
     const ctx = scheduler.getThreadContext(scheduler.current_thread_index) orelse return;
-    if (!ctx.ready) return;
+    if (!scheduler.isThreadReady(scheduler.current_thread_index)) return;
     asm volatile ("fxrstor64 (%[ptr])"
         :
         : [ptr] "r" (&ctx.fx_state),
@@ -286,9 +287,11 @@ fn initKernelRuntimeOrHalt() void {
         if (!x86_platform.installIdentityPageTables0To1GiB()) {
             halt.haltWithMessage("page table install failed");
         }
+        _ = x86_platform.enablePcidIfSupported();
         x86_platform.hardenKernelMappingsSupervisorOnly();
     }
     installInterruptTrampolines();
+    x86_platform.installSyscallEntry(@intFromPtr(&traps.syscallLstarHandlerStub));
     asm volatile ("cli");
     if (!lapic.initTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count)) {
         halt.haltWithMessage("LAPIC timer init failed");
@@ -374,8 +377,7 @@ fn nextReadyThreadAfter(current_thread: usize) ?usize {
     var step: usize = 1;
     while (step <= scheduler.max_thread_slots) : (step += 1) {
         const thread_index = (current_thread + step) % scheduler.max_thread_slots;
-        const ctx = scheduler.getThreadContextConst(thread_index) orelse continue;
-        if (!ctx.allocated or !ctx.ready) continue;
+        if (!scheduler.isThreadReady(thread_index)) continue;
         return thread_index;
     }
     return null;
@@ -420,11 +422,14 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_state_global.exec_image_tables[process_index] = .{};
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
+    var endpoint_targets_removed = false;
     var storage_index: usize = 0;
     while (storage_index < kernel.principal_count) : (storage_index += 1) {
         var wake_owner = false;
         if (storage_index < kernel.process_count) {
-            wake_owner = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+            const removed = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+            if (removed) endpoint_targets_removed = true;
+            wake_owner = removed;
         }
         if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
             wake_owner = true;
@@ -439,6 +444,10 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
         if (storage_index >= kernel.process_count) continue;
         const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
         scheduler.wakeBlockedThreadForPrincipal(owner);
+    }
+    if (endpoint_targets_removed) {
+        kernel_state_global.bumpEndpointGeneration();
+        scheduler.invalidateAllIpcFastpathState();
     }
 
     _ = kernel_state_global.markProcessFaulted(principal, fault_vector);
@@ -467,11 +476,14 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     kernel_state_global.exec_image_tables[process_index] = .{};
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
+    var endpoint_targets_removed = false;
     var storage_index: usize = 0;
     while (storage_index < kernel.principal_count) : (storage_index += 1) {
         var wake_owner = false;
         if (storage_index < kernel.process_count) {
-            wake_owner = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+            const removed = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+            if (removed) endpoint_targets_removed = true;
+            wake_owner = removed;
         }
         if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
             wake_owner = true;
@@ -486,6 +498,10 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
         if (storage_index >= kernel.process_count) continue;
         const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
         scheduler.wakeBlockedThreadForPrincipal(owner);
+    }
+    if (endpoint_targets_removed) {
+        kernel_state_global.bumpEndpointGeneration();
+        scheduler.invalidateAllIpcFastpathState();
     }
 
     _ = kernel_state_global.markProcessExited(principal);
@@ -722,7 +738,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     );
     const init_thread = scheduler.threadSlotForPrincipal(init_principal).?;
     const init_ctx = scheduler.getThreadContext(init_thread).?;
-    if (init_ctx.ready) {
+    if (scheduler.isThreadReady(init_thread)) {
         init_ctx.frame.rip = loaded_init.entry;
         init_ctx.frame.rsp = boot_static.user_entry_rsp;
     }
@@ -737,6 +753,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 
 fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
     spawn.init(state, &global_free_list, user_spaces, boot_init_principal);
+    process_builder.init(state, &global_free_list, user_spaces);
 
     syscalls.init(.{
         .state = state,

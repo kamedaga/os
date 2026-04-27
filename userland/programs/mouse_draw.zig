@@ -1,4 +1,5 @@
 const protocol = @import("support_root").window_protocol;
+const user_vm = @import("support_root").user_vm;
 const window_client = @import("support_root").window_client;
 
 const syscall_log: u64 = 0x9;
@@ -6,7 +7,6 @@ const syscall_log: u64 = 0x9;
 const shared_page_va: usize = 0x3C00_3000;
 const window_pixels_va: usize = 0x3C00_4000;
 const window_meta_shared_va: usize = 0x3C00_7000;
-const window_cap_tmp_va: u64 = 0x3C10_0000;
 const pixel_width: i32 = 32;
 const pixel_height: i32 = 32;
 const pixel_pitch: i32 = 32;
@@ -121,6 +121,10 @@ pub export fn _start() noreturn {
         _ = userLog("MouseDraw: shared magic mismatch\n");
         while (true) asm volatile ("pause");
     }
+    const window_cap_tmp_va: u64 = @intCast(user_vm.reservePages(1) orelse {
+        _ = userLog("MouseDraw: reserve cap tmp failed\n");
+        while (true) asm volatile ("pause");
+    });
 
     const window_created = window_client.createAndPublishWindowWithDma(
         @intCast(pixel_width),

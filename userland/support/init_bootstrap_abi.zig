@@ -17,9 +17,13 @@ pub const boot_log_page_length_offset: usize = 0;
 pub const boot_log_page_status_offset: usize = 4;
 
 /// Indices (in u64 words) within boot_display's config page for framebuffer metadata.
+pub const boot_display_config_width_index: u64 = 17;
+pub const boot_display_config_height_index: u64 = 18;
+pub const boot_display_config_pitch_index: u64 = 19;
 pub const boot_display_config_fb_paddr_index: u64 = 20;
 pub const boot_display_config_fb_size_bytes_index: u64 = 21;
 pub const boot_display_config_fb_vm_token_index: u64 = 22;
+pub const boot_display_config_pointer_shared_va_index: u64 = 23;
 
 pub const spawn_page_flag_kernel_backed: u64 = 1 << 0;
 pub const spawn_page_flag_mirror_to_boot_display: u64 = 1 << 1;

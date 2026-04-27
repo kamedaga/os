@@ -3,11 +3,11 @@ const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
 const process_abi = @import("support_root").process_abi;
 const mouse_input = @import("support_root").mouse_input;
+const user_vm = @import("support_root").user_vm;
 const window_client = @import("support_root").window_client;
 
 const window_pixels_va: usize = 0x3C00_4000;
 const window_meta_shared_va: usize = 0x3C00_7000;
-const window_cap_tmp_va: u64 = 0x3C00_8000;
 
 const pixel_width: usize = 16;
 const pixel_height: usize = 32;
@@ -91,6 +91,10 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
     var mouse_reader = mouse_input.Reader.init(0, 0);
+    const window_cap_tmp_va: u64 = @intCast(user_vm.reservePages(1) orelse {
+        _ = userLog("MouseButtonDemo: reserve cap tmp failed\n");
+        while (true) asm volatile ("pause");
+    });
 
     const window_created = window_client.createAndPublishWindow(
         @intCast(pixel_width),

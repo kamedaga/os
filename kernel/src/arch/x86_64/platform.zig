@@ -22,6 +22,9 @@ pub const gdt_kernel_data_selector: u16 = 0x10;
 pub const gdt_user_code_selector: u16 = 0x18;
 pub const gdt_user_data_selector: u16 = 0x20;
 pub const gdt_tss_selector: u16 = 0x28;
+pub const gdt_sysret_user_base_selector: u16 = 0x30;
+pub const gdt_sysret_user_data_selector: u16 = 0x38;
+pub const gdt_sysret_user_code_selector: u16 = 0x40;
 
 pub const page_present: u64 = 1 << 0;
 pub const page_rw: u64 = 1 << 1;
@@ -71,14 +74,16 @@ var high_mmio_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entri
 var high_mmio_pd_tables: [high_mmio_pdp_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_mmio_pdp_table_count;
 pub var phys_copy_window_pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
-var gdt: [7]u64 align(16) = .{
+var gdt: [9]u64 align(16) = .{
     0x0000000000000000,
     0x00AF9A000000FFFF,
     0x00AF92000000FFFF,
     0x00AFFA000000FFFF,
-    0x00AFF2000000FFFF,
+    0x00CFF2000000FFFF,
     0x0000000000000000,
     0x0000000000000000,
+    0x00CFF2000000FFFF,
+    0x00AFFA000000FFFF,
 };
 var ring0_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var pf_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
@@ -106,6 +111,94 @@ var np_trampoline_entry: usize = 0;
 var ss_trampoline_entry: usize = 0;
 var timer_trampoline_entry: usize = 0;
 pub export var kernel_cr3_value: u64 = 0;
+pub export var kernel_syscall_stack_top: u64 = 0;
+pub export var pcid_enabled: u64 = 0;
+
+const msr_efer: u32 = 0xC000_0080;
+const msr_star: u32 = 0xC000_0081;
+const msr_lstar: u32 = 0xC000_0082;
+const msr_fmask: u32 = 0xC000_0084;
+const efer_sce: u64 = 1 << 0;
+const cr4_pge: u64 = 1 << 7;
+const cr4_pcide: u64 = 1 << 17;
+const cpuid_leaf1_ecx_pcid: u32 = 1 << 17;
+const cr3_addr_mask: u64 = 0x000f_ffff_ffff_f000;
+const cr3_no_flush: u64 = 1 << 63;
+
+fn cpuid(leaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+    var eax: u32 = 0;
+    var ebx: u32 = 0;
+    var ecx: u32 = 0;
+    var edx: u32 = 0;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (@as(u32, 0)),
+    );
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+fn readCr4() u64 {
+    var value: u64 = 0;
+    asm volatile ("mov %%cr4, %[out]"
+        : [out] "=r" (value),
+    );
+    return value;
+}
+
+fn writeCr4(value: u64) void {
+    asm volatile ("mov %[value], %%cr4"
+        :
+        : [value] "r" (value),
+        : .{ .memory = true });
+}
+
+pub fn enablePcidIfSupported() bool {
+    const features = cpuid(1);
+    if ((features.ecx & cpuid_leaf1_ecx_pcid) == 0) return false;
+    if ((readCr3() & 0xfff) != 0) return false;
+
+    var cr4 = readCr4();
+    cr4 |= cr4_pge;
+    writeCr4(cr4);
+    cr4 |= cr4_pcide;
+    writeCr4(cr4);
+    pcid_enabled = 1;
+    return true;
+}
+
+pub fn cr3AddressPart(value: u64) u64 {
+    return value & cr3_addr_mask;
+}
+
+pub fn cr3WithUserPcid(raw_cr3: u64, pcid: u16) u64 {
+    const raw = cr3AddressPart(raw_cr3);
+    if (pcid_enabled == 0 or pcid == 0) return raw;
+    return raw | (@as(u64, pcid) & 0xfff) | cr3_no_flush;
+}
+
+fn readMsr(msr: u32) u64 {
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    asm volatile ("rdmsr"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+        : [msr] "{ecx}" (msr),
+    );
+    return (@as(u64, hi) << 32) | @as(u64, lo);
+}
+
+fn writeMsr(msr: u32, value: u64) void {
+    asm volatile ("wrmsr"
+        :
+        : [msr] "{ecx}" (msr),
+          [lo] "{eax}" (@as(u32, @truncate(value))),
+          [hi] "{edx}" (@as(u32, @truncate(value >> 32))),
+        : .{ .memory = true });
+}
 
 fn writeU64LEBytes(ptr: [*]u8, offset: usize, value: u64) void {
     var i: usize = 0;
@@ -183,6 +276,16 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     interrupts.loadIdt(&idt);
 }
 
+pub fn installSyscallEntry(target: usize) void {
+    const star = (@as(u64, gdt_sysret_user_base_selector | 0x3) << 48) |
+        (@as(u64, gdt_kernel_code_selector) << 32);
+    const fmask: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18);
+    writeMsr(msr_star, star);
+    writeMsr(msr_lstar, @as(u64, @intCast(target)));
+    writeMsr(msr_fmask, fmask);
+    writeMsr(msr_efer, readMsr(msr_efer) | efer_sce);
+}
+
 pub fn readCr2() u64 {
     var value: u64 = 0;
     asm volatile ("mov %%cr2, %[out]"
@@ -195,8 +298,7 @@ pub fn writeCr3(value: u64) void {
     asm volatile ("mov %[value], %%cr3"
         :
         : [value] "r" (value),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 pub fn readCr3() u64 {
@@ -211,8 +313,7 @@ pub fn invlpg(addr: u64) void {
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (addr),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 pub fn stackTop(region: []u8, usable_bytes: usize) u64 {
@@ -361,6 +462,7 @@ pub fn loadGdtAndReloadSegments() void {
     const tss_base = @intFromPtr(&tss);
     const tss_limit: u64 = @sizeOf(Tss) - 1;
     tss.rsp0 = stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes);
+    kernel_syscall_stack_top = tss.rsp0;
     tss.ist1 = stackTop(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes);
     tss.ist2 = stackTop(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes);
     tss.iomap_base = @sizeOf(Tss);
@@ -379,8 +481,7 @@ pub fn loadGdtAndReloadSegments() void {
     asm volatile ("lgdt (%[ptr])"
         :
         : [ptr] "r" (&gdt_ptr),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 
     asm volatile (
         \\pushq %[kcs]
@@ -394,15 +495,13 @@ pub fn loadGdtAndReloadSegments() void {
         :
         : [kcs] "i" (@as(u64, gdt_kernel_code_selector)),
           [kds] "i" (gdt_kernel_data_selector),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     asm volatile (
         \\mov %[tss_sel], %%ax
         \\ltr %%ax
         :
         : [tss_sel] "i" (gdt_tss_selector),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 pub fn ring0StackTop() u64 {

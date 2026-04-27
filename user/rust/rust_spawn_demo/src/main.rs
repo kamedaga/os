@@ -9,8 +9,8 @@ use core::fmt::Write;
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use rt_alloc as _;
+use rt_core::SyscallError;
 use rt_core::entry_point;
-use rt_core::{SyscallError, syscall};
 use rt_handle::{
     ExecImageRights, ExecImageToken, SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE, SpawnBuilder,
     VmObjectRights, VmObjectToken, fixed_va,
@@ -27,16 +27,6 @@ const CONFIG_IDX_STATE: usize = 2;
 const CONFIG_IDX_REMAINING_DEPTH: usize = 3;
 const CONFIG_IDX_VM_OBJECT_TOKEN: usize = 4;
 const CONFIG_IDX_LINEAGE: usize = 5;
-const CONFIG_PAGE_SOURCE_CANDIDATES: [u64; 8] = [
-    0x3F10_0000,
-    0x3F10_1000,
-    0x3F10_2000,
-    0x3F10_3000,
-    0x3F10_4000,
-    0x3F10_5000,
-    0x3F10_6000,
-    0x3F10_7000,
-];
 
 struct DemoConfig {
     state: u64,
@@ -114,18 +104,7 @@ fn init_demo_config_page(
 }
 
 fn alloc_owned_config_source_page() -> Result<u64, SyscallError> {
-    let mut last_error = SyscallError::Map;
-    for candidate_va in CONFIG_PAGE_SOURCE_CANDIDATES {
-        let status = syscall::call4(syscall::ALLOC_MAP_PAGES, candidate_va, 1, 1, 0);
-        if status == syscall::OK {
-            return Ok(candidate_va);
-        }
-        let err = SyscallError::from_error_raw(status);
-        if err != SyscallError::Map {
-            last_error = err;
-        }
-    }
-    Err(last_error)
+    Ok(rt_core::vm::alloc_map_page(true)?.va())
 }
 
 fn log_and_abort(mut message: String) -> ! {

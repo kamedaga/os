@@ -1,10 +1,10 @@
 #![no_std]
 
 use core::mem::size_of;
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_bytes, write_volatile};
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use rt_core::syscall;
+use rt_core::{SyscallError, syscall, vm};
 use rt_handle::{ServiceKind, snapshot_service_registry_shadow};
 
 pub mod protocol {
@@ -145,8 +145,6 @@ pub mod protocol {
 }
 
 const PAGE_BYTES: usize = 4096;
-const DEFAULT_REQUEST_VA: u64 = 0x3C12_0000;
-const DEFAULT_RESPONSE_VA: u64 = 0x3C12_1000;
 const DEFAULT_RESPONSE_POLL_LIMIT: u64 = 4096;
 const PAGE_RIGHT_CPU_READ: u64 = 0x1;
 const PAGE_RIGHT_CPU_WRITE: u64 = 0x2;
@@ -258,13 +256,15 @@ impl Client {
         }
         .ok_or(Error::MissingService)?;
 
-        Self::connect(ConnectOptions {
-            request_va: DEFAULT_REQUEST_VA,
-            response_va: DEFAULT_RESPONSE_VA,
-            endpoint_id: binding.endpoint_id,
-            server_process_slot: binding.process_slot,
-            response_poll_limit: DEFAULT_RESPONSE_POLL_LIMIT,
-        })
+        let request = vm::alloc_map_page(true).map_err(map_request_page_error)?;
+        let response = vm::alloc_map_page(true).map_err(map_response_page_error)?;
+        Self::connect_mapped(
+            request,
+            response,
+            binding.endpoint_id,
+            binding.process_slot,
+            DEFAULT_RESPONSE_POLL_LIMIT,
+        )
     }
 
     pub fn connect(options: ConnectOptions) -> Result<Self, Error> {
@@ -307,6 +307,49 @@ impl Client {
             next_seq: 1,
             request_shared: false,
             response_poll_limit: options.response_poll_limit,
+        };
+        client.clear_pages();
+        Ok(client)
+    }
+
+    fn connect_mapped(
+        request: vm::MappedPage,
+        response: vm::MappedPage,
+        endpoint_id: u64,
+        server_process_slot: u64,
+        response_poll_limit: u64,
+    ) -> Result<Self, Error> {
+        if endpoint_id == 0 || server_process_slot == 0 {
+            return Err(Error::EndpointNotFound);
+        }
+        if syscall::call3(
+            syscall::INSTALL_ENDPOINT,
+            0,
+            endpoint_id,
+            server_process_slot,
+        ) != syscall::OK
+        {
+            return Err(Error::EndpointInstallFailed);
+        }
+        let rights = PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE;
+        if syscall::call3(
+            syscall::GRANT_CAP_ON_ENDPOINT,
+            response.paddr(),
+            endpoint_id,
+            rights,
+        ) != syscall::OK
+        {
+            return Err(Error::ResponseGrantFailed);
+        }
+        let client = Self {
+            request_va: request.va(),
+            response_va: response.va(),
+            request_paddr: request.paddr(),
+            response_paddr: response.paddr(),
+            endpoint_id,
+            next_seq: 1,
+            request_shared: false,
+            response_poll_limit,
         };
         client.clear_pages();
         Ok(client)
@@ -527,6 +570,22 @@ fn alloc_page() -> Option<u64> {
     if raw < 0x1000 { None } else { Some(raw) }
 }
 
+fn map_request_page_error(err: SyscallError) -> Error {
+    match err {
+        SyscallError::Alloc => Error::RequestAllocFailed,
+        SyscallError::Map => Error::RequestMapFailed,
+        _ => Error::RequestMapFailed,
+    }
+}
+
+fn map_response_page_error(err: SyscallError) -> Error {
+    match err {
+        SyscallError::Alloc => Error::ResponseAllocFailed,
+        SyscallError::Map => Error::ResponseMapFailed,
+        _ => Error::ResponseMapFailed,
+    }
+}
+
 fn map_page(va: u64, paddr: u64, writable: bool) -> Result<(), ()> {
     let flags = if writable { 1 } else { 0 };
     if syscall::call3(syscall::MAP_PAGE, va, paddr, flags) == syscall::OK {
@@ -537,7 +596,12 @@ fn map_page(va: u64, paddr: u64, writable: bool) -> Result<(), ()> {
 }
 
 fn clear_page(va: u64) {
-    unsafe { write_bytes(va as *mut u8, 0, PAGE_BYTES) };
+    let bytes = va as *mut u8;
+    let mut index = 0usize;
+    while index < PAGE_BYTES {
+        unsafe { write_volatile(bytes.add(index), 0) };
+        index += 1;
+    }
 }
 
 fn copy_bytes_to_volatile(dst: *mut u8, src: &[u8]) {

@@ -7,10 +7,13 @@ const cap_transfer_abi = abi_root.cap_transfer_abi;
 const image_abi = abi_root.image_abi;
 const user_vm = @import("memory/user_vm.zig");
 const process_abi = abi_root.process_abi;
+const process_builder_abi = abi_root.process_builder_abi;
 const queue_abi = abi_root.queue_abi;
 const untyped_memory = @import("untyped_memory.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
+const x86_platform = @import("arch/x86_64/platform.zig");
+const process_builder = @import("runtime/process_builder.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 
@@ -58,6 +61,7 @@ const syscall_install_caps_batch: u64 = 0x32;
 const syscall_publish_service_endpoint: u64 = 0x33;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
 const syscall_get_memory_stats: u64 = 0x3C;
+const syscall_ipc_call_reply_recv: u64 = 0x40;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -74,6 +78,8 @@ const syscall_err_revoke: u64 = 10;
 const syscall_err_grant: u64 = 11;
 const syscall_err_empty: u64 = 13;
 const syscall_alloc_map_drop_cap_flag: u64 = 0x2;
+const ipc_call_flag_retain_sender: u64 = 0x1;
+const ipc_call_flag_signal_only: u64 = 0x2;
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -109,6 +115,12 @@ pub const Hooks = struct {
 
 var hooks: ?Hooks = null;
 pub export var syscall_return_writeback_enabled: u64 = 1;
+const syscall_fast_handled_mask: u64 = 1 << 63;
+
+const IpcSignalTarget = struct {
+    principal: kernel.PrincipalId,
+    thread_index: usize,
+};
 
 pub fn init(new_hooks: Hooks) void {
     hooks = new_hooks;
@@ -237,6 +249,445 @@ fn transferPageCapOnEndpoint(
     return syscall_ok;
 }
 
+fn dispatchIpcSyscall(
+    h: *const Hooks,
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    frame: *TrapFrame,
+) ?u64 {
+    return switch (frame.rax) {
+        syscall_send_cap => transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, false),
+        syscall_share_cap => transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, true),
+        syscall_recv_cap => blk: {
+            const received = state.recvCap(proc) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
+                else => break :blk syscall_err_send,
+            };
+            break :blk received;
+        },
+        syscall_accept_cap_transfer => blk: {
+            const received = state.acceptCapTransfer(proc, frame.rdi) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
+                kernel.KernelError.InvalidState => break :blk syscall_err_invalid,
+                kernel.KernelError.CapabilityNotFound => break :blk syscall_err_send,
+                kernel.KernelError.TableFull => break :blk syscall_err_alloc,
+                else => break :blk syscall_err_send,
+            };
+            break :blk received;
+        },
+        syscall_signal_endpoint => blk: {
+            break :blk signalEndpointMessage(state, proc, frame.rdi, false, 0, 0, 0, 0);
+        },
+        syscall_wait_event => blk: {
+            const wait_mailbox = (frame.rdi & 0x1) != 0;
+            const timeout_ticks = frame.rsi;
+            if (wait_mailbox) {
+                const received = state.recvCap(proc) catch |err| switch (err) {
+                    kernel.KernelError.MailboxEmpty => 0,
+                    else => break :blk syscall_err_send,
+                };
+                if (received >= cap_transfer_abi.transfer_id_min) break :blk received;
+            }
+            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) break :blk syscall_ok;
+            if (h.consume_pending_signal_for_principal(proc)) break :blk syscall_ok;
+            if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
+                break :blk syscall_err_not_ready;
+            }
+            break :blk syscall_ok;
+        },
+        syscall_ipc_call_reply_recv => blk: {
+            const endpoint_id = frame.rsi;
+            const flags = frame.rdx;
+            const signal_only = (flags & ipc_call_flag_signal_only) != 0;
+            if (signal_only) {
+                const status = signalEndpointMessage(state, proc, endpoint_id, true, frame.rdi, frame.r8, frame.r9, frame.r10);
+                if (status != syscall_ok) break :blk status;
+            } else {
+                const status = transferPageCapOnEndpoint(
+                    state,
+                    h,
+                    proc,
+                    endpoint_id,
+                    frame.rdi,
+                    (flags & ipc_call_flag_retain_sender) != 0,
+                );
+                if (status != syscall_ok) break :blk status;
+            }
+            if (!signal_only) {
+                const received = state.recvCap(proc) catch |err| switch (err) {
+                    kernel.KernelError.MailboxEmpty => 0,
+                    else => break :blk syscall_err_send,
+                };
+                if (received >= cap_transfer_abi.transfer_id_min) break :blk received;
+            }
+            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) break :blk syscall_ok;
+            if (h.consume_pending_signal_for_principal(proc)) break :blk syscall_ok;
+            if (!h.block_current_thread_for_event(frame, !signal_only, 0, syscall_ok)) {
+                break :blk syscall_err_not_ready;
+            }
+            break :blk syscall_ok;
+        },
+        else => null,
+    };
+}
+
+pub export fn syscallIpcDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    const h = getHooks();
+    const entry_thread = scheduler.current_thread_index;
+    syscall_return_writeback_enabled = 1;
+    defer {
+        if (scheduler.current_thread_index != entry_thread) {
+            syscall_return_writeback_enabled = 0;
+        }
+    }
+    if (!h.kernel_state_ready.*) return syscall_err_not_ready;
+
+    const state = h.state;
+    const proc = scheduler.current_user_principal;
+    return dispatchIpcSyscall(h, state, proc, frame) orelse syscall_err_invalid;
+}
+
+pub export fn syscallIpcCallReplyRecvSignalOnlyDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    const h = getHooks();
+    const entry_thread = scheduler.current_thread_index;
+    syscall_return_writeback_enabled = 1;
+    defer {
+        if (scheduler.current_thread_index != entry_thread) {
+            syscall_return_writeback_enabled = 0;
+        }
+    }
+    if (!h.kernel_state_ready.*) return syscall_err_not_ready;
+
+    const proc = scheduler.current_user_principal;
+    const status = signalEndpointMessage(h.state, proc, frame.rsi, true, frame.rdi, frame.r8, frame.r9, frame.r10);
+    if (status != syscall_ok) return status;
+    if (consumeQueuedIpcMessageForPrincipal(proc, frame)) return syscall_ok;
+    if (h.consume_pending_signal_for_principal(proc)) return syscall_ok;
+    if (!h.block_current_thread_for_event(frame, false, 0, syscall_ok)) return syscall_err_not_ready;
+    return syscall_ok;
+}
+
+const IpcSignalSave = extern struct {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    rip: u64,
+    rflags: u64,
+    rsp: u64,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+};
+
+fn trapFrameFromIpcSignalSave(save: *const IpcSignalSave, rax: u64) TrapFrame {
+    return .{
+        .r15 = save.r15,
+        .r14 = save.r14,
+        .r13 = save.r13,
+        .r12 = save.r12,
+        .r11 = save.rflags,
+        .r10 = 0,
+        .r9 = 0,
+        .r8 = 0,
+        .rbp = save.rbp,
+        .rdi = 0,
+        .rsi = 0,
+        .rdx = 0,
+        .rcx = save.rip,
+        .rbx = save.rbx,
+        .rax = rax,
+        .rip = save.rip,
+        .cs = @as(u64, x86_platform.gdt_user_code_selector) | 0x3,
+        .rflags = save.rflags,
+        .rsp = save.rsp,
+        .ss = @as(u64, x86_platform.gdt_user_data_selector) | 0x3,
+    };
+}
+
+fn saveIpcSignalFrameToContext(ctx: *scheduler.ThreadContext, save: *const IpcSignalSave, rax: u64) void {
+    ctx.frame.r15 = save.r15;
+    ctx.frame.r14 = save.r14;
+    ctx.frame.r13 = save.r13;
+    ctx.frame.r12 = save.r12;
+    ctx.frame.rbp = save.rbp;
+    ctx.frame.rcx = save.rip;
+    ctx.frame.rbx = save.rbx;
+    ctx.frame.rax = rax;
+    ctx.frame.rip = save.rip;
+    ctx.frame.rflags = save.rflags;
+    ctx.frame.rsp = save.rsp;
+}
+
+fn deliverIpcSignalMessageToContext(ctx: *scheduler.ThreadContext, save: *const IpcSignalSave) void {
+    ctx.frame.rax = syscall_ok;
+    ctx.frame.rdi = save.mr0;
+    ctx.frame.rsi = save.mr1;
+    ctx.frame.rdx = save.mr2;
+    ctx.frame.r8 = save.mr3;
+}
+
+fn deliverIpcMessageToContext(ctx: *scheduler.ThreadContext, mr0: u64, mr1: u64, mr2: u64, mr3: u64) void {
+    ctx.frame.rax = syscall_ok;
+    ctx.frame.rdi = mr0;
+    ctx.frame.rsi = mr1;
+    ctx.frame.rdx = mr2;
+    ctx.frame.r8 = mr3;
+}
+
+fn applyQueuedIpcMessageToFrame(frame: *TrapFrame, msg: scheduler.IpcQueuedMessage) void {
+    frame.rax = syscall_ok;
+    frame.rdi = msg.mr0;
+    frame.rsi = msg.mr1;
+    frame.rdx = msg.mr2;
+    frame.r8 = msg.mr3;
+}
+
+fn grantQueuedReplyToken(receiver_thread: usize, msg: scheduler.IpcQueuedMessage) void {
+    if (!msg.grants_reply) return;
+    scheduler.setIpcReplyTokenForThread(receiver_thread, true, msg.sender_thread);
+}
+
+fn consumeQueuedIpcMessageForThread(thread_index: usize, frame: *TrapFrame) bool {
+    if (scheduler.dequeueIpcMessageForThread(thread_index)) |msg| {
+        grantQueuedReplyToken(thread_index, msg);
+        applyQueuedIpcMessageToFrame(frame, msg);
+        return true;
+    }
+    return false;
+}
+
+fn consumeQueuedIpcMessageForPrincipal(principal: kernel.PrincipalId, frame: *TrapFrame) bool {
+    const thread_index = scheduler.threadSlotForPrincipal(principal) orelse return false;
+    return consumeQueuedIpcMessageForThread(thread_index, frame);
+}
+
+fn writeCurrentIpcSignalQueuedReturn(out_frame: *TrapFrame, save: *const IpcSignalSave, msg: scheduler.IpcQueuedMessage) usize {
+    out_frame.* = trapFrameFromIpcSignalSave(save, syscall_ok);
+    grantQueuedReplyToken(scheduler.current_thread_index, msg);
+    applyQueuedIpcMessageToFrame(out_frame, msg);
+    return @intFromPtr(out_frame);
+}
+
+fn writeCurrentIpcSignalReturn(out_frame: *TrapFrame, save: *const IpcSignalSave, rax: u64) usize {
+    out_frame.* = trapFrameFromIpcSignalSave(save, rax);
+    return @intFromPtr(out_frame);
+}
+
+fn deliverOrQueueIpcMessageToThread(
+    target_thread: usize,
+    endpoint_id: u64,
+    sender_thread: usize,
+    grants_reply: bool,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+) u64 {
+    const target_ctx = scheduler.getThreadContext(target_thread) orelse return syscall_err_endpoint;
+    const target_hot = scheduler.getIpcHotThreadConst(target_thread) orelse return syscall_err_endpoint;
+    if (target_hot.allocated == 0) return syscall_err_endpoint;
+    if (target_hot.ready == 0) {
+        target_ctx.wait_mailbox = false;
+        target_ctx.wake_tick = 0;
+        target_ctx.ready = true;
+        scheduler.setIpcHotWaitState(target_thread, false, 0, true);
+        if (grants_reply) {
+            scheduler.setIpcReplyTokenForThread(target_thread, true, sender_thread);
+        }
+        deliverIpcMessageToContext(target_ctx, mr0, mr1, mr2, mr3);
+        scheduler.preferIpcSwitchToThread(target_thread);
+        return syscall_ok;
+    }
+    if (!scheduler.enqueueIpcMessageForThread(target_thread, endpoint_id, sender_thread, grants_reply, mr0, mr1, mr2, mr3)) {
+        return syscall_err_not_ready;
+    }
+    scheduler.preferIpcSwitchToThread(target_thread);
+    return syscall_ok;
+}
+
+fn signalEndpointMessage(
+    state: *kernel.KernelState,
+    owner: kernel.PrincipalId,
+    endpoint_id: u64,
+    grants_reply: bool,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+) u64 {
+    const target_principal = state.endpointTargetFor(owner, endpoint_id) orelse return syscall_err_endpoint;
+    const target_thread = scheduler.threadSlotForPrincipal(target_principal) orelse return syscall_err_endpoint;
+    return deliverOrQueueIpcMessageToThread(
+        target_thread,
+        endpoint_id,
+        scheduler.current_thread_index,
+        grants_reply,
+        mr0,
+        mr1,
+        mr2,
+        mr3,
+    );
+}
+
+fn resolveIpcSignalTargetThread(
+    state: *const kernel.KernelState,
+    current_ctx: *scheduler.ThreadContext,
+    owner: kernel.PrincipalId,
+    endpoint_id: u64,
+) ?IpcSignalTarget {
+    _ = current_ctx;
+    const generation = state.endpoint_generation;
+    const current_thread = scheduler.current_thread_index;
+    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return null;
+    if (current_hot.ipc_cached_endpoint_generation == generation and
+        current_hot.ipc_cached_endpoint_id == endpoint_id)
+    {
+        return .{
+            .principal = current_hot.ipc_cached_target,
+            .thread_index = current_hot.ipc_cached_target_thread,
+        };
+    }
+
+    const target = state.endpointTargetFor(owner, endpoint_id) orelse return null;
+    const thread_index = scheduler.threadSlotForPrincipal(target) orelse return null;
+    scheduler.setIpcEndpointCacheForThread(current_thread, generation, endpoint_id, target, thread_index);
+    return .{ .principal = target, .thread_index = thread_index };
+}
+
+pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *const IpcSignalSave, out_frame: *TrapFrame) callconv(.c) usize {
+    const h = getHooks();
+    if (!h.kernel_state_ready.*) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+
+    const proc = scheduler.current_user_principal;
+    const current_thread = scheduler.current_thread_index;
+    const current_ctx = scheduler.getThreadContext(current_thread) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+    const target = resolveIpcSignalTargetThread(h.state, current_ctx, proc, endpoint_id) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    const target_ctx = scheduler.getThreadContext(target.thread_index) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+    const target_hot = scheduler.getIpcHotThreadConst(target.thread_index) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    if (target_hot.allocated == 0 or target_hot.owner_process != target.principal) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    if (target.thread_index == current_thread) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+
+    const is_reply = current_hot.ipc_reply_token_valid != 0;
+    if (is_reply) {
+        if (current_hot.ipc_reply_token_target_thread != target.thread_index) {
+            return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+        }
+        scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
+    }
+
+    const target_was_ready = target_hot.ready != 0;
+    const send_status = deliverOrQueueIpcMessageToThread(
+        target.thread_index,
+        endpoint_id,
+        current_thread,
+        true,
+        save.mr0,
+        save.mr1,
+        save.mr2,
+        save.mr3,
+    );
+    if (send_status != syscall_ok) return writeCurrentIpcSignalReturn(out_frame, save, send_status);
+
+    if (scheduler.dequeueIpcMessageForThread(current_thread)) |msg| {
+        return writeCurrentIpcSignalQueuedReturn(out_frame, save, msg);
+    }
+
+    if (current_hot.signal_pending != 0) {
+        current_ctx.signal_pending = false;
+        scheduler.setIpcHotSignalPending(current_thread, false);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_ok);
+    }
+
+    if (current_hot.allocated == 0) {
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+    }
+    if (target_was_ready) {
+        out_frame.* = trapFrameFromIpcSignalSave(save, syscall_ok);
+        if (!scheduler.blockCurrentThreadForEvent(out_frame, false, 0, syscall_ok)) {
+            return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+        }
+        return @intFromPtr(out_frame);
+    }
+
+    saveIpcSignalFrameToContext(current_ctx, save, syscall_ok);
+    current_ctx.cr3 = scheduler.user_cr3_value;
+    current_ctx.wait_mailbox = false;
+    current_ctx.wake_tick = 0;
+    current_ctx.ready = false;
+    scheduler.setIpcHotCr3(current_thread, scheduler.user_cr3_value);
+    scheduler.setIpcHotWaitState(current_thread, false, 0, false);
+
+    scheduler.current_thread_index = target.thread_index;
+    scheduler.current_user_principal = target.principal;
+    scheduler.user_cr3_value = target_hot.cr3;
+
+    return @intFromPtr(&target_ctx.frame);
+}
+
+pub export fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) callconv(.c) u64 {
+    const h = getHooks();
+    if (!h.kernel_state_ready.*) return syscall_fast_handled_mask | syscall_err_not_ready;
+
+    const state = h.state;
+    const proc = scheduler.current_user_principal;
+    const result: u64 = switch (nr) {
+        syscall_send_cap => transferPageCapOnEndpoint(state, h, proc, arg1, arg0, false),
+        syscall_share_cap => transferPageCapOnEndpoint(state, h, proc, arg1, arg0, true),
+        syscall_recv_cap => blk: {
+            const received = state.recvCap(proc) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
+                else => break :blk syscall_err_send,
+            };
+            break :blk received;
+        },
+        syscall_accept_cap_transfer => blk: {
+            const received = state.acceptCapTransfer(proc, arg0) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
+                kernel.KernelError.InvalidState => break :blk syscall_err_invalid,
+                kernel.KernelError.CapabilityNotFound => break :blk syscall_err_send,
+                kernel.KernelError.TableFull => break :blk syscall_err_alloc,
+                else => break :blk syscall_err_send,
+            };
+            break :blk received;
+        },
+        syscall_signal_endpoint => blk: {
+            break :blk signalEndpointMessage(state, proc, arg0, false, 0, 0, 0, 0);
+        },
+        syscall_ipc_call_reply_recv => blk: {
+            const endpoint_id = arg1;
+            const flags = arg2;
+            const to = state.endpointTargetFor(proc, endpoint_id) orelse break :blk syscall_err_endpoint;
+            if (to != proc) return 0;
+            if ((flags & ipc_call_flag_signal_only) != 0) {
+                h.wake_blocked_thread_for_principal(to);
+                if (h.consume_pending_signal_for_principal(proc)) break :blk syscall_ok;
+                break :blk syscall_err_not_ready;
+            }
+            const status = transferPageCapOnEndpoint(
+                state,
+                h,
+                proc,
+                endpoint_id,
+                arg0,
+                (flags & ipc_call_flag_retain_sender) != 0,
+            );
+            if (status != syscall_ok) break :blk status;
+            const received = state.recvCap(proc) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
+                else => break :blk syscall_err_send,
+            };
+            break :blk received;
+        },
+        else => syscall_err_invalid,
+    };
+    return syscall_fast_handled_mask | result;
+}
+
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
     const h = getHooks();
     const entry_thread = scheduler.current_thread_index;
@@ -253,6 +704,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
 
     const state = h.state;
     const proc = scheduler.current_user_principal;
+    if (dispatchIpcSyscall(h, state, proc, frame)) |result| return result;
     if (h.scheduler_log_int80 and scheduler.scheduler_int80_log_count < h.scheduler_int80_log_max_lines) {
         h.write("INT80 dispatch ");
         h.write(h.thread_label(scheduler.current_thread_index));
@@ -575,9 +1027,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return syscall_ok;
         },
         syscall_signal_endpoint => {
-            const to = state.endpointTargetFor(proc, frame.rdi) orelse return syscall_err_endpoint;
-            h.wake_blocked_thread_for_principal(to);
-            return syscall_ok;
+            return signalEndpointMessage(state, proc, frame.rdi, false, 0, 0, 0, 0);
         },
         syscall_get_tick_count => {
             return scheduler.lapic_tick_count;
@@ -816,6 +1266,9 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                     return received;
                 }
             }
+            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+                return syscall_ok;
+            }
             if (h.consume_pending_signal_for_principal(proc)) {
                 return syscall_ok;
             }
@@ -826,6 +1279,8 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_revoke_tree => {
             state.revokeCapTree(proc, frame.rdi) catch return syscall_err_revoke;
+            state.bumpEndpointGeneration();
+            scheduler.invalidateAllIpcFastpathState();
             h.write("revoke_tree by=");
             h.write(h.principal_label(proc));
             h.write(" paddr=");
@@ -835,7 +1290,11 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return syscall_ok;
         },
         syscall_drop_present => {
-            if (capability.dropPresentForUserMappedPaddr(state, proc, frame.rdi)) return syscall_ok;
+            if (capability.dropPresentForUserMappedPaddr(state, proc, frame.rdi)) {
+                state.bumpEndpointGeneration();
+                scheduler.invalidateAllIpcFastpathState();
+                return syscall_ok;
+            }
             return syscall_err_drop_present;
         },
         syscall_switch_thread => {
@@ -847,8 +1306,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 return syscall_err_invalid;
             }
             const current_thread = scheduler.current_thread_index;
-            const target_ctx = scheduler.getThreadContextConst(target_thread).?;
-            if (!target_ctx.ready) {
+            if (!scheduler.isThreadReady(target_thread)) {
                 h.log_race_switch(current_thread, target_thread, "target_not_ready");
                 return syscall_err_not_ready;
             }
@@ -867,6 +1325,24 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_launch_pie_user => return h.launch_pie_user_thread(frame),
         process_abi.syscall_spawn_exec => return h.spawn_exec(frame),
+        process_builder_abi.syscall_create_suspended_process => {
+            return process_builder.createSuspendedProcess(proc);
+        },
+        process_builder_abi.syscall_map_vm_object_to_process => {
+            return process_builder.mapVmObjectToProcess(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx);
+        },
+        process_builder_abi.syscall_alloc_map_pages_to_process => {
+            return process_builder.allocMapPagesToProcess(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8);
+        },
+        process_builder_abi.syscall_set_process_initial_context => {
+            return process_builder.setInitialContext(proc, frame.rdi, frame.rsi, frame.rdx);
+        },
+        process_builder_abi.syscall_start_process => {
+            return process_builder.startProcess(proc, frame.rdi);
+        },
+        process_builder_abi.syscall_abort_process => {
+            return process_builder.abortProcess(proc, frame.rdi);
+        },
         syscall_log => {
             const req_len_u64 = frame.rsi;
             if (req_len_u64 == 0) return syscall_ok;

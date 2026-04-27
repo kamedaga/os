@@ -8,11 +8,14 @@ members = [
 
     # Public facade
     "cap_std",
+    "capfont",
     "caplibgl",
+    "cap_window",
     "capgl_shader_wave",
     "capwm_client",
     "capwm_smoke",
     "pachafetch",
+    "pitty",
     "pachaland_assets",
     "pitty_assets",
 

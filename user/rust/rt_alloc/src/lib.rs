@@ -42,8 +42,7 @@ fn syscall_is_error(value: u64) -> bool {
 }
 
 impl BumpAllocator {
-    fn map_until(&self, end_addr: usize) -> bool {
-        let state = unsafe { &mut *self.state.get() };
+    fn map_until_state(state: &mut AllocState, end_addr: usize) -> bool {
         while end_addr > state.end {
             let page_paddr = syscall::call0(syscall::ALLOC_PAGE);
             if syscall_is_error(page_paddr) {
@@ -79,7 +78,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
             Some(value) => value,
             None => return null_mut(),
         };
-        if !self.map_until(end_addr) {
+        if !Self::map_until_state(state, end_addr) {
             return null_mut();
         }
         state.next = end_addr;

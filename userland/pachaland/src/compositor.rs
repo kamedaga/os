@@ -15,6 +15,26 @@ const LOADING_GLOSS_PHASE_STEP: f32 = 0.095;
 const LOADING_GLOSS_STRENGTH: f32 = -0.78;
 const LOADING_GLOSS_CYCLES: f32 = 1.0;
 
+pub fn content_size_for_window_frame(size: Size) -> Size {
+    Size {
+        width: size.width.saturating_sub(WINDOW_BORDER * 2).max(1),
+        height: size
+            .height
+            .saturating_sub(TITLEBAR_HEIGHT + WINDOW_BORDER)
+            .max(1),
+    }
+}
+
+pub fn frame_size_for_content(size: Size) -> Size {
+    Size {
+        width: size.width.saturating_add(WINDOW_BORDER * 2).max(1),
+        height: size
+            .height
+            .saturating_add(TITLEBAR_HEIGHT + WINDOW_BORDER)
+            .max(1),
+    }
+}
+
 pub struct GpuCompositor {
     context: Option<caplibgl::Context>,
     features: u64,
@@ -250,14 +270,7 @@ fn draw_composited_window(
         x: window.position.x + WINDOW_BORDER as i32,
         y: window.position.y + TITLEBAR_HEIGHT as i32,
     };
-    let content_size = Size {
-        width: window.size.width.saturating_sub(WINDOW_BORDER * 2).max(1),
-        height: window
-            .size
-            .height
-            .saturating_sub(TITLEBAR_HEIGHT + WINDOW_BORDER)
-            .max(1),
-    };
+    let content_size = content_size_for_window_frame(window.size);
     if window.presented_frames == 0 {
         return draw_loading_placeholder(
             context,
@@ -268,8 +281,20 @@ fn draw_composited_window(
             scratch,
         );
     }
-    let vertices =
-        window_quad_vertices(target.width, target.height, content_position, content_size);
+    let draw_size = Size {
+        width: content_size.width.min(window.app_surface.size.width).max(1),
+        height: content_size
+            .height
+            .min(window.app_surface.size.height)
+            .max(1),
+    };
+    let vertices = window_quad_vertices(
+        target.width,
+        target.height,
+        content_position,
+        draw_size,
+        window.app_surface.size,
+    );
     context.gl_draw_vertices(
         caplibgl::Primitive::TriangleStrip,
         &vertices,
@@ -722,7 +747,8 @@ fn window_quad_vertices(
     target_width: u32,
     target_height: u32,
     position: Position,
-    surface_size: Size,
+    visible_size: Size,
+    texture_size: Size,
 ) -> [caplibgl::Vertex; 4] {
     let target_w = target_width.max(1) as f32;
     let target_h = target_height.max(1) as f32;
@@ -730,8 +756,12 @@ fn window_quad_vertices(
     let top_px = position.y.max(0) as u32;
     let max_w = target_width.saturating_sub(left_px).max(1);
     let max_h = target_height.saturating_sub(top_px).max(1);
-    let window_w = surface_size.width.min(max_w) as f32;
-    let window_h = surface_size.height.min(max_h) as f32;
+    let clipped_w = visible_size.width.min(max_w).max(1);
+    let clipped_h = visible_size.height.min(max_h).max(1);
+    let window_w = clipped_w as f32;
+    let window_h = clipped_h as f32;
+    let u1 = clipped_w as f32 / texture_size.width.max(1) as f32;
+    let v1 = clipped_h as f32 / texture_size.height.max(1) as f32;
     let left = left_px as f32;
     let top = top_px as f32;
     let right = left + window_w;
@@ -742,9 +772,9 @@ fn window_quad_vertices(
     let y1 = pixel_y_to_ndc(bottom, target_h);
     [
         vertex(x0, y0, 0.0, 0.0),
-        vertex(x0, y1, 0.0, 1.0),
-        vertex(x1, y0, 1.0, 0.0),
-        vertex(x1, y1, 1.0, 1.0),
+        vertex(x0, y1, 0.0, v1),
+        vertex(x1, y0, u1, 0.0),
+        vertex(x1, y1, u1, v1),
     ]
 }
 

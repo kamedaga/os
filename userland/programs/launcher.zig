@@ -2,17 +2,15 @@ const process_abi = @import("support_root").process_abi;
 const process_args_env_bootstrap_abi = @import("support_root").process_args_env_bootstrap_abi;
 const process_exit_bootstrap_abi = @import("support_root").process_exit_bootstrap_abi;
 const stdio_bootstrap_abi = @import("support_root").stdio_bootstrap_abi;
+const user_vm = @import("support_root").user_vm;
 const vfs_client = @import("support_root").vfs_client;
 
 const syscall_log: u64 = 0x9;
-const syscall_alloc_map_pages: u64 = 0xC;
 
 const launcher_process_slot: u64 = 9;
-const vfs_request_va: u64 = 0x3C10_4000;
-const vfs_response_va: u64 = 0x3C10_5000;
-const launcher_stdio_bootstrap_source_va: u64 = 0x3F10_8000;
-const launcher_exit_status_bootstrap_source_va: u64 = 0x3F10_9000;
-const launcher_args_env_bootstrap_source_va: u64 = 0x3F10_A000;
+var launcher_stdio_bootstrap_source_va: u64 = 0;
+var launcher_exit_status_bootstrap_source_va: u64 = 0;
+var launcher_args_env_bootstrap_source_va: u64 = 0;
 
 fn userLog(message: []const u8) u64 {
     return asm volatile (
@@ -24,32 +22,23 @@ fn userLog(message: []const u8) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_va: u64) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_alloc_map_pages),
-          [arg0] "{rdi}" (base_va),
-          [arg1] "{rsi}" (page_count),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-          [arg3] "{rcx}" (out_paddr_list_va),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
 fn ensureStdioBootstrapPage() bool {
-    if (allocMapPages(launcher_stdio_bootstrap_source_va, 1, true, 0) != 0) return false;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    launcher_stdio_bootstrap_source_va = @intCast(page.va);
     stdio_bootstrap_abi.initZeroPage(launcher_stdio_bootstrap_source_va);
     return true;
 }
 
 fn ensureExitStatusBootstrapPage() bool {
-    if (allocMapPages(launcher_exit_status_bootstrap_source_va, 1, true, 0) != 0) return false;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    launcher_exit_status_bootstrap_source_va = @intCast(page.va);
     process_exit_bootstrap_abi.initZeroPage(launcher_exit_status_bootstrap_source_va);
     return true;
 }
 
 fn ensureArgsEnvBootstrapPage() bool {
-    if (allocMapPages(launcher_args_env_bootstrap_source_va, 1, true, 0) != 0) return false;
+    const page = user_vm.allocMapPage(true) orelse return false;
+    launcher_args_env_bootstrap_source_va = @intCast(page.va);
     process_args_env_bootstrap_abi.initZeroPage(launcher_args_env_bootstrap_source_va);
     return true;
 }
@@ -98,9 +87,13 @@ pub export fn _start() noreturn {
         while (true) asm volatile ("pause");
     }
 
+    const ipc_va = user_vm.reservePages(2) orelse {
+        _ = userLog("Launcher: IPC VA reserve failed\n");
+        while (true) asm volatile ("pause");
+    };
     var client = vfs_client.Client.connect(.{
-        .request_va = vfs_request_va,
-        .response_va = vfs_response_va,
+        .request_va = @intCast(ipc_va),
+        .response_va = @intCast(ipc_va + user_vm.page_bytes),
         .client_process_slot = launcher_process_slot,
     }) catch {
         _ = userLog("Launcher: VFS connect failed\n");

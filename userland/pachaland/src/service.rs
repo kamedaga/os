@@ -1,24 +1,23 @@
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, Ordering};
 
-use capwm_client::protocol;
-use rt_core::syscall;
+use cap_window::protocol;
+use rt_core::{syscall, vm};
 
 use crate::server::Server;
 
 const CAP_TRANSFER_ID_MIN: u64 = 0x1000;
-const PAGE_BYTES: u64 = 4096;
-const SESSION_BASE_VA: u64 = 0x3C18_0000;
-const SESSION_STRIDE_BYTES: u64 = PAGE_BYTES * 2;
-const MAX_SESSIONS: usize = 16;
+const MAX_SESSIONS: usize = 64;
 const POINTER_POLL_TICKS: u64 = 1;
 
 #[derive(Copy, Clone)]
 struct Session {
+    active: bool,
     request_paddr: u64,
     response_paddr: u64,
+    session_nonce: u64,
     request_va: u64,
     response_va: u64,
     last_request_seq: u64,
@@ -51,8 +50,8 @@ impl ServiceHost {
                         .ok();
                 }
             }
-            self.process_sessions();
             self.server.pump_pointer();
+            self.process_sessions();
             if self.server.has_loading_windows() {
                 self.server.present_desktop();
             }
@@ -60,29 +59,53 @@ impl ServiceHost {
     }
 
     fn accept_request_page(&mut self, request_paddr: u64) {
-        if self
-            .sessions
-            .iter()
-            .any(|session| session.request_paddr == request_paddr)
-        {
-            return;
+        for session in &mut self.sessions {
+            if session.active && session.request_paddr == request_paddr {
+                session.active = false;
+            }
         }
         if self.sessions.len() >= MAX_SESSIONS {
             cap_std::println!("pachaland: client session table full").ok();
             return;
         }
-        let index = self.sessions.len() as u64;
-        let request_va = SESSION_BASE_VA + index * SESSION_STRIDE_BYTES;
-        let response_va = request_va + PAGE_BYTES;
-        if map_page(request_va, request_paddr, false).is_err() {
+        let request_page = match vm::map_page_at_dynamic_va(request_paddr, false) {
+            Ok(page) => page,
+            Err(_) => {
+                cap_std::println!("pachaland: map request page failed").ok();
+                return;
+            }
+        };
+        let request_va = request_page.va();
+        if request_va == 0 {
             cap_std::println!("pachaland: map request page failed").ok();
             return;
         }
+        let request = unsafe { read_volatile(request_va as *const protocol::RequestHeader) };
+        if request.magic != protocol::REQUEST_MAGIC
+            || request.version != protocol::VERSION
+            || request.request_seq == 0
+            || request.response_paddr < CAP_TRANSFER_ID_MIN
+            || request.session_nonce == 0
+        {
+            cap_std::println!("pachaland: invalid session request").ok();
+            self.sessions.push(Session {
+                active: false,
+                request_paddr,
+                response_paddr: 0,
+                session_nonce: 0,
+                request_va,
+                response_va: 0,
+                last_request_seq: request.request_seq,
+            });
+            return;
+        }
         self.sessions.push(Session {
+            active: true,
             request_paddr,
             response_paddr: 0,
+            session_nonce: request.session_nonce,
             request_va,
-            response_va,
+            response_va: 0,
             last_request_seq: 0,
         });
     }
@@ -90,7 +113,9 @@ impl ServiceHost {
     fn process_sessions(&mut self) {
         let mut index = 0;
         while index < self.sessions.len() {
-            self.process_session(index);
+            if self.sessions[index].active {
+                self.process_session(index);
+            }
             index += 1;
         }
     }
@@ -100,6 +125,13 @@ impl ServiceHost {
         let request = unsafe { read_volatile(request_ptr) };
         if request.request_seq == 0 || request.request_seq == self.sessions[index].last_request_seq
         {
+            return;
+        }
+        if request.session_nonce != self.sessions[index].session_nonce {
+            return;
+        }
+        if request.magic != protocol::REQUEST_MAGIC || request.version != protocol::VERSION {
+            self.sessions[index].last_request_seq = request.request_seq;
             return;
         }
         if request.inline_bytes as usize > protocol::REQUEST_PAYLOAD_BYTES
@@ -116,7 +148,9 @@ impl ServiceHost {
             self.sessions[index].request_va + size_of::<protocol::RequestHeader>() as u64,
             request.inline_bytes as usize,
         );
-        let response = self.server.handle_request(&request, &payload);
+        let response =
+            self.server
+                .handle_request((index as u32).saturating_add(1), &request, &payload);
         write_response(self.sessions[index].response_va, response);
         self.sessions[index].last_request_seq = request.request_seq;
     }
@@ -128,23 +162,19 @@ impl ServiceHost {
         }
         if session.response_paddr != 0 {
             cap_std::println!("pachaland: response page changed").ok();
+            session.active = false;
             return false;
         }
-        if map_page(session.response_va, response_paddr, true).is_err() {
-            cap_std::println!("pachaland: map response page failed").ok();
-            return false;
-        }
+        let response_page = match vm::map_page_at_dynamic_va(response_paddr, true) {
+            Ok(page) => page,
+            Err(_) => {
+                cap_std::println!("pachaland: map response page failed").ok();
+                return false;
+            }
+        };
+        session.response_va = response_page.va();
         session.response_paddr = response_paddr;
         true
-    }
-}
-
-fn map_page(va: u64, paddr: u64, writable: bool) -> Result<(), ()> {
-    let flags = if writable { 1 } else { 0 };
-    if syscall::call3(syscall::MAP_PAGE, va, paddr, flags) == syscall::OK {
-        Ok(())
-    } else {
-        Err(())
     }
 }
 

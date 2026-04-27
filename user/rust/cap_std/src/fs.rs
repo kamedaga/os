@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::str;
 
@@ -34,6 +35,14 @@ impl Session {
 
 fn closed_error() -> Error {
     Error::new(ErrorKind::Closed)
+}
+
+fn file_len_to_usize(file_bytes: u64, max_bytes: usize) -> Result<usize> {
+    let len = usize::try_from(file_bytes).map_err(|_| Error::new(ErrorKind::BufferTooSmall))?;
+    if len > max_bytes {
+        return Err(Error::new(ErrorKind::BufferTooSmall));
+    }
+    Ok(len)
 }
 
 fn open_dir_path(session: &SharedSession, dir: rt_io::Dir, path: &Path) -> Result<rt_io::Dir> {
@@ -305,6 +314,20 @@ impl RootDir {
         })
     }
 
+    pub fn read_to_vec_bounded<P>(&self, path: P, max_bytes: usize) -> Result<Vec<u8>>
+    where
+        P: AsRef<Path>,
+    {
+        let mut file = self.open_file(path)?;
+        let len = file_len_to_usize(file.len(), max_bytes)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        file.read_to_end_bounded(&mut bytes, max_bytes)?;
+        Ok(bytes)
+    }
+
     pub fn create_dir<P>(&self, path: P) -> Result<Dir>
     where
         P: AsRef<Path>,
@@ -451,6 +474,20 @@ impl Dir {
             cursor: 0,
             file_bytes: raw.file_bytes(),
         })
+    }
+
+    pub fn read_to_vec_bounded<P>(&self, path: P, max_bytes: usize) -> Result<Vec<u8>>
+    where
+        P: AsRef<Path>,
+    {
+        let mut file = self.open_file(path)?;
+        let len = file_len_to_usize(file.len(), max_bytes)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        file.read_to_end_bounded(&mut bytes, max_bytes)?;
+        Ok(bytes)
     }
 
     pub fn create_dir<P>(&self, path: P) -> Result<Dir>
@@ -646,6 +683,30 @@ impl File {
         self.file_bytes
     }
 
+    /// Blocking positional read through rt_io's inline chunked FS protocol.
+    pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let read = self
+            .session
+            .client
+            .borrow_mut()
+            .read_at(self.raw()?, offset, buf)
+            .map_err(Error::from)?;
+        self.file_bytes = read.file_bytes;
+        Ok(read.bytes_read)
+    }
+
+    /// Blocking positional write through rt_io's inline chunked FS protocol.
+    pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize> {
+        let written = self
+            .session
+            .client
+            .borrow_mut()
+            .write_at(self.raw()?, offset, buf)
+            .map_err(Error::from)?;
+        self.file_bytes = written.file_bytes;
+        Ok(written.bytes_written)
+    }
+
     pub fn close(mut self) -> Result<()> {
         self.close_inner()
     }
@@ -658,12 +719,13 @@ impl Drop for File {
 }
 
 impl Read for File {
+    /// Blocking cursor read.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let read = self
             .session
             .client
             .borrow_mut()
-            .read(self.raw()?, self.cursor, buf)
+            .read_at(self.raw()?, self.cursor, buf)
             .map_err(Error::from)?;
         self.cursor = read.next_offset;
         self.file_bytes = read.file_bytes;
@@ -672,19 +734,17 @@ impl Read for File {
 }
 
 impl Write for File {
+    /// Blocking cursor write.
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let file_bytes = self
+        let written = self
             .session
             .client
             .borrow_mut()
-            .write(self.raw()?, self.cursor, buf)
+            .write_at(self.raw()?, self.cursor, buf)
             .map_err(Error::from)?;
-        self.cursor = self
-            .cursor
-            .checked_add(buf.len() as u64)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput))?;
-        self.file_bytes = file_bytes;
-        Ok(buf.len())
+        self.cursor = written.next_offset;
+        self.file_bytes = written.file_bytes;
+        Ok(written.bytes_written)
     }
 }
 

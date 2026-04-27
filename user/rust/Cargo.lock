@@ -75,12 +75,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "capgl_shader_wave"
+name = "cap_window"
 version = "0.1.0"
 dependencies = [
  "cap_std",
  "caplibgl",
- "capwm_client",
+ "rt_core",
+ "rt_handle",
+]
+
+[[package]]
+name = "capfont"
+version = "0.1.0"
+dependencies = [
+ "cap_std",
+]
+
+[[package]]
+name = "capgl_shader_wave"
+version = "0.1.0"
+dependencies = [
+ "cap_std",
+ "cap_window",
+ "caplibgl",
  "rt_alloc",
  "rt_core",
 ]
@@ -108,8 +125,8 @@ name = "capwm_smoke"
 version = "0.1.0"
 dependencies = [
  "cap_std",
+ "cap_window",
  "caplibgl",
- "capwm_client",
  "rt_alloc",
  "rt_core",
 ]
@@ -296,10 +313,9 @@ name = "pachafetch"
 version = "0.1.0"
 dependencies = [
  "cap_std",
+ "cap_window",
+ "capfont",
  "caplibgl",
- "capwm_client",
- "pachaland_assets",
- "pitty_assets",
  "rt_alloc",
  "rt_core",
 ]
@@ -307,6 +323,18 @@ dependencies = [
 [[package]]
 name = "pachaland_assets"
 version = "0.1.0"
+
+[[package]]
+name = "pitty"
+version = "0.1.0"
+dependencies = [
+ "cap_std",
+ "cap_window",
+ "capfont",
+ "caplibgl",
+ "rt_alloc",
+ "rt_core",
+]
 
 [[package]]
 name = "pitty_assets"

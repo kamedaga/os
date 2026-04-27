@@ -38,6 +38,7 @@ fn PrincipalIdType(comptime named_process_slots: usize) type {
 
 pub const PrincipalId = PrincipalIdType(process_count);
 const default_process_principal: PrincipalId = processPrincipalFromIndex(0) orelse unreachable;
+pub export var endpoint_generation_fast_mirror: u64 = 0;
 
 const process_labels = blk: {
     var labels: [process_count][]const u8 = undefined;
@@ -77,6 +78,12 @@ pub const Rights = struct {
     grant: bool = false,
 };
 
+pub const MapProt = struct {
+    read: bool = false,
+    write: bool = false,
+    exec: bool = false,
+};
+
 pub const Capability = struct {
     paddr: u64,
     rights: Rights,
@@ -108,6 +115,8 @@ pub const ProcessDescriptor = struct {
     principal: PrincipalId = @enumFromInt(0),
     label: []const u8 = "",
     bootstrap_owner: bool = false,
+    process_builder_owner: ?PrincipalId = null,
+    process_builder_suspended: bool = false,
     faulted: bool = false,
     fault_vector: u8 = 0,
 };
@@ -772,6 +781,7 @@ pub const KernelState = struct {
     untyped_tables: [principal_count]UntypedCNode = [_]UntypedCNode{.{}} ** principal_count,
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
     published_service_endpoints: PublishedEndpointTable = .{},
+    endpoint_generation: u64 = 0,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     pending_page_transfers: [principal_count]?PendingCapTransfer = [_]?PendingCapTransfer{null} ** principal_count,
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
@@ -1076,11 +1086,35 @@ pub const KernelState = struct {
         self.process_descriptors[index].bootstrap_owner = enabled;
     }
 
+    pub fn markProcessBuilderSuspended(self: *KernelState, principal: PrincipalId, owner: PrincipalId) KernelError!void {
+        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
+        if (!self.process_descriptors[index].active) return KernelError.InvalidState;
+        try self.requireActiveProcess(owner);
+        self.process_descriptors[index].process_builder_owner = owner;
+        self.process_descriptors[index].process_builder_suspended = true;
+    }
+
+    pub fn processBuilderOwnerMatches(self: *const KernelState, principal: PrincipalId, owner: PrincipalId) bool {
+        const index = processIndexFromPrincipal(principal) orelse return false;
+        const desc = self.process_descriptors[index];
+        if (!desc.active or !desc.process_builder_suspended) return false;
+        return desc.process_builder_owner == owner;
+    }
+
+    pub fn clearProcessBuilderSuspended(self: *KernelState, principal: PrincipalId) KernelError!void {
+        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
+        if (!self.process_descriptors[index].active) return KernelError.InvalidState;
+        self.process_descriptors[index].process_builder_owner = null;
+        self.process_descriptors[index].process_builder_suspended = false;
+    }
+
     pub fn markProcessFaulted(self: *KernelState, principal: PrincipalId, fault_vector: u8) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;
         self.process_descriptors[index].active = false;
         self.process_descriptors[index].bootstrap_owner = false;
+        self.process_descriptors[index].process_builder_owner = null;
+        self.process_descriptors[index].process_builder_suspended = false;
         self.process_descriptors[index].faulted = true;
         self.process_descriptors[index].fault_vector = fault_vector;
         if (self.active_process_count > 0) self.active_process_count -= 1;
@@ -1092,6 +1126,8 @@ pub const KernelState = struct {
         if (!self.process_descriptors[index].active) return false;
         self.process_descriptors[index].active = false;
         self.process_descriptors[index].bootstrap_owner = false;
+        self.process_descriptors[index].process_builder_owner = null;
+        self.process_descriptors[index].process_builder_suspended = false;
         self.process_descriptors[index].faulted = false;
         self.process_descriptors[index].fault_vector = 0;
         if (self.active_process_count > 0) self.active_process_count -= 1;
@@ -1348,6 +1384,11 @@ pub const KernelState = struct {
         return &self.endpoint_tables[self.principalStorageIndex(principal)];
     }
 
+    pub fn bumpEndpointGeneration(self: *KernelState) void {
+        self.endpoint_generation +%= 1;
+        endpoint_generation_fast_mirror = self.endpoint_generation;
+    }
+
     pub fn installEndpoint(
         self: *KernelState,
         owner: PrincipalId,
@@ -1360,6 +1401,7 @@ pub const KernelState = struct {
             .endpoint_id = endpoint_id,
             .target = target,
         });
+        self.bumpEndpointGeneration();
     }
 
     pub fn installServiceEndpointForActiveProcesses(
@@ -1387,10 +1429,15 @@ pub const KernelState = struct {
             .endpoint_id = endpoint_id,
             .target = target,
         });
+        self.bumpEndpointGeneration();
     }
 
     pub fn unpublishServiceEndpointsForTarget(self: *KernelState, target: PrincipalId) bool {
-        return self.published_service_endpoints.removeTarget(target);
+        const removed = self.published_service_endpoints.removeTarget(target);
+        if (removed) {
+            self.bumpEndpointGeneration();
+        }
+        return removed;
     }
 
     pub fn getVmObjectTable(self: *KernelState, principal: PrincipalId) *VmObjectCNode {

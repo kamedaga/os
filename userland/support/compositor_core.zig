@@ -3,6 +3,7 @@ const cap_transfer_abi = @import("cap_transfer_abi.zig");
 const font = @import("font.zig");
 const protocol = @import("window_protocol.zig");
 const model = @import("compositor_model.zig");
+const user_vm = @import("user_vm.zig");
 const virtgpu = @import("virtgpu.zig");
 
 const syscall_map_page: u64 = 0x2;
@@ -15,10 +16,8 @@ const syscall_wait_event: u64 = 0x17;
 const syscall_ok: u64 = 0;
 const syscall_err_empty: u64 = 13;
 
-const shared_page_va: usize = 0x3C00_3000;
 const taskbar_state_shared_va: usize = 0x3C00_4000;
 const taskbar_command_shared_va: usize = 0x3C00_6000;
-const ipc_rx_page_va: usize = 0x3C10_8000;
 
 const shared_magic = protocol.mouse_shared_magic;
 const taskbar_state_magic = protocol.taskbar_state_magic;
@@ -110,7 +109,6 @@ const taskbar_process_gradient_width: i32 = 48;
 
 const window_title_offset: usize = 16;
 const window_title_max_bytes = protocol.window_title_max_bytes;
-const window_map_base_va: usize = 0x3C11_0000;
 const max_window_pixel_pages: usize = 128;
 const max_window_pixel_bytes: usize = max_window_pixel_pages * 4096;
 const window_map_stride_va: usize = (2 + max_window_pixel_pages) * 4096;
@@ -154,6 +152,9 @@ var logged_first_gpu_sync_slot: bool = false;
 var debug_recent_window_slot: ?usize = null;
 var debug_recent_window_sync_logged = false;
 var debug_recent_window_draw_logged = false;
+var ipc_rx_page_va: usize = 0;
+var shared_page_va: usize = 0;
+var window_map_base_va: usize = 0;
 const compositor_perf_report_min_wall_tsc: u64 = 1_000_000_000;
 const CompositorPerfReport = struct {
     start_tsc: u64 = 0,
@@ -199,6 +200,25 @@ fn readTsc() u64 {
           [hi] "={edx}" (hi),
     );
     return (@as(u64, hi) << 32) | @as(u64, lo);
+}
+
+fn ensureIpcRxPageVa() ?usize {
+    if (ipc_rx_page_va != 0) return ipc_rx_page_va;
+    ipc_rx_page_va = user_vm.reservePages(1) orelse return null;
+    return ipc_rx_page_va;
+}
+
+fn ensureMouseSharedPageVa() ?usize {
+    if (shared_page_va != 0) return shared_page_va;
+    shared_page_va = user_vm.reservePages(1) orelse return null;
+    return shared_page_va;
+}
+
+fn ensureWindowMapBaseVa() ?usize {
+    if (window_map_base_va != 0) return window_map_base_va;
+    const page_count = max_windows * (window_map_stride_va / user_vm.page_bytes);
+    window_map_base_va = user_vm.reservePages(page_count) orelse return null;
+    return window_map_base_va;
 }
 
 const cursor_width: usize = 15;
@@ -526,6 +546,7 @@ fn decodeSharedCoord(raw: u64, limit: i32, fallback: i32) i32 {
 
 fn syncMouseState(force: bool) void {
     if (!mouse_state_storage.ready) return;
+    if (shared_page_va == 0) return;
     const shared_now: *const volatile MouseSharedPage = @ptrFromInt(shared_page_va);
     if (shared_now.magic != shared_magic) return;
     const seq = shared_now.seq;
@@ -2322,7 +2343,11 @@ fn registerWindowCap(page_paddr: u64) ?Rect {
     const existing = findWindowSlotById(cap_snapshot.window_id);
     const slot = existing orelse (findFreeWindowSlot() orelse return null);
     const prior_z = if (existing != null) window_store.slots[slot].z_order else 0;
-    const slot_base = window_map_base_va + slot * window_map_stride_va;
+    const window_map_base = ensureWindowMapBaseVa() orelse {
+        logWindowRegisterRejected("map_va_reserve_failed", page_paddr);
+        return null;
+    };
+    const slot_base = window_map_base + slot * window_map_stride_va;
     const map_meta_va = slot_base + 0x1000;
     const map_pixel_va = slot_base + 0x2000;
     const dma_pixels = rights.dma_pixels and ((cap_snapshot.flags & protocol.window_flag_allow_pixels_dma) != 0);
@@ -2725,9 +2750,10 @@ pub fn run(comptime gpu_mode: bool) noreturn {
         const page_paddr = recvCap();
         if (page_paddr == syscall_err_empty) break;
         if (page_paddr < 0x1000) break;
-        if (mapPage(ipc_rx_page_va, page_paddr, true) != syscall_ok) continue;
+        const rx_page_va = ensureIpcRxPageVa() orelse continue;
+        if (mapPage(rx_page_va, page_paddr, true) != syscall_ok) continue;
 
-        const msg_words: [*]const volatile u64 = @ptrFromInt(ipc_rx_page_va);
+        const msg_words: [*]const volatile u64 = @ptrFromInt(rx_page_va);
         const magic32: u32 = @truncate(msg_words[0]);
         if (magic32 == window_cap_magic) {
             if (registerWindowCap(page_paddr) != null) {
@@ -2736,9 +2762,10 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             continue;
         }
         if (msg_words[0] != shared_magic or mouse_state_storage.ready) continue;
-        if (mapPage(shared_page_va, page_paddr, false) != syscall_ok) continue;
+        const mouse_shared_va = ensureMouseSharedPageVa() orelse continue;
+        if (mapPage(mouse_shared_va, page_paddr, false) != syscall_ok) continue;
 
-        const shared_now: *const volatile MouseSharedPage = @ptrFromInt(shared_page_va);
+        const shared_now: *const volatile MouseSharedPage = @ptrFromInt(mouse_shared_va);
         if (shared_now.magic != shared_magic) continue;
 
         mouse_state_storage.ready = true;
@@ -2782,9 +2809,10 @@ pub fn run(comptime gpu_mode: bool) noreturn {
             const page_paddr = recvCap();
             if (page_paddr == syscall_err_empty) break;
             if (page_paddr < 0x1000) break;
-            if (mapPage(ipc_rx_page_va, page_paddr, true) != syscall_ok) continue;
+            const rx_page_va = ensureIpcRxPageVa() orelse continue;
+            if (mapPage(rx_page_va, page_paddr, true) != syscall_ok) continue;
 
-            const msg_words: [*]const volatile u64 = @ptrFromInt(ipc_rx_page_va);
+            const msg_words: [*]const volatile u64 = @ptrFromInt(rx_page_va);
             const magic32: u32 = @truncate(msg_words[0]);
             if (magic32 == window_cap_magic) {
                 if (registerWindowCap(page_paddr) != null) {
@@ -2793,9 +2821,10 @@ pub fn run(comptime gpu_mode: bool) noreturn {
                 continue;
             }
             if (msg_words[0] != shared_magic or mouse_state_storage.ready) continue;
-            if (mapPage(shared_page_va, page_paddr, false) != syscall_ok) continue;
+            const mouse_shared_va = ensureMouseSharedPageVa() orelse continue;
+            if (mapPage(mouse_shared_va, page_paddr, false) != syscall_ok) continue;
 
-            const shared_now: *const volatile MouseSharedPage = @ptrFromInt(shared_page_va);
+            const shared_now: *const volatile MouseSharedPage = @ptrFromInt(mouse_shared_va);
             if (shared_now.magic != shared_magic) continue;
 
             mouse_state_storage.ready = true;

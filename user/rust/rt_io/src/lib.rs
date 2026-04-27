@@ -3,7 +3,7 @@
 use core::ptr::{addr_of, read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use rt_core::{SyscallError, syscall};
+use rt_core::{SyscallError, syscall, vm};
 use rt_handle::{
     ClockKind, DirToken, ExecImageToken, FsConnectionId, FsObjectKind, FsObjectToken, FsRights,
     OpenFileToken, RandomKind, ServiceKind, VnodeFileToken, snapshot_service_registry_shadow,
@@ -14,13 +14,10 @@ const MAX_PATH_BYTES: usize = 128;
 const REQUEST_MAGIC: u32 = 0x5153_4653;
 const RESPONSE_MAGIC: u32 = 0x5253_4653;
 const VERSION: u16 = 1;
-const DEFAULT_RESPONSE_POLL_LIMIT: u64 = 256;
+const DEFAULT_RESPONSE_POLL_LIMIT: u64 = 65_536;
 const CREATE_FLAG_DIRECTORY: u32 = 1 << 0;
 const PAGE_RIGHT_CPU_READ: u64 = 0x1;
 const PAGE_RIGHT_CPU_WRITE: u64 = 0x2;
-
-const REQUEST_VA: u64 = 0x3F20_0000;
-const RESPONSE_VA: u64 = 0x3F20_1000;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -97,9 +94,11 @@ struct FsRequestHeader {
     reserved0: u32,
     arg0: u64,
     arg1: u64,
+    session_nonce: u64,
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct FsResponseHeader {
     magic: u32,
     version: u16,
@@ -119,6 +118,7 @@ struct FsResponseHeader {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct FsStatRecord {
     object_kind: u8,
     reserved0: [u8; 7],
@@ -130,6 +130,7 @@ struct FsStatRecord {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct FsDirentRecord {
     next_cursor: u64,
     object_kind: u8,
@@ -171,6 +172,13 @@ pub struct StatFsResult {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ReadResult {
     pub bytes_read: usize,
+    pub file_bytes: u64,
+    pub next_offset: u64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct WriteResult {
+    pub bytes_written: usize,
     pub file_bytes: u64,
     pub next_offset: u64,
 }
@@ -316,6 +324,7 @@ pub struct PersistentFsClient {
     request_paddr: u64,
     response_paddr: u64,
     server_endpoint_id: u64,
+    session_nonce: u64,
     mount_token: FsObjectToken,
     next_seq: u64,
     response_poll_limit: u64,
@@ -324,7 +333,9 @@ pub struct PersistentFsClient {
 impl PersistentFsClient {
     pub fn connect_from_shadow(connection_id: FsConnectionId) -> Result<Self, Error> {
         let process_slot = current_process_slot()?;
-        Self::connect_from_registry_shadow(connection_id, REQUEST_VA, RESPONSE_VA, process_slot)
+        let request = vm::alloc_map_page(true).map_err(map_request_page_error)?;
+        let response = vm::alloc_map_page(true).map_err(map_response_page_error)?;
+        Self::connect_from_registry_shadow_mapped(connection_id, request, response, process_slot)
     }
 
     pub fn connect_from_registry_shadow(
@@ -355,6 +366,40 @@ impl PersistentFsClient {
             connection_id,
             request_va,
             response_va,
+            client_process_slot,
+            binding.endpoint_id,
+            binding.process_slot,
+        )
+    }
+
+    fn connect_from_registry_shadow_mapped(
+        connection_id: FsConnectionId,
+        request: vm::MappedPage,
+        response: vm::MappedPage,
+        client_process_slot: u64,
+    ) -> Result<Self, Error> {
+        // SAFETY: The launcher bootstraps the service registry shadow page for user processes.
+        let binding = unsafe {
+            snapshot_service_registry_shadow()
+                .and_then(|snapshot| snapshot.find_kind(ServiceKind::PersistentFs))
+        }
+        .ok_or(Error::MissingService)?;
+
+        if unit_syscall(syscall::call3(
+            syscall::INSTALL_ENDPOINT,
+            0,
+            binding.endpoint_id,
+            binding.process_slot,
+        ))
+        .is_err()
+        {
+            return Err(Error::EndpointInstallFailed);
+        }
+
+        Self::connect_mapped(
+            connection_id,
+            request,
+            response,
             client_process_slot,
             binding.endpoint_id,
             binding.process_slot,
@@ -402,6 +447,64 @@ impl PersistentFsClient {
         {
             return Err(Error::ResponseGrantFailed);
         }
+        Self::init_connected(
+            connection_id,
+            request_va,
+            response_va,
+            request_paddr,
+            response_paddr,
+            client_process_slot,
+            endpoint_id,
+            server_process_slot,
+        )
+    }
+
+    fn connect_mapped(
+        connection_id: FsConnectionId,
+        request: vm::MappedPage,
+        response: vm::MappedPage,
+        client_process_slot: u64,
+        endpoint_id: u64,
+        server_process_slot: u64,
+    ) -> Result<Self, Error> {
+        if unit_syscall(syscall::call3(
+            syscall::GRANT_CAP,
+            response.paddr(),
+            server_process_slot,
+            PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE,
+        ))
+        .is_err()
+        {
+            return Err(Error::ResponseGrantFailed);
+        }
+        Self::init_connected(
+            connection_id,
+            request.va(),
+            response.va(),
+            request.paddr(),
+            response.paddr(),
+            client_process_slot,
+            endpoint_id,
+            server_process_slot,
+        )
+    }
+
+    fn init_connected(
+        connection_id: FsConnectionId,
+        request_va: u64,
+        response_va: u64,
+        request_paddr: u64,
+        response_paddr: u64,
+        client_process_slot: u64,
+        endpoint_id: u64,
+        _server_process_slot: u64,
+    ) -> Result<Self, Error> {
+        let session_nonce = make_session_nonce(
+            request_paddr,
+            response_paddr,
+            endpoint_id,
+            client_process_slot,
+        );
 
         let mut client = Self {
             connection_id,
@@ -410,6 +513,7 @@ impl PersistentFsClient {
             request_paddr,
             response_paddr,
             server_endpoint_id: endpoint_id,
+            session_nonce,
             mount_token: FsObjectToken::encode(1).expect("placeholder fs token must encode"),
             next_seq: 2,
             response_poll_limit: DEFAULT_RESPONSE_POLL_LIMIT,
@@ -429,6 +533,7 @@ impl PersistentFsClient {
         request.reserved0 = 0;
         request.arg0 = response_paddr;
         request.arg1 = client_process_slot;
+        request.session_nonce = session_nonce;
         compiler_fence(Ordering::SeqCst);
         request.request_seq = 1;
 
@@ -558,7 +663,7 @@ impl PersistentFsClient {
         if inline_bytes < DIRENT_RECORD_BYTES {
             return Err(Error::InvalidResponse);
         }
-        let record = self.response_dirent_record();
+        let record = self.response_dirent_record_snapshot();
         let name_len = record.name_bytes as usize;
         if name_len > name_buf.len() {
             return Err(Error::BufferTooSmall);
@@ -625,6 +730,67 @@ impl PersistentFsClient {
         offset: u64,
         out: &mut [u8],
     ) -> Result<ReadResult, Error> {
+        self.read_at(file, offset, out)
+    }
+
+    /// Blocking positional read.
+    ///
+    /// This is the only large-file read contract in rt_io. The caller blocks
+    /// until the filesystem service replies for each inline chunk; no bulk
+    /// page grant or shared target VA is part of the FS API.
+    pub fn read_at(
+        &mut self,
+        file: OpenFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<ReadResult, Error> {
+        if out.len() > RESPONSE_PAYLOAD_BYTES {
+            return self.read_inline_loop(file, offset, out);
+        }
+        self.read_inline_once(file, offset, out)
+    }
+
+    fn read_inline_loop(
+        &mut self,
+        file: OpenFile,
+        mut offset: u64,
+        out: &mut [u8],
+    ) -> Result<ReadResult, Error> {
+        let mut total_read = 0usize;
+        let mut file_bytes = file.file_bytes();
+        let mut next_offset = offset;
+        while total_read < out.len() {
+            let remaining = out.len() - total_read;
+            let chunk_len = usize::min(remaining, RESPONSE_PAYLOAD_BYTES);
+            let read = self.read_inline_once(
+                file,
+                offset,
+                &mut out[total_read..total_read + chunk_len],
+            )?;
+            file_bytes = read.file_bytes;
+            next_offset = read.next_offset;
+            if read.bytes_read == 0 {
+                break;
+            }
+            total_read += read.bytes_read;
+            offset = read.next_offset;
+            if read.bytes_read < chunk_len {
+                break;
+            }
+        }
+        Ok(ReadResult {
+            bytes_read: total_read,
+            file_bytes,
+            next_offset,
+        })
+    }
+
+    fn read_inline_once(
+        &mut self,
+        file: OpenFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<ReadResult, Error> {
         self.ensure_connection(file.connection_id())?;
         let request_len = usize::min(out.len(), RESPONSE_PAYLOAD_BYTES);
         let seq = self.begin_request(
@@ -652,6 +818,43 @@ impl PersistentFsClient {
     }
 
     pub fn write(&mut self, file: OpenFile, offset: u64, bytes: &[u8]) -> Result<u64, Error> {
+        self.write_at(file, offset, bytes)
+            .map(|result| result.file_bytes)
+    }
+
+    /// Blocking positional write.
+    ///
+    /// The write is synchronously chunked through the request payload and
+    /// completes only after every accepted chunk has a filesystem reply.
+    pub fn write_at(
+        &mut self,
+        file: OpenFile,
+        mut offset: u64,
+        mut bytes: &[u8],
+    ) -> Result<WriteResult, Error> {
+        self.ensure_connection(file.connection_id())?;
+        let start_offset = offset;
+        let mut total_written = 0usize;
+        let mut file_bytes = file.file_bytes();
+
+        while !bytes.is_empty() {
+            let chunk_len = usize::min(bytes.len(), REQUEST_PAYLOAD_BYTES);
+            file_bytes = self.write_at_once(file, offset, &bytes[..chunk_len])?;
+            offset = offset.checked_add(chunk_len as u64).ok_or(Error::Invalid)?;
+            total_written += chunk_len;
+            bytes = &bytes[chunk_len..];
+        }
+
+        Ok(WriteResult {
+            bytes_written: total_written,
+            file_bytes,
+            next_offset: start_offset
+                .checked_add(total_written as u64)
+                .ok_or(Error::Invalid)?,
+        })
+    }
+
+    fn write_at_once(&mut self, file: OpenFile, offset: u64, bytes: &[u8]) -> Result<u64, Error> {
         self.ensure_connection(file.connection_id())?;
         if bytes.len() > REQUEST_PAYLOAD_BYTES {
             return Err(Error::BufferTooSmall);
@@ -752,7 +955,7 @@ impl PersistentFsClient {
         if (response.inline_bytes as usize) < STAT_RECORD_BYTES {
             return Err(Error::InvalidResponse);
         }
-        let stat_record = self.response_stat_record();
+        let stat_record = self.response_stat_record_snapshot();
         Ok(StatResult {
             object_kind: FsObjectKind::from_raw(stat_record.object_kind as u64),
             size_bytes: stat_record.size_bytes,
@@ -819,12 +1022,18 @@ impl PersistentFsClient {
         unsafe { &*(self.response_va as *const FsResponseHeader) }
     }
 
-    fn response_stat_record(&self) -> &FsStatRecord {
-        unsafe { &*((self.response_va + RESPONSE_HEADER_BYTES as u64) as *const FsStatRecord) }
+    fn response_stat_record_snapshot(&self) -> FsStatRecord {
+        unsafe {
+            read_volatile((self.response_va + RESPONSE_HEADER_BYTES as u64) as *const FsStatRecord)
+        }
     }
 
-    fn response_dirent_record(&self) -> &FsDirentRecord {
-        unsafe { &*((self.response_va + RESPONSE_HEADER_BYTES as u64) as *const FsDirentRecord) }
+    fn response_dirent_record_snapshot(&self) -> FsDirentRecord {
+        unsafe {
+            read_volatile(
+                (self.response_va + RESPONSE_HEADER_BYTES as u64) as *const FsDirentRecord,
+            )
+        }
     }
 
     fn request_payload(&self) -> *mut u8 {
@@ -876,6 +1085,7 @@ impl PersistentFsClient {
         request.reserved0 = 0;
         request.arg0 = 0;
         request.arg1 = 0;
+        request.session_nonce = self.session_nonce;
         if !path.is_empty() {
             copy_bytes_to_volatile(self.request_payload(), path.as_bytes());
         }
@@ -894,11 +1104,12 @@ impl PersistentFsClient {
         &mut self,
         expected_seq: u64,
         expected_op: Opcode,
-    ) -> Result<&FsResponseHeader, Error> {
+    ) -> Result<FsResponseHeader, Error> {
         if !self.wait_for_response(expected_seq) {
             return Err(Error::Timeout);
         }
-        let response = self.response_header();
+        compiler_fence(Ordering::SeqCst);
+        let response = unsafe { read_volatile(self.response_header()) };
         if response.magic != RESPONSE_MAGIC || response.version != VERSION {
             return Err(Error::InvalidResponse);
         }
@@ -913,7 +1124,7 @@ impl PersistentFsClient {
         &mut self,
         expected_seq: u64,
         expected_op: Opcode,
-    ) -> Result<&FsResponseHeader, Error> {
+    ) -> Result<FsResponseHeader, Error> {
         let response = self.finish_request(expected_seq, expected_op)?;
         let status = parse_status(response.status).ok_or(Error::InvalidResponse)?;
         if status != Status::Ok {
@@ -951,6 +1162,31 @@ fn current_process_slot() -> Result<u64, Error> {
 fn alloc_page() -> Option<u64> {
     let raw = syscall::call0(syscall::ALLOC_PAGE);
     if raw < 0x1000 { None } else { Some(raw) }
+}
+
+fn map_request_page_error(err: SyscallError) -> Error {
+    match err {
+        SyscallError::Alloc => Error::RequestAllocFailed,
+        SyscallError::Map => Error::RequestMapFailed,
+        _ => Error::RequestMapFailed,
+    }
+}
+
+fn map_response_page_error(err: SyscallError) -> Error {
+    match err {
+        SyscallError::Alloc => Error::ResponseAllocFailed,
+        SyscallError::Map => Error::ResponseMapFailed,
+        _ => Error::ResponseMapFailed,
+    }
+}
+
+fn make_session_nonce(request_paddr: u64, response_paddr: u64, endpoint_id: u64, tag: u64) -> u64 {
+    let nonce = request_paddr
+        ^ response_paddr.rotate_left(17)
+        ^ endpoint_id.rotate_left(7)
+        ^ tag
+        ^ 0x9e37_79b9_7f4a_7c15;
+    if nonce == 0 { 1 } else { nonce }
 }
 
 fn clear_page(va: u64) {

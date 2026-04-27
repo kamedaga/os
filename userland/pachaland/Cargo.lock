@@ -12,19 +12,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "caplibgl"
+name = "cap_window"
 version = "0.1.0"
 dependencies = [
+ "cap_std",
+ "caplibgl",
  "rt_core",
  "rt_handle",
 ]
 
 [[package]]
-name = "capwm_client"
+name = "caplibgl"
 version = "0.1.0"
 dependencies = [
- "cap_std",
- "caplibgl",
  "rt_core",
  "rt_handle",
 ]
@@ -34,8 +34,8 @@ name = "pachaland"
 version = "0.1.0"
 dependencies = [
  "cap_std",
+ "cap_window",
  "caplibgl",
- "capwm_client",
  "rt_alloc",
  "rt_core",
 ]

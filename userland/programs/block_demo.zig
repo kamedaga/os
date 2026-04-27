@@ -1,11 +1,10 @@
 const std = @import("std");
 const block_client = @import("support_root").block_client;
+const user_vm = @import("support_root").user_vm;
 
 const syscall_log: u64 = 0x9;
 const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
-const request_va: u64 = 0x3C10_4000;
-const response_va: u64 = 0x3C10_5000;
 const demo_magic: u64 = 0x424C_4B44_454D_4F31; // "BLKDEMO1"
 
 var block_storage: [4096]u8 align(16) = [_]u8{0} ** 4096;
@@ -66,7 +65,11 @@ pub export fn _start() noreturn {
     const process_slot_tick = getTickCount();
     userLogTick("BlockDemo: got process slot", start_tick, process_slot_tick);
 
-    var client = block_client.Client.connectFromServiceRegistry(request_va, response_va, process_slot) catch |err| {
+    const ipc_va = user_vm.reservePages(2) orelse {
+        _ = userLog("BlockDemo: IPC VA reserve failed\n");
+        while (true) asm volatile ("pause");
+    };
+    var client = block_client.Client.connectFromServiceRegistry(@intCast(ipc_va), @intCast(ipc_va + user_vm.page_bytes), process_slot) catch |err| {
         _ = userLog("BlockDemo: block connect failed\n");
         _ = userLog(@errorName(err));
         _ = userLog("\n");

@@ -2,11 +2,11 @@ const std = @import("std");
 const cap_transfer_abi = @import("support_root").cap_transfer_abi;
 const gpu_bootstrap = @import("support_root").gpu_bootstrap_abi;
 const gpu_protocol = @import("support_root").gpu_protocol;
+const process_abi = @import("support_root").process_abi;
 const queue_abi = @import("support_root").queue_abi;
+const user_vm = @import("support_root").user_vm;
 
-const syscall_map_page: u64 = 0x2;
 const syscall_alloc_map_pages: u64 = 0xC;
-const syscall_map_mmio: u64 = 0xB;
 const syscall_wait_event: u64 = 0x17;
 const syscall_log: u64 = 0x9;
 const syscall_queue_submit: u64 = 0xE;
@@ -19,23 +19,11 @@ const syscall_dma_map_release: u64 = queue_abi.syscall_dma_map_release;
 
 const syscall_ok: u64 = 0;
 
-const config_page_va: usize = 0x3C00_2000;
-const common_page_va: usize = 0x2100_4000;
-const notify_page_va: usize = 0x2100_5000;
-const isr_page_va: usize = 0x2100_6000;
-const device_page_va: usize = 0x2100_7000;
-const queue_page0_va: usize = 0x2100_8000;
-const queue_page1_va: usize = 0x2100_9000;
-const control_page_va: usize = 0x2100_A000;
-const mem_entries_page0_va: usize = 0x2100_B000;
-const mem_entries_page1_va: usize = 0x2100_C000;
-const cursor_queue_page0_va: usize = 0x2100_D000;
-const cursor_queue_page1_va: usize = 0x2100_E000;
-const cursor_pixels_va: usize = 0x2100_F000;
-const backing_base_va: usize = 0x2140_0000;
-const gpu_session_base_va: usize = 0x3C01_0000;
-const gpu_session_stride_bytes: usize = 0x2000;
-const max_gpu_sessions: usize = 8;
+const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
+const gpu_bulk_upload_pages: usize = 16;
+const max_gpu_sessions: usize = 32;
+const virgl_surface_object_stride: u32 = 16;
+const shell_framebuffer_resource_id: u32 = 0x4000_0000;
 
 const control_request_offset: usize = 0x000;
 const control_response_offset: usize = 0x800;
@@ -69,6 +57,9 @@ const desc_flag_next: u16 = 1 << 0;
 const desc_flag_write: u16 = 1 << 1;
 const max_backing_pages: usize = 512;
 const max_alloc_chunk_pages: usize = 64;
+const max_virgl_command_bytes: usize = 8192;
+const virgl_inline_write_header_bytes: usize = 48;
+const max_virgl_inline_payload_bytes: usize = max_virgl_command_bytes - virgl_inline_write_header_bytes;
 const scanout_width_cap: u32 = 1920;
 const scanout_height_cap: u32 = 1080;
 const wait_spin_limit: usize = 400_000;
@@ -316,6 +307,11 @@ const GpuState = struct {
     cursor_queue_size: u16 = 0,
     used_idx_seen: u16 = 0,
     cursor_used_idx_seen: u16 = 0,
+    queue_base_va: usize = 0,
+    control_page_va: usize = 0,
+    mem_entries_base_va: usize = 0,
+    cursor_queue_base_va: usize = 0,
+    cursor_pixels_va: usize = 0,
     queue_paddr0: u64 = 0,
     queue_paddr1: u64 = 0,
     cursor_queue_paddr0: u64 = 0,
@@ -324,9 +320,16 @@ const GpuState = struct {
     mem_entries_paddr0: u64 = 0,
     mem_entries_paddr1: u64 = 0,
     cursor_pixels_paddrs: [cursor_pixel_pages]u64 = [_]u64{0} ** cursor_pixel_pages,
+    backing_base_va: usize = 0,
     backing_page_count: usize = 0,
     backing_bytes_len: usize = 0,
     resource_id: u32 = 1,
+    shell_framebuffer_paddr: u64 = 0,
+    shell_framebuffer_byte_len: usize = 0,
+    shell_framebuffer_width: u32 = 0,
+    shell_framebuffer_height: u32 = 0,
+    shell_framebuffer_pitch: u32 = 0,
+    shell_framebuffer_ready: bool = false,
     scanout_id: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
@@ -352,8 +355,12 @@ const GpuState = struct {
 const GpuSession = struct {
     request_paddr: u64 = 0,
     response_paddr: u64 = 0,
+    session_nonce: u64 = 0,
     request_va: usize = 0,
     response_va: usize = 0,
+    bulk_base_va: usize = 0,
+    bulk_page_count: u16 = 0,
+    bulk_paddrs: [gpu_bulk_upload_pages]u64 = [_]u64{0} ** gpu_bulk_upload_pages,
     last_request_seq: u64 = 0,
     active: bool = false,
 };
@@ -403,28 +410,6 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool, out_paddr_list_v
           [arg1] "{rsi}" (page_count),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
           [arg3] "{rcx}" (out_paddr_list_va),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_map_page),
-          [arg0] "{rdi}" (va),
-          [arg1] "{rsi}" (paddr),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_map_mmio),
-          [arg0] "{rdi}" (va),
-          [arg1] "{rsi}" (paddr),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -562,6 +547,16 @@ fn copyVolatileBytes(dest: [*]volatile u8, src: [*]const volatile u8, len: usize
     }
 }
 
+fn readRequestPayloadU64(offset: usize) u64 {
+    const payload: [*]const volatile u8 = @ptrFromInt(active_request_page_va + gpu_protocol.request_header_bytes);
+    var value: u64 = 0;
+    var byte_index: usize = 0;
+    while (byte_index < @sizeOf(u64)) : (byte_index += 1) {
+        value |= @as(u64, payload[offset + byte_index]) << @intCast(byte_index * 8);
+    }
+    return value;
+}
+
 fn memoryBarrier() void {
     asm volatile ("" ::: .{ .memory = true });
 }
@@ -570,14 +565,15 @@ fn minU32(a: u32, b: u32) u32 {
     return if (a < b) a else b;
 }
 
-fn waitMapMmioPage(va: u64, paddr: u64, writable: bool) bool {
-    if (paddr < 0x1000) return false;
+fn waitMapMmioPageDynamic(paddr: u64, writable: bool) ?usize {
+    if (paddr < 0x1000) return null;
+    const va = user_vm.reservePages(1) orelse return null;
     var attempt: usize = 0;
     while (attempt < 4096) : (attempt += 1) {
-        if (mapMmioPage(va, paddr, writable) == syscall_ok) return true;
+        if (user_vm.mapMmioPageAtVa(va, paddr, writable)) return va;
         _ = waitEvent(false, 1);
     }
-    return false;
+    return null;
 }
 
 fn parseBootState() ?BootState {
@@ -623,40 +619,41 @@ fn waitForBootResources() void {
 }
 
 fn mapDeviceView() bool {
-    if (!waitMapMmioPage(common_page_va, boot_state.common_page_paddr, true)) {
+    const common_map_va = waitMapMmioPageDynamic(boot_state.common_page_paddr, true) orelse {
         _ = userLog("VirtioGpuGl: map common failed\n");
         return false;
-    }
-    const notify_map_va = if (boot_state.notify_page_paddr == boot_state.common_page_paddr) common_page_va else notify_page_va;
-    if (notify_map_va != common_page_va and !waitMapMmioPage(notify_map_va, boot_state.notify_page_paddr, true)) {
+    };
+    const notify_map_va = if (boot_state.notify_page_paddr == boot_state.common_page_paddr) common_map_va else waitMapMmioPageDynamic(boot_state.notify_page_paddr, true) orelse {
         _ = userLog("VirtioGpuGl: map notify failed\n");
         return false;
-    }
+    };
     var isr_map_va: usize = 0;
     if (boot_state.isr_page_paddr != 0) {
-        isr_map_va = if (boot_state.isr_page_paddr == boot_state.common_page_paddr) common_page_va else if (boot_state.isr_page_paddr == boot_state.notify_page_paddr) notify_map_va else isr_page_va;
-        if (isr_map_va != common_page_va and isr_map_va != notify_map_va and !waitMapMmioPage(isr_map_va, boot_state.isr_page_paddr, false)) {
+        isr_map_va = if (boot_state.isr_page_paddr == boot_state.common_page_paddr) common_map_va else if (boot_state.isr_page_paddr == boot_state.notify_page_paddr) notify_map_va else waitMapMmioPageDynamic(boot_state.isr_page_paddr, false) orelse {
             _ = userLog("VirtioGpuGl: map isr failed\n");
             return false;
-        }
+        };
     }
     if (boot_state.device_page_paddr != 0) {
         const device_map_va =
             if (boot_state.device_page_paddr == boot_state.common_page_paddr)
-                common_page_va
+                common_map_va
             else if (boot_state.device_page_paddr == boot_state.notify_page_paddr)
                 notify_map_va
             else if (boot_state.isr_page_paddr != 0 and boot_state.device_page_paddr == boot_state.isr_page_paddr)
                 isr_map_va
             else
-                device_page_va;
-        if (device_map_va != common_page_va and device_map_va != notify_map_va and device_map_va != isr_map_va and !waitMapMmioPage(device_map_va, boot_state.device_page_paddr, false)) {
+                waitMapMmioPageDynamic(boot_state.device_page_paddr, false) orelse {
+                    _ = userLog("VirtioGpuGl: map device failed\n");
+                    return false;
+                };
+        if (device_map_va == 0) {
             _ = userLog("VirtioGpuGl: map device failed\n");
             return false;
         }
     }
 
-    gpu_state.common_base = common_page_va + @as(usize, @intCast(boot_state.common_page_offset));
+    gpu_state.common_base = common_map_va + @as(usize, @intCast(boot_state.common_page_offset));
     gpu_state.notify_base = notify_map_va + @as(usize, @intCast(boot_state.notify_page_offset));
     gpu_state.notify_off_multiplier = @intCast(boot_state.notify_off_multiplier);
     if (gpu_state.notify_off_multiplier == 0) return false;
@@ -675,44 +672,44 @@ fn cursorQueueRegionPhys(offset: usize) u64 {
 
 fn queueDescPtr(index: u16) *volatile VirtqDesc {
     const offset = @as(usize, index) * @sizeOf(VirtqDesc);
-    return @ptrFromInt(queue_page0_va + offset);
+    return @ptrFromInt(gpu_state.queue_base_va + offset);
 }
 
 fn queueAvailIdxPtr() *volatile u16 {
-    return @ptrFromInt(queue_page0_va + @as(usize, gpu_state.queue_size) * @sizeOf(VirtqDesc) + 2);
+    return @ptrFromInt(gpu_state.queue_base_va + @as(usize, gpu_state.queue_size) * @sizeOf(VirtqDesc) + 2);
 }
 
 fn queueAvailRingPtr() [*]volatile u16 {
-    return @ptrFromInt(queue_page0_va + @as(usize, gpu_state.queue_size) * @sizeOf(VirtqDesc) + 4);
+    return @ptrFromInt(gpu_state.queue_base_va + @as(usize, gpu_state.queue_size) * @sizeOf(VirtqDesc) + 4);
 }
 
 fn queueUsedIdxPtr() *volatile u16 {
-    return @ptrFromInt(queue_page0_va + queue_used_offset + 2);
+    return @ptrFromInt(gpu_state.queue_base_va + queue_used_offset + 2);
 }
 
 fn queueUsedRingPtr() [*]volatile VirtqUsedElem {
-    return @ptrFromInt(queue_page0_va + queue_used_offset + 4);
+    return @ptrFromInt(gpu_state.queue_base_va + queue_used_offset + 4);
 }
 
 fn cursorQueueDescPtr(index: u16) *volatile VirtqDesc {
     const offset = @as(usize, index) * @sizeOf(VirtqDesc);
-    return @ptrFromInt(cursor_queue_page0_va + offset);
+    return @ptrFromInt(gpu_state.cursor_queue_base_va + offset);
 }
 
 fn cursorQueueAvailIdxPtr() *volatile u16 {
-    return @ptrFromInt(cursor_queue_page0_va + @as(usize, gpu_state.cursor_queue_size) * @sizeOf(VirtqDesc) + 2);
+    return @ptrFromInt(gpu_state.cursor_queue_base_va + @as(usize, gpu_state.cursor_queue_size) * @sizeOf(VirtqDesc) + 2);
 }
 
 fn cursorQueueAvailRingPtr() [*]volatile u16 {
-    return @ptrFromInt(cursor_queue_page0_va + @as(usize, gpu_state.cursor_queue_size) * @sizeOf(VirtqDesc) + 4);
+    return @ptrFromInt(gpu_state.cursor_queue_base_va + @as(usize, gpu_state.cursor_queue_size) * @sizeOf(VirtqDesc) + 4);
 }
 
 fn cursorQueueUsedIdxPtr() *volatile u16 {
-    return @ptrFromInt(cursor_queue_page0_va + queue_used_offset + 2);
+    return @ptrFromInt(gpu_state.cursor_queue_base_va + queue_used_offset + 2);
 }
 
 fn cursorQueueUsedRingPtr() [*]volatile VirtqUsedElem {
-    return @ptrFromInt(cursor_queue_page0_va + queue_used_offset + 4);
+    return @ptrFromInt(gpu_state.cursor_queue_base_va + queue_used_offset + 4);
 }
 
 fn queuePushAvail(head_desc: u16) void {
@@ -745,13 +742,18 @@ fn controlRespPaddr() u64 {
 
 fn initQueueMemory() bool {
     var init_paddrs: [7 + cursor_pixel_pages]u64 = [_]u64{0} ** (7 + cursor_pixel_pages);
-    if (allocMapPages(queue_page0_va, init_paddrs.len, true, @intFromPtr(&init_paddrs)) != syscall_ok) {
+    const base_va = user_vm.allocMapPagesInto(init_paddrs.len, true, init_paddrs[0..]) orelse {
         _ = userLog("VirtioGpuGl: alloc queue pages failed\n");
         return false;
-    }
+    };
     for (init_paddrs) |paddr| {
         if (paddr < 0x1000) return false;
     }
+    gpu_state.queue_base_va = base_va;
+    gpu_state.control_page_va = base_va + 2 * user_vm.page_bytes;
+    gpu_state.mem_entries_base_va = base_va + 3 * user_vm.page_bytes;
+    gpu_state.cursor_queue_base_va = base_va + 5 * user_vm.page_bytes;
+    gpu_state.cursor_pixels_va = base_va + 7 * user_vm.page_bytes;
     gpu_state.queue_paddr0 = init_paddrs[0];
     gpu_state.queue_paddr1 = init_paddrs[1];
     gpu_state.control_page_paddr = init_paddrs[2];
@@ -763,11 +765,11 @@ fn initQueueMemory() bool {
     while (cursor_page < cursor_pixel_pages) : (cursor_page += 1) {
         gpu_state.cursor_pixels_paddrs[cursor_page] = init_paddrs[7 + cursor_page];
     }
-    clearBytes(queue_page0_va, 8192);
-    clearBytes(cursor_queue_page0_va, 8192);
-    clearBytes(control_page_va, 4096);
-    clearBytes(mem_entries_page0_va, 8192);
-    clearBytes(cursor_pixels_va, cursor_pixel_bytes);
+    clearBytes(gpu_state.queue_base_va, 8192);
+    clearBytes(gpu_state.cursor_queue_base_va, 8192);
+    clearBytes(gpu_state.control_page_va, 4096);
+    clearBytes(gpu_state.mem_entries_base_va, 8192);
+    clearBytes(gpu_state.cursor_pixels_va, cursor_pixel_bytes);
     return true;
 }
 
@@ -879,7 +881,7 @@ fn submitCommand(
         return false;
     }
 
-    clearBytes(control_page_va + control_response_offset, @sizeOf(VirtioGpuRespDisplayInfo));
+    clearBytes(gpu_state.control_page_va + control_response_offset, @sizeOf(VirtioGpuRespDisplayInfo));
     memoryBarrier();
 
     var desc_count: u16 = 0;
@@ -958,7 +960,7 @@ fn submitCommand(
         return false;
     }
     memoryBarrier();
-    const resp: *const volatile VirtioGpuCtrlHdr = @ptrFromInt(control_page_va + control_response_offset);
+    const resp: *const volatile VirtioGpuCtrlHdr = @ptrFromInt(gpu_state.control_page_va + control_response_offset);
     if (resp.type != expected_resp_type) {
         _ = userLog("VirtioGpuGl: bad response\n");
         return false;
@@ -984,7 +986,7 @@ fn submitCursorCommand(req_len: usize) bool {
     const req_mapping = createControlMapping(controlReqPaddr(), req_len, .read, .map_read);
     const resp_mapping = createControlMapping(controlRespPaddr(), @sizeOf(VirtioGpuCtrlHdr), .write, .map_write);
     if (req_mapping == 0 or resp_mapping == 0) return false;
-    clearBytes(control_page_va + control_response_offset, @sizeOf(VirtioGpuCtrlHdr));
+    clearBytes(gpu_state.control_page_va + control_response_offset, @sizeOf(VirtioGpuCtrlHdr));
     memoryBarrier();
 
     cursorQueueDescPtr(0).* = .{
@@ -1025,7 +1027,7 @@ fn submitCursorCommand(req_len: usize) bool {
     gpu_state.cursor_used_idx_seen +%= 1;
     if (used.id != 0) return false;
     memoryBarrier();
-    const resp: *const volatile VirtioGpuCtrlHdr = @ptrFromInt(control_page_va + control_response_offset);
+    const resp: *const volatile VirtioGpuCtrlHdr = @ptrFromInt(gpu_state.control_page_va + control_response_offset);
     if (resp.type != virtio_gpu_resp_ok_nodata) return false;
     if (!setMappingState(req_mapping, .completed) or !setMappingState(resp_mapping, .completed)) return false;
     return releaseMapping(req_mapping) and releaseMapping(resp_mapping);
@@ -1046,13 +1048,13 @@ fn virglCmd0(command: u32, object: u32, len: u32) u32 {
 }
 
 fn getDisplayInfo() bool {
-    const req: *volatile VirtioGpuCtrlHdr = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuCtrlHdr = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = controlHdr(virtio_gpu_cmd_get_display_info);
     if (!submitCommand(@sizeOf(VirtioGpuCtrlHdr), 0, 0, .gpu_admin, virtio_gpu_resp_ok_display_info)) {
         _ = userLog("VirtioGpuGl: display info failed\n");
         return false;
     }
-    const resp: *const volatile VirtioGpuRespDisplayInfo = @ptrFromInt(control_page_va + control_response_offset);
+    const resp: *const volatile VirtioGpuRespDisplayInfo = @ptrFromInt(gpu_state.control_page_va + control_response_offset);
     var chosen = resp.pmodes[0];
     var scanout: u32 = 0;
     var i: usize = 0;
@@ -1088,7 +1090,7 @@ fn queryCapsetInfo() bool {
     };
     var index: u32 = 0;
     while (index < 4) : (index += 1) {
-        const req: *volatile VirtioGpuGetCapsetInfo = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuGetCapsetInfo = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_get_capset_info),
             .capset_index = index,
@@ -1098,7 +1100,7 @@ fn queryCapsetInfo() bool {
             _ = userLog("VirtioGpuGl: capset info failed\n");
             return false;
         }
-        const resp: *const volatile VirtioGpuRespCapsetInfo = @ptrFromInt(control_page_va + control_response_offset);
+        const resp: *const volatile VirtioGpuRespCapsetInfo = @ptrFromInt(gpu_state.control_page_va + control_response_offset);
         if (resp.capset_max_version == 0 or resp.capset_max_size == 0) continue;
         if (resp.capset_id == virtio_gpu_capset_virgl2) {
             selected = resp.*;
@@ -1122,7 +1124,7 @@ fn queryCapsetInfo() bool {
 fn createVirglContext() bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
     const name = "capos-virgl";
-    const req: *volatile VirtioGpuCtxCreate = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuCtxCreate = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = .{
         .hdr = controlHdr(virtio_gpu_cmd_ctx_create),
         .nlen = name.len,
@@ -1145,7 +1147,7 @@ fn createVirglContext() bool {
 fn createVirglResource3d(resource_id: u32, target: u32, format: u32, bind: u32, width: u32, height: u32) bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
     if (width == 0 or height == 0) return false;
-    const req: *volatile VirtioGpuResourceCreate3d = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuResourceCreate3d = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = .{
         .hdr = controlHdr(virtio_gpu_cmd_resource_create_3d),
         .resource_id = resource_id,
@@ -1172,7 +1174,7 @@ fn createVirglResource3d(resource_id: u32, target: u32, format: u32, bind: u32, 
 
 fn attachVirglResourceToContext(resource_id: u32) bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
-    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = .{
         .hdr = controlHdr(virtio_gpu_cmd_ctx_attach_resource),
         .resource_id = resource_id,
@@ -1189,7 +1191,7 @@ fn attachVirglResourceToContext(resource_id: u32) bool {
 
 fn detachVirglResourceFromContext(resource_id: u32) bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0 or resource_id == 0) return false;
-    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = .{
         .hdr = controlHdr(virtio_gpu_cmd_ctx_detach_resource),
         .resource_id = resource_id,
@@ -1206,7 +1208,7 @@ fn detachVirglResourceFromContext(resource_id: u32) bool {
 
 fn unrefVirglResource(resource_id: u32) bool {
     if (resource_id == 0) return false;
-    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuCtxResource = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = .{
         .hdr = controlHdr(virtio_gpu_cmd_resource_unref),
         .resource_id = resource_id,
@@ -1264,15 +1266,17 @@ fn ensureVirglRenderTarget() bool {
 
 fn nextVirglSurfaceId() u32 {
     const surface_id = gpu_state.next_virgl_surface_id;
-    gpu_state.next_virgl_surface_id +%= 1;
-    if (gpu_state.next_virgl_surface_id == 0) gpu_state.next_virgl_surface_id = 1;
+    gpu_state.next_virgl_surface_id +%= virgl_surface_object_stride;
+    if (gpu_state.next_virgl_surface_id < virgl_surface_object_stride) {
+        gpu_state.next_virgl_surface_id = 1;
+    }
     return surface_id;
 }
 
 fn submitVirglNoop() bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
-    clearBytes(mem_entries_page0_va, 4);
-    const commands: [*]volatile u32 = @ptrFromInt(mem_entries_page0_va);
+    clearBytes(gpu_state.mem_entries_base_va, 4);
+    const commands: [*]volatile u32 = @ptrFromInt(gpu_state.mem_entries_base_va);
     commands[0] = virglCmd0(virgl_ccmd_nop, virgl_object_null, 0);
     return submitVirglCommandBuffer(4);
 }
@@ -1281,8 +1285,8 @@ fn submitVirglInlineCommands(inline_bytes: usize) bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
     if (active_request_page_va == 0) return false;
     if (inline_bytes == 0 or inline_bytes > gpu_protocol.request_payload_bytes or (inline_bytes & 0x3) != 0) return false;
-    clearBytes(mem_entries_page0_va, inline_bytes);
-    const dest: [*]volatile u8 = @ptrFromInt(mem_entries_page0_va);
+    clearBytes(gpu_state.mem_entries_base_va, inline_bytes);
+    const dest: [*]volatile u8 = @ptrFromInt(gpu_state.mem_entries_base_va);
     const src: [*]const volatile u8 = @ptrFromInt(active_request_page_va + gpu_protocol.request_header_bytes);
     copyVolatileBytes(dest, src, inline_bytes);
     return submitVirglCommandBuffer(inline_bytes);
@@ -1290,10 +1294,10 @@ fn submitVirglInlineCommands(inline_bytes: usize) bool {
 
 fn submitVirglCommandBuffer(command_bytes: usize) bool {
     if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
-    if (command_bytes == 0 or command_bytes > 4096 or (command_bytes & 0x3) != 0) return false;
+    if (command_bytes == 0 or command_bytes > max_virgl_command_bytes or (command_bytes & 0x3) != 0) return false;
     memoryBarrier();
 
-    const req: *volatile VirtioGpuCmdSubmit = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuCmdSubmit = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = .{
         .hdr = controlHdr(virtio_gpu_cmd_submit_3d),
         .size = @intCast(command_bytes),
@@ -1318,11 +1322,11 @@ fn submitVirglTextureInlineWrite(resource_id: u32, x: u32, y: u32, width: u32, h
     const expected_bytes = @as(usize, width) * @as(usize, height) * 4;
     if (payload_bytes != expected_bytes) return false;
     const padded_bytes = (payload_bytes + 3) & ~@as(usize, 3);
-    const command_bytes = 48 + padded_bytes;
-    if (command_bytes > 4096) return false;
+    const command_bytes = virgl_inline_write_header_bytes + padded_bytes;
+    if (command_bytes > max_virgl_command_bytes) return false;
 
-    clearBytes(mem_entries_page0_va, command_bytes);
-    const commands: [*]volatile u32 = @ptrFromInt(mem_entries_page0_va);
+    clearBytes(gpu_state.mem_entries_base_va, command_bytes);
+    const commands: [*]volatile u32 = @ptrFromInt(gpu_state.mem_entries_base_va);
     commands[0] = virglCmd0(virgl_ccmd_resource_inline_write, virgl_object_null, 11 + @as(u32, @intCast(padded_bytes / 4)));
     commands[1] = resource_id;
     commands[2] = 0;
@@ -1336,7 +1340,7 @@ fn submitVirglTextureInlineWrite(resource_id: u32, x: u32, y: u32, width: u32, h
     commands[10] = height;
     commands[11] = 1;
 
-    const dest: [*]volatile u8 = @ptrFromInt(mem_entries_page0_va + 48);
+    const dest: [*]volatile u8 = @ptrFromInt(gpu_state.mem_entries_base_va + virgl_inline_write_header_bytes);
     const src: [*]const volatile u8 = @ptrFromInt(active_request_page_va + gpu_protocol.request_header_bytes);
     copyVolatileBytes(dest, src, payload_bytes);
     return submitVirglCommandBuffer(command_bytes);
@@ -1374,6 +1378,28 @@ fn uploadVirglTexture2d(resource_id_hint: u32, width: u32, height: u32, payload_
     return resource_id;
 }
 
+fn createVirglAlphaTexture2d(width: u32, height: u32) ?u32 {
+    if (!ensureVirglRenderTarget()) return null;
+    if (width == 0 or height == 0) return null;
+    if (width > 2048 or height > 2048) return null;
+
+    const resource_id = gpu_state.next_virgl_texture_resource_id;
+    gpu_state.next_virgl_texture_resource_id +%= 1;
+    if (gpu_state.next_virgl_texture_resource_id < gpu_protocol.first_virgl_texture_resource_id) {
+        gpu_state.next_virgl_texture_resource_id = gpu_protocol.first_virgl_texture_resource_id;
+    }
+    if (!createVirglResource3d(
+        resource_id,
+        pipe_texture_2d,
+        virgl_format_r8_unorm,
+        pipe_bind_sampler_view,
+        width,
+        height,
+    )) return null;
+    if (!attachVirglResourceToContext(resource_id)) return null;
+    return resource_id;
+}
+
 fn createVirglAppSurface(width: u32, height: u32) ?u64 {
     if (!ensureVirglRenderTarget()) return null;
     if (width == 0 or height == 0) return null;
@@ -1401,8 +1427,51 @@ fn createVirglAppSurface(width: u32, height: u32) ?u64 {
     return @as(u64, resource_id) | (@as(u64, surface_id) << 32);
 }
 
+fn submitVirglAlphaTextureInlineWriteFromVa(resource_id: u32, x: u32, y: u32, width: u32, height: u32, source_va: usize, payload_bytes: usize) bool {
+    if (!gpu_state.virgl_supported or gpu_state.capset_id == 0) return false;
+    if (width == 0 or height == 0 or payload_bytes == 0 or payload_bytes > max_virgl_inline_payload_bytes) return false;
+    const expected_bytes = @as(usize, width) * @as(usize, height);
+    if (payload_bytes != expected_bytes) return false;
+    const padded_bytes = (payload_bytes + 3) & ~@as(usize, 3);
+    const command_bytes = virgl_inline_write_header_bytes + padded_bytes;
+    if (command_bytes > max_virgl_command_bytes) return false;
+
+    clearBytes(gpu_state.mem_entries_base_va, command_bytes);
+    const commands: [*]volatile u32 = @ptrFromInt(gpu_state.mem_entries_base_va);
+    commands[0] = virglCmd0(virgl_ccmd_resource_inline_write, virgl_object_null, 11 + @as(u32, @intCast(padded_bytes / 4)));
+    commands[1] = resource_id;
+    commands[2] = 0;
+    commands[3] = 0;
+    commands[4] = width;
+    commands[5] = @intCast(payload_bytes);
+    commands[6] = x;
+    commands[7] = y;
+    commands[8] = 0;
+    commands[9] = width;
+    commands[10] = height;
+    commands[11] = 1;
+
+    const dest: [*]volatile u8 = @ptrFromInt(gpu_state.mem_entries_base_va + virgl_inline_write_header_bytes);
+    const src: [*]const volatile u8 = @ptrFromInt(source_va);
+    copyVolatileBytes(dest, src, payload_bytes);
+    return submitVirglCommandBuffer(command_bytes);
+}
+
+fn submitVirglAlphaTextureInlineWrite(resource_id: u32, x: u32, y: u32, width: u32, height: u32, payload_bytes: usize) bool {
+    if (active_request_page_va == 0 or payload_bytes > gpu_protocol.request_payload_bytes) return false;
+    return submitVirglAlphaTextureInlineWriteFromVa(
+        resource_id,
+        x,
+        y,
+        width,
+        height,
+        active_request_page_va + gpu_protocol.request_header_bytes,
+        payload_bytes,
+    );
+}
+
 fn paintCursorPixels() void {
-    const pixels: [*]volatile u32 = @ptrFromInt(cursor_pixels_va);
+    const pixels: [*]volatile u32 = @ptrFromInt(gpu_state.cursor_pixels_va);
     var i: usize = 0;
     while (i < @as(usize, cursor_dim) * @as(usize, cursor_dim)) : (i += 1) {
         pixels[i] = 0x0000_0000;
@@ -1429,7 +1498,7 @@ fn ensureCursorResource() bool {
     paintCursorPixels();
 
     {
-        const req: *volatile VirtioGpuResourceCreate2d = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuResourceCreate2d = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_resource_create_2d),
             .resource_id = cursor_resource_id,
@@ -1440,17 +1509,17 @@ fn ensureCursorResource() bool {
         if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, 0, .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) return false;
     }
     {
-        clearBytes(mem_entries_page0_va, cursor_pixel_pages * @sizeOf(VirtioGpuMemEntry));
+        clearBytes(gpu_state.mem_entries_base_va, cursor_pixel_pages * @sizeOf(VirtioGpuMemEntry));
         var page_index: usize = 0;
         while (page_index < cursor_pixel_pages) : (page_index += 1) {
-            const entry: *volatile VirtioGpuMemEntry = @ptrFromInt(mem_entries_page0_va + page_index * @sizeOf(VirtioGpuMemEntry));
+            const entry: *volatile VirtioGpuMemEntry = @ptrFromInt(gpu_state.mem_entries_base_va + page_index * @sizeOf(VirtioGpuMemEntry));
             entry.* = .{
                 .addr = gpu_state.cursor_pixels_paddrs[page_index],
                 .length = 4096,
                 .padding = 0,
             };
         }
-        const req: *volatile VirtioGpuResourceAttachBacking = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuResourceAttachBacking = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_resource_attach_backing),
             .resource_id = cursor_resource_id,
@@ -1459,7 +1528,7 @@ fn ensureCursorResource() bool {
         if (!submitCommand(@sizeOf(VirtioGpuResourceAttachBacking), gpu_state.mem_entries_paddr0, cursor_pixel_pages * @sizeOf(VirtioGpuMemEntry), .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) return false;
     }
     {
-        const req: *volatile VirtioGpuTransferToHost2d = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuTransferToHost2d = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_transfer_to_host_2d),
             .rect = .{ .x = 0, .y = 0, .width = cursor_dim, .height = cursor_dim },
@@ -1470,7 +1539,7 @@ fn ensureCursorResource() bool {
         if (!submitCommand(@sizeOf(VirtioGpuTransferToHost2d), 0, 0, .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) return false;
     }
     {
-        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_resource_flush),
             .rect = .{ .x = 0, .y = 0, .width = cursor_dim, .height = cursor_dim },
@@ -1490,7 +1559,7 @@ fn ensureCursorResource() bool {
 fn setHardwareCursor(x: i32, y: i32) bool {
     const already_ready = gpu_state.cursor_ready;
     if (!ensureCursorResource()) return false;
-    const req: *volatile VirtioGpuUpdateCursor = @ptrFromInt(control_page_va + control_request_offset);
+    const req: *volatile VirtioGpuUpdateCursor = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
     req.* = .{
         .hdr = controlHdr(if (already_ready) virtio_gpu_cmd_move_cursor else virtio_gpu_cmd_update_cursor),
         .pos = .{
@@ -1520,18 +1589,67 @@ fn updateVirglTexture2d(resource_id: u32, x: u32, y: u32, width: u32, height: u3
     return true;
 }
 
+fn updateVirglAlphaTexture2d(resource_id: u32, x: u32, y: u32, width: u32, height: u32, payload_bytes: usize) bool {
+    if (resource_id < gpu_protocol.first_virgl_texture_resource_id) return false;
+    if (!ensureVirglRenderTarget()) return false;
+    if (width == 0 or height == 0) return false;
+    if (payload_bytes != @as(usize, width) * @as(usize, height)) return false;
+    if (!submitVirglAlphaTextureInlineWrite(resource_id, x, y, width, height, payload_bytes)) return false;
+    if (!gpu_state.texture_upload_logged) {
+        _ = userLog("VirtioGpuGl: texture_upload ready\n");
+        gpu_state.texture_upload_logged = true;
+    }
+    return true;
+}
+
+fn updateVirglAlphaTexture2dBulk(resource_id: u32, x: u32, y: u32, width: u32, height: u32, source_va: usize, payload_bytes: usize) bool {
+    if (resource_id < gpu_protocol.first_virgl_texture_resource_id) return false;
+    if (!ensureVirglRenderTarget()) return false;
+    if (width == 0 or height == 0) return false;
+    if (payload_bytes != @as(usize, width) * @as(usize, height)) return false;
+    if (payload_bytes > gpu_bulk_upload_pages * gpu_protocol.page_bytes) return false;
+    const max_rows_per_submit = max_virgl_inline_payload_bytes / @as(usize, width);
+    if (max_rows_per_submit == 0) return false;
+
+    var rows_done: u32 = 0;
+    var copied: usize = 0;
+    while (rows_done < height) {
+        const remaining_rows = height - rows_done;
+        const submit_rows: u32 = @intCast(@min(@as(usize, remaining_rows), max_rows_per_submit));
+        const submit_bytes = @as(usize, submit_rows) * @as(usize, width);
+        if (!submitVirglAlphaTextureInlineWriteFromVa(
+            resource_id,
+            x,
+            y + rows_done,
+            width,
+            submit_rows,
+            source_va + copied,
+            submit_bytes,
+        )) return false;
+        rows_done += submit_rows;
+        copied += submit_bytes;
+    }
+    if (copied != payload_bytes) return false;
+    if (!gpu_state.texture_upload_logged) {
+        _ = userLog("VirtioGpuGl: texture_upload ready\n");
+        gpu_state.texture_upload_logged = true;
+    }
+    return true;
+}
+
 fn allocBacking() bool {
     const total_bytes = @as(usize, gpu_state.width) * @as(usize, gpu_state.height) * 4;
     const page_count = (total_bytes + 4095) / 4096;
     if (page_count == 0 or page_count > max_backing_pages) return false;
     gpu_state.backing_bytes_len = total_bytes;
     gpu_state.backing_page_count = page_count;
+    gpu_state.backing_base_va = user_vm.reservePages(page_count) orelse return false;
 
     var page_index: usize = 0;
     while (page_index < page_count) {
         const remaining = page_count - page_index;
         const chunk_pages = if (remaining > max_alloc_chunk_pages) max_alloc_chunk_pages else remaining;
-        const chunk_base_va = backing_base_va + page_index * 4096;
+        const chunk_base_va = gpu_state.backing_base_va + page_index * 4096;
         if (allocMapPages(@intCast(chunk_base_va), @intCast(chunk_pages), true, @intFromPtr(&backing_paddrs[page_index])) != syscall_ok) return false;
         var j: usize = 0;
         while (j < chunk_pages) : (j += 1) {
@@ -1543,7 +1661,7 @@ fn allocBacking() bool {
 }
 
 fn paintBacking() void {
-    const pixels: [*]volatile u32 = @ptrFromInt(backing_base_va);
+    const pixels: [*]volatile u32 = @ptrFromInt(gpu_state.backing_base_va);
     var y: u32 = 0;
     while (y < gpu_state.height) : (y += 1) {
         var x: u32 = 0;
@@ -1565,7 +1683,7 @@ fn createAndScanout2d() bool {
     paintBacking();
 
     {
-        const req: *volatile VirtioGpuResourceCreate2d = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuResourceCreate2d = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_resource_create_2d),
             .resource_id = gpu_state.resource_id,
@@ -1580,17 +1698,17 @@ fn createAndScanout2d() bool {
     }
 
     {
-        clearBytes(mem_entries_page0_va, 8192);
+        clearBytes(gpu_state.mem_entries_base_va, 8192);
         var i: usize = 0;
         while (i < gpu_state.backing_page_count) : (i += 1) {
-            const entry: *volatile VirtioGpuMemEntry = @ptrFromInt(mem_entries_page0_va + i * @sizeOf(VirtioGpuMemEntry));
+            const entry: *volatile VirtioGpuMemEntry = @ptrFromInt(gpu_state.mem_entries_base_va + i * @sizeOf(VirtioGpuMemEntry));
             entry.* = .{
                 .addr = backing_paddrs[i],
                 .length = 4096,
                 .padding = 0,
             };
         }
-        const req: *volatile VirtioGpuResourceAttachBacking = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuResourceAttachBacking = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_resource_attach_backing),
             .resource_id = gpu_state.resource_id,
@@ -1610,7 +1728,7 @@ fn createAndScanout2d() bool {
 
     const rect = Rect{ .x = 0, .y = 0, .width = gpu_state.width, .height = gpu_state.height };
     {
-        const req: *volatile VirtioGpuSetScanout = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuSetScanout = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_set_scanout),
             .rect = rect,
@@ -1623,7 +1741,7 @@ fn createAndScanout2d() bool {
         }
     }
     {
-        const req: *volatile VirtioGpuTransferToHost2d = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuTransferToHost2d = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_transfer_to_host_2d),
             .rect = rect,
@@ -1637,7 +1755,7 @@ fn createAndScanout2d() bool {
         }
     }
     {
-        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_resource_flush),
             .rect = rect,
@@ -1655,6 +1773,130 @@ fn createAndScanout2d() bool {
     return true;
 }
 
+fn ensureShellFramebufferResource(width: u32, height: u32, pitch: u32, paddr: u64, byte_len: usize) bool {
+    if (width == 0 or height == 0 or pitch < width) return false;
+    if (paddr < @as(u64, gpu_protocol.page_bytes) or (paddr & @as(u64, gpu_protocol.page_bytes - 1)) != 0) return false;
+    const min_bytes = @as(usize, pitch) * @as(usize, height) * 4;
+    if (byte_len < min_bytes) return false;
+    const page_count = (byte_len + gpu_protocol.page_bytes - 1) / gpu_protocol.page_bytes;
+    if (page_count == 0 or page_count > max_backing_pages) return false;
+
+    if (gpu_state.shell_framebuffer_ready) {
+        return gpu_state.shell_framebuffer_paddr == paddr and
+            gpu_state.shell_framebuffer_byte_len == byte_len and
+            gpu_state.shell_framebuffer_width == width and
+            gpu_state.shell_framebuffer_height == height and
+            gpu_state.shell_framebuffer_pitch == pitch;
+    }
+
+    {
+        const req: *volatile VirtioGpuResourceCreate2d = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_resource_create_2d),
+            .resource_id = shell_framebuffer_resource_id,
+            .format = virtio_gpu_format_b8g8r8x8_unorm,
+            .width = pitch,
+            .height = height,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuResourceCreate2d), 0, 0, .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) {
+            _ = userLog("VirtioGpuGl: shell fb resource_create failed\n");
+            return false;
+        }
+    }
+
+    {
+        clearBytes(gpu_state.mem_entries_base_va, 8192);
+        var page_index: usize = 0;
+        while (page_index < page_count) : (page_index += 1) {
+            const remaining = byte_len - page_index * gpu_protocol.page_bytes;
+            const entry_len: u32 = @intCast(if (remaining > gpu_protocol.page_bytes) gpu_protocol.page_bytes else remaining);
+            const entry: *volatile VirtioGpuMemEntry = @ptrFromInt(gpu_state.mem_entries_base_va + page_index * @sizeOf(VirtioGpuMemEntry));
+            entry.* = .{
+                .addr = paddr + @as(u64, @intCast(page_index * gpu_protocol.page_bytes)),
+                .length = entry_len,
+                .padding = 0,
+            };
+        }
+        const req: *volatile VirtioGpuResourceAttachBacking = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_resource_attach_backing),
+            .resource_id = shell_framebuffer_resource_id,
+            .nr_entries = @intCast(page_count),
+        };
+        if (!submitCommand(
+            @sizeOf(VirtioGpuResourceAttachBacking),
+            gpu_state.mem_entries_paddr0,
+            page_count * @sizeOf(VirtioGpuMemEntry),
+            .gpu_resource_2d,
+            virtio_gpu_resp_ok_nodata,
+        )) {
+            _ = userLog("VirtioGpuGl: shell fb attach_backing failed\n");
+            return false;
+        }
+    }
+
+    gpu_state.shell_framebuffer_paddr = paddr;
+    gpu_state.shell_framebuffer_byte_len = byte_len;
+    gpu_state.shell_framebuffer_width = width;
+    gpu_state.shell_framebuffer_height = height;
+    gpu_state.shell_framebuffer_pitch = pitch;
+    gpu_state.shell_framebuffer_ready = true;
+    _ = userLog("VirtioGpuGl: shell framebuffer ready\n");
+    return true;
+}
+
+fn presentShellFramebuffer(width: u32, height: u32, pitch: u32, paddr: u64, byte_len: usize) bool {
+    if (gpu_state.width == 0 or gpu_state.height == 0) {
+        if (!getDisplayInfo()) return false;
+    }
+    if (!ensureShellFramebufferResource(width, height, pitch, paddr, byte_len)) return false;
+
+    const visible_rect = Rect{ .x = 0, .y = 0, .width = width, .height = height };
+    const backing_rect = Rect{ .x = 0, .y = 0, .width = pitch, .height = height };
+    {
+        const req: *volatile VirtioGpuSetScanout = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_set_scanout),
+            .rect = visible_rect,
+            .scanout_id = gpu_state.scanout_id,
+            .resource_id = shell_framebuffer_resource_id,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuSetScanout), 0, 0, .gpu_scanout, virtio_gpu_resp_ok_nodata)) {
+            _ = userLog("VirtioGpuGl: shell fb set_scanout failed\n");
+            return false;
+        }
+    }
+    {
+        const req: *volatile VirtioGpuTransferToHost2d = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_transfer_to_host_2d),
+            .rect = backing_rect,
+            .offset = 0,
+            .resource_id = shell_framebuffer_resource_id,
+            .padding = 0,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuTransferToHost2d), 0, 0, .gpu_resource_2d, virtio_gpu_resp_ok_nodata)) {
+            _ = userLog("VirtioGpuGl: shell fb transfer failed\n");
+            return false;
+        }
+    }
+    {
+        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
+        req.* = .{
+            .hdr = controlHdr(virtio_gpu_cmd_resource_flush),
+            .rect = visible_rect,
+            .resource_id = shell_framebuffer_resource_id,
+            .padding = 0,
+        };
+        if (!submitCommand(@sizeOf(VirtioGpuResourceFlush), 0, 0, .gpu_scanout, virtio_gpu_resp_ok_nodata)) {
+            _ = userLog("VirtioGpuGl: shell fb flush failed\n");
+            return false;
+        }
+    }
+    gpu_state.scanout_ready = true;
+    return true;
+}
+
 fn gpuFeatureFlags() u64 {
     var flags: u64 = 0;
     if (gpu_state.virgl_supported and gpu_state.capset_id != 0) {
@@ -1663,11 +1905,13 @@ fn gpuFeatureFlags() u64 {
         flags |= gpu_protocol.feature_present_3d;
         flags |= gpu_protocol.feature_texture_2d;
         flags |= gpu_protocol.feature_app_surface;
+        flags |= gpu_protocol.feature_texture_bulk;
     }
     if (boot_state.cursor_queue_submit_token != 0 and boot_state.cursor_queue_notify_token != 0) {
         flags |= gpu_protocol.feature_cursor;
     }
     flags |= gpu_protocol.feature_present_2d;
+    flags |= gpu_protocol.feature_shell_framebuffer;
     return flags;
 }
 
@@ -1682,7 +1926,7 @@ fn presentVirglRenderTarget() bool {
     if (!ensureVirglRenderTarget()) return false;
     const rect = Rect{ .x = 0, .y = 0, .width = gpu_state.width, .height = gpu_state.height };
     {
-        const req: *volatile VirtioGpuSetScanout = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuSetScanout = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_set_scanout),
             .rect = rect,
@@ -1695,7 +1939,7 @@ fn presentVirglRenderTarget() bool {
         }
     }
     {
-        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(control_page_va + control_request_offset);
+        const req: *volatile VirtioGpuResourceFlush = @ptrFromInt(gpu_state.control_page_va + control_request_offset);
         req.* = .{
             .hdr = controlHdr(virtio_gpu_cmd_resource_flush),
             .rect = rect,
@@ -1715,14 +1959,6 @@ fn presentVirglRenderTarget() bool {
     return true;
 }
 
-fn gpuSessionRequestVa(index: usize) usize {
-    return gpu_session_base_va + index * gpu_session_stride_bytes;
-}
-
-fn gpuSessionResponseVa(index: usize) usize {
-    return gpuSessionRequestVa(index) + 0x1000;
-}
-
 fn findGpuSession(request_paddr: u64) ?usize {
     var index: usize = 0;
     while (index < gpu_sessions.len) : (index += 1) {
@@ -1733,22 +1969,36 @@ fn findGpuSession(request_paddr: u64) ?usize {
 
 fn acceptGpuSession(request_paddr: u64) ?usize {
     if (request_paddr < 0x1000) return null;
-    if (findGpuSession(request_paddr)) |index| return index;
+    if (findGpuSession(request_paddr)) |index| {
+        gpu_sessions[index].active = false;
+    }
 
     var index: usize = 0;
     while (index < gpu_sessions.len) : (index += 1) {
         if (gpu_sessions[index].active) continue;
-        const request_va = gpuSessionRequestVa(index);
-        const response_va = gpuSessionResponseVa(index);
-        if (mapPage(request_va, request_paddr, false) != syscall_ok) {
+        if (gpu_sessions[index].request_va != 0) continue;
+        const request_page = user_vm.mapPageAtDynamicVa(request_paddr, false) orelse {
             _ = userLog("VirtioGpuGl: map request page failed\n");
+            return null;
+        };
+        const request_va = request_page.va;
+        const request: *const volatile gpu_protocol.RequestHeader = @ptrFromInt(request_va);
+        if (request.magic != gpu_protocol.request_magic or
+            request.version != gpu_protocol.version or
+            request.request_seq == 0 or
+            request.response_paddr < 0x1000 or
+            request.session_nonce == 0)
+        {
+            _ = userLog("VirtioGpuGl: invalid session request\n");
+            gpu_sessions[index].request_va = request_va;
             return null;
         }
         gpu_sessions[index] = .{
             .request_paddr = request_paddr,
             .response_paddr = 0,
+            .session_nonce = request.session_nonce,
             .request_va = request_va,
-            .response_va = response_va,
+            .response_va = 0,
             .last_request_seq = 0,
             .active = true,
         };
@@ -1764,13 +2014,44 @@ fn mapGpuResponsePage(session_index: usize, response_paddr: u64) bool {
     if (gpu_sessions[session_index].response_paddr == response_paddr) return true;
     if (gpu_sessions[session_index].response_paddr != 0) {
         _ = userLog("VirtioGpuGl: response page changed\n");
+        gpu_sessions[session_index].active = false;
         return false;
     }
-    if (mapPage(gpu_sessions[session_index].response_va, response_paddr, true) != syscall_ok) {
+    const response_page = user_vm.mapPageAtDynamicVa(response_paddr, true) orelse {
         _ = userLog("VirtioGpuGl: map response page failed\n");
         return false;
-    }
+    };
+    gpu_sessions[session_index].response_va = response_page.va;
     gpu_sessions[session_index].response_paddr = response_paddr;
+    return true;
+}
+
+fn ensureGpuBulkUploadMappings(session_index: usize, paddrs: []const u64) bool {
+    if (session_index >= gpu_sessions.len or !gpu_sessions[session_index].active) return false;
+    if (paddrs.len == 0 or paddrs.len > gpu_bulk_upload_pages) return false;
+    if (gpu_sessions[session_index].bulk_base_va == 0) {
+        const base_va = user_vm.mapPagesAtDynamicVa(paddrs, false) orelse return false;
+        gpu_sessions[session_index].bulk_base_va = base_va;
+        var page_index: usize = 0;
+        while (page_index < paddrs.len) : (page_index += 1) {
+            gpu_sessions[session_index].bulk_paddrs[page_index] = paddrs[page_index];
+        }
+        gpu_sessions[session_index].bulk_page_count = @intCast(paddrs.len);
+        return true;
+    }
+    const base_va = gpu_sessions[session_index].bulk_base_va;
+    var page_index: usize = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        if (paddrs[page_index] < 0x1000) return false;
+        if (page_index < gpu_sessions[session_index].bulk_page_count) {
+            if (gpu_sessions[session_index].bulk_paddrs[page_index] != paddrs[page_index]) return false;
+            continue;
+        }
+        const va = base_va + page_index * gpu_protocol.page_bytes;
+        if (!user_vm.mapPageAtVa(va, paddrs[page_index], false)) return false;
+        gpu_sessions[session_index].bulk_paddrs[page_index] = paddrs[page_index];
+        gpu_sessions[session_index].bulk_page_count = @intCast(page_index + 1);
+    }
     return true;
 }
 
@@ -1805,6 +2086,7 @@ fn processMappedGpuRequest(session_index: usize) void {
         _ = userLog("VirtioGpuGl: invalid request\n");
         return;
     }
+    if (request.session_nonce != gpu_sessions[session_index].session_nonce) return;
     if (!mapGpuResponsePage(session_index, request.response_paddr)) return;
     active_response_page_va = gpu_sessions[session_index].response_va;
     const op = std.meta.intToEnum(gpu_protocol.Opcode, request.op) catch {
@@ -1930,6 +2212,104 @@ fn processMappedGpuRequest(session_index: usize) void {
             }
             writeGpuResponse(.delete_texture_2d, seq, .ok, resource_id, 0, 0);
         },
+        .create_alpha_texture_2d => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_texture_2d) == 0) {
+                writeGpuResponse(.create_alpha_texture_2d, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const width: u32 = @intCast(request.arg0 & 0xffff_ffff);
+            const height: u32 = @intCast(request.arg0 >> 32);
+            if (width == 0 or height == 0 or request.inline_bytes != 0) {
+                writeGpuResponse(.create_alpha_texture_2d, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            const resource_id = createVirglAlphaTexture2d(width, height) orelse {
+                writeGpuResponse(.create_alpha_texture_2d, seq, .io_error, 0, 0, 0);
+                return;
+            };
+            writeGpuResponse(.create_alpha_texture_2d, seq, .ok, resource_id, width, height);
+        },
+        .update_texture_alpha_2d => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_texture_2d) == 0) {
+                writeGpuResponse(.update_texture_alpha_2d, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const resource_id: u32 = @intCast(request.arg0 & 0xffff_ffff);
+            const x: u32 = @intCast(request.arg0 >> 32);
+            const y: u32 = @intCast(request.arg1 & 0xffff);
+            const width: u32 = @intCast((request.arg1 >> 16) & 0xffff);
+            const height: u32 = @intCast((request.arg1 >> 32) & 0xffff);
+            const inline_bytes: usize = request.inline_bytes;
+            if (inline_bytes == 0 or inline_bytes > gpu_protocol.request_payload_bytes) {
+                writeGpuResponse(.update_texture_alpha_2d, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            if (!updateVirglAlphaTexture2d(resource_id, x, y, width, height, inline_bytes)) {
+                writeGpuResponse(.update_texture_alpha_2d, seq, .io_error, 0, 0, 0);
+                return;
+            }
+            writeGpuResponse(.update_texture_alpha_2d, seq, .ok, resource_id, width, height);
+        },
+        .update_texture_alpha_2d_bulk => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_texture_bulk) == 0) {
+                writeGpuResponse(.update_texture_alpha_2d_bulk, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            const resource_id: u32 = @intCast(request.arg0 & 0xffff_ffff);
+            const x: u32 = @intCast(request.arg0 >> 32);
+            const y: u32 = @intCast(request.arg1 & 0xffff);
+            const width: u32 = @intCast((request.arg1 >> 16) & 0xffff);
+            const height: u32 = @intCast((request.arg1 >> 32) & 0xffff);
+            const payload_bytes = @as(usize, width) * @as(usize, height);
+            const paddr_payload_bytes: usize = request.inline_bytes;
+            if (resource_id == 0 or width == 0 or height == 0 or
+                paddr_payload_bytes == 0 or
+                paddr_payload_bytes > gpu_protocol.request_payload_bytes or
+                (paddr_payload_bytes % @sizeOf(u64)) != 0)
+            {
+                writeGpuResponse(.update_texture_alpha_2d_bulk, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            const page_count = paddr_payload_bytes / @sizeOf(u64);
+            if (page_count == 0 or page_count > gpu_bulk_upload_pages or payload_bytes > page_count * gpu_protocol.page_bytes) {
+                writeGpuResponse(.update_texture_alpha_2d_bulk, seq, .invalid, 0, 0, 0);
+                return;
+            }
+
+            const payload: [*]const volatile u8 = @ptrFromInt(active_request_page_va + gpu_protocol.request_header_bytes);
+            var paddrs: [gpu_bulk_upload_pages]u64 = [_]u64{0} ** gpu_bulk_upload_pages;
+            var page_index: usize = 0;
+            while (page_index < page_count) : (page_index += 1) {
+                var raw: u64 = 0;
+                var byte_index: usize = 0;
+                while (byte_index < @sizeOf(u64)) : (byte_index += 1) {
+                    raw |= @as(u64, payload[page_index * @sizeOf(u64) + byte_index]) << @intCast(byte_index * 8);
+                }
+                if (raw < 0x1000) {
+                    writeGpuResponse(.update_texture_alpha_2d_bulk, seq, .invalid, 0, 0, 0);
+                    return;
+                }
+                paddrs[page_index] = raw;
+            }
+
+            if (!ensureGpuBulkUploadMappings(session_index, paddrs[0..page_count])) {
+                writeGpuResponse(.update_texture_alpha_2d_bulk, seq, .io_error, 0, 0, 0);
+                return;
+            }
+            if (!updateVirglAlphaTexture2dBulk(
+                resource_id,
+                x,
+                y,
+                width,
+                height,
+                gpu_sessions[session_index].bulk_base_va,
+                payload_bytes,
+            )) {
+                writeGpuResponse(.update_texture_alpha_2d_bulk, seq, .io_error, 0, 0, 0);
+                return;
+            }
+            writeGpuResponse(.update_texture_alpha_2d_bulk, seq, .ok, resource_id, width, height);
+        },
         .create_app_surface => {
             if ((gpuFeatureFlags() & gpu_protocol.feature_app_surface) == 0) {
                 writeGpuResponse(.create_app_surface, seq, .unavailable, 0, 0, 0);
@@ -1966,6 +2346,31 @@ fn processMappedGpuRequest(session_index: usize) void {
                 return;
             }
             writeGpuResponse(.present_test_pattern, seq, .ok, gpu_state.width, gpu_state.height, 0);
+        },
+        .present_shell_framebuffer => {
+            if ((gpuFeatureFlags() & gpu_protocol.feature_shell_framebuffer) == 0) {
+                writeGpuResponse(.present_shell_framebuffer, seq, .unavailable, 0, 0, 0);
+                return;
+            }
+            if (request.inline_bytes != @sizeOf(gpu_protocol.ShellFramebufferPayload) or request.arg1 > @as(u64, std.math.maxInt(u32))) {
+                writeGpuResponse(.present_shell_framebuffer, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            const width: u32 = @intCast(request.arg0 & 0xffff_ffff);
+            const height: u32 = @intCast(request.arg0 >> 32);
+            const pitch: u32 = @intCast(request.arg1);
+            const paddr = readRequestPayloadU64(0);
+            const byte_len_u64 = readRequestPayloadU64(8);
+            if (byte_len_u64 > @as(u64, std.math.maxInt(usize))) {
+                writeGpuResponse(.present_shell_framebuffer, seq, .invalid, 0, 0, 0);
+                return;
+            }
+            const byte_len: usize = @intCast(byte_len_u64);
+            if (!presentShellFramebuffer(width, height, pitch, paddr, byte_len)) {
+                writeGpuResponse(.present_shell_framebuffer, seq, .io_error, 0, 0, 0);
+                return;
+            }
+            writeGpuResponse(.present_shell_framebuffer, seq, .ok, width, height, shell_framebuffer_resource_id);
         },
     }
 }
