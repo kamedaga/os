@@ -1,6 +1,6 @@
 const std = @import("std");
-const block_client = @import("support_root").block_client;
-const user_vm = @import("support_root").user_vm;
+const block_client = @import("abi_root").block_client;
+const user_vm = @import("abi_root").user_vm;
 
 const syscall_log: u64 = 0x9;
 const syscall_get_tick_count: u64 = 0x2D;
@@ -160,3 +160,4 @@ pub export fn _start() noreturn {
 
     while (true) asm volatile ("pause");
 }
+

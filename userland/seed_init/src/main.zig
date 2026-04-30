@@ -1,25 +1,25 @@
 const std = @import("std");
-const boot_status_abi = @import("support_root").boot_status_abi;
-const boot_status_client = @import("support_root").boot_status_client;
-const bootfs_format = @import("support_root").bootfs_format;
-const cap_transfer_abi = @import("support_root").cap_transfer_abi;
-const capctl_protocol = @import("support_root").capctl_protocol;
-const image_abi = @import("support_root").image_abi;
-const startup_plan_abi = @import("support_root").startup_plan_abi;
-const queue_abi = @import("support_root").queue_abi;
-const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
-const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
-const manager_init_bootstrap_abi = @import("support_root").manager_init_bootstrap_abi;
-const block_bootstrap = @import("support_root").block_bootstrap_abi;
-const gpu_bootstrap = @import("support_root").gpu_bootstrap_abi;
-const gpu_protocol = @import("support_root").gpu_protocol;
-const persistent_fs_bootstrap = @import("support_root").persistent_fs_bootstrap_abi;
-const process_abi = @import("support_root").process_abi;
-const process_args_env_bootstrap_abi = @import("support_root").process_args_env_bootstrap_abi;
-const process_exit_bootstrap_abi = @import("support_root").process_exit_bootstrap_abi;
-const service_registry_abi = @import("support_root").service_registry_abi;
-const stdio_bootstrap_abi = @import("support_root").stdio_bootstrap_abi;
-const rootfs_core = @import("support_root").rootfs_core;
+const boot_status_abi = @import("abi_root").boot_status_abi;
+const boot_status_client = @import("abi_root").boot_status_client;
+const bootfs_format = @import("abi_root").bootfs_format;
+const cap_transfer_abi = @import("abi_root").cap_transfer_abi;
+const capctl_protocol = @import("abi_root").capctl_protocol;
+const image_abi = @import("abi_root").image_abi;
+const startup_plan_abi = @import("abi_root").startup_plan_abi;
+const queue_abi = @import("abi_root").queue_abi;
+const init_bootstrap_abi = @import("abi_root").init_bootstrap_abi;
+const input_bootstrap = @import("abi_root").input_driver_bootstrap_abi;
+const manager_init_bootstrap_abi = @import("abi_root").manager_init_bootstrap_abi;
+const block_bootstrap = @import("abi_root").block_bootstrap_abi;
+const gpu_bootstrap = @import("abi_root").gpu_bootstrap_abi;
+const gpu_protocol = @import("abi_root").gpu_protocol;
+const persistent_fs_bootstrap = @import("abi_root").persistent_fs_bootstrap_abi;
+const process_abi = @import("abi_root").process_abi;
+const process_args_env_bootstrap_abi = @import("abi_root").process_args_env_bootstrap_abi;
+const process_exit_bootstrap_abi = @import("abi_root").process_exit_bootstrap_abi;
+const service_registry_abi = @import("abi_root").service_registry_abi;
+const stdio_bootstrap_abi = @import("abi_root").stdio_bootstrap_abi;
+const rootfs_core = @import("abi_root").rootfs_core;
 
 const syscall_log: u64 = 0x9;
 const syscall_map_page: u64 = 0x2;
@@ -374,6 +374,10 @@ fn deriveCommandCap(token: u64, opcode_mask: u64) u64 {
 }
 
 fn spawnExecWithExtendedBootstrapTable(exec_token: u64, table: *const process_abi.BootstrapDescriptorTable) u64 {
+    return spawnExecWithExtendedBootstrapTableFlags(exec_token, table, process_abi.spawn_flag_bootstrap_extended_descriptor_table);
+}
+
+fn spawnExecWithExtendedBootstrapTableFlags(exec_token: u64, table: *const process_abi.BootstrapDescriptorTable, flags: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
@@ -381,7 +385,7 @@ fn spawnExecWithExtendedBootstrapTable(exec_token: u64, table: *const process_ab
           [arg0] "{rdi}" (exec_token),
           [arg1] "{rsi}" (@as(u64, @intFromPtr(table))),
           [arg2] "{rdx}" (@as(u64, 0)),
-          [arg3] "{rcx}" (process_abi.spawn_flag_bootstrap_extended_descriptor_table),
+          [arg3] "{rcx}" (flags),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -980,6 +984,8 @@ fn defaultStartupPolicyLabel(policy: *const StartupPolicy) []const u8 {
         .gpu_driver => "gpu driver",
         .persistent_fs_server => "persistent fs",
         .window_service => "window service",
+        .process => "process",
+        .process_builder => "process builder",
         else => "service",
     };
 }
@@ -999,6 +1005,8 @@ fn validateStartupPolicy(policy: *StartupPolicy) void {
         .gpu_driver => {},
         .persistent_fs_server => {},
         .window_service => {},
+        .process => {},
+        .process_builder => {},
         else => startupManifestFail("ManagerInit: unsupported startup action\n"),
     }
     if (policy.name.len == 0) startupManifestFail("ManagerInit: startup manifest name missing\n");
@@ -2447,6 +2455,47 @@ const LaunchContext = struct {
         self.persistent_fs_policy = policy;
     }
 
+    fn launchProcessForPolicy(self: *LaunchContext, policy: StartupPolicy, grant_process_builder: bool) void {
+        const exec = self.requireExecForPolicy(policy);
+        const registry_source_va = self.ensureSharedServiceRegistryPage();
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+
+        generic_service_bootstrap_table_storage = .{};
+        generic_service_bootstrap_table_storage.page_count = 4;
+        generic_service_bootstrap_table_storage.page_descriptors[0] = .{
+            .source_va = registry_source_va,
+            .target_va = process_abi.service_registry_shadow_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[1] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[2] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[3] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+
+        const spawn_flags = process_abi.spawn_flag_bootstrap_extended_descriptor_table |
+            (if (grant_process_builder) process_abi.spawn_flag_child_bootstrap_owner else @as(u64, 0));
+        const spawned = spawnExecWithExtendedBootstrapTableFlags(exec.token, &generic_service_bootstrap_table_storage, spawn_flags);
+        if (process_abi.decodeSpawnedProcessSlot(spawned) == null) {
+            self.logRoleLine("spawn", policy.label, "failed");
+            self.logRoleHex(policy.label, " spawn ret=", spawned);
+            fail("ManagerInit: process spawn failed\n");
+        }
+        self.logRoleLine("spawn", policy.label, "ok");
+    }
+
     fn launchPolicy(self: *LaunchContext, policy: StartupPolicy) void {
         self.ensurePolicyResources(policy);
         switch (policy.action) {
@@ -2455,6 +2504,8 @@ const LaunchContext = struct {
             .gpu_driver => self.launchGpuDriverForPolicy(policy),
             .window_service => self.launchWindowServiceForPolicy(policy),
             .persistent_fs_server => self.launchPersistentFsForPolicy(policy),
+            .process => self.launchProcessForPolicy(policy, false),
+            .process_builder => self.launchProcessForPolicy(policy, true),
             else => startupManifestFail("ManagerInit: unsupported policy action\n"),
         }
     }
@@ -2567,3 +2618,4 @@ pub export fn _start() noreturn {
     }
     managerMain();
 }
+

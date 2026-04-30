@@ -33,6 +33,7 @@ pub const ThreadContext = struct {
     allocated: bool = false,
     owner_process: kernel.PrincipalId = default_process_principal,
     cr3: u64 = 0,
+    fs_base: u64 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
     signal_pending: bool = false,
@@ -43,6 +44,7 @@ pub const ThreadContext = struct {
     ipc_cached_target_thread: usize = 0,
     ipc_reply_token_valid: bool = false,
     ipc_reply_token_target_thread: usize = 0,
+    abi_trap_reply_pending: bool = false,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
 };
@@ -416,6 +418,7 @@ pub fn initThreadContextWithSpaces(
     ctx.allocated = true;
     ctx.owner_process = owner_process;
     ctx.cr3 = x86_platform.cr3WithUserPcid(space.cr3, pcidForPrincipal(owner_process));
+    ctx.fs_base = 0;
     ctx.ready = true;
     ctx.wait_mailbox = false;
     ctx.signal_pending = false;
@@ -631,6 +634,22 @@ pub fn activateThread(thread_index: usize) bool {
     current_thread_index = thread_index;
     current_user_principal = hot.owner_process;
     user_cr3_value = hot.cr3;
+    if (!applyThreadFsBase(thread_index)) return false;
+    return true;
+}
+
+pub fn applyThreadFsBase(thread_index: usize) bool {
+    const ctx = getThreadContextConst(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    x86_platform.writeFsBase(ctx.fs_base);
+    return true;
+}
+
+pub fn setCurrentThreadFsBase(fs_base: u64) bool {
+    const ctx = getThreadContext(current_thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.fs_base = fs_base;
+    x86_platform.writeFsBase(fs_base);
     return true;
 }
 
@@ -652,6 +671,7 @@ pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
     const hot = getIpcHotThreadConst(thread_index) orelse return false;
     if (hot.allocated == 0) return false;
     if (hot.ready == 0) return false;
+    x86_platform.writeFsBase(ctx.fs_base);
     frame.* = ctx.frame;
     return true;
 }

@@ -9,11 +9,13 @@ kernel/zig-out/
 tools/wasmtime_artifact_builder/target
 target/
 **/target/
+tools/pactl/target
 **/zig-out/
 *.pdb
 *.o
 *.obj
 
+legacy/
 
 # Runtime / emulator artifacts
 .artifacts/

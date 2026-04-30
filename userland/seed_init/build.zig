@@ -9,16 +9,16 @@ pub fn build(b: *std.Build) void {
     });
 
     const persistent_fs_layout_mod = b.createModule(.{
-        .root_source_file = b.path("../support/persistent_fs_layout.zig"),
+        .root_source_file = b.path("../programs/abi/persistent_fs_layout.zig"),
     });
-    const support_root_mod = b.createModule(.{
-        .root_source_file = b.path("../support/support_root.zig"),
+    const abi_root_mod = b.createModule(.{
+        .root_source_file = b.path("../programs/abi/abi_root.zig"),
         .target = target,
         .optimize = optimize,
         .code_model = .small,
         .red_zone = false,
     });
-    support_root_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
+    abi_root_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
 
     const seed_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
         .code_model = .small,
         .red_zone = false,
     });
-    seed_mod.addImport("support_root", support_root_mod);
+    seed_mod.addImport("abi_root", abi_root_mod);
     seed_mod.strip = true;
 
     const seed_app = b.addExecutable(.{
@@ -45,3 +45,7 @@ pub fn build(b: *std.Build) void {
     const seed_step = b.step("seed-elf", "Build seed init PIE ELF");
     seed_step.dependOn(&install_seed.step);
 }
+
+
+
+

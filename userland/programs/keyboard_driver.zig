@@ -1,8 +1,8 @@
-const boot_status_abi = @import("support_root").boot_status_abi;
-const boot_status_client = @import("support_root").boot_status_client;
-const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
-const process_abi = @import("support_root").process_abi;
-const user_vm = @import("support_root").user_vm;
+const boot_status_abi = @import("abi_root").boot_status_abi;
+const boot_status_client = @import("abi_root").boot_status_client;
+const input_bootstrap = @import("abi_root").input_driver_bootstrap_abi;
+const process_abi = @import("abi_root").process_abi;
+const user_vm = @import("abi_root").user_vm;
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_send_cap: u64 = 0x6;
@@ -624,3 +624,4 @@ pub export fn _start() noreturn {
         asm volatile ("pause");
     }
 }
+

@@ -1,10 +1,10 @@
 const std = @import("std");
-const cap_transfer_abi = @import("support_root").cap_transfer_abi;
-const gpu_bootstrap = @import("support_root").gpu_bootstrap_abi;
-const gpu_protocol = @import("support_root").gpu_protocol;
-const process_abi = @import("support_root").process_abi;
-const queue_abi = @import("support_root").queue_abi;
-const user_vm = @import("support_root").user_vm;
+const cap_transfer_abi = @import("abi_root").cap_transfer_abi;
+const gpu_bootstrap = @import("abi_root").gpu_bootstrap_abi;
+const gpu_protocol = @import("abi_root").gpu_protocol;
+const process_abi = @import("abi_root").process_abi;
+const queue_abi = @import("abi_root").queue_abi;
+const user_vm = @import("abi_root").user_vm;
 
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_wait_event: u64 = 0x17;
@@ -2427,3 +2427,4 @@ pub export fn _start() noreturn {
         }
     }
 }
+

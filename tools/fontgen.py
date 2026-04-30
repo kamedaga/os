@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 DEFAULT_TTF = Path("tools/Cantarell-Regular.ttf")
-DEFAULT_OUTPUT = Path("userland/support/generated_font.zig")
+DEFAULT_OUTPUT = Path("userland/programs/abi/generated_font.zig")
 DEFAULT_FIRST = 0x20
 DEFAULT_LAST = 0x7E
 
@@ -243,3 +243,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

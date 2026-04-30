@@ -1,4 +1,5 @@
 /// Suspended process construction syscalls for user-space exec loaders.
+const std = @import("std");
 const kernel = @import("../kernel.zig");
 const capability = @import("../capability.zig");
 const scheduler = @import("../scheduler.zig");
@@ -146,6 +147,66 @@ pub fn allocMapPagesToProcess(
             if (!user_copy.writeUserU64(caller, list_va, page.paddr)) return boot_static.syscall_err_map;
         }
     }
+    return boot_static.syscall_ok;
+}
+
+pub fn copyToProcess(caller: kernel.PrincipalId, token: u64, dest_va: u64, src_va: u64, byte_len: u64) u64 {
+    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
+    if (byte_len > process_builder_abi.copy_to_process_max_bytes) return boot_static.syscall_err_invalid;
+    if (byte_len == 0) return boot_static.syscall_ok;
+
+    var buf: [512]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < byte_len) {
+        const remaining = byte_len - copied;
+        const chunk_len_u64 = if (remaining < buf.len) remaining else buf.len;
+        const chunk_len: usize = @intCast(chunk_len_u64);
+        const src_cur, const src_overflow = @addWithOverflow(src_va, copied);
+        if (src_overflow != 0) return boot_static.syscall_err_invalid;
+        const dest_cur, const dest_overflow = @addWithOverflow(dest_va, copied);
+        if (dest_overflow != 0) return boot_static.syscall_err_invalid;
+
+        const chunk = buf[0..chunk_len];
+        if (!user_copy.copyUserBytesFromVa(caller, src_cur, chunk)) return boot_static.syscall_err_invalid;
+        if (!user_copy.copyBytesToUserVa(target, dest_cur, chunk)) return boot_static.syscall_err_map;
+        copied += chunk_len_u64;
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn mprotectSelf(caller: kernel.PrincipalId, target_va: u64, byte_len: u64, prot_bits: u64) u64 {
+    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
+    if (byte_len == 0 or (byte_len & 0xFFF) != 0) return boot_static.syscall_err_invalid;
+    const end_va, const overflow = @addWithOverflow(target_va, byte_len - 1);
+    if (overflow != 0) return boot_static.syscall_err_invalid;
+    if (!capability.isUserCanonicalVa(target_va) or !capability.isUserCanonicalVa(end_va)) return boot_static.syscall_err_invalid;
+    if (byte_len > std.math.maxInt(usize)) return boot_static.syscall_err_invalid;
+    if (!user_vm.protectUserLinearRegionWithProt(caller, target_va, @intCast(byte_len), prot)) {
+        return boot_static.syscall_err_map;
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn setAbiTrapDelegate(
+    caller: kernel.PrincipalId,
+    token: u64,
+    endpoint_id: u64,
+    target_process_slot: u64,
+    flavor: u64,
+) u64 {
+    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
+    const endpoint_target = kernel.processPrincipalFromIndex(@intCast(target_process_slot)) orelse return boot_static.syscall_err_invalid;
+    state_ptr.installEndpoint(target, endpoint_id, endpoint_target) catch |err| switch (err) {
+        kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
+        else => return boot_static.syscall_err_invalid,
+    };
+    state_ptr.setAbiTrapDelegate(target, endpoint_id, @truncate(flavor)) catch |err| switch (err) {
+        kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
+        else => return boot_static.syscall_err_invalid,
+    };
     return boot_static.syscall_ok;
 }
 

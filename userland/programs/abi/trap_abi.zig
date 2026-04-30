@@ -1,0 +1,62 @@
+pub const magic: u64 = 0x3149_4241_5041_5254; // TRAPABI1
+pub const version: u32 = 1;
+
+pub const TrapKind = enum(u32) {
+    abi_syscall = 1,
+    page_fault = 2,
+    illegal_instruction = 3,
+    breakpoint = 4,
+    protection_fault = 5,
+};
+
+pub const AbiFlavor = enum(u32) {
+    native = 0,
+    linux_x86_64 = 1,
+    linux_i386 = 2,
+    wasm_hostcall = 3,
+    debug = 4,
+};
+
+pub const TrapAction = enum(u32) {
+    resume_thread = 0,
+    fail = 1,
+    kill = 2,
+    block = 3,
+    restart = 4,
+};
+
+pub const response_flag_exit: u64 = 1 << 0;
+pub const response_flag_block: u64 = 1 << 1;
+pub const response_flag_restart: u64 = 1 << 2;
+
+pub const max_args: usize = 6;
+pub const request_page_va: u64 = 0x3000_0000;
+pub const syscall_set_abi_trap_delegate: u64 = 0x49;
+pub const syscall_clear_abi_trap_delegate: u64 = 0x4A;
+pub const syscall_map_abi_trap_reply_target_pages: u64 = 0x4C;
+
+pub const TrapRequest = extern struct {
+    magic: u64 = magic,
+    version: u32 = version,
+    kind: u32,
+    flavor: u32,
+    reserved0: u32 = 0,
+    caller_principal: u64,
+    thread_id: u64,
+    rip: u64,
+    rsp: u64,
+    fault_addr: u64,
+    error_code: u64,
+    nr: u64,
+    args: [max_args]u64,
+};
+
+pub const TrapResponse = extern struct {
+    magic: u64 = magic,
+    version: u32 = version,
+    action: u32,
+    flags: u64,
+    result: u64,
+    new_rip: u64,
+    new_rsp: u64,
+};

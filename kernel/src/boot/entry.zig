@@ -316,6 +316,7 @@ fn initMemoryModules() void {
         .page_present = boot_static.page_present,
         .page_rw = boot_static.page_rw,
         .page_user = boot_static.page_user,
+        .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
         .seed_user_pd_with_kernel_identity = x86_platform.seedUserPdWithKernelIdentity,
     });
     pmm.init(.{

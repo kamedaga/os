@@ -14,6 +14,7 @@ pub const Hooks = struct {
     page_present: u64,
     page_rw: u64,
     page_user: u64,
+    flush_user_tlb_for_principal_va: *const fn (principal: kernel.PrincipalId, va: u64) void,
     seed_user_pd_with_kernel_identity: *const fn ([]u64) void,
 };
 
@@ -119,6 +120,47 @@ pub fn mapUserLinearRegionWithProt(
         const pt_index: usize = @intCast((va >> 12) & 0x1FF);
         if ((space.pt_pages[pt_slot][pt_index] & h.page_present) != 0) return false;
         space.pt_pages[pt_slot][pt_index] = paddr | pte_flags;
+    }
+
+    return true;
+}
+
+pub fn protectUserLinearRegionWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+    prot: kernel.MapProt,
+) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (size_bytes == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const size_u64: u64 = @intCast(size_bytes);
+    const map_end_va, const overflow = @addWithOverflow(va_start, size_u64 - 1);
+    if (overflow != 0) return false;
+
+    const user_pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
+    const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);
+    const start_pdp: usize = @intCast((va_start >> 30) & 0x1FF);
+    const end_pml4: usize = @intCast((map_end_va >> 39) & 0x1FF);
+    const end_pdp: usize = @intCast((map_end_va >> 30) & 0x1FF);
+    if (start_pml4 != 0 or end_pml4 != 0) return false;
+    if (start_pdp != user_pdp_index or end_pdp != user_pdp_index) return false;
+
+    var offset: u64 = 0;
+    while (offset < size_u64) : (offset += 4096) {
+        const va = va_start + offset;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = findUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const old_entry = space.pt_pages[pt_slot][pt_index];
+        if ((old_entry & h.page_present) == 0) return false;
+        if ((old_entry & h.page_user) == 0) return false;
+        const paddr = old_entry & ~@as(u64, 0xFFF);
+        space.pt_pages[pt_slot][pt_index] = paddr | pte_flags;
+        h.flush_user_tlb_for_principal_va(principal, va);
     }
 
     return true;

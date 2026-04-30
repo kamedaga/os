@@ -1,7 +1,7 @@
-const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
-const mouse_shared_abi = @import("support_root").mouse_shared_abi;
-const process_abi = @import("support_root").process_abi;
-const user_vm = @import("support_root").user_vm;
+const input_bootstrap = @import("abi_root").input_driver_bootstrap_abi;
+const mouse_shared_abi = @import("abi_root").mouse_shared_abi;
+const process_abi = @import("abi_root").process_abi;
+const user_vm = @import("abi_root").user_vm;
 
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
@@ -519,3 +519,4 @@ pub export fn _start() noreturn {
         _ = waitEvent(false, 1);
     }
 }
+

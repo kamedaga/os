@@ -1,16 +1,16 @@
 const std = @import("std");
 const boot_logo = @import("generated_pacha_logo.zig");
-const boot_manifest_abi = @import("support_root").boot_manifest_abi;
-const boot_status_abi = @import("support_root").boot_status_abi;
-const boot_status_client = @import("support_root").boot_status_client;
-const font = @import("support_root").font;
-const image_abi = @import("support_root").image_abi;
-const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
-const manager_init_bootstrap_abi = @import("support_root").manager_init_bootstrap_abi;
-const bootfs_format = @import("support_root").bootfs_format;
-const process_abi = @import("support_root").process_abi;
-const queue_abi = @import("support_root").queue_abi;
-const rootfs_core = @import("support_root").rootfs_core;
+const boot_manifest_abi = @import("abi_root").boot_manifest_abi;
+const boot_status_abi = @import("abi_root").boot_status_abi;
+const boot_status_client = @import("abi_root").boot_status_client;
+const font = @import("abi_root").font;
+const image_abi = @import("abi_root").image_abi;
+const init_bootstrap_abi = @import("abi_root").init_bootstrap_abi;
+const manager_init_bootstrap_abi = @import("abi_root").manager_init_bootstrap_abi;
+const bootfs_format = @import("abi_root").bootfs_format;
+const process_abi = @import("abi_root").process_abi;
+const queue_abi = @import("abi_root").queue_abi;
+const rootfs_core = @import("abi_root").rootfs_core;
 
 const syscall_log: u64 = 0x9;
 const syscall_map_page: u64 = 0x2;
@@ -1156,3 +1156,4 @@ pub export fn _start() noreturn {
     }
     bootMain();
 }
+

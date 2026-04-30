@@ -58,6 +58,7 @@ pub export var fatal_exception_resume_work_frame: TrapFrame = std.mem.zeroes(Tra
 pub export var timer_interrupt_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
 pub export var syscall_interrupt_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
 pub export var syscall_entry_user_rsp: u64 = 0;
+pub export var syscall_entry_is_lstar: u64 = 0;
 
 pub fn init(new_hooks: Hooks) void {
     hooks = new_hooks;
@@ -900,6 +901,7 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
+            \\movq $0, syscall_entry_is_lstar(%rip)
             \\push %rax
             \\push %rbx
             \\push %rcx
@@ -932,6 +934,7 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
+            \\movq $0, syscall_entry_is_lstar(%rip)
             \\push %rax
             \\push %rbx
             \\push %rcx
@@ -1025,6 +1028,7 @@ pub export fn syscallLstarHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r15
             \\mov %r15, %cr3
             \\pop %r15
+            \\movq $1, syscall_entry_is_lstar(%rip)
             \\pushq %[user_ss]
             \\pushq syscall_entry_user_rsp(%rip)
             \\push %r11
@@ -1119,6 +1123,7 @@ pub export fn syscallLstarHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r15
             \\mov %r15, %cr3
             \\pop %r15
+            \\movq $1, syscall_entry_is_lstar(%rip)
             \\pushq %[user_ss]
             \\pushq syscall_entry_user_rsp(%rip)
             \\push %r11

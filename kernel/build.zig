@@ -60,10 +60,10 @@ pub fn build(b: *std.Build) void {
         .abi = .msvc,
     });
     const kernel_abi_root_mod = b.createModule(.{
-        .root_source_file = b.path("../userland/support/kernel_abi_root.zig"),
+        .root_source_file = b.path("abi/kernel_abi_root.zig"),
     });
     const persistent_fs_layout_mod = b.createModule(.{
-        .root_source_file = b.path("../userland/support/persistent_fs_layout.zig"),
+        .root_source_file = b.path("../userland/programs/abi/persistent_fs_layout.zig"),
     });
     test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
 
@@ -87,14 +87,14 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
         .abi = .none,
     });
-    const support_root_mod = b.createModule(.{
-        .root_source_file = b.path("../userland/support/support_root.zig"),
+    const abi_root_mod = b.createModule(.{
+        .root_source_file = b.path("../userland/programs/abi/abi_root.zig"),
         .target = init_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
         .red_zone = false,
     });
-    support_root_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
+    abi_root_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
     const init_app_mod = b.createModule(.{
         .root_source_file = b.path("../bootstrap/programs/init_app.zig"),
         .target = init_target,
@@ -102,7 +102,7 @@ pub fn build(b: *std.Build) void {
         .code_model = .small,
         .red_zone = false,
     });
-    init_app_mod.addImport("support_root", support_root_mod);
+    init_app_mod.addImport("abi_root", abi_root_mod);
     init_app_mod.strip = true;
     const init_app = b.addExecutable(.{
         .name = "INITAPP",
@@ -127,3 +127,9 @@ pub fn build(b: *std.Build) void {
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
 }
+
+
+
+
+
+

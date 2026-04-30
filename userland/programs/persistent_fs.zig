@@ -1,13 +1,13 @@
 const std = @import("std");
-const cap_transfer_abi = @import("support_root").cap_transfer_abi;
-const fs_abi = @import("support_root").fs_abi;
-const fs_protocol = @import("support_root").fs_protocol;
-const image_abi = @import("support_root").image_abi;
+const cap_transfer_abi = @import("abi_root").cap_transfer_abi;
+const fs_abi = @import("abi_root").fs_abi;
+const fs_protocol = @import("abi_root").fs_protocol;
+const image_abi = @import("abi_root").image_abi;
 const layout = @import("persistent_fs_layout");
-const persistent_fs_bootstrap = @import("support_root").persistent_fs_bootstrap_abi;
-const persistent_volume_store = @import("support_root").persistent_volume_store;
-const process_abi = @import("support_root").process_abi;
-const user_vm = @import("support_root").user_vm;
+const persistent_fs_bootstrap = @import("abi_root").persistent_fs_bootstrap_abi;
+const persistent_volume_store = @import("abi_root").persistent_volume_store;
+const process_abi = @import("abi_root").process_abi;
+const user_vm = @import("abi_root").user_vm;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_log: u64 = 0x9;
@@ -1874,3 +1874,4 @@ pub export fn _start() noreturn {
         pollSessions();
     }
 }
+

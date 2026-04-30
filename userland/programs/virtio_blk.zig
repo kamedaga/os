@@ -1,11 +1,11 @@
 const std = @import("std");
-const cap_transfer_abi = @import("support_root").cap_transfer_abi;
-const block_bootstrap = @import("support_root").block_bootstrap_abi;
-const block_protocol = @import("support_root").block_protocol;
-const fs_abi = @import("support_root").fs_abi;
-const process_abi = @import("support_root").process_abi;
-const queue_abi = @import("support_root").queue_abi;
-const user_vm = @import("support_root").user_vm;
+const cap_transfer_abi = @import("abi_root").cap_transfer_abi;
+const block_bootstrap = @import("abi_root").block_bootstrap_abi;
+const block_protocol = @import("abi_root").block_protocol;
+const fs_abi = @import("abi_root").fs_abi;
+const process_abi = @import("abi_root").process_abi;
+const queue_abi = @import("abi_root").queue_abi;
+const user_vm = @import("abi_root").user_vm;
 
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_map_mmio: u64 = 0xB;
@@ -1217,3 +1217,4 @@ pub export fn _start() noreturn {
         pollSessions();
     }
 }
+

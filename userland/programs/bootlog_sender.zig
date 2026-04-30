@@ -1,5 +1,5 @@
-const mouse_shared_abi = @import("support_root").mouse_shared_abi;
-const window_client = @import("support_root").window_client;
+const mouse_shared_abi = @import("abi_root").mouse_shared_abi;
+const window_client = @import("abi_root").window_client;
 
 const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
@@ -108,3 +108,4 @@ pub export fn _start() noreturn {
     _ = userLog("BootLogSender: boot log page sent\n");
     while (true) asm volatile ("pause");
 }
+

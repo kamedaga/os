@@ -1,21 +1,21 @@
 /// Rootfs shell displayed on the primary framebuffer until the windowed UI takes over.
 const std = @import("std");
-const block_client = @import("support_root").block_client;
-const capctl_protocol = @import("support_root").capctl_protocol;
-const font = @import("support_root").font;
-const fs_abi = @import("support_root").fs_abi;
-const fs_client = @import("support_root").fs_client;
-const fs_protocol = @import("support_root").fs_protocol;
-const gpu_client = @import("support_root").gpu_client;
-const image_abi = @import("support_root").image_abi;
-const input_bootstrap = @import("support_root").input_driver_bootstrap_abi;
-const init_bootstrap_abi = @import("support_root").init_bootstrap_abi;
-const process_abi = @import("support_root").process_abi;
-const process_args_env_bootstrap_abi = @import("support_root").process_args_env_bootstrap_abi;
-const process_exit_bootstrap_abi = @import("support_root").process_exit_bootstrap_abi;
-const service_registry_abi = @import("support_root").service_registry_abi;
-const stdio_bootstrap_abi = @import("support_root").stdio_bootstrap_abi;
-const user_vm = @import("support_root").user_vm;
+const block_client = @import("abi_root").block_client;
+const capctl_protocol = @import("abi_root").capctl_protocol;
+const font = @import("abi_root").font;
+const fs_abi = @import("abi_root").fs_abi;
+const fs_client = @import("abi_root").fs_client;
+const fs_protocol = @import("abi_root").fs_protocol;
+const gpu_client = @import("abi_root").gpu_client;
+const image_abi = @import("abi_root").image_abi;
+const input_bootstrap = @import("abi_root").input_driver_bootstrap_abi;
+const init_bootstrap_abi = @import("abi_root").init_bootstrap_abi;
+const process_abi = @import("abi_root").process_abi;
+const process_args_env_bootstrap_abi = @import("abi_root").process_args_env_bootstrap_abi;
+const process_exit_bootstrap_abi = @import("abi_root").process_exit_bootstrap_abi;
+const service_registry_abi = @import("abi_root").service_registry_abi;
+const stdio_bootstrap_abi = @import("abi_root").stdio_bootstrap_abi;
+const user_vm = @import("abi_root").user_vm;
 
 const syscall_log: u64 = 0x9;
 const syscall_alloc_map_pages: u64 = 0xC;
@@ -3572,3 +3572,4 @@ pub export fn _start() noreturn {
         }
     }
 }
+

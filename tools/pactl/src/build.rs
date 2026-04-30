@@ -164,7 +164,7 @@ fn build_zig_app(
     let imports = zig_imports(src);
     for import in &imports {
         match import.as_str() {
-            "support_root" | "persistent_fs_layout" => {
+            "abi_root" | "persistent_fs_layout" => {
                 cmd.arg("--dep").arg(import);
             }
             other => {
@@ -177,19 +177,19 @@ fn build_zig_app(
     }
     cmd.arg(format!("-Mroot={}", normalize_slashes(&src.entry)));
 
-    if imports.iter().any(|item| item == "support_root") {
+    if imports.iter().any(|item| item == "abi_root") {
         cmd.arg("-target").arg(&app.build.target);
         cmd.arg("-O").arg(&app.build.optimize);
         cmd.arg("-mcmodel=small");
         cmd.arg("-mno-red-zone");
         cmd.arg("--dep").arg("persistent_fs_layout");
-        cmd.arg("-Msupport_root=userland/support/support_root.zig");
+        cmd.arg("-Mabi_root=userland/programs/abi/abi_root.zig");
     }
     if imports
         .iter()
-        .any(|item| item == "support_root" || item == "persistent_fs_layout")
+        .any(|item| item == "abi_root" || item == "persistent_fs_layout")
     {
-        cmd.arg("-Mpersistent_fs_layout=userland/support/persistent_fs_layout.zig");
+        cmd.arg("-Mpersistent_fs_layout=userland/programs/abi/persistent_fs_layout.zig");
     }
 
     cmd.arg("-fPIE");
@@ -482,3 +482,7 @@ fn copy_if_changed(source_path: &Path, output_path: &Path) -> Result<(), String>
     fs::write(output_path, source)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))
 }
+
+
+
+

@@ -30,7 +30,7 @@ impl HostTool {
             Self::BootfsBuilder => &["tools/bootfs_builder.zig"],
             Self::RootfsBuilder | Self::EspBuilder => &[
                 "tools/rootfs_host.zig",
-                "userland/support/persistent_fs_layout.zig",
+                "userland/programs/abi/persistent_fs_layout.zig",
             ],
         }
     }
@@ -81,14 +81,14 @@ pub fn ensure_host_tool(
             cmd.arg("-Mroot=tools/rootfs_builder.zig");
             cmd.arg("--dep").arg("persistent_fs_layout");
             cmd.arg("-Mrootfs_host=tools/rootfs_host.zig");
-            cmd.arg("-Mpersistent_fs_layout=userland/support/persistent_fs_layout.zig");
+            cmd.arg("-Mpersistent_fs_layout=userland/programs/abi/persistent_fs_layout.zig");
         }
         HostTool::EspBuilder => {
             cmd.arg("--dep").arg("rootfs_host");
             cmd.arg("-Mroot=tools/esp_builder.zig");
             cmd.arg("--dep").arg("persistent_fs_layout");
             cmd.arg("-Mrootfs_host=tools/rootfs_host.zig");
-            cmd.arg("-Mpersistent_fs_layout=userland/support/persistent_fs_layout.zig");
+            cmd.arg("-Mpersistent_fs_layout=userland/programs/abi/persistent_fs_layout.zig");
         }
     }
     cmd.arg(workspace_path_flag(
@@ -165,3 +165,5 @@ fn run_command(label: &str, cmd: &mut Command) -> Result<(), String> {
         ))
     }
 }
+
+

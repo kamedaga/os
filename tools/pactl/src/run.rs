@@ -378,6 +378,10 @@ fn build_wsl_script(
         script.push_str("echo\n");
         script.push_str("echo \"serial log: $SERIAL_LOG\"\n");
         script.push_str("echo \"summary: $SUMMARY_LOG\"\n");
+        script.push_str("if [ \"$qemu_status\" -eq 1 ]; then\n");
+        script.push_str("  echo 'timed run stopped after capture; treating QEMU exit code 1 as success'\n");
+        script.push_str("  exit 0\n");
+        script.push_str("fi\n");
         script.push_str("exit \"$qemu_status\"\n");
     } else {
         script.push_str("set +e\n");

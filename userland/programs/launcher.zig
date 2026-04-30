@@ -1,9 +1,9 @@
-const process_abi = @import("support_root").process_abi;
-const process_args_env_bootstrap_abi = @import("support_root").process_args_env_bootstrap_abi;
-const process_exit_bootstrap_abi = @import("support_root").process_exit_bootstrap_abi;
-const stdio_bootstrap_abi = @import("support_root").stdio_bootstrap_abi;
-const user_vm = @import("support_root").user_vm;
-const vfs_client = @import("support_root").vfs_client;
+const process_abi = @import("abi_root").process_abi;
+const process_args_env_bootstrap_abi = @import("abi_root").process_args_env_bootstrap_abi;
+const process_exit_bootstrap_abi = @import("abi_root").process_exit_bootstrap_abi;
+const stdio_bootstrap_abi = @import("abi_root").stdio_bootstrap_abi;
+const user_vm = @import("abi_root").user_vm;
+const vfs_client = @import("abi_root").vfs_client;
 
 const syscall_log: u64 = 0x9;
 
@@ -126,3 +126,4 @@ pub export fn _start() noreturn {
 
     while (true) asm volatile ("pause");
 }
+

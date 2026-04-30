@@ -1,6 +1,6 @@
-const protocol = @import("support_root").window_protocol;
-const user_vm = @import("support_root").user_vm;
-const window_client = @import("support_root").window_client;
+const protocol = @import("abi_root").window_protocol;
+const user_vm = @import("abi_root").user_vm;
+const window_client = @import("abi_root").window_client;
 
 const syscall_log: u64 = 0x9;
 
@@ -181,3 +181,4 @@ pub export fn _start() noreturn {
         prev_y = y2;
     }
 }
+

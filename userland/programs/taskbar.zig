@@ -1,12 +1,12 @@
 const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
-const font = @import("support_root").font;
-const mouse_input = @import("support_root").mouse_input;
-const process_abi = @import("support_root").process_abi;
-const protocol = @import("support_root").window_protocol;
-const taskbar_bootstrap = @import("support_root").taskbar_bootstrap_abi;
-const user_vm = @import("support_root").user_vm;
-const window_client = @import("support_root").window_client;
+const font = @import("abi_root").font;
+const mouse_input = @import("abi_root").mouse_input;
+const process_abi = @import("abi_root").process_abi;
+const protocol = @import("abi_root").window_protocol;
+const taskbar_bootstrap = @import("abi_root").taskbar_bootstrap_abi;
+const user_vm = @import("abi_root").user_vm;
+const window_client = @import("abi_root").window_client;
 
 const window_pixels_va: usize = 0x2030_0000;
 const window_meta_shared_va: usize = 0x3C00_7000;
@@ -577,3 +577,4 @@ pub export fn _start() noreturn {
         last_hovered_index = hovered_index;
     }
 }
+
