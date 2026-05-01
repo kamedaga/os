@@ -488,14 +488,16 @@ fn consumeQueuedIpcMessageForPrincipal(principal: kernel.PrincipalId, frame: *Tr
     return consumeQueuedIpcMessageForThread(thread_index, frame);
 }
 
-fn consumeQueuedAbiTrapReplyForPrincipal(principal: kernel.PrincipalId, frame: *TrapFrame) bool {
+fn consumeQueuedAbiTrapReplyForPrincipal(h: *const Hooks, principal: kernel.PrincipalId, frame: *TrapFrame) bool {
     const thread_index = scheduler.threadSlotForPrincipal(principal) orelse return false;
     if (scheduler.dequeueIpcMessageForThread(thread_index)) |msg| {
         grantQueuedReplyToken(thread_index, msg);
         frame.rax = msg.mr0;
         if (msg.mr2 != 0) frame.rip = msg.mr2;
         if (msg.mr3 != 0) frame.rsp = msg.mr3;
-        _ = msg.mr1;
+        if ((msg.mr1 & trap_abi.response_flag_exit) != 0) {
+            h.exit_current_process(principal, @truncate(msg.mr0), frame);
+        }
         return true;
     }
     return false;
@@ -576,8 +578,10 @@ fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u6
     const target_thread = current_hot.ipc_reply_token_target_thread;
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return syscall_err_endpoint;
     if (!target_ctx.allocated) return syscall_err_endpoint;
-    if (target_ctx.abi_trap_reply_pending and (mr1 & trap_abi.response_flag_exit) != 0) {
-        const target_proc = target_ctx.owner_process;
+    const target_proc = target_ctx.owner_process;
+    if ((mr1 & trap_abi.response_flag_exit) != 0 and
+        (target_ctx.abi_trap_reply_pending or h.state.abiTrapDelegateFor(target_proc) != null))
+    {
         _ = reclaimPrivatePagesForProcess(h, target_proc);
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
         target_ctx.abi_trap_reply_pending = false;
@@ -832,6 +836,28 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
             return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
         }
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
+        if ((save.mr1 & trap_abi.response_flag_exit) != 0 and
+            (target_ctx.abi_trap_reply_pending or h.state.abiTrapDelegateFor(target.principal) != null))
+        {
+            _ = reclaimPrivatePagesForProcess(h, target.principal);
+            target_ctx.abi_trap_reply_pending = false;
+            _ = h.state.markProcessExited(target.principal);
+            _ = scheduler.releaseThreadSlot(target.thread_index);
+
+            if (scheduler.dequeueIpcMessageForThread(current_thread)) |msg| {
+                return writeCurrentIpcSignalQueuedReturn(out_frame, save, msg);
+            }
+            if (current_hot.signal_pending != 0) {
+                current_ctx.signal_pending = false;
+                scheduler.setIpcHotSignalPending(current_thread, false);
+                return writeCurrentIpcSignalReturn(out_frame, save, syscall_ok);
+            }
+            out_frame.* = trapFrameFromIpcSignalSave(save, syscall_ok);
+            if (!scheduler.blockCurrentThreadForEvent(out_frame, false, 0, syscall_ok)) {
+                return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+            }
+            return @intFromPtr(out_frame);
+        }
     }
 
     const target_was_ready = target_hot.ready != 0;
@@ -973,7 +999,7 @@ fn dispatchAbiTrapDelegate(
     );
     if (status != syscall_ok) return status;
 
-    if (consumeQueuedAbiTrapReplyForPrincipal(proc, frame)) return frame.rax;
+    if (consumeQueuedAbiTrapReplyForPrincipal(h, proc, frame)) return frame.rax;
     if (h.consume_pending_signal_for_principal(proc)) return syscall_ok;
 
     current_ctx.abi_trap_reply_pending = true;

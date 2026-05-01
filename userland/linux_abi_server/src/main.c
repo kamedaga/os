@@ -138,7 +138,7 @@ enum {
     EXEC_LOADER_BOOTSTRAP_MAGIC = 0x5845434C44523031ULL,
     EXEC_LOADER_BOOTSTRAP_VERSION = 2,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
-    LINUX_ABI_BOOTSTRAP_VERSION = 1,
+    LINUX_ABI_BOOTSTRAP_VERSION = 2,
     LINUX_ABI_BOOTSTRAP_READY = 0x4C414249524459ULL,
     EXEC_LOADER_CONFIG_TARGET_VA = 0x3C002000,
     LINUX_ABI_CONFIG_TARGET_VA = 0x3C002000,
@@ -204,6 +204,8 @@ struct linux_abi_bootstrap_config {
     u64 magic;
     u64 version;
     u64 exec_loader_vm_token;
+    u64 standard_interpreter_vm_token;
+    u64 standard_interpreter_file_bytes;
     u64 abi_trap_request_page_va;
     u64 status;
 };
@@ -215,6 +217,8 @@ static struct vfs_client g_vfs;
 static struct fd_entry g_fds[32];
 static int execve_scratch_ready = 0;
 static u64 g_exec_loader_vm_token = 0;
+static u64 g_standard_interpreter_vm_token = 0;
+static u64 g_standard_interpreter_bytes = 0;
 
 enum { VM_REGION_MAX = 64 };
 struct vm_region { u64 start; u64 size; u64 prot; int used; };
@@ -486,13 +490,12 @@ static int configure_exec_args_from_target(struct exec_loader_config *cfg, const
 static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_va) {
     if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
 
-    u64 main_bytes = 0, ld_bytes = 0;
+    u64 main_bytes = 0;
     if (!is_vm_object_token(g_exec_loader_vm_token)) { user_log("LinuxAbiServer: execve loader token absent\n"); return 0; }
+    if (!is_vm_object_token(g_standard_interpreter_vm_token) || g_standard_interpreter_bytes == 0) { user_log("LinuxAbiServer: execve interpreter token absent\n"); return 0; }
     if (!vfs_read_file_to_buffer(path, EXECVE_MAIN_IMAGE_VA, EXECVE_MAX_IMAGE_BYTES, &main_bytes)) { user_log("LinuxAbiServer: execve main read failed\n"); return 0; }
-    if (!vfs_read_file_to_buffer("/lib/ld-musl-x86_64.so.1", EXECVE_LD_IMAGE_VA, EXECVE_MAX_LD_BYTES, &ld_bytes)) { user_log("LinuxAbiServer: execve ld read failed\n"); return 0; }
     const u64 main_vm_token = install_vm_object_from_buffer(EXECVE_MAIN_IMAGE_VA, main_bytes);
-    const u64 ld_vm_token = install_vm_object_from_buffer(EXECVE_LD_IMAGE_VA, ld_bytes);
-    if (main_vm_token == 0 || ld_vm_token == 0) { user_log("LinuxAbiServer: execve vm install failed\n"); return 0; }
+    if (main_vm_token == 0) { user_log("LinuxAbiServer: execve vm install failed\n"); return 0; }
     const u64 loader_exec_token = install_exec_image_from_vm(g_exec_loader_vm_token);
     if (loader_exec_token == 0) { user_log("LinuxAbiServer: execve loader exec install failed\n"); return 0; }
 
@@ -502,7 +505,7 @@ static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_
     cfg->magic = EXEC_LOADER_BOOTSTRAP_MAGIC;
     cfg->version = EXEC_LOADER_BOOTSTRAP_VERSION;
     cfg->executable_file_bytes = main_bytes;
-    cfg->interpreter_file_bytes = ld_bytes;
+    cfg->interpreter_file_bytes = g_standard_interpreter_bytes;
     cfg->abi_trap_endpoint_id = LINUX_ABI_ENDPOINT_ID;
     cfg->abi_trap_endpoint_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     cfg->abi_trap_flavor = 1;
@@ -520,7 +523,7 @@ static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_
     table->cap_descriptors[0].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, executable_vm_token);
     table->cap_descriptors[0].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[0].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
-    table->cap_descriptors[1].source_token = ld_vm_token;
+    table->cap_descriptors[1].source_token = g_standard_interpreter_vm_token;
     table->cap_descriptors[1].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, interpreter_vm_token);
     table->cap_descriptors[1].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[1].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
@@ -855,6 +858,8 @@ void linux_abi_main(void) {
     }
     trap_request_page_va = cfg->abi_trap_request_page_va;
     g_exec_loader_vm_token = cfg->exec_loader_vm_token;
+    g_standard_interpreter_vm_token = cfg->standard_interpreter_vm_token;
+    g_standard_interpreter_bytes = cfg->standard_interpreter_file_bytes;
     const u64 request_page_status = alloc_map_pages(trap_request_page_va, 1, 0x1);
     if (request_page_status != SYSCALL_OK) { user_log("LinuxAbiServer: request page map failed\n"); user_log_hex_value(request_page_status); for (;;) __asm__ volatile("pause"); }
     init_fds();
