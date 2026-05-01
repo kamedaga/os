@@ -29,13 +29,12 @@ if [ -z "$libc_so" ]; then
 fi
 
 cp "$libc_so" userland/fixtures/libc.so
+cp "$libc_so" userland/fixtures/ld-musl-x86_64.so.1
 
 "$cc" \
   -fPIE \
   -pie \
-  -nostartfiles \
-  -Wl,-e,_start \
-  -Wl,--dynamic-linker=/lib/ld.so \
+  -Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
   -Wl,-rpath,/lib \
   -Wl,-z,now \
   -Wl,-z,relro \

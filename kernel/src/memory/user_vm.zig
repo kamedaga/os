@@ -166,6 +166,193 @@ pub fn protectUserLinearRegionWithProt(
     return true;
 }
 
+pub fn unmapUserLinearRegion(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (size_bytes == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const size_u64: u64 = @intCast(size_bytes);
+    const map_end_va, const overflow = @addWithOverflow(va_start, size_u64 - 1);
+    if (overflow != 0) return false;
+
+    const user_pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
+    const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);
+    const start_pdp: usize = @intCast((va_start >> 30) & 0x1FF);
+    const end_pml4: usize = @intCast((map_end_va >> 39) & 0x1FF);
+    const end_pdp: usize = @intCast((map_end_va >> 30) & 0x1FF);
+    if (start_pml4 != 0 or end_pml4 != 0) return false;
+    if (start_pdp != user_pdp_index or end_pdp != user_pdp_index) return false;
+
+    var offset: u64 = 0;
+    while (offset < size_u64) : (offset += 4096) {
+        const va = va_start + offset;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = findUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const old_entry = space.pt_pages[pt_slot][pt_index];
+        if ((old_entry & h.page_present) == 0) return false;
+        if ((old_entry & h.page_user) == 0) return false;
+    }
+
+    offset = 0;
+    while (offset < size_u64) : (offset += 4096) {
+        const va = va_start + offset;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = findUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        space.pt_pages[pt_slot][pt_index] = 0;
+        h.flush_user_tlb_for_principal_va(principal, va);
+    }
+
+    return true;
+}
+
+pub fn collectUserLinearRegionPaddrs(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+    out_paddrs: []u64,
+) ?usize {
+    const h = hooks orelse return null;
+    const space = getUserSpace(principal) orelse return null;
+    if (size_bytes == 0) return null;
+    if ((va_start & 0xFFF) != 0) return null;
+
+    const size_u64: u64 = @intCast(size_bytes);
+    if ((size_u64 & 0xFFF) != 0) return null;
+    const page_count: usize = @intCast(size_u64 / 4096);
+    if (page_count == 0 or page_count > out_paddrs.len) return null;
+    const map_end_va, const overflow = @addWithOverflow(va_start, size_u64 - 1);
+    if (overflow != 0) return null;
+
+    const user_pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
+    const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);
+    const start_pdp: usize = @intCast((va_start >> 30) & 0x1FF);
+    const end_pml4: usize = @intCast((map_end_va >> 39) & 0x1FF);
+    const end_pdp: usize = @intCast((map_end_va >> 30) & 0x1FF);
+    if (start_pml4 != 0 or end_pml4 != 0) return null;
+    if (start_pdp != user_pdp_index or end_pdp != user_pdp_index) return null;
+
+    var page_index: usize = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index * 4096));
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = findUserPtSlotForPd(space, pd_index) orelse return null;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const old_entry = space.pt_pages[pt_slot][pt_index];
+        if ((old_entry & h.page_present) == 0) return null;
+        if ((old_entry & h.page_user) == 0) return null;
+        out_paddrs[page_index] = old_entry & ~@as(u64, 0xFFF);
+    }
+
+    return page_count;
+}
+
+pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
+    const h = hooks orelse return 0;
+    const space = getUserSpace(principal) orelse return 0;
+    if ((paddr & 0xFFF) != 0) return 0;
+
+    const user_pdp_index: u64 = (h.user_va >> 30) & 0x1FF;
+    var removed: usize = 0;
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        const pd_index_meta = space.pt_page_pd_index[slot];
+        if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
+        const pd_index: usize = @intCast(pd_index_meta);
+        var pt_index: usize = 0;
+        while (pt_index < h.page_entries) : (pt_index += 1) {
+            const old_entry = space.pt_pages[slot][pt_index];
+            if ((old_entry & h.page_present) == 0) continue;
+            if ((old_entry & h.page_user) == 0) continue;
+            if ((old_entry & ~@as(u64, 0xFFF)) != paddr) continue;
+            space.pt_pages[slot][pt_index] = 0;
+            const va = (user_pdp_index << 30) |
+                (@as(u64, @intCast(pd_index)) << 21) |
+                (@as(u64, @intCast(pt_index)) << 12);
+            h.flush_user_tlb_for_principal_va(principal, va);
+            removed += 1;
+        }
+    }
+    return removed;
+}
+
+pub fn collectUserMappedPaddrs(principal: kernel.PrincipalId, out_paddrs: []u64) usize {
+    const h = hooks orelse return 0;
+    const space = getUserSpace(principal) orelse return 0;
+    var count: usize = 0;
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        if (space.pt_page_pd_index[slot] == UserAddressSpace.no_pd_index) continue;
+        var pt_index: usize = 0;
+        while (pt_index < h.page_entries) : (pt_index += 1) {
+            const entry = space.pt_pages[slot][pt_index];
+            if ((entry & h.page_present) == 0) continue;
+            if ((entry & h.page_user) == 0) continue;
+            const paddr = entry & ~@as(u64, 0xFFF);
+            if (paddr == 0) continue;
+            var duplicate = false;
+            for (out_paddrs[0..count]) |seen| {
+                if (seen == paddr) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (count >= out_paddrs.len) return count;
+            out_paddrs[count] = paddr;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+pub const MappedUserPage = struct {
+    va: u64,
+    paddr: u64,
+};
+
+pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []MappedUserPage) usize {
+    const h = hooks orelse return 0;
+    const space = getUserSpace(principal) orelse return 0;
+    const user_pdp_index: u64 = (h.user_va >> 30) & 0x1FF;
+    var count: usize = 0;
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        const pd_index_meta = space.pt_page_pd_index[slot];
+        if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
+        const pd_index: usize = @intCast(pd_index_meta);
+        var pt_index: usize = 0;
+        while (pt_index < h.page_entries) : (pt_index += 1) {
+            const entry = space.pt_pages[slot][pt_index];
+            if ((entry & h.page_present) == 0) continue;
+            if ((entry & h.page_user) == 0) continue;
+            const paddr = entry & ~@as(u64, 0xFFF);
+            if (paddr == 0) continue;
+            var duplicate = false;
+            for (out_pages[0..count]) |seen| {
+                if (seen.paddr == paddr) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (count >= out_pages.len) return count;
+            const va = (user_pdp_index << 30) |
+                (@as(u64, @intCast(pd_index)) << 21) |
+                (@as(u64, @intCast(pt_index)) << 12);
+            out_pages[count] = .{ .va = va, .paddr = paddr };
+            count += 1;
+        }
+    }
+    return count;
+}
+
 pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64, user_stack_paddr: u64) bool {
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;

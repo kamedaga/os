@@ -653,6 +653,14 @@ pub fn setCurrentThreadFsBase(fs_base: u64) bool {
     return true;
 }
 
+pub fn setThreadFsBase(thread_index: usize, fs_base: u64) bool {
+    const ctx = getThreadContext(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.fs_base = fs_base;
+    if (thread_index == current_thread_index) x86_platform.writeFsBase(fs_base);
+    return true;
+}
+
 pub fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
     const ctx = getThreadContext(current_thread_index) orelse return;
     if (!ctx.allocated) return;

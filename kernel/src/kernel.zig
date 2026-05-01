@@ -525,6 +525,15 @@ pub const FreePageList = struct {
         self.len += 1;
     }
 
+    pub fn canAppendPage(self: *const FreePageList, region_id: u64, paddr: u64) bool {
+        if (self.range_len > 0) {
+            const last = &self.ranges[self.range_len - 1];
+            const expected_next = last.physical_start + (@as(u64, last.len) * 4096);
+            if (last.region_id == region_id and paddr == expected_next) return true;
+        }
+        return self.range_len < self.ranges.len;
+    }
+
     pub fn popFront(self: *FreePageList) KernelError!u64 {
         if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
 
@@ -1725,6 +1734,27 @@ pub const KernelState = struct {
         }
         // Freshly allocated pages are not mapped yet, so no PTE rights sync is needed here.
         return cap;
+    }
+
+    pub fn reclaimExclusiveRootPage(
+        self: *KernelState,
+        owner: PrincipalId,
+        paddr: u64,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        if (!free_list.canAppendPage(0, paddr)) return KernelError.TooManyFreeRanges;
+        const table = self.getTable(owner);
+        const cap = table.find(paddr) orelse return KernelError.CapabilityNotFound;
+        if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) return KernelError.InvalidState;
+        switch (self.scanCapTables(paddr)) {
+            .owner => |actual_owner| if (actual_owner != owner) return KernelError.InvalidState,
+            .shared, .none => return KernelError.InvalidState,
+        }
+        _ = table.removeByPaddr(paddr);
+        self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
+        try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
+        try free_list.appendPage(0, paddr);
     }
 
     pub fn createUntypedBlock(

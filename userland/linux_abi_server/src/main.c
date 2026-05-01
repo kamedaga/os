@@ -5,21 +5,31 @@ typedef unsigned long long u64;
 typedef long long i64;
 typedef int i32;
 
+#define OFFSETOF(type, member) __builtin_offsetof(type, member)
+
 enum {
     SYSCALL_ALLOC_PAGE = 0x1,
     SYSCALL_MAP_PAGE = 0x2,
     SYSCALL_LOG = 0x9,
     SYSCALL_ALLOC_MAP_PAGES = 0xC,
     SYSCALL_WAIT_EVENT = 0x17,
+    SYSCALL_SPAWN_EXEC = 0x1D,
+    SYSCALL_INSTALL_VM_OBJECT = 0x1E,
+    SYSCALL_INSTALL_EXEC_IMAGE = 0x20,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
+    SYSCALL_PROCESS_EXIT = 0x34,
     SYSCALL_IPC_CALL_REPLY_RECV = 0x40,
     SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES = 0x4C,
     SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET = 0x4D,
     SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET = 0x4E,
+    SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE = 0x4F,
+    SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES = 0x50,
+    SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES = 0x51,
+    SYSCALL_RECLAIM_ABI_TRAP_REPLY_TARGET_PRIVATE_PAGES = 0x52,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     IPC_CALL_FLAG_SIGNAL_ONLY = 0x2,
@@ -54,6 +64,7 @@ enum {
     FS_OP_READDIR = 19,
     FS_OP_STAT = 20,
     FS_OP_CLOSE = 21,
+    FS_OP_OPEN_EXEC = 32,
     FS_STATUS_OK = 0,
     FS_STATUS_END_OF_DIR = 10,
     FS_OBJECT_NONE = 0,
@@ -61,6 +72,7 @@ enum {
     FS_OBJECT_DIRECTORY = 2,
     FS_OBJECT_FILE = 3,
     FS_OBJECT_OPEN_FILE = 4,
+    FS_OBJECT_EXEC = 5,
     FS_DIR_MODE = 0x4000,
     FS_FILE_MODE = 0x8000,
 
@@ -73,13 +85,17 @@ enum {
     LINUX_SYS_LSTAT = 6,
     LINUX_SYS_LSEEK = 8,
     LINUX_SYS_MMAP = 9,
+    LINUX_SYS_MPROTECT = 10,
     LINUX_SYS_MUNMAP = 11,
     LINUX_SYS_BRK = 12,
     LINUX_SYS_RT_SIGACTION = 13,
     LINUX_SYS_RT_SIGPROCMASK = 14,
     LINUX_SYS_IOCTL = 16,
+    LINUX_SYS_PREAD64 = 17,
+    LINUX_SYS_WRITEV = 20,
     LINUX_SYS_ACCESS = 21,
     LINUX_SYS_GETPID = 39,
+    LINUX_SYS_EXECVE = 59,
     LINUX_SYS_EXIT = 60,
     LINUX_SYS_ARCH_PRCTL = 158,
     LINUX_SYS_GETTID = 186,
@@ -107,6 +123,35 @@ enum {
     DT_REG = 8,
 
     TRAP_RESPONSE_FLAG_EXIT = 1,
+    ARCH_SET_FS = 0x1002,
+
+    SPAWN_RESULT_TAG = 1ULL << 63,
+    SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
+    SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1 << 2,
+    SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1 << 3,
+    BOOTSTRAP_CAP_KIND_VM_OBJECT = 2,
+    VM_OBJECT_TOKEN_TAG = 1ULL << 62,
+    EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
+    VM_RIGHT_READ_MAP = 0x5,
+    VM_RIGHT_READ_MAP_GRANT = 0xD,
+    EXEC_RIGHT_EXEC_GRANT = 0x3,
+    EXEC_LOADER_BOOTSTRAP_MAGIC = 0x5845434C44523031ULL,
+    EXEC_LOADER_BOOTSTRAP_VERSION = 2,
+    LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
+    LINUX_ABI_BOOTSTRAP_VERSION = 1,
+    LINUX_ABI_BOOTSTRAP_READY = 0x4C414249524459ULL,
+    EXEC_LOADER_CONFIG_TARGET_VA = 0x3C002000,
+    LINUX_ABI_CONFIG_TARGET_VA = 0x3C002000,
+    LINUX_ABI_ENDPOINT_ID = 0x90,
+    EXECVE_MAIN_IMAGE_VA = 0x26000000,
+    EXECVE_LD_IMAGE_VA = 0x26200000,
+    EXECVE_CONFIG_VA = 0x26400000,
+    EXECVE_TABLE_VA = 0x26401000,
+    EXECVE_MAX_IMAGE_BYTES = 2 * 1024 * 1024,
+    EXECVE_MAX_LD_BYTES = 768 * 1024,
+    EXECVE_MAX_ARGV = 8,
+    EXECVE_MAX_ENVP = 16,
+    EXECVE_MAX_ARG_DATA_BYTES = 2048,
 };
 
 struct ipc_message { u64 status; u64 request_va; u64 reserved0; u64 reserved1; u64 reserved2; };
@@ -137,25 +182,58 @@ enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3 };
 struct fd_entry { enum fd_kind kind; u64 token; u64 offset; u64 size; u32 mode_bits; u8 object_kind; };
 struct vfs_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
 
+struct exec_loader_config {
+    u64 magic; u64 version; u64 executable_vm_token; u64 executable_file_bytes; u64 flags;
+    u64 interpreter_vm_token; u64 interpreter_file_bytes; u64 bootfs_vm_token; u64 bootfs_file_bytes;
+    u64 fs_endpoint_id; u64 fs_compat_process_slot; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_process_slot;
+    u64 abi_trap_flavor; u64 abi_trap_request_page_va;
+    u16 execfn_offset; u16 execfn_bytes; u16 argv_count; u16 envp_count; u16 arg_data_bytes; u16 reserved_arg0;
+    u16 argv_offsets[EXECVE_MAX_ARGV]; u16 argv_bytes[EXECVE_MAX_ARGV];
+    u16 envp_offsets[EXECVE_MAX_ENVP]; u16 envp_bytes[EXECVE_MAX_ENVP];
+    u8 arg_data[EXECVE_MAX_ARG_DATA_BYTES];
+};
+
+struct bootstrap_page_descriptor { u64 source_va; u64 target_va; u64 flags; };
+struct bootstrap_cap_descriptor { u64 source_token; u64 target_token_va; u64 rights_bits; u8 kind; u8 reserved[7]; };
+struct bootstrap_descriptor_table {
+    u16 page_count; u16 cap_count; u32 reserved0;
+    struct bootstrap_page_descriptor page_descriptors[136];
+    struct bootstrap_cap_descriptor cap_descriptors[8];
+};
+struct linux_abi_bootstrap_config {
+    u64 magic;
+    u64 version;
+    u64 exec_loader_vm_token;
+    u64 abi_trap_request_page_va;
+    u64 status;
+};
+
 static u64 mmap_next_va = 0x31000000ULL;
 static u64 brk_next_va = 0x38000000ULL;
 static u64 trap_request_page_va = 0;
 static struct vfs_client g_vfs;
 static struct fd_entry g_fds[32];
+static int execve_scratch_ready = 0;
+static u64 g_exec_loader_vm_token = 0;
+
+enum { VM_REGION_MAX = 64 };
+struct vm_region { u64 start; u64 size; u64 prot; int used; };
+static struct vm_region g_regions[VM_REGION_MAX];
 
 static u64 cstr_len(const char *s) { u64 n = 0; while (s[n] != 0) n++; return n; }
 static void user_log_len(const char *message, u64 len) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"((u64)SYSCALL_LOG), "D"((u64)message), "S"(len) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); (void)ret; }
 static void user_log(const char *message) { user_log_len(message, cstr_len(message)); }
 static void user_log_hex_value(u64 value) { static const char hex[] = "0123456789ABCDEF"; char buf[32]; u64 pos = 0; buf[pos++] = '0'; buf[pos++] = 'x'; int started = 0; for (int shift = 60; shift >= 0; shift -= 4) { unsigned nibble = (unsigned)((value >> (u64)shift) & 0xFULL); if (nibble != 0 || started || shift == 0) { buf[pos++] = hex[nibble]; started = 1; } } buf[pos++] = '\n'; user_log_len(buf, pos); }
-static void log_syscall_nr(u64 nr) { user_log("LinuxAbiServer: syscall\n"); user_log_hex_value(nr); }
 static void clear_page(u64 va) { volatile u64 *p = (volatile u64 *)va; for (u64 i = 0; i < 512; i++) p[i] = 0; }
 static u64 min_u64(u64 a, u64 b) { return a < b ? a : b; }
 static u64 align_up(u64 value, u64 align) { return (value + align - 1) & ~(align - 1); }
 
 static u64 syscall0(u64 nr) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
+static u64 syscall1(u64 nr, u64 a0) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall2(u64 nr, u64 a0, u64 a1) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall3(u64 nr, u64 a0, u64 a1, u64 a2) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3) : "r8", "r9", "r10", "r11", "memory"); return ret; }
+static void process_exit(u64 code) { (void)syscall2(SYSCALL_PROCESS_EXIT, code, 0); for (;;) __asm__ volatile("pause"); }
 
 static struct ipc_message wait_ipc(void) {
     register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 0; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
@@ -168,7 +246,6 @@ static struct ipc_message reply(u64 result, u64 flags) {
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
 
-static u64 errno_perm(void) { return (u64)(i64)-1; }
 static u64 errno_noent(void) { return (u64)(i64)-2; }
 static u64 errno_io(void) { return (u64)(i64)-5; }
 static u64 errno_badf(void) { return (u64)(i64)-9; }
@@ -183,8 +260,11 @@ static u64 errno_nosys(void) { return (u64)(i64)-38; }
 static u64 errno_nametoolong(void) { return (u64)(i64)-36; }
 
 static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
+static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
+static u64 unmap_reply_target_pages(u64 target_va, u64 page_count) { return syscall2(SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count); }
 static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
 static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
+static u64 set_target_fs_base(u64 fs_base) { return syscall1(SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE, fs_base); }
 static u64 alloc_map_pages(u64 target_va, u64 page_count, u64 flags) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, flags, 0); }
 
 static int copy_cstr_from_target(u64 target_va, char *dst, u64 cap) {
@@ -232,7 +312,6 @@ static int connect_vfs_from_registry(void) {
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
     request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = FS_OP_CONNECT; request->request_seq = 1; request->arg0 = g_vfs.response_paddr; request->arg1 = self_slot; request->session_nonce = g_vfs.session_nonce;
     if (!share_vfs_request_page()) return 0;
-    if (!signal_vfs()) return 0;
     if (!wait_vfs_response(1, FS_OP_CONNECT)) return 0;
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
@@ -263,17 +342,210 @@ static int alloc_fd(void) { for (int i = 3; i < 32; i++) if (g_fds[i].kind == FD
 static int fd_valid(u64 fd) { return fd < 32 && g_fds[fd].kind != FD_UNUSED; }
 
 static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_record *stat_out, u64 *file_bytes_out, u8 *kind_out) {
-    if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) return 0;
+    if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) { user_log("LinuxAbiServer: lookup request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-    if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
+    if (response->status != FS_STATUS_OK || response->result_token == 0) { user_log("LinuxAbiServer: lookup status failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }
     const u64 token = response->result_token;
-    if (!vfs_request(FS_OP_STAT, token, 0, 0, 0)) return 0;
+    if (!vfs_request(FS_OP_STAT, token, 0, 0, 0)) { user_log("LinuxAbiServer: stat request failed\n"); return 0; }
     response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-    if (response->status != FS_STATUS_OK || response->inline_bytes < FS_STAT_RECORD_BYTES) return 0;
+    if (response->status != FS_STATUS_OK || response->inline_bytes < FS_STAT_RECORD_BYTES) { user_log("LinuxAbiServer: stat status failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }
     volatile struct fs_stat_record *record = (volatile struct fs_stat_record *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
     token_out[0] = token; stat_out->object_kind = record->object_kind; stat_out->size_bytes = record->size_bytes; stat_out->mode_bits = record->mode_bits; stat_out->mtime_unix_sec = record->mtime_unix_sec;
     *file_bytes_out = record->size_bytes; *kind_out = response->object_kind != FS_OBJECT_NONE ? response->object_kind : record->object_kind;
     return 1;
+}
+
+static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_bytes_out) {
+    if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) return 0;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
+    const u8 kind = response->object_kind;
+    if (kind != FS_OBJECT_FILE) return 0;
+    *token_out = response->result_token;
+    *file_bytes_out = response->file_bytes;
+    return response->file_bytes != 0;
+}
+
+static int is_vm_object_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG && (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
+static int is_exec_image_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG && (token & ~EXEC_IMAGE_TOKEN_TAG) != 0; }
+static u64 decode_spawned_process_slot(u64 value) { if ((value & SPAWN_RESULT_TAG) == 0) return 0; return value & SPAWN_RESULT_PROCESS_MASK; }
+
+static int alloc_map_range_self(u64 base_va, u64 page_count, u64 writable) {
+    u64 done = 0;
+    while (done < page_count) {
+        const u64 chunk = min_u64(page_count - done, 64);
+        if (alloc_map_pages(base_va + done * PAGE_BYTES, chunk, writable) != SYSCALL_OK) return 0;
+        done += chunk;
+    }
+    return 1;
+}
+
+static int ensure_execve_scratch(void) {
+    if (execve_scratch_ready) return 1;
+    if (!alloc_map_range_self(EXECVE_MAIN_IMAGE_VA, EXECVE_MAX_IMAGE_BYTES / PAGE_BYTES, 1)) return 0;
+    if (!alloc_map_range_self(EXECVE_LD_IMAGE_VA, EXECVE_MAX_LD_BYTES / PAGE_BYTES, 1)) return 0;
+    if (!alloc_map_range_self(EXECVE_CONFIG_VA, 1, 1)) return 0;
+    if (!alloc_map_range_self(EXECVE_TABLE_VA, 1, 1)) return 0;
+    execve_scratch_ready = 1;
+    return 1;
+}
+
+static int vfs_read_file_to_buffer(const char *path, u64 buffer_va, u64 buffer_cap, u64 *file_bytes_out) {
+    u64 file_token = 0; u64 file_bytes = 0;
+    if (!vfs_lookup_file_token(path, &file_token, &file_bytes)) { user_log("LinuxAbiServer: vfs read lookup failed\n"); return 0; }
+    if (file_bytes == 0 || file_bytes > buffer_cap) { user_log("LinuxAbiServer: vfs read stat invalid\n"); user_log_hex_value(file_bytes); return 0; }
+    if (!vfs_request(FS_OP_OPEN, file_token, 0, 0, 0)) { user_log("LinuxAbiServer: vfs read open request failed\n"); return 0; }
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    if (response->status != FS_STATUS_OK || response->result_token == 0) { user_log("LinuxAbiServer: vfs read open failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }
+    const u64 open_token = response->result_token;
+    u64 copied = 0;
+    int ok = 1;
+    while (copied < file_bytes) {
+        const u64 chunk = min_u64(file_bytes - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        if (!vfs_request(FS_OP_READ, open_token, copied, (u32)chunk, 0)) { user_log("LinuxAbiServer: vfs read request failed\n"); ok = 0; break; }
+        response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        if (response->status != FS_STATUS_OK || response->inline_bytes == 0) { user_log("LinuxAbiServer: vfs read chunk failed\n"); user_log_hex_value((u64)(u32)response->status); ok = 0; break; }
+        volatile u8 *src = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
+        u8 *dst = (u8 *)(buffer_va + copied);
+        for (u64 i = 0; i < response->inline_bytes; i++) dst[i] = src[i];
+        copied += response->inline_bytes;
+    }
+    (void)vfs_request(FS_OP_CLOSE, open_token, 0, 0, 0);
+    if (!ok) return 0;
+    *file_bytes_out = file_bytes;
+    return 1;
+}
+
+static u64 install_vm_object_from_buffer(u64 buffer_va, u64 file_bytes) {
+    const u64 token = syscall3(SYSCALL_INSTALL_VM_OBJECT, buffer_va, file_bytes, VM_RIGHT_READ_MAP_GRANT);
+    return is_vm_object_token(token) ? token : 0;
+}
+
+static u64 install_exec_image_from_vm(u64 vm_token) {
+    const u64 token = syscall2(SYSCALL_INSTALL_EXEC_IMAGE, vm_token, EXEC_RIGHT_EXEC_GRANT);
+    return is_exec_image_token(token) ? token : 0;
+}
+
+static void reset_exec_runtime_state(void) {
+    mmap_next_va = 0x31000000ULL;
+    brk_next_va = 0x38000000ULL;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) g_regions[i].used = 0;
+}
+
+static int append_exec_arg(struct exec_loader_config *cfg, u16 *cursor, const char *value, u64 len, u16 *offset_out, u16 *len_out) {
+    if (len == 0 || len > 0xffff) return 0;
+    if ((u64)*cursor + len > EXECVE_MAX_ARG_DATA_BYTES) return 0;
+    for (u64 i = 0; i < len; i++) cfg->arg_data[(u64)*cursor + i] = (u8)value[i];
+    *offset_out = *cursor;
+    *len_out = (u16)len;
+    *cursor = (u16)((u64)*cursor + len);
+    cfg->arg_data_bytes = *cursor;
+    return 1;
+}
+
+static int append_target_cstr_arg(struct exec_loader_config *cfg, u16 *cursor, u64 target_va, u16 *offset_out, u16 *len_out) {
+    char temp[256];
+    if (!copy_cstr_from_target(target_va, temp, sizeof(temp))) return 0;
+    return append_exec_arg(cfg, cursor, temp, cstr_len(temp), offset_out, len_out);
+}
+
+static int configure_exec_args_from_target(struct exec_loader_config *cfg, const char *path, u64 argv_va, u64 envp_va) {
+    u16 cursor = 0;
+    if (!append_exec_arg(cfg, &cursor, path, cstr_len(path), &cfg->execfn_offset, &cfg->execfn_bytes)) return 0;
+
+    u64 argv_count = 0;
+    if (argv_va != 0) {
+        while (argv_count < EXECVE_MAX_ARGV) {
+            u64 ptr = 0;
+            if (copy_from_target(argv_va + argv_count * 8, &ptr, 8) != 8) return 0;
+            if (ptr == 0) break;
+            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->argv_offsets[argv_count], &cfg->argv_bytes[argv_count])) return 0;
+            argv_count++;
+        }
+    }
+    if (argv_count == 0) {
+        if (!append_exec_arg(cfg, &cursor, path, cstr_len(path), &cfg->argv_offsets[0], &cfg->argv_bytes[0])) return 0;
+        argv_count = 1;
+    }
+    cfg->argv_count = (u16)argv_count;
+
+    u64 envp_count = 0;
+    if (envp_va != 0) {
+        while (envp_count < EXECVE_MAX_ENVP) {
+            u64 ptr = 0;
+            if (copy_from_target(envp_va + envp_count * 8, &ptr, 8) != 8) return 0;
+            if (ptr == 0) break;
+            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->envp_offsets[envp_count], &cfg->envp_bytes[envp_count])) return 0;
+            envp_count++;
+        }
+    }
+    cfg->envp_count = (u16)envp_count;
+    return 1;
+}
+
+static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_va) {
+    if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
+
+    u64 main_bytes = 0, ld_bytes = 0;
+    if (!is_vm_object_token(g_exec_loader_vm_token)) { user_log("LinuxAbiServer: execve loader token absent\n"); return 0; }
+    if (!vfs_read_file_to_buffer(path, EXECVE_MAIN_IMAGE_VA, EXECVE_MAX_IMAGE_BYTES, &main_bytes)) { user_log("LinuxAbiServer: execve main read failed\n"); return 0; }
+    if (!vfs_read_file_to_buffer("/lib/ld-musl-x86_64.so.1", EXECVE_LD_IMAGE_VA, EXECVE_MAX_LD_BYTES, &ld_bytes)) { user_log("LinuxAbiServer: execve ld read failed\n"); return 0; }
+    const u64 main_vm_token = install_vm_object_from_buffer(EXECVE_MAIN_IMAGE_VA, main_bytes);
+    const u64 ld_vm_token = install_vm_object_from_buffer(EXECVE_LD_IMAGE_VA, ld_bytes);
+    if (main_vm_token == 0 || ld_vm_token == 0) { user_log("LinuxAbiServer: execve vm install failed\n"); return 0; }
+    const u64 loader_exec_token = install_exec_image_from_vm(g_exec_loader_vm_token);
+    if (loader_exec_token == 0) { user_log("LinuxAbiServer: execve loader exec install failed\n"); return 0; }
+
+    clear_page(EXECVE_CONFIG_VA);
+    clear_page(EXECVE_TABLE_VA);
+    struct exec_loader_config *cfg = (struct exec_loader_config *)EXECVE_CONFIG_VA;
+    cfg->magic = EXEC_LOADER_BOOTSTRAP_MAGIC;
+    cfg->version = EXEC_LOADER_BOOTSTRAP_VERSION;
+    cfg->executable_file_bytes = main_bytes;
+    cfg->interpreter_file_bytes = ld_bytes;
+    cfg->abi_trap_endpoint_id = LINUX_ABI_ENDPOINT_ID;
+    cfg->abi_trap_endpoint_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    cfg->abi_trap_flavor = 1;
+    cfg->abi_trap_request_page_va = trap_request_page_va;
+    cfg->fs_endpoint_id = g_vfs.endpoint_id;
+    cfg->fs_compat_process_slot = g_vfs.process_slot;
+    if (!configure_exec_args_from_target(cfg, path, argv_va, envp_va)) { user_log("LinuxAbiServer: execve argv copy failed\n"); return 0; }
+
+    struct bootstrap_descriptor_table *table = (struct bootstrap_descriptor_table *)EXECVE_TABLE_VA;
+    table->page_count = 1;
+    table->cap_count = 2;
+    table->page_descriptors[0].source_va = EXECVE_CONFIG_VA;
+    table->page_descriptors[0].target_va = EXEC_LOADER_CONFIG_TARGET_VA;
+    table->cap_descriptors[0].source_token = main_vm_token;
+    table->cap_descriptors[0].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, executable_vm_token);
+    table->cap_descriptors[0].rights_bits = VM_RIGHT_READ_MAP;
+    table->cap_descriptors[0].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
+    table->cap_descriptors[1].source_token = ld_vm_token;
+    table->cap_descriptors[1].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, interpreter_vm_token);
+    table->cap_descriptors[1].rights_bits = VM_RIGHT_READ_MAP;
+    table->cap_descriptors[1].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
+
+    const u64 flags = SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER;
+    const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, loader_exec_token, EXECVE_TABLE_VA, 0, flags);
+    if (decode_spawned_process_slot(spawned) == 0) {
+        user_log("LinuxAbiServer: execve spawn failed ret=");
+        user_log_hex_value(spawned);
+        return 0;
+    }
+    user_log("LinuxAbiServer: execve spawned\n");
+    return 1;
+}
+
+static struct ipc_message handle_execve(const struct trap_request *req) {
+    char path[256];
+    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
+    if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
+    user_log("LinuxAbiServer: execve ");
+    user_log(path);
+    user_log("\n");
+    if (!spawn_exec_loader_for_execve(path, req->args[1], req->args[2])) return reply(errno_io(), 0);
+    reset_exec_runtime_state();
+    return reply(0, TRAP_RESPONSE_FLAG_EXIT);
 }
 
 static u32 linux_mode_from_fs(u32 fs_mode, u8 kind) { u32 perm = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0555 : 0444; u32 type = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0040000 : 0100000; if ((fs_mode & FS_DIR_MODE) != 0) type = 0040000; if ((fs_mode & FS_FILE_MODE) != 0) type = 0100000; return type | perm; }
@@ -321,6 +593,35 @@ static struct ipc_message handle_read(const struct trap_request *req) {
     return reply(copied, 0);
 }
 
+static u64 read_fd_at_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 len, int *fault) {
+    u64 copied = 0;
+    *fault = 0;
+    while (copied < len && file_offset + copied < fd->size) {
+        u64 request_len = min_u64(len - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        const u64 remaining = fd->size - (file_offset + copied);
+        if (request_len > remaining) request_len = remaining;
+        if (!vfs_request(FS_OP_READ, fd->token, file_offset + copied, (u32)request_len, 0)) break;
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        if (response->status != FS_STATUS_OK) break;
+        if (response->inline_bytes == 0) break;
+        if (copy_to_target(dst + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) {
+            *fault = 1;
+            break;
+        }
+        copied += response->inline_bytes;
+        if (response->inline_bytes < request_len) break;
+    }
+    return copied;
+}
+
+static struct ipc_message handle_pread64(const struct trap_request *req) {
+    const u64 fd = req->args[0]; const u64 dst = req->args[1]; const u64 len = req->args[2]; const u64 offset = req->args[3];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0); if (len == 0) return reply(0, 0); if (g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
+    int fault = 0; const u64 copied = read_fd_at_to_target(&g_fds[fd], offset, dst, len, &fault);
+    if (fault) return reply(errno_fault(), 0);
+    return copied != 0 ? reply(copied, 0) : reply(0, 0);
+}
+
 static struct ipc_message handle_write(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 src = req->args[1]; const u64 len = req->args[2];
     if (fd == 1 || fd == 2) {
@@ -329,6 +630,27 @@ static struct ipc_message handle_write(const struct trap_request *req) {
         return reply(len, 0);
     }
     return reply(errno_badf(), 0);
+}
+
+static struct ipc_message handle_writev(const struct trap_request *req) {
+    const u64 fd = req->args[0]; const u64 iov = req->args[1]; const u64 iovcnt = req->args[2];
+    if (fd != 1 && fd != 2) return reply(errno_badf(), 0);
+    if (iovcnt > 64) return reply(errno_inval(), 0);
+    u64 total = 0;
+    for (u64 i = 0; i < iovcnt; i++) {
+        u64 pair[2];
+        if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
+        const u64 src = pair[0]; const u64 len = pair[1];
+        u64 done = 0;
+        while (done < len) {
+            char buf[129]; u64 chunk = min_u64(len - done, 128);
+            if (copy_from_target(src + done, buf, chunk) != chunk) return reply(errno_fault(), 0);
+            user_log_len(buf, chunk);
+            done += chunk;
+        }
+        total += len;
+    }
+    return reply(total, 0);
 }
 
 static struct ipc_message handle_fstat(const struct trap_request *req) {
@@ -375,53 +697,208 @@ static struct ipc_message handle_lseek(const struct trap_request *req) {
 
 static struct ipc_message handle_close(const struct trap_request *req) { const u64 fd = req->args[0]; if (fd >= 32 || g_fds[fd].kind == FD_UNUSED) return reply(errno_badf(), 0); if (fd > 2) g_fds[fd].kind = FD_UNUSED; return reply(0, 0); }
 static struct ipc_message handle_access(const struct trap_request *req) { char path[256]; if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0); struct fs_stat_record rec; u64 token = 0, size = 0; u8 kind = 0; return reply(vfs_lookup_stat(path, &token, &rec, &size, &kind) ? 0 : errno_noent(), 0); }
+static struct ipc_message handle_arch_prctl(const struct trap_request *req) { if (req->args[0] != ARCH_SET_FS) return reply(errno_inval(), 0); return reply(set_target_fs_base(req->args[1]) == SYSCALL_OK ? 0 : errno_inval(), 0); }
 
 static u64 page_up(u64 value) { return (value + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1); }
+
+static int vm_add_region(u64 start, u64 size, u64 prot) {
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used) {
+            g_regions[i].used = 1; g_regions[i].start = start; g_regions[i].size = size; g_regions[i].prot = prot;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int vm_find_free_region_slot(void) {
+    for (u64 i = 0; i < VM_REGION_MAX; i++) if (!g_regions[i].used) return (int)i;
+    return -1;
+}
+
+static int vm_split_at(u64 point) {
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (point <= rs || point >= re) continue;
+        const int slot = vm_find_free_region_slot();
+        if (slot < 0) return 0;
+        g_regions[(u64)slot].used = 1;
+        g_regions[(u64)slot].start = point;
+        g_regions[(u64)slot].size = re - point;
+        g_regions[(u64)slot].prot = g_regions[i].prot;
+        g_regions[i].size = point - rs;
+        return 1;
+    }
+    return 1;
+}
+
+static int vm_split_range_boundaries(u64 start, u64 size) {
+    return vm_split_at(start) && vm_split_at(start + size);
+}
+
+static int vm_range_covered(u64 start, u64 size) {
+    const u64 end = start + size;
+    u64 cursor = start;
+    while (cursor < end) {
+        u64 best_end = cursor;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (rs <= cursor && re > best_end) best_end = re;
+        }
+        if (best_end == cursor) return 0;
+        cursor = best_end;
+    }
+    return 1;
+}
+
+static void vm_protect_range(u64 start, u64 size, u64 prot) {
+    const u64 end = start + size;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (rs >= start && re <= end) g_regions[i].prot = prot;
+    }
+}
+
+static void vm_remove_range(u64 start, u64 size) {
+    const u64 end = start + size;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (rs >= start && re <= end) g_regions[i].used = 0;
+    }
+}
+
+static u64 normalize_linux_prot(u64 prot) {
+    prot &= 0x7;
+    if ((prot & 0x2) != 0) prot |= 0x1;
+    if (prot == 0) prot = 0x1;
+    return prot;
+}
+
+static u64 apply_target_pages(u64 start, u64 page_count, u64 prot, u64 (*fn)(u64, u64, u64)) {
+    u64 done = 0;
+    while (done < page_count) {
+        const u64 chunk = min_u64(page_count - done, 64);
+        const u64 status = fn(start + done * PAGE_BYTES, chunk, prot);
+        if (status != SYSCALL_OK) return status;
+        done += chunk;
+    }
+    return SYSCALL_OK;
+}
+
 static struct ipc_message handle_mmap(const struct trap_request *req) {
     enum { PROT_READ = 0x1, PROT_WRITE = 0x2, PROT_EXEC = 0x4, MAP_SHARED = 0x01, MAP_PRIVATE = 0x02, MAP_SHARED_VALIDATE = 0x03, MAP_TYPE = 0x0F, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_FIXED_NOREPLACE = 0x100000 };
     const u64 requested_va = req->args[0]; const u64 len = req->args[1]; u64 prot = req->args[2] & (PROT_READ | PROT_WRITE | PROT_EXEC); const u64 flags = req->args[3]; const u64 fd = req->args[4]; const u64 offset = req->args[5]; const u64 map_type = flags & MAP_TYPE;
-    if (len == 0) return reply(errno_inval(), 0); if (map_type != MAP_PRIVATE && map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE) return reply(errno_inval(), 0); if ((offset & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0); if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) return reply(errno_inval(), 0); if ((flags & MAP_ANONYMOUS) == 0) return fd <= 2 ? reply(errno_acces(), 0) : reply(errno_badf(), 0); if (prot == 0) return reply(errno_inval(), 0); if ((prot & PROT_WRITE) != 0) prot |= PROT_READ; if ((prot & PROT_WRITE) != 0 && (prot & PROT_EXEC) != 0) return reply(errno_inval(), 0);
-    const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; const u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : mmap_next_va; const u64 map_status = map_reply_target_pages(target_va, page_count, prot);
-    if (map_status == SYSCALL_OK) { if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) mmap_next_va += size; return reply(target_va, 0); }
+    const int file_backed = (flags & MAP_ANONYMOUS) == 0;
+    if (len == 0) return reply(errno_inval(), 0); if (map_type != MAP_PRIVATE && map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE) return reply(errno_inval(), 0); if ((offset & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0); if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) return reply(errno_inval(), 0); if (file_backed && (!fd_valid(fd) || g_fds[fd].kind != FD_FILE)) return reply(errno_badf(), 0); prot = normalize_linux_prot(prot);
+    const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; const u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : mmap_next_va; const u64 map_prot = file_backed ? (prot | PROT_WRITE) : prot; const u64 map_status = map_reply_target_pages(target_va, page_count, map_prot);
+    if (map_status == SYSCALL_OK) {
+        if (file_backed) {
+            int fault = 0;
+            (void)read_fd_at_to_target(&g_fds[fd], offset, target_va, len, &fault);
+            if (fault) return reply(errno_fault(), 0);
+        }
+        if (!vm_add_region(target_va, size, prot)) return reply(errno_nomem(), 0);
+        if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) mmap_next_va += size;
+        return reply(target_va, 0);
+    }
     return reply(errno_nomem(), 0);
 }
 static struct ipc_message handle_brk(const struct trap_request *req) { if (req->args[0] == 0) return reply(brk_next_va, 0); if (req->args[0] > brk_next_va) { u64 from = page_up(brk_next_va); u64 to = page_up(req->args[0]); if (to > from && map_reply_target_pages(from, (to - from) / PAGE_BYTES, 0x3) != SYSCALL_OK) return reply(brk_next_va, 0); } brk_next_va = req->args[0]; return reply(brk_next_va, 0); }
 
+static struct ipc_message handle_mprotect(const struct trap_request *req) {
+    const u64 start = req->args[0]; const u64 len = req->args[1]; const u64 prot = normalize_linux_prot(req->args[2]);
+    if (len == 0) return reply(0, 0);
+    if ((start & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0);
+    const u64 size = page_up(len);
+    const int tracked = vm_range_covered(start, size);
+    if (tracked && !vm_split_range_boundaries(start, size)) return reply(errno_nomem(), 0);
+    const u64 status = apply_target_pages(start, size / PAGE_BYTES, prot, protect_reply_target_pages);
+    if (status != SYSCALL_OK) return reply(errno_nomem(), 0);
+    if (tracked) vm_protect_range(start, size, prot);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_munmap(const struct trap_request *req) {
+    const u64 start = req->args[0]; const u64 len = req->args[1];
+    if (len == 0) return reply(errno_inval(), 0);
+    if ((start & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0);
+    const u64 size = page_up(len);
+    if (!vm_range_covered(start, size)) return reply(errno_inval(), 0);
+    if (!vm_split_range_boundaries(start, size)) return reply(errno_nomem(), 0);
+    u64 done = 0; const u64 page_count = size / PAGE_BYTES;
+    while (done < page_count) {
+        const u64 chunk = min_u64(page_count - done, 64);
+        const u64 status = unmap_reply_target_pages(start + done * PAGE_BYTES, chunk);
+        if (status != SYSCALL_OK) return reply(errno_inval(), 0);
+        done += chunk;
+    }
+    vm_remove_range(start, size);
+    return reply(0, 0);
+}
+
 void linux_abi_main(void) {
-    const struct ipc_message cfg = wait_ipc();
-    if (cfg.status != SYSCALL_OK || cfg.request_va == 0) { user_log("LinuxAbiServer: config IPC invalid\n"); for (;;) __asm__ volatile("pause"); }
-    trap_request_page_va = cfg.request_va;
+    volatile struct linux_abi_bootstrap_config *cfg = (volatile struct linux_abi_bootstrap_config *)LINUX_ABI_CONFIG_TARGET_VA;
+    if (cfg->magic != LINUX_ABI_BOOTSTRAP_MAGIC ||
+        cfg->version != LINUX_ABI_BOOTSTRAP_VERSION ||
+        cfg->abi_trap_request_page_va == 0)
+    {
+        user_log("LinuxAbiServer: bootstrap config invalid\n");
+        for (;;) __asm__ volatile("pause");
+    }
+    trap_request_page_va = cfg->abi_trap_request_page_va;
+    g_exec_loader_vm_token = cfg->exec_loader_vm_token;
     const u64 request_page_status = alloc_map_pages(trap_request_page_va, 1, 0x1);
     if (request_page_status != SYSCALL_OK) { user_log("LinuxAbiServer: request page map failed\n"); user_log_hex_value(request_page_status); for (;;) __asm__ volatile("pause"); }
     init_fds();
     if (!connect_vfs_from_registry()) user_log("LinuxAbiServer: vfs connect failed\n");
+    cfg->status = LINUX_ABI_BOOTSTRAP_READY;
     user_log("LinuxAbiServer: started\n");
     struct ipc_message msg = reply(0, 0);
     for (;;) {
         if (msg.status != SYSCALL_OK) { msg = wait_ipc(); continue; }
+        if (msg.request_va == 0) { msg = wait_ipc(); continue; }
         if (msg.request_va != trap_request_page_va) { user_log("LinuxAbiServer: bad request va\n"); msg = reply(errno_inval(), 0); continue; }
         const struct trap_request *req = (const struct trap_request *)trap_request_page_va;
         if (req->magic != TRAP_MAGIC || req->version != TRAP_VERSION) { user_log("LinuxAbiServer: bad request header\n"); msg = reply(errno_inval(), 0); continue; }
-        log_syscall_nr(req->nr);
         switch (req->nr) {
         case LINUX_SYS_READ: msg = handle_read(req); break;
         case LINUX_SYS_WRITE: msg = handle_write(req); break;
+        case LINUX_SYS_WRITEV: msg = handle_writev(req); break;
         case LINUX_SYS_OPEN: msg = handle_openat(req, 1); break;
         case LINUX_SYS_OPENAT: msg = handle_openat(req, 0); break;
         case LINUX_SYS_CLOSE: msg = handle_close(req); break;
         case LINUX_SYS_STAT: case LINUX_SYS_LSTAT: msg = handle_newfstatat(req, 1); break;
         case LINUX_SYS_FSTAT: msg = handle_fstat(req); break;
         case LINUX_SYS_NEWFSTATAT: msg = handle_newfstatat(req, 0); break;
+        case LINUX_SYS_PREAD64: msg = handle_pread64(req); break;
         case LINUX_SYS_GETDENTS64: msg = handle_getdents64(req); break;
         case LINUX_SYS_LSEEK: msg = handle_lseek(req); break;
         case LINUX_SYS_ACCESS: msg = handle_access(req); break;
+        case LINUX_SYS_EXECVE: msg = handle_execve(req); break;
         case LINUX_SYS_MMAP: msg = handle_mmap(req); break;
         case LINUX_SYS_BRK: msg = handle_brk(req); break;
-        case LINUX_SYS_MUNMAP: msg = reply(0, 0); break;
-        case LINUX_SYS_RT_SIGACTION: case LINUX_SYS_RT_SIGPROCMASK: case LINUX_SYS_IOCTL: case LINUX_SYS_ARCH_PRCTL: case LINUX_SYS_FUTEX: case LINUX_SYS_SET_TID_ADDRESS: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_MPROTECT: msg = handle_mprotect(req); break;
+        case LINUX_SYS_MUNMAP: msg = handle_munmap(req); break;
+        case LINUX_SYS_ARCH_PRCTL: msg = handle_arch_prctl(req); break;
+        case LINUX_SYS_RT_SIGACTION: case LINUX_SYS_RT_SIGPROCMASK: case LINUX_SYS_IOCTL: case LINUX_SYS_FUTEX: case LINUX_SYS_SET_TID_ADDRESS: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
         case LINUX_SYS_GETPID: case LINUX_SYS_GETTID: msg = reply(1, 0); break;
         case LINUX_SYS_GETRANDOM: msg = reply(errno_again(), 0); break;
-        case LINUX_SYS_EXIT: case LINUX_SYS_EXIT_GROUP: user_log("LinuxAbiServer: exit\n"); msg = reply(0, TRAP_RESPONSE_FLAG_EXIT); break;
+        case LINUX_SYS_EXIT:
+        case LINUX_SYS_EXIT_GROUP:
+            user_log("LinuxAbiServer: exit\n");
+            msg = reply(0, TRAP_RESPONSE_FLAG_EXIT);
+            (void)msg;
+            user_log("LinuxAbiServer: companion exit\n");
+            process_exit(0);
+            break;
         default: user_log("LinuxAbiServer: unhandled syscall\n"); user_log_hex_value(req->nr); msg = reply(errno_nosys(), 0); break;
         }
     }

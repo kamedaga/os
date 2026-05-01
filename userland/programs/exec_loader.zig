@@ -55,7 +55,7 @@ const pt_dynamic: u32 = 2;
 const pt_interp: u32 = 3;
 const pt_tls: u32 = 7;
 const pt_gnu_relro: u32 = 0x6474_e552;
-const interp_path_ld = "/lib/ld.so";
+const interp_path_ld = "/lib/ld-musl-x86_64.so.1";
 const pf_x: u32 = 1 << 0;
 const pf_w: u32 = 1 << 1;
 const pf_r: u32 = 1 << 2;
@@ -77,6 +77,93 @@ const elf_dyn_bytes: usize = 16;
 const max_lib_queue_depth: usize = max_needed_count;
 const elf_rela_bytes: u64 = 24;
 const r_x86_64_relative: u64 = 8;
+const linux_stack_execfn = "/cmd/musl_smoke.elf";
+const linux_stack_platform = "x86_64";
+const linux_stack_arg1 = "argv-smoke";
+const linux_stack_env_path = "PATH=/bin:/cmd";
+const linux_stack_env_os = "CAPABILITYOS=1";
+const at_null: u64 = 0;
+const at_ignore: u64 = 1;
+const at_execfd: u64 = 2;
+const at_phdr: u64 = 3;
+const at_phent: u64 = 4;
+const at_phnum: u64 = 5;
+const at_pagesz: u64 = 6;
+const at_base: u64 = 7;
+const at_flags: u64 = 8;
+const at_entry: u64 = 9;
+const at_uid: u64 = 11;
+const at_euid: u64 = 12;
+const at_gid: u64 = 13;
+const at_egid: u64 = 14;
+const at_platform: u64 = 15;
+const at_hwcap: u64 = 16;
+const at_clktck: u64 = 17;
+const at_secure: u64 = 23;
+const at_random: u64 = 25;
+const at_execfn: u64 = 31;
+const at_sysinfo_ehdr: u64 = 33;
+
+const LinuxInitialStackConfig = struct {
+    execfn: []const u8,
+    argv: []const []const u8,
+    envp: []const []const u8,
+    platform: []const u8,
+};
+
+const linux_stack_argv = [_][]const u8{
+    linux_stack_execfn,
+    linux_stack_arg1,
+};
+
+const linux_stack_envp = [_][]const u8{
+    linux_stack_env_path,
+    linux_stack_env_os,
+};
+
+const linux_initial_stack_config = LinuxInitialStackConfig{
+    .execfn = linux_stack_execfn,
+    .argv = linux_stack_argv[0..],
+    .envp = linux_stack_envp[0..],
+    .platform = linux_stack_platform,
+};
+
+fn bootstrapArgSlice(cfg: *const exec_loader_bootstrap_abi.Config, offset: u16, byte_len: u16) ?[]const u8 {
+    const off: usize = @intCast(offset);
+    const len: usize = @intCast(byte_len);
+    const used: usize = @intCast(cfg.arg_data_bytes);
+    if (len == 0) return null;
+    if (used > cfg.arg_data.len) return null;
+    if (off > used or len > used - off) return null;
+    return cfg.arg_data[off .. off + len];
+}
+
+fn linuxInitialStackConfigFromBootstrap(
+    cfg: *const exec_loader_bootstrap_abi.Config,
+    argv_storage: *[exec_loader_bootstrap_abi.max_argv][]const u8,
+    envp_storage: *[exec_loader_bootstrap_abi.max_envp][]const u8,
+) ?LinuxInitialStackConfig {
+    if (cfg.arg_data_bytes == 0 or cfg.argv_count == 0) return linux_initial_stack_config;
+    if (cfg.argv_count > exec_loader_bootstrap_abi.max_argv) return null;
+    if (cfg.envp_count > exec_loader_bootstrap_abi.max_envp) return null;
+
+    const execfn = bootstrapArgSlice(cfg, cfg.execfn_offset, cfg.execfn_bytes) orelse return null;
+    var argv_index: usize = 0;
+    while (argv_index < cfg.argv_count) : (argv_index += 1) {
+        argv_storage[argv_index] = bootstrapArgSlice(cfg, cfg.argv_offsets[argv_index], cfg.argv_bytes[argv_index]) orelse return null;
+    }
+    var envp_index: usize = 0;
+    while (envp_index < cfg.envp_count) : (envp_index += 1) {
+        envp_storage[envp_index] = bootstrapArgSlice(cfg, cfg.envp_offsets[envp_index], cfg.envp_bytes[envp_index]) orelse return null;
+    }
+
+    return .{
+        .execfn = execfn,
+        .argv = argv_storage[0..cfg.argv_count],
+        .envp = envp_storage[0..cfg.envp_count],
+        .platform = linux_stack_platform,
+    };
+}
 
 var lib_image_scratch: [max_lib_image_bytes]u8 align(4096) = undefined;
 var needed_queue_scratch: [max_lib_queue_depth]NeededPath = undefined;
@@ -570,6 +657,11 @@ fn writeProcessU64(process_token: u64, dest_va: u64, value: u64) bool {
     return copyToProcess(process_token, dest_va, @intFromPtr(&bytes), bytes.len);
 }
 
+fn writeProcessBytes(process_token: u64, dest_va: u64, bytes: []const u8) bool {
+    if (bytes.len == 0) return true;
+    return copyToProcess(process_token, dest_va, @intFromPtr(bytes.ptr), bytes.len);
+}
+
 
 fn bootfsLibPath(name: []const u8, out: *[max_lib_path_bytes]u8) ?[]const u8 {
     if (name.len == 0) return null;
@@ -963,6 +1055,121 @@ fn installRuntimeBootstrapPages(process_token: u64) bool {
     return true;
 }
 
+fn pushStackBytes(process_token: u64, sp: *u64, bytes: []const u8) ?u64 {
+    if (bytes.len == 0 or bytes.len > sp.* - process_abi.user_stack_page_va) return null;
+    sp.* -= @intCast(bytes.len);
+    if (!writeProcessBytes(process_token, sp.*, bytes)) return null;
+    return sp.*;
+}
+
+fn pushStackString(process_token: u64, sp: *u64, bytes: []const u8) ?u64 {
+    var nul: [1]u8 = .{0};
+    if (pushStackBytes(process_token, sp, nul[0..]) == null) return null;
+    if (bytes.len == 0) return sp.*;
+    sp.* -= @intCast(bytes.len);
+    if (!writeProcessBytes(process_token, sp.*, bytes)) return null;
+    return sp.*;
+}
+
+const LinuxAuxEntry = struct {
+    tag: u64,
+    value: u64,
+};
+
+fn writeStackWords(process_token: u64, sp: *u64, words: []const u64) bool {
+    const word_bytes = @as(u64, @intCast(words.len * 8));
+    if (word_bytes > sp.* - process_abi.user_stack_page_va) return false;
+    sp.* -= word_bytes;
+    var index: usize = 0;
+    while (index < words.len) : (index += 1) {
+        if (!writeProcessU64(process_token, sp.* + @as(u64, @intCast(index * 8)), words[index])) return false;
+    }
+    return true;
+}
+
+fn appendAux(entries: *[24]LinuxAuxEntry, count: *usize, tag: u64, value: u64) bool {
+    if (count.* >= entries.len) return false;
+    entries[count.*] = .{ .tag = tag, .value = value };
+    count.* += 1;
+    return true;
+}
+
+fn installLinuxInitialStack(
+    process_token: u64,
+    main_image: LoadedImage,
+    main_entry: u64,
+    interp_base: u64,
+    config: LinuxInitialStackConfig,
+) ?u64 {
+    var sp = process_abi.user_stack_page_va + page_bytes;
+    var random_bytes = [_]u8{ 0x43, 0x61, 0x70, 0x4f, 0x53, 0x2d, 0x6c, 0x69, 0x6e, 0x75, 0x78, 0x2d, 0x61, 0x62, 0x69, 0x00 };
+    const random_va = pushStackBytes(process_token, &sp, random_bytes[0..]) orelse return null;
+    const platform_va = pushStackString(process_token, &sp, config.platform) orelse return null;
+    const execfn_va = pushStackString(process_token, &sp, config.execfn) orelse return null;
+
+    var argv_ptrs: [8]u64 = [_]u64{0} ** 8;
+    if (config.argv.len == 0 or config.argv.len > argv_ptrs.len) return null;
+    var argv_index = config.argv.len;
+    while (argv_index > 0) {
+        argv_index -= 1;
+        argv_ptrs[argv_index] = pushStackString(process_token, &sp, config.argv[argv_index]) orelse return null;
+    }
+
+    var envp_ptrs: [16]u64 = [_]u64{0} ** 16;
+    if (config.envp.len > envp_ptrs.len) return null;
+    var env_index = config.envp.len;
+    while (env_index > 0) {
+        env_index -= 1;
+        envp_ptrs[env_index] = pushStackString(process_token, &sp, config.envp[env_index]) orelse return null;
+    }
+
+    sp &= ~@as(u64, 15);
+
+    const main_phdr, const phdr_overflow = @addWithOverflow(main_image.load_bias, main_image.ehdr.phoff);
+    if (phdr_overflow != 0) return null;
+
+    var aux: [24]LinuxAuxEntry = undefined;
+    var aux_count: usize = 0;
+    if (!appendAux(&aux, &aux_count, at_phdr, main_phdr)) return null;
+    if (!appendAux(&aux, &aux_count, at_phent, main_image.ehdr.phentsize)) return null;
+    if (!appendAux(&aux, &aux_count, at_phnum, main_image.ehdr.phnum)) return null;
+    if (!appendAux(&aux, &aux_count, at_pagesz, page_bytes)) return null;
+    if (!appendAux(&aux, &aux_count, at_base, interp_base)) return null;
+    if (!appendAux(&aux, &aux_count, at_flags, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_entry, main_entry)) return null;
+    if (!appendAux(&aux, &aux_count, at_uid, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_euid, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_gid, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_egid, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_hwcap, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_clktck, 100)) return null;
+    if (!appendAux(&aux, &aux_count, at_secure, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_random, random_va)) return null;
+    if (!appendAux(&aux, &aux_count, at_execfn, execfn_va)) return null;
+    if (!appendAux(&aux, &aux_count, at_platform, platform_va)) return null;
+    if (!appendAux(&aux, &aux_count, at_sysinfo_ehdr, 0)) return null;
+    if (!appendAux(&aux, &aux_count, at_null, 0)) return null;
+
+    var words: [96]u64 = undefined;
+    var count: usize = 0;
+    words[count] = @intCast(config.argv.len); count += 1;
+    for (argv_ptrs[0..config.argv.len]) |argv_va| {
+        words[count] = argv_va; count += 1;
+    }
+    words[count] = 0; count += 1;
+    for (envp_ptrs[0..config.envp.len]) |env_va| {
+        words[count] = env_va; count += 1;
+    }
+    words[count] = 0; count += 1;
+    for (aux[0..aux_count]) |entry| {
+        words[count] = entry.tag; count += 1;
+        words[count] = entry.value; count += 1;
+    }
+
+    if (!writeStackWords(process_token, &sp, words[0..count])) return null;
+    return sp;
+}
+
 fn mapProtFromPhdr(phdr: ProgramHeader) process_builder_abi.MapProt {
     return .{
         .read = (phdr.flags & pf_r) != 0,
@@ -1282,7 +1489,13 @@ fn installDynamicLinkerBootstrapPage(
     return true;
 }
 
-fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_vm_token: u64, interpreter_file_bytes: u64) ?u64 {
+fn launchExec(
+    cfg: *const exec_loader_bootstrap_abi.Config,
+    executable_vm_token: u64,
+    executable_file_bytes: u64,
+    interpreter_vm_token: u64,
+    interpreter_file_bytes: u64,
+) ?u64 {
     if (!mapVmObject(executable_vm_token, main_source_map_va)) {
         userLog("ExecLoader: source map failed\n");
         return null;
@@ -1296,7 +1509,6 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
         userLog("ExecLoader: vm layout init failed\n");
         return null;
     };
-    const cfg: *const volatile exec_loader_bootstrap_abi.Config = @ptrFromInt(exec_loader_bootstrap_abi.target_va);
     const bootfs_image_bytes = if (image_abi.decodeVmObjectToken(cfg.bootfs_vm_token) != null) cfg.bootfs_file_bytes else 0;
     if (!vm_layout.reserveBootFsImage(bootfs_image_bytes)) {
         abortProcess(process_token);
@@ -1317,6 +1529,7 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
         return null;
     }
     var initial_entry = main_entry;
+    var interp_base: u64 = 0;
 
     if (main_image.interp_phdr) |interp_phdr| {
         const interp_path = readInterpPath(main_source_map_va, interp_phdr, executable_file_bytes) orelse {
@@ -1351,33 +1564,8 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
             return null;
         }
         initial_entry = interp_entry;
-        if (bootfs_image_bytes != 0 and !mapVmObjectToProcess(process_token, cfg.bootfs_vm_token, dynamic_linker_bootstrap_abi.bootfs_image_target_va, .{ .read = true })) {
-            abortProcess(process_token);
-            userLog("ExecLoader: bootfs map failed\n");
-            return null;
-        }
-        var loaded_lib_buf: [dynamic_linker_bootstrap_abi.max_loaded_libs]dynamic_linker_bootstrap_abi.LoadedLibInfo = [_]dynamic_linker_bootstrap_abi.LoadedLibInfo{.{}} ** dynamic_linker_bootstrap_abi.max_loaded_libs;
-        var rootfs = connectRootFs(cfg.fs_endpoint_id, cfg.fs_compat_process_slot) orelse {
-            abortProcess(process_token);
-            userLog("ExecLoader: rootfs unavailable for dependencies\n");
-            return null;
-        };
-        const loaded_lib_count = loadNeededLibs(
-            process_token,
-            &vm_layout,
-            &child_mapped_pages,
-            &rootfs.client,
-            rootfs.root_token,
-            main_source_map_va,
-            main_image.ehdr,
-            executable_file_bytes,
-            loaded_lib_buf[0..],
-        );
-        if (!installDynamicLinkerBootstrapPage(process_token, main_image, bootfs_image_bytes, loaded_lib_buf[0..loaded_lib_count])) {
-            abortProcess(process_token);
-            userLog("ExecLoader: dynamic linker bootstrap failed\n");
-            return null;
-        }
+        interp_base = interp_image.load_bias;
+        userLog("ExecLoader: standard interpreter loaded\n");
     }
 
     if (!allocMapPagesToProcess(process_token, process_abi.user_stack_page_va, 1, .{ .read = true, .write = true })) {
@@ -1390,7 +1578,19 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
         userLog("ExecLoader: runtime bootstrap failed\n");
         return null;
     }
-    if (!setProcessInitialContext(process_token, initial_entry, process_abi.user_entry_rsp)) {
+    var argv_storage: [exec_loader_bootstrap_abi.max_argv][]const u8 = undefined;
+    var envp_storage: [exec_loader_bootstrap_abi.max_envp][]const u8 = undefined;
+    const stack_config = linuxInitialStackConfigFromBootstrap(cfg, &argv_storage, &envp_storage) orelse {
+        abortProcess(process_token);
+        userLog("ExecLoader: linux argv config failed\n");
+        return null;
+    };
+    const initial_rsp = installLinuxInitialStack(process_token, main_image, main_entry, interp_base, stack_config) orelse {
+        abortProcess(process_token);
+        userLog("ExecLoader: linux stack failed\n");
+        return null;
+    };
+    if (!setProcessInitialContext(process_token, initial_entry, initial_rsp)) {
         abortProcess(process_token);
         userLog("ExecLoader: set context failed\n");
         return null;
@@ -1419,12 +1619,12 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
 
 pub export fn _start() noreturn {
     userLog("ExecLoader: started\n");
-    const cfg: *const volatile exec_loader_bootstrap_abi.Config = @ptrFromInt(exec_loader_bootstrap_abi.target_va);
+    const cfg: *const exec_loader_bootstrap_abi.Config = @ptrFromInt(exec_loader_bootstrap_abi.target_va);
     if (cfg.magic != exec_loader_bootstrap_abi.magic or cfg.version != exec_loader_bootstrap_abi.version) {
         userLog("ExecLoader: missing bootstrap config\n");
     } else if (image_abi.decodeVmObjectToken(cfg.executable_vm_token) == null or cfg.executable_file_bytes == 0) {
         userLog("ExecLoader: invalid executable token\n");
-    } else if (launchExec(cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes)) |child_process_slot| {
+    } else if (launchExec(cfg, cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes)) |child_process_slot| {
         userLog("ExecLoader: child started\n");
         while (true) {
             switch (getProcessStatus(child_process_slot)) {

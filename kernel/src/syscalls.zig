@@ -69,6 +69,10 @@ const syscall_clear_abi_trap_delegate: u64 = trap_abi.syscall_clear_abi_trap_del
 const syscall_map_abi_trap_reply_target_pages: u64 = trap_abi.syscall_map_abi_trap_reply_target_pages;
 const syscall_copy_from_abi_trap_reply_target: u64 = trap_abi.syscall_copy_from_abi_trap_reply_target;
 const syscall_copy_to_abi_trap_reply_target: u64 = trap_abi.syscall_copy_to_abi_trap_reply_target;
+const syscall_set_abi_trap_reply_target_fs_base: u64 = trap_abi.syscall_set_abi_trap_reply_target_fs_base;
+const syscall_protect_abi_trap_reply_target_pages: u64 = trap_abi.syscall_protect_abi_trap_reply_target_pages;
+const syscall_unmap_abi_trap_reply_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_reply_target_pages;
+const syscall_reclaim_abi_trap_reply_target_private_pages: u64 = trap_abi.syscall_reclaim_abi_trap_reply_target_private_pages;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -572,14 +576,16 @@ fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u6
     const target_thread = current_hot.ipc_reply_token_target_thread;
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return syscall_err_endpoint;
     if (!target_ctx.allocated) return syscall_err_endpoint;
-    scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
     if (target_ctx.abi_trap_reply_pending and (mr1 & trap_abi.response_flag_exit) != 0) {
         const target_proc = target_ctx.owner_process;
+        _ = reclaimPrivatePagesForProcess(h, target_proc);
+        scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
         target_ctx.abi_trap_reply_pending = false;
         _ = h.state.markProcessExited(target_proc);
         _ = scheduler.releaseThreadSlot(target_thread);
         return syscall_ok;
     }
+    scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
     return deliverOrQueueIpcMessageToThread(target_thread, 0, current_thread, false, mr0, mr1, mr2, mr3);
 }
 
@@ -627,6 +633,23 @@ fn currentIpcReplyTargetPrincipal() ?kernel.PrincipalId {
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
     if (!target_ctx.allocated) return null;
     return target_ctx.owner_process;
+}
+
+fn currentIpcReplyTargetThread() ?usize {
+    const current_thread = scheduler.current_thread_index;
+    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return null;
+    if (current_hot.ipc_reply_token_valid == 0) return null;
+    const target_thread = current_hot.ipc_reply_token_target_thread;
+    const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
+    if (!target_ctx.allocated) return null;
+    return target_thread;
+}
+
+fn setCurrentIpcReplyTargetFsBase(fs_base: u64) u64 {
+    if (fs_base != 0 and !capability.isUserCanonicalVa(fs_base)) return syscall_err_invalid;
+    const target_thread = currentIpcReplyTargetThread() orelse return syscall_err_endpoint;
+    if (!scheduler.setThreadFsBase(target_thread, fs_base)) return syscall_err_not_ready;
+    return syscall_ok;
 }
 
 fn copyFromCurrentIpcReplyTarget(h: *const Hooks, proc: kernel.PrincipalId, dst_current_va: u64, src_target_va: u64, len_u64: u64) u64 {
@@ -680,6 +703,88 @@ fn mapPagesToCurrentIpcReplyTarget(h: *const Hooks, target_va: u64, page_count: 
         if (!user_vm.mapUserLinearRegionWithProt(target_proc, va, page.paddr, 4096, prot)) return syscall_err_map;
     }
     return syscall_ok;
+}
+
+fn protectCurrentIpcReplyTargetPages(target_va: u64, page_count: u64, prot_bits: u64) u64 {
+    if ((target_va & 0xFFF) != 0) return syscall_err_invalid;
+    if (page_count == 0 or page_count > syscall_batch_max_pages) return syscall_err_invalid;
+    const target_proc = currentIpcReplyTargetPrincipal() orelse return syscall_err_endpoint;
+    const abi_prot = process_builder_abi.mapProtFromBits(prot_bits);
+    const prot = kernel.MapProt{
+        .read = abi_prot.read,
+        .write = abi_prot.write,
+        .exec = abi_prot.exec,
+    };
+    if (!prot.read) return syscall_err_invalid;
+    if (!user_vm.protectUserLinearRegionWithProt(target_proc, target_va, @intCast(page_count * 4096), prot)) {
+        return syscall_err_map;
+    }
+    return syscall_ok;
+}
+
+fn unmapCurrentIpcReplyTargetPages(h: *const Hooks, target_va: u64, page_count: u64) u64 {
+    if ((target_va & 0xFFF) != 0) return syscall_err_invalid;
+    if (page_count == 0 or page_count > syscall_batch_max_pages) return syscall_err_invalid;
+    const target_proc = currentIpcReplyTargetPrincipal() orelse return syscall_err_endpoint;
+    const byte_len: usize = @intCast(page_count * 4096);
+    var paddrs: [syscall_batch_max_pages]u64 = undefined;
+    const collected = user_vm.collectUserLinearRegionPaddrs(target_proc, target_va, byte_len, paddrs[0..]) orelse return syscall_err_map;
+    if (collected != page_count) return syscall_err_map;
+    for (paddrs[0..collected]) |paddr| {
+        const cap = h.state.getTableConst(target_proc).find(paddr) orelse return syscall_err_invalid;
+        if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) return syscall_err_invalid;
+        switch (h.state.scanCapTables(paddr)) {
+            .owner => |actual_owner| if (actual_owner != target_proc) return syscall_err_invalid,
+            .shared, .none => return syscall_err_invalid,
+        }
+        if (!h.free_list.canAppendPage(0, paddr)) return syscall_err_alloc;
+    }
+    if (!user_vm.unmapUserLinearRegion(target_proc, target_va, byte_len)) {
+        return syscall_err_map;
+    }
+    for (paddrs[0..collected]) |paddr| {
+        h.state.reclaimExclusiveRootPage(target_proc, paddr, h.free_list) catch return syscall_err_invalid;
+    }
+    return syscall_ok;
+}
+
+fn isExclusiveRootMappedPage(h: *const Hooks, target_proc: kernel.PrincipalId, paddr: u64) bool {
+    const cap = h.state.getTableConst(target_proc).find(paddr) orelse return false;
+    if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) return false;
+    switch (h.state.scanCapTables(paddr)) {
+        .owner => |actual_owner| if (actual_owner != target_proc) return false,
+        .shared, .none => return false,
+    }
+    return true;
+}
+
+fn reclaimPrivatePagesForProcess(h: *const Hooks, target_proc: kernel.PrincipalId) u64 {
+    var mapped_pages: [512]user_vm.MappedUserPage = undefined;
+    var pages: [syscall_batch_max_pages]user_vm.MappedUserPage = undefined;
+    const mapped_count = user_vm.collectUserMappedPages(target_proc, mapped_pages[0..]);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < mapped_count) : (i += 1) {
+        const paddr = mapped_pages[i].paddr;
+        if (!isExclusiveRootMappedPage(h, target_proc, paddr)) continue;
+        if (count >= pages.len) break;
+        if (!h.free_list.canAppendPage(0, paddr)) return syscall_err_alloc;
+        pages[count] = mapped_pages[i];
+        count += 1;
+    }
+    var reclaimed: u64 = 0;
+    for (pages[0..count]) |page| {
+        if (!user_vm.unmapUserLinearRegion(target_proc, page.va, 4096)) continue;
+        const paddr = page.paddr;
+        h.state.reclaimExclusiveRootPage(target_proc, paddr, h.free_list) catch return syscall_err_invalid;
+        reclaimed += 1;
+    }
+    return reclaimed;
+}
+
+fn reclaimCurrentIpcReplyTargetPrivatePages(h: *const Hooks) u64 {
+    const target_proc = currentIpcReplyTargetPrincipal() orelse return syscall_err_endpoint;
+    return reclaimPrivatePagesForProcess(h, target_proc);
 }
 
 fn resolveIpcSignalTargetThread(
@@ -895,10 +1000,10 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
 
     const state = h.state;
     const proc = scheduler.current_user_principal;
-    if (dispatchIpcSyscall(h, state, proc, frame)) |result| return result;
     if (syscall_entry_is_lstar != 0) {
         if (dispatchAbiTrapDelegate(h, state, proc, frame)) |result| return result;
     }
+    if (dispatchIpcSyscall(h, state, proc, frame)) |result| return result;
     if (h.scheduler_log_int80 and scheduler.scheduler_int80_log_count < h.scheduler_int80_log_max_lines) {
         h.write("INT80 dispatch ");
         h.write(h.thread_label(scheduler.current_thread_index));
@@ -1325,6 +1430,18 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_copy_to_abi_trap_reply_target => {
             return copyToCurrentIpcReplyTarget(h, proc, frame.rdi, frame.rsi, frame.rdx);
+        },
+        syscall_set_abi_trap_reply_target_fs_base => {
+            return setCurrentIpcReplyTargetFsBase(frame.rdi);
+        },
+        syscall_protect_abi_trap_reply_target_pages => {
+            return protectCurrentIpcReplyTargetPages(frame.rdi, frame.rsi, frame.rdx);
+        },
+        syscall_unmap_abi_trap_reply_target_pages => {
+            return unmapCurrentIpcReplyTargetPages(h, frame.rdi, frame.rsi);
+        },
+        syscall_reclaim_abi_trap_reply_target_private_pages => {
+            return reclaimCurrentIpcReplyTargetPrivatePages(h);
         },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;

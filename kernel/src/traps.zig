@@ -124,8 +124,6 @@ fn asmCallSyscallDispatchFromStackFrame() []const u8 {
         \\mov 112(%r15), %rax
         \\cmp $0x6, %rax
         \\je 30f
-        \\cmp $0xa, %rax
-        \\je 30f
         \\cmp $0x17, %rax
         \\je 30f
         \\cmp $0x2a, %rax
@@ -983,8 +981,6 @@ pub export fn syscallLstarHandlerStub() callconv(.naked) noreturn {
             \\je 28f
             \\cmp $0x6, %rax
             \\je 24f
-            \\cmp $0xa, %rax
-            \\je 24f
             \\cmp $0x2a, %rax
             \\je 24f
             \\cmp $0x2b, %rax
@@ -1077,8 +1073,6 @@ pub export fn syscallLstarHandlerStub() callconv(.naked) noreturn {
             \\cmp $0x17, %rax
             \\je 28f
             \\cmp $0x6, %rax
-            \\je 24f
-            \\cmp $0xa, %rax
             \\je 24f
             \\cmp $0x2a, %rax
             \\je 24f
