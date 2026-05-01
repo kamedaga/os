@@ -119,6 +119,7 @@ pub const ProcessDescriptor = struct {
     process_builder_suspended: bool = false,
     abi_trap_delegate_endpoint_id: u64 = 0,
     abi_trap_delegate_flavor: u32 = 0,
+    abi_trap_request_page_va: u64 = 0,
     faulted: bool = false,
     fault_vector: u8 = 0,
 };
@@ -126,6 +127,7 @@ pub const ProcessDescriptor = struct {
 pub const AbiTrapDelegate = struct {
     endpoint_id: u64,
     flavor: u32,
+    request_page_va: u64,
 };
 
 pub const ProcessStatus = struct {
@@ -1120,12 +1122,15 @@ pub const KernelState = struct {
         principal: PrincipalId,
         endpoint_id: u64,
         flavor: u32,
+        request_page_va: u64,
     ) KernelError!void {
         const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
         if (!self.process_descriptors[index].active) return KernelError.InvalidState;
         if (self.endpointTargetFor(principal, endpoint_id) == null) return KernelError.EndpointNotFound;
+        if (request_page_va == 0 or (request_page_va & 0xFFF) != 0 or !capability.isUserCanonicalVa(request_page_va)) return KernelError.InvalidState;
         self.process_descriptors[index].abi_trap_delegate_endpoint_id = endpoint_id;
         self.process_descriptors[index].abi_trap_delegate_flavor = flavor;
+        self.process_descriptors[index].abi_trap_request_page_va = request_page_va;
     }
 
     pub fn clearAbiTrapDelegate(self: *KernelState, principal: PrincipalId) KernelError!void {
@@ -1133,6 +1138,7 @@ pub const KernelState = struct {
         if (!self.process_descriptors[index].active) return KernelError.InvalidState;
         self.process_descriptors[index].abi_trap_delegate_endpoint_id = 0;
         self.process_descriptors[index].abi_trap_delegate_flavor = 0;
+        self.process_descriptors[index].abi_trap_request_page_va = 0;
     }
 
     pub fn abiTrapDelegateFor(self: *const KernelState, principal: PrincipalId) ?AbiTrapDelegate {
@@ -1142,6 +1148,7 @@ pub const KernelState = struct {
         return .{
             .endpoint_id = desc.abi_trap_delegate_endpoint_id,
             .flavor = desc.abi_trap_delegate_flavor,
+            .request_page_va = desc.abi_trap_request_page_va,
         };
     }
 
@@ -1154,6 +1161,7 @@ pub const KernelState = struct {
         self.process_descriptors[index].process_builder_suspended = false;
         self.process_descriptors[index].abi_trap_delegate_endpoint_id = 0;
         self.process_descriptors[index].abi_trap_delegate_flavor = 0;
+        self.process_descriptors[index].abi_trap_request_page_va = 0;
         self.process_descriptors[index].faulted = true;
         self.process_descriptors[index].fault_vector = fault_vector;
         if (self.active_process_count > 0) self.active_process_count -= 1;
@@ -1169,6 +1177,7 @@ pub const KernelState = struct {
         self.process_descriptors[index].process_builder_suspended = false;
         self.process_descriptors[index].abi_trap_delegate_endpoint_id = 0;
         self.process_descriptors[index].abi_trap_delegate_flavor = 0;
+        self.process_descriptors[index].abi_trap_request_page_va = 0;
         self.process_descriptors[index].faulted = false;
         self.process_descriptors[index].fault_vector = 0;
         if (self.active_process_count > 0) self.active_process_count -= 1;

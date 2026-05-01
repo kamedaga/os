@@ -1,95 +1,41 @@
 # PachaOS
 
-> A hypervisor-first capability microkernel OS.
-> Small kernel. Userland drivers. Dynamic DMA authority.
+Capability-based pure microkernel OS written in Zig.
 
-PachaOS は、OS 全体を capability machine として一貫させることを目指す実験的な OS です。  
-kernel はできるだけ小さく保ち、driver、filesystem、compositor まで userland に押し出します。
+musl libc と動的リンクにより、既存の Linux エコシステムとの互換を目指す。
 
-## What Makes PachaOS Different
+## Features
 
-- **DMA / IOMMU を capability transfer の問題として扱う**
-  - メモリ保護だけでなく DMA authority まで capability の rights に含めて扱います。
-  - IOMMU を巨大な専用サブシステムとしてではなく、小さい kernel の中に最小構成で収めようとしています。
+- **Pure microkernel** — カーネルは capability 管理・スケジューリング・trap delegation のみを担当
+- **Trap delegation** — syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーに委譲
+- **Hardware capabilities** — DMA バッファ・IOMMU マッピング・Virtqueue を capability として抽象化
+- **Linux ABI compatibility** — 無改造の musl libc を動的リンクでロードし、ユーザーランドで Linux syscall を処理
+- **Userland drivers** — virtio-blk / virtio-gpu ドライバはすべてユーザー空間で動作
 
-- **driver から compositor まで userland**
-  - `virtio_input`、`virtio_gpu`、`virtio_blk` の driver 群だけでなく、VFS、persistent storage、window system まで user-space に寄せています。
-  - kernel は mechanism を担当し、policy は `Init` と service 側へ移す方向です。
+## Design
 
-- **kernel が service 固有名を知りすぎない方向で進めている**
-  - microkernel の見た目よりも、authority を capability と descriptor に還元できることを優先しています。
-  - これは boot path や device bring-up にまで適用しようとしています。
+カーネルは Linux syscall の意味を持たない。fd table、errno、パス解決、filesystem semantics はすべてユーザーランドの `linux_abi_server` に閉じる。
 
-- **hypervisor-first で現実の virtio world を相手にしている**
-  - 対象は `x86_64 + UEFI + q35 + virtio` です。
-  - 抽象論ではなく、virtio / DMA / UI を含んだ一式を capability model で揃えることを狙っています。
+カーネルの設計目標は 20,000 行以下。Lean 4 形式検証目標。
 
-## What Already Works
+## Tech Stack
 
-- **capability ベースの kernel core**
-  - page / endpoint / filesystem / VM object / exec image / untyped / queue capability 系が入っています。
-  - `grant`、`send`、`share`、`revoke tree` の lineage を保つ方向で kernel test が揃っています。
+| Layer | Language | Note |
+|---|---|---|
+| Kernel | Zig | Freestanding, UEFI boot, x86_64 |
+| Userland | C / CMake | musl libc, ELF loader, ABI server |
 
-- **DMA / IOMMU まわりの土台**
-  - DMA mapping manager、device domain binding、queue capability が実装されています。
-  - IOMMU no-cap-driver mode と DMA rights 同期のテストがあります。
+## Build
 
-- **user-space storage path**
-  - `virtio_blk` と `persistent_fs` は現行 boot path に入っています。
-  - bootfs だけで終わらない storage / rootfs 方向へ進める基礎ができています。
-
-- **user-space UI stack**
-  - compositor、GPU compositor、terminal、taskbar、input driver 群が codebase 上で揃っています。
-  - window system も capability ベースで組まれています。
-
-- **形式検証への足場**
-  - `tla/` に DMA / capability 周辺のモデルがあります。
-  - 将来の Capability model 検証は、完全なゼロスタートではありません。
-
-## Core Ideas
-
-- **Capability で DMA / IOMMU を動的に制御する**
-  - メモリ権限だけでなく DMA authority も capability の rights として扱います。
-
-- **最小 kernel、最大 userland**
-  - `virtio_input`、`virtio_gpu`、`virtio_blk` の driver から UI まで user-space で構成します。
-
-- **ハイパーバイザー向け microkernel**
-  - 主な対象は `x86_64 + UEFI + q35 + virtio` です。
-
-- **boot も capability handoff として扱う**
-  - boot 後の system bring-up を、特別処理ではなく descriptor / capability の受け渡しとして整理します。
-
-## Roadmap
-
-- rootfs の完全対応
-- kernel が init を知らないようにする
-- TLA+ で Capability model を検証する
-
-## Build / Run
-
-通常の開発ループは `pactl` を使います。
-
-```powershell
-pactl plan
-pactl setup
+```bash
+pactl setup full
 pactl run
 ```
 
-- `pactl setup`: 通常の差分 setup。kernel build、disk image の確認、bootfs/rootfs の同期をまとめて行います。
-- `pactl setup full`: `disk.img` を作り直してから full setup を行います。
-- `pactl run --timed`: QEMU を起動しつつ boot timing を記録します。
-- `pactl run --no-kvm`: KVM を無効にして QEMU を起動します。
-- `pactl build userland <app-id> --fresh`: 特定 app の artifact を明示的に更新します。
+## Status
 
-kernel だけを確認したい時は、従来どおり `kernel/` で `zig build efi` を使えます。
+Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカが動作し、musl libc のロードとエントリ到達を確認。Trap delegation と linux_abi_server を実装中。
 
-設定の source of truth は次です。
+## License
 
-- workspace 全体: `pactl.conf`
-- userland app ごとの定義: `userland/apps/<app-id>/app.conf`
-- 生成物: `.artifacts/`
-
-## Technical Notes
-
-実装寄りの説明は [TECHNICAL.md](TECHNICAL.md) に分離しています。
+MIT

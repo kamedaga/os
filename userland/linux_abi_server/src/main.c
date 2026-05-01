@@ -13,7 +13,6 @@ enum {
     PAGE_BYTES = 4096,
     TRAP_MAGIC = 0x3149424150415254ULL,
     TRAP_VERSION = 1,
-    TRAP_REQUEST_PAGE_VA = 0x30000000ULL,
 
     LINUX_SYS_WRITE = 1,
     LINUX_SYS_MMAP = 9,
@@ -48,6 +47,7 @@ struct trap_request {
 };
 
 static u64 mmap_next_va = 0x31000000ULL;
+static u64 trap_request_page_va = 0;
 
 static u64 cstr_len(const char *s) {
     u64 n = 0;
@@ -91,6 +91,11 @@ static void user_log_hex_value(u64 value) {
     user_log_len(buf, pos);
 }
 
+static void log_syscall_nr(u64 nr) {
+    user_log("LinuxAbiServer: syscall\n");
+    user_log_hex_value(nr);
+}
+
 static struct ipc_message wait_ipc(void) {
     register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT;
     register u64 rdi __asm__("rdi") = 0;
@@ -113,7 +118,7 @@ static struct ipc_message wait_ipc(void) {
     return msg;
 }
 
-static void reply(u64 result, u64 flags) {
+static struct ipc_message reply(u64 result, u64 flags) {
     register u64 rax __asm__("rax") = SYSCALL_IPC_CALL_REPLY_RECV;
     register u64 rdi __asm__("rdi") = result;
     register u64 rsi __asm__("rsi") = 0;
@@ -127,6 +132,14 @@ static void reply(u64 result, u64 flags) {
         : "+r"(rax), "+r"(rdi), "+r"(rsi), "+r"(rdx), "+r"(r8), "+r"(r9), "+r"(r10)
         :
         : "rcx", "r11", "memory");
+
+    struct ipc_message msg;
+    msg.status = rax;
+    msg.request_va = rdi;
+    msg.reserved0 = rsi;
+    msg.reserved1 = rdx;
+    msg.reserved2 = r8;
+    return msg;
 }
 
 static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) {
@@ -160,6 +173,14 @@ static u64 errno_inval(void) {
     return (u64)(i64)-22;
 }
 
+static u64 errno_badf(void) {
+    return (u64)(i64)-9;
+}
+
+static u64 errno_acces(void) {
+    return (u64)(i64)-13;
+}
+
 static u64 errno_nosys(void) {
     return (u64)(i64)-38;
 }
@@ -172,109 +193,154 @@ static u64 page_up(u64 value) {
     return (value + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1);
 }
 
-static void handle_mmap(const struct trap_request *req) {
+static struct ipc_message handle_mmap(const struct trap_request *req) {
     enum {
+        PROT_READ = 0x1,
+        PROT_WRITE = 0x2,
+        PROT_EXEC = 0x4,
+
+        MAP_SHARED = 0x01,
+        MAP_PRIVATE = 0x02,
+        MAP_SHARED_VALIDATE = 0x03,
+        MAP_TYPE = 0x0F,
         MAP_FIXED = 0x10,
         MAP_ANONYMOUS = 0x20,
+        MAP_FIXED_NOREPLACE = 0x100000,
     };
     const u64 requested_va = req->args[0];
     const u64 len = req->args[1];
-    const u64 requested_prot = req->args[2] & 0x7;
+    const u64 requested_prot = req->args[2] & (PROT_READ | PROT_WRITE | PROT_EXEC);
     const u64 flags = req->args[3];
     const u64 fd = req->args[4];
-    const u64 prot = requested_prot == 0 ? 0x3 : requested_prot;
+    const u64 offset = req->args[5];
+    const u64 map_type = flags & MAP_TYPE;
+    u64 prot = requested_prot;
 
     if (len == 0) {
         user_log("LinuxAbiServer: mmap invalid zero len\n");
-        reply(errno_inval(), 0);
-        return;
+        return reply(errno_inval(), 0);
     }
 
-    if ((flags & MAP_ANONYMOUS) == 0 && fd != (u64)-1) {
-        user_log("LinuxAbiServer: file-backed mmap stub as anonymous\n");
+    if (map_type != MAP_PRIVATE && map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE) {
+        user_log("LinuxAbiServer: mmap invalid map type\n");
         user_log_hex_value(flags);
-        user_log_hex_value(fd);
+        return reply(errno_inval(), 0);
     }
 
-    if ((flags & MAP_FIXED) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) {
+    if ((offset & (PAGE_BYTES - 1)) != 0) {
+        user_log("LinuxAbiServer: mmap unaligned offset\n");
+        user_log_hex_value(offset);
+        return reply(errno_inval(), 0);
+    }
+
+    if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) {
         user_log("LinuxAbiServer: mmap bad fixed va\n");
         user_log_hex_value(requested_va);
-        reply(errno_inval(), 0);
-        return;
+        return reply(errno_inval(), 0);
+    }
+
+    if ((flags & MAP_ANONYMOUS) == 0) {
+        user_log("LinuxAbiServer: file-backed mmap unsupported\n");
+        user_log_hex_value(flags);
+        user_log_hex_value(fd);
+        if (fd <= 2) return reply(errno_acces(), 0);
+        return reply(errno_badf(), 0);
+    }
+
+    if (prot == 0) {
+        user_log("LinuxAbiServer: mmap PROT_NONE unsupported\n");
+        return reply(errno_inval(), 0);
+    }
+
+    if ((prot & PROT_WRITE) != 0) prot |= PROT_READ;
+    if ((prot & PROT_WRITE) != 0 && (prot & PROT_EXEC) != 0) {
+        user_log("LinuxAbiServer: mmap W+X unsupported\n");
+        return reply(errno_inval(), 0);
     }
 
     const u64 size = page_up(len);
     const u64 page_count = size / PAGE_BYTES;
-    const u64 target_va = ((flags & MAP_FIXED) != 0) ? requested_va : mmap_next_va;
+    const u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : mmap_next_va;
     const u64 map_status = map_reply_target_pages(target_va, page_count, prot);
     if (map_status == SYSCALL_OK) {
-        if ((flags & MAP_FIXED) == 0) mmap_next_va += size;
+        if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) mmap_next_va += size;
         user_log("LinuxAbiServer: mmap ok va\n");
         user_log_hex_value(target_va);
-        reply(target_va, 0);
+        return reply(target_va, 0);
     } else {
         user_log("LinuxAbiServer: mmap failed pages\n");
         user_log_hex_value(page_count);
         user_log("LinuxAbiServer: mmap status\n");
         user_log_hex_value(map_status);
-        reply(errno_nomem(), 0);
+        return reply(errno_nomem(), 0);
     }
 }
 
-static void handle_write(const struct trap_request *req) {
+static struct ipc_message handle_write(const struct trap_request *req) {
     const u64 fd = req->args[0];
     const u64 len = req->args[2];
     if (fd == 1 || fd == 2) {
         user_log("LinuxAbiServer: write len\n");
         user_log_hex_value(len);
-        reply(len, 0);
+        return reply(len, 0);
     } else {
         user_log("LinuxAbiServer: write bad fd\n");
         user_log_hex_value(fd);
-        reply(errno_inval(), 0);
+        return reply(errno_inval(), 0);
     }
 }
 
 void linux_abi_main(void) {
-    const u64 request_page_status = alloc_map_pages(TRAP_REQUEST_PAGE_VA, 1, 0x1);
+    const struct ipc_message cfg = wait_ipc();
+    if (cfg.status != SYSCALL_OK || cfg.request_va == 0) {
+        user_log("LinuxAbiServer: config IPC invalid\n");
+        for (;;) __asm__ volatile("pause");
+    }
+    trap_request_page_va = cfg.request_va;
+    const u64 request_page_status = alloc_map_pages(trap_request_page_va, 1, 0x1);
     if (request_page_status != SYSCALL_OK) {
         user_log("LinuxAbiServer: request page map failed\n");
         user_log_hex_value(request_page_status);
         for (;;) __asm__ volatile("pause");
     }
     user_log("LinuxAbiServer: started\n");
+    struct ipc_message msg = reply(0, 0);
     for (;;) {
-        const struct ipc_message msg = wait_ipc();
-        if (msg.status != SYSCALL_OK) continue;
-        if (msg.request_va != TRAP_REQUEST_PAGE_VA) {
+        if (msg.status != SYSCALL_OK) {
+            msg = wait_ipc();
+            continue;
+        }
+        if (msg.request_va != trap_request_page_va) {
             user_log("LinuxAbiServer: bad request va\n");
             user_log_hex_value(msg.request_va);
-            reply(errno_inval(), 0);
+            msg = reply(errno_inval(), 0);
             continue;
         }
 
-        const struct trap_request *req = (const struct trap_request *)TRAP_REQUEST_PAGE_VA;
+        const struct trap_request *req = (const struct trap_request *)trap_request_page_va;
         if (req->magic != TRAP_MAGIC || req->version != TRAP_VERSION) {
             user_log("LinuxAbiServer: bad request header\n");
-            reply(errno_inval(), 0);
+            msg = reply(errno_inval(), 0);
             continue;
         }
 
+        log_syscall_nr(req->nr);
         switch (req->nr) {
         case LINUX_SYS_MMAP:
-            handle_mmap(req);
+            msg = handle_mmap(req);
             break;
         case LINUX_SYS_WRITE:
-            handle_write(req);
+            msg = handle_write(req);
             break;
         case LINUX_SYS_EXIT:
         case LINUX_SYS_EXIT_GROUP:
-            reply(0, TRAP_RESPONSE_FLAG_EXIT);
+            user_log("LinuxAbiServer: exit\n");
+            msg = reply(0, TRAP_RESPONSE_FLAG_EXIT);
             break;
         default:
             user_log("LinuxAbiServer: unhandled syscall\n");
             user_log_hex_value(req->nr);
-            reply(errno_nosys(), 0);
+            msg = reply(errno_nosys(), 0);
             break;
         }
     }

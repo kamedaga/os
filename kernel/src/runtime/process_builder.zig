@@ -195,6 +195,7 @@ pub fn setAbiTrapDelegate(
     endpoint_id: u64,
     target_process_slot: u64,
     flavor: u64,
+    request_page_va: u64,
 ) u64 {
     if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
@@ -203,7 +204,7 @@ pub fn setAbiTrapDelegate(
         kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
         else => return boot_static.syscall_err_invalid,
     };
-    state_ptr.setAbiTrapDelegate(target, endpoint_id, @truncate(flavor)) catch |err| switch (err) {
+    state_ptr.setAbiTrapDelegate(target, endpoint_id, @truncate(flavor), request_page_va) catch |err| switch (err) {
         kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
         else => return boot_static.syscall_err_invalid,
     };

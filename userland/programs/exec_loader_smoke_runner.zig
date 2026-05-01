@@ -12,13 +12,17 @@ const user_vm = support.user_vm;
 const syscall_log: u64 = 0x9;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_get_process_slot: u64 = 0x2E;
+const syscall_install_endpoint: u64 = 0x26;
+const syscall_ipc_call_reply_recv: u64 = 0x40;
 const syscall_ok: u64 = 0;
+const ipc_call_flag_signal_only: u64 = 0x2;
 
 const exec_loader_path = "/srv/exec_loader.elf";
 const linux_abi_server_path = "/srv/linux_abi_server.elf";
 const smoke_app_path = "/cmd/musl_smoke.elf";
 const ld_path = "/lib/ld.so";
 const linux_abi_endpoint_id: u64 = 0x90;
+const linux_abi_config_endpoint_id: u64 = 0x91;
 
 const max_file_bytes: usize = 128 * 1024;
 const stack_extension_pages: u64 = 4;
@@ -68,6 +72,31 @@ fn allocMapPages(base_va: u64, page_count: u64, writable: bool) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_install_endpoint),
+          [arg0] "{rdi}" (@as(u64, 0)),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (target_process_slot),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn signalEndpointValue(endpoint_id: u64, value: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_ipc_call_reply_recv),
+          [arg0] "{rdi}" (value),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (@as(u64, ipc_call_flag_signal_only)),
+          [arg3] "{r8}" (@as(u64, 0)),
+          [arg4] "{r9}" (@as(u64, 0)),
+          [arg5] "{r10}" (@as(u64, 0)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
     return asm volatile (
         \\int $0x80
@@ -79,7 +108,9 @@ fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRigh
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn spawnExecWithExtendedBootstrapTable(exec_token: u64, table: *const process_abi.BootstrapDescriptorTable) u64 {
+fn spawnExecWithExtendedBootstrapTable(exec_token: u64, table: *const process_abi.BootstrapDescriptorTable, child_bootstrap_owner: bool) u64 {
+    const flags = process_abi.spawn_flag_bootstrap_extended_descriptor_table |
+        if (child_bootstrap_owner) process_abi.spawn_flag_child_bootstrap_owner else 0;
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
@@ -87,7 +118,7 @@ fn spawnExecWithExtendedBootstrapTable(exec_token: u64, table: *const process_ab
           [arg0] "{rdi}" (exec_token),
           [arg1] "{rsi}" (@as(u64, @intFromPtr(table))),
           [arg2] "{rdx}" (@as(u64, 0)),
-          [arg3] "{rcx}" (process_abi.spawn_flag_bootstrap_extended_descriptor_table | process_abi.spawn_flag_child_bootstrap_owner),
+          [arg3] "{rcx}" (flags),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -112,6 +143,93 @@ fn lookupPersistentRoot(client: *fs_client.Client) fs_client.LookupResult {
     const root = client.lookup(client.mount_token, ".") catch |err| failErr("ExecSmokeRunner: root lookup failed: ", err);
     if (root.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: root lookup returned non-dir\n");
     return root;
+}
+
+fn runRootVfsSmoke(process_slot: u64) void {
+    const ipc_va = user_vm.reservePages(2) orelse fail("ExecSmokeRunner: vfs IPC VA reserve failed\n");
+    var client = fs_client.Client.connectFromRegistryPageKind(
+        process_abi.service_registry_shadow_va,
+        .vfs,
+        @intCast(ipc_va),
+        @intCast(ipc_va + user_vm.page_bytes),
+        process_slot,
+    ) catch |err| failErr("ExecSmokeRunner: vfs connect failed: ", err);
+    _ = userLog("ExecSmokeRunner: vfs connect ok\n");
+
+    const root_stat = client.stat(client.mount_token) catch |err| failErr("ExecSmokeRunner: vfs root stat failed: ", err);
+    if (root_stat.object_kind != fs_abi.ObjectKind.mount and root_stat.object_kind != fs_abi.ObjectKind.vnode_dir) {
+        fail("ExecSmokeRunner: vfs root stat non-dir\n");
+    }
+    _ = userLog("ExecSmokeRunner: vfs root stat ok\n");
+
+    const root_lookup = client.lookup(client.mount_token, "/") catch |err| failErr("ExecSmokeRunner: vfs root lookup failed: ", err);
+    if (root_lookup.object_kind != fs_abi.ObjectKind.mount) fail("ExecSmokeRunner: vfs root lookup non-mount\n");
+    _ = userLog("ExecSmokeRunner: vfs root lookup ok\n");
+
+    var entry_buf: [8]fs_client.DirEntry = undefined;
+    var name_storage: [64]u8 = undefined;
+    const entries = client.readdirMany(client.mount_token, 0, entry_buf[0..], name_storage[0..]) catch |err| failErr("ExecSmokeRunner: vfs readdir failed: ", err);
+    var saw_dev = false;
+    var saw_proc = false;
+    var saw_tmp = false;
+    var saw_run = false;
+    var saw_fat_probe = false;
+    for (entries.entries) |entry| {
+        if (entry.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs readdir non-dir\n");
+        if (std.mem.eql(u8, entry.name, "dev")) saw_dev = true;
+        if (std.mem.eql(u8, entry.name, "proc")) saw_proc = true;
+        if (std.mem.eql(u8, entry.name, "tmp")) saw_tmp = true;
+        if (std.mem.eql(u8, entry.name, "run")) saw_run = true;
+        if (std.mem.eql(u8, entry.name, "fat_probe")) saw_fat_probe = true;
+    }
+    if (!saw_dev or !saw_proc or !saw_tmp or !saw_run) fail("ExecSmokeRunner: vfs builtin mount missing\n");
+    if (!saw_fat_probe) fail("ExecSmokeRunner: vfs fat backend entry missing\n");
+    _ = userLog("ExecSmokeRunner: vfs readdir ok\n");
+
+    const fat_probe = client.lookup(client.mount_token, "/fat_probe") catch |err| failErr("ExecSmokeRunner: vfs fat probe lookup failed: ", err);
+    if (fat_probe.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs fat probe non-dir\n");
+    const fat_probe_stat = client.stat(fat_probe.token) catch |err| failErr("ExecSmokeRunner: vfs fat probe stat failed: ", err);
+    if (fat_probe_stat.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs fat probe stat non-dir\n");
+    _ = userLog("ExecSmokeRunner: vfs fat backend smoke ok\n");
+
+    const dev = client.lookup(client.mount_token, "/dev") catch |err| failErr("ExecSmokeRunner: vfs /dev lookup failed: ", err);
+    if (dev.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs /dev non-dir\n");
+    const dev_stat = client.stat(dev.token) catch |err| failErr("ExecSmokeRunner: vfs /dev stat failed: ", err);
+    if (dev_stat.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs /dev stat non-dir\n");
+
+    var dev_entry_buf: [4]fs_client.DirEntry = undefined;
+    var dev_name_storage: [32]u8 = undefined;
+    const dev_entries = client.readdirMany(dev.token, 0, dev_entry_buf[0..], dev_name_storage[0..]) catch |err| failErr("ExecSmokeRunner: vfs /dev readdir failed: ", err);
+    var saw_null = false;
+    var saw_zero = false;
+    for (dev_entries.entries) |entry| {
+        if (entry.object_kind != fs_abi.ObjectKind.vnode_file) fail("ExecSmokeRunner: vfs /dev readdir non-file\n");
+        if (std.mem.eql(u8, entry.name, "null")) saw_null = true;
+        if (std.mem.eql(u8, entry.name, "zero")) saw_zero = true;
+    }
+    if (!saw_null or !saw_zero) fail("ExecSmokeRunner: vfs /dev builtin missing\n");
+
+    const null_node = client.lookup(dev.token, "null") catch |err| failErr("ExecSmokeRunner: vfs /dev/null lookup failed: ", err);
+    if (null_node.object_kind != fs_abi.ObjectKind.vnode_file) fail("ExecSmokeRunner: vfs /dev/null non-file\n");
+    const null_open = client.open(null_node.token) catch |err| failErr("ExecSmokeRunner: vfs /dev/null open failed: ", err);
+    var null_read_buf: [8]u8 = undefined;
+    const null_read = client.read(null_open.token, 0, null_read_buf[0..]) catch |err| failErr("ExecSmokeRunner: vfs /dev/null read failed: ", err);
+    if (null_read.bytes_read != 0) fail("ExecSmokeRunner: vfs /dev/null read non-empty\n");
+    const null_written = client.write(null_open.token, 0, "discard") catch |err| failErr("ExecSmokeRunner: vfs /dev/null write failed: ", err);
+    if (null_written != 7) fail("ExecSmokeRunner: vfs /dev/null write count invalid\n");
+    client.close(null_open.token) catch |err| failErr("ExecSmokeRunner: vfs /dev/null close failed: ", err);
+
+    const zero_node = client.lookup(client.mount_token, "/dev/zero") catch |err| failErr("ExecSmokeRunner: vfs /dev/zero lookup failed: ", err);
+    if (zero_node.object_kind != fs_abi.ObjectKind.vnode_file) fail("ExecSmokeRunner: vfs /dev/zero non-file\n");
+    const zero_open = client.open(zero_node.token) catch |err| failErr("ExecSmokeRunner: vfs /dev/zero open failed: ", err);
+    var zero_buf: [16]u8 = undefined;
+    const zero_read = client.read(zero_open.token, 0, zero_buf[0..]) catch |err| failErr("ExecSmokeRunner: vfs /dev/zero read failed: ", err);
+    if (zero_read.bytes_read != zero_buf.len) fail("ExecSmokeRunner: vfs /dev/zero read size invalid\n");
+    for (zero_buf) |byte| {
+        if (byte != 0) fail("ExecSmokeRunner: vfs /dev/zero read nonzero\n");
+    }
+    client.close(zero_open.token) catch |err| failErr("ExecSmokeRunner: vfs /dev/zero close failed: ", err);
+    _ = userLog("ExecSmokeRunner: vfs smoke ok\n");
 }
 
 fn readRootFsFile(client: *fs_client.Client, root_token: u64, path: []const u8, out: []u8) FileImage {
@@ -174,6 +292,7 @@ fn spawnExecLoader(
     bootfs_token: u64,
     bootfs_bytes: usize,
     abi_server_process_slot: u64,
+    abi_trap_request_page_va: u64,
 ) void {
     const cfg: *volatile exec_loader_bootstrap_abi.Config = @ptrCast(@alignCast(&exec_loader_config_page));
     cfg.* = .{
@@ -191,6 +310,7 @@ fn spawnExecLoader(
         .abi_trap_endpoint_id = linux_abi_endpoint_id,
         .abi_trap_endpoint_process_slot = abi_server_process_slot,
         .abi_trap_flavor = @intFromEnum(trap_abi.AbiFlavor.linux_x86_64),
+        .abi_trap_request_page_va = abi_trap_request_page_va,
     };
     if (service_registry_abi.findService(process_abi.service_registry_shadow_va, .persistent_fs)) |entry| {
         cfg.fs_endpoint_id = entry.endpoint_id;
@@ -227,7 +347,7 @@ fn spawnExecLoader(
     }
 
     _ = userLog("ExecSmokeRunner: exec_loader spawn begin\n");
-    const spawned = spawnExecWithExtendedBootstrapTable(loader_exec.token, &exec_loader_bootstrap_table);
+    const spawned = spawnExecWithExtendedBootstrapTable(loader_exec.token, &exec_loader_bootstrap_table, true);
     if (process_abi.decodeSpawnedProcessSlot(spawned) == null) {
         userLogHex("ExecSmokeRunner: spawn ret=", spawned);
         fail("ExecSmokeRunner: exec_loader spawn failed\n");
@@ -253,6 +373,8 @@ pub export fn _start() noreturn {
     const process_slot = getProcessSlot();
     if (process_slot == 0) fail("ExecSmokeRunner: process slot unavailable\n");
 
+    runRootVfsSmoke(process_slot);
+
     const ipc_va = user_vm.reservePages(2) orelse fail("ExecSmokeRunner: IPC VA reserve failed\n");
     var client = fs_client.Client.connectFromRegistryPage(
         process_abi.service_registry_shadow_va,
@@ -271,11 +393,14 @@ pub export fn _start() noreturn {
     const smoke_token = installReadMapVmObject(smoke_app_image[0..smoke.bytes]);
     const ld_token = installReadMapVmObject(ld_image[0..ld.bytes]);
     _ = userLog("ExecSmokeRunner: assets ready\n");
+    const abi_trap_request_page_va = user_vm.reservePages(1) orelse fail("ExecSmokeRunner: abi trap VA reserve failed\n");
     const abi_server_spawned = spawnPlainExec(linux_abi_server_exec.token);
     const abi_server_process_slot = process_abi.decodeSpawnedProcessSlot(abi_server_spawned) orelse {
         userLogHex("ExecSmokeRunner: linux abi spawn ret=", abi_server_spawned);
         fail("ExecSmokeRunner: linux abi server spawn failed\n");
     };
+    if (installEndpoint(linux_abi_config_endpoint_id, abi_server_process_slot) != syscall_ok) fail("ExecSmokeRunner: linux abi config endpoint failed\n");
+    if (signalEndpointValue(linux_abi_config_endpoint_id, @intCast(abi_trap_request_page_va)) != syscall_ok) fail("ExecSmokeRunner: linux abi config send failed\n");
     _ = userLog("ExecSmokeRunner: linux abi server spawn ok\n");
 
     spawnExecLoader(
@@ -287,6 +412,7 @@ pub export fn _start() noreturn {
         0,
         0,
         abi_server_process_slot,
+        @intCast(abi_trap_request_page_va),
     );
 
     while (true) asm volatile ("pause");

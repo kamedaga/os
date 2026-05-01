@@ -19,4 +19,5 @@ pub const Config = extern struct {
     abi_trap_endpoint_id: u64 = 0,
     abi_trap_endpoint_process_slot: u64 = 0,
     abi_trap_flavor: u64 = 0,
+    abi_trap_request_page_va: u64 = 0,
 };

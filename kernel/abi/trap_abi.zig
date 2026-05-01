@@ -30,7 +30,6 @@ pub const response_flag_block: u64 = 1 << 1;
 pub const response_flag_restart: u64 = 1 << 2;
 
 pub const max_args: usize = 6;
-pub const request_page_va: u64 = 0x3000_0000;
 pub const syscall_set_abi_trap_delegate: u64 = 0x49;
 pub const syscall_clear_abi_trap_delegate: u64 = 0x4A;
 pub const syscall_map_abi_trap_reply_target_pages: u64 = 0x4C;

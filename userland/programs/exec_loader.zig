@@ -269,6 +269,20 @@ fn syscall5(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) u64 
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn syscall6(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (nr),
+          [arg0] "{rdi}" (arg0),
+          [arg1] "{rsi}" (arg1),
+          [arg2] "{rdx}" (arg2),
+          [arg3] "{rcx}" (arg3),
+          [arg4] "{r8}" (arg4),
+          [arg5] "{r9}" (arg5),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn userLog(message: []const u8) void {
     _ = syscall3(syscall_log, @intFromPtr(message.ptr), message.len, 0);
 }
@@ -435,8 +449,8 @@ fn startProcess(process_token: u64) ?u64 {
     return if (process_abi.decodeSpawnedProcessSlot(spawned) != null) spawned else null;
 }
 
-fn setProcessAbiTrapDelegate(process_token: u64, endpoint_id: u64, target_process_slot: u64, flavor: u64) bool {
-    return syscall4(process_builder_abi.syscall_set_process_abi_trap_delegate, process_token, endpoint_id, target_process_slot, flavor) == syscall_ok;
+fn setProcessAbiTrapDelegate(process_token: u64, endpoint_id: u64, target_process_slot: u64, flavor: u64, request_page_va: u64) bool {
+    return syscall5(process_builder_abi.syscall_set_process_abi_trap_delegate, process_token, endpoint_id, target_process_slot, flavor, request_page_va) == syscall_ok;
 }
 
 fn abortProcess(process_token: u64) void {
@@ -1374,7 +1388,12 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
     }
     if (cfg.abi_trap_endpoint_id != 0 and cfg.abi_trap_endpoint_process_slot != 0) {
         const flavor = if (cfg.abi_trap_flavor != 0) cfg.abi_trap_flavor else @as(u64, @intFromEnum(trap_abi.AbiFlavor.linux_x86_64));
-        if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_process_slot, flavor)) {
+        if (cfg.abi_trap_request_page_va == 0) {
+            abortProcess(process_token);
+            userLog("ExecLoader: abi trap request page absent\n");
+            return false;
+        }
+        if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_process_slot, flavor, cfg.abi_trap_request_page_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: abi trap delegate failed\n");
             return false;

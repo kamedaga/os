@@ -24,6 +24,7 @@ const default_response_poll_limit: u64 = 256;
 const default_bulk_read_va_gap: u64 = 0x20_000;
 const page_bytes: usize = block_protocol.page_bytes;
 const bulk_read_pages: usize = 16;
+const bulk_buffer_pages: usize = bulk_read_pages + 1;
 const bulk_read_bytes: usize = bulk_read_pages * page_bytes;
 
 pub const Error = error{
@@ -87,7 +88,7 @@ pub const Client = struct {
     response_poll_limit: u64 = default_response_poll_limit,
     bulk_read_ready: bool = false,
     bulk_read_disabled: bool = false,
-    bulk_read_paddrs: [bulk_read_pages]u64 = [_]u64{0} ** bulk_read_pages,
+    bulk_read_paddrs: [bulk_buffer_pages]u64 = [_]u64{0} ** bulk_buffer_pages,
 
     pub fn connect(options: ConnectOptions) Error!Client {
         const pages = try allocConnectPages(options.request_va, options.response_va);
@@ -199,7 +200,10 @@ pub const Client = struct {
         if ((out.len % self.block_size) != 0) return error.BufferTooSmall;
         const block_count: usize = out.len / @as(usize, @intCast(self.block_size));
         if (block_count == 0 or block_count > std.math.maxInt(u32)) return error.BufferTooSmall;
-        if (out.len > block_protocol.response_payload_bytes and self.server_process_slot != 0 and !self.bulk_read_disabled) {
+        // Keep the legacy rootfs path conservative while the replacement FS
+        // server is being built. The old bulk-read path can trigger tail-page
+        // overreads in optimized copies; inline reads are slower but stable.
+        if (false and out.len > block_protocol.response_payload_bytes and self.server_process_slot != 0 and !self.bulk_read_disabled) {
             return self.readBlocksBulk(block_index, out) catch {
                 self.bulk_read_disabled = true;
                 self.bulk_read_ready = false;
@@ -266,13 +270,13 @@ pub const Client = struct {
         if (self.bulk_read_ready) return;
         if (self.server_process_slot == 0) return error.Invalid;
         if (self.bulk_read_va == 0) {
-            self.bulk_read_va = @intCast(user_vm.allocMapPagesInto(bulk_read_pages, true, self.bulk_read_paddrs[0..]) orelse {
+            self.bulk_read_va = @intCast(user_vm.allocMapPagesInto(bulk_buffer_pages, true, self.bulk_read_paddrs[0..]) orelse {
                 return error.BulkBufferAllocFailed;
             });
-        } else if (allocMapPages(self.bulk_read_va, bulk_read_pages, true, @intFromPtr(&self.bulk_read_paddrs)) != syscall_ok) {
+        } else if (allocMapPages(self.bulk_read_va, bulk_buffer_pages, true, @intFromPtr(&self.bulk_read_paddrs)) != syscall_ok) {
             return error.BulkBufferAllocFailed;
         }
-        for (self.bulk_read_paddrs) |paddr| {
+        for (self.bulk_read_paddrs[0..bulk_read_pages]) |paddr| {
             if (paddr < 0x1000 or grantCap(paddr, self.server_process_slot, page_right_cpu_write) != syscall_ok) {
                 return error.BulkBufferGrantFailed;
             }
@@ -639,7 +643,10 @@ fn copyVolatileBytes(src: [*]volatile u8, dest: []u8) void {
 }
 
 fn copyPlainBytes(src: [*]const u8, dest: []u8) void {
-    @memcpy(dest, src[0..dest.len]);
+    var i: usize = 0;
+    while (i < dest.len) : (i += 1) {
+        dest[i] = src[i];
+    }
 }
 
 fn compilerBarrier() void {

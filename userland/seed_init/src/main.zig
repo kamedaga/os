@@ -979,10 +979,12 @@ fn parseStartupNamedDependencyList(
 
 fn defaultStartupPolicyLabel(policy: *const StartupPolicy) []const u8 {
     return switch (policy.action) {
+        .vfs => "vfs",
         .input_driver => "input driver",
         .block_driver => "block driver",
         .gpu_driver => "gpu driver",
         .persistent_fs_server => "persistent fs",
+        .fat_server => "fat server",
         .window_service => "window service",
         .process => "process",
         .process_builder => "process builder",
@@ -992,7 +994,9 @@ fn defaultStartupPolicyLabel(policy: *const StartupPolicy) []const u8 {
 
 fn normalizeStartupPolicy(policy: *StartupPolicy) void {
     switch (policy.action) {
+        .vfs => policy.require_flags |= startup_plan_abi.require_flag_block_service,
         .persistent_fs_server => policy.require_flags |= startup_plan_abi.require_flag_block_service,
+        .fat_server => policy.require_flags |= startup_plan_abi.require_flag_persistent_fs_service,
         else => {},
     }
 }
@@ -1000,10 +1004,12 @@ fn normalizeStartupPolicy(policy: *StartupPolicy) void {
 fn validateStartupPolicy(policy: *StartupPolicy) void {
     normalizeStartupPolicy(policy);
     switch (policy.action) {
+        .vfs => {},
         .input_driver => if (policy.input_kind == null) startupManifestFail("ManagerInit: startup input driver missing selector\n"),
         .block_driver => if (policy.block_kind == null) startupManifestFail("ManagerInit: startup block driver missing selector\n"),
         .gpu_driver => {},
         .persistent_fs_server => {},
+        .fat_server => {},
         .window_service => {},
         .process => {},
         .process_builder => {},
@@ -1196,6 +1202,9 @@ const LaunchContext = struct {
     persistent_fs_process_slot: ?u64 = null,
     persistent_fs_endpoint_id: ?u64 = null,
     persistent_fs_policy: ?StartupPolicy = null,
+    fat_fs_process_slot: ?u64 = null,
+    fat_fs_endpoint_id: ?u64 = null,
+    fat_fs_policy: ?StartupPolicy = null,
     capctl_request_paddr: u64 = 0,
     capctl_response_paddr: u64 = 0,
     ready_name_count: usize = 0,
@@ -2496,14 +2505,133 @@ const LaunchContext = struct {
         self.logRoleLine("spawn", policy.label, "ok");
     }
 
+    fn launchVfsForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
+        const exec = self.requireExecForPolicy(policy);
+        const endpoint_id = allocDynamicServiceEndpointId();
+        const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc vfs config page failed\n");
+        const config_words: [*]volatile u64 = @ptrFromInt(config_source_va);
+        config_words[0] = endpoint_id;
+        config_words[1] = 0x3153_4656; // "VFS1"
+        config_words[2] = 0;
+        config_words[3] = self.fat_fs_endpoint_id orelse 0;
+        config_words[4] = self.fat_fs_process_slot orelse 0;
+
+        const registry_source_va = self.ensureSharedServiceRegistryPage();
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+
+        generic_service_bootstrap_table_storage = .{};
+        generic_service_bootstrap_table_storage.page_count = 5;
+        generic_service_bootstrap_table_storage.page_descriptors[0] = .{
+            .source_va = config_source_va,
+            .target_va = process_abi.standard_config_target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[1] = .{
+            .source_va = registry_source_va,
+            .target_va = process_abi.service_registry_shadow_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[2] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[3] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[4] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &generic_service_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", policy.label, "failed");
+            self.logRoleHex(policy.label, " spawn ret=", spawned);
+            fail("ManagerInit: vfs spawn failed\n");
+        };
+        self.logRoleLine("spawn", policy.label, "ok");
+        if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: vfs endpoint install failed\n");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: vfs endpoint publish failed\n");
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .vfs, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .vfs, child_slot, endpoint_id);
+        self.waitForConfigWord(config_source_va, 2, 1);
+    }
+
+    fn launchFatServerForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
+        const exec = self.requireExecForPolicy(policy);
+        const endpoint_id = allocDynamicServiceEndpointId();
+        const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc fat server config page failed\n");
+        const config_words: [*]volatile u64 = @ptrFromInt(config_source_va);
+        config_words[0] = endpoint_id;
+        config_words[1] = 0x3154_4146; // "FAT1"
+        config_words[2] = 0;
+
+        const registry_source_va = self.ensureSharedServiceRegistryPage();
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+
+        generic_service_bootstrap_table_storage = .{};
+        generic_service_bootstrap_table_storage.page_count = 5;
+        generic_service_bootstrap_table_storage.page_descriptors[0] = .{
+            .source_va = config_source_va,
+            .target_va = process_abi.standard_config_target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[1] = .{
+            .source_va = registry_source_va,
+            .target_va = process_abi.service_registry_shadow_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[2] = .{
+            .source_va = stdio_source_va,
+            .target_va = stdio_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[3] = .{
+            .source_va = args_env_source_va,
+            .target_va = process_args_env_bootstrap_abi.target_va,
+            .flags = 0,
+        };
+        generic_service_bootstrap_table_storage.page_descriptors[4] = .{
+            .source_va = exit_status_source_va,
+            .target_va = process_exit_bootstrap_abi.target_va,
+            .flags = process_abi.spawn_flag_bootstrap_page_writable,
+        };
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &generic_service_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", policy.label, "failed");
+            self.logRoleHex(policy.label, " spawn ret=", spawned);
+            fail("ManagerInit: fat server spawn failed\n");
+        };
+        self.logRoleLine("spawn", policy.label, "ok");
+        if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: fat server endpoint install failed\n");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: fat server endpoint publish failed\n");
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .fat_fs, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .fat_fs, child_slot, endpoint_id);
+        self.waitForConfigWord(config_source_va, 2, 1);
+        self.fat_fs_process_slot = child_slot;
+        self.fat_fs_endpoint_id = endpoint_id;
+        self.fat_fs_policy = policy;
+    }
+
     fn launchPolicy(self: *LaunchContext, policy: StartupPolicy) void {
         self.ensurePolicyResources(policy);
         switch (policy.action) {
+            .vfs => self.launchVfsForPolicy(policy),
             .input_driver => self.launchInputDriverForPolicy(policy),
             .block_driver => self.launchBlockDriverForPolicy(policy),
             .gpu_driver => self.launchGpuDriverForPolicy(policy),
             .window_service => self.launchWindowServiceForPolicy(policy),
             .persistent_fs_server => self.launchPersistentFsForPolicy(policy),
+            .fat_server => self.launchFatServerForPolicy(policy),
             .process => self.launchProcessForPolicy(policy, false),
             .process_builder => self.launchProcessForPolicy(policy, true),
             else => startupManifestFail("ManagerInit: unsupported policy action\n"),

@@ -16,6 +16,7 @@ pub const StartupAction = enum(u8) {
     window_service = 10,
     process = 11,
     process_builder = 12,
+    fat_server = 13,
 };
 
 pub const StartupExecSource = enum(u8) {
@@ -64,6 +65,7 @@ pub const StartupProgramRole = enum(u64) {
     block_demo = 10,
     persistent_fs = 11,
     gpu_driver = 12,
+    fat_server = 13,
 };
 
 pub const StartupProgramDescriptor = extern struct {
@@ -92,6 +94,7 @@ pub fn roleLabel(role: StartupProgramRole) []const u8 {
         .block_demo => "block demo",
         .persistent_fs => "persistent fs",
         .gpu_driver => "gpu driver",
+        .fat_server => "fat server",
     };
 }
 
@@ -109,6 +112,7 @@ pub fn roleKey(role: StartupProgramRole) []const u8 {
         .block_demo => "block_demo",
         .persistent_fs => "persistent_fs",
         .gpu_driver => "gpu_driver",
+        .fat_server => "fat_server",
     };
 }
 
@@ -125,6 +129,7 @@ pub fn actionFromKey(key: []const u8) ?StartupAction {
     if (std.mem.eql(u8, key, "input_driver")) return .input_driver;
     if (std.mem.eql(u8, key, "block_driver")) return .block_driver;
     if (std.mem.eql(u8, key, "persistent_fs")) return .persistent_fs_server;
+    if (std.mem.eql(u8, key, "fat_server") or std.mem.eql(u8, key, "fat_fs")) return .fat_server;
     if (std.mem.eql(u8, key, "gpu_driver")) return .gpu_driver;
     if (std.mem.eql(u8, key, "window_service")) return .window_service;
     if (std.mem.eql(u8, key, "process") or std.mem.eql(u8, key, "program")) return .process;

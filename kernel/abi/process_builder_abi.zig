@@ -10,6 +10,8 @@ pub const syscall_copy_to_process: u64 = 0x47;
 pub const syscall_mprotect_self: u64 = 0x48;
 pub const syscall_set_process_abi_trap_delegate: u64 = 0x4B;
 
+pub const abi_trap_request_page_bytes: u64 = 4096;
+
 pub const process_builder_token_tag: u64 = 1 << 60;
 pub const process_builder_process_mask: u64 = (@as(u64, 1) << 32) - 1;
 pub const copy_to_process_max_bytes: u64 = 64 * 1024 * 1024;

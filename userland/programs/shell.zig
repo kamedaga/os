@@ -2863,6 +2863,7 @@ fn serviceKindName(kind: service_registry_abi.ServiceKind) []const u8 {
         .capctl => "capctl",
         .gpu => "gpu",
         .pointer => "pointer",
+        .fat_fs => "fat_fs",
     };
 }
 
@@ -2874,6 +2875,7 @@ fn parseServiceKind(text: []const u8) ?service_registry_abi.ServiceKind {
     if (eqAsciiNoCase(text, "capctl")) return .capctl;
     if (eqAsciiNoCase(text, "gpu")) return .gpu;
     if (eqAsciiNoCase(text, "pointer")) return .pointer;
+    if (eqAsciiNoCase(text, "fat_fs") or eqAsciiNoCase(text, "fat-fs") or eqAsciiNoCase(text, "fat")) return .fat_fs;
     return null;
 }
 

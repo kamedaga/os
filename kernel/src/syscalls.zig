@@ -306,7 +306,7 @@ fn dispatchIpcSyscall(
             const flags = frame.rdx;
             const signal_only = (flags & ipc_call_flag_signal_only) != 0;
             if (signal_only and endpoint_id == 0) {
-                const status = replyToCurrentIpcToken(frame.rdi, frame.r8, frame.r9, frame.r10);
+                const status = replyToCurrentIpcToken(h, frame.rdi, frame.r8, frame.r9, frame.r10);
                 if (status != syscall_ok) break :blk status;
             } else if (signal_only) {
                 const status = signalEndpointMessage(state, proc, endpoint_id, true, frame.rdi, frame.r8, frame.r9, frame.r10);
@@ -562,7 +562,7 @@ fn signalEndpointMessage(
     );
 }
 
-fn replyToCurrentIpcToken(mr0: u64, mr1: u64, mr2: u64, mr3: u64) u64 {
+fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u64) u64 {
     const current_thread = scheduler.current_thread_index;
     const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return syscall_err_not_ready;
     if (current_hot.ipc_reply_token_valid == 0) return syscall_err_endpoint;
@@ -570,16 +570,24 @@ fn replyToCurrentIpcToken(mr0: u64, mr1: u64, mr2: u64, mr3: u64) u64 {
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return syscall_err_endpoint;
     if (!target_ctx.allocated) return syscall_err_endpoint;
     scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
+    if (target_ctx.abi_trap_reply_pending and (mr1 & trap_abi.response_flag_exit) != 0) {
+        const target_proc = target_ctx.owner_process;
+        target_ctx.abi_trap_reply_pending = false;
+        _ = h.state.markProcessExited(target_proc);
+        _ = scheduler.releaseThreadSlot(target_thread);
+        return syscall_ok;
+    }
     return deliverOrQueueIpcMessageToThread(target_thread, 0, current_thread, false, mr0, mr1, mr2, mr3);
 }
 
-fn writeAbiTrapRequestU64(h: *const Hooks, target: kernel.PrincipalId, offset: u64, value: u64) bool {
-    return h.write_user_u64(target, trap_abi.request_page_va + offset, value);
+fn writeAbiTrapRequestU64(h: *const Hooks, target: kernel.PrincipalId, request_page_va: u64, offset: u64, value: u64) bool {
+    return h.write_user_u64(target, request_page_va + offset, value);
 }
 
 fn writeAbiTrapRequest(
     h: *const Hooks,
     target: kernel.PrincipalId,
+    request_page_va: u64,
     caller: kernel.PrincipalId,
     thread_id: u64,
     flavor: u32,
@@ -589,22 +597,22 @@ fn writeAbiTrapRequest(
         (@as(u64, @intFromEnum(trap_abi.TrapKind.abi_syscall)) << 32);
     const flavor_reserved = @as(u64, flavor);
 
-    if (!writeAbiTrapRequestU64(h, target, 0x00, trap_abi.magic)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x08, version_kind)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x10, flavor_reserved)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x18, @intFromEnum(caller))) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x20, thread_id)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x28, frame.rip)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x30, frame.rsp)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x38, 0)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x40, 0)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x48, frame.rax)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x50, frame.rdi)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x58, frame.rsi)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x60, frame.rdx)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x68, frame.r10)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x70, frame.r8)) return false;
-    if (!writeAbiTrapRequestU64(h, target, 0x78, frame.r9)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x00, trap_abi.magic)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x08, version_kind)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x10, flavor_reserved)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x18, @intFromEnum(caller))) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x20, thread_id)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x28, frame.rip)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x30, frame.rsp)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x38, 0)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x40, 0)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x48, frame.rax)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x50, frame.rdi)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x58, frame.rsi)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x60, frame.rdx)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x68, frame.r10)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x70, frame.r8)) return false;
+    if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x78, frame.r9)) return false;
     return true;
 }
 
@@ -802,7 +810,7 @@ fn dispatchAbiTrapDelegate(
     const current_ctx = scheduler.getThreadContext(current_thread) orelse return syscall_err_not_ready;
     const target_principal = state.endpointTargetFor(proc, delegate.endpoint_id) orelse return syscall_err_endpoint;
     const target_thread = scheduler.threadSlotForPrincipal(target_principal) orelse return syscall_err_endpoint;
-    if (!writeAbiTrapRequest(h, target_principal, proc, @intCast(current_thread), delegate.flavor, frame)) {
+    if (!writeAbiTrapRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame)) {
         h.write("abi_trap request write failed target=");
         h.write(h.principal_label(target_principal));
         h.write("\n");
@@ -814,7 +822,7 @@ fn dispatchAbiTrapDelegate(
         delegate.endpoint_id,
         current_thread,
         true,
-        trap_abi.request_page_va,
+        delegate.request_page_va,
         0,
         0,
         0,
@@ -1260,7 +1268,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return syscall_ok;
         },
         syscall_set_abi_trap_delegate => {
-            state.setAbiTrapDelegate(proc, frame.rdi, @truncate(frame.rsi)) catch |err| switch (err) {
+            state.setAbiTrapDelegate(proc, frame.rdi, @truncate(frame.rsi), frame.rdx) catch |err| switch (err) {
                 kernel.KernelError.EndpointNotFound => return syscall_err_endpoint,
                 else => return syscall_err_invalid,
             };
@@ -1517,7 +1525,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             return process_builder.mprotectSelf(proc, frame.rdi, frame.rsi, frame.rdx);
         },
         process_builder_abi.syscall_set_process_abi_trap_delegate => {
-            return process_builder.setAbiTrapDelegate(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx);
+            return process_builder.setAbiTrapDelegate(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8);
         },
         syscall_log => {
             const req_len_u64 = frame.rsi;
