@@ -374,6 +374,10 @@ pub export fn _start() noreturn {
     if (process_slot == 0) fail("ExecSmokeRunner: process slot unavailable\n");
 
     runRootVfsSmoke(process_slot);
+    _ = userLog("ExecSmokeRunner: rootfs vfs-only smoke done\n");
+    var run_legacy_dynamic_smoke = false;
+    run_legacy_dynamic_smoke = run_legacy_dynamic_smoke and process_slot != 0;
+    if (!run_legacy_dynamic_smoke) while (true) asm volatile ("pause");
 
     const ipc_va = user_vm.reservePages(2) orelse fail("ExecSmokeRunner: IPC VA reserve failed\n");
     var client = fs_client.Client.connectFromRegistryPage(

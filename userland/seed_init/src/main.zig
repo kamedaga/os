@@ -2571,6 +2571,7 @@ const LaunchContext = struct {
         config_words[0] = endpoint_id;
         config_words[1] = 0x3154_4146; // "FAT1"
         config_words[2] = 0;
+        config_words[3] = persistent_fs_start_block;
 
         const registry_source_va = self.ensureSharedServiceRegistryPage();
         const stdio_source_va = self.ensureSharedStdioBootstrapPage();
@@ -2701,16 +2702,6 @@ fn managerMain() noreturn {
         .has_boot_display = window_service != null,
     };
     launch_ctx_storage.ensureBootFsArchive();
-    if (gpu_device != null) {
-        const gpu_exec_policy = StartupPolicy{
-            .action = .gpu_driver,
-            .path = rootfs_gpu_driver_path,
-            .name = "gpu",
-            .label = "gpu_driver",
-            .exec_source = .startup_path,
-        };
-        launch_ctx_storage.cacheExecForPolicy(gpu_exec_policy);
-    }
     var startup_manifest_from_rootfs = false;
     const startup_manifest = blk: {
         if (loadStartupManifestFromBootFs(rootfs_startup_manifest_path)) |manifest| break :blk manifest;

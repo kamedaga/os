@@ -1112,7 +1112,7 @@ fn processSessionRequest(session: *Session) void {
 }
 
 fn handleConnectRequest(request_paddr: u64) void {
-    _ = userLog("VirtioBlk: connect request\n");
+    _ = userLog("[virtio_blk] VirtioBlk: connect request\n");
     for (&sessions) |*session| {
         if (session.active and session.request_paddr == request_paddr) {
             session.active = false;
@@ -1122,7 +1122,7 @@ fn handleConnectRequest(request_paddr: u64) void {
         if (session.active) continue;
         if (session.request_va != 0) continue;
         const request_page = user_vm.mapPageAtDynamicVa(request_paddr, false) orelse {
-            _ = userLog("VirtioBlk: map request page failed\n");
+            _ = userLog("[virtio_blk] VirtioBlk: map request page failed\n");
             return;
         };
         const req_va: u64 = @intCast(request_page.va);
@@ -1136,18 +1136,18 @@ fn handleConnectRequest(request_paddr: u64) void {
             request.arg0 < 0x1000 or
             request.session_nonce == 0)
         {
-            _ = userLog("VirtioBlk: invalid connect request\n");
+            _ = userLog("[virtio_blk] VirtioBlk: invalid connect request\n");
             return;
         }
         const response_page = user_vm.mapPageAtDynamicVa(request.arg0, true) orelse {
-            _ = userLog("VirtioBlk: map response page failed\n");
+            _ = userLog("[virtio_blk] VirtioBlk: map response page failed\n");
             return;
         };
         const resp_va: u64 = @intCast(response_page.va);
         session.response_va = resp_va;
         const reply_endpoint_id = reply_endpoint_id_base + @as(u64, @intCast(slot));
         if (installEndpoint(reply_endpoint_id, request.arg1) != syscall_ok) {
-            _ = userLog("VirtioBlk: install reply endpoint failed\n");
+            _ = userLog("[virtio_blk] VirtioBlk: install reply endpoint failed\n");
             return;
         }
         const rights = clientRights();
@@ -1180,7 +1180,7 @@ fn handleConnectRequest(request_paddr: u64) void {
         session.last_completed_seq = request.request_seq;
         return;
     }
-    _ = userLog("VirtioBlk: session table full\n");
+    _ = userLog("[virtio_blk] VirtioBlk: session table full\n");
 }
 
 fn pollSessions() void {
@@ -1191,18 +1191,18 @@ fn pollSessions() void {
 }
 
 pub export fn _start() noreturn {
-    _ = userLog("VirtioBlk: started\n");
+    _ = userLog("[virtio_blk] VirtioBlk: started\n");
     waitForBootResources();
     if (!reserveVirtioTargetVas()) {
-        _ = userLog("VirtioBlk: reserve target VAs failed\n");
+        _ = userLog("[virtio_blk] VirtioBlk: reserve target VAs failed\n");
         while (true) asm volatile ("pause");
     }
     if (!initVirtio()) {
-        _ = userLog("VirtioBlk: init failed\n");
+        _ = userLog("[virtio_blk] VirtioBlk: init failed\n");
         while (true) asm volatile ("pause");
     }
     writeCfgU64(block_bootstrap.driver_status_index, block_bootstrap.driver_status_ready);
-    _ = userLog("VirtioBlk: queue ready\n");
+    _ = userLog("[virtio_blk] VirtioBlk: queue ready\n");
 
     while (true) {
         const received = waitEvent(true, session_poll_timeout_ticks);
@@ -1211,7 +1211,7 @@ pub export fn _start() noreturn {
             if (request_paddr >= 0x1000) {
                 handleConnectRequest(request_paddr);
             } else {
-                _ = userLog("VirtioBlk: accept cap transfer failed\n");
+                _ = userLog("[virtio_blk] VirtioBlk: accept cap transfer failed\n");
             }
         }
         pollSessions();
