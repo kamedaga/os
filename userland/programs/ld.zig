@@ -8,6 +8,7 @@ const syscall_log: u64 = 0x9;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_ok: u64 = 0;
 const syscall_set_fs_base_self: u64 = process_abi.syscall_set_fs_base_self;
+const linux_sys_exit_group: u64 = 231;
 const elf_phdr_bytes: u64 = 56;
 const elf_dyn_bytes: u64 = 16;
 const page_bytes: u64 = 4096;
@@ -177,6 +178,16 @@ pub export fn __cap_tlsdesc_static() callconv(.naked) noreturn {
 
 fn userLog(message: []const u8) void {
     _ = syscall3(syscall_log, @intFromPtr(message.ptr), message.len, 0);
+}
+
+fn linuxExitGroup(code: u64) noreturn {
+    _ = asm volatile (
+        \\syscall
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (linux_sys_exit_group),
+          [arg0] "{rdi}" (code),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+    while (true) asm volatile ("pause");
 }
 
 fn readU32(addr: u64) u32 {
@@ -1617,6 +1628,7 @@ pub export fn _start() noreturn {
     if (main_info) |info| {
         runFinalizers(cfg, info);
     }
-    while (true) asm volatile ("pause");
+    userLog("ld: exit_group\n");
+    linuxExitGroup(0);
 }
 

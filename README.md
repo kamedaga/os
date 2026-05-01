@@ -11,7 +11,7 @@ musl libc と動的リンクにより、既存の Linux エコシステムとの
 - **Hardware capabilities** — DMA バッファ・IOMMU マッピング・Virtqueue を capability として抽象化
 - **Linux ABI compatibility** — 無改造の musl libc を動的リンクでロードし、ユーザーランドで Linux syscall を処理
 - **Userland drivers** — virtio-blk / virtio-gpu ドライバはすべてユーザー空間で動作
-
+- **x86_64 support** — x86_64のみに対応 AArch64に対応予定
 ## Design
 
 カーネルは Linux syscall の意味を持たない。fd table、errno、パス解決、filesystem semantics はすべてユーザーランドの `linux_abi_server` に閉じる。

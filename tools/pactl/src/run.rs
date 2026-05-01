@@ -363,6 +363,7 @@ fn build_wsl_script(
 
     if options.timed {
         script.push_str("set +e\n");
+        script.push_str("timeout --kill-after=2s 20s \\\n  ");
         script.push_str(&qemu_cmd);
         script.push_str(&format!(
             " | python3 {} | tee \"$RUNTIME_SERIAL_LOG\"\n",
@@ -370,6 +371,19 @@ fn build_wsl_script(
         ));
         script.push_str("qemu_status=${PIPESTATUS[0]}\n");
         script.push_str("set -e\n");
+        script.push_str("if [ \"$qemu_status\" -eq 124 ] || [ \"$qemu_status\" -eq 137 ]; then\n");
+        script.push_str("  sync_logs\n");
+        script.push_str(&format!(
+            "  python3 {} \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
+            bash_quote(&summarize_script)
+        ));
+        script.push_str("  sync_logs\n");
+        script.push_str("  echo\n");
+        script.push_str("  echo \"serial log: $SERIAL_LOG\"\n");
+        script.push_str("  echo \"summary: $SUMMARY_LOG\"\n");
+        script.push_str("  echo \"timed run stopped after 20s; treating QEMU timeout as captured failure\"\n");
+        script.push_str("  exit \"$qemu_status\"\n");
+        script.push_str("fi\n");
         script.push_str("schedule_writeback\n");
         script.push_str(&format!(
             "python3 {} \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",

@@ -16,6 +16,8 @@ set_target_properties(seed2_root PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 
+target_include_directories(seed2_root PRIVATE ../rootfs/fat_server/include)
+
 target_compile_options(seed2_root PRIVATE
   -target x86_64-freestanding-none
   -ffreestanding

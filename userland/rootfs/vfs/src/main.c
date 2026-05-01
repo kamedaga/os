@@ -250,6 +250,13 @@ static u64 lookup_dev_name(const volatile u8 *name, u16 name_len) {
     return 0;
 }
 
+static int root_mount_name_exists(const volatile u8 *name, u16 name_len) {
+    for (u64 i = 0; i < sizeof(g_root_mounts) / sizeof(g_root_mounts[0]); i++) {
+        if (path_equals(name, name_len, g_root_mounts[i].name, g_root_mounts[i].name_len)) return 1;
+    }
+    return 0;
+}
+
 static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
     const u64 base_object_id = object_id_from_token(base_token);
     if (base_object_id == 0) return 0;
@@ -644,6 +651,15 @@ static void forward_backend_response(u16 op, u64 client_seq, u64 cursor_bias) {
     write_response(op, client_seq, backend->status, result_token, backend->file_bytes, cursor_next, backend->object_kind, inline_bytes);
 }
 
+static int backend_readdir_entry_shadowed_by_builtin_root(void) {
+    volatile struct fs_response_header *backend = (volatile struct fs_response_header *)g_root_backend.response_va;
+    if (backend->status != FS_STATUS_OK || backend->inline_bytes < FS_DIRENT_RECORD_BYTES) return 0;
+    volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)(g_root_backend.response_va + FS_RESPONSE_HEADER_BYTES);
+    if (backend->inline_bytes < FS_DIRENT_RECORD_BYTES + record->name_bytes) return 0;
+    const volatile u8 *name = (const volatile u8 *)(g_root_backend.response_va + FS_RESPONSE_HEADER_BYTES + FS_DIRENT_RECORD_BYTES);
+    return root_mount_name_exists(name, record->name_bytes);
+}
+
 static void forward_backend_request(
     u16 op,
     u64 client_seq,
@@ -662,6 +678,43 @@ static void forward_backend_request(
         return;
     }
     forward_backend_response(op, client_seq, cursor_bias);
+}
+
+static void forward_backend_root_readdir_filtered(u64 client_seq, u64 backend_cursor, u32 length, u32 flags, u64 cursor_bias) {
+    for (u64 guard = 0; guard < 64; guard++) {
+        if (!backend_request(
+            FS_OP_READDIR,
+            g_root_backend.root_token,
+            backend_cursor,
+            length,
+            flags,
+            (const volatile u8 *)0,
+            0,
+            (const volatile u8 *)0,
+            0
+        )) {
+            reply_status(FS_OP_READDIR, client_seq, FS_STATUS_IO_ERROR);
+            return;
+        }
+
+        volatile struct fs_response_header *backend = (volatile struct fs_response_header *)g_root_backend.response_va;
+        if (backend->status != FS_STATUS_OK) {
+            forward_backend_response(FS_OP_READDIR, client_seq, cursor_bias);
+            return;
+        }
+        if (!backend_readdir_entry_shadowed_by_builtin_root()) {
+            forward_backend_response(FS_OP_READDIR, client_seq, cursor_bias);
+            return;
+        }
+
+        volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)(g_root_backend.response_va + FS_RESPONSE_HEADER_BYTES);
+        if (record->next_cursor <= backend_cursor) {
+            reply_status(FS_OP_READDIR, client_seq, FS_STATUS_INVALID);
+            return;
+        }
+        backend_cursor = record->next_cursor;
+    }
+    reply_status(FS_OP_READDIR, client_seq, FS_STATUS_BUSY);
 }
 
 static void handle_fs_request(void) {
@@ -755,17 +808,11 @@ static void handle_fs_request(void) {
             request->offset >= sizeof(g_root_mounts) / sizeof(g_root_mounts[0]))
         {
             const u64 bias = sizeof(g_root_mounts) / sizeof(g_root_mounts[0]);
-            forward_backend_request(
-                FS_OP_READDIR,
+            forward_backend_root_readdir_filtered(
                 seq,
-                g_root_backend.root_token,
                 request->offset - bias,
                 request->length,
                 request->flags,
-                (const volatile u8 *)0,
-                0,
-                (const volatile u8 *)0,
-                0,
                 bias
             );
         } else if (is_directory_token(request->object_token)) reply_readdir(seq, request->object_token, request->offset);

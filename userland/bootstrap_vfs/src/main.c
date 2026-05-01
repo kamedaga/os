@@ -28,12 +28,39 @@ enum {
     REQUEST_VA = 0x28000000,
     RESPONSE_VA = 0x28001000,
     ROOT_SEED2_IMAGE_VA = 0x28100000,
+    ROOT_SEED2_CONFIG_VA = 0x2A000000,
+    PROCESS_STANDARD_CONFIG_TARGET_VA = 0x3C002000,
     REPLY_ENDPOINT_ID = 0xEA,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xFFFFFFFFULL,
+    SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE = 1ULL << 0,
+    SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1ULL << 2,
+    SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1ULL << 3,
     MAX_ROOT_SEED2_PAGES = 256,
+};
+
+struct bootstrap_page_descriptor {
+    u64 source_va;
+    u64 target_va;
+    u64 flags;
+};
+
+struct bootstrap_cap_descriptor {
+    u64 source_token;
+    u64 target_token_va;
+    u64 rights_bits;
+    u8 kind;
+    u8 reserved[7];
+};
+
+struct bootstrap_descriptor_table {
+    u16 page_count;
+    u16 cap_count;
+    u32 reserved0;
+    struct bootstrap_page_descriptor pages[136];
+    struct bootstrap_cap_descriptor caps[8];
 };
 
 struct backend_session {
@@ -272,7 +299,32 @@ static void spawn_root_seed2(void) {
         return;
     }
     user_log("[bootstrap_vfs] root seed2 exec ready\n");
-    const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, exec_token, 0, 0, 0);
+    u64 config_paddr = 0;
+    if (syscall4(SYSCALL_ALLOC_MAP_PAGES, ROOT_SEED2_CONFIG_VA, 1, 1, (u64)&config_paddr) != SYSCALL_OK) {
+        user_log("[bootstrap_vfs] root seed2 config alloc failed\n");
+        return;
+    }
+    clear_page(ROOT_SEED2_CONFIG_VA);
+    volatile u64 *config = (volatile u64 *)ROOT_SEED2_CONFIG_VA;
+    config[0] = 0x32545253;
+    config[1] = 1;
+    config[3] = g_fat.endpoint_id;
+    config[4] = g_fat.process_slot;
+
+    static struct bootstrap_descriptor_table table;
+    clear_page((u64)&table);
+    table.page_count = 1;
+    table.pages[0].source_va = ROOT_SEED2_CONFIG_VA;
+    table.pages[0].target_va = PROCESS_STANDARD_CONFIG_TARGET_VA;
+    table.pages[0].flags = SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE;
+
+    const u64 spawned = syscall4(
+        SYSCALL_SPAWN_EXEC,
+        exec_token,
+        (u64)&table,
+        0,
+        SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER
+    );
     const u64 child_slot = decode_spawn_process_slot(spawned);
     if (child_slot == 0) {
         user_log("[bootstrap_vfs] root seed2 spawn failed\n");

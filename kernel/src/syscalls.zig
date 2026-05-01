@@ -67,6 +67,8 @@ const syscall_ipc_call_reply_recv: u64 = 0x40;
 const syscall_set_abi_trap_delegate: u64 = trap_abi.syscall_set_abi_trap_delegate;
 const syscall_clear_abi_trap_delegate: u64 = trap_abi.syscall_clear_abi_trap_delegate;
 const syscall_map_abi_trap_reply_target_pages: u64 = trap_abi.syscall_map_abi_trap_reply_target_pages;
+const syscall_copy_from_abi_trap_reply_target: u64 = trap_abi.syscall_copy_from_abi_trap_reply_target;
+const syscall_copy_to_abi_trap_reply_target: u64 = trap_abi.syscall_copy_to_abi_trap_reply_target;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -104,6 +106,7 @@ pub const Hooks = struct {
     read_user_u64: *const fn (kernel.PrincipalId, u64) ?u64,
     write_user_u64: *const fn (kernel.PrincipalId, u64, u64) bool,
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
+    copy_bytes_to_user_va: *const fn (kernel.PrincipalId, u64, []const u8) bool,
     launch_pie_user_thread: *const fn (*TrapFrame) u64,
     spawn_exec: *const fn (*TrapFrame) u64,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
@@ -614,6 +617,42 @@ fn writeAbiTrapRequest(
     if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x70, frame.r8)) return false;
     if (!writeAbiTrapRequestU64(h, target, request_page_va, 0x78, frame.r9)) return false;
     return true;
+}
+
+fn currentIpcReplyTargetPrincipal() ?kernel.PrincipalId {
+    const current_thread = scheduler.current_thread_index;
+    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return null;
+    if (current_hot.ipc_reply_token_valid == 0) return null;
+    const target_thread = current_hot.ipc_reply_token_target_thread;
+    const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
+    if (!target_ctx.allocated) return null;
+    return target_ctx.owner_process;
+}
+
+fn copyFromCurrentIpcReplyTarget(h: *const Hooks, proc: kernel.PrincipalId, dst_current_va: u64, src_target_va: u64, len_u64: u64) u64 {
+    if (len_u64 > @as(u64, trap_abi.abi_trap_copy_max_bytes)) return syscall_err_invalid;
+    const target_proc = currentIpcReplyTargetPrincipal() orelse return syscall_err_endpoint;
+    const len: usize = @intCast(len_u64);
+    if (len == 0) return 0;
+
+    var scratch: [trap_abi.abi_trap_copy_max_bytes]u8 = undefined;
+    const bytes = scratch[0..len];
+    if (!h.copy_user_bytes_from_va(target_proc, src_target_va, bytes)) return syscall_err_invalid;
+    if (!h.copy_bytes_to_user_va(proc, dst_current_va, bytes)) return syscall_err_invalid;
+    return len_u64;
+}
+
+fn copyToCurrentIpcReplyTarget(h: *const Hooks, proc: kernel.PrincipalId, dst_target_va: u64, src_current_va: u64, len_u64: u64) u64 {
+    if (len_u64 > @as(u64, trap_abi.abi_trap_copy_max_bytes)) return syscall_err_invalid;
+    const target_proc = currentIpcReplyTargetPrincipal() orelse return syscall_err_endpoint;
+    const len: usize = @intCast(len_u64);
+    if (len == 0) return 0;
+
+    var scratch: [trap_abi.abi_trap_copy_max_bytes]u8 = undefined;
+    const bytes = scratch[0..len];
+    if (!h.copy_user_bytes_from_va(proc, src_current_va, bytes)) return syscall_err_invalid;
+    if (!h.copy_bytes_to_user_va(target_proc, dst_target_va, bytes)) return syscall_err_invalid;
+    return len_u64;
 }
 
 fn mapPagesToCurrentIpcReplyTarget(h: *const Hooks, target_va: u64, page_count: u64, prot_bits: u64) u64 {
@@ -1280,6 +1319,12 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
         },
         syscall_map_abi_trap_reply_target_pages => {
             return mapPagesToCurrentIpcReplyTarget(h, frame.rdi, frame.rsi, frame.rdx);
+        },
+        syscall_copy_from_abi_trap_reply_target => {
+            return copyFromCurrentIpcReplyTarget(h, proc, frame.rdi, frame.rsi, frame.rdx);
+        },
+        syscall_copy_to_abi_trap_reply_target => {
+            return copyToCurrentIpcReplyTarget(h, proc, frame.rdi, frame.rsi, frame.rdx);
         },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;

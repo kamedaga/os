@@ -33,6 +33,9 @@ pub const max_args: usize = 6;
 pub const syscall_set_abi_trap_delegate: u64 = 0x49;
 pub const syscall_clear_abi_trap_delegate: u64 = 0x4A;
 pub const syscall_map_abi_trap_reply_target_pages: u64 = 0x4C;
+pub const syscall_copy_from_abi_trap_reply_target: u64 = 0x4D;
+pub const syscall_copy_to_abi_trap_reply_target: u64 = 0x4E;
+pub const abi_trap_copy_max_bytes: usize = 4096;
 
 pub const TrapRequest = extern struct {
     magic: u64 = magic,

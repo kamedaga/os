@@ -291,6 +291,15 @@ fn getProcessSlot() u64 {
     return syscall1(syscall_get_process_slot, 0);
 }
 
+fn getProcessStatus(process_slot: u64) process_abi.ProcessStatusKind {
+    return process_abi.decodeProcessStatusKind(syscall1(process_abi.syscall_get_process_status, process_slot));
+}
+
+fn processExit(code: u64) noreturn {
+    _ = syscall1(process_abi.syscall_process_exit, code);
+    while (true) asm volatile ("pause");
+}
+
 fn allocMapPagesSelf(base_va: u64, page_count: u64, writable: bool) u64 {
     return syscall4(syscall_alloc_map_pages, base_va, page_count, if (writable) 1 else 0, 0);
 }
@@ -341,7 +350,7 @@ fn connectRootFs(endpoint_id: u64, compat_process_slot: u64) ?struct { client: f
         userLog("ExecLoader: root lookup failed\n");
         return null;
     };
-    if (root.object_kind != fs_abi.ObjectKind.vnode_dir) {
+    if (root.object_kind != fs_abi.ObjectKind.mount and root.object_kind != fs_abi.ObjectKind.vnode_dir) {
         userLog("ExecLoader: root lookup returned non-dir\n");
         return null;
     }
@@ -1273,39 +1282,39 @@ fn installDynamicLinkerBootstrapPage(
     return true;
 }
 
-fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_vm_token: u64, interpreter_file_bytes: u64) bool {
+fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_vm_token: u64, interpreter_file_bytes: u64) ?u64 {
     if (!mapVmObject(executable_vm_token, main_source_map_va)) {
         userLog("ExecLoader: source map failed\n");
-        return false;
+        return null;
     }
     const process_token = createSuspendedProcess() orelse {
         userLog("ExecLoader: create suspended failed\n");
-        return false;
+        return null;
     };
     var vm_layout = VmLayout.initForExecChild() orelse {
         abortProcess(process_token);
         userLog("ExecLoader: vm layout init failed\n");
-        return false;
+        return null;
     };
     const cfg: *const volatile exec_loader_bootstrap_abi.Config = @ptrFromInt(exec_loader_bootstrap_abi.target_va);
     const bootfs_image_bytes = if (image_abi.decodeVmObjectToken(cfg.bootfs_vm_token) != null) cfg.bootfs_file_bytes else 0;
     if (!vm_layout.reserveBootFsImage(bootfs_image_bytes)) {
         abortProcess(process_token);
         userLog("ExecLoader: bootfs reserve failed\n");
-        return false;
+        return null;
     }
     child_mapped_pages = .{};
     const main_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, executable_vm_token, main_source_map_va, executable_file_bytes, "ExecLoader: main") orelse {
         abortProcess(process_token);
         userLog("ExecLoader: main ELF load failed\n");
-        return false;
+        return null;
     };
 
     const main_entry, const main_entry_overflow = @addWithOverflow(main_image.load_bias, main_image.ehdr.entry);
     if (main_entry_overflow != 0) {
         abortProcess(process_token);
         userLog("ExecLoader: entry overflow\n");
-        return false;
+        return null;
     }
     var initial_entry = main_entry;
 
@@ -1313,45 +1322,45 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
         const interp_path = readInterpPath(main_source_map_va, interp_phdr, executable_file_bytes) orelse {
             abortProcess(process_token);
             userLog("ExecLoader: bad PT_INTERP\n");
-            return false;
+            return null;
         };
         if (!sameBytes(interp_path, interp_path_ld)) {
             abortProcess(process_token);
             userLog("ExecLoader: unsupported PT_INTERP\n");
-            return false;
+            return null;
         }
         if (image_abi.decodeVmObjectToken(interpreter_vm_token) == null or interpreter_file_bytes == 0) {
             abortProcess(process_token);
             userLog("ExecLoader: missing interpreter ELF\n");
-            return false;
+            return null;
         }
         if (!mapVmObject(interpreter_vm_token, interpreter_source_map_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: interpreter source map failed\n");
-            return false;
+            return null;
         }
         const interp_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, interpreter_vm_token, interpreter_source_map_va, interpreter_file_bytes, "ExecLoader: interpreter") orelse {
             abortProcess(process_token);
             userLog("ExecLoader: interpreter ELF load failed\n");
-            return false;
+            return null;
         };
         const interp_entry, const interp_entry_overflow = @addWithOverflow(interp_image.load_bias, interp_image.ehdr.entry);
         if (interp_entry_overflow != 0) {
             abortProcess(process_token);
             userLog("ExecLoader: interpreter entry overflow\n");
-            return false;
+            return null;
         }
         initial_entry = interp_entry;
         if (bootfs_image_bytes != 0 and !mapVmObjectToProcess(process_token, cfg.bootfs_vm_token, dynamic_linker_bootstrap_abi.bootfs_image_target_va, .{ .read = true })) {
             abortProcess(process_token);
             userLog("ExecLoader: bootfs map failed\n");
-            return false;
+            return null;
         }
         var loaded_lib_buf: [dynamic_linker_bootstrap_abi.max_loaded_libs]dynamic_linker_bootstrap_abi.LoadedLibInfo = [_]dynamic_linker_bootstrap_abi.LoadedLibInfo{.{}} ** dynamic_linker_bootstrap_abi.max_loaded_libs;
         var rootfs = connectRootFs(cfg.fs_endpoint_id, cfg.fs_compat_process_slot) orelse {
             abortProcess(process_token);
             userLog("ExecLoader: rootfs unavailable for dependencies\n");
-            return false;
+            return null;
         };
         const loaded_lib_count = loadNeededLibs(
             process_token,
@@ -1367,45 +1376,45 @@ fn launchExec(executable_vm_token: u64, executable_file_bytes: u64, interpreter_
         if (!installDynamicLinkerBootstrapPage(process_token, main_image, bootfs_image_bytes, loaded_lib_buf[0..loaded_lib_count])) {
             abortProcess(process_token);
             userLog("ExecLoader: dynamic linker bootstrap failed\n");
-            return false;
+            return null;
         }
     }
 
     if (!allocMapPagesToProcess(process_token, process_abi.user_stack_page_va, 1, .{ .read = true, .write = true })) {
         abortProcess(process_token);
         userLog("ExecLoader: stack alloc failed\n");
-        return false;
+        return null;
     }
     if (!installRuntimeBootstrapPages(process_token)) {
         abortProcess(process_token);
         userLog("ExecLoader: runtime bootstrap failed\n");
-        return false;
+        return null;
     }
     if (!setProcessInitialContext(process_token, initial_entry, process_abi.user_entry_rsp)) {
         abortProcess(process_token);
         userLog("ExecLoader: set context failed\n");
-        return false;
+        return null;
     }
     if (cfg.abi_trap_endpoint_id != 0 and cfg.abi_trap_endpoint_process_slot != 0) {
         const flavor = if (cfg.abi_trap_flavor != 0) cfg.abi_trap_flavor else @as(u64, @intFromEnum(trap_abi.AbiFlavor.linux_x86_64));
         if (cfg.abi_trap_request_page_va == 0) {
             abortProcess(process_token);
             userLog("ExecLoader: abi trap request page absent\n");
-            return false;
+            return null;
         }
         if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_process_slot, flavor, cfg.abi_trap_request_page_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: abi trap delegate failed\n");
-            return false;
+            return null;
         }
         userLog("ExecLoader: abi trap delegate ready\n");
     }
-    _ = startProcess(process_token) orelse {
+    const spawned = startProcess(process_token) orelse {
         abortProcess(process_token);
         userLog("ExecLoader: start failed\n");
-        return false;
+        return null;
     };
-    return true;
+    return process_abi.decodeSpawnedProcessSlot(spawned);
 }
 
 pub export fn _start() noreturn {
@@ -1415,10 +1424,23 @@ pub export fn _start() noreturn {
         userLog("ExecLoader: missing bootstrap config\n");
     } else if (image_abi.decodeVmObjectToken(cfg.executable_vm_token) == null or cfg.executable_file_bytes == 0) {
         userLog("ExecLoader: invalid executable token\n");
-    } else if (launchExec(cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes)) {
+    } else if (launchExec(cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes)) |child_process_slot| {
         userLog("ExecLoader: child started\n");
+        while (true) {
+            switch (getProcessStatus(child_process_slot)) {
+                .active => asm volatile ("pause"),
+                .inactive => {
+                    userLog("ExecLoader: child exited\n");
+                    processExit(0);
+                },
+                .faulted => {
+                    userLog("ExecLoader: child faulted\n");
+                    processExit(1);
+                },
+            }
+        }
     }
 
-    while (true) asm volatile ("pause");
+    processExit(1);
 }
 

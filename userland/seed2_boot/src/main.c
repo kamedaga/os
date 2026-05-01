@@ -60,6 +60,7 @@ enum {
     SPAWN_RESULT_PROCESS_MASK = 0xFFFFFFFFULL,
     SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE = 1ULL << 0,
     SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1ULL << 2,
+    SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1ULL << 3,
 
     BLOCK_CONFIG_MAGIC = 0x424C4B43,
     BLOCK_CONFIG_VERSION = 1,
@@ -327,12 +328,6 @@ static void user_log(const char *message) {
     user_log_len(message, cstr_len(message));
 }
 
-static u64 syscall0(u64 nr) {
-    u64 ret;
-    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
-    return ret;
-}
-
 static u64 syscall2(u64 nr, u64 a0, u64 a1) {
     u64 ret;
     __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
@@ -353,12 +348,6 @@ static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) {
 
 static u64 wait_event_poll(void) {
     return syscall2(SYSCALL_WAIT_EVENT, 0, 1);
-}
-
-static void wait_bootseed_grants_window(void) {
-    for (u64 i = 0; i < 4096; i++) {
-        (void)wait_event_poll();
-    }
 }
 
 static u64 alloc_map_page(u64 source_va) {
@@ -663,7 +652,7 @@ static void launch_block_server(void) {
     user_log("[seed2_boot] block_server ready\n");
 }
 
-static u64 launch_configured_service(const char *path, const char *label, u64 config_magic, u64 backend_endpoint, u64 backend_slot, u64 ready_index, u64 ready_value, u64 service_kind) {
+static u64 launch_configured_service(const char *path, const char *label, u64 config_magic, u64 backend_endpoint, u64 backend_slot, u64 ready_index, u64 ready_value, u64 service_kind, u64 spawn_flags) {
     struct exec_image exec;
     if (!open_exec_from_bootfs(path, &exec)) {
         user_log("[seed2_boot] open service failed\n");
@@ -690,7 +679,13 @@ static u64 launch_configured_service(const char *path, const char *label, u64 co
     table.pages[1].target_va = PROCESS_SERVICE_REGISTRY_SHADOW_VA;
     table.pages[1].flags = 0;
 
-    const u64 spawned = spawn_with_table(exec.token, &table);
+    const u64 spawned = syscall4(
+        SYSCALL_SPAWN_EXEC,
+        exec.token,
+        (u64)&table,
+        0,
+        SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | spawn_flags
+    );
     const u64 child_slot = decode_spawn_process_slot(spawned);
     if (child_slot == 0) {
         user_log("[seed2_boot] spawn service failed\n");
@@ -710,16 +705,25 @@ static u64 launch_configured_service(const char *path, const char *label, u64 co
 
 static void launch_fat_server(void) {
     g_fat_endpoint_id = g_next_endpoint_id;
-    g_fat_process_slot = launch_configured_service("/srv/fat_server.elf", "[seed2_boot] fat_server ready\n", 0x31544146, 0, 0, 2, 1, SERVICE_KIND_FAT_FS);
+    g_fat_process_slot = launch_configured_service("/srv/fat_server.elf", "[seed2_boot] fat_server ready\n", 0x31544146, 0, 0, 2, 1, SERVICE_KIND_FAT_FS, 0);
 }
 
 static void launch_bootstrap_vfs(void) {
-    (void)launch_configured_service("/srv/bootstrap_vfs.elf", "[seed2_boot] bootstrap_vfs ready\n", 0x31534656, g_fat_endpoint_id, g_fat_process_slot, 2, 1, SERVICE_KIND_VFS);
+    (void)launch_configured_service(
+        "/srv/bootstrap_vfs.elf",
+        "[seed2_boot] bootstrap_vfs ready\n",
+        0x31534656,
+        g_fat_endpoint_id,
+        g_fat_process_slot,
+        2,
+        1,
+        SERVICE_KIND_VFS,
+        SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER
+    );
 }
 
 void seed2_boot_main(void) {
     user_log("[seed2_boot] started\n");
-    wait_bootseed_grants_window();
     wait_for_handoff();
     if (!map_bootfs_archive()) {
         user_log("[seed2_boot] bootfs map failed\n");

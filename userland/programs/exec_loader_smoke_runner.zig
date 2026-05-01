@@ -29,8 +29,12 @@ const stack_extension_pages: u64 = 4;
 
 var smoke_app_image: [max_file_bytes]u8 align(4096) = undefined;
 var ld_image: [max_file_bytes]u8 align(4096) = undefined;
+var exec_loader_image: [max_file_bytes]u8 align(4096) = undefined;
+var linux_abi_server_image: [max_file_bytes]u8 align(4096) = undefined;
+var linux_abi_registry_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var exec_loader_config_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var exec_loader_bootstrap_table = process_abi.BootstrapDescriptorTable{};
+var linux_abi_bootstrap_table = process_abi.BootstrapDescriptorTable{};
 
 const FileImage = struct {
     bytes: usize,
@@ -108,6 +112,16 @@ fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRigh
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn installExecImage(vm_token: u64, rights: image_abi.ExecImageRights) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (image_abi.syscall_install_exec_image),
+          [arg0] "{rdi}" (vm_token),
+          [arg1] "{rsi}" (image_abi.execImageRightsToBits(rights)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn spawnExecWithExtendedBootstrapTable(exec_token: u64, table: *const process_abi.BootstrapDescriptorTable, child_bootstrap_owner: bool) u64 {
     const flags = process_abi.spawn_flag_bootstrap_extended_descriptor_table |
         if (child_bootstrap_owner) process_abi.spawn_flag_child_bootstrap_owner else 0;
@@ -141,7 +155,7 @@ fn extendStack() void {
 
 fn lookupPersistentRoot(client: *fs_client.Client) fs_client.LookupResult {
     const root = client.lookup(client.mount_token, ".") catch |err| failErr("ExecSmokeRunner: root lookup failed: ", err);
-    if (root.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: root lookup returned non-dir\n");
+    if (root.object_kind != fs_abi.ObjectKind.mount and root.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: root lookup returned non-dir\n");
     return root;
 }
 
@@ -166,30 +180,43 @@ fn runRootVfsSmoke(process_slot: u64) void {
     if (root_lookup.object_kind != fs_abi.ObjectKind.mount) fail("ExecSmokeRunner: vfs root lookup non-mount\n");
     _ = userLog("ExecSmokeRunner: vfs root lookup ok\n");
 
-    var entry_buf: [8]fs_client.DirEntry = undefined;
-    var name_storage: [64]u8 = undefined;
+    var entry_buf: [16]fs_client.DirEntry = undefined;
+    var name_storage: [192]u8 = undefined;
     const entries = client.readdirMany(client.mount_token, 0, entry_buf[0..], name_storage[0..]) catch |err| failErr("ExecSmokeRunner: vfs readdir failed: ", err);
     var saw_dev = false;
     var saw_proc = false;
     var saw_tmp = false;
     var saw_run = false;
-    var saw_fat_probe = false;
+    var saw_cmd = false;
+    var saw_srv = false;
+    var saw_sys = false;
+    var saw_sbin = false;
     for (entries.entries) |entry| {
         if (entry.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs readdir non-dir\n");
         if (std.mem.eql(u8, entry.name, "dev")) saw_dev = true;
         if (std.mem.eql(u8, entry.name, "proc")) saw_proc = true;
         if (std.mem.eql(u8, entry.name, "tmp")) saw_tmp = true;
         if (std.mem.eql(u8, entry.name, "run")) saw_run = true;
-        if (std.mem.eql(u8, entry.name, "fat_probe")) saw_fat_probe = true;
+        if (std.mem.eql(u8, entry.name, "cmd")) saw_cmd = true;
+        if (std.mem.eql(u8, entry.name, "srv")) saw_srv = true;
+        if (std.mem.eql(u8, entry.name, "sys")) saw_sys = true;
+        if (std.mem.eql(u8, entry.name, "sbin")) saw_sbin = true;
     }
     if (!saw_dev or !saw_proc or !saw_tmp or !saw_run) fail("ExecSmokeRunner: vfs builtin mount missing\n");
-    if (!saw_fat_probe) fail("ExecSmokeRunner: vfs fat backend entry missing\n");
+    if (!saw_cmd or !saw_srv or !saw_sys or !saw_sbin) fail("ExecSmokeRunner: vfs fat backend entry missing\n");
     _ = userLog("ExecSmokeRunner: vfs readdir ok\n");
 
-    const fat_probe = client.lookup(client.mount_token, "/fat_probe") catch |err| failErr("ExecSmokeRunner: vfs fat probe lookup failed: ", err);
-    if (fat_probe.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs fat probe non-dir\n");
-    const fat_probe_stat = client.stat(fat_probe.token) catch |err| failErr("ExecSmokeRunner: vfs fat probe stat failed: ", err);
-    if (fat_probe_stat.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs fat probe stat non-dir\n");
+    const cmd = client.lookup(client.mount_token, "/cmd") catch |err| failErr("ExecSmokeRunner: vfs /cmd lookup failed: ", err);
+    if (cmd.object_kind != fs_abi.ObjectKind.vnode_dir) fail("ExecSmokeRunner: vfs /cmd non-dir\n");
+    const shell = client.lookup(cmd.token, "shell.elf") catch |err| failErr("ExecSmokeRunner: vfs /cmd/shell.elf lookup failed: ", err);
+    if (shell.object_kind != fs_abi.ObjectKind.vnode_file) fail("ExecSmokeRunner: vfs /cmd/shell.elf non-file\n");
+    const startup = client.lookup(client.mount_token, "/sys/startup_manifest.txt") catch |err| failErr("ExecSmokeRunner: vfs startup lookup failed: ", err);
+    if (startup.object_kind != fs_abi.ObjectKind.vnode_file) fail("ExecSmokeRunner: vfs startup non-file\n");
+    const startup_open = client.open(startup.token) catch |err| failErr("ExecSmokeRunner: vfs startup open failed: ", err);
+    var startup_buf: [64]u8 = undefined;
+    const startup_read = client.read(startup_open.token, 0, startup_buf[0..]) catch |err| failErr("ExecSmokeRunner: vfs startup read failed: ", err);
+    if (startup_read.bytes_read == 0) fail("ExecSmokeRunner: vfs startup read empty\n");
+    client.close(startup_open.token) catch |err| failErr("ExecSmokeRunner: vfs startup close failed: ", err);
     _ = userLog("ExecSmokeRunner: vfs fat backend smoke ok\n");
 
     const dev = client.lookup(client.mount_token, "/dev") catch |err| failErr("ExecSmokeRunner: vfs /dev lookup failed: ", err);
@@ -256,6 +283,14 @@ fn openRootFsExec(client: *fs_client.Client, root_token: u64, path: []const u8) 
     return client.openExec(lookup.token) catch |err| failErr("ExecSmokeRunner: open_exec failed: ", err);
 }
 
+fn loadRootFsExec(client: *fs_client.Client, root_token: u64, path: []const u8, out: []u8) fs_client.OpenResult {
+    const image = readRootFsFile(client, root_token, path, out);
+    const vm_token = installReadMapVmObject(out[0..image.bytes]);
+    const exec_token = installExecImage(vm_token, .{ .exec = true, .grant = true });
+    if (image_abi.decodeExecImageToken(exec_token) == null) fail("ExecSmokeRunner: install exec image failed\n");
+    return .{ .token = exec_token, .file_bytes = image.bytes };
+}
+
 fn installReadMapVmObject(bytes: []u8) u64 {
     const token = installVmObject(@intFromPtr(bytes.ptr), bytes.len, .{
         .read = true,
@@ -270,6 +305,9 @@ fn mapStaticScratchBuffers() void {
     const file_pages = max_file_bytes / user_vm.page_bytes;
     mapStaticScratchBuffer(@intFromPtr(&smoke_app_image), file_pages);
     mapStaticScratchBuffer(@intFromPtr(&ld_image), file_pages);
+    mapStaticScratchBuffer(@intFromPtr(&exec_loader_image), file_pages);
+    mapStaticScratchBuffer(@intFromPtr(&linux_abi_server_image), file_pages);
+    mapStaticScratchBuffer(@intFromPtr(&linux_abi_registry_page), 1);
 }
 
 fn mapStaticScratchBuffer(base_va: u64, page_count: usize) void {
@@ -312,7 +350,7 @@ fn spawnExecLoader(
         .abi_trap_flavor = @intFromEnum(trap_abi.AbiFlavor.linux_x86_64),
         .abi_trap_request_page_va = abi_trap_request_page_va,
     };
-    if (service_registry_abi.findService(process_abi.service_registry_shadow_va, .persistent_fs)) |entry| {
+    if (service_registry_abi.findService(process_abi.service_registry_shadow_va, .vfs)) |entry| {
         cfg.fs_endpoint_id = entry.endpoint_id;
         cfg.fs_compat_process_slot = entry.process_slot;
     }
@@ -367,6 +405,24 @@ fn spawnPlainExec(exec_token: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn spawnLinuxAbiServer(exec_token: u64) u64 {
+    const src: [*]volatile u8 = @ptrFromInt(process_abi.service_registry_shadow_va);
+    const dst: [*]volatile u8 = @ptrFromInt(@intFromPtr(&linux_abi_registry_page));
+    var i: usize = 0;
+    while (i < linux_abi_registry_page.len) : (i += 1) {
+        dst[i] = src[i];
+    }
+
+    linux_abi_bootstrap_table = .{};
+    linux_abi_bootstrap_table.page_count = 1;
+    linux_abi_bootstrap_table.page_descriptors[0] = .{
+        .source_va = @intFromPtr(&linux_abi_registry_page),
+        .target_va = process_abi.service_registry_shadow_va,
+        .flags = 0,
+    };
+    return spawnExecWithExtendedBootstrapTable(exec_token, &linux_abi_bootstrap_table, false);
+}
+
 pub export fn _start() noreturn {
     _ = userLog("ExecSmokeRunner: started\n");
     extendStack();
@@ -375,22 +431,22 @@ pub export fn _start() noreturn {
 
     runRootVfsSmoke(process_slot);
     _ = userLog("ExecSmokeRunner: rootfs vfs-only smoke done\n");
-    var run_legacy_dynamic_smoke = false;
-    run_legacy_dynamic_smoke = run_legacy_dynamic_smoke and process_slot != 0;
+    const run_legacy_dynamic_smoke = process_slot != 0;
     if (!run_legacy_dynamic_smoke) while (true) asm volatile ("pause");
 
     const ipc_va = user_vm.reservePages(2) orelse fail("ExecSmokeRunner: IPC VA reserve failed\n");
-    var client = fs_client.Client.connectFromRegistryPage(
+    var client = fs_client.Client.connectFromRegistryPageKind(
         process_abi.service_registry_shadow_va,
+        .vfs,
         @intCast(ipc_va),
         @intCast(ipc_va + user_vm.page_bytes),
         process_slot,
-    ) catch |err| failErr("ExecSmokeRunner: persistent fs connect failed: ", err);
-    _ = userLog("ExecSmokeRunner: persistent fs connect ok\n");
+    ) catch |err| failErr("ExecSmokeRunner: vfs connect for dynamic smoke failed: ", err);
+    _ = userLog("ExecSmokeRunner: vfs connect for dynamic smoke ok\n");
 
     const root = lookupPersistentRoot(&client);
-    const loader_exec = openRootFsExec(&client, root.token, exec_loader_path);
-    const linux_abi_server_exec = openRootFsExec(&client, root.token, linux_abi_server_path);
+    const loader_exec = loadRootFsExec(&client, root.token, exec_loader_path, exec_loader_image[0..]);
+    const linux_abi_server_exec = loadRootFsExec(&client, root.token, linux_abi_server_path, linux_abi_server_image[0..]);
     const smoke = readRootFsFile(&client, root.token, smoke_app_path, smoke_app_image[0..]);
     const ld = readRootFsFile(&client, root.token, ld_path, ld_image[0..]);
 
@@ -398,7 +454,7 @@ pub export fn _start() noreturn {
     const ld_token = installReadMapVmObject(ld_image[0..ld.bytes]);
     _ = userLog("ExecSmokeRunner: assets ready\n");
     const abi_trap_request_page_va = user_vm.reservePages(1) orelse fail("ExecSmokeRunner: abi trap VA reserve failed\n");
-    const abi_server_spawned = spawnPlainExec(linux_abi_server_exec.token);
+    const abi_server_spawned = spawnLinuxAbiServer(linux_abi_server_exec.token);
     const abi_server_process_slot = process_abi.decodeSpawnedProcessSlot(abi_server_spawned) orelse {
         userLogHex("ExecSmokeRunner: linux abi spawn ret=", abi_server_spawned);
         fail("ExecSmokeRunner: linux abi server spawn failed\n");

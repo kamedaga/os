@@ -774,6 +774,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .read_user_u64 = user_copy.readUserU64,
         .write_user_u64 = user_copy.writeUserU64,
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
+        .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
         .launch_pie_user_thread = spawn.launchPieUserThread,
         .spawn_exec = spawn.spawnExecFromSyscall,
         .wake_waiting_thread_for_principal = scheduler.wakeWaitingThreadForPrincipal,
