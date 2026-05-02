@@ -34,7 +34,7 @@ pactl run
 
 ## Status
 
-Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカが動作し、musl libc のロードとエントリ到達を確認。Trap delegation と linux_abi_server を実装中。
+Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカが動作し、dash shellのほとんどの操作(pipeを含む)が動く状況になっている。
 
 ## License
 

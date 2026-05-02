@@ -21,20 +21,55 @@ static int connect_vfs_from_registry(void) {
     return 1;
 }
 
-static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *path) {
+static int vfs_request_full(u16 op, u64 token, u64 offset, u32 length, u32 flags, const char *path, u64 inline_src, u16 inline_bytes) {
     if (!g_vfs.active) return 0;
+    if (inline_bytes > PAGE_BYTES - FS_REQUEST_HEADER_BYTES) return 0;
     clear_page(VFS_REQUEST_VA); clear_page(VFS_RESPONSE_VA);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
     const u64 seq = g_vfs.next_seq++;
-    request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = op; request->request_seq = seq; request->object_token = token; request->offset = offset; request->length = length; request->session_nonce = g_vfs.session_nonce;
+    request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = op; request->request_seq = seq; request->object_token = token; request->offset = offset; request->length = length; request->flags = flags; request->session_nonce = g_vfs.session_nonce;
+    u16 path_len = 0;
     if (path != 0) {
         u64 len = cstr_len(path);
         if (len > FS_MAX_PATH_BYTES) return 0;
-        request->path_bytes = (u16)len;
+        path_len = (u16)len;
+        request->path_bytes = path_len;
         volatile u8 *payload = (volatile u8 *)(VFS_REQUEST_VA + FS_REQUEST_HEADER_BYTES);
         for (u64 i = 0; i < len; i++) payload[i] = (u8)path[i];
     }
+    if (inline_bytes != 0) {
+        if ((u64)path_len + inline_bytes > PAGE_BYTES - FS_REQUEST_HEADER_BYTES) return 0;
+        request->inline_bytes = inline_bytes;
+        volatile u8 *payload = (volatile u8 *)((u64)VFS_REQUEST_VA + FS_REQUEST_HEADER_BYTES + path_len);
+        if (copy_from_target(inline_src, (void *)payload, inline_bytes) != inline_bytes) return 0;
+    }
     if (!signal_vfs()) return 0;
     return wait_vfs_response(seq, op);
+}
+
+static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *path) {
+    return vfs_request_full(op, token, offset, length, 0, path, 0, 0);
+}
+
+static int vfs_create_path(const char *path, int truncate_existing) {
+    const u32 flags = truncate_existing ? FS_CREATE_FLAG_TRUNCATE : 0;
+    return vfs_request_full(FS_OP_CREATE, g_vfs.root_token, 0, 0, flags, path, 0, 0);
+}
+
+static u64 vfs_write_from_target(u64 token, u64 offset, u64 src, u64 len, int *fault) {
+    *fault = 0;
+    u64 written = 0;
+    while (written < len) {
+        u64 chunk = min_u64(len - written, PAGE_BYTES - FS_REQUEST_HEADER_BYTES);
+        if (chunk > 0xffff) chunk = 0xffff;
+        if (!vfs_request_full(FS_OP_WRITE, token, offset + written, (u32)chunk, 0, 0, src + written, (u16)chunk)) {
+            *fault = 1;
+            return written;
+        }
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        if (response->status != FS_STATUS_OK) return written;
+        written += chunk;
+    }
+    return written;
 }
 

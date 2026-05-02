@@ -55,10 +55,13 @@ enum {
     BLOCK_PROTOCOL_VERSION = 1,
     BLOCK_OP_CONNECT = 1,
     BLOCK_OP_READ_BLOCKS = 3,
+    BLOCK_OP_WRITE_BLOCKS = 4,
     BLOCK_STATUS_OK = 0,
     BLOCK_REQUEST_HEADER_BYTES = 72,
+    BLOCK_REQUEST_PAYLOAD_BYTES = 4096 - BLOCK_REQUEST_HEADER_BYTES,
     BLOCK_RESPONSE_HEADER_BYTES = 56,
     BLOCK_RESPONSE_PAYLOAD_BYTES = 4096 - BLOCK_RESPONSE_HEADER_BYTES,
+    FS_CREATE_FLAG_TRUNCATE = 1 << 1,
 };
 
 struct service_entry {
@@ -191,6 +194,11 @@ struct fat_dir_entry_view {
     u32 size_bytes;
 };
 
+struct fat_dir_entry_location {
+    u32 sector;
+    u16 offset;
+};
+
 struct fat_dynamic_object {
     u8 used;
     u8 attr;
@@ -203,6 +211,15 @@ struct fat_dynamic_object {
 };
 
 static struct fat_dynamic_object g_dynamic_objects[FAT_MAX_DYNAMIC_OBJECTS];
+
+static void copy_dir_entry_view(struct fat_dir_entry_view *dst, const struct fat_dir_entry_view *src) {
+    for (u16 i = 0; i < sizeof(dst->name); i++) dst->name[i] = src->name[i];
+    dst->name_len = src->name_len;
+    dst->attr = src->attr;
+    dst->first_cluster = src->first_cluster;
+    dst->size_bytes = src->size_bytes;
+}
+
 static u64 cstr_len(const char *s) {
     u64 n = 0;
     while (s[n] != 0) n++;
@@ -424,6 +441,18 @@ static u32 load_le32(const u8 *p) {
         ((u32)p[3] << 24);
 }
 
+static void store_le16(u8 *p, u16 v) {
+    p[0] = (u8)(v & 0xffu);
+    p[1] = (u8)((v >> 8) & 0xffu);
+}
+
+static void store_le32(u8 *p, u32 v) {
+    p[0] = (u8)(v & 0xffu);
+    p[1] = (u8)((v >> 8) & 0xffu);
+    p[2] = (u8)((v >> 16) & 0xffu);
+    p[3] = (u8)((v >> 24) & 0xffu);
+}
+
 static int parse_fat32_bpb(void) {
     if (g_block.block_size < 512) return 0;
     if (g_volume_sector0[510] != 0x55 || g_volume_sector0[511] != 0xAA) return 0;
@@ -643,9 +672,11 @@ static int read_volume_sector0_probe(void) {
 
 static FAT_NOINLINE_NOOPT void copy_block_payload_to_sector(u8 *out, u64 copy_bytes) {
     const volatile u8 *payload = (const volatile u8 *)(FAT_BLOCK_RESPONSE_VA + BLOCK_RESPONSE_HEADER_BYTES);
-    for (u64 i = 0; i < copy_bytes; i++) {
-        out[i] = payload[i];
-    }
+    __asm__ volatile(
+        "rep movsb"
+        : "+D"(out), "+S"(payload), "+c"(copy_bytes)
+        :
+        : "memory");
 }
 
 static u32 cluster_to_sector(u32 cluster) {
@@ -659,6 +690,18 @@ static int fat_cluster_is_eoc(u32 cluster) {
 
 static int fat_cluster_valid(u32 cluster) {
     return cluster >= 2 && cluster < 0x0FFFFFF0u;
+}
+
+static u32 fat_cluster_limit(void) {
+    if (!g_bpb.valid || g_bpb.sectors_per_cluster == 0 || g_bpb.total_sectors <= g_bpb.first_data_sector) return 2;
+    const u64 data_sectors = g_bpb.total_sectors - g_bpb.first_data_sector;
+    const u64 clusters = data_sectors / g_bpb.sectors_per_cluster;
+    if (clusters > 0x0FFFFFEFu - 2u) return 0x0FFFFFEFu;
+    return (u32)clusters + 2u;
+}
+
+static int fat_cluster_in_volume(u32 cluster) {
+    return fat_cluster_valid(cluster) && cluster < fat_cluster_limit();
 }
 
 static FAT_NOINLINE_NOOPT int read_volume_sector(u32 sector, u8 *out) {
@@ -694,6 +737,47 @@ static FAT_NOINLINE_NOOPT int read_volume_sector(u32 sector, u8 *out) {
     return 1;
 }
 
+static FAT_NOINLINE_NOOPT void copy_sector_to_block_payload(const u8 *src, u64 copy_bytes) {
+    volatile u8 *payload = (volatile u8 *)(FAT_BLOCK_REQUEST_VA + BLOCK_REQUEST_HEADER_BYTES);
+    __asm__ volatile(
+        "rep movsb"
+        : "+D"(payload), "+S"(src), "+c"(copy_bytes)
+        :
+        : "memory");
+}
+
+static FAT_NOINLINE_NOOPT int write_volume_sector(u32 sector, const u8 *src) {
+    if (!g_block.active || g_block.block_size == 0 || g_block.block_size > BLOCK_REQUEST_PAYLOAD_BYTES) return 0;
+    const u64 copy_bytes = g_bpb.valid ? (u64)g_bpb.bytes_per_sector : g_block.block_size;
+    if (copy_bytes == 0 || copy_bytes > BLOCK_REQUEST_PAYLOAD_BYTES) return 0;
+    clear_page(FAT_BLOCK_REQUEST_VA);
+    clear_page(FAT_BLOCK_RESPONSE_VA);
+    const u64 seq = g_block.next_seq++;
+    volatile struct block_request_header *request = (volatile struct block_request_header *)FAT_BLOCK_REQUEST_VA;
+    request->magic = BLOCK_REQUEST_MAGIC;
+    request->version = BLOCK_PROTOCOL_VERSION;
+    request->op = BLOCK_OP_WRITE_BLOCKS;
+    request->object_token = g_block.root_token;
+    request->block_index = g_volume_start_block + sector;
+    request->block_count = 1;
+    request->flags = 0;
+    request->inline_bytes = (u16)copy_bytes;
+    request->reserved0 = 0;
+    request->reserved1 = 0;
+    request->arg0 = 0;
+    request->arg1 = 0;
+    request->session_nonce = g_block.session_nonce;
+    copy_sector_to_block_payload(src, copy_bytes);
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+
+    if (!signal_block_endpoint()) return 0;
+    if (!wait_block_response(seq, BLOCK_OP_WRITE_BLOCKS)) return 0;
+
+    volatile struct block_response_header *response = (volatile struct block_response_header *)FAT_BLOCK_RESPONSE_VA;
+    return response->status == BLOCK_STATUS_OK;
+}
+
 static int read_fat_next_cluster(u32 cluster, u32 *next_out) {
     if (!g_bpb.valid || !fat_cluster_valid(cluster)) return 0;
     const u32 fat_offset = cluster * 4u;
@@ -709,6 +793,83 @@ static int read_fat_next_cluster(u32 cluster, u32 *next_out) {
     if (!fat_cluster_valid(next)) return 0;
     *next_out = next;
     return 1;
+}
+
+static int read_fat_entry_raw(u32 cluster, u32 *value_out) {
+    if (!g_bpb.valid || !fat_cluster_in_volume(cluster)) return 0;
+    const u32 fat_offset = cluster * 4u;
+    const u32 fat_sector = g_bpb.first_fat_sector + (fat_offset / g_bpb.bytes_per_sector);
+    const u32 fat_sector_offset = fat_offset % g_bpb.bytes_per_sector;
+    if (fat_sector_offset + 4 > g_bpb.bytes_per_sector) return 0;
+    if (!read_volume_sector(fat_sector, g_sector_scratch)) return 0;
+    *value_out = load_le32(&g_sector_scratch[fat_sector_offset]) & 0x0FFFFFFFu;
+    return 1;
+}
+
+static int write_fat_entry(u32 cluster, u32 value) {
+    if (!g_bpb.valid || !fat_cluster_in_volume(cluster)) return 0;
+    const u32 fat_offset = cluster * 4u;
+    const u32 fat_sector_index = fat_offset / g_bpb.bytes_per_sector;
+    const u32 fat_sector_offset = fat_offset % g_bpb.bytes_per_sector;
+    if (fat_sector_offset + 4 > g_bpb.bytes_per_sector) return 0;
+    for (u8 fat = 0; fat < g_bpb.num_fats; fat++) {
+        const u32 fat_sector = g_bpb.first_fat_sector + (u32)fat * g_bpb.fat_size_sectors + fat_sector_index;
+        if (!read_volume_sector(fat_sector, g_sector_scratch)) return 0;
+        const u32 existing = load_le32(&g_sector_scratch[fat_sector_offset]);
+        const u32 stored = (existing & 0xF0000000u) | (value & 0x0FFFFFFFu);
+        store_le32(&g_sector_scratch[fat_sector_offset], stored);
+        if (!write_volume_sector(fat_sector, g_sector_scratch)) return 0;
+    }
+    return 1;
+}
+
+static void zero_sector_buffer(void) {
+    for (u32 i = 0; i < sizeof(g_sector_scratch); i++) g_sector_scratch[i] = 0;
+}
+
+static int zero_cluster(u32 cluster) {
+    if (!fat_cluster_in_volume(cluster)) return 0;
+    zero_sector_buffer();
+    const u32 first_sector = cluster_to_sector(cluster);
+    for (u32 i = 0; i < g_bpb.sectors_per_cluster; i++) {
+        if (!write_volume_sector(first_sector + i, g_sector_scratch)) return 0;
+    }
+    return 1;
+}
+
+static int find_free_cluster(u32 *cluster_out) {
+    const u32 limit = fat_cluster_limit();
+    for (u32 cluster = 2; cluster < limit; cluster++) {
+        u32 value = 0;
+        if (!read_fat_entry_raw(cluster, &value)) return 0;
+        if (value == 0) {
+            *cluster_out = cluster;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int allocate_cluster(u32 *cluster_out) {
+    u32 cluster = 0;
+    if (!find_free_cluster(&cluster)) return 0;
+    if (!write_fat_entry(cluster, 0x0FFFFFFFu)) return 0;
+    if (!zero_cluster(cluster)) return 0;
+    *cluster_out = cluster;
+    return 1;
+}
+
+static int free_cluster_chain(u32 start_cluster) {
+    u32 cluster = start_cluster;
+    for (u32 guard = 0; guard < 65536 && fat_cluster_in_volume(cluster); guard++) {
+        u32 next = 0;
+        if (!read_fat_entry_raw(cluster, &next)) return 0;
+        if (!write_fat_entry(cluster, 0)) return 0;
+        if (fat_cluster_is_eoc(next) || next == 0) return 1;
+        if (!fat_cluster_in_volume(next)) return 0;
+        cluster = next;
+    }
+    return 0;
 }
 
 static int seek_cluster_cached(
@@ -858,11 +1019,149 @@ static int find_child_in_directory(u32 dir_cluster, const char *name, struct fat
         struct fat_dir_entry_view entry;
         if (!read_dir_visible_entry(dir_cluster, cursor, &entry)) return 0;
         if (name_equals((const u8 *)entry.name, entry.name_len, name)) {
-            *out = entry;
+            copy_dir_entry_view(out, &entry);
             return 1;
         }
     }
     return 0;
+}
+
+static int find_child_dirent_location(
+    u32 dir_cluster,
+    const char *name,
+    struct fat_dir_entry_location *loc_out,
+    struct fat_dir_entry_view *view_out
+) {
+    if (!g_bpb.valid || !fat_cluster_in_volume(dir_cluster)) return 0;
+    u8 lfn_name[128];
+    u16 lfn_len = 0;
+    u32 cluster = dir_cluster;
+    for (u32 cluster_guard = 0; cluster_guard < 65536 && fat_cluster_in_volume(cluster); cluster_guard++) {
+        const u32 first_sector = cluster_to_sector(cluster);
+        for (u32 sector_offset = 0; sector_offset < g_bpb.sectors_per_cluster; sector_offset++) {
+            const u32 sector = first_sector + sector_offset;
+            if (!read_volume_sector(sector, g_sector_scratch)) return 0;
+            for (u32 off = 0; off < g_bpb.bytes_per_sector; off += 32) {
+                const u8 *entry = &g_sector_scratch[off];
+                if (entry[0] == 0x00) return 0;
+                if (entry[0] == 0xE5) {
+                    lfn_len = 0;
+                    continue;
+                }
+                const u8 attr = entry[11];
+                if (attr == FAT_ATTR_LONG_NAME) {
+                    const u8 seq = entry[0] & 0x1F;
+                    if ((entry[0] & 0x40) != 0) lfn_len = 0;
+                    if (seq != 0) {
+                        const u16 end = read_lfn_one_entry(entry, lfn_name, (u16)(seq - 1) * 13, sizeof(lfn_name));
+                        if (end > lfn_len) lfn_len = end;
+                    }
+                    continue;
+                }
+                if ((attr & 0x08) != 0) {
+                    lfn_len = 0;
+                    continue;
+                }
+                struct fat_dir_entry_view view;
+                fill_dir_entry_view(entry, lfn_name, lfn_len, &view);
+                if (view.name_len != 0 && name_equals((const u8 *)view.name, view.name_len, name)) {
+                    loc_out->sector = sector;
+                    loc_out->offset = (u16)off;
+                    if (view_out) copy_dir_entry_view(view_out, &view);
+                    return 1;
+                }
+                lfn_len = 0;
+            }
+        }
+        u32 next = 0;
+        if (!read_fat_next_cluster(cluster, &next)) return 0;
+        if (next == 0) return 0;
+        cluster = next;
+    }
+    return 0;
+}
+
+static int find_free_dirent_location(u32 dir_cluster, struct fat_dir_entry_location *loc_out) {
+    if (!g_bpb.valid || !fat_cluster_in_volume(dir_cluster)) return 0;
+    u32 cluster = dir_cluster;
+    for (u32 cluster_guard = 0; cluster_guard < 65536 && fat_cluster_in_volume(cluster); cluster_guard++) {
+        const u32 first_sector = cluster_to_sector(cluster);
+        for (u32 sector_offset = 0; sector_offset < g_bpb.sectors_per_cluster; sector_offset++) {
+            const u32 sector = first_sector + sector_offset;
+            if (!read_volume_sector(sector, g_sector_scratch)) return 0;
+            for (u32 off = 0; off < g_bpb.bytes_per_sector; off += 32) {
+                const u8 first = g_sector_scratch[off];
+                if (first == 0x00 || first == 0xE5) {
+                    loc_out->sector = sector;
+                    loc_out->offset = (u16)off;
+                    return 1;
+                }
+            }
+        }
+        u32 next = 0;
+        if (!read_fat_next_cluster(cluster, &next)) return 0;
+        if (next == 0) return 0;
+        cluster = next;
+    }
+    return 0;
+}
+
+static int split_parent_child_path(const char *path, char *parent_out, u16 parent_cap, char *name_out, u16 name_cap) {
+    if (!path || path[0] != '/') return 0;
+    u16 len = (u16)cstr_len(path);
+    while (len > 1 && path[len - 1] == '/') len--;
+    if (len <= 1) return 0;
+    u16 slash = len;
+    while (slash > 0 && path[slash - 1] != '/') slash--;
+    if (slash == 0 || slash >= len) return 0;
+    const u16 name_len = len - slash;
+    if (name_len == 0 || name_len >= name_cap) return 0;
+    u16 parent_len = slash == 1 ? 1 : (u16)(slash - 1);
+    if (parent_len >= parent_cap) return 0;
+    for (u16 i = 0; i < parent_len; i++) parent_out[i] = path[i];
+    parent_out[parent_len] = 0;
+    for (u16 i = 0; i < name_len; i++) name_out[i] = path[slash + i];
+    name_out[name_len] = 0;
+    return 1;
+}
+
+static int short_name_char_ok(char ch) {
+    if (ch >= 'a' && ch <= 'z') return 1;
+    if (ch >= 'A' && ch <= 'Z') return 1;
+    if (ch >= '0' && ch <= '9') return 1;
+    return ch == '_' || ch == '-';
+}
+
+static u8 short_name_upper(char ch) {
+    if (ch >= 'a' && ch <= 'z') return (u8)(ch - 'a' + 'A');
+    return (u8)ch;
+}
+
+static int make_short_8_3_name(const char *name, u8 out[11]) {
+    for (u8 i = 0; i < 11; i++) out[i] = ' ';
+    u16 len = (u16)cstr_len(name);
+    if (len == 0 || len > 12) return 0;
+    u16 dot = len;
+    for (u16 i = 0; i < len; i++) {
+        if (name[i] == '.') {
+            if (dot != len) return 0;
+            dot = i;
+        }
+    }
+    const u16 base_len = dot == len ? len : dot;
+    const u16 ext_len = dot == len ? 0 : (u16)(len - dot - 1);
+    if (base_len == 0 || base_len > 8 || ext_len > 3) return 0;
+    if (dot != len && ext_len == 0) return 0;
+    for (u16 i = 0; i < base_len; i++) {
+        if (!short_name_char_ok(name[i])) return 0;
+        out[i] = short_name_upper(name[i]);
+    }
+    for (u16 i = 0; i < ext_len; i++) {
+        const char ch = name[dot + 1 + i];
+        if (!short_name_char_ok(ch)) return 0;
+        out[8 + i] = short_name_upper(ch);
+    }
+    return 1;
 }
 
 static int resolve_path_cstr(const char *path, u32 *cluster_out, u32 *size_out, u8 *attr_out) {
@@ -1032,6 +1331,252 @@ static u16 read_cached_file_payload(struct fat_cached_file *file, u64 offset, u3
         &file->cached_cluster_index,
         &file->cached_cluster
     );
+}
+
+static void refresh_dynamic_object_by_path(const char *path, u32 first_cluster, u32 size_bytes, u8 attr) {
+    const u16 path_len = (u16)cstr_len(path);
+    for (u64 i = 0; i < FAT_MAX_DYNAMIC_OBJECTS; i++) {
+        if (!g_dynamic_objects[i].used || g_dynamic_objects[i].path_len != path_len) continue;
+        int same = 1;
+        for (u16 j = 0; j < path_len; j++) {
+            if (g_dynamic_objects[i].path[j] != path[j]) {
+                same = 0;
+                break;
+            }
+        }
+        if (!same) continue;
+        g_dynamic_objects[i].attr = attr;
+        g_dynamic_objects[i].first_cluster = first_cluster;
+        g_dynamic_objects[i].size_bytes = size_bytes;
+        g_dynamic_objects[i].cached_cluster_index = 0;
+        g_dynamic_objects[i].cached_cluster = first_cluster;
+    }
+}
+
+static void forget_dynamic_object_by_path(const char *path) {
+    const u16 path_len = (u16)cstr_len(path);
+    for (u64 i = 0; i < FAT_MAX_DYNAMIC_OBJECTS; i++) {
+        if (!g_dynamic_objects[i].used || g_dynamic_objects[i].path_len != path_len) continue;
+        int same = 1;
+        for (u16 j = 0; j < path_len; j++) {
+            if (g_dynamic_objects[i].path[j] != path[j]) {
+                same = 0;
+                break;
+            }
+        }
+        if (same) g_dynamic_objects[i].used = 0;
+    }
+}
+
+static int update_file_dirent(
+    const struct fat_dir_entry_location *loc,
+    u32 first_cluster,
+    u32 size_bytes,
+    struct fat_dir_entry_view *view_out
+) {
+    if (!read_volume_sector(loc->sector, g_sector_scratch)) return 0;
+    u8 *entry = &g_sector_scratch[loc->offset];
+    store_le16(&entry[20], (u16)((first_cluster >> 16) & 0xffffu));
+    store_le16(&entry[26], (u16)(first_cluster & 0xffffu));
+    store_le32(&entry[28], size_bytes);
+    if (!write_volume_sector(loc->sector, g_sector_scratch)) return 0;
+    if (view_out) fill_dir_entry_view(entry, (const u8 *)0, 0, view_out);
+    return 1;
+}
+
+static int create_file_dirent(
+    const struct fat_dir_entry_location *loc,
+    const u8 short_name[11],
+    struct fat_dir_entry_view *view_out
+) {
+    if (!read_volume_sector(loc->sector, g_sector_scratch)) return 0;
+    u8 *entry = &g_sector_scratch[loc->offset];
+    for (u8 i = 0; i < 32; i++) entry[i] = 0;
+    for (u8 i = 0; i < 11; i++) entry[i] = short_name[i];
+    entry[11] = 0x20;
+    store_le16(&entry[20], 0);
+    store_le16(&entry[26], 0);
+    store_le32(&entry[28], 0);
+    if (!write_volume_sector(loc->sector, g_sector_scratch)) return 0;
+    if (view_out) fill_dir_entry_view(entry, (const u8 *)0, 0, view_out);
+    return 1;
+}
+
+static int ensure_file_cluster_at(struct fat_dynamic_object *object, u32 cluster_index, u32 *cluster_out) {
+    if (object->first_cluster < 2) {
+        u32 first = 0;
+        if (!allocate_cluster(&first)) return 0;
+        object->first_cluster = first;
+        object->cached_cluster_index = 0;
+        object->cached_cluster = first;
+    }
+    u32 index = 0;
+    u32 cluster = object->first_cluster;
+    while (index < cluster_index) {
+        u32 next = 0;
+        if (!read_fat_entry_raw(cluster, &next)) return 0;
+        if (fat_cluster_is_eoc(next) || next == 0) {
+            u32 new_cluster = 0;
+            if (!allocate_cluster(&new_cluster)) return 0;
+            if (!write_fat_entry(cluster, new_cluster)) return 0;
+            next = new_cluster;
+        } else if (!fat_cluster_in_volume(next)) {
+            return 0;
+        }
+        cluster = next;
+        index++;
+    }
+    *cluster_out = cluster;
+    return 1;
+}
+
+static int ensure_directory_cluster_for_path(const char *dir_path, u32 *cluster_out) {
+    u32 cluster = 0;
+    u32 size_bytes = 0;
+    u8 attr = 0;
+    if (!resolve_path_cstr(dir_path, &cluster, &size_bytes, &attr)) return 0;
+    if ((attr & FAT_ATTR_DIRECTORY) == 0) return 0;
+    if (fat_cluster_in_volume(cluster)) {
+        *cluster_out = cluster;
+        return 1;
+    }
+    if (dir_path[0] == '/' && dir_path[1] == 0) return 0;
+
+    char parent_path[128];
+    char name[32];
+    if (!split_parent_child_path(dir_path, parent_path, sizeof(parent_path), name, sizeof(name))) return 0;
+    u32 parent_cluster = 0;
+    u32 parent_size = 0;
+    u8 parent_attr = 0;
+    if (!resolve_path_cstr(parent_path, &parent_cluster, &parent_size, &parent_attr)) return 0;
+    if ((parent_attr & FAT_ATTR_DIRECTORY) == 0) return 0;
+    if (!fat_cluster_in_volume(parent_cluster) && !ensure_directory_cluster_for_path(parent_path, &parent_cluster)) return 0;
+
+    struct fat_dir_entry_location loc;
+    struct fat_dir_entry_view view;
+    if (!find_child_dirent_location(parent_cluster, name, &loc, &view)) return 0;
+    if ((view.attr & FAT_ATTR_DIRECTORY) == 0) return 0;
+    u32 new_cluster = 0;
+    if (!allocate_cluster(&new_cluster)) return 0;
+    if (!update_file_dirent(&loc, new_cluster, 0, &view)) return 0;
+    refresh_dynamic_object_by_path(dir_path, new_cluster, 0, view.attr);
+    *cluster_out = new_cluster;
+    return 1;
+}
+
+static int fat_create_path(const char *full_path, u32 flags, u64 *object_id_out, u32 *size_out) {
+    char parent_path[128];
+    char name[32];
+    if (!split_parent_child_path(full_path, parent_path, sizeof(parent_path), name, sizeof(name))) return FS_STATUS_INVALID;
+
+    u32 parent_cluster = 0;
+    u32 parent_size = 0;
+    u8 parent_attr = 0;
+    if (!resolve_path_cstr(parent_path, &parent_cluster, &parent_size, &parent_attr)) return FS_STATUS_NOT_DIR;
+    if ((parent_attr & FAT_ATTR_DIRECTORY) == 0) return FS_STATUS_NOT_DIR;
+    if (!fat_cluster_in_volume(parent_cluster) && !ensure_directory_cluster_for_path(parent_path, &parent_cluster)) return FS_STATUS_IO_ERROR;
+
+    struct fat_dir_entry_location existing_loc;
+    struct fat_dir_entry_view existing;
+    if (find_child_dirent_location(parent_cluster, name, &existing_loc, &existing)) {
+        if ((existing.attr & FAT_ATTR_DIRECTORY) != 0) return FS_STATUS_IS_DIR;
+        if ((flags & FS_CREATE_FLAG_TRUNCATE) != 0) {
+            if (existing.first_cluster >= 2 && !free_cluster_chain(existing.first_cluster)) return FS_STATUS_IO_ERROR;
+            existing.first_cluster = 0;
+            existing.size_bytes = 0;
+            if (!update_file_dirent(&existing_loc, 0, 0, &existing)) return FS_STATUS_IO_ERROR;
+        }
+        const u16 full_len = (u16)cstr_len(full_path);
+        const u64 object_id = intern_dynamic_object(full_path, full_len, &existing);
+        if (object_id == 0) return FS_STATUS_BUSY;
+        refresh_dynamic_object_by_path(full_path, existing.first_cluster, existing.size_bytes, existing.attr);
+        *object_id_out = object_id;
+        *size_out = existing.size_bytes;
+        return FS_STATUS_OK;
+    }
+
+    u8 short_name[11];
+    if (!make_short_8_3_name(name, short_name)) return FS_STATUS_NOT_SUPPORTED;
+    struct fat_dir_entry_location free_loc;
+    if (!find_free_dirent_location(parent_cluster, &free_loc)) return FS_STATUS_BUSY;
+    struct fat_dir_entry_view created;
+    if (!create_file_dirent(&free_loc, short_name, &created)) return FS_STATUS_IO_ERROR;
+    const u16 full_len = (u16)cstr_len(full_path);
+    const u64 object_id = intern_dynamic_object(full_path, full_len, &created);
+    if (object_id == 0) return FS_STATUS_BUSY;
+    *object_id_out = object_id;
+    *size_out = 0;
+    return FS_STATUS_OK;
+}
+
+static int fat_write_object(struct fat_dynamic_object *object, u64 offset, u32 length, const volatile u8 *payload, u16 inline_bytes, u32 *size_out) {
+    if (!object || (object->attr & FAT_ATTR_DIRECTORY) != 0) return FS_STATUS_NOT_FOUND;
+    if (length > inline_bytes || length > FS_RESPONSE_PAYLOAD_BYTES) return FS_STATUS_INVALID;
+    if (length == 0) {
+        *size_out = object->size_bytes;
+        return FS_STATUS_OK;
+    }
+    const u64 end = offset + length;
+    if (end > 0xffffffffULL) return FS_STATUS_TOO_BIG;
+
+    char parent_path[128];
+    char name[32];
+    if (!split_parent_child_path(object->path, parent_path, sizeof(parent_path), name, sizeof(name))) return FS_STATUS_INVALID;
+    u32 parent_cluster = 0;
+    u32 parent_size = 0;
+    u8 parent_attr = 0;
+    if (!resolve_path_cstr(parent_path, &parent_cluster, &parent_size, &parent_attr)) return FS_STATUS_NOT_DIR;
+    struct fat_dir_entry_location loc;
+    struct fat_dir_entry_view view;
+    if (!find_child_dirent_location(parent_cluster, name, &loc, &view)) return FS_STATUS_NOT_FOUND;
+
+    const u32 cluster_bytes = (u32)g_bpb.bytes_per_sector * (u32)g_bpb.sectors_per_cluster;
+    u32 copied = 0;
+    while (copied < length) {
+        const u64 file_pos = offset + copied;
+        const u32 cluster_index = (u32)(file_pos / cluster_bytes);
+        const u32 within_cluster = (u32)(file_pos % cluster_bytes);
+        const u32 sector_in_cluster = within_cluster / g_bpb.bytes_per_sector;
+        const u32 within_sector = within_cluster % g_bpb.bytes_per_sector;
+        u32 cluster = 0;
+        if (!ensure_file_cluster_at(object, cluster_index, &cluster)) return FS_STATUS_IO_ERROR;
+        const u32 sector = cluster_to_sector(cluster) + sector_in_cluster;
+        if (!read_volume_sector(sector, g_sector_scratch)) return FS_STATUS_IO_ERROR;
+        u32 chunk = (u32)g_bpb.bytes_per_sector - within_sector;
+        if (chunk > length - copied) chunk = length - copied;
+        for (u32 i = 0; i < chunk; i++) g_sector_scratch[within_sector + i] = payload[copied + i];
+        if (!write_volume_sector(sector, g_sector_scratch)) return FS_STATUS_IO_ERROR;
+        copied += chunk;
+    }
+    if ((u32)end > object->size_bytes) object->size_bytes = (u32)end;
+    object->cached_cluster_index = 0;
+    object->cached_cluster = object->first_cluster;
+    if (!update_file_dirent(&loc, object->first_cluster, object->size_bytes, &view)) return FS_STATUS_IO_ERROR;
+    refresh_dynamic_object_by_path(object->path, object->first_cluster, object->size_bytes, object->attr);
+    *size_out = object->size_bytes;
+    return FS_STATUS_OK;
+}
+
+static int fat_unlink_path(const char *full_path) {
+    char parent_path[128];
+    char name[32];
+    if (!split_parent_child_path(full_path, parent_path, sizeof(parent_path), name, sizeof(name))) return FS_STATUS_INVALID;
+    u32 parent_cluster = 0;
+    u32 parent_size = 0;
+    u8 parent_attr = 0;
+    if (!resolve_path_cstr(parent_path, &parent_cluster, &parent_size, &parent_attr)) return FS_STATUS_NOT_DIR;
+    if ((parent_attr & FAT_ATTR_DIRECTORY) == 0) return FS_STATUS_NOT_DIR;
+
+    struct fat_dir_entry_location loc;
+    struct fat_dir_entry_view view;
+    if (!find_child_dirent_location(parent_cluster, name, &loc, &view)) return FS_STATUS_NOT_FOUND;
+    if ((view.attr & FAT_ATTR_DIRECTORY) != 0) return FS_STATUS_IS_DIR;
+    if (view.first_cluster >= 2 && !free_cluster_chain(view.first_cluster)) return FS_STATUS_IO_ERROR;
+    if (!read_volume_sector(loc.sector, g_sector_scratch)) return FS_STATUS_IO_ERROR;
+    g_sector_scratch[loc.offset] = 0xE5;
+    if (!write_volume_sector(loc.sector, g_sector_scratch)) return FS_STATUS_IO_ERROR;
+    forget_dynamic_object_by_path(full_path);
+    return FS_STATUS_OK;
 }
 
 static void write_response(
@@ -1303,8 +1848,56 @@ static void handle_fs_request(void) {
         if (cached_file_ready(file)) reply_file_read(seq, file, request->offset, request->length);
         else if (dynamic && is_dynamic_open_object_id(object_id)) reply_dynamic_read(seq, dynamic, request->offset, request->length);
         else reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
-    } else if (request->op == FS_OP_CREATE || request->op == FS_OP_WRITE || request->op == FS_OP_UNLINK || request->op == FS_OP_RENAME) {
-        reply_status(request->op, seq, FS_STATUS_NO_RIGHT);
+    } else if (request->op == FS_OP_CREATE) {
+        if (!is_dir_token(request->object_token) || request->path_bytes > FS_MAX_PATH_BYTES) {
+            reply_status(request->op, seq, FS_STATUS_INVALID);
+        } else {
+            char full_path[128];
+            u16 full_len = 0;
+            const volatile u8 *path = (const volatile u8 *)(FAT_REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+            if (!build_lookup_path(request->object_token, path, request->path_bytes, full_path, sizeof(full_path), &full_len)) {
+                reply_status(request->op, seq, FS_STATUS_INVALID);
+            } else {
+                u64 object_id = 0;
+                u32 size_bytes = 0;
+                const int status = fat_create_path(full_path, request->flags, &object_id, &size_bytes);
+                if (status == FS_STATUS_OK) {
+                    clear_page(FAT_RESPONSE_VA);
+                    write_response(FS_OP_CREATE, seq, FS_STATUS_OK, token_from_object_id(object_id), size_bytes, 0, FS_OBJECT_FILE, 0);
+                } else reply_status(request->op, seq, status);
+            }
+        }
+    } else if (request->op == FS_OP_WRITE) {
+        const u64 object_id = object_id_from_token(request->object_token);
+        struct fat_dynamic_object *dynamic = dynamic_object_by_id(object_id);
+        if (!dynamic || !is_dynamic_open_object_id(object_id)) {
+            reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
+        } else {
+            const volatile u8 *payload = (const volatile u8 *)((u64)FAT_REQUEST_VA + FS_REQUEST_HEADER_BYTES + request->path_bytes);
+            u32 size_bytes = 0;
+            const int status = fat_write_object(dynamic, request->offset, request->length, payload, request->inline_bytes, &size_bytes);
+            if (status == FS_STATUS_OK) {
+                clear_page(FAT_RESPONSE_VA);
+                write_response(FS_OP_WRITE, seq, FS_STATUS_OK, 0, size_bytes, request->offset + request->length, FS_OBJECT_OPEN_FILE, 0);
+            } else {
+                reply_status(request->op, seq, status);
+            }
+        }
+    } else if (request->op == FS_OP_UNLINK) {
+        if (!is_dir_token(request->object_token) || request->path_bytes > FS_MAX_PATH_BYTES) {
+            reply_status(request->op, seq, FS_STATUS_INVALID);
+        } else {
+            char full_path[128];
+            u16 full_len = 0;
+            const volatile u8 *path = (const volatile u8 *)(FAT_REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+            if (!build_lookup_path(request->object_token, path, request->path_bytes, full_path, sizeof(full_path), &full_len)) {
+                reply_status(request->op, seq, FS_STATUS_INVALID);
+            } else {
+                reply_status(request->op, seq, fat_unlink_path(full_path));
+            }
+        }
+    } else if (request->op == FS_OP_RENAME) {
+        reply_status(request->op, seq, FS_STATUS_NOT_SUPPORTED);
     } else {
         reply_status(request->op, seq, FS_STATUS_NOT_SUPPORTED);
     }

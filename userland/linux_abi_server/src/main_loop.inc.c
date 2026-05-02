@@ -61,6 +61,8 @@ void linux_abi_main(void) {
         case LINUX_SYS_ACCESS: msg = handle_access(req); break;
         case LINUX_SYS_GETCWD: msg = handle_getcwd(req); break;
         case LINUX_SYS_CHDIR: msg = handle_chdir(req); break;
+        case LINUX_SYS_UNLINK: msg = handle_unlinkat(req, 1); break;
+        case LINUX_SYS_UNLINKAT: msg = handle_unlinkat(req, 0); break;
         case LINUX_SYS_READLINK: msg = handle_readlink(req); break;
         case LINUX_SYS_UNAME: msg = handle_uname(req); break;
         case LINUX_SYS_CLOCK_GETTIME: msg = handle_clock_gettime(req); break;

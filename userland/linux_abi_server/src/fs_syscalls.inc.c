@@ -69,18 +69,43 @@ static int resolve_path_at(u64 dirfd, const char *path, char *out) {
     return normalize_path(g_fds[dirfd].path, path, out);
 }
 
+static int path_is_dev_file(const char *path) {
+    return path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/';
+}
+
 static struct ipc_message handle_openat(const struct trap_request *req, int old_open) {
     char path[256];
     char resolved[FS_MAX_PATH_BYTES + 1];
     const u64 dirfd = old_open ? AT_FDCWD_U64 : req->args[0];
     const u64 path_ptr = old_open ? req->args[0] : req->args[1];
     const u64 flags = old_open ? req->args[1] : req->args[2];
-    if ((flags & O_ACCMODE) != O_RDONLY) return reply(errno_acces(), 0);
+    const u64 access_mode = flags & O_ACCMODE;
+    if (access_mode != O_RDONLY && access_mode != O_WRONLY && access_mode != O_RDWR) return reply(errno_acces(), 0);
+    if ((flags & (O_CREAT | O_TRUNC)) != 0 && access_mode == O_RDONLY) return reply(errno_acces(), 0);
     if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
     if (path[0] == 0) return reply(errno_noent(), 0);
     if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
     struct fs_stat_record rec; u64 token = 0; u64 size = 0; u8 kind = FS_OBJECT_NONE;
-    if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_noent(), 0);
+    if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) {
+        if ((flags & O_CREAT) == 0) return reply(errno_noent(), 0);
+        if (!vfs_create_path(resolved, 0)) return reply(errno_io(), 0);
+        volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        if (created->status != FS_STATUS_OK || created->result_token == 0) return reply(errno_acces(), 0);
+        token = created->result_token;
+        size = created->file_bytes;
+        kind = created->object_kind;
+        rec.object_kind = kind;
+        rec.size_bytes = size;
+        rec.mode_bits = FS_FILE_MODE;
+        rec.mtime_unix_sec = 0;
+    } else if ((flags & O_TRUNC) != 0 && access_mode != O_RDONLY && !path_is_dev_file(resolved)) {
+        if (!vfs_create_path(resolved, 1)) return reply(errno_io(), 0);
+        volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        if (created->status != FS_STATUS_OK || created->result_token == 0) return reply(errno_acces(), 0);
+        token = created->result_token;
+        size = 0;
+        kind = created->object_kind;
+    }
     const int fd = alloc_fd(); if (fd < 0) return reply(errno_busy(), 0);
     if (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) {
         g_fds[fd].kind = FD_DIR; g_fds[fd].token = token; g_fds[fd].offset = 0; g_fds[fd].size = 0; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = kind;
@@ -105,7 +130,7 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
         struct pipe_entry *pipe = &g_pipes[pipe_id];
-    if (pipe->len == 0 && pipe->write_refs != 0) {
+        if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
             if (pipe->pending_read) return reply(errno_again(), 0);
             pipe->pending_read = 1;
             pipe->pending_principal = req->caller_principal;
@@ -167,6 +192,18 @@ static struct ipc_message handle_write(const struct trap_request *req) {
         if (!fault && (i64)n > 0) try_satisfy_pending_pipe_read(pipe_id);
         return reply(fault ? errno_fault() : n, 0);
     }
+    if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
+        if (len == 0) return reply(0, 0);
+        int fault = 0;
+        const u64 n = vfs_write_from_target(g_fds[fd].token, g_fds[fd].offset, src, len, &fault);
+        if (fault) return reply(errno_fault(), 0);
+        if (n != 0) {
+            g_fds[fd].offset += n;
+            if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
+            return reply(n, 0);
+        }
+        return reply(errno_io(), 0);
+    }
     if (fd == 1 || fd == 2) {
         char buf[129]; u64 done = 0;
         while (done < len) { u64 chunk = min_u64(len - done, 128); if (copy_from_target(src + done, buf, chunk) != chunk) break; user_log_len(buf, chunk); done += chunk; }
@@ -191,6 +228,23 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             if (n != pair[1]) break;
         }
         if (total != 0) try_satisfy_pending_pipe_read(pipe_id);
+        return reply(total, 0);
+    }
+    if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
+        if (iovcnt > 64) return reply(errno_inval(), 0);
+        u64 total = 0;
+        for (u64 i = 0; i < iovcnt; i++) {
+            u64 pair[2];
+            if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
+            int fault = 0;
+            const u64 n = vfs_write_from_target(g_fds[fd].token, g_fds[fd].offset, pair[0], pair[1], &fault);
+            if (fault) return reply(errno_fault(), 0);
+            if (n == 0 && pair[1] != 0) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
+            g_fds[fd].offset += n;
+            if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
+            total += n;
+            if (n != pair[1]) break;
+        }
         return reply(total, 0);
     }
     if (fd != 1 && fd != 2) return reply(errno_badf(), 0);
@@ -264,6 +318,21 @@ static struct ipc_message handle_close(const struct trap_request *req) {
     if (fd_is_pipe(fd)) close_pipe_fd(fd);
     g_fds[fd].kind = FD_UNUSED;
     return reply(0, 0);
+}
+static struct ipc_message handle_unlinkat(const struct trap_request *req, int old_unlink) {
+    char path[256];
+    char resolved[FS_MAX_PATH_BYTES + 1];
+    const u64 dirfd = old_unlink ? AT_FDCWD_U64 : req->args[0];
+    const u64 path_ptr = old_unlink ? req->args[0] : req->args[1];
+    if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
+    if (path[0] == 0) return reply(errno_noent(), 0);
+    if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    if (!vfs_request(FS_OP_UNLINK, g_vfs.root_token, 0, 0, resolved)) return reply(errno_io(), 0);
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    if (response->status == FS_STATUS_OK) return reply(0, 0);
+    if (response->status == FS_STATUS_NOT_FOUND) return reply(errno_noent(), 0);
+    if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
+    return reply(errno_acces(), 0);
 }
 static struct ipc_message handle_access(const struct trap_request *req) { char path[256]; char resolved[FS_MAX_PATH_BYTES + 1]; if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0); if (path[0] == 0) return reply(errno_noent(), 0); if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0); struct fs_stat_record rec; u64 token = 0, size = 0; u8 kind = 0; return reply(vfs_lookup_stat(resolved, &token, &rec, &size, &kind) ? 0 : errno_noent(), 0); }
 static struct ipc_message handle_arch_prctl(const struct trap_request *req) { if (req->args[0] != ARCH_SET_FS) return reply(errno_inval(), 0); return reply(set_target_fs_base(req->args[1]) == SYSCALL_OK ? 0 : errno_inval(), 0); }

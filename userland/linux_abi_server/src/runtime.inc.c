@@ -11,6 +11,7 @@ static u64 syscall1(u64 nr, u64 a0) { u64 ret; __asm__ volatile("int $0x80" : "=
 static u64 syscall2(u64 nr, u64 a0, u64 a1) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall3(u64 nr, u64 a0, u64 a1, u64 a2) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3) : "r8", "r9", "r10", "r11", "memory"); return ret; }
+static u64 syscall4_r10(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { register u64 r10 __asm__("r10") = a3; u64 ret; __asm__ volatile("int $0x80" : "=a"(ret), "+r"(r10) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r11", "memory"); return ret; }
 static void process_exit(u64 code) { (void)syscall2(SYSCALL_PROCESS_EXIT, code, 0); for (;;) __asm__ volatile("pause"); }
 
 static struct ipc_message wait_ipc(void) {
@@ -47,7 +48,7 @@ static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bi
 static u64 unmap_reply_target_pages(u64 target_va, u64 page_count) { return syscall2(SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count); }
 static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
 static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
-static u64 copy_to_trap_target(u64 principal, u64 target_va, const void *src, u64 len) { return syscall4(SYSCALL_COPY_TO_ABI_TRAP_TARGET, principal, target_va, (u64)src, len); }
+static u64 copy_to_trap_target(u64 principal, u64 target_va, const void *src, u64 len) { return syscall4_r10(SYSCALL_COPY_TO_ABI_TRAP_TARGET, principal, target_va, (u64)src, len); }
 static u64 reply_trap_target(u64 principal, u64 result, u64 flags) { return syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, principal, result, flags); }
 static u64 start_trap_target(u64 principal) { return syscall1(SYSCALL_START_ABI_TRAP_TARGET, principal); }
 static u64 set_trap_target_request_page(u64 principal, u64 request_page_va) { return syscall2(SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE, principal, request_page_va); }
@@ -71,8 +72,11 @@ static int is_known_trap_request_page(u64 request_va) {
 static int ensure_child_trap_request_page(u64 principal, u64 *request_va_out) {
     const u64 request_va = trap_request_page_for_principal(principal);
     if (request_va == 0) return 0;
-    const u64 status = alloc_map_pages(request_va, 1, 0x3);
-    if (status != SYSCALL_OK) return 0;
+    if (!g_request_page_mapped[principal]) {
+        const u64 status = alloc_map_pages(request_va, 1, 0x3);
+        if (status != SYSCALL_OK) return 0;
+        g_request_page_mapped[principal] = 1;
+    }
     clear_page(request_va);
     if (set_trap_target_request_page(principal, request_va) != SYSCALL_OK) return 0;
     *request_va_out = request_va;

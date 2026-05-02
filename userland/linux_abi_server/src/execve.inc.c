@@ -1,7 +1,7 @@
 static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_record *stat_out, u64 *file_bytes_out, u8 *kind_out) {
     if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) { user_log("LinuxAbiServer: lookup request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-    if (response->status != FS_STATUS_OK || response->result_token == 0) { user_log("LinuxAbiServer: lookup status failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }
+    if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     const u64 token = response->result_token;
     const u8 lookup_kind = response->object_kind;
     const u64 lookup_file_bytes = response->file_bytes;

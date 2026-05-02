@@ -44,7 +44,33 @@ static void process_exit(u64 code) {
 void exec_client_main(void) {
     user_log("ExecClient: started\n");
 
-    static const char *argv[] = { "/cmd/dash.elf", "-c", "echo pipe-ok | while read x; do echo $x; done" };
+    static const char *argv[] = {
+        "/cmd/dash.elf",
+        "-c",
+        "echo basic-ok; "
+        "x=var-ok; echo $x; "
+        "for x in for-a for-b; do echo $x; done; "
+        "case word in word) echo case-ok;; *) echo case-bad;; esac; "
+        "f(){ echo func-ok; }; f; "
+        "cd /cmd && pwd; "
+        "y=$(echo subst-ok); "
+        "if [ \"$y\" = subst-ok ]; then echo subst-ok; else echo subst-bad; fi; "
+        "true && echo and-ok || echo and-bad; "
+        "false || echo or-ok; "
+        "[ x = x ] && echo test-ok || echo test-bad; "
+        "(echo subshell-ok); "
+        "gok=0; for g in /cmd/*.elf; do case $g in /cmd/dash.elf) gok=1;; esac; done; "
+        "[ \"$gok\" = 1 ] && echo glob-ok || echo glob-bad; "
+        "echo hidden > /dev/null && echo redirect-ok || echo redirect-bad; "
+        "echo file-ok > /tmp/dash-smoke.txt; "
+        "read z < /tmp/dash-smoke.txt; "
+        "[ \"$z\" = file-ok ] && echo file-rw-ok || echo file-rw-bad; "
+        "echo fat-ok > /share/fat.txt; "
+        "read fz < /share/fat.txt; "
+        "[ \"$fz\" = fat-ok ] && echo fat-rw-ok || echo fat-rw-bad; "
+        "echo pipe-ok | while read x; do echo $x; done; "
+        "echo dash-smoke-done"
+    };
     static const char *envp[] = { "PATH=/bin:/cmd", "CAPABILITYOS=1" };
     struct exec_service_spawn_result result;
     const struct exec_service_spawn_options options = {

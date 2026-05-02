@@ -33,8 +33,14 @@ enum {
     VFS_DEV_ZERO_OBJECT_ID = 7,
     VFS_DEV_NULL_OPEN_OBJECT_ID = 8,
     VFS_DEV_ZERO_OPEN_OBJECT_ID = 9,
+    VFS_TMPFS_FILE_OBJECT_ID_BASE = 0x1000,
+    VFS_TMPFS_OPEN_OBJECT_ID_BASE = 0x2000,
+    VFS_TMPFS_MAX_FILES = 16,
+    VFS_TMPFS_FILE_BYTES = 2048,
     VFS_DIR_MODE = 0x4000,
     VFS_FILE_MODE = 0x8000,
+    VFS_CREATE_FLAG_DIRECTORY = 1 << 0,
+    VFS_CREATE_FLAG_TRUNCATE = 1 << 1,
 };
 
 struct vfs_mount_entry {
@@ -48,6 +54,17 @@ struct vfs_builtin_file {
     u64 open_object_id;
     const char *name;
     u16 name_len;
+};
+
+struct vfs_tmpfs_file {
+    u8 used;
+    u8 reserved0[7];
+    u64 parent_object_id;
+    u16 name_len;
+    u16 reserved1;
+    u32 size;
+    char name[FS_MAX_PATH_BYTES + 1];
+    u8 bytes[VFS_TMPFS_FILE_BYTES];
 };
 
 struct vfs_session {
@@ -79,6 +96,7 @@ struct vfs_backend_session {
 
 static struct vfs_session g_session;
 static struct vfs_backend_session g_root_backend;
+static struct vfs_tmpfs_file g_tmpfs_files[VFS_TMPFS_MAX_FILES];
 static u64 g_endpoint_id;
 static const struct vfs_mount_entry g_root_mounts[] = {
     { VFS_DEV_OBJECT_ID, "dev", 3 },
@@ -184,7 +202,33 @@ static u64 object_id_from_token(u64 token) {
     if ((token & VFS_TOKEN_TAG) == 0) return 0;
     const u64 object_id = token & ~VFS_TOKEN_TAG;
     if (object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_DEV_ZERO_OPEN_OBJECT_ID) return object_id;
+    if (object_id >= VFS_TMPFS_FILE_OBJECT_ID_BASE &&
+        object_id < VFS_TMPFS_FILE_OBJECT_ID_BASE + VFS_TMPFS_MAX_FILES) return object_id;
+    if (object_id >= VFS_TMPFS_OPEN_OBJECT_ID_BASE &&
+        object_id < VFS_TMPFS_OPEN_OBJECT_ID_BASE + VFS_TMPFS_MAX_FILES) return object_id;
     return 0;
+}
+
+static u64 tmpfs_index_from_file_object_id(u64 object_id) {
+    if (object_id < VFS_TMPFS_FILE_OBJECT_ID_BASE ||
+        object_id >= VFS_TMPFS_FILE_OBJECT_ID_BASE + VFS_TMPFS_MAX_FILES) return VFS_TMPFS_MAX_FILES;
+    return object_id - VFS_TMPFS_FILE_OBJECT_ID_BASE;
+}
+
+static u64 tmpfs_index_from_open_object_id(u64 object_id) {
+    if (object_id < VFS_TMPFS_OPEN_OBJECT_ID_BASE ||
+        object_id >= VFS_TMPFS_OPEN_OBJECT_ID_BASE + VFS_TMPFS_MAX_FILES) return VFS_TMPFS_MAX_FILES;
+    return object_id - VFS_TMPFS_OPEN_OBJECT_ID_BASE;
+}
+
+static int is_tmpfs_file_object_id(u64 object_id) {
+    const u64 index = tmpfs_index_from_file_object_id(object_id);
+    return index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[index].used;
+}
+
+static int is_tmpfs_open_object_id(u64 object_id) {
+    const u64 index = tmpfs_index_from_open_object_id(object_id);
+    return index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[index].used;
 }
 
 static int is_directory_object_id(u64 object_id) {
@@ -192,11 +236,11 @@ static int is_directory_object_id(u64 object_id) {
 }
 
 static int is_file_object_id(u64 object_id) {
-    return object_id == VFS_DEV_NULL_OBJECT_ID || object_id == VFS_DEV_ZERO_OBJECT_ID;
+    return object_id == VFS_DEV_NULL_OBJECT_ID || object_id == VFS_DEV_ZERO_OBJECT_ID || is_tmpfs_file_object_id(object_id);
 }
 
 static int is_open_file_object_id(u64 object_id) {
-    return object_id == VFS_DEV_NULL_OPEN_OBJECT_ID || object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID;
+    return object_id == VFS_DEV_NULL_OPEN_OBJECT_ID || object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID || is_tmpfs_open_object_id(object_id);
 }
 
 static int is_directory_token(u64 token) {
@@ -214,6 +258,10 @@ static int is_open_file_token(u64 token) {
 static u64 open_object_id_for_file(u64 object_id) {
     for (u64 i = 0; i < sizeof(g_dev_files) / sizeof(g_dev_files[0]); i++) {
         if (g_dev_files[i].object_id == object_id) return g_dev_files[i].open_object_id;
+    }
+    const u64 tmpfs_index = tmpfs_index_from_file_object_id(object_id);
+    if (tmpfs_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_index].used) {
+        return VFS_TMPFS_OPEN_OBJECT_ID_BASE + tmpfs_index;
     }
     return 0;
 }
@@ -248,6 +296,26 @@ static u64 lookup_dev_name(const volatile u8 *name, u16 name_len) {
         }
     }
     return 0;
+}
+
+static u64 lookup_tmpfs_name(u64 parent_object_id, const volatile u8 *name, u16 name_len) {
+    if (parent_object_id != VFS_TMP_OBJECT_ID && parent_object_id != VFS_RUN_OBJECT_ID) return 0;
+    if (name_len == 0 || name_len > FS_MAX_PATH_BYTES) return 0;
+    for (u64 i = 0; i < VFS_TMPFS_MAX_FILES; i++) {
+        if (!g_tmpfs_files[i].used || g_tmpfs_files[i].parent_object_id != parent_object_id) continue;
+        if (path_equals(name, name_len, g_tmpfs_files[i].name, g_tmpfs_files[i].name_len)) {
+            return token_from_object_id(VFS_TMPFS_FILE_OBJECT_ID_BASE + i);
+        }
+    }
+    return 0;
+}
+
+static int path_single_component(const volatile u8 *path, u16 len) {
+    if (len == 0 || len > FS_MAX_PATH_BYTES) return 0;
+    for (u16 i = 0; i < len; i++) {
+        if (path[i] == '/') return 0;
+    }
+    return 1;
 }
 
 static int root_mount_name_exists(const volatile u8 *name, u16 name_len) {
@@ -285,19 +353,26 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
         const u64 token = lookup_dev_name(path + start, component_len);
         if (token == 0) return 0;
         current_object_id = object_id_from_token(token);
+    } else if (current_object_id == VFS_TMP_OBJECT_ID || current_object_id == VFS_RUN_OBJECT_ID) {
+        const u64 token = lookup_tmpfs_name(current_object_id, path + start, component_len);
+        if (token == 0) return 0;
+        current_object_id = object_id_from_token(token);
     } else {
         return 0;
     }
 
     if (pos >= len) return token_from_object_id(current_object_id);
-    if (current_object_id != VFS_DEV_OBJECT_ID) return 0;
+    if (current_object_id != VFS_DEV_OBJECT_ID &&
+        current_object_id != VFS_TMP_OBJECT_ID &&
+        current_object_id != VFS_RUN_OBJECT_ID) return 0;
 
     const u16 second_start = pos;
     while (pos < len && path[pos] != '/') pos++;
     const u16 second_len = pos - second_start;
     while (pos < len && path[pos] == '/') pos++;
     if (pos < len) return 0;
-    return lookup_dev_name(path + second_start, second_len);
+    if (current_object_id == VFS_DEV_OBJECT_ID) return lookup_dev_name(path + second_start, second_len);
+    return lookup_tmpfs_name(current_object_id, path + second_start, second_len);
 }
 
 static void write_response(
@@ -353,8 +428,15 @@ static void reply_stat(u64 seq, u64 token) {
     volatile struct fs_stat_record *record = (volatile struct fs_stat_record *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
     const u64 object_id = object_id_from_token(token);
     const int is_dir = is_directory_object_id(object_id);
+    const u64 tmpfs_file_index = tmpfs_index_from_file_object_id(object_id);
+    const u64 tmpfs_open_index = tmpfs_index_from_open_object_id(object_id);
     record->object_kind = is_dir ? FS_OBJECT_DIRECTORY : FS_OBJECT_FILE;
     record->size_bytes = 0;
+    if (tmpfs_file_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_file_index].used) {
+        record->size_bytes = g_tmpfs_files[tmpfs_file_index].size;
+    } else if (tmpfs_open_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_open_index].used) {
+        record->size_bytes = g_tmpfs_files[tmpfs_open_index].size;
+    }
     record->mode_bits = is_dir ? VFS_DIR_MODE : VFS_FILE_MODE;
     record->reserved1 = 0;
     record->mtime_unix_sec = 0;
@@ -413,6 +495,25 @@ static void reply_readdir(u64 seq, u64 token, u64 cursor) {
         write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_FILE);
         return;
     }
+    const u64 dir_object_id = object_id_from_token(token);
+    if (dir_object_id == VFS_TMP_OBJECT_ID || dir_object_id == VFS_RUN_OBJECT_ID) {
+        u64 seen = 0;
+        for (u64 i = 0; i < VFS_TMPFS_MAX_FILES; i++) {
+            if (!g_tmpfs_files[i].used || g_tmpfs_files[i].parent_object_id != dir_object_id) continue;
+            if (seen++ < cursor) continue;
+            write_dirent_response(
+                seq,
+                token_from_object_id(VFS_TMPFS_FILE_OBJECT_ID_BASE + i),
+                cursor + 1,
+                g_tmpfs_files[i].name,
+                g_tmpfs_files[i].name_len,
+                FS_OBJECT_FILE
+            );
+            return;
+        }
+        write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
+        return;
+    }
     if (is_directory_token(token)) {
         write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
         return;
@@ -432,29 +533,52 @@ static void reply_open(u64 seq, u64 token) {
 }
 
 static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
-    (void)offset;
     clear_page(g_session.response_va);
     const u64 object_id = object_id_from_token(token);
     if (object_id == VFS_DEV_NULL_OPEN_OBJECT_ID) {
         write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, 0, offset, FS_OBJECT_OPEN_FILE, 0);
         return;
     }
-    if (object_id != VFS_DEV_ZERO_OPEN_OBJECT_ID) {
-        write_response(FS_OP_READ, seq, FS_STATUS_NOT_FOUND, 0, 0, offset, FS_OBJECT_NONE, 0);
+    if (object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID) {
+        u16 bytes = (u16)length;
+        if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
+        volatile u8 *payload = (volatile u8 *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
+        for (u16 i = 0; i < bytes; i++) payload[i] = 0;
+        write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, 0, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
         return;
     }
-    u16 bytes = (u16)length;
-    if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
-    volatile u8 *payload = (volatile u8 *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
-    for (u16 i = 0; i < bytes; i++) payload[i] = 0;
-    write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, 0, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+    const u64 tmpfs_index = tmpfs_index_from_open_object_id(object_id);
+    if (tmpfs_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_index].used) {
+        struct vfs_tmpfs_file *file = &g_tmpfs_files[tmpfs_index];
+        u16 bytes = 0;
+        if (offset < file->size) {
+            const u64 remaining = file->size - offset;
+            bytes = (u16)(remaining < length ? remaining : length);
+            if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
+            volatile u8 *payload = (volatile u8 *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
+            for (u16 i = 0; i < bytes; i++) payload[i] = file->bytes[offset + i];
+        }
+        write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, file->size, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+        return;
+    }
+    write_response(FS_OP_READ, seq, FS_STATUS_NOT_FOUND, 0, 0, offset, FS_OBJECT_NONE, 0);
 }
 
-static void reply_write(u64 seq, u64 token, u64 offset, u32 length) {
+static void reply_write(u64 seq, u64 token, u64 offset, u32 length, const volatile u8 *payload, u16 inline_bytes) {
     const u64 object_id = object_id_from_token(token);
     if (!is_open_file_object_id(object_id)) {
         reply_status(FS_OP_WRITE, seq, FS_STATUS_NOT_FOUND);
         return;
+    }
+    const u64 tmpfs_index = tmpfs_index_from_open_object_id(object_id);
+    if (tmpfs_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_index].used) {
+        struct vfs_tmpfs_file *file = &g_tmpfs_files[tmpfs_index];
+        if (length > inline_bytes || offset > VFS_TMPFS_FILE_BYTES || offset + length > VFS_TMPFS_FILE_BYTES) {
+            reply_status(FS_OP_WRITE, seq, FS_STATUS_TOO_BIG);
+            return;
+        }
+        for (u32 i = 0; i < length; i++) file->bytes[offset + i] = payload[i];
+        if (offset + length > file->size) file->size = (u32)(offset + length);
     }
     clear_page(g_session.response_va);
     write_response(
@@ -462,11 +586,100 @@ static void reply_write(u64 seq, u64 token, u64 offset, u32 length) {
         seq,
         FS_STATUS_OK,
         0,
-        offset + length,
+        tmpfs_index < VFS_TMPFS_MAX_FILES ? g_tmpfs_files[tmpfs_index].size : offset + length,
         offset + length,
         FS_OBJECT_OPEN_FILE,
         0
     );
+}
+
+static int tmpfs_parent_from_path(const volatile u8 *path, u16 path_len, u64 *parent_out, const volatile u8 **name_out, u16 *name_len_out) {
+    if (path_len == 0 || path_len > FS_MAX_PATH_BYTES) return 0;
+    u16 pos = 0;
+    u64 parent = 0;
+    if (path[0] == '/') {
+        pos = 1;
+        const u16 start = pos;
+        while (pos < path_len && path[pos] != '/') pos++;
+        const u16 first_len = pos - start;
+        if (path_equals(path + start, first_len, "tmp", 3)) parent = VFS_TMP_OBJECT_ID;
+        else if (path_equals(path + start, first_len, "run", 3)) parent = VFS_RUN_OBJECT_ID;
+        else return 0;
+        while (pos < path_len && path[pos] == '/') pos++;
+    } else {
+        return 0;
+    }
+    const u16 name_start = pos;
+    while (pos < path_len && path[pos] != '/') pos++;
+    const u16 name_len = pos - name_start;
+    while (pos < path_len && path[pos] == '/') pos++;
+    if (pos < path_len || !path_single_component(path + name_start, name_len)) return 0;
+    *parent_out = parent;
+    *name_out = path + name_start;
+    *name_len_out = name_len;
+    return 1;
+}
+
+static int path_targets_tmpfs(const volatile u8 *path, u16 path_len) {
+    u64 parent = 0;
+    const volatile u8 *name = (const volatile u8 *)0;
+    u16 name_len = 0;
+    return tmpfs_parent_from_path(path, path_len, &parent, &name, &name_len);
+}
+
+static void reply_tmpfs_create(u64 seq, const volatile u8 *path, u16 path_len, u32 flags) {
+    if ((flags & VFS_CREATE_FLAG_DIRECTORY) != 0) {
+        reply_status(FS_OP_CREATE, seq, FS_STATUS_NOT_SUPPORTED);
+        return;
+    }
+    u64 parent = 0;
+    const volatile u8 *name = (const volatile u8 *)0;
+    u16 name_len = 0;
+    if (!tmpfs_parent_from_path(path, path_len, &parent, &name, &name_len)) {
+        reply_status(FS_OP_CREATE, seq, FS_STATUS_NOT_DIR);
+        return;
+    }
+    const u64 existing = lookup_tmpfs_name(parent, name, name_len);
+    if (existing != 0) {
+        const u64 index = tmpfs_index_from_file_object_id(object_id_from_token(existing));
+        if ((flags & VFS_CREATE_FLAG_TRUNCATE) != 0 && index < VFS_TMPFS_MAX_FILES) g_tmpfs_files[index].size = 0;
+        reply_file_lookup(FS_OP_CREATE, seq, existing);
+        return;
+    }
+    for (u64 i = 0; i < VFS_TMPFS_MAX_FILES; i++) {
+        if (g_tmpfs_files[i].used) continue;
+        g_tmpfs_files[i].used = 1;
+        g_tmpfs_files[i].parent_object_id = parent;
+        g_tmpfs_files[i].name_len = name_len;
+        g_tmpfs_files[i].size = 0;
+        for (u16 j = 0; j < name_len; j++) g_tmpfs_files[i].name[j] = (char)name[j];
+        g_tmpfs_files[i].name[name_len] = 0;
+        reply_file_lookup(FS_OP_CREATE, seq, token_from_object_id(VFS_TMPFS_FILE_OBJECT_ID_BASE + i));
+        return;
+    }
+    reply_status(FS_OP_CREATE, seq, FS_STATUS_BUSY);
+}
+
+static void reply_tmpfs_unlink(u64 seq, const volatile u8 *path, u16 path_len) {
+    u64 parent = 0;
+    const volatile u8 *name = (const volatile u8 *)0;
+    u16 name_len = 0;
+    if (!tmpfs_parent_from_path(path, path_len, &parent, &name, &name_len)) {
+        reply_status(FS_OP_UNLINK, seq, FS_STATUS_NOT_DIR);
+        return;
+    }
+    const u64 existing = lookup_tmpfs_name(parent, name, name_len);
+    if (existing == 0) {
+        reply_status(FS_OP_UNLINK, seq, FS_STATUS_NOT_FOUND);
+        return;
+    }
+    const u64 index = tmpfs_index_from_file_object_id(object_id_from_token(existing));
+    if (index >= VFS_TMPFS_MAX_FILES) {
+        reply_status(FS_OP_UNLINK, seq, FS_STATUS_NOT_FOUND);
+        return;
+    }
+    g_tmpfs_files[index].used = 0;
+    reply_status(FS_OP_UNLINK, seq, FS_STATUS_OK);
 }
 
 static u64 make_backend_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
@@ -923,10 +1136,28 @@ static void handle_fs_request(void) {
                 request->inline_bytes,
                 0
             );
-        } else if (is_open_file_token(request->object_token)) reply_write(seq, request->object_token, request->offset, request->length);
+        } else if (is_open_file_token(request->object_token)) {
+            const volatile u8 *payload = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES + request->path_bytes);
+            reply_write(seq, request->object_token, request->offset, request->length, payload, request->inline_bytes);
+        }
         else reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
     } else if (request->op == FS_OP_CREATE || request->op == FS_OP_UNLINK || request->op == FS_OP_RENAME) {
-        if (is_backend_token(request->object_token)) {
+        const volatile u8 *path = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES);
+        if (request->op == FS_OP_CREATE &&
+            object_id_from_token(request->object_token) == VFS_ROOT_OBJECT_ID &&
+            request->path_bytes > 0 &&
+            request->path_bytes <= FS_MAX_PATH_BYTES &&
+            path_targets_tmpfs(path, request->path_bytes))
+        {
+            reply_tmpfs_create(seq, path, request->path_bytes, request->flags);
+        } else if (request->op == FS_OP_UNLINK &&
+            object_id_from_token(request->object_token) == VFS_ROOT_OBJECT_ID &&
+            request->path_bytes > 0 &&
+            request->path_bytes <= FS_MAX_PATH_BYTES &&
+            path_targets_tmpfs(path, request->path_bytes))
+        {
+            reply_tmpfs_unlink(seq, path, request->path_bytes);
+        } else if (is_backend_token(request->object_token)) {
             const volatile u8 *path = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES);
             const volatile u8 *inline_payload = path + request->path_bytes;
             forward_backend_request(

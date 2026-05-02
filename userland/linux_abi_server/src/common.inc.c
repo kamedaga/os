@@ -70,8 +70,13 @@ enum {
     FS_OP_READDIR = 19,
     FS_OP_STAT = 20,
     FS_OP_CLOSE = 21,
+    FS_OP_CREATE = 22,
+    FS_OP_WRITE = 23,
+    FS_OP_UNLINK = 24,
     FS_OP_OPEN_EXEC = 32,
     FS_STATUS_OK = 0,
+    FS_STATUS_NOT_FOUND = 2,
+    FS_STATUS_NOT_DIR = 3,
     FS_STATUS_END_OF_DIR = 10,
     FS_OBJECT_NONE = 0,
     FS_OBJECT_MOUNT = 1,
@@ -112,6 +117,7 @@ enum {
     LINUX_SYS_FCNTL = 72,
     LINUX_SYS_GETCWD = 79,
     LINUX_SYS_CHDIR = 80,
+    LINUX_SYS_UNLINK = 87,
     LINUX_SYS_READLINK = 89,
     LINUX_SYS_UMASK = 95,
     LINUX_SYS_GETUID = 102,
@@ -130,6 +136,7 @@ enum {
     LINUX_SYS_EXIT_GROUP = 231,
     LINUX_SYS_OPENAT = 257,
     LINUX_SYS_NEWFSTATAT = 262,
+    LINUX_SYS_UNLINKAT = 263,
     LINUX_SYS_SET_ROBUST_LIST = 273,
     LINUX_SYS_DUP3 = 292,
     LINUX_SYS_PIPE2 = 293,
@@ -142,9 +149,13 @@ enum {
     O_ACCMODE = 00000003,
     O_RDONLY = 0,
     O_WRONLY = 1,
+    O_RDWR = 2,
     O_NONBLOCK = 00004000,
+    O_CREAT = 00000100,
+    O_TRUNC = 00001000,
     O_CLOEXEC = 02000000,
     O_DIRECTORY = 00200000,
+    FS_CREATE_FLAG_TRUNCATE = 1 << 1,
     WNOHANG = 1,
     SIGCHLD = 17,
     F_DUPFD = 0,
@@ -295,6 +306,7 @@ static struct vfs_client g_vfs;
 static struct linux_process_state g_processes[LINUX_PROCESS_MAX];
 static struct linux_process_state *g_proc = 0;
 static struct pipe_entry g_pipes[PIPE_MAX];
+static u8 g_request_page_mapped[LINUX_ABI_REQUEST_PAGE_COUNT];
 static int execve_scratch_ready = 0;
 static u64 g_exec_loader_vm_token = 0;
 static u64 g_standard_interpreter_vm_token = 0;

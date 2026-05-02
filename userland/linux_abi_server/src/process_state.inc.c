@@ -30,6 +30,7 @@ static void pipe_ref_fd(const struct fd_entry *fd) {
     if (fd->kind == FD_PIPE_WRITE) g_pipes[fd->pipe_id].write_refs++;
 }
 
+static int pipe_has_live_writer(u8 pipe_id);
 static void try_satisfy_pending_pipe_read(u8 pipe_id);
 
 static void close_pipe_fd(u64 fd) {
@@ -46,7 +47,7 @@ static void try_satisfy_pending_pipe_read(u8 pipe_id) {
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return;
     struct pipe_entry *pipe = &g_pipes[pipe_id];
     if (!pipe->pending_read) return;
-    if (pipe->len == 0 && pipe->write_refs != 0) return;
+    if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) return;
     const u64 principal = pipe->pending_principal;
     const u64 dst = pipe->pending_dst;
     const u64 want = pipe->pending_len;
@@ -124,3 +125,15 @@ static u64 pipe_write_from_target(u64 fd, u64 src, u64 len, int *fault) {
 }
 static int alloc_fd(void) { for (int i = 3; i < 32; i++) if (g_fds[i].kind == FD_UNUSED) return i; return -1; }
 static int fd_valid(u64 fd) { return g_proc != 0 && fd < 32 && g_fds[fd].kind != FD_UNUSED; }
+
+static int pipe_has_live_writer(u8 pipe_id) {
+    if (pipe_id >= PIPE_MAX) return 0;
+    for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
+        struct linux_process_state *proc = &g_processes[p];
+        if (!proc->used) continue;
+        for (u64 fd = 0; fd < 32; fd++) {
+            if (proc->fds[fd].kind == FD_PIPE_WRITE && proc->fds[fd].pipe_id == pipe_id) return 1;
+        }
+    }
+    return 0;
+}
