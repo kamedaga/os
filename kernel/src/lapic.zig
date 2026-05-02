@@ -4,10 +4,19 @@ const x2apic_enable_bit: u64 = 1 << 10;
 const apic_base_mask: u64 = 0xFFFF_F000;
 
 const lapic_reg_eoi: u32 = 0x0B0;
+const lapic_reg_id: u32 = 0x020;
 const lapic_reg_svr: u32 = 0x0F0;
+const lapic_reg_icr_low: u32 = 0x300;
+const lapic_reg_icr_high: u32 = 0x310;
 const lapic_reg_lvt_timer: u32 = 0x320;
 const lapic_reg_initial_count: u32 = 0x380;
 const lapic_reg_divide_config: u32 = 0x3E0;
+
+const icr_delivery_status: u32 = 1 << 12;
+const icr_level_assert: u32 = 1 << 14;
+const icr_trigger_level: u32 = 1 << 15;
+const icr_delivery_init: u32 = 0x5 << 8;
+const icr_delivery_startup: u32 = 0x6 << 8;
 
 var lapic_base_pa: u64 = 0;
 
@@ -51,6 +60,20 @@ fn mmioWrite(offset: u32, value: u32) void {
     reg.* = value;
 }
 
+fn waitIcrIdle() void {
+    var spins: u32 = 0;
+    while ((mmioRead(lapic_reg_icr_low) & icr_delivery_status) != 0 and spins < 1000000) : (spins += 1) {
+        asm volatile ("pause");
+    }
+}
+
+fn delayIpi() void {
+    var spins: u32 = 0;
+    while (spins < 200000) : (spins += 1) {
+        asm volatile ("pause");
+    }
+}
+
 pub fn maskLegacyPic() void {
     // Mask all legacy PIC IRQ lines to avoid stray IRQ while using LAPIC timer.
     outb(0x21, 0xFF);
@@ -76,6 +99,42 @@ pub fn initTimer(timer_vector: u8, initial_count: u32) bool {
     mmioWrite(lapic_reg_lvt_timer, (@as(u32, timer_vector) & 0xFF) | (1 << 17)); // periodic mode
     mmioWrite(lapic_reg_initial_count, initial_count);
     mmioWrite(lapic_reg_eoi, 0);
+    return true;
+}
+
+pub fn enableLocalApic() bool {
+    var apic_base = rdmsr(ia32_apic_base_msr);
+    if ((apic_base & x2apic_enable_bit) != 0) return false;
+    if ((apic_base & apic_enable_bit) == 0) {
+        apic_base |= apic_enable_bit;
+        wrmsr(ia32_apic_base_msr, apic_base);
+        apic_base = rdmsr(ia32_apic_base_msr);
+    }
+    lapic_base_pa = apic_base & apic_base_mask;
+    if (lapic_base_pa == 0) return false;
+    mmioWrite(lapic_reg_svr, 0x100 | 0xFF);
+    return true;
+}
+
+pub fn localApicId() u8 {
+    if (lapic_base_pa == 0 and !enableLocalApic()) return 0;
+    return @truncate(mmioRead(lapic_reg_id) >> 24);
+}
+
+pub fn sendInitSipi(apic_id: u8, startup_vector: u8) bool {
+    if (lapic_base_pa == 0 and !enableLocalApic()) return false;
+    waitIcrIdle();
+    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
+    mmioWrite(lapic_reg_icr_low, icr_delivery_init | icr_level_assert | icr_trigger_level);
+    waitIcrIdle();
+    delayIpi();
+    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
+    mmioWrite(lapic_reg_icr_low, icr_delivery_startup | @as(u32, startup_vector));
+    waitIcrIdle();
+    delayIpi();
+    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
+    mmioWrite(lapic_reg_icr_low, icr_delivery_startup | @as(u32, startup_vector));
+    waitIcrIdle();
     return true;
 }
 

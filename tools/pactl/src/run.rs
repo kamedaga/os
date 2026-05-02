@@ -217,6 +217,7 @@ fn build_wsl_script(
     let mut qemu_parts = vec![
         "qemu-system-x86_64".to_string(),
         "-machine q35".to_string(),
+        "-smp 4".to_string(),
         "-m 512M".to_string(),
         "-monitor none".to_string(),
         format!("-d {QEMU_DEBUG_FLAGS}"),

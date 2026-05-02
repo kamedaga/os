@@ -11,9 +11,11 @@ const syscalls = @import("../syscalls.zig");
 const traps = @import("../traps.zig");
 const interrupts = @import("../interrupts.zig");
 const lapic = @import("../lapic.zig");
+const smp = @import("../smp.zig");
 const serial = @import("../serial.zig");
 const kernel_log = @import("../kernel_log.zig");
 const page_fault_log = @import("../page_fault_log.zig");
+const user_programs = @import("../user_programs.zig");
 const user_copy = @import("../user_copy.zig");
 const virtio_probe = @import("../virtio_probe.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
@@ -595,10 +597,16 @@ fn runBootServicesPhase() BootResources {
     const disk_bootfs_image = uefi_services.loadBootDiskFile(bs, boot_images.bootfs_image) orelse {
         halt.haltWithMessage("disk bootfs image load failed");
     };
+    var smp_info = smp.prepareBootInfo(bs);
 
     const memory_stats = uefi_services.collectBootMemoryStatsOrHalt(bs, &global_free_list, user_spaces);
     uefi_services.exitBootServicesOrHalt();
     initKernelRuntimeOrHalt();
+    scheduler.installCpuIdleObserver();
+    smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
+    smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
+    scheduler.refreshCpuTopology();
+    logSchedulerCpuTopology();
 
     return .{
         .framebuffer_info = framebuffer_info,
@@ -606,6 +614,48 @@ fn runBootServicesPhase() BootResources {
         .disk_bootfs_image = disk_bootfs_image,
         .memory_stats = memory_stats,
     };
+}
+
+fn logSchedulerCpuTopology() void {
+    var cpu_slot: usize = 0;
+    while (cpu_slot < scheduler.cpuCount()) : (cpu_slot += 1) {
+        const info = scheduler.schedulerCpuInfo(cpu_slot) orelse continue;
+        serial.writeRaw("SCHED CPU cpu=");
+        serial.printNumber(cpu_slot);
+        serial.writeRaw(" smp_state=");
+        serial.printNumber(@intFromEnum(info.smp_state));
+        serial.writeRaw(" current=");
+        serial.printNumber(info.current_thread);
+        serial.writeRaw(" idle_thread=");
+        serial.printNumber(info.idle_thread);
+        serial.writeRaw(" runnable=");
+        serial.printNumber(info.runnable_count);
+        serial.writeRaw(" enabled=");
+        serial.printNumber(if (info.enabled) @as(u64, 1) else @as(u64, 0));
+        serial.writeRaw(" accepts=");
+        serial.printNumber(if (info.accepts_runnable) @as(u64, 1) else @as(u64, 0));
+        serial.writeRaw(" accepts_req=");
+        serial.printNumber(if (info.runnable_acceptance_requested) @as(u64, 1) else @as(u64, 0));
+        serial.writeRaw(" idle=");
+        serial.printNumber(if (info.is_idle) @as(u64, 1) else @as(u64, 0));
+        serial.writeRaw(" obs=");
+        serial.printNumber(info.observer_ticks);
+        serial.writeRaw(" obs_run=");
+        serial.printNumber(info.observed_runnable_ticks);
+        serial.writeRaw(" handoff=");
+        serial.printNumber(info.handoff_ticks);
+        serial.writeRaw(" valid=");
+        serial.printNumber(info.handoff_validation_ticks);
+        serial.writeRaw(" consumed=");
+        serial.printNumber(info.handoff_consume_ticks);
+        serial.writeRaw(" snapshot=");
+        serial.printNumber(info.handoff_snapshot_ticks);
+        serial.writeRaw(" user_entry=");
+        serial.printNumber(info.handoff_user_entry_ticks);
+        serial.writeRaw(" ap_timer=");
+        serial.printNumber(info.ap_timer_save_ticks);
+        serial.writeRaw("\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -744,9 +794,472 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         init_ctx.frame.rip = loaded_init.entry;
         init_ctx.frame.rsp = boot_static.user_entry_rsp;
     }
+    runSchedulerApObserverProbe(init_thread);
+    runSchedulerApUserEntryProbe(state);
 
     state.pte_sync_hook = capability.syncPageTableRightsForPrincipalPaddr;
     kernel_state_ready = true;
+}
+
+const SchedulerApUserThread = struct {
+    principal: kernel.PrincipalId,
+    thread_index: usize,
+};
+
+fn createSchedulerApUserEntryThread(state: *kernel.KernelState) ?SchedulerApUserThread {
+    if (!scheduler.schedulerApQueueExperimentEnabled()) return null;
+    const created = process_factory.tryCreateDynamicUserProcess(state, "apidle", &global_free_list, user_spaces) catch |err| {
+        serial.writeRaw("SCHED APUSER create failed err=");
+        serial.writeRaw(@errorName(err));
+        serial.writeRaw("\n");
+        return null;
+    };
+    user_programs.installIdleTaskCode(created.process.user_page.paddr);
+    const ctx = scheduler.getThreadContext(created.process.thread_slot) orelse return null;
+    ctx.frame.rip = boot_static.user_va;
+    ctx.frame.rsp = boot_static.user_entry_rsp;
+    return .{
+        .principal = created.principal,
+        .thread_index = created.process.thread_slot,
+    };
+}
+
+const SchedulerApUserProbe = struct {
+    active: bool = false,
+    cpu_slot: usize = 0,
+    principal: ?kernel.PrincipalId = null,
+    next_principal: ?kernel.PrincipalId = null,
+    thread_index: usize = scheduler.idle_thread_marker,
+    next_thread_index: usize = scheduler.idle_thread_marker,
+    before_entry_ticks: u64 = 0,
+    before_timer_ticks: u64 = 0,
+    before_requeue_ticks: u64 = 0,
+    before_preempt_ticks: u64 = 0,
+    enable_ok: bool = false,
+    cycle_ok: bool = false,
+    arm_ok: bool = false,
+    move_ok: bool = false,
+    move_next_ok: bool = false,
+    disable_ok: bool = false,
+    observed: bool = false,
+    consumed: bool = false,
+    snapshotted: bool = false,
+    preempted: bool = false,
+    entered: bool = false,
+    timer_saved: bool = false,
+    requeued: bool = false,
+    returned_idle: bool = false,
+    entered_thread: ?usize = null,
+    timer_saved_thread: ?usize = null,
+    timer_saved_rip: u64 = 0,
+    timer_saved_rsp: u64 = 0,
+    entry_count: u64 = 0,
+    timer_count: u64 = 0,
+    requeue_count: u64 = 0,
+    preempt_count: u64 = 0,
+    preempt_from_thread: ?usize = null,
+    preempt_to_thread: ?usize = null,
+    cpu_state: smp.CpuState = .absent,
+    target_current_thread: usize = scheduler.idle_thread_marker,
+    target_idle: bool = true,
+};
+
+fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
+    if (!scheduler.schedulerApQueueExperimentEnabled()) return;
+    if (scheduler.cpuCount() <= 1) {
+        serial.writeRaw("SCHED APUSER probe skipped no_ap\n");
+        return;
+    }
+
+    var probes = [_]SchedulerApUserProbe{.{}} ** smp.max_cpus;
+    var probe_count: usize = 0;
+    var cpu_slot: usize = 1;
+    while (cpu_slot < scheduler.cpuCount() and cpu_slot < probes.len) : (cpu_slot += 1) {
+        const info = scheduler.schedulerCpuInfo(cpu_slot) orelse continue;
+        if (!info.enabled or info.smp_state == .absent) continue;
+        const created = createSchedulerApUserEntryThread(state) orelse {
+            serial.writeRaw("SCHED APUSER probe skipped no_thread cpu=");
+            serial.printNumber(cpu_slot);
+            serial.writeRaw("\n");
+            continue;
+        };
+        const next_created = createSchedulerApUserEntryThread(state) orelse {
+            serial.writeRaw("SCHED APUSER probe skipped no_next_thread cpu=");
+            serial.printNumber(cpu_slot);
+            serial.writeRaw("\n");
+            teardownExitedProcess(created.principal);
+            continue;
+        };
+
+        var probe = SchedulerApUserProbe{
+            .active = true,
+            .cpu_slot = cpu_slot,
+            .principal = created.principal,
+            .next_principal = next_created.principal,
+            .thread_index = created.thread_index,
+            .next_thread_index = next_created.thread_index,
+            .before_entry_ticks = info.handoff_user_entry_ticks,
+            .before_timer_ticks = info.ap_timer_save_ticks,
+            .before_requeue_ticks = info.ap_timer_requeue_ticks,
+            .before_preempt_ticks = info.ap_preempt_switch_ticks,
+            .cpu_state = info.smp_state,
+            .target_current_thread = info.current_thread,
+            .target_idle = info.is_idle,
+        };
+        probe.enable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(cpu_slot, true);
+        probe.cycle_ok = probe.enable_ok and scheduler.setCpuUserEntryTargetCyclesForExperiment(cpu_slot, probe.before_timer_ticks +% 2);
+        probe.move_ok = probe.cycle_ok and scheduler.assignThreadToCpu(created.thread_index, cpu_slot);
+        probe.move_next_ok = probe.move_ok and scheduler.assignThreadToCpu(next_created.thread_index, cpu_slot);
+        probe.arm_ok = probe.move_next_ok and scheduler.setCpuUserEntryForExperiment(cpu_slot, true);
+        probes[probe_count] = probe;
+        probe_count += 1;
+    }
+
+    if (probe_count == 0) {
+        serial.writeRaw("SCHED APUSER probe skipped no_targets\n");
+        return;
+    }
+
+    var spins: usize = 0;
+    while (spins < 12_000_000) : (spins += 1) {
+        var all_done = true;
+        var index: usize = 0;
+        while (index < probe_count) : (index += 1) {
+            updateSchedulerApUserProbe(&probes[index]);
+            if (probes[index].arm_ok and !probes[index].returned_idle) all_done = false;
+        }
+        if (all_done) break;
+        asm volatile ("pause");
+    }
+
+    var ready_count: usize = 0;
+    var index: usize = 0;
+    while (index < probe_count) : (index += 1) {
+        probes[index].disable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(probes[index].cpu_slot, false);
+        if (probes[index].returned_idle) ready_count += 1;
+        logSchedulerApUserProbe(&probes[index]);
+        if (probes[index].next_principal) |principal| teardownExitedProcess(principal);
+        if (probes[index].principal) |principal| teardownExitedProcess(principal);
+    }
+    serial.writeRaw("SCHED APUSER all aps=");
+    serial.printNumber(probe_count);
+    serial.writeRaw(" ready=");
+    serial.printNumber(ready_count);
+    serial.writeRaw("\n");
+}
+
+fn updateSchedulerApUserProbe(probe: *SchedulerApUserProbe) void {
+    if (!probe.active or !probe.move_ok) return;
+    const info = scheduler.schedulerCpuInfo(probe.cpu_slot) orelse return;
+    probe.cpu_state = info.smp_state;
+    probe.target_current_thread = info.current_thread;
+    probe.target_idle = info.is_idle;
+    probe.entered_thread = info.entered_handoff_thread;
+    probe.timer_saved_thread = info.ap_timer_saved_thread;
+    probe.timer_saved_rip = info.ap_timer_saved_rip;
+    probe.timer_saved_rsp = info.ap_timer_saved_rsp;
+    probe.entry_count = info.handoff_user_entry_ticks -% probe.before_entry_ticks;
+    probe.timer_count = info.ap_timer_save_ticks -% probe.before_timer_ticks;
+    probe.requeue_count = info.ap_timer_requeue_ticks -% probe.before_requeue_ticks;
+    probe.preempt_count = info.ap_preempt_switch_ticks -% probe.before_preempt_ticks;
+    probe.preempt_from_thread = info.ap_preempt_from_thread;
+    probe.preempt_to_thread = info.ap_preempt_to_thread;
+    if (info.observed_next_thread == probe.thread_index or info.validated_handoff_thread == probe.thread_index or info.consumed_handoff_thread == probe.thread_index) {
+        probe.observed = true;
+    }
+    if (info.consumed_handoff_thread == probe.thread_index and info.current_thread == probe.thread_index and !info.is_idle) {
+        probe.consumed = true;
+    }
+    if (info.snapshot_handoff_thread == probe.thread_index and info.snapshot_cr3 != 0 and info.snapshot_rip != 0 and info.snapshot_rsp != 0) {
+        probe.snapshotted = true;
+    }
+    if (probe.preempt_count != 0 and info.ap_preempt_from_thread == probe.thread_index and info.ap_preempt_to_thread == probe.next_thread_index) {
+        probe.preempted = true;
+    }
+    if (probe.entry_count >= 2 and info.ap_timer_saved_thread == probe.next_thread_index) {
+        probe.entered = true;
+    }
+    if (probe.timer_count >= 2 and info.ap_timer_saved_thread == probe.next_thread_index and info.ap_timer_saved_rip != 0 and info.ap_timer_saved_rsp != 0) {
+        probe.timer_saved = true;
+    }
+    if (probe.requeue_count != 0 and probe.entry_count >= 2) {
+        probe.requeued = true;
+    }
+    if (probe.timer_saved and info.smp_state == .idle and info.current_thread == scheduler.idle_thread_marker and info.is_idle) {
+        probe.returned_idle = true;
+    }
+}
+
+fn logSchedulerApUserProbe(probe: *const SchedulerApUserProbe) void {
+    serial.writeRaw("SCHED APUSER probe cpu=");
+    serial.printNumber(probe.cpu_slot);
+    serial.writeRaw(" thread=");
+    serial.printNumber(probe.thread_index);
+    serial.writeRaw(" next_thread=");
+    serial.printNumber(probe.next_thread_index);
+    serial.writeRaw(" enable=");
+    serial.printNumber(if (probe.enable_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" cycle=");
+    serial.printNumber(if (probe.cycle_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" arm=");
+    serial.printNumber(if (probe.arm_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" move=");
+    serial.printNumber(if (probe.move_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" move_next=");
+    serial.printNumber(if (probe.move_next_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" observed=");
+    serial.printNumber(if (probe.observed) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" consumed=");
+    serial.printNumber(if (probe.consumed) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" snapshot=");
+    serial.printNumber(if (probe.snapshotted) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" preempted=");
+    serial.printNumber(if (probe.preempted) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" entered=");
+    serial.printNumber(if (probe.entered) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" timer_saved=");
+    serial.printNumber(if (probe.timer_saved) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" requeued=");
+    serial.printNumber(if (probe.requeued) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" returned_idle=");
+    serial.printNumber(if (probe.returned_idle) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" entries=");
+    serial.printNumber(probe.entry_count);
+    serial.writeRaw(" timers=");
+    serial.printNumber(probe.timer_count);
+    serial.writeRaw(" requeues=");
+    serial.printNumber(probe.requeue_count);
+    serial.writeRaw(" preempts=");
+    serial.printNumber(probe.preempt_count);
+    serial.writeRaw(" preempt_from=");
+    if (probe.preempt_from_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" preempt_to=");
+    if (probe.preempt_to_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" entered_thread=");
+    if (probe.entered_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" smp_state=");
+    serial.printNumber(@intFromEnum(probe.cpu_state));
+    serial.writeRaw(" timer_thread=");
+    if (probe.timer_saved_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" timer_rip=");
+    serial.writeHexRaw(probe.timer_saved_rip);
+    serial.writeRaw(" timer_rsp=");
+    serial.writeHexRaw(probe.timer_saved_rsp);
+    serial.writeRaw(" target_current=");
+    serial.printNumber(probe.target_current_thread);
+    serial.writeRaw(" target_idle=");
+    serial.printNumber(if (probe.target_idle) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" disable=");
+    serial.printNumber(if (probe.disable_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw("\n");
+}
+
+fn runSchedulerApObserverProbe(thread_index: usize) void {
+    if (!scheduler.schedulerApQueueExperimentEnabled()) return;
+    if (scheduler.cpuCount() <= 1) {
+        serial.writeRaw("SCHED APHAND probe skipped no_ap\n");
+        return;
+    }
+
+    const target_cpu: usize = 1;
+    const original_cpu = scheduler.threadCpuSlot(thread_index) orelse 0;
+    const before_ticks = blk: {
+        const info = scheduler.schedulerCpuInfo(target_cpu) orelse break :blk 0;
+        break :blk info.observed_runnable_ticks;
+    };
+    const before_handoff_ticks = blk: {
+        const info = scheduler.schedulerCpuInfo(target_cpu) orelse break :blk 0;
+        break :blk info.handoff_ticks;
+    };
+    const before_validation_ticks = blk: {
+        const info = scheduler.schedulerCpuInfo(target_cpu) orelse break :blk 0;
+        break :blk info.handoff_validation_ticks;
+    };
+    const before_consume_ticks = blk: {
+        const info = scheduler.schedulerCpuInfo(target_cpu) orelse break :blk 0;
+        break :blk info.handoff_consume_ticks;
+    };
+    const before_snapshot_ticks = blk: {
+        const info = scheduler.schedulerCpuInfo(target_cpu) orelse break :blk 0;
+        break :blk info.handoff_snapshot_ticks;
+    };
+
+    const enable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(target_cpu, true);
+    const move_ok = enable_ok and scheduler.assignThreadToCpu(thread_index, target_cpu);
+
+    var observed = false;
+    var handed_off = false;
+    var validated = false;
+    var consumed = false;
+    var snapshotted = false;
+    var observed_next: ?usize = null;
+    var observed_count: usize = 0;
+    var handoff_thread: ?usize = null;
+    var handoff_count: usize = 0;
+    var validated_thread: ?usize = null;
+    var validation_code: u8 = scheduler.handoff_validation_none;
+    var consumed_thread: ?usize = null;
+    var snapshot_thread: ?usize = null;
+    var snapshot_cr3: u64 = 0;
+    var snapshot_fs_base: u64 = 0;
+    var snapshot_rip: u64 = 0;
+    var snapshot_rsp: u64 = 0;
+    var snapshot_rflags: u64 = 0;
+    var snapshot_cs: u64 = 0;
+    var snapshot_ss: u64 = 0;
+    var target_current_thread: usize = scheduler.idle_thread_marker;
+    var target_idle = true;
+    if (move_ok) {
+        var spins: usize = 0;
+        while (spins < 5_000_000) : (spins += 1) {
+            if (scheduler.schedulerCpuInfo(target_cpu)) |info| {
+                observed_next = info.observed_next_thread;
+                observed_count = info.observed_runnable_count;
+                handoff_thread = info.pending_handoff_thread;
+                handoff_count = info.handoff_runnable_count;
+                validated_thread = info.validated_handoff_thread;
+                validation_code = info.handoff_validation_code;
+                consumed_thread = info.consumed_handoff_thread;
+                snapshot_thread = info.snapshot_handoff_thread;
+                snapshot_cr3 = info.snapshot_cr3;
+                snapshot_fs_base = info.snapshot_fs_base;
+                snapshot_rip = info.snapshot_rip;
+                snapshot_rsp = info.snapshot_rsp;
+                snapshot_rflags = info.snapshot_rflags;
+                snapshot_cs = info.snapshot_cs;
+                snapshot_ss = info.snapshot_ss;
+                target_current_thread = info.current_thread;
+                target_idle = info.is_idle;
+                if (info.observed_runnable_ticks != before_ticks and
+                    (info.observed_next_thread == thread_index or info.validated_handoff_thread == thread_index or info.consumed_handoff_thread == thread_index))
+                {
+                    observed = true;
+                }
+                if (info.handoff_ticks != before_handoff_ticks and
+                    (info.pending_handoff_thread == thread_index or info.validated_handoff_thread == thread_index or info.consumed_handoff_thread == thread_index))
+                {
+                    handed_off = true;
+                }
+                if (info.handoff_validation_ticks != before_validation_ticks and info.validated_handoff_thread == thread_index and info.handoff_validation_code == scheduler.handoff_validation_ok) {
+                    validated = true;
+                }
+                if (info.handoff_consume_ticks != before_consume_ticks and info.consumed_handoff_thread == thread_index and info.current_thread == thread_index and !info.is_idle) {
+                    consumed = true;
+                }
+                if (info.handoff_snapshot_ticks != before_snapshot_ticks and
+                    info.snapshot_handoff_thread == thread_index and
+                    info.snapshot_cr3 != 0 and
+                    info.snapshot_rip != 0 and
+                    info.snapshot_rsp != 0)
+                {
+                    snapshotted = true;
+                }
+                if (observed and handed_off and validated and consumed and snapshotted) {
+                    break;
+                }
+            }
+            asm volatile ("pause");
+        }
+    }
+
+    const restore_ok = scheduler.assignThreadToCpu(thread_index, original_cpu);
+    const disable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(target_cpu, false);
+
+    serial.writeRaw("SCHED APHAND probe cpu=");
+    serial.printNumber(target_cpu);
+    serial.writeRaw(" thread=");
+    serial.printNumber(thread_index);
+    serial.writeRaw(" enable=");
+    serial.printNumber(if (enable_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" move=");
+    serial.printNumber(if (move_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" observed=");
+    serial.printNumber(if (observed) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" handoff=");
+    serial.printNumber(if (handed_off) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" valid=");
+    serial.printNumber(if (validated) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" consumed=");
+    serial.printNumber(if (consumed) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" snapshot=");
+    serial.printNumber(if (snapshotted) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" next=");
+    if (observed_next) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" runnable=");
+    serial.printNumber(observed_count);
+    serial.writeRaw(" hand_thread=");
+    if (handoff_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" hand_runnable=");
+    serial.printNumber(handoff_count);
+    serial.writeRaw(" valid_thread=");
+    if (validated_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" valid_code=");
+    serial.printNumber(validation_code);
+    serial.writeRaw(" consumed_thread=");
+    if (consumed_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" snap_thread=");
+    if (snapshot_thread) |thread| {
+        serial.printNumber(thread);
+    } else {
+        serial.writeRaw("none");
+    }
+    serial.writeRaw(" snap_cr3=");
+    serial.writeHexRaw(snapshot_cr3);
+    serial.writeRaw(" snap_fs=");
+    serial.writeHexRaw(snapshot_fs_base);
+    serial.writeRaw(" snap_rip=");
+    serial.writeHexRaw(snapshot_rip);
+    serial.writeRaw(" snap_rsp=");
+    serial.writeHexRaw(snapshot_rsp);
+    serial.writeRaw(" snap_rflags=");
+    serial.writeHexRaw(snapshot_rflags);
+    serial.writeRaw(" snap_cs=");
+    serial.writeHexRaw(snapshot_cs);
+    serial.writeRaw(" snap_ss=");
+    serial.writeHexRaw(snapshot_ss);
+    serial.writeRaw(" target_current=");
+    serial.printNumber(target_current_thread);
+    serial.writeRaw(" target_idle=");
+    serial.printNumber(if (target_idle) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" restore=");
+    serial.printNumber(if (restore_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" disable=");
+    serial.printNumber(if (disable_ok) @as(u64, 1) else @as(u64, 0));
+    serial.writeRaw(" cpu=");
+    serial.printNumber(scheduler.threadCpuSlot(thread_index) orelse scheduler.idle_thread_marker);
+    serial.writeRaw("\n");
 }
 
 // ---------------------------------------------------------------------------

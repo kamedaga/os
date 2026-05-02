@@ -41,11 +41,21 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const scheduler_ap_queue_experiment = b.option(
+        bool,
+        "scheduler-ap-queue-experiment",
+        "Allow non-BSP scheduler run queues to accept runnable threads for scheduler experiments",
+    ) orelse false;
+    const build_workarounds = b.addOptions();
+    build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
+    build_workarounds.addOption(bool, "scheduler_ap_queue_experiment", scheduler_ap_queue_experiment);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/kernel.zig"),
         .target = target,
         .optimize = optimize,
     });
+    test_mod.addOptions("build_workarounds", build_workarounds);
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
     });
@@ -73,8 +83,6 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .code_model = .small,
     });
-    const build_workarounds = b.addOptions();
-    build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
     efi_mod.addOptions("build_workarounds", build_workarounds);
     efi_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     const efi_app = b.addExecutable(.{

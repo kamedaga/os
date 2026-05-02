@@ -1,6 +1,7 @@
 const std = @import("std");
 const interrupts = @import("../../interrupts.zig");
 
+pub const max_cpus: usize = 4;
 pub const page_entries: usize = 512;
 pub const two_mib: u64 = 2 * 1024 * 1024;
 pub const four_gib: u64 = 4 * 1024 * 1024 * 1024;
@@ -15,6 +16,8 @@ pub const stack_region_raw_bytes: usize = stack_region_bytes + @as(usize, @intCa
 pub const stack_region_chunk_count: usize = stack_region_bytes / @as(usize, @intCast(two_mib));
 pub const ring0_stack_bytes: usize = stack_region_bytes - (2 * guard_page_bytes);
 pub const ist_stack_bytes: usize = 2 * 1024 * 1024;
+const ap_ring0_stack_bytes: usize = 64 * 1024;
+const ap_ist_stack_bytes: usize = 64 * 1024;
 pub const phys_copy_window_va: u64 = (@as(u64, @intCast(high_mmio_pml4_index)) << 39);
 
 pub const gdt_kernel_code_selector: u16 = 0x08;
@@ -74,7 +77,7 @@ var high_mmio_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entri
 var high_mmio_pd_tables: [high_mmio_pdp_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_mmio_pdp_table_count;
 pub var phys_copy_window_pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
-var gdt: [9]u64 align(16) = .{
+const gdt_template: [9]u64 = .{
     0x0000000000000000,
     0x00AF9A000000FFFF,
     0x00AF92000000FFFF,
@@ -85,13 +88,17 @@ var gdt: [9]u64 align(16) = .{
     0x00CFF2000000FFFF,
     0x00AFFA000000FFFF,
 };
+var gdt_tables: [max_cpus][9]u64 align(16) = [_][9]u64{gdt_template} ** max_cpus;
 var ring0_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var pf_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var df_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
+var ap_ring0_stacks: [max_cpus - 1][ap_ring0_stack_bytes]u8 align(16) = [_][ap_ring0_stack_bytes]u8{[_]u8{0} ** ap_ring0_stack_bytes} ** (max_cpus - 1);
+var ap_pf_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(16) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
+var ap_df_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(16) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
 var ring0_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var pf_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var df_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
-var tss: Tss = std.mem.zeroes(Tss);
+var tss_tables: [max_cpus]Tss = [_]Tss{std.mem.zeroes(Tss)} ** max_cpus;
 var int80_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var pf_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var gp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
@@ -123,6 +130,7 @@ const efer_sce: u64 = 1 << 0;
 const cr4_pge: u64 = 1 << 7;
 const cr4_pcide: u64 = 1 << 17;
 const cpuid_leaf1_ecx_pcid: u32 = 1 << 17;
+const page_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_no_flush: u64 = 1 << 63;
 
@@ -337,6 +345,43 @@ fn alignedStackRegion(raw: []u8) []u8 {
     return raw[start .. start + stack_region_bytes];
 }
 
+pub fn cpuKernelStackTop(cpu_slot: usize) ?u64 {
+    if (cpu_slot == 0) return stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes);
+    if (cpu_slot >= max_cpus) return null;
+    const stack = &ap_ring0_stacks[cpu_slot - 1];
+    return (@intFromPtr(stack) + ap_ring0_stack_bytes) & ~@as(u64, 0xF);
+}
+
+pub fn cpuSlotForStackPointer(rsp: u64) ?usize {
+    const bsp_region = alignedStackRegion(ring0_stack_region_raw[0..]);
+    const bsp_base = @intFromPtr(bsp_region.ptr) + guard_page_bytes;
+    const bsp_end = bsp_base + ring0_stack_bytes;
+    if (rsp >= bsp_base and rsp <= bsp_end) return 0;
+
+    var cpu_slot: usize = 1;
+    while (cpu_slot < max_cpus) : (cpu_slot += 1) {
+        const stack = &ap_ring0_stacks[cpu_slot - 1];
+        const base = @intFromPtr(stack);
+        const end = base + ap_ring0_stack_bytes;
+        if (rsp >= base and rsp <= end) return cpu_slot;
+    }
+    return null;
+}
+
+fn cpuPageFaultIstTop(cpu_slot: usize) ?u64 {
+    if (cpu_slot == 0) return stackTop(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes);
+    if (cpu_slot >= max_cpus) return null;
+    const stack = &ap_pf_ist_stacks[cpu_slot - 1];
+    return (@intFromPtr(stack) + ap_ist_stack_bytes) & ~@as(u64, 0xF);
+}
+
+fn cpuDoubleFaultIstTop(cpu_slot: usize) ?u64 {
+    if (cpu_slot == 0) return stackTop(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes);
+    if (cpu_slot >= max_cpus) return null;
+    const stack = &ap_df_ist_stacks[cpu_slot - 1];
+    return (@intFromPtr(stack) + ap_ist_stack_bytes) & ~@as(u64, 0xF);
+}
+
 fn installGuardedIdentityStackRegion(region: []u8, usable_bytes: usize, pt_tables: *[stack_region_chunk_count][page_entries]u64) bool {
     if (region.len != stack_region_bytes) return false;
     if (usable_bytes == 0) return false;
@@ -369,6 +414,42 @@ fn installGuardedIdentityStackRegion(region: []u8, usable_bytes: usize, pt_table
         if (pt_pa >= four_gib) return false;
         pd_tables[pdp_index][pd_index + chunk_index] = pt_pa | page_present | page_rw;
     }
+    return true;
+}
+
+fn mapKernelIdentityPage(page_base: u64) bool {
+    if ((page_base & 0xFFF) != 0) return false;
+    const pml4_index: usize = @intCast((page_base >> 39) & 0x1FF);
+    const pdp_index: usize = @intCast((page_base >> 30) & 0x1FF);
+    const pd_index: usize = @intCast((page_base >> 21) & 0x1FF);
+    const pt_index: usize = @intCast((page_base >> 12) & 0x1FF);
+    if (pml4_index != 0 or pdp_index >= pd_table_count) return false;
+
+    const pd_entry = &pd_tables[pdp_index][pd_index];
+    if ((pd_entry.* & page_present) == 0) return false;
+    if ((pd_entry.* & page_ps) != 0) return true;
+
+    const pt: *[page_entries]u64 = @ptrFromInt(pd_entry.* & page_addr_mask);
+    pt[pt_index] = page_base | page_present | page_rw;
+    return true;
+}
+
+fn mapKernelIdentityRange(base: u64, bytes: usize) bool {
+    if (bytes == 0) return true;
+    var page = base & ~@as(u64, 0xFFF);
+    const end = (base + @as(u64, @intCast(bytes)) + 0xFFF) & ~@as(u64, 0xFFF);
+    while (page < end) : (page += 4096) {
+        if (!mapKernelIdentityPage(page)) return false;
+    }
+    return true;
+}
+
+fn mapPerCpuKernelStorage() bool {
+    if (!mapKernelIdentityRange(@intFromPtr(&gdt_tables), @sizeOf(@TypeOf(gdt_tables)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&tss_tables), @sizeOf(@TypeOf(tss_tables)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_ring0_stacks), @sizeOf(@TypeOf(ap_ring0_stacks)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_pf_ist_stacks), @sizeOf(@TypeOf(ap_pf_ist_stacks)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_df_ist_stacks), @sizeOf(@TypeOf(ap_df_ist_stacks)))) return false;
     return true;
 }
 
@@ -428,6 +509,7 @@ pub fn installIdentityPageTables0To1GiB() bool {
     if (!installGuardedIdentityStackRegion(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes, &ring0_stack_guard_pt)) return false;
     if (!installGuardedIdentityStackRegion(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes, &pf_ist_stack_guard_pt)) return false;
     if (!installGuardedIdentityStackRegion(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes, &df_ist_stack_guard_pt)) return false;
+    if (!mapPerCpuKernelStorage()) return false;
 
     writeCr3(pml4_pa);
     kernel_cr3_value = pml4_pa;
@@ -463,25 +545,36 @@ pub fn seedUserPdWithKernelIdentity(pd: []u64) void {
     }
 }
 
-pub fn loadGdtAndReloadSegments() void {
-    const tss_base = @intFromPtr(&tss);
-    const tss_limit: u64 = @sizeOf(Tss) - 1;
-    tss.rsp0 = stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes);
-    kernel_syscall_stack_top = tss.rsp0;
-    tss.ist1 = stackTop(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes);
-    tss.ist2 = stackTop(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes);
+fn installTssDescriptor(cpu_slot: usize) bool {
+    if (cpu_slot >= max_cpus) return false;
+    const rsp0 = cpuKernelStackTop(cpu_slot) orelse return false;
+    const ist1 = cpuPageFaultIstTop(cpu_slot) orelse return false;
+    const ist2 = cpuDoubleFaultIstTop(cpu_slot) orelse return false;
+    const tss = &tss_tables[cpu_slot];
+    tss.* = std.mem.zeroes(Tss);
+    tss.rsp0 = rsp0;
+    tss.ist1 = ist1;
+    tss.ist2 = ist2;
     tss.iomap_base = @sizeOf(Tss);
-    gdt[5] =
+
+    const tss_base = @intFromPtr(tss);
+    const tss_limit: u64 = @sizeOf(Tss) - 1;
+    gdt_tables[cpu_slot][5] =
         (tss_limit & 0xFFFF) |
         ((tss_base & 0x00FF_FFFF) << 16) |
         (@as(u64, 0x89) << 40) |
         (((tss_limit >> 16) & 0xF) << 48) |
         (((tss_base >> 24) & 0xFF) << 56);
-    gdt[6] = (tss_base >> 32) & 0xFFFF_FFFF;
+    gdt_tables[cpu_slot][6] = (tss_base >> 32) & 0xFFFF_FFFF;
+    return true;
+}
+
+fn loadGdtAndReloadSegmentsForCpuInternal(cpu_slot: usize) bool {
+    if (!installTssDescriptor(cpu_slot)) return false;
 
     const gdt_ptr = GdtPtr{
-        .limit = @as(u16, @intCast(@sizeOf(@TypeOf(gdt)) - 1)),
-        .base = @intFromPtr(&gdt),
+        .limit = @as(u16, @intCast(@sizeOf(@TypeOf(gdt_tables[0])) - 1)),
+        .base = @intFromPtr(&gdt_tables[cpu_slot]),
     };
     asm volatile ("lgdt (%[ptr])"
         :
@@ -507,20 +600,34 @@ pub fn loadGdtAndReloadSegments() void {
         :
         : [tss_sel] "i" (gdt_tss_selector),
         : .{ .memory = true });
+    return true;
+}
+
+pub fn loadGdtAndReloadSegmentsForCpu(cpu_slot: usize) bool {
+    return loadGdtAndReloadSegmentsForCpuInternal(cpu_slot);
+}
+
+pub fn loadGdtAndReloadSegments() void {
+    if (!loadGdtAndReloadSegmentsForCpu(0)) unreachable;
+    kernel_syscall_stack_top = tss_tables[0].rsp0;
+}
+
+pub fn loadInterruptTableForCurrentCpu() void {
+    interrupts.loadIdt(&idt);
 }
 
 pub fn ring0StackTop() u64 {
-    return stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes);
+    return cpuKernelStackTop(0) orelse unreachable;
 }
 
 pub fn userCodeDescriptor() u64 {
-    return gdt[3];
+    return gdt_tables[0][3];
 }
 
 pub fn userDataDescriptor() u64 {
-    return gdt[4];
+    return gdt_tables[0][4];
 }
 
 pub fn gdtBase() u64 {
-    return @intFromPtr(&gdt);
+    return @intFromPtr(&gdt_tables[0]);
 }

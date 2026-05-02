@@ -1,16 +1,33 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 const interrupts = @import("interrupts.zig");
+const smp = @import("smp.zig");
+const build_workarounds = @import("build_workarounds");
+const scheduler_observer = @import("scheduler_observer.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const UserAddressSpace = capability.UserAddressSpace;
 const default_process_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
+const bootstrap_cpu_slot: usize = 0;
+const all_cpu_affinity_mask: u64 = if (smp.max_cpus >= 64) std.math.maxInt(u64) else (@as(u64, 1) << smp.max_cpus) - 1;
 
 const fx_state_bytes: usize = 512;
 pub const max_thread_slots: usize = kernel.max_thread_slots;
 pub const max_ipc_queue_depth: usize = 8;
+pub const idle_thread_marker: usize = max_thread_slots;
+pub const handoff_validation_none: u8 = 0;
+pub const handoff_validation_ok: u8 = 1;
+pub const handoff_validation_bad_thread: u8 = 2;
+pub const handoff_validation_not_allocated: u8 = 3;
+pub const handoff_validation_not_ready: u8 = 4;
+pub const handoff_validation_wrong_cpu: u8 = 5;
+pub const handoff_validation_bad_affinity: u8 = 6;
+pub const handoff_validation_bad_owner: u8 = 7;
+pub const handoff_validation_bad_cr3: u8 = 8;
+pub const handoff_validation_bad_frame: u8 = 9;
 
 pub const IpcQueuedMessage = struct {
     endpoint_id: u64 = 0,
@@ -28,10 +45,206 @@ const IpcQueue = struct {
     len: u8 = 0,
 };
 
+fn schedulerLocksMaskInterrupts() bool {
+    return !builtin.is_test;
+}
+
+fn interruptsEnabled() bool {
+    if (!schedulerLocksMaskInterrupts()) return false;
+    var flags: u64 = 0;
+    asm volatile ("pushfq; pop %[out]"
+        : [out] "=r" (flags),
+    );
+    return (flags & (@as(u64, 1) << 9)) != 0;
+}
+
+fn disableInterruptsForSchedulerLock() void {
+    if (!schedulerLocksMaskInterrupts()) return;
+    asm volatile ("cli" ::: .{ .memory = true });
+}
+
+fn enableInterruptsForSchedulerLock() void {
+    if (!schedulerLocksMaskInterrupts()) return;
+    asm volatile ("sti" ::: .{ .memory = true });
+}
+
+const SchedulerSpinLock = struct {
+    value: u8 = 0,
+    interrupts_were_enabled: bool = false,
+
+    fn lock(self: *SchedulerSpinLock) void {
+        const restore_interrupts = interruptsEnabled();
+        disableInterruptsForSchedulerLock();
+        while (true) {
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
+                self.interrupts_were_enabled = restore_interrupts;
+                return;
+            }
+            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
+                asm volatile ("pause");
+            }
+        }
+    }
+
+    fn unlock(self: *SchedulerSpinLock) void {
+        const restore_interrupts = self.interrupts_were_enabled;
+        @atomicStore(u8, &self.value, 0, .release);
+        if (restore_interrupts) enableInterruptsForSchedulerLock();
+    }
+};
+
+const RunQueue = struct {
+    runnable: [max_thread_slots]bool = [_]bool{false} ** max_thread_slots,
+    len: usize = 0,
+
+    fn markRunnable(self: *RunQueue, thread_index: usize) void {
+        if (thread_index >= max_thread_slots) return;
+        if (!self.runnable[thread_index]) {
+            self.runnable[thread_index] = true;
+            self.len += 1;
+        }
+    }
+
+    fn markBlocked(self: *RunQueue, thread_index: usize) void {
+        if (thread_index >= max_thread_slots) return;
+        if (self.runnable[thread_index]) {
+            self.runnable[thread_index] = false;
+            self.len -= 1;
+        }
+    }
+
+    fn contains(self: *const RunQueue, thread_index: usize) bool {
+        return thread_index < max_thread_slots and self.runnable[thread_index];
+    }
+
+    fn pickFirst(self: *const RunQueue) ?usize {
+        var i: usize = 0;
+        while (i < max_thread_slots) : (i += 1) {
+            if (self.contains(i)) return i;
+        }
+        return null;
+    }
+
+    fn pickNextAfter(self: *const RunQueue, current_index: usize) usize {
+        if (current_index >= max_thread_slots) return self.pickFirst() orelse 0;
+        var step: usize = 1;
+        while (step <= max_thread_slots) : (step += 1) {
+            const idx = (current_index + step) % max_thread_slots;
+            if (self.contains(idx)) return idx;
+        }
+        return current_index;
+    }
+};
+
+pub const CpuSchedulerInfo = struct {
+    slot: usize,
+    smp_state: smp.CpuState,
+    current_thread: usize,
+    current_principal: ?kernel.PrincipalId,
+    current_cr3: u64,
+    idle_thread: usize,
+    runnable_count: usize,
+    idle_ticks: u64,
+    observer_ticks: u64,
+    observed_runnable_ticks: u64,
+    observed_runnable_count: usize,
+    observed_next_thread: ?usize,
+    handoff_ticks: u64,
+    handoff_runnable_count: usize,
+    pending_handoff_thread: ?usize,
+    handoff_validation_ticks: u64,
+    handoff_validation_failures: u64,
+    validated_handoff_thread: ?usize,
+    handoff_validation_code: u8,
+    handoff_consume_ticks: u64,
+    consumed_handoff_thread: ?usize,
+    handoff_snapshot_ticks: u64,
+    handoff_snapshot_failures: u64,
+    snapshot_handoff_thread: ?usize,
+    snapshot_cr3: u64,
+    snapshot_fs_base: u64,
+    snapshot_rip: u64,
+    snapshot_rsp: u64,
+    snapshot_rflags: u64,
+    snapshot_cs: u64,
+    snapshot_ss: u64,
+    handoff_user_entry_ticks: u64,
+    handoff_user_entry_failures: u64,
+    entered_handoff_thread: ?usize,
+    user_entry_requested: bool,
+    ap_timer_save_ticks: u64,
+    ap_timer_saved_thread: ?usize,
+    ap_timer_saved_rip: u64,
+    ap_timer_saved_rsp: u64,
+    ap_timer_requeue_ticks: u64,
+    ap_preempt_switch_ticks: u64,
+    ap_preempt_from_thread: ?usize,
+    ap_preempt_to_thread: ?usize,
+    ap_user_entry_target_cycles: u64,
+    schedule_ticks: u64,
+    enabled: bool,
+    accepts_runnable: bool,
+    runnable_acceptance_requested: bool,
+    is_idle: bool,
+};
+
+const CpuSchedulerState = struct {
+    lock: SchedulerSpinLock = .{},
+    run_queue: RunQueue = .{},
+    current_thread: usize = idle_thread_marker,
+    current_principal: ?kernel.PrincipalId = null,
+    current_cr3: u64 = 0,
+    idle_thread: usize = idle_thread_marker,
+    idle_ticks: u64 = 0,
+    observer_ticks: u64 = 0,
+    observed_runnable_ticks: u64 = 0,
+    observed_runnable_count: usize = 0,
+    observed_next_thread: ?usize = null,
+    handoff_ticks: u64 = 0,
+    handoff_runnable_count: usize = 0,
+    pending_handoff_thread: ?usize = null,
+    handoff_validation_ticks: u64 = 0,
+    handoff_validation_failures: u64 = 0,
+    validated_handoff_thread: ?usize = null,
+    handoff_validation_code: u8 = handoff_validation_none,
+    handoff_consume_ticks: u64 = 0,
+    consumed_handoff_thread: ?usize = null,
+    handoff_snapshot_ticks: u64 = 0,
+    handoff_snapshot_failures: u64 = 0,
+    snapshot_handoff_thread: ?usize = null,
+    snapshot_cr3: u64 = 0,
+    snapshot_fs_base: u64 = 0,
+    snapshot_rip: u64 = 0,
+    snapshot_rsp: u64 = 0,
+    snapshot_rflags: u64 = 0,
+    snapshot_cs: u64 = 0,
+    snapshot_ss: u64 = 0,
+    handoff_user_entry_ticks: u64 = 0,
+    handoff_user_entry_failures: u64 = 0,
+    entered_handoff_thread: ?usize = null,
+    user_entry_requested: bool = false,
+    ap_timer_save_ticks: u64 = 0,
+    ap_timer_saved_thread: ?usize = null,
+    ap_timer_saved_rip: u64 = 0,
+    ap_timer_saved_rsp: u64 = 0,
+    ap_timer_requeue_ticks: u64 = 0,
+    ap_preempt_switch_ticks: u64 = 0,
+    ap_preempt_from_thread: ?usize = null,
+    ap_preempt_to_thread: ?usize = null,
+    ap_user_entry_target_cycles: u64 = 0,
+    schedule_ticks: u64 = 0,
+    enabled: bool = false,
+    accepts_runnable: bool = false,
+    runnable_acceptance_requested: bool = false,
+    is_idle: bool = true,
+};
+
 pub const ThreadContext = struct {
     id: u32 = 0,
     allocated: bool = false,
     owner_process: kernel.PrincipalId = default_process_principal,
+    cpu_slot: usize = bootstrap_cpu_slot,
+    cpu_affinity_mask: u64 = all_cpu_affinity_mask,
     cr3: u64 = 0,
     fs_base: u64 = 0,
     ready: bool = false,
@@ -97,6 +310,7 @@ pub export var thread_contexts_ptr: *anyopaque = @ptrCast(&thread_contexts);
 pub var ipc_hot_threads: [max_thread_slots]IpcHotThread = buildInitialIpcHotThreads();
 pub export var ipc_hot_threads_ptr: *anyopaque = @ptrCast(&ipc_hot_threads);
 var ipc_queues: [max_thread_slots]IpcQueue = buildInitialIpcQueues();
+var cpu_scheduler_states: [smp.max_cpus]CpuSchedulerState = buildInitialCpuSchedulerStates();
 pub var process_thread_slots: [kernel.process_count]?usize = [_]?usize{null} ** kernel.process_count;
 pub export var user_cr3_value: u64 = 0;
 pub export var current_user_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
@@ -117,6 +331,643 @@ pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_by
 pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 var preferred_ipc_switch_threads: [max_thread_slots]?usize = [_]?usize{null} ** max_thread_slots;
 
+fn buildInitialCpuSchedulerStates() [smp.max_cpus]CpuSchedulerState {
+    var states: [smp.max_cpus]CpuSchedulerState = [_]CpuSchedulerState{.{}} ** smp.max_cpus;
+    states[bootstrap_cpu_slot].enabled = true;
+    states[bootstrap_cpu_slot].accepts_runnable = true;
+    states[bootstrap_cpu_slot].runnable_acceptance_requested = true;
+    states[bootstrap_cpu_slot].current_thread = 0;
+    states[bootstrap_cpu_slot].is_idle = false;
+    return states;
+}
+
+fn primarySchedulerState() *CpuSchedulerState {
+    return &cpu_scheduler_states[bootstrap_cpu_slot];
+}
+
+fn schedulerStateForSlot(cpu_slot: usize) ?*CpuSchedulerState {
+    if (cpu_slot >= cpu_scheduler_states.len) return null;
+    return &cpu_scheduler_states[cpu_slot];
+}
+
+fn lockAllCpuSchedulerStates() void {
+    var cpu_slot: usize = 0;
+    while (cpu_slot < cpu_scheduler_states.len) : (cpu_slot += 1) {
+        cpu_scheduler_states[cpu_slot].lock.lock();
+    }
+}
+
+fn unlockAllCpuSchedulerStates() void {
+    var remaining = cpu_scheduler_states.len;
+    while (remaining != 0) {
+        remaining -= 1;
+        cpu_scheduler_states[remaining].lock.unlock();
+    }
+}
+
+fn rebuildRunnableQueuesFromHotThreadsLocked() void {
+    var cpu_slot: usize = 0;
+    while (cpu_slot < cpu_scheduler_states.len) : (cpu_slot += 1) {
+        cpu_scheduler_states[cpu_slot].run_queue = .{};
+    }
+    var i: usize = 0;
+    while (i < max_thread_slots) : (i += 1) {
+        const hot = getIpcHotThreadConst(i) orelse continue;
+        if (hot.allocated != 0 and hot.ready != 0) _ = enqueueRunnableThreadLocked(i);
+    }
+}
+
+fn rebuildRunnableQueuesFromHotThreads() void {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    rebuildRunnableQueuesFromHotThreadsLocked();
+}
+
+fn cpuAcceptsRunnableLocked(cpu_slot: usize) bool {
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    return state.enabled and state.accepts_runnable;
+}
+
+fn requestedRunnableAcceptanceAllowed(cpu_slot: usize, accepts: bool) bool {
+    if (!accepts) return true;
+    if (cpu_slot == bootstrap_cpu_slot) return true;
+    return build_workarounds.scheduler_ap_queue_experiment;
+}
+
+fn cpuAffinityBit(cpu_slot: usize) ?u64 {
+    if (cpu_slot >= 64) return null;
+    return @as(u64, 1) << @intCast(cpu_slot);
+}
+
+fn threadAssignedCpuSlot(thread_index: usize) usize {
+    const ctx = getThreadContextConst(thread_index) orelse return bootstrap_cpu_slot;
+    if (!ctx.allocated) return bootstrap_cpu_slot;
+    if (ctx.cpu_slot >= cpu_scheduler_states.len) return bootstrap_cpu_slot;
+    return ctx.cpu_slot;
+}
+
+fn dequeueRunnableThreadFromAllCpusLocked(thread_index: usize) void {
+    var cpu_slot: usize = 0;
+    while (cpu_slot < cpu_scheduler_states.len) : (cpu_slot += 1) {
+        const state = &cpu_scheduler_states[cpu_slot];
+        state.run_queue.markBlocked(thread_index);
+        if (state.pending_handoff_thread == thread_index) {
+            state.pending_handoff_thread = null;
+            state.validated_handoff_thread = null;
+            state.handoff_validation_code = handoff_validation_none;
+            state.handoff_runnable_count = state.run_queue.len;
+        }
+        if (state.consumed_handoff_thread == thread_index) {
+            state.consumed_handoff_thread = null;
+            if (state.entered_handoff_thread == thread_index) state.entered_handoff_thread = null;
+            clearHandoffSnapshotLocked(state);
+            state.current_thread = state.idle_thread;
+            state.current_principal = null;
+            state.current_cr3 = 0;
+            state.is_idle = true;
+        }
+    }
+}
+
+fn enqueueRunnableThreadLocked(thread_index: usize) bool {
+    const cpu_slot = threadAssignedCpuSlot(thread_index);
+    if (!cpuAcceptsRunnableLocked(cpu_slot)) return false;
+    const state = &cpu_scheduler_states[cpu_slot];
+    if (state.consumed_handoff_thread == thread_index) return true;
+    state.run_queue.markRunnable(thread_index);
+    return true;
+}
+
+fn setRunnableQueueMembership(thread_index: usize, runnable: bool) void {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    dequeueRunnableThreadFromAllCpusLocked(thread_index);
+    if (runnable) _ = enqueueRunnableThreadLocked(thread_index);
+}
+
+pub fn cpuCount() usize {
+    return smp.cpuCount();
+}
+
+pub fn currentCpuSlot() usize {
+    return smp.currentCpuSlot();
+}
+
+pub fn schedulerRunsOnCurrentCpu() bool {
+    return smp.isBootstrapCpu();
+}
+
+pub fn installCpuIdleObserver() void {
+    scheduler_observer.registerIdleObserver(observeCpuIdleFromAp);
+    scheduler_observer.registerIdleSchedulerPoll(pollSchedulerFromIdleAp);
+    scheduler_observer.registerIdleUserEntryPoll(claimIdleUserEntryFromAp);
+}
+
+fn observeCpuIdleFromAp(cpu_slot: usize) callconv(.c) void {
+    noteCpuIdleTick(cpu_slot);
+}
+
+fn pollSchedulerFromIdleAp(cpu_slot: usize) callconv(.c) void {
+    handoffNextThreadToIdleCpu(cpu_slot);
+}
+
+fn claimIdleUserEntryFromAp(cpu_slot: usize, out_entry: *scheduler_observer.UserEntry) callconv(.c) bool {
+    if (!build_workarounds.scheduler_ap_queue_experiment) return false;
+    if (cpu_slot == bootstrap_cpu_slot) return false;
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    state.lock.lock();
+    defer state.lock.unlock();
+    if (!state.user_entry_requested) return false;
+    if (state.entered_handoff_thread != null) return false;
+    const thread_index = state.consumed_handoff_thread orelse return false;
+    const code = validateThreadForCpuHandoff(cpu_slot, thread_index);
+    if (code != handoff_validation_ok) {
+        state.handoff_user_entry_failures +%= 1;
+        return false;
+    }
+    const ctx = getThreadContextConst(thread_index) orelse {
+        state.handoff_user_entry_failures +%= 1;
+        return false;
+    };
+    out_entry.* = .{
+        .cpu_slot = cpu_slot,
+        .thread_index = thread_index,
+        .cr3 = ctx.cr3,
+        .fs_base = ctx.fs_base,
+        .frame = ctx.frame,
+    };
+    state.current_thread = thread_index;
+    state.current_principal = ctx.owner_process;
+    state.current_cr3 = ctx.cr3;
+    state.is_idle = false;
+    state.entered_handoff_thread = thread_index;
+    state.handoff_user_entry_ticks +%= 1;
+    return true;
+}
+
+pub fn refreshCpuTopology() void {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const count = @min(smp.cpuCount(), cpu_scheduler_states.len);
+    var i: usize = 0;
+    while (i < cpu_scheduler_states.len) : (i += 1) {
+        const observed = i < count and smp.cpuState(i) != .absent;
+        const state = &cpu_scheduler_states[i];
+        state.enabled = observed;
+        if (i == bootstrap_cpu_slot) state.runnable_acceptance_requested = true;
+        state.accepts_runnable = observed and state.runnable_acceptance_requested and requestedRunnableAcceptanceAllowed(i, true);
+        if (!observed) {
+            state.current_thread = state.idle_thread;
+            state.current_principal = null;
+            state.current_cr3 = 0;
+            state.is_idle = true;
+        } else if (i != bootstrap_cpu_slot) {
+            state.current_thread = state.idle_thread;
+            state.current_principal = null;
+            state.current_cr3 = 0;
+            state.is_idle = true;
+        } else if (state.current_thread == idle_thread_marker) {
+            state.current_thread = current_thread_index;
+            state.current_principal = current_user_principal;
+            state.current_cr3 = user_cr3_value;
+            state.is_idle = false;
+        }
+    }
+}
+
+pub fn schedulerApQueueExperimentEnabled() bool {
+    return build_workarounds.scheduler_ap_queue_experiment;
+}
+
+pub fn cpuRunnableAcceptanceRequested(cpu_slot: usize) bool {
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    state.lock.lock();
+    defer state.lock.unlock();
+    return state.runnable_acceptance_requested;
+}
+
+pub fn setCpuRunnableAcceptanceForExperiment(cpu_slot: usize, accepts: bool) bool {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    if (!state.enabled) return false;
+    if (!requestedRunnableAcceptanceAllowed(cpu_slot, accepts)) return false;
+    state.runnable_acceptance_requested = accepts;
+    state.accepts_runnable = accepts;
+    if (!accepts) {
+        var i: usize = 0;
+        while (i < max_thread_slots) : (i += 1) {
+            state.run_queue.markBlocked(i);
+        }
+        state.pending_handoff_thread = null;
+        state.handoff_runnable_count = 0;
+        state.validated_handoff_thread = null;
+        state.handoff_validation_code = handoff_validation_none;
+        state.consumed_handoff_thread = null;
+        state.entered_handoff_thread = null;
+        state.user_entry_requested = false;
+        state.ap_user_entry_target_cycles = 0;
+        state.ap_timer_saved_thread = null;
+        state.ap_timer_saved_rip = 0;
+        state.ap_timer_saved_rsp = 0;
+        state.ap_preempt_from_thread = null;
+        state.ap_preempt_to_thread = null;
+        clearHandoffSnapshotLocked(state);
+        if (state.current_thread != state.idle_thread) {
+            state.current_thread = state.idle_thread;
+            state.current_principal = null;
+            state.current_cr3 = 0;
+            state.is_idle = true;
+        }
+    }
+    rebuildRunnableQueuesFromHotThreadsLocked();
+    return true;
+}
+
+pub fn setCpuUserEntryForExperiment(cpu_slot: usize, enabled: bool) bool {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    if (!state.enabled) return false;
+    if (!build_workarounds.scheduler_ap_queue_experiment) return false;
+    if (cpu_slot == bootstrap_cpu_slot and enabled) return false;
+    state.user_entry_requested = enabled;
+    if (!enabled) state.entered_handoff_thread = null;
+    return true;
+}
+
+pub fn setCpuUserEntryTargetCyclesForExperiment(cpu_slot: usize, cycles: u64) bool {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    if (!state.enabled) return false;
+    if (!build_workarounds.scheduler_ap_queue_experiment) return false;
+    if (cpu_slot == bootstrap_cpu_slot and cycles != 0) return false;
+    state.ap_user_entry_target_cycles = cycles;
+    return true;
+}
+
+pub fn threadCpuSlot(thread_index: usize) ?usize {
+    const ctx = getThreadContextConst(thread_index) orelse return null;
+    if (!ctx.allocated) return null;
+    return ctx.cpu_slot;
+}
+
+pub fn threadCpuAffinityMask(thread_index: usize) ?u64 {
+    const ctx = getThreadContextConst(thread_index) orelse return null;
+    if (!ctx.allocated) return null;
+    return ctx.cpu_affinity_mask;
+}
+
+pub fn assignThreadToCpu(thread_index: usize, cpu_slot: usize) bool {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const ctx = getThreadContext(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    if (cpu_slot >= cpu_scheduler_states.len) return false;
+    const bit = cpuAffinityBit(cpu_slot) orelse return false;
+    if ((ctx.cpu_affinity_mask & bit) == 0) return false;
+    if (!cpuAcceptsRunnableLocked(cpu_slot)) return false;
+    const was_ready = ctx.ready;
+    dequeueRunnableThreadFromAllCpusLocked(thread_index);
+    ctx.cpu_slot = cpu_slot;
+    if (was_ready) return enqueueRunnableThreadLocked(thread_index);
+    return true;
+}
+
+pub fn schedulerCpuInfo(cpu_slot: usize) ?CpuSchedulerInfo {
+    if (cpu_slot >= cpu_scheduler_states.len) return null;
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    rebuildRunnableQueuesFromHotThreadsLocked();
+    const state = &cpu_scheduler_states[cpu_slot];
+    return .{
+        .slot = cpu_slot,
+        .smp_state = smp.cpuState(cpu_slot),
+        .current_thread = state.current_thread,
+        .current_principal = state.current_principal,
+        .current_cr3 = state.current_cr3,
+        .idle_thread = state.idle_thread,
+        .runnable_count = state.run_queue.len,
+        .idle_ticks = state.idle_ticks,
+        .observer_ticks = state.observer_ticks,
+        .observed_runnable_ticks = state.observed_runnable_ticks,
+        .observed_runnable_count = state.observed_runnable_count,
+        .observed_next_thread = state.observed_next_thread,
+        .handoff_ticks = state.handoff_ticks,
+        .handoff_runnable_count = state.handoff_runnable_count,
+        .pending_handoff_thread = state.pending_handoff_thread,
+        .handoff_validation_ticks = state.handoff_validation_ticks,
+        .handoff_validation_failures = state.handoff_validation_failures,
+        .validated_handoff_thread = state.validated_handoff_thread,
+        .handoff_validation_code = state.handoff_validation_code,
+        .handoff_consume_ticks = state.handoff_consume_ticks,
+        .consumed_handoff_thread = state.consumed_handoff_thread,
+        .handoff_snapshot_ticks = state.handoff_snapshot_ticks,
+        .handoff_snapshot_failures = state.handoff_snapshot_failures,
+        .snapshot_handoff_thread = state.snapshot_handoff_thread,
+        .snapshot_cr3 = state.snapshot_cr3,
+        .snapshot_fs_base = state.snapshot_fs_base,
+        .snapshot_rip = state.snapshot_rip,
+        .snapshot_rsp = state.snapshot_rsp,
+        .snapshot_rflags = state.snapshot_rflags,
+        .snapshot_cs = state.snapshot_cs,
+        .snapshot_ss = state.snapshot_ss,
+        .handoff_user_entry_ticks = state.handoff_user_entry_ticks,
+        .handoff_user_entry_failures = state.handoff_user_entry_failures,
+        .entered_handoff_thread = state.entered_handoff_thread,
+        .user_entry_requested = state.user_entry_requested,
+        .ap_timer_save_ticks = state.ap_timer_save_ticks,
+        .ap_timer_saved_thread = state.ap_timer_saved_thread,
+        .ap_timer_saved_rip = state.ap_timer_saved_rip,
+        .ap_timer_saved_rsp = state.ap_timer_saved_rsp,
+        .ap_timer_requeue_ticks = state.ap_timer_requeue_ticks,
+        .ap_preempt_switch_ticks = state.ap_preempt_switch_ticks,
+        .ap_preempt_from_thread = state.ap_preempt_from_thread,
+        .ap_preempt_to_thread = state.ap_preempt_to_thread,
+        .ap_user_entry_target_cycles = state.ap_user_entry_target_cycles,
+        .schedule_ticks = state.schedule_ticks,
+        .enabled = state.enabled,
+        .accepts_runnable = state.accepts_runnable,
+        .runnable_acceptance_requested = state.runnable_acceptance_requested,
+        .is_idle = state.is_idle,
+    };
+}
+
+pub fn noteCurrentCpuIdleTick() void {
+    noteCpuIdleTick(currentCpuSlot());
+}
+
+fn noteCpuIdleTick(cpu_slot: usize) void {
+    const state = schedulerStateForSlot(cpu_slot) orelse return;
+    state.lock.lock();
+    defer state.lock.unlock();
+    if (state.consumed_handoff_thread) |thread| {
+        state.current_thread = thread;
+        if (getThreadContextConst(thread)) |ctx| {
+            state.current_principal = ctx.owner_process;
+            state.current_cr3 = ctx.cr3;
+        }
+        state.is_idle = false;
+    } else {
+        state.current_thread = state.idle_thread;
+        state.current_principal = null;
+        state.current_cr3 = 0;
+        state.is_idle = true;
+    }
+    state.idle_ticks +%= 1;
+    state.observer_ticks +%= 1;
+    if (state.enabled and state.accepts_runnable and state.run_queue.len != 0) {
+        state.observed_runnable_ticks +%= 1;
+        state.observed_runnable_count = state.run_queue.len;
+        state.observed_next_thread = state.run_queue.pickFirst();
+    } else {
+        state.observed_runnable_count = 0;
+        state.observed_next_thread = null;
+    }
+}
+
+pub fn saveApUserTimerFrame(frame: *const TrapFrame) bool {
+    if (!build_workarounds.scheduler_ap_queue_experiment) return false;
+    const cpu_slot = currentCpuSlot();
+    if (cpu_slot == bootstrap_cpu_slot) return false;
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    state.lock.lock();
+    defer state.lock.unlock();
+    const thread_index = state.entered_handoff_thread orelse state.current_thread;
+    if (thread_index >= max_thread_slots) {
+        state.handoff_user_entry_failures +%= 1;
+        return false;
+    }
+    const ctx = getThreadContext(thread_index) orelse {
+        state.handoff_user_entry_failures +%= 1;
+        return false;
+    };
+    const hot = getIpcHotThread(thread_index) orelse {
+        state.handoff_user_entry_failures +%= 1;
+        return false;
+    };
+    if (!ctx.allocated or hot.allocated == 0) {
+        state.handoff_user_entry_failures +%= 1;
+        return false;
+    }
+    ctx.frame = frame.*;
+    state.consumed_handoff_thread = null;
+    state.pending_handoff_thread = null;
+    state.validated_handoff_thread = null;
+    state.handoff_validation_code = handoff_validation_none;
+    state.current_thread = state.idle_thread;
+    state.current_principal = null;
+    state.current_cr3 = 0;
+    state.is_idle = true;
+    state.ap_timer_saved_thread = thread_index;
+    state.ap_timer_saved_rip = frame.rip;
+    state.ap_timer_saved_rsp = frame.rsp;
+    state.ap_timer_save_ticks +%= 1;
+    state.entered_handoff_thread = null;
+
+    const reached_target = state.ap_user_entry_target_cycles != 0 and state.ap_timer_save_ticks >= state.ap_user_entry_target_cycles;
+    if (reached_target) {
+        var i: usize = 0;
+        while (i < max_thread_slots) : (i += 1) {
+            if (getThreadContext(i)) |slot_ctx| {
+                if (slot_ctx.allocated and slot_ctx.cpu_slot == cpu_slot) {
+                    slot_ctx.ready = false;
+                    if (getIpcHotThread(i)) |slot_hot| slot_hot.ready = 0;
+                }
+            }
+            state.run_queue.markBlocked(i);
+        }
+        state.user_entry_requested = false;
+        clearHandoffSnapshotLocked(state);
+        return true;
+    }
+
+    ctx.ready = true;
+    hot.ready = 1;
+    state.run_queue.markRunnable(thread_index);
+
+    const next_thread = state.run_queue.pickNextAfter(thread_index);
+    const code = validateThreadForCpuHandoff(cpu_slot, next_thread);
+    state.handoff_validation_code = code;
+    if (code != handoff_validation_ok) {
+        state.validated_handoff_thread = null;
+        state.user_entry_requested = false;
+        state.handoff_validation_failures +%= 1;
+        return true;
+    }
+
+    state.pending_handoff_thread = next_thread;
+    state.handoff_runnable_count = state.run_queue.len;
+    state.handoff_ticks +%= 1;
+    state.validated_handoff_thread = next_thread;
+    state.handoff_validation_ticks +%= 1;
+    consumeValidatedHandoffLocked(state, next_thread);
+    if (state.consumed_handoff_thread == next_thread) {
+        state.user_entry_requested = true;
+        state.ap_timer_requeue_ticks +%= 1;
+        state.ap_preempt_switch_ticks +%= 1;
+        state.ap_preempt_from_thread = thread_index;
+        state.ap_preempt_to_thread = next_thread;
+        snapshotConsumedHandoffLocked(state, cpu_slot, next_thread);
+    }
+    return true;
+}
+
+fn handoffNextThreadToIdleCpu(cpu_slot: usize) void {
+    if (!build_workarounds.scheduler_ap_queue_experiment) return;
+    if (cpu_slot == bootstrap_cpu_slot) return;
+    const state = schedulerStateForSlot(cpu_slot) orelse return;
+    state.lock.lock();
+    defer state.lock.unlock();
+    if (state.consumed_handoff_thread) |thread| {
+        snapshotConsumedHandoffLocked(state, cpu_slot, thread);
+        return;
+    }
+    if (!state.enabled or !state.accepts_runnable or state.run_queue.len == 0) {
+        state.pending_handoff_thread = null;
+        state.handoff_runnable_count = 0;
+        state.validated_handoff_thread = null;
+        state.handoff_validation_code = handoff_validation_none;
+        clearHandoffSnapshotLocked(state);
+        return;
+    }
+    const next_thread = state.run_queue.pickFirst() orelse {
+        state.pending_handoff_thread = null;
+        state.handoff_runnable_count = 0;
+        state.validated_handoff_thread = null;
+        state.handoff_validation_code = handoff_validation_none;
+        clearHandoffSnapshotLocked(state);
+        return;
+    };
+    state.handoff_runnable_count = state.run_queue.len;
+    if (state.pending_handoff_thread != next_thread) {
+        state.pending_handoff_thread = next_thread;
+        state.handoff_ticks +%= 1;
+    }
+    validatePendingHandoffLocked(state, cpu_slot, next_thread);
+    consumeValidatedHandoffLocked(state, next_thread);
+    if (state.consumed_handoff_thread == next_thread) {
+        snapshotConsumedHandoffLocked(state, cpu_slot, next_thread);
+    }
+}
+
+fn validatePendingHandoffLocked(state: *CpuSchedulerState, cpu_slot: usize, thread_index: usize) void {
+    const code = validateThreadForCpuHandoff(cpu_slot, thread_index);
+    state.handoff_validation_code = code;
+    if (code == handoff_validation_ok) {
+        if (state.validated_handoff_thread != thread_index) {
+            state.validated_handoff_thread = thread_index;
+            state.handoff_validation_ticks +%= 1;
+        }
+    } else {
+        state.validated_handoff_thread = null;
+        state.handoff_validation_failures +%= 1;
+    }
+}
+
+fn consumeValidatedHandoffLocked(state: *CpuSchedulerState, thread_index: usize) void {
+    if (state.validated_handoff_thread != thread_index) return;
+    if (state.handoff_validation_code != handoff_validation_ok) return;
+    state.run_queue.markBlocked(thread_index);
+    state.pending_handoff_thread = null;
+    state.current_thread = thread_index;
+    if (getThreadContextConst(thread_index)) |ctx| {
+        state.current_principal = ctx.owner_process;
+        state.current_cr3 = ctx.cr3;
+    }
+    state.is_idle = false;
+    if (state.consumed_handoff_thread != thread_index) {
+        state.consumed_handoff_thread = thread_index;
+        state.handoff_consume_ticks +%= 1;
+        state.schedule_ticks +%= 1;
+    }
+}
+
+fn clearHandoffSnapshotLocked(state: *CpuSchedulerState) void {
+    state.snapshot_handoff_thread = null;
+    state.snapshot_cr3 = 0;
+    state.snapshot_fs_base = 0;
+    state.snapshot_rip = 0;
+    state.snapshot_rsp = 0;
+    state.snapshot_rflags = 0;
+    state.snapshot_cs = 0;
+    state.snapshot_ss = 0;
+}
+
+fn snapshotConsumedHandoffLocked(state: *CpuSchedulerState, cpu_slot: usize, thread_index: usize) void {
+    const code = validateThreadForCpuHandoff(cpu_slot, thread_index);
+    if (code != handoff_validation_ok) {
+        if (state.snapshot_handoff_thread == thread_index) clearHandoffSnapshotLocked(state);
+        state.handoff_snapshot_failures +%= 1;
+        return;
+    }
+    const ctx = getThreadContextConst(thread_index) orelse {
+        state.handoff_snapshot_failures +%= 1;
+        clearHandoffSnapshotLocked(state);
+        return;
+    };
+    const changed = state.snapshot_handoff_thread != thread_index or
+        state.snapshot_cr3 != ctx.cr3 or
+        state.snapshot_fs_base != ctx.fs_base or
+        state.snapshot_rip != ctx.frame.rip or
+        state.snapshot_rsp != ctx.frame.rsp or
+        state.snapshot_rflags != ctx.frame.rflags or
+        state.snapshot_cs != ctx.frame.cs or
+        state.snapshot_ss != ctx.frame.ss;
+    state.snapshot_handoff_thread = thread_index;
+    state.snapshot_cr3 = ctx.cr3;
+    state.snapshot_fs_base = ctx.fs_base;
+    state.snapshot_rip = ctx.frame.rip;
+    state.snapshot_rsp = ctx.frame.rsp;
+    state.snapshot_rflags = ctx.frame.rflags;
+    state.snapshot_cs = ctx.frame.cs;
+    state.snapshot_ss = ctx.frame.ss;
+    if (changed) state.handoff_snapshot_ticks +%= 1;
+}
+
+fn validateThreadForCpuHandoff(cpu_slot: usize, thread_index: usize) u8 {
+    if (thread_index >= max_thread_slots) return handoff_validation_bad_thread;
+    const ctx = getThreadContextConst(thread_index) orelse return handoff_validation_bad_thread;
+    const hot = getIpcHotThreadConst(thread_index) orelse return handoff_validation_bad_thread;
+    if (!ctx.allocated or hot.allocated == 0) return handoff_validation_not_allocated;
+    if (!ctx.ready or hot.ready == 0) return handoff_validation_not_ready;
+    if (ctx.cpu_slot != cpu_slot) return handoff_validation_wrong_cpu;
+    const affinity_bit = cpuAffinityBit(cpu_slot) orelse return handoff_validation_bad_affinity;
+    if ((ctx.cpu_affinity_mask & affinity_bit) == 0) return handoff_validation_bad_affinity;
+    if (threadSlotForPrincipal(ctx.owner_process) != thread_index) return handoff_validation_bad_owner;
+    if (hot.owner_process != ctx.owner_process) return handoff_validation_bad_owner;
+    const cr3_addr = x86_platform.cr3AddressPart(ctx.cr3);
+    if (ctx.cr3 != hot.cr3 or cr3_addr == 0 or (cr3_addr & 0xFFF) != 0) return handoff_validation_bad_cr3;
+    if (ctx.frame.rip == 0 or ctx.frame.rsp == 0) return handoff_validation_bad_frame;
+    return handoff_validation_ok;
+}
+
+pub fn runnableThreadCount() usize {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    rebuildRunnableQueuesFromHotThreadsLocked();
+    return primarySchedulerState().run_queue.len;
+}
+
+pub fn runnableThreadCountForCpu(cpu_slot: usize) usize {
+    const state = schedulerStateForSlot(cpu_slot) orelse return 0;
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    rebuildRunnableQueuesFromHotThreadsLocked();
+    return state.run_queue.len;
+}
+
+pub fn pickNextReadyThreadIndexForCpu(cpu_slot: usize, current_index: usize) ?usize {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const state = schedulerStateForSlot(cpu_slot) orelse return null;
+    if (!state.enabled or !state.accepts_runnable) return null;
+    rebuildRunnableQueuesFromHotThreadsLocked();
+    if (state.run_queue.len == 0) return null;
+    return state.run_queue.pickNextAfter(current_index);
+}
+
 pub const RaceLogHooks = struct {
     write: *const fn ([]const u8) void,
     print_hex: *const fn (u64) void,
@@ -133,6 +984,7 @@ pub const PerfReport = struct {
 };
 
 pub fn noteUserTimerTick() void {
+    if (!schedulerRunsOnCurrentCpu()) return;
     scheduler_perf_user_ticks +%= 1;
     if (runtime_priority_principal) |principal| {
         if (getThreadContextConst(current_thread_index)) |ctx| {
@@ -145,6 +997,7 @@ pub fn noteUserTimerTick() void {
 }
 
 pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, priority_hold_quanta: u64) ?usize {
+    if (!schedulerRunsOnCurrentCpu()) return null;
     if (quantum_ticks == 0) return null;
 
     scheduler_tick_accum +%= 1;
@@ -267,10 +1120,18 @@ fn syncHotThreadFromContext(thread_index: usize) void {
     const ctx = getThreadContextConst(thread_index) orelse return;
     const hot = getIpcHotThread(thread_index) orelse return;
     hot.* = hotThreadFromContext(ctx);
+    setRunnableQueueMembership(thread_index, ctx.allocated and ctx.ready);
 }
 
 pub fn setIpcHotReady(thread_index: usize, ready: bool) void {
-    if (getIpcHotThread(thread_index)) |hot| hot.ready = boolByte(ready);
+    const runnable = blk: {
+        if (getIpcHotThread(thread_index)) |hot| {
+            hot.ready = boolByte(ready);
+            break :blk ready and hot.allocated != 0;
+        }
+        break :blk false;
+    };
+    setRunnableQueueMembership(thread_index, runnable);
 }
 
 pub fn setIpcHotSignalPending(thread_index: usize, pending: bool) void {
@@ -278,11 +1139,14 @@ pub fn setIpcHotSignalPending(thread_index: usize, pending: bool) void {
 }
 
 pub fn setIpcHotWaitState(thread_index: usize, wait_mailbox: bool, wake_tick: u64, ready: bool) void {
+    var runnable = false;
     if (getIpcHotThread(thread_index)) |hot| {
         hot.wait_mailbox = boolByte(wait_mailbox);
         hot.wake_tick = wake_tick;
         hot.ready = boolByte(ready);
+        runnable = ready and hot.allocated != 0;
     }
+    setRunnableQueueMembership(thread_index, runnable);
 }
 
 pub fn setIpcHotCr3(thread_index: usize, cr3: u64) void {
@@ -417,6 +1281,8 @@ pub fn initThreadContextWithSpaces(
     ctx.id = @intCast(thread_index);
     ctx.allocated = true;
     ctx.owner_process = owner_process;
+    ctx.cpu_slot = bootstrap_cpu_slot;
+    ctx.cpu_affinity_mask = all_cpu_affinity_mask;
     ctx.cr3 = x86_platform.cr3WithUserPcid(space.cr3, pcidForPrincipal(owner_process));
     ctx.fs_base = 0;
     ctx.ready = true;
@@ -628,10 +1494,20 @@ pub fn sanitizeAllThreadContextsWithSpaces(user_spaces: []UserAddressSpace, init
 }
 
 pub fn activateThread(thread_index: usize) bool {
+    if (!schedulerRunsOnCurrentCpu()) return false;
     const hot = getIpcHotThreadConst(thread_index) orelse return false;
     if (hot.allocated == 0) return false;
     if (hot.ready == 0) return false;
+    const previous_thread = current_thread_index;
     current_thread_index = thread_index;
+    const state = primarySchedulerState();
+    state.lock.lock();
+    defer state.lock.unlock();
+    state.current_thread = thread_index;
+    state.current_principal = hot.owner_process;
+    state.current_cr3 = hot.cr3;
+    state.is_idle = false;
+    if (previous_thread != thread_index) state.schedule_ticks +%= 1;
     current_user_principal = hot.owner_process;
     user_cr3_value = hot.cr3;
     if (!applyThreadFsBase(thread_index)) return false;
@@ -685,6 +1561,7 @@ pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
 }
 
 pub fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bool {
+    if (!schedulerRunsOnCurrentCpu()) return false;
     if (next_thread >= max_thread_slots) return false;
     const current_thread = current_thread_index;
     if (next_thread == current_thread) {
@@ -707,22 +1584,18 @@ pub fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bo
 
 pub fn pickNextReadyThreadIndex(current_index: usize) usize {
     if (current_index >= max_thread_slots) return 0;
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    rebuildRunnableQueuesFromHotThreadsLocked();
     if (runtime_priority_active) {
         if (runtime_priority_principal) |priority_principal| {
             if (threadSlotForPrincipal(priority_principal)) |priority_slot| {
                 const priority_hot = getIpcHotThreadConst(priority_slot) orelse return current_index;
-                if (current_index != priority_slot and priority_hot.allocated != 0 and priority_hot.ready != 0) return priority_slot;
+                if (current_index != priority_slot and priority_hot.allocated != 0 and priority_hot.ready != 0 and threadAssignedCpuSlot(priority_slot) == bootstrap_cpu_slot) return priority_slot;
             }
         }
     }
-    var step: usize = 1;
-    while (step <= max_thread_slots) : (step += 1) {
-        const idx = (current_index + step) % max_thread_slots;
-        const hot = getIpcHotThreadConst(idx) orelse continue;
-        if (hot.allocated == 0) continue;
-        if (hot.ready != 0) return idx;
-    }
-    return current_index;
+    return primarySchedulerState().run_queue.pickNextAfter(current_index);
 }
 
 pub fn wakeThreadIfWaiting(thread_index: usize) void {
@@ -776,6 +1649,7 @@ pub fn consumePendingSignalForPrincipal(principal: kernel.PrincipalId) bool {
 }
 
 pub fn wakeThreadsForTimer(now_tick: u64) void {
+    if (!schedulerRunsOnCurrentCpu()) return;
     var i: usize = 0;
     while (i < max_thread_slots) : (i += 1) {
         const hot = getIpcHotThreadConst(i) orelse continue;
@@ -787,6 +1661,7 @@ pub fn wakeThreadsForTimer(now_tick: u64) void {
 }
 
 pub fn blockCurrentThreadForEvent(frame: *TrapFrame, wait_mailbox: bool, timeout_ticks: u64, resume_rax: u64) bool {
+    if (!schedulerRunsOnCurrentCpu()) return false;
     const current_thread = current_thread_index;
     const ctx = getThreadContext(current_thread) orelse return false;
     const preferred_thread = preferred_ipc_switch_threads[current_thread];

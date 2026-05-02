@@ -4,6 +4,7 @@ const capability = @import("capability.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
 const scheduler = @import("scheduler.zig");
+const smp = @import("smp.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 
 const TrapFrame = interrupts.TrapFrame;
@@ -745,13 +746,20 @@ pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(
 
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     const h = getHooks();
-    scheduler.lapic_tick_count +%= 1;
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
+    const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
+    if (!scheduler.schedulerRunsOnCurrentCpu()) {
+        if (user_mode and scheduler.saveApUserTimerFrame(frame)) {
+            smp.returnCurrentApToIdleFromInterrupt();
+        }
+        scheduler.noteCurrentCpuIdleTick();
+        return;
+    }
+    scheduler.lapic_tick_count +%= 1;
     if (!h.kernel_state_ready.*) return;
     scheduler.wakeThreadsForTimer(scheduler.lapic_tick_count);
     if (h.scheduler_quantum_ticks == 0) return;
-    const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!user_mode) return;
     scheduler.noteUserTimerTick();
 
