@@ -91,6 +91,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         if (!vfs_create_path(resolved, 0)) return reply(errno_io(), 0);
         volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
         if (created->status != FS_STATUS_OK || created->result_token == 0) return reply(errno_acces(), 0);
+        invalidate_exec_cache_for_path(resolved);
         token = created->result_token;
         size = created->file_bytes;
         kind = created->object_kind;
@@ -102,6 +103,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         if (!vfs_create_path(resolved, 1)) return reply(errno_io(), 0);
         volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
         if (created->status != FS_STATUS_OK || created->result_token == 0) return reply(errno_acces(), 0);
+        invalidate_exec_cache_for_path(resolved);
         token = created->result_token;
         size = 0;
         kind = created->object_kind;
@@ -189,7 +191,7 @@ static struct ipc_message handle_write(const struct trap_request *req) {
     if (fd_valid(fd) && g_fds[fd].kind == FD_PIPE_WRITE) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         int fault = 0; const u64 n = pipe_write_from_target(fd, src, len, &fault);
-        if (!fault && (i64)n > 0) try_satisfy_pending_pipe_read(pipe_id);
+        if (!fault && (i64)n > 0) defer_pipe_wake(pipe_id);
         return reply(fault ? errno_fault() : n, 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
@@ -198,6 +200,7 @@ static struct ipc_message handle_write(const struct trap_request *req) {
         const u64 n = vfs_write_from_target(g_fds[fd].token, g_fds[fd].offset, src, len, &fault);
         if (fault) return reply(errno_fault(), 0);
         if (n != 0) {
+            invalidate_exec_cache_for_path(g_fds[fd].path);
             g_fds[fd].offset += n;
             if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
             return reply(n, 0);
@@ -227,7 +230,7 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             total += n;
             if (n != pair[1]) break;
         }
-        if (total != 0) try_satisfy_pending_pipe_read(pipe_id);
+        if (total != 0) defer_pipe_wake(pipe_id);
         return reply(total, 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
@@ -240,6 +243,7 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             const u64 n = vfs_write_from_target(g_fds[fd].token, g_fds[fd].offset, pair[0], pair[1], &fault);
             if (fault) return reply(errno_fault(), 0);
             if (n == 0 && pair[1] != 0) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
+            if (n != 0) invalidate_exec_cache_for_path(g_fds[fd].path);
             g_fds[fd].offset += n;
             if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
             total += n;
@@ -329,7 +333,7 @@ static struct ipc_message handle_unlinkat(const struct trap_request *req, int ol
     if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
     if (!vfs_request(FS_OP_UNLINK, g_vfs.root_token, 0, 0, resolved)) return reply(errno_io(), 0);
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-    if (response->status == FS_STATUS_OK) return reply(0, 0);
+    if (response->status == FS_STATUS_OK) { invalidate_exec_cache_for_path(resolved); return reply(0, 0); }
     if (response->status == FS_STATUS_NOT_FOUND) return reply(errno_noent(), 0);
     if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
     return reply(errno_acces(), 0);

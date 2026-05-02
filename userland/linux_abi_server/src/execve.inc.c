@@ -1,3 +1,5 @@
+#define LINUX_ABI_EXECVE_PROFILE 0
+
 static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_record *stat_out, u64 *file_bytes_out, u8 *kind_out) {
     if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) { user_log("LinuxAbiServer: lookup request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
@@ -38,6 +40,12 @@ static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_byt
 static int is_vm_object_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG && (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
 static int is_exec_image_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG && (token & ~EXEC_IMAGE_TOKEN_TAG) != 0; }
 static u64 decode_spawned_process_slot(u64 value) { if ((value & SPAWN_RESULT_TAG) == 0) return 0; return value & SPAWN_RESULT_PROCESS_MASK; }
+static void execve_profile_step(const char *step) {
+    if (!LINUX_ABI_EXECVE_PROFILE) return;
+    user_log("LinuxAbiServer.prof: ");
+    user_log(step);
+    user_log("\n");
+}
 
 static int alloc_map_range_self(u64 base_va, u64 page_count, u64 writable) {
     u64 done = 0;
@@ -51,11 +59,20 @@ static int alloc_map_range_self(u64 base_va, u64 page_count, u64 writable) {
 
 static int ensure_execve_scratch(void) {
     if (execve_scratch_ready) return 1;
-    if (!alloc_map_range_self(EXECVE_MAIN_IMAGE_VA, EXECVE_MAX_IMAGE_BYTES / PAGE_BYTES, 1)) return 0;
-    if (!alloc_map_range_self(EXECVE_LD_IMAGE_VA, EXECVE_MAX_LD_BYTES / PAGE_BYTES, 1)) return 0;
     if (!alloc_map_range_self(EXECVE_CONFIG_VA, 1, 1)) return 0;
     if (!alloc_map_range_self(EXECVE_TABLE_VA, 1, 1)) return 0;
     execve_scratch_ready = 1;
+    return 1;
+}
+
+static int ensure_execve_main_scratch(u64 file_bytes) {
+    if (file_bytes == 0 || file_bytes > EXECVE_MAX_IMAGE_BYTES) return 0;
+    const u64 required_pages = (file_bytes + PAGE_BYTES - 1) / PAGE_BYTES;
+    if (required_pages <= execve_main_scratch_pages) return 1;
+    const u64 base_va = EXECVE_MAIN_IMAGE_VA + execve_main_scratch_pages * PAGE_BYTES;
+    const u64 add_pages = required_pages - execve_main_scratch_pages;
+    if (!alloc_map_range_self(base_va, add_pages, 1)) return 0;
+    execve_main_scratch_pages = required_pages;
     return 1;
 }
 
@@ -63,6 +80,7 @@ static int vfs_read_file_to_buffer(const char *path, u64 buffer_va, u64 buffer_c
     u64 file_token = 0; u64 file_bytes = 0;
     if (!vfs_lookup_file_token(path, &file_token, &file_bytes)) { user_log("LinuxAbiServer: vfs read lookup failed\n"); return 0; }
     if (file_bytes == 0 || file_bytes > buffer_cap) { user_log("LinuxAbiServer: vfs read stat invalid\n"); user_log_hex_value(file_bytes); return 0; }
+    if (buffer_va == EXECVE_MAIN_IMAGE_VA && !ensure_execve_main_scratch(file_bytes)) { user_log("LinuxAbiServer: execve main scratch failed\n"); return 0; }
     if (!vfs_request(FS_OP_OPEN, file_token, 0, 0, 0)) { user_log("LinuxAbiServer: vfs read open request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
     if (response->status != FS_STATUS_OK || response->result_token == 0) { user_log("LinuxAbiServer: vfs read open failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }
@@ -93,6 +111,66 @@ static u64 install_vm_object_from_buffer(u64 buffer_va, u64 file_bytes) {
 static u64 install_exec_image_from_vm(u64 vm_token) {
     const u64 token = syscall2(SYSCALL_INSTALL_EXEC_IMAGE, vm_token, EXEC_RIGHT_EXEC_GRANT);
     return is_exec_image_token(token) ? token : 0;
+}
+
+static int exec_cache_path_matches(const char *path, u64 len) {
+    if (g_cached_exec_vm_token == 0 || g_cached_exec_path_len != len) return 0;
+    for (u64 i = 0; i < len; i++) {
+        if (g_cached_exec_path[i] != path[i]) return 0;
+    }
+    return g_cached_exec_path[len] == 0;
+}
+
+static void invalidate_exec_cache(void) {
+    g_cached_exec_vm_token = 0;
+    g_cached_exec_file_bytes = 0;
+    g_cached_exec_path_len = 0;
+    g_cached_exec_path[0] = 0;
+}
+
+static void invalidate_exec_cache_for_path(const char *path) {
+    if (g_cached_exec_vm_token == 0) return;
+    if (exec_cache_path_matches(path, cstr_len(path))) invalidate_exec_cache();
+}
+
+static int get_exec_vm_for_path(const char *path, u64 *vm_token_out, u64 *file_bytes_out) {
+    const u64 path_len = cstr_len(path);
+    if (exec_cache_path_matches(path, path_len)) {
+        execve_profile_step("main cache hit");
+        *vm_token_out = g_cached_exec_vm_token;
+        *file_bytes_out = g_cached_exec_file_bytes;
+        return 1;
+    }
+
+    u64 file_bytes = 0;
+    execve_profile_step("main read begin");
+    if (!vfs_read_file_to_buffer(path, EXECVE_MAIN_IMAGE_VA, EXECVE_MAX_IMAGE_BYTES, &file_bytes)) return 0;
+    execve_profile_step("main read done");
+    execve_profile_step("main vm install begin");
+    const u64 vm_token = install_vm_object_from_buffer(EXECVE_MAIN_IMAGE_VA, file_bytes);
+    if (vm_token == 0) return 0;
+    execve_profile_step("main vm install done");
+
+    g_cached_exec_vm_token = vm_token;
+    g_cached_exec_file_bytes = file_bytes;
+    g_cached_exec_path_len = (u16)path_len;
+    for (u64 i = 0; i < path_len; i++) g_cached_exec_path[i] = path[i];
+    g_cached_exec_path[path_len] = 0;
+
+    *vm_token_out = vm_token;
+    *file_bytes_out = file_bytes;
+    return 1;
+}
+
+static u64 get_exec_loader_exec_token(void) {
+    if (g_exec_loader_exec_token != 0) {
+        execve_profile_step("loader exec cache hit");
+        return g_exec_loader_exec_token;
+    }
+    execve_profile_step("loader exec install begin");
+    g_exec_loader_exec_token = install_exec_image_from_vm(g_exec_loader_vm_token);
+    execve_profile_step("loader exec install done");
+    return g_exec_loader_exec_token;
 }
 
 static void reset_exec_runtime_state(void) {
@@ -127,9 +205,21 @@ static int configure_exec_args_from_target(struct exec_loader_config *cfg, const
     if (argv_va != 0) {
         while (argv_count < EXECVE_MAX_ARGV) {
             u64 ptr = 0;
-            if (copy_from_target(argv_va + argv_count * 8, &ptr, 8) != 8) return 0;
+            if (copy_from_target(argv_va + argv_count * 8, &ptr, 8) != 8) {
+                user_log("LinuxAbiServer: execve argv ptr copy failed idx=");
+                user_log_hex_value(argv_count);
+                user_log("LinuxAbiServer: execve argv ptr va=");
+                user_log_hex_value(argv_va + argv_count * 8);
+                return 0;
+            }
             if (ptr == 0) break;
-            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->argv_offsets[argv_count], &cfg->argv_bytes[argv_count])) return 0;
+            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->argv_offsets[argv_count], &cfg->argv_bytes[argv_count])) {
+                user_log("LinuxAbiServer: execve argv string copy failed idx=");
+                user_log_hex_value(argv_count);
+                user_log("LinuxAbiServer: execve argv string va=");
+                user_log_hex_value(ptr);
+                return 0;
+            }
             argv_count++;
         }
     }
@@ -143,9 +233,13 @@ static int configure_exec_args_from_target(struct exec_loader_config *cfg, const
     if (envp_va != 0) {
         while (envp_count < EXECVE_MAX_ENVP) {
             u64 ptr = 0;
-            if (copy_from_target(envp_va + envp_count * 8, &ptr, 8) != 8) return 0;
+            if (copy_from_target(envp_va + envp_count * 8, &ptr, 8) != 8) {
+                break;
+            }
             if (ptr == 0) break;
-            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->envp_offsets[envp_count], &cfg->envp_bytes[envp_count])) return 0;
+            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->envp_offsets[envp_count], &cfg->envp_bytes[envp_count])) {
+                break;
+            }
             envp_count++;
         }
     }
@@ -153,18 +247,22 @@ static int configure_exec_args_from_target(struct exec_loader_config *cfg, const
     return 1;
 }
 
-static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_va) {
+static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_va, u64 *spawned_principal_out) {
+    execve_profile_step("scratch begin");
     if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
+    execve_profile_step("scratch done");
 
     u64 main_bytes = 0;
     if (!is_vm_object_token(g_exec_loader_vm_token)) { user_log("LinuxAbiServer: execve loader token absent\n"); return 0; }
     if (!is_vm_object_token(g_standard_interpreter_vm_token) || g_standard_interpreter_bytes == 0) { user_log("LinuxAbiServer: execve interpreter token absent\n"); return 0; }
-    if (!vfs_read_file_to_buffer(path, EXECVE_MAIN_IMAGE_VA, EXECVE_MAX_IMAGE_BYTES, &main_bytes)) { user_log("LinuxAbiServer: execve main read failed\n"); return 0; }
-    const u64 main_vm_token = install_vm_object_from_buffer(EXECVE_MAIN_IMAGE_VA, main_bytes);
-    if (main_vm_token == 0) { user_log("LinuxAbiServer: execve vm install failed\n"); return 0; }
-    const u64 loader_exec_token = install_exec_image_from_vm(g_exec_loader_vm_token);
+    u64 main_vm_token = 0;
+    if (!get_exec_vm_for_path(path, &main_vm_token, &main_bytes)) { user_log("LinuxAbiServer: execve main vm failed\n"); return 0; }
+    execve_profile_step("main vm done");
+    const u64 loader_exec_token = get_exec_loader_exec_token();
     if (loader_exec_token == 0) { user_log("LinuxAbiServer: execve loader exec install failed\n"); return 0; }
+    execve_profile_step("loader exec done");
 
+    execve_profile_step("config begin");
     clear_page(EXECVE_CONFIG_VA);
     clear_page(EXECVE_TABLE_VA);
     struct exec_loader_config *cfg = (struct exec_loader_config *)EXECVE_CONFIG_VA;
@@ -179,6 +277,7 @@ static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
     cfg->fs_compat_process_slot = g_vfs.process_slot;
     if (!configure_exec_args_from_target(cfg, path, argv_va, envp_va)) { user_log("LinuxAbiServer: execve argv copy failed\n"); return 0; }
+    execve_profile_step("argv done");
 
     struct bootstrap_descriptor_table *table = (struct bootstrap_descriptor_table *)EXECVE_TABLE_VA;
     table->page_count = 1;
@@ -193,14 +292,19 @@ static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_
     table->cap_descriptors[1].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, interpreter_vm_token);
     table->cap_descriptors[1].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[1].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
+    execve_profile_step("table done");
 
     const u64 flags = SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER;
+    execve_profile_step("spawn begin");
     const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, loader_exec_token, EXECVE_TABLE_VA, 0, flags);
-    if (decode_spawned_process_slot(spawned) == 0) {
+    execve_profile_step("spawn syscall done");
+    const u64 spawned_principal = decode_spawned_process_slot(spawned);
+    if (spawned_principal == 0) {
         user_log("LinuxAbiServer: execve spawn failed ret=");
         user_log_hex_value(spawned);
         return 0;
     }
+    *spawned_principal_out = spawned_principal;
     user_log("LinuxAbiServer: execve spawned\n");
     return 1;
 }
@@ -212,7 +316,15 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     user_log("LinuxAbiServer: execve ");
     user_log(path);
     user_log("\n");
-    if (!spawn_exec_loader_for_execve(path, req->args[1], req->args[2])) return reply(errno_io(), 0);
+    const u64 old_principal = req->caller_principal;
+    u64 spawned_principal = 0;
+    if (!spawn_exec_loader_for_execve(path, req->args[1], req->args[2], &spawned_principal)) return reply(errno_io(), 0);
+    (void)spawned_principal;
+    if (g_proc) {
+        g_proc->principal = 0;
+        g_proc->exec_pending = 1;
+        if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
+    }
     reset_exec_runtime_state();
     return reply(0, TRAP_RESPONSE_FLAG_EXIT);
 }

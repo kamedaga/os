@@ -12,6 +12,7 @@ static void close_all_process_fds(struct linux_process_state *proc) {
 static int has_live_linux_process_state(void) {
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_processes[i].used) continue;
+        if (g_processes[i].exec_pending || g_processes[i].principal == 0) return 1;
         const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, g_processes[i].principal);
         if ((st & 0xff) == 1) return 1;
     }
@@ -41,15 +42,15 @@ static int wait_pid_matches_child(i64 pid, u64 child_slot) {
     return 1;
 }
 
-static int write_wait_status_to_current(u64 status_va) {
+static int write_wait_status_to_current(u64 status_va, u32 exit_code) {
     if (status_va == 0) return 1;
-    const u32 code = 0;
+    const u32 code = (exit_code & 0xffu) << 8;
     return copy_to_target(status_va, &code, sizeof(code)) == sizeof(code);
 }
 
-static int write_wait_status_to_trap_target(u64 principal, u64 status_va) {
+static int write_wait_status_to_trap_target(u64 principal, u64 status_va, u32 exit_code) {
     if (status_va == 0) return 1;
-    const u32 code = 0;
+    const u32 code = (exit_code & 0xffu) << 8;
     return copy_to_trap_target(principal, status_va, &code, sizeof(code)) == sizeof(code);
 }
 
@@ -59,13 +60,30 @@ static int reap_exited_child_for_current(struct linux_process_state *proc, i64 p
         if (!proc->child_used[i]) continue;
         const u64 child = proc->child_slot[i];
         if (!wait_pid_matches_child(pid, child)) continue;
-        const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child);
+        u32 recorded_status = 0;
+        if (take_process_exit_record(child, &recorded_status)) {
+            if (!write_wait_status_to_current(status_va, recorded_status)) {
+                *fault = 1;
+                return 0;
+            }
+            struct linux_process_state *recorded_proc = process_state_for_pid(child);
+            if (recorded_proc) recorded_proc->used = 0;
+            proc->child_used[i] = 0;
+            *child_out = child;
+            return 1;
+        }
+        struct linux_process_state *child_proc = process_state_for_pid(child);
+        if (child_proc && child_proc->exec_pending) continue;
+        const u64 child_principal = child_proc ? child_proc->principal : child;
+        const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child_principal);
         if ((st & 0xff) == 1) continue;
-        if (!write_wait_status_to_current(status_va)) {
+        const u32 exit_code = child_proc ? child_proc->exit_status : 0;
+        if (!write_wait_status_to_current(status_va, exit_code)) {
             *fault = 1;
             return 0;
         }
         proc->child_used[i] = 0;
+        if (child_proc) child_proc->used = 0;
         *child_out = child;
         return 1;
     }
@@ -81,12 +99,20 @@ static int satisfy_pending_waiters_for_child(u64 child_slot) {
         for (u64 i = 0; i < LINUX_CHILD_MAX; i++) {
             if (!proc->child_used[i] || proc->child_slot[i] != child_slot) continue;
             u64 result = child_slot;
-            if (!write_wait_status_to_trap_target(proc->principal, proc->wait_status_va)) result = errno_fault();
+            struct linux_process_state *child_proc = process_state_for_pid(child_slot);
+            u32 exit_code = child_proc ? child_proc->exit_status : 0;
+            (void)take_process_exit_record(child_slot, &exit_code);
+            if (!write_wait_status_to_trap_target(proc->principal, proc->wait_status_va, exit_code)) result = errno_fault();
             proc->child_used[i] = 0;
+            if (child_proc) child_proc->used = 0;
             proc->wait_pending = 0;
             proc->wait_pid = 0;
             proc->wait_status_va = 0;
-            (void)reply_trap_target(proc->principal, result, 0);
+            const u64 reply_status = reply_trap_target(proc->principal, result, 0);
+            if (reply_status != SYSCALL_OK) {
+                user_log("LinuxAbiServer: wait reply failed=");
+                user_log_hex_value(reply_status);
+            }
             satisfied = 1;
             break;
         }
@@ -104,8 +130,34 @@ static int add_child_slot(struct linux_process_state *proc, u64 child_slot) {
     return 0;
 }
 
+static int defer_trap_target_start(u64 child_slot) {
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (g_deferred_start_used[i]) continue;
+        g_deferred_start_used[i] = 1;
+        g_deferred_start_principal[i] = child_slot;
+        return 1;
+    }
+    return 0;
+}
+
+static void start_deferred_trap_targets(void) {
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (!g_deferred_start_used[i]) continue;
+        const u64 child_slot = g_deferred_start_principal[i];
+        g_deferred_start_used[i] = 0;
+        const u64 status = start_trap_target(child_slot);
+        if (status != SYSCALL_OK) {
+            user_log("LinuxAbiServer: deferred start failed=");
+            user_log_hex_value(status);
+        }
+    }
+}
+
 static void copy_process_state_for_fork(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal) {
     child->used = 1;
+    child->exec_pending = 0;
+    child->exit_status = 0;
+    child->pid = child_principal;
     child->principal = child_principal;
     child->mmap_next_va = parent->mmap_next_va;
     child->brk_next_va = parent->brk_next_va;
@@ -151,7 +203,7 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
     if (!ensure_child_trap_request_page(child_slot, &child_request_va)) return reply(errno_busy(), 0);
     copy_process_state_for_fork(child, g_proc, child_slot);
     (void)add_child_slot(g_proc, child_slot);
-    if (start_trap_target(child_slot) != SYSCALL_OK) return reply(errno_busy(), 0);
+    if (!defer_trap_target_start(child_slot)) return reply(errno_busy(), 0);
     return reply(child_slot, 0);
 }
 

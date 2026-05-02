@@ -1061,6 +1061,73 @@ fn handleWriteBlocks(session: *Session, request_seq: u64) void {
     );
 }
 
+fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
+    const request = requestHeader(session);
+    const rights = resolveSession(session, request) orelse {
+        replyStatus(session, .write_blocks_bulk, request_seq, .not_found);
+        return;
+    };
+    if (!rights.write) {
+        replyStatus(session, .write_blocks_bulk, request_seq, .no_right);
+        return;
+    }
+    const byte_count = @as(u64, request.block_count) * boot_state.logical_block_size;
+    const end_block = request.block_index + request.block_count;
+    const page_count: usize = @intCast(request.flags);
+    if (request.block_count == 0 or
+        page_count == 0 or
+        page_count > max_bulk_read_pages or
+        byte_count > page_count * block_protocol.page_bytes or
+        byte_count > block_protocol.page_bytes or
+        end_block > boot_state.capacity_blocks or
+        request.inline_bytes != page_count * @sizeOf(u64))
+    {
+        replyStatus(session, .write_blocks_bulk, request_seq, .too_big);
+        return;
+    }
+
+    const payload: [*]const volatile u8 = @ptrCast(requestPayload(session));
+    var paddrs: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages;
+    var page_index: usize = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        var raw: u64 = 0;
+        var byte_index: usize = 0;
+        while (byte_index < @sizeOf(u64)) : (byte_index += 1) {
+            raw |= @as(u64, payload[page_index * @sizeOf(u64) + byte_index]) << @intCast(byte_index * 8);
+        }
+        if (raw < 0x1000) {
+            replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
+            return;
+        }
+        paddrs[page_index] = raw;
+    }
+
+    if (!ensureBulkMappings(session, paddrs[0..page_count])) {
+        replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
+        return;
+    }
+
+    const src: [*]volatile u8 = @ptrFromInt(session.bulk_base_va);
+    const data = @as([*]u8, @ptrCast(@volatileCast(requestDataPtr())));
+    copyVolatileToPlain(src, data[0..@intCast(byte_count)]);
+    if (!executeBlockRequest(request_type_out, request.block_index, request.block_count, true)) {
+        replyStatus(session, .write_blocks_bulk, request_seq, .io_error);
+        return;
+    }
+    clearPage(session.response_va);
+    writeResponseHeader(
+        session,
+        .write_blocks_bulk,
+        request_seq,
+        .ok,
+        0,
+        .block_device,
+        0,
+        boot_state.logical_block_size,
+        boot_state.capacity_blocks,
+    );
+}
+
 fn handleFlush(session: *Session, request_seq: u64) void {
     const request = requestHeader(session);
     const rights = resolveSession(session, request) orelse {
@@ -1106,6 +1173,7 @@ fn processSessionRequest(session: *Session) void {
         .read_blocks => handleReadBlocks(session, request_seq),
         .read_blocks_bulk => handleReadBlocksBulk(session, request_seq),
         .write_blocks => handleWriteBlocks(session, request_seq),
+        .write_blocks_bulk => handleWriteBlocksBulk(session, request_seq),
         .flush => handleFlush(session, request_seq),
     }
     session.last_completed_seq = request_seq;

@@ -12,6 +12,7 @@ pub const Opcode = enum(u16) {
     write_blocks = 4,
     flush = 5,
     read_blocks_bulk = 6,
+    write_blocks_bulk = 7,
 };
 
 pub const Status = enum(i32) {

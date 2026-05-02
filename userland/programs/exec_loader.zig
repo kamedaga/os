@@ -80,6 +80,8 @@ const max_lib_image_bytes: usize = 2 * 1024 * 1024;
 const elf_dyn_bytes: usize = 16;
 const max_lib_queue_depth: usize = max_needed_count;
 const elf_rela_bytes: u64 = 24;
+const max_reloc_pages: usize = 256;
+const exec_loader_profile_enabled = false;
 const r_x86_64_relative: u64 = 8;
 const linux_stack_execfn = "/cmd/musl_smoke.elf";
 const linux_stack_platform = "x86_64";
@@ -212,6 +214,11 @@ const ImageSpan = struct {
     align_bytes: u64,
 };
 
+const RelocationTable = struct {
+    file_off: u64,
+    size: u64,
+};
+
 const ReservedRange = struct {
     start: u64,
     end: u64,
@@ -314,6 +321,8 @@ const ChildPageTracker = struct {
 };
 
 var child_mapped_pages = ChildPageTracker{};
+var reloc_pages_scratch: [max_reloc_pages]u64 = undefined;
+var reloc_page_buffer: [4096]u8 = undefined;
 
 fn syscall1(nr: u64, arg0: u64) u64 {
     return asm volatile (
@@ -377,6 +386,10 @@ fn syscall6(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
 fn userLog(message: []const u8) void {
     _ = syscall3(syscall_log, @intFromPtr(message.ptr), message.len, 0);
 }
+
+fn profileEvent(_: []const u8) void {}
+
+fn profileStep(_: []const u8, _: []const u8) void {}
 
 fn getProcessSlot() u64 {
     return syscall1(syscall_get_process_slot, 0);
@@ -659,6 +672,15 @@ fn writeProcessU64(process_token: u64, dest_va: u64, value: u64) bool {
         bytes[index] = @intCast((value >> @intCast(index * 8)) & 0xff);
     }
     return copyToProcess(process_token, dest_va, @intFromPtr(&bytes), bytes.len);
+}
+
+fn writeU64Le(bytes: *[4096]u8, off: usize, value: u64) bool {
+    if (off + 8 > bytes.len) return false;
+    var index: usize = 0;
+    while (index < 8) : (index += 1) {
+        bytes[off + index] = @intCast((value >> @intCast(index * 8)) & 0xff);
+    }
+    return true;
 }
 
 fn writeProcessBytes(process_token: u64, dest_va: u64, bytes: []const u8) bool {
@@ -1234,7 +1256,17 @@ fn loadMappedSegment(process_token: u64, source_vm_token: u64, phdr: ProgramHead
     return mapVmObjectToProcess(process_token, segment_vm, target_va, mapProtFromPhdr(phdr));
 }
 
-fn canMapSegmentDirectly(phdr: ProgramHeader, file_bytes: u64) bool {
+fn canMapSegmentDirectly(
+    mapped_pages: *const ChildPageTracker,
+    source_base_va: u64,
+    ehdr: ElfHeader,
+    phdr: ProgramHeader,
+    file_bytes: u64,
+    load_bias: u64,
+) bool {
+    if ((phdr.flags & pf_w) != 0) return false;
+    if (phdr.memsz != phdr.filesz) return false;
+    if (((phdr.offset ^ phdr.vaddr) & (page_bytes - 1)) != 0) return false;
     const file_page_off = pageDown(phdr.offset);
     const segment_page_va = pageDown(phdr.vaddr);
     const page_delta = phdr.vaddr - segment_page_va;
@@ -1242,7 +1274,20 @@ fn canMapSegmentDirectly(phdr: ProgramHeader, file_bytes: u64) bool {
     if (segment_overflow != 0) return false;
     const map_bytes = pageUp(segment_end) orelse return false;
     const file_map_end, const file_map_overflow = @addWithOverflow(file_page_off, map_bytes);
-    return file_map_overflow == 0 and file_map_end <= file_bytes;
+    if (file_map_overflow != 0 or file_map_end > file_bytes) return false;
+
+    const target_va, const target_overflow = @addWithOverflow(load_bias, segment_page_va);
+    if (target_overflow != 0) return false;
+    const page_count = map_bytes / page_bytes;
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const page_vaddr = segment_page_va + page_index * page_bytes;
+        const page_target_va = target_va + page_index * page_bytes;
+        if (mapped_pages.contains(page_target_va)) return false;
+        const prot = pageProtFromImage(source_base_va, ehdr, file_bytes, page_vaddr) orelse return false;
+        if (prot.write) return false;
+    }
+    return true;
 }
 
 fn loadPrivateSegment(
@@ -1309,7 +1354,19 @@ fn loadSegment(
     load_bias: u64,
 ) bool {
     if (!validateLoadSegment(phdr, file_bytes)) return false;
-    _ = source_vm_token;
+    if (canMapSegmentDirectly(mapped_pages, source_base_va, ehdr, phdr, file_bytes, load_bias)) {
+        const segment_page_va = pageDown(phdr.vaddr);
+        const page_delta = phdr.vaddr - segment_page_va;
+        const segment_end, const segment_overflow = @addWithOverflow(page_delta, phdr.filesz);
+        if (segment_overflow != 0) return false;
+        const map_bytes = pageUp(segment_end) orelse return false;
+        const target_va, const target_overflow = @addWithOverflow(load_bias, segment_page_va);
+        if (target_overflow != 0) return false;
+        if (loadMappedSegment(process_token, source_vm_token, phdr, load_bias)) {
+            if (!mapped_pages.addRange(target_va, map_bytes / page_bytes)) return false;
+            return true;
+        }
+    }
     return loadPrivateSegment(process_token, mapped_pages, source_base_va, ehdr, file_bytes, phdr, load_bias);
 }
 
@@ -1368,29 +1425,105 @@ fn fileOffsetForVaddr(source_base_va: u64, ehdr: ElfHeader, vaddr: u64, size: u6
     return null;
 }
 
-fn applyRelativeRelocations(process_token: u64, source_base_va: u64, ehdr: ElfHeader, dynamic: ProgramHeader, load_bias: u64, file_bytes: u64) bool {
-    const dyn_bytes = bytesAt(source_base_va, dynamic.offset, @intCast(dynamic.filesz), file_bytes) orelse return false;
+fn findRelativeRelocationTable(source_base_va: u64, ehdr: ElfHeader, dynamic: ProgramHeader, file_bytes: u64) ?RelocationTable {
+    const dyn_bytes = bytesAt(source_base_va, dynamic.offset, @intCast(dynamic.filesz), file_bytes) orelse return null;
     var rela_va: u64 = 0;
     var rela_size: u64 = 0;
     var rela_ent: u64 = elf_rela_bytes;
 
     var dyn_off: usize = 0;
     while (dyn_off + elf_dyn_bytes <= dyn_bytes.len) : (dyn_off += elf_dyn_bytes) {
-        const tag = readI64Le(dyn_bytes, dyn_off) orelse return false;
-        const value = readU64Le(dyn_bytes, dyn_off + 8) orelse return false;
+        const tag = readI64Le(dyn_bytes, dyn_off) orelse return null;
+        const value = readU64Le(dyn_bytes, dyn_off + 8) orelse return null;
         if (tag == dt_null) break;
         if (tag == dt_rela) rela_va = value;
         if (tag == dt_relasz) rela_size = value;
         if (tag == dt_relaent) rela_ent = value;
     }
 
-    if (rela_va == 0 or rela_size == 0) return true;
-    if (rela_ent != elf_rela_bytes) return false;
-    if ((rela_size % elf_rela_bytes) != 0) return false;
-    const rela_file_off = fileOffsetForVaddr(source_base_va, ehdr, rela_va, rela_size, file_bytes) orelse return false;
+    if (rela_va == 0 or rela_size == 0) return .{ .file_off = 0, .size = 0 };
+    if (rela_ent != elf_rela_bytes) return null;
+    if ((rela_size % elf_rela_bytes) != 0) return null;
+    const rela_file_off = fileOffsetForVaddr(source_base_va, ehdr, rela_va, rela_size, file_bytes) orelse return null;
+    return .{ .file_off = rela_file_off, .size = rela_size };
+}
 
-    var rela_off = rela_file_off;
-    const rela_end = rela_file_off + rela_size;
+fn fillLoadedImagePage(source_base_va: u64, ehdr: ElfHeader, file_bytes: u64, load_bias: u64, dest_page_va: u64, out: *[4096]u8) bool {
+    if (dest_page_va < load_bias) return false;
+    @memset(out[0..], 0);
+
+    const page_vaddr = dest_page_va - load_bias;
+    const page_end, const page_end_overflow = @addWithOverflow(page_vaddr, page_bytes);
+    if (page_end_overflow != 0) return false;
+
+    var index: u16 = 0;
+    while (index < ehdr.phnum) : (index += 1) {
+        const phdr = parseProgramHeader(source_base_va, ehdr, index, file_bytes) orelse return false;
+        if (phdr.p_type != pt_load or phdr.memsz == 0) continue;
+        const segment_end, const segment_overflow = @addWithOverflow(phdr.vaddr, phdr.memsz);
+        if (segment_overflow != 0) return false;
+        if (!rangesOverlap(page_vaddr, page_end, phdr.vaddr, segment_end)) continue;
+
+        const copy_start = if (page_vaddr > phdr.vaddr) page_vaddr else phdr.vaddr;
+        const copy_end_mem = if (page_end < segment_end) page_end else segment_end;
+        const segment_offset = copy_start - phdr.vaddr;
+        if (segment_offset >= phdr.filesz) continue;
+
+        const file_avail = phdr.filesz - segment_offset;
+        var copy_len = copy_end_mem - copy_start;
+        if (copy_len > file_avail) copy_len = file_avail;
+        if (copy_len == 0) continue;
+
+        const file_off, const file_off_overflow = @addWithOverflow(phdr.offset, segment_offset);
+        if (file_off_overflow != 0) return false;
+        const src = bytesAt(source_base_va, file_off, @intCast(copy_len), file_bytes) orelse return false;
+        const dst_off: usize = @intCast(copy_start - page_vaddr);
+        @memcpy(out[dst_off .. dst_off + src.len], src);
+    }
+    return true;
+}
+
+fn collectRelativeRelocationPages(source_base_va: u64, ehdr: ElfHeader, table: RelocationTable, load_bias: u64, file_bytes: u64, pages: *[max_reloc_pages]u64) ?usize {
+    var page_count: usize = 0;
+    var rela_off = table.file_off;
+    const rela_end = table.file_off + table.size;
+    while (rela_off < rela_end) : (rela_off += elf_rela_bytes) {
+        const rela = bytesAt(source_base_va, rela_off, @intCast(elf_rela_bytes), file_bytes) orelse return null;
+        const r_offset = readU64Le(rela, 0) orelse return null;
+        const r_info = readU64Le(rela, 8) orelse return null;
+        const r_type = r_info & 0xffff_ffff;
+        const r_sym = r_info >> 32;
+        if (r_type != r_x86_64_relative or r_sym != 0) continue;
+
+        const dest_va, const dest_overflow = @addWithOverflow(load_bias, r_offset);
+        if (dest_overflow != 0) return null;
+        if ((dest_va & (page_bytes - 1)) > page_bytes - 8) return null;
+        const page_va = pageDown(dest_va);
+        if (page_va < load_bias) return null;
+        const page_vaddr = page_va - load_bias;
+        const prot = pageProtFromImage(source_base_va, ehdr, file_bytes, page_vaddr) orelse return null;
+        if (!prot.write) return null;
+
+        var found = false;
+        var index: usize = 0;
+        while (index < page_count) : (index += 1) {
+            if (pages[index] == page_va) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (page_count >= pages.len) return null;
+            pages[page_count] = page_va;
+            page_count += 1;
+        }
+    }
+    return page_count;
+}
+
+fn applyRelativeRelocationsSlow(process_token: u64, source_base_va: u64, table: RelocationTable, load_bias: u64, file_bytes: u64) bool {
+    var rela_off = table.file_off;
+    const rela_end = table.file_off + table.size;
     while (rela_off < rela_end) : (rela_off += elf_rela_bytes) {
         const rela = bytesAt(source_base_va, rela_off, @intCast(elf_rela_bytes), file_bytes) orelse return false;
         const r_offset = readU64Le(rela, 0) orelse return false;
@@ -1408,6 +1541,43 @@ fn applyRelativeRelocations(process_token: u64, source_base_va: u64, ehdr: ElfHe
     return true;
 }
 
+fn applyRelativeRelocationsBatched(process_token: u64, source_base_va: u64, ehdr: ElfHeader, table: RelocationTable, load_bias: u64, file_bytes: u64) bool {
+    const page_count = collectRelativeRelocationPages(source_base_va, ehdr, table, load_bias, file_bytes, &reloc_pages_scratch) orelse return applyRelativeRelocationsSlow(process_token, source_base_va, table, load_bias, file_bytes);
+
+    var page_index: usize = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const page_va = reloc_pages_scratch[page_index];
+        if (!fillLoadedImagePage(source_base_va, ehdr, file_bytes, load_bias, page_va, &reloc_page_buffer)) return false;
+
+        var rela_off = table.file_off;
+        const rela_end = table.file_off + table.size;
+        while (rela_off < rela_end) : (rela_off += elf_rela_bytes) {
+            const rela = bytesAt(source_base_va, rela_off, @intCast(elf_rela_bytes), file_bytes) orelse return false;
+            const r_offset = readU64Le(rela, 0) orelse return false;
+            const r_info = readU64Le(rela, 8) orelse return false;
+            const r_addend = readI64Le(rela, 16) orelse return false;
+            const r_type = r_info & 0xffff_ffff;
+            const r_sym = r_info >> 32;
+            if (r_type != r_x86_64_relative or r_sym != 0) continue;
+
+            const dest_va, const dest_overflow = @addWithOverflow(load_bias, r_offset);
+            if (dest_overflow != 0) return false;
+            if (pageDown(dest_va) != page_va) continue;
+            const relocated = addSigned(load_bias, r_addend) orelse return false;
+            if (!writeU64Le(&reloc_page_buffer, @intCast(dest_va - page_va), relocated)) return false;
+        }
+
+        if (!copyToProcess(process_token, page_va, @intFromPtr(&reloc_page_buffer), page_bytes)) return false;
+    }
+    return true;
+}
+
+fn applyRelativeRelocations(process_token: u64, source_base_va: u64, ehdr: ElfHeader, dynamic: ProgramHeader, load_bias: u64, file_bytes: u64) bool {
+    const table = findRelativeRelocationTable(source_base_va, ehdr, dynamic, file_bytes) orelse return false;
+    if (table.size == 0) return true;
+    return applyRelativeRelocationsBatched(process_token, source_base_va, ehdr, table, load_bias, file_bytes);
+}
+
 fn loadElfImage(
     process_token: u64,
     layout: *VmLayout,
@@ -1417,16 +1587,19 @@ fn loadElfImage(
     file_bytes: u64,
     label: []const u8,
 ) ?LoadedImage {
+    profileStep(label, "begin");
     const ehdr = parseElfHeader(source_base_va, file_bytes) orelse {
         userLog(label);
         userLog(" ELF header failed\n");
         return null;
     };
+    profileStep(label, "header ok");
     const load_bias = chooseLoadBias(layout, source_base_va, ehdr, file_bytes) orelse {
         userLog(label);
         userLog(" load bias failed\n");
         return null;
     };
+    profileStep(label, "bias ok");
     var dynamic_phdr: ?ProgramHeader = null;
     var interp_phdr: ?ProgramHeader = null;
     var tls_phdr: ?ProgramHeader = null;
@@ -1443,21 +1616,27 @@ fn loadElfImage(
         if (phdr.p_type == pt_tls) tls_phdr = phdr;
         if (phdr.p_type == pt_gnu_relro) relro_phdr = phdr;
         if (phdr.p_type != pt_load) continue;
+        profileStep(label, "PT_LOAD begin");
         if (!loadSegment(process_token, mapped_pages, source_vm_token, source_base_va, ehdr, phdr, file_bytes, load_bias)) {
             userLog(label);
             userLog(" PT_LOAD failed\n");
             return null;
         }
+        profileStep(label, "PT_LOAD done");
     }
+    profileStep(label, "segments done");
 
     if (dynamic_phdr) |phdr| {
+        profileStep(label, "reloc begin");
         if (!applyRelativeRelocations(process_token, source_base_va, ehdr, phdr, load_bias, file_bytes)) {
             userLog(label);
             userLog(" relocation failed\n");
             return null;
         }
+        profileStep(label, "reloc done");
     }
 
+    profileStep(label, "done");
     return .{ .ehdr = ehdr, .load_bias = load_bias, .interp_phdr = interp_phdr, .dynamic_phdr = dynamic_phdr, .tls_phdr = tls_phdr, .relro_phdr = relro_phdr };
 }
 
@@ -1515,31 +1694,38 @@ fn launchExec(
     interpreter_vm_token: u64,
     interpreter_file_bytes: u64,
 ) ?u64 {
+    profileEvent("launch begin");
     if (!mapVmObject(executable_vm_token, main_source_map_va)) {
         userLog("ExecLoader: source map failed\n");
         return null;
     }
+    profileEvent("main source map done");
     const process_token = createSuspendedProcess() orelse {
         userLog("ExecLoader: create suspended failed\n");
         return null;
     };
+    profileEvent("create suspended done");
     var vm_layout = VmLayout.initForExecChild() orelse {
         abortProcess(process_token);
         userLog("ExecLoader: vm layout init failed\n");
         return null;
     };
+    profileEvent("vm layout init done");
     const bootfs_image_bytes = if (image_abi.decodeVmObjectToken(cfg.bootfs_vm_token) != null) cfg.bootfs_file_bytes else 0;
     if (!vm_layout.reserveBootFsImage(bootfs_image_bytes)) {
         abortProcess(process_token);
         userLog("ExecLoader: bootfs reserve failed\n");
         return null;
     }
+    profileEvent("bootfs reserve done");
     child_mapped_pages = .{};
+    profileEvent("main load begin");
     const main_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, executable_vm_token, main_source_map_va, executable_file_bytes, "ExecLoader: main") orelse {
         abortProcess(process_token);
         userLog("ExecLoader: main ELF load failed\n");
         return null;
     };
+    profileEvent("main load done");
 
     const main_entry, const main_entry_overflow = @addWithOverflow(main_image.load_bias, main_image.ehdr.entry);
     if (main_entry_overflow != 0) {
@@ -1551,11 +1737,13 @@ fn launchExec(
     var interp_base: u64 = 0;
 
     if (main_image.interp_phdr) |interp_phdr| {
+        profileEvent("interp path begin");
         const interp_path = readInterpPath(main_source_map_va, interp_phdr, executable_file_bytes) orelse {
             abortProcess(process_token);
             userLog("ExecLoader: bad PT_INTERP\n");
             return null;
         };
+        profileEvent("interp path done");
         if (!sameBytes(interp_path, interp_path_ld)) {
             abortProcess(process_token);
             userLog("ExecLoader: unsupported PT_INTERP\n");
@@ -1566,16 +1754,20 @@ fn launchExec(
             userLog("ExecLoader: missing interpreter ELF\n");
             return null;
         }
+        profileEvent("interp source map begin");
         if (!mapVmObject(interpreter_vm_token, interpreter_source_map_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: interpreter source map failed\n");
             return null;
         }
+        profileEvent("interp source map done");
+        profileEvent("interp load begin");
         const interp_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, interpreter_vm_token, interpreter_source_map_va, interpreter_file_bytes, "ExecLoader: interpreter") orelse {
             abortProcess(process_token);
             userLog("ExecLoader: interpreter ELF load failed\n");
             return null;
         };
+        profileEvent("interp load done");
         const interp_entry, const interp_entry_overflow = @addWithOverflow(interp_image.load_bias, interp_image.ehdr.entry);
         if (interp_entry_overflow != 0) {
             abortProcess(process_token);
@@ -1587,33 +1779,43 @@ fn launchExec(
         userLog("ExecLoader: standard interpreter loaded\n");
     }
 
+    profileEvent("stack alloc begin");
     if (!allocMapPagesToProcess(process_token, linux_stack_bottom_va, linux_stack_pages, .{ .read = true, .write = true })) {
         abortProcess(process_token);
         userLog("ExecLoader: stack alloc failed\n");
         return null;
     }
+    profileEvent("stack alloc done");
+    profileEvent("runtime bootstrap begin");
     if (!installRuntimeBootstrapPages(process_token)) {
         abortProcess(process_token);
         userLog("ExecLoader: runtime bootstrap failed\n");
         return null;
     }
+    profileEvent("runtime bootstrap done");
     var argv_storage: [exec_loader_bootstrap_abi.max_argv][]const u8 = undefined;
     var envp_storage: [exec_loader_bootstrap_abi.max_envp][]const u8 = undefined;
+    profileEvent("argv config begin");
     const stack_config = linuxInitialStackConfigFromBootstrap(cfg, &argv_storage, &envp_storage) orelse {
         abortProcess(process_token);
         userLog("ExecLoader: linux argv config failed\n");
         return null;
     };
+    profileEvent("argv config done");
+    profileEvent("linux stack begin");
     const initial_rsp = installLinuxInitialStack(process_token, main_image, main_entry, interp_base, stack_config) orelse {
         abortProcess(process_token);
         userLog("ExecLoader: linux stack failed\n");
         return null;
     };
+    profileEvent("linux stack done");
+    profileEvent("context begin");
     if (!setProcessInitialContext(process_token, initial_entry, initial_rsp)) {
         abortProcess(process_token);
         userLog("ExecLoader: set context failed\n");
         return null;
     }
+    profileEvent("context done");
     if (cfg.abi_trap_endpoint_id != 0 and cfg.abi_trap_endpoint_process_slot != 0) {
         const flavor = if (cfg.abi_trap_flavor != 0) cfg.abi_trap_flavor else @as(u64, @intFromEnum(trap_abi.AbiFlavor.linux_x86_64));
         if (cfg.abi_trap_request_page_va == 0) {
@@ -1621,23 +1823,28 @@ fn launchExec(
             userLog("ExecLoader: abi trap request page absent\n");
             return null;
         }
+        profileEvent("abi delegate begin");
         if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_process_slot, flavor, cfg.abi_trap_request_page_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: abi trap delegate failed\n");
             return null;
         }
+        profileEvent("abi delegate done");
         userLog("ExecLoader: abi trap delegate ready\n");
     }
+    profileEvent("start process begin");
     const spawned = startProcess(process_token) orelse {
         abortProcess(process_token);
         userLog("ExecLoader: start failed\n");
         return null;
     };
+    profileEvent("start process done");
     return process_abi.decodeSpawnedProcessSlot(spawned);
 }
 
 pub export fn _start() noreturn {
     userLog("ExecLoader: started\n");
+    profileEvent("entry begin");
     const cfg: *const exec_loader_bootstrap_abi.Config = @ptrFromInt(exec_loader_bootstrap_abi.target_va);
     if (cfg.magic != exec_loader_bootstrap_abi.magic or cfg.version != exec_loader_bootstrap_abi.version) {
         userLog("ExecLoader: missing bootstrap config\n");

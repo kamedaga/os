@@ -8,6 +8,7 @@ use std::time::SystemTime;
 const OVMF_CODE_PATH: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 const OVMF_VARS_TEMPLATE_PATH: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 const QEMU_DEBUG_FLAGS: &str = "guest_errors,cpu_reset";
+const TIMED_RUN_SECONDS: u32 = 35;
 
 pub struct RunOptions {
     pub timed: bool,
@@ -363,7 +364,9 @@ fn build_wsl_script(
 
     if options.timed {
         script.push_str("set +e\n");
-        script.push_str("timeout --kill-after=2s 20s \\\n  ");
+        script.push_str(&format!(
+            "timeout --kill-after=2s {TIMED_RUN_SECONDS}s \\\n  "
+        ));
         script.push_str(&qemu_cmd);
         script.push_str(&format!(
             " | python3 {} | tee \"$RUNTIME_SERIAL_LOG\"\n",
@@ -381,7 +384,9 @@ fn build_wsl_script(
         script.push_str("  echo\n");
         script.push_str("  echo \"serial log: $SERIAL_LOG\"\n");
         script.push_str("  echo \"summary: $SUMMARY_LOG\"\n");
-        script.push_str("  echo \"timed run stopped after 20s; treating QEMU timeout as captured failure\"\n");
+        script.push_str(&format!(
+            "  echo \"timed run stopped after {TIMED_RUN_SECONDS}s; treating QEMU timeout as captured failure\"\n"
+        ));
         script.push_str("  exit \"$qemu_status\"\n");
         script.push_str("fi\n");
         script.push_str("schedule_writeback\n");

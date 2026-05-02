@@ -85,9 +85,18 @@ static int ensure_child_trap_request_page(u64 principal, u64 *request_va_out) {
 
 static int copy_cstr_from_target(u64 target_va, char *dst, u64 cap) {
     if (target_va == 0 || cap == 0) return 0;
-    for (u64 i = 0; i + 1 < cap; i++) {
-        if (copy_from_target(target_va + i, &dst[i], 1) != 1) return 0;
-        if (dst[i] == 0) return 1;
+    u64 copied = 0;
+    while (copied + 1 < cap) {
+        u64 chunk = min_u64(cap - 1 - copied, 64);
+        const u64 page_left = PAGE_BYTES - ((target_va + copied) & (PAGE_BYTES - 1));
+        chunk = min_u64(chunk, page_left);
+        const u64 got = copy_from_target(target_va + copied, dst + copied, chunk);
+        if (got == 0) return 0;
+        for (u64 i = 0; i < got; i++) {
+            if (dst[copied + i] == 0) return 1;
+        }
+        if (got != chunk) return 0;
+        copied += got;
     }
     dst[cap - 1] = 0;
     return 0;

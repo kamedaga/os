@@ -1,5 +1,7 @@
 #include "exec_service_abi.h"
 
+#define EXEC_SERVICE_PROFILE 0
+
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
@@ -149,11 +151,20 @@ static u64 g_ld_vm_token = 0;
 static u64 g_ld_bytes = 0;
 static u64 request_map_next = SCRATCH_REQUEST_MAP_BASE_VA;
 static u64 response_map_next = SCRATCH_RESPONSE_MAP_BASE_VA;
+static const char *g_vfs_read_profile_label = 0;
 
 static u64 cstr_len(const char *s) { u64 n = 0; while (s[n] != 0) n++; return n; }
 static u64 min_u64(u64 a, u64 b) { return a < b ? a : b; }
 static void user_log_len(const char *message, u64 len) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"((u64)SYSCALL_LOG), "D"((u64)message), "S"(len) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); (void)ret; }
 static void user_log(const char *message) { user_log_len(message, cstr_len(message)); }
+static void profile_vfs_read_step(const char *step) {
+    if (!EXEC_SERVICE_PROFILE || g_vfs_read_profile_label == 0) return;
+    user_log("ExecService.prof: ");
+    user_log(g_vfs_read_profile_label);
+    user_log(" ");
+    user_log(step);
+    user_log("\n");
+}
 static void clear_page(u64 va) { volatile u64 *p = (volatile u64 *)va; for (u64 i = 0; i < 512; i++) p[i] = 0; }
 static u64 syscall0(u64 nr) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall1(u64 nr, u64 a0) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
@@ -261,11 +272,14 @@ static int vfs_lookup_file_token(const char *path, u16 path_len, u64 *token_out,
 
 static int vfs_read_file_to_buffer(const char *path, u16 path_len, u64 buffer_va, u64 buffer_cap, u64 *file_bytes_out) {
     u64 file_token = 0; u64 file_bytes = 0;
+    profile_vfs_read_step("lookup begin");
     if (!vfs_lookup_file_token(path, path_len, &file_token, &file_bytes)) { user_log("ExecService: vfs read lookup failed\n"); return 0; }
+    profile_vfs_read_step("lookup done");
     if (file_bytes == 0 || file_bytes > buffer_cap) { user_log("ExecService: vfs read size invalid\n"); return 0; }
     if (!vfs_request(FS_OP_OPEN, file_token, 0, 0, 0, 0)) { user_log("ExecService: vfs open request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
     if (response->status != FS_STATUS_OK || response->result_token == 0) { user_log("ExecService: vfs open status failed\n"); return 0; }
+    profile_vfs_read_step("open done");
     const u64 open_token = response->result_token;
     u64 copied = 0;
     int ok = 1;
@@ -279,7 +293,9 @@ static int vfs_read_file_to_buffer(const char *path, u16 path_len, u64 buffer_va
         for (u64 i = 0; i < response->inline_bytes; i++) dst[i] = src[i];
         copied += response->inline_bytes;
     }
+    profile_vfs_read_step("read done");
     (void)vfs_request(FS_OP_CLOSE, open_token, 0, 0, 0, 0);
+    profile_vfs_read_step("close done");
     if (!ok) return 0;
     *file_bytes_out = file_bytes;
     return 1;
@@ -515,8 +531,15 @@ static int init_assets(void) {
     if (g_linux_abi_exec_token == 0) return 0;
     user_log("ExecService: load linux_abi_server ok\n");
     user_log("ExecService: load ld begin\n");
-    if (!vfs_read_file_to_buffer("/lib/ld-musl-x86_64.so.1", 24, SCRATCH_LD_IMAGE_VA, MAX_LD_IMAGE_BYTES, &g_ld_bytes)) return 0;
+    g_vfs_read_profile_label = "ld";
+    if (!vfs_read_file_to_buffer("/lib/ld-musl-x86_64.so.1", 24, SCRATCH_LD_IMAGE_VA, MAX_LD_IMAGE_BYTES, &g_ld_bytes)) {
+        g_vfs_read_profile_label = 0;
+        return 0;
+    }
+    g_vfs_read_profile_label = 0;
+    if (EXEC_SERVICE_PROFILE) user_log("ExecService.prof: ld vm install begin\n");
     g_ld_vm_token = install_vm_object_from_buffer(SCRATCH_LD_IMAGE_VA, g_ld_bytes);
+    if (EXEC_SERVICE_PROFILE) user_log("ExecService.prof: ld vm install done\n");
     if (g_ld_vm_token != 0) user_log("ExecService: load ld ok\n");
     return g_ld_vm_token != 0;
 }

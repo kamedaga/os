@@ -1,6 +1,6 @@
 static void init_process_fds(struct linux_process_state *proc) { for (u64 i = 0; i < 32; i++) proc->fds[i].kind = FD_UNUSED; proc->fds[0].kind = FD_STDIO; proc->fds[1].kind = FD_STDIO; proc->fds[2].kind = FD_STDIO; }
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
-    proc->used = 1; proc->principal = principal; init_process_fds(proc);
+    proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->principal = principal; init_process_fds(proc);
     proc->mmap_next_va = 0x31000000ULL;
     proc->brk_next_va = 0x38000000ULL;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
@@ -14,10 +14,23 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
         proc->sig_flags[i] = 0;
     }
 }
-static void init_process_tables(void) { for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) g_processes[i].used = 0; for (u64 i = 0; i < PIPE_MAX; i++) g_pipes[i].used = 0; }
+static void init_process_tables(void) {
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        g_processes[i].used = 0;
+        g_exit_record_used[i] = 0;
+        g_deferred_start_used[i] = 0;
+    }
+    for (u64 i = 0; i < PIPE_MAX; i++) g_pipes[i].used = 0;
+}
 static struct linux_process_state *process_state_for(u64 principal) {
     if (principal == 0) return 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) if (g_processes[i].used && g_processes[i].principal == principal) return &g_processes[i];
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (!g_processes[i].used || !g_processes[i].exec_pending) continue;
+        g_processes[i].principal = principal;
+        g_processes[i].exec_pending = 0;
+        return &g_processes[i];
+    }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) { if (g_processes[i].used) continue; init_process_state(&g_processes[i], principal); return &g_processes[i]; }
     return 0;
 }
@@ -33,13 +46,27 @@ static void pipe_ref_fd(const struct fd_entry *fd) {
 static int pipe_has_live_writer(u8 pipe_id);
 static void try_satisfy_pending_pipe_read(u8 pipe_id);
 
+static void defer_pipe_wake(u8 pipe_id) {
+    if (pipe_id < PIPE_MAX) g_deferred_pipe_wake_mask |= (u32)(1u << pipe_id);
+    prime_reply_return_signal();
+}
+
+static void flush_deferred_pipe_wakes(void) {
+    const u32 mask = g_deferred_pipe_wake_mask;
+    g_deferred_pipe_wake_mask = 0;
+    for (u8 pipe_id = 0; pipe_id < PIPE_MAX; pipe_id++) {
+        if ((mask & (u32)(1u << pipe_id)) == 0) continue;
+        try_satisfy_pending_pipe_read(pipe_id);
+    }
+}
+
 static void close_pipe_fd(u64 fd) {
     if (!fd_is_pipe(fd)) return;
     const u8 pipe_id = g_fds[fd].pipe_id;
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return;
     if (g_fds[fd].kind == FD_PIPE_READ && g_pipes[pipe_id].read_refs != 0) g_pipes[pipe_id].read_refs--;
     if (g_fds[fd].kind == FD_PIPE_WRITE && g_pipes[pipe_id].write_refs != 0) g_pipes[pipe_id].write_refs--;
-    try_satisfy_pending_pipe_read(pipe_id);
+    defer_pipe_wake(pipe_id);
     if (g_pipes[pipe_id].read_refs == 0 && g_pipes[pipe_id].write_refs == 0) g_pipes[pipe_id].used = 0;
 }
 
@@ -134,6 +161,38 @@ static int pipe_has_live_writer(u8 pipe_id) {
         for (u64 fd = 0; fd < 32; fd++) {
             if (proc->fds[fd].kind == FD_PIPE_WRITE && proc->fds[fd].pipe_id == pipe_id) return 1;
         }
+    }
+    return 0;
+}
+static struct linux_process_state *process_state_for_pid(u64 pid) {
+    if (pid == 0) return 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) if (g_processes[i].used && g_processes[i].pid == pid) return &g_processes[i];
+    return 0;
+}
+
+static void record_process_exit(u64 pid, u32 status) {
+    if (pid == 0) return;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (!g_exit_record_used[i] || g_exit_record_pid[i] != pid) continue;
+        g_exit_record_status[i] = status;
+        return;
+    }
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (g_exit_record_used[i]) continue;
+        g_exit_record_used[i] = 1;
+        g_exit_record_pid[i] = pid;
+        g_exit_record_status[i] = status;
+        return;
+    }
+}
+
+static int take_process_exit_record(u64 pid, u32 *status_out) {
+    if (pid == 0) return 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (!g_exit_record_used[i] || g_exit_record_pid[i] != pid) continue;
+        *status_out = g_exit_record_status[i];
+        g_exit_record_used[i] = 0;
+        return 1;
     }
     return 0;
 }

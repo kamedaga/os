@@ -23,9 +23,11 @@ void linux_abi_main(void) {
     user_log("LinuxAbiServer: started\n");
     struct ipc_message msg = reply(0, 0);
     for (;;) {
+        start_deferred_trap_targets();
+        flush_deferred_pipe_wakes();
         if (msg.status != SYSCALL_OK) { msg = wait_ipc(); continue; }
         if (msg.request_va == 0) { msg = wait_ipc(); continue; }
-        if (!is_known_trap_request_page(msg.request_va)) { user_log("LinuxAbiServer: bad request va\n"); msg = reply(errno_inval(), 0); continue; }
+        if (!is_known_trap_request_page(msg.request_va)) { msg = reply(errno_inval(), 0); continue; }
         const struct trap_request req_snapshot = *(const struct trap_request *)msg.request_va;
         const struct trap_request *req = &req_snapshot;
         if (req->magic != TRAP_MAGIC || req->version != TRAP_VERSION) { user_log("LinuxAbiServer: bad request header\n"); msg = reply(errno_inval(), 0); continue; }
@@ -85,9 +87,12 @@ void linux_abi_main(void) {
                 user_log("LinuxAbiServer: exit\n");
                 const u64 exiting_principal = req->caller_principal;
                 struct linux_process_state *exiting_proc = g_proc;
-                (void)satisfy_pending_waiters_for_child(exiting_principal);
+                const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
+                if (exiting_proc) exiting_proc->exit_status = (u32)(req->args[0] & 0xffu);
+                if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
+                (void)satisfy_pending_waiters_for_child(exiting_pid);
                 close_all_process_fds(g_proc);
-                exiting_proc->used = 0;
+                if (exiting_proc) exiting_proc->used = 0;
                 prime_reply_return_signal();
                 msg = reply(0, TRAP_RESPONSE_FLAG_EXIT);
                 (void)msg;

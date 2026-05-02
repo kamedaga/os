@@ -37,7 +37,7 @@ pub fn setup_workspace(
             SetupMode::Full => DiskEnsureMode::Always,
         },
     )?;
-    let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::fresh())?;
+    let inputs = prepare_sync_inputs(workspace_root, workspace, BuildOptions::default())?;
     let bootfs = sync_bootfs_generated(
         workspace_root,
         workspace,

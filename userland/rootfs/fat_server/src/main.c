@@ -10,6 +10,8 @@ enum {
     SYSCALL_ALLOC_PAGE = 0x1,
     SYSCALL_LOG = 0x9,
     SYSCALL_MAP_PAGE = 0x2,
+    SYSCALL_GRANT_CAP = 0x8,
+    SYSCALL_ALLOC_MAP_PAGES = 0xC,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
@@ -28,6 +30,8 @@ enum {
     FAT_RESPONSE_VA = 0x27001000,
     FAT_BLOCK_REQUEST_VA = 0x27100000,
     FAT_BLOCK_RESPONSE_VA = 0x27101000,
+    FAT_BLOCK_BULK_VA = 0x27102000,
+    FAT_BLOCK_BULK_PAGE_COUNT = 2,
     FAT_REPLY_ENDPOINT_ID = 0xE8,
     FAT_TOKEN_TAG = 1ULL << 63,
     FAT_ROOT_OBJECT_ID = 1,
@@ -56,6 +60,8 @@ enum {
     BLOCK_OP_CONNECT = 1,
     BLOCK_OP_READ_BLOCKS = 3,
     BLOCK_OP_WRITE_BLOCKS = 4,
+    BLOCK_OP_READ_BLOCKS_BULK = 6,
+    BLOCK_OP_WRITE_BLOCKS_BULK = 7,
     BLOCK_STATUS_OK = 0,
     BLOCK_REQUEST_HEADER_BYTES = 72,
     BLOCK_REQUEST_PAYLOAD_BYTES = 4096 - BLOCK_REQUEST_HEADER_BYTES,
@@ -139,6 +145,9 @@ struct block_session {
     u64 block_size;
     u64 capacity_blocks;
     u64 next_seq;
+    u64 bulk_paddr;
+    u64 bulk_guard_paddr;
+    u8 bulk_ready;
 };
 
 struct fat_bpb_info {
@@ -267,6 +276,17 @@ static u64 syscall3(u64 nr, u64 arg0, u64 arg1, u64 arg2) {
         : "=a"(ret)
         : "a"(nr), "D"(arg0), "S"(arg1), "d"(arg2)
         : "rcx", "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
+static u64 syscall4(u64 nr, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
+    u64 ret;
+    register u64 r10 __asm__("r10") = arg3;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr), "D"(arg0), "S"(arg1), "d"(arg2), "r"(r10)
+        : "rcx", "r8", "r9", "r11", "memory");
     return ret;
 }
 
@@ -544,6 +564,38 @@ static int grant_block_response_page(void) {
     return ret == SYSCALL_OK;
 }
 
+static int grant_block_bulk_page(void) {
+    if (g_block.bulk_paddr < 0x1000) return 0;
+    u64 ret = syscall3(
+        SYSCALL_GRANT_CAP,
+        g_block.bulk_paddr,
+        g_block.process_slot,
+        PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE
+    );
+    if (ret == SYSCALL_OK) return 1;
+    return ret == SYSCALL_OK;
+}
+
+static int ensure_block_bulk_page(void) {
+    if (g_block.bulk_ready) return 1;
+    if (g_block.bulk_paddr == 0) {
+        u64 paddrs[FAT_BLOCK_BULK_PAGE_COUNT] = {0, 0};
+        if (syscall4(
+                SYSCALL_ALLOC_MAP_PAGES,
+                FAT_BLOCK_BULK_VA,
+                FAT_BLOCK_BULK_PAGE_COUNT,
+                1,
+                (u64)paddrs
+            ) != SYSCALL_OK) return 0;
+        g_block.bulk_paddr = paddrs[0];
+        g_block.bulk_guard_paddr = paddrs[1];
+        if (g_block.bulk_paddr < 0x1000 || g_block.bulk_guard_paddr < 0x1000) return 0;
+    }
+    if (!grant_block_bulk_page()) return 0;
+    g_block.bulk_ready = 1;
+    return 1;
+}
+
 static int share_block_request_page(void) {
     u64 ret = syscall2(SYSCALL_SHARE_CAP, g_block.request_paddr, g_block.endpoint_id);
     if (ret == SYSCALL_OK) return 1;
@@ -637,7 +689,42 @@ static int connect_block_service(void) {
 }
 
 static int read_volume_sector0_probe(void) {
-    if (!g_block.active || g_block.block_size == 0 || g_block.block_size > BLOCK_RESPONSE_PAYLOAD_BYTES) return 0;
+    if (!g_block.active || g_block.block_size == 0 || g_block.block_size > sizeof(g_volume_sector0)) return 0;
+    if (g_block.block_size > BLOCK_RESPONSE_PAYLOAD_BYTES) {
+        if (!ensure_block_bulk_page()) return 0;
+        clear_page(FAT_BLOCK_REQUEST_VA);
+        clear_page(FAT_BLOCK_RESPONSE_VA);
+        clear_page(FAT_BLOCK_BULK_VA);
+        const u64 seq = g_block.next_seq++;
+        volatile struct block_request_header *request = (volatile struct block_request_header *)FAT_BLOCK_REQUEST_VA;
+        request->magic = BLOCK_REQUEST_MAGIC;
+        request->version = BLOCK_PROTOCOL_VERSION;
+        request->op = BLOCK_OP_READ_BLOCKS_BULK;
+        request->object_token = g_block.root_token;
+        request->block_index = g_volume_start_block;
+        request->block_count = 1;
+        request->flags = 1;
+        request->inline_bytes = 8;
+        request->reserved0 = 0;
+        request->reserved1 = 0;
+        request->arg0 = 0;
+        request->arg1 = 0;
+        request->session_nonce = g_block.session_nonce;
+        volatile u64 *payload = (volatile u64 *)(FAT_BLOCK_REQUEST_VA + BLOCK_REQUEST_HEADER_BYTES);
+        payload[0] = g_block.bulk_paddr;
+        __asm__ volatile("" ::: "memory");
+        request->request_seq = seq;
+
+        if (!signal_block_endpoint()) return 0;
+        if (!wait_block_response(seq, BLOCK_OP_READ_BLOCKS_BULK)) return 0;
+
+        volatile struct block_response_header *response = (volatile struct block_response_header *)FAT_BLOCK_RESPONSE_VA;
+        if (response->status != BLOCK_STATUS_OK || response->arg0 != g_block.block_size) return 0;
+        volatile u8 *bulk = (volatile u8 *)FAT_BLOCK_BULK_VA;
+        for (u64 i = 0; i < g_block.block_size; i++) g_volume_sector0[i] = bulk[i];
+        user_log("[fat_server] FatServer: volume sector0 read ok\n");
+        return 1;
+    }
     clear_page(FAT_BLOCK_REQUEST_VA);
     clear_page(FAT_BLOCK_RESPONSE_VA);
     const u64 seq = g_block.next_seq++;
@@ -679,6 +766,15 @@ static FAT_NOINLINE_NOOPT void copy_block_payload_to_sector(u8 *out, u64 copy_by
         : "memory");
 }
 
+static FAT_NOINLINE_NOOPT void copy_block_bulk_to_sector(u8 *out, u64 copy_bytes) {
+    const volatile u8 *payload = (const volatile u8 *)FAT_BLOCK_BULK_VA;
+    __asm__ volatile(
+        "rep movsb"
+        : "+D"(out), "+S"(payload), "+c"(copy_bytes)
+        :
+        : "memory");
+}
+
 static u32 cluster_to_sector(u32 cluster) {
     if (cluster < 2) return 0;
     return g_bpb.first_data_sector + (cluster - 2) * (u32)g_bpb.sectors_per_cluster;
@@ -705,9 +801,42 @@ static int fat_cluster_in_volume(u32 cluster) {
 }
 
 static FAT_NOINLINE_NOOPT int read_volume_sector(u32 sector, u8 *out) {
-    if (!g_block.active || g_block.block_size == 0 || g_block.block_size > BLOCK_RESPONSE_PAYLOAD_BYTES) return 0;
+    if (!g_block.active || g_block.block_size == 0 || g_block.block_size > sizeof(g_sector_scratch)) return 0;
     const u64 copy_bytes = g_bpb.valid ? (u64)g_bpb.bytes_per_sector : g_block.block_size;
-    if (copy_bytes == 0 || copy_bytes > BLOCK_RESPONSE_PAYLOAD_BYTES) return 0;
+    if (copy_bytes == 0 || copy_bytes > sizeof(g_sector_scratch) || copy_bytes > g_block.block_size) return 0;
+    if (copy_bytes > BLOCK_RESPONSE_PAYLOAD_BYTES) {
+        if (!ensure_block_bulk_page()) return 0;
+        clear_page(FAT_BLOCK_REQUEST_VA);
+        clear_page(FAT_BLOCK_RESPONSE_VA);
+        clear_page(FAT_BLOCK_BULK_VA);
+        const u64 seq = g_block.next_seq++;
+        volatile struct block_request_header *request = (volatile struct block_request_header *)FAT_BLOCK_REQUEST_VA;
+        request->magic = BLOCK_REQUEST_MAGIC;
+        request->version = BLOCK_PROTOCOL_VERSION;
+        request->op = BLOCK_OP_READ_BLOCKS_BULK;
+        request->object_token = g_block.root_token;
+        request->block_index = g_volume_start_block + sector;
+        request->block_count = 1;
+        request->flags = 1;
+        request->inline_bytes = 8;
+        request->reserved0 = 0;
+        request->reserved1 = 0;
+        request->arg0 = 0;
+        request->arg1 = 0;
+        request->session_nonce = g_block.session_nonce;
+        volatile u64 *payload = (volatile u64 *)(FAT_BLOCK_REQUEST_VA + BLOCK_REQUEST_HEADER_BYTES);
+        payload[0] = g_block.bulk_paddr;
+        __asm__ volatile("" ::: "memory");
+        request->request_seq = seq;
+
+        if (!signal_block_endpoint()) return 0;
+        if (!wait_block_response(seq, BLOCK_OP_READ_BLOCKS_BULK)) return 0;
+
+        volatile struct block_response_header *response = (volatile struct block_response_header *)FAT_BLOCK_RESPONSE_VA;
+        if (response->status != BLOCK_STATUS_OK || response->arg0 < copy_bytes || response->arg0 > FS_PAGE_BYTES) return 0;
+        copy_block_bulk_to_sector(out, copy_bytes);
+        return 1;
+    }
     clear_page(FAT_BLOCK_REQUEST_VA);
     clear_page(FAT_BLOCK_RESPONSE_VA);
     const u64 seq = g_block.next_seq++;
@@ -746,10 +875,51 @@ static FAT_NOINLINE_NOOPT void copy_sector_to_block_payload(const u8 *src, u64 c
         : "memory");
 }
 
+static FAT_NOINLINE_NOOPT void copy_sector_to_block_bulk(const u8 *src, u64 copy_bytes) {
+    volatile u8 *payload = (volatile u8 *)FAT_BLOCK_BULK_VA;
+    __asm__ volatile(
+        "rep movsb"
+        : "+D"(payload), "+S"(src), "+c"(copy_bytes)
+        :
+        : "memory");
+}
+
 static FAT_NOINLINE_NOOPT int write_volume_sector(u32 sector, const u8 *src) {
-    if (!g_block.active || g_block.block_size == 0 || g_block.block_size > BLOCK_REQUEST_PAYLOAD_BYTES) return 0;
+    if (!g_block.active || g_block.block_size == 0 || g_block.block_size > FS_PAGE_BYTES) return 0;
     const u64 copy_bytes = g_bpb.valid ? (u64)g_bpb.bytes_per_sector : g_block.block_size;
-    if (copy_bytes == 0 || copy_bytes > BLOCK_REQUEST_PAYLOAD_BYTES) return 0;
+    if (copy_bytes == 0 || copy_bytes > FS_PAGE_BYTES || copy_bytes > g_block.block_size) return 0;
+    if (copy_bytes > BLOCK_REQUEST_PAYLOAD_BYTES) {
+        if (!ensure_block_bulk_page()) return 0;
+        clear_page(FAT_BLOCK_REQUEST_VA);
+        clear_page(FAT_BLOCK_RESPONSE_VA);
+        clear_page(FAT_BLOCK_BULK_VA);
+        copy_sector_to_block_bulk(src, copy_bytes);
+        const u64 seq = g_block.next_seq++;
+        volatile struct block_request_header *request = (volatile struct block_request_header *)FAT_BLOCK_REQUEST_VA;
+        request->magic = BLOCK_REQUEST_MAGIC;
+        request->version = BLOCK_PROTOCOL_VERSION;
+        request->op = BLOCK_OP_WRITE_BLOCKS_BULK;
+        request->object_token = g_block.root_token;
+        request->block_index = g_volume_start_block + sector;
+        request->block_count = 1;
+        request->flags = 1;
+        request->inline_bytes = 8;
+        request->reserved0 = 0;
+        request->reserved1 = 0;
+        request->arg0 = 0;
+        request->arg1 = 0;
+        request->session_nonce = g_block.session_nonce;
+        volatile u64 *payload = (volatile u64 *)(FAT_BLOCK_REQUEST_VA + BLOCK_REQUEST_HEADER_BYTES);
+        payload[0] = g_block.bulk_paddr;
+        __asm__ volatile("" ::: "memory");
+        request->request_seq = seq;
+
+        if (!signal_block_endpoint()) return 0;
+        if (!wait_block_response(seq, BLOCK_OP_WRITE_BLOCKS_BULK)) return 0;
+
+        volatile struct block_response_header *response = (volatile struct block_response_header *)FAT_BLOCK_RESPONSE_VA;
+        return response->status == BLOCK_STATUS_OK;
+    }
     clear_page(FAT_BLOCK_REQUEST_VA);
     clear_page(FAT_BLOCK_RESPONSE_VA);
     const u64 seq = g_block.next_seq++;
