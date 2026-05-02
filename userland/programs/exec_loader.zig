@@ -20,6 +20,10 @@ const interpreter_source_map_va: u64 = 0x2900_0000;
 const bootfs_source_map_va: u64 = 0x2A00_0000;
 const lib_source_map_va: u64 = 0x2B00_0000;
 const page_bytes: u64 = 4096;
+const zero_page = [_]u8{0} ** 4096;
+const linux_stack_pages: u64 = 16;
+const linux_stack_bytes: u64 = linux_stack_pages * page_bytes;
+const linux_stack_bottom_va: u64 = process_abi.user_stack_top - linux_stack_bytes;
 const stdio_sink_target_va: u64 = 0x3C02_2000;
 const stdio_sink_magic: u64 = 0x5354_4449_4F53_4831;
 const stdio_sink_version: u64 = 1;
@@ -1056,7 +1060,7 @@ fn installRuntimeBootstrapPages(process_token: u64) bool {
 }
 
 fn pushStackBytes(process_token: u64, sp: *u64, bytes: []const u8) ?u64 {
-    if (bytes.len == 0 or bytes.len > sp.* - process_abi.user_stack_page_va) return null;
+    if (bytes.len == 0 or bytes.len > sp.* - linux_stack_bottom_va) return null;
     sp.* -= @intCast(bytes.len);
     if (!writeProcessBytes(process_token, sp.*, bytes)) return null;
     return sp.*;
@@ -1078,7 +1082,7 @@ const LinuxAuxEntry = struct {
 
 fn writeStackWords(process_token: u64, sp: *u64, words: []const u64) bool {
     const word_bytes = @as(u64, @intCast(words.len * 8));
-    if (word_bytes > sp.* - process_abi.user_stack_page_va) return false;
+    if (word_bytes > sp.* - linux_stack_bottom_va) return false;
     sp.* -= word_bytes;
     var index: usize = 0;
     while (index < words.len) : (index += 1) {
@@ -1101,7 +1105,7 @@ fn installLinuxInitialStack(
     interp_base: u64,
     config: LinuxInitialStackConfig,
 ) ?u64 {
-    var sp = process_abi.user_stack_page_va + page_bytes;
+    var sp = process_abi.user_stack_top;
     var random_bytes = [_]u8{ 0x43, 0x61, 0x70, 0x4f, 0x53, 0x2d, 0x6c, 0x69, 0x6e, 0x75, 0x78, 0x2d, 0x61, 0x62, 0x69, 0x00 };
     const random_va = pushStackBytes(process_token, &sp, random_bytes[0..]) orelse return null;
     const platform_va = pushStackString(process_token, &sp, config.platform) orelse return null;
@@ -1267,16 +1271,31 @@ fn loadPrivateSegment(
         if (!mapped_pages.contains(page_target_va)) {
             const prot = pageProtFromImage(source_base_va, ehdr, file_bytes, page_vaddr) orelse return false;
             if (!allocMapPagesToProcess(process_token, page_target_va, 1, prot)) return false;
+            if (!copyToProcess(process_token, page_target_va, @intFromPtr(&zero_page), page_bytes)) return false;
             if (!mapped_pages.add(page_target_va)) return false;
         }
     }
 
-    if (phdr.filesz == 0) return true;
-    const src_va, const src_overflow = @addWithOverflow(source_base_va, phdr.offset);
-    if (src_overflow != 0) return false;
     const dest_va, const dest_overflow = @addWithOverflow(load_bias, phdr.vaddr);
     if (dest_overflow != 0) return false;
-    return copyToProcess(process_token, dest_va, src_va, phdr.filesz);
+    if (phdr.filesz != 0) {
+        const src_va, const src_overflow = @addWithOverflow(source_base_va, phdr.offset);
+        if (src_overflow != 0) return false;
+        if (!copyToProcess(process_token, dest_va, src_va, phdr.filesz)) return false;
+    }
+    if (phdr.memsz > phdr.filesz) {
+        const bss_va, const bss_overflow = @addWithOverflow(dest_va, phdr.filesz);
+        if (bss_overflow != 0) return false;
+        var remaining = phdr.memsz - phdr.filesz;
+        var offset: u64 = 0;
+        while (remaining != 0) {
+            const chunk = if (remaining > page_bytes) page_bytes else remaining;
+            if (!copyToProcess(process_token, bss_va + offset, @intFromPtr(&zero_page), chunk)) return false;
+            remaining -= chunk;
+            offset += chunk;
+        }
+    }
+    return true;
 }
 
 fn loadSegment(
@@ -1568,7 +1587,7 @@ fn launchExec(
         userLog("ExecLoader: standard interpreter loaded\n");
     }
 
-    if (!allocMapPagesToProcess(process_token, process_abi.user_stack_page_va, 1, .{ .read = true, .write = true })) {
+    if (!allocMapPagesToProcess(process_token, linux_stack_bottom_va, linux_stack_pages, .{ .read = true, .write = true })) {
         abortProcess(process_token);
         userLog("ExecLoader: stack alloc failed\n");
         return null;

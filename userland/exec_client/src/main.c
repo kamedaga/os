@@ -44,13 +44,13 @@ static void process_exit(u64 code) {
 void exec_client_main(void) {
     user_log("ExecClient: started\n");
 
-    static const char *argv[] = { "/cmd/musl_smoke.elf", "argv-smoke" };
+    static const char *argv[] = { "/cmd/dash.elf", "-c", "echo pipe-ok | while read x; do echo $x; done" };
     static const char *envp[] = { "PATH=/bin:/cmd", "CAPABILITYOS=1" };
     struct exec_service_spawn_result result;
     const struct exec_service_spawn_options options = {
-        .path = "/cmd/musl_smoke.elf",
+        .path = "/cmd/dash.elf",
         .argv = argv,
-        .argv_count = 2,
+        .argv_count = 3,
         .envp = envp,
         .envp_count = 2,
         .request_va = EXEC_CLIENT_REQUEST_VA,

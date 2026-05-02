@@ -5,9 +5,28 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 project(linux_abi_server C ASM)
 
+set(LINUX_ABI_SERVER_INCLUDED_SOURCES
+  src/common.inc.c
+  src/runtime.inc.c
+  src/vfs.inc.c
+  src/process_state.inc.c
+  src/execve.inc.c
+  src/fs_syscalls.inc.c
+  src/fd_syscalls.inc.c
+  src/process_syscalls.inc.c
+  src/misc_syscalls.inc.c
+  src/vm_syscalls.inc.c
+  src/main_loop.inc.c
+)
+
+set_source_files_properties(${LINUX_ABI_SERVER_INCLUDED_SOURCES}
+  PROPERTIES HEADER_FILE_ONLY TRUE
+)
+
 add_executable(linux_abi_server
   src/entry.S
   src/main.c
+  ${LINUX_ABI_SERVER_INCLUDED_SOURCES}
 )
 
 set_target_properties(linux_abi_server PROPERTIES

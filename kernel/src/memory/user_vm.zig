@@ -315,7 +315,39 @@ pub fn collectUserMappedPaddrs(principal: kernel.PrincipalId, out_paddrs: []u64)
 pub const MappedUserPage = struct {
     va: u64,
     paddr: u64,
+    writable: bool,
 };
+
+pub const MappedUserPageVisitor = *const fn (context: *anyopaque, page: MappedUserPage) bool;
+
+pub fn forEachUserMappedPage(principal: kernel.PrincipalId, context: *anyopaque, visitor: MappedUserPageVisitor) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const user_pdp_index: u64 = (h.user_va >> 30) & 0x1FF;
+    var slot: usize = 0;
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        const pd_index_meta = space.pt_page_pd_index[slot];
+        if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
+        const pd_index: usize = @intCast(pd_index_meta);
+        var pt_index: usize = 0;
+        while (pt_index < h.page_entries) : (pt_index += 1) {
+            const entry = space.pt_pages[slot][pt_index];
+            if ((entry & h.page_present) == 0) continue;
+            if ((entry & h.page_user) == 0) continue;
+            const paddr = entry & ~@as(u64, 0xFFF);
+            if (paddr == 0) continue;
+            const va = (user_pdp_index << 30) |
+                (@as(u64, @intCast(pd_index)) << 21) |
+                (@as(u64, @intCast(pt_index)) << 12);
+            if (!visitor(context, .{
+                .va = va,
+                .paddr = paddr,
+                .writable = (entry & h.page_rw) != 0,
+            })) return false;
+        }
+    }
+    return true;
+}
 
 pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []MappedUserPage) usize {
     const h = hooks orelse return 0;
@@ -346,7 +378,11 @@ pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []Mapped
             const va = (user_pdp_index << 30) |
                 (@as(u64, @intCast(pd_index)) << 21) |
                 (@as(u64, @intCast(pt_index)) << 12);
-            out_pages[count] = .{ .va = va, .paddr = paddr };
+            out_pages[count] = .{
+                .va = va,
+                .paddr = paddr,
+                .writable = (entry & h.page_rw) != 0,
+            };
             count += 1;
         }
     }

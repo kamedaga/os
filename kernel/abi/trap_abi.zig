@@ -39,6 +39,10 @@ pub const syscall_set_abi_trap_reply_target_fs_base: u64 = 0x4F;
 pub const syscall_protect_abi_trap_reply_target_pages: u64 = 0x50;
 pub const syscall_unmap_abi_trap_reply_target_pages: u64 = 0x51;
 pub const syscall_reclaim_abi_trap_reply_target_private_pages: u64 = 0x52;
+pub const syscall_reply_abi_trap_target: u64 = 0x54;
+pub const syscall_copy_to_abi_trap_target: u64 = 0x55;
+pub const syscall_start_abi_trap_target: u64 = 0x56;
+pub const syscall_set_abi_trap_target_request_page: u64 = 0x57;
 pub const abi_trap_copy_max_bytes: usize = 4096;
 
 pub const TrapRequest = extern struct {

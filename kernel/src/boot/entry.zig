@@ -31,6 +31,7 @@ const elf_load = @import("elf_load.zig");
 const init_setup = @import("init_setup.zig");
 const spawn = @import("../runtime/spawn.zig");
 const process_builder = @import("../runtime/process_builder.zig");
+const abi_trap_runtime = @import("../runtime/abi_trap.zig");
 const halt = @import("../halt.zig");
 const log_util = @import("../log_util.zig");
 
@@ -755,6 +756,19 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
     spawn.init(state, &global_free_list, user_spaces, boot_init_principal);
     process_builder.init(state, &global_free_list, user_spaces);
+    abi_trap_runtime.init(.{
+        .state = state,
+        .free_list = &global_free_list,
+        .user_spaces = user_spaces,
+        .write = kernel_log.write,
+        .principal_label = principalLabel,
+        .write_user_u64 = user_copy.writeUserU64,
+        .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
+        .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
+        .consume_pending_signal_for_principal = scheduler.consumePendingSignalForPrincipal,
+        .block_current_thread_for_event = scheduler.blockCurrentThreadForEvent,
+        .exit_current_process = exitCurrentProcess,
+    });
 
     syscalls.init(.{
         .state = state,

@@ -203,8 +203,6 @@ struct fat_dynamic_object {
 };
 
 static struct fat_dynamic_object g_dynamic_objects[FAT_MAX_DYNAMIC_OBJECTS];
-static volatile u64 g_block_copy_index;
-
 static u64 cstr_len(const char *s) {
     u64 n = 0;
     while (s[n] != 0) n++;
@@ -645,10 +643,8 @@ static int read_volume_sector0_probe(void) {
 
 static FAT_NOINLINE_NOOPT void copy_block_payload_to_sector(u8 *out, u64 copy_bytes) {
     const volatile u8 *payload = (const volatile u8 *)(FAT_BLOCK_RESPONSE_VA + BLOCK_RESPONSE_HEADER_BYTES);
-    g_block_copy_index = 0;
-    while (g_block_copy_index < copy_bytes) {
-        out[g_block_copy_index] = payload[g_block_copy_index];
-        g_block_copy_index = g_block_copy_index + 1;
+    for (u64 i = 0; i < copy_bytes; i++) {
+        out[i] = payload[i];
     }
 }
 

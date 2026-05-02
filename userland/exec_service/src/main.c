@@ -135,6 +135,9 @@ struct linux_abi_bootstrap_config {
     u64 standard_interpreter_file_bytes;
     u64 abi_trap_request_page_va;
     u64 status;
+    u16 exec_path_bytes;
+    u8 reserved0[6];
+    char exec_path[128];
 };
 
 static struct vfs_client g_vfs;
@@ -357,7 +360,7 @@ static int configure_exec_args(struct exec_loader_config *cfg, const struct exec
     return 1;
 }
 
-static u64 spawn_linux_abi_server(void) {
+static u64 spawn_linux_abi_server(const struct exec_service_request *request) {
     volatile u8 *registry_src = (volatile u8 *)PROCESS_SERVICE_REGISTRY_SHADOW_VA;
     volatile u8 *registry_dst = (volatile u8 *)SCRATCH_REGISTRY_COPY_VA;
     for (u64 i = 0; i < PAGE_BYTES; i++) registry_dst[i] = registry_src[i];
@@ -368,6 +371,11 @@ static u64 spawn_linux_abi_server(void) {
     cfg->version = LINUX_ABI_BOOTSTRAP_VERSION;
     cfg->standard_interpreter_file_bytes = g_ld_bytes;
     cfg->abi_trap_request_page_va = LINUX_ABI_TRAP_REQUEST_PAGE_VA;
+    cfg->exec_path_bytes = request->path_bytes;
+    for (u16 i = 0; i < request->path_bytes && i < sizeof(cfg->exec_path) - 1; i++) {
+        cfg->exec_path[i] = (char)request->arg_data[i];
+    }
+    cfg->exec_path[request->path_bytes < sizeof(cfg->exec_path) ? request->path_bytes : sizeof(cfg->exec_path) - 1] = 0;
 
     struct bootstrap_descriptor_table *table = (struct bootstrap_descriptor_table *)SCRATCH_LINUX_ABI_TABLE_VA;
     clear_page(SCRATCH_LINUX_ABI_TABLE_VA);
@@ -480,7 +488,7 @@ static void handle_request_paddr(u64 request_paddr) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_IO, 0, 0);
         return;
     }
-    const u64 abi_slot = spawn_linux_abi_server();
+    const u64 abi_slot = spawn_linux_abi_server(request);
     if (abi_slot == 0) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, 0, 0);
         return;
