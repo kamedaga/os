@@ -1,6 +1,7 @@
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 const interrupts = @import("interrupts.zig");
+const scheduler = @import("scheduler.zig");
 
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
@@ -11,7 +12,6 @@ pub const Hooks = struct {
     page_ps: u64,
     kernel_state_ready: *const bool,
     state: *kernel.KernelState,
-    current_user_principal: *const kernel.PrincipalId,
     write: *const fn ([]const u8) void,
     write_hex_raw: *const fn (u64) void,
     write_bool01: *const fn (bool) void,
@@ -79,7 +79,7 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     h.write_bool01(va_user);
     h.write("\n");
 
-    const pf_cap = capability.issuePageFaultCapability(h.current_user_principal.*, frame, cr2) orelse {
+    const pf_cap = capability.issuePageFaultCapability(scheduler.currentUserPrincipal(), frame, cr2) orelse {
         h.write("  PF_CAP=none\n");
         h.write("  CAP_LOOKUP=skip\n");
         return;

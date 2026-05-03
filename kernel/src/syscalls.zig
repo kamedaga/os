@@ -13,6 +13,7 @@ const queue_abi = abi_root.queue_abi;
 const untyped_memory = @import("untyped_memory.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
+const smp = @import("smp.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const process_builder = @import("runtime/process_builder.zig");
 const abi_trap_runtime = @import("runtime/abi_trap.zig");
@@ -133,8 +134,9 @@ pub const Hooks = struct {
 
 var hooks: ?Hooks = null;
 pub export var syscall_return_writeback_enabled: u64 = 1;
+pub export var syscall_return_writeback_enabled_by_cpu: [smp.max_cpus]u64 = [_]u64{1} ** smp.max_cpus;
 const syscall_fast_handled_mask: u64 = 1 << 63;
-extern var syscall_entry_is_lstar: u64;
+extern var syscall_entry_is_lstars: [smp.max_cpus]u64;
 
 const IpcSignalTarget = struct {
     principal: kernel.PrincipalId,
@@ -147,6 +149,21 @@ pub fn init(new_hooks: Hooks) void {
 
 fn getHooks() *const Hooks {
     return &(hooks orelse unreachable);
+}
+
+fn currentCpuSlotBounded() usize {
+    const cpu_slot = scheduler.currentCpuSlot();
+    return if (cpu_slot < smp.max_cpus) cpu_slot else 0;
+}
+
+fn setSyscallReturnWritebackEnabled(enabled: bool) void {
+    const value: u64 = if (enabled) 1 else 0;
+    syscall_return_writeback_enabled = value;
+    syscall_return_writeback_enabled_by_cpu[currentCpuSlotBounded()] = value;
+}
+
+fn currentSyscallEntryIsLstar() bool {
+    return syscall_entry_is_lstars[currentCpuSlotBounded()] != 0;
 }
 
 fn hasExplicitUserLogLabel(message: []const u8) bool {
@@ -355,32 +372,32 @@ fn dispatchIpcSyscall(
 
 pub export fn syscallIpcDispatch(frame: *TrapFrame) callconv(.c) u64 {
     const h = getHooks();
-    const entry_thread = scheduler.current_thread_index;
-    syscall_return_writeback_enabled = 1;
+    const entry_thread = scheduler.currentThreadIndex();
+    setSyscallReturnWritebackEnabled(true);
     defer {
-        if (scheduler.current_thread_index != entry_thread) {
-            syscall_return_writeback_enabled = 0;
+        if (scheduler.currentThreadIndex() != entry_thread) {
+            setSyscallReturnWritebackEnabled(false);
         }
     }
     if (!h.kernel_state_ready.*) return syscall_err_not_ready;
 
     const state = h.state;
-    const proc = scheduler.current_user_principal;
+    const proc = scheduler.currentUserPrincipal();
     return dispatchIpcSyscall(h, state, proc, frame) orelse syscall_err_invalid;
 }
 
 pub export fn syscallIpcCallReplyRecvSignalOnlyDispatch(frame: *TrapFrame) callconv(.c) u64 {
     const h = getHooks();
-    const entry_thread = scheduler.current_thread_index;
-    syscall_return_writeback_enabled = 1;
+    const entry_thread = scheduler.currentThreadIndex();
+    setSyscallReturnWritebackEnabled(true);
     defer {
-        if (scheduler.current_thread_index != entry_thread) {
-            syscall_return_writeback_enabled = 0;
+        if (scheduler.currentThreadIndex() != entry_thread) {
+            setSyscallReturnWritebackEnabled(false);
         }
     }
     if (!h.kernel_state_ready.*) return syscall_err_not_ready;
 
-    const proc = scheduler.current_user_principal;
+    const proc = scheduler.currentUserPrincipal();
     const status = signalEndpointMessage(h.state, proc, frame.rsi, true, frame.rdi, frame.r8, frame.r9, frame.r10);
     if (status != syscall_ok) return status;
     if (consumeQueuedIpcMessageForPrincipal(proc, frame)) return syscall_ok;
@@ -481,7 +498,7 @@ fn consumeQueuedIpcMessageForPrincipal(principal: kernel.PrincipalId, frame: *Tr
 
 fn writeCurrentIpcSignalQueuedReturn(out_frame: *TrapFrame, save: *const IpcSignalSave, msg: scheduler.IpcQueuedMessage) usize {
     out_frame.* = trapFrameFromIpcSignalSave(save, syscall_ok);
-    grantQueuedReplyToken(scheduler.current_thread_index, msg);
+    grantQueuedReplyToken(scheduler.currentThreadIndex(), msg);
     applyQueuedIpcMessageToFrame(out_frame, msg);
     return @intFromPtr(out_frame);
 }
@@ -519,7 +536,7 @@ fn signalEndpointMessage(
     return deliverOrQueueIpcMessageToThread(
         target_thread,
         endpoint_id,
-        scheduler.current_thread_index,
+        scheduler.currentThreadIndex(),
         grants_reply,
         mr0,
         mr1,
@@ -529,7 +546,7 @@ fn signalEndpointMessage(
 }
 
 fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u64) u64 {
-    const current_thread = scheduler.current_thread_index;
+    const current_thread = scheduler.currentThreadIndex();
     const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return syscall_err_not_ready;
     if (current_hot.ipc_reply_token_valid == 0) return syscall_err_endpoint;
     const target_thread = current_hot.ipc_reply_token_target_thread;
@@ -562,7 +579,7 @@ fn resolveIpcSignalTargetThread(
 ) ?IpcSignalTarget {
     _ = current_ctx;
     const generation = state.endpoint_generation;
-    const current_thread = scheduler.current_thread_index;
+    const current_thread = scheduler.currentThreadIndex();
     const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return null;
     if (current_hot.ipc_cached_endpoint_generation == generation and
         current_hot.ipc_cached_endpoint_id == endpoint_id)
@@ -583,8 +600,8 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
     const h = getHooks();
     if (!h.kernel_state_ready.*) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
 
-    const proc = scheduler.current_user_principal;
-    const current_thread = scheduler.current_thread_index;
+    const proc = scheduler.currentUserPrincipal();
+    const current_thread = scheduler.currentThreadIndex();
     const current_ctx = scheduler.getThreadContext(current_thread) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
     const target = resolveIpcSignalTargetThread(h.state, current_ctx, proc, endpoint_id) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
     const target_ctx = scheduler.getThreadContext(target.thread_index) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
@@ -658,16 +675,14 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
     }
 
     saveIpcSignalFrameToContext(current_ctx, save, syscall_ok);
-    current_ctx.cr3 = scheduler.user_cr3_value;
+    current_ctx.cr3 = scheduler.currentUserCr3();
     current_ctx.wait_mailbox = false;
     current_ctx.wake_tick = 0;
     current_ctx.ready = false;
-    scheduler.setIpcHotCr3(current_thread, scheduler.user_cr3_value);
+    scheduler.setIpcHotCr3(current_thread, scheduler.currentUserCr3());
     scheduler.setIpcHotWaitState(current_thread, false, 0, false);
 
-    scheduler.current_thread_index = target.thread_index;
-    scheduler.current_user_principal = target.principal;
-    scheduler.user_cr3_value = target_hot.cr3;
+    _ = scheduler.setCurrentExecutionFromHotThread(target.thread_index);
     _ = scheduler.applyThreadFsBase(target.thread_index);
 
     return @intFromPtr(&target_ctx.frame);
@@ -678,7 +693,7 @@ pub export fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) c
     if (!h.kernel_state_ready.*) return syscall_fast_handled_mask | syscall_err_not_ready;
 
     const state = h.state;
-    const proc = scheduler.current_user_principal;
+    const proc = scheduler.currentUserPrincipal();
     const result: u64 = switch (nr) {
         syscall_send_cap => transferPageCapOnEndpoint(state, h, proc, arg1, arg0, false),
         syscall_share_cap => transferPageCapOnEndpoint(state, h, proc, arg1, arg0, true),
@@ -732,29 +747,31 @@ pub export fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) c
     return syscall_fast_handled_mask | result;
 }
 
-pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
+fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     const h = getHooks();
-    const entry_thread = scheduler.current_thread_index;
-    syscall_return_writeback_enabled = 1;
+    const entry_thread = scheduler.currentThreadIndex();
+    setSyscallReturnWritebackEnabled(true);
     defer {
-        if (scheduler.current_thread_index != entry_thread) {
+        if (scheduler.currentThreadIndex() != entry_thread) {
             // When a syscall returns to a different thread, the loaded frame
             // already belongs to that target thread and must not inherit the
             // caller's syscall result in RAX.
-            syscall_return_writeback_enabled = 0;
+            setSyscallReturnWritebackEnabled(false);
         }
     }
     if (!h.kernel_state_ready.*) return syscall_err_not_ready;
 
     const state = h.state;
-    const proc = scheduler.current_user_principal;
-    if (syscall_entry_is_lstar != 0) {
-        if (abi_trap_runtime.dispatchDelegate(proc, frame)) |result| return result;
+    const proc = scheduler.currentUserPrincipal();
+    if (entry_is_lstar) {
+        if (abi_trap_runtime.dispatchDelegate(proc, frame)) |result| {
+            return result;
+        }
     }
     if (dispatchIpcSyscall(h, state, proc, frame)) |result| return result;
     if (h.scheduler_log_int80 and scheduler.scheduler_int80_log_count < h.scheduler_int80_log_max_lines) {
         h.write("INT80 dispatch ");
-        h.write(h.thread_label(scheduler.current_thread_index));
+        h.write(h.thread_label(scheduler.currentThreadIndex()));
         h.write("/");
         h.write(h.principal_label(proc));
         h.write(" SYS=");
@@ -1402,7 +1419,7 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
                 h.write("\n");
                 return syscall_err_invalid;
             }
-            const current_thread = scheduler.current_thread_index;
+            const current_thread = scheduler.currentThreadIndex();
             if (!scheduler.isThreadReady(target_thread)) {
                 h.log_race_switch(current_thread, target_thread, "target_not_ready");
                 return syscall_err_not_ready;
@@ -1461,13 +1478,40 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
             const msg = buf[0..req_len];
             if (!h.copy_user_bytes_from_va(proc, frame.rdi, msg)) return syscall_err_invalid;
             if (!hasExplicitUserLogLabel(msg)) {
-                writeThreadUserLogPrefix(h, scheduler.current_thread_index);
+                writeThreadUserLogPrefix(h, scheduler.currentThreadIndex());
             }
             h.write(msg);
             return syscall_ok;
         },
         else => return syscall_err_invalid,
     }
+}
+
+pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    return syscallDispatchFrom(frame, currentSyscallEntryIsLstar());
+}
+
+fn syscallLstarDelegateDispatch(frame: *TrapFrame) ?u64 {
+    const h = getHooks();
+    const entry_thread = scheduler.currentThreadIndex();
+    setSyscallReturnWritebackEnabled(true);
+    defer {
+        if (scheduler.currentThreadIndex() != entry_thread) {
+            setSyscallReturnWritebackEnabled(false);
+        }
+    }
+    if (!h.kernel_state_ready.*) return syscall_err_not_ready;
+
+    const proc = scheduler.currentUserPrincipal();
+    if (abi_trap_runtime.dispatchDelegate(proc, frame)) |result| {
+        return result;
+    }
+    return null;
+}
+
+pub export fn syscallLstarDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    if (syscallLstarDelegateDispatch(frame)) |result| return result;
+    return syscallDispatchFrom(frame, false);
 }
 
 test "explicit userlog label detection" {

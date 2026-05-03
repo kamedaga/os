@@ -269,6 +269,7 @@ struct linux_process_state {
     u8 wait_pending;
     i64 wait_pid;
     u64 wait_status_va;
+    u64 clear_child_tid;
     u64 sig_handler[65];
     u64 sig_flags[65];
 };

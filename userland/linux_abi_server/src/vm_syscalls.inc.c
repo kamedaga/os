@@ -133,7 +133,8 @@ static struct ipc_message handle_brk(const struct trap_request *req) {
         u64 from = page_up(g_brk_next_va);
         u64 to = page_up(req->args[0]);
         if (to > from) {
-            if (map_reply_target_pages(from, (to - from) / PAGE_BYTES, 0x3) != SYSCALL_OK) return reply(g_brk_next_va, 0);
+            const u64 status = map_reply_target_pages(from, (to - from) / PAGE_BYTES, 0x3);
+            if (status != SYSCALL_OK) return reply(g_brk_next_va, 0);
             if (!vm_add_region(from, to - from, 0x3)) return reply(g_brk_next_va, 0);
         }
     }

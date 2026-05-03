@@ -232,8 +232,9 @@ fn initFxStateSupport() void {
 
 pub export fn saveCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
-    const ctx = scheduler.getThreadContext(scheduler.current_thread_index) orelse return;
-    if (!scheduler.isThreadReady(scheduler.current_thread_index)) return;
+    const thread_index = scheduler.currentThreadIndex();
+    const ctx = scheduler.getThreadContext(thread_index) orelse return;
+    if (!scheduler.isThreadReady(thread_index)) return;
     asm volatile ("fxsave64 (%[ptr])"
         :
         : [ptr] "r" (&ctx.fx_state),
@@ -242,8 +243,9 @@ pub export fn saveCurrentThreadFxState() callconv(.c) void {
 
 pub export fn restoreCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
-    const ctx = scheduler.getThreadContext(scheduler.current_thread_index) orelse return;
-    if (!scheduler.isThreadReady(scheduler.current_thread_index)) return;
+    const thread_index = scheduler.currentThreadIndex();
+    const ctx = scheduler.getThreadContext(thread_index) orelse return;
+    if (!scheduler.isThreadReady(thread_index)) return;
     asm volatile ("fxrstor64 (%[ptr])"
         :
         : [ptr] "r" (&ctx.fx_state),
@@ -290,11 +292,14 @@ fn initKernelRuntimeOrHalt() void {
         if (!x86_platform.installIdentityPageTables0To1GiB()) {
             halt.haltWithMessage("page table install failed");
         }
+        if (!user_copy.mapKernelRuntimeStorage(x86_platform.mapKernelRuntimeIdentityRange)) {
+            halt.haltWithMessage("user copy runtime mapping failed");
+        }
         _ = x86_platform.enablePcidIfSupported();
         x86_platform.hardenKernelMappingsSupervisorOnly();
     }
     installInterruptTrampolines();
-    x86_platform.installSyscallEntry(@intFromPtr(&traps.syscallLstarHandlerStub));
+    x86_platform.installSyscallEntry(traps.syscallLstarEntryForCpu(0));
     asm volatile ("cli");
     if (!lapic.initTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count)) {
         halt.haltWithMessage("LAPIC timer init failed");
@@ -310,7 +315,6 @@ fn initMemoryModules() void {
 
     user_vm.init(.{
         .user_spaces = user_spaces,
-        .current_user_principal = &scheduler.current_user_principal,
         .four_gib = boot_static.four_gib,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
         .user_va = boot_static.user_va,
@@ -389,7 +393,7 @@ fn nextReadyThreadAfter(current_thread: usize) ?usize {
 
 fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
     while (true) {
-        const current_thread = scheduler.current_thread_index;
+        const current_thread = scheduler.currentThreadIndex();
         if (nextReadyThreadAfter(current_thread)) |thread_index| {
             if (scheduler.threadContextLooksCorrupted(thread_index)) {
                 _ = scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame());
@@ -603,6 +607,7 @@ fn runBootServicesPhase() BootResources {
     uefi_services.exitBootServicesOrHalt();
     initKernelRuntimeOrHalt();
     scheduler.installCpuIdleObserver();
+    smp.configureLstarEntries(traps.syscallLstarEntries());
     smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
     smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
     scheduler.refreshCpuTopology();
@@ -697,7 +702,6 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
         .page_ps = boot_static.page_ps,
         .kernel_state_ready = &kernel_state_ready,
         .state = &kernel_state_global,
-        .current_user_principal = &scheduler.current_user_principal,
         .write = kernel_log.write,
         .write_hex_raw = kernel_log.writeHexRaw,
         .write_bool01 = kernel_log.writeBool01,
@@ -794,8 +798,10 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         init_ctx.frame.rip = loaded_init.entry;
         init_ctx.frame.rsp = boot_static.user_entry_rsp;
     }
-    runSchedulerApObserverProbe(init_thread);
-    runSchedulerApUserEntryProbe(state);
+    if (!scheduler.spawnExecApPlacementExperimentEnabled()) {
+        runSchedulerApObserverProbe(init_thread);
+        runSchedulerApUserEntryProbe(state);
+    }
 
     state.pte_sync_hook = capability.syncPageTableRightsForPrincipalPaddr;
     kernel_state_ready = true;
@@ -871,12 +877,13 @@ fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
         return;
     }
 
+    const policy_enable_ok = scheduler.setApRunnablePolicyForExperiment(true);
     var probes = [_]SchedulerApUserProbe{.{}} ** smp.max_cpus;
     var probe_count: usize = 0;
     var cpu_slot: usize = 1;
     while (cpu_slot < scheduler.cpuCount() and cpu_slot < probes.len) : (cpu_slot += 1) {
-        const info = scheduler.schedulerCpuInfo(cpu_slot) orelse continue;
-        if (!info.enabled or info.smp_state == .absent) continue;
+        const candidate_info = scheduler.schedulerCpuInfo(cpu_slot) orelse continue;
+        if (!candidate_info.enabled or candidate_info.smp_state == .absent) continue;
         const created = createSchedulerApUserEntryThread(state) orelse {
             serial.writeRaw("SCHED APUSER probe skipped no_thread cpu=");
             serial.printNumber(cpu_slot);
@@ -891,9 +898,24 @@ fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
             continue;
         };
 
+        const chosen_cpu = if (policy_enable_ok) scheduler.assignThreadPairToChosenCpu(created.thread_index, next_created.thread_index, false) else null;
+        const selected_cpu = chosen_cpu orelse {
+            serial.writeRaw("SCHED APUSER probe skipped no_chosen_cpu seed_cpu=");
+            serial.printNumber(cpu_slot);
+            serial.writeRaw("\n");
+            teardownExitedProcess(next_created.principal);
+            teardownExitedProcess(created.principal);
+            continue;
+        };
+        const info = scheduler.schedulerCpuInfo(selected_cpu) orelse {
+            teardownExitedProcess(next_created.principal);
+            teardownExitedProcess(created.principal);
+            continue;
+        };
+
         var probe = SchedulerApUserProbe{
             .active = true,
-            .cpu_slot = cpu_slot,
+            .cpu_slot = selected_cpu,
             .principal = created.principal,
             .next_principal = next_created.principal,
             .thread_index = created.thread_index,
@@ -906,16 +928,17 @@ fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
             .target_current_thread = info.current_thread,
             .target_idle = info.is_idle,
         };
-        probe.enable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(cpu_slot, true);
-        probe.cycle_ok = probe.enable_ok and scheduler.setCpuUserEntryTargetCyclesForExperiment(cpu_slot, probe.before_timer_ticks +% 2);
-        probe.move_ok = probe.cycle_ok and scheduler.assignThreadToCpu(created.thread_index, cpu_slot);
-        probe.move_next_ok = probe.move_ok and scheduler.assignThreadToCpu(next_created.thread_index, cpu_slot);
-        probe.arm_ok = probe.move_next_ok and scheduler.setCpuUserEntryForExperiment(cpu_slot, true);
+        probe.enable_ok = policy_enable_ok;
+        probe.cycle_ok = probe.enable_ok and scheduler.setCpuProbeUserEntryTargetCyclesForExperiment(selected_cpu, probe.before_timer_ticks +% 2);
+        probe.move_ok = scheduler.threadCpuSlot(created.thread_index) == selected_cpu;
+        probe.move_next_ok = scheduler.threadCpuSlot(next_created.thread_index) == selected_cpu;
+        probe.arm_ok = probe.cycle_ok and probe.move_ok and probe.move_next_ok and scheduler.setCpuUserEntryForExperiment(selected_cpu, true);
         probes[probe_count] = probe;
         probe_count += 1;
     }
 
     if (probe_count == 0) {
+        _ = scheduler.setApRunnablePolicyForExperiment(false);
         serial.writeRaw("SCHED APUSER probe skipped no_targets\n");
         return;
     }
@@ -933,9 +956,10 @@ fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
     }
 
     var ready_count: usize = 0;
+    const policy_disable_ok = scheduler.setApRunnablePolicyForExperiment(false);
     var index: usize = 0;
     while (index < probe_count) : (index += 1) {
-        probes[index].disable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(probes[index].cpu_slot, false);
+        probes[index].disable_ok = policy_disable_ok;
         if (probes[index].returned_idle) ready_count += 1;
         logSchedulerApUserProbe(&probes[index]);
         if (probes[index].next_principal) |principal| teardownExitedProcess(principal);
@@ -1100,7 +1124,7 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
         break :blk info.handoff_snapshot_ticks;
     };
 
-    const enable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(target_cpu, true);
+    const enable_ok = scheduler.setApRunnablePolicyForExperiment(true);
     const move_ok = enable_ok and scheduler.assignThreadToCpu(thread_index, target_cpu);
 
     var observed = false;
@@ -1179,7 +1203,7 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
     }
 
     const restore_ok = scheduler.assignThreadToCpu(thread_index, original_cpu);
-    const disable_ok = scheduler.setCpuRunnableAcceptanceForExperiment(target_cpu, false);
+    const disable_ok = scheduler.setApRunnablePolicyForExperiment(false);
 
     serial.writeRaw("SCHED APHAND probe cpu=");
     serial.printNumber(target_cpu);
@@ -1360,7 +1384,7 @@ pub fn kernelMain() void {
     constructBootProcesses(state, resources, &devices);
     wireRuntimeSubsystems(state, resources.memory_stats);
 
-    const boot_ctx = scheduler.getThreadContextConst(scheduler.current_thread_index).?;
+    const boot_ctx = scheduler.getThreadContextConst(scheduler.currentThreadIndex()).?;
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
 }
 

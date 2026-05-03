@@ -9,6 +9,7 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->wait_pending = 0;
     proc->wait_pid = 0;
     proc->wait_status_va = 0;
+    proc->clear_child_tid = 0;
     for (u64 i = 0; i < 65; i++) {
         proc->sig_handler[i] = 0;
         proc->sig_flags[i] = 0;

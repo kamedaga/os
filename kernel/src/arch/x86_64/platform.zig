@@ -16,8 +16,8 @@ pub const stack_region_raw_bytes: usize = stack_region_bytes + @as(usize, @intCa
 pub const stack_region_chunk_count: usize = stack_region_bytes / @as(usize, @intCast(two_mib));
 pub const ring0_stack_bytes: usize = stack_region_bytes - (2 * guard_page_bytes);
 pub const ist_stack_bytes: usize = 2 * 1024 * 1024;
-const ap_ring0_stack_bytes: usize = 64 * 1024;
-const ap_ist_stack_bytes: usize = 64 * 1024;
+const ap_ring0_stack_bytes: usize = 2 * 1024 * 1024;
+const ap_ist_stack_bytes: usize = 256 * 1024;
 pub const phys_copy_window_va: u64 = (@as(u64, @intCast(high_mmio_pml4_index)) << 39);
 
 pub const gdt_kernel_code_selector: u16 = 0x08;
@@ -92,9 +92,9 @@ var gdt_tables: [max_cpus][9]u64 align(16) = [_][9]u64{gdt_template} ** max_cpus
 var ring0_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var pf_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var df_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
-var ap_ring0_stacks: [max_cpus - 1][ap_ring0_stack_bytes]u8 align(16) = [_][ap_ring0_stack_bytes]u8{[_]u8{0} ** ap_ring0_stack_bytes} ** (max_cpus - 1);
-var ap_pf_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(16) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
-var ap_df_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(16) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
+var ap_ring0_stacks: [max_cpus - 1][ap_ring0_stack_bytes]u8 align(4096) = [_][ap_ring0_stack_bytes]u8{[_]u8{0} ** ap_ring0_stack_bytes} ** (max_cpus - 1);
+var ap_pf_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(4096) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
+var ap_df_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(4096) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
 var ring0_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var pf_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var df_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
@@ -119,6 +119,7 @@ var ss_trampoline_entry: usize = 0;
 var timer_trampoline_entry: usize = 0;
 pub export var kernel_cr3_value: u64 = 0;
 pub export var kernel_syscall_stack_top: u64 = 0;
+pub export var kernel_syscall_stack_tops: [max_cpus]u64 = [_]u64{0} ** max_cpus;
 pub export var pcid_enabled: u64 = 0;
 
 const msr_efer: u32 = 0xC000_0080;
@@ -358,12 +359,32 @@ pub fn cpuSlotForStackPointer(rsp: u64) ?usize {
     const bsp_end = bsp_base + ring0_stack_bytes;
     if (rsp >= bsp_base and rsp <= bsp_end) return 0;
 
+    const bsp_pf_region = alignedStackRegion(pf_ist_stack_region_raw[0..]);
+    const bsp_pf_base = @intFromPtr(bsp_pf_region.ptr) + guard_page_bytes;
+    const bsp_pf_end = bsp_pf_base + ist_stack_bytes;
+    if (rsp >= bsp_pf_base and rsp <= bsp_pf_end) return 0;
+
+    const bsp_df_region = alignedStackRegion(df_ist_stack_region_raw[0..]);
+    const bsp_df_base = @intFromPtr(bsp_df_region.ptr) + guard_page_bytes;
+    const bsp_df_end = bsp_df_base + ist_stack_bytes;
+    if (rsp >= bsp_df_base and rsp <= bsp_df_end) return 0;
+
     var cpu_slot: usize = 1;
     while (cpu_slot < max_cpus) : (cpu_slot += 1) {
-        const stack = &ap_ring0_stacks[cpu_slot - 1];
-        const base = @intFromPtr(stack);
-        const end = base + ap_ring0_stack_bytes;
-        if (rsp >= base and rsp <= end) return cpu_slot;
+        const ring0_stack = &ap_ring0_stacks[cpu_slot - 1];
+        const ring0_base = @intFromPtr(ring0_stack);
+        const ring0_end = ring0_base + ap_ring0_stack_bytes;
+        if (rsp >= ring0_base and rsp <= ring0_end) return cpu_slot;
+
+        const pf_stack = &ap_pf_ist_stacks[cpu_slot - 1];
+        const pf_base = @intFromPtr(pf_stack);
+        const pf_end = pf_base + ap_ist_stack_bytes;
+        if (rsp >= pf_base and rsp <= pf_end) return cpu_slot;
+
+        const df_stack = &ap_df_ist_stacks[cpu_slot - 1];
+        const df_base = @intFromPtr(df_stack);
+        const df_end = df_base + ap_ist_stack_bytes;
+        if (rsp >= df_base and rsp <= df_end) return cpu_slot;
     }
     return null;
 }
@@ -444,7 +465,12 @@ fn mapKernelIdentityRange(base: u64, bytes: usize) bool {
     return true;
 }
 
+pub fn mapKernelRuntimeIdentityRange(base: u64, bytes: usize) bool {
+    return mapKernelIdentityRange(base, bytes);
+}
+
 fn mapPerCpuKernelStorage() bool {
+    if (!mapKernelIdentityRange(@intFromPtr(&phys_copy_window_pt), @sizeOf(@TypeOf(phys_copy_window_pt)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&gdt_tables), @sizeOf(@TypeOf(gdt_tables)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&tss_tables), @sizeOf(@TypeOf(tss_tables)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ap_ring0_stacks), @sizeOf(@TypeOf(ap_ring0_stacks)))) return false;
@@ -556,6 +582,7 @@ fn installTssDescriptor(cpu_slot: usize) bool {
     tss.ist1 = ist1;
     tss.ist2 = ist2;
     tss.iomap_base = @sizeOf(Tss);
+    kernel_syscall_stack_tops[cpu_slot] = rsp0;
 
     const tss_base = @intFromPtr(tss);
     const tss_limit: u64 = @sizeOf(Tss) - 1;

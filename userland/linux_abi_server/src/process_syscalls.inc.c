@@ -168,6 +168,7 @@ static void copy_process_state_for_fork(struct linux_process_state *child, const
     child->wait_pending = 0;
     child->wait_pid = 0;
     child->wait_status_va = 0;
+    child->clear_child_tid = 0;
     for (u64 i = 0; i < 65; i++) {
         child->sig_handler[i] = parent->sig_handler[i];
         child->sig_flags[i] = parent->sig_flags[i];
@@ -205,6 +206,11 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
     (void)add_child_slot(g_proc, child_slot);
     if (!defer_trap_target_start(child_slot)) return reply(errno_busy(), 0);
     return reply(child_slot, 0);
+}
+
+static struct ipc_message handle_set_tid_address(const struct trap_request *req) {
+    if (g_proc) g_proc->clear_child_tid = req->args[0];
+    return reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0);
 }
 
 static struct ipc_message handle_wait4(const struct trap_request *req) {

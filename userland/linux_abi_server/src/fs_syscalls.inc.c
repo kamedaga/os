@@ -339,7 +339,11 @@ static struct ipc_message handle_unlinkat(const struct trap_request *req, int ol
     return reply(errno_acces(), 0);
 }
 static struct ipc_message handle_access(const struct trap_request *req) { char path[256]; char resolved[FS_MAX_PATH_BYTES + 1]; if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0); if (path[0] == 0) return reply(errno_noent(), 0); if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0); struct fs_stat_record rec; u64 token = 0, size = 0; u8 kind = 0; return reply(vfs_lookup_stat(resolved, &token, &rec, &size, &kind) ? 0 : errno_noent(), 0); }
-static struct ipc_message handle_arch_prctl(const struct trap_request *req) { if (req->args[0] != ARCH_SET_FS) return reply(errno_inval(), 0); return reply(set_target_fs_base(req->args[1]) == SYSCALL_OK ? 0 : errno_inval(), 0); }
+static struct ipc_message handle_arch_prctl(const struct trap_request *req) {
+    if (req->args[0] != ARCH_SET_FS) return reply(errno_inval(), 0);
+    const u64 status = set_target_fs_base(req->args[1]);
+    return reply(status == SYSCALL_OK ? 0 : errno_inval(), 0);
+}
 
 static struct ipc_message handle_rt_sigaction(const struct trap_request *req) {
     const u64 signo = req->args[0];

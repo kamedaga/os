@@ -387,6 +387,27 @@ fn userLog(message: []const u8) void {
     _ = syscall3(syscall_log, @intFromPtr(message.ptr), message.len, 0);
 }
 
+fn userLogHex(value: u64) void {
+    const hex_digits = "0123456789abcdef";
+    var buf: [18]u8 = undefined;
+    buf[0] = '0';
+    buf[1] = 'x';
+    var shift: u6 = 60;
+    var index: usize = 2;
+    while (index < buf.len) : (index += 1) {
+        const nibble: usize = @intCast((value >> shift) & 0xF);
+        buf[index] = hex_digits[nibble];
+        if (shift == 0) break;
+        shift -= 4;
+    }
+    userLog(buf[0..]);
+}
+
+fn userLogHexField(label: []const u8, value: u64) void {
+    userLog(label);
+    userLogHex(value);
+}
+
 fn profileEvent(_: []const u8) void {}
 
 fn profileStep(_: []const u8, _: []const u8) void {}
@@ -687,7 +708,6 @@ fn writeProcessBytes(process_token: u64, dest_va: u64, bytes: []const u8) bool {
     if (bytes.len == 0) return true;
     return copyToProcess(process_token, dest_va, @intFromPtr(bytes.ptr), bytes.len);
 }
-
 
 fn bootfsLibPath(name: []const u8, out: *[max_lib_path_bytes]u8) ?[]const u8 {
     if (name.len == 0) return null;
@@ -1178,18 +1198,25 @@ fn installLinuxInitialStack(
 
     var words: [96]u64 = undefined;
     var count: usize = 0;
-    words[count] = @intCast(config.argv.len); count += 1;
+    words[count] = @intCast(config.argv.len);
+    count += 1;
     for (argv_ptrs[0..config.argv.len]) |argv_va| {
-        words[count] = argv_va; count += 1;
+        words[count] = argv_va;
+        count += 1;
     }
-    words[count] = 0; count += 1;
+    words[count] = 0;
+    count += 1;
     for (envp_ptrs[0..config.envp.len]) |env_va| {
-        words[count] = env_va; count += 1;
+        words[count] = env_va;
+        count += 1;
     }
-    words[count] = 0; count += 1;
+    words[count] = 0;
+    count += 1;
     for (aux[0..aux_count]) |entry| {
-        words[count] = entry.tag; count += 1;
-        words[count] = entry.value; count += 1;
+        words[count] = entry.tag;
+        count += 1;
+        words[count] = entry.value;
+        count += 1;
     }
 
     if (!writeStackWords(process_token, &sp, words[0..count])) return null;
@@ -1733,6 +1760,11 @@ fn launchExec(
         userLog("ExecLoader: entry overflow\n");
         return null;
     }
+    userLog("ExecLoader: main ");
+    userLogHexField("bias=", main_image.load_bias);
+    userLogHexField(" entry=", main_entry);
+    userLogHexField(" phoff=", main_image.ehdr.phoff);
+    userLog("\n");
     var initial_entry = main_entry;
     var interp_base: u64 = 0;
 
@@ -1776,7 +1808,14 @@ fn launchExec(
         }
         initial_entry = interp_entry;
         interp_base = interp_image.load_bias;
-        userLog("ExecLoader: standard interpreter loaded\n");
+        userLog("ExecLoader: standard interpreter loaded ");
+        userLogHexField("bias=", interp_image.load_bias);
+        userLogHexField(" entry=", interp_entry);
+        if (interp_image.dynamic_phdr) |dynamic_phdr| {
+            const dynamic_va, const dynamic_overflow = @addWithOverflow(interp_image.load_bias, dynamic_phdr.vaddr);
+            if (dynamic_overflow == 0) userLogHexField(" dynamic=", dynamic_va);
+        }
+        userLog("\n");
     }
 
     profileEvent("stack alloc begin");
@@ -1808,8 +1847,18 @@ fn launchExec(
         userLog("ExecLoader: linux stack failed\n");
         return null;
     };
+    userLog("ExecLoader: linux stack ");
+    userLogHexField("rsp=", initial_rsp);
+    userLogHexField(" bottom=", linux_stack_bottom_va);
+    userLogHexField(" top=", process_abi.user_stack_top);
+    userLog("\n");
     profileEvent("linux stack done");
     profileEvent("context begin");
+    userLog("ExecLoader: initial context ");
+    userLogHexField("rip=", initial_entry);
+    userLogHexField(" rsp=", initial_rsp);
+    userLogHexField(" interp_base=", interp_base);
+    userLog("\n");
     if (!setProcessInitialContext(process_token, initial_entry, initial_rsp)) {
         abortProcess(process_token);
         userLog("ExecLoader: set context failed\n");
@@ -1869,4 +1918,3 @@ pub export fn _start() noreturn {
 
     processExit(1);
 }
-

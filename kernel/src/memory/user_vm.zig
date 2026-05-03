@@ -1,11 +1,11 @@
 const capability = @import("../capability.zig");
 const kernel = @import("../kernel.zig");
+const scheduler = @import("../scheduler.zig");
 
 const UserAddressSpace = capability.UserAddressSpace;
 
 pub const Hooks = struct {
     user_spaces: []UserAddressSpace,
-    current_user_principal: *kernel.PrincipalId,
     four_gib: u64,
     physical_map_limit: u64,
     user_va: u64,
@@ -32,8 +32,7 @@ pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
 }
 
 pub fn currentUserSpace() *UserAddressSpace {
-    const h = hooks.?;
-    return getUserSpace(h.current_user_principal.*).?;
+    return getUserSpace(scheduler.currentUserPrincipal()).?;
 }
 
 fn findUserPtSlotForPd(space: *const UserAddressSpace, pd_index: usize) ?usize {

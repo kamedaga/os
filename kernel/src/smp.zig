@@ -41,10 +41,15 @@ var cpu_states: [max_cpus]u32 = [_]u32{cpu_state_absent} ** max_cpus;
 var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
 var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
+var lstar_entries: [max_cpus]usize = [_]usize{0} ** max_cpus;
 
 pub fn configureApUserTimer(timer_vector: u8, initial_count: u32) void {
     ap_user_timer_vector = timer_vector;
     ap_user_timer_initial_count = initial_count;
+}
+
+pub fn configureLstarEntries(entries: [max_cpus]usize) void {
+    lstar_entries = entries;
 }
 
 fn stateFromRaw(raw: u32) CpuState {
@@ -518,6 +523,9 @@ fn apIdleEntry(cpu_slot: usize) callconv(.c) noreturn {
         while (true) asm volatile ("hlt");
     }
     x86_platform.loadInterruptTableForCurrentCpu();
+    if (cpu_slot < lstar_entries.len and lstar_entries[cpu_slot] != 0) {
+        x86_platform.installSyscallEntry(lstar_entries[cpu_slot]);
+    }
     _ = lapic.enableLocalApic();
     runtimeLapicIdPtr(cpu_slot).* = lapic.localApicId();
     cpuStatePtr(cpu_slot).* = cpu_state_idle;
@@ -532,6 +540,13 @@ pub fn returnCurrentApToIdleFromInterrupt() noreturn {
     apIdleLoop(cpu_slot);
 }
 
+pub fn wakeCpu(cpu_slot: usize) bool {
+    if (cpu_slot == 0 or cpu_slot >= runtime_lapic_ids.len) return false;
+    const apic_id = runtime_lapic_ids[cpu_slot];
+    if (apic_id == 0xFF or ap_user_timer_vector == 0) return false;
+    return lapic.sendFixedIpi(apic_id, ap_user_timer_vector);
+}
+
 fn apIdleLoop(cpu_slot: usize) noreturn {
     while (true) {
         scheduler_observer.observeIdle(cpu_slot);
@@ -541,8 +556,8 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
             cpuStatePtr(cpu_slot).* = cpu_state_user;
             enterUserModeFromIdle(&user_entry);
         }
-        if (build_workarounds.scheduler_ap_queue_experiment) {
-            asm volatile ("pause");
+        if (build_workarounds.scheduler_ap_queue_experiment or build_workarounds.spawn_exec_ap_placement_experiment) {
+            asm volatile ("sti; hlt; cli");
         } else {
             asm volatile ("hlt");
         }

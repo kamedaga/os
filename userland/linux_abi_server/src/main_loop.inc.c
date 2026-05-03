@@ -76,8 +76,10 @@ void linux_abi_main(void) {
         case LINUX_SYS_ARCH_PRCTL: msg = handle_arch_prctl(req); break;
         case LINUX_SYS_RT_SIGACTION: msg = handle_rt_sigaction(req); break;
         case LINUX_SYS_RT_SIGPROCMASK: msg = handle_rt_sigprocmask(req); break;
-        case LINUX_SYS_IOCTL: case LINUX_SYS_FUTEX: case LINUX_SYS_SET_TID_ADDRESS: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
-        case LINUX_SYS_GETPID: case LINUX_SYS_GETTID: case LINUX_SYS_GETPPID: msg = reply(1, 0); break;
+        case LINUX_SYS_SET_TID_ADDRESS: msg = handle_set_tid_address(req); break;
+        case LINUX_SYS_IOCTL: case LINUX_SYS_FUTEX: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_GETPID: case LINUX_SYS_GETTID: msg = reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0); break;
+        case LINUX_SYS_GETPPID: msg = reply(1, 0); break;
         case LINUX_SYS_GETUID: case LINUX_SYS_GETGID: case LINUX_SYS_GETEUID: case LINUX_SYS_GETEGID: msg = reply(0, 0); break;
         case LINUX_SYS_UMASK: msg = reply(022, 0); break;
         case LINUX_SYS_GETRANDOM: msg = reply(errno_again(), 0); break;
@@ -89,6 +91,10 @@ void linux_abi_main(void) {
                 struct linux_process_state *exiting_proc = g_proc;
                 const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
                 if (exiting_proc) exiting_proc->exit_status = (u32)(req->args[0] & 0xffu);
+                if (exiting_proc && exiting_proc->clear_child_tid != 0) {
+                    const u32 zero = 0;
+                    (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
+                }
                 if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
                 (void)satisfy_pending_waiters_for_child(exiting_pid);
                 close_all_process_fds(g_proc);

@@ -17,6 +17,49 @@ pub const Hooks = struct {
 
 var hooks: ?Hooks = null;
 
+const PhysCopyWindowLock = struct {
+    value: u8 = 0,
+    interrupts_were_enabled: bool = false,
+
+    fn interruptsEnabled() bool {
+        var flags: u64 = 0;
+        asm volatile (
+            \\pushfq
+            \\pop %[flags]
+            : [flags] "=r" (flags),
+        );
+        return (flags & (1 << 9)) != 0;
+    }
+
+    fn lock(self: *PhysCopyWindowLock) void {
+        const restore_interrupts = interruptsEnabled();
+        asm volatile ("cli" ::: .{ .memory = true });
+        while (true) {
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
+                self.interrupts_were_enabled = restore_interrupts;
+                return;
+            }
+            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
+                asm volatile ("pause");
+            }
+        }
+    }
+
+    fn unlock(self: *PhysCopyWindowLock) void {
+        const restore_interrupts = self.interrupts_were_enabled;
+        @atomicStore(u8, &self.value, 0, .release);
+        if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
+    }
+};
+
+var phys_copy_window_lock: PhysCopyWindowLock = .{};
+
+pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
+    if (!map_identity_range(@intFromPtr(&hooks), @sizeOf(@TypeOf(hooks)))) return false;
+    if (!map_identity_range(@intFromPtr(&phys_copy_window_lock), @sizeOf(@TypeOf(phys_copy_window_lock)))) return false;
+    return true;
+}
+
 pub fn init(new_hooks: Hooks) void {
     hooks = new_hooks;
 }
@@ -46,24 +89,32 @@ fn physWindowAddr(addr: u64, access_len: usize) ?u64 {
 }
 
 pub fn readPhysU8(addr: u64) ?u8 {
+    phys_copy_window_lock.lock();
+    defer phys_copy_window_lock.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u8)) orelse return null;
     const ptr: *volatile u8 = @ptrFromInt(window_addr);
     return ptr.*;
 }
 
 pub fn readPhysU32(addr: u64) ?u32 {
+    phys_copy_window_lock.lock();
+    defer phys_copy_window_lock.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u32)) orelse return null;
     const ptr: *volatile u32 = @ptrFromInt(window_addr);
     return ptr.*;
 }
 
 pub fn readPhysU64(addr: u64) ?u64 {
+    phys_copy_window_lock.lock();
+    defer phys_copy_window_lock.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u64)) orelse return null;
     const ptr: *volatile u64 = @ptrFromInt(window_addr);
     return ptr.*;
 }
 
 pub fn writePhysU8(addr: u64, value: u8) bool {
+    phys_copy_window_lock.lock();
+    defer phys_copy_window_lock.unlock();
     const window_addr = physWindowAddr(addr, @sizeOf(u8)) orelse return false;
     const ptr: *volatile u8 = @ptrFromInt(window_addr);
     ptr.* = value;
@@ -73,6 +124,9 @@ pub fn writePhysU8(addr: u64, value: u8) bool {
 pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
     const h = getHooks();
     if (dest.len == 0) return true;
+
+    phys_copy_window_lock.lock();
+    defer phys_copy_window_lock.unlock();
 
     const original_cr3 = h.read_cr3();
     if (original_cr3 != h.kernel_cr3_value.*) {
@@ -120,6 +174,9 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
 pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: []const u8) bool {
     const h = getHooks();
     if (src.len == 0) return true;
+
+    phys_copy_window_lock.lock();
+    defer phys_copy_window_lock.unlock();
 
     const original_cr3 = h.read_cr3();
     if (original_cr3 != h.kernel_cr3_value.*) {

@@ -38,12 +38,14 @@ pub fn deliverOrQueueMessageToThread(
             scheduler.setIpcReplyTokenForThread(target_thread, true, sender_thread);
         }
         deliverMessageToContext(target_ctx, mr0, mr1, mr2, mr3);
+        scheduler.wakeAssignedApForRunnableThread(target_thread);
         scheduler.preferIpcSwitchToThread(target_thread);
         return boot_static.syscall_ok;
     }
     if (!scheduler.enqueueIpcMessageForThread(target_thread, endpoint_id, sender_thread, grants_reply, mr0, mr1, mr2, mr3)) {
         return boot_static.syscall_err_not_ready;
     }
+    scheduler.wakeAssignedApForRunnableThread(target_thread);
     scheduler.preferIpcSwitchToThread(target_thread);
     return boot_static.syscall_ok;
 }

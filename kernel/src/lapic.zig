@@ -138,6 +138,15 @@ pub fn sendInitSipi(apic_id: u8, startup_vector: u8) bool {
     return true;
 }
 
+pub fn sendFixedIpi(apic_id: u8, vector: u8) bool {
+    if (lapic_base_pa == 0 and !enableLocalApic()) return false;
+    waitIcrIdle();
+    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
+    mmioWrite(lapic_reg_icr_low, @as(u32, vector));
+    waitIcrIdle();
+    return true;
+}
+
 pub fn eoi() void {
     if (lapic_base_pa == 0) return;
     mmioWrite(lapic_reg_eoi, 0);

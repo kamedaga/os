@@ -46,9 +46,15 @@ pub fn build(b: *std.Build) void {
         "scheduler-ap-queue-experiment",
         "Allow non-BSP scheduler run queues to accept runnable threads for scheduler experiments",
     ) orelse false;
+    const spawn_exec_ap_placement_experiment = b.option(
+        bool,
+        "spawn-exec-ap-placement-experiment",
+        "Attempt to place spawn_exec children on AP scheduler queues when AP user syscall/trap paths are ready",
+    ) orelse false;
     const build_workarounds = b.addOptions();
     build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
     build_workarounds.addOption(bool, "scheduler_ap_queue_experiment", scheduler_ap_queue_experiment);
+    build_workarounds.addOption(bool, "spawn_exec_ap_placement_experiment", spawn_exec_ap_placement_experiment);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/kernel.zig"),
@@ -135,9 +141,3 @@ pub fn build(b: *std.Build) void {
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
 }
-
-
-
-
-
-

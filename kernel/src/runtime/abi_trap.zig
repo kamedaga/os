@@ -94,8 +94,23 @@ pub fn consumeQueuedReplyForPrincipal(principal: kernel.PrincipalId, frame: *Tra
     return false;
 }
 
+fn consumeQueuedReplyForPrincipalFromSender(principal: kernel.PrincipalId, sender_thread: usize, frame: *TrapFrame) bool {
+    const h = getHooks();
+    const thread_index = scheduler.threadSlotForPrincipal(principal) orelse return false;
+    if (scheduler.dequeueIpcReplyMessageForThreadFromSender(thread_index, sender_thread)) |msg| {
+        frame.rax = msg.mr0;
+        if (msg.mr2 != 0) frame.rip = msg.mr2;
+        if (msg.mr3 != 0) frame.rsp = msg.mr3;
+        if ((msg.mr1 & trap_abi.response_flag_exit) != 0) {
+            h.exit_current_process(principal, @truncate(msg.mr0), frame);
+        }
+        return true;
+    }
+    return false;
+}
+
 fn currentReplyTargetPrincipal() ?kernel.PrincipalId {
-    const current_thread = scheduler.current_thread_index;
+    const current_thread = scheduler.currentThreadIndex();
     const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return null;
     if (current_hot.ipc_reply_token_valid == 0) return null;
     const target_thread = current_hot.ipc_reply_token_target_thread;
@@ -105,7 +120,7 @@ fn currentReplyTargetPrincipal() ?kernel.PrincipalId {
 }
 
 fn currentReplyTargetThread() ?usize {
-    const current_thread = scheduler.current_thread_index;
+    const current_thread = scheduler.currentThreadIndex();
     const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return null;
     if (current_hot.ipc_reply_token_valid == 0) return null;
     const target_thread = current_hot.ipc_reply_token_target_thread;
@@ -189,7 +204,7 @@ pub fn replyToTarget(proc: kernel.PrincipalId, target_raw: u64, result: u64, fla
         _ = scheduler.releaseThreadSlot(target_thread);
         return boot_static.syscall_ok;
     }
-    return ipc.deliverOrQueueMessageToThread(target_thread, 0, scheduler.current_thread_index, false, result, flags, 0, 0);
+    return ipc.deliverOrQueueMessageToThread(target_thread, 0, scheduler.currentThreadIndex(), false, result, flags, 0, 0);
 }
 
 pub fn startTarget(proc: kernel.PrincipalId, target_raw: u64) u64 {
@@ -202,7 +217,9 @@ pub fn startTarget(proc: kernel.PrincipalId, target_raw: u64) u64 {
     const delegate = h.state.abiTrapDelegateFor(target_proc) orelse return boot_static.syscall_err_endpoint;
     const delegate_target = h.state.endpointTargetFor(target_proc, delegate.endpoint_id) orelse return boot_static.syscall_err_endpoint;
     if (delegate_target != proc) return boot_static.syscall_err_endpoint;
-    return if (scheduler.setThreadReady(target_thread, true)) boot_static.syscall_ok else boot_static.syscall_err_not_ready;
+    if (!scheduler.setThreadReady(target_thread, true)) return boot_static.syscall_err_not_ready;
+    scheduler.wakeAssignedApForRunnableThread(target_thread);
+    return boot_static.syscall_ok;
 }
 
 pub fn setTargetRequestPage(proc: kernel.PrincipalId, target_raw: u64, request_page_va: u64) u64 {
@@ -421,10 +438,12 @@ pub fn forkCurrentReplyTarget() u64 {
 pub fn dispatchDelegate(proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     const h = getHooks();
     const delegate = h.state.abiTrapDelegateFor(proc) orelse return null;
-    const current_thread = scheduler.current_thread_index;
+    const current_thread = scheduler.currentThreadIndex();
     const current_ctx = scheduler.getThreadContext(current_thread) orelse return boot_static.syscall_err_not_ready;
     const target_principal = h.state.endpointTargetFor(proc, delegate.endpoint_id) orelse return boot_static.syscall_err_endpoint;
     const target_thread = scheduler.threadSlotForPrincipal(target_principal) orelse return boot_static.syscall_err_endpoint;
+    const stale_replies = scheduler.discardIpcReplyMessagesForThreadFromSender(current_thread, target_thread);
+    if (stale_replies != 0) current_ctx.abi_trap_reply_pending = false;
     if (!writeRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame)) {
         h.write("abi_trap request write failed target=");
         h.write(h.principal_label(target_principal));
@@ -432,6 +451,7 @@ pub fn dispatchDelegate(proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
         return boot_static.syscall_err_invalid;
     }
 
+    current_ctx.abi_trap_reply_pending = true;
     const status = ipc.deliverOrQueueMessageToThread(
         target_thread,
         delegate.endpoint_id,
@@ -442,12 +462,16 @@ pub fn dispatchDelegate(proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
         0,
         0,
     );
-    if (status != boot_static.syscall_ok) return status;
+    if (status != boot_static.syscall_ok) {
+        current_ctx.abi_trap_reply_pending = false;
+        return status;
+    }
 
-    if (consumeQueuedReplyForPrincipal(proc, frame)) return frame.rax;
-    if (h.consume_pending_signal_for_principal(proc)) return boot_static.syscall_ok;
+    if (consumeQueuedReplyForPrincipalFromSender(proc, target_thread, frame)) {
+        current_ctx.abi_trap_reply_pending = false;
+        return frame.rax;
+    }
 
-    current_ctx.abi_trap_reply_pending = true;
     if (!h.block_current_thread_for_event(frame, false, 0, boot_static.syscall_err_not_ready)) {
         current_ctx.abi_trap_reply_pending = false;
         return boot_static.syscall_err_not_ready;
