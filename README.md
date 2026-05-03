@@ -27,7 +27,7 @@ musl libc と動的リンクにより、既存の Linux エコシステムとの
 
 ## Build
 
-```bash
+```powershell
 pactl setup full
 pactl run
 ```
@@ -35,6 +35,7 @@ pactl run
 ## Status
 
 Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカが動作し、dash shellのほとんどの操作(pipeを含む)が動く状況になっている。
+マルチコアでLinux互換プロセス状態に来ていて、リファクタリング、粗削りな部分をつぶす予定。いいです
 
 ## License
 
