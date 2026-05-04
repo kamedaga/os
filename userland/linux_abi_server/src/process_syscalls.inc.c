@@ -175,15 +175,7 @@ static void copy_process_state_for_fork(struct linux_process_state *child, const
         child->sig_flags[i] = parent->sig_flags[i];
     }
     for (u64 fd = 0; fd < 32; fd++) {
-        child->fds[fd].kind = parent->fds[fd].kind;
-        child->fds[fd].token = parent->fds[fd].token;
-        child->fds[fd].offset = parent->fds[fd].offset;
-        child->fds[fd].size = parent->fds[fd].size;
-        child->fds[fd].mode_bits = parent->fds[fd].mode_bits;
-        child->fds[fd].object_kind = parent->fds[fd].object_kind;
-        child->fds[fd].pipe_id = parent->fds[fd].pipe_id;
-        child->fds[fd].path_len = parent->fds[fd].path_len;
-        for (u16 i = 0; i <= parent->fds[fd].path_len && i <= FS_MAX_PATH_BYTES; i++) child->fds[fd].path[i] = parent->fds[fd].path[i];
+        copy_fd_entry(&child->fds[fd], &parent->fds[fd]);
         pipe_ref_fd(&child->fds[fd]);
     }
 }
@@ -215,21 +207,46 @@ static struct ipc_message handle_clone_thread(const struct trap_request *req) {
 
     const u64 spawned = clone_reply_target(child_stack, tls);
     const u64 child_slot = decode_spawned_process_slot(spawned);
-    if (child_slot == 0) return reply(errno_busy(), 0);
+    if (child_slot == 0) {
+        user_log("LinuxAbiServer: clone thread spawn failed\n");
+        user_log_hex_value(spawned);
+        return reply(errno_busy(), 0);
+    }
     struct linux_process_state *child = process_state_for(child_slot);
-    if (!child) return reply(errno_busy(), 0);
+    if (!child) {
+        user_log("LinuxAbiServer: clone thread state failed\n");
+        user_log_hex_value(child_slot);
+        return reply(errno_busy(), 0);
+    }
     u64 child_request_va = 0;
-    if (!ensure_child_trap_request_page(child_slot, &child_request_va)) return reply(errno_busy(), 0);
+    if (!ensure_child_trap_request_page(child_slot, &child_request_va)) {
+        user_log("LinuxAbiServer: clone thread request page failed\n");
+        user_log_hex_value(child_slot);
+        return reply(errno_busy(), 0);
+    }
 
     copy_process_state_for_clone_thread(child, g_proc, child_slot, (flags & CLONE_CHILD_CLEARTID) != 0 ? child_tidptr : 0);
     const u32 child_tid32 = (u32)child_slot;
     if ((flags & CLONE_PARENT_SETTID) != 0 && parent_tidptr != 0) {
-        if (copy_to_target(parent_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) return reply(errno_fault(), 0);
+        if (copy_to_target(parent_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) {
+            user_log("LinuxAbiServer: clone parent_tid write failed\n");
+            user_log_hex_value(parent_tidptr);
+            return reply(errno_fault(), 0);
+        }
     }
     if ((flags & CLONE_CHILD_SETTID) != 0 && child_tidptr != 0) {
-        if (copy_to_trap_target(child_slot, child_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) return reply(errno_fault(), 0);
+        if (copy_to_trap_target(child_slot, child_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) {
+            user_log("LinuxAbiServer: clone child_tid write failed\n");
+            user_log_hex_value(child_tidptr);
+            return reply(errno_fault(), 0);
+        }
     }
-    if (!defer_trap_target_start(child_slot)) return reply(errno_busy(), 0);
+    if (!defer_trap_target_start(child_slot)) {
+        user_log("LinuxAbiServer: clone thread defer start failed\n");
+        user_log_hex_value(child_slot);
+        return reply(errno_busy(), 0);
+    }
+    prime_reply_return_signal();
     return reply(child_slot, 0);
 }
 

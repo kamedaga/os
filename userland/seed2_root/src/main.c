@@ -37,6 +37,7 @@ enum {
     PROCESS_SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     REPLY_ENDPOINT_ID = 0xEB,
     ROOTFS_VFS_ENDPOINT_ID = 0x90,
+    EXEC_SERVICE_ENDPOINT_ID = 0x92,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
     SERVICE_REGISTRY_VERSION = 1,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
@@ -98,6 +99,7 @@ struct startup_node {
     char provides[48];
     u8 completed;
     u8 spawned;
+    u64 child_slot;
 };
 
 static struct backend_session g_fat;
@@ -706,6 +708,33 @@ static void mark_node_completed(struct startup_node *node) {
     if (!cstr_empty(node->provides)) provided_add(node->provides);
 }
 
+static int startup_node_ready_after_spawn(struct startup_node *node) {
+    if (cstr_eq(node->provides, "exec_service")) {
+        return syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_SERVICE_ENDPOINT_ID, 0) == SYSCALL_OK;
+    }
+    return 1;
+}
+
+static int startup_has_pending_nodes(void) {
+    for (u32 i = 0; i < g_startup_node_count; i++) {
+        if (!g_startup_nodes[i].completed) return 1;
+    }
+    return 0;
+}
+
+static int startup_has_spawned_pending_nodes(void) {
+    for (u32 i = 0; i < g_startup_node_count; i++) {
+        if (!g_startup_nodes[i].completed && g_startup_nodes[i].spawned) return 1;
+    }
+    return 0;
+}
+
+static void log_startup_node(const char *prefix, struct startup_node *node) {
+    user_log(prefix);
+    user_log(cstr_empty(node->name) ? node->path : node->name);
+    user_log("\n");
+}
+
 static int spawn_manifest_node(struct startup_node *node) {
     if (cstr_empty(node->path)) return 0;
     if (!cstr_empty(node->load) && !cstr_eq(node->load, "rootfs") && !cstr_eq(node->load, "bootfs")) return 0;
@@ -728,6 +757,7 @@ static int spawn_manifest_node(struct startup_node *node) {
     const u64 child_slot = decode_spawn_process_slot(spawned);
     if (child_slot == 0) return 0;
     node->spawned = 1;
+    node->child_slot = child_slot;
     return 1;
 }
 
@@ -736,11 +766,19 @@ static void run_startup_scheduler(void) {
     parse_startup_manifest();
     user_log("[seed2_root] manifest scheduler begin\n");
 
-    for (u32 pass = 0; pass < MAX_STARTUP_NODES; pass++) {
+    for (;;) {
         int progressed = 0;
         for (u32 i = 0; i < g_startup_node_count; i++) {
             struct startup_node *node = &g_startup_nodes[i];
             if (node->completed) continue;
+            if (node->spawned) {
+                if (startup_node_ready_after_spawn(node)) {
+                    mark_node_completed(node);
+                    log_startup_node("[seed2_root] manifest ready ", node);
+                    progressed = 1;
+                }
+                continue;
+            }
             if (!node_dependencies_ready(node)) continue;
             if (!cstr_empty(node->provides) && provided_has(node->provides)) {
                 mark_node_completed(node);
@@ -748,18 +786,24 @@ static void run_startup_scheduler(void) {
                 continue;
             }
             if (spawn_manifest_node(node)) {
-                mark_node_completed(node);
-                user_log("[seed2_root] manifest spawned ");
-                user_log(cstr_empty(node->name) ? node->path : node->name);
-                user_log("\n");
+                log_startup_node("[seed2_root] manifest spawned ", node);
+                if (startup_node_ready_after_spawn(node)) {
+                    mark_node_completed(node);
+                    log_startup_node("[seed2_root] manifest ready ", node);
+                }
                 progressed = 1;
             } else {
-                user_log("[seed2_root] manifest node deferred ");
-                user_log(cstr_empty(node->name) ? node->path : node->name);
-                user_log("\n");
+                log_startup_node("[seed2_root] manifest node deferred ", node);
             }
         }
-        if (!progressed) break;
+        if (!startup_has_pending_nodes()) break;
+        if (!progressed) {
+            if (startup_has_spawned_pending_nodes()) {
+                (void)wait_event();
+                continue;
+            }
+            break;
+        }
     }
     user_log("[seed2_root] manifest scheduler done\n");
 }

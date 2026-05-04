@@ -586,7 +586,7 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
 
 fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
     asm volatile ("cli");
-    if (ap_user_timer_vector != 0) {
+    if (build_workarounds.ap_user_timer_preemption and ap_user_timer_vector != 0) {
         _ = lapic.initTimer(ap_user_timer_vector, ap_user_timer_initial_count);
     }
     const fx_state: *const [512]u8 align(16) = @ptrFromInt(entry.fx_state_addr);

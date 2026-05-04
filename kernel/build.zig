@@ -61,10 +61,16 @@ pub fn build(b: *std.Build) void {
         "spawn-exec-ap-user-scheduling",
         "Place spawn_exec children on AP scheduler queues when AP user syscall/trap paths are ready",
     ) orelse legacy_spawn_exec_ap_placement_experiment;
+    const ap_user_timer_preemption = b.option(
+        bool,
+        "ap-user-timer-preemption",
+        "Allow AP user threads to be preempted by the AP timer; disabled by default while AP scheduling productionizes",
+    ) orelse false;
     const build_workarounds = b.addOptions();
     build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
     build_workarounds.addOption(bool, "scheduler_ap_user_diagnostics", scheduler_ap_user_diagnostics);
     build_workarounds.addOption(bool, "spawn_exec_ap_user_scheduling", spawn_exec_ap_user_scheduling);
+    build_workarounds.addOption(bool, "ap_user_timer_preemption", ap_user_timer_preemption);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/kernel.zig"),

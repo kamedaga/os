@@ -864,8 +864,6 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
 }
 
 pub export fn pageFaultDispatch(frame: *const ExceptionTrapFrame) callconv(.c) u64 {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     const cr2 = h.read_cr2();
     const pf_cap = capability.issuePageFaultCapability(scheduler.currentUserPrincipal(), frame, cr2) orelse return 0;
@@ -888,8 +886,6 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
 }
 
 pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const ExceptionTrapFrame) callconv(.c) void {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     asm volatile ("cli");
     writeExceptionWithErrorSummary(h, vec, frame);
@@ -949,8 +945,6 @@ pub export fn invalidOpcodeHandlerCommon(frame: *const TrapFrame) callconv(.c) n
 }
 
 pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(.c) void {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     asm volatile ("cli");
     const label = switch (vec) {
@@ -967,19 +961,15 @@ pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(
 }
 
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!scheduler.schedulerRunsOnCurrentCpu()) {
         if (user_mode and !scheduler.currentApUserThreadCanContinue()) {
-            scheduler.unlockKernelTrapPathIfHeldForCurrentCpu();
             smp.returnCurrentApToIdleFromInterrupt();
         }
-        if (user_mode and scheduler.shouldPreemptCurrentApUserThread() and scheduler.saveApUserTimerFrame(frame)) {
-            scheduler.unlockKernelTrapPathIfHeldForCurrentCpu();
+        if (user_mode and scheduler.apUserTimerPreemptionEnabled() and scheduler.shouldPreemptCurrentApUserThread() and scheduler.saveApUserTimerFrame(frame)) {
             smp.returnCurrentApToIdleFromInterrupt();
         }
         scheduler.noteCurrentCpuIdleTick();

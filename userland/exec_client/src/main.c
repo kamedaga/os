@@ -12,6 +12,7 @@ enum {
     PROCESS_STATUS_FAULTED = 2,
     EXEC_CLIENT_REQUEST_VA = 0x27000000ULL,
     EXEC_CLIENT_RESPONSE_VA = 0x27001000ULL,
+    EXEC_CLIENT_SPAWN_WAIT_TICKS = 120000,
 };
 
 static u64 syscall1(u64 n, u64 a0) {
@@ -46,57 +47,19 @@ void exec_client_main(void) {
 
     static const char *argv[] = {
         "/cmd/dash.elf",
-        "-c",
-        "echo basic-ok; "
-        "x=var-ok; echo $x; "
-        "for x in for-a for-b; do echo $x; done; "
-        "case word in word) echo case-ok;; *) echo case-bad;; esac; "
-        "f(){ echo func-ok; }; f; "
-        "cd /cmd && pwd; "
-        "y=$(echo subst-ok); "
-        "if [ \"$y\" = subst-ok ]; then echo subst-ok; else echo subst-bad; fi; "
-        "true && echo and-ok || echo and-bad; "
-        "false || echo or-ok; "
-        "[ x = x ] && echo test-ok || echo test-bad; "
-        "(echo subshell-ok); "
-        "gok=0; for g in /cmd/*.elf; do case $g in /cmd/dash.elf) gok=1;; esac; done; "
-        "[ \"$gok\" = 1 ] && echo glob-ok || echo glob-bad; "
-        "echo hidden > /dev/null && echo redirect-ok || echo redirect-bad; "
-        "echo file-ok > /tmp/ds; "
-        "read z < /tmp/ds; "
-        "[ \"$z\" = file-ok ] && echo file-rw-ok || echo file-rw-bad; "
-        "cd /tmp && [ \"$(pwd)\" = /tmp ] && echo cwd-ok || echo cwd-bad; "
-        "echo rel-ok > r; "
-        "read rz < r; "
-        "[ \"$rz\" = rel-ok ] && echo rel-rw-ok || echo rel-rw-bad; "
-        "/cmd/busybox.elf cat /tmp/ds > /tmp/bc; "
-        "echo busybox-cat-cmd-returned; "
-        "read bbcat < /tmp/bc; "
-        "[ \"$bbcat\" = file-ok ] && echo busybox-cat-ok || echo busybox-cat-bad; "
-        "cd /cmd; "
-        "echo fat-ok > /share/f; "
-        "read fz < /share/f; "
-        "[ \"$fz\" = fat-ok ] && echo fat-rw-ok || echo fat-rw-bad; "
-        "/cmd/busybox.elf cat /share/f > /tmp/bf; "
-        "read bbfat < /tmp/bf; "
-        "[ \"$bbfat\" = fat-ok ] && echo busybox-fat-cat-ok || echo busybox-fat-cat-bad; "
-        "/cmd/busybox.elf true && echo busybox-true-ok || echo busybox-true-bad; "
-        "/cmd/busybox.elf false || echo busybox-false-ok; "
-        "/cmd/musl_smoke.elf argv-smoke && echo musl-smoke-ok || echo musl-smoke-bad; "
-        "echo pipe-ok | while read x; do echo $x; done; "
-        "echo dash-smoke-done"
+        "/cmd/linux_smoke.sh",
     };
     static const char *envp[] = { "PATH=/bin:/cmd", "CAPABILITYOS=1" };
     struct exec_service_spawn_result result;
     const struct exec_service_spawn_options options = {
         .path = "/cmd/dash.elf",
         .argv = argv,
-        .argv_count = 3,
+        .argv_count = 2,
         .envp = envp,
         .envp_count = 2,
         .request_va = EXEC_CLIENT_REQUEST_VA,
         .response_va = EXEC_CLIENT_RESPONSE_VA,
-        .wait_ticks = 20000,
+        .wait_ticks = EXEC_CLIENT_SPAWN_WAIT_TICKS,
     };
 
     if (!exec_service_spawn_linux(&options, &result)) {

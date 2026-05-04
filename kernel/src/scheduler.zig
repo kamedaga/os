@@ -335,8 +335,6 @@ pub var runtime_priority_principal: ?kernel.PrincipalId = null;
 pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 var preferred_ipc_switch_threads: [max_thread_slots]?usize = [_]?usize{null} ** max_thread_slots;
-var kernel_trap_lock: SchedulerSpinLock = .{};
-var kernel_trap_lock_depths: [smp.max_cpus]u8 = [_]u8{0} ** smp.max_cpus;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -378,43 +376,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_fx_state), &initial_fx_state));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_interrupt_fx_state), &kernel_interrupt_fx_state));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(preferred_ipc_switch_threads), &preferred_ipc_switch_threads));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_trap_lock), &kernel_trap_lock));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_trap_lock_depths), &kernel_trap_lock_depths));
     return end;
-}
-
-fn boundedCurrentCpuSlot() usize {
-    const cpu_slot = currentCpuSlot();
-    return if (cpu_slot < smp.max_cpus) cpu_slot else bootstrap_cpu_slot;
-}
-
-pub fn lockKernelTrapPath() void {
-    const cpu_slot = boundedCurrentCpuSlot();
-    if (kernel_trap_lock_depths[cpu_slot] != 0) {
-        kernel_trap_lock_depths[cpu_slot] +%= 1;
-        return;
-    }
-    kernel_trap_lock.lock();
-    kernel_trap_lock_depths[cpu_slot] = 1;
-}
-
-pub fn unlockKernelTrapPath() void {
-    const cpu_slot = boundedCurrentCpuSlot();
-    const depth = kernel_trap_lock_depths[cpu_slot];
-    if (depth == 0) return;
-    if (depth > 1) {
-        kernel_trap_lock_depths[cpu_slot] = depth - 1;
-        return;
-    }
-    kernel_trap_lock_depths[cpu_slot] = 0;
-    kernel_trap_lock.unlock();
-}
-
-pub fn unlockKernelTrapPathIfHeldForCurrentCpu() void {
-    const cpu_slot = boundedCurrentCpuSlot();
-    while (kernel_trap_lock_depths[cpu_slot] != 0) {
-        unlockKernelTrapPath();
-    }
 }
 
 fn mirrorBootstrapCurrentState(thread_index: usize, principal: kernel.PrincipalId, cr3: u64) void {
@@ -714,8 +676,6 @@ fn pollSchedulerFromIdleAp(cpu_slot: usize) callconv(.c) void {
 }
 
 fn claimIdleUserEntryFromAp(cpu_slot: usize, out_entry: *scheduler_observer.UserEntry) callconv(.c) bool {
-    lockKernelTrapPath();
-    defer unlockKernelTrapPath();
     if (!apUserSchedulingFeatureEnabled()) return false;
     if (cpu_slot == bootstrap_cpu_slot) return false;
     const state = schedulerStateForSlot(cpu_slot) orelse return false;
@@ -825,6 +785,10 @@ pub fn spawnExecApUserSchedulingBlockReason() SpawnExecApUserSchedulingBlock {
 
 pub fn spawnExecApUserSchedulingReady() bool {
     return spawnExecApUserSchedulingBlockReason() == .none;
+}
+
+pub fn apUserTimerPreemptionEnabled() bool {
+    return apUserSchedulingFeatureEnabled() and build_workarounds.ap_user_timer_preemption;
 }
 
 pub fn cpuRunnableAcceptanceRequested(cpu_slot: usize) bool {
@@ -1036,7 +1000,6 @@ fn parkCurrentApAfterBlocking(cpu_slot: usize) noreturn {
         user_cr3_values[cpu_slot] = 0;
         state.lock.unlock();
     }
-    unlockKernelTrapPathIfHeldForCurrentCpu();
     smp.returnCurrentApToIdleFromInterrupt();
 }
 

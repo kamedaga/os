@@ -11,8 +11,9 @@ static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_reco
     response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
     if (response->status == FS_STATUS_OK && response->inline_bytes >= FS_STAT_RECORD_BYTES) {
         volatile struct fs_stat_record *record = (volatile struct fs_stat_record *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
-        token_out[0] = token; stat_out->object_kind = record->object_kind; stat_out->size_bytes = record->size_bytes; stat_out->mode_bits = record->mode_bits; stat_out->mtime_unix_sec = record->mtime_unix_sec;
-        *file_bytes_out = record->size_bytes; *kind_out = response->object_kind != FS_OBJECT_NONE ? response->object_kind : record->object_kind;
+        const u64 file_bytes = record->size_bytes != 0 ? record->size_bytes : lookup_file_bytes;
+        token_out[0] = token; stat_out->object_kind = record->object_kind; stat_out->size_bytes = file_bytes; stat_out->mode_bits = record->mode_bits; stat_out->mtime_unix_sec = record->mtime_unix_sec;
+        *file_bytes_out = file_bytes; *kind_out = response->object_kind != FS_OBJECT_NONE ? response->object_kind : record->object_kind;
         return 1;
     }
     if (response->status != FS_STATUS_OK || lookup_kind == FS_OBJECT_NONE) { user_log("LinuxAbiServer: stat status failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }

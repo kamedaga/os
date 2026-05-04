@@ -40,6 +40,7 @@ void linux_abi_main(void) {
         switch (req->nr) {
         case LINUX_SYS_READ: msg = handle_read(req); break;
         case LINUX_SYS_WRITE: msg = handle_write(req); break;
+        case LINUX_SYS_READV: msg = handle_readv(req); break;
         case LINUX_SYS_WRITEV: msg = handle_writev(req); break;
         case LINUX_SYS_PIPE: msg = handle_pipe2(req, 0); break;
         case LINUX_SYS_PIPE2: msg = handle_pipe2(req, 1); break;
@@ -79,7 +80,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_RT_SIGPROCMASK: msg = handle_rt_sigprocmask(req); break;
         case LINUX_SYS_SET_TID_ADDRESS: msg = handle_set_tid_address(req); break;
         case LINUX_SYS_FUTEX: msg = handle_futex(req); break;
-        case LINUX_SYS_IOCTL: case LINUX_SYS_MADVISE: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_IOCTL: case LINUX_SYS_MADVISE: case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
         case LINUX_SYS_GETPID: msg = reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0); break;
         case LINUX_SYS_GETTID: msg = reply(g_proc && g_proc->tid != 0 ? g_proc->tid : 1, 0); break;
         case LINUX_SYS_GETPPID: msg = reply(1, 0); break;
@@ -93,11 +94,33 @@ void linux_abi_main(void) {
                 struct linux_process_state *exiting_proc = g_proc;
                 const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
                 const int exiting_thread = exiting_proc && exiting_proc->tid != exiting_proc->pid;
+                const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
                 if (exiting_proc) exiting_proc->exit_status = (u32)(req->args[0] & 0xffu);
+                if (exit_group && exiting_proc) {
+                    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+                        struct linux_process_state *thread_proc = &g_processes[i];
+                        if (!thread_proc->used || thread_proc == exiting_proc || thread_proc->pid != exiting_pid) continue;
+                        thread_proc->exit_status = exiting_proc->exit_status;
+                        if (thread_proc->clear_child_tid != 0) {
+                            const u32 zero = 0;
+                            (void)copy_to_trap_target(thread_proc->principal, thread_proc->clear_child_tid, &zero, sizeof(zero));
+                        }
+                        remove_futex_waiters_for_principal(thread_proc->principal);
+                        const u64 reply_status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
+                        if (reply_status == SYSCALL_OK) {
+                            user_log("LinuxAbiServer: exit_group teardown thread\n");
+                            thread_proc->used = 0;
+                        } else {
+                            user_log("LinuxAbiServer: exit_group teardown pending miss=");
+                            user_log_hex_value(reply_status);
+                        }
+                    }
+                }
                 if (exiting_proc && exiting_proc->clear_child_tid != 0) {
                     const u32 zero = 0;
                     (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
                     (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
+                    if (exiting_thread) user_log("LinuxAbiServer: clear_child_tid wake\n");
                 }
                 if (!exiting_thread) {
                     if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);

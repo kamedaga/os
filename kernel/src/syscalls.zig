@@ -81,6 +81,8 @@ const syscall_copy_to_abi_trap_target: u64 = trap_abi.syscall_copy_to_abi_trap_t
 const syscall_start_abi_trap_target: u64 = trap_abi.syscall_start_abi_trap_target;
 const syscall_set_abi_trap_target_request_page: u64 = trap_abi.syscall_set_abi_trap_target_request_page;
 const syscall_detach_abi_trap_reply_token: u64 = trap_abi.syscall_detach_abi_trap_reply_token;
+const syscall_share_abi_trap_reply_target_pages_to_target: u64 = trap_abi.syscall_share_abi_trap_reply_target_pages_to_target;
+const syscall_unmap_abi_trap_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_target_pages;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -396,8 +398,6 @@ fn dispatchIpcSyscall(
 }
 
 pub export fn syscallIpcDispatch(frame: *TrapFrame) callconv(.c) u64 {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     const entry_thread = scheduler.currentThreadIndex();
     setSyscallReturnWritebackEnabled(true);
@@ -414,8 +414,6 @@ pub export fn syscallIpcDispatch(frame: *TrapFrame) callconv(.c) u64 {
 }
 
 pub export fn syscallIpcCallReplyRecvSignalOnlyDispatch(frame: *TrapFrame) callconv(.c) u64 {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     const entry_thread = scheduler.currentThreadIndex();
     setSyscallReturnWritebackEnabled(true);
@@ -633,8 +631,6 @@ fn resolveIpcSignalTargetThread(
 }
 
 pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *const IpcSignalSave, out_frame: *TrapFrame) callconv(.c) usize {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     if (!h.kernel_state_ready.*) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
 
@@ -726,8 +722,6 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
 }
 
 pub export fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) callconv(.c) u64 {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     if (!h.kernel_state_ready.*) return syscall_fast_handled_mask | syscall_err_not_ready;
 
@@ -1303,6 +1297,12 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         syscall_set_abi_trap_target_request_page => {
             return abi_trap_runtime.setTargetRequestPage(state, proc, frame.rdi, frame.rsi);
         },
+        syscall_share_abi_trap_reply_target_pages_to_target => {
+            return abi_trap_runtime.shareCurrentReplyTargetPagesToTarget(state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10);
+        },
+        syscall_unmap_abi_trap_target_pages => {
+            return abi_trap_runtime.unmapTargetPages(state, proc, frame.rdi, frame.rsi, frame.rdx);
+        },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;
             const collected = collectMappedPagesForRange(state, proc, frame.rdi, frame.rsi, &page_paddrs) orelse return syscall_err_invalid;
@@ -1574,8 +1574,6 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
 }
 
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     return syscallDispatchFrom(frame, currentSyscallEntryIsLstar());
 }
 
@@ -1599,8 +1597,6 @@ fn syscallLstarDelegateDispatch(frame: *TrapFrame) ?u64 {
 }
 
 pub export fn syscallLstarDispatch(frame: *TrapFrame) callconv(.c) u64 {
-    scheduler.lockKernelTrapPath();
-    defer scheduler.unlockKernelTrapPath();
     if (syscallLstarDelegateDispatch(frame)) |result| return result;
     return syscallDispatchFrom(frame, false);
 }

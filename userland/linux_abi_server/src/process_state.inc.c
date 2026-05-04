@@ -1,4 +1,15 @@
 static void init_process_fds(struct linux_process_state *proc) { for (u64 i = 0; i < 32; i++) proc->fds[i].kind = FD_UNUSED; proc->fds[0].kind = FD_STDIO; proc->fds[1].kind = FD_STDIO; proc->fds[2].kind = FD_STDIO; }
+static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
+    dst->kind = src->kind;
+    dst->token = src->token;
+    dst->offset = src->offset;
+    dst->size = src->size;
+    dst->mode_bits = src->mode_bits;
+    dst->object_kind = src->object_kind;
+    dst->pipe_id = src->pipe_id;
+    dst->path_len = src->path_len;
+    for (u16 i = 0; i <= src->path_len && i <= FS_MAX_PATH_BYTES; i++) dst->path[i] = src->path[i];
+}
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
     proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->principal = principal; init_process_fds(proc);
     proc->mmap_next_va = 0x31000000ULL;
@@ -160,6 +171,15 @@ static u64 pipe_write_from_target(u64 fd, u64 src, u64 len, int *fault) {
 }
 static int alloc_fd(void) { for (int i = 3; i < 32; i++) if (g_fds[i].kind == FD_UNUSED) return i; return -1; }
 static int fd_valid(u64 fd) { return g_proc != 0 && fd < 32 && g_fds[fd].kind != FD_UNUSED; }
+
+static void sync_fd_to_thread_group(u64 fd) {
+    if (!g_proc || g_proc->pid == 0 || fd >= 32) return;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *peer = &g_processes[i];
+        if (!peer->used || peer == g_proc || peer->exec_pending || peer->principal == 0 || peer->pid != g_proc->pid) continue;
+        copy_fd_entry(&peer->fds[fd], &g_fds[fd]);
+    }
+}
 
 static int pipe_has_live_writer(u8 pipe_id) {
     if (pipe_id >= PIPE_MAX) return 0;

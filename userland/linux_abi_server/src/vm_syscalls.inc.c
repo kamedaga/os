@@ -92,17 +92,68 @@ static u64 apply_target_pages(u64 start, u64 page_count, u64 prot, u64 (*fn)(u64
     return SYSCALL_OK;
 }
 
+static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot) {
+    if (page_count <= 64) return map_reply_target_pages(start, page_count, prot);
+    return apply_target_pages(start, page_count, prot, map_reply_target_pages);
+}
+
+static void sync_thread_group_vm_state(void) {
+    if (!g_proc || g_proc->pid == 0) return;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *peer = &g_processes[i];
+        if (!peer->used || peer == g_proc || peer->exec_pending || peer->principal == 0 || peer->pid != g_proc->pid) continue;
+        peer->mmap_next_va = g_proc->mmap_next_va;
+        peer->brk_next_va = g_proc->brk_next_va;
+        for (u64 r = 0; r < VM_REGION_MAX; r++) peer->regions[r] = g_proc->regions[r];
+    }
+}
+
+static u64 share_target_pages_to_thread_group(u64 start, u64 page_count, u64 prot) {
+    if (!g_proc || g_proc->pid == 0) return SYSCALL_OK;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *peer = &g_processes[i];
+        if (!peer->used || peer == g_proc || peer->exec_pending || peer->principal == 0 || peer->pid != g_proc->pid) continue;
+        u64 done = 0;
+        while (done < page_count) {
+            const u64 chunk = min_u64(page_count - done, 64);
+            const u64 status = share_reply_target_pages_to_trap_target(peer->principal, start + done * PAGE_BYTES, chunk, prot);
+            if (status != SYSCALL_OK) return status;
+            done += chunk;
+        }
+    }
+    return SYSCALL_OK;
+}
+
+static u64 unmap_target_pages_from_thread_group(u64 start, u64 page_count) {
+    if (!g_proc || g_proc->pid == 0) return SYSCALL_OK;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *peer = &g_processes[i];
+        if (!peer->used || peer == g_proc || peer->exec_pending || peer->principal == 0 || peer->pid != g_proc->pid) continue;
+        u64 done = 0;
+        while (done < page_count) {
+            const u64 chunk = min_u64(page_count - done, 64);
+            const u64 status = unmap_trap_target_pages(peer->principal, start + done * PAGE_BYTES, chunk);
+            if (status != SYSCALL_OK) return status;
+            done += chunk;
+        }
+    }
+    return SYSCALL_OK;
+}
+
 static int unmap_tracked_target_range(u64 start, u64 size) {
     u64 done = 0;
     const u64 page_count = size / PAGE_BYTES;
     while (done < page_count) {
         const u64 chunk = min_u64(page_count - done, 64);
-        (void)unmap_reply_target_pages(start + done * PAGE_BYTES, chunk);
+        const u64 status = unmap_reply_target_pages(start + done * PAGE_BYTES, chunk);
+        if (status != SYSCALL_OK) return 0;
         done += chunk;
     }
+    if (unmap_target_pages_from_thread_group(start, page_count) != SYSCALL_OK) return 0;
     if (!vm_range_covered(start, size)) return 1;
     if (!vm_split_range_boundaries(start, size)) return 0;
     vm_remove_range(start, size);
+    sync_thread_group_vm_state();
     return 1;
 }
 
@@ -114,17 +165,33 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; const u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : g_mmap_next_va; const u64 map_prot = file_backed ? (prot | PROT_WRITE) : prot;
     if ((flags & MAP_FIXED_NOREPLACE) != 0 && vm_range_covered(target_va, size)) return reply(errno_exist(), 0);
     if ((flags & MAP_FIXED) != 0 && !unmap_tracked_target_range(target_va, size)) return reply(errno_nomem(), 0);
-    const u64 map_status = map_reply_target_pages(target_va, page_count, map_prot);
+    const u64 map_status = map_target_pages_chunked(target_va, page_count, map_prot);
     if (map_status == SYSCALL_OK) {
         if (file_backed) {
             int fault = 0;
             (void)read_fd_at_to_target(&g_fds[fd], offset, target_va, len, &fault);
             if (fault) return reply(errno_fault(), 0);
         }
-        if (!vm_add_region(target_va, size, prot)) return reply(errno_nomem(), 0);
+        const u64 share_status = share_target_pages_to_thread_group(target_va, page_count, map_prot);
+        if (share_status != SYSCALL_OK) {
+            user_log("LinuxAbiServer: mmap thread-group share failed\n");
+            user_log_hex_value(share_status);
+            return reply(errno_nomem(), 0);
+        }
+        if (!vm_add_region(target_va, size, prot)) {
+            user_log("LinuxAbiServer: mmap vm_add_region failed\n");
+            user_log_hex_value(target_va);
+            user_log_hex_value(size);
+            return reply(errno_nomem(), 0);
+        }
         if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) g_mmap_next_va += size;
+        sync_thread_group_vm_state();
         return reply(target_va, 0);
     }
+    user_log("LinuxAbiServer: mmap map_reply_target_pages failed\n");
+    user_log_hex_value(map_status);
+    user_log_hex_value(target_va);
+    user_log_hex_value(page_count);
     return reply(errno_nomem(), 0);
 }
 static struct ipc_message handle_brk(const struct trap_request *req) {
@@ -133,12 +200,24 @@ static struct ipc_message handle_brk(const struct trap_request *req) {
         u64 from = page_up(g_brk_next_va);
         u64 to = page_up(req->args[0]);
         if (to > from) {
-            const u64 status = map_reply_target_pages(from, (to - from) / PAGE_BYTES, 0x3);
+            const u64 status = map_target_pages_chunked(from, (to - from) / PAGE_BYTES, 0x3);
             if (status != SYSCALL_OK) return reply(g_brk_next_va, 0);
-            if (!vm_add_region(from, to - from, 0x3)) return reply(g_brk_next_va, 0);
+            const u64 share_status = share_target_pages_to_thread_group(from, (to - from) / PAGE_BYTES, 0x3);
+            if (share_status != SYSCALL_OK) {
+                user_log("LinuxAbiServer: brk thread-group share failed\n");
+                user_log_hex_value(share_status);
+                return reply(g_brk_next_va, 0);
+            }
+            if (!vm_add_region(from, to - from, 0x3)) {
+                user_log("LinuxAbiServer: brk vm_add_region failed\n");
+                user_log_hex_value(from);
+                user_log_hex_value(to - from);
+                return reply(g_brk_next_va, 0);
+            }
         }
     }
     g_brk_next_va = req->args[0];
+    sync_thread_group_vm_state();
     return reply(g_brk_next_va, 0);
 }
 
@@ -150,8 +229,23 @@ static struct ipc_message handle_mprotect(const struct trap_request *req) {
     const int tracked = vm_range_covered(start, size);
     if (tracked && !vm_split_range_boundaries(start, size)) return reply(errno_nomem(), 0);
     const u64 status = apply_target_pages(start, size / PAGE_BYTES, prot, protect_reply_target_pages);
-    if (status != SYSCALL_OK) return reply(errno_nomem(), 0);
+    if (!tracked && status == SYSCALL_ERR_MAP) return reply(0, 0);
+    if (status != SYSCALL_OK) {
+        user_log("LinuxAbiServer: mprotect current target failed\n");
+        user_log_hex_value(status);
+        user_log_hex_value(start);
+        user_log_hex_value(size / PAGE_BYTES);
+        user_log_hex_value(prot);
+        return reply(errno_nomem(), 0);
+    }
+    const u64 share_status = share_target_pages_to_thread_group(start, size / PAGE_BYTES, prot);
+    if (share_status != SYSCALL_OK) {
+        user_log("LinuxAbiServer: mprotect thread-group share failed\n");
+        user_log_hex_value(share_status);
+        return reply(errno_nomem(), 0);
+    }
     if (tracked) vm_protect_range(start, size, prot);
+    sync_thread_group_vm_state();
     return reply(0, 0);
 }
 
@@ -169,6 +263,8 @@ static struct ipc_message handle_munmap(const struct trap_request *req) {
         if (status != SYSCALL_OK) return reply(errno_inval(), 0);
         done += chunk;
     }
+    if (unmap_target_pages_from_thread_group(start, page_count) != SYSCALL_OK) return reply(errno_inval(), 0);
     vm_remove_range(start, size);
+    sync_thread_group_vm_state();
     return reply(0, 0);
 }

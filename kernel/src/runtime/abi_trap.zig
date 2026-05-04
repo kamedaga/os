@@ -208,6 +208,33 @@ fn deferredTargetThread(h: *const Hooks, server_proc: kernel.PrincipalId, target
     return target_thread;
 }
 
+fn abiTrapTargetThread(h: *const Hooks, server_proc: kernel.PrincipalId, target_raw: u64) ?usize {
+    if (target_raw >= kernel.process_count) return null;
+    const target_proc: kernel.PrincipalId = @enumFromInt(@as(u8, @intCast(target_raw)));
+    const target_thread = scheduler.threadSlotForPrincipal(target_proc) orelse return null;
+    const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
+    if (!target_ctx.allocated) return null;
+    const delegate = h.state.abiTrapDelegateFor(target_proc) orelse return null;
+    const delegate_target = h.state.endpointTargetFor(target_proc, delegate.endpoint_id) orelse return null;
+    if (delegate_target != server_proc) return null;
+    return target_thread;
+}
+
+fn inactiveTargetThreadWithEndpointToServer(h: *const Hooks, server_proc: kernel.PrincipalId, target_raw: u64) ?usize {
+    if (target_raw >= kernel.process_count) return null;
+    const target_proc: kernel.PrincipalId = @enumFromInt(@as(u8, @intCast(target_raw)));
+    const target_thread = scheduler.threadSlotForPrincipal(target_proc) orelse return null;
+    const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
+    if (!target_ctx.allocated) return null;
+    const table = h.state.getEndpointTableConst(target_proc);
+    const limit = @min(table.len, table.caps.len);
+    var i: usize = 0;
+    while (i < limit) : (i += 1) {
+        if (table.caps[i].target == server_proc) return target_thread;
+    }
+    return null;
+}
+
 pub fn copyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, dst_target_va: u64, src_current_va: u64, len_u64: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
@@ -228,10 +255,17 @@ pub fn copyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target
 pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, result: u64, flags: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
-    const target_thread = deferredTargetThread(h, proc, target_raw) orelse return boot_static.syscall_err_endpoint;
+    const exit_response = (flags & trap_abi.response_flag_exit) != 0;
+    const target_thread = if (exit_response)
+        (deferredTargetThread(h, proc, target_raw) orelse
+            abiTrapTargetThread(h, proc, target_raw) orelse
+            inactiveTargetThreadWithEndpointToServer(h, proc, target_raw) orelse
+            return boot_static.syscall_err_endpoint)
+    else
+        (deferredTargetThread(h, proc, target_raw) orelse return boot_static.syscall_err_endpoint);
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return boot_static.syscall_err_endpoint;
     const target_proc = target_ctx.owner_process;
-    if ((flags & trap_abi.response_flag_exit) != 0) {
+    if (exit_response) {
         _ = scheduler.releaseThreadSlot(target_thread);
         _ = h.state.markProcessExited(target_proc);
         _ = reclaimPrivatePagesForProcessWithHooks(h, target_proc);
@@ -320,22 +354,99 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
     const target_proc = currentReplyTargetPrincipal() orelse return boot_static.syscall_err_endpoint;
     const byte_len: usize = @intCast(page_count * 4096);
     var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
+    var reclaimable: [boot_static.syscall_batch_max_pages]bool = [_]bool{false} ** boot_static.syscall_batch_max_pages;
     const collected = user_vm.collectUserLinearRegionPaddrs(target_proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
     if (collected != page_count) return boot_static.syscall_err_map;
-    for (paddrs[0..collected]) |paddr| {
+    var page_index: usize = 0;
+    while (page_index < collected) : (page_index += 1) {
+        const paddr = paddrs[page_index];
         const cap = h.state.getTableConst(target_proc).find(paddr) orelse return boot_static.syscall_err_invalid;
-        if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) return boot_static.syscall_err_invalid;
-        switch (h.state.scanCapTables(paddr)) {
-            .owner => |actual_owner| if (actual_owner != target_proc) return boot_static.syscall_err_invalid,
-            .shared, .none => return boot_static.syscall_err_invalid,
+        if (cap.cap_id == cap.root_cap_id and cap.parent_cap_id == 0) {
+            switch (h.state.scanCapTables(paddr)) {
+                .owner => |actual_owner| {
+                    if (actual_owner != target_proc) return boot_static.syscall_err_invalid;
+                    if (!h.free_list.canAppendPage(0, paddr)) return boot_static.syscall_err_alloc;
+                    reclaimable[page_index] = true;
+                },
+                .shared => {},
+                .none => return boot_static.syscall_err_invalid,
+            }
         }
-        if (!h.free_list.canAppendPage(0, paddr)) return boot_static.syscall_err_alloc;
     }
     if (!user_vm.unmapUserLinearRegion(target_proc, target_va, byte_len)) {
         return boot_static.syscall_err_map;
     }
-    for (paddrs[0..collected]) |paddr| {
+    page_index = 0;
+    while (page_index < collected) : (page_index += 1) {
+        if (!reclaimable[page_index]) continue;
+        const paddr = paddrs[page_index];
         h.state.reclaimExclusiveRootPage(target_proc, paddr, h.free_list) catch return boot_static.syscall_err_invalid;
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn unmapTargetPages(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, target_va: u64, page_count: u64) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
+    if (page_count == 0 or page_count > boot_static.syscall_batch_max_pages) return boot_static.syscall_err_invalid;
+    const target_thread = abiTrapTargetThread(h, proc, target_raw) orelse return boot_static.syscall_err_endpoint;
+    const target_ctx = scheduler.getThreadContext(target_thread) orelse return boot_static.syscall_err_endpoint;
+    const target_proc = target_ctx.owner_process;
+    const byte_len: usize = @intCast(page_count * 4096);
+    if (!user_vm.unmapUserLinearRegion(target_proc, target_va, byte_len)) {
+        return boot_static.syscall_err_map;
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn shareCurrentReplyTargetPagesToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, target_va: u64, page_count: u64, prot_bits: u64) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
+    if (page_count == 0 or page_count > boot_static.syscall_batch_max_pages) return boot_static.syscall_err_invalid;
+    const source_proc = currentReplyTargetPrincipal() orelse return boot_static.syscall_err_endpoint;
+    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    const target_thread = abiTrapTargetThread(h, proc, target_raw) orelse return boot_static.syscall_err_endpoint;
+    const target_ctx = scheduler.getThreadContext(target_thread) orelse return boot_static.syscall_err_endpoint;
+    const target_proc = target_ctx.owner_process;
+    if (target_proc == source_proc) return boot_static.syscall_ok;
+
+    const byte_len: usize = @intCast(page_count * 4096);
+    var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
+    const collected = user_vm.collectUserLinearRegionPaddrs(source_proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
+    if (collected != page_count) return boot_static.syscall_err_map;
+
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const va = target_va + page_index * 4096;
+        const paddr = paddrs[@intCast(page_index)];
+
+        if (capability.lookupUserMappedPaddrForVa(target_proc, va)) |existing_paddr| {
+            if (existing_paddr != paddr) return boot_static.syscall_err_map;
+            const target_cap = h.state.getTableConst(target_proc).find(paddr) orelse return boot_static.syscall_err_invalid;
+            if (!target_cap.rights.cpu_read or (prot.write and !target_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
+            if (!user_vm.protectUserLinearRegionWithProt(target_proc, va, 4096, prot)) return boot_static.syscall_err_map;
+            continue;
+        }
+
+        if (h.state.getTableConst(target_proc).find(paddr)) |target_cap| {
+            if (!target_cap.rights.cpu_read or (prot.write and !target_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
+        } else {
+            const source_cap = h.state.getTableConst(source_proc).find(paddr) orelse return boot_static.syscall_err_invalid;
+            if (!source_cap.rights.cpu_read or (prot.write and !source_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
+            h.state.deriveCapForSharedAddressSpace(
+                source_proc,
+                target_proc,
+                paddr,
+                .{
+                    .cpu_read = true,
+                    .cpu_write = source_cap.rights.cpu_write,
+                    .dma = false,
+                },
+            ) catch return boot_static.syscall_err_grant;
+        }
+        if (!user_vm.mapUserLinearRegionWithProt(target_proc, va, paddr, 4096, prot)) return boot_static.syscall_err_map;
     }
     return boot_static.syscall_ok;
 }
@@ -467,21 +578,20 @@ fn shareCloneMappedPage(context: *anyopaque, page: user_vm.MappedUserPage) bool 
     if (!src_cap.rights.cpu_read) {
         return copyCloneMappedPage(ctx, page);
     }
-    const child_writable = page.writable and src_cap.rights.cpu_write;
     ctx.h.state.deriveCapForSharedAddressSpace(
         ctx.parent,
         ctx.child,
         page.paddr,
         .{
             .cpu_read = true,
-            .cpu_write = child_writable,
+            .cpu_write = src_cap.rights.cpu_write,
             .dma = false,
         },
     ) catch {
         ctx.status = boot_static.syscall_err_grant;
         return false;
     };
-    if (!user_vm.mapUserLinearRegionWithProt(ctx.child, page.va, page.paddr, 4096, .{ .read = true, .write = child_writable, .exec = true })) {
+    if (!user_vm.mapUserLinearRegionWithProt(ctx.child, page.va, page.paddr, 4096, .{ .read = true, .write = page.writable, .exec = true })) {
         ctx.status = boot_static.syscall_err_map;
         return false;
     }

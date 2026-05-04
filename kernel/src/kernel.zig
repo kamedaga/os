@@ -7,7 +7,7 @@ const dma_mapping_manager = @import("dma_mapping_manager.zig");
 const device_capabilities = @import("device_capabilities.zig");
 pub const initial_process_count: usize = 8;
 pub const process_count: usize = 32;
-pub const max_thread_slots: usize = 16;
+pub const max_thread_slots: usize = 32;
 pub const device_count: usize = 1;
 pub const principal_count: usize = process_count + device_count;
 
@@ -1078,11 +1078,22 @@ pub const KernelState = struct {
         return @intFromEnum(principal);
     }
 
+    fn clearPrincipalTablesForReuse(self: *KernelState, index: usize) void {
+        self.cap_tables[index] = .{};
+        self.untyped_tables[index] = .{};
+        self.endpoint_tables[index] = .{};
+        self.cap_mailboxes[index] = .{};
+        self.pending_page_transfers[index] = null;
+        self.vm_object_tables[index] = .{};
+        self.exec_image_tables[index] = .{};
+    }
+
     pub fn createProcessDescriptor(self: *KernelState, label: []const u8) ?PrincipalId {
         var i: usize = 0;
         while (i < self.process_descriptors.len) : (i += 1) {
             if (self.process_descriptors[i].active) continue;
             const principal = processPrincipal(i);
+            self.clearPrincipalTablesForReuse(i);
             self.process_descriptors[i] = .{
                 .active = true,
                 .principal = principal,
@@ -1101,6 +1112,7 @@ pub const KernelState = struct {
             self.process_descriptors[index].label = label;
             return true;
         }
+        self.clearPrincipalTablesForReuse(index);
         self.process_descriptors[index] = .{
             .active = true,
             .principal = principal,

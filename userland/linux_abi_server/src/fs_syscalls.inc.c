@@ -112,6 +112,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     if (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) {
         g_fds[fd].kind = FD_DIR; g_fds[fd].token = token; g_fds[fd].offset = 0; g_fds[fd].size = 0; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = kind;
         fd_set_path(&g_fds[fd], resolved);
+        sync_fd_to_thread_group((u64)fd);
         return reply((u64)fd, 0);
     }
     if ((flags & O_DIRECTORY) != 0) return reply(errno_notdir(), 0);
@@ -120,6 +121,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     if (response->status != FS_STATUS_OK || response->result_token == 0) return reply(errno_acces(), 0);
     g_fds[fd].kind = FD_FILE; g_fds[fd].token = response->result_token; g_fds[fd].offset = 0; g_fds[fd].size = response->file_bytes != 0 ? response->file_bytes : size; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = FS_OBJECT_FILE;
     fd_set_path(&g_fds[fd], resolved);
+    sync_fd_to_thread_group((u64)fd);
     return reply((u64)fd, 0);
 }
 
@@ -141,18 +143,20 @@ static struct ipc_message handle_read(const struct trap_request *req) {
             detach_reply_token();
             return wait_ipc();
         }
-        int fault = 0; const u64 n = pipe_read_to_target(fd, dst, len, &fault); return reply(fault ? errno_fault() : n, 0);
+        int fault = 0; const u64 n = pipe_read_to_target(fd, dst, len, &fault); sync_fd_to_thread_group(fd); return reply(fault ? errno_fault() : n, 0);
     }
     if (g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
     u64 copied = 0;
-    while (copied < len) {
+    while (copied < len && g_fds[fd].offset < g_fds[fd].size) {
         u64 request_len = min_u64(len - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
+        if (request_len > remaining) request_len = remaining;
         if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
         volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
         if (response->status != FS_STATUS_OK) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
         if (response->inline_bytes == 0) break;
         if (copy_to_target(dst + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) return reply(errno_fault(), 0);
-        copied += response->inline_bytes; g_fds[fd].offset += response->inline_bytes;
+        copied += response->inline_bytes; g_fds[fd].offset += response->inline_bytes; sync_fd_to_thread_group(fd);
         if (response->inline_bytes < request_len) break;
     }
     return reply(copied, 0);
@@ -187,6 +191,57 @@ static struct ipc_message handle_pread64(const struct trap_request *req) {
     return copied != 0 ? reply(copied, 0) : reply(0, 0);
 }
 
+static struct ipc_message handle_readv(const struct trap_request *req) {
+    const u64 fd = req->args[0]; const u64 iov = req->args[1]; const u64 iovcnt = req->args[2];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    if (iovcnt > 64) return reply(errno_inval(), 0);
+    if (g_fds[fd].kind == FD_STDIO) return reply(0, 0);
+    u64 total = 0;
+    if (g_fds[fd].kind == FD_PIPE_READ) {
+        const u8 pipe_id = g_fds[fd].pipe_id;
+        if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
+        struct pipe_entry *pipe = &g_pipes[pipe_id];
+        if (pipe->len == 0) return reply((pipe->write_refs != 0 || pipe_has_live_writer(pipe_id)) ? errno_again() : 0, 0);
+        for (u64 i = 0; i < iovcnt; i++) {
+            u64 pair[2];
+            if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+            if (pair[1] == 0) continue;
+            int fault = 0;
+            const u64 n = pipe_read_to_target(fd, pair[0], pair[1], &fault);
+            if (fault) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+            sync_fd_to_thread_group(fd);
+            total += n;
+            if (n != pair[1]) break;
+        }
+        return reply(total, 0);
+    }
+    if (g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
+    for (u64 i = 0; i < iovcnt; i++) {
+        u64 pair[2];
+        if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+        u64 copied = 0;
+        while (copied < pair[1] && g_fds[fd].offset < g_fds[fd].size) {
+            u64 request_len = min_u64(pair[1] - copied, FS_RESPONSE_PAYLOAD_BYTES);
+            const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
+            if (request_len > remaining) request_len = remaining;
+            if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
+            volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+            if (response->status != FS_STATUS_OK) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
+            if (response->inline_bytes == 0) return reply(total, 0);
+            if (copy_to_target(pair[0] + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) {
+                return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+            }
+            copied += response->inline_bytes;
+            total += response->inline_bytes;
+            g_fds[fd].offset += response->inline_bytes;
+            sync_fd_to_thread_group(fd);
+            if (response->inline_bytes < request_len) return reply(total, 0);
+        }
+        if (copied < pair[1]) return reply(total, 0);
+    }
+    return reply(total, 0);
+}
+
 static struct ipc_message handle_write(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 src = req->args[1]; const u64 len = req->args[2];
     if (fd_valid(fd) && g_fds[fd].kind == FD_PIPE_WRITE) {
@@ -204,6 +259,7 @@ static struct ipc_message handle_write(const struct trap_request *req) {
             invalidate_exec_cache_for_path(g_fds[fd].path);
             g_fds[fd].offset += n;
             if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
+            sync_fd_to_thread_group(fd);
             return reply(n, 0);
         }
         return reply(errno_io(), 0);
@@ -247,6 +303,7 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             if (n != 0) invalidate_exec_cache_for_path(g_fds[fd].path);
             g_fds[fd].offset += n;
             if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
+            sync_fd_to_thread_group(fd);
             total += n;
             if (n != pair[1]) break;
         }
@@ -314,7 +371,7 @@ static struct ipc_message handle_lseek(const struct trap_request *req) {
     const u64 fd = req->args[0]; const i64 off = (i64)req->args[1]; const u64 whence = req->args[2]; if (!fd_valid(fd)) return reply(errno_badf(), 0);
     if (fd_is_pipe(fd)) return reply(errno_spipe(), 0);
     i64 base = 0; if (whence == SEEK_SET) base = 0; else if (whence == SEEK_CUR) base = (i64)g_fds[fd].offset; else if (whence == SEEK_END) base = (i64)g_fds[fd].size; else return reply(errno_inval(), 0);
-    i64 next = base + off; if (next < 0) return reply(errno_inval(), 0); g_fds[fd].offset = (u64)next; return reply((u64)next, 0);
+    i64 next = base + off; if (next < 0) return reply(errno_inval(), 0); g_fds[fd].offset = (u64)next; sync_fd_to_thread_group(fd); return reply((u64)next, 0);
 }
 
 static struct ipc_message handle_close(const struct trap_request *req) {
@@ -322,6 +379,7 @@ static struct ipc_message handle_close(const struct trap_request *req) {
     if (fd >= 32 || g_fds[fd].kind == FD_UNUSED) return reply(errno_badf(), 0);
     if (fd_is_pipe(fd)) close_pipe_fd(fd);
     g_fds[fd].kind = FD_UNUSED;
+    sync_fd_to_thread_group(fd);
     return reply(0, 0);
 }
 static struct ipc_message handle_unlinkat(const struct trap_request *req, int old_unlink) {

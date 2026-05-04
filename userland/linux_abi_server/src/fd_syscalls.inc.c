@@ -10,6 +10,7 @@ static int fd_clone_into(u64 dst, u64 src) {
     g_fds[dst].path_len = g_fds[src].path_len;
     for (u16 i = 0; i <= g_fds[src].path_len && i <= FS_MAX_PATH_BYTES; i++) g_fds[dst].path[i] = g_fds[src].path[i];
     pipe_ref_fd(&g_fds[dst]);
+    sync_fd_to_thread_group(dst);
     return 1;
 }
 
@@ -60,6 +61,8 @@ static struct ipc_message handle_pipe2(const struct trap_request *req, int has_f
     g_fds[(u64)write_fd].pipe_id = (u8)pipe_slot;
     g_fds[(u64)write_fd].path_len = 0;
     g_fds[(u64)write_fd].path[0] = 0;
+    sync_fd_to_thread_group((u64)read_fd);
+    sync_fd_to_thread_group((u64)write_fd);
 
     const u32 read_fd32 = (u32)read_fd;
     const u32 write_fd32 = (u32)write_fd;

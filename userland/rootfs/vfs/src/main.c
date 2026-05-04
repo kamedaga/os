@@ -447,9 +447,15 @@ static void reply_dir_lookup(u16 op, u64 seq, u64 token) {
     write_response(op, seq, FS_STATUS_OK, token, 0, 0, kind, 0);
 }
 
+static u64 tmpfs_file_bytes_from_token(u64 token) {
+    const u64 index = tmpfs_index_from_file_object_id(object_id_from_token(token));
+    if (index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[index].used) return g_tmpfs_files[index].size;
+    return 0;
+}
+
 static void reply_file_lookup(u16 op, u64 seq, u64 token) {
     clear_page(g_session->response_va);
-    write_response(op, seq, FS_STATUS_OK, token, 0, 0, FS_OBJECT_FILE, 0);
+    write_response(op, seq, FS_STATUS_OK, token, tmpfs_file_bytes_from_token(token), 0, FS_OBJECT_FILE, 0);
 }
 
 static void reply_stat(u64 seq, u64 token) {
@@ -558,7 +564,7 @@ static void reply_open(u64 seq, u64 token) {
         return;
     }
     clear_page(g_session->response_va);
-    write_response(FS_OP_OPEN, seq, FS_STATUS_OK, token_from_object_id(open_object_id), 0, 0, FS_OBJECT_OPEN_FILE, 0);
+    write_response(FS_OP_OPEN, seq, FS_STATUS_OK, token_from_object_id(open_object_id), tmpfs_file_bytes_from_token(token), 0, FS_OBJECT_OPEN_FILE, 0);
 }
 
 static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
