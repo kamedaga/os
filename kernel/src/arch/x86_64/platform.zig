@@ -122,6 +122,59 @@ pub export var kernel_syscall_stack_top: u64 = 0;
 pub export var kernel_syscall_stack_tops: [max_cpus]u64 = [_]u64{0} ** max_cpus;
 pub export var pcid_enabled: u64 = 0;
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pml4_table), &pml4_table));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pdp_table), &pdp_table));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pd_tables), &pd_tables));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(high_mmio_pdp_table), &high_mmio_pdp_table));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(high_mmio_pd_tables), &high_mmio_pd_tables));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(phys_copy_window_pt), &phys_copy_window_pt));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(idt), &idt));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gdt_tables), &gdt_tables));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ring0_stack_region_raw), &ring0_stack_region_raw));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_ist_stack_region_raw), &pf_ist_stack_region_raw));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_ist_stack_region_raw), &df_ist_stack_region_raw));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_ring0_stacks), &ap_ring0_stacks));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_pf_ist_stacks), &ap_pf_ist_stacks));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_df_ist_stacks), &ap_df_ist_stacks));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ring0_stack_guard_pt), &ring0_stack_guard_pt));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_ist_stack_guard_pt), &pf_ist_stack_guard_pt));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_ist_stack_guard_pt), &df_ist_stack_guard_pt));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tss_tables), &tss_tables));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(int80_trampoline_page), &int80_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_page), &df_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ud_trampoline_page), &ud_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ts_trampoline_page), &ts_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(np_trampoline_page), &np_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(int80_trampoline_entry), &int80_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_entry), &df_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ud_trampoline_entry), &ud_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ts_trampoline_entry), &ts_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(np_trampoline_entry), &np_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ss_trampoline_entry), &ss_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_trampoline_entry), &timer_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_cr3_value), &kernel_cr3_value));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_syscall_stack_top), &kernel_syscall_stack_top));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_syscall_stack_tops), &kernel_syscall_stack_tops));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pcid_enabled), &pcid_enabled));
+    return end;
+}
+
 const msr_efer: u32 = 0xC000_0080;
 const msr_star: u32 = 0xC000_0081;
 const msr_lstar: u32 = 0xC000_0082;
@@ -422,13 +475,16 @@ fn installGuardedIdentityStackRegion(region: []u8, usable_bytes: usize, pt_table
     while (chunk_index < stack_region_chunk_count) : (chunk_index += 1) {
         const chunk_base = region_base + (@as(u64, @intCast(chunk_index)) * two_mib);
         const pt = &pt_tables[chunk_index];
-        @memset(pt[0..], 0);
 
         var page_index: usize = 0;
         while (page_index < page_entries) : (page_index += 1) {
             const page_base = chunk_base + (@as(u64, @intCast(page_index)) * 4096);
-            if (page_base < usable_start or page_base >= usable_end) continue;
             pt[page_index] = page_base | page_present | page_rw;
+            if (page_base >= region_base and page_base < region_base + region.len) {
+                if (page_base < usable_start or page_base >= usable_end) {
+                    pt[page_index] = 0;
+                }
+            }
         }
 
         const pt_pa = @intFromPtr(pt);

@@ -17,6 +17,22 @@ var state_ptr: *kernel.KernelState = undefined;
 var free_list_ptr: *kernel.FreePageList = undefined;
 var user_spaces_ptr: []boot_static.UserAddressSpace = undefined;
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(state_ptr), &state_ptr));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(free_list_ptr), &free_list_ptr));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces_ptr), &user_spaces_ptr));
+    return end;
+}
+
 pub fn init(
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
@@ -210,7 +226,7 @@ pub fn setAbiTrapDelegate(
         kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
         else => return boot_static.syscall_err_invalid,
     };
-    if (scheduler.spawnExecApPlacementExperimentEnabled()) {
+    if (scheduler.spawnExecApUserSchedulingEnabled()) {
         kernel_log.write("process_builder abi_delegate target=");
         log_util.printNumber(processSlot(target) orelse scheduler.idle_thread_marker);
         kernel_log.write(" endpoint=");
@@ -242,11 +258,11 @@ pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
     const thread_index = scheduler.threadSlotForPrincipal(target) orelse return boot_static.syscall_err_invalid;
     const slot = processSlot(target) orelse return boot_static.syscall_err_invalid;
-    const ap_placement_block = scheduler.spawnExecApPlacementBlockReason();
+    const ap_placement_block = scheduler.spawnExecApUserSchedulingBlockReason();
     state_ptr.clearProcessBuilderSuspended(target) catch return boot_static.syscall_err_invalid;
     if (!scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
     const ap_placed_cpu = scheduler.assignReadyUserThreadToApIfReady(thread_index);
-    if (scheduler.spawnExecApPlacementExperimentEnabled()) {
+    if (scheduler.spawnExecApUserSchedulingEnabled()) {
         kernel_log.write("process_builder start child=");
         log_util.printNumber(slot);
         kernel_log.write(" thread=");
@@ -264,11 +280,11 @@ pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     return boot_abi.process_abi.encodeSpawnedProcess(slot, @intCast(thread_index));
 }
 
-fn writeApPlacementBlock(reason: scheduler.SpawnExecApPlacementBlock) void {
+fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void {
     switch (reason) {
         .none => kernel_log.write("none"),
         .flag_disabled => kernel_log.write("off"),
-        .ap_queue_experiment_disabled => kernel_log.write("blocked:ap_queue_experiment_disabled"),
+        .ap_user_policy_disabled => kernel_log.write("blocked:ap_user_policy_disabled"),
         .no_ap => kernel_log.write("blocked:no_ap"),
         .bootstrap_path => kernel_log.write("blocked:bootstrap_path"),
         .ap_syscall_global_state_not_per_cpu => kernel_log.write("blocked:ap_syscall_global_state_not_per_cpu"),

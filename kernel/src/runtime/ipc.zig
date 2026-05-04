@@ -29,15 +29,16 @@ pub fn deliverOrQueueMessageToThread(
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return boot_static.syscall_err_endpoint;
     const target_hot = scheduler.getIpcHotThreadConst(target_thread) orelse return boot_static.syscall_err_endpoint;
     if (target_hot.allocated == 0) return boot_static.syscall_err_endpoint;
-    if (target_hot.ready == 0) {
+    const abi_reply_to_pending_target = target_ctx.abi_trap_reply_pending and endpoint_id == 0 and !grants_reply;
+    if (target_hot.ready == 0 or abi_reply_to_pending_target) {
         target_ctx.wait_mailbox = false;
         target_ctx.wake_tick = 0;
-        target_ctx.ready = true;
-        scheduler.setIpcHotWaitState(target_thread, false, 0, true);
         if (grants_reply) {
             scheduler.setIpcReplyTokenForThread(target_thread, true, sender_thread);
         }
         deliverMessageToContext(target_ctx, mr0, mr1, mr2, mr3);
+        target_ctx.ready = true;
+        scheduler.setIpcHotWaitState(target_thread, false, 0, true);
         scheduler.wakeAssignedApForRunnableThread(target_thread);
         scheduler.preferIpcSwitchToThread(target_thread);
         return boot_static.syscall_ok;

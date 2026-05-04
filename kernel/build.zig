@@ -41,20 +41,30 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const scheduler_ap_queue_experiment = b.option(
+    const legacy_scheduler_ap_queue_experiment = b.option(
         bool,
         "scheduler-ap-queue-experiment",
-        "Allow non-BSP scheduler run queues to accept runnable threads for scheduler experiments",
+        "Deprecated alias for scheduler-ap-user-diagnostics",
     ) orelse false;
-    const spawn_exec_ap_placement_experiment = b.option(
+    const scheduler_ap_user_diagnostics = b.option(
+        bool,
+        "scheduler-ap-user-diagnostics",
+        "Run boot-time AP user scheduler diagnostics/probes",
+    ) orelse legacy_scheduler_ap_queue_experiment;
+    const legacy_spawn_exec_ap_placement_experiment = b.option(
         bool,
         "spawn-exec-ap-placement-experiment",
-        "Attempt to place spawn_exec children on AP scheduler queues when AP user syscall/trap paths are ready",
+        "Deprecated alias for spawn-exec-ap-user-scheduling",
     ) orelse false;
+    const spawn_exec_ap_user_scheduling = b.option(
+        bool,
+        "spawn-exec-ap-user-scheduling",
+        "Place spawn_exec children on AP scheduler queues when AP user syscall/trap paths are ready",
+    ) orelse legacy_spawn_exec_ap_placement_experiment;
     const build_workarounds = b.addOptions();
     build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
-    build_workarounds.addOption(bool, "scheduler_ap_queue_experiment", scheduler_ap_queue_experiment);
-    build_workarounds.addOption(bool, "spawn_exec_ap_placement_experiment", spawn_exec_ap_placement_experiment);
+    build_workarounds.addOption(bool, "scheduler_ap_user_diagnostics", scheduler_ap_user_diagnostics);
+    build_workarounds.addOption(bool, "spawn_exec_ap_user_scheduling", spawn_exec_ap_user_scheduling);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/kernel.zig"),

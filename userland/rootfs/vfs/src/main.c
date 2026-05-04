@@ -19,6 +19,8 @@ enum {
     VFS_CONFIG_VA = 0x3C002000,
     VFS_REQUEST_VA = 0x26000000,
     VFS_RESPONSE_VA = 0x26001000,
+    VFS_SESSION_STRIDE_BYTES = 0x2000,
+    VFS_MAX_SESSIONS = 8,
     VFS_FAT_REQUEST_VA = 0x26100000,
     VFS_FAT_RESPONSE_VA = 0x26101000,
     VFS_REPLY_ENDPOINT_ID = 0xE0,
@@ -94,7 +96,8 @@ struct vfs_backend_session {
     u64 next_seq;
 };
 
-static struct vfs_session g_session;
+static struct vfs_session g_sessions[VFS_MAX_SESSIONS];
+static struct vfs_session *g_session;
 static struct vfs_backend_session g_root_backend;
 static struct vfs_tmpfs_file g_tmpfs_files[VFS_TMPFS_MAX_FILES];
 static u64 g_endpoint_id;
@@ -127,6 +130,32 @@ static void user_log_len(const char *message, u64 len) {
 
 static void user_log(const char *message) {
     user_log_len(message, cstr_len(message));
+}
+
+static u64 session_request_va(u64 slot) {
+    return VFS_REQUEST_VA + slot * VFS_SESSION_STRIDE_BYTES;
+}
+
+static u64 session_response_va(u64 slot) {
+    return session_request_va(slot) + FS_PAGE_BYTES;
+}
+
+static struct vfs_session *find_session_by_request_paddr(u64 request_paddr) {
+    for (u64 i = 0; i < VFS_MAX_SESSIONS; i++) {
+        if (g_sessions[i].active && g_sessions[i].request_paddr == request_paddr) return &g_sessions[i];
+    }
+    return 0;
+}
+
+static struct vfs_session *alloc_session_slot(void) {
+    for (u64 i = 0; i < VFS_MAX_SESSIONS; i++) {
+        if (!g_sessions[i].active) return &g_sessions[i];
+    }
+    return 0;
+}
+
+static u64 session_slot(struct vfs_session *session) {
+    return (u64)(session - g_sessions);
 }
 
 static u64 syscall2(u64 nr, u64 arg0, u64 arg1) {
@@ -385,7 +414,7 @@ static void write_response(
     u8 object_kind,
     u16 inline_bytes
 ) {
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_session.response_va;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_session->response_va;
     response->magic = FS_RESPONSE_MAGIC;
     response->version = FS_PROTOCOL_VERSION;
     response->op = op;
@@ -402,30 +431,30 @@ static void write_response(
     response->arg1 = 0;
     __asm__ volatile("" ::: "memory");
     response->response_seq = seq;
-    if (g_session.reply_endpoint_id != 0) {
-        (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, g_session.reply_endpoint_id, 0);
+    if (g_session->reply_endpoint_id != 0) {
+        (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, g_session->reply_endpoint_id, 0);
     }
 }
 
 static void reply_status(u16 op, u64 seq, i32 status) {
-    clear_page(g_session.response_va);
+    clear_page(g_session->response_va);
     write_response(op, seq, status, 0, 0, 0, FS_OBJECT_NONE, 0);
 }
 
 static void reply_dir_lookup(u16 op, u64 seq, u64 token) {
-    clear_page(g_session.response_va);
+    clear_page(g_session->response_va);
     const u8 kind = token == root_token() ? FS_OBJECT_MOUNT : FS_OBJECT_DIRECTORY;
     write_response(op, seq, FS_STATUS_OK, token, 0, 0, kind, 0);
 }
 
 static void reply_file_lookup(u16 op, u64 seq, u64 token) {
-    clear_page(g_session.response_va);
+    clear_page(g_session->response_va);
     write_response(op, seq, FS_STATUS_OK, token, 0, 0, FS_OBJECT_FILE, 0);
 }
 
 static void reply_stat(u64 seq, u64 token) {
-    clear_page(g_session.response_va);
-    volatile struct fs_stat_record *record = (volatile struct fs_stat_record *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
+    clear_page(g_session->response_va);
+    volatile struct fs_stat_record *record = (volatile struct fs_stat_record *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
     const u64 object_id = object_id_from_token(token);
     const int is_dir = is_directory_object_id(object_id);
     const u64 tmpfs_file_index = tmpfs_index_from_file_object_id(object_id);
@@ -447,7 +476,7 @@ static void reply_stat(u64 seq, u64 token) {
 }
 
 static void write_dirent_response(u64 seq, u64 result_token, u64 next_cursor, const char *name, u16 name_len, u8 object_kind) {
-    volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
+    volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
     record->next_cursor = next_cursor;
     record->object_kind = object_kind;
     record->reserved0[0] = 0;
@@ -461,7 +490,7 @@ static void write_dirent_response(u64 seq, u64 result_token, u64 next_cursor, co
     record->reserved1 = 0;
     record->reserved2 = 0;
 
-    volatile u8 *payload = (volatile u8 *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES + FS_DIRENT_RECORD_BYTES);
+    volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES + FS_DIRENT_RECORD_BYTES);
     for (u16 i = 0; i < name_len; i++) payload[i] = (u8)name[i];
     write_response(
         FS_OP_READDIR,
@@ -476,7 +505,7 @@ static void write_dirent_response(u64 seq, u64 result_token, u64 next_cursor, co
 }
 
 static void reply_readdir(u64 seq, u64 token, u64 cursor) {
-    clear_page(g_session.response_va);
+    clear_page(g_session->response_va);
     if (token == root_token()) {
         if (cursor >= sizeof(g_root_mounts) / sizeof(g_root_mounts[0])) {
             write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
@@ -528,12 +557,12 @@ static void reply_open(u64 seq, u64 token) {
         reply_status(FS_OP_OPEN, seq, FS_STATUS_NOT_FOUND);
         return;
     }
-    clear_page(g_session.response_va);
+    clear_page(g_session->response_va);
     write_response(FS_OP_OPEN, seq, FS_STATUS_OK, token_from_object_id(open_object_id), 0, 0, FS_OBJECT_OPEN_FILE, 0);
 }
 
 static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
-    clear_page(g_session.response_va);
+    clear_page(g_session->response_va);
     const u64 object_id = object_id_from_token(token);
     if (object_id == VFS_DEV_NULL_OPEN_OBJECT_ID) {
         write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, 0, offset, FS_OBJECT_OPEN_FILE, 0);
@@ -542,7 +571,7 @@ static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
     if (object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID) {
         u16 bytes = (u16)length;
         if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
-        volatile u8 *payload = (volatile u8 *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
+        volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < bytes; i++) payload[i] = 0;
         write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, 0, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
         return;
@@ -555,7 +584,7 @@ static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
             const u64 remaining = file->size - offset;
             bytes = (u16)(remaining < length ? remaining : length);
             if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
-            volatile u8 *payload = (volatile u8 *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
+            volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
             for (u16 i = 0; i < bytes; i++) payload[i] = file->bytes[offset + i];
         }
         write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, file->size, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
@@ -580,7 +609,7 @@ static void reply_write(u64 seq, u64 token, u64 offset, u32 length, const volati
         for (u32 i = 0; i < length; i++) file->bytes[offset + i] = payload[i];
         if (offset + length > file->size) file->size = (u32)(offset + length);
     }
-    clear_page(g_session.response_va);
+    clear_page(g_session->response_va);
     write_response(
         FS_OP_WRITE,
         seq,
@@ -847,8 +876,8 @@ static void forward_backend_response(u16 op, u64 client_seq, u64 cursor_bias) {
         return;
     }
 
-    clear_page(g_session.response_va);
-    volatile u8 *dst = (volatile u8 *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
+    clear_page(g_session->response_va);
+    volatile u8 *dst = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
     const volatile u8 *src = (const volatile u8 *)(g_root_backend.response_va + FS_RESPONSE_HEADER_BYTES);
     for (u16 i = 0; i < inline_bytes; i++) dst[i] = src[i];
 
@@ -931,12 +960,12 @@ static void forward_backend_root_readdir_filtered(u64 client_seq, u64 backend_cu
 }
 
 static void handle_fs_request(void) {
-    if (!g_session.active) return;
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_session.request_va;
+    if (g_session == 0 || !g_session->active) return;
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_session->request_va;
     if (request->magic != FS_REQUEST_MAGIC || request->version != FS_PROTOCOL_VERSION) return;
     const u64 seq = request->request_seq;
-    if (seq == 0 || seq <= g_session.last_completed_seq) return;
-    if (request->session_nonce != g_session.session_nonce) return;
+    if (seq == 0 || seq <= g_session->last_completed_seq) return;
+    if (request->session_nonce != g_session->session_nonce) return;
 
     if (request->op == FS_OP_CONNECT) {
         reply_status(FS_OP_CONNECT, seq, FS_STATUS_BUSY);
@@ -944,7 +973,7 @@ static void handle_fs_request(void) {
         if (request->path_bytes > FS_MAX_PATH_BYTES) {
             reply_status(FS_OP_LOOKUP, seq, FS_STATUS_INVALID);
         } else {
-            const volatile u8 *path = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES);
+            const volatile u8 *path = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES);
             if (is_backend_token(request->object_token)) {
                 forward_backend_request(
                     FS_OP_LOOKUP,
@@ -1064,7 +1093,7 @@ static void handle_fs_request(void) {
                 0
             );
         } else {
-            clear_page(g_session.response_va);
+            clear_page(g_session->response_va);
             write_response(FS_OP_STATFS, seq, FS_STATUS_OK, 0, 0, 0, FS_OBJECT_MOUNT, 0);
         }
     } else if (request->op == FS_OP_OPEN) {
@@ -1122,7 +1151,7 @@ static void handle_fs_request(void) {
         else reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
     } else if (request->op == FS_OP_WRITE) {
         if (is_backend_token(request->object_token)) {
-            const volatile u8 *payload = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES + request->path_bytes);
+            const volatile u8 *payload = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES + request->path_bytes);
             forward_backend_request(
                 request->op,
                 seq,
@@ -1137,12 +1166,12 @@ static void handle_fs_request(void) {
                 0
             );
         } else if (is_open_file_token(request->object_token)) {
-            const volatile u8 *payload = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES + request->path_bytes);
+            const volatile u8 *payload = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES + request->path_bytes);
             reply_write(seq, request->object_token, request->offset, request->length, payload, request->inline_bytes);
         }
         else reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
     } else if (request->op == FS_OP_CREATE || request->op == FS_OP_UNLINK || request->op == FS_OP_RENAME) {
-        const volatile u8 *path = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES);
+        const volatile u8 *path = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES);
         if (request->op == FS_OP_CREATE &&
             object_id_from_token(request->object_token) == VFS_ROOT_OBJECT_ID &&
             request->path_bytes > 0 &&
@@ -1158,7 +1187,7 @@ static void handle_fs_request(void) {
         {
             reply_tmpfs_unlink(seq, path, request->path_bytes);
         } else if (is_backend_token(request->object_token)) {
-            const volatile u8 *path = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES);
+            const volatile u8 *path = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES);
             const volatile u8 *inline_payload = path + request->path_bytes;
             forward_backend_request(
                 request->op,
@@ -1174,7 +1203,7 @@ static void handle_fs_request(void) {
                 0
             );
         } else if (g_root_backend.active && object_id_from_token(request->object_token) == VFS_ROOT_OBJECT_ID) {
-            const volatile u8 *path = (const volatile u8 *)(g_session.request_va + FS_REQUEST_HEADER_BYTES);
+            const volatile u8 *path = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES);
             const volatile u8 *inline_payload = path + request->path_bytes;
             forward_backend_request(
                 request->op,
@@ -1196,15 +1225,26 @@ static void handle_fs_request(void) {
         reply_status(request->op, seq, FS_STATUS_NOT_SUPPORTED);
     }
 
-    g_session.last_completed_seq = seq;
+    g_session->last_completed_seq = seq;
 }
 
 static void handle_connect_transfer(u64 transfer_id) {
     const u64 request_paddr = syscall2(SYSCALL_ACCEPT_CAP_TRANSFER, transfer_id, 0);
     if (request_paddr < 0x1000) return;
-    if (syscall3(SYSCALL_MAP_PAGE, VFS_REQUEST_VA, request_paddr, 0) != SYSCALL_OK) return;
+    struct vfs_session *session = find_session_by_request_paddr(request_paddr);
+    const int is_new_session = session == 0;
+    if (session == 0) session = alloc_session_slot();
+    if (session == 0) {
+        user_log("RootVfs: no free session slot\n");
+        return;
+    }
 
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
+    const u64 slot = session_slot(session);
+    const u64 request_va = session_request_va(slot);
+    const u64 response_va = session_response_va(slot);
+    if (is_new_session && syscall3(SYSCALL_MAP_PAGE, request_va, request_paddr, 0) != SYSCALL_OK) return;
+
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_va;
     if (request->magic != FS_REQUEST_MAGIC ||
         request->version != FS_PROTOCOL_VERSION ||
         request->op != FS_OP_CONNECT ||
@@ -1215,22 +1255,23 @@ static void handle_connect_transfer(u64 transfer_id) {
         user_log("RootVfs: invalid connect request\n");
         return;
     }
-    if (syscall3(SYSCALL_MAP_PAGE, VFS_RESPONSE_VA, request->arg0, 1) != SYSCALL_OK) return;
+    if (is_new_session && syscall3(SYSCALL_MAP_PAGE, response_va, request->arg0, 1) != SYSCALL_OK) return;
 
-    clear_page(VFS_RESPONSE_VA);
-    g_session.active = 1;
-    g_session.request_va = VFS_REQUEST_VA;
-    g_session.response_va = VFS_RESPONSE_VA;
-    g_session.request_paddr = request_paddr;
-    g_session.response_paddr = request->arg0;
-    g_session.reply_endpoint_id = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, VFS_REPLY_ENDPOINT_ID, request->arg1) == SYSCALL_OK
-        ? VFS_REPLY_ENDPOINT_ID
+    clear_page(response_va);
+    session->active = 1;
+    session->request_va = request_va;
+    session->response_va = response_va;
+    session->request_paddr = request_paddr;
+    session->response_paddr = request->arg0;
+    session->reply_endpoint_id = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, VFS_REPLY_ENDPOINT_ID + slot, request->arg1) == SYSCALL_OK
+        ? VFS_REPLY_ENDPOINT_ID + slot
         : 0;
-    g_session.session_nonce = request->session_nonce;
-    g_session.last_completed_seq = 0;
-    g_session.root_token = root_token();
-    write_response(FS_OP_CONNECT, request->request_seq, FS_STATUS_OK, g_session.root_token, 0, 0, FS_OBJECT_MOUNT, 0);
-    g_session.last_completed_seq = request->request_seq;
+    session->session_nonce = request->session_nonce;
+    session->last_completed_seq = 0;
+    session->root_token = root_token();
+    g_session = session;
+    write_response(FS_OP_CONNECT, request->request_seq, FS_STATUS_OK, session->root_token, 0, 0, FS_OBJECT_MOUNT, 0);
+    session->last_completed_seq = request->request_seq;
     user_log("RootVfs: session connect ok\n");
 }
 
@@ -1257,6 +1298,10 @@ void rootfs_vfs_main(void) {
     for (;;) {
         const u64 received = wait_event();
         if (received >= CAP_TRANSFER_ID_MIN) handle_connect_transfer(received);
-        handle_fs_request();
+        for (u64 i = 0; i < VFS_MAX_SESSIONS; i++) {
+            if (!g_sessions[i].active) continue;
+            g_session = &g_sessions[i];
+            handle_fs_request();
+        }
     }
 }

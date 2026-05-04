@@ -55,6 +55,35 @@ pub var kernel_state_ready: bool = false;
 var boot_init_principal: ?kernel.PrincipalId = null;
 const spawn_parent_endpoint_id: u64 = 0x14;
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+fn kernelStaticStorageEndAddr() usize {
+    var end = uefi_services.kernelStaticStorageEndAddr();
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces_storage), &user_spaces_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(global_free_list), &global_free_list));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_global), &kernel_state_global));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_ready), &kernel_state_ready));
+    end = maxStaticEnd(end, capability.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, spawn.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, process_builder.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, abi_trap_runtime.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, scheduler.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, syscalls.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
+    return end;
+}
+
 // ---------------------------------------------------------------------------
 // Thread label helper (used in Hooks)
 // ---------------------------------------------------------------------------
@@ -295,6 +324,15 @@ fn initKernelRuntimeOrHalt() void {
         if (!user_copy.mapKernelRuntimeStorage(x86_platform.mapKernelRuntimeIdentityRange)) {
             halt.haltWithMessage("user copy runtime mapping failed");
         }
+        if (!traps.mapKernelRuntimeStorage(x86_platform.mapKernelRuntimeIdentityRange)) {
+            halt.haltWithMessage("trap runtime mapping failed");
+        }
+        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(&kernel_state_global), @sizeOf(@TypeOf(kernel_state_global)))) {
+            halt.haltWithMessage("kernel state runtime mapping failed");
+        }
+        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(&user_spaces_storage), @sizeOf(@TypeOf(user_spaces_storage)))) {
+            halt.haltWithMessage("user spaces runtime mapping failed");
+        }
         _ = x86_platform.enablePcidIfSupported();
         x86_platform.hardenKernelMappingsSupervisorOnly();
     }
@@ -320,9 +358,11 @@ fn initMemoryModules() void {
         .user_va = boot_static.user_va,
         .user_stack_page_va = boot_static.user_stack_page_va,
         .page_entries = boot_static.page_entries,
+        .page_addr_mask = boot_static.page_addr_mask,
         .page_present = boot_static.page_present,
         .page_rw = boot_static.page_rw,
         .page_user = boot_static.page_user,
+        .page_ps = boot_static.page_ps,
         .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
         .seed_user_pd_with_kernel_identity = x86_platform.seedUserPdWithKernelIdentity,
     });
@@ -332,7 +372,7 @@ fn initMemoryModules() void {
         .kernel_cr3_addr = @intFromPtr(&x86_platform.kernel_cr3_value),
         .kernel_image_base_paddr = &uefi_services.kernel_image_base_paddr_ref,
         .kernel_image_size_bytes = &uefi_services.kernel_image_size_bytes_ref,
-        .post_exit_load_scratch_addr = uefi_services.postExitLoadScratchEndAddr(),
+        .kernel_static_end_addr = kernelStaticStorageEndAddr(),
         .reserved_low_mem_end = boot_static.reserved_low_mem_end,
     });
 }
@@ -392,6 +432,23 @@ fn nextReadyThreadAfter(current_thread: usize) ?usize {
 }
 
 fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
+    const cpu_slot = scheduler.currentCpuSlot();
+    if (cpu_slot != 0 and scheduler.spawnExecApUserSchedulingReady()) {
+        while (true) {
+            const current_thread = scheduler.currentThreadIndex();
+            if (scheduler.pickNextReadyThreadIndexForCpu(cpu_slot, current_thread)) |thread_index| {
+                if (scheduler.threadContextLooksCorrupted(thread_index)) {
+                    _ = scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame());
+                }
+                if (scheduler.activateThread(thread_index) and scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
+                if (scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame()) and
+                    scheduler.activateThread(thread_index) and
+                    scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
+            }
+            scheduler.parkCurrentApAfterCurrentThreadStopped();
+        }
+    }
+
     while (true) {
         const current_thread = scheduler.currentThreadIndex();
         if (nextReadyThreadAfter(current_thread)) |thread_index| {
@@ -719,6 +776,7 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
         state.iommu_audit_hook = null;
     }
     state.debug_alloc_page_hook = null;
+    state.debug_process_lifecycle_hook = null;
     state.pte_sync_hook = null;
 
     return state;
@@ -798,7 +856,8 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         init_ctx.frame.rip = loaded_init.entry;
         init_ctx.frame.rsp = boot_static.user_entry_rsp;
     }
-    if (!scheduler.spawnExecApPlacementExperimentEnabled()) {
+    activateThreadOrHalt(init_thread);
+    if (scheduler.apUserSchedulingDiagnosticsEnabled()) {
         runSchedulerApObserverProbe(init_thread);
         runSchedulerApUserEntryProbe(state);
     }
@@ -813,7 +872,7 @@ const SchedulerApUserThread = struct {
 };
 
 fn createSchedulerApUserEntryThread(state: *kernel.KernelState) ?SchedulerApUserThread {
-    if (!scheduler.schedulerApQueueExperimentEnabled()) return null;
+    if (!scheduler.apUserSchedulingDiagnosticsEnabled()) return null;
     const created = process_factory.tryCreateDynamicUserProcess(state, "apidle", &global_free_list, user_spaces) catch |err| {
         serial.writeRaw("SCHED APUSER create failed err=");
         serial.writeRaw(@errorName(err));
@@ -871,13 +930,13 @@ const SchedulerApUserProbe = struct {
 };
 
 fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
-    if (!scheduler.schedulerApQueueExperimentEnabled()) return;
+    if (!scheduler.apUserSchedulingDiagnosticsEnabled()) return;
     if (scheduler.cpuCount() <= 1) {
         serial.writeRaw("SCHED APUSER probe skipped no_ap\n");
         return;
     }
 
-    const policy_enable_ok = scheduler.setApRunnablePolicyForExperiment(true);
+    const policy_enable_ok = scheduler.setApRunnablePolicyEnabled(true);
     var probes = [_]SchedulerApUserProbe{.{}} ** smp.max_cpus;
     var probe_count: usize = 0;
     var cpu_slot: usize = 1;
@@ -929,16 +988,16 @@ fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
             .target_idle = info.is_idle,
         };
         probe.enable_ok = policy_enable_ok;
-        probe.cycle_ok = probe.enable_ok and scheduler.setCpuProbeUserEntryTargetCyclesForExperiment(selected_cpu, probe.before_timer_ticks +% 2);
+        probe.cycle_ok = probe.enable_ok and scheduler.setCpuProbeUserEntryTargetCycles(selected_cpu, probe.before_timer_ticks +% 2);
         probe.move_ok = scheduler.threadCpuSlot(created.thread_index) == selected_cpu;
         probe.move_next_ok = scheduler.threadCpuSlot(next_created.thread_index) == selected_cpu;
-        probe.arm_ok = probe.cycle_ok and probe.move_ok and probe.move_next_ok and scheduler.setCpuUserEntryForExperiment(selected_cpu, true);
+        probe.arm_ok = probe.cycle_ok and probe.move_ok and probe.move_next_ok and scheduler.requestCpuUserEntry(selected_cpu, true);
         probes[probe_count] = probe;
         probe_count += 1;
     }
 
     if (probe_count == 0) {
-        _ = scheduler.setApRunnablePolicyForExperiment(false);
+        _ = scheduler.setApRunnablePolicyEnabled(false);
         serial.writeRaw("SCHED APUSER probe skipped no_targets\n");
         return;
     }
@@ -956,7 +1015,7 @@ fn runSchedulerApUserEntryProbe(state: *kernel.KernelState) void {
     }
 
     var ready_count: usize = 0;
-    const policy_disable_ok = scheduler.setApRunnablePolicyForExperiment(false);
+    const policy_disable_ok = scheduler.setApRunnablePolicyEnabled(false);
     var index: usize = 0;
     while (index < probe_count) : (index += 1) {
         probes[index].disable_ok = policy_disable_ok;
@@ -1095,7 +1154,7 @@ fn logSchedulerApUserProbe(probe: *const SchedulerApUserProbe) void {
 }
 
 fn runSchedulerApObserverProbe(thread_index: usize) void {
-    if (!scheduler.schedulerApQueueExperimentEnabled()) return;
+    if (!scheduler.apUserSchedulingDiagnosticsEnabled()) return;
     if (scheduler.cpuCount() <= 1) {
         serial.writeRaw("SCHED APHAND probe skipped no_ap\n");
         return;
@@ -1124,7 +1183,7 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
         break :blk info.handoff_snapshot_ticks;
     };
 
-    const enable_ok = scheduler.setApRunnablePolicyForExperiment(true);
+    const enable_ok = scheduler.setApRunnablePolicyEnabled(true);
     const move_ok = enable_ok and scheduler.assignThreadToCpu(thread_index, target_cpu);
 
     var observed = false;
@@ -1203,7 +1262,7 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
     }
 
     const restore_ok = scheduler.assignThreadToCpu(thread_index, original_cpu);
-    const disable_ok = scheduler.setApRunnablePolicyForExperiment(false);
+    const disable_ok = scheduler.setApRunnablePolicyEnabled(false);
 
     serial.writeRaw("SCHED APHAND probe cpu=");
     serial.printNumber(target_cpu);
@@ -1298,6 +1357,8 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .free_list = &global_free_list,
         .user_spaces = user_spaces,
         .write = kernel_log.write,
+        .print_hex = log_util.printHex,
+        .print_number = log_util.printNumberU64,
         .principal_label = principalLabel,
         .write_user_u64 = user_copy.writeUserU64,
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,

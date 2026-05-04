@@ -11,14 +11,24 @@ pub const Hooks = struct {
     user_va: u64,
     user_stack_page_va: u64,
     page_entries: usize,
+    page_addr_mask: u64,
     page_present: u64,
     page_rw: u64,
     page_user: u64,
+    page_ps: u64,
     flush_user_tlb_for_principal_va: *const fn (principal: kernel.PrincipalId, va: u64) void,
     seed_user_pd_with_kernel_identity: *const fn ([]u64) void,
 };
 
 var hooks: ?Hooks = null;
+
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    return staticStorageEnd(@TypeOf(hooks), &hooks);
+}
 
 pub fn init(new_hooks: Hooks) void {
     hooks = new_hooks;
@@ -44,6 +54,32 @@ fn findUserPtSlotForPd(space: *const UserAddressSpace, pd_index: usize) ?usize {
     return null;
 }
 
+fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde: u64) void {
+    const h = hooks orelse return;
+    @memset(space.pt_pages[slot][0..], 0);
+    if ((existing_pde & h.page_present) == 0) return;
+    if ((existing_pde & h.page_ps) == 0) {
+        if ((existing_pde & h.page_user) != 0) return;
+        const src_pt_addr = existing_pde & h.page_addr_mask;
+        if (src_pt_addr == 0 or src_pt_addr >= h.physical_map_limit) return;
+        const src_pt: *const [512]u64 = @ptrFromInt(src_pt_addr);
+        var copy_index: usize = 0;
+        while (copy_index < h.page_entries) : (copy_index += 1) {
+            space.pt_pages[slot][copy_index] = src_pt[copy_index] & ~h.page_user;
+        }
+        return;
+    }
+
+    const two_mib_mask = ~@as(u64, 0x1F_FFFF);
+    const page_base = existing_pde & two_mib_mask;
+    const pte_flags = (existing_pde & 0xFFF) & ~h.page_ps & ~h.page_user;
+    var pt_index: usize = 0;
+    while (pt_index < h.page_entries) : (pt_index += 1) {
+        const paddr = page_base + @as(u64, @intCast(pt_index)) * 4096;
+        space.pt_pages[slot][pt_index] = paddr | pte_flags;
+    }
+}
+
 pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     const h = hooks orelse return null;
     if (pd_index >= h.page_entries) return null;
@@ -53,7 +89,8 @@ pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     while (slot < UserAddressSpace.max_dynamic_pt_pages and space.pt_page_pd_index[slot] != UserAddressSpace.no_pd_index) : (slot += 1) {}
     if (slot >= UserAddressSpace.max_dynamic_pt_pages) return null;
     space.pt_page_pd_index[slot] = @intCast(pd_index);
-    @memset(space.pt_pages[slot][0..], 0);
+    const existing_pde = space.pd[pd_index];
+    seedPtSlotFromExistingPd(space, slot, existing_pde);
     const pt_pa: u64 = @intFromPtr(&space.pt_pages[slot]);
     if (pt_pa >= h.four_gib) return null;
     space.pd[pd_index] = pt_pa | h.page_present | h.page_rw | h.page_user;
@@ -117,7 +154,8 @@ pub fn mapUserLinearRegionWithProt(
         const pd_index: usize = @intCast((va >> 21) & 0x1FF);
         const pt_slot = ensureUserPtSlotForPd(space, pd_index) orelse return false;
         const pt_index: usize = @intCast((va >> 12) & 0x1FF);
-        if ((space.pt_pages[pt_slot][pt_index] & h.page_present) != 0) return false;
+        const old_entry = space.pt_pages[pt_slot][pt_index];
+        if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
         space.pt_pages[pt_slot][pt_index] = paddr | pte_flags;
     }
 

@@ -9,11 +9,13 @@ const OVMF_CODE_PATH: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 const OVMF_VARS_TEMPLATE_PATH: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 const QEMU_DEBUG_FLAGS: &str = "guest_errors,cpu_reset";
 const TIMED_RUN_SECONDS: u32 = 35;
+const PF_CHECK_RUN_SECONDS: u32 = 60;
 
 pub struct RunOptions {
     pub timed: bool,
     pub kvm: bool,
     pub dry_run: bool,
+    pub pf_check_jobs: usize,
 }
 
 pub struct RunPlan {
@@ -65,6 +67,37 @@ pub fn run_qemu(
         .then(|| artifact_dir.join("boot-timing-summary.txt"));
 
     validate_run_inputs(workspace_root, workspace, &disk_image)?;
+
+    if options.pf_check_jobs != 0 {
+        let summary_log = artifact_dir.join("pf-check").join("summary.txt");
+        let script = build_wsl_pf_check_script(workspace_root, &artifact_dir, &disk_image, options)?;
+        if !options.dry_run {
+            let status = Command::new("wsl")
+                .arg("-e")
+                .arg("bash")
+                .arg("-lc")
+                .arg(&script)
+                .status()
+                .map_err(|err| format!("failed to launch WSL QEMU PF check: {err}"))?;
+            if !status.success() {
+                if !pf_check_summary_reports_success(&summary_log) {
+                    return Err(format!(
+                        "parallel PF check failed with exit code {:?}",
+                        status.code()
+                    ));
+                }
+            }
+        }
+        return Ok(RunPlan {
+            disk_image,
+            ovmf_vars,
+            qemu_log,
+            serial_log: None,
+            summary_log: Some(summary_log),
+            script,
+        });
+    }
+
     let script = build_wsl_script(
         workspace_root,
         &disk_image,
@@ -84,6 +117,20 @@ pub fn run_qemu(
             .status()
             .map_err(|err| format!("failed to launch WSL QEMU command: {err}"))?;
         if !status.success() {
+            if options.timed
+                && summary_log
+                    .as_ref()
+                    .is_some_and(|path| timed_summary_reports_success(path))
+            {
+                return Ok(RunPlan {
+                    disk_image,
+                    ovmf_vars,
+                    qemu_log,
+                    serial_log,
+                    summary_log,
+                    script,
+                });
+            }
             return Err(format!(
                 "QEMU run failed with exit code {:?}",
                 status.code()
@@ -99,6 +146,25 @@ pub fn run_qemu(
         summary_log,
         script,
     })
+}
+
+fn timed_summary_reports_success(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|summary| summary.contains("AP Linux smoke complete"))
+        .unwrap_or(false)
+}
+
+fn pf_check_summary_reports_success(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|summary| {
+            summary.contains("parallel PF check ok:")
+                && !summary.contains("smoke summary incomplete")
+                && !summary.contains("PF marker found")
+                && !summary.contains("reset loop after boot start")
+                && !summary.contains("qemu failed")
+                && !summary.contains("qemu exited before smoke completed")
+        })
+        .unwrap_or(false)
 }
 
 fn validate_run_inputs(
@@ -219,6 +285,7 @@ fn build_wsl_script(
         "-machine q35".to_string(),
         "-smp 4".to_string(),
         "-m 512M".to_string(),
+        "-no-reboot".to_string(),
         "-monitor none".to_string(),
         format!("-d {QEMU_DEBUG_FLAGS}"),
         format!("-D {}", bash_quote(&runtime_qemu_log_wsl)),
@@ -249,7 +316,7 @@ fn build_wsl_script(
     script.push_str("set -euo pipefail\n");
     script.push_str(&format!("cd {}\n", bash_quote(&workspace_wsl)));
     script.push_str(&format!("ARTIFACT_DIR={}\n", bash_quote(&artifact_dir_wsl)));
-    script.push_str(&format!("RUNTIME_DIR={}\n", bash_quote(&runtime_dir_wsl)));
+    script.push_str(&format!("RUNTIME_DIR={runtime_dir_wsl}\n"));
     script.push_str(&format!(
         "LAUNCHER_SOCKET={}\n",
         bash_quote(&launcher_socket_wsl)
@@ -377,30 +444,45 @@ fn build_wsl_script(
         script.push_str("set -e\n");
         script.push_str("if [ \"$qemu_status\" -eq 124 ] || [ \"$qemu_status\" -eq 137 ]; then\n");
         script.push_str("  sync_logs\n");
+        script.push_str("  set +e\n");
         script.push_str(&format!(
-            "  python3 {} \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
+            "  python3 {} --check \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
             bash_quote(&summarize_script)
         ));
+        script.push_str("  summary_status=${PIPESTATUS[0]}\n");
+        script.push_str("  set -e\n");
         script.push_str("  sync_logs\n");
         script.push_str("  echo\n");
         script.push_str("  echo \"serial log: $SERIAL_LOG\"\n");
         script.push_str("  echo \"summary: $SUMMARY_LOG\"\n");
+        script.push_str("  if [ \"$summary_status\" -eq 0 ]; then\n");
+        script.push_str("    echo 'timed run reached AP Linux smoke success before timeout'\n");
+        script.push_str("    trap - EXIT\n");
+        script.push_str("    exit 0\n");
+        script.push_str("  fi\n");
         script.push_str(&format!(
             "  echo \"timed run stopped after {TIMED_RUN_SECONDS}s; treating QEMU timeout as captured failure\"\n"
         ));
         script.push_str("  exit \"$qemu_status\"\n");
         script.push_str("fi\n");
         script.push_str("schedule_writeback\n");
+        script.push_str("set +e\n");
         script.push_str(&format!(
-            "python3 {} \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
+            "python3 {} --check \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
             bash_quote(&summarize_script)
         ));
+        script.push_str("summary_status=${PIPESTATUS[0]}\n");
+        script.push_str("set -e\n");
         script.push_str("echo\n");
         script.push_str("echo \"serial log: $SERIAL_LOG\"\n");
         script.push_str("echo \"summary: $SUMMARY_LOG\"\n");
-        script.push_str("if [ \"$qemu_status\" -eq 1 ]; then\n");
-        script.push_str("  echo 'timed run stopped after capture; treating QEMU exit code 1 as success'\n");
+        script.push_str("if [ \"$summary_status\" -eq 0 ] && { [ \"$qemu_status\" -eq 0 ] || [ \"$qemu_status\" -eq 1 ]; }; then\n");
+        script.push_str("  echo 'timed run reached AP Linux smoke success'\n");
+        script.push_str("  trap - EXIT\n");
         script.push_str("  exit 0\n");
+        script.push_str("fi\n");
+        script.push_str("if [ \"$qemu_status\" -eq 0 ]; then\n");
+        script.push_str("  exit \"$summary_status\"\n");
         script.push_str("fi\n");
         script.push_str("exit \"$qemu_status\"\n");
     } else {
@@ -412,6 +494,137 @@ fn build_wsl_script(
         script.push_str("schedule_writeback\n");
         script.push_str("exit \"$qemu_status\"\n");
     }
+
+    Ok(script)
+}
+
+fn build_wsl_pf_check_script(
+    workspace_root: &Path,
+    artifact_root: &Path,
+    disk_image: &Path,
+    options: &RunOptions,
+) -> Result<String, String> {
+    if options.pf_check_jobs == 0 || options.pf_check_jobs > 16 {
+        return Err("PF check job count must be between 1 and 16".to_string());
+    }
+
+    let workspace_wsl = windows_path_to_wsl(workspace_root)?;
+    let disk_wsl = windows_path_to_wsl(disk_image)?;
+    let artifact_dir = artifact_root.join("pf-check");
+    let artifact_dir_wsl = windows_path_to_wsl(&artifact_dir)?;
+    let timestamp_stream = windows_path_to_wsl(&workspace_root.join("tools/timestamp_stream.py"))?;
+    let summarize_script =
+        windows_path_to_wsl(&workspace_root.join("tools/summarize_boot_timed_log.py"))?;
+    let runtime_dir_wsl = format!(
+        "/tmp/capabilityos-qemu-{}/pf-check-$$",
+        runtime_slug(workspace_root)
+    );
+
+    let mut qemu_parts = vec![
+        "qemu-system-x86_64".to_string(),
+        "-machine q35".to_string(),
+        "-smp 4".to_string(),
+        "-m 512M".to_string(),
+        "-no-reboot".to_string(),
+        "-monitor none".to_string(),
+        format!("-d {QEMU_DEBUG_FLAGS}"),
+        "-D \"$RUN_QEMU_LOG\"".to_string(),
+        "-display gtk,gl=on,grab-on-hover=off".to_string(),
+        "-vga none".to_string(),
+        "-device virtio-vga-gl,xres=1920,yres=1080".to_string(),
+        "-device virtio-tablet-pci".to_string(),
+        "-device virtio-keyboard-pci".to_string(),
+        format!(
+            "-drive if=pflash,format=raw,readonly=on,file={}",
+            bash_quote(OVMF_CODE_PATH)
+        ),
+        "-drive if=pflash,format=raw,file=\"$RUN_OVMF_VARS\"".to_string(),
+        "-drive if=none,file=\"$RUN_DISK\",format=raw,id=bootdisk".to_string(),
+        "-device virtio-blk-pci,drive=bootdisk".to_string(),
+        "-serial stdio".to_string(),
+    ];
+    if options.kvm {
+        qemu_parts.insert(1, "-cpu host".to_string());
+        qemu_parts.insert(1, "-enable-kvm".to_string());
+    }
+    let qemu_cmd = qemu_parts.join(" \\\n    ");
+
+    let mut script = String::new();
+    script.push_str("set -euo pipefail\n");
+    script.push_str(&format!("cd {}\n", bash_quote(&workspace_wsl)));
+    script.push_str(&format!("DISK_IMG={}\n", bash_quote(&disk_wsl)));
+    script.push_str(&format!("ARTIFACT_DIR={}\n", bash_quote(&artifact_dir_wsl)));
+    script.push_str(&format!("RUNTIME_DIR={runtime_dir_wsl}\n"));
+    script.push_str(&format!("JOBS={}\n", options.pf_check_jobs));
+    script.push_str("mkdir -p \"$ARTIFACT_DIR\" \"$RUNTIME_DIR\"\n");
+    script.push_str("rm -f \"$ARTIFACT_DIR/summary.txt\"\n");
+    script.push_str(
+        "if ! command -v python3 >/dev/null 2>&1; then echo 'missing python3'; exit 1; fi\n",
+    );
+    script.push_str("run_one() {\n");
+    script.push_str("  id=\"$1\"\n");
+    script.push_str("  RUN_DIR=\"$RUNTIME_DIR/run-$id\"\n");
+    script.push_str("  OUT_DIR=\"$ARTIFACT_DIR/run-$id\"\n");
+    script.push_str("  mkdir -p \"$RUN_DIR\" \"$OUT_DIR\"\n");
+    script.push_str("  rm -f \"$OUT_DIR/qemu.log\" \"$OUT_DIR/serial-timed.log\" \"$OUT_DIR/boot-timing-summary.txt\" \"$OUT_DIR/pf-grep.txt\"\n");
+    script.push_str("  RUN_DISK=\"$RUN_DIR/disk.img\"\n");
+    script.push_str("  RUN_OVMF_VARS=\"$RUN_DIR/OVMF_VARS.fd\"\n");
+    script.push_str("  RUN_QEMU_LOG=\"$RUN_DIR/qemu.log\"\n");
+    script.push_str("  RUN_SERIAL_LOG=\"$RUN_DIR/serial-timed.log\"\n");
+    script.push_str("  RUN_SUMMARY_LOG=\"$RUN_DIR/boot-timing-summary.txt\"\n");
+    script.push_str("  cp \"$DISK_IMG\" \"$RUN_DISK\"\n");
+    script.push_str(&format!(
+        "  cp {} \"$RUN_OVMF_VARS\"\n",
+        bash_quote(OVMF_VARS_TEMPLATE_PATH)
+    ));
+    script.push_str("  set +e\n");
+    script.push_str(&format!(
+        "  timeout --kill-after=2s {PF_CHECK_RUN_SECONDS}s \\\n    "
+    ));
+    script.push_str(&qemu_cmd);
+    script.push_str(&format!(
+        " | python3 {} | tee \"$RUN_SERIAL_LOG\"\n",
+        bash_quote(&timestamp_stream)
+    ));
+    script.push_str("  qemu_status=${PIPESTATUS[0]}\n");
+    script.push_str("  python3 ");
+    script.push_str(&bash_quote(&summarize_script));
+    script.push_str(" --check \"$RUN_SERIAL_LOG\" > \"$RUN_SUMMARY_LOG\" 2>&1\n");
+    script.push_str("  summary_status=$?\n");
+    script.push_str("  grep -E 'PAGE FAULT|#PF|PF_CAP|ACTION=terminate process|GENERAL PROTECTION|INVALID OPCODE|STACK SEGMENT FAULT|SEGMENT NOT PRESENT' \"$RUN_SERIAL_LOG\" > \"$RUN_DIR/pf-grep.txt\" 2>/dev/null\n");
+    script.push_str("  pf_status=$?\n");
+    script.push_str("  boot_count=$(grep -c 'RAW ENTER MAIN' \"$RUN_SERIAL_LOG\" 2>/dev/null || true)\n");
+    script.push_str("  set -e\n");
+    script.push_str("  cp \"$RUN_QEMU_LOG\" \"$OUT_DIR/qemu.log\" 2>/dev/null || true\n");
+    script.push_str("  cp \"$RUN_SERIAL_LOG\" \"$OUT_DIR/serial-timed.log\" 2>/dev/null || true\n");
+    script.push_str("  cp \"$RUN_SUMMARY_LOG\" \"$OUT_DIR/boot-timing-summary.txt\" 2>/dev/null || true\n");
+    script.push_str("  cp \"$RUN_DIR/pf-grep.txt\" \"$OUT_DIR/pf-grep.txt\" 2>/dev/null || true\n");
+    script.push_str("  if [ \"$pf_status\" -eq 0 ]; then echo \"run-$id: PF marker found\"; return 20; fi\n");
+    script.push_str("  if [ \"$boot_count\" -gt 1 ]; then echo \"run-$id: reset loop after boot start ($boot_count boots)\"; return 21; fi\n");
+    script.push_str("  if [ \"$qemu_status\" -ne 0 ] && [ \"$qemu_status\" -ne 124 ] && [ \"$qemu_status\" -ne 137 ]; then echo \"run-$id: qemu failed $qemu_status\"; return \"$qemu_status\"; fi\n");
+    script.push_str("  if [ \"$qemu_status\" -eq 0 ] && [ \"$summary_status\" -ne 0 ]; then echo \"run-$id: qemu exited before smoke completed\"; return 22; fi\n");
+    script.push_str("  if [ \"$summary_status\" -ne 0 ]; then echo \"run-$id: no PF markers; smoke summary incomplete\"; return 23; fi\n");
+    script.push_str("  echo \"run-$id: no PF markers; smoke summary complete\"\n");
+    script.push_str("  return 0\n");
+    script.push_str("}\n");
+    script.push_str("pids=\"\"\n");
+    script.push_str("for id in $(seq 1 \"$JOBS\"); do\n");
+    script.push_str("  (run_one \"$id\") > \"$RUNTIME_DIR/run-$id.stdout\" 2>&1 &\n");
+    script.push_str("  pids=\"$pids $!:$id\"\n");
+    script.push_str("done\n");
+    script.push_str("status=0\n");
+    script.push_str(": > \"$ARTIFACT_DIR/summary.txt\"\n");
+    script.push_str("for pair in $pids; do\n");
+    script.push_str("  pid=\"${pair%%:*}\"\n");
+    script.push_str("  id=\"${pair##*:}\"\n");
+    script.push_str("  if wait \"$pid\"; then run_status=0; else run_status=$?; fi\n");
+    script.push_str("  cat \"$RUNTIME_DIR/run-$id.stdout\"\n");
+    script.push_str("  cat \"$RUNTIME_DIR/run-$id.stdout\" >> \"$ARTIFACT_DIR/summary.txt\"\n");
+    script.push_str("  if [ \"$run_status\" -ne 0 ]; then status=\"$run_status\"; fi\n");
+    script.push_str("done\n");
+    script.push_str("echo \"logs: $ARTIFACT_DIR\"\n");
+    script.push_str("if [ \"$status\" -eq 0 ]; then echo \"parallel PF check ok: $JOBS runs\" | tee -a \"$ARTIFACT_DIR/summary.txt\"; exit 0; fi\n");
+    script.push_str("exit \"$status\"\n");
 
     Ok(script)
 }

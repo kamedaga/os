@@ -70,6 +70,7 @@ void exec_client_main(void) {
         "read rz < r; "
         "[ \"$rz\" = rel-ok ] && echo rel-rw-ok || echo rel-rw-bad; "
         "/cmd/busybox.elf cat /tmp/ds > /tmp/bc; "
+        "echo busybox-cat-cmd-returned; "
         "read bbcat < /tmp/bc; "
         "[ \"$bbcat\" = file-ok ] && echo busybox-cat-ok || echo busybox-cat-bad; "
         "cd /cmd; "
@@ -81,6 +82,7 @@ void exec_client_main(void) {
         "[ \"$bbfat\" = fat-ok ] && echo busybox-fat-cat-ok || echo busybox-fat-cat-bad; "
         "/cmd/busybox.elf true && echo busybox-true-ok || echo busybox-true-bad; "
         "/cmd/busybox.elf false || echo busybox-false-ok; "
+        "/cmd/musl_smoke.elf argv-smoke && echo musl-smoke-ok || echo musl-smoke-bad; "
         "echo pipe-ok | while read x; do echo $x; done; "
         "echo dash-smoke-done"
     };

@@ -38,5 +38,6 @@ cp "$libc_so" userland/fixtures/ld-musl-x86_64.so.1
   -Wl,-rpath,/lib \
   -Wl,-z,now \
   -Wl,-z,relro \
+  -pthread \
   -o userland/fixtures/musl_smoke.elf \
   userland/fixtures/wsl_musl/musl_smoke.c

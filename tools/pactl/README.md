@@ -42,7 +42,11 @@ pactl build userland <app-id> --fresh
 - `pactl setup [diff|full]`
 - `pactl sync rootfs`
 - `pactl sync bootfs`
-- `pactl run [--timed] [--no-kvm] [--dry-run]`
+- `pactl run [--timed] [--pf-check <jobs>] [--no-kvm] [--dry-run]`
+
+`--pf-check <jobs>` runs timed QEMU smoke checks in parallel with isolated
+runtime disks/logs and fails if any serial log contains page-fault or fatal
+user-trap markers.
 - `pactl gen manifests`
 
 This crate is intentionally dependency-free for the first scaffold so it can

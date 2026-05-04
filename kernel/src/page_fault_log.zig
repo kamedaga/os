@@ -17,14 +17,28 @@ pub const Hooks = struct {
     write_bool01: *const fn (bool) void,
 };
 
-var hooks: ?Hooks = null;
+var page_fault_log_hooks_storage: Hooks = undefined;
+var page_fault_log_hooks_ready = false;
+
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    return @max(
+        staticStorageEnd(@TypeOf(page_fault_log_hooks_storage), &page_fault_log_hooks_storage),
+        staticStorageEnd(@TypeOf(page_fault_log_hooks_ready), &page_fault_log_hooks_ready),
+    );
+}
 
 pub fn init(new_hooks: Hooks) void {
-    hooks = new_hooks;
+    page_fault_log_hooks_storage = new_hooks;
+    page_fault_log_hooks_ready = true;
 }
 
 fn getHooks() *const Hooks {
-    return &(hooks orelse unreachable);
+    if (!page_fault_log_hooks_ready) unreachable;
+    return &page_fault_log_hooks_storage;
 }
 
 pub fn dumpPageWalkForVa(cr3: u64, va: u64) void {

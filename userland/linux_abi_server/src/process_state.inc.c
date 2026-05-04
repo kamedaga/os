@@ -1,6 +1,6 @@
 static void init_process_fds(struct linux_process_state *proc) { for (u64 i = 0; i < 32; i++) proc->fds[i].kind = FD_UNUSED; proc->fds[0].kind = FD_STDIO; proc->fds[1].kind = FD_STDIO; proc->fds[2].kind = FD_STDIO; }
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
-    proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->principal = principal; init_process_fds(proc);
+    proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->principal = principal; init_process_fds(proc);
     proc->mmap_next_va = 0x31000000ULL;
     proc->brk_next_va = 0x38000000ULL;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
@@ -22,10 +22,17 @@ static void init_process_tables(void) {
         g_deferred_start_used[i] = 0;
     }
     for (u64 i = 0; i < PIPE_MAX; i++) g_pipes[i].used = 0;
+    for (u64 i = 0; i < FUTEX_WAITER_MAX; i++) g_futex_waiters[i].used = 0;
 }
 static struct linux_process_state *process_state_for(u64 principal) {
     if (principal == 0) return 0;
-    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) if (g_processes[i].used && g_processes[i].principal == principal) return &g_processes[i];
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (!g_processes[i].used || g_processes[i].principal != principal) continue;
+        if (g_processes[i].exec_pending) {
+            g_processes[i].exec_pending = 0;
+        }
+        return &g_processes[i];
+    }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_processes[i].used || !g_processes[i].exec_pending) continue;
         g_processes[i].principal = principal;

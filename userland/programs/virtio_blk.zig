@@ -706,15 +706,34 @@ fn executeBlockRequest(request_type: u32, block_index: u64, block_count: u32, wr
 
     const desc0 = queueDescPtr(0);
     const desc1 = queueDescPtr(1);
+    const desc2 = queueDescPtr(2);
+    desc0.* = .{
+        .addr = reqHeaderPaddr(),
+        .len = @sizeOf(VirtioBlkReqHeader),
+        .flags = desc_flag_next,
+        .next = if (request_type == request_type_flush) 2 else 1,
+    };
+    desc1.* = .{
+        .addr = boot_state.dma_data_paddr,
+        .len = @intCast(byte_count),
+        .flags = desc_flag_next | if (!write) desc_flag_write else @as(u16, 0),
+        .next = 2,
+    };
+    desc2.* = .{
+        .addr = reqStatusPaddr(),
+        .len = 1,
+        .flags = desc_flag_write,
+        .next = 0,
+    };
     if (request_type == request_type_flush) {
-        desc0.flags = desc_flag_next;
-        desc0.next = 2;
+        desc1.len = 0;
+        desc1.flags = 0;
+        desc1.next = 0;
     } else {
-        desc0.flags = desc_flag_next;
-        desc0.next = 1;
-        desc1.len = @intCast(byte_count);
-        desc1.flags = desc_flag_next | if (!write) desc_flag_write else @as(u16, 0);
-        desc1.next = 2;
+        if (byte_count == 0) {
+            _ = releaseOptionalDmaMapping(data_mapping_token);
+            return false;
+        }
     }
     if (!setOptionalDmaMappingState(data_mapping_token, .in_flight)) {
         _ = releaseOptionalDmaMapping(data_mapping_token);

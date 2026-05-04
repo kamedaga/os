@@ -136,6 +136,14 @@ pub const ProcessStatus = struct {
     fault_vector: u8 = 0,
 };
 
+pub const DebugProcessLifecycleReason = enum(u8) {
+    create,
+    ensure,
+    fault,
+    exit,
+    remove,
+};
+
 pub const KernelError = error{
     RegionNotFound,
     CapabilityNotFound,
@@ -260,7 +268,8 @@ pub const EndpointCNode = struct {
 
     fn findIndex(self: *const EndpointCNode, endpoint_id: u64) ?usize {
         var i: usize = 0;
-        while (i < self.len) : (i += 1) {
+        const limit = @min(self.len, self.caps.len);
+        while (i < limit) : (i += 1) {
             if (self.caps[i].endpoint_id == endpoint_id) return i;
         }
         return null;
@@ -309,7 +318,8 @@ pub const PublishedEndpointTable = struct {
 
     fn findIndex(self: *const PublishedEndpointTable, endpoint_id: u64) ?usize {
         var i: usize = 0;
-        while (i < self.len) : (i += 1) {
+        const limit = @min(self.len, self.caps.len);
+        while (i < limit) : (i += 1) {
             if (self.caps[i].endpoint_id == endpoint_id) return i;
         }
         return null;
@@ -807,6 +817,7 @@ pub const KernelState = struct {
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     debug_alloc_page_hook: ?*const fn (state: *const KernelState, requester: PrincipalId, stage: DebugAllocPageStage, paddr: u64) void = null,
+    debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
     untyped_revoke_queue: [max_total_caps]u64 = undefined,
@@ -1078,6 +1089,7 @@ pub const KernelState = struct {
                 .label = label,
             };
             self.active_process_count += 1;
+            if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .create);
             return principal;
         }
         return null;
@@ -1095,6 +1107,7 @@ pub const KernelState = struct {
             .label = label,
         };
         self.active_process_count += 1;
+        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .ensure);
         return true;
     }
 
@@ -1174,6 +1187,7 @@ pub const KernelState = struct {
         self.process_descriptors[index].faulted = true;
         self.process_descriptors[index].fault_vector = fault_vector;
         if (self.active_process_count > 0) self.active_process_count -= 1;
+        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .fault);
         return true;
     }
 
@@ -1190,6 +1204,7 @@ pub const KernelState = struct {
         self.process_descriptors[index].faulted = false;
         self.process_descriptors[index].fault_vector = 0;
         if (self.active_process_count > 0) self.active_process_count -= 1;
+        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .exit);
         return true;
     }
 
@@ -1198,6 +1213,7 @@ pub const KernelState = struct {
         if (!self.process_descriptors[index].active) return false;
         self.process_descriptors[index] = .{};
         if (self.active_process_count > 0) self.active_process_count -= 1;
+        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .remove);
         return true;
     }
 
@@ -1517,6 +1533,10 @@ pub const KernelState = struct {
 
     pub fn endpointTargetFor(self: *const KernelState, owner: PrincipalId, endpoint_id: u64) ?PrincipalId {
         if (!self.hasActivePrincipal(owner)) return null;
+        return self.endpointTargetForKnownActiveOwner(owner, endpoint_id);
+    }
+
+    pub fn endpointTargetForKnownActiveOwner(self: *const KernelState, owner: PrincipalId, endpoint_id: u64) ?PrincipalId {
         if (self.getEndpointTableConst(owner).find(endpoint_id)) |ep| {
             if (!self.hasActivePrincipal(ep.target)) return null;
             return ep.target;
@@ -1705,6 +1725,8 @@ pub const KernelState = struct {
         free_list: *FreePageList,
     ) KernelError!PageCapability {
         try self.requireActiveProcess(requester);
+        const table = self.getTable(requester);
+        if (table.len >= table.caps.len) return KernelError.TableFull;
         const cap = try self.allocPage(requester, free_list);
         if (self.debug_alloc_page_hook) |hook| {
             hook(self, requester, .after_pop, cap.paddr);
@@ -1717,7 +1739,7 @@ pub const KernelState = struct {
             hook(self, requester, .after_memset, cap.paddr);
         }
         const root_id = self.allocCapId();
-        try self.getTable(requester).addAssumeFresh(.{
+        try table.addAssumeFresh(.{
             .paddr = cap.paddr,
             .rights = .{
                 .cpu_read = true,
@@ -2105,6 +2127,32 @@ pub const KernelState = struct {
 
         const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
         if (!src_cap.rights.grant) return KernelError.InvalidState;
+        if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+        if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
+
+        const child_id = self.allocCapId();
+        try self.getTable(to).addAssumeFresh(.{
+            .paddr = paddr,
+            .rights = rights,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
+    }
+
+    pub fn deriveCapForSharedAddressSpace(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        paddr: u64,
+        rights: Rights,
+    ) KernelError!void {
+        if (rights.dma) return KernelError.InvalidState;
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+
+        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
         if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
         if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
 
@@ -2595,6 +2643,51 @@ test "alloc page to principal installs capability by paddr" {
     try std.testing.expectEqual(@as(u64, 0x9000), cap.paddr);
     const installed = s.getTableConst(.Process0).find(0x9000).?;
     try std.testing.expect(installed.rights.grant);
+}
+
+test "allocPageTo table full does not consume a free page" {
+    var s = try KernelState.initFromDetectedRegions(1);
+    var free_list = FreePageList{};
+    try free_list.appendPage(0, 0x9000);
+    const table = s.getTable(.Process0);
+    while (table.len < table.caps.len) {
+        const id: u64 = @intCast(table.len + 1);
+        try table.addAssumeFresh(.{
+            .paddr = 0x1000_0000 + id * 0x1000,
+            .rights = .{
+                .cpu_read = true,
+                .cpu_write = true,
+                .dma = true,
+                .grant = true,
+            },
+            .cap_id = id,
+            .root_cap_id = id,
+            .parent_cap_id = 0,
+        });
+    }
+
+    try std.testing.expectError(KernelError.TableFull, s.allocPageTo(.Process0, &free_list));
+    try std.testing.expectEqual(@as(usize, 1), free_list.len);
+    try std.testing.expectEqual(@as(u64, 0x9000), try free_list.popFront());
+}
+
+test "endpoint tables clamp corrupted length during lookup" {
+    var endpoints = EndpointCNode{};
+    endpoints.len = EndpointCNode.max_caps + 64;
+    for (&endpoints.caps, 0..) |*cap, index| {
+        cap.* = .{
+            .endpoint_id = @as(u64, @intCast(index + 1)),
+            .target = .Process1,
+        };
+    }
+    endpoints.caps[EndpointCNode.max_caps - 1] = .{
+        .endpoint_id = 0x90,
+        .target = .Process2,
+    };
+
+    const found = endpoints.find(0x90) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(PrincipalId.Process2, found.target);
+    try std.testing.expect(endpoints.find(0x91) == null);
 }
 
 test "allocPageTo skips paddr already covered by active untyped block" {

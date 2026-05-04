@@ -42,6 +42,7 @@ static u64 errno_pipe(void) { return (u64)(i64)-32; }
 static u64 errno_nosys(void) { return (u64)(i64)-38; }
 static u64 errno_nametoolong(void) { return (u64)(i64)-36; }
 static u64 errno_range(void) { return (u64)(i64)-34; }
+static u64 errno_timedout(void) { return (u64)(i64)-110; }
 
 static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
@@ -53,6 +54,8 @@ static u64 reply_trap_target(u64 principal, u64 result, u64 flags) { return sysc
 static u64 start_trap_target(u64 principal) { return syscall1(SYSCALL_START_ABI_TRAP_TARGET, principal); }
 static u64 set_trap_target_request_page(u64 principal, u64 request_page_va) { return syscall2(SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE, principal, request_page_va); }
 static u64 set_target_fs_base(u64 fs_base) { return syscall1(SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE, fs_base); }
+static u64 clone_reply_target(u64 child_stack, u64 tls) { return syscall2(SYSCALL_CLONE_ABI_TRAP_REPLY_TARGET, child_stack, tls); }
+static void detach_reply_token(void) { (void)syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN); }
 static u64 alloc_map_pages(u64 target_va, u64 page_count, u64 flags) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, flags, 0); }
 static int install_self_wake_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, syscall0(SYSCALL_GET_PROCESS_SLOT)) == SYSCALL_OK; }
 static void prime_reply_return_signal(void) { (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, 0); }
@@ -71,14 +74,33 @@ static int is_known_trap_request_page(u64 request_va) {
 
 static int ensure_child_trap_request_page(u64 principal, u64 *request_va_out) {
     const u64 request_va = trap_request_page_for_principal(principal);
-    if (request_va == 0) return 0;
+    if (request_va == 0) {
+        user_log("LinuxAbiServer: request page principal out of range=");
+        user_log_hex_value(principal);
+        return 0;
+    }
     if (!g_request_page_mapped[principal]) {
         const u64 status = alloc_map_pages(request_va, 1, 0x3);
-        if (status != SYSCALL_OK) return 0;
+        if (status != SYSCALL_OK) {
+            user_log("LinuxAbiServer: request page map failed principal=");
+            user_log_hex_value(principal);
+            user_log("LinuxAbiServer: request page map status=");
+            user_log_hex_value(status);
+            return 0;
+        }
         g_request_page_mapped[principal] = 1;
     }
     clear_page(request_va);
-    if (set_trap_target_request_page(principal, request_va) != SYSCALL_OK) return 0;
+    const u64 set_status = set_trap_target_request_page(principal, request_va);
+    if (set_status != SYSCALL_OK) {
+        user_log("LinuxAbiServer: request page set failed principal=");
+        user_log_hex_value(principal);
+        user_log("LinuxAbiServer: request page set va=");
+        user_log_hex_value(request_va);
+        user_log("LinuxAbiServer: request page set status=");
+        user_log_hex_value(set_status);
+        return 0;
+    }
     *request_va_out = request_va;
     return 1;
 }

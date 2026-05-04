@@ -1,13 +1,79 @@
+#include <errno.h>
 #include <stddef.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <sys/auxv.h>
 #include <unistd.h>
+
+#ifndef SYS_futex
+#define SYS_futex 202
+#endif
+#define CAP_FUTEX_WAIT 0
+#define CAP_FUTEX_WAKE 1
+#define CAP_FUTEX_PRIVATE_FLAG 128
+
+static volatile int pthread_value = 0;
 
 static int write_all(const char *message) {
     size_t len = strlen(message);
     ssize_t written = write(1, message, len);
     return written == (ssize_t)len ? 0 : 1;
+}
+
+static int futex_smoke(void) {
+    int word = 1;
+    errno = 0;
+    long ret = syscall(SYS_futex, &word, CAP_FUTEX_WAIT | CAP_FUTEX_PRIVATE_FLAG, 0, NULL, NULL, 0);
+    if (ret != -1 || errno != EAGAIN) {
+        (void)write_all("musl_smoke: futex wait mismatch failed\n");
+        return 20;
+    }
+
+    errno = 0;
+    ret = syscall(SYS_futex, &word, CAP_FUTEX_WAKE | CAP_FUTEX_PRIVATE_FLAG, 1, NULL, NULL, 0);
+    if (ret != 0) {
+        (void)write_all("musl_smoke: futex wake failed\n");
+        return 21;
+    }
+
+    struct timespec ts = { 0, 0 };
+    word = 0;
+    errno = 0;
+    ret = syscall(SYS_futex, &word, CAP_FUTEX_WAIT | CAP_FUTEX_PRIVATE_FLAG, 0, &ts, NULL, 0);
+    if (ret != -1 || errno != ETIMEDOUT) {
+        (void)write_all("musl_smoke: futex timeout failed\n");
+        return 22;
+    }
+
+    return write_all("musl_smoke: futex ok\n") == 0 ? 0 : 23;
+}
+
+static void *pthread_entry(void *arg) {
+    long value = (long)arg;
+    pthread_value = (int)(value + 1);
+    return (void *)7;
+}
+
+static int pthread_smoke(void) {
+    pthread_t thread;
+    void *joined = NULL;
+    pthread_value = 0;
+    if (pthread_create(&thread, NULL, pthread_entry, (void *)41) != 0) {
+        (void)write_all("musl_smoke: pthread create failed\n");
+        return 24;
+    }
+    if (pthread_join(thread, &joined) != 0) {
+        (void)write_all("musl_smoke: pthread join failed\n");
+        return 25;
+    }
+    if (pthread_value != 42 || (long)joined != 7) {
+        (void)write_all("musl_smoke: pthread result failed\n");
+        return 26;
+    }
+    return write_all("musl_smoke: pthread ok\n") == 0 ? 0 : 27;
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -24,7 +90,11 @@ int main(int argc, char **argv, char **envp) {
     const char *execfn = (const char *)getauxval(AT_EXECFN);
     if (execfn == NULL || strcmp(execfn, "/cmd/musl_smoke.elf") != 0) return 9;
     if (write_all("musl_smoke: argv envp auxv ok\n") != 0) return 10;
+    int futex_status = futex_smoke();
+    if (futex_status != 0) return futex_status;
     if (execve_child) {
+        int pthread_status = pthread_smoke();
+        if (pthread_status != 0) return pthread_status;
         if (write_all("musl_smoke: execve child ok\n") != 0) return 12;
         return 0;
     }

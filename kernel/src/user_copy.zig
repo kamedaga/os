@@ -15,7 +15,8 @@ pub const Hooks = struct {
     invlpg: *const fn (u64) void,
 };
 
-var hooks: ?Hooks = null;
+var user_copy_hooks_storage: Hooks = undefined;
+var user_copy_hooks_ready = false;
 
 const PhysCopyWindowLock = struct {
     value: u8 = 0,
@@ -54,18 +55,37 @@ const PhysCopyWindowLock = struct {
 
 var phys_copy_window_lock: PhysCopyWindowLock = .{};
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_storage), &user_copy_hooks_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_ready), &user_copy_hooks_ready));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(phys_copy_window_lock), &phys_copy_window_lock));
+    return end;
+}
+
 pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
-    if (!map_identity_range(@intFromPtr(&hooks), @sizeOf(@TypeOf(hooks)))) return false;
+    if (!map_identity_range(@intFromPtr(&user_copy_hooks_storage), @sizeOf(@TypeOf(user_copy_hooks_storage)))) return false;
+    if (!map_identity_range(@intFromPtr(&user_copy_hooks_ready), @sizeOf(@TypeOf(user_copy_hooks_ready)))) return false;
     if (!map_identity_range(@intFromPtr(&phys_copy_window_lock), @sizeOf(@TypeOf(phys_copy_window_lock)))) return false;
     return true;
 }
 
 pub fn init(new_hooks: Hooks) void {
-    hooks = new_hooks;
+    user_copy_hooks_storage = new_hooks;
+    user_copy_hooks_ready = true;
 }
 
 fn getHooks() *const Hooks {
-    return &(hooks orelse unreachable);
+    if (!user_copy_hooks_ready) unreachable;
+    return &user_copy_hooks_storage;
 }
 
 fn mapPhysPageForKernelAccess(page_paddr: u64) ?[*]u8 {

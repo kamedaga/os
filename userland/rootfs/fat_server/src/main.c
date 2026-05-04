@@ -759,11 +759,8 @@ static int read_volume_sector0_probe(void) {
 
 static FAT_NOINLINE_NOOPT void copy_block_payload_to_sector(u8 *out, u64 copy_bytes) {
     const volatile u8 *payload = (const volatile u8 *)(FAT_BLOCK_RESPONSE_VA + BLOCK_RESPONSE_HEADER_BYTES);
-    __asm__ volatile(
-        "rep movsb"
-        : "+D"(out), "+S"(payload), "+c"(copy_bytes)
-        :
-        : "memory");
+    if (copy_bytes > BLOCK_RESPONSE_PAYLOAD_BYTES) copy_bytes = BLOCK_RESPONSE_PAYLOAD_BYTES;
+    for (u64 i = 0; i < copy_bytes; i++) out[i] = payload[i];
 }
 
 static FAT_NOINLINE_NOOPT void copy_block_bulk_to_sector(u8 *out, u64 copy_bytes) {

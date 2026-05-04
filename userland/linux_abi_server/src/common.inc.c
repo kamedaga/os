@@ -36,6 +36,8 @@ enum {
     SYSCALL_COPY_TO_ABI_TRAP_TARGET = 0x55,
     SYSCALL_START_ABI_TRAP_TARGET = 0x56,
     SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE = 0x57,
+    SYSCALL_CLONE_ABI_TRAP_REPLY_TARGET = 0x58,
+    SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN = 0x59,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     IPC_CALL_FLAG_SIGNAL_ONLY = 0x2,
@@ -106,6 +108,7 @@ enum {
     LINUX_SYS_WRITEV = 20,
     LINUX_SYS_ACCESS = 21,
     LINUX_SYS_PIPE = 22,
+    LINUX_SYS_MADVISE = 28,
     LINUX_SYS_DUP = 32,
     LINUX_SYS_DUP2 = 33,
     LINUX_SYS_GETPID = 39,
@@ -142,6 +145,7 @@ enum {
     LINUX_SYS_PIPE2 = 293,
     LINUX_SYS_PRLIMIT64 = 302,
     LINUX_SYS_GETRANDOM = 318,
+    LINUX_SYS_MEMBARRIER = 324,
     LINUX_SYS_RSEQ = 334,
 
     AT_FDCWD_U64 = 0xffffffffffffff9cULL,
@@ -158,6 +162,17 @@ enum {
     FS_CREATE_FLAG_TRUNCATE = 1 << 1,
     WNOHANG = 1,
     SIGCHLD = 17,
+    CLONE_VM = 0x00000100,
+    CLONE_FS = 0x00000200,
+    CLONE_FILES = 0x00000400,
+    CLONE_SIGHAND = 0x00000800,
+    CLONE_THREAD = 0x00010000,
+    CLONE_SYSVSEM = 0x00040000,
+    CLONE_SETTLS = 0x00080000,
+    CLONE_PARENT_SETTID = 0x00100000,
+    CLONE_CHILD_CLEARTID = 0x00200000,
+    CLONE_DETACHED = 0x00400000,
+    CLONE_CHILD_SETTID = 0x01000000,
     F_DUPFD = 0,
     F_GETFD = 1,
     F_SETFD = 2,
@@ -170,6 +185,15 @@ enum {
     DT_UNKNOWN = 0,
     DT_DIR = 4,
     DT_REG = 8,
+    FUTEX_WAIT = 0,
+    FUTEX_WAKE = 1,
+    FUTEX_PRIVATE_FLAG = 128,
+    FUTEX_CLOCK_REALTIME = 256,
+    FUTEX_CMD_MASK = 0x7f,
+    MEMBARRIER_CMD_QUERY = 0,
+    MEMBARRIER_CMD_GLOBAL = 1 << 0,
+    MEMBARRIER_CMD_PRIVATE_EXPEDITED = 1 << 3,
+    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED = 1 << 4,
 
     TRAP_RESPONSE_FLAG_EXIT = 1,
     ARCH_SET_FS = 0x1002,
@@ -248,15 +272,24 @@ struct pipe_entry {
     u8 bytes[PIPE_BUFFER_BYTES];
 };
 
+enum { FUTEX_WAITER_MAX = 32 };
+struct futex_waiter {
+    u8 used;
+    u64 principal;
+    u64 owner_pid;
+    u64 uaddr;
+};
+
 enum { VM_REGION_MAX = 64 };
 struct vm_region { u64 start; u64 size; u64 prot; int used; };
 
-enum { LINUX_PROCESS_MAX = 8, LINUX_CHILD_MAX = 8 };
+enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16 };
 struct linux_process_state {
     u8 used;
     u8 exec_pending;
     u32 exit_status;
     u64 pid;
+    u64 tid;
     u64 principal;
     struct fd_entry fds[32];
     u64 mmap_next_va;
@@ -316,6 +349,7 @@ static u8 g_deferred_start_used[LINUX_PROCESS_MAX];
 static u64 g_deferred_start_principal[LINUX_PROCESS_MAX];
 static u32 g_deferred_pipe_wake_mask = 0;
 static struct pipe_entry g_pipes[PIPE_MAX];
+static struct futex_waiter g_futex_waiters[FUTEX_WAITER_MAX];
 static u8 g_request_page_mapped[LINUX_ABI_REQUEST_PAGE_COUNT];
 static int execve_scratch_ready = 0;
 static u64 execve_main_scratch_pages = 0;

@@ -76,3 +76,15 @@ static struct ipc_message handle_clock_gettime(const struct trap_request *req) {
     ts.tv_nsec = 0;
     return copy_to_target(req->args[1], &ts, sizeof(ts)) == sizeof(ts) ? reply(0, 0) : reply(errno_fault(), 0);
 }
+
+static struct ipc_message handle_membarrier(const struct trap_request *req) {
+    const u64 cmd = req->args[0];
+    const u64 flags = req->args[1];
+    if (flags != 0) return reply(errno_inval(), 0);
+    const u64 supported = (u64)MEMBARRIER_CMD_GLOBAL |
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED |
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+    if (cmd == MEMBARRIER_CMD_QUERY) return reply(supported, 0);
+    if ((cmd & ~supported) != 0) return reply(errno_inval(), 0);
+    return reply(0, 0);
+}

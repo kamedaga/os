@@ -107,7 +107,7 @@ fn print_help() {
     println!("  pactl setup [diff|full]   (default: diff)");
     println!("  pactl sync rootfs");
     println!("  pactl sync bootfs");
-    println!("  pactl run [--timed] [--no-kvm] [--dry-run]");
+    println!("  pactl run [--timed] [--pf-check <jobs>] [--no-kvm] [--dry-run]");
     println!("  pactl gen manifests");
 }
 
@@ -345,15 +345,34 @@ fn cmd_run(
         timed: false,
         kvm: true,
         dry_run: false,
+        pf_check_jobs: 0,
     };
 
-    for arg in args {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         match arg.as_str() {
             "--timed" => options.timed = true,
             "--no-kvm" => options.kvm = false,
             "--dry-run" => options.dry_run = true,
-            _ => return Err(format!("unknown run option: {arg}")),
+            "--pf-check" => {
+                i += 1;
+                let jobs = args
+                    .get(i)
+                    .ok_or_else(|| "--pf-check requires a job count".to_string())?;
+                options.pf_check_jobs = parse_pf_check_jobs(jobs)?;
+                options.timed = true;
+            }
+            _ => {
+                if let Some(jobs) = arg.strip_prefix("--pf-check=") {
+                    options.pf_check_jobs = parse_pf_check_jobs(jobs)?;
+                    options.timed = true;
+                } else {
+                    return Err(format!("unknown run option: {arg}"));
+                }
+            }
         }
+        i += 1;
     }
 
     let plan = run_qemu(workspace_root, workspace, &options)?;
@@ -362,6 +381,9 @@ fn cmd_run(
     println!("qemu log: {}", plan.qemu_log.display());
     println!("kvm: {}", if options.kvm { "on" } else { "off" });
     println!("timed: {}", if options.timed { "on" } else { "off" });
+    if options.pf_check_jobs != 0 {
+        println!("pf-check jobs: {}", options.pf_check_jobs);
+    }
     if let Some(serial_log) = plan.serial_log {
         println!("serial log: {}", serial_log.display());
     }
@@ -373,4 +395,14 @@ fn cmd_run(
         println!("{}", plan.script);
     }
     Ok(())
+}
+
+fn parse_pf_check_jobs(value: &str) -> Result<usize, String> {
+    let jobs = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid --pf-check job count: {value}"))?;
+    if jobs == 0 || jobs > 16 {
+        return Err("--pf-check job count must be between 1 and 16".to_string());
+    }
+    Ok(jobs)
 }

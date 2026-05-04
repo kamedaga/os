@@ -24,6 +24,23 @@ var free_list_ptr: *kernel.FreePageList = undefined;
 var user_spaces_ptr: []@import("../boot/main_static.zig").UserAddressSpace = undefined;
 var boot_init_principal: ?kernel.PrincipalId = null;
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(state_ptr), &state_ptr));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(free_list_ptr), &free_list_ptr));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces_ptr), &user_spaces_ptr));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_init_principal), &boot_init_principal));
+    return end;
+}
+
 pub fn init(
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
@@ -121,7 +138,7 @@ pub fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
         bootstrap_request.child_bootstrap_owner;
     const dry_run_ap_cpu = scheduler.chooseCpuForThread(created.process.thread_slot, false);
     const dry_run_any_cpu = scheduler.chooseCpuForThread(created.process.thread_slot, true);
-    const ap_placement_block: scheduler.SpawnExecApPlacementBlock = if (bootstrap_spawn) .bootstrap_path else scheduler.spawnExecApPlacementBlockReason();
+    const ap_placement_block: scheduler.SpawnExecApUserSchedulingBlock = if (bootstrap_spawn) .bootstrap_path else scheduler.spawnExecApUserSchedulingBlockReason();
     if (!scheduler.setThreadReady(created.process.thread_slot, true)) return boot_static.syscall_err_not_ready;
     const ap_placed_cpu = if (bootstrap_spawn) null else scheduler.assignSpawnExecThreadToApIfReady(created.process.thread_slot);
 
@@ -161,11 +178,11 @@ pub fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
     );
 }
 
-fn writeApPlacementBlock(reason: scheduler.SpawnExecApPlacementBlock) void {
+fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void {
     switch (reason) {
         .none => kernel_log.write("none"),
         .flag_disabled => kernel_log.write("off"),
-        .ap_queue_experiment_disabled => kernel_log.write("blocked:ap_queue_experiment_disabled"),
+        .ap_user_policy_disabled => kernel_log.write("blocked:ap_user_policy_disabled"),
         .no_ap => kernel_log.write("blocked:no_ap"),
         .bootstrap_path => kernel_log.write("blocked:bootstrap_path"),
         .ap_syscall_global_state_not_per_cpu => kernel_log.write("blocked:ap_syscall_global_state_not_per_cpu"),

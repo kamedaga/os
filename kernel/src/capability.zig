@@ -1,3 +1,4 @@
+const std = @import("std");
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 
@@ -45,6 +46,22 @@ pub const PageFaultCapability = struct {
 var runtime_ready = false;
 var runtime: RuntimeConfig = undefined;
 var lookup_diag_count: u64 = 0;
+
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_ready), &runtime_ready));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime), &runtime));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lookup_diag_count), &lookup_diag_count));
+    return end;
+}
 
 fn shouldLogLookupDiag(principal: kernel.PrincipalId) bool {
     _ = principal;
@@ -128,6 +145,7 @@ pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
     const slot = findPtSlotForPd(space, pd_index) orelse return null;
     const entry = space.pt_pages[slot][pt_index];
+    const is_user_mapping = (entry & runtime.page_present) != 0 and (entry & runtime.page_user) != 0;
     const paddr = entry & runtime.page_addr_mask;
     if (shouldLogLookupDiag(principal)) {
         runtime.serial_write("lookup mid pd=");
@@ -143,7 +161,7 @@ pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
         runtime.serial_write("\n");
         logLookupSpaceDiag("lookup post", principal, space);
     }
-    if (paddr == 0) return null;
+    if (!is_user_mapping or paddr == 0) return null;
     return paddr;
 }
 
@@ -273,6 +291,32 @@ fn findPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     return null;
 }
 
+fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde: u64) void {
+    const page_ps: u64 = 1 << 7;
+    @memset(space.pt_pages[slot][0..], 0);
+    if ((existing_pde & runtime.page_present) == 0) return;
+    if ((existing_pde & page_ps) == 0) {
+        if ((existing_pde & runtime.page_user) != 0) return;
+        const src_pt_addr = existing_pde & runtime.page_addr_mask;
+        if (src_pt_addr == 0 or src_pt_addr >= runtime.physical_map_limit) return;
+        const src_pt: *const [512]u64 = @ptrFromInt(src_pt_addr);
+        var copy_index: usize = 0;
+        while (copy_index < runtime.page_entries) : (copy_index += 1) {
+            space.pt_pages[slot][copy_index] = src_pt[copy_index] & ~runtime.page_user;
+        }
+        return;
+    }
+
+    const two_mib_mask = ~@as(u64, 0x1F_FFFF);
+    const page_base = existing_pde & runtime.page_addr_mask & two_mib_mask;
+    const pte_flags = (existing_pde & 0xFFF) & ~page_ps & ~runtime.page_user;
+    var pt_index: usize = 0;
+    while (pt_index < runtime.page_entries) : (pt_index += 1) {
+        const paddr = page_base + @as(u64, @intCast(pt_index)) * 4096;
+        space.pt_pages[slot][pt_index] = paddr | pte_flags;
+    }
+}
+
 fn ensurePtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     if (pd_index >= 512) return null;
     if (findPtSlotForPd(space, pd_index)) |existing| return existing;
@@ -286,7 +330,8 @@ fn ensurePtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     }
     if (slot >= UserAddressSpace.max_dynamic_pt_pages) return null;
     space.pt_page_pd_index[slot] = @intCast(pd_index);
-    @memset(space.pt_pages[slot][0..], 0);
+    const existing_pde = space.pd[pd_index];
+    seedPtSlotFromExistingPd(space, slot, existing_pde);
     const pt_pa = @intFromPtr(&space.pt_pages[slot]);
     space.pd[pd_index] = pt_pa | runtime.page_present | runtime.page_rw | runtime.page_user;
     const next_len = slot + 1;
@@ -528,7 +573,7 @@ pub fn mapFreshUserPage(
         return false;
     };
     const old_entry = space.pt_pages[map_slot][pt_index];
-    if ((old_entry & runtime.page_present) != 0) {
+    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) {
         runtime.serial_write("mapFreshUserPage fail: already_present proc=");
         runtime.serial_write(runtime.principal_label(principal));
         runtime.serial_write(" va=");
@@ -712,4 +757,38 @@ pub fn dumpPrincipalEndpoints(state: *const kernel.KernelState, principal: kerne
         logWrite(runtime.principal_label(ep.target));
         logWrite("\n");
     }
+}
+
+fn testSerialWrite(_: []const u8) void {}
+fn testPrintHex(_: u64) void {}
+fn testPrincipalLabel(_: kernel.PrincipalId) []const u8 {
+    return "test";
+}
+fn testFlushUserTlb(_: kernel.PrincipalId, _: u64) void {}
+
+test "lookupUserMappedPaddrForVa rejects supervisor-only entries" {
+    var spaces = [_]UserAddressSpace{.{}} ** 1;
+    spaces[0].pt_page_pd_index[0] = 0;
+    spaces[0].pt_pages[0][1] = 0x1234_5000 | 0x1 | 0x2;
+
+    init(.{
+        .user_spaces = spaces[0..],
+        .user_va = 0,
+        .physical_map_limit = 0x1_0000_0000,
+        .page_entries = 512,
+        .page_addr_mask = 0x000f_ffff_ffff_f000,
+        .page_present = 0x1,
+        .page_rw = 0x2,
+        .page_user = 0x4,
+        .canonical_user_limit_exclusive = 0x0000_8000_0000_0000,
+        .serial_write = testSerialWrite,
+        .print_hex = testPrintHex,
+        .principal_label = testPrincipalLabel,
+        .flush_user_tlb_for_principal_va = testFlushUserTlb,
+    });
+
+    try std.testing.expect(lookupUserMappedPaddrForVa(.Process0, 0x1000) == null);
+
+    spaces[0].pt_pages[0][1] |= 0x4;
+    try std.testing.expectEqual(@as(?u64, 0x1234_5000), lookupUserMappedPaddrForVa(.Process0, 0x1000));
 }

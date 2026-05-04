@@ -8,6 +8,7 @@
 #include "fs_syscalls.inc.c"
 #include "fd_syscalls.inc.c"
 #include "process_syscalls.inc.c"
+#include "futex_syscalls.inc.c"
 #include "misc_syscalls.inc.c"
 #include "vm_syscalls.inc.c"
 #include "main_loop.inc.c"

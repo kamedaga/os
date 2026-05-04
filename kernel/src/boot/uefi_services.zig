@@ -31,6 +31,26 @@ pub fn postExitLoadScratchEndAddr() usize {
     return @intFromPtr(&post_exit_load_scratch) + post_exit_load_scratch.len;
 }
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end = postExitLoadScratchEndAddr();
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_services_cache), &boot_services_cache));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_image_base_paddr_ref), &kernel_image_base_paddr_ref));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_image_size_bytes_ref), &kernel_image_size_bytes_ref));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(uefi_mmap_buffer), &uefi_mmap_buffer));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(uefi_exitbs_mmap_buffer), &uefi_exitbs_mmap_buffer));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(post_exit_load_scratch), &post_exit_load_scratch));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(post_exit_load_scratch_used), &post_exit_load_scratch_used));
+    return end;
+}
+
 // ---------------------------------------------------------------------------
 // Early UEFI console output (before serial is ready)
 // ---------------------------------------------------------------------------

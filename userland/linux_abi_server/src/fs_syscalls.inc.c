@@ -138,6 +138,7 @@ static struct ipc_message handle_read(const struct trap_request *req) {
             pipe->pending_principal = req->caller_principal;
             pipe->pending_dst = dst;
             pipe->pending_len = len;
+            detach_reply_token();
             return wait_ipc();
         }
         int fault = 0; const u64 n = pipe_read_to_target(fd, dst, len, &fault); return reply(fault ? errno_fault() : n, 0);

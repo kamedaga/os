@@ -80,6 +80,7 @@ const syscall_reply_abi_trap_target: u64 = trap_abi.syscall_reply_abi_trap_targe
 const syscall_copy_to_abi_trap_target: u64 = trap_abi.syscall_copy_to_abi_trap_target;
 const syscall_start_abi_trap_target: u64 = trap_abi.syscall_start_abi_trap_target;
 const syscall_set_abi_trap_target_request_page: u64 = trap_abi.syscall_set_abi_trap_target_request_page;
+const syscall_detach_abi_trap_reply_token: u64 = trap_abi.syscall_detach_abi_trap_reply_token;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -98,6 +99,8 @@ const syscall_err_empty: u64 = 13;
 const syscall_alloc_map_drop_cap_flag: u64 = 0x2;
 const ipc_call_flag_retain_sender: u64 = 0x1;
 const ipc_call_flag_signal_only: u64 = 0x2;
+var sys_alloc_page_failure_log_count: u64 = 0;
+const sys_alloc_page_failure_log_limit: u64 = 64;
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -132,7 +135,8 @@ pub const Hooks = struct {
     total_usable_memory_bytes: u64,
 };
 
-var hooks: ?Hooks = null;
+var syscall_hooks_storage: Hooks = undefined;
+var syscall_hooks_ready = false;
 pub export var syscall_return_writeback_enabled: u64 = 1;
 pub export var syscall_return_writeback_enabled_by_cpu: [smp.max_cpus]u64 = [_]u64{1} ** smp.max_cpus;
 const syscall_fast_handled_mask: u64 = 1 << 63;
@@ -143,12 +147,33 @@ const IpcSignalTarget = struct {
     thread_index: usize,
 };
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(sys_alloc_page_failure_log_count), &sys_alloc_page_failure_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_storage), &syscall_hooks_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled), &syscall_return_writeback_enabled));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled_by_cpu), &syscall_return_writeback_enabled_by_cpu));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstars), &syscall_entry_is_lstars));
+    return end;
+}
+
 pub fn init(new_hooks: Hooks) void {
-    hooks = new_hooks;
+    syscall_hooks_storage = new_hooks;
+    syscall_hooks_ready = true;
 }
 
 fn getHooks() *const Hooks {
-    return &(hooks orelse unreachable);
+    if (!syscall_hooks_ready) unreachable;
+    return &syscall_hooks_storage;
 }
 
 fn currentCpuSlotBounded() usize {
@@ -371,6 +396,8 @@ fn dispatchIpcSyscall(
 }
 
 pub export fn syscallIpcDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    scheduler.lockKernelTrapPath();
+    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     const entry_thread = scheduler.currentThreadIndex();
     setSyscallReturnWritebackEnabled(true);
@@ -387,6 +414,8 @@ pub export fn syscallIpcDispatch(frame: *TrapFrame) callconv(.c) u64 {
 }
 
 pub export fn syscallIpcCallReplyRecvSignalOnlyDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    scheduler.lockKernelTrapPath();
+    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     const entry_thread = scheduler.currentThreadIndex();
     setSyscallReturnWritebackEnabled(true);
@@ -557,11 +586,10 @@ fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u6
     if ((mr1 & trap_abi.response_flag_exit) != 0 and
         (target_ctx.abi_trap_reply_pending or target_has_abi_delegate))
     {
-        _ = abi_trap_runtime.reclaimPrivatePagesForProcess(target_proc);
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
-        target_ctx.abi_trap_reply_pending = false;
-        _ = h.state.markProcessExited(target_proc);
         _ = scheduler.releaseThreadSlot(target_thread);
+        _ = h.state.markProcessExited(target_proc);
+        _ = abi_trap_runtime.reclaimPrivatePagesForProcess(h.state, target_proc);
         return syscall_ok;
     }
     if (target_has_abi_delegate) {
@@ -569,6 +597,14 @@ fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u6
     }
     scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
     return deliverOrQueueIpcMessageToThread(target_thread, 0, current_thread, false, mr0, mr1, mr2, mr3);
+}
+
+fn detachCurrentAbiTrapReplyToken() u64 {
+    const current_thread = scheduler.currentThreadIndex();
+    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return syscall_err_not_ready;
+    if (current_hot.ipc_reply_token_valid == 0) return syscall_err_endpoint;
+    scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
+    return syscall_ok;
 }
 
 fn resolveIpcSignalTargetThread(
@@ -597,6 +633,8 @@ fn resolveIpcSignalTargetThread(
 }
 
 pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *const IpcSignalSave, out_frame: *TrapFrame) callconv(.c) usize {
+    scheduler.lockKernelTrapPath();
+    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     if (!h.kernel_state_ready.*) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
 
@@ -619,10 +657,9 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
         if ((save.mr1 & trap_abi.response_flag_exit) != 0 and
             (target_ctx.abi_trap_reply_pending or h.state.abiTrapDelegateFor(target.principal) != null))
         {
-            _ = abi_trap_runtime.reclaimPrivatePagesForProcess(target.principal);
-            target_ctx.abi_trap_reply_pending = false;
-            _ = h.state.markProcessExited(target.principal);
             _ = scheduler.releaseThreadSlot(target.thread_index);
+            _ = h.state.markProcessExited(target.principal);
+            _ = abi_trap_runtime.reclaimPrivatePagesForProcess(h.state, target.principal);
 
             if (scheduler.dequeueIpcMessageForThread(current_thread)) |msg| {
                 return writeCurrentIpcSignalQueuedReturn(out_frame, save, msg);
@@ -689,6 +726,8 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
 }
 
 pub export fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) callconv(.c) u64 {
+    scheduler.lockKernelTrapPath();
+    defer scheduler.unlockKernelTrapPath();
     const h = getHooks();
     if (!h.kernel_state_ready.*) return syscall_fast_handled_mask | syscall_err_not_ready;
 
@@ -763,8 +802,23 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
 
     const state = h.state;
     const proc = scheduler.currentUserPrincipal();
-    if (entry_is_lstar) {
-        if (abi_trap_runtime.dispatchDelegate(proc, frame)) |result| {
+    if (!state.hasActivePrincipal(proc)) {
+        h.write("syscall from inactive principal proc=");
+        h.write(h.principal_label(proc));
+        h.write(" thread=");
+        h.print_number(@intCast(scheduler.currentThreadIndex()));
+        h.write("\n");
+        h.exit_current_process(proc, 0, frame);
+        return syscall_ok;
+    }
+    const abi_delegate = state.abiTrapDelegateFor(proc);
+    const has_abi_delegate = abi_delegate != null;
+    if (entry_is_lstar or has_abi_delegate) {
+        if (abi_delegate) |delegate| {
+            if (abi_trap_runtime.dispatchKnownDelegate(state, proc, delegate, frame)) |result| {
+                return result;
+            }
+        } else if (abi_trap_runtime.dispatchDelegate(state, proc, frame)) |result| {
             return result;
         }
     }
@@ -783,17 +837,43 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     switch (frame.rax) {
         syscall_alloc_page => {
             const cap = state.allocPageTo(proc, h.free_list) catch |err| {
-                h.write("sys_alloc_page failed proc=");
-                h.write(h.principal_label(proc));
-                h.write(" err=");
-                h.write(@errorName(err));
-                h.write(" caps=");
-                h.print_number(@intCast(state.getTableConst(proc).len));
-                h.write("/");
-                h.print_number(kernel.CNode.max_caps);
-                h.write(" free_pages=");
-                h.print_number(@intCast(h.free_list.len));
-                h.write("\n");
+                if (sys_alloc_page_failure_log_count < sys_alloc_page_failure_log_limit) {
+                    h.write("sys_alloc_page failed proc=");
+                    h.write(h.principal_label(proc));
+                    h.write(" proc_raw=");
+                    h.print_hex(@intFromEnum(proc));
+                    if (kernel.processIndexFromPrincipal(proc)) |proc_index| {
+                        const desc = state.process_descriptors[proc_index];
+                        h.write(" active=");
+                        h.print_number(if (desc.active) 1 else 0);
+                        h.write(" delegate=");
+                        h.print_hex(desc.abi_trap_delegate_endpoint_id);
+                        h.write(" request=");
+                        h.print_hex(desc.abi_trap_request_page_va);
+                    }
+                    h.write(" thread=");
+                    h.print_number(@intCast(scheduler.currentThreadIndex()));
+                    h.write(" cpu=");
+                    h.print_number(@intCast(scheduler.currentCpuSlot()));
+                    h.write(" entry_lstar=");
+                    h.print_number(if (currentSyscallEntryIsLstar()) 1 else 0);
+                    h.write(" rip=");
+                    h.print_hex(frame.rip);
+                    h.write(" rdi=");
+                    h.print_hex(frame.rdi);
+                    h.write(" rsi=");
+                    h.print_hex(frame.rsi);
+                    h.write(" err=");
+                    h.write(@errorName(err));
+                    h.write(" caps=");
+                    h.print_number(@intCast(state.getTableConst(proc).len));
+                    h.write("/");
+                    h.print_number(kernel.CNode.max_caps);
+                    h.write(" free_pages=");
+                    h.print_number(@intCast(h.free_list.len));
+                    h.write("\n");
+                    sys_alloc_page_failure_log_count += 1;
+                }
                 return syscall_err_alloc;
             };
             return cap.paddr;
@@ -1188,7 +1268,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return syscall_ok;
         },
         syscall_map_abi_trap_reply_target_pages => {
-            return abi_trap_runtime.mapPagesToCurrentReplyTarget(frame.rdi, frame.rsi, frame.rdx);
+            return abi_trap_runtime.mapPagesToCurrentReplyTarget(state, frame.rdi, frame.rsi, frame.rdx);
         },
         syscall_copy_from_abi_trap_reply_target => {
             return abi_trap_runtime.copyFromCurrentReplyTarget(proc, frame.rdi, frame.rsi, frame.rdx);
@@ -1203,22 +1283,25 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return abi_trap_runtime.protectCurrentReplyTargetPages(frame.rdi, frame.rsi, frame.rdx);
         },
         syscall_unmap_abi_trap_reply_target_pages => {
-            return abi_trap_runtime.unmapCurrentReplyTargetPages(frame.rdi, frame.rsi);
+            return abi_trap_runtime.unmapCurrentReplyTargetPages(state, frame.rdi, frame.rsi);
         },
         syscall_reclaim_abi_trap_reply_target_private_pages => {
-            return abi_trap_runtime.reclaimCurrentReplyTargetPrivatePages();
+            return abi_trap_runtime.reclaimCurrentReplyTargetPrivatePages(state);
         },
         syscall_reply_abi_trap_target => {
-            return abi_trap_runtime.replyToTarget(proc, frame.rdi, frame.rsi, frame.rdx);
+            return abi_trap_runtime.replyToTarget(state, proc, frame.rdi, frame.rsi, frame.rdx);
+        },
+        syscall_detach_abi_trap_reply_token => {
+            return detachCurrentAbiTrapReplyToken();
         },
         syscall_copy_to_abi_trap_target => {
-            return abi_trap_runtime.copyToTarget(proc, frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            return abi_trap_runtime.copyToTarget(state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10);
         },
         syscall_start_abi_trap_target => {
-            return abi_trap_runtime.startTarget(proc, frame.rdi);
+            return abi_trap_runtime.startTarget(state, proc, frame.rdi);
         },
         syscall_set_abi_trap_target_request_page => {
-            return abi_trap_runtime.setTargetRequestPage(proc, frame.rdi, frame.rsi);
+            return abi_trap_runtime.setTargetRequestPage(state, proc, frame.rdi, frame.rsi);
         },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;
@@ -1467,7 +1550,10 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return process_builder.setAbiTrapDelegate(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8);
         },
         process_builder_abi.syscall_fork_abi_trap_reply_target => {
-            return abi_trap_runtime.forkCurrentReplyTarget();
+            return abi_trap_runtime.forkCurrentReplyTarget(state);
+        },
+        process_builder_abi.syscall_clone_abi_trap_reply_target => {
+            return abi_trap_runtime.cloneCurrentReplyTargetShared(state, frame.rdi, frame.rsi);
         },
         syscall_log => {
             const req_len_u64 = frame.rsi;
@@ -1488,6 +1574,8 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
 }
 
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    scheduler.lockKernelTrapPath();
+    defer scheduler.unlockKernelTrapPath();
     return syscallDispatchFrom(frame, currentSyscallEntryIsLstar());
 }
 
@@ -1503,13 +1591,16 @@ fn syscallLstarDelegateDispatch(frame: *TrapFrame) ?u64 {
     if (!h.kernel_state_ready.*) return syscall_err_not_ready;
 
     const proc = scheduler.currentUserPrincipal();
-    if (abi_trap_runtime.dispatchDelegate(proc, frame)) |result| {
+    const state = h.state;
+    if (abi_trap_runtime.dispatchDelegate(state, proc, frame)) |result| {
         return result;
     }
     return null;
 }
 
 pub export fn syscallLstarDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    scheduler.lockKernelTrapPath();
+    defer scheduler.unlockKernelTrapPath();
     if (syscallLstarDelegateDispatch(frame)) |result| return result;
     return syscallDispatchFrom(frame, false);
 }

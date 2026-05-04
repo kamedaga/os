@@ -247,10 +247,15 @@ static int configure_exec_args_from_target(struct exec_loader_config *cfg, const
     return 1;
 }
 
-static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_va, u64 *spawned_principal_out) {
+static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, u64 *spawned_principal_out) {
     execve_profile_step("scratch begin");
     if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
     execve_profile_step("scratch done");
+    u64 abi_request_va = 0;
+    if (!ensure_child_trap_request_page(caller_principal, &abi_request_va)) {
+        user_log("LinuxAbiServer: execve request page failed\n");
+        return 0;
+    }
 
     u64 main_bytes = 0;
     if (!is_vm_object_token(g_exec_loader_vm_token)) { user_log("LinuxAbiServer: execve loader token absent\n"); return 0; }
@@ -273,7 +278,7 @@ static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_
     cfg->abi_trap_endpoint_id = LINUX_ABI_ENDPOINT_ID;
     cfg->abi_trap_endpoint_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     cfg->abi_trap_flavor = 1;
-    cfg->abi_trap_request_page_va = trap_request_page_va;
+    cfg->abi_trap_request_page_va = abi_request_va;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
     cfg->fs_compat_process_slot = g_vfs.process_slot;
     if (!configure_exec_args_from_target(cfg, path, argv_va, envp_va)) { user_log("LinuxAbiServer: execve argv copy failed\n"); return 0; }
@@ -305,7 +310,6 @@ static int spawn_exec_loader_for_execve(const char *path, u64 argv_va, u64 envp_
         return 0;
     }
     *spawned_principal_out = spawned_principal;
-    user_log("LinuxAbiServer: execve spawned\n");
     return 1;
 }
 
@@ -313,13 +317,9 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     char path[256];
     if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
     if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
-    user_log("LinuxAbiServer: execve ");
-    user_log(path);
-    user_log("\n");
     const u64 old_principal = req->caller_principal;
     u64 spawned_principal = 0;
-    if (!spawn_exec_loader_for_execve(path, req->args[1], req->args[2], &spawned_principal)) return reply(errno_io(), 0);
-    (void)spawned_principal;
+    if (!spawn_exec_loader_for_execve(req->caller_principal, path, req->args[1], req->args[2], &spawned_principal)) return reply(errno_io(), 0);
     if (g_proc) {
         g_proc->principal = 0;
         g_proc->exec_pending = 1;

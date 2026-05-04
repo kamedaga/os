@@ -43,6 +43,26 @@ var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
 var lstar_entries: [max_cpus]usize = [_]usize{0} ** max_cpus;
 
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(observed_cpu_count), &observed_cpu_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_started), &ap_started));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cpu_states), &cpu_states));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_lapic_ids), &runtime_lapic_ids));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_vector), &ap_user_timer_vector));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_initial_count), &ap_user_timer_initial_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lstar_entries), &lstar_entries));
+    return end;
+}
+
 pub fn configureApUserTimer(timer_vector: u8, initial_count: u32) void {
     ap_user_timer_vector = timer_vector;
     ap_user_timer_initial_count = initial_count;
@@ -556,8 +576,8 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
             cpuStatePtr(cpu_slot).* = cpu_state_user;
             enterUserModeFromIdle(&user_entry);
         }
-        if (build_workarounds.scheduler_ap_queue_experiment or build_workarounds.spawn_exec_ap_placement_experiment) {
-            asm volatile ("sti; hlt; cli");
+        if (build_workarounds.scheduler_ap_user_diagnostics or build_workarounds.spawn_exec_ap_user_scheduling) {
+            asm volatile ("pause");
         } else {
             asm volatile ("hlt");
         }
@@ -569,6 +589,11 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
     if (ap_user_timer_vector != 0) {
         _ = lapic.initTimer(ap_user_timer_vector, ap_user_timer_initial_count);
     }
+    const fx_state: *const [512]u8 align(16) = @ptrFromInt(entry.fx_state_addr);
+    asm volatile ("fxrstor64 (%[ptr])"
+        :
+        : [ptr] "r" (fx_state),
+        : .{ .memory = true });
     x86_platform.writeFsBase(entry.fs_base);
     asm volatile (std.fmt.comptimePrint(
             \\mov %[entry], %%rbx

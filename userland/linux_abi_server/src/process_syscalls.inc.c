@@ -158,6 +158,7 @@ static void copy_process_state_for_fork(struct linux_process_state *child, const
     child->exec_pending = 0;
     child->exit_status = 0;
     child->pid = child_principal;
+    child->tid = child_principal;
     child->principal = child_principal;
     child->mmap_next_va = parent->mmap_next_va;
     child->brk_next_va = parent->brk_next_va;
@@ -187,10 +188,56 @@ static void copy_process_state_for_fork(struct linux_process_state *child, const
     }
 }
 
+static void copy_process_state_for_clone_thread(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal, u64 clear_child_tid) {
+    copy_process_state_for_fork(child, parent, child_principal);
+    child->pid = parent->pid;
+    child->tid = child_principal;
+    child->clear_child_tid = clear_child_tid;
+}
+
+static int supported_clone_thread_flags(u64 flags) {
+    const u64 signal = flags & 0xffu;
+    const u64 required = (u64)CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS;
+    const u64 supported = required | CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | CLONE_DETACHED;
+    if (signal != 0) return 0;
+    if ((flags & required) != required) return 0;
+    if ((flags & ~(supported | (u64)0xff)) != 0) return 0;
+    return 1;
+}
+
+static struct ipc_message handle_clone_thread(const struct trap_request *req) {
+    const u64 flags = req->args[0];
+    const u64 child_stack = req->args[1];
+    const u64 parent_tidptr = req->args[2];
+    const u64 child_tidptr = req->args[3];
+    const u64 tls = req->args[4];
+    if (child_stack == 0 || tls == 0 || !supported_clone_thread_flags(flags)) return reply(errno_inval(), 0);
+
+    const u64 spawned = clone_reply_target(child_stack, tls);
+    const u64 child_slot = decode_spawned_process_slot(spawned);
+    if (child_slot == 0) return reply(errno_busy(), 0);
+    struct linux_process_state *child = process_state_for(child_slot);
+    if (!child) return reply(errno_busy(), 0);
+    u64 child_request_va = 0;
+    if (!ensure_child_trap_request_page(child_slot, &child_request_va)) return reply(errno_busy(), 0);
+
+    copy_process_state_for_clone_thread(child, g_proc, child_slot, (flags & CLONE_CHILD_CLEARTID) != 0 ? child_tidptr : 0);
+    const u32 child_tid32 = (u32)child_slot;
+    if ((flags & CLONE_PARENT_SETTID) != 0 && parent_tidptr != 0) {
+        if (copy_to_target(parent_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) return reply(errno_fault(), 0);
+    }
+    if ((flags & CLONE_CHILD_SETTID) != 0 && child_tidptr != 0) {
+        if (copy_to_trap_target(child_slot, child_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) return reply(errno_fault(), 0);
+    }
+    if (!defer_trap_target_start(child_slot)) return reply(errno_busy(), 0);
+    return reply(child_slot, 0);
+}
+
 static struct ipc_message handle_fork_like(const struct trap_request *req, int clone_form) {
     if (clone_form) {
         const u64 flags = req->args[0];
         const u64 child_stack = req->args[1];
+        if ((flags & CLONE_THREAD) != 0) return handle_clone_thread(req);
         if (child_stack != 0) return reply(errno_inval(), 0);
         if ((flags & ~(u64)0xff) != 0) return reply(errno_inval(), 0);
         if ((flags & 0xff) != SIGCHLD && (flags & 0xff) != 0) return reply(errno_inval(), 0);
@@ -210,7 +257,7 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
 
 static struct ipc_message handle_set_tid_address(const struct trap_request *req) {
     if (g_proc) g_proc->clear_child_tid = req->args[0];
-    return reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0);
+    return reply(g_proc && g_proc->tid != 0 ? g_proc->tid : 1, 0);
 }
 
 static struct ipc_message handle_wait4(const struct trap_request *req) {
@@ -232,5 +279,6 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
     g_proc->wait_pending = 1;
     g_proc->wait_pid = pid;
     g_proc->wait_status_va = status_va;
+    detach_reply_token();
     return wait_ipc();
 }
