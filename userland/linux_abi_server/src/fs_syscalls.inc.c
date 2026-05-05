@@ -171,6 +171,7 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         }
         int fault = 0; const u64 n = pipe_read_to_target(fd, dst, len, &fault); sync_fd_to_thread_group(fd); return reply(fault ? errno_fault() : n, 0);
     }
+    if (g_fds[fd].kind == FD_SOCKET) return reply(socket_read_to_target(fd, dst, len), 0);
     if (g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
     u64 copied = 0;
     while (copied < len && g_fds[fd].offset < g_fds[fd].size) {
@@ -257,6 +258,15 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
         }
         return reply(total, 0);
     }
+    if (g_fds[fd].kind == FD_SOCKET) {
+        for (u64 i = 0; i < iovcnt; i++) {
+            u64 pair[2];
+            if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
+            if (pair[1] == 0) continue;
+            return reply(socket_read_to_target(fd, pair[0], pair[1]), 0);
+        }
+        return reply(0, 0);
+    }
     if (g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
     for (u64 i = 0; i < iovcnt; i++) {
         u64 pair[2];
@@ -286,6 +296,7 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
 
 static struct ipc_message handle_write(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 src = req->args[1]; const u64 len = req->args[2];
+    if (fd_valid(fd) && g_fds[fd].kind == FD_SOCKET) return reply(socket_write_from_target(fd, src, len), 0);
     if (fd_valid(fd) && g_fds[fd].kind == FD_PIPE_WRITE) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         int fault = 0; const u64 n = pipe_write_from_target(fd, src, len, &fault);
@@ -327,6 +338,20 @@ static struct ipc_message handle_write(const struct trap_request *req) {
 
 static struct ipc_message handle_writev(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 iov = req->args[1]; const u64 iovcnt = req->args[2];
+    if (fd_valid(fd) && g_fds[fd].kind == FD_SOCKET) {
+        if (iovcnt > 64) return reply(errno_inval(), 0);
+        u8 payload[NET_UDP_MAX_PAYLOAD];
+        u64 total = 0;
+        for (u64 i = 0; i < iovcnt; i++) {
+            u64 pair[2];
+            if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
+            if (pair[1] == 0) continue;
+            if (total + pair[1] > NET_UDP_MAX_PAYLOAD) return reply(errno_msgsize(), 0);
+            if (copy_from_target(pair[0], payload + total, pair[1]) != pair[1]) return reply(errno_fault(), 0);
+            total += pair[1];
+        }
+        return reply(socket_send_payload(fd, payload, total), 0);
+    }
     if (fd_valid(fd) && g_fds[fd].kind == FD_PIPE_WRITE) {
         if (iovcnt > 64) return reply(errno_inval(), 0);
         u64 total = 0;
@@ -452,6 +477,7 @@ static struct ipc_message handle_close(const struct trap_request *req) {
     const u64 fd = req->args[0];
     if (fd >= 32 || g_fds[fd].kind == FD_UNUSED) return reply(errno_badf(), 0);
     if (fd_is_pipe(fd)) close_pipe_fd(fd);
+    if (g_fds[fd].kind == FD_SOCKET) net_close_udp(g_fds[fd].token);
     g_fds[fd].kind = FD_UNUSED;
     sync_fd_to_thread_group(fd);
     return reply(0, 0);

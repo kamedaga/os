@@ -25,7 +25,13 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
     dst->mode_bits = src->mode_bits;
     dst->object_kind = src->object_kind;
     dst->pipe_id = src->pipe_id;
+    dst->socket_connected = src->socket_connected;
+    dst->reserved_fd0 = src->reserved_fd0;
     dst->path_len = src->path_len;
+    dst->socket_local_port = src->socket_local_port;
+    dst->socket_remote_port = src->socket_remote_port;
+    dst->socket_local_ip = src->socket_local_ip;
+    dst->socket_remote_ip = src->socket_remote_ip;
     for (u16 i = 0; i <= src->path_len && i <= FS_MAX_PATH_BYTES; i++) dst->path[i] = src->path[i];
 }
 static void init_process_state(struct linux_process_state *proc, u64 principal) {

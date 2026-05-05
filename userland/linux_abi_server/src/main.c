@@ -5,6 +5,7 @@
 #include "vfs.inc.c"
 #include "console.inc.c"
 #include "process_state.inc.c"
+#include "net_syscalls.inc.c"
 #include "execve.inc.c"
 #include "fs_syscalls.inc.c"
 #include "fd_syscalls.inc.c"

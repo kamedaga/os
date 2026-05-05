@@ -43,6 +43,14 @@ static u64 errno_pipe(void) { return (u64)(i64)-32; }
 static u64 errno_nosys(void) { return (u64)(i64)-38; }
 static u64 errno_nametoolong(void) { return (u64)(i64)-36; }
 static u64 errno_range(void) { return (u64)(i64)-34; }
+static u64 errno_destaddrreq(void) { return (u64)(i64)-89; }
+static u64 errno_msgsize(void) { return (u64)(i64)-90; }
+static u64 errno_protonosupport(void) { return (u64)(i64)-93; }
+static u64 errno_socktnosupport(void) { return (u64)(i64)-94; }
+static u64 errno_afnosupport(void) { return (u64)(i64)-97; }
+static u64 errno_addrinuse(void) { return (u64)(i64)-98; }
+static u64 errno_netunreach(void) { return (u64)(i64)-101; }
+static u64 errno_notconn(void) { return (u64)(i64)-107; }
 static u64 errno_timedout(void) { return (u64)(i64)-110; }
 
 static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }

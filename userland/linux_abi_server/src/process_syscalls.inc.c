@@ -4,6 +4,7 @@ static void close_all_process_fds(struct linux_process_state *proc) {
     for (u64 fd = 0; fd < 32; fd++) {
         if (g_fds[fd].kind == FD_UNUSED) continue;
         if (fd_is_pipe(fd)) close_pipe_fd(fd);
+        if (g_fds[fd].kind == FD_SOCKET) net_close_udp(g_fds[fd].token);
         if (fd > 2 || fd_is_pipe(fd)) g_fds[fd].kind = FD_UNUSED;
     }
     g_proc = saved;

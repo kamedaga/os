@@ -19,6 +19,7 @@ void linux_abi_main(void) {
     (void)install_self_wake_endpoint();
     if (!connect_vfs_from_registry()) user_log("LinuxAbiServer: vfs connect failed\n");
     if (!connect_console_from_registry()) user_log("LinuxAbiServer: console connect skipped\n");
+    if (!connect_net_from_registry()) user_log("LinuxAbiServer: net connect skipped\n");
     init_process_tables();
     cfg->status = LINUX_ABI_BOOTSTRAP_READY;
     user_log("LinuxAbiServer: started\n");
@@ -51,6 +52,15 @@ void linux_abi_main(void) {
         case LINUX_SYS_DUP: msg = handle_dup(req); break;
         case LINUX_SYS_DUP2: msg = handle_dup2_like(req, 0); break;
         case LINUX_SYS_DUP3: msg = handle_dup2_like(req, 1); break;
+        case LINUX_SYS_SOCKET: msg = handle_socket(req); break;
+        case LINUX_SYS_CONNECT: msg = handle_connect_socket(req); break;
+        case LINUX_SYS_BIND: msg = handle_bind_socket(req); break;
+        case LINUX_SYS_SENDTO: msg = handle_sendto(req); break;
+        case LINUX_SYS_RECVFROM: msg = handle_recvfrom(req); break;
+        case LINUX_SYS_GETSOCKNAME: msg = handle_getsockname_socket(req); break;
+        case LINUX_SYS_GETPEERNAME: msg = handle_getpeername_socket(req); break;
+        case LINUX_SYS_SETSOCKOPT: msg = handle_setsockopt_socket(req); break;
+        case LINUX_SYS_GETSOCKOPT: msg = handle_getsockopt_socket(req); break;
         case LINUX_SYS_CLONE: msg = handle_fork_like(req, 1); break;
         case LINUX_SYS_FORK: msg = handle_fork_like(req, 0); break;
         case LINUX_SYS_VFORK: msg = handle_fork_like(req, 0); break;
@@ -60,6 +70,10 @@ void linux_abi_main(void) {
         case LINUX_SYS_STAT: case LINUX_SYS_LSTAT: msg = handle_newfstatat(req, 1); break;
         case LINUX_SYS_FSTAT: msg = handle_fstat(req); break;
         case LINUX_SYS_NEWFSTATAT: msg = handle_newfstatat(req, 0); break;
+        case LINUX_SYS_POLL: msg = handle_poll(req, 0); break;
+        case LINUX_SYS_SELECT: msg = handle_select(req, 0); break;
+        case LINUX_SYS_PSELECT6: msg = handle_select(req, 1); break;
+        case LINUX_SYS_PPOLL: msg = handle_poll(req, 1); break;
         case LINUX_SYS_PREAD64: msg = handle_pread64(req); break;
         case LINUX_SYS_GETDENTS64: msg = handle_getdents64(req); break;
         case LINUX_SYS_LSEEK: msg = handle_lseek(req); break;

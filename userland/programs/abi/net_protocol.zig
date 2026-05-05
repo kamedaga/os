@@ -6,17 +6,29 @@ pub const version: u16 = 1;
 pub const Opcode = enum(u16) {
     connect = 1,
     get_status = 2,
+    bind = 3,
+    send_to = 4,
+    recv_from = 5,
+    close = 6,
+    poll = 7,
 };
 
 pub const Status = enum(i32) {
     ok = 0,
     invalid = 2,
     not_connected = 4,
+    no_route = 5,
+    port_in_use = 6,
+    would_block = 7,
+    too_big = 8,
+    busy = 9,
 };
 
 pub const flag_link_up: u32 = 1 << 0;
 pub const flag_dhcp_bound: u32 = 1 << 1;
 pub const flag_gateway_arp: u32 = 1 << 2;
+pub const poll_readable: u64 = 1 << 0;
+pub const poll_writable: u64 = 1 << 2;
 
 pub const RequestHeader = extern struct {
     magic: u32 = request_magic,
@@ -60,6 +72,7 @@ pub const request_header_bytes = @sizeOf(RequestHeader);
 pub const response_header_bytes = @sizeOf(ResponseHeader);
 pub const request_payload_bytes = page_bytes - request_header_bytes;
 pub const response_payload_bytes = page_bytes - response_header_bytes;
+pub const udp_max_payload: usize = 1200;
 
 pub fn opcodeRaw(op: Opcode) u16 {
     return @intFromEnum(op);

@@ -26,6 +26,23 @@ pub const Error = error{
     InvalidResponse,
     Invalid,
     NotFound,
+    NoRoute,
+    PortInUse,
+    WouldBlock,
+    TooBig,
+    Busy,
+};
+
+pub const UdpBinding = struct {
+    handle: u64,
+    local_port: u16,
+    local_ipv4: u32,
+};
+
+pub const UdpDatagram = struct {
+    src_ipv4: u32,
+    src_port: u16,
+    bytes: usize,
 };
 
 pub const ConnectOptions = struct {
@@ -123,6 +140,45 @@ pub const Client = struct {
         return self.statusPayload().*;
     }
 
+    pub fn bindUdp(self: *Client, local_port: u16) Error!UdpBinding {
+        const seq = self.beginRequestArgs(.bind, local_port, 0, 0, 0, null);
+        const response = try self.finishRequestOk(seq, .bind);
+        return .{
+            .handle = response.arg0,
+            .local_port = @intCast(response.arg1 & 0xFFFF),
+            .local_ipv4 = @intCast(response.arg2 & 0xFFFF_FFFF),
+        };
+    }
+
+    pub fn sendTo(self: *Client, handle: u64, remote_ipv4: u32, remote_port: u16, payload: []const u8) Error!void {
+        if (payload.len > net_protocol.request_payload_bytes or payload.len > net_protocol.udp_max_payload) return error.TooBig;
+        const seq = self.beginRequestArgs(.send_to, handle, remote_ipv4, remote_port, payload.len, payload);
+        _ = try self.finishRequestOk(seq, .send_to);
+    }
+
+    pub fn recvFrom(self: *Client, handle: u64, out: []u8) Error!UdpDatagram {
+        const seq = self.beginRequestArgs(.recv_from, handle, 0, 0, out.len, null);
+        const response = try self.finishRequestOk(seq, .recv_from);
+        if (response.inline_bytes > out.len) return error.InvalidResponse;
+        copyVolatileBytes(out, self.responsePayload(), response.inline_bytes);
+        return .{
+            .src_ipv4 = @intCast(response.arg0 & 0xFFFF_FFFF),
+            .src_port = @intCast(response.arg1 & 0xFFFF),
+            .bytes = response.inline_bytes,
+        };
+    }
+
+    pub fn pollUdp(self: *Client, handle: u64) Error!u64 {
+        const seq = self.beginRequestArgs(.poll, handle, 0, 0, 0, null);
+        const response = try self.finishRequestOk(seq, .poll);
+        return response.arg0;
+    }
+
+    pub fn close(self: *Client, handle: u64) Error!void {
+        const seq = self.beginRequestArgs(.close, handle, 0, 0, 0, null);
+        _ = try self.finishRequestOk(seq, .close);
+    }
+
     fn requestHeader(self: *const Client) *volatile net_protocol.RequestHeader {
         return @ptrFromInt(self.request_va);
     }
@@ -135,22 +191,43 @@ pub const Client = struct {
         return @ptrFromInt(self.response_va + @sizeOf(net_protocol.ResponseHeader));
     }
 
+    fn requestPayload(self: *const Client) [*]volatile u8 {
+        return @ptrFromInt(self.request_va + @sizeOf(net_protocol.RequestHeader));
+    }
+
+    fn responsePayload(self: *const Client) [*]volatile u8 {
+        return @ptrFromInt(self.response_va + @sizeOf(net_protocol.ResponseHeader));
+    }
+
     fn clearMappedPages(self: *Client) void {
         clearPage(self.request_va);
         clearPage(self.response_va);
     }
 
     fn beginRequest(self: *Client, op: net_protocol.Opcode) u64 {
+        return self.beginRequestArgs(op, 0, 0, 0, 0, null);
+    }
+
+    fn beginRequestArgs(
+        self: *Client,
+        op: net_protocol.Opcode,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+        reserved0: u64,
+        payload: ?[]const u8,
+    ) u64 {
         self.clearMappedPages();
         const request = self.requestHeader();
         request.magic = net_protocol.request_magic;
         request.version = net_protocol.version;
         request.op = net_protocol.opcodeRaw(op);
         request.session_nonce = self.session_nonce;
-        request.arg0 = 0;
-        request.arg1 = 0;
-        request.arg2 = 0;
-        request.reserved0 = 0;
+        request.arg0 = arg0;
+        request.arg1 = arg1;
+        request.arg2 = arg2;
+        request.reserved0 = reserved0;
+        if (payload) |bytes| copyBytesToVolatile(self.requestPayload(), bytes);
         const seq = self.next_seq;
         self.next_seq += 1;
         compilerBarrier();
@@ -169,6 +246,11 @@ pub const Client = struct {
             .ok => response,
             .invalid => error.Invalid,
             .not_connected => error.EndpointNotFound,
+            .no_route => error.NoRoute,
+            .port_in_use => error.PortInUse,
+            .would_block => error.WouldBlock,
+            .too_big => error.TooBig,
+            .busy => error.Busy,
         };
     }
 
@@ -285,6 +367,16 @@ fn clearPage(base_va: u64) void {
     const ptr: [*]volatile u64 = @ptrFromInt(base_va);
     var i: usize = 0;
     while (i < 512) : (i += 1) ptr[i] = 0;
+}
+
+fn copyBytesToVolatile(dst: [*]volatile u8, src: []const u8) void {
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) dst[i] = src[i];
+}
+
+fn copyVolatileBytes(dst: []u8, src: [*]volatile u8, len: usize) void {
+    var i: usize = 0;
+    while (i < len) : (i += 1) dst[i] = src[i];
 }
 
 fn shareCap(paddr: u64, endpoint_id: u64) u64 {

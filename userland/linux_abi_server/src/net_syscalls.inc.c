@@ -1,0 +1,590 @@
+static u16 read_net_be16(const u8 *p) {
+    return (u16)(((u16)p[0] << 8) | p[1]);
+}
+
+static u16 read_net_le16(const u8 *p) {
+    return (u16)(((u16)p[1] << 8) | p[0]);
+}
+
+struct linux_pollfd {
+    i32 fd;
+    short events;
+    short revents;
+};
+
+static u32 read_net_be32(const u8 *p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+static void write_net_be16(u8 *p, u16 value) {
+    p[0] = (u8)(value >> 8);
+    p[1] = (u8)value;
+}
+
+static void write_net_be32(u8 *p, u32 value) {
+    p[0] = (u8)(value >> 24);
+    p[1] = (u8)(value >> 16);
+    p[2] = (u8)(value >> 8);
+    p[3] = (u8)value;
+}
+
+static void write_net_le16(u8 *p, u16 value) {
+    p[0] = (u8)value;
+    p[1] = (u8)(value >> 8);
+}
+
+static u64 make_net_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
+    u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x6e65742d73746174ULL;
+    return nonce == 0 ? 1 : nonce;
+}
+
+static int install_net_endpoint(void) {
+    if (g_net.endpoint_id == 0 || g_net.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_net.endpoint_id, g_net.process_slot) == SYSCALL_OK;
+}
+
+static int grant_net_response_page(void) {
+    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_net.response_paddr, g_net.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_net.response_paddr, g_net.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
+    return ret == SYSCALL_OK;
+}
+
+static int share_net_request_page(void) {
+    u64 ret = syscall2(SYSCALL_SHARE_CAP, g_net.request_paddr, g_net.endpoint_id);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_net.request_paddr, g_net.endpoint_id);
+    return ret == SYSCALL_OK;
+}
+
+static int signal_net(void) {
+    u64 ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_net.endpoint_id, 0);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_net.endpoint_id, 0);
+    return ret == SYSCALL_OK;
+}
+
+static int wait_net_response(u64 expected_seq, u16 expected_op, u64 poll_limit) {
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    for (u64 i = 0; poll_limit == 0 || i < poll_limit; i++) {
+        if (response->response_seq == expected_seq) {
+            return response->magic == NET_RESPONSE_MAGIC &&
+                response->version == NET_PROTOCOL_VERSION &&
+                response->op == expected_op;
+        }
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+    return 0;
+}
+
+static int connect_net_from_registry(void) {
+    struct service_entry entry;
+    if (!find_service(SERVICE_KIND_NET, &entry)) return 0;
+    g_net.endpoint_id = entry.endpoint_id;
+    g_net.process_slot = entry.process_slot;
+    g_net.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    g_net.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    if (g_net.request_paddr < 0x1000 || g_net.response_paddr < 0x1000) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, NET_REQUEST_VA, g_net.request_paddr, 1) != SYSCALL_OK) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, NET_RESPONSE_VA, g_net.response_paddr, 1) != SYSCALL_OK) return 0;
+    if (!grant_net_response_page()) return 0;
+    clear_page(NET_REQUEST_VA);
+    clear_page(NET_RESPONSE_VA);
+
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    g_net.session_nonce = make_net_nonce(g_net.request_paddr, g_net.response_paddr, g_net.endpoint_id, self_slot);
+    volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+    request->magic = NET_REQUEST_MAGIC;
+    request->version = NET_PROTOCOL_VERSION;
+    request->op = NET_OP_CONNECT;
+    request->session_nonce = g_net.session_nonce;
+    request->arg0 = g_net.response_paddr;
+    request->arg1 = self_slot;
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = 1;
+    if (!share_net_request_page()) return 0;
+    if (!wait_net_response(1, NET_OP_CONNECT, 8192)) return 0;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    if (response->status != NET_STATUS_OK) return 0;
+    g_net.next_seq = 2;
+    g_net.active = 1;
+    user_log("LinuxAbiServer: net connect ok\n");
+    return 1;
+}
+
+static int ensure_net_connected(void) {
+    if (g_net.active) return 1;
+    return connect_net_from_registry();
+}
+
+static int net_begin_request(u16 op, u64 arg0, u64 arg1, u64 arg2, u64 reserved0, const u8 *payload, u32 payload_len, u64 *seq_out) {
+    if (!ensure_net_connected()) return 0;
+    if (payload_len > NET_REQUEST_PAYLOAD_BYTES) return 0;
+    clear_page(NET_REQUEST_VA);
+    clear_page(NET_RESPONSE_VA);
+    volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+    const u64 seq = g_net.next_seq++;
+    request->magic = NET_REQUEST_MAGIC;
+    request->version = NET_PROTOCOL_VERSION;
+    request->op = op;
+    request->session_nonce = g_net.session_nonce;
+    request->arg0 = arg0;
+    request->arg1 = arg1;
+    request->arg2 = arg2;
+    request->reserved0 = reserved0;
+    if (payload_len != 0 && payload != 0) {
+        volatile u8 *dst = (volatile u8 *)(NET_REQUEST_VA + NET_REQUEST_HEADER_BYTES);
+        for (u32 i = 0; i < payload_len; i++) dst[i] = payload[i];
+    }
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    if (!signal_net()) return 0;
+    *seq_out = seq;
+    return 1;
+}
+
+static u64 net_status_to_errno(i32 status) {
+    if (status == NET_STATUS_INVALID) return errno_inval();
+    if (status == NET_STATUS_NOT_CONNECTED) return errno_netunreach();
+    if (status == NET_STATUS_NO_ROUTE) return errno_netunreach();
+    if (status == NET_STATUS_PORT_IN_USE) return errno_addrinuse();
+    if (status == NET_STATUS_WOULD_BLOCK) return errno_again();
+    if (status == NET_STATUS_TOO_BIG) return errno_msgsize();
+    if (status == NET_STATUS_BUSY) return errno_again();
+    return errno_io();
+}
+
+static int net_bind_udp(u16 local_port, u64 *handle_out, u16 *actual_port_out, u32 *local_ip_out) {
+    u64 seq = 0;
+    if (!net_begin_request(NET_OP_BIND, local_port, 0, 0, 0, 0, 0, &seq)) return 0;
+    if (!wait_net_response(seq, NET_OP_BIND, 8192)) return 0;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    if (response->status != NET_STATUS_OK) return 0;
+    *handle_out = response->arg0;
+    if (actual_port_out != 0) *actual_port_out = (u16)response->arg1;
+    if (local_ip_out != 0) *local_ip_out = (u32)response->arg2;
+    return *handle_out != 0;
+}
+
+static u64 net_send_udp(u64 handle, u32 remote_ip, u16 remote_port, const u8 *payload, u32 payload_len) {
+    u64 seq = 0;
+    if (!net_begin_request(NET_OP_SEND_TO, handle, remote_ip, remote_port, payload_len, payload, payload_len, &seq)) return errno_io();
+    if (!wait_net_response(seq, NET_OP_SEND_TO, 8192)) return errno_timedout();
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    return response->status == NET_STATUS_OK ? (u64)payload_len : net_status_to_errno(response->status);
+}
+
+static u64 net_recv_udp(u64 handle, u8 *out, u32 out_cap, u32 *src_ip, u16 *src_port) {
+    u64 seq = 0;
+    if (!net_begin_request(NET_OP_RECV_FROM, handle, 0, 0, out_cap, 0, 0, &seq)) return errno_io();
+    if (!wait_net_response(seq, NET_OP_RECV_FROM, 8192)) return errno_timedout();
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    if (response->status != NET_STATUS_OK) return net_status_to_errno(response->status);
+    if (response->inline_bytes > out_cap || response->inline_bytes > NET_RESPONSE_PAYLOAD_BYTES) return errno_io();
+    volatile u8 *src = (volatile u8 *)(NET_RESPONSE_VA + NET_RESPONSE_HEADER_BYTES);
+    for (u32 i = 0; i < response->inline_bytes; i++) out[i] = src[i];
+    *src_ip = (u32)response->arg0;
+    *src_port = (u16)response->arg1;
+    return response->inline_bytes;
+}
+
+static u64 net_poll_udp(u64 handle) {
+    u64 seq = 0;
+    if (!net_begin_request(NET_OP_POLL, handle, 0, 0, 0, 0, 0, &seq)) return errno_io();
+    if (!wait_net_response(seq, NET_OP_POLL, 8192)) return errno_timedout();
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    return response->status == NET_STATUS_OK ? response->arg0 : net_status_to_errno(response->status);
+}
+
+static void net_close_udp(u64 handle) {
+    if (handle == 0 || !g_net.active) return;
+    u64 seq = 0;
+    if (!net_begin_request(NET_OP_CLOSE, handle, 0, 0, 0, 0, 0, &seq)) return;
+    (void)wait_net_response(seq, NET_OP_CLOSE, 8192);
+}
+
+static struct ipc_message handle_socket(const struct trap_request *req) {
+    const u64 domain = req->args[0];
+    const u64 type = req->args[1];
+    const u64 protocol = req->args[2];
+    if (domain != AF_INET) return reply(errno_afnosupport(), 0);
+    if ((type & SOCK_TYPE_MASK) != SOCK_DGRAM) return reply(errno_socktnosupport(), 0);
+    if (protocol != 0 && protocol != IPPROTO_UDP) return reply(errno_protonosupport(), 0);
+    if (!ensure_net_connected()) return reply(errno_netunreach(), 0);
+    const int fd = alloc_fd();
+    if (fd < 0) return reply(errno_busy(), 0);
+    g_fds[(u64)fd].kind = FD_SOCKET;
+    g_fds[(u64)fd].token = 0;
+    g_fds[(u64)fd].offset = 0;
+    g_fds[(u64)fd].size = 0;
+    g_fds[(u64)fd].mode_bits = 0;
+    g_fds[(u64)fd].object_kind = FS_OBJECT_FILE;
+    g_fds[(u64)fd].pipe_id = 0;
+    g_fds[(u64)fd].socket_connected = 0;
+    g_fds[(u64)fd].reserved_fd0 = 0;
+    g_fds[(u64)fd].socket_local_port = 0;
+    g_fds[(u64)fd].socket_remote_port = 0;
+    g_fds[(u64)fd].socket_local_ip = 0;
+    g_fds[(u64)fd].socket_remote_ip = 0;
+    g_fds[(u64)fd].path_len = 0;
+    g_fds[(u64)fd].path[0] = 0;
+    sync_fd_to_thread_group((u64)fd);
+    return reply((u64)fd, 0);
+}
+
+static int read_sockaddr_in(u64 addr_va, u64 addr_len, u32 *ip_out, u16 *port_out) {
+    if (addr_va == 0 || addr_len < 16) return 0;
+    u8 raw[16];
+    if (copy_from_target(addr_va, raw, sizeof(raw)) != sizeof(raw)) return 0;
+    if (read_net_le16(raw) != AF_INET) return 0;
+    *port_out = read_net_be16(raw + 2);
+    *ip_out = read_net_be32(raw + 4);
+    return 1;
+}
+
+static int write_sockaddr_in_to_target(u64 addr_va, u64 addrlen_va, u32 ip, u16 port) {
+    if (addr_va == 0 || addrlen_va == 0) return 0;
+    u32 addrlen = 0;
+    if (copy_from_target(addrlen_va, &addrlen, sizeof(addrlen)) != sizeof(addrlen)) return 0;
+    if (addrlen < 16) return 0;
+    u8 raw[16];
+    for (u64 i = 0; i < sizeof(raw); i++) raw[i] = 0;
+    write_net_le16(raw, AF_INET);
+    write_net_be16(raw + 2, port);
+    write_net_be32(raw + 4, ip);
+    addrlen = 16;
+    return copy_to_target(addr_va, raw, sizeof(raw)) == sizeof(raw) &&
+        copy_to_target(addrlen_va, &addrlen, sizeof(addrlen)) == sizeof(addrlen);
+}
+
+static int ensure_socket_bound(u64 fd) {
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return 0;
+    if (g_fds[fd].token != 0) return 1;
+    u64 handle = 0;
+    u16 local_port = 0;
+    u32 local_ip = 0;
+    if (!net_bind_udp(0, &handle, &local_port, &local_ip)) return 0;
+    g_fds[fd].token = handle;
+    g_fds[fd].socket_local_port = local_port;
+    g_fds[fd].socket_local_ip = local_ip;
+    sync_fd_to_thread_group(fd);
+    return 1;
+}
+
+static struct ipc_message handle_bind_socket(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    u32 ip = 0;
+    u16 port = 0;
+    if (!read_sockaddr_in(req->args[1], req->args[2], &ip, &port)) return reply(errno_inval(), 0);
+    (void)ip;
+    if (g_fds[fd].token != 0) return reply(errno_inval(), 0);
+    u64 handle = 0;
+    u16 local_port = 0;
+    u32 local_ip = 0;
+    if (!net_bind_udp(port, &handle, &local_port, &local_ip)) return reply(errno_addrinuse(), 0);
+    g_fds[fd].token = handle;
+    g_fds[fd].socket_local_port = local_port;
+    g_fds[fd].socket_local_ip = local_ip;
+    sync_fd_to_thread_group(fd);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_connect_socket(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    u32 remote_ip = 0;
+    u16 remote_port = 0;
+    if (!read_sockaddr_in(req->args[1], req->args[2], &remote_ip, &remote_port)) return reply(errno_inval(), 0);
+    if (remote_ip == 0 || remote_port == 0) return reply(errno_inval(), 0);
+    if (!ensure_socket_bound(fd)) return reply(errno_busy(), 0);
+    g_fds[fd].socket_connected = 1;
+    g_fds[fd].socket_remote_ip = remote_ip;
+    g_fds[fd].socket_remote_port = remote_port;
+    sync_fd_to_thread_group(fd);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_sendto(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const u64 src_va = req->args[1];
+    const u64 len = req->args[2];
+    const u64 addr_va = req->args[4];
+    const u64 addr_len = req->args[5];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (len > NET_UDP_MAX_PAYLOAD) return reply(errno_msgsize(), 0);
+    u32 remote_ip = 0;
+    u16 remote_port = 0;
+    if (addr_va != 0) {
+        if (!read_sockaddr_in(addr_va, addr_len, &remote_ip, &remote_port)) return reply(errno_inval(), 0);
+    } else {
+        if (!g_fds[fd].socket_connected) return reply(errno_destaddrreq(), 0);
+        remote_ip = g_fds[fd].socket_remote_ip;
+        remote_port = g_fds[fd].socket_remote_port;
+    }
+    if (!ensure_socket_bound(fd)) return reply(errno_busy(), 0);
+    u8 payload[NET_UDP_MAX_PAYLOAD];
+    if (len != 0 && copy_from_target(src_va, payload, len) != len) return reply(errno_fault(), 0);
+    return reply(net_send_udp(g_fds[fd].token, remote_ip, remote_port, payload, (u32)len), 0);
+}
+
+static struct ipc_message handle_recvfrom(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const u64 dst_va = req->args[1];
+    const u64 len = req->args[2];
+    const u64 addr_va = req->args[4];
+    const u64 addrlen_va = req->args[5];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (!ensure_socket_bound(fd)) return reply(errno_busy(), 0);
+    u8 payload[NET_UDP_MAX_PAYLOAD];
+    const u32 cap = (u32)min_u64(len, NET_UDP_MAX_PAYLOAD);
+    u32 src_ip = 0;
+    u16 src_port = 0;
+    u64 result = errno_again();
+    for (u64 i = 0; i < 8192; i++) {
+        result = net_recv_udp(g_fds[fd].token, payload, cap, &src_ip, &src_port);
+        if ((i64)result >= 0 || result != errno_again()) break;
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+    if ((i64)result < 0) return reply(result, 0);
+    if (result != 0 && copy_to_target(dst_va, payload, result) != result) return reply(errno_fault(), 0);
+    if (addr_va != 0) {
+        u8 raw[16];
+        for (u64 i = 0; i < sizeof(raw); i++) raw[i] = 0;
+        write_net_le16(raw, AF_INET);
+        write_net_be16(raw + 2, src_port);
+        write_net_be32(raw + 4, src_ip);
+        if (copy_to_target(addr_va, raw, sizeof(raw)) != sizeof(raw)) return reply(errno_fault(), 0);
+    }
+    if (addrlen_va != 0) {
+        u32 addrlen = 16;
+        if (copy_to_target(addrlen_va, &addrlen, sizeof(addrlen)) != sizeof(addrlen)) return reply(errno_fault(), 0);
+    }
+    return reply(result, 0);
+}
+
+static u64 socket_send_payload(u64 fd, const u8 *payload, u64 len) {
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return errno_badf();
+    if (!g_fds[fd].socket_connected) return errno_destaddrreq();
+    if (len > NET_UDP_MAX_PAYLOAD) return errno_msgsize();
+    if (!ensure_socket_bound(fd)) return errno_busy();
+    return net_send_udp(g_fds[fd].token, g_fds[fd].socket_remote_ip, g_fds[fd].socket_remote_port, payload, (u32)len);
+}
+
+static u64 socket_write_from_target(u64 fd, u64 src_va, u64 len) {
+    u8 payload[NET_UDP_MAX_PAYLOAD];
+    if (len > NET_UDP_MAX_PAYLOAD) return errno_msgsize();
+    if (len != 0 && copy_from_target(src_va, payload, len) != len) return errno_fault();
+    return socket_send_payload(fd, payload, len);
+}
+
+static u64 socket_read_to_target(u64 fd, u64 dst_va, u64 len) {
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return errno_badf();
+    if (!ensure_socket_bound(fd)) return errno_busy();
+    u8 payload[NET_UDP_MAX_PAYLOAD];
+    const u32 cap = (u32)min_u64(len, NET_UDP_MAX_PAYLOAD);
+    u32 src_ip = 0;
+    u16 src_port = 0;
+    u64 result = errno_again();
+    for (u64 i = 0; i < 8192; i++) {
+        result = net_recv_udp(g_fds[fd].token, payload, cap, &src_ip, &src_port);
+        if ((i64)result >= 0 || result != errno_again()) break;
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+    if ((i64)result < 0) return result;
+    if (result != 0 && copy_to_target(dst_va, payload, result) != result) return errno_fault();
+    return result;
+}
+
+static struct ipc_message handle_getsockname_socket(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (!ensure_socket_bound(fd)) return reply(errno_busy(), 0);
+    if (!write_sockaddr_in_to_target(req->args[1], req->args[2], g_fds[fd].socket_local_ip, g_fds[fd].socket_local_port)) return reply(errno_fault(), 0);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_getpeername_socket(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (!g_fds[fd].socket_connected) return reply(errno_notconn(), 0);
+    if (!write_sockaddr_in_to_target(req->args[1], req->args[2], g_fds[fd].socket_remote_ip, g_fds[fd].socket_remote_port)) return reply(errno_fault(), 0);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_setsockopt_socket(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_getsockopt_socket(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const u64 level = req->args[1];
+    const u64 optname = req->args[2];
+    const u64 optval_va = req->args[3];
+    const u64 optlen_va = req->args[4];
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (level == SOL_SOCKET && optname == SO_ERROR && optval_va != 0 && optlen_va != 0) {
+        u32 optlen = 0;
+        if (copy_from_target(optlen_va, &optlen, sizeof(optlen)) != sizeof(optlen)) return reply(errno_fault(), 0);
+        if (optlen < sizeof(i32)) return reply(errno_inval(), 0);
+        i32 value = 0;
+        optlen = sizeof(i32);
+        if (copy_to_target(optval_va, &value, sizeof(value)) != sizeof(value) ||
+            copy_to_target(optlen_va, &optlen, sizeof(optlen)) != sizeof(optlen)) return reply(errno_fault(), 0);
+        return reply(0, 0);
+    }
+    return reply(0, 0);
+}
+
+static u16 fd_poll_revents(u64 fd, u16 requested) {
+    const u16 read_mask = (u16)(POLLIN | POLLRDNORM);
+    const u16 write_mask = (u16)(POLLOUT | POLLWRNORM);
+    if (!fd_valid(fd)) return POLLNVAL;
+    if (requested == 0) return 0;
+
+    struct fd_entry *entry = &g_fds[fd];
+    if (entry->kind == FD_SOCKET) {
+        u64 events = NET_POLL_WRITABLE;
+        if (entry->token != 0) events = net_poll_udp(entry->token);
+        if ((i64)events < 0) return POLLERR;
+        u16 revents = 0;
+        if ((events & NET_POLL_READABLE) != 0) revents |= (u16)(requested & read_mask);
+        if ((events & NET_POLL_WRITABLE) != 0) revents |= (u16)(requested & write_mask);
+        return revents;
+    }
+
+    if (entry->kind == FD_PIPE_READ) {
+        const u8 pipe_id = entry->pipe_id;
+        if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return POLLNVAL;
+        if (g_pipes[pipe_id].len != 0 || (g_pipes[pipe_id].write_refs == 0 && !pipe_has_live_writer(pipe_id))) return (u16)(requested & read_mask);
+        return 0;
+    }
+
+    if (entry->kind == FD_PIPE_WRITE) {
+        const u8 pipe_id = entry->pipe_id;
+        if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return POLLNVAL;
+        if (g_pipes[pipe_id].read_refs == 0) return POLLERR;
+        return g_pipes[pipe_id].len < PIPE_BUFFER_BYTES ? (u16)(requested & write_mask) : 0;
+    }
+
+    if (entry->kind == FD_FILE || entry->kind == FD_DIR) return (u16)(requested & (read_mask | write_mask));
+    if (entry->kind == FD_STDIO || entry->kind == FD_TTY) return (u16)(requested & (read_mask | write_mask));
+    return POLLNVAL;
+}
+
+static u64 poll_wait_limit(const struct trap_request *req, int ppoll, int *immediate, int *fault) {
+    *immediate = 0;
+    *fault = 0;
+    if (ppoll) {
+        const u64 timespec_va = req->args[2];
+        if (timespec_va == 0) return 8192;
+        i64 pair[2];
+        if (copy_from_target(timespec_va, pair, sizeof(pair)) != sizeof(pair)) { *fault = 1; return 0; }
+        if (pair[0] == 0 && pair[1] == 0) { *immediate = 1; return 0; }
+        return 8192;
+    }
+    const i32 timeout_ms = (i32)(u32)req->args[2];
+    if (timeout_ms == 0) { *immediate = 1; return 0; }
+    if (timeout_ms < 0) return 8192;
+    u64 attempts = (u64)(u32)timeout_ms * 4 + 1;
+    if (attempts > 8192) attempts = 8192;
+    return attempts;
+}
+
+static i64 scan_pollfds(u64 fds_va, u64 nfds) {
+    if (nfds > 64) return (i64)errno_inval();
+    i64 ready = 0;
+    for (u64 i = 0; i < nfds; i++) {
+        struct linux_pollfd pfd;
+        const u64 pfd_va = fds_va + i * sizeof(pfd);
+        if (copy_from_target(pfd_va, &pfd, sizeof(pfd)) != sizeof(pfd)) return (i64)errno_fault();
+        pfd.revents = 0;
+        if (pfd.fd >= 0) {
+            pfd.revents = (short)fd_poll_revents((u64)(u32)pfd.fd, (u16)pfd.events);
+            if (pfd.revents != 0) ready++;
+        }
+        if (copy_to_target(pfd_va, &pfd, sizeof(pfd)) != sizeof(pfd)) return (i64)errno_fault();
+    }
+    return ready;
+}
+
+static struct ipc_message handle_poll(const struct trap_request *req, int ppoll) {
+    const u64 fds_va = req->args[0];
+    const u64 nfds = req->args[1];
+    if (nfds != 0 && fds_va == 0) return reply(errno_fault(), 0);
+    int immediate = 0;
+    int fault = 0;
+    const u64 wait_limit = poll_wait_limit(req, ppoll, &immediate, &fault);
+    if (fault) return reply(errno_fault(), 0);
+    for (u64 attempt = 0;; attempt++) {
+        const i64 ready = scan_pollfds(fds_va, nfds);
+        if (ready < 0) return reply((u64)ready, 0);
+        if (ready != 0 || immediate || attempt >= wait_limit) return reply((u64)ready, 0);
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+}
+
+static int select_timeout_is_zero(u64 timeout_va, int *fault) {
+    *fault = 0;
+    if (timeout_va == 0) return 0;
+    i64 pair[2];
+    if (copy_from_target(timeout_va, pair, sizeof(pair)) != sizeof(pair)) { *fault = 1; return 1; }
+    return pair[0] == 0 && pair[1] == 0;
+}
+
+static i64 scan_select_sets(u64 nfds, u64 readfds_va, u64 writefds_va, u64 exceptfds_va, u64 *read_out, u64 *write_out, u64 *except_out) {
+    if (nfds > 32) return (i64)errno_inval();
+    u64 read_in = 0;
+    u64 write_in = 0;
+    u64 except_in = 0;
+    if (readfds_va != 0 && copy_from_target(readfds_va, &read_in, sizeof(read_in)) != sizeof(read_in)) return (i64)errno_fault();
+    if (writefds_va != 0 && copy_from_target(writefds_va, &write_in, sizeof(write_in)) != sizeof(write_in)) return (i64)errno_fault();
+    if (exceptfds_va != 0 && copy_from_target(exceptfds_va, &except_in, sizeof(except_in)) != sizeof(except_in)) return (i64)errno_fault();
+    (void)except_in;
+
+    *read_out = 0;
+    *write_out = 0;
+    *except_out = 0;
+    i64 ready = 0;
+    for (u64 fd = 0; fd < nfds; fd++) {
+        const u64 bit = 1ULL << fd;
+        const int want_read = (read_in & bit) != 0;
+        const int want_write = (write_in & bit) != 0;
+        if (!want_read && !want_write) continue;
+        if (!fd_valid(fd)) return (i64)errno_badf();
+        const u16 requested = (u16)((want_read ? (POLLIN | POLLRDNORM) : 0) | (want_write ? (POLLOUT | POLLWRNORM) : 0));
+        const u16 revents = fd_poll_revents(fd, requested);
+        if (want_read && (revents & (POLLIN | POLLRDNORM)) != 0) { *read_out |= bit; ready++; }
+        if (want_write && (revents & (POLLOUT | POLLWRNORM)) != 0) { *write_out |= bit; ready++; }
+    }
+    return ready;
+}
+
+static struct ipc_message handle_select(const struct trap_request *req, int pselect) {
+    const u64 nfds = req->args[0];
+    const u64 readfds_va = req->args[1];
+    const u64 writefds_va = req->args[2];
+    const u64 exceptfds_va = req->args[3];
+    const u64 timeout_va = req->args[4];
+    (void)pselect;
+    int fault = 0;
+    const int immediate = select_timeout_is_zero(timeout_va, &fault);
+    if (fault) return reply(errno_fault(), 0);
+    const u64 wait_limit = timeout_va == 0 ? 8192 : (immediate ? 0 : 8192);
+    for (u64 attempt = 0;; attempt++) {
+        u64 read_out = 0;
+        u64 write_out = 0;
+        u64 except_out = 0;
+        const i64 ready = scan_select_sets(nfds, readfds_va, writefds_va, exceptfds_va, &read_out, &write_out, &except_out);
+        if (ready < 0) return reply((u64)ready, 0);
+        if (ready != 0 || immediate || attempt >= wait_limit) {
+            if (readfds_va != 0 && copy_to_target(readfds_va, &read_out, sizeof(read_out)) != sizeof(read_out)) return reply(errno_fault(), 0);
+            if (writefds_va != 0 && copy_to_target(writefds_va, &write_out, sizeof(write_out)) != sizeof(write_out)) return reply(errno_fault(), 0);
+            if (exceptfds_va != 0 && copy_to_target(exceptfds_va, &except_out, sizeof(except_out)) != sizeof(except_out)) return reply(errno_fault(), 0);
+            return reply((u64)ready, 0);
+        }
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+}

@@ -99,14 +99,35 @@ enum {
     NET_PROTOCOL_VERSION = 1,
     NET_OP_CONNECT = 1,
     NET_OP_GET_STATUS = 2,
+    NET_OP_BIND = 3,
+    NET_OP_SEND_TO = 4,
+    NET_OP_RECV_FROM = 5,
+    NET_OP_CLOSE = 6,
+    NET_OP_POLL = 7,
     NET_STATUS_OK = 0,
     NET_STATUS_INVALID = 2,
     NET_STATUS_NOT_CONNECTED = 4,
+    NET_STATUS_NO_ROUTE = 5,
+    NET_STATUS_PORT_IN_USE = 6,
+    NET_STATUS_WOULD_BLOCK = 7,
+    NET_STATUS_TOO_BIG = 8,
+    NET_STATUS_BUSY = 9,
     NET_REPLY_ENDPOINT_ID = 0xEA,
     CAP_TRANSFER_ID_MIN = 0x1000,
     NET_FLAG_LINK_UP = 1 << 0,
     NET_FLAG_DHCP_BOUND = 1 << 1,
     NET_FLAG_GATEWAY_ARP = 1 << 2,
+    NET_POLL_READABLE = 1 << 0,
+    NET_POLL_WRITABLE = 1 << 2,
+    NET_REQUEST_HEADER_BYTES = 56,
+    NET_RESPONSE_HEADER_BYTES = 56,
+    NET_PAYLOAD_BYTES = 4096 - NET_REQUEST_HEADER_BYTES,
+    NET_UDP_MAX_PAYLOAD = 1200,
+    NET_UDP_BINDINGS = 4,
+    NET_UDP_PENDING = 4,
+    NET_SESSION_MAX = 4,
+    NET_UDP_HANDLE_TAG = 0x5544500000000000ULL,
+    NET_EPHEMERAL_PORT_BASE = 49152,
 
     DESC_FLAG_NEXT = 1 << 0,
     DESC_FLAG_WRITE = 1 << 1,
@@ -205,8 +226,31 @@ struct net_session {
     u64 last_completed_seq;
 };
 
+struct udp_packet {
+    u8 used;
+    u8 reserved0[7];
+    u32 src_ip;
+    u16 src_port;
+    u16 dst_port;
+    u32 len;
+    u8 bytes[NET_UDP_MAX_PAYLOAD];
+};
+
+struct udp_binding {
+    u8 active;
+    u8 reserved0[7];
+    u64 handle;
+    u16 local_port;
+    u16 head;
+    u16 count;
+    u16 reserved1;
+    struct udp_packet packets[NET_UDP_PENDING];
+};
+
 static struct boot_state g_boot;
-static struct net_session g_session;
+static struct net_session g_sessions[NET_SESSION_MAX];
+static struct net_session *g_current_session;
+static struct udp_binding g_udp_bindings[NET_UDP_BINDINGS];
 static struct queue_state g_rx_queue = { RX_QUEUE_INDEX, 0, 0, RX_QUEUE_PAGE_VA, 0, 0, 0 };
 static struct queue_state g_tx_queue = { TX_QUEUE_INDEX, 0, 0, TX_QUEUE_PAGE_VA, 0, 0, 0 };
 static u64 g_common_base;
@@ -218,6 +262,7 @@ static u64 g_rx_dma_tokens[RX_BUFFER_COUNT];
 static u64 g_tx_buffer_paddr;
 static u64 g_tx_dma_token;
 static u8 g_mac[6];
+static u8 g_gateway_mac[6];
 static u64 g_rx_packets;
 static u32 g_dhcp_xid = 0x50414348;
 static u32 g_ipv4_addr;
@@ -230,9 +275,11 @@ static int g_dhcp_request_sent;
 static int g_dhcp_configured;
 static int g_arp_sent;
 static int g_arp_reply_seen;
+static int g_gateway_mac_ready;
 static int g_tx_complete_logged;
 static int g_tx_in_flight;
 static u64 g_tx_completions;
+static u16 g_next_ephemeral_port = NET_EPHEMERAL_PORT_BASE;
 
 void *memset(void *dst, int value, u64 n) {
     u8 *d = (u8 *)dst;
@@ -603,7 +650,7 @@ static void write_net_response(u16 op, u64 seq, int status, u32 inline_bytes, u6
     response->reserved0 = 0;
     __asm__ volatile("" ::: "memory");
     response->response_seq = seq;
-    if (g_session.reply_endpoint_id != 0) (void)signal_endpoint(g_session.reply_endpoint_id);
+    if (g_current_session != 0 && g_current_session->reply_endpoint_id != 0) (void)signal_endpoint(g_current_session->reply_endpoint_id);
 }
 
 static void write_net_status_payload(void) {
@@ -620,6 +667,122 @@ static void write_net_status_payload(void) {
         (g_arp_reply_seen ? NET_FLAG_GATEWAY_ARP : 0);
     payload->rx_packets = g_rx_packets;
     payload->tx_completions = g_tx_completions;
+}
+
+static const u8 *net_request_payload(void) {
+    return (const u8 *)(NET_REQUEST_VA + sizeof(struct net_request_header));
+}
+
+static u8 *net_response_payload(void) {
+    return (u8 *)(NET_RESPONSE_VA + sizeof(struct net_response_header));
+}
+
+static int udp_handle_index(u64 handle, u64 *index_out) {
+    if ((handle & 0xFFFFFFFF00000000ULL) != NET_UDP_HANDLE_TAG) return 0;
+    const u64 index = handle & 0xFFFF;
+    if (index == 0 || index > NET_UDP_BINDINGS) return 0;
+    *index_out = index - 1;
+    return 1;
+}
+
+static struct udp_binding *find_udp_binding_by_handle(u64 handle) {
+    u64 index = 0;
+    if (!udp_handle_index(handle, &index)) return 0;
+    struct udp_binding *binding = &g_udp_bindings[index];
+    if (!binding->active || binding->handle != handle) return 0;
+    return binding;
+}
+
+static struct udp_binding *find_udp_binding_by_port(u16 port) {
+    for (u64 i = 0; i < NET_UDP_BINDINGS; i++) {
+        if (g_udp_bindings[i].active && g_udp_bindings[i].local_port == port) return &g_udp_bindings[i];
+    }
+    return 0;
+}
+
+static int udp_port_in_use(u16 port) {
+    return find_udp_binding_by_port(port) != 0;
+}
+
+static u16 allocate_ephemeral_port(void) {
+    for (u32 attempts = 0; attempts < 16384; attempts++) {
+        u16 port = g_next_ephemeral_port++;
+        if (g_next_ephemeral_port < NET_EPHEMERAL_PORT_BASE) g_next_ephemeral_port = NET_EPHEMERAL_PORT_BASE;
+        if (!udp_port_in_use(port)) return port;
+    }
+    return 0;
+}
+
+static struct udp_binding *alloc_udp_binding(u16 local_port) {
+    if (local_port == 0) local_port = allocate_ephemeral_port();
+    if (local_port == 0 || udp_port_in_use(local_port)) return 0;
+
+    for (u64 i = 0; i < NET_UDP_BINDINGS; i++) {
+        struct udp_binding *binding = &g_udp_bindings[i];
+        if (binding->active) continue;
+        memset(binding, 0, sizeof(*binding));
+        binding->active = 1;
+        binding->local_port = local_port;
+        binding->handle = NET_UDP_HANDLE_TAG |
+            (((g_rx_packets + g_tx_completions + (u64)local_port) & 0xFFFF) << 16) |
+            (i + 1);
+        return binding;
+    }
+    return 0;
+}
+
+static int close_udp_binding(u64 handle) {
+    struct udp_binding *binding = find_udp_binding_by_handle(handle);
+    if (binding == 0) return 0;
+    memset(binding, 0, sizeof(*binding));
+    return 1;
+}
+
+static int enqueue_udp_packet(u32 src_ip, u16 src_port, u16 dst_port, const u8 *payload, u32 len) {
+    struct udp_binding *binding = find_udp_binding_by_port(dst_port);
+    if (binding == 0 || len > NET_UDP_MAX_PAYLOAD) return 0;
+    if (binding->count >= NET_UDP_PENDING) return 0;
+
+    const u16 slot = (u16)((binding->head + binding->count) % NET_UDP_PENDING);
+    struct udp_packet *packet = &binding->packets[slot];
+    memset(packet, 0, sizeof(*packet));
+    packet->used = 1;
+    packet->src_ip = src_ip;
+    packet->src_port = src_port;
+    packet->dst_port = dst_port;
+    packet->len = len;
+    memcpy(packet->bytes, payload, len);
+    binding->count++;
+    return 1;
+}
+
+static int dequeue_udp_packet(u64 handle, u8 *out, u32 out_cap, u32 *out_len, u32 *src_ip, u16 *src_port) {
+    struct udp_binding *binding = find_udp_binding_by_handle(handle);
+    if (binding == 0) return NET_STATUS_INVALID;
+    if (binding->count == 0) return NET_STATUS_WOULD_BLOCK;
+
+    struct udp_packet *packet = &binding->packets[binding->head];
+    const u32 copy_len = packet->len < out_cap ? packet->len : out_cap;
+    memcpy(out, packet->bytes, copy_len);
+    *out_len = copy_len;
+    *src_ip = packet->src_ip;
+    *src_port = packet->src_port;
+    memset(packet, 0, sizeof(*packet));
+    binding->head = (u16)((binding->head + 1) % NET_UDP_PENDING);
+    binding->count--;
+    return NET_STATUS_OK;
+}
+
+static int poll_udp_binding(u64 handle, u64 *events_out) {
+    struct udp_binding *binding = find_udp_binding_by_handle(handle);
+    if (binding == 0) return NET_STATUS_INVALID;
+    u64 events = 0;
+    if (binding->count != 0) events |= NET_POLL_READABLE;
+    if (g_dhcp_configured && g_ipv4_addr != 0 && g_gateway_addr != 0 && g_gateway_mac_ready && !g_tx_in_flight) {
+        events |= NET_POLL_WRITABLE;
+    }
+    *events_out = events;
+    return NET_STATUS_OK;
 }
 
 static int parse_boot_state(void) {
@@ -761,6 +924,52 @@ static int send_packet(const u8 *frame, u32 frame_len) {
     mmio_write_u16(g_tx_queue.notify_addr, g_tx_queue.index);
     g_tx_in_flight = 1;
     return 1;
+}
+
+static int send_arp_request(u32 source_ip, u32 target_ip);
+
+static int send_ipv4_udp(u64 handle, u32 remote_ip, u16 remote_port, const u8 *payload, u32 payload_len) {
+    struct udp_binding *binding = find_udp_binding_by_handle(handle);
+    if (binding == 0 || remote_ip == 0 || remote_port == 0) return NET_STATUS_INVALID;
+    if (payload_len > NET_UDP_MAX_PAYLOAD || payload_len > NET_PAYLOAD_BYTES) return NET_STATUS_TOO_BIG;
+    if (!g_dhcp_configured || g_ipv4_addr == 0 || g_gateway_addr == 0) return NET_STATUS_NO_ROUTE;
+    if (!g_gateway_mac_ready) {
+        if (!g_tx_in_flight) (void)send_arp_request(g_ipv4_addr, g_gateway_addr);
+        return NET_STATUS_NO_ROUTE;
+    }
+    if (g_tx_in_flight) return NET_STATUS_BUSY;
+
+    u8 frame[ETH_HDR_BYTES + 20 + 8 + NET_UDP_MAX_PAYLOAD];
+    memset(frame, 0, sizeof(frame));
+    memcpy(frame + 0, g_gateway_mac, 6);
+    memcpy(frame + 6, g_mac, 6);
+    write_be16(frame + 12, ETHERTYPE_IPV4);
+
+    u8 *ip = frame + ETH_HDR_BYTES;
+    u8 *udp = ip + 20;
+    const u16 udp_len = (u16)(8 + payload_len);
+    const u16 ip_len = (u16)(20 + udp_len);
+    const u16 frame_len = (u16)(ETH_HDR_BYTES + ip_len);
+
+    ip[0] = 0x45;
+    ip[1] = 0;
+    write_be16(ip + 2, ip_len);
+    write_be16(ip + 4, (u16)(3 + (g_tx_completions & 0x7FFF)));
+    write_be16(ip + 6, 0);
+    ip[8] = 64;
+    ip[9] = IP_PROTO_UDP;
+    write_be32(ip + 12, g_ipv4_addr);
+    write_be32(ip + 16, remote_ip);
+    write_be16(ip + 10, ipv4_checksum(ip, 20));
+
+    write_be16(udp + 0, binding->local_port);
+    write_be16(udp + 2, remote_port);
+    write_be16(udp + 4, udp_len);
+    write_be16(udp + 6, 0);
+    memcpy(udp + 8, payload, payload_len);
+    write_be16(udp + 6, udp_ipv4_checksum(g_ipv4_addr, remote_ip, udp, udp_len));
+
+    return send_packet(frame, frame_len) ? NET_STATUS_OK : NET_STATUS_BUSY;
 }
 
 static int send_dhcp_discover(void) {
@@ -1090,7 +1299,15 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
     }
     if (src_port == DHCP_SERVER_PORT && dst_port == DHCP_CLIENT_PORT) {
         parse_dhcp_payload(udp + 8, (u32)udp_len - 8);
+        return;
     }
+    (void)enqueue_udp_packet(
+        read_be32(ip + 12),
+        src_port,
+        dst_port,
+        udp + 8,
+        (u32)udp_len - 8
+    );
 }
 
 static void parse_ethernet_frame(const u8 *frame, u32 frame_len) {
@@ -1104,7 +1321,12 @@ static void parse_ethernet_frame(const u8 *frame, u32 frame_len) {
             if (g_rx_packets <= 16) log_arp(op);
             if (op == 2 && read_be16(arp + 2) == ETHERTYPE_IPV4 && arp[4] == 6 && arp[5] == 4) {
                 g_arp_reply_seen = 1;
-                log_arp_reply(arp + 8, read_be32(arp + 14));
+                const u32 sender_ip = read_be32(arp + 14);
+                if (sender_ip == g_gateway_addr) {
+                    memcpy(g_gateway_mac, arp + 8, 6);
+                    g_gateway_mac_ready = 1;
+                }
+                log_arp_reply(arp + 8, sender_ip);
             }
         }
         return;
@@ -1151,7 +1373,9 @@ static void poll_tx_queue(void) {
         if (g_dhcp_offer_addr != 0 && !g_dhcp_request_sent) {
             send_dhcp_request();
         } else if (g_dhcp_sent && !g_arp_sent) {
-            send_arp_request(0x0A00020F, 0x0A000202);
+            const u32 source_ip = g_ipv4_addr != 0 ? g_ipv4_addr : 0x0A00020F;
+            const u32 target_ip = g_gateway_addr != 0 ? g_gateway_addr : 0x0A000202;
+            send_arp_request(source_ip, target_ip);
         }
     }
     if (!g_tx_in_flight && g_dhcp_offer_addr != 0 && !g_dhcp_request_sent) {
@@ -1179,24 +1403,52 @@ static void handle_net_connect_transfer(u64 transfer_id) {
     }
     if (map_mmio_page(NET_RESPONSE_VA, request->arg0, 1) != SYSCALL_OK) return;
     memset((void *)NET_RESPONSE_VA, 0, 4096);
-    g_session.active = 1;
-    g_session.request_paddr = request_paddr;
-    g_session.response_paddr = request->arg0;
-    g_session.reply_endpoint_id = install_endpoint(NET_REPLY_ENDPOINT_ID, request->arg1) == SYSCALL_OK ? NET_REPLY_ENDPOINT_ID : 0;
-    g_session.session_nonce = request->session_nonce;
-    g_session.last_completed_seq = 0;
+    struct net_session *session = 0;
+    u64 session_index = 0;
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+        if (g_sessions[i].active && g_sessions[i].request_paddr == request_paddr) {
+            session = &g_sessions[i];
+            session_index = i;
+            break;
+        }
+    }
+    if (session == 0) {
+        for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+            if (!g_sessions[i].active) {
+                session = &g_sessions[i];
+                session_index = i;
+                break;
+            }
+        }
+    }
+    if (session == 0) {
+        user_log("[virtio_net] VirtioNet: session table full\n");
+        return;
+    }
+    session->active = 1;
+    session->request_paddr = request_paddr;
+    session->response_paddr = request->arg0;
+    const u64 reply_endpoint_id = NET_REPLY_ENDPOINT_ID + session_index;
+    session->reply_endpoint_id = install_endpoint(reply_endpoint_id, request->arg1) == SYSCALL_OK ? reply_endpoint_id : 0;
+    session->session_nonce = request->session_nonce;
+    session->last_completed_seq = 0;
+    g_current_session = session;
     write_net_response(NET_OP_CONNECT, request->request_seq, NET_STATUS_OK, 0, 0, 0, 0);
-    g_session.last_completed_seq = request->request_seq;
+    session->last_completed_seq = request->request_seq;
+    g_current_session = 0;
     user_log("[virtio_net] VirtioNet: session connect ok\n");
 }
 
-static void handle_net_request(void) {
-    if (!g_session.active) return;
+static void handle_net_request_for_session(struct net_session *session) {
+    if (session == 0 || !session->active) return;
+    if (map_mmio_page(NET_REQUEST_VA, session->request_paddr, 0) != SYSCALL_OK) return;
+    if (map_mmio_page(NET_RESPONSE_VA, session->response_paddr, 1) != SYSCALL_OK) return;
+    g_current_session = session;
     volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
     if (request->magic != NET_PROTOCOL_REQUEST_MAGIC || request->version != NET_PROTOCOL_VERSION) return;
     const u64 seq = request->request_seq;
-    if (seq == 0 || seq <= g_session.last_completed_seq) return;
-    if (request->session_nonce != g_session.session_nonce) return;
+    if (seq == 0 || seq <= session->last_completed_seq) return;
+    if (request->session_nonce != session->session_nonce) return;
 
     if (request->op == NET_OP_GET_STATUS) {
         write_net_status_payload();
@@ -1211,10 +1463,57 @@ static void handle_net_request(void) {
         );
     } else if (request->op == NET_OP_CONNECT) {
         write_net_response(NET_OP_CONNECT, seq, NET_STATUS_OK, 0, 0, 0, 0);
+    } else if (request->op == NET_OP_BIND) {
+        const u16 requested_port = (u16)request->arg0;
+        if (requested_port != 0 && udp_port_in_use(requested_port)) {
+            write_net_response(NET_OP_BIND, seq, NET_STATUS_PORT_IN_USE, 0, 0, requested_port, 0);
+        } else {
+            struct udp_binding *binding = alloc_udp_binding(requested_port);
+            if (binding == 0) {
+                write_net_response(NET_OP_BIND, seq, NET_STATUS_PORT_IN_USE, 0, 0, requested_port, 0);
+            } else {
+                write_net_response(NET_OP_BIND, seq, NET_STATUS_OK, 0, binding->handle, binding->local_port, g_ipv4_addr);
+            }
+        }
+    } else if (request->op == NET_OP_SEND_TO) {
+        const u32 payload_len = (u32)request->reserved0;
+        int status = NET_STATUS_OK;
+        if (payload_len > NET_PAYLOAD_BYTES) {
+            status = NET_STATUS_TOO_BIG;
+        } else {
+            status = send_ipv4_udp(
+                request->arg0,
+                (u32)request->arg1,
+                (u16)request->arg2,
+                net_request_payload(),
+                payload_len
+            );
+        }
+        write_net_response(NET_OP_SEND_TO, seq, status, 0, status == NET_STATUS_OK ? payload_len : 0, 0, 0);
+    } else if (request->op == NET_OP_RECV_FROM) {
+        u32 out_len = 0;
+        u32 src_ip = 0;
+        u16 src_port = 0;
+        u32 out_cap = (u32)request->reserved0;
+        if (out_cap > NET_PAYLOAD_BYTES) out_cap = NET_PAYLOAD_BYTES;
+        const int status = dequeue_udp_packet(request->arg0, net_response_payload(), out_cap, &out_len, &src_ip, &src_port);
+        write_net_response(NET_OP_RECV_FROM, seq, status, status == NET_STATUS_OK ? out_len : 0, src_ip, src_port, out_len);
+    } else if (request->op == NET_OP_CLOSE) {
+        const int ok = close_udp_binding(request->arg0);
+        write_net_response(NET_OP_CLOSE, seq, ok ? NET_STATUS_OK : NET_STATUS_INVALID, 0, 0, 0, 0);
+    } else if (request->op == NET_OP_POLL) {
+        u64 events = 0;
+        const int status = poll_udp_binding(request->arg0, &events);
+        write_net_response(NET_OP_POLL, seq, status, 0, events, 0, 0);
     } else {
         write_net_response(request->op, seq, NET_STATUS_INVALID, 0, 0, 0, 0);
     }
-    g_session.last_completed_seq = seq;
+    session->last_completed_seq = seq;
+    g_current_session = 0;
+}
+
+static void handle_net_requests(void) {
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) handle_net_request_for_session(&g_sessions[i]);
 }
 
 void virtio_net_main(void) {
@@ -1238,6 +1537,6 @@ void virtio_net_main(void) {
         poll_rx_queue();
         const u64 received = wait_event(1, 1);
         if (received >= CAP_TRANSFER_ID_MIN) handle_net_connect_transfer(received);
-        handle_net_request();
+        handle_net_requests();
     }
 }
