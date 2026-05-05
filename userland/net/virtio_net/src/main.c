@@ -1,0 +1,1243 @@
+typedef unsigned long long u64;
+typedef unsigned int u32;
+typedef unsigned short u16;
+typedef unsigned char u8;
+
+enum {
+    SYSCALL_MAP_PAGE = 0x2,
+    SYSCALL_LOG = 0x9,
+    SYSCALL_ALLOC_MAP_PAGES = 0xC,
+    SYSCALL_QUEUE_SUBMIT = 0xE,
+    SYSCALL_QUEUE_NOTIFY = 0xF,
+    SYSCALL_WAIT_EVENT = 0x17,
+    SYSCALL_INSTALL_ENDPOINT = 0x26,
+    SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
+    SYSCALL_SIGNAL_ENDPOINT = 0x2C,
+    SYSCALL_IOMMU_AUTHORIZE = 0x35,
+    SYSCALL_DMA_MAP_CREATE = 0x37,
+    SYSCALL_DMA_MAP_SET_STATE = 0x38,
+
+    SYSCALL_OK = 0,
+
+    CONFIG_VA = 0x3C002000,
+    VIRTIO_MMIO_BASE_VA = 0x30200000,
+    RX_QUEUE_PAGE_VA = 0x30210000,
+    TX_QUEUE_PAGE_VA = 0x30211000,
+    RX_BUFFER_BASE_VA = 0x30220000,
+    TX_BUFFER_VA = 0x30240000,
+    NET_REQUEST_VA = 0x30250000,
+    NET_RESPONSE_VA = 0x30251000,
+
+    NET_CONFIG_MAGIC = 0x4E455443,
+    NET_CONFIG_VERSION = 1,
+    NET_ENDPOINT_ID_INDEX = 2,
+    NET_COMMON_PAGE_PADDR_INDEX = 3,
+    NET_NOTIFY_PAGE_PADDR_INDEX = 4,
+    NET_ISR_PAGE_PADDR_INDEX = 5,
+    NET_DEVICE_PAGE_PADDR_INDEX = 6,
+    NET_COMMON_PAGE_OFFSET_INDEX = 7,
+    NET_NOTIFY_PAGE_OFFSET_INDEX = 8,
+    NET_ISR_PAGE_OFFSET_INDEX = 9,
+    NET_DEVICE_PAGE_OFFSET_INDEX = 10,
+    NET_NOTIFY_OFF_MULTIPLIER_INDEX = 11,
+    NET_IOMMU_TOKEN_INDEX = 12,
+    NET_RX_QUEUE_SUBMIT_TOKEN_INDEX = 13,
+    NET_RX_QUEUE_NOTIFY_TOKEN_INDEX = 14,
+    NET_TX_QUEUE_SUBMIT_TOKEN_INDEX = 15,
+    NET_TX_QUEUE_NOTIFY_TOKEN_INDEX = 16,
+    NET_COMMAND_TOKEN_INDEX = 17,
+    NET_RESOURCE_ID_INDEX = 18,
+    NET_DRIVER_STATUS_INDEX = 19,
+    NET_STATUS_READY = 0x4E524459,
+    NET_STATUS_FAILED = 0x4E464149,
+
+    COMMON_DEVICE_FEATURE_SELECT = 0x00,
+    COMMON_DEVICE_FEATURE = 0x04,
+    COMMON_DRIVER_FEATURE_SELECT = 0x08,
+    COMMON_DRIVER_FEATURE = 0x0C,
+    COMMON_DEVICE_STATUS = 0x14,
+    COMMON_QUEUE_SELECT = 0x16,
+    COMMON_QUEUE_SIZE = 0x18,
+    COMMON_QUEUE_ENABLE = 0x1C,
+    COMMON_QUEUE_NOTIFY_OFF = 0x1E,
+    COMMON_QUEUE_DESC = 0x20,
+    COMMON_QUEUE_AVAIL = 0x28,
+    COMMON_QUEUE_USED = 0x30,
+
+    STATUS_ACKNOWLEDGE = 0x01,
+    STATUS_DRIVER = 0x02,
+    STATUS_DRIVER_OK = 0x04,
+    STATUS_FEATURES_OK = 0x08,
+    STATUS_FAILED = 0x80,
+
+    VIRTIO_NET_F_MAC = 5,
+    VIRTIO_F_VERSION_1 = 32,
+
+    QUEUE_SIZE = 16,
+    QUEUE_USED_OFFSET = 2048,
+    RX_QUEUE_INDEX = 0,
+    TX_QUEUE_INDEX = 1,
+    RX_BUFFER_COUNT = 8,
+    NET_HDR_BYTES = 12,
+    ETH_HDR_BYTES = 14,
+    RX_BUFFER_BYTES = 2048,
+    TX_BUFFER_BYTES = 2048,
+
+    ETHERTYPE_IPV4 = 0x0800,
+    ETHERTYPE_ARP = 0x0806,
+    IP_PROTO_UDP = 17,
+    DHCP_CLIENT_PORT = 68,
+    DHCP_SERVER_PORT = 67,
+    DHCP_MAGIC_COOKIE = 0x63825363,
+    DHCP_MSG_DISCOVER = 1,
+    DHCP_MSG_OFFER = 2,
+    DHCP_MSG_REQUEST = 3,
+    DHCP_MSG_ACK = 5,
+
+    NET_PROTOCOL_REQUEST_MAGIC = 0x514E4554,
+    NET_PROTOCOL_RESPONSE_MAGIC = 0x524E4554,
+    NET_PROTOCOL_VERSION = 1,
+    NET_OP_CONNECT = 1,
+    NET_OP_GET_STATUS = 2,
+    NET_STATUS_OK = 0,
+    NET_STATUS_INVALID = 2,
+    NET_STATUS_NOT_CONNECTED = 4,
+    NET_REPLY_ENDPOINT_ID = 0xEA,
+    CAP_TRANSFER_ID_MIN = 0x1000,
+    NET_FLAG_LINK_UP = 1 << 0,
+    NET_FLAG_DHCP_BOUND = 1 << 1,
+    NET_FLAG_GATEWAY_ARP = 1 << 2,
+
+    DESC_FLAG_NEXT = 1 << 0,
+    DESC_FLAG_WRITE = 1 << 1,
+
+    DMA_DIRECTION_READ = 0,
+    DMA_DIRECTION_WRITE = 1,
+    DMA_STATE_IN_FLIGHT = 1,
+    IOMMU_OP_MAP_READ = 0,
+    IOMMU_OP_MAP_WRITE = 1,
+
+    DMA_MAPPING_TOKEN_TAG = (1ULL << 63) | (1ULL << 61),
+};
+
+struct virtq_desc {
+    u64 addr;
+    u32 len;
+    u16 flags;
+    u16 next;
+};
+
+struct virtq_used_elem {
+    u32 id;
+    u32 len;
+};
+
+struct queue_state {
+    u16 index;
+    u64 submit_token;
+    u64 notify_token;
+    u64 page_va;
+    u64 page_paddr;
+    u64 notify_addr;
+    u16 last_used_idx;
+};
+
+struct boot_state {
+    u64 endpoint_id;
+    u64 resource_id;
+    u64 common_page_paddr;
+    u64 notify_page_paddr;
+    u64 isr_page_paddr;
+    u64 device_page_paddr;
+    u64 common_page_offset;
+    u64 notify_page_offset;
+    u64 isr_page_offset;
+    u64 device_page_offset;
+    u64 notify_off_multiplier;
+    u64 iommu_token;
+    u64 command_token;
+};
+
+struct net_request_header {
+    u32 magic;
+    u16 version;
+    u16 op;
+    u64 request_seq;
+    u64 session_nonce;
+    u64 arg0;
+    u64 arg1;
+    u64 arg2;
+    u64 reserved0;
+};
+
+struct net_response_header {
+    u32 magic;
+    u16 version;
+    u16 op;
+    u64 response_seq;
+    int status;
+    u32 inline_bytes;
+    u64 arg0;
+    u64 arg1;
+    u64 arg2;
+    u64 reserved0;
+};
+
+struct net_status_payload {
+    u8 mac[6];
+    u8 link_up;
+    u8 dhcp_bound;
+    u32 ipv4_addr;
+    u32 gateway_addr;
+    u32 dns_addr;
+    u32 dhcp_server_addr;
+    u32 flags;
+    u64 rx_packets;
+    u64 tx_completions;
+};
+
+struct net_session {
+    int active;
+    u64 request_paddr;
+    u64 response_paddr;
+    u64 reply_endpoint_id;
+    u64 session_nonce;
+    u64 last_completed_seq;
+};
+
+static struct boot_state g_boot;
+static struct net_session g_session;
+static struct queue_state g_rx_queue = { RX_QUEUE_INDEX, 0, 0, RX_QUEUE_PAGE_VA, 0, 0, 0 };
+static struct queue_state g_tx_queue = { TX_QUEUE_INDEX, 0, 0, TX_QUEUE_PAGE_VA, 0, 0, 0 };
+static u64 g_common_base;
+static u64 g_notify_base;
+static u64 g_isr_base;
+static u64 g_device_base;
+static u64 g_rx_buffer_paddrs[RX_BUFFER_COUNT];
+static u64 g_rx_dma_tokens[RX_BUFFER_COUNT];
+static u64 g_tx_buffer_paddr;
+static u64 g_tx_dma_token;
+static u8 g_mac[6];
+static u64 g_rx_packets;
+static u32 g_dhcp_xid = 0x50414348;
+static u32 g_ipv4_addr;
+static u32 g_dhcp_offer_addr;
+static u32 g_dhcp_server_addr;
+static u32 g_gateway_addr;
+static u32 g_dns_addr;
+static int g_dhcp_sent;
+static int g_dhcp_request_sent;
+static int g_dhcp_configured;
+static int g_arp_sent;
+static int g_arp_reply_seen;
+static int g_tx_complete_logged;
+static int g_tx_in_flight;
+static u64 g_tx_completions;
+
+void *memset(void *dst, int value, u64 n) {
+    u8 *d = (u8 *)dst;
+    for (u64 i = 0; i < n; i++) d[i] = (u8)value;
+    return dst;
+}
+
+void *memcpy(void *dst, const void *src, u64 n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    for (u64 i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+
+static u64 cstr_len(const char *s) {
+    u64 n = 0;
+    while (s[n] != 0) n++;
+    return n;
+}
+
+static void user_log_len(const char *message, u64 len) {
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"((u64)SYSCALL_LOG), "D"((u64)message), "S"(len)
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    (void)ret;
+}
+
+static void user_log(const char *message) {
+    user_log_len(message, cstr_len(message));
+}
+
+static u64 syscall2(u64 nr, u64 a0, u64 a1) {
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1)
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
+static u64 syscall1(u64 nr, u64 a0) {
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0)
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
+static u64 syscall3(u64 nr, u64 a0, u64 a1, u64 a2) {
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
+        : "rcx", "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
+static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) {
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3)
+        : "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
+static u64 wait_event(u64 wait_mailbox, u64 timeout_ticks) {
+    return syscall2(SYSCALL_WAIT_EVENT, wait_mailbox, timeout_ticks);
+}
+
+static u64 accept_cap_transfer(u64 transfer_id) {
+    return syscall1(SYSCALL_ACCEPT_CAP_TRANSFER, transfer_id);
+}
+
+static u64 install_endpoint(u64 endpoint_id, u64 target_process_slot) {
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, target_process_slot);
+}
+
+static u64 signal_endpoint(u64 endpoint_id) {
+    return syscall2(SYSCALL_SIGNAL_ENDPOINT, endpoint_id, 0);
+}
+
+static u64 alloc_map_pages(u64 base_va, u64 page_count, u64 writable, u64 paddrs_out) {
+    return syscall4(SYSCALL_ALLOC_MAP_PAGES, base_va, page_count, writable, paddrs_out);
+}
+
+static u64 map_mmio_page(u64 va, u64 paddr, u64 writable) {
+    return syscall3(SYSCALL_MAP_PAGE, va, paddr, writable);
+}
+
+static u64 queue_submit(u64 token, u64 queue_index) {
+    return syscall2(SYSCALL_QUEUE_SUBMIT, token, queue_index);
+}
+
+static u64 queue_notify(u64 token, u64 queue_index) {
+    return syscall2(SYSCALL_QUEUE_NOTIFY, token, queue_index);
+}
+
+static u64 iommu_authorize(u64 token, u64 device, u64 op) {
+    return syscall3(SYSCALL_IOMMU_AUTHORIZE, token, device, op);
+}
+
+static u64 dma_map_create(u64 device, u64 paddr_start, u64 length, u64 direction) {
+    const u64 raw = syscall4(SYSCALL_DMA_MAP_CREATE, device, paddr_start, length, direction);
+    if ((raw & DMA_MAPPING_TOKEN_TAG) != DMA_MAPPING_TOKEN_TAG) return 0;
+    return raw & ~DMA_MAPPING_TOKEN_TAG;
+}
+
+static u64 dma_map_set_state(u64 token, u64 state) {
+    return syscall2(SYSCALL_DMA_MAP_SET_STATE, token, state);
+}
+
+static u8 mmio_read_u8(u64 addr) {
+    volatile u8 *p = (volatile u8 *)addr;
+    return *p;
+}
+
+static u16 mmio_read_u16(u64 addr) {
+    volatile u16 *p = (volatile u16 *)addr;
+    return *p;
+}
+
+static u32 mmio_read_u32(u64 addr) {
+    volatile u32 *p = (volatile u32 *)addr;
+    return *p;
+}
+
+static void mmio_write_u8(u64 addr, u8 value) {
+    volatile u8 *p = (volatile u8 *)addr;
+    *p = value;
+}
+
+static void mmio_write_u16(u64 addr, u16 value) {
+    volatile u16 *p = (volatile u16 *)addr;
+    *p = value;
+}
+
+static void mmio_write_u32(u64 addr, u32 value) {
+    volatile u32 *p = (volatile u32 *)addr;
+    *p = value;
+}
+
+static void mmio_write_u64(u64 addr, u64 value) {
+    volatile u64 *p = (volatile u64 *)addr;
+    *p = value;
+}
+
+static u64 cfg_read(u64 index) {
+    volatile u64 *cfg = (volatile u64 *)CONFIG_VA;
+    return cfg[index];
+}
+
+static void cfg_write(u64 index, u64 value) {
+    volatile u64 *cfg = (volatile u64 *)CONFIG_VA;
+    cfg[index] = value;
+}
+
+static void append_char(char *buf, u64 cap, u64 *len, char ch) {
+    if (*len + 1 >= cap) return;
+    buf[*len] = ch;
+    *len = *len + 1;
+    buf[*len] = 0;
+}
+
+static void append_str(char *buf, u64 cap, u64 *len, const char *s) {
+    for (u64 i = 0; s[i] != 0; i++) append_char(buf, cap, len, s[i]);
+}
+
+static void append_hex_nibble(char *buf, u64 cap, u64 *len, u8 value) {
+    append_char(buf, cap, len, value < 10 ? (char)('0' + value) : (char)('a' + value - 10));
+}
+
+static void append_hex_byte(char *buf, u64 cap, u64 *len, u8 value) {
+    append_hex_nibble(buf, cap, len, (u8)(value >> 4));
+    append_hex_nibble(buf, cap, len, (u8)(value & 0x0F));
+}
+
+static void append_u64_dec(char *buf, u64 cap, u64 *len, u64 value) {
+    char tmp[20];
+    u64 n = 0;
+    if (value == 0) {
+        append_char(buf, cap, len, '0');
+        return;
+    }
+    while (value != 0 && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    while (n != 0) append_char(buf, cap, len, tmp[--n]);
+}
+
+static u16 read_be16(const u8 *p) {
+    return (u16)(((u16)p[0] << 8) | p[1]);
+}
+
+static u32 read_be32(const u8 *p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+static void write_be16(u8 *p, u16 value) {
+    p[0] = (u8)(value >> 8);
+    p[1] = (u8)value;
+}
+
+static void write_be32(u8 *p, u32 value) {
+    p[0] = (u8)(value >> 24);
+    p[1] = (u8)(value >> 16);
+    p[2] = (u8)(value >> 8);
+    p[3] = (u8)value;
+}
+
+static void append_ipv4(char *buf, u64 cap, u64 *len, u32 addr) {
+    append_u64_dec(buf, cap, len, (addr >> 24) & 0xFF);
+    append_char(buf, cap, len, '.');
+    append_u64_dec(buf, cap, len, (addr >> 16) & 0xFF);
+    append_char(buf, cap, len, '.');
+    append_u64_dec(buf, cap, len, (addr >> 8) & 0xFF);
+    append_char(buf, cap, len, '.');
+    append_u64_dec(buf, cap, len, addr & 0xFF);
+}
+
+static u16 ipv4_checksum(const u8 *header, u32 header_len) {
+    u32 sum = 0;
+    for (u32 i = 0; i + 1 < header_len; i += 2) {
+        sum += read_be16(header + i);
+        while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    if ((header_len & 1) != 0) {
+        sum += (u32)header[header_len - 1] << 8;
+        while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (u16)~sum;
+}
+
+static u16 udp_ipv4_checksum(u32 src_ip, u32 dst_ip, const u8 *udp, u32 udp_len) {
+    u32 sum = 0;
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += IP_PROTO_UDP;
+    sum += udp_len;
+    for (u32 i = 0; i + 1 < udp_len; i += 2) {
+        sum += read_be16(udp + i);
+        while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    if ((udp_len & 1) != 0) {
+        sum += (u32)udp[udp_len - 1] << 8;
+        while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    const u16 checksum = (u16)~sum;
+    return checksum == 0 ? 0xFFFF : checksum;
+}
+
+static void log_mac(void) {
+    char line[96];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: mac=");
+    for (u64 i = 0; i < 6; i++) {
+        if (i != 0) append_char(line, sizeof(line), &len, ':');
+        append_hex_byte(line, sizeof(line), &len, g_mac[i]);
+    }
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
+static void log_rx_packet(u64 bytes, u16 ethertype) {
+    char line[128];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: rx packet len=");
+    append_u64_dec(line, sizeof(line), &len, bytes);
+    append_str(line, sizeof(line), &len, " ethertype=0x");
+    append_hex_byte(line, sizeof(line), &len, (u8)(ethertype >> 8));
+    append_hex_byte(line, sizeof(line), &len, (u8)(ethertype & 0xFF));
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
+static void log_arp(u16 op) {
+    char line[96];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: arp op=");
+    append_u64_dec(line, sizeof(line), &len, op);
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
+static void log_arp_reply(const u8 *sha, u32 spa) {
+    char line[160];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: arp reply ");
+    append_ipv4(line, sizeof(line), &len, spa);
+    append_str(line, sizeof(line), &len, " mac=");
+    for (u64 i = 0; i < 6; i++) {
+        if (i != 0) append_char(line, sizeof(line), &len, ':');
+        append_hex_byte(line, sizeof(line), &len, sha[i]);
+    }
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
+static void log_udp(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port) {
+    char line[160];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: udp ");
+    append_ipv4(line, sizeof(line), &len, src_ip);
+    append_char(line, sizeof(line), &len, ':');
+    append_u64_dec(line, sizeof(line), &len, src_port);
+    append_str(line, sizeof(line), &len, " -> ");
+    append_ipv4(line, sizeof(line), &len, dst_ip);
+    append_char(line, sizeof(line), &len, ':');
+    append_u64_dec(line, sizeof(line), &len, dst_port);
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
+static void log_dhcp(u8 message_type, u32 yiaddr) {
+    char line[192];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: dhcp ");
+    if (message_type == DHCP_MSG_OFFER) {
+        append_str(line, sizeof(line), &len, "offer");
+    } else if (message_type == DHCP_MSG_ACK) {
+        append_str(line, sizeof(line), &len, "ack");
+    } else {
+        append_str(line, sizeof(line), &len, "message=");
+        append_u64_dec(line, sizeof(line), &len, message_type);
+    }
+    append_str(line, sizeof(line), &len, " yiaddr=");
+    append_ipv4(line, sizeof(line), &len, yiaddr);
+    if (g_gateway_addr != 0) {
+        append_str(line, sizeof(line), &len, " gw=");
+        append_ipv4(line, sizeof(line), &len, g_gateway_addr);
+    }
+    if (g_dns_addr != 0) {
+        append_str(line, sizeof(line), &len, " dns=");
+        append_ipv4(line, sizeof(line), &len, g_dns_addr);
+    }
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
+static void write_net_response(u16 op, u64 seq, int status, u32 inline_bytes, u64 arg0, u64 arg1, u64 arg2) {
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    response->magic = NET_PROTOCOL_RESPONSE_MAGIC;
+    response->version = NET_PROTOCOL_VERSION;
+    response->op = op;
+    response->status = status;
+    response->inline_bytes = inline_bytes;
+    response->arg0 = arg0;
+    response->arg1 = arg1;
+    response->arg2 = arg2;
+    response->reserved0 = 0;
+    __asm__ volatile("" ::: "memory");
+    response->response_seq = seq;
+    if (g_session.reply_endpoint_id != 0) (void)signal_endpoint(g_session.reply_endpoint_id);
+}
+
+static void write_net_status_payload(void) {
+    volatile struct net_status_payload *payload = (volatile struct net_status_payload *)(NET_RESPONSE_VA + sizeof(struct net_response_header));
+    for (u64 i = 0; i < 6; i++) payload->mac[i] = g_mac[i];
+    payload->link_up = 1;
+    payload->dhcp_bound = g_dhcp_configured ? 1 : 0;
+    payload->ipv4_addr = g_ipv4_addr;
+    payload->gateway_addr = g_gateway_addr;
+    payload->dns_addr = g_dns_addr;
+    payload->dhcp_server_addr = g_dhcp_server_addr;
+    payload->flags = NET_FLAG_LINK_UP |
+        (g_dhcp_configured ? NET_FLAG_DHCP_BOUND : 0) |
+        (g_arp_reply_seen ? NET_FLAG_GATEWAY_ARP : 0);
+    payload->rx_packets = g_rx_packets;
+    payload->tx_completions = g_tx_completions;
+}
+
+static int parse_boot_state(void) {
+    if (cfg_read(0) != NET_CONFIG_MAGIC || cfg_read(1) != NET_CONFIG_VERSION) return 0;
+    g_rx_queue.submit_token = cfg_read(NET_RX_QUEUE_SUBMIT_TOKEN_INDEX);
+    g_rx_queue.notify_token = cfg_read(NET_RX_QUEUE_NOTIFY_TOKEN_INDEX);
+    g_tx_queue.submit_token = cfg_read(NET_TX_QUEUE_SUBMIT_TOKEN_INDEX);
+    g_tx_queue.notify_token = cfg_read(NET_TX_QUEUE_NOTIFY_TOKEN_INDEX);
+    g_boot.endpoint_id = cfg_read(NET_ENDPOINT_ID_INDEX);
+    g_boot.resource_id = cfg_read(NET_RESOURCE_ID_INDEX);
+    g_boot.common_page_paddr = cfg_read(NET_COMMON_PAGE_PADDR_INDEX);
+    g_boot.notify_page_paddr = cfg_read(NET_NOTIFY_PAGE_PADDR_INDEX);
+    g_boot.isr_page_paddr = cfg_read(NET_ISR_PAGE_PADDR_INDEX);
+    g_boot.device_page_paddr = cfg_read(NET_DEVICE_PAGE_PADDR_INDEX);
+    g_boot.common_page_offset = cfg_read(NET_COMMON_PAGE_OFFSET_INDEX);
+    g_boot.notify_page_offset = cfg_read(NET_NOTIFY_PAGE_OFFSET_INDEX);
+    g_boot.isr_page_offset = cfg_read(NET_ISR_PAGE_OFFSET_INDEX);
+    g_boot.device_page_offset = cfg_read(NET_DEVICE_PAGE_OFFSET_INDEX);
+    g_boot.notify_off_multiplier = cfg_read(NET_NOTIFY_OFF_MULTIPLIER_INDEX);
+    g_boot.iommu_token = cfg_read(NET_IOMMU_TOKEN_INDEX);
+    g_boot.command_token = cfg_read(NET_COMMAND_TOKEN_INDEX);
+    return g_boot.endpoint_id != 0 &&
+        g_boot.resource_id != 0 &&
+        g_boot.common_page_paddr != 0 &&
+        g_boot.notify_page_paddr != 0 &&
+        g_rx_queue.submit_token != 0 &&
+        g_rx_queue.notify_token != 0 &&
+        g_tx_queue.submit_token != 0 &&
+        g_tx_queue.notify_token != 0;
+}
+
+static void wait_for_boot_resources(void) {
+    while (!parse_boot_state()) wait_event(0, 1);
+}
+
+static struct virtq_desc *desc_ptr(struct queue_state *queue, u64 index) {
+    return (struct virtq_desc *)(queue->page_va + index * sizeof(struct virtq_desc));
+}
+
+static volatile u16 *avail_idx_ptr(struct queue_state *queue) {
+    return (volatile u16 *)(queue->page_va + QUEUE_SIZE * sizeof(struct virtq_desc) + 2);
+}
+
+static volatile u16 *avail_ring_ptr(struct queue_state *queue) {
+    return (volatile u16 *)(queue->page_va + QUEUE_SIZE * sizeof(struct virtq_desc) + 4);
+}
+
+static volatile u16 *used_idx_ptr(struct queue_state *queue) {
+    return (volatile u16 *)(queue->page_va + QUEUE_USED_OFFSET + 2);
+}
+
+static volatile struct virtq_used_elem *used_ring_ptr(struct queue_state *queue) {
+    return (volatile struct virtq_used_elem *)(queue->page_va + QUEUE_USED_OFFSET + 4);
+}
+
+static void queue_push_avail(struct queue_state *queue, u16 desc_index) {
+    const u16 idx = *avail_idx_ptr(queue);
+    avail_ring_ptr(queue)[idx % QUEUE_SIZE] = desc_index;
+    __asm__ volatile("" ::: "memory");
+    *avail_idx_ptr(queue) = (u16)(idx + 1);
+}
+
+static int setup_queue(struct queue_state *queue) {
+    mmio_write_u16(g_common_base + COMMON_QUEUE_SELECT, queue->index);
+    const u16 max_size = mmio_read_u16(g_common_base + COMMON_QUEUE_SIZE);
+    if (max_size == 0 || max_size < QUEUE_SIZE) return 0;
+    mmio_write_u16(g_common_base + COMMON_QUEUE_SIZE, QUEUE_SIZE);
+    mmio_write_u64(g_common_base + COMMON_QUEUE_DESC, queue->page_paddr);
+    mmio_write_u64(g_common_base + COMMON_QUEUE_AVAIL, queue->page_paddr + QUEUE_SIZE * sizeof(struct virtq_desc));
+    mmio_write_u64(g_common_base + COMMON_QUEUE_USED, queue->page_paddr + QUEUE_USED_OFFSET);
+    const u16 queue_notify_off = mmio_read_u16(g_common_base + COMMON_QUEUE_NOTIFY_OFF);
+    queue->notify_addr = g_notify_base + (u64)queue_notify_off * g_boot.notify_off_multiplier;
+    mmio_write_u16(g_common_base + COMMON_QUEUE_ENABLE, 1);
+    return 1;
+}
+
+static int init_queue_memory(void) {
+    u64 q_paddrs[2] = { 0, 0 };
+    if (alloc_map_pages(RX_QUEUE_PAGE_VA, 1, 1, (u64)&q_paddrs[0]) != SYSCALL_OK) return 0;
+    if (alloc_map_pages(TX_QUEUE_PAGE_VA, 1, 1, (u64)&q_paddrs[1]) != SYSCALL_OK) return 0;
+    g_rx_queue.page_paddr = q_paddrs[0];
+    g_tx_queue.page_paddr = q_paddrs[1];
+    memset((void *)RX_QUEUE_PAGE_VA, 0, 4096);
+    memset((void *)TX_QUEUE_PAGE_VA, 0, 4096);
+
+    for (u64 i = 0; i < RX_BUFFER_COUNT; i++) {
+        if (alloc_map_pages(RX_BUFFER_BASE_VA + i * 4096, 1, 1, (u64)&g_rx_buffer_paddrs[i]) != SYSCALL_OK) return 0;
+        memset((void *)(RX_BUFFER_BASE_VA + i * 4096), 0, 4096);
+    }
+    if (alloc_map_pages(TX_BUFFER_VA, 1, 1, (u64)&g_tx_buffer_paddr) != SYSCALL_OK) return 0;
+    memset((void *)TX_BUFFER_VA, 0, 4096);
+    return 1;
+}
+
+static int authorize_dma(void) {
+    if (g_boot.iommu_token == 0) return 1;
+    if (iommu_authorize(g_boot.iommu_token, g_boot.resource_id, IOMMU_OP_MAP_READ) != SYSCALL_OK) return 0;
+    for (u64 i = 0; i < RX_BUFFER_COUNT; i++) {
+        g_rx_dma_tokens[i] = dma_map_create(g_boot.resource_id, g_rx_buffer_paddrs[i], RX_BUFFER_BYTES, DMA_DIRECTION_WRITE);
+        if (g_rx_dma_tokens[i] == 0) return 0;
+        if (dma_map_set_state(g_rx_dma_tokens[i], DMA_STATE_IN_FLIGHT) != SYSCALL_OK) return 0;
+    }
+    if (iommu_authorize(g_boot.iommu_token, g_boot.resource_id, IOMMU_OP_MAP_READ) != SYSCALL_OK) return 0;
+    g_tx_dma_token = dma_map_create(g_boot.resource_id, g_tx_buffer_paddr, TX_BUFFER_BYTES, DMA_DIRECTION_READ);
+    if (g_tx_dma_token == 0) return 0;
+    return dma_map_set_state(g_tx_dma_token, DMA_STATE_IN_FLIGHT) == SYSCALL_OK;
+}
+
+static int prime_rx_queue(void) {
+    for (u64 i = 0; i < RX_BUFFER_COUNT; i++) {
+        struct virtq_desc *desc = desc_ptr(&g_rx_queue, i);
+        desc->addr = g_rx_buffer_paddrs[i];
+        desc->len = RX_BUFFER_BYTES;
+        desc->flags = DESC_FLAG_WRITE;
+        desc->next = 0;
+        queue_push_avail(&g_rx_queue, (u16)i);
+    }
+    if (queue_submit(g_rx_queue.submit_token, g_rx_queue.index) != SYSCALL_OK) return 0;
+    if (queue_notify(g_rx_queue.notify_token, g_rx_queue.index) != SYSCALL_OK) return 0;
+    mmio_write_u16(g_rx_queue.notify_addr, g_rx_queue.index);
+    return 1;
+}
+
+static int send_packet(const u8 *frame, u32 frame_len) {
+    if (g_tx_in_flight) return 0;
+    if (frame_len + NET_HDR_BYTES > TX_BUFFER_BYTES) return 0;
+    u8 *tx = (u8 *)TX_BUFFER_VA;
+    memset(tx, 0, NET_HDR_BYTES);
+    memcpy(tx + NET_HDR_BYTES, frame, frame_len);
+
+    struct virtq_desc *desc = desc_ptr(&g_tx_queue, 0);
+    desc->addr = g_tx_buffer_paddr;
+    desc->len = frame_len + NET_HDR_BYTES;
+    desc->flags = 0;
+    desc->next = 0;
+    if (queue_submit(g_tx_queue.submit_token, g_tx_queue.index) != SYSCALL_OK) return 0;
+    queue_push_avail(&g_tx_queue, 0);
+    if (queue_notify(g_tx_queue.notify_token, g_tx_queue.index) != SYSCALL_OK) return 0;
+    mmio_write_u16(g_tx_queue.notify_addr, g_tx_queue.index);
+    g_tx_in_flight = 1;
+    return 1;
+}
+
+static int send_dhcp_discover(void) {
+    u8 frame[512];
+    memset(frame, 0, sizeof(frame));
+
+    for (u32 i = 0; i < 6; i++) frame[i] = 0xFF;
+    memcpy(frame + 6, g_mac, 6);
+    write_be16(frame + 12, ETHERTYPE_IPV4);
+
+    u8 *ip = frame + ETH_HDR_BYTES;
+    u8 *udp = ip + 20;
+    u8 *dhcp = udp + 8;
+    u8 *opt = dhcp + 236;
+
+    dhcp[0] = 1; // BOOTREQUEST
+    dhcp[1] = 1; // Ethernet
+    dhcp[2] = 6; // MAC length
+    write_be32(dhcp + 4, g_dhcp_xid);
+    write_be16(dhcp + 10, 0x8000);
+    memcpy(dhcp + 28, g_mac, 6);
+
+    write_be32(opt, DHCP_MAGIC_COOKIE);
+    opt += 4;
+    *opt++ = 53;
+    *opt++ = 1;
+    *opt++ = DHCP_MSG_DISCOVER;
+    *opt++ = 55;
+    *opt++ = 8;
+    *opt++ = 1;
+    *opt++ = 3;
+    *opt++ = 6;
+    *opt++ = 15;
+    *opt++ = 28;
+    *opt++ = 51;
+    *opt++ = 54;
+    *opt++ = 58;
+    *opt++ = 57;
+    *opt++ = 2;
+    write_be16(opt, 576);
+    opt += 2;
+    *opt++ = 12;
+    *opt++ = 7;
+    *opt++ = 'p';
+    *opt++ = 'a';
+    *opt++ = 'c';
+    *opt++ = 'h';
+    *opt++ = 'a';
+    *opt++ = 'o';
+    *opt++ = 's';
+    *opt++ = 255;
+    while ((u32)(opt - dhcp) < 300) *opt++ = 0;
+
+    const u16 dhcp_len = (u16)(opt - dhcp);
+    const u16 udp_len = (u16)(8 + dhcp_len);
+    const u16 ip_len = (u16)(20 + udp_len);
+    const u16 frame_len = (u16)(ETH_HDR_BYTES + ip_len);
+
+    ip[0] = 0x45;
+    ip[1] = 0;
+    write_be16(ip + 2, ip_len);
+    write_be16(ip + 4, 1);
+    write_be16(ip + 6, 0);
+    ip[8] = 64;
+    ip[9] = IP_PROTO_UDP;
+    write_be32(ip + 12, 0);
+    write_be32(ip + 16, 0xFFFFFFFF);
+    write_be16(ip + 10, ipv4_checksum(ip, 20));
+
+    write_be16(udp + 0, DHCP_CLIENT_PORT);
+    write_be16(udp + 2, DHCP_SERVER_PORT);
+    write_be16(udp + 4, udp_len);
+    write_be16(udp + 6, 0);
+    write_be16(udp + 6, udp_ipv4_checksum(0, 0xFFFFFFFF, udp, udp_len));
+
+    if (!send_packet(frame, frame_len)) {
+        user_log("[virtio_net] VirtioNet: dhcp discover failed\n");
+        return 0;
+    }
+    g_dhcp_sent = 1;
+    user_log("[virtio_net] VirtioNet: dhcp discover sent\n");
+    return 1;
+}
+
+static int send_dhcp_request(void) {
+    if (g_dhcp_offer_addr == 0) return 0;
+    u8 frame[512];
+    memset(frame, 0, sizeof(frame));
+
+    for (u32 i = 0; i < 6; i++) frame[i] = 0xFF;
+    memcpy(frame + 6, g_mac, 6);
+    write_be16(frame + 12, ETHERTYPE_IPV4);
+
+    u8 *ip = frame + ETH_HDR_BYTES;
+    u8 *udp = ip + 20;
+    u8 *dhcp = udp + 8;
+    u8 *opt = dhcp + 236;
+
+    dhcp[0] = 1;
+    dhcp[1] = 1;
+    dhcp[2] = 6;
+    write_be32(dhcp + 4, g_dhcp_xid);
+    write_be16(dhcp + 10, 0x8000);
+    memcpy(dhcp + 28, g_mac, 6);
+
+    write_be32(opt, DHCP_MAGIC_COOKIE);
+    opt += 4;
+    *opt++ = 53;
+    *opt++ = 1;
+    *opt++ = DHCP_MSG_REQUEST;
+    *opt++ = 50;
+    *opt++ = 4;
+    write_be32(opt, g_dhcp_offer_addr);
+    opt += 4;
+    if (g_dhcp_server_addr != 0) {
+        *opt++ = 54;
+        *opt++ = 4;
+        write_be32(opt, g_dhcp_server_addr);
+        opt += 4;
+    }
+    *opt++ = 55;
+    *opt++ = 8;
+    *opt++ = 1;
+    *opt++ = 3;
+    *opt++ = 6;
+    *opt++ = 15;
+    *opt++ = 28;
+    *opt++ = 51;
+    *opt++ = 54;
+    *opt++ = 58;
+    *opt++ = 57;
+    *opt++ = 2;
+    write_be16(opt, 576);
+    opt += 2;
+    *opt++ = 12;
+    *opt++ = 7;
+    *opt++ = 'p';
+    *opt++ = 'a';
+    *opt++ = 'c';
+    *opt++ = 'h';
+    *opt++ = 'a';
+    *opt++ = 'o';
+    *opt++ = 's';
+    *opt++ = 255;
+    while ((u32)(opt - dhcp) < 300) *opt++ = 0;
+
+    const u16 dhcp_len = (u16)(opt - dhcp);
+    const u16 udp_len = (u16)(8 + dhcp_len);
+    const u16 ip_len = (u16)(20 + udp_len);
+    const u16 frame_len = (u16)(ETH_HDR_BYTES + ip_len);
+
+    ip[0] = 0x45;
+    ip[1] = 0;
+    write_be16(ip + 2, ip_len);
+    write_be16(ip + 4, 2);
+    write_be16(ip + 6, 0);
+    ip[8] = 64;
+    ip[9] = IP_PROTO_UDP;
+    write_be32(ip + 12, 0);
+    write_be32(ip + 16, 0xFFFFFFFF);
+    write_be16(ip + 10, ipv4_checksum(ip, 20));
+
+    write_be16(udp + 0, DHCP_CLIENT_PORT);
+    write_be16(udp + 2, DHCP_SERVER_PORT);
+    write_be16(udp + 4, udp_len);
+    write_be16(udp + 6, 0);
+    write_be16(udp + 6, udp_ipv4_checksum(0, 0xFFFFFFFF, udp, udp_len));
+
+    if (!send_packet(frame, frame_len)) {
+        user_log("[virtio_net] VirtioNet: dhcp request failed\n");
+        return 0;
+    }
+    g_dhcp_request_sent = 1;
+    user_log("[virtio_net] VirtioNet: dhcp request sent\n");
+    return 1;
+}
+
+static int send_arp_request(u32 source_ip, u32 target_ip) {
+    u8 frame[ETH_HDR_BYTES + 28];
+    memset(frame, 0, sizeof(frame));
+    for (u32 i = 0; i < 6; i++) frame[i] = 0xFF;
+    memcpy(frame + 6, g_mac, 6);
+    write_be16(frame + 12, ETHERTYPE_ARP);
+
+    u8 *arp = frame + ETH_HDR_BYTES;
+    write_be16(arp + 0, 1);
+    write_be16(arp + 2, ETHERTYPE_IPV4);
+    arp[4] = 6;
+    arp[5] = 4;
+    write_be16(arp + 6, 1);
+    memcpy(arp + 8, g_mac, 6);
+    write_be32(arp + 14, source_ip);
+    write_be32(arp + 24, target_ip);
+
+    if (!send_packet(frame, sizeof(frame))) {
+        user_log("[virtio_net] VirtioNet: arp request failed\n");
+        return 0;
+    }
+    g_arp_sent = 1;
+    user_log("[virtio_net] VirtioNet: arp request sent\n");
+    return 1;
+}
+
+static u64 read_device_features(u32 select) {
+    mmio_write_u32(g_common_base + COMMON_DEVICE_FEATURE_SELECT, select);
+    return mmio_read_u32(g_common_base + COMMON_DEVICE_FEATURE);
+}
+
+static int negotiate_features(void) {
+    const u32 device_features_low = (u32)read_device_features(0);
+    const u32 device_features_high = (u32)read_device_features(1);
+    u32 driver_features_low = 0;
+    u32 driver_features_high = 0;
+    if ((device_features_low & (1U << VIRTIO_NET_F_MAC)) != 0) {
+        driver_features_low |= 1U << VIRTIO_NET_F_MAC;
+    }
+    if ((device_features_high & (1U << (VIRTIO_F_VERSION_1 - 32))) != 0) {
+        driver_features_high |= 1U << (VIRTIO_F_VERSION_1 - 32);
+    }
+    mmio_write_u32(g_common_base + COMMON_DRIVER_FEATURE_SELECT, 0);
+    mmio_write_u32(g_common_base + COMMON_DRIVER_FEATURE, driver_features_low);
+    mmio_write_u32(g_common_base + COMMON_DRIVER_FEATURE_SELECT, 1);
+    mmio_write_u32(g_common_base + COMMON_DRIVER_FEATURE, driver_features_high);
+    mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, (u8)(mmio_read_u8(g_common_base + COMMON_DEVICE_STATUS) | STATUS_FEATURES_OK));
+    if ((mmio_read_u8(g_common_base + COMMON_DEVICE_STATUS) & STATUS_FEATURES_OK) == 0) return 0;
+    return 1;
+}
+
+static void read_mac(void) {
+    if (g_device_base == 0) return;
+    for (u64 i = 0; i < 6; i++) g_mac[i] = mmio_read_u8(g_device_base + i);
+}
+
+static int init_virtio(void) {
+    while (map_mmio_page(VIRTIO_MMIO_BASE_VA, g_boot.common_page_paddr, 1) != SYSCALL_OK) wait_event(0, 1);
+    while (map_mmio_page(VIRTIO_MMIO_BASE_VA + 0x1000, g_boot.notify_page_paddr, 1) != SYSCALL_OK) wait_event(0, 1);
+    if (g_boot.isr_page_paddr != 0) {
+        while (map_mmio_page(VIRTIO_MMIO_BASE_VA + 0x2000, g_boot.isr_page_paddr, 0) != SYSCALL_OK) wait_event(0, 1);
+    }
+    if (g_boot.device_page_paddr != 0) {
+        while (map_mmio_page(VIRTIO_MMIO_BASE_VA + 0x3000, g_boot.device_page_paddr, 1) != SYSCALL_OK) wait_event(0, 1);
+    }
+    if (!init_queue_memory()) return 0;
+
+    g_common_base = VIRTIO_MMIO_BASE_VA + g_boot.common_page_offset;
+    g_notify_base = VIRTIO_MMIO_BASE_VA + 0x1000 + g_boot.notify_page_offset;
+    g_isr_base = g_boot.isr_page_paddr != 0 ? VIRTIO_MMIO_BASE_VA + 0x2000 + g_boot.isr_page_offset : 0;
+    g_device_base = g_boot.device_page_paddr != 0 ? VIRTIO_MMIO_BASE_VA + 0x3000 + g_boot.device_page_offset : 0;
+
+    mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, 0);
+    mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    if (!negotiate_features()) return 0;
+    read_mac();
+    if (!setup_queue(&g_rx_queue)) return 0;
+    if (!setup_queue(&g_tx_queue)) return 0;
+    if (!authorize_dma()) return 0;
+    if (!prime_rx_queue()) return 0;
+    mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, (u8)(mmio_read_u8(g_common_base + COMMON_DEVICE_STATUS) | STATUS_DRIVER_OK));
+    return 1;
+}
+
+static int is_known_ethertype(u16 ethertype) {
+    return ethertype == ETHERTYPE_IPV4 || ethertype == ETHERTYPE_ARP;
+}
+
+static void parse_dhcp_payload(const u8 *dhcp, u32 len) {
+    if (len < 240) return;
+    if (dhcp[0] != 2 || dhcp[1] != 1 || dhcp[2] != 6) return;
+    if (read_be32(dhcp + 4) != g_dhcp_xid) return;
+    if (read_be32(dhcp + 236) != DHCP_MAGIC_COOKIE) return;
+
+    u8 msg_type = 0;
+    u32 server_id = 0;
+    u32 router = 0;
+    u32 dns = 0;
+    u32 cursor = 240;
+    while (cursor < len) {
+        const u8 tag = dhcp[cursor++];
+        if (tag == 0) continue;
+        if (tag == 255) break;
+        if (cursor >= len) break;
+        const u8 opt_len = dhcp[cursor++];
+        if (cursor + opt_len > len) break;
+        const u8 *value = dhcp + cursor;
+        if (tag == 53 && opt_len >= 1) msg_type = value[0];
+        if (tag == 54 && opt_len >= 4) server_id = read_be32(value);
+        if (tag == 3 && opt_len >= 4) router = read_be32(value);
+        if (tag == 6 && opt_len >= 4) dns = read_be32(value);
+        cursor += opt_len;
+    }
+
+    if (msg_type == 0) return;
+    if (server_id != 0) g_dhcp_server_addr = server_id;
+    if (router != 0) g_gateway_addr = router;
+    if (dns != 0) g_dns_addr = dns;
+    if (msg_type == DHCP_MSG_OFFER || msg_type == DHCP_MSG_ACK) {
+        const u32 yiaddr = read_be32(dhcp + 16);
+        if (msg_type == DHCP_MSG_OFFER) g_dhcp_offer_addr = yiaddr;
+        if (msg_type == DHCP_MSG_ACK) {
+            g_ipv4_addr = yiaddr;
+            g_dhcp_configured = 1;
+        }
+        log_dhcp(msg_type, yiaddr);
+    }
+}
+
+static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
+    if (frame_len < ETH_HDR_BYTES + 20) return;
+    const u8 *ip = frame + ETH_HDR_BYTES;
+    const u32 ihl = (u32)(ip[0] & 0x0F) * 4;
+    if ((ip[0] >> 4) != 4 || ihl < 20) return;
+    if (frame_len < ETH_HDR_BYTES + ihl) return;
+    const u16 total_len = read_be16(ip + 2);
+    if (total_len < ihl || frame_len < ETH_HDR_BYTES + total_len) return;
+    if (ip[9] != IP_PROTO_UDP) return;
+
+    const u8 *udp = ip + ihl;
+    const u32 udp_packet_len = (u32)total_len - ihl;
+    if (udp_packet_len < 8) return;
+    const u16 src_port = read_be16(udp + 0);
+    const u16 dst_port = read_be16(udp + 2);
+    const u16 udp_len = read_be16(udp + 4);
+    if (udp_len < 8 || udp_len > udp_packet_len) return;
+
+    if (g_rx_packets <= 16) {
+        log_udp(read_be32(ip + 12), read_be32(ip + 16), src_port, dst_port);
+    }
+    if (src_port == DHCP_SERVER_PORT && dst_port == DHCP_CLIENT_PORT) {
+        parse_dhcp_payload(udp + 8, (u32)udp_len - 8);
+    }
+}
+
+static void parse_ethernet_frame(const u8 *frame, u32 frame_len) {
+    if (frame_len < ETH_HDR_BYTES) return;
+    const u16 ethertype = read_be16(frame + 12);
+    if (g_rx_packets <= 16) log_rx_packet(frame_len, ethertype);
+    if (ethertype == ETHERTYPE_ARP) {
+        if (frame_len >= ETH_HDR_BYTES + 28) {
+            const u8 *arp = frame + ETH_HDR_BYTES;
+            const u16 op = read_be16(arp + 6);
+            if (g_rx_packets <= 16) log_arp(op);
+            if (op == 2 && read_be16(arp + 2) == ETHERTYPE_IPV4 && arp[4] == 6 && arp[5] == 4) {
+                g_arp_reply_seen = 1;
+                log_arp_reply(arp + 8, read_be32(arp + 14));
+            }
+        }
+        return;
+    }
+    if (ethertype == ETHERTYPE_IPV4) parse_ipv4_packet(frame, frame_len);
+}
+
+static void poll_rx_queue(void) {
+    while (*used_idx_ptr(&g_rx_queue) != g_rx_queue.last_used_idx) {
+        volatile struct virtq_used_elem *used = &used_ring_ptr(&g_rx_queue)[g_rx_queue.last_used_idx % QUEUE_SIZE];
+        const u16 desc_index = (u16)(used->id % QUEUE_SIZE);
+        const u32 packet_len = used->len;
+        g_rx_queue.last_used_idx++;
+        g_rx_packets++;
+        if (packet_len > NET_HDR_BYTES) {
+            const u8 *src = (const u8 *)(RX_BUFFER_BASE_VA + (u64)desc_index * 4096);
+            u32 offset = NET_HDR_BYTES;
+            if (packet_len >= NET_HDR_BYTES + ETH_HDR_BYTES) {
+                u16 ethertype = read_be16(src + NET_HDR_BYTES + 12);
+                if (!is_known_ethertype(ethertype) && packet_len >= 12 + ETH_HDR_BYTES) {
+                    ethertype = read_be16(src + 12 + 12);
+                    if (is_known_ethertype(ethertype)) offset = 12;
+                }
+            }
+            parse_ethernet_frame(src + offset, packet_len - offset);
+        }
+        queue_push_avail(&g_rx_queue, desc_index);
+    }
+    if (queue_notify(g_rx_queue.notify_token, g_rx_queue.index) == SYSCALL_OK) {
+        mmio_write_u16(g_rx_queue.notify_addr, g_rx_queue.index);
+    }
+    if (g_isr_base != 0) (void)mmio_read_u8(g_isr_base);
+}
+
+static void poll_tx_queue(void) {
+    while (*used_idx_ptr(&g_tx_queue) != g_tx_queue.last_used_idx) {
+        g_tx_in_flight = 0;
+        g_tx_completions++;
+        if (!g_tx_complete_logged) {
+            user_log("[virtio_net] VirtioNet: tx complete\n");
+            g_tx_complete_logged = 1;
+        }
+        g_tx_queue.last_used_idx++;
+        if (g_dhcp_offer_addr != 0 && !g_dhcp_request_sent) {
+            send_dhcp_request();
+        } else if (g_dhcp_sent && !g_arp_sent) {
+            send_arp_request(0x0A00020F, 0x0A000202);
+        }
+    }
+    if (!g_tx_in_flight && g_dhcp_offer_addr != 0 && !g_dhcp_request_sent) {
+        send_dhcp_request();
+    }
+}
+
+static void handle_net_connect_transfer(u64 transfer_id) {
+    const u64 request_paddr = accept_cap_transfer(transfer_id);
+    if (request_paddr < 0x1000) {
+        user_log("[virtio_net] VirtioNet: accept cap transfer failed\n");
+        return;
+    }
+    if (map_mmio_page(NET_REQUEST_VA, request_paddr, 0) != SYSCALL_OK) return;
+    volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+    if (request->magic != NET_PROTOCOL_REQUEST_MAGIC ||
+        request->version != NET_PROTOCOL_VERSION ||
+        request->op != NET_OP_CONNECT ||
+        request->request_seq == 0 ||
+        request->arg0 < 0x1000 ||
+        request->session_nonce == 0)
+    {
+        user_log("[virtio_net] VirtioNet: invalid connect request\n");
+        return;
+    }
+    if (map_mmio_page(NET_RESPONSE_VA, request->arg0, 1) != SYSCALL_OK) return;
+    memset((void *)NET_RESPONSE_VA, 0, 4096);
+    g_session.active = 1;
+    g_session.request_paddr = request_paddr;
+    g_session.response_paddr = request->arg0;
+    g_session.reply_endpoint_id = install_endpoint(NET_REPLY_ENDPOINT_ID, request->arg1) == SYSCALL_OK ? NET_REPLY_ENDPOINT_ID : 0;
+    g_session.session_nonce = request->session_nonce;
+    g_session.last_completed_seq = 0;
+    write_net_response(NET_OP_CONNECT, request->request_seq, NET_STATUS_OK, 0, 0, 0, 0);
+    g_session.last_completed_seq = request->request_seq;
+    user_log("[virtio_net] VirtioNet: session connect ok\n");
+}
+
+static void handle_net_request(void) {
+    if (!g_session.active) return;
+    volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+    if (request->magic != NET_PROTOCOL_REQUEST_MAGIC || request->version != NET_PROTOCOL_VERSION) return;
+    const u64 seq = request->request_seq;
+    if (seq == 0 || seq <= g_session.last_completed_seq) return;
+    if (request->session_nonce != g_session.session_nonce) return;
+
+    if (request->op == NET_OP_GET_STATUS) {
+        write_net_status_payload();
+        write_net_response(
+            NET_OP_GET_STATUS,
+            seq,
+            NET_STATUS_OK,
+            sizeof(struct net_status_payload),
+            g_ipv4_addr,
+            g_gateway_addr,
+            g_dns_addr
+        );
+    } else if (request->op == NET_OP_CONNECT) {
+        write_net_response(NET_OP_CONNECT, seq, NET_STATUS_OK, 0, 0, 0, 0);
+    } else {
+        write_net_response(request->op, seq, NET_STATUS_INVALID, 0, 0, 0, 0);
+    }
+    g_session.last_completed_seq = seq;
+}
+
+void virtio_net_main(void) {
+    user_log("[virtio_net] VirtioNet: started\n");
+    wait_for_boot_resources();
+    if (!init_virtio()) {
+        cfg_write(NET_DRIVER_STATUS_INDEX, NET_STATUS_FAILED);
+        if (g_common_base != 0) {
+            mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, (u8)(mmio_read_u8(g_common_base + COMMON_DEVICE_STATUS) | STATUS_FAILED));
+        }
+        user_log("[virtio_net] VirtioNet: init failed\n");
+        for (;;) wait_event(0, 1);
+    }
+    cfg_write(NET_DRIVER_STATUS_INDEX, NET_STATUS_READY);
+    log_mac();
+    user_log("[virtio_net] VirtioNet: queue ready\n");
+    send_dhcp_discover();
+
+    for (;;) {
+        poll_tx_queue();
+        poll_rx_queue();
+        const u64 received = wait_event(1, 1);
+        if (received >= CAP_TRANSFER_ID_MIN) handle_net_connect_transfer(received);
+        handle_net_request();
+    }
+}

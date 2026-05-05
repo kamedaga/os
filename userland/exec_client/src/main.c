@@ -44,7 +44,6 @@ static void process_exit(u64 code) {
 
 void exec_client_main(void) {
     user_log("ExecClient: started\n");
-
     static const char *argv[] = {
         "/cmd/dash.elf",
         "/cmd/linux_smoke.sh",

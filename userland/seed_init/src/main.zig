@@ -11,6 +11,7 @@ const init_bootstrap_abi = @import("abi_root").init_bootstrap_abi;
 const input_bootstrap = @import("abi_root").input_driver_bootstrap_abi;
 const manager_init_bootstrap_abi = @import("abi_root").manager_init_bootstrap_abi;
 const block_bootstrap = @import("abi_root").block_bootstrap_abi;
+const console_bootstrap = @import("abi_root").console_bootstrap_abi;
 const gpu_bootstrap = @import("abi_root").gpu_bootstrap_abi;
 const gpu_protocol = @import("abi_root").gpu_protocol;
 const persistent_fs_bootstrap = @import("abi_root").persistent_fs_bootstrap_abi;
@@ -41,6 +42,8 @@ const virtio_blk_device_modern: u64 = 0x1042;
 const virtio_blk_subsystem_id: u64 = 0x0002;
 const virtio_gpu_device_modern: u64 = 0x1050;
 const virtio_gpu_subsystem_id: u64 = 0x0010;
+const virtio_console_device_modern: u64 = 0x1043;
+const virtio_console_subsystem_id: u64 = 0x0003;
 const input_cfg_select: u64 = 0;
 const input_cfg_subsel: u64 = 1;
 const input_cfg_size: u64 = 2;
@@ -71,6 +74,7 @@ const startup_ready_name_max: usize = startup_plan_abi.max_startup_program_descr
 
 const InputDeviceKind = startup_plan_abi.StartupInputSelector;
 const BlockDeviceKind = startup_plan_abi.StartupBlockSelector;
+const StartupDeviceKind = startup_plan_abi.StartupDeviceSelector;
 
 const BlockGeometry = struct {
     capacity_sectors: u64,
@@ -111,6 +115,7 @@ const StartupPolicy = struct {
     provide_count: usize = 0,
     provide_names: [startup_named_dependency_max][]const u8 = [_][]const u8{""} ** startup_named_dependency_max,
     block_kind: ?BlockDeviceKind = null,
+    device_kind: ?StartupDeviceKind = null,
     input_kind: ?InputDeviceKind = null,
 };
 
@@ -141,6 +146,8 @@ var next_inspect_mmio_page_va: u64 = inspect_mmio_base_va;
 var mmio_cap_cache = MmioCapCache{};
 var block_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
 var block_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
+var console_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
+var console_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 var gpu_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
 var gpu_bootstrap_table_storage = process_abi.BootstrapDescriptorTable{};
 var persistent_fs_bootstrap_pages_storage: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined;
@@ -504,6 +511,12 @@ fn isVirtioGpuDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) 
         (descriptor.device_id == virtio_gpu_device_modern or descriptor.subsystem_id == virtio_gpu_subsystem_id);
 }
 
+fn isVirtioConsoleDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
+    return descriptor.transport == @intFromEnum(init_bootstrap_abi.DeviceTransport.virtio_pci_modern) and
+        descriptor.vendor_id == virtio_vendor_id and
+        (descriptor.device_id == virtio_console_device_modern or descriptor.subsystem_id == virtio_console_subsystem_id);
+}
+
 fn appendDeviceMmioPage(set: *DeviceMmioPageSet, paddr: u64, rights_bits: u64) bool {
     if (paddr == 0) return true;
     var i: usize = 0;
@@ -800,6 +813,21 @@ fn findGpuDeviceDescriptor(
     return null;
 }
 
+fn findConsoleDeviceDescriptor(
+    bootstrap_handoff: manager_init_bootstrap_abi.ConfigPage,
+) ?init_bootstrap_abi.DeviceDescriptor {
+    const page = descriptorPage() orelse return null;
+    var i: usize = 0;
+    while (i < page.device_count and i < init_bootstrap_abi.max_device_descriptors) : (i += 1) {
+        const descriptor = page.devices[i];
+        if (!isBootstrapDeviceDescriptorPresent(descriptor)) continue;
+        if (!isVirtioConsoleDeviceDescriptor(descriptor)) continue;
+        if (!deviceHasBootstrapQueueGrant(bootstrap_handoff, descriptor)) continue;
+        return descriptor;
+    }
+    return null;
+}
+
 fn requireInputDeviceDescriptor(
     bootstrap_handoff: manager_init_bootstrap_abi.ConfigPage,
     kind: InputDeviceKind,
@@ -982,6 +1010,7 @@ fn defaultStartupPolicyLabel(policy: *const StartupPolicy) []const u8 {
         .vfs => "vfs",
         .input_driver => "input driver",
         .block_driver => "block driver",
+        .console_driver => "console driver",
         .gpu_driver => "gpu driver",
         .persistent_fs_server => "persistent fs",
         .fat_server => "fat server",
@@ -1007,6 +1036,7 @@ fn validateStartupPolicy(policy: *StartupPolicy) void {
         .vfs => {},
         .input_driver => if (policy.input_kind == null) startupManifestFail("ManagerInit: startup input driver missing selector\n"),
         .block_driver => if (policy.block_kind == null) startupManifestFail("ManagerInit: startup block driver missing selector\n"),
+        .console_driver => if (policy.device_kind == null) startupManifestFail("ManagerInit: startup console driver missing selector\n"),
         .gpu_driver => {},
         .persistent_fs_server => {},
         .fat_server => {},
@@ -1072,6 +1102,10 @@ fn parseStartupPolicyToken(policy: *StartupPolicy, token: []const u8, has_action
         policy.input_kind = startup_plan_abi.inputSelectorFromKey(value) orelse startupManifestFail("ManagerInit: unknown startup input selector\n");
         return;
     }
+    if (std.mem.eql(u8, key, "device")) {
+        policy.device_kind = startup_plan_abi.deviceSelectorFromKey(value) orelse startupManifestFail("ManagerInit: unknown startup device selector\n");
+        return;
+    }
     startupManifestFail("ManagerInit: unknown startup manifest key\n");
 }
 
@@ -1131,6 +1165,8 @@ fn allocChildServiceRegistryPage(
     block_endpoint_id: ?u64,
     gpu_process_slot: ?u64,
     gpu_endpoint_id: ?u64,
+    console_process_slot: ?u64,
+    console_endpoint_id: ?u64,
     persistent_fs_process_slot: ?u64,
     persistent_fs_endpoint_id: ?u64,
 ) ?u64 {
@@ -1148,6 +1184,9 @@ fn allocChildServiceRegistryPage(
     }
     if (gpu_process_slot != null and gpu_endpoint_id != null) {
         service_registry_abi.addServiceWithProcessSlot(source_va, .gpu, gpu_process_slot.?, gpu_endpoint_id.?);
+    }
+    if (console_process_slot != null and console_endpoint_id != null) {
+        service_registry_abi.addServiceWithProcessSlot(source_va, .console, console_process_slot.?, console_endpoint_id.?);
     }
     if (persistent_fs_process_slot != null and persistent_fs_endpoint_id != null) {
         service_registry_abi.addServiceWithProcessSlot(source_va, .persistent_fs, persistent_fs_process_slot.?, persistent_fs_endpoint_id.?);
@@ -1174,6 +1213,7 @@ const LaunchContext = struct {
     keyboard_input: init_bootstrap_abi.DeviceDescriptor,
     pointer_input: ?init_bootstrap_abi.DeviceDescriptor = null,
     block_device: init_bootstrap_abi.DeviceDescriptor,
+    console_device: ?init_bootstrap_abi.DeviceDescriptor = null,
     gpu_device: ?init_bootstrap_abi.DeviceDescriptor = null,
     window_service_page: init_bootstrap_abi.SpawnPageDescriptor,
     window_service: ?service_registry_abi.ServiceEntry = null,
@@ -1199,6 +1239,9 @@ const LaunchContext = struct {
     gpu_process_slot: ?u64 = null,
     gpu_endpoint_id: ?u64 = null,
     gpu_policy: ?StartupPolicy = null,
+    console_process_slot: ?u64 = null,
+    console_endpoint_id: ?u64 = null,
+    console_policy: ?StartupPolicy = null,
     persistent_fs_process_slot: ?u64 = null,
     persistent_fs_endpoint_id: ?u64 = null,
     persistent_fs_policy: ?StartupPolicy = null,
@@ -1394,6 +1437,8 @@ const LaunchContext = struct {
             self.block_endpoint_id,
             self.gpu_process_slot,
             self.gpu_endpoint_id,
+            self.console_process_slot,
+            self.console_endpoint_id,
             self.persistent_fs_process_slot,
             self.persistent_fs_endpoint_id,
         ) orelse fail("ManagerInit: alloc shared service registry failed\n");
@@ -1924,6 +1969,7 @@ const LaunchContext = struct {
             .isr_page_offset = self.keyboard_input.isr_page_offset,
             .device_page_offset = self.keyboard_input.device_page_offset,
             .notify_off_multiplier = self.keyboard_input.notify_off_multiplier,
+            .resource_id = self.keyboard_input.resource_id,
         });
         const config_words: [*]volatile u64 = @ptrFromInt(config_source_va);
         config_words[init_bootstrap_abi.boot_display_config_width_index] = self.primary_display.width;
@@ -1998,6 +2044,7 @@ const LaunchContext = struct {
     fn currentReadyFlags(self: *const LaunchContext) u64 {
         var flags: u64 = 0;
         if (self.block_process_slot != null and self.block_endpoint_id != null) flags |= startup_plan_abi.require_flag_block_service;
+        if (self.console_process_slot != null and self.console_endpoint_id != null) flags |= startup_plan_abi.require_flag_console_service;
         if (self.persistent_fs_process_slot != null and self.persistent_fs_endpoint_id != null) flags |= startup_plan_abi.require_flag_persistent_fs_service;
         if (self.pointer_shared_source_va != null) flags |= startup_plan_abi.require_flag_pointer_shared;
         return flags;
@@ -2078,6 +2125,7 @@ const LaunchContext = struct {
                 .isr_page_offset = input_desc.isr_page_offset,
                 .device_page_offset = input_desc.device_page_offset,
                 .notify_off_multiplier = input_desc.notify_off_multiplier,
+                .resource_id = input_desc.resource_id,
             }),
             .pointer => input_bootstrap.writeMouseConfigPage(config_source_va, .{
                 .common_page_paddr = input_desc.common_page_paddr,
@@ -2093,6 +2141,7 @@ const LaunchContext = struct {
                 .screen_width = self.primary_display.width,
                 .screen_height = self.primary_display.height,
                 .screen_pitch = self.primary_display.pitch,
+                .resource_id = input_desc.resource_id,
             }),
         }
 
@@ -2164,6 +2213,7 @@ const LaunchContext = struct {
             .notify_off_multiplier = block_desc.notify_off_multiplier,
             .capacity_sectors = block_geometry.capacity_sectors,
             .logical_block_size = block_geometry.logical_block_size,
+            .resource_id = block_desc.resource_id,
         });
         block_bootstrap_pages_storage[0] = .{
             .source_va = config_source_va,
@@ -2239,6 +2289,74 @@ const LaunchContext = struct {
         self.block_policy = policy;
     }
 
+    fn launchConsoleDriverForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
+        _ = policy.device_kind orelse fail("ManagerInit: console device selector missing\n");
+        const console_desc = self.console_device orelse fail("ManagerInit: console device descriptor missing\n");
+        const exec = self.requireExecForPolicy(policy);
+        const rx_queue_grant = self.findQueueGrant(console_desc, console_bootstrap.rx_queue_index) orelse fail("ManagerInit: console rx queue grant missing\n");
+        const tx_queue_grant = self.findQueueGrant(console_desc, console_bootstrap.tx_queue_index) orelse fail("ManagerInit: console tx queue grant missing\n");
+        const endpoint_id = allocDynamicServiceEndpointId();
+        const config_source_va = self.allocWritableBootstrapPage("ManagerInit: alloc console driver config page failed\n");
+        const stdio_source_va = self.ensureSharedStdioBootstrapPage();
+        const args_env_source_va = self.ensureSharedProcessArgsEnvPage();
+        const exit_status_source_va = self.ensureSharedProcessExitStatusPage();
+        console_bootstrap.writeConfigPage(config_source_va, .{
+            .endpoint_id = endpoint_id,
+            .common_page_paddr = console_desc.common_page_paddr,
+            .notify_page_paddr = console_desc.notify_page_paddr,
+            .isr_page_paddr = console_desc.isr_page_paddr,
+            .device_page_paddr = console_desc.device_page_paddr,
+            .common_page_offset = console_desc.common_page_offset,
+            .notify_page_offset = console_desc.notify_page_offset,
+            .isr_page_offset = console_desc.isr_page_offset,
+            .device_page_offset = console_desc.device_page_offset,
+            .notify_off_multiplier = console_desc.notify_off_multiplier,
+            .resource_id = console_desc.resource_id,
+        });
+        console_bootstrap_pages_storage[0] = .{ .source_va = config_source_va, .target_va = process_abi.standard_config_target_va, .flags = process_abi.spawn_flag_bootstrap_page_writable };
+        console_bootstrap_pages_storage[1] = .{ .source_va = stdio_source_va, .target_va = stdio_bootstrap_abi.target_va, .flags = 0 };
+        console_bootstrap_pages_storage[2] = .{ .source_va = args_env_source_va, .target_va = process_args_env_bootstrap_abi.target_va, .flags = 0 };
+        console_bootstrap_pages_storage[3] = .{ .source_va = exit_status_source_va, .target_va = process_exit_bootstrap_abi.target_va, .flags = process_abi.spawn_flag_bootstrap_page_writable };
+        console_bootstrap_table_storage = .{};
+        console_bootstrap_table_storage.page_count = 4;
+        console_bootstrap_table_storage.page_descriptors[0] = console_bootstrap_pages_storage[0];
+        console_bootstrap_table_storage.page_descriptors[1] = console_bootstrap_pages_storage[1];
+        console_bootstrap_table_storage.page_descriptors[2] = console_bootstrap_pages_storage[2];
+        console_bootstrap_table_storage.page_descriptors[3] = console_bootstrap_pages_storage[3];
+
+        const spawned = spawnExecWithExtendedBootstrapTable(exec.token, &console_bootstrap_table_storage);
+        const child_slot = process_abi.decodeSpawnedProcessSlot(spawned) orelse {
+            self.logRoleLine("spawn", policy.label, "failed");
+            self.logRoleHex(policy.label, " spawn ret=", spawned);
+            fail("ManagerInit: console driver spawn failed\n");
+        };
+        self.logRoleLine("spawn", policy.label, "ok");
+        if (installEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: console endpoint install failed\n");
+        if (publishServiceEndpoint(endpoint_id, child_slot) != 0) fail("ManagerInit: console endpoint publish failed\n");
+        if (!ensureDeviceMmioCapsInstalled(console_desc)) fail("ManagerInit: console MMIO install failed\n");
+        if (!grantDeviceMmioPages(console_desc, child_slot)) fail("ManagerInit: console MMIO grant failed\n");
+        const iommu_child_encoded = grantQueueCap(queue_abi.encodeIommuCapToken(rx_queue_grant.iommu_token), child_slot);
+        const rx_submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(rx_queue_grant.submit_token), child_slot);
+        const rx_notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(rx_queue_grant.notify_token), child_slot);
+        const tx_submit_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(tx_queue_grant.submit_token), child_slot);
+        const tx_notify_child_encoded = grantQueueCap(queue_abi.encodeQueueCapToken(tx_queue_grant.notify_token), child_slot);
+        const command_child_encoded = grantQueueCap(queue_abi.encodeCommandCapToken(rx_queue_grant.command_token), child_slot);
+        const iommu_child = queue_abi.decodeIommuCapToken(iommu_child_encoded) orelse fail("ManagerInit: console iommu grant failed\n");
+        const rx_submit_child = queue_abi.decodeQueueCapToken(rx_submit_child_encoded) orelse fail("ManagerInit: console rx submit grant failed\n");
+        const rx_notify_child = queue_abi.decodeQueueCapToken(rx_notify_child_encoded) orelse fail("ManagerInit: console rx notify grant failed\n");
+        const tx_submit_child = queue_abi.decodeQueueCapToken(tx_submit_child_encoded) orelse fail("ManagerInit: console tx submit grant failed\n");
+        const tx_notify_child = queue_abi.decodeQueueCapToken(tx_notify_child_encoded) orelse fail("ManagerInit: console tx notify grant failed\n");
+        const command_child = queue_abi.decodeCommandCapToken(command_child_encoded) orelse fail("ManagerInit: console command grant failed\n");
+        console_bootstrap.writeGrantedCapabilityTokens(config_source_va, iommu_child, rx_submit_child, rx_notify_child, tx_submit_child, tx_notify_child, command_child);
+        _ = signalEndpoint(endpoint_id);
+        self.waitForConfigWord(config_source_va, console_bootstrap.driver_status_index, console_bootstrap.driver_status_ready);
+        service_registry_abi.setServiceWithProcessSlot(self.window_service_page.source_va, .console, child_slot, endpoint_id);
+        if (self.shared_service_registry_source_va) |source_va| service_registry_abi.setServiceWithProcessSlot(source_va, .console, child_slot, endpoint_id);
+        self.console_process_slot = child_slot;
+        self.console_endpoint_id = endpoint_id;
+        self.console_policy = policy;
+    }
+
     fn launchGpuDriverForPolicy(self: *LaunchContext, policy: StartupPolicy) void {
         const gpu_desc = self.gpu_device orelse fail("ManagerInit: gpu device descriptor missing\n");
         const exec = self.requireExecForPolicy(policy);
@@ -2260,6 +2378,7 @@ const LaunchContext = struct {
             .isr_page_offset = gpu_desc.isr_page_offset,
             .device_page_offset = gpu_desc.device_page_offset,
             .notify_off_multiplier = gpu_desc.notify_off_multiplier,
+            .resource_id = gpu_desc.resource_id,
         });
         gpu_bootstrap_pages_storage[0] = .{
             .source_va = config_source_va,
@@ -2405,6 +2524,8 @@ const LaunchContext = struct {
             self.block_endpoint_id,
             self.gpu_process_slot,
             self.gpu_endpoint_id,
+            self.console_process_slot,
+            self.console_endpoint_id,
             self.persistent_fs_process_slot,
             self.persistent_fs_endpoint_id,
         ) orelse fail("ManagerInit: alloc persistent fs registry failed\n");
@@ -2629,6 +2750,7 @@ const LaunchContext = struct {
             .vfs => self.launchVfsForPolicy(policy),
             .input_driver => self.launchInputDriverForPolicy(policy),
             .block_driver => self.launchBlockDriverForPolicy(policy),
+            .console_driver => self.launchConsoleDriverForPolicy(policy),
             .gpu_driver => self.launchGpuDriverForPolicy(policy),
             .window_service => self.launchWindowServiceForPolicy(policy),
             .persistent_fs_server => self.launchPersistentFsForPolicy(policy),
@@ -2685,6 +2807,7 @@ fn managerMain() noreturn {
     const keyboard_input = requireInputDeviceDescriptor(bootstrap_handoff, .keyboard, "ManagerInit: keyboard input descriptor missing\n");
     const pointer_input = findInputDeviceDescriptor(bootstrap_handoff, .pointer);
     const block_device = requireBlockDeviceDescriptor(bootstrap_handoff, .virtio_blk, "ManagerInit: block device descriptor missing\n");
+    const console_device = findConsoleDeviceDescriptor(bootstrap_handoff);
     const gpu_device = findGpuDeviceDescriptor(bootstrap_handoff);
     const window_service_page = requireSpawnPageDescriptor(.service_config, .window_service, "ManagerInit: window service descriptor missing\n");
 
@@ -2696,6 +2819,7 @@ fn managerMain() noreturn {
         .keyboard_input = keyboard_input,
         .pointer_input = pointer_input,
         .block_device = block_device,
+        .console_device = console_device,
         .gpu_device = gpu_device,
         .window_service_page = window_service_page,
         .window_service = window_service,
@@ -2737,4 +2861,3 @@ pub export fn _start() noreturn {
     }
     managerMain();
 }
-

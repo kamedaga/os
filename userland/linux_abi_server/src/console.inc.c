@@ -1,0 +1,176 @@
+static u64 make_console_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
+    u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x434f4e534f4c4555ULL;
+    return nonce == 0 ? 1 : nonce;
+}
+
+static int install_console_endpoint(void) {
+    if (g_console.endpoint_id == 0 || g_console.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_console.endpoint_id, g_console.process_slot) == SYSCALL_OK;
+}
+
+static int grant_console_response_page(void) {
+    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_console.response_paddr, g_console.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_console_endpoint()) ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_console.response_paddr, g_console.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
+    return ret == SYSCALL_OK;
+}
+
+static int share_console_request_page(void) {
+    u64 ret = syscall2(SYSCALL_SHARE_CAP, g_console.request_paddr, g_console.endpoint_id);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_console_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_console.request_paddr, g_console.endpoint_id);
+    return ret == SYSCALL_OK;
+}
+
+static int signal_console(void) {
+    u64 ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_console.endpoint_id, 0);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_console_endpoint()) ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_console.endpoint_id, 0);
+    return ret == SYSCALL_OK;
+}
+
+static int wait_console_response(u64 expected_seq, u16 expected_op, u64 poll_limit) {
+    volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
+    for (u64 i = 0; poll_limit == 0 || i < poll_limit; i++) {
+        if (response->response_seq == expected_seq) {
+            return response->magic == CONSOLE_RESPONSE_MAGIC &&
+                response->version == CONSOLE_PROTOCOL_VERSION &&
+                response->op == expected_op;
+        }
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+    return 0;
+}
+
+static int connect_console_from_registry(void) {
+    struct service_entry entry;
+    if (!find_service(SERVICE_KIND_CONSOLE, &entry)) return 0;
+    g_console.endpoint_id = entry.endpoint_id;
+    g_console.process_slot = entry.process_slot;
+    g_console.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    g_console.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    if (g_console.request_paddr < 0x1000 || g_console.response_paddr < 0x1000) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, CONSOLE_REQUEST_VA, g_console.request_paddr, 1) != SYSCALL_OK) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, CONSOLE_RESPONSE_VA, g_console.response_paddr, 1) != SYSCALL_OK) return 0;
+    if (!grant_console_response_page()) return 0;
+    clear_page(CONSOLE_REQUEST_VA);
+    clear_page(CONSOLE_RESPONSE_VA);
+
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    g_console.session_nonce = make_console_nonce(g_console.request_paddr, g_console.response_paddr, g_console.endpoint_id, self_slot);
+    volatile struct console_request_header *request = (volatile struct console_request_header *)CONSOLE_REQUEST_VA;
+    request->magic = CONSOLE_REQUEST_MAGIC;
+    request->version = CONSOLE_PROTOCOL_VERSION;
+    request->op = CONSOLE_OP_CONNECT;
+    request->session_nonce = g_console.session_nonce;
+    request->arg0 = g_console.response_paddr;
+    request->arg1 = self_slot;
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = 1;
+    if (!share_console_request_page()) return 0;
+    if (!wait_console_response(1, CONSOLE_OP_CONNECT, 8192)) return 0;
+    volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
+    if (response->status != CONSOLE_STATUS_OK) return 0;
+    g_console.next_seq = 2;
+    g_console.active = 1;
+    user_log("LinuxAbiServer: console connect ok\n");
+    return 1;
+}
+
+static int console_begin_request(u16 op, u32 length, const char *inline_src, u32 inline_bytes, u64 *seq_out) {
+    if (!g_console.active) return 0;
+    if (inline_bytes > CONSOLE_REQUEST_PAYLOAD_BYTES) return 0;
+    clear_page(CONSOLE_REQUEST_VA);
+    clear_page(CONSOLE_RESPONSE_VA);
+    volatile struct console_request_header *request = (volatile struct console_request_header *)CONSOLE_REQUEST_VA;
+    const u64 seq = g_console.next_seq++;
+    request->magic = CONSOLE_REQUEST_MAGIC;
+    request->version = CONSOLE_PROTOCOL_VERSION;
+    request->op = op;
+    request->session_nonce = g_console.session_nonce;
+    request->length = length;
+    request->flags = 0;
+    request->arg0 = 0;
+    request->arg1 = 0;
+    request->arg2 = 0;
+    request->reserved0 = 0;
+    if (inline_bytes != 0) {
+        volatile u8 *payload = (volatile u8 *)(CONSOLE_REQUEST_VA + CONSOLE_REQUEST_HEADER_BYTES);
+        for (u32 i = 0; i < inline_bytes; i++) payload[i] = (u8)inline_src[i];
+    }
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    if (!signal_console()) return 0;
+    *seq_out = seq;
+    return 1;
+}
+
+static u64 console_write_bytes(const char *bytes, u64 len) {
+    if (!g_console.active) {
+        user_log("LinuxAbiServer: console write inactive\n");
+        return errno_io();
+    }
+    u64 done = 0;
+    while (done < len) {
+        u64 chunk = min_u64(len - done, CONSOLE_REQUEST_PAYLOAD_BYTES);
+        u64 seq = 0;
+        if (!console_begin_request(CONSOLE_OP_WRITE, (u32)chunk, bytes + done, (u32)chunk, &seq)) {
+            user_log("LinuxAbiServer: console write begin failed\n");
+            return done != 0 ? done : errno_io();
+        }
+        if (!wait_console_response(seq, CONSOLE_OP_WRITE, 8192)) {
+            user_log("LinuxAbiServer: console write response timeout\n");
+            return done != 0 ? done : errno_io();
+        }
+        volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
+        if (response->status != CONSOLE_STATUS_OK) {
+            user_log("LinuxAbiServer: console write status=");
+            user_log_hex_value(response->status);
+            return done != 0 ? done : errno_io();
+        }
+        done += chunk;
+    }
+    return done;
+}
+
+static u64 console_write_from_target(u64 src, u64 len, int *fault) {
+    *fault = 0;
+    u64 done = 0;
+    while (done < len) {
+        char buf[128];
+        const u64 chunk = min_u64(len - done, sizeof(buf));
+        if (copy_from_target(src + done, buf, chunk) != chunk) {
+            *fault = 1;
+            return done;
+        }
+        const u64 n = console_write_bytes(buf, chunk);
+        if (n != chunk) return done != 0 ? done : n;
+        done += chunk;
+    }
+    return done;
+}
+
+static u64 console_read_to_target(u64 dst, u64 len, int *fault) {
+    *fault = 0;
+    if (!g_console.active) return errno_io();
+    if (len == 0) return 0;
+    const u32 request_len = (u32)min_u64(len, CONSOLE_RESPONSE_PAYLOAD_BYTES);
+    for (;;) {
+        u64 seq = 0;
+        if (!console_begin_request(CONSOLE_OP_READ, request_len, 0, 0, &seq)) return errno_io();
+        if (!wait_console_response(seq, CONSOLE_OP_READ, 0)) return errno_io();
+        volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
+        if (response->status == CONSOLE_STATUS_AGAIN) {
+            (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+            continue;
+        }
+        if (response->status != CONSOLE_STATUS_OK) return errno_io();
+        const u64 n = min_u64(response->inline_bytes, request_len);
+        if (n == 0) continue;
+        if (copy_to_target(dst, (const void *)(CONSOLE_RESPONSE_VA + CONSOLE_RESPONSE_HEADER_BYTES), n) != n) {
+            *fault = 1;
+            return 0;
+        }
+        return n;
+    }
+}

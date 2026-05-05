@@ -88,3 +88,85 @@ static struct ipc_message handle_membarrier(const struct trap_request *req) {
     if ((cmd & ~supported) != 0) return reply(errno_inval(), 0);
     return reply(0, 0);
 }
+
+static struct ipc_message handle_sched_getaffinity(const struct trap_request *req) {
+    const u64 cpu_set_size = req->args[1];
+    const u64 mask_va = req->args[2];
+    if (cpu_set_size == 0 || mask_va == 0) return reply(errno_inval(), 0);
+
+    u8 mask[128];
+    const u64 n = min_u64(cpu_set_size, sizeof(mask));
+    for (u64 i = 0; i < n; i++) mask[i] = 0;
+    mask[0] = 1;
+    return copy_to_target(mask_va, mask, n) == n ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+struct linux_termios_kernel {
+    u32 c_iflag;
+    u32 c_oflag;
+    u32 c_cflag;
+    u32 c_lflag;
+    u8 c_line;
+    u8 c_cc[19];
+    u32 c_ispeed;
+    u32 c_ospeed;
+};
+
+struct linux_winsize {
+    u16 ws_row;
+    u16 ws_col;
+    u16 ws_xpixel;
+    u16 ws_ypixel;
+};
+
+static int fd_is_stdio_tty(u64 fd) {
+    return fd_is_tty_like(fd);
+}
+
+static void fill_default_termios(struct linux_termios_kernel *termios) {
+    u8 *p = (u8 *)termios; for (u64 i = 0; i < sizeof(*termios); i++) p[i] = 0;
+    termios->c_iflag = 0000400; /* ICRNL */
+    termios->c_oflag = 0000001 | 0000004; /* OPOST | ONLCR */
+    termios->c_cflag = 0000060 | 0000400 | 0000200; /* CS8 | CREAD | HUPCL */
+    termios->c_lflag = 0000001 | 0000002 | 0000010 | 0000020 | 0000100; /* ISIG | ICANON | ECHO | ECHOE | ECHOK */
+    termios->c_cc[0] = 3;   /* VINTR */
+    termios->c_cc[1] = 28;  /* VQUIT */
+    termios->c_cc[2] = 127; /* VERASE */
+    termios->c_cc[3] = 21;  /* VKILL */
+    termios->c_cc[4] = 4;   /* VEOF */
+    termios->c_cc[5] = 0;   /* VTIME */
+    termios->c_cc[6] = 1;   /* VMIN */
+    termios->c_cc[8] = 17;  /* VSTART */
+    termios->c_cc[9] = 19;  /* VSTOP */
+    termios->c_cc[10] = 26; /* VSUSP */
+    termios->c_ispeed = 15; /* B38400 */
+    termios->c_ospeed = 15; /* B38400 */
+}
+
+static struct ipc_message handle_ioctl(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const u64 request = req->args[1];
+    const u64 argp = req->args[2];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    if (!fd_is_stdio_tty(fd)) return reply(errno_notty(), 0);
+
+    if (request == TCGETS) {
+        struct linux_termios_kernel termios;
+        fill_default_termios(&termios);
+        return copy_to_target(argp, &termios, sizeof(termios)) == sizeof(termios) ? reply(0, 0) : reply(errno_fault(), 0);
+    }
+    if (request == TIOCGWINSZ) {
+        struct linux_winsize ws;
+        ws.ws_row = 40;
+        ws.ws_col = 120;
+        ws.ws_xpixel = 0;
+        ws.ws_ypixel = 0;
+        return copy_to_target(argp, &ws, sizeof(ws)) == sizeof(ws) ? reply(0, 0) : reply(errno_fault(), 0);
+    }
+    if (request == TIOCGPGRP) {
+        const u32 pgrp = (u32)(g_proc && g_proc->pid != 0 ? g_proc->pid : 1);
+        return copy_to_target(argp, &pgrp, sizeof(pgrp)) == sizeof(pgrp) ? reply(0, 0) : reply(errno_fault(), 0);
+    }
+    if (request == TCSETS || request == TCSETSW || request == TCSETSF || request == TIOCSPGRP || request == TIOCSWINSZ) return reply(0, 0);
+    return reply(errno_inval(), 0);
+}

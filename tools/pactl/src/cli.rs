@@ -2,7 +2,7 @@ use crate::build::{build_userland, BuildOptions};
 use crate::config::{discover_apps, find_workspace_root, load_workspace_config, AppConfig};
 use crate::disk::{ensure_disk_image, DiskEnsureMode};
 use crate::manifest::generate_manifests;
-use crate::run::{run_qemu, RunOptions};
+use crate::run::{run_qemu, ConsoleBackend, DisplayBackend, RunOptions};
 use crate::setup::{setup_workspace, SetupMode};
 use crate::sync::{sync_bootfs, sync_rootfs};
 use std::env;
@@ -107,7 +107,8 @@ fn print_help() {
     println!("  pactl setup [diff|full]   (default: diff)");
     println!("  pactl sync rootfs");
     println!("  pactl sync bootfs");
-    println!("  pactl run [--timed] [--pf-check <jobs>] [--no-kvm] [--dry-run]");
+    println!("  pactl run [--timed] [--pf-check <jobs>] [--no-kvm] [--dry-run] [--console=off|pty|stdio] [--display=gtk|none] [--split-windows]");
+    println!("    run defaults: --console=stdio --display=gtk; timed/pf-check and --split-windows default to --console=pty");
     println!("  pactl gen manifests");
 }
 
@@ -346,8 +347,12 @@ fn cmd_run(
         kvm: true,
         dry_run: false,
         pf_check_jobs: 0,
+        console: ConsoleBackend::Pty,
+        display: DisplayBackend::Gtk,
+        split_windows: false,
     };
 
+    let mut console_specified = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -355,6 +360,21 @@ fn cmd_run(
             "--timed" => options.timed = true,
             "--no-kvm" => options.kvm = false,
             "--dry-run" => options.dry_run = true,
+            "--split-windows" => options.split_windows = true,
+            "--console=off" => {
+                options.console = ConsoleBackend::Off;
+                console_specified = true;
+            }
+            "--console=pty" => {
+                options.console = ConsoleBackend::Pty;
+                console_specified = true;
+            }
+            "--console=stdio" => {
+                options.console = ConsoleBackend::Stdio;
+                console_specified = true;
+            }
+            "--display=gtk" => options.display = DisplayBackend::Gtk,
+            "--display=none" => options.display = DisplayBackend::None,
             "--pf-check" => {
                 i += 1;
                 let jobs = args
@@ -374,16 +394,41 @@ fn cmd_run(
         }
         i += 1;
     }
-
+    if !console_specified && !options.timed && options.pf_check_jobs == 0 {
+        options.console = if options.split_windows {
+            ConsoleBackend::Pty
+        } else {
+            ConsoleBackend::Stdio
+        };
+    }
     let plan = run_qemu(workspace_root, workspace, &options)?;
     println!("disk: {}", plan.disk_image.display());
     println!("ovmf vars: {}", plan.ovmf_vars.display());
     println!("qemu log: {}", plan.qemu_log.display());
     println!("kvm: {}", if options.kvm { "on" } else { "off" });
     println!("timed: {}", if options.timed { "on" } else { "off" });
+    println!(
+        "console: {}",
+        match options.console {
+            ConsoleBackend::Off => "off",
+            ConsoleBackend::Pty => "pty",
+            ConsoleBackend::Stdio => "stdio",
+        }
+    );
+    println!(
+        "display: {}",
+        match options.display {
+            DisplayBackend::Gtk => "gtk",
+            DisplayBackend::None => "none",
+        }
+    );
     if options.pf_check_jobs != 0 {
         println!("pf-check jobs: {}", options.pf_check_jobs);
     }
+    println!(
+        "split windows: {}",
+        if options.split_windows { "on" } else { "off" }
+    );
     if let Some(serial_log) = plan.serial_log {
         println!("serial log: {}", serial_log.display());
     }

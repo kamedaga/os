@@ -11,8 +11,6 @@ pub const CommandOpcodeClass = dma_mapping_manager.CommandOpcodeClass;
 pub const CommandCapability = dma_mapping_manager.CommandCapability;
 pub const CommandCapabilityTable = dma_mapping_manager.CommandCapabilityTable;
 
-const iommu_devices = [_]kernel.DmaDeviceId{ .virtio_gpu, .virtio_input, .virtio_blk };
-
 pub fn principalHasIommuCapForDevice(state: *const kernel.KernelState, principal: kernel.PrincipalId, device: kernel.DmaDeviceId) bool {
     const owner_raw: u8 = @intCast(@intFromEnum(principal));
     for (state.iommu_caps.entries) |cap| {
@@ -72,14 +70,22 @@ pub fn syncIommuForPrincipalPaddr(
     reason: kernel.IommuSyncReason,
 ) kernel.KernelError!void {
     if (state.iommu.mode == .off) return;
-    inline for (iommu_devices) |device| {
-        try syncIommuForPrincipalDevicePaddr(state, principal, device, paddr, reason);
+    const owner_raw: u8 = @intCast(@intFromEnum(principal));
+    for (state.iommu_caps.entries) |cap| {
+        if (!cap.valid or cap.owner_principal_raw != owner_raw) continue;
+        try syncIommuForPrincipalDevicePaddr(state, principal, cap.device, paddr, reason);
+    }
+    for (state.queue_caps.entries) |cap| {
+        if (!cap.valid or cap.owner_principal_raw != owner_raw) continue;
+        try syncIommuForPrincipalDevicePaddr(state, principal, cap.device, paddr, reason);
     }
 }
 
 pub fn iommuHasMappingForPrincipalForTest(state: *const kernel.KernelState, principal: kernel.PrincipalId, paddr: u64) bool {
-    inline for (iommu_devices) |device| {
-        if (state.iommuFindMappingIndex(principal, device, paddr) != null) return true;
+    for (state.iommu.mappings) |entry| {
+        if (!entry.valid) continue;
+        if (entry.principal != principal or entry.paddr != paddr) continue;
+        return true;
     }
     return false;
 }

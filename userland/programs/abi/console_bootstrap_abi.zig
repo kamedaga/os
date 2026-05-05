@@ -1,0 +1,97 @@
+pub const config_magic: u64 = 0x434F_4E43; // "CONC"
+pub const config_version: u64 = 1;
+
+pub const endpoint_id_index: usize = 2;
+pub const common_page_paddr_index: usize = 3;
+pub const notify_page_paddr_index: usize = 4;
+pub const isr_page_paddr_index: usize = 5;
+pub const device_page_paddr_index: usize = 6;
+pub const common_page_offset_index: usize = 7;
+pub const notify_page_offset_index: usize = 8;
+pub const isr_page_offset_index: usize = 9;
+pub const device_page_offset_index: usize = 10;
+pub const notify_off_multiplier_index: usize = 11;
+pub const iommu_token_index: usize = 12;
+pub const rx_queue_submit_token_index: usize = 13;
+pub const rx_queue_notify_token_index: usize = 14;
+pub const tx_queue_submit_token_index: usize = 15;
+pub const tx_queue_notify_token_index: usize = 16;
+pub const command_token_index: usize = 17;
+pub const resource_id_index: usize = 18;
+pub const driver_status_index: usize = 19;
+
+pub const rx_queue_index: u16 = 0;
+pub const tx_queue_index: u16 = 1;
+pub const control_rx_queue_index: u16 = 2;
+pub const control_tx_queue_index: u16 = 3;
+
+pub const driver_status_ready: u64 = 0x4352_4459; // "CRDY"
+
+pub const ConfigPageDescriptor = struct {
+    endpoint_id: u64,
+    common_page_paddr: u64,
+    notify_page_paddr: u64,
+    isr_page_paddr: u64,
+    device_page_paddr: u64,
+    common_page_offset: u64,
+    notify_page_offset: u64,
+    isr_page_offset: u64,
+    device_page_offset: u64,
+    notify_off_multiplier: u64,
+    iommu_token: u64 = 0,
+    rx_queue_submit_token: u64 = 0,
+    rx_queue_notify_token: u64 = 0,
+    tx_queue_submit_token: u64 = 0,
+    tx_queue_notify_token: u64 = 0,
+    command_token: u64 = 0,
+    resource_id: u64 = 0,
+};
+
+pub fn writeConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
+    const words: [*]volatile u64 = @ptrFromInt(base_va);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) words[i] = 0;
+
+    words[0] = config_magic;
+    words[1] = config_version;
+    words[endpoint_id_index] = descriptor.endpoint_id;
+    words[common_page_paddr_index] = descriptor.common_page_paddr;
+    words[notify_page_paddr_index] = descriptor.notify_page_paddr;
+    words[isr_page_paddr_index] = descriptor.isr_page_paddr;
+    words[device_page_paddr_index] = descriptor.device_page_paddr;
+    words[common_page_offset_index] = descriptor.common_page_offset;
+    words[notify_page_offset_index] = descriptor.notify_page_offset;
+    words[isr_page_offset_index] = descriptor.isr_page_offset;
+    words[device_page_offset_index] = descriptor.device_page_offset;
+    words[notify_off_multiplier_index] = descriptor.notify_off_multiplier;
+    words[iommu_token_index] = descriptor.iommu_token;
+    words[rx_queue_submit_token_index] = descriptor.rx_queue_submit_token;
+    words[rx_queue_notify_token_index] = descriptor.rx_queue_notify_token;
+    words[tx_queue_submit_token_index] = descriptor.tx_queue_submit_token;
+    words[tx_queue_notify_token_index] = descriptor.tx_queue_notify_token;
+    words[command_token_index] = descriptor.command_token;
+    words[resource_id_index] = descriptor.resource_id;
+}
+
+pub fn writeGrantedCapabilityTokens(
+    base_va: u64,
+    iommu_token: u64,
+    rx_submit_token: u64,
+    rx_notify_token: u64,
+    tx_submit_token: u64,
+    tx_notify_token: u64,
+    command_token: u64,
+) void {
+    const words: [*]volatile u64 = @ptrFromInt(base_va);
+    words[iommu_token_index] = iommu_token;
+    words[rx_queue_submit_token_index] = rx_submit_token;
+    words[rx_queue_notify_token_index] = rx_notify_token;
+    words[tx_queue_submit_token_index] = tx_submit_token;
+    words[tx_queue_notify_token_index] = tx_notify_token;
+    words[command_token_index] = command_token;
+}
+
+pub fn writeDriverStatus(base_va: u64, status: u64) void {
+    const words: [*]volatile u64 = @ptrFromInt(base_va);
+    words[driver_status_index] = status;
+}

@@ -165,5 +165,3 @@ fn run_command(label: &str, cmd: &mut Command) -> Result<(), String> {
         ))
     }
 }
-
-

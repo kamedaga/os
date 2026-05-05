@@ -6,6 +6,7 @@ pub const queue_submit_token_index: usize = 14;
 pub const queue_notify_token_index: usize = 15;
 pub const command_token_index: usize = 16;
 pub const shared_target_va_index: usize = 20;
+pub const resource_id_index: usize = 21;
 pub const pointer_shared_target_va: u64 = 0x3C00_3000;
 
 pub const ConfigPageDescriptor = struct {
@@ -25,6 +26,7 @@ pub const ConfigPageDescriptor = struct {
     queue_submit_token: u64 = 0,
     queue_notify_token: u64 = 0,
     command_token: u64 = 0,
+    resource_id: u64 = 0,
     screen_width: u64 = 0,
     screen_height: u64 = 0,
     screen_pitch: u64 = 0,
@@ -63,6 +65,7 @@ pub fn writeMouseConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void
     words[18] = descriptor.screen_height;
     words[19] = descriptor.screen_pitch;
     words[shared_target_va_index] = descriptor.shared_target_va;
+    words[resource_id_index] = descriptor.resource_id;
 }
 
 pub fn writeKeyboardConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
@@ -84,6 +87,7 @@ pub fn writeKeyboardConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) v
     words[queue_submit_token_index] = descriptor.queue_submit_token;
     words[queue_notify_token_index] = descriptor.queue_notify_token;
     words[command_token_index] = descriptor.command_token;
+    words[resource_id_index] = descriptor.resource_id;
     words[shared_target_va_index] = descriptor.shared_target_va;
 }
 

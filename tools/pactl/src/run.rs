@@ -8,7 +8,7 @@ use std::time::SystemTime;
 const OVMF_CODE_PATH: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 const OVMF_VARS_TEMPLATE_PATH: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 const QEMU_DEBUG_FLAGS: &str = "guest_errors,cpu_reset";
-const TIMED_RUN_SECONDS: u32 = 35;
+const TIMED_RUN_SECONDS: u32 = 60;
 const PF_CHECK_RUN_SECONDS: u32 = 60;
 
 pub struct RunOptions {
@@ -16,6 +16,22 @@ pub struct RunOptions {
     pub kvm: bool,
     pub dry_run: bool,
     pub pf_check_jobs: usize,
+    pub console: ConsoleBackend,
+    pub display: DisplayBackend,
+    pub split_windows: bool,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum ConsoleBackend {
+    Off,
+    Pty,
+    Stdio,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum DisplayBackend {
+    Gtk,
+    None,
 }
 
 pub struct RunPlan {
@@ -54,6 +70,19 @@ pub fn run_qemu(
     workspace: &WorkspaceConfig,
     options: &RunOptions,
 ) -> Result<RunPlan, String> {
+    if options.console == ConsoleBackend::Stdio && (options.timed || options.pf_check_jobs != 0) {
+        return Err("--console=stdio cannot be combined with timed or pf-check runs because those consume stdio for the serial log".to_string());
+    }
+    if options.split_windows {
+        if options.console != ConsoleBackend::Pty {
+            return Err("--split-windows requires --console=pty".to_string());
+        }
+        if options.timed || options.pf_check_jobs != 0 {
+            return Err(
+                "--split-windows cannot be combined with timed or pf-check runs".to_string(),
+            );
+        }
+    }
     let artifact_dir = workspace_root.join(&workspace.artifacts.dir);
     fs::create_dir_all(&artifact_dir)
         .map_err(|err| format!("failed to create {}: {err}", artifact_dir.display()))?;
@@ -61,7 +90,11 @@ pub fn run_qemu(
     let disk_image = workspace_root.join(&workspace.disk.image);
     let ovmf_vars = artifact_dir.join("OVMF_VARS.fd");
     let qemu_log = artifact_dir.join("qemu.log");
-    let serial_log = options.timed.then(|| artifact_dir.join("serial-timed.log"));
+    let serial_log = if options.timed {
+        Some(artifact_dir.join("serial-timed.log"))
+    } else {
+        None
+    };
     let summary_log = options
         .timed
         .then(|| artifact_dir.join("boot-timing-summary.txt"));
@@ -70,7 +103,8 @@ pub fn run_qemu(
 
     if options.pf_check_jobs != 0 {
         let summary_log = artifact_dir.join("pf-check").join("summary.txt");
-        let script = build_wsl_pf_check_script(workspace_root, &artifact_dir, &disk_image, options)?;
+        let script =
+            build_wsl_pf_check_script(workspace_root, &artifact_dir, &disk_image, options)?;
         if !options.dry_run {
             let status = Command::new("wsl")
                 .arg("-e")
@@ -280,6 +314,11 @@ fn build_wsl_script(
         runtime_slug(workspace_root)
     );
 
+    let serial_backend = if options.console == ConsoleBackend::Stdio {
+        "-serial file:$RUNTIME_DIR/serial.log".to_string()
+    } else {
+        "-serial stdio".to_string()
+    };
     let mut qemu_parts = vec![
         "qemu-system-x86_64".to_string(),
         "-machine q35".to_string(),
@@ -289,11 +328,6 @@ fn build_wsl_script(
         "-monitor none".to_string(),
         format!("-d {QEMU_DEBUG_FLAGS}"),
         format!("-D {}", bash_quote(&runtime_qemu_log_wsl)),
-        "-display gtk,gl=on,grab-on-hover=off".to_string(),
-        "-vga none".to_string(),
-        "-device virtio-vga-gl,xres=1920,yres=1080".to_string(),
-        "-device virtio-tablet-pci".to_string(),
-        "-device virtio-keyboard-pci".to_string(),
         format!(
             "-drive if=pflash,format=raw,readonly=on,file={}",
             bash_quote(OVMF_CODE_PATH)
@@ -304,8 +338,11 @@ fn build_wsl_script(
         ),
         "-drive if=none,file=\"$CACHE_DISK\",format=raw,id=bootdisk".to_string(),
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
-        "-serial stdio".to_string(),
+        serial_backend,
     ];
+    append_display_devices(&mut qemu_parts, options.display);
+    append_console_device(&mut qemu_parts, options.console);
+    append_network_device(&mut qemu_parts);
     if options.kvm {
         qemu_parts.insert(1, "-cpu host".to_string());
         qemu_parts.insert(1, "-enable-kvm".to_string());
@@ -359,6 +396,55 @@ fn build_wsl_script(
     script.push_str("mkdir -p \"$ARTIFACT_DIR\"\n");
     script.push_str("mkdir -p \"$RUNTIME_DIR\"\n");
     script.push_str("mkdir -p \"$CACHE_DIR\"\n");
+    if options.split_windows {
+        script.push_str("cat > \"$RUNTIME_DIR/attach-console.sh\" <<'CAPCONSOLE_ATTACH'\n");
+        script.push_str("#!/usr/bin/env bash\n");
+        script.push_str("set -euo pipefail\n");
+        script.push_str("pty=\"$1\"\n");
+        script.push_str("echo \"CapabilityOS console: $pty\"\n");
+        script.push_str("exec 3<>\"$pty\"\n");
+        script.push_str("old_stty=\"\"\n");
+        script.push_str("if [ -t 0 ]; then old_stty=$(stty -g < /dev/tty 2>/dev/null || true); stty raw -echo < /dev/tty 2>/dev/null || true; fi\n");
+        script.push_str("cleanup() { if [ -n \"$old_stty\" ]; then stty \"$old_stty\" < /dev/tty 2>/dev/null || true; fi; }\n");
+        script.push_str("trap cleanup EXIT\n");
+        script.push_str("cat <&3 & reader=$!\n");
+        script.push_str("cat >&3 || true\n");
+        script.push_str("kill \"$reader\" 2>/dev/null || true\n");
+        script.push_str("wait \"$reader\" 2>/dev/null || true\n");
+        script.push_str("CAPCONSOLE_ATTACH\n");
+        script.push_str("chmod +x \"$RUNTIME_DIR/attach-console.sh\"\n");
+        script.push_str("launch_console_window() {\n");
+        script.push_str("  pty=\"$1\"\n");
+        script.push_str("  echo \"console pty: $pty\"\n");
+        script.push_str("  if command -v cmd.exe >/dev/null 2>&1; then\n");
+        script.push_str("    cmd.exe /C start \"\" wt.exe -w -1 new-tab --title CapabilityOS-console wsl.exe -e bash \"$RUNTIME_DIR/attach-console.sh\" \"$pty\" >/dev/null 2>&1 && return 0\n");
+        script.push_str("    cmd.exe /C start \"\" powershell.exe -NoExit -Command wsl.exe -e bash \"$RUNTIME_DIR/attach-console.sh\" \"$pty\" >/dev/null 2>&1 && return 0\n");
+        script.push_str("  fi\n");
+        script.push_str("  if command -v wt.exe >/dev/null 2>&1; then\n");
+        script.push_str("    wt.exe -w -1 new-tab --title CapabilityOS-console wsl.exe -e bash \"$RUNTIME_DIR/attach-console.sh\" \"$pty\" >/dev/null 2>&1 && return 0\n");
+        script.push_str("  fi\n");
+        script.push_str("  if command -v powershell.exe >/dev/null 2>&1; then\n");
+        script.push_str("    powershell.exe -NoExit -Command wsl.exe -e bash \"$RUNTIME_DIR/attach-console.sh\" \"$pty\" >/dev/null 2>&1 && return 0\n");
+        script.push_str("  fi\n");
+        script.push_str("  echo \"open another terminal and run: wsl -e bash $RUNTIME_DIR/attach-console.sh $pty\"\n");
+        script.push_str("}\n");
+        script.push_str("split_windows_qemu() {\n");
+        script.push_str("  opened=0\n");
+        script.push_str("  while IFS= read -r line; do\n");
+        script.push_str("    echo \"$line\"\n");
+        script.push_str("    case \"$line\" in\n");
+        script.push_str("      *\"char device redirected to \"*)\n");
+        script.push_str("        if [ \"$opened\" -eq 0 ]; then\n");
+        script.push_str("          rest=${line#*char device redirected to }\n");
+        script.push_str("          pty=${rest%% *}\n");
+        script.push_str("          launch_console_window \"$pty\"\n");
+        script.push_str("          opened=1\n");
+        script.push_str("        fi\n");
+        script.push_str("        ;;\n");
+        script.push_str("    esac\n");
+        script.push_str("  done\n");
+        script.push_str("}\n");
+    }
     script.push_str(
         "if ! command -v python3 >/dev/null 2>&1; then echo 'missing python3'; exit 1; fi\n",
     );
@@ -397,6 +483,8 @@ fn build_wsl_script(
         script.push_str(
             "  [ ! -f \"$RUNTIME_SERIAL_LOG\" ] || cp \"$RUNTIME_SERIAL_LOG\" \"$SERIAL_LOG\"\n",
         );
+    }
+    if options.timed {
         script.push_str(
             "  [ ! -f \"$RUNTIME_SUMMARY_LOG\" ] || cp \"$RUNTIME_SUMMARY_LOG\" \"$SUMMARY_LOG\"\n",
         );
@@ -409,9 +497,10 @@ fn build_wsl_script(
         "rm -f \"$OVMF_VARS\" \"$QEMU_LOG\" \"$RUNTIME_OVMF_VARS\" \"$RUNTIME_QEMU_LOG\"",
     );
     if options.timed {
-        script.push_str(
-            " \"$SERIAL_LOG\" \"$SUMMARY_LOG\" \"$RUNTIME_SERIAL_LOG\" \"$RUNTIME_SUMMARY_LOG\"",
-        );
+        script.push_str(" \"$SERIAL_LOG\" \"$RUNTIME_SERIAL_LOG\"");
+    }
+    if options.timed {
+        script.push_str(" \"$SUMMARY_LOG\" \"$RUNTIME_SUMMARY_LOG\"");
     }
     script.push('\n');
     script.push_str("if [ -f \"$CACHE_DIRTY\" ]; then\n");
@@ -487,15 +576,61 @@ fn build_wsl_script(
         script.push_str("exit \"$qemu_status\"\n");
     } else {
         script.push_str("set +e\n");
-        script.push_str(&qemu_cmd);
-        script.push('\n');
-        script.push_str("qemu_status=$?\n");
+        if options.split_windows {
+            script.push_str(&qemu_cmd);
+            script.push_str(" 2>&1 | split_windows_qemu\n");
+            script.push_str("qemu_status=${PIPESTATUS[0]}\n");
+        } else {
+            script.push_str(&qemu_cmd);
+            script.push('\n');
+            script.push_str("qemu_status=$?\n");
+        }
         script.push_str("set -e\n");
         script.push_str("schedule_writeback\n");
         script.push_str("exit \"$qemu_status\"\n");
     }
 
     Ok(script)
+}
+
+fn append_display_devices(qemu_parts: &mut Vec<String>, backend: DisplayBackend) {
+    match backend {
+        DisplayBackend::Gtk => {
+            qemu_parts.push("-display gtk,gl=on,grab-on-hover=off".to_string());
+            qemu_parts.push("-vga none".to_string());
+            qemu_parts.push("-device virtio-vga-gl,xres=1920,yres=1080".to_string());
+            qemu_parts.push("-device virtio-tablet-pci".to_string());
+            qemu_parts.push("-device virtio-keyboard-pci".to_string());
+        }
+        DisplayBackend::None => {
+            qemu_parts.push("-display none".to_string());
+        }
+    }
+}
+
+fn append_console_device(qemu_parts: &mut Vec<String>, backend: ConsoleBackend) {
+    match backend {
+        ConsoleBackend::Off => {}
+        ConsoleBackend::Pty => {
+            qemu_parts.push("-device virtio-serial-pci".to_string());
+            qemu_parts.push("-chardev pty,id=capconsole".to_string());
+            qemu_parts.push(
+                "-device virtconsole,chardev=capconsole,name=capabilityos.console.0".to_string(),
+            );
+        }
+        ConsoleBackend::Stdio => {
+            qemu_parts.push("-device virtio-serial-pci".to_string());
+            qemu_parts.push("-chardev stdio,id=capconsole,signal=off".to_string());
+            qemu_parts.push(
+                "-device virtconsole,chardev=capconsole,name=capabilityos.console.0".to_string(),
+            );
+        }
+    }
+}
+
+fn append_network_device(qemu_parts: &mut Vec<String>) {
+    qemu_parts.push("-netdev user,id=capnet0,ipv6=off,dhcpstart=10.0.2.15".to_string());
+    qemu_parts.push("-device virtio-net-pci,netdev=capnet0,mac=52:54:00:12:34:56".to_string());
 }
 
 fn build_wsl_pf_check_script(
@@ -529,11 +664,6 @@ fn build_wsl_pf_check_script(
         "-monitor none".to_string(),
         format!("-d {QEMU_DEBUG_FLAGS}"),
         "-D \"$RUN_QEMU_LOG\"".to_string(),
-        "-display gtk,gl=on,grab-on-hover=off".to_string(),
-        "-vga none".to_string(),
-        "-device virtio-vga-gl,xres=1920,yres=1080".to_string(),
-        "-device virtio-tablet-pci".to_string(),
-        "-device virtio-keyboard-pci".to_string(),
         format!(
             "-drive if=pflash,format=raw,readonly=on,file={}",
             bash_quote(OVMF_CODE_PATH)
@@ -543,6 +673,9 @@ fn build_wsl_pf_check_script(
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
         "-serial stdio".to_string(),
     ];
+    append_display_devices(&mut qemu_parts, options.display);
+    append_console_device(&mut qemu_parts, options.console);
+    append_network_device(&mut qemu_parts);
     if options.kvm {
         qemu_parts.insert(1, "-cpu host".to_string());
         qemu_parts.insert(1, "-enable-kvm".to_string());
@@ -593,13 +726,19 @@ fn build_wsl_pf_check_script(
     script.push_str("  summary_status=$?\n");
     script.push_str("  grep -E 'PAGE FAULT|#PF|PF_CAP|ACTION=terminate process|GENERAL PROTECTION|INVALID OPCODE|STACK SEGMENT FAULT|SEGMENT NOT PRESENT' \"$RUN_SERIAL_LOG\" > \"$RUN_DIR/pf-grep.txt\" 2>/dev/null\n");
     script.push_str("  pf_status=$?\n");
-    script.push_str("  boot_count=$(grep -c 'RAW ENTER MAIN' \"$RUN_SERIAL_LOG\" 2>/dev/null || true)\n");
+    script.push_str(
+        "  boot_count=$(grep -c 'RAW ENTER MAIN' \"$RUN_SERIAL_LOG\" 2>/dev/null || true)\n",
+    );
     script.push_str("  set -e\n");
     script.push_str("  cp \"$RUN_QEMU_LOG\" \"$OUT_DIR/qemu.log\" 2>/dev/null || true\n");
     script.push_str("  cp \"$RUN_SERIAL_LOG\" \"$OUT_DIR/serial-timed.log\" 2>/dev/null || true\n");
-    script.push_str("  cp \"$RUN_SUMMARY_LOG\" \"$OUT_DIR/boot-timing-summary.txt\" 2>/dev/null || true\n");
+    script.push_str(
+        "  cp \"$RUN_SUMMARY_LOG\" \"$OUT_DIR/boot-timing-summary.txt\" 2>/dev/null || true\n",
+    );
     script.push_str("  cp \"$RUN_DIR/pf-grep.txt\" \"$OUT_DIR/pf-grep.txt\" 2>/dev/null || true\n");
-    script.push_str("  if [ \"$pf_status\" -eq 0 ]; then echo \"run-$id: PF marker found\"; return 20; fi\n");
+    script.push_str(
+        "  if [ \"$pf_status\" -eq 0 ]; then echo \"run-$id: PF marker found\"; return 20; fi\n",
+    );
     script.push_str("  if [ \"$boot_count\" -gt 1 ]; then echo \"run-$id: reset loop after boot start ($boot_count boots)\"; return 21; fi\n");
     script.push_str("  if [ \"$qemu_status\" -ne 0 ] && [ \"$qemu_status\" -ne 124 ] && [ \"$qemu_status\" -ne 137 ]; then echo \"run-$id: qemu failed $qemu_status\"; return \"$qemu_status\"; fi\n");
     script.push_str("  if [ \"$qemu_status\" -eq 0 ] && [ \"$summary_status\" -ne 0 ]; then echo \"run-$id: qemu exited before smoke completed\"; return 22; fi\n");

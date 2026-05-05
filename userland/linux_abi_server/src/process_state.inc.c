@@ -1,4 +1,22 @@
-static void init_process_fds(struct linux_process_state *proc) { for (u64 i = 0; i < 32; i++) proc->fds[i].kind = FD_UNUSED; proc->fds[0].kind = FD_STDIO; proc->fds[1].kind = FD_STDIO; proc->fds[2].kind = FD_STDIO; }
+static int initial_stdio_should_use_tty(void) {
+    static const char dash_path[] = "/cmd/dash_interactive.elf";
+    if (!g_console.active) return 0;
+    u64 i = 0;
+    while (dash_path[i] != 0) {
+        if (g_exec_path[i] != dash_path[i]) return 0;
+        i++;
+    }
+    return g_exec_path[i] == 0;
+}
+
+static void init_process_fds(struct linux_process_state *proc) {
+    for (u64 i = 0; i < 32; i++) proc->fds[i].kind = FD_UNUSED;
+    const int use_tty = initial_stdio_should_use_tty();
+    const enum fd_kind stdio_kind = use_tty ? FD_TTY : FD_STDIO;
+    proc->fds[0].kind = stdio_kind;
+    proc->fds[1].kind = stdio_kind;
+    proc->fds[2].kind = stdio_kind;
+}
 static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
     dst->kind = src->kind;
     dst->token = src->token;
@@ -12,6 +30,7 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
 }
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
     proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->principal = principal; init_process_fds(proc);
+    proc->exec_pending_principal = 0;
     proc->mmap_next_va = 0x31000000ULL;
     proc->brk_next_va = 0x38000000ULL;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
@@ -38,16 +57,14 @@ static void init_process_tables(void) {
 static struct linux_process_state *process_state_for(u64 principal) {
     if (principal == 0) return 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
-        if (!g_processes[i].used || g_processes[i].principal != principal) continue;
-        if (g_processes[i].exec_pending) {
-            g_processes[i].exec_pending = 0;
-        }
+        if (!g_processes[i].used || g_processes[i].exec_pending || g_processes[i].principal != principal) continue;
         return &g_processes[i];
     }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_processes[i].used || !g_processes[i].exec_pending) continue;
         g_processes[i].principal = principal;
         g_processes[i].exec_pending = 0;
+        g_processes[i].exec_pending_principal = 0;
         return &g_processes[i];
     }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) { if (g_processes[i].used) continue; init_process_state(&g_processes[i], principal); return &g_processes[i]; }
@@ -171,6 +188,7 @@ static u64 pipe_write_from_target(u64 fd, u64 src, u64 len, int *fault) {
 }
 static int alloc_fd(void) { for (int i = 3; i < 32; i++) if (g_fds[i].kind == FD_UNUSED) return i; return -1; }
 static int fd_valid(u64 fd) { return g_proc != 0 && fd < 32 && g_fds[fd].kind != FD_UNUSED; }
+static int fd_is_tty_like(u64 fd) { return fd_valid(fd) && (g_fds[fd].kind == FD_STDIO || g_fds[fd].kind == FD_TTY); }
 
 static void sync_fd_to_thread_group(u64 fd) {
     if (!g_proc || g_proc->pid == 0 || fd >= 32) return;

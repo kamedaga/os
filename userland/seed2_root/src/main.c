@@ -43,6 +43,8 @@ enum {
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     SERVICE_KIND_VFS = 2,
     SERVICE_KIND_FAT_FS = 9,
+    SERVICE_KIND_CONSOLE = 10,
+    SERVICE_KIND_NET = 11,
     SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
@@ -110,6 +112,8 @@ static char g_provided_services[MAX_PROVIDED_SERVICES][48];
 static u8 g_startup_manifest[4096];
 static u32 g_startup_manifest_len;
 static u64 g_rootfs_vfs_process_slot;
+static u64 g_net_endpoint_id;
+static u64 g_net_process_slot;
 static u32 g_startup_node_count;
 static u32 g_provided_service_count;
 static u64 g_next_sched_image_va = SCHED_IMAGE_BASE_VA;
@@ -572,6 +576,8 @@ static void launch_rootfs_vfs(void) {
     config[2] = 0;
     config[3] = g_fat.endpoint_id;
     config[4] = g_fat.process_slot;
+    config[5] = g_net_endpoint_id;
+    config[6] = g_net_process_slot;
 
     static struct bootstrap_descriptor_table table;
     clear_page((u64)&table);
@@ -814,9 +820,21 @@ void seed2_root_main(void) {
     volatile u64 *config = (volatile u64 *)ROOT_CONFIG_VA;
     const u64 fat_endpoint_id = config[3];
     const u64 fat_process_slot = config[4];
+    const u64 console_endpoint_id = config[5];
+    const u64 console_process_slot = config[6];
+    const u64 net_endpoint_id = config[7];
+    const u64 net_process_slot = config[8];
+    g_net_endpoint_id = net_endpoint_id;
+    g_net_process_slot = net_process_slot;
     if (connect_fat(fat_endpoint_id, fat_process_slot)) {
         user_log("[seed2_root] fat connect ok\n");
         service_registry_set(SERVICE_KIND_FAT_FS, fat_process_slot, fat_endpoint_id);
+        if (console_endpoint_id != 0 && console_process_slot != 0) {
+            service_registry_set(SERVICE_KIND_CONSOLE, console_process_slot, console_endpoint_id);
+        }
+        if (net_endpoint_id != 0 && net_process_slot != 0) {
+            service_registry_set(SERVICE_KIND_NET, net_process_slot, net_endpoint_id);
+        }
         launch_rootfs_vfs();
         load_startup_manifest();
         run_startup_scheduler();

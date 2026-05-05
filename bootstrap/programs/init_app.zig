@@ -28,6 +28,10 @@ const virtio_blk_device_modern: u64 = 0x1042;
 const virtio_blk_subsystem_id: u64 = 0x0002;
 const virtio_gpu_device_modern: u64 = 0x1050;
 const virtio_gpu_subsystem_id: u64 = 0x0010;
+const virtio_console_device_modern: u64 = 0x1043;
+const virtio_console_subsystem_id: u64 = 0x0003;
+const virtio_net_device_modern: u64 = 0x1041;
+const virtio_net_subsystem_id: u64 = 0x0001;
 const input_cfg_select: u64 = 0;
 const input_cfg_subsel: u64 = 1;
 const input_cfg_size: u64 = 2;
@@ -654,6 +658,18 @@ fn isVirtioGpuDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) 
         (descriptor.device_id == virtio_gpu_device_modern or descriptor.subsystem_id == virtio_gpu_subsystem_id);
 }
 
+fn isVirtioConsoleDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
+    return descriptor.transport == @intFromEnum(init_bootstrap_abi.DeviceTransport.virtio_pci_modern) and
+        descriptor.vendor_id == virtio_vendor_id and
+        (descriptor.device_id == virtio_console_device_modern or descriptor.subsystem_id == virtio_console_subsystem_id);
+}
+
+fn isVirtioNetDeviceDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
+    return descriptor.transport == @intFromEnum(init_bootstrap_abi.DeviceTransport.virtio_pci_modern) and
+        descriptor.vendor_id == virtio_vendor_id and
+        (descriptor.device_id == virtio_net_device_modern or descriptor.subsystem_id == virtio_net_subsystem_id);
+}
+
 fn findDeviceQueueGrant(descriptor: init_bootstrap_abi.DeviceDescriptor, queue_index: u64) ?init_bootstrap_abi.DeviceQueueGrant {
     var i: usize = 0;
     while (@as(u64, @intCast(i)) < descriptor.init_queue_grant_count and i < init_bootstrap_abi.max_device_queue_grants) : (i += 1) {
@@ -871,6 +887,14 @@ fn rebuildManagerDeviceNeedCache(page: *const volatile init_bootstrap_abi.Descri
             continue;
         }
         if (isVirtioGpuDeviceDescriptor(descriptor)) {
+            manager_device_needed_cache[i] = true;
+            continue;
+        }
+        if (isVirtioConsoleDeviceDescriptor(descriptor)) {
+            manager_device_needed_cache[i] = true;
+            continue;
+        }
+        if (isVirtioNetDeviceDescriptor(descriptor)) {
             manager_device_needed_cache[i] = true;
             continue;
         }
@@ -1156,4 +1180,3 @@ pub export fn _start() noreturn {
     }
     bootMain();
 }
-

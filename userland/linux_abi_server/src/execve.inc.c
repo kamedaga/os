@@ -324,6 +324,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     if (g_proc) {
         g_proc->principal = 0;
         g_proc->exec_pending = 1;
+        g_proc->exec_pending_principal = spawned_principal;
         if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
     }
     reset_exec_runtime_state();

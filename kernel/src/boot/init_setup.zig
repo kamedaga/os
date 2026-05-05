@@ -71,11 +71,8 @@ fn initSpawnPageLabel(_: init_bootstrap_abi.SpawnPageDescriptor) []const u8 {
 }
 
 fn deviceLabel(device: kernel.DmaDeviceId) []const u8 {
-    return switch (device) {
-        .virtio_input => "virtio input device",
-        .virtio_gpu => "virtio gpu device",
-        .virtio_blk => "virtio block device",
-    };
+    _ = device;
+    return "device resource";
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +298,8 @@ pub fn publishInitBootstrapDescriptorPage(
             .pci_bus = 0,
             .pci_device = 0,
             .pci_function = 0,
+            .resource_id = 0,
+            .queue_count = 0,
             .common_page_paddr = 0,
             .notify_page_paddr = 0,
             .isr_page_paddr = 0,
@@ -348,10 +347,8 @@ fn grantInitDeviceQueueTokenOrHalt(
 }
 
 fn bootstrapQueueGrantCountForDevice(device: kernel.DmaDeviceId) usize {
-    return switch (device) {
-        .virtio_gpu => 2,
-        .virtio_input, .virtio_blk => 1,
-    };
+    _ = device;
+    return init_bootstrap_abi.max_device_queue_grants;
 }
 
 fn grantInitDeviceIommuTokenOrHalt(
@@ -366,34 +363,9 @@ fn grantInitDeviceIommuTokenOrHalt(
     };
 }
 
-fn blkCommandMask() u64 {
-    return commandOpcodeBit(.blk_read) |
-        commandOpcodeBit(.blk_write) |
-        commandOpcodeBit(.blk_flush) |
-        commandOpcodeBit(.blk_identify);
-}
-
-fn gpuCommandMask() u64 {
-    return commandOpcodeBit(.gpu_admin) |
-        commandOpcodeBit(.gpu_resource_2d) |
-        commandOpcodeBit(.gpu_scanout) |
-        commandOpcodeBit(.gpu_cursor) |
-        commandOpcodeBit(.gpu_virgl_context) |
-        commandOpcodeBit(.gpu_virgl_resource) |
-        commandOpcodeBit(.gpu_virgl_submit) |
-        commandOpcodeBit(.gpu_fence);
-}
-
-fn commandOpcodeBit(opcode: device_capabilities.CommandOpcodeClass) u64 {
-    return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(opcode)));
-}
-
 fn defaultCommandMaskForDevice(device: kernel.DmaDeviceId) u64 {
-    return switch (device) {
-        .virtio_blk => blkCommandMask(),
-        .virtio_gpu => gpuCommandMask(),
-        .virtio_input => commandOpcodeBit(.gpu_admin),
-    };
+    _ = device;
+    return std.math.maxInt(u64);
 }
 
 fn grantInitDeviceCommandTokenOrHalt(
@@ -430,7 +402,11 @@ pub fn setupDeviceBootstrapForInit(
         free_list,
     );
     var init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants;
-    const queue_grant_count = bootstrapQueueGrantCountForDevice(device.dma_device);
+    const queue_limit = bootstrapQueueGrantCountForDevice(device.dma_device);
+    const queue_grant_count = if (device.descriptor.queue_count == 0)
+        queue_limit
+    else
+        @min(queue_limit, @as(usize, @intCast(device.descriptor.queue_count)));
     var queue_index: usize = 0;
     while (queue_index < queue_grant_count and queue_index < init_bootstrap_abi.max_device_queue_grants) : (queue_index += 1) {
         const queue_index_u16: u16 = @intCast(queue_index);

@@ -4,12 +4,6 @@ const pci_status_cap_list: u16 = 1 << 4;
 const pci_cap_id_vendor: u8 = 0x09;
 
 const virtio_vendor_id: u16 = 0x1AF4;
-const virtio_input_device_modern: u16 = 0x1052;
-const virtio_input_subsystem_id: u16 = 0x0012;
-const virtio_gpu_device_modern: u16 = 0x1050;
-const virtio_gpu_subsystem_id: u16 = 0x0010;
-const virtio_blk_device_modern: u16 = 0x1042;
-const virtio_blk_subsystem_id: u16 = 0x0002;
 
 const virtio_pci_cap_common_cfg: u8 = 1;
 const virtio_pci_cap_notify_cfg: u8 = 2;
@@ -26,6 +20,7 @@ pub const ModernDeviceInfo = struct {
     isr_cfg: u64,
     device_cfg: u64,
     notify_off_multiplier: u32,
+    queue_count: u16,
 };
 pub const max_modern_devices: usize = 8;
 
@@ -61,18 +56,6 @@ fn readMemBarBase(loc: pci.Location, bar_index: u8) ?u64 {
         return low_base | (@as(u64, high) << 32);
     }
     return null;
-}
-
-pub fn isVirtioInputDeviceId(device_id: u16, subsystem_id: u16) bool {
-    return device_id == virtio_input_device_modern or subsystem_id == virtio_input_subsystem_id;
-}
-
-pub fn isVirtioGpuDeviceId(device_id: u16, subsystem_id: u16) bool {
-    return device_id == virtio_gpu_device_modern or subsystem_id == virtio_gpu_subsystem_id;
-}
-
-pub fn isVirtioBlkDeviceId(device_id: u16, subsystem_id: u16) bool {
-    return device_id == virtio_blk_device_modern or subsystem_id == virtio_blk_subsystem_id;
 }
 
 fn collectModernCaps(
@@ -171,6 +154,7 @@ fn collectModernCaps(
         .isr_cfg = isr_cfg,
         .device_cfg = device_cfg,
         .notify_off_multiplier = notify_off_multiplier,
+        .queue_count = 0,
     };
 }
 
@@ -202,13 +186,6 @@ pub fn probeModernDevices(write_log: *const fn ([]const u8) void) [max_modern_de
 
                 const device_id = pci.readDeviceId(loc);
                 const subsystem_id = pci.readSubsystemId(loc);
-                if (!isVirtioInputDeviceId(device_id, subsystem_id) and
-                    !isVirtioGpuDeviceId(device_id, subsystem_id) and
-                    !isVirtioBlkDeviceId(device_id, subsystem_id))
-                {
-                    continue;
-                }
-
                 const info = collectModernCaps(write_log, loc, vendor_id, device_id, subsystem_id) orelse continue;
                 if (result_count >= result.len) return result;
                 result[result_count] = info;

@@ -1,8 +1,5 @@
-pub const DmaDeviceId = enum(u8) {
-    virtio_gpu,
-    virtio_input,
-    virtio_blk,
-};
+pub const DmaDeviceId = u64;
+pub const invalid_dma_device_id: DmaDeviceId = 0;
 
 pub const DmaDirection = enum(u8) {
     read,
@@ -20,7 +17,7 @@ pub const DmaMapping = struct {
     valid: bool = false,
     token: u64 = 0,
     owner_principal_raw: u8 = 0,
-    device: DmaDeviceId = .virtio_gpu,
+    device: DmaDeviceId = invalid_dma_device_id,
     paddr_start: u64 = 0,
     length: u64 = 0,
     direction: DmaDirection = .bidirectional,
@@ -29,7 +26,7 @@ pub const DmaMapping = struct {
 
 pub const DeviceDomainBinding = struct {
     valid: bool = false,
-    device: DmaDeviceId = .virtio_gpu,
+    device: DmaDeviceId = invalid_dma_device_id,
     domain_id: u32 = 0,
 };
 
@@ -50,7 +47,7 @@ pub const QueueCapability = struct {
     root_token: u64 = 0,
     parent_token: u64 = 0,
     owner_principal_raw: u8 = 0,
-    device: DmaDeviceId = .virtio_gpu,
+    device: DmaDeviceId = invalid_dma_device_id,
     queue_index: u16 = 0,
     allow_submit: bool = false,
     allow_notify: bool = false,
@@ -62,7 +59,7 @@ pub const IommuCapability = struct {
     root_token: u64 = 0,
     parent_token: u64 = 0,
     owner_principal_raw: u8 = 0,
-    device: DmaDeviceId = .virtio_gpu,
+    device: DmaDeviceId = invalid_dma_device_id,
     allow_map_read: bool = false,
     allow_map_write: bool = false,
     allow_map_status: bool = false,
@@ -89,7 +86,7 @@ pub const CommandCapability = struct {
     root_token: u64 = 0,
     parent_token: u64 = 0,
     owner_principal_raw: u8 = 0,
-    device: DmaDeviceId = .virtio_gpu,
+    device: DmaDeviceId = invalid_dma_device_id,
     opcode_mask: u64 = 0,
 };
 
@@ -114,7 +111,7 @@ pub const DmaMappingTable = struct {
         length: u64,
         direction: DmaDirection,
     ) DmaMappingError!u64 {
-        if (paddr_start == 0 or length == 0) return DmaMappingError.InvalidState;
+        if (device == invalid_dma_device_id or paddr_start == 0 or length == 0) return DmaMappingError.InvalidState;
 
         var i: usize = 0;
         while (i < self.entries.len) : (i += 1) {
@@ -209,7 +206,7 @@ pub const IommuCapabilityTable = struct {
         root_token_hint: u64,
         parent_token: u64,
     ) DmaMappingError!u64 {
-        if (!allow_map_read and !allow_map_write and !allow_map_status) return DmaMappingError.InvalidState;
+        if (device == invalid_dma_device_id or (!allow_map_read and !allow_map_write and !allow_map_status)) return DmaMappingError.InvalidState;
 
         var i: usize = 0;
         while (i < self.entries.len) : (i += 1) {
@@ -378,7 +375,7 @@ pub const QueueCapabilityTable = struct {
         root_token_hint: u64,
         parent_token: u64,
     ) DmaMappingError!u64 {
-        if (!allow_submit and !allow_notify) return DmaMappingError.InvalidState;
+        if (device == invalid_dma_device_id or (!allow_submit and !allow_notify)) return DmaMappingError.InvalidState;
 
         var i: usize = 0;
         while (i < self.entries.len) : (i += 1) {
@@ -509,7 +506,7 @@ pub const CommandCapabilityTable = struct {
         root_token_hint: u64,
         parent_token: u64,
     ) DmaMappingError!u64 {
-        if (opcode_mask == 0) return DmaMappingError.InvalidState;
+        if (device == invalid_dma_device_id or opcode_mask == 0) return DmaMappingError.InvalidState;
 
         var i: usize = 0;
         while (i < self.entries.len) : (i += 1) {

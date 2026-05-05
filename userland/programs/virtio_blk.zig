@@ -90,6 +90,7 @@ const VirtioBlkReqHeader = extern struct {
 
 const BootState = struct {
     endpoint_id: u64 = 0,
+    resource_id: queue_abi.DeviceId = queue_abi.invalid_device_id,
     capacity_sectors: u64 = 0,
     logical_block_size: u64 = 0,
     capacity_blocks: u64 = 0,
@@ -248,7 +249,7 @@ fn iommuAuthorize(token: u64, device: queue_abi.DeviceId, op: queue_abi.IommuOpe
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_iommu_authorize),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (@as(u64, @intFromEnum(device))),
+          [arg1] "{rsi}" (device),
           [arg2] "{rdx}" (@as(u64, @intFromEnum(op))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
@@ -259,7 +260,7 @@ fn commandAuthorize(token: u64, device: queue_abi.DeviceId, opcode: queue_abi.Co
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_command_authorize),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (@as(u64, @intFromEnum(device))),
+          [arg1] "{rsi}" (device),
           [arg2] "{rdx}" (@as(u64, @intFromEnum(opcode))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
@@ -269,7 +270,7 @@ fn dmaMapCreate(device: queue_abi.DeviceId, paddr_start: u64, length: u64, direc
         \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_dma_map_create),
-          [arg0] "{rdi}" (@as(u64, @intFromEnum(device))),
+          [arg0] "{rdi}" (device),
           [arg1] "{rsi}" (paddr_start),
           [arg2] "{rdx}" (length),
           [arg3] "{r8}" (@as(u64, @intFromEnum(direction))),
@@ -436,6 +437,7 @@ fn parseBootState() ?BootState {
     const capacity_sectors = readCfgU64(block_bootstrap.capacity_sectors_index);
     return .{
         .endpoint_id = readCfgU64(block_bootstrap.endpoint_id_index),
+        .resource_id = readCfgU64(block_bootstrap.resource_id_index),
         .capacity_sectors = capacity_sectors,
         .logical_block_size = block_size,
         .capacity_blocks = capacity_sectors / sectors_per_block,
@@ -464,6 +466,7 @@ fn waitForBootResources() void {
             continue;
         };
         if (boot_state.endpoint_id != 0 and
+            boot_state.resource_id != queue_abi.invalid_device_id and
             boot_state.command_token != 0 and
             boot_state.capacity_blocks != 0)
         {
@@ -566,8 +569,8 @@ fn initVirtio() bool {
         .next = 0,
     };
     if (boot_state.iommu_token != 0) {
-        if (iommuAuthorize(boot_state.iommu_token, .virtio_blk, .map_status) != syscall_ok) return false;
-        request_control_mapping_token = dmaMapCreate(.virtio_blk, reqHeaderPaddr(), reqControlBytes(), .bidirectional);
+        if (iommuAuthorize(boot_state.iommu_token, boot_state.resource_id, .map_status) != syscall_ok) return false;
+        request_control_mapping_token = dmaMapCreate(boot_state.resource_id, reqHeaderPaddr(), reqControlBytes(), .bidirectional);
         if (request_control_mapping_token == 0) return false;
     } else {
         request_control_mapping_token = 0;
@@ -648,7 +651,7 @@ fn createBlkDataMapping(byte_count: usize, write: bool) u64 {
 }
 
 fn createBlkDataMappingForPage(paddr: u64, byte_count: usize, write: bool) u64 {
-    const device: queue_abi.DeviceId = .virtio_blk;
+    const device: queue_abi.DeviceId = boot_state.resource_id;
     if (paddr < 0x1000 or byte_count == 0) return 0;
     const direction: queue_abi.DmaDirection = if (write) .read else .write;
     return dmaMapCreate(device, paddr, @intCast(byte_count), direction);
@@ -672,7 +675,7 @@ fn completeAndReleaseMappings(tokens: []const u64) void {
 }
 
 fn authorizeBlkRequest(request_type: u32, write: bool) bool {
-    const device: queue_abi.DeviceId = .virtio_blk;
+    const device: queue_abi.DeviceId = boot_state.resource_id;
     const command = switch (request_type) {
         request_type_in => queue_abi.CommandOpcodeClass.blk_read,
         request_type_out => queue_abi.CommandOpcodeClass.blk_write,
@@ -1304,4 +1307,3 @@ pub export fn _start() noreturn {
         pollSessions();
     }
 }
-

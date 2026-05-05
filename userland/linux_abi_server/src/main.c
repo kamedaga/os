@@ -3,6 +3,7 @@
 #include "common.inc.c"
 #include "runtime.inc.c"
 #include "vfs.inc.c"
+#include "console.inc.c"
 #include "process_state.inc.c"
 #include "execve.inc.c"
 #include "fs_syscalls.inc.c"

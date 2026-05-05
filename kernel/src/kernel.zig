@@ -786,7 +786,7 @@ pub const DmaMapping = dma_mapping_manager.DmaMapping;
 const IommuMapEntry = struct {
     valid: bool = false,
     principal: PrincipalId = default_process_principal,
-    device: DmaDeviceId = .virtio_gpu,
+    device: DmaDeviceId = 0x1001,
     paddr: u64 = 0,
 };
 
@@ -2408,7 +2408,7 @@ test "dma mapping manager stage1 create state and release" {
     var s = KernelState.initPhase1();
     const token = try s.dmaMapCreateStage1(
         .Process0,
-        .virtio_gpu,
+        0x1001,
         0x4000,
         4096,
         .bidirectional,
@@ -2429,14 +2429,14 @@ test "dma mapping manager stage1 create state and release" {
 
 test "dma mapping manager stage1 device domain bind" {
     var s = KernelState.initPhase1();
-    try s.dmaBindDeviceDomainStage1(.virtio_gpu, 1);
-    try std.testing.expectEqual(@as(?u32, 1), s.dmaDeviceDomainStage1(.virtio_gpu));
+    try s.dmaBindDeviceDomainStage1(0x1001, 1);
+    try std.testing.expectEqual(@as(?u32, 1), s.dmaDeviceDomainStage1(0x1001));
 }
 
 test "queue cap stage2 authorize submit and notify" {
     var s = KernelState.initPhase1();
-    const submit_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
-    const notify_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, false, true);
+    const submit_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, 0x1001, 0, true, false);
+    const notify_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, 0x1001, 0, false, true);
 
     try device_capabilities.queueCapAuthorizeStage2(&s, .Process1, submit_token, 0, .submit);
     try device_capabilities.queueCapAuthorizeStage2(&s, .Process1, notify_token, 0, .notify);
@@ -2447,13 +2447,13 @@ test "queue cap stage2 authorize submit and notify" {
 
 test "queue cap stage2 rejects owner mismatch" {
     var s = KernelState.initPhase1();
-    const token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, true);
+    const token = try device_capabilities.queueCapGrantStage2(&s, .Process1, 0x1001, 0, true, true);
     try std.testing.expectError(KernelError.InvalidState, device_capabilities.queueCapAuthorizeStage2(&s, .Process0, token, 0, .submit));
 }
 
 test "device queue cap revoke removes descendants" {
     var s = KernelState.initPhase1();
-    const root = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, true);
+    const root = try device_capabilities.queueCapGrantStage2(&s, .Process1, 0x1001, 0, true, true);
     const child = try device_capabilities.grantQueueCapStage2(&s, .Process1, .Process2, root);
 
     try device_capabilities.queueCapAuthorizeStage2(&s, .Process2, child, 0, .submit);
@@ -2469,19 +2469,19 @@ test "command cap derive subset preserves lineage and revoke" {
         commandOpcodeBitForTest(.blk_write) |
         commandOpcodeBitForTest(.blk_flush);
     const read_mask = commandOpcodeBitForTest(.blk_read);
-    const root = try device_capabilities.commandCapGrantStage2(&s, .Process1, .virtio_blk, full_mask);
+    const root = try device_capabilities.commandCapGrantStage2(&s, .Process1, 0x1002, full_mask);
     const subset = try device_capabilities.deriveCommandCapStage2(&s, .Process1, root, read_mask);
     const child = try device_capabilities.grantCommandCapStage2(&s, .Process1, .Process2, subset);
 
-    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, .virtio_blk, .blk_read);
-    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, .virtio_blk, .blk_write));
-    try device_capabilities.commandCapAuthorizeStage2(&s, .Process2, child, .virtio_blk, .blk_read);
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, 0x1002, .blk_read);
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, 0x1002, .blk_write));
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process2, child, 0x1002, .blk_read);
 
     try device_capabilities.revokeDeviceCapStage2(&s, .Process1, .command, subset);
 
-    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, .virtio_blk, .blk_read));
-    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.commandCapAuthorizeStage2(&s, .Process2, child, .virtio_blk, .blk_read));
-    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, root, .virtio_blk, .blk_write);
+    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, subset, 0x1002, .blk_read));
+    try std.testing.expectError(KernelError.CapabilityNotFound, device_capabilities.commandCapAuthorizeStage2(&s, .Process2, child, 0x1002, .blk_read));
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, root, 0x1002, .blk_write);
 }
 
 test "gpu command cap isolates virgl submit from scanout" {
@@ -2493,13 +2493,13 @@ test "gpu command cap isolates virgl submit from scanout" {
         commandOpcodeBitForTest(.gpu_fence);
     const submit_mask = commandOpcodeBitForTest(.gpu_virgl_submit) |
         commandOpcodeBitForTest(.gpu_fence);
-    const root = try device_capabilities.commandCapGrantStage2(&s, .Process1, .virtio_gpu, full_mask);
+    const root = try device_capabilities.commandCapGrantStage2(&s, .Process1, 0x1001, full_mask);
     const submit_only = try device_capabilities.deriveCommandCapStage2(&s, .Process1, root, submit_mask);
 
-    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_gpu, .gpu_virgl_submit);
-    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_gpu, .gpu_fence);
-    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_gpu, .gpu_scanout));
-    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, .virtio_blk, .gpu_virgl_submit));
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, 0x1001, .gpu_virgl_submit);
+    try device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, 0x1001, .gpu_fence);
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, 0x1001, .gpu_scanout));
+    try std.testing.expectError(KernelError.InvalidState, device_capabilities.commandCapAuthorizeStage2(&s, .Process1, submit_only, 0x1002, .gpu_virgl_submit));
 }
 
 fn commandOpcodeBitForTest(opcode: device_capabilities.CommandOpcodeClass) u64 {
@@ -2510,7 +2510,7 @@ test "dma mapping manager stage1 rejects invalid transition" {
     var s = KernelState.initPhase1();
     const token = try s.dmaMapCreateStage1(
         .Process0,
-        .virtio_gpu,
+        0x1001,
         0x5000,
         4096,
         .bidirectional,
@@ -2524,7 +2524,7 @@ test "dma mapping manager stage1 release requires completed" {
     var s = KernelState.initPhase1();
     const token = try s.dmaMapCreateStage1(
         .Process0,
-        .virtio_gpu,
+        0x1001,
         0x6000,
         4096,
         .bidirectional,
@@ -2856,8 +2856,8 @@ test "sendCapOnEndpoint requires endpoint capability" {
 test "iommu no-cap-driver shadow maps active dma mapping" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
-    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, .virtio_gpu, true, true, true);
-    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
+    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, 0x1001, true, true, true);
+    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, 0x1001, 0, true, false);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
@@ -2866,7 +2866,7 @@ test "iommu no-cap-driver shadow maps active dma mapping" {
     });
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
-    const mapping = try s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read);
+    const mapping = try s.dmaMapCreateStage1(.Process1, 0x1001, 0x1000, 128, .read);
     try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
     try s.dmaMapSetStateStage1(mapping, .in_flight);
@@ -2874,7 +2874,7 @@ test "iommu no-cap-driver shadow maps active dma mapping" {
     try s.dmaMapReleaseStage1(mapping);
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
-    const mapping2 = try s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read);
+    const mapping2 = try s.dmaMapCreateStage1(.Process1, 0x1001, 0x1000, 128, .read);
     try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
     try s.revokeCapTree(.Process1, 0x1000);
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
@@ -2884,32 +2884,32 @@ test "iommu no-cap-driver shadow maps active dma mapping" {
 test "iommu no-cap-driver does not map non-dma grant" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
-    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, .virtio_gpu, true, true, true);
-    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
+    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, 0x1001, true, true, true);
+    _ = try device_capabilities.queueCapGrantStage2(&s, .Process1, 0x1001, 0, true, false);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
         .cpu_write = false,
         .dma = false,
     });
-    try std.testing.expectError(KernelError.NoDmaRight, s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read));
+    try std.testing.expectError(KernelError.NoDmaRight, s.dmaMapCreateStage1(.Process1, 0x1001, 0x1000, 128, .read));
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 }
 
 test "queue cap grant syncs existing dma mapping" {
     var s = KernelState.initPhase1();
     s.setIommuNoCapDriverMode(.shadow);
-    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, .virtio_gpu, true, true, true);
+    _ = try device_capabilities.iommuCapGrantStage2(&s, .Process1, 0x1001, true, true, true);
 
     try s.grantCap(.Process0, .Process1, 0x1000, .{
         .cpu_read = true,
         .cpu_write = false,
         .dma = true,
     });
-    const mapping = try s.dmaMapCreateStage1(.Process1, .virtio_gpu, 0x1000, 128, .read);
+    const mapping = try s.dmaMapCreateStage1(.Process1, 0x1001, 0x1000, 128, .read);
     try std.testing.expect(!device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
-    const queue_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, .virtio_gpu, 0, true, false);
+    const queue_token = try device_capabilities.queueCapGrantStage2(&s, .Process1, 0x1001, 0, true, false);
     try std.testing.expect(device_capabilities.iommuHasMappingForPrincipalForTest(&s, .Process1, 0x1000));
 
     try device_capabilities.revokeDeviceCapStage2(&s, .Process1, .virtqueue, queue_token);

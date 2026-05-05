@@ -17,6 +17,8 @@ pub const ServiceKind = enum(u64) {
     gpu = 7,
     pointer = 8,
     fat_fs = 9,
+    console = 10,
+    net = 11,
 };
 
 pub const ServiceEntry = extern struct {

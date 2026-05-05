@@ -56,9 +56,12 @@ enum {
     SERVICE_REGISTRY_VERSION = 1,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     SERVICE_KIND_VFS = 2,
+    SERVICE_KIND_CONSOLE = 10,
 
     VFS_REQUEST_VA = 0x2B000000,
     VFS_RESPONSE_VA = 0x2B001000,
+    CONSOLE_REQUEST_VA = 0x2B010000,
+    CONSOLE_RESPONSE_VA = 0x2B011000,
     FS_REQUEST_MAGIC = 0x51534653,
     FS_RESPONSE_MAGIC = 0x52534653,
     FS_PROTOCOL_VERSION = 1,
@@ -92,6 +95,24 @@ enum {
     FS_DIR_MODE = 0x4000,
     FS_FILE_MODE = 0x8000,
 
+    CONSOLE_REQUEST_MAGIC = 0x514E4F43,
+    CONSOLE_RESPONSE_MAGIC = 0x524E4F43,
+    CONSOLE_PROTOCOL_VERSION = 1,
+    CONSOLE_OP_CONNECT = 1,
+    CONSOLE_OP_READ = 2,
+    CONSOLE_OP_WRITE = 3,
+    CONSOLE_OP_GET_ATTR = 4,
+    CONSOLE_OP_SET_ATTR = 5,
+    CONSOLE_STATUS_OK = 0,
+    CONSOLE_STATUS_AGAIN = 1,
+    CONSOLE_STATUS_INVALID = 2,
+    CONSOLE_STATUS_IO_ERROR = 3,
+    CONSOLE_STATUS_NOT_CONNECTED = 4,
+    CONSOLE_REQUEST_HEADER_BYTES = 64,
+    CONSOLE_RESPONSE_HEADER_BYTES = 64,
+    CONSOLE_REQUEST_PAYLOAD_BYTES = PAGE_BYTES - CONSOLE_REQUEST_HEADER_BYTES,
+    CONSOLE_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - CONSOLE_RESPONSE_HEADER_BYTES,
+
     LINUX_SYS_READ = 0,
     LINUX_SYS_WRITE = 1,
     LINUX_SYS_OPEN = 2,
@@ -120,6 +141,7 @@ enum {
     LINUX_SYS_FORK = 57,
     LINUX_SYS_VFORK = 58,
     LINUX_SYS_WAIT4 = 61,
+    LINUX_SYS_KILL = 62,
     LINUX_SYS_UNAME = 63,
     LINUX_SYS_FCNTL = 72,
     LINUX_SYS_GETCWD = 79,
@@ -136,12 +158,15 @@ enum {
     LINUX_SYS_GETGID = 104,
     LINUX_SYS_GETEUID = 107,
     LINUX_SYS_GETEGID = 108,
+    LINUX_SYS_SETPGID = 109,
     LINUX_SYS_GETPPID = 110,
+    LINUX_SYS_GETPGID = 121,
     LINUX_SYS_EXECVE = 59,
     LINUX_SYS_EXIT = 60,
     LINUX_SYS_ARCH_PRCTL = 158,
     LINUX_SYS_GETTID = 186,
     LINUX_SYS_FUTEX = 202,
+    LINUX_SYS_SCHED_GETAFFINITY = 204,
     LINUX_SYS_GETDENTS64 = 217,
     LINUX_SYS_SET_TID_ADDRESS = 218,
     LINUX_SYS_CLOCK_GETTIME = 228,
@@ -171,6 +196,8 @@ enum {
     O_DIRECTORY = 00200000,
     FS_CREATE_FLAG_TRUNCATE = 1 << 1,
     WNOHANG = 1,
+    WUNTRACED = 2,
+    WCONTINUED = 8,
     SIGCHLD = 17,
     CLONE_VM = 0x00000100,
     CLONE_FS = 0x00000200,
@@ -207,6 +234,14 @@ enum {
 
     TRAP_RESPONSE_FLAG_EXIT = 1,
     ARCH_SET_FS = 0x1002,
+    TCGETS = 0x5401,
+    TCSETS = 0x5402,
+    TCSETSW = 0x5403,
+    TCSETSF = 0x5404,
+    TIOCGPGRP = 0x540F,
+    TIOCSPGRP = 0x5410,
+    TIOCGWINSZ = 0x5413,
+    TIOCSWINSZ = 0x5414,
 
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
@@ -255,6 +290,14 @@ struct fs_response_header {
     u32 magic; u16 version; u16 op; u64 response_seq; i32 status; u32 result_flags; u64 result_token;
     u64 file_bytes; u64 cursor_next; u16 inline_bytes; u8 object_kind; u8 reserved0; u32 reserved1; u64 arg0; u64 arg1;
 };
+struct console_request_header {
+    u32 magic; u16 version; u16 op; u64 request_seq; u64 session_nonce; u32 length; u32 flags;
+    u64 arg0; u64 arg1; u64 arg2; u64 reserved0;
+};
+struct console_response_header {
+    u32 magic; u16 version; u16 op; u64 response_seq; i32 status; u32 result_flags;
+    u32 inline_bytes; u32 reserved0; u64 arg0; u64 arg1; u64 reserved1; u64 reserved2;
+};
 struct fs_stat_record { u8 object_kind; u8 reserved0[7]; u64 size_bytes; u32 mode_bits; u32 reserved1; u64 mtime_unix_sec; u64 reserved2[2]; };
 struct fs_dirent_record { u64 next_cursor; u8 object_kind; u8 reserved0[7]; u16 name_bytes; u16 reserved1; u32 reserved2; };
 struct linux_stat {
@@ -264,9 +307,10 @@ struct linux_stat {
     i64 __unused[3];
 };
 
-enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5 };
+enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6 };
 struct fd_entry { enum fd_kind kind; u64 token; u64 offset; u64 size; u32 mode_bits; u8 object_kind; u8 pipe_id; u16 path_len; char path[FS_MAX_PATH_BYTES + 1]; };
 struct vfs_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
+struct console_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
 
 enum { PIPE_MAX = 8, PIPE_BUFFER_BYTES = 4096 };
 struct pipe_entry {
@@ -298,6 +342,7 @@ struct linux_process_state {
     u8 used;
     u8 exec_pending;
     u32 exit_status;
+    u64 exec_pending_principal;
     u64 pid;
     u64 tid;
     u64 principal;
@@ -350,6 +395,7 @@ struct linux_abi_bootstrap_config {
 
 static u64 trap_request_page_va = 0;
 static struct vfs_client g_vfs;
+static struct console_client g_console;
 static struct linux_process_state g_processes[LINUX_PROCESS_MAX];
 static struct linux_process_state *g_proc = 0;
 static u8 g_exit_record_used[LINUX_PROCESS_MAX];

@@ -77,6 +77,10 @@ struct backend_session {
 
 static struct backend_session g_fat;
 static u64 g_image_page_paddrs[MAX_ROOT_SEED2_PAGES];
+static u64 g_console_endpoint_id;
+static u64 g_console_process_slot;
+static u64 g_net_endpoint_id;
+static u64 g_net_process_slot;
 
 static u64 cstr_len(const char *s) {
     u64 n = 0;
@@ -310,6 +314,10 @@ static void spawn_root_seed2(void) {
     config[1] = 1;
     config[3] = g_fat.endpoint_id;
     config[4] = g_fat.process_slot;
+    config[5] = g_console_endpoint_id;
+    config[6] = g_console_process_slot;
+    config[7] = g_net_endpoint_id;
+    config[8] = g_net_process_slot;
 
     static struct bootstrap_descriptor_table table;
     clear_page((u64)&table);
@@ -338,6 +346,10 @@ void bootstrap_vfs_main(void) {
     volatile u64 *config = (volatile u64 *)BOOTSTRAP_VFS_CONFIG_VA;
     const u64 fat_endpoint_id = config[3];
     const u64 fat_process_slot = config[4];
+    g_console_endpoint_id = config[5];
+    g_console_process_slot = config[6];
+    g_net_endpoint_id = config[7];
+    g_net_process_slot = config[8];
     if (connect_fat(fat_endpoint_id, fat_process_slot)) {
         user_log("[bootstrap_vfs] fat connect ok\n");
         spawn_root_seed2();

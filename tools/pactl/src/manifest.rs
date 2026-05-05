@@ -33,6 +33,7 @@ struct StartupNode {
     provides: Vec<String>,
     ensure: Vec<String>,
     block: Vec<String>,
+    device: Vec<String>,
     input: Vec<String>,
 }
 
@@ -228,6 +229,17 @@ fn render_startup_manifest(apps: &[AppConfig]) -> Result<String, String> {
             out.push_str("input=");
             out.push_str(&node.input[0]);
         }
+        if !node.device.is_empty() {
+            if node.device.len() != 1 {
+                return Err(format!(
+                    "startup device selector must have exactly one value for app {}",
+                    node.app_id
+                ));
+            }
+            out.push(' ');
+            out.push_str("device=");
+            out.push_str(&node.device[0]);
+        }
         append_list_field(&mut out, "after", &node.after);
         append_list_field(&mut out, "requires", &node.requires);
         append_list_field(&mut out, "ensure", &node.ensure);
@@ -273,6 +285,7 @@ fn order_startup_nodes(apps: &[AppConfig]) -> Result<Vec<StartupNode>, String> {
             provides: startup.provides.clone(),
             ensure: startup.ensure.clone(),
             block: startup.block.clone(),
+            device: startup.device.clone(),
             input: startup.input.clone(),
         };
         if node.action.is_empty()

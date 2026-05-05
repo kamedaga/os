@@ -11,6 +11,7 @@ enum {
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
+    SYSCALL_GET_MEMORY_STATS = 0x3C,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     PAGE_RIGHT_CPU_READ = 0x1,
@@ -23,7 +24,10 @@ enum {
     VFS_MAX_SESSIONS = 8,
     VFS_FAT_REQUEST_VA = 0x26100000,
     VFS_FAT_RESPONSE_VA = 0x26101000,
+    VFS_NET_REQUEST_VA = 0x26200000,
+    VFS_NET_RESPONSE_VA = 0x26201000,
     VFS_REPLY_ENDPOINT_ID = 0xE0,
+    VFS_NET_REPLY_ENDPOINT_ID = 0xEA,
     VFS_TOKEN_TAG = 1ULL << 63,
     VFS_BACKEND_TOKEN_BASE = 1ULL << 40,
     VFS_ROOT_OBJECT_ID = 1,
@@ -35,6 +39,29 @@ enum {
     VFS_DEV_ZERO_OBJECT_ID = 7,
     VFS_DEV_NULL_OPEN_OBJECT_ID = 8,
     VFS_DEV_ZERO_OPEN_OBJECT_ID = 9,
+    VFS_PROC_CPUINFO_OBJECT_ID = 10,
+    VFS_PROC_MEMINFO_OBJECT_ID = 11,
+    VFS_PROC_UPTIME_OBJECT_ID = 12,
+    VFS_PROC_STAT_OBJECT_ID = 13,
+    VFS_PROC_SELF_OBJECT_ID = 14,
+    VFS_PROC_SELF_EXE_OBJECT_ID = 15,
+    VFS_PROC_CPUINFO_OPEN_OBJECT_ID = 16,
+    VFS_PROC_MEMINFO_OPEN_OBJECT_ID = 17,
+    VFS_PROC_UPTIME_OPEN_OBJECT_ID = 18,
+    VFS_PROC_STAT_OPEN_OBJECT_ID = 19,
+    VFS_PROC_MOUNTS_OBJECT_ID = 20,
+    VFS_PROC_SELF_STAT_OBJECT_ID = 21,
+    VFS_PROC_SELF_STATUS_OBJECT_ID = 22,
+    VFS_PROC_MOUNTS_OPEN_OBJECT_ID = 23,
+    VFS_PROC_SELF_STAT_OPEN_OBJECT_ID = 24,
+    VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID = 25,
+    VFS_PROC_NET_OBJECT_ID = 26,
+    VFS_PROC_NET_DEV_OBJECT_ID = 27,
+    VFS_PROC_NET_ROUTE_OBJECT_ID = 28,
+    VFS_PROC_NET_DEV_OPEN_OBJECT_ID = 29,
+    VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID = 30,
+    VFS_PROC_NET_CAPABILITYOS_OBJECT_ID = 31,
+    VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID = 32,
     VFS_TMPFS_FILE_OBJECT_ID_BASE = 0x1000,
     VFS_TMPFS_OPEN_OBJECT_ID_BASE = 0x2000,
     VFS_TMPFS_MAX_FILES = 16,
@@ -43,6 +70,16 @@ enum {
     VFS_FILE_MODE = 0x8000,
     VFS_CREATE_FLAG_DIRECTORY = 1 << 0,
     VFS_CREATE_FLAG_TRUNCATE = 1 << 1,
+
+    NET_PROTOCOL_REQUEST_MAGIC = 0x514E4554,
+    NET_PROTOCOL_RESPONSE_MAGIC = 0x524E4554,
+    NET_PROTOCOL_VERSION = 1,
+    NET_OP_CONNECT = 1,
+    NET_OP_GET_STATUS = 2,
+    NET_STATUS_OK = 0,
+    NET_FLAG_LINK_UP = 1 << 0,
+    NET_FLAG_DHCP_BOUND = 1 << 1,
+    NET_FLAG_GATEWAY_ARP = 1 << 2,
 };
 
 struct vfs_mount_entry {
@@ -96,9 +133,62 @@ struct vfs_backend_session {
     u64 next_seq;
 };
 
+struct net_request_header {
+    u32 magic;
+    u16 version;
+    u16 op;
+    u64 request_seq;
+    u64 session_nonce;
+    u64 arg0;
+    u64 arg1;
+    u64 arg2;
+    u64 reserved0;
+};
+
+struct net_response_header {
+    u32 magic;
+    u16 version;
+    u16 op;
+    u64 response_seq;
+    int status;
+    u32 inline_bytes;
+    u64 arg0;
+    u64 arg1;
+    u64 arg2;
+    u64 reserved0;
+};
+
+struct net_status_payload {
+    u8 mac[6];
+    u8 link_up;
+    u8 dhcp_bound;
+    u32 ipv4_addr;
+    u32 gateway_addr;
+    u32 dns_addr;
+    u32 dhcp_server_addr;
+    u32 flags;
+    u64 rx_packets;
+    u64 tx_completions;
+};
+
+struct net_backend_session {
+    u8 active;
+    u8 reserved0[7];
+    u64 endpoint_id;
+    u64 process_slot;
+    u64 request_va;
+    u64 response_va;
+    u64 request_paddr;
+    u64 response_paddr;
+    u64 session_nonce;
+    u64 next_seq;
+    struct net_status_payload last_status;
+};
+
 static struct vfs_session g_sessions[VFS_MAX_SESSIONS];
 static struct vfs_session *g_session;
 static struct vfs_backend_session g_root_backend;
+static struct net_backend_session g_net_backend;
 static struct vfs_tmpfs_file g_tmpfs_files[VFS_TMPFS_MAX_FILES];
 static u64 g_endpoint_id;
 static const struct vfs_mount_entry g_root_mounts[] = {
@@ -111,11 +201,182 @@ static const struct vfs_builtin_file g_dev_files[] = {
     { VFS_DEV_NULL_OBJECT_ID, VFS_DEV_NULL_OPEN_OBJECT_ID, "null", 4 },
     { VFS_DEV_ZERO_OBJECT_ID, VFS_DEV_ZERO_OPEN_OBJECT_ID, "zero", 4 },
 };
+static const struct vfs_builtin_file g_proc_files[] = {
+    { VFS_PROC_CPUINFO_OBJECT_ID, VFS_PROC_CPUINFO_OPEN_OBJECT_ID, "cpuinfo", 7 },
+    { VFS_PROC_MEMINFO_OBJECT_ID, VFS_PROC_MEMINFO_OPEN_OBJECT_ID, "meminfo", 7 },
+    { VFS_PROC_UPTIME_OBJECT_ID, VFS_PROC_UPTIME_OPEN_OBJECT_ID, "uptime", 6 },
+    { VFS_PROC_STAT_OBJECT_ID, VFS_PROC_STAT_OPEN_OBJECT_ID, "stat", 4 },
+    { VFS_PROC_MOUNTS_OBJECT_ID, VFS_PROC_MOUNTS_OPEN_OBJECT_ID, "mounts", 6 },
+};
+static const struct vfs_mount_entry g_proc_dirs[] = {
+    { VFS_PROC_SELF_OBJECT_ID, "self", 4 },
+    { VFS_PROC_NET_OBJECT_ID, "net", 3 },
+};
+static const struct vfs_builtin_file g_proc_self_files[] = {
+    { VFS_PROC_SELF_EXE_OBJECT_ID, 0, "exe", 3 },
+    { VFS_PROC_SELF_STAT_OBJECT_ID, VFS_PROC_SELF_STAT_OPEN_OBJECT_ID, "stat", 4 },
+    { VFS_PROC_SELF_STATUS_OBJECT_ID, VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID, "status", 6 },
+};
+static const struct vfs_builtin_file g_proc_net_files[] = {
+    { VFS_PROC_NET_DEV_OBJECT_ID, VFS_PROC_NET_DEV_OPEN_OBJECT_ID, "dev", 3 },
+    { VFS_PROC_NET_ROUTE_OBJECT_ID, VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID, "route", 5 },
+    { VFS_PROC_NET_CAPABILITYOS_OBJECT_ID, VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID, "capabilityos", 12 },
+};
+static const char g_proc_cpuinfo[] =
+    "processor\t: 0\n"
+    "vendor_id\t: PachaOS\n"
+    "model name\t: PachaOS Virtual CPU\n"
+    "cpu cores\t: 4\n"
+    "siblings\t: 4\n"
+    "\n"
+    "processor\t: 1\n"
+    "vendor_id\t: PachaOS\n"
+    "model name\t: PachaOS Virtual CPU\n"
+    "cpu cores\t: 4\n"
+    "siblings\t: 4\n"
+    "\n"
+    "processor\t: 2\n"
+    "vendor_id\t: PachaOS\n"
+    "model name\t: PachaOS Virtual CPU\n"
+    "cpu cores\t: 4\n"
+    "siblings\t: 4\n"
+    "\n"
+    "processor\t: 3\n"
+    "vendor_id\t: PachaOS\n"
+    "model name\t: PachaOS Virtual CPU\n"
+    "cpu cores\t: 4\n"
+    "siblings\t: 4\n"
+    "\n";
+static char g_proc_meminfo_buf[256];
+static char g_proc_net_dev_buf[512];
+static char g_proc_net_route_buf[384];
+static char g_proc_net_capabilityos_buf[384];
+static const char g_proc_uptime[] = "1.00 0.00\n";
+static const char g_proc_stat[] =
+    "cpu  100 0 50 1000 0 0 0 0 0 0\n"
+    "cpu0 25 0 12 250 0 0 0 0 0 0\n"
+    "cpu1 25 0 12 250 0 0 0 0 0 0\n"
+    "cpu2 25 0 13 250 0 0 0 0 0 0\n"
+    "cpu3 25 0 13 250 0 0 0 0 0 0\n"
+    "intr 0\n"
+    "ctxt 0\n"
+    "btime 0\n"
+    "processes 1\n"
+    "procs_running 1\n"
+    "procs_blocked 0\n";
+static const char g_proc_mounts[] =
+    "rootfs / fat32 rw 0 0\n"
+    "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+    "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+    "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
+    "tmpfs /run tmpfs rw,nosuid,nodev 0 0\n";
+static const char g_proc_self_stat[] =
+    "1 (dash) S 0 1 1 0 -1 4194304 0 0 0 0 1 0 0 0 20 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+static const char g_proc_self_status[] =
+    "Name:\tdash\n"
+    "Umask:\t0022\n"
+    "State:\tS (sleeping)\n"
+    "Tgid:\t1\n"
+    "Ngid:\t0\n"
+    "Pid:\t1\n"
+    "PPid:\t0\n"
+    "TracerPid:\t0\n"
+    "Uid:\t0\t0\t0\t0\n"
+    "Gid:\t0\t0\t0\t0\n"
+    "Threads:\t1\n"
+    "VmPeak:\t0 kB\n"
+    "VmSize:\t0 kB\n"
+    "VmRSS:\t0 kB\n"
+    "RssAnon:\t0 kB\n"
+    "RssFile:\t0 kB\n"
+    "RssShmem:\t0 kB\n"
+    "SigQ:\t0/0\n"
+    "SigPnd:\t0000000000000000\n"
+    "ShdPnd:\t0000000000000000\n"
+    "SigBlk:\t0000000000000000\n"
+    "SigIgn:\t0000000000000000\n"
+    "SigCgt:\t0000000000000000\n"
+    "CapInh:\t0000000000000000\n"
+    "CapPrm:\t0000000000000000\n"
+    "CapEff:\t0000000000000000\n"
+    "CapBnd:\t0000000000000000\n"
+    "CapAmb:\t0000000000000000\n";
 
 static u64 cstr_len(const char *s) {
     u64 n = 0;
     while (s[n] != 0) n++;
     return n;
+}
+
+static int refresh_net_status(void);
+
+static void append_char(char *buf, u64 cap, u64 *len, char ch) {
+    if (*len + 1 >= cap) return;
+    buf[*len] = ch;
+    *len = *len + 1;
+    buf[*len] = 0;
+}
+
+static void append_str(char *buf, u64 cap, u64 *len, const char *s) {
+    for (u64 i = 0; s[i] != 0; i++) append_char(buf, cap, len, s[i]);
+}
+
+static void append_u64_dec(char *buf, u64 cap, u64 *len, u64 value) {
+    char tmp[20];
+    u64 n = 0;
+    if (value == 0) {
+        append_char(buf, cap, len, '0');
+        return;
+    }
+    while (value != 0 && n < sizeof(tmp)) {
+        tmp[n] = (char)('0' + (value % 10));
+        value /= 10;
+        n++;
+    }
+    while (n != 0) {
+        n--;
+        append_char(buf, cap, len, tmp[n]);
+    }
+}
+
+static void append_hex_digit(char *buf, u64 cap, u64 *len, u8 value) {
+    append_char(buf, cap, len, (char)(value < 10 ? ('0' + value) : ('A' + value - 10)));
+}
+
+static void append_hex_byte(char *buf, u64 cap, u64 *len, u8 value) {
+    append_hex_digit(buf, cap, len, (u8)((value >> 4) & 0xF));
+    append_hex_digit(buf, cap, len, (u8)(value & 0xF));
+}
+
+static void append_mac(char *buf, u64 cap, u64 *len, const u8 mac[6]) {
+    for (u64 i = 0; i < 6; i++) {
+        if (i != 0) append_char(buf, cap, len, ':');
+        append_hex_byte(buf, cap, len, mac[i]);
+    }
+}
+
+static void append_ipv4(char *buf, u64 cap, u64 *len, u32 addr) {
+    append_u64_dec(buf, cap, len, (addr >> 24) & 0xFF);
+    append_char(buf, cap, len, '.');
+    append_u64_dec(buf, cap, len, (addr >> 16) & 0xFF);
+    append_char(buf, cap, len, '.');
+    append_u64_dec(buf, cap, len, (addr >> 8) & 0xFF);
+    append_char(buf, cap, len, '.');
+    append_u64_dec(buf, cap, len, addr & 0xFF);
+}
+
+static void append_route_hex_ipv4(char *buf, u64 cap, u64 *len, u32 addr) {
+    append_hex_byte(buf, cap, len, (u8)(addr & 0xFF));
+    append_hex_byte(buf, cap, len, (u8)((addr >> 8) & 0xFF));
+    append_hex_byte(buf, cap, len, (u8)((addr >> 16) & 0xFF));
+    append_hex_byte(buf, cap, len, (u8)((addr >> 24) & 0xFF));
+}
+
+static void append_meminfo_line(char *buf, u64 cap, u64 *len, const char *name, u64 kb) {
+    append_str(buf, cap, len, name);
+    append_str(buf, cap, len, ": ");
+    append_u64_dec(buf, cap, len, kb);
+    append_str(buf, cap, len, " kB\n");
 }
 
 static void user_log_len(const char *message, u64 len) {
@@ -178,6 +439,16 @@ static u64 syscall0(u64 nr) {
     return ret;
 }
 
+static u64 syscall1(u64 nr, u64 arg0) {
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr), "D"(arg0)
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
 static u64 syscall3(u64 nr, u64 arg0, u64 arg1, u64 arg2) {
     u64 ret;
     __asm__ volatile(
@@ -230,7 +501,7 @@ static u64 root_token(void) {
 static u64 object_id_from_token(u64 token) {
     if ((token & VFS_TOKEN_TAG) == 0) return 0;
     const u64 object_id = token & ~VFS_TOKEN_TAG;
-    if (object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_DEV_ZERO_OPEN_OBJECT_ID) return object_id;
+    if (object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID) return object_id;
     if (object_id >= VFS_TMPFS_FILE_OBJECT_ID_BASE &&
         object_id < VFS_TMPFS_FILE_OBJECT_ID_BASE + VFS_TMPFS_MAX_FILES) return object_id;
     if (object_id >= VFS_TMPFS_OPEN_OBJECT_ID_BASE &&
@@ -261,15 +532,42 @@ static int is_tmpfs_open_object_id(u64 object_id) {
 }
 
 static int is_directory_object_id(u64 object_id) {
-    return object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_RUN_OBJECT_ID;
+    return (object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_RUN_OBJECT_ID) ||
+        object_id == VFS_PROC_SELF_OBJECT_ID ||
+        object_id == VFS_PROC_NET_OBJECT_ID;
 }
 
 static int is_file_object_id(u64 object_id) {
-    return object_id == VFS_DEV_NULL_OBJECT_ID || object_id == VFS_DEV_ZERO_OBJECT_ID || is_tmpfs_file_object_id(object_id);
+    return object_id == VFS_DEV_NULL_OBJECT_ID ||
+        object_id == VFS_DEV_ZERO_OBJECT_ID ||
+        object_id == VFS_PROC_CPUINFO_OBJECT_ID ||
+        object_id == VFS_PROC_MEMINFO_OBJECT_ID ||
+        object_id == VFS_PROC_UPTIME_OBJECT_ID ||
+        object_id == VFS_PROC_STAT_OBJECT_ID ||
+        object_id == VFS_PROC_MOUNTS_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_EXE_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STAT_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STATUS_OBJECT_ID ||
+        object_id == VFS_PROC_NET_DEV_OBJECT_ID ||
+        object_id == VFS_PROC_NET_ROUTE_OBJECT_ID ||
+        object_id == VFS_PROC_NET_CAPABILITYOS_OBJECT_ID ||
+        is_tmpfs_file_object_id(object_id);
 }
 
 static int is_open_file_object_id(u64 object_id) {
-    return object_id == VFS_DEV_NULL_OPEN_OBJECT_ID || object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID || is_tmpfs_open_object_id(object_id);
+    return object_id == VFS_DEV_NULL_OPEN_OBJECT_ID ||
+        object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_CPUINFO_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_MEMINFO_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_UPTIME_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_STAT_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_MOUNTS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STAT_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_DEV_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID ||
+        is_tmpfs_open_object_id(object_id);
 }
 
 static int is_directory_token(u64 token) {
@@ -287,6 +585,15 @@ static int is_open_file_token(u64 token) {
 static u64 open_object_id_for_file(u64 object_id) {
     for (u64 i = 0; i < sizeof(g_dev_files) / sizeof(g_dev_files[0]); i++) {
         if (g_dev_files[i].object_id == object_id) return g_dev_files[i].open_object_id;
+    }
+    for (u64 i = 0; i < sizeof(g_proc_files) / sizeof(g_proc_files[0]); i++) {
+        if (g_proc_files[i].object_id == object_id) return g_proc_files[i].open_object_id;
+    }
+    for (u64 i = 0; i < sizeof(g_proc_self_files) / sizeof(g_proc_self_files[0]); i++) {
+        if (g_proc_self_files[i].object_id == object_id) return g_proc_self_files[i].open_object_id;
+    }
+    for (u64 i = 0; i < sizeof(g_proc_net_files) / sizeof(g_proc_net_files[0]); i++) {
+        if (g_proc_net_files[i].object_id == object_id) return g_proc_net_files[i].open_object_id;
     }
     const u64 tmpfs_index = tmpfs_index_from_file_object_id(object_id);
     if (tmpfs_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_index].used) {
@@ -309,6 +616,50 @@ static int path_equals(const volatile u8 *path, u16 len, const char *name, u16 n
     return 1;
 }
 
+static u64 lookup_proc_self_exact_path(u64 base_object_id, const volatile u8 *path, u16 len) {
+    if ((base_object_id == VFS_ROOT_OBJECT_ID && path_equals(path, len, "/proc/self/exe", 14)) ||
+        (base_object_id == VFS_PROC_OBJECT_ID && path_equals(path, len, "self/exe", 8)) ||
+        (base_object_id == VFS_PROC_SELF_OBJECT_ID && path_equals(path, len, "exe", 3)))
+    {
+        return token_from_object_id(VFS_PROC_SELF_EXE_OBJECT_ID);
+    }
+    if ((base_object_id == VFS_ROOT_OBJECT_ID && path_equals(path, len, "/proc/self/stat", 15)) ||
+        (base_object_id == VFS_PROC_OBJECT_ID && path_equals(path, len, "self/stat", 9)) ||
+        (base_object_id == VFS_PROC_SELF_OBJECT_ID && path_equals(path, len, "stat", 4)))
+    {
+        return token_from_object_id(VFS_PROC_SELF_STAT_OBJECT_ID);
+    }
+    if ((base_object_id == VFS_ROOT_OBJECT_ID && path_equals(path, len, "/proc/self/status", 17)) ||
+        (base_object_id == VFS_PROC_OBJECT_ID && path_equals(path, len, "self/status", 11)) ||
+        (base_object_id == VFS_PROC_SELF_OBJECT_ID && path_equals(path, len, "status", 6)))
+    {
+        return token_from_object_id(VFS_PROC_SELF_STATUS_OBJECT_ID);
+    }
+    return 0;
+}
+
+static u64 lookup_proc_net_exact_path(u64 base_object_id, const volatile u8 *path, u16 len) {
+    if ((base_object_id == VFS_ROOT_OBJECT_ID && path_equals(path, len, "/proc/net/dev", 13)) ||
+        (base_object_id == VFS_PROC_OBJECT_ID && path_equals(path, len, "net/dev", 7)) ||
+        (base_object_id == VFS_PROC_NET_OBJECT_ID && path_equals(path, len, "dev", 3)))
+    {
+        return token_from_object_id(VFS_PROC_NET_DEV_OBJECT_ID);
+    }
+    if ((base_object_id == VFS_ROOT_OBJECT_ID && path_equals(path, len, "/proc/net/route", 15)) ||
+        (base_object_id == VFS_PROC_OBJECT_ID && path_equals(path, len, "net/route", 9)) ||
+        (base_object_id == VFS_PROC_NET_OBJECT_ID && path_equals(path, len, "route", 5)))
+    {
+        return token_from_object_id(VFS_PROC_NET_ROUTE_OBJECT_ID);
+    }
+    if ((base_object_id == VFS_ROOT_OBJECT_ID && path_equals(path, len, "/proc/net/capabilityos", 22)) ||
+        (base_object_id == VFS_PROC_OBJECT_ID && path_equals(path, len, "net/capabilityos", 16)) ||
+        (base_object_id == VFS_PROC_NET_OBJECT_ID && path_equals(path, len, "capabilityos", 12)))
+    {
+        return token_from_object_id(VFS_PROC_NET_CAPABILITYOS_OBJECT_ID);
+    }
+    return 0;
+}
+
 static u64 lookup_mount_name(const volatile u8 *name, u16 name_len) {
     for (u64 i = 0; i < sizeof(g_root_mounts) / sizeof(g_root_mounts[0]); i++) {
         if (path_equals(name, name_len, g_root_mounts[i].name, g_root_mounts[i].name_len)) {
@@ -322,6 +673,38 @@ static u64 lookup_dev_name(const volatile u8 *name, u16 name_len) {
     for (u64 i = 0; i < sizeof(g_dev_files) / sizeof(g_dev_files[0]); i++) {
         if (path_equals(name, name_len, g_dev_files[i].name, g_dev_files[i].name_len)) {
             return token_from_object_id(g_dev_files[i].object_id);
+        }
+    }
+    return 0;
+}
+
+static u64 lookup_proc_name(const volatile u8 *name, u16 name_len) {
+    for (u64 i = 0; i < sizeof(g_proc_dirs) / sizeof(g_proc_dirs[0]); i++) {
+        if (path_equals(name, name_len, g_proc_dirs[i].name, g_proc_dirs[i].name_len)) {
+            return token_from_object_id(g_proc_dirs[i].object_id);
+        }
+    }
+    for (u64 i = 0; i < sizeof(g_proc_files) / sizeof(g_proc_files[0]); i++) {
+        if (path_equals(name, name_len, g_proc_files[i].name, g_proc_files[i].name_len)) {
+            return token_from_object_id(g_proc_files[i].object_id);
+        }
+    }
+    return 0;
+}
+
+static u64 lookup_proc_self_name(const volatile u8 *name, u16 name_len) {
+    for (u64 i = 0; i < sizeof(g_proc_self_files) / sizeof(g_proc_self_files[0]); i++) {
+        if (path_equals(name, name_len, g_proc_self_files[i].name, g_proc_self_files[i].name_len)) {
+            return token_from_object_id(g_proc_self_files[i].object_id);
+        }
+    }
+    return 0;
+}
+
+static u64 lookup_proc_net_name(const volatile u8 *name, u16 name_len) {
+    for (u64 i = 0; i < sizeof(g_proc_net_files) / sizeof(g_proc_net_files[0]); i++) {
+        if (path_equals(name, name_len, g_proc_net_files[i].name, g_proc_net_files[i].name_len)) {
+            return token_from_object_id(g_proc_net_files[i].object_id);
         }
     }
     return 0;
@@ -358,6 +741,10 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
     const u64 base_object_id = object_id_from_token(base_token);
     if (base_object_id == 0) return 0;
     if (is_root_path(path, len)) return base_token;
+    const u64 self_exact_token = lookup_proc_self_exact_path(base_object_id, path, len);
+    if (self_exact_token != 0) return self_exact_token;
+    const u64 net_exact_token = lookup_proc_net_exact_path(base_object_id, path, len);
+    if (net_exact_token != 0) return net_exact_token;
 
     u16 pos = 0;
     u64 current_object_id = base_object_id;
@@ -382,6 +769,18 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
         const u64 token = lookup_dev_name(path + start, component_len);
         if (token == 0) return 0;
         current_object_id = object_id_from_token(token);
+    } else if (current_object_id == VFS_PROC_OBJECT_ID) {
+        const u64 token = lookup_proc_name(path + start, component_len);
+        if (token == 0) return 0;
+        current_object_id = object_id_from_token(token);
+    } else if (current_object_id == VFS_PROC_SELF_OBJECT_ID) {
+        const u64 token = lookup_proc_self_name(path + start, component_len);
+        if (token == 0) return 0;
+        current_object_id = object_id_from_token(token);
+    } else if (current_object_id == VFS_PROC_NET_OBJECT_ID) {
+        const u64 token = lookup_proc_net_name(path + start, component_len);
+        if (token == 0) return 0;
+        current_object_id = object_id_from_token(token);
     } else if (current_object_id == VFS_TMP_OBJECT_ID || current_object_id == VFS_RUN_OBJECT_ID) {
         const u64 token = lookup_tmpfs_name(current_object_id, path + start, component_len);
         if (token == 0) return 0;
@@ -392,6 +791,9 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
 
     if (pos >= len) return token_from_object_id(current_object_id);
     if (current_object_id != VFS_DEV_OBJECT_ID &&
+        current_object_id != VFS_PROC_OBJECT_ID &&
+        current_object_id != VFS_PROC_SELF_OBJECT_ID &&
+        current_object_id != VFS_PROC_NET_OBJECT_ID &&
         current_object_id != VFS_TMP_OBJECT_ID &&
         current_object_id != VFS_RUN_OBJECT_ID) return 0;
 
@@ -401,6 +803,9 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
     while (pos < len && path[pos] == '/') pos++;
     if (pos < len) return 0;
     if (current_object_id == VFS_DEV_OBJECT_ID) return lookup_dev_name(path + second_start, second_len);
+    if (current_object_id == VFS_PROC_OBJECT_ID) return lookup_proc_name(path + second_start, second_len);
+    if (current_object_id == VFS_PROC_SELF_OBJECT_ID) return lookup_proc_self_name(path + second_start, second_len);
+    if (current_object_id == VFS_PROC_NET_OBJECT_ID) return lookup_proc_net_name(path + second_start, second_len);
     return lookup_tmpfs_name(current_object_id, path + second_start, second_len);
 }
 
@@ -453,9 +858,165 @@ static u64 tmpfs_file_bytes_from_token(u64 token) {
     return 0;
 }
 
+static const char *build_proc_meminfo(u64 *bytes_out) {
+    u64 stats[4];
+    stats[0] = 512ULL * 1024ULL * 1024ULL;
+    stats[1] = 256ULL * 1024ULL * 1024ULL;
+    stats[2] = 256ULL * 1024ULL * 1024ULL;
+    stats[3] = 4096;
+    const u64 status = syscall1(SYSCALL_GET_MEMORY_STATS, (u64)stats);
+    if (status != SYSCALL_OK || stats[0] == 0 || stats[2] > stats[0]) {
+        stats[0] = 512ULL * 1024ULL * 1024ULL;
+        stats[1] = 256ULL * 1024ULL * 1024ULL;
+        stats[2] = 256ULL * 1024ULL * 1024ULL;
+        stats[3] = 4096;
+    }
+
+    const u64 total_kb = stats[0] / 1024;
+    const u64 free_kb = stats[2] / 1024;
+    u64 len = 0;
+    g_proc_meminfo_buf[0] = 0;
+    append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "MemTotal", total_kb);
+    append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "MemFree", free_kb);
+    append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "MemAvailable", free_kb);
+    append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "Buffers", 0);
+    append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "Cached", 0);
+    append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "SwapTotal", 0);
+    append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "SwapFree", 0);
+    if (bytes_out != 0) *bytes_out = len;
+    return g_proc_meminfo_buf;
+}
+
+static void fallback_net_status(struct net_status_payload *status) {
+    status->mac[0] = 0x52;
+    status->mac[1] = 0x54;
+    status->mac[2] = 0x00;
+    status->mac[3] = 0x12;
+    status->mac[4] = 0x34;
+    status->mac[5] = 0x56;
+    status->link_up = 1;
+    status->dhcp_bound = 1;
+    status->ipv4_addr = 0x0A00020FULL;
+    status->gateway_addr = 0x0A000202ULL;
+    status->dns_addr = 0x0A000203ULL;
+    status->dhcp_server_addr = 0x0A000202ULL;
+    status->flags = NET_FLAG_LINK_UP | NET_FLAG_DHCP_BOUND | NET_FLAG_GATEWAY_ARP;
+    status->rx_packets = 2;
+    status->tx_completions = 3;
+}
+
+static void current_net_status(struct net_status_payload *status) {
+    if (refresh_net_status()) {
+        *status = g_net_backend.last_status;
+    } else {
+        fallback_net_status(status);
+    }
+}
+
+static const char *build_proc_net_dev(u64 *bytes_out) {
+    struct net_status_payload status;
+    current_net_status(&status);
+    u64 len = 0;
+    g_proc_net_dev_buf[0] = 0;
+    append_str(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, "Inter-|   Receive                                                |  Transmit\n");
+    append_str(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    append_str(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, "  eth0:");
+    append_u64_dec(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, status.rx_packets * 590);
+    append_char(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, ' ');
+    append_u64_dec(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, status.rx_packets);
+    append_str(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, "    0    0    0     0          0         0 ");
+    append_u64_dec(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, status.tx_completions * 128);
+    append_char(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, ' ');
+    append_u64_dec(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, status.tx_completions);
+    append_str(g_proc_net_dev_buf, sizeof(g_proc_net_dev_buf), &len, "    0    0    0     0       0       0          0\n");
+    if (bytes_out != 0) *bytes_out = len;
+    return g_proc_net_dev_buf;
+}
+
+static const char *build_proc_net_route(u64 *bytes_out) {
+    struct net_status_payload status;
+    current_net_status(&status);
+    const u32 mask = 0xFFFFFF00U;
+    const u32 network = status.ipv4_addr & mask;
+    u64 len = 0;
+    g_proc_net_route_buf[0] = 0;
+    append_str(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
+    append_str(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, "eth0\t00000000\t");
+    append_route_hex_ipv4(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, status.gateway_addr);
+    append_str(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, "\t0003\t0\t0\t100\t00000000\t0\t0\t0\n");
+    append_str(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, "eth0\t");
+    append_route_hex_ipv4(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, network);
+    append_str(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, "\t00000000\t0001\t0\t0\t100\t");
+    append_route_hex_ipv4(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, mask);
+    append_str(g_proc_net_route_buf, sizeof(g_proc_net_route_buf), &len, "\t0\t0\t0\n");
+    if (bytes_out != 0) *bytes_out = len;
+    return g_proc_net_route_buf;
+}
+
+static const char *build_proc_net_capabilityos(u64 *bytes_out) {
+    struct net_status_payload status;
+    current_net_status(&status);
+    u64 len = 0;
+    g_proc_net_capabilityos_buf[0] = 0;
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "iface=eth0\nlink=");
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.link_up ? "up" : "down");
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\ndhcp=");
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.dhcp_bound ? "bound" : "pending");
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\nmac=");
+    append_mac(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.mac);
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\nip=");
+    append_ipv4(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.ipv4_addr);
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\ngateway=");
+    append_ipv4(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.gateway_addr);
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\ndns=");
+    append_ipv4(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.dns_addr);
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\ndhcp_server=");
+    append_ipv4(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.dhcp_server_addr);
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\nrx_packets=");
+    append_u64_dec(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.rx_packets);
+    append_str(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "\ntx_completions=");
+    append_u64_dec(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, status.tx_completions);
+    append_char(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, '\n');
+    if (bytes_out != 0) *bytes_out = len;
+    return g_proc_net_capabilityos_buf;
+}
+
+static const char *proc_content_from_object_id(u64 object_id, u64 *bytes_out) {
+    const char *content = 0;
+    if (object_id == VFS_PROC_CPUINFO_OBJECT_ID || object_id == VFS_PROC_CPUINFO_OPEN_OBJECT_ID) {
+        content = g_proc_cpuinfo;
+    } else if (object_id == VFS_PROC_MEMINFO_OBJECT_ID || object_id == VFS_PROC_MEMINFO_OPEN_OBJECT_ID) {
+        return build_proc_meminfo(bytes_out);
+    } else if (object_id == VFS_PROC_UPTIME_OBJECT_ID || object_id == VFS_PROC_UPTIME_OPEN_OBJECT_ID) {
+        content = g_proc_uptime;
+    } else if (object_id == VFS_PROC_STAT_OBJECT_ID || object_id == VFS_PROC_STAT_OPEN_OBJECT_ID) {
+        content = g_proc_stat;
+    } else if (object_id == VFS_PROC_MOUNTS_OBJECT_ID || object_id == VFS_PROC_MOUNTS_OPEN_OBJECT_ID) {
+        content = g_proc_mounts;
+    } else if (object_id == VFS_PROC_NET_DEV_OBJECT_ID || object_id == VFS_PROC_NET_DEV_OPEN_OBJECT_ID) {
+        return build_proc_net_dev(bytes_out);
+    } else if (object_id == VFS_PROC_NET_ROUTE_OBJECT_ID || object_id == VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID) {
+        return build_proc_net_route(bytes_out);
+    } else if (object_id == VFS_PROC_NET_CAPABILITYOS_OBJECT_ID || object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID) {
+        return build_proc_net_capabilityos(bytes_out);
+    } else if (object_id == VFS_PROC_SELF_STAT_OBJECT_ID || object_id == VFS_PROC_SELF_STAT_OPEN_OBJECT_ID) {
+        content = g_proc_self_stat;
+    } else if (object_id == VFS_PROC_SELF_STATUS_OBJECT_ID || object_id == VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID) {
+        content = g_proc_self_status;
+    }
+    if (content != 0 && bytes_out != 0) *bytes_out = cstr_len(content);
+    return content;
+}
+
+static u64 file_bytes_from_token(u64 token) {
+    u64 bytes = 0;
+    if (proc_content_from_object_id(object_id_from_token(token), &bytes) != 0) return bytes;
+    return tmpfs_file_bytes_from_token(token);
+}
+
 static void reply_file_lookup(u16 op, u64 seq, u64 token) {
     clear_page(g_session->response_va);
-    write_response(op, seq, FS_STATUS_OK, token, tmpfs_file_bytes_from_token(token), 0, FS_OBJECT_FILE, 0);
+    write_response(op, seq, FS_STATUS_OK, token, file_bytes_from_token(token), 0, FS_OBJECT_FILE, 0);
 }
 
 static void reply_stat(u64 seq, u64 token) {
@@ -471,6 +1032,9 @@ static void reply_stat(u64 seq, u64 token) {
         record->size_bytes = g_tmpfs_files[tmpfs_file_index].size;
     } else if (tmpfs_open_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_open_index].used) {
         record->size_bytes = g_tmpfs_files[tmpfs_open_index].size;
+    } else {
+        u64 static_bytes = 0;
+        if (proc_content_from_object_id(object_id, &static_bytes) != 0) record->size_bytes = static_bytes;
     }
     record->mode_bits = is_dir ? VFS_DIR_MODE : VFS_FILE_MODE;
     record->reserved1 = 0;
@@ -530,6 +1094,40 @@ static void reply_readdir(u64 seq, u64 token, u64 cursor) {
         write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_FILE);
         return;
     }
+    if (token == token_from_object_id(VFS_PROC_OBJECT_ID)) {
+        const u64 dir_count = sizeof(g_proc_dirs) / sizeof(g_proc_dirs[0]);
+        if (cursor < dir_count) {
+            const struct vfs_mount_entry *entry = &g_proc_dirs[cursor];
+            write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_DIRECTORY);
+            return;
+        }
+        const u64 file_cursor = cursor - dir_count;
+        if (file_cursor >= sizeof(g_proc_files) / sizeof(g_proc_files[0])) {
+            write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
+            return;
+        }
+        const struct vfs_builtin_file *entry = &g_proc_files[file_cursor];
+        write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_FILE);
+        return;
+    }
+    if (token == token_from_object_id(VFS_PROC_SELF_OBJECT_ID)) {
+        if (cursor >= sizeof(g_proc_self_files) / sizeof(g_proc_self_files[0])) {
+            write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
+            return;
+        }
+        const struct vfs_builtin_file *entry = &g_proc_self_files[cursor];
+        write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_FILE);
+        return;
+    }
+    if (token == token_from_object_id(VFS_PROC_NET_OBJECT_ID)) {
+        if (cursor >= sizeof(g_proc_net_files) / sizeof(g_proc_net_files[0])) {
+            write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
+            return;
+        }
+        const struct vfs_builtin_file *entry = &g_proc_net_files[cursor];
+        write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_FILE);
+        return;
+    }
     const u64 dir_object_id = object_id_from_token(token);
     if (dir_object_id == VFS_TMP_OBJECT_ID || dir_object_id == VFS_RUN_OBJECT_ID) {
         u64 seen = 0;
@@ -564,7 +1162,7 @@ static void reply_open(u64 seq, u64 token) {
         return;
     }
     clear_page(g_session->response_va);
-    write_response(FS_OP_OPEN, seq, FS_STATUS_OK, token_from_object_id(open_object_id), tmpfs_file_bytes_from_token(token), 0, FS_OBJECT_OPEN_FILE, 0);
+    write_response(FS_OP_OPEN, seq, FS_STATUS_OK, token_from_object_id(open_object_id), file_bytes_from_token(token), 0, FS_OBJECT_OPEN_FILE, 0);
 }
 
 static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
@@ -580,6 +1178,20 @@ static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
         volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < bytes; i++) payload[i] = 0;
         write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, 0, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+        return;
+    }
+    u64 proc_bytes = 0;
+    const char *proc_content = proc_content_from_object_id(object_id, &proc_bytes);
+    if (proc_content != 0) {
+        u16 bytes = 0;
+        if (offset < proc_bytes) {
+            const u64 remaining = proc_bytes - offset;
+            bytes = (u16)(remaining < length ? remaining : length);
+            if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
+            volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
+            for (u16 i = 0; i < bytes; i++) payload[i] = (u8)proc_content[offset + i];
+        }
+        write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, proc_bytes, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
         return;
     }
     const u64 tmpfs_index = tmpfs_index_from_open_object_id(object_id);
@@ -603,6 +1215,20 @@ static void reply_write(u64 seq, u64 token, u64 offset, u32 length, const volati
     const u64 object_id = object_id_from_token(token);
     if (!is_open_file_object_id(object_id)) {
         reply_status(FS_OP_WRITE, seq, FS_STATUS_NOT_FOUND);
+        return;
+    }
+    if (object_id == VFS_PROC_CPUINFO_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_MEMINFO_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_UPTIME_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_STAT_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_MOUNTS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STAT_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_DEV_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID)
+    {
+        reply_status(FS_OP_WRITE, seq, FS_STATUS_NO_RIGHT);
         return;
     }
     const u64 tmpfs_index = tmpfs_index_from_open_object_id(object_id);
@@ -829,6 +1455,152 @@ static int connect_root_backend(u64 endpoint_id, u64 process_slot) {
     g_root_backend.root_token = response->result_token;
     g_root_backend.next_seq = 2;
     g_root_backend.active = 1;
+    return 1;
+}
+
+static u64 make_net_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
+    u64 nonce = request_paddr ^
+        ((response_paddr << 17) | (response_paddr >> 47)) ^
+        ((endpoint_id << 7) | (endpoint_id >> 57)) ^
+        process_slot ^
+        0x6e65742d73746174ULL;
+    return nonce == 0 ? 1 : nonce;
+}
+
+static int install_net_endpoint(void) {
+    if (g_net_backend.endpoint_id == 0 || g_net_backend.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_net_backend.endpoint_id, g_net_backend.process_slot) == SYSCALL_OK;
+}
+
+static int grant_net_response_page(void) {
+    u64 ret = syscall3(
+        SYSCALL_GRANT_CAP_ON_ENDPOINT,
+        g_net_backend.response_paddr,
+        g_net_backend.endpoint_id,
+        PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE
+    );
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) {
+        ret = syscall3(
+            SYSCALL_GRANT_CAP_ON_ENDPOINT,
+            g_net_backend.response_paddr,
+            g_net_backend.endpoint_id,
+            PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE
+        );
+    }
+    return ret == SYSCALL_OK;
+}
+
+static int share_net_request_page(void) {
+    u64 ret = syscall2(SYSCALL_SHARE_CAP, g_net_backend.request_paddr, g_net_backend.endpoint_id);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) {
+        ret = syscall2(SYSCALL_SHARE_CAP, g_net_backend.request_paddr, g_net_backend.endpoint_id);
+    }
+    return ret == SYSCALL_OK;
+}
+
+static int signal_net_backend(void) {
+    u64 ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_net_backend.endpoint_id, 0);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) {
+        ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_net_backend.endpoint_id, 0);
+    }
+    return ret == SYSCALL_OK;
+}
+
+static int wait_net_response(u64 expected_seq, u16 expected_op) {
+    volatile struct net_response_header *response = (volatile struct net_response_header *)g_net_backend.response_va;
+    for (u64 i = 0; i < 1024; i++) {
+        if (response->response_seq == expected_seq) {
+            return response->magic == NET_PROTOCOL_RESPONSE_MAGIC &&
+                response->version == NET_PROTOCOL_VERSION &&
+                response->op == expected_op &&
+                response->status == NET_STATUS_OK;
+        }
+        (void)wait_event_poll();
+    }
+    return 0;
+}
+
+static int connect_net_backend(u64 endpoint_id, u64 process_slot) {
+    if (endpoint_id == 0 || process_slot == 0) return 0;
+
+    g_net_backend.endpoint_id = endpoint_id;
+    g_net_backend.process_slot = process_slot;
+    g_net_backend.request_va = VFS_NET_REQUEST_VA;
+    g_net_backend.response_va = VFS_NET_RESPONSE_VA;
+    g_net_backend.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    g_net_backend.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    if (g_net_backend.request_paddr < 0x1000 || g_net_backend.response_paddr < 0x1000) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, g_net_backend.request_va, g_net_backend.request_paddr, 1) != SYSCALL_OK) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, g_net_backend.response_va, g_net_backend.response_paddr, 1) != SYSCALL_OK) return 0;
+    if (!grant_net_response_page()) return 0;
+
+    clear_page(g_net_backend.request_va);
+    clear_page(g_net_backend.response_va);
+    const u64 process_slot_self = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    g_net_backend.session_nonce = make_net_session_nonce(
+        g_net_backend.request_paddr,
+        g_net_backend.response_paddr,
+        endpoint_id,
+        process_slot_self
+    );
+
+    volatile struct net_request_header *request = (volatile struct net_request_header *)g_net_backend.request_va;
+    request->magic = NET_PROTOCOL_REQUEST_MAGIC;
+    request->version = NET_PROTOCOL_VERSION;
+    request->op = NET_OP_CONNECT;
+    request->arg0 = g_net_backend.response_paddr;
+    request->arg1 = process_slot_self;
+    request->arg2 = 0;
+    request->reserved0 = 0;
+    request->session_nonce = g_net_backend.session_nonce;
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = 1;
+
+    if (!share_net_request_page()) return 0;
+    if (!wait_net_response(1, NET_OP_CONNECT)) return 0;
+    g_net_backend.next_seq = 2;
+    g_net_backend.active = 1;
+    user_log("RootVfs: net backend connect ok\n");
+    return 1;
+}
+
+static int refresh_net_status(void) {
+    if (!g_net_backend.active) return 0;
+    clear_page(g_net_backend.request_va);
+    clear_page(g_net_backend.response_va);
+    const u64 seq = g_net_backend.next_seq++;
+    volatile struct net_request_header *request = (volatile struct net_request_header *)g_net_backend.request_va;
+    request->magic = NET_PROTOCOL_REQUEST_MAGIC;
+    request->version = NET_PROTOCOL_VERSION;
+    request->op = NET_OP_GET_STATUS;
+    request->arg0 = 0;
+    request->arg1 = 0;
+    request->arg2 = 0;
+    request->reserved0 = 0;
+    request->session_nonce = g_net_backend.session_nonce;
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    if (!signal_net_backend()) return 0;
+    if (!wait_net_response(seq, NET_OP_GET_STATUS)) {
+        g_net_backend.active = 0;
+        return 0;
+    }
+    volatile struct net_response_header *response = (volatile struct net_response_header *)g_net_backend.response_va;
+    if (response->inline_bytes < sizeof(struct net_status_payload)) return 0;
+    volatile struct net_status_payload *payload = (volatile struct net_status_payload *)(g_net_backend.response_va + sizeof(struct net_response_header));
+    for (u64 i = 0; i < 6; i++) g_net_backend.last_status.mac[i] = payload->mac[i];
+    g_net_backend.last_status.link_up = payload->link_up;
+    g_net_backend.last_status.dhcp_bound = payload->dhcp_bound;
+    g_net_backend.last_status.ipv4_addr = payload->ipv4_addr;
+    g_net_backend.last_status.gateway_addr = payload->gateway_addr;
+    g_net_backend.last_status.dns_addr = payload->dns_addr;
+    g_net_backend.last_status.dhcp_server_addr = payload->dhcp_server_addr;
+    g_net_backend.last_status.flags = payload->flags;
+    g_net_backend.last_status.rx_packets = payload->rx_packets;
+    g_net_backend.last_status.tx_completions = payload->tx_completions;
     return 1;
 }
 
@@ -1288,12 +2060,21 @@ void rootfs_vfs_main(void) {
     g_endpoint_id = config[0];
     const u64 fat_endpoint_id = config[3];
     const u64 fat_process_slot = config[4];
+    const u64 net_endpoint_id = config[5];
+    const u64 net_process_slot = config[6];
     if (connect_root_backend(fat_endpoint_id, fat_process_slot)) {
         user_log("RootVfs: fat backend connect ok\n");
     } else if (fat_endpoint_id != 0) {
         user_log("RootVfs: fat backend connect failed\n");
     } else {
         user_log("RootVfs: fat backend missing\n");
+    }
+    if (connect_net_backend(net_endpoint_id, net_process_slot)) {
+        (void)refresh_net_status();
+    } else if (net_endpoint_id != 0) {
+        user_log("RootVfs: net backend connect failed\n");
+    } else {
+        user_log("RootVfs: net backend missing\n");
     }
     if (g_endpoint_id != 0) {
         user_log("RootVfs: endpoint ready\n");

@@ -9,11 +9,8 @@ pub const syscall_dma_map_release: u64 = 0x39;
 pub const syscall_revoke_cap: u64 = 0x3A;
 pub const syscall_derive_command_cap: u64 = 0x3B;
 
-pub const DeviceId = enum(u8) {
-    virtio_gpu = 0,
-    virtio_input = 1,
-    virtio_blk = 2,
-};
+pub const DeviceId = u64;
+pub const invalid_device_id: DeviceId = 0;
 
 pub const DmaDirection = enum(u8) {
     read = 0,

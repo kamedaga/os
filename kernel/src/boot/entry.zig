@@ -792,14 +792,16 @@ fn discoverDevices() DetectedDevices {
     };
 
     const probed = virtio_probe.probeModernDevices(noopLog);
-    for (probed, 0..) |entry, index| {
+    var descriptor_index: usize = 0;
+    for (probed) |entry| {
         const info = entry orelse continue;
-        if (index >= boot_abi.init_bootstrap_abi.max_device_descriptors) break;
-        const dma_device = dmaDeviceForModernDevice(info) orelse continue;
+        if (descriptor_index >= boot_abi.init_bootstrap_abi.max_device_descriptors) break;
+        const resource_id = resourceIdForModernDevice(info);
         appendDetectedDevice(&result.devices, .{
-            .descriptor = descriptorFromModernDevice(info, init_bootstrap_layout.deviceConfigSourceVa(index)),
-            .dma_device = dma_device,
+            .descriptor = descriptorFromModernDevice(info, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index), resource_id),
+            .dma_device = resource_id,
         });
+        descriptor_index += 1;
     }
 
     return result;
@@ -1459,16 +1461,18 @@ fn noopLog(_: []const u8) void {}
 // Helper: generic virtio device export
 // ---------------------------------------------------------------------------
 
-fn dmaDeviceForModernDevice(info: virtio_probe.ModernDeviceInfo) ?kernel.DmaDeviceId {
-    if (virtio_probe.isVirtioInputDeviceId(info.device_id, info.subsystem_id)) return .virtio_input;
-    if (virtio_probe.isVirtioGpuDeviceId(info.device_id, info.subsystem_id)) return .virtio_gpu;
-    if (virtio_probe.isVirtioBlkDeviceId(info.device_id, info.subsystem_id)) return .virtio_blk;
-    return null;
+fn resourceIdForModernDevice(info: virtio_probe.ModernDeviceInfo) kernel.DmaDeviceId {
+    const loc = info.location;
+    return 0x50434900_00000000 |
+        (@as(u64, loc.bus) << 16) |
+        (@as(u64, loc.device) << 8) |
+        @as(u64, loc.function);
 }
 
 fn descriptorFromModernDevice(
     info: virtio_probe.ModernDeviceInfo,
     bootstrap_source_va: u64,
+    resource_id: kernel.DmaDeviceId,
 ) boot_abi.init_bootstrap_abi.DeviceDescriptor {
     const common = mmioPageWithOffset(info.common_cfg);
     const notify = mmioPageWithOffset(info.notify_cfg);
@@ -1484,6 +1488,8 @@ fn descriptorFromModernDevice(
         .pci_bus = info.location.bus,
         .pci_device = info.location.device,
         .pci_function = info.location.function,
+        .resource_id = resource_id,
+        .queue_count = info.queue_count,
         .common_page_paddr = common.page_paddr,
         .notify_page_paddr = notify.page_paddr,
         .isr_page_paddr = isr.page_paddr,

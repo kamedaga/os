@@ -9,6 +9,7 @@ set(LINUX_ABI_SERVER_INCLUDED_SOURCES
   src/common.inc.c
   src/runtime.inc.c
   src/vfs.inc.c
+  src/console.inc.c
   src/process_state.inc.c
   src/execve.inc.c
   src/fs_syscalls.inc.c

@@ -21,6 +21,7 @@ pub const root_token_index: usize = 18;
 pub const device_features_low_index: usize = 19;
 pub const device_features_high_index: usize = 20;
 pub const driver_status_index: usize = 21;
+pub const resource_id_index: usize = 22;
 
 pub const control_queue_index: u16 = 0;
 pub const cursor_queue_index: u16 = 1;
@@ -47,6 +48,7 @@ pub const ConfigPageDescriptor = struct {
     root_token: u64 = 0,
     device_features_low: u64 = 0,
     device_features_high: u64 = 0,
+    resource_id: u64 = 0,
 };
 
 pub fn writeConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
@@ -77,6 +79,7 @@ pub fn writeConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
     words[root_token_index] = descriptor.root_token;
     words[device_features_low_index] = descriptor.device_features_low;
     words[device_features_high_index] = descriptor.device_features_high;
+    words[resource_id_index] = descriptor.resource_id;
 }
 
 pub fn writeGrantedControlQueueTokens(base_va: u64, submit_token: u64, notify_token: u64) void {

@@ -16,9 +16,10 @@ void linux_abi_main(void) {
     g_exec_path[g_exec_path_len] = 0;
     const u64 request_page_status = alloc_map_pages(trap_request_page_va, 1, 0x1);
     if (request_page_status != SYSCALL_OK) { user_log("LinuxAbiServer: request page map failed\n"); user_log_hex_value(request_page_status); for (;;) __asm__ volatile("pause"); }
-    init_process_tables();
     (void)install_self_wake_endpoint();
     if (!connect_vfs_from_registry()) user_log("LinuxAbiServer: vfs connect failed\n");
+    if (!connect_console_from_registry()) user_log("LinuxAbiServer: console connect skipped\n");
+    init_process_tables();
     cfg->status = LINUX_ABI_BOOTSTRAP_READY;
     user_log("LinuxAbiServer: started\n");
     struct ipc_message msg = reply(0, 0);
@@ -54,6 +55,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_FORK: msg = handle_fork_like(req, 0); break;
         case LINUX_SYS_VFORK: msg = handle_fork_like(req, 0); break;
         case LINUX_SYS_WAIT4: msg = handle_wait4(req); break;
+        case LINUX_SYS_KILL: msg = handle_kill(req); break;
         case LINUX_SYS_FCNTL: msg = handle_fcntl(req); break;
         case LINUX_SYS_STAT: case LINUX_SYS_LSTAT: msg = handle_newfstatat(req, 1); break;
         case LINUX_SYS_FSTAT: msg = handle_fstat(req); break;
@@ -69,6 +71,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_READLINK: msg = handle_readlink(req); break;
         case LINUX_SYS_UNAME: msg = handle_uname(req); break;
         case LINUX_SYS_CLOCK_GETTIME: msg = handle_clock_gettime(req); break;
+        case LINUX_SYS_SCHED_GETAFFINITY: msg = handle_sched_getaffinity(req); break;
         case LINUX_SYS_MEMBARRIER: msg = handle_membarrier(req); break;
         case LINUX_SYS_EXECVE: msg = handle_execve(req); break;
         case LINUX_SYS_MMAP: msg = handle_mmap(req); break;
@@ -80,10 +83,13 @@ void linux_abi_main(void) {
         case LINUX_SYS_RT_SIGPROCMASK: msg = handle_rt_sigprocmask(req); break;
         case LINUX_SYS_SET_TID_ADDRESS: msg = handle_set_tid_address(req); break;
         case LINUX_SYS_FUTEX: msg = handle_futex(req); break;
-        case LINUX_SYS_IOCTL: case LINUX_SYS_MADVISE: case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_IOCTL: msg = handle_ioctl(req); break;
+        case LINUX_SYS_MADVISE: case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
         case LINUX_SYS_GETPID: msg = reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0); break;
         case LINUX_SYS_GETTID: msg = reply(g_proc && g_proc->tid != 0 ? g_proc->tid : 1, 0); break;
         case LINUX_SYS_GETPPID: msg = reply(1, 0); break;
+        case LINUX_SYS_SETPGID: msg = handle_setpgid(req); break;
+        case LINUX_SYS_GETPGID: msg = handle_getpgid(req); break;
         case LINUX_SYS_GETUID: case LINUX_SYS_GETGID: case LINUX_SYS_GETEUID: case LINUX_SYS_GETEGID: msg = reply(0, 0); break;
         case LINUX_SYS_UMASK: msg = reply(022, 0); break;
         case LINUX_SYS_GETRANDOM: msg = reply(errno_again(), 0); break;

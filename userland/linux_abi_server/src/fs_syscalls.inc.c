@@ -73,6 +73,11 @@ static int path_is_dev_file(const char *path) {
     return path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/';
 }
 
+static int path_is_dev_tty(const char *path) {
+    return path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/' &&
+        path[5] == 't' && path[6] == 't' && path[7] == 'y' && path[8] == 0;
+}
+
 static struct ipc_message handle_openat(const struct trap_request *req, int old_open) {
     char path[256];
     char resolved[FS_MAX_PATH_BYTES + 1];
@@ -85,6 +90,19 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
     if (path[0] == 0) return reply(errno_noent(), 0);
     if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    if (path_is_dev_tty(resolved)) {
+        const int fd = alloc_fd(); if (fd < 0) return reply(errno_busy(), 0);
+        g_fds[fd].kind = g_console.active ? FD_TTY : FD_STDIO;
+        g_fds[fd].token = 0;
+        g_fds[fd].offset = 0;
+        g_fds[fd].size = 0;
+        g_fds[fd].mode_bits = FS_FILE_MODE;
+        g_fds[fd].object_kind = FS_OBJECT_FILE;
+        g_fds[fd].path_len = 0;
+        g_fds[fd].path[0] = 0;
+        sync_fd_to_thread_group((u64)fd);
+        return reply((u64)fd, 0);
+    }
     struct fs_stat_record rec; u64 token = 0; u64 size = 0; u8 kind = FS_OBJECT_NONE;
     if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) {
         if ((flags & O_CREAT) == 0) return reply(errno_noent(), 0);
@@ -129,7 +147,15 @@ static struct ipc_message handle_read(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 dst = req->args[1]; const u64 len = req->args[2];
     if (!fd_valid(fd)) return reply(errno_badf(), 0);
     if (len == 0) return reply(0, 0);
-    if (g_fds[fd].kind == FD_STDIO) return reply(0, 0);
+    if (g_fds[fd].kind == FD_STDIO) {
+        (void)dst;
+        return reply(0, 0);
+    }
+    if (g_fds[fd].kind == FD_TTY) {
+        int fault = 0;
+        const u64 n = console_read_to_target(dst, len, &fault);
+        return reply(fault ? errno_fault() : n, 0);
+    }
     if (g_fds[fd].kind == FD_PIPE_READ) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
@@ -195,7 +221,23 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 iov = req->args[1]; const u64 iovcnt = req->args[2];
     if (!fd_valid(fd)) return reply(errno_badf(), 0);
     if (iovcnt > 64) return reply(errno_inval(), 0);
-    if (g_fds[fd].kind == FD_STDIO) return reply(0, 0);
+    if (g_fds[fd].kind == FD_STDIO) {
+        return reply(0, 0);
+    }
+    if (g_fds[fd].kind == FD_TTY) {
+        u64 total = 0;
+        for (u64 i = 0; i < iovcnt; i++) {
+            u64 pair[2];
+            if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+            if (pair[1] == 0) continue;
+            int fault = 0;
+            const u64 n = console_read_to_target(pair[0], pair[1], &fault);
+            if (fault) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+            total += n;
+            if (n != pair[1]) break;
+        }
+        return reply(total, 0);
+    }
     u64 total = 0;
     if (g_fds[fd].kind == FD_PIPE_READ) {
         const u8 pipe_id = g_fds[fd].pipe_id;
@@ -264,9 +306,20 @@ static struct ipc_message handle_write(const struct trap_request *req) {
         }
         return reply(errno_io(), 0);
     }
-    if (fd == 1 || fd == 2) {
+    if (fd_valid(fd) && g_fds[fd].kind == FD_STDIO) {
         char buf[129]; u64 done = 0;
         while (done < len) { u64 chunk = min_u64(len - done, 128); if (copy_from_target(src + done, buf, chunk) != chunk) break; user_log_len(buf, chunk); done += chunk; }
+        return reply(len, 0);
+    }
+    if (fd_valid(fd) && g_fds[fd].kind == FD_TTY) {
+        char logbuf[129]; u64 logged = 0;
+        while (logged < len) {
+            u64 chunk = min_u64(len - logged, 128);
+            if (copy_from_target(src + logged, logbuf, chunk) != chunk) return reply(errno_fault(), 0);
+            user_log_len(logbuf, chunk);
+            (void)console_write_bytes(logbuf, chunk);
+            logged += chunk;
+        }
         return reply(len, 0);
     }
     return reply(errno_badf(), 0);
@@ -309,7 +362,7 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
         }
         return reply(total, 0);
     }
-    if (fd != 1 && fd != 2) return reply(errno_badf(), 0);
+    if (!fd_valid(fd) || (g_fds[fd].kind != FD_STDIO && g_fds[fd].kind != FD_TTY)) return reply(errno_badf(), 0);
     if (iovcnt > 64) return reply(errno_inval(), 0);
     u64 total = 0;
     for (u64 i = 0; i < iovcnt; i++) {
@@ -323,6 +376,16 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             user_log_len(buf, chunk);
             done += chunk;
         }
+        if (g_fds[fd].kind == FD_STDIO && fd_valid(0) && g_fds[0].kind == FD_TTY) {
+            int ignored_fault = 0;
+            (void)console_write_from_target(src, len, &ignored_fault);
+        }
+        if (g_fds[fd].kind == FD_TTY) {
+            int ignored_fault = 0;
+            (void)console_write_from_target(src, len, &ignored_fault);
+            total += len;
+            continue;
+        }
         total += len;
     }
     return reply(total, 0);
@@ -331,7 +394,7 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
 static struct ipc_message handle_fstat(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 stat_va = req->args[1]; if (!fd_valid(fd)) return reply(errno_badf(), 0);
     struct fs_stat_record rec; rec.object_kind = g_fds[fd].object_kind; rec.size_bytes = g_fds[fd].size; rec.mode_bits = g_fds[fd].mode_bits; rec.mtime_unix_sec = 0;
-    if (g_fds[fd].kind == FD_STDIO) { rec.object_kind = FS_OBJECT_FILE; rec.size_bytes = 0; rec.mode_bits = FS_FILE_MODE; }
+    if (g_fds[fd].kind == FD_STDIO || g_fds[fd].kind == FD_TTY) { rec.object_kind = FS_OBJECT_FILE; rec.size_bytes = 0; rec.mode_bits = FS_FILE_MODE; }
     struct linux_stat st; fill_linux_stat(&st, &rec, rec.size_bytes, rec.object_kind);
     if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0);
     return reply(0, 0);
@@ -344,6 +407,17 @@ static struct ipc_message handle_newfstatat(const struct trap_request *req, int 
     if (path[0] == 0 && (flags & AT_EMPTY_PATH) != 0) { struct trap_request f = *req; f.args[0] = old_stat ? 0 : dirfd; f.args[1] = stat_va; return handle_fstat(&f); }
     if (path[0] == 0) return reply(errno_noent(), 0);
     if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    if (path_is_dev_tty(resolved)) {
+        struct fs_stat_record rec;
+        rec.object_kind = FS_OBJECT_FILE;
+        rec.size_bytes = 0;
+        rec.mode_bits = FS_FILE_MODE;
+        rec.mtime_unix_sec = 0;
+        struct linux_stat st;
+        fill_linux_stat(&st, &rec, 0, FS_OBJECT_FILE);
+        if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0);
+        return reply(0, 0);
+    }
     struct fs_stat_record rec; u64 token = 0; u64 size = 0; u8 kind = FS_OBJECT_NONE; if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_noent(), 0); (void)token;
     struct linux_stat st; fill_linux_stat(&st, &rec, size, kind); if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0); return reply(0, 0);
 }
@@ -397,7 +471,7 @@ static struct ipc_message handle_unlinkat(const struct trap_request *req, int ol
     if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
     return reply(errno_acces(), 0);
 }
-static struct ipc_message handle_access(const struct trap_request *req) { char path[256]; char resolved[FS_MAX_PATH_BYTES + 1]; if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0); if (path[0] == 0) return reply(errno_noent(), 0); if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0); struct fs_stat_record rec; u64 token = 0, size = 0; u8 kind = 0; return reply(vfs_lookup_stat(resolved, &token, &rec, &size, &kind) ? 0 : errno_noent(), 0); }
+static struct ipc_message handle_access(const struct trap_request *req) { char path[256]; char resolved[FS_MAX_PATH_BYTES + 1]; if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0); if (path[0] == 0) return reply(errno_noent(), 0); if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0); if (path_is_dev_tty(resolved)) return reply(0, 0); struct fs_stat_record rec; u64 token = 0, size = 0; u8 kind = 0; return reply(vfs_lookup_stat(resolved, &token, &rec, &size, &kind) ? 0 : errno_noent(), 0); }
 static struct ipc_message handle_arch_prctl(const struct trap_request *req) {
     if (req->args[0] != ARCH_SET_FS) return reply(errno_inval(), 0);
     const u64 status = set_target_fs_base(req->args[1]);

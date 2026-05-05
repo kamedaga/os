@@ -19,6 +19,7 @@ pub const root_token_index: usize = 16;
 pub const capacity_sectors_index: usize = 17;
 pub const logical_block_size_index: usize = 18;
 pub const driver_status_index: usize = 19;
+pub const resource_id_index: usize = 20;
 pub const driver_status_ready: u64 = 0x4452_4459; // "DRDY"
 
 pub const ConfigPageDescriptor = struct {
@@ -39,6 +40,7 @@ pub const ConfigPageDescriptor = struct {
     root_token: u64 = 0,
     capacity_sectors: u64 = 0,
     logical_block_size: u64 = 0,
+    resource_id: u64 = 0,
 };
 
 pub fn writeConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
@@ -67,6 +69,7 @@ pub fn writeConfigPage(base_va: u64, descriptor: ConfigPageDescriptor) void {
     words[root_token_index] = descriptor.root_token;
     words[capacity_sectors_index] = descriptor.capacity_sectors;
     words[logical_block_size_index] = descriptor.logical_block_size;
+    words[resource_id_index] = descriptor.resource_id;
 }
 
 pub fn writeGrantedQueueTokens(base_va: u64, submit_token: u64, notify_token: u64) void {

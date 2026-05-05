@@ -135,6 +135,7 @@ const virgl_ccmd_resource_inline_write: u32 = 9;
 
 const BootState = struct {
     endpoint_id: u64 = 0,
+    resource_id: queue_abi.DeviceId = queue_abi.invalid_device_id,
     common_page_paddr: u64 = 0,
     notify_page_paddr: u64 = 0,
     isr_page_paddr: u64 = 0,
@@ -439,7 +440,7 @@ fn iommuAuthorize(token: u64, device: queue_abi.DeviceId, op: queue_abi.IommuOpe
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_iommu_authorize),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (@as(u64, @intFromEnum(device))),
+          [arg1] "{rsi}" (device),
           [arg2] "{rdx}" (@as(u64, @intFromEnum(op))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
@@ -450,7 +451,7 @@ fn commandAuthorize(token: u64, device: queue_abi.DeviceId, opcode: queue_abi.Co
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_command_authorize),
           [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (@as(u64, @intFromEnum(device))),
+          [arg1] "{rsi}" (device),
           [arg2] "{rdx}" (@as(u64, @intFromEnum(opcode))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
@@ -460,7 +461,7 @@ fn dmaMapCreate(device: queue_abi.DeviceId, paddr_start: u64, length: u64, direc
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_dma_map_create),
-          [arg0] "{rdi}" (@as(u64, @intFromEnum(device))),
+          [arg0] "{rdi}" (device),
           [arg1] "{rsi}" (paddr_start),
           [arg2] "{rdx}" (length),
           [arg3] "{r8}" (@as(u64, @intFromEnum(direction))),
@@ -580,6 +581,7 @@ fn parseBootState() ?BootState {
     if (readCfgU64(0) != gpu_bootstrap.config_magic or readCfgU64(1) != gpu_bootstrap.config_version) return null;
     return .{
         .endpoint_id = readCfgU64(gpu_bootstrap.endpoint_id_index),
+        .resource_id = readCfgU64(gpu_bootstrap.resource_id_index),
         .common_page_paddr = readCfgU64(gpu_bootstrap.common_page_paddr_index),
         .notify_page_paddr = readCfgU64(gpu_bootstrap.notify_page_paddr_index),
         .isr_page_paddr = readCfgU64(gpu_bootstrap.isr_page_paddr_index),
@@ -852,8 +854,8 @@ fn releaseMapping(token: u64) bool {
 }
 
 fn createControlMapping(paddr: u64, len: usize, direction: queue_abi.DmaDirection, op: queue_abi.IommuOperation) u64 {
-    if (iommuAuthorize(boot_state.iommu_token, .virtio_gpu, op) != syscall_ok) return 0;
-    return dmaMapCreate(.virtio_gpu, paddr, @intCast(len), direction);
+    if (iommuAuthorize(boot_state.iommu_token, boot_state.resource_id, op) != syscall_ok) return 0;
+    return dmaMapCreate(boot_state.resource_id, paddr, @intCast(len), direction);
 }
 
 fn submitCommand(
@@ -863,7 +865,7 @@ fn submitCommand(
     opcode: queue_abi.CommandOpcodeClass,
     expected_resp_type: u32,
 ) bool {
-    if (commandAuthorize(boot_state.command_token, .virtio_gpu, opcode) != syscall_ok) {
+    if (commandAuthorize(boot_state.command_token, boot_state.resource_id, opcode) != syscall_ok) {
         _ = userLog("VirtioGpuGl: command denied\n");
         return false;
     }
@@ -978,7 +980,7 @@ fn submitCommand(
 
 fn submitCursorCommand(req_len: usize) bool {
     if (gpu_state.cursor_queue_size < 2 or gpu_state.cursor_notify_addr == 0) return false;
-    if (commandAuthorize(boot_state.command_token, .virtio_gpu, .gpu_cursor) != syscall_ok) {
+    if (commandAuthorize(boot_state.command_token, boot_state.resource_id, .gpu_cursor) != syscall_ok) {
         _ = userLog("VirtioGpuGl: cursor command denied\n");
         return false;
     }
@@ -2389,7 +2391,7 @@ fn processGpuSessions() void {
 
 fn initGpuService() bool {
     if (!mapDeviceView()) return false;
-    if (commandAuthorize(boot_state.command_token, .virtio_gpu, .gpu_admin) != syscall_ok) {
+    if (commandAuthorize(boot_state.command_token, boot_state.resource_id, .gpu_admin) != syscall_ok) {
         _ = userLog("VirtioGpuGl: gpu_admin denied\n");
         return false;
     }
@@ -2427,4 +2429,3 @@ pub export fn _start() noreturn {
         }
     }
 }
-

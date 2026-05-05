@@ -293,11 +293,10 @@ fn build_file_app(
     app: &AppConfig,
     src: &FileSource,
     output_path: &Path,
-    options: BuildOptions,
+    _options: BuildOptions,
 ) -> Result<(), String> {
     let source_path = workspace_root.join(&src.path);
-    let should_rebuild =
-        !src.rebuild_tool.is_empty() && (options.force || !output_is_usable(&source_path)?);
+    let should_rebuild = !src.rebuild_tool.is_empty();
 
     if should_rebuild {
         let mut cmd = Command::new(resolve_tool(workspace, &src.rebuild_tool));
@@ -482,7 +481,3 @@ fn copy_if_changed(source_path: &Path, output_path: &Path) -> Result<(), String>
     fs::write(output_path, source)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))
 }
-
-
-
-

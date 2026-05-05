@@ -156,6 +156,7 @@ static void start_deferred_trap_targets(void) {
 static void copy_process_state_for_fork(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal) {
     child->used = 1;
     child->exec_pending = 0;
+    child->exec_pending_principal = 0;
     child->exit_status = 0;
     child->pid = child_principal;
     child->tid = child_principal;
@@ -277,11 +278,52 @@ static struct ipc_message handle_set_tid_address(const struct trap_request *req)
     return reply(g_proc && g_proc->tid != 0 ? g_proc->tid : 1, 0);
 }
 
+static struct ipc_message handle_getpgid(const struct trap_request *req) {
+    const u64 requested = req->args[0];
+    if (!g_proc) return reply(errno_child(), 0);
+    if (requested == 0 || requested == g_proc->pid || requested == g_proc->tid) return reply(g_proc->pid, 0);
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        const struct linux_process_state *proc = &g_processes[i];
+        if (!proc->used) continue;
+        if (proc->pid == requested || proc->tid == requested) return reply(proc->pid, 0);
+    }
+    return reply(errno_noent(), 0);
+}
+
+static struct ipc_message handle_setpgid(const struct trap_request *req) {
+    const u64 pid = req->args[0];
+    const u64 pgid = req->args[1];
+    if (!g_proc) return reply(errno_child(), 0);
+    if ((pid == 0 || pid == g_proc->pid || pid == g_proc->tid) && (pgid == 0 || pgid == g_proc->pid)) return reply(0, 0);
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        const struct linux_process_state *proc = &g_processes[i];
+        if (!proc->used) continue;
+        if ((proc->pid == pid || proc->tid == pid) && (pgid == 0 || pgid == proc->pid)) return reply(0, 0);
+    }
+    return reply(errno_noent(), 0);
+}
+
+static struct ipc_message handle_kill(const struct trap_request *req) {
+    const i64 pid = (i64)req->args[0];
+    const u64 sig = req->args[1];
+    if (sig >= 65) return reply(errno_inval(), 0);
+    if (pid == 0 || pid == -1) return reply(0, 0);
+    const u64 abs_pid = pid < 0 ? (u64)(-pid) : (u64)pid;
+    if (abs_pid == 0) return reply(0, 0);
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        const struct linux_process_state *proc = &g_processes[i];
+        if (!proc->used) continue;
+        if (proc->pid == abs_pid || proc->tid == abs_pid) return reply(0, 0);
+    }
+    return reply(errno_noent(), 0);
+}
+
 static struct ipc_message handle_wait4(const struct trap_request *req) {
     const i64 pid = (i64)req->args[0];
     const u64 status_va = req->args[1];
     const u64 options = req->args[2];
-    if ((options & ~(u64)WNOHANG) != 0) return reply(errno_inval(), 0);
+    const u64 supported_options = (u64)WNOHANG | (u64)WUNTRACED | (u64)WCONTINUED;
+    if ((options & ~supported_options) != 0) return reply(errno_inval(), 0);
     u64 child = 0;
     int fault = 0;
     if (reap_exited_child_for_current(g_proc, pid, status_va, &child, &fault)) return reply(child, 0);

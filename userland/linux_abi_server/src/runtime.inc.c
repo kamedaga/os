@@ -37,6 +37,7 @@ static u64 errno_exist(void) { return (u64)(i64)-17; }
 static u64 errno_child(void) { return (u64)(i64)-10; }
 static u64 errno_notdir(void) { return (u64)(i64)-20; }
 static u64 errno_inval(void) { return (u64)(i64)-22; }
+static u64 errno_notty(void) { return (u64)(i64)-25; }
 static u64 errno_spipe(void) { return (u64)(i64)-29; }
 static u64 errno_pipe(void) { return (u64)(i64)-32; }
 static u64 errno_nosys(void) { return (u64)(i64)-38; }
@@ -59,6 +60,7 @@ static void detach_reply_token(void) { (void)syscall0(SYSCALL_DETACH_ABI_TRAP_RE
 static u64 share_reply_target_pages_to_trap_target(u64 principal, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4_r10(SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET, principal, target_va, page_count, prot_bits); }
 static u64 unmap_trap_target_pages(u64 principal, u64 target_va, u64 page_count) { return syscall3(SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES, principal, target_va, page_count); }
 static u64 alloc_map_pages(u64 target_va, u64 page_count, u64 flags) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, flags, 0); }
+static u64 alloc_map_pages_with_paddrs(u64 target_va, u64 page_count, u64 writable, u64 out_paddr_list_va) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, writable, out_paddr_list_va); }
 static int install_self_wake_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, syscall0(SYSCALL_GET_PROCESS_SLOT)) == SYSCALL_OK; }
 static void prime_reply_return_signal(void) { (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, 0); }
 

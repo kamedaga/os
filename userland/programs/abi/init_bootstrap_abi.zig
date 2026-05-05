@@ -2,7 +2,7 @@ const boot_manifest_abi = @import("boot_manifest_abi.zig");
 const process_abi = @import("process_abi.zig");
 
 pub const magic: u64 = 0x49425453; // "IBTS"
-pub const version: u64 = 15;
+pub const version: u64 = 16;
 pub const config_magic: u64 = 0x49425443; // "IBTC"
 pub const config_version: u64 = 1;
 pub const max_spawn_page_descriptors: usize = 8;
@@ -76,6 +76,8 @@ pub const DeviceDescriptor = extern struct {
     pci_bus: u64,
     pci_device: u64,
     pci_function: u64,
+    resource_id: u64,
+    queue_count: u64,
     common_page_paddr: u64,
     notify_page_paddr: u64,
     isr_page_paddr: u64,

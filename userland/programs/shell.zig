@@ -9,6 +9,7 @@ const fs_protocol = @import("abi_root").fs_protocol;
 const gpu_client = @import("abi_root").gpu_client;
 const image_abi = @import("abi_root").image_abi;
 const input_bootstrap = @import("abi_root").input_driver_bootstrap_abi;
+const net_client = @import("abi_root").net_client;
 const init_bootstrap_abi = @import("abi_root").init_bootstrap_abi;
 const process_abi = @import("abi_root").process_abi;
 const process_args_env_bootstrap_abi = @import("abi_root").process_args_env_bootstrap_abi;
@@ -237,6 +238,8 @@ const ShellState = struct {
     keyboard_ready: bool = false,
     block_client_ready: bool = false,
     block_client_state: block_client.Client = undefined,
+    net_client_ready: bool = false,
+    net_client_state: net_client.Client = undefined,
     gpu_client_ready: bool = false,
     gpu_client_state: gpu_client.Client = undefined,
     shell_scanout_active: bool = false,
@@ -1639,6 +1642,91 @@ fn ensurePersistentFsClient(st: *ShellState) ?*fs_client.Client {
     return &st.persistent_fs_client_state;
 }
 
+fn ensureNetClient(st: *ShellState) ?*net_client.Client {
+    if (st.net_client_ready) return &st.net_client_state;
+    const process_slot = getProcessSlot();
+    if (process_slot == 0) {
+        st.writeLine("net process slot unavailable");
+        shellLogLine("net process slot unavailable");
+        return null;
+    }
+    const ipc_va = user_vm.reservePages(2) orelse {
+        st.writeLine("net ipc va unavailable");
+        shellLogLine("net ipc va unavailable");
+        return null;
+    };
+    st.net_client_state = net_client.Client.connectFromRegistryPageOptions(
+        service_registry_page_va,
+        @intCast(ipc_va),
+        @intCast(ipc_va + user_vm.page_bytes),
+        process_slot,
+        .{
+            .response_poll_limit = 65536,
+        },
+    ) catch |err| {
+        st.writeLine("net connect failed");
+        shellLogLine("net connect failed");
+        _ = userLog(@errorName(err));
+        _ = userLog("\n");
+        return null;
+    };
+    st.net_client_ready = true;
+    shellLogLine("net client connect ok");
+    return &st.net_client_state;
+}
+
+fn formatIpv4(addr: u32, out: *[16]u8) []const u8 {
+    return std.fmt.bufPrint(out, "{d}.{d}.{d}.{d}", .{
+        (addr >> 24) & 0xff,
+        (addr >> 16) & 0xff,
+        (addr >> 8) & 0xff,
+        addr & 0xff,
+    }) catch "0.0.0.0";
+}
+
+fn runNetStatus(st: *ShellState) bool {
+    if (service_registry_abi.findService(service_registry_page_va, .net) == null) {
+        st.writeLine("net service unavailable");
+        shellLogLine("net service unavailable");
+        return false;
+    }
+    const client = ensureNetClient(st) orelse return false;
+    const status = client.status() catch |err| {
+        st.writeLine("net status failed");
+        shellLogLine("net status failed");
+        _ = userLog(@errorName(err));
+        _ = userLog("\n");
+        st.net_client_ready = false;
+        return false;
+    };
+
+    var ip_buf: [16]u8 = undefined;
+    var gw_buf: [16]u8 = undefined;
+    var dns_buf: [16]u8 = undefined;
+    const ip = formatIpv4(status.ipv4_addr, &ip_buf);
+    const gateway = formatIpv4(status.gateway_addr, &gw_buf);
+    const dns = formatIpv4(status.dns_addr, &dns_buf);
+    var line_buf: [128]u8 = undefined;
+    const link_text = if (status.link_up != 0) "up" else "down";
+    const dhcp_text = if (status.dhcp_bound != 0) "bound" else "pending";
+    const line0 = std.fmt.bufPrint(&line_buf, "link={s} dhcp={s}", .{ link_text, dhcp_text }) catch return false;
+    st.writeLine(line0);
+    const line1 = std.fmt.bufPrint(&line_buf, "mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+        status.mac[0],
+        status.mac[1],
+        status.mac[2],
+        status.mac[3],
+        status.mac[4],
+        status.mac[5],
+    }) catch return false;
+    st.writeLine(line1);
+    const line2 = std.fmt.bufPrint(&line_buf, "ip={s} gateway={s} dns={s}", .{ ip, gateway, dns }) catch return false;
+    st.writeLine(line2);
+    const line3 = std.fmt.bufPrint(&line_buf, "rx={d} tx_complete={d}", .{ status.rx_packets, status.tx_completions }) catch return false;
+    st.writeLine(line3);
+    return true;
+}
+
 fn reportPersistentFsError(st: *ShellState, message: []const u8, err: anyerror, reset_client: bool) void {
     st.writeLine(message);
     shellLogLine(message);
@@ -2852,6 +2940,7 @@ fn activatePachaland(st: *ShellState) bool {
 fn resetServiceClients(st: *ShellState) void {
     st.block_client_ready = false;
     st.persistent_fs_client_ready = false;
+    st.net_client_ready = false;
 }
 
 fn serviceKindName(kind: service_registry_abi.ServiceKind) []const u8 {
@@ -2864,6 +2953,8 @@ fn serviceKindName(kind: service_registry_abi.ServiceKind) []const u8 {
         .gpu => "gpu",
         .pointer => "pointer",
         .fat_fs => "fat_fs",
+        .console => "console",
+        .net => "net",
     };
 }
 
@@ -2876,6 +2967,8 @@ fn parseServiceKind(text: []const u8) ?service_registry_abi.ServiceKind {
     if (eqAsciiNoCase(text, "gpu")) return .gpu;
     if (eqAsciiNoCase(text, "pointer")) return .pointer;
     if (eqAsciiNoCase(text, "fat_fs") or eqAsciiNoCase(text, "fat-fs") or eqAsciiNoCase(text, "fat")) return .fat_fs;
+    if (eqAsciiNoCase(text, "console")) return .console;
+    if (eqAsciiNoCase(text, "net") or eqAsciiNoCase(text, "network")) return .net;
     return null;
 }
 
@@ -3118,7 +3211,7 @@ fn executeCommand(st: *ShellState) RenderAction {
 
     if (eqAsciiNoCase(parsed.head, "help")) {
         st.writeLine("commands: help clear pwd cd mkdir ls stat");
-        st.writeLine("cat exec touch write rm mv block_demo");
+        st.writeLine("cat exec touch write rm mv net block_demo");
         st.writeLine("fs_demo pie_user gpu gpu_demo cap service");
         st.writeLine("exec <path> | exec --service <kind> <path>");
         st.writeLine("hotkeys: Ctrl+Q pitty, Ctrl+Shift+Q shell");
@@ -3192,6 +3285,10 @@ fn executeCommand(st: *ShellState) RenderAction {
         const old_path = requireRootfsPath(st, args.head, &old_path_buf) orelse return .full;
         const new_path = requireRootfsPath(st, args.tail, &new_path_buf) orelse return .full;
         _ = runPersistentFsRename(st, old_path, new_path);
+        return .full;
+    }
+    if (eqAsciiNoCase(parsed.head, "net") or eqAsciiNoCase(parsed.head, "ifconfig")) {
+        _ = runNetStatus(st);
         return .full;
     }
     if (eqAsciiNoCase(parsed.head, "service") or eqAsciiNoCase(parsed.head, "svc") or eqAsciiNoCase(parsed.head, "exec-service")) {
@@ -3530,8 +3627,8 @@ pub export fn _start() noreturn {
         shell.writeLine("type help");
         _ = userLog("Shell: keyboard ready\n");
     } else {
-        shell.writeLine("keyboard unavailable");
-        _ = userLog("Shell: keyboard unavailable\n");
+        shell.writeLine("input unavailable");
+        _ = userLog("Shell: input unavailable\n");
     }
     shellLogLine("render begin");
     renderFull(vfb, shell);
@@ -3574,4 +3671,3 @@ pub export fn _start() noreturn {
         }
     }
 }
-

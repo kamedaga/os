@@ -34,8 +34,7 @@ pactl run
 
 ## Status
 
-Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカが動作し、dash shellのほとんどの操作(pipeを含む)が動く状況になっている。
-マルチコアでLinux互換プロセスが動く状態に来ていて、リファクタリング、粗削りな部分をつぶしたpthread導入中
+Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカがマルチコアで動作し、fastfetch zstd busyboxが動いています
 
 ## License
 

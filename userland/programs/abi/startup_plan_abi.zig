@@ -17,6 +17,7 @@ pub const StartupAction = enum(u8) {
     process = 11,
     process_builder = 12,
     fat_server = 13,
+    console_driver = 14,
 };
 
 pub const StartupExecSource = enum(u8) {
@@ -31,6 +32,10 @@ pub const StartupInputSelector = enum(u8) {
 
 pub const StartupBlockSelector = enum(u8) {
     virtio_blk = 1,
+};
+
+pub const StartupDeviceSelector = enum(u8) {
+    virtio_console = 1,
 };
 
 pub const StartupWindowConfig = enum(u8) {
@@ -49,6 +54,7 @@ pub const ensure_flag_boot_display: u64 = 1 << 0;
 pub const require_flag_keyboard_shared: u64 = 1 << 0;
 pub const require_flag_pointer_shared: u64 = 1 << 1;
 pub const require_flag_block_service: u64 = 1 << 2;
+pub const require_flag_console_service: u64 = 1 << 3;
 pub const require_flag_persistent_fs_service: u64 = 1 << 4;
 pub const require_flag_compositor_armed: u64 = 1 << 5;
 
@@ -66,6 +72,7 @@ pub const StartupProgramRole = enum(u64) {
     persistent_fs = 11,
     gpu_driver = 12,
     fat_server = 13,
+    console_driver = 14,
 };
 
 pub const StartupProgramDescriptor = extern struct {
@@ -95,6 +102,7 @@ pub fn roleLabel(role: StartupProgramRole) []const u8 {
         .persistent_fs => "persistent fs",
         .gpu_driver => "gpu driver",
         .fat_server => "fat server",
+        .console_driver => "console driver",
     };
 }
 
@@ -113,6 +121,7 @@ pub fn roleKey(role: StartupProgramRole) []const u8 {
         .persistent_fs => "persistent_fs",
         .gpu_driver => "gpu_driver",
         .fat_server => "fat_server",
+        .console_driver => "console_driver",
     };
 }
 
@@ -134,6 +143,7 @@ pub fn actionFromKey(key: []const u8) ?StartupAction {
     if (std.mem.eql(u8, key, "window_service")) return .window_service;
     if (std.mem.eql(u8, key, "process") or std.mem.eql(u8, key, "program")) return .process;
     if (std.mem.eql(u8, key, "process_builder")) return .process_builder;
+    if (std.mem.eql(u8, key, "console_driver")) return .console_driver;
     if (std.mem.eql(u8, key, "block_client") or std.mem.eql(u8, key, "block_demo")) return .block_client;
     if (std.mem.eql(u8, key, "window_client")) return .window_client;
     if (std.mem.eql(u8, key, "deferred_compositor")) return .deferred_compositor;
@@ -164,6 +174,11 @@ pub fn blockSelectorFromKey(key: []const u8) ?StartupBlockSelector {
     return null;
 }
 
+pub fn deviceSelectorFromKey(key: []const u8) ?StartupDeviceSelector {
+    if (std.mem.eql(u8, key, "virtio_console")) return .virtio_console;
+    return null;
+}
+
 pub fn windowConfigFromKey(key: []const u8) ?StartupWindowConfig {
     if (std.mem.eql(u8, key, "terminal")) return .terminal;
     if (std.mem.eql(u8, key, "taskbar")) return .taskbar;
@@ -186,6 +201,7 @@ pub fn requirementBitFromKey(key: []const u8) ?u64 {
     if (std.mem.eql(u8, key, "keyboard_shared")) return require_flag_keyboard_shared;
     if (std.mem.eql(u8, key, "pointer_shared")) return require_flag_pointer_shared;
     if (std.mem.eql(u8, key, "block_service")) return require_flag_block_service;
+    if (std.mem.eql(u8, key, "console_service")) return require_flag_console_service;
     if (std.mem.eql(u8, key, "persistent_fs_service")) return require_flag_persistent_fs_service;
     if (std.mem.eql(u8, key, "compositor_armed")) return require_flag_compositor_armed;
     return null;

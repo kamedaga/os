@@ -1016,19 +1016,19 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return syscall_ok;
         },
         syscall_iommu_authorize => {
-            const device: kernel.DmaDeviceId = std.meta.intToEnum(kernel.DmaDeviceId, @as(u8, @truncate(frame.rsi))) catch return syscall_err_invalid;
+            const device: kernel.DmaDeviceId = frame.rsi;
             const op: device_capabilities.IommuOperation = std.meta.intToEnum(device_capabilities.IommuOperation, @as(u8, @truncate(frame.rdx))) catch return syscall_err_invalid;
             device_capabilities.iommuCapAuthorizeStage2(state, proc, frame.rdi, device, op) catch return syscall_err_invalid;
             return syscall_ok;
         },
         syscall_command_authorize => {
-            const device: kernel.DmaDeviceId = std.meta.intToEnum(kernel.DmaDeviceId, @as(u8, @truncate(frame.rsi))) catch return syscall_err_invalid;
+            const device: kernel.DmaDeviceId = frame.rsi;
             const opcode: device_capabilities.CommandOpcodeClass = std.meta.intToEnum(device_capabilities.CommandOpcodeClass, @as(u8, @truncate(frame.rdx))) catch return syscall_err_invalid;
             device_capabilities.commandCapAuthorizeStage2(state, proc, frame.rdi, device, opcode) catch return syscall_err_invalid;
             return syscall_ok;
         },
         syscall_dma_map_create => {
-            const device: kernel.DmaDeviceId = std.meta.intToEnum(kernel.DmaDeviceId, @as(u8, @truncate(frame.rdi))) catch return syscall_err_invalid;
+            const device: kernel.DmaDeviceId = frame.rdi;
             const direction: kernel.DmaDirection = std.meta.intToEnum(kernel.DmaDirection, @as(u8, @truncate(frame.r8))) catch return syscall_err_invalid;
             const token = state.dmaMapCreateStage1(proc, device, frame.rsi, frame.rdx, direction) catch |err| switch (err) {
                 kernel.KernelError.InvalidState => return syscall_err_invalid,
