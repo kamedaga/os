@@ -12,6 +12,9 @@ struct linux_pollfd {
     short revents;
 };
 
+static u64 socket_write_from_target(u64 fd, u64 src_va, u64 len);
+static u64 socket_read_to_target(u64 fd, u64 dst_va, u64 len);
+
 static u32 read_net_be32(const u8 *p) {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
 }
@@ -196,6 +199,53 @@ static u64 net_poll_udp(u64 handle) {
     return response->status == NET_STATUS_OK ? response->arg0 : net_status_to_errno(response->status);
 }
 
+static u64 net_tcp_connect(u32 remote_ip, u16 remote_port, u64 *handle_out, u16 *actual_port_out, u32 *local_ip_out) {
+    u64 result = errno_netunreach();
+    for (u64 attempt = 0; attempt < 8192; attempt++) {
+        u64 seq = 0;
+        if (!net_begin_request(NET_OP_TCP_CONNECT, remote_ip, remote_port, 0, 0, 0, 0, &seq)) return errno_io();
+        if (!wait_net_response(seq, NET_OP_TCP_CONNECT, 8192)) return errno_timedout();
+        volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+        if (response->status == NET_STATUS_OK) {
+            *handle_out = response->arg0;
+            if (actual_port_out != 0) *actual_port_out = (u16)response->arg1;
+            if (local_ip_out != 0) *local_ip_out = (u32)response->arg2;
+            break;
+        }
+        result = net_status_to_errno(response->status);
+        if (response->status != NET_STATUS_BUSY && response->status != NET_STATUS_NO_ROUTE) return result;
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+    if (*handle_out == 0) return result;
+    for (u64 attempt = 0; attempt < 8192; attempt++) {
+        const u64 events = net_poll_udp(*handle_out);
+        if ((i64)events < 0) return events;
+        if ((events & NET_POLL_WRITABLE) != 0) return 0;
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+    return errno_timedout();
+}
+
+static u64 net_tcp_write(u64 handle, const u8 *payload, u32 payload_len) {
+    u64 seq = 0;
+    if (!net_begin_request(NET_OP_TCP_WRITE, handle, 0, 0, payload_len, payload, payload_len, &seq)) return errno_io();
+    if (!wait_net_response(seq, NET_OP_TCP_WRITE, 8192)) return errno_timedout();
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    return response->status == NET_STATUS_OK ? response->arg0 : net_status_to_errno(response->status);
+}
+
+static u64 net_tcp_read(u64 handle, u8 *out, u32 out_cap) {
+    u64 seq = 0;
+    if (!net_begin_request(NET_OP_TCP_READ, handle, 0, 0, out_cap, 0, 0, &seq)) return errno_io();
+    if (!wait_net_response(seq, NET_OP_TCP_READ, 8192)) return errno_timedout();
+    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    if (response->status != NET_STATUS_OK) return net_status_to_errno(response->status);
+    if (response->inline_bytes > out_cap || response->inline_bytes > NET_RESPONSE_PAYLOAD_BYTES) return errno_io();
+    volatile u8 *src = (volatile u8 *)(NET_RESPONSE_VA + NET_RESPONSE_HEADER_BYTES);
+    for (u32 i = 0; i < response->inline_bytes; i++) out[i] = src[i];
+    return response->inline_bytes;
+}
+
 static void net_close_udp(u64 handle) {
     if (handle == 0 || !g_net.active) return;
     u64 seq = 0;
@@ -208,8 +258,10 @@ static struct ipc_message handle_socket(const struct trap_request *req) {
     const u64 type = req->args[1];
     const u64 protocol = req->args[2];
     if (domain != AF_INET) return reply(errno_afnosupport(), 0);
-    if ((type & SOCK_TYPE_MASK) != SOCK_DGRAM) return reply(errno_socktnosupport(), 0);
-    if (protocol != 0 && protocol != IPPROTO_UDP) return reply(errno_protonosupport(), 0);
+    const u64 socket_type = type & SOCK_TYPE_MASK;
+    if (socket_type != SOCK_DGRAM && socket_type != SOCK_STREAM) return reply(errno_socktnosupport(), 0);
+    if (socket_type == SOCK_DGRAM && protocol != 0 && protocol != IPPROTO_UDP) return reply(errno_protonosupport(), 0);
+    if (socket_type == SOCK_STREAM && protocol != 0 && protocol != IPPROTO_TCP) return reply(errno_protonosupport(), 0);
     if (!ensure_net_connected()) return reply(errno_netunreach(), 0);
     const int fd = alloc_fd();
     if (fd < 0) return reply(errno_busy(), 0);
@@ -221,7 +273,7 @@ static struct ipc_message handle_socket(const struct trap_request *req) {
     g_fds[(u64)fd].object_kind = FS_OBJECT_FILE;
     g_fds[(u64)fd].pipe_id = 0;
     g_fds[(u64)fd].socket_connected = 0;
-    g_fds[(u64)fd].reserved_fd0 = 0;
+    g_fds[(u64)fd].socket_type = (u8)socket_type;
     g_fds[(u64)fd].socket_local_port = 0;
     g_fds[(u64)fd].socket_remote_port = 0;
     g_fds[(u64)fd].socket_local_ip = 0;
@@ -260,6 +312,7 @@ static int write_sockaddr_in_to_target(u64 addr_va, u64 addrlen_va, u32 ip, u16 
 static int ensure_socket_bound(u64 fd) {
     if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return 0;
     if (g_fds[fd].token != 0) return 1;
+    if (g_fds[fd].socket_type != SOCK_DGRAM) return 0;
     u64 handle = 0;
     u16 local_port = 0;
     u32 local_ip = 0;
@@ -274,6 +327,7 @@ static int ensure_socket_bound(u64 fd) {
 static struct ipc_message handle_bind_socket(const struct trap_request *req) {
     const u64 fd = req->args[0];
     if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (g_fds[fd].socket_type != SOCK_DGRAM) return reply(errno_nosys(), 0);
     u32 ip = 0;
     u16 port = 0;
     if (!read_sockaddr_in(req->args[1], req->args[2], &ip, &port)) return reply(errno_inval(), 0);
@@ -297,6 +351,22 @@ static struct ipc_message handle_connect_socket(const struct trap_request *req) 
     u16 remote_port = 0;
     if (!read_sockaddr_in(req->args[1], req->args[2], &remote_ip, &remote_port)) return reply(errno_inval(), 0);
     if (remote_ip == 0 || remote_port == 0) return reply(errno_inval(), 0);
+    if (g_fds[fd].socket_type == SOCK_STREAM) {
+        if (g_fds[fd].token != 0) return reply(errno_inval(), 0);
+        u64 handle = 0;
+        u16 local_port = 0;
+        u32 local_ip = 0;
+        const u64 result = net_tcp_connect(remote_ip, remote_port, &handle, &local_port, &local_ip);
+        if ((i64)result < 0) return reply(result, 0);
+        g_fds[fd].token = handle;
+        g_fds[fd].socket_local_port = local_port;
+        g_fds[fd].socket_local_ip = local_ip;
+        g_fds[fd].socket_connected = 1;
+        g_fds[fd].socket_remote_ip = remote_ip;
+        g_fds[fd].socket_remote_port = remote_port;
+        sync_fd_to_thread_group(fd);
+        return reply(0, 0);
+    }
     if (!ensure_socket_bound(fd)) return reply(errno_busy(), 0);
     g_fds[fd].socket_connected = 1;
     g_fds[fd].socket_remote_ip = remote_ip;
@@ -312,6 +382,10 @@ static struct ipc_message handle_sendto(const struct trap_request *req) {
     const u64 addr_va = req->args[4];
     const u64 addr_len = req->args[5];
     if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (g_fds[fd].socket_type == SOCK_STREAM) {
+        if (addr_va != 0) return reply(errno_inval(), 0);
+        return reply(socket_write_from_target(fd, src_va, len), 0);
+    }
     if (len > NET_UDP_MAX_PAYLOAD) return reply(errno_msgsize(), 0);
     u32 remote_ip = 0;
     u16 remote_port = 0;
@@ -335,6 +409,7 @@ static struct ipc_message handle_recvfrom(const struct trap_request *req) {
     const u64 addr_va = req->args[4];
     const u64 addrlen_va = req->args[5];
     if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
+    if (g_fds[fd].socket_type == SOCK_STREAM) return reply(socket_read_to_target(fd, dst_va, len), 0);
     if (!ensure_socket_bound(fd)) return reply(errno_busy(), 0);
     u8 payload[NET_UDP_MAX_PAYLOAD];
     const u32 cap = (u32)min_u64(len, NET_UDP_MAX_PAYLOAD);
@@ -366,20 +441,37 @@ static struct ipc_message handle_recvfrom(const struct trap_request *req) {
 static u64 socket_send_payload(u64 fd, const u8 *payload, u64 len) {
     if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return errno_badf();
     if (!g_fds[fd].socket_connected) return errno_destaddrreq();
+    if (g_fds[fd].socket_type == SOCK_STREAM) {
+        if (len > NET_TCP_MAX_PAYLOAD) return errno_msgsize();
+        return net_tcp_write(g_fds[fd].token, payload, (u32)len);
+    }
     if (len > NET_UDP_MAX_PAYLOAD) return errno_msgsize();
     if (!ensure_socket_bound(fd)) return errno_busy();
     return net_send_udp(g_fds[fd].token, g_fds[fd].socket_remote_ip, g_fds[fd].socket_remote_port, payload, (u32)len);
 }
 
 static u64 socket_write_from_target(u64 fd, u64 src_va, u64 len) {
-    u8 payload[NET_UDP_MAX_PAYLOAD];
-    if (len > NET_UDP_MAX_PAYLOAD) return errno_msgsize();
+    u8 payload[NET_TCP_MAX_PAYLOAD];
+    if (len > NET_TCP_MAX_PAYLOAD) return errno_msgsize();
     if (len != 0 && copy_from_target(src_va, payload, len) != len) return errno_fault();
     return socket_send_payload(fd, payload, len);
 }
 
 static u64 socket_read_to_target(u64 fd, u64 dst_va, u64 len) {
     if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return errno_badf();
+    if (g_fds[fd].socket_type == SOCK_STREAM) {
+        u8 payload[NET_TCP_MAX_PAYLOAD];
+        const u32 cap = (u32)min_u64(len, NET_TCP_MAX_PAYLOAD);
+        u64 result = errno_again();
+        for (u64 i = 0; i < 8192; i++) {
+            result = net_tcp_read(g_fds[fd].token, payload, cap);
+            if ((i64)result >= 0 || result != errno_again()) break;
+            (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+        }
+        if ((i64)result < 0) return result;
+        if (result != 0 && copy_to_target(dst_va, payload, result) != result) return errno_fault();
+        return result;
+    }
     if (!ensure_socket_bound(fd)) return errno_busy();
     u8 payload[NET_UDP_MAX_PAYLOAD];
     const u32 cap = (u32)min_u64(len, NET_UDP_MAX_PAYLOAD);
@@ -399,7 +491,8 @@ static u64 socket_read_to_target(u64 fd, u64 dst_va, u64 len) {
 static struct ipc_message handle_getsockname_socket(const struct trap_request *req) {
     const u64 fd = req->args[0];
     if (!fd_valid(fd) || g_fds[fd].kind != FD_SOCKET) return reply(errno_badf(), 0);
-    if (!ensure_socket_bound(fd)) return reply(errno_busy(), 0);
+    if (g_fds[fd].socket_type == SOCK_DGRAM && !ensure_socket_bound(fd)) return reply(errno_busy(), 0);
+    if (g_fds[fd].socket_type == SOCK_STREAM && g_fds[fd].token == 0) return reply(errno_inval(), 0);
     if (!write_sockaddr_in_to_target(req->args[1], req->args[2], g_fds[fd].socket_local_ip, g_fds[fd].socket_local_port)) return reply(errno_fault(), 0);
     return reply(0, 0);
 }
@@ -446,7 +539,7 @@ static u16 fd_poll_revents(u64 fd, u16 requested) {
 
     struct fd_entry *entry = &g_fds[fd];
     if (entry->kind == FD_SOCKET) {
-        u64 events = NET_POLL_WRITABLE;
+        u64 events = entry->socket_type == SOCK_DGRAM ? NET_POLL_WRITABLE : 0;
         if (entry->token != 0) events = net_poll_udp(entry->token);
         if ((i64)events < 0) return POLLERR;
         u16 revents = 0;

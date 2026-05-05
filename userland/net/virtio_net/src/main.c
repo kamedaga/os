@@ -85,6 +85,7 @@ enum {
 
     ETHERTYPE_IPV4 = 0x0800,
     ETHERTYPE_ARP = 0x0806,
+    IP_PROTO_TCP = 6,
     IP_PROTO_UDP = 17,
     DHCP_CLIENT_PORT = 68,
     DHCP_SERVER_PORT = 67,
@@ -104,6 +105,9 @@ enum {
     NET_OP_RECV_FROM = 5,
     NET_OP_CLOSE = 6,
     NET_OP_POLL = 7,
+    NET_OP_TCP_CONNECT = 8,
+    NET_OP_TCP_WRITE = 9,
+    NET_OP_TCP_READ = 10,
     NET_STATUS_OK = 0,
     NET_STATUS_INVALID = 2,
     NET_STATUS_NOT_CONNECTED = 4,
@@ -125,9 +129,22 @@ enum {
     NET_UDP_MAX_PAYLOAD = 1200,
     NET_UDP_BINDINGS = 4,
     NET_UDP_PENDING = 4,
+    NET_TCP_CONNECTIONS = 4,
+    NET_TCP_MAX_PAYLOAD = 1200,
+    NET_TCP_RX_BYTES = 4096,
     NET_SESSION_MAX = 4,
     NET_UDP_HANDLE_TAG = 0x5544500000000000ULL,
+    NET_TCP_HANDLE_TAG = 0x5443500000000000ULL,
     NET_EPHEMERAL_PORT_BASE = 49152,
+    TCP_STATE_SYN_SENT = 1,
+    TCP_STATE_ESTABLISHED = 2,
+    TCP_STATE_FIN_WAIT = 3,
+    TCP_STATE_CLOSED = 4,
+    TCP_FLAG_FIN = 0x01,
+    TCP_FLAG_SYN = 0x02,
+    TCP_FLAG_RST = 0x04,
+    TCP_FLAG_PSH = 0x08,
+    TCP_FLAG_ACK = 0x10,
 
     DESC_FLAG_NEXT = 1 << 0,
     DESC_FLAG_WRITE = 1 << 1,
@@ -247,10 +264,29 @@ struct udp_binding {
     struct udp_packet packets[NET_UDP_PENDING];
 };
 
+struct tcp_connection {
+    u8 active;
+    u8 state;
+    u8 peer_closed;
+    u8 reserved0;
+    u64 handle;
+    u32 local_ip;
+    u32 remote_ip;
+    u16 local_port;
+    u16 remote_port;
+    u32 seq;
+    u32 ack;
+    u32 initial_seq;
+    u32 rx_head;
+    u32 rx_len;
+    u8 rx[NET_TCP_RX_BYTES];
+};
+
 static struct boot_state g_boot;
 static struct net_session g_sessions[NET_SESSION_MAX];
 static struct net_session *g_current_session;
 static struct udp_binding g_udp_bindings[NET_UDP_BINDINGS];
+static struct tcp_connection g_tcp_connections[NET_TCP_CONNECTIONS];
 static struct queue_state g_rx_queue = { RX_QUEUE_INDEX, 0, 0, RX_QUEUE_PAGE_VA, 0, 0, 0 };
 static struct queue_state g_tx_queue = { TX_QUEUE_INDEX, 0, 0, TX_QUEUE_PAGE_VA, 0, 0, 0 };
 static u64 g_common_base;
@@ -543,6 +579,27 @@ static u16 udp_ipv4_checksum(u32 src_ip, u32 dst_ip, const u8 *udp, u32 udp_len)
     return checksum == 0 ? 0xFFFF : checksum;
 }
 
+static u16 tcp_ipv4_checksum(u32 src_ip, u32 dst_ip, const u8 *tcp, u32 tcp_len) {
+    u32 sum = 0;
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += IP_PROTO_TCP;
+    sum += tcp_len;
+    for (u32 i = 0; i + 1 < tcp_len; i += 2) {
+        sum += read_be16(tcp + i);
+        while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    if ((tcp_len & 1) != 0) {
+        sum += (u32)tcp[tcp_len - 1] << 8;
+        while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+    const u16 checksum = (u16)~sum;
+    return checksum == 0 ? 0xFFFF : checksum;
+}
+
 static void log_mac(void) {
     char line[96];
     u64 len = 0;
@@ -704,11 +761,13 @@ static int udp_port_in_use(u16 port) {
     return find_udp_binding_by_port(port) != 0;
 }
 
+static int tcp_port_in_use(u16 port);
+
 static u16 allocate_ephemeral_port(void) {
     for (u32 attempts = 0; attempts < 16384; attempts++) {
         u16 port = g_next_ephemeral_port++;
         if (g_next_ephemeral_port < NET_EPHEMERAL_PORT_BASE) g_next_ephemeral_port = NET_EPHEMERAL_PORT_BASE;
-        if (!udp_port_in_use(port)) return port;
+        if (!udp_port_in_use(port) && !tcp_port_in_use(port)) return port;
     }
     return 0;
 }
@@ -970,6 +1029,192 @@ static int send_ipv4_udp(u64 handle, u32 remote_ip, u16 remote_port, const u8 *p
     write_be16(udp + 6, udp_ipv4_checksum(g_ipv4_addr, remote_ip, udp, udp_len));
 
     return send_packet(frame, frame_len) ? NET_STATUS_OK : NET_STATUS_BUSY;
+}
+
+static int tcp_handle_index(u64 handle, u64 *index_out) {
+    if ((handle & 0xFFFFFFFF00000000ULL) != NET_TCP_HANDLE_TAG) return 0;
+    const u64 index = handle & 0xFFFF;
+    if (index == 0 || index > NET_TCP_CONNECTIONS) return 0;
+    *index_out = index - 1;
+    return 1;
+}
+
+static struct tcp_connection *find_tcp_connection_by_handle(u64 handle) {
+    u64 index = 0;
+    if (!tcp_handle_index(handle, &index)) return 0;
+    struct tcp_connection *conn = &g_tcp_connections[index];
+    if (!conn->active || conn->handle != handle) return 0;
+    return conn;
+}
+
+static struct tcp_connection *find_tcp_connection_by_tuple(u32 remote_ip, u16 remote_port, u16 local_port) {
+    for (u64 i = 0; i < NET_TCP_CONNECTIONS; i++) {
+        struct tcp_connection *conn = &g_tcp_connections[i];
+        if (!conn->active) continue;
+        if (conn->remote_ip == remote_ip && conn->remote_port == remote_port && conn->local_port == local_port) return conn;
+    }
+    return 0;
+}
+
+static int tcp_port_in_use(u16 port) {
+    for (u64 i = 0; i < NET_TCP_CONNECTIONS; i++) {
+        if (g_tcp_connections[i].active && g_tcp_connections[i].local_port == port) return 1;
+    }
+    return 0;
+}
+
+static int tcp_rx_append(struct tcp_connection *conn, const u8 *payload, u32 len) {
+    if (len > NET_TCP_RX_BYTES - conn->rx_len) return 0;
+    for (u32 i = 0; i < len; i++) {
+        const u32 index = (conn->rx_head + conn->rx_len + i) % NET_TCP_RX_BYTES;
+        conn->rx[index] = payload[i];
+    }
+    conn->rx_len += len;
+    return 1;
+}
+
+static u32 tcp_rx_pop(struct tcp_connection *conn, u8 *out, u32 out_cap) {
+    const u32 n = conn->rx_len < out_cap ? conn->rx_len : out_cap;
+    for (u32 i = 0; i < n; i++) {
+        out[i] = conn->rx[(conn->rx_head + i) % NET_TCP_RX_BYTES];
+    }
+    conn->rx_head = (conn->rx_head + n) % NET_TCP_RX_BYTES;
+    conn->rx_len -= n;
+    return n;
+}
+
+static int send_ipv4_tcp_segment(struct tcp_connection *conn, u8 flags, const u8 *payload, u32 payload_len) {
+    if (conn == 0 || !conn->active || conn->remote_ip == 0 || conn->remote_port == 0) return NET_STATUS_INVALID;
+    if (payload_len > NET_TCP_MAX_PAYLOAD || payload_len > NET_PAYLOAD_BYTES) return NET_STATUS_TOO_BIG;
+    if (!g_dhcp_configured || g_ipv4_addr == 0 || g_gateway_addr == 0) return NET_STATUS_NO_ROUTE;
+    if (!g_gateway_mac_ready) {
+        if (!g_tx_in_flight) (void)send_arp_request(g_ipv4_addr, g_gateway_addr);
+        return NET_STATUS_NO_ROUTE;
+    }
+    if (g_tx_in_flight) return NET_STATUS_BUSY;
+
+    u8 frame[ETH_HDR_BYTES + 20 + 20 + NET_TCP_MAX_PAYLOAD];
+    memset(frame, 0, sizeof(frame));
+    memcpy(frame + 0, g_gateway_mac, 6);
+    memcpy(frame + 6, g_mac, 6);
+    write_be16(frame + 12, ETHERTYPE_IPV4);
+
+    u8 *ip = frame + ETH_HDR_BYTES;
+    u8 *tcp = ip + 20;
+    const u16 tcp_len = (u16)(20 + payload_len);
+    const u16 ip_len = (u16)(20 + tcp_len);
+    const u16 frame_len = (u16)(ETH_HDR_BYTES + ip_len);
+
+    ip[0] = 0x45;
+    ip[1] = 0;
+    write_be16(ip + 2, ip_len);
+    write_be16(ip + 4, (u16)(0x4000 | (g_tx_completions & 0x3FFF)));
+    write_be16(ip + 6, 0x4000);
+    ip[8] = 64;
+    ip[9] = IP_PROTO_TCP;
+    write_be32(ip + 12, conn->local_ip);
+    write_be32(ip + 16, conn->remote_ip);
+    write_be16(ip + 10, ipv4_checksum(ip, 20));
+
+    write_be16(tcp + 0, conn->local_port);
+    write_be16(tcp + 2, conn->remote_port);
+    write_be32(tcp + 4, conn->seq);
+    write_be32(tcp + 8, conn->ack);
+    tcp[12] = 5 << 4;
+    tcp[13] = flags;
+    write_be16(tcp + 14, 4096);
+    write_be16(tcp + 16, 0);
+    write_be16(tcp + 18, 0);
+    if (payload_len != 0) memcpy(tcp + 20, payload, payload_len);
+    write_be16(tcp + 16, tcp_ipv4_checksum(conn->local_ip, conn->remote_ip, tcp, tcp_len));
+
+    if (!send_packet(frame, frame_len)) return NET_STATUS_BUSY;
+    if ((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) != 0) conn->seq++;
+    conn->seq += payload_len;
+    return NET_STATUS_OK;
+}
+
+static struct tcp_connection *alloc_tcp_connection(u32 remote_ip, u16 remote_port) {
+    const u16 local_port = allocate_ephemeral_port();
+    if (local_port == 0) return 0;
+    for (u64 i = 0; i < NET_TCP_CONNECTIONS; i++) {
+        struct tcp_connection *conn = &g_tcp_connections[i];
+        if (conn->active) continue;
+        memset(conn, 0, sizeof(*conn));
+        conn->active = 1;
+        conn->state = TCP_STATE_SYN_SENT;
+        conn->local_ip = g_ipv4_addr;
+        conn->remote_ip = remote_ip;
+        conn->local_port = local_port;
+        conn->remote_port = remote_port;
+        conn->initial_seq = (u32)(0x43415000u + ((g_rx_packets + g_tx_completions + local_port) & 0xFFFF));
+        conn->seq = conn->initial_seq;
+        conn->ack = 0;
+        conn->handle = NET_TCP_HANDLE_TAG |
+            (((u64)local_port & 0xFFFF) << 16) |
+            (i + 1);
+        return conn;
+    }
+    return 0;
+}
+
+static int net_tcp_connect(u32 remote_ip, u16 remote_port, u64 *handle_out, u16 *local_port_out, u32 *local_ip_out) {
+    if (remote_ip == 0 || remote_port == 0) return NET_STATUS_INVALID;
+    if (!g_dhcp_configured || g_ipv4_addr == 0 || g_gateway_addr == 0) return NET_STATUS_NO_ROUTE;
+    struct tcp_connection *conn = alloc_tcp_connection(remote_ip, remote_port);
+    if (conn == 0) return NET_STATUS_PORT_IN_USE;
+    const int status = send_ipv4_tcp_segment(conn, TCP_FLAG_SYN, 0, 0);
+    if (status != NET_STATUS_OK) {
+        memset(conn, 0, sizeof(*conn));
+        return status;
+    }
+    *handle_out = conn->handle;
+    *local_port_out = conn->local_port;
+    *local_ip_out = conn->local_ip;
+    return NET_STATUS_OK;
+}
+
+static int tcp_write(u64 handle, const u8 *payload, u32 payload_len, u32 *written_out) {
+    struct tcp_connection *conn = find_tcp_connection_by_handle(handle);
+    if (conn == 0) return NET_STATUS_INVALID;
+    if (conn->state != TCP_STATE_ESTABLISHED) return NET_STATUS_NOT_CONNECTED;
+    const int status = send_ipv4_tcp_segment(conn, TCP_FLAG_ACK | TCP_FLAG_PSH, payload, payload_len);
+    if (status == NET_STATUS_OK) *written_out = payload_len;
+    return status;
+}
+
+static int tcp_read(u64 handle, u8 *out, u32 out_cap, u32 *out_len) {
+    struct tcp_connection *conn = find_tcp_connection_by_handle(handle);
+    if (conn == 0) return NET_STATUS_INVALID;
+    if (conn->rx_len == 0) {
+        if (conn->peer_closed || conn->state == TCP_STATE_CLOSED) {
+            *out_len = 0;
+            return NET_STATUS_OK;
+        }
+        return NET_STATUS_WOULD_BLOCK;
+    }
+    *out_len = tcp_rx_pop(conn, out, out_cap);
+    return NET_STATUS_OK;
+}
+
+static int poll_tcp_connection(u64 handle, u64 *events_out) {
+    struct tcp_connection *conn = find_tcp_connection_by_handle(handle);
+    if (conn == 0) return NET_STATUS_INVALID;
+    u64 events = 0;
+    if (conn->rx_len != 0 || conn->peer_closed) events |= NET_POLL_READABLE;
+    if (conn->state == TCP_STATE_ESTABLISHED && !g_tx_in_flight) events |= NET_POLL_WRITABLE;
+    *events_out = events;
+    return NET_STATUS_OK;
+}
+
+static int close_tcp_connection(u64 handle) {
+    struct tcp_connection *conn = find_tcp_connection_by_handle(handle);
+    if (conn == 0) return 0;
+    if (conn->state == TCP_STATE_ESTABLISHED && !g_tx_in_flight) {
+        (void)send_ipv4_tcp_segment(conn, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+    }
+    memset(conn, 0, sizeof(*conn));
+    return 1;
 }
 
 static int send_dhcp_discover(void) {
@@ -1284,6 +1529,49 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
     if (frame_len < ETH_HDR_BYTES + ihl) return;
     const u16 total_len = read_be16(ip + 2);
     if (total_len < ihl || frame_len < ETH_HDR_BYTES + total_len) return;
+    if (ip[9] == IP_PROTO_TCP) {
+        const u8 *tcp = ip + ihl;
+        const u32 tcp_packet_len = (u32)total_len - ihl;
+        if (tcp_packet_len < 20) return;
+        const u16 src_port = read_be16(tcp + 0);
+        const u16 dst_port = read_be16(tcp + 2);
+        const u32 seq = read_be32(tcp + 4);
+        const u32 ack_num = read_be32(tcp + 8);
+        const u32 tcp_header_len = (u32)(tcp[12] >> 4) * 4;
+        const u8 flags = tcp[13];
+        if (tcp_header_len < 20 || tcp_header_len > tcp_packet_len) return;
+        const u8 *payload = tcp + tcp_header_len;
+        const u32 payload_len = tcp_packet_len - tcp_header_len;
+        struct tcp_connection *conn = find_tcp_connection_by_tuple(read_be32(ip + 12), src_port, dst_port);
+        if (conn == 0) return;
+        if ((flags & TCP_FLAG_RST) != 0) {
+            conn->state = TCP_STATE_CLOSED;
+            conn->peer_closed = 1;
+            return;
+        }
+        if (conn->state == TCP_STATE_SYN_SENT && (flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
+            if (ack_num == conn->seq) {
+                conn->ack = seq + 1;
+                conn->state = TCP_STATE_ESTABLISHED;
+                (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
+            }
+            return;
+        }
+        if (conn->state != TCP_STATE_ESTABLISHED && conn->state != TCP_STATE_FIN_WAIT) return;
+        if (payload_len != 0 && seq == conn->ack) {
+            if (tcp_rx_append(conn, payload, payload_len)) {
+                conn->ack += payload_len;
+                (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
+            }
+        }
+        if ((flags & TCP_FLAG_FIN) != 0) {
+            if (seq == conn->ack) conn->ack++;
+            conn->peer_closed = 1;
+            conn->state = TCP_STATE_CLOSED;
+            (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
+        }
+        return;
+    }
     if (ip[9] != IP_PROTO_UDP) return;
 
     const u8 *udp = ip + ihl;
@@ -1499,12 +1787,36 @@ static void handle_net_request_for_session(struct net_session *session) {
         const int status = dequeue_udp_packet(request->arg0, net_response_payload(), out_cap, &out_len, &src_ip, &src_port);
         write_net_response(NET_OP_RECV_FROM, seq, status, status == NET_STATUS_OK ? out_len : 0, src_ip, src_port, out_len);
     } else if (request->op == NET_OP_CLOSE) {
-        const int ok = close_udp_binding(request->arg0);
+        int ok = close_udp_binding(request->arg0);
+        if (!ok) ok = close_tcp_connection(request->arg0);
         write_net_response(NET_OP_CLOSE, seq, ok ? NET_STATUS_OK : NET_STATUS_INVALID, 0, 0, 0, 0);
     } else if (request->op == NET_OP_POLL) {
         u64 events = 0;
-        const int status = poll_udp_binding(request->arg0, &events);
+        int status = poll_udp_binding(request->arg0, &events);
+        if (status == NET_STATUS_INVALID) status = poll_tcp_connection(request->arg0, &events);
         write_net_response(NET_OP_POLL, seq, status, 0, events, 0, 0);
+    } else if (request->op == NET_OP_TCP_CONNECT) {
+        u64 handle = 0;
+        u16 local_port = 0;
+        u32 local_ip = 0;
+        const int status = net_tcp_connect((u32)request->arg0, (u16)request->arg1, &handle, &local_port, &local_ip);
+        write_net_response(NET_OP_TCP_CONNECT, seq, status, 0, handle, local_port, local_ip);
+    } else if (request->op == NET_OP_TCP_WRITE) {
+        const u32 payload_len = (u32)request->reserved0;
+        u32 written = 0;
+        int status = NET_STATUS_OK;
+        if (payload_len > NET_PAYLOAD_BYTES || payload_len > NET_TCP_MAX_PAYLOAD) {
+            status = NET_STATUS_TOO_BIG;
+        } else {
+            status = tcp_write(request->arg0, net_request_payload(), payload_len, &written);
+        }
+        write_net_response(NET_OP_TCP_WRITE, seq, status, 0, written, 0, 0);
+    } else if (request->op == NET_OP_TCP_READ) {
+        u32 out_len = 0;
+        u32 out_cap = (u32)request->reserved0;
+        if (out_cap > NET_PAYLOAD_BYTES) out_cap = NET_PAYLOAD_BYTES;
+        const int status = tcp_read(request->arg0, net_response_payload(), out_cap, &out_len);
+        write_net_response(NET_OP_TCP_READ, seq, status, status == NET_STATUS_OK ? out_len : 0, out_len, 0, 0);
     } else {
         write_net_response(request->op, seq, NET_STATUS_INVALID, 0, 0, 0, 0);
     }

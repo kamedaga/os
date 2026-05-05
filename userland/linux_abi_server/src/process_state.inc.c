@@ -26,7 +26,7 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
     dst->object_kind = src->object_kind;
     dst->pipe_id = src->pipe_id;
     dst->socket_connected = src->socket_connected;
-    dst->reserved_fd0 = src->reserved_fd0;
+    dst->socket_type = src->socket_type;
     dst->path_len = src->path_len;
     dst->socket_local_port = src->socket_local_port;
     dst->socket_remote_port = src->socket_remote_port;

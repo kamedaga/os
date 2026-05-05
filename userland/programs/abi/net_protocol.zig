@@ -11,6 +11,9 @@ pub const Opcode = enum(u16) {
     recv_from = 5,
     close = 6,
     poll = 7,
+    tcp_connect = 8,
+    tcp_write = 9,
+    tcp_read = 10,
 };
 
 pub const Status = enum(i32) {
@@ -73,6 +76,7 @@ pub const response_header_bytes = @sizeOf(ResponseHeader);
 pub const request_payload_bytes = page_bytes - request_header_bytes;
 pub const response_payload_bytes = page_bytes - response_header_bytes;
 pub const udp_max_payload: usize = 1200;
+pub const tcp_max_payload: usize = 1200;
 
 pub fn opcodeRaw(op: Opcode) u16 {
     return @intFromEnum(op);

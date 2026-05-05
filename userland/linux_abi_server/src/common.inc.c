@@ -124,6 +124,9 @@ enum {
     NET_OP_RECV_FROM = 5,
     NET_OP_CLOSE = 6,
     NET_OP_POLL = 7,
+    NET_OP_TCP_CONNECT = 8,
+    NET_OP_TCP_WRITE = 9,
+    NET_OP_TCP_READ = 10,
     NET_POLL_READABLE = 1 << 0,
     NET_POLL_WRITABLE = 1 << 2,
     NET_STATUS_OK = 0,
@@ -139,6 +142,7 @@ enum {
     NET_REQUEST_PAYLOAD_BYTES = PAGE_BYTES - NET_REQUEST_HEADER_BYTES,
     NET_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - NET_RESPONSE_HEADER_BYTES,
     NET_UDP_MAX_PAYLOAD = 1200,
+    NET_TCP_MAX_PAYLOAD = 1200,
 
     LINUX_SYS_READ = 0,
     LINUX_SYS_WRITE = 1,
@@ -235,8 +239,10 @@ enum {
     O_CLOEXEC = 02000000,
     O_DIRECTORY = 00200000,
     AF_INET = 2,
+    SOCK_STREAM = 1,
     SOCK_DGRAM = 2,
     SOCK_TYPE_MASK = 0xf,
+    IPPROTO_TCP = 6,
     IPPROTO_UDP = 17,
     SOL_SOCKET = 1,
     SO_ERROR = 4,
@@ -378,7 +384,7 @@ struct fd_entry {
     u8 object_kind;
     u8 pipe_id;
     u8 socket_connected;
-    u8 reserved_fd0;
+    u8 socket_type;
     u16 path_len;
     u16 socket_local_port;
     u16 socket_remote_port;
