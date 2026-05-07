@@ -162,7 +162,14 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     const u64 requested_va = req->args[0]; const u64 len = req->args[1]; u64 prot = req->args[2] & (PROT_READ | PROT_WRITE | PROT_EXEC); const u64 flags = req->args[3]; const u64 fd = req->args[4]; const u64 offset = req->args[5]; const u64 map_type = flags & MAP_TYPE;
     const int file_backed = (flags & MAP_ANONYMOUS) == 0;
     if (len == 0) return reply(errno_inval(), 0); if (map_type != MAP_PRIVATE && map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE) return reply(errno_inval(), 0); if ((offset & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0); if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) return reply(errno_inval(), 0); if (file_backed && (!fd_valid(fd) || g_fds[fd].kind != FD_FILE)) return reply(errno_badf(), 0); prot = normalize_linux_prot(prot);
-    const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; const u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : g_mmap_next_va; const u64 map_prot = file_backed ? (prot | PROT_WRITE) : prot;
+    const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; const u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : g_mmap_next_va; const u64 map_prot = file_backed ? ((prot | PROT_WRITE) & ~PROT_EXEC) : prot;
+    g_prof.mmap_calls++;
+    g_prof.mmap_pages += page_count;
+    if (file_backed) {
+        g_prof.mmap_file_calls++;
+        g_prof.mmap_file_pages += page_count;
+        g_prof.mmap_file_bytes += len;
+    }
     if ((flags & MAP_FIXED_NOREPLACE) != 0 && vm_range_covered(target_va, size)) return reply(errno_exist(), 0);
     if ((flags & MAP_FIXED) != 0 && !unmap_tracked_target_range(target_va, size)) return reply(errno_nomem(), 0);
     const u64 map_status = map_target_pages_chunked(target_va, page_count, map_prot);
@@ -171,8 +178,17 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
             int fault = 0;
             (void)read_fd_at_to_target(&g_fds[fd], offset, target_va, len, &fault);
             if (fault) return reply(errno_fault(), 0);
+            if (map_prot != prot) {
+                const u64 protect_status = apply_target_pages(target_va, page_count, prot, protect_reply_target_pages);
+                if (protect_status != SYSCALL_OK) {
+                    user_log("LinuxAbiServer: mmap file-backed protect failed\n");
+                    user_log_hex_value(protect_status);
+                    return reply(errno_nomem(), 0);
+                }
+            }
         }
-        const u64 share_status = share_target_pages_to_thread_group(target_va, page_count, map_prot);
+        const u64 share_prot = file_backed ? prot : map_prot;
+        const u64 share_status = share_target_pages_to_thread_group(target_va, page_count, share_prot);
         if (share_status != SYSCALL_OK) {
             user_log("LinuxAbiServer: mmap thread-group share failed\n");
             user_log_hex_value(share_status);
@@ -195,6 +211,7 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     return reply(errno_nomem(), 0);
 }
 static struct ipc_message handle_brk(const struct trap_request *req) {
+    g_prof.brk_calls++;
     if (req->args[0] == 0) return reply(g_brk_next_va, 0);
     if (req->args[0] > g_brk_next_va) {
         u64 from = page_up(g_brk_next_va);
@@ -226,6 +243,8 @@ static struct ipc_message handle_mprotect(const struct trap_request *req) {
     if (len == 0) return reply(0, 0);
     if ((start & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0);
     const u64 size = page_up(len);
+    g_prof.mprotect_calls++;
+    g_prof.mprotect_pages += size / PAGE_BYTES;
     const int tracked = vm_range_covered(start, size);
     if (tracked && !vm_split_range_boundaries(start, size)) return reply(errno_nomem(), 0);
     const u64 status = apply_target_pages(start, size / PAGE_BYTES, prot, protect_reply_target_pages);

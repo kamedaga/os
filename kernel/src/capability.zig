@@ -144,7 +144,8 @@ pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     const pd_index = userPdIndexForVa(va) orelse return null;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
     const slot = findPtSlotForPd(space, pd_index) orelse return null;
-    const entry = space.pt_pages[slot][pt_index];
+    const pt_page: *const [512]u64 = &space.pt_pages[slot];
+    const entry = pt_page[pt_index];
     const is_user_mapping = (entry & runtime.page_present) != 0 and (entry & runtime.page_user) != 0;
     const paddr = entry & runtime.page_addr_mask;
     if (shouldLogLookupDiag(principal)) {
@@ -201,9 +202,10 @@ fn slotPtPa(space: *const UserAddressSpace, slot: usize) u64 {
 
 fn slotHasAnyMappedPaddr(space: *const UserAddressSpace, slot: usize) bool {
     if (slot >= UserAddressSpace.max_dynamic_pt_pages) return true;
+    const pt_page: *const [512]u64 = &space.pt_pages[slot];
     var i: usize = 0;
     while (i < runtime.page_entries) : (i += 1) {
-        if ((space.pt_pages[slot][i] & runtime.page_addr_mask) != 0) return true;
+        if ((pt_page[i] & runtime.page_addr_mask) != 0) return true;
     }
     return false;
 }
@@ -293,7 +295,8 @@ fn findPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
 
 fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde: u64) void {
     const page_ps: u64 = 1 << 7;
-    @memset(space.pt_pages[slot][0..], 0);
+    const pt_page: *[512]u64 = &space.pt_pages[slot];
+    @memset(pt_page[0..], 0);
     if ((existing_pde & runtime.page_present) == 0) return;
     if ((existing_pde & page_ps) == 0) {
         if ((existing_pde & runtime.page_user) != 0) return;
@@ -302,7 +305,7 @@ fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde:
         const src_pt: *const [512]u64 = @ptrFromInt(src_pt_addr);
         var copy_index: usize = 0;
         while (copy_index < runtime.page_entries) : (copy_index += 1) {
-            space.pt_pages[slot][copy_index] = src_pt[copy_index] & ~runtime.page_user;
+            pt_page[copy_index] = src_pt[copy_index] & ~runtime.page_user;
         }
         return;
     }
@@ -313,7 +316,7 @@ fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde:
     var pt_index: usize = 0;
     while (pt_index < runtime.page_entries) : (pt_index += 1) {
         const paddr = page_base + @as(u64, @intCast(pt_index)) * 4096;
-        space.pt_pages[slot][pt_index] = paddr | pte_flags;
+        pt_page[pt_index] = paddr | pte_flags;
     }
 }
 
@@ -470,7 +473,8 @@ pub fn mapUserPageFromCapability(
     clearAliasMappings(space, principal, paddr, map_slot, pt_index);
     if (diag) logMapMmioDiagPostAliasLoop(space, map_slot, pt_index);
 
-    space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
+    map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     if (diag) logMapMmioDiagPostPteWrite();
     runtime.flush_user_tlb_for_principal_va(principal, va);
     if (diag) logMapMmioDiagPostMap();
@@ -498,7 +502,8 @@ fn mapUserPageFromCapabilityNoAlias(
     if (!cap.rights.cpu_read) return false;
     if (writable and !cap.rights.cpu_write) return false;
 
-    space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
+    map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     runtime.flush_user_tlb_for_principal_va(principal, va);
     return true;
 }
@@ -572,7 +577,8 @@ pub fn mapFreshUserPage(
         runtime.serial_write("\n");
         return false;
     };
-    const old_entry = space.pt_pages[map_slot][pt_index];
+    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
+    const old_entry = map_pt_page[pt_index];
     if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) {
         runtime.serial_write("mapFreshUserPage fail: already_present proc=");
         runtime.serial_write(runtime.principal_label(principal));
@@ -588,7 +594,7 @@ pub fn mapFreshUserPage(
         return false;
     }
 
-    space.pt_pages[map_slot][pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     runtime.flush_user_tlb_for_principal_va(principal, va);
     return true;
 }
@@ -604,12 +610,13 @@ pub fn dropPresentForUserMappedPaddr(
     var slot: usize = 0;
     while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
         const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
+        const pt_page: *[512]u64 = &space.pt_pages[slot];
         var i: usize = 0;
         while (i < runtime.page_entries) : (i += 1) {
-            const entry = space.pt_pages[slot][i];
+            const entry = pt_page[i];
             if ((entry & runtime.page_addr_mask) != paddr) continue;
             if ((entry & runtime.page_present) == 0) continue;
-            space.pt_pages[slot][i] = entry & ~runtime.page_present;
+            pt_page[i] = entry & ~runtime.page_present;
             runtime.flush_user_tlb_for_principal_va(principal, aliasVaForPdPt(slot_pd_index, i));
             return true;
         }
@@ -627,9 +634,10 @@ noinline fn syncPageTableRightsScan(
     var slot: usize = 0;
     while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
         const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
+        const pt_page: *[512]u64 = &space.pt_pages[slot];
         var i: usize = 0;
         while (i < runtime.page_entries) : (i += 1) {
-            const old_entry = space.pt_pages[slot][i];
+            const old_entry = pt_page[i];
             const mapped_paddr = old_entry & runtime.page_addr_mask;
             if (mapped_paddr != paddr) continue;
 
@@ -643,7 +651,7 @@ noinline fn syncPageTableRightsScan(
             }
 
             if (new_entry == old_entry) continue;
-            space.pt_pages[slot][i] = new_entry;
+            pt_page[i] = new_entry;
             const va = aliasVaForPdPt(slot_pd_index, i);
             runtime.flush_user_tlb_for_principal_va(principal, va);
         }
@@ -659,9 +667,10 @@ pub fn principalHasMappedPaddr(principal: kernel.PrincipalId, paddr: u64) bool {
             continue;
         };
         _ = slot_pd_index;
+        const pt_page: *const [512]u64 = &space.pt_pages[slot];
         var i: usize = 0;
         while (i < runtime.page_entries) : (i += 1) {
-            const entry = space.pt_pages[slot][i];
+            const entry = pt_page[i];
             if ((entry & runtime.page_present) == 0) continue;
             if ((entry & runtime.page_addr_mask) == paddr) return true;
         }

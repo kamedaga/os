@@ -302,6 +302,7 @@ pub export fn restoreKernelInterruptFxState() callconv(.c) void {
 fn installInterruptTrampolines() void {
     x86_platform.installInterruptTrampolines(.{
         .syscall_stub = @intFromPtr(&traps.syscallHandlerStub),
+        .divide_error_stub = @intFromPtr(&traps.divideErrorHandlerStub),
         .page_fault_stub = @intFromPtr(&traps.pageFaultHandlerStub),
         .general_protection_stub = @intFromPtr(&traps.generalProtectionHandlerStub),
         .double_fault_stub = @intFromPtr(&traps.doubleFaultHandlerStub),
@@ -574,6 +575,19 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
 }
 
 fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) void {
+    kernel_log.write("USER fault principal=");
+    kernel_log.write(principalLabel(principal));
+    kernel_log.write(" thread=");
+    log_util.printNumber(@as(u64, @intCast(scheduler.currentThreadIndex())));
+    kernel_log.write(" cpu=");
+    log_util.printNumber(@as(u64, @intCast(scheduler.currentCpuSlot())));
+    kernel_log.write(" vector=");
+    log_util.printNumber(@as(u64, fault_vector));
+    kernel_log.write(" rip=");
+    kernel_log.writeHexRaw(out_frame.rip);
+    kernel_log.write(" rsp=");
+    kernel_log.writeHexRaw(out_frame.rsp);
+    kernel_log.write("\n");
     teardownFaultedProcess(principal, fault_vector);
     loadRunnableThreadOrIdle(out_frame);
 }
@@ -710,8 +724,6 @@ fn logSchedulerCpuTopology() void {
         serial.printNumber(info.handoff_validation_ticks);
         serial.writeRaw(" consumed=");
         serial.printNumber(info.handoff_consume_ticks);
-        serial.writeRaw(" snapshot=");
-        serial.printNumber(info.handoff_snapshot_ticks);
         serial.writeRaw(" user_entry=");
         serial.printNumber(info.handoff_user_entry_ticks);
         serial.writeRaw(" ap_timer=");
@@ -812,8 +824,8 @@ fn discoverDevices() DetectedDevices {
 // ---------------------------------------------------------------------------
 
 fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
-    const init_principal = state.createProcessDescriptor("bootseed") orelse
-        halt.haltWithMessage("bootseed process descriptor alloc failed");
+    const init_principal = state.createProcessDescriptor("seed2_boot") orelse
+        halt.haltWithMessage("seed2_boot process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
         halt.haltWithError("init bootstrap owner mark failed: ", err);
     };
@@ -910,7 +922,6 @@ const SchedulerApUserProbe = struct {
     disable_ok: bool = false,
     observed: bool = false,
     consumed: bool = false,
-    snapshotted: bool = false,
     preempted: bool = false,
     entered: bool = false,
     timer_saved: bool = false,
@@ -1055,9 +1066,6 @@ fn updateSchedulerApUserProbe(probe: *SchedulerApUserProbe) void {
     if (info.consumed_handoff_thread == probe.thread_index and info.current_thread == probe.thread_index and !info.is_idle) {
         probe.consumed = true;
     }
-    if (info.snapshot_handoff_thread == probe.thread_index and info.snapshot_cr3 != 0 and info.snapshot_rip != 0 and info.snapshot_rsp != 0) {
-        probe.snapshotted = true;
-    }
     if (probe.preempt_count != 0 and info.ap_preempt_from_thread == probe.thread_index and info.ap_preempt_to_thread == probe.next_thread_index) {
         probe.preempted = true;
     }
@@ -1096,8 +1104,6 @@ fn logSchedulerApUserProbe(probe: *const SchedulerApUserProbe) void {
     serial.printNumber(if (probe.observed) @as(u64, 1) else @as(u64, 0));
     serial.writeRaw(" consumed=");
     serial.printNumber(if (probe.consumed) @as(u64, 1) else @as(u64, 0));
-    serial.writeRaw(" snapshot=");
-    serial.printNumber(if (probe.snapshotted) @as(u64, 1) else @as(u64, 0));
     serial.writeRaw(" preempted=");
     serial.printNumber(if (probe.preempted) @as(u64, 1) else @as(u64, 0));
     serial.writeRaw(" entered=");
@@ -1180,11 +1186,6 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
         const info = scheduler.schedulerCpuInfo(target_cpu) orelse break :blk 0;
         break :blk info.handoff_consume_ticks;
     };
-    const before_snapshot_ticks = blk: {
-        const info = scheduler.schedulerCpuInfo(target_cpu) orelse break :blk 0;
-        break :blk info.handoff_snapshot_ticks;
-    };
-
     const enable_ok = scheduler.setApRunnablePolicyEnabled(true);
     const move_ok = enable_ok and scheduler.assignThreadToCpu(thread_index, target_cpu);
 
@@ -1192,7 +1193,6 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
     var handed_off = false;
     var validated = false;
     var consumed = false;
-    var snapshotted = false;
     var observed_next: ?usize = null;
     var observed_count: usize = 0;
     var handoff_thread: ?usize = null;
@@ -1200,14 +1200,6 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
     var validated_thread: ?usize = null;
     var validation_code: u8 = scheduler.handoff_validation_none;
     var consumed_thread: ?usize = null;
-    var snapshot_thread: ?usize = null;
-    var snapshot_cr3: u64 = 0;
-    var snapshot_fs_base: u64 = 0;
-    var snapshot_rip: u64 = 0;
-    var snapshot_rsp: u64 = 0;
-    var snapshot_rflags: u64 = 0;
-    var snapshot_cs: u64 = 0;
-    var snapshot_ss: u64 = 0;
     var target_current_thread: usize = scheduler.idle_thread_marker;
     var target_idle = true;
     if (move_ok) {
@@ -1221,14 +1213,6 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
                 validated_thread = info.validated_handoff_thread;
                 validation_code = info.handoff_validation_code;
                 consumed_thread = info.consumed_handoff_thread;
-                snapshot_thread = info.snapshot_handoff_thread;
-                snapshot_cr3 = info.snapshot_cr3;
-                snapshot_fs_base = info.snapshot_fs_base;
-                snapshot_rip = info.snapshot_rip;
-                snapshot_rsp = info.snapshot_rsp;
-                snapshot_rflags = info.snapshot_rflags;
-                snapshot_cs = info.snapshot_cs;
-                snapshot_ss = info.snapshot_ss;
                 target_current_thread = info.current_thread;
                 target_idle = info.is_idle;
                 if (info.observed_runnable_ticks != before_ticks and
@@ -1247,15 +1231,7 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
                 if (info.handoff_consume_ticks != before_consume_ticks and info.consumed_handoff_thread == thread_index and info.current_thread == thread_index and !info.is_idle) {
                     consumed = true;
                 }
-                if (info.handoff_snapshot_ticks != before_snapshot_ticks and
-                    info.snapshot_handoff_thread == thread_index and
-                    info.snapshot_cr3 != 0 and
-                    info.snapshot_rip != 0 and
-                    info.snapshot_rsp != 0)
-                {
-                    snapshotted = true;
-                }
-                if (observed and handed_off and validated and consumed and snapshotted) {
+                if (observed and handed_off and validated and consumed) {
                     break;
                 }
             }
@@ -1282,8 +1258,6 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
     serial.printNumber(if (validated) @as(u64, 1) else @as(u64, 0));
     serial.writeRaw(" consumed=");
     serial.printNumber(if (consumed) @as(u64, 1) else @as(u64, 0));
-    serial.writeRaw(" snapshot=");
-    serial.printNumber(if (snapshotted) @as(u64, 1) else @as(u64, 0));
     serial.writeRaw(" next=");
     if (observed_next) |thread| {
         serial.printNumber(thread);
@@ -1314,26 +1288,6 @@ fn runSchedulerApObserverProbe(thread_index: usize) void {
     } else {
         serial.writeRaw("none");
     }
-    serial.writeRaw(" snap_thread=");
-    if (snapshot_thread) |thread| {
-        serial.printNumber(thread);
-    } else {
-        serial.writeRaw("none");
-    }
-    serial.writeRaw(" snap_cr3=");
-    serial.writeHexRaw(snapshot_cr3);
-    serial.writeRaw(" snap_fs=");
-    serial.writeHexRaw(snapshot_fs_base);
-    serial.writeRaw(" snap_rip=");
-    serial.writeHexRaw(snapshot_rip);
-    serial.writeRaw(" snap_rsp=");
-    serial.writeHexRaw(snapshot_rsp);
-    serial.writeRaw(" snap_rflags=");
-    serial.writeHexRaw(snapshot_rflags);
-    serial.writeRaw(" snap_cs=");
-    serial.writeHexRaw(snapshot_cs);
-    serial.writeRaw(" snap_ss=");
-    serial.writeHexRaw(snapshot_ss);
     serial.writeRaw(" target_current=");
     serial.printNumber(target_current_thread);
     serial.writeRaw(" target_idle=");

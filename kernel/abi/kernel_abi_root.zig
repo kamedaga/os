@@ -11,4 +11,5 @@ pub const process_abi = @import("process_abi.zig");
 pub const process_builder_abi = @import("process_builder_abi.zig");
 pub const queue_abi = @import("queue_abi.zig");
 pub const service_registry_abi = @import("service_registry_abi.zig");
+pub const time_abi = @import("time_abi.zig");
 pub const trap_abi = @import("trap_abi.zig");

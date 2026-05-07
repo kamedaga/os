@@ -91,6 +91,8 @@ static int reap_exited_child_for_current(struct linux_process_state *proc, i64 p
     return 0;
 }
 
+static void log_wait_state_for_miss(u64 child_slot);
+
 static int satisfy_pending_waiters_for_child(u64 child_slot) {
     int satisfied = 0;
     for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
@@ -118,6 +120,7 @@ static int satisfy_pending_waiters_for_child(u64 child_slot) {
             break;
         }
     }
+    if (!satisfied) log_wait_state_for_miss(child_slot);
     return satisfied;
 }
 
@@ -129,6 +132,10 @@ static int add_child_slot(struct linux_process_state *proc, u64 child_slot) {
         return 1;
     }
     return 0;
+}
+
+static void log_wait_state_for_miss(u64 child_slot) {
+    (void)child_slot;
 }
 
 static int defer_trap_target_start(u64 child_slot) {
@@ -339,6 +346,12 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
     g_proc->wait_pending = 1;
     g_proc->wait_pid = pid;
     g_proc->wait_status_va = status_va;
-    detach_reply_token();
+    const u64 detach_status = detach_reply_token();
+    if (detach_status != SYSCALL_OK) {
+        g_proc->wait_pending = 0;
+        g_proc->wait_pid = 0;
+        g_proc->wait_status_va = 0;
+        return reply(errno_again(), 0);
+    }
     return wait_ipc();
 }

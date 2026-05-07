@@ -3,6 +3,17 @@ static u64 make_console_nonce(u64 request_paddr, u64 response_paddr, u64 endpoin
     return nonce == 0 ? 1 : nonce;
 }
 
+static u64 g_console_read_diag_count = 0;
+
+static void log_console_read_diag(const char *reason, u64 detail) {
+    if (g_console_read_diag_count >= 16) return;
+    g_console_read_diag_count++;
+    user_log("LinuxAbiServer: console read ");
+    user_log(reason);
+    user_log(" detail=");
+    user_log_hex_value(detail);
+}
+
 static int install_console_endpoint(void) {
     if (g_console.endpoint_id == 0 || g_console.process_slot == 0) return 0;
     return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_console.endpoint_id, g_console.process_slot) == SYSCALL_OK;
@@ -152,22 +163,35 @@ static u64 console_write_from_target(u64 src, u64 len, int *fault) {
 
 static u64 console_read_to_target(u64 dst, u64 len, int *fault) {
     *fault = 0;
-    if (!g_console.active) return errno_io();
+    if (!g_console.active) {
+        log_console_read_diag("inactive", len);
+        return errno_io();
+    }
     if (len == 0) return 0;
     const u32 request_len = (u32)min_u64(len, CONSOLE_RESPONSE_PAYLOAD_BYTES);
     for (;;) {
         u64 seq = 0;
-        if (!console_begin_request(CONSOLE_OP_READ, request_len, 0, 0, &seq)) return errno_io();
-        if (!wait_console_response(seq, CONSOLE_OP_READ, 0)) return errno_io();
+        if (!console_begin_request(CONSOLE_OP_READ, request_len, 0, 0, &seq)) {
+            log_console_read_diag("begin-failed", request_len);
+            return errno_io();
+        }
+        if (!wait_console_response(seq, CONSOLE_OP_READ, 0)) {
+            log_console_read_diag("wait-failed", seq);
+            return errno_io();
+        }
         volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
         if (response->status == CONSOLE_STATUS_AGAIN) {
             (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
             continue;
         }
-        if (response->status != CONSOLE_STATUS_OK) return errno_io();
+        if (response->status != CONSOLE_STATUS_OK) {
+            log_console_read_diag("status", response->status);
+            return errno_io();
+        }
         const u64 n = min_u64(response->inline_bytes, request_len);
         if (n == 0) continue;
         if (copy_to_target(dst, (const void *)(CONSOLE_RESPONSE_VA + CONSOLE_RESPONSE_HEADER_BYTES), n) != n) {
+            log_console_read_diag("copy-failed", n);
             *fault = 1;
             return 0;
         }

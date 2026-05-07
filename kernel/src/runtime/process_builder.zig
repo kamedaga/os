@@ -260,8 +260,8 @@ pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     const slot = processSlot(target) orelse return boot_static.syscall_err_invalid;
     const ap_placement_block = scheduler.spawnExecApUserSchedulingBlockReason();
     state_ptr.clearProcessBuilderSuspended(target) catch return boot_static.syscall_err_invalid;
-    if (!scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
-    const ap_placed_cpu = scheduler.assignReadyUserThreadToApIfReady(thread_index);
+    const ap_placed_cpu = scheduler.readySpawnExecThreadOnApIfReady(thread_index);
+    if (ap_placed_cpu == null and !scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
     if (scheduler.spawnExecApUserSchedulingEnabled()) {
         kernel_log.write("process_builder start child=");
         log_util.printNumber(slot);
@@ -287,7 +287,6 @@ fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void 
         .ap_user_policy_disabled => kernel_log.write("blocked:ap_user_policy_disabled"),
         .no_ap => kernel_log.write("blocked:no_ap"),
         .bootstrap_path => kernel_log.write("blocked:bootstrap_path"),
-        .ap_syscall_global_state_not_per_cpu => kernel_log.write("blocked:ap_syscall_global_state_not_per_cpu"),
     }
 }
 

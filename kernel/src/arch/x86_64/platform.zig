@@ -18,6 +18,7 @@ pub const ring0_stack_bytes: usize = stack_region_bytes - (2 * guard_page_bytes)
 pub const ist_stack_bytes: usize = 2 * 1024 * 1024;
 const ap_ring0_stack_bytes: usize = 2 * 1024 * 1024;
 const ap_ist_stack_bytes: usize = 256 * 1024;
+const runtime_identity_split_pt_count: usize = 256;
 pub const phys_copy_window_va: u64 = (@as(u64, @intCast(high_mmio_pml4_index)) << 39);
 
 pub const gdt_kernel_code_selector: u16 = 0x08;
@@ -59,6 +60,7 @@ const Tss = packed struct {
 
 pub const TrapTargets = struct {
     syscall_stub: usize,
+    divide_error_stub: usize,
     page_fault_stub: usize,
     general_protection_stub: usize,
     double_fault_stub: usize,
@@ -98,8 +100,11 @@ var ap_df_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(4096) = [_][ap_
 var ring0_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var pf_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var df_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
+var runtime_identity_split_pts: [runtime_identity_split_pt_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** runtime_identity_split_pt_count;
+var runtime_identity_split_pt_used: usize = 0;
 var tss_tables: [max_cpus]Tss = [_]Tss{std.mem.zeroes(Tss)} ** max_cpus;
 var int80_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var de_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var pf_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var gp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var df_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
@@ -109,6 +114,7 @@ var np_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var ss_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var timer_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var int80_trampoline_entry: usize = 0;
+var de_trampoline_entry: usize = 0;
 var pf_trampoline_entry: usize = 0;
 var gp_trampoline_entry: usize = 0;
 var df_trampoline_entry: usize = 0;
@@ -149,8 +155,11 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ring0_stack_guard_pt), &ring0_stack_guard_pt));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_ist_stack_guard_pt), &pf_ist_stack_guard_pt));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_ist_stack_guard_pt), &df_ist_stack_guard_pt));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pts), &runtime_identity_split_pts));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tss_tables), &tss_tables));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(int80_trampoline_page), &int80_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_page), &de_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_page), &df_trampoline_page));
@@ -160,6 +169,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(int80_trampoline_entry), &int80_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_entry), &df_trampoline_entry));
@@ -240,7 +250,11 @@ pub fn cr3AddressPart(value: u64) u64 {
 pub fn cr3WithUserPcid(raw_cr3: u64, pcid: u16) u64 {
     const raw = cr3AddressPart(raw_cr3);
     if (pcid_enabled == 0 or pcid == 0) return raw;
-    return raw | (@as(u64, pcid) & 0xfff) | cr3_no_flush;
+    // Process slots and their PCIDs are reused aggressively during exec/spawn
+    // tests. Until we have generation-based INVPCID/TLB shootdown, switching
+    // with CR3.NOFLUSH can let APs observe stale translations for a newly
+    // rebuilt address space.
+    return raw | (@as(u64, pcid) & 0xfff);
 }
 
 fn readMsr(msr: u32) u64 {
@@ -321,6 +335,7 @@ fn buildCr3SwitchTrampoline(page: *[4096]u8, target: usize) usize {
 
 pub fn installInterruptTrampolines(targets: TrapTargets) void {
     int80_trampoline_entry = buildCr3SwitchTrampoline(&int80_trampoline_page, targets.syscall_stub);
+    de_trampoline_entry = buildCr3SwitchTrampoline(&de_trampoline_page, targets.divide_error_stub);
     pf_trampoline_entry = buildCr3SwitchTrampoline(&pf_trampoline_page, targets.page_fault_stub);
     gp_trampoline_entry = buildCr3SwitchTrampoline(&gp_trampoline_page, targets.general_protection_stub);
     df_trampoline_entry = buildCr3SwitchTrampoline(&df_trampoline_page, targets.double_fault_stub);
@@ -330,6 +345,7 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     ss_trampoline_entry = buildCr3SwitchTrampoline(&ss_trampoline_page, targets.stack_segment_fault_stub);
     timer_trampoline_entry = buildCr3SwitchTrampoline(&timer_trampoline_page, targets.timer_interrupt_stub);
     interrupts.clearIdt(&idt);
+    interrupts.setIdtEntry(&idt, 0, gdt_kernel_code_selector, de_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, 6, gdt_kernel_code_selector, ud_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, 10, gdt_kernel_code_selector, ts_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, 11, gdt_kernel_code_selector, np_trampoline_entry, 0x8E);
@@ -494,6 +510,24 @@ fn installGuardedIdentityStackRegion(region: []u8, usable_bytes: usize, pt_table
     return true;
 }
 
+fn splitLargeKernelIdentityPage(pd_entry: *u64) bool {
+    if ((pd_entry.* & page_present) == 0) return false;
+    if ((pd_entry.* & page_ps) == 0) return true;
+    if (runtime_identity_split_pt_used >= runtime_identity_split_pts.len) return false;
+    const pt = &runtime_identity_split_pts[runtime_identity_split_pt_used];
+    runtime_identity_split_pt_used += 1;
+
+    const large_base = pd_entry.* & ~@as(u64, 0x1F_FFFF);
+    const pte_flags = (pd_entry.* & 0xFFF) & ~page_ps;
+    var page_index: usize = 0;
+    while (page_index < page_entries) : (page_index += 1) {
+        const page_base = large_base + (@as(u64, @intCast(page_index)) * 4096);
+        pt[page_index] = page_base | pte_flags;
+    }
+    pd_entry.* = @intFromPtr(pt) | pte_flags;
+    return true;
+}
+
 fn mapKernelIdentityPage(page_base: u64) bool {
     if ((page_base & 0xFFF) != 0) return false;
     const pml4_index: usize = @intCast((page_base >> 39) & 0x1FF);
@@ -504,7 +538,7 @@ fn mapKernelIdentityPage(page_base: u64) bool {
 
     const pd_entry = &pd_tables[pdp_index][pd_index];
     if ((pd_entry.* & page_present) == 0) return false;
-    if ((pd_entry.* & page_ps) != 0) return true;
+    if ((pd_entry.* & page_ps) != 0 and !splitLargeKernelIdentityPage(pd_entry)) return false;
 
     const pt: *[page_entries]u64 = @ptrFromInt(pd_entry.* & page_addr_mask);
     pt[pt_index] = page_base | page_present | page_rw;
@@ -532,6 +566,31 @@ fn mapPerCpuKernelStorage() bool {
     if (!mapKernelIdentityRange(@intFromPtr(&ap_ring0_stacks), @sizeOf(@TypeOf(ap_ring0_stacks)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ap_pf_ist_stacks), @sizeOf(@TypeOf(ap_pf_ist_stacks)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ap_df_ist_stacks), @sizeOf(@TypeOf(ap_df_ist_stacks)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&runtime_identity_split_pts), @sizeOf(@TypeOf(runtime_identity_split_pts)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&runtime_identity_split_pt_used), @sizeOf(@TypeOf(runtime_identity_split_pt_used)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&int80_trampoline_page), @sizeOf(@TypeOf(int80_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&pf_trampoline_page), @sizeOf(@TypeOf(pf_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&gp_trampoline_page), @sizeOf(@TypeOf(gp_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&df_trampoline_page), @sizeOf(@TypeOf(df_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ud_trampoline_page), @sizeOf(@TypeOf(ud_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ts_trampoline_page), @sizeOf(@TypeOf(ts_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&np_trampoline_page), @sizeOf(@TypeOf(np_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ss_trampoline_page), @sizeOf(@TypeOf(ss_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&timer_trampoline_page), @sizeOf(@TypeOf(timer_trampoline_page)))) return false;
+    return true;
+}
+
+pub fn mapCpuRuntimeStacks(cpu_slot: usize) bool {
+    if (cpu_slot >= max_cpus) return false;
+    if (cpu_slot == 0) {
+        if (!mapKernelIdentityRange(stackBottom(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes), ring0_stack_bytes)) return false;
+        if (!mapKernelIdentityRange(stackBottom(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes), ist_stack_bytes)) return false;
+        if (!mapKernelIdentityRange(stackBottom(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes), ist_stack_bytes)) return false;
+        return true;
+    }
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_ring0_stacks[cpu_slot - 1]), ap_ring0_stack_bytes)) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_pf_ist_stacks[cpu_slot - 1]), ap_ist_stack_bytes)) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_df_ist_stacks[cpu_slot - 1]), ap_ist_stack_bytes)) return false;
     return true;
 }
 

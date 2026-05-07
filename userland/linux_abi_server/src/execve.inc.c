@@ -1,6 +1,96 @@
 #define LINUX_ABI_EXECVE_PROFILE 0
 
+static int path_has_prefix(const char *path, const char *prefix) {
+    u64 i = 0;
+    while (prefix[i] != 0) {
+        if (path[i] != prefix[i]) return 0;
+        i++;
+    }
+    return 1;
+}
+
+static int cacheable_readonly_path(const char *path) {
+    return path_has_prefix(path, "/lib/") ||
+        path_has_prefix(path, "/bin/") ||
+        path_has_prefix(path, "/cmd/") ||
+        path_has_prefix(path, "/sbin/");
+}
+
+static void profile_fs_read_path(const struct fd_entry *fd, u64 bytes) {
+    if (bytes == 0) return;
+    g_prof.fs_read_bytes += bytes;
+    if (fd->path_len == 0) return;
+    if (path_has_prefix(fd->path, "/cmd/") || path_has_prefix(fd->path, "/bin/") || path_has_prefix(fd->path, "/sbin/")) {
+        g_prof.fs_read_cmd_bytes += bytes;
+    } else if (path_has_prefix(fd->path, "/lib/")) {
+        g_prof.fs_read_lib_bytes += bytes;
+    } else if (path_has_prefix(fd->path, "/tmp/")) {
+        g_prof.fs_read_tmp_bytes += bytes;
+    } else if (path_has_prefix(fd->path, "/proc/")) {
+        g_prof.fs_read_proc_bytes += bytes;
+    }
+}
+
+static int cache_path_matches(const char *cached, u16 cached_len, const char *path, u64 path_len) {
+    if (cached_len != path_len) return 0;
+    for (u64 i = 0; i < path_len; i++) {
+        if (cached[i] != path[i]) return 0;
+    }
+    return cached[path_len] == 0;
+}
+
+static void copy_path_to_cache(char *dst, u16 *dst_len, const char *path, u64 path_len) {
+    if (path_len > FS_MAX_PATH_BYTES) path_len = FS_MAX_PATH_BYTES;
+    *dst_len = (u16)path_len;
+    for (u64 i = 0; i < path_len; i++) dst[i] = path[i];
+    dst[path_len] = 0;
+}
+
+static struct path_cache_entry *path_cache_find(const char *path) {
+    const u64 path_len = cstr_len(path);
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (!g_path_cache[i].used) continue;
+        if (cache_path_matches(g_path_cache[i].path, g_path_cache[i].path_len, path, path_len)) return &g_path_cache[i];
+    }
+    return 0;
+}
+
+static void path_cache_store(const char *path, u64 token, const struct fs_stat_record *stat, u64 size, u8 kind) {
+    if (!cacheable_readonly_path(path)) return;
+    const u64 path_len = cstr_len(path);
+    if (path_len == 0 || path_len > FS_MAX_PATH_BYTES) return;
+    u64 slot = FILE_CACHE_MAX;
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (!g_path_cache[i].used) { slot = i; break; }
+    }
+    if (slot == FILE_CACHE_MAX) slot = token % FILE_CACHE_MAX;
+    g_path_cache[slot].used = 1;
+    g_path_cache[slot].kind = kind;
+    g_path_cache[slot].token = token;
+    g_path_cache[slot].size = size;
+    g_path_cache[slot].stat = *stat;
+    copy_path_to_cache(g_path_cache[slot].path, &g_path_cache[slot].path_len, path, path_len);
+}
+
+static void path_cache_invalidate(const char *path) {
+    const u64 path_len = cstr_len(path);
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (g_path_cache[i].used && cache_path_matches(g_path_cache[i].path, g_path_cache[i].path_len, path, path_len)) g_path_cache[i].used = 0;
+        if (g_file_cache[i].used && cache_path_matches(g_file_cache[i].path, g_file_cache[i].path_len, path, path_len)) g_file_cache[i].used = 0;
+    }
+}
+
 static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_record *stat_out, u64 *file_bytes_out, u8 *kind_out) {
+    struct path_cache_entry *cached = path_cache_find(path);
+    if (cached != 0) {
+        g_prof.path_cache_hits++;
+        *token_out = cached->token;
+        *stat_out = cached->stat;
+        *file_bytes_out = cached->size;
+        *kind_out = cached->kind;
+        return 1;
+    }
+    g_prof.path_cache_misses++;
     if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) { user_log("LinuxAbiServer: lookup request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
@@ -14,6 +104,7 @@ static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_reco
         const u64 file_bytes = record->size_bytes != 0 ? record->size_bytes : lookup_file_bytes;
         token_out[0] = token; stat_out->object_kind = record->object_kind; stat_out->size_bytes = file_bytes; stat_out->mode_bits = record->mode_bits; stat_out->mtime_unix_sec = record->mtime_unix_sec;
         *file_bytes_out = file_bytes; *kind_out = response->object_kind != FS_OBJECT_NONE ? response->object_kind : record->object_kind;
+        path_cache_store(path, token, stat_out, file_bytes, *kind_out);
         return 1;
     }
     if (response->status != FS_STATUS_OK || lookup_kind == FS_OBJECT_NONE) { user_log("LinuxAbiServer: stat status failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }
@@ -24,18 +115,16 @@ static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_reco
     stat_out->mtime_unix_sec = 0;
     *file_bytes_out = lookup_file_bytes;
     *kind_out = lookup_kind;
+    path_cache_store(path, token, stat_out, lookup_file_bytes, lookup_kind);
     return 1;
 }
 
 static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_bytes_out) {
-    if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-    if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
-    const u8 kind = response->object_kind;
+    struct fs_stat_record rec;
+    u8 kind = FS_OBJECT_NONE;
+    if (!vfs_lookup_stat(path, token_out, &rec, file_bytes_out, &kind)) return 0;
     if (kind != FS_OBJECT_FILE) return 0;
-    *token_out = response->result_token;
-    *file_bytes_out = response->file_bytes;
-    return response->file_bytes != 0;
+    return *file_bytes_out != 0;
 }
 
 static int is_vm_object_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG && (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
@@ -56,6 +145,93 @@ static int alloc_map_range_self(u64 base_va, u64 page_count, u64 writable) {
         done += chunk;
     }
     return 1;
+}
+
+static struct file_cache_entry *file_cache_find_by_path(const char *path) {
+    const u64 path_len = cstr_len(path);
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (!g_file_cache[i].used) continue;
+        if (cache_path_matches(g_file_cache[i].path, g_file_cache[i].path_len, path, path_len)) return &g_file_cache[i];
+    }
+    return 0;
+}
+
+static int file_cache_alloc_buffer(u64 size, u64 *buffer_va_out) {
+    const u64 aligned = align_up(size, PAGE_BYTES);
+    if (aligned == 0 || aligned > FILE_CACHE_BYTES || g_file_cache_next_offset + aligned > FILE_CACHE_BYTES) return 0;
+    const u64 va = FILE_CACHE_BASE_VA + g_file_cache_next_offset;
+    if (!alloc_map_range_self(va, aligned / PAGE_BYTES, 1)) return 0;
+    g_file_cache_next_offset += aligned;
+    *buffer_va_out = va;
+    return 1;
+}
+
+static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *fd) {
+    if (fd->path_len == 0 || !cacheable_readonly_path(fd->path) || fd->size == 0) return 0;
+    struct file_cache_entry *cached = file_cache_find_by_path(fd->path);
+    if (cached != 0) {
+        g_prof.file_cache_hits++;
+        return cached;
+    }
+    g_prof.file_cache_misses++;
+
+    u64 slot = FILE_CACHE_MAX;
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (!g_file_cache[i].used) { slot = i; break; }
+    }
+    if (slot == FILE_CACHE_MAX) return 0;
+
+    u64 buffer_va = 0;
+    const u64 saved_cache_offset = g_file_cache_next_offset;
+    if (!file_cache_alloc_buffer(fd->size, &buffer_va)) return 0;
+    u64 copied = 0;
+    while (copied < fd->size) {
+        u64 chunk = min_u64(fd->size - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        if (!vfs_request(FS_OP_READ, fd->token, copied, (u32)chunk, 0)) break;
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        if (response->status != FS_STATUS_OK || response->inline_bytes == 0) break;
+        volatile u8 *src = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
+        u8 *dst = (u8 *)(buffer_va + copied);
+        for (u64 i = 0; i < response->inline_bytes; i++) dst[i] = src[i];
+        copied += response->inline_bytes;
+        if (response->inline_bytes < chunk) break;
+    }
+    if (copied != fd->size) {
+        g_file_cache_next_offset = saved_cache_offset;
+        return 0;
+    }
+
+    g_file_cache[slot].used = 1;
+    g_file_cache[slot].kind = fd->object_kind;
+    g_file_cache[slot].token = fd->token;
+    g_file_cache[slot].size = fd->size;
+    g_file_cache[slot].buffer_va = buffer_va;
+    g_file_cache[slot].stat.object_kind = fd->object_kind;
+    g_file_cache[slot].stat.size_bytes = fd->size;
+    g_file_cache[slot].stat.mode_bits = fd->mode_bits;
+    g_file_cache[slot].stat.mtime_unix_sec = 0;
+    copy_path_to_cache(g_file_cache[slot].path, &g_file_cache[slot].path_len, fd->path, fd->path_len);
+    g_prof.file_cache_fill_bytes += fd->size;
+    return &g_file_cache[slot];
+}
+
+static u64 file_cache_read_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 len, int *fault) {
+    *fault = 0;
+    struct file_cache_entry *cached = file_cache_fill_from_fd(fd);
+    if (cached == 0) return 0;
+    if (file_offset >= cached->size) return 0;
+    u64 n = min_u64(len, cached->size - file_offset);
+    u64 copied = 0;
+    while (copied < n) {
+        const u64 chunk = min_u64(n - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        if (copy_to_target(dst + copied, (const void *)(cached->buffer_va + file_offset + copied), chunk) != chunk) {
+            *fault = 1;
+            return copied;
+        }
+        copied += chunk;
+    }
+    profile_fs_read_path(fd, n);
+    return n;
 }
 
 static int ensure_execve_scratch(void) {
@@ -130,6 +306,7 @@ static void invalidate_exec_cache(void) {
 }
 
 static void invalidate_exec_cache_for_path(const char *path) {
+    path_cache_invalidate(path);
     if (g_cached_exec_vm_token == 0) return;
     if (exec_cache_path_matches(path, cstr_len(path))) invalidate_exec_cache();
 }
@@ -318,6 +495,10 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     char path[256];
     if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
     if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
+    profile_clear();
+    g_exec_path_len = (u16)cstr_len(path);
+    for (u16 i = 0; i < g_exec_path_len; i++) g_exec_path[i] = path[i];
+    g_exec_path[g_exec_path_len] = 0;
     const u64 old_principal = req->caller_principal;
     u64 spawned_principal = 0;
     if (!spawn_exec_loader_for_execve(req->caller_principal, path, req->args[1], req->args[2], &spawned_principal)) return reply(errno_io(), 0);

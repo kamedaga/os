@@ -16,14 +16,8 @@ MILESTONES = [
     ("collectMemoryStats begin", (r"\[stage\] collectMemoryStats begin",)),
     ("collectMemoryStats got map", (r"\[stage\] collectMemoryStats got map",)),
     ("USER_PAGE_READY", (r"^USER_PAGE_READY$",)),
-    ("boot manifest ok", (r"boot manifest ok",)),
-    ("seed exec ready", (r"seed exec ready",)),
-    ("manager bootstrap table ready", (r"manager bootstrap table ready",)),
-    ("spawn_exec seed", (r"spawn_exec ready child=1 thread=1",)),
-    ("seed spawn returned", (r"seed spawn returned",)),
-    ("manager grants begin", (r"manager grants begin",)),
-    ("manager grants ready", (r"manager grants ready",)),
-    ("seed slot", (r"seed slot=1",)),
+    ("seed2_boot started", (r"\[seed2_boot\] started",)),
+    ("seed2_boot bootfs ready", (r"\[seed2_boot\] bootfs ready",)),
     ("VirtioBlk started", (r"VirtioBlk: started",)),
     ("VirtioBlk queue ready", (r"VirtioBlk: queue ready",)),
     ("VirtioBlk connect request", (r"VirtioBlk: connect request",)),
@@ -31,62 +25,13 @@ MILESTONES = [
     ("RootVfs endpoint ready", (r"RootVfs: endpoint ready",)),
     ("ExecService endpoint ready", (r"ExecService: endpoint ready",)),
     ("LinuxAbiServer started", (r"LinuxAbiServer: started",)),
-    ("AP Linux child CPU1", (r"process_builder start child=.*sched_ap_place=1 assigned_cpu=1",)),
-    ("AP Linux child CPU2", (r"process_builder start child=.*sched_ap_place=2 assigned_cpu=2",)),
-    ("AP Linux child CPU3", (r"process_builder start child=.*sched_ap_place=3 assigned_cpu=3",)),
-    ("dash basic-ok", (r"basic-ok",)),
-    ("busybox-cat-ok", (r"busybox-cat-ok",)),
-    ("busybox-fat-cat-ok", (r"busybox-fat-cat-ok",)),
-    ("busybox-true-ok", (r"busybox-true-ok",)),
-    ("busybox-false-ok", (r"busybox-false-ok",)),
-    ("musl futex ok", (r"musl_smoke: futex ok",)),
-    ("musl clone invalid flags ok", (r"musl_smoke: clone invalid flags ok",)),
-    ("musl thread group ok", (r"musl_smoke: thread group ok",)),
-    ("LinuxAbiServer clear_child_tid wake", (r"LinuxAbiServer: clear_child_tid wake",)),
-    ("musl clear-child-tid join ok", (r"musl_smoke: clear-child-tid join ok",)),
-    ("musl pthread ok", (r"musl_smoke: pthread ok",)),
-    ("musl 4 pthreads joined", (r"musl_smoke: 4 pthreads joined",)),
-    ("musl 4 pthreads ok", (r"musl_smoke: 4 pthreads ok",)),
-    ("musl-smoke-ok", (r"musl-smoke-ok",)),
-    ("four-pthread-ok", (r"four-pthread-ok",)),
-    ("musl exit_group child waiting", (r"musl_smoke: exit_group child waiting",)),
-    ("musl exit_group running child ready", (r"musl_smoke: exit_group running child ready",)),
-    ("LinuxAbiServer exit_group teardown thread", (r"LinuxAbiServer: exit_group teardown thread",)),
-    ("exit-group-ok", (r"exit-group-ok",)),
-    ("zstd-version-ok", (r"zstd-version-ok",)),
-    ("zstd-compress-ok", (r"zstd-compress-ok",)),
-    ("zstd-decompress-ok", (r"zstd-decompress-ok",)),
-    ("zstd-roundtrip-ok", (r"zstd-roundtrip-ok",)),
-    ("pipe-ok", (r"pipe-ok",)),
-    ("dash-smoke-done", (r"dash-smoke-done",)),
-    ("LinuxAbiServer companion exit", (r"LinuxAbiServer: companion exit",)),
-    ("ExecClient child done", (r"ExecClient: child done",)),
+    ("DashShim dash spawned", (r"DashShim: dash spawned", r"ExecService: spawn ok")),
 ]
 
 REQUIRED_MILESTONES = {
-    "busybox-cat-ok",
-    "busybox-fat-cat-ok",
-    "busybox-true-ok",
-    "busybox-false-ok",
-    "musl futex ok",
-    "musl clone invalid flags ok",
-    "musl thread group ok",
-    "LinuxAbiServer clear_child_tid wake",
-    "musl clear-child-tid join ok",
-    "musl 4 pthreads ok",
-    "musl-smoke-ok",
-    "four-pthread-ok",
-    "musl exit_group child waiting",
-    "musl exit_group running child ready",
-    "LinuxAbiServer exit_group teardown thread",
-    "exit-group-ok",
-    "zstd-version-ok",
-    "zstd-compress-ok",
-    "zstd-decompress-ok",
-    "zstd-roundtrip-ok",
-    "pipe-ok",
-    "dash-smoke-done",
-    "ExecClient child done",
+    "ExecService endpoint ready",
+    "LinuxAbiServer started",
+    "DashShim dash spawned",
 }
 
 
@@ -110,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="return non-zero when the AP Linux smoke milestones are incomplete",
+        help="return non-zero when the interactive boot milestones are incomplete",
     )
     return parser.parse_args()
 
@@ -155,17 +100,17 @@ def main() -> int:
         if label in REQUIRED_MILESTONES and label not in found
     ]
     if missing_required:
-        print("missing required AP Linux smoke milestones:")
+        print("missing required interactive boot milestones:")
         for label in missing_required:
             print(f"  {label}")
     else:
-        print("AP Linux smoke complete")
+        print("interactive boot complete")
 
-    end = found.get("ExecClient child done")
+    end = found.get("DashShim dash spawned")
     start = found.get("BdsDxe loading")
     if start and end:
         total_ms = end[0] - start[0]
-        print(f"total to ExecClient child done: {total_ms:.3f} ms")
+        print(f"total to interactive shell spawned: {total_ms:.3f} ms")
 
     if args.check and missing_required:
         return 2

@@ -11,7 +11,9 @@ static int connect_vfs_from_registry(void) {
     const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_vfs.session_nonce = make_nonce(g_vfs.request_paddr, g_vfs.response_paddr, g_vfs.endpoint_id, self_slot);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
-    request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = FS_OP_CONNECT; request->request_seq = 1; request->arg0 = g_vfs.response_paddr; request->arg1 = self_slot; request->session_nonce = g_vfs.session_nonce;
+    request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = FS_OP_CONNECT; request->arg0 = g_vfs.response_paddr; request->arg1 = self_slot; request->session_nonce = g_vfs.session_nonce;
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = 1;
     if (!share_vfs_request_page()) return 0;
     if (!wait_vfs_response(1, FS_OP_CONNECT)) return 0;
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
@@ -24,10 +26,17 @@ static int connect_vfs_from_registry(void) {
 static int vfs_request_full(u16 op, u64 token, u64 offset, u32 length, u32 flags, const char *path, u64 inline_src, u16 inline_bytes) {
     if (!g_vfs.active) return 0;
     if (inline_bytes > PAGE_BYTES - FS_REQUEST_HEADER_BYTES) return 0;
+    g_prof.vfs_requests++;
+    if (op < FS_PROFILE_OP_COUNT) g_prof.vfs_op_counts[op]++;
+    if (op == FS_OP_READ) g_prof.vfs_read_request_bytes += length;
+    if (op == FS_OP_WRITE) {
+        g_prof.vfs_write_request_bytes += length;
+        g_prof.vfs_inline_write_bytes += inline_bytes;
+    }
     clear_page(VFS_REQUEST_VA); clear_page(VFS_RESPONSE_VA);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
     const u64 seq = g_vfs.next_seq++;
-    request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = op; request->request_seq = seq; request->object_token = token; request->offset = offset; request->length = length; request->flags = flags; request->session_nonce = g_vfs.session_nonce;
+    request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = op; request->object_token = token; request->offset = offset; request->length = length; request->flags = flags; request->session_nonce = g_vfs.session_nonce;
     u16 path_len = 0;
     if (path != 0) {
         u64 len = cstr_len(path);
@@ -43,6 +52,8 @@ static int vfs_request_full(u16 op, u64 token, u64 offset, u32 length, u32 flags
         volatile u8 *payload = (volatile u8 *)((u64)VFS_REQUEST_VA + FS_REQUEST_HEADER_BYTES + path_len);
         if (copy_from_target(inline_src, (void *)payload, inline_bytes) != inline_bytes) return 0;
     }
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
     if (!signal_vfs()) return 0;
     return wait_vfs_response(seq, op);
 }
@@ -54,6 +65,33 @@ static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *pa
 static int vfs_create_path(const char *path, int truncate_existing) {
     const u32 flags = truncate_existing ? FS_CREATE_FLAG_TRUNCATE : 0;
     return vfs_request_full(FS_OP_CREATE, g_vfs.root_token, 0, 0, flags, path, 0, 0);
+}
+
+static int vfs_rename_paths(const char *old_path, const char *new_path) {
+    if (!g_vfs.active) return 0;
+    const u64 old_len = cstr_len(old_path);
+    const u64 new_len = cstr_len(new_path);
+    if (old_len == 0 || new_len == 0 || old_len > FS_MAX_PATH_BYTES || new_len > FS_MAX_PATH_BYTES) return 0;
+    if (old_len + new_len > PAGE_BYTES - FS_REQUEST_HEADER_BYTES) return 0;
+    g_prof.vfs_requests++;
+    if (FS_OP_RENAME < FS_PROFILE_OP_COUNT) g_prof.vfs_op_counts[FS_OP_RENAME]++;
+    clear_page(VFS_REQUEST_VA); clear_page(VFS_RESPONSE_VA);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
+    const u64 seq = g_vfs.next_seq++;
+    request->magic = FS_REQUEST_MAGIC;
+    request->version = FS_PROTOCOL_VERSION;
+    request->op = FS_OP_RENAME;
+    request->object_token = g_vfs.root_token;
+    request->path_bytes = (u16)old_len;
+    request->inline_bytes = (u16)new_len;
+    request->session_nonce = g_vfs.session_nonce;
+    volatile u8 *payload = (volatile u8 *)(VFS_REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+    for (u64 i = 0; i < old_len; i++) payload[i] = (u8)old_path[i];
+    for (u64 i = 0; i < new_len; i++) payload[old_len + i] = (u8)new_path[i];
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    if (!signal_vfs()) return 0;
+    return wait_vfs_response(seq, FS_OP_RENAME);
 }
 
 static u64 vfs_write_from_target(u64 token, u64 offset, u64 src, u64 len, int *fault) {

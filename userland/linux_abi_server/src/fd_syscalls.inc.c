@@ -1,14 +1,6 @@
 static int fd_clone_into(u64 dst, u64 src) {
     if (!fd_valid(src) || dst >= 32) return 0;
-    g_fds[dst].kind = g_fds[src].kind;
-    g_fds[dst].token = g_fds[src].token;
-    g_fds[dst].offset = g_fds[src].offset;
-    g_fds[dst].size = g_fds[src].size;
-    g_fds[dst].mode_bits = g_fds[src].mode_bits;
-    g_fds[dst].object_kind = g_fds[src].object_kind;
-    g_fds[dst].pipe_id = g_fds[src].pipe_id;
-    g_fds[dst].path_len = g_fds[src].path_len;
-    for (u16 i = 0; i <= g_fds[src].path_len && i <= FS_MAX_PATH_BYTES; i++) g_fds[dst].path[i] = g_fds[src].path[i];
+    copy_fd_entry(&g_fds[dst], &g_fds[src]);
     pipe_ref_fd(&g_fds[dst]);
     sync_fd_to_thread_group(dst);
     return 1;
@@ -106,7 +98,14 @@ static struct ipc_message handle_fcntl(const struct trap_request *req) {
     }
     if (cmd == F_GETFD) return reply(0, 0);
     if (cmd == F_SETFD) return reply(0, 0);
-    if (cmd == F_GETFL) return reply(g_fds[fd].kind == FD_PIPE_WRITE ? O_WRONLY : O_RDONLY, 0);
-    if (cmd == F_SETFL) return reply(0, 0);
+    if (cmd == F_GETFL) {
+        const u64 access = g_fds[fd].kind == FD_PIPE_WRITE ? O_WRONLY : (g_fds[fd].kind == FD_SOCKET ? O_RDWR : O_RDONLY);
+        return reply(access | (g_fds[fd].fd_flags & O_NONBLOCK), 0);
+    }
+    if (cmd == F_SETFL) {
+        g_fds[fd].fd_flags = (u32)(arg & O_NONBLOCK);
+        sync_fd_to_thread_group(fd);
+        return reply(0, 0);
+    }
     return reply(errno_inval(), 0);
 }

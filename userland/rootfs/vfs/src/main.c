@@ -10,8 +10,10 @@ enum {
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
+    SYSCALL_GET_TICK_COUNT = 0x2D,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_GET_MEMORY_STATS = 0x3C,
+    SYSCALL_GET_RTC_UNIX_TIME = 0x3E,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     PAGE_RIGHT_CPU_READ = 0x1,
@@ -62,6 +64,13 @@ enum {
     VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID = 30,
     VFS_PROC_NET_CAPABILITYOS_OBJECT_ID = 31,
     VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID = 32,
+    VFS_DEV_RANDOM_OBJECT_ID = 33,
+    VFS_DEV_URANDOM_OBJECT_ID = 34,
+    VFS_DEV_RANDOM_OPEN_OBJECT_ID = 35,
+    VFS_DEV_URANDOM_OPEN_OBJECT_ID = 36,
+    VFS_PROC_DRIVER_OBJECT_ID = 37,
+    VFS_PROC_DRIVER_RTC_OBJECT_ID = 38,
+    VFS_PROC_DRIVER_RTC_OPEN_OBJECT_ID = 39,
     VFS_TMPFS_FILE_OBJECT_ID_BASE = 0x1000,
     VFS_TMPFS_OPEN_OBJECT_ID_BASE = 0x2000,
     VFS_TMPFS_MAX_FILES = 16,
@@ -80,6 +89,7 @@ enum {
     NET_FLAG_LINK_UP = 1 << 0,
     NET_FLAG_DHCP_BOUND = 1 << 1,
     NET_FLAG_GATEWAY_ARP = 1 << 2,
+    PROC_MONOTONIC_NS_PER_TICK = 1000000,
 };
 
 struct vfs_mount_entry {
@@ -191,6 +201,8 @@ static struct vfs_backend_session g_root_backend;
 static struct net_backend_session g_net_backend;
 static struct vfs_tmpfs_file g_tmpfs_files[VFS_TMPFS_MAX_FILES];
 static u64 g_endpoint_id;
+static u64 g_net_endpoint_id;
+static u64 g_net_process_slot;
 static const struct vfs_mount_entry g_root_mounts[] = {
     { VFS_DEV_OBJECT_ID, "dev", 3 },
     { VFS_PROC_OBJECT_ID, "proc", 4 },
@@ -200,6 +212,8 @@ static const struct vfs_mount_entry g_root_mounts[] = {
 static const struct vfs_builtin_file g_dev_files[] = {
     { VFS_DEV_NULL_OBJECT_ID, VFS_DEV_NULL_OPEN_OBJECT_ID, "null", 4 },
     { VFS_DEV_ZERO_OBJECT_ID, VFS_DEV_ZERO_OPEN_OBJECT_ID, "zero", 4 },
+    { VFS_DEV_RANDOM_OBJECT_ID, VFS_DEV_RANDOM_OPEN_OBJECT_ID, "random", 6 },
+    { VFS_DEV_URANDOM_OBJECT_ID, VFS_DEV_URANDOM_OPEN_OBJECT_ID, "urandom", 7 },
 };
 static const struct vfs_builtin_file g_proc_files[] = {
     { VFS_PROC_CPUINFO_OBJECT_ID, VFS_PROC_CPUINFO_OPEN_OBJECT_ID, "cpuinfo", 7 },
@@ -211,6 +225,7 @@ static const struct vfs_builtin_file g_proc_files[] = {
 static const struct vfs_mount_entry g_proc_dirs[] = {
     { VFS_PROC_SELF_OBJECT_ID, "self", 4 },
     { VFS_PROC_NET_OBJECT_ID, "net", 3 },
+    { VFS_PROC_DRIVER_OBJECT_ID, "driver", 6 },
 };
 static const struct vfs_builtin_file g_proc_self_files[] = {
     { VFS_PROC_SELF_EXE_OBJECT_ID, 0, "exe", 3 },
@@ -221,6 +236,9 @@ static const struct vfs_builtin_file g_proc_net_files[] = {
     { VFS_PROC_NET_DEV_OBJECT_ID, VFS_PROC_NET_DEV_OPEN_OBJECT_ID, "dev", 3 },
     { VFS_PROC_NET_ROUTE_OBJECT_ID, VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID, "route", 5 },
     { VFS_PROC_NET_CAPABILITYOS_OBJECT_ID, VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID, "capabilityos", 12 },
+};
+static const struct vfs_builtin_file g_proc_driver_files[] = {
+    { VFS_PROC_DRIVER_RTC_OBJECT_ID, VFS_PROC_DRIVER_RTC_OPEN_OBJECT_ID, "rtc", 3 },
 };
 static const char g_proc_cpuinfo[] =
     "processor\t: 0\n"
@@ -248,10 +266,11 @@ static const char g_proc_cpuinfo[] =
     "siblings\t: 4\n"
     "\n";
 static char g_proc_meminfo_buf[256];
+static char g_proc_uptime_buf[64];
 static char g_proc_net_dev_buf[512];
 static char g_proc_net_route_buf[384];
 static char g_proc_net_capabilityos_buf[384];
-static const char g_proc_uptime[] = "1.00 0.00\n";
+static char g_proc_driver_rtc_buf[384];
 static const char g_proc_stat[] =
     "cpu  100 0 50 1000 0 0 0 0 0 0\n"
     "cpu0 25 0 12 250 0 0 0 0 0 0\n"
@@ -332,6 +351,28 @@ static void append_u64_dec(char *buf, u64 cap, u64 *len, u64 value) {
         tmp[n] = (char)('0' + (value % 10));
         value /= 10;
         n++;
+    }
+    while (n != 0) {
+        n--;
+        append_char(buf, cap, len, tmp[n]);
+    }
+}
+
+static void append_u64_dec_width(char *buf, u64 cap, u64 *len, u64 value, u64 width) {
+    char tmp[20];
+    u64 n = 0;
+    if (value == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (value != 0 && n < sizeof(tmp)) {
+            tmp[n] = (char)('0' + (value % 10));
+            value /= 10;
+            n++;
+        }
+    }
+    while (n < width) {
+        append_char(buf, cap, len, '0');
+        width--;
     }
     while (n != 0) {
         n--;
@@ -472,6 +513,14 @@ static void clear_page(u64 va) {
     for (u64 i = 0; i < 512; i++) p[i] = 0;
 }
 
+static void copy_from_volatile(volatile u8 *dst, const volatile u8 *src, u64 bytes) {
+    __asm__ volatile(
+        "rep movsb"
+        : "+D"(dst), "+S"(src), "+c"(bytes)
+        :
+        : "memory");
+}
+
 static u64 token_from_object_id(u64 object_id) {
     return VFS_TOKEN_TAG | object_id;
 }
@@ -501,7 +550,7 @@ static u64 root_token(void) {
 static u64 object_id_from_token(u64 token) {
     if ((token & VFS_TOKEN_TAG) == 0) return 0;
     const u64 object_id = token & ~VFS_TOKEN_TAG;
-    if (object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID) return object_id;
+    if (object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_PROC_DRIVER_RTC_OPEN_OBJECT_ID) return object_id;
     if (object_id >= VFS_TMPFS_FILE_OBJECT_ID_BASE &&
         object_id < VFS_TMPFS_FILE_OBJECT_ID_BASE + VFS_TMPFS_MAX_FILES) return object_id;
     if (object_id >= VFS_TMPFS_OPEN_OBJECT_ID_BASE &&
@@ -534,12 +583,15 @@ static int is_tmpfs_open_object_id(u64 object_id) {
 static int is_directory_object_id(u64 object_id) {
     return (object_id >= VFS_ROOT_OBJECT_ID && object_id <= VFS_RUN_OBJECT_ID) ||
         object_id == VFS_PROC_SELF_OBJECT_ID ||
-        object_id == VFS_PROC_NET_OBJECT_ID;
+        object_id == VFS_PROC_NET_OBJECT_ID ||
+        object_id == VFS_PROC_DRIVER_OBJECT_ID;
 }
 
 static int is_file_object_id(u64 object_id) {
     return object_id == VFS_DEV_NULL_OBJECT_ID ||
         object_id == VFS_DEV_ZERO_OBJECT_ID ||
+        object_id == VFS_DEV_RANDOM_OBJECT_ID ||
+        object_id == VFS_DEV_URANDOM_OBJECT_ID ||
         object_id == VFS_PROC_CPUINFO_OBJECT_ID ||
         object_id == VFS_PROC_MEMINFO_OBJECT_ID ||
         object_id == VFS_PROC_UPTIME_OBJECT_ID ||
@@ -551,12 +603,15 @@ static int is_file_object_id(u64 object_id) {
         object_id == VFS_PROC_NET_DEV_OBJECT_ID ||
         object_id == VFS_PROC_NET_ROUTE_OBJECT_ID ||
         object_id == VFS_PROC_NET_CAPABILITYOS_OBJECT_ID ||
+        object_id == VFS_PROC_DRIVER_RTC_OBJECT_ID ||
         is_tmpfs_file_object_id(object_id);
 }
 
 static int is_open_file_object_id(u64 object_id) {
     return object_id == VFS_DEV_NULL_OPEN_OBJECT_ID ||
         object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID ||
+        object_id == VFS_DEV_RANDOM_OPEN_OBJECT_ID ||
+        object_id == VFS_DEV_URANDOM_OPEN_OBJECT_ID ||
         object_id == VFS_PROC_CPUINFO_OPEN_OBJECT_ID ||
         object_id == VFS_PROC_MEMINFO_OPEN_OBJECT_ID ||
         object_id == VFS_PROC_UPTIME_OPEN_OBJECT_ID ||
@@ -567,6 +622,7 @@ static int is_open_file_object_id(u64 object_id) {
         object_id == VFS_PROC_NET_DEV_OPEN_OBJECT_ID ||
         object_id == VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID ||
         object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_DRIVER_RTC_OPEN_OBJECT_ID ||
         is_tmpfs_open_object_id(object_id);
 }
 
@@ -594,6 +650,9 @@ static u64 open_object_id_for_file(u64 object_id) {
     }
     for (u64 i = 0; i < sizeof(g_proc_net_files) / sizeof(g_proc_net_files[0]); i++) {
         if (g_proc_net_files[i].object_id == object_id) return g_proc_net_files[i].open_object_id;
+    }
+    for (u64 i = 0; i < sizeof(g_proc_driver_files) / sizeof(g_proc_driver_files[0]); i++) {
+        if (g_proc_driver_files[i].object_id == object_id) return g_proc_driver_files[i].open_object_id;
     }
     const u64 tmpfs_index = tmpfs_index_from_file_object_id(object_id);
     if (tmpfs_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_index].used) {
@@ -660,6 +719,16 @@ static u64 lookup_proc_net_exact_path(u64 base_object_id, const volatile u8 *pat
     return 0;
 }
 
+static u64 lookup_proc_driver_exact_path(u64 base_object_id, const volatile u8 *path, u16 len) {
+    if ((base_object_id == VFS_ROOT_OBJECT_ID && path_equals(path, len, "/proc/driver/rtc", 16)) ||
+        (base_object_id == VFS_PROC_OBJECT_ID && path_equals(path, len, "driver/rtc", 10)) ||
+        (base_object_id == VFS_PROC_DRIVER_OBJECT_ID && path_equals(path, len, "rtc", 3)))
+    {
+        return token_from_object_id(VFS_PROC_DRIVER_RTC_OBJECT_ID);
+    }
+    return 0;
+}
+
 static u64 lookup_mount_name(const volatile u8 *name, u16 name_len) {
     for (u64 i = 0; i < sizeof(g_root_mounts) / sizeof(g_root_mounts[0]); i++) {
         if (path_equals(name, name_len, g_root_mounts[i].name, g_root_mounts[i].name_len)) {
@@ -710,6 +779,15 @@ static u64 lookup_proc_net_name(const volatile u8 *name, u16 name_len) {
     return 0;
 }
 
+static u64 lookup_proc_driver_name(const volatile u8 *name, u16 name_len) {
+    for (u64 i = 0; i < sizeof(g_proc_driver_files) / sizeof(g_proc_driver_files[0]); i++) {
+        if (path_equals(name, name_len, g_proc_driver_files[i].name, g_proc_driver_files[i].name_len)) {
+            return token_from_object_id(g_proc_driver_files[i].object_id);
+        }
+    }
+    return 0;
+}
+
 static u64 lookup_tmpfs_name(u64 parent_object_id, const volatile u8 *name, u16 name_len) {
     if (parent_object_id != VFS_TMP_OBJECT_ID && parent_object_id != VFS_RUN_OBJECT_ID) return 0;
     if (name_len == 0 || name_len > FS_MAX_PATH_BYTES) return 0;
@@ -745,6 +823,8 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
     if (self_exact_token != 0) return self_exact_token;
     const u64 net_exact_token = lookup_proc_net_exact_path(base_object_id, path, len);
     if (net_exact_token != 0) return net_exact_token;
+    const u64 driver_exact_token = lookup_proc_driver_exact_path(base_object_id, path, len);
+    if (driver_exact_token != 0) return driver_exact_token;
 
     u16 pos = 0;
     u64 current_object_id = base_object_id;
@@ -781,6 +861,10 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
         const u64 token = lookup_proc_net_name(path + start, component_len);
         if (token == 0) return 0;
         current_object_id = object_id_from_token(token);
+    } else if (current_object_id == VFS_PROC_DRIVER_OBJECT_ID) {
+        const u64 token = lookup_proc_driver_name(path + start, component_len);
+        if (token == 0) return 0;
+        current_object_id = object_id_from_token(token);
     } else if (current_object_id == VFS_TMP_OBJECT_ID || current_object_id == VFS_RUN_OBJECT_ID) {
         const u64 token = lookup_tmpfs_name(current_object_id, path + start, component_len);
         if (token == 0) return 0;
@@ -794,6 +878,7 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
         current_object_id != VFS_PROC_OBJECT_ID &&
         current_object_id != VFS_PROC_SELF_OBJECT_ID &&
         current_object_id != VFS_PROC_NET_OBJECT_ID &&
+        current_object_id != VFS_PROC_DRIVER_OBJECT_ID &&
         current_object_id != VFS_TMP_OBJECT_ID &&
         current_object_id != VFS_RUN_OBJECT_ID) return 0;
 
@@ -806,6 +891,7 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
     if (current_object_id == VFS_PROC_OBJECT_ID) return lookup_proc_name(path + second_start, second_len);
     if (current_object_id == VFS_PROC_SELF_OBJECT_ID) return lookup_proc_self_name(path + second_start, second_len);
     if (current_object_id == VFS_PROC_NET_OBJECT_ID) return lookup_proc_net_name(path + second_start, second_len);
+    if (current_object_id == VFS_PROC_DRIVER_OBJECT_ID) return lookup_proc_driver_name(path + second_start, second_len);
     return lookup_tmpfs_name(current_object_id, path + second_start, second_len);
 }
 
@@ -858,6 +944,19 @@ static u64 tmpfs_file_bytes_from_token(u64 token) {
     return 0;
 }
 
+static u64 dev_file_bytes_from_object_id(u64 object_id) {
+    if (object_id == VFS_DEV_ZERO_OBJECT_ID ||
+        object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID ||
+        object_id == VFS_DEV_RANDOM_OBJECT_ID ||
+        object_id == VFS_DEV_RANDOM_OPEN_OBJECT_ID ||
+        object_id == VFS_DEV_URANDOM_OBJECT_ID ||
+        object_id == VFS_DEV_URANDOM_OPEN_OBJECT_ID)
+    {
+        return ~0ULL;
+    }
+    return 0;
+}
+
 static const char *build_proc_meminfo(u64 *bytes_out) {
     u64 stats[4];
     stats[0] = 512ULL * 1024ULL * 1024ULL;
@@ -885,6 +984,99 @@ static const char *build_proc_meminfo(u64 *bytes_out) {
     append_meminfo_line(g_proc_meminfo_buf, sizeof(g_proc_meminfo_buf), &len, "SwapFree", 0);
     if (bytes_out != 0) *bytes_out = len;
     return g_proc_meminfo_buf;
+}
+
+static const char *build_proc_uptime(u64 *bytes_out) {
+    const u64 ticks = syscall0(SYSCALL_GET_TICK_COUNT);
+    const u64 ns = ticks * (u64)PROC_MONOTONIC_NS_PER_TICK;
+    const u64 seconds = ns / 1000000000ULL;
+    const u64 centis = (ns % 1000000000ULL) / 10000000ULL;
+    u64 len = 0;
+    g_proc_uptime_buf[0] = 0;
+    append_u64_dec(g_proc_uptime_buf, sizeof(g_proc_uptime_buf), &len, seconds);
+    append_char(g_proc_uptime_buf, sizeof(g_proc_uptime_buf), &len, '.');
+    append_u64_dec_width(g_proc_uptime_buf, sizeof(g_proc_uptime_buf), &len, centis, 2);
+    append_str(g_proc_uptime_buf, sizeof(g_proc_uptime_buf), &len, " 0.00\n");
+    if (bytes_out != 0) *bytes_out = len;
+    return g_proc_uptime_buf;
+}
+
+static int rtc_is_leap_year(u64 year) {
+    if ((year % 400) == 0) return 1;
+    if ((year % 100) == 0) return 0;
+    return (year % 4) == 0;
+}
+
+static u64 rtc_days_in_month(u64 year, u64 month) {
+    static const u8 days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (month == 2 && rtc_is_leap_year(year)) return 29;
+    if (month < 1 || month > 12) return 30;
+    return days[month - 1];
+}
+
+static void rtc_unix_to_utc(u64 epoch, u64 *year, u64 *month, u64 *day, u64 *hour, u64 *minute, u64 *second) {
+    u64 days = epoch / 86400ULL;
+    u64 rem = epoch % 86400ULL;
+    *hour = rem / 3600ULL;
+    rem %= 3600ULL;
+    *minute = rem / 60ULL;
+    *second = rem % 60ULL;
+
+    u64 y = 1970;
+    while (1) {
+        const u64 diy = rtc_is_leap_year(y) ? 366 : 365;
+        if (days < diy) break;
+        days -= diy;
+        y++;
+    }
+
+    u64 m = 1;
+    while (1) {
+        const u64 dim = rtc_days_in_month(y, m);
+        if (days < dim) break;
+        days -= dim;
+        m++;
+    }
+
+    *year = y;
+    *month = m;
+    *day = days + 1;
+}
+
+static const char *build_proc_driver_rtc(u64 *bytes_out) {
+    u64 epoch = syscall0(SYSCALL_GET_RTC_UNIX_TIME);
+    if (epoch == 0) epoch = 0;
+
+    u64 year = 1970;
+    u64 month = 1;
+    u64 day = 1;
+    u64 hour = 0;
+    u64 minute = 0;
+    u64 second = 0;
+    rtc_unix_to_utc(epoch, &year, &month, &day, &hour, &minute, &second);
+
+    u64 len = 0;
+    g_proc_driver_rtc_buf[0] = 0;
+    append_str(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, "rtc_time\t: ");
+    append_u64_dec_width(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, hour, 2);
+    append_char(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, ':');
+    append_u64_dec_width(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, minute, 2);
+    append_char(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, ':');
+    append_u64_dec_width(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, second, 2);
+    append_str(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, "\nrtc_date\t: ");
+    append_u64_dec_width(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, year, 4);
+    append_char(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, '-');
+    append_u64_dec_width(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, month, 2);
+    append_char(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, '-');
+    append_u64_dec_width(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len, day, 2);
+    append_str(g_proc_driver_rtc_buf, sizeof(g_proc_driver_rtc_buf), &len,
+        "\nalrm_time\t: 00:00:00\n"
+        "alrm_date\t: ****-**-**\n"
+        "alarm_IRQ\t: no\n"
+        "24hr\t\t: yes\n"
+        "update_IRQ\t: no\n");
+    if (bytes_out != 0) *bytes_out = len;
+    return g_proc_driver_rtc_buf;
 }
 
 static void fallback_net_status(struct net_status_payload *status) {
@@ -988,7 +1180,7 @@ static const char *proc_content_from_object_id(u64 object_id, u64 *bytes_out) {
     } else if (object_id == VFS_PROC_MEMINFO_OBJECT_ID || object_id == VFS_PROC_MEMINFO_OPEN_OBJECT_ID) {
         return build_proc_meminfo(bytes_out);
     } else if (object_id == VFS_PROC_UPTIME_OBJECT_ID || object_id == VFS_PROC_UPTIME_OPEN_OBJECT_ID) {
-        content = g_proc_uptime;
+        return build_proc_uptime(bytes_out);
     } else if (object_id == VFS_PROC_STAT_OBJECT_ID || object_id == VFS_PROC_STAT_OPEN_OBJECT_ID) {
         content = g_proc_stat;
     } else if (object_id == VFS_PROC_MOUNTS_OBJECT_ID || object_id == VFS_PROC_MOUNTS_OPEN_OBJECT_ID) {
@@ -999,6 +1191,8 @@ static const char *proc_content_from_object_id(u64 object_id, u64 *bytes_out) {
         return build_proc_net_route(bytes_out);
     } else if (object_id == VFS_PROC_NET_CAPABILITYOS_OBJECT_ID || object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID) {
         return build_proc_net_capabilityos(bytes_out);
+    } else if (object_id == VFS_PROC_DRIVER_RTC_OBJECT_ID || object_id == VFS_PROC_DRIVER_RTC_OPEN_OBJECT_ID) {
+        return build_proc_driver_rtc(bytes_out);
     } else if (object_id == VFS_PROC_SELF_STAT_OBJECT_ID || object_id == VFS_PROC_SELF_STAT_OPEN_OBJECT_ID) {
         content = g_proc_self_stat;
     } else if (object_id == VFS_PROC_SELF_STATUS_OBJECT_ID || object_id == VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID) {
@@ -1009,6 +1203,8 @@ static const char *proc_content_from_object_id(u64 object_id, u64 *bytes_out) {
 }
 
 static u64 file_bytes_from_token(u64 token) {
+    const u64 dev_bytes = dev_file_bytes_from_object_id(object_id_from_token(token));
+    if (dev_bytes != 0) return dev_bytes;
     u64 bytes = 0;
     if (proc_content_from_object_id(object_id_from_token(token), &bytes) != 0) return bytes;
     return tmpfs_file_bytes_from_token(token);
@@ -1027,7 +1223,7 @@ static void reply_stat(u64 seq, u64 token) {
     const u64 tmpfs_file_index = tmpfs_index_from_file_object_id(object_id);
     const u64 tmpfs_open_index = tmpfs_index_from_open_object_id(object_id);
     record->object_kind = is_dir ? FS_OBJECT_DIRECTORY : FS_OBJECT_FILE;
-    record->size_bytes = 0;
+    record->size_bytes = dev_file_bytes_from_object_id(object_id);
     if (tmpfs_file_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_file_index].used) {
         record->size_bytes = g_tmpfs_files[tmpfs_file_index].size;
     } else if (tmpfs_open_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_open_index].used) {
@@ -1128,6 +1324,15 @@ static void reply_readdir(u64 seq, u64 token, u64 cursor) {
         write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_FILE);
         return;
     }
+    if (token == token_from_object_id(VFS_PROC_DRIVER_OBJECT_ID)) {
+        if (cursor >= sizeof(g_proc_driver_files) / sizeof(g_proc_driver_files[0])) {
+            write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
+            return;
+        }
+        const struct vfs_builtin_file *entry = &g_proc_driver_files[cursor];
+        write_dirent_response(seq, token_from_object_id(entry->object_id), cursor + 1, entry->name, entry->name_len, FS_OBJECT_FILE);
+        return;
+    }
     const u64 dir_object_id = object_id_from_token(token);
     if (dir_object_id == VFS_TMP_OBJECT_ID || dir_object_id == VFS_RUN_OBJECT_ID) {
         u64 seen = 0;
@@ -1165,6 +1370,40 @@ static void reply_open(u64 seq, u64 token) {
     write_response(FS_OP_OPEN, seq, FS_STATUS_OK, token_from_object_id(open_object_id), file_bytes_from_token(token), 0, FS_OBJECT_OPEN_FILE, 0);
 }
 
+static int cpu_has_rdrand(void) {
+    u32 eax = 1, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    (void)ebx;
+    (void)edx;
+    return (ecx & (1u << 30)) != 0;
+}
+
+static int rdrand64(u64 *out) {
+    unsigned char ok = 0;
+    u64 value = 0;
+    for (u32 attempt = 0; attempt < 16; attempt++) {
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(value), "=qm"(ok));
+        if (ok) {
+            *out = value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int fill_random_bytes(volatile u8 *payload, u16 bytes) {
+    if (!cpu_has_rdrand()) return 0;
+    u16 copied = 0;
+    while (copied < bytes) {
+        u64 value = 0;
+        if (!rdrand64(&value)) return 0;
+        const u16 chunk = (u16)(((u64)(bytes - copied) < sizeof(value)) ? (bytes - copied) : sizeof(value));
+        for (u16 i = 0; i < chunk; i++) payload[copied + i] = (u8)(value >> (i * 8));
+        copied = (u16)(copied + chunk);
+    }
+    return 1;
+}
+
 static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
     clear_page(g_session->response_va);
     const u64 object_id = object_id_from_token(token);
@@ -1178,6 +1417,17 @@ static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
         volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < bytes; i++) payload[i] = 0;
         write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, 0, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+        return;
+    }
+    if (object_id == VFS_DEV_RANDOM_OPEN_OBJECT_ID || object_id == VFS_DEV_URANDOM_OPEN_OBJECT_ID) {
+        u16 bytes = (u16)length;
+        if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
+        volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
+        if (!fill_random_bytes(payload, bytes)) {
+            write_response(FS_OP_READ, seq, FS_STATUS_IO_ERROR, 0, 0, offset, FS_OBJECT_OPEN_FILE, 0);
+            return;
+        }
+        write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, ~0ULL, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
         return;
     }
     u64 proc_bytes = 0;
@@ -1226,7 +1476,8 @@ static void reply_write(u64 seq, u64 token, u64 offset, u32 length, const volati
         object_id == VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID ||
         object_id == VFS_PROC_NET_DEV_OPEN_OBJECT_ID ||
         object_id == VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID ||
-        object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID)
+        object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_DRIVER_RTC_OPEN_OBJECT_ID)
     {
         reply_status(FS_OP_WRITE, seq, FS_STATUS_NO_RIGHT);
         return;
@@ -1341,6 +1592,45 @@ static void reply_tmpfs_unlink(u64 seq, const volatile u8 *path, u16 path_len) {
     }
     g_tmpfs_files[index].used = 0;
     reply_status(FS_OP_UNLINK, seq, FS_STATUS_OK);
+}
+
+static void reply_tmpfs_rename(u64 seq, const volatile u8 *old_path, u16 old_path_len, const volatile u8 *new_path, u16 new_path_len) {
+    u64 old_parent = 0;
+    u64 new_parent = 0;
+    const volatile u8 *old_name = (const volatile u8 *)0;
+    const volatile u8 *new_name = (const volatile u8 *)0;
+    u16 old_name_len = 0;
+    u16 new_name_len = 0;
+    if (!tmpfs_parent_from_path(old_path, old_path_len, &old_parent, &old_name, &old_name_len) ||
+        !tmpfs_parent_from_path(new_path, new_path_len, &new_parent, &new_name, &new_name_len))
+    {
+        reply_status(FS_OP_RENAME, seq, FS_STATUS_NOT_DIR);
+        return;
+    }
+    const u64 old_token = lookup_tmpfs_name(old_parent, old_name, old_name_len);
+    if (old_token == 0) {
+        reply_status(FS_OP_RENAME, seq, FS_STATUS_NOT_FOUND);
+        return;
+    }
+    const u64 old_index = tmpfs_index_from_file_object_id(object_id_from_token(old_token));
+    if (old_index >= VFS_TMPFS_MAX_FILES || !g_tmpfs_files[old_index].used) {
+        reply_status(FS_OP_RENAME, seq, FS_STATUS_NOT_FOUND);
+        return;
+    }
+    const u64 new_token = lookup_tmpfs_name(new_parent, new_name, new_name_len);
+    if (new_token != 0) {
+        const u64 new_index = tmpfs_index_from_file_object_id(object_id_from_token(new_token));
+        if (new_index == old_index) {
+            reply_status(FS_OP_RENAME, seq, FS_STATUS_OK);
+            return;
+        }
+        if (new_index < VFS_TMPFS_MAX_FILES) g_tmpfs_files[new_index].used = 0;
+    }
+    g_tmpfs_files[old_index].parent_object_id = new_parent;
+    g_tmpfs_files[old_index].name_len = new_name_len;
+    for (u16 j = 0; j < new_name_len; j++) g_tmpfs_files[old_index].name[j] = (char)new_name[j];
+    g_tmpfs_files[old_index].name[new_name_len] = 0;
+    reply_status(FS_OP_RENAME, seq, FS_STATUS_OK);
 }
 
 static u64 make_backend_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
@@ -1567,8 +1857,15 @@ static int connect_net_backend(u64 endpoint_id, u64 process_slot) {
     return 1;
 }
 
+static int ensure_net_backend_connected(void) {
+    if (g_net_backend.active) return 1;
+    if (g_net_endpoint_id == 0 || g_net_process_slot == 0) return 0;
+    if (connect_net_backend(g_net_endpoint_id, g_net_process_slot)) return 1;
+    return 0;
+}
+
 static int refresh_net_status(void) {
-    if (!g_net_backend.active) return 0;
+    if (!ensure_net_backend_connected()) return 0;
     clear_page(g_net_backend.request_va);
     clear_page(g_net_backend.response_va);
     const u64 seq = g_net_backend.next_seq++;
@@ -1657,7 +1954,7 @@ static void forward_backend_response(u16 op, u64 client_seq, u64 cursor_bias) {
     clear_page(g_session->response_va);
     volatile u8 *dst = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
     const volatile u8 *src = (const volatile u8 *)(g_root_backend.response_va + FS_RESPONSE_HEADER_BYTES);
-    for (u16 i = 0; i < inline_bytes; i++) dst[i] = src[i];
+    copy_from_volatile(dst, src, inline_bytes);
 
     u64 result_token = backend->result_token == 0 ? 0 : wrap_backend_token(backend->result_token);
     u64 cursor_next = backend->cursor_next;
@@ -1964,6 +2261,16 @@ static void handle_fs_request(void) {
             path_targets_tmpfs(path, request->path_bytes))
         {
             reply_tmpfs_unlink(seq, path, request->path_bytes);
+        } else if (request->op == FS_OP_RENAME &&
+            object_id_from_token(request->object_token) == VFS_ROOT_OBJECT_ID &&
+            request->path_bytes > 0 &&
+            request->path_bytes <= FS_MAX_PATH_BYTES &&
+            request->inline_bytes > 0 &&
+            request->inline_bytes <= FS_MAX_PATH_BYTES &&
+            path_targets_tmpfs(path, request->path_bytes) &&
+            path_targets_tmpfs(path + request->path_bytes, request->inline_bytes))
+        {
+            reply_tmpfs_rename(seq, path, request->path_bytes, path + request->path_bytes, request->inline_bytes);
         } else if (is_backend_token(request->object_token)) {
             const volatile u8 *path = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES);
             const volatile u8 *inline_payload = path + request->path_bytes;
@@ -2060,8 +2367,8 @@ void rootfs_vfs_main(void) {
     g_endpoint_id = config[0];
     const u64 fat_endpoint_id = config[3];
     const u64 fat_process_slot = config[4];
-    const u64 net_endpoint_id = config[5];
-    const u64 net_process_slot = config[6];
+    g_net_endpoint_id = config[5];
+    g_net_process_slot = config[6];
     if (connect_root_backend(fat_endpoint_id, fat_process_slot)) {
         user_log("RootVfs: fat backend connect ok\n");
     } else if (fat_endpoint_id != 0) {
@@ -2069,18 +2376,16 @@ void rootfs_vfs_main(void) {
     } else {
         user_log("RootVfs: fat backend missing\n");
     }
-    if (connect_net_backend(net_endpoint_id, net_process_slot)) {
-        (void)refresh_net_status();
-    } else if (net_endpoint_id != 0) {
-        user_log("RootVfs: net backend connect failed\n");
-    } else {
-        user_log("RootVfs: net backend missing\n");
-    }
     if (g_endpoint_id != 0) {
         user_log("RootVfs: endpoint ready\n");
         config[2] = 1;
     } else {
         user_log("RootVfs: endpoint missing\n");
+    }
+    if (g_net_endpoint_id != 0 && g_net_process_slot != 0) {
+        user_log("RootVfs: net backend lazy\n");
+    } else {
+        user_log("RootVfs: net backend missing\n");
     }
     for (;;) {
         const u64 received = wait_event();

@@ -8,6 +8,7 @@ typedef unsigned char u8;
 enum {
     SYSCALL_ALLOC_PAGE = 0x1,
     SYSCALL_MAP_PAGE = 0x2,
+    SYSCALL_GRANT_CAP = 0x8,
     SYSCALL_LOG = 0x9,
     SYSCALL_ALLOC_MAP_PAGES = 0xC,
     SYSCALL_WAIT_EVENT = 0x17,
@@ -20,11 +21,14 @@ enum {
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
+    SYSCALL_GRANT_QUEUE_CAP = 0x23,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
+    PAGE_RIGHT_GRANT = 0x8,
     ROOT_CONFIG_VA = 0x3C002000,
+    DEVICE_CATALOG_VA = 0x3C030000,
     REQUEST_VA = 0x29000000,
     RESPONSE_VA = 0x29001000,
     VFS_REQUEST_VA = 0x29002000,
@@ -33,11 +37,14 @@ enum {
     SCHED_IMAGE_BASE_VA = 0x2B000000,
     ROOTFS_VFS_CONFIG_VA = 0x2A200000,
     SERVICE_REGISTRY_SOURCE_VA = 0x2A300000,
+    DRIVER_CONFIG_BASE_VA = 0x2A400000,
     PROCESS_STANDARD_CONFIG_TARGET_VA = 0x3C002000,
     PROCESS_SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     REPLY_ENDPOINT_ID = 0xEB,
     ROOTFS_VFS_ENDPOINT_ID = 0x90,
     EXEC_SERVICE_ENDPOINT_ID = 0x92,
+    ROOT_CONSOLE_ENDPOINT_ID = 0x88,
+    ROOT_NET_ENDPOINT_ID = 0x89,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
     SERVICE_REGISTRY_VERSION = 1,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
@@ -53,10 +60,66 @@ enum {
     SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE = 1ULL << 0,
     SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1ULL << 2,
     SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1ULL << 3,
+    SPAWN_FLAG_ALLOW_BOOTSTRAP_AP_PLACEMENT = 1ULL << 4,
     MAX_ROOTFS_VFS_PAGES = 256,
     MAX_SCHED_IMAGE_PAGES = 256,
     MAX_STARTUP_NODES = 24,
     MAX_PROVIDED_SERVICES = 32,
+    DEVICE_CATALOG_MAGIC = 0x44455643,
+    DEVICE_CATALOG_VERSION = 1,
+    DEVICE_CATALOG_READY = 0x44564352,
+    DEVICE_CATALOG_MAX_ENTRIES = 6,
+    DEVICE_CATALOG_KIND_CONSOLE = 1,
+    DEVICE_CATALOG_KIND_NET = 2,
+    QUEUE_CAP_TAG_BASE = (1ULL << 62) | (1ULL << 60),
+    QUEUE_CAP_KIND_SHIFT = 56,
+    QUEUE_CAP_KIND_MASK = 0x0FULL << 56,
+    QUEUE_CAP_KIND_IOMMU = 1,
+    QUEUE_CAP_KIND_VIRTQUEUE = 2,
+    QUEUE_CAP_KIND_COMMAND = 3,
+    CONSOLE_CONFIG_MAGIC = 0x434F4E43,
+    CONSOLE_CONFIG_VERSION = 1,
+    CONSOLE_STATUS_READY = 0x43524459,
+    CONSOLE_ENDPOINT_ID_INDEX = 2,
+    CONSOLE_COMMON_PAGE_PADDR_INDEX = 3,
+    CONSOLE_NOTIFY_PAGE_PADDR_INDEX = 4,
+    CONSOLE_ISR_PAGE_PADDR_INDEX = 5,
+    CONSOLE_DEVICE_PAGE_PADDR_INDEX = 6,
+    CONSOLE_COMMON_PAGE_OFFSET_INDEX = 7,
+    CONSOLE_NOTIFY_PAGE_OFFSET_INDEX = 8,
+    CONSOLE_ISR_PAGE_OFFSET_INDEX = 9,
+    CONSOLE_DEVICE_PAGE_OFFSET_INDEX = 10,
+    CONSOLE_NOTIFY_OFF_MULTIPLIER_INDEX = 11,
+    CONSOLE_IOMMU_TOKEN_INDEX = 12,
+    CONSOLE_RX_QUEUE_SUBMIT_TOKEN_INDEX = 13,
+    CONSOLE_RX_QUEUE_NOTIFY_TOKEN_INDEX = 14,
+    CONSOLE_TX_QUEUE_SUBMIT_TOKEN_INDEX = 15,
+    CONSOLE_TX_QUEUE_NOTIFY_TOKEN_INDEX = 16,
+    CONSOLE_COMMAND_TOKEN_INDEX = 17,
+    CONSOLE_RESOURCE_ID_INDEX = 18,
+    CONSOLE_DRIVER_STATUS_INDEX = 19,
+    NET_CONFIG_MAGIC = 0x4E455443,
+    NET_CONFIG_VERSION = 1,
+    NET_STATUS_READY = 0x4E524459,
+    NET_STATUS_FAILED = 0x4E464149,
+    NET_ENDPOINT_ID_INDEX = 2,
+    NET_COMMON_PAGE_PADDR_INDEX = 3,
+    NET_NOTIFY_PAGE_PADDR_INDEX = 4,
+    NET_ISR_PAGE_PADDR_INDEX = 5,
+    NET_DEVICE_PAGE_PADDR_INDEX = 6,
+    NET_COMMON_PAGE_OFFSET_INDEX = 7,
+    NET_NOTIFY_PAGE_OFFSET_INDEX = 8,
+    NET_ISR_PAGE_OFFSET_INDEX = 9,
+    NET_DEVICE_PAGE_OFFSET_INDEX = 10,
+    NET_NOTIFY_OFF_MULTIPLIER_INDEX = 11,
+    NET_IOMMU_TOKEN_INDEX = 12,
+    NET_RX_QUEUE_SUBMIT_TOKEN_INDEX = 13,
+    NET_RX_QUEUE_NOTIFY_TOKEN_INDEX = 14,
+    NET_TX_QUEUE_SUBMIT_TOKEN_INDEX = 15,
+    NET_TX_QUEUE_NOTIFY_TOKEN_INDEX = 16,
+    NET_COMMAND_TOKEN_INDEX = 17,
+    NET_RESOURCE_ID_INDEX = 18,
+    NET_DRIVER_STATUS_INDEX = 19,
 };
 
 struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
@@ -104,19 +167,57 @@ struct startup_node {
     u64 child_slot;
 };
 
+struct device_catalog_entry {
+    u64 present;
+    u64 kind;
+    u64 vendor_id;
+    u64 device_id;
+    u64 subsystem_id;
+    u64 resource_id;
+    u64 common_page_paddr;
+    u64 notify_page_paddr;
+    u64 isr_page_paddr;
+    u64 device_page_paddr;
+    u64 common_page_offset;
+    u64 notify_page_offset;
+    u64 isr_page_offset;
+    u64 device_page_offset;
+    u64 notify_off_multiplier;
+    u64 iommu_token;
+    u64 queue0_submit_token;
+    u64 queue0_notify_token;
+    u64 queue1_submit_token;
+    u64 queue1_notify_token;
+    u64 command_token;
+};
+
+struct device_catalog_page {
+    u64 magic;
+    u64 version;
+    u64 entry_count;
+    u64 reserved0;
+    struct device_catalog_entry entries[DEVICE_CATALOG_MAX_ENTRIES];
+};
+
 static struct backend_session g_fat;
 static struct backend_session g_vfs;
-static u64 g_image_page_paddrs[MAX_ROOTFS_VFS_PAGES];
 static struct startup_node g_startup_nodes[MAX_STARTUP_NODES];
 static char g_provided_services[MAX_PROVIDED_SERVICES][48];
 static u8 g_startup_manifest[4096];
 static u32 g_startup_manifest_len;
 static u64 g_rootfs_vfs_process_slot;
+static u64 g_console_endpoint_id;
+static u64 g_console_process_slot;
 static u64 g_net_endpoint_id;
 static u64 g_net_process_slot;
+static u64 g_net_exec_token;
 static u32 g_startup_node_count;
 static u32 g_provided_service_count;
 static u64 g_next_sched_image_va = SCHED_IMAGE_BASE_VA;
+static u64 g_next_driver_config_va = DRIVER_CONFIG_BASE_VA;
+static u64 g_device_catalog_va;
+
+static u64 decode_spawn_process_slot(u64 value);
 
 static u64 cstr_len(const char *s) { u64 n = 0; while (s[n] != 0) n++; return n; }
 
@@ -185,6 +286,17 @@ static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) {
 static u64 wait_event_poll(void) { return syscall2(SYSCALL_WAIT_EVENT, 0, 1); }
 static u64 wait_event(void) { return syscall2(SYSCALL_WAIT_EVENT, 1, 1); }
 static void clear_page(u64 va) { volatile u64 *p = (volatile u64 *)va; for (u64 i = 0; i < 512; i++) p[i] = 0; }
+static void clear_bytes(void *ptr, u64 bytes) { u8 *p = (u8 *)ptr; for (u64 i = 0; i < bytes; i++) p[i] = 0; }
+
+static u64 encode_queue_cap(u64 kind, u64 token) {
+    return QUEUE_CAP_TAG_BASE | (kind << QUEUE_CAP_KIND_SHIFT) | token;
+}
+
+static u64 decode_queue_cap(u64 value, u64 kind) {
+    if ((value & QUEUE_CAP_TAG_BASE) != QUEUE_CAP_TAG_BASE) return 0;
+    if (((value & QUEUE_CAP_KIND_MASK) >> QUEUE_CAP_KIND_SHIFT) != kind) return 0;
+    return value & ~(QUEUE_CAP_TAG_BASE | QUEUE_CAP_KIND_MASK);
+}
 
 static void service_registry_init(void) {
     u64 paddr = 0;
@@ -313,18 +425,6 @@ static int fs_request(u16 op, u64 token, u64 offset, u32 length, const char *pat
     return wait_response(seq, op);
 }
 
-static int alloc_image_pages(u64 file_bytes) {
-    const u64 pages = (file_bytes + 4095) / 4096;
-    if (pages == 0 || pages > MAX_ROOTFS_VFS_PAGES) return 0;
-    for (u64 i = 0; i < pages; i++) {
-        const u64 va = ROOTFS_VFS_IMAGE_VA + i * 4096;
-        g_image_page_paddrs[i] = 0;
-        if (syscall4(SYSCALL_ALLOC_MAP_PAGES, va, 1, 1, (u64)&g_image_page_paddrs[i]) != SYSCALL_OK) return 0;
-        clear_page(va);
-    }
-    return 1;
-}
-
 static int alloc_pages_at(u64 base_va, u64 file_bytes, u64 max_pages) {
     const u64 pages = (file_bytes + 4095) / 4096;
     if (pages == 0 || pages > max_pages) return 0;
@@ -347,7 +447,7 @@ static int load_exec_from_fat(const char *path, u64 image_va, u64 *exec_token_ou
     if (response->status != FS_STATUS_OK || response->result_token == 0 || response->file_bytes == 0) return 0;
     const u64 open_token = response->result_token;
     const u64 file_bytes = response->file_bytes;
-    if (!alloc_image_pages(file_bytes)) return 0;
+    if (!alloc_pages_at(image_va, file_bytes, MAX_SCHED_IMAGE_PAGES)) return 0;
 
     u64 offset = 0;
     while (offset < file_bytes) {
@@ -434,6 +534,7 @@ static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
 }
 
 static int connect_vfs(u64 endpoint_id, u64 process_slot) {
+    if (g_vfs.active) return 1;
     g_vfs.endpoint_id = endpoint_id;
     g_vfs.process_slot = process_slot;
     if (endpoint_id == 0 || process_slot == 0) return 0;
@@ -551,6 +652,187 @@ static int load_exec_from_vfs(const char *path, u64 image_va, u64 *exec_token_ou
     return 1;
 }
 
+static volatile struct device_catalog_entry *find_device_catalog_entry(u64 kind) {
+    if (g_device_catalog_va == 0) return 0;
+    volatile struct device_catalog_page *page = (volatile struct device_catalog_page *)g_device_catalog_va;
+    if (page->magic != DEVICE_CATALOG_MAGIC || page->version != DEVICE_CATALOG_VERSION) return 0;
+    for (u64 i = 0; i < page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
+        volatile struct device_catalog_entry *entry = &page->entries[i];
+        if (entry->present != 0 && entry->kind == kind) return entry;
+    }
+    return 0;
+}
+
+static int grant_driver_mmio(volatile struct device_catalog_entry *entry, u64 child_slot) {
+    if (syscall3(SYSCALL_GRANT_CAP, entry->common_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
+    if (syscall3(SYSCALL_GRANT_CAP, entry->notify_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
+    if (entry->isr_page_paddr != 0 &&
+        syscall3(SYSCALL_GRANT_CAP, entry->isr_page_paddr, child_slot, PAGE_RIGHT_CPU_READ) != SYSCALL_OK) return 0;
+    if (entry->device_page_paddr != 0 &&
+        syscall3(SYSCALL_GRANT_CAP, entry->device_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
+    return 1;
+}
+
+static int grant_driver_queue_caps(volatile struct device_catalog_entry *entry, u64 child_slot, u64 *iommu, u64 *q0_submit, u64 *q0_notify, u64 *q1_submit, u64 *q1_notify, u64 *command) {
+    *iommu = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_IOMMU, entry->iommu_token), child_slot), QUEUE_CAP_KIND_IOMMU);
+    *q0_submit = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue0_submit_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *q0_notify = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue0_notify_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *q1_submit = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue1_submit_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *q1_notify = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue1_notify_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *command = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_COMMAND, entry->command_token), child_slot), QUEUE_CAP_KIND_COMMAND);
+    return *iommu != 0 && *q0_submit != 0 && *q0_notify != 0 && *q1_submit != 0 && *q1_notify != 0 && *command != 0;
+}
+
+static int load_root_driver_exec(const char *path, u64 *exec_token_out) {
+    const u64 image_va = g_next_sched_image_va;
+    g_next_sched_image_va += MAX_SCHED_IMAGE_PAGES * 4096;
+    return load_exec_from_fat(path, image_va, exec_token_out);
+}
+
+static int spawn_root_driver_with_exec(u64 exec_token, u64 catalog_kind, u64 endpoint_id, u64 service_kind, const char *ready_label) {
+    volatile struct device_catalog_entry *entry = find_device_catalog_entry(catalog_kind);
+    if (!entry) return 0;
+    if ((exec_token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG) return 0;
+
+    u64 config_paddr = 0;
+    const u64 cfg_va = g_next_driver_config_va;
+    g_next_driver_config_va += 0x1000;
+    if (syscall4(SYSCALL_ALLOC_MAP_PAGES, cfg_va, 1, 1, (u64)&config_paddr) != SYSCALL_OK || config_paddr < 0x1000) return 0;
+    clear_page(cfg_va);
+    volatile u64 *cfg = (volatile u64 *)cfg_va;
+
+    static struct bootstrap_descriptor_table table;
+    clear_bytes(&table, sizeof(table));
+    table.page_count = 1;
+    table.pages[0].source_va = cfg_va;
+    table.pages[0].target_va = PROCESS_STANDARD_CONFIG_TARGET_VA;
+    table.pages[0].flags = SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE;
+
+    const u64 spawned = syscall4(
+        SYSCALL_SPAWN_EXEC,
+        exec_token,
+        (u64)&table,
+        0,
+        SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE
+    );
+    const u64 child_slot = decode_spawn_process_slot(spawned);
+    if (child_slot == 0) return 0;
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, child_slot) != SYSCALL_OK ||
+        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, child_slot) != SYSCALL_OK ||
+        !grant_driver_mmio(entry, child_slot))
+    {
+        return 0;
+    }
+
+    u64 iommu = 0, q0_submit = 0, q0_notify = 0, q1_submit = 0, q1_notify = 0, command = 0;
+    if (!grant_driver_queue_caps(entry, child_slot, &iommu, &q0_submit, &q0_notify, &q1_submit, &q1_notify, &command)) return 0;
+
+    if (catalog_kind == DEVICE_CATALOG_KIND_CONSOLE) {
+        cfg[0] = CONSOLE_CONFIG_MAGIC;
+        cfg[1] = CONSOLE_CONFIG_VERSION;
+        cfg[CONSOLE_ENDPOINT_ID_INDEX] = endpoint_id;
+        cfg[CONSOLE_COMMON_PAGE_PADDR_INDEX] = entry->common_page_paddr;
+        cfg[CONSOLE_NOTIFY_PAGE_PADDR_INDEX] = entry->notify_page_paddr;
+        cfg[CONSOLE_ISR_PAGE_PADDR_INDEX] = entry->isr_page_paddr;
+        cfg[CONSOLE_DEVICE_PAGE_PADDR_INDEX] = entry->device_page_paddr;
+        cfg[CONSOLE_COMMON_PAGE_OFFSET_INDEX] = entry->common_page_offset;
+        cfg[CONSOLE_NOTIFY_PAGE_OFFSET_INDEX] = entry->notify_page_offset;
+        cfg[CONSOLE_ISR_PAGE_OFFSET_INDEX] = entry->isr_page_offset;
+        cfg[CONSOLE_DEVICE_PAGE_OFFSET_INDEX] = entry->device_page_offset;
+        cfg[CONSOLE_NOTIFY_OFF_MULTIPLIER_INDEX] = entry->notify_off_multiplier;
+        cfg[CONSOLE_IOMMU_TOKEN_INDEX] = iommu;
+        cfg[CONSOLE_RX_QUEUE_SUBMIT_TOKEN_INDEX] = q0_submit;
+        cfg[CONSOLE_RX_QUEUE_NOTIFY_TOKEN_INDEX] = q0_notify;
+        cfg[CONSOLE_TX_QUEUE_SUBMIT_TOKEN_INDEX] = q1_submit;
+        cfg[CONSOLE_TX_QUEUE_NOTIFY_TOKEN_INDEX] = q1_notify;
+        cfg[CONSOLE_COMMAND_TOKEN_INDEX] = command;
+        cfg[CONSOLE_RESOURCE_ID_INDEX] = entry->resource_id;
+        (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, endpoint_id, 0);
+        if (cfg[CONSOLE_DRIVER_STATUS_INDEX] != CONSOLE_STATUS_READY) {
+            user_log("[seed2_root] console status wait deferred\n");
+        }
+        g_console_endpoint_id = endpoint_id;
+        g_console_process_slot = child_slot;
+    } else {
+        cfg[0] = NET_CONFIG_MAGIC;
+        cfg[1] = NET_CONFIG_VERSION;
+        cfg[NET_ENDPOINT_ID_INDEX] = endpoint_id;
+        cfg[NET_COMMON_PAGE_PADDR_INDEX] = entry->common_page_paddr;
+        cfg[NET_NOTIFY_PAGE_PADDR_INDEX] = entry->notify_page_paddr;
+        cfg[NET_ISR_PAGE_PADDR_INDEX] = entry->isr_page_paddr;
+        cfg[NET_DEVICE_PAGE_PADDR_INDEX] = entry->device_page_paddr;
+        cfg[NET_COMMON_PAGE_OFFSET_INDEX] = entry->common_page_offset;
+        cfg[NET_NOTIFY_PAGE_OFFSET_INDEX] = entry->notify_page_offset;
+        cfg[NET_ISR_PAGE_OFFSET_INDEX] = entry->isr_page_offset;
+        cfg[NET_DEVICE_PAGE_OFFSET_INDEX] = entry->device_page_offset;
+        cfg[NET_NOTIFY_OFF_MULTIPLIER_INDEX] = entry->notify_off_multiplier;
+        cfg[NET_IOMMU_TOKEN_INDEX] = iommu;
+        cfg[NET_RX_QUEUE_SUBMIT_TOKEN_INDEX] = q0_submit;
+        cfg[NET_RX_QUEUE_NOTIFY_TOKEN_INDEX] = q0_notify;
+        cfg[NET_TX_QUEUE_SUBMIT_TOKEN_INDEX] = q1_submit;
+        cfg[NET_TX_QUEUE_NOTIFY_TOKEN_INDEX] = q1_notify;
+        cfg[NET_COMMAND_TOKEN_INDEX] = command;
+        cfg[NET_RESOURCE_ID_INDEX] = entry->resource_id;
+        (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, endpoint_id, 0);
+        if (cfg[NET_DRIVER_STATUS_INDEX] == NET_STATUS_FAILED) {
+            user_log("[seed2_root] net status failed deferred\n");
+        } else if (cfg[NET_DRIVER_STATUS_INDEX] != NET_STATUS_READY) {
+            user_log("[seed2_root] net status wait deferred\n");
+        }
+        g_net_endpoint_id = endpoint_id;
+        g_net_process_slot = child_slot;
+    }
+
+    service_registry_set(service_kind, child_slot, endpoint_id);
+    user_log(ready_label);
+    return 1;
+}
+
+static int spawn_root_driver(const char *path, u64 catalog_kind, u64 endpoint_id, u64 service_kind, const char *ready_label) {
+    u64 exec_token = 0;
+    if (!load_root_driver_exec(path, &exec_token)) return 0;
+    return spawn_root_driver_with_exec(exec_token, catalog_kind, endpoint_id, service_kind, ready_label);
+}
+
+static void wait_device_catalog_ready(volatile u64 *config) {
+    g_device_catalog_va = config[9];
+    if (g_device_catalog_va == 0) return;
+    for (u64 i = 0; i < 100000; i++) {
+        if (config[10] == DEVICE_CATALOG_READY) return;
+        (void)wait_event_poll();
+    }
+    user_log("[seed2_root] device catalog ready timeout\n");
+    g_device_catalog_va = 0;
+}
+
+static void launch_root_console_driver(void) {
+    if (g_device_catalog_va == 0) {
+        user_log("[seed2_root] device catalog missing\n");
+        return;
+    }
+    if (!spawn_root_driver("/srv/virtio_console.elf", DEVICE_CATALOG_KIND_CONSOLE, ROOT_CONSOLE_ENDPOINT_ID, SERVICE_KIND_CONSOLE, "[seed2_root] console_server ready\n")) {
+        user_log("[seed2_root] console_server launch failed\n");
+    }
+}
+
+static void preload_root_net_driver(void) {
+    if (g_net_exec_token != 0) return;
+    if (!load_root_driver_exec("/srv/virtio_net.elf", &g_net_exec_token)) {
+        user_log("[seed2_root] net_server preload failed\n");
+    }
+}
+
+static void launch_root_net_driver(void) {
+    if (g_device_catalog_va == 0) {
+        user_log("[seed2_root] device catalog missing\n");
+        return;
+    }
+    if (g_net_exec_token == 0) preload_root_net_driver();
+    if (!spawn_root_driver_with_exec(g_net_exec_token, DEVICE_CATALOG_KIND_NET, ROOT_NET_ENDPOINT_ID, SERVICE_KIND_NET, "[seed2_root] net_server ready\n")) {
+        user_log("[seed2_root] net_server launch failed\n");
+    }
+}
+
 static u64 decode_spawn_process_slot(u64 value) {
     if ((value & SPAWN_RESULT_TAG) == 0) return 0;
     return value & SPAWN_RESULT_PROCESS_MASK;
@@ -580,7 +862,7 @@ static void launch_rootfs_vfs(void) {
     config[6] = g_net_process_slot;
 
     static struct bootstrap_descriptor_table table;
-    clear_page((u64)&table);
+    clear_bytes(&table, sizeof(table));
     table.page_count = 2;
     table.pages[0].source_va = ROOTFS_VFS_CONFIG_VA;
     table.pages[0].target_va = PROCESS_STANDARD_CONFIG_TARGET_VA;
@@ -589,7 +871,13 @@ static void launch_rootfs_vfs(void) {
     table.pages[1].target_va = PROCESS_SERVICE_REGISTRY_SHADOW_VA;
     table.pages[1].flags = 0;
 
-    const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, exec_token, (u64)&table, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE);
+    const u64 spawned = syscall4(
+        SYSCALL_SPAWN_EXEC,
+        exec_token,
+        (u64)&table,
+        0,
+        SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE
+    );
     const u64 child_slot = decode_spawn_process_slot(spawned);
     if (child_slot == 0) {
         user_log("[seed2_root] rootfs_vfs spawn failed\n");
@@ -609,13 +897,13 @@ static void launch_rootfs_vfs(void) {
 }
 
 static void load_startup_manifest(void) {
-    if (g_rootfs_vfs_process_slot != 0 &&
+    if (load_text_from_fat("/sys/startup_manifest.txt", g_startup_manifest, sizeof(g_startup_manifest), &g_startup_manifest_len)) {
+        user_log("[seed2_root] startup manifest ready via fat\n");
+    } else if (g_rootfs_vfs_process_slot != 0 &&
         connect_vfs(ROOTFS_VFS_ENDPOINT_ID, g_rootfs_vfs_process_slot) &&
         load_text_from_vfs("/sys/startup_manifest.txt", g_startup_manifest, sizeof(g_startup_manifest), &g_startup_manifest_len))
     {
         user_log("[seed2_root] startup manifest ready via vfs\n");
-    } else if (load_text_from_fat("/sys/startup_manifest.txt", g_startup_manifest, sizeof(g_startup_manifest), &g_startup_manifest_len)) {
-        user_log("[seed2_root] startup manifest ready via fat fallback\n");
     } else {
         user_log("[seed2_root] startup manifest load failed\n");
     }
@@ -748,10 +1036,11 @@ static int spawn_manifest_node(struct startup_node *node) {
     u64 exec_token = 0;
     const u64 image_va = g_next_sched_image_va;
     g_next_sched_image_va += MAX_SCHED_IMAGE_PAGES * 4096;
+    if (!connect_vfs(ROOTFS_VFS_ENDPOINT_ID, g_rootfs_vfs_process_slot)) return 0;
     if (!load_exec_from_vfs(node->path, image_va, &exec_token)) return 0;
 
     static struct bootstrap_descriptor_table table;
-    clear_page((u64)&table);
+    clear_bytes(&table, sizeof(table));
     table.page_count = 1;
     table.pages[0].source_va = SERVICE_REGISTRY_SOURCE_VA;
     table.pages[0].target_va = PROCESS_SERVICE_REGISTRY_SHADOW_VA;
@@ -824,19 +1113,21 @@ void seed2_root_main(void) {
     const u64 console_process_slot = config[6];
     const u64 net_endpoint_id = config[7];
     const u64 net_process_slot = config[8];
+    wait_device_catalog_ready(config);
+    g_console_endpoint_id = console_endpoint_id;
+    g_console_process_slot = console_process_slot;
     g_net_endpoint_id = net_endpoint_id;
     g_net_process_slot = net_process_slot;
     if (connect_fat(fat_endpoint_id, fat_process_slot)) {
         user_log("[seed2_root] fat connect ok\n");
         service_registry_set(SERVICE_KIND_FAT_FS, fat_process_slot, fat_endpoint_id);
-        if (console_endpoint_id != 0 && console_process_slot != 0) {
-            service_registry_set(SERVICE_KIND_CONSOLE, console_process_slot, console_endpoint_id);
-        }
-        if (net_endpoint_id != 0 && net_process_slot != 0) {
-            service_registry_set(SERVICE_KIND_NET, net_process_slot, net_endpoint_id);
-        }
-        launch_rootfs_vfs();
+        if (g_console_endpoint_id != 0 && g_console_process_slot != 0) service_registry_set(SERVICE_KIND_CONSOLE, g_console_process_slot, g_console_endpoint_id);
+        if (g_net_endpoint_id != 0 && g_net_process_slot != 0) service_registry_set(SERVICE_KIND_NET, g_net_process_slot, g_net_endpoint_id);
+        launch_root_console_driver();
         load_startup_manifest();
+        preload_root_net_driver();
+        launch_root_net_driver();
+        launch_rootfs_vfs();
         run_startup_scheduler();
     } else {
         user_log("[seed2_root] fat connect failed\n");

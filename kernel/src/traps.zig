@@ -55,8 +55,8 @@ pub export var last_stage_source_rip: u64 = 0;
 pub export var last_stage_saved_rip: u64 = 0;
 pub export var page_fault_work_frame: ExceptionTrapFrame = std.mem.zeroes(ExceptionTrapFrame);
 pub export var page_fault_work_frames: [smp.max_cpus]ExceptionTrapFrame = [_]ExceptionTrapFrame{std.mem.zeroes(ExceptionTrapFrame)} ** smp.max_cpus;
-pub export var exception_fault_work_frame: ExceptionTrapFrame = std.mem.zeroes(ExceptionTrapFrame);
 pub export var trap_fault_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
+pub export var trap_fault_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var fatal_exception_resume_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
 pub export var fatal_exception_resume_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var timer_interrupt_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
@@ -69,6 +69,7 @@ pub export var syscall_interrupt_work_frame_cpu_slot: usize = 0;
 pub export var syscall_lstar_cpu_slot: usize = 0;
 pub export var syscall_entry_user_rsp: u64 = 0;
 pub export var syscall_entry_user_rsps: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
+pub export var syscall_entry_saved_r15s: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
 pub export var syscall_entry_is_lstar: u64 = 0;
 pub export var syscall_entry_is_lstars: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
 
@@ -96,8 +97,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(last_stage_saved_rip), &last_stage_saved_rip));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(page_fault_work_frame), &page_fault_work_frame));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(page_fault_work_frames), &page_fault_work_frames));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(exception_fault_work_frame), &exception_fault_work_frame));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(trap_fault_work_frame), &trap_fault_work_frame));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(trap_fault_work_frames), &trap_fault_work_frames));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(fatal_exception_resume_work_frame), &fatal_exception_resume_work_frame));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(fatal_exception_resume_work_frames), &fatal_exception_resume_work_frames));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_interrupt_work_frame), &timer_interrupt_work_frame));
@@ -110,6 +111,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_lstar_cpu_slot), &syscall_lstar_cpu_slot));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_user_rsp), &syscall_entry_user_rsp));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_user_rsps), &syscall_entry_user_rsps));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_saved_r15s), &syscall_entry_saved_r15s));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstar), &syscall_entry_is_lstar));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstars), &syscall_entry_is_lstars));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_return_saved_r10), &user_return_saved_r10));
@@ -142,8 +144,8 @@ pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) 
     if (!map_identity_range(@intFromPtr(&last_stage_saved_rip), @sizeOf(@TypeOf(last_stage_saved_rip)))) return false;
     if (!map_identity_range(@intFromPtr(&page_fault_work_frame), @sizeOf(@TypeOf(page_fault_work_frame)))) return false;
     if (!map_identity_range(@intFromPtr(&page_fault_work_frames), @sizeOf(@TypeOf(page_fault_work_frames)))) return false;
-    if (!map_identity_range(@intFromPtr(&exception_fault_work_frame), @sizeOf(@TypeOf(exception_fault_work_frame)))) return false;
     if (!map_identity_range(@intFromPtr(&trap_fault_work_frame), @sizeOf(@TypeOf(trap_fault_work_frame)))) return false;
+    if (!map_identity_range(@intFromPtr(&trap_fault_work_frames), @sizeOf(@TypeOf(trap_fault_work_frames)))) return false;
     if (!map_identity_range(@intFromPtr(&fatal_exception_resume_work_frame), @sizeOf(@TypeOf(fatal_exception_resume_work_frame)))) return false;
     if (!map_identity_range(@intFromPtr(&fatal_exception_resume_work_frames), @sizeOf(@TypeOf(fatal_exception_resume_work_frames)))) return false;
     if (!map_identity_range(@intFromPtr(&timer_interrupt_work_frame), @sizeOf(@TypeOf(timer_interrupt_work_frame)))) return false;
@@ -156,6 +158,7 @@ pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) 
     if (!map_identity_range(@intFromPtr(&syscall_lstar_cpu_slot), @sizeOf(@TypeOf(syscall_lstar_cpu_slot)))) return false;
     if (!map_identity_range(@intFromPtr(&syscall_entry_user_rsp), @sizeOf(@TypeOf(syscall_entry_user_rsp)))) return false;
     if (!map_identity_range(@intFromPtr(&syscall_entry_user_rsps), @sizeOf(@TypeOf(syscall_entry_user_rsps)))) return false;
+    if (!map_identity_range(@intFromPtr(&syscall_entry_saved_r15s), @sizeOf(@TypeOf(syscall_entry_saved_r15s)))) return false;
     if (!map_identity_range(@intFromPtr(&syscall_entry_is_lstar), @sizeOf(@TypeOf(syscall_entry_is_lstar)))) return false;
     if (!map_identity_range(@intFromPtr(&syscall_entry_is_lstars), @sizeOf(@TypeOf(syscall_entry_is_lstars)))) return false;
     return true;
@@ -214,6 +217,10 @@ fn boundedCurrentCpuSlot() usize {
 
 pub export fn pageFaultWorkFrameForCurrentCpuFromAsm() callconv(.c) *ExceptionTrapFrame {
     return &page_fault_work_frames[boundedCurrentCpuSlot()];
+}
+
+pub export fn trapFaultWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
+    return &trap_fault_work_frames[boundedCurrentCpuSlot()];
 }
 
 pub export fn fatalExceptionResumeWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
@@ -306,10 +313,12 @@ fn asmWriteSyscallReturnToWorkFramePointer() []const u8 {
     return std.fmt.comptimePrint(
         \\
         \\push %rax
+        \\push %r10
         \\
     , .{}) ++ asmCallAligned("syscallReturnWritebackEnabledForCurrentCpuFromAsm") ++ std.fmt.comptimePrint(
         \\
         \\mov %rax, %r11
+        \\pop %r10
         \\pop %rax
         \\cmpq $0, %r11
         \\je 7f
@@ -648,6 +657,33 @@ fn asmStageUserReturnFromWorkFramePointer(comptime iret_offset: usize) []const u
     , .{iret_offset}) ++ asmCallAligned("stageUserReturnFromFramePointerForCurrentCpu");
 }
 
+fn asmExceptionWithErrorHandlerBody(comptime vec_number: u64) []const u8 {
+    return asmCallAligned("pageFaultWorkFrameForCurrentCpuFromAsm") ++
+        \\mov %rax, %r12
+    ++ asmCopyStackFrameToWorkFramePointer(exception_trap_frame_qword_count) ++
+        std.fmt.comptimePrint(
+            \\mov 136(%r12), %rax
+            \\and $0x3, %rax
+            \\cmp $0x3, %rax
+            \\jne 1f
+            \\mov ${d}, %rcx
+            \\mov %r12, %rdx
+        , .{vec_number}) ++
+        asmCallAligned("fatalUserExceptionWithErrorDispatch") ++
+        asmCallAligned("restoreCurrentThreadFxState") ++
+        asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++
+        asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+        \\jmp userReturnToSavedFrame
+        \\1:
+    ++ std.fmt.comptimePrint(
+        \\mov ${d}, %rcx
+        \\mov %r12, %rdx
+    , .{vec_number}) ++
+        asmCallAligned("exceptionWithErrorCommon") ++
+        \\ud2
+    ;
+}
+
 fn asmSysretReturnFromWorkFrame(comptime work_frame_symbol: []const u8, comptime user_cr3_symbol: []const u8) []const u8 {
     return std.fmt.comptimePrint(
         \\
@@ -944,10 +980,18 @@ pub export fn invalidOpcodeHandlerCommon(frame: *const TrapFrame) callconv(.c) n
     h.halt_loop();
 }
 
+pub export fn divideErrorHandlerCommon(frame: *const TrapFrame) callconv(.c) noreturn {
+    const h = getHooks();
+    asm volatile ("cli");
+    writeTrapSummary(h, "DIVIDE ERROR", frame);
+    h.halt_loop();
+}
+
 pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(.c) void {
     const h = getHooks();
     asm volatile ("cli");
     const label = switch (vec) {
+        0 => "DIVIDE ERROR",
         6 => "INVALID OPCODE",
         else => "TRAP",
     };
@@ -1062,17 +1106,10 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
         \\cmp $0x3, %rax
         \\jne 2f
     ++ asmCallAligned("restoreCurrentThreadFxState") ++
+        \\mov %rsp, %rax
+    ++ asmStageUserReturnFromWorkFramePointer(exception_trap_frame_iret_offset) ++
+        \\jmp userReturnToSavedFrame
         \\2:
-        \\mov 128(%rsp), %r10
-        \\mov %r10, user_return_iret_frame(%rip)
-        \\mov 136(%rsp), %r10
-        \\mov %r10, user_return_iret_frame+8(%rip)
-        \\mov 144(%rsp), %r10
-        \\mov %r10, user_return_iret_frame+16(%rip)
-        \\mov 152(%rsp), %r10
-        \\mov %r10, user_return_iret_frame+24(%rip)
-        \\mov 160(%rsp), %r10
-        \\mov %r10, user_return_iret_frame+32(%rip)
         \\pop %r15
         \\pop %r14
         \\pop %r13
@@ -1088,11 +1125,7 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
         \\pop %rcx
         \\pop %rbx
         \\pop %rax
-        \\mov %r10, user_return_saved_r10(%rip)
-        \\lea user_return_iret_frame(%rip), %rsp
-        \\mov user_cr3_value(%rip), %r10
-        \\mov %r10, %cr3
-        \\mov user_return_saved_r10(%rip), %r10
+        \\add $8, %rsp
         \\iretq
         \\1:
         \\mov %rsp, %rdx
@@ -1218,11 +1251,22 @@ fn asmLstarEntryPrefix(comptime cpu_slot: usize) []const u8 {
         \\
         \\mov %rsp, syscall_entry_user_rsp(%rip)
         \\mov %rsp, syscall_entry_user_rsps+{d}(%rip)
+        \\mov %r15, syscall_entry_saved_r15s+{d}(%rip)
+        \\mov kernel_cr3_value(%rip), %r15
+        \\mov %r15, %cr3
         \\movq ${d}, syscall_lstar_cpu_slot(%rip)
         \\movq ${d}, syscall_interrupt_work_frame_cpu_slot(%rip)
         \\mov kernel_syscall_stack_tops+{d}(%rip), %rsp
+        \\mov syscall_entry_saved_r15s+{d}(%rip), %r15
         \\
-    , .{ cpu_slot * @sizeOf(u64), cpu_slot, cpu_slot, cpu_slot * @sizeOf(u64) });
+    , .{
+        cpu_slot * @sizeOf(u64),
+        cpu_slot * @sizeOf(u64),
+        cpu_slot,
+        cpu_slot,
+        cpu_slot * @sizeOf(u64),
+        cpu_slot * @sizeOf(u64),
+    });
 }
 
 fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, comptime user_ss: u64) []const u8 {
@@ -1233,10 +1277,16 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
     const user_cr3_symbol = lstarUserCr3Symbol(cpu_slot);
     const writeback_symbol = lstarReturnWritebackSymbol(cpu_slot);
     const entry_is_lstar_symbol = lstarEntryIsLstarSymbol(cpu_slot);
+    // LSTAR is also the Linux ABI syscall entry. Do not pre-dispatch raw
+    // syscall numbers here: Linux recvfrom/sendmsg are 0x2d/0x2e and must
+    // reach the ABI delegate before any CapabilityOS syscall fast path.
+    const slowpath_gate =
+        \\jmp 29f
+        \\
+    ;
     if (debug_skip_syscall_fx_state) {
-        return asmLstarEntryPrefix(cpu_slot) ++ std.fmt.comptimePrint(
+        return asmLstarEntryPrefix(cpu_slot) ++ slowpath_gate ++ std.fmt.comptimePrint(
             \\
-            \\jmp 29f
             \\cmp $0x2d, %rax
             \\je 20f
             \\cmp $0x2e, %rax
@@ -1268,10 +1318,12 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
             \\22:
             \\mov $1, %rax
             \\23:
+            \\mov {s}(%rip), %r10
+            \\mov %r10, %cr3
             \\mov {s}(%rip), %rsp
             \\sysretq
             \\24:
-        , .{ current_principal_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
             \\jmp userReturnToSavedFrame
             \\
         ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
@@ -1317,7 +1369,7 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
             \\
         ;
     } else {
-        return asmLstarEntryPrefix(cpu_slot) ++ std.fmt.comptimePrint(
+        return asmLstarEntryPrefix(cpu_slot) ++ slowpath_gate ++ std.fmt.comptimePrint(
             \\
             \\jmp 29f
             \\cmp $0x2d, %rax
@@ -1351,10 +1403,12 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
             \\22:
             \\mov $1, %rax
             \\23:
+            \\mov {s}(%rip), %r10
+            \\mov %r10, %cr3
             \\mov {s}(%rip), %rsp
             \\sysretq
             \\24:
-        , .{ current_principal_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
             \\jmp userReturnToSavedFrame
             \\
         ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
@@ -1637,21 +1691,7 @@ pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
         \\push %r13
         \\push %r14
         \\push %r15
-    ++ asmCopyStackFrameToWorkFrame("exception_fault_work_frame", exception_trap_frame_qword_count) ++
-        \\mov exception_fault_work_frame+136(%rip), %rax
-        \\and $0x3, %rax
-        \\cmp $0x3, %rax
-        \\jne 1f
-        \\mov $13, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("fatalUserExceptionWithErrorDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
-        \\jmp userReturnToSavedFrame
-        \\1:
-        \\mov $13, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("exceptionWithErrorCommon") ++
-        \\ud2
-    );
+    ++ asmExceptionWithErrorHandlerBody(13));
 }
 
 pub export fn invalidTssHandlerStub() callconv(.naked) noreturn {
@@ -1675,21 +1715,7 @@ pub export fn invalidTssHandlerStub() callconv(.naked) noreturn {
         \\push %r13
         \\push %r14
         \\push %r15
-    ++ asmCopyStackFrameToWorkFrame("exception_fault_work_frame", exception_trap_frame_qword_count) ++
-        \\mov exception_fault_work_frame+136(%rip), %rax
-        \\and $0x3, %rax
-        \\cmp $0x3, %rax
-        \\jne 1f
-        \\mov $10, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("fatalUserExceptionWithErrorDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
-        \\jmp userReturnToSavedFrame
-        \\1:
-        \\mov $10, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("exceptionWithErrorCommon") ++
-        \\ud2
-    );
+    ++ asmExceptionWithErrorHandlerBody(10));
 }
 
 pub export fn segmentNotPresentHandlerStub() callconv(.naked) noreturn {
@@ -1713,21 +1739,7 @@ pub export fn segmentNotPresentHandlerStub() callconv(.naked) noreturn {
         \\push %r13
         \\push %r14
         \\push %r15
-    ++ asmCopyStackFrameToWorkFrame("exception_fault_work_frame", exception_trap_frame_qword_count) ++
-        \\mov exception_fault_work_frame+136(%rip), %rax
-        \\and $0x3, %rax
-        \\cmp $0x3, %rax
-        \\jne 1f
-        \\mov $11, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("fatalUserExceptionWithErrorDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
-        \\jmp userReturnToSavedFrame
-        \\1:
-        \\mov $11, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("exceptionWithErrorCommon") ++
-        \\ud2
-    );
+    ++ asmExceptionWithErrorHandlerBody(11));
 }
 
 pub export fn stackSegmentFaultHandlerStub() callconv(.naked) noreturn {
@@ -1751,19 +1763,44 @@ pub export fn stackSegmentFaultHandlerStub() callconv(.naked) noreturn {
         \\push %r13
         \\push %r14
         \\push %r15
-    ++ asmCopyStackFrameToWorkFrame("exception_fault_work_frame", exception_trap_frame_qword_count) ++
-        \\mov exception_fault_work_frame+136(%rip), %rax
+    ++ asmExceptionWithErrorHandlerBody(12));
+}
+
+pub export fn divideErrorHandlerStub() callconv(.naked) noreturn {
+    asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
+        \\push %rax
+        \\push %rbx
+        \\push %rcx
+        \\push %rdx
+        \\push %rsi
+        \\push %rdi
+        \\push %rbp
+        \\push %r8
+        \\push %r9
+        \\push %r10
+        \\push %r11
+        \\push %r12
+        \\push %r13
+        \\push %r14
+        \\push %r15
+    ++ asmCallAligned("trapFaultWorkFrameForCurrentCpuFromAsm") ++
+        \\mov %rax, %r12
+    ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+        \\mov 128(%r12), %rax
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 1f
-        \\mov $12, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("fatalUserExceptionWithErrorDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+        \\mov $0, %rcx
+        \\mov %r12, %rdx
+    ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\1:
-        \\mov $12, %rcx
-        \\lea exception_fault_work_frame(%rip), %rdx
-    ++ asmCallAligned("exceptionWithErrorCommon") ++
+        \\mov %r12, %rcx
+    ++ asmCallAligned("divideErrorHandlerCommon") ++
         \\ud2
     );
 }
@@ -1789,17 +1826,19 @@ pub export fn invalidOpcodeHandlerStub() callconv(.naked) noreturn {
         \\push %r13
         \\push %r14
         \\push %r15
-    ++ asmCopyStackFrameToWorkFrame("trap_fault_work_frame", trap_frame_qword_count) ++
-        \\mov trap_fault_work_frame+128(%rip), %rax
+    ++ asmCallAligned("trapFaultWorkFrameForCurrentCpuFromAsm") ++
+        \\mov %rax, %r12
+    ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+        \\mov 128(%r12), %rax
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 1f
         \\mov $6, %rcx
-        \\lea trap_fault_work_frame(%rip), %rdx
+        \\mov %r12, %rdx
     ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\1:
-        \\lea trap_fault_work_frame(%rip), %rcx
+        \\mov %r12, %rcx
     ++ asmCallAligned("invalidOpcodeHandlerCommon") ++
         \\ud2
     );

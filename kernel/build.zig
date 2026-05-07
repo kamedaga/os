@@ -41,31 +41,21 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const legacy_scheduler_ap_queue_experiment = b.option(
-        bool,
-        "scheduler-ap-queue-experiment",
-        "Deprecated alias for scheduler-ap-user-diagnostics",
-    ) orelse false;
     const scheduler_ap_user_diagnostics = b.option(
         bool,
         "scheduler-ap-user-diagnostics",
         "Run boot-time AP user scheduler diagnostics/probes",
-    ) orelse legacy_scheduler_ap_queue_experiment;
-    const legacy_spawn_exec_ap_placement_experiment = b.option(
-        bool,
-        "spawn-exec-ap-placement-experiment",
-        "Deprecated alias for spawn-exec-ap-user-scheduling",
     ) orelse false;
     const spawn_exec_ap_user_scheduling = b.option(
         bool,
         "spawn-exec-ap-user-scheduling",
         "Place spawn_exec children on AP scheduler queues when AP user syscall/trap paths are ready",
-    ) orelse legacy_spawn_exec_ap_placement_experiment;
+    ) orelse true;
     const ap_user_timer_preemption = b.option(
         bool,
         "ap-user-timer-preemption",
-        "Allow AP user threads to be preempted by the AP timer; disabled by default while AP scheduling productionizes",
-    ) orelse false;
+        "Allow AP user threads to be preempted by the AP timer",
+    ) orelse true;
     const build_workarounds = b.addOptions();
     build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
     build_workarounds.addOption(bool, "scheduler_ap_user_diagnostics", scheduler_ap_user_diagnostics);
@@ -94,9 +84,6 @@ pub fn build(b: *std.Build) void {
     const kernel_abi_root_mod = b.createModule(.{
         .root_source_file = b.path("abi/kernel_abi_root.zig"),
     });
-    const persistent_fs_layout_mod = b.createModule(.{
-        .root_source_file = b.path("../userland/programs/abi/persistent_fs_layout.zig"),
-    });
     test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
 
     const efi_mod = b.createModule(.{
@@ -112,48 +99,11 @@ pub fn build(b: *std.Build) void {
         .root_module = efi_mod,
     });
 
-    const init_target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
-        .os_tag = .freestanding,
-        .abi = .none,
-    });
-    const abi_root_mod = b.createModule(.{
-        .root_source_file = b.path("../userland/programs/abi/abi_root.zig"),
-        .target = init_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    abi_root_mod.addImport("persistent_fs_layout", persistent_fs_layout_mod);
-    const init_app_mod = b.createModule(.{
-        .root_source_file = b.path("../bootstrap/programs/init_app.zig"),
-        .target = init_target,
-        .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .red_zone = false,
-    });
-    init_app_mod.addImport("abi_root", abi_root_mod);
-    init_app_mod.strip = true;
-    const init_app = b.addExecutable(.{
-        .name = "INITAPP",
-        .root_module = init_app_mod,
-    });
-    init_app.pie = true;
-    init_app.entry = .{ .symbol_name = "_start" };
-    init_app.link_z_common_page_size = 0x10;
-    init_app.link_z_max_page_size = 0x10;
-    const install_init = b.addInstallArtifact(init_app, .{
-        .dest_sub_path = "EFI/BOOT/INITAPP.ELF",
-    });
-    const init_step = b.step("init-elf", "Build init PIE ELF");
-    init_step.dependOn(&install_init.step);
-
     const install_efi = b.addInstallArtifact(efi_app, .{
         .dest_sub_path = "EFI/BOOT/BOOTX64.EFI",
     });
     // `pactl` owns userland, bootfs/rootfs packaging, and host tools.
     // Keep `zig build efi` focused on kernel-side boot artifacts only.
-    install_efi.step.dependOn(&install_init.step);
     const efi_step = b.step("efi", "Build UEFI kernel application");
     efi_step.dependOn(&install_efi.step);
 }

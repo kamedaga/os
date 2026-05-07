@@ -69,6 +69,12 @@ pub fn buildInitialUserTrapFrame() TrapFrame {
     return frame;
 }
 
+fn releaseStaleThreadSlot(principal: kernel.PrincipalId) void {
+    if (scheduler.threadSlotForPrincipal(principal)) |thread_slot| {
+        _ = scheduler.releaseThreadSlot(thread_slot);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Address space helpers
 // ---------------------------------------------------------------------------
@@ -142,6 +148,7 @@ pub fn tryCreateDynamicUserProcess(
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!DynamicUserProcess {
     const principal = state.createProcessDescriptor(role_label) orelse return error.NoFreeProcess;
+    releaseStaleThreadSlot(principal);
     const process = tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch return error.CreateFailed;
     return .{
         .principal = principal,
@@ -155,6 +162,7 @@ pub fn tryCreateSuspendedUserProcess(
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!SuspendedUserProcess {
     const principal = state.createProcessDescriptor(role_label) orelse return error.NoFreeProcess;
+    releaseStaleThreadSlot(principal);
     if (!user_vm.buildEmptyUserAddressSpace(principal)) {
         _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;

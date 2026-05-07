@@ -4,12 +4,7 @@ typedef unsigned long long u64;
 
 enum {
     SYSCALL_LOG = 0x9,
-    SYSCALL_WAIT_EVENT = 0x17,
-    SYSCALL_GET_PROCESS_STATUS = 0x30,
     SYSCALL_PROCESS_EXIT = 0x34,
-    PROCESS_STATUS_INACTIVE = 0,
-    PROCESS_STATUS_ACTIVE = 1,
-    PROCESS_STATUS_FAULTED = 2,
     DASH_SHIM_REQUEST_VA = 0x27300000ULL,
     DASH_SHIM_RESPONSE_VA = 0x27301000ULL,
     DASH_SHIM_WAIT_TICKS = 120000,
@@ -73,22 +68,5 @@ void dash_shim_main(void) {
         process_exit(1);
     }
     user_log("DashShim: dash spawned\n");
-
-    for (;;) {
-        const u64 status = syscall1(SYSCALL_GET_PROCESS_STATUS, result.linux_abi_process_slot);
-        const u64 status_kind = status & 0xff;
-        if (status_kind == PROCESS_STATUS_INACTIVE) {
-            user_log("DashShim: dash exited\n");
-            process_exit(0);
-        }
-        if (status_kind == PROCESS_STATUS_FAULTED) {
-            user_log("DashShim: dash faulted\n");
-            process_exit(1);
-        }
-        if (status_kind != PROCESS_STATUS_ACTIVE) {
-            user_log("DashShim: dash status invalid\n");
-            process_exit(1);
-        }
-        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
-    }
+    process_exit(0);
 }

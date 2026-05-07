@@ -1,5 +1,5 @@
 use crate::build::planned_artifact_path;
-use crate::config::{discover_apps, WorkspaceConfig};
+use crate::config::{app_is_skipped, discover_apps, WorkspaceConfig};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +8,7 @@ use std::time::SystemTime;
 const OVMF_CODE_PATH: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 const OVMF_VARS_TEMPLATE_PATH: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 const QEMU_DEBUG_FLAGS: &str = "guest_errors,cpu_reset";
-const TIMED_RUN_SECONDS: u32 = 60;
+const TIMED_RUN_SECONDS: u32 = 30;
 const PF_CHECK_RUN_SECONDS: u32 = 60;
 
 pub struct RunOptions {
@@ -184,7 +184,7 @@ pub fn run_qemu(
 
 fn timed_summary_reports_success(path: &Path) -> bool {
     fs::read_to_string(path)
-        .map(|summary| summary.contains("AP Linux smoke complete"))
+        .map(|summary| summary.contains("interactive boot complete"))
         .unwrap_or(false)
 }
 
@@ -219,20 +219,25 @@ fn validate_run_inputs(
         .join("EFI")
         .join("BOOT")
         .join("BOOTX64.EFI");
-    let initapp = workspace_root
+    let kernel_initapp = workspace_root
         .join(&workspace.kernel.dir)
         .join("zig-out")
         .join("bin")
         .join("EFI")
         .join("BOOT")
         .join("INITAPP.ELF");
+    let initapp = discover_apps(workspace_root, workspace)?
+        .iter()
+        .find(|app| app.app.id == "seed2_boot" && !app_is_skipped(workspace, app))
+        .map(|app| planned_artifact_path(workspace_root, workspace, app))
+        .unwrap_or(kernel_initapp);
     let bootfs_image = workspace_root
         .join(&workspace.artifacts.dir)
         .join("bootfs")
         .join("BOOTFS.IMG");
 
     require_nonempty_file(&bootx64, "EFI boot image", "run zig build efi first")?;
-    require_nonempty_file(&initapp, "init image", "run zig build efi first")?;
+    require_nonempty_file(&initapp, "init image", "run pactl setup first")?;
     require_nonempty_file(&bootfs_image, "bootfs image", "run pactl sync bootfs first")?;
 
     let disk_time = modified_time(disk_image)?;
@@ -404,12 +409,14 @@ fn build_wsl_script(
         script.push_str("echo \"CapabilityOS console: $pty\"\n");
         script.push_str("exec 3<>\"$pty\"\n");
         script.push_str("old_stty=\"\"\n");
+        script.push_str("old_pty_stty=$(stty -g < \"$pty\" 2>/dev/null || true)\n");
         script.push_str("if [ -t 0 ]; then old_stty=$(stty -g < /dev/tty 2>/dev/null || true); stty raw -echo < /dev/tty 2>/dev/null || true; fi\n");
-        script.push_str("cleanup() { if [ -n \"$old_stty\" ]; then stty \"$old_stty\" < /dev/tty 2>/dev/null || true; fi; }\n");
+        script.push_str("stty raw -echo < \"$pty\" 2>/dev/null || true\n");
+        script.push_str("cleanup() { if [ -n \"$old_stty\" ]; then stty \"$old_stty\" < /dev/tty 2>/dev/null || true; fi; if [ -n \"$old_pty_stty\" ]; then stty \"$old_pty_stty\" < \"$pty\" 2>/dev/null || true; fi; }\n");
         script.push_str("trap cleanup EXIT\n");
         script.push_str("cat <&3 & reader=$!\n");
         script.push_str("cat >&3 || true\n");
-        script.push_str("kill \"$reader\" 2>/dev/null || true\n");
+        script.push_str("echo \"CapabilityOS console input closed; keeping output attached until QEMU exits.\"\n");
         script.push_str("wait \"$reader\" 2>/dev/null || true\n");
         script.push_str("CAPCONSOLE_ATTACH\n");
         script.push_str("chmod +x \"$RUNTIME_DIR/attach-console.sh\"\n");
@@ -545,7 +552,7 @@ fn build_wsl_script(
         script.push_str("  echo \"serial log: $SERIAL_LOG\"\n");
         script.push_str("  echo \"summary: $SUMMARY_LOG\"\n");
         script.push_str("  if [ \"$summary_status\" -eq 0 ]; then\n");
-        script.push_str("    echo 'timed run reached AP Linux smoke success before timeout'\n");
+        script.push_str("    echo 'timed run reached interactive boot success before timeout'\n");
         script.push_str("    trap - EXIT\n");
         script.push_str("    exit 0\n");
         script.push_str("  fi\n");
@@ -566,7 +573,7 @@ fn build_wsl_script(
         script.push_str("echo \"serial log: $SERIAL_LOG\"\n");
         script.push_str("echo \"summary: $SUMMARY_LOG\"\n");
         script.push_str("if [ \"$summary_status\" -eq 0 ] && { [ \"$qemu_status\" -eq 0 ] || [ \"$qemu_status\" -eq 1 ]; }; then\n");
-        script.push_str("  echo 'timed run reached AP Linux smoke success'\n");
+        script.push_str("  echo 'timed run reached interactive boot success'\n");
         script.push_str("  trap - EXIT\n");
         script.push_str("  exit 0\n");
         script.push_str("fi\n");

@@ -21,6 +21,7 @@ pub const Hooks = struct {
 pub const Request = struct {
     requested: bool = false,
     child_bootstrap_owner: bool = false,
+    allow_bootstrap_ap_placement: bool = false,
     descriptor_mode: bool = false,
     extended_descriptor_mode: bool = false,
     page_descriptors: [process_abi.max_bootstrap_page_descriptors]process_abi.BootstrapPageDescriptor = undefined,
@@ -39,10 +40,16 @@ pub fn parseRequest(
 ) u64 {
     out.* = .{};
     const child_bootstrap_owner = (bootstrap_flags & process_abi.spawn_flag_child_bootstrap_owner) != 0;
-    const request_flags = bootstrap_flags & ~process_abi.spawn_flag_child_bootstrap_owner;
+    const allow_bootstrap_ap_placement = (bootstrap_flags & process_abi.spawn_flag_allow_bootstrap_ap_placement) != 0;
+    const request_flags = bootstrap_flags & ~(process_abi.spawn_flag_child_bootstrap_owner | process_abi.spawn_flag_allow_bootstrap_ap_placement);
     out.child_bootstrap_owner = child_bootstrap_owner;
+    out.allow_bootstrap_ap_placement = allow_bootstrap_ap_placement;
     if (child_bootstrap_owner and !hooks.state.isBootstrapOwner(caller)) {
         hooks.write("spawn_exec child bootstrap owner denied\n");
+        return hooks.syscall_err_invalid;
+    }
+    if (allow_bootstrap_ap_placement and !hooks.state.isBootstrapOwner(caller)) {
+        hooks.write("spawn_exec bootstrap AP placement denied\n");
         return hooks.syscall_err_invalid;
     }
     out.requested = bootstrap_source_va != 0 or bootstrap_target_va != 0 or request_flags != 0;

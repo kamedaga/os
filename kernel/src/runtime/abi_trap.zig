@@ -834,6 +834,10 @@ fn dispatchKnownDelegateWithHooks(h: *const Hooks, proc: kernel.PrincipalId, del
     }
 
     if (!h.block_current_thread_for_event(frame, false, 0, boot_static.syscall_err_not_ready)) {
+        if (consumeQueuedReplyForPrincipalFromSender(h, proc, target_thread, frame)) {
+            current_ctx.abi_trap_reply_pending = false;
+            return frame.rax;
+        }
         current_ctx.abi_trap_reply_pending = false;
         return boot_static.syscall_err_not_ready;
     }

@@ -416,8 +416,8 @@ fn getProcessSlot() u64 {
     return syscall1(syscall_get_process_slot, 0);
 }
 
-fn getProcessStatus(process_slot: u64) process_abi.ProcessStatusKind {
-    return process_abi.decodeProcessStatusKind(syscall1(process_abi.syscall_get_process_status, process_slot));
+fn getProcessStatusRaw(process_slot: u64) u64 {
+    return syscall1(process_abi.syscall_get_process_status, process_slot);
 }
 
 fn processExit(code: u64) noreturn {
@@ -810,17 +810,21 @@ fn resolveNeededPath(
     const origin = originDir(requester_path);
     if (runpath.len != 0) {
         if (resolveFromSearchList(client, root_token, runpath, origin, name, out)) |path| {
-            userLog("ExecLoader: resolve via RUNPATH: ");
-            userLog(path);
-            userLog("\n");
+            if (exec_loader_profile_enabled) {
+                userLog("ExecLoader: resolve via RUNPATH: ");
+                userLog(path);
+                userLog("\n");
+            }
             return path;
         }
     }
     if (rpath.len != 0) {
         if (resolveFromSearchList(client, root_token, rpath, origin, name, out)) |path| {
-            userLog("ExecLoader: resolve via RPATH: ");
-            userLog(path);
-            userLog("\n");
+            if (exec_loader_profile_enabled) {
+                userLog("ExecLoader: resolve via RPATH: ");
+                userLog(path);
+                userLog("\n");
+            }
             return path;
         }
     }
@@ -1036,9 +1040,11 @@ fn loadNeededLibs(
         };
         const soname = imageSoname(scratch_va, identity_ehdr, file_bytes) orelse "";
         if (soname.len != 0 and pathInList(loaded_sonames[0..], lib_count, soname)) {
-            userLog("ExecLoader: skip duplicate SONAME: ");
-            userLog(soname);
-            userLog("\n");
+            if (exec_loader_profile_enabled) {
+                userLog("ExecLoader: skip duplicate SONAME: ");
+                userLog(soname);
+                userLog("\n");
+            }
             continue;
         }
 
@@ -1070,14 +1076,18 @@ fn loadNeededLibs(
         loaded_sonames[lib_count].len = 0;
         if (soname.len != 0) {
             _ = storePath(&loaded_sonames[lib_count], soname);
-            userLog("ExecLoader: lib SONAME: ");
-            userLog(soname);
-            userLog("\n");
+            if (exec_loader_profile_enabled) {
+                userLog("ExecLoader: lib SONAME: ");
+                userLog(soname);
+                userLog("\n");
+            }
         }
         lib_count += 1;
-        userLog("ExecLoader: lib loaded: ");
-        userLog(path);
-        userLog("\n");
+        if (exec_loader_profile_enabled) {
+            userLog("ExecLoader: lib loaded: ");
+            userLog(path);
+            userLog("\n");
+        }
 
         collectNeededPaths(client, root_token, path, scratch_va, lib_image.ehdr, file_bytes, queue[0..], &queue_count, loaded_paths[0..], loaded_sonames[0..], lib_count);
     }
@@ -1760,11 +1770,13 @@ fn launchExec(
         userLog("ExecLoader: entry overflow\n");
         return null;
     }
-    userLog("ExecLoader: main ");
-    userLogHexField("bias=", main_image.load_bias);
-    userLogHexField(" entry=", main_entry);
-    userLogHexField(" phoff=", main_image.ehdr.phoff);
-    userLog("\n");
+    if (exec_loader_profile_enabled) {
+        userLog("ExecLoader: main ");
+        userLogHexField("bias=", main_image.load_bias);
+        userLogHexField(" entry=", main_entry);
+        userLogHexField(" phoff=", main_image.ehdr.phoff);
+        userLog("\n");
+    }
     var initial_entry = main_entry;
     var interp_base: u64 = 0;
 
@@ -1808,14 +1820,16 @@ fn launchExec(
         }
         initial_entry = interp_entry;
         interp_base = interp_image.load_bias;
-        userLog("ExecLoader: standard interpreter loaded ");
-        userLogHexField("bias=", interp_image.load_bias);
-        userLogHexField(" entry=", interp_entry);
-        if (interp_image.dynamic_phdr) |dynamic_phdr| {
-            const dynamic_va, const dynamic_overflow = @addWithOverflow(interp_image.load_bias, dynamic_phdr.vaddr);
-            if (dynamic_overflow == 0) userLogHexField(" dynamic=", dynamic_va);
+        if (exec_loader_profile_enabled) {
+            userLog("ExecLoader: standard interpreter loaded ");
+            userLogHexField("bias=", interp_image.load_bias);
+            userLogHexField(" entry=", interp_entry);
+            if (interp_image.dynamic_phdr) |dynamic_phdr| {
+                const dynamic_va, const dynamic_overflow = @addWithOverflow(interp_image.load_bias, dynamic_phdr.vaddr);
+                if (dynamic_overflow == 0) userLogHexField(" dynamic=", dynamic_va);
+            }
+            userLog("\n");
         }
-        userLog("\n");
     }
 
     profileEvent("stack alloc begin");
@@ -1847,18 +1861,22 @@ fn launchExec(
         userLog("ExecLoader: linux stack failed\n");
         return null;
     };
-    userLog("ExecLoader: linux stack ");
-    userLogHexField("rsp=", initial_rsp);
-    userLogHexField(" bottom=", linux_stack_bottom_va);
-    userLogHexField(" top=", process_abi.user_stack_top);
-    userLog("\n");
+    if (exec_loader_profile_enabled) {
+        userLog("ExecLoader: linux stack ");
+        userLogHexField("rsp=", initial_rsp);
+        userLogHexField(" bottom=", linux_stack_bottom_va);
+        userLogHexField(" top=", process_abi.user_stack_top);
+        userLog("\n");
+    }
     profileEvent("linux stack done");
     profileEvent("context begin");
-    userLog("ExecLoader: initial context ");
-    userLogHexField("rip=", initial_entry);
-    userLogHexField(" rsp=", initial_rsp);
-    userLogHexField(" interp_base=", interp_base);
-    userLog("\n");
+    if (exec_loader_profile_enabled) {
+        userLog("ExecLoader: initial context ");
+        userLogHexField("rip=", initial_entry);
+        userLogHexField(" rsp=", initial_rsp);
+        userLogHexField(" interp_base=", interp_base);
+        userLog("\n");
+    }
     if (!setProcessInitialContext(process_token, initial_entry, initial_rsp)) {
         abortProcess(process_token);
         userLog("ExecLoader: set context failed\n");
@@ -1879,7 +1897,7 @@ fn launchExec(
             return null;
         }
         profileEvent("abi delegate done");
-        userLog("ExecLoader: abi trap delegate ready\n");
+        if (exec_loader_profile_enabled) userLog("ExecLoader: abi trap delegate ready\n");
     }
     profileEvent("start process begin");
     const spawned = startProcess(process_token) orelse {
@@ -1892,7 +1910,7 @@ fn launchExec(
 }
 
 pub export fn _start() noreturn {
-    userLog("ExecLoader: started\n");
+    if (exec_loader_profile_enabled) userLog("ExecLoader: started\n");
     profileEvent("entry begin");
     const cfg: *const exec_loader_bootstrap_abi.Config = @ptrFromInt(exec_loader_bootstrap_abi.target_va);
     if (cfg.magic != exec_loader_bootstrap_abi.magic or cfg.version != exec_loader_bootstrap_abi.version) {
@@ -1900,16 +1918,23 @@ pub export fn _start() noreturn {
     } else if (image_abi.decodeVmObjectToken(cfg.executable_vm_token) == null or cfg.executable_file_bytes == 0) {
         userLog("ExecLoader: invalid executable token\n");
     } else if (launchExec(cfg, cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes)) |child_process_slot| {
-        userLog("ExecLoader: child started\n");
+        if (exec_loader_profile_enabled) userLog("ExecLoader: child started\n");
         while (true) {
-            switch (getProcessStatus(child_process_slot)) {
+            const status = getProcessStatusRaw(child_process_slot);
+            switch (process_abi.decodeProcessStatusKind(status)) {
                 .active => asm volatile ("pause"),
                 .inactive => {
                     userLog("ExecLoader: child exited\n");
                     processExit(0);
                 },
                 .faulted => {
-                    userLog("ExecLoader: child faulted\n");
+                    userLog("ExecLoader: child faulted slot=");
+                    userLogHex(child_process_slot);
+                    userLog(" status=");
+                    userLogHex(status);
+                    userLog(" vector=");
+                    userLogHex(process_abi.decodeProcessStatusFaultVector(status));
+                    userLog("\n");
                     processExit(1);
                 },
             }

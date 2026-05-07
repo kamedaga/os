@@ -19,7 +19,6 @@ void linux_abi_main(void) {
     (void)install_self_wake_endpoint();
     if (!connect_vfs_from_registry()) user_log("LinuxAbiServer: vfs connect failed\n");
     if (!connect_console_from_registry()) user_log("LinuxAbiServer: console connect skipped\n");
-    if (!connect_net_from_registry()) user_log("LinuxAbiServer: net connect skipped\n");
     init_process_tables();
     cfg->status = LINUX_ABI_BOOTSTRAP_READY;
     user_log("LinuxAbiServer: started\n");
@@ -39,6 +38,7 @@ void linux_abi_main(void) {
         }
         g_proc = process_state_for(req->caller_principal);
         if (!g_proc) { msg = reply(errno_busy(), 0); continue; }
+        profile_count_syscall(req->nr);
         switch (req->nr) {
         case LINUX_SYS_READ: msg = handle_read(req); break;
         case LINUX_SYS_WRITE: msg = handle_write(req); break;
@@ -56,7 +56,10 @@ void linux_abi_main(void) {
         case LINUX_SYS_CONNECT: msg = handle_connect_socket(req); break;
         case LINUX_SYS_BIND: msg = handle_bind_socket(req); break;
         case LINUX_SYS_SENDTO: msg = handle_sendto(req); break;
+        case LINUX_SYS_SENDMSG: msg = handle_sendmsg_socket(req); break;
         case LINUX_SYS_RECVFROM: msg = handle_recvfrom(req); break;
+        case LINUX_SYS_RECVMSG: msg = handle_recvmsg_socket(req); break;
+        case LINUX_SYS_SHUTDOWN: msg = handle_shutdown_socket(req); break;
         case LINUX_SYS_GETSOCKNAME: msg = handle_getsockname_socket(req); break;
         case LINUX_SYS_GETPEERNAME: msg = handle_getpeername_socket(req); break;
         case LINUX_SYS_SETSOCKOPT: msg = handle_setsockopt_socket(req); break;
@@ -80,10 +83,14 @@ void linux_abi_main(void) {
         case LINUX_SYS_ACCESS: msg = handle_access(req); break;
         case LINUX_SYS_GETCWD: msg = handle_getcwd(req); break;
         case LINUX_SYS_CHDIR: msg = handle_chdir(req); break;
+        case LINUX_SYS_RENAME: msg = handle_renameat(req, 1, 0); break;
         case LINUX_SYS_UNLINK: msg = handle_unlinkat(req, 1); break;
         case LINUX_SYS_UNLINKAT: msg = handle_unlinkat(req, 0); break;
+        case LINUX_SYS_RENAMEAT: msg = handle_renameat(req, 0, 0); break;
         case LINUX_SYS_READLINK: msg = handle_readlink(req); break;
         case LINUX_SYS_UNAME: msg = handle_uname(req); break;
+        case LINUX_SYS_TIME: msg = handle_time_syscall(req); break;
+        case LINUX_SYS_GETTIMEOFDAY: msg = handle_gettimeofday(req); break;
         case LINUX_SYS_CLOCK_GETTIME: msg = handle_clock_gettime(req); break;
         case LINUX_SYS_SCHED_GETAFFINITY: msg = handle_sched_getaffinity(req); break;
         case LINUX_SYS_MEMBARRIER: msg = handle_membarrier(req); break;
@@ -99,6 +106,8 @@ void linux_abi_main(void) {
         case LINUX_SYS_FUTEX: msg = handle_futex(req); break;
         case LINUX_SYS_IOCTL: msg = handle_ioctl(req); break;
         case LINUX_SYS_MADVISE: case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_RENAMEAT2: msg = handle_renameat(req, 0, 1); break;
+        case LINUX_SYS_SETITIMER: case LINUX_SYS_EVENTFD2: msg = reply(errno_nosys(), 0); break;
         case LINUX_SYS_GETPID: msg = reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0); break;
         case LINUX_SYS_GETTID: msg = reply(g_proc && g_proc->tid != 0 ? g_proc->tid : 1, 0); break;
         case LINUX_SYS_GETPPID: msg = reply(1, 0); break;
@@ -106,15 +115,32 @@ void linux_abi_main(void) {
         case LINUX_SYS_GETPGID: msg = handle_getpgid(req); break;
         case LINUX_SYS_GETUID: case LINUX_SYS_GETGID: case LINUX_SYS_GETEUID: case LINUX_SYS_GETEGID: msg = reply(0, 0); break;
         case LINUX_SYS_UMASK: msg = reply(022, 0); break;
-        case LINUX_SYS_GETRANDOM: msg = reply(errno_again(), 0); break;
+        case LINUX_SYS_GETRANDOM: msg = handle_getrandom(req); break;
         case LINUX_SYS_EXIT:
         case LINUX_SYS_EXIT_GROUP:
             {
+                profile_clear();
                 const u64 exiting_principal = req->caller_principal;
                 struct linux_process_state *exiting_proc = g_proc;
                 const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
                 const int exiting_thread = exiting_proc && exiting_proc->tid != exiting_proc->pid;
                 const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
+                const int process_exits = exit_group || !exiting_thread;
+                if (g_root_linux_principal_set && (exiting_principal == g_root_linux_principal || exiting_pid == g_root_linux_principal)) {
+                    user_log("LinuxAbiServer: root exit nr=");
+                    user_log_dec_value(req->nr);
+                    user_log(" principal=");
+                    user_log_hex_value(exiting_principal);
+                    user_log("LinuxAbiServer: root exit pid=");
+                    user_log_hex_value(exiting_pid);
+                    user_log("LinuxAbiServer: root exit status=");
+                    user_log_hex_value(req->args[0] & 0xffu);
+                    user_log("LinuxAbiServer: root exit group=");
+                    user_log_dec_value(exit_group);
+                    user_log(" process=");
+                    user_log_dec_value(process_exits);
+                    user_log("\n");
+                }
                 if (exiting_proc) exiting_proc->exit_status = (u32)(req->args[0] & 0xffu);
                 if (exit_group && exiting_proc) {
                     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
@@ -128,11 +154,7 @@ void linux_abi_main(void) {
                         remove_futex_waiters_for_principal(thread_proc->principal);
                         const u64 reply_status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
                         if (reply_status == SYSCALL_OK) {
-                            user_log("LinuxAbiServer: exit_group teardown thread\n");
                             thread_proc->used = 0;
-                        } else {
-                            user_log("LinuxAbiServer: exit_group teardown pending miss=");
-                            user_log_hex_value(reply_status);
                         }
                     }
                 }
@@ -140,9 +162,8 @@ void linux_abi_main(void) {
                     const u32 zero = 0;
                     (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
                     (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
-                    if (exiting_thread) user_log("LinuxAbiServer: clear_child_tid wake\n");
                 }
-                if (!exiting_thread) {
+                if (process_exits) {
                     if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
                     (void)satisfy_pending_waiters_for_child(exiting_pid);
                     close_all_process_fds(g_proc);
@@ -158,7 +179,6 @@ void linux_abi_main(void) {
                     root_exited = (root_status & 0xff) != 1;
                 }
                 if (root_exited && !has_live_linux_process_state() && !has_open_pipe_state() && !has_known_child_slots()) {
-                    user_log("LinuxAbiServer: companion exit\n");
                     process_exit(0);
                 }
             }

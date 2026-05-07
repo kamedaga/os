@@ -30,7 +30,19 @@ pub fn deliverOrQueueMessageToThread(
     const target_hot = scheduler.getIpcHotThreadConst(target_thread) orelse return boot_static.syscall_err_endpoint;
     if (target_hot.allocated == 0) return boot_static.syscall_err_endpoint;
     const abi_reply_to_pending_target = target_ctx.abi_trap_reply_pending and endpoint_id == 0 and !grants_reply;
+    if (abi_reply_to_pending_target and target_hot.ready != 0) {
+        // The target has issued an ABI trap but has not necessarily saved its
+        // current trap frame and blocked yet. Queue the reply so the caller can
+        // consume it before blocking; writing target_ctx.frame here can be
+        // overwritten by the late block path on another CPU.
+        if (!scheduler.enqueueIpcMessageForThread(target_thread, endpoint_id, sender_thread, grants_reply, mr0, mr1, mr2, mr3)) {
+            return boot_static.syscall_err_not_ready;
+        }
+        scheduler.preferIpcSwitchToThread(target_thread);
+        return boot_static.syscall_ok;
+    }
     if (target_hot.ready == 0 or abi_reply_to_pending_target) {
+        scheduler.prepareBlockedThreadForWake(target_thread);
         target_ctx.wait_mailbox = false;
         target_ctx.wake_tick = 0;
         if (grants_reply) {

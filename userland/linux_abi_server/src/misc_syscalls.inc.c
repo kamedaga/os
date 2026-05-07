@@ -43,6 +43,29 @@ static struct ipc_message handle_readlink(const struct trap_request *req) {
 }
 
 struct linux_timespec { i64 tv_sec; i64 tv_nsec; };
+struct linux_timeval { i64 tv_sec; i64 tv_usec; };
+struct linux_timezone { int tz_minuteswest; int tz_dsttime; };
+enum {
+    LINUX_CLOCK_REALTIME = 0,
+    LINUX_CLOCK_MONOTONIC = 1,
+    LINUX_CLOCK_MONOTONIC_RAW = 4,
+    LINUX_CLOCK_BOOTTIME = 7,
+    LINUX_ABI_MONOTONIC_NS_PER_TICK = 1000000,
+    CAPABILITYOS_CERT_TIME_UNIX = 1778025600
+};
+
+static i64 realtime_unix_seconds(void) {
+    const u64 rtc = syscall0(SYSCALL_GET_RTC_UNIX_TIME);
+    if (rtc != 0) return (i64)rtc;
+    return CAPABILITYOS_CERT_TIME_UNIX;
+}
+
+static void monotonic_timespec(struct linux_timespec *ts) {
+    const u64 ticks = syscall0(SYSCALL_GET_TICK_COUNT);
+    const u64 ns = ticks * (u64)LINUX_ABI_MONOTONIC_NS_PER_TICK;
+    ts->tv_sec = (i64)(ns / 1000000000ULL);
+    ts->tv_nsec = (i64)(ns % 1000000000ULL);
+}
 struct linux_utsname {
     char sysname[65];
     char nodename[65];
@@ -71,10 +94,42 @@ static struct ipc_message handle_uname(const struct trap_request *req) {
 }
 
 static struct ipc_message handle_clock_gettime(const struct trap_request *req) {
+    const u64 clock_id = req->args[0];
     struct linux_timespec ts;
-    ts.tv_sec = 1;
-    ts.tv_nsec = 0;
+    if (clock_id == LINUX_CLOCK_REALTIME) {
+        ts.tv_sec = realtime_unix_seconds();
+        ts.tv_nsec = 0;
+    } else if (clock_id == LINUX_CLOCK_MONOTONIC ||
+        clock_id == LINUX_CLOCK_MONOTONIC_RAW ||
+        clock_id == LINUX_CLOCK_BOOTTIME)
+    {
+        monotonic_timespec(&ts);
+    } else {
+        monotonic_timespec(&ts);
+    }
     return copy_to_target(req->args[1], &ts, sizeof(ts)) == sizeof(ts) ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+static struct ipc_message handle_gettimeofday(const struct trap_request *req) {
+    if (req->args[0] != 0) {
+        struct linux_timeval tv;
+        tv.tv_sec = realtime_unix_seconds();
+        tv.tv_usec = 0;
+        if (copy_to_target(req->args[0], &tv, sizeof(tv)) != sizeof(tv)) return reply(errno_fault(), 0);
+    }
+    if (req->args[1] != 0) {
+        struct linux_timezone tz;
+        tz.tz_minuteswest = 0;
+        tz.tz_dsttime = 0;
+        if (copy_to_target(req->args[1], &tz, sizeof(tz)) != sizeof(tz)) return reply(errno_fault(), 0);
+    }
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_time_syscall(const struct trap_request *req) {
+    const i64 now = realtime_unix_seconds();
+    if (req->args[0] != 0 && copy_to_target(req->args[0], &now, sizeof(now)) != sizeof(now)) return reply(errno_fault(), 0);
+    return reply((u64)now, 0);
 }
 
 static struct ipc_message handle_membarrier(const struct trap_request *req) {
@@ -99,6 +154,50 @@ static struct ipc_message handle_sched_getaffinity(const struct trap_request *re
     for (u64 i = 0; i < n; i++) mask[i] = 0;
     mask[0] = 1;
     return copy_to_target(mask_va, mask, n) == n ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+static int cpu_has_rdrand(void) {
+    u32 eax = 1, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+    (void)ebx;
+    (void)edx;
+    return (ecx & (1u << 30)) != 0;
+}
+
+static int rdrand64(u64 *out) {
+    unsigned char ok = 0;
+    u64 value = 0;
+    for (u32 attempt = 0; attempt < 16; attempt++) {
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(value), "=qm"(ok));
+        if (ok) {
+            *out = value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static struct ipc_message handle_getrandom(const struct trap_request *req) {
+    enum { GRND_NONBLOCK = 0x0001, GRND_RANDOM = 0x0002 };
+    const u64 dst = req->args[0];
+    const u64 len = req->args[1];
+    const u64 flags = req->args[2];
+    g_prof.getrandom_calls++;
+    if (dst == 0 && len != 0) return reply(errno_fault(), 0);
+    if ((flags & ~(u64)(GRND_NONBLOCK | GRND_RANDOM)) != 0) return reply(errno_inval(), 0);
+    if (len == 0) return reply(0, 0);
+    if (!cpu_has_rdrand()) return reply(errno_again(), 0);
+
+    u64 copied = 0;
+    while (copied < len) {
+        u64 value = 0;
+        if (!rdrand64(&value)) return copied != 0 ? reply(copied, 0) : reply(errno_again(), 0);
+        const u64 chunk = min_u64(len - copied, sizeof(value));
+        if (copy_to_target(dst + copied, &value, chunk) != chunk) return copied != 0 ? reply(copied, 0) : reply(errno_fault(), 0);
+        copied += chunk;
+    }
+    g_prof.getrandom_bytes += copied;
+    return reply(copied, 0);
 }
 
 struct linux_termios_kernel {

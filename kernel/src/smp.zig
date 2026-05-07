@@ -505,15 +505,21 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
         apStartedPtr(cpu_slot).* = 0;
         runtimeLapicIdPtr(cpu_slot).* = 0xFF;
         cpuStatePtr(cpu_slot).* = cpu_state_booting;
+        if (!x86_platform.mapCpuRuntimeStacks(cpu_slot)) {
+            logApStart(cpu_slot, apic_id, false);
+            cpu_slot += 1;
+            continue;
+        }
+        const stack_top = x86_platform.cpuKernelStackTop(cpu_slot) orelse {
+            logApStart(cpu_slot, apic_id, false);
+            cpu_slot += 1;
+            continue;
+        };
         const trampoline_base = info.trampoline_base + (@as(u64, @intCast(cpu_slot)) * trampoline_page_bytes);
         const vector = buildTrampoline(
             trampoline_base,
             kernel_cr3,
-            x86_platform.cpuKernelStackTop(cpu_slot) orelse {
-                logApStart(cpu_slot, apic_id, false);
-                cpu_slot += 1;
-                continue;
-            },
+            stack_top,
             cpu_slot,
             @intFromPtr(&apIdleEntry),
         ) orelse {
@@ -543,6 +549,7 @@ fn apIdleEntry(cpu_slot: usize) callconv(.c) noreturn {
         while (true) asm volatile ("hlt");
     }
     x86_platform.loadInterruptTableForCurrentCpu();
+    _ = x86_platform.enablePcidIfSupported();
     if (cpu_slot < lstar_entries.len and lstar_entries[cpu_slot] != 0) {
         x86_platform.installSyscallEntry(lstar_entries[cpu_slot]);
     }
@@ -597,8 +604,17 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
     x86_platform.writeFsBase(entry.fs_base);
     asm volatile (std.fmt.comptimePrint(
             \\mov %[entry], %%rbx
+            \\mov {d}(%%rbx), %%r11
+            \\push %%r11
+            \\lea {d}(%%rbx), %%rbx
             \\mov {d}(%%rbx), %%r10
-            \\mov %%r10, %%cr3
+            \\push %%r10
+            \\mov {d}(%%rbx), %%r10
+            \\push %%r10
+            \\mov {d}(%%rbx), %%r10
+            \\push %%r10
+            \\mov {d}(%%rbx), %%r10
+            \\push %%r10
             \\mov {d}(%%rbx), %%r10
             \\push %%r10
             \\mov {d}(%%rbx), %%r10
@@ -613,7 +629,6 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
             \\mov {d}(%%rbx), %%r14
             \\mov {d}(%%rbx), %%r13
             \\mov {d}(%%rbx), %%r12
-            \\mov {d}(%%rbx), %%r11
             \\mov {d}(%%rbx), %%r9
             \\mov {d}(%%rbx), %%r8
             \\mov {d}(%%rbx), %%rbp
@@ -621,32 +636,36 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
             \\mov {d}(%%rbx), %%rsi
             \\mov {d}(%%rbx), %%rdx
             \\mov {d}(%%rbx), %%rcx
-            \\mov {d}(%%rbx), %%rax
-            \\mov {d}(%%rbx), %%r10
-            \\mov {d}(%%rbx), %%rbx
+            \\mov 72(%%rsp), %%r11
+            \\mov %%r11, %%cr3
+            \\pop %%rax
+            \\pop %%r10
+            \\pop %%rbx
+            \\pop %%r11
             \\iretq
         , .{
             @offsetOf(scheduler_observer.UserEntry, "cr3"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "ss"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rsp"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rflags"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "cs"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rip"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r15"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r14"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r13"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r12"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r11"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r9"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r8"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rbp"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rdi"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rsi"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rdx"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rcx"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rax"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "r10"),
-            @offsetOf(scheduler_observer.UserEntry, "frame") + @offsetOf(interrupts.TrapFrame, "rbx"),
+            @offsetOf(scheduler_observer.UserEntry, "frame"),
+            @offsetOf(interrupts.TrapFrame, "ss"),
+            @offsetOf(interrupts.TrapFrame, "rsp"),
+            @offsetOf(interrupts.TrapFrame, "rflags"),
+            @offsetOf(interrupts.TrapFrame, "cs"),
+            @offsetOf(interrupts.TrapFrame, "rip"),
+            @offsetOf(interrupts.TrapFrame, "r11"),
+            @offsetOf(interrupts.TrapFrame, "rbx"),
+            @offsetOf(interrupts.TrapFrame, "r10"),
+            @offsetOf(interrupts.TrapFrame, "rax"),
+            @offsetOf(interrupts.TrapFrame, "r15"),
+            @offsetOf(interrupts.TrapFrame, "r14"),
+            @offsetOf(interrupts.TrapFrame, "r13"),
+            @offsetOf(interrupts.TrapFrame, "r12"),
+            @offsetOf(interrupts.TrapFrame, "r9"),
+            @offsetOf(interrupts.TrapFrame, "r8"),
+            @offsetOf(interrupts.TrapFrame, "rbp"),
+            @offsetOf(interrupts.TrapFrame, "rdi"),
+            @offsetOf(interrupts.TrapFrame, "rsi"),
+            @offsetOf(interrupts.TrapFrame, "rdx"),
+            @offsetOf(interrupts.TrapFrame, "rcx"),
         })
         :
         : [entry] "r" (entry),

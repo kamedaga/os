@@ -20,9 +20,11 @@ enum {
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
+    SYSCALL_GET_TICK_COUNT = 0x2D,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_GET_PROCESS_STATUS = 0x30,
     SYSCALL_PROCESS_EXIT = 0x34,
+    SYSCALL_GET_RTC_UNIX_TIME = 0x3E,
     SYSCALL_IPC_CALL_REPLY_RECV = 0x40,
     SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES = 0x4C,
     SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET = 0x4D,
@@ -84,10 +86,13 @@ enum {
     FS_OP_CREATE = 22,
     FS_OP_WRITE = 23,
     FS_OP_UNLINK = 24,
+    FS_OP_RENAME = 25,
     FS_OP_OPEN_EXEC = 32,
     FS_STATUS_OK = 0,
+    FS_STATUS_INVALID = 1,
     FS_STATUS_NOT_FOUND = 2,
     FS_STATUS_NOT_DIR = 3,
+    FS_STATUS_NOT_SUPPORTED = 7,
     FS_STATUS_END_OF_DIR = 10,
     FS_OBJECT_NONE = 0,
     FS_OBJECT_MOUNT = 1,
@@ -143,6 +148,7 @@ enum {
     NET_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - NET_RESPONSE_HEADER_BYTES,
     NET_UDP_MAX_PAYLOAD = 1200,
     NET_TCP_MAX_PAYLOAD = 1200,
+    NET_TCP_READ_BYTES = NET_RESPONSE_PAYLOAD_BYTES,
 
     LINUX_SYS_READ = 0,
     LINUX_SYS_WRITE = 1,
@@ -169,11 +175,15 @@ enum {
     LINUX_SYS_MADVISE = 28,
     LINUX_SYS_DUP = 32,
     LINUX_SYS_DUP2 = 33,
+    LINUX_SYS_SETITIMER = 38,
     LINUX_SYS_GETPID = 39,
     LINUX_SYS_SOCKET = 41,
     LINUX_SYS_CONNECT = 42,
     LINUX_SYS_SENDTO = 44,
     LINUX_SYS_RECVFROM = 45,
+    LINUX_SYS_SENDMSG = 46,
+    LINUX_SYS_RECVMSG = 47,
+    LINUX_SYS_SHUTDOWN = 48,
     LINUX_SYS_BIND = 49,
     LINUX_SYS_GETSOCKNAME = 51,
     LINUX_SYS_GETPEERNAME = 52,
@@ -188,6 +198,7 @@ enum {
     LINUX_SYS_FCNTL = 72,
     LINUX_SYS_GETCWD = 79,
     LINUX_SYS_CHDIR = 80,
+    LINUX_SYS_RENAME = 82,
     LINUX_SYS_UNLINK = 87,
     LINUX_SYS_READLINK = 89,
     LINUX_SYS_CHMOD = 90,
@@ -196,6 +207,7 @@ enum {
     LINUX_SYS_FCHOWN = 93,
     LINUX_SYS_LCHOWN = 94,
     LINUX_SYS_UMASK = 95,
+    LINUX_SYS_GETTIMEOFDAY = 96,
     LINUX_SYS_GETUID = 102,
     LINUX_SYS_GETGID = 104,
     LINUX_SYS_GETEUID = 107,
@@ -207,6 +219,7 @@ enum {
     LINUX_SYS_EXIT = 60,
     LINUX_SYS_ARCH_PRCTL = 158,
     LINUX_SYS_GETTID = 186,
+    LINUX_SYS_TIME = 201,
     LINUX_SYS_FUTEX = 202,
     LINUX_SYS_SCHED_GETAFFINITY = 204,
     LINUX_SYS_GETDENTS64 = 217,
@@ -216,14 +229,17 @@ enum {
     LINUX_SYS_OPENAT = 257,
     LINUX_SYS_NEWFSTATAT = 262,
     LINUX_SYS_UNLINKAT = 263,
+    LINUX_SYS_RENAMEAT = 264,
     LINUX_SYS_PSELECT6 = 270,
     LINUX_SYS_PPOLL = 271,
     LINUX_SYS_SET_ROBUST_LIST = 273,
     LINUX_SYS_UTIMENSAT = 280,
+    LINUX_SYS_EVENTFD2 = 290,
     LINUX_SYS_DUP3 = 292,
     LINUX_SYS_PIPE2 = 293,
     LINUX_SYS_PRLIMIT64 = 302,
     LINUX_SYS_GETRANDOM = 318,
+    LINUX_SYS_RENAMEAT2 = 316,
     LINUX_SYS_MEMBARRIER = 324,
     LINUX_SYS_RSEQ = 334,
 
@@ -245,7 +261,13 @@ enum {
     IPPROTO_TCP = 6,
     IPPROTO_UDP = 17,
     SOL_SOCKET = 1,
+    SO_TYPE = 3,
     SO_ERROR = 4,
+    SO_KEEPALIVE = 9,
+    SO_RCVTIMEO = 20,
+    SO_SNDTIMEO = 21,
+    SOL_TCP = 6,
+    TCP_NODELAY = 1,
     POLLIN = 0x001,
     POLLOUT = 0x004,
     POLLERR = 0x008,
@@ -327,6 +349,9 @@ enum {
     EXECVE_TABLE_VA = 0x26401000,
     LINUX_ABI_REQUEST_PAGES_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
+    FILE_CACHE_BASE_VA = 0x28000000,
+    FILE_CACHE_BYTES = 8 * 1024 * 1024,
+    FILE_CACHE_MAX = 12,
     EXECVE_MAX_IMAGE_BYTES = 2 * 1024 * 1024,
     EXECVE_MAX_LD_BYTES = 768 * 1024,
     EXECVE_MAX_ARGV = 8,
@@ -374,13 +399,14 @@ struct linux_stat {
     i64 __unused[3];
 };
 
-enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6, FD_SOCKET = 7 };
+enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6, FD_SOCKET = 7, FD_RANDOM = 8 };
 struct fd_entry {
     enum fd_kind kind;
     u64 token;
     u64 offset;
     u64 size;
     u32 mode_bits;
+    u32 fd_flags;
     u8 object_kind;
     u8 pipe_id;
     u8 socket_connected;
@@ -395,6 +421,25 @@ struct fd_entry {
 struct vfs_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
 struct console_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
 struct net_client_state { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
+struct path_cache_entry {
+    u8 used;
+    u8 kind;
+    u16 path_len;
+    u64 token;
+    u64 size;
+    struct fs_stat_record stat;
+    char path[FS_MAX_PATH_BYTES + 1];
+};
+struct file_cache_entry {
+    u8 used;
+    u8 kind;
+    u16 path_len;
+    u64 token;
+    u64 size;
+    u64 buffer_va;
+    struct fs_stat_record stat;
+    char path[FS_MAX_PATH_BYTES + 1];
+};
 
 enum { PIPE_MAX = 8, PIPE_BUFFER_BYTES = 4096 };
 struct pipe_entry {
@@ -418,7 +463,7 @@ struct futex_waiter {
     u64 uaddr;
 };
 
-enum { VM_REGION_MAX = 64 };
+enum { VM_REGION_MAX = 256 };
 struct vm_region { u64 start; u64 size; u64 prot; int used; };
 
 enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16 };
@@ -477,12 +522,68 @@ struct linux_abi_bootstrap_config {
     char exec_path[128];
 };
 
+enum { LINUX_SYSCALL_PROFILE_COUNT = 335, FS_PROFILE_OP_COUNT = 33, NET_PROFILE_OP_COUNT = 11 };
+struct linux_abi_profile {
+    u64 syscall_total;
+    u64 syscall_counts[LINUX_SYSCALL_PROFILE_COUNT + 1];
+    u64 vfs_requests;
+    u64 vfs_op_counts[FS_PROFILE_OP_COUNT];
+    u64 vfs_read_request_bytes;
+    u64 vfs_write_request_bytes;
+    u64 vfs_inline_write_bytes;
+    u64 vfs_wait_calls;
+    u64 vfs_wait_loops;
+    u64 vfs_wait_timeouts;
+    u64 vfs_wait_slow;
+    u64 fs_read_bytes;
+    u64 fs_read_cmd_bytes;
+    u64 fs_read_lib_bytes;
+    u64 fs_read_tmp_bytes;
+    u64 fs_read_proc_bytes;
+    u64 fs_write_bytes;
+    u64 mmap_calls;
+    u64 mmap_pages;
+    u64 mmap_file_calls;
+    u64 mmap_file_pages;
+    u64 mmap_file_bytes;
+    u64 mprotect_calls;
+    u64 mprotect_pages;
+    u64 brk_calls;
+    u64 net_requests;
+    u64 net_op_counts[NET_PROFILE_OP_COUNT];
+    u64 net_payload_tx_bytes;
+    u64 net_payload_rx_bytes;
+    u64 net_wait_calls;
+    u64 net_wait_loops;
+    u64 net_wait_timeouts;
+    u64 net_wait_slow;
+    u64 net_tcp_connect_attempts;
+    u64 net_tcp_connect_poll_loops;
+    u64 poll_calls;
+    u64 poll_wait_loops;
+    u64 select_calls;
+    u64 select_wait_loops;
+    u64 getrandom_calls;
+    u64 getrandom_bytes;
+    u64 file_cache_hits;
+    u64 file_cache_misses;
+    u64 file_cache_fill_bytes;
+    u64 path_cache_hits;
+    u64 path_cache_misses;
+    u64 open_cache_hits;
+    u64 open_cache_misses;
+};
+
 static u64 trap_request_page_va = 0;
 static struct vfs_client g_vfs;
 static struct console_client g_console;
 static struct net_client_state g_net;
+static struct linux_abi_profile g_prof;
 static struct linux_process_state g_processes[LINUX_PROCESS_MAX];
 static struct linux_process_state *g_proc = 0;
+static struct path_cache_entry g_path_cache[FILE_CACHE_MAX];
+static struct file_cache_entry g_file_cache[FILE_CACHE_MAX];
+static u64 g_file_cache_next_offset = 0;
 static u8 g_exit_record_used[LINUX_PROCESS_MAX];
 static u64 g_exit_record_pid[LINUX_PROCESS_MAX];
 static u32 g_exit_record_status[LINUX_PROCESS_MAX];

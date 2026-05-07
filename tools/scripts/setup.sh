@@ -12,9 +12,8 @@ ESP_BUILDER_BIN="$SCRIPT_DIR/kernel/zig-out/bin/esp_builder"
 BOOTFS_BUILDER_EXE="$SCRIPT_DIR/kernel/zig-out/bin/bootfs_builder.exe"
 BOOTFS_BUILDER_BIN="$SCRIPT_DIR/kernel/zig-out/bin/bootfs_builder"
 BOOTFS_IMAGE_OUT="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/BOOTFS.IMG"
+INITAPP_SRC="$SCRIPT_DIR/.artifacts/userland/seed2_boot/SEED2BT.ELF"
 ROOTFS_MANIFEST="$SCRIPT_DIR/userland/rootfs/rootfs_manifest.txt"
-SEED_INIT_DIR="$SCRIPT_DIR/userland/seed_init"
-SEED_INIT_OUT="$SEED_INIT_DIR/zig-out/bin/seed.elf"
 SHELL_BOOTFS_SRC="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/SHELL.ELF"
 BLOCK_BOOTFS_SRC="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/VBLKDRV.ELF"
 PERSISTENT_FS_BOOTFS_SRC="$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/PERSFS.ELF"
@@ -130,14 +129,6 @@ else
   PS_EXE=powershell.exe
 fi
 
-build_seed_init() {
-  local seed_init_win
-  seed_init_win=$(wslpath -w "$SEED_INIT_DIR")
-  "$PS_EXE" -NoLogo -NoProfile -Command "Set-Location '$seed_init_win'; zig build seed-elf -Doptimize=ReleaseSmall"
-}
-
-build_seed_init
-
 build_bootfs_image() {
   local out_path="$1"
   shift
@@ -183,13 +174,7 @@ build_bootfs_image() {
   fi
 }
 
-if [ ! -f "$SEED_INIT_OUT" ]; then
-  echo "missing seed init artifact: $SEED_INIT_OUT" >&2
-  exit 1
-fi
-
 build_bootfs_image "$BOOTFS_IMAGE_OUT" \
-  /srv/seed.elf "$SEED_INIT_OUT" \
   /cmd/shell.elf "$SHELL_BOOTFS_SRC" \
   /srv/virtio_blk.elf "$BLOCK_BOOTFS_SRC" \
   /srv/persistent_fs.elf "$PERSISTENT_FS_BOOTFS_SRC" \
@@ -198,7 +183,7 @@ build_bootfs_image "$BOOTFS_IMAGE_OUT" \
 repair_bootx64_efi_if_needed || true
 require_nonempty_file "$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI" "EFI boot image"
 require_nonempty_file "$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/SHELL.ELF" "shell image"
-require_nonempty_file "$SCRIPT_DIR/kernel/zig-out/bin/EFI/BOOT/INITAPP.ELF" "init image"
+require_nonempty_file "$INITAPP_SRC" "init image"
 require_nonempty_file "$BOOTFS_IMAGE_OUT" "bootfs image"
 
 run_disk_builder() {

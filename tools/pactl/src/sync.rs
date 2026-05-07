@@ -217,13 +217,18 @@ fn generate_esp_manifest(
     shell_source: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let apps = discover_apps(workspace_root, workspace)?;
-    let init_image = workspace_root
+    let kernel_init_image = workspace_root
         .join(&workspace.kernel.dir)
         .join("zig-out")
         .join("bin")
         .join("EFI")
         .join("BOOT")
         .join("INITAPP.ELF");
+    let init_image = apps
+        .iter()
+        .find(|app| app.app.id == "seed2_boot" && !app_is_skipped(workspace, app))
+        .map(|app| planned_artifact_path(workspace_root, workspace, app))
+        .unwrap_or(kernel_init_image);
     let bootx64 = workspace_root
         .join(&workspace.kernel.dir)
         .join("zig-out")
@@ -240,7 +245,7 @@ fn generate_esp_manifest(
     require_nonempty_file(
         &init_image,
         "init image",
-        "run zig build efi in kernel first",
+        "run pactl build userland seed2_boot first",
     )?;
 
     let shell_output = if let Some(shell_app) = apps

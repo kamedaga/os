@@ -6,6 +6,7 @@ const abi_root = @import("kernel_abi_root");
 const cap_transfer_abi = abi_root.cap_transfer_abi;
 const image_abi = abi_root.image_abi;
 const trap_abi = abi_root.trap_abi;
+const time_abi = abi_root.time_abi;
 const user_vm = @import("memory/user_vm.zig");
 const process_abi = abi_root.process_abi;
 const process_builder_abi = abi_root.process_builder_abi;
@@ -14,6 +15,7 @@ const untyped_memory = @import("untyped_memory.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
 const smp = @import("smp.zig");
+const rtc = @import("rtc.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const process_builder = @import("runtime/process_builder.zig");
 const abi_trap_runtime = @import("runtime/abi_trap.zig");
@@ -66,6 +68,7 @@ const syscall_install_caps_batch: u64 = 0x32;
 const syscall_publish_service_endpoint: u64 = 0x33;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
 const syscall_get_memory_stats: u64 = 0x3C;
+const syscall_get_rtc_unix_time: u64 = time_abi.syscall_get_rtc_unix_time;
 const syscall_ipc_call_reply_recv: u64 = 0x40;
 const syscall_set_abi_trap_delegate: u64 = trap_abi.syscall_set_abi_trap_delegate;
 const syscall_clear_abi_trap_delegate: u64 = trap_abi.syscall_clear_abi_trap_delegate;
@@ -103,6 +106,8 @@ const ipc_call_flag_retain_sender: u64 = 0x1;
 const ipc_call_flag_signal_only: u64 = 0x2;
 var sys_alloc_page_failure_log_count: u64 = 0;
 const sys_alloc_page_failure_log_limit: u64 = 64;
+var lstar_no_delegate_log_count: u64 = 0;
+const lstar_no_delegate_log_limit: u64 = 32;
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -144,6 +149,25 @@ pub export var syscall_return_writeback_enabled_by_cpu: [smp.max_cpus]u64 = [_]u
 const syscall_fast_handled_mask: u64 = 1 << 63;
 extern var syscall_entry_is_lstars: [smp.max_cpus]u64;
 
+const KernelStateSpinLock = struct {
+    value: u8 = 0,
+
+    fn lock(self: *KernelStateSpinLock) void {
+        while (true) {
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) return;
+            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
+                asm volatile ("pause");
+            }
+        }
+    }
+
+    fn unlock(self: *KernelStateSpinLock) void {
+        @atomicStore(u8, &self.value, 0, .release);
+    }
+};
+
+var kernel_state_lock: KernelStateSpinLock = .{};
+
 const IpcSignalTarget = struct {
     principal: kernel.PrincipalId,
     thread_index: usize,
@@ -160,11 +184,13 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(sys_alloc_page_failure_log_count), &sys_alloc_page_failure_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lstar_no_delegate_log_count), &lstar_no_delegate_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_storage), &syscall_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled), &syscall_return_writeback_enabled));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled_by_cpu), &syscall_return_writeback_enabled_by_cpu));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstars), &syscall_entry_is_lstars));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
     return end;
 }
 
@@ -191,6 +217,79 @@ fn setSyscallReturnWritebackEnabled(enabled: bool) void {
 
 fn currentSyscallEntryIsLstar() bool {
     return syscall_entry_is_lstars[currentCpuSlotBounded()] != 0;
+}
+
+fn syscallNeedsKernelStateLock(nr: u64) bool {
+    return switch (nr) {
+        syscall_alloc_page,
+        syscall_map_page,
+        syscall_map_mmio,
+        syscall_alloc_map_pages,
+        syscall_map_pages_batch,
+        syscall_untyped_alloc,
+        syscall_untyped_retype_pages,
+        syscall_untyped_reset,
+        syscall_untyped_alloc_map_pages,
+        syscall_queue_submit,
+        syscall_queue_notify,
+        syscall_iommu_authorize,
+        syscall_command_authorize,
+        syscall_dma_map_create,
+        syscall_dma_map_set_state,
+        syscall_dma_map_release,
+        syscall_revoke_device_cap,
+        syscall_derive_command_cap,
+        syscall_move_cap,
+        syscall_revoke_tree,
+        syscall_drop_present,
+        syscall_grant_cap,
+        syscall_grant_caps_batch,
+        syscall_grant_cap_on_endpoint,
+        syscall_grant_caps_batch_on_endpoint,
+        syscall_install_caps_batch,
+        syscall_install_endpoint,
+        syscall_install_mmio_cap,
+        syscall_publish_service_endpoint,
+        syscall_set_abi_trap_delegate,
+        syscall_clear_abi_trap_delegate,
+        syscall_get_process_status,
+        syscall_map_abi_trap_reply_target_pages,
+        syscall_copy_from_abi_trap_reply_target,
+        syscall_copy_to_abi_trap_reply_target,
+        syscall_set_abi_trap_reply_target_fs_base,
+        syscall_protect_abi_trap_reply_target_pages,
+        syscall_unmap_abi_trap_reply_target_pages,
+        syscall_reclaim_abi_trap_reply_target_private_pages,
+        syscall_reply_abi_trap_target,
+        syscall_detach_abi_trap_reply_token,
+        syscall_copy_to_abi_trap_target,
+        syscall_start_abi_trap_target,
+        syscall_set_abi_trap_target_request_page,
+        syscall_share_abi_trap_reply_target_pages_to_target,
+        syscall_unmap_abi_trap_target_pages,
+        process_abi.syscall_spawn_exec,
+        process_builder_abi.syscall_create_suspended_process,
+        process_builder_abi.syscall_map_vm_object_to_process,
+        process_builder_abi.syscall_alloc_map_pages_to_process,
+        process_builder_abi.syscall_set_process_initial_context,
+        process_builder_abi.syscall_start_process,
+        process_builder_abi.syscall_abort_process,
+        process_builder_abi.syscall_copy_to_process,
+        process_builder_abi.syscall_mprotect_self,
+        process_builder_abi.syscall_set_process_abi_trap_delegate,
+        process_builder_abi.syscall_fork_abi_trap_reply_target,
+        process_builder_abi.syscall_clone_abi_trap_reply_target,
+        image_abi.syscall_install_vm_object,
+        image_abi.syscall_install_vm_object_mmio_range,
+        image_abi.syscall_grant_vm_object,
+        image_abi.syscall_slice_vm_object,
+        image_abi.syscall_map_vm_object,
+        image_abi.syscall_install_exec_image,
+        image_abi.syscall_grant_exec_image,
+        queue_abi.syscall_grant_cap,
+        => true,
+        else => false,
+    };
 }
 
 fn hasExplicitUserLogLabel(message: []const u8) bool {
@@ -319,9 +418,19 @@ fn dispatchIpcSyscall(
     frame: *TrapFrame,
 ) ?u64 {
     return switch (frame.rax) {
-        syscall_send_cap => transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, false),
-        syscall_share_cap => transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, true),
+        syscall_send_cap => blk: {
+            kernel_state_lock.lock();
+            defer kernel_state_lock.unlock();
+            break :blk transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, false);
+        },
+        syscall_share_cap => blk: {
+            kernel_state_lock.lock();
+            defer kernel_state_lock.unlock();
+            break :blk transferPageCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, true);
+        },
         syscall_recv_cap => blk: {
+            kernel_state_lock.lock();
+            defer kernel_state_lock.unlock();
             const received = state.recvCap(proc) catch |err| switch (err) {
                 kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
                 else => break :blk syscall_err_send,
@@ -329,6 +438,8 @@ fn dispatchIpcSyscall(
             break :blk received;
         },
         syscall_accept_cap_transfer => blk: {
+            kernel_state_lock.lock();
+            defer kernel_state_lock.unlock();
             const received = state.acceptCapTransfer(proc, frame.rdi) catch |err| switch (err) {
                 kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
                 kernel.KernelError.InvalidState => break :blk syscall_err_invalid,
@@ -339,20 +450,36 @@ fn dispatchIpcSyscall(
             break :blk received;
         },
         syscall_signal_endpoint => blk: {
+            kernel_state_lock.lock();
+            defer kernel_state_lock.unlock();
             break :blk signalEndpointMessage(state, proc, frame.rdi, false, 0, 0, 0, 0);
         },
         syscall_wait_event => blk: {
             const wait_mailbox = (frame.rdi & 0x1) != 0;
             const timeout_ticks = frame.rsi;
+            kernel_state_lock.lock();
             if (wait_mailbox) {
                 const received = state.recvCap(proc) catch |err| switch (err) {
                     kernel.KernelError.MailboxEmpty => 0,
-                    else => break :blk syscall_err_send,
+                    else => {
+                        kernel_state_lock.unlock();
+                        break :blk syscall_err_send;
+                    },
                 };
-                if (received >= cap_transfer_abi.transfer_id_min) break :blk received;
+                if (received >= cap_transfer_abi.transfer_id_min) {
+                    kernel_state_lock.unlock();
+                    break :blk received;
+                }
             }
-            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) break :blk syscall_ok;
-            if (h.consume_pending_signal_for_principal(proc)) break :blk syscall_ok;
+            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+                kernel_state_lock.unlock();
+                break :blk syscall_ok;
+            }
+            if (h.consume_pending_signal_for_principal(proc)) {
+                kernel_state_lock.unlock();
+                break :blk syscall_ok;
+            }
+            kernel_state_lock.unlock();
             if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
                 break :blk syscall_err_not_ready;
             }
@@ -362,12 +489,19 @@ fn dispatchIpcSyscall(
             const endpoint_id = frame.rsi;
             const flags = frame.rdx;
             const signal_only = (flags & ipc_call_flag_signal_only) != 0;
+            kernel_state_lock.lock();
             if (signal_only and endpoint_id == 0) {
                 const status = replyToCurrentIpcToken(h, frame.rdi, frame.r8, frame.r9, frame.r10);
-                if (status != syscall_ok) break :blk status;
+                if (status != syscall_ok) {
+                    kernel_state_lock.unlock();
+                    break :blk status;
+                }
             } else if (signal_only) {
                 const status = signalEndpointMessage(state, proc, endpoint_id, true, frame.rdi, frame.r8, frame.r9, frame.r10);
-                if (status != syscall_ok) break :blk status;
+                if (status != syscall_ok) {
+                    kernel_state_lock.unlock();
+                    break :blk status;
+                }
             } else {
                 const status = transferPageCapOnEndpoint(
                     state,
@@ -377,17 +511,33 @@ fn dispatchIpcSyscall(
                     frame.rdi,
                     (flags & ipc_call_flag_retain_sender) != 0,
                 );
-                if (status != syscall_ok) break :blk status;
+                if (status != syscall_ok) {
+                    kernel_state_lock.unlock();
+                    break :blk status;
+                }
             }
             if (!signal_only) {
                 const received = state.recvCap(proc) catch |err| switch (err) {
                     kernel.KernelError.MailboxEmpty => 0,
-                    else => break :blk syscall_err_send,
+                    else => {
+                        kernel_state_lock.unlock();
+                        break :blk syscall_err_send;
+                    },
                 };
-                if (received >= cap_transfer_abi.transfer_id_min) break :blk received;
+                if (received >= cap_transfer_abi.transfer_id_min) {
+                    kernel_state_lock.unlock();
+                    break :blk received;
+                }
             }
-            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) break :blk syscall_ok;
-            if (h.consume_pending_signal_for_principal(proc)) break :blk syscall_ok;
+            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+                kernel_state_lock.unlock();
+                break :blk syscall_ok;
+            }
+            if (h.consume_pending_signal_for_principal(proc)) {
+                kernel_state_lock.unlock();
+                break :blk syscall_ok;
+            }
+            kernel_state_lock.unlock();
             if (!h.block_current_thread_for_event(frame, !signal_only, 0, syscall_ok)) {
                 break :blk syscall_err_not_ready;
             }
@@ -817,6 +967,11 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         }
     }
     if (dispatchIpcSyscall(h, state, proc, frame)) |result| return result;
+    const hold_kernel_state_lock = syscallNeedsKernelStateLock(frame.rax);
+    if (hold_kernel_state_lock) kernel_state_lock.lock();
+    defer {
+        if (hold_kernel_state_lock) kernel_state_lock.unlock();
+    }
     if (h.scheduler_log_int80 and scheduler.scheduler_int80_log_count < h.scheduler_int80_log_max_lines) {
         h.write("INT80 dispatch ");
         h.write(h.thread_label(scheduler.currentThreadIndex()));
@@ -1011,6 +1166,19 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             const op: device_capabilities.QueueOperation = if (frame.rax == syscall_queue_submit) .submit else .notify;
             device_capabilities.queueCapAuthorizeStage2(state, proc, queue_token, queue_index, op) catch |err| {
                 h.log_queue_cap_deny(proc, queue_token, queue_index, op, err);
+                h.write("queue_cap ctx thread=");
+                h.print_number(@intCast(scheduler.currentThreadIndex()));
+                h.write(" cpu=");
+                h.print_number(@intCast(scheduler.currentCpuSlot()));
+                h.write(" entry_lstar=");
+                h.print_number(if (currentSyscallEntryIsLstar()) 1 else 0);
+                h.write(" rip=");
+                h.print_hex(frame.rip);
+                h.write(" rdi=");
+                h.print_hex(frame.rdi);
+                h.write(" rsi=");
+                h.print_hex(frame.rsi);
+                h.write("\n");
                 return syscall_err_invalid;
             };
             return syscall_ok;
@@ -1169,6 +1337,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         syscall_get_tick_count => {
             return scheduler.lapic_tick_count;
+        },
+        syscall_get_rtc_unix_time => {
+            return rtc.unixTimeSeconds();
         },
         syscall_get_process_slot => {
             const slot = kernel.processIndexFromPrincipal(proc) orelse return syscall_err_invalid;
@@ -1592,6 +1763,20 @@ fn syscallLstarDelegateDispatch(frame: *TrapFrame) ?u64 {
     const state = h.state;
     if (abi_trap_runtime.dispatchDelegate(state, proc, frame)) |result| {
         return result;
+    }
+    if (frame.rax >= 128 and lstar_no_delegate_log_count < lstar_no_delegate_log_limit) {
+        lstar_no_delegate_log_count += 1;
+        h.write("lstar no delegate proc=");
+        h.write(h.principal_label(proc));
+        h.write(" thread=");
+        h.print_number(@intCast(scheduler.currentThreadIndex()));
+        h.write(" cpu=");
+        h.print_number(@intCast(scheduler.currentCpuSlot()));
+        h.write(" nr=");
+        h.print_number(frame.rax);
+        h.write(" rip=");
+        h.print_hex(frame.rip);
+        h.write("\n");
     }
     return null;
 }

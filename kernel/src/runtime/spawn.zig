@@ -136,40 +136,51 @@ pub fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
     const bootstrap_spawn = (if (boot_init_principal) |init_principal| caller == init_principal else false) or
         bootstrap_request.requested or
         bootstrap_request.child_bootstrap_owner;
+    const bootstrap_ap_blocked = bootstrap_spawn and !bootstrap_request.allow_bootstrap_ap_placement;
     const dry_run_ap_cpu = scheduler.chooseCpuForThread(created.process.thread_slot, false);
     const dry_run_any_cpu = scheduler.chooseCpuForThread(created.process.thread_slot, true);
-    const ap_placement_block: scheduler.SpawnExecApUserSchedulingBlock = if (bootstrap_spawn) .bootstrap_path else scheduler.spawnExecApUserSchedulingBlockReason();
-    if (!scheduler.setThreadReady(created.process.thread_slot, true)) return boot_static.syscall_err_not_ready;
-    const ap_placed_cpu = if (bootstrap_spawn) null else scheduler.assignSpawnExecThreadToApIfReady(created.process.thread_slot);
+    const ap_placement_block: scheduler.SpawnExecApUserSchedulingBlock = if (bootstrap_ap_blocked) .bootstrap_path else scheduler.spawnExecApUserSchedulingBlockReason();
+    const ap_placed_cpu = if (bootstrap_ap_blocked) null else scheduler.readySpawnExecThreadOnApIfReady(created.process.thread_slot);
+    if (ap_placed_cpu == null) {
+        if (!scheduler.setThreadReady(created.process.thread_slot, true)) return boot_static.syscall_err_not_ready;
+    }
 
-    if (boot_init_principal) |init_principal| {
-        if (caller == init_principal) {
-            kernel_log.write("spawn_exec ready child=");
-            log_util.printNumber(@as(u64, @intCast(kernel.processIndexFromPrincipal(created.principal).?)));
-            kernel_log.write(" thread=");
-            log_util.printNumber(@as(u64, @intCast(created.process.thread_slot)));
-            kernel_log.write(" sched_ap_dry=");
-            if (dry_run_ap_cpu) |cpu| {
-                log_util.printNumber(@as(u64, @intCast(cpu)));
-            } else {
-                kernel_log.write("none");
-            }
-            kernel_log.write(" sched_any_dry=");
-            if (dry_run_any_cpu) |cpu| {
-                log_util.printNumber(@as(u64, @intCast(cpu)));
-            } else {
-                kernel_log.write("none");
-            }
-            kernel_log.write(" sched_ap_place=");
-            if (ap_placed_cpu) |cpu| {
-                log_util.printNumber(@as(u64, @intCast(cpu)));
-            } else {
-                writeApPlacementBlock(ap_placement_block);
-            }
-            kernel_log.write(" assigned_cpu=");
-            log_util.printNumber(@as(u64, @intCast(scheduler.threadCpuSlot(created.process.thread_slot) orelse scheduler.idle_thread_marker)));
-            kernel_log.write("\n");
+    const log_spawn = if (boot_init_principal) |init_principal|
+        caller == init_principal or state_ptr.isBootstrapOwner(caller)
+    else
+        state_ptr.isBootstrapOwner(caller);
+    if (log_spawn) {
+        kernel_log.write("spawn_exec ready child=");
+        log_util.printNumber(@as(u64, @intCast(kernel.processIndexFromPrincipal(created.principal).?)));
+        kernel_log.write(" thread=");
+        log_util.printNumber(@as(u64, @intCast(created.process.thread_slot)));
+        kernel_log.write(" sched_ap_dry=");
+        if (dry_run_ap_cpu) |cpu| {
+            log_util.printNumber(@as(u64, @intCast(cpu)));
+        } else {
+            kernel_log.write("none");
         }
+        kernel_log.write(" sched_any_dry=");
+        if (dry_run_any_cpu) |cpu| {
+            log_util.printNumber(@as(u64, @intCast(cpu)));
+        } else {
+            kernel_log.write("none");
+        }
+        kernel_log.write(" sched_ap_place=");
+        if (ap_placed_cpu) |cpu| {
+            log_util.printNumber(@as(u64, @intCast(cpu)));
+        } else {
+            writeApPlacementBlock(ap_placement_block);
+        }
+        kernel_log.write(" assigned_cpu=");
+        log_util.printNumber(@as(u64, @intCast(scheduler.threadCpuSlot(created.process.thread_slot) orelse scheduler.idle_thread_marker)));
+        kernel_log.write(" entry=");
+        kernel_log.writeHexRaw(loaded.entry);
+        kernel_log.write(" rsp=");
+        kernel_log.writeHexRaw(ctx.frame.rsp);
+        kernel_log.write(" cr3=");
+        kernel_log.writeHexRaw(ctx.cr3);
+        kernel_log.write("\n");
     }
 
     return boot_abi.process_abi.encodeSpawnedProcess(
@@ -185,7 +196,6 @@ fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void 
         .ap_user_policy_disabled => kernel_log.write("blocked:ap_user_policy_disabled"),
         .no_ap => kernel_log.write("blocked:no_ap"),
         .bootstrap_path => kernel_log.write("blocked:bootstrap_path"),
-        .ap_syscall_global_state_not_per_cpu => kernel_log.write("blocked:ap_syscall_global_state_not_per_cpu"),
     }
 }
 

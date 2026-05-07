@@ -131,7 +131,7 @@ enum {
     NET_UDP_PENDING = 4,
     NET_TCP_CONNECTIONS = 4,
     NET_TCP_MAX_PAYLOAD = 1200,
-    NET_TCP_RX_BYTES = 4096,
+    NET_TCP_RX_BYTES = 32768,
     NET_SESSION_MAX = 4,
     NET_UDP_HANDLE_TAG = 0x5544500000000000ULL,
     NET_TCP_HANDLE_TAG = 0x5443500000000000ULL,
@@ -1073,6 +1073,11 @@ static int tcp_rx_append(struct tcp_connection *conn, const u8 *payload, u32 len
     return 1;
 }
 
+static u16 tcp_advertised_window(const struct tcp_connection *conn) {
+    const u32 free_bytes = NET_TCP_RX_BYTES - conn->rx_len;
+    return (u16)(free_bytes > 65535 ? 65535 : free_bytes);
+}
+
 static u32 tcp_rx_pop(struct tcp_connection *conn, u8 *out, u32 out_cap) {
     const u32 n = conn->rx_len < out_cap ? conn->rx_len : out_cap;
     for (u32 i = 0; i < n; i++) {
@@ -1122,7 +1127,7 @@ static int send_ipv4_tcp_segment(struct tcp_connection *conn, u8 flags, const u8
     write_be32(tcp + 8, conn->ack);
     tcp[12] = 5 << 4;
     tcp[13] = flags;
-    write_be16(tcp + 14, 4096);
+    write_be16(tcp + 14, tcp_advertised_window(conn));
     write_be16(tcp + 16, 0);
     write_be16(tcp + 18, 0);
     if (payload_len != 0) memcpy(tcp + 20, payload, payload_len);
@@ -1194,6 +1199,9 @@ static int tcp_read(u64 handle, u8 *out, u32 out_cap, u32 *out_len) {
         return NET_STATUS_WOULD_BLOCK;
     }
     *out_len = tcp_rx_pop(conn, out, out_cap);
+    if (conn->state == TCP_STATE_ESTABLISHED && !g_tx_in_flight) {
+        (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
+    }
     return NET_STATUS_OK;
 }
 
@@ -1561,8 +1569,8 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
         if (payload_len != 0 && seq == conn->ack) {
             if (tcp_rx_append(conn, payload, payload_len)) {
                 conn->ack += payload_len;
-                (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
             }
+            (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
         }
         if ((flags & TCP_FLAG_FIN) != 0) {
             if (seq == conn->ack) conn->ack++;

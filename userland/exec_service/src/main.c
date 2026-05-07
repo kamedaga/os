@@ -166,6 +166,13 @@ static void profile_vfs_read_step(const char *step) {
     user_log("\n");
 }
 static void clear_page(u64 va) { volatile u64 *p = (volatile u64 *)va; for (u64 i = 0; i < 512; i++) p[i] = 0; }
+static void copy_from_volatile(u8 *dst, const volatile u8 *src, u64 bytes) {
+    __asm__ volatile(
+        "rep movsb"
+        : "+D"(dst), "+S"(src), "+c"(bytes)
+        :
+        : "memory");
+}
 static u64 syscall0(u64 nr) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall1(u64 nr, u64 a0) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall2(u64 nr, u64 a0, u64 a1) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); return ret; }
@@ -218,6 +225,7 @@ static int signal_vfs(void) {
 static int wait_vfs_response(u64 expected_seq, u16 expected_op) { volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA; for (u64 i = 0; i < 8192; i++) { if (response->response_seq == expected_seq) return response->magic == FS_RESPONSE_MAGIC && response->version == FS_PROTOCOL_VERSION && response->op == expected_op; (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1); } return 0; }
 
 static int connect_vfs_from_registry(void) {
+    if (g_vfs.active) return 1;
     struct service_entry entry;
     if (!find_service(SERVICE_KIND_VFS, &entry)) return 0;
     g_vfs.endpoint_id = entry.endpoint_id; g_vfs.process_slot = entry.process_slot;
@@ -270,30 +278,45 @@ static int vfs_lookup_file_token(const char *path, u16 path_len, u64 *token_out,
     return response->file_bytes != 0;
 }
 
-static int vfs_read_file_to_buffer(const char *path, u16 path_len, u64 buffer_va, u64 buffer_cap, u64 *file_bytes_out) {
+static int vfs_open_file_for_read(const char *path, u16 path_len, u64 *open_token_out, u64 *file_bytes_out) {
     u64 file_token = 0; u64 file_bytes = 0;
     profile_vfs_read_step("lookup begin");
     if (!vfs_lookup_file_token(path, path_len, &file_token, &file_bytes)) { user_log("ExecService: vfs read lookup failed\n"); return 0; }
     profile_vfs_read_step("lookup done");
-    if (file_bytes == 0 || file_bytes > buffer_cap) { user_log("ExecService: vfs read size invalid\n"); return 0; }
+    if (file_bytes == 0) { user_log("ExecService: vfs read size invalid\n"); return 0; }
     if (!vfs_request(FS_OP_OPEN, file_token, 0, 0, 0, 0)) { user_log("ExecService: vfs open request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
     if (response->status != FS_STATUS_OK || response->result_token == 0) { user_log("ExecService: vfs open status failed\n"); return 0; }
     profile_vfs_read_step("open done");
-    const u64 open_token = response->result_token;
+    *open_token_out = response->result_token;
+    *file_bytes_out = file_bytes;
+    return 1;
+}
+
+static int vfs_read_open_file_to_buffer(u64 open_token, u64 file_bytes, u64 buffer_va, u64 buffer_cap) {
+    if (file_bytes == 0 || file_bytes > buffer_cap) { user_log("ExecService: vfs read size invalid\n"); return 0; }
     u64 copied = 0;
     int ok = 1;
     while (copied < file_bytes) {
         const u64 chunk = min_u64(file_bytes - copied, FS_RESPONSE_PAYLOAD_BYTES);
         if (!vfs_request(FS_OP_READ, open_token, copied, (u32)chunk, 0, 0)) { user_log("ExecService: vfs read request failed\n"); ok = 0; break; }
-        response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
         if (response->status != FS_STATUS_OK || response->inline_bytes == 0) { user_log("ExecService: vfs read chunk failed\n"); ok = 0; break; }
         volatile u8 *src = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
         u8 *dst = (u8 *)(buffer_va + copied);
-        for (u64 i = 0; i < response->inline_bytes; i++) dst[i] = src[i];
+        copy_from_volatile(dst, src, response->inline_bytes);
         copied += response->inline_bytes;
     }
     profile_vfs_read_step("read done");
+    if (!ok) return 0;
+    return 1;
+}
+
+static int vfs_read_file_to_buffer(const char *path, u16 path_len, u64 buffer_va, u64 buffer_cap, u64 *file_bytes_out) {
+    u64 open_token = 0;
+    u64 file_bytes = 0;
+    if (!vfs_open_file_for_read(path, path_len, &open_token, &file_bytes)) return 0;
+    const int ok = vfs_read_open_file_to_buffer(open_token, file_bytes, buffer_va, buffer_cap);
     (void)vfs_request(FS_OP_CLOSE, open_token, 0, 0, 0, 0);
     profile_vfs_read_step("close done");
     if (!ok) return 0;
@@ -376,7 +399,7 @@ static int configure_exec_args(struct exec_loader_config *cfg, const struct exec
     return 1;
 }
 
-static u64 spawn_linux_abi_server(const struct exec_service_request *request) {
+static u64 start_linux_abi_server(const struct exec_service_request *request, volatile struct linux_abi_bootstrap_config **cfg_out) {
     volatile u8 *registry_src = (volatile u8 *)PROCESS_SERVICE_REGISTRY_SHADOW_VA;
     volatile u8 *registry_dst = (volatile u8 *)SCRATCH_REGISTRY_COPY_VA;
     for (u64 i = 0; i < PAGE_BYTES; i++) registry_dst[i] = registry_src[i];
@@ -414,8 +437,14 @@ static u64 spawn_linux_abi_server(const struct exec_service_request *request) {
     const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, g_linux_abi_exec_token, SCRATCH_LINUX_ABI_TABLE_VA, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER);
     const u64 slot = decode_spawned_process_slot(spawned);
     if (slot == 0) return 0;
+    if (cfg_out != 0) *cfg_out = (volatile struct linux_abi_bootstrap_config *)cfg;
+    return slot;
+}
+
+static int wait_linux_abi_server_ready(volatile struct linux_abi_bootstrap_config *cfg) {
+    if (cfg == 0) return 0;
     for (u64 i = 0; i < 100000000; i++) {
-        if (cfg->status == LINUX_ABI_BOOTSTRAP_READY) return slot;
+        if (cfg->status == LINUX_ABI_BOOTSTRAP_READY) return 1;
         (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
     }
     return 0;
@@ -494,18 +523,31 @@ static void handle_request_paddr(u64 request_paddr) {
         return;
     }
 
+    u64 app_open_token = 0;
     u64 app_bytes = 0;
-    if (!vfs_read_file_to_buffer((const char *)request->arg_data, request->path_bytes, SCRATCH_APP_IMAGE_VA, MAX_APP_IMAGE_BYTES, &app_bytes)) {
+    if (!vfs_open_file_for_read((const char *)request->arg_data, request->path_bytes, &app_open_token, &app_bytes)) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_NOT_FOUND, 0, 0);
         return;
     }
+    volatile struct linux_abi_bootstrap_config *abi_cfg = 0;
+    const u64 abi_slot = start_linux_abi_server(request, &abi_cfg);
+    if (abi_slot == 0) {
+        (void)vfs_request(FS_OP_CLOSE, app_open_token, 0, 0, 0, 0);
+        write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, 0, 0);
+        return;
+    }
+    if (!vfs_read_open_file_to_buffer(app_open_token, app_bytes, SCRATCH_APP_IMAGE_VA, MAX_APP_IMAGE_BYTES)) {
+        (void)vfs_request(FS_OP_CLOSE, app_open_token, 0, 0, 0, 0);
+        write_response(request->response_paddr, EXEC_SERVICE_STATUS_NOT_FOUND, 0, 0);
+        return;
+    }
+    (void)vfs_request(FS_OP_CLOSE, app_open_token, 0, 0, 0, 0);
     const u64 app_vm_token = install_vm_object_from_buffer(SCRATCH_APP_IMAGE_VA, app_bytes);
     if (app_vm_token == 0) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_IO, 0, 0);
         return;
     }
-    const u64 abi_slot = spawn_linux_abi_server(request);
-    if (abi_slot == 0) {
+    if (!wait_linux_abi_server_ready(abi_cfg)) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, 0, 0);
         return;
     }
@@ -519,6 +561,7 @@ static void handle_request_paddr(u64 request_paddr) {
 }
 
 static int init_assets(void) {
+    if (g_loader_exec_token != 0 && g_linux_abi_exec_token != 0 && g_ld_vm_token != 0) return 1;
     if (!ensure_scratch()) return 0;
     if (!connect_vfs_from_registry()) return 0;
     user_log("ExecService: load exec_loader begin\n");
@@ -547,8 +590,8 @@ static int init_assets(void) {
 void exec_service_main(void) {
     user_log("ExecService: started\n");
     if (!init_assets()) {
-        user_log("ExecService: init failed\n");
-        for (;;) __asm__ volatile("pause");
+        user_log("ExecService: preload failed\n");
+        for (;;) (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
     }
     const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_SERVICE_ENDPOINT_ID, self_slot) != SYSCALL_OK ||
