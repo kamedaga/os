@@ -10,7 +10,6 @@ const OwnershipView = kernel.OwnershipView;
 const FreePageList = kernel.FreePageList;
 const EndpointCNode = kernel.EndpointCNode;
 const PrincipalId = kernel.PrincipalId;
-const PageCapability = kernel.PageCapability;
 const processPrincipalFromIndex = kernel.processPrincipalFromIndex;
 const initial_process_count = kernel.initial_process_count;
 const default_process_principal: PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
@@ -328,21 +327,6 @@ test "endpoint tables clamp corrupted length during lookup" {
     try std.testing.expect(endpoints.find(0x91) == null);
 }
 
-test "allocPageTo skips paddr already covered by active untyped block" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    var free_list = FreePageList{};
-    try free_list.appendPage(0, 0x1000);
-    try free_list.appendPage(0, 0x2000);
-    _ = try s.createUntypedBlock(.Process0, 0x2000, 0x1000, .{
-        .contiguous_only = true,
-        .dma_ok = true,
-    });
-
-    const cap = try s.allocPageTo(.Process1, &free_list);
-    try std.testing.expectEqual(@as(u64, 0x1000), cap.paddr);
-    try std.testing.expect(s.getTableConst(.Process1).find(0x1000) != null);
-}
-
 test "allocPageTo skips paddr that already exists in another cap table" {
     var s = try KernelState.initFromDetectedRegions(1);
     var free_list = FreePageList{};
@@ -357,63 +341,6 @@ test "allocPageTo skips paddr that already exists in another cap table" {
     const cap = try s.allocPageTo(.Process0, &free_list);
     try std.testing.expectEqual(@as(u64, 0x1000), cap.paddr);
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) != null);
-}
-
-test "untyped retype installs page caps under untyped root" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    const block_id = try s.createUntypedBlock(.Process0, 0x20_0000, 0x4000, .{
-        .contiguous_only = true,
-        .dma_ok = true,
-    });
-    var caps: [2]PageCapability = undefined;
-    try s.retypeUntypedToPages(.Process0, block_id, 2, true, caps[0..]);
-
-    try std.testing.expectEqual(@as(u64, 0x20_0000), caps[0].paddr);
-    try std.testing.expectEqual(@as(u64, 0x20_1000), caps[1].paddr);
-    try std.testing.expect(s.getTableConst(.Process0).find(caps[0].paddr).?.rights.grant);
-    try std.testing.expect(s.getTableConst(.Process0).find(caps[1].paddr).?.rights.grant);
-}
-
-test "untyped grant allows child owner to retype" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    const block_id = try s.createUntypedBlock(.Process0, 0x30_0000, 0x4000, .{
-        .contiguous_only = true,
-        .dma_ok = true,
-    });
-    try s.grantUntypedCap(.Process0, .Process1, block_id);
-
-    var caps: [1]PageCapability = undefined;
-    try s.retypeUntypedToPages(.Process1, block_id, 1, true, caps[0..]);
-    try std.testing.expectEqual(@as(u64, 0x30_0000), caps[0].paddr);
-    try std.testing.expect(s.getTableConst(.Process1).find(caps[0].paddr) != null);
-}
-
-test "findOwnedUntypedForPages sees granted block for Process1" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    const block_id = try s.createUntypedBlock(.Process0, 0x35_0000, 0x8000, .{
-        .contiguous_only = true,
-        .dma_ok = true,
-    });
-    try s.grantUntypedCap(.Process0, .Process1, block_id);
-
-    try std.testing.expectEqual(block_id, s.findOwnedUntypedForPages(.Process1, 2, true).?);
-}
-
-test "untyped revoke tree removes descendant pages and resets root block" {
-    var s = try KernelState.initFromDetectedRegions(1);
-    const block_id = try s.createUntypedBlock(.Process0, 0x40_0000, 0x4000, .{
-        .contiguous_only = true,
-        .dma_ok = true,
-    });
-    try s.grantUntypedCap(.Process0, .Process1, block_id);
-    var caps: [1]PageCapability = undefined;
-    try s.retypeUntypedToPages(.Process1, block_id, 1, true, caps[0..]);
-
-    try s.revokeUntypedCapTree(.Process0, block_id);
-    try std.testing.expectEqual(@as(usize, 0), s.getUntypedTableConst(.Process0).len);
-    try std.testing.expectEqual(@as(usize, 0), s.getUntypedTableConst(.Process1).len);
-    try std.testing.expect(s.getTableConst(.Process1).find(caps[0].paddr) == null);
-    try std.testing.expectEqual(@as(u64, 0), s.untyped_pool.getBlockConst(block_id).?.used_bytes);
 }
 
 test "moveCap enforces single holder" {

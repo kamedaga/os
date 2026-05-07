@@ -4,7 +4,6 @@ const std = @import("std");
 const kernel = @import("../kernel.zig");
 const capability = @import("../capability.zig");
 const device_capabilities = @import("../device_capabilities.zig");
-const untyped_memory = @import("../untyped_memory.zig");
 const elf_loader = @import("../elf_loader.zig");
 const scheduler = @import("../scheduler.zig");
 const syscalls = @import("../syscalls.zig");
@@ -479,7 +478,6 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
 
     user_spaces[process_index] = .{};
     kernel_state_global.cap_tables[process_index] = .{};
-    kernel_state_global.untyped_tables[process_index] = .{};
     kernel_state_global.endpoint_tables[process_index] = .{};
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;
@@ -533,7 +531,6 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
 
     user_spaces[process_index] = .{};
     kernel_state_global.cap_tables[process_index] = .{};
-    kernel_state_global.untyped_tables[process_index] = .{};
     kernel_state_global.endpoint_tables[process_index] = .{};
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;
@@ -815,10 +812,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         halt.haltWithError("init bootstrap owner mark failed: ", err);
     };
     boot_init_principal = init_principal;
-    const untyped_bootstrap = untyped_memory.bootstrapUntypedForOwner(state, &global_free_list, init_principal) catch |err| {
-        halt.haltWithError("untyped bootstrap failed: ", err);
-    };
-    _ = untyped_bootstrap;
     const init_process = process_factory.createUserProcess(state, init_principal, "init", &global_free_list, user_spaces);
     init_setup.setupInitBootstrapResources(
         state,

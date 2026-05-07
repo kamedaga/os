@@ -738,14 +738,12 @@ fn apUserSchedulingFeatureEnabled() bool {
 pub const SpawnExecApUserSchedulingBlock = enum(u8) {
     none,
     flag_disabled,
-    ap_user_policy_disabled,
     no_ap,
     bootstrap_path,
 };
 
 pub fn spawnExecApUserSchedulingBlockReason() SpawnExecApUserSchedulingBlock {
     if (!build_workarounds.spawn_exec_ap_user_scheduling) return .flag_disabled;
-    if (!apUserSchedulingFeatureEnabled()) return .ap_user_policy_disabled;
     if (smp.cpuCount() <= 1) return .no_ap;
     return .none;
 }

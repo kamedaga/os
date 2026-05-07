@@ -82,7 +82,6 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
         user_spaces_ptr[process_index] = .{};
     }
     state_ptr.cap_tables[process_index] = .{};
-    state_ptr.untyped_tables[process_index] = .{};
     state_ptr.endpoint_tables[process_index] = .{};
     state_ptr.cap_mailboxes[process_index] = .{};
     state_ptr.pending_page_transfers[process_index] = null;
@@ -284,7 +283,6 @@ fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void 
     switch (reason) {
         .none => kernel_log.write("none"),
         .flag_disabled => kernel_log.write("off"),
-        .ap_user_policy_disabled => kernel_log.write("blocked:ap_user_policy_disabled"),
         .no_ap => kernel_log.write("blocked:no_ap"),
         .bootstrap_path => kernel_log.write("blocked:bootstrap_path"),
     }

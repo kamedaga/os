@@ -37,7 +37,7 @@ fn pruneZeroSizedBootx64Artifacts() bool {
 }
 
 pub fn build(b: *std.Build) void {
-    const bootx64_cache_repaired = pruneZeroSizedBootx64Artifacts();
+    _ = pruneZeroSizedBootx64Artifacts();
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -52,7 +52,6 @@ pub fn build(b: *std.Build) void {
         "Allow AP user threads to be preempted by the AP timer",
     ) orelse true;
     const build_workarounds = b.addOptions();
-    build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
     build_workarounds.addOption(bool, "spawn_exec_ap_user_scheduling", spawn_exec_ap_user_scheduling);
     build_workarounds.addOption(bool, "ap_user_timer_preemption", ap_user_timer_preemption);
 

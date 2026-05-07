@@ -193,7 +193,6 @@ fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void 
     switch (reason) {
         .none => kernel_log.write("none"),
         .flag_disabled => kernel_log.write("off"),
-        .ap_user_policy_disabled => kernel_log.write("blocked:ap_user_policy_disabled"),
         .no_ap => kernel_log.write("blocked:no_ap"),
         .bootstrap_path => kernel_log.write("blocked:bootstrap_path"),
     }

@@ -11,7 +11,6 @@ const user_vm = @import("memory/user_vm.zig");
 const process_abi = abi_root.process_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 const queue_abi = abi_root.queue_abi;
-const untyped_memory = @import("untyped_memory.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
 const smp = @import("smp.zig");
@@ -37,10 +36,6 @@ const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
-const syscall_untyped_alloc: u64 = 0x10;
-const syscall_untyped_retype_pages: u64 = 0x11;
-const syscall_untyped_reset: u64 = 0x12;
-const syscall_untyped_alloc_map_pages: u64 = 0x13;
 const syscall_grant_caps_batch: u64 = 0x14;
 const syscall_map_pages_batch: u64 = 0x15;
 const syscall_launch_pie_user: u64 = 0x16;
@@ -142,6 +137,57 @@ pub const Hooks = struct {
     total_usable_memory_bytes: u64,
 };
 
+const AllocMapPagesError = error{
+    InvalidArgument,
+    AllocationFailed,
+    MapFailed,
+};
+
+const AllocMapPagesConfig = struct {
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    free_list: *kernel.FreePageList,
+    base_va: u64,
+    page_count: usize,
+    writable: bool,
+    drop_cap_after_map: bool,
+    out_paddr_list_va: u64,
+    write_user_u64: *const fn (principal: kernel.PrincipalId, dest_user_va: u64, value: u64) bool,
+};
+
+fn allocMapPages(config: AllocMapPagesConfig) AllocMapPagesError!void {
+    if ((config.base_va & 0xFFF) != 0) return error.InvalidArgument;
+    if (config.page_count == 0) return error.InvalidArgument;
+
+    var i: usize = 0;
+    while (i < config.page_count) : (i += 1) {
+        const cap = config.state.allocPageTo(config.proc, config.free_list) catch return error.AllocationFailed;
+        const i_u64: u64 = @intCast(i);
+        const offset_4k, const mul_overflow = @mulWithOverflow(i_u64, @as(u64, 4096));
+        if (mul_overflow != 0) return error.MapFailed;
+        const map_va, const va_overflow = @addWithOverflow(config.base_va, offset_4k);
+        if (va_overflow != 0) return error.MapFailed;
+
+        if (!capability.mapFreshUserPage(config.proc, map_va, cap.paddr, config.writable)) {
+            return error.MapFailed;
+        }
+
+        if (config.out_paddr_list_va != 0) {
+            const offset_8, const list_mul_overflow = @mulWithOverflow(i_u64, @as(u64, 8));
+            if (list_mul_overflow != 0) return error.InvalidArgument;
+            const list_va, const list_va_overflow = @addWithOverflow(config.out_paddr_list_va, offset_8);
+            if (list_va_overflow != 0) return error.InvalidArgument;
+            if (!config.write_user_u64(config.proc, list_va, cap.paddr)) {
+                return error.MapFailed;
+            }
+        }
+
+        if (config.drop_cap_after_map) {
+            _ = config.state.getTable(config.proc).removeByPaddr(cap.paddr);
+        }
+    }
+}
+
 var syscall_hooks_storage: Hooks = undefined;
 var syscall_hooks_ready = false;
 pub export var syscall_return_writeback_enabled: u64 = 1;
@@ -226,10 +272,6 @@ fn syscallNeedsKernelStateLock(nr: u64) bool {
         syscall_map_mmio,
         syscall_alloc_map_pages,
         syscall_map_pages_batch,
-        syscall_untyped_alloc,
-        syscall_untyped_retype_pages,
-        syscall_untyped_reset,
-        syscall_untyped_alloc_map_pages,
         syscall_queue_submit,
         syscall_queue_notify,
         syscall_iommu_authorize,
@@ -1049,7 +1091,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         syscall_alloc_map_pages => {
             const page_count_u64 = frame.rsi;
             if (page_count_u64 == 0 or page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
-            untyped_memory.allocMapPages(.{
+            allocMapPages(.{
                 .state = state,
                 .proc = proc,
                 .free_list = h.free_list,
@@ -1121,42 +1163,6 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                     h.write("\n");
                     return syscall_err_map;
                 },
-            };
-            return syscall_ok;
-        },
-        syscall_untyped_alloc => {
-            const token = untyped_memory.allocUntyped(state, proc, h.free_list, frame.rdi, frame.rsi, @bitCast(frame.rdx)) catch |err| switch (err) {
-                kernel.KernelError.InvalidState => return syscall_err_invalid,
-                kernel.KernelError.OutOfFreePages, kernel.KernelError.TooManyFreeRanges, kernel.KernelError.TooManyUntypedBlocks, kernel.KernelError.TableFull => return syscall_err_alloc,
-                else => return syscall_err_alloc,
-            };
-            return token;
-        },
-        syscall_untyped_retype_pages => {
-            const page_count_u64 = frame.rdx;
-            if (page_count_u64 == 0 or page_count_u64 > kernel.max_retype_page_batch) return syscall_err_invalid;
-            untyped_memory.retypeMapPages(state, proc, frame.rdi, frame.rsi, @intCast(page_count_u64), frame.r10, frame.r8, h.write_user_u64) catch |err| switch (err) {
-                error.InvalidArgument => return syscall_err_invalid,
-                error.AllocationFailed => return syscall_err_alloc,
-                error.MapFailed => return syscall_err_map,
-            };
-            return syscall_ok;
-        },
-        syscall_untyped_reset => {
-            untyped_memory.resetUntyped(state, proc, frame.rdi) catch |err| switch (err) {
-                kernel.KernelError.InvalidState, kernel.KernelError.UntypedNotFound => return syscall_err_invalid,
-                kernel.KernelError.UntypedHasChildren => return syscall_err_not_ready,
-                else => return syscall_err_revoke,
-            };
-            return syscall_ok;
-        },
-        syscall_untyped_alloc_map_pages => {
-            const page_count_u64 = frame.rsi;
-            if (page_count_u64 == 0 or page_count_u64 > kernel.max_retype_page_batch) return syscall_err_invalid;
-            untyped_memory.allocOwnedUntypedMapPages(state, proc, frame.rdi, @intCast(page_count_u64), frame.rdx, frame.rcx, h.write_user_u64) catch |err| switch (err) {
-                error.InvalidArgument => return syscall_err_invalid,
-                error.AllocationFailed => return syscall_err_alloc,
-                error.MapFailed => return syscall_err_map,
             };
             return syscall_ok;
         },

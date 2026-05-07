@@ -160,9 +160,6 @@ pub const KernelError = error{
     TooManyFreePages,
     TooManyFreeRanges,
     OutOfFreePages,
-    TooManyUntypedBlocks,
-    UntypedNotFound,
-    UntypedHasChildren,
 };
 
 pub const CNode = struct {
@@ -612,140 +609,6 @@ pub const PageCapability = struct {
     paddr: u64,
 };
 
-pub const max_retype_page_batch: usize = 64;
-
-pub const UntypedFlags = packed struct(u8) {
-    contiguous_only: bool = false,
-    dma_ok: bool = false,
-    _reserved: u6 = 0,
-};
-
-pub const UntypedBlock = struct {
-    active: bool = false,
-    base_paddr: u64 = 0,
-    size_bytes: u64 = 0,
-    used_bytes: u64 = 0,
-    flags: UntypedFlags = .{},
-};
-
-pub const UntypedCapability = struct {
-    block_id: u32,
-    cap_id: u64,
-    root_cap_id: u64,
-    parent_cap_id: u64,
-};
-
-pub const UntypedCNode = struct {
-    pub const max_caps = 256;
-
-    caps: [max_caps]UntypedCapability = undefined,
-    len: usize = 0,
-
-    pub fn add(self: *UntypedCNode, cap: UntypedCapability) KernelError!void {
-        if (self.findIndex(cap.block_id) != null) return KernelError.InvalidState;
-        if (self.len >= self.caps.len) return KernelError.TableFull;
-        self.caps[self.len] = cap;
-        self.len += 1;
-    }
-
-    pub fn find(self: *const UntypedCNode, block_id: u32) ?*const UntypedCapability {
-        if (self.findIndex(block_id)) |index| {
-            return &self.caps[index];
-        }
-        return null;
-    }
-
-    pub fn findByCapId(self: *const UntypedCNode, cap_id: u64) ?*const UntypedCapability {
-        if (self.findIndexByCapId(cap_id)) |index| {
-            return &self.caps[index];
-        }
-        return null;
-    }
-
-    pub fn removeByBlockId(self: *UntypedCNode, block_id: u32) bool {
-        if (self.findIndex(block_id)) |index| {
-            var i = index;
-            while (i + 1 < self.len) : (i += 1) {
-                self.caps[i] = self.caps[i + 1];
-            }
-            self.len -= 1;
-            return true;
-        }
-        return false;
-    }
-
-    pub fn removeByCapId(self: *UntypedCNode, cap_id: u64) bool {
-        if (self.findIndexByCapId(cap_id)) |index| {
-            var i = index;
-            while (i + 1 < self.len) : (i += 1) {
-                self.caps[i] = self.caps[i + 1];
-            }
-            self.len -= 1;
-            return true;
-        }
-        return false;
-    }
-
-    fn findIndex(self: *const UntypedCNode, block_id: u32) ?usize {
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            if (self.caps[i].block_id == block_id) return i;
-        }
-        return null;
-    }
-
-    fn findIndexByCapId(self: *const UntypedCNode, cap_id: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            if (self.caps[i].cap_id == cap_id) return i;
-        }
-        return null;
-    }
-};
-
-pub const UntypedPool = struct {
-    pub const max_blocks = 256;
-
-    blocks: [max_blocks]UntypedBlock = [_]UntypedBlock{.{}} ** max_blocks,
-    len: usize = 0,
-
-    pub fn allocBlock(
-        self: *UntypedPool,
-        base_paddr: u64,
-        size_bytes: u64,
-        flags: UntypedFlags,
-    ) KernelError!u32 {
-        if ((base_paddr & 0xFFF) != 0 or size_bytes == 0 or (size_bytes & 0xFFF) != 0) {
-            return KernelError.InvalidState;
-        }
-        if (self.len >= self.blocks.len) return KernelError.TooManyUntypedBlocks;
-        const block_id: u32 = @intCast(self.len);
-        self.blocks[self.len] = .{
-            .active = true,
-            .base_paddr = base_paddr,
-            .size_bytes = size_bytes,
-            .used_bytes = 0,
-            .flags = flags,
-        };
-        self.len += 1;
-        return block_id;
-    }
-
-    pub fn getBlock(self: *UntypedPool, block_id: u32) ?*UntypedBlock {
-        const index: usize = @intCast(block_id);
-        if (index >= self.len) return null;
-        if (!self.blocks[index].active) return null;
-        return &self.blocks[index];
-    }
-
-    pub fn getBlockConst(self: *const UntypedPool, block_id: u32) ?*const UntypedBlock {
-        const index: usize = @intCast(block_id);
-        if (index >= self.len) return null;
-        if (!self.blocks[index].active) return null;
-        return &self.blocks[index];
-    }
-};
-
 const DmaRestoreEntry = struct {
     valid: bool = false,
     paddr: u64 = 0,
@@ -806,7 +669,6 @@ pub const KernelState = struct {
     process_descriptors: [process_count]ProcessDescriptor = [_]ProcessDescriptor{.{}} ** process_count,
     active_process_count: usize = 0,
     cap_tables: [principal_count]CNode = [_]CNode{.{}} ** principal_count,
-    untyped_tables: [principal_count]UntypedCNode = [_]UntypedCNode{.{}} ** principal_count,
     endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
     published_service_endpoints: PublishedEndpointTable = .{},
     endpoint_generation: u64 = 0,
@@ -820,8 +682,6 @@ pub const KernelState = struct {
     debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
-    untyped_revoke_queue: [max_total_caps]u64 = undefined,
-    untyped_revoke_subtree: [max_total_caps]u64 = undefined,
     dma_restore: [max_total_caps]DmaRestoreEntry = [_]DmaRestoreEntry{.{}} ** max_total_caps,
     dma_mappings: dma_mapping_manager.DmaMappingTable = .{},
     dma_device_domains: dma_mapping_manager.DeviceDomainTable = .{},
@@ -831,7 +691,6 @@ pub const KernelState = struct {
     iommu: IommuNoCapDriverState = .{},
     next_cap_id: u64 = 1,
     next_transfer_id: u64 = cap_transfer_abi.transfer_id_min,
-    untyped_pool: UntypedPool = .{},
 
     fn allocCapId(self: *KernelState) u64 {
         const id = self.next_cap_id;
@@ -1080,7 +939,6 @@ pub const KernelState = struct {
 
     fn clearPrincipalTablesForReuse(self: *KernelState, index: usize) void {
         self.cap_tables[index] = .{};
-        self.untyped_tables[index] = .{};
         self.endpoint_tables[index] = .{};
         self.cap_mailboxes[index] = .{};
         self.pending_page_transfers[index] = null;
@@ -1233,7 +1091,6 @@ pub const KernelState = struct {
         var i: usize = 0;
         while (i < principal_count) : (i += 1) {
             self.cap_tables[i] = .{};
-            self.untyped_tables[i] = .{};
             self.endpoint_tables[i] = .{};
             self.cap_mailboxes[i] = .{};
             self.pending_page_transfers[i] = null;
@@ -1453,14 +1310,6 @@ pub const KernelState = struct {
 
     pub fn getTableConst(self: *const KernelState, principal: PrincipalId) *const CNode {
         return &self.cap_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getUntypedTable(self: *KernelState, principal: PrincipalId) *UntypedCNode {
-        return &self.untyped_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getUntypedTableConst(self: *const KernelState, principal: PrincipalId) *const UntypedCNode {
-        return &self.untyped_tables[self.principalStorageIndex(principal)];
     }
 
     pub fn getEndpointTable(self: *KernelState, principal: PrincipalId) *EndpointCNode {
@@ -1703,17 +1552,6 @@ pub const KernelState = struct {
         return false;
     }
 
-    fn paddrFallsInsideActiveUntypedBlock(self: *const KernelState, paddr: u64) bool {
-        var i: usize = 0;
-        while (i < self.untyped_pool.len) : (i += 1) {
-            const block = self.untyped_pool.blocks[i];
-            if (!block.active) continue;
-            const block_end = block.base_paddr + block.size_bytes;
-            if (paddr >= block.base_paddr and paddr < block_end) return true;
-        }
-        return false;
-    }
-
     pub fn allocPage(
         self: *KernelState,
         requester: PrincipalId,
@@ -1724,7 +1562,6 @@ pub const KernelState = struct {
         while (true) {
             const paddr = try free_list.popFrontBelow(user_mappable_paddr_limit);
             if (self.anyPrincipalHasPageCap(paddr)) continue;
-            if (self.paddrFallsInsideActiveUntypedBlock(paddr)) continue;
             return .{
                 .paddr = paddr,
             };
@@ -1789,256 +1626,6 @@ pub const KernelState = struct {
         self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
         try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
         try free_list.appendPage(0, paddr);
-    }
-
-    pub fn createUntypedBlock(
-        self: *KernelState,
-        owner: PrincipalId,
-        base_paddr: u64,
-        size_bytes: u64,
-        flags: UntypedFlags,
-    ) KernelError!u32 {
-        try self.requireActiveProcess(owner);
-        const block_id = try self.untyped_pool.allocBlock(base_paddr, size_bytes, flags);
-        const root_id = self.allocCapId();
-        try self.getUntypedTable(owner).add(.{
-            .block_id = block_id,
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        return block_id;
-    }
-
-    pub fn findOwnedUntypedForPages(
-        self: *const KernelState,
-        owner: PrincipalId,
-        page_count: usize,
-        contiguous: bool,
-    ) ?u32 {
-        self.requireActiveProcess(owner) catch return null;
-        const bytes_needed, const overflow = @mulWithOverflow(@as(u64, @intCast(page_count)), @as(u64, 4096));
-        if (overflow != 0) return null;
-        const table = self.getUntypedTableConst(owner);
-        var i: usize = 0;
-        while (i < table.len) : (i += 1) {
-            const cap = table.caps[i];
-            const block = self.untyped_pool.getBlockConst(cap.block_id) orelse continue;
-            if (contiguous and !block.flags.contiguous_only) continue;
-            const used_aligned = pageAlignUp(block.used_bytes);
-            if (used_aligned > block.size_bytes) continue;
-            if ((block.size_bytes - used_aligned) >= bytes_needed) return cap.block_id;
-        }
-        return null;
-    }
-
-    pub fn retypeUntypedToPages(
-        self: *KernelState,
-        owner: PrincipalId,
-        block_id: u32,
-        page_count: usize,
-        contiguous: bool,
-        out_caps: []PageCapability,
-    ) KernelError!void {
-        try self.requireActiveProcess(owner);
-        if (page_count == 0 or out_caps.len < page_count) return KernelError.InvalidState;
-        const untyped_cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
-        const block = self.untyped_pool.getBlock(block_id) orelse return KernelError.UntypedNotFound;
-        if (contiguous and !block.flags.contiguous_only) return KernelError.InvalidState;
-
-        const bytes_needed, const overflow = @mulWithOverflow(@as(u64, @intCast(page_count)), @as(u64, 4096));
-        if (overflow != 0) return KernelError.InvalidState;
-        const used_aligned = pageAlignUp(block.used_bytes);
-        if (used_aligned > block.size_bytes or (block.size_bytes - used_aligned) < bytes_needed) {
-            return KernelError.OutOfFreePages;
-        }
-
-        var i: usize = 0;
-        while (i < page_count) : (i += 1) {
-            const paddr = block.base_paddr + used_aligned + (@as(u64, @intCast(i)) * 4096);
-            if (!builtin.is_test) {
-                const page_bytes: [*]u8 = @ptrFromInt(paddr);
-                @memset(page_bytes[0..4096], 0);
-            }
-        }
-        i = 0;
-        while (i < page_count) : (i += 1) {
-            const paddr = block.base_paddr + used_aligned + (@as(u64, @intCast(i)) * 4096);
-            const cap_id = self.allocCapId();
-            try self.getTable(owner).add(.{
-                .paddr = paddr,
-                .rights = .{
-                    .cpu_read = true,
-                    .cpu_write = true,
-                    .dma = block.flags.dma_ok,
-                    .grant = true,
-                },
-                .cap_id = cap_id,
-                .root_cap_id = untyped_cap.root_cap_id,
-                .parent_cap_id = untyped_cap.cap_id,
-            });
-            out_caps[i] = .{ .paddr = paddr };
-        }
-        block.used_bytes = used_aligned + bytes_needed;
-    }
-
-    pub fn grantUntypedCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        block_id: u32,
-    ) KernelError!void {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-        const src_cap = self.getUntypedTableConst(from).find(block_id) orelse return KernelError.UntypedNotFound;
-        if (self.getUntypedTableConst(to).find(block_id) != null) return KernelError.InvalidState;
-        const child_id = self.allocCapId();
-        try self.getUntypedTable(to).add(.{
-            .block_id = block_id,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-    }
-
-    pub fn moveUntypedCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        block_id: u32,
-    ) KernelError!void {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-        const src = self.getUntypedTable(from);
-        const src_cap = src.find(block_id) orelse return KernelError.UntypedNotFound;
-        if (self.getUntypedTableConst(to).find(block_id) != null) return KernelError.InvalidState;
-        const moved = src_cap.*;
-        _ = src.removeByBlockId(block_id);
-        try self.getUntypedTable(to).add(moved);
-    }
-
-    fn hasUntypedChildren(self: *const KernelState, cap_id: u64) bool {
-        var pidx: usize = 0;
-        while (pidx < principal_count) : (pidx += 1) {
-            const table = &self.untyped_tables[pidx];
-            var i: usize = 0;
-            while (i < table.len) : (i += 1) {
-                if (table.caps[i].parent_cap_id == cap_id) return true;
-            }
-        }
-        return false;
-    }
-
-    fn hasPageChildren(self: *const KernelState, cap_id: u64) bool {
-        var pidx: usize = 0;
-        while (pidx < principal_count) : (pidx += 1) {
-            const table = &self.cap_tables[pidx];
-            var i: usize = 0;
-            while (i < table.len) : (i += 1) {
-                if (table.caps[i].parent_cap_id == cap_id) return true;
-            }
-        }
-        return false;
-    }
-
-    pub fn resetUntyped(
-        self: *KernelState,
-        owner: PrincipalId,
-        block_id: u32,
-    ) KernelError!void {
-        try self.requireActiveProcess(owner);
-        const cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
-        if (cap.parent_cap_id != 0) return KernelError.InvalidState;
-        if (self.hasUntypedChildren(cap.cap_id) or self.hasPageChildren(cap.cap_id)) {
-            return KernelError.UntypedHasChildren;
-        }
-        const block = self.untyped_pool.getBlock(block_id) orelse return KernelError.UntypedNotFound;
-        block.used_bytes = 0;
-    }
-
-    pub fn revokeUntypedCapTree(
-        self: *KernelState,
-        owner: PrincipalId,
-        block_id: u32,
-    ) KernelError!void {
-        try self.requireActiveProcess(owner);
-        const start_cap = self.getUntypedTableConst(owner).find(block_id) orelse return KernelError.UntypedNotFound;
-        const start_id = start_cap.cap_id;
-        const is_root = start_cap.parent_cap_id == 0;
-
-        const queue = &self.untyped_revoke_queue;
-        var queue_len: usize = 0;
-        var queue_head: usize = 0;
-        queue[0] = start_id;
-        queue_len = 1;
-
-        const subtree = &self.untyped_revoke_subtree;
-        var subtree_len: usize = 0;
-
-        while (queue_head < queue_len) : (queue_head += 1) {
-            const current_id = queue[queue_head];
-            if (containsCapId(subtree[0..subtree_len], current_id)) continue;
-            if (subtree_len >= subtree.len) return KernelError.RevokeOverflow;
-            subtree[subtree_len] = current_id;
-            subtree_len += 1;
-
-            var pidx: usize = 0;
-            while (pidx < principal_count) : (pidx += 1) {
-                const page_table = &self.cap_tables[pidx];
-                var i: usize = 0;
-                while (i < page_table.len) : (i += 1) {
-                    const cap = page_table.caps[i];
-                    if (cap.parent_cap_id != current_id) continue;
-                    if (containsCapId(queue[0..queue_len], cap.cap_id)) continue;
-                    if (queue_len >= queue.len) return KernelError.RevokeOverflow;
-                    queue[queue_len] = cap.cap_id;
-                    queue_len += 1;
-                }
-
-                const untyped_table = &self.untyped_tables[pidx];
-                i = 0;
-                while (i < untyped_table.len) : (i += 1) {
-                    const cap = untyped_table.caps[i];
-                    if (cap.parent_cap_id != current_id) continue;
-                    if (containsCapId(queue[0..queue_len], cap.cap_id)) continue;
-                    if (queue_len >= queue.len) return KernelError.RevokeOverflow;
-                    queue[queue_len] = cap.cap_id;
-                    queue_len += 1;
-                }
-            }
-        }
-
-        var s: usize = 0;
-        while (s < subtree_len) : (s += 1) {
-            const cap_id = subtree[s];
-            var pidx: usize = 0;
-            while (pidx < principal_count) : (pidx += 1) {
-                const page_table = &self.cap_tables[pidx];
-                if (page_table.findByCapId(cap_id)) |page_cap| {
-                    const removed_paddr = page_cap.paddr;
-                    _ = page_table.removeByCapId(cap_id);
-                    self.removeDmaMappingsForPrincipalPaddr(@enumFromInt(pidx), removed_paddr);
-                    try device_capabilities.syncIommuForPrincipalPaddr(self, @enumFromInt(pidx), removed_paddr, .revoke);
-                    if (self.pte_sync_hook) |hook| {
-                        callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);
-                    }
-                    break;
-                }
-
-                const untyped_table = &self.untyped_tables[pidx];
-                if (untyped_table.findByCapId(cap_id) != null) {
-                    _ = untyped_table.removeByCapId(cap_id);
-                    break;
-                }
-            }
-        }
-
-        if (is_root) {
-            const block = self.untyped_pool.getBlock(block_id) orelse return KernelError.UntypedNotFound;
-            block.used_bytes = 0;
-        }
     }
 
     pub fn installCap(
@@ -2403,4 +1990,3 @@ fn containsCapId(ids: []const u64, target: u64) bool {
     }
     return false;
 }
-

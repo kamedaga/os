@@ -2,17 +2,12 @@
 /// All boot logic lives in boot/entry.zig.  This file is intentionally minimal:
 /// panic handler, exported asm symbols, and the UEFI main() stack-switch stub.
 const std = @import("std");
-const build_workarounds = @import("build_workarounds");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const uefi_services = @import("boot/uefi_services.zig");
 
 // Pull in boot/entry.zig so that its `pub export` FX-state functions
 // (saveCurrentThreadFxState, restoreCurrentThreadFxState, etc.) are emitted.
 const entry = @import("boot/entry.zig");
-
-comptime {
-    _ = build_workarounds.bootx64_cache_repaired;
-}
 
 // ---------------------------------------------------------------------------
 // Exported symbols accessed by assembly stubs in traps.zig / syscalls.zig
@@ -48,7 +43,6 @@ pub fn main() void {
         :
         : [stack_top] "r" (boot_stack_top),
           [target] "r" (&entry.kernelMain),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     unreachable;
 }
