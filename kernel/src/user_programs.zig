@@ -20,15 +20,6 @@ fn writeU64LE(ptr: [*]volatile u8, offset: usize, value: u64) void {
     }
 }
 
-pub fn installIdleTaskCode(user_page_paddr: u64) void {
-    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
-    // pause; jmp -4
-    code[0] = 0xF3;
-    code[1] = 0x90;
-    code[2] = 0xEB;
-    code[3] = 0xFC;
-}
-
 pub fn installFramebufferFillCode(
     user_page_paddr: u64,
     framebuffer_user_va: u64,
@@ -332,74 +323,6 @@ pub fn installDmaUnmapVerifyCode(cfg: Config, user_page_paddr: u64) void {
 
     code[off] = 0xEB;
     code[off + 1] = 0xFE;
-}
-
-pub fn installSchedulerProbeCode(user_page_paddr: u64, syscall_no: u64) void {
-    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
-    var off: usize = 0;
-
-    // loop: mov rax, syscall_no ; int 0x80 ; jmp loop
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, syscall_no);
-    off += 10;
-
-    code[off] = 0xCD;
-    code[off + 1] = 0x80;
-    off += 2;
-
-    code[off] = 0xEB;
-    code[off + 1] = 0xF2; // jump back -14 bytes to loop head
-}
-
-pub fn installSchedulerProbeWithSendCapCode(
-    cfg: Config,
-    user_page_paddr: u64,
-    probe_syscall_no: u64,
-    endpoint_id: u64,
-) void {
-    const code: [*]volatile u8 = @ptrFromInt(user_page_paddr);
-    var off: usize = 0;
-
-    // one-shot: alloc page -> send_cap(page, target_process)
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, cfg.syscall_alloc_page);
-    off += 10;
-    code[off] = 0xCD;
-    code[off + 1] = 0x80;
-    off += 2;
-    code[off] = 0x48;
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xC3; // mov rbx, rax (allocated paddr)
-    off += 3;
-
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, cfg.syscall_send_cap);
-    off += 10;
-    code[off] = 0x48;
-    code[off + 1] = 0x89;
-    code[off + 2] = 0xDF; // mov rdi, rbx (paddr)
-    off += 3;
-    code[off] = 0x48;
-    code[off + 1] = 0xBE;
-    writeU64LE(code, off + 2, endpoint_id); // rsi = endpoint id
-    off += 10;
-    code[off] = 0xCD;
-    code[off + 1] = 0x80;
-    off += 2;
-
-    // loop: mov rax, probe_syscall_no ; int 0x80 ; jmp loop
-    code[off] = 0x48;
-    code[off + 1] = 0xB8;
-    writeU64LE(code, off + 2, probe_syscall_no);
-    off += 10;
-    code[off] = 0xCD;
-    code[off + 1] = 0x80;
-    off += 2;
-    code[off] = 0xEB;
-    code[off + 1] = 0xF2; // jump back -14 bytes to loop head
 }
 
 pub fn installCapSendTransferDemoCode(

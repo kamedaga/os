@@ -43,34 +43,15 @@ pub const Hooks = struct {
 
 var trap_hooks_storage: Hooks = undefined;
 var trap_hooks_ready = false;
-pub export var timer_entry_saved_rax: u64 = 0;
-pub export var timer_entry_pushed_rax: u64 = 0;
-pub export var timer_stack_rax_post_dispatch: u64 = 0;
-pub export var timer_stack_rax_pre_log: u64 = 0;
-pub export var last_user_return_rax: u64 = 0;
-pub export var last_user_return_rip: u64 = 0;
-pub export var last_stage_source_rax: u64 = 0;
-pub export var last_stage_saved_rax: u64 = 0;
-pub export var last_stage_source_rip: u64 = 0;
-pub export var last_stage_saved_rip: u64 = 0;
-pub export var page_fault_work_frame: ExceptionTrapFrame = std.mem.zeroes(ExceptionTrapFrame);
 pub export var page_fault_work_frames: [smp.max_cpus]ExceptionTrapFrame = [_]ExceptionTrapFrame{std.mem.zeroes(ExceptionTrapFrame)} ** smp.max_cpus;
-pub export var trap_fault_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
 pub export var trap_fault_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var fatal_exception_resume_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
 pub export var fatal_exception_resume_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var timer_interrupt_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
 pub export var timer_interrupt_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var timer_interrupt_work_frame_cpu_slot: usize = 0;
 pub export var syscall_interrupt_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var user_return_saved_gprs_by_cpu: [smp.max_cpus][16]u64 align(16) = [_][16]u64{[_]u64{0} ** 16} ** smp.max_cpus;
 pub export var user_return_iret_frames_by_cpu: [smp.max_cpus][8]u64 align(16) = [_][8]u64{[_]u64{0} ** 8} ** smp.max_cpus;
-pub export var syscall_interrupt_work_frame_cpu_slot: usize = 0;
-pub export var syscall_lstar_cpu_slot: usize = 0;
-pub export var syscall_entry_user_rsp: u64 = 0;
 pub export var syscall_entry_user_rsps: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
 pub export var syscall_entry_saved_r15s: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
-pub export var syscall_entry_is_lstar: u64 = 0;
 pub export var syscall_entry_is_lstars: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
@@ -81,43 +62,36 @@ fn maxStaticEnd(a: usize, b: usize) usize {
     return if (a > b) a else b;
 }
 
+fn updateStaticEnd(end: *usize, comptime ptr: anytype) void {
+    end.* = maxStaticEnd(end.*, staticStorageEnd(@TypeOf(ptr.*), ptr));
+}
+
+fn mapStaticStorage(map_identity_range: *const fn (u64, usize) bool, comptime ptr: anytype) bool {
+    return map_identity_range(@intFromPtr(ptr), @sizeOf(@TypeOf(ptr.*)));
+}
+
+const runtime_storage_ptrs = .{
+    &trap_hooks_storage,
+    &trap_hooks_ready,
+    &page_fault_work_frames,
+    &trap_fault_work_frames,
+    &fatal_exception_resume_work_frames,
+    &timer_interrupt_work_frames,
+    &syscall_interrupt_work_frames,
+    &user_return_saved_gprs_by_cpu,
+    &user_return_iret_frames_by_cpu,
+    &syscall_entry_user_rsps,
+    &syscall_entry_saved_r15s,
+    &syscall_entry_is_lstars,
+    &user_return_saved_r10,
+    &user_return_saved_gprs,
+    &user_return_iret_frame,
+    &syscall_return_writeback_enabled_by_cpu,
+};
+
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(trap_hooks_storage), &trap_hooks_storage));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(trap_hooks_ready), &trap_hooks_ready));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_entry_saved_rax), &timer_entry_saved_rax));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_entry_pushed_rax), &timer_entry_pushed_rax));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_stack_rax_post_dispatch), &timer_stack_rax_post_dispatch));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_stack_rax_pre_log), &timer_stack_rax_pre_log));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(last_user_return_rax), &last_user_return_rax));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(last_user_return_rip), &last_user_return_rip));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(last_stage_source_rax), &last_stage_source_rax));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(last_stage_saved_rax), &last_stage_saved_rax));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(last_stage_source_rip), &last_stage_source_rip));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(last_stage_saved_rip), &last_stage_saved_rip));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(page_fault_work_frame), &page_fault_work_frame));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(page_fault_work_frames), &page_fault_work_frames));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(trap_fault_work_frame), &trap_fault_work_frame));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(trap_fault_work_frames), &trap_fault_work_frames));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(fatal_exception_resume_work_frame), &fatal_exception_resume_work_frame));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(fatal_exception_resume_work_frames), &fatal_exception_resume_work_frames));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_interrupt_work_frame), &timer_interrupt_work_frame));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_interrupt_work_frames), &timer_interrupt_work_frames));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_interrupt_work_frame_cpu_slot), &timer_interrupt_work_frame_cpu_slot));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_interrupt_work_frames), &syscall_interrupt_work_frames));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_return_saved_gprs_by_cpu), &user_return_saved_gprs_by_cpu));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_return_iret_frames_by_cpu), &user_return_iret_frames_by_cpu));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_interrupt_work_frame_cpu_slot), &syscall_interrupt_work_frame_cpu_slot));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_lstar_cpu_slot), &syscall_lstar_cpu_slot));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_user_rsp), &syscall_entry_user_rsp));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_user_rsps), &syscall_entry_user_rsps));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_saved_r15s), &syscall_entry_saved_r15s));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstar), &syscall_entry_is_lstar));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstars), &syscall_entry_is_lstars));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_return_saved_r10), &user_return_saved_r10));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_return_saved_gprs), &user_return_saved_gprs));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_return_iret_frame), &user_return_iret_frame));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled_by_cpu), &syscall_return_writeback_enabled_by_cpu));
+    inline for (runtime_storage_ptrs) |ptr| updateStaticEnd(&end, ptr);
     return end;
 }
 
@@ -127,40 +101,9 @@ pub fn init(new_hooks: Hooks) void {
 }
 
 pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
-    if (!map_identity_range(@intFromPtr(&trap_hooks_storage), @sizeOf(@TypeOf(trap_hooks_storage)))) return false;
-    if (!map_identity_range(@intFromPtr(&trap_hooks_ready), @sizeOf(@TypeOf(trap_hooks_ready)))) return false;
-    if (!map_identity_range(@intFromPtr(&timer_entry_saved_rax), @sizeOf(@TypeOf(timer_entry_saved_rax)))) return false;
-    if (!map_identity_range(@intFromPtr(&timer_entry_pushed_rax), @sizeOf(@TypeOf(timer_entry_pushed_rax)))) return false;
-    if (!map_identity_range(@intFromPtr(&timer_stack_rax_post_dispatch), @sizeOf(@TypeOf(timer_stack_rax_post_dispatch)))) return false;
-    if (!map_identity_range(@intFromPtr(&timer_stack_rax_pre_log), @sizeOf(@TypeOf(timer_stack_rax_pre_log)))) return false;
-    if (!map_identity_range(@intFromPtr(&user_return_saved_r10), @sizeOf(@TypeOf(user_return_saved_r10)))) return false;
-    if (!map_identity_range(@intFromPtr(&user_return_saved_gprs), @sizeOf(@TypeOf(user_return_saved_gprs)))) return false;
-    if (!map_identity_range(@intFromPtr(&user_return_iret_frame), @sizeOf(@TypeOf(user_return_iret_frame)))) return false;
-    if (!map_identity_range(@intFromPtr(&last_user_return_rax), @sizeOf(@TypeOf(last_user_return_rax)))) return false;
-    if (!map_identity_range(@intFromPtr(&last_user_return_rip), @sizeOf(@TypeOf(last_user_return_rip)))) return false;
-    if (!map_identity_range(@intFromPtr(&last_stage_source_rax), @sizeOf(@TypeOf(last_stage_source_rax)))) return false;
-    if (!map_identity_range(@intFromPtr(&last_stage_saved_rax), @sizeOf(@TypeOf(last_stage_saved_rax)))) return false;
-    if (!map_identity_range(@intFromPtr(&last_stage_source_rip), @sizeOf(@TypeOf(last_stage_source_rip)))) return false;
-    if (!map_identity_range(@intFromPtr(&last_stage_saved_rip), @sizeOf(@TypeOf(last_stage_saved_rip)))) return false;
-    if (!map_identity_range(@intFromPtr(&page_fault_work_frame), @sizeOf(@TypeOf(page_fault_work_frame)))) return false;
-    if (!map_identity_range(@intFromPtr(&page_fault_work_frames), @sizeOf(@TypeOf(page_fault_work_frames)))) return false;
-    if (!map_identity_range(@intFromPtr(&trap_fault_work_frame), @sizeOf(@TypeOf(trap_fault_work_frame)))) return false;
-    if (!map_identity_range(@intFromPtr(&trap_fault_work_frames), @sizeOf(@TypeOf(trap_fault_work_frames)))) return false;
-    if (!map_identity_range(@intFromPtr(&fatal_exception_resume_work_frame), @sizeOf(@TypeOf(fatal_exception_resume_work_frame)))) return false;
-    if (!map_identity_range(@intFromPtr(&fatal_exception_resume_work_frames), @sizeOf(@TypeOf(fatal_exception_resume_work_frames)))) return false;
-    if (!map_identity_range(@intFromPtr(&timer_interrupt_work_frame), @sizeOf(@TypeOf(timer_interrupt_work_frame)))) return false;
-    if (!map_identity_range(@intFromPtr(&timer_interrupt_work_frames), @sizeOf(@TypeOf(timer_interrupt_work_frames)))) return false;
-    if (!map_identity_range(@intFromPtr(&timer_interrupt_work_frame_cpu_slot), @sizeOf(@TypeOf(timer_interrupt_work_frame_cpu_slot)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_interrupt_work_frames), @sizeOf(@TypeOf(syscall_interrupt_work_frames)))) return false;
-    if (!map_identity_range(@intFromPtr(&user_return_saved_gprs_by_cpu), @sizeOf(@TypeOf(user_return_saved_gprs_by_cpu)))) return false;
-    if (!map_identity_range(@intFromPtr(&user_return_iret_frames_by_cpu), @sizeOf(@TypeOf(user_return_iret_frames_by_cpu)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_interrupt_work_frame_cpu_slot), @sizeOf(@TypeOf(syscall_interrupt_work_frame_cpu_slot)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_lstar_cpu_slot), @sizeOf(@TypeOf(syscall_lstar_cpu_slot)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_entry_user_rsp), @sizeOf(@TypeOf(syscall_entry_user_rsp)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_entry_user_rsps), @sizeOf(@TypeOf(syscall_entry_user_rsps)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_entry_saved_r15s), @sizeOf(@TypeOf(syscall_entry_saved_r15s)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_entry_is_lstar), @sizeOf(@TypeOf(syscall_entry_is_lstar)))) return false;
-    if (!map_identity_range(@intFromPtr(&syscall_entry_is_lstars), @sizeOf(@TypeOf(syscall_entry_is_lstars)))) return false;
+    inline for (runtime_storage_ptrs) |ptr| {
+        if (!mapStaticStorage(map_identity_range, ptr)) return false;
+    }
     return true;
 }
 
@@ -199,14 +142,12 @@ extern fn schedulerSyncBootstrapCurrentStateFromMirrorFromAsm() callconv(.c) voi
 pub export fn syscallInterruptWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
     const cpu_slot = scheduler.currentCpuSlot();
     const bounded_slot = if (cpu_slot < syscall_interrupt_work_frames.len) cpu_slot else 0;
-    syscall_interrupt_work_frame_cpu_slot = bounded_slot;
     return &syscall_interrupt_work_frames[bounded_slot];
 }
 
 pub export fn timerInterruptWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
     const cpu_slot = scheduler.currentCpuSlot();
     const bounded_slot = if (cpu_slot < timer_interrupt_work_frames.len) cpu_slot else 0;
-    timer_interrupt_work_frame_cpu_slot = bounded_slot;
     return &timer_interrupt_work_frames[bounded_slot];
 }
 
@@ -228,9 +169,7 @@ pub export fn fatalExceptionResumeWorkFrameForCurrentCpuFromAsm() callconv(.c) *
 }
 
 pub export fn markSyscallEntryInt80ForCurrentCpuFromAsm() callconv(.c) void {
-    const cpu_slot = boundedCurrentCpuSlot();
-    syscall_entry_is_lstar = 0;
-    syscall_entry_is_lstars[cpu_slot] = 0;
+    syscall_entry_is_lstars[boundedCurrentCpuSlot()] = 0;
 }
 
 pub export fn syscallReturnWritebackEnabledForCurrentCpuFromAsm() callconv(.c) u64 {
@@ -249,10 +188,6 @@ pub export fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, ir
     while (iret_index < user_return_iret_qword_count) : (iret_index += 1) {
         user_return_iret_frames_by_cpu[cpu_slot][iret_index] = iret_src[iret_index];
     }
-    last_stage_source_rax = src[@offsetOf(TrapFrame, "rax") / @sizeOf(u64)];
-    last_stage_saved_rax = user_return_saved_gprs_by_cpu[cpu_slot][@offsetOf(TrapFrame, "rax") / @sizeOf(u64)];
-    last_stage_source_rip = iret_src[0];
-    last_stage_saved_rip = user_return_iret_frames_by_cpu[cpu_slot][0];
 }
 
 pub export fn userReturnSavedGprsForCurrentCpuFromAsm() callconv(.c) *u64 {
@@ -819,12 +754,6 @@ fn writeExceptionWithErrorSummary(h: *const Hooks, vec: u64, frame: *const Excep
     h.write("  SS=");
     h.write_hex_raw(frame.ss);
     h.write("\n");
-    h.write("  LAST_USER_RIP=");
-    h.write_hex_raw(last_user_return_rip);
-    h.write("\n");
-    h.write("  LAST_STAGE_RIP=");
-    h.write_hex_raw(last_stage_saved_rip);
-    h.write("\n");
     writeCommonTrapRegs(h, frame);
 }
 
@@ -842,10 +771,6 @@ fn writeTrapSummary(h: *const Hooks, label: []const u8, frame: *const TrapFrame)
     h.write("\n");
     writeCommonTrapRegs(h, frame);
 }
-
-pub export fn logTimerReturnFrame(_: *const TrapFrame) callconv(.c) void {}
-
-pub export fn logCurrentStagedUserReturnFrame() callconv(.c) void {}
 
 pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
     asm volatile (
@@ -875,10 +800,6 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
         \\pop %rdi
         \\pop %rax
         \\mov %rax, %cr3
-        \\mov 112(%rsi), %r10
-        \\mov %r10, last_user_return_rax(%rip)
-        \\mov (%rdi), %r10
-        \\mov %r10, last_user_return_rip(%rip)
         \\mov 0(%rsi), %r15
         \\mov 8(%rsi), %r14
         \\mov 16(%rsi), %r13
@@ -1159,7 +1080,6 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
-            \\movq $0, syscall_entry_is_lstar(%rip)
             \\push %rax
             \\push %rbx
             \\push %rcx
@@ -1181,7 +1101,7 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\push %rax
         ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++
             \\pop %r10
-        ++ asmWriteSyscallReturnToWorkFramePointer() ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        ++ asmWriteSyscallReturnToWorkFramePointer() ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
         );
     } else {
@@ -1190,7 +1110,6 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
-            \\movq $0, syscall_entry_is_lstar(%rip)
             \\push %rax
             \\push %rbx
             \\push %rcx
@@ -1212,7 +1131,7 @@ pub export fn syscallHandlerStub() callconv(.naked) noreturn {
             \\push %rax
         ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++
             \\pop %r10
-        ++ asmWriteSyscallReturnToWorkFramePointer() ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        ++ asmWriteSyscallReturnToWorkFramePointer() ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
         );
     }
@@ -1249,21 +1168,16 @@ fn lstarEntryIsLstarSymbol(comptime cpu_slot: usize) []const u8 {
 fn asmLstarEntryPrefix(comptime cpu_slot: usize) []const u8 {
     return std.fmt.comptimePrint(
         \\
-        \\mov %rsp, syscall_entry_user_rsp(%rip)
         \\mov %rsp, syscall_entry_user_rsps+{d}(%rip)
         \\mov %r15, syscall_entry_saved_r15s+{d}(%rip)
         \\mov kernel_cr3_value(%rip), %r15
         \\mov %r15, %cr3
-        \\movq ${d}, syscall_lstar_cpu_slot(%rip)
-        \\movq ${d}, syscall_interrupt_work_frame_cpu_slot(%rip)
         \\mov kernel_syscall_stack_tops+{d}(%rip), %rsp
         \\mov syscall_entry_saved_r15s+{d}(%rip), %r15
         \\
     , .{
         cpu_slot * @sizeOf(u64),
         cpu_slot * @sizeOf(u64),
-        cpu_slot,
-        cpu_slot,
         cpu_slot * @sizeOf(u64),
         cpu_slot * @sizeOf(u64),
     });
@@ -1323,10 +1237,10 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
             \\mov {s}(%rip), %rsp
             \\sysretq
             \\24:
-        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\
-        ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             std.fmt.comptimePrint(
                 \\jmp userReturnToSavedFrame
                 \\29:
@@ -1334,7 +1248,6 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
                 \\mov kernel_cr3_value(%rip), %r15
                 \\mov %r15, %cr3
                 \\pop %r15
-                \\movq $1, syscall_entry_is_lstar(%rip)
                 \\movq $1, {s}(%rip)
                 \\pushq %[user_ss]
                 \\pushq {s}(%rip)
@@ -1364,7 +1277,7 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
                 \\mov %rax, 112(%rsp)
                 \\7:
                 \\
-            , .{writeback_symbol}) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+            , .{writeback_symbol}) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\
         ;
@@ -1408,10 +1321,10 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
             \\mov {s}(%rip), %rsp
             \\sysretq
             \\24:
-        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\
-        ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             std.fmt.comptimePrint(
                 \\jmp userReturnToSavedFrame
                 \\29:
@@ -1419,7 +1332,6 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
                 \\mov kernel_cr3_value(%rip), %r15
                 \\mov %r15, %cr3
                 \\pop %r15
-                \\movq $1, syscall_entry_is_lstar(%rip)
                 \\movq $1, {s}(%rip)
                 \\pushq %[user_ss]
                 \\pushq {s}(%rip)
@@ -1451,7 +1363,7 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
                 \\mov %rax, 112(%rsp)
                 \\7:
                 \\
-            , .{writeback_symbol}) ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+            , .{writeback_symbol}) ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\
         ;
@@ -1523,9 +1435,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
-            \\mov %rax, timer_entry_saved_rax(%rip)
             \\push %rax
-            \\mov %rax, timer_entry_pushed_rax(%rip)
             \\push %rbx
             \\push %rcx
             \\push %rdx
@@ -1549,26 +1459,14 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
         ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
             \\mov %r12, %rcx
         ++ asmCallAligned("timerInterruptDispatch") ++
-            \\mov 112(%r12), %r10
-            \\mov %r10, timer_stack_rax_post_dispatch(%rip)
-            \\mov %r10, timer_stack_rax_pre_log(%rip)
-            \\mov %r12, %rcx
-        ++ asmCallAligned("logTimerReturnFrame") ++
             \\mov %r12, %rax
-        ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\9:
             \\sub $512, %rsp
             \\lea 512(%rsp), %rdi
             \\mov %rdi, %rcx
             \\call timerInterruptDispatch
-            \\add $512, %rsp
-            \\mov 112(%rsp), %r10
-            \\mov %r10, timer_stack_rax_post_dispatch(%rip)
-            \\mov %r10, timer_stack_rax_pre_log(%rip)
-            \\sub $512, %rsp
-            \\lea 512(%rsp), %rcx
-            \\call logTimerReturnFrame
             \\add $512, %rsp
             \\pop %r15
             \\pop %r14
@@ -1597,9 +1495,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\mov kernel_cr3_value(%rip), %r10
             \\mov %r10, %cr3
             \\pop %r10
-            \\mov %rax, timer_entry_saved_rax(%rip)
             \\push %rax
-            \\mov %rax, timer_entry_pushed_rax(%rip)
             \\push %rbx
             \\push %rcx
             \\push %rdx
@@ -1622,29 +1518,15 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\mov %rax, %r12
         ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
             \\mov %r12, %rcx
-        ++ asmCallAligned("timerInterruptDispatch") ++
-            \\mov 112(%r12), %r10
-            \\mov %r10, timer_stack_rax_post_dispatch(%rip)
-        ++ asmCallAligned("restoreCurrentThreadFxState") ++
-            \\mov 112(%r12), %r10
-            \\mov %r10, timer_stack_rax_pre_log(%rip)
-            \\mov %r12, %rcx
-        ++ asmCallAligned("logTimerReturnFrame") ++
+        ++ asmCallAligned("timerInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
             \\mov %r12, %rax
-        ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++ asmCallAligned("logCurrentStagedUserReturnFrame") ++
+        ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\9:
             \\sub $512, %rsp
             \\lea 512(%rsp), %rdi
             \\mov %rdi, %rcx
             \\call timerInterruptDispatch
-            \\add $512, %rsp
-            \\mov 112(%rsp), %r10
-            \\mov %r10, timer_stack_rax_post_dispatch(%rip)
-            \\mov %r10, timer_stack_rax_pre_log(%rip)
-            \\sub $512, %rsp
-            \\lea 512(%rsp), %rcx
-            \\call logTimerReturnFrame
             \\add $512, %rsp
             \\pop %r15
             \\pop %r14

@@ -583,7 +583,7 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
             cpuStatePtr(cpu_slot).* = cpu_state_user;
             enterUserModeFromIdle(&user_entry);
         }
-        if (build_workarounds.scheduler_ap_user_diagnostics or build_workarounds.spawn_exec_ap_user_scheduling) {
+        if (build_workarounds.spawn_exec_ap_user_scheduling) {
             asm volatile ("pause");
         } else {
             asm volatile ("hlt");

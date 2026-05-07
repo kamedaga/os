@@ -41,11 +41,6 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const scheduler_ap_user_diagnostics = b.option(
-        bool,
-        "scheduler-ap-user-diagnostics",
-        "Run boot-time AP user scheduler diagnostics/probes",
-    ) orelse false;
     const spawn_exec_ap_user_scheduling = b.option(
         bool,
         "spawn-exec-ap-user-scheduling",
@@ -58,23 +53,8 @@ pub fn build(b: *std.Build) void {
     ) orelse true;
     const build_workarounds = b.addOptions();
     build_workarounds.addOption(bool, "bootx64_cache_repaired", bootx64_cache_repaired);
-    build_workarounds.addOption(bool, "scheduler_ap_user_diagnostics", scheduler_ap_user_diagnostics);
     build_workarounds.addOption(bool, "spawn_exec_ap_user_scheduling", spawn_exec_ap_user_scheduling);
     build_workarounds.addOption(bool, "ap_user_timer_preemption", ap_user_timer_preemption);
-
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/kernel.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_mod.addOptions("build_workarounds", build_workarounds);
-    const unit_tests = b.addTest(.{
-        .root_module = test_mod,
-    });
-
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run kernel unit tests");
-    test_step.dependOn(&run_unit_tests.step);
 
     const efi_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
@@ -84,7 +64,29 @@ pub fn build(b: *std.Build) void {
     const kernel_abi_root_mod = b.createModule(.{
         .root_source_file = b.path("abi/kernel_abi_root.zig"),
     });
+    const kernel_mod = b.createModule(.{
+        .root_source_file = b.path("src/kernel.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kernel_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("../tests/kernel_state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_mod.addOptions("build_workarounds", build_workarounds);
+    test_mod.addImport("kernel", kernel_mod);
     test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const unit_tests = b.addTest(.{
+        .root_module = test_mod,
+    });
+    unit_tests.stack_size = 512 * 1024 * 1024;
+
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run kernel unit tests");
+    test_step.dependOn(&run_unit_tests.step);
 
     const efi_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
