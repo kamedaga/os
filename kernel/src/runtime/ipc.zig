@@ -2,8 +2,8 @@ const boot_static = @import("../boot/main_static.zig");
 const scheduler = @import("../scheduler.zig");
 
 pub fn deliverMessageToContext(ctx: *scheduler.ThreadContext, mr0: u64, mr1: u64, mr2: u64, mr3: u64) void {
-    if (ctx.abi_trap_reply_pending) {
-        ctx.abi_trap_reply_pending = false;
+    if (scheduler.delegateReplyPending(ctx)) {
+        scheduler.setDelegateReplyPending(ctx, false);
         ctx.frame.rax = mr0;
         if (mr2 != 0) ctx.frame.rip = mr2;
         if (mr3 != 0) ctx.frame.rsp = mr3;
@@ -29,7 +29,7 @@ pub fn deliverOrQueueMessageToThread(
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return boot_static.syscall_err_endpoint;
     const target_hot = scheduler.getIpcHotThreadConst(target_thread) orelse return boot_static.syscall_err_endpoint;
     if (target_hot.allocated == 0) return boot_static.syscall_err_endpoint;
-    const abi_reply_to_pending_target = target_ctx.abi_trap_reply_pending and endpoint_id == 0 and !grants_reply;
+    const abi_reply_to_pending_target = scheduler.delegateReplyPending(target_ctx) and endpoint_id == 0 and !grants_reply;
     if (target_hot.ready == 0 and target_ctx.ipc_signal_wait_only and !abi_reply_to_pending_target) {
         if (!grants_reply) {
             scheduler.prepareBlockedThreadForWake(target_thread);

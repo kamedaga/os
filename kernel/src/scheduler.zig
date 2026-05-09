@@ -176,7 +176,11 @@ pub const ThreadContext = struct {
     ipc_cached_target_thread: usize = 0,
     ipc_reply_token_valid: bool = false,
     ipc_reply_token_target_thread: usize = 0,
-    abi_trap_reply_pending: bool = false,
+    // Delegate transport has two blocked states. send_pending means the
+    // request is still waiting for server delivery; reply_pending means the
+    // server owns the request and the caller is waiting for a reply.
+    delegate_send_pending: bool = false,
+    delegate_reply_pending: bool = false,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
 };
@@ -222,6 +226,31 @@ fn buildInitialIpcQueues() [max_thread_slots]IpcQueue {
         queues[i] = .{};
     }
     return queues;
+}
+
+pub fn delegateSendPending(ctx: *const ThreadContext) bool {
+    return ctx.delegate_send_pending;
+}
+
+pub fn delegateReplyPending(ctx: *const ThreadContext) bool {
+    return ctx.delegate_reply_pending;
+}
+
+pub fn delegateTransportBlocked(ctx: *const ThreadContext) bool {
+    return ctx.delegate_send_pending or ctx.delegate_reply_pending;
+}
+
+pub fn setDelegateSendPending(ctx: *ThreadContext, pending: bool) void {
+    ctx.delegate_send_pending = pending;
+}
+
+pub fn setDelegateReplyPending(ctx: *ThreadContext, pending: bool) void {
+    ctx.delegate_reply_pending = pending;
+}
+
+pub fn clearDelegateTransportPending(ctx: *ThreadContext) void {
+    ctx.delegate_send_pending = false;
+    ctx.delegate_reply_pending = false;
 }
 
 pub var thread_contexts: [max_thread_slots]ThreadContext = buildInitialThreadContexts();
@@ -573,7 +602,7 @@ fn clearApThreadAssociationLocked(cpu_slot: usize, state: *CpuSchedulerState, th
     if (state.entered_handoff_thread == thread_index) state.entered_handoff_thread = null;
     state.user_entry_requested = state.consumed_handoff_thread != null;
     if (getThreadContextConst(thread_index)) |ctx| {
-        if (ctx.allocated and ctx.ready and !ctx.abi_trap_reply_pending and ctx.cpu_slot == cpu_slot) {
+        if (ctx.allocated and ctx.ready and !delegateTransportBlocked(ctx) and ctx.cpu_slot == cpu_slot) {
             if (getIpcHotThread(thread_index)) |hot| {
                 hot.ready = 1;
                 hot.wait_mailbox = 0;
@@ -609,7 +638,7 @@ fn threadReadyForCpuLocked(thread_index: usize, cpu_slot: usize) bool {
     const ctx = getThreadContextConst(thread_index) orelse return false;
     const hot = getIpcHotThreadConst(thread_index) orelse return false;
     if (!ctx.allocated or hot.allocated == 0) return false;
-    if (!ctx.ready or hot.ready == 0 or ctx.abi_trap_reply_pending) return false;
+    if (!ctx.ready or hot.ready == 0 or delegateTransportBlocked(ctx)) return false;
     if (ctx.cpu_slot != cpu_slot) return false;
     return true;
 }
@@ -618,7 +647,7 @@ fn enqueueRunnableThreadLocked(thread_index: usize) bool {
     const cpu_slot = threadAssignedCpuSlot(thread_index);
     if (!cpuAcceptsRunnableLocked(cpu_slot)) return false;
     const ctx = getThreadContextConst(thread_index) orelse return false;
-    if (!ctx.allocated or !ctx.ready or ctx.abi_trap_reply_pending) return false;
+    if (!ctx.allocated or !ctx.ready or delegateTransportBlocked(ctx)) return false;
     if (threadAssociatedWithAnyCpuLocked(thread_index)) {
         clearIdleApThreadAssociationsLocked(thread_index);
         if (threadAssociatedWithAnyCpuLocked(thread_index)) return false;
@@ -990,7 +1019,7 @@ pub fn assignReadyUserThreadToApIfReady(thread_index: usize) ?usize {
 
 pub fn wakeAssignedApForRunnableThread(thread_index: usize) void {
     const ctx = getThreadContextConst(thread_index) orelse return;
-    if (!ctx.allocated or !ctx.ready or ctx.abi_trap_reply_pending) return;
+    if (!ctx.allocated or !ctx.ready or delegateTransportBlocked(ctx)) return;
     const cpu_slot = ctx.cpu_slot;
     if (cpu_slot == bootstrap_cpu_slot) return;
     if (!spawnExecApUserSchedulingReady()) return;
@@ -1090,7 +1119,7 @@ pub fn saveApUserTimerFrame(frame: *const TrapFrame) bool {
     const ctx = getThreadContext(thread_index) orelse return false;
     const hot = getIpcHotThread(thread_index) orelse return false;
     if (!ctx.allocated or hot.allocated == 0) return false;
-    if (ctx.abi_trap_reply_pending) return false;
+    if (delegateTransportBlocked(ctx)) return false;
     ctx.frame = frame.*;
     state.consumed_handoff_thread = null;
     state.pending_handoff_thread = null;
@@ -1137,7 +1166,7 @@ pub fn currentApUserThreadCanContinue() bool {
         ctx.ready and
         hot.ready != 0 and
         ctx.cpu_slot == cpu_slot and
-        !ctx.abi_trap_reply_pending;
+        !delegateTransportBlocked(ctx);
 }
 
 pub fn shouldPreemptCurrentApUserThread() bool {
@@ -1205,7 +1234,7 @@ fn validateThreadForCpuHandoff(cpu_slot: usize, thread_index: usize) bool {
     const ctx = getThreadContextConst(thread_index) orelse return false;
     const hot = getIpcHotThreadConst(thread_index) orelse return false;
     if (!ctx.allocated or hot.allocated == 0) return false;
-    if (ctx.abi_trap_reply_pending) return false;
+    if (delegateTransportBlocked(ctx)) return false;
     if (!ctx.ready or hot.ready == 0) return false;
     if (ctx.cpu_slot != cpu_slot) return false;
     const affinity_bit = cpuAffinityBit(cpu_slot) orelse return false;
@@ -1396,7 +1425,7 @@ fn syncHotThreadFromContext(thread_index: usize) void {
     const ctx = getThreadContextConst(thread_index) orelse return;
     const hot = getIpcHotThread(thread_index) orelse return;
     hot.* = hotThreadFromContext(ctx);
-    setRunnableQueueMembership(thread_index, ctx.allocated and ctx.ready and !ctx.abi_trap_reply_pending);
+    setRunnableQueueMembership(thread_index, ctx.allocated and ctx.ready and !delegateTransportBlocked(ctx));
 }
 
 pub fn setIpcHotReady(thread_index: usize, ready: bool) void {
@@ -1404,7 +1433,7 @@ pub fn setIpcHotReady(thread_index: usize, ready: bool) void {
         if (getIpcHotThread(thread_index)) |hot| {
             hot.ready = boolByte(ready);
             const ctx = getThreadContextConst(thread_index) orelse break :blk false;
-            break :blk ready and hot.allocated != 0 and !ctx.abi_trap_reply_pending;
+            break :blk ready and hot.allocated != 0 and !delegateTransportBlocked(ctx);
         }
         break :blk false;
     };
@@ -1422,7 +1451,7 @@ pub fn setIpcHotWaitState(thread_index: usize, wait_mailbox: bool, wake_tick: u6
         hot.wake_tick = wake_tick;
         hot.ready = boolByte(ready);
         const ctx = getThreadContextConst(thread_index) orelse return;
-        runnable = ready and hot.allocated != 0 and !ctx.abi_trap_reply_pending;
+        runnable = ready and hot.allocated != 0 and !delegateTransportBlocked(ctx);
     }
     setRunnableQueueMembership(thread_index, runnable);
 }
@@ -1567,6 +1596,8 @@ pub fn initThreadContextWithSpaces(
     ctx.wait_mailbox = false;
     ctx.ipc_signal_wait_only = false;
     ctx.signal_pending = false;
+    ctx.delegate_send_pending = false;
+    ctx.delegate_reply_pending = false;
     ctx.wake_tick = 0;
     ctx.frame = initial_frame;
     ctx.fx_state = initial_fx_state;
@@ -1753,7 +1784,9 @@ pub fn enqueueDelegateSendPending(
     const target_ctx = getThreadContextConst(target_thread) orelse return false;
     const sender_ctx = getThreadContextConst(sender_thread) orelse return false;
     if (!target_ctx.allocated or !sender_ctx.allocated) return false;
-    return enqueueMessageInQueue(&delegate_send_queues[target_thread], endpoint_id, sender_thread, true, request_va, 0, 0, 0);
+    if (!enqueueMessageInQueue(&delegate_send_queues[target_thread], endpoint_id, sender_thread, true, request_va, 0, 0, 0)) return false;
+    if (getThreadContext(sender_thread)) |ctx| setDelegateSendPending(ctx, true);
+    return true;
 }
 
 pub fn promoteDelegateSendForThread(target_thread: usize) bool {
@@ -1774,6 +1807,10 @@ pub fn promoteDelegateSendForThread(target_thread: usize) bool {
         delegate_send_queues[target_thread].entries[delegate_send_queues[target_thread].head] = pending;
         delegate_send_queues[target_thread].len += 1;
         return false;
+    }
+    if (getThreadContext(pending.sender_thread)) |sender_ctx| {
+        sender_ctx.delegate_send_pending = false;
+        sender_ctx.delegate_reply_pending = true;
     }
     return true;
 }
@@ -2243,7 +2280,7 @@ fn blockCurrentThreadForEventMode(frame: *TrapFrame, wait_mailbox: bool, timeout
     ctx.ready = false;
     setIpcHotCr3(current_thread, ctx.cr3);
     setIpcHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);
-    if (ctx.abi_trap_reply_pending and ctx.signal_pending) {
+    if (delegateReplyPending(ctx) and ctx.signal_pending) {
         ctx.wait_mailbox = false;
         ctx.ipc_signal_wait_only = false;
         ctx.wake_tick = 0;

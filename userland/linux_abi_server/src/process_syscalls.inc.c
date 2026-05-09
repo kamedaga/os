@@ -410,8 +410,8 @@ static int linux_signal_default_terminates(u64 sig) {
     return 1;
 }
 
-static struct ipc_message terminate_linux_process_by_signal(const struct trap_request *req, struct linux_process_state *target, u64 sig) {
-    if (!target || sig == 0 || sig >= 65) return reply(errno_inval(), 0);
+static struct abi_handler_result terminate_linux_process_by_signal(const struct trap_request *req, struct linux_process_state *target, u64 sig) {
+    if (!target || sig == 0 || sig >= 65) return abi_reply_now(errno_inval(), 0);
     const u64 target_pid = target->pid;
     const u64 current_principal = req->caller_principal;
     const int exits_current = g_proc && g_proc->pid == target_pid;
@@ -446,54 +446,135 @@ static struct ipc_message terminate_linux_process_by_signal(const struct trap_re
         prime_reply_return_signal();
         exit_trap_target_no_wait(current_principal);
         (void)satisfy_pending_waiters_for_child(target_pid);
-        struct ipc_message msg = wait_ipc();
-        return msg;
+        return abi_wait_next();
     }
 
     close_all_process_fds(target);
     target->used = 0;
     prime_reply_return_signal();
     (void)satisfy_pending_waiters_for_child(target_pid);
-    return reply(0, 0);
+    return abi_reply_now(0, 0);
 }
 
-static struct ipc_message handle_thread_signal(u64 tgid, u64 tid, u64 sig, const struct trap_request *req) {
-    if (sig >= 65) return reply(errno_inval(), 0);
+static struct abi_handler_result handle_thread_signal(u64 tgid, u64 tid, u64 sig, const struct trap_request *req) {
+    if (sig >= 65) return abi_reply_now(errno_inval(), 0);
     struct linux_process_state *target = process_state_for_tid(tid);
-    if (!target) return reply(errno_noent(), 0);
-    if (tgid != 0 && target->pid != tgid) return reply(errno_noent(), 0);
-    if (sig == 0) return reply(0, 0);
-    if (target->sig_handler[sig] == 1) return reply(0, 0);
-    if (target->sig_handler[sig] != 0) return reply(0, 0);
-    if (!linux_signal_default_terminates(sig)) return reply(0, 0);
+    if (!target) return abi_reply_now(errno_noent(), 0);
+    if (tgid != 0 && target->pid != tgid) return abi_reply_now(errno_noent(), 0);
+    if (sig == 0) return abi_reply_now(0, 0);
+    if (target->sig_handler[sig] == 1) return abi_reply_now(0, 0);
+    if (target->sig_handler[sig] != 0) return abi_reply_now(0, 0);
+    if (!linux_signal_default_terminates(sig)) return abi_reply_now(0, 0);
     return terminate_linux_process_by_signal(req, target, sig);
 }
 
-static struct ipc_message handle_tkill(const struct trap_request *req) {
+static struct abi_handler_result handle_tkill(const struct trap_request *req) {
     return handle_thread_signal(0, req->args[0], req->args[1], req);
 }
 
-static struct ipc_message handle_tgkill(const struct trap_request *req) {
+static struct abi_handler_result handle_tgkill(const struct trap_request *req) {
     return handle_thread_signal(req->args[0], req->args[1], req->args[2], req);
 }
 
-static struct ipc_message handle_wait4(const struct trap_request *req) {
+static struct abi_handler_result handle_current_exit(const struct trap_request *req, u64 syscall_profile_start_tick, int *syscall_profile_recorded) {
+    const u64 exiting_principal = req->caller_principal;
+    struct linux_process_state *exiting_proc = g_proc;
+    if (exiting_proc && exiting_proc->profile_enabled) {
+        const u64 syscall_profile_end_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+        profile_record_syscall_ticks(req->nr, syscall_profile_end_tick - syscall_profile_start_tick);
+        *syscall_profile_recorded = 1;
+        profile_report_and_reset();
+        exiting_proc->profile_enabled = 0;
+    } else {
+        profile_clear();
+    }
+
+    const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
+    const int exiting_thread = exiting_proc && exiting_proc->tid != exiting_proc->pid;
+    const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
+    const int process_exits = exit_group || !exiting_thread;
+    int satisfy_waiters_after_exit_reply = 0;
+    if (g_root_linux_principal_set && (exiting_principal == g_root_linux_principal || exiting_pid == g_root_linux_principal)) {
+        user_log("LinuxAbiServer: root exit nr=");
+        user_log_dec_value(req->nr);
+        user_log(" principal=");
+        user_log_hex_value(exiting_principal);
+        user_log("LinuxAbiServer: root exit pid=");
+        user_log_hex_value(exiting_pid);
+        user_log("LinuxAbiServer: root exit status=");
+        user_log_hex_value(req->args[0] & 0xffu);
+        user_log("LinuxAbiServer: root exit group=");
+        user_log_dec_value(exit_group);
+        user_log(" process=");
+        user_log_dec_value(process_exits);
+        user_log("\n");
+    }
+
+    if (exiting_proc) exiting_proc->exit_status = (u32)((req->args[0] & 0xffu) << 8);
+    if (exit_group && exiting_proc) {
+        for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+            struct linux_process_state *thread_proc = &g_processes[i];
+            if (!thread_proc->used || thread_proc == exiting_proc || thread_proc->pid != exiting_pid) continue;
+            thread_proc->exit_status = exiting_proc->exit_status;
+            if (thread_proc->clear_child_tid != 0) {
+                const u32 zero = 0;
+                (void)copy_to_trap_target(thread_proc->principal, thread_proc->clear_child_tid, &zero, sizeof(zero));
+            }
+            remove_futex_waiters_for_principal(thread_proc->principal);
+            const u64 reply_status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
+            if (reply_status == SYSCALL_OK) {
+                thread_proc->used = 0;
+            }
+        }
+    }
+
+    if (exiting_proc && exiting_proc->clear_child_tid != 0) {
+        const u32 zero = 0;
+        (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
+        (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
+    }
+    if (process_exits) {
+        if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
+        close_all_process_fds(g_proc);
+        satisfy_waiters_after_exit_reply = 1;
+    }
+
+    remove_futex_waiters_for_principal(exiting_principal);
+    if (exiting_proc) exiting_proc->used = 0;
+    prime_reply_return_signal();
+    exit_trap_target_no_wait(exiting_principal);
+    if (satisfy_waiters_after_exit_reply) (void)satisfy_pending_waiters_for_child(exiting_pid);
+    return abi_exit_current(exiting_principal);
+}
+
+static void finish_current_exit_after_wait(u64 exiting_principal) {
+    int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
+    if (!root_exited && g_root_linux_principal_set) {
+        const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);
+        root_exited = (root_status & 0xff) != 1;
+    }
+    if (root_exited && !has_live_linux_process_state() && !has_open_pipe_state() && !has_known_child_slots()) {
+        process_exit(0);
+    }
+}
+
+static struct abi_handler_result handle_wait4(const struct trap_request *req) {
     const i64 pid = (i64)req->args[0];
     const u64 status_va = req->args[1];
     const u64 options = req->args[2];
     const u64 supported_options = (u64)WNOHANG | (u64)WUNTRACED | (u64)WCONTINUED;
-    if ((options & ~supported_options) != 0) return reply(errno_inval(), 0);
+    if ((options & ~supported_options) != 0) return abi_reply_now(errno_inval(), 0);
     u64 child = 0;
     int fault = 0;
-    if (reap_exited_child_for_current(g_proc, pid, status_va, &child, &fault)) return reply(child, 0);
-    if (fault) return reply(errno_fault(), 0);
-    if ((options & WNOHANG) != 0) return reply(0, 0);
+    if (reap_exited_child_for_current(g_proc, pid, status_va, &child, &fault)) return abi_reply_now(child, 0);
+    if (fault) return abi_reply_now(errno_fault(), 0);
+    if ((options & WNOHANG) != 0) return abi_reply_now(0, 0);
     int has_matching_child = 0;
     for (u64 i = 0; i < LINUX_CHILD_MAX; i++) {
         if (g_proc->child_used[i] && wait_pid_matches_child(pid, g_proc->child_slot[i])) has_matching_child = 1;
     }
-    if (!has_matching_child) return reply(errno_child(), 0);
-    if (g_proc->wait_pending) return reply(errno_again(), 0);
+    if (!has_matching_child) return abi_reply_now(errno_child(), 0);
+    if (g_proc->wait_pending) return abi_reply_now(errno_again(), 0);
     g_proc->wait_pending = 1;
     g_proc->wait_pid = pid;
     g_proc->wait_status_va = status_va;
@@ -502,7 +583,7 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
         g_proc->wait_pending = 0;
         g_proc->wait_pid = 0;
         g_proc->wait_status_va = 0;
-        return reply(errno_again(), 0);
+        return abi_reply_now(errno_again(), 0);
     }
-    return wait_ipc();
+    return abi_pending();
 }

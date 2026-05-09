@@ -126,9 +126,83 @@ static void exit_trap_target_no_wait(u64 principal) {
     }
 }
 
-static struct ipc_message exit_trap_target_and_wait(u64 principal) {
-    exit_trap_target_no_wait(principal);
-    return wait_ipc();
+static struct abi_handler_result abi_reply_now(u64 result, u64 flags) {
+    struct abi_handler_result out;
+    out.kind = ABI_HANDLER_REPLY_NOW;
+    out.result = result;
+    out.flags = flags;
+    out.principal = 0;
+    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
+    return out;
+}
+
+static struct abi_handler_result abi_pending(void) {
+    struct abi_handler_result out;
+    out.kind = ABI_HANDLER_PENDING;
+    out.result = 0;
+    out.flags = 0;
+    out.principal = 0;
+    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
+    return out;
+}
+
+static struct abi_handler_result abi_exit_target(u64 principal) {
+    struct abi_handler_result out;
+    out.kind = ABI_HANDLER_EXIT_TARGET;
+    out.result = 0;
+    out.flags = 0;
+    out.principal = principal;
+    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
+    return out;
+}
+
+static struct abi_handler_result abi_wait_next(void) {
+    struct abi_handler_result out;
+    out.kind = ABI_HANDLER_WAIT_NEXT;
+    out.result = 0;
+    out.flags = 0;
+    out.principal = 0;
+    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
+    return out;
+}
+
+static struct abi_handler_result abi_exit_current(u64 principal) {
+    struct abi_handler_result out;
+    out.kind = ABI_HANDLER_EXIT_CURRENT;
+    out.result = 0;
+    out.flags = 0;
+    out.principal = principal;
+    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
+    return out;
+}
+
+static struct abi_handler_result abi_result_from_legacy_message(struct ipc_message msg) {
+    struct abi_handler_result out;
+    out.kind = ABI_HANDLER_LEGACY_NEXT_MESSAGE;
+    out.result = 0;
+    out.flags = 0;
+    out.principal = 0;
+    out.next_message = msg;
+    return out;
+}
+
+static struct ipc_message abi_apply_handler_result(struct abi_handler_result result) {
+    switch (result.kind) {
+    case ABI_HANDLER_REPLY_NOW:
+        return reply(result.result, result.flags);
+    case ABI_HANDLER_PENDING:
+        return wait_ipc();
+    case ABI_HANDLER_EXIT_TARGET:
+        exit_trap_target_no_wait(result.principal);
+        return wait_ipc();
+    case ABI_HANDLER_WAIT_NEXT:
+        return wait_ipc();
+    case ABI_HANDLER_EXIT_CURRENT:
+        return wait_ipc();
+    case ABI_HANDLER_LEGACY_NEXT_MESSAGE:
+    default:
+        return result.next_message;
+    }
 }
 
 static u64 trap_request_page_for_principal(u64 principal) {

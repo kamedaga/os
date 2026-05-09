@@ -420,6 +420,21 @@ enum {
 };
 
 struct ipc_message { u64 status; u64 request_va; u64 reserved0; u64 reserved1; u64 reserved2; };
+enum abi_handler_result_kind {
+    ABI_HANDLER_REPLY_NOW = 1,
+    ABI_HANDLER_PENDING = 2,
+    ABI_HANDLER_EXIT_TARGET = 3,
+    ABI_HANDLER_LEGACY_NEXT_MESSAGE = 4,
+    ABI_HANDLER_WAIT_NEXT = 5,
+    ABI_HANDLER_EXIT_CURRENT = 6,
+};
+struct abi_handler_result {
+    enum abi_handler_result_kind kind;
+    u64 result;
+    u64 flags;
+    u64 principal;
+    struct ipc_message next_message;
+};
 struct trap_request {
     u64 magic; unsigned version; unsigned kind; unsigned flavor; unsigned reserved0;
     u64 caller_principal; u64 thread_id; u64 rip; u64 rsp; u64 fault_addr; u64 error_code; u64 nr; u64 args[6];

@@ -934,7 +934,7 @@ fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u6
     const target_proc = target_ctx.owner_process;
     const target_has_abi_delegate = h.state.abiTrapDelegateFor(target_proc) != null;
     if ((mr1 & trap_abi.response_flag_exit) != 0 and
-        (target_ctx.abi_trap_reply_pending or target_has_abi_delegate))
+        (scheduler.delegateReplyPending(target_ctx) or target_has_abi_delegate))
     {
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
         _ = scheduler.releaseThreadSlot(target_thread);
@@ -943,7 +943,7 @@ fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u6
         return syscall_ok;
     }
     if (target_has_abi_delegate) {
-        target_ctx.abi_trap_reply_pending = true;
+        scheduler.setDelegateReplyPending(target_ctx, true);
     }
     scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
     return deliverOrQueueIpcMessageToThread(target_thread, 0, current_thread, false, mr0, mr1, mr2, mr3);
@@ -1003,7 +1003,7 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
         }
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
         if ((save.mr1 & trap_abi.response_flag_exit) != 0 and
-            (target_ctx.abi_trap_reply_pending or h.state.abiTrapDelegateFor(target.principal) != null))
+            (scheduler.delegateReplyPending(target_ctx) or h.state.abiTrapDelegateFor(target.principal) != null))
         {
             _ = scheduler.releaseThreadSlot(target.thread_index);
             _ = h.state.markProcessExited(target.principal);

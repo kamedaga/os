@@ -233,7 +233,7 @@ fn resolveTarget(h: *const Hooks, server_proc: kernel.PrincipalId, target_raw: u
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
     if (!target_ctx.allocated) return null;
     const accepted = switch (use) {
-        .deferred_reply => target_ctx.abi_trap_reply_pending and delegateTargetsServer(h, server_proc, target_proc),
+        .deferred_reply => scheduler.delegateReplyPending(target_ctx) and delegateTargetsServer(h, server_proc, target_proc),
         .delegated => delegateTargetsServer(h, server_proc, target_proc),
         .exit_response => delegateTargetsServer(h, server_proc, target_proc) or endpointTableTargetsServer(h, server_proc, target_proc),
     };
@@ -279,7 +279,7 @@ pub fn startTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_
     const h = &h_storage;
     if (targetPrincipalFromRaw(target_raw) == null) return boot_static.syscall_err_invalid;
     const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
-    if (target.ctx.ready or target.ctx.abi_trap_reply_pending) return boot_static.syscall_err_invalid;
+    if (target.ctx.ready or scheduler.delegateTransportBlocked(target.ctx)) return boot_static.syscall_err_invalid;
     if (!scheduler.setThreadReady(target.thread, true)) return boot_static.syscall_err_not_ready;
     scheduler.wakeAssignedApForRunnableThread(target.thread);
     return boot_static.syscall_ok;
@@ -592,7 +592,7 @@ fn initChildThreadFromTarget(child: kernel.PrincipalId, target: ReplyTarget, chi
     if (child_rsp != 0) child_ctx.frame.rsp = child_rsp;
     child_ctx.fs_base = if (child_fs_base != 0) child_fs_base else target.ctx.fs_base;
     child_ctx.fx_state = target.ctx.fx_state;
-    child_ctx.abi_trap_reply_pending = false;
+    scheduler.clearDelegateTransportPending(child_ctx);
     return child_thread;
 }
 
@@ -676,9 +676,9 @@ fn deliverDelegateRequestLocked(
     current_ctx: *scheduler.ThreadContext,
 ) u64 {
     const stale_replies = scheduler.discardIpcReplyMessagesForThreadFromSender(current_thread, target_thread);
-    if (stale_replies != 0) current_ctx.abi_trap_reply_pending = false;
+    if (stale_replies != 0) scheduler.setDelegateReplyPending(current_ctx, false);
     const stale_requests = scheduler.discardIpcMessagesForThreadFromSenderOnEndpoint(target_thread, current_thread, delegate.endpoint_id, true);
-    if (stale_requests != 0) current_ctx.abi_trap_reply_pending = false;
+    if (stale_requests != 0) scheduler.clearDelegateTransportPending(current_ctx);
     if (!writeRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame)) {
         h.write("abi_trap request write failed target=");
         h.write(h.principal_label(target_principal));
@@ -686,7 +686,6 @@ fn deliverDelegateRequestLocked(
         return boot_static.syscall_err_invalid;
     }
 
-    current_ctx.abi_trap_reply_pending = true;
     if (scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true) >= delegate_transport_queue_limit) {
         if (scheduler.enqueueDelegateSendPending(target_thread, delegate.endpoint_id, current_thread, delegate.request_page_va)) {
             if (dispatch_delegate_backpressure_log_count < dispatch_delegate_backpressure_log_limit) {
@@ -709,7 +708,7 @@ fn deliverDelegateRequestLocked(
             scheduler.preferIpcSwitchToThread(target_thread);
             return boot_static.syscall_ok;
         }
-        current_ctx.abi_trap_reply_pending = false;
+        scheduler.clearDelegateTransportPending(current_ctx);
         return boot_static.syscall_err_not_ready;
     }
 
@@ -723,7 +722,10 @@ fn deliverDelegateRequestLocked(
         0,
         0,
     );
-    if (status == boot_static.syscall_ok) return boot_static.syscall_ok;
+    if (status == boot_static.syscall_ok) {
+        scheduler.setDelegateReplyPending(current_ctx, true);
+        return boot_static.syscall_ok;
+    }
 
     if (status == boot_static.syscall_err_not_ready) {
         if (scheduler.enqueueDelegateSendPending(target_thread, delegate.endpoint_id, current_thread, delegate.request_page_va)) {
@@ -764,7 +766,7 @@ fn deliverDelegateRequestLocked(
             dispatch_delegate_backpressure_log_count += 1;
         }
     }
-    current_ctx.abi_trap_reply_pending = false;
+    scheduler.clearDelegateTransportPending(current_ctx);
     if (status != boot_static.syscall_err_not_ready) logDelegateDeliveryFailure(h, proc, target_principal, target_thread, status);
     return status;
 }
@@ -867,21 +869,21 @@ fn dispatchKnownDelegateWithHooks(h: *const Hooks, proc: kernel.PrincipalId, del
     const status = deliverDelegateRequestLocked(h, proc, target_principal, target_thread, delegate, frame, current_thread, current_ctx);
     dispatch_delegate_lock.unlock();
     if (status != boot_static.syscall_ok) {
-        current_ctx.abi_trap_reply_pending = false;
+        scheduler.clearDelegateTransportPending(current_ctx);
         return status;
     }
 
     if (consumeQueuedReplyForPrincipalFromSender(h, proc, target_thread, frame)) {
-        current_ctx.abi_trap_reply_pending = false;
+        scheduler.clearDelegateTransportPending(current_ctx);
         return frame.rax;
     }
 
     if (!h.block_current_thread_for_event(frame, false, 0, boot_static.syscall_err_not_ready)) {
         if (consumeQueuedReplyForPrincipalFromSender(h, proc, target_thread, frame)) {
-            current_ctx.abi_trap_reply_pending = false;
+            scheduler.clearDelegateTransportPending(current_ctx);
             return frame.rax;
         }
-        current_ctx.abi_trap_reply_pending = false;
+        scheduler.clearDelegateTransportPending(current_ctx);
         return boot_static.syscall_err_not_ready;
     }
     return boot_static.syscall_ok;

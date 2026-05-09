@@ -827,10 +827,10 @@ static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, 
     return send_result == 1;
 }
 
-static struct ipc_message handle_execve(const struct trap_request *req) {
+static struct abi_handler_result handle_execve(const struct trap_request *req) {
     char path[256];
-    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
-    if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
+    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return abi_reply_now(errno_fault(), 0);
+    if (cstr_len(path) > FS_MAX_PATH_BYTES) return abi_reply_now(errno_nametoolong(), 0);
     g_execve_profile_enabled = target_env_has_exec_profile(req->args[2]);
     g_execve_profile_verbose = target_env_has_exec_profile_verbose(req->args[2]);
     const char *load_path = path;
@@ -852,12 +852,12 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     g_exec_path[g_exec_path_len] = 0;
     u64 exec_probe_token = 0;
     u64 exec_probe_bytes = 0;
-    if (!vfs_lookup_file_token(path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
-    if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
+    if (!vfs_lookup_file_token(path, &exec_probe_token, &exec_probe_bytes)) return abi_reply_now(errno_noent(), 0);
+    if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return abi_reply_now(errno_noent(), 0);
     execve_profile_step("probe lookup done");
     const u64 old_principal = req->caller_principal;
     u64 spawned_principal = 0;
-    if (!spawn_exec_loader_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) return reply(errno_io(), 0);
+    if (!spawn_exec_loader_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) return abi_reply_now(errno_io(), 0);
     execve_profile_step("spawn loader done");
     execve_profile_flush();
     if (g_proc) {
@@ -867,5 +867,5 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
         if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
     }
     reset_exec_runtime_state();
-    return exit_trap_target_and_wait(old_principal);
+    return abi_exit_target(old_principal);
 }
