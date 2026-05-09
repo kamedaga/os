@@ -16,6 +16,18 @@ static void fill_linux_stat_path(struct linux_stat *st, const struct fs_stat_rec
     st->st_dev = 1;
     st->st_ino = linux_ino_from_path(path);
 }
+static void fill_linux_statfs(struct linux_statfs *st) {
+    u8 *p = (u8 *)st; for (u64 i = 0; i < sizeof(*st); i++) p[i] = 0;
+    st->f_type = 0x4d44;
+    st->f_bsize = 4096;
+    st->f_blocks = 1024 * 1024;
+    st->f_bfree = 512 * 1024;
+    st->f_bavail = 512 * 1024;
+    st->f_files = 65536;
+    st->f_ffree = 32768;
+    st->f_namelen = 255;
+    st->f_frsize = 4096;
+}
 
 static void fd_set_path(struct fd_entry *fd, const char *path) {
     u64 len = cstr_len(path);
@@ -23,6 +35,41 @@ static void fd_set_path(struct fd_entry *fd, const char *path) {
     fd->path_len = (u16)len;
     for (u64 i = 0; i < len; i++) fd->path[i] = path[i];
     fd->path[len] = 0;
+}
+
+static int path_contains_literal(const char *path, const char *needle) {
+    const u64 path_len = cstr_len(path);
+    const u64 needle_len = cstr_len(needle);
+    if (needle_len == 0 || needle_len > path_len) return 0;
+    for (u64 i = 0; i + needle_len <= path_len; i++) {
+        u64 j = 0;
+        while (j < needle_len && path[i + j] == needle[j]) j++;
+        if (j == needle_len) return 1;
+    }
+    return 0;
+}
+
+static int path_should_trace_io(const char *path) {
+    return path_contains_literal(path, "/apk") || path_contains_literal(path, "/tmp/");
+}
+
+static void log_io_path(const char *prefix, const char *path) {
+    user_log(prefix);
+    user_log(path);
+    user_log("\n");
+}
+
+static void log_fd_write_failure(u64 fd) {
+    user_log("LinuxAbiServer: file write failed path=");
+    if (fd_valid(fd) && g_fds[fd].path_len != 0) user_log_len(g_fds[fd].path, g_fds[fd].path_len);
+    else user_log("(unknown)");
+    user_log("\n");
+    user_log("LinuxAbiServer: vfs write status=");
+    user_log_hex_value(g_last_vfs_write_status);
+    user_log("LinuxAbiServer: vfs write offset=");
+    user_log_hex_value(g_last_vfs_write_offset);
+    user_log("LinuxAbiServer: vfs write length=");
+    user_log_hex_value(g_last_vfs_write_length);
 }
 
 static int append_path_component(char *out, u16 *len, const char *component, u16 component_len) {
@@ -144,10 +191,15 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     const u64 flags = old_open ? req->args[1] : req->args[2];
     const u64 access_mode = flags & O_ACCMODE;
     if (access_mode != O_RDONLY && access_mode != O_WRONLY && access_mode != O_RDWR) return reply(errno_acces(), 0);
-    if ((flags & (O_CREAT | O_TRUNC)) != 0 && access_mode == O_RDONLY) return reply(errno_acces(), 0);
+    if ((flags & O_TRUNC) != 0 && access_mode == O_RDONLY) return reply(errno_acces(), 0);
     if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
     if (path[0] == 0) return reply(errno_noent(), 0);
     if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    if (((flags & (O_CREAT | O_TRUNC)) != 0 || access_mode != O_RDONLY) && path_should_trace_io(resolved)) {
+        log_io_path("LinuxAbiServer: open write path=", resolved);
+        user_log("LinuxAbiServer: open flags=");
+        user_log_hex_value(flags);
+    }
     if (path_is_dev_tty(resolved)) {
         const int fd = alloc_fd(); if (fd < 0) return reply(errno_busy(), 0);
         g_fds[fd].kind = g_console.active ? FD_TTY : FD_STDIO;
@@ -176,9 +228,19 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     struct fs_stat_record rec; u64 token = 0; u64 size = 0; u8 kind = FS_OBJECT_NONE;
     if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) {
         if ((flags & O_CREAT) == 0) return reply(errno_noent(), 0);
-        if (!vfs_create_path(resolved, 0)) return reply(errno_io(), 0);
+        if (!vfs_create_path(resolved, 0)) {
+            if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: create request failed path=", resolved);
+            return reply(errno_io(), 0);
+        }
         volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-        if (created->status != FS_STATUS_OK || created->result_token == 0) return reply(errno_acces(), 0);
+        if (created->status != FS_STATUS_OK || created->result_token == 0) {
+            if (path_should_trace_io(resolved)) {
+                log_io_path("LinuxAbiServer: create failed path=", resolved);
+                user_log("LinuxAbiServer: create status=");
+                user_log_hex_value((u64)(u32)created->status);
+            }
+            return reply(errno_acces(), 0);
+        }
         invalidate_exec_cache_for_path(resolved);
         token = created->result_token;
         size = created->file_bytes;
@@ -188,9 +250,19 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         rec.mode_bits = FS_FILE_MODE;
         rec.mtime_unix_sec = 0;
     } else if ((flags & O_TRUNC) != 0 && access_mode != O_RDONLY && !path_is_dev_file(resolved)) {
-        if (!vfs_create_path(resolved, 1)) return reply(errno_io(), 0);
+        if (!vfs_create_path(resolved, 1)) {
+            if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: truncate request failed path=", resolved);
+            return reply(errno_io(), 0);
+        }
         volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-        if (created->status != FS_STATUS_OK || created->result_token == 0) return reply(errno_acces(), 0);
+        if (created->status != FS_STATUS_OK || created->result_token == 0) {
+            if (path_should_trace_io(resolved)) {
+                log_io_path("LinuxAbiServer: truncate failed path=", resolved);
+                user_log("LinuxAbiServer: truncate status=");
+                user_log_hex_value((u64)(u32)created->status);
+            }
+            return reply(errno_acces(), 0);
+        }
         invalidate_exec_cache_for_path(resolved);
         token = created->result_token;
         size = 0;
@@ -220,9 +292,19 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         }
         g_prof.open_cache_misses++;
     }
-    if (!vfs_request(FS_OP_OPEN, token, 0, 0, 0)) return reply(errno_io(), 0);
+    if (!vfs_request(FS_OP_OPEN, token, 0, 0, 0)) {
+        if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: open request failed path=", resolved);
+        return reply(errno_io(), 0);
+    }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-    if (response->status != FS_STATUS_OK || response->result_token == 0) return reply(errno_acces(), 0);
+    if (response->status != FS_STATUS_OK || response->result_token == 0) {
+        if (path_should_trace_io(resolved)) {
+            log_io_path("LinuxAbiServer: open failed path=", resolved);
+            user_log("LinuxAbiServer: open status=");
+            user_log_hex_value((u64)(u32)response->status);
+        }
+        return reply(errno_acces(), 0);
+    }
     g_fds[fd].kind = FD_FILE; g_fds[fd].token = response->result_token; g_fds[fd].offset = 0; g_fds[fd].size = response->file_bytes != 0 ? response->file_bytes : size; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = FS_OBJECT_FILE;
     fd_set_path(&g_fds[fd], resolved);
     sync_fd_to_thread_group((u64)fd);
@@ -439,6 +521,7 @@ static struct ipc_message handle_write(const struct trap_request *req) {
             sync_fd_to_thread_group(fd);
             return reply(n, 0);
         }
+        log_fd_write_failure(fd);
         return reply(errno_io(), 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_STDIO) {
@@ -490,7 +573,10 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             int fault = 0;
             const u64 n = vfs_write_from_target(g_fds[fd].token, g_fds[fd].offset, pair[0], pair[1], &fault);
             if (fault) return reply(errno_fault(), 0);
-            if (n == 0 && pair[1] != 0) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
+            if (n == 0 && pair[1] != 0) {
+                if (total == 0) log_fd_write_failure(fd);
+                return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
+            }
             if (n != 0) {
                 g_prof.fs_write_bytes += n;
                 invalidate_exec_cache_for_path(g_fds[fd].path);
@@ -541,6 +627,33 @@ static struct ipc_message handle_fstat(const struct trap_request *req) {
     else { fill_linux_stat(&st, &rec, rec.size_bytes, rec.object_kind); st.st_dev = 1; st.st_ino = 0x100000ULL + fd; }
     if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0);
     return reply(0, 0);
+}
+
+static struct ipc_message handle_fstatfs(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const u64 statfs_va = req->args[1];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    struct linux_statfs st;
+    fill_linux_statfs(&st);
+    return copy_to_target(statfs_va, &st, sizeof(st)) == sizeof(st) ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+static struct ipc_message handle_statfs(const struct trap_request *req) {
+    const u64 path_ptr = req->args[0];
+    const u64 statfs_va = req->args[1];
+    char path[256];
+    char resolved[FS_MAX_PATH_BYTES + 1];
+    if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
+    if (path[0] == 0) return reply(errno_noent(), 0);
+    if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0);
+    struct fs_stat_record rec;
+    u64 token = 0, size = 0;
+    u8 kind = 0;
+    if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_noent(), 0);
+    (void)token; (void)rec; (void)size; (void)kind;
+    struct linux_statfs st;
+    fill_linux_statfs(&st);
+    return copy_to_target(statfs_va, &st, sizeof(st)) == sizeof(st) ? reply(0, 0) : reply(errno_fault(), 0);
 }
 
 static struct ipc_message handle_newfstatat(const struct trap_request *req, int old_stat) {
@@ -700,5 +813,38 @@ static struct ipc_message handle_rt_sigprocmask(const struct trap_request *req) 
         const u64 empty = 0;
         if (copy_to_target(oldset_va, &empty, sizeof(empty)) != sizeof(empty)) return reply(errno_fault(), 0);
     }
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_sigaltstack(const struct trap_request *req) {
+    const u64 ss_va = req->args[0];
+    const u64 old_ss_va = req->args[1];
+
+    if (old_ss_va != 0) {
+        struct linux_stack_t old_ss;
+        old_ss.ss_sp = g_proc->sigaltstack_sp;
+        old_ss.ss_flags = g_proc->sigaltstack_flags != 0 ? g_proc->sigaltstack_flags : SS_DISABLE;
+        old_ss.reserved0 = 0;
+        old_ss.ss_size = g_proc->sigaltstack_size;
+        if (copy_to_target(old_ss_va, &old_ss, sizeof(old_ss)) != sizeof(old_ss)) return reply(errno_fault(), 0);
+    }
+
+    if (ss_va != 0) {
+        struct linux_stack_t ss;
+        if (copy_from_target(ss_va, &ss, sizeof(ss)) != sizeof(ss)) return reply(errno_fault(), 0);
+        const u32 supported_flags = (u32)(SS_DISABLE | SS_AUTODISARM);
+        if ((ss.ss_flags & ~supported_flags) != 0) return reply(errno_inval(), 0);
+        if ((ss.ss_flags & SS_DISABLE) != 0) {
+            g_proc->sigaltstack_sp = 0;
+            g_proc->sigaltstack_size = 0;
+            g_proc->sigaltstack_flags = SS_DISABLE;
+        } else {
+            if (ss.ss_sp == 0 || ss.ss_size < MINSIGSTKSZ) return reply(errno_inval(), 0);
+            g_proc->sigaltstack_sp = ss.ss_sp;
+            g_proc->sigaltstack_size = ss.ss_size;
+            g_proc->sigaltstack_flags = ss.ss_flags & SS_AUTODISARM;
+        }
+    }
+
     return reply(0, 0);
 }

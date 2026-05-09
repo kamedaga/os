@@ -127,11 +127,15 @@ enum {
     NET_RESPONSE_HEADER_BYTES = 56,
     NET_PAYLOAD_BYTES = 4096 - NET_REQUEST_HEADER_BYTES,
     NET_UDP_MAX_PAYLOAD = 1200,
-    NET_UDP_BINDINGS = 4,
-    NET_UDP_PENDING = 4,
+    NET_UDP_BINDINGS = 8,
+    NET_UDP_PENDING = 8,
     NET_TCP_CONNECTIONS = 4,
     NET_TCP_MAX_PAYLOAD = 1200,
-    NET_TCP_RX_BYTES = 32768,
+    NET_TCP_MSS = 1200,
+    NET_TCP_OOO_SEGMENTS = 8,
+    NET_TCP_OOO_BYTES = 1600,
+    NET_TCP_RX_BYTES = 64 * 1024,
+    NET_TCP_WINDOW_MAX = 8 * 1024,
     NET_SESSION_MAX = 4,
     NET_UDP_HANDLE_TAG = 0x5544500000000000ULL,
     NET_TCP_HANDLE_TAG = 0x5443500000000000ULL,
@@ -232,6 +236,39 @@ struct net_status_payload {
     u32 flags;
     u64 rx_packets;
     u64 tx_completions;
+    u64 tcp_rx_segments;
+    u64 tcp_rx_payload_bytes;
+    u64 tcp_rx_in_order_bytes;
+    u64 tcp_rx_duplicate_segments;
+    u64 tcp_rx_out_of_order_segments;
+    u64 tcp_rx_ooo_stored;
+    u64 tcp_rx_ooo_drained;
+    u64 tcp_rx_ooo_dropped;
+    u64 tcp_rx_append_failed;
+    u64 tcp_ack_sent;
+    u64 tcp_ack_deferred;
+    u64 tcp_ack_flushed;
+    u64 tcp_tx_busy;
+    u64 tcp_connect_requests;
+    u64 tcp_connect_established;
+    u64 tcp_tx_segments;
+    u64 tcp_tx_payload_bytes;
+    u64 tcp_read_requests;
+    u64 tcp_read_would_block;
+    u64 tcp_read_bytes;
+    u64 tcp_poll_requests;
+    u64 tcp_poll_readable;
+    u64 tcp_rx_syn_ack;
+    u64 tcp_rx_fin;
+    u64 tcp_rx_rst;
+    u64 tcp_active_connections;
+    u64 tcp_established_connections;
+    u64 tcp_rx_buffered_bytes;
+    u64 tcp_rx_buffer_max_bytes;
+    u64 tcp_ack_pending_connections;
+    u64 net_service_requests;
+    u64 net_service_work_loops;
+    u64 net_service_idle_sleeps;
 };
 
 struct net_session {
@@ -264,11 +301,19 @@ struct udp_binding {
     struct udp_packet packets[NET_UDP_PENDING];
 };
 
+struct tcp_ooo_segment {
+    u8 used;
+    u8 reserved0[3];
+    u32 seq;
+    u32 len;
+    u8 bytes[NET_TCP_OOO_BYTES];
+};
+
 struct tcp_connection {
     u8 active;
     u8 state;
     u8 peer_closed;
-    u8 reserved0;
+    u8 ack_pending;
     u64 handle;
     u32 local_ip;
     u32 remote_ip;
@@ -279,6 +324,7 @@ struct tcp_connection {
     u32 initial_seq;
     u32 rx_head;
     u32 rx_len;
+    struct tcp_ooo_segment ooo[NET_TCP_OOO_SEGMENTS];
     u8 rx[NET_TCP_RX_BYTES];
 };
 
@@ -316,6 +362,35 @@ static int g_tx_complete_logged;
 static int g_tx_in_flight;
 static u64 g_tx_completions;
 static u16 g_next_ephemeral_port = NET_EPHEMERAL_PORT_BASE;
+static u64 g_tcp_rx_segments;
+static u64 g_tcp_rx_payload_bytes;
+static u64 g_tcp_rx_in_order_bytes;
+static u64 g_tcp_rx_duplicate_segments;
+static u64 g_tcp_rx_out_of_order_segments;
+static u64 g_tcp_rx_ooo_stored;
+static u64 g_tcp_rx_ooo_drained;
+static u64 g_tcp_rx_ooo_dropped;
+static u64 g_tcp_rx_append_failed;
+static u64 g_tcp_ack_sent;
+static u64 g_tcp_ack_deferred;
+static u64 g_tcp_ack_flushed;
+static u64 g_tcp_tx_busy;
+static u64 g_tcp_connect_requests;
+static u64 g_tcp_connect_established;
+static u64 g_tcp_tx_segments;
+static u64 g_tcp_tx_payload_bytes;
+static u64 g_tcp_read_requests;
+static u64 g_tcp_read_would_block;
+static u64 g_tcp_read_bytes;
+static u64 g_tcp_poll_requests;
+static u64 g_tcp_poll_readable;
+static u64 g_tcp_rx_syn_ack;
+static u64 g_tcp_rx_fin;
+static u64 g_tcp_rx_rst;
+static u64 g_net_service_requests;
+static u64 g_net_service_work_loops;
+static u64 g_net_service_idle_sleeps;
+static u64 g_tcp_next_progress_log_bytes = 64 * 1024;
 
 void *memset(void *dst, int value, u64 n) {
     u8 *d = (u8 *)dst;
@@ -545,6 +620,72 @@ static void append_ipv4(char *buf, u64 cap, u64 *len, u32 addr) {
     append_u64_dec(buf, cap, len, addr & 0xFF);
 }
 
+static void tcp_connection_totals(u64 *active, u64 *established, u64 *buffered, u64 *max_buffered, u64 *ack_pending) {
+    *active = 0;
+    *established = 0;
+    *buffered = 0;
+    *max_buffered = 0;
+    *ack_pending = 0;
+    for (u64 i = 0; i < NET_TCP_CONNECTIONS; i++) {
+        const struct tcp_connection *conn = &g_tcp_connections[i];
+        if (!conn->active) continue;
+        *active = *active + 1;
+        if (conn->state == TCP_STATE_ESTABLISHED) *established = *established + 1;
+        *buffered = *buffered + conn->rx_len;
+        if (conn->rx_len > *max_buffered) *max_buffered = conn->rx_len;
+        if (conn->ack_pending) *ack_pending = *ack_pending + 1;
+    }
+}
+
+static void tcp_log_progress_if_needed(void) {
+    if (g_tcp_rx_in_order_bytes < g_tcp_next_progress_log_bytes) return;
+    while (g_tcp_rx_in_order_bytes >= g_tcp_next_progress_log_bytes) {
+        g_tcp_next_progress_log_bytes += 64 * 1024;
+    }
+    u64 active = 0;
+    u64 established = 0;
+    u64 buffered = 0;
+    u64 max_buffered = 0;
+    u64 ack_pending = 0;
+    tcp_connection_totals(&active, &established, &buffered, &max_buffered, &ack_pending);
+    char line[192];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: tcp progress rx_in=");
+    append_u64_dec(line, sizeof(line), &len, g_tcp_rx_in_order_bytes);
+    append_str(line, sizeof(line), &len, " read=");
+    append_u64_dec(line, sizeof(line), &len, g_tcp_read_bytes);
+    append_str(line, sizeof(line), &len, " tx=");
+    append_u64_dec(line, sizeof(line), &len, g_tcp_tx_payload_bytes);
+    append_str(line, sizeof(line), &len, " queued=");
+    append_u64_dec(line, sizeof(line), &len, buffered);
+    append_str(line, sizeof(line), &len, " active=");
+    append_u64_dec(line, sizeof(line), &len, active);
+    append_str(line, sizeof(line), &len, " est=");
+    append_u64_dec(line, sizeof(line), &len, established);
+    append_str(line, sizeof(line), &len, " ackp=");
+    append_u64_dec(line, sizeof(line), &len, ack_pending);
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
+static void tcp_log_rx_full(const struct tcp_connection *conn, u32 append_len) {
+    if (g_tcp_rx_append_failed > 8) return;
+    char line[192];
+    u64 len = 0;
+    line[0] = 0;
+    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: tcp rx full queued=");
+    append_u64_dec(line, sizeof(line), &len, conn->rx_len);
+    append_str(line, sizeof(line), &len, " append=");
+    append_u64_dec(line, sizeof(line), &len, append_len);
+    append_str(line, sizeof(line), &len, " ackp=");
+    append_u64_dec(line, sizeof(line), &len, conn->ack_pending ? 1 : 0);
+    append_str(line, sizeof(line), &len, " failures=");
+    append_u64_dec(line, sizeof(line), &len, g_tcp_rx_append_failed);
+    append_char(line, sizeof(line), &len, '\n');
+    user_log_len(line, len);
+}
+
 static u16 ipv4_checksum(const u8 *header, u32 header_len) {
     u32 sum = 0;
     for (u32 i = 0; i + 1 < header_len; i += 2) {
@@ -724,6 +865,45 @@ static void write_net_status_payload(void) {
         (g_arp_reply_seen ? NET_FLAG_GATEWAY_ARP : 0);
     payload->rx_packets = g_rx_packets;
     payload->tx_completions = g_tx_completions;
+    payload->tcp_rx_segments = g_tcp_rx_segments;
+    payload->tcp_rx_payload_bytes = g_tcp_rx_payload_bytes;
+    payload->tcp_rx_in_order_bytes = g_tcp_rx_in_order_bytes;
+    payload->tcp_rx_duplicate_segments = g_tcp_rx_duplicate_segments;
+    payload->tcp_rx_out_of_order_segments = g_tcp_rx_out_of_order_segments;
+    payload->tcp_rx_ooo_stored = g_tcp_rx_ooo_stored;
+    payload->tcp_rx_ooo_drained = g_tcp_rx_ooo_drained;
+    payload->tcp_rx_ooo_dropped = g_tcp_rx_ooo_dropped;
+    payload->tcp_rx_append_failed = g_tcp_rx_append_failed;
+    payload->tcp_ack_sent = g_tcp_ack_sent;
+    payload->tcp_ack_deferred = g_tcp_ack_deferred;
+    payload->tcp_ack_flushed = g_tcp_ack_flushed;
+    payload->tcp_tx_busy = g_tcp_tx_busy;
+    payload->tcp_connect_requests = g_tcp_connect_requests;
+    payload->tcp_connect_established = g_tcp_connect_established;
+    payload->tcp_tx_segments = g_tcp_tx_segments;
+    payload->tcp_tx_payload_bytes = g_tcp_tx_payload_bytes;
+    payload->tcp_read_requests = g_tcp_read_requests;
+    payload->tcp_read_would_block = g_tcp_read_would_block;
+    payload->tcp_read_bytes = g_tcp_read_bytes;
+    payload->tcp_poll_requests = g_tcp_poll_requests;
+    payload->tcp_poll_readable = g_tcp_poll_readable;
+    payload->tcp_rx_syn_ack = g_tcp_rx_syn_ack;
+    payload->tcp_rx_fin = g_tcp_rx_fin;
+    payload->tcp_rx_rst = g_tcp_rx_rst;
+    u64 active = 0;
+    u64 established = 0;
+    u64 buffered = 0;
+    u64 max_buffered = 0;
+    u64 ack_pending = 0;
+    tcp_connection_totals(&active, &established, &buffered, &max_buffered, &ack_pending);
+    payload->tcp_active_connections = active;
+    payload->tcp_established_connections = established;
+    payload->tcp_rx_buffered_bytes = buffered;
+    payload->tcp_rx_buffer_max_bytes = max_buffered;
+    payload->tcp_ack_pending_connections = ack_pending;
+    payload->net_service_requests = g_net_service_requests;
+    payload->net_service_work_loops = g_net_service_work_loops;
+    payload->net_service_idle_sleeps = g_net_service_idle_sleeps;
 }
 
 static const u8 *net_request_payload(void) {
@@ -1073,9 +1253,95 @@ static int tcp_rx_append(struct tcp_connection *conn, const u8 *payload, u32 len
     return 1;
 }
 
+static int tcp_seq_lt(u32 a, u32 b) {
+    return (int)(a - b) < 0;
+}
+
+static int tcp_seq_leq(u32 a, u32 b) {
+    return (int)(a - b) <= 0;
+}
+
+static int tcp_rx_append_counted(struct tcp_connection *conn, const u8 *payload, u32 len) {
+    if (!tcp_rx_append(conn, payload, len)) {
+        g_tcp_rx_append_failed++;
+        tcp_log_rx_full(conn, len);
+        return 0;
+    }
+    g_tcp_rx_in_order_bytes += len;
+    tcp_log_progress_if_needed();
+    return 1;
+}
+
+static int tcp_ooo_range_overlaps(const struct tcp_ooo_segment *seg, u32 seq, u32 len) {
+    const u32 seg_end = seg->seq + seg->len;
+    const u32 end = seq + len;
+    return tcp_seq_lt(seq, seg_end) && tcp_seq_lt(seg->seq, end);
+}
+
+static int tcp_store_ooo(struct tcp_connection *conn, u32 seq, const u8 *payload, u32 len) {
+    if (len == 0) return 1;
+    if (len > NET_TCP_OOO_BYTES) {
+        g_tcp_rx_ooo_dropped++;
+        return 0;
+    }
+    for (u64 i = 0; i < NET_TCP_OOO_SEGMENTS; i++) {
+        const struct tcp_ooo_segment *seg = &conn->ooo[i];
+        if (seg->used && tcp_ooo_range_overlaps(seg, seq, len)) {
+            if (seg->seq == seq && seg->len == len) return 1;
+            g_tcp_rx_ooo_dropped++;
+            return 0;
+        }
+    }
+    for (u64 i = 0; i < NET_TCP_OOO_SEGMENTS; i++) {
+        struct tcp_ooo_segment *seg = &conn->ooo[i];
+        if (seg->used) continue;
+        seg->used = 1;
+        seg->seq = seq;
+        seg->len = len;
+        memcpy(seg->bytes, payload, len);
+        g_tcp_rx_ooo_stored++;
+        return 1;
+    }
+    g_tcp_rx_ooo_dropped++;
+    return 0;
+}
+
+static void tcp_drain_ooo(struct tcp_connection *conn) {
+    for (;;) {
+        struct tcp_ooo_segment *match = 0;
+        for (u64 i = 0; i < NET_TCP_OOO_SEGMENTS; i++) {
+            struct tcp_ooo_segment *seg = &conn->ooo[i];
+            if (!seg->used) continue;
+            const u32 seg_end = seg->seq + seg->len;
+            if (tcp_seq_leq(seg_end, conn->ack)) {
+                seg->used = 0;
+                seg->len = 0;
+                continue;
+            }
+            if (tcp_seq_leq(seg->seq, conn->ack) && tcp_seq_lt(conn->ack, seg_end)) {
+                match = seg;
+                break;
+            }
+        }
+        if (match == 0) return;
+        const u32 skip = conn->ack - match->seq;
+        u32 append_len = match->len - skip;
+        const u32 free_bytes = NET_TCP_RX_BYTES - conn->rx_len;
+        if (free_bytes == 0) return;
+        if (append_len > free_bytes) append_len = free_bytes;
+        if (!tcp_rx_append_counted(conn, match->bytes + skip, append_len)) return;
+        conn->ack += append_len;
+        if (skip + append_len >= match->len) {
+            match->used = 0;
+            match->len = 0;
+            g_tcp_rx_ooo_drained++;
+        }
+    }
+}
+
 static u16 tcp_advertised_window(const struct tcp_connection *conn) {
     const u32 free_bytes = NET_TCP_RX_BYTES - conn->rx_len;
-    return (u16)(free_bytes > 65535 ? 65535 : free_bytes);
+    return (u16)(free_bytes > NET_TCP_WINDOW_MAX ? NET_TCP_WINDOW_MAX : free_bytes);
 }
 
 static u32 tcp_rx_pop(struct tcp_connection *conn, u8 *out, u32 out_cap) {
@@ -1096,9 +1362,13 @@ static int send_ipv4_tcp_segment(struct tcp_connection *conn, u8 flags, const u8
         if (!g_tx_in_flight) (void)send_arp_request(g_ipv4_addr, g_gateway_addr);
         return NET_STATUS_NO_ROUTE;
     }
-    if (g_tx_in_flight) return NET_STATUS_BUSY;
+    if (g_tx_in_flight) {
+        g_tcp_tx_busy++;
+        return NET_STATUS_BUSY;
+    }
 
-    u8 frame[ETH_HDR_BYTES + 20 + 20 + NET_TCP_MAX_PAYLOAD];
+    const u32 tcp_header_len = (flags & TCP_FLAG_SYN) != 0 ? 24 : 20;
+    u8 frame[ETH_HDR_BYTES + 20 + 24 + NET_TCP_MAX_PAYLOAD];
     memset(frame, 0, sizeof(frame));
     memcpy(frame + 0, g_gateway_mac, 6);
     memcpy(frame + 6, g_mac, 6);
@@ -1106,7 +1376,7 @@ static int send_ipv4_tcp_segment(struct tcp_connection *conn, u8 flags, const u8
 
     u8 *ip = frame + ETH_HDR_BYTES;
     u8 *tcp = ip + 20;
-    const u16 tcp_len = (u16)(20 + payload_len);
+    const u16 tcp_len = (u16)(tcp_header_len + payload_len);
     const u16 ip_len = (u16)(20 + tcp_len);
     const u16 frame_len = (u16)(ETH_HDR_BYTES + ip_len);
 
@@ -1125,18 +1395,57 @@ static int send_ipv4_tcp_segment(struct tcp_connection *conn, u8 flags, const u8
     write_be16(tcp + 2, conn->remote_port);
     write_be32(tcp + 4, conn->seq);
     write_be32(tcp + 8, conn->ack);
-    tcp[12] = 5 << 4;
+    tcp[12] = (u8)((tcp_header_len / 4) << 4);
     tcp[13] = flags;
     write_be16(tcp + 14, tcp_advertised_window(conn));
     write_be16(tcp + 16, 0);
     write_be16(tcp + 18, 0);
-    if (payload_len != 0) memcpy(tcp + 20, payload, payload_len);
+    if ((flags & TCP_FLAG_SYN) != 0) {
+        tcp[20] = 2;
+        tcp[21] = 4;
+        write_be16(tcp + 22, NET_TCP_MSS);
+    }
+    if (payload_len != 0) memcpy(tcp + tcp_header_len, payload, payload_len);
     write_be16(tcp + 16, tcp_ipv4_checksum(conn->local_ip, conn->remote_ip, tcp, tcp_len));
 
-    if (!send_packet(frame, frame_len)) return NET_STATUS_BUSY;
+    if (!send_packet(frame, frame_len)) {
+        g_tcp_tx_busy++;
+        return NET_STATUS_BUSY;
+    }
+    g_tcp_tx_segments++;
+    g_tcp_tx_payload_bytes += payload_len;
     if ((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) != 0) conn->seq++;
     conn->seq += payload_len;
     return NET_STATUS_OK;
+}
+
+static void tcp_send_or_defer_ack(struct tcp_connection *conn) {
+    if (conn == 0 || !conn->active) return;
+    if (!g_tx_in_flight && send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0) == NET_STATUS_OK) {
+        conn->ack_pending = 0;
+        g_tcp_ack_sent++;
+        return;
+    }
+    conn->ack_pending = 1;
+    g_tcp_ack_deferred++;
+}
+
+static int flush_pending_tcp_acks(void) {
+    if (g_tx_in_flight) return 0;
+    for (u64 i = 0; i < NET_TCP_CONNECTIONS; i++) {
+        struct tcp_connection *conn = &g_tcp_connections[i];
+        if (!conn->active || !conn->ack_pending) continue;
+        conn->ack_pending = 0;
+        if (send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0) != NET_STATUS_OK) {
+            conn->ack_pending = 1;
+        } else {
+            g_tcp_ack_sent++;
+            g_tcp_ack_flushed++;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
 }
 
 static struct tcp_connection *alloc_tcp_connection(u32 remote_ip, u16 remote_port) {
@@ -1166,6 +1475,7 @@ static struct tcp_connection *alloc_tcp_connection(u32 remote_ip, u16 remote_por
 static int net_tcp_connect(u32 remote_ip, u16 remote_port, u64 *handle_out, u16 *local_port_out, u32 *local_ip_out) {
     if (remote_ip == 0 || remote_port == 0) return NET_STATUS_INVALID;
     if (!g_dhcp_configured || g_ipv4_addr == 0 || g_gateway_addr == 0) return NET_STATUS_NO_ROUTE;
+    g_tcp_connect_requests++;
     struct tcp_connection *conn = alloc_tcp_connection(remote_ip, remote_port);
     if (conn == 0) return NET_STATUS_PORT_IN_USE;
     const int status = send_ipv4_tcp_segment(conn, TCP_FLAG_SYN, 0, 0);
@@ -1191,16 +1501,21 @@ static int tcp_write(u64 handle, const u8 *payload, u32 payload_len, u32 *writte
 static int tcp_read(u64 handle, u8 *out, u32 out_cap, u32 *out_len) {
     struct tcp_connection *conn = find_tcp_connection_by_handle(handle);
     if (conn == 0) return NET_STATUS_INVALID;
+    g_tcp_read_requests++;
+    if (conn->state == TCP_STATE_ESTABLISHED) tcp_drain_ooo(conn);
     if (conn->rx_len == 0) {
         if (conn->peer_closed || conn->state == TCP_STATE_CLOSED) {
             *out_len = 0;
             return NET_STATUS_OK;
         }
+        g_tcp_read_would_block++;
         return NET_STATUS_WOULD_BLOCK;
     }
     *out_len = tcp_rx_pop(conn, out, out_cap);
-    if (conn->state == TCP_STATE_ESTABLISHED && !g_tx_in_flight) {
-        (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
+    g_tcp_read_bytes += *out_len;
+    if (conn->state == TCP_STATE_ESTABLISHED) {
+        tcp_drain_ooo(conn);
+        tcp_send_or_defer_ack(conn);
     }
     return NET_STATUS_OK;
 }
@@ -1208,9 +1523,12 @@ static int tcp_read(u64 handle, u8 *out, u32 out_cap, u32 *out_len) {
 static int poll_tcp_connection(u64 handle, u64 *events_out) {
     struct tcp_connection *conn = find_tcp_connection_by_handle(handle);
     if (conn == 0) return NET_STATUS_INVALID;
+    g_tcp_poll_requests++;
+    if (conn->state == TCP_STATE_ESTABLISHED) tcp_drain_ooo(conn);
     u64 events = 0;
     if (conn->rx_len != 0 || conn->peer_closed) events |= NET_POLL_READABLE;
     if (conn->state == TCP_STATE_ESTABLISHED && !g_tx_in_flight) events |= NET_POLL_WRITABLE;
+    if ((events & NET_POLL_READABLE) != 0) g_tcp_poll_readable++;
     *events_out = events;
     return NET_STATUS_OK;
 }
@@ -1553,30 +1871,54 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
         struct tcp_connection *conn = find_tcp_connection_by_tuple(read_be32(ip + 12), src_port, dst_port);
         if (conn == 0) return;
         if ((flags & TCP_FLAG_RST) != 0) {
+            g_tcp_rx_rst++;
             conn->state = TCP_STATE_CLOSED;
             conn->peer_closed = 1;
             return;
         }
         if (conn->state == TCP_STATE_SYN_SENT && (flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
+            g_tcp_rx_syn_ack++;
             if (ack_num == conn->seq) {
                 conn->ack = seq + 1;
                 conn->state = TCP_STATE_ESTABLISHED;
-                (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
+                g_tcp_connect_established++;
+                tcp_send_or_defer_ack(conn);
             }
             return;
         }
         if (conn->state != TCP_STATE_ESTABLISHED && conn->state != TCP_STATE_FIN_WAIT) return;
-        if (payload_len != 0 && seq == conn->ack) {
-            if (tcp_rx_append(conn, payload, payload_len)) {
-                conn->ack += payload_len;
+        if (payload_len != 0) {
+            g_tcp_rx_segments++;
+            g_tcp_rx_payload_bytes += payload_len;
+            const u32 payload_end = seq + payload_len;
+            if (tcp_seq_leq(seq, conn->ack) && tcp_seq_lt(conn->ack, payload_end)) {
+                const u32 skip = conn->ack - seq;
+                const u32 append_len = payload_len - skip;
+                if (tcp_rx_append_counted(conn, payload + skip, append_len)) {
+                    conn->ack += append_len;
+                    tcp_drain_ooo(conn);
+                } else {
+                    (void)tcp_store_ooo(conn, seq + skip, payload + skip, append_len);
+                }
+                tcp_send_or_defer_ack(conn);
+            } else if (tcp_seq_leq(payload_end, conn->ack)) {
+                g_tcp_rx_duplicate_segments++;
+                tcp_send_or_defer_ack(conn);
+            } else {
+                g_tcp_rx_out_of_order_segments++;
+                (void)tcp_store_ooo(conn, seq, payload, payload_len);
+                tcp_send_or_defer_ack(conn);
             }
-            (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
         }
         if ((flags & TCP_FLAG_FIN) != 0) {
-            if (seq == conn->ack) conn->ack++;
-            conn->peer_closed = 1;
-            conn->state = TCP_STATE_CLOSED;
-            (void)send_ipv4_tcp_segment(conn, TCP_FLAG_ACK, 0, 0);
+            g_tcp_rx_fin++;
+            const u32 fin_seq = seq + payload_len;
+            if (fin_seq == conn->ack) {
+                conn->ack++;
+                conn->peer_closed = 1;
+                conn->state = TCP_STATE_CLOSED;
+            }
+            tcp_send_or_defer_ack(conn);
         }
         return;
     }
@@ -1630,13 +1972,17 @@ static void parse_ethernet_frame(const u8 *frame, u32 frame_len) {
     if (ethertype == ETHERTYPE_IPV4) parse_ipv4_packet(frame, frame_len);
 }
 
-static void poll_rx_queue(void) {
-    while (*used_idx_ptr(&g_rx_queue) != g_rx_queue.last_used_idx) {
+static int poll_rx_queue_budget(u32 budget) {
+    int processed = 0;
+    u32 count = 0;
+    while (*used_idx_ptr(&g_rx_queue) != g_rx_queue.last_used_idx && count < budget) {
         volatile struct virtq_used_elem *used = &used_ring_ptr(&g_rx_queue)[g_rx_queue.last_used_idx % QUEUE_SIZE];
         const u16 desc_index = (u16)(used->id % QUEUE_SIZE);
         const u32 packet_len = used->len;
         g_rx_queue.last_used_idx++;
         g_rx_packets++;
+        count++;
+        processed = 1;
         if (packet_len > NET_HDR_BYTES) {
             const u8 *src = (const u8 *)(RX_BUFFER_BASE_VA + (u64)desc_index * 4096);
             u32 offset = NET_HDR_BYTES;
@@ -1651,16 +1997,19 @@ static void poll_rx_queue(void) {
         }
         queue_push_avail(&g_rx_queue, desc_index);
     }
-    if (queue_notify(g_rx_queue.notify_token, g_rx_queue.index) == SYSCALL_OK) {
+    if (processed && queue_notify(g_rx_queue.notify_token, g_rx_queue.index) == SYSCALL_OK) {
         mmio_write_u16(g_rx_queue.notify_addr, g_rx_queue.index);
     }
     if (g_isr_base != 0) (void)mmio_read_u8(g_isr_base);
+    return processed;
 }
 
-static void poll_tx_queue(void) {
+static int poll_tx_queue(void) {
+    int processed = 0;
     while (*used_idx_ptr(&g_tx_queue) != g_tx_queue.last_used_idx) {
         g_tx_in_flight = 0;
         g_tx_completions++;
+        processed = 1;
         if (!g_tx_complete_logged) {
             user_log("[virtio_net] VirtioNet: tx complete\n");
             g_tx_complete_logged = 1;
@@ -1675,8 +2024,10 @@ static void poll_tx_queue(void) {
         }
     }
     if (!g_tx_in_flight && g_dhcp_offer_addr != 0 && !g_dhcp_request_sent) {
-        send_dhcp_request();
+        if (send_dhcp_request()) processed = 1;
     }
+    if (flush_pending_tcp_acks()) processed = 1;
+    return processed;
 }
 
 static void handle_net_connect_transfer(u64 transfer_id) {
@@ -1735,17 +2086,27 @@ static void handle_net_connect_transfer(u64 transfer_id) {
     user_log("[virtio_net] VirtioNet: session connect ok\n");
 }
 
-static void handle_net_request_for_session(struct net_session *session) {
-    if (session == 0 || !session->active) return;
-    if (map_mmio_page(NET_REQUEST_VA, session->request_paddr, 0) != SYSCALL_OK) return;
-    if (map_mmio_page(NET_RESPONSE_VA, session->response_paddr, 1) != SYSCALL_OK) return;
+static int handle_net_request_for_session(struct net_session *session) {
+    if (session == 0 || !session->active) return 0;
+    if (map_mmio_page(NET_REQUEST_VA, session->request_paddr, 0) != SYSCALL_OK) return 0;
+    if (map_mmio_page(NET_RESPONSE_VA, session->response_paddr, 1) != SYSCALL_OK) return 0;
     g_current_session = session;
     volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
-    if (request->magic != NET_PROTOCOL_REQUEST_MAGIC || request->version != NET_PROTOCOL_VERSION) return;
+    if (request->magic != NET_PROTOCOL_REQUEST_MAGIC || request->version != NET_PROTOCOL_VERSION) {
+        g_current_session = 0;
+        return 0;
+    }
     const u64 seq = request->request_seq;
-    if (seq == 0 || seq <= session->last_completed_seq) return;
-    if (request->session_nonce != session->session_nonce) return;
+    if (seq == 0 || seq <= session->last_completed_seq) {
+        g_current_session = 0;
+        return 0;
+    }
+    if (request->session_nonce != session->session_nonce) {
+        g_current_session = 0;
+        return 0;
+    }
 
+    g_net_service_requests++;
     if (request->op == NET_OP_GET_STATUS) {
         write_net_status_payload();
         write_net_response(
@@ -1830,10 +2191,15 @@ static void handle_net_request_for_session(struct net_session *session) {
     }
     session->last_completed_seq = seq;
     g_current_session = 0;
+    return 1;
 }
 
-static void handle_net_requests(void) {
-    for (u64 i = 0; i < NET_SESSION_MAX; i++) handle_net_request_for_session(&g_sessions[i]);
+static int handle_net_requests(void) {
+    int processed = 0;
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+        if (handle_net_request_for_session(&g_sessions[i])) processed = 1;
+    }
+    return processed;
 }
 
 void virtio_net_main(void) {
@@ -1853,10 +2219,17 @@ void virtio_net_main(void) {
     send_dhcp_discover();
 
     for (;;) {
-        poll_tx_queue();
-        poll_rx_queue();
+        int did_work = 0;
+        did_work |= handle_net_requests();
+        did_work |= poll_tx_queue();
+        did_work |= poll_rx_queue_budget(8);
+        did_work |= handle_net_requests();
+        if (did_work) {
+            g_net_service_work_loops++;
+            continue;
+        }
+        g_net_service_idle_sleeps++;
         const u64 received = wait_event(1, 1);
         if (received >= CAP_TRANSFER_ID_MIN) handle_net_connect_transfer(received);
-        handle_net_requests();
     }
 }

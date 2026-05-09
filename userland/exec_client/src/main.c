@@ -48,7 +48,7 @@ void exec_client_main(void) {
         "/cmd/dash.elf",
         "/cmd/linux_smoke.sh",
     };
-    static const char *envp[] = { "PATH=/bin:/cmd", "CAPABILITYOS=1" };
+    static const char *envp[] = { "PATH=/bin:/usr/bin:/usr/lib/uutils:/cmd", "CAPABILITYOS=1" };
     struct exec_service_spawn_result result;
     const struct exec_service_spawn_options options = {
         .path = "/cmd/dash.elf",

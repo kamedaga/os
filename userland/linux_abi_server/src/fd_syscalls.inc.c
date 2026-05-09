@@ -107,5 +107,20 @@ static struct ipc_message handle_fcntl(const struct trap_request *req) {
         sync_fd_to_thread_group(fd);
         return reply(0, 0);
     }
+    if (cmd == F_GETLK) {
+        if (arg == 0) return reply(errno_fault(), 0);
+        const u16 unlocked = F_UNLCK;
+        return copy_to_target(arg, &unlocked, sizeof(unlocked)) == sizeof(unlocked) ? reply(0, 0) : reply(errno_fault(), 0);
+    }
+    if (cmd == F_SETLK || cmd == F_SETLKW) return reply(0, 0);
     return reply(errno_inval(), 0);
+}
+
+static struct ipc_message handle_flock(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const u64 op = req->args[1];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    const u64 lock_op = op & ~(u64)LOCK_NB;
+    if (lock_op != LOCK_SH && lock_op != LOCK_EX && lock_op != LOCK_UN) return reply(errno_inval(), 0);
+    return reply(0, 0);
 }

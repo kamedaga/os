@@ -44,7 +44,7 @@ void dash_shim_main(void) {
         "-i",
     };
     static const char *envp[] = {
-        "PATH=/bin:/cmd",
+        "PATH=/bin:/usr/bin:/usr/lib/uutils:/cmd",
         "HOME=/",
         "SHELL=/bin/dash",
         "TERM=virtio-console",

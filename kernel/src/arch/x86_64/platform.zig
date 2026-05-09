@@ -132,8 +132,64 @@ fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
 }
 
+fn staticStorageStart(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr);
+}
+
 fn maxStaticEnd(a: usize, b: usize) usize {
     return if (a > b) a else b;
+}
+
+fn minStaticStart(a: usize, b: usize) usize {
+    return if (a < b) a else b;
+}
+
+pub fn kernelStaticStorageStartAddr() usize {
+    var start = staticStorageStart(@TypeOf(pml4_table), &pml4_table);
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pdp_table), &pdp_table));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pd_tables), &pd_tables));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(high_mmio_pdp_table), &high_mmio_pdp_table));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(high_mmio_pd_tables), &high_mmio_pd_tables));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(phys_copy_window_pt), &phys_copy_window_pt));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(idt), &idt));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(gdt_tables), &gdt_tables));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ring0_stack_region_raw), &ring0_stack_region_raw));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pf_ist_stack_region_raw), &pf_ist_stack_region_raw));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(df_ist_stack_region_raw), &df_ist_stack_region_raw));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_ring0_stacks), &ap_ring0_stacks));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_pf_ist_stacks), &ap_pf_ist_stacks));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_df_ist_stacks), &ap_df_ist_stacks));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ring0_stack_guard_pt), &ring0_stack_guard_pt));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pf_ist_stack_guard_pt), &pf_ist_stack_guard_pt));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(df_ist_stack_guard_pt), &df_ist_stack_guard_pt));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pts), &runtime_identity_split_pts));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(tss_tables), &tss_tables));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(int80_trampoline_page), &int80_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_page), &de_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(df_trampoline_page), &df_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ud_trampoline_page), &ud_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ts_trampoline_page), &ts_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(np_trampoline_page), &np_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(int80_trampoline_entry), &int80_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(df_trampoline_entry), &df_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ud_trampoline_entry), &ud_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ts_trampoline_entry), &ts_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(np_trampoline_entry), &np_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ss_trampoline_entry), &ss_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(timer_trampoline_entry), &timer_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_cr3_value), &kernel_cr3_value));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_syscall_stack_top), &kernel_syscall_stack_top));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_syscall_stack_tops), &kernel_syscall_stack_tops));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pcid_enabled), &pcid_enabled));
+    return start;
 }
 
 pub fn kernelStaticStorageEndAddr() usize {
@@ -683,6 +739,15 @@ pub fn seedUserPdWithKernelIdentity(pd: []u64) void {
     var i: usize = 0;
     while (i < page_entries and i < pd.len) : (i += 1) {
         pd[i] = pd_tables[0][i] & ~page_user;
+    }
+}
+
+pub fn seedUserPdpWithKernelIdentity(pdp: []u64) void {
+    const kernel_table_flags = page_present | page_rw;
+    var pdp_idx: usize = 1;
+    while (pdp_idx < pd_table_count and pdp_idx < pdp.len) : (pdp_idx += 1) {
+        const pd_pa: u64 = @intFromPtr(&pd_tables[pdp_idx]);
+        pdp[pdp_idx] = pd_pa | kernel_table_flags;
     }
 }
 

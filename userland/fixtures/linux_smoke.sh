@@ -23,19 +23,19 @@ cd /tmp && [ "$(pwd)" = /tmp ] && echo cwd-ok || echo cwd-bad
 echo rel-ok > r
 read rz < r
 [ "$rz" = rel-ok ] && echo rel-rw-ok || echo rel-rw-bad
-/cmd/busybox.elf cat /tmp/ds > /tmp/bc
-echo busybox-cat-cmd-returned
-read bbcat < /tmp/bc
-[ "$bbcat" = file-ok ] && echo busybox-cat-ok || echo busybox-cat-bad
+cat /tmp/ds > /tmp/bc
+echo uutils-cat-cmd-returned
+read ucat < /tmp/bc
+[ "$ucat" = file-ok ] && echo uutils-cat-ok || echo uutils-cat-bad
 cd /cmd
 echo fat-ok > /share/f
 read fz < /share/f
 [ "$fz" = fat-ok ] && echo fat-rw-ok || echo fat-rw-bad
-/cmd/busybox.elf cat /share/f > /tmp/bf
-read bbfat < /tmp/bf
-[ "$bbfat" = fat-ok ] && echo busybox-fat-cat-ok || echo busybox-fat-cat-bad
-/cmd/busybox.elf true && echo busybox-true-ok || echo busybox-true-bad
-/cmd/busybox.elf false || echo busybox-false-ok
+cat /share/f > /tmp/bf
+read ufat < /tmp/bf
+[ "$ufat" = fat-ok ] && echo uutils-fat-cat-ok || echo uutils-fat-cat-bad
+true && echo uutils-true-ok || echo uutils-true-bad
+false || echo uutils-false-ok
 /cmd/zstd.elf --version >/dev/null && echo zstd-version-ok || echo zstd-version-bad
 /cmd/zstd.elf -q -f -T4 /tmp/ds -o /tmp/zstd.zst && echo zstd-compress-ok || echo zstd-compress-bad
 /cmd/zstd.elf -q -d -f /tmp/zstd.zst -o /tmp/zstd.out && echo zstd-decompress-ok || echo zstd-decompress-bad

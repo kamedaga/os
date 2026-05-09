@@ -94,6 +94,22 @@ fn parseManifestLine(line: []const u8) !?struct { image_path: []const u8, source
     return .{ .image_path = image_path, .source_path = source_path };
 }
 
+fn validateFatImagePath(path: []const u8) !void {
+    if (path.len < 2 or path[0] != '/') return error.InvalidImagePath;
+    if (path.len >= 128 or path[path.len - 1] == '/') return error.InvalidImagePath;
+
+    var pos: usize = 1;
+    while (pos < path.len) {
+        const start = pos;
+        while (pos < path.len and path[pos] != '/') : (pos += 1) {}
+        const component = path[start..pos];
+        if (component.len == 0) return error.InvalidImagePath;
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidImagePath;
+        if (component.len >= 128) return error.ImagePathTooLong;
+        if (pos < path.len) pos += 1;
+    }
+}
+
 fn resolveManifestSourcePath(allocator: std.mem.Allocator, manifest_path: []const u8, source_path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(source_path)) return allocator.dupe(u8, source_path);
     const manifest_dir = std.fs.path.dirname(manifest_path) orelse ".";
@@ -182,10 +198,13 @@ fn loadManifest(allocator: std.mem.Allocator, manifest_path: []const u8, dirs: *
     var line_it = std.mem.splitScalar(u8, manifest_bytes, '\n');
     while (line_it.next()) |line| {
         const parsed = try parseManifestLine(line) orelse continue;
-        try rootfs_host.validateImagePath(parsed.image_path);
+        try validateFatImagePath(parsed.image_path);
         const split = splitParentPath(parsed.image_path);
+        if (std.mem.eql(u8, parsed.source_path, rootfs_host.directory_source_token)) {
+            _ = try ensureDirectory(allocator, dirs, parsed.image_path);
+            continue;
+        }
         const parent_dir_index = try ensureDirectory(allocator, dirs, split.parent);
-        if (std.mem.eql(u8, parsed.source_path, rootfs_host.directory_source_token)) continue;
 
         const image_path_copy = try allocator.dupe(u8, parsed.image_path);
         errdefer allocator.free(image_path_copy);

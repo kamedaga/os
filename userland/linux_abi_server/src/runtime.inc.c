@@ -35,18 +35,37 @@ static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { u64 ret; __asm__ v
 static u64 syscall4_r10(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { register u64 r10 __asm__("r10") = a3; u64 ret; __asm__ volatile("int $0x80" : "=a"(ret), "+r"(r10) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r11", "memory"); return ret; }
 static void process_exit(u64 code) { (void)syscall2(SYSCALL_PROCESS_EXIT, code, 0); for (;;) __asm__ volatile("pause"); }
 
+static void wait_without_consuming_ipc(void) {
+    (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_IPC_SIGNAL_ONLY, 1);
+}
+
 static struct ipc_message wait_ipc(void) {
     register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 0; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
     __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "=r"(rdx), "=r"(r8) : : "rcx", "r9", "r10", "r11", "memory");
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
+
 static struct ipc_message reply(u64 result, u64 flags) {
+    const u64 explicit_target = abi_reply_target_principal();
+    if (explicit_target != 0) {
+        const u64 target = explicit_target;
+        abi_set_reply_target_principal(0);
+        const u64 status = syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, target, result, flags);
+        (void)syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN);
+        if (status != SYSCALL_OK) {
+            user_log("LinuxAbiServer: explicit reply failed=");
+            user_log_hex_value(status);
+        }
+        return wait_ipc();
+    }
     register u64 rax __asm__("rax") = SYSCALL_IPC_CALL_REPLY_RECV; register u64 rdi __asm__("rdi") = result; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx") = IPC_CALL_FLAG_SIGNAL_ONLY; register u64 r8 __asm__("r8") = flags; register u64 r9 __asm__("r9") = 0; register u64 r10 __asm__("r10") = 0;
     __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "+r"(rdx), "+r"(r8), "+r"(r9), "+r"(r10) : : "rcx", "r11", "memory");
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
 
 static u64 errno_noent(void) { return (u64)(i64)-2; }
+static u64 errno_perm(void) { return (u64)(i64)-1; }
+static u64 errno_intr(void) { return (u64)(i64)-4; }
 static u64 errno_io(void) { return (u64)(i64)-5; }
 static u64 errno_badf(void) { return (u64)(i64)-9; }
 static u64 errno_again(void) { return (u64)(i64)-11; }
@@ -72,8 +91,11 @@ static u64 errno_opnotsupp(void) { return (u64)(i64)-95; }
 static u64 errno_afnosupport(void) { return (u64)(i64)-97; }
 static u64 errno_addrinuse(void) { return (u64)(i64)-98; }
 static u64 errno_netunreach(void) { return (u64)(i64)-101; }
+static u64 errno_isconn(void) { return (u64)(i64)-106; }
 static u64 errno_notconn(void) { return (u64)(i64)-107; }
 static u64 errno_timedout(void) { return (u64)(i64)-110; }
+static u64 errno_already(void) { return (u64)(i64)-114; }
+static u64 errno_inprogress(void) { return (u64)(i64)-115; }
 
 static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
@@ -94,6 +116,21 @@ static u64 alloc_map_pages_with_paddrs(u64 target_va, u64 page_count, u64 writab
 static int install_self_wake_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, syscall0(SYSCALL_GET_PROCESS_SLOT)) == SYSCALL_OK; }
 static void prime_reply_return_signal(void) { (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, 0); }
 
+static void exit_trap_target_no_wait(u64 principal) {
+    abi_set_reply_target_principal(0);
+    const u64 status = reply_trap_target(principal, 0, TRAP_RESPONSE_FLAG_EXIT);
+    (void)detach_reply_token();
+    if (status != SYSCALL_OK) {
+        user_log("LinuxAbiServer: explicit exit reply failed=");
+        user_log_hex_value(status);
+    }
+}
+
+static struct ipc_message exit_trap_target_and_wait(u64 principal) {
+    exit_trap_target_no_wait(principal);
+    return wait_ipc();
+}
+
 static u64 trap_request_page_for_principal(u64 principal) {
     if (principal >= LINUX_ABI_REQUEST_PAGE_COUNT) return 0;
     return LINUX_ABI_REQUEST_PAGES_VA + principal * PAGE_BYTES;
@@ -104,6 +141,24 @@ static int is_known_trap_request_page(u64 request_va) {
     if (request_va < LINUX_ABI_REQUEST_PAGES_VA) return 0;
     const u64 offset = request_va - LINUX_ABI_REQUEST_PAGES_VA;
     return (offset & (PAGE_BYTES - 1)) == 0 && offset / PAGE_BYTES < LINUX_ABI_REQUEST_PAGE_COUNT;
+}
+
+static int ensure_all_child_trap_request_pages(void) {
+    for (u64 principal = 0; principal < LINUX_ABI_REQUEST_PAGE_COUNT; principal++) {
+        if (g_request_page_mapped[principal]) continue;
+        const u64 request_va = trap_request_page_for_principal(principal);
+        const u64 status = alloc_map_pages(request_va, 1, 0x3);
+        if (status != SYSCALL_OK) {
+            user_log("LinuxAbiServer: request page table map failed principal=");
+            user_log_hex_value(principal);
+            user_log("LinuxAbiServer: request page table map status=");
+            user_log_hex_value(status);
+            return 0;
+        }
+        g_request_page_mapped[principal] = 1;
+        clear_page(request_va);
+    }
+    return 1;
 }
 
 static int ensure_child_trap_request_page(u64 principal, u64 *request_va_out) {
@@ -172,12 +227,8 @@ static int find_service(u64 kind, struct service_entry *out) {
 static u64 make_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
     return request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ (endpoint_id << 1) ^ (process_slot << 33) ^ 0x4653434f4e4e4543ULL;
 }
-static int install_vfs_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_vfs.endpoint_id, g_vfs.process_slot) == SYSCALL_OK; }
-static int grant_vfs_response_page(void) { u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_vfs.response_paddr, g_vfs.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_vfs.response_paddr, g_vfs.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE); return ret == SYSCALL_OK; }
-static int share_vfs_request_page(void) { u64 ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id); return ret == SYSCALL_OK; }
-static int signal_vfs(void) { u64 ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_vfs.endpoint_id, 0); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_vfs.endpoint_id, 0); return ret == SYSCALL_OK; }
-static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+static int wait_fs_response_at(u64 response_va, u64 expected_seq, u16 expected_op) {
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)response_va;
     g_prof.vfs_wait_calls++;
     for (u64 i = 0; i < 8192; i++) {
         if (response->response_seq == expected_seq) {
@@ -185,11 +236,15 @@ static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
             if (i > 8) g_prof.vfs_wait_slow++;
             return response->magic == FS_RESPONSE_MAGIC && response->version == FS_PROTOCOL_VERSION && response->op == expected_op;
         }
-        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+        wait_without_consuming_ipc();
     }
     g_prof.vfs_wait_loops += 8192;
     g_prof.vfs_wait_timeouts++;
     return 0;
+}
+
+static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
+    return wait_fs_response_at(VFS_RESPONSE_VA, expected_seq, expected_op);
 }
 
 static void profile_count_syscall(u64 nr) {
@@ -197,12 +252,22 @@ static void profile_count_syscall(u64 nr) {
     if (nr <= LINUX_SYSCALL_PROFILE_COUNT) g_prof.syscall_counts[nr]++;
 }
 
+static void profile_record_syscall_ticks(u64 nr, u64 ticks) {
+    if (nr > LINUX_SYSCALL_PROFILE_COUNT) return;
+    g_prof.syscall_ticks[nr] += ticks;
+    if (ticks > g_prof.syscall_max_ticks[nr]) g_prof.syscall_max_ticks[nr] = ticks;
+}
+
 static void profile_print_syscall(const char *name, u64 nr) {
     if (nr > LINUX_SYSCALL_PROFILE_COUNT || g_prof.syscall_counts[nr] == 0) return;
     user_log("LinuxAbiServer.perf.syscall ");
     user_log(name);
-    user_log("=");
+    user_log(" count=");
     user_log_dec_value(g_prof.syscall_counts[nr]);
+    user_log(" ticks=");
+    user_log_dec_value(g_prof.syscall_ticks[nr]);
+    user_log(" max=");
+    user_log_dec_value(g_prof.syscall_max_ticks[nr]);
     user_log("\n");
 }
 

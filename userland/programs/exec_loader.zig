@@ -12,7 +12,12 @@ const user_vm = support.user_vm;
 
 const syscall_log: u64 = 0x9;
 const syscall_ok: u64 = 0;
+const syscall_map_page: u64 = 0x2;
 const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_wait_event: u64 = 0x17;
+const syscall_accept_cap_transfer: u64 = 0x2A;
+const syscall_install_endpoint: u64 = 0x26;
+const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
 
 const main_source_map_va: u64 = 0x2800_0000;
@@ -21,7 +26,7 @@ const bootfs_source_map_va: u64 = 0x2A00_0000;
 const lib_source_map_va: u64 = 0x2B00_0000;
 const page_bytes: u64 = 4096;
 const zero_page = [_]u8{0} ** 4096;
-const linux_stack_pages: u64 = 16;
+const linux_stack_pages: u64 = 64;
 const linux_stack_bytes: u64 = linux_stack_pages * page_bytes;
 const linux_stack_bottom_va: u64 = process_abi.user_stack_top - linux_stack_bytes;
 const stdio_sink_target_va: u64 = 0x3C02_2000;
@@ -53,10 +58,11 @@ const dynamic_reserved_high_end_va: u64 = 0x3D00_0000;
 const et_dyn_alloc_start_va: u64 = user_load_min_va;
 const et_dyn_alloc_end_va: u64 = dynamic_reserved_high_base_va;
 const max_vm_layout_ranges: usize = 16;
-const max_child_mapped_pages: usize = 2048;
+const max_child_mapped_pages: usize = 8192;
 const pt_load: u32 = 1;
 const pt_dynamic: u32 = 2;
 const pt_interp: u32 = 3;
+const pt_phdr: u32 = 6;
 const pt_tls: u32 = 7;
 const pt_gnu_relro: u32 = 0x6474_e552;
 const interp_path_ld = "/lib/ld-musl-x86_64.so.1";
@@ -81,12 +87,28 @@ const elf_dyn_bytes: usize = 16;
 const max_lib_queue_depth: usize = max_needed_count;
 const elf_rela_bytes: u64 = 24;
 const max_reloc_pages: usize = 256;
-const exec_loader_profile_enabled = false;
+const service_request_va: u64 = 0x2600_0000;
+const service_response_va: u64 = 0x2600_1000;
+const service_main_source_base_va: u64 = 0x2800_0000;
+const service_main_source_slot_span: u64 = 0x0200_0000;
+const service_main_source_cache_max: usize = 8;
+const service_interpreter_source_map_va: u64 = 0x3900_0000;
+const service_cache_path_bytes: usize = 128;
+const linux_abi_request_pages_base_va: u64 = 0x2650_0000;
+const linux_abi_request_page_count: u64 = 64;
+var exec_loader_profile_enabled = false;
+var exec_loader_profile_verbose = false;
+var exec_loader_profile_start_tick: u64 = 0;
+var exec_loader_profile_last_tick: u64 = 0;
+var exec_loader_profile_count: usize = 0;
+var exec_loader_profile_labels: [64][]const u8 = [_][]const u8{""} ** 64;
+var exec_loader_profile_dt: [64]u64 = [_]u64{0} ** 64;
+var exec_loader_profile_total: [64]u64 = [_]u64{0} ** 64;
 const r_x86_64_relative: u64 = 8;
 const linux_stack_execfn = "/cmd/musl_smoke.elf";
 const linux_stack_platform = "x86_64";
 const linux_stack_arg1 = "argv-smoke";
-const linux_stack_env_path = "PATH=/bin:/cmd";
+const linux_stack_env_path = "PATH=/bin:/usr/bin:/usr/lib/uutils:/cmd";
 const linux_stack_env_os = "CAPABILITYOS=1";
 const at_null: u64 = 0;
 const at_ignore: u64 = 1;
@@ -184,6 +206,7 @@ const NeededPath = struct {
 const LoadedImage = struct {
     ehdr: ElfHeader,
     load_bias: u64,
+    phdr_va: u64,
     interp_phdr: ?ProgramHeader,
     dynamic_phdr: ?ProgramHeader,
     tls_phdr: ?ProgramHeader,
@@ -323,6 +346,33 @@ const ChildPageTracker = struct {
 var child_mapped_pages = ChildPageTracker{};
 var reloc_pages_scratch: [max_reloc_pages]u64 = undefined;
 var reloc_page_buffer: [4096]u8 = undefined;
+const ServiceSourceCacheEntry = struct {
+    used: bool = false,
+    poisoned: bool = false,
+    path_len: usize = 0,
+    file_bytes: u64 = 0,
+    vm_token: u64 = 0,
+    source_va: u64 = 0,
+    path: [service_cache_path_bytes]u8 = [_]u8{0} ** service_cache_path_bytes,
+};
+var service_source_cache: [service_main_source_cache_max]ServiceSourceCacheEntry = [_]ServiceSourceCacheEntry{.{}} ** service_main_source_cache_max;
+var service_request_paddr: u64 = 0;
+var service_response_paddr: u64 = 0;
+var service_interpreter_vm_token: u64 = 0;
+var service_interpreter_file_bytes: u64 = 0;
+var service_last_request_seq: u64 = 0;
+var launch_executable_source_map_va: u64 = main_source_map_va;
+var launch_interpreter_source_map_va: u64 = interpreter_source_map_va;
+var launch_map_executable_source: bool = true;
+var launch_map_interpreter_source: bool = true;
+
+fn syscall0(nr: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (nr),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
 
 fn syscall1(nr: u64, arg0: u64) u64 {
     return asm volatile (
@@ -330,6 +380,16 @@ fn syscall1(nr: u64, arg0: u64) u64 {
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (nr),
           [arg0] "{rdi}" (arg0),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn syscall2(nr: u64, arg0: u64, arg1: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (nr),
+          [arg0] "{rdi}" (arg0),
+          [arg1] "{rsi}" (arg1),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -408,12 +468,101 @@ fn userLogHexField(label: []const u8, value: u64) void {
     userLogHex(value);
 }
 
-fn profileEvent(_: []const u8) void {}
+fn userLogDec(value: u64) void {
+    var buf: [20]u8 = undefined;
+    var n = value;
+    var index: usize = buf.len;
+    if (n == 0) {
+        userLog("0");
+        return;
+    }
+    while (n != 0 and index != 0) {
+        index -= 1;
+        buf[index] = '0' + @as(u8, @intCast(n % 10));
+        n /= 10;
+    }
+    userLog(buf[index..]);
+}
 
-fn profileStep(_: []const u8, _: []const u8) void {}
+fn profileBegin(cfg: *const exec_loader_bootstrap_abi.Config) void {
+    exec_loader_profile_enabled = configHasEnvFlag(cfg, "CAPABILITYOS_EXEC_PROFILE=1");
+    exec_loader_profile_verbose = configHasEnvFlag(cfg, "CAPABILITYOS_EXEC_PROFILE_VERBOSE=1");
+    if (!exec_loader_profile_enabled) return;
+    exec_loader_profile_start_tick = syscall1(syscall_get_tick_count, 0);
+    exec_loader_profile_last_tick = exec_loader_profile_start_tick;
+    exec_loader_profile_count = 0;
+    userLog("ExecLoader.exec_profile.begin tick=");
+    userLogDec(exec_loader_profile_start_tick);
+    userLog("\n");
+}
+
+fn profileEvent(label: []const u8) void {
+    if (!exec_loader_profile_enabled) return;
+    const now = syscall1(syscall_get_tick_count, 0);
+    if (exec_loader_profile_count < exec_loader_profile_dt.len) {
+        const slot = exec_loader_profile_count;
+        exec_loader_profile_count += 1;
+        exec_loader_profile_labels[slot] = label;
+        exec_loader_profile_dt[slot] = now - exec_loader_profile_last_tick;
+        exec_loader_profile_total[slot] = now - exec_loader_profile_start_tick;
+    }
+    exec_loader_profile_last_tick = now;
+}
+
+fn profileFlush() void {
+    if (!exec_loader_profile_enabled) return;
+    if (!exec_loader_profile_verbose) {
+        var max_index: usize = 0;
+        var index: usize = 0;
+        while (index < exec_loader_profile_count) : (index += 1) {
+            if (exec_loader_profile_dt[index] > exec_loader_profile_dt[max_index]) max_index = index;
+        }
+        const total = if (exec_loader_profile_count == 0) 0 else exec_loader_profile_total[exec_loader_profile_count - 1];
+        userLog("ExecLoader.exec_profile.summary count=");
+        userLogDec(exec_loader_profile_count);
+        userLog(" total=");
+        userLogDec(total);
+        userLog(" max_step=");
+        if (exec_loader_profile_count != 0) userLog(exec_loader_profile_labels[max_index]) else userLog("none");
+        userLog(" max_dt=");
+        userLogDec(if (exec_loader_profile_count == 0) 0 else exec_loader_profile_dt[max_index]);
+        userLog("\n");
+        return;
+    }
+    var index: usize = 0;
+    while (index < exec_loader_profile_count) : (index += 1) {
+        userLog("ExecLoader.exec_profile.step ");
+        userLog(exec_loader_profile_labels[index]);
+        userLog(" dt=");
+        userLogDec(exec_loader_profile_dt[index]);
+        userLog(" total=");
+        userLogDec(exec_loader_profile_total[index]);
+        userLog("\n");
+    }
+}
+
+fn profileStep(_: []const u8, step: []const u8) void {
+    profileEvent(step);
+}
 
 fn getProcessSlot() u64 {
     return syscall1(syscall_get_process_slot, 0);
+}
+
+fn mapPage(va: u64, paddr: u64, writable: bool) bool {
+    return syscall3(syscall_map_page, va, paddr, if (writable) 1 else 0) == syscall_ok;
+}
+
+fn waitEvent(mailbox: bool, ticks: u64) u64 {
+    return syscall2(syscall_wait_event, if (mailbox) 1 else 0, ticks);
+}
+
+fn acceptCapTransfer(transfer_id: u64) u64 {
+    return syscall1(syscall_accept_cap_transfer, transfer_id);
+}
+
+fn installEndpoint(endpoint_id: u64, process_slot: u64) bool {
+    return syscall3(syscall_install_endpoint, 0, endpoint_id, process_slot) == syscall_ok;
 }
 
 fn getProcessStatusRaw(process_slot: u64) u64 {
@@ -423,6 +572,12 @@ fn getProcessStatusRaw(process_slot: u64) u64 {
 fn processExit(code: u64) noreturn {
     _ = syscall1(process_abi.syscall_process_exit, code);
     while (true) asm volatile ("pause");
+}
+
+fn ensureExecLoaderStack() void {
+    const extra_pages: u64 = 15;
+    const base = process_abi.user_stack_top - (extra_pages + 1) * page_bytes;
+    _ = allocMapPagesSelf(base, extra_pages, true);
 }
 
 fn allocMapPagesSelf(base_va: u64, page_count: u64, writable: bool) u64 {
@@ -513,6 +668,17 @@ fn sameBytes(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+fn configHasEnvFlag(cfg: *const exec_loader_bootstrap_abi.Config, flag: []const u8) bool {
+    var index: usize = 0;
+    while (index < cfg.envp_count and index < exec_loader_bootstrap_abi.max_envp) : (index += 1) {
+        const offset: usize = cfg.envp_offsets[index];
+        const len: usize = cfg.envp_bytes[index];
+        if (len == 0 or offset + len > cfg.arg_data.len) continue;
+        if (sameBytes(cfg.arg_data[offset .. offset + len], flag)) return true;
+    }
+    return false;
+}
+
 fn mapVmObject(token: u64, target_va: u64) bool {
     return syscall3(image_abi.syscall_map_vm_object, token, target_va, 0) == syscall_ok;
 }
@@ -587,6 +753,15 @@ fn setProcessAbiTrapDelegate(process_token: u64, endpoint_id: u64, target_proces
     return syscall5(process_builder_abi.syscall_set_process_abi_trap_delegate, process_token, endpoint_id, target_process_slot, flavor, request_page_va) == syscall_ok;
 }
 
+fn abiTrapRequestPageForProcessToken(config_request_page_va: u64, process_token: u64) u64 {
+    if (config_request_page_va < linux_abi_request_pages_base_va) return config_request_page_va;
+    const offset = config_request_page_va - linux_abi_request_pages_base_va;
+    if ((offset & (page_bytes - 1)) != 0 or offset >= linux_abi_request_page_count * page_bytes) return config_request_page_va;
+    const process_slot = process_builder_abi.decodeProcessBuilderToken(process_token) orelse return config_request_page_va;
+    if (process_slot >= linux_abi_request_page_count) return config_request_page_va;
+    return linux_abi_request_pages_base_va + process_slot * page_bytes;
+}
+
 fn abortProcess(process_token: u64) void {
     _ = syscall1(process_builder_abi.syscall_abort_process, process_token);
 }
@@ -655,6 +830,42 @@ fn parseProgramHeader(source_base_va: u64, ehdr: ElfHeader, index: u16, file_byt
         .memsz = readU64Le(phdr, 40) orelse return null,
         .align_bytes = readU64Le(phdr, 48) orelse return null,
     };
+}
+
+fn programHeadersVa(source_base_va: u64, ehdr: ElfHeader, file_bytes: u64, load_bias: u64) ?u64 {
+    var phdr_table_bytes: u64 = 0;
+    const phdr_count_bytes, const count_overflow = @mulWithOverflow(@as(u64, ehdr.phnum), @as(u64, ehdr.phentsize));
+    if (count_overflow != 0) return null;
+    phdr_table_bytes = phdr_count_bytes;
+    const phdr_table_end, const table_end_overflow = @addWithOverflow(ehdr.phoff, phdr_table_bytes);
+    if (table_end_overflow != 0) return null;
+
+    var index: u16 = 0;
+    while (index < ehdr.phnum) : (index += 1) {
+        const phdr = parseProgramHeader(source_base_va, ehdr, index, file_bytes) orelse return null;
+        if (phdr.p_type != pt_phdr) continue;
+        const va, const overflow = @addWithOverflow(load_bias, phdr.vaddr);
+        if (overflow != 0) return null;
+        return va;
+    }
+
+    index = 0;
+    while (index < ehdr.phnum) : (index += 1) {
+        const phdr = parseProgramHeader(source_base_va, ehdr, index, file_bytes) orelse return null;
+        if (phdr.p_type != pt_load) continue;
+        if (ehdr.phoff < phdr.offset) continue;
+        const segment_file_end, const segment_end_overflow = @addWithOverflow(phdr.offset, phdr.filesz);
+        if (segment_end_overflow != 0) return null;
+        if (phdr_table_end > segment_file_end) continue;
+        const delta = ehdr.phoff - phdr.offset;
+        const segment_va, const segment_va_overflow = @addWithOverflow(load_bias, phdr.vaddr);
+        if (segment_va_overflow != 0) return null;
+        const phdr_va, const phdr_va_overflow = @addWithOverflow(segment_va, delta);
+        if (phdr_va_overflow != 0) return null;
+        return phdr_va;
+    }
+
+    return null;
 }
 
 fn pageDown(value: u64) u64 {
@@ -1181,12 +1392,9 @@ fn installLinuxInitialStack(
 
     sp &= ~@as(u64, 15);
 
-    const main_phdr, const phdr_overflow = @addWithOverflow(main_image.load_bias, main_image.ehdr.phoff);
-    if (phdr_overflow != 0) return null;
-
     var aux: [24]LinuxAuxEntry = undefined;
     var aux_count: usize = 0;
-    if (!appendAux(&aux, &aux_count, at_phdr, main_phdr)) return null;
+    if (!appendAux(&aux, &aux_count, at_phdr, main_image.phdr_va)) return null;
     if (!appendAux(&aux, &aux_count, at_phent, main_image.ehdr.phentsize)) return null;
     if (!appendAux(&aux, &aux_count, at_phnum, main_image.ehdr.phnum)) return null;
     if (!appendAux(&aux, &aux_count, at_pagesz, page_bytes)) return null;
@@ -1609,9 +1817,56 @@ fn applyRelativeRelocationsBatched(process_token: u64, source_base_va: u64, ehdr
     return true;
 }
 
+fn applyRelativeRelocationsSortedPages(process_token: u64, source_base_va: u64, ehdr: ElfHeader, table: RelocationTable, load_bias: u64, file_bytes: u64) bool {
+    var have_page = false;
+    var current_page_va: u64 = 0;
+    var previous_page_va: u64 = 0;
+    var rela_off = table.file_off;
+    const rela_end = table.file_off + table.size;
+
+    while (rela_off < rela_end) : (rela_off += elf_rela_bytes) {
+        const rela = bytesAt(source_base_va, rela_off, @intCast(elf_rela_bytes), file_bytes) orelse return false;
+        const r_offset = readU64Le(rela, 0) orelse return false;
+        const r_info = readU64Le(rela, 8) orelse return false;
+        const r_addend = readI64Le(rela, 16) orelse return false;
+        const r_type = r_info & 0xffff_ffff;
+        const r_sym = r_info >> 32;
+        if (r_type != r_x86_64_relative or r_sym != 0) continue;
+
+        const dest_va, const dest_overflow = @addWithOverflow(load_bias, r_offset);
+        if (dest_overflow != 0) return false;
+        if ((dest_va & (page_bytes - 1)) > page_bytes - 8) return false;
+        const page_va = pageDown(dest_va);
+        if (page_va < load_bias) return false;
+        if (have_page and page_va < previous_page_va) return false;
+
+        if (!have_page or page_va != current_page_va) {
+            if (have_page) {
+                if (!copyToProcess(process_token, current_page_va, @intFromPtr(&reloc_page_buffer), page_bytes)) return false;
+            }
+            const page_vaddr = page_va - load_bias;
+            const prot = pageProtFromImage(source_base_va, ehdr, file_bytes, page_vaddr) orelse return false;
+            if (!prot.write) return false;
+            if (!fillLoadedImagePage(source_base_va, ehdr, file_bytes, load_bias, page_va, &reloc_page_buffer)) return false;
+            have_page = true;
+            current_page_va = page_va;
+            previous_page_va = page_va;
+        }
+
+        const relocated = addSigned(load_bias, r_addend) orelse return false;
+        if (!writeU64Le(&reloc_page_buffer, @intCast(dest_va - current_page_va), relocated)) return false;
+    }
+
+    if (have_page) {
+        if (!copyToProcess(process_token, current_page_va, @intFromPtr(&reloc_page_buffer), page_bytes)) return false;
+    }
+    return true;
+}
+
 fn applyRelativeRelocations(process_token: u64, source_base_va: u64, ehdr: ElfHeader, dynamic: ProgramHeader, load_bias: u64, file_bytes: u64) bool {
     const table = findRelativeRelocationTable(source_base_va, ehdr, dynamic, file_bytes) orelse return false;
     if (table.size == 0) return true;
+    if (applyRelativeRelocationsSortedPages(process_token, source_base_va, ehdr, table, load_bias, file_bytes)) return true;
     return applyRelativeRelocationsBatched(process_token, source_base_va, ehdr, table, load_bias, file_bytes);
 }
 
@@ -1673,8 +1928,14 @@ fn loadElfImage(
         profileStep(label, "reloc done");
     }
 
+    const phdr_va = programHeadersVa(source_base_va, ehdr, file_bytes, load_bias) orelse {
+        userLog(label);
+        userLog(" program header VA failed\n");
+        return null;
+    };
+
     profileStep(label, "done");
-    return .{ .ehdr = ehdr, .load_bias = load_bias, .interp_phdr = interp_phdr, .dynamic_phdr = dynamic_phdr, .tls_phdr = tls_phdr, .relro_phdr = relro_phdr };
+    return .{ .ehdr = ehdr, .load_bias = load_bias, .phdr_va = phdr_va, .interp_phdr = interp_phdr, .dynamic_phdr = dynamic_phdr, .tls_phdr = tls_phdr, .relro_phdr = relro_phdr };
 }
 
 fn readInterpPath(source_base_va: u64, phdr: ProgramHeader, file_bytes: u64) ?[]const u8 {
@@ -1697,9 +1958,7 @@ fn installDynamicLinkerBootstrapPage(
     if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "version"), dynamic_linker_bootstrap_abi.version)) return false;
     if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "main_entry"), main_entry)) return false;
     if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "main_load_bias"), main_image.load_bias)) return false;
-    const main_phdr, const phdr_overflow = @addWithOverflow(main_image.load_bias, main_image.ehdr.phoff);
-    if (phdr_overflow != 0) return false;
-    if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "main_phdr"), main_phdr)) return false;
+    if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "main_phdr"), main_image.phdr_va)) return false;
     if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "main_phnum"), main_image.ehdr.phnum)) return false;
     if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "main_phent"), main_image.ehdr.phentsize)) return false;
     if (!writeProcessU64(process_token, dynamic_linker_bootstrap_abi.target_va + @offsetOf(dynamic_linker_bootstrap_abi.Config, "bootfs_image_va"), if (bootfs_image_bytes != 0) dynamic_linker_bootstrap_abi.bootfs_image_target_va else 0)) return false;
@@ -1730,9 +1989,10 @@ fn launchExec(
     executable_file_bytes: u64,
     interpreter_vm_token: u64,
     interpreter_file_bytes: u64,
+    flush_profile_before_return: bool,
 ) ?u64 {
     profileEvent("launch begin");
-    if (!mapVmObject(executable_vm_token, main_source_map_va)) {
+    if (launch_map_executable_source and !mapVmObject(executable_vm_token, launch_executable_source_map_va)) {
         userLog("ExecLoader: source map failed\n");
         return null;
     }
@@ -1757,7 +2017,7 @@ fn launchExec(
     profileEvent("bootfs reserve done");
     child_mapped_pages = .{};
     profileEvent("main load begin");
-    const main_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, executable_vm_token, main_source_map_va, executable_file_bytes, "ExecLoader: main") orelse {
+    const main_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, executable_vm_token, launch_executable_source_map_va, executable_file_bytes, "ExecLoader: main") orelse {
         abortProcess(process_token);
         userLog("ExecLoader: main ELF load failed\n");
         return null;
@@ -1770,7 +2030,7 @@ fn launchExec(
         userLog("ExecLoader: entry overflow\n");
         return null;
     }
-    if (exec_loader_profile_enabled) {
+    if (false) {
         userLog("ExecLoader: main ");
         userLogHexField("bias=", main_image.load_bias);
         userLogHexField(" entry=", main_entry);
@@ -1782,7 +2042,7 @@ fn launchExec(
 
     if (main_image.interp_phdr) |interp_phdr| {
         profileEvent("interp path begin");
-        const interp_path = readInterpPath(main_source_map_va, interp_phdr, executable_file_bytes) orelse {
+        const interp_path = readInterpPath(launch_executable_source_map_va, interp_phdr, executable_file_bytes) orelse {
             abortProcess(process_token);
             userLog("ExecLoader: bad PT_INTERP\n");
             return null;
@@ -1799,14 +2059,14 @@ fn launchExec(
             return null;
         }
         profileEvent("interp source map begin");
-        if (!mapVmObject(interpreter_vm_token, interpreter_source_map_va)) {
+        if (launch_map_interpreter_source and !mapVmObject(interpreter_vm_token, launch_interpreter_source_map_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: interpreter source map failed\n");
             return null;
         }
         profileEvent("interp source map done");
         profileEvent("interp load begin");
-        const interp_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, interpreter_vm_token, interpreter_source_map_va, interpreter_file_bytes, "ExecLoader: interpreter") orelse {
+        const interp_image = loadElfImage(process_token, &vm_layout, &child_mapped_pages, interpreter_vm_token, launch_interpreter_source_map_va, interpreter_file_bytes, "ExecLoader: interpreter") orelse {
             abortProcess(process_token);
             userLog("ExecLoader: interpreter ELF load failed\n");
             return null;
@@ -1820,7 +2080,7 @@ fn launchExec(
         }
         initial_entry = interp_entry;
         interp_base = interp_image.load_bias;
-        if (exec_loader_profile_enabled) {
+        if (false) {
             userLog("ExecLoader: standard interpreter loaded ");
             userLogHexField("bias=", interp_image.load_bias);
             userLogHexField(" entry=", interp_entry);
@@ -1861,7 +2121,7 @@ fn launchExec(
         userLog("ExecLoader: linux stack failed\n");
         return null;
     };
-    if (exec_loader_profile_enabled) {
+    if (false) {
         userLog("ExecLoader: linux stack ");
         userLogHexField("rsp=", initial_rsp);
         userLogHexField(" bottom=", linux_stack_bottom_va);
@@ -1870,7 +2130,7 @@ fn launchExec(
     }
     profileEvent("linux stack done");
     profileEvent("context begin");
-    if (exec_loader_profile_enabled) {
+    if (false) {
         userLog("ExecLoader: initial context ");
         userLogHexField("rip=", initial_entry);
         userLogHexField(" rsp=", initial_rsp);
@@ -1885,19 +2145,20 @@ fn launchExec(
     profileEvent("context done");
     if (cfg.abi_trap_endpoint_id != 0 and cfg.abi_trap_endpoint_process_slot != 0) {
         const flavor = if (cfg.abi_trap_flavor != 0) cfg.abi_trap_flavor else @as(u64, @intFromEnum(trap_abi.AbiFlavor.linux_x86_64));
-        if (cfg.abi_trap_request_page_va == 0) {
+        const abi_trap_request_page_va = abiTrapRequestPageForProcessToken(cfg.abi_trap_request_page_va, process_token);
+        if (abi_trap_request_page_va == 0) {
             abortProcess(process_token);
             userLog("ExecLoader: abi trap request page absent\n");
             return null;
         }
         profileEvent("abi delegate begin");
-        if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_process_slot, flavor, cfg.abi_trap_request_page_va)) {
+        if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_process_slot, flavor, abi_trap_request_page_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: abi trap delegate failed\n");
             return null;
         }
         profileEvent("abi delegate done");
-        if (exec_loader_profile_enabled) userLog("ExecLoader: abi trap delegate ready\n");
+        if (false) userLog("ExecLoader: abi trap delegate ready\n");
     }
     profileEvent("start process begin");
     const spawned = startProcess(process_token) orelse {
@@ -1906,19 +2167,190 @@ fn launchExec(
         return null;
     };
     profileEvent("start process done");
+    if (flush_profile_before_return) profileFlush();
     return process_abi.decodeSpawnedProcessSlot(spawned);
 }
 
+fn configExecfn(cfg: *const exec_loader_bootstrap_abi.Config) ?[]const u8 {
+    return bootstrapArgSlice(cfg, cfg.execfn_offset, cfg.execfn_bytes);
+}
+
+fn cachePathMatches(entry: *const ServiceSourceCacheEntry, path: []const u8, file_bytes: u64) bool {
+    if (!entry.used or entry.poisoned or entry.path_len != path.len or entry.file_bytes != file_bytes) return false;
+    var index: usize = 0;
+    while (index < path.len) : (index += 1) {
+        if (entry.path[index] != path[index]) return false;
+    }
+    return true;
+}
+
+noinline fn serviceSourceForRequest(cfg: *const exec_loader_bootstrap_abi.Config) ?*ServiceSourceCacheEntry {
+    const path = configExecfn(cfg) orelse return null;
+    if (path.len == 0 or path.len > service_cache_path_bytes) return null;
+
+    var index: usize = 0;
+    while (index < service_source_cache.len) : (index += 1) {
+        if (cachePathMatches(&service_source_cache[index], path, cfg.executable_file_bytes)) {
+            if (image_abi.decodeVmObjectToken(cfg.executable_vm_token) != null) {
+                service_source_cache[index].vm_token = cfg.executable_vm_token;
+            }
+            return &service_source_cache[index];
+        }
+    }
+
+    if (image_abi.decodeVmObjectToken(cfg.executable_vm_token) == null or cfg.executable_file_bytes == 0) return null;
+    index = 0;
+    while (index < service_source_cache.len) : (index += 1) {
+        if (service_source_cache[index].used or service_source_cache[index].poisoned) continue;
+        const source_va = service_main_source_base_va + @as(u64, @intCast(index)) * service_main_source_slot_span;
+        if (!mapVmObject(cfg.executable_vm_token, source_va)) return null;
+        var entry = ServiceSourceCacheEntry{
+            .used = true,
+            .poisoned = false,
+            .path_len = path.len,
+            .file_bytes = cfg.executable_file_bytes,
+            .vm_token = cfg.executable_vm_token,
+            .source_va = source_va,
+        };
+        var path_index: usize = 0;
+        while (path_index < path.len) : (path_index += 1) entry.path[path_index] = path[path_index];
+        service_source_cache[index] = entry;
+        return &service_source_cache[index];
+    }
+    userLog("ExecLoader: service source cache full\n");
+    return null;
+}
+
+fn mapServiceRequestPage(request_paddr: u64) bool {
+    if (service_request_paddr == request_paddr) return true;
+    if (service_request_paddr != 0) return false;
+    if (!mapPage(service_request_va, request_paddr, false)) return false;
+    service_request_paddr = request_paddr;
+    return true;
+}
+
+fn mapServiceResponsePage(response_paddr: u64) bool {
+    if (service_response_paddr == response_paddr) return true;
+    if (service_response_paddr != 0) return false;
+    if (!mapPage(service_response_va, response_paddr, true)) return false;
+    service_response_paddr = response_paddr;
+    return true;
+}
+
+fn writeServiceResponse(seq: u64, status: u64, child_process_slot: u64) void {
+    const response: *volatile exec_loader_bootstrap_abi.ServiceResponse = @ptrFromInt(service_response_va);
+    response.magic = exec_loader_bootstrap_abi.service_response_magic;
+    response.version = exec_loader_bootstrap_abi.service_version;
+    response.op = exec_loader_bootstrap_abi.service_op_launch;
+    response.status = status;
+    response.child_process_slot = child_process_slot;
+    response.seq = seq;
+    if (status != exec_loader_bootstrap_abi.service_status_ok) {
+        userLog("ExecLoader: service response error\n");
+    }
+}
+
+fn pendingMappedServiceRequestSeq() u64 {
+    if (service_request_paddr == 0) return 0;
+    const request: *const volatile exec_loader_bootstrap_abi.ServiceRequest = @ptrFromInt(service_request_va);
+    if (request.magic != exec_loader_bootstrap_abi.service_request_magic or
+        request.version != exec_loader_bootstrap_abi.service_version or
+        request.op != exec_loader_bootstrap_abi.service_op_launch)
+    {
+        return 0;
+    }
+    return request.seq;
+}
+
+noinline fn handleServiceRequest(request_paddr: u64) void {
+    if (!mapServiceRequestPage(request_paddr)) {
+        userLog("ExecLoader: service request map failed\n");
+        return;
+    }
+    const request: *const volatile exec_loader_bootstrap_abi.ServiceRequest = @ptrFromInt(service_request_va);
+    if (request.magic != exec_loader_bootstrap_abi.service_request_magic or
+        request.version != exec_loader_bootstrap_abi.service_version or
+        request.op != exec_loader_bootstrap_abi.service_op_launch or
+        request.response_paddr < page_bytes)
+    {
+        userLog("ExecLoader: service request invalid\n");
+        return;
+    }
+    service_last_request_seq = request.seq;
+    if (!mapServiceResponsePage(request.response_paddr)) {
+        userLog("ExecLoader: service response map failed\n");
+        return;
+    }
+
+    const cfg: *const exec_loader_bootstrap_abi.Config = @ptrCast(@volatileCast(&request.config));
+    if (cfg.magic != exec_loader_bootstrap_abi.magic or cfg.version != exec_loader_bootstrap_abi.version) {
+        writeServiceResponse(request.seq, exec_loader_bootstrap_abi.service_status_invalid, 0);
+        return;
+    }
+    profileBegin(cfg);
+    profileEvent("service request begin");
+    const source = serviceSourceForRequest(cfg) orelse {
+        writeServiceResponse(request.seq, exec_loader_bootstrap_abi.service_status_map_failed, 0);
+        return;
+    };
+    profileEvent("service source ready");
+    launch_executable_source_map_va = source.source_va;
+    launch_interpreter_source_map_va = service_interpreter_source_map_va;
+    launch_map_executable_source = false;
+    launch_map_interpreter_source = false;
+    const child_process_slot = launchExec(cfg, source.vm_token, source.file_bytes, service_interpreter_vm_token, service_interpreter_file_bytes, false) orelse {
+        source.used = false;
+        source.poisoned = true;
+        writeServiceResponse(request.seq, exec_loader_bootstrap_abi.service_status_launch_failed, 0);
+        profileFlush();
+        return;
+    };
+    writeServiceResponse(request.seq, exec_loader_bootstrap_abi.service_status_ok, child_process_slot);
+    profileFlush();
+}
+
+noinline fn runExecLoaderService(cfg: *const exec_loader_bootstrap_abi.Config) noreturn {
+    service_interpreter_vm_token = cfg.interpreter_vm_token;
+    service_interpreter_file_bytes = cfg.interpreter_file_bytes;
+    if (image_abi.decodeVmObjectToken(service_interpreter_vm_token) != null and service_interpreter_file_bytes != 0) {
+        if (!mapVmObject(service_interpreter_vm_token, service_interpreter_source_map_va)) {
+            userLog("ExecLoader: service interpreter map failed\n");
+        }
+    }
+    const self_slot = getProcessSlot();
+    if (!installEndpoint(exec_loader_bootstrap_abi.service_endpoint_id, self_slot)) {
+        userLog("ExecLoader: service endpoint failed\n");
+        processExit(1);
+    }
+    userLog("ExecLoader: service ready\n");
+    while (true) {
+        const received = waitEvent(true, 1);
+        if (received >= page_bytes) {
+            const request_paddr = acceptCapTransfer(received);
+            if (request_paddr >= page_bytes) handleServiceRequest(request_paddr);
+            continue;
+        }
+        const seq = pendingMappedServiceRequestSeq();
+        if (seq != 0 and seq != service_last_request_seq) {
+            handleServiceRequest(service_request_paddr);
+        }
+    }
+}
+
 pub export fn _start() noreturn {
-    if (exec_loader_profile_enabled) userLog("ExecLoader: started\n");
-    profileEvent("entry begin");
+    ensureExecLoaderStack();
     const cfg: *const exec_loader_bootstrap_abi.Config = @ptrFromInt(exec_loader_bootstrap_abi.target_va);
+    profileBegin(cfg);
+    if (false) userLog("ExecLoader: started\n");
+    profileEvent("entry begin");
     if (cfg.magic != exec_loader_bootstrap_abi.magic or cfg.version != exec_loader_bootstrap_abi.version) {
         userLog("ExecLoader: missing bootstrap config\n");
+    } else if ((cfg.flags & exec_loader_bootstrap_abi.flag_service_mode) != 0) {
+        runExecLoaderService(cfg);
     } else if (image_abi.decodeVmObjectToken(cfg.executable_vm_token) == null or cfg.executable_file_bytes == 0) {
         userLog("ExecLoader: invalid executable token\n");
-    } else if (launchExec(cfg, cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes)) |child_process_slot| {
-        if (exec_loader_profile_enabled) userLog("ExecLoader: child started\n");
+    } else if (launchExec(cfg, cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes, true)) |child_process_slot| {
+        if (false) userLog("ExecLoader: child started\n");
         while (true) {
             const status = getProcessStatusRaw(child_process_slot);
             switch (process_abi.decodeProcessStatusKind(status)) {

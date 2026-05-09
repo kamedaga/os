@@ -346,7 +346,7 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
     char *const next_argv[] = { "/cmd/musl_smoke.elf", "execve-child", 0 };
-    char *const next_envp[] = { "PATH=/bin:/cmd", "CAPABILITYOS=1", "EXECVE_STAGE=1", 0 };
+    char *const next_envp[] = { "PATH=/bin:/usr/bin:/usr/lib/uutils:/cmd", "CAPABILITYOS=1", "EXECVE_STAGE=1", 0 };
     execve("/cmd/musl_smoke.elf", next_argv, next_envp);
     if (write_all("musl_smoke: execve failed\n") != 0) return 13;
     return 14;

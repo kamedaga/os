@@ -347,7 +347,23 @@ pub const CapMailbox = struct {
     }
 };
 
-pub const max_image_backing_pages: usize = 512;
+pub const max_image_backing_pages: usize = 4096;
+pub const max_image_backing_store_pages: usize = 65536;
+
+var image_backing_page_store: [max_image_backing_store_pages]u64 = [_]u64{0} ** max_image_backing_store_pages;
+var image_backing_page_store_next: usize = 0;
+
+fn allocImageBackingPageStore(page_paddrs: []const u64) ?u32 {
+    if (page_paddrs.len == 0 or page_paddrs.len > max_image_backing_pages) return null;
+    if (image_backing_page_store_next + page_paddrs.len > image_backing_page_store.len) return null;
+    const start = image_backing_page_store_next;
+    for (page_paddrs, 0..) |paddr, i| {
+        if ((paddr & 0xFFF) != 0) return null;
+        image_backing_page_store[start + i] = paddr;
+    }
+    image_backing_page_store_next += page_paddrs.len;
+    return @intCast(start);
+}
 
 pub const VmObjectRights = packed struct(u32) {
     read: bool = false,
@@ -366,9 +382,8 @@ pub const ExecImageRights = packed struct(u32) {
 pub const ImageBacking = struct {
     page_offset_bytes: u16 = 0,
     page_count: u16 = 0,
-    _reserved0: u32 = 0,
+    page_store_start: u32 = 0,
     size_bytes: u64 = 0,
-    page_paddrs: [max_image_backing_pages]u64 = [_]u64{0} ** max_image_backing_pages,
 
     fn init(page_paddrs: []const u64, page_offset_bytes: u16, size_bytes: u64) ?ImageBacking {
         if (page_paddrs.len == 0 or page_paddrs.len > max_image_backing_pages) return null;
@@ -377,16 +392,22 @@ pub const ImageBacking = struct {
         const total_capacity = first_page_bytes + (@as(u64, @intCast(page_paddrs.len - 1)) * 4096);
         if (total_capacity < size_bytes) return null;
 
-        var backing = ImageBacking{
+        const page_store_start = allocImageBackingPageStore(page_paddrs) orelse return null;
+        return ImageBacking{
             .page_offset_bytes = page_offset_bytes,
             .page_count = @intCast(page_paddrs.len),
+            .page_store_start = page_store_start,
             .size_bytes = size_bytes,
         };
-        for (page_paddrs, 0..) |paddr, i| {
-            if ((paddr & 0xFFF) != 0) return null;
-            backing.page_paddrs[i] = paddr;
-        }
-        return backing;
+    }
+
+    pub fn pagePaddr(self: *const ImageBacking, page_index: usize) ?u64 {
+        if (page_index >= self.page_count) return null;
+        const store_index = @as(usize, self.page_store_start) + page_index;
+        if (store_index >= image_backing_page_store.len) return null;
+        const paddr = image_backing_page_store[store_index];
+        if ((paddr & 0xFFF) != 0) return null;
+        return paddr;
     }
 
     fn slice(self: *const ImageBacking, offset_bytes: u64, size_bytes: u64) ?ImageBacking {
@@ -405,12 +426,12 @@ pub const ImageBacking = struct {
         const page_count = 1 + extra_pages;
         if (start_page_index + page_count > self.page_count) return null;
 
-        var page_paddrs: [max_image_backing_pages]u64 = [_]u64{0} ** max_image_backing_pages;
-        var i: usize = 0;
-        while (i < page_count) : (i += 1) {
-            page_paddrs[i] = self.page_paddrs[start_page_index + i];
-        }
-        return ImageBacking.init(page_paddrs[0..page_count], start_page_offset, size_bytes);
+        return .{
+            .page_offset_bytes = start_page_offset,
+            .page_count = @intCast(page_count),
+            .page_store_start = self.page_store_start + @as(u32, @intCast(start_page_index)),
+            .size_bytes = size_bytes,
+        };
     }
 };
 
@@ -1613,7 +1634,6 @@ pub const KernelState = struct {
         paddr: u64,
         free_list: *FreePageList,
     ) KernelError!void {
-        try self.requireActiveProcess(owner);
         if (!free_list.canAppendPage(0, paddr)) return KernelError.TooManyFreeRanges;
         const table = self.getTable(owner);
         const cap = table.find(paddr) orelse return KernelError.CapabilityNotFound;

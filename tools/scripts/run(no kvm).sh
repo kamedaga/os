@@ -30,7 +30,7 @@ cp /usr/share/OVMF/OVMF_VARS_4M.fd "$OVMF_VARS"
 
 qemu-system-x86_64 \
   -machine q35 \
-  -m 512M \
+  -m 2G \
   -monitor none \
   -d int,guest_errors,cpu_reset \
   -D "$QEMU_LOG" \

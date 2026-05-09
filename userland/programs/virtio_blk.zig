@@ -684,7 +684,7 @@ fn authorizeBlkRequest(request_type: u32, write: bool) bool {
     };
     if (commandAuthorize(boot_state.command_token, device, command) != syscall_ok) return false;
     if (request_type != request_type_flush) {
-        const data_op: queue_abi.IommuOperation = if (write) .map_write else .map_read;
+        const data_op: queue_abi.IommuOperation = if (write) .map_read else .map_write;
         if (iommuAuthorize(boot_state.iommu_token, device, data_op) != syscall_ok) return false;
     }
     return iommuAuthorize(boot_state.iommu_token, device, .map_status) == syscall_ok;
@@ -1050,22 +1050,26 @@ fn handleReadBlocksBulk(session: *Session, request_seq: u64) void {
 fn handleWriteBlocks(session: *Session, request_seq: u64) void {
     const request = requestHeader(session);
     const rights = resolveSession(session, request) orelse {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks no session\n");
         replyStatus(session, .write_blocks, request_seq, .not_found);
         return;
     };
     if (!rights.write) {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks no right\n");
         replyStatus(session, .write_blocks, request_seq, .no_right);
         return;
     }
     const byte_count = @as(u64, request.block_count) * boot_state.logical_block_size;
     const end_block = request.block_index + request.block_count;
     if (request.block_count == 0 or request.inline_bytes != byte_count or byte_count > 4096 or end_block > boot_state.capacity_blocks) {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks too big\n");
         replyStatus(session, .write_blocks, request_seq, .too_big);
         return;
     }
     const data = @as([*]u8, @ptrCast(@volatileCast(requestDataPtr())));
     copyVolatileToPlain(requestPayload(session), data[0..@intCast(byte_count)]);
     if (!executeBlockRequest(request_type_out, request.block_index, request.block_count, true)) {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks io error\n");
         replyStatus(session, .write_blocks, request_seq, .io_error);
         return;
     }
@@ -1086,10 +1090,12 @@ fn handleWriteBlocks(session: *Session, request_seq: u64) void {
 fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
     const request = requestHeader(session);
     const rights = resolveSession(session, request) orelse {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk no session\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .not_found);
         return;
     };
     if (!rights.write) {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk no right\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .no_right);
         return;
     }
@@ -1104,6 +1110,7 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
         end_block > boot_state.capacity_blocks or
         request.inline_bytes != page_count * @sizeOf(u64))
     {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk too big\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .too_big);
         return;
     }
@@ -1118,6 +1125,7 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
             raw |= @as(u64, payload[page_index * @sizeOf(u64) + byte_index]) << @intCast(byte_index * 8);
         }
         if (raw < 0x1000) {
+            _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk bad paddr\n");
             replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
             return;
         }
@@ -1125,6 +1133,7 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
     }
 
     if (!ensureBulkMappings(session, paddrs[0..page_count])) {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk map failed\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
         return;
     }
@@ -1133,6 +1142,7 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
     const data = @as([*]u8, @ptrCast(@volatileCast(requestDataPtr())));
     copyVolatileToPlain(src, data[0..@intCast(byte_count)]);
     if (!executeBlockRequest(request_type_out, request.block_index, request.block_count, true)) {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk io error\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .io_error);
         return;
     }

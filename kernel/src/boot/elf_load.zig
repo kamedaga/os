@@ -123,8 +123,7 @@ fn readImageBackingAt(context: *anyopaque, offset: u64, out: []u8) elf_loader.St
         const page_index: usize = @intCast(absolute / 4096);
         if (page_index >= ctx.backing.page_count) return error.SourceOutOfRange;
         const page_offset: usize = @intCast(absolute % 4096);
-        const page_paddr = ctx.backing.page_paddrs[page_index];
-        if ((page_paddr & 0xFFF) != 0) return error.SourceOutOfRange;
+        const page_paddr = ctx.backing.pagePaddr(page_index) orelse return error.SourceOutOfRange;
         const page: [*]const u8 = @ptrFromInt(page_paddr);
         const available = 4096 - page_offset;
         const remaining = out.len - copied;
@@ -380,8 +379,7 @@ pub fn copyImageBackingBytes(backing: kernel.ImageBacking, dest: []u8) bool {
     var page_index: usize = 0;
     var page_offset: usize = backing.page_offset_bytes;
     while (copied < backing.size_bytes and page_index < backing.page_count) : (page_index += 1) {
-        const page_paddr = backing.page_paddrs[page_index];
-        if ((page_paddr & 0xFFF) != 0) return false;
+        const page_paddr = backing.pagePaddr(page_index) orelse return false;
         const page: [*]const u8 = @ptrFromInt(page_paddr);
         const page_available = 4096 - page_offset;
         const remaining = @as(usize, @intCast(backing.size_bytes)) - copied;

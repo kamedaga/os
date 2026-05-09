@@ -21,6 +21,8 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
     dst->pipe_id = src->pipe_id;
     dst->socket_connected = src->socket_connected;
     dst->socket_type = src->socket_type;
+    dst->socket_connecting = src->socket_connecting;
+    dst->socket_reserved0 = src->socket_reserved0;
     dst->path_len = src->path_len;
     dst->socket_local_port = src->socket_local_port;
     dst->socket_remote_port = src->socket_remote_port;
@@ -29,7 +31,7 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
     for (u16 i = 0; i <= src->path_len && i <= FS_MAX_PATH_BYTES; i++) dst->path[i] = src->path[i];
 }
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
-    proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->principal = principal; init_process_fds(proc);
+    proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->pgid = principal; proc->principal = principal; init_process_fds(proc);
     proc->exec_pending_principal = 0;
     proc->mmap_next_va = 0x31000000ULL;
     proc->brk_next_va = 0x38000000ULL;
@@ -40,6 +42,10 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->wait_pid = 0;
     proc->wait_status_va = 0;
     proc->clear_child_tid = 0;
+    proc->profile_enabled = 0;
+    proc->sigaltstack_sp = 0;
+    proc->sigaltstack_size = 0;
+    proc->sigaltstack_flags = SS_DISABLE;
     for (u64 i = 0; i < 65; i++) {
         proc->sig_handler[i] = 0;
         proc->sig_flags[i] = 0;
@@ -85,7 +91,8 @@ static struct linux_process_state *process_state_for(u64 principal) {
     return 0;
 }
 static int alloc_pipe_slot(void) { for (u64 i = 0; i < PIPE_MAX; i++) if (!g_pipes[i].used) return (int)i; return -1; }
-static int fd_is_pipe(u64 fd) { return g_proc != 0 && fd < 32 && (g_fds[fd].kind == FD_PIPE_READ || g_fds[fd].kind == FD_PIPE_WRITE); }
+static int fd_entry_is_pipe(const struct fd_entry *entry) { return entry != 0 && (entry->kind == FD_PIPE_READ || entry->kind == FD_PIPE_WRITE); }
+static int fd_is_pipe(u64 fd) { return g_proc != 0 && fd < 32 && fd_entry_is_pipe(&g_fds[fd]); }
 
 static void pipe_ref_fd(const struct fd_entry *fd) {
     if (fd->pipe_id >= PIPE_MAX || !g_pipes[fd->pipe_id].used) return;
@@ -110,14 +117,18 @@ static void flush_deferred_pipe_wakes(void) {
     }
 }
 
-static void close_pipe_fd(u64 fd) {
-    if (!fd_is_pipe(fd)) return;
-    const u8 pipe_id = g_fds[fd].pipe_id;
+static void close_pipe_entry(struct fd_entry *entry) {
+    if (!fd_entry_is_pipe(entry)) return;
+    const u8 pipe_id = entry->pipe_id;
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return;
-    if (g_fds[fd].kind == FD_PIPE_READ && g_pipes[pipe_id].read_refs != 0) g_pipes[pipe_id].read_refs--;
-    if (g_fds[fd].kind == FD_PIPE_WRITE && g_pipes[pipe_id].write_refs != 0) g_pipes[pipe_id].write_refs--;
+    if (entry->kind == FD_PIPE_READ && g_pipes[pipe_id].read_refs != 0) g_pipes[pipe_id].read_refs--;
+    if (entry->kind == FD_PIPE_WRITE && g_pipes[pipe_id].write_refs != 0) g_pipes[pipe_id].write_refs--;
     defer_pipe_wake(pipe_id);
     if (g_pipes[pipe_id].read_refs == 0 && g_pipes[pipe_id].write_refs == 0) g_pipes[pipe_id].used = 0;
+}
+static void close_pipe_fd(u64 fd) {
+    if (!fd_is_pipe(fd)) return;
+    close_pipe_entry(&g_fds[fd]);
 }
 
 static void try_satisfy_pending_pipe_read(u8 pipe_id) {
@@ -230,6 +241,12 @@ static struct linux_process_state *process_state_for_pid(u64 pid) {
     return 0;
 }
 
+static struct linux_process_state *process_state_for_tid(u64 tid) {
+    if (tid == 0) return 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) if (g_processes[i].used && g_processes[i].tid == tid) return &g_processes[i];
+    return 0;
+}
+
 static void record_process_exit(u64 pid, u32 status) {
     if (pid == 0) return;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
@@ -255,4 +272,16 @@ static int take_process_exit_record(u64 pid, u32 *status_out) {
         return 1;
     }
     return 0;
+}
+
+static void discard_process_exit_records(u64 pid) {
+    u32 ignored = 0;
+    while (take_process_exit_record(pid, &ignored)) {}
+}
+
+static void remove_child_slot(struct linux_process_state *proc, u64 child_slot) {
+    if (!proc) return;
+    for (u64 i = 0; i < LINUX_CHILD_MAX; i++) {
+        if (proc->child_used[i] && proc->child_slot[i] == child_slot) proc->child_used[i] = 0;
+    }
 }

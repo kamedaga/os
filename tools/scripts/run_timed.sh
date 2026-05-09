@@ -52,7 +52,7 @@ qemu-system-x86_64 \
   -enable-kvm \
   -cpu host \
   -machine q35 \
-  -m 512M \
+  -m 2G \
   -monitor none \
   -d int,guest_errors,cpu_reset \
   -D "$QEMU_LOG" \

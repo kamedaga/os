@@ -99,10 +99,24 @@ const syscall_err_empty: u64 = 13;
 const syscall_alloc_map_drop_cap_flag: u64 = 0x2;
 const ipc_call_flag_retain_sender: u64 = 0x1;
 const ipc_call_flag_signal_only: u64 = 0x2;
+const wait_event_flag_mailbox: u64 = 0x1;
+const wait_event_flag_ipc_signal_only: u64 = 0x2;
 var sys_alloc_page_failure_log_count: u64 = 0;
 const sys_alloc_page_failure_log_limit: u64 = 64;
 var lstar_no_delegate_log_count: u64 = 0;
 const lstar_no_delegate_log_limit: u64 = 32;
+const kernel_exec_profile_slots_max: usize = 96;
+const kernel_exec_profile_lstar_delegate: u64 = 0xFFFF_FF00;
+var kernel_exec_profile_active: bool = false;
+var kernel_exec_profile_slots: [kernel_exec_profile_slots_max]KernelExecProfileSlot = [_]KernelExecProfileSlot{.{}} ** kernel_exec_profile_slots_max;
+
+const KernelExecProfileSlot = struct {
+    nr: u64 = 0,
+    detail: u64 = 0,
+    count: u64 = 0,
+    cycles: u64 = 0,
+    max_cycles: u64 = 0,
+};
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -231,6 +245,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(sys_alloc_page_failure_log_count), &sys_alloc_page_failure_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lstar_no_delegate_log_count), &lstar_no_delegate_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_exec_profile_active), &kernel_exec_profile_active));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_exec_profile_slots), &kernel_exec_profile_slots));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_storage), &syscall_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled), &syscall_return_writeback_enabled));
@@ -341,6 +357,117 @@ fn hasExplicitUserLogLabel(message: []const u8) bool {
     return close_index + 1 == message.len or message[close_index + 1] == ' ';
 }
 
+fn readTsc() u64 {
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | @as(u64, lo);
+}
+
+fn kernelExecProfileName(nr: u64) ?[]const u8 {
+    return switch (nr) {
+        kernel_exec_profile_lstar_delegate => "lstar_delegate",
+        syscall_ipc_call_reply_recv => "ipc_call_reply_recv",
+        syscall_signal_endpoint => "signal_endpoint",
+        syscall_wait_event => "wait_event",
+        syscall_alloc_map_pages => "alloc_map_pages",
+        syscall_map_page => "map_page",
+        syscall_map_pages_batch => "map_pages_batch",
+        syscall_set_abi_trap_delegate => "set_abi_trap_delegate",
+        syscall_map_abi_trap_reply_target_pages => "abi_map_reply_target_pages",
+        syscall_copy_from_abi_trap_reply_target => "abi_copy_from_reply_target",
+        syscall_copy_to_abi_trap_reply_target => "abi_copy_to_reply_target",
+        syscall_set_abi_trap_reply_target_fs_base => "abi_set_reply_fs_base",
+        syscall_protect_abi_trap_reply_target_pages => "abi_protect_reply_target_pages",
+        syscall_unmap_abi_trap_reply_target_pages => "abi_unmap_reply_target_pages",
+        syscall_reclaim_abi_trap_reply_target_private_pages => "abi_reclaim_reply_target_pages",
+        syscall_reply_abi_trap_target => "abi_reply_target",
+        syscall_copy_to_abi_trap_target => "abi_copy_to_target",
+        syscall_start_abi_trap_target => "abi_start_target",
+        syscall_set_abi_trap_target_request_page => "abi_set_target_request_page",
+        syscall_share_abi_trap_reply_target_pages_to_target => "abi_share_reply_pages_to_target",
+        syscall_unmap_abi_trap_target_pages => "abi_unmap_target_pages",
+        image_abi.syscall_install_vm_object => "install_vm_object",
+        image_abi.syscall_map_vm_object => "map_vm_object",
+        image_abi.syscall_install_exec_image => "install_exec_image",
+        process_abi.syscall_spawn_exec => "spawn_exec",
+        process_builder_abi.syscall_create_suspended_process => "pb_create_suspended",
+        process_builder_abi.syscall_map_vm_object_to_process => "pb_map_vm_object",
+        process_builder_abi.syscall_alloc_map_pages_to_process => "pb_alloc_map_pages",
+        process_builder_abi.syscall_set_process_initial_context => "pb_set_initial_context",
+        process_builder_abi.syscall_start_process => "pb_start_process",
+        process_builder_abi.syscall_copy_to_process => "pb_copy_to_process",
+        process_builder_abi.syscall_mprotect_self => "pb_mprotect_self",
+        process_builder_abi.syscall_set_process_abi_trap_delegate => "pb_set_abi_delegate",
+        process_builder_abi.syscall_fork_abi_trap_reply_target => "pb_fork_reply_target",
+        process_builder_abi.syscall_clone_abi_trap_reply_target => "pb_clone_reply_target",
+        else => null,
+    };
+}
+
+fn kernelExecProfileReset() void {
+    kernel_exec_profile_active = true;
+    for (&kernel_exec_profile_slots) |*slot| slot.* = .{};
+}
+
+fn kernelExecProfileRecord(nr: u64, cycles: u64) void {
+    kernelExecProfileRecordDetail(nr, 0, cycles);
+}
+
+fn kernelExecProfileRecordDetail(nr: u64, detail: u64, cycles: u64) void {
+    if (!kernel_exec_profile_active) return;
+    if (kernelExecProfileName(nr) == null) return;
+    var free_slot: ?*KernelExecProfileSlot = null;
+    for (&kernel_exec_profile_slots) |*slot| {
+        if (slot.count != 0 and slot.nr == nr and slot.detail == detail) {
+            slot.count +%= 1;
+            slot.cycles +%= cycles;
+            if (cycles > slot.max_cycles) slot.max_cycles = cycles;
+            return;
+        }
+        if (slot.count == 0 and free_slot == null) free_slot = slot;
+    }
+    if (free_slot) |slot| {
+        slot.* = .{ .nr = nr, .detail = detail, .count = 1, .cycles = cycles, .max_cycles = cycles };
+    }
+}
+
+fn kernelExecProfileReport(h: *const Hooks) void {
+    if (!kernel_exec_profile_active) return;
+    h.write("KernelExecProfile.begin\n");
+    for (kernel_exec_profile_slots) |slot| {
+        if (slot.count == 0) continue;
+        const name = kernelExecProfileName(slot.nr) orelse continue;
+        h.write("KernelExecProfile.item ");
+        h.write(name);
+        if (slot.detail != 0) {
+            h.write(" detail=");
+            h.print_hex(slot.detail);
+        }
+        h.write(" count=");
+        h.print_number(slot.count);
+        h.write(" cycles=");
+        h.print_number(slot.cycles);
+        h.write(" max=");
+        h.print_number(slot.max_cycles);
+        h.write("\n");
+    }
+    h.write("KernelExecProfile.end\n");
+    kernel_exec_profile_active = false;
+}
+
+fn kernelExecProfileObserveUserLog(h: *const Hooks, msg: []const u8) void {
+    if (std.mem.startsWith(u8, msg, "LinuxAbiServer.exec_profile.begin")) {
+        kernelExecProfileReset();
+        h.write("KernelExecProfile.armed\n");
+    } else if (std.mem.startsWith(u8, msg, "LinuxAbiServer.perf.end")) {
+        kernelExecProfileReport(h);
+    }
+}
+
 fn writeThreadUserLogPrefix(h: *const Hooks, thread_index: usize) void {
     h.write("[Thread ");
     h.print_number(@intCast(thread_index));
@@ -357,8 +484,14 @@ fn parseExecImageRights(bits: u64) kernel.ExecImageRights {
     return @bitCast(abi_rights);
 }
 
-fn collectMappedPagesForRange(
-    state: *kernel.KernelState,
+fn releaseCopiedVmObjectPages(free_list: *kernel.FreePageList, pages: []const u64) void {
+    for (pages) |paddr| {
+        free_list.appendPage(0, paddr) catch {};
+    }
+}
+
+fn copyUserRangeIntoVmObjectPages(
+    h: *const Hooks,
     proc: kernel.PrincipalId,
     base_va: u64,
     size_bytes: u64,
@@ -368,7 +501,6 @@ fn collectMappedPagesForRange(
     page_offset_bytes: u16,
 } {
     if (size_bytes == 0) return null;
-    const page_base = base_va & ~@as(u64, 0xFFF);
     const page_offset_bytes: u16 = @intCast(base_va & 0xFFF);
     const span_bytes = (@as(u64, page_offset_bytes) + size_bytes + 4095) & ~@as(u64, 4095);
     const page_count_u64 = span_bytes / 4096;
@@ -377,11 +509,30 @@ fn collectMappedPagesForRange(
 
     var i: usize = 0;
     while (i < page_count) : (i += 1) {
-        const page_va = page_base + (@as(u64, @intCast(i)) * 4096);
-        const page_paddr = capability.lookupUserMappedPaddrForVa(proc, page_va) orelse return null;
-        const page_cap = state.getTableConst(proc).find(page_paddr) orelse return null;
-        if (!page_cap.rights.cpu_read) return null;
-        out_pages[i] = page_paddr;
+        const cap = h.state.allocPage(proc, h.free_list) catch {
+            releaseCopiedVmObjectPages(h.free_list, out_pages[0..i]);
+            return null;
+        };
+        const page: [*]u8 = @ptrFromInt(cap.paddr);
+        @memset(page[0..4096], 0);
+        out_pages[i] = cap.paddr;
+    }
+
+    var copied: u64 = 0;
+    while (copied < size_bytes) {
+        const absolute = @as(u64, page_offset_bytes) + copied;
+        const page_index: usize = @intCast(absolute / 4096);
+        const page_off: usize = @intCast(absolute & 0xFFF);
+        const page_remaining: u64 = 4096 - @as(u64, @intCast(page_off));
+        const remaining = size_bytes - copied;
+        const chunk_u64 = if (remaining < page_remaining) remaining else page_remaining;
+        const chunk_len: usize = @intCast(chunk_u64);
+        const dst: [*]u8 = @ptrFromInt(out_pages[page_index] + @as(u64, @intCast(page_off)));
+        if (!h.copy_user_bytes_from_va(proc, base_va + copied, dst[0..chunk_len])) {
+            releaseCopiedVmObjectPages(h.free_list, out_pages[0..page_count]);
+            return null;
+        }
+        copied += chunk_u64;
     }
 
     return .{
@@ -497,7 +648,8 @@ fn dispatchIpcSyscall(
             break :blk signalEndpointMessage(state, proc, frame.rdi, false, 0, 0, 0, 0);
         },
         syscall_wait_event => blk: {
-            const wait_mailbox = (frame.rdi & 0x1) != 0;
+            const wait_mailbox = (frame.rdi & wait_event_flag_mailbox) != 0;
+            const ipc_signal_only = (frame.rdi & wait_event_flag_ipc_signal_only) != 0;
             const timeout_ticks = frame.rsi;
             kernel_state_lock.lock();
             if (wait_mailbox) {
@@ -513,7 +665,11 @@ fn dispatchIpcSyscall(
                     break :blk received;
                 }
             }
-            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+            if (ipc_signal_only and scheduler.discardOneReplylessSignalForPrincipal(proc)) {
+                kernel_state_lock.unlock();
+                break :blk syscall_ok;
+            }
+            if (!ipc_signal_only and consumeQueuedIpcMessageForPrincipal(proc, frame)) {
                 kernel_state_lock.unlock();
                 break :blk syscall_ok;
             }
@@ -522,7 +678,11 @@ fn dispatchIpcSyscall(
                 break :blk syscall_ok;
             }
             kernel_state_lock.unlock();
-            if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
+            const blocked = if (ipc_signal_only)
+                scheduler.blockCurrentThreadForIpcSignal(frame, timeout_ticks, syscall_ok)
+            else
+                h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok);
+            if (!blocked) {
                 break :blk syscall_err_not_ready;
             }
             break :blk syscall_ok;
@@ -1000,19 +1160,43 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     const abi_delegate = state.abiTrapDelegateFor(proc);
     const has_abi_delegate = abi_delegate != null;
     if (entry_is_lstar or has_abi_delegate) {
+        const delegate_profile_start = if (kernel_exec_profile_active) readTsc() else 0;
         if (abi_delegate) |delegate| {
             if (abi_trap_runtime.dispatchKnownDelegate(state, proc, delegate, frame)) |result| {
+                if (kernel_exec_profile_active) kernelExecProfileRecord(kernel_exec_profile_lstar_delegate, readTsc() - delegate_profile_start);
                 return result;
             }
         } else if (abi_trap_runtime.dispatchDelegate(state, proc, frame)) |result| {
+            if (kernel_exec_profile_active) kernelExecProfileRecord(kernel_exec_profile_lstar_delegate, readTsc() - delegate_profile_start);
             return result;
         }
     }
-    if (dispatchIpcSyscall(h, state, proc, frame)) |result| return result;
+    const ipc_profile_start = if (kernel_exec_profile_active) readTsc() else 0;
+    if (dispatchIpcSyscall(h, state, proc, frame)) |result| {
+        if (kernel_exec_profile_active) {
+            const cycles = readTsc() - ipc_profile_start;
+            kernelExecProfileRecord(frame.rax, cycles);
+            if (frame.rax == syscall_signal_endpoint) {
+                kernelExecProfileRecordDetail(frame.rax, frame.rdi, cycles);
+            }
+        }
+        return result;
+    }
     const hold_kernel_state_lock = syscallNeedsKernelStateLock(frame.rax);
+    const syscall_profile_active = kernel_exec_profile_active;
+    const syscall_profile_start = if (syscall_profile_active) readTsc() else 0;
     if (hold_kernel_state_lock) kernel_state_lock.lock();
     defer {
         if (hold_kernel_state_lock) kernel_state_lock.unlock();
+    }
+    defer {
+        if (syscall_profile_active) {
+            const cycles = readTsc() - syscall_profile_start;
+            kernelExecProfileRecord(frame.rax, cycles);
+            if (frame.rax == syscall_signal_endpoint) {
+                kernelExecProfileRecordDetail(frame.rax, frame.rdi, cycles);
+            }
+        }
     }
     if (h.scheduler_log_int80 and scheduler.scheduler_int80_log_count < h.scheduler_int80_log_max_lines) {
         h.write("INT80 dispatch ");
@@ -1482,14 +1666,17 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;
-            const collected = collectMappedPagesForRange(state, proc, frame.rdi, frame.rsi, &page_paddrs) orelse return syscall_err_invalid;
+            const collected = copyUserRangeIntoVmObjectPages(h, proc, frame.rdi, frame.rsi, &page_paddrs) orelse return syscall_err_invalid;
             const cap_id = state.installVmObjectCap(
                 proc,
                 page_paddrs[0..collected.page_count],
                 collected.page_offset_bytes,
                 frame.rsi,
                 parseVmObjectRights(frame.rdx),
-            ) catch return syscall_err_grant;
+            ) catch {
+                releaseCopiedVmObjectPages(h.free_list, page_paddrs[0..collected.page_count]);
+                return syscall_err_grant;
+            };
             return image_abi.encodeVmObjectToken(cap_id);
         },
         image_abi.syscall_install_vm_object_mmio_range => {
@@ -1571,11 +1758,11 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             var i: usize = 0;
             while (i < vm_cap.backing.page_count) {
                 const run_start = i;
-                const run_paddr = vm_cap.backing.page_paddrs[run_start];
+                const run_paddr = vm_cap.backing.pagePaddr(run_start) orelse return syscall_err_invalid;
                 var run_len: usize = 1;
                 while (run_start + run_len < vm_cap.backing.page_count) : (run_len += 1) {
                     const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
-                    if (vm_cap.backing.page_paddrs[run_start + run_len] != expected) break;
+                    if ((vm_cap.backing.pagePaddr(run_start + run_len) orelse break) != expected) break;
                 }
                 if (!user_vm.mapUserLinearRegion(
                     proc,
@@ -1629,7 +1816,8 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             }
         },
         syscall_wait_event => {
-            const wait_mailbox = (frame.rdi & 0x1) != 0;
+            const wait_mailbox = (frame.rdi & wait_event_flag_mailbox) != 0;
+            const ipc_signal_only = (frame.rdi & wait_event_flag_ipc_signal_only) != 0;
             const timeout_ticks = frame.rsi;
             if (wait_mailbox) {
                 const received = state.recvCap(proc) catch |err| switch (err) {
@@ -1640,13 +1828,20 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                     return received;
                 }
             }
-            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+            if (ipc_signal_only and scheduler.discardOneReplylessSignalForPrincipal(proc)) {
+                return syscall_ok;
+            }
+            if (!ipc_signal_only and consumeQueuedIpcMessageForPrincipal(proc, frame)) {
                 return syscall_ok;
             }
             if (h.consume_pending_signal_for_principal(proc)) {
                 return syscall_ok;
             }
-            if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
+            const blocked = if (ipc_signal_only)
+                scheduler.blockCurrentThreadForIpcSignal(frame, timeout_ticks, syscall_ok)
+            else
+                h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok);
+            if (!blocked) {
                 return syscall_err_not_ready;
             }
             return syscall_ok;
@@ -1740,6 +1935,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             var buf: [user_log_max_bytes]u8 = undefined;
             const msg = buf[0..req_len];
             if (!h.copy_user_bytes_from_va(proc, frame.rdi, msg)) return syscall_err_invalid;
+            kernelExecProfileObserveUserLog(h, msg);
             if (!hasExplicitUserLogLabel(msg)) {
                 writeThreadUserLogPrefix(h, scheduler.currentThreadIndex());
             }

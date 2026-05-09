@@ -45,7 +45,7 @@ enum {
     FAT_STARTUP_MANIFEST_OPEN_OBJECT_ID = 8,
     FAT_DYNAMIC_OBJECT_ID_BASE = 0x100,
     FAT_DYNAMIC_OPEN_OBJECT_ID_BASE = 0x100000,
-    FAT_MAX_DYNAMIC_OBJECTS = 64,
+    FAT_MAX_DYNAMIC_OBJECTS = 128,
     FAT_ATTR_DIRECTORY = 0x10,
     FAT_ATTR_LONG_NAME = 0x0F,
     FAT_DIR_MODE = 0x4000,
@@ -616,7 +616,7 @@ static int signal_block_endpoint(void) {
 
 static int wait_block_response(u64 expected_seq, u16 expected_op) {
     volatile struct block_response_header *response = (volatile struct block_response_header *)FAT_BLOCK_RESPONSE_VA;
-    for (u64 i = 0; i < 512; i++) {
+    for (u64 i = 0; i < 8192; i++) {
         if (response->response_seq == expected_seq) {
             return response->magic == BLOCK_RESPONSE_MAGIC &&
                 response->version == BLOCK_PROTOCOL_VERSION &&
@@ -1629,7 +1629,10 @@ static int create_file_dirent(
     const u8 short_name[11],
     struct fat_dir_entry_view *view_out
 ) {
-    if (!read_volume_sector(loc->sector, g_sector_scratch)) return 0;
+    if (!read_volume_sector(loc->sector, g_sector_scratch)) {
+        user_log("[fat_server] FatServer: create dirent read failed\n");
+        return 0;
+    }
     u8 *entry = &g_sector_scratch[loc->offset];
     for (u8 i = 0; i < 32; i++) entry[i] = 0;
     for (u8 i = 0; i < 11; i++) entry[i] = short_name[i];
@@ -1637,7 +1640,10 @@ static int create_file_dirent(
     store_le16(&entry[20], 0);
     store_le16(&entry[26], 0);
     store_le32(&entry[28], 0);
-    if (!write_volume_sector(loc->sector, g_sector_scratch)) return 0;
+    if (!write_volume_sector(loc->sector, g_sector_scratch)) {
+        user_log("[fat_server] FatServer: create dirent write failed\n");
+        return 0;
+    }
     if (view_out) fill_dir_entry_view(entry, (const u8 *)0, 0, view_out);
     return 1;
 }
@@ -1740,7 +1746,12 @@ static int fat_create_path(const char *full_path, u32 flags, u64 *object_id_out,
     struct fat_dir_entry_location free_loc;
     if (!find_free_dirent_location(parent_cluster, &free_loc)) return FS_STATUS_BUSY;
     struct fat_dir_entry_view created;
-    if (!create_file_dirent(&free_loc, short_name, &created)) return FS_STATUS_IO_ERROR;
+    if (!create_file_dirent(&free_loc, short_name, &created)) {
+        user_log("[fat_server] FatServer: create failed path=");
+        user_log(full_path);
+        user_log("\n");
+        return FS_STATUS_IO_ERROR;
+    }
     const u16 full_len = (u16)cstr_len(full_path);
     const u64 object_id = intern_dynamic_object(full_path, full_len, &created);
     if (object_id == 0) return FS_STATUS_BUSY;

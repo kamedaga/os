@@ -35,8 +35,27 @@ fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
 }
 
+fn staticStorageStart(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr);
+}
+
 fn maxStaticEnd(a: usize, b: usize) usize {
     return if (a > b) a else b;
+}
+
+fn minStaticStart(a: usize, b: usize) usize {
+    return if (a < b) a else b;
+}
+
+pub fn kernelStaticStorageStartAddr() usize {
+    var start = staticStorageStart(@TypeOf(boot_services_cache), &boot_services_cache);
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_image_base_paddr_ref), &kernel_image_base_paddr_ref));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_image_size_bytes_ref), &kernel_image_size_bytes_ref));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(uefi_mmap_buffer), &uefi_mmap_buffer));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(uefi_exitbs_mmap_buffer), &uefi_exitbs_mmap_buffer));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(post_exit_load_scratch), &post_exit_load_scratch));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(post_exit_load_scratch_used), &post_exit_load_scratch_used));
+    return start;
 }
 
 pub fn kernelStaticStorageEndAddr() usize {

@@ -17,6 +17,7 @@ pub const Hooks = struct {
     page_user: u64,
     page_ps: u64,
     flush_user_tlb_for_principal_va: *const fn (principal: kernel.PrincipalId, va: u64) void,
+    seed_user_pdp_with_kernel_identity: *const fn ([]u64) void,
     seed_user_pd_with_kernel_identity: *const fn ([]u64) void,
 };
 
@@ -463,6 +464,7 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     const stack_pd_index: usize = @intCast((h.user_stack_page_va >> 21) & 0x1FF);
 
     space.pml4[0] = user_pdp_pa | h.page_present | h.page_rw | h.page_user;
+    h.seed_user_pdp_with_kernel_identity(space.pdp[0..]);
     space.pdp[pdp_index] = user_pd_pa | h.page_present | h.page_rw | h.page_user;
     h.seed_user_pd_with_kernel_identity(space.pd[0..]);
     const user_slot = ensureUserPtSlotForPd(space, pd_index_base) orelse return false;
@@ -496,6 +498,7 @@ pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
 
     const pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
     space.pml4[0] = user_pdp_pa | h.page_present | h.page_rw | h.page_user;
+    h.seed_user_pdp_with_kernel_identity(space.pdp[0..]);
     space.pdp[pdp_index] = user_pd_pa | h.page_present | h.page_rw | h.page_user;
     h.seed_user_pd_with_kernel_identity(space.pd[0..]);
     space.cr3 = user_pml4_pa;

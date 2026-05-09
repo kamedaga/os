@@ -19,6 +19,7 @@ pub const Hooks = struct {
     kernel_cr3_addr: usize,
     kernel_image_base_paddr: *const u64,
     kernel_image_size_bytes: *const usize,
+    kernel_static_start_addr: usize,
     kernel_static_end_addr: usize,
     reserved_low_mem_end: u64,
 };
@@ -65,16 +66,14 @@ pub fn collectMemoryStatsAndFreePages(
         kernel_vm.pageAlignUp(h.kernel_image_base_paddr.* + h.kernel_image_size_bytes.*)
     else
         fallback_kernel_start;
+    const kernel_static_start = kernel_vm.pageAlignDown(h.kernel_static_start_addr);
     const kernel_static_end = kernel_vm.pageAlignUp(h.kernel_static_end_addr);
-    const static_reserved_start = if (kernel_static_end > h.reserved_low_mem_end)
-        h.reserved_low_mem_end
-    else
-        kernel_static_end;
-    const kernel_reserved_start = @min(@min(image_start, fallback_kernel_start), static_reserved_start);
-    const kernel_reserved_end = @max(image_end, kernel_static_end);
+    const kernel_reserved_start = @min(image_start, fallback_kernel_start);
+    const kernel_reserved_end = image_end;
     const reserved = [_]ReservedRange{
         .{ .start = 0, .end = h.reserved_low_mem_end },
         .{ .start = kernel_reserved_start, .end = kernel_reserved_end },
+        .{ .start = kernel_static_start, .end = kernel_static_end },
         .{ .start = user_spaces_start, .end = user_spaces_end },
     };
 

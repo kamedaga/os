@@ -80,7 +80,7 @@ def qemu_cmd(run_dir: Path, disk: Path, run_id: int) -> list[str]:
         "-smp",
         "4",
         "-m",
-        "512M",
+        "2G",
         "-no-reboot",
         "-monitor",
         "none",
@@ -169,13 +169,14 @@ def run_one(root: Path, out_dir: Path, run_id: int, loops: int, prompt_timeout: 
                 ("pwd", 10.0, [b"/"]),
                 ("ls", 15.0, [b"bin", b"cmd", b"dev"]),
                 ("fastfetch", 30.0, [b"PachaOS", b"Shell:", b"dash", b"Terminal:", b"virtio-console"]),
+                ("apk --version", 20.0, [b"apk-tools"]),
                 ("zstd --version", 15.0, [b"Zstandard CLI"]),
                 ("cat /etc/os-release", 10.0, [b'NAME="PachaOS"']),
                 ("true", 10.0, []),
                 ("echo simple-ok", 10.0, [b"simple-ok"]),
                 ("cd bin", 10.0, []),
                 ("pwd", 10.0, [b"/bin"]),
-                ("ls", 15.0, [b"busybox", b"zstd", b"fastfetch"]),
+                ("ls", 15.0, [b"coreutils", b"zstd", b"fastfetch"]),
                 ("cd /", 10.0, []),
             ]
             for text, timeout, required in checks:
@@ -208,7 +209,10 @@ def run_one(root: Path, out_dir: Path, run_id: int, loops: int, prompt_timeout: 
     finally:
         if fd is not None:
             if old_attrs is not None:
-                termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+                try:
+                    termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+                except termios.error:
+                    pass
             os.close(fd)
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)

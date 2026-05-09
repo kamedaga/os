@@ -5,6 +5,34 @@ static u64 make_console_nonce(u64 request_paddr, u64 response_paddr, u64 endpoin
 
 static u64 g_console_read_diag_count = 0;
 
+enum {
+    TTY_ATTR_VERSION = 2,
+    TTY_IFLAG_ICRNL = 1 << 0,
+    TTY_IFLAG_INLCR = 1 << 1,
+    TTY_IFLAG_IGNCR = 1 << 2,
+    TTY_OFLAG_OPOST = 1 << 0,
+    TTY_OFLAG_ONLCR = 1 << 1,
+    TTY_LFLAG_ISIG = 1 << 0,
+    TTY_LFLAG_ICANON = 1 << 1,
+    TTY_LFLAG_ECHO = 1 << 2,
+    TTY_LFLAG_ECHOE = 1 << 3,
+    TTY_LFLAG_ECHOK = 1 << 4,
+    TTY_LFLAG_ECHONL = 1 << 5,
+    TTY_LFLAG_IEXTEN = 1 << 6,
+    TTY_CC_COUNT = 32,
+};
+
+struct tty_attr_payload {
+    u32 version;
+    u32 iflag;
+    u32 oflag;
+    u32 lflag;
+    u8 cc[TTY_CC_COUNT];
+    u16 columns;
+    u16 rows;
+    u32 reserved0;
+};
+
 static void log_console_read_diag(const char *reason, u64 detail) {
     if (g_console_read_diag_count >= 16) return;
     g_console_read_diag_count++;
@@ -48,14 +76,15 @@ static int wait_console_response(u64 expected_seq, u16 expected_op, u64 poll_lim
                 response->version == CONSOLE_PROTOCOL_VERSION &&
                 response->op == expected_op;
         }
-        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+        wait_without_consuming_ipc();
     }
     return 0;
 }
 
 static int connect_console_from_registry(void) {
     struct service_entry entry;
-    if (!find_service(SERVICE_KIND_CONSOLE, &entry)) return 0;
+    const int using_tty = find_service(SERVICE_KIND_TTY, &entry);
+    if (!using_tty && !find_service(SERVICE_KIND_CONSOLE, &entry)) return 0;
     g_console.endpoint_id = entry.endpoint_id;
     g_console.process_slot = entry.process_slot;
     g_console.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -84,7 +113,8 @@ static int connect_console_from_registry(void) {
     if (response->status != CONSOLE_STATUS_OK) return 0;
     g_console.next_seq = 2;
     g_console.active = 1;
-    user_log("LinuxAbiServer: console connect ok\n");
+    g_console.is_tty = using_tty;
+    user_log(using_tty ? "LinuxAbiServer: tty connect ok\n" : "LinuxAbiServer: console connect ok\n");
     return 1;
 }
 
@@ -114,6 +144,50 @@ static int console_begin_request(u16 op, u32 length, const char *inline_src, u32
     if (!signal_console()) return 0;
     *seq_out = seq;
     return 1;
+}
+
+static int console_get_tty_attr(struct tty_attr_payload *out) {
+    if (!g_console.active) return 0;
+    u64 seq = 0;
+    if (!console_begin_request(CONSOLE_OP_GET_ATTR, sizeof(*out), 0, 0, &seq)) return 0;
+    if (!wait_console_response(seq, CONSOLE_OP_GET_ATTR, 8192)) return 0;
+    volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
+    if (response->status != CONSOLE_STATUS_OK) return 0;
+    if (response->inline_bytes < sizeof(*out)) return 0;
+    volatile u8 *src = (volatile u8 *)(CONSOLE_RESPONSE_VA + CONSOLE_RESPONSE_HEADER_BYTES);
+    u8 *dst = (u8 *)out;
+    for (u64 i = 0; i < sizeof(*out); i++) dst[i] = src[i];
+    return out->version == TTY_ATTR_VERSION;
+}
+
+static int console_set_tty_attr(const struct tty_attr_payload *attr) {
+    if (!g_console.active) return 0;
+    u64 seq = 0;
+    if (!console_begin_request(CONSOLE_OP_SET_ATTR, sizeof(*attr), (const char *)attr, sizeof(*attr), &seq)) return 0;
+    if (!wait_console_response(seq, CONSOLE_OP_SET_ATTR, 8192)) return 0;
+    volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
+    return response->status == CONSOLE_STATUS_OK;
+}
+
+static int console_take_tty_signal(u64 *signo_out) {
+    *signo_out = 0;
+    if (!g_console.active || !g_console.is_tty) return 0;
+    u64 seq = 0;
+    if (!console_begin_request(CONSOLE_OP_GET_SIGNAL, 0, 0, 0, &seq)) return 0;
+    if (!wait_console_response(seq, CONSOLE_OP_GET_SIGNAL, 8192)) return 0;
+    volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
+    if (response->status == CONSOLE_STATUS_AGAIN) return 1;
+    if (response->status != CONSOLE_STATUS_OK) return 0;
+    *signo_out = response->arg0;
+    return 1;
+}
+
+static void poll_tty_signal_events(void) {
+    for (;;) {
+        u64 signo = 0;
+        if (!console_take_tty_signal(&signo) || signo == 0) return;
+        deliver_tty_signal(signo);
+    }
 }
 
 static u64 console_write_bytes(const char *bytes, u64 len) {
@@ -181,15 +255,19 @@ static u64 console_read_to_target(u64 dst, u64 len, int *fault) {
         }
         volatile struct console_response_header *response = (volatile struct console_response_header *)CONSOLE_RESPONSE_VA;
         if (response->status == CONSOLE_STATUS_AGAIN) {
-            (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+            wait_without_consuming_ipc();
             continue;
+        }
+        if (response->status == CONSOLE_STATUS_INTERRUPTED) {
+            if (response->arg0 != 0) deliver_tty_signal(response->arg0);
+            return errno_intr();
         }
         if (response->status != CONSOLE_STATUS_OK) {
             log_console_read_diag("status", response->status);
             return errno_io();
         }
         const u64 n = min_u64(response->inline_bytes, request_len);
-        if (n == 0) continue;
+        if (n == 0) return 0;
         if (copy_to_target(dst, (const void *)(CONSOLE_RESPONSE_VA + CONSOLE_RESPONSE_HEADER_BYTES), n) != n) {
             log_console_read_diag("copy-failed", n);
             *fault = 1;

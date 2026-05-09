@@ -17,6 +17,28 @@ var dispatch_delegate_failure_log_count: u64 = 0;
 const dispatch_delegate_failure_log_limit: u64 = 16;
 var dispatch_delegate_lookup_log_count: u64 = 0;
 const dispatch_delegate_lookup_log_limit: u64 = 16;
+var dispatch_delegate_backpressure_log_count: u64 = 0;
+const dispatch_delegate_backpressure_log_limit: u64 = 1;
+const delegate_transport_queue_limit: usize = 1;
+
+const AbiTrapSpinLock = struct {
+    value: u8 = 0,
+
+    fn lock(self: *AbiTrapSpinLock) void {
+        while (true) {
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) return;
+            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
+                asm volatile ("pause");
+            }
+        }
+    }
+
+    fn unlock(self: *AbiTrapSpinLock) void {
+        @atomicStore(u8, &self.value, 0, .release);
+    }
+};
+
+var dispatch_delegate_lock: AbiTrapSpinLock = .{};
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -49,6 +71,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_failure_log_count), &dispatch_delegate_failure_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_lookup_log_count), &dispatch_delegate_lookup_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_backpressure_log_count), &dispatch_delegate_backpressure_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_lock), &dispatch_delegate_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_storage), &abi_trap_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_ready), &abi_trap_hooks_ready));
     return end;
@@ -424,27 +448,34 @@ fn isExclusiveRootMappedPage(h: *const Hooks, target_proc: kernel.PrincipalId, p
 }
 
 fn reclaimPrivatePagesForProcessWithHooks(h: *const Hooks, target_proc: kernel.PrincipalId) u64 {
-    var mapped_pages: [512]user_vm.MappedUserPage = undefined;
-    var pages: [boot_static.syscall_batch_max_pages]user_vm.MappedUserPage = undefined;
-    const mapped_count = user_vm.collectUserMappedPages(target_proc, mapped_pages[0..]);
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < mapped_count) : (i += 1) {
-        const paddr = mapped_pages[i].paddr;
-        if (!isExclusiveRootMappedPage(h, target_proc, paddr)) continue;
-        if (count >= pages.len) break;
-        if (!h.free_list.canAppendPage(0, paddr)) return boot_static.syscall_err_alloc;
-        pages[count] = mapped_pages[i];
-        count += 1;
+    var total_reclaimed: u64 = 0;
+    while (true) {
+        var mapped_pages: [512]user_vm.MappedUserPage = undefined;
+        var pages: [boot_static.syscall_batch_max_pages]user_vm.MappedUserPage = undefined;
+        const mapped_count = user_vm.collectUserMappedPages(target_proc, mapped_pages[0..]);
+        var count: usize = 0;
+        var i: usize = 0;
+        while (i < mapped_count) : (i += 1) {
+            const paddr = mapped_pages[i].paddr;
+            if (!isExclusiveRootMappedPage(h, target_proc, paddr)) continue;
+            if (count >= pages.len) break;
+            if (!h.free_list.canAppendPage(0, paddr)) return boot_static.syscall_err_alloc;
+            pages[count] = mapped_pages[i];
+            count += 1;
+        }
+        if (count == 0) break;
+
+        var reclaimed_this_round: u64 = 0;
+        for (pages[0..count]) |page| {
+            if (!user_vm.unmapUserLinearRegion(target_proc, page.va, 4096)) continue;
+            const paddr = page.paddr;
+            h.state.reclaimExclusiveRootPage(target_proc, paddr, h.free_list) catch return boot_static.syscall_err_invalid;
+            reclaimed_this_round += 1;
+        }
+        if (reclaimed_this_round == 0) break;
+        total_reclaimed += reclaimed_this_round;
     }
-    var reclaimed: u64 = 0;
-    for (pages[0..count]) |page| {
-        if (!user_vm.unmapUserLinearRegion(target_proc, page.va, 4096)) continue;
-        const paddr = page.paddr;
-        h.state.reclaimExclusiveRootPage(target_proc, paddr, h.free_list) catch return boot_static.syscall_err_invalid;
-        reclaimed += 1;
-    }
-    return reclaimed;
+    return total_reclaimed;
 }
 
 pub fn reclaimPrivatePagesForProcess(state: *kernel.KernelState, target_proc: kernel.PrincipalId) u64 {
@@ -634,6 +665,147 @@ pub fn dispatchKnownDelegate(state: *kernel.KernelState, proc: kernel.PrincipalI
     return dispatchKnownDelegateWithHooks(&h_storage, proc, delegate, frame);
 }
 
+fn deliverDelegateRequestLocked(
+    h: *const Hooks,
+    proc: kernel.PrincipalId,
+    target_principal: kernel.PrincipalId,
+    target_thread: usize,
+    delegate: kernel.AbiTrapDelegate,
+    frame: *TrapFrame,
+    current_thread: usize,
+    current_ctx: *scheduler.ThreadContext,
+) u64 {
+    const stale_replies = scheduler.discardIpcReplyMessagesForThreadFromSender(current_thread, target_thread);
+    if (stale_replies != 0) current_ctx.abi_trap_reply_pending = false;
+    const stale_requests = scheduler.discardIpcMessagesForThreadFromSenderOnEndpoint(target_thread, current_thread, delegate.endpoint_id, true);
+    if (stale_requests != 0) current_ctx.abi_trap_reply_pending = false;
+    if (!writeRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame)) {
+        h.write("abi_trap request write failed target=");
+        h.write(h.principal_label(target_principal));
+        h.write("\n");
+        return boot_static.syscall_err_invalid;
+    }
+
+    current_ctx.abi_trap_reply_pending = true;
+    if (scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true) >= delegate_transport_queue_limit) {
+        if (scheduler.enqueueDelegateSendPending(target_thread, delegate.endpoint_id, current_thread, delegate.request_page_va)) {
+            if (dispatch_delegate_backpressure_log_count < dispatch_delegate_backpressure_log_limit) {
+                h.write("abi dispatch backpressure proc=");
+                h.print_hex(@intFromEnum(proc));
+                h.write(" target_proc=");
+                h.print_hex(@intFromEnum(target_principal));
+                h.write(" target_thread=");
+                h.print_number(@intCast(target_thread));
+                h.write(" qlen=");
+                h.print_number(@intCast(scheduler.ipcQueueLenForThread(target_thread)));
+                h.write(" delegate_qlen=");
+                h.print_number(@intCast(scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true)));
+                h.write(" pending=");
+                h.print_number(@intCast(scheduler.delegateSendPendingLenForThread(target_thread)));
+                h.write("\n");
+                dispatch_delegate_backpressure_log_count += 1;
+            }
+            scheduler.wakeAssignedApForRunnableThread(target_thread);
+            scheduler.preferIpcSwitchToThread(target_thread);
+            return boot_static.syscall_ok;
+        }
+        current_ctx.abi_trap_reply_pending = false;
+        return boot_static.syscall_err_not_ready;
+    }
+
+    const status = ipc.deliverOrQueueMessageToThread(
+        target_thread,
+        delegate.endpoint_id,
+        current_thread,
+        true,
+        delegate.request_page_va,
+        0,
+        0,
+        0,
+    );
+    if (status == boot_static.syscall_ok) return boot_static.syscall_ok;
+
+    if (status == boot_static.syscall_err_not_ready) {
+        if (scheduler.enqueueDelegateSendPending(target_thread, delegate.endpoint_id, current_thread, delegate.request_page_va)) {
+            if (dispatch_delegate_backpressure_log_count < dispatch_delegate_backpressure_log_limit) {
+                h.write("abi dispatch backpressure proc=");
+                h.print_hex(@intFromEnum(proc));
+                h.write(" target_proc=");
+                h.print_hex(@intFromEnum(target_principal));
+                h.write(" target_thread=");
+                h.print_number(@intCast(target_thread));
+                h.write(" qlen=");
+                h.print_number(@intCast(scheduler.ipcQueueLenForThread(target_thread)));
+                h.write(" delegate_qlen=");
+                h.print_number(@intCast(scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true)));
+                h.write(" pending=");
+                h.print_number(@intCast(scheduler.delegateSendPendingLenForThread(target_thread)));
+                h.write("\n");
+                dispatch_delegate_backpressure_log_count += 1;
+            }
+            scheduler.wakeAssignedApForRunnableThread(target_thread);
+            scheduler.preferIpcSwitchToThread(target_thread);
+            return boot_static.syscall_ok;
+        }
+        if (dispatch_delegate_backpressure_log_count < dispatch_delegate_backpressure_log_limit) {
+            h.write("abi dispatch backpressure drop proc=");
+            h.print_hex(@intFromEnum(proc));
+            h.write(" target_proc=");
+            h.print_hex(@intFromEnum(target_principal));
+            h.write(" target_thread=");
+            h.print_number(@intCast(target_thread));
+            h.write(" qlen=");
+            h.print_number(@intCast(scheduler.ipcQueueLenForThread(target_thread)));
+            h.write(" delegate_qlen=");
+            h.print_number(@intCast(scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true)));
+            h.write(" pending=");
+            h.print_number(@intCast(scheduler.delegateSendPendingLenForThread(target_thread)));
+            h.write("\n");
+            dispatch_delegate_backpressure_log_count += 1;
+        }
+    }
+    current_ctx.abi_trap_reply_pending = false;
+    if (status != boot_static.syscall_err_not_ready) logDelegateDeliveryFailure(h, proc, target_principal, target_thread, status);
+    return status;
+}
+
+fn logDelegateDeliveryFailure(
+    h: *const Hooks,
+    proc: kernel.PrincipalId,
+    target_principal: kernel.PrincipalId,
+    target_thread: usize,
+    status: u64,
+) void {
+    if (dispatch_delegate_failure_log_count < dispatch_delegate_failure_log_limit) {
+        h.write("abi dispatch deliver failed status=");
+        h.print_hex(status);
+        h.write(" proc=");
+        h.print_hex(@intFromEnum(proc));
+        h.write(" target_proc=");
+        h.print_hex(@intFromEnum(target_principal));
+        h.write(" target_thread=");
+        h.print_number(@intCast(target_thread));
+        if (scheduler.getThreadContext(target_thread)) |target_ctx| {
+            h.write(" ctx_alloc=");
+            h.print_number(if (target_ctx.allocated) 1 else 0);
+            h.write(" ctx_ready=");
+            h.print_number(if (target_ctx.ready) 1 else 0);
+        } else {
+            h.write(" ctx_missing=1");
+        }
+        if (scheduler.getIpcHotThreadConst(target_thread)) |target_hot| {
+            h.write(" hot_alloc=");
+            h.print_number(target_hot.allocated);
+            h.write(" hot_ready=");
+            h.print_number(target_hot.ready);
+        } else {
+            h.write(" hot_missing=1");
+        }
+        h.write("\n");
+        dispatch_delegate_failure_log_count += 1;
+    }
+}
+
 fn dispatchKnownDelegateWithHooks(h: *const Hooks, proc: kernel.PrincipalId, delegate: kernel.AbiTrapDelegate, frame: *TrapFrame) ?u64 {
     const current_thread = scheduler.currentThreadIndex();
     const current_ctx = scheduler.getThreadContext(current_thread) orelse return boot_static.syscall_err_not_ready;
@@ -691,55 +863,10 @@ fn dispatchKnownDelegateWithHooks(h: *const Hooks, proc: kernel.PrincipalId, del
         }
         return boot_static.syscall_err_endpoint;
     };
-    const stale_replies = scheduler.discardIpcReplyMessagesForThreadFromSender(current_thread, target_thread);
-    if (stale_replies != 0) current_ctx.abi_trap_reply_pending = false;
-    if (!writeRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame)) {
-        h.write("abi_trap request write failed target=");
-        h.write(h.principal_label(target_principal));
-        h.write("\n");
-        return boot_static.syscall_err_invalid;
-    }
-
-    current_ctx.abi_trap_reply_pending = true;
-    const status = ipc.deliverOrQueueMessageToThread(
-        target_thread,
-        delegate.endpoint_id,
-        current_thread,
-        true,
-        delegate.request_page_va,
-        0,
-        0,
-        0,
-    );
+    dispatch_delegate_lock.lock();
+    const status = deliverDelegateRequestLocked(h, proc, target_principal, target_thread, delegate, frame, current_thread, current_ctx);
+    dispatch_delegate_lock.unlock();
     if (status != boot_static.syscall_ok) {
-        if (dispatch_delegate_failure_log_count < dispatch_delegate_failure_log_limit) {
-            h.write("abi dispatch deliver failed status=");
-            h.print_hex(status);
-            h.write(" proc=");
-            h.print_hex(@intFromEnum(proc));
-            h.write(" target_proc=");
-            h.print_hex(@intFromEnum(target_principal));
-            h.write(" target_thread=");
-            h.print_number(@intCast(target_thread));
-            if (scheduler.getThreadContext(target_thread)) |target_ctx| {
-                h.write(" ctx_alloc=");
-                h.print_number(if (target_ctx.allocated) 1 else 0);
-                h.write(" ctx_ready=");
-                h.print_number(if (target_ctx.ready) 1 else 0);
-            } else {
-                h.write(" ctx_missing=1");
-            }
-            if (scheduler.getIpcHotThreadConst(target_thread)) |target_hot| {
-                h.write(" hot_alloc=");
-                h.print_number(target_hot.allocated);
-                h.write(" hot_ready=");
-                h.print_number(target_hot.ready);
-            } else {
-                h.write(" hot_missing=1");
-            }
-            h.write("\n");
-            dispatch_delegate_failure_log_count += 1;
-        }
         current_ctx.abi_trap_reply_pending = false;
         return status;
     }

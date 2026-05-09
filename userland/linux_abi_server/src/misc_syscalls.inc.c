@@ -227,7 +227,7 @@ static void fill_default_termios(struct linux_termios_kernel *termios) {
     termios->c_iflag = 0000400; /* ICRNL */
     termios->c_oflag = 0000001 | 0000004; /* OPOST | ONLCR */
     termios->c_cflag = 0000060 | 0000400 | 0000200; /* CS8 | CREAD | HUPCL */
-    termios->c_lflag = 0000001 | 0000002 | 0000010 | 0000020 | 0000100; /* ISIG | ICANON | ECHO | ECHOE | ECHOK */
+    termios->c_lflag = 0000001 | 0000002 | 0000010 | 0000020 | 0000040 | 0100000; /* ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN */
     termios->c_cc[0] = 3;   /* VINTR */
     termios->c_cc[1] = 28;  /* VQUIT */
     termios->c_cc[2] = 127; /* VERASE */
@@ -238,8 +238,59 @@ static void fill_default_termios(struct linux_termios_kernel *termios) {
     termios->c_cc[8] = 17;  /* VSTART */
     termios->c_cc[9] = 19;  /* VSTOP */
     termios->c_cc[10] = 26; /* VSUSP */
+    termios->c_cc[12] = 18; /* VREPRINT */
+    termios->c_cc[14] = 23; /* VWERASE */
     termios->c_ispeed = 15; /* B38400 */
     termios->c_ospeed = 15; /* B38400 */
+}
+
+static void tty_attr_to_linux_termios(const struct tty_attr_payload *attr, struct linux_termios_kernel *termios) {
+    fill_default_termios(termios);
+    termios->c_iflag = 0;
+    if (attr->iflag & TTY_IFLAG_INLCR) termios->c_iflag |= 0000100;
+    if (attr->iflag & TTY_IFLAG_IGNCR) termios->c_iflag |= 0000200;
+    if (attr->iflag & TTY_IFLAG_ICRNL) termios->c_iflag |= 0000400;
+    termios->c_oflag = 0;
+    if (attr->oflag & TTY_OFLAG_OPOST) termios->c_oflag |= 0000001;
+    if (attr->oflag & TTY_OFLAG_ONLCR) termios->c_oflag |= 0000004;
+    termios->c_lflag = 0;
+    if (attr->lflag & TTY_LFLAG_ISIG) termios->c_lflag |= 0000001;
+    if (attr->lflag & TTY_LFLAG_ICANON) termios->c_lflag |= 0000002;
+    if (attr->lflag & TTY_LFLAG_ECHO) termios->c_lflag |= 0000010;
+    if (attr->lflag & TTY_LFLAG_ECHOE) termios->c_lflag |= 0000020;
+    if (attr->lflag & TTY_LFLAG_ECHOK) termios->c_lflag |= 0000040;
+    if (attr->lflag & TTY_LFLAG_ECHONL) termios->c_lflag |= 0000100;
+    if (attr->lflag & TTY_LFLAG_IEXTEN) termios->c_lflag |= 0100000;
+    for (u64 i = 0; i < sizeof(termios->c_cc) && i < sizeof(attr->cc); i++) termios->c_cc[i] = attr->cc[i];
+}
+
+static void linux_termios_to_tty_attr(const struct linux_termios_kernel *termios, struct tty_attr_payload *attr) {
+    attr->version = TTY_ATTR_VERSION;
+    attr->iflag = 0;
+    attr->oflag = 0;
+    attr->lflag = 0;
+    if (termios->c_iflag & 0000100) attr->iflag |= TTY_IFLAG_INLCR;
+    if (termios->c_iflag & 0000200) attr->iflag |= TTY_IFLAG_IGNCR;
+    if (termios->c_iflag & 0000400) attr->iflag |= TTY_IFLAG_ICRNL;
+    if (termios->c_oflag & 0000001) attr->oflag |= TTY_OFLAG_OPOST;
+    if (termios->c_oflag & 0000004) attr->oflag |= TTY_OFLAG_ONLCR;
+    if (termios->c_lflag & 0000001) attr->lflag |= TTY_LFLAG_ISIG;
+    if (termios->c_lflag & 0000002) attr->lflag |= TTY_LFLAG_ICANON;
+    if (termios->c_lflag & 0000010) attr->lflag |= TTY_LFLAG_ECHO;
+    if (termios->c_lflag & 0000020) attr->lflag |= TTY_LFLAG_ECHOE;
+    if (termios->c_lflag & 0000040) attr->lflag |= TTY_LFLAG_ECHOK;
+    if (termios->c_lflag & 0000100) attr->lflag |= TTY_LFLAG_ECHONL;
+    if (termios->c_lflag & 0100000) attr->lflag |= TTY_LFLAG_IEXTEN;
+    for (u64 i = 0; i < sizeof(attr->cc); i++) attr->cc[i] = i < sizeof(termios->c_cc) ? termios->c_cc[i] : 0;
+    attr->columns = 120;
+    attr->rows = 40;
+    attr->reserved0 = 0;
+
+    struct tty_attr_payload current;
+    if (console_get_tty_attr(&current)) {
+        attr->columns = current.columns;
+        attr->rows = current.rows;
+    }
 }
 
 static struct ipc_message handle_ioctl(const struct trap_request *req) {
@@ -251,13 +302,24 @@ static struct ipc_message handle_ioctl(const struct trap_request *req) {
 
     if (request == TCGETS) {
         struct linux_termios_kernel termios;
-        fill_default_termios(&termios);
+        struct tty_attr_payload attr;
+        if (console_get_tty_attr(&attr)) {
+            tty_attr_to_linux_termios(&attr, &termios);
+        } else {
+            fill_default_termios(&termios);
+        }
         return copy_to_target(argp, &termios, sizeof(termios)) == sizeof(termios) ? reply(0, 0) : reply(errno_fault(), 0);
     }
     if (request == TIOCGWINSZ) {
         struct linux_winsize ws;
-        ws.ws_row = 40;
-        ws.ws_col = 120;
+        struct tty_attr_payload attr;
+        if (console_get_tty_attr(&attr)) {
+            ws.ws_row = attr.rows;
+            ws.ws_col = attr.columns;
+        } else {
+            ws.ws_row = 40;
+            ws.ws_col = 120;
+        }
         ws.ws_xpixel = 0;
         ws.ws_ypixel = 0;
         return copy_to_target(argp, &ws, sizeof(ws)) == sizeof(ws) ? reply(0, 0) : reply(errno_fault(), 0);
@@ -266,6 +328,13 @@ static struct ipc_message handle_ioctl(const struct trap_request *req) {
         const u32 pgrp = (u32)(g_proc && g_proc->pid != 0 ? g_proc->pid : 1);
         return copy_to_target(argp, &pgrp, sizeof(pgrp)) == sizeof(pgrp) ? reply(0, 0) : reply(errno_fault(), 0);
     }
-    if (request == TCSETS || request == TCSETSW || request == TCSETSF || request == TIOCSPGRP || request == TIOCSWINSZ) return reply(0, 0);
+    if (request == TCSETS || request == TCSETSW || request == TCSETSF) {
+        struct linux_termios_kernel termios;
+        if (copy_from_target(argp, &termios, sizeof(termios)) != sizeof(termios)) return reply(errno_fault(), 0);
+        struct tty_attr_payload attr;
+        linux_termios_to_tty_attr(&termios, &attr);
+        return reply(console_set_tty_attr(&attr) ? 0 : errno_io(), 0);
+    }
+    if (request == TIOCSPGRP || request == TIOCSWINSZ) return reply(0, 0);
     return reply(errno_inval(), 0);
 }

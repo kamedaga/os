@@ -57,8 +57,26 @@ fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
 }
 
+fn staticStorageStart(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr);
+}
+
 fn maxStaticEnd(a: usize, b: usize) usize {
     return if (a > b) a else b;
+}
+
+fn minStaticStart(a: usize, b: usize) usize {
+    return if (a < b) a else b;
+}
+
+fn kernelStaticStorageStartAddr() usize {
+    var start = uefi_services.kernelStaticStorageStartAddr();
+    start = minStaticStart(start, staticStorageStart(@TypeOf(user_spaces_storage), &user_spaces_storage));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(global_free_list), &global_free_list));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_global), &kernel_state_global));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_ready), &kernel_state_ready));
+    start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
+    return start;
 }
 
 fn kernelStaticStorageEndAddr() usize {
@@ -363,6 +381,7 @@ fn initMemoryModules() void {
         .page_user = boot_static.page_user,
         .page_ps = boot_static.page_ps,
         .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
+        .seed_user_pdp_with_kernel_identity = x86_platform.seedUserPdpWithKernelIdentity,
         .seed_user_pd_with_kernel_identity = x86_platform.seedUserPdWithKernelIdentity,
     });
     pmm.init(.{
@@ -371,6 +390,7 @@ fn initMemoryModules() void {
         .kernel_cr3_addr = @intFromPtr(&x86_platform.kernel_cr3_value),
         .kernel_image_base_paddr = &uefi_services.kernel_image_base_paddr_ref,
         .kernel_image_size_bytes = &uefi_services.kernel_image_size_bytes_ref,
+        .kernel_static_start_addr = kernelStaticStorageStartAddr(),
         .kernel_static_end_addr = kernelStaticStorageEndAddr(),
         .reserved_low_mem_end = boot_static.reserved_low_mem_end,
     });

@@ -122,11 +122,11 @@ pub fn mapVmObjectToProcess(caller: kernel.PrincipalId, token: u64, vm_token: u6
     var page_index: usize = 0;
     while (page_index < vm_cap.backing.page_count) {
         const run_start = page_index;
-        const run_paddr = vm_cap.backing.page_paddrs[run_start];
+        const run_paddr = vm_cap.backing.pagePaddr(run_start) orelse return boot_static.syscall_err_invalid;
         var run_len: usize = 1;
         while (run_start + run_len < vm_cap.backing.page_count) : (run_len += 1) {
             const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
-            if (vm_cap.backing.page_paddrs[run_start + run_len] != expected) break;
+            if ((vm_cap.backing.pagePaddr(run_start + run_len) orelse break) != expected) break;
         }
         const run_va = target_va + @as(u64, @intCast(run_start)) * 4096;
         const run_bytes = run_len * 4096;

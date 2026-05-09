@@ -45,6 +45,7 @@ enum {
     EXEC_SERVICE_ENDPOINT_ID = 0x92,
     ROOT_CONSOLE_ENDPOINT_ID = 0x88,
     ROOT_NET_ENDPOINT_ID = 0x89,
+    TTY_SERVICE_ENDPOINT_ID = 0x8A,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
     SERVICE_REGISTRY_VERSION = 1,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
@@ -52,6 +53,7 @@ enum {
     SERVICE_KIND_FAT_FS = 9,
     SERVICE_KIND_CONSOLE = 10,
     SERVICE_KIND_NET = 11,
+    SERVICE_KIND_TTY = 12,
     SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
@@ -1005,6 +1007,11 @@ static void mark_node_completed(struct startup_node *node) {
 static int startup_node_ready_after_spawn(struct startup_node *node) {
     if (cstr_eq(node->provides, "exec_service")) {
         return syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_SERVICE_ENDPOINT_ID, 0) == SYSCALL_OK;
+    }
+    if (cstr_eq(node->provides, "tty_service")) {
+        if (syscall2(SYSCALL_SIGNAL_ENDPOINT, TTY_SERVICE_ENDPOINT_ID, 0) != SYSCALL_OK) return 0;
+        service_registry_set(SERVICE_KIND_TTY, node->child_slot, TTY_SERVICE_ENDPOINT_ID);
+        return 1;
     }
     return 1;
 }

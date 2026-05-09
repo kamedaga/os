@@ -1,9 +1,53 @@
 static u64 page_up(u64 value) { return (value + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1); }
 
+static void vm_merge_adjacent_regions(void) {
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used) continue;
+            const u64 i_end = g_regions[i].start + g_regions[i].size;
+            for (u64 j = 0; j < VM_REGION_MAX; j++) {
+                if (i == j || !g_regions[j].used || g_regions[i].prot != g_regions[j].prot) continue;
+                if (i_end == g_regions[j].start) {
+                    g_regions[i].size += g_regions[j].size;
+                    g_regions[j].used = 0;
+                    changed = 1;
+                    break;
+                }
+                const u64 j_end = g_regions[j].start + g_regions[j].size;
+                if (j_end == g_regions[i].start) {
+                    g_regions[i].start = g_regions[j].start;
+                    g_regions[i].size += g_regions[j].size;
+                    g_regions[j].used = 0;
+                    changed = 1;
+                    break;
+                }
+            }
+            if (changed) break;
+        }
+    }
+}
+
 static int vm_add_region(u64 start, u64 size, u64 prot) {
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used || g_regions[i].prot != prot) continue;
+        if (g_regions[i].start + g_regions[i].size == start) {
+            g_regions[i].size += size;
+            vm_merge_adjacent_regions();
+            return 1;
+        }
+        if (start + size == g_regions[i].start) {
+            g_regions[i].start = start;
+            g_regions[i].size += size;
+            vm_merge_adjacent_regions();
+            return 1;
+        }
+    }
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
         if (!g_regions[i].used) {
             g_regions[i].used = 1; g_regions[i].start = start; g_regions[i].size = size; g_regions[i].prot = prot;
+            vm_merge_adjacent_regions();
             return 1;
         }
     }
