@@ -19,6 +19,7 @@ enum {
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
+    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     PAGE_RIGHT_CPU_READ = 0x1,
@@ -51,9 +52,9 @@ enum {
     FAT_DIR_MODE = 0x4000,
     FAT_FILE_MODE = 0x8000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
-    SERVICE_REGISTRY_VERSION = 1,
+    SERVICE_REGISTRY_VERSION = 2,
     SERVICE_KIND_BLOCK = 4,
-    SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
+    SERVICE_FLAG_RESERVED0 = 1,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     BLOCK_REQUEST_MAGIC = 0x514B4C42,
     BLOCK_RESPONSE_MAGIC = 0x524B4C42,
@@ -73,7 +74,7 @@ enum {
 
 struct service_entry {
     u64 kind;
-    u64 process_slot;
+    u64 process_handle;
     u64 endpoint_id;
     u64 flags;
 };
@@ -136,7 +137,7 @@ struct block_session {
     u8 active;
     u8 reserved0[7];
     u64 endpoint_id;
-    u64 process_slot;
+    u64 process_handle;
     u64 request_va;
     u64 response_va;
     u64 request_paddr;
@@ -523,9 +524,9 @@ static int find_block_service(u64 *endpoint_id, u64 *process_slot) {
         volatile struct service_entry *entry = &registry->entries[i];
         if (entry->kind != SERVICE_KIND_BLOCK) continue;
         if (entry->endpoint_id == 0) return 0;
-        if ((entry->flags & SERVICE_FLAG_PROCESS_SLOT_COMPAT) == 0 || entry->process_slot == 0) return 0;
+        if (entry->process_handle == 0) return 0;
         *endpoint_id = entry->endpoint_id;
-        *process_slot = entry->process_slot;
+        *process_slot = entry->process_handle;
         return 1;
     }
     return 0;
@@ -541,8 +542,8 @@ static u64 make_block_session_nonce(u64 request_paddr, u64 response_paddr, u64 e
 }
 
 static int install_block_endpoint(void) {
-    if (g_block.endpoint_id == 0 || g_block.process_slot == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_block.endpoint_id, g_block.process_slot) == SYSCALL_OK;
+    if (g_block.endpoint_id == 0 || g_block.process_handle == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_block.endpoint_id, g_block.process_handle) == SYSCALL_OK;
 }
 
 static int grant_block_response_page(void) {
@@ -567,12 +568,20 @@ static int grant_block_response_page(void) {
 static int grant_block_bulk_page(void) {
     if (g_block.bulk_paddr < 0x1000) return 0;
     u64 ret = syscall3(
-        SYSCALL_GRANT_CAP,
+        SYSCALL_GRANT_CAP_ON_ENDPOINT,
         g_block.bulk_paddr,
-        g_block.process_slot,
+        g_block.endpoint_id,
         PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE
     );
     if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_block_endpoint()) {
+        ret = syscall3(
+            SYSCALL_GRANT_CAP_ON_ENDPOINT,
+            g_block.bulk_paddr,
+            g_block.endpoint_id,
+            PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE
+        );
+    }
     return ret == SYSCALL_OK;
 }
 
@@ -636,7 +645,7 @@ static int connect_block_service(void) {
     }
 
     g_block.endpoint_id = endpoint_id;
-    g_block.process_slot = process_slot;
+    g_block.process_handle = process_slot;
     g_block.request_va = FAT_BLOCK_REQUEST_VA;
     g_block.response_va = FAT_BLOCK_RESPONSE_VA;
     g_block.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -648,7 +657,7 @@ static int connect_block_service(void) {
 
     clear_page(FAT_BLOCK_REQUEST_VA);
     clear_page(FAT_BLOCK_RESPONSE_VA);
-    const u64 self_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    const u64 self_process_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
     g_block.session_nonce = make_block_session_nonce(
         g_block.request_paddr,
         g_block.response_paddr,

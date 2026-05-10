@@ -28,6 +28,7 @@ enum {
     SYSCALL_GET_PROCESS_STATUS = 0x30,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
     SYSCALL_PROCESS_EXIT = 0x34,
+    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_IPC_CALL_REPLY_RECV = 0x40,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
@@ -36,7 +37,7 @@ enum {
     PAGE_BYTES = 4096,
     SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
-    SERVICE_REGISTRY_VERSION = 1,
+    SERVICE_REGISTRY_VERSION = 2,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     SERVICE_KIND_VFS = 2,
 
@@ -58,8 +59,12 @@ enum {
     FS_OBJECT_NONE = 0,
     FS_OBJECT_FILE = 3,
 
-    SPAWN_RESULT_TAG = 1ULL << 63,
-    SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
+    PROCESS_HANDLE_TAG = 2ULL << 60,
+    PROCESS_HANDLE_TAG_MASK = 0xFULL << 60,
+    PROCESS_HANDLE_SLOT_MASK = 0xffffffffULL,
+    PROCESS_HANDLE_GENERATION_SHIFT = 32,
+    PROCESS_HANDLE_GENERATION_MASK = 0xfffffffULL,
+    DELEGATE_TARGET_TOKEN_TAG = 3ULL << 60,
     SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE = 1 << 0,
     SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1 << 2,
     SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1 << 3,
@@ -73,7 +78,7 @@ enum {
     PROCESS_STANDARD_CONFIG_TARGET_VA = 0x3C002000,
     PROCESS_SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     EXEC_LOADER_BOOTSTRAP_MAGIC = 0x5845434C44523031ULL,
-    EXEC_LOADER_BOOTSTRAP_VERSION = 2,
+    EXEC_LOADER_BOOTSTRAP_VERSION = 4,
     EXEC_LOADER_CONFIG_TARGET_VA = 0x3C002000,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
     LINUX_ABI_BOOTSTRAP_VERSION = 2,
@@ -101,7 +106,7 @@ enum {
     MAX_SERVICE_IMAGE_BYTES = 256 * 1024,
 };
 
-struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
+struct service_entry { u64 kind; u64 process_handle; u64 endpoint_id; u64 flags; };
 struct service_registry_page { u64 magic; u64 version; u64 entry_count; u64 reserved0; struct service_entry entries[SERVICE_REGISTRY_MAX_ENTRIES]; };
 struct fs_request_header {
     u32 magic; u16 version; u16 op; u64 request_seq; u64 object_token; u64 offset; u32 length; u32 flags;
@@ -111,11 +116,11 @@ struct fs_response_header {
     u32 magic; u16 version; u16 op; u64 response_seq; i32 status; u32 result_flags; u64 result_token;
     u64 file_bytes; u64 cursor_next; u16 inline_bytes; u8 object_kind; u8 reserved0; u32 reserved1; u64 arg0; u64 arg1;
 };
-struct vfs_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
+struct vfs_client { int active; u64 endpoint_id; u64 process_handle; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
 struct exec_loader_config {
     u64 magic; u64 version; u64 executable_vm_token; u64 executable_file_bytes; u64 flags;
     u64 interpreter_vm_token; u64 interpreter_file_bytes; u64 bootfs_vm_token; u64 bootfs_file_bytes;
-    u64 fs_endpoint_id; u64 fs_compat_process_slot; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_process_slot;
+    u64 fs_endpoint_id; u64 fs_process_handle; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_target_token;
     u64 abi_trap_flavor; u64 abi_trap_request_page_va;
     u16 execfn_offset; u16 execfn_bytes; u16 argv_count; u16 envp_count; u16 arg_data_bytes; u16 reserved_arg0;
     u16 argv_offsets[EXECVE_MAX_ARGV]; u16 argv_bytes[EXECVE_MAX_ARGV];
@@ -190,14 +195,31 @@ static u64 alloc_map_pages(u64 target_va, u64 page_count, u64 writable) { return
 static int map_page(u64 va, u64 paddr, u64 writable) { return syscall3(SYSCALL_MAP_PAGE, va, paddr, writable) == SYSCALL_OK; }
 static int is_vm_object_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG && (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
 static int is_exec_image_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG && (token & ~EXEC_IMAGE_TOKEN_TAG) != 0; }
-static u64 decode_spawned_process_slot(u64 value) { if ((value & SPAWN_RESULT_TAG) == 0) return 0; return value & SPAWN_RESULT_PROCESS_MASK; }
+static u64 decode_process_handle_slot(u64 value) {
+    if ((value & PROCESS_HANDLE_TAG_MASK) != PROCESS_HANDLE_TAG) return 0;
+    const u64 slot = value & PROCESS_HANDLE_SLOT_MASK;
+    const u64 generation = (value >> PROCESS_HANDLE_GENERATION_SHIFT) & PROCESS_HANDLE_GENERATION_MASK;
+    return slot != 0 && generation != 0 ? slot : 0;
+}
+static u64 decode_process_handle_generation(u64 value) {
+    if ((value & PROCESS_HANDLE_TAG_MASK) != PROCESS_HANDLE_TAG) return 0;
+    const u64 slot = value & PROCESS_HANDLE_SLOT_MASK;
+    const u64 generation = (value >> PROCESS_HANDLE_GENERATION_SHIFT) & PROCESS_HANDLE_GENERATION_MASK;
+    return slot != 0 && generation != 0 ? generation : 0;
+}
+static u64 delegate_target_token_from_process_handle(u64 handle) {
+    const u64 slot = decode_process_handle_slot(handle);
+    const u64 generation = decode_process_handle_generation(handle);
+    if (slot == 0 || generation == 0) return 0;
+    return DELEGATE_TARGET_TOKEN_TAG | slot | (generation << PROCESS_HANDLE_GENERATION_SHIFT);
+}
 
 static int find_service(u64 kind, struct service_entry *out) {
     volatile struct service_registry_page *page = (volatile struct service_registry_page *)SERVICE_REGISTRY_SHADOW_VA;
     if (page->magic != SERVICE_REGISTRY_MAGIC || page->version != SERVICE_REGISTRY_VERSION) return 0;
     for (u64 i = 0; i < page->entry_count && i < SERVICE_REGISTRY_MAX_ENTRIES; i++) {
         if (page->entries[i].kind != kind) continue;
-        out->kind = page->entries[i].kind; out->process_slot = page->entries[i].process_slot; out->endpoint_id = page->entries[i].endpoint_id; out->flags = page->entries[i].flags;
+        out->kind = page->entries[i].kind; out->process_handle = page->entries[i].process_handle; out->endpoint_id = page->entries[i].endpoint_id; out->flags = page->entries[i].flags;
         return 1;
     }
     return 0;
@@ -207,7 +229,7 @@ static u64 make_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u6
     const u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x9e3779b97f4a7c15ULL;
     return nonce == 0 ? 1 : nonce;
 }
-static int install_vfs_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_vfs.endpoint_id, g_vfs.process_slot) == SYSCALL_OK; }
+static int install_vfs_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_vfs.endpoint_id, g_vfs.process_handle) == SYSCALL_OK; }
 static int grant_vfs_response_page(void) { u64 ret = syscall3(0x24, g_vfs.response_paddr, g_vfs.endpoint_id, 3); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall3(0x24, g_vfs.response_paddr, g_vfs.endpoint_id, 3); return ret == SYSCALL_OK; }
 static int share_vfs_request_page(void) { u64 ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id); return ret == SYSCALL_OK; }
 static int signal_vfs(void) {
@@ -228,7 +250,7 @@ static int connect_vfs_from_registry(void) {
     if (g_vfs.active) return 1;
     struct service_entry entry;
     if (!find_service(SERVICE_KIND_VFS, &entry)) return 0;
-    g_vfs.endpoint_id = entry.endpoint_id; g_vfs.process_slot = entry.process_slot;
+    g_vfs.endpoint_id = entry.endpoint_id; g_vfs.process_handle = entry.process_handle;
     g_vfs.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_vfs.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (g_vfs.request_paddr < 0x1000 || g_vfs.response_paddr < 0x1000) return 0;
@@ -236,7 +258,7 @@ static int connect_vfs_from_registry(void) {
     if (!map_page(VFS_RESPONSE_VA, g_vfs.response_paddr, 1)) return 0;
     if (!grant_vfs_response_page()) return 0;
     clear_page(VFS_REQUEST_VA); clear_page(VFS_RESPONSE_VA);
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
     g_vfs.session_nonce = make_nonce(g_vfs.request_paddr, g_vfs.response_paddr, g_vfs.endpoint_id, self_slot);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
     request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = FS_OP_CONNECT; request->arg0 = g_vfs.response_paddr; request->arg1 = self_slot; request->session_nonce = g_vfs.session_nonce;
@@ -399,7 +421,7 @@ static int configure_exec_args(struct exec_loader_config *cfg, const struct exec
     return 1;
 }
 
-static u64 start_linux_abi_server(const struct exec_service_request *request, volatile struct linux_abi_bootstrap_config **cfg_out) {
+static u64 start_linux_abi_server(const struct exec_service_request *request, volatile struct linux_abi_bootstrap_config **cfg_out, u64 *slot_out) {
     volatile u8 *registry_src = (volatile u8 *)PROCESS_SERVICE_REGISTRY_SHADOW_VA;
     volatile u8 *registry_dst = (volatile u8 *)SCRATCH_REGISTRY_COPY_VA;
     for (u64 i = 0; i < PAGE_BYTES; i++) registry_dst[i] = registry_src[i];
@@ -435,10 +457,11 @@ static u64 start_linux_abi_server(const struct exec_service_request *request, vo
     table->cap_descriptors[1].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
 
     const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, g_linux_abi_exec_token, SCRATCH_LINUX_ABI_TABLE_VA, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER);
-    const u64 slot = decode_spawned_process_slot(spawned);
+    const u64 slot = decode_process_handle_slot(spawned);
     if (slot == 0) return 0;
     if (cfg_out != 0) *cfg_out = (volatile struct linux_abi_bootstrap_config *)cfg;
-    return slot;
+    if (slot_out != 0) *slot_out = slot;
+    return spawned;
 }
 
 static int wait_linux_abi_server_ready(volatile struct linux_abi_bootstrap_config *cfg) {
@@ -450,7 +473,7 @@ static int wait_linux_abi_server_ready(volatile struct linux_abi_bootstrap_confi
     return 0;
 }
 
-static u64 spawn_exec_loader(const struct exec_service_request *request, u64 app_vm_token, u64 app_bytes, u64 abi_server_slot) {
+static u64 spawn_exec_loader(const struct exec_service_request *request, u64 app_vm_token, u64 app_bytes, u64 abi_server_target_token) {
     struct exec_loader_config *cfg = (struct exec_loader_config *)SCRATCH_EXEC_CONFIG_VA;
     clear_page(SCRATCH_EXEC_CONFIG_VA);
     cfg->magic = EXEC_LOADER_BOOTSTRAP_MAGIC;
@@ -458,9 +481,9 @@ static u64 spawn_exec_loader(const struct exec_service_request *request, u64 app
     cfg->executable_file_bytes = app_bytes;
     cfg->interpreter_file_bytes = g_ld_bytes;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
-    cfg->fs_compat_process_slot = g_vfs.process_slot;
+    cfg->fs_process_handle = g_vfs.process_handle;
     cfg->abi_trap_endpoint_id = LINUX_ABI_ENDPOINT_ID;
-    cfg->abi_trap_endpoint_process_slot = abi_server_slot;
+    cfg->abi_trap_endpoint_target_token = abi_server_target_token;
     cfg->abi_trap_flavor = 1;
     cfg->abi_trap_request_page_va = LINUX_ABI_TRAP_REQUEST_PAGE_VA;
     if (!configure_exec_args(cfg, request)) return 0;
@@ -479,7 +502,7 @@ static u64 spawn_exec_loader(const struct exec_service_request *request, u64 app
     table->cap_descriptors[1].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, interpreter_vm_token);
     table->cap_descriptors[1].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[1].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
-    return decode_spawned_process_slot(syscall4(SYSCALL_SPAWN_EXEC, g_loader_exec_token, SCRATCH_EXEC_TABLE_VA, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER));
+    return syscall4(SYSCALL_SPAWN_EXEC, g_loader_exec_token, SCRATCH_EXEC_TABLE_VA, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER);
 }
 
 static void write_response(u64 response_paddr, u32 status, u64 abi_slot, u64 loader_slot) {
@@ -530,8 +553,10 @@ static void handle_request_paddr(u64 request_paddr) {
         return;
     }
     volatile struct linux_abi_bootstrap_config *abi_cfg = 0;
-    const u64 abi_slot = start_linux_abi_server(request, &abi_cfg);
-    if (abi_slot == 0) {
+    u64 abi_slot = 0;
+    const u64 abi_handle = start_linux_abi_server(request, &abi_cfg, &abi_slot);
+    const u64 abi_target_token = delegate_target_token_from_process_handle(abi_handle);
+    if (abi_slot == 0 || abi_target_token == 0) {
         (void)vfs_request(FS_OP_CLOSE, app_open_token, 0, 0, 0, 0);
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, 0, 0);
         return;
@@ -551,7 +576,8 @@ static void handle_request_paddr(u64 request_paddr) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, 0, 0);
         return;
     }
-    const u64 loader_slot = spawn_exec_loader(request, app_vm_token, app_bytes, abi_slot);
+    const u64 loader_handle = spawn_exec_loader(request, app_vm_token, app_bytes, abi_target_token);
+    const u64 loader_slot = decode_process_handle_slot(loader_handle);
     if (loader_slot == 0) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, abi_slot, 0);
         return;
@@ -593,9 +619,9 @@ void exec_service_main(void) {
         user_log("ExecService: preload failed\n");
         for (;;) (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
     }
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
-    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_SERVICE_ENDPOINT_ID, self_slot) != SYSCALL_OK ||
-        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, EXEC_SERVICE_ENDPOINT_ID, self_slot) != SYSCALL_OK) {
+    const u64 self_handle = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_SERVICE_ENDPOINT_ID, self_handle) != SYSCALL_OK ||
+        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, EXEC_SERVICE_ENDPOINT_ID, self_handle) != SYSCALL_OK) {
         user_log("ExecService: publish failed\n");
         for (;;) __asm__ volatile("pause");
     }

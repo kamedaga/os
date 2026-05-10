@@ -7,6 +7,7 @@ enum {
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
+    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_OK = 0,
@@ -71,7 +72,7 @@ static void copy_bytes_from_volatile(const volatile u8 *src, u8 *dst, u64 len) {
     for (u64 i = 0; i < len; i++) dst[i] = src[i];
 }
 
-static int find_block_service(u64 *endpoint_id, u64 *process_slot) {
+static int find_block_service(u64 *endpoint_id, u64 *process_handle) {
     volatile struct service_registry_page *page = (volatile struct service_registry_page *)SERVICE_REGISTRY_PAGE_VA;
     if (page->magic != SERVICE_REGISTRY_MAGIC || page->version != SERVICE_REGISTRY_VERSION) return 0;
     u64 count = page->entry_count;
@@ -81,36 +82,36 @@ static int find_block_service(u64 *endpoint_id, u64 *process_slot) {
         if (entry->kind != SERVICE_KIND_BLOCK) continue;
         if (entry->endpoint_id == 0) return 0;
         *endpoint_id = entry->endpoint_id;
-        *process_slot = ((entry->flags & SERVICE_FLAG_PROCESS_SLOT_COMPAT) != 0) ? entry->process_slot : 0;
+        *process_handle = entry->process_handle;
         return 1;
     }
     return 0;
 }
 
-static int install_compat_endpoint_if_needed(u64 endpoint_id, u64 process_slot) {
-    if (process_slot == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, process_slot) == SYSCALL_OK;
+static int install_endpoint_if_needed(u64 endpoint_id, u64 process_handle) {
+    if (process_handle == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, process_handle) == SYSCALL_OK;
 }
 
-static int grant_response_cap(u64 response_paddr, u64 endpoint_id, u64 process_slot) {
+static int grant_response_cap(u64 response_paddr, u64 endpoint_id, u64 process_handle) {
     u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
     if (ret == SYSCALL_OK) return 1;
     if (ret != SYSCALL_ERR_ENDPOINT) return 0;
-    if (!install_compat_endpoint_if_needed(endpoint_id, process_slot)) return 0;
+    if (!install_endpoint_if_needed(endpoint_id, process_handle)) return 0;
     return syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) == SYSCALL_OK;
 }
 
-static int share_request_cap(u64 request_paddr, u64 endpoint_id, u64 process_slot) {
+static int share_request_cap(u64 request_paddr, u64 endpoint_id, u64 process_handle) {
     u64 ret = syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id);
     if (ret == SYSCALL_OK) return 1;
     if (ret != SYSCALL_ERR_ENDPOINT) return 0;
-    if (!install_compat_endpoint_if_needed(endpoint_id, process_slot)) return 0;
+    if (!install_endpoint_if_needed(endpoint_id, process_handle)) return 0;
     return syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id) == SYSCALL_OK;
 }
 
-static u64 make_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
+static u64 make_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_handle) {
     u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^
-        ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x517cc1b727220a95ULL;
+        ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_handle ^ 0x517cc1b727220a95ULL;
     return nonce == 0 ? 1 : nonce;
 }
 
@@ -153,15 +154,15 @@ static u64 begin_request(struct block_client *client, u16 op, u64 object_token, 
 
 int block_client_connect(struct block_client *client) {
     u64 endpoint_id = 0;
-    u64 process_slot = 0;
-    if (!find_block_service(&endpoint_id, &process_slot)) return 0;
+    u64 process_handle = 0;
+    if (!find_block_service(&endpoint_id, &process_handle)) return 0;
 
     u64 paddrs[2] = {0, 0};
     if (syscall4(SYSCALL_ALLOC_MAP_PAGES, BLOCK_REQUEST_VA, 2, 1, (u64)paddrs) != SYSCALL_OK) return 0;
     if (paddrs[0] < 0x1000 || paddrs[1] < 0x1000) return 0;
-    if (!grant_response_cap(paddrs[1], endpoint_id, process_slot)) return 0;
+    if (!grant_response_cap(paddrs[1], endpoint_id, process_handle)) return 0;
 
-    u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
     u64 nonce = make_session_nonce(paddrs[0], paddrs[1], endpoint_id, self_slot);
 
     clear_page(BLOCK_REQUEST_VA);
@@ -175,14 +176,14 @@ int block_client_connect(struct block_client *client) {
     request->arg1 = self_slot;
     request->session_nonce = nonce;
 
-    if (!share_request_cap(paddrs[0], endpoint_id, process_slot)) return 0;
+    if (!share_request_cap(paddrs[0], endpoint_id, process_handle)) return 0;
 
     client->request_va = BLOCK_REQUEST_VA;
     client->response_va = BLOCK_RESPONSE_VA;
     client->request_paddr = paddrs[0];
     client->response_paddr = paddrs[1];
     client->endpoint_id = endpoint_id;
-    client->server_process_slot = process_slot;
+    client->server_process_handle = process_handle;
     client->session_nonce = nonce;
     client->next_seq = 2;
 

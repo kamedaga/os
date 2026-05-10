@@ -1,44 +1,60 @@
-# Zig build artifacts
+# Build outputs
+.artifacts/
+**/zig-out/
 kernel/.zig-cache/
-kernel/zig-out/
 .zig-cache/
 .zig-cache-global/
 .zig-cache-local/
 .zig-global-cache/
-.cargo/
-tools/wasmtime_artifact_builder/target
-target/
-**/target/
-tools/pactl/target
-**/zig-out/
-*.pdb
+
+# Object/debug files
 *.o
 *.obj
+*.pdb
+*.dSYM/
 
-legacy/
+# Rust/Cargo outputs
+target/
+**/target/
+.cargo/
 
-# Runtime / emulator artifacts
-.artifacts/
-_disk_bootx64.efi
+# Runtime and emulator outputs
 *.img
 *.fd
 *.qcow2
 *.log
+*.trace
+*.dump
+*.dmp
+_disk_bootx64.efi
 
-# TLA+ state dumps
+# Temporary files
+tmp-*
+*.tmp
+*.bak
+*.old
+*.orig
+*.rej
+*~
+
+# Test/model-check state
 tla/states/
 states/
+.pytest_cache/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local notes and private workspace files
+.claude/
+legacy/
+README-neta.md
+hikitugi.md
+
+# Vendored/generated fixture files
+userland/fixtures/ca-certificates.crt
 
 # OS/editor noise
 .DS_Store
 Thumbs.db
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-.claude
-
-README-neta.md
-hikitugi.md
-userland\fixtures\ca-certificates.crt
-userland/fixtures/ca-certificates.crt

@@ -406,40 +406,6 @@ fn activateThreadOrHalt(thread_index: usize) void {
     halt.haltWithMessage("activate thread failed");
 }
 
-fn scrubMailboxSender(mailbox: *kernel.CapMailbox, sender: kernel.PrincipalId) bool {
-    var out: usize = 0;
-    var changed = false;
-    var i: usize = 0;
-    while (i < mailbox.len) : (i += 1) {
-        const item = mailbox.items[i];
-        if (item.sender == sender) {
-            changed = true;
-            continue;
-        }
-        mailbox.items[out] = item;
-        out += 1;
-    }
-    mailbox.len = out;
-    return changed;
-}
-
-fn scrubEndpointTargets(table: *kernel.EndpointCNode, target: kernel.PrincipalId) bool {
-    var out: usize = 0;
-    var changed = false;
-    var i: usize = 0;
-    while (i < table.len) : (i += 1) {
-        const entry = table.caps[i];
-        if (entry.target == target) {
-            changed = true;
-            continue;
-        }
-        table.caps[out] = entry;
-        out += 1;
-    }
-    table.len = out;
-    return changed;
-}
-
 fn nextReadyThreadAfter(current_thread: usize) ?usize {
     var step: usize = 1;
     while (step <= scheduler.max_thread_slots) : (step += 1) {
@@ -484,7 +450,20 @@ fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
     }
 }
 
-fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
+fn wakeRetiredProcessOwners(retired: kernel.RetireProcessResult) void {
+    var mask = retired.wake_process_mask;
+    while (mask != 0) {
+        const bit: u6 = @intCast(@ctz(mask));
+        mask &= mask - 1;
+        const owner = kernel.processPrincipalFromIndex(bit) orelse continue;
+        scheduler.wakeBlockedThreadForPrincipal(owner);
+    }
+    if (retired.endpoint_targets_removed) {
+        scheduler.invalidateAllIpcFastpathState();
+    }
+}
+
+fn retireProcessRuntime(principal: kernel.PrincipalId, reason: kernel.RetireProcessReason, fault_vector: u8) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
 
@@ -497,97 +476,19 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     }
 
     user_spaces[process_index] = .{};
-    kernel_state_global.cap_tables[process_index] = .{};
-    kernel_state_global.endpoint_tables[process_index] = .{};
-    kernel_state_global.cap_mailboxes[process_index] = .{};
-    kernel_state_global.pending_page_transfers[process_index] = null;
-    kernel_state_global.vm_object_tables[process_index] = .{};
-    kernel_state_global.exec_image_tables[process_index] = .{};
-    _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
-
-    var endpoint_targets_removed = false;
-    var storage_index: usize = 0;
-    while (storage_index < kernel.principal_count) : (storage_index += 1) {
-        var wake_owner = false;
-        if (storage_index < kernel.process_count) {
-            const removed = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
-            if (removed) endpoint_targets_removed = true;
-            wake_owner = removed;
-        }
-        if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
-            wake_owner = true;
-        }
-        if (kernel_state_global.pending_page_transfers[storage_index]) |pending| {
-            if (pending.sender == principal) {
-                kernel_state_global.pending_page_transfers[storage_index] = null;
-                wake_owner = true;
-            }
-        }
-        if (!wake_owner) continue;
-        if (storage_index >= kernel.process_count) continue;
-        const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
-        scheduler.wakeBlockedThreadForPrincipal(owner);
+    if (kernel_state_global.retireProcessIncarnation(principal, reason, fault_vector)) |retired| {
+        wakeRetiredProcessOwners(retired);
     }
-    if (endpoint_targets_removed) {
-        kernel_state_global.bumpEndpointGeneration();
-        scheduler.invalidateAllIpcFastpathState();
-    }
-
-    _ = kernel_state_global.markProcessFaulted(principal, fault_vector);
+    kernel_state_global.prepareProcessSlotForReuse(principal, &global_free_list);
     if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
 }
 
+fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
+    retireProcessRuntime(principal, .fault, fault_vector);
+}
+
 fn teardownExitedProcess(principal: kernel.PrincipalId) void {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
-    const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
-
-    if (scheduler.runtime_priority_principal) |priority_principal| {
-        if (priority_principal == principal) scheduler.setRuntimePriorityPrincipal(null);
-    }
-
-    if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
-        _ = scheduler.releaseThreadSlot(thread_index);
-    }
-
-    user_spaces[process_index] = .{};
-    kernel_state_global.cap_tables[process_index] = .{};
-    kernel_state_global.endpoint_tables[process_index] = .{};
-    kernel_state_global.cap_mailboxes[process_index] = .{};
-    kernel_state_global.pending_page_transfers[process_index] = null;
-    kernel_state_global.vm_object_tables[process_index] = .{};
-    kernel_state_global.exec_image_tables[process_index] = .{};
-    _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
-
-    var endpoint_targets_removed = false;
-    var storage_index: usize = 0;
-    while (storage_index < kernel.principal_count) : (storage_index += 1) {
-        var wake_owner = false;
-        if (storage_index < kernel.process_count) {
-            const removed = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
-            if (removed) endpoint_targets_removed = true;
-            wake_owner = removed;
-        }
-        if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
-            wake_owner = true;
-        }
-        if (kernel_state_global.pending_page_transfers[storage_index]) |pending| {
-            if (pending.sender == principal) {
-                kernel_state_global.pending_page_transfers[storage_index] = null;
-                wake_owner = true;
-            }
-        }
-        if (!wake_owner) continue;
-        if (storage_index >= kernel.process_count) continue;
-        const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
-        scheduler.wakeBlockedThreadForPrincipal(owner);
-    }
-    if (endpoint_targets_removed) {
-        kernel_state_global.bumpEndpointGeneration();
-        scheduler.invalidateAllIpcFastpathState();
-    }
-
-    _ = kernel_state_global.markProcessExited(principal);
-    if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
+    retireProcessRuntime(principal, .exit, 0);
 }
 
 fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) void {
@@ -892,6 +793,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
         .consume_pending_signal_for_principal = scheduler.consumePendingSignalForPrincipal,
+        .wake_blocked_thread_for_principal = scheduler.wakeBlockedThreadForPrincipal,
         .block_current_thread_for_event = scheduler.blockCurrentThreadForEvent,
         .exit_current_process = exitCurrentProcess,
     });

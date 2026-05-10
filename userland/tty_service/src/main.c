@@ -17,13 +17,14 @@ enum {
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
+    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
 
     PAGE_BYTES = 4096,
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
     SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
-    SERVICE_REGISTRY_VERSION = 1,
+    SERVICE_REGISTRY_VERSION = 2,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     SERVICE_KIND_CONSOLE = 10,
 
@@ -56,7 +57,7 @@ enum {
     TTY_INPUT_RING_BYTES = 4096,
 };
 
-struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
+struct service_entry { u64 kind; u64 process_handle; u64 endpoint_id; u64 flags; };
 struct service_registry_page { u64 magic; u64 version; u64 entry_count; u64 reserved0; struct service_entry entries[SERVICE_REGISTRY_MAX_ENTRIES]; };
 
 struct console_request_header {
@@ -72,7 +73,7 @@ struct console_response_header {
 struct console_client {
     int active;
     u64 endpoint_id;
-    u64 process_slot;
+    u64 process_handle;
     u64 request_paddr;
     u64 response_paddr;
     u64 session_nonce;
@@ -146,9 +147,9 @@ void tty_service_main(void) {
     while (!backend_connect_console()) (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
     tty_core_init_defaults();
 
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
-    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, TTY_SERVICE_ENDPOINT_ID, self_slot) != SYSCALL_OK ||
-        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, TTY_SERVICE_ENDPOINT_ID, self_slot) != SYSCALL_OK) {
+    const u64 self_handle = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, TTY_SERVICE_ENDPOINT_ID, self_handle) != SYSCALL_OK ||
+        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, TTY_SERVICE_ENDPOINT_ID, self_handle) != SYSCALL_OK) {
         user_log("TtyService: publish failed\n");
         for (;;) (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
     }

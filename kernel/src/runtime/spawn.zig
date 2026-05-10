@@ -139,11 +139,10 @@ pub fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
     const bootstrap_ap_blocked = bootstrap_spawn and !bootstrap_request.allow_bootstrap_ap_placement;
     const dry_run_ap_cpu = scheduler.chooseCpuForThread(created.process.thread_slot, false);
     const dry_run_any_cpu = scheduler.chooseCpuForThread(created.process.thread_slot, true);
-    const ap_placement_block: scheduler.SpawnExecApUserSchedulingBlock = if (bootstrap_ap_blocked) .bootstrap_path else scheduler.spawnExecApUserSchedulingBlockReason();
-    const ap_placed_cpu = if (bootstrap_ap_blocked) null else scheduler.readySpawnExecThreadOnApIfReady(created.process.thread_slot);
-    if (ap_placed_cpu == null) {
-        if (!scheduler.setThreadReady(created.process.thread_slot, true)) return boot_static.syscall_err_not_ready;
-    }
+    const placement = scheduler.readyUserThreadForStartWithBlock(
+        created.process.thread_slot,
+        if (bootstrap_ap_blocked) .bootstrap_path else null,
+    ) orelse return boot_static.syscall_err_not_ready;
 
     const log_spawn = if (boot_init_principal) |init_principal|
         caller == init_principal or state_ptr.isBootstrapOwner(caller)
@@ -167,10 +166,10 @@ pub fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
             kernel_log.write("none");
         }
         kernel_log.write(" sched_ap_place=");
-        if (ap_placed_cpu) |cpu| {
+        if (placement.ap_placed_cpu) |cpu| {
             log_util.printNumber(@as(u64, @intCast(cpu)));
         } else {
-            writeApPlacementBlock(ap_placement_block);
+            writeApPlacementBlock(placement.block_reason);
         }
         kernel_log.write(" assigned_cpu=");
         log_util.printNumber(@as(u64, @intCast(scheduler.threadCpuSlot(created.process.thread_slot) orelse scheduler.idle_thread_marker)));
@@ -183,9 +182,10 @@ pub fn spawnExecFromSyscall(frame: *TrapFrame) u64 {
         kernel_log.write("\n");
     }
 
+    const generation = state_ptr.processGeneration(created.principal) orelse return boot_static.syscall_err_invalid;
     return boot_abi.process_abi.encodeSpawnedProcess(
         @intCast(kernel.processIndexFromPrincipal(created.principal).?),
-        @intCast(created.process.thread_slot),
+        generation,
     );
 }
 

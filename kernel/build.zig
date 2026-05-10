@@ -83,9 +83,22 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.stack_size = 512 * 1024 * 1024;
 
+    const scheduler_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/scheduler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scheduler_test_mod.addOptions("build_workarounds", build_workarounds);
+    scheduler_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const scheduler_unit_tests = b.addTest(.{
+        .root_module = scheduler_test_mod,
+    });
+
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    const run_scheduler_unit_tests = b.addRunArtifact(scheduler_unit_tests);
     const test_step = b.step("test", "Run kernel unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_scheduler_unit_tests.step);
 
     const efi_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

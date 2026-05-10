@@ -13,9 +13,9 @@ enum {
     BLOCK_OP_READ_BLOCKS = 3,
     BLOCK_STATUS_OK = 0,
     SERVICE_REGISTRY_MAGIC = 0x53525643u,
-    SERVICE_REGISTRY_VERSION = 1,
+    SERVICE_REGISTRY_VERSION = 2,
     SERVICE_KIND_BLOCK = 4,
-    SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
+    SERVICE_FLAG_RESERVED0 = 1,
 };
 
 struct block_request_header {
@@ -53,7 +53,7 @@ struct block_response_header {
 
 struct service_registry_entry {
     u64 kind;
-    u64 process_slot;
+    u64 process_handle;
     u64 endpoint_id;
     u64 flags;
 };
@@ -72,7 +72,7 @@ struct block_client {
     u64 request_paddr;
     u64 response_paddr;
     u64 endpoint_id;
-    u64 server_process_slot;
+    u64 server_process_handle;
     u64 session_nonce;
     u64 root_token;
     u64 block_size;

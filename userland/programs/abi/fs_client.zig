@@ -49,16 +49,14 @@ pub const Error = error{
 pub const ConnectOptions = struct {
     request_va: u64 = 0,
     response_va: u64 = 0,
-    client_process_slot: u64,
+    client_process_handle: u64,
     endpoint_id: u64,
     response_poll_limit: u64 = default_response_poll_limit,
-    compat_process_slot: u64 = 0,
-    allow_process_slot_compat: bool = false,
+    service_process_handle: u64 = 0,
 };
 
 pub const RegistryConnectOptions = struct {
     response_poll_limit: u64 = default_response_poll_limit,
-    allow_process_slot_compat: bool = true,
 };
 
 pub const LookupResult = struct {
@@ -115,9 +113,9 @@ pub const Client = struct {
 
     pub fn connect(options: ConnectOptions) Error!Client {
         const pages = try allocConnectPages(options.request_va, options.response_va);
-        var compat_installed = false;
-        try grantResponseCapForConnect(pages.response_paddr, options, &compat_installed);
-        const session_nonce = makeSessionNonce(pages.request_paddr, pages.response_paddr, options.endpoint_id, options.client_process_slot);
+        var endpoint_installed = false;
+        try grantResponseCapForConnect(pages.response_paddr, options, &endpoint_installed);
+        const session_nonce = makeSessionNonce(pages.request_paddr, pages.response_paddr, options.endpoint_id, options.client_process_handle);
 
         var client = Client{
             .request_va = pages.request_va,
@@ -143,12 +141,12 @@ pub const Client = struct {
         request.inline_bytes = 0;
         request.reserved0 = 0;
         request.arg0 = pages.response_paddr;
-        request.arg1 = options.client_process_slot;
+        request.arg1 = options.client_process_handle;
         request.session_nonce = session_nonce;
         compilerBarrier();
         request.request_seq = 1;
 
-        try shareConnectRequest(pages.request_paddr, options, &compat_installed);
+        try shareConnectRequest(pages.request_paddr, options, &endpoint_installed);
         const response = try client.finishRequestOk(1, .connect);
         client.mount_token = response.result_token;
         if (!fs_abi.isCapToken(client.mount_token)) return error.InvalidResponse;
@@ -161,20 +159,18 @@ pub const Client = struct {
         service_kind: service_registry_abi.ServiceKind,
         request_va: u64,
         response_va: u64,
-        client_process_slot: u64,
+        client_process_handle: u64,
         options: RegistryConnectOptions,
     ) Error!Client {
         const entry = service_registry_abi.findService(registry_page_va, service_kind) orelse return error.NotFound;
-        if (entry.endpoint_id == 0) return error.Invalid;
-        const compat_allowed = service_registry_abi.allowsProcessSlotCompat(entry);
+        if (entry.endpoint_id == 0 or !service_registry_abi.hasProcessHandle(entry)) return error.Invalid;
         return connect(.{
             .request_va = request_va,
             .response_va = response_va,
-            .client_process_slot = client_process_slot,
+            .client_process_handle = client_process_handle,
             .endpoint_id = entry.endpoint_id,
             .response_poll_limit = options.response_poll_limit,
-            .compat_process_slot = if (compat_allowed) entry.process_slot else 0,
-            .allow_process_slot_compat = options.allow_process_slot_compat and compat_allowed,
+            .service_process_handle = entry.process_handle,
         });
     }
 
@@ -183,20 +179,20 @@ pub const Client = struct {
         service_kind: service_registry_abi.ServiceKind,
         request_va: u64,
         response_va: u64,
-        client_process_slot: u64,
+        client_process_handle: u64,
     ) Error!Client {
-        return connectFromRegistryPageKindOptions(registry_page_va, service_kind, request_va, response_va, client_process_slot, .{});
+        return connectFromRegistryPageKindOptions(registry_page_va, service_kind, request_va, response_va, client_process_handle, .{});
     }
 
-    pub fn connectFromRegistryPage(registry_page_va: u64, request_va: u64, response_va: u64, client_process_slot: u64) Error!Client {
-        return connectFromRegistryPageKind(registry_page_va, .persistent_fs, request_va, response_va, client_process_slot);
+    pub fn connectFromRegistryPage(registry_page_va: u64, request_va: u64, response_va: u64, client_process_handle: u64) Error!Client {
+        return connectFromRegistryPageKind(registry_page_va, .persistent_fs, request_va, response_va, client_process_handle);
     }
 
     pub fn connectFromRegistryPageOptions(
         registry_page_va: u64,
         request_va: u64,
         response_va: u64,
-        client_process_slot: u64,
+        client_process_handle: u64,
         options: RegistryConnectOptions,
     ) Error!Client {
         return connectFromRegistryPageKindOptions(
@@ -204,7 +200,7 @@ pub const Client = struct {
             .persistent_fs,
             request_va,
             response_va,
-            client_process_slot,
+            client_process_handle,
             options,
         );
     }
@@ -213,23 +209,23 @@ pub const Client = struct {
         service_kind: service_registry_abi.ServiceKind,
         request_va: u64,
         response_va: u64,
-        client_process_slot: u64,
+        client_process_handle: u64,
         options: RegistryConnectOptions,
     ) Error!Client {
-        return connectFromRegistryPageKindOptions(service_registry_abi.page_va, service_kind, request_va, response_va, client_process_slot, options);
+        return connectFromRegistryPageKindOptions(service_registry_abi.page_va, service_kind, request_va, response_va, client_process_handle, options);
     }
 
     pub fn connectFromServiceRegistryKind(
         service_kind: service_registry_abi.ServiceKind,
         request_va: u64,
         response_va: u64,
-        client_process_slot: u64,
+        client_process_handle: u64,
     ) Error!Client {
-        return connectFromServiceRegistryKindOptions(service_kind, request_va, response_va, client_process_slot, .{});
+        return connectFromServiceRegistryKindOptions(service_kind, request_va, response_va, client_process_handle, .{});
     }
 
-    pub fn connectFromServiceRegistry(request_va: u64, response_va: u64, client_process_slot: u64) Error!Client {
-        return connectFromServiceRegistryKind(.persistent_fs, request_va, response_va, client_process_slot);
+    pub fn connectFromServiceRegistry(request_va: u64, response_va: u64, client_process_handle: u64) Error!Client {
+        return connectFromServiceRegistryKind(.persistent_fs, request_va, response_va, client_process_handle);
     }
 
     pub fn lookup(self: *Client, object_token: u64, path: []const u8) Error!LookupResult {
@@ -575,13 +571,13 @@ fn grantCapOnEndpoint(paddr: u64, endpoint_id: u64, rights_bits: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn grantResponseCapForConnect(paddr: u64, options: ConnectOptions, compat_installed: *bool) Error!void {
+fn grantResponseCapForConnect(paddr: u64, options: ConnectOptions, endpoint_installed: *bool) Error!void {
     const result = grantCapOnEndpoint(paddr, options.endpoint_id, page_right_cpu_read | page_right_cpu_write);
     if (result == syscall_ok) return;
     if (result != syscall_err_endpoint) return error.ResponseGrantFailed;
 
-    if (!compat_installed.* and try attemptCompatEndpointInstall(options)) {
-        compat_installed.* = true;
+    if (!endpoint_installed.* and try attemptEndpointInstall(options)) {
+        endpoint_installed.* = true;
         const retry = grantCapOnEndpoint(paddr, options.endpoint_id, page_right_cpu_read | page_right_cpu_write);
         if (retry == syscall_ok) return;
         if (retry == syscall_err_endpoint) return error.EndpointNotFound;
@@ -590,13 +586,13 @@ fn grantResponseCapForConnect(paddr: u64, options: ConnectOptions, compat_instal
     return error.EndpointNotFound;
 }
 
-fn shareConnectRequest(paddr: u64, options: ConnectOptions, compat_installed: *bool) Error!void {
+fn shareConnectRequest(paddr: u64, options: ConnectOptions, endpoint_installed: *bool) Error!void {
     const result = shareCap(paddr, options.endpoint_id);
     if (result == syscall_ok) return;
     if (result != syscall_err_endpoint) return error.ConnectSendFailed;
 
-    if (!compat_installed.* and try attemptCompatEndpointInstall(options)) {
-        compat_installed.* = true;
+    if (!endpoint_installed.* and try attemptEndpointInstall(options)) {
+        endpoint_installed.* = true;
         const retry = shareCap(paddr, options.endpoint_id);
         if (retry == syscall_ok) return;
         if (retry == syscall_err_endpoint) return error.EndpointNotFound;
@@ -605,23 +601,22 @@ fn shareConnectRequest(paddr: u64, options: ConnectOptions, compat_installed: *b
     return error.EndpointNotFound;
 }
 
-fn attemptCompatEndpointInstall(options: ConnectOptions) Error!bool {
-    if (!options.allow_process_slot_compat or options.compat_process_slot == 0) return false;
-    _ = userLog("fs_client: process-slot compat fallback\n");
-    return switch (installEndpoint(options.endpoint_id, options.compat_process_slot)) {
+fn attemptEndpointInstall(options: ConnectOptions) Error!bool {
+    if (options.service_process_handle == 0) return false;
+    return switch (installEndpoint(options.endpoint_id, options.service_process_handle)) {
         syscall_ok => true,
         else => error.EndpointInstallFailed,
     };
 }
 
-fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
+fn installEndpoint(endpoint_id: u64, target_process_handle: u64) u64 {
     return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_install_endpoint),
           [arg0] "{rdi}" (@as(u64, 0)),
           [arg1] "{rsi}" (endpoint_id),
-          [arg2] "{rdx}" (target_process_slot),
+          [arg2] "{rdx}" (target_process_handle),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 

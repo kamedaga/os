@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const capability = @import("capability.zig");
+pub const capability = @import("capability.zig");
 const abi_root = @import("kernel_abi_root");
 const cap_transfer_abi = abi_root.cap_transfer_abi;
+const process_abi = abi_root.process_abi;
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
 pub const device_capabilities = @import("device_capabilities.zig");
 pub const initial_process_count: usize = 8;
@@ -113,21 +114,34 @@ pub const Region = struct {
 pub const ProcessDescriptor = struct {
     active: bool = false,
     principal: PrincipalId = @enumFromInt(0),
+    generation: u64 = 0,
     label: []const u8 = "",
     bootstrap_owner: bool = false,
     process_builder_owner: ?PrincipalId = null,
     process_builder_suspended: bool = false,
-    abi_trap_delegate_endpoint_id: u64 = 0,
-    abi_trap_delegate_flavor: u32 = 0,
-    abi_trap_request_page_va: u64 = 0,
+    abi_trap_delegate: ?AbiTrapDelegateState = null,
     faulted: bool = false,
     fault_vector: u8 = 0,
+};
+
+pub const AbiTrapDelegateState = struct {
+    endpoint_id: u64,
+    flavor: u32,
+    request_page_va: u64,
+    target_generation: u64,
+    server_principal: PrincipalId,
+    server_generation: u64,
+    request_generation: u64,
 };
 
 pub const AbiTrapDelegate = struct {
     endpoint_id: u64,
     flavor: u32,
     request_page_va: u64,
+    target_generation: u64,
+    server_principal: PrincipalId,
+    server_generation: u64,
+    request_generation: u64,
 };
 
 pub const ProcessStatus = struct {
@@ -142,6 +156,17 @@ pub const DebugProcessLifecycleReason = enum(u8) {
     fault,
     exit,
     remove,
+};
+
+pub const RetireProcessReason = enum(u8) {
+    exit,
+    fault,
+};
+
+pub const RetireProcessResult = struct {
+    wake_process_mask: u64 = 0,
+    endpoint_targets_removed: bool = false,
+    published_endpoints_removed: bool = false,
 };
 
 pub const KernelError = error{
@@ -531,20 +556,61 @@ pub const FreePageList = struct {
     }
 
     pub fn appendPage(self: *FreePageList, region_id: u64, paddr: u64) KernelError!void {
-        // 直前 range と「同じ region かつ物理的に連続」の場合は range を延長する。
-        if (self.range_len > 0) {
-            const last = &self.ranges[self.range_len - 1];
-            const expected_next = last.physical_start + (@as(u64, last.len) * 4096);
-            if (last.region_id == region_id and paddr == expected_next) {
-                self.len += 1;
-                last.len += 1;
-                return;
+        var insert_index: usize = 0;
+        while (insert_index < self.range_len) : (insert_index += 1) {
+            const range = self.ranges[insert_index];
+            if (range.region_id > region_id) break;
+            if (range.region_id == region_id) {
+                if (paddr < range.physical_start) break;
+                const range_end = range.physical_start + (@as(u64, range.len) * 4096);
+                if (paddr < range_end) return KernelError.InvalidState;
             }
+        }
+
+        const prev_index: ?usize = if (insert_index > 0) insert_index - 1 else null;
+        const next_index: ?usize = if (insert_index < self.range_len) insert_index else null;
+        const prev_adjacent = if (prev_index) |prev_i| blk: {
+            const prev = self.ranges[prev_i];
+            const prev_end = prev.physical_start + (@as(u64, prev.len) * 4096);
+            break :blk prev.region_id == region_id and prev_end == paddr;
+        } else false;
+        const next_adjacent = if (next_index) |next_i| blk: {
+            const next = self.ranges[next_i];
+            break :blk next.region_id == region_id and paddr + 4096 == next.physical_start;
+        } else false;
+
+        if (prev_adjacent) {
+            const prev_i = prev_index.?;
+            self.ranges[prev_i].len += 1;
+            self.len += 1;
+            if (next_adjacent) {
+                const next_i = next_index.?;
+                self.ranges[prev_i].len += self.ranges[next_i].len;
+                var r: usize = next_i + 1;
+                while (r < self.range_len) : (r += 1) {
+                    self.ranges[r - 1] = self.ranges[r];
+                }
+                self.range_len -= 1;
+            }
+            return;
+        }
+
+        if (next_adjacent) {
+            const next_i = next_index.?;
+            self.ranges[next_i].physical_start = paddr;
+            self.ranges[next_i].len += 1;
+            self.len += 1;
+            return;
         }
 
         if (self.range_len >= self.ranges.len) return KernelError.TooManyFreeRanges;
 
-        self.ranges[self.range_len] = .{
+        var r: usize = self.range_len;
+        while (r > insert_index) : (r -= 1) {
+            self.ranges[r] = self.ranges[r - 1];
+        }
+
+        self.ranges[insert_index] = .{
             .region_id = region_id,
             .len = 1,
             .physical_start = paddr,
@@ -554,10 +620,25 @@ pub const FreePageList = struct {
     }
 
     pub fn canAppendPage(self: *const FreePageList, region_id: u64, paddr: u64) bool {
-        if (self.range_len > 0) {
-            const last = &self.ranges[self.range_len - 1];
-            const expected_next = last.physical_start + (@as(u64, last.len) * 4096);
-            if (last.region_id == region_id and paddr == expected_next) return true;
+        var insert_index: usize = 0;
+        while (insert_index < self.range_len) : (insert_index += 1) {
+            const range = self.ranges[insert_index];
+            if (range.region_id > region_id) break;
+            if (range.region_id == region_id) {
+                if (paddr < range.physical_start) break;
+                const range_end = range.physical_start + (@as(u64, range.len) * 4096);
+                if (paddr < range_end) return false;
+            }
+        }
+
+        if (insert_index > 0) {
+            const prev = self.ranges[insert_index - 1];
+            const prev_end = prev.physical_start + (@as(u64, prev.len) * 4096);
+            if (prev.region_id == region_id and prev_end == paddr) return true;
+        }
+        if (insert_index < self.range_len) {
+            const next = self.ranges[insert_index];
+            if (next.region_id == region_id and paddr + 4096 == next.physical_start) return true;
         }
         return self.range_len < self.ranges.len;
     }
@@ -916,10 +997,76 @@ pub const KernelState = struct {
         return self.process_descriptors[index].active;
     }
 
+    fn nextProcessGeneration(current: u64) u64 {
+        const next = current +% 1;
+        if (next == 0 or next > process_abi.process_handle_generation_mask) return 1;
+        return next;
+    }
+
+    fn activateProcessDescriptorSlot(
+        self: *KernelState,
+        index: usize,
+        label: []const u8,
+        clear_storage: bool,
+        reason: DebugProcessLifecycleReason,
+    ) PrincipalId {
+        const principal = processPrincipal(index);
+        const generation = nextProcessGeneration(self.process_descriptors[index].generation);
+        if (clear_storage) self.clearPrincipalTablesForReuse(index);
+        self.process_descriptors[index] = .{
+            .active = true,
+            .principal = principal,
+            .generation = generation,
+            .label = label,
+        };
+        self.active_process_count += 1;
+        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, reason);
+        return principal;
+    }
+
+    fn clearProcessDescriptorTransientState(self: *KernelState, index: usize) void {
+        self.process_descriptors[index].bootstrap_owner = false;
+        self.process_descriptors[index].process_builder_owner = null;
+        self.process_descriptors[index].process_builder_suspended = false;
+        self.process_descriptors[index].abi_trap_delegate = null;
+    }
+
     pub fn processDescriptor(self: *const KernelState, principal: PrincipalId) ?*const ProcessDescriptor {
         const index = processIndexFromPrincipal(principal) orelse return null;
         if (!self.process_descriptors[index].active) return null;
         return &self.process_descriptors[index];
+    }
+
+    pub fn processGeneration(self: *const KernelState, principal: PrincipalId) ?u64 {
+        const desc = self.processDescriptor(principal) orelse return null;
+        if (desc.generation == 0) return null;
+        return desc.generation;
+    }
+
+    pub fn processHandleFor(self: *const KernelState, principal: PrincipalId) ?process_abi.ProcessHandle {
+        const index = processIndexFromPrincipal(principal) orelse return null;
+        if (index == 0) return null;
+        const desc = self.process_descriptors[index];
+        if (!desc.active or desc.generation == 0) return null;
+        return .{
+            .slot = @intCast(index),
+            .generation = desc.generation,
+        };
+    }
+
+    pub fn principalFromProcessHandle(self: *const KernelState, handle: process_abi.ProcessHandle) ?PrincipalId {
+        if (handle.slot == 0 or handle.generation == 0) return null;
+        if (handle.slot > std.math.maxInt(usize)) return null;
+        const index: usize = @intCast(handle.slot);
+        if (index >= process_count) return null;
+        const desc = self.process_descriptors[index];
+        if (!desc.active or desc.generation != handle.generation) return null;
+        return desc.principal;
+    }
+
+    pub fn principalFromEncodedProcessHandle(self: *const KernelState, encoded: u64) ?PrincipalId {
+        const handle = process_abi.decodeProcessHandle(encoded) orelse return null;
+        return self.principalFromProcessHandle(handle);
     }
 
     pub fn processStatus(self: *const KernelState, principal: PrincipalId) ProcessStatus {
@@ -967,20 +1114,92 @@ pub const KernelState = struct {
         self.exec_image_tables[index] = .{};
     }
 
+    fn markWakeProcess(result: *RetireProcessResult, storage_index: usize) void {
+        if (storage_index >= process_count or storage_index >= 64) return;
+        result.wake_process_mask |= @as(u64, 1) << @intCast(storage_index);
+    }
+
+    fn scrubMailboxSender(mailbox: *CapMailbox, sender: PrincipalId) bool {
+        var out: usize = 0;
+        var changed = false;
+        var i: usize = 0;
+        while (i < mailbox.len) : (i += 1) {
+            const item = mailbox.items[i];
+            if (item.sender == sender) {
+                changed = true;
+                continue;
+            }
+            mailbox.items[out] = item;
+            out += 1;
+        }
+        mailbox.len = out;
+        return changed;
+    }
+
+    fn scrubEndpointTargets(table: *EndpointCNode, target: PrincipalId) bool {
+        var out: usize = 0;
+        var changed = false;
+        var i: usize = 0;
+        while (i < table.len) : (i += 1) {
+            const entry = table.caps[i];
+            if (entry.target == target) {
+                changed = true;
+                continue;
+            }
+            table.caps[out] = entry;
+            out += 1;
+        }
+        table.len = out;
+        return changed;
+    }
+
+    pub fn reclaimPrincipalTablesForReuse(
+        self: *KernelState,
+        principal: PrincipalId,
+        free_list: *FreePageList,
+    ) void {
+        const index = processIndexFromPrincipal(principal) orelse return;
+        const table = &self.cap_tables[index];
+        var cap_index: usize = 0;
+        while (cap_index < table.len) {
+            const cap = table.caps[cap_index];
+            if (cap.cap_id == cap.root_cap_id and cap.parent_cap_id == 0) {
+                self.reclaimExclusiveRootPage(principal, cap.paddr, free_list) catch {
+                    cap_index += 1;
+                    continue;
+                };
+                continue;
+            }
+            cap_index += 1;
+        }
+        self.clearPrincipalTablesForReuse(index);
+    }
+
+    pub fn prepareProcessSlotForReuse(
+        self: *KernelState,
+        principal: PrincipalId,
+        free_list: *FreePageList,
+    ) void {
+        self.reclaimPrincipalTablesForReuse(principal, free_list);
+    }
+
     pub fn createProcessDescriptor(self: *KernelState, label: []const u8) ?PrincipalId {
         var i: usize = 0;
         while (i < self.process_descriptors.len) : (i += 1) {
             if (self.process_descriptors[i].active) continue;
-            const principal = processPrincipal(i);
-            self.clearPrincipalTablesForReuse(i);
-            self.process_descriptors[i] = .{
-                .active = true,
-                .principal = principal,
-                .label = label,
-            };
-            self.active_process_count += 1;
-            if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .create);
-            return principal;
+            return self.activateProcessDescriptorSlot(i, label, true, .create);
+        }
+        return null;
+    }
+
+    pub fn createProcessDescriptorPreservingStorage(
+        self: *KernelState,
+        label: []const u8,
+    ) ?PrincipalId {
+        var i: usize = 0;
+        while (i < self.process_descriptors.len) : (i += 1) {
+            if (self.process_descriptors[i].active) continue;
+            return self.activateProcessDescriptorSlot(i, label, false, .create);
         }
         return null;
     }
@@ -991,14 +1210,7 @@ pub const KernelState = struct {
             self.process_descriptors[index].label = label;
             return true;
         }
-        self.clearPrincipalTablesForReuse(index);
-        self.process_descriptors[index] = .{
-            .active = true,
-            .principal = principal,
-            .label = label,
-        };
-        self.active_process_count += 1;
-        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .ensure);
+        _ = self.activateProcessDescriptorSlot(index, label, true, .ensure);
         return true;
     }
 
@@ -1038,71 +1250,148 @@ pub const KernelState = struct {
         request_page_va: u64,
     ) KernelError!void {
         const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
-        if (!self.process_descriptors[index].active) return KernelError.InvalidState;
-        if (self.endpointTargetFor(principal, endpoint_id) == null) return KernelError.EndpointNotFound;
+        const desc = &self.process_descriptors[index];
+        if (!desc.active or desc.generation == 0) return KernelError.InvalidState;
+        const server_principal = self.endpointTargetFor(principal, endpoint_id) orelse return KernelError.EndpointNotFound;
+        const server_generation = self.processGeneration(server_principal) orelse return KernelError.InvalidState;
         if (request_page_va == 0 or (request_page_va & 0xFFF) != 0 or !capability.isUserCanonicalVa(request_page_va)) return KernelError.InvalidState;
-        self.process_descriptors[index].abi_trap_delegate_endpoint_id = endpoint_id;
-        self.process_descriptors[index].abi_trap_delegate_flavor = flavor;
-        self.process_descriptors[index].abi_trap_request_page_va = request_page_va;
+        const request_generation = if (desc.abi_trap_delegate) |delegate| delegate.request_generation +% 1 else 1;
+        desc.abi_trap_delegate = .{
+            .endpoint_id = endpoint_id,
+            .flavor = flavor,
+            .request_page_va = request_page_va,
+            .target_generation = desc.generation,
+            .server_principal = server_principal,
+            .server_generation = server_generation,
+            .request_generation = if (request_generation == 0) 1 else request_generation,
+        };
+    }
+
+    pub fn updateAbiTrapDelegateRequestPage(
+        self: *KernelState,
+        principal: PrincipalId,
+        expected_generation: u64,
+        request_page_va: u64,
+    ) KernelError!void {
+        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
+        const desc = &self.process_descriptors[index];
+        if (!desc.active or desc.generation == 0 or desc.generation != expected_generation) return KernelError.InvalidState;
+        if (request_page_va == 0 or (request_page_va & 0xFFF) != 0 or !capability.isUserCanonicalVa(request_page_va)) return KernelError.InvalidState;
+        var delegate = desc.abi_trap_delegate orelse return KernelError.EndpointNotFound;
+        if (delegate.target_generation != desc.generation) return KernelError.InvalidState;
+        delegate.request_page_va = request_page_va;
+        delegate.request_generation +%= 1;
+        if (delegate.request_generation == 0) delegate.request_generation = 1;
+        desc.abi_trap_delegate = delegate;
     }
 
     pub fn clearAbiTrapDelegate(self: *KernelState, principal: PrincipalId) KernelError!void {
         const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
         if (!self.process_descriptors[index].active) return KernelError.InvalidState;
-        self.process_descriptors[index].abi_trap_delegate_endpoint_id = 0;
-        self.process_descriptors[index].abi_trap_delegate_flavor = 0;
-        self.process_descriptors[index].abi_trap_request_page_va = 0;
+        self.process_descriptors[index].abi_trap_delegate = null;
     }
 
     pub fn abiTrapDelegateFor(self: *const KernelState, principal: PrincipalId) ?AbiTrapDelegate {
         const index = processIndexFromPrincipal(principal) orelse return null;
         const desc = self.process_descriptors[index];
-        if (!desc.active or desc.abi_trap_delegate_endpoint_id == 0) return null;
+        if (!desc.active or desc.generation == 0) return null;
+        const delegate = desc.abi_trap_delegate orelse return null;
+        if (delegate.endpoint_id == 0 or delegate.target_generation != desc.generation) return null;
         return .{
-            .endpoint_id = desc.abi_trap_delegate_endpoint_id,
-            .flavor = desc.abi_trap_delegate_flavor,
-            .request_page_va = desc.abi_trap_request_page_va,
+            .endpoint_id = delegate.endpoint_id,
+            .flavor = delegate.flavor,
+            .request_page_va = delegate.request_page_va,
+            .target_generation = delegate.target_generation,
+            .server_principal = delegate.server_principal,
+            .server_generation = delegate.server_generation,
+            .request_generation = delegate.request_generation,
         };
     }
 
     pub fn markProcessFaulted(self: *KernelState, principal: PrincipalId, fault_vector: u8) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;
-        self.process_descriptors[index].active = false;
-        self.process_descriptors[index].bootstrap_owner = false;
-        self.process_descriptors[index].process_builder_owner = null;
-        self.process_descriptors[index].process_builder_suspended = false;
-        self.process_descriptors[index].abi_trap_delegate_endpoint_id = 0;
-        self.process_descriptors[index].abi_trap_delegate_flavor = 0;
-        self.process_descriptors[index].abi_trap_request_page_va = 0;
-        self.process_descriptors[index].faulted = true;
-        self.process_descriptors[index].fault_vector = fault_vector;
-        if (self.active_process_count > 0) self.active_process_count -= 1;
-        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .fault);
+        self.markProcessDescriptorRetired(index, .fault, fault_vector);
         return true;
     }
 
     pub fn markProcessExited(self: *KernelState, principal: PrincipalId) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;
-        self.process_descriptors[index].active = false;
-        self.process_descriptors[index].bootstrap_owner = false;
-        self.process_descriptors[index].process_builder_owner = null;
-        self.process_descriptors[index].process_builder_suspended = false;
-        self.process_descriptors[index].abi_trap_delegate_endpoint_id = 0;
-        self.process_descriptors[index].abi_trap_delegate_flavor = 0;
-        self.process_descriptors[index].abi_trap_request_page_va = 0;
-        self.process_descriptors[index].faulted = false;
-        self.process_descriptors[index].fault_vector = 0;
-        if (self.active_process_count > 0) self.active_process_count -= 1;
-        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .exit);
+        self.markProcessDescriptorRetired(index, .exit, 0);
         return true;
+    }
+
+    fn markProcessDescriptorRetired(
+        self: *KernelState,
+        index: usize,
+        reason: RetireProcessReason,
+        fault_vector: u8,
+    ) void {
+        const principal = self.process_descriptors[index].principal;
+        self.process_descriptors[index].active = false;
+        self.clearProcessDescriptorTransientState(index);
+        switch (reason) {
+            .fault => {
+                self.process_descriptors[index].faulted = true;
+                self.process_descriptors[index].fault_vector = fault_vector;
+            },
+            .exit => {
+                self.process_descriptors[index].faulted = false;
+                self.process_descriptors[index].fault_vector = 0;
+            },
+        }
+        if (self.active_process_count > 0) self.active_process_count -= 1;
+        if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, switch (reason) {
+            .fault => .fault,
+            .exit => .exit,
+        });
+    }
+
+    pub fn retireProcessIncarnation(
+        self: *KernelState,
+        principal: PrincipalId,
+        reason: RetireProcessReason,
+        fault_vector: u8,
+    ) ?RetireProcessResult {
+        const index = processIndexFromPrincipal(principal) orelse return null;
+        if (!self.process_descriptors[index].active) return null;
+        var result: RetireProcessResult = .{};
+
+        result.published_endpoints_removed = self.unpublishServiceEndpointsForTarget(principal);
+
+        var storage_index: usize = 0;
+        while (storage_index < principal_count) : (storage_index += 1) {
+            var wake_owner = false;
+            if (storage_index < process_count) {
+                const removed = scrubEndpointTargets(&self.endpoint_tables[storage_index], principal);
+                if (removed) {
+                    result.endpoint_targets_removed = true;
+                    wake_owner = true;
+                }
+            }
+            if (scrubMailboxSender(&self.cap_mailboxes[storage_index], principal)) {
+                wake_owner = true;
+            }
+            if (self.pending_page_transfers[storage_index]) |pending| {
+                if (pending.sender == principal) {
+                    self.pending_page_transfers[storage_index] = null;
+                    wake_owner = true;
+                }
+            }
+            if (wake_owner) markWakeProcess(&result, storage_index);
+        }
+        if (result.endpoint_targets_removed) self.bumpEndpointGeneration();
+
+        self.markProcessDescriptorRetired(index, reason, fault_vector);
+        return result;
     }
 
     pub fn removeProcessDescriptor(self: *KernelState, principal: PrincipalId) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;
-        self.process_descriptors[index] = .{};
+        const generation = self.process_descriptors[index].generation;
+        self.process_descriptors[index] = .{ .generation = generation };
         if (self.active_process_count > 0) self.active_process_count -= 1;
         if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .remove);
         return true;
@@ -1134,6 +1423,7 @@ pub const KernelState = struct {
             self.process_descriptors[i] = .{
                 .active = true,
                 .principal = principal,
+                .generation = nextProcessGeneration(self.process_descriptors[i].generation),
                 .label = principalLabel(principal),
             };
             self.active_process_count += 1;

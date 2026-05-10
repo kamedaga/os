@@ -10,7 +10,6 @@ const ipc = @import("ipc.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const trap_abi = abi_root.trap_abi;
-const process_abi = abi_root.process_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 
 var dispatch_delegate_failure_log_count: u64 = 0;
@@ -19,7 +18,7 @@ var dispatch_delegate_lookup_log_count: u64 = 0;
 const dispatch_delegate_lookup_log_limit: u64 = 16;
 var dispatch_delegate_backpressure_log_count: u64 = 0;
 const dispatch_delegate_backpressure_log_limit: u64 = 1;
-const delegate_transport_queue_limit: usize = 1;
+const delegate_transport_queue_limit: usize = scheduler.max_ipc_queue_depth;
 
 const AbiTrapSpinLock = struct {
     value: u8 = 0,
@@ -52,6 +51,7 @@ pub const Hooks = struct {
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
     copy_bytes_to_user_va: *const fn (kernel.PrincipalId, u64, []const u8) bool,
     consume_pending_signal_for_principal: *const fn (kernel.PrincipalId) bool,
+    wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64) bool,
     exit_current_process: *const fn (kernel.PrincipalId, u8, *TrapFrame) void,
 };
@@ -103,7 +103,7 @@ fn writeRequest(
     target: kernel.PrincipalId,
     request_page_va: u64,
     caller: kernel.PrincipalId,
-    thread_id: u64,
+    target_token: u64,
     flavor: u32,
     frame: *const TrapFrame,
 ) bool {
@@ -115,7 +115,7 @@ fn writeRequest(
     if (!writeRequestU64(h, target, request_page_va, 0x08, version_kind)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x10, flavor_reserved)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x18, @intFromEnum(caller))) return false;
-    if (!writeRequestU64(h, target, request_page_va, 0x20, thread_id)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0x20, target_token)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x28, frame.rip)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x30, frame.rsp)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x38, 0)) return false;
@@ -132,7 +132,7 @@ fn writeRequest(
 
 fn grantQueuedReplyToken(receiver_thread: usize, msg: scheduler.IpcQueuedMessage) void {
     if (!msg.grants_reply) return;
-    scheduler.setIpcReplyTokenForThread(receiver_thread, true, msg.sender_thread);
+    scheduler.setIpcReplyTokenForThreadWithIdentity(receiver_thread, true, msg.sender_thread, msg.sender_owner, msg.sender_generation);
 }
 
 pub fn consumeQueuedReplyForPrincipal(principal: kernel.PrincipalId, frame: *TrapFrame) bool {
@@ -178,6 +178,8 @@ fn currentReplyTarget() ?ResolvedTarget {
     const target_thread = current_hot.ipc_reply_token_target_thread;
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
     if (!target_ctx.allocated) return null;
+    if (target_ctx.owner_process != current_hot.ipc_reply_token_target_owner) return null;
+    if (target_ctx.slot_generation != current_hot.ipc_reply_token_target_generation) return null;
     return .{ .thread = target_thread, .ctx = target_ctx, .proc = target_ctx.owner_process };
 }
 
@@ -206,15 +208,26 @@ const TargetResolveUse = enum {
     exit_response,
 };
 
-fn targetPrincipalFromRaw(target_raw: u64) ?kernel.PrincipalId {
-    if (target_raw >= kernel.process_count) return null;
-    return @enumFromInt(@as(u8, @intCast(target_raw)));
+fn delegateTargetTokenForPrincipal(h: *const Hooks, target_proc: kernel.PrincipalId) ?u64 {
+    const handle = h.state.processHandleFor(target_proc) orelse return null;
+    return trap_abi.encodeDelegateTargetToken(handle.slot, handle.generation);
+}
+
+fn targetPrincipalFromToken(h: *const Hooks, target_token: u64) ?kernel.PrincipalId {
+    const decoded = trap_abi.decodeDelegateTargetToken(target_token) orelse return null;
+    return h.state.principalFromProcessHandle(.{
+        .slot = decoded.process_slot,
+        .generation = decoded.generation,
+    });
 }
 
 fn delegateTargetsServer(h: *const Hooks, server_proc: kernel.PrincipalId, target_proc: kernel.PrincipalId) bool {
     const delegate = h.state.abiTrapDelegateFor(target_proc) orelse return false;
     const delegate_target = h.state.endpointTargetFor(target_proc, delegate.endpoint_id) orelse return false;
-    return delegate_target == server_proc;
+    const server_generation = h.state.processGeneration(server_proc) orelse return false;
+    return delegate_target == server_proc and
+        delegate.server_principal == server_proc and
+        delegate.server_generation == server_generation;
 }
 
 fn endpointTableTargetsServer(h: *const Hooks, server_proc: kernel.PrincipalId, target_proc: kernel.PrincipalId) bool {
@@ -227,8 +240,8 @@ fn endpointTableTargetsServer(h: *const Hooks, server_proc: kernel.PrincipalId, 
     return false;
 }
 
-fn resolveTarget(h: *const Hooks, server_proc: kernel.PrincipalId, target_raw: u64, use: TargetResolveUse) ?ResolvedTarget {
-    const target_proc = targetPrincipalFromRaw(target_raw) orelse return null;
+fn resolveTarget(h: *const Hooks, server_proc: kernel.PrincipalId, target_token: u64, use: TargetResolveUse) ?ResolvedTarget {
+    const target_proc = targetPrincipalFromToken(h, target_token) orelse return null;
     const target_thread = scheduler.threadSlotForPrincipal(target_proc) orelse return null;
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return null;
     if (!target_ctx.allocated) return null;
@@ -252,48 +265,56 @@ fn copyBetweenPrincipals(h: *const Hooks, src_proc: kernel.PrincipalId, src_va: 
     return len_u64;
 }
 
-pub fn copyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, dst_target_va: u64, src_current_va: u64, len_u64: u64) u64 {
+pub fn copyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_token: u64, dst_target_va: u64, src_current_va: u64, len_u64: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
-    const target = resolveTarget(h, proc, target_raw, .deferred_reply) orelse return boot_static.syscall_err_endpoint;
+    const target = resolveTarget(h, proc, target_token, .deferred_reply) orelse return boot_static.syscall_err_endpoint;
     return copyBetweenPrincipals(h, proc, src_current_va, target.proc, dst_target_va, len_u64);
 }
 
-pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, result: u64, flags: u64) u64 {
+pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_token: u64, result: u64, flags: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
     const exit_response = (flags & trap_abi.response_flag_exit) != 0;
-    const target = resolveTarget(h, proc, target_raw, if (exit_response) .exit_response else .deferred_reply) orelse
+    const target = resolveTarget(h, proc, target_token, if (exit_response) .exit_response else .deferred_reply) orelse
         return boot_static.syscall_err_endpoint;
     if (exit_response) {
-        _ = scheduler.releaseThreadSlot(target.thread);
-        _ = h.state.markProcessExited(target.proc);
+        retireResolvedTarget(h, target);
         _ = reclaimPrivatePagesForProcessWithHooks(h, target.proc);
         return boot_static.syscall_ok;
     }
     return ipc.deliverOrQueueMessageToThread(target.thread, 0, scheduler.currentThreadIndex(), false, result, flags, 0, 0);
 }
 
-pub fn startTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64) u64 {
+pub fn startTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_token: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
-    if (targetPrincipalFromRaw(target_raw) == null) return boot_static.syscall_err_invalid;
-    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    if (trap_abi.decodeDelegateTargetToken(target_token) == null) return boot_static.syscall_err_invalid;
+    const target = resolveTarget(h, proc, target_token, .delegated) orelse return boot_static.syscall_err_endpoint;
     if (target.ctx.ready or scheduler.delegateTransportBlocked(target.ctx)) return boot_static.syscall_err_invalid;
-    if (!scheduler.setThreadReady(target.thread, true)) return boot_static.syscall_err_not_ready;
-    scheduler.wakeAssignedApForRunnableThread(target.thread);
+    h.state.clearProcessBuilderSuspended(target.proc) catch return boot_static.syscall_err_invalid;
+    _ = scheduler.readyUserThreadForStart(target.thread) orelse return boot_static.syscall_err_not_ready;
     return boot_static.syscall_ok;
 }
 
-pub fn setTargetRequestPage(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, request_page_va: u64) u64 {
+pub fn setTargetRequestPage(state: *kernel.KernelState, proc: kernel.PrincipalId, target_token: u64, request_page_va: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
-    const target_proc = targetPrincipalFromRaw(target_raw) orelse return boot_static.syscall_err_invalid;
     if (request_page_va == 0 or (request_page_va & 0xFFF) != 0 or !capability.isUserCanonicalVa(request_page_va)) return boot_static.syscall_err_invalid;
-    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    const decoded = trap_abi.decodeDelegateTargetToken(target_token) orelse return boot_static.syscall_err_invalid;
+    const target = resolveTarget(h, proc, target_token, .delegated) orelse return boot_static.syscall_err_endpoint;
+    const target_proc = target.proc;
     if (target.ctx.ready) return boot_static.syscall_err_invalid;
     const delegate = h.state.abiTrapDelegateFor(target_proc) orelse return boot_static.syscall_err_endpoint;
-    h.state.setAbiTrapDelegate(target_proc, delegate.endpoint_id, delegate.flavor, request_page_va) catch return boot_static.syscall_err_invalid;
+    _ = scheduler.discardDelegateTransportMessagesForThreadFromSenderOnEndpoint(
+        scheduler.currentThreadIndex(),
+        target.thread,
+        delegate.endpoint_id,
+    );
+    h.state.updateAbiTrapDelegateRequestPage(target_proc, decoded.generation, request_page_va) catch |err| switch (err) {
+        kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
+        else => return boot_static.syscall_err_invalid,
+    };
     return boot_static.syscall_ok;
 }
 
@@ -315,20 +336,38 @@ fn pageBatchByteLen(target_va: u64, page_count: u64) ?usize {
     return @intCast(page_count * 4096);
 }
 
-pub fn mapPagesToCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, page_count: u64, prot_bits: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
+fn rollbackFreshTargetMappings(h: *const Hooks, target_proc: kernel.PrincipalId, target_va: u64, paddrs: []const u64) void {
+    if (paddrs.len == 0) return;
+    _ = user_vm.unmapUserLinearRegion(target_proc, target_va, paddrs.len * 4096);
+    for (paddrs) |paddr| {
+        h.state.reclaimExclusiveRootPage(target_proc, paddr, h.free_list) catch {};
+    }
+}
+
+fn mapPagesToResolvedTarget(h: *const Hooks, target: ResolvedTarget, target_va: u64, page_count: u64, prot_bits: u64) u64 {
     _ = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
 
+    var mapped_paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
     var page_index: u64 = 0;
     while (page_index < page_count) : (page_index += 1) {
         const page = h.state.allocPageTo(target.proc, h.free_list) catch return boot_static.syscall_err_alloc;
         const va = target_va + page_index * 4096;
-        if (!user_vm.mapUserLinearRegionWithProt(target.proc, va, page.paddr, 4096, prot)) return boot_static.syscall_err_map;
+        if (!user_vm.mapUserLinearRegionWithProt(target.proc, va, page.paddr, 4096, prot)) {
+            h.state.reclaimExclusiveRootPage(target.proc, page.paddr, h.free_list) catch {};
+            rollbackFreshTargetMappings(h, target.proc, target_va, mapped_paddrs[0..@intCast(page_index)]);
+            return boot_static.syscall_err_map;
+        }
+        mapped_paddrs[@intCast(page_index)] = page.paddr;
     }
     return boot_static.syscall_ok;
+}
+
+pub fn mapPagesToCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, page_count: u64, prot_bits: u64) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
+    return mapPagesToResolvedTarget(h, target, target_va, page_count, prot_bits);
 }
 
 pub fn protectCurrentReplyTargetPages(target_va: u64, page_count: u64, prot_bits: u64) u64 {
@@ -378,24 +417,24 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
     return boot_static.syscall_ok;
 }
 
-pub fn unmapTargetPages(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, target_va: u64, page_count: u64) u64 {
+pub fn unmapTargetPages(state: *kernel.KernelState, proc: kernel.PrincipalId, target_token: u64, target_va: u64, page_count: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
-    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    const target = resolveTarget(h, proc, target_token, .delegated) orelse return boot_static.syscall_err_endpoint;
     if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) {
         return boot_static.syscall_err_map;
     }
     return boot_static.syscall_ok;
 }
 
-pub fn shareCurrentReplyTargetPagesToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, target_va: u64, page_count: u64, prot_bits: u64) u64 {
+pub fn shareCurrentReplyTargetPagesToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_token: u64, target_va: u64, page_count: u64, prot_bits: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const source = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    const target = resolveTarget(h, proc, target_token, .delegated) orelse return boot_static.syscall_err_endpoint;
     const target_proc = target.proc;
     if (target_proc == source.proc) return boot_static.syscall_ok;
 
@@ -489,12 +528,35 @@ pub fn reclaimCurrentReplyTargetPrivatePages(state: *kernel.KernelState) u64 {
     return reclaimPrivatePagesForProcessWithHooks(&h_storage, target.proc);
 }
 
+fn wakeRetiredProcessOwners(h: *const Hooks, retired: kernel.RetireProcessResult) void {
+    var mask = retired.wake_process_mask;
+    while (mask != 0) {
+        const bit: u6 = @intCast(@ctz(mask));
+        mask &= mask - 1;
+        const owner = kernel.processPrincipalFromIndex(bit) orelse continue;
+        h.wake_blocked_thread_for_principal(owner);
+    }
+    if (retired.endpoint_targets_removed) scheduler.invalidateAllIpcFastpathState();
+}
+
+fn retireResolvedTarget(h: *const Hooks, target: ResolvedTarget) void {
+    _ = scheduler.releaseThreadSlot(target.thread);
+    if (scheduler.runtime_priority_principal) |priority_principal| {
+        if (priority_principal == target.proc) scheduler.setRuntimePriorityPrincipal(null);
+    }
+    if (h.state.retireProcessIncarnation(target.proc, .exit, 0)) |retired| {
+        wakeRetiredProcessOwners(h, retired);
+    }
+}
+
 fn abortChildProcess(h: *const Hooks, principal: kernel.PrincipalId, reclaim_pages: bool) void {
     if (reclaim_pages) _ = reclaimPrivatePagesForProcessWithHooks(h, principal);
     if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
         _ = scheduler.releaseThreadSlot(thread_index);
     }
-    _ = h.state.markProcessExited(principal);
+    if (h.state.retireProcessIncarnation(principal, .exit, 0)) |retired| {
+        wakeRetiredProcessOwners(h, retired);
+    }
 }
 
 const ReplyTarget = struct {
@@ -508,6 +570,8 @@ fn currentReplyTargetWithDelegate(h: *const Hooks) ?ReplyTarget {
     const target = currentReplyTarget() orelse return null;
     const delegate = h.state.abiTrapDelegateFor(target.proc) orelse return null;
     const delegate_target = h.state.endpointTargetFor(target.proc, delegate.endpoint_id) orelse return null;
+    const delegate_generation = h.state.processGeneration(delegate_target) orelse return null;
+    if (delegate_target != delegate.server_principal or delegate_generation != delegate.server_generation) return null;
     return .{
         .ctx = target.ctx,
         .proc = target.proc,
@@ -596,9 +660,11 @@ fn initChildThreadFromTarget(child: kernel.PrincipalId, target: ReplyTarget, chi
     return child_thread;
 }
 
-fn encodeChildProcess(child: kernel.PrincipalId, child_thread: usize) u64 {
+fn encodeChildProcess(h: *const Hooks, child: kernel.PrincipalId, child_thread: usize) u64 {
     const slot = kernel.processIndexFromPrincipal(child) orelse return boot_static.syscall_err_invalid;
-    return process_abi.encodeSpawnedProcess(@intCast(slot), @intCast(child_thread));
+    _ = child_thread;
+    const generation = h.state.processGeneration(child) orelse return boot_static.syscall_err_invalid;
+    return trap_abi.encodeDelegateTargetToken(@intCast(slot), generation);
 }
 
 const ChildMapMode = enum { copy_private, share_readable };
@@ -611,7 +677,7 @@ fn spawnReplyTargetChild(
     child_rsp: u64,
     child_fs_base: u64,
 ) u64 {
-    const created = process_factory.tryCreateSuspendedUserProcess(h.state, name, h.user_spaces) catch return boot_static.syscall_err_alloc;
+    const created = process_factory.tryCreateSuspendedUserProcess(h.state, name, h.free_list, h.user_spaces) catch return boot_static.syscall_err_alloc;
     const child = created.principal;
     var scratch: [4096]u8 = undefined;
     var context = ChildPageContext{
@@ -637,7 +703,7 @@ fn spawnReplyTargetChild(
         abortChildProcess(h, child, mode == .copy_private);
         return boot_static.syscall_err_invalid;
     };
-    return encodeChildProcess(child, child_thread);
+    return encodeChildProcess(h, child, child_thread);
 }
 
 pub fn forkCurrentReplyTarget(state: *kernel.KernelState) u64 {
@@ -679,7 +745,8 @@ fn deliverDelegateRequestLocked(
     if (stale_replies != 0) scheduler.setDelegateReplyPending(current_ctx, false);
     const stale_requests = scheduler.discardIpcMessagesForThreadFromSenderOnEndpoint(target_thread, current_thread, delegate.endpoint_id, true);
     if (stale_requests != 0) scheduler.clearDelegateTransportPending(current_ctx);
-    if (!writeRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame)) {
+    const target_token = delegateTargetTokenForPrincipal(h, proc) orelse return boot_static.syscall_err_invalid;
+    if (!writeRequest(h, target_principal, delegate.request_page_va, proc, target_token, delegate.flavor, frame)) {
         h.write("abi_trap request write failed target=");
         h.write(h.principal_label(target_principal));
         h.write("\n");
@@ -826,9 +893,9 @@ fn dispatchKnownDelegateWithHooks(h: *const Hooks, proc: kernel.PrincipalId, del
                 h.write(" desc_active=");
                 h.print_number(if (desc.active) 1 else 0);
                 h.write(" desc_delegate=");
-                h.print_hex(desc.abi_trap_delegate_endpoint_id);
+                h.print_hex(if (desc.abi_trap_delegate) |state| state.endpoint_id else 0);
                 h.write(" desc_request=");
-                h.print_hex(desc.abi_trap_request_page_va);
+                h.print_hex(if (desc.abi_trap_delegate) |state| state.request_page_va else 0);
                 const table = h.state.endpoint_tables[proc_index];
                 h.write(" ep_len=");
                 h.print_number(@intCast(table.len));
@@ -852,6 +919,10 @@ fn dispatchKnownDelegateWithHooks(h: *const Hooks, proc: kernel.PrincipalId, del
         }
         return boot_static.syscall_err_endpoint;
     };
+    const target_generation = h.state.processGeneration(target_principal) orelse return boot_static.syscall_err_endpoint;
+    if (target_principal != delegate.server_principal or target_generation != delegate.server_generation) {
+        return boot_static.syscall_err_endpoint;
+    }
     const target_thread = scheduler.threadSlotForPrincipal(target_principal) orelse {
         if (dispatch_delegate_lookup_log_count < dispatch_delegate_lookup_log_limit) {
             h.write("abi dispatch target thread miss proc=");

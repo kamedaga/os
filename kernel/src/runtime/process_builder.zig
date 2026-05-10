@@ -7,11 +7,13 @@ const user_vm = @import("../memory/user_vm.zig");
 const user_copy = @import("../user_copy.zig");
 const boot_static = @import("../boot/main_static.zig");
 const boot_abi = @import("../boot/abi.zig");
+const abi_root = @import("kernel_abi_root");
 const process_factory = @import("../boot/process_factory.zig");
 const kernel_log = @import("../kernel_log.zig");
 const log_util = @import("../log_util.zig");
 
 const process_builder_abi = boot_abi.process_builder_abi;
+const trap_abi = abi_root.trap_abi;
 
 var state_ptr: *kernel.KernelState = undefined;
 var free_list_ptr: *kernel.FreePageList = undefined;
@@ -63,8 +65,11 @@ fn protFromBits(bits: u64) ?kernel.MapProt {
 }
 
 fn principalFromBuilderToken(caller: kernel.PrincipalId, token: u64) ?kernel.PrincipalId {
-    const process_slot = process_builder_abi.decodeProcessBuilderToken(token) orelse return null;
-    const principal = kernel.processPrincipalFromIndex(@intCast(process_slot)) orelse return null;
+    const decoded = process_builder_abi.decodeProcessBuilderToken(token) orelse return null;
+    const principal = state_ptr.principalFromProcessHandle(.{
+        .slot = decoded.process_slot,
+        .generation = decoded.generation,
+    }) orelse return null;
     if (!state_ptr.processBuilderOwnerMatches(principal, caller)) return null;
     return principal;
 }
@@ -81,13 +86,21 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
     if (process_index < user_spaces_ptr.len) {
         user_spaces_ptr[process_index] = .{};
     }
-    state_ptr.cap_tables[process_index] = .{};
-    state_ptr.endpoint_tables[process_index] = .{};
-    state_ptr.cap_mailboxes[process_index] = .{};
-    state_ptr.pending_page_transfers[process_index] = null;
-    state_ptr.vm_object_tables[process_index] = .{};
-    state_ptr.exec_image_tables[process_index] = .{};
-    _ = state_ptr.removeProcessDescriptor(principal);
+    if (state_ptr.retireProcessIncarnation(principal, .exit, 0)) |retired| {
+        wakeRetiredProcessOwners(retired);
+    }
+    state_ptr.prepareProcessSlotForReuse(principal, free_list_ptr);
+}
+
+fn wakeRetiredProcessOwners(retired: kernel.RetireProcessResult) void {
+    var mask = retired.wake_process_mask;
+    while (mask != 0) {
+        const bit: u6 = @intCast(@ctz(mask));
+        mask &= mask - 1;
+        const owner = kernel.processPrincipalFromIndex(bit) orelse continue;
+        scheduler.wakeBlockedThreadForPrincipal(owner);
+    }
+    if (retired.endpoint_targets_removed) scheduler.invalidateAllIpcFastpathState();
 }
 
 pub fn createSuspendedProcess(caller: kernel.PrincipalId) u64 {
@@ -95,6 +108,7 @@ pub fn createSuspendedProcess(caller: kernel.PrincipalId) u64 {
     const created = process_factory.tryCreateSuspendedUserProcess(
         state_ptr,
         "suspended exec",
+        free_list_ptr,
         user_spaces_ptr,
     ) catch return boot_static.syscall_err_alloc;
     state_ptr.markProcessBuilderSuspended(created.principal, caller) catch {
@@ -105,7 +119,11 @@ pub fn createSuspendedProcess(caller: kernel.PrincipalId) u64 {
         clearProcessRuntimeState(created.principal);
         return boot_static.syscall_err_invalid;
     };
-    return process_builder_abi.encodeProcessBuilderToken(slot);
+    const generation = state_ptr.processGeneration(created.principal) orelse {
+        clearProcessRuntimeState(created.principal);
+        return boot_static.syscall_err_invalid;
+    };
+    return process_builder_abi.encodeProcessBuilderToken(slot, generation);
 }
 
 pub fn mapVmObjectToProcess(caller: kernel.PrincipalId, token: u64, vm_token: u64, target_va: u64, prot_bits: u64) u64 {
@@ -210,17 +228,30 @@ pub fn setAbiTrapDelegate(
     caller: kernel.PrincipalId,
     token: u64,
     endpoint_id: u64,
-    target_process_slot: u64,
+    delegate_target_token: u64,
     flavor: u64,
     request_page_va: u64,
 ) u64 {
     if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
-    const endpoint_target = kernel.processPrincipalFromIndex(@intCast(target_process_slot)) orelse return boot_static.syscall_err_invalid;
+    const delegate_target = trap_abi.decodeDelegateTargetToken(delegate_target_token) orelse return boot_static.syscall_err_invalid;
+    const endpoint_target = state_ptr.principalFromProcessHandle(.{
+        .slot = delegate_target.process_slot,
+        .generation = delegate_target.generation,
+    }) orelse return boot_static.syscall_err_invalid;
     state_ptr.installEndpoint(target, endpoint_id, endpoint_target) catch |err| switch (err) {
         kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
         else => return boot_static.syscall_err_invalid,
     };
+    if (scheduler.threadSlotForPrincipal(endpoint_target)) |delegate_thread| {
+        if (scheduler.threadSlotForPrincipal(target)) |target_thread| {
+            _ = scheduler.discardDelegateTransportMessagesForThreadFromSenderOnEndpoint(
+                delegate_thread,
+                target_thread,
+                endpoint_id,
+            );
+        }
+    }
     state_ptr.setAbiTrapDelegate(target, endpoint_id, @truncate(flavor), request_page_va) catch |err| switch (err) {
         kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
         else => return boot_static.syscall_err_invalid,
@@ -230,8 +261,8 @@ pub fn setAbiTrapDelegate(
         log_util.printNumber(processSlot(target) orelse scheduler.idle_thread_marker);
         kernel_log.write(" endpoint=");
         log_util.printHex(endpoint_id);
-        kernel_log.write(" delegate_proc=");
-        log_util.printNumber(target_process_slot);
+        kernel_log.write(" delegate_token=");
+        log_util.printHex(delegate_target_token);
         kernel_log.write(" request=");
         log_util.printHex(request_page_va);
         kernel_log.write("\n");
@@ -257,26 +288,25 @@ pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
     const thread_index = scheduler.threadSlotForPrincipal(target) orelse return boot_static.syscall_err_invalid;
     const slot = processSlot(target) orelse return boot_static.syscall_err_invalid;
-    const ap_placement_block = scheduler.spawnExecApUserSchedulingBlockReason();
+    const generation = state_ptr.processGeneration(target) orelse return boot_static.syscall_err_invalid;
     state_ptr.clearProcessBuilderSuspended(target) catch return boot_static.syscall_err_invalid;
-    const ap_placed_cpu = scheduler.readySpawnExecThreadOnApIfReady(thread_index);
-    if (ap_placed_cpu == null and !scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
+    const placement = scheduler.readyUserThreadForStart(thread_index) orelse return boot_static.syscall_err_not_ready;
     if (scheduler.spawnExecApUserSchedulingEnabled()) {
         kernel_log.write("process_builder start child=");
         log_util.printNumber(slot);
         kernel_log.write(" thread=");
         log_util.printNumber(@as(u64, @intCast(thread_index)));
         kernel_log.write(" sched_ap_place=");
-        if (ap_placed_cpu) |cpu| {
+        if (placement.ap_placed_cpu) |cpu| {
             log_util.printNumber(@as(u64, @intCast(cpu)));
         } else {
-            writeApPlacementBlock(ap_placement_block);
+            writeApPlacementBlock(placement.block_reason);
         }
         kernel_log.write(" assigned_cpu=");
         log_util.printNumber(@as(u64, @intCast(scheduler.threadCpuSlot(thread_index) orelse scheduler.idle_thread_marker)));
         kernel_log.write("\n");
     }
-    return boot_abi.process_abi.encodeSpawnedProcess(slot, @intCast(thread_index));
+    return boot_abi.process_abi.encodeSpawnedProcess(slot, generation);
 }
 
 fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void {

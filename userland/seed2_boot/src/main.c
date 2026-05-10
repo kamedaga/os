@@ -27,6 +27,7 @@ enum {
     SYSCALL_INSTALL_CAPS_BATCH = 0x32,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
     SYSCALL_GRANT_QUEUE_CAP = 0x23,
+    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
 
@@ -67,8 +68,11 @@ enum {
 
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
-    SPAWN_RESULT_TAG = 1ULL << 63,
-    SPAWN_RESULT_PROCESS_MASK = 0xFFFFFFFFULL,
+    PROCESS_HANDLE_TAG = 2ULL << 60,
+    PROCESS_HANDLE_TAG_MASK = 0xFULL << 60,
+    PROCESS_HANDLE_SLOT_MASK = 0xFFFFFFFFULL,
+    PROCESS_HANDLE_GENERATION_SHIFT = 32,
+    PROCESS_HANDLE_GENERATION_MASK = 0xFFFFFFFULL,
     SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE = 1ULL << 0,
     SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1ULL << 2,
     SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1ULL << 3,
@@ -146,13 +150,13 @@ enum {
     NET_TX_QUEUE_INDEX = 1,
 
     SERVICE_REGISTRY_MAGIC = 0x53525643,
-    SERVICE_REGISTRY_VERSION = 1,
+    SERVICE_REGISTRY_VERSION = 2,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     SERVICE_KIND_BLOCK = 4,
     SERVICE_KIND_CONSOLE = 10,
     SERVICE_KIND_FAT_FS = 9,
     SERVICE_KIND_NET = 11,
-    SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
+    SERVICE_FLAG_RESERVED0 = 1,
 
     VIRTIO_VENDOR_ID = 0x1AF4,
     VIRTIO_BLK_DEVICE_MODERN = 0x1042,
@@ -361,7 +365,7 @@ struct bootstrap_descriptor_table {
 
 struct service_entry {
     u64 kind;
-    u64 process_slot;
+    u64 process_handle;
     u64 endpoint_id;
     u64 flags;
 };
@@ -383,7 +387,7 @@ struct backend_session {
     u8 active;
     u8 reserved0[7];
     u64 endpoint_id;
-    u64 process_slot;
+    u64 process_handle;
     u64 request_paddr;
     u64 response_paddr;
     u64 session_nonce;
@@ -601,8 +605,10 @@ static u64 decode_queue_cap(u64 value, u64 kind) {
 }
 
 static u64 decode_spawn_process_slot(u64 value) {
-    if ((value & SPAWN_RESULT_TAG) == 0) return 0;
-    return value & SPAWN_RESULT_PROCESS_MASK;
+    if ((value & PROCESS_HANDLE_TAG_MASK) != PROCESS_HANDLE_TAG) return 0;
+    const u64 slot = value & PROCESS_HANDLE_SLOT_MASK;
+    const u64 generation = (value >> PROCESS_HANDLE_GENERATION_SHIFT) & PROCESS_HANDLE_GENERATION_MASK;
+    return slot != 0 && generation != 0 ? slot : 0;
 }
 
 static struct init_descriptor_page *descriptor_page(void) {
@@ -939,36 +945,36 @@ static int install_device_mmio_caps_for(struct device_descriptor *device) {
     return 1;
 }
 
-static int grant_device_mmio(struct device_descriptor *device, u64 child_slot) {
-    if (syscall3(SYSCALL_GRANT_CAP, device->common_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != 0) return 0;
-    if (syscall3(SYSCALL_GRANT_CAP, device->notify_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != 0) return 0;
+static int grant_device_mmio(struct device_descriptor *device, u64 child_handle) {
+    if (syscall3(SYSCALL_GRANT_CAP, device->common_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != 0) return 0;
+    if (syscall3(SYSCALL_GRANT_CAP, device->notify_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != 0) return 0;
     if (device->isr_page_paddr != 0 &&
-        syscall3(SYSCALL_GRANT_CAP, device->isr_page_paddr, child_slot, PAGE_RIGHT_CPU_READ) != 0) return 0;
+        syscall3(SYSCALL_GRANT_CAP, device->isr_page_paddr, child_handle, PAGE_RIGHT_CPU_READ) != 0) return 0;
     if (device->device_page_paddr != 0 &&
-        syscall3(SYSCALL_GRANT_CAP, device->device_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != 0) return 0;
+        syscall3(SYSCALL_GRANT_CAP, device->device_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != 0) return 0;
     return 1;
 }
 
-static int grant_device_mmio_with_grant(struct device_catalog_entry *entry, u64 child_slot) {
-    u64 status = syscall3(SYSCALL_GRANT_CAP, entry->common_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT);
+static int grant_device_mmio_with_grant(struct device_catalog_entry *entry, u64 child_handle) {
+    u64 status = syscall3(SYSCALL_GRANT_CAP, entry->common_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT);
     if (status != 0) {
         user_log_hex("[seed2_boot] catalog common grant status=", status);
         return 0;
     }
-    status = syscall3(SYSCALL_GRANT_CAP, entry->notify_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT);
+    status = syscall3(SYSCALL_GRANT_CAP, entry->notify_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT);
     if (status != 0) {
         user_log_hex("[seed2_boot] catalog notify grant status=", status);
         return 0;
     }
     if (entry->isr_page_paddr != 0) {
-        status = syscall3(SYSCALL_GRANT_CAP, entry->isr_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_GRANT);
+        status = syscall3(SYSCALL_GRANT_CAP, entry->isr_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_GRANT);
         if (status != 0) {
             user_log_hex("[seed2_boot] catalog isr grant status=", status);
             return 0;
         }
     }
     if (entry->device_page_paddr != 0) {
-        status = syscall3(SYSCALL_GRANT_CAP, entry->device_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT);
+        status = syscall3(SYSCALL_GRANT_CAP, entry->device_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT);
         if (status != 0) {
             user_log_hex("[seed2_boot] catalog device grant status=", status);
             return 0;
@@ -1006,17 +1012,17 @@ static void service_registry_set(u64 va, u64 kind, u64 process_slot, u64 endpoin
     if (page->magic != SERVICE_REGISTRY_MAGIC || page->version != SERVICE_REGISTRY_VERSION) service_registry_init(va);
     for (u64 i = 0; i < page->entry_count && i < SERVICE_REGISTRY_MAX_ENTRIES; i++) {
         if (page->entries[i].kind != kind) continue;
-        page->entries[i].process_slot = process_slot;
+        page->entries[i].process_handle = process_slot;
         page->entries[i].endpoint_id = endpoint_id;
-        page->entries[i].flags = SERVICE_FLAG_PROCESS_SLOT_COMPAT;
+        page->entries[i].flags = 0;
         return;
     }
     if (page->entry_count >= SERVICE_REGISTRY_MAX_ENTRIES) return;
     u64 index = page->entry_count++;
     page->entries[index].kind = kind;
-    page->entries[index].process_slot = process_slot;
+    page->entries[index].process_handle = process_slot;
     page->entries[index].endpoint_id = endpoint_id;
-    page->entries[index].flags = SERVICE_FLAG_PROCESS_SLOT_COMPAT;
+    page->entries[index].flags = 0;
 }
 
 static u64 ensure_service_registry(void) {
@@ -1076,7 +1082,7 @@ static u64 ensure_device_catalog(void) {
     return g_device_catalog_source_va;
 }
 
-static int fill_catalog_queue_tokens_for_child(volatile struct device_catalog_entry *entry, u64 child_slot) {
+static int fill_catalog_queue_tokens_for_child(volatile struct device_catalog_entry *entry, u64 child_handle) {
     struct device_descriptor *device = entry->kind == DEVICE_CATALOG_KIND_CONSOLE ? &g_console_device : &g_net_device;
     struct queue_grant q0;
     struct queue_grant q1;
@@ -1085,12 +1091,12 @@ static int fill_catalog_queue_tokens_for_child(volatile struct device_catalog_en
         return 0;
     }
 
-    const u64 iommu_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_IOMMU, q0.iommu_token), child_slot);
-    const u64 q0_submit_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q0.submit_token), child_slot);
-    const u64 q0_notify_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q0.notify_token), child_slot);
-    const u64 q1_submit_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q1.submit_token), child_slot);
-    const u64 q1_notify_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q1.notify_token), child_slot);
-    const u64 command_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_COMMAND, q0.command_token), child_slot);
+    const u64 iommu_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_IOMMU, q0.iommu_token), child_handle);
+    const u64 q0_submit_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q0.submit_token), child_handle);
+    const u64 q0_notify_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q0.notify_token), child_handle);
+    const u64 q1_submit_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q1.submit_token), child_handle);
+    const u64 q1_notify_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, q1.notify_token), child_handle);
+    const u64 command_raw = syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_COMMAND, q0.command_token), child_handle);
     const u64 iommu_child = decode_queue_cap(iommu_raw, QUEUE_CAP_KIND_IOMMU);
     const u64 q0_submit_child = decode_queue_cap(q0_submit_raw, QUEUE_CAP_KIND_VIRTQUEUE);
     const u64 q0_notify_child = decode_queue_cap(q0_notify_raw, QUEUE_CAP_KIND_VIRTQUEUE);
@@ -1116,14 +1122,14 @@ static int fill_catalog_queue_tokens_for_child(volatile struct device_catalog_en
     return 1;
 }
 
-static int grant_device_catalog_to_child(u64 child_slot) {
+static int grant_device_catalog_to_child(u64 child_handle) {
     if (g_device_catalog_source_va == 0) return 1;
     volatile struct device_catalog_page *page = (volatile struct device_catalog_page *)g_device_catalog_source_va;
     for (u64 i = 0; i < page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
         volatile struct device_catalog_entry *entry = &page->entries[i];
         if (entry->present == 0) continue;
-        if (!grant_device_mmio_with_grant((struct device_catalog_entry *)entry, child_slot)) return 0;
-        if (!fill_catalog_queue_tokens_for_child(entry, child_slot)) return 0;
+        if (!grant_device_mmio_with_grant((struct device_catalog_entry *)entry, child_handle)) return 0;
+        if (!fill_catalog_queue_tokens_for_child(entry, child_handle)) return 0;
     }
     return 1;
 }
@@ -1140,8 +1146,8 @@ static void wait_config_word(u64 va, u64 index, u64 expected) {
 }
 
 static int install_fat_endpoint_for_boot(void) {
-    if (g_fat_session.endpoint_id == 0 || g_fat_session.process_slot == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_fat_session.endpoint_id, g_fat_session.process_slot) == SYSCALL_OK;
+    if (g_fat_session.endpoint_id == 0 || g_fat_session.process_handle == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_fat_session.endpoint_id, g_fat_session.process_handle) == SYSCALL_OK;
 }
 
 static int grant_fat_response_page(void) {
@@ -1206,8 +1212,8 @@ static u64 make_fat_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id
 
 static int connect_fat_for_root_spawn(void) {
     g_fat_session.endpoint_id = g_fat_endpoint_id;
-    g_fat_session.process_slot = g_fat_process_slot;
-    if (g_fat_session.endpoint_id == 0 || g_fat_session.process_slot == 0) return 0;
+    g_fat_session.process_handle = g_fat_process_slot;
+    if (g_fat_session.endpoint_id == 0 || g_fat_session.process_handle == 0) return 0;
 
     g_fat_session.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_fat_session.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -1218,7 +1224,7 @@ static int connect_fat_for_root_spawn(void) {
 
     clear_page(REQUEST_VA);
     clear_page(RESPONSE_VA);
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
     g_fat_session.session_nonce = make_fat_nonce(
         g_fat_session.request_paddr,
         g_fat_session.response_paddr,
@@ -1383,7 +1389,7 @@ static void spawn_root_seed2_direct(void) {
         user_log("[seed2_boot] root seed2 spawn failed\n");
         return;
     }
-    if (!grant_device_catalog_to_child(child_slot)) {
+    if (!grant_device_catalog_to_child(spawned)) {
         user_log("[seed2_boot] device catalog grant failed\n");
         return;
     }
@@ -1441,18 +1447,18 @@ static void launch_block_server(void) {
         user_log("[seed2_boot] spawn block_server failed\n");
         return;
     }
-    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, child_slot) != 0 ||
-        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, child_slot) != 0 ||
-        !grant_device_mmio(&g_block_device, child_slot))
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, spawned) != 0 ||
+        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, spawned) != 0 ||
+        !grant_device_mmio(&g_block_device, spawned))
     {
         user_log("[seed2_boot] block_server publish/grant failed\n");
         return;
     }
 
-    const u64 iommu_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_IOMMU, grant.iommu_token), child_slot), QUEUE_CAP_KIND_IOMMU);
-    const u64 submit_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, grant.submit_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
-    const u64 notify_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, grant.notify_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
-    const u64 command_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_COMMAND, grant.command_token), child_slot), QUEUE_CAP_KIND_COMMAND);
+    const u64 iommu_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_IOMMU, grant.iommu_token), spawned), QUEUE_CAP_KIND_IOMMU);
+    const u64 submit_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, grant.submit_token), spawned), QUEUE_CAP_KIND_VIRTQUEUE);
+    const u64 notify_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, grant.notify_token), spawned), QUEUE_CAP_KIND_VIRTQUEUE);
+    const u64 command_child = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_COMMAND, grant.command_token), spawned), QUEUE_CAP_KIND_COMMAND);
     if (iommu_child == 0 || submit_child == 0 || notify_child == 0 || command_child == 0) {
         user_log("[seed2_boot] block_server queue grant failed\n");
         return;
@@ -1464,9 +1470,9 @@ static void launch_block_server(void) {
     (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, endpoint_id, 0);
     wait_config_word(cfg_va, BLOCK_DRIVER_STATUS_INDEX, BLOCK_STATUS_READY);
 
-    g_block_process_slot = child_slot;
+    g_block_process_slot = spawned;
     g_block_endpoint_id = endpoint_id;
-    service_registry_set(ensure_service_registry(), SERVICE_KIND_BLOCK, child_slot, endpoint_id);
+    service_registry_set(ensure_service_registry(), SERVICE_KIND_BLOCK, spawned, endpoint_id);
     user_log("[seed2_boot] block_server ready\n");
 }
 
@@ -1511,16 +1517,16 @@ static u64 launch_configured_service(const char *path, const char *label, u64 co
         user_log("[seed2_boot] spawn service failed\n");
         return 0;
     }
-    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, child_slot) != 0 ||
-        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, child_slot) != 0)
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, spawned) != 0 ||
+        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, spawned) != 0)
     {
         user_log("[seed2_boot] service publish failed\n");
         return 0;
     }
     wait_config_word(cfg_va, ready_index, ready_value);
-    service_registry_set(ensure_service_registry(), service_kind, child_slot, endpoint_id);
+    service_registry_set(ensure_service_registry(), service_kind, spawned, endpoint_id);
     user_log(label);
-    return child_slot;
+    return spawned;
 }
 
 static void launch_fat_server(void) {

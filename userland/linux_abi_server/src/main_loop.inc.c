@@ -38,11 +38,17 @@ void linux_abi_main(void) {
         const struct trap_request req_snapshot = *(const struct trap_request *)msg.request_va;
         const struct trap_request *req = &req_snapshot;
         if (req->magic != TRAP_MAGIC || req->version != TRAP_VERSION) { user_log("LinuxAbiServer: bad request header\n"); msg = reply(errno_inval(), 0); continue; }
+        if (!delegate_target_token_matches_slot(req->thread_id, req->caller_principal)) {
+            user_log("LinuxAbiServer: bad delegate target token\n");
+            msg = reply(errno_inval(), 0);
+            continue;
+        }
         struct linux_abi_context ctx;
         ctx.proc = process_state_for(req->caller_principal);
         ctx.request = req;
-        ctx.reply_target_principal = req->caller_principal;
+        ctx.reply_target_principal = 0;
         g_abi_ctx = &ctx;
+        if (ctx.proc) ctx.proc->target_token = req->thread_id;
         if (!g_root_linux_principal_set) {
             g_root_linux_principal = req->caller_principal;
             g_root_linux_principal_set = 1;
@@ -57,9 +63,9 @@ void linux_abi_main(void) {
         struct abi_handler_result handler_result = abi_result_from_legacy_message(msg);
         switch (req->nr) {
         case LINUX_SYS_READ: handler_result = handle_read(req); handler_result_active = 1; break;
-        case LINUX_SYS_WRITE: msg = handle_write(req); break;
-        case LINUX_SYS_READV: msg = handle_readv(req); break;
-        case LINUX_SYS_WRITEV: msg = handle_writev(req); break;
+        case LINUX_SYS_WRITE: handler_result = handle_write_blocking(req); handler_result_active = 1; break;
+        case LINUX_SYS_READV: handler_result = handle_readv_blocking(req); handler_result_active = 1; break;
+        case LINUX_SYS_WRITEV: handler_result = handle_writev_blocking(req); handler_result_active = 1; break;
         case LINUX_SYS_PIPE: msg = handle_pipe2(req, 0); break;
         case LINUX_SYS_PIPE2: msg = handle_pipe2(req, 1); break;
         case LINUX_SYS_OPEN: msg = handle_openat(req, 1); break;

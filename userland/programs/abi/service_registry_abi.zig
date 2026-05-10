@@ -1,12 +1,11 @@
 const process_abi = @import("process_abi.zig");
 
 pub const magic: u64 = 0x53525643; // "SRVC"
-pub const version: u64 = 1;
+pub const version: u64 = 2;
 pub const page_va: u64 = process_abi.auxPageVa(5);
 pub const max_entries: usize = 12;
 pub const dynamic_endpoint_id_base: u64 = 0x80;
 pub const syscall_publish_service_endpoint: u64 = 0x33;
-pub const service_flag_process_slot_compat: u64 = 1 << 0;
 
 pub const ServiceKind = enum(u64) {
     window = 1,
@@ -23,8 +22,7 @@ pub const ServiceKind = enum(u64) {
 
 pub const ServiceEntry = extern struct {
     kind: u64,
-    // Optional compatibility field. Public service lookup should use endpoint_id.
-    process_slot: u64,
+    process_handle: u64,
     endpoint_id: u64,
     flags: u64,
 };
@@ -58,37 +56,37 @@ pub fn writeSingleService(base_va: u64, kind: ServiceKind, endpoint_id: u64) voi
     addService(base_va, kind, endpoint_id);
 }
 
-pub fn writeSingleServiceWithProcessSlot(base_va: u64, kind: ServiceKind, process_slot: u64, endpoint_id: u64) void {
+pub fn writeSingleServiceWithProcessHandle(base_va: u64, kind: ServiceKind, process_handle: u64, endpoint_id: u64) void {
     initPage(base_va);
-    addServiceWithProcessSlot(base_va, kind, process_slot, endpoint_id);
+    addServiceWithProcessHandle(base_va, kind, process_handle, endpoint_id);
 }
 
 pub fn addService(base_va: u64, kind: ServiceKind, endpoint_id: u64) void {
-    addServiceWithProcessSlot(base_va, kind, 0, endpoint_id);
+    addServiceWithProcessHandle(base_va, kind, 0, endpoint_id);
 }
 
-pub fn addServiceWithProcessSlot(base_va: u64, kind: ServiceKind, process_slot: u64, endpoint_id: u64) void {
+pub fn addServiceWithProcessHandle(base_va: u64, kind: ServiceKind, process_handle: u64, endpoint_id: u64) void {
     addServiceEntry(base_va, .{
         .kind = @intFromEnum(kind),
-        .process_slot = process_slot,
+        .process_handle = process_handle,
         .endpoint_id = endpoint_id,
-        .flags = service_flag_process_slot_compat,
+        .flags = 0,
     });
 }
 
-pub fn setServiceWithProcessSlot(base_va: u64, kind: ServiceKind, process_slot: u64, endpoint_id: u64) void {
+pub fn setServiceWithProcessHandle(base_va: u64, kind: ServiceKind, process_handle: u64, endpoint_id: u64) void {
     const page: *volatile RegistryPage = @ptrFromInt(base_va);
     if (page.magic != magic or page.version != version) initPage(base_va);
     var i: usize = 0;
     while (i < page.entry_count and i < max_entries) : (i += 1) {
         const entry = &page.entries[i];
         if (entry.kind != @intFromEnum(kind)) continue;
-        entry.process_slot = process_slot;
+        entry.process_handle = process_handle;
         entry.endpoint_id = endpoint_id;
-        entry.flags = service_flag_process_slot_compat;
+        entry.flags = 0;
         return;
     }
-    addServiceWithProcessSlot(base_va, kind, process_slot, endpoint_id);
+    addServiceWithProcessHandle(base_va, kind, process_handle, endpoint_id);
 }
 
 pub fn removeService(base_va: u64, kind: ServiceKind) void {
@@ -103,7 +101,7 @@ pub fn removeService(base_va: u64, kind: ServiceKind) void {
         }
         if (page.entry_count != 0) {
             page.entry_count -= 1;
-            page.entries[page.entry_count] = .{ .kind = 0, .process_slot = 0, .endpoint_id = 0, .flags = 0 };
+            page.entries[page.entry_count] = .{ .kind = 0, .process_handle = 0, .endpoint_id = 0, .flags = 0 };
         }
         return;
     }
@@ -116,7 +114,7 @@ pub fn addServiceEntry(base_va: u64, entry: ServiceEntry) void {
     const index: usize = @intCast(page.entry_count);
     const slot = &page.entries[index];
     slot.kind = entry.kind;
-    slot.process_slot = entry.process_slot;
+    slot.process_handle = entry.process_handle;
     slot.endpoint_id = entry.endpoint_id;
     slot.flags = entry.flags;
     page.entry_count += 1;
@@ -131,7 +129,7 @@ pub fn findService(base_va: u64, kind: ServiceKind) ?ServiceEntry {
         if (entry.kind == @intFromEnum(kind)) {
             return .{
                 .kind = entry.kind,
-                .process_slot = entry.process_slot,
+                .process_handle = entry.process_handle,
                 .endpoint_id = entry.endpoint_id,
                 .flags = entry.flags,
             };
@@ -140,6 +138,6 @@ pub fn findService(base_va: u64, kind: ServiceKind) ?ServiceEntry {
     return null;
 }
 
-pub fn allowsProcessSlotCompat(entry: ServiceEntry) bool {
-    return entry.process_slot != 0 and (entry.flags & service_flag_process_slot_compat) != 0;
+pub fn hasProcessHandle(entry: ServiceEntry) bool {
+    return entry.process_handle != 0;
 }

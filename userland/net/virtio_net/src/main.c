@@ -473,8 +473,8 @@ static u64 accept_cap_transfer(u64 transfer_id) {
     return syscall1(SYSCALL_ACCEPT_CAP_TRANSFER, transfer_id);
 }
 
-static u64 install_endpoint(u64 endpoint_id, u64 target_process_slot) {
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, target_process_slot);
+static u64 install_endpoint(u64 endpoint_id, u64 target_process_handle) {
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, target_process_handle);
 }
 
 static u64 signal_endpoint(u64 endpoint_id) {

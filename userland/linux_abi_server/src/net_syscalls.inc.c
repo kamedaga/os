@@ -75,8 +75,8 @@ static u64 make_net_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id
 }
 
 static int install_net_endpoint(void) {
-    if (g_net.endpoint_id == 0 || g_net.process_slot == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_net.endpoint_id, g_net.process_slot) == SYSCALL_OK;
+    if (g_net.endpoint_id == 0 || g_net.process_handle == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_net.endpoint_id, g_net.process_handle) == SYSCALL_OK;
 }
 
 static int grant_net_response_page(void) {
@@ -122,7 +122,7 @@ static int connect_net_from_registry(void) {
     struct service_entry entry;
     if (!find_service(SERVICE_KIND_NET, &entry)) return 0;
     g_net.endpoint_id = entry.endpoint_id;
-    g_net.process_slot = entry.process_slot;
+    g_net.process_handle = entry.process_handle;
     const int have_pages = g_net.request_paddr >= 0x1000 && g_net.response_paddr >= 0x1000;
     if (!have_pages) {
         g_net.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -135,7 +135,7 @@ static int connect_net_from_registry(void) {
     clear_page(NET_REQUEST_VA);
     clear_page(NET_RESPONSE_VA);
 
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
     g_net.session_nonce = make_net_nonce(g_net.request_paddr, g_net.response_paddr, g_net.endpoint_id, self_slot);
     volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
     const u64 connect_seq = g_net.next_seq != 0 ? g_net.next_seq++ : 1;
@@ -348,6 +348,7 @@ static struct ipc_message handle_socket(const struct trap_request *req) {
     g_fds[(u64)fd].size = 0;
     g_fds[(u64)fd].mode_bits = 0;
     g_fds[(u64)fd].fd_flags = (u32)((type & SOCK_NONBLOCK) != 0 ? O_NONBLOCK : 0);
+    g_fds[(u64)fd].desc_flags = (u32)((type & SOCK_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
     g_fds[(u64)fd].object_kind = FS_OBJECT_FILE;
     g_fds[(u64)fd].pipe_id = 0;
     g_fds[(u64)fd].socket_connected = 0;

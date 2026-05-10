@@ -1,7 +1,11 @@
 const std = @import("std");
 const kernel = @import("kernel");
+const capability = kernel.capability;
 const device_capabilities = kernel.device_capabilities;
 const cap_transfer_abi = @import("kernel_abi_root").cap_transfer_abi;
+const process_abi = @import("kernel_abi_root").process_abi;
+const process_builder_abi = @import("kernel_abi_root").process_builder_abi;
+const trap_abi = @import("kernel_abi_root").trap_abi;
 
 const KernelState = kernel.KernelState;
 const DmaMappingState = kernel.DmaMappingState;
@@ -13,6 +17,33 @@ const PrincipalId = kernel.PrincipalId;
 const processPrincipalFromIndex = kernel.processPrincipalFromIndex;
 const initial_process_count = kernel.initial_process_count;
 const default_process_principal: PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
+
+var test_user_spaces = [_]capability.UserAddressSpace{.{}} ** kernel.process_count;
+
+fn testSerialWrite(_: []const u8) void {}
+fn testPrintHex(_: u64) void {}
+fn testPrincipalLabel(_: PrincipalId) []const u8 {
+    return "test";
+}
+fn testFlushUserTlb(_: PrincipalId, _: u64) void {}
+
+fn initCapabilityRuntimeForTests() void {
+    capability.init(.{
+        .user_spaces = test_user_spaces[0..],
+        .user_va = 0,
+        .physical_map_limit = 0x1_0000_0000,
+        .page_entries = 512,
+        .page_addr_mask = 0x000f_ffff_ffff_f000,
+        .page_present = 0x1,
+        .page_rw = 0x2,
+        .page_user = 0x4,
+        .canonical_user_limit_exclusive = 0x0000_8000_0000_0000,
+        .serial_write = testSerialWrite,
+        .print_hex = testPrintHex,
+        .principal_label = testPrincipalLabel,
+        .flush_user_tlb_for_principal_va = testFlushUserTlb,
+    });
+}
 
 fn installProcessDmaCapForTest(s: *KernelState, paddr: u64) !void {
     try s.installCap(.Process0, paddr, .{
@@ -590,6 +621,196 @@ test "ensureProcessDescriptor updates label for reserved slot" {
     try std.testing.expectEqualStrings("bootstrap-fs", s.processDescriptor(fs_owner).?.label);
     try std.testing.expect(s.ensureProcessDescriptor(.Process0, "bootstrap-owner"));
     try std.testing.expectEqualStrings("bootstrap-owner", s.processDescriptor(.Process0).?.label);
+}
+
+test "process descriptor generation advances on slot reuse" {
+    var s = KernelState.initPhase1();
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    const first_generation = s.processGeneration(fs_owner).?;
+    try std.testing.expect(first_generation != 0);
+
+    try std.testing.expect(s.markProcessExited(fs_owner));
+    try std.testing.expectEqual(@as(?u64, null), s.processGeneration(fs_owner));
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs-2"));
+    const second_generation = s.processGeneration(fs_owner).?;
+    try std.testing.expectEqual(first_generation + 1, second_generation);
+}
+
+test "process descriptor generation survives remove before preserving storage reuse" {
+    var s = KernelState.initPhase1();
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    const first_generation = s.processGeneration(fs_owner).?;
+
+    try std.testing.expect(s.removeProcessDescriptor(fs_owner));
+    try std.testing.expectEqual(@as(?u64, null), s.processGeneration(fs_owner));
+
+    const created = s.createProcessDescriptorPreservingStorage("bootstrap-fs-2").?;
+    try std.testing.expectEqual(fs_owner, created);
+    try std.testing.expectEqual(first_generation + 1, s.processGeneration(created).?);
+}
+
+test "process handle rejects stale descriptor generation" {
+    var s = KernelState.initPhase1();
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    const stale_handle = s.processHandleFor(fs_owner).?;
+    const encoded_stale = process_abi.encodeProcessHandle(stale_handle.slot, stale_handle.generation);
+    try std.testing.expectEqual(fs_owner, s.principalFromProcessHandle(stale_handle).?);
+    try std.testing.expectEqual(fs_owner, s.principalFromEncodedProcessHandle(encoded_stale).?);
+
+    try std.testing.expect(s.markProcessExited(fs_owner));
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs-2"));
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.principalFromProcessHandle(stale_handle));
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.principalFromEncodedProcessHandle(encoded_stale));
+
+    const fresh_handle = s.processHandleFor(fs_owner).?;
+    try std.testing.expectEqual(fs_owner, s.principalFromProcessHandle(fresh_handle).?);
+}
+
+test "builder token decoded handle rejects stale descriptor generation" {
+    var s = KernelState.initPhase1();
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    try s.markProcessBuilderSuspended(fs_owner, .Process0);
+    const stale_handle = s.processHandleFor(fs_owner).?;
+    const stale_token = process_builder_abi.encodeProcessBuilderToken(stale_handle.slot, stale_handle.generation);
+    const stale_decoded = process_builder_abi.decodeProcessBuilderToken(stale_token).?;
+    const stale_principal = s.principalFromProcessHandle(.{
+        .slot = stale_decoded.process_slot,
+        .generation = stale_decoded.generation,
+    }).?;
+    try std.testing.expectEqual(fs_owner, stale_principal);
+    try std.testing.expect(s.processBuilderOwnerMatches(stale_principal, .Process0));
+    try std.testing.expect(!s.processBuilderOwnerMatches(stale_principal, .Process1));
+
+    try std.testing.expect(s.markProcessExited(fs_owner));
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs-2"));
+    try s.markProcessBuilderSuspended(fs_owner, .Process0);
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.principalFromProcessHandle(.{
+        .slot = stale_decoded.process_slot,
+        .generation = stale_decoded.generation,
+    }));
+
+    const fresh_handle = s.processHandleFor(fs_owner).?;
+    const fresh_token = process_builder_abi.encodeProcessBuilderToken(fresh_handle.slot, fresh_handle.generation);
+    const fresh_decoded = process_builder_abi.decodeProcessBuilderToken(fresh_token).?;
+    const fresh_principal = s.principalFromProcessHandle(.{
+        .slot = fresh_decoded.process_slot,
+        .generation = fresh_decoded.generation,
+    }).?;
+    try std.testing.expectEqual(fs_owner, fresh_principal);
+    try std.testing.expect(s.processBuilderOwnerMatches(fresh_principal, .Process0));
+}
+
+test "delegate target token decoded handle rejects stale descriptor generation" {
+    var s = KernelState.initPhase1();
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    const stale_handle = s.processHandleFor(fs_owner).?;
+    const stale_token = trap_abi.encodeDelegateTargetToken(stale_handle.slot, stale_handle.generation);
+    const stale_decoded = trap_abi.decodeDelegateTargetToken(stale_token).?;
+    try std.testing.expectEqual(fs_owner, s.principalFromProcessHandle(.{
+        .slot = stale_decoded.process_slot,
+        .generation = stale_decoded.generation,
+    }).?);
+
+    try std.testing.expect(s.markProcessExited(fs_owner));
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs-2"));
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.principalFromProcessHandle(.{
+        .slot = stale_decoded.process_slot,
+        .generation = stale_decoded.generation,
+    }));
+
+    const fresh_handle = s.processHandleFor(fs_owner).?;
+    const fresh_token = trap_abi.encodeDelegateTargetToken(fresh_handle.slot, fresh_handle.generation);
+    const fresh_decoded = trap_abi.decodeDelegateTargetToken(fresh_token).?;
+    try std.testing.expectEqual(fs_owner, s.principalFromProcessHandle(.{
+        .slot = fresh_decoded.process_slot,
+        .generation = fresh_decoded.generation,
+    }).?);
+}
+
+test "abi trap delegate state carries generation and updates request page by generation" {
+    initCapabilityRuntimeForTests();
+    var s = KernelState.initPhase1();
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    const generation = s.processGeneration(fs_owner).?;
+    try s.installEndpoint(fs_owner, 0x90, .Process0);
+    try s.setAbiTrapDelegate(fs_owner, 0x90, 1, 0x2000_0000);
+
+    var delegate = s.abiTrapDelegateFor(fs_owner).?;
+    try std.testing.expectEqual(@as(u64, 0x90), delegate.endpoint_id);
+    try std.testing.expectEqual(@as(u64, 0x2000_0000), delegate.request_page_va);
+    try std.testing.expectEqual(generation, delegate.target_generation);
+    try std.testing.expectEqual(@as(PrincipalId, .Process0), delegate.server_principal);
+    try std.testing.expectEqual(s.processGeneration(.Process0).?, delegate.server_generation);
+    try std.testing.expectEqual(@as(u64, 1), delegate.request_generation);
+
+    try s.updateAbiTrapDelegateRequestPage(fs_owner, generation, 0x2000_1000);
+    delegate = s.abiTrapDelegateFor(fs_owner).?;
+    try std.testing.expectEqual(@as(u64, 0x2000_1000), delegate.request_page_va);
+    try std.testing.expectEqual(generation, delegate.target_generation);
+    try std.testing.expectEqual(@as(u64, 2), delegate.request_generation);
+
+    try std.testing.expectError(KernelError.InvalidState, s.updateAbiTrapDelegateRequestPage(fs_owner, generation + 1, 0x2000_2000));
+
+    try std.testing.expect(s.markProcessExited(fs_owner));
+    try std.testing.expectEqual(@as(?kernel.AbiTrapDelegate, null), s.abiTrapDelegateFor(fs_owner));
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs-2"));
+    try s.installEndpoint(fs_owner, 0x90, .Process0);
+    try s.setAbiTrapDelegate(fs_owner, 0x90, 1, 0x2000_3000);
+    delegate = s.abiTrapDelegateFor(fs_owner).?;
+    try std.testing.expectEqual(generation + 1, delegate.target_generation);
+    try std.testing.expectEqual(@as(u64, 0x2000_3000), delegate.request_page_va);
+}
+
+test "retireProcessIncarnation clears delegate and scrubs cross-process state" {
+    initCapabilityRuntimeForTests();
+    var s = KernelState.initPhase1();
+    const fs_owner = processPrincipalFromIndex(initial_process_count) orelse unreachable;
+
+    try std.testing.expect(s.ensureProcessDescriptor(fs_owner, "bootstrap-fs"));
+    try s.installEndpoint(fs_owner, 0x90, .Process0);
+    try s.setAbiTrapDelegate(fs_owner, 0x90, 1, 0x2000_0000);
+    try s.installEndpoint(.Process0, 0x44, fs_owner);
+    try s.publishServiceEndpoint(0x45, fs_owner);
+    try s.cap_mailboxes[@intFromEnum(PrincipalId.Process0)].push(.{
+        .transfer_id = 1,
+        .sender = fs_owner,
+        .endpoint_id = 0x44,
+        .paddr = 0x1000,
+        .rights = .{ .cpu_read = true, .cpu_write = false, .dma = false },
+    });
+    s.pending_page_transfers[@intFromEnum(PrincipalId.Process1)] = .{
+        .transfer_id = 2,
+        .sender = fs_owner,
+        .endpoint_id = 0x55,
+        .paddr = 0x2000,
+        .rights = .{ .cpu_read = true, .cpu_write = true, .dma = false },
+    };
+
+    const retired = s.retireProcessIncarnation(fs_owner, .exit, 0).?;
+    try std.testing.expect(!s.isActiveProcess(fs_owner));
+    try std.testing.expectEqual(@as(?kernel.AbiTrapDelegate, null), s.abiTrapDelegateFor(fs_owner));
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.endpointTargetFor(.Process0, 0x44));
+    try std.testing.expectEqual(@as(?PrincipalId, null), s.endpointTargetFor(.Process1, 0x45));
+    try std.testing.expectEqual(@as(usize, 0), s.cap_mailboxes[@intFromEnum(PrincipalId.Process0)].len);
+    try std.testing.expectEqual(@as(?kernel.PendingCapTransfer, null), s.pending_page_transfers[@intFromEnum(PrincipalId.Process1)]);
+    try std.testing.expect(retired.endpoint_targets_removed);
+    try std.testing.expect(retired.published_endpoints_removed);
+    try std.testing.expect((retired.wake_process_mask & (@as(u64, 1) << @intFromEnum(PrincipalId.Process0))) != 0);
+    try std.testing.expect((retired.wake_process_mask & (@as(u64, 1) << @intFromEnum(PrincipalId.Process1))) != 0);
 }
 
 test "markProcessFaulted records fault status" {
