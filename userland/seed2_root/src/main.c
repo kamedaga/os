@@ -21,7 +21,6 @@ enum {
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
-    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_GRANT_QUEUE_CAP = 0x23,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
@@ -48,21 +47,18 @@ enum {
     ROOT_NET_ENDPOINT_ID = 0x89,
     TTY_SERVICE_ENDPOINT_ID = 0x8A,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
-    SERVICE_REGISTRY_VERSION = 2,
+    SERVICE_REGISTRY_VERSION = 1,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     SERVICE_KIND_VFS = 2,
     SERVICE_KIND_FAT_FS = 9,
     SERVICE_KIND_CONSOLE = 10,
     SERVICE_KIND_NET = 11,
     SERVICE_KIND_TTY = 12,
-    SERVICE_FLAG_RESERVED0 = 1,
+    SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
-    PROCESS_HANDLE_TAG = 2ULL << 60,
-    PROCESS_HANDLE_TAG_MASK = 0xFULL << 60,
-    PROCESS_HANDLE_SLOT_MASK = 0xFFFFFFFFULL,
-    PROCESS_HANDLE_GENERATION_SHIFT = 32,
-    PROCESS_HANDLE_GENERATION_MASK = 0xFFFFFFFULL,
+    SPAWN_RESULT_TAG = 1ULL << 63,
+    SPAWN_RESULT_PROCESS_MASK = 0xFFFFFFFFULL,
     SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE = 1ULL << 0,
     SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1ULL << 2,
     SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1ULL << 3,
@@ -128,7 +124,7 @@ enum {
     NET_DRIVER_STATUS_INDEX = 19,
 };
 
-struct service_entry { u64 kind; u64 process_handle; u64 endpoint_id; u64 flags; };
+struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
 struct service_registry_page {
     u64 magic;
     u64 version;
@@ -151,7 +147,7 @@ struct backend_session {
     u8 active;
     u8 reserved0[7];
     u64 endpoint_id;
-    u64 process_handle;
+    u64 process_slot;
     u64 request_paddr;
     u64 response_paddr;
     u64 session_nonce;
@@ -321,22 +317,22 @@ static void service_registry_set(u64 kind, u64 process_slot, u64 endpoint_id) {
     if (page->magic != SERVICE_REGISTRY_MAGIC || page->version != SERVICE_REGISTRY_VERSION) return;
     for (u64 i = 0; i < page->entry_count && i < SERVICE_REGISTRY_MAX_ENTRIES; i++) {
         if (page->entries[i].kind != kind) continue;
-        page->entries[i].process_handle = process_slot;
+        page->entries[i].process_slot = process_slot;
         page->entries[i].endpoint_id = endpoint_id;
-        page->entries[i].flags = 0;
+        page->entries[i].flags = SERVICE_FLAG_PROCESS_SLOT_COMPAT;
         return;
     }
     if (page->entry_count >= SERVICE_REGISTRY_MAX_ENTRIES) return;
     const u64 index = page->entry_count++;
     page->entries[index].kind = kind;
-    page->entries[index].process_handle = process_slot;
+    page->entries[index].process_slot = process_slot;
     page->entries[index].endpoint_id = endpoint_id;
-    page->entries[index].flags = 0;
+    page->entries[index].flags = SERVICE_FLAG_PROCESS_SLOT_COMPAT;
 }
 
 static int install_fat_endpoint(void) {
-    if (g_fat.endpoint_id == 0 || g_fat.process_handle == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_fat.endpoint_id, g_fat.process_handle) == SYSCALL_OK;
+    if (g_fat.endpoint_id == 0 || g_fat.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_fat.endpoint_id, g_fat.process_slot) == SYSCALL_OK;
 }
 
 static int grant_response_page(void) {
@@ -376,7 +372,7 @@ static u64 make_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u6
 
 static int connect_fat(u64 endpoint_id, u64 process_slot) {
     g_fat.endpoint_id = endpoint_id;
-    g_fat.process_handle = process_slot;
+    g_fat.process_slot = process_slot;
     if (endpoint_id == 0 || process_slot == 0) return 0;
     g_fat.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_fat.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -387,7 +383,7 @@ static int connect_fat(u64 endpoint_id, u64 process_slot) {
 
     clear_page(REQUEST_VA);
     clear_page(RESPONSE_VA);
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_fat.session_nonce = make_nonce(g_fat.request_paddr, g_fat.response_paddr, endpoint_id, self_slot);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)REQUEST_VA;
     request->magic = FS_REQUEST_MAGIC;
@@ -505,8 +501,8 @@ static int load_text_from_fat(const char *path, u8 *buffer, u32 capacity, u32 *l
 }
 
 static int install_vfs_endpoint(void) {
-    if (g_vfs.endpoint_id == 0 || g_vfs.process_handle == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_vfs.endpoint_id, g_vfs.process_handle) == SYSCALL_OK;
+    if (g_vfs.endpoint_id == 0 || g_vfs.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_vfs.endpoint_id, g_vfs.process_slot) == SYSCALL_OK;
 }
 
 static int grant_vfs_response_page(void) {
@@ -542,7 +538,7 @@ static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
 static int connect_vfs(u64 endpoint_id, u64 process_slot) {
     if (g_vfs.active) return 1;
     g_vfs.endpoint_id = endpoint_id;
-    g_vfs.process_handle = process_slot;
+    g_vfs.process_slot = process_slot;
     if (endpoint_id == 0 || process_slot == 0) return 0;
     g_vfs.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_vfs.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -553,7 +549,7 @@ static int connect_vfs(u64 endpoint_id, u64 process_slot) {
 
     clear_page(VFS_REQUEST_VA);
     clear_page(VFS_RESPONSE_VA);
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_vfs.session_nonce = make_nonce(g_vfs.request_paddr, g_vfs.response_paddr, endpoint_id, self_slot);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
     request->magic = FS_REQUEST_MAGIC;
@@ -669,23 +665,23 @@ static volatile struct device_catalog_entry *find_device_catalog_entry(u64 kind)
     return 0;
 }
 
-static int grant_driver_mmio(volatile struct device_catalog_entry *entry, u64 child_handle) {
-    if (syscall3(SYSCALL_GRANT_CAP, entry->common_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
-    if (syscall3(SYSCALL_GRANT_CAP, entry->notify_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
+static int grant_driver_mmio(volatile struct device_catalog_entry *entry, u64 child_slot) {
+    if (syscall3(SYSCALL_GRANT_CAP, entry->common_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
+    if (syscall3(SYSCALL_GRANT_CAP, entry->notify_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
     if (entry->isr_page_paddr != 0 &&
-        syscall3(SYSCALL_GRANT_CAP, entry->isr_page_paddr, child_handle, PAGE_RIGHT_CPU_READ) != SYSCALL_OK) return 0;
+        syscall3(SYSCALL_GRANT_CAP, entry->isr_page_paddr, child_slot, PAGE_RIGHT_CPU_READ) != SYSCALL_OK) return 0;
     if (entry->device_page_paddr != 0 &&
-        syscall3(SYSCALL_GRANT_CAP, entry->device_page_paddr, child_handle, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
+        syscall3(SYSCALL_GRANT_CAP, entry->device_page_paddr, child_slot, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return 0;
     return 1;
 }
 
-static int grant_driver_queue_caps(volatile struct device_catalog_entry *entry, u64 child_handle, u64 *iommu, u64 *q0_submit, u64 *q0_notify, u64 *q1_submit, u64 *q1_notify, u64 *command) {
-    *iommu = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_IOMMU, entry->iommu_token), child_handle), QUEUE_CAP_KIND_IOMMU);
-    *q0_submit = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue0_submit_token), child_handle), QUEUE_CAP_KIND_VIRTQUEUE);
-    *q0_notify = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue0_notify_token), child_handle), QUEUE_CAP_KIND_VIRTQUEUE);
-    *q1_submit = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue1_submit_token), child_handle), QUEUE_CAP_KIND_VIRTQUEUE);
-    *q1_notify = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue1_notify_token), child_handle), QUEUE_CAP_KIND_VIRTQUEUE);
-    *command = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_COMMAND, entry->command_token), child_handle), QUEUE_CAP_KIND_COMMAND);
+static int grant_driver_queue_caps(volatile struct device_catalog_entry *entry, u64 child_slot, u64 *iommu, u64 *q0_submit, u64 *q0_notify, u64 *q1_submit, u64 *q1_notify, u64 *command) {
+    *iommu = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_IOMMU, entry->iommu_token), child_slot), QUEUE_CAP_KIND_IOMMU);
+    *q0_submit = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue0_submit_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *q0_notify = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue0_notify_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *q1_submit = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue1_submit_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *q1_notify = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_VIRTQUEUE, entry->queue1_notify_token), child_slot), QUEUE_CAP_KIND_VIRTQUEUE);
+    *command = decode_queue_cap(syscall2(SYSCALL_GRANT_QUEUE_CAP, encode_queue_cap(QUEUE_CAP_KIND_COMMAND, entry->command_token), child_slot), QUEUE_CAP_KIND_COMMAND);
     return *iommu != 0 && *q0_submit != 0 && *q0_notify != 0 && *q1_submit != 0 && *q1_notify != 0 && *command != 0;
 }
 
@@ -723,15 +719,15 @@ static int spawn_root_driver_with_exec(u64 exec_token, u64 catalog_kind, u64 end
     );
     const u64 child_slot = decode_spawn_process_slot(spawned);
     if (child_slot == 0) return 0;
-    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, spawned) != SYSCALL_OK ||
-        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, spawned) != SYSCALL_OK ||
-        !grant_driver_mmio(entry, spawned))
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, child_slot) != SYSCALL_OK ||
+        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, child_slot) != SYSCALL_OK ||
+        !grant_driver_mmio(entry, child_slot))
     {
         return 0;
     }
 
     u64 iommu = 0, q0_submit = 0, q0_notify = 0, q1_submit = 0, q1_notify = 0, command = 0;
-    if (!grant_driver_queue_caps(entry, spawned, &iommu, &q0_submit, &q0_notify, &q1_submit, &q1_notify, &command)) return 0;
+    if (!grant_driver_queue_caps(entry, child_slot, &iommu, &q0_submit, &q0_notify, &q1_submit, &q1_notify, &command)) return 0;
 
     if (catalog_kind == DEVICE_CATALOG_KIND_CONSOLE) {
         cfg[0] = CONSOLE_CONFIG_MAGIC;
@@ -758,7 +754,7 @@ static int spawn_root_driver_with_exec(u64 exec_token, u64 catalog_kind, u64 end
             user_log("[seed2_root] console status wait deferred\n");
         }
         g_console_endpoint_id = endpoint_id;
-        g_console_process_slot = spawned;
+        g_console_process_slot = child_slot;
     } else {
         cfg[0] = NET_CONFIG_MAGIC;
         cfg[1] = NET_CONFIG_VERSION;
@@ -786,10 +782,10 @@ static int spawn_root_driver_with_exec(u64 exec_token, u64 catalog_kind, u64 end
             user_log("[seed2_root] net status wait deferred\n");
         }
         g_net_endpoint_id = endpoint_id;
-        g_net_process_slot = spawned;
+        g_net_process_slot = child_slot;
     }
 
-    service_registry_set(service_kind, spawned, endpoint_id);
+    service_registry_set(service_kind, child_slot, endpoint_id);
     user_log(ready_label);
     return 1;
 }
@@ -840,10 +836,8 @@ static void launch_root_net_driver(void) {
 }
 
 static u64 decode_spawn_process_slot(u64 value) {
-    if ((value & PROCESS_HANDLE_TAG_MASK) != PROCESS_HANDLE_TAG) return 0;
-    const u64 slot = value & PROCESS_HANDLE_SLOT_MASK;
-    const u64 generation = (value >> PROCESS_HANDLE_GENERATION_SHIFT) & PROCESS_HANDLE_GENERATION_MASK;
-    return slot != 0 && generation != 0 ? slot : 0;
+    if ((value & SPAWN_RESULT_TAG) == 0) return 0;
+    return value & SPAWN_RESULT_PROCESS_MASK;
 }
 
 static void launch_rootfs_vfs(void) {
@@ -865,7 +859,7 @@ static void launch_rootfs_vfs(void) {
     config[1] = 0x31534656;
     config[2] = 0;
     config[3] = g_fat.endpoint_id;
-    config[4] = g_fat.process_handle;
+    config[4] = g_fat.process_slot;
     config[5] = g_net_endpoint_id;
     config[6] = g_net_process_slot;
 
@@ -891,14 +885,14 @@ static void launch_rootfs_vfs(void) {
         user_log("[seed2_root] rootfs_vfs spawn failed\n");
         return;
     }
-    g_rootfs_vfs_process_slot = spawned;
-    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, ROOTFS_VFS_ENDPOINT_ID, spawned) != SYSCALL_OK ||
-        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, ROOTFS_VFS_ENDPOINT_ID, spawned) != SYSCALL_OK)
+    g_rootfs_vfs_process_slot = child_slot;
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, ROOTFS_VFS_ENDPOINT_ID, child_slot) != SYSCALL_OK ||
+        syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, ROOTFS_VFS_ENDPOINT_ID, child_slot) != SYSCALL_OK)
     {
         user_log("[seed2_root] rootfs_vfs endpoint publish deferred\n");
     } else {
         user_log("[seed2_root] rootfs_vfs endpoint published\n");
-        service_registry_set(SERVICE_KIND_VFS, spawned, ROOTFS_VFS_ENDPOINT_ID);
+        service_registry_set(SERVICE_KIND_VFS, child_slot, ROOTFS_VFS_ENDPOINT_ID);
         (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, ROOTFS_VFS_ENDPOINT_ID, 0);
     }
     user_log("[seed2_root] rootfs_vfs ready wait deferred\n");
@@ -1065,7 +1059,7 @@ static int spawn_manifest_node(struct startup_node *node) {
     const u64 child_slot = decode_spawn_process_slot(spawned);
     if (child_slot == 0) return 0;
     node->spawned = 1;
-    node->child_slot = spawned;
+    node->child_slot = child_slot;
     return 1;
 }
 

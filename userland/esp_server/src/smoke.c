@@ -6,7 +6,6 @@ enum {
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
-    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_LOG = 0x9,
@@ -17,9 +16,9 @@ enum {
     PAGE_RIGHT_CPU_WRITE = 0x2,
 
     SERVICE_REGISTRY_MAGIC = 0x53525643u,
-    SERVICE_REGISTRY_VERSION = 2,
+    SERVICE_REGISTRY_VERSION = 1,
     SERVICE_KIND_VFS = 2,
-    SERVICE_FLAG_RESERVED0 = 1,
+    SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
     SERVICE_REGISTRY_PAGE_VA = 0x3C2C0000,
 
     REQUEST_VA = 0x25000000,
@@ -29,7 +28,7 @@ enum {
 
 struct service_registry_entry {
     u64 kind;
-    u64 process_handle;
+    u64 process_slot;
     u64 endpoint_id;
     u64 flags;
 };
@@ -44,7 +43,7 @@ struct service_registry_page {
 
 struct fs_smoke_client {
     u64 endpoint_id;
-    u64 server_process_handle;
+    u64 server_process_slot;
     u64 request_paddr;
     u64 response_paddr;
     u64 session_nonce;
@@ -122,7 +121,7 @@ static void copy_to_volatile(volatile u8 *dst, const u8 *src, u64 len) {
     for (u64 i = 0; i < len; i++) dst[i] = src[i];
 }
 
-static int find_esp_fs_service(u64 *endpoint_id, u64 *process_handle) {
+static int find_esp_fs_service(u64 *endpoint_id, u64 *process_slot) {
     volatile struct service_registry_page *page = (volatile struct service_registry_page *)SERVICE_REGISTRY_PAGE_VA;
     if (page->magic != SERVICE_REGISTRY_MAGIC || page->version != SERVICE_REGISTRY_VERSION) return 0;
     u64 count = page->entry_count;
@@ -131,36 +130,36 @@ static int find_esp_fs_service(u64 *endpoint_id, u64 *process_handle) {
         volatile struct service_registry_entry *entry = &page->entries[i];
         if (entry->kind != SERVICE_KIND_VFS) continue;
         *endpoint_id = entry->endpoint_id;
-        *process_handle = entry->process_handle;
+        *process_slot = ((entry->flags & SERVICE_FLAG_PROCESS_SLOT_COMPAT) != 0) ? entry->process_slot : 0;
         return *endpoint_id != 0;
     }
     return 0;
 }
 
-static int install_endpoint_if_needed(u64 endpoint_id, u64 process_handle) {
-    if (process_handle == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, process_handle) == SYSCALL_OK;
+static int install_compat_endpoint_if_needed(u64 endpoint_id, u64 process_slot) {
+    if (process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, process_slot) == SYSCALL_OK;
 }
 
-static int grant_response_cap(u64 response_paddr, u64 endpoint_id, u64 process_handle) {
+static int grant_response_cap(u64 response_paddr, u64 endpoint_id, u64 process_slot) {
     u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
     if (ret == SYSCALL_OK) return 1;
     if (ret != SYSCALL_ERR_ENDPOINT) return 0;
-    if (!install_endpoint_if_needed(endpoint_id, process_handle)) return 0;
+    if (!install_compat_endpoint_if_needed(endpoint_id, process_slot)) return 0;
     return syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) == SYSCALL_OK;
 }
 
-static int share_request_cap(u64 request_paddr, u64 endpoint_id, u64 process_handle) {
+static int share_request_cap(u64 request_paddr, u64 endpoint_id, u64 process_slot) {
     u64 ret = syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id);
     if (ret == SYSCALL_OK) return 1;
     if (ret != SYSCALL_ERR_ENDPOINT) return 0;
-    if (!install_endpoint_if_needed(endpoint_id, process_handle)) return 0;
+    if (!install_compat_endpoint_if_needed(endpoint_id, process_slot)) return 0;
     return syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id) == SYSCALL_OK;
 }
 
-static u64 make_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_handle) {
+static u64 make_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
     u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^
-        ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_handle ^ 0x6d6f6b655f667331ULL;
+        ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x6d6f6b655f667331ULL;
     return nonce == 0 ? 1 : nonce;
 }
 
@@ -205,15 +204,15 @@ static u64 begin_request(struct fs_smoke_client *client, u16 op, u64 object_toke
 
 static int connect_esp_fs(struct fs_smoke_client *client) {
     u64 endpoint_id = 0;
-    u64 process_handle = 0;
-    if (!find_esp_fs_service(&endpoint_id, &process_handle)) return 0;
+    u64 process_slot = 0;
+    if (!find_esp_fs_service(&endpoint_id, &process_slot)) return 0;
 
     u64 paddrs[2] = {0, 0};
     if (syscall4(SYSCALL_ALLOC_MAP_PAGES, REQUEST_VA, 2, 1, (u64)paddrs) != SYSCALL_OK) return 0;
     if (paddrs[0] < 0x1000 || paddrs[1] < 0x1000) return 0;
-    if (!grant_response_cap(paddrs[1], endpoint_id, process_handle)) return 0;
+    if (!grant_response_cap(paddrs[1], endpoint_id, process_slot)) return 0;
 
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     const u64 nonce = make_session_nonce(paddrs[0], paddrs[1], endpoint_id, self_slot);
     clear_page(REQUEST_VA);
     clear_page(RESPONSE_VA);
@@ -226,12 +225,12 @@ static int connect_esp_fs(struct fs_smoke_client *client) {
     request->arg1 = self_slot;
     request->session_nonce = nonce;
 
-    if (!share_request_cap(paddrs[0], endpoint_id, process_handle)) return 0;
+    if (!share_request_cap(paddrs[0], endpoint_id, process_slot)) return 0;
     if (!wait_response(1, FS_OP_CONNECT)) return 0;
 
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
     client->endpoint_id = endpoint_id;
-    client->server_process_handle = process_handle;
+    client->server_process_slot = process_slot;
     client->request_paddr = paddrs[0];
     client->response_paddr = paddrs[1];
     client->session_nonce = nonce;

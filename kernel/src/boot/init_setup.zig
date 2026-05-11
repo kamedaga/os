@@ -162,7 +162,7 @@ const InitServiceDescriptorSet = struct {
     descriptors: [service_registry_abi.max_entries]service_registry_abi.ServiceEntry =
         [_]service_registry_abi.ServiceEntry{.{
             .kind = 0,
-            .process_handle = 0,
+            .process_slot = 0,
             .endpoint_id = 0,
             .flags = 0,
         }} ** service_registry_abi.max_entries,

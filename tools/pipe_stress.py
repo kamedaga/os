@@ -133,14 +133,19 @@ def make_command(index: int, body: str) -> tuple[bytes, bytes, str]:
     return begin.encode("ascii"), end.encode("ascii"), wrapped
 
 
-def run_pipe_command(console: Console, index: int, label: str, body: str, required: tuple[bytes, ...], timeout: float, send_delay: float) -> bytes:
+def run_pipe_command(console: Console, index: int, label: str, body: str, required: tuple[bytes, ...], timeout: float, send_delay: float) -> tuple[bytes, dict[str, float]]:
     begin, end, wrapped = make_command(index, body)
     if send_delay > 0:
         time.sleep(send_delay)
+    sent_at = time.monotonic()
     console.write_line(wrapped)
+    wrote_at = time.monotonic()
     console.read_until(begin, timeout)
+    begin_at = time.monotonic()
     out = console.read_until(end, timeout)
+    end_at = time.monotonic()
     tail = console.read_until(b"# ", timeout)
+    prompt_at = time.monotonic()
     plain = ANSI_RE.sub(b"", out + tail)
     if b"/cmd/dash_interactive.elf:" in plain or b"I/O error" in plain or b"not found" in plain:
         raise RuntimeError(f"{label} reported shell error: {plain!r}")
@@ -154,7 +159,14 @@ def run_pipe_command(console: Console, index: int, label: str, body: str, requir
         raise RuntimeError(f"{label} produced more than one line: {plain!r}")
     if b":0" not in plain[: plain.find(b"# ") if b"# " in plain else len(plain)]:
         raise RuntimeError(f"{label} non-zero or missing rc: {plain!r}")
-    return plain
+    timing = {
+        "write_s": wrote_at - sent_at,
+        "begin_s": begin_at - wrote_at,
+        "command_s": end_at - begin_at,
+        "prompt_s": prompt_at - end_at,
+        "total_s": prompt_at - sent_at,
+    }
+    return plain, timing
 
 
 def copy_logs(runtime_dir: Path, out_dir: Path, console: Console | None, qemu_stdout: list[str], failure: str | None) -> None:
@@ -225,6 +237,7 @@ def main() -> int:
     console = None
     qemu_stdout: list[str] = []
     completed: list[str] = []
+    timings: list[tuple[int, str, dict[str, float]]] = []
     failure: str | None = None
     try:
         pty_path = None
@@ -262,11 +275,19 @@ def main() -> int:
             if index > len(commands) and not args.only:
                 label, body, required = random.choice(commands)
             print(f"{index:04d} {label}: {body}", flush=True)
-            out = run_pipe_command(console, index, label, body, required, args.timeout, args.send_delay)
-            completed.append(f"{index:04d} {label} ok")
+            out, timing = run_pipe_command(console, index, label, body, required, args.timeout, args.send_delay)
+            timings.append((index, label, timing))
+            completed.append(f"{index:04d} {label} ok total={timing['total_s']:.3f}s command={timing['command_s']:.3f}s prompt={timing['prompt_s']:.3f}s")
+            print(completed[-1], flush=True)
             (out_dir / "last-output.txt").write_bytes(out)
             check_serial(runtime_dir)
 
+        timing_lines = ["index\tlabel\twrite_s\tbegin_s\tcommand_s\tprompt_s\ttotal_s"]
+        for item_index, item_label, timing in timings:
+            timing_lines.append(
+                f"{item_index}\t{item_label}\t{timing['write_s']:.6f}\t{timing['begin_s']:.6f}\t{timing['command_s']:.6f}\t{timing['prompt_s']:.6f}\t{timing['total_s']:.6f}"
+            )
+        (out_dir / "timings.tsv").write_text("\n".join(timing_lines) + "\n", encoding="utf-8")
         summary = "\n".join(completed + [f"result: ok ({len(completed)} commands)"]) + "\n"
         (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
         print(summary, end="")

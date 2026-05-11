@@ -75,35 +75,6 @@ fn releaseStaleThreadSlot(principal: kernel.PrincipalId) void {
     }
 }
 
-fn clearReusableProcessStorage(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    free_list: *kernel.FreePageList,
-    user_spaces: []boot_static.UserAddressSpace,
-) void {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
-    releaseStaleThreadSlot(principal);
-    if (process_index < user_spaces.len) {
-        user_spaces[process_index] = .{};
-    }
-    state.prepareProcessSlotForReuse(principal, free_list);
-}
-
-fn discardCreatedProcessStorage(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    free_list: *kernel.FreePageList,
-    user_spaces: []boot_static.UserAddressSpace,
-) void {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
-    releaseStaleThreadSlot(principal);
-    if (process_index < user_spaces.len) {
-        user_spaces[process_index] = .{};
-    }
-    _ = state.retireProcessIncarnation(principal, .exit, 0);
-    state.prepareProcessSlotForReuse(principal, free_list);
-}
-
 // ---------------------------------------------------------------------------
 // Address space helpers
 // ---------------------------------------------------------------------------
@@ -176,12 +147,9 @@ pub fn tryCreateDynamicUserProcess(
     free_list: *kernel.FreePageList,
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!DynamicUserProcess {
-    const principal = state.createProcessDescriptorPreservingStorage(role_label) orelse return error.NoFreeProcess;
-    clearReusableProcessStorage(state, principal, free_list, user_spaces);
-    const process = tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch {
-        discardCreatedProcessStorage(state, principal, free_list, user_spaces);
-        return error.CreateFailed;
-    };
+    const principal = state.createProcessDescriptor(role_label) orelse return error.NoFreeProcess;
+    releaseStaleThreadSlot(principal);
+    const process = tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch return error.CreateFailed;
     return .{
         .principal = principal,
         .process = process,
@@ -191,17 +159,16 @@ pub fn tryCreateDynamicUserProcess(
 pub fn tryCreateSuspendedUserProcess(
     state: *kernel.KernelState,
     role_label: []const u8,
-    free_list: *kernel.FreePageList,
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!SuspendedUserProcess {
-    const principal = state.createProcessDescriptorPreservingStorage(role_label) orelse return error.NoFreeProcess;
-    clearReusableProcessStorage(state, principal, free_list, user_spaces);
+    const principal = state.createProcessDescriptor(role_label) orelse return error.NoFreeProcess;
+    releaseStaleThreadSlot(principal);
     if (!user_vm.buildEmptyUserAddressSpace(principal)) {
-        discardCreatedProcessStorage(state, principal, free_list, user_spaces);
+        _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     }
     const thread_slot = scheduler.allocateThreadSlot(principal, user_spaces, buildInitialUserTrapFrame()) orelse {
-        discardCreatedProcessStorage(state, principal, free_list, user_spaces);
+        _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     };
     if (!scheduler.setThreadReady(thread_slot, false)) return error.CreateFailed;

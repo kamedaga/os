@@ -4,10 +4,10 @@ static int find_service(u64 kind, struct service_entry *out) {
     for (u64 i = 0; i < page->entry_count && i < SERVICE_REGISTRY_MAX_ENTRIES; i++) {
         if (page->entries[i].kind != kind) continue;
         out->kind = page->entries[i].kind;
-        out->process_handle = page->entries[i].process_handle;
+        out->process_slot = page->entries[i].process_slot;
         out->endpoint_id = page->entries[i].endpoint_id;
         out->flags = page->entries[i].flags;
-        return out->endpoint_id != 0 && out->process_handle != 0;
+        return out->endpoint_id != 0 && out->process_slot != 0;
     }
     return 0;
 }
@@ -93,17 +93,17 @@ static int backend_connect_console(void) {
     struct service_entry entry;
     if (!find_service(SERVICE_KIND_CONSOLE, &entry)) return 0;
     g_console.endpoint_id = entry.endpoint_id;
-    g_console.process_handle = entry.process_handle;
+    g_console.process_slot = entry.process_slot;
     g_console.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_console.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (g_console.request_paddr < PAGE_BYTES || g_console.response_paddr < PAGE_BYTES) return 0;
     if (syscall3(SYSCALL_MAP_PAGE, TTY_CONSOLE_REQUEST_VA, g_console.request_paddr, 1) != SYSCALL_OK) return 0;
     if (syscall3(SYSCALL_MAP_PAGE, TTY_CONSOLE_RESPONSE_VA, g_console.response_paddr, 1) != SYSCALL_OK) return 0;
-    if (!grant_response_page(g_console.response_paddr, g_console.endpoint_id, g_console.process_handle)) return 0;
+    if (!grant_response_page(g_console.response_paddr, g_console.endpoint_id, g_console.process_slot)) return 0;
 
     clear_page(TTY_CONSOLE_REQUEST_VA);
     clear_page(TTY_CONSOLE_RESPONSE_VA);
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_console.session_nonce = make_nonce(g_console.request_paddr, g_console.response_paddr, g_console.endpoint_id, self_slot);
     volatile struct console_request_header *request = request_at(TTY_CONSOLE_REQUEST_VA);
     request->magic = CONSOLE_REQUEST_MAGIC;
@@ -114,7 +114,7 @@ static int backend_connect_console(void) {
     request->arg1 = self_slot;
     __asm__ volatile("" ::: "memory");
     request->request_seq = 1;
-    if (!share_request_page(g_console.request_paddr, g_console.endpoint_id, g_console.process_handle)) return 0;
+    if (!share_request_page(g_console.request_paddr, g_console.endpoint_id, g_console.process_slot)) return 0;
     if (!wait_console_response(1, CONSOLE_OP_CONNECT, 8192)) return 0;
     volatile struct console_response_header *response = response_at(TTY_CONSOLE_RESPONSE_VA);
     if (response->status != CONSOLE_STATUS_OK) return 0;

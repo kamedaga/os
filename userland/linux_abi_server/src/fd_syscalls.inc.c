@@ -6,13 +6,6 @@ static int fd_clone_into(u64 dst, u64 src) {
     return 1;
 }
 
-static int fd_clone_into_with_desc_flags(u64 dst, u64 src, u32 desc_flags) {
-    if (!fd_clone_into(dst, src)) return 0;
-    g_fds[dst].desc_flags = desc_flags;
-    sync_fd_to_thread_group(dst);
-    return 1;
-}
-
 static int alloc_fd_at_least(u64 min_fd) {
     if (min_fd >= 32) return -1;
     for (u64 i = min_fd; i < 32; i++) if (g_fds[i].kind == FD_UNUSED) return (int)i;
@@ -33,8 +26,6 @@ static struct ipc_message handle_pipe2(const struct trap_request *req, int has_f
 
     g_pipes[(u64)pipe_slot].used = 1;
     g_pipes[(u64)pipe_slot].pending_read = 0;
-    g_pipes[(u64)pipe_slot].pending_write = 0;
-    g_pipes[(u64)pipe_slot].pending_write_atomic = 0;
     g_pipes[(u64)pipe_slot].read_refs = 1;
     g_pipes[(u64)pipe_slot].write_refs = 1;
     g_pipes[(u64)pipe_slot].head = 0;
@@ -42,16 +33,11 @@ static struct ipc_message handle_pipe2(const struct trap_request *req, int has_f
     g_pipes[(u64)pipe_slot].pending_principal = 0;
     g_pipes[(u64)pipe_slot].pending_dst = 0;
     g_pipes[(u64)pipe_slot].pending_len = 0;
-    g_pipes[(u64)pipe_slot].pending_write_principal = 0;
-    g_pipes[(u64)pipe_slot].pending_write_token = 0;
-    g_pipes[(u64)pipe_slot].pending_write_len = 0;
 
     g_fds[(u64)read_fd].kind = FD_PIPE_READ;
     g_fds[(u64)read_fd].token = 0;
     g_fds[(u64)read_fd].offset = 0;
     g_fds[(u64)read_fd].size = 0;
-    g_fds[(u64)read_fd].fd_flags = (u32)(flags & O_NONBLOCK);
-    g_fds[(u64)read_fd].desc_flags = (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
     g_fds[(u64)read_fd].mode_bits = FS_FILE_MODE;
     g_fds[(u64)read_fd].object_kind = FS_OBJECT_FILE;
     g_fds[(u64)read_fd].pipe_id = (u8)pipe_slot;
@@ -62,8 +48,6 @@ static struct ipc_message handle_pipe2(const struct trap_request *req, int has_f
     g_fds[(u64)write_fd].token = 0;
     g_fds[(u64)write_fd].offset = 0;
     g_fds[(u64)write_fd].size = 0;
-    g_fds[(u64)write_fd].fd_flags = (u32)(flags & O_NONBLOCK);
-    g_fds[(u64)write_fd].desc_flags = (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
     g_fds[(u64)write_fd].mode_bits = FS_FILE_MODE;
     g_fds[(u64)write_fd].object_kind = FS_OBJECT_FILE;
     g_fds[(u64)write_fd].pipe_id = (u8)pipe_slot;
@@ -88,7 +72,7 @@ static struct ipc_message handle_dup(const struct trap_request *req) {
     const u64 oldfd = req->args[0];
     const int newfd = alloc_fd_at_least(0);
     if (newfd < 0) return reply(errno_busy(), 0);
-    if (!fd_clone_into_with_desc_flags((u64)newfd, oldfd, 0)) return reply(errno_badf(), 0);
+    if (!fd_clone_into((u64)newfd, oldfd)) return reply(errno_badf(), 0);
     return reply((u64)newfd, 0);
 }
 
@@ -99,9 +83,7 @@ static struct ipc_message handle_dup2_like(const struct trap_request *req, int d
     if (dup3 && oldfd == newfd) return reply(errno_inval(), 0);
     if (oldfd == newfd) return reply(newfd, 0);
     if (fd_is_pipe(newfd)) close_pipe_fd(newfd);
-    const u64 flags = dup3 ? req->args[2] : 0;
-    if ((flags & ~(u64)O_CLOEXEC) != 0) return reply(errno_inval(), 0);
-    if (!fd_clone_into_with_desc_flags(newfd, oldfd, (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0))) return reply(errno_badf(), 0);
+    if (!fd_clone_into(newfd, oldfd)) return reply(errno_badf(), 0);
     return reply(newfd, 0);
 }
 
@@ -111,15 +93,11 @@ static struct ipc_message handle_fcntl(const struct trap_request *req) {
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         const int newfd = alloc_fd_at_least(arg);
         if (newfd < 0) return reply(errno_busy(), 0);
-        if (!fd_clone_into_with_desc_flags((u64)newfd, fd, cmd == F_DUPFD_CLOEXEC ? FD_CLOEXEC : 0)) return reply(errno_badf(), 0);
+        if (!fd_clone_into((u64)newfd, fd)) return reply(errno_badf(), 0);
         return reply((u64)newfd, 0);
     }
-    if (cmd == F_GETFD) return reply(g_fds[fd].desc_flags & FD_CLOEXEC, 0);
-    if (cmd == F_SETFD) {
-        g_fds[fd].desc_flags = (u32)(arg & FD_CLOEXEC);
-        sync_fd_to_thread_group(fd);
-        return reply(0, 0);
-    }
+    if (cmd == F_GETFD) return reply(0, 0);
+    if (cmd == F_SETFD) return reply(0, 0);
     if (cmd == F_GETFL) {
         const u64 access = g_fds[fd].kind == FD_PIPE_WRITE ? O_WRONLY : (g_fds[fd].kind == FD_SOCKET ? O_RDWR : O_RDONLY);
         return reply(access | (g_fds[fd].fd_flags & O_NONBLOCK), 0);

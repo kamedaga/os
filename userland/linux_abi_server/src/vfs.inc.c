@@ -1,5 +1,5 @@
 static int install_fs_endpoint(const struct vfs_client *client) {
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, client->endpoint_id, client->process_handle) == SYSCALL_OK;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, client->endpoint_id, client->process_slot) == SYSCALL_OK;
 }
 
 static int grant_fs_response_page(struct vfs_client *client) {
@@ -33,7 +33,7 @@ static int connect_fs_from_registry(u64 service_kind, struct vfs_client *client,
     struct service_entry entry;
     if (!find_service(service_kind, &entry)) return 0;
     client->endpoint_id = entry.endpoint_id;
-    client->process_handle = entry.process_handle;
+    client->process_slot = entry.process_slot;
     client->request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     client->response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (client->request_paddr < 0x1000 || client->response_paddr < 0x1000) return 0;
@@ -42,7 +42,7 @@ static int connect_fs_from_registry(u64 service_kind, struct vfs_client *client,
     if (!grant_fs_response_page(client)) return 0;
     clear_page(request_va);
     clear_page(response_va);
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     client->session_nonce = make_nonce(client->request_paddr, client->response_paddr, client->endpoint_id, self_slot);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_va;
     request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = FS_OP_CONNECT; request->arg0 = client->response_paddr; request->arg1 = self_slot; request->session_nonce = client->session_nonce;

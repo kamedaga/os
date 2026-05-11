@@ -36,7 +36,11 @@ static u64 syscall4_r10(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { register u64 r
 static void process_exit(u64 code) { (void)syscall2(SYSCALL_PROCESS_EXIT, code, 0); for (;;) __asm__ volatile("pause"); }
 
 static void wait_without_consuming_ipc(void) {
-    (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_IPC_SIGNAL_ONLY, 1);
+    const u64 start = syscall0(SYSCALL_GET_TICK_COUNT);
+    for (;;) {
+        for (u64 i = 0; i < 256; i++) __asm__ volatile("pause");
+        if (syscall0(SYSCALL_GET_TICK_COUNT) != start) return;
+    }
 }
 
 static struct ipc_message wait_ipc(void) {
@@ -48,8 +52,9 @@ static struct ipc_message wait_ipc(void) {
 static struct ipc_message reply(u64 result, u64 flags) {
     const u64 explicit_target = abi_reply_target_principal();
     if (explicit_target != 0) {
+        const u64 target = explicit_target;
         abi_set_reply_target_principal(0);
-        const u64 status = reply_trap_target(explicit_target, result, flags);
+        const u64 status = syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, target, result, flags);
         (void)syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN);
         if (status != SYSCALL_OK) {
             user_log("LinuxAbiServer: explicit reply failed=");
@@ -101,46 +106,18 @@ static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bi
 static u64 unmap_reply_target_pages(u64 target_va, u64 page_count) { return syscall2(SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count); }
 static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
 static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
-static u64 explicit_target_token_or_endpoint(u64 principal) {
-    const u64 token = target_token_for_principal(principal);
-    return token != 0 ? token : 0;
-}
-static u64 copy_to_trap_target(u64 principal, u64 target_va, const void *src, u64 len) {
-    const u64 token = explicit_target_token_or_endpoint(principal);
-    if (token == 0) return SYSCALL_ERR_ENDPOINT;
-    return syscall4_r10(SYSCALL_COPY_TO_ABI_TRAP_TARGET, token, target_va, (u64)src, len);
-}
-static u64 reply_trap_target(u64 principal, u64 result, u64 flags) {
-    const u64 token = explicit_target_token_or_endpoint(principal);
-    if (token == 0) return SYSCALL_ERR_ENDPOINT;
-    return syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, token, result, flags);
-}
-static u64 start_trap_target(u64 principal) {
-    const u64 token = explicit_target_token_or_endpoint(principal);
-    if (token == 0) return SYSCALL_ERR_ENDPOINT;
-    return syscall1(SYSCALL_START_ABI_TRAP_TARGET, token);
-}
-static u64 set_trap_target_request_page(u64 principal, u64 request_page_va) {
-    const u64 token = explicit_target_token_or_endpoint(principal);
-    if (token == 0) return SYSCALL_ERR_ENDPOINT;
-    return syscall2(SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE, token, request_page_va);
-}
+static u64 copy_to_trap_target(u64 principal, u64 target_va, const void *src, u64 len) { return syscall4_r10(SYSCALL_COPY_TO_ABI_TRAP_TARGET, principal, target_va, (u64)src, len); }
+static u64 reply_trap_target(u64 principal, u64 result, u64 flags) { return syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, principal, result, flags); }
+static u64 start_trap_target(u64 principal) { return syscall1(SYSCALL_START_ABI_TRAP_TARGET, principal); }
+static u64 set_trap_target_request_page(u64 principal, u64 request_page_va) { return syscall2(SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE, principal, request_page_va); }
 static u64 set_target_fs_base(u64 fs_base) { return syscall1(SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE, fs_base); }
 static u64 clone_reply_target(u64 child_stack, u64 tls) { return syscall2(SYSCALL_CLONE_ABI_TRAP_REPLY_TARGET, child_stack, tls); }
 static u64 detach_reply_token(void) { return syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN); }
-static u64 share_reply_target_pages_to_trap_target(u64 principal, u64 target_va, u64 page_count, u64 prot_bits) {
-    const u64 token = explicit_target_token_or_endpoint(principal);
-    if (token == 0) return SYSCALL_ERR_ENDPOINT;
-    return syscall4_r10(SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET, token, target_va, page_count, prot_bits);
-}
-static u64 unmap_trap_target_pages(u64 principal, u64 target_va, u64 page_count) {
-    const u64 token = explicit_target_token_or_endpoint(principal);
-    if (token == 0) return SYSCALL_ERR_ENDPOINT;
-    return syscall3(SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES, token, target_va, page_count);
-}
+static u64 share_reply_target_pages_to_trap_target(u64 principal, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4_r10(SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET, principal, target_va, page_count, prot_bits); }
+static u64 unmap_trap_target_pages(u64 principal, u64 target_va, u64 page_count) { return syscall3(SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES, principal, target_va, page_count); }
 static u64 alloc_map_pages(u64 target_va, u64 page_count, u64 flags) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, flags, 0); }
 static u64 alloc_map_pages_with_paddrs(u64 target_va, u64 page_count, u64 writable, u64 out_paddr_list_va) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, writable, out_paddr_list_va); }
-static int install_self_wake_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, syscall0(SYSCALL_GET_PROCESS_HANDLE)) == SYSCALL_OK; }
+static int install_self_wake_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, syscall0(SYSCALL_GET_PROCESS_SLOT)) == SYSCALL_OK; }
 static void prime_reply_return_signal(void) { (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, 0); }
 
 static void exit_trap_target_no_wait(u64 principal) {
@@ -153,92 +130,9 @@ static void exit_trap_target_no_wait(u64 principal) {
     }
 }
 
-static void exit_trap_target_preserve_reply(u64 principal) {
-    if (principal == 0) return;
-    const u64 status = reply_trap_target(principal, 0, TRAP_RESPONSE_FLAG_EXIT);
-    if (status != SYSCALL_OK) {
-        user_log("LinuxAbiServer: deferred exit reply failed=");
-        user_log_hex_value(status);
-    }
-}
-
-static struct abi_handler_result abi_reply_now(u64 result, u64 flags) {
-    struct abi_handler_result out;
-    out.kind = ABI_HANDLER_REPLY_NOW;
-    out.result = result;
-    out.flags = flags;
-    out.principal = 0;
-    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
-    return out;
-}
-
-static struct abi_handler_result abi_pending(void) {
-    struct abi_handler_result out;
-    out.kind = ABI_HANDLER_PENDING;
-    out.result = 0;
-    out.flags = 0;
-    out.principal = 0;
-    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
-    return out;
-}
-
-static struct abi_handler_result abi_exit_target(u64 principal) {
-    struct abi_handler_result out;
-    out.kind = ABI_HANDLER_EXIT_TARGET;
-    out.result = 0;
-    out.flags = 0;
-    out.principal = principal;
-    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
-    return out;
-}
-
-static struct abi_handler_result abi_wait_next(void) {
-    struct abi_handler_result out;
-    out.kind = ABI_HANDLER_WAIT_NEXT;
-    out.result = 0;
-    out.flags = 0;
-    out.principal = 0;
-    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
-    return out;
-}
-
-static struct abi_handler_result abi_exit_current(u64 principal) {
-    struct abi_handler_result out;
-    out.kind = ABI_HANDLER_EXIT_CURRENT;
-    out.result = 0;
-    out.flags = 0;
-    out.principal = principal;
-    out.next_message = (struct ipc_message){0, 0, 0, 0, 0};
-    return out;
-}
-
-static struct abi_handler_result abi_result_from_legacy_message(struct ipc_message msg) {
-    struct abi_handler_result out;
-    out.kind = ABI_HANDLER_LEGACY_NEXT_MESSAGE;
-    out.result = 0;
-    out.flags = 0;
-    out.principal = 0;
-    out.next_message = msg;
-    return out;
-}
-
-static struct ipc_message abi_apply_handler_result(struct abi_handler_result result) {
-    switch (result.kind) {
-    case ABI_HANDLER_REPLY_NOW:
-        return reply(result.result, result.flags);
-    case ABI_HANDLER_PENDING:
-        return wait_ipc();
-    case ABI_HANDLER_EXIT_TARGET:
-        exit_trap_target_no_wait(result.principal);
-        return wait_ipc();
-    case ABI_HANDLER_WAIT_NEXT:
-        return wait_ipc();
-    case ABI_HANDLER_EXIT_CURRENT:
-        return wait_ipc();
-    case ABI_HANDLER_LEGACY_NEXT_MESSAGE:
-    default:
-        return result.next_message;
-    }
+static struct ipc_message exit_trap_target_and_wait(u64 principal) {
+    exit_trap_target_no_wait(principal);
+    return wait_ipc();
 }
 
 static u64 trap_request_page_for_principal(u64 principal) {
@@ -328,8 +222,8 @@ static int find_service(u64 kind, struct service_entry *out) {
     if (page->magic != SERVICE_REGISTRY_MAGIC || page->version != SERVICE_REGISTRY_VERSION) return 0;
     for (u64 i = 0; i < page->entry_count && i < SERVICE_REGISTRY_MAX_ENTRIES; i++) {
         if (page->entries[i].kind != kind) continue;
-        out->kind = page->entries[i].kind; out->process_handle = page->entries[i].process_handle; out->endpoint_id = page->entries[i].endpoint_id; out->flags = page->entries[i].flags;
-        return out->endpoint_id != 0 && out->process_handle != 0;
+        out->kind = page->entries[i].kind; out->process_slot = page->entries[i].process_slot; out->endpoint_id = page->entries[i].endpoint_id; out->flags = page->entries[i].flags;
+        return out->endpoint_id != 0 && out->process_slot != 0;
     }
     return 0;
 }

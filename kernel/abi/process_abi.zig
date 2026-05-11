@@ -5,14 +5,12 @@ pub const syscall_arm_deferred_compositor: u64 = 0x22;
 pub const syscall_get_process_status: u64 = 0x30;
 pub const syscall_process_exit: u64 = 0x34;
 pub const syscall_set_fs_base_self: u64 = 0x3D;
-pub const syscall_get_process_handle: u64 = 0x5C;
-pub const process_handle_tag: u64 = 0x2 << 60;
-pub const process_handle_tag_mask: u64 = 0xF << 60;
-pub const process_handle_slot_bits: u6 = 32;
-pub const process_handle_generation_bits: u6 = 28;
-pub const process_handle_slot_mask: u64 = (@as(u64, 1) << process_handle_slot_bits) - 1;
-pub const process_handle_generation_mask: u64 = (@as(u64, 1) << process_handle_generation_bits) - 1;
-pub const process_handle_generation_shift: u6 = process_handle_slot_bits;
+pub const spawn_result_tag: u64 = 1 << 63;
+pub const spawn_result_process_bits: u6 = 32;
+pub const spawn_result_thread_bits: u6 = 16;
+pub const spawn_result_process_mask: u64 = (@as(u64, 1) << spawn_result_process_bits) - 1;
+pub const spawn_result_thread_mask: u64 = (@as(u64, 1) << spawn_result_thread_bits) - 1;
+pub const spawn_result_thread_shift: u6 = spawn_result_process_bits;
 pub const spawn_flag_bootstrap_page_writable: u64 = 1 << 0;
 pub const spawn_flag_bootstrap_descriptor_table: u64 = 1 << 1;
 pub const spawn_flag_bootstrap_extended_descriptor_table: u64 = 1 << 2;
@@ -70,52 +68,33 @@ pub const ProcessStatusKind = enum(u8) {
     faulted = 2,
 };
 
-pub const ProcessHandle = struct {
-    slot: u64,
-    generation: u64,
-};
-
 pub fn auxPageVa(page_index: u64) u64 {
     return aux_base_va + page_index * aux_page_bytes;
 }
 
-pub fn encodeSpawnedProcess(process_slot: u64, generation: u64) u64 {
-    return encodeProcessHandle(process_slot, generation);
+pub fn encodeSpawnedProcess(process_slot: u64, thread_slot: u64) u64 {
+    std.debug.assert(process_slot != 0);
+    std.debug.assert((process_slot & ~spawn_result_process_mask) == 0);
+    std.debug.assert((thread_slot & ~spawn_result_thread_mask) == 0);
+    return spawn_result_tag |
+        process_slot |
+        (thread_slot << spawn_result_thread_shift);
 }
 
-pub fn decodeSpawnedProcessHandle(value: u64) ?ProcessHandle {
-    return decodeProcessHandle(value);
+pub fn encodeSpawnedProcessSlot(process_slot: u64) u64 {
+    return encodeSpawnedProcess(process_slot, 0);
 }
 
 pub fn decodeSpawnedProcessSlot(value: u64) ?u64 {
-    const handle = decodeSpawnedProcessHandle(value) orelse return null;
-    return handle.slot;
+    if ((value & spawn_result_tag) == 0) return null;
+    const process_slot = value & spawn_result_process_mask;
+    if (process_slot == 0) return null;
+    return process_slot;
 }
 
-pub fn decodeSpawnedProcessGeneration(value: u64) ?u64 {
-    const handle = decodeSpawnedProcessHandle(value) orelse return null;
-    return handle.generation;
-}
-
-pub fn encodeProcessHandle(process_slot: u64, generation: u64) u64 {
-    std.debug.assert(process_slot != 0);
-    std.debug.assert(generation != 0);
-    std.debug.assert((process_slot & ~process_handle_slot_mask) == 0);
-    std.debug.assert((generation & ~process_handle_generation_mask) == 0);
-    return process_handle_tag |
-        process_slot |
-        (generation << process_handle_generation_shift);
-}
-
-pub fn decodeProcessHandle(value: u64) ?ProcessHandle {
-    if ((value & process_handle_tag_mask) != process_handle_tag) return null;
-    const process_slot = value & process_handle_slot_mask;
-    const generation = (value >> process_handle_generation_shift) & process_handle_generation_mask;
-    if (process_slot == 0 or generation == 0) return null;
-    return .{
-        .slot = process_slot,
-        .generation = generation,
-    };
+pub fn decodeSpawnedThreadSlot(value: u64) ?u64 {
+    if ((value & spawn_result_tag) == 0) return null;
+    return (value >> spawn_result_thread_shift) & spawn_result_thread_mask;
 }
 
 pub fn encodeProcessStatus(kind: ProcessStatusKind, fault_vector: u8) u64 {
@@ -132,25 +111,12 @@ pub fn decodeProcessStatusFaultVector(value: u64) u8 {
     return @truncate((value >> 8) & 0xFF);
 }
 
-test "spawned process handle round-trips" {
+test "spawned process slot round-trips" {
     const encoded = encodeSpawnedProcess(10, 7);
-    const decoded = decodeSpawnedProcessHandle(encoded).?;
-    try std.testing.expectEqual(@as(u64, 10), decoded.slot);
-    try std.testing.expectEqual(@as(u64, 7), decoded.generation);
     try std.testing.expectEqual(@as(?u64, 10), decodeSpawnedProcessSlot(encoded));
-    try std.testing.expectEqual(@as(?u64, 7), decodeSpawnedProcessGeneration(encoded));
+    try std.testing.expectEqual(@as(?u64, 7), decodeSpawnedThreadSlot(encoded));
     try std.testing.expectEqual(@as(?u64, null), decodeSpawnedProcessSlot(10));
-    try std.testing.expectEqual(@as(?u64, null), decodeSpawnedProcessGeneration(10));
-}
-
-test "process handle round-trips" {
-    const encoded = encodeProcessHandle(10, 3);
-    const decoded = decodeProcessHandle(encoded).?;
-    try std.testing.expectEqual(@as(u64, 10), decoded.slot);
-    try std.testing.expectEqual(@as(u64, 3), decoded.generation);
-    try std.testing.expectEqual(@as(?ProcessHandle, null), decodeProcessHandle(10));
-    try std.testing.expectEqual(@as(?ProcessHandle, null), decodeProcessHandle(process_handle_tag | 10));
-    try std.testing.expectEqual(@as(?ProcessHandle, null), decodeProcessHandle(process_handle_tag | (@as(u64, 3) << process_handle_generation_shift)));
+    try std.testing.expectEqual(@as(?u64, null), decodeSpawnedThreadSlot(10));
 }
 
 test "process status round-trips" {

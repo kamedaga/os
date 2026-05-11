@@ -581,10 +581,6 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
         var user_entry: scheduler_observer.UserEntry = undefined;
         if (scheduler_observer.claimIdleUserEntry(cpu_slot, &user_entry)) {
             cpuStatePtr(cpu_slot).* = cpu_state_user;
-            if (!scheduler_observer.validateIdleUserEntry(&user_entry)) {
-                cpuStatePtr(cpu_slot).* = cpu_state_idle;
-                continue;
-            }
             enterUserModeFromIdle(&user_entry);
         }
         if (build_workarounds.spawn_exec_ap_user_scheduling) {

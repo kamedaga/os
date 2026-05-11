@@ -48,7 +48,6 @@ const syscall_share_cap: u64 = 0x2B;
 const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_get_tick_count: u64 = 0x2D;
 const syscall_get_process_slot: u64 = 0x2E;
-const syscall_get_process_handle: u64 = process_abi.syscall_get_process_handle;
 const syscall_set_fs_base_self: u64 = process_abi.syscall_set_fs_base_self;
 const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
 const syscall_process_exit: u64 = process_abi.syscall_process_exit;
@@ -100,20 +99,17 @@ const syscall_err_empty: u64 = 13;
 const syscall_alloc_map_drop_cap_flag: u64 = 0x2;
 const ipc_call_flag_retain_sender: u64 = 0x1;
 const ipc_call_flag_signal_only: u64 = 0x2;
-const wait_event_flag_mailbox: u64 = 0x1;
-const wait_event_flag_ipc_signal_only: u64 = 0x2;
 var sys_alloc_page_failure_log_count: u64 = 0;
 const sys_alloc_page_failure_log_limit: u64 = 64;
 var lstar_no_delegate_log_count: u64 = 0;
 const lstar_no_delegate_log_limit: u64 = 32;
-const kernel_exec_profile_slots_max: usize = 96;
+const kernel_exec_profile_slots_max: usize = 64;
 const kernel_exec_profile_lstar_delegate: u64 = 0xFFFF_FF00;
 var kernel_exec_profile_active: bool = false;
 var kernel_exec_profile_slots: [kernel_exec_profile_slots_max]KernelExecProfileSlot = [_]KernelExecProfileSlot{.{}} ** kernel_exec_profile_slots_max;
 
 const KernelExecProfileSlot = struct {
     nr: u64 = 0,
-    detail: u64 = 0,
     count: u64 = 0,
     cycles: u64 = 0,
     max_cycles: u64 = 0,
@@ -311,7 +307,6 @@ fn syscallNeedsKernelStateLock(nr: u64) bool {
         syscall_publish_service_endpoint,
         syscall_set_abi_trap_delegate,
         syscall_clear_abi_trap_delegate,
-        syscall_get_process_handle,
         syscall_get_process_status,
         syscall_map_abi_trap_reply_target_pages,
         syscall_copy_from_abi_trap_reply_target,
@@ -392,7 +387,6 @@ fn kernelExecProfileName(nr: u64) ?[]const u8 {
         syscall_set_abi_trap_target_request_page => "abi_set_target_request_page",
         syscall_share_abi_trap_reply_target_pages_to_target => "abi_share_reply_pages_to_target",
         syscall_unmap_abi_trap_target_pages => "abi_unmap_target_pages",
-        syscall_get_process_handle => "get_process_handle",
         image_abi.syscall_install_vm_object => "install_vm_object",
         image_abi.syscall_map_vm_object => "map_vm_object",
         image_abi.syscall_install_exec_image => "install_exec_image",
@@ -417,15 +411,11 @@ fn kernelExecProfileReset() void {
 }
 
 fn kernelExecProfileRecord(nr: u64, cycles: u64) void {
-    kernelExecProfileRecordDetail(nr, 0, cycles);
-}
-
-fn kernelExecProfileRecordDetail(nr: u64, detail: u64, cycles: u64) void {
     if (!kernel_exec_profile_active) return;
     if (kernelExecProfileName(nr) == null) return;
     var free_slot: ?*KernelExecProfileSlot = null;
     for (&kernel_exec_profile_slots) |*slot| {
-        if (slot.count != 0 and slot.nr == nr and slot.detail == detail) {
+        if (slot.count != 0 and slot.nr == nr) {
             slot.count +%= 1;
             slot.cycles +%= cycles;
             if (cycles > slot.max_cycles) slot.max_cycles = cycles;
@@ -434,7 +424,7 @@ fn kernelExecProfileRecordDetail(nr: u64, detail: u64, cycles: u64) void {
         if (slot.count == 0 and free_slot == null) free_slot = slot;
     }
     if (free_slot) |slot| {
-        slot.* = .{ .nr = nr, .detail = detail, .count = 1, .cycles = cycles, .max_cycles = cycles };
+        slot.* = .{ .nr = nr, .count = 1, .cycles = cycles, .max_cycles = cycles };
     }
 }
 
@@ -446,10 +436,6 @@ fn kernelExecProfileReport(h: *const Hooks) void {
         const name = kernelExecProfileName(slot.nr) orelse continue;
         h.write("KernelExecProfile.item ");
         h.write(name);
-        if (slot.detail != 0) {
-            h.write(" detail=");
-            h.print_hex(slot.detail);
-        }
         h.write(" count=");
         h.print_number(slot.count);
         h.write(" cycles=");
@@ -559,10 +545,6 @@ fn readUserPaddrBatch(
     return true;
 }
 
-fn principalFromProcessHandleArg(state: *kernel.KernelState, encoded: u64) ?kernel.PrincipalId {
-    return state.principalFromEncodedProcessHandle(encoded);
-}
-
 fn transferPageCapOnEndpoint(
     state: *kernel.KernelState,
     h: *const Hooks,
@@ -655,8 +637,7 @@ fn dispatchIpcSyscall(
             break :blk signalEndpointMessage(state, proc, frame.rdi, false, 0, 0, 0, 0);
         },
         syscall_wait_event => blk: {
-            const wait_mailbox = (frame.rdi & wait_event_flag_mailbox) != 0;
-            const ipc_signal_only = (frame.rdi & wait_event_flag_ipc_signal_only) != 0;
+            const wait_mailbox = (frame.rdi & 0x1) != 0;
             const timeout_ticks = frame.rsi;
             kernel_state_lock.lock();
             if (wait_mailbox) {
@@ -672,11 +653,7 @@ fn dispatchIpcSyscall(
                     break :blk received;
                 }
             }
-            if (ipc_signal_only and scheduler.discardOneReplylessSignalForPrincipal(proc)) {
-                kernel_state_lock.unlock();
-                break :blk syscall_ok;
-            }
-            if (!ipc_signal_only and consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
                 kernel_state_lock.unlock();
                 break :blk syscall_ok;
             }
@@ -685,11 +662,7 @@ fn dispatchIpcSyscall(
                 break :blk syscall_ok;
             }
             kernel_state_lock.unlock();
-            const blocked = if (ipc_signal_only)
-                scheduler.blockCurrentThreadForIpcSignal(frame, timeout_ticks, syscall_ok)
-            else
-                h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok);
-            if (!blocked) {
+            if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
                 break :blk syscall_err_not_ready;
             }
             break :blk syscall_ok;
@@ -865,11 +838,10 @@ fn applyQueuedIpcMessageToFrame(frame: *TrapFrame, msg: scheduler.IpcQueuedMessa
 
 fn grantQueuedReplyToken(receiver_thread: usize, msg: scheduler.IpcQueuedMessage) void {
     if (!msg.grants_reply) return;
-    scheduler.setIpcReplyTokenForThreadWithIdentity(receiver_thread, true, msg.sender_thread, msg.sender_owner, msg.sender_generation);
+    scheduler.setIpcReplyTokenForThread(receiver_thread, true, msg.sender_thread);
 }
 
 fn consumeQueuedIpcMessageForThread(thread_index: usize, frame: *TrapFrame) bool {
-    _ = scheduler.promoteDelegateSendForThread(thread_index);
     if (scheduler.dequeueIpcMessageForThread(thread_index)) |msg| {
         grantQueuedReplyToken(thread_index, msg);
         applyQueuedIpcMessageToFrame(frame, msg);
@@ -939,24 +911,19 @@ fn replyToCurrentIpcToken(h: *const Hooks, mr0: u64, mr1: u64, mr2: u64, mr3: u6
     const target_thread = current_hot.ipc_reply_token_target_thread;
     const target_ctx = scheduler.getThreadContext(target_thread) orelse return syscall_err_endpoint;
     if (!target_ctx.allocated) return syscall_err_endpoint;
-    if (target_ctx.owner_process != current_hot.ipc_reply_token_target_owner or
-        target_ctx.slot_generation != current_hot.ipc_reply_token_target_generation)
-    {
-        scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
-        return syscall_err_endpoint;
-    }
     const target_proc = target_ctx.owner_process;
     const target_has_abi_delegate = h.state.abiTrapDelegateFor(target_proc) != null;
     if ((mr1 & trap_abi.response_flag_exit) != 0 and
-        (scheduler.delegateReplyPending(target_ctx) or target_has_abi_delegate))
+        (target_ctx.abi_trap_reply_pending or target_has_abi_delegate))
     {
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
-        retireReplyExitTarget(h, target_thread, target_proc);
+        _ = scheduler.releaseThreadSlot(target_thread);
+        _ = h.state.markProcessExited(target_proc);
         _ = abi_trap_runtime.reclaimPrivatePagesForProcess(h.state, target_proc);
         return syscall_ok;
     }
     if (target_has_abi_delegate) {
-        scheduler.setDelegateReplyPending(target_ctx, true);
+        target_ctx.abi_trap_reply_pending = true;
     }
     scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
     return deliverOrQueueIpcMessageToThread(target_thread, 0, current_thread, false, mr0, mr1, mr2, mr3);
@@ -968,27 +935,6 @@ fn detachCurrentAbiTrapReplyToken() u64 {
     if (current_hot.ipc_reply_token_valid == 0) return syscall_err_endpoint;
     scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
     return syscall_ok;
-}
-
-fn wakeRetiredProcessOwners(h: *const Hooks, retired: kernel.RetireProcessResult) void {
-    var mask = retired.wake_process_mask;
-    while (mask != 0) {
-        const bit: u6 = @intCast(@ctz(mask));
-        mask &= mask - 1;
-        const owner = kernel.processPrincipalFromIndex(bit) orelse continue;
-        h.wake_blocked_thread_for_principal(owner);
-    }
-    if (retired.endpoint_targets_removed) scheduler.invalidateAllIpcFastpathState();
-}
-
-fn retireReplyExitTarget(h: *const Hooks, target_thread: usize, target_proc: kernel.PrincipalId) void {
-    _ = scheduler.releaseThreadSlot(target_thread);
-    if (scheduler.runtime_priority_principal) |priority_principal| {
-        if (priority_principal == target_proc) scheduler.setRuntimePriorityPrincipal(null);
-    }
-    if (h.state.retireProcessIncarnation(target_proc, .exit, 0)) |retired| {
-        wakeRetiredProcessOwners(h, retired);
-    }
 }
 
 fn resolveIpcSignalTargetThread(
@@ -1032,18 +978,15 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
 
     const is_reply = current_hot.ipc_reply_token_valid != 0;
     if (is_reply) {
-        if (current_hot.ipc_reply_token_target_thread != target.thread_index or
-            current_hot.ipc_reply_token_target_owner != target.principal or
-            target_ctx.slot_generation != current_hot.ipc_reply_token_target_generation)
-        {
-            scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
+        if (current_hot.ipc_reply_token_target_thread != target.thread_index) {
             return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
         }
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
         if ((save.mr1 & trap_abi.response_flag_exit) != 0 and
-            (scheduler.delegateReplyPending(target_ctx) or h.state.abiTrapDelegateFor(target.principal) != null))
+            (target_ctx.abi_trap_reply_pending or h.state.abiTrapDelegateFor(target.principal) != null))
         {
-            retireReplyExitTarget(h, target.thread_index, target.principal);
+            _ = scheduler.releaseThreadSlot(target.thread_index);
+            _ = h.state.markProcessExited(target.principal);
             _ = abi_trap_runtime.reclaimPrivatePagesForProcess(h.state, target.principal);
 
             if (scheduler.dequeueIpcMessageForThread(current_thread)) |msg| {
@@ -1096,16 +1039,6 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
         return @intFromPtr(out_frame);
     }
 
-    const current_cpu = scheduler.currentCpuSlot();
-    const target_cpu = scheduler.threadCpuSlot(target.thread_index) orelse current_cpu;
-    if (target_cpu != current_cpu) {
-        out_frame.* = trapFrameFromIpcSignalSave(save, syscall_ok);
-        if (!scheduler.blockCurrentThreadForEvent(out_frame, false, 0, syscall_ok)) {
-            return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
-        }
-        return @intFromPtr(out_frame);
-    }
-
     saveIpcSignalFrameToContext(current_ctx, save, syscall_ok);
     current_ctx.cr3 = scheduler.currentUserCr3();
     current_ctx.wait_mailbox = false;
@@ -1114,9 +1047,8 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
     scheduler.setIpcHotCr3(current_thread, scheduler.currentUserCr3());
     scheduler.setIpcHotWaitState(current_thread, false, 0, false);
 
-    if (!scheduler.activateThread(target.thread_index)) {
-        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
-    }
+    _ = scheduler.setCurrentExecutionFromHotThread(target.thread_index);
+    _ = scheduler.applyThreadFsBase(target.thread_index);
 
     return @intFromPtr(&target_ctx.frame);
 }
@@ -1221,13 +1153,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     }
     const ipc_profile_start = if (kernel_exec_profile_active) readTsc() else 0;
     if (dispatchIpcSyscall(h, state, proc, frame)) |result| {
-        if (kernel_exec_profile_active) {
-            const cycles = readTsc() - ipc_profile_start;
-            kernelExecProfileRecord(frame.rax, cycles);
-            if (frame.rax == syscall_signal_endpoint) {
-                kernelExecProfileRecordDetail(frame.rax, frame.rdi, cycles);
-            }
-        }
+        if (kernel_exec_profile_active) kernelExecProfileRecord(frame.rax, readTsc() - ipc_profile_start);
         return result;
     }
     const hold_kernel_state_lock = syscallNeedsKernelStateLock(frame.rax);
@@ -1238,13 +1164,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         if (hold_kernel_state_lock) kernel_state_lock.unlock();
     }
     defer {
-        if (syscall_profile_active) {
-            const cycles = readTsc() - syscall_profile_start;
-            kernelExecProfileRecord(frame.rax, cycles);
-            if (frame.rax == syscall_signal_endpoint) {
-                kernelExecProfileRecordDetail(frame.rax, frame.rdi, cycles);
-            }
-        }
+        if (syscall_profile_active) kernelExecProfileRecord(frame.rax, readTsc() - syscall_profile_start);
     }
     if (h.scheduler_log_int80 and scheduler.scheduler_int80_log_count < h.scheduler_int80_log_max_lines) {
         h.write("INT80 dispatch ");
@@ -1270,9 +1190,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                         h.write(" active=");
                         h.print_number(if (desc.active) 1 else 0);
                         h.write(" delegate=");
-                        h.print_hex(if (desc.abi_trap_delegate) |delegate| delegate.endpoint_id else 0);
+                        h.print_hex(desc.abi_trap_delegate_endpoint_id);
                         h.write(" request=");
-                        h.print_hex(if (desc.abi_trap_delegate) |delegate| delegate.request_page_va else 0);
+                        h.print_hex(desc.abi_trap_request_page_va);
                     }
                     h.write(" thread=");
                     h.print_number(@intCast(scheduler.currentThreadIndex()));
@@ -1495,7 +1415,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return syscall_ok;
         },
         syscall_grant_cap => {
-            const to = principalFromProcessHandleArg(state, frame.rsi) orelse return syscall_err_invalid;
+            const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
             const rights = capability.parseRights(frame.rdx);
             state.grantCap(proc, to, frame.rdi, rights) catch return syscall_err_grant;
             if (h.enable_cap_table_dump_logs) h.dump_all_process_caps(state);
@@ -1504,7 +1424,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         syscall_grant_caps_batch => {
             const page_count_u64 = frame.rsi;
             if (page_count_u64 == 0 or page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
-            const to = principalFromProcessHandleArg(state, frame.rdx) orelse return syscall_err_invalid;
+            const to = h.principal_from_process_slot(frame.rdx) orelse return syscall_err_invalid;
             const rights = capability.parseRights(frame.rcx);
             var paddrs: [syscall_batch_max_pages]u64 = undefined;
             if (!readUserPaddrBatch(h, proc, frame.rdi, page_count_u64, &paddrs)) return syscall_err_invalid;
@@ -1562,7 +1482,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return syscall_ok;
         },
         syscall_install_endpoint => {
-            const target = principalFromProcessHandleArg(state, frame.rdx) orelse return syscall_err_invalid;
+            const target = h.principal_from_process_slot(frame.rdx) orelse return syscall_err_invalid;
             state.installEndpoint(proc, frame.rsi, target) catch |err| switch (err) {
                 kernel.KernelError.InvalidState => return syscall_err_invalid,
                 kernel.KernelError.TableFull => return syscall_err_alloc,
@@ -1582,10 +1502,6 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         syscall_get_process_slot => {
             const slot = kernel.processIndexFromPrincipal(proc) orelse return syscall_err_invalid;
             return @intCast(slot);
-        },
-        syscall_get_process_handle => {
-            const handle = state.processHandleFor(proc) orelse return syscall_err_invalid;
-            return process_abi.encodeProcessHandle(handle.slot, handle.generation);
         },
         syscall_set_fs_base_self => {
             const fs_base = frame.rdi;
@@ -1655,7 +1571,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         syscall_publish_service_endpoint => {
             if (!state.isBootstrapOwner(proc)) return syscall_err_invalid;
-            const target = principalFromProcessHandleArg(state, frame.rsi) orelse return syscall_err_invalid;
+            const target = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
             state.publishServiceEndpoint(frame.rdi, target) catch |err| switch (err) {
                 kernel.KernelError.InvalidState => return syscall_err_invalid,
                 kernel.KernelError.TableFull => return syscall_err_alloc,
@@ -1758,7 +1674,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         image_abi.syscall_grant_vm_object => {
             const cap_id = image_abi.decodeVmObjectToken(frame.rdi) orelse return syscall_err_invalid;
-            const to = principalFromProcessHandleArg(state, frame.rsi) orelse return syscall_err_invalid;
+            const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
             const child_id = state.grantVmObjectCap(proc, to, cap_id, parseVmObjectRights(frame.rdx)) catch return syscall_err_grant;
             return image_abi.encodeVmObjectToken(child_id);
         },
@@ -1845,12 +1761,12 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         image_abi.syscall_grant_exec_image => {
             const cap_id = image_abi.decodeExecImageToken(frame.rdi) orelse return syscall_err_invalid;
-            const to = principalFromProcessHandleArg(state, frame.rsi) orelse return syscall_err_invalid;
+            const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
             const child_id = state.grantExecImageCap(proc, to, cap_id, parseExecImageRights(frame.rdx)) catch return syscall_err_grant;
             return image_abi.encodeExecImageToken(child_id);
         },
         queue_abi.syscall_grant_cap => {
-            const to = principalFromProcessHandleArg(state, frame.rsi) orelse return syscall_err_invalid;
+            const to = h.principal_from_process_slot(frame.rsi) orelse return syscall_err_invalid;
             const decoded = queue_abi.decodeCapToken(frame.rdi) orelse return syscall_err_invalid;
             switch (decoded.kind) {
                 .iommu => {
@@ -1868,8 +1784,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             }
         },
         syscall_wait_event => {
-            const wait_mailbox = (frame.rdi & wait_event_flag_mailbox) != 0;
-            const ipc_signal_only = (frame.rdi & wait_event_flag_ipc_signal_only) != 0;
+            const wait_mailbox = (frame.rdi & 0x1) != 0;
             const timeout_ticks = frame.rsi;
             if (wait_mailbox) {
                 const received = state.recvCap(proc) catch |err| switch (err) {
@@ -1880,20 +1795,13 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                     return received;
                 }
             }
-            if (ipc_signal_only and scheduler.discardOneReplylessSignalForPrincipal(proc)) {
-                return syscall_ok;
-            }
-            if (!ipc_signal_only and consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
                 return syscall_ok;
             }
             if (h.consume_pending_signal_for_principal(proc)) {
                 return syscall_ok;
             }
-            const blocked = if (ipc_signal_only)
-                scheduler.blockCurrentThreadForIpcSignal(frame, timeout_ticks, syscall_ok)
-            else
-                h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok);
-            if (!blocked) {
+            if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
                 return syscall_err_not_ready;
             }
             return syscall_ok;

@@ -116,7 +116,7 @@ const BootState = struct {
 
 const Session = struct {
     active: bool = false,
-    client_process_handle: u64 = 0,
+    client_process_slot: u64 = 0,
     request_paddr: u64 = 0,
     response_paddr: u64 = 0,
     request_va: u64 = 0,
@@ -169,14 +169,14 @@ fn acceptCapTransfer(transfer_id: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn installEndpoint(endpoint_id: u64, target_process_handle: u64) u64 {
+fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
     return asm volatile (
         \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_install_endpoint),
           [arg0] "{rdi}" (@as(u64, 0)),
           [arg1] "{rsi}" (endpoint_id),
-          [arg2] "{rdx}" (target_process_handle),
+          [arg2] "{rdx}" (target_process_slot),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -1254,7 +1254,7 @@ fn handleConnectRequest(request_paddr: u64) void {
         const child_token = allocFsToken();
         session.* = .{
             .active = true,
-            .client_process_handle = request.arg1,
+            .client_process_slot = request.arg1,
             .request_paddr = request_paddr,
             .response_paddr = request.arg0,
             .request_va = req_va,

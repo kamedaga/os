@@ -43,8 +43,8 @@ static void log_console_read_diag(const char *reason, u64 detail) {
 }
 
 static int install_console_endpoint(void) {
-    if (g_console.endpoint_id == 0 || g_console.process_handle == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_console.endpoint_id, g_console.process_handle) == SYSCALL_OK;
+    if (g_console.endpoint_id == 0 || g_console.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_console.endpoint_id, g_console.process_slot) == SYSCALL_OK;
 }
 
 static int grant_console_response_page(void) {
@@ -86,7 +86,7 @@ static int connect_console_from_registry(void) {
     const int using_tty = find_service(SERVICE_KIND_TTY, &entry);
     if (!using_tty && !find_service(SERVICE_KIND_CONSOLE, &entry)) return 0;
     g_console.endpoint_id = entry.endpoint_id;
-    g_console.process_handle = entry.process_handle;
+    g_console.process_slot = entry.process_slot;
     g_console.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_console.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (g_console.request_paddr < 0x1000 || g_console.response_paddr < 0x1000) return 0;
@@ -96,7 +96,7 @@ static int connect_console_from_registry(void) {
     clear_page(CONSOLE_REQUEST_VA);
     clear_page(CONSOLE_RESPONSE_VA);
 
-    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_console.session_nonce = make_console_nonce(g_console.request_paddr, g_console.response_paddr, g_console.endpoint_id, self_slot);
     volatile struct console_request_header *request = (volatile struct console_request_header *)CONSOLE_REQUEST_VA;
     request->magic = CONSOLE_REQUEST_MAGIC;

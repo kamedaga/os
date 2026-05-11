@@ -206,8 +206,6 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         g_fds[fd].token = 0;
         g_fds[fd].offset = 0;
         g_fds[fd].size = 0;
-        g_fds[fd].fd_flags = (u32)(flags & O_NONBLOCK);
-        g_fds[fd].desc_flags = (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
         g_fds[fd].mode_bits = FS_FILE_MODE;
         g_fds[fd].object_kind = FS_OBJECT_FILE;
         g_fds[fd].path_len = 0;
@@ -221,8 +219,6 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         g_fds[fd].token = 0;
         g_fds[fd].offset = 0;
         g_fds[fd].size = 0;
-        g_fds[fd].fd_flags = (u32)(flags & O_NONBLOCK);
-        g_fds[fd].desc_flags = (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
         g_fds[fd].mode_bits = FS_FILE_MODE;
         g_fds[fd].object_kind = FS_OBJECT_FILE;
         fd_set_path(&g_fds[fd], resolved);
@@ -275,7 +271,6 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     const int fd = alloc_fd(); if (fd < 0) return reply(errno_busy(), 0);
     if (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) {
         g_fds[fd].kind = FD_DIR; g_fds[fd].token = token; g_fds[fd].offset = 0; g_fds[fd].size = 0; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = kind;
-        g_fds[fd].fd_flags = (u32)(flags & O_NONBLOCK); g_fds[fd].desc_flags = (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
         fd_set_path(&g_fds[fd], resolved);
         sync_fd_to_thread_group((u64)fd);
         return reply((u64)fd, 0);
@@ -289,8 +284,6 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
             g_fds[fd].token = token;
             g_fds[fd].offset = 0;
             g_fds[fd].size = size;
-            g_fds[fd].fd_flags = (u32)(flags & O_NONBLOCK);
-            g_fds[fd].desc_flags = (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
             g_fds[fd].mode_bits = rec.mode_bits;
             g_fds[fd].object_kind = FS_OBJECT_FILE;
             fd_set_path(&g_fds[fd], resolved);
@@ -312,58 +305,57 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         }
         return reply(errno_acces(), 0);
     }
-    g_fds[fd].kind = FD_FILE; g_fds[fd].token = response->result_token; g_fds[fd].offset = 0; g_fds[fd].size = response->file_bytes != 0 ? response->file_bytes : size; g_fds[fd].fd_flags = (u32)(flags & O_NONBLOCK); g_fds[fd].desc_flags = (u32)((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0); g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = FS_OBJECT_FILE;
+    g_fds[fd].kind = FD_FILE; g_fds[fd].token = response->result_token; g_fds[fd].offset = 0; g_fds[fd].size = response->file_bytes != 0 ? response->file_bytes : size; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = FS_OBJECT_FILE;
     fd_set_path(&g_fds[fd], resolved);
     sync_fd_to_thread_group((u64)fd);
     return reply((u64)fd, 0);
 }
 
-static struct abi_handler_result handle_read(const struct trap_request *req) {
+static struct ipc_message handle_read(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 dst = req->args[1]; const u64 len = req->args[2];
-    if (!fd_valid(fd)) return abi_reply_now(errno_badf(), 0);
-    if (len == 0) return abi_reply_now(0, 0);
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    if (len == 0) return reply(0, 0);
     if (g_fds[fd].kind == FD_STDIO) {
         (void)dst;
-        return abi_reply_now(0, 0);
+        return reply(0, 0);
     }
     if (g_fds[fd].kind == FD_TTY) {
         int fault = 0;
         const u64 n = console_read_to_target(dst, len, &fault);
-        return abi_reply_now(fault ? errno_fault() : n, 0);
+        return reply(fault ? errno_fault() : n, 0);
     }
     if (g_fds[fd].kind == FD_PIPE_READ) {
         const u8 pipe_id = g_fds[fd].pipe_id;
-        if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return abi_reply_now(errno_badf(), 0);
+        if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
         struct pipe_entry *pipe = &g_pipes[pipe_id];
-        if (pipe->len == 0 && pipe_has_live_writer(pipe_id)) {
-        if (pipe->pending_read) return abi_reply_now(errno_again(), 0);
-        pipe->pending_read = 1;
-        pipe->pending_principal = req->caller_principal;
-        pipe->pending_dst = dst;
-        pipe->pending_len = len;
-        pipe_debug_event("pending_read", pipe_id, req->caller_principal);
-        detach_reply_token();
-        return abi_pending();
+        if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
+            if (pipe->pending_read) return reply(errno_again(), 0);
+            pipe->pending_read = 1;
+            pipe->pending_principal = req->caller_principal;
+            pipe->pending_dst = dst;
+            pipe->pending_len = len;
+            detach_reply_token();
+            return wait_ipc();
         }
-        int fault = 0; const u64 n = pipe_read_to_target(fd, dst, len, &fault); sync_fd_to_thread_group(fd); return abi_reply_now(fault ? errno_fault() : n, 0);
+        int fault = 0; const u64 n = pipe_read_to_target(fd, dst, len, &fault); sync_fd_to_thread_group(fd); return reply(fault ? errno_fault() : n, 0);
     }
     if (g_fds[fd].kind == FD_RANDOM) {
         int fault = 0;
         const u64 n = random_read_to_target(dst, len, &fault);
-        return abi_reply_now(fault ? errno_fault() : (n != 0 ? n : errno_again()), 0);
+        return reply(fault ? errno_fault() : (n != 0 ? n : errno_again()), 0);
     }
     if (g_fds[fd].kind == FD_SOCKET) {
-        return abi_reply_now(socket_read_to_target(fd, dst, len), 0);
+        return reply(socket_read_to_target(fd, dst, len), 0);
     }
-    if (g_fds[fd].kind != FD_FILE) return abi_reply_now(errno_badf(), 0);
+    if (g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
     if (g_fds[fd].path_len != 0 && cacheable_readonly_path(g_fds[fd].path)) {
         int fault = 0;
         const u64 n = file_cache_read_to_target(&g_fds[fd], g_fds[fd].offset, dst, len, &fault);
-        if (fault) return abi_reply_now(errno_fault(), 0);
+        if (fault) return reply(errno_fault(), 0);
         if (n != 0 || g_fds[fd].offset >= g_fds[fd].size) {
             g_fds[fd].offset += n;
             sync_fd_to_thread_group(fd);
-            return abi_reply_now(n, 0);
+            return reply(n, 0);
         }
     }
     u64 copied = 0;
@@ -371,16 +363,16 @@ static struct abi_handler_result handle_read(const struct trap_request *req) {
         u64 request_len = min_u64(len - copied, FS_RESPONSE_PAYLOAD_BYTES);
         const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
         if (request_len > remaining) request_len = remaining;
-        if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return abi_reply_now(copied != 0 ? copied : errno_io(), 0);
+        if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
         volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
-        if (response->status != FS_STATUS_OK) return abi_reply_now(copied != 0 ? copied : errno_io(), 0);
+        if (response->status != FS_STATUS_OK) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
         if (response->inline_bytes == 0) break;
-        if (copy_to_target(dst + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) return abi_reply_now(errno_fault(), 0);
+        if (copy_to_target(dst + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) return reply(errno_fault(), 0);
         profile_fs_read_path(&g_fds[fd], response->inline_bytes);
         copied += response->inline_bytes; g_fds[fd].offset += response->inline_bytes; sync_fd_to_thread_group(fd);
         if (response->inline_bytes < request_len) break;
     }
-    return abi_reply_now(copied, 0);
+    return reply(copied, 0);
 }
 
 static u64 read_fd_at_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 len, int *fault) {
@@ -443,7 +435,7 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
         struct pipe_entry *pipe = &g_pipes[pipe_id];
-        if (pipe->len == 0) return reply(pipe_has_live_writer(pipe_id) ? errno_again() : 0, 0);
+        if (pipe->len == 0) return reply((pipe->write_refs != 0 || pipe_has_live_writer(pipe_id)) ? errno_again() : 0, 0);
         for (u64 i = 0; i < iovcnt; i++) {
             u64 pair[2];
             if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
@@ -505,36 +497,6 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
         if (copied < pair[1]) return reply(total, 0);
     }
     return reply(total, 0);
-}
-
-static struct abi_handler_result handle_readv_blocking(const struct trap_request *req) {
-    const u64 fd = req->args[0];
-    const u64 iov = req->args[1];
-    const u64 iovcnt = req->args[2];
-    if (!fd_valid(fd)) return abi_reply_now(errno_badf(), 0);
-    if (iovcnt > 64) return abi_reply_now(errno_inval(), 0);
-    if (g_fds[fd].kind != FD_PIPE_READ) {
-        return abi_result_from_legacy_message(handle_readv(req));
-    }
-    const u8 pipe_id = g_fds[fd].pipe_id;
-    if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return abi_reply_now(errno_badf(), 0);
-    struct pipe_entry *pipe = &g_pipes[pipe_id];
-    if (pipe->len != 0 || !pipe_has_live_writer(pipe_id)) {
-        return abi_result_from_legacy_message(handle_readv(req));
-    }
-    for (u64 i = 0; i < iovcnt; i++) {
-        u64 pair[2];
-        if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return abi_reply_now(errno_fault(), 0);
-        if (pair[1] == 0) continue;
-        if (pipe->pending_read) return abi_reply_now(errno_again(), 0);
-        pipe->pending_read = 1;
-        pipe->pending_principal = req->caller_principal;
-        pipe->pending_dst = pair[0];
-        pipe->pending_len = pair[1];
-        detach_reply_token();
-        return abi_pending();
-    }
-    return abi_reply_now(0, 0);
 }
 
 static struct ipc_message handle_write(const struct trap_request *req) {
@@ -656,90 +618,6 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
     return reply(total, 0);
 }
 
-static struct abi_handler_result pending_pipe_write_from_current(u64 fd, u64 src, u64 len, u64 principal, u64 token) {
-    if (!fd_valid(fd) || g_fds[fd].kind != FD_PIPE_WRITE) return abi_reply_now(errno_badf(), 0);
-    const u8 pipe_id = g_fds[fd].pipe_id;
-    if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return abi_reply_now(errno_badf(), 0);
-    struct pipe_entry *pipe = &g_pipes[pipe_id];
-    if (!pipe_has_live_reader(pipe_id)) return abi_reply_now(errno_pipe(), 0);
-    if ((g_fds[fd].fd_flags & O_NONBLOCK) != 0) return abi_reply_now(errno_again(), 0);
-    if (pipe->pending_write) return abi_reply_now(errno_again(), 0);
-    const u64 pending_len = min_u64(len, PIPE_BUFFER_BYTES);
-    if (pending_len == 0) return abi_reply_now(0, 0);
-    if (copy_from_target(src, pipe->pending_write_bytes, pending_len) != pending_len) return abi_reply_now(errno_fault(), 0);
-    pipe->pending_write = 1;
-    pipe->pending_write_atomic = len <= PIPE_BUFFER_BYTES ? 1 : 0;
-    pipe->pending_write_principal = principal;
-    pipe->pending_write_token = token;
-    pipe->pending_write_len = pending_len;
-    pipe_debug_event("pending_write", pipe_id, principal);
-    detach_reply_token();
-    return abi_pending();
-}
-
-static struct abi_handler_result exit_current_on_sigpipe(u64 principal, u64 token) {
-    u64 exited_pid = 0;
-    if (g_proc) {
-        exited_pid = terminate_process_for_sigpipe(principal);
-        prime_reply_return_signal();
-        exit_trap_target_no_wait(token != 0 ? token : principal);
-        if (exited_pid != 0) (void)satisfy_pending_waiters_for_child(exited_pid);
-        return abi_exit_current(principal);
-    }
-    exit_trap_target_no_wait(token != 0 ? token : principal);
-    return abi_exit_current(principal);
-}
-
-static struct abi_handler_result handle_write_blocking(const struct trap_request *req) {
-    const u64 fd = req->args[0];
-    const u64 src = req->args[1];
-    const u64 len = req->args[2];
-    if (!fd_valid(fd) || g_fds[fd].kind != FD_PIPE_WRITE) {
-        return abi_result_from_legacy_message(handle_write(req));
-    }
-    const u8 pipe_id = g_fds[fd].pipe_id;
-    int fault = 0;
-    const u64 n = pipe_write_from_target(fd, src, len, &fault);
-    if (fault) return abi_reply_now(errno_fault(), 0);
-    if ((i64)n > 0) {
-        defer_pipe_wake(pipe_id);
-        return abi_reply_now(n, 0);
-    }
-    if (n == errno_again()) return pending_pipe_write_from_current(fd, src, len, req->caller_principal, req->thread_id);
-    if (n == errno_pipe()) return exit_current_on_sigpipe(req->caller_principal, req->thread_id);
-    return abi_reply_now(n, 0);
-}
-
-static struct abi_handler_result handle_writev_blocking(const struct trap_request *req) {
-    const u64 fd = req->args[0];
-    const u64 iov = req->args[1];
-    const u64 iovcnt = req->args[2];
-    if (!fd_valid(fd) || g_fds[fd].kind != FD_PIPE_WRITE) {
-        return abi_result_from_legacy_message(handle_writev(req));
-    }
-    if (iovcnt > 64) return abi_reply_now(errno_inval(), 0);
-    u64 total = 0;
-    const u8 pipe_id = g_fds[fd].pipe_id;
-    for (u64 i = 0; i < iovcnt; i++) {
-        u64 pair[2];
-        if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? abi_reply_now(total, 0) : abi_reply_now(errno_fault(), 0);
-        if (pair[1] == 0) continue;
-        int fault = 0;
-        const u64 n = pipe_write_from_target(fd, pair[0], pair[1], &fault);
-        if (fault) return total != 0 ? abi_reply_now(total, 0) : abi_reply_now(errno_fault(), 0);
-        if ((i64)n < 0) {
-            if (total != 0) return abi_reply_now(total, 0);
-            if (n == errno_again()) return pending_pipe_write_from_current(fd, pair[0], pair[1], req->caller_principal, req->thread_id);
-            if (n == errno_pipe()) return exit_current_on_sigpipe(req->caller_principal, req->thread_id);
-            return abi_reply_now(n, 0);
-        }
-        total += n;
-        if (n != pair[1]) break;
-    }
-    if (total != 0) defer_pipe_wake(pipe_id);
-    return abi_reply_now(total, 0);
-}
-
 static struct ipc_message handle_fstat(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 stat_va = req->args[1]; if (!fd_valid(fd)) return reply(errno_badf(), 0);
     struct fs_stat_record rec; rec.object_kind = g_fds[fd].object_kind; rec.size_bytes = g_fds[fd].size; rec.mode_bits = g_fds[fd].mode_bits; rec.mtime_unix_sec = 0;
@@ -843,8 +721,6 @@ static struct ipc_message handle_close(const struct trap_request *req) {
     if (fd_is_pipe(fd)) close_pipe_fd(fd);
     if (g_fds[fd].kind == FD_SOCKET) net_close_udp(g_fds[fd].token);
     g_fds[fd].kind = FD_UNUSED;
-    g_fds[fd].fd_flags = 0;
-    g_fds[fd].desc_flags = 0;
     sync_fd_to_thread_group(fd);
     return reply(0, 0);
 }

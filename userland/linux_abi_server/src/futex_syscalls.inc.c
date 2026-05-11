@@ -30,7 +30,7 @@ static u64 wake_futex_waiters(u64 owner_pid, u64 uaddr, u64 max_wake) {
     return woke;
 }
 
-static struct abi_handler_result handle_futex(const struct trap_request *req) {
+static struct ipc_message handle_futex(const struct trap_request *req) {
     const u64 uaddr = req->args[0];
     const u64 op = req->args[1];
     const u64 val = req->args[2];
@@ -38,19 +38,19 @@ static struct abi_handler_result handle_futex(const struct trap_request *req) {
     const u64 cmd = op & FUTEX_CMD_MASK;
     const u64 owner_pid = futex_owner_pid_for_current();
 
-    if ((op & ~(u64)(FUTEX_CMD_MASK | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)) != 0) return abi_reply_now(errno_inval(), 0);
-    if (uaddr == 0 || (uaddr & 3) != 0 || owner_pid == 0) return abi_reply_now(errno_inval(), 0);
+    if ((op & ~(u64)(FUTEX_CMD_MASK | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)) != 0) return reply(errno_inval(), 0);
+    if (uaddr == 0 || (uaddr & 3) != 0 || owner_pid == 0) return reply(errno_inval(), 0);
 
     if (cmd == FUTEX_WAKE) {
-        return abi_reply_now(wake_futex_waiters(owner_pid, uaddr, val), 0);
+        return reply(wake_futex_waiters(owner_pid, uaddr, val), 0);
     }
 
-    if (cmd != FUTEX_WAIT) return abi_reply_now(errno_nosys(), 0);
-    if (timeout != 0) return abi_reply_now(errno_timedout(), 0);
+    if (cmd != FUTEX_WAIT) return reply(errno_nosys(), 0);
+    if (timeout != 0) return reply(errno_timedout(), 0);
 
     u32 current = 0;
-    if (copy_from_target(uaddr, &current, sizeof(current)) != sizeof(current)) return abi_reply_now(errno_fault(), 0);
-    if (current != (u32)val) return abi_reply_now(errno_again(), 0);
+    if (copy_from_target(uaddr, &current, sizeof(current)) != sizeof(current)) return reply(errno_fault(), 0);
+    if (current != (u32)val) return reply(errno_again(), 0);
 
     remove_futex_waiters_for_principal(req->caller_principal);
     for (u64 i = 0; i < FUTEX_WAITER_MAX; i++) {
@@ -60,7 +60,7 @@ static struct abi_handler_result handle_futex(const struct trap_request *req) {
         g_futex_waiters[i].owner_pid = owner_pid;
         g_futex_waiters[i].uaddr = uaddr;
         detach_reply_token();
-        return abi_pending();
+        return wait_ipc();
     }
-    return abi_reply_now(errno_again(), 0);
+    return reply(errno_again(), 0);
 }

@@ -1,7 +1,5 @@
 static u64 page_up(u64 value) { return (value + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1); }
 
-enum { LINUX_MMAP_MIN_ADDR = 0x10000 };
-
 static void vm_merge_adjacent_regions(void) {
     int changed = 1;
     while (changed) {
@@ -209,7 +207,6 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     const int file_backed = (flags & MAP_ANONYMOUS) == 0;
     if (len == 0) return reply(errno_inval(), 0); if (map_type != MAP_PRIVATE && map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE) return reply(errno_inval(), 0); if ((offset & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0); if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) return reply(errno_inval(), 0); if (file_backed && (!fd_valid(fd) || g_fds[fd].kind != FD_FILE)) return reply(errno_badf(), 0); prot = normalize_linux_prot(prot);
     const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; const u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : g_mmap_next_va; const u64 map_prot = file_backed ? ((prot | PROT_WRITE) & ~PROT_EXEC) : prot;
-    if (target_va < LINUX_MMAP_MIN_ADDR) return reply(errno_nomem(), 0);
     g_prof.mmap_calls++;
     g_prof.mmap_pages += page_count;
     if (file_backed) {

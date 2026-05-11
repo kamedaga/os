@@ -12,7 +12,6 @@ enum {
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
-    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_SHARE_CAP = 0x2B,
     PAGE_BYTES = 4096,
 };
@@ -67,7 +66,7 @@ static int fill_request(struct exec_service_request *request, const struct exec_
     request->version = EXEC_SERVICE_ABI_VERSION;
     request->op = EXEC_SERVICE_OP_SPAWN_LINUX;
     request->response_paddr = response_paddr;
-    request->client_process_handle = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    request->client_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
 
     u16 cursor = 0;
     if (!append_arg(request, &cursor, options->path, &request->argv_offsets[0], &request->path_bytes)) return 0;

@@ -30,7 +30,7 @@ struct exec_service_request {
     unsigned short envp_count;
     unsigned short arg_data_bytes;
     unsigned long long response_paddr;
-    unsigned long long client_process_handle;
+    unsigned long long client_process_slot;
     unsigned short argv_offsets[EXEC_SERVICE_MAX_ARGV];
     unsigned short argv_bytes[EXEC_SERVICE_MAX_ARGV];
     unsigned short envp_offsets[EXEC_SERVICE_MAX_ENVP];

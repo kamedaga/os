@@ -12,7 +12,6 @@ enum {
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_TICK_COUNT = 0x2D,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
-    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_GET_MEMORY_STATS = 0x3C,
     SYSCALL_GET_RTC_UNIX_TIME = 0x3E,
     SYSCALL_OK = 0,
@@ -138,7 +137,7 @@ struct vfs_backend_session {
     u8 active;
     u8 reserved0[7];
     u64 endpoint_id;
-    u64 process_handle;
+    u64 process_slot;
     u64 request_va;
     u64 response_va;
     u64 request_paddr;
@@ -223,7 +222,7 @@ struct net_backend_session {
     u8 active;
     u8 reserved0[7];
     u64 endpoint_id;
-    u64 process_handle;
+    u64 process_slot;
     u64 request_va;
     u64 response_va;
     u64 request_paddr;
@@ -2102,8 +2101,8 @@ static u64 make_backend_session_nonce(u64 request_paddr, u64 response_paddr, u64
 }
 
 static int install_backend_endpoint(void) {
-    if (g_root_backend.endpoint_id == 0 || g_root_backend.process_handle == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_root_backend.endpoint_id, g_root_backend.process_handle) == SYSCALL_OK;
+    if (g_root_backend.endpoint_id == 0 || g_root_backend.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_root_backend.endpoint_id, g_root_backend.process_slot) == SYSCALL_OK;
 }
 
 static int grant_backend_response_page(void) {
@@ -2160,7 +2159,7 @@ static int connect_root_backend(u64 endpoint_id, u64 process_slot) {
     if (endpoint_id == 0 || process_slot == 0) return 0;
 
     g_root_backend.endpoint_id = endpoint_id;
-    g_root_backend.process_handle = process_slot;
+    g_root_backend.process_slot = process_slot;
     g_root_backend.request_va = VFS_FAT_REQUEST_VA;
     g_root_backend.response_va = VFS_FAT_RESPONSE_VA;
     g_root_backend.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -2172,7 +2171,7 @@ static int connect_root_backend(u64 endpoint_id, u64 process_slot) {
 
     clear_page(g_root_backend.request_va);
     clear_page(g_root_backend.response_va);
-    const u64 process_slot_self = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 process_slot_self = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_root_backend.session_nonce = make_backend_session_nonce(
         g_root_backend.request_paddr,
         g_root_backend.response_paddr,
@@ -2217,8 +2216,8 @@ static u64 make_net_session_nonce(u64 request_paddr, u64 response_paddr, u64 end
 }
 
 static int install_net_endpoint(void) {
-    if (g_net_backend.endpoint_id == 0 || g_net_backend.process_handle == 0) return 0;
-    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_net_backend.endpoint_id, g_net_backend.process_handle) == SYSCALL_OK;
+    if (g_net_backend.endpoint_id == 0 || g_net_backend.process_slot == 0) return 0;
+    return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_net_backend.endpoint_id, g_net_backend.process_slot) == SYSCALL_OK;
 }
 
 static int grant_net_response_page(void) {
@@ -2276,7 +2275,7 @@ static int connect_net_backend(u64 endpoint_id, u64 process_slot) {
     if (endpoint_id == 0 || process_slot == 0) return 0;
 
     g_net_backend.endpoint_id = endpoint_id;
-    g_net_backend.process_handle = process_slot;
+    g_net_backend.process_slot = process_slot;
     g_net_backend.request_va = VFS_NET_REQUEST_VA;
     g_net_backend.response_va = VFS_NET_RESPONSE_VA;
     g_net_backend.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -2288,7 +2287,7 @@ static int connect_net_backend(u64 endpoint_id, u64 process_slot) {
 
     clear_page(g_net_backend.request_va);
     clear_page(g_net_backend.response_va);
-    const u64 process_slot_self = syscall0(SYSCALL_GET_PROCESS_HANDLE);
+    const u64 process_slot_self = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_net_backend.session_nonce = make_net_session_nonce(
         g_net_backend.request_paddr,
         g_net_backend.response_paddr,

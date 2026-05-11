@@ -1,5 +1,3 @@
-const std = @import("std");
-
 pub const magic: u64 = 0x3149_4241_5041_5254; // TRAPABI1
 pub const version: u32 = 1;
 
@@ -49,39 +47,6 @@ pub const syscall_detach_abi_trap_reply_token: u64 = 0x59;
 pub const syscall_share_abi_trap_reply_target_pages_to_target: u64 = 0x5A;
 pub const syscall_unmap_abi_trap_target_pages: u64 = 0x5B;
 pub const abi_trap_copy_max_bytes: usize = 4096;
-pub const delegate_target_token_tag: u64 = 0x3 << 60;
-pub const delegate_target_token_tag_mask: u64 = 0xF << 60;
-pub const delegate_target_slot_bits: u6 = 32;
-pub const delegate_target_generation_bits: u6 = 28;
-pub const delegate_target_slot_mask: u64 = (@as(u64, 1) << delegate_target_slot_bits) - 1;
-pub const delegate_target_generation_mask: u64 = (@as(u64, 1) << delegate_target_generation_bits) - 1;
-pub const delegate_target_generation_shift: u6 = delegate_target_slot_bits;
-
-pub const DelegateTargetToken = struct {
-    process_slot: u64,
-    generation: u64,
-};
-
-pub fn encodeDelegateTargetToken(process_slot: u64, generation: u64) u64 {
-    std.debug.assert(process_slot != 0);
-    std.debug.assert(generation != 0);
-    std.debug.assert((process_slot & ~delegate_target_slot_mask) == 0);
-    std.debug.assert((generation & ~delegate_target_generation_mask) == 0);
-    return delegate_target_token_tag |
-        process_slot |
-        (generation << delegate_target_generation_shift);
-}
-
-pub fn decodeDelegateTargetToken(token: u64) ?DelegateTargetToken {
-    if ((token & delegate_target_token_tag_mask) != delegate_target_token_tag) return null;
-    const slot = token & delegate_target_slot_mask;
-    const generation = (token >> delegate_target_generation_shift) & delegate_target_generation_mask;
-    if (slot == 0 or generation == 0) return null;
-    return .{
-        .process_slot = slot,
-        .generation = generation,
-    };
-}
 
 pub const TrapRequest = extern struct {
     magic: u64 = magic,
@@ -108,16 +73,3 @@ pub const TrapResponse = extern struct {
     new_rip: u64,
     new_rsp: u64,
 };
-
-test "delegate target token round-trips" {
-    const encoded = encodeDelegateTargetToken(12, 7);
-    const decoded = decodeDelegateTargetToken(encoded).?;
-    try std.testing.expectEqual(@as(u64, 12), decoded.process_slot);
-    try std.testing.expectEqual(@as(u64, 7), decoded.generation);
-    try std.testing.expectEqual(@as(?DelegateTargetToken, null), decodeDelegateTargetToken(12));
-    try std.testing.expectEqual(@as(?DelegateTargetToken, null), decodeDelegateTargetToken(delegate_target_token_tag | 12));
-    try std.testing.expectEqual(
-        @as(?DelegateTargetToken, null),
-        decodeDelegateTargetToken(delegate_target_token_tag | (@as(u64, 7) << delegate_target_generation_shift)),
-    );
-}

@@ -18,6 +18,7 @@ const syscall_wait_event: u64 = 0x17;
 const syscall_accept_cap_transfer: u64 = 0x2A;
 const syscall_install_endpoint: u64 = 0x26;
 const syscall_get_tick_count: u64 = 0x2D;
+const syscall_get_process_slot: u64 = 0x2E;
 
 const main_source_map_va: u64 = 0x2800_0000;
 const interpreter_source_map_va: u64 = 0x2900_0000;
@@ -25,7 +26,7 @@ const bootfs_source_map_va: u64 = 0x2A00_0000;
 const lib_source_map_va: u64 = 0x2B00_0000;
 const page_bytes: u64 = 4096;
 const zero_page = [_]u8{0} ** 4096;
-const linux_stack_pages: u64 = 256;
+const linux_stack_pages: u64 = 64;
 const linux_stack_bytes: u64 = linux_stack_pages * page_bytes;
 const linux_stack_bottom_va: u64 = process_abi.user_stack_top - linux_stack_bytes;
 const stdio_sink_target_va: u64 = 0x3C02_2000;
@@ -544,8 +545,8 @@ fn profileStep(_: []const u8, step: []const u8) void {
     profileEvent(step);
 }
 
-fn getProcessHandle() u64 {
-    return syscall1(process_abi.syscall_get_process_handle, 0);
+fn getProcessSlot() u64 {
+    return syscall1(syscall_get_process_slot, 0);
 }
 
 fn mapPage(va: u64, paddr: u64, writable: bool) bool {
@@ -560,8 +561,8 @@ fn acceptCapTransfer(transfer_id: u64) u64 {
     return syscall1(syscall_accept_cap_transfer, transfer_id);
 }
 
-fn installEndpoint(endpoint_id: u64, process_handle: u64) bool {
-    return syscall3(syscall_install_endpoint, 0, endpoint_id, process_handle) == syscall_ok;
+fn installEndpoint(endpoint_id: u64, process_slot: u64) bool {
+    return syscall3(syscall_install_endpoint, 0, endpoint_id, process_slot) == syscall_ok;
 }
 
 fn getProcessStatusRaw(process_slot: u64) u64 {
@@ -600,14 +601,14 @@ fn mapExecLoaderScratch() void {
     mapStaticScratchBuffer(@intFromPtr(&child_mapped_pages), @sizeOf(@TypeOf(child_mapped_pages)));
 }
 
-fn connectRootFs(endpoint_id: u64, service_process_handle: u64) ?struct { client: fs_client.Client, root_token: u64 } {
+fn connectRootFs(endpoint_id: u64, compat_process_slot: u64) ?struct { client: fs_client.Client, root_token: u64 } {
     if (endpoint_id == 0) {
         userLog("ExecLoader: fs endpoint absent\n");
         return null;
     }
-    const process_handle = getProcessHandle();
-    if (process_handle == 0) {
-        userLog("ExecLoader: process handle unavailable\n");
+    const process_slot = getProcessSlot();
+    if (process_slot == 0) {
+        userLog("ExecLoader: process slot unavailable\n");
         return null;
     }
     const ipc_va = user_vm.reservePages(2) orelse {
@@ -617,9 +618,10 @@ fn connectRootFs(endpoint_id: u64, service_process_handle: u64) ?struct { client
     var client = fs_client.Client.connect(.{
         .request_va = @intCast(ipc_va),
         .response_va = @intCast(ipc_va + user_vm.page_bytes),
-        .client_process_handle = process_handle,
+        .client_process_slot = process_slot,
         .endpoint_id = endpoint_id,
-        .service_process_handle = service_process_handle,
+        .compat_process_slot = compat_process_slot,
+        .allow_process_slot_compat = compat_process_slot != 0,
     }) catch {
         userLog("ExecLoader: persistent fs connect failed\n");
         return null;
@@ -728,18 +730,6 @@ fn allocMapPagesToProcess(process_token: u64, target_va: u64, page_count: u64, p
     ) == syscall_ok;
 }
 
-fn allocMapPageRangeToProcess(process_token: u64, target_va: u64, page_count: u64, prot: process_builder_abi.MapProt) bool {
-    const max_batch_pages: u64 = 64;
-    var mapped_pages: u64 = 0;
-    while (mapped_pages < page_count) {
-        const remaining = page_count - mapped_pages;
-        const batch_pages = if (remaining < max_batch_pages) remaining else max_batch_pages;
-        if (!allocMapPagesToProcess(process_token, target_va + mapped_pages * page_bytes, batch_pages, prot)) return false;
-        mapped_pages += batch_pages;
-    }
-    return true;
-}
-
 fn copyToProcess(process_token: u64, dest_va: u64, src_va: u64, byte_len: u64) bool {
     return syscall4(
         process_builder_abi.syscall_copy_to_process,
@@ -759,16 +749,15 @@ fn startProcess(process_token: u64) ?u64 {
     return if (process_abi.decodeSpawnedProcessSlot(spawned) != null) spawned else null;
 }
 
-fn setProcessAbiTrapDelegate(process_token: u64, endpoint_id: u64, target_token: u64, flavor: u64, request_page_va: u64) bool {
-    return syscall5(process_builder_abi.syscall_set_process_abi_trap_delegate, process_token, endpoint_id, target_token, flavor, request_page_va) == syscall_ok;
+fn setProcessAbiTrapDelegate(process_token: u64, endpoint_id: u64, target_process_slot: u64, flavor: u64, request_page_va: u64) bool {
+    return syscall5(process_builder_abi.syscall_set_process_abi_trap_delegate, process_token, endpoint_id, target_process_slot, flavor, request_page_va) == syscall_ok;
 }
 
 fn abiTrapRequestPageForProcessToken(config_request_page_va: u64, process_token: u64) u64 {
     if (config_request_page_va < linux_abi_request_pages_base_va) return config_request_page_va;
     const offset = config_request_page_va - linux_abi_request_pages_base_va;
     if ((offset & (page_bytes - 1)) != 0 or offset >= linux_abi_request_page_count * page_bytes) return config_request_page_va;
-    const decoded = process_builder_abi.decodeProcessBuilderToken(process_token) orelse return config_request_page_va;
-    const process_slot = decoded.process_slot;
+    const process_slot = process_builder_abi.decodeProcessBuilderToken(process_token) orelse return config_request_page_va;
     if (process_slot >= linux_abi_request_page_count) return config_request_page_va;
     return linux_abi_request_pages_base_va + process_slot * page_bytes;
 }
@@ -2001,7 +1990,6 @@ fn launchExec(
     interpreter_vm_token: u64,
     interpreter_file_bytes: u64,
     flush_profile_before_return: bool,
-    start_child: bool,
 ) ?u64 {
     profileEvent("launch begin");
     if (launch_map_executable_source and !mapVmObject(executable_vm_token, launch_executable_source_map_va)) {
@@ -2105,7 +2093,7 @@ fn launchExec(
     }
 
     profileEvent("stack alloc begin");
-    if (!allocMapPageRangeToProcess(process_token, linux_stack_bottom_va, linux_stack_pages, .{ .read = true, .write = true })) {
+    if (!allocMapPagesToProcess(process_token, linux_stack_bottom_va, linux_stack_pages, .{ .read = true, .write = true })) {
         abortProcess(process_token);
         userLog("ExecLoader: stack alloc failed\n");
         return null;
@@ -2155,7 +2143,7 @@ fn launchExec(
         return null;
     }
     profileEvent("context done");
-    if (cfg.abi_trap_endpoint_id != 0 and cfg.abi_trap_endpoint_target_token != 0) {
+    if (cfg.abi_trap_endpoint_id != 0 and cfg.abi_trap_endpoint_process_slot != 0) {
         const flavor = if (cfg.abi_trap_flavor != 0) cfg.abi_trap_flavor else @as(u64, @intFromEnum(trap_abi.AbiFlavor.linux_x86_64));
         const abi_trap_request_page_va = abiTrapRequestPageForProcessToken(cfg.abi_trap_request_page_va, process_token);
         if (abi_trap_request_page_va == 0) {
@@ -2164,22 +2152,13 @@ fn launchExec(
             return null;
         }
         profileEvent("abi delegate begin");
-        if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_target_token, flavor, abi_trap_request_page_va)) {
+        if (!setProcessAbiTrapDelegate(process_token, cfg.abi_trap_endpoint_id, cfg.abi_trap_endpoint_process_slot, flavor, abi_trap_request_page_va)) {
             abortProcess(process_token);
             userLog("ExecLoader: abi trap delegate failed\n");
             return null;
         }
         profileEvent("abi delegate done");
         if (false) userLog("ExecLoader: abi trap delegate ready\n");
-    }
-    if (!start_child) {
-        const decoded = process_builder_abi.decodeProcessBuilderToken(process_token) orelse {
-            abortProcess(process_token);
-            userLog("ExecLoader: child token decode failed\n");
-            return null;
-        };
-        if (flush_profile_before_return) profileFlush();
-        return trap_abi.encodeDelegateTargetToken(decoded.process_slot, decoded.generation);
     }
     profileEvent("start process begin");
     const spawned = startProcess(process_token) orelse {
@@ -2258,18 +2237,13 @@ fn mapServiceResponsePage(response_paddr: u64) bool {
     return true;
 }
 
-fn writeServiceResponse(seq: u64, status: u64, child_process_token: u64) void {
+fn writeServiceResponse(seq: u64, status: u64, child_process_slot: u64) void {
     const response: *volatile exec_loader_bootstrap_abi.ServiceResponse = @ptrFromInt(service_response_va);
     response.magic = exec_loader_bootstrap_abi.service_response_magic;
     response.version = exec_loader_bootstrap_abi.service_version;
     response.op = exec_loader_bootstrap_abi.service_op_launch;
     response.status = status;
-    response.child_process_slot = 0;
-    response.child_process_token = 0;
-    if (trap_abi.decodeDelegateTargetToken(child_process_token)) |decoded| {
-        response.child_process_slot = decoded.process_slot;
-        response.child_process_token = child_process_token;
-    }
+    response.child_process_slot = child_process_slot;
     response.seq = seq;
     if (status != exec_loader_bootstrap_abi.service_status_ok) {
         userLog("ExecLoader: service response error\n");
@@ -2324,14 +2298,14 @@ noinline fn handleServiceRequest(request_paddr: u64) void {
     launch_interpreter_source_map_va = service_interpreter_source_map_va;
     launch_map_executable_source = false;
     launch_map_interpreter_source = false;
-    const child_process_token = launchExec(cfg, source.vm_token, source.file_bytes, service_interpreter_vm_token, service_interpreter_file_bytes, false, false) orelse {
+    const child_process_slot = launchExec(cfg, source.vm_token, source.file_bytes, service_interpreter_vm_token, service_interpreter_file_bytes, false) orelse {
         source.used = false;
         source.poisoned = true;
         writeServiceResponse(request.seq, exec_loader_bootstrap_abi.service_status_launch_failed, 0);
         profileFlush();
         return;
     };
-    writeServiceResponse(request.seq, exec_loader_bootstrap_abi.service_status_ok, child_process_token);
+    writeServiceResponse(request.seq, exec_loader_bootstrap_abi.service_status_ok, child_process_slot);
     profileFlush();
 }
 
@@ -2343,8 +2317,8 @@ noinline fn runExecLoaderService(cfg: *const exec_loader_bootstrap_abi.Config) n
             userLog("ExecLoader: service interpreter map failed\n");
         }
     }
-    const self_handle = getProcessHandle();
-    if (!installEndpoint(exec_loader_bootstrap_abi.service_endpoint_id, self_handle)) {
+    const self_slot = getProcessSlot();
+    if (!installEndpoint(exec_loader_bootstrap_abi.service_endpoint_id, self_slot)) {
         userLog("ExecLoader: service endpoint failed\n");
         processExit(1);
     }
@@ -2375,7 +2349,7 @@ pub export fn _start() noreturn {
         runExecLoaderService(cfg);
     } else if (image_abi.decodeVmObjectToken(cfg.executable_vm_token) == null or cfg.executable_file_bytes == 0) {
         userLog("ExecLoader: invalid executable token\n");
-    } else if (launchExec(cfg, cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes, true, true)) |child_process_slot| {
+    } else if (launchExec(cfg, cfg.executable_vm_token, cfg.executable_file_bytes, cfg.interpreter_vm_token, cfg.interpreter_file_bytes, true)) |child_process_slot| {
         if (false) userLog("ExecLoader: child started\n");
         while (true) {
             const status = getProcessStatusRaw(child_process_slot);

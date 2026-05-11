@@ -140,26 +140,7 @@ static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_byt
 
 static int is_vm_object_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG && (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
 static int is_exec_image_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG && (token & ~EXEC_IMAGE_TOKEN_TAG) != 0; }
-static u64 decode_process_handle_slot(u64 value) {
-    if ((value & PROCESS_HANDLE_TAG_MASK) != PROCESS_HANDLE_TAG) return 0;
-    const u64 slot = value & PROCESS_HANDLE_SLOT_MASK;
-    const u64 generation = (value >> PROCESS_HANDLE_GENERATION_SHIFT) & PROCESS_HANDLE_GENERATION_MASK;
-    return slot != 0 && generation != 0 ? slot : 0;
-}
-
-static u64 decode_process_handle_generation(u64 value) {
-    if ((value & PROCESS_HANDLE_TAG_MASK) != PROCESS_HANDLE_TAG) return 0;
-    const u64 slot = value & PROCESS_HANDLE_SLOT_MASK;
-    const u64 generation = (value >> PROCESS_HANDLE_GENERATION_SHIFT) & PROCESS_HANDLE_GENERATION_MASK;
-    return slot != 0 && generation != 0 ? generation : 0;
-}
-
-static u64 delegate_target_token_from_process_handle(u64 handle) {
-    const u64 slot = decode_process_handle_slot(handle);
-    const u64 generation = decode_process_handle_generation(handle);
-    if (slot == 0 || generation == 0) return 0;
-    return DELEGATE_TARGET_TOKEN_TAG | slot | (generation << PROCESS_HANDLE_GENERATION_SHIFT);
-}
+static u64 decode_spawned_process_slot(u64 value) { if ((value & SPAWN_RESULT_TAG) == 0) return 0; return value & SPAWN_RESULT_PROCESS_MASK; }
 static void execve_profile_begin(const char *path) {
     if (!g_execve_profile_enabled) return;
     g_execve_profile_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
@@ -451,7 +432,7 @@ static u64 get_exec_loader_exec_token(void) {
 }
 
 static u64 grant_vm_object_to_loader(u64 vm_token) {
-    const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_exec_loader_service_handle, VM_RIGHT_READ_MAP);
+    const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_exec_loader_service_slot, VM_RIGHT_READ_MAP);
     return is_vm_object_token(granted) ? granted : 0;
 }
 
@@ -487,7 +468,7 @@ static int start_exec_loader_service(void) {
     cfg->flags = EXEC_LOADER_BOOTSTRAP_FLAG_SERVICE_MODE;
     cfg->interpreter_file_bytes = g_standard_interpreter_bytes;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
-    cfg->fs_process_handle = g_vfs.process_handle;
+    cfg->fs_compat_process_slot = g_vfs.process_slot;
 
     struct bootstrap_descriptor_table *table = (struct bootstrap_descriptor_table *)EXECVE_LOADER_SERVICE_TABLE_VA;
     table->page_count = 1;
@@ -501,8 +482,7 @@ static int start_exec_loader_service(void) {
 
     const u64 flags = SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER;
     const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, loader_exec_token, EXECVE_LOADER_SERVICE_TABLE_VA, 0, flags);
-    g_exec_loader_service_handle = spawned;
-    g_exec_loader_service_slot = decode_process_handle_slot(spawned);
+    g_exec_loader_service_slot = decode_spawned_process_slot(spawned);
     execve_profile_step("loader service start done");
     if (g_exec_loader_service_slot == 0) {
         user_log("LinuxAbiServer: exec loader service spawn failed ret=");
@@ -512,7 +492,7 @@ static int start_exec_loader_service(void) {
     return 1;
 }
 
-static int send_exec_loader_service_request(struct exec_loader_config *cfg, struct exec_cache_entry *entry, u64 main_vm_token, u64 *spawned_principal_out, u64 *spawned_token_out) {
+static int send_exec_loader_service_request(struct exec_loader_config *cfg, struct exec_cache_entry *entry, u64 main_vm_token, u64 *spawned_principal_out) {
     if (!ensure_exec_loader_service_pages()) { user_log("LinuxAbiServer: exec loader service pages failed\n"); return 0; }
     if (!start_exec_loader_service()) return 0;
 
@@ -544,7 +524,7 @@ static int send_exec_loader_service_request(struct exec_loader_config *cfg, stru
     request->seq = request_seq;
 
     execve_profile_step(loader_has_source ? "loader service cached send begin" : "loader service grant send begin");
-    u64 install_status = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_LOADER_SERVICE_ENDPOINT_ID, g_exec_loader_service_handle);
+    u64 install_status = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_LOADER_SERVICE_ENDPOINT_ID, g_exec_loader_service_slot);
     u64 grant_status = 0;
     u64 share_status = 0;
     u64 attempts = 0;
@@ -586,9 +566,7 @@ static int send_exec_loader_service_request(struct exec_loader_config *cfg, stru
             response->version == EXEC_LOADER_SERVICE_VERSION &&
             response->op == EXEC_LOADER_SERVICE_OP_LAUNCH &&
             response->seq == request_seq) {
-            if (response->status != EXEC_LOADER_SERVICE_STATUS_OK ||
-                response->child_process_slot == 0 ||
-                !delegate_target_token_matches_slot(response->child_process_token, response->child_process_slot)) {
+            if (response->status != EXEC_LOADER_SERVICE_STATUS_OK || response->child_process_slot == 0) {
                 user_log("LinuxAbiServer: exec loader service failed status=");
                 user_log_hex_value(response->status);
                 if (loader_has_source && entry != 0) {
@@ -599,7 +577,6 @@ static int send_exec_loader_service_request(struct exec_loader_config *cfg, stru
             }
             if (entry != 0) entry->loader_service_cached = 1;
             *spawned_principal_out = response->child_process_slot;
-            *spawned_token_out = response->child_process_token;
             execve_profile_step("loader service reply done");
             return 1;
         }
@@ -629,19 +606,6 @@ static void reset_exec_runtime_state(void) {
     g_mmap_next_va = 0x31000000ULL;
     g_brk_next_va = 0x38000000ULL;
     for (u64 i = 0; i < VM_REGION_MAX; i++) g_regions[i].used = 0;
-}
-
-static void close_cloexec_fds_for_exec(void) {
-    if (!g_proc) return;
-    for (u64 fd = 0; fd < 32; fd++) {
-        struct fd_entry *entry = &g_proc->fds[fd];
-        if (entry->kind == FD_UNUSED || (entry->desc_flags & FD_CLOEXEC) == 0) continue;
-        if (fd_entry_is_pipe(entry)) close_pipe_entry(entry);
-        if (entry->kind == FD_SOCKET) net_close_udp(entry->token);
-        entry->kind = FD_UNUSED;
-        entry->fd_flags = 0;
-        entry->desc_flags = 0;
-    }
 }
 
 static int exec_cstr_eq(const char *a, const char *b) {
@@ -817,7 +781,7 @@ static int configure_exec_args_from_target(struct exec_loader_config *cfg, const
     return 1;
 }
 
-static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override, u64 *spawned_principal_out, u64 *spawned_token_out) {
+static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override, u64 *spawned_principal_out) {
     execve_profile_step("scratch begin");
     if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
     execve_profile_step("scratch done");
@@ -846,27 +810,27 @@ static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, 
     cfg->executable_file_bytes = main_bytes;
     cfg->interpreter_file_bytes = g_standard_interpreter_bytes;
     cfg->abi_trap_endpoint_id = LINUX_ABI_ENDPOINT_ID;
-    cfg->abi_trap_endpoint_target_token = delegate_target_token_from_process_handle(syscall0(SYSCALL_GET_PROCESS_HANDLE));
+    cfg->abi_trap_endpoint_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     cfg->abi_trap_flavor = 1;
     cfg->abi_trap_request_page_va = abi_request_va;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
-    cfg->fs_process_handle = g_vfs.process_handle;
+    cfg->fs_compat_process_slot = g_vfs.process_slot;
     execve_profile_step("config done");
 
     struct exec_cache_entry *entry = exec_cache_find(path, cstr_len(path));
     execve_profile_step("loader service begin");
-    int send_result = send_exec_loader_service_request(cfg, entry, main_vm_token, spawned_principal_out, spawned_token_out);
+    int send_result = send_exec_loader_service_request(cfg, entry, main_vm_token, spawned_principal_out);
     if (send_result == 2) {
         execve_profile_step("loader service retry begin");
-        send_result = send_exec_loader_service_request(cfg, entry, main_vm_token, spawned_principal_out, spawned_token_out);
+        send_result = send_exec_loader_service_request(cfg, entry, main_vm_token, spawned_principal_out);
     }
     return send_result == 1;
 }
 
-static struct abi_handler_result handle_execve(const struct trap_request *req) {
+static struct ipc_message handle_execve(const struct trap_request *req) {
     char path[256];
-    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return abi_reply_now(errno_fault(), 0);
-    if (cstr_len(path) > FS_MAX_PATH_BYTES) return abi_reply_now(errno_nametoolong(), 0);
+    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
+    if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
     g_execve_profile_enabled = target_env_has_exec_profile(req->args[2]);
     g_execve_profile_verbose = target_env_has_exec_profile_verbose(req->args[2]);
     const char *load_path = path;
@@ -888,16 +852,14 @@ static struct abi_handler_result handle_execve(const struct trap_request *req) {
     g_exec_path[g_exec_path_len] = 0;
     u64 exec_probe_token = 0;
     u64 exec_probe_bytes = 0;
-    if (!vfs_lookup_file_token(path, &exec_probe_token, &exec_probe_bytes)) return abi_reply_now(errno_noent(), 0);
-    if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return abi_reply_now(errno_noent(), 0);
+    if (!vfs_lookup_file_token(path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
+    if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
     execve_profile_step("probe lookup done");
     const u64 old_principal = req->caller_principal;
     u64 spawned_principal = 0;
-    u64 spawned_token = 0;
-    if (!spawn_exec_loader_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal, &spawned_token)) return abi_reply_now(errno_io(), 0);
+    if (!spawn_exec_loader_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) return reply(errno_io(), 0);
     execve_profile_step("spawn loader done");
     execve_profile_flush();
-    close_cloexec_fds_for_exec();
     if (g_proc) {
         g_proc->principal = 0;
         g_proc->exec_pending = 1;
@@ -905,17 +867,5 @@ static struct abi_handler_result handle_execve(const struct trap_request *req) {
         if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
     }
     reset_exec_runtime_state();
-    const u64 start_status = start_trap_target(spawned_token);
-    if (start_status != SYSCALL_OK) {
-        user_log("LinuxAbiServer: exec start target failed=");
-        user_log_hex_value(start_status);
-        if (g_proc) {
-            g_proc->principal = old_principal;
-            g_proc->exec_pending = 0;
-            g_proc->exec_pending_principal = 0;
-        }
-        exit_trap_target_preserve_reply(spawned_token);
-        return abi_reply_now(errno_io(), 0);
-    }
-    return abi_exit_target(req->thread_id);
+    return exit_trap_target_and_wait(old_principal);
 }

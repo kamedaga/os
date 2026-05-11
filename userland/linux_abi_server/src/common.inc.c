@@ -43,27 +43,20 @@ enum {
     SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN = 0x59,
     SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET = 0x5A,
     SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES = 0x5B,
-    SYSCALL_GET_PROCESS_HANDLE = 0x5C,
     SYSCALL_OK = 0,
     SYSCALL_ERR_MAP = 5,
     SYSCALL_ERR_ENDPOINT = 9,
     IPC_CALL_FLAG_SIGNAL_ONLY = 0x2,
-    WAIT_EVENT_FLAG_IPC_SIGNAL_ONLY = 0x2,
 
     PAGE_BYTES = 4096,
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
     TRAP_MAGIC = 0x3149424150415254ULL,
     TRAP_VERSION = 1,
-    DELEGATE_TARGET_TOKEN_TAG = 0x3000000000000000ULL,
-    DELEGATE_TARGET_TOKEN_TAG_MASK = 0xF000000000000000ULL,
-    DELEGATE_TARGET_SLOT_MASK = 0x00000000FFFFFFFFULL,
-    DELEGATE_TARGET_GENERATION_SHIFT = 32,
-    DELEGATE_TARGET_GENERATION_MASK = 0x0FFFFFFFULL,
 
     SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
-    SERVICE_REGISTRY_VERSION = 2,
+    SERVICE_REGISTRY_VERSION = 1,
     SERVICE_REGISTRY_MAX_ENTRIES = 12,
     SERVICE_KIND_VFS = 2,
     SERVICE_KIND_CONSOLE = 10,
@@ -344,7 +337,6 @@ enum {
     F_GETLK = 5,
     F_SETLK = 6,
     F_SETLKW = 7,
-    FD_CLOEXEC = 1,
     F_RDLCK = 0,
     F_WRLCK = 1,
     F_UNLCK = 2,
@@ -380,11 +372,8 @@ enum {
     TIOCGWINSZ = 0x5413,
     TIOCSWINSZ = 0x5414,
 
-    PROCESS_HANDLE_TAG = 2ULL << 60,
-    PROCESS_HANDLE_TAG_MASK = 0xFULL << 60,
-    PROCESS_HANDLE_SLOT_MASK = 0xffffffffULL,
-    PROCESS_HANDLE_GENERATION_SHIFT = 32,
-    PROCESS_HANDLE_GENERATION_MASK = 0xfffffffULL,
+    SPAWN_RESULT_TAG = 1ULL << 63,
+    SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
     SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1 << 2,
     SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1 << 3,
     BOOTSTRAP_CAP_KIND_VM_OBJECT = 2,
@@ -394,7 +383,7 @@ enum {
     VM_RIGHT_READ_MAP_GRANT = 0xD,
     EXEC_RIGHT_EXEC_GRANT = 0x3,
     EXEC_LOADER_BOOTSTRAP_MAGIC = 0x5845434C44523031ULL,
-    EXEC_LOADER_BOOTSTRAP_VERSION = 4,
+    EXEC_LOADER_BOOTSTRAP_VERSION = 2,
     EXEC_LOADER_BOOTSTRAP_FLAG_SERVICE_MODE = 1ULL << 0,
     EXEC_LOADER_SERVICE_ENDPOINT_ID = 0x93,
     EXEC_LOADER_SERVICE_REQUEST_MAGIC = 0x5845434C44535651ULL,
@@ -430,26 +419,11 @@ enum {
 };
 
 struct ipc_message { u64 status; u64 request_va; u64 reserved0; u64 reserved1; u64 reserved2; };
-enum abi_handler_result_kind {
-    ABI_HANDLER_REPLY_NOW = 1,
-    ABI_HANDLER_PENDING = 2,
-    ABI_HANDLER_EXIT_TARGET = 3,
-    ABI_HANDLER_LEGACY_NEXT_MESSAGE = 4,
-    ABI_HANDLER_WAIT_NEXT = 5,
-    ABI_HANDLER_EXIT_CURRENT = 6,
-};
-struct abi_handler_result {
-    enum abi_handler_result_kind kind;
-    u64 result;
-    u64 flags;
-    u64 principal;
-    struct ipc_message next_message;
-};
 struct trap_request {
     u64 magic; unsigned version; unsigned kind; unsigned flavor; unsigned reserved0;
     u64 caller_principal; u64 thread_id; u64 rip; u64 rsp; u64 fault_addr; u64 error_code; u64 nr; u64 args[6];
 };
-struct service_entry { u64 kind; u64 process_handle; u64 endpoint_id; u64 flags; };
+struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
 struct service_registry_page { u64 magic; u64 version; u64 entry_count; u64 reserved0; struct service_entry entries[SERVICE_REGISTRY_MAX_ENTRIES]; };
 struct fs_request_header {
     u32 magic; u16 version; u16 op; u64 request_seq; u64 object_token; u64 offset; u32 length; u32 flags;
@@ -506,7 +480,6 @@ struct fd_entry {
     u64 size;
     u32 mode_bits;
     u32 fd_flags;
-    u32 desc_flags;
     u8 object_kind;
     u8 pipe_id;
     u8 socket_connected;
@@ -520,9 +493,9 @@ struct fd_entry {
     u32 socket_remote_ip;
     char path[FS_MAX_PATH_BYTES + 1];
 };
-struct vfs_client { int active; u64 endpoint_id; u64 process_handle; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
-struct console_client { int active; int is_tty; u64 endpoint_id; u64 process_handle; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
-struct net_client_state { int active; u64 endpoint_id; u64 process_handle; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
+struct vfs_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
+struct console_client { int active; int is_tty; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
+struct net_client_state { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
 struct path_cache_entry {
     u8 used;
     u8 kind;
@@ -547,8 +520,6 @@ enum { PIPE_MAX = 8, PIPE_BUFFER_BYTES = 4096 };
 struct pipe_entry {
     u8 used;
     u8 pending_read;
-    u8 pending_write;
-    u8 pending_write_atomic;
     u16 read_refs;
     u16 write_refs;
     u64 head;
@@ -556,11 +527,7 @@ struct pipe_entry {
     u64 pending_principal;
     u64 pending_dst;
     u64 pending_len;
-    u64 pending_write_principal;
-    u64 pending_write_token;
-    u64 pending_write_len;
     u8 bytes[PIPE_BUFFER_BYTES];
-    u8 pending_write_bytes[PIPE_BUFFER_BYTES];
 };
 
 enum { FUTEX_WAITER_MAX = 32 };
@@ -594,7 +561,6 @@ struct linux_process_state {
     u64 tid;
     u64 pgid;
     u64 principal;
-    u64 target_token;
     struct fd_entry fds[32];
     u64 mmap_next_va;
     u64 brk_next_va;
@@ -625,7 +591,7 @@ struct linux_stack_t {
 struct exec_loader_config {
     u64 magic; u64 version; u64 executable_vm_token; u64 executable_file_bytes; u64 flags;
     u64 interpreter_vm_token; u64 interpreter_file_bytes; u64 bootfs_vm_token; u64 bootfs_file_bytes;
-    u64 fs_endpoint_id; u64 fs_process_handle; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_target_token;
+    u64 fs_endpoint_id; u64 fs_compat_process_slot; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_process_slot;
     u64 abi_trap_flavor; u64 abi_trap_request_page_va;
     u16 execfn_offset; u16 execfn_bytes; u16 argv_count; u16 envp_count; u16 arg_data_bytes; u16 reserved_arg0;
     u16 argv_offsets[EXECVE_MAX_ARGV]; u16 argv_bytes[EXECVE_MAX_ARGV];
@@ -647,7 +613,6 @@ struct exec_loader_service_response {
     u64 seq;
     u64 status;
     u64 child_process_slot;
-    u64 child_process_token;
 };
 
 struct bootstrap_page_descriptor { u64 source_va; u64 target_va; u64 flags; };
@@ -735,11 +700,9 @@ static struct file_cache_entry g_file_cache[FILE_CACHE_MAX];
 static u64 g_file_cache_next_offset = 0;
 static u8 g_exit_record_used[LINUX_PROCESS_MAX];
 static u64 g_exit_record_pid[LINUX_PROCESS_MAX];
-static u64 g_exit_record_principal[LINUX_PROCESS_MAX];
 static u32 g_exit_record_status[LINUX_PROCESS_MAX];
 static u8 g_deferred_start_used[LINUX_PROCESS_MAX];
 static u64 g_deferred_start_principal[LINUX_PROCESS_MAX];
-static u64 g_deferred_start_token[LINUX_PROCESS_MAX];
 static u32 g_deferred_pipe_wake_mask = 0;
 static struct pipe_entry g_pipes[PIPE_MAX];
 static struct futex_waiter g_futex_waiters[FUTEX_WAITER_MAX];
@@ -750,7 +713,6 @@ static u64 execve_main_scratch_pages = 0;
 static u64 g_exec_loader_vm_token = 0;
 static u64 g_exec_loader_exec_token = 0;
 static u64 g_exec_loader_service_slot = 0;
-static u64 g_exec_loader_service_handle = 0;
 static u64 g_exec_loader_service_request_paddr = 0;
 static u64 g_exec_loader_service_response_paddr = 0;
 static int g_exec_loader_service_connected = 0;
@@ -775,9 +737,6 @@ struct linux_abi_context {
 
 static struct linux_abi_context *g_abi_ctx = 0;
 
-static u64 target_token_for_principal(u64 principal);
-static u64 reply_trap_target(u64 principal, u64 result, u64 flags);
-
 static struct linux_process_state *abi_current_proc(void) {
     return g_abi_ctx != 0 ? g_abi_ctx->proc : 0;
 }
@@ -797,8 +756,3 @@ static void abi_set_reply_target_principal(u64 principal) {
 #define g_regions (g_proc->regions)
 #define g_cwd (g_proc->cwd)
 #define g_cwd_len (g_proc->cwd_len)
-
-static void close_all_process_fds(struct linux_process_state *proc);
-static int satisfy_pending_waiters_for_child(u64 child_slot);
-static void record_process_exit_for_principal(u64 pid, u64 principal, u32 status);
-static u64 terminate_process_for_sigpipe(u64 principal);

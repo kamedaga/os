@@ -1,7 +1,7 @@
 const process_abi = @import("process_abi.zig");
 
 pub const magic: u64 = 0x5845_434C_4452_3031; // "XECLDR01"
-pub const version: u64 = 4;
+pub const version: u64 = 1;
 pub const target_va: u64 = process_abi.standard_config_target_va;
 
 pub const Config = extern struct {
@@ -15,8 +15,8 @@ pub const Config = extern struct {
     bootfs_vm_token: u64 = 0,
     bootfs_file_bytes: u64 = 0,
     fs_endpoint_id: u64 = 0,
-    fs_process_handle: u64 = 0,
+    fs_compat_process_slot: u64 = 0,
     abi_trap_endpoint_id: u64 = 0,
-    abi_trap_endpoint_target_token: u64 = 0,
+    abi_trap_endpoint_process_slot: u64 = 0,
     abi_trap_flavor: u64 = 0,
 };
