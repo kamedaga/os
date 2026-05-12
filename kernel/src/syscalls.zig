@@ -65,6 +65,7 @@ const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_tra
 const syscall_get_memory_stats: u64 = 0x3C;
 const syscall_get_rtc_unix_time: u64 = time_abi.syscall_get_rtc_unix_time;
 const syscall_ipc_call_reply_recv: u64 = 0x40;
+const syscall_ipc_call_reply_recv_fast: u64 = 0x400;
 const syscall_set_abi_trap_delegate: u64 = trap_abi.syscall_set_abi_trap_delegate;
 const syscall_clear_abi_trap_delegate: u64 = trap_abi.syscall_clear_abi_trap_delegate;
 const syscall_map_abi_trap_reply_target_pages: u64 = trap_abi.syscall_map_abi_trap_reply_target_pages;
@@ -103,10 +104,48 @@ var sys_alloc_page_failure_log_count: u64 = 0;
 const sys_alloc_page_failure_log_limit: u64 = 64;
 var lstar_no_delegate_log_count: u64 = 0;
 const lstar_no_delegate_log_limit: u64 = 32;
+var ipc40_debug_log_count: u64 = 0;
+var ipc40_debug_trace_enabled: bool = false;
+const ipc40_debug_log_limit: u64 = 96;
 const kernel_exec_profile_slots_max: usize = 64;
 const kernel_exec_profile_lstar_delegate: u64 = 0xFFFF_FF00;
 var kernel_exec_profile_active: bool = false;
 var kernel_exec_profile_slots: [kernel_exec_profile_slots_max]KernelExecProfileSlot = [_]KernelExecProfileSlot{.{}} ** kernel_exec_profile_slots_max;
+pub export var ipc_lstar_sparse_probe_enabled: u64 = 0;
+extern var ipc_lstar_asm_fastpath_attempts: u64;
+extern var ipc_lstar_asm_fastpath_hits: u64;
+extern var ipc_lstar_asm_sparse_fallbacks: u64;
+
+const KernelIpcProfileCounters = struct {
+    lstar_entries: u64 = 0,
+    int80_entries: u64 = 0,
+    lstar_ipc40_entries: u64 = 0,
+    int80_ipc40_entries: u64 = 0,
+    lstar_delegate_known: u64 = 0,
+    lstar_delegate_generic: u64 = 0,
+    int80_delegate_known: u64 = 0,
+    int80_delegate_generic: u64 = 0,
+    ipc_slow_dispatch: u64 = 0,
+    ipc_reply_token_calls: u64 = 0,
+    ipc_signal_endpoint_calls: u64 = 0,
+    ipc_signal_endpoint_syscalls: u64 = 0,
+    wait_event_syscalls: u64 = 0,
+    wait_event_no_ipc: u64 = 0,
+    wait_event_immediate: u64 = 0,
+    wait_event_blocks: u64 = 0,
+    ipc_call_blocks: u64 = 0,
+    ipc_call_immediate: u64 = 0,
+    sparse_direct_switches: u64 = 0,
+};
+
+const kernel_ipc_profile_endpoint_slots_max: usize = 16;
+const KernelIpcProfileEndpointSlot = struct {
+    endpoint_id: u64 = 0,
+    count: u64 = 0,
+};
+
+var kernel_ipc_profile: KernelIpcProfileCounters = .{};
+var kernel_ipc_profile_signal_endpoints: [kernel_ipc_profile_endpoint_slots_max]KernelIpcProfileEndpointSlot = [_]KernelIpcProfileEndpointSlot{.{}} ** kernel_ipc_profile_endpoint_slots_max;
 
 const KernelExecProfileSlot = struct {
     nr: u64 = 0,
@@ -242,8 +281,13 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(sys_alloc_page_failure_log_count), &sys_alloc_page_failure_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lstar_no_delegate_log_count), &lstar_no_delegate_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ipc40_debug_log_count), &ipc40_debug_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ipc40_debug_trace_enabled), &ipc40_debug_trace_enabled));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_exec_profile_active), &kernel_exec_profile_active));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_exec_profile_slots), &kernel_exec_profile_slots));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ipc_lstar_sparse_probe_enabled), &ipc_lstar_sparse_probe_enabled));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_ipc_profile), &kernel_ipc_profile));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_ipc_profile_signal_endpoints), &kernel_ipc_profile_signal_endpoints));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_storage), &syscall_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled), &syscall_return_writeback_enabled));
@@ -276,6 +320,148 @@ fn setSyscallReturnWritebackEnabled(enabled: bool) void {
 
 fn currentSyscallEntryIsLstar() bool {
     return syscall_entry_is_lstars[currentCpuSlotBounded()] != 0;
+}
+
+fn printBoolAsNumber(h: *const Hooks, value: bool) void {
+    h.print_number(if (value) 1 else 0);
+}
+
+fn printByteAsBoolNumber(h: *const Hooks, value: u8) void {
+    h.print_number(if (value != 0) 1 else 0);
+}
+
+fn debugLogIpcThreadState(h: *const Hooks, label: []const u8, thread_index: usize) void {
+    h.write("Ipc40Debug.");
+    h.write(label);
+    h.write(" thread=");
+    h.print_number(@intCast(thread_index));
+    if (scheduler.getThreadContextConst(thread_index)) |ctx| {
+        h.write(" ctx_alloc=");
+        printBoolAsNumber(h, ctx.allocated);
+        h.write(" ctx_owner=");
+        h.write(h.principal_label(ctx.owner_process));
+        h.write(" ctx_ready=");
+        printBoolAsNumber(h, ctx.ready);
+        h.write(" ctx_wait_mailbox=");
+        printBoolAsNumber(h, ctx.wait_mailbox);
+        h.write(" ctx_signal=");
+        printBoolAsNumber(h, ctx.signal_pending);
+        h.write(" ctx_abi_pending=");
+        printBoolAsNumber(h, ctx.abi_trap_reply_pending);
+        h.write(" ctx_cr3=");
+        h.print_hex(ctx.cr3);
+        h.write(" ctx_reply=");
+        printBoolAsNumber(h, ctx.ipc_reply_token_valid);
+        h.write(" ctx_reply_target=");
+        h.print_number(@intCast(ctx.ipc_reply_token_target_thread));
+    } else {
+        h.write(" ctx=missing");
+    }
+    if (scheduler.getIpcHotThreadConst(thread_index)) |hot| {
+        h.write(" hot_alloc=");
+        printByteAsBoolNumber(h, hot.allocated);
+        h.write(" hot_owner=");
+        h.write(h.principal_label(hot.owner_process));
+        h.write(" hot_ready=");
+        printByteAsBoolNumber(h, hot.ready);
+        h.write(" hot_wait_mailbox=");
+        printByteAsBoolNumber(h, hot.wait_mailbox);
+        h.write(" hot_signal=");
+        printByteAsBoolNumber(h, hot.signal_pending);
+        h.write(" hot_cr3=");
+        h.print_hex(hot.cr3);
+        h.write(" hot_reply=");
+        printByteAsBoolNumber(h, hot.ipc_reply_token_valid);
+        h.write(" hot_reply_target=");
+        h.print_number(@intCast(hot.ipc_reply_token_target_thread));
+    } else {
+        h.write(" hot=missing");
+    }
+    h.write("\n");
+}
+
+fn debugLogIpc40State(
+    h: *const Hooks,
+    state: *const kernel.KernelState,
+    proc: kernel.PrincipalId,
+    tag: []const u8,
+    nr: u64,
+    endpoint_id: u64,
+    flags: u64,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+    rip: u64,
+    rsp: u64,
+) void {
+    if (!kernel_exec_profile_active) return;
+    if (!ipc40_debug_trace_enabled) return;
+    if (ipc40_debug_log_count >= ipc40_debug_log_limit) return;
+    ipc40_debug_log_count +%= 1;
+
+    const current_thread = scheduler.currentThreadIndex();
+    h.write("Ipc40Debug.");
+    h.write(tag);
+    h.write(" count=");
+    h.print_number(ipc40_debug_log_count);
+    h.write(" cpu=");
+    h.print_number(@intCast(scheduler.currentCpuSlot()));
+    h.write(" entry_lstar=");
+    printBoolAsNumber(h, currentSyscallEntryIsLstar());
+    h.write(" nr=");
+    h.print_hex(nr);
+    h.write(" proc=");
+    h.write(h.principal_label(proc));
+    h.write(" cur_thread=");
+    h.print_number(@intCast(current_thread));
+    h.write(" cur_principal=");
+    h.write(h.principal_label(scheduler.currentUserPrincipal()));
+    h.write(" cur_cr3=");
+    h.print_hex(scheduler.currentUserCr3());
+    h.write(" endpoint=");
+    h.print_hex(endpoint_id);
+    h.write(" flags=");
+    h.print_hex(flags);
+    h.write(" mr0=");
+    h.print_hex(mr0);
+    h.write(" mr1=");
+    h.print_hex(mr1);
+    h.write(" mr2=");
+    h.print_hex(mr2);
+    h.write(" mr3=");
+    h.print_hex(mr3);
+    h.write(" rip=");
+    h.print_hex(rip);
+    h.write(" rsp=");
+    h.print_hex(rsp);
+    h.write("\n");
+
+    debugLogIpcThreadState(h, "current", current_thread);
+    const target_thread = blk: {
+        if (endpoint_id == 0) {
+            const hot = scheduler.getIpcHotThreadConst(current_thread) orelse break :blk null;
+            if (hot.ipc_reply_token_valid == 0) break :blk null;
+            break :blk hot.ipc_reply_token_target_thread;
+        }
+        const target_proc = state.endpointTargetFor(proc, endpoint_id) orelse break :blk null;
+        break :blk scheduler.threadSlotForPrincipal(target_proc);
+    };
+    if (target_thread) |thread_index| {
+        debugLogIpcThreadState(h, "target", thread_index);
+    } else {
+        h.write("Ipc40Debug.target missing\n");
+    }
+}
+
+fn debugLogIpc40SparseState(
+    h: *const Hooks,
+    proc: kernel.PrincipalId,
+    tag: []const u8,
+    endpoint_id: u64,
+    save: *const IpcSignalSave,
+) void {
+    debugLogIpc40State(h, h.state, proc, tag, syscall_ipc_call_reply_recv_fast, endpoint_id, ipc_call_flag_signal_only, save.mr0, save.mr1, save.mr2, save.mr3, save.rip, save.rsp);
 }
 
 fn syscallNeedsKernelStateLock(nr: u64) bool {
@@ -368,6 +554,7 @@ fn kernelExecProfileName(nr: u64) ?[]const u8 {
     return switch (nr) {
         kernel_exec_profile_lstar_delegate => "lstar_delegate",
         syscall_ipc_call_reply_recv => "ipc_call_reply_recv",
+        syscall_ipc_call_reply_recv_fast => "ipc_call_reply_recv_fast",
         syscall_signal_endpoint => "signal_endpoint",
         syscall_wait_event => "wait_event",
         syscall_alloc_map_pages => "alloc_map_pages",
@@ -408,6 +595,14 @@ fn kernelExecProfileName(nr: u64) ?[]const u8 {
 fn kernelExecProfileReset() void {
     kernel_exec_profile_active = true;
     for (&kernel_exec_profile_slots) |*slot| slot.* = .{};
+    kernel_ipc_profile = .{};
+    for (&kernel_ipc_profile_signal_endpoints) |*slot| slot.* = .{};
+    ipc40_debug_log_count = 0;
+    ipc40_debug_trace_enabled = false;
+    ipc_lstar_sparse_probe_enabled = 1;
+    ipc_lstar_asm_fastpath_attempts = 0;
+    ipc_lstar_asm_fastpath_hits = 0;
+    ipc_lstar_asm_sparse_fallbacks = 0;
 }
 
 fn kernelExecProfileRecord(nr: u64, cycles: u64) void {
@@ -444,14 +639,71 @@ fn kernelExecProfileReport(h: *const Hooks) void {
         h.print_number(slot.max_cycles);
         h.write("\n");
     }
+    kernelIpcProfileReportCounter(h, "lstar_entries", kernel_ipc_profile.lstar_entries);
+    kernelIpcProfileReportCounter(h, "int80_entries", kernel_ipc_profile.int80_entries);
+    kernelIpcProfileReportCounter(h, "lstar_ipc40_entries", kernel_ipc_profile.lstar_ipc40_entries);
+    kernelIpcProfileReportCounter(h, "int80_ipc40_entries", kernel_ipc_profile.int80_ipc40_entries);
+    kernelIpcProfileReportCounter(h, "asm_fastpath_attempts", ipc_lstar_asm_fastpath_attempts);
+    kernelIpcProfileReportCounter(h, "asm_fastpath_hits", ipc_lstar_asm_fastpath_hits);
+    kernelIpcProfileReportCounter(h, "asm_sparse_fallbacks", ipc_lstar_asm_sparse_fallbacks);
+    kernelIpcProfileReportCounter(h, "lstar_delegate_known", kernel_ipc_profile.lstar_delegate_known);
+    kernelIpcProfileReportCounter(h, "lstar_delegate_generic", kernel_ipc_profile.lstar_delegate_generic);
+    kernelIpcProfileReportCounter(h, "int80_delegate_known", kernel_ipc_profile.int80_delegate_known);
+    kernelIpcProfileReportCounter(h, "int80_delegate_generic", kernel_ipc_profile.int80_delegate_generic);
+    kernelIpcProfileReportCounter(h, "ipc_slow_dispatch", kernel_ipc_profile.ipc_slow_dispatch);
+    kernelIpcProfileReportCounter(h, "ipc_reply_token_calls", kernel_ipc_profile.ipc_reply_token_calls);
+    kernelIpcProfileReportCounter(h, "ipc_signal_endpoint_calls", kernel_ipc_profile.ipc_signal_endpoint_calls);
+    kernelIpcProfileReportCounter(h, "ipc_signal_endpoint_syscalls", kernel_ipc_profile.ipc_signal_endpoint_syscalls);
+    kernelIpcProfileReportCounter(h, "wait_event_syscalls", kernel_ipc_profile.wait_event_syscalls);
+    kernelIpcProfileReportCounter(h, "wait_event_no_ipc", kernel_ipc_profile.wait_event_no_ipc);
+    kernelIpcProfileReportCounter(h, "wait_event_immediate", kernel_ipc_profile.wait_event_immediate);
+    kernelIpcProfileReportCounter(h, "wait_event_blocks", kernel_ipc_profile.wait_event_blocks);
+    kernelIpcProfileReportCounter(h, "ipc_call_blocks", kernel_ipc_profile.ipc_call_blocks);
+    kernelIpcProfileReportCounter(h, "ipc_call_immediate", kernel_ipc_profile.ipc_call_immediate);
+    kernelIpcProfileReportCounter(h, "sparse_direct_switches", kernel_ipc_profile.sparse_direct_switches);
+    for (&kernel_ipc_profile_signal_endpoints) |*slot| {
+        if (slot.count == 0) continue;
+        h.write("KernelExecProfile.ipc signal_endpoint_id=");
+        h.print_hex(slot.endpoint_id);
+        h.write(" count=");
+        h.print_number(slot.count);
+        h.write("\n");
+    }
     h.write("KernelExecProfile.end\n");
     kernel_exec_profile_active = false;
+    ipc_lstar_sparse_probe_enabled = 0;
+}
+
+fn kernelIpcProfileReportCounter(h: *const Hooks, name: []const u8, value: u64) void {
+    h.write("KernelExecProfile.ipc ");
+    h.write(name);
+    h.write("=");
+    h.print_number(value);
+    h.write("\n");
+}
+
+fn kernelIpcProfileRecordSignalEndpoint(endpoint_id: u64) void {
+    if (!kernel_exec_profile_active) return;
+    var empty_slot: ?*KernelIpcProfileEndpointSlot = null;
+    for (&kernel_ipc_profile_signal_endpoints) |*slot| {
+        if (slot.count != 0 and slot.endpoint_id == endpoint_id) {
+            slot.count +%= 1;
+            return;
+        }
+        if (slot.count == 0 and empty_slot == null) empty_slot = slot;
+    }
+    if (empty_slot) |slot| {
+        slot.endpoint_id = endpoint_id;
+        slot.count = 1;
+    }
 }
 
 fn kernelExecProfileObserveUserLog(h: *const Hooks, msg: []const u8) void {
     if (std.mem.startsWith(u8, msg, "LinuxAbiServer.exec_profile.begin")) {
         kernelExecProfileReset();
         h.write("KernelExecProfile.armed\n");
+    } else if (std.mem.startsWith(u8, msg, "LinuxAbiServer.exec_profile.debug")) {
+        ipc40_debug_trace_enabled = true;
     } else if (std.mem.startsWith(u8, msg, "LinuxAbiServer.perf.end")) {
         kernelExecProfileReport(h);
     }
@@ -632,12 +884,16 @@ fn dispatchIpcSyscall(
             break :blk received;
         },
         syscall_signal_endpoint => blk: {
+            if (kernel_exec_profile_active) kernel_ipc_profile.ipc_signal_endpoint_syscalls +%= 1;
             kernel_state_lock.lock();
             defer kernel_state_lock.unlock();
             break :blk signalEndpointMessage(state, proc, frame.rdi, false, 0, 0, 0, 0);
         },
         syscall_wait_event => blk: {
+            if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_syscalls +%= 1;
             const wait_mailbox = (frame.rdi & 0x1) != 0;
+            const preserve_ipc_queue = (frame.rdi & 0x2) != 0;
+            if (kernel_exec_profile_active and preserve_ipc_queue) kernel_ipc_profile.wait_event_no_ipc +%= 1;
             const timeout_ticks = frame.rsi;
             kernel_state_lock.lock();
             if (wait_mailbox) {
@@ -649,30 +905,44 @@ fn dispatchIpcSyscall(
                     },
                 };
                 if (received >= cap_transfer_abi.transfer_id_min) {
+                    if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_immediate +%= 1;
                     kernel_state_lock.unlock();
                     break :blk received;
                 }
             }
-            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+            if (!preserve_ipc_queue and consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+                if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_immediate +%= 1;
                 kernel_state_lock.unlock();
                 break :blk syscall_ok;
             }
             if (h.consume_pending_signal_for_principal(proc)) {
+                if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_immediate +%= 1;
+                kernel_state_lock.unlock();
+                break :blk syscall_ok;
+            }
+            if (preserve_ipc_queue) {
+                if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_immediate +%= 1;
                 kernel_state_lock.unlock();
                 break :blk syscall_ok;
             }
             kernel_state_lock.unlock();
+            if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_blocks +%= 1;
             if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
                 break :blk syscall_err_not_ready;
             }
             break :blk syscall_ok;
         },
-        syscall_ipc_call_reply_recv => blk: {
+        syscall_ipc_call_reply_recv, syscall_ipc_call_reply_recv_fast => blk: {
+            if (kernel_exec_profile_active) kernel_ipc_profile.ipc_slow_dispatch +%= 1;
             const endpoint_id = frame.rsi;
             const flags = frame.rdx;
             const signal_only = (flags & ipc_call_flag_signal_only) != 0;
             kernel_state_lock.lock();
+            if (currentSyscallEntryIsLstar()) {
+                debugLogIpc40State(h, state, proc, "slow.enter", frame.rax, endpoint_id, flags, frame.rdi, frame.r8, frame.r9, frame.r10, frame.rip, frame.rsp);
+            }
             if (signal_only and endpoint_id == 0) {
+                if (kernel_exec_profile_active) kernel_ipc_profile.ipc_reply_token_calls +%= 1;
                 const status = replyToCurrentIpcToken(h, frame.rdi, frame.r8, frame.r9, frame.r10);
                 if (status != syscall_ok) {
                     kernel_state_lock.unlock();
@@ -707,19 +977,26 @@ fn dispatchIpcSyscall(
                     },
                 };
                 if (received >= cap_transfer_abi.transfer_id_min) {
+                    if (kernel_exec_profile_active) kernel_ipc_profile.ipc_call_immediate +%= 1;
                     kernel_state_lock.unlock();
                     break :blk received;
                 }
             }
             if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+                if (kernel_exec_profile_active) kernel_ipc_profile.ipc_call_immediate +%= 1;
                 kernel_state_lock.unlock();
                 break :blk syscall_ok;
             }
             if (h.consume_pending_signal_for_principal(proc)) {
+                if (kernel_exec_profile_active) kernel_ipc_profile.ipc_call_immediate +%= 1;
                 kernel_state_lock.unlock();
                 break :blk syscall_ok;
             }
+            if (currentSyscallEntryIsLstar()) {
+                debugLogIpc40State(h, state, proc, "slow.block", frame.rax, endpoint_id, flags, frame.rdi, frame.r8, frame.r9, frame.r10, frame.rip, frame.rsp);
+            }
             kernel_state_lock.unlock();
+            if (kernel_exec_profile_active) kernel_ipc_profile.ipc_call_blocks +%= 1;
             if (!h.block_current_thread_for_event(frame, !signal_only, 0, syscall_ok)) {
                 break :blk syscall_err_not_ready;
             }
@@ -890,6 +1167,8 @@ fn signalEndpointMessage(
     mr2: u64,
     mr3: u64,
 ) u64 {
+    if (kernel_exec_profile_active) kernel_ipc_profile.ipc_signal_endpoint_calls +%= 1;
+    kernelIpcProfileRecordSignalEndpoint(endpoint_id);
     const target_principal = state.endpointTargetFor(owner, endpoint_id) orelse return syscall_err_endpoint;
     const target_thread = scheduler.threadSlotForPrincipal(target_principal) orelse return syscall_err_endpoint;
     return deliverOrQueueIpcMessageToThread(
@@ -968,19 +1247,53 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
 
     const proc = scheduler.currentUserPrincipal();
     const current_thread = scheduler.currentThreadIndex();
-    const current_ctx = scheduler.getThreadContext(current_thread) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
-    const target = resolveIpcSignalTargetThread(h.state, current_ctx, proc, endpoint_id) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
-    const target_ctx = scheduler.getThreadContext(target.thread_index) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
-    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
-    const target_hot = scheduler.getIpcHotThreadConst(target.thread_index) orelse return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
-    if (target_hot.allocated == 0 or target_hot.owner_process != target.principal) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
-    if (target.thread_index == current_thread) return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
-
-    const is_reply = current_hot.ipc_reply_token_valid != 0;
-    if (is_reply) {
-        if (current_hot.ipc_reply_token_target_thread != target.thread_index) {
+    debugLogIpc40SparseState(h, proc, "sparse.enter", endpoint_id, save);
+    const current_ctx = scheduler.getThreadContext(current_thread) orelse {
+        debugLogIpc40SparseState(h, proc, "sparse.return_no_current_ctx", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+    };
+    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse {
+        debugLogIpc40SparseState(h, proc, "sparse.return_no_current_hot", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+    };
+    const reply_to_token = endpoint_id == 0;
+    const target = if (reply_to_token) blk: {
+        if (current_hot.ipc_reply_token_valid == 0) {
+            debugLogIpc40SparseState(h, proc, "sparse.return_no_reply_token", endpoint_id, save);
             return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
         }
+        const reply_target_thread = current_hot.ipc_reply_token_target_thread;
+        const reply_target_ctx = scheduler.getThreadContext(reply_target_thread) orelse {
+            debugLogIpc40SparseState(h, proc, "sparse.return_no_reply_target_ctx", endpoint_id, save);
+            return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+        };
+        break :blk IpcSignalTarget{
+            .principal = reply_target_ctx.owner_process,
+            .thread_index = reply_target_thread,
+        };
+    } else resolveIpcSignalTargetThread(h.state, current_ctx, proc, endpoint_id) orelse {
+        debugLogIpc40SparseState(h, proc, "sparse.return_no_target", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    };
+    const target_ctx = scheduler.getThreadContext(target.thread_index) orelse {
+        debugLogIpc40SparseState(h, proc, "sparse.return_no_target_ctx", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    };
+    const target_hot = scheduler.getIpcHotThreadConst(target.thread_index) orelse {
+        debugLogIpc40SparseState(h, proc, "sparse.return_no_target_hot", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    };
+    if (target_hot.allocated == 0 or target_hot.owner_process != target.principal) {
+        debugLogIpc40SparseState(h, proc, "sparse.return_stale_target_hot", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_endpoint);
+    }
+    if (target.thread_index == current_thread) {
+        debugLogIpc40SparseState(h, proc, "sparse.return_self_target", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
+    }
+
+    const target_was_ready = target_hot.ready != 0;
+    const send_status = if (reply_to_token) blk: {
         scheduler.setIpcReplyTokenForThread(current_thread, false, 0);
         if ((save.mr1 & trap_abi.response_flag_exit) != 0 and
             (target_ctx.abi_trap_reply_pending or h.state.abiTrapDelegateFor(target.principal) != null))
@@ -990,23 +1303,40 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
             _ = abi_trap_runtime.reclaimPrivatePagesForProcess(h.state, target.principal);
 
             if (scheduler.dequeueIpcMessageForThread(current_thread)) |msg| {
+                debugLogIpc40SparseState(h, proc, "sparse.return_exit_queued", endpoint_id, save);
                 return writeCurrentIpcSignalQueuedReturn(out_frame, save, msg);
             }
             if (current_hot.signal_pending != 0) {
                 current_ctx.signal_pending = false;
                 scheduler.setIpcHotSignalPending(current_thread, false);
+                debugLogIpc40SparseState(h, proc, "sparse.return_exit_signal", endpoint_id, save);
                 return writeCurrentIpcSignalReturn(out_frame, save, syscall_ok);
             }
+            debugLogIpc40SparseState(h, proc, "sparse.exit_block", endpoint_id, save);
             out_frame.* = trapFrameFromIpcSignalSave(save, syscall_ok);
             if (!scheduler.blockCurrentThreadForEvent(out_frame, false, 0, syscall_ok)) {
+                debugLogIpc40SparseState(h, proc, "sparse.return_exit_block_failed", endpoint_id, save);
                 return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
             }
+            debugLogIpc40SparseState(h, proc, "sparse.return_exit_blocked", endpoint_id, save);
             return @intFromPtr(out_frame);
         }
-    }
-
-    const target_was_ready = target_hot.ready != 0;
-    const send_status = deliverOrQueueIpcMessageToThread(
+        const target_has_abi_delegate = h.state.abiTrapDelegateFor(target.principal) != null;
+        if (target_has_abi_delegate) {
+            target_ctx.abi_trap_reply_pending = true;
+        }
+        const status = deliverOrQueueIpcMessageToThread(
+            target.thread_index,
+            0,
+            current_thread,
+            false,
+            save.mr0,
+            save.mr1,
+            save.mr2,
+            save.mr3,
+        );
+        break :blk status;
+    } else deliverOrQueueIpcMessageToThread(
         target.thread_index,
         endpoint_id,
         current_thread,
@@ -1016,26 +1346,35 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
         save.mr2,
         save.mr3,
     );
-    if (send_status != syscall_ok) return writeCurrentIpcSignalReturn(out_frame, save, send_status);
+    if (send_status != syscall_ok) {
+        debugLogIpc40SparseState(h, proc, "sparse.return_send_status", endpoint_id, save);
+        return writeCurrentIpcSignalReturn(out_frame, save, send_status);
+    }
 
     if (scheduler.dequeueIpcMessageForThread(current_thread)) |msg| {
+        debugLogIpc40SparseState(h, proc, "sparse.return_queued", endpoint_id, save);
         return writeCurrentIpcSignalQueuedReturn(out_frame, save, msg);
     }
 
     if (current_hot.signal_pending != 0) {
         current_ctx.signal_pending = false;
         scheduler.setIpcHotSignalPending(current_thread, false);
+        debugLogIpc40SparseState(h, proc, "sparse.return_signal", endpoint_id, save);
         return writeCurrentIpcSignalReturn(out_frame, save, syscall_ok);
     }
 
     if (current_hot.allocated == 0) {
+        debugLogIpc40SparseState(h, proc, "sparse.return_current_freed", endpoint_id, save);
         return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
     }
     if (target_was_ready) {
+        debugLogIpc40SparseState(h, proc, "sparse.exit_block_target_ready", endpoint_id, save);
         out_frame.* = trapFrameFromIpcSignalSave(save, syscall_ok);
         if (!scheduler.blockCurrentThreadForEvent(out_frame, false, 0, syscall_ok)) {
+            debugLogIpc40SparseState(h, proc, "sparse.return_block_failed", endpoint_id, save);
             return writeCurrentIpcSignalReturn(out_frame, save, syscall_err_not_ready);
         }
+        debugLogIpc40SparseState(h, proc, "sparse.return_blocked", endpoint_id, save);
         return @intFromPtr(out_frame);
     }
 
@@ -1047,8 +1386,10 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
     scheduler.setIpcHotCr3(current_thread, scheduler.currentUserCr3());
     scheduler.setIpcHotWaitState(current_thread, false, 0, false);
 
+    debugLogIpc40SparseState(h, proc, "sparse.exit_switch", endpoint_id, save);
     _ = scheduler.setCurrentExecutionFromHotThread(target.thread_index);
     _ = scheduler.applyThreadFsBase(target.thread_index);
+    if (kernel_exec_profile_active) kernel_ipc_profile.sparse_direct_switches +%= 1;
 
     return @intFromPtr(&target_ctx.frame);
 }
@@ -1082,7 +1423,7 @@ pub export fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) c
         syscall_signal_endpoint => blk: {
             break :blk signalEndpointMessage(state, proc, arg0, false, 0, 0, 0, 0);
         },
-        syscall_ipc_call_reply_recv => blk: {
+        syscall_ipc_call_reply_recv, syscall_ipc_call_reply_recv_fast => blk: {
             const endpoint_id = arg1;
             const flags = arg2;
             const to = state.endpointTargetFor(proc, endpoint_id) orelse break :blk syscall_err_endpoint;
@@ -1143,11 +1484,17 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         const delegate_profile_start = if (kernel_exec_profile_active) readTsc() else 0;
         if (abi_delegate) |delegate| {
             if (abi_trap_runtime.dispatchKnownDelegate(state, proc, delegate, frame)) |result| {
-                if (kernel_exec_profile_active) kernelExecProfileRecord(kernel_exec_profile_lstar_delegate, readTsc() - delegate_profile_start);
+                if (kernel_exec_profile_active) {
+                    if (currentSyscallEntryIsLstar()) kernel_ipc_profile.lstar_delegate_known +%= 1 else kernel_ipc_profile.int80_delegate_known +%= 1;
+                    kernelExecProfileRecord(kernel_exec_profile_lstar_delegate, readTsc() - delegate_profile_start);
+                }
                 return result;
             }
         } else if (abi_trap_runtime.dispatchDelegate(state, proc, frame)) |result| {
-            if (kernel_exec_profile_active) kernelExecProfileRecord(kernel_exec_profile_lstar_delegate, readTsc() - delegate_profile_start);
+            if (kernel_exec_profile_active) {
+                if (currentSyscallEntryIsLstar()) kernel_ipc_profile.lstar_delegate_generic +%= 1 else kernel_ipc_profile.int80_delegate_generic +%= 1;
+                kernelExecProfileRecord(kernel_exec_profile_lstar_delegate, readTsc() - delegate_profile_start);
+            }
             return result;
         }
     }
@@ -1785,6 +2132,8 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         syscall_wait_event => {
             const wait_mailbox = (frame.rdi & 0x1) != 0;
+            const preserve_ipc_queue = (frame.rdi & 0x2) != 0;
+            if (kernel_exec_profile_active and preserve_ipc_queue) kernel_ipc_profile.wait_event_no_ipc +%= 1;
             const timeout_ticks = frame.rsi;
             if (wait_mailbox) {
                 const received = state.recvCap(proc) catch |err| switch (err) {
@@ -1795,10 +2144,13 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                     return received;
                 }
             }
-            if (consumeQueuedIpcMessageForPrincipal(proc, frame)) {
+            if (!preserve_ipc_queue and consumeQueuedIpcMessageForPrincipal(proc, frame)) {
                 return syscall_ok;
             }
             if (h.consume_pending_signal_for_principal(proc)) {
+                return syscall_ok;
+            }
+            if (preserve_ipc_queue) {
                 return syscall_ok;
             }
             if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {
@@ -1907,6 +2259,10 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
 }
 
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    if (kernel_exec_profile_active) {
+        kernel_ipc_profile.int80_entries +%= 1;
+        if (frame.rax == syscall_ipc_call_reply_recv or frame.rax == syscall_ipc_call_reply_recv_fast) kernel_ipc_profile.int80_ipc40_entries +%= 1;
+    }
     return syscallDispatchFrom(frame, currentSyscallEntryIsLstar());
 }
 
@@ -1924,6 +2280,7 @@ fn syscallLstarDelegateDispatch(frame: *TrapFrame) ?u64 {
     const proc = scheduler.currentUserPrincipal();
     const state = h.state;
     if (abi_trap_runtime.dispatchDelegate(state, proc, frame)) |result| {
+        if (kernel_exec_profile_active) kernel_ipc_profile.lstar_delegate_generic +%= 1;
         return result;
     }
     if (frame.rax >= 128 and lstar_no_delegate_log_count < lstar_no_delegate_log_limit) {
@@ -1944,6 +2301,10 @@ fn syscallLstarDelegateDispatch(frame: *TrapFrame) ?u64 {
 }
 
 pub export fn syscallLstarDispatch(frame: *TrapFrame) callconv(.c) u64 {
+    if (kernel_exec_profile_active) {
+        kernel_ipc_profile.lstar_entries +%= 1;
+        if (frame.rax == syscall_ipc_call_reply_recv or frame.rax == syscall_ipc_call_reply_recv_fast) kernel_ipc_profile.lstar_ipc40_entries +%= 1;
+    }
     if (syscallLstarDelegateDispatch(frame)) |result| return result;
     return syscallDispatchFrom(frame, false);
 }

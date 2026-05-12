@@ -44,7 +44,7 @@ struct exec_service_response {
     unsigned short op;
     unsigned int status;
     unsigned long long linux_abi_process_slot;
-    unsigned long long exec_loader_process_slot;
+    unsigned long long exec_process_slot;
 };
 
 #endif

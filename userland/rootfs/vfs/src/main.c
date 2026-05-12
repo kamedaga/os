@@ -1,5 +1,7 @@
 #include "vfs_protocol.h"
 
+#define VFS_PROFILE_READ_BULK 0
+
 enum {
     SYSCALL_ALLOC_PAGE = 0x1,
     SYSCALL_LOG = 0x9,
@@ -14,16 +16,23 @@ enum {
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_GET_MEMORY_STATS = 0x3C,
     SYSCALL_GET_RTC_UNIX_TIME = 0x3E,
+    SYSCALL_IPC_CALL_REPLY_RECV = 0x400,
+    IPC_CALL_FLAG_SIGNAL_ONLY = 0x2,
+    WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE = 0x2,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
+    PAGE_RIGHT_GRANT = 0x8,
     CAP_TRANSFER_ID_MIN = 0x1000,
     VFS_CONFIG_VA = 0x3C002000,
     VFS_REQUEST_VA = 0x26000000,
     VFS_RESPONSE_VA = 0x26001000,
     VFS_SESSION_STRIDE_BYTES = 0x2000,
     VFS_MAX_SESSIONS = 8,
+    VFS_SESSION_BULK_BASE_VA = 0x26300000,
+    VFS_BULK_PAGE_COUNT = 128,
+    VFS_BULK_BYTES = VFS_BULK_PAGE_COUNT * FS_PAGE_BYTES,
     VFS_FAT_REQUEST_VA = 0x26100000,
     VFS_FAT_RESPONSE_VA = 0x26101000,
     VFS_NET_REQUEST_VA = 0x26200000,
@@ -127,6 +136,9 @@ struct vfs_session {
     u64 response_va;
     u64 request_paddr;
     u64 response_paddr;
+    u64 bulk_paddrs[VFS_BULK_PAGE_COUNT];
+    u8 bulk_mapped;
+    u8 reserved1[7];
     u64 reply_endpoint_id;
     u64 session_nonce;
     u64 last_completed_seq;
@@ -145,6 +157,14 @@ struct vfs_backend_session {
     u64 session_nonce;
     u64 root_token;
     u64 next_seq;
+    u64 bulk_granted_paddrs[VFS_BULK_PAGE_COUNT];
+    u8 bulk_granted;
+    u8 reserved1[7];
+};
+
+struct ipc_wait_result {
+    u64 status;
+    u64 mr0;
 };
 
 struct net_request_header {
@@ -589,12 +609,31 @@ static void user_log(const char *message) {
     user_log_len(message, cstr_len(message));
 }
 
+static void user_log_dec_value(u64 value) {
+    char buf[20];
+    u64 i = sizeof(buf);
+    if (value == 0) {
+        user_log_len("0", 1);
+        return;
+    }
+    while (value != 0 && i != 0) {
+        i--;
+        buf[i] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    user_log_len(buf + i, sizeof(buf) - i);
+}
+
 static u64 session_request_va(u64 slot) {
     return VFS_REQUEST_VA + slot * VFS_SESSION_STRIDE_BYTES;
 }
 
 static u64 session_response_va(u64 slot) {
     return session_request_va(slot) + FS_PAGE_BYTES;
+}
+
+static u64 session_bulk_va(u64 slot) {
+    return VFS_SESSION_BULK_BASE_VA + slot * VFS_BULK_BYTES;
 }
 
 static struct vfs_session *find_session_by_request_paddr(u64 request_paddr) {
@@ -655,12 +694,49 @@ static u64 syscall3(u64 nr, u64 arg0, u64 arg1, u64 arg2) {
     return ret;
 }
 
+static u64 ipc_call_reply_recv_signal_only(u64 endpoint_id, u64 mr0) {
+    register u64 rax __asm__("rax") = SYSCALL_IPC_CALL_REPLY_RECV;
+    register u64 rdi __asm__("rdi") = mr0;
+    register u64 rsi __asm__("rsi") = endpoint_id;
+    register u64 rdx __asm__("rdx") = IPC_CALL_FLAG_SIGNAL_ONLY;
+    register u64 r8 __asm__("r8") = 0;
+    register u64 r9 __asm__("r9") = 0;
+    register u64 r10 __asm__("r10") = 0;
+    __asm__ volatile(
+        "syscall"
+        : "+r"(rax), "+r"(rdi), "+r"(rsi), "+r"(rdx), "+r"(r8), "+r"(r9), "+r"(r10)
+        :
+        : "rcx", "r11", "memory");
+    return rax;
+}
+
+static struct ipc_wait_result wait_event_message(u64 wait_mailbox, u64 timeout_ticks) {
+    register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT;
+    register u64 rdi __asm__("rdi") = wait_mailbox;
+    register u64 rsi __asm__("rsi") = timeout_ticks;
+    register u64 rdx __asm__("rdx") = 0;
+    register u64 r8 __asm__("r8") = 0;
+    __asm__ volatile(
+        "int $0x80"
+        : "+r"(rax), "+r"(rdi), "+r"(rsi), "=r"(rdx), "=r"(r8)
+        :
+        : "rcx", "r9", "r10", "r11", "memory");
+    struct ipc_wait_result result;
+    result.status = rax;
+    result.mr0 = rdi;
+    return result;
+}
+
 static u64 wait_event(void) {
-    return syscall2(SYSCALL_WAIT_EVENT, 1, 1);
+    return wait_event_message(1, 1).status;
 }
 
 static u64 wait_event_poll(void) {
-    return syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    static u64 iteration = 0;
+    const u64 current = iteration++;
+    for (u64 i = 0; i < 256; i++) __asm__ volatile("pause" ::: "memory");
+    if ((current & 0x3f) == 0x3f) return syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    return syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, 1);
 }
 
 static void clear_page(u64 va) {
@@ -724,6 +800,61 @@ static void copy_from_volatile(volatile u8 *dst, const volatile u8 *src, u64 byt
         :
         : "memory");
 }
+
+static int ensure_session_bulk_pages(struct vfs_session *session, const volatile struct fs_request_header *request) {
+    const u64 page_count = request->flags;
+    if (page_count == 0 || page_count > VFS_BULK_PAGE_COUNT) return 0;
+    if (request->inline_bytes != page_count * sizeof(u64)) return 0;
+    const volatile u64 *paddrs = (const volatile u64 *)(session->request_va + FS_REQUEST_HEADER_BYTES);
+    const u64 base_va = session_bulk_va(session_slot(session));
+    for (u64 i = 0; i < page_count; i++) {
+        const u64 paddr = paddrs[i];
+        if (paddr < FS_PAGE_BYTES) return 0;
+        if (!session->bulk_mapped || session->bulk_paddrs[i] != paddr) {
+            if (syscall3(SYSCALL_MAP_PAGE, base_va + i * FS_PAGE_BYTES, paddr, 1) != SYSCALL_OK) return 0;
+            session->bulk_paddrs[i] = paddr;
+        }
+    }
+    session->bulk_mapped = 1;
+    return 1;
+}
+
+static void write_bulk_response(u16 op, u64 seq, i32 status, u64 file_bytes, u64 cursor_next, u8 object_kind, u64 bytes) {
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_session->response_va;
+    response->magic = FS_RESPONSE_MAGIC;
+    response->version = FS_PROTOCOL_VERSION;
+    response->op = op;
+    response->status = status;
+    response->result_flags = 0;
+    response->result_token = 0;
+    response->file_bytes = file_bytes;
+    response->cursor_next = cursor_next;
+    response->inline_bytes = 0;
+    response->object_kind = object_kind;
+    response->reserved0 = 0;
+    response->reserved1 = 0;
+    response->arg0 = bytes;
+    response->arg1 = 0;
+    __asm__ volatile("" ::: "memory");
+    response->response_seq = seq;
+    if (g_session->reply_endpoint_id != 0) {
+        (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, g_session->reply_endpoint_id, 0);
+    }
+}
+
+static int backend_request(
+    u16 op,
+    u64 backend_token,
+    u64 offset,
+    u32 length,
+    u32 flags,
+    const volatile u8 *path,
+    u16 path_bytes,
+    const volatile u8 *inline_payload,
+    u16 inline_bytes
+);
+static int grant_backend_page(u64 paddr, u64 rights);
+static int ensure_backend_bulk_grants(const volatile u64 *paddrs, u64 page_count, u64 *new_grants_out);
 
 static u64 token_from_object_id(u64 object_id) {
     return VFS_TOKEN_TAG | object_id;
@@ -1932,6 +2063,165 @@ static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
     write_response(FS_OP_READ, seq, FS_STATUS_NOT_FOUND, 0, 0, offset, FS_OBJECT_NONE, 0);
 }
 
+static void reply_read_bulk_local(u64 seq, u64 token, u64 offset, u32 length, const volatile struct fs_request_header *request) {
+    clear_page(g_session->response_va);
+    if (!ensure_session_bulk_pages(g_session, request)) {
+        write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_NONE, 0);
+        return;
+    }
+    if (length > VFS_BULK_BYTES) length = VFS_BULK_BYTES;
+    volatile u8 *bulk = (volatile u8 *)session_bulk_va(session_slot(g_session));
+    const u64 object_id = object_id_from_token(token);
+    if (object_id == VFS_DEV_NULL_OPEN_OBJECT_ID) {
+        write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, 0, offset, FS_OBJECT_OPEN_FILE, 0);
+        return;
+    }
+    if (object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID) {
+        for (u32 i = 0; i < length; i++) bulk[i] = 0;
+        write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, 0, offset + length, FS_OBJECT_OPEN_FILE, length);
+        return;
+    }
+    if (object_id == VFS_DEV_RANDOM_OPEN_OBJECT_ID || object_id == VFS_DEV_URANDOM_OPEN_OBJECT_ID) {
+        if (!fill_random_bytes(bulk, (u16)(length > 0xffff ? 0xffff : length))) {
+            write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_IO_ERROR, 0, offset, FS_OBJECT_OPEN_FILE, 0);
+            return;
+        }
+        const u64 bytes = length > 0xffff ? 0xffff : length;
+        write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, ~0ULL, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+        return;
+    }
+    u64 proc_bytes = 0;
+    const char *proc_content = proc_content_from_object_id(object_id, &proc_bytes);
+    if (proc_content != 0) {
+        u32 bytes = 0;
+        if (offset < proc_bytes) {
+            const u64 remaining = proc_bytes - offset;
+            bytes = (u32)(remaining < length ? remaining : length);
+            for (u32 i = 0; i < bytes; i++) bulk[i] = (u8)proc_content[offset + i];
+        }
+        write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, proc_bytes, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+        return;
+    }
+    const u64 tmpfs_index = tmpfs_index_from_open_object_id(object_id);
+    if (tmpfs_index < VFS_TMPFS_MAX_FILES && g_tmpfs_files[tmpfs_index].used) {
+        struct vfs_tmpfs_file *file = &g_tmpfs_files[tmpfs_index];
+        u32 bytes = 0;
+        if (offset < file->size) {
+            const u64 remaining = file->size - offset;
+            bytes = (u32)(remaining < length ? remaining : length);
+            for (u32 i = 0; i < bytes; i++) bulk[i] = tmpfs_read_byte(tmpfs_index, offset + i);
+        }
+        write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, file->size, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+        return;
+    }
+    write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_NOT_FOUND, 0, offset, FS_OBJECT_NONE, 0);
+}
+
+static void forward_backend_read_bulk(u64 client_seq, u64 backend_token, u64 offset, u32 length, u32 flags, const volatile struct fs_request_header *request) {
+    (void)flags;
+    const u64 total_start_tick = VFS_PROFILE_READ_BULK ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+    clear_page(g_session->response_va);
+    const u64 page_count = request->flags;
+    if (page_count == 0 || page_count > VFS_BULK_PAGE_COUNT || request->inline_bytes != page_count * sizeof(u64)) {
+        write_bulk_response(FS_OP_READ_BULK, client_seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_NONE, 0);
+        return;
+    }
+    if (length > VFS_BULK_BYTES) length = VFS_BULK_BYTES;
+    const volatile u8 *bulk_payload = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES);
+    const volatile u64 *paddrs = (const volatile u64 *)bulk_payload;
+    u64 new_grants = 0;
+    const u64 grant_start_tick = VFS_PROFILE_READ_BULK ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+    const int grants_ok = ensure_backend_bulk_grants(paddrs, page_count, &new_grants);
+    const u64 grant_ticks = VFS_PROFILE_READ_BULK ? syscall0(SYSCALL_GET_TICK_COUNT) - grant_start_tick : 0;
+    u64 backend_ticks = 0;
+    if (grants_ok)
+    {
+        const u64 backend_start_tick = VFS_PROFILE_READ_BULK ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+        const int backend_ok = backend_request(FS_OP_READ_BULK, backend_token, offset, length, (u32)page_count, (const volatile u8 *)0, 0, bulk_payload, request->inline_bytes);
+        backend_ticks = VFS_PROFILE_READ_BULK ? syscall0(SYSCALL_GET_TICK_COUNT) - backend_start_tick : 0;
+        if (backend_ok) {
+            volatile struct fs_response_header *backend = (volatile struct fs_response_header *)g_root_backend.response_va;
+            const u64 bytes = backend->arg0;
+            if (bytes <= length && bytes <= VFS_BULK_BYTES) {
+                if (VFS_PROFILE_READ_BULK) {
+                    const u64 total_ticks = syscall0(SYSCALL_GET_TICK_COUNT) - total_start_tick;
+                    user_log("RootVfs.prof.read_bulk seq=");
+                    user_log_dec_value(client_seq);
+                    user_log(" pages=");
+                    user_log_dec_value(page_count);
+                    user_log(" len=");
+                    user_log_dec_value(length);
+                    user_log(" bytes=");
+                    user_log_dec_value(bytes);
+                    user_log(" total=");
+                    user_log_dec_value(total_ticks);
+                    user_log(" cap_grant=");
+                    user_log_dec_value(grant_ticks);
+                    user_log(" backend=");
+                    user_log_dec_value(backend_ticks);
+                    user_log(" new_grants=");
+                    user_log_dec_value(new_grants);
+                    user_log(" fallback=0\n");
+                }
+                write_bulk_response(FS_OP_READ_BULK, client_seq, backend->status, backend->file_bytes, backend->cursor_next, backend->object_kind, bytes);
+                return;
+            }
+        }
+    }
+
+    if (!ensure_session_bulk_pages(g_session, request)) {
+        write_bulk_response(FS_OP_READ_BULK, client_seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_NONE, 0);
+        return;
+    }
+    volatile u8 *bulk = (volatile u8 *)session_bulk_va(session_slot(g_session));
+    u64 copied = 0;
+    u64 file_bytes = 0;
+    i32 status = FS_STATUS_OK;
+    while (copied < length) {
+        const u32 chunk = (u32)(((u64)(length - copied) < FS_RESPONSE_PAYLOAD_BYTES) ? (length - copied) : FS_RESPONSE_PAYLOAD_BYTES);
+        if (!backend_request(FS_OP_READ, backend_token, offset + copied, chunk, 0, (const volatile u8 *)0, 0, (const volatile u8 *)0, 0)) {
+            status = FS_STATUS_IO_ERROR;
+            break;
+        }
+        volatile struct fs_response_header *backend = (volatile struct fs_response_header *)g_root_backend.response_va;
+        file_bytes = backend->file_bytes;
+        if (backend->status != FS_STATUS_OK) {
+            status = backend->status;
+            break;
+        }
+        if (backend->inline_bytes == 0) break;
+        if (backend->inline_bytes > FS_RESPONSE_PAYLOAD_BYTES || copied + backend->inline_bytes > VFS_BULK_BYTES) {
+            status = FS_STATUS_INVALID;
+            break;
+        }
+        const volatile u8 *src = (const volatile u8 *)(g_root_backend.response_va + FS_RESPONSE_HEADER_BYTES);
+        copy_from_volatile(bulk + copied, src, backend->inline_bytes);
+        copied += backend->inline_bytes;
+        if (backend->inline_bytes < chunk) break;
+    }
+    if (VFS_PROFILE_READ_BULK) {
+        const u64 total_ticks = syscall0(SYSCALL_GET_TICK_COUNT) - total_start_tick;
+        user_log("RootVfs.prof.read_bulk seq=");
+        user_log_dec_value(client_seq);
+        user_log(" pages=");
+        user_log_dec_value(page_count);
+        user_log(" len=");
+        user_log_dec_value(length);
+        user_log(" bytes=");
+        user_log_dec_value(copied);
+        user_log(" total=");
+        user_log_dec_value(total_ticks);
+        user_log(" cap_grant=");
+        user_log_dec_value(grant_ticks);
+        user_log(" backend=");
+        user_log_dec_value(backend_ticks);
+        user_log(" new_grants=");
+        user_log_dec_value(new_grants);
+        user_log(" fallback=1\n");
+    }
+    write_bulk_response(FS_OP_READ_BULK, client_seq, status, file_bytes, offset + copied, FS_OBJECT_OPEN_FILE, copied);
+}
+
 static void reply_write(u64 seq, u64 token, u64 offset, u32 length, const volatile u8 *payload, u16 inline_bytes) {
     const u64 object_id = object_id_from_token(token);
     if (!is_open_file_object_id(object_id)) {
@@ -2124,6 +2414,31 @@ static int grant_backend_response_page(void) {
     return ret == SYSCALL_OK;
 }
 
+static int grant_backend_page(u64 paddr, u64 rights) {
+    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, paddr, g_root_backend.endpoint_id, rights);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_backend_endpoint()) {
+        ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, paddr, g_root_backend.endpoint_id, rights);
+    }
+    return ret == SYSCALL_OK;
+}
+
+static int ensure_backend_bulk_grants(const volatile u64 *paddrs, u64 page_count, u64 *new_grants_out) {
+    if (page_count == 0 || page_count > VFS_BULK_PAGE_COUNT) return 0;
+    if (new_grants_out != 0) *new_grants_out = 0;
+    for (u64 i = 0; i < page_count; i++) {
+        const u64 paddr = paddrs[i];
+        if (paddr < FS_PAGE_BYTES) return 0;
+        if (!g_root_backend.bulk_granted || g_root_backend.bulk_granted_paddrs[i] != paddr) {
+            if (!grant_backend_page(paddr, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE)) return 0;
+            g_root_backend.bulk_granted_paddrs[i] = paddr;
+            if (new_grants_out != 0) (*new_grants_out)++;
+        }
+    }
+    g_root_backend.bulk_granted = 1;
+    return 1;
+}
+
 static int share_backend_request_page(void) {
     u64 ret = syscall2(SYSCALL_SHARE_CAP, g_root_backend.request_paddr, g_root_backend.endpoint_id);
     if (ret == SYSCALL_OK) return 1;
@@ -2134,10 +2449,10 @@ static int share_backend_request_page(void) {
 }
 
 static int signal_backend(void) {
-    u64 ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_root_backend.endpoint_id, 0);
+    u64 ret = ipc_call_reply_recv_signal_only(g_root_backend.endpoint_id, g_root_backend.request_paddr);
     if (ret == SYSCALL_OK) return 1;
     if (ret == SYSCALL_ERR_ENDPOINT && install_backend_endpoint()) {
-        ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_root_backend.endpoint_id, 0);
+        ret = ipc_call_reply_recv_signal_only(g_root_backend.endpoint_id, g_root_backend.request_paddr);
     }
     return ret == SYSCALL_OK;
 }
@@ -2718,6 +3033,21 @@ static void handle_fs_request(void) {
             );
         } else if (is_open_file_token(request->object_token)) reply_read(seq, request->object_token, request->offset, request->length);
         else reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
+    } else if (request->op == FS_OP_READ_BULK) {
+        if (is_backend_token(request->object_token)) {
+            forward_backend_read_bulk(
+                seq,
+                unwrap_backend_token(request->object_token),
+                request->offset,
+                request->length,
+                request->flags,
+                request
+            );
+        } else if (is_open_file_token(request->object_token)) {
+            reply_read_bulk_local(seq, request->object_token, request->offset, request->length, request);
+        } else {
+            reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
+        }
     } else if (request->op == FS_OP_WRITE) {
         if (is_backend_token(request->object_token)) {
             const volatile u8 *payload = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES + request->path_bytes);
@@ -2882,12 +3212,21 @@ void rootfs_vfs_main(void) {
         user_log("RootVfs: net backend missing\n");
     }
     for (;;) {
-        const u64 received = wait_event();
-        if (received >= CAP_TRANSFER_ID_MIN) handle_connect_transfer(received);
-        for (u64 i = 0; i < VFS_MAX_SESSIONS; i++) {
-            if (!g_sessions[i].active) continue;
-            g_session = &g_sessions[i];
-            handle_fs_request();
+        const struct ipc_wait_result received = wait_event_message(1, 1);
+        if (received.status >= CAP_TRANSFER_ID_MIN) {
+            handle_connect_transfer(received.status);
+        } else if (received.status == SYSCALL_OK && received.mr0 >= FS_PAGE_BYTES) {
+            struct vfs_session *session = find_session_by_request_paddr(received.mr0);
+            if (session != 0) {
+                g_session = session;
+                handle_fs_request();
+            }
+        } else {
+            for (u64 i = 0; i < VFS_MAX_SESSIONS; i++) {
+                if (!g_sessions[i].active) continue;
+                g_session = &g_sessions[i];
+                handle_fs_request();
+            }
         }
     }
 }

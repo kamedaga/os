@@ -32,8 +32,12 @@ enum {
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     IPC_CALL_FLAG_SIGNAL_ONLY = 0x2,
+    WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE = 0x2,
 
     PAGE_BYTES = 4096,
+    PAGE_RIGHT_CPU_READ = 0x1,
+    PAGE_RIGHT_CPU_WRITE = 0x2,
+    PAGE_RIGHT_GRANT = 0x8,
     SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
     SERVICE_REGISTRY_VERSION = 1,
@@ -49,10 +53,14 @@ enum {
     FS_REQUEST_HEADER_BYTES = 72,
     FS_RESPONSE_HEADER_BYTES = 72,
     FS_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - FS_RESPONSE_HEADER_BYTES,
+    FS_BULK_READ_INITIAL_PAGE_COUNT = 16,
+    FS_BULK_READ_PAGE_COUNT = 128,
+    FS_BULK_READ_BYTES = FS_BULK_READ_PAGE_COUNT * PAGE_BYTES,
     FS_OP_CONNECT = 1,
     FS_OP_LOOKUP = 16,
     FS_OP_OPEN = 17,
     FS_OP_READ = 18,
+    FS_OP_READ_BULK = 27,
     FS_OP_CLOSE = 21,
     FS_STATUS_OK = 0,
     FS_OBJECT_NONE = 0,
@@ -72,9 +80,9 @@ enum {
 
     PROCESS_STANDARD_CONFIG_TARGET_VA = 0x3C002000,
     PROCESS_SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
-    EXEC_LOADER_BOOTSTRAP_MAGIC = 0x5845434C44523031ULL,
-    EXEC_LOADER_BOOTSTRAP_VERSION = 2,
-    EXEC_LOADER_CONFIG_TARGET_VA = 0x3C002000,
+    EXEC_BOOTSTRAP_MAGIC = 0x45584543424F4F54ULL,
+    EXEC_BOOTSTRAP_VERSION = 2,
+    EXEC_BOOTSTRAP_TARGET_VA = 0x3C002000,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
     LINUX_ABI_BOOTSTRAP_VERSION = 2,
     LINUX_ABI_BOOTSTRAP_READY = 0x4C414249524459ULL,
@@ -87,7 +95,7 @@ enum {
 
     SCRATCH_APP_IMAGE_VA = 0x26000000,
     SCRATCH_LD_IMAGE_VA = 0x26200000,
-    SCRATCH_EXEC_LOADER_IMAGE_VA = 0x26400000,
+    SCRATCH_EXEC_IMAGE_VA = 0x26400000,
     SCRATCH_LINUX_ABI_IMAGE_VA = 0x26600000,
     SCRATCH_EXEC_CONFIG_VA = 0x26800000,
     SCRATCH_EXEC_TABLE_VA = 0x26801000,
@@ -96,6 +104,7 @@ enum {
     SCRATCH_REGISTRY_COPY_VA = 0x26804000,
     SCRATCH_REQUEST_MAP_BASE_VA = 0x26900000,
     SCRATCH_RESPONSE_MAP_BASE_VA = 0x26910000,
+    SCRATCH_VFS_BULK_VA = 0x26A00000,
     MAX_APP_IMAGE_BYTES = 2 * 1024 * 1024,
     MAX_LD_IMAGE_BYTES = 768 * 1024,
     MAX_SERVICE_IMAGE_BYTES = 256 * 1024,
@@ -111,8 +120,20 @@ struct fs_response_header {
     u32 magic; u16 version; u16 op; u64 response_seq; i32 status; u32 result_flags; u64 result_token;
     u64 file_bytes; u64 cursor_next; u16 inline_bytes; u8 object_kind; u8 reserved0; u32 reserved1; u64 arg0; u64 arg1;
 };
-struct vfs_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
-struct exec_loader_config {
+struct vfs_client {
+    int active;
+    u64 endpoint_id;
+    u64 process_slot;
+    u64 request_paddr;
+    u64 response_paddr;
+    u64 bulk_paddrs[FS_BULK_READ_PAGE_COUNT];
+    u16 bulk_page_count;
+    u8 reserved0[6];
+    u64 root_token;
+    u64 next_seq;
+    u64 session_nonce;
+};
+struct exec_bootstrap_config {
     u64 magic; u64 version; u64 executable_vm_token; u64 executable_file_bytes; u64 flags;
     u64 interpreter_vm_token; u64 interpreter_file_bytes; u64 bootfs_vm_token; u64 bootfs_file_bytes;
     u64 fs_endpoint_id; u64 fs_compat_process_slot; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_process_slot;
@@ -132,7 +153,7 @@ struct bootstrap_descriptor_table {
 struct linux_abi_bootstrap_config {
     u64 magic;
     u64 version;
-    u64 exec_loader_vm_token;
+    u64 exec_vm_token;
     u64 standard_interpreter_vm_token;
     u64 standard_interpreter_file_bytes;
     u64 abi_trap_request_page_va;
@@ -144,8 +165,8 @@ struct linux_abi_bootstrap_config {
 
 static struct vfs_client g_vfs;
 static int scratch_ready = 0;
-static u64 g_loader_exec_token = 0;
-static u64 g_loader_vm_token = 0;
+static u64 g_exec_program_token = 0;
+static u64 g_exec_vm_token = 0;
 static u64 g_linux_abi_exec_token = 0;
 static u64 g_ld_vm_token = 0;
 static u64 g_ld_bytes = 0;
@@ -208,7 +229,33 @@ static u64 make_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u6
     return nonce == 0 ? 1 : nonce;
 }
 static int install_vfs_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_vfs.endpoint_id, g_vfs.process_slot) == SYSCALL_OK; }
-static int grant_vfs_response_page(void) { u64 ret = syscall3(0x24, g_vfs.response_paddr, g_vfs.endpoint_id, 3); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall3(0x24, g_vfs.response_paddr, g_vfs.endpoint_id, 3); return ret == SYSCALL_OK; }
+static int grant_vfs_page(u64 paddr, u64 rights) { u64 ret = syscall3(0x24, paddr, g_vfs.endpoint_id, rights); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall3(0x24, paddr, g_vfs.endpoint_id, rights); return ret == SYSCALL_OK; }
+static int grant_vfs_response_page(void) { return grant_vfs_page(g_vfs.response_paddr, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE); }
+static u64 vfs_bulk_page_count_for_length(u32 length) {
+    u64 page_count = (length + PAGE_BYTES - 1) / PAGE_BYTES;
+    if (page_count > FS_BULK_READ_PAGE_COUNT) page_count = FS_BULK_READ_PAGE_COUNT;
+    if (page_count > FS_BULK_READ_INITIAL_PAGE_COUNT) {
+        u64 cap = g_vfs.bulk_page_count;
+        if (cap == 0) cap = FS_BULK_READ_INITIAL_PAGE_COUNT;
+        else if (cap < FS_BULK_READ_PAGE_COUNT) cap *= 2;
+        if (cap > FS_BULK_READ_PAGE_COUNT) cap = FS_BULK_READ_PAGE_COUNT;
+        if (page_count > cap) page_count = cap;
+    }
+    return page_count;
+}
+
+static int ensure_vfs_bulk_pages(u64 page_count) {
+    if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
+    for (u64 i = g_vfs.bulk_page_count; i < page_count; i++) {
+        const u64 paddr = syscall0(SYSCALL_ALLOC_PAGE);
+        if (paddr < 0x1000) return 0;
+        if (!map_page(SCRATCH_VFS_BULK_VA + i * PAGE_BYTES, paddr, 1)) return 0;
+        if (!grant_vfs_page(paddr, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT)) return 0;
+        g_vfs.bulk_paddrs[i] = paddr;
+        g_vfs.bulk_page_count = (u16)(i + 1);
+    }
+    return 1;
+}
 static int share_vfs_request_page(void) { u64 ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id); if (ret == SYSCALL_OK) return 1; if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id); return ret == SYSCALL_OK; }
 static int signal_vfs(void) {
     u64 ret = ipc_call_reply_recv_signal_only(g_vfs.endpoint_id);
@@ -222,7 +269,16 @@ static int signal_vfs(void) {
     if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall2(SYSCALL_SIGNAL_ENDPOINT, g_vfs.endpoint_id, 0);
     return ret == SYSCALL_OK;
 }
-static int wait_vfs_response(u64 expected_seq, u16 expected_op) { volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA; for (u64 i = 0; i < 8192; i++) { if (response->response_seq == expected_seq) return response->magic == FS_RESPONSE_MAGIC && response->version == FS_PROTOCOL_VERSION && response->op == expected_op; (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1); } return 0; }
+static void wait_response_poll(u64 iteration) {
+    for (u64 i = 0; i < 256; i++) __asm__ volatile("pause" ::: "memory");
+    if ((iteration & 0x3f) == 0x3f) {
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    } else {
+        (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, 1);
+    }
+}
+
+static int wait_vfs_response(u64 expected_seq, u16 expected_op) { volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA; for (u64 i = 0; i < 65536; i++) { if (response->response_seq == expected_seq) return response->magic == FS_RESPONSE_MAGIC && response->version == FS_PROTOCOL_VERSION && response->op == expected_op; wait_response_poll(i); } return 0; }
 
 static int connect_vfs_from_registry(void) {
     if (g_vfs.active) return 1;
@@ -269,6 +325,33 @@ static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *pa
     return wait_vfs_response(seq, op);
 }
 
+static int vfs_read_bulk_to_buffer(u64 token, u64 offset, u32 length, u64 dst_va, u64 *bytes_out) {
+    *bytes_out = 0;
+    if (length == 0) return 1;
+    if (length > FS_BULK_READ_BYTES) length = FS_BULK_READ_BYTES;
+    const u64 page_count = vfs_bulk_page_count_for_length(length);
+    if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
+    length = (u32)(page_count * PAGE_BYTES);
+    if (!ensure_vfs_bulk_pages(page_count)) return 0;
+    clear_page(VFS_REQUEST_VA); clear_page(VFS_RESPONSE_VA);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
+    const u64 seq = g_vfs.next_seq++;
+    request->magic = FS_REQUEST_MAGIC; request->version = FS_PROTOCOL_VERSION; request->op = FS_OP_READ_BULK; request->object_token = token; request->offset = offset; request->length = length; request->flags = (u32)page_count; request->inline_bytes = (u16)(page_count * sizeof(u64)); request->session_nonce = g_vfs.session_nonce;
+    volatile u64 *payload = (volatile u64 *)(VFS_REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+    for (u64 i = 0; i < page_count; i++) payload[i] = g_vfs.bulk_paddrs[i];
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    if (!signal_vfs()) return 0;
+    if (!wait_vfs_response(seq, FS_OP_READ_BULK)) return 0;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    if (response->status != FS_STATUS_OK) return 0;
+    const u64 bytes = response->arg0;
+    if (bytes > length || bytes > FS_BULK_READ_BYTES) return 0;
+    copy_from_volatile((u8 *)dst_va, (const volatile u8 *)SCRATCH_VFS_BULK_VA, bytes);
+    *bytes_out = bytes;
+    return 1;
+}
+
 static int vfs_lookup_file_token(const char *path, u16 path_len, u64 *token_out, u64 *file_bytes_out) {
     if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path, path_len)) { user_log("ExecService: vfs lookup request failed\n"); return 0; }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
@@ -298,8 +381,14 @@ static int vfs_read_open_file_to_buffer(u64 open_token, u64 file_bytes, u64 buff
     u64 copied = 0;
     int ok = 1;
     while (copied < file_bytes) {
-        const u64 chunk = min_u64(file_bytes - copied, FS_RESPONSE_PAYLOAD_BYTES);
-        if (!vfs_request(FS_OP_READ, open_token, copied, (u32)chunk, 0, 0)) { user_log("ExecService: vfs read request failed\n"); ok = 0; break; }
+        const u64 chunk = min_u64(file_bytes - copied, FS_BULK_READ_BYTES);
+        u64 bulk_bytes = 0;
+        if (vfs_read_bulk_to_buffer(open_token, copied, (u32)chunk, buffer_va + copied, &bulk_bytes) && bulk_bytes != 0) {
+            copied += bulk_bytes;
+            continue;
+        }
+        const u64 fallback_chunk = min_u64(file_bytes - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        if (!vfs_request(FS_OP_READ, open_token, copied, (u32)fallback_chunk, 0, 0)) { user_log("ExecService: vfs read request failed\n"); ok = 0; break; }
         volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
         if (response->status != FS_STATUS_OK || response->inline_bytes == 0) { user_log("ExecService: vfs read chunk failed\n"); ok = 0; break; }
         volatile u8 *src = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
@@ -337,7 +426,7 @@ static int ensure_scratch(void) {
     if (scratch_ready) return 1;
     if (!alloc_map_range_self(SCRATCH_APP_IMAGE_VA, MAX_APP_IMAGE_BYTES / PAGE_BYTES)) return 0;
     if (!alloc_map_range_self(SCRATCH_LD_IMAGE_VA, MAX_LD_IMAGE_BYTES / PAGE_BYTES)) return 0;
-    if (!alloc_map_range_self(SCRATCH_EXEC_LOADER_IMAGE_VA, MAX_SERVICE_IMAGE_BYTES / PAGE_BYTES)) return 0;
+    if (!alloc_map_range_self(SCRATCH_EXEC_IMAGE_VA, MAX_SERVICE_IMAGE_BYTES / PAGE_BYTES)) return 0;
     if (!alloc_map_range_self(SCRATCH_LINUX_ABI_IMAGE_VA, MAX_SERVICE_IMAGE_BYTES / PAGE_BYTES)) return 0;
     if (!alloc_map_range_self(SCRATCH_EXEC_CONFIG_VA, 1)) return 0;
     if (!alloc_map_range_self(SCRATCH_EXEC_TABLE_VA, 1)) return 0;
@@ -369,7 +458,7 @@ static u64 load_exec_image(const char *path, u16 path_len, u64 buffer_va, u64 bu
     return exec_token;
 }
 
-static int append_arg(struct exec_loader_config *cfg, u16 *cursor, const char *data, u16 len, u16 *offset_out, u16 *bytes_out) {
+static int append_arg(struct exec_bootstrap_config *cfg, u16 *cursor, const char *data, u16 len, u16 *offset_out, u16 *bytes_out) {
     if (len == 0 || (u64)*cursor + len > EXECVE_MAX_ARG_DATA_BYTES) return 0;
     const u16 off = *cursor;
     for (u16 i = 0; i < len; i++) cfg->arg_data[off + i] = (u8)data[i];
@@ -380,7 +469,7 @@ static int append_arg(struct exec_loader_config *cfg, u16 *cursor, const char *d
     return 1;
 }
 
-static int configure_exec_args(struct exec_loader_config *cfg, const struct exec_service_request *request) {
+static int configure_exec_args(struct exec_bootstrap_config *cfg, const struct exec_service_request *request) {
     const char *arg_data = (const char *)request->arg_data;
     u16 cursor = 0;
     if (!append_arg(cfg, &cursor, arg_data, request->path_bytes, &cfg->execfn_offset, &cfg->execfn_bytes)) return 0;
@@ -425,8 +514,8 @@ static u64 start_linux_abi_server(const struct exec_service_request *request, vo
     table->page_descriptors[0].flags = SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE;
     table->page_descriptors[1].source_va = SCRATCH_REGISTRY_COPY_VA;
     table->page_descriptors[1].target_va = PROCESS_SERVICE_REGISTRY_SHADOW_VA;
-    table->cap_descriptors[0].source_token = g_loader_vm_token;
-    table->cap_descriptors[0].target_token_va = PROCESS_STANDARD_CONFIG_TARGET_VA + OFFSETOF(struct linux_abi_bootstrap_config, exec_loader_vm_token);
+    table->cap_descriptors[0].source_token = g_exec_vm_token;
+    table->cap_descriptors[0].target_token_va = PROCESS_STANDARD_CONFIG_TARGET_VA + OFFSETOF(struct linux_abi_bootstrap_config, exec_vm_token);
     table->cap_descriptors[0].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[0].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
     table->cap_descriptors[1].source_token = g_ld_vm_token;
@@ -445,16 +534,16 @@ static int wait_linux_abi_server_ready(volatile struct linux_abi_bootstrap_confi
     if (cfg == 0) return 0;
     for (u64 i = 0; i < 100000000; i++) {
         if (cfg->status == LINUX_ABI_BOOTSTRAP_READY) return 1;
-        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+        wait_response_poll(i);
     }
     return 0;
 }
 
-static u64 spawn_exec_loader(const struct exec_service_request *request, u64 app_vm_token, u64 app_bytes, u64 abi_server_slot) {
-    struct exec_loader_config *cfg = (struct exec_loader_config *)SCRATCH_EXEC_CONFIG_VA;
+static u64 spawn_exec_process(const struct exec_service_request *request, u64 app_vm_token, u64 app_bytes, u64 abi_server_slot) {
+    struct exec_bootstrap_config *cfg = (struct exec_bootstrap_config *)SCRATCH_EXEC_CONFIG_VA;
     clear_page(SCRATCH_EXEC_CONFIG_VA);
-    cfg->magic = EXEC_LOADER_BOOTSTRAP_MAGIC;
-    cfg->version = EXEC_LOADER_BOOTSTRAP_VERSION;
+    cfg->magic = EXEC_BOOTSTRAP_MAGIC;
+    cfg->version = EXEC_BOOTSTRAP_VERSION;
     cfg->executable_file_bytes = app_bytes;
     cfg->interpreter_file_bytes = g_ld_bytes;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
@@ -470,19 +559,19 @@ static u64 spawn_exec_loader(const struct exec_service_request *request, u64 app
     table->page_count = 1;
     table->cap_count = 2;
     table->page_descriptors[0].source_va = SCRATCH_EXEC_CONFIG_VA;
-    table->page_descriptors[0].target_va = EXEC_LOADER_CONFIG_TARGET_VA;
+    table->page_descriptors[0].target_va = EXEC_BOOTSTRAP_TARGET_VA;
     table->cap_descriptors[0].source_token = app_vm_token;
-    table->cap_descriptors[0].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, executable_vm_token);
+    table->cap_descriptors[0].target_token_va = EXEC_BOOTSTRAP_TARGET_VA + OFFSETOF(struct exec_bootstrap_config, executable_vm_token);
     table->cap_descriptors[0].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[0].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
     table->cap_descriptors[1].source_token = g_ld_vm_token;
-    table->cap_descriptors[1].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, interpreter_vm_token);
+    table->cap_descriptors[1].target_token_va = EXEC_BOOTSTRAP_TARGET_VA + OFFSETOF(struct exec_bootstrap_config, interpreter_vm_token);
     table->cap_descriptors[1].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[1].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
-    return decode_spawned_process_slot(syscall4(SYSCALL_SPAWN_EXEC, g_loader_exec_token, SCRATCH_EXEC_TABLE_VA, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER));
+    return decode_spawned_process_slot(syscall4(SYSCALL_SPAWN_EXEC, g_exec_program_token, SCRATCH_EXEC_TABLE_VA, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER));
 }
 
-static void write_response(u64 response_paddr, u32 status, u64 abi_slot, u64 loader_slot) {
+static void write_response(u64 response_paddr, u32 status, u64 abi_slot, u64 exec_slot) {
     const u64 response_va = response_map_next;
     response_map_next += PAGE_BYTES;
     if (!map_page(response_va, response_paddr, 1)) return;
@@ -492,7 +581,7 @@ static void write_response(u64 response_paddr, u32 status, u64 abi_slot, u64 loa
     response->op = EXEC_SERVICE_OP_SPAWN_LINUX;
     response->status = status;
     response->linux_abi_process_slot = abi_slot;
-    response->exec_loader_process_slot = loader_slot;
+    response->exec_process_slot = exec_slot;
 }
 
 static void handle_request_paddr(u64 request_paddr) {
@@ -514,7 +603,7 @@ static void handle_request_paddr(u64 request_paddr) {
     }
 
     user_log("ExecService: spawn request\n");
-    if (g_loader_exec_token == 0 && !init_assets()) {
+    if (g_exec_program_token == 0 && !init_assets()) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_IO, 0, 0);
         return;
     }
@@ -551,24 +640,24 @@ static void handle_request_paddr(u64 request_paddr) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, 0, 0);
         return;
     }
-    const u64 loader_slot = spawn_exec_loader(request, app_vm_token, app_bytes, abi_slot);
-    if (loader_slot == 0) {
+    const u64 exec_slot = spawn_exec_process(request, app_vm_token, app_bytes, abi_slot);
+    if (exec_slot == 0) {
         write_response(request->response_paddr, EXEC_SERVICE_STATUS_SPAWN_FAILED, abi_slot, 0);
         return;
     }
     user_log("ExecService: spawn ok\n");
-    write_response(request->response_paddr, EXEC_SERVICE_STATUS_OK, abi_slot, loader_slot);
+    write_response(request->response_paddr, EXEC_SERVICE_STATUS_OK, abi_slot, exec_slot);
 }
 
 static int init_assets(void) {
-    if (g_loader_exec_token != 0 && g_linux_abi_exec_token != 0 && g_ld_vm_token != 0) return 1;
+    if (g_exec_program_token != 0 && g_linux_abi_exec_token != 0 && g_ld_vm_token != 0) return 1;
     if (!ensure_scratch()) return 0;
     if (!connect_vfs_from_registry()) return 0;
-    user_log("ExecService: load exec_loader begin\n");
+    user_log("ExecService: load exec begin\n");
     u64 bytes = 0;
-    g_loader_exec_token = load_exec_image("/srv/exec_loader.elf", 20, SCRATCH_EXEC_LOADER_IMAGE_VA, MAX_SERVICE_IMAGE_BYTES, &g_loader_vm_token, &bytes);
-    if (g_loader_exec_token == 0) return 0;
-    user_log("ExecService: load exec_loader ok\n");
+    g_exec_program_token = load_exec_image("/srv/exec.elf", 13, SCRATCH_EXEC_IMAGE_VA, MAX_SERVICE_IMAGE_BYTES, &g_exec_vm_token, &bytes);
+    if (g_exec_program_token == 0) return 0;
+    user_log("ExecService: load exec ok\n");
     user_log("ExecService: load linux_abi_server begin\n");
     g_linux_abi_exec_token = load_exec_image("/srv/linux_abi_server.elf", 25, SCRATCH_LINUX_ABI_IMAGE_VA, MAX_SERVICE_IMAGE_BYTES, 0, &bytes);
     if (g_linux_abi_exec_token == 0) return 0;

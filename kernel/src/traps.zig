@@ -53,6 +53,9 @@ pub export var user_return_iret_frames_by_cpu: [smp.max_cpus][8]u64 align(16) = 
 pub export var syscall_entry_user_rsps: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
 pub export var syscall_entry_saved_r15s: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
 pub export var syscall_entry_is_lstars: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
+pub export var ipc_lstar_asm_fastpath_attempts: u64 = 0;
+pub export var ipc_lstar_asm_fastpath_hits: u64 = 0;
+pub export var ipc_lstar_asm_sparse_fallbacks: u64 = 0;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -83,6 +86,9 @@ const runtime_storage_ptrs = .{
     &syscall_entry_user_rsps,
     &syscall_entry_saved_r15s,
     &syscall_entry_is_lstars,
+    &ipc_lstar_asm_fastpath_attempts,
+    &ipc_lstar_asm_fastpath_hits,
+    &ipc_lstar_asm_sparse_fallbacks,
     &user_return_saved_r10,
     &user_return_saved_gprs,
     &user_return_iret_frame,
@@ -123,6 +129,7 @@ extern var current_thread_indices: [smp.max_cpus]usize;
 extern var thread_contexts_ptr: *anyopaque;
 extern var ipc_hot_threads_ptr: *anyopaque;
 extern var endpoint_generation_fast_mirror: u64;
+extern var ipc_lstar_sparse_probe_enabled: u64;
 extern var lapic_tick_count: u64;
 extern var user_return_saved_r10: u64;
 extern var user_return_saved_gprs: [15]u64 align(16);
@@ -230,6 +237,25 @@ fn asmCopyStackFrameToWorkFramePointer(comptime qword_count: usize) []const u8 {
         \\rep movsq
         \\
     , .{qword_count});
+}
+
+fn asmCopyFramePointerToWorkFrameOnKernelStack(
+    comptime frame_reg: []const u8,
+    comptime work_frame_symbol: []const u8,
+    comptime cpu_slot: usize,
+    comptime qword_count: usize,
+) []const u8 {
+    return std.fmt.comptimePrint(
+        \\
+        \\mov {s}, %r12
+        \\mov kernel_syscall_stack_tops+{d}(%rip), %rsp
+        \\lea {s}(%rip), %rdi
+        \\mov %r12, %rsi
+        \\mov ${d}, %ecx
+        \\cld
+        \\rep movsq
+        \\
+    , .{ frame_reg, cpu_slot * @sizeOf(u64), work_frame_symbol, qword_count });
 }
 
 fn asmCallAligned(comptime target: []const u8) []const u8 {
@@ -392,6 +418,7 @@ fn asmIpcCallReplyRecvSignalOnlyNoCr3(
     return std.fmt.comptimePrint(
         \\
         \\27:
+        \\incq ipc_lstar_asm_fastpath_attempts(%rip)
         \\test $2, %rdx
         \\jz 28f
         \\sub $32, %rsp
@@ -519,12 +546,14 @@ fn asmIpcCallReplyRecvSignalOnlyNoCr3(
         \\mov 24(%rsp), %r9
         \\mov %r9, {d}(%rax)
         \\add $32, %rsp
+        \\incq ipc_lstar_asm_fastpath_hits(%rip)
         \\push %rax
     ++ asmCallAligned("schedulerSyncBootstrapCurrentStateFromMirrorFromAsm") ++
         \\pop %rax
         \\lea {d}(%rax), %rsp
         \\jmp 273f
         \\270:
+        \\incq ipc_lstar_asm_sparse_fallbacks(%rip)
         \\mov 0(%rsp), %rdi
         \\mov 8(%rsp), %r8
         \\mov 16(%rsp), %r9
@@ -574,6 +603,44 @@ fn asmIpcCallReplyRecvSignalOnlyNoCr3(
         @offsetOf(scheduler.ThreadContext, "frame"),
         user_rsp_symbol,
     });
+}
+
+fn asmIpcCallReplyRecvSignalOnlySparseOnlyNoCr3(comptime user_rsp_symbol: []const u8, comptime entry_is_lstar_symbol: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\
+        \\26:
+        \\movq $1, {s}(%rip)
+        \\test $2, %rdx
+        \\jz 29f
+        \\cmp $2, %rdx
+        \\jne 29f
+        \\incq ipc_lstar_asm_sparse_fallbacks(%rip)
+        \\sub $264, %rsp
+        \\mov %r15, 160(%rsp)
+        \\mov %r14, 168(%rsp)
+        \\mov %r13, 176(%rsp)
+        \\mov %r12, 184(%rsp)
+        \\mov %rbp, 192(%rsp)
+        \\mov %rbx, 200(%rsp)
+        \\mov %rcx, 208(%rsp)
+        \\mov %r11, 216(%rsp)
+        \\mov {s}(%rip), %r11
+        \\mov %r11, 224(%rsp)
+        \\mov %rdi, 232(%rsp)
+        \\mov %r8, 240(%rsp)
+        \\mov %r9, 248(%rsp)
+        \\mov %r10, 256(%rsp)
+        \\mov %rsp, %r15
+        \\mov %rsi, %rcx
+        \\lea 160(%r15), %rdx
+        \\mov %r15, %r8
+        \\and $-16, %rsp
+        \\sub $32, %rsp
+        \\call syscallIpcCallReplyRecvSignalOnlySparse
+        \\mov %rax, %rsp
+        \\jmp 274f
+        \\
+    , .{ entry_is_lstar_symbol, user_rsp_symbol });
 }
 
 fn asmStageUserReturnFromWorkFrame(comptime work_frame_symbol: []const u8, comptime iret_offset: usize) []const u8 {
@@ -1191,10 +1258,16 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
     const user_cr3_symbol = lstarUserCr3Symbol(cpu_slot);
     const writeback_symbol = lstarReturnWritebackSymbol(cpu_slot);
     const entry_is_lstar_symbol = lstarEntryIsLstarSymbol(cpu_slot);
-    // LSTAR is also the Linux ABI syscall entry. Do not pre-dispatch raw
-    // syscall numbers here: Linux recvfrom/sendmsg are 0x2d/0x2e and must
-    // reach the ABI delegate before any CapabilityOS syscall fast path.
+    // LSTAR is also the Linux ABI syscall entry. Keep CapabilityOS IPC on the
+    // Zig slow path until the asm direct-switch invariants are proven safe.
+    // Route only the explicit 0x400 probe syscall into the sparse C path so
+    // the direct asm hot-mirror mutation remains disabled while its
+    // invariants are investigated.
     const slowpath_gate =
+        \\cmp $0x400, %rax
+        \\jne 29f
+        \\cmpq $0, ipc_lstar_sparse_probe_enabled(%rip)
+        \\jne 26f
         \\jmp 29f
         \\
     ;
@@ -1237,7 +1310,10 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
             \\mov {s}(%rip), %rsp
             \\sysretq
             \\24:
-        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
+        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlySparseOnlyNoCr3(user_rsp_symbol, entry_is_lstar_symbol) ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++
+            \\274:
+            \\
+        ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyFramePointerToWorkFrameOnKernelStack("%rsp", work_frame_symbol, cpu_slot, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\
         ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
@@ -1321,7 +1397,10 @@ fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, compti
             \\mov {s}(%rip), %rsp
             \\sysretq
             \\24:
-        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
+        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlySparseOnlyNoCr3(user_rsp_symbol, entry_is_lstar_symbol) ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++
+            \\274:
+            \\
+        ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyFramePointerToWorkFrameOnKernelStack("%rsp", work_frame_symbol, cpu_slot, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\
         ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++

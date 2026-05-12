@@ -182,10 +182,15 @@ static int console_take_tty_signal(u64 *signo_out) {
     return 1;
 }
 
-static void poll_tty_signal_events(void) {
+static int poll_tty_signal_events(void) {
+    static u64 next_poll_tick = 0;
+    const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (now < next_poll_tick) return 0;
+    next_poll_tick = now + 4;
     for (;;) {
         u64 signo = 0;
-        if (!console_take_tty_signal(&signo) || signo == 0) return;
+        if (!console_take_tty_signal(&signo) || signo == 0) return 1;
+        next_poll_tick = now;
         deliver_tty_signal(signo);
     }
 }

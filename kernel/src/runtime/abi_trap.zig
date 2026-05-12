@@ -687,7 +687,7 @@ fn deliverDelegateRequestLocked(
     }
 
     current_ctx.abi_trap_reply_pending = true;
-    if (scheduler.ipcQueueLenForThread(target_thread) >= delegate_transport_queue_limit) {
+    if (scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true) >= delegate_transport_queue_limit) {
         if (scheduler.enqueueDelegateSendPending(target_thread, delegate.endpoint_id, current_thread, delegate.request_page_va)) {
             if (dispatch_delegate_backpressure_log_count < dispatch_delegate_backpressure_log_limit) {
                 h.write("abi dispatch backpressure proc=");
@@ -698,6 +698,8 @@ fn deliverDelegateRequestLocked(
                 h.print_number(@intCast(target_thread));
                 h.write(" qlen=");
                 h.print_number(@intCast(scheduler.ipcQueueLenForThread(target_thread)));
+                h.write(" delegate_qlen=");
+                h.print_number(@intCast(scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true)));
                 h.write(" pending=");
                 h.print_number(@intCast(scheduler.delegateSendPendingLenForThread(target_thread)));
                 h.write("\n");
@@ -734,6 +736,8 @@ fn deliverDelegateRequestLocked(
                 h.print_number(@intCast(target_thread));
                 h.write(" qlen=");
                 h.print_number(@intCast(scheduler.ipcQueueLenForThread(target_thread)));
+                h.write(" delegate_qlen=");
+                h.print_number(@intCast(scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true)));
                 h.write(" pending=");
                 h.print_number(@intCast(scheduler.delegateSendPendingLenForThread(target_thread)));
                 h.write("\n");
@@ -752,6 +756,8 @@ fn deliverDelegateRequestLocked(
             h.print_number(@intCast(target_thread));
             h.write(" qlen=");
             h.print_number(@intCast(scheduler.ipcQueueLenForThread(target_thread)));
+            h.write(" delegate_qlen=");
+            h.print_number(@intCast(scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true)));
             h.write(" pending=");
             h.print_number(@intCast(scheduler.delegateSendPendingLenForThread(target_thread)));
             h.write("\n");

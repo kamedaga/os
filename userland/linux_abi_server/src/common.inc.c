@@ -44,13 +44,16 @@ enum {
     SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET = 0x5A,
     SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES = 0x5B,
     SYSCALL_OK = 0,
+    SYSCALL_ERR_NOT_READY = 2,
     SYSCALL_ERR_MAP = 5,
     SYSCALL_ERR_ENDPOINT = 9,
     IPC_CALL_FLAG_SIGNAL_ONLY = 0x2,
+    WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE = 0x2,
 
     PAGE_BYTES = 4096,
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
+    PAGE_RIGHT_GRANT = 0x8,
     TRAP_MAGIC = 0x3149424150415254ULL,
     TRAP_VERSION = 1,
 
@@ -69,6 +72,7 @@ enum {
     CONSOLE_RESPONSE_VA = 0x2B011000,
     NET_REQUEST_VA = 0x2B020000,
     NET_RESPONSE_VA = 0x2B021000,
+    VFS_BULK_VA = 0x2B040000,
     FS_REQUEST_MAGIC = 0x51534653,
     FS_RESPONSE_MAGIC = 0x52534653,
     FS_PROTOCOL_VERSION = 1,
@@ -76,6 +80,9 @@ enum {
     FS_REQUEST_HEADER_BYTES = 72,
     FS_RESPONSE_HEADER_BYTES = 72,
     FS_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - FS_RESPONSE_HEADER_BYTES,
+    FS_BULK_READ_INITIAL_PAGE_COUNT = 16,
+    FS_BULK_READ_PAGE_COUNT = 128,
+    FS_BULK_READ_BYTES = FS_BULK_READ_PAGE_COUNT * PAGE_BYTES,
     FS_STAT_RECORD_BYTES = 56,
     FS_DIRENT_RECORD_BYTES = 24,
     FS_OP_CONNECT = 1,
@@ -89,6 +96,7 @@ enum {
     FS_OP_WRITE = 23,
     FS_OP_UNLINK = 24,
     FS_OP_RENAME = 25,
+    FS_OP_READ_BULK = 27,
     FS_OP_OPEN_EXEC = 32,
     FS_STATUS_OK = 0,
     FS_STATUS_INVALID = 1,
@@ -382,19 +390,19 @@ enum {
     VM_RIGHT_READ_MAP = 0x5,
     VM_RIGHT_READ_MAP_GRANT = 0xD,
     EXEC_RIGHT_EXEC_GRANT = 0x3,
-    EXEC_LOADER_BOOTSTRAP_MAGIC = 0x5845434C44523031ULL,
-    EXEC_LOADER_BOOTSTRAP_VERSION = 2,
-    EXEC_LOADER_BOOTSTRAP_FLAG_SERVICE_MODE = 1ULL << 0,
-    EXEC_LOADER_SERVICE_ENDPOINT_ID = 0x93,
-    EXEC_LOADER_SERVICE_REQUEST_MAGIC = 0x5845434C44535651ULL,
-    EXEC_LOADER_SERVICE_RESPONSE_MAGIC = 0x5845434C44535652ULL,
-    EXEC_LOADER_SERVICE_VERSION = 1,
-    EXEC_LOADER_SERVICE_OP_LAUNCH = 1,
-    EXEC_LOADER_SERVICE_STATUS_OK = 0,
+    EXEC_BOOTSTRAP_MAGIC = 0x45584543424F4F54ULL,
+    EXEC_BOOTSTRAP_VERSION = 2,
+    EXEC_BOOTSTRAP_FLAG_SERVICE_MODE = 1ULL << 0,
+    EXEC_LAUNCH_ENDPOINT_ID = 0x93,
+    EXEC_LAUNCH_REQUEST_MAGIC = 0x4558454353565251ULL,
+    EXEC_LAUNCH_RESPONSE_MAGIC = 0x4558454353565252ULL,
+    EXEC_LAUNCH_VERSION = 1,
+    EXEC_LAUNCH_OP_START = 1,
+    EXEC_LAUNCH_STATUS_OK = 0,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
     LINUX_ABI_BOOTSTRAP_VERSION = 2,
     LINUX_ABI_BOOTSTRAP_READY = 0x4C414249524459ULL,
-    EXEC_LOADER_CONFIG_TARGET_VA = 0x3C002000,
+    EXEC_BOOTSTRAP_TARGET_VA = 0x3C002000,
     LINUX_ABI_CONFIG_TARGET_VA = 0x3C002000,
     LINUX_ABI_ENDPOINT_ID = 0x90,
     LINUX_ABI_SELF_WAKE_ENDPOINT_ID = 0x91,
@@ -402,10 +410,10 @@ enum {
     EXECVE_LD_IMAGE_VA = 0x26200000,
     EXECVE_CONFIG_VA = 0x26400000,
     EXECVE_TABLE_VA = 0x26401000,
-    EXECVE_LOADER_REQUEST_VA = 0x26402000,
-    EXECVE_LOADER_RESPONSE_VA = 0x26403000,
-    EXECVE_LOADER_SERVICE_CONFIG_VA = 0x26404000,
-    EXECVE_LOADER_SERVICE_TABLE_VA = 0x26405000,
+    EXECVE_EXEC_REQUEST_VA = 0x26402000,
+    EXECVE_EXEC_RESPONSE_VA = 0x26403000,
+    EXECVE_EXEC_SERVICE_CONFIG_VA = 0x26404000,
+    EXECVE_EXEC_SERVICE_TABLE_VA = 0x26405000,
     LINUX_ABI_REQUEST_PAGES_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
     FILE_CACHE_BASE_VA = 0x28000000,
@@ -493,7 +501,19 @@ struct fd_entry {
     u32 socket_remote_ip;
     char path[FS_MAX_PATH_BYTES + 1];
 };
-struct vfs_client { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 root_token; u64 next_seq; u64 session_nonce; };
+struct vfs_client {
+    int active;
+    u64 endpoint_id;
+    u64 process_slot;
+    u64 request_paddr;
+    u64 response_paddr;
+    u64 bulk_paddrs[FS_BULK_READ_PAGE_COUNT];
+    u16 bulk_page_count;
+    u8 reserved0[6];
+    u64 root_token;
+    u64 next_seq;
+    u64 session_nonce;
+};
 struct console_client { int active; int is_tty; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
 struct net_client_state { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
 struct path_cache_entry {
@@ -541,7 +561,7 @@ struct futex_waiter {
 enum { EXEC_CACHE_MAX = 16 };
 struct exec_cache_entry {
     u8 used;
-    u8 loader_service_cached;
+    u8 exec_service_cached;
     u16 path_len;
     u64 vm_token;
     u64 file_bytes;
@@ -574,6 +594,7 @@ struct linux_process_state {
     u64 wait_status_va;
     u64 clear_child_tid;
     u8 profile_enabled;
+    u8 profile_verbose_enabled;
     u64 sigaltstack_sp;
     u64 sigaltstack_size;
     u32 sigaltstack_flags;
@@ -588,7 +609,7 @@ struct linux_stack_t {
     u64 ss_size;
 };
 
-struct exec_loader_config {
+struct exec_bootstrap_config {
     u64 magic; u64 version; u64 executable_vm_token; u64 executable_file_bytes; u64 flags;
     u64 interpreter_vm_token; u64 interpreter_file_bytes; u64 bootfs_vm_token; u64 bootfs_file_bytes;
     u64 fs_endpoint_id; u64 fs_compat_process_slot; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_process_slot;
@@ -598,15 +619,15 @@ struct exec_loader_config {
     u16 envp_offsets[EXECVE_MAX_ENVP]; u16 envp_bytes[EXECVE_MAX_ENVP];
     u8 arg_data[EXECVE_MAX_ARG_DATA_BYTES];
 };
-struct exec_loader_service_request {
+struct exec_launch_request {
     u64 magic;
     u64 version;
     u64 op;
     u64 seq;
     u64 response_paddr;
-    struct exec_loader_config config;
+    struct exec_bootstrap_config config;
 };
-struct exec_loader_service_response {
+struct exec_launch_response {
     u64 magic;
     u64 version;
     u64 op;
@@ -625,7 +646,7 @@ struct bootstrap_descriptor_table {
 struct linux_abi_bootstrap_config {
     u64 magic;
     u64 version;
-    u64 exec_loader_vm_token;
+    u64 exec_vm_token;
     u64 standard_interpreter_vm_token;
     u64 standard_interpreter_file_bytes;
     u64 abi_trap_request_page_va;
@@ -650,6 +671,10 @@ struct linux_abi_profile {
     u64 vfs_wait_loops;
     u64 vfs_wait_timeouts;
     u64 vfs_wait_slow;
+    u64 vfs_bulk_cap_pages;
+    u64 vfs_bulk_cap_ticks;
+    u64 vfs_bulk_request_ticks;
+    u64 vfs_bulk_copy_ticks;
     u64 fs_read_bytes;
     u64 fs_read_cmd_bytes;
     u64 fs_read_lib_bytes;
@@ -701,22 +726,24 @@ static u64 g_file_cache_next_offset = 0;
 static u8 g_exit_record_used[LINUX_PROCESS_MAX];
 static u64 g_exit_record_pid[LINUX_PROCESS_MAX];
 static u32 g_exit_record_status[LINUX_PROCESS_MAX];
+static u64 g_next_linux_pid = 100;
 static u8 g_deferred_start_used[LINUX_PROCESS_MAX];
 static u64 g_deferred_start_principal[LINUX_PROCESS_MAX];
 static u32 g_deferred_pipe_wake_mask = 0;
 static struct pipe_entry g_pipes[PIPE_MAX];
 static struct futex_waiter g_futex_waiters[FUTEX_WAITER_MAX];
+static int g_profile_trace_verbose = 0;
 static u8 g_request_page_mapped[LINUX_ABI_REQUEST_PAGE_COUNT];
 static int execve_scratch_ready = 0;
-static int execve_loader_service_scratch_ready = 0;
+static int execve_exec_service_scratch_ready = 0;
 static u64 execve_main_scratch_pages = 0;
-static u64 g_exec_loader_vm_token = 0;
-static u64 g_exec_loader_exec_token = 0;
-static u64 g_exec_loader_service_slot = 0;
-static u64 g_exec_loader_service_request_paddr = 0;
-static u64 g_exec_loader_service_response_paddr = 0;
-static int g_exec_loader_service_connected = 0;
-static u64 g_exec_loader_service_seq = 1;
+static u64 g_exec_vm_token = 0;
+static u64 g_exec_program_token = 0;
+static u64 g_exec_service_slot = 0;
+static u64 g_exec_launch_request_paddr = 0;
+static u64 g_exec_launch_response_paddr = 0;
+static int g_exec_service_connected = 0;
+static u64 g_exec_service_seq = 1;
 static u64 g_standard_interpreter_vm_token = 0;
 static u64 g_standard_interpreter_bytes = 0;
 static struct exec_cache_entry g_exec_cache[EXEC_CACHE_MAX];

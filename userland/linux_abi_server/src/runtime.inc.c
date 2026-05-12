@@ -35,7 +35,51 @@ static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { u64 ret; __asm__ v
 static u64 syscall4_r10(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { register u64 r10 __asm__("r10") = a3; u64 ret; __asm__ volatile("int $0x80" : "=a"(ret), "+r"(r10) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r11", "memory"); return ret; }
 static void process_exit(u64 code) { (void)syscall2(SYSCALL_PROCESS_EXIT, code, 0); for (;;) __asm__ volatile("pause"); }
 
+static int profile_trace_enabled(void) {
+    if (g_profile_trace_verbose) return 1;
+    return g_proc != 0 && g_proc->profile_verbose_enabled != 0;
+}
+
+static void profile_trace_prefix(const char *event) {
+    user_log("LinuxAbiServer.trace tick=");
+    user_log_dec_value(syscall0(SYSCALL_GET_TICK_COUNT));
+    user_log(" event=");
+    user_log(event);
+    if (g_proc != 0) {
+        user_log(" pid=");
+        user_log_dec_value(g_proc->pid);
+        user_log(" principal=");
+        user_log_dec_value(g_proc->principal);
+    }
+}
+
+static void profile_trace_event_u64(const char *event, u64 value) {
+    if (!profile_trace_enabled()) return;
+    profile_trace_prefix(event);
+    user_log(" value=");
+    user_log_dec_value(value);
+    user_log("\n");
+}
+
+static void profile_trace_syscall_span(u64 nr, u64 principal, u64 start_tick, u64 end_tick) {
+    if (!profile_trace_enabled()) return;
+    user_log("LinuxAbiServer.trace tick=");
+    user_log_dec_value(end_tick);
+    user_log(" event=syscall.done nr=");
+    user_log_dec_value(nr);
+    user_log(" principal=");
+    user_log_dec_value(principal);
+    user_log(" dt=");
+    user_log_dec_value(end_tick - start_tick);
+    user_log("\n");
+}
+
 static void wait_without_consuming_ipc(void) {
+    for (u64 i = 0; i < 4096; i++) __asm__ volatile("pause");
+    (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, 1);
+}
+
+static void wait_without_consuming_ipc_no_switch(void) {
     const u64 start = syscall0(SYSCALL_GET_TICK_COUNT);
     for (;;) {
         for (u64 i = 0; i < 256; i++) __asm__ volatile("pause");
@@ -49,22 +93,29 @@ static struct ipc_message wait_ipc(void) {
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
 
+static struct ipc_message wait_ipc_timeout(u64 timeout_ticks) {
+    register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 0; register u64 rsi __asm__("rsi") = timeout_ticks; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
+    __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "=r"(rdx), "=r"(r8) : : "rcx", "r9", "r10", "r11", "memory");
+    struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
+}
+
+static struct ipc_message reply_current_token(u64 result, u64 flags) {
+    register u64 rax __asm__("rax") = SYSCALL_IPC_CALL_REPLY_RECV; register u64 rdi __asm__("rdi") = result; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx") = IPC_CALL_FLAG_SIGNAL_ONLY; register u64 r8 __asm__("r8") = flags; register u64 r9 __asm__("r9") = 0; register u64 r10 __asm__("r10") = 0;
+    __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "+r"(rdx), "+r"(r8), "+r"(r9), "+r"(r10) : : "rcx", "r11", "memory");
+    struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
+}
+
 static struct ipc_message reply(u64 result, u64 flags) {
     const u64 explicit_target = abi_reply_target_principal();
     if (explicit_target != 0) {
         const u64 target = explicit_target;
         abi_set_reply_target_principal(0);
         const u64 status = syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, target, result, flags);
-        (void)syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN);
-        if (status != SYSCALL_OK) {
-            user_log("LinuxAbiServer: explicit reply failed=");
-            user_log_hex_value(status);
-        }
-        return wait_ipc();
+        if (status == SYSCALL_OK) (void)syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN);
+        else return reply_current_token(result, flags);
+        return wait_ipc_timeout(1);
     }
-    register u64 rax __asm__("rax") = SYSCALL_IPC_CALL_REPLY_RECV; register u64 rdi __asm__("rdi") = result; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx") = IPC_CALL_FLAG_SIGNAL_ONLY; register u64 r8 __asm__("r8") = flags; register u64 r9 __asm__("r9") = 0; register u64 r10 __asm__("r10") = 0;
-    __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "+r"(rdx), "+r"(r8), "+r"(r9), "+r"(r10) : : "rcx", "r11", "memory");
-    struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
+    return reply_current_token(result, flags);
 }
 
 static u64 errno_noent(void) { return (u64)(i64)-2; }
@@ -302,6 +353,15 @@ static void profile_report_and_reset(void) {
     user_log("LinuxAbiServer.perf.begin exec=");
     user_log(g_exec_path);
     user_log("\n");
+    if (!profile_trace_enabled()) {
+        user_log_dec_line("LinuxAbiServer.perf.summary.syscalls=", g_prof.syscall_total);
+        user_log_dec_line("LinuxAbiServer.perf.summary.vfs_requests=", g_prof.vfs_requests);
+        user_log_dec_line("LinuxAbiServer.perf.summary.fs_read_bytes=", g_prof.fs_read_bytes);
+        user_log_dec_line("LinuxAbiServer.perf.summary.path_misses=", g_prof.path_cache_misses);
+        user_log("LinuxAbiServer.perf.end\n");
+        profile_clear();
+        return;
+    }
     user_log_dec_line("LinuxAbiServer.perf.syscalls.total=", g_prof.syscall_total);
     profile_print_syscall("read", LINUX_SYS_READ);
     profile_print_syscall("write", LINUX_SYS_WRITE);
@@ -339,6 +399,7 @@ static void profile_report_and_reset(void) {
     profile_print_fs_op("lookup", FS_OP_LOOKUP);
     profile_print_fs_op("open", FS_OP_OPEN);
     profile_print_fs_op("read", FS_OP_READ);
+    profile_print_fs_op("read_bulk", FS_OP_READ_BULK);
     profile_print_fs_op("readdir", FS_OP_READDIR);
     profile_print_fs_op("stat", FS_OP_STAT);
     profile_print_fs_op("close", FS_OP_CLOSE);
@@ -352,6 +413,10 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.vfs.wait_loops=", g_prof.vfs_wait_loops);
     user_log_dec_line("LinuxAbiServer.perf.vfs.wait_slow=", g_prof.vfs_wait_slow);
     user_log_dec_line("LinuxAbiServer.perf.vfs.wait_timeouts=", g_prof.vfs_wait_timeouts);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_cap_pages=", g_prof.vfs_bulk_cap_pages);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_cap_ticks=", g_prof.vfs_bulk_cap_ticks);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_request_ticks=", g_prof.vfs_bulk_request_ticks);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_copy_ticks=", g_prof.vfs_bulk_copy_ticks);
 
     user_log_dec_line("LinuxAbiServer.perf.fs.read_bytes=", g_prof.fs_read_bytes);
     user_log_dec_line("LinuxAbiServer.perf.fs.read_cmd_bytes=", g_prof.fs_read_cmd_bytes);

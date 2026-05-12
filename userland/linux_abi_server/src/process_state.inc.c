@@ -43,6 +43,7 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->wait_status_va = 0;
     proc->clear_child_tid = 0;
     proc->profile_enabled = 0;
+    proc->profile_verbose_enabled = 0;
     proc->sigaltstack_sp = 0;
     proc->sigaltstack_size = 0;
     proc->sigaltstack_flags = SS_DISABLE;
@@ -59,6 +60,7 @@ static void init_process_tables(void) {
     }
     for (u64 i = 0; i < PIPE_MAX; i++) g_pipes[i].used = 0;
     for (u64 i = 0; i < FUTEX_WAITER_MAX; i++) g_futex_waiters[i].used = 0;
+    g_next_linux_pid = 100;
 }
 static struct linux_process_state *process_state_for(u64 principal) {
     if (principal == 0) return 0;
@@ -88,6 +90,16 @@ static struct linux_process_state *process_state_for(u64 principal) {
         return single_pending;
     }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) { if (g_processes[i].used) continue; init_process_state(&g_processes[i], principal); return &g_processes[i]; }
+    return 0;
+}
+
+static struct linux_process_state *alloc_process_state_for_new_principal(u64 principal) {
+    if (principal == 0) return 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (g_processes[i].used) continue;
+        init_process_state(&g_processes[i], principal);
+        return &g_processes[i];
+    }
     return 0;
 }
 static int alloc_pipe_slot(void) { for (u64 i = 0; i < PIPE_MAX; i++) if (!g_pipes[i].used) return (int)i; return -1; }
@@ -238,6 +250,15 @@ static int pipe_has_live_writer(u8 pipe_id) {
 static struct linux_process_state *process_state_for_pid(u64 pid) {
     if (pid == 0) return 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) if (g_processes[i].used && g_processes[i].pid == pid) return &g_processes[i];
+    return 0;
+}
+
+static u64 alloc_linux_pid(void) {
+    for (u64 attempts = 0; attempts < 4096; attempts++) {
+        const u64 pid = g_next_linux_pid++;
+        if (pid == 0) continue;
+        if (process_state_for_pid(pid) == 0) return pid;
+    }
     return 0;
 }
 

@@ -57,9 +57,9 @@ static void wait_child_slot_settled(u64 child_slot) {
     for (u64 i = 0; i < 16; i++) {
         const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child_slot);
         if ((st & 0xffu) != 1) break;
-        wait_without_consuming_ipc();
+        wait_without_consuming_ipc_no_switch();
     }
-    wait_without_consuming_ipc();
+    wait_without_consuming_ipc_no_switch();
 }
 
 static int reap_exited_child_for_current(struct linux_process_state *proc, i64 pid, u64 status_va, u64 *child_out, int *fault) {
@@ -191,6 +191,7 @@ static void copy_process_state_for_fork(struct linux_process_state *child, const
     child->wait_status_va = 0;
     child->clear_child_tid = 0;
     child->profile_enabled = parent->profile_enabled;
+    child->profile_verbose_enabled = parent->profile_verbose_enabled;
     child->sigaltstack_sp = parent->sigaltstack_sp;
     child->sigaltstack_size = parent->sigaltstack_size;
     child->sigaltstack_flags = parent->sigaltstack_flags;
@@ -236,7 +237,7 @@ static struct ipc_message handle_clone_thread(const struct trap_request *req) {
         user_log_hex_value(spawned);
         return reply(errno_busy(), 0);
     }
-    struct linux_process_state *child = process_state_for(child_slot);
+    struct linux_process_state *child = alloc_process_state_for_new_principal(child_slot);
     if (!child) {
         user_log("LinuxAbiServer: clone thread state failed\n");
         user_log_hex_value(child_slot);
@@ -286,16 +287,19 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
     const u64 spawned = syscall0(SYSCALL_FORK_ABI_TRAP_REPLY_TARGET);
     const u64 child_slot = decode_spawned_process_slot(spawned);
     if (child_slot == 0) return reply(errno_busy(), 0);
-    discard_process_exit_records(child_slot);
-    remove_child_slot(g_proc, child_slot);
-    struct linux_process_state *child = process_state_for(child_slot);
+    const u64 child_pid = alloc_linux_pid();
+    if (child_pid == 0) return reply(errno_busy(), 0);
+    discard_process_exit_records(child_pid);
+    remove_child_slot(g_proc, child_pid);
+    struct linux_process_state *child = alloc_process_state_for_new_principal(child_slot);
     if (!child) return reply(errno_busy(), 0);
     u64 child_request_va = 0;
     if (!ensure_child_trap_request_page(child_slot, &child_request_va)) return reply(errno_busy(), 0);
-    copy_process_state_for_fork(child, g_proc, child_slot);
-    (void)add_child_slot(g_proc, child_slot);
+    copy_process_state_for_fork(child, g_proc, child_pid);
+    child->principal = child_slot;
+    (void)add_child_slot(g_proc, child_pid);
     if (!defer_trap_target_start(child_slot)) return reply(errno_busy(), 0);
-    return reply(child_slot, 0);
+    return reply(child_pid, 0);
 }
 
 static struct ipc_message handle_set_tid_address(const struct trap_request *req) {
@@ -482,10 +486,14 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
     const u64 status_va = req->args[1];
     const u64 options = req->args[2];
     const u64 supported_options = (u64)WNOHANG | (u64)WUNTRACED | (u64)WCONTINUED;
+    profile_trace_event_u64("wait4.begin pid", (u64)pid);
     if ((options & ~supported_options) != 0) return reply(errno_inval(), 0);
     u64 child = 0;
     int fault = 0;
-    if (reap_exited_child_for_current(g_proc, pid, status_va, &child, &fault)) return reply(child, 0);
+    if (reap_exited_child_for_current(g_proc, pid, status_va, &child, &fault)) {
+        profile_trace_event_u64("wait4.reap child", child);
+        return reply(child, 0);
+    }
     if (fault) return reply(errno_fault(), 0);
     if ((options & WNOHANG) != 0) return reply(0, 0);
     int has_matching_child = 0;
@@ -494,6 +502,7 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
     }
     if (!has_matching_child) return reply(errno_child(), 0);
     if (g_proc->wait_pending) return reply(errno_again(), 0);
+    profile_trace_event_u64("wait4.pending pid", (u64)pid);
     g_proc->wait_pending = 1;
     g_proc->wait_pid = pid;
     g_proc->wait_status_va = status_va;

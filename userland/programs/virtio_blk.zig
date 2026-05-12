@@ -21,6 +21,7 @@ const syscall_wait_event: u64 = 0x17;
 const syscall_log: u64 = 0x9;
 const syscall_install_endpoint: u64 = 0x26;
 const syscall_signal_endpoint: u64 = 0x2C;
+const syscall_get_tick_count: u64 = 0x2D;
 
 const syscall_ok: u64 = 0;
 const reply_endpoint_id_base: u64 = 0xC0;
@@ -148,6 +149,34 @@ fn userLog(message: []const u8) u64 {
           [arg0] "{rdi}" (@as(u64, @intFromPtr(message.ptr))),
           [arg1] "{rsi}" (@as(u64, @intCast(message.len))),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn getTickCount() u64 {
+    return asm volatile (
+        \\syscall
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_get_tick_count),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn userLogDec(value: u64) void {
+    var buf: [20]u8 = undefined;
+    var i: usize = buf.len;
+    var x = value;
+    if (x == 0) {
+        _ = userLog("0");
+        return;
+    }
+    while (x != 0 and i != 0) {
+        i -= 1;
+        buf[i] = @as(u8, '0') + @as(u8, @intCast(x % 10));
+        x /= 10;
+    }
+    _ = userLog(buf[i..]);
+}
+
+fn profileReadBulk() bool {
+    return false;
 }
 
 fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
@@ -985,6 +1014,7 @@ fn ensureBulkMappings(session: *Session, paddrs: []const u64) bool {
 }
 
 fn handleReadBlocksBulk(session: *Session, request_seq: u64) void {
+    const total_start_tick = if (profileReadBulk()) getTickCount() else 0;
     const request = requestHeader(session);
     const rights = resolveSession(session, request) orelse {
         replyStatus(session, .read_blocks_bulk, request_seq, .not_found);
@@ -1024,14 +1054,36 @@ fn handleReadBlocksBulk(session: *Session, request_seq: u64) void {
         paddrs[page_index] = raw;
     }
 
+    const map_start_tick = if (profileReadBulk()) getTickCount() else 0;
     if (!ensureBulkMappings(session, paddrs[0..page_count])) {
         replyStatus(session, .read_blocks_bulk, request_seq, .invalid);
         return;
     }
+    const map_ticks = if (profileReadBulk()) getTickCount() - map_start_tick else 0;
 
+    const io_start_tick = if (profileReadBulk()) getTickCount() else 0;
     if (!executeBulkReadRequest(request.block_index, request.block_count, session.bulk_base_va, @intCast(byte_count))) {
         replyStatus(session, .read_blocks_bulk, request_seq, .io_error);
         return;
+    }
+    if (profileReadBulk()) {
+        const io_ticks = getTickCount() - io_start_tick;
+        const total_ticks = getTickCount() - total_start_tick;
+        _ = userLog("[virtio_blk] VirtioBlk.prof.read_bulk seq=");
+        userLogDec(request_seq);
+        _ = userLog(" blocks=");
+        userLogDec(request.block_count);
+        _ = userLog(" pages=");
+        userLogDec(page_count);
+        _ = userLog(" bytes=");
+        userLogDec(byte_count);
+        _ = userLog(" total=");
+        userLogDec(total_ticks);
+        _ = userLog(" cap_map=");
+        userLogDec(map_ticks);
+        _ = userLog(" io=");
+        userLogDec(io_ticks);
+        _ = userLog("\n");
     }
     clearPage(session.response_va);
     writeResponseHeader(

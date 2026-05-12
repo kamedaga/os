@@ -1,15 +1,23 @@
 #define LINUX_ABI_EXECVE_PROFILE_ENV "CAPABILITYOS_EXEC_PROFILE=1"
 #define LINUX_ABI_EXECVE_PROFILE_VERBOSE_ENV "CAPABILITYOS_EXEC_PROFILE_VERBOSE=1"
 
+enum {
+    EXEC_OPT_PATH_CACHE = 0,
+    EXEC_OPT_FILE_READ_CACHE = 0,
+    EXEC_OPT_MAIN_VM_CACHE = 1,
+    EXEC_OPT_SERVICE_SOURCE_CACHE = 1,
+};
+
 static int g_execve_profile_enabled = 0;
 static int g_execve_profile_verbose = 0;
 static u64 g_execve_profile_start_tick = 0;
 static u64 g_execve_profile_last_tick = 0;
 static u64 g_execve_profile_count = 0;
 static const char *g_execve_profile_path = 0;
-static const char *g_execve_profile_labels[32];
-static u64 g_execve_profile_dt[32];
-static u64 g_execve_profile_total[32];
+static const char *g_execve_profile_labels[64];
+static u64 g_execve_profile_tick[64];
+static u64 g_execve_profile_dt[64];
+static u64 g_execve_profile_total[64];
 
 static int path_has_prefix(const char *path, const char *prefix) {
     u64 i = 0;
@@ -58,6 +66,7 @@ static void copy_path_to_cache(char *dst, u16 *dst_len, const char *path, u64 pa
 }
 
 static struct path_cache_entry *path_cache_find(const char *path) {
+    if (!EXEC_OPT_PATH_CACHE) return 0;
     const u64 path_len = cstr_len(path);
     for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
         if (!g_path_cache[i].used) continue;
@@ -67,6 +76,7 @@ static struct path_cache_entry *path_cache_find(const char *path) {
 }
 
 static void path_cache_store(const char *path, u64 token, const struct fs_stat_record *stat, u64 size, u8 kind) {
+    if (!EXEC_OPT_PATH_CACHE) return;
     if (!cacheable_readonly_path(path)) return;
     const u64 path_len = cstr_len(path);
     if (path_len == 0 || path_len > FS_MAX_PATH_BYTES) return;
@@ -160,6 +170,7 @@ static void execve_profile_step(const char *step) {
     if (g_execve_profile_count < sizeof(g_execve_profile_dt) / sizeof(g_execve_profile_dt[0])) {
         const u64 slot = g_execve_profile_count++;
         g_execve_profile_labels[slot] = step;
+        g_execve_profile_tick[slot] = now;
         g_execve_profile_dt[slot] = now - g_execve_profile_last_tick;
         g_execve_profile_total[slot] = now - g_execve_profile_start_tick;
     }
@@ -190,6 +201,8 @@ static void execve_profile_flush(void) {
     for (u64 i = 0; i < g_execve_profile_count; i++) {
         user_log("LinuxAbiServer.exec_profile.step ");
         user_log(g_execve_profile_labels[i]);
+        user_log(" tick=");
+        user_log_dec_value(g_execve_profile_tick[i]);
         user_log(" dt=");
         user_log_dec_value(g_execve_profile_dt[i]);
         user_log(" total=");
@@ -228,6 +241,7 @@ static int file_cache_alloc_buffer(u64 size, u64 *buffer_va_out) {
 }
 
 static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *fd) {
+    if (!EXEC_OPT_FILE_READ_CACHE) return 0;
     if (fd->path_len == 0 || !cacheable_readonly_path(fd->path) || fd->size == 0) return 0;
     struct file_cache_entry *cached = file_cache_find_by_path(fd->path);
     if (cached != 0) {
@@ -326,8 +340,14 @@ static int vfs_read_file_to_buffer(const char *path, u64 buffer_va, u64 buffer_c
     u64 copied = 0;
     int ok = 1;
     while (copied < file_bytes) {
-        const u64 chunk = min_u64(file_bytes - copied, FS_RESPONSE_PAYLOAD_BYTES);
-        if (!vfs_request(FS_OP_READ, open_token, copied, (u32)chunk, 0)) { user_log("LinuxAbiServer: vfs read request failed\n"); ok = 0; break; }
+        const u64 chunk = min_u64(file_bytes - copied, FS_BULK_READ_BYTES);
+        u64 bulk_bytes = 0;
+        if (vfs_read_bulk_to_buffer(open_token, copied, (u32)chunk, buffer_va + copied, &bulk_bytes) && bulk_bytes != 0) {
+            copied += bulk_bytes;
+            continue;
+        }
+        const u64 fallback_chunk = min_u64(file_bytes - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        if (!vfs_request(FS_OP_READ, open_token, copied, (u32)fallback_chunk, 0)) { user_log("LinuxAbiServer: vfs read request failed\n"); ok = 0; break; }
         response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
         if (response->status != FS_STATUS_OK || response->inline_bytes == 0) { user_log("LinuxAbiServer: vfs read chunk failed\n"); user_log_hex_value((u64)(u32)response->status); ok = 0; break; }
         volatile u8 *src = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
@@ -360,6 +380,7 @@ static int cache_entry_path_matches(const struct exec_cache_entry *entry, const 
 }
 
 static struct exec_cache_entry *exec_cache_find(const char *path, u64 path_len) {
+    if (!EXEC_OPT_MAIN_VM_CACHE && !EXEC_OPT_SERVICE_SOURCE_CACHE) return 0;
     for (u64 i = 0; i < EXEC_CACHE_MAX; i++) {
         if (cache_entry_path_matches(&g_exec_cache[i], path, path_len)) return &g_exec_cache[i];
     }
@@ -367,6 +388,7 @@ static struct exec_cache_entry *exec_cache_find(const char *path, u64 path_len) 
 }
 
 static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 file_bytes) {
+    if (!EXEC_OPT_MAIN_VM_CACHE && !EXEC_OPT_SERVICE_SOURCE_CACHE) return;
     if (path_len == 0 || path_len > FS_MAX_PATH_BYTES) return;
     struct exec_cache_entry *entry = exec_cache_find(path, path_len);
     if (entry == 0) {
@@ -379,7 +401,7 @@ static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 f
     }
     if (entry == 0) return;
     entry->used = 1;
-    entry->loader_service_cached = 0;
+    entry->exec_service_cached = 0;
     entry->path_len = (u16)path_len;
     entry->vm_token = vm_token;
     entry->file_bytes = file_bytes;
@@ -397,7 +419,7 @@ static void invalidate_exec_cache_for_path(const char *path) {
 static int get_exec_vm_for_path(const char *path, u64 *vm_token_out, u64 *file_bytes_out) {
     const u64 path_len = cstr_len(path);
     struct exec_cache_entry *cached = exec_cache_find(path, path_len);
-    if (cached != 0) {
+    if (EXEC_OPT_MAIN_VM_CACHE && cached != 0) {
         execve_profile_step("main cache hit");
         *vm_token_out = cached->vm_token;
         *file_bytes_out = cached->file_bytes;
@@ -413,108 +435,112 @@ static int get_exec_vm_for_path(const char *path, u64 *vm_token_out, u64 *file_b
     if (vm_token == 0) return 0;
     execve_profile_step("main vm install done");
 
-    exec_cache_store(path, path_len, vm_token, file_bytes);
+    if (EXEC_OPT_MAIN_VM_CACHE || EXEC_OPT_SERVICE_SOURCE_CACHE) exec_cache_store(path, path_len, vm_token, file_bytes);
 
     *vm_token_out = vm_token;
     *file_bytes_out = file_bytes;
     return 1;
 }
 
-static u64 get_exec_loader_exec_token(void) {
-    if (g_exec_loader_exec_token != 0) {
-        execve_profile_step("loader exec cache hit");
-        return g_exec_loader_exec_token;
+static u64 get_exec_program_token(void) {
+    if (g_exec_program_token != 0) {
+        execve_profile_step("exec image cache hit");
+        return g_exec_program_token;
     }
-    execve_profile_step("loader exec install begin");
-    g_exec_loader_exec_token = install_exec_image_from_vm(g_exec_loader_vm_token);
-    execve_profile_step("loader exec install done");
-    return g_exec_loader_exec_token;
+    execve_profile_step("exec image install begin");
+    g_exec_program_token = install_exec_image_from_vm(g_exec_vm_token);
+    execve_profile_step("exec image install done");
+    return g_exec_program_token;
 }
 
-static u64 grant_vm_object_to_loader(u64 vm_token) {
-    const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_exec_loader_service_slot, VM_RIGHT_READ_MAP);
+static u64 grant_vm_object_to_exec(u64 vm_token) {
+    const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_exec_service_slot, VM_RIGHT_READ_MAP);
     return is_vm_object_token(granted) ? granted : 0;
 }
 
-static int ensure_exec_loader_service_pages(void) {
-    if (g_exec_loader_service_request_paddr != 0 && g_exec_loader_service_response_paddr != 0) return 1;
-    g_exec_loader_service_request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
-    g_exec_loader_service_response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
-    if (g_exec_loader_service_request_paddr < PAGE_BYTES || g_exec_loader_service_response_paddr < PAGE_BYTES) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, EXECVE_LOADER_REQUEST_VA, g_exec_loader_service_request_paddr, 1) != SYSCALL_OK) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, EXECVE_LOADER_RESPONSE_VA, g_exec_loader_service_response_paddr, 1) != SYSCALL_OK) return 0;
+static int ensure_exec_service_pages(void) {
+    if (g_exec_launch_request_paddr != 0 && g_exec_launch_response_paddr != 0) return 1;
+    g_exec_launch_request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    g_exec_launch_response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    if (g_exec_launch_request_paddr < PAGE_BYTES || g_exec_launch_response_paddr < PAGE_BYTES) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, EXECVE_EXEC_REQUEST_VA, g_exec_launch_request_paddr, 1) != SYSCALL_OK) return 0;
+    if (syscall3(SYSCALL_MAP_PAGE, EXECVE_EXEC_RESPONSE_VA, g_exec_launch_response_paddr, 1) != SYSCALL_OK) return 0;
     return 1;
 }
 
-static int ensure_exec_loader_service_scratch(void) {
-    if (execve_loader_service_scratch_ready) return 1;
-    if (!alloc_map_range_self(EXECVE_LOADER_SERVICE_CONFIG_VA, 1, 1)) return 0;
-    if (!alloc_map_range_self(EXECVE_LOADER_SERVICE_TABLE_VA, 1, 1)) return 0;
-    execve_loader_service_scratch_ready = 1;
+static int ensure_exec_service_scratch(void) {
+    if (execve_exec_service_scratch_ready) return 1;
+    if (!alloc_map_range_self(EXECVE_EXEC_SERVICE_CONFIG_VA, 1, 1)) return 0;
+    if (!alloc_map_range_self(EXECVE_EXEC_SERVICE_TABLE_VA, 1, 1)) return 0;
+    execve_exec_service_scratch_ready = 1;
     return 1;
 }
 
-static int start_exec_loader_service(void) {
-    if (g_exec_loader_service_slot != 0) return 1;
-    execve_profile_step("loader service start begin");
-    if (!ensure_exec_loader_service_scratch()) return 0;
-    const u64 loader_exec_token = get_exec_loader_exec_token();
-    if (loader_exec_token == 0) return 0;
-    clear_page(EXECVE_LOADER_SERVICE_CONFIG_VA);
-    clear_page(EXECVE_LOADER_SERVICE_TABLE_VA);
-    struct exec_loader_config *cfg = (struct exec_loader_config *)EXECVE_LOADER_SERVICE_CONFIG_VA;
-    cfg->magic = EXEC_LOADER_BOOTSTRAP_MAGIC;
-    cfg->version = EXEC_LOADER_BOOTSTRAP_VERSION;
-    cfg->flags = EXEC_LOADER_BOOTSTRAP_FLAG_SERVICE_MODE;
+static int start_exec_service(void) {
+    if (g_exec_service_slot != 0) return 1;
+    execve_profile_step("exec service start begin");
+    if (!ensure_exec_service_scratch()) return 0;
+    const u64 exec_program_token = get_exec_program_token();
+    if (exec_program_token == 0) return 0;
+    clear_page(EXECVE_EXEC_SERVICE_CONFIG_VA);
+    clear_page(EXECVE_EXEC_SERVICE_TABLE_VA);
+    struct exec_bootstrap_config *cfg = (struct exec_bootstrap_config *)EXECVE_EXEC_SERVICE_CONFIG_VA;
+    cfg->magic = EXEC_BOOTSTRAP_MAGIC;
+    cfg->version = EXEC_BOOTSTRAP_VERSION;
+    cfg->flags = EXEC_BOOTSTRAP_FLAG_SERVICE_MODE;
     cfg->interpreter_file_bytes = g_standard_interpreter_bytes;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
     cfg->fs_compat_process_slot = g_vfs.process_slot;
 
-    struct bootstrap_descriptor_table *table = (struct bootstrap_descriptor_table *)EXECVE_LOADER_SERVICE_TABLE_VA;
+    struct bootstrap_descriptor_table *table = (struct bootstrap_descriptor_table *)EXECVE_EXEC_SERVICE_TABLE_VA;
     table->page_count = 1;
     table->cap_count = 1;
-    table->page_descriptors[0].source_va = EXECVE_LOADER_SERVICE_CONFIG_VA;
-    table->page_descriptors[0].target_va = EXEC_LOADER_CONFIG_TARGET_VA;
+    table->page_descriptors[0].source_va = EXECVE_EXEC_SERVICE_CONFIG_VA;
+    table->page_descriptors[0].target_va = EXEC_BOOTSTRAP_TARGET_VA;
     table->cap_descriptors[0].source_token = g_standard_interpreter_vm_token;
-    table->cap_descriptors[0].target_token_va = EXEC_LOADER_CONFIG_TARGET_VA + OFFSETOF(struct exec_loader_config, interpreter_vm_token);
+    table->cap_descriptors[0].target_token_va = EXEC_BOOTSTRAP_TARGET_VA + OFFSETOF(struct exec_bootstrap_config, interpreter_vm_token);
     table->cap_descriptors[0].rights_bits = VM_RIGHT_READ_MAP;
     table->cap_descriptors[0].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
 
     const u64 flags = SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER;
-    const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, loader_exec_token, EXECVE_LOADER_SERVICE_TABLE_VA, 0, flags);
-    g_exec_loader_service_slot = decode_spawned_process_slot(spawned);
-    execve_profile_step("loader service start done");
-    if (g_exec_loader_service_slot == 0) {
-        user_log("LinuxAbiServer: exec loader service spawn failed ret=");
+    const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, exec_program_token, EXECVE_EXEC_SERVICE_TABLE_VA, 0, flags);
+    g_exec_service_slot = decode_spawned_process_slot(spawned);
+    execve_profile_step("exec service start done");
+    if (g_exec_service_slot == 0) {
+        user_log("LinuxAbiServer: exec service spawn failed ret=");
         user_log_hex_value(spawned);
         return 0;
     }
     return 1;
 }
 
-static int send_exec_loader_service_request(struct exec_loader_config *cfg, struct exec_cache_entry *entry, u64 main_vm_token, u64 *spawned_principal_out) {
-    if (!ensure_exec_loader_service_pages()) { user_log("LinuxAbiServer: exec loader service pages failed\n"); return 0; }
-    if (!start_exec_loader_service()) return 0;
+static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct exec_cache_entry *entry, u64 main_vm_token, u64 *spawned_principal_out) {
+    if (!ensure_exec_service_pages()) { user_log("LinuxAbiServer: exec service pages failed\n"); return 0; }
+    execve_profile_step("exec service pages done");
+    if (!start_exec_service()) return 0;
+    execve_profile_step("exec service started");
 
-    const int loader_has_source = entry != 0 && entry->loader_service_cached != 0;
+    const int exec_has_source = EXEC_OPT_SERVICE_SOURCE_CACHE && entry != 0 && entry->exec_service_cached != 0;
     cfg->executable_vm_token = 0;
-    if (!loader_has_source) {
-        cfg->executable_vm_token = grant_vm_object_to_loader(main_vm_token);
+    if (!exec_has_source) {
+        execve_profile_step("exec service grant begin");
+        cfg->executable_vm_token = grant_vm_object_to_exec(main_vm_token);
+        execve_profile_step("exec service grant done");
         if (cfg->executable_vm_token == 0) {
-            user_log("LinuxAbiServer: exec loader service grant failed\n");
+            user_log("LinuxAbiServer: exec service grant failed\n");
             return 0;
         }
     }
     cfg->interpreter_vm_token = 0;
 
-    clear_page(EXECVE_LOADER_REQUEST_VA);
-    clear_page(EXECVE_LOADER_RESPONSE_VA);
-    struct exec_loader_service_request *request = (struct exec_loader_service_request *)EXECVE_LOADER_REQUEST_VA;
-    const u64 request_seq = g_exec_loader_service_seq++;
-    request->magic = EXEC_LOADER_SERVICE_REQUEST_MAGIC;
-    request->version = EXEC_LOADER_SERVICE_VERSION;
-    request->op = EXEC_LOADER_SERVICE_OP_LAUNCH;
-    request->response_paddr = g_exec_loader_service_response_paddr;
+    clear_page(EXECVE_EXEC_REQUEST_VA);
+    clear_page(EXECVE_EXEC_RESPONSE_VA);
+    struct exec_launch_request *request = (struct exec_launch_request *)EXECVE_EXEC_REQUEST_VA;
+    const u64 request_seq = g_exec_service_seq++;
+    request->magic = EXEC_LAUNCH_REQUEST_MAGIC;
+    request->version = EXEC_LAUNCH_VERSION;
+    request->op = EXEC_LAUNCH_OP_START;
+    request->response_paddr = g_exec_launch_response_paddr;
     {
         const u8 *src = (const u8 *)cfg;
         u8 *dst = (u8 *)&request->config;
@@ -523,80 +549,84 @@ static int send_exec_loader_service_request(struct exec_loader_config *cfg, stru
     __asm__ volatile("" ::: "memory");
     request->seq = request_seq;
 
-    execve_profile_step(loader_has_source ? "loader service cached send begin" : "loader service grant send begin");
-    u64 install_status = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_LOADER_SERVICE_ENDPOINT_ID, g_exec_loader_service_slot);
+    execve_profile_step(exec_has_source ? "exec service cached send begin" : "exec service grant send begin");
+    u64 install_status = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_LAUNCH_ENDPOINT_ID, g_exec_service_slot);
+    execve_profile_step("exec service endpoint installed");
     u64 grant_status = 0;
     u64 share_status = 0;
     u64 attempts = 0;
-    if (!g_exec_loader_service_connected) {
+    if (!g_exec_service_connected) {
         while (attempts++ < 20000) {
-            grant_status = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_exec_loader_service_response_paddr, EXEC_LOADER_SERVICE_ENDPOINT_ID, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-            share_status = syscall2(SYSCALL_SHARE_CAP, g_exec_loader_service_request_paddr, EXEC_LOADER_SERVICE_ENDPOINT_ID);
+            grant_status = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_exec_launch_response_paddr, EXEC_LAUNCH_ENDPOINT_ID, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
+            share_status = syscall2(SYSCALL_SHARE_CAP, g_exec_launch_request_paddr, EXEC_LAUNCH_ENDPOINT_ID);
             if (grant_status == SYSCALL_OK && share_status == SYSCALL_OK) {
-                g_exec_loader_service_connected = 1;
+                g_exec_service_connected = 1;
+                execve_profile_step("exec service caps connected");
                 break;
             }
             __asm__ volatile("pause" ::: "memory");
         }
-        if (!g_exec_loader_service_connected) {
-            user_log("LinuxAbiServer: exec loader service signal failed install=");
+        if (!g_exec_service_connected) {
+            user_log("LinuxAbiServer: exec service signal failed install=");
             user_log_hex_value(install_status);
-            user_log("LinuxAbiServer: exec loader service signal grant=");
+            user_log("LinuxAbiServer: exec service signal grant=");
             user_log_hex_value(grant_status);
-            user_log("LinuxAbiServer: exec loader service signal share=");
+            user_log("LinuxAbiServer: exec service signal share=");
             user_log_hex_value(share_status);
             return 0;
         }
     } else {
-        u64 signal_status = syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LOADER_SERVICE_ENDPOINT_ID, 0);
+        u64 signal_status = syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
         if (signal_status == SYSCALL_ERR_ENDPOINT && install_status == SYSCALL_OK) {
-            signal_status = syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LOADER_SERVICE_ENDPOINT_ID, 0);
+            signal_status = syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
         }
+        execve_profile_step("exec service signaled");
         if (signal_status != SYSCALL_OK) {
-            user_log("LinuxAbiServer: exec loader service wake failed=");
+            user_log("LinuxAbiServer: exec service wake failed=");
             user_log_hex_value(signal_status);
             return 0;
         }
     }
 
-    volatile struct exec_loader_service_response *response = (volatile struct exec_loader_service_response *)EXECVE_LOADER_RESPONSE_VA;
+    volatile struct exec_launch_response *response = (volatile struct exec_launch_response *)EXECVE_EXEC_RESPONSE_VA;
+    execve_profile_step("exec service response wait begin");
     attempts = 0;
     while (attempts++ < 2000000) {
-        if (response->magic == EXEC_LOADER_SERVICE_RESPONSE_MAGIC &&
-            response->version == EXEC_LOADER_SERVICE_VERSION &&
-            response->op == EXEC_LOADER_SERVICE_OP_LAUNCH &&
+        if (response->magic == EXEC_LAUNCH_RESPONSE_MAGIC &&
+            response->version == EXEC_LAUNCH_VERSION &&
+            response->op == EXEC_LAUNCH_OP_START &&
             response->seq == request_seq) {
-            if (response->status != EXEC_LOADER_SERVICE_STATUS_OK || response->child_process_slot == 0) {
-                user_log("LinuxAbiServer: exec loader service failed status=");
+            if (response->status != EXEC_LAUNCH_STATUS_OK || response->child_process_slot == 0) {
+                user_log("LinuxAbiServer: exec service failed status=");
                 user_log_hex_value(response->status);
-                if (loader_has_source && entry != 0) {
-                    entry->loader_service_cached = 0;
+                if (exec_has_source && entry != 0) {
+                    entry->exec_service_cached = 0;
                     return 2;
                 }
                 return 0;
             }
-            if (entry != 0) entry->loader_service_cached = 1;
+            if (EXEC_OPT_SERVICE_SOURCE_CACHE && entry != 0) entry->exec_service_cached = 1;
             *spawned_principal_out = response->child_process_slot;
-            execve_profile_step("loader service reply done");
+            execve_profile_step("exec service reply done");
             return 1;
         }
-        if ((attempts & 0x3ffu) == 0) wait_without_consuming_ipc();
+        if ((attempts & 0x3ffu) == 0) wait_without_consuming_ipc_no_switch();
         __asm__ volatile("pause" ::: "memory");
     }
-    user_log("LinuxAbiServer: exec loader service timeout\n");
-    user_log("LinuxAbiServer: exec loader service timeout magic=");
+    user_log("LinuxAbiServer: exec service timeout\n");
+    user_log("LinuxAbiServer: exec service timeout magic=");
     user_log_hex_value(response->magic);
-    user_log("LinuxAbiServer: exec loader service timeout version=");
+    user_log("LinuxAbiServer: exec service timeout version=");
     user_log_hex_value(response->version);
-    user_log("LinuxAbiServer: exec loader service timeout op=");
+    user_log("LinuxAbiServer: exec service timeout op=");
     user_log_hex_value(response->op);
-    user_log("LinuxAbiServer: exec loader service timeout seq=");
+    user_log("LinuxAbiServer: exec service timeout seq=");
     user_log_hex_value(response->seq);
-    user_log("LinuxAbiServer: exec loader service timeout status=");
+    user_log("LinuxAbiServer: exec service timeout status=");
     user_log_hex_value(response->status);
-    user_log("LinuxAbiServer: exec loader service timeout child=");
+    user_log("LinuxAbiServer: exec service timeout child=");
     user_log_hex_value(response->child_process_slot);
-    user_log("LinuxAbiServer: exec loader service request seq=");
+    user_log("LinuxAbiServer: exec service request seq=");
     user_log_hex_value(request_seq);
     return 0;
 }
@@ -708,7 +738,7 @@ static int maybe_uutils_applet_exec(const char *path, char *tool_out, u64 tool_c
     return 1;
 }
 
-static int append_exec_arg(struct exec_loader_config *cfg, u16 *cursor, const char *value, u64 len, u16 *offset_out, u16 *len_out) {
+static int append_exec_arg(struct exec_bootstrap_config *cfg, u16 *cursor, const char *value, u64 len, u16 *offset_out, u16 *len_out) {
     if (len == 0 || len > 0xffff) return 0;
     if ((u64)*cursor + len > EXECVE_MAX_ARG_DATA_BYTES) return 0;
     for (u64 i = 0; i < len; i++) cfg->arg_data[(u64)*cursor + i] = (u8)value[i];
@@ -719,13 +749,13 @@ static int append_exec_arg(struct exec_loader_config *cfg, u16 *cursor, const ch
     return 1;
 }
 
-static int append_target_cstr_arg(struct exec_loader_config *cfg, u16 *cursor, u64 target_va, u16 *offset_out, u16 *len_out) {
+static int append_target_cstr_arg(struct exec_bootstrap_config *cfg, u16 *cursor, u64 target_va, u16 *offset_out, u16 *len_out) {
     char temp[256];
     if (!copy_cstr_from_target(target_va, temp, sizeof(temp))) return 0;
     return append_exec_arg(cfg, cursor, temp, cstr_len(temp), offset_out, len_out);
 }
 
-static int configure_exec_args_from_target(struct exec_loader_config *cfg, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override) {
+static int configure_exec_args_from_target(struct exec_bootstrap_config *cfg, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override) {
     u16 cursor = 0;
     if (!append_exec_arg(cfg, &cursor, path, cstr_len(path), &cfg->execfn_offset, &cfg->execfn_bytes)) return 0;
 
@@ -781,15 +811,15 @@ static int configure_exec_args_from_target(struct exec_loader_config *cfg, const
     return 1;
 }
 
-static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override, u64 *spawned_principal_out) {
+static int spawn_exec_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override, u64 *spawned_principal_out) {
     execve_profile_step("scratch begin");
     if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
     execve_profile_step("scratch done");
-    if (!is_vm_object_token(g_exec_loader_vm_token)) { user_log("LinuxAbiServer: execve loader token absent\n"); return 0; }
+    if (!is_vm_object_token(g_exec_vm_token)) { user_log("LinuxAbiServer: execve exec token absent\n"); return 0; }
     if (!is_vm_object_token(g_standard_interpreter_vm_token) || g_standard_interpreter_bytes == 0) { user_log("LinuxAbiServer: execve interpreter token absent\n"); return 0; }
-    if (!start_exec_loader_service()) { user_log("LinuxAbiServer: execve loader service absent\n"); return 0; }
+    if (!start_exec_service()) { user_log("LinuxAbiServer: execve exec service absent\n"); return 0; }
     clear_page(EXECVE_CONFIG_VA);
-    struct exec_loader_config *cfg = (struct exec_loader_config *)EXECVE_CONFIG_VA;
+    struct exec_bootstrap_config *cfg = (struct exec_bootstrap_config *)EXECVE_CONFIG_VA;
     if (!configure_exec_args_from_target(cfg, path, argv_va, envp_va, argv0_override)) { user_log("LinuxAbiServer: execve argv copy failed\n"); return 0; }
     execve_profile_step("argv done");
 
@@ -805,8 +835,8 @@ static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, 
     execve_profile_step("main vm done");
 
     execve_profile_step("config begin");
-    cfg->magic = EXEC_LOADER_BOOTSTRAP_MAGIC;
-    cfg->version = EXEC_LOADER_BOOTSTRAP_VERSION;
+    cfg->magic = EXEC_BOOTSTRAP_MAGIC;
+    cfg->version = EXEC_BOOTSTRAP_VERSION;
     cfg->executable_file_bytes = main_bytes;
     cfg->interpreter_file_bytes = g_standard_interpreter_bytes;
     cfg->abi_trap_endpoint_id = LINUX_ABI_ENDPOINT_ID;
@@ -817,12 +847,12 @@ static int spawn_exec_loader_for_execve(u64 caller_principal, const char *path, 
     cfg->fs_compat_process_slot = g_vfs.process_slot;
     execve_profile_step("config done");
 
-    struct exec_cache_entry *entry = exec_cache_find(path, cstr_len(path));
-    execve_profile_step("loader service begin");
-    int send_result = send_exec_loader_service_request(cfg, entry, main_vm_token, spawned_principal_out);
+    struct exec_cache_entry *entry = EXEC_OPT_SERVICE_SOURCE_CACHE ? exec_cache_find(path, cstr_len(path)) : 0;
+    execve_profile_step("exec service begin");
+    int send_result = send_exec_launch_request(cfg, entry, main_vm_token, spawned_principal_out);
     if (send_result == 2) {
-        execve_profile_step("loader service retry begin");
-        send_result = send_exec_loader_service_request(cfg, entry, main_vm_token, spawned_principal_out);
+        execve_profile_step("exec service retry begin");
+        send_result = send_exec_launch_request(cfg, entry, main_vm_token, spawned_principal_out);
     }
     return send_result == 1;
 }
@@ -833,6 +863,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
     g_execve_profile_enabled = target_env_has_exec_profile(req->args[2]);
     g_execve_profile_verbose = target_env_has_exec_profile_verbose(req->args[2]);
+    if (g_execve_profile_verbose) g_profile_trace_verbose = 1;
     const char *load_path = path;
     char uutils_tool[32];
     const char *uutils_tool_ptr = 0;
@@ -844,7 +875,10 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
         argv0_override = path;
     }
     profile_clear();
-    if (g_proc) g_proc->profile_enabled = (u8)g_execve_profile_enabled;
+    if (g_proc) {
+        g_proc->profile_enabled = (u8)g_execve_profile_enabled;
+        g_proc->profile_verbose_enabled = (u8)g_execve_profile_verbose;
+    }
     execve_profile_begin(load_path);
     execve_profile_step("entry");
     g_exec_path_len = (u16)cstr_len(load_path);
@@ -857,8 +891,8 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     execve_profile_step("probe lookup done");
     const u64 old_principal = req->caller_principal;
     u64 spawned_principal = 0;
-    if (!spawn_exec_loader_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) return reply(errno_io(), 0);
-    execve_profile_step("spawn loader done");
+    if (!spawn_exec_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) return reply(errno_io(), 0);
+    execve_profile_step("spawn exec done");
     execve_profile_flush();
     if (g_proc) {
         g_proc->principal = 0;

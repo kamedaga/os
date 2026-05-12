@@ -91,7 +91,7 @@ int exec_service_spawn_linux(const struct exec_service_spawn_options *options,
 
     result->status = EXEC_SERVICE_STATUS_INVALID;
     result->linux_abi_process_slot = 0;
-    result->exec_loader_process_slot = 0;
+    result->exec_process_slot = 0;
 
     const u64 request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     const u64 response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
@@ -122,7 +122,7 @@ int exec_service_spawn_linux(const struct exec_service_spawn_options *options,
             response->op == EXEC_SERVICE_OP_SPAWN_LINUX) {
             result->status = response->status;
             result->linux_abi_process_slot = response->linux_abi_process_slot;
-            result->exec_loader_process_slot = response->exec_loader_process_slot;
+            result->exec_process_slot = response->exec_process_slot;
             return result->status == EXEC_SERVICE_STATUS_OK;
         }
         if (attempts++ >= wait_ticks * 512ULL) return 0;

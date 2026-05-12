@@ -11,6 +11,47 @@ static int grant_fs_response_page(struct vfs_client *client) {
     return ret == SYSCALL_OK;
 }
 
+static int grant_fs_page(struct vfs_client *client, u64 paddr, u64 rights) {
+    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, paddr, client->endpoint_id, rights);
+    if (ret == SYSCALL_OK) return 1;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_fs_endpoint(client)) {
+        ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, paddr, client->endpoint_id, rights);
+    }
+    return ret == SYSCALL_OK;
+}
+
+static u64 fs_bulk_page_count_for_length(const struct vfs_client *client, u32 length) {
+    u64 page_count = (length + PAGE_BYTES - 1) / PAGE_BYTES;
+    if (page_count > FS_BULK_READ_PAGE_COUNT) page_count = FS_BULK_READ_PAGE_COUNT;
+    if (page_count > FS_BULK_READ_INITIAL_PAGE_COUNT) {
+        u64 cap = client->bulk_page_count;
+        if (cap == 0) cap = FS_BULK_READ_INITIAL_PAGE_COUNT;
+        else if (cap < FS_BULK_READ_PAGE_COUNT) cap *= 2;
+        if (cap > FS_BULK_READ_PAGE_COUNT) cap = FS_BULK_READ_PAGE_COUNT;
+        if (page_count > cap) page_count = cap;
+    }
+    return page_count;
+}
+
+static int ensure_fs_bulk_pages(struct vfs_client *client, u64 bulk_va, u64 page_count) {
+    if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
+    const u64 start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    const u64 old_count = client->bulk_page_count;
+    for (u64 i = client->bulk_page_count; i < page_count; i++) {
+        const u64 paddr = syscall0(SYSCALL_ALLOC_PAGE);
+        if (paddr < 0x1000) return 0;
+        if (syscall3(SYSCALL_MAP_PAGE, bulk_va + i * PAGE_BYTES, paddr, 1) != SYSCALL_OK) return 0;
+        if (!grant_fs_page(client, paddr, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE | PAGE_RIGHT_GRANT)) return 0;
+        client->bulk_paddrs[i] = paddr;
+        client->bulk_page_count = (u16)(i + 1);
+    }
+    if (client->bulk_page_count > old_count) {
+        g_prof.vfs_bulk_cap_pages += client->bulk_page_count - old_count;
+        g_prof.vfs_bulk_cap_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - start_tick;
+    }
+    return 1;
+}
+
 static int share_fs_request_page(struct vfs_client *client) {
     u64 ret = syscall2(SYSCALL_SHARE_CAP, client->request_paddr, client->endpoint_id);
     if (ret == SYSCALL_OK) return 1;
@@ -73,6 +114,8 @@ static int fs_request_full(struct vfs_client *client, u64 request_va, u64 respon
         g_prof.vfs_write_request_bytes += length;
         g_prof.vfs_inline_write_bytes += inline_bytes;
     }
+    const int trace_request = profile_trace_enabled();
+    const u64 trace_start_tick = trace_request ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
     clear_page(request_va);
     clear_page(response_va);
     volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_va;
@@ -96,7 +139,26 @@ static int fs_request_full(struct vfs_client *client, u64 request_va, u64 respon
     __asm__ volatile("" ::: "memory");
     request->request_seq = seq;
     if (!signal_fs(client)) return 0;
-    return wait_fs_response_at(response_va, seq, op);
+    const int ok = wait_fs_response_at(response_va, seq, op);
+    if (trace_request) {
+        const u64 trace_end_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+        user_log("LinuxAbiServer.trace tick=");
+        user_log_dec_value(trace_end_tick);
+        user_log(" event=vfs.request op=");
+        user_log_dec_value(op);
+        user_log(" seq=");
+        user_log_dec_value(seq);
+        user_log(" offset=");
+        user_log_dec_value(offset);
+        user_log(" length=");
+        user_log_dec_value(length);
+        user_log(" dt=");
+        user_log_dec_value(trace_end_tick - trace_start_tick);
+        user_log(" ok=");
+        user_log_dec_value((u64)ok);
+        user_log("\n");
+    }
+    return ok;
 }
 
 static int vfs_request_full(u16 op, u64 token, u64 offset, u32 length, u32 flags, const char *path, u64 inline_src, u16 inline_bytes) {
@@ -105,6 +167,54 @@ static int vfs_request_full(u16 op, u64 token, u64 offset, u32 length, u32 flags
 
 static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *path) {
     return vfs_request_full(op, token, offset, length, 0, path, 0, 0);
+}
+
+static int vfs_read_bulk_to_buffer(u64 token, u64 offset, u32 length, u64 dst_va, u64 *bytes_out) {
+    *bytes_out = 0;
+    if (length == 0) return 1;
+    if (length > FS_BULK_READ_BYTES) length = FS_BULK_READ_BYTES;
+    const u64 page_count = fs_bulk_page_count_for_length(&g_vfs, length);
+    if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
+    length = (u32)(page_count * PAGE_BYTES);
+    if (!ensure_fs_bulk_pages(&g_vfs, VFS_BULK_VA, page_count)) return 0;
+
+    g_prof.vfs_requests++;
+    if (FS_OP_READ_BULK < FS_PROFILE_OP_COUNT) g_prof.vfs_op_counts[FS_OP_READ_BULK]++;
+    g_prof.vfs_read_request_bytes += length;
+
+    clear_page(VFS_REQUEST_VA);
+    clear_page(VFS_RESPONSE_VA);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
+    const u64 seq = g_vfs.next_seq++;
+    request->magic = FS_REQUEST_MAGIC;
+    request->version = FS_PROTOCOL_VERSION;
+    request->op = FS_OP_READ_BULK;
+    request->object_token = token;
+    request->offset = offset;
+    request->length = length;
+    request->flags = (u32)page_count;
+    request->inline_bytes = (u16)(page_count * sizeof(u64));
+    request->session_nonce = g_vfs.session_nonce;
+    volatile u64 *payload = (volatile u64 *)(VFS_REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+    for (u64 i = 0; i < page_count; i++) payload[i] = g_vfs.bulk_paddrs[i];
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    const u64 request_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (!signal_fs(&g_vfs)) return 0;
+    if (!wait_fs_response_at(VFS_RESPONSE_VA, seq, FS_OP_READ_BULK)) return 0;
+    g_prof.vfs_bulk_request_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - request_start_tick;
+
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    if (response->status != FS_STATUS_OK) return 0;
+    const u64 bytes = response->arg0;
+    if (bytes > length || bytes > FS_BULK_READ_BYTES) return 0;
+    u8 *dst = (u8 *)dst_va;
+    const volatile u8 *src = (const volatile u8 *)VFS_BULK_VA;
+    const u64 copy_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    for (u64 i = 0; i < bytes; i++) dst[i] = src[i];
+    g_prof.vfs_bulk_copy_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - copy_start_tick;
+    *bytes_out = bytes;
+    return 1;
 }
 
 static u64 g_last_vfs_write_status = FS_STATUS_OK;

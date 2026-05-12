@@ -17,7 +17,7 @@ struct exec_service_spawn_options {
 struct exec_service_spawn_result {
     unsigned int status;
     unsigned long long linux_abi_process_slot;
-    unsigned long long exec_loader_process_slot;
+    unsigned long long exec_process_slot;
 };
 
 int exec_service_spawn_linux(const struct exec_service_spawn_options *options,

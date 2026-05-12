@@ -8,7 +8,6 @@ pub const cap_transfer_abi = @import("cap_transfer_abi.zig");
 pub const console_bootstrap_abi = @import("console_bootstrap_abi.zig");
 pub const console_protocol = @import("console_protocol.zig");
 pub const dynamic_linker_bootstrap_abi = @import("dynamic_linker_bootstrap_abi.zig");
-pub const exec_loader_bootstrap_abi = @import("exec_loader_bootstrap_abi.zig");
 pub const font = @import("font.zig");
 pub const fs_abi = @import("fs_abi.zig");
 pub const fs_client = @import("fs_client.zig");

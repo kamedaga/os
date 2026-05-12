@@ -116,6 +116,11 @@ def base_commands() -> list[tuple[str, str, tuple[bytes, ...]]]:
             "CAPABILITYOS_EXEC_PROFILE=1 CAPABILITYOS_EXEC_PROFILE_VERBOSE=1 seq 1 1000 | CAPABILITYOS_EXEC_PROFILE=1 CAPABILITYOS_EXEC_PROFILE_VERBOSE=1 head -n 1",
             (b"1",),
         ),
+        (
+            "seq-head1-profile-quiet",
+            "CAPABILITYOS_EXEC_PROFILE=1 seq 1 1000 | CAPABILITYOS_EXEC_PROFILE=1 head -n 1",
+            (b"1",),
+        ),
         ("seq-grep-wc", "seq 1 20 | grep 1 | wc -l", (b"11",)),
         ("sort", r"printf 'z\nb\na\n' | sort", (b"a", b"b", b"z")),
         ("sort-head", r"printf 'z\nb\na\n' | sort | head -n 2", (b"a", b"b")),
@@ -140,6 +145,8 @@ def run_pipe_command(console: Console, index: int, label: str, body: str, requir
     sent_at = time.monotonic()
     console.write_line(wrapped)
     wrote_at = time.monotonic()
+    console.read_until(b"\r\n", timeout)
+    echo_at = time.monotonic()
     console.read_until(begin, timeout)
     begin_at = time.monotonic()
     out = console.read_until(end, timeout)
@@ -155,13 +162,14 @@ def run_pipe_command(console: Console, index: int, label: str, body: str, requir
     missing = [item for item in required if item not in payload]
     if missing:
         raise RuntimeError(f"{label} missing {missing!r}: {plain!r}")
-    if label in ("seq-head1", "seq-head1-profile") and b"\n2" in payload.replace(b"\r\n", b"\n"):
+    if label in ("seq-head1", "seq-head1-profile", "seq-head1-profile-quiet") and b"\n2" in payload.replace(b"\r\n", b"\n"):
         raise RuntimeError(f"{label} produced more than one line: {plain!r}")
     if b":0" not in plain[: plain.find(b"# ") if b"# " in plain else len(plain)]:
         raise RuntimeError(f"{label} non-zero or missing rc: {plain!r}")
     timing = {
         "write_s": wrote_at - sent_at,
-        "begin_s": begin_at - wrote_at,
+        "echo_s": echo_at - wrote_at,
+        "begin_s": begin_at - echo_at,
         "command_s": end_at - begin_at,
         "prompt_s": prompt_at - end_at,
         "total_s": prompt_at - sent_at,
@@ -181,6 +189,16 @@ def copy_logs(runtime_dir: Path, out_dir: Path, console: Console | None, qemu_st
         (out_dir / "qemu-stdout.log").write_text("".join(qemu_stdout), encoding="utf-8")
     if failure is not None:
         (out_dir / "failure.txt").write_text(failure + "\n", encoding="utf-8")
+
+
+def write_results(out_dir: Path, completed: list[str], timings: list[tuple[int, str, dict[str, float]]], result: str) -> None:
+    timing_lines = ["index\tlabel\twrite_s\techo_s\tbegin_s\tcommand_s\tprompt_s\ttotal_s"]
+    for item_index, item_label, timing in timings:
+        timing_lines.append(
+            f"{item_index}\t{item_label}\t{timing['write_s']:.6f}\t{timing['echo_s']:.6f}\t{timing['begin_s']:.6f}\t{timing['command_s']:.6f}\t{timing['prompt_s']:.6f}\t{timing['total_s']:.6f}"
+        )
+    (out_dir / "timings.tsv").write_text("\n".join(timing_lines) + "\n", encoding="utf-8")
+    (out_dir / "summary.txt").write_text("\n".join(completed + [result]) + "\n", encoding="utf-8")
 
 
 def check_serial(runtime_dir: Path) -> None:
@@ -282,20 +300,14 @@ def main() -> int:
             (out_dir / "last-output.txt").write_bytes(out)
             check_serial(runtime_dir)
 
-        timing_lines = ["index\tlabel\twrite_s\tbegin_s\tcommand_s\tprompt_s\ttotal_s"]
-        for item_index, item_label, timing in timings:
-            timing_lines.append(
-                f"{item_index}\t{item_label}\t{timing['write_s']:.6f}\t{timing['begin_s']:.6f}\t{timing['command_s']:.6f}\t{timing['prompt_s']:.6f}\t{timing['total_s']:.6f}"
-            )
-        (out_dir / "timings.tsv").write_text("\n".join(timing_lines) + "\n", encoding="utf-8")
         summary = "\n".join(completed + [f"result: ok ({len(completed)} commands)"]) + "\n"
-        (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
+        write_results(out_dir, completed, timings, f"result: ok ({len(completed)} commands)")
         print(summary, end="")
         return 0
     except Exception as exc:
         failure = f"failed after {len(completed)} commands: {exc}"
         print(failure, flush=True)
-        (out_dir / "summary.txt").write_text("\n".join(completed + [failure]) + "\n", encoding="utf-8")
+        write_results(out_dir, completed, timings, failure)
         return 1
     finally:
         copy_logs(runtime_dir, out_dir, console, qemu_stdout, failure)

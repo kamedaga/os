@@ -1242,6 +1242,20 @@ pub fn pickNextReadyThreadIndexForCpu(cpu_slot: usize, current_index: usize) ?us
     return state.run_queue.pickNextAfter(current_index);
 }
 
+pub fn enterReadyThreadFromBootstrapKernelInterrupt(frame: *TrapFrame) bool {
+    if (!schedulerRunsOnCurrentCpu()) return false;
+    const current_thread = currentThreadIndex();
+    if (current_thread < max_thread_slots) {
+        const ctx = getThreadContextConst(current_thread) orelse return false;
+        const hot = getIpcHotThreadConst(current_thread) orelse return false;
+        if (ctx.allocated and ctx.ready and hot.allocated != 0 and hot.ready != 0 and !ctx.abi_trap_reply_pending) return false;
+    }
+    const next_thread = pickNextReadyThreadIndex(current_thread);
+    if (next_thread == current_thread) return false;
+    if (!activateThread(next_thread)) return false;
+    return loadThreadContextToFrame(next_thread, frame);
+}
+
 pub const RaceLogHooks = struct {
     write: *const fn ([]const u8) void,
     print_hex: *const fn (u64) void,
@@ -1910,6 +1924,19 @@ pub fn discardIpcMessagesForThreadFromSenderOnEndpoint(thread_index: usize, send
 pub fn ipcQueueLenForThread(thread_index: usize) usize {
     if (thread_index >= max_thread_slots) return 0;
     return ipc_queues[thread_index].len;
+}
+
+pub fn ipcQueueLenForThreadOnEndpoint(thread_index: usize, endpoint_id: u64, grants_reply: bool) usize {
+    if (thread_index >= max_thread_slots) return 0;
+    const queue = &ipc_queues[thread_index];
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (offset < queue.len) : (offset += 1) {
+        const index = (@as(usize, queue.head) + offset) % max_ipc_queue_depth;
+        const msg = queue.entries[index];
+        if (msg.endpoint_id == endpoint_id and msg.grants_reply == grants_reply) count += 1;
+    }
+    return count;
 }
 
 pub fn dequeueIpcMessageForPrincipal(principal: kernel.PrincipalId) ?IpcQueuedMessage {

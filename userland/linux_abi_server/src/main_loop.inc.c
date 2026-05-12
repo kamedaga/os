@@ -8,7 +8,7 @@ void linux_abi_main(void) {
         for (;;) __asm__ volatile("pause");
     }
     trap_request_page_va = cfg->abi_trap_request_page_va;
-    g_exec_loader_vm_token = cfg->exec_loader_vm_token;
+    g_exec_vm_token = cfg->exec_vm_token;
     g_standard_interpreter_vm_token = cfg->standard_interpreter_vm_token;
     g_standard_interpreter_bytes = cfg->standard_interpreter_file_bytes;
     g_exec_path_len = cfg->exec_path_bytes <= FS_MAX_PATH_BYTES ? cfg->exec_path_bytes : FS_MAX_PATH_BYTES;
@@ -23,15 +23,23 @@ void linux_abi_main(void) {
     init_process_tables();
     cfg->status = LINUX_ABI_BOOTSTRAP_READY;
     user_log("LinuxAbiServer: started\n");
+    prime_reply_return_signal();
     struct ipc_message msg = reply(0, 0);
     for (;;) {
         g_abi_ctx = 0;
         start_deferred_trap_targets();
         flush_deferred_pipe_wakes();
-        if (msg.status != SYSCALL_OK) { msg = wait_ipc(); continue; }
+        if (msg.status != SYSCALL_OK) {
+            msg = msg.status == SYSCALL_ERR_NOT_READY ? wait_ipc_timeout(1) : wait_ipc();
+            continue;
+        }
         if (msg.request_va == 0) {
-            if (g_console.active && g_console.is_tty) poll_tty_signal_events();
-            msg = wait_ipc();
+            if (!g_root_linux_principal_set) {
+                msg = wait_ipc_timeout(1);
+                continue;
+            }
+            const int polled_tty = g_console.active && g_console.is_tty ? poll_tty_signal_events() : 1;
+            msg = polled_tty ? wait_ipc() : wait_ipc_timeout(1);
             continue;
         }
         if (!is_known_trap_request_page(msg.request_va)) { msg = reply(errno_inval(), 0); continue; }
@@ -51,7 +59,9 @@ void linux_abi_main(void) {
         profile_count_syscall(req->nr);
         (void)syscall0(SYSCALL_GET_TICK_COUNT);
         const int profile_this_syscall = g_proc->profile_enabled != 0;
+        const int profile_trace_this_syscall = profile_trace_enabled();
         const u64 syscall_profile_start_tick = profile_this_syscall ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+        const u64 syscall_trace_start_tick = profile_trace_this_syscall ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
         int syscall_profile_recorded = 0;
         switch (req->nr) {
         case LINUX_SYS_READ: msg = handle_read(req); break;
@@ -156,6 +166,7 @@ void linux_abi_main(void) {
                 const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
                 const int process_exits = exit_group || !exiting_thread;
                 int satisfy_waiters_after_exit_reply = 0;
+                profile_trace_event_u64("exit.begin principal", exiting_principal);
                 if (g_root_linux_principal_set && (exiting_principal == g_root_linux_principal || exiting_pid == g_root_linux_principal)) {
                     user_log("LinuxAbiServer: root exit nr=");
                     user_log_dec_value(req->nr);
@@ -195,14 +206,19 @@ void linux_abi_main(void) {
                 }
                 if (process_exits) {
                     if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
+                    profile_trace_event_u64("exit.close_fds pid", exiting_pid);
                     close_all_process_fds(g_proc);
                     satisfy_waiters_after_exit_reply = 1;
                 }
                 remove_futex_waiters_for_principal(exiting_principal);
                 if (exiting_proc) exiting_proc->used = 0;
                 prime_reply_return_signal();
+                profile_trace_event_u64("exit.reply principal", exiting_principal);
                 exit_trap_target_no_wait(exiting_principal);
-                if (satisfy_waiters_after_exit_reply) (void)satisfy_pending_waiters_for_child(exiting_pid);
+                if (satisfy_waiters_after_exit_reply) {
+                    profile_trace_event_u64("exit.satisfy_waiters pid", exiting_pid);
+                    (void)satisfy_pending_waiters_for_child(exiting_pid);
+                }
                 msg = wait_ipc();
                 (void)msg;
                 int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
@@ -216,6 +232,9 @@ void linux_abi_main(void) {
             }
             break;
         default: user_log("LinuxAbiServer: unhandled syscall\n"); user_log_hex_value(req->nr); msg = reply(errno_nosys(), 0); break;
+        }
+        if (profile_trace_this_syscall) {
+            profile_trace_syscall_span(req->nr, req->caller_principal, syscall_trace_start_tick, syscall0(SYSCALL_GET_TICK_COUNT));
         }
         if (profile_this_syscall && !syscall_profile_recorded) {
             const u64 syscall_profile_end_tick = syscall0(SYSCALL_GET_TICK_COUNT);

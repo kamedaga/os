@@ -44,7 +44,7 @@ pub fn init(
 }
 
 fn isBuilderAuthorized(caller: kernel.PrincipalId) bool {
-    // Temporary authority source: init can spawn the future exec_loader as a
+    // Temporary authority source: init can spawn the user-space exec service as a
     // bootstrap owner. Keep this behind one predicate so it can become a
     // dedicated process_builder capability without changing syscall handlers.
     return state_ptr.isBootstrapOwner(caller);
@@ -257,35 +257,19 @@ pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
     const thread_index = scheduler.threadSlotForPrincipal(target) orelse return boot_static.syscall_err_invalid;
     const slot = processSlot(target) orelse return boot_static.syscall_err_invalid;
-    const ap_placement_block = scheduler.spawnExecApUserSchedulingBlockReason();
     state_ptr.clearProcessBuilderSuspended(target) catch return boot_static.syscall_err_invalid;
-    const ap_placed_cpu = scheduler.readySpawnExecThreadOnApIfReady(thread_index);
-    if (ap_placed_cpu == null and !scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
+    if (!scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
     if (scheduler.spawnExecApUserSchedulingEnabled()) {
         kernel_log.write("process_builder start child=");
         log_util.printNumber(slot);
         kernel_log.write(" thread=");
         log_util.printNumber(@as(u64, @intCast(thread_index)));
-        kernel_log.write(" sched_ap_place=");
-        if (ap_placed_cpu) |cpu| {
-            log_util.printNumber(@as(u64, @intCast(cpu)));
-        } else {
-            writeApPlacementBlock(ap_placement_block);
-        }
+        kernel_log.write(" sched_ap_place=blocked:process_builder_path");
         kernel_log.write(" assigned_cpu=");
         log_util.printNumber(@as(u64, @intCast(scheduler.threadCpuSlot(thread_index) orelse scheduler.idle_thread_marker)));
         kernel_log.write("\n");
     }
     return boot_abi.process_abi.encodeSpawnedProcess(slot, @intCast(thread_index));
-}
-
-fn writeApPlacementBlock(reason: scheduler.SpawnExecApUserSchedulingBlock) void {
-    switch (reason) {
-        .none => kernel_log.write("none"),
-        .flag_disabled => kernel_log.write("off"),
-        .no_ap => kernel_log.write("blocked:no_ap"),
-        .bootstrap_path => kernel_log.write("blocked:bootstrap_path"),
-    }
 }
 
 pub fn abortProcess(caller: kernel.PrincipalId, token: u64) u64 {

@@ -505,7 +505,7 @@ static struct ipc_message handle_write(const struct trap_request *req) {
     if (fd_valid(fd) && g_fds[fd].kind == FD_PIPE_WRITE) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         int fault = 0; const u64 n = pipe_write_from_target(fd, src, len, &fault);
-        if (!fault && (i64)n > 0) defer_pipe_wake(pipe_id);
+        if (!fault && (i64)n > 0) try_satisfy_pending_pipe_read(pipe_id);
         return reply(fault ? errno_fault() : n, 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
@@ -561,7 +561,7 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             total += n;
             if (n != pair[1]) break;
         }
-        if (total != 0) defer_pipe_wake(pipe_id);
+        if (total != 0) try_satisfy_pending_pipe_read(pipe_id);
         return reply(total, 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
