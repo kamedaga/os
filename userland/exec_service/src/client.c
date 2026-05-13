@@ -8,12 +8,21 @@ typedef unsigned long long u64;
 enum {
     SYSCALL_OK = 0,
     SYSCALL_ALLOC_PAGE = 0x1,
-    SYSCALL_MAP_PAGE = 0x2,
     SYSCALL_WAIT_EVENT = 0x17,
-    SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
-    SYSCALL_SHARE_CAP = 0x2B,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
+    SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
+    SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     PAGE_BYTES = 4096,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
+    IPC_BUFFER_RIGHT_READ = 0x1,
+    IPC_BUFFER_RIGHT_WRITE = 0x2,
+    IPC_BUFFER_RIGHT_MAP = 0x4,
+    IPC_BUFFER_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_ROLE_REQUEST = 1,
+    IPC_BUFFER_ROLE_RESPONSE = 2,
 };
 
 static u64 syscall0(u64 n) {
@@ -57,7 +66,11 @@ static int append_arg(struct exec_service_request *request, u16 *cursor, const c
     return 1;
 }
 
-static int fill_request(struct exec_service_request *request, const struct exec_service_spawn_options *options, u64 response_paddr) {
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static int fill_request(struct exec_service_request *request, const struct exec_service_spawn_options *options, u64 response_token) {
     if (!request || !options || !options->path || !options->argv || options->argv_count == 0) return 0;
     if (options->argv_count > EXEC_SERVICE_MAX_ARGV || options->envp_count > EXEC_SERVICE_MAX_ENVP) return 0;
 
@@ -65,7 +78,7 @@ static int fill_request(struct exec_service_request *request, const struct exec_
     request->magic = EXEC_SERVICE_ABI_MAGIC;
     request->version = EXEC_SERVICE_ABI_VERSION;
     request->op = EXEC_SERVICE_OP_SPAWN_LINUX;
-    request->response_paddr = response_paddr;
+    request->response_token = response_token;
     request->client_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
 
     u16 cursor = 0;
@@ -87,7 +100,7 @@ static int fill_request(struct exec_service_request *request, const struct exec_
 
 int exec_service_spawn_linux(const struct exec_service_spawn_options *options,
                              struct exec_service_spawn_result *result) {
-    if (!options || !result || options->request_va < PAGE_BYTES || options->response_va < PAGE_BYTES) return 0;
+    if (!options || !result) return 0;
 
     result->status = EXEC_SERVICE_STATUS_INVALID;
     result->linux_abi_process_slot = 0;
@@ -96,19 +109,35 @@ int exec_service_spawn_linux(const struct exec_service_spawn_options *options,
     const u64 request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     const u64 response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (request_paddr < PAGE_BYTES || response_paddr < PAGE_BYTES) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, options->request_va, request_paddr, 1) != SYSCALL_OK) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, options->response_va, response_paddr, 1) != SYSCALL_OK) return 0;
+    const u64 request_va = syscall2(SYSCALL_MAP_PAGE_ANYWHERE, request_paddr, 1);
+    const u64 response_va = syscall2(SYSCALL_MAP_PAGE_ANYWHERE, response_paddr, 1);
+    if (request_va < PAGE_BYTES || response_va < PAGE_BYTES) return 0;
+    const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
+    const u64 request_token = syscall3(SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE, request_paddr, owner_rights, IPC_BUFFER_ROLE_REQUEST);
+    const u64 response_token = syscall3(SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE, response_paddr, owner_rights, IPC_BUFFER_ROLE_RESPONSE);
+    if (!is_ipc_buffer_token(request_token) || !is_ipc_buffer_token(response_token)) return 0;
+    const u64 remote_response_token = syscall3(
+        SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT,
+        response_token,
+        EXEC_SERVICE_ENDPOINT_ID,
+        IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP
+    );
+    if (!is_ipc_buffer_token(remote_response_token)) return 0;
 
-    struct exec_service_request *request = (struct exec_service_request *)options->request_va;
-    volatile struct exec_service_response *response = (volatile struct exec_service_response *)options->response_va;
-    clear_page(options->response_va);
-    if (!fill_request(request, options, response_paddr)) return 0;
+    struct exec_service_request *request = (struct exec_service_request *)request_va;
+    volatile struct exec_service_response *response = (volatile struct exec_service_response *)response_va;
+    clear_page(response_va);
+    if (!fill_request(request, options, remote_response_token)) return 0;
 
     u64 attempts = 0;
     const u64 wait_ticks = options->wait_ticks ? options->wait_ticks : 20000;
     while (1) {
-        if (syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, EXEC_SERVICE_ENDPOINT_ID, 3) == SYSCALL_OK &&
-            syscall2(SYSCALL_SHARE_CAP, request_paddr, EXEC_SERVICE_ENDPOINT_ID) == SYSCALL_OK) {
+        if (syscall3(
+                SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT,
+                request_token,
+                EXEC_SERVICE_ENDPOINT_ID,
+                IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP
+            ) == SYSCALL_OK) {
             break;
         }
         if (attempts++ >= wait_ticks) return 0;

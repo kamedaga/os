@@ -118,6 +118,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_UNAME: msg = handle_uname(req); break;
         case LINUX_SYS_TIME: msg = handle_time_syscall(req); break;
         case LINUX_SYS_GETTIMEOFDAY: msg = handle_gettimeofday(req); break;
+        case LINUX_SYS_SYSINFO: msg = handle_sysinfo(req); break;
         case LINUX_SYS_CLOCK_GETTIME: msg = handle_clock_gettime(req); break;
         case LINUX_SYS_SCHED_GETAFFINITY: msg = handle_sched_getaffinity(req); break;
         case LINUX_SYS_MEMBARRIER: msg = handle_membarrier(req); break;

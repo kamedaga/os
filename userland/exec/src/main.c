@@ -27,14 +27,15 @@ enum {
     SYSCALL_ABORT_PROCESS = 0x46,
     SYSCALL_COPY_TO_PROCESS = 0x47,
     SYSCALL_SET_PROCESS_ABI_TRAP_DELEGATE = 0x4B,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER = 0x61,
+    SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
     SYSCALL_OK = 0,
     PAGE_BYTES = 4096,
     USER_STACK_TOP = 0x3C000000,
-    LINUX_STACK_PAGES = 64,
+    LINUX_STACK_PAGES = 128,
     LINUX_STACK_BYTES = LINUX_STACK_PAGES * PAGE_BYTES,
     LINUX_STACK_BOTTOM_VA = USER_STACK_TOP - LINUX_STACK_BYTES,
-    SERVICE_REQUEST_VA = 0x26000000,
-    SERVICE_RESPONSE_VA = 0x26001000,
     SOURCE_IMAGE_BASE_VA = 0x28000000,
     SOURCE_IMAGE_SLOT_SPAN = 0x02000000,
     SOURCE_IMAGE_SLOT_COUNT = 8,
@@ -46,6 +47,8 @@ enum {
     EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
     PROCESS_BUILDER_TOKEN_TAG = 1ULL << 60,
     PROCESS_BUILDER_PROCESS_MASK = 0xffffffffULL,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
     VM_RIGHT_READ_MAP = 0x5,
@@ -122,6 +125,10 @@ struct aux_entry {
 
 static u64 service_request_paddr;
 static u64 service_response_paddr;
+static u64 service_request_token;
+static u64 service_response_token;
+static u64 service_request_va;
+static u64 service_response_va;
 static u64 service_last_request_seq;
 static u64 service_interpreter_vm_token;
 static u64 service_interpreter_file_bytes;
@@ -219,8 +226,20 @@ static void process_exit(u64 code) {
     for (;;) __asm__ volatile("pause");
 }
 
-static int map_page(u64 va, u64 paddr, u64 writable) {
-    return syscall3(SYSCALL_MAP_PAGE, va, paddr, writable) == SYSCALL_OK;
+static u64 map_page_anywhere(u64 paddr, u64 writable) {
+    return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, writable);
+}
+
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static u64 accept_ipc_buffer_transfer(u64 transfer_id) {
+    return syscall1(SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER, transfer_id);
+}
+
+static u64 map_ipc_buffer_anywhere(u64 token, u64 writable) {
+    return syscall2(SYSCALL_MAP_IPC_BUFFER_ANYWHERE, token, writable);
 }
 
 static int is_vm_object_token(u64 token) {
@@ -267,6 +286,18 @@ static int map_vm_object_to_process(u64 process_token, u64 vm_token, u64 target_
 
 static int alloc_map_pages_to_process(u64 process_token, u64 target_va, u64 page_count, u64 prot_bits) {
     return syscall5(SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS, process_token, target_va, page_count, prot_bits, 0) == SYSCALL_OK;
+}
+
+static int alloc_map_pages_to_process_chunked(u64 process_token, u64 target_va, u64 page_count, u64 prot_bits) {
+    const u64 max_batch_pages = 64;
+    u64 done = 0;
+    while (done < page_count) {
+        const u64 remaining = page_count - done;
+        const u64 batch = remaining < max_batch_pages ? remaining : max_batch_pages;
+        if (!alloc_map_pages_to_process(process_token, target_va + done * PAGE_BYTES, batch, prot_bits)) return 0;
+        done += batch;
+    }
+    return 1;
 }
 
 static int copy_to_process(u64 process_token, u64 dest_va, u64 src_va, u64 byte_len) {
@@ -523,7 +554,7 @@ static int install_linux_initial_stack(
     const struct linux_stack_config *config,
     u64 *initial_rsp_out
 ) {
-    if (!alloc_map_pages_to_process(process_token, LINUX_STACK_BOTTOM_VA, LINUX_STACK_PAGES, 3)) return 0;
+    if (!alloc_map_pages_to_process_chunked(process_token, LINUX_STACK_BOTTOM_VA, LINUX_STACK_PAGES, 3)) return 0;
 
     u64 sp = USER_STACK_TOP;
     const unsigned char random_bytes[16] = {
@@ -1273,7 +1304,8 @@ static int prepare_and_start_process(const struct exec_bootstrap_config *cfg, st
 static int map_service_request_page(u64 request_paddr) {
     if (service_request_paddr == request_paddr) return 1;
     if (service_request_paddr != 0) return 0;
-    if (!map_page(SERVICE_REQUEST_VA, request_paddr, 0)) return 0;
+    service_request_va = map_page_anywhere(request_paddr, 0);
+    if (service_request_va < PAGE_BYTES) return 0;
     service_request_paddr = request_paddr;
     return 1;
 }
@@ -1281,13 +1313,32 @@ static int map_service_request_page(u64 request_paddr) {
 static int map_service_response_page(u64 response_paddr) {
     if (service_response_paddr == response_paddr) return 1;
     if (service_response_paddr != 0) return 0;
-    if (!map_page(SERVICE_RESPONSE_VA, response_paddr, 1)) return 0;
+    service_response_va = map_page_anywhere(response_paddr, 1);
+    if (service_response_va < PAGE_BYTES) return 0;
     service_response_paddr = response_paddr;
     return 1;
 }
 
+static int map_service_request_buffer(u64 request_token) {
+    if (service_request_token == request_token) return 1;
+    if (service_request_token != 0) return 0;
+    service_request_va = map_ipc_buffer_anywhere(request_token, 0);
+    if (service_request_va < PAGE_BYTES) return 0;
+    service_request_token = request_token;
+    return 1;
+}
+
+static int map_service_response_buffer(u64 response_token) {
+    if (service_response_token == response_token) return 1;
+    if (service_response_token != 0) return 0;
+    service_response_va = map_ipc_buffer_anywhere(response_token, 1);
+    if (service_response_va < PAGE_BYTES) return 0;
+    service_response_token = response_token;
+    return 1;
+}
+
 static void write_service_response(u64 seq, u64 status, u64 child_process_slot) {
-    volatile struct exec_launch_response *response = (volatile struct exec_launch_response *)SERVICE_RESPONSE_VA;
+    volatile struct exec_launch_response *response = (volatile struct exec_launch_response *)service_response_va;
     response->magic = EXEC_LAUNCH_RESPONSE_MAGIC;
     response->version = EXEC_LAUNCH_VERSION;
     response->op = EXEC_LAUNCH_OP_START;
@@ -1297,8 +1348,8 @@ static void write_service_response(u64 seq, u64 status, u64 child_process_slot) 
 }
 
 static u64 pending_mapped_service_request_seq(void) {
-    if (service_request_paddr == 0) return 0;
-    const volatile struct exec_launch_request *request = (const volatile struct exec_launch_request *)SERVICE_REQUEST_VA;
+    if (service_request_paddr == 0 && service_request_token == 0) return 0;
+    const volatile struct exec_launch_request *request = (const volatile struct exec_launch_request *)service_request_va;
     if (request->magic != EXEC_LAUNCH_REQUEST_MAGIC ||
         request->version != EXEC_LAUNCH_VERSION ||
         request->op != EXEC_LAUNCH_OP_START) {
@@ -1307,24 +1358,72 @@ static u64 pending_mapped_service_request_seq(void) {
     return request->seq;
 }
 
+static void handle_mapped_service_request(void) {
+    const volatile struct exec_launch_request *request = (const volatile struct exec_launch_request *)service_request_va;
+    if (request->magic != EXEC_LAUNCH_REQUEST_MAGIC ||
+        request->version != EXEC_LAUNCH_VERSION ||
+        request->op != EXEC_LAUNCH_OP_START ||
+        !is_ipc_buffer_token(request->response_token)) {
+        user_log("Exec: service request invalid\n");
+        return;
+    }
+
+    service_last_request_seq = request->seq;
+    if (!map_service_response_buffer(request->response_token)) {
+        user_log("Exec: service response map failed\n");
+        return;
+    }
+
+    struct exec_bootstrap_config *config = &service_request_config;
+    {
+        const volatile unsigned char *src = (const volatile unsigned char *)&request->config;
+        unsigned char *dst = (unsigned char *)config;
+        for (u64 i = 0; i < sizeof(*config); i++) dst[i] = src[i];
+    }
+    if (!is_vm_object_token(config->interpreter_vm_token) && is_vm_object_token(service_interpreter_vm_token)) {
+        config->interpreter_vm_token = service_interpreter_vm_token;
+        config->interpreter_file_bytes = service_interpreter_file_bytes;
+    }
+
+    if (!valid_config(config)) {
+        write_service_response(request->seq, EXEC_LAUNCH_STATUS_INVALID, 0);
+        return;
+    }
+
+    struct loaded_image image;
+    u64 child_process_slot = 0;
+    if (!prepare_and_start_process(config, &image, &child_process_slot)) {
+        write_service_response(request->seq, EXEC_LAUNCH_STATUS_LAUNCH_FAILED, 0);
+        return;
+    }
+    (void)image;
+
+    user_log("Exec: launch ok\n");
+    write_service_response(request->seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
+}
+
+static void handle_service_request_token(u64 request_token) {
+    if (!map_service_request_buffer(request_token)) {
+        user_log("Exec: service request token map failed\n");
+        return;
+    }
+    handle_mapped_service_request();
+}
+
 static void handle_service_request(u64 request_paddr) {
     if (!map_service_request_page(request_paddr)) {
         user_log("Exec: service request map failed\n");
         return;
     }
 
-    const volatile struct exec_launch_request *request = (const volatile struct exec_launch_request *)SERVICE_REQUEST_VA;
-    if (request->magic != EXEC_LAUNCH_REQUEST_MAGIC ||
-        request->version != EXEC_LAUNCH_VERSION ||
-        request->op != EXEC_LAUNCH_OP_START ||
-        request->response_paddr < PAGE_BYTES) {
-        user_log("Exec: service request invalid\n");
+    const volatile struct exec_launch_request *request = (const volatile struct exec_launch_request *)service_request_va;
+    if (request->response_token < PAGE_BYTES) {
+        user_log("Exec: service legacy response invalid\n");
         return;
     }
-
     service_last_request_seq = request->seq;
-    if (!map_service_response_page(request->response_paddr)) {
-        user_log("Exec: service response map failed\n");
+    if (!map_service_response_page(request->response_token)) {
+        user_log("Exec: service legacy response map failed\n");
         return;
     }
 
@@ -1369,14 +1468,20 @@ static void run_exec_service(const struct exec_bootstrap_config *cfg) {
     for (;;) {
         const u64 received = wait_event(1, 1);
         if (received >= PAGE_BYTES) {
-            const u64 request_paddr = accept_cap_transfer(received);
-            if (request_paddr >= PAGE_BYTES) handle_service_request(request_paddr);
+            const u64 request_token = accept_ipc_buffer_transfer(received);
+            if (is_ipc_buffer_token(request_token)) {
+                handle_service_request_token(request_token);
+            } else {
+                const u64 request_paddr = accept_cap_transfer(received);
+                if (request_paddr >= PAGE_BYTES) handle_service_request(request_paddr);
+            }
             continue;
         }
 
         const u64 seq = pending_mapped_service_request_seq();
         if (seq != 0 && seq != service_last_request_seq) {
-            handle_service_request(service_request_paddr);
+            if (service_request_token != 0) handle_mapped_service_request();
+            else handle_service_request(service_request_paddr);
         }
     }
 }

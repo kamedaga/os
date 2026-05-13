@@ -5,7 +5,25 @@ const interrupts = @import("interrupts.zig");
 pub const UserAddressSpace = struct {
     // Includes user VA mappings plus supervisor-only helper PTs for return stacks.
     pub const max_dynamic_pt_pages: usize = 320;
+    pub const max_reservations: usize = 2048;
     pub const no_pd_index: u16 = 0xFFFF;
+
+    pub const ReservationKind = enum(u8) {
+        none = 0,
+        bootstrap = 1,
+        capability_page = 2,
+        fresh_page = 3,
+        linear_region = 4,
+    };
+
+    pub const Reservation = struct {
+        base_va: u64 = 0,
+        page_count: u32 = 0,
+        generation: u32 = 0,
+        kind: ReservationKind = .none,
+        writable: bool = false,
+        active: bool = false,
+    };
 
     pml4: [512]u64 align(4096) = [_]u64{0} ** 512,
     pdp: [512]u64 align(4096) = [_]u64{0} ** 512,
@@ -13,6 +31,8 @@ pub const UserAddressSpace = struct {
     pt_pages: [max_dynamic_pt_pages][512]u64 align(4096) = [_][512]u64{[_]u64{0} ** 512} ** max_dynamic_pt_pages,
     pt_page_pd_index: [max_dynamic_pt_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pt_pages,
     pt_page_used_len: u16 = 0,
+    reservations: [max_reservations]Reservation = [_]Reservation{.{}} ** max_reservations,
+    reservation_generation: u32 = 0,
     cr3: u64 = 0,
 };
 
@@ -177,6 +197,220 @@ pub fn parseRights(bits: u64) kernel.Rights {
 
 fn pageAlignDown(addr: u64) u64 {
     return addr & ~@as(u64, 4095);
+}
+
+pub fn resetUserReservations(space: *UserAddressSpace) void {
+    @memset(space.reservations[0..], .{});
+    space.reservation_generation = 0;
+}
+
+fn reservationEndPage(base_va: u64, page_count: u64) ?u64 {
+    if (page_count == 0) return null;
+    if ((base_va & 0xFFF) != 0) return null;
+    const base_page = base_va >> 12;
+    const end_page, const overflow = @addWithOverflow(base_page, page_count);
+    if (overflow != 0) return null;
+    return end_page;
+}
+
+fn reservationOverlaps(base_a: u64, count_a: u64, base_b: u64, count_b: u64) bool {
+    const end_a = reservationEndPage(base_a, count_a) orelse return true;
+    const end_b = reservationEndPage(base_b, count_b) orelse return true;
+    const start_a = base_a >> 12;
+    const start_b = base_b >> 12;
+    return start_a < end_b and start_b < end_a;
+}
+
+fn logReservationOverlap(
+    principal: kernel.PrincipalId,
+    base_va: u64,
+    page_count: u64,
+    existing: *const UserAddressSpace.Reservation,
+) void {
+    runtime.serial_write("user reservation overlap proc=");
+    runtime.serial_write(runtime.principal_label(principal));
+    runtime.serial_write(" base=");
+    runtime.print_hex(base_va);
+    runtime.serial_write(" pages=");
+    runtime.print_hex(page_count);
+    runtime.serial_write(" existing_base=");
+    runtime.print_hex(existing.base_va);
+    runtime.serial_write(" existing_pages=");
+    runtime.print_hex(existing.page_count);
+    runtime.serial_write(" existing_kind=");
+    runtime.print_hex(@intFromEnum(existing.kind));
+    runtime.serial_write("\n");
+}
+
+pub fn canReserveUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
+    if (!runtime_ready) return false;
+    const space = getUserSpace(principal) orelse return false;
+    _ = reservationEndPage(base_va, page_count) orelse return false;
+    for (&space.reservations) |*reservation| {
+        if (!reservation.active) continue;
+        if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
+        logReservationOverlap(principal, base_va, page_count, reservation);
+        return false;
+    }
+    return true;
+}
+
+pub fn reserveUserMapping(
+    principal: kernel.PrincipalId,
+    base_va: u64,
+    page_count: u64,
+    kind: UserAddressSpace.ReservationKind,
+    writable: bool,
+) bool {
+    if (!runtime_ready) return false;
+    if (kind == .none) return false;
+    if (page_count > std.math.maxInt(u32)) return false;
+    const space = getUserSpace(principal) orelse return false;
+    _ = reservationEndPage(base_va, page_count) orelse return false;
+    for (&space.reservations) |*reservation| {
+        if (!reservation.active) continue;
+        if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
+        logReservationOverlap(principal, base_va, page_count, reservation);
+        return false;
+    }
+    for (&space.reservations) |*reservation| {
+        if (reservation.active) continue;
+        space.reservation_generation +%= 1;
+        reservation.* = .{
+            .base_va = base_va,
+            .page_count = @intCast(page_count),
+            .generation = space.reservation_generation,
+            .kind = kind,
+            .writable = writable,
+            .active = true,
+        };
+        return true;
+    }
+    runtime.serial_write("user reservation table full proc=");
+    runtime.serial_write(runtime.principal_label(principal));
+    runtime.serial_write(" base=");
+    runtime.print_hex(base_va);
+    runtime.serial_write(" pages=");
+    runtime.print_hex(page_count);
+    runtime.serial_write("\n");
+    return false;
+}
+
+fn releaseReservationRecord(
+    space: *UserAddressSpace,
+    index: usize,
+    release_start_page: u64,
+    release_end_page: u64,
+) bool {
+    const reservation = &space.reservations[index];
+    const record_start_page = reservation.base_va >> 12;
+    const record_end_page = record_start_page + reservation.page_count;
+    if (release_start_page <= record_start_page and release_end_page >= record_end_page) {
+        reservation.* = .{};
+        return true;
+    }
+    if (release_start_page <= record_start_page) {
+        const new_count = record_end_page - release_end_page;
+        reservation.base_va = release_end_page << 12;
+        reservation.page_count = @intCast(new_count);
+        return true;
+    }
+    if (release_end_page >= record_end_page) {
+        const new_count = release_start_page - record_start_page;
+        reservation.page_count = @intCast(new_count);
+        return true;
+    }
+
+    const right_count = record_end_page - release_end_page;
+    for (&space.reservations) |*free_record| {
+        if (free_record.active) continue;
+        space.reservation_generation +%= 1;
+        free_record.* = .{
+            .base_va = release_end_page << 12,
+            .page_count = @intCast(right_count),
+            .generation = space.reservation_generation,
+            .kind = reservation.kind,
+            .writable = reservation.writable,
+            .active = true,
+        };
+        reservation.page_count = @intCast(release_start_page - record_start_page);
+        return true;
+    }
+    return false;
+}
+
+pub fn releaseUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
+    if (!runtime_ready) return false;
+    const space = getUserSpace(principal) orelse return false;
+    const release_end_page = reservationEndPage(base_va, page_count) orelse return false;
+    const release_start_page = base_va >> 12;
+    var changed = false;
+    var index: usize = 0;
+    while (index < UserAddressSpace.max_reservations) : (index += 1) {
+        const reservation = &space.reservations[index];
+        if (!reservation.active) continue;
+        const record_start_page = reservation.base_va >> 12;
+        const record_end_page = record_start_page + reservation.page_count;
+        if (record_start_page >= release_end_page or release_start_page >= record_end_page) continue;
+        const overlap_start = if (release_start_page > record_start_page) release_start_page else record_start_page;
+        const overlap_end = if (release_end_page < record_end_page) release_end_page else record_end_page;
+        if (!releaseReservationRecord(space, index, overlap_start, overlap_end)) return false;
+        changed = true;
+    }
+    return changed;
+}
+
+fn userDynamicMapRange() ?struct { start_page: u64, end_page: u64 } {
+    const base = runtime.user_va + 0x0300_0000;
+    const layout_end = runtime.user_va + 0x1C00_0000;
+    const pdp_base = (runtime.user_va >> 30) << 30;
+    const pdp_end = pdp_base + 0x4000_0000;
+    const end = if (layout_end < pdp_end) layout_end else pdp_end;
+    const start_page = (base + 0xFFF) >> 12;
+    const end_page = end >> 12;
+    if (start_page >= end_page) return null;
+    return .{ .start_page = start_page, .end_page = end_page };
+}
+
+fn rangeOverlapsActiveReservation(space: *const UserAddressSpace, base_va: u64, page_count: u64) bool {
+    for (&space.reservations) |*reservation| {
+        if (!reservation.active) continue;
+        if (reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) return true;
+    }
+    return false;
+}
+
+fn rangeHasPresentUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const va = base_va + page_index * 4096;
+        if (lookupUserMappedPaddrForVa(principal, va) != null) return true;
+    }
+    return false;
+}
+
+pub fn findFreeUserMappingRange(principal: kernel.PrincipalId, page_count: u64, align_pages: u64) ?u64 {
+    if (!runtime_ready) return null;
+    if (page_count == 0) return null;
+    const alignment = if (align_pages == 0) @as(u64, 1) else align_pages;
+    const space = getUserSpace(principal) orelse return null;
+    const range = userDynamicMapRange() orelse return null;
+    var base_page = range.start_page;
+    const align_mask = alignment - 1;
+    if ((alignment & align_mask) == 0) {
+        base_page = (base_page + align_mask) & ~align_mask;
+    } else {
+        const rem = base_page % alignment;
+        if (rem != 0) base_page += alignment - rem;
+    }
+
+    while (base_page <= range.end_page and page_count <= range.end_page - base_page) : (base_page += alignment) {
+        const base_va = base_page << 12;
+        if (rangeOverlapsActiveReservation(space, base_va, page_count)) continue;
+        if (rangeHasPresentUserMapping(principal, base_va, page_count)) continue;
+        return base_va;
+    }
+    return null;
 }
 
 fn userPdIndexForVa(va: u64) ?usize {
@@ -401,6 +635,7 @@ noinline fn clearAliasMappings(
             if (entry == 0) continue;
             pt_page[i] = 0;
             const alias_va = aliasVaForPdPt(slot_pd_index, i);
+            _ = releaseUserMapping(principal, alias_va, 1);
             runtime.flush_user_tlb_for_principal_va(principal, alias_va);
         }
     }
@@ -470,14 +705,45 @@ pub fn mapUserPageFromCapability(
     if (!cap.rights.cpu_read) return false;
     if (writable and !cap.rights.cpu_write) return false;
 
+    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
+    const old_entry = map_pt_page[pt_index];
+    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) return false;
+    if (!reserveUserMapping(principal, va, 1, .capability_page, writable)) return false;
+
     clearAliasMappings(space, principal, paddr, map_slot, pt_index);
     if (diag) logMapMmioDiagPostAliasLoop(space, map_slot, pt_index);
 
-    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
     map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     if (diag) logMapMmioDiagPostPteWrite();
     runtime.flush_user_tlb_for_principal_va(principal, va);
     if (diag) logMapMmioDiagPostMap();
+    return true;
+}
+
+pub fn mapTrustedUserPage(
+    principal: kernel.PrincipalId,
+    va: u64,
+    paddr: u64,
+    writable: bool,
+) bool {
+    if (!runtime_ready) return false;
+    const space = getUserSpace(principal) orelse return false;
+    if ((va & 0xFFF) != 0) return false;
+    if ((paddr & 0xFFF) != 0) return false;
+    if (paddr >= runtime.physical_map_limit) return false;
+
+    const pd_index = userPdIndexForVa(va) orelse return false;
+    const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+    const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
+
+    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
+    const old_entry = map_pt_page[pt_index];
+    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) return false;
+    if (!reserveUserMapping(principal, va, 1, .capability_page, writable)) return false;
+
+    clearAliasMappings(space, principal, paddr, map_slot, pt_index);
+    map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
+    runtime.flush_user_tlb_for_principal_va(principal, va);
     return true;
 }
 
@@ -503,6 +769,9 @@ fn mapUserPageFromCapabilityNoAlias(
     if (writable and !cap.rights.cpu_write) return false;
 
     const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
+    const old_entry = map_pt_page[pt_index];
+    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) return false;
+    if (!reserveUserMapping(principal, va, 1, .capability_page, writable)) return false;
     map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     runtime.flush_user_tlb_for_principal_va(principal, va);
     return true;
@@ -593,6 +862,7 @@ pub fn mapFreshUserPage(
         runtime.serial_write("\n");
         return false;
     }
+    if (!reserveUserMapping(principal, va, 1, .fresh_page, writable)) return false;
 
     map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     runtime.flush_user_tlb_for_principal_va(principal, va);
@@ -617,7 +887,9 @@ pub fn dropPresentForUserMappedPaddr(
             if ((entry & runtime.page_addr_mask) != paddr) continue;
             if ((entry & runtime.page_present) == 0) continue;
             pt_page[i] = entry & ~runtime.page_present;
-            runtime.flush_user_tlb_for_principal_va(principal, aliasVaForPdPt(slot_pd_index, i));
+            const va = aliasVaForPdPt(slot_pd_index, i);
+            _ = releaseUserMapping(principal, va, 1);
+            runtime.flush_user_tlb_for_principal_va(principal, va);
             return true;
         }
     }
@@ -653,6 +925,9 @@ noinline fn syncPageTableRightsScan(
             if (new_entry == old_entry) continue;
             pt_page[i] = new_entry;
             const va = aliasVaForPdPt(slot_pd_index, i);
+            if (new_entry == 0) {
+                _ = releaseUserMapping(principal, va, 1);
+            }
             runtime.flush_user_tlb_for_principal_va(principal, va);
         }
     }
@@ -800,4 +1075,117 @@ test "lookupUserMappedPaddrForVa rejects supervisor-only entries" {
 
     spaces[0].pt_pages[0][1] |= 0x4;
     try std.testing.expectEqual(@as(?u64, 0x1234_5000), lookupUserMappedPaddrForVa(.Process0, 0x1000));
+}
+
+test "user reservations reject overlap and split on release" {
+    var spaces = [_]UserAddressSpace{.{}} ** 1;
+
+    init(.{
+        .user_spaces = spaces[0..],
+        .user_va = 0,
+        .physical_map_limit = 0x1_0000_0000,
+        .page_entries = 512,
+        .page_addr_mask = 0x000f_ffff_ffff_f000,
+        .page_present = 0x1,
+        .page_rw = 0x2,
+        .page_user = 0x4,
+        .canonical_user_limit_exclusive = 0x0000_8000_0000_0000,
+        .serial_write = testSerialWrite,
+        .print_hex = testPrintHex,
+        .principal_label = testPrincipalLabel,
+        .flush_user_tlb_for_principal_va = testFlushUserTlb,
+    });
+
+    try std.testing.expect(reserveUserMapping(.Process0, 0x2000, 4, .linear_region, true));
+    try std.testing.expect(!reserveUserMapping(.Process0, 0x3000, 1, .fresh_page, true));
+    try std.testing.expect(releaseUserMapping(.Process0, 0x3000, 1));
+    try std.testing.expect(reserveUserMapping(.Process0, 0x3000, 1, .fresh_page, true));
+    try std.testing.expect(!reserveUserMapping(.Process0, 0x5000, 1, .fresh_page, true));
+}
+
+test "findFreeUserMappingRange skips active reservations" {
+    var spaces = [_]UserAddressSpace{.{}} ** 1;
+
+    init(.{
+        .user_spaces = spaces[0..],
+        .user_va = 0x2000_0000,
+        .physical_map_limit = 0x1_0000_0000,
+        .page_entries = 512,
+        .page_addr_mask = 0x000f_ffff_ffff_f000,
+        .page_present = 0x1,
+        .page_rw = 0x2,
+        .page_user = 0x4,
+        .canonical_user_limit_exclusive = 0x0000_8000_0000_0000,
+        .serial_write = testSerialWrite,
+        .print_hex = testPrintHex,
+        .principal_label = testPrincipalLabel,
+        .flush_user_tlb_for_principal_va = testFlushUserTlb,
+    });
+
+    const first = findFreeUserMappingRange(.Process0, 2, 1).?;
+    try std.testing.expectEqual(@as(u64, 0x2300_0000), first);
+    try std.testing.expect(reserveUserMapping(.Process0, first, 2, .linear_region, true));
+    const second = findFreeUserMappingRange(.Process0, 2, 1).?;
+    try std.testing.expectEqual(@as(u64, 0x2300_2000), second);
+}
+
+test "ipc buffer token encode decode and rights subset" {
+    const ipc_buffer_abi = @import("kernel_abi_root").ipc_buffer_abi;
+    const token = ipc_buffer_abi.encodeIpcBufferToken(0x1234);
+    try std.testing.expectEqual(@as(?u64, 0x1234), ipc_buffer_abi.decodeIpcBufferToken(token));
+    try std.testing.expectEqual(@as(?u64, null), ipc_buffer_abi.decodeIpcBufferToken(0x1234));
+
+    var state: kernel.KernelState = .{};
+    try std.testing.expect(state.ensureProcessDescriptor(.Process0, "p0"));
+    try state.installCap(.Process0, 0x4000, .{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true });
+
+    const root_id = try state.createIpcBufferFromPage(.Process0, 0x4000, .{
+        .read = true,
+        .write = true,
+        .map = true,
+        .grant = true,
+    }, .request);
+    try std.testing.expect(root_id != 0);
+    try state.installCap(.Process0, 0x7000, .{ .cpu_read = true, .cpu_write = false, .dma = false, .grant = true });
+    try std.testing.expectError(kernel.KernelError.InvalidState, state.createIpcBufferFromPage(.Process0, 0x7000, .{
+        .read = true,
+        .write = true,
+        .map = true,
+        .grant = true,
+    }, .request));
+}
+
+test "ipc buffer grant tree and wrong-kind accept does not consume page transfer" {
+    var state: kernel.KernelState = .{};
+    try std.testing.expect(state.ensureProcessDescriptor(.Process0, "p0"));
+    try std.testing.expect(state.ensureProcessDescriptor(.Process1, "p1"));
+
+    try state.installCap(.Process0, 0x5000, .{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true });
+    const root_id = try state.createIpcBufferFromPage(.Process0, 0x5000, .{
+        .read = true,
+        .write = true,
+        .map = true,
+        .grant = true,
+    }, .response);
+    const child_id = try state.grantIpcBufferCap(.Process0, .Process1, root_id, .{
+        .read = true,
+        .write = false,
+        .map = true,
+        .grant = false,
+    });
+    const child = state.getIpcBufferTableConst(.Process1).findByCapId(child_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0x5000), child.paddr);
+    try std.testing.expectEqual(root_id, child.root_cap_id);
+    try std.testing.expectEqual(root_id, child.parent_cap_id);
+    try std.testing.expect(child.rights.read);
+    try std.testing.expect(!child.rights.write);
+    try std.testing.expect(child.rights.map);
+    try std.testing.expect(!child.rights.grant);
+
+    try state.installEndpoint(.Process0, 0x80, .Process1);
+    try state.installCap(.Process0, 0x6000, .{ .cpu_read = true, .cpu_write = true, .dma = false, .grant = true });
+    try state.shareCapOnEndpoint(.Process0, 0x80, 0x6000);
+    const page_transfer_id = try state.recvCap(.Process1);
+    try std.testing.expectError(kernel.KernelError.MailboxEmpty, state.acceptIpcBufferTransfer(.Process1, page_transfer_id));
+    try std.testing.expectEqual(@as(u64, 0x6000), try state.acceptCapTransfer(.Process1, page_transfer_id));
 }

@@ -20,24 +20,33 @@ static int signal_endpoint(u64 endpoint_id) {
     return syscall2(SYSCALL_SIGNAL_ENDPOINT, endpoint_id, 0) == SYSCALL_OK;
 }
 
-static int grant_response_page(u64 response_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-    if (ret == SYSCALL_OK) return 1;
+static int create_console_ipc_buffers(void) {
+    const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
+    g_console.request_token = create_ipc_buffer_from_page(g_console.request_paddr, owner_rights, IPC_BUFFER_ROLE_REQUEST);
+    g_console.response_token = create_ipc_buffer_from_page(g_console.response_paddr, owner_rights, IPC_BUFFER_ROLE_RESPONSE);
+    return is_ipc_buffer_token(g_console.request_token) && is_ipc_buffer_token(g_console.response_token);
+}
+
+static u64 grant_console_response_buffer(u64 endpoint_id, u64 process_slot) {
+    const u64 rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP;
+    u64 token = grant_ipc_buffer_on_endpoint(g_console.response_token, endpoint_id, rights);
+    if (is_ipc_buffer_token(token)) return token;
     if (install_endpoint(endpoint_id, process_slot)) {
-        ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
+        token = grant_ipc_buffer_on_endpoint(g_console.response_token, endpoint_id, rights);
     }
-    return ret == SYSCALL_OK;
+    return is_ipc_buffer_token(token) ? token : 0;
 }
 
-static int share_request_page(u64 request_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 ret = syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id);
+static int share_console_request_buffer(u64 endpoint_id, u64 process_slot) {
+    const u64 rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP;
+    u64 ret = share_ipc_buffer_on_endpoint(g_console.request_token, endpoint_id, rights);
     if (ret == SYSCALL_OK) return 1;
-    if (install_endpoint(endpoint_id, process_slot)) ret = syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id);
+    if (install_endpoint(endpoint_id, process_slot)) ret = share_ipc_buffer_on_endpoint(g_console.request_token, endpoint_id, rights);
     return ret == SYSCALL_OK;
 }
 
-static u64 make_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x5454595345525631ULL;
+static u64 make_nonce(u64 request_token, u64 response_token, u64 endpoint_id, u64 process_slot) {
+    u64 nonce = request_token ^ ((response_token << 17) | (response_token >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x5454595345525631ULL;
     return nonce == 0 ? 1 : nonce;
 }
 
@@ -54,9 +63,10 @@ static volatile u8 *payload_at(u64 va, u64 header_bytes) {
 }
 
 static int wait_console_response(u64 expected_seq, u16 expected_op, u64 poll_limit) {
-    volatile struct console_response_header *response = response_at(TTY_CONSOLE_RESPONSE_VA);
+    volatile struct console_response_header *response = response_at(g_console.response_va);
     for (u64 i = 0; poll_limit == 0 || i < poll_limit; i++) {
         if (response->response_seq == expected_seq) {
+            __sync_synchronize();
             return response->magic == CONSOLE_RESPONSE_MAGIC &&
                 response->version == CONSOLE_PROTOCOL_VERSION &&
                 response->op == expected_op;
@@ -68,9 +78,9 @@ static int wait_console_response(u64 expected_seq, u16 expected_op, u64 poll_lim
 
 static int console_begin_request(u16 op, u32 length, u32 flags, const char *inline_src, u32 inline_bytes, u64 *seq_out) {
     if (!g_console.active || inline_bytes > CONSOLE_REQUEST_PAYLOAD_BYTES) return 0;
-    clear_page(TTY_CONSOLE_REQUEST_VA);
-    clear_page(TTY_CONSOLE_RESPONSE_VA);
-    volatile struct console_request_header *request = request_at(TTY_CONSOLE_REQUEST_VA);
+    clear_page(g_console.request_va);
+    clear_page(g_console.response_va);
+    volatile struct console_request_header *request = request_at(g_console.request_va);
     const u64 seq = g_console.next_seq++;
     request->magic = CONSOLE_REQUEST_MAGIC;
     request->version = CONSOLE_PROTOCOL_VERSION;
@@ -79,11 +89,12 @@ static int console_begin_request(u16 op, u32 length, u32 flags, const char *inli
     request->length = length;
     request->flags = flags;
     if (inline_bytes != 0) {
-        volatile u8 *payload = payload_at(TTY_CONSOLE_REQUEST_VA, CONSOLE_REQUEST_HEADER_BYTES);
+        volatile u8 *payload = payload_at(g_console.request_va, CONSOLE_REQUEST_HEADER_BYTES);
         for (u32 i = 0; i < inline_bytes; i++) payload[i] = (u8)inline_src[i];
     }
-    __asm__ volatile("" ::: "memory");
+    __sync_synchronize();
     request->request_seq = seq;
+    __sync_synchronize();
     if (!signal_endpoint(g_console.endpoint_id)) return 0;
     *seq_out = seq;
     return 1;
@@ -97,26 +108,30 @@ static int backend_connect_console(void) {
     g_console.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_console.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (g_console.request_paddr < PAGE_BYTES || g_console.response_paddr < PAGE_BYTES) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, TTY_CONSOLE_REQUEST_VA, g_console.request_paddr, 1) != SYSCALL_OK) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, TTY_CONSOLE_RESPONSE_VA, g_console.response_paddr, 1) != SYSCALL_OK) return 0;
-    if (!grant_response_page(g_console.response_paddr, g_console.endpoint_id, g_console.process_slot)) return 0;
+    g_console.request_va = map_page_anywhere(g_console.request_paddr, 1);
+    g_console.response_va = map_page_anywhere(g_console.response_paddr, 1);
+    if (g_console.request_va < PAGE_BYTES || g_console.response_va < PAGE_BYTES) return 0;
+    if (!create_console_ipc_buffers()) return 0;
+    const u64 remote_response_token = grant_console_response_buffer(g_console.endpoint_id, g_console.process_slot);
+    if (!is_ipc_buffer_token(remote_response_token)) return 0;
 
-    clear_page(TTY_CONSOLE_REQUEST_VA);
-    clear_page(TTY_CONSOLE_RESPONSE_VA);
+    clear_page(g_console.request_va);
+    clear_page(g_console.response_va);
     const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
-    g_console.session_nonce = make_nonce(g_console.request_paddr, g_console.response_paddr, g_console.endpoint_id, self_slot);
-    volatile struct console_request_header *request = request_at(TTY_CONSOLE_REQUEST_VA);
+    g_console.session_nonce = make_nonce(g_console.request_token, g_console.response_token, g_console.endpoint_id, self_slot);
+    volatile struct console_request_header *request = request_at(g_console.request_va);
     request->magic = CONSOLE_REQUEST_MAGIC;
     request->version = CONSOLE_PROTOCOL_VERSION;
     request->op = CONSOLE_OP_CONNECT;
     request->session_nonce = g_console.session_nonce;
-    request->arg0 = g_console.response_paddr;
+    request->arg0 = remote_response_token;
     request->arg1 = self_slot;
-    __asm__ volatile("" ::: "memory");
+    __sync_synchronize();
     request->request_seq = 1;
-    if (!share_request_page(g_console.request_paddr, g_console.endpoint_id, g_console.process_slot)) return 0;
+    __sync_synchronize();
+    if (!share_console_request_buffer(g_console.endpoint_id, g_console.process_slot)) return 0;
     if (!wait_console_response(1, CONSOLE_OP_CONNECT, 8192)) return 0;
-    volatile struct console_response_header *response = response_at(TTY_CONSOLE_RESPONSE_VA);
+    volatile struct console_response_header *response = response_at(g_console.response_va);
     if (response->status != CONSOLE_STATUS_OK) return 0;
     g_console.next_seq = 2;
     g_console.active = 1;
@@ -131,7 +146,7 @@ static u64 backend_write_bytes(const char *bytes, u64 len) {
         u64 seq = 0;
         if (!console_begin_request(CONSOLE_OP_WRITE, (u32)chunk, 0, bytes + done, (u32)chunk, &seq)) return done;
         if (!wait_console_response(seq, CONSOLE_OP_WRITE, 8192)) return done;
-        volatile struct console_response_header *response = response_at(TTY_CONSOLE_RESPONSE_VA);
+        volatile struct console_response_header *response = response_at(g_console.response_va);
         if (response->status != CONSOLE_STATUS_OK) return done;
         done += chunk;
     }
@@ -145,7 +160,7 @@ static u64 backend_try_read_raw(void) {
         return 0;
     }
     if (!wait_console_response(seq, CONSOLE_OP_READ, 8192)) return 0;
-    volatile struct console_response_header *response = response_at(TTY_CONSOLE_RESPONSE_VA);
+    volatile struct console_response_header *response = response_at(g_console.response_va);
     if (response->status == CONSOLE_STATUS_AGAIN) return 0;
     if (response->status != CONSOLE_STATUS_OK) return 0;
     return min_u64(response->inline_bytes, CONSOLE_RESPONSE_PAYLOAD_BYTES);

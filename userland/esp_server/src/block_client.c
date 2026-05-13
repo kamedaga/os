@@ -1,23 +1,28 @@
 #include "block_client.h"
 
 enum {
-    SYSCALL_ALLOC_MAP_PAGES = 0x0C,
     SYSCALL_GRANT_CAP = 0x08,
-    SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
-    SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_WAIT_EVENT = 0x17,
+    SYSCALL_ALLOC_MAP_PAGES_ANYWHERE = 0x5D,
+    SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
+    SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
+    SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
 
-    PAGE_RIGHT_CPU_READ = 0x1,
-    PAGE_RIGHT_CPU_WRITE = 0x2,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
+    IPC_BUFFER_RIGHT_READ = 0x1,
+    IPC_BUFFER_RIGHT_WRITE = 0x2,
+    IPC_BUFFER_RIGHT_MAP = 0x4,
+    IPC_BUFFER_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_ROLE_REQUEST = 1,
+    IPC_BUFFER_ROLE_RESPONSE = 2,
 
     SERVICE_REGISTRY_PAGE_VA = 0x3C2C0000,
-    BLOCK_REQUEST_VA = 0x23000000,
-    BLOCK_RESPONSE_VA = 0x23001000,
     RESPONSE_POLL_LIMIT = 512,
 };
 
@@ -51,17 +56,6 @@ static u64 syscall3(u64 nr, u64 arg0, u64 arg1, u64 arg2) {
     return ret;
 }
 
-static u64 syscall4(u64 nr, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
-    register u64 rcx __asm__("rcx") = arg3;
-    u64 ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret), "+c"(rcx)
-        : "a"(nr), "D"(arg0), "S"(arg1), "d"(arg2)
-        : "r8", "r9", "r10", "r11", "memory");
-    return ret;
-}
-
 static void clear_page(u64 va) {
     volatile u64 *p = (volatile u64 *)va;
     for (u64 i = 0; i < 512; i++) p[i] = 0;
@@ -92,24 +86,33 @@ static int install_compat_endpoint_if_needed(u64 endpoint_id, u64 process_slot) 
     return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, process_slot) == SYSCALL_OK;
 }
 
-static int grant_response_cap(u64 response_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static u64 create_ipc_buffer_from_page(u64 paddr, u64 rights_bits, u64 role) {
+    return syscall3(SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE, paddr, rights_bits, role);
+}
+
+static u64 grant_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits, u64 process_slot) {
+    u64 ret = syscall3(SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits);
+    if (is_ipc_buffer_token(ret)) return ret;
+    if (ret != SYSCALL_ERR_ENDPOINT) return 0;
+    if (!install_compat_endpoint_if_needed(endpoint_id, process_slot)) return 0;
+    ret = syscall3(SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits);
+    return is_ipc_buffer_token(ret) ? ret : 0;
+}
+
+static int share_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits, u64 process_slot) {
+    u64 ret = syscall3(SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits);
     if (ret == SYSCALL_OK) return 1;
     if (ret != SYSCALL_ERR_ENDPOINT) return 0;
     if (!install_compat_endpoint_if_needed(endpoint_id, process_slot)) return 0;
-    return syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, response_paddr, endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) == SYSCALL_OK;
+    return syscall3(SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits) == SYSCALL_OK;
 }
 
-static int share_request_cap(u64 request_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 ret = syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id);
-    if (ret == SYSCALL_OK) return 1;
-    if (ret != SYSCALL_ERR_ENDPOINT) return 0;
-    if (!install_compat_endpoint_if_needed(endpoint_id, process_slot)) return 0;
-    return syscall2(SYSCALL_SHARE_CAP, request_paddr, endpoint_id) == SYSCALL_OK;
-}
-
-static u64 make_session_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^
+static u64 make_token_session_nonce(u64 request_token, u64 response_token, u64 endpoint_id, u64 process_slot) {
+    u64 nonce = request_token ^ ((response_token << 17) | (response_token >> 47)) ^
         ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x517cc1b727220a95ULL;
     return nonce == 0 ? 1 : nonce;
 }
@@ -157,30 +160,44 @@ int block_client_connect(struct block_client *client) {
     if (!find_block_service(&endpoint_id, &process_slot)) return 0;
 
     u64 paddrs[2] = {0, 0};
-    if (syscall4(SYSCALL_ALLOC_MAP_PAGES, BLOCK_REQUEST_VA, 2, 1, (u64)paddrs) != SYSCALL_OK) return 0;
+    const u64 request_va = syscall3(SYSCALL_ALLOC_MAP_PAGES_ANYWHERE, 2, 1, (u64)paddrs);
+    const u64 response_va = request_va + BLOCK_PAGE_BYTES;
+    if (request_va < 0x1000) return 0;
     if (paddrs[0] < 0x1000 || paddrs[1] < 0x1000) return 0;
-    if (!grant_response_cap(paddrs[1], endpoint_id, process_slot)) return 0;
+    const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
+    const u64 request_token = create_ipc_buffer_from_page(paddrs[0], owner_rights, IPC_BUFFER_ROLE_REQUEST);
+    const u64 response_token = create_ipc_buffer_from_page(paddrs[1], owner_rights, IPC_BUFFER_ROLE_RESPONSE);
+    if (!is_ipc_buffer_token(request_token) || !is_ipc_buffer_token(response_token)) return 0;
+    const u64 remote_response_token = grant_ipc_buffer_on_endpoint(
+        response_token,
+        endpoint_id,
+        IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP,
+        process_slot
+    );
+    if (!is_ipc_buffer_token(remote_response_token)) return 0;
 
     u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
-    u64 nonce = make_session_nonce(paddrs[0], paddrs[1], endpoint_id, self_slot);
+    u64 nonce = make_token_session_nonce(request_token, response_token, endpoint_id, self_slot);
 
-    clear_page(BLOCK_REQUEST_VA);
-    clear_page(BLOCK_RESPONSE_VA);
-    volatile struct block_request_header *request = (volatile struct block_request_header *)BLOCK_REQUEST_VA;
+    clear_page(request_va);
+    clear_page(response_va);
+    volatile struct block_request_header *request = (volatile struct block_request_header *)request_va;
     request->magic = BLOCK_REQUEST_MAGIC;
     request->version = BLOCK_PROTOCOL_VERSION;
     request->op = BLOCK_OP_CONNECT;
     request->request_seq = 1;
-    request->arg0 = paddrs[1];
+    request->arg0 = remote_response_token;
     request->arg1 = self_slot;
     request->session_nonce = nonce;
 
-    if (!share_request_cap(paddrs[0], endpoint_id, process_slot)) return 0;
+    if (!share_ipc_buffer_on_endpoint(request_token, endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP, process_slot)) return 0;
 
-    client->request_va = BLOCK_REQUEST_VA;
-    client->response_va = BLOCK_RESPONSE_VA;
+    client->request_va = request_va;
+    client->response_va = response_va;
     client->request_paddr = paddrs[0];
     client->response_paddr = paddrs[1];
+    client->request_token = request_token;
+    client->response_token = response_token;
     client->endpoint_id = endpoint_id;
     client->server_process_slot = process_slot;
     client->session_nonce = nonce;

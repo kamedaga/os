@@ -9,8 +9,6 @@ struct exec_service_spawn_options {
     unsigned long long argv_count;
     const char * const *envp;
     unsigned long long envp_count;
-    unsigned long long request_va;
-    unsigned long long response_va;
     unsigned long long wait_ticks;
 };
 

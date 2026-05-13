@@ -167,7 +167,12 @@ static u64 detach_reply_token(void) { return syscall0(SYSCALL_DETACH_ABI_TRAP_RE
 static u64 share_reply_target_pages_to_trap_target(u64 principal, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4_r10(SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET, principal, target_va, page_count, prot_bits); }
 static u64 unmap_trap_target_pages(u64 principal, u64 target_va, u64 page_count) { return syscall3(SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES, principal, target_va, page_count); }
 static u64 alloc_map_pages(u64 target_va, u64 page_count, u64 flags) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, flags, 0); }
-static u64 alloc_map_pages_with_paddrs(u64 target_va, u64 page_count, u64 writable, u64 out_paddr_list_va) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, writable, out_paddr_list_va); }
+static u64 map_page_anywhere(u64 paddr, u64 flags) { return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, flags); }
+static u64 alloc_map_pages_anywhere(u64 page_count, u64 flags, u64 out_paddr_list_addr) { return syscall3(SYSCALL_ALLOC_MAP_PAGES_ANYWHERE, page_count, flags, out_paddr_list_addr); }
+static int is_ipc_buffer_token(u64 token) { return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0; }
+static u64 create_ipc_buffer_from_page(u64 paddr, u64 rights_bits, u64 role) { return syscall3(SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE, paddr, rights_bits, role); }
+static u64 grant_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits) { return syscall3(SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits); }
+static u64 share_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits) { return syscall3(SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits); }
 static int install_self_wake_endpoint(void) { return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, syscall0(SYSCALL_GET_PROCESS_SLOT)) == SYSCALL_OK; }
 static void prime_reply_return_signal(void) { (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, LINUX_ABI_SELF_WAKE_ENDPOINT_ID, 0); }
 
@@ -279,8 +284,8 @@ static int find_service(u64 kind, struct service_entry *out) {
     return 0;
 }
 
-static u64 make_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
-    return request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ (endpoint_id << 1) ^ (process_slot << 33) ^ 0x4653434f4e4e4543ULL;
+static u64 make_nonce(u64 request_token, u64 response_token, u64 endpoint_id, u64 process_slot) {
+    return request_token ^ ((response_token << 17) | (response_token >> 47)) ^ (endpoint_id << 1) ^ (process_slot << 33) ^ 0x4653434f4e4e4543ULL;
 }
 static int wait_fs_response_at(u64 response_va, u64 expected_seq, u16 expected_op) {
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)response_va;
@@ -299,7 +304,7 @@ static int wait_fs_response_at(u64 response_va, u64 expected_seq, u16 expected_o
 }
 
 static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
-    return wait_fs_response_at(VFS_RESPONSE_VA, expected_seq, expected_op);
+    return wait_fs_response_at(g_vfs.response_map.addr, expected_seq, expected_op);
 }
 
 static void profile_count_syscall(u64 nr) {

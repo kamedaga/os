@@ -71,6 +71,8 @@ struct block_client {
     u64 response_va;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
     u64 endpoint_id;
     u64 server_process_slot;
     u64 session_nonce;

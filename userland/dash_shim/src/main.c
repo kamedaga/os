@@ -5,8 +5,6 @@ typedef unsigned long long u64;
 enum {
     SYSCALL_LOG = 0x9,
     SYSCALL_PROCESS_EXIT = 0x34,
-    DASH_SHIM_REQUEST_VA = 0x27300000ULL,
-    DASH_SHIM_RESPONSE_VA = 0x27301000ULL,
     DASH_SHIM_WAIT_TICKS = 120000,
 };
 
@@ -58,8 +56,6 @@ void dash_shim_main(void) {
         .argv_count = 2,
         .envp = envp,
         .envp_count = 6,
-        .request_va = DASH_SHIM_REQUEST_VA,
-        .response_va = DASH_SHIM_RESPONSE_VA,
         .wait_ticks = DASH_SHIM_WAIT_TICKS,
     };
 

@@ -61,7 +61,7 @@ struct exec_launch_request {
     exec_u64 version;
     exec_u64 op;
     exec_u64 seq;
-    exec_u64 response_paddr;
+    exec_u64 response_token;
     struct exec_bootstrap_config config;
 };
 

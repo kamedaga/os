@@ -17,6 +17,9 @@ enum {
     SYSCALL_IOMMU_AUTHORIZE = 0x35,
     SYSCALL_DMA_MAP_CREATE = 0x37,
     SYSCALL_DMA_MAP_SET_STATE = 0x38,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER = 0x61,
+    SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
 
     SYSCALL_OK = 0,
     PAGE_BYTES = 4096,
@@ -27,8 +30,6 @@ enum {
     TX_QUEUE_PAGE_VA = 0x27221000,
     RX_BUFFER_BASE_VA = 0x27230000,
     TX_BUFFER_VA = 0x27240000,
-    CONSOLE_REQUEST_VA = 0x27200000,
-    CONSOLE_RESPONSE_VA = 0x27201000,
 
     CONSOLE_CONFIG_MAGIC = 0x434F4E43,
     CONSOLE_CONFIG_VERSION = 1,
@@ -97,6 +98,8 @@ enum {
     CONSOLE_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - CONSOLE_RESPONSE_HEADER_BYTES,
     CONSOLE_REPLY_ENDPOINT_ID = 0xE9,
     CAP_TRANSFER_ID_MIN = 0x1000,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
 
     DESC_FLAG_WRITE = 1 << 1,
     DMA_DIRECTION_READ = 0,
@@ -177,6 +180,10 @@ struct console_session {
     int active;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    u64 request_va;
+    u64 response_va;
     u64 reply_endpoint_id;
     u64 session_nonce;
     u64 last_completed_seq;
@@ -294,6 +301,22 @@ static u64 alloc_map_pages(u64 base_va, u64 page_count, u64 writable, u64 paddrs
 
 static u64 map_page(u64 va, u64 paddr, u64 writable) {
     return syscall3(SYSCALL_MAP_PAGE, va, paddr, writable);
+}
+
+static u64 map_page_anywhere(u64 paddr, u64 writable) {
+    return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, writable);
+}
+
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static u64 accept_ipc_buffer_transfer(u64 transfer_id) {
+    return syscall1(SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER, transfer_id);
+}
+
+static u64 map_ipc_buffer_anywhere(u64 token, u64 writable) {
+    return syscall2(SYSCALL_MAP_IPC_BUFFER_ANYWHERE, token, writable);
 }
 
 static u64 queue_submit(u64 token, u64 queue_index) {
@@ -543,19 +566,19 @@ static int send_bytes(const u8 *bytes, u64 len) {
 }
 
 static struct console_request_header *request_header(void) {
-    return (struct console_request_header *)CONSOLE_REQUEST_VA;
+    return (struct console_request_header *)g_session.request_va;
 }
 
-static struct console_response_header *response_header(void) {
-    return (struct console_response_header *)CONSOLE_RESPONSE_VA;
+static volatile struct console_response_header *response_header(void) {
+    return (volatile struct console_response_header *)g_session.response_va;
 }
 
 static volatile u8 *request_payload(void) {
-    return (volatile u8 *)(CONSOLE_REQUEST_VA + CONSOLE_REQUEST_HEADER_BYTES);
+    return (volatile u8 *)(g_session.request_va + CONSOLE_REQUEST_HEADER_BYTES);
 }
 
 static volatile u8 *response_payload(void) {
-    return (volatile u8 *)(CONSOLE_RESPONSE_VA + CONSOLE_RESPONSE_HEADER_BYTES);
+    return (volatile u8 *)(g_session.response_va + CONSOLE_RESPONSE_HEADER_BYTES);
 }
 
 static void clear_page(u64 base_va) {
@@ -563,7 +586,7 @@ static void clear_page(u64 base_va) {
 }
 
 static void write_console_response(u16 op, u64 seq, i32 status, u32 inline_bytes, u64 arg0, u64 arg1) {
-    struct console_response_header *response = response_header();
+    volatile struct console_response_header *response = response_header();
     response->magic = CONSOLE_RESPONSE_MAGIC;
     response->version = CONSOLE_PROTOCOL_VERSION;
     response->op = op;
@@ -575,8 +598,9 @@ static void write_console_response(u16 op, u64 seq, i32 status, u32 inline_bytes
     response->arg1 = arg1;
     response->reserved1 = 0;
     response->reserved2 = 0;
-    __asm__ volatile("" ::: "memory");
+    __sync_synchronize();
     response->response_seq = seq;
+    __sync_synchronize();
     if (g_session.reply_endpoint_id != 0) (void)signal_endpoint(g_session.reply_endpoint_id);
 }
 
@@ -630,13 +654,63 @@ static int write_volatile_to_tx(volatile u8 *src, u64 len) {
     return 1;
 }
 
-static void handle_console_connect_transfer(u64 transfer_id) {
+static void finish_console_connect(
+    struct console_request_header *request,
+    u64 request_va,
+    u64 response_va,
+    u64 request_paddr,
+    u64 response_paddr,
+    u64 request_token,
+    u64 response_token
+) {
+    g_session.request_va = request_va;
+    g_session.response_va = response_va;
+    clear_page(g_session.response_va);
+    g_session.active = 1;
+    g_session.request_paddr = request_paddr;
+    g_session.response_paddr = response_paddr;
+    g_session.request_token = request_token;
+    g_session.response_token = response_token;
+    g_session.reply_endpoint_id =
+        install_endpoint(CONSOLE_REPLY_ENDPOINT_ID, request->arg1) == SYSCALL_OK ? CONSOLE_REPLY_ENDPOINT_ID : 0;
+    g_session.session_nonce = request->session_nonce;
+    g_session.last_completed_seq = 0;
+    reset_input_state();
+    write_console_response(CONSOLE_OP_CONNECT, request->request_seq, CONSOLE_STATUS_OK, 0, 0, 0);
+    g_session.last_completed_seq = request->request_seq;
+}
+
+static int handle_console_connect_token(u64 request_token) {
+    const u64 request_va = map_ipc_buffer_anywhere(request_token, 0);
+    if (request_va < PAGE_BYTES) return 0;
+    g_session.request_va = request_va;
+    struct console_request_header *request = request_header();
+    if (request->magic != CONSOLE_REQUEST_MAGIC ||
+        request->version != CONSOLE_PROTOCOL_VERSION ||
+        request->op != CONSOLE_OP_CONNECT ||
+        request->request_seq == 0 ||
+        !is_ipc_buffer_token(request->arg0) ||
+        request->session_nonce == 0) {
+        user_log("VirtioConsole: invalid ipc-buffer connect request\n");
+        return 0;
+    }
+    const u64 response_token = request->arg0;
+    const u64 response_va = map_ipc_buffer_anywhere(response_token, 1);
+    if (response_va < PAGE_BYTES) return 0;
+    finish_console_connect(request, request_va, response_va, 0, 0, request_token, response_token);
+    user_log("VirtioConsole: ipc-buffer session connect ok\n");
+    return 1;
+}
+
+static void handle_console_connect_paddr_transfer(u64 transfer_id) {
     const u64 request_paddr = accept_cap_transfer(transfer_id);
     if (request_paddr < PAGE_BYTES) {
         user_log("VirtioConsole: accept cap transfer failed\n");
         return;
     }
-    if (map_page(CONSOLE_REQUEST_VA, request_paddr, 0) != SYSCALL_OK) return;
+    const u64 request_va = map_page_anywhere(request_paddr, 0);
+    if (request_va < PAGE_BYTES) return;
+    g_session.request_va = request_va;
 
     struct console_request_header *request = request_header();
     if (request->magic != CONSOLE_REQUEST_MAGIC ||
@@ -649,19 +723,16 @@ static void handle_console_connect_transfer(u64 transfer_id) {
         return;
     }
 
-    if (map_page(CONSOLE_RESPONSE_VA, request->arg0, 1) != SYSCALL_OK) return;
-    clear_page(CONSOLE_RESPONSE_VA);
-    g_session.active = 1;
-    g_session.request_paddr = request_paddr;
-    g_session.response_paddr = request->arg0;
-    g_session.reply_endpoint_id =
-        install_endpoint(CONSOLE_REPLY_ENDPOINT_ID, request->arg1) == SYSCALL_OK ? CONSOLE_REPLY_ENDPOINT_ID : 0;
-    g_session.session_nonce = request->session_nonce;
-    g_session.last_completed_seq = 0;
-    reset_input_state();
-    write_console_response(CONSOLE_OP_CONNECT, request->request_seq, CONSOLE_STATUS_OK, 0, 0, 0);
-    g_session.last_completed_seq = request->request_seq;
+    const u64 response_va = map_page_anywhere(request->arg0, 1);
+    if (response_va < PAGE_BYTES) return;
+    finish_console_connect(request, request_va, response_va, request_paddr, request->arg0, 0, 0);
     user_log("VirtioConsole: session connect ok\n");
+}
+
+static void handle_console_connect_transfer(u64 transfer_id) {
+    const u64 request_token = accept_ipc_buffer_transfer(transfer_id);
+    if (is_ipc_buffer_token(request_token) && handle_console_connect_token(request_token)) return;
+    handle_console_connect_paddr_transfer(transfer_id);
 }
 
 static void handle_console_request(void) {

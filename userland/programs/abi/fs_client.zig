@@ -2,6 +2,7 @@ const std = @import("std");
 const fs_abi = @import("fs_abi.zig");
 const fs_protocol = @import("fs_protocol.zig");
 const image_abi = @import("image_abi.zig");
+const ipc_buffer_abi = @import("ipc_buffer_abi.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
 const user_vm = @import("user_vm.zig");
 
@@ -14,6 +15,9 @@ const syscall_install_endpoint: u64 = 0x26;
 const syscall_share_cap: u64 = 0x2B;
 const syscall_signal_endpoint: u64 = 0x2C;
 const syscall_ipc_call_reply_recv: u64 = 0x40;
+const syscall_create_ipc_buffer_from_page: u64 = ipc_buffer_abi.syscall_create_ipc_buffer_from_page;
+const syscall_grant_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_grant_ipc_buffer_on_endpoint;
+const syscall_share_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_share_ipc_buffer_on_endpoint;
 const syscall_ok: u64 = 0;
 const syscall_err_endpoint: u64 = 9;
 const ipc_call_flag_signal_only: u64 = 0x2;
@@ -29,6 +33,10 @@ pub const Error = error{
     ResponseMapFailed,
     EndpointNotFound,
     EndpointInstallFailed,
+    RequestBufferCreateFailed,
+    ResponseBufferCreateFailed,
+    ResponseBufferGrantFailed,
+    RequestBufferShareFailed,
     ResponseGrantFailed,
     ConnectSendFailed,
     Timeout,
@@ -105,8 +113,8 @@ pub const ReadResult = struct {
 pub const Client = struct {
     request_va: u64,
     response_va: u64,
-    request_paddr: u64,
-    response_paddr: u64,
+    request_token: u64,
+    response_token: u64,
     server_endpoint_id: u64,
     session_nonce: u64,
     mount_token: u64,
@@ -116,14 +124,16 @@ pub const Client = struct {
     pub fn connect(options: ConnectOptions) Error!Client {
         const pages = try allocConnectPages(options.request_va, options.response_va);
         var compat_installed = false;
-        try grantResponseCapForConnect(pages.response_paddr, options, &compat_installed);
-        const session_nonce = makeSessionNonce(pages.request_paddr, pages.response_paddr, options.endpoint_id, options.client_process_slot);
+        const request_token = try createConnectIpcBuffer(pages.request_paddr, .request, error.RequestBufferCreateFailed);
+        const response_token = try createConnectIpcBuffer(pages.response_paddr, .response, error.ResponseBufferCreateFailed);
+        const remote_response_token = try grantResponseBufferForConnect(response_token, options, &compat_installed);
+        const session_nonce = makeSessionNonce(request_token, response_token, options.endpoint_id, options.client_process_slot);
 
         var client = Client{
             .request_va = pages.request_va,
             .response_va = pages.response_va,
-            .request_paddr = pages.request_paddr,
-            .response_paddr = pages.response_paddr,
+            .request_token = request_token,
+            .response_token = response_token,
             .server_endpoint_id = options.endpoint_id,
             .session_nonce = session_nonce,
             .mount_token = 0,
@@ -142,13 +152,13 @@ pub const Client = struct {
         request.path_bytes = 0;
         request.inline_bytes = 0;
         request.reserved0 = 0;
-        request.arg0 = pages.response_paddr;
+        request.arg0 = remote_response_token;
         request.arg1 = options.client_process_slot;
         request.session_nonce = session_nonce;
         compilerBarrier();
         request.request_seq = 1;
 
-        try shareConnectRequest(pages.request_paddr, options, &compat_installed);
+        try shareConnectRequestBuffer(request_token, options, &compat_installed);
         const response = try client.finishRequestOk(1, .connect);
         client.mount_token = response.result_token;
         if (!fs_abi.isCapToken(client.mount_token)) return error.InvalidResponse;
@@ -495,8 +505,8 @@ pub const Client = struct {
     }
 };
 
-fn makeSessionNonce(request_paddr: u64, response_paddr: u64, endpoint_id: u64, tag: u64) u64 {
-    const nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ tag ^ 0x9e37_79b9_7f4a_7c15;
+fn makeSessionNonce(request_token: u64, response_token: u64, endpoint_id: u64, tag: u64) u64 {
+    const nonce = request_token ^ ((response_token << 17) | (response_token >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ tag ^ 0x9e37_79b9_7f4a_7c15;
     return if (nonce == 0) 1 else nonce;
 }
 
@@ -575,6 +585,39 @@ fn grantCapOnEndpoint(paddr: u64, endpoint_id: u64, rights_bits: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
+fn createIpcBufferFromPage(paddr: u64, rights: ipc_buffer_abi.Rights, role: ipc_buffer_abi.Role) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_create_ipc_buffer_from_page),
+          [arg0] "{rdi}" (paddr),
+          [arg1] "{rsi}" (ipc_buffer_abi.rightsToBits(rights)),
+          [arg2] "{rdx}" (@as(u64, @intFromEnum(role))),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn grantIpcBufferOnEndpoint(token: u64, endpoint_id: u64, rights: ipc_buffer_abi.Rights) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_grant_ipc_buffer_on_endpoint),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (ipc_buffer_abi.rightsToBits(rights)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn shareIpcBufferOnEndpoint(token: u64, endpoint_id: u64, rights: ipc_buffer_abi.Rights) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (syscall_share_ipc_buffer_on_endpoint),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (endpoint_id),
+          [arg2] "{rdx}" (ipc_buffer_abi.rightsToBits(rights)),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
 fn grantResponseCapForConnect(paddr: u64, options: ConnectOptions, compat_installed: *bool) Error!void {
     const result = grantCapOnEndpoint(paddr, options.endpoint_id, page_right_cpu_read | page_right_cpu_write);
     if (result == syscall_ok) return;
@@ -586,6 +629,60 @@ fn grantResponseCapForConnect(paddr: u64, options: ConnectOptions, compat_instal
         if (retry == syscall_ok) return;
         if (retry == syscall_err_endpoint) return error.EndpointNotFound;
         return error.ResponseGrantFailed;
+    }
+    return error.EndpointNotFound;
+}
+
+fn createConnectIpcBuffer(paddr: u64, role: ipc_buffer_abi.Role, fail_error: Error) Error!u64 {
+    const rights: ipc_buffer_abi.Rights = .{
+        .read = true,
+        .write = true,
+        .map = true,
+        .grant = true,
+    };
+    const token = createIpcBufferFromPage(paddr, rights, role);
+    if (ipc_buffer_abi.decodeIpcBufferToken(token) == null) return fail_error;
+    return token;
+}
+
+fn grantResponseBufferForConnect(token: u64, options: ConnectOptions, compat_installed: *bool) Error!u64 {
+    const rights: ipc_buffer_abi.Rights = .{
+        .read = true,
+        .write = true,
+        .map = true,
+        .grant = false,
+    };
+    const result = grantIpcBufferOnEndpoint(token, options.endpoint_id, rights);
+    if (ipc_buffer_abi.decodeIpcBufferToken(result) != null) return result;
+    if (result != syscall_err_endpoint) return error.ResponseBufferGrantFailed;
+
+    if (!compat_installed.* and try attemptCompatEndpointInstall(options)) {
+        compat_installed.* = true;
+        const retry = grantIpcBufferOnEndpoint(token, options.endpoint_id, rights);
+        if (ipc_buffer_abi.decodeIpcBufferToken(retry) != null) return retry;
+        if (retry == syscall_err_endpoint) return error.EndpointNotFound;
+        return error.ResponseBufferGrantFailed;
+    }
+    return error.EndpointNotFound;
+}
+
+fn shareConnectRequestBuffer(token: u64, options: ConnectOptions, compat_installed: *bool) Error!void {
+    const rights: ipc_buffer_abi.Rights = .{
+        .read = true,
+        .write = false,
+        .map = true,
+        .grant = false,
+    };
+    const result = shareIpcBufferOnEndpoint(token, options.endpoint_id, rights);
+    if (result == syscall_ok) return;
+    if (result != syscall_err_endpoint) return error.RequestBufferShareFailed;
+
+    if (!compat_installed.* and try attemptCompatEndpointInstall(options)) {
+        compat_installed.* = true;
+        const retry = shareIpcBufferOnEndpoint(token, options.endpoint_id, rights);
+        if (retry == syscall_ok) return;
+        if (retry == syscall_err_endpoint) return error.EndpointNotFound;
+        return error.RequestBufferShareFailed;
     }
     return error.EndpointNotFound;
 }

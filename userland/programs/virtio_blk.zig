@@ -3,6 +3,7 @@ const cap_transfer_abi = @import("abi_root").cap_transfer_abi;
 const block_bootstrap = @import("abi_root").block_bootstrap_abi;
 const block_protocol = @import("abi_root").block_protocol;
 const fs_abi = @import("abi_root").fs_abi;
+const ipc_buffer_abi = @import("abi_root").ipc_buffer_abi;
 const process_abi = @import("abi_root").process_abi;
 const queue_abi = @import("abi_root").queue_abi;
 const user_vm = @import("abi_root").user_vm;
@@ -120,6 +121,8 @@ const Session = struct {
     client_process_slot: u64 = 0,
     request_paddr: u64 = 0,
     response_paddr: u64 = 0,
+    request_token: u64 = 0,
+    response_token: u64 = 0,
     request_va: u64 = 0,
     response_va: u64 = 0,
     reply_endpoint_id: u64 = 0,
@@ -131,6 +134,8 @@ const Session = struct {
     bulk_base_va: u64 = 0,
     bulk_page_count: u16 = 0,
     bulk_paddrs: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages,
+    bulk_tokens: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages,
+    bulk_vas: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages,
 };
 
 var boot_state: BootState = .{};
@@ -196,6 +201,32 @@ fn acceptCapTransfer(transfer_id: u64) u64 {
         : [nr] "{rax}" (cap_transfer_abi.syscall_accept_cap_transfer),
           [arg0] "{rdi}" (transfer_id),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn acceptIpcBufferTransfer(transfer_id: u64) u64 {
+    return asm volatile (
+        \\syscall
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (ipc_buffer_abi.syscall_accept_ipc_buffer_transfer),
+          [arg0] "{rdi}" (transfer_id),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn mapIpcBufferAnywhere(token: u64, writable: bool) ?u64 {
+    const flags: u64 = if (writable) 1 else 0;
+    const va = asm volatile (
+        \\syscall
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (ipc_buffer_abi.syscall_map_ipc_buffer_anywhere),
+          [arg0] "{rdi}" (token),
+          [arg1] "{rsi}" (flags),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+    if (va < block_protocol.page_bytes) return null;
+    return va;
+}
+
+fn isIpcBufferToken(token: u64) bool {
+    return ipc_buffer_abi.decodeIpcBufferToken(token) != null;
 }
 
 fn installEndpoint(endpoint_id: u64, target_process_slot: u64) u64 {
@@ -893,7 +924,47 @@ fn executeBlockReadToDriverBuffer(block_index: u64, block_count: u32, byte_count
     return false;
 }
 
-fn executeBulkReadRequest(block_index: u64, block_count: u32, out_va: u64, byte_count: usize) bool {
+fn bulkVaForOffset(session: *const Session, offset: usize) ?u64 {
+    const page_index = offset / block_protocol.page_bytes;
+    if (page_index >= session.bulk_page_count) return null;
+    const va = session.bulk_vas[page_index];
+    if (va < block_protocol.page_bytes) return null;
+    return va + @as(u64, @intCast(offset % block_protocol.page_bytes));
+}
+
+fn copyVolatileToBulk(session: *const Session, dst_offset: usize, src: [*]volatile u8, byte_count: usize) bool {
+    var copied: usize = 0;
+    while (copied < byte_count) {
+        const dst_va = bulkVaForOffset(session, dst_offset + copied) orelse return false;
+        const page_remaining = block_protocol.page_bytes - ((dst_offset + copied) % block_protocol.page_bytes);
+        const chunk = @min(byte_count - copied, page_remaining);
+        const dst: [*]volatile u8 = @ptrFromInt(dst_va);
+        var i: usize = 0;
+        while (i < chunk) : (i += 1) {
+            dst[i] = src[copied + i];
+        }
+        copied += chunk;
+    }
+    return true;
+}
+
+fn copyBulkToPlain(session: *const Session, src_offset: usize, dest: []u8) bool {
+    var copied: usize = 0;
+    while (copied < dest.len) {
+        const src_va = bulkVaForOffset(session, src_offset + copied) orelse return false;
+        const page_remaining = block_protocol.page_bytes - ((src_offset + copied) % block_protocol.page_bytes);
+        const chunk = @min(dest.len - copied, page_remaining);
+        const src: [*]volatile u8 = @ptrFromInt(src_va);
+        var i: usize = 0;
+        while (i < chunk) : (i += 1) {
+            dest[copied + i] = src[i];
+        }
+        copied += chunk;
+    }
+    return true;
+}
+
+fn executeBulkReadRequest(block_index: u64, block_count: u32, session: *const Session, byte_count: usize) bool {
     if (byte_count == 0 or byte_count > max_bulk_read_pages * block_protocol.page_bytes) return false;
     if (block_count == 0) return false;
     const block_bytes: usize = @intCast(boot_state.logical_block_size);
@@ -912,12 +983,11 @@ fn executeBulkReadRequest(block_index: u64, block_count: u32, out_va: u64, byte_
         const chunk_blocks: u32 = @intCast(chunk_bytes / block_bytes);
         if (chunk_blocks == 0 or chunk_blocks > remaining_blocks) return false;
         if (!executeBlockReadToDriverBuffer(current_block, chunk_blocks, chunk_bytes)) return false;
-        const dest: [*]u8 = @ptrFromInt(out_va + @as(u64, @intCast(copied)));
         var page_index: usize = 0;
         var page_offset: usize = 0;
         while (page_offset < chunk_bytes) : (page_index += 1) {
             const page_bytes = @min(chunk_bytes - page_offset, block_protocol.page_bytes);
-            copyVolatileToPlain(requestDataPagePtr(page_index), dest[page_offset .. page_offset + page_bytes]);
+            if (!copyVolatileToBulk(session, copied + page_offset, requestDataPagePtr(page_index), page_bytes)) return false;
             page_offset += page_bytes;
         }
         copied += chunk_bytes;
@@ -985,28 +1055,54 @@ fn handleReadBlocks(session: *Session, request_seq: u64) void {
     );
 }
 
-fn ensureBulkMappings(session: *Session, paddrs: []const u64) bool {
-    if (session.bulk_base_va == 0) {
-        session.bulk_base_va = @intCast(user_vm.mapPagesAtDynamicVa(paddrs, true) orelse return false);
-        var i: usize = 0;
-        while (i < paddrs.len) : (i += 1) {
-            session.bulk_paddrs[i] = paddrs[i];
+fn ensureBulkMappings(session: *Session, buffers: []const u64) bool {
+    if (buffers.len == 0 or buffers.len > max_bulk_read_pages) return false;
+    var all_paddrs = true;
+    var check_index: usize = 0;
+    while (check_index < buffers.len) : (check_index += 1) {
+        if (isIpcBufferToken(buffers[check_index])) {
+            all_paddrs = false;
+        } else if (buffers[check_index] < 0x1000) {
+            return false;
         }
-        session.bulk_page_count = @intCast(paddrs.len);
+    }
+
+    if (all_paddrs and session.bulk_base_va == 0) {
+        session.bulk_base_va = @intCast(user_vm.mapPagesAtDynamicVa(buffers, true) orelse return false);
+        var i: usize = 0;
+        while (i < buffers.len) : (i += 1) {
+            session.bulk_paddrs[i] = buffers[i];
+            session.bulk_tokens[i] = 0;
+            session.bulk_vas[i] = session.bulk_base_va + @as(u64, @intCast(i * block_protocol.page_bytes));
+        }
+        session.bulk_page_count = @intCast(buffers.len);
         session.bulk_mapped = true;
         return true;
     }
-    const base_va = session.bulk_base_va;
+
     var page_index: usize = 0;
-    while (page_index < paddrs.len) : (page_index += 1) {
-        if (paddrs[page_index] < 0x1000) return false;
-        if (page_index < session.bulk_page_count) {
-            if (session.bulk_paddrs[page_index] != paddrs[page_index]) return false;
+    while (page_index < buffers.len) : (page_index += 1) {
+        const buffer = buffers[page_index];
+        if (isIpcBufferToken(buffer)) {
+            if (page_index < session.bulk_page_count) {
+                if (session.bulk_tokens[page_index] != buffer) return false;
+                continue;
+            }
+            const va = mapIpcBufferAnywhere(buffer, true) orelse return false;
+            session.bulk_tokens[page_index] = buffer;
+            session.bulk_paddrs[page_index] = 0;
+            session.bulk_vas[page_index] = va;
+            session.bulk_page_count = @intCast(page_index + 1);
             continue;
         }
-        const va = base_va + @as(u64, @intCast(page_index * block_protocol.page_bytes));
-        if (!user_vm.mapPageAtVa(@intCast(va), paddrs[page_index], true)) return false;
-        session.bulk_paddrs[page_index] = paddrs[page_index];
+        if (page_index < session.bulk_page_count) {
+            if (session.bulk_paddrs[page_index] != buffer) return false;
+            continue;
+        }
+        const mapping = user_vm.mapPageAnywhere(buffer, true) orelse return false;
+        session.bulk_paddrs[page_index] = buffer;
+        session.bulk_tokens[page_index] = 0;
+        session.bulk_vas[page_index] = @intCast(mapping.va);
         session.bulk_page_count = @intCast(page_index + 1);
     }
     session.bulk_mapped = true;
@@ -1039,7 +1135,7 @@ fn handleReadBlocksBulk(session: *Session, request_seq: u64) void {
     }
 
     const payload: [*]const volatile u8 = @ptrCast(requestPayload(session));
-    var paddrs: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages;
+    var buffers: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages;
     var page_index: usize = 0;
     while (page_index < page_count) : (page_index += 1) {
         var raw: u64 = 0;
@@ -1047,22 +1143,22 @@ fn handleReadBlocksBulk(session: *Session, request_seq: u64) void {
         while (byte_index < @sizeOf(u64)) : (byte_index += 1) {
             raw |= @as(u64, payload[page_index * @sizeOf(u64) + byte_index]) << @intCast(byte_index * 8);
         }
-        if (raw < 0x1000) {
+        if (!isIpcBufferToken(raw) and raw < 0x1000) {
             replyStatus(session, .read_blocks_bulk, request_seq, .invalid);
             return;
         }
-        paddrs[page_index] = raw;
+        buffers[page_index] = raw;
     }
 
     const map_start_tick = if (profileReadBulk()) getTickCount() else 0;
-    if (!ensureBulkMappings(session, paddrs[0..page_count])) {
+    if (!ensureBulkMappings(session, buffers[0..page_count])) {
         replyStatus(session, .read_blocks_bulk, request_seq, .invalid);
         return;
     }
     const map_ticks = if (profileReadBulk()) getTickCount() - map_start_tick else 0;
 
     const io_start_tick = if (profileReadBulk()) getTickCount() else 0;
-    if (!executeBulkReadRequest(request.block_index, request.block_count, session.bulk_base_va, @intCast(byte_count))) {
+    if (!executeBulkReadRequest(request.block_index, request.block_count, session, @intCast(byte_count))) {
         replyStatus(session, .read_blocks_bulk, request_seq, .io_error);
         return;
     }
@@ -1168,7 +1264,7 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
     }
 
     const payload: [*]const volatile u8 = @ptrCast(requestPayload(session));
-    var paddrs: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages;
+    var buffers: [max_bulk_read_pages]u64 = [_]u64{0} ** max_bulk_read_pages;
     var page_index: usize = 0;
     while (page_index < page_count) : (page_index += 1) {
         var raw: u64 = 0;
@@ -1176,23 +1272,26 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
         while (byte_index < @sizeOf(u64)) : (byte_index += 1) {
             raw |= @as(u64, payload[page_index * @sizeOf(u64) + byte_index]) << @intCast(byte_index * 8);
         }
-        if (raw < 0x1000) {
-            _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk bad paddr\n");
+        if (!isIpcBufferToken(raw) and raw < 0x1000) {
+            _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk bad buffer\n");
             replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
             return;
         }
-        paddrs[page_index] = raw;
+        buffers[page_index] = raw;
     }
 
-    if (!ensureBulkMappings(session, paddrs[0..page_count])) {
+    if (!ensureBulkMappings(session, buffers[0..page_count])) {
         _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk map failed\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
         return;
     }
 
-    const src: [*]volatile u8 = @ptrFromInt(session.bulk_base_va);
     const data = @as([*]u8, @ptrCast(@volatileCast(requestDataPtr())));
-    copyVolatileToPlain(src, data[0..@intCast(byte_count)]);
+    if (!copyBulkToPlain(session, 0, data[0..@intCast(byte_count)])) {
+        _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk copy failed\n");
+        replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
+        return;
+    }
     if (!executeBlockRequest(request_type_out, request.block_index, request.block_count, true)) {
         _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk io error\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .io_error);
@@ -1309,6 +1408,78 @@ fn handleConnectRequest(request_paddr: u64) void {
             .client_process_slot = request.arg1,
             .request_paddr = request_paddr,
             .response_paddr = request.arg0,
+            .request_token = 0,
+            .response_token = 0,
+            .request_va = req_va,
+            .response_va = resp_va,
+            .reply_endpoint_id = reply_endpoint_id,
+            .session_nonce = request.session_nonce,
+            .last_completed_seq = 0,
+            .object_token = child_token,
+            .rights = rights,
+        };
+        clearPage(resp_va);
+        writeResponseHeader(
+            session,
+            .connect,
+            request.request_seq,
+            .ok,
+            child_token,
+            .block_device,
+            0,
+            boot_state.logical_block_size,
+            boot_state.capacity_blocks,
+        );
+        session.last_completed_seq = request.request_seq;
+        return;
+    }
+    _ = userLog("[virtio_blk] VirtioBlk: session table full\n");
+}
+
+fn handleConnectToken(request_token: u64) void {
+    _ = userLog("[virtio_blk] VirtioBlk: token connect request\n");
+    for (&sessions) |*session| {
+        if (session.active and session.request_token == request_token) {
+            session.active = false;
+        }
+    }
+    for (&sessions, 0..) |*session, slot| {
+        if (session.active) continue;
+        if (session.request_va != 0) continue;
+        const req_va = mapIpcBufferAnywhere(request_token, false) orelse {
+            _ = userLog("[virtio_blk] VirtioBlk: map request buffer failed\n");
+            return;
+        };
+        const request: *volatile block_protocol.BlockRequestHeader = @ptrFromInt(req_va);
+        if (request.magic != block_protocol.request_magic or
+            request.version != block_protocol.version or
+            request.op != block_protocol.opcodeRaw(.connect) or
+            request.request_seq == 0 or
+            !isIpcBufferToken(request.arg0) or
+            request.session_nonce == 0)
+        {
+            _ = userLog("[virtio_blk] VirtioBlk: invalid token connect request\n");
+            return;
+        }
+        const response_token = request.arg0;
+        const resp_va = mapIpcBufferAnywhere(response_token, true) orelse {
+            _ = userLog("[virtio_blk] VirtioBlk: map response buffer failed\n");
+            return;
+        };
+        const reply_endpoint_id = reply_endpoint_id_base + @as(u64, @intCast(slot));
+        if (installEndpoint(reply_endpoint_id, request.arg1) != syscall_ok) {
+            _ = userLog("[virtio_blk] VirtioBlk: install reply endpoint failed\n");
+            return;
+        }
+        const rights = clientRights();
+        const child_token = allocFsToken();
+        session.* = .{
+            .active = true,
+            .client_process_slot = request.arg1,
+            .request_paddr = 0,
+            .response_paddr = 0,
+            .request_token = request_token,
+            .response_token = response_token,
             .request_va = req_va,
             .response_va = resp_va,
             .reply_endpoint_id = reply_endpoint_id,
@@ -1359,11 +1530,16 @@ pub export fn _start() noreturn {
     while (true) {
         const received = waitEvent(true, session_poll_timeout_ticks);
         if (received >= 0x1000) {
-            const request_paddr = acceptCapTransfer(received);
-            if (request_paddr >= 0x1000) {
-                handleConnectRequest(request_paddr);
+            const request_token = acceptIpcBufferTransfer(received);
+            if (isIpcBufferToken(request_token)) {
+                handleConnectToken(request_token);
             } else {
-                _ = userLog("[virtio_blk] VirtioBlk: accept cap transfer failed\n");
+                const request_paddr = acceptCapTransfer(received);
+                if (request_paddr >= 0x1000) {
+                    handleConnectRequest(request_paddr);
+                } else {
+                    _ = userLog("[virtio_blk] VirtioBlk: accept cap transfer failed\n");
+                }
             }
         }
         pollSessions();

@@ -106,6 +106,39 @@ pub const PendingCapTransfer = struct {
     retain_sender: bool = false,
 };
 
+pub const IpcBufferRights = packed struct(u32) {
+    read: bool = false,
+    write: bool = false,
+    map: bool = false,
+    grant: bool = false,
+    _reserved: u28 = 0,
+};
+
+pub const IpcBufferRole = enum(u8) {
+    generic = 0,
+    request = 1,
+    response = 2,
+    bulk = 3,
+};
+
+pub const IpcBufferCapability = struct {
+    paddr: u64,
+    rights: IpcBufferRights,
+    role: IpcBufferRole,
+    cap_id: u64,
+    root_cap_id: u64,
+    parent_cap_id: u64,
+};
+
+pub const PendingIpcBufferTransfer = struct {
+    transfer_id: u64,
+    sender: PrincipalId,
+    endpoint_id: u64,
+    cap_id: u64,
+    rights: IpcBufferRights,
+    retain_sender: bool = true,
+};
+
 pub const Region = struct {
     id: u64,
 };
@@ -342,6 +375,65 @@ pub const CapMailbox = struct {
         while (i < self.len) : (i += 1) {
             self.items[i - 1] = self.items[i];
         }
+        self.len -= 1;
+        return transfer;
+    }
+};
+
+pub const IpcBufferCNode = struct {
+    pub const max_caps = 512;
+
+    caps: [max_caps]IpcBufferCapability = undefined,
+    len: usize = 0,
+
+    pub fn add(self: *IpcBufferCNode, cap: IpcBufferCapability) KernelError!void {
+        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
+        if (self.len >= self.caps.len) return KernelError.TableFull;
+        self.caps[self.len] = cap;
+        self.len += 1;
+    }
+
+    pub fn findByCapId(self: *const IpcBufferCNode, cap_id: u64) ?*const IpcBufferCapability {
+        if (self.findIndexByCapId(cap_id)) |index| return &self.caps[index];
+        return null;
+    }
+
+    pub fn removeByCapId(self: *IpcBufferCNode, cap_id: u64) bool {
+        if (self.findIndexByCapId(cap_id)) |index| {
+            var i = index;
+            while (i + 1 < self.len) : (i += 1) self.caps[i] = self.caps[i + 1];
+            self.len -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn findIndexByCapId(self: *const IpcBufferCNode, cap_id: u64) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.caps[i].cap_id == cap_id) return i;
+        }
+        return null;
+    }
+};
+
+pub const IpcBufferMailbox = struct {
+    const max_items = 8;
+
+    items: [max_items]PendingIpcBufferTransfer = undefined,
+    len: usize = 0,
+
+    pub fn push(self: *IpcBufferMailbox, transfer: PendingIpcBufferTransfer) KernelError!void {
+        if (self.len >= self.items.len) return KernelError.TableFull;
+        self.items[self.len] = transfer;
+        self.len += 1;
+    }
+
+    pub fn pop(self: *IpcBufferMailbox) ?PendingIpcBufferTransfer {
+        if (self.len == 0) return null;
+        const transfer = self.items[0];
+        var i: usize = 1;
+        while (i < self.len) : (i += 1) self.items[i - 1] = self.items[i];
         self.len -= 1;
         return transfer;
     }
@@ -695,6 +787,9 @@ pub const KernelState = struct {
     endpoint_generation: u64 = 0,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     pending_page_transfers: [principal_count]?PendingCapTransfer = [_]?PendingCapTransfer{null} ** principal_count,
+    ipc_buffer_tables: [principal_count]IpcBufferCNode = [_]IpcBufferCNode{.{}} ** principal_count,
+    ipc_buffer_mailboxes: [principal_count]IpcBufferMailbox = [_]IpcBufferMailbox{.{}} ** principal_count,
+    pending_ipc_buffer_transfers: [principal_count]?PendingIpcBufferTransfer = [_]?PendingIpcBufferTransfer{null} ** principal_count,
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
     exec_image_tables: [principal_count]ExecImageCNode = [_]ExecImageCNode{.{}} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
@@ -907,6 +1002,12 @@ pub const KernelState = struct {
         return (child_bits & ~parent_bits) == 0;
     }
 
+    fn isIpcBufferRightsSubset(child: IpcBufferRights, parent: IpcBufferRights) bool {
+        const child_bits: u32 = @bitCast(child);
+        const parent_bits: u32 = @bitCast(parent);
+        return (child_bits & ~parent_bits) == 0;
+    }
+
     fn processPrincipal(index: usize) PrincipalId {
         return processPrincipalFromIndex(index) orelse unreachable;
     }
@@ -963,6 +1064,9 @@ pub const KernelState = struct {
         self.endpoint_tables[index] = .{};
         self.cap_mailboxes[index] = .{};
         self.pending_page_transfers[index] = null;
+        self.ipc_buffer_tables[index] = .{};
+        self.ipc_buffer_mailboxes[index] = .{};
+        self.pending_ipc_buffer_transfers[index] = null;
         self.vm_object_tables[index] = .{};
         self.exec_image_tables[index] = .{};
     }
@@ -1115,6 +1219,9 @@ pub const KernelState = struct {
             self.endpoint_tables[i] = .{};
             self.cap_mailboxes[i] = .{};
             self.pending_page_transfers[i] = null;
+            self.ipc_buffer_tables[i] = .{};
+            self.ipc_buffer_mailboxes[i] = .{};
+            self.pending_ipc_buffer_transfers[i] = null;
             self.vm_object_tables[i] = .{};
             self.exec_image_tables[i] = .{};
         }
@@ -1405,6 +1512,14 @@ pub const KernelState = struct {
         return &self.vm_object_tables[self.principalStorageIndex(principal)];
     }
 
+    pub fn getIpcBufferTable(self: *KernelState, principal: PrincipalId) *IpcBufferCNode {
+        return &self.ipc_buffer_tables[self.principalStorageIndex(principal)];
+    }
+
+    pub fn getIpcBufferTableConst(self: *const KernelState, principal: PrincipalId) *const IpcBufferCNode {
+        return &self.ipc_buffer_tables[self.principalStorageIndex(principal)];
+    }
+
     pub fn getExecImageTable(self: *KernelState, principal: PrincipalId) *ExecImageCNode {
         return &self.exec_image_tables[self.principalStorageIndex(principal)];
     }
@@ -1428,6 +1543,118 @@ pub const KernelState = struct {
             return ep.target;
         }
         return null;
+    }
+
+    pub fn createIpcBufferFromPage(
+        self: *KernelState,
+        owner: PrincipalId,
+        paddr: u64,
+        rights: IpcBufferRights,
+        role: IpcBufferRole,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(owner);
+        const page_cap = self.getTableConst(owner).find(paddr) orelse return KernelError.CapabilityNotFound;
+        if (rights.read and !page_cap.rights.cpu_read) return KernelError.InvalidState;
+        if (rights.write and !page_cap.rights.cpu_write) return KernelError.InvalidState;
+        if (rights.map and !(page_cap.rights.cpu_read or page_cap.rights.cpu_write)) return KernelError.InvalidState;
+        if (rights.grant and !page_cap.rights.grant) return KernelError.InvalidState;
+
+        const root_id = self.allocCapId();
+        try self.getIpcBufferTable(owner).add(.{
+            .paddr = paddr,
+            .rights = rights,
+            .role = role,
+            .cap_id = root_id,
+            .root_cap_id = root_id,
+            .parent_cap_id = 0,
+        });
+        return root_id;
+    }
+
+    pub fn grantIpcBufferCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        cap_id: u64,
+        rights: IpcBufferRights,
+    ) KernelError!u64 {
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+        const src_cap = self.getIpcBufferTableConst(from).findByCapId(cap_id) orelse return KernelError.CapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
+        if (!isIpcBufferRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+
+        const child_id = self.allocCapId();
+        try self.getIpcBufferTable(to).add(.{
+            .paddr = src_cap.paddr,
+            .rights = rights,
+            .role = src_cap.role,
+            .cap_id = child_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.cap_id,
+        });
+        return child_id;
+    }
+
+    pub fn moveIpcBufferCap(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        cap_id: u64,
+        rights: IpcBufferRights,
+    ) KernelError!u64 {
+        if (from == to) return KernelError.InvalidState;
+        try self.requireActiveProcess(from);
+        try self.requireActiveProcess(to);
+        const src_cap = self.getIpcBufferTableConst(from).findByCapId(cap_id) orelse return KernelError.CapabilityNotFound;
+        if (!isIpcBufferRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+
+        const moved = IpcBufferCapability{
+            .paddr = src_cap.paddr,
+            .rights = rights,
+            .role = src_cap.role,
+            .cap_id = src_cap.cap_id,
+            .root_cap_id = src_cap.root_cap_id,
+            .parent_cap_id = src_cap.parent_cap_id,
+        };
+        try self.getIpcBufferTable(to).add(moved);
+        _ = self.getIpcBufferTable(from).removeByCapId(cap_id);
+        return moved.cap_id;
+    }
+
+    pub fn grantIpcBufferCapOnEndpoint(
+        self: *KernelState,
+        from: PrincipalId,
+        endpoint_id: u64,
+        cap_id: u64,
+        rights: IpcBufferRights,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(from);
+        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
+        return self.grantIpcBufferCap(from, target, cap_id, rights);
+    }
+
+    pub fn shareIpcBufferCapOnEndpoint(
+        self: *KernelState,
+        from: PrincipalId,
+        endpoint_id: u64,
+        cap_id: u64,
+        rights: IpcBufferRights,
+    ) KernelError!void {
+        try self.requireActiveProcess(from);
+        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
+        const src_cap = self.getIpcBufferTableConst(from).findByCapId(cap_id) orelse return KernelError.CapabilityNotFound;
+        if (!src_cap.rights.grant) return KernelError.InvalidState;
+        if (!isIpcBufferRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
+        try self.ipc_buffer_mailboxes[@intFromEnum(target)].push(.{
+            .transfer_id = self.allocTransferId(),
+            .sender = from,
+            .endpoint_id = endpoint_id,
+            .cap_id = cap_id,
+            .rights = rights,
+            .retain_sender = true,
+        });
     }
 
     pub fn installVmObjectCap(
@@ -1914,6 +2141,24 @@ pub const KernelState = struct {
         return received.transfer_id;
     }
 
+    pub fn recvIpcBufferTransfer(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
+        try self.requireActiveProcess(receiver);
+        const storage_index = @intFromEnum(receiver);
+        if (self.pending_ipc_buffer_transfers[storage_index]) |pending| {
+            return pending.transfer_id;
+        }
+        const received = self.ipc_buffer_mailboxes[storage_index].pop() orelse return KernelError.MailboxEmpty;
+        self.pending_ipc_buffer_transfers[storage_index] = received;
+        return received.transfer_id;
+    }
+
+    pub fn recvAnyCapTransfer(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
+        return self.recvCap(receiver) catch |page_err| switch (page_err) {
+            KernelError.MailboxEmpty => self.recvIpcBufferTransfer(receiver),
+            else => page_err,
+        };
+    }
+
     pub fn acceptCapTransfer(self: *KernelState, receiver: PrincipalId, transfer_id: u64) KernelError!u64 {
         try self.requireActiveProcess(receiver);
         const storage_index = @intFromEnum(receiver);
@@ -1926,6 +2171,19 @@ pub const KernelState = struct {
         }
         self.pending_page_transfers[storage_index] = null;
         return pending.paddr;
+    }
+
+    pub fn acceptIpcBufferTransfer(self: *KernelState, receiver: PrincipalId, transfer_id: u64) KernelError!u64 {
+        try self.requireActiveProcess(receiver);
+        const storage_index = @intFromEnum(receiver);
+        const pending = self.pending_ipc_buffer_transfers[storage_index] orelse return KernelError.MailboxEmpty;
+        if (pending.transfer_id != transfer_id) return KernelError.InvalidState;
+        const child_id = if (pending.retain_sender)
+            try self.grantIpcBufferCap(pending.sender, receiver, pending.cap_id, pending.rights)
+        else
+            try self.moveIpcBufferCap(pending.sender, receiver, pending.cap_id, pending.rights);
+        self.pending_ipc_buffer_transfers[storage_index] = null;
+        return child_id;
     }
 
     pub fn revokeCapTree(

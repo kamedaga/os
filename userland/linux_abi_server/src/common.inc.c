@@ -43,6 +43,11 @@ enum {
     SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN = 0x59,
     SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET = 0x5A,
     SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES = 0x5B,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_ALLOC_MAP_PAGES_ANYWHERE = 0x5D,
+    SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
+    SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
+    SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_OK = 0,
     SYSCALL_ERR_NOT_READY = 2,
     SYSCALL_ERR_MAP = 5,
@@ -54,6 +59,15 @@ enum {
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
     PAGE_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
+    IPC_BUFFER_RIGHT_READ = 0x1,
+    IPC_BUFFER_RIGHT_WRITE = 0x2,
+    IPC_BUFFER_RIGHT_MAP = 0x4,
+    IPC_BUFFER_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_ROLE_REQUEST = 1,
+    IPC_BUFFER_ROLE_RESPONSE = 2,
+    IPC_BUFFER_ROLE_BULK = 3,
     TRAP_MAGIC = 0x3149424150415254ULL,
     TRAP_VERSION = 1,
 
@@ -66,13 +80,6 @@ enum {
     SERVICE_KIND_NET = 11,
     SERVICE_KIND_TTY = 12,
 
-    VFS_REQUEST_VA = 0x2B000000,
-    VFS_RESPONSE_VA = 0x2B001000,
-    CONSOLE_REQUEST_VA = 0x2B010000,
-    CONSOLE_RESPONSE_VA = 0x2B011000,
-    NET_REQUEST_VA = 0x2B020000,
-    NET_RESPONSE_VA = 0x2B021000,
-    VFS_BULK_VA = 0x2B040000,
     FS_REQUEST_MAGIC = 0x51534653,
     FS_RESPONSE_MAGIC = 0x52534653,
     FS_PROTOCOL_VERSION = 1,
@@ -221,6 +228,7 @@ enum {
     LINUX_SYS_LCHOWN = 94,
     LINUX_SYS_UMASK = 95,
     LINUX_SYS_GETTIMEOFDAY = 96,
+    LINUX_SYS_SYSINFO = 99,
     LINUX_SYS_GETUID = 102,
     LINUX_SYS_GETGID = 104,
     LINUX_SYS_GETEUID = 107,
@@ -348,6 +356,8 @@ enum {
     F_RDLCK = 0,
     F_WRLCK = 1,
     F_UNLCK = 2,
+    FD_CLOEXEC = 1,
+    FD_INTERNAL_CLOEXEC = 0x80000000u,
     F_DUPFD_CLOEXEC = 1030,
     LOCK_SH = 1,
     LOCK_EX = 2,
@@ -410,8 +420,6 @@ enum {
     EXECVE_LD_IMAGE_VA = 0x26200000,
     EXECVE_CONFIG_VA = 0x26400000,
     EXECVE_TABLE_VA = 0x26401000,
-    EXECVE_EXEC_REQUEST_VA = 0x26402000,
-    EXECVE_EXEC_RESPONSE_VA = 0x26403000,
     EXECVE_EXEC_SERVICE_CONFIG_VA = 0x26404000,
     EXECVE_EXEC_SERVICE_TABLE_VA = 0x26405000,
     LINUX_ABI_REQUEST_PAGES_VA = 0x26500000,
@@ -501,21 +509,59 @@ struct fd_entry {
     u32 socket_remote_ip;
     char path[FS_MAX_PATH_BYTES + 1];
 };
+struct local_mapping {
+    u64 addr;
+    u16 page_count;
+    u16 reserved0;
+    u32 reserved1;
+};
 struct vfs_client {
     int active;
     u64 endpoint_id;
     u64 process_slot;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    struct local_mapping request_map;
+    struct local_mapping response_map;
+    struct local_mapping bulk_map;
     u64 bulk_paddrs[FS_BULK_READ_PAGE_COUNT];
+    u64 bulk_tokens[FS_BULK_READ_PAGE_COUNT];
+    u64 bulk_remote_tokens[FS_BULK_READ_PAGE_COUNT];
     u16 bulk_page_count;
     u8 reserved0[6];
     u64 root_token;
     u64 next_seq;
     u64 session_nonce;
 };
-struct console_client { int active; int is_tty; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
-struct net_client_state { int active; u64 endpoint_id; u64 process_slot; u64 request_paddr; u64 response_paddr; u64 next_seq; u64 session_nonce; };
+struct console_client {
+    int active;
+    int is_tty;
+    u64 endpoint_id;
+    u64 process_slot;
+    u64 request_paddr;
+    u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    struct local_mapping request_map;
+    struct local_mapping response_map;
+    u64 next_seq;
+    u64 session_nonce;
+};
+struct net_client_state {
+    int active;
+    u64 endpoint_id;
+    u64 process_slot;
+    u64 request_paddr;
+    u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    struct local_mapping request_map;
+    struct local_mapping response_map;
+    u64 next_seq;
+    u64 session_nonce;
+};
 struct path_cache_entry {
     u8 used;
     u8 kind;
@@ -624,7 +670,7 @@ struct exec_launch_request {
     u64 version;
     u64 op;
     u64 seq;
-    u64 response_paddr;
+    u64 response_token;
     struct exec_bootstrap_config config;
 };
 struct exec_launch_response {
@@ -742,6 +788,11 @@ static u64 g_exec_program_token = 0;
 static u64 g_exec_service_slot = 0;
 static u64 g_exec_launch_request_paddr = 0;
 static u64 g_exec_launch_response_paddr = 0;
+static u64 g_exec_launch_request_token = 0;
+static u64 g_exec_launch_response_token = 0;
+static u64 g_exec_launch_remote_response_token = 0;
+static struct local_mapping g_exec_launch_request_map;
+static struct local_mapping g_exec_launch_response_map;
 static int g_exec_service_connected = 0;
 static u64 g_exec_service_seq = 1;
 static u64 g_standard_interpreter_vm_token = 0;

@@ -21,18 +21,26 @@ enum {
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
+    SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
+    SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_GRANT_QUEUE_CAP = 0x23,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
     PAGE_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
+    IPC_BUFFER_RIGHT_READ = 0x1,
+    IPC_BUFFER_RIGHT_WRITE = 0x2,
+    IPC_BUFFER_RIGHT_MAP = 0x4,
+    IPC_BUFFER_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_ROLE_REQUEST = 1,
+    IPC_BUFFER_ROLE_RESPONSE = 2,
     ROOT_CONFIG_VA = 0x3C002000,
     DEVICE_CATALOG_VA = 0x3C030000,
-    REQUEST_VA = 0x29000000,
-    RESPONSE_VA = 0x29001000,
-    VFS_REQUEST_VA = 0x29002000,
-    VFS_RESPONSE_VA = 0x29003000,
     ROOTFS_VFS_IMAGE_VA = 0x29100000,
     SCHED_IMAGE_BASE_VA = 0x2B000000,
     ROOTFS_VFS_CONFIG_VA = 0x2A200000,
@@ -150,6 +158,10 @@ struct backend_session {
     u64 process_slot;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    u64 request_va;
+    u64 response_va;
     u64 session_nonce;
     u64 root_token;
     u64 next_seq;
@@ -287,6 +299,11 @@ static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) {
 
 static u64 wait_event_poll(void) { return syscall2(SYSCALL_WAIT_EVENT, 0, 1); }
 static u64 wait_event(void) { return syscall2(SYSCALL_WAIT_EVENT, 1, 1); }
+static u64 map_page_anywhere(u64 paddr, u64 writable) { return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, writable); }
+static int is_ipc_buffer_token(u64 token) { return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0; }
+static u64 create_ipc_buffer_from_page(u64 paddr, u64 rights_bits, u64 role) { return syscall3(SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE, paddr, rights_bits, role); }
+static u64 grant_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits) { return syscall3(SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits); }
+static u64 share_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits) { return syscall3(SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits); }
 static void clear_page(u64 va) { volatile u64 *p = (volatile u64 *)va; for (u64 i = 0; i < 512; i++) p[i] = 0; }
 static void clear_bytes(void *ptr, u64 bytes) { u8 *p = (u8 *)ptr; for (u64 i = 0; i < bytes; i++) p[i] = 0; }
 
@@ -335,17 +352,17 @@ static int install_fat_endpoint(void) {
     return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_fat.endpoint_id, g_fat.process_slot) == SYSCALL_OK;
 }
 
-static int grant_response_page(void) {
-    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_fat.response_paddr, g_fat.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-    if (ret == SYSCALL_OK) return 1;
-    if (ret == SYSCALL_ERR_ENDPOINT && install_fat_endpoint()) ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_fat.response_paddr, g_fat.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-    return ret == SYSCALL_OK;
+static u64 grant_response_buffer(void) {
+    u64 ret = grant_ipc_buffer_on_endpoint(g_fat.response_token, g_fat.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP);
+    if (is_ipc_buffer_token(ret)) return ret;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_fat_endpoint()) ret = grant_ipc_buffer_on_endpoint(g_fat.response_token, g_fat.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP);
+    return is_ipc_buffer_token(ret) ? ret : 0;
 }
 
-static int share_request_page(void) {
-    u64 ret = syscall2(SYSCALL_SHARE_CAP, g_fat.request_paddr, g_fat.endpoint_id);
+static int share_request_buffer(void) {
+    u64 ret = share_ipc_buffer_on_endpoint(g_fat.request_token, g_fat.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP);
     if (ret == SYSCALL_OK) return 1;
-    if (ret == SYSCALL_ERR_ENDPOINT && install_fat_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_fat.request_paddr, g_fat.endpoint_id);
+    if (ret == SYSCALL_ERR_ENDPOINT && install_fat_endpoint()) ret = share_ipc_buffer_on_endpoint(g_fat.request_token, g_fat.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP);
     return ret == SYSCALL_OK;
 }
 
@@ -357,7 +374,7 @@ static int signal_fat(void) {
 }
 
 static int wait_response(u64 expected_seq, u16 expected_op) {
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat.response_va;
     for (u64 i = 0; i < 4096; i++) {
         if (response->response_seq == expected_seq) return response->magic == FS_RESPONSE_MAGIC && response->version == FS_PROTOCOL_VERSION && response->op == expected_op;
         (void)wait_event_poll();
@@ -365,8 +382,8 @@ static int wait_response(u64 expected_seq, u16 expected_op) {
     return 0;
 }
 
-static u64 make_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x5eed2002f5007ULL;
+static u64 make_nonce(u64 request_token, u64 response_token, u64 endpoint_id, u64 process_slot) {
+    u64 nonce = request_token ^ ((response_token << 17) | (response_token >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x5eed2002f5007ULL;
     return nonce == 0 ? 1 : nonce;
 }
 
@@ -377,27 +394,33 @@ static int connect_fat(u64 endpoint_id, u64 process_slot) {
     g_fat.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_fat.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (g_fat.request_paddr < 0x1000 || g_fat.response_paddr < 0x1000) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, REQUEST_VA, g_fat.request_paddr, 1) != SYSCALL_OK) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, RESPONSE_VA, g_fat.response_paddr, 1) != SYSCALL_OK) return 0;
-    if (!grant_response_page()) return 0;
+    g_fat.request_va = map_page_anywhere(g_fat.request_paddr, 1);
+    g_fat.response_va = map_page_anywhere(g_fat.response_paddr, 1);
+    if (g_fat.request_va < 0x1000 || g_fat.response_va < 0x1000) return 0;
+    const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
+    g_fat.request_token = create_ipc_buffer_from_page(g_fat.request_paddr, owner_rights, IPC_BUFFER_ROLE_REQUEST);
+    g_fat.response_token = create_ipc_buffer_from_page(g_fat.response_paddr, owner_rights, IPC_BUFFER_ROLE_RESPONSE);
+    if (!is_ipc_buffer_token(g_fat.request_token) || !is_ipc_buffer_token(g_fat.response_token)) return 0;
+    const u64 remote_response_token = grant_response_buffer();
+    if (!is_ipc_buffer_token(remote_response_token)) return 0;
 
-    clear_page(REQUEST_VA);
-    clear_page(RESPONSE_VA);
+    clear_page(g_fat.request_va);
+    clear_page(g_fat.response_va);
     const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
-    g_fat.session_nonce = make_nonce(g_fat.request_paddr, g_fat.response_paddr, endpoint_id, self_slot);
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)REQUEST_VA;
+    g_fat.session_nonce = make_nonce(g_fat.request_token, g_fat.response_token, endpoint_id, self_slot);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_fat.request_va;
     request->magic = FS_REQUEST_MAGIC;
     request->version = FS_PROTOCOL_VERSION;
     request->op = FS_OP_CONNECT;
-    request->arg0 = g_fat.response_paddr;
+    request->arg0 = remote_response_token;
     request->arg1 = self_slot;
     request->session_nonce = g_fat.session_nonce;
     __asm__ volatile("" ::: "memory");
     request->request_seq = 1;
 
-    if (!share_request_page()) return 0;
+    if (!share_request_buffer()) return 0;
     if (!wait_response(1, FS_OP_CONNECT)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     g_fat.root_token = response->result_token;
     g_fat.next_seq = 2;
@@ -408,9 +431,9 @@ static int connect_fat(u64 endpoint_id, u64 process_slot) {
 static int fs_request(u16 op, u64 token, u64 offset, u32 length, const char *path) {
     const u16 path_len = path ? (u16)cstr_len(path) : 0;
     const u64 seq = g_fat.next_seq++;
-    clear_page(REQUEST_VA);
-    clear_page(RESPONSE_VA);
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)REQUEST_VA;
+    clear_page(g_fat.request_va);
+    clear_page(g_fat.response_va);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_fat.request_va;
     request->magic = FS_REQUEST_MAGIC;
     request->version = FS_PROTOCOL_VERSION;
     request->op = op;
@@ -419,7 +442,7 @@ static int fs_request(u16 op, u64 token, u64 offset, u32 length, const char *pat
     request->length = length;
     request->path_bytes = path_len;
     request->session_nonce = g_fat.session_nonce;
-    volatile u8 *payload = (volatile u8 *)(REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+    volatile u8 *payload = (volatile u8 *)(g_fat.request_va + FS_REQUEST_HEADER_BYTES);
     for (u16 i = 0; i < path_len; i++) payload[i] = (u8)path[i];
     __asm__ volatile("" ::: "memory");
     request->request_seq = seq;
@@ -441,11 +464,11 @@ static int alloc_pages_at(u64 base_va, u64 file_bytes, u64 max_pages) {
 
 static int load_exec_from_fat(const char *path, u64 image_va, u64 *exec_token_out) {
     if (!fs_request(FS_OP_LOOKUP, g_fat.root_token, 0, 0, path)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     const u64 file_token = response->result_token;
     if (!fs_request(FS_OP_OPEN_EXEC, file_token, 0, 0, 0)) return 0;
-    response = (volatile struct fs_response_header *)RESPONSE_VA;
+    response = (volatile struct fs_response_header *)g_fat.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0 || response->file_bytes == 0) return 0;
     const u64 open_token = response->result_token;
     const u64 file_bytes = response->file_bytes;
@@ -456,10 +479,10 @@ static int load_exec_from_fat(const char *path, u64 image_va, u64 *exec_token_ou
         u32 request_len = FS_RESPONSE_PAYLOAD_BYTES;
         if ((u64)request_len > file_bytes - offset) request_len = (u32)(file_bytes - offset);
         if (!fs_request(FS_OP_READ, open_token, offset, request_len, 0)) return 0;
-        response = (volatile struct fs_response_header *)RESPONSE_VA;
+        response = (volatile struct fs_response_header *)g_fat.response_va;
         if (response->status != FS_STATUS_OK || response->inline_bytes == 0) return 0;
         volatile u8 *dst = (volatile u8 *)(image_va + offset);
-        volatile u8 *src = (volatile u8 *)(RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
+        volatile u8 *src = (volatile u8 *)(g_fat.response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < response->inline_bytes; i++) dst[i] = src[i];
         offset += response->inline_bytes;
     }
@@ -474,11 +497,11 @@ static int load_exec_from_fat(const char *path, u64 image_va, u64 *exec_token_ou
 
 static int load_text_from_fat(const char *path, u8 *buffer, u32 capacity, u32 *len_out) {
     if (!fs_request(FS_OP_LOOKUP, g_fat.root_token, 0, 0, path)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     const u64 file_token = response->result_token;
     if (!fs_request(FS_OP_OPEN, file_token, 0, 0, 0)) return 0;
-    response = (volatile struct fs_response_header *)RESPONSE_VA;
+    response = (volatile struct fs_response_header *)g_fat.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     if (response->file_bytes >= capacity) return 0;
     const u64 open_token = response->result_token;
@@ -488,10 +511,10 @@ static int load_text_from_fat(const char *path, u8 *buffer, u32 capacity, u32 *l
         u32 request_len = FS_RESPONSE_PAYLOAD_BYTES;
         if ((u64)request_len > file_bytes - offset) request_len = (u32)(file_bytes - offset);
         if (!fs_request(FS_OP_READ, open_token, offset, request_len, 0)) return 0;
-        response = (volatile struct fs_response_header *)RESPONSE_VA;
+        response = (volatile struct fs_response_header *)g_fat.response_va;
         if (response->status != FS_STATUS_OK) return 0;
         if (response->inline_bytes == 0 && offset < file_bytes) return 0;
-        volatile u8 *src = (volatile u8 *)(RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
+        volatile u8 *src = (volatile u8 *)(g_fat.response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < response->inline_bytes; i++) buffer[offset + i] = src[i];
         offset += response->inline_bytes;
     }
@@ -505,17 +528,17 @@ static int install_vfs_endpoint(void) {
     return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_vfs.endpoint_id, g_vfs.process_slot) == SYSCALL_OK;
 }
 
-static int grant_vfs_response_page(void) {
-    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_vfs.response_paddr, g_vfs.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-    if (ret == SYSCALL_OK) return 1;
-    if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_vfs.response_paddr, g_vfs.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-    return ret == SYSCALL_OK;
+static u64 grant_vfs_response_buffer(void) {
+    u64 ret = grant_ipc_buffer_on_endpoint(g_vfs.response_token, g_vfs.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP);
+    if (is_ipc_buffer_token(ret)) return ret;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = grant_ipc_buffer_on_endpoint(g_vfs.response_token, g_vfs.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP);
+    return is_ipc_buffer_token(ret) ? ret : 0;
 }
 
-static int share_vfs_request_page(void) {
-    u64 ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id);
+static int share_vfs_request_buffer(void) {
+    u64 ret = share_ipc_buffer_on_endpoint(g_vfs.request_token, g_vfs.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP);
     if (ret == SYSCALL_OK) return 1;
-    if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_vfs.request_paddr, g_vfs.endpoint_id);
+    if (ret == SYSCALL_ERR_ENDPOINT && install_vfs_endpoint()) ret = share_ipc_buffer_on_endpoint(g_vfs.request_token, g_vfs.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP);
     return ret == SYSCALL_OK;
 }
 
@@ -527,7 +550,7 @@ static int signal_vfs(void) {
 }
 
 static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_vfs.response_va;
     for (u64 i = 0; i < 8192; i++) {
         if (response->response_seq == expected_seq) return response->magic == FS_RESPONSE_MAGIC && response->version == FS_PROTOCOL_VERSION && response->op == expected_op;
         (void)wait_event_poll();
@@ -543,27 +566,33 @@ static int connect_vfs(u64 endpoint_id, u64 process_slot) {
     g_vfs.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_vfs.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (g_vfs.request_paddr < 0x1000 || g_vfs.response_paddr < 0x1000) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, VFS_REQUEST_VA, g_vfs.request_paddr, 1) != SYSCALL_OK) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, VFS_RESPONSE_VA, g_vfs.response_paddr, 1) != SYSCALL_OK) return 0;
-    if (!grant_vfs_response_page()) return 0;
+    g_vfs.request_va = map_page_anywhere(g_vfs.request_paddr, 1);
+    g_vfs.response_va = map_page_anywhere(g_vfs.response_paddr, 1);
+    if (g_vfs.request_va < 0x1000 || g_vfs.response_va < 0x1000) return 0;
+    const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
+    g_vfs.request_token = create_ipc_buffer_from_page(g_vfs.request_paddr, owner_rights, IPC_BUFFER_ROLE_REQUEST);
+    g_vfs.response_token = create_ipc_buffer_from_page(g_vfs.response_paddr, owner_rights, IPC_BUFFER_ROLE_RESPONSE);
+    if (!is_ipc_buffer_token(g_vfs.request_token) || !is_ipc_buffer_token(g_vfs.response_token)) return 0;
+    const u64 remote_response_token = grant_vfs_response_buffer();
+    if (!is_ipc_buffer_token(remote_response_token)) return 0;
 
-    clear_page(VFS_REQUEST_VA);
-    clear_page(VFS_RESPONSE_VA);
+    clear_page(g_vfs.request_va);
+    clear_page(g_vfs.response_va);
     const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
-    g_vfs.session_nonce = make_nonce(g_vfs.request_paddr, g_vfs.response_paddr, endpoint_id, self_slot);
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
+    g_vfs.session_nonce = make_nonce(g_vfs.request_token, g_vfs.response_token, endpoint_id, self_slot);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_vfs.request_va;
     request->magic = FS_REQUEST_MAGIC;
     request->version = FS_PROTOCOL_VERSION;
     request->op = FS_OP_CONNECT;
-    request->arg0 = g_vfs.response_paddr;
+    request->arg0 = remote_response_token;
     request->arg1 = self_slot;
     request->session_nonce = g_vfs.session_nonce;
     __asm__ volatile("" ::: "memory");
     request->request_seq = 1;
 
-    if (!share_vfs_request_page()) return 0;
+    if (!share_vfs_request_buffer()) return 0;
     if (!wait_vfs_response(1, FS_OP_CONNECT)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_vfs.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     g_vfs.root_token = response->result_token;
     g_vfs.next_seq = 2;
@@ -574,9 +603,9 @@ static int connect_vfs(u64 endpoint_id, u64 process_slot) {
 static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *path) {
     const u16 path_len = path ? (u16)cstr_len(path) : 0;
     const u64 seq = g_vfs.next_seq++;
-    clear_page(VFS_REQUEST_VA);
-    clear_page(VFS_RESPONSE_VA);
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)VFS_REQUEST_VA;
+    clear_page(g_vfs.request_va);
+    clear_page(g_vfs.response_va);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_vfs.request_va;
     request->magic = FS_REQUEST_MAGIC;
     request->version = FS_PROTOCOL_VERSION;
     request->op = op;
@@ -585,7 +614,7 @@ static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *pa
     request->length = length;
     request->path_bytes = path_len;
     request->session_nonce = g_vfs.session_nonce;
-    volatile u8 *payload = (volatile u8 *)(VFS_REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+    volatile u8 *payload = (volatile u8 *)(g_vfs.request_va + FS_REQUEST_HEADER_BYTES);
     for (u16 i = 0; i < path_len; i++) payload[i] = (u8)path[i];
     __asm__ volatile("" ::: "memory");
     request->request_seq = seq;
@@ -595,11 +624,11 @@ static int vfs_request(u16 op, u64 token, u64 offset, u32 length, const char *pa
 
 static int load_text_from_vfs(const char *path, u8 *buffer, u32 capacity, u32 *len_out) {
     if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_vfs.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     const u64 file_token = response->result_token;
     if (!vfs_request(FS_OP_OPEN, file_token, 0, 0, 0)) return 0;
-    response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    response = (volatile struct fs_response_header *)g_vfs.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     if (response->file_bytes >= capacity) return 0;
     const u64 open_token = response->result_token;
@@ -609,10 +638,10 @@ static int load_text_from_vfs(const char *path, u8 *buffer, u32 capacity, u32 *l
         u32 request_len = FS_RESPONSE_PAYLOAD_BYTES;
         if ((u64)request_len > file_bytes - offset) request_len = (u32)(file_bytes - offset);
         if (!vfs_request(FS_OP_READ, open_token, offset, request_len, 0)) return 0;
-        response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        response = (volatile struct fs_response_header *)g_vfs.response_va;
         if (response->status != FS_STATUS_OK) return 0;
         if (response->inline_bytes == 0 && offset < file_bytes) return 0;
-        volatile u8 *src = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
+        volatile u8 *src = (volatile u8 *)(g_vfs.response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < response->inline_bytes; i++) buffer[offset + i] = src[i];
         offset += response->inline_bytes;
     }
@@ -623,11 +652,11 @@ static int load_text_from_vfs(const char *path, u8 *buffer, u32 capacity, u32 *l
 
 static int load_exec_from_vfs(const char *path, u64 image_va, u64 *exec_token_out) {
     if (!vfs_request(FS_OP_LOOKUP, g_vfs.root_token, 0, 0, path)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_vfs.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     const u64 file_token = response->result_token;
     if (!vfs_request(FS_OP_OPEN_EXEC, file_token, 0, 0, 0)) return 0;
-    response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    response = (volatile struct fs_response_header *)g_vfs.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0 || response->file_bytes == 0) return 0;
     const u64 open_token = response->result_token;
     const u64 file_bytes = response->file_bytes;
@@ -638,10 +667,10 @@ static int load_exec_from_vfs(const char *path, u64 image_va, u64 *exec_token_ou
         u32 request_len = FS_RESPONSE_PAYLOAD_BYTES;
         if ((u64)request_len > file_bytes - offset) request_len = (u32)(file_bytes - offset);
         if (!vfs_request(FS_OP_READ, open_token, offset, request_len, 0)) return 0;
-        response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        response = (volatile struct fs_response_header *)g_vfs.response_va;
         if (response->status != FS_STATUS_OK || response->inline_bytes == 0) return 0;
         volatile u8 *dst = (volatile u8 *)(image_va + offset);
-        volatile u8 *src = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
+        volatile u8 *src = (volatile u8 *)(g_vfs.response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < response->inline_bytes; i++) dst[i] = src[i];
         offset += response->inline_bytes;
     }

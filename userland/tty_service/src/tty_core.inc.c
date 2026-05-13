@@ -31,7 +31,7 @@ static void tty_core_notify_client_event(void) {
 static u64 tty_core_pump_input_once(void) {
     const u64 n = backend_try_read_raw();
     if (n == 0) return 0;
-    volatile u8 *src = payload_at(TTY_CONSOLE_RESPONSE_VA, CONSOLE_RESPONSE_HEADER_BYTES);
+    volatile u8 *src = payload_at(g_console.response_va, CONSOLE_RESPONSE_HEADER_BYTES);
     for (u64 i = 0; i < n; i++) g_tty_pump_buf[i] = src[i];
     bsd_ttydisc_rint_bypass(&g_tty, g_tty_pump_buf, n);
     if (bsd_ttydisc_peek_signal(&g_tty) != 0) tty_core_notify_client_event();
@@ -56,7 +56,7 @@ static u64 tty_read_to_client_payload(u64 max_len, u8 *signal_out) {
         }
         if (bsd_ttydisc_readable(&g_tty) ||
             bsd_ttyinq_bytes_used(&g_tty.inq) >= bsd_ttyinq_capacity()) {
-            volatile u8 *dst = payload_at(TTY_CLIENT_RESPONSE_VA, CONSOLE_RESPONSE_HEADER_BYTES);
+            volatile u8 *dst = payload_at(g_client.response_va, CONSOLE_RESPONSE_HEADER_BYTES);
             return bsd_ttydisc_read(&g_tty, dst, request_len);
         }
 

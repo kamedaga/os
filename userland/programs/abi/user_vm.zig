@@ -2,6 +2,8 @@ const syscall_alloc_page: u64 = 0x1;
 const syscall_map_page: u64 = 0x2;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_map_page_anywhere: u64 = 0x5C;
+const syscall_alloc_map_pages_anywhere: u64 = 0x5D;
 
 pub const page_bytes: usize = 4096;
 pub const syscall_ok: u64 = 0;
@@ -16,6 +18,16 @@ fn syscall0(nr: u64) u64 {
         \\int $0x80
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (nr),
+        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+}
+
+fn syscall2(nr: u64, arg0: u64, arg1: u64) u64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> u64),
+        : [nr] "{rax}" (nr),
+          [arg0] "{rdi}" (arg0),
+          [arg1] "{rsi}" (arg1),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
@@ -71,11 +83,37 @@ pub fn allocMapPages(page_count: usize, writable: bool) ?usize {
     return va;
 }
 
+pub fn allocMapPagesAnywhere(page_count: usize, writable: bool) ?usize {
+    if (page_count == 0) return null;
+    const flags: u64 = if (writable) 1 else 0;
+    const va = syscall3(syscall_alloc_map_pages_anywhere, @intCast(page_count), flags, 0);
+    if (va < page_bytes) return null;
+    return @intCast(va);
+}
+
+pub fn allocMapPagesAnywhereInto(page_count: usize, writable: bool, paddrs: []u64) ?usize {
+    if (page_count == 0 or page_count > paddrs.len) return null;
+    var i: usize = 0;
+    while (i < paddrs.len) : (i += 1) paddrs[i] = 0;
+    const flags: u64 = if (writable) 1 else 0;
+    const va = syscall3(syscall_alloc_map_pages_anywhere, @intCast(page_count), flags, @intFromPtr(paddrs.ptr));
+    if (va < page_bytes) return null;
+    return @intCast(va);
+}
+
 pub fn mapPageAtDynamicVa(paddr: u64, writable: bool) ?MappedPage {
     if (paddr < 0x1000) return null;
     const va = reservePages(1) orelse return null;
     if (!mapPageAtVa(va, paddr, writable)) return null;
     return .{ .va = va, .paddr = paddr };
+}
+
+pub fn mapPageAnywhere(paddr: u64, writable: bool) ?MappedPage {
+    if (paddr < 0x1000) return null;
+    const flags: u64 = if (writable) 1 else 0;
+    const va = syscall2(syscall_map_page_anywhere, paddr, flags);
+    if (va < page_bytes) return null;
+    return .{ .va = @intCast(va), .paddr = paddr };
 }
 
 pub fn mapPageAtVa(va: usize, paddr: u64, writable: bool) bool {

@@ -190,6 +190,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     const u64 path_ptr = old_open ? req->args[0] : req->args[1];
     const u64 flags = old_open ? req->args[1] : req->args[2];
     const u64 access_mode = flags & O_ACCMODE;
+    const u32 new_fd_flags = (u32)((flags & O_NONBLOCK) | ((flags & O_CLOEXEC) != 0 ? FD_INTERNAL_CLOEXEC : 0));
     if (access_mode != O_RDONLY && access_mode != O_WRONLY && access_mode != O_RDWR) return reply(errno_acces(), 0);
     if ((flags & O_TRUNC) != 0 && access_mode == O_RDONLY) return reply(errno_acces(), 0);
     if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
@@ -206,6 +207,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         g_fds[fd].token = 0;
         g_fds[fd].offset = 0;
         g_fds[fd].size = 0;
+        g_fds[fd].fd_flags = new_fd_flags;
         g_fds[fd].mode_bits = FS_FILE_MODE;
         g_fds[fd].object_kind = FS_OBJECT_FILE;
         g_fds[fd].path_len = 0;
@@ -219,6 +221,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         g_fds[fd].token = 0;
         g_fds[fd].offset = 0;
         g_fds[fd].size = 0;
+        g_fds[fd].fd_flags = new_fd_flags;
         g_fds[fd].mode_bits = FS_FILE_MODE;
         g_fds[fd].object_kind = FS_OBJECT_FILE;
         fd_set_path(&g_fds[fd], resolved);
@@ -232,7 +235,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
             if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: create request failed path=", resolved);
             return reply(errno_io(), 0);
         }
-        volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        volatile struct fs_response_header *created = (volatile struct fs_response_header *)vfs_response_addr();
         if (created->status != FS_STATUS_OK || created->result_token == 0) {
             if (path_should_trace_io(resolved)) {
                 log_io_path("LinuxAbiServer: create failed path=", resolved);
@@ -254,7 +257,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
             if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: truncate request failed path=", resolved);
             return reply(errno_io(), 0);
         }
-        volatile struct fs_response_header *created = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        volatile struct fs_response_header *created = (volatile struct fs_response_header *)vfs_response_addr();
         if (created->status != FS_STATUS_OK || created->result_token == 0) {
             if (path_should_trace_io(resolved)) {
                 log_io_path("LinuxAbiServer: truncate failed path=", resolved);
@@ -270,7 +273,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     }
     const int fd = alloc_fd(); if (fd < 0) return reply(errno_busy(), 0);
     if (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) {
-        g_fds[fd].kind = FD_DIR; g_fds[fd].token = token; g_fds[fd].offset = 0; g_fds[fd].size = 0; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = kind;
+        g_fds[fd].kind = FD_DIR; g_fds[fd].token = token; g_fds[fd].offset = 0; g_fds[fd].size = 0; g_fds[fd].fd_flags = new_fd_flags; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = kind;
         fd_set_path(&g_fds[fd], resolved);
         sync_fd_to_thread_group((u64)fd);
         return reply((u64)fd, 0);
@@ -284,6 +287,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
             g_fds[fd].token = token;
             g_fds[fd].offset = 0;
             g_fds[fd].size = size;
+            g_fds[fd].fd_flags = new_fd_flags;
             g_fds[fd].mode_bits = rec.mode_bits;
             g_fds[fd].object_kind = FS_OBJECT_FILE;
             fd_set_path(&g_fds[fd], resolved);
@@ -296,7 +300,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: open request failed path=", resolved);
         return reply(errno_io(), 0);
     }
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
     if (response->status != FS_STATUS_OK || response->result_token == 0) {
         if (path_should_trace_io(resolved)) {
             log_io_path("LinuxAbiServer: open failed path=", resolved);
@@ -305,7 +309,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         }
         return reply(errno_acces(), 0);
     }
-    g_fds[fd].kind = FD_FILE; g_fds[fd].token = response->result_token; g_fds[fd].offset = 0; g_fds[fd].size = response->file_bytes != 0 ? response->file_bytes : size; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = FS_OBJECT_FILE;
+    g_fds[fd].kind = FD_FILE; g_fds[fd].token = response->result_token; g_fds[fd].offset = 0; g_fds[fd].size = response->file_bytes != 0 ? response->file_bytes : size; g_fds[fd].fd_flags = new_fd_flags; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = FS_OBJECT_FILE;
     fd_set_path(&g_fds[fd], resolved);
     sync_fd_to_thread_group((u64)fd);
     return reply((u64)fd, 0);
@@ -364,10 +368,10 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
         if (request_len > remaining) request_len = remaining;
         if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
-        volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
         if (response->status != FS_STATUS_OK) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
         if (response->inline_bytes == 0) break;
-        if (copy_to_target(dst + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) return reply(errno_fault(), 0);
+        if (copy_to_target(dst + copied, vfs_response_payload(), response->inline_bytes) != response->inline_bytes) return reply(errno_fault(), 0);
         profile_fs_read_path(&g_fds[fd], response->inline_bytes);
         copied += response->inline_bytes; g_fds[fd].offset += response->inline_bytes; sync_fd_to_thread_group(fd);
         if (response->inline_bytes < request_len) break;
@@ -387,10 +391,10 @@ static u64 read_fd_at_to_target(const struct fd_entry *fd, u64 file_offset, u64 
         const u64 remaining = fd->size - (file_offset + copied);
         if (request_len > remaining) request_len = remaining;
         if (!vfs_request(FS_OP_READ, fd->token, file_offset + copied, (u32)request_len, 0)) break;
-        volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
         if (response->status != FS_STATUS_OK) break;
         if (response->inline_bytes == 0) break;
-        if (copy_to_target(dst + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) {
+        if (copy_to_target(dst + copied, vfs_response_payload(), response->inline_bytes) != response->inline_bytes) {
             *fault = 1;
             break;
         }
@@ -481,10 +485,10 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
             const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
             if (request_len > remaining) request_len = remaining;
             if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
-            volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+            volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
             if (response->status != FS_STATUS_OK) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
             if (response->inline_bytes == 0) return reply(total, 0);
-            if (copy_to_target(pair[0] + copied, (const void *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES), response->inline_bytes) != response->inline_bytes) {
+            if (copy_to_target(pair[0] + copied, vfs_response_payload(), response->inline_bytes) != response->inline_bytes) {
                 return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
             }
             profile_fs_read_path(&g_fds[fd], response->inline_bytes);
@@ -694,13 +698,13 @@ static struct ipc_message handle_getdents64(const struct trap_request *req) {
     u64 written = 0;
     while (written + 32 <= len) {
         if (!vfs_request(FS_OP_READDIR, g_fds[fd].token, g_fds[fd].offset, 0, 0)) return written != 0 ? reply(written, 0) : reply(errno_io(), 0);
-        volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
         if (response->status == FS_STATUS_END_OF_DIR) break; if (response->status != FS_STATUS_OK || response->inline_bytes < FS_DIRENT_RECORD_BYTES) return written != 0 ? reply(written, 0) : reply(errno_io(), 0);
-        volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES); if (response->inline_bytes < FS_DIRENT_RECORD_BYTES + record->name_bytes) return reply(errno_io(), 0);
+        volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)vfs_response_payload(); if (response->inline_bytes < FS_DIRENT_RECORD_BYTES + record->name_bytes) return reply(errno_io(), 0);
         u64 reclen = align_up(19 + record->name_bytes + 1, 8); if (written + reclen > len) break;
         u8 out[320]; for (u64 i = 0; i < sizeof(out); i++) out[i] = 0;
         *((u64 *)(out + 0)) = 1; *((i64 *)(out + 8)) = (i64)record->next_cursor; *((u16 *)(out + 16)) = (u16)reclen; out[18] = (record->object_kind == FS_OBJECT_DIRECTORY || record->object_kind == FS_OBJECT_MOUNT) ? DT_DIR : DT_REG;
-        volatile u8 *name = (volatile u8 *)(VFS_RESPONSE_VA + FS_RESPONSE_HEADER_BYTES + FS_DIRENT_RECORD_BYTES); for (u64 i = 0; i < record->name_bytes && 19 + i < sizeof(out); i++) out[19 + i] = name[i];
+        volatile u8 *name = (volatile u8 *)(vfs_response_addr() + FS_RESPONSE_HEADER_BYTES + FS_DIRENT_RECORD_BYTES); for (u64 i = 0; i < record->name_bytes && 19 + i < sizeof(out); i++) out[19 + i] = name[i];
         if (copy_to_target(dst + written, out, reclen) != reclen) return reply(errno_fault(), 0);
         written += reclen; g_fds[fd].offset = record->next_cursor;
         if (record->next_cursor == 0) break;
@@ -733,7 +737,7 @@ static struct ipc_message handle_unlinkat(const struct trap_request *req, int ol
     if (path[0] == 0) return reply(errno_noent(), 0);
     if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
     if (!vfs_request(FS_OP_UNLINK, g_vfs.root_token, 0, 0, resolved)) return reply(errno_io(), 0);
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
     if (response->status == FS_STATUS_OK) { invalidate_exec_cache_for_path(resolved); return reply(0, 0); }
     if (response->status == FS_STATUS_NOT_FOUND) return reply(errno_noent(), 0);
     if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
@@ -767,7 +771,7 @@ static struct ipc_message handle_renameat(const struct trap_request *req, int ol
     if (!resolve_path_at(new_dirfd, new_path, new_resolved)) return reply(errno_nametoolong(), 0);
     if (fs_cstr_eq(old_resolved, new_resolved)) return reply(0, 0);
     if (!vfs_rename_paths(old_resolved, new_resolved)) return reply(errno_io(), 0);
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)VFS_RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
     if (response->status == FS_STATUS_OK) {
         invalidate_exec_cache_for_path(old_resolved);
         invalidate_exec_cache_for_path(new_resolved);

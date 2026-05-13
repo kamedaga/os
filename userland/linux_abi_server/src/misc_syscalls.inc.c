@@ -45,6 +45,21 @@ static struct ipc_message handle_readlink(const struct trap_request *req) {
 struct linux_timespec { i64 tv_sec; i64 tv_nsec; };
 struct linux_timeval { i64 tv_sec; i64 tv_usec; };
 struct linux_timezone { int tz_minuteswest; int tz_dsttime; };
+struct linux_sysinfo {
+    i64 uptime;
+    u64 loads[3];
+    u64 totalram;
+    u64 freeram;
+    u64 sharedram;
+    u64 bufferram;
+    u64 totalswap;
+    u64 freeswap;
+    u16 procs;
+    u16 pad;
+    u64 totalhigh;
+    u64 freehigh;
+    u32 mem_unit;
+};
 enum {
     LINUX_CLOCK_REALTIME = 0,
     LINUX_CLOCK_MONOTONIC = 1,
@@ -124,6 +139,20 @@ static struct ipc_message handle_gettimeofday(const struct trap_request *req) {
         if (copy_to_target(req->args[1], &tz, sizeof(tz)) != sizeof(tz)) return reply(errno_fault(), 0);
     }
     return reply(0, 0);
+}
+
+static struct ipc_message handle_sysinfo(const struct trap_request *req) {
+    struct linux_sysinfo info;
+    u8 *p = (u8 *)&info; for (u64 i = 0; i < sizeof(info); i++) p[i] = 0;
+    const u64 ticks = syscall0(SYSCALL_GET_TICK_COUNT);
+    info.uptime = (i64)(ticks / 1000ULL);
+    info.totalram = 512ULL * 1024ULL * 1024ULL;
+    info.freeram = 256ULL * 1024ULL * 1024ULL;
+    info.mem_unit = 1;
+    u16 procs = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) if (g_processes[i].used) procs++;
+    info.procs = procs;
+    return copy_to_target(req->args[0], &info, sizeof(info)) == sizeof(info) ? reply(0, 0) : reply(errno_fault(), 0);
 }
 
 static struct ipc_message handle_time_syscall(const struct trap_request *req) {

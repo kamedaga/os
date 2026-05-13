@@ -13,6 +13,7 @@ pub const fs_abi = @import("fs_abi.zig");
 pub const fs_client = @import("fs_client.zig");
 pub const fs_protocol = @import("fs_protocol.zig");
 pub const image_abi = @import("image_abi.zig");
+pub const ipc_buffer_abi = @import("ipc_buffer_abi.zig");
 pub const init_bootstrap_abi = @import("init_bootstrap_abi.zig");
 pub const manager_init_bootstrap_abi = @import("manager_init_bootstrap_abi.zig");
 pub const process_abi = @import("process_abi.zig");

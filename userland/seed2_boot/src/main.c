@@ -27,12 +27,24 @@ enum {
     SYSCALL_INSTALL_CAPS_BATCH = 0x32,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
     SYSCALL_GRANT_QUEUE_CAP = 0x23,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
+    SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
+    SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
 
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
     PAGE_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
+    IPC_BUFFER_RIGHT_READ = 0x1,
+    IPC_BUFFER_RIGHT_WRITE = 0x2,
+    IPC_BUFFER_RIGHT_MAP = 0x4,
+    IPC_BUFFER_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_ROLE_REQUEST = 1,
+    IPC_BUFFER_ROLE_RESPONSE = 2,
     VM_OBJECT_RIGHT_READ = 0x1,
     VM_OBJECT_RIGHT_WRITE = 0x2,
     VM_OBJECT_RIGHT_MAP = 0x4,
@@ -182,8 +194,6 @@ enum {
     DEVICE_CATALOG_KIND_CONSOLE = 1,
     DEVICE_CATALOG_KIND_NET = 2,
 
-    REQUEST_VA = 0x28000000,
-    RESPONSE_VA = 0x28001000,
     ROOT_SEED2_IMAGE_VA = 0x28100000,
     ROOT_SEED2_CONFIG_VA = 0x2A000000,
     BOOT_TEXT_FB_VA = 0x3E000000,
@@ -386,6 +396,10 @@ struct backend_session {
     u64 process_slot;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    u64 request_va;
+    u64 response_va;
     u64 session_nonce;
     u64 root_token;
     u64 next_seq;
@@ -564,6 +578,26 @@ static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) {
 
 static u64 wait_event_poll(void) {
     return syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+}
+
+static u64 map_page_anywhere(u64 paddr, u64 writable) {
+    return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, writable);
+}
+
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static u64 create_ipc_buffer_from_page(u64 paddr, u64 rights_bits, u64 role) {
+    return syscall3(SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE, paddr, rights_bits, role);
+}
+
+static u64 grant_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits) {
+    return syscall3(SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits);
+}
+
+static u64 share_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights_bits) {
+    return syscall3(SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights_bits);
 }
 
 static u64 alloc_map_page(u64 source_va) {
@@ -1144,30 +1178,36 @@ static int install_fat_endpoint_for_boot(void) {
     return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_fat_session.endpoint_id, g_fat_session.process_slot) == SYSCALL_OK;
 }
 
-static int grant_fat_response_page(void) {
-    u64 ret = syscall3(
-        SYSCALL_GRANT_CAP_ON_ENDPOINT,
-        g_fat_session.response_paddr,
+static u64 grant_fat_response_buffer(void) {
+    u64 ret = grant_ipc_buffer_on_endpoint(
+        g_fat_session.response_token,
         g_fat_session.endpoint_id,
-        PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE
+        IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP
+    );
+    if (is_ipc_buffer_token(ret)) return ret;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_fat_endpoint_for_boot()) {
+        ret = grant_ipc_buffer_on_endpoint(
+            g_fat_session.response_token,
+            g_fat_session.endpoint_id,
+            IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP
+        );
+    }
+    return is_ipc_buffer_token(ret) ? ret : 0;
+}
+
+static int share_fat_request_buffer(void) {
+    u64 ret = share_ipc_buffer_on_endpoint(
+        g_fat_session.request_token,
+        g_fat_session.endpoint_id,
+        IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP
     );
     if (ret == SYSCALL_OK) return 1;
     if (ret == SYSCALL_ERR_ENDPOINT && install_fat_endpoint_for_boot()) {
-        ret = syscall3(
-            SYSCALL_GRANT_CAP_ON_ENDPOINT,
-            g_fat_session.response_paddr,
+        ret = share_ipc_buffer_on_endpoint(
+            g_fat_session.request_token,
             g_fat_session.endpoint_id,
-            PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE
+            IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP
         );
-    }
-    return ret == SYSCALL_OK;
-}
-
-static int share_fat_request_page(void) {
-    u64 ret = syscall2(SYSCALL_SHARE_CAP, g_fat_session.request_paddr, g_fat_session.endpoint_id);
-    if (ret == SYSCALL_OK) return 1;
-    if (ret == SYSCALL_ERR_ENDPOINT && install_fat_endpoint_for_boot()) {
-        ret = syscall2(SYSCALL_SHARE_CAP, g_fat_session.request_paddr, g_fat_session.endpoint_id);
     }
     return ret == SYSCALL_OK;
 }
@@ -1182,7 +1222,7 @@ static int signal_fat_for_boot(void) {
 }
 
 static int wait_fat_response(u64 expected_seq, u16 expected_op) {
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat_session.response_va;
     for (u64 i = 0; i < 8192; i++) {
         if (response->response_seq == expected_seq) {
             return response->magic == FS_RESPONSE_MAGIC &&
@@ -1194,10 +1234,10 @@ static int wait_fat_response(u64 expected_seq, u16 expected_op) {
     return 0;
 }
 
-static u64 make_fat_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
+static u64 make_fat_nonce(u64 request_token, u64 response_token, u64 endpoint_id, u64 process_slot) {
     u64 nonce =
-        request_paddr ^
-        ((response_paddr << 17) | (response_paddr >> 47)) ^
+        request_token ^
+        ((response_token << 17) | (response_token >> 47)) ^
         ((endpoint_id << 7) | (endpoint_id >> 57)) ^
         process_slot ^
         0x5eed2002b0075ULL;
@@ -1212,33 +1252,39 @@ static int connect_fat_for_root_spawn(void) {
     g_fat_session.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     g_fat_session.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     if (g_fat_session.request_paddr < 0x1000 || g_fat_session.response_paddr < 0x1000) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, REQUEST_VA, g_fat_session.request_paddr, 1) != SYSCALL_OK) return 0;
-    if (syscall3(SYSCALL_MAP_PAGE, RESPONSE_VA, g_fat_session.response_paddr, 1) != SYSCALL_OK) return 0;
-    if (!grant_fat_response_page()) return 0;
+    g_fat_session.request_va = map_page_anywhere(g_fat_session.request_paddr, 1);
+    g_fat_session.response_va = map_page_anywhere(g_fat_session.response_paddr, 1);
+    if (g_fat_session.request_va < 0x1000 || g_fat_session.response_va < 0x1000) return 0;
+    const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
+    g_fat_session.request_token = create_ipc_buffer_from_page(g_fat_session.request_paddr, owner_rights, IPC_BUFFER_ROLE_REQUEST);
+    g_fat_session.response_token = create_ipc_buffer_from_page(g_fat_session.response_paddr, owner_rights, IPC_BUFFER_ROLE_RESPONSE);
+    if (!is_ipc_buffer_token(g_fat_session.request_token) || !is_ipc_buffer_token(g_fat_session.response_token)) return 0;
+    const u64 remote_response_token = grant_fat_response_buffer();
+    if (!is_ipc_buffer_token(remote_response_token)) return 0;
 
-    clear_page(REQUEST_VA);
-    clear_page(RESPONSE_VA);
+    clear_page(g_fat_session.request_va);
+    clear_page(g_fat_session.response_va);
     const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     g_fat_session.session_nonce = make_fat_nonce(
-        g_fat_session.request_paddr,
-        g_fat_session.response_paddr,
+        g_fat_session.request_token,
+        g_fat_session.response_token,
         g_fat_session.endpoint_id,
         self_slot
     );
 
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)REQUEST_VA;
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_fat_session.request_va;
     request->magic = FS_REQUEST_MAGIC;
     request->version = FS_PROTOCOL_VERSION;
     request->op = FS_OP_CONNECT;
-    request->arg0 = g_fat_session.response_paddr;
+    request->arg0 = remote_response_token;
     request->arg1 = self_slot;
     request->session_nonce = g_fat_session.session_nonce;
     __asm__ volatile("" ::: "memory");
     request->request_seq = 1;
 
-    if (!share_fat_request_page()) return 0;
+    if (!share_fat_request_buffer()) return 0;
     if (!wait_fat_response(1, FS_OP_CONNECT)) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat_session.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     g_fat_session.root_token = response->result_token;
     g_fat_session.next_seq = 2;
@@ -1251,9 +1297,9 @@ static int fat_request(u16 op, u64 token, u64 offset, u32 length, const char *pa
     if (path_len64 > FS_MAX_PATH_BYTES) return 0;
     const u16 path_len = (u16)path_len64;
     const u64 seq = g_fat_session.next_seq++;
-    clear_page(REQUEST_VA);
-    clear_page(RESPONSE_VA);
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)REQUEST_VA;
+    clear_page(g_fat_session.request_va);
+    clear_page(g_fat_session.response_va);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)g_fat_session.request_va;
     request->magic = FS_REQUEST_MAGIC;
     request->version = FS_PROTOCOL_VERSION;
     request->op = op;
@@ -1266,7 +1312,7 @@ static int fat_request(u16 op, u64 token, u64 offset, u32 length, const char *pa
     request->arg0 = 0;
     request->arg1 = 0;
     request->session_nonce = g_fat_session.session_nonce;
-    volatile u8 *payload = (volatile u8 *)(REQUEST_VA + FS_REQUEST_HEADER_BYTES);
+    volatile u8 *payload = (volatile u8 *)(g_fat_session.request_va + FS_REQUEST_HEADER_BYTES);
     for (u16 i = 0; i < path_len; i++) payload[i] = (u8)path[i];
     __asm__ volatile("" ::: "memory");
     request->request_seq = seq;
@@ -1288,12 +1334,12 @@ static int alloc_root_seed2_image_pages(u64 file_bytes) {
 
 static int load_root_seed2_from_fat(u64 *exec_token_out) {
     if (!fat_request(FS_OP_LOOKUP, g_fat_session.root_token, 0, 0, "/sbin/seed2.elf")) return 0;
-    volatile struct fs_response_header *response = (volatile struct fs_response_header *)RESPONSE_VA;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat_session.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
     const u64 file_token = response->result_token;
 
     if (!fat_request(FS_OP_OPEN_EXEC, file_token, 0, 0, 0)) return 0;
-    response = (volatile struct fs_response_header *)RESPONSE_VA;
+    response = (volatile struct fs_response_header *)g_fat_session.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0 || response->file_bytes == 0) return 0;
     const u64 open_token = response->result_token;
     const u64 file_bytes = response->file_bytes;
@@ -1304,11 +1350,11 @@ static int load_root_seed2_from_fat(u64 *exec_token_out) {
         u32 request_len = FS_RESPONSE_PAYLOAD_BYTES;
         if ((u64)request_len > file_bytes - offset) request_len = (u32)(file_bytes - offset);
         if (!fat_request(FS_OP_READ, open_token, offset, request_len, 0)) return 0;
-        response = (volatile struct fs_response_header *)RESPONSE_VA;
+        response = (volatile struct fs_response_header *)g_fat_session.response_va;
         if (response->status != FS_STATUS_OK || response->inline_bytes == 0 || response->inline_bytes > request_len) return 0;
         if (offset + response->inline_bytes > file_bytes) return 0;
         volatile u8 *dst = (volatile u8 *)(ROOT_SEED2_IMAGE_VA + offset);
-        volatile u8 *src = (volatile u8 *)(RESPONSE_VA + FS_RESPONSE_HEADER_BYTES);
+        volatile u8 *src = (volatile u8 *)(g_fat_session.response_va + FS_RESPONSE_HEADER_BYTES);
         for (u16 i = 0; i < response->inline_bytes; i++) dst[i] = src[i];
         offset += response->inline_bytes;
     }

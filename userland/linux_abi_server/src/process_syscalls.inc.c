@@ -171,7 +171,7 @@ static void start_deferred_trap_targets(void) {
     }
 }
 
-static void copy_process_state_for_fork(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal) {
+static void copy_process_state_for_fork_impl(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal, int ref_pipe_fds) {
     child->used = 1;
     child->exec_pending = 0;
     child->exec_pending_principal = 0;
@@ -201,12 +201,16 @@ static void copy_process_state_for_fork(struct linux_process_state *child, const
     }
     for (u64 fd = 0; fd < 32; fd++) {
         copy_fd_entry(&child->fds[fd], &parent->fds[fd]);
-        pipe_ref_fd(&child->fds[fd]);
+        if (ref_pipe_fds) pipe_ref_fd(&child->fds[fd]);
     }
 }
 
+static void copy_process_state_for_fork(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal) {
+    copy_process_state_for_fork_impl(child, parent, child_principal, 1);
+}
+
 static void copy_process_state_for_clone_thread(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal, u64 clear_child_tid) {
-    copy_process_state_for_fork(child, parent, child_principal);
+    copy_process_state_for_fork_impl(child, parent, child_principal, 0);
     child->pid = parent->pid;
     child->tid = child_principal;
     child->clear_child_tid = clear_child_tid;

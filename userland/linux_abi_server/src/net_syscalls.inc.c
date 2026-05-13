@@ -69,27 +69,31 @@ static void write_net_le16(u8 *p, u16 value) {
     p[1] = (u8)(value >> 8);
 }
 
-static u64 make_net_nonce(u64 request_paddr, u64 response_paddr, u64 endpoint_id, u64 process_slot) {
-    u64 nonce = request_paddr ^ ((response_paddr << 17) | (response_paddr >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x6e65742d73746174ULL;
+static u64 make_net_nonce(u64 request_token, u64 response_token, u64 endpoint_id, u64 process_slot) {
+    u64 nonce = request_token ^ ((response_token << 17) | (response_token >> 47)) ^ ((endpoint_id << 7) | (endpoint_id >> 57)) ^ process_slot ^ 0x6e65742d73746174ULL;
     return nonce == 0 ? 1 : nonce;
 }
+
+static u64 net_request_addr(void) { return g_net.request_map.addr; }
+static u64 net_response_addr(void) { return g_net.response_map.addr; }
+static void *net_response_payload(void) { return (void *)(net_response_addr() + NET_RESPONSE_HEADER_BYTES); }
 
 static int install_net_endpoint(void) {
     if (g_net.endpoint_id == 0 || g_net.process_slot == 0) return 0;
     return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, g_net.endpoint_id, g_net.process_slot) == SYSCALL_OK;
 }
 
-static int grant_net_response_page(void) {
-    u64 ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_net.response_paddr, g_net.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-    if (ret == SYSCALL_OK) return 1;
-    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) ret = syscall3(SYSCALL_GRANT_CAP_ON_ENDPOINT, g_net.response_paddr, g_net.endpoint_id, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE);
-    return ret == SYSCALL_OK;
+static u64 grant_net_response_buffer(void) {
+    u64 ret = grant_ipc_buffer_on_endpoint(g_net.response_token, g_net.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP);
+    if (is_ipc_buffer_token(ret)) return ret;
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) ret = grant_ipc_buffer_on_endpoint(g_net.response_token, g_net.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP);
+    return is_ipc_buffer_token(ret) ? ret : 0;
 }
 
-static int share_net_request_page(void) {
-    u64 ret = syscall2(SYSCALL_SHARE_CAP, g_net.request_paddr, g_net.endpoint_id);
+static int share_net_request_buffer(void) {
+    u64 ret = share_ipc_buffer_on_endpoint(g_net.request_token, g_net.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP);
     if (ret == SYSCALL_OK) return 1;
-    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) ret = syscall2(SYSCALL_SHARE_CAP, g_net.request_paddr, g_net.endpoint_id);
+    if (ret == SYSCALL_ERR_ENDPOINT && install_net_endpoint()) ret = share_ipc_buffer_on_endpoint(g_net.request_token, g_net.endpoint_id, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP);
     return ret == SYSCALL_OK;
 }
 
@@ -101,7 +105,9 @@ static u64 signal_net_status(void) {
 }
 
 static int wait_net_response(u64 expected_seq, u16 expected_op, u64 poll_limit) {
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    const u64 response_addr = net_response_addr();
+    if (response_addr < PAGE_BYTES) return 0;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)response_addr;
     g_prof.net_wait_calls++;
     for (u64 i = 0; poll_limit == 0 || i < poll_limit; i++) {
         if (response->response_seq == expected_seq) {
@@ -128,28 +134,42 @@ static int connect_net_from_registry(void) {
         g_net.request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
         g_net.response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
         if (g_net.request_paddr < 0x1000 || g_net.response_paddr < 0x1000) return 0;
-        if (syscall3(SYSCALL_MAP_PAGE, NET_REQUEST_VA, g_net.request_paddr, 1) != SYSCALL_OK) return 0;
-        if (syscall3(SYSCALL_MAP_PAGE, NET_RESPONSE_VA, g_net.response_paddr, 1) != SYSCALL_OK) return 0;
     }
-    if (!grant_net_response_page()) return 0;
-    clear_page(NET_REQUEST_VA);
-    clear_page(NET_RESPONSE_VA);
+    if (g_net.request_map.addr < PAGE_BYTES || g_net.response_map.addr < PAGE_BYTES) {
+        const u64 request_addr = map_page_anywhere(g_net.request_paddr, 1);
+        const u64 response_addr = map_page_anywhere(g_net.response_paddr, 1);
+        if (request_addr < PAGE_BYTES || response_addr < PAGE_BYTES) return 0;
+        g_net.request_map.addr = request_addr;
+        g_net.request_map.page_count = 1;
+        g_net.response_map.addr = response_addr;
+        g_net.response_map.page_count = 1;
+    }
+    const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
+    g_net.request_token = create_ipc_buffer_from_page(g_net.request_paddr, owner_rights, IPC_BUFFER_ROLE_REQUEST);
+    g_net.response_token = create_ipc_buffer_from_page(g_net.response_paddr, owner_rights, IPC_BUFFER_ROLE_RESPONSE);
+    if (!is_ipc_buffer_token(g_net.request_token) || !is_ipc_buffer_token(g_net.response_token)) return 0;
+    const u64 remote_response_token = grant_net_response_buffer();
+    if (!is_ipc_buffer_token(remote_response_token)) return 0;
+    const u64 request_addr = net_request_addr();
+    const u64 response_addr = net_response_addr();
+    clear_page(request_addr);
+    clear_page(response_addr);
 
     const u64 self_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
-    g_net.session_nonce = make_net_nonce(g_net.request_paddr, g_net.response_paddr, g_net.endpoint_id, self_slot);
-    volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+    g_net.session_nonce = make_net_nonce(g_net.request_token, g_net.response_token, g_net.endpoint_id, self_slot);
+    volatile struct net_request_header *request = (volatile struct net_request_header *)request_addr;
     const u64 connect_seq = g_net.next_seq != 0 ? g_net.next_seq++ : 1;
     request->magic = NET_REQUEST_MAGIC;
     request->version = NET_PROTOCOL_VERSION;
     request->op = NET_OP_CONNECT;
     request->session_nonce = g_net.session_nonce;
-    request->arg0 = g_net.response_paddr;
+    request->arg0 = remote_response_token;
     request->arg1 = self_slot;
     __asm__ volatile("" ::: "memory");
     request->request_seq = connect_seq;
-    if (!share_net_request_page()) return 0;
+    if (!share_net_request_buffer()) return 0;
     if (!wait_net_response(connect_seq, NET_OP_CONNECT, 8192)) return 0;
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)response_addr;
     if (response->status != NET_STATUS_OK) return 0;
     if (g_net.next_seq <= connect_seq) g_net.next_seq = connect_seq + 1;
     g_net.active = 1;
@@ -169,9 +189,12 @@ static int net_begin_request(u16 op, u64 arg0, u64 arg1, u64 arg2, u64 reserved0
         g_prof.net_requests++;
         if (op < NET_PROFILE_OP_COUNT) g_prof.net_op_counts[op]++;
         if (op == NET_OP_SEND_TO || op == NET_OP_TCP_WRITE) g_prof.net_payload_tx_bytes += payload_len;
-        clear_page(NET_REQUEST_VA);
-        clear_page(NET_RESPONSE_VA);
-        volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+        const u64 request_addr = net_request_addr();
+        const u64 response_addr = net_response_addr();
+        if (request_addr < PAGE_BYTES || response_addr < PAGE_BYTES) return 0;
+        clear_page(request_addr);
+        clear_page(response_addr);
+        volatile struct net_request_header *request = (volatile struct net_request_header *)request_addr;
         const u64 seq = g_net.next_seq++;
         request->magic = NET_REQUEST_MAGIC;
         request->version = NET_PROTOCOL_VERSION;
@@ -182,7 +205,7 @@ static int net_begin_request(u16 op, u64 arg0, u64 arg1, u64 arg2, u64 reserved0
         request->arg2 = arg2;
         request->reserved0 = reserved0;
         if (payload_len != 0 && payload != 0) {
-            volatile u8 *dst = (volatile u8 *)(NET_REQUEST_VA + NET_REQUEST_HEADER_BYTES);
+            volatile u8 *dst = (volatile u8 *)(request_addr + NET_REQUEST_HEADER_BYTES);
             for (u32 i = 0; i < payload_len; i++) dst[i] = payload[i];
         }
         __asm__ volatile("" ::: "memory");
@@ -215,7 +238,7 @@ static int net_bind_udp(u16 local_port, u64 *handle_out, u16 *actual_port_out, u
     u64 seq = 0;
     if (!net_begin_request(NET_OP_BIND, local_port, 0, 0, 0, 0, 0, &seq)) return 0;
     if (!wait_net_response(seq, NET_OP_BIND, 8192)) return 0;
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
     if (response->status != NET_STATUS_OK) return 0;
     *handle_out = response->arg0;
     if (actual_port_out != 0) *actual_port_out = (u16)response->arg1;
@@ -227,7 +250,7 @@ static u64 net_send_udp(u64 handle, u32 remote_ip, u16 remote_port, const u8 *pa
     u64 seq = 0;
     if (!net_begin_request(NET_OP_SEND_TO, handle, remote_ip, remote_port, payload_len, payload, payload_len, &seq)) return errno_io();
     if (!wait_net_response(seq, NET_OP_SEND_TO, 8192)) return errno_timedout();
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
     return response->status == NET_STATUS_OK ? (u64)payload_len : net_status_to_errno(response->status);
 }
 
@@ -235,10 +258,10 @@ static u64 net_recv_udp(u64 handle, u8 *out, u32 out_cap, u32 *src_ip, u16 *src_
     u64 seq = 0;
     if (!net_begin_request(NET_OP_RECV_FROM, handle, 0, 0, out_cap, 0, 0, &seq)) return errno_io();
     if (!wait_net_response(seq, NET_OP_RECV_FROM, 8192)) return errno_timedout();
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
     if (response->status != NET_STATUS_OK) return net_status_to_errno(response->status);
     if (response->inline_bytes > out_cap || response->inline_bytes > NET_RESPONSE_PAYLOAD_BYTES) return errno_io();
-    volatile u8 *src = (volatile u8 *)(NET_RESPONSE_VA + NET_RESPONSE_HEADER_BYTES);
+    volatile u8 *src = (volatile u8 *)net_response_payload();
     for (u32 i = 0; i < response->inline_bytes; i++) out[i] = src[i];
     g_prof.net_payload_rx_bytes += response->inline_bytes;
     *src_ip = (u32)response->arg0;
@@ -255,7 +278,7 @@ static u64 net_poll_udp(u64 handle) {
         } else if (!wait_net_response(seq, NET_OP_POLL, 8192)) {
             last_error = errno_timedout();
         } else {
-            volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+            volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
             if (response->status == NET_STATUS_OK) return response->arg0;
             last_error = net_status_to_errno(response->status);
             if (last_error != errno_io() && last_error != errno_timedout()) return last_error;
@@ -276,7 +299,7 @@ static u64 net_tcp_begin_connect(u32 remote_ip, u16 remote_port, u64 *handle_out
         u64 seq = 0;
         if (!net_begin_request(NET_OP_TCP_CONNECT, remote_ip, remote_port, 0, 0, 0, 0, &seq)) return errno_io();
         if (!wait_net_response(seq, NET_OP_TCP_CONNECT, 8192)) return errno_timedout();
-        volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+        volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
         if (response->status == NET_STATUS_OK) {
             *handle_out = response->arg0;
             if (actual_port_out != 0) *actual_port_out = (u16)response->arg1;
@@ -306,7 +329,7 @@ static u64 net_tcp_write(u64 handle, const u8 *payload, u32 payload_len) {
     u64 seq = 0;
     if (!net_begin_request(NET_OP_TCP_WRITE, handle, 0, 0, payload_len, payload, payload_len, &seq)) return errno_io();
     if (!wait_net_response(seq, NET_OP_TCP_WRITE, 8192)) return errno_timedout();
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
     return response->status == NET_STATUS_OK ? response->arg0 : net_status_to_errno(response->status);
 }
 
@@ -314,10 +337,10 @@ static u64 net_tcp_read(u64 handle, u8 *out, u32 out_cap) {
     u64 seq = 0;
     if (!net_begin_request(NET_OP_TCP_READ, handle, 0, 0, out_cap, 0, 0, &seq)) return errno_io();
     if (!wait_net_response(seq, NET_OP_TCP_READ, 8192)) return errno_timedout();
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
     if (response->status != NET_STATUS_OK) return net_status_to_errno(response->status);
     if (response->inline_bytes > out_cap || response->inline_bytes > NET_RESPONSE_PAYLOAD_BYTES) return errno_io();
-    volatile u8 *src = (volatile u8 *)(NET_RESPONSE_VA + NET_RESPONSE_HEADER_BYTES);
+    volatile u8 *src = (volatile u8 *)net_response_payload();
     for (u32 i = 0; i < response->inline_bytes; i++) out[i] = src[i];
     g_prof.net_payload_rx_bytes += response->inline_bytes;
     return response->inline_bytes;
@@ -347,7 +370,8 @@ static struct ipc_message handle_socket(const struct trap_request *req) {
     g_fds[(u64)fd].offset = 0;
     g_fds[(u64)fd].size = 0;
     g_fds[(u64)fd].mode_bits = 0;
-    g_fds[(u64)fd].fd_flags = (u32)((type & SOCK_NONBLOCK) != 0 ? O_NONBLOCK : 0);
+    g_fds[(u64)fd].fd_flags = (u32)(((type & SOCK_NONBLOCK) != 0 ? O_NONBLOCK : 0) |
+        ((type & SOCK_CLOEXEC) != 0 ? FD_INTERNAL_CLOEXEC : 0));
     g_fds[(u64)fd].object_kind = FS_OBJECT_FILE;
     g_fds[(u64)fd].pipe_id = 0;
     g_fds[(u64)fd].socket_connected = 0;

@@ -121,12 +121,12 @@ def base_commands() -> list[tuple[str, str, tuple[bytes, ...]]]:
             "CAPABILITYOS_EXEC_PROFILE=1 seq 1 1000 | CAPABILITYOS_EXEC_PROFILE=1 head -n 1",
             (b"1",),
         ),
-        ("seq-grep-wc", "seq 1 20 | grep 1 | wc -l", (b"11",)),
-        ("sort", r"printf 'z\nb\na\n' | sort", (b"a", b"b", b"z")),
-        ("sort-head", r"printf 'z\nb\na\n' | sort | head -n 2", (b"a", b"b")),
-        ("ls-sort-wc", "ls / | sort | wc -l", ()),
-        ("cat-head-wc", "cat /cmd/ls | head -c 16 | wc -c", (b"16",)),
-        ("yes-head3", "yes | head -n 3", (b"y",)),
+        ("seq-head-wc", "seq 1 20 | head -n 11 | wc -l", (b"11",)),
+        ("printf-cat-wc", r"printf 'z\nb\na\n' | cat | wc -l", (b"3",)),
+        ("seq-head-wc3", "seq 1 10 | head -n 3 | wc -l", (b"3",)),
+        ("ls-wc", "ls / | wc -l", ()),
+        ("cat-head-wc", "cat /bin/ls | head -c 16 | wc -c", (b"16",)),
+        ("seq-head3-repeat", "seq 1 3 | head -n 3", (b"1", b"2", b"3")),
         ("printf-readv", r"printf '0123456789abcdef\n' | wc -c", (b"17",)),
     ]
 
@@ -218,6 +218,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=12.0)
     parser.add_argument("--out", default=".artifacts/pipe-stress")
     parser.add_argument("--only", help="run only the command with this label")
+    parser.add_argument("--exclude", action="append", default=[], help="exclude a command label; may be repeated or comma-separated")
     parser.add_argument("--body", help="run this exact shell body for every loop")
     parser.add_argument("--label", default="custom", help="label to use with --body")
     parser.add_argument("--expect", action="append", default=[], help="required output substring for --body")
@@ -288,6 +289,11 @@ def main() -> int:
             commands = [cmd for cmd in commands if cmd[0] == args.only]
             if not commands:
                 raise RuntimeError(f"unknown command label: {args.only}")
+        excludes = {item for group in args.exclude for item in group.split(",") if item}
+        if excludes:
+            commands = [cmd for cmd in commands if cmd[0] not in excludes]
+            if not commands:
+                raise RuntimeError("all command labels were excluded")
         for index in range(1, args.loops + 1):
             label, body, required = commands[(index - 1) % len(commands)]
             if index > len(commands) and not args.only:

@@ -4,6 +4,7 @@ const capability = @import("capability.zig");
 const device_capabilities = @import("device_capabilities.zig");
 const abi_root = @import("kernel_abi_root");
 const cap_transfer_abi = abi_root.cap_transfer_abi;
+const ipc_buffer_abi = abi_root.ipc_buffer_abi;
 const image_abi = abi_root.image_abi;
 const trap_abi = abi_root.trap_abi;
 const time_abi = abi_root.time_abi;
@@ -34,6 +35,8 @@ const syscall_log: u64 = 0x9;
 const syscall_recv_cap: u64 = 0xA;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
+const syscall_map_page_anywhere: u64 = 0x5C;
+const syscall_alloc_map_pages_anywhere: u64 = 0x5D;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_grant_caps_batch: u64 = 0x14;
@@ -62,6 +65,11 @@ const syscall_install_mmio_cap: u64 = 0x2F;
 const syscall_install_caps_batch: u64 = 0x32;
 const syscall_publish_service_endpoint: u64 = 0x33;
 const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
+const syscall_create_ipc_buffer_from_page: u64 = ipc_buffer_abi.syscall_create_ipc_buffer_from_page;
+const syscall_grant_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_grant_ipc_buffer_on_endpoint;
+const syscall_share_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_share_ipc_buffer_on_endpoint;
+const syscall_accept_ipc_buffer_transfer: u64 = ipc_buffer_abi.syscall_accept_ipc_buffer_transfer;
+const syscall_map_ipc_buffer_anywhere: u64 = ipc_buffer_abi.syscall_map_ipc_buffer_anywhere;
 const syscall_get_memory_stats: u64 = 0x3C;
 const syscall_get_rtc_unix_time: u64 = time_abi.syscall_get_rtc_unix_time;
 const syscall_ipc_call_reply_recv: u64 = 0x40;
@@ -236,6 +244,15 @@ fn allocMapPages(config: AllocMapPagesConfig) AllocMapPagesError!void {
             _ = config.state.getTable(config.proc).removeByPaddr(cap.paddr);
         }
     }
+}
+
+fn allocMapPagesAnywhere(config: AllocMapPagesConfig) AllocMapPagesError!u64 {
+    if (config.page_count == 0) return error.InvalidArgument;
+    const base_va = capability.findFreeUserMappingRange(config.proc, @intCast(config.page_count), 1) orelse return error.MapFailed;
+    var fixed = config;
+    fixed.base_va = base_va;
+    try allocMapPages(fixed);
+    return base_va;
 }
 
 var syscall_hooks_storage: Hooks = undefined;
@@ -470,6 +487,8 @@ fn syscallNeedsKernelStateLock(nr: u64) bool {
         syscall_map_page,
         syscall_map_mmio,
         syscall_alloc_map_pages,
+        syscall_map_page_anywhere,
+        syscall_alloc_map_pages_anywhere,
         syscall_map_pages_batch,
         syscall_queue_submit,
         syscall_queue_notify,
@@ -491,6 +510,11 @@ fn syscallNeedsKernelStateLock(nr: u64) bool {
         syscall_install_endpoint,
         syscall_install_mmio_cap,
         syscall_publish_service_endpoint,
+        syscall_create_ipc_buffer_from_page,
+        syscall_grant_ipc_buffer_on_endpoint,
+        syscall_share_ipc_buffer_on_endpoint,
+        syscall_accept_ipc_buffer_transfer,
+        syscall_map_ipc_buffer_anywhere,
         syscall_set_abi_trap_delegate,
         syscall_clear_abi_trap_delegate,
         syscall_get_process_status,
@@ -558,7 +582,14 @@ fn kernelExecProfileName(nr: u64) ?[]const u8 {
         syscall_signal_endpoint => "signal_endpoint",
         syscall_wait_event => "wait_event",
         syscall_alloc_map_pages => "alloc_map_pages",
+        syscall_alloc_map_pages_anywhere => "alloc_map_pages_anywhere",
         syscall_map_page => "map_page",
+        syscall_map_page_anywhere => "map_page_anywhere",
+        syscall_create_ipc_buffer_from_page => "create_ipc_buffer",
+        syscall_grant_ipc_buffer_on_endpoint => "grant_ipc_buffer_on_endpoint",
+        syscall_share_ipc_buffer_on_endpoint => "share_ipc_buffer_on_endpoint",
+        syscall_accept_ipc_buffer_transfer => "accept_ipc_buffer_transfer",
+        syscall_map_ipc_buffer_anywhere => "map_ipc_buffer_anywhere",
         syscall_map_pages_batch => "map_pages_batch",
         syscall_set_abi_trap_delegate => "set_abi_trap_delegate",
         syscall_map_abi_trap_reply_target_pages => "abi_map_reply_target_pages",
@@ -723,6 +754,54 @@ fn parseVmObjectRights(bits: u64) kernel.VmObjectRights {
 fn parseExecImageRights(bits: u64) kernel.ExecImageRights {
     const abi_rights = image_abi.execImageRightsFromBits(bits);
     return @bitCast(abi_rights);
+}
+
+fn parseIpcBufferRights(bits: u64) ?kernel.IpcBufferRights {
+    if ((bits & ~@as(u64, 0xF)) != 0) return null;
+    const abi_rights = ipc_buffer_abi.rightsFromBits(bits);
+    return @bitCast(abi_rights);
+}
+
+fn parseIpcBufferRole(value: u64) ?kernel.IpcBufferRole {
+    return switch (value) {
+        0 => .generic,
+        1 => .request,
+        2 => .response,
+        3 => .bulk,
+        else => null,
+    };
+}
+
+fn transferIpcBufferCapOnEndpoint(
+    state: *kernel.KernelState,
+    h: *const Hooks,
+    proc: kernel.PrincipalId,
+    endpoint_id: u64,
+    token: u64,
+    rights_bits: u64,
+) u64 {
+    const cap_id = ipc_buffer_abi.decodeIpcBufferToken(token) orelse return syscall_err_invalid;
+    const to = state.endpointTargetFor(proc, endpoint_id) orelse {
+        h.log_race_send_cap(proc, null, endpoint_id, token, "endpoint_not_found");
+        return syscall_err_endpoint;
+    };
+    const rights = parseIpcBufferRights(rights_bits) orelse return syscall_err_invalid;
+    state.shareIpcBufferCapOnEndpoint(proc, endpoint_id, cap_id, rights) catch |err| switch (err) {
+        kernel.KernelError.EndpointNotFound => {
+            h.log_race_send_cap(proc, null, endpoint_id, token, "endpoint_not_found");
+            return syscall_err_endpoint;
+        },
+        kernel.KernelError.CapabilityNotFound => {
+            h.log_race_send_cap(proc, to, endpoint_id, token, "ipc_buffer_missing");
+            return syscall_err_send;
+        },
+        else => {
+            h.log_race_send_cap(proc, to, endpoint_id, token, @errorName(err));
+            return syscall_err_send;
+        },
+    };
+    h.wake_waiting_thread_for_principal(to);
+    return syscall_ok;
 }
 
 fn releaseCopiedVmObjectPages(free_list: *kernel.FreePageList, pages: []const u64) void {
@@ -897,7 +976,7 @@ fn dispatchIpcSyscall(
             const timeout_ticks = frame.rsi;
             kernel_state_lock.lock();
             if (wait_mailbox) {
-                const received = state.recvCap(proc) catch |err| switch (err) {
+                const received = state.recvAnyCapTransfer(proc) catch |err| switch (err) {
                     kernel.KernelError.MailboxEmpty => 0,
                     else => {
                         kernel_state_lock.unlock();
@@ -969,7 +1048,7 @@ fn dispatchIpcSyscall(
                 }
             }
             if (!signal_only) {
-                const received = state.recvCap(proc) catch |err| switch (err) {
+                const received = state.recvAnyCapTransfer(proc) catch |err| switch (err) {
                     kernel.KernelError.MailboxEmpty => 0,
                     else => {
                         kernel_state_lock.unlock();
@@ -1442,7 +1521,7 @@ pub export fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) c
                 (flags & ipc_call_flag_retain_sender) != 0,
             );
             if (status != syscall_ok) break :blk status;
-            const received = state.recvCap(proc) catch |err| switch (err) {
+            const received = state.recvAnyCapTransfer(proc) catch |err| switch (err) {
                 kernel.KernelError.MailboxEmpty => break :blk syscall_err_empty,
                 else => break :blk syscall_err_send,
             };
@@ -1575,6 +1654,66 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             }
             return syscall_err_map;
         },
+        syscall_map_page_anywhere => {
+            const writable = (frame.rsi & 0x1) != 0;
+            const map_va = capability.findFreeUserMappingRange(proc, 1, 1) orelse return syscall_err_map;
+            if (capability.mapUserPageFromCapability(state, proc, map_va, frame.rdi, writable)) {
+                return map_va;
+            }
+            return syscall_err_map;
+        },
+        syscall_create_ipc_buffer_from_page => {
+            const role = parseIpcBufferRole(frame.rdx) orelse return syscall_err_invalid;
+            const rights = parseIpcBufferRights(frame.rsi) orelse return syscall_err_invalid;
+            const cap_id = state.createIpcBufferFromPage(proc, frame.rdi, rights, role) catch |err| switch (err) {
+                kernel.KernelError.CapabilityNotFound => return syscall_err_send,
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_grant,
+            };
+            return ipc_buffer_abi.encodeIpcBufferToken(cap_id);
+        },
+        syscall_grant_ipc_buffer_on_endpoint => {
+            const cap_id = ipc_buffer_abi.decodeIpcBufferToken(frame.rdi) orelse return syscall_err_invalid;
+            const rights = parseIpcBufferRights(frame.rdx) orelse return syscall_err_invalid;
+            const child_id = state.grantIpcBufferCapOnEndpoint(proc, frame.rsi, cap_id, rights) catch |err| switch (err) {
+                kernel.KernelError.EndpointNotFound => return syscall_err_endpoint,
+                kernel.KernelError.CapabilityNotFound => return syscall_err_send,
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_grant,
+            };
+            return ipc_buffer_abi.encodeIpcBufferToken(child_id);
+        },
+        syscall_share_ipc_buffer_on_endpoint => {
+            return transferIpcBufferCapOnEndpoint(state, h, proc, frame.rsi, frame.rdi, frame.rdx);
+        },
+        syscall_accept_ipc_buffer_transfer => {
+            const cap_id = state.acceptIpcBufferTransfer(proc, frame.rdi) catch |err| switch (err) {
+                kernel.KernelError.MailboxEmpty => return syscall_err_empty,
+                kernel.KernelError.InvalidState => return syscall_err_invalid,
+                kernel.KernelError.CapabilityNotFound => return syscall_err_send,
+                kernel.KernelError.TableFull => return syscall_err_alloc,
+                else => return syscall_err_send,
+            };
+            return ipc_buffer_abi.encodeIpcBufferToken(cap_id);
+        },
+        syscall_map_ipc_buffer_anywhere => {
+            const cap_id = ipc_buffer_abi.decodeIpcBufferToken(frame.rdi) orelse return syscall_err_invalid;
+            const ipc_cap = state.getIpcBufferTableConst(proc).findByCapId(cap_id) orelse return syscall_err_invalid;
+            const writable = (frame.rsi & 0x1) != 0;
+            if (!ipc_cap.rights.map) return syscall_err_invalid;
+            if (writable) {
+                if (!ipc_cap.rights.write) return syscall_err_map;
+            } else if (!ipc_cap.rights.read) {
+                return syscall_err_map;
+            }
+            const map_va = capability.findFreeUserMappingRange(proc, 1, 1) orelse return syscall_err_map;
+            if (capability.mapTrustedUserPage(proc, map_va, ipc_cap.paddr, writable)) {
+                return map_va;
+            }
+            return syscall_err_map;
+        },
         syscall_map_pages_batch => {
             const page_count_u64 = frame.rdx;
             if (page_count_u64 == 0 or page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
@@ -1664,6 +1803,25 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                 },
             };
             return syscall_ok;
+        },
+        syscall_alloc_map_pages_anywhere => {
+            const page_count_u64 = frame.rdi;
+            if (page_count_u64 == 0 or page_count_u64 > syscall_batch_max_pages) return syscall_err_invalid;
+            return allocMapPagesAnywhere(.{
+                .state = state,
+                .proc = proc,
+                .free_list = h.free_list,
+                .base_va = 0,
+                .page_count = @intCast(page_count_u64),
+                .writable = (frame.rsi & 0x1) != 0,
+                .drop_cap_after_map = (frame.rsi & syscall_alloc_map_drop_cap_flag) != 0,
+                .out_paddr_list_va = frame.rdx,
+                .write_user_u64 = h.write_user_u64,
+            }) catch |err| switch (err) {
+                error.InvalidArgument => return syscall_err_invalid,
+                error.AllocationFailed => return syscall_err_alloc,
+                error.MapFailed => return syscall_err_map,
+            };
         },
         syscall_queue_submit, syscall_queue_notify => {
             const queue_token = frame.rdi;
@@ -2136,7 +2294,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             if (kernel_exec_profile_active and preserve_ipc_queue) kernel_ipc_profile.wait_event_no_ipc +%= 1;
             const timeout_ticks = frame.rsi;
             if (wait_mailbox) {
-                const received = state.recvCap(proc) catch |err| switch (err) {
+                const received = state.recvAnyCapTransfer(proc) catch |err| switch (err) {
                     kernel.KernelError.MailboxEmpty => 0,
                     else => return syscall_err_send,
                 };

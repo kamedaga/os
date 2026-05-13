@@ -4,15 +4,17 @@
 
 enum {
     SYSCALL_LOG = 0x9,
-    SYSCALL_MAP_PAGE = 0x2,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER = 0x61,
+    SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
     SYSCALL_OK = 0,
     CAP_TRANSFER_ID_MIN = 0x1000,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
     ESP_CONFIG_VA = 0x3C002000,
-    ESP_REQUEST_VA = 0x24000000,
-    ESP_RESPONSE_VA = 0x24001000,
     ESP_MAX_OBJECTS = 32,
     ESP_OBJECT_MOUNT = 1,
     ESP_OBJECT_DIR = 2,
@@ -55,14 +57,20 @@ static u64 syscall2(u64 nr, u64 arg0, u64 arg1) {
     return ret;
 }
 
-static u64 syscall3(u64 nr, u64 arg0, u64 arg1, u64 arg2) {
-    u64 ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(nr), "D"(arg0), "S"(arg1), "d"(arg2)
-        : "rcx", "r8", "r9", "r10", "r11", "memory");
-    return ret;
+static u64 map_page_anywhere(u64 paddr, u64 writable) {
+    return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, writable);
+}
+
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static u64 accept_ipc_buffer_transfer(u64 transfer_id) {
+    return syscall2(SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER, transfer_id, 0);
+}
+
+static u64 map_ipc_buffer_anywhere(u64 token, u64 writable) {
+    return syscall2(SYSCALL_MAP_IPC_BUFFER_ANYWHERE, token, writable);
 }
 
 static u32 load_le32(const u8 *p) {
@@ -125,6 +133,8 @@ struct fat_session {
     u64 response_va;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
     u64 session_nonce;
     u64 last_completed_seq;
     u64 mount_token;
@@ -569,13 +579,61 @@ static void handle_fs_request(void) {
     g_session.last_completed_seq = seq;
 }
 
-static void handle_connect_transfer(u64 transfer_id) {
-    if (!g_fat_mounted) return;
+static void finish_connect_session(
+    volatile struct fs_request_header *request,
+    u64 request_va,
+    u64 response_va,
+    u64 request_paddr,
+    u64 response_paddr,
+    u64 request_token,
+    u64 response_token
+) {
+    clear_page(response_va);
+    g_session.active = 1;
+    g_session.request_va = request_va;
+    g_session.response_va = response_va;
+    g_session.request_paddr = request_paddr;
+    g_session.response_paddr = response_paddr;
+    g_session.request_token = request_token;
+    g_session.response_token = response_token;
+    g_session.session_nonce = request->session_nonce;
+    g_session.last_completed_seq = 0;
+    const u64 mount_token = alloc_object(ESP_OBJECT_MOUNT, 0, 0);
+    g_session.mount_token = mount_token;
+    write_response(FS_OP_CONNECT, request->request_seq, FS_STATUS_OK, mount_token, 0, 0, FS_OBJECT_MOUNT, 0);
+    g_session.last_completed_seq = request->request_seq;
+}
+
+static int handle_connect_token(u64 request_token) {
+    const u64 request_va = map_ipc_buffer_anywhere(request_token, 0);
+    if (request_va < 0x1000) return 0;
+
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_va;
+    if (request->magic != FS_REQUEST_MAGIC ||
+        request->version != FS_PROTOCOL_VERSION ||
+        request->op != FS_OP_CONNECT ||
+        request->request_seq == 0 ||
+        !is_ipc_buffer_token(request->arg0) ||
+        request->session_nonce == 0)
+    {
+        user_log("EspServer: invalid ipc-buffer connect request\n");
+        return 0;
+    }
+    const u64 response_token = request->arg0;
+    const u64 response_va = map_ipc_buffer_anywhere(response_token, 1);
+    if (response_va < 0x1000) return 0;
+    finish_connect_session(request, request_va, response_va, 0, 0, request_token, response_token);
+    user_log("EspServer: ipc-buffer session connect ok\n");
+    return 1;
+}
+
+static void handle_connect_paddr_transfer(u64 transfer_id) {
     const u64 request_paddr = syscall2(SYSCALL_ACCEPT_CAP_TRANSFER, transfer_id, 0);
     if (request_paddr < 0x1000) return;
-    if (syscall3(SYSCALL_MAP_PAGE, ESP_REQUEST_VA, request_paddr, 0) != SYSCALL_OK) return;
+    const u64 request_va = map_page_anywhere(request_paddr, 0);
+    if (request_va < 0x1000) return;
 
-    volatile struct fs_request_header *request = (volatile struct fs_request_header *)ESP_REQUEST_VA;
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_va;
     if (request->magic != FS_REQUEST_MAGIC ||
         request->version != FS_PROTOCOL_VERSION ||
         request->op != FS_OP_CONNECT ||
@@ -586,21 +644,18 @@ static void handle_connect_transfer(u64 transfer_id) {
         user_log("EspServer: invalid connect request\n");
         return;
     }
-    if (syscall3(SYSCALL_MAP_PAGE, ESP_RESPONSE_VA, request->arg0, 1) != SYSCALL_OK) return;
+    const u64 response_va = map_page_anywhere(request->arg0, 1);
+    if (response_va < 0x1000) return;
 
-    clear_page(ESP_RESPONSE_VA);
-    g_session.active = 1;
-    g_session.request_va = ESP_REQUEST_VA;
-    g_session.response_va = ESP_RESPONSE_VA;
-    g_session.request_paddr = request_paddr;
-    g_session.response_paddr = request->arg0;
-    g_session.session_nonce = request->session_nonce;
-    g_session.last_completed_seq = 0;
-    const u64 mount_token = alloc_object(ESP_OBJECT_MOUNT, 0, 0);
-    g_session.mount_token = mount_token;
-    write_response(FS_OP_CONNECT, request->request_seq, FS_STATUS_OK, mount_token, 0, 0, FS_OBJECT_MOUNT, 0);
-    g_session.last_completed_seq = request->request_seq;
+    finish_connect_session(request, request_va, response_va, request_paddr, request->arg0, 0, 0);
     user_log("EspServer: session connect ok\n");
+}
+
+static void handle_connect_transfer(u64 transfer_id) {
+    if (!g_fat_mounted) return;
+    const u64 request_token = accept_ipc_buffer_transfer(transfer_id);
+    if (is_ipc_buffer_token(request_token) && handle_connect_token(request_token)) return;
+    handle_connect_paddr_transfer(transfer_id);
 }
 
 static void mount_from_block_service(void) {

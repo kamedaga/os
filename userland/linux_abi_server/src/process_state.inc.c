@@ -3,7 +3,10 @@ static int initial_stdio_should_use_tty(void) {
 }
 
 static void init_process_fds(struct linux_process_state *proc) {
-    for (u64 i = 0; i < 32; i++) proc->fds[i].kind = FD_UNUSED;
+    for (u64 i = 0; i < 32; i++) {
+        proc->fds[i].kind = FD_UNUSED;
+        proc->fds[i].fd_flags = 0;
+    }
     const int use_tty = initial_stdio_should_use_tty();
     const enum fd_kind stdio_kind = use_tty ? FD_TTY : FD_STDIO;
     proc->fds[0].kind = stdio_kind;
@@ -102,7 +105,52 @@ static struct linux_process_state *alloc_process_state_for_new_principal(u64 pri
     }
     return 0;
 }
-static int alloc_pipe_slot(void) { for (u64 i = 0; i < PIPE_MAX; i++) if (!g_pipes[i].used) return (int)i; return -1; }
+
+static int pipe_ref_already_counted(u64 proc_index, const struct linux_process_state *proc, u64 fd, enum fd_kind kind, u8 pipe_id) {
+    for (u64 i = 0; i < proc_index; i++) {
+        const struct linux_process_state *peer = &g_processes[i];
+        if (!peer->used || peer->pid != proc->pid) continue;
+        const struct fd_entry *entry = &peer->fds[fd];
+        if (entry->kind == kind && entry->pipe_id == pipe_id) return 1;
+    }
+    return 0;
+}
+
+static void reconcile_pipe_refs_for_alloc(void) {
+    u64 read_refs[PIPE_MAX];
+    u64 write_refs[PIPE_MAX];
+    for (u64 i = 0; i < PIPE_MAX; i++) {
+        read_refs[i] = 0;
+        write_refs[i] = 0;
+    }
+    for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
+        struct linux_process_state *proc = &g_processes[p];
+        if (!proc->used) continue;
+        for (u64 fd = 0; fd < 32; fd++) {
+            struct fd_entry *entry = &proc->fds[fd];
+            if (entry->pipe_id >= PIPE_MAX || !g_pipes[entry->pipe_id].used) continue;
+            if (pipe_ref_already_counted(p, proc, fd, entry->kind, entry->pipe_id)) continue;
+            if (entry->kind == FD_PIPE_READ) read_refs[entry->pipe_id]++;
+            if (entry->kind == FD_PIPE_WRITE) write_refs[entry->pipe_id]++;
+        }
+    }
+    for (u64 i = 0; i < PIPE_MAX; i++) {
+        if (!g_pipes[i].used) continue;
+        g_pipes[i].read_refs = read_refs[i];
+        g_pipes[i].write_refs = write_refs[i];
+        if (read_refs[i] == 0 && write_refs[i] == 0 && !g_pipes[i].pending_read) {
+            g_pipes[i].used = 0;
+            g_pipes[i].head = 0;
+            g_pipes[i].len = 0;
+        }
+    }
+}
+
+static int alloc_pipe_slot(void) {
+    reconcile_pipe_refs_for_alloc();
+    for (u64 i = 0; i < PIPE_MAX; i++) if (!g_pipes[i].used) return (int)i;
+    return -1;
+}
 static int fd_entry_is_pipe(const struct fd_entry *entry) { return entry != 0 && (entry->kind == FD_PIPE_READ || entry->kind == FD_PIPE_WRITE); }
 static int fd_is_pipe(u64 fd) { return g_proc != 0 && fd < 32 && fd_entry_is_pipe(&g_fds[fd]); }
 

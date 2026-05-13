@@ -16,6 +16,9 @@ enum {
     SYSCALL_IOMMU_AUTHORIZE = 0x35,
     SYSCALL_DMA_MAP_CREATE = 0x37,
     SYSCALL_DMA_MAP_SET_STATE = 0x38,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER = 0x61,
+    SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
 
     SYSCALL_OK = 0,
 
@@ -25,8 +28,6 @@ enum {
     TX_QUEUE_PAGE_VA = 0x30211000,
     RX_BUFFER_BASE_VA = 0x30220000,
     TX_BUFFER_VA = 0x30240000,
-    NET_REQUEST_VA = 0x30250000,
-    NET_RESPONSE_VA = 0x30251000,
 
     NET_CONFIG_MAGIC = 0x4E455443,
     NET_CONFIG_VERSION = 1,
@@ -118,6 +119,8 @@ enum {
     NET_STATUS_BUSY = 9,
     NET_REPLY_ENDPOINT_ID = 0xEA,
     CAP_TRANSFER_ID_MIN = 0x1000,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
     NET_FLAG_LINK_UP = 1 << 0,
     NET_FLAG_DHCP_BOUND = 1 << 1,
     NET_FLAG_GATEWAY_ARP = 1 << 2,
@@ -275,6 +278,10 @@ struct net_session {
     int active;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    u64 request_va;
+    u64 response_va;
     u64 reply_endpoint_id;
     u64 session_nonce;
     u64 last_completed_seq;
@@ -487,6 +494,22 @@ static u64 alloc_map_pages(u64 base_va, u64 page_count, u64 writable, u64 paddrs
 
 static u64 map_mmio_page(u64 va, u64 paddr, u64 writable) {
     return syscall3(SYSCALL_MAP_PAGE, va, paddr, writable);
+}
+
+static u64 map_page_anywhere(u64 paddr, u64 writable) {
+    return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, writable);
+}
+
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static u64 accept_ipc_buffer_transfer(u64 transfer_id) {
+    return syscall1(SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER, transfer_id);
+}
+
+static u64 map_ipc_buffer_anywhere(u64 token, u64 writable) {
+    return syscall2(SYSCALL_MAP_IPC_BUFFER_ANYWHERE, token, writable);
 }
 
 static u64 queue_submit(u64 token, u64 queue_index) {
@@ -836,7 +859,8 @@ static void log_dhcp(u8 message_type, u32 yiaddr) {
 }
 
 static void write_net_response(u16 op, u64 seq, int status, u32 inline_bytes, u64 arg0, u64 arg1, u64 arg2) {
-    volatile struct net_response_header *response = (volatile struct net_response_header *)NET_RESPONSE_VA;
+    if (g_current_session == 0) return;
+    volatile struct net_response_header *response = (volatile struct net_response_header *)g_current_session->response_va;
     response->magic = NET_PROTOCOL_RESPONSE_MAGIC;
     response->version = NET_PROTOCOL_VERSION;
     response->op = op;
@@ -852,7 +876,7 @@ static void write_net_response(u16 op, u64 seq, int status, u32 inline_bytes, u6
 }
 
 static void write_net_status_payload(void) {
-    volatile struct net_status_payload *payload = (volatile struct net_status_payload *)(NET_RESPONSE_VA + sizeof(struct net_response_header));
+    volatile struct net_status_payload *payload = (volatile struct net_status_payload *)(g_current_session->response_va + sizeof(struct net_response_header));
     for (u64 i = 0; i < 6; i++) payload->mac[i] = g_mac[i];
     payload->link_up = 1;
     payload->dhcp_bound = g_dhcp_configured ? 1 : 0;
@@ -907,11 +931,11 @@ static void write_net_status_payload(void) {
 }
 
 static const u8 *net_request_payload(void) {
-    return (const u8 *)(NET_REQUEST_VA + sizeof(struct net_request_header));
+    return (const u8 *)(g_current_session->request_va + sizeof(struct net_request_header));
 }
 
 static u8 *net_response_payload(void) {
-    return (u8 *)(NET_RESPONSE_VA + sizeof(struct net_response_header));
+    return (u8 *)(g_current_session->response_va + sizeof(struct net_response_header));
 }
 
 static int udp_handle_index(u64 handle, u64 *index_out) {
@@ -2030,14 +2054,90 @@ static int poll_tx_queue(void) {
     return processed;
 }
 
-static void handle_net_connect_transfer(u64 transfer_id) {
+static struct net_session *find_or_alloc_net_session(u64 request_paddr, u64 request_token, u64 *session_index_out) {
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+        if (g_sessions[i].active &&
+            ((request_token != 0 && g_sessions[i].request_token == request_token) ||
+             (request_token == 0 && g_sessions[i].request_paddr == request_paddr)))
+        {
+            *session_index_out = i;
+            return &g_sessions[i];
+        }
+    }
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+        if (!g_sessions[i].active) {
+            *session_index_out = i;
+            return &g_sessions[i];
+        }
+    }
+    return 0;
+}
+
+static int finish_net_connect(
+    volatile struct net_request_header *request,
+    u64 request_va,
+    u64 response_va,
+    u64 request_paddr,
+    u64 response_paddr,
+    u64 request_token,
+    u64 response_token
+) {
+    memset((void *)response_va, 0, 4096);
+    u64 session_index = 0;
+    struct net_session *session = find_or_alloc_net_session(request_paddr, request_token, &session_index);
+    if (session == 0) {
+        user_log("[virtio_net] VirtioNet: session table full\n");
+        return 0;
+    }
+    session->active = 1;
+    session->request_paddr = request_paddr;
+    session->response_paddr = response_paddr;
+    session->request_token = request_token;
+    session->response_token = response_token;
+    session->request_va = request_va;
+    session->response_va = response_va;
+    const u64 reply_endpoint_id = NET_REPLY_ENDPOINT_ID + session_index;
+    session->reply_endpoint_id = install_endpoint(reply_endpoint_id, request->arg1) == SYSCALL_OK ? reply_endpoint_id : 0;
+    session->session_nonce = request->session_nonce;
+    session->last_completed_seq = 0;
+    g_current_session = session;
+    write_net_response(NET_OP_CONNECT, request->request_seq, NET_STATUS_OK, 0, 0, 0, 0);
+    session->last_completed_seq = request->request_seq;
+    g_current_session = 0;
+    return 1;
+}
+
+static int handle_net_connect_token(u64 request_token) {
+    const u64 request_va = map_ipc_buffer_anywhere(request_token, 0);
+    if (request_va < 0x1000) return 0;
+    volatile struct net_request_header *request = (volatile struct net_request_header *)request_va;
+    if (request->magic != NET_PROTOCOL_REQUEST_MAGIC ||
+        request->version != NET_PROTOCOL_VERSION ||
+        request->op != NET_OP_CONNECT ||
+        request->request_seq == 0 ||
+        !is_ipc_buffer_token(request->arg0) ||
+        request->session_nonce == 0)
+    {
+        user_log("[virtio_net] VirtioNet: invalid ipc-buffer connect request\n");
+        return 0;
+    }
+    const u64 response_token = request->arg0;
+    const u64 response_va = map_ipc_buffer_anywhere(response_token, 1);
+    if (response_va < 0x1000) return 0;
+    if (!finish_net_connect(request, request_va, response_va, 0, 0, request_token, response_token)) return 0;
+    user_log("[virtio_net] VirtioNet: ipc-buffer session connect ok\n");
+    return 1;
+}
+
+static void handle_net_connect_paddr_transfer(u64 transfer_id) {
     const u64 request_paddr = accept_cap_transfer(transfer_id);
     if (request_paddr < 0x1000) {
         user_log("[virtio_net] VirtioNet: accept cap transfer failed\n");
         return;
     }
-    if (map_mmio_page(NET_REQUEST_VA, request_paddr, 0) != SYSCALL_OK) return;
-    volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+    const u64 request_va = map_page_anywhere(request_paddr, 0);
+    if (request_va < 0x1000) return;
+    volatile struct net_request_header *request = (volatile struct net_request_header *)request_va;
     if (request->magic != NET_PROTOCOL_REQUEST_MAGIC ||
         request->version != NET_PROTOCOL_VERSION ||
         request->op != NET_OP_CONNECT ||
@@ -2048,50 +2148,22 @@ static void handle_net_connect_transfer(u64 transfer_id) {
         user_log("[virtio_net] VirtioNet: invalid connect request\n");
         return;
     }
-    if (map_mmio_page(NET_RESPONSE_VA, request->arg0, 1) != SYSCALL_OK) return;
-    memset((void *)NET_RESPONSE_VA, 0, 4096);
-    struct net_session *session = 0;
-    u64 session_index = 0;
-    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
-        if (g_sessions[i].active && g_sessions[i].request_paddr == request_paddr) {
-            session = &g_sessions[i];
-            session_index = i;
-            break;
-        }
-    }
-    if (session == 0) {
-        for (u64 i = 0; i < NET_SESSION_MAX; i++) {
-            if (!g_sessions[i].active) {
-                session = &g_sessions[i];
-                session_index = i;
-                break;
-            }
-        }
-    }
-    if (session == 0) {
-        user_log("[virtio_net] VirtioNet: session table full\n");
-        return;
-    }
-    session->active = 1;
-    session->request_paddr = request_paddr;
-    session->response_paddr = request->arg0;
-    const u64 reply_endpoint_id = NET_REPLY_ENDPOINT_ID + session_index;
-    session->reply_endpoint_id = install_endpoint(reply_endpoint_id, request->arg1) == SYSCALL_OK ? reply_endpoint_id : 0;
-    session->session_nonce = request->session_nonce;
-    session->last_completed_seq = 0;
-    g_current_session = session;
-    write_net_response(NET_OP_CONNECT, request->request_seq, NET_STATUS_OK, 0, 0, 0, 0);
-    session->last_completed_seq = request->request_seq;
-    g_current_session = 0;
+    const u64 response_va = map_page_anywhere(request->arg0, 1);
+    if (response_va < 0x1000) return;
+    if (!finish_net_connect(request, request_va, response_va, request_paddr, request->arg0, 0, 0)) return;
     user_log("[virtio_net] VirtioNet: session connect ok\n");
+}
+
+static void handle_net_connect_transfer(u64 transfer_id) {
+    const u64 request_token = accept_ipc_buffer_transfer(transfer_id);
+    if (is_ipc_buffer_token(request_token) && handle_net_connect_token(request_token)) return;
+    handle_net_connect_paddr_transfer(transfer_id);
 }
 
 static int handle_net_request_for_session(struct net_session *session) {
     if (session == 0 || !session->active) return 0;
-    if (map_mmio_page(NET_REQUEST_VA, session->request_paddr, 0) != SYSCALL_OK) return 0;
-    if (map_mmio_page(NET_RESPONSE_VA, session->response_paddr, 1) != SYSCALL_OK) return 0;
     g_current_session = session;
-    volatile struct net_request_header *request = (volatile struct net_request_header *)NET_REQUEST_VA;
+    volatile struct net_request_header *request = (volatile struct net_request_header *)session->request_va;
     if (request->magic != NET_PROTOCOL_REQUEST_MAGIC || request->version != NET_PROTOCOL_VERSION) {
         g_current_session = 0;
         return 0;

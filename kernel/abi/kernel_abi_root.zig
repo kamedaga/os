@@ -5,6 +5,7 @@ pub const device_abi = @import("device_abi.zig");
 pub const dynamic_linker_bootstrap_abi = @import("dynamic_linker_bootstrap_abi.zig");
 pub const fs_abi = @import("fs_abi.zig");
 pub const image_abi = @import("image_abi.zig");
+pub const ipc_buffer_abi = @import("ipc_buffer_abi.zig");
 pub const init_bootstrap_abi = @import("init_bootstrap_abi.zig");
 pub const process_abi = @import("process_abi.zig");
 pub const process_builder_abi = @import("process_builder_abi.zig");

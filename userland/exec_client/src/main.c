@@ -10,8 +10,6 @@ enum {
     PROCESS_STATUS_INACTIVE = 0,
     PROCESS_STATUS_ACTIVE = 1,
     PROCESS_STATUS_FAULTED = 2,
-    EXEC_CLIENT_REQUEST_VA = 0x27000000ULL,
-    EXEC_CLIENT_RESPONSE_VA = 0x27001000ULL,
     EXEC_CLIENT_SPAWN_WAIT_TICKS = 120000,
 };
 
@@ -56,8 +54,6 @@ void exec_client_main(void) {
         .argv_count = 2,
         .envp = envp,
         .envp_count = 2,
-        .request_va = EXEC_CLIENT_REQUEST_VA,
-        .response_va = EXEC_CLIENT_RESPONSE_VA,
         .wait_ticks = EXEC_CLIENT_SPAWN_WAIT_TICKS,
     };
 

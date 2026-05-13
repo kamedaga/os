@@ -17,10 +17,24 @@ enum {
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
+    SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
+    SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
+    SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
+    SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER = 0x61,
+    SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
 
     PAGE_BYTES = 4096,
     PAGE_RIGHT_CPU_READ = 0x1,
     PAGE_RIGHT_CPU_WRITE = 0x2,
+    IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
+    IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
+    IPC_BUFFER_RIGHT_READ = 0x1,
+    IPC_BUFFER_RIGHT_WRITE = 0x2,
+    IPC_BUFFER_RIGHT_MAP = 0x4,
+    IPC_BUFFER_RIGHT_GRANT = 0x8,
+    IPC_BUFFER_ROLE_REQUEST = 1,
+    IPC_BUFFER_ROLE_RESPONSE = 2,
     SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
     SERVICE_REGISTRY_VERSION = 1,
@@ -29,10 +43,6 @@ enum {
 
     TTY_SERVICE_ENDPOINT_ID = 0x8A,
     TTY_REPLY_ENDPOINT_ID = 0xEF,
-    TTY_CLIENT_REQUEST_VA = 0x2B030000,
-    TTY_CLIENT_RESPONSE_VA = 0x2B031000,
-    TTY_CONSOLE_REQUEST_VA = 0x2B032000,
-    TTY_CONSOLE_RESPONSE_VA = 0x2B033000,
 
     CONSOLE_REQUEST_MAGIC = 0x514E4F43,
     CONSOLE_RESPONSE_MAGIC = 0x524E4F43,
@@ -75,6 +85,10 @@ struct console_client {
     u64 process_slot;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    u64 request_va;
+    u64 response_va;
     u64 session_nonce;
     u64 next_seq;
 };
@@ -83,6 +97,10 @@ struct tty_client_session {
     int active;
     u64 request_paddr;
     u64 response_paddr;
+    u64 request_token;
+    u64 response_token;
+    u64 request_va;
+    u64 response_va;
     u64 session_nonce;
     u64 reply_endpoint_id;
     u64 last_completed_seq;
@@ -113,6 +131,34 @@ static u64 syscall3(u64 n, u64 a0, u64 a1, u64 a2) {
     u64 ret;
     __asm__ volatile("int $0x80" : "=a"(ret) : "a"(n), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r10", "r11", "memory");
     return ret;
+}
+
+static u64 map_page_anywhere(u64 paddr, u64 writable) {
+    return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, writable);
+}
+
+static int is_ipc_buffer_token(u64 token) {
+    return (token & ~IPC_BUFFER_TOKEN_MASK) == IPC_BUFFER_TOKEN_TAG && (token & IPC_BUFFER_TOKEN_MASK) != 0;
+}
+
+static u64 create_ipc_buffer_from_page(u64 paddr, u64 rights, u64 role) {
+    return syscall3(SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE, paddr, rights, role);
+}
+
+static u64 grant_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights) {
+    return syscall3(SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights);
+}
+
+static u64 share_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights) {
+    return syscall3(SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights);
+}
+
+static u64 accept_ipc_buffer_transfer(u64 transfer_id) {
+    return syscall1(SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER, transfer_id);
+}
+
+static u64 map_ipc_buffer_anywhere(u64 token, u64 writable) {
+    return syscall2(SYSCALL_MAP_IPC_BUFFER_ANYWHERE, token, writable);
 }
 
 static u64 cstr_len(const char *s) {
