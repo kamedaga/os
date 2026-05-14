@@ -22,6 +22,7 @@ static void user_log_dec_line(const char *label, u64 value) {
     user_log_dec_value(value);
     user_log("\n");
 }
+static void user_log_hex_inline(u64 value) { static const char hex[] = "0123456789ABCDEF"; char buf[32]; u64 pos = 0; buf[pos++] = '0'; buf[pos++] = 'x'; int started = 0; for (int shift = 60; shift >= 0; shift -= 4) { unsigned nibble = (unsigned)((value >> (u64)shift) & 0xFULL); if (nibble != 0 || started || shift == 0) { buf[pos++] = hex[nibble]; started = 1; } } user_log_len(buf, pos); }
 static void user_log_hex_value(u64 value) { static const char hex[] = "0123456789ABCDEF"; char buf[32]; u64 pos = 0; buf[pos++] = '0'; buf[pos++] = 'x'; int started = 0; for (int shift = 60; shift >= 0; shift -= 4) { unsigned nibble = (unsigned)((value >> (u64)shift) & 0xFULL); if (nibble != 0 || started || shift == 0) { buf[pos++] = hex[nibble]; started = 1; } } buf[pos++] = '\n'; user_log_len(buf, pos); }
 static void clear_page(u64 va) { volatile u64 *p = (volatile u64 *)va; for (u64 i = 0; i < 512; i++) p[i] = 0; }
 static u64 min_u64(u64 a, u64 b) { return a < b ? a : b; }
@@ -349,6 +350,32 @@ static void profile_print_net_op(const char *name, u64 op) {
     user_log("\n");
 }
 
+static void profile_print_net_wait_op(const char *name, u64 op) {
+    if (op >= NET_PROFILE_OP_COUNT || g_prof.net_wait_op_calls[op] == 0) return;
+    user_log("LinuxAbiServer.perf.net.wait_op ");
+    user_log(name);
+    user_log(" calls=");
+    user_log_dec_value(g_prof.net_wait_op_calls[op]);
+    user_log(" loops=");
+    user_log_dec_value(g_prof.net_wait_op_loops[op]);
+    user_log(" slow=");
+    user_log_dec_value(g_prof.net_wait_op_slow[op]);
+    user_log(" timeouts=");
+    user_log_dec_value(g_prof.net_wait_op_timeouts[op]);
+    user_log("\n");
+}
+
+static void profile_print_vm_bucket(const char *prefix, const char *name, u64 index, const u64 *calls, const u64 *pages) {
+    if (calls[index] == 0) return;
+    user_log(prefix);
+    user_log(name);
+    user_log(" calls=");
+    user_log_dec_value(calls[index]);
+    user_log(" pages=");
+    user_log_dec_value(pages[index]);
+    user_log("\n");
+}
+
 static void profile_clear(void) {
     u8 *p = (u8 *)&g_prof;
     for (u64 i = 0; i < sizeof(g_prof); i++) p[i] = 0;
@@ -370,6 +397,8 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.syscalls.total=", g_prof.syscall_total);
     profile_print_syscall("read", LINUX_SYS_READ);
     profile_print_syscall("write", LINUX_SYS_WRITE);
+    profile_print_syscall("readv", LINUX_SYS_READV);
+    profile_print_syscall("writev", LINUX_SYS_WRITEV);
     profile_print_syscall("open", LINUX_SYS_OPEN);
     profile_print_syscall("openat", LINUX_SYS_OPENAT);
     profile_print_syscall("close", LINUX_SYS_CLOSE);
@@ -380,6 +409,7 @@ static void profile_report_and_reset(void) {
     profile_print_syscall("mmap", LINUX_SYS_MMAP);
     profile_print_syscall("mprotect", LINUX_SYS_MPROTECT);
     profile_print_syscall("munmap", LINUX_SYS_MUNMAP);
+    profile_print_syscall("mremap", LINUX_SYS_MREMAP);
     profile_print_syscall("brk", LINUX_SYS_BRK);
     profile_print_syscall("poll", LINUX_SYS_POLL);
     profile_print_syscall("select", LINUX_SYS_SELECT);
@@ -410,6 +440,7 @@ static void profile_report_and_reset(void) {
     profile_print_fs_op("close", FS_OP_CLOSE);
     profile_print_fs_op("create", FS_OP_CREATE);
     profile_print_fs_op("write", FS_OP_WRITE);
+    profile_print_fs_op("write_bulk", FS_OP_WRITE_BULK);
     profile_print_fs_op("unlink", FS_OP_UNLINK);
     profile_print_fs_op("rename", FS_OP_RENAME);
     user_log_dec_line("LinuxAbiServer.perf.vfs.read_request_bytes=", g_prof.vfs_read_request_bytes);
@@ -442,6 +473,18 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.vm.mmap_file_calls=", g_prof.mmap_file_calls);
     user_log_dec_line("LinuxAbiServer.perf.vm.mmap_file_pages=", g_prof.mmap_file_pages);
     user_log_dec_line("LinuxAbiServer.perf.vm.mmap_file_bytes=", g_prof.mmap_file_bytes);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.mmap_bucket ", "1", 0, g_prof.mmap_bucket_calls, g_prof.mmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.mmap_bucket ", "2_4", 1, g_prof.mmap_bucket_calls, g_prof.mmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.mmap_bucket ", "5_16", 2, g_prof.mmap_bucket_calls, g_prof.mmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.mmap_bucket ", "17_64", 3, g_prof.mmap_bucket_calls, g_prof.mmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.mmap_bucket ", "65_plus", 4, g_prof.mmap_bucket_calls, g_prof.mmap_bucket_pages);
+    user_log_dec_line("LinuxAbiServer.perf.vm.munmap_calls=", g_prof.munmap_calls);
+    user_log_dec_line("LinuxAbiServer.perf.vm.munmap_pages=", g_prof.munmap_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.munmap_bucket ", "1", 0, g_prof.munmap_bucket_calls, g_prof.munmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.munmap_bucket ", "2_4", 1, g_prof.munmap_bucket_calls, g_prof.munmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.munmap_bucket ", "5_16", 2, g_prof.munmap_bucket_calls, g_prof.munmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.munmap_bucket ", "17_64", 3, g_prof.munmap_bucket_calls, g_prof.munmap_bucket_pages);
+    profile_print_vm_bucket("LinuxAbiServer.perf.vm.munmap_bucket ", "65_plus", 4, g_prof.munmap_bucket_calls, g_prof.munmap_bucket_pages);
     user_log_dec_line("LinuxAbiServer.perf.vm.mprotect_calls=", g_prof.mprotect_calls);
     user_log_dec_line("LinuxAbiServer.perf.vm.mprotect_pages=", g_prof.mprotect_pages);
     user_log_dec_line("LinuxAbiServer.perf.vm.brk_calls=", g_prof.brk_calls);
@@ -456,14 +499,33 @@ static void profile_report_and_reset(void) {
     profile_print_net_op("tcp_connect", NET_OP_TCP_CONNECT);
     profile_print_net_op("tcp_write", NET_OP_TCP_WRITE);
     profile_print_net_op("tcp_read", NET_OP_TCP_READ);
+    profile_print_net_op("tcp_read_bulk", NET_OP_TCP_READ_BULK);
     user_log_dec_line("LinuxAbiServer.perf.net.tx_payload_bytes=", g_prof.net_payload_tx_bytes);
     user_log_dec_line("LinuxAbiServer.perf.net.rx_payload_bytes=", g_prof.net_payload_rx_bytes);
     user_log_dec_line("LinuxAbiServer.perf.net.wait_calls=", g_prof.net_wait_calls);
     user_log_dec_line("LinuxAbiServer.perf.net.wait_loops=", g_prof.net_wait_loops);
     user_log_dec_line("LinuxAbiServer.perf.net.wait_slow=", g_prof.net_wait_slow);
     user_log_dec_line("LinuxAbiServer.perf.net.wait_timeouts=", g_prof.net_wait_timeouts);
+    profile_print_net_wait_op("connect", NET_OP_CONNECT);
+    profile_print_net_wait_op("bind", NET_OP_BIND);
+    profile_print_net_wait_op("send_to", NET_OP_SEND_TO);
+    profile_print_net_wait_op("recv_from", NET_OP_RECV_FROM);
+    profile_print_net_wait_op("close", NET_OP_CLOSE);
+    profile_print_net_wait_op("poll", NET_OP_POLL);
+    profile_print_net_wait_op("tcp_connect", NET_OP_TCP_CONNECT);
+    profile_print_net_wait_op("tcp_write", NET_OP_TCP_WRITE);
+    profile_print_net_wait_op("tcp_read", NET_OP_TCP_READ);
+    profile_print_net_wait_op("tcp_read_bulk", NET_OP_TCP_READ_BULK);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_connect_attempts=", g_prof.net_tcp_connect_attempts);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_connect_poll_loops=", g_prof.net_tcp_connect_poll_loops);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_attempts=", g_prof.net_tcp_prefetch_attempts);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_ready_hits=", g_prof.net_tcp_prefetch_ready_hits);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_bytes=", g_prof.net_tcp_prefetch_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_consumed=", g_prof.net_tcp_prefetch_consumed);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_eof=", g_prof.net_tcp_prefetch_eof);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_bulk_cap_pages=", g_prof.net_tcp_bulk_cap_pages);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_bulk_cap_ticks=", g_prof.net_tcp_bulk_cap_ticks);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_bulk_copy_ticks=", g_prof.net_tcp_bulk_copy_ticks);
     user_log_dec_line("LinuxAbiServer.perf.poll.calls=", g_prof.poll_calls);
     user_log_dec_line("LinuxAbiServer.perf.poll.wait_loops=", g_prof.poll_wait_loops);
     user_log_dec_line("LinuxAbiServer.perf.select.calls=", g_prof.select_calls);

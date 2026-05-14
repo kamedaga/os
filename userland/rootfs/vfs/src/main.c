@@ -17,6 +17,7 @@ enum {
     SYSCALL_GET_MEMORY_STATS = 0x3C,
     SYSCALL_GET_RTC_UNIX_TIME = 0x3E,
     SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
+    SYSCALL_ALLOC_MAP_PAGES_ANYWHERE = 0x5D,
     SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
     SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
@@ -93,7 +94,6 @@ enum {
     VFS_TMPFS_MAX_FILES = 16,
     VFS_TMPFS_FILE_BYTES = 8 * 1024 * 1024,
     VFS_TMPFS_PAGES_PER_FILE = VFS_TMPFS_FILE_BYTES / FS_PAGE_BYTES,
-    VFS_TMPFS_STORAGE_VA = 0x30000000,
     VFS_DIR_MODE = 0x4000,
     VFS_FILE_MODE = 0x8000,
     VFS_CREATE_FLAG_DIRECTORY = 1 << 0,
@@ -132,7 +132,7 @@ struct vfs_tmpfs_file {
     u16 reserved1;
     u32 size;
     char name[FS_MAX_PATH_BYTES + 1];
-    u64 page_paddrs[VFS_TMPFS_PAGES_PER_FILE];
+    u64 page_vas[VFS_TMPFS_PAGES_PER_FILE];
 };
 
 struct vfs_session {
@@ -250,6 +250,9 @@ struct net_status_payload {
     u64 net_service_requests;
     u64 net_service_work_loops;
     u64 net_service_idle_sleeps;
+    u64 net_service_active_poll_rounds;
+    u64 net_service_active_poll_hits;
+    u64 net_service_active_poll_misses;
 };
 
 struct net_backend_session {
@@ -713,6 +716,10 @@ static u64 map_page_anywhere(u64 paddr, u64 flags) {
     return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, flags);
 }
 
+static u64 alloc_map_pages_anywhere(u64 page_count, u64 flags, u64 out_paddr_list_addr) {
+    return syscall3(SYSCALL_ALLOC_MAP_PAGES_ANYWHERE, page_count, flags, out_paddr_list_addr);
+}
+
 static u64 accept_ipc_buffer_transfer(u64 transfer_id) {
     return syscall1(SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER, transfer_id);
 }
@@ -780,29 +787,21 @@ static void clear_page(u64 va) {
 }
 
 static u64 tmpfs_page_va(u64 file_index, u64 page_index) {
-    return VFS_TMPFS_STORAGE_VA + file_index * VFS_TMPFS_FILE_BYTES + page_index * FS_PAGE_BYTES;
+    if (file_index >= VFS_TMPFS_MAX_FILES || page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
+    return g_tmpfs_files[file_index].page_vas[page_index];
 }
 
 static int ensure_tmpfs_page(u64 file_index, u64 page_index) {
     if (file_index >= VFS_TMPFS_MAX_FILES || page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
-    if (g_tmpfs_files[file_index].page_paddrs[page_index] != 0) return 1;
-    const u64 paddr = syscall0(SYSCALL_ALLOC_PAGE);
-    if (paddr < FS_PAGE_BYTES) return 0;
-    const u64 va = tmpfs_page_va(file_index, page_index);
-    if (syscall3(SYSCALL_MAP_PAGE, va, paddr, 1) != SYSCALL_OK) return 0;
+    if (g_tmpfs_files[file_index].page_vas[page_index] != 0) return 1;
+    const u64 va = alloc_map_pages_anywhere(1, 1, 0);
+    if (va < FS_PAGE_BYTES) return 0;
     clear_page(va);
-    g_tmpfs_files[file_index].page_paddrs[page_index] = paddr;
+    g_tmpfs_files[file_index].page_vas[page_index] = va;
     return 1;
 }
 
-static u8 tmpfs_read_byte(u64 file_index, u64 offset) {
-    const u64 page_index = offset / FS_PAGE_BYTES;
-    const u64 page_offset = offset % FS_PAGE_BYTES;
-    if (file_index >= VFS_TMPFS_MAX_FILES || page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
-    if (g_tmpfs_files[file_index].page_paddrs[page_index] == 0) return 0;
-    volatile u8 *page = (volatile u8 *)tmpfs_page_va(file_index, page_index);
-    return page[page_offset];
-}
+static void copy_from_volatile(volatile u8 *dst, const volatile u8 *src, u64 bytes);
 
 static int tmpfs_write_bytes(u64 file_index, u64 offset, const volatile u8 *src, u32 length) {
     if (file_index >= VFS_TMPFS_MAX_FILES || offset > VFS_TMPFS_FILE_BYTES || offset + length > VFS_TMPFS_FILE_BYTES) return 0;
@@ -815,7 +814,7 @@ static int tmpfs_write_bytes(u64 file_index, u64 offset, const volatile u8 *src,
         u32 chunk = (u32)(FS_PAGE_BYTES - page_offset);
         if (chunk > length - done) chunk = length - done;
         volatile u8 *page = (volatile u8 *)tmpfs_page_va(file_index, page_index);
-        for (u32 i = 0; i < chunk; i++) page[page_offset + i] = src[done + i];
+        copy_from_volatile(page + page_offset, src + done, chunk);
         done += chunk;
     }
     return 1;
@@ -824,7 +823,7 @@ static int tmpfs_write_bytes(u64 file_index, u64 offset, const volatile u8 *src,
 static void tmpfs_clear_file_storage(u64 file_index) {
     if (file_index >= VFS_TMPFS_MAX_FILES) return;
     for (u64 i = 0; i < VFS_TMPFS_PAGES_PER_FILE; i++) {
-        if (g_tmpfs_files[file_index].page_paddrs[i] != 0) clear_page(tmpfs_page_va(file_index, i));
+        if (g_tmpfs_files[file_index].page_vas[i] != 0) clear_page(tmpfs_page_va(file_index, i));
     }
 }
 
@@ -836,22 +835,106 @@ static void copy_from_volatile(volatile u8 *dst, const volatile u8 *src, u64 byt
         : "memory");
 }
 
+static void clear_bytes_volatile(volatile u8 *dst, u64 bytes) {
+    u64 value = 0;
+    __asm__ volatile(
+        "rep stosb"
+        : "+D"(dst), "+c"(bytes), "+a"(value)
+        :
+        : "memory");
+}
+
+static int tmpfs_copy_to_volatile(u64 file_index, u64 offset, volatile u8 *dst, u64 bytes) {
+    if (file_index >= VFS_TMPFS_MAX_FILES || offset > VFS_TMPFS_FILE_BYTES || offset + bytes > VFS_TMPFS_FILE_BYTES) return 0;
+    u64 done = 0;
+    while (done < bytes) {
+        const u64 read_offset = offset + done;
+        const u64 page_index = read_offset / FS_PAGE_BYTES;
+        const u64 page_offset = read_offset & (FS_PAGE_BYTES - 1);
+        u64 chunk = FS_PAGE_BYTES - page_offset;
+        if (chunk > bytes - done) chunk = bytes - done;
+        if (page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
+        if (g_tmpfs_files[file_index].page_vas[page_index] == 0) {
+            clear_bytes_volatile(dst + done, chunk);
+        } else {
+            const volatile u8 *page = (const volatile u8 *)tmpfs_page_va(file_index, page_index);
+            copy_from_volatile(dst + done, page + page_offset, chunk);
+        }
+        done += chunk;
+    }
+    return 1;
+}
+
 static volatile u8 *session_bulk_byte_ptr(struct vfs_session *session, u64 offset) {
     const u64 page_index = offset / FS_PAGE_BYTES;
     if (page_index >= VFS_BULK_PAGE_COUNT || session->bulk_vas[page_index] < FS_PAGE_BYTES) return (volatile u8 *)0;
     return (volatile u8 *)(session->bulk_vas[page_index] + (offset & (FS_PAGE_BYTES - 1)));
 }
 
-static int session_bulk_write_byte(struct vfs_session *session, u64 offset, u8 value) {
-    volatile u8 *dst = session_bulk_byte_ptr(session, offset);
-    if (dst == (volatile u8 *)0) return 0;
-    *dst = value;
+static int session_bulk_copy_from_volatile(struct vfs_session *session, u64 offset, const volatile u8 *src, u64 bytes) {
+    u64 done = 0;
+    while (done < bytes) {
+        const u64 write_offset = offset + done;
+        const u64 page_index = write_offset / FS_PAGE_BYTES;
+        const u64 page_offset = write_offset & (FS_PAGE_BYTES - 1);
+        if (page_index >= VFS_BULK_PAGE_COUNT || session->bulk_vas[page_index] < FS_PAGE_BYTES) return 0;
+        u64 chunk = FS_PAGE_BYTES - page_offset;
+        if (chunk > bytes - done) chunk = bytes - done;
+        volatile u8 *dst = (volatile u8 *)(session->bulk_vas[page_index] + page_offset);
+        copy_from_volatile(dst, src + done, chunk);
+        done += chunk;
+    }
     return 1;
 }
 
-static int session_bulk_copy_from_volatile(struct vfs_session *session, u64 offset, const volatile u8 *src, u64 bytes) {
-    for (u64 i = 0; i < bytes; i++) {
-        if (!session_bulk_write_byte(session, offset + i, src[i])) return 0;
+static int session_bulk_clear(struct vfs_session *session, u64 offset, u64 bytes) {
+    u64 done = 0;
+    while (done < bytes) {
+        const u64 write_offset = offset + done;
+        const u64 page_index = write_offset / FS_PAGE_BYTES;
+        const u64 page_offset = write_offset & (FS_PAGE_BYTES - 1);
+        if (page_index >= VFS_BULK_PAGE_COUNT || session->bulk_vas[page_index] < FS_PAGE_BYTES) return 0;
+        u64 chunk = FS_PAGE_BYTES - page_offset;
+        if (chunk > bytes - done) chunk = bytes - done;
+        volatile u8 *dst = (volatile u8 *)(session->bulk_vas[page_index] + page_offset);
+        clear_bytes_volatile(dst, chunk);
+        done += chunk;
+    }
+    return 1;
+}
+
+static int session_bulk_copy_from_tmpfs(struct vfs_session *session, u64 dst_offset, u64 file_index, u64 file_offset, u64 bytes) {
+    if (file_index >= VFS_TMPFS_MAX_FILES || file_offset > VFS_TMPFS_FILE_BYTES || file_offset + bytes > VFS_TMPFS_FILE_BYTES) return 0;
+    u64 done = 0;
+    while (done < bytes) {
+        const u64 read_offset = file_offset + done;
+        const u64 page_index = read_offset / FS_PAGE_BYTES;
+        const u64 page_offset = read_offset & (FS_PAGE_BYTES - 1);
+        if (page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
+        u64 chunk = FS_PAGE_BYTES - page_offset;
+        if (chunk > bytes - done) chunk = bytes - done;
+        if (g_tmpfs_files[file_index].page_vas[page_index] == 0) {
+            if (!session_bulk_clear(session, dst_offset + done, chunk)) return 0;
+        } else {
+            const volatile u8 *page = (const volatile u8 *)tmpfs_page_va(file_index, page_index);
+            if (!session_bulk_copy_from_volatile(session, dst_offset + done, page + page_offset, chunk)) return 0;
+        }
+        done += chunk;
+    }
+    return 1;
+}
+
+static int session_bulk_copy_to_tmpfs(struct vfs_session *session, u64 src_offset, u64 file_index, u64 file_offset, u64 bytes) {
+    u64 done = 0;
+    while (done < bytes) {
+        const u64 read_offset = src_offset + done;
+        const u64 page_offset = read_offset & (FS_PAGE_BYTES - 1);
+        u64 chunk = FS_PAGE_BYTES - page_offset;
+        if (chunk > bytes - done) chunk = bytes - done;
+        const volatile u8 *src = session_bulk_byte_ptr(session, read_offset);
+        if (src == (const volatile u8 *)0) return 0;
+        if (!tmpfs_write_bytes(file_index, file_offset + done, src, (u32)chunk)) return 0;
+        done += chunk;
     }
     return 1;
 }
@@ -1676,6 +1759,9 @@ static void fallback_net_status(struct net_status_payload *status) {
     status->net_service_requests = 0;
     status->net_service_work_loops = 0;
     status->net_service_idle_sleeps = 0;
+    status->net_service_active_poll_rounds = 0;
+    status->net_service_active_poll_hits = 0;
+    status->net_service_active_poll_misses = 0;
 }
 
 static void copy_net_status(struct net_status_payload *dst, const struct net_status_payload *src) {
@@ -1722,6 +1808,9 @@ static void copy_net_status(struct net_status_payload *dst, const struct net_sta
     dst->net_service_requests = src->net_service_requests;
     dst->net_service_work_loops = src->net_service_work_loops;
     dst->net_service_idle_sleeps = src->net_service_idle_sleeps;
+    dst->net_service_active_poll_rounds = src->net_service_active_poll_rounds;
+    dst->net_service_active_poll_hits = src->net_service_active_poll_hits;
+    dst->net_service_active_poll_misses = src->net_service_active_poll_misses;
 }
 
 static void current_net_status(struct net_status_payload *status) {
@@ -1833,6 +1922,9 @@ static const char *build_proc_net_capabilityos(u64 *bytes_out) {
     append_proc_net_counter(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "net_service_requests", status.net_service_requests);
     append_proc_net_counter(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "net_service_work_loops", status.net_service_work_loops);
     append_proc_net_counter(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "net_service_idle_sleeps", status.net_service_idle_sleeps);
+    append_proc_net_counter(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "net_service_active_poll_rounds", status.net_service_active_poll_rounds);
+    append_proc_net_counter(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "net_service_active_poll_hits", status.net_service_active_poll_hits);
+    append_proc_net_counter(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, "net_service_active_poll_misses", status.net_service_active_poll_misses);
     append_char(g_proc_net_capabilityos_buf, sizeof(g_proc_net_capabilityos_buf), &len, '\n');
     if (bytes_out != 0) *bytes_out = len;
     return g_proc_net_capabilityos_buf;
@@ -2138,7 +2230,10 @@ static void reply_read(u64 seq, u64 token, u64 offset, u32 length) {
             bytes = (u16)(remaining < length ? remaining : length);
             if (bytes > FS_RESPONSE_PAYLOAD_BYTES) bytes = FS_RESPONSE_PAYLOAD_BYTES;
             volatile u8 *payload = (volatile u8 *)(g_session->response_va + FS_RESPONSE_HEADER_BYTES);
-            for (u16 i = 0; i < bytes; i++) payload[i] = tmpfs_read_byte(tmpfs_index, offset + i);
+            if (!tmpfs_copy_to_volatile(tmpfs_index, offset, payload, bytes)) {
+                write_response(FS_OP_READ, seq, FS_STATUS_IO_ERROR, 0, file->size, offset, FS_OBJECT_OPEN_FILE, 0);
+                return;
+            }
         }
         write_response(FS_OP_READ, seq, FS_STATUS_OK, 0, file->size, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
         return;
@@ -2159,11 +2254,9 @@ static void reply_read_bulk_local(u64 seq, u64 token, u64 offset, u32 length, co
         return;
     }
     if (object_id == VFS_DEV_ZERO_OPEN_OBJECT_ID) {
-        for (u32 i = 0; i < length; i++) {
-            if (!session_bulk_write_byte(g_session, i, 0)) {
-                write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_OPEN_FILE, 0);
-                return;
-            }
+        if (!session_bulk_clear(g_session, 0, length)) {
+            write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_OPEN_FILE, 0);
+            return;
         }
         write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, 0, offset + length, FS_OBJECT_OPEN_FILE, length);
         return;
@@ -2184,11 +2277,9 @@ static void reply_read_bulk_local(u64 seq, u64 token, u64 offset, u32 length, co
         if (offset < proc_bytes) {
             const u64 remaining = proc_bytes - offset;
             bytes = (u32)(remaining < length ? remaining : length);
-            for (u32 i = 0; i < bytes; i++) {
-                if (!session_bulk_write_byte(g_session, i, (u8)proc_content[offset + i])) {
-                    write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_OPEN_FILE, 0);
-                    return;
-                }
+            if (!session_bulk_copy_from_volatile(g_session, 0, (const volatile u8 *)(proc_content + offset), bytes)) {
+                write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_OPEN_FILE, 0);
+                return;
             }
         }
         write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, proc_bytes, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
@@ -2201,11 +2292,9 @@ static void reply_read_bulk_local(u64 seq, u64 token, u64 offset, u32 length, co
         if (offset < file->size) {
             const u64 remaining = file->size - offset;
             bytes = (u32)(remaining < length ? remaining : length);
-            for (u32 i = 0; i < bytes; i++) {
-                if (!session_bulk_write_byte(g_session, i, tmpfs_read_byte(tmpfs_index, offset + i))) {
-                    write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_OPEN_FILE, 0);
-                    return;
-                }
+            if (!session_bulk_copy_from_tmpfs(g_session, 0, tmpfs_index, offset, bytes)) {
+                write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_OPEN_FILE, 0);
+                return;
             }
         }
         write_bulk_response(FS_OP_READ_BULK, seq, FS_STATUS_OK, file->size, offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
@@ -2367,6 +2456,58 @@ static void reply_write(u64 seq, u64 token, u64 offset, u32 length, const volati
         FS_OBJECT_OPEN_FILE,
         0
     );
+}
+
+static void reply_write_bulk_local(u64 seq, u64 token, u64 offset, u32 length, const volatile struct fs_request_header *request) {
+    const u64 page_count = request->flags;
+    if (page_count == 0 || page_count > VFS_BULK_PAGE_COUNT || length > page_count * FS_PAGE_BYTES) {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_NONE, 0);
+        return;
+    }
+    if (!ensure_session_bulk_pages(g_session, request)) {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_INVALID, 0, offset, FS_OBJECT_NONE, 0);
+        return;
+    }
+    const u64 object_id = object_id_from_token(token);
+    if (!is_open_file_object_id(object_id)) {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_NOT_FOUND, 0, offset, FS_OBJECT_NONE, 0);
+        return;
+    }
+    if (object_id == VFS_DEV_NULL_OPEN_OBJECT_ID) {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_OK, 0, offset + length, FS_OBJECT_OPEN_FILE, length);
+        return;
+    }
+    if (object_id == VFS_PROC_CPUINFO_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_MEMINFO_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_UPTIME_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_STAT_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_MOUNTS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STAT_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_SELF_STATUS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_DEV_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_ROUTE_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_NET_CAPABILITYOS_OPEN_OBJECT_ID ||
+        object_id == VFS_PROC_DRIVER_RTC_OPEN_OBJECT_ID)
+    {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_NO_RIGHT, 0, offset, FS_OBJECT_OPEN_FILE, 0);
+        return;
+    }
+    const u64 tmpfs_index = tmpfs_index_from_open_object_id(object_id);
+    if (tmpfs_index >= VFS_TMPFS_MAX_FILES || !g_tmpfs_files[tmpfs_index].used) {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_NOT_FOUND, 0, offset, FS_OBJECT_NONE, 0);
+        return;
+    }
+    if (offset > VFS_TMPFS_FILE_BYTES || offset + length > VFS_TMPFS_FILE_BYTES) {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_TOO_BIG, g_tmpfs_files[tmpfs_index].size, offset, FS_OBJECT_OPEN_FILE, 0);
+        return;
+    }
+    if (!session_bulk_copy_to_tmpfs(g_session, 0, tmpfs_index, offset, length)) {
+        write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_IO_ERROR, g_tmpfs_files[tmpfs_index].size, offset, FS_OBJECT_OPEN_FILE, 0);
+        return;
+    }
+    struct vfs_tmpfs_file *file = &g_tmpfs_files[tmpfs_index];
+    if (offset + length > file->size) file->size = (u32)(offset + length);
+    write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_OK, file->size, offset + length, FS_OBJECT_OPEN_FILE, length);
 }
 
 static int tmpfs_parent_from_path(const volatile u8 *path, u16 path_len, u64 *parent_out, const volatile u8 **name_out, u16 *name_len_out) {
@@ -2823,6 +2964,9 @@ static int refresh_net_status(void) {
     g_net_backend.last_status.net_service_requests = payload->net_service_requests;
     g_net_backend.last_status.net_service_work_loops = payload->net_service_work_loops;
     g_net_backend.last_status.net_service_idle_sleeps = payload->net_service_idle_sleeps;
+    g_net_backend.last_status.net_service_active_poll_rounds = payload->net_service_active_poll_rounds;
+    g_net_backend.last_status.net_service_active_poll_hits = payload->net_service_active_poll_hits;
+    g_net_backend.last_status.net_service_active_poll_misses = payload->net_service_active_poll_misses;
     return 1;
 }
 
@@ -3188,6 +3332,14 @@ static void handle_fs_request(void) {
             reply_write(seq, request->object_token, request->offset, request->length, payload, request->inline_bytes);
         }
         else reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
+    } else if (request->op == FS_OP_WRITE_BULK) {
+        if (is_backend_token(request->object_token)) {
+            reply_status(request->op, seq, FS_STATUS_NOT_SUPPORTED);
+        } else if (is_open_file_token(request->object_token)) {
+            reply_write_bulk_local(seq, request->object_token, request->offset, request->length, request);
+        } else {
+            reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
+        }
     } else if (request->op == FS_OP_CREATE || request->op == FS_OP_UNLINK || request->op == FS_OP_RENAME) {
         const volatile u8 *path = (const volatile u8 *)(g_session->request_va + FS_REQUEST_HEADER_BYTES);
         if (request->op == FS_OP_CREATE &&

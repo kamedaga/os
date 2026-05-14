@@ -367,6 +367,20 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         u64 request_len = min_u64(len - copied, FS_RESPONSE_PAYLOAD_BYTES);
         const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
         if (request_len > remaining) request_len = remaining;
+        if (len - copied > FS_RESPONSE_PAYLOAD_BYTES) {
+            u64 bulk_len = min_u64(len - copied, FS_BULK_READ_BYTES);
+            if (bulk_len > remaining) bulk_len = remaining;
+            u64 bulk_bytes = 0;
+            if (vfs_read_bulk_to_target(g_fds[fd].token, g_fds[fd].offset, (u32)bulk_len, dst + copied, &bulk_bytes)) {
+                if (bulk_bytes == 0) break;
+                profile_fs_read_path(&g_fds[fd], bulk_bytes);
+                copied += bulk_bytes;
+                g_fds[fd].offset += bulk_bytes;
+                sync_fd_to_thread_group(fd);
+                if (bulk_bytes < bulk_len) break;
+                continue;
+            }
+        }
         if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
         volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
         if (response->status != FS_STATUS_OK) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
@@ -390,6 +404,18 @@ static u64 read_fd_at_to_target(const struct fd_entry *fd, u64 file_offset, u64 
         u64 request_len = min_u64(len - copied, FS_RESPONSE_PAYLOAD_BYTES);
         const u64 remaining = fd->size - (file_offset + copied);
         if (request_len > remaining) request_len = remaining;
+        if (len - copied > FS_RESPONSE_PAYLOAD_BYTES) {
+            u64 bulk_len = min_u64(len - copied, FS_BULK_READ_BYTES);
+            if (bulk_len > remaining) bulk_len = remaining;
+            u64 bulk_bytes = 0;
+            if (vfs_read_bulk_to_target(fd->token, file_offset + copied, (u32)bulk_len, dst + copied, &bulk_bytes)) {
+                if (bulk_bytes == 0) break;
+                profile_fs_read_path(fd, bulk_bytes);
+                copied += bulk_bytes;
+                if (bulk_bytes < bulk_len) break;
+                continue;
+            }
+        }
         if (!vfs_request(FS_OP_READ, fd->token, file_offset + copied, (u32)request_len, 0)) break;
         volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
         if (response->status != FS_STATUS_OK) break;
@@ -484,6 +510,21 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
             u64 request_len = min_u64(pair[1] - copied, FS_RESPONSE_PAYLOAD_BYTES);
             const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
             if (request_len > remaining) request_len = remaining;
+            if (pair[1] - copied > FS_RESPONSE_PAYLOAD_BYTES) {
+                u64 bulk_len = min_u64(pair[1] - copied, FS_BULK_READ_BYTES);
+                if (bulk_len > remaining) bulk_len = remaining;
+                u64 bulk_bytes = 0;
+                if (vfs_read_bulk_to_target(g_fds[fd].token, g_fds[fd].offset, (u32)bulk_len, pair[0] + copied, &bulk_bytes)) {
+                    if (bulk_bytes == 0) return reply(total, 0);
+                    profile_fs_read_path(&g_fds[fd], bulk_bytes);
+                    copied += bulk_bytes;
+                    total += bulk_bytes;
+                    g_fds[fd].offset += bulk_bytes;
+                    sync_fd_to_thread_group(fd);
+                    if (bulk_bytes < bulk_len) return reply(total, 0);
+                    continue;
+                }
+            }
             if (!vfs_request(FS_OP_READ, g_fds[fd].token, g_fds[fd].offset, (u32)request_len, 0)) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
             volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
             if (response->status != FS_STATUS_OK) return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
@@ -570,14 +611,41 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
         if (iovcnt > 64) return reply(errno_inval(), 0);
-        u64 total = 0;
+        u64 pairs[64][2];
         for (u64 i = 0; i < iovcnt; i++) {
-            u64 pair[2];
-            if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
+            if (copy_from_target(iov + i * 16, pairs[i], sizeof(pairs[i])) != sizeof(pairs[i])) return reply(errno_fault(), 0);
+        }
+        u64 total = 0;
+        u64 i = 0;
+        u64 iov_offset = 0;
+        while (i < iovcnt) {
+            if (iov_offset >= pairs[i][1]) {
+                i++;
+                iov_offset = 0;
+                continue;
+            }
+            if (iovcnt > 1 || pairs[i][1] - iov_offset > FS_RESPONSE_PAYLOAD_BYTES) {
+                u64 bulk_bytes = 0;
+                int bulk_fault = 0;
+                if (vfs_writev_bulk_from_target(g_fds[fd].token, g_fds[fd].offset, &pairs[0][0], iovcnt, &i, &iov_offset, &bulk_bytes, &bulk_fault)) {
+                    if (bulk_fault) return reply(errno_fault(), 0);
+                    if (bulk_bytes == 0) {
+                        if (total == 0) log_fd_write_failure(fd);
+                        return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
+                    }
+                    g_prof.fs_write_bytes += bulk_bytes;
+                    invalidate_exec_cache_for_path(g_fds[fd].path);
+                    g_fds[fd].offset += bulk_bytes;
+                    if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
+                    sync_fd_to_thread_group(fd);
+                    total += bulk_bytes;
+                    continue;
+                }
+            }
             int fault = 0;
-            const u64 n = vfs_write_from_target(g_fds[fd].token, g_fds[fd].offset, pair[0], pair[1], &fault);
+            const u64 n = vfs_write_from_target(g_fds[fd].token, g_fds[fd].offset, pairs[i][0] + iov_offset, pairs[i][1] - iov_offset, &fault);
             if (fault) return reply(errno_fault(), 0);
-            if (n == 0 && pair[1] != 0) {
+            if (n == 0 && pairs[i][1] != iov_offset) {
                 if (total == 0) log_fd_write_failure(fd);
                 return total != 0 ? reply(total, 0) : reply(errno_io(), 0);
             }
@@ -589,7 +657,10 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
             if (g_fds[fd].offset > g_fds[fd].size) g_fds[fd].size = g_fds[fd].offset;
             sync_fd_to_thread_group(fd);
             total += n;
-            if (n != pair[1]) break;
+            iov_offset += n;
+            if (iov_offset != pairs[i][1]) break;
+            i++;
+            iov_offset = 0;
         }
         return reply(total, 0);
     }
@@ -620,6 +691,12 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
         total += len;
     }
     return reply(total, 0);
+}
+
+static struct ipc_message handle_fsync_like(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    return reply(0, 0);
 }
 
 static struct ipc_message handle_fstat(const struct trap_request *req) {

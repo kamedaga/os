@@ -208,7 +208,7 @@ static int vfs_read_bulk_to_buffer(u64 token, u64 offset, u32 length, u64 dst_va
     if (length > FS_BULK_READ_BYTES) length = FS_BULK_READ_BYTES;
     const u64 page_count = fs_bulk_page_count_for_length(&g_vfs, length);
     if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
-    length = (u32)(page_count * PAGE_BYTES);
+    if (length > page_count * PAGE_BYTES) length = (u32)(page_count * PAGE_BYTES);
     if (!ensure_fs_bulk_pages(&g_vfs, page_count)) return 0;
     const u64 request_addr = vfs_request_addr();
     const u64 response_addr = vfs_response_addr();
@@ -254,6 +254,63 @@ static int vfs_read_bulk_to_buffer(u64 token, u64 offset, u32 length, u64 dst_va
     return 1;
 }
 
+static int vfs_read_bulk_to_target(u64 token, u64 offset, u32 length, u64 dst_va, u64 *bytes_out) {
+    *bytes_out = 0;
+    if (length == 0) return 1;
+    if (length > FS_BULK_READ_BYTES) length = FS_BULK_READ_BYTES;
+    const u64 page_count = fs_bulk_page_count_for_length(&g_vfs, length);
+    if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
+    if (length > page_count * PAGE_BYTES) length = (u32)(page_count * PAGE_BYTES);
+    if (!ensure_fs_bulk_pages(&g_vfs, page_count)) return 0;
+    const u64 request_addr = vfs_request_addr();
+    const u64 response_addr = vfs_response_addr();
+    const u64 bulk_addr = vfs_bulk_addr();
+    if (request_addr < PAGE_BYTES || response_addr < PAGE_BYTES || bulk_addr < PAGE_BYTES) return 0;
+
+    g_prof.vfs_requests++;
+    if (FS_OP_READ_BULK < FS_PROFILE_OP_COUNT) g_prof.vfs_op_counts[FS_OP_READ_BULK]++;
+    g_prof.vfs_read_request_bytes += length;
+
+    clear_page(request_addr);
+    clear_page(response_addr);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_addr;
+    const u64 seq = g_vfs.next_seq++;
+    request->magic = FS_REQUEST_MAGIC;
+    request->version = FS_PROTOCOL_VERSION;
+    request->op = FS_OP_READ_BULK;
+    request->object_token = token;
+    request->offset = offset;
+    request->length = length;
+    request->flags = (u32)page_count;
+    request->inline_bytes = (u16)(page_count * sizeof(u64));
+    request->session_nonce = g_vfs.session_nonce;
+    volatile u64 *payload = (volatile u64 *)(request_addr + FS_REQUEST_HEADER_BYTES);
+    for (u64 i = 0; i < page_count; i++) payload[i] = g_vfs.bulk_remote_tokens[i];
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    const u64 request_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (!signal_fs(&g_vfs)) return 0;
+    if (!wait_fs_response_at(response_addr, seq, FS_OP_READ_BULK)) return 0;
+    g_prof.vfs_bulk_request_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - request_start_tick;
+
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)response_addr;
+    if (response->status != FS_STATUS_OK) return 0;
+    const u64 bytes = response->arg0;
+    if (bytes > length || bytes > FS_BULK_READ_BYTES) return 0;
+    const u64 copy_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    u64 copied = 0;
+    while (copied < bytes) {
+        u64 chunk = bytes - copied;
+        const u64 page_left = PAGE_BYTES - ((dst_va + copied) & (PAGE_BYTES - 1));
+        if (chunk > page_left) chunk = page_left;
+        if (copy_to_target(dst_va + copied, (const void *)(bulk_addr + copied), chunk) != chunk) return 0;
+        copied += chunk;
+    }
+    g_prof.vfs_bulk_copy_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - copy_start_tick;
+    *bytes_out = bytes;
+    return 1;
+}
+
 static u64 g_last_vfs_write_status = FS_STATUS_OK;
 static u64 g_last_vfs_write_offset = 0;
 static u64 g_last_vfs_write_length = 0;
@@ -293,6 +350,139 @@ static int vfs_rename_paths(const char *old_path, const char *new_path) {
     return wait_vfs_response(seq, FS_OP_RENAME);
 }
 
+static int vfs_write_bulk_submit(u64 token, u64 offset, u32 length, u64 page_count, u64 *bytes_out) {
+    *bytes_out = 0;
+    if (length == 0) return 1;
+    if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
+    const u64 request_addr = vfs_request_addr();
+    const u64 response_addr = vfs_response_addr();
+    if (request_addr < PAGE_BYTES || response_addr < PAGE_BYTES) return 0;
+
+    g_prof.vfs_requests++;
+    if (FS_OP_WRITE_BULK < FS_PROFILE_OP_COUNT) g_prof.vfs_op_counts[FS_OP_WRITE_BULK]++;
+    g_prof.vfs_write_request_bytes += length;
+
+    clear_page(request_addr);
+    clear_page(response_addr);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_addr;
+    const u64 seq = g_vfs.next_seq++;
+    request->magic = FS_REQUEST_MAGIC;
+    request->version = FS_PROTOCOL_VERSION;
+    request->op = FS_OP_WRITE_BULK;
+    request->object_token = token;
+    request->offset = offset;
+    request->length = length;
+    request->flags = (u32)page_count;
+    request->inline_bytes = (u16)(page_count * sizeof(u64));
+    request->session_nonce = g_vfs.session_nonce;
+    volatile u64 *payload = (volatile u64 *)(request_addr + FS_REQUEST_HEADER_BYTES);
+    for (u64 i = 0; i < page_count; i++) payload[i] = g_vfs.bulk_remote_tokens[i];
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    const u64 request_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (!signal_fs(&g_vfs)) return 0;
+    if (!wait_fs_response_at(response_addr, seq, FS_OP_WRITE_BULK)) return 0;
+    g_prof.vfs_bulk_request_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - request_start_tick;
+
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)response_addr;
+    if (response->status == FS_STATUS_NOT_SUPPORTED || response->status == FS_STATUS_INVALID) return 0;
+    if (response->status != FS_STATUS_OK) {
+        g_last_vfs_write_status = (u64)(u32)response->status;
+        g_last_vfs_write_offset = offset;
+        g_last_vfs_write_length = length;
+        return 1;
+    }
+    const u64 bytes = response->arg0;
+    if (bytes > length) return 0;
+    *bytes_out = bytes;
+    return 1;
+}
+
+static int vfs_write_bulk_from_target(u64 token, u64 offset, u64 src, u32 length, u64 *bytes_out, int *fault) {
+    *bytes_out = 0;
+    *fault = 0;
+    if (length == 0) return 1;
+    if (length > FS_BULK_READ_BYTES) length = FS_BULK_READ_BYTES;
+    const u64 page_count = fs_bulk_page_count_for_length(&g_vfs, length);
+    if (page_count == 0 || page_count > FS_BULK_READ_PAGE_COUNT) return 0;
+    if (length > page_count * PAGE_BYTES) length = (u32)(page_count * PAGE_BYTES);
+    if (!ensure_fs_bulk_pages(&g_vfs, page_count)) return 0;
+    const u64 bulk_addr = vfs_bulk_addr();
+    if (bulk_addr < PAGE_BYTES) return 0;
+
+    const u64 copy_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    u64 copied = 0;
+    while (copied < length) {
+        u64 chunk = length - copied;
+        const u64 page_left = PAGE_BYTES - ((src + copied) & (PAGE_BYTES - 1));
+        if (chunk > page_left) chunk = page_left;
+        if (copy_from_target(src + copied, (void *)(bulk_addr + copied), chunk) != chunk) {
+            *fault = 1;
+            return 1;
+        }
+        copied += chunk;
+    }
+    g_prof.vfs_bulk_copy_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - copy_start_tick;
+    return vfs_write_bulk_submit(token, offset, length, page_count, bytes_out);
+}
+
+static int vfs_writev_bulk_from_target(u64 token, u64 offset, const u64 *pairs, u64 iovcnt, u64 *index_io, u64 *iov_offset_io, u64 *bytes_out, int *fault) {
+    *bytes_out = 0;
+    *fault = 0;
+    if (*index_io >= iovcnt) return 1;
+    if (!ensure_fs_bulk_pages(&g_vfs, FS_BULK_READ_PAGE_COUNT)) return 0;
+    const u64 bulk_addr = vfs_bulk_addr();
+    if (bulk_addr < PAGE_BYTES) return 0;
+
+    u64 index = *index_io;
+    u64 iov_offset = *iov_offset_io;
+    u64 filled = 0;
+    const u64 copy_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    while (index < iovcnt && filled < FS_BULK_READ_BYTES) {
+        const u64 src = pairs[index * 2];
+        const u64 len = pairs[index * 2 + 1];
+        if (iov_offset >= len) {
+            index++;
+            iov_offset = 0;
+            continue;
+        }
+        u64 chunk = len - iov_offset;
+        if (chunk > FS_BULK_READ_BYTES - filled) chunk = FS_BULK_READ_BYTES - filled;
+        const u64 page_left = PAGE_BYTES - ((src + iov_offset) & (PAGE_BYTES - 1));
+        if (chunk > page_left) chunk = page_left;
+        if (copy_from_target(src + iov_offset, (void *)(bulk_addr + filled), chunk) != chunk) {
+            *fault = 1;
+            return 1;
+        }
+        filled += chunk;
+        iov_offset += chunk;
+    }
+    g_prof.vfs_bulk_copy_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - copy_start_tick;
+    if (filled == 0) return 1;
+
+    const u64 page_count = (filled + PAGE_BYTES - 1) / PAGE_BYTES;
+    if (!vfs_write_bulk_submit(token, offset, (u32)filled, page_count, bytes_out)) return 0;
+
+    u64 advance = *bytes_out;
+    index = *index_io;
+    iov_offset = *iov_offset_io;
+    while (advance != 0 && index < iovcnt) {
+        const u64 len = pairs[index * 2 + 1];
+        const u64 available = iov_offset < len ? len - iov_offset : 0;
+        if (advance < available) {
+            iov_offset += advance;
+            advance = 0;
+            break;
+        }
+        advance -= available;
+        index++;
+        iov_offset = 0;
+    }
+    *index_io = index;
+    *iov_offset_io = iov_offset;
+    return 1;
+}
+
 static u64 vfs_write_from_target(u64 token, u64 offset, u64 src, u64 len, int *fault) {
     *fault = 0;
     g_last_vfs_write_status = FS_STATUS_OK;
@@ -300,6 +490,19 @@ static u64 vfs_write_from_target(u64 token, u64 offset, u64 src, u64 len, int *f
     g_last_vfs_write_length = len;
     u64 written = 0;
     while (written < len) {
+        if (len - written > PAGE_BYTES - FS_REQUEST_HEADER_BYTES) {
+            u64 bulk_bytes = 0;
+            int bulk_fault = 0;
+            if (vfs_write_bulk_from_target(token, offset + written, src + written, (u32)min_u64(len - written, FS_BULK_READ_BYTES), &bulk_bytes, &bulk_fault)) {
+                if (bulk_fault) {
+                    *fault = 1;
+                    return written;
+                }
+                if (bulk_bytes == 0) return written;
+                written += bulk_bytes;
+                continue;
+            }
+        }
         u64 chunk = min_u64(len - written, PAGE_BYTES - FS_REQUEST_HEADER_BYTES);
         if (chunk > 0xffff) chunk = 0xffff;
         if (!vfs_request_full(FS_OP_WRITE, token, offset + written, (u32)chunk, 0, 0, src + written, (u16)chunk)) {

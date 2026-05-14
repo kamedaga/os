@@ -21,6 +21,26 @@ var dispatch_delegate_backpressure_log_count: u64 = 0;
 const dispatch_delegate_backpressure_log_limit: u64 = 1;
 const delegate_transport_queue_limit: usize = 1;
 
+const ProfileSlot = struct {
+    count: u64 = 0,
+    cycles: u64 = 0,
+    max_cycles: u64 = 0,
+};
+
+const AbiTrapProfile = struct {
+    unmap_collect: ProfileSlot = .{},
+    unmap_collected_mismatch: ProfileSlot = .{},
+    unmap_cap_scan: ProfileSlot = .{},
+    unmap_cap_scan_fail: ProfileSlot = .{},
+    unmap_cap_linear_found: ProfileSlot = .{},
+    unmap_cap_linear_missing: ProfileSlot = .{},
+    unmap_cap_scan_skip: ProfileSlot = .{},
+    unmap_pte: ProfileSlot = .{},
+    unmap_reclaim: ProfileSlot = .{},
+};
+
+var abi_trap_profile: AbiTrapProfile = .{};
+
 const AbiTrapSpinLock = struct {
     value: u8 = 0,
 
@@ -72,6 +92,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_failure_log_count), &dispatch_delegate_failure_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_lookup_log_count), &dispatch_delegate_lookup_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_backpressure_log_count), &dispatch_delegate_backpressure_log_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_profile), &abi_trap_profile));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_lock), &dispatch_delegate_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_storage), &abi_trap_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_ready), &abi_trap_hooks_ready));
@@ -86,6 +107,58 @@ pub fn init(new_hooks: Hooks) void {
 fn getHooks() *const Hooks {
     if (!abi_trap_hooks_ready) unreachable;
     return &abi_trap_hooks_storage;
+}
+
+fn readTsc() u64 {
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | @as(u64, lo);
+}
+
+fn profileRecord(slot: *ProfileSlot, cycles: u64) void {
+    slot.count +%= 1;
+    slot.cycles +%= cycles;
+    if (cycles > slot.max_cycles) slot.max_cycles = cycles;
+}
+
+pub fn profileReset() void {
+    abi_trap_profile = .{};
+}
+
+fn profileReportSlot(
+    write: *const fn ([]const u8) void,
+    print_number: *const fn (u64) void,
+    name: []const u8,
+    slot: ProfileSlot,
+) void {
+    if (slot.count == 0) return;
+    write("AbiTrapProfile.item ");
+    write(name);
+    write(" count=");
+    print_number(slot.count);
+    write(" cycles=");
+    print_number(slot.cycles);
+    write(" max=");
+    print_number(slot.max_cycles);
+    write("\n");
+}
+
+pub fn profileReport(write: *const fn ([]const u8) void, print_number: *const fn (u64) void) void {
+    write("AbiTrapProfile.begin\n");
+    profileReportSlot(write, print_number, "unmap_collect", abi_trap_profile.unmap_collect);
+    profileReportSlot(write, print_number, "unmap_collected_mismatch", abi_trap_profile.unmap_collected_mismatch);
+    profileReportSlot(write, print_number, "unmap_cap_scan", abi_trap_profile.unmap_cap_scan);
+    profileReportSlot(write, print_number, "unmap_cap_scan_fail", abi_trap_profile.unmap_cap_scan_fail);
+    profileReportSlot(write, print_number, "unmap_cap_linear_found", abi_trap_profile.unmap_cap_linear_found);
+    profileReportSlot(write, print_number, "unmap_cap_linear_missing", abi_trap_profile.unmap_cap_linear_missing);
+    profileReportSlot(write, print_number, "unmap_cap_scan_skip", abi_trap_profile.unmap_cap_scan_skip);
+    profileReportSlot(write, print_number, "unmap_pte", abi_trap_profile.unmap_pte);
+    profileReportSlot(write, print_number, "unmap_reclaim", abi_trap_profile.unmap_reclaim);
+    write("AbiTrapProfile.end\n");
 }
 
 fn hooksForState(state: *kernel.KernelState) Hooks {
@@ -128,6 +201,15 @@ fn writeRequest(
     if (!writeRequestU64(h, target, request_page_va, 0x70, frame.r8)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x78, frame.r9)) return false;
     return true;
+}
+
+fn findCapLinear(table: *const kernel.CNode, paddr: u64) ?kernel.Capability {
+    var index: usize = 0;
+    while (index < table.len) : (index += 1) {
+        const cap = table.get(index) orelse return null;
+        if (cap.paddr == paddr) return cap;
+    }
+    return null;
 }
 
 fn grantQueuedReplyToken(receiver_thread: usize, msg: scheduler.IpcQueuedMessage) void {
@@ -321,12 +403,24 @@ pub fn mapPagesToCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, 
     _ = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    const page_count_usize: usize = @intCast(page_count);
 
-    var page_index: u64 = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const page = h.state.allocPageTo(target.proc, h.free_list) catch return boot_static.syscall_err_alloc;
-        const va = target_va + page_index * 4096;
-        if (!user_vm.mapUserLinearRegionWithProt(target.proc, va, page.paddr, 4096, prot)) return boot_static.syscall_err_map;
+    var pages: [boot_static.syscall_batch_max_pages]kernel.PageCapability = undefined;
+    var allocated: usize = 0;
+    const cap_table_start_index = h.state.getTableConst(target.proc).len;
+    while (allocated < page_count_usize) : (allocated += 1) {
+        pages[allocated] = h.state.allocPageTo(target.proc, h.free_list) catch {
+            for (pages[0..allocated]) |page| {
+                h.state.reclaimExclusiveRootPage(target.proc, page.paddr, h.free_list) catch {};
+            }
+            return boot_static.syscall_err_alloc;
+        };
+    }
+    if (!user_vm.mapFreshUserPageCapabilitiesWithProt(h.state, target.proc, target_va, pages[0..allocated], cap_table_start_index, prot)) {
+        for (pages[0..allocated]) |page| {
+            h.state.reclaimExclusiveRootPage(target.proc, page.paddr, h.free_list) catch {};
+        }
+        return boot_static.syscall_err_map;
     }
     return boot_static.syscall_ok;
 }
@@ -342,39 +436,24 @@ pub fn protectCurrentReplyTargetPages(target_va: u64, page_count: u64, prot_bits
 }
 
 pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, page_count: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
+    _ = state;
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
-    var reclaimable: [boot_static.syscall_batch_max_pages]bool = [_]bool{false} ** boot_static.syscall_batch_max_pages;
+    var profile_start = readTsc();
     const collected = user_vm.collectUserLinearRegionPaddrs(target.proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
-    if (collected != page_count) return boot_static.syscall_err_map;
-    var page_index: usize = 0;
-    while (page_index < collected) : (page_index += 1) {
-        const paddr = paddrs[page_index];
-        const cap = h.state.getTableConst(target.proc).find(paddr) orelse return boot_static.syscall_err_invalid;
-        if (cap.cap_id == cap.root_cap_id and cap.parent_cap_id == 0) {
-            switch (h.state.scanCapTables(paddr)) {
-                .owner => |actual_owner| {
-                    if (actual_owner != target.proc) return boot_static.syscall_err_invalid;
-                    if (!h.free_list.canAppendPage(0, paddr)) return boot_static.syscall_err_alloc;
-                    reclaimable[page_index] = true;
-                },
-                .shared => {},
-                .none => return boot_static.syscall_err_invalid,
-            }
-        }
+    profileRecord(&abi_trap_profile.unmap_collect, readTsc() - profile_start);
+    if (collected != page_count) {
+        profileRecord(&abi_trap_profile.unmap_collected_mismatch, 0);
+        return boot_static.syscall_err_map;
     }
+    profile_start = readTsc();
+    profileRecord(&abi_trap_profile.unmap_cap_scan_skip, readTsc() - profile_start);
+    profile_start = readTsc();
     if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) {
         return boot_static.syscall_err_map;
     }
-    page_index = 0;
-    while (page_index < collected) : (page_index += 1) {
-        if (!reclaimable[page_index]) continue;
-        const paddr = paddrs[page_index];
-        h.state.reclaimExclusiveRootPage(target.proc, paddr, h.free_list) catch return boot_static.syscall_err_invalid;
-    }
+    profileRecord(&abi_trap_profile.unmap_pte, readTsc() - profile_start);
     return boot_static.syscall_ok;
 }
 

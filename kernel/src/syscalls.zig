@@ -117,6 +117,8 @@ var ipc40_debug_trace_enabled: bool = false;
 const ipc40_debug_log_limit: u64 = 96;
 const kernel_exec_profile_slots_max: usize = 64;
 const kernel_exec_profile_lstar_delegate: u64 = 0xFFFF_FF00;
+const kernel_exec_profile_abi_unmap_lock_wait: u64 = 0xFFFF_FF01;
+const kernel_exec_profile_abi_unmap_runtime_call: u64 = 0xFFFF_FF02;
 var kernel_exec_profile_active: bool = false;
 var kernel_exec_profile_slots: [kernel_exec_profile_slots_max]KernelExecProfileSlot = [_]KernelExecProfileSlot{.{}} ** kernel_exec_profile_slots_max;
 pub export var ipc_lstar_sparse_probe_enabled: u64 = 0;
@@ -577,6 +579,8 @@ fn readTsc() u64 {
 fn kernelExecProfileName(nr: u64) ?[]const u8 {
     return switch (nr) {
         kernel_exec_profile_lstar_delegate => "lstar_delegate",
+        kernel_exec_profile_abi_unmap_lock_wait => "abi_unmap_lock_wait",
+        kernel_exec_profile_abi_unmap_runtime_call => "abi_unmap_runtime_call",
         syscall_ipc_call_reply_recv => "ipc_call_reply_recv",
         syscall_ipc_call_reply_recv_fast => "ipc_call_reply_recv_fast",
         syscall_signal_endpoint => "signal_endpoint",
@@ -628,6 +632,7 @@ fn kernelExecProfileReset() void {
     for (&kernel_exec_profile_slots) |*slot| slot.* = .{};
     kernel_ipc_profile = .{};
     for (&kernel_ipc_profile_signal_endpoints) |*slot| slot.* = .{};
+    abi_trap_runtime.profileReset();
     ipc40_debug_log_count = 0;
     ipc40_debug_trace_enabled = false;
     ipc_lstar_sparse_probe_enabled = 1;
@@ -701,6 +706,7 @@ fn kernelExecProfileReport(h: *const Hooks) void {
         h.write("\n");
     }
     h.write("KernelExecProfile.end\n");
+    abi_trap_runtime.profileReport(h.write, h.print_number);
     kernel_exec_profile_active = false;
     ipc_lstar_sparse_probe_enabled = 0;
 }
@@ -1585,7 +1591,13 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     const hold_kernel_state_lock = syscallNeedsKernelStateLock(frame.rax);
     const syscall_profile_active = kernel_exec_profile_active;
     const syscall_profile_start = if (syscall_profile_active) readTsc() else 0;
-    if (hold_kernel_state_lock) kernel_state_lock.lock();
+    if (hold_kernel_state_lock) {
+        const lock_profile_start = if (syscall_profile_active and frame.rax == syscall_unmap_abi_trap_reply_target_pages) readTsc() else 0;
+        kernel_state_lock.lock();
+        if (syscall_profile_active and frame.rax == syscall_unmap_abi_trap_reply_target_pages) {
+            kernelExecProfileRecord(kernel_exec_profile_abi_unmap_lock_wait, readTsc() - lock_profile_start);
+        }
+    }
     defer {
         if (hold_kernel_state_lock) kernel_state_lock.unlock();
     }
@@ -2111,7 +2123,10 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return abi_trap_runtime.protectCurrentReplyTargetPages(frame.rdi, frame.rsi, frame.rdx);
         },
         syscall_unmap_abi_trap_reply_target_pages => {
-            return abi_trap_runtime.unmapCurrentReplyTargetPages(state, frame.rdi, frame.rsi);
+            const call_profile_start = if (kernel_exec_profile_active) readTsc() else 0;
+            const result = abi_trap_runtime.unmapCurrentReplyTargetPages(state, frame.rdi, frame.rsi);
+            if (kernel_exec_profile_active) kernelExecProfileRecord(kernel_exec_profile_abi_unmap_runtime_call, readTsc() - call_profile_start);
+            return result;
         },
         syscall_reclaim_abi_trap_reply_target_private_pages => {
             return abi_trap_runtime.reclaimCurrentReplyTargetPrivatePages(state);

@@ -10,7 +10,7 @@ const x86_platform = @import("arch/x86_64/platform.zig");
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
-const debug_skip_syscall_fx_state = true;
+const debug_skip_syscall_fx_state = false;
 const debug_skip_timer_fx_state = false;
 const trap_frame_qword_count = @sizeOf(TrapFrame) / @sizeOf(u64);
 const exception_trap_frame_qword_count = @sizeOf(ExceptionTrapFrame) / @sizeOf(u64);

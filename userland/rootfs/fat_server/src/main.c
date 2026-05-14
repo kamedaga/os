@@ -2666,6 +2666,8 @@ static void handle_fs_request(void) {
                 reply_status(request->op, seq, status);
             }
         }
+    } else if (request->op == FS_OP_WRITE_BULK) {
+        reply_status(request->op, seq, FS_STATUS_NOT_SUPPORTED);
     } else if (request->op == FS_OP_UNLINK) {
         if (!is_dir_token(request->object_token) || request->path_bytes > FS_MAX_PATH_BYTES) {
             reply_status(request->op, seq, FS_STATUS_INVALID);

@@ -497,7 +497,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     }
 
     user_spaces[process_index] = .{};
-    kernel_state_global.cap_tables[process_index] = .{};
+    kernel_state_global.cap_tables[process_index].reset();
     kernel_state_global.endpoint_tables[process_index] = .{};
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;
@@ -550,7 +550,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     }
 
     user_spaces[process_index] = .{};
-    kernel_state_global.cap_tables[process_index] = .{};
+    kernel_state_global.cap_tables[process_index].reset();
     kernel_state_global.endpoint_tables[process_index] = .{};
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;

@@ -98,7 +98,8 @@ pub fn syncAllIommuForPrincipal(
     const table = state.getTableConst(principal);
     var i: usize = 0;
     while (i < table.len) : (i += 1) {
-        try syncIommuForPrincipalPaddr(state, principal, table.caps[i].paddr, reason);
+        const cap = table.get(i) orelse break;
+        try syncIommuForPrincipalPaddr(state, principal, cap.paddr, reason);
     }
 }
 

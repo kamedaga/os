@@ -73,6 +73,7 @@ enum {
 
     VIRTIO_NET_F_MAC = 5,
     VIRTIO_F_VERSION_1 = 32,
+    VIRTIO_NET_HDR_F_NEEDS_CSUM = 1,
 
     QUEUE_SIZE = 16,
     QUEUE_USED_OFFSET = 2048,
@@ -109,6 +110,7 @@ enum {
     NET_OP_TCP_CONNECT = 8,
     NET_OP_TCP_WRITE = 9,
     NET_OP_TCP_READ = 10,
+    NET_OP_TCP_READ_BULK = 11,
     NET_STATUS_OK = 0,
     NET_STATUS_INVALID = 2,
     NET_STATUS_NOT_CONNECTED = 4,
@@ -135,11 +137,17 @@ enum {
     NET_TCP_CONNECTIONS = 4,
     NET_TCP_MAX_PAYLOAD = 1200,
     NET_TCP_MSS = 1200,
+    NET_TCP_BULK_READ_PAGE_COUNT = 16,
+    NET_TCP_BULK_READ_BYTES = NET_TCP_BULK_READ_PAGE_COUNT * 4096,
     NET_TCP_OOO_SEGMENTS = 8,
-    NET_TCP_OOO_BYTES = 1600,
-    NET_TCP_RX_BYTES = 64 * 1024,
-    NET_TCP_WINDOW_MAX = 8 * 1024,
+    NET_TCP_OOO_BYTES = 4096,
+    NET_TCP_RX_BYTES = 4 * 1024 * 1024,
+    NET_TCP_RX_SOFT_LIMIT = 256 * 1024,
+    NET_TCP_WINDOW_MAX = 64 * 1024 - 1,
     NET_SESSION_MAX = 4,
+    NET_PENDING_READ_ACTIVE_POLL_ROUNDS = 1024,
+    NET_CONNECTION_ACTIVE_POLL_ROUNDS = 16,
+    NET_ACTIVE_POLL_PAUSE = 64,
     NET_UDP_HANDLE_TAG = 0x5544500000000000ULL,
     NET_TCP_HANDLE_TAG = 0x5443500000000000ULL,
     NET_EPHEMERAL_PORT_BASE = 49152,
@@ -272,6 +280,9 @@ struct net_status_payload {
     u64 net_service_requests;
     u64 net_service_work_loops;
     u64 net_service_idle_sleeps;
+    u64 net_service_active_poll_rounds;
+    u64 net_service_active_poll_hits;
+    u64 net_service_active_poll_misses;
 };
 
 struct net_session {
@@ -285,6 +296,16 @@ struct net_session {
     u64 reply_endpoint_id;
     u64 session_nonce;
     u64 last_completed_seq;
+    u8 pending_tcp_read;
+    u8 reserved0[7];
+    u16 pending_op;
+    u16 reserved1;
+    u32 pending_out_cap;
+    u64 pending_seq;
+    u64 pending_handle;
+    u64 bulk_tokens[NET_TCP_BULK_READ_PAGE_COUNT];
+    u64 bulk_vas[NET_TCP_BULK_READ_PAGE_COUNT];
+    u8 bulk_mapped;
 };
 
 struct udp_packet {
@@ -378,6 +399,7 @@ static u64 g_tcp_rx_ooo_stored;
 static u64 g_tcp_rx_ooo_drained;
 static u64 g_tcp_rx_ooo_dropped;
 static u64 g_tcp_rx_append_failed;
+static u64 g_tcp_rx_bad_checksum;
 static u64 g_tcp_ack_sent;
 static u64 g_tcp_ack_deferred;
 static u64 g_tcp_ack_flushed;
@@ -397,18 +419,30 @@ static u64 g_tcp_rx_rst;
 static u64 g_net_service_requests;
 static u64 g_net_service_work_loops;
 static u64 g_net_service_idle_sleeps;
+static u64 g_net_service_active_poll_rounds;
+static u64 g_net_service_active_poll_hits;
+static u64 g_net_service_active_poll_misses;
 static u64 g_tcp_next_progress_log_bytes = 64 * 1024;
 
 void *memset(void *dst, int value, u64 n) {
     u8 *d = (u8 *)dst;
-    for (u64 i = 0; i < n; i++) d[i] = (u8)value;
+    u64 v = (u8)value;
+    __asm__ volatile(
+        "rep stosb"
+        : "+D"(d), "+c"(n), "+a"(v)
+        :
+        : "memory");
     return dst;
 }
 
 void *memcpy(void *dst, const void *src, u64 n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
-    for (u64 i = 0; i < n; i++) d[i] = s[i];
+    __asm__ volatile(
+        "rep movsb"
+        : "+D"(d), "+S"(s), "+c"(n)
+        :
+        : "memory");
     return dst;
 }
 
@@ -928,6 +962,9 @@ static void write_net_status_payload(void) {
     payload->net_service_requests = g_net_service_requests;
     payload->net_service_work_loops = g_net_service_work_loops;
     payload->net_service_idle_sleeps = g_net_service_idle_sleeps;
+    payload->net_service_active_poll_rounds = g_net_service_active_poll_rounds;
+    payload->net_service_active_poll_hits = g_net_service_active_poll_hits;
+    payload->net_service_active_poll_misses = g_net_service_active_poll_misses;
 }
 
 static const u8 *net_request_payload(void) {
@@ -1269,9 +1306,14 @@ static int tcp_port_in_use(u16 port) {
 
 static int tcp_rx_append(struct tcp_connection *conn, const u8 *payload, u32 len) {
     if (len > NET_TCP_RX_BYTES - conn->rx_len) return 0;
-    for (u32 i = 0; i < len; i++) {
-        const u32 index = (conn->rx_head + conn->rx_len + i) % NET_TCP_RX_BYTES;
-        conn->rx[index] = payload[i];
+    u32 tail = (conn->rx_head + conn->rx_len) % NET_TCP_RX_BYTES;
+    u32 done = 0;
+    while (done < len) {
+        u32 chunk = NET_TCP_RX_BYTES - tail;
+        if (chunk > len - done) chunk = len - done;
+        memcpy(conn->rx + tail, payload + done, chunk);
+        done += chunk;
+        tail = 0;
     }
     conn->rx_len += len;
     return 1;
@@ -1294,40 +1336,6 @@ static int tcp_rx_append_counted(struct tcp_connection *conn, const u8 *payload,
     g_tcp_rx_in_order_bytes += len;
     tcp_log_progress_if_needed();
     return 1;
-}
-
-static int tcp_ooo_range_overlaps(const struct tcp_ooo_segment *seg, u32 seq, u32 len) {
-    const u32 seg_end = seg->seq + seg->len;
-    const u32 end = seq + len;
-    return tcp_seq_lt(seq, seg_end) && tcp_seq_lt(seg->seq, end);
-}
-
-static int tcp_store_ooo(struct tcp_connection *conn, u32 seq, const u8 *payload, u32 len) {
-    if (len == 0) return 1;
-    if (len > NET_TCP_OOO_BYTES) {
-        g_tcp_rx_ooo_dropped++;
-        return 0;
-    }
-    for (u64 i = 0; i < NET_TCP_OOO_SEGMENTS; i++) {
-        const struct tcp_ooo_segment *seg = &conn->ooo[i];
-        if (seg->used && tcp_ooo_range_overlaps(seg, seq, len)) {
-            if (seg->seq == seq && seg->len == len) return 1;
-            g_tcp_rx_ooo_dropped++;
-            return 0;
-        }
-    }
-    for (u64 i = 0; i < NET_TCP_OOO_SEGMENTS; i++) {
-        struct tcp_ooo_segment *seg = &conn->ooo[i];
-        if (seg->used) continue;
-        seg->used = 1;
-        seg->seq = seq;
-        seg->len = len;
-        memcpy(seg->bytes, payload, len);
-        g_tcp_rx_ooo_stored++;
-        return 1;
-    }
-    g_tcp_rx_ooo_dropped++;
-    return 0;
 }
 
 static void tcp_drain_ooo(struct tcp_connection *conn) {
@@ -1364,16 +1372,20 @@ static void tcp_drain_ooo(struct tcp_connection *conn) {
 }
 
 static u16 tcp_advertised_window(const struct tcp_connection *conn) {
-    const u32 free_bytes = NET_TCP_RX_BYTES - conn->rx_len;
+    const u32 free_bytes = conn->rx_len < NET_TCP_RX_SOFT_LIMIT ? NET_TCP_RX_SOFT_LIMIT - conn->rx_len : 0;
     return (u16)(free_bytes > NET_TCP_WINDOW_MAX ? NET_TCP_WINDOW_MAX : free_bytes);
 }
 
 static u32 tcp_rx_pop(struct tcp_connection *conn, u8 *out, u32 out_cap) {
     const u32 n = conn->rx_len < out_cap ? conn->rx_len : out_cap;
-    for (u32 i = 0; i < n; i++) {
-        out[i] = conn->rx[(conn->rx_head + i) % NET_TCP_RX_BYTES];
+    u32 done = 0;
+    while (done < n) {
+        u32 chunk = NET_TCP_RX_BYTES - conn->rx_head;
+        if (chunk > n - done) chunk = n - done;
+        memcpy(out + done, conn->rx + conn->rx_head, chunk);
+        done += chunk;
+        conn->rx_head = (conn->rx_head + chunk) % NET_TCP_RX_BYTES;
     }
-    conn->rx_head = (conn->rx_head + n) % NET_TCP_RX_BYTES;
     conn->rx_len -= n;
     return n;
 }
@@ -1542,6 +1554,111 @@ static int tcp_read(u64 handle, u8 *out, u32 out_cap, u32 *out_len) {
         tcp_send_or_defer_ack(conn);
     }
     return NET_STATUS_OK;
+}
+
+static int ensure_session_bulk_pages(struct net_session *session, const volatile struct net_request_header *request) {
+    const u32 page_count = (u32)request->arg1;
+    if (page_count == 0 || page_count > NET_TCP_BULK_READ_PAGE_COUNT) return 0;
+    if (page_count * sizeof(u64) > NET_PAYLOAD_BYTES) return 0;
+    const volatile u64 *buffers = (const volatile u64 *)(session->request_va + NET_REQUEST_HEADER_BYTES);
+    for (u32 i = 0; i < page_count; i++) {
+        const u64 token = buffers[i];
+        if (!is_ipc_buffer_token(token)) return 0;
+        if (!session->bulk_mapped || session->bulk_tokens[i] != token) {
+            const u64 mapped_va = map_ipc_buffer_anywhere(token, 1);
+            if (mapped_va < 4096) return 0;
+            session->bulk_tokens[i] = token;
+            session->bulk_vas[i] = mapped_va;
+        }
+    }
+    session->bulk_mapped = 1;
+    return 1;
+}
+
+static int tcp_read_bulk(u64 handle, struct net_session *session, u32 out_cap, u32 *out_len) {
+    if (session == 0 || !ensure_session_bulk_pages(session, (const volatile struct net_request_header *)session->request_va)) return NET_STATUS_INVALID;
+    if (out_cap > NET_TCP_BULK_READ_BYTES) out_cap = NET_TCP_BULK_READ_BYTES;
+    struct tcp_connection *conn = find_tcp_connection_by_handle(handle);
+    if (conn == 0) return NET_STATUS_INVALID;
+    g_tcp_read_requests++;
+    if (conn->state == TCP_STATE_ESTABLISHED) tcp_drain_ooo(conn);
+    if (conn->rx_len == 0) {
+        if (conn->peer_closed || conn->state == TCP_STATE_CLOSED) {
+            *out_len = 0;
+            return NET_STATUS_OK;
+        }
+        g_tcp_read_would_block++;
+        return NET_STATUS_WOULD_BLOCK;
+    }
+    const u32 n = conn->rx_len < out_cap ? conn->rx_len : out_cap;
+    u32 done = 0;
+    while (done < n) {
+        const u32 page_index = done / 4096;
+        const u32 page_offset = done & 4095;
+        if (page_index >= NET_TCP_BULK_READ_PAGE_COUNT || session->bulk_vas[page_index] < 4096) return NET_STATUS_INVALID;
+        u32 chunk = 4096 - page_offset;
+        if (chunk > n - done) chunk = n - done;
+        u32 rx_chunk = NET_TCP_RX_BYTES - conn->rx_head;
+        if (rx_chunk > chunk) rx_chunk = chunk;
+        memcpy((void *)(session->bulk_vas[page_index] + page_offset), conn->rx + conn->rx_head, rx_chunk);
+        done += rx_chunk;
+        conn->rx_head = (conn->rx_head + rx_chunk) % NET_TCP_RX_BYTES;
+    }
+    conn->rx_len -= n;
+    *out_len = n;
+    g_tcp_read_bytes += n;
+    if (conn->state == TCP_STATE_ESTABLISHED) {
+        tcp_drain_ooo(conn);
+        tcp_send_or_defer_ack(conn);
+    }
+    return NET_STATUS_OK;
+}
+
+static void defer_tcp_read_response(struct net_session *session, u16 op, u64 seq, u64 handle, u32 out_cap) {
+    session->pending_tcp_read = 1;
+    session->pending_op = op;
+    session->pending_seq = seq;
+    session->pending_handle = handle;
+    session->pending_out_cap = out_cap;
+}
+
+static int finish_tcp_read_response(struct net_session *session) {
+    if (session == 0 || !session->pending_tcp_read) return 0;
+    g_current_session = session;
+    u32 out_len = 0;
+    int status = NET_STATUS_INVALID;
+    if (session->pending_op == NET_OP_TCP_READ) {
+        u32 out_cap = session->pending_out_cap;
+        if (out_cap > NET_PAYLOAD_BYTES) out_cap = NET_PAYLOAD_BYTES;
+        status = tcp_read(session->pending_handle, net_response_payload(), out_cap, &out_len);
+        if (status == NET_STATUS_OK) write_net_response(NET_OP_TCP_READ, session->pending_seq, status, out_len, out_len, 0, 0);
+    } else if (session->pending_op == NET_OP_TCP_READ_BULK) {
+        u32 out_cap = session->pending_out_cap;
+        if (out_cap > NET_TCP_BULK_READ_BYTES) out_cap = NET_TCP_BULK_READ_BYTES;
+        status = tcp_read_bulk(session->pending_handle, session, out_cap, &out_len);
+        if (status == NET_STATUS_OK) write_net_response(NET_OP_TCP_READ_BULK, session->pending_seq, status, 0, out_len, 0, 0);
+    }
+    if (status == NET_STATUS_WOULD_BLOCK) {
+        g_current_session = 0;
+        return 0;
+    }
+    if (status != NET_STATUS_OK) write_net_response(session->pending_op, session->pending_seq, status, 0, 0, 0, 0);
+    session->last_completed_seq = session->pending_seq;
+    session->pending_tcp_read = 0;
+    session->pending_op = 0;
+    session->pending_seq = 0;
+    session->pending_handle = 0;
+    session->pending_out_cap = 0;
+    g_current_session = 0;
+    return 1;
+}
+
+static int finish_pending_tcp_reads(void) {
+    int completed = 0;
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+        if (finish_tcp_read_response(&g_sessions[i])) completed = 1;
+    }
+    return completed;
 }
 
 static int poll_tcp_connection(u64 handle, u64 *events_out) {
@@ -1871,7 +1988,7 @@ static void parse_dhcp_payload(const u8 *dhcp, u32 len) {
     }
 }
 
-static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
+static void parse_ipv4_packet(const u8 *frame, u32 frame_len, int checksum_complete) {
     if (frame_len < ETH_HDR_BYTES + 20) return;
     const u8 *ip = frame + ETH_HDR_BYTES;
     const u32 ihl = (u32)(ip[0] & 0x0F) * 4;
@@ -1879,10 +1996,13 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
     if (frame_len < ETH_HDR_BYTES + ihl) return;
     const u16 total_len = read_be16(ip + 2);
     if (total_len < ihl || frame_len < ETH_HDR_BYTES + total_len) return;
+    if (ipv4_checksum(ip, ihl) != 0) return;
     if (ip[9] == IP_PROTO_TCP) {
         const u8 *tcp = ip + ihl;
         const u32 tcp_packet_len = (u32)total_len - ihl;
         if (tcp_packet_len < 20) return;
+        const u32 src_ip = read_be32(ip + 12);
+        const u32 dst_ip = read_be32(ip + 16);
         const u16 src_port = read_be16(tcp + 0);
         const u16 dst_port = read_be16(tcp + 2);
         const u32 seq = read_be32(tcp + 4);
@@ -1890,9 +2010,13 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
         const u32 tcp_header_len = (u32)(tcp[12] >> 4) * 4;
         const u8 flags = tcp[13];
         if (tcp_header_len < 20 || tcp_header_len > tcp_packet_len) return;
+        if (checksum_complete && tcp_ipv4_checksum(src_ip, dst_ip, tcp, tcp_packet_len) != 0xFFFF) {
+            g_tcp_rx_bad_checksum++;
+            return;
+        }
         const u8 *payload = tcp + tcp_header_len;
         const u32 payload_len = tcp_packet_len - tcp_header_len;
-        struct tcp_connection *conn = find_tcp_connection_by_tuple(read_be32(ip + 12), src_port, dst_port);
+        struct tcp_connection *conn = find_tcp_connection_by_tuple(src_ip, src_port, dst_port);
         if (conn == 0) return;
         if ((flags & TCP_FLAG_RST) != 0) {
             g_tcp_rx_rst++;
@@ -1917,12 +2041,11 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
             const u32 payload_end = seq + payload_len;
             if (tcp_seq_leq(seq, conn->ack) && tcp_seq_lt(conn->ack, payload_end)) {
                 const u32 skip = conn->ack - seq;
-                const u32 append_len = payload_len - skip;
-                if (tcp_rx_append_counted(conn, payload + skip, append_len)) {
+                u32 append_len = payload_len - skip;
+                const u32 soft_free = conn->rx_len < NET_TCP_RX_SOFT_LIMIT ? NET_TCP_RX_SOFT_LIMIT - conn->rx_len : 0;
+                if (append_len > soft_free) append_len = soft_free;
+                if (append_len != 0 && tcp_rx_append_counted(conn, payload + skip, append_len)) {
                     conn->ack += append_len;
-                    tcp_drain_ooo(conn);
-                } else {
-                    (void)tcp_store_ooo(conn, seq + skip, payload + skip, append_len);
                 }
                 tcp_send_or_defer_ack(conn);
             } else if (tcp_seq_leq(payload_end, conn->ack)) {
@@ -1930,7 +2053,6 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
                 tcp_send_or_defer_ack(conn);
             } else {
                 g_tcp_rx_out_of_order_segments++;
-                (void)tcp_store_ooo(conn, seq, payload, payload_len);
                 tcp_send_or_defer_ack(conn);
             }
         }
@@ -1972,7 +2094,7 @@ static void parse_ipv4_packet(const u8 *frame, u32 frame_len) {
     );
 }
 
-static void parse_ethernet_frame(const u8 *frame, u32 frame_len) {
+static void parse_ethernet_frame(const u8 *frame, u32 frame_len, int checksum_complete) {
     if (frame_len < ETH_HDR_BYTES) return;
     const u16 ethertype = read_be16(frame + 12);
     if (g_rx_packets <= 16) log_rx_packet(frame_len, ethertype);
@@ -1993,7 +2115,7 @@ static void parse_ethernet_frame(const u8 *frame, u32 frame_len) {
         }
         return;
     }
-    if (ethertype == ETHERTYPE_IPV4) parse_ipv4_packet(frame, frame_len);
+    if (ethertype == ETHERTYPE_IPV4) parse_ipv4_packet(frame, frame_len, checksum_complete);
 }
 
 static int poll_rx_queue_budget(u32 budget) {
@@ -2009,6 +2131,7 @@ static int poll_rx_queue_budget(u32 budget) {
         processed = 1;
         if (packet_len > NET_HDR_BYTES) {
             const u8 *src = (const u8 *)(RX_BUFFER_BASE_VA + (u64)desc_index * 4096);
+            const int checksum_complete = (src[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM) == 0;
             u32 offset = NET_HDR_BYTES;
             if (packet_len >= NET_HDR_BYTES + ETH_HDR_BYTES) {
                 u16 ethertype = read_be16(src + NET_HDR_BYTES + 12);
@@ -2017,7 +2140,7 @@ static int poll_rx_queue_budget(u32 budget) {
                     if (is_known_ethertype(ethertype)) offset = 12;
                 }
             }
-            parse_ethernet_frame(src + offset, packet_len - offset);
+            parse_ethernet_frame(src + offset, packet_len - offset, checksum_complete);
         }
         queue_push_avail(&g_rx_queue, desc_index);
     }
@@ -2100,6 +2223,11 @@ static int finish_net_connect(
     session->reply_endpoint_id = install_endpoint(reply_endpoint_id, request->arg1) == SYSCALL_OK ? reply_endpoint_id : 0;
     session->session_nonce = request->session_nonce;
     session->last_completed_seq = 0;
+    session->pending_tcp_read = 0;
+    session->pending_op = 0;
+    session->pending_seq = 0;
+    session->pending_handle = 0;
+    session->pending_out_cap = 0;
     g_current_session = session;
     write_net_response(NET_OP_CONNECT, request->request_seq, NET_STATUS_OK, 0, 0, 0, 0);
     session->last_completed_seq = request->request_seq;
@@ -2162,6 +2290,7 @@ static void handle_net_connect_transfer(u64 transfer_id) {
 
 static int handle_net_request_for_session(struct net_session *session) {
     if (session == 0 || !session->active) return 0;
+    if (session->pending_tcp_read) return 0;
     g_current_session = session;
     volatile struct net_request_header *request = (volatile struct net_request_header *)session->request_va;
     if (request->magic != NET_PROTOCOL_REQUEST_MAGIC || request->version != NET_PROTOCOL_VERSION) {
@@ -2257,7 +2386,23 @@ static int handle_net_request_for_session(struct net_session *session) {
         u32 out_cap = (u32)request->reserved0;
         if (out_cap > NET_PAYLOAD_BYTES) out_cap = NET_PAYLOAD_BYTES;
         const int status = tcp_read(request->arg0, net_response_payload(), out_cap, &out_len);
+        if (status == NET_STATUS_WOULD_BLOCK) {
+            defer_tcp_read_response(session, NET_OP_TCP_READ, seq, request->arg0, out_cap);
+            g_current_session = 0;
+            return 1;
+        }
         write_net_response(NET_OP_TCP_READ, seq, status, status == NET_STATUS_OK ? out_len : 0, out_len, 0, 0);
+    } else if (request->op == NET_OP_TCP_READ_BULK) {
+        u32 out_len = 0;
+        u32 out_cap = (u32)request->reserved0;
+        if (out_cap > NET_TCP_BULK_READ_BYTES) out_cap = NET_TCP_BULK_READ_BYTES;
+        const int status = tcp_read_bulk(request->arg0, session, out_cap, &out_len);
+        if (status == NET_STATUS_WOULD_BLOCK) {
+            defer_tcp_read_response(session, NET_OP_TCP_READ_BULK, seq, request->arg0, out_cap);
+            g_current_session = 0;
+            return 1;
+        }
+        write_net_response(NET_OP_TCP_READ_BULK, seq, status, 0, out_len, 0, 0);
     } else {
         write_net_response(request->op, seq, NET_STATUS_INVALID, 0, 0, 0, 0);
     }
@@ -2272,6 +2417,51 @@ static int handle_net_requests(void) {
         if (handle_net_request_for_session(&g_sessions[i])) processed = 1;
     }
     return processed;
+}
+
+static int pump_net_service_once(u32 rx_budget) {
+    int did_work = 0;
+    did_work |= handle_net_requests();
+    did_work |= poll_tx_queue();
+    const int rx_work = poll_rx_queue_budget(rx_budget);
+    did_work |= rx_work;
+    if (rx_work) did_work |= finish_pending_tcp_reads();
+    did_work |= handle_net_requests();
+    return did_work;
+}
+
+static int has_pending_tcp_read(void) {
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+        if (g_sessions[i].active && g_sessions[i].pending_tcp_read) return 1;
+    }
+    return 0;
+}
+
+static int has_active_tcp_connection(void) {
+    for (u64 i = 0; i < NET_TCP_CONNECTIONS; i++) {
+        if (!g_tcp_connections[i].active) continue;
+        if (g_tcp_connections[i].state == TCP_STATE_ESTABLISHED ||
+            g_tcp_connections[i].state == TCP_STATE_SYN_SENT ||
+            g_tcp_connections[i].state == TCP_STATE_FIN_WAIT) return 1;
+    }
+    return 0;
+}
+
+static int active_poll_net_service(void) {
+    u64 rounds = 0;
+    if (has_pending_tcp_read()) rounds = NET_PENDING_READ_ACTIVE_POLL_ROUNDS;
+    else if (has_active_tcp_connection()) rounds = NET_CONNECTION_ACTIVE_POLL_ROUNDS;
+    else return 0;
+    for (u64 round = 0; round < rounds; round++) {
+        for (u64 i = 0; i < NET_ACTIVE_POLL_PAUSE; i++) __asm__ volatile("pause");
+        g_net_service_active_poll_rounds++;
+        if (pump_net_service_once(64)) {
+            g_net_service_active_poll_hits++;
+            return 1;
+        }
+    }
+    g_net_service_active_poll_misses++;
+    return 0;
 }
 
 void virtio_net_main(void) {
@@ -2291,12 +2481,11 @@ void virtio_net_main(void) {
     send_dhcp_discover();
 
     for (;;) {
-        int did_work = 0;
-        did_work |= handle_net_requests();
-        did_work |= poll_tx_queue();
-        did_work |= poll_rx_queue_budget(8);
-        did_work |= handle_net_requests();
-        if (did_work) {
+        if (pump_net_service_once(64)) {
+            g_net_service_work_loops++;
+            continue;
+        }
+        if (active_poll_net_service()) {
             g_net_service_work_loops++;
             continue;
         }

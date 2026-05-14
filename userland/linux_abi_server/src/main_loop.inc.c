@@ -56,10 +56,9 @@ void linux_abi_main(void) {
             g_root_linux_principal_set = 1;
         }
         if (!g_proc) { msg = reply(errno_busy(), 0); continue; }
-        profile_count_syscall(req->nr);
-        (void)syscall0(SYSCALL_GET_TICK_COUNT);
         const int profile_this_syscall = g_proc->profile_enabled != 0;
         const int profile_trace_this_syscall = profile_trace_enabled();
+        if (profile_this_syscall) profile_count_syscall(req->nr);
         const u64 syscall_profile_start_tick = profile_this_syscall ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
         const u64 syscall_trace_start_tick = profile_trace_this_syscall ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
         int syscall_profile_recorded = 0;
@@ -95,6 +94,8 @@ void linux_abi_main(void) {
         case LINUX_SYS_KILL: msg = handle_kill(req); break;
         case LINUX_SYS_FCNTL: msg = handle_fcntl(req); break;
         case LINUX_SYS_FLOCK: msg = handle_flock(req); break;
+        case LINUX_SYS_FSYNC: case LINUX_SYS_FDATASYNC: case LINUX_SYS_SYNCFS: msg = handle_fsync_like(req); break;
+        case LINUX_SYS_SYNC: msg = reply(0, 0); break;
         case LINUX_SYS_STAT: case LINUX_SYS_LSTAT: msg = handle_newfstatat(req, 1); break;
         case LINUX_SYS_FSTAT: msg = handle_fstat(req); break;
         case LINUX_SYS_NEWFSTATAT: msg = handle_newfstatat(req, 0); break;
@@ -127,6 +128,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_BRK: msg = handle_brk(req); break;
         case LINUX_SYS_MPROTECT: msg = handle_mprotect(req); break;
         case LINUX_SYS_MUNMAP: msg = handle_munmap(req); break;
+        case LINUX_SYS_MREMAP: msg = handle_mremap(req); break;
         case LINUX_SYS_ARCH_PRCTL: msg = handle_arch_prctl(req); break;
         case LINUX_SYS_MOUNT: case LINUX_SYS_UMOUNT2: msg = reply(errno_perm(), 0); break;
         case LINUX_SYS_RT_SIGACTION: msg = handle_rt_sigaction(req); break;

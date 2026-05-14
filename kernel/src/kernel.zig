@@ -72,9 +72,9 @@ fn isProcessPrincipal(principal: PrincipalId) bool {
 }
 
 pub const Rights = struct {
-    cpu_read: bool,
-    cpu_write: bool,
-    dma: bool,
+    cpu_read: bool = false,
+    cpu_write: bool = false,
+    dma: bool = false,
     grant: bool = false,
 };
 
@@ -85,11 +85,11 @@ pub const MapProt = struct {
 };
 
 pub const Capability = struct {
-    paddr: u64,
-    rights: Rights,
-    cap_id: u64,
-    root_cap_id: u64,
-    parent_cap_id: u64,
+    paddr: u64 = 0,
+    rights: Rights = .{},
+    cap_id: u64 = 0,
+    root_cap_id: u64 = 0,
+    parent_cap_id: u64 = 0,
 };
 
 pub const EndpointCapability = struct {
@@ -196,35 +196,49 @@ pub const KernelError = error{
 };
 
 pub const CNode = struct {
-    pub const max_caps = 4096;
+    pub const inline_caps = 512;
+    pub const chunk_caps = 512;
+    pub const chunk_pool_count = 512;
+    pub const max_caps = inline_caps + chunk_pool_count * chunk_caps;
+    pub const paddr_index_slots = 65536;
+    const invalid_chunk: u16 = std.math.maxInt(u16);
+    const invalid_index: u32 = std.math.maxInt(u32);
 
-    caps: [max_caps]Capability = undefined,
+    caps: [inline_caps]Capability = [_]Capability{.{}} ** inline_caps,
+    paddr_index: [paddr_index_slots]u32 = [_]u32{invalid_index} ** paddr_index_slots,
+    paddr_index_overflow: bool = false,
+    overflow_head: u16 = invalid_chunk,
     len: usize = 0,
 
     pub fn add(self: *CNode, cap: Capability) KernelError!void {
         if (self.findIndex(cap.paddr) != null) return KernelError.InvalidState;
-        if (self.len >= self.caps.len) {
-            return KernelError.TableFull;
-        }
-        self.caps[self.len] = cap;
-        self.len += 1;
+        try self.putFresh(cap);
     }
 
     pub fn addAssumeFresh(self: *CNode, cap: Capability) KernelError!void {
-        if (self.len >= self.caps.len) {
-            return KernelError.TableFull;
-        }
-        self.caps[self.len] = cap;
+        try self.putFresh(cap);
+    }
+
+    fn putFresh(self: *CNode, cap: Capability) KernelError!void {
+        const slot = try self.slotAtOrAllocate(self.len);
+        slot.* = cap;
+        self.insertPaddrIndex(cap.paddr, self.len);
         self.len += 1;
+    }
+
+    pub fn reset(self: *CNode) void {
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            const next = cap_chunk_pool[chunk_index].next;
+            cap_chunk_pool[chunk_index] = .{};
+            chunk_index = next;
+        }
+        self.* = .{};
     }
 
     pub fn removeByPaddr(self: *CNode, paddr: u64) bool {
         if (self.findIndex(paddr)) |index| {
-            var i = index;
-            while (i + 1 < self.len) : (i += 1) {
-                self.caps[i] = self.caps[i + 1];
-            }
-            self.len -= 1;
+            self.removeIndex(index);
             return true;
         }
         return false;
@@ -232,46 +246,210 @@ pub const CNode = struct {
 
     pub fn find(self: *const CNode, paddr: u64) ?*const Capability {
         if (self.findIndex(paddr)) |index| {
-            return &self.caps[index];
+            return self.slotAtConst(index);
         }
         return null;
     }
 
     pub fn findByCapId(self: *const CNode, cap_id: u64) ?*const Capability {
         if (self.findIndexByCapId(cap_id)) |index| {
-            return &self.caps[index];
+            return self.slotAtConst(index);
         }
         return null;
     }
 
     pub fn removeByCapId(self: *CNode, cap_id: u64) bool {
         if (self.findIndexByCapId(cap_id)) |index| {
-            var i = index;
-            while (i + 1 < self.len) : (i += 1) {
-                self.caps[i] = self.caps[i + 1];
-            }
-            self.len -= 1;
+            self.removeIndex(index);
             return true;
         }
         return false;
     }
 
+    pub fn removeExclusiveRootByPaddr(self: *CNode, paddr: u64) KernelError!void {
+        const index = self.findIndex(paddr) orelse return KernelError.CapabilityNotFound;
+        const cap = (self.slotAtConst(index) orelse return KernelError.CapabilityNotFound).*;
+        if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) return KernelError.InvalidState;
+        self.removeIndex(index);
+    }
+
+    pub fn get(self: *const CNode, index: usize) ?Capability {
+        if (index >= self.len) return null;
+        return (self.slotAtConst(index) orelse return null).*;
+    }
+
+    fn removeIndex(self: *CNode, index: usize) void {
+        if (index >= self.len) return;
+        const last_index = self.len - 1;
+        const removed = (self.slotAtConst(index) orelse return).*;
+        self.removePaddrIndex(removed.paddr);
+        if (index != last_index) {
+            const last = (self.slotAtConst(last_index) orelse return).*;
+            self.removePaddrIndex(last.paddr);
+            (self.slotAt(index) orelse return).* = last;
+            self.insertPaddrIndex(last.paddr, index);
+        }
+        self.len -= 1;
+        if (self.slotAt(self.len)) |slot| slot.* = .{};
+    }
+
     fn findIndex(self: *const CNode, paddr: u64) ?usize {
+        if (self.findIndexByPaddrIndex(paddr)) |index| return index;
+        if (!self.paddr_index_overflow) return null;
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
-            if (self.caps[i].paddr == paddr) return i;
+            const cap = self.slotAtConst(i) orelse return null;
+            if (cap.paddr == paddr) return i;
         }
         return null;
+    }
+
+    fn paddrHash(paddr: u64) usize {
+        const page = paddr >> 12;
+        const mixed = page *% 11400714819323198485;
+        return @intCast(mixed & @as(u64, paddr_index_slots - 1));
+    }
+
+    fn probeDistance(home: usize, slot: usize) usize {
+        return (slot + paddr_index_slots - home) & (paddr_index_slots - 1);
+    }
+
+    fn findIndexByPaddrIndex(self: *const CNode, paddr: u64) ?usize {
+        var slot = paddrHash(paddr);
+        var probes: usize = 0;
+        while (probes < paddr_index_slots) : (probes += 1) {
+            const stored = self.paddr_index[slot];
+            if (stored == invalid_index) return null;
+            const index: usize = @intCast(stored);
+            if (index < self.len) {
+                const cap = self.slotAtConst(index) orelse return null;
+                if (cap.paddr == paddr) return index;
+            }
+            slot = (slot + 1) & (paddr_index_slots - 1);
+        }
+        return null;
+    }
+
+    fn insertPaddrIndex(self: *CNode, paddr: u64, index: usize) void {
+        if (index > std.math.maxInt(u32)) {
+            self.paddr_index_overflow = true;
+            return;
+        }
+        var slot = paddrHash(paddr);
+        var probes: usize = 0;
+        while (probes < paddr_index_slots) : (probes += 1) {
+            if (self.paddr_index[slot] == invalid_index) {
+                self.paddr_index[slot] = @intCast(index);
+                return;
+            }
+            slot = (slot + 1) & (paddr_index_slots - 1);
+        }
+        self.paddr_index_overflow = true;
+    }
+
+    fn removePaddrIndex(self: *CNode, paddr: u64) void {
+        var slot = paddrHash(paddr);
+        var probes: usize = 0;
+        while (probes < paddr_index_slots) : (probes += 1) {
+            const stored = self.paddr_index[slot];
+            if (stored == invalid_index) return;
+            const index: usize = @intCast(stored);
+            if (index < self.len) {
+                if (self.slotAtConst(index)) |cap| {
+                    if (cap.paddr == paddr) {
+                        self.removePaddrIndexSlot(slot);
+                        return;
+                    }
+                }
+            }
+            slot = (slot + 1) & (paddr_index_slots - 1);
+        }
+    }
+
+    fn removePaddrIndexSlot(self: *CNode, remove_slot: usize) void {
+        var hole = remove_slot;
+        var slot = (hole + 1) & (paddr_index_slots - 1);
+        while (self.paddr_index[slot] != invalid_index) {
+            const index: usize = @intCast(self.paddr_index[slot]);
+            const cap = self.slotAtConst(index) orelse break;
+            const home = paddrHash(cap.paddr);
+            if (probeDistance(home, slot) > probeDistance(home, hole)) {
+                self.paddr_index[hole] = self.paddr_index[slot];
+                hole = slot;
+            }
+            slot = (slot + 1) & (paddr_index_slots - 1);
+        }
+        self.paddr_index[hole] = invalid_index;
     }
 
     fn findIndexByCapId(self: *const CNode, cap_id: u64) ?usize {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
-            if (self.caps[i].cap_id == cap_id) return i;
+            const cap = self.slotAtConst(i) orelse return null;
+            if (cap.cap_id == cap_id) return i;
         }
         return null;
     }
+
+    fn slotAt(self: *CNode, index: usize) ?*Capability {
+        if (index < inline_caps) return &self.caps[index];
+        var remaining = index - inline_caps;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_caps) return &cap_chunk_pool[chunk_index].caps[remaining];
+            remaining -= chunk_caps;
+            chunk_index = cap_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAtConst(self: *const CNode, index: usize) ?*const Capability {
+        if (index < inline_caps) return &self.caps[index];
+        var remaining = index - inline_caps;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_caps) return &cap_chunk_pool[chunk_index].caps[remaining];
+            remaining -= chunk_caps;
+            chunk_index = cap_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAtOrAllocate(self: *CNode, index: usize) KernelError!*Capability {
+        if (index < inline_caps) return &self.caps[index];
+        const needed_chunk_offset = (index - inline_caps) / chunk_caps;
+        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
+        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocCapChunk();
+
+        var chunk_index = self.overflow_head;
+        var offset: usize = 0;
+        while (offset < needed_chunk_offset) : (offset += 1) {
+            if (cap_chunk_pool[chunk_index].next == invalid_chunk) {
+                cap_chunk_pool[chunk_index].next = try allocCapChunk();
+            }
+            chunk_index = cap_chunk_pool[chunk_index].next;
+        }
+        return &cap_chunk_pool[chunk_index].caps[(index - inline_caps) % chunk_caps];
+    }
 };
+
+const CapChunk = struct {
+    used: bool = false,
+    next: u16 = CNode.invalid_chunk,
+    caps: [CNode.chunk_caps]Capability = [_]Capability{.{}} ** CNode.chunk_caps,
+};
+
+var cap_chunk_pool: [CNode.chunk_pool_count]CapChunk = [_]CapChunk{.{}} ** CNode.chunk_pool_count;
+
+fn allocCapChunk() KernelError!u16 {
+    var i: usize = 0;
+    while (i < cap_chunk_pool.len) : (i += 1) {
+        if (cap_chunk_pool[i].used) continue;
+        cap_chunk_pool[i] = .{ .used = true };
+        return @intCast(i);
+    }
+    return KernelError.TableFull;
+}
 
 pub const EndpointCNode = struct {
     const max_caps = 8;
@@ -623,7 +801,6 @@ pub const FreePageList = struct {
     }
 
     pub fn appendPage(self: *FreePageList, region_id: u64, paddr: u64) KernelError!void {
-        // 直前 range と「同じ region かつ物理的に連続」の場合は range を延長する。
         if (self.range_len > 0) {
             const last = &self.ranges[self.range_len - 1];
             const expected_next = last.physical_start + (@as(u64, last.len) * 4096);
@@ -775,7 +952,7 @@ const IommuNoCapDriverState = struct {
 
 pub const KernelState = struct {
     pub const max_regions = 256;
-    const max_total_caps = principal_count * CNode.max_caps;
+    const max_total_caps = 65536;
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
@@ -1060,7 +1237,7 @@ pub const KernelState = struct {
     }
 
     fn clearPrincipalTablesForReuse(self: *KernelState, index: usize) void {
-        self.cap_tables[index] = .{};
+        self.cap_tables[index].reset();
         self.endpoint_tables[index] = .{};
         self.cap_mailboxes[index] = .{};
         self.pending_page_transfers[index] = null;
@@ -1215,7 +1392,7 @@ pub const KernelState = struct {
     fn clearPrincipalState(self: *KernelState) void {
         var i: usize = 0;
         while (i < principal_count) : (i += 1) {
-            self.cap_tables[i] = .{};
+            self.cap_tables[i].reset();
             self.endpoint_tables[i] = .{};
             self.cap_mailboxes[i] = .{};
             self.pending_page_transfers[i] = null;
@@ -1800,20 +1977,28 @@ pub const KernelState = struct {
         return false;
     }
 
+    pub fn anyOtherPrincipalHasPageCap(self: *const KernelState, owner: PrincipalId, paddr: u64) bool {
+        const owner_index = self.principalStorageIndex(owner);
+        var pidx: usize = 0;
+        while (pidx < principal_count) : (pidx += 1) {
+            if (pidx == owner_index) continue;
+            if (self.cap_tables[pidx].find(paddr) != null) return true;
+        }
+        return false;
+    }
+
     pub fn allocPage(
         self: *KernelState,
         requester: PrincipalId,
         free_list: *FreePageList,
     ) KernelError!PageCapability {
         _ = requester;
+        _ = self;
         const user_mappable_paddr_limit: u64 = 4 * 1024 * 1024 * 1024;
-        while (true) {
-            const paddr = try free_list.popFrontBelow(user_mappable_paddr_limit);
-            if (self.anyPrincipalHasPageCap(paddr)) continue;
-            return .{
-                .paddr = paddr,
-            };
-        }
+        const paddr = try free_list.popFrontBelow(user_mappable_paddr_limit);
+        return .{
+            .paddr = paddr,
+        };
     }
 
     pub fn allocPageTo(
@@ -1823,7 +2008,7 @@ pub const KernelState = struct {
     ) KernelError!PageCapability {
         try self.requireActiveProcess(requester);
         const table = self.getTable(requester);
-        if (table.len >= table.caps.len) return KernelError.TableFull;
+        if (table.len >= CNode.max_caps) return KernelError.TableFull;
         const cap = try self.allocPage(requester, free_list);
         if (self.debug_alloc_page_hook) |hook| {
             hook(self, requester, .after_pop, cap.paddr);
@@ -1870,6 +2055,20 @@ pub const KernelState = struct {
             .shared, .none => return KernelError.InvalidState,
         }
         _ = table.removeByPaddr(paddr);
+        self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
+        try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
+        try free_list.appendPage(0, paddr);
+    }
+
+    pub fn reclaimScannedExclusiveRootPage(
+        self: *KernelState,
+        owner: PrincipalId,
+        paddr: u64,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        if (!free_list.canAppendPage(0, paddr)) return KernelError.TooManyFreeRanges;
+        const table = self.getTable(owner);
+        try table.removeExclusiveRootByPaddr(paddr);
         self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
         try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
         try free_list.appendPage(0, paddr);
@@ -2224,7 +2423,7 @@ pub const KernelState = struct {
                 const table = &self.cap_tables[pidx];
                 var i: usize = 0;
                 while (i < table.len) : (i += 1) {
-                    const cap = table.caps[i];
+                    const cap = table.get(i) orelse break;
                     if (cap.parent_cap_id != current_id) continue;
                     var known = false;
                     var q: usize = 0;

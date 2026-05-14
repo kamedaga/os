@@ -47,12 +47,18 @@ pub fn currentUserSpace() *UserAddressSpace {
 }
 
 fn findUserPtSlotForPd(space: *const UserAddressSpace, pd_index: usize) ?usize {
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         if (space.pt_page_pd_index[slot] == UserAddressSpace.no_pd_index) continue;
         if (space.pt_page_pd_index[slot] == pd_index) return slot;
     }
     return null;
+}
+
+fn ptSlotScanLimit(space: *const UserAddressSpace) usize {
+    const used_len = @min(@as(usize, @intCast(space.pt_page_used_len)), UserAddressSpace.max_dynamic_pt_pages);
+    return if (used_len == 0) UserAddressSpace.max_dynamic_pt_pages else used_len;
 }
 
 fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde: u64) void {
@@ -172,6 +178,128 @@ pub fn mapUserLinearRegionWithProt(
         const pt_index: usize = @intCast((va >> 12) & 0x1FF);
         const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
         pt_page[pt_index] = paddr | pte_flags;
+    }
+
+    return true;
+}
+
+pub fn mapUserPageCapabilitiesWithProt(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    pages: []const kernel.PageCapability,
+    prot: kernel.MapProt,
+) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (pages.len == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const page_count_u64: u64 = @intCast(pages.len);
+    const size_u64 = page_count_u64 * 4096;
+    const map_end_va, const overflow = @addWithOverflow(va_start, size_u64 - 1);
+    if (overflow != 0) return false;
+
+    const user_pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
+    const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);
+    const start_pdp: usize = @intCast((va_start >> 30) & 0x1FF);
+    const end_pml4: usize = @intCast((map_end_va >> 39) & 0x1FF);
+    const end_pdp: usize = @intCast((map_end_va >> 30) & 0x1FF);
+    if (start_pml4 != 0 or end_pml4 != 0) return false;
+    if (start_pdp != user_pdp_index or end_pdp != user_pdp_index) return false;
+
+    var page_index: usize = 0;
+    while (page_index < pages.len) : (page_index += 1) {
+        const paddr = pages[page_index].paddr;
+        if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
+        const cap = state.getTableConst(principal).find(paddr) orelse return false;
+        if (!cap.rights.cpu_read) return false;
+        if (prot.write and !cap.rights.cpu_write) return false;
+
+        var previous_index: usize = 0;
+        while (previous_index < page_index) : (previous_index += 1) {
+            if (pages[previous_index].paddr == paddr) return false;
+        }
+
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = ensureUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const old_entry = pt_page[pt_index];
+        if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
+    }
+    if (!capability.reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
+
+    page_index = 0;
+    while (page_index < pages.len) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = ensureUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        pt_page[pt_index] = pages[page_index].paddr | pte_flags;
+    }
+
+    return true;
+}
+
+pub fn mapFreshUserPageCapabilitiesWithProt(
+    state: *const kernel.KernelState,
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    pages: []const kernel.PageCapability,
+    cap_table_start_index: usize,
+    prot: kernel.MapProt,
+) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (pages.len == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const page_count_u64: u64 = @intCast(pages.len);
+    const size_u64 = page_count_u64 * 4096;
+    const map_end_va, const overflow = @addWithOverflow(va_start, size_u64 - 1);
+    if (overflow != 0) return false;
+
+    const user_pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
+    const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);
+    const start_pdp: usize = @intCast((va_start >> 30) & 0x1FF);
+    const end_pml4: usize = @intCast((map_end_va >> 39) & 0x1FF);
+    const end_pdp: usize = @intCast((map_end_va >> 30) & 0x1FF);
+    if (start_pml4 != 0 or end_pml4 != 0) return false;
+    if (start_pdp != user_pdp_index or end_pdp != user_pdp_index) return false;
+
+    const table = state.getTableConst(principal);
+    var page_index: usize = 0;
+    while (page_index < pages.len) : (page_index += 1) {
+        const paddr = pages[page_index].paddr;
+        if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
+        const cap = table.get(cap_table_start_index + page_index) orelse return false;
+        if (cap.paddr != paddr) return false;
+        if (!cap.rights.cpu_read) return false;
+        if (prot.write and !cap.rights.cpu_write) return false;
+
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = ensureUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const old_entry = pt_page[pt_index];
+        if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
+    }
+    if (!capability.reserveUserMapping(principal, va_start, page_count_u64, .fresh_page, prot.write)) return false;
+
+    page_index = 0;
+    while (page_index < pages.len) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = ensureUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        pt_page[pt_index] = pages[page_index].paddr | pte_flags;
     }
 
     return true;
@@ -317,8 +445,9 @@ pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
 
     const user_pdp_index: u64 = (h.user_va >> 30) & 0x1FF;
     var removed: usize = 0;
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         const pd_index_meta = space.pt_page_pd_index[slot];
         if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
         const pd_index: usize = @intCast(pd_index_meta);
@@ -345,8 +474,9 @@ pub fn collectUserMappedPaddrs(principal: kernel.PrincipalId, out_paddrs: []u64)
     const h = hooks orelse return 0;
     const space = getUserSpace(principal) orelse return 0;
     var count: usize = 0;
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         if (space.pt_page_pd_index[slot] == UserAddressSpace.no_pd_index) continue;
         const pt_page: *const [512]u64 = &space.pt_pages[slot];
         var pt_index: usize = 0;
@@ -384,8 +514,9 @@ pub fn forEachUserMappedPage(principal: kernel.PrincipalId, context: *anyopaque,
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const user_pdp_index: u64 = (h.user_va >> 30) & 0x1FF;
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         const pd_index_meta = space.pt_page_pd_index[slot];
         if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
         const pd_index: usize = @intCast(pd_index_meta);
@@ -415,8 +546,9 @@ pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []Mapped
     const space = getUserSpace(principal) orelse return 0;
     const user_pdp_index: u64 = (h.user_va >> 30) & 0x1FF;
     var count: usize = 0;
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         const pd_index_meta = space.pt_page_pd_index[slot];
         if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
         const pd_index: usize = @intCast(pd_index_meta);

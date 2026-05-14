@@ -88,7 +88,7 @@ enum {
     FS_RESPONSE_HEADER_BYTES = 72,
     FS_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - FS_RESPONSE_HEADER_BYTES,
     FS_BULK_READ_INITIAL_PAGE_COUNT = 16,
-    FS_BULK_READ_PAGE_COUNT = 128,
+    FS_BULK_READ_PAGE_COUNT = 16,
     FS_BULK_READ_BYTES = FS_BULK_READ_PAGE_COUNT * PAGE_BYTES,
     FS_STAT_RECORD_BYTES = 56,
     FS_DIRENT_RECORD_BYTES = 24,
@@ -104,6 +104,7 @@ enum {
     FS_OP_UNLINK = 24,
     FS_OP_RENAME = 25,
     FS_OP_READ_BULK = 27,
+    FS_OP_WRITE_BULK = 29,
     FS_OP_OPEN_EXEC = 32,
     FS_STATUS_OK = 0,
     FS_STATUS_INVALID = 1,
@@ -151,6 +152,7 @@ enum {
     NET_OP_TCP_CONNECT = 8,
     NET_OP_TCP_WRITE = 9,
     NET_OP_TCP_READ = 10,
+    NET_OP_TCP_READ_BULK = 11,
     NET_POLL_READABLE = 1 << 0,
     NET_POLL_WRITABLE = 1 << 2,
     NET_STATUS_OK = 0,
@@ -168,6 +170,8 @@ enum {
     NET_UDP_MAX_PAYLOAD = 1200,
     NET_TCP_MAX_PAYLOAD = 1200,
     NET_TCP_READ_BYTES = NET_RESPONSE_PAYLOAD_BYTES,
+    NET_TCP_BULK_READ_PAGE_COUNT = 16,
+    NET_TCP_BULK_READ_BYTES = NET_TCP_BULK_READ_PAGE_COUNT * PAGE_BYTES,
 
     LINUX_SYS_READ = 0,
     LINUX_SYS_WRITE = 1,
@@ -191,6 +195,7 @@ enum {
     LINUX_SYS_ACCESS = 21,
     LINUX_SYS_PIPE = 22,
     LINUX_SYS_SELECT = 23,
+    LINUX_SYS_MREMAP = 25,
     LINUX_SYS_MADVISE = 28,
     LINUX_SYS_DUP = 32,
     LINUX_SYS_DUP2 = 33,
@@ -216,6 +221,8 @@ enum {
     LINUX_SYS_UNAME = 63,
     LINUX_SYS_FCNTL = 72,
     LINUX_SYS_FLOCK = 73,
+    LINUX_SYS_FSYNC = 74,
+    LINUX_SYS_FDATASYNC = 75,
     LINUX_SYS_GETCWD = 79,
     LINUX_SYS_CHDIR = 80,
     LINUX_SYS_RENAME = 82,
@@ -242,6 +249,7 @@ enum {
     LINUX_SYS_EXECVE = 59,
     LINUX_SYS_EXIT = 60,
     LINUX_SYS_ARCH_PRCTL = 158,
+    LINUX_SYS_SYNC = 162,
     LINUX_SYS_MOUNT = 165,
     LINUX_SYS_UMOUNT2 = 166,
     LINUX_SYS_GETTID = 186,
@@ -267,6 +275,7 @@ enum {
     LINUX_SYS_DUP3 = 292,
     LINUX_SYS_PIPE2 = 293,
     LINUX_SYS_PRLIMIT64 = 302,
+    LINUX_SYS_SYNCFS = 306,
     LINUX_SYS_GETRANDOM = 318,
     LINUX_SYS_RENAMEAT2 = 316,
     LINUX_SYS_MEMBARRIER = 324,
@@ -559,6 +568,11 @@ struct net_client_state {
     u64 response_token;
     struct local_mapping request_map;
     struct local_mapping response_map;
+    struct local_mapping bulk_map;
+    u64 bulk_paddrs[NET_TCP_BULK_READ_PAGE_COUNT];
+    u64 bulk_tokens[NET_TCP_BULK_READ_PAGE_COUNT];
+    u64 bulk_remote_tokens[NET_TCP_BULK_READ_PAGE_COUNT];
+    u16 bulk_page_count;
     u64 next_seq;
     u64 session_nonce;
 };
@@ -702,7 +716,7 @@ struct linux_abi_bootstrap_config {
     char exec_path[128];
 };
 
-enum { LINUX_SYSCALL_PROFILE_COUNT = 335, FS_PROFILE_OP_COUNT = 33, NET_PROFILE_OP_COUNT = 11 };
+enum { LINUX_SYSCALL_PROFILE_COUNT = 335, FS_PROFILE_OP_COUNT = 33, NET_PROFILE_OP_COUNT = 12 };
 struct linux_abi_profile {
     u64 syscall_total;
     u64 syscall_counts[LINUX_SYSCALL_PROFILE_COUNT + 1];
@@ -732,6 +746,12 @@ struct linux_abi_profile {
     u64 mmap_file_calls;
     u64 mmap_file_pages;
     u64 mmap_file_bytes;
+    u64 mmap_bucket_calls[5];
+    u64 mmap_bucket_pages[5];
+    u64 munmap_calls;
+    u64 munmap_pages;
+    u64 munmap_bucket_calls[5];
+    u64 munmap_bucket_pages[5];
     u64 mprotect_calls;
     u64 mprotect_pages;
     u64 brk_calls;
@@ -743,8 +763,20 @@ struct linux_abi_profile {
     u64 net_wait_loops;
     u64 net_wait_timeouts;
     u64 net_wait_slow;
+    u64 net_wait_op_calls[NET_PROFILE_OP_COUNT];
+    u64 net_wait_op_loops[NET_PROFILE_OP_COUNT];
+    u64 net_wait_op_timeouts[NET_PROFILE_OP_COUNT];
+    u64 net_wait_op_slow[NET_PROFILE_OP_COUNT];
     u64 net_tcp_connect_attempts;
     u64 net_tcp_connect_poll_loops;
+    u64 net_tcp_prefetch_attempts;
+    u64 net_tcp_prefetch_ready_hits;
+    u64 net_tcp_prefetch_bytes;
+    u64 net_tcp_prefetch_consumed;
+    u64 net_tcp_prefetch_eof;
+    u64 net_tcp_bulk_cap_pages;
+    u64 net_tcp_bulk_cap_ticks;
+    u64 net_tcp_bulk_copy_ticks;
     u64 poll_calls;
     u64 poll_wait_loops;
     u64 select_calls;

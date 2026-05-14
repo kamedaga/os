@@ -33,6 +33,7 @@ pub const UserAddressSpace = struct {
     pt_page_used_len: u16 = 0,
     reservations: [max_reservations]Reservation = [_]Reservation{.{}} ** max_reservations,
     reservation_generation: u32 = 0,
+    next_dynamic_map_page: u64 = 0,
     cr3: u64 = 0,
 };
 
@@ -202,6 +203,7 @@ fn pageAlignDown(addr: u64) u64 {
 pub fn resetUserReservations(space: *UserAddressSpace) void {
     @memset(space.reservations[0..], .{});
     space.reservation_generation = 0;
+    space.next_dynamic_map_page = 0;
 }
 
 fn reservationEndPage(base_va: u64, page_count: u64) ?u64 {
@@ -242,6 +244,65 @@ fn logReservationOverlap(
     runtime.serial_write("\n");
 }
 
+fn reservationStartPage(reservation: *const UserAddressSpace.Reservation) u64 {
+    return reservation.base_va >> 12;
+}
+
+fn tryMergeUserReservation(
+    space: *UserAddressSpace,
+    base_va: u64,
+    page_count: u64,
+    kind: UserAddressSpace.ReservationKind,
+    writable: bool,
+) bool {
+    const new_start_page = base_va >> 12;
+    const new_end_page = reservationEndPage(base_va, page_count) orelse return false;
+    var merge_index: ?usize = null;
+
+    var index: usize = 0;
+    while (index < UserAddressSpace.max_reservations) : (index += 1) {
+        const reservation = &space.reservations[index];
+        if (!reservation.active or reservation.kind != kind or reservation.writable != writable) continue;
+        const record_start_page = reservationStartPage(reservation);
+        const record_end_page = record_start_page + reservation.page_count;
+        if (record_end_page == new_start_page or new_end_page == record_start_page) {
+            merge_index = index;
+            break;
+        }
+    }
+
+    const target_index = merge_index orelse return false;
+    var target = &space.reservations[target_index];
+    var merged_start_page = @min(new_start_page, reservationStartPage(target));
+    var merged_end_page = @max(new_end_page, reservationStartPage(target) + target.page_count);
+
+    while (true) {
+        const merged_count = merged_end_page - merged_start_page;
+        if (merged_count == 0 or merged_count > std.math.maxInt(u32)) return false;
+
+        target.base_va = merged_start_page << 12;
+        target.page_count = @intCast(merged_count);
+
+        var absorbed = false;
+        index = 0;
+        while (index < UserAddressSpace.max_reservations) : (index += 1) {
+            if (index == target_index) continue;
+            const candidate = &space.reservations[index];
+            if (!candidate.active or candidate.kind != kind or candidate.writable != writable) continue;
+            const candidate_start_page = reservationStartPage(candidate);
+            const candidate_end_page = candidate_start_page + candidate.page_count;
+            if (candidate_end_page != merged_start_page and merged_end_page != candidate_start_page) continue;
+
+            merged_start_page = @min(merged_start_page, candidate_start_page);
+            merged_end_page = @max(merged_end_page, candidate_end_page);
+            candidate.* = .{};
+            absorbed = true;
+            break;
+        }
+        if (!absorbed) return true;
+    }
+}
+
 pub fn canReserveUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
     if (!runtime_ready) return false;
     const space = getUserSpace(principal) orelse return false;
@@ -273,6 +334,7 @@ pub fn reserveUserMapping(
         logReservationOverlap(principal, base_va, page_count, reservation);
         return false;
     }
+    if (tryMergeUserReservation(space, base_va, page_count, kind, writable)) return true;
     for (&space.reservations) |*reservation| {
         if (reservation.active) continue;
         space.reservation_generation +%= 1;
@@ -360,6 +422,36 @@ pub fn releaseUserMapping(principal: kernel.PrincipalId, base_va: u64, page_coun
     return changed;
 }
 
+pub fn userMappingRangeCoveredByKind(
+    principal: kernel.PrincipalId,
+    base_va: u64,
+    page_count: u64,
+    kind: UserAddressSpace.ReservationKind,
+) bool {
+    if (!runtime_ready) return false;
+    if (kind == .none) return false;
+    const space = getUserSpace(principal) orelse return false;
+    const target_end_page = reservationEndPage(base_va, page_count) orelse return false;
+    var cursor_page = base_va >> 12;
+    while (cursor_page < target_end_page) {
+        var next_page = cursor_page;
+        for (&space.reservations) |*reservation| {
+            if (!reservation.active) continue;
+            if (reservation.kind != kind) continue;
+            const record_start_page = reservation.base_va >> 12;
+            if (record_start_page > cursor_page) continue;
+            const record_end_page = record_start_page + reservation.page_count;
+            if (record_end_page <= cursor_page) continue;
+            if (record_end_page > next_page) {
+                next_page = if (record_end_page < target_end_page) record_end_page else target_end_page;
+            }
+        }
+        if (next_page == cursor_page) return false;
+        cursor_page = next_page;
+    }
+    return true;
+}
+
 fn userDynamicMapRange() ?struct { start_page: u64, end_page: u64 } {
     const base = runtime.user_va + 0x0300_0000;
     const layout_end = runtime.user_va + 0x1C00_0000;
@@ -372,12 +464,15 @@ fn userDynamicMapRange() ?struct { start_page: u64, end_page: u64 } {
     return .{ .start_page = start_page, .end_page = end_page };
 }
 
-fn rangeOverlapsActiveReservation(space: *const UserAddressSpace, base_va: u64, page_count: u64) bool {
+fn rangeOverlappingReservationEndPage(space: *const UserAddressSpace, base_va: u64, page_count: u64) ?u64 {
+    var skip_to_page: u64 = 0;
     for (&space.reservations) |*reservation| {
         if (!reservation.active) continue;
-        if (reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) return true;
+        if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
+        const reservation_end_page = reservationStartPage(reservation) + reservation.page_count;
+        if (reservation_end_page > skip_to_page) skip_to_page = reservation_end_page;
     }
-    return false;
+    return if (skip_to_page == 0) null else skip_to_page;
 }
 
 fn rangeHasPresentUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
@@ -389,26 +484,56 @@ fn rangeHasPresentUserMapping(principal: kernel.PrincipalId, base_va: u64, page_
     return false;
 }
 
+fn alignPageForward(page: u64, alignment: u64) u64 {
+    const align_mask = alignment - 1;
+    if ((alignment & align_mask) == 0) return (page + align_mask) & ~align_mask;
+
+    const rem = page % alignment;
+    return if (rem == 0) page else page + alignment - rem;
+}
+
+fn findFreeUserMappingRangeInSpan(
+    principal: kernel.PrincipalId,
+    space: *UserAddressSpace,
+    page_count: u64,
+    alignment: u64,
+    start_page: u64,
+    end_page: u64,
+) ?u64 {
+    var base_page = alignPageForward(start_page, alignment);
+    while (base_page < end_page and page_count <= end_page - base_page) {
+        const base_va = base_page << 12;
+        if (rangeOverlappingReservationEndPage(space, base_va, page_count)) |skip_to_page| {
+            const next_page = if (skip_to_page > base_page) skip_to_page else base_page + 1;
+            base_page = alignPageForward(next_page, alignment);
+            continue;
+        }
+        if (rangeHasPresentUserMapping(principal, base_va, page_count)) {
+            base_page += alignment;
+            continue;
+        }
+        space.next_dynamic_map_page = base_page + page_count;
+        return base_va;
+    }
+    return null;
+}
+
 pub fn findFreeUserMappingRange(principal: kernel.PrincipalId, page_count: u64, align_pages: u64) ?u64 {
     if (!runtime_ready) return null;
     if (page_count == 0) return null;
     const alignment = if (align_pages == 0) @as(u64, 1) else align_pages;
     const space = getUserSpace(principal) orelse return null;
     const range = userDynamicMapRange() orelse return null;
-    var base_page = range.start_page;
-    const align_mask = alignment - 1;
-    if ((alignment & align_mask) == 0) {
-        base_page = (base_page + align_mask) & ~align_mask;
-    } else {
-        const rem = base_page % alignment;
-        if (rem != 0) base_page += alignment - rem;
-    }
+    const cursor_page = if (space.next_dynamic_map_page >= range.start_page and space.next_dynamic_map_page < range.end_page)
+        space.next_dynamic_map_page
+    else
+        range.start_page;
 
-    while (base_page <= range.end_page and page_count <= range.end_page - base_page) : (base_page += alignment) {
-        const base_va = base_page << 12;
-        if (rangeOverlapsActiveReservation(space, base_va, page_count)) continue;
-        if (rangeHasPresentUserMapping(principal, base_va, page_count)) continue;
+    if (findFreeUserMappingRangeInSpan(principal, space, page_count, alignment, cursor_page, range.end_page)) |base_va| {
         return base_va;
+    }
+    if (cursor_page > range.start_page) {
+        return findFreeUserMappingRangeInSpan(principal, space, page_count, alignment, range.start_page, cursor_page);
     }
     return null;
 }
@@ -442,6 +567,11 @@ fn slotHasAnyMappedPaddr(space: *const UserAddressSpace, slot: usize) bool {
         if ((pt_page[i] & runtime.page_addr_mask) != 0) return true;
     }
     return false;
+}
+
+fn ptSlotScanLimit(space: *const UserAddressSpace) usize {
+    const used_len = @min(@as(usize, @intCast(space.pt_page_used_len)), UserAddressSpace.max_dynamic_pt_pages);
+    return if (used_len == 0) UserAddressSpace.max_dynamic_pt_pages else used_len;
 }
 
 fn pdIndexForPtSlot(space: *const UserAddressSpace, slot: usize) ?usize {
@@ -623,8 +753,9 @@ noinline fn clearAliasMappings(
     map_slot: usize,
     pt_index: usize,
 ) void {
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
         const pt_page = &space.pt_pages[slot];
         var i: usize = 0;
@@ -877,8 +1008,9 @@ pub fn dropPresentForUserMappedPaddr(
     if (!runtime_ready) return false;
     const space = getUserSpace(principal) orelse return false;
     _ = state.getTableConst(principal).find(paddr) orelse return false;
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
         const pt_page: *[512]u64 = &space.pt_pages[slot];
         var i: usize = 0;
@@ -903,8 +1035,9 @@ noinline fn syncPageTableRightsScan(
     cap: ?*const kernel.Capability,
 ) void {
     var kept_one = false;
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         const slot_pd_index = pdIndexForPtSlot(space, slot) orelse continue;
         const pt_page: *[512]u64 = &space.pt_pages[slot];
         var i: usize = 0;
@@ -936,8 +1069,9 @@ noinline fn syncPageTableRightsScan(
 pub fn principalHasMappedPaddr(principal: kernel.PrincipalId, paddr: u64) bool {
     if (!runtime_ready) return false;
     const space = getUserSpace(principal) orelse return false;
+    const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+    while (slot < slot_limit) : (slot += 1) {
         const slot_pd_index = pdIndexForPtSlot(space, slot) orelse {
             continue;
         };
@@ -996,7 +1130,7 @@ pub fn dumpPrincipalCaps(state: *const kernel.KernelState, principal: kernel.Pri
 
     var i: usize = 0;
     while (i < table.len) : (i += 1) {
-        const cap = table.caps[i];
+        const cap = table.get(i) orelse break;
         logWrite("  ");
         logHex(cap.paddr);
         logWrite(" id=");
@@ -1127,6 +1261,52 @@ test "findFreeUserMappingRange skips active reservations" {
     try std.testing.expect(reserveUserMapping(.Process0, first, 2, .linear_region, true));
     const second = findFreeUserMappingRange(.Process0, 2, 1).?;
     try std.testing.expectEqual(@as(u64, 0x2300_2000), second);
+    try std.testing.expectEqual(@as(u64, 0x2300_4000 >> 12), spaces[0].next_dynamic_map_page);
+
+    try std.testing.expect(releaseUserMapping(.Process0, first, 2));
+    spaces[0].next_dynamic_map_page = 0x3bff_f000 >> 12;
+    try std.testing.expect(reserveUserMapping(.Process0, 0x3bff_f000, 1, .linear_region, true));
+    const wrapped = findFreeUserMappingRange(.Process0, 2, 1).?;
+    try std.testing.expectEqual(first, wrapped);
+
+    resetUserReservations(&spaces[0]);
+    try std.testing.expectEqual(@as(u64, 0), spaces[0].next_dynamic_map_page);
+}
+
+test "user reservations merge adjacent compatible ranges" {
+    var spaces = [_]UserAddressSpace{.{}} ** 1;
+
+    init(.{
+        .user_spaces = spaces[0..],
+        .user_va = 0,
+        .physical_map_limit = 0x1_0000_0000,
+        .page_entries = 512,
+        .page_addr_mask = 0x000f_ffff_ffff_f000,
+        .page_present = 0x1,
+        .page_rw = 0x2,
+        .page_user = 0x4,
+        .canonical_user_limit_exclusive = 0x0000_8000_0000_0000,
+        .serial_write = testSerialWrite,
+        .print_hex = testPrintHex,
+        .principal_label = testPrincipalLabel,
+        .flush_user_tlb_for_principal_va = testFlushUserTlb,
+    });
+
+    try std.testing.expect(reserveUserMapping(.Process0, 0x4000, 1, .linear_region, true));
+    try std.testing.expect(reserveUserMapping(.Process0, 0x6000, 1, .linear_region, true));
+    try std.testing.expect(reserveUserMapping(.Process0, 0x5000, 1, .linear_region, true));
+
+    var active_count: usize = 0;
+    var merged: ?UserAddressSpace.Reservation = null;
+    for (spaces[0].reservations) |reservation| {
+        if (!reservation.active) continue;
+        active_count += 1;
+        merged = reservation;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), active_count);
+    try std.testing.expectEqual(@as(u64, 0x4000), merged.?.base_va);
+    try std.testing.expectEqual(@as(u32, 3), merged.?.page_count);
 }
 
 test "ipc buffer token encode decode and rights subset" {

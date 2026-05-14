@@ -667,7 +667,7 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
 
 static void reset_exec_runtime_state(void) {
     if (!g_proc) return;
-    g_mmap_next_va = 0x31000000ULL;
+    g_mmap_next_va = 0x29000000ULL;
     g_brk_next_va = 0x38000000ULL;
     for (u64 i = 0; i < VM_REGION_MAX; i++) g_regions[i].used = 0;
 }

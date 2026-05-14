@@ -36,7 +36,7 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
     proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->pgid = principal; proc->principal = principal; init_process_fds(proc);
     proc->exec_pending_principal = 0;
-    proc->mmap_next_va = 0x31000000ULL;
+    proc->mmap_next_va = 0x29000000ULL;
     proc->brk_next_va = 0x38000000ULL;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
     proc->cwd[0] = '/'; proc->cwd[1] = 0; proc->cwd_len = 1;
