@@ -91,6 +91,7 @@ const syscall_set_abi_trap_target_request_page: u64 = trap_abi.syscall_set_abi_t
 const syscall_detach_abi_trap_reply_token: u64 = trap_abi.syscall_detach_abi_trap_reply_token;
 const syscall_share_abi_trap_reply_target_pages_to_target: u64 = trap_abi.syscall_share_abi_trap_reply_target_pages_to_target;
 const syscall_unmap_abi_trap_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_target_pages;
+const syscall_reserve_abi_trap_reply_target_pages: u64 = trap_abi.syscall_reserve_abi_trap_reply_target_pages;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -535,6 +536,7 @@ fn syscallNeedsKernelStateLock(nr: u64) bool {
         syscall_set_abi_trap_target_request_page,
         syscall_share_abi_trap_reply_target_pages_to_target,
         syscall_unmap_abi_trap_target_pages,
+        syscall_reserve_abi_trap_reply_target_pages,
         process_abi.syscall_spawn_exec,
         process_builder_abi.syscall_create_suspended_process,
         process_builder_abi.syscall_map_vm_object_to_process,
@@ -610,6 +612,7 @@ fn kernelExecProfileName(nr: u64) ?[]const u8 {
         syscall_set_abi_trap_target_request_page => "abi_set_target_request_page",
         syscall_share_abi_trap_reply_target_pages_to_target => "abi_share_reply_pages_to_target",
         syscall_unmap_abi_trap_target_pages => "abi_unmap_target_pages",
+        syscall_reserve_abi_trap_reply_target_pages => "abi_reserve_reply_target_pages",
         image_abi.syscall_install_vm_object => "install_vm_object",
         image_abi.syscall_map_vm_object => "map_vm_object",
         image_abi.syscall_install_exec_image => "install_exec_image",
@@ -2160,6 +2163,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         syscall_unmap_abi_trap_target_pages => {
             return abi_trap_runtime.unmapTargetPages(state, proc, frame.rdi, frame.rsi, frame.rdx);
+        },
+        syscall_reserve_abi_trap_reply_target_pages => {
+            return abi_trap_runtime.reserveLazyAnonymousPagesForCurrentReplyTarget(state, frame.rdi, frame.rsi, frame.rdx);
         },
         image_abi.syscall_install_vm_object => {
             var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;

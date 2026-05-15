@@ -1,31 +1,28 @@
 static u64 page_up(u64 value) { return (value + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1); }
 static u64 page_down(u64 value) { return value & ~(u64)(PAGE_BYTES - 1); }
 
-static void vm_merge_adjacent_regions(void) {
+static void vm_merge_region_at(u64 slot) {
+    if (slot >= VM_REGION_MAX || !g_regions[slot].used) return;
     int changed = 1;
     while (changed) {
         changed = 0;
-        for (u64 i = 0; i < VM_REGION_MAX; i++) {
-            if (!g_regions[i].used) continue;
-            const u64 i_end = g_regions[i].start + g_regions[i].size;
-            for (u64 j = 0; j < VM_REGION_MAX; j++) {
-                if (i == j || !g_regions[j].used || g_regions[i].prot != g_regions[j].prot) continue;
-                if (i_end == g_regions[j].start) {
-                    g_regions[i].size += g_regions[j].size;
-                    g_regions[j].used = 0;
-                    changed = 1;
-                    break;
-                }
-                const u64 j_end = g_regions[j].start + g_regions[j].size;
-                if (j_end == g_regions[i].start) {
-                    g_regions[i].start = g_regions[j].start;
-                    g_regions[i].size += g_regions[j].size;
-                    g_regions[j].used = 0;
-                    changed = 1;
-                    break;
-                }
+        const u64 slot_end = g_regions[slot].start + g_regions[slot].size;
+        for (u64 j = 0; j < VM_REGION_MAX; j++) {
+            if (slot == j || !g_regions[j].used || g_regions[slot].prot != g_regions[j].prot) continue;
+            if (slot_end == g_regions[j].start) {
+                g_regions[slot].size += g_regions[j].size;
+                g_regions[j].used = 0;
+                changed = 1;
+                break;
             }
-            if (changed) break;
+            const u64 j_end = g_regions[j].start + g_regions[j].size;
+            if (j_end == g_regions[slot].start) {
+                g_regions[slot].start = g_regions[j].start;
+                g_regions[slot].size += g_regions[j].size;
+                g_regions[j].used = 0;
+                changed = 1;
+                break;
+            }
         }
     }
 }
@@ -35,20 +32,20 @@ static int vm_add_region(u64 start, u64 size, u64 prot) {
         if (!g_regions[i].used || g_regions[i].prot != prot) continue;
         if (g_regions[i].start + g_regions[i].size == start) {
             g_regions[i].size += size;
-            vm_merge_adjacent_regions();
+            vm_merge_region_at(i);
             return 1;
         }
         if (start + size == g_regions[i].start) {
             g_regions[i].start = start;
             g_regions[i].size += size;
-            vm_merge_adjacent_regions();
+            vm_merge_region_at(i);
             return 1;
         }
     }
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
         if (!g_regions[i].used) {
             g_regions[i].used = 1; g_regions[i].start = start; g_regions[i].size = size; g_regions[i].prot = prot;
-            vm_merge_adjacent_regions();
+            vm_merge_region_at(i);
             return 1;
         }
     }
@@ -218,6 +215,21 @@ static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot) {
     return apply_target_pages(start, page_count, prot, map_reply_target_pages);
 }
 
+static u64 reserve_target_pages_chunked(u64 start, u64 page_count, u64 prot) {
+    if (page_count <= 64) return reserve_reply_target_pages(start, page_count, prot);
+    return apply_target_pages(start, page_count, prot, reserve_reply_target_pages);
+}
+
+static int has_thread_group_peers(void) {
+    if (!g_proc || g_proc->pid == 0) return 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *peer = &g_processes[i];
+        if (!peer->used || peer == g_proc || peer->exec_pending || peer->principal == 0 || peer->pid != g_proc->pid) continue;
+        return 1;
+    }
+    return 0;
+}
+
 static u64 vm_page_count_bucket(u64 page_count) {
     if (page_count <= 1) return 0;
     if (page_count <= 4) return 1;
@@ -348,11 +360,12 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     }
     if ((flags & MAP_FIXED_NOREPLACE) != 0 && vm_range_covered(target_va, size)) return reply(errno_exist(), 0);
     if ((flags & MAP_FIXED) != 0 && !unmap_overlapping_target_range(target_va, size)) return reply(errno_nomem(), 0);
-    u64 map_status = map_target_pages_chunked(target_va, page_count, map_prot);
+    const int lazy_anon = !file_backed && !has_thread_group_peers();
+    u64 map_status = lazy_anon ? reserve_target_pages_chunked(target_va, page_count, map_prot) : map_target_pages_chunked(target_va, page_count, map_prot);
     if (map_status == SYSCALL_ERR_MAP && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) {
         g_mmap_next_va = target_va + size;
         target_va = find_mmap_area(size);
-        if (target_va != 0) map_status = map_target_pages_chunked(target_va, page_count, map_prot);
+        if (target_va != 0) map_status = lazy_anon ? reserve_target_pages_chunked(target_va, page_count, map_prot) : map_target_pages_chunked(target_va, page_count, map_prot);
     }
     if (map_status == SYSCALL_OK) {
         if (file_backed) {
@@ -368,12 +381,14 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
                 }
             }
         }
-        const u64 share_prot = file_backed ? prot : map_prot;
-        const u64 share_status = share_target_pages_to_thread_group(target_va, page_count, share_prot);
-        if (share_status != SYSCALL_OK) {
-            user_log("LinuxAbiServer: mmap thread-group share failed\n");
-            user_log_hex_value(share_status);
-            return reply(errno_nomem(), 0);
+        if (!lazy_anon) {
+            const u64 share_prot = file_backed ? prot : map_prot;
+            const u64 share_status = share_target_pages_to_thread_group(target_va, page_count, share_prot);
+            if (share_status != SYSCALL_OK) {
+                user_log("LinuxAbiServer: mmap thread-group share failed\n");
+                user_log_hex_value(share_status);
+                return reply(errno_nomem(), 0);
+            }
         }
         if (!vm_add_region(target_va, size, prot)) {
             user_log("LinuxAbiServer: mmap vm_add_region failed\n");

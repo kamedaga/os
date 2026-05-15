@@ -2154,6 +2154,7 @@ static int poll_rx_queue_budget(u32 budget) {
                 }
             }
             parse_ethernet_frame(src + offset, packet_len - offset, checksum_complete);
+            (void)finish_pending_tcp_reads();
         }
         queue_push_avail(&g_rx_queue, desc_index);
     }

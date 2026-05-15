@@ -46,6 +46,7 @@ pub const syscall_set_abi_trap_target_request_page: u64 = 0x57;
 pub const syscall_detach_abi_trap_reply_token: u64 = 0x59;
 pub const syscall_share_abi_trap_reply_target_pages_to_target: u64 = 0x5A;
 pub const syscall_unmap_abi_trap_target_pages: u64 = 0x5B;
+pub const syscall_reserve_abi_trap_reply_target_pages: u64 = 0x63;
 pub const abi_trap_copy_max_bytes: usize = 4096;
 
 pub const TrapRequest = extern struct {

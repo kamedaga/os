@@ -28,6 +28,9 @@ const ProfileSlot = struct {
 };
 
 const AbiTrapProfile = struct {
+    lazy_reserve: ProfileSlot = .{},
+    lazy_fault: ProfileSlot = .{},
+    lazy_copy_fault: ProfileSlot = .{},
     unmap_collect: ProfileSlot = .{},
     unmap_collected_mismatch: ProfileSlot = .{},
     unmap_cap_scan: ProfileSlot = .{},
@@ -40,6 +43,17 @@ const AbiTrapProfile = struct {
 };
 
 var abi_trap_profile: AbiTrapProfile = .{};
+
+const lazy_anon_region_capacity: usize = 2048;
+const lazy_fault_cluster_max_pages: usize = boot_static.syscall_batch_max_pages;
+const LazyAnonRegion = struct {
+    active: bool = false,
+    proc: kernel.PrincipalId = @enumFromInt(0),
+    start: u64 = 0,
+    page_count: u64 = 0,
+    prot: kernel.MapProt = .{ .read = false, .write = false, .exec = false },
+};
+var lazy_anon_regions: [lazy_anon_region_capacity]LazyAnonRegion = [_]LazyAnonRegion{.{}} ** lazy_anon_region_capacity;
 
 const AbiTrapSpinLock = struct {
     value: u8 = 0,
@@ -93,6 +107,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_lookup_log_count), &dispatch_delegate_lookup_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_backpressure_log_count), &dispatch_delegate_backpressure_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_profile), &abi_trap_profile));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lazy_anon_regions), &lazy_anon_regions));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_lock), &dispatch_delegate_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_storage), &abi_trap_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_ready), &abi_trap_hooks_ready));
@@ -149,6 +164,9 @@ fn profileReportSlot(
 
 pub fn profileReport(write: *const fn ([]const u8) void, print_number: *const fn (u64) void) void {
     write("AbiTrapProfile.begin\n");
+    profileReportSlot(write, print_number, "lazy_reserve", abi_trap_profile.lazy_reserve);
+    profileReportSlot(write, print_number, "lazy_fault", abi_trap_profile.lazy_fault);
+    profileReportSlot(write, print_number, "lazy_copy_fault", abi_trap_profile.lazy_copy_fault);
     profileReportSlot(write, print_number, "unmap_collect", abi_trap_profile.unmap_collect);
     profileReportSlot(write, print_number, "unmap_collected_mismatch", abi_trap_profile.unmap_collected_mismatch);
     profileReportSlot(write, print_number, "unmap_cap_scan", abi_trap_profile.unmap_cap_scan);
@@ -329,7 +347,9 @@ fn copyBetweenPrincipals(h: *const Hooks, src_proc: kernel.PrincipalId, src_va: 
     if (len == 0) return 0;
     var scratch: [trap_abi.abi_trap_copy_max_bytes]u8 = undefined;
     const bytes = scratch[0..len];
+    if (!ensureLazyAnonymousRangeMapped(h, src_proc, src_va, len_u64, false)) return boot_static.syscall_err_invalid;
     if (!h.copy_user_bytes_from_va(src_proc, src_va, bytes)) return boot_static.syscall_err_invalid;
+    if (!ensureLazyAnonymousRangeMapped(h, dst_proc, dst_va, len_u64, true)) return boot_static.syscall_err_invalid;
     if (!h.copy_bytes_to_user_va(dst_proc, dst_va, bytes)) return boot_static.syscall_err_invalid;
     return len_u64;
 }
@@ -397,6 +417,208 @@ fn pageBatchByteLen(target_va: u64, page_count: u64) ?usize {
     return @intCast(page_count * 4096);
 }
 
+fn pageRangeEnd(start: u64, page_count: u64) ?u64 {
+    const bytes, const mul_overflow = @mulWithOverflow(page_count, @as(u64, 4096));
+    if (mul_overflow != 0) return null;
+    const end, const add_overflow = @addWithOverflow(start, bytes);
+    if (add_overflow != 0) return null;
+    return end;
+}
+
+fn lazyRegionEnd(region: *const LazyAnonRegion) u64 {
+    return region.start + region.page_count * 4096;
+}
+
+fn lazyRegionCoversPage(proc: kernel.PrincipalId, va: u64) ?*LazyAnonRegion {
+    const page_va = va & ~@as(u64, 0xFFF);
+    for (&lazy_anon_regions) |*region| {
+        if (!region.active or region.proc != proc) continue;
+        if (page_va >= region.start and page_va < lazyRegionEnd(region)) return region;
+    }
+    return null;
+}
+
+fn lazyRangeIntersects(proc: kernel.PrincipalId, start: u64, page_count: u64) bool {
+    const end = pageRangeEnd(start, page_count) orelse return true;
+    for (&lazy_anon_regions) |*region| {
+        if (!region.active or region.proc != proc) continue;
+        const region_end = lazyRegionEnd(region);
+        if (start < region_end and end > region.start) return true;
+    }
+    return false;
+}
+
+fn removeLazyAnonRange(proc: kernel.PrincipalId, start: u64, page_count: u64) bool {
+    const end = pageRangeEnd(start, page_count) orelse return false;
+    var changed = false;
+    var i: usize = 0;
+    while (i < lazy_anon_regions.len) : (i += 1) {
+        var region = &lazy_anon_regions[i];
+        if (!region.active or region.proc != proc) continue;
+        const region_end = lazyRegionEnd(region);
+        if (start >= region_end or end <= region.start) continue;
+        changed = true;
+
+        if (start <= region.start and end >= region_end) {
+            region.* = .{};
+            continue;
+        }
+        if (start <= region.start) {
+            region.start = end;
+            region.page_count = (region_end - end) / 4096;
+            continue;
+        }
+        if (end >= region_end) {
+            region.page_count = (start - region.start) / 4096;
+            continue;
+        }
+
+        const right_start = end;
+        const right_count = (region_end - end) / 4096;
+        region.page_count = (start - region.start) / 4096;
+        for (&lazy_anon_regions) |*free_region| {
+            if (free_region.active) continue;
+            free_region.* = .{
+                .active = true,
+                .proc = proc,
+                .start = right_start,
+                .page_count = right_count,
+                .prot = region.prot,
+            };
+            break;
+        }
+    }
+    return changed;
+}
+
+fn clearLazyAnonRegionsForProcess(proc: kernel.PrincipalId) void {
+    for (&lazy_anon_regions) |*region| {
+        if (!region.active or region.proc != proc) continue;
+        region.* = .{};
+    }
+}
+
+fn insertLazyAnonRange(proc: kernel.PrincipalId, start: u64, page_count: u64, prot: kernel.MapProt) bool {
+    if ((start & 0xFFF) != 0 or page_count == 0) return false;
+    const end = pageRangeEnd(start, page_count) orelse return false;
+    if (lazyRangeIntersects(proc, start, page_count)) return false;
+    for (&lazy_anon_regions) |*region| {
+        if (!region.active or region.proc != proc) continue;
+        if (region.prot.read != prot.read or region.prot.write != prot.write or region.prot.exec != prot.exec) continue;
+        const region_end = lazyRegionEnd(region);
+        if (region_end == start) {
+            region.page_count += page_count;
+            return true;
+        }
+        if (end == region.start) {
+            region.start = start;
+            region.page_count += page_count;
+            return true;
+        }
+    }
+    for (&lazy_anon_regions) |*region| {
+        if (region.active) continue;
+        region.* = .{
+            .active = true,
+            .proc = proc,
+            .start = start,
+            .page_count = page_count,
+            .prot = prot,
+        };
+        return true;
+    }
+    return false;
+}
+
+fn mapLazyAnonymousPage(h: *const Hooks, proc: kernel.PrincipalId, page_va: u64, write_access: bool, instruction_fetch: bool) bool {
+    const region = lazyRegionCoversPage(proc, page_va) orelse return false;
+    if (write_access and !region.prot.write) return false;
+    if (instruction_fetch and !region.prot.exec) return false;
+    if (capability.lookupUserMappedPaddrForVa(proc, page_va) != null) return true;
+    const page = h.state.allocPageTo(proc, h.free_list) catch return false;
+    if (!user_vm.mapUserLinearRegionWithProt(proc, page_va, page.paddr, 4096, region.prot)) {
+        h.state.reclaimExclusiveRootPage(proc, page.paddr, h.free_list) catch {};
+        return false;
+    }
+    return true;
+}
+
+fn mapLazyAnonymousPageCluster(h: *const Hooks, proc: kernel.PrincipalId, page_va: u64, write_access: bool, instruction_fetch: bool) bool {
+    const region = lazyRegionCoversPage(proc, page_va) orelse return false;
+    if (write_access and !region.prot.write) return false;
+    if (instruction_fetch and !region.prot.exec) return false;
+    if (capability.lookupUserMappedPaddrForVa(proc, page_va) != null) return true;
+
+    const region_end = lazyRegionEnd(region);
+    var map_count: usize = 0;
+    while (map_count < lazy_fault_cluster_max_pages) : (map_count += 1) {
+        const va = page_va + @as(u64, @intCast(map_count)) * 4096;
+        if (va >= region_end) break;
+        if (capability.lookupUserMappedPaddrForVa(proc, va) != null) break;
+    }
+    if (map_count == 0) return false;
+
+    var pages: [lazy_fault_cluster_max_pages]kernel.PageCapability = undefined;
+    var allocated: usize = 0;
+    const cap_table_start_index = h.state.getTableConst(proc).len;
+    while (allocated < map_count) : (allocated += 1) {
+        pages[allocated] = h.state.allocPageTo(proc, h.free_list) catch {
+            for (pages[0..allocated]) |page| {
+                h.state.reclaimExclusiveRootPage(proc, page.paddr, h.free_list) catch {};
+            }
+            return false;
+        };
+    }
+
+    if (!user_vm.mapFreshUserPageCapabilitiesWithProt(h.state, proc, page_va, pages[0..allocated], cap_table_start_index, region.prot)) {
+        for (pages[0..allocated]) |page| {
+            h.state.reclaimExclusiveRootPage(proc, page.paddr, h.free_list) catch {};
+        }
+        return false;
+    }
+    return true;
+}
+
+fn ensureLazyAnonymousRangeMapped(h: *const Hooks, proc: kernel.PrincipalId, va: u64, len_u64: u64, write_access: bool) bool {
+    if (len_u64 == 0) return true;
+    const end, const overflow = @addWithOverflow(va, len_u64 - 1);
+    if (overflow != 0) return false;
+    var page_va = va & ~@as(u64, 0xFFF);
+    const last_page = end & ~@as(u64, 0xFFF);
+    var touched = false;
+    while (true) {
+        if (capability.lookupUserMappedPaddrForVa(proc, page_va) == null and lazyRegionCoversPage(proc, page_va) != null) {
+            if (!mapLazyAnonymousPage(h, proc, page_va, write_access, false)) return false;
+            touched = true;
+        }
+        if (page_va == last_page) break;
+        page_va += 4096;
+    }
+    if (touched) profileRecord(&abi_trap_profile.lazy_copy_fault, 0);
+    return true;
+}
+
+pub fn resolveLazyAnonymousPageFault(state: *kernel.KernelState, proc: kernel.PrincipalId, fault_va: u64, error_code: u64) bool {
+    const write_access = (error_code & (1 << 1)) != 0;
+    const instruction_fetch = (error_code & (1 << 4)) != 0;
+    var h_storage = hooksForState(state);
+    const page_va = fault_va & ~@as(u64, 0xFFF);
+    if (capability.lookupUserMappedPaddrForVa(proc, page_va) != null) return false;
+    if (!mapLazyAnonymousPageCluster(&h_storage, proc, page_va, write_access, instruction_fetch)) return false;
+    profileRecord(&abi_trap_profile.lazy_fault, 0);
+    return true;
+}
+
+pub fn reserveLazyAnonymousPagesForCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, page_count: u64, prot_bits: u64) u64 {
+    _ = state;
+    _ = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
+    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
+    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    if (!insertLazyAnonRange(target.proc, target_va, page_count, prot)) return boot_static.syscall_err_map;
+    profileRecord(&abi_trap_profile.lazy_reserve, page_count);
+    return boot_static.syscall_ok;
+}
+
 pub fn mapPagesToCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, page_count: u64, prot_bits: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
@@ -429,6 +651,21 @@ pub fn protectCurrentReplyTargetPages(target_va: u64, page_count: u64, prot_bits
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    if (lazyRangeIntersects(target.proc, target_va, page_count)) {
+        var page_index: u64 = 0;
+        while (page_index < page_count) : (page_index += 1) {
+            const va = target_va + page_index * 4096;
+            if (capability.lookupUserMappedPaddrForVa(target.proc, va) != null) {
+                if (!user_vm.protectUserLinearRegionWithProt(target.proc, va, 4096, prot)) return boot_static.syscall_err_map;
+            }
+            if (lazyRegionCoversPage(target.proc, va)) |region| {
+                region.prot = prot;
+            } else {
+                return boot_static.syscall_err_map;
+            }
+        }
+        return boot_static.syscall_ok;
+    }
     if (!user_vm.protectUserLinearRegionWithProt(target.proc, target_va, byte_len, prot)) {
         return boot_static.syscall_err_map;
     }
@@ -439,6 +676,27 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
     _ = state;
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
+    if (lazyRangeIntersects(target.proc, target_va, page_count)) {
+        var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
+        if (user_vm.collectUserLinearRegionPaddrs(target.proc, target_va, byte_len, paddrs[0..])) |collected| {
+            if (collected == page_count) {
+                if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) return boot_static.syscall_err_map;
+                _ = removeLazyAnonRange(target.proc, target_va, page_count);
+                return boot_static.syscall_ok;
+            }
+        }
+        var page_index: u64 = 0;
+        while (page_index < page_count) : (page_index += 1) {
+            const va = target_va + page_index * 4096;
+            if (capability.lookupUserMappedPaddrForVa(target.proc, va) != null) {
+                if (!user_vm.unmapUserLinearRegion(target.proc, va, 4096)) return boot_static.syscall_err_map;
+            } else if (lazyRegionCoversPage(target.proc, va) == null) {
+                return boot_static.syscall_err_map;
+            }
+        }
+        _ = removeLazyAnonRange(target.proc, target_va, page_count);
+        return boot_static.syscall_ok;
+    }
     var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
     var profile_start = readTsc();
     const collected = user_vm.collectUserLinearRegionPaddrs(target.proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
@@ -554,6 +812,7 @@ fn reclaimPrivatePagesForProcessWithHooks(h: *const Hooks, target_proc: kernel.P
         if (reclaimed_this_round == 0) break;
         total_reclaimed += reclaimed_this_round;
     }
+    clearLazyAnonRegionsForProcess(target_proc);
     return total_reclaimed;
 }
 
