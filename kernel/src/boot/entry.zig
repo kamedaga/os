@@ -4,6 +4,7 @@ const std = @import("std");
 const kernel = @import("../kernel.zig");
 const capability = @import("../capability.zig");
 const device_capabilities = @import("../device_capabilities.zig");
+const device_events = @import("../device_events.zig");
 const elf_loader = @import("../elf_loader.zig");
 const scheduler = @import("../scheduler.zig");
 const syscalls = @import("../syscalls.zig");
@@ -75,6 +76,7 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(global_free_list), &global_free_list));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_global), &kernel_state_global));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_ready), &kernel_state_ready));
+    start = minStaticStart(start, device_events.kernelStaticStorageStartAddr());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
@@ -96,6 +98,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, device_events.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
 }
@@ -327,7 +330,9 @@ fn installInterruptTrampolines() void {
         .segment_not_present_stub = @intFromPtr(&traps.segmentNotPresentHandlerStub),
         .stack_segment_fault_stub = @intFromPtr(&traps.stackSegmentFaultHandlerStub),
         .timer_interrupt_stub = @intFromPtr(&traps.timerInterruptHandlerStub),
+        .device_interrupt_stub = @intFromPtr(&traps.deviceInterruptHandlerStub),
         .lapic_timer_vector = boot_static.lapic_timer_vector,
+        .device_interrupt_vector = device_events.generic_device_interrupt_vector,
     });
 }
 
@@ -381,6 +386,7 @@ fn initMemoryModules() void {
         .page_user = boot_static.page_user,
         .page_ps = boot_static.page_ps,
         .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
+        .flush_user_tlb_for_principal_range = user_copy.flushUserTlbForPrincipalRange,
         .seed_user_pdp_with_kernel_identity = x86_platform.seedUserPdpWithKernelIdentity,
         .seed_user_pd_with_kernel_identity = x86_platform.seedUserPdWithKernelIdentity,
     });

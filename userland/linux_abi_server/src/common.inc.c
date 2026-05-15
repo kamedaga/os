@@ -654,6 +654,7 @@ struct linux_process_state {
     u64 wait_status_va;
     u64 clear_child_tid;
     u8 profile_enabled;
+    u8 profile_detail_enabled;
     u8 profile_verbose_enabled;
     u64 sigaltstack_sp;
     u64 sigaltstack_size;

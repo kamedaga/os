@@ -1,6 +1,7 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
+const device_events = @import("device_events.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
 const scheduler = @import("scheduler.zig");
@@ -1039,6 +1040,15 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     }
 }
 
+pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
+    const h = getHooks();
+    lapic.eoi();
+    _ = frame;
+    if (!scheduler.schedulerRunsOnCurrentCpu()) return;
+    if (!h.kernel_state_ready.*) return;
+    _ = device_events.wakeAllBoundDeviceWaiters();
+}
+
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
     asm volatile (
         \\push %r10
@@ -1606,6 +1616,130 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\lea 512(%rsp), %rdi
             \\mov %rdi, %rcx
             \\call timerInterruptDispatch
+            \\add $512, %rsp
+            \\pop %r15
+            \\pop %r14
+            \\pop %r13
+            \\pop %r12
+            \\pop %r11
+            \\pop %r10
+            \\pop %r9
+            \\pop %r8
+            \\pop %rbp
+            \\pop %rdi
+            \\pop %rsi
+            \\pop %rdx
+            \\pop %rcx
+            \\pop %rbx
+            \\pop %rax
+            \\mov %r10, user_return_saved_r10(%rip)
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\mov user_return_saved_r10(%rip), %r10
+            \\iretq
+        );
+    }
+}
+
+pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
+    if (debug_skip_timer_fx_state) {
+        asm volatile (
+            \\push %r10
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\pop %r10
+            \\push %rax
+            \\push %rbx
+            \\push %rcx
+            \\push %rdx
+            \\push %rsi
+            \\push %rdi
+            \\push %rbp
+            \\push %r8
+            \\push %r9
+            \\push %r10
+            \\push %r11
+            \\push %r12
+            \\push %r13
+            \\push %r14
+            \\push %r15
+            \\mov 128(%rsp), %rax
+            \\and $0x3, %rax
+            \\cmp $0x3, %rax
+            \\jne 9f
+        ++ asmCallAligned("timerInterruptWorkFrameForCurrentCpuFromAsm") ++
+            \\mov %rax, %r12
+        ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+            \\mov %r12, %rcx
+        ++ asmCallAligned("deviceInterruptDispatch") ++
+            \\mov %r12, %rax
+        ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+            \\jmp userReturnToSavedFrame
+            \\9:
+            \\sub $512, %rsp
+            \\lea 512(%rsp), %rdi
+            \\mov %rdi, %rcx
+            \\call deviceInterruptDispatch
+            \\add $512, %rsp
+            \\pop %r15
+            \\pop %r14
+            \\pop %r13
+            \\pop %r12
+            \\pop %r11
+            \\pop %r10
+            \\pop %r9
+            \\pop %r8
+            \\pop %rbp
+            \\pop %rdi
+            \\pop %rsi
+            \\pop %rdx
+            \\pop %rcx
+            \\pop %rbx
+            \\pop %rax
+            \\mov %r10, user_return_saved_r10(%rip)
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\mov user_return_saved_r10(%rip), %r10
+            \\iretq
+        );
+    } else {
+        asm volatile (
+            \\push %r10
+            \\mov kernel_cr3_value(%rip), %r10
+            \\mov %r10, %cr3
+            \\pop %r10
+            \\push %rax
+            \\push %rbx
+            \\push %rcx
+            \\push %rdx
+            \\push %rsi
+            \\push %rdi
+            \\push %rbp
+            \\push %r8
+            \\push %r9
+            \\push %r10
+            \\push %r11
+            \\push %r12
+            \\push %r13
+            \\push %r14
+            \\push %r15
+            \\mov 128(%rsp), %rax
+            \\and $0x3, %rax
+            \\cmp $0x3, %rax
+            \\jne 9f
+        ++ asmCallAligned("saveCurrentThreadFxState") ++ asmCallAligned("timerInterruptWorkFrameForCurrentCpuFromAsm") ++
+            \\mov %rax, %r12
+        ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+            \\mov %r12, %rcx
+        ++ asmCallAligned("deviceInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
+            \\mov %r12, %rax
+        ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+            \\jmp userReturnToSavedFrame
+            \\9:
+            \\sub $512, %rsp
+            \\lea 512(%rsp), %rdi
+            \\mov %rdi, %rcx
+            \\call deviceInterruptDispatch
             \\add $512, %rsp
             \\pop %r15
             \\pop %r14

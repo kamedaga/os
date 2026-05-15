@@ -56,9 +56,11 @@ enum {
     COMMON_DEVICE_FEATURE = 0x04,
     COMMON_DRIVER_FEATURE_SELECT = 0x08,
     COMMON_DRIVER_FEATURE = 0x0C,
+    COMMON_MSIX_CONFIG = 0x10,
     COMMON_DEVICE_STATUS = 0x14,
     COMMON_QUEUE_SELECT = 0x16,
     COMMON_QUEUE_SIZE = 0x18,
+    COMMON_QUEUE_MSIX_VECTOR = 0x1A,
     COMMON_QUEUE_ENABLE = 0x1C,
     COMMON_QUEUE_NOTIFY_OFF = 0x1E,
     COMMON_QUEUE_DESC = 0x20,
@@ -79,6 +81,8 @@ enum {
     QUEUE_USED_OFFSET = 2048,
     RX_QUEUE_INDEX = 0,
     TX_QUEUE_INDEX = 1,
+    VIRTIO_MSI_NO_VECTOR = 0xFFFF,
+    NET_MSIX_VECTOR_INDEX = 0,
     RX_BUFFER_COUNT = 8,
     NET_HDR_BYTES = 12,
     ETH_HDR_BYTES = 14,
@@ -422,6 +426,7 @@ static u64 g_net_service_idle_sleeps;
 static u64 g_net_service_active_poll_rounds;
 static u64 g_net_service_active_poll_hits;
 static u64 g_net_service_active_poll_misses;
+static int g_msix_enabled;
 static u64 g_tcp_next_progress_log_bytes = 64 * 1024;
 
 void *memset(void *dst, int value, u64 n) {
@@ -1150,12 +1155,19 @@ static int setup_queue(struct queue_state *queue) {
     const u16 max_size = mmio_read_u16(g_common_base + COMMON_QUEUE_SIZE);
     if (max_size == 0 || max_size < QUEUE_SIZE) return 0;
     mmio_write_u16(g_common_base + COMMON_QUEUE_SIZE, QUEUE_SIZE);
+    mmio_write_u16(g_common_base + COMMON_QUEUE_MSIX_VECTOR, NET_MSIX_VECTOR_INDEX);
     mmio_write_u64(g_common_base + COMMON_QUEUE_DESC, queue->page_paddr);
     mmio_write_u64(g_common_base + COMMON_QUEUE_AVAIL, queue->page_paddr + QUEUE_SIZE * sizeof(struct virtq_desc));
     mmio_write_u64(g_common_base + COMMON_QUEUE_USED, queue->page_paddr + QUEUE_USED_OFFSET);
     const u16 queue_notify_off = mmio_read_u16(g_common_base + COMMON_QUEUE_NOTIFY_OFF);
     queue->notify_addr = g_notify_base + (u64)queue_notify_off * g_boot.notify_off_multiplier;
     mmio_write_u16(g_common_base + COMMON_QUEUE_ENABLE, 1);
+    if (mmio_read_u16(g_common_base + COMMON_QUEUE_MSIX_VECTOR) == VIRTIO_MSI_NO_VECTOR) {
+        user_log("[virtio_net] VirtioNet: queue MSI-X unavailable\n");
+        g_msix_enabled = 0;
+    } else {
+        g_msix_enabled = 1;
+    }
     return 1;
 }
 
@@ -1934,6 +1946,7 @@ static int init_virtio(void) {
     mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, 0);
     mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
     if (!negotiate_features()) return 0;
+    mmio_write_u16(g_common_base + COMMON_MSIX_CONFIG, NET_MSIX_VECTOR_INDEX);
     read_mac();
     if (!setup_queue(&g_rx_queue)) return 0;
     if (!setup_queue(&g_tx_queue)) return 0;

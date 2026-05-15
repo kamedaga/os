@@ -46,6 +46,7 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->wait_status_va = 0;
     proc->clear_child_tid = 0;
     proc->profile_enabled = 0;
+    proc->profile_detail_enabled = 0;
     proc->profile_verbose_enabled = 0;
     proc->sigaltstack_sp = 0;
     proc->sigaltstack_size = 0;

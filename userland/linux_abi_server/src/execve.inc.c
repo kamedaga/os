@@ -1,4 +1,5 @@
 #define LINUX_ABI_EXECVE_PROFILE_ENV "CAPABILITYOS_EXEC_PROFILE=1"
+#define LINUX_ABI_EXECVE_PROFILE_DETAIL_ENV "CAPABILITYOS_EXEC_PROFILE_DETAIL=1"
 #define LINUX_ABI_EXECVE_PROFILE_VERBOSE_ENV "CAPABILITYOS_EXEC_PROFILE_VERBOSE=1"
 
 enum {
@@ -9,6 +10,7 @@ enum {
 };
 
 static int g_execve_profile_enabled = 0;
+static int g_execve_profile_detail = 0;
 static int g_execve_profile_verbose = 0;
 static u64 g_execve_profile_start_tick = 0;
 static u64 g_execve_profile_last_tick = 0;
@@ -707,6 +709,19 @@ static int target_env_has_exec_profile_verbose(u64 envp_va) {
     return 0;
 }
 
+static int target_env_has_exec_profile_detail(u64 envp_va) {
+    if (envp_va == 0) return 0;
+    for (u64 i = 0; i < EXECVE_MAX_ENVP; i++) {
+        u64 ptr = 0;
+        if (copy_from_target(envp_va + i * 8, &ptr, 8) != 8) return 0;
+        if (ptr == 0) return 0;
+        char value[64];
+        if (!copy_cstr_from_target(ptr, value, sizeof(value))) continue;
+        if (exec_cstr_eq(value, LINUX_ABI_EXECVE_PROFILE_DETAIL_ENV)) return 1;
+    }
+    return 0;
+}
+
 static const char *path_basename(const char *path) {
     const char *base = path;
     for (u64 i = 0; path[i] != 0; i++) {
@@ -908,6 +923,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
     if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
     g_execve_profile_enabled = target_env_has_exec_profile(req->args[2]);
+    g_execve_profile_detail = target_env_has_exec_profile_detail(req->args[2]);
     g_execve_profile_verbose = target_env_has_exec_profile_verbose(req->args[2]);
     if (g_execve_profile_verbose) g_profile_trace_verbose = 1;
     const char *load_path = path;
@@ -923,6 +939,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     profile_clear();
     if (g_proc) {
         g_proc->profile_enabled = (u8)g_execve_profile_enabled;
+        g_proc->profile_detail_enabled = (u8)g_execve_profile_detail;
         g_proc->profile_verbose_enabled = (u8)g_execve_profile_verbose;
     }
     execve_profile_begin(load_path);

@@ -69,7 +69,9 @@ pub const TrapTargets = struct {
     segment_not_present_stub: usize,
     stack_segment_fault_stub: usize,
     timer_interrupt_stub: usize,
+    device_interrupt_stub: usize,
     lapic_timer_vector: u8,
+    device_interrupt_vector: u8,
 };
 
 var pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
@@ -411,6 +413,7 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     interrupts.setIdtEntryWithIst(&idt, 8, gdt_kernel_code_selector, df_trampoline_entry, 2, 0x8E);
     interrupts.setIdtEntry(&idt, 0x20, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, targets.lapic_timer_vector, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
+    interrupts.setIdtEntry(&idt, targets.device_interrupt_vector, gdt_kernel_code_selector, targets.device_interrupt_stub, 0x8E);
     interrupts.setIdtEntry(&idt, 0x80, gdt_kernel_code_selector, int80_trampoline_entry, 0xEE);
     interrupts.loadIdt(&idt);
 }

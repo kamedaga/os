@@ -41,9 +41,18 @@ pub fn deliverOrQueueMessageToThread(
         scheduler.preferIpcSwitchToThread(target_thread);
         return boot_static.syscall_ok;
     }
+    if (target_hot.ready == 0 and target_hot.wait_preserve_ipc_queue != 0) {
+        if (!scheduler.enqueueIpcMessageForThread(target_thread, endpoint_id, sender_thread, grants_reply, mr0, mr1, mr2, mr3)) {
+            return boot_static.syscall_err_not_ready;
+        }
+        scheduler.wakeThreadIfWaiting(target_thread);
+        scheduler.preferIpcSwitchToThread(target_thread);
+        return boot_static.syscall_ok;
+    }
     if (target_hot.ready == 0 or abi_reply_to_pending_target) {
         scheduler.prepareBlockedThreadForWake(target_thread);
         target_ctx.wait_mailbox = false;
+        target_ctx.wait_preserve_ipc_queue = false;
         target_ctx.wake_tick = 0;
         if (grants_reply) {
             scheduler.setIpcReplyTokenForThread(target_thread, true, sender_thread);

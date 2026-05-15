@@ -191,6 +191,7 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
     child->wait_status_va = 0;
     child->clear_child_tid = 0;
     child->profile_enabled = parent->profile_enabled;
+    child->profile_detail_enabled = parent->profile_detail_enabled;
     child->profile_verbose_enabled = parent->profile_verbose_enabled;
     child->sigaltstack_sp = parent->sigaltstack_sp;
     child->sigaltstack_size = parent->sigaltstack_size;

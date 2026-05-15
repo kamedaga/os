@@ -2,6 +2,7 @@ const std = @import("std");
 const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 const device_capabilities = @import("device_capabilities.zig");
+const device_events = @import("device_events.zig");
 const abi_root = @import("kernel_abi_root");
 const cap_transfer_abi = abi_root.cap_transfer_abi;
 const ipc_buffer_abi = abi_root.ipc_buffer_abi;
@@ -697,6 +698,7 @@ fn kernelExecProfileReport(h: *const Hooks) void {
     kernelIpcProfileReportCounter(h, "ipc_call_blocks", kernel_ipc_profile.ipc_call_blocks);
     kernelIpcProfileReportCounter(h, "ipc_call_immediate", kernel_ipc_profile.ipc_call_immediate);
     kernelIpcProfileReportCounter(h, "sparse_direct_switches", kernel_ipc_profile.sparse_direct_switches);
+    kernelIpcProfileReportCounter(h, "device_interrupts", device_events.interruptCount());
     for (&kernel_ipc_profile_signal_endpoints) |*slot| {
         if (slot.count == 0) continue;
         h.write("KernelExecProfile.ipc signal_endpoint_id=");
@@ -1006,8 +1008,11 @@ fn dispatchIpcSyscall(
                 break :blk syscall_ok;
             }
             if (preserve_ipc_queue) {
-                if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_immediate +%= 1;
                 kernel_state_lock.unlock();
+                if (kernel_exec_profile_active) kernel_ipc_profile.wait_event_blocks +%= 1;
+                if (!scheduler.blockCurrentThreadForEventPreservingIpc(frame, timeout_ticks, syscall_ok)) {
+                    break :blk syscall_err_not_ready;
+                }
                 break :blk syscall_ok;
             }
             kernel_state_lock.unlock();
@@ -1466,6 +1471,7 @@ pub export fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *c
     saveIpcSignalFrameToContext(current_ctx, save, syscall_ok);
     current_ctx.cr3 = scheduler.currentUserCr3();
     current_ctx.wait_mailbox = false;
+    current_ctx.wait_preserve_ipc_queue = false;
     current_ctx.wake_tick = 0;
     current_ctx.ready = false;
     scheduler.setIpcHotCr3(current_thread, scheduler.currentUserCr3());
@@ -1856,6 +1862,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                 h.write("\n");
                 return syscall_err_invalid;
             };
+            if (device_capabilities.queueCapDeviceForToken(state, proc, queue_token, queue_index)) |device| {
+                _ = device_events.bindDeviceEvent(proc, device);
+            }
             return syscall_ok;
         },
         syscall_iommu_authorize => {
@@ -2324,6 +2333,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
                 return syscall_ok;
             }
             if (preserve_ipc_queue) {
+                if (!scheduler.blockCurrentThreadForEventPreservingIpc(frame, timeout_ticks, syscall_ok)) {
+                    return syscall_err_not_ready;
+                }
                 return syscall_ok;
             }
             if (!h.block_current_thread_for_event(frame, wait_mailbox, timeout_ticks, syscall_ok)) {

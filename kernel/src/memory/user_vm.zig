@@ -17,6 +17,7 @@ pub const Hooks = struct {
     page_user: u64,
     page_ps: u64,
     flush_user_tlb_for_principal_va: *const fn (principal: kernel.PrincipalId, va: u64) void,
+    flush_user_tlb_for_principal_range: *const fn (principal: kernel.PrincipalId, va: u64, size_bytes: usize) void,
     seed_user_pdp_with_kernel_identity: *const fn ([]u64) void,
     seed_user_pd_with_kernel_identity: *const fn ([]u64) void,
 };
@@ -341,8 +342,8 @@ pub fn protectUserLinearRegionWithProt(
         if ((old_entry & h.page_user) == 0) return false;
         const paddr = old_entry & ~@as(u64, 0xFFF);
         pt_page[pt_index] = paddr | pte_flags;
-        h.flush_user_tlb_for_principal_va(principal, va);
     }
+    h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
 
     return true;
 }
@@ -389,9 +390,9 @@ pub fn unmapUserLinearRegion(
         const pt_index: usize = @intCast((va >> 12) & 0x1FF);
         const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
         pt_page[pt_index] = 0;
-        h.flush_user_tlb_for_principal_va(principal, va);
     }
     if (!capability.releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
+    h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
 
     return true;
 }

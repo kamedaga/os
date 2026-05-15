@@ -2,13 +2,22 @@ const std = @import("std");
 const pci = @import("pci.zig");
 const pci_status_cap_list: u16 = 1 << 4;
 const pci_cap_id_vendor: u8 = 0x09;
+const pci_cap_id_msix: u8 = 0x11;
 
 const virtio_vendor_id: u16 = 0x1AF4;
+const virtio_net_legacy_device_id: u16 = 0x1000;
+const virtio_net_modern_device_id: u16 = 0x1041;
+const virtio_net_subsystem_id: u16 = 1;
 
 const virtio_pci_cap_common_cfg: u8 = 1;
 const virtio_pci_cap_notify_cfg: u8 = 2;
 const virtio_pci_cap_isr_cfg: u8 = 3;
 const virtio_pci_cap_device_cfg: u8 = 4;
+const msix_control_table_size_mask: u16 = 0x07FF;
+const msix_control_function_mask: u16 = 1 << 14;
+const msix_control_enable: u16 = 1 << 15;
+const pci_command_memory_space: u16 = 1 << 1;
+const pci_command_bus_master: u16 = 1 << 2;
 
 pub const ModernDeviceInfo = struct {
     location: pci.Location,
@@ -21,6 +30,7 @@ pub const ModernDeviceInfo = struct {
     device_cfg: u64,
     notify_off_multiplier: u32,
     queue_count: u16,
+    msix_enabled: bool,
 };
 pub const max_modern_devices: usize = 8;
 
@@ -56,6 +66,61 @@ fn readMemBarBase(loc: pci.Location, bar_index: u8) ?u64 {
         return low_base | (@as(u64, high) << 32);
     }
     return null;
+}
+
+fn mmioWrite32(paddr: u64, value: u32) void {
+    const reg: *volatile u32 = @ptrFromInt(paddr);
+    reg.* = value;
+}
+
+fn findMsixCapability(loc: pci.Location) ?u8 {
+    const status = pci.readConfigU16(loc, 0x06);
+    if ((status & pci_status_cap_list) == 0) return null;
+    var cap_ptr: u8 = pci.readConfigU8(loc, 0x34) & 0xFC;
+    var iter: usize = 0;
+    while (cap_ptr != 0 and iter < 64) : (iter += 1) {
+        const cap_id = pci.readConfigU8(loc, cap_ptr + 0);
+        const next_ptr = pci.readConfigU8(loc, cap_ptr + 1) & 0xFC;
+        if (cap_id == pci_cap_id_msix) return cap_ptr;
+        if (next_ptr == cap_ptr) break;
+        cap_ptr = next_ptr;
+    }
+    return null;
+}
+
+fn configureMsixSingleVector(
+    write_log: *const fn ([]const u8) void,
+    loc: pci.Location,
+    device_id: u16,
+    vector: u8,
+) bool {
+    if (device_id != virtio_net_modern_device_id and
+        device_id != virtio_net_legacy_device_id and
+        pci.readSubsystemId(loc) != virtio_net_subsystem_id) return false;
+    const cap_ptr = findMsixCapability(loc) orelse return false;
+    const control = pci.readConfigU16(loc, cap_ptr + 2);
+    const table_size = (control & msix_control_table_size_mask) + 1;
+    if (table_size == 0) return false;
+    const table_info = pci.readConfigU32(loc, cap_ptr + 4);
+    const bir: u8 = @intCast(table_info & 0x7);
+    const table_offset = table_info & 0xFFFF_FFF8;
+    const bar_base = readMemBarBase(loc, bir) orelse return false;
+    const table_paddr = addU64(bar_base, table_offset) orelse return false;
+
+    mmioWrite32(table_paddr + 0x0, 0xFEE0_0000);
+    mmioWrite32(table_paddr + 0x4, 0);
+    mmioWrite32(table_paddr + 0x8, vector);
+    mmioWrite32(table_paddr + 0xC, 0);
+
+    const command = pci.readConfigU16(loc, 0x04);
+    pci.writeConfigU16(loc, 0x04, command | pci_command_memory_space | pci_command_bus_master);
+    pci.writeConfigU16(loc, cap_ptr + 2, (control | msix_control_enable) & ~msix_control_function_mask);
+    emitFmt(
+        write_log,
+        "virtio-probe: msix enabled vector=0x{x} table=0x{x}\n",
+        .{ vector, table_paddr },
+    );
+    return true;
 }
 
 fn collectModernCaps(
@@ -155,6 +220,7 @@ fn collectModernCaps(
         .device_cfg = device_cfg,
         .notify_off_multiplier = notify_off_multiplier,
         .queue_count = 0,
+        .msix_enabled = configureMsixSingleVector(write_log, loc, device_id, 0x41),
     };
 }
 

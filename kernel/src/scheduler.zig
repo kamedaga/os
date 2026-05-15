@@ -167,6 +167,7 @@ pub const ThreadContext = struct {
     fs_base: u64 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
+    wait_preserve_ipc_queue: bool = false,
     signal_pending: bool = false,
     wake_tick: u64 = 0,
     ipc_cached_endpoint_generation: u64 = std.math.maxInt(u64),
@@ -185,8 +186,9 @@ pub const IpcHotThread = extern struct {
     ready: u8 = 0,
     signal_pending: u8 = 0,
     wait_mailbox: u8 = 0,
+    wait_preserve_ipc_queue: u8 = 0,
     owner_process: kernel.PrincipalId = default_process_principal,
-    _pad0: [3]u8 = [_]u8{0} ** 3,
+    _pad0: [2]u8 = [_]u8{0} ** 2,
     wake_tick: u64 = 0,
     cr3: u64 = 0,
     ipc_cached_endpoint_generation: u64 = std.math.maxInt(u64),
@@ -576,6 +578,7 @@ fn clearApThreadAssociationLocked(cpu_slot: usize, state: *CpuSchedulerState, th
             if (getIpcHotThread(thread_index)) |hot| {
                 hot.ready = 1;
                 hot.wait_mailbox = 0;
+                hot.wait_preserve_ipc_queue = 0;
                 hot.wake_tick = 0;
             }
             state.run_queue.markRunnable(thread_index);
@@ -1393,6 +1396,7 @@ fn hotThreadFromContext(ctx: *const ThreadContext) IpcHotThread {
         .ready = boolByte(ctx.ready),
         .signal_pending = boolByte(ctx.signal_pending),
         .wait_mailbox = boolByte(ctx.wait_mailbox),
+        .wait_preserve_ipc_queue = boolByte(ctx.wait_preserve_ipc_queue),
         .owner_process = ctx.owner_process,
         .wake_tick = ctx.wake_tick,
         .cr3 = ctx.cr3,
@@ -1429,9 +1433,14 @@ pub fn setIpcHotSignalPending(thread_index: usize, pending: bool) void {
 }
 
 pub fn setIpcHotWaitState(thread_index: usize, wait_mailbox: bool, wake_tick: u64, ready: bool) void {
+    setIpcHotWaitStateEx(thread_index, wait_mailbox, false, wake_tick, ready);
+}
+
+fn setIpcHotWaitStateEx(thread_index: usize, wait_mailbox: bool, preserve_ipc_queue: bool, wake_tick: u64, ready: bool) void {
     var runnable = false;
     if (getIpcHotThread(thread_index)) |hot| {
         hot.wait_mailbox = boolByte(wait_mailbox);
+        hot.wait_preserve_ipc_queue = boolByte(preserve_ipc_queue);
         hot.wake_tick = wake_tick;
         hot.ready = boolByte(ready);
         const ctx = getThreadContextConst(thread_index) orelse return;
@@ -1578,6 +1587,7 @@ pub fn initThreadContextWithSpaces(
     ctx.fs_base = 0;
     ctx.ready = true;
     ctx.wait_mailbox = false;
+    ctx.wait_preserve_ipc_queue = false;
     ctx.signal_pending = false;
     ctx.wake_tick = 0;
     ctx.frame = initial_frame;
@@ -2082,7 +2092,7 @@ pub fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
     ctx.cr3 = currentUserCr3();
     setIpcHotCr3(current_thread, ctx.cr3);
     const hot = getIpcHotThreadConst(current_thread) orelse return;
-    if (hot.wait_mailbox == 0 and hot.wake_tick == 0) {
+    if (hot.wait_mailbox == 0 and hot.wait_preserve_ipc_queue == 0 and hot.wake_tick == 0) {
         ctx.ready = true;
         setIpcHotReady(current_thread, true);
     }
@@ -2141,6 +2151,7 @@ pub fn wakeThreadIfWaiting(thread_index: usize) void {
     if (!ctx.allocated) return;
     prepareBlockedThreadForWake(thread_index);
     ctx.wait_mailbox = false;
+    ctx.wait_preserve_ipc_queue = false;
     ctx.wake_tick = 0;
     ctx.ready = true;
     setIpcHotWaitState(thread_index, false, 0, true);
@@ -2202,6 +2213,14 @@ pub fn wakeThreadsForTimer(now_tick: u64) void {
 }
 
 pub fn blockCurrentThreadForEvent(frame: *TrapFrame, wait_mailbox: bool, timeout_ticks: u64, resume_rax: u64) bool {
+    return blockCurrentThreadForEventInternal(frame, wait_mailbox, false, timeout_ticks, resume_rax);
+}
+
+pub fn blockCurrentThreadForEventPreservingIpc(frame: *TrapFrame, timeout_ticks: u64, resume_rax: u64) bool {
+    return blockCurrentThreadForEventInternal(frame, false, true, timeout_ticks, resume_rax);
+}
+
+fn blockCurrentThreadForEventInternal(frame: *TrapFrame, wait_mailbox: bool, preserve_ipc_queue: bool, timeout_ticks: u64, resume_rax: u64) bool {
     if (!schedulerRunsOnCurrentCpu() and !spawnExecApUserSchedulingReady()) return false;
     const current_thread = currentThreadIndex();
     const ctx = getThreadContext(current_thread) orelse return false;
@@ -2213,12 +2232,14 @@ pub fn blockCurrentThreadForEvent(frame: *TrapFrame, wait_mailbox: bool, timeout
     ctx.frame = saved;
     ctx.cr3 = currentUserCr3();
     ctx.wait_mailbox = wait_mailbox;
+    ctx.wait_preserve_ipc_queue = preserve_ipc_queue;
     ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;
     ctx.ready = false;
     setIpcHotCr3(current_thread, ctx.cr3);
-    setIpcHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);
+    setIpcHotWaitStateEx(current_thread, wait_mailbox, preserve_ipc_queue, ctx.wake_tick, false);
     if (ctx.abi_trap_reply_pending and ctx.signal_pending) {
         ctx.wait_mailbox = false;
+        ctx.wait_preserve_ipc_queue = false;
         ctx.wake_tick = 0;
         ctx.ready = true;
         setIpcHotWaitState(current_thread, false, 0, true);
@@ -2251,6 +2272,7 @@ pub fn blockCurrentThreadForEvent(frame: *TrapFrame, wait_mailbox: bool, timeout
             parkCurrentApAfterBlocking(cpu_slot, current_thread);
         }
         ctx.wait_mailbox = false;
+        ctx.wait_preserve_ipc_queue = false;
         ctx.wake_tick = 0;
         ctx.ready = true;
         setIpcHotWaitState(current_thread, false, 0, true);
@@ -2258,6 +2280,7 @@ pub fn blockCurrentThreadForEvent(frame: *TrapFrame, wait_mailbox: bool, timeout
     }
     if (!activateThread(next_thread)) {
         ctx.wait_mailbox = false;
+        ctx.wait_preserve_ipc_queue = false;
         ctx.wake_tick = 0;
         ctx.ready = true;
         setIpcHotWaitState(current_thread, false, 0, true);
@@ -2265,6 +2288,7 @@ pub fn blockCurrentThreadForEvent(frame: *TrapFrame, wait_mailbox: bool, timeout
     }
     if (!loadThreadContextToFrame(next_thread, frame)) {
         ctx.wait_mailbox = false;
+        ctx.wait_preserve_ipc_queue = false;
         ctx.wake_tick = 0;
         ctx.ready = true;
         setIpcHotWaitState(current_thread, false, 0, true);

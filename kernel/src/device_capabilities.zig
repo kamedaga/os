@@ -206,6 +206,18 @@ pub fn queueCapAuthorizeStage2(
     }
 }
 
+pub fn queueCapDeviceForToken(
+    state: *const kernel.KernelState,
+    owner: kernel.PrincipalId,
+    token: u64,
+    queue_index: u16,
+) ?kernel.DmaDeviceId {
+    const cap = state.queue_caps.findByToken(token) orelse return null;
+    if (cap.owner_principal_raw != @intFromEnum(owner)) return null;
+    if (cap.queue_index != queue_index) return null;
+    return cap.device;
+}
+
 pub fn grantQueueCapStage2(
     state: *kernel.KernelState,
     owner: kernel.PrincipalId,

@@ -65,6 +65,15 @@ pub fn readConfigU8(loc: Location, offset: u8) u8 {
     return @intCast((value >> shift) & 0xFF);
 }
 
+pub fn writeConfigU8(loc: Location, offset: u8, value: u8) void {
+    const aligned = offset & 0xFC;
+    const shift: u5 = @intCast((offset & 0x3) * 8);
+    const mask: u32 = ~(@as(u32, 0xFF) << shift);
+    const cur = readConfigU32(loc, aligned);
+    const next = (cur & mask) | (@as(u32, value) << shift);
+    writeConfigU32(loc, aligned, next);
+}
+
 pub fn readVendorId(loc: Location) u16 {
     return readConfigU16(loc, 0x00);
 }

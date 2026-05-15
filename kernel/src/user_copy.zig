@@ -267,8 +267,36 @@ pub fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
     h.write_cr3(current_cr3);
 }
 
+pub fn flushTlbForCr3Range(target_cr3: u64, va: u64, size_bytes: usize) void {
+    const h = getHooks();
+    if (target_cr3 == 0 or size_bytes == 0) return;
+    const page_count = (size_bytes + 4095) / 4096;
+    if (page_count <= 4) {
+        var offset: usize = 0;
+        while (offset < size_bytes) : (offset += 4096) {
+            flushTlbForCr3Va(target_cr3, va + @as(u64, @intCast(offset)));
+        }
+        return;
+    }
+
+    const current_cr3 = h.read_cr3();
+    if (current_cr3 == target_cr3) {
+        h.write_cr3(current_cr3);
+        return;
+    }
+
+    h.write_cr3(target_cr3);
+    h.write_cr3(current_cr3);
+}
+
 pub fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {
     const h = getHooks();
     const target_cr3 = h.user_space_cr3_for_principal(principal);
     flushTlbForCr3Va(target_cr3, va);
+}
+
+pub fn flushUserTlbForPrincipalRange(principal: kernel.PrincipalId, va: u64, size_bytes: usize) void {
+    const h = getHooks();
+    const target_cr3 = h.user_space_cr3_for_principal(principal);
+    flushTlbForCr3Range(target_cr3, va, size_bytes);
 }

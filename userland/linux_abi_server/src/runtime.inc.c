@@ -41,6 +41,11 @@ static int profile_trace_enabled(void) {
     return g_proc != 0 && g_proc->profile_verbose_enabled != 0;
 }
 
+static int profile_detail_enabled(void) {
+    if (profile_trace_enabled()) return 1;
+    return g_proc != 0 && g_proc->profile_detail_enabled != 0;
+}
+
 static void profile_trace_prefix(const char *event) {
     user_log("LinuxAbiServer.trace tick=");
     user_log_dec_value(syscall0(SYSCALL_GET_TICK_COUNT));
@@ -76,7 +81,10 @@ static void profile_trace_syscall_span(u64 nr, u64 principal, u64 start_tick, u6
 }
 
 static void wait_without_consuming_ipc(void) {
-    for (u64 i = 0; i < 4096; i++) __asm__ volatile("pause");
+    static u64 preserve_wait_poll_counter = 0;
+    for (u64 i = 0; i < 1024; i++) __asm__ volatile("pause");
+    preserve_wait_poll_counter++;
+    if ((preserve_wait_poll_counter & 0x3u) != 0) return;
     (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, 1);
 }
 
@@ -385,7 +393,7 @@ static void profile_report_and_reset(void) {
     user_log("LinuxAbiServer.perf.begin exec=");
     user_log(g_exec_path);
     user_log("\n");
-    if (!profile_trace_enabled()) {
+    if (!profile_detail_enabled()) {
         user_log_dec_line("LinuxAbiServer.perf.summary.syscalls=", g_prof.syscall_total);
         user_log_dec_line("LinuxAbiServer.perf.summary.vfs_requests=", g_prof.vfs_requests);
         user_log_dec_line("LinuxAbiServer.perf.summary.fs_read_bytes=", g_prof.fs_read_bytes);
