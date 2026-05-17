@@ -1,4 +1,4 @@
-static u32 linux_mode_from_fs(u32 fs_mode, u8 kind) { u32 perm = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0555 : 0444; u32 type = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0040000 : 0100000; if ((fs_mode & FS_DIR_MODE) != 0) type = 0040000; if ((fs_mode & FS_FILE_MODE) != 0) type = 0100000; return type | perm; }
+static u32 linux_mode_from_fs(u32 fs_mode, u8 kind) { u32 perm = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0555 : 0444; u32 type = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0040000 : (kind == FS_OBJECT_SYMLINK ? 0120000 : 0100000); const u32 fs_type = fs_mode & 0xF000; if (fs_type == FS_DIR_MODE) type = 0040000; if (fs_type == FS_FILE_MODE) type = 0100000; if (fs_type == FS_SYMLINK_MODE) type = 0120000; return type | perm; }
 static u64 linux_ino_from_path(const char *path) {
     u64 hash = 1469598103934665603ULL;
     for (u64 i = 0; path[i] != 0; i++) {
@@ -37,20 +37,9 @@ static void fd_set_path(struct fd_entry *fd, const char *path) {
     fd->path[len] = 0;
 }
 
-static int path_contains_literal(const char *path, const char *needle) {
-    const u64 path_len = cstr_len(path);
-    const u64 needle_len = cstr_len(needle);
-    if (needle_len == 0 || needle_len > path_len) return 0;
-    for (u64 i = 0; i + needle_len <= path_len; i++) {
-        u64 j = 0;
-        while (j < needle_len && path[i + j] == needle[j]) j++;
-        if (j == needle_len) return 1;
-    }
-    return 0;
-}
-
 static int path_should_trace_io(const char *path) {
-    return path_contains_literal(path, "/apk") || path_contains_literal(path, "/tmp/");
+    (void)path;
+    return 0;
 }
 
 static void log_io_path(const char *prefix, const char *path) {
@@ -122,11 +111,57 @@ static int normalize_path(const char *base, const char *path, char *out) {
     return 1;
 }
 
-static int resolve_path_at(u64 dirfd, const char *path, char *out) {
+static int chroot_is_default(void) {
+    return g_proc == 0 || (g_proc->root_len == 1 && g_proc->root_path[0] == '/');
+}
+
+static int map_virtual_path_to_host(const char *path, char *out) {
+    if (chroot_is_default()) return normalize_path("/", path, out);
+    if (path[0] != '/') return 0;
+    const u64 root_len = g_proc->root_len;
+    if (root_len == 0 || root_len > FS_MAX_PATH_BYTES) return 0;
+    if (path[1] == 0) {
+        for (u16 i = 0; i <= g_proc->root_len; i++) out[i] = g_proc->root_path[i];
+        return 1;
+    }
+    if (root_len + cstr_len(path) > FS_MAX_PATH_BYTES) return 0;
+    for (u16 i = 0; i < g_proc->root_len; i++) out[i] = g_proc->root_path[i];
+    u16 pos = g_proc->root_len;
+    if (pos > 1 && out[pos - 1] == '/') pos--;
+    for (u16 i = 0; path[i] != 0; i++) out[pos + i] = path[i];
+    out[pos + cstr_len(path)] = 0;
+    return normalize_path("/", out, out);
+}
+
+static int host_path_to_virtual(const char *host, char *out) {
+    if (chroot_is_default()) return normalize_path("/", host, out);
+    const u64 root_len = g_proc->root_len;
+    if (root_len == 0 || root_len > FS_MAX_PATH_BYTES) return 0;
+    for (u16 i = 0; i < root_len; i++) {
+        if (host[i] != g_proc->root_path[i]) return 0;
+    }
+    if (host[root_len] == 0) {
+        out[0] = '/';
+        out[1] = 0;
+        return 1;
+    }
+    if (root_len > 1 && host[root_len] != '/') return 0;
+    return normalize_path("/", host + root_len, out);
+}
+
+static int resolve_virtual_path_at(u64 dirfd, const char *path, char *out) {
     if (path[0] == '/') return normalize_path("/", path, out);
     if (dirfd == AT_FDCWD_U64) return normalize_path(g_cwd, path, out);
     if (!fd_valid(dirfd) || g_fds[dirfd].kind != FD_DIR || g_fds[dirfd].path_len == 0) return 0;
-    return normalize_path(g_fds[dirfd].path, path, out);
+    char base[FS_MAX_PATH_BYTES + 1];
+    if (!host_path_to_virtual(g_fds[dirfd].path, base)) return 0;
+    return normalize_path(base, path, out);
+}
+
+static int resolve_path_at(u64 dirfd, const char *path, char *out) {
+    char virtual_path[FS_MAX_PATH_BYTES + 1];
+    if (!resolve_virtual_path_at(dirfd, path, virtual_path)) return 0;
+    return map_virtual_path_to_host(virtual_path, out);
 }
 
 static int path_is_dev_file(const char *path) {
@@ -165,6 +200,85 @@ static int fs_rdrand64(u64 *out) {
     return 0;
 }
 
+static int read_symlink_target_for_follow(const char *path, char *target, u64 target_capacity, u64 *target_len_out) {
+    *target_len_out = 0;
+    if (target_capacity == 0) return 0;
+    struct fs_stat_record rec;
+    u64 token = 0;
+    u64 size = 0;
+    u8 kind = FS_OBJECT_NONE;
+    if (!vfs_lookup_stat(path, &token, &rec, &size, &kind)) return 0;
+    if (kind != FS_OBJECT_SYMLINK) return 0;
+    u32 request_len = (u32)target_capacity;
+    if (request_len > FS_RESPONSE_PAYLOAD_BYTES) request_len = FS_RESPONSE_PAYLOAD_BYTES;
+    if (!vfs_request(FS_OP_READ, token, 0, request_len, 0)) return 0;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status != FS_STATUS_OK || response->inline_bytes > request_len) return 0;
+    volatile u8 *payload = (volatile u8 *)vfs_response_payload();
+    for (u16 i = 0; i < response->inline_bytes; i++) target[i] = (char)payload[i];
+    target[response->inline_bytes] = 0;
+    *target_len_out = response->inline_bytes;
+    (void)rec;
+    (void)size;
+    return 1;
+}
+
+static int parent_path_for_link(const char *path, char *parent) {
+    u64 last_slash = 0;
+    for (u64 i = 0; path[i] != 0; i++) {
+        if (path[i] == '/') last_slash = i;
+    }
+    if (last_slash == 0) {
+        parent[0] = '/';
+        parent[1] = 0;
+        return 1;
+    }
+    if (last_slash > FS_MAX_PATH_BYTES) return 0;
+    for (u64 i = 0; i < last_slash; i++) parent[i] = path[i];
+    parent[last_slash] = 0;
+    return 1;
+}
+
+static int resolve_symlink_target_for_follow(const char *link_path, char *out) {
+    char target[FS_MAX_PATH_BYTES + 1];
+    u64 target_len = 0;
+    if (!read_symlink_target_for_follow(link_path, target, sizeof(target) - 1, &target_len)) return 0;
+    if (target_len == 0) return 0;
+    if (target[0] == '/') return normalize_path("/", target, out);
+    char parent[FS_MAX_PATH_BYTES + 1];
+    if (!parent_path_for_link(link_path, parent)) return 0;
+    return normalize_path(parent, target, out);
+}
+
+static int vfs_lookup_stat_follow_final(
+    const char *path,
+    int follow_final,
+    char *resolved_out,
+    u64 *token_out,
+    struct fs_stat_record *rec_out,
+    u64 *size_out,
+    u8 *kind_out
+) {
+    char current[FS_MAX_PATH_BYTES + 1];
+    if (!normalize_path("/", path, current)) return 0;
+    for (u32 depth = 0; depth < 16; depth++) {
+        if (!vfs_lookup_stat(current, token_out, rec_out, size_out, kind_out)) return 0;
+        if (!follow_final || *kind_out != FS_OBJECT_SYMLINK) {
+            const u64 len = cstr_len(current);
+            if (len > FS_MAX_PATH_BYTES) return 0;
+            for (u64 i = 0; i <= len; i++) resolved_out[i] = current[i];
+            return 1;
+        }
+        char next[FS_MAX_PATH_BYTES + 1];
+        if (!resolve_symlink_target_for_follow(current, next)) return 0;
+        for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
+            current[i] = next[i];
+            if (next[i] == 0) break;
+        }
+    }
+    return 0;
+}
+
 static u64 random_read_to_target(u64 dst, u64 len, int *fault) {
     *fault = 0;
     if (len == 0) return 0;
@@ -190,7 +304,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     const u64 path_ptr = old_open ? req->args[0] : req->args[1];
     const u64 flags = old_open ? req->args[1] : req->args[2];
     const u64 access_mode = flags & O_ACCMODE;
-    const u32 new_fd_flags = (u32)((flags & O_NONBLOCK) | ((flags & O_CLOEXEC) != 0 ? FD_INTERNAL_CLOEXEC : 0));
+    const u32 new_fd_flags = (u32)(access_mode | (flags & O_NONBLOCK) | ((flags & O_CLOEXEC) != 0 ? FD_INTERNAL_CLOEXEC : 0));
     if (access_mode != O_RDONLY && access_mode != O_WRONLY && access_mode != O_RDWR) return reply(errno_acces(), 0);
     if ((flags & O_TRUNC) != 0 && access_mode == O_RDONLY) return reply(errno_acces(), 0);
     if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
@@ -229,7 +343,8 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         return reply((u64)fd, 0);
     }
     struct fs_stat_record rec; u64 token = 0; u64 size = 0; u8 kind = FS_OBJECT_NONE;
-    if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) {
+    char opened_path[FS_MAX_PATH_BYTES + 1];
+    if (!vfs_lookup_stat_follow_final(resolved, (flags & O_NOFOLLOW) == 0, opened_path, &token, &rec, &size, &kind)) {
         if ((flags & O_CREAT) == 0) return reply(errno_noent(), 0);
         if (!vfs_create_path(resolved, 0)) {
             if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: create request failed path=", resolved);
@@ -252,21 +367,25 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         rec.size_bytes = size;
         rec.mode_bits = FS_FILE_MODE;
         rec.mtime_unix_sec = 0;
+        for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
+            opened_path[i] = resolved[i];
+            if (resolved[i] == 0) break;
+        }
     } else if ((flags & O_TRUNC) != 0 && access_mode != O_RDONLY && !path_is_dev_file(resolved)) {
-        if (!vfs_create_path(resolved, 1)) {
-            if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: truncate request failed path=", resolved);
+        if (!vfs_create_path(opened_path, 1)) {
+            if (path_should_trace_io(opened_path)) log_io_path("LinuxAbiServer: truncate request failed path=", opened_path);
             return reply(errno_io(), 0);
         }
         volatile struct fs_response_header *created = (volatile struct fs_response_header *)vfs_response_addr();
         if (created->status != FS_STATUS_OK || created->result_token == 0) {
-            if (path_should_trace_io(resolved)) {
-                log_io_path("LinuxAbiServer: truncate failed path=", resolved);
+            if (path_should_trace_io(opened_path)) {
+                log_io_path("LinuxAbiServer: truncate failed path=", opened_path);
                 user_log("LinuxAbiServer: truncate status=");
                 user_log_hex_value((u64)(u32)created->status);
             }
             return reply(errno_acces(), 0);
         }
-        invalidate_exec_cache_for_path(resolved);
+        invalidate_exec_cache_for_path(opened_path);
         token = created->result_token;
         size = 0;
         kind = created->object_kind;
@@ -274,13 +393,13 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
     const int fd = alloc_fd(); if (fd < 0) return reply(errno_busy(), 0);
     if (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) {
         g_fds[fd].kind = FD_DIR; g_fds[fd].token = token; g_fds[fd].offset = 0; g_fds[fd].size = 0; g_fds[fd].fd_flags = new_fd_flags; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = kind;
-        fd_set_path(&g_fds[fd], resolved);
+        fd_set_path(&g_fds[fd], opened_path);
         sync_fd_to_thread_group((u64)fd);
         return reply((u64)fd, 0);
     }
     if ((flags & O_DIRECTORY) != 0) return reply(errno_notdir(), 0);
-    if (access_mode == O_RDONLY && (flags & (O_CREAT | O_TRUNC)) == 0 && cacheable_readonly_path(resolved)) {
-        struct file_cache_entry *cached = file_cache_find_by_path(resolved);
+    if (access_mode == O_RDONLY && (flags & (O_CREAT | O_TRUNC)) == 0 && cacheable_readonly_path(opened_path)) {
+        struct file_cache_entry *cached = file_cache_find_by_path(opened_path);
         if (cached != 0 && cached->size == size) {
             g_prof.open_cache_hits++;
             g_fds[fd].kind = FD_FILE;
@@ -290,27 +409,27 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
             g_fds[fd].fd_flags = new_fd_flags;
             g_fds[fd].mode_bits = rec.mode_bits;
             g_fds[fd].object_kind = FS_OBJECT_FILE;
-            fd_set_path(&g_fds[fd], resolved);
+            fd_set_path(&g_fds[fd], opened_path);
             sync_fd_to_thread_group((u64)fd);
             return reply((u64)fd, 0);
         }
         g_prof.open_cache_misses++;
     }
     if (!vfs_request(FS_OP_OPEN, token, 0, 0, 0)) {
-        if (path_should_trace_io(resolved)) log_io_path("LinuxAbiServer: open request failed path=", resolved);
+        if (path_should_trace_io(opened_path)) log_io_path("LinuxAbiServer: open request failed path=", opened_path);
         return reply(errno_io(), 0);
     }
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
     if (response->status != FS_STATUS_OK || response->result_token == 0) {
-        if (path_should_trace_io(resolved)) {
-            log_io_path("LinuxAbiServer: open failed path=", resolved);
+        if (path_should_trace_io(opened_path)) {
+            log_io_path("LinuxAbiServer: open failed path=", opened_path);
             user_log("LinuxAbiServer: open status=");
             user_log_hex_value((u64)(u32)response->status);
         }
         return reply(errno_acces(), 0);
     }
     g_fds[fd].kind = FD_FILE; g_fds[fd].token = response->result_token; g_fds[fd].offset = 0; g_fds[fd].size = response->file_bytes != 0 ? response->file_bytes : size; g_fds[fd].fd_flags = new_fd_flags; g_fds[fd].mode_bits = rec.mode_bits; g_fds[fd].object_kind = FS_OBJECT_FILE;
-    fd_set_path(&g_fds[fd], resolved);
+    fd_set_path(&g_fds[fd], opened_path);
     sync_fd_to_thread_group((u64)fd);
     return reply((u64)fd, 0);
 }
@@ -575,15 +694,9 @@ static struct ipc_message handle_write(const struct trap_request *req) {
         return reply(len, 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_TTY) {
-        char logbuf[129]; u64 logged = 0;
-        while (logged < len) {
-            u64 chunk = min_u64(len - logged, 128);
-            if (copy_from_target(src + logged, logbuf, chunk) != chunk) return reply(errno_fault(), 0);
-            user_log_len(logbuf, chunk);
-            (void)console_write_bytes(logbuf, chunk);
-            logged += chunk;
-        }
-        return reply(len, 0);
+        int fault = 0;
+        const u64 n = console_write_from_target(src, len, &fault);
+        return reply(fault ? errno_fault() : (n != 0 ? n : errno_io()), 0);
     }
     return reply(errno_badf(), 0);
 }
@@ -672,11 +785,13 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
         if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
         const u64 src = pair[0]; const u64 len = pair[1];
         u64 done = 0;
-        while (done < len) {
-            char buf[129]; u64 chunk = min_u64(len - done, 128);
-            if (copy_from_target(src + done, buf, chunk) != chunk) return reply(errno_fault(), 0);
-            user_log_len(buf, chunk);
-            done += chunk;
+        if (g_fds[fd].kind == FD_STDIO && !(fd_valid(0) && g_fds[0].kind == FD_TTY)) {
+            while (done < len) {
+                char buf[129]; u64 chunk = min_u64(len - done, 128);
+                if (copy_from_target(src + done, buf, chunk) != chunk) return reply(errno_fault(), 0);
+                user_log_len(buf, chunk);
+                done += chunk;
+            }
         }
         if (g_fds[fd].kind == FD_STDIO && fd_valid(0) && g_fds[0].kind == FD_TTY) {
             int ignored_fault = 0;
@@ -780,7 +895,7 @@ static struct ipc_message handle_getdents64(const struct trap_request *req) {
         volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)vfs_response_payload(); if (response->inline_bytes < FS_DIRENT_RECORD_BYTES + record->name_bytes) return reply(errno_io(), 0);
         u64 reclen = align_up(19 + record->name_bytes + 1, 8); if (written + reclen > len) break;
         u8 out[320]; for (u64 i = 0; i < sizeof(out); i++) out[i] = 0;
-        *((u64 *)(out + 0)) = 1; *((i64 *)(out + 8)) = (i64)record->next_cursor; *((u16 *)(out + 16)) = (u16)reclen; out[18] = (record->object_kind == FS_OBJECT_DIRECTORY || record->object_kind == FS_OBJECT_MOUNT) ? DT_DIR : DT_REG;
+        *((u64 *)(out + 0)) = 1; *((i64 *)(out + 8)) = (i64)record->next_cursor; *((u16 *)(out + 16)) = (u16)reclen; out[18] = (record->object_kind == FS_OBJECT_DIRECTORY || record->object_kind == FS_OBJECT_MOUNT) ? DT_DIR : (record->object_kind == FS_OBJECT_SYMLINK ? DT_LNK : DT_REG);
         volatile u8 *name = (volatile u8 *)(vfs_response_addr() + FS_RESPONSE_HEADER_BYTES + FS_DIRENT_RECORD_BYTES); for (u64 i = 0; i < record->name_bytes && 19 + i < sizeof(out); i++) out[19 + i] = name[i];
         if (copy_to_target(dst + written, out, reclen) != reclen) return reply(errno_fault(), 0);
         written += reclen; g_fds[fd].offset = record->next_cursor;
@@ -799,11 +914,20 @@ static struct ipc_message handle_lseek(const struct trap_request *req) {
 static struct ipc_message handle_close(const struct trap_request *req) {
     const u64 fd = req->args[0];
     if (fd >= 32 || g_fds[fd].kind == FD_UNUSED) return reply(errno_badf(), 0);
+    int close_error = 0;
+    if (g_fds[fd].kind == FD_FILE && (g_fds[fd].fd_flags & O_ACCMODE) != O_RDONLY && g_fds[fd].token != 0) {
+        if (!vfs_request(FS_OP_CLOSE, g_fds[fd].token, 0, 0, 0)) {
+            close_error = 1;
+        } else {
+            volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+            if (response->status != FS_STATUS_OK) close_error = 1;
+        }
+    }
     if (fd_is_pipe(fd)) close_pipe_fd(fd);
-    if (g_fds[fd].kind == FD_SOCKET) net_close_udp(g_fds[fd].token);
+    if (g_fds[fd].kind == FD_SOCKET) close_socket_entry(&g_fds[fd]);
     g_fds[fd].kind = FD_UNUSED;
     sync_fd_to_thread_group(fd);
-    return reply(0, 0);
+    return reply(close_error ? errno_io() : 0, 0);
 }
 static struct ipc_message handle_unlinkat(const struct trap_request *req, int old_unlink) {
     char path[256];
@@ -820,6 +944,56 @@ static struct ipc_message handle_unlinkat(const struct trap_request *req, int ol
     if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
     return reply(errno_acces(), 0);
 }
+
+static struct ipc_message handle_mkdirat(const struct trap_request *req, int old_mkdir) {
+    char path[256];
+    char resolved[FS_MAX_PATH_BYTES + 1];
+    const u64 dirfd = old_mkdir ? AT_FDCWD_U64 : req->args[0];
+    const u64 path_ptr = old_mkdir ? req->args[0] : req->args[1];
+    (void)(old_mkdir ? req->args[1] : req->args[2]);
+    if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
+    if (path[0] == 0) return reply(errno_noent(), 0);
+    if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    struct fs_stat_record rec;
+    u64 token = 0;
+    u64 size = 0;
+    u8 kind = FS_OBJECT_NONE;
+    if (vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_exist(), 0);
+    if (!vfs_create_path_with_flags(resolved, FS_CREATE_FLAG_DIRECTORY)) return reply(errno_io(), 0);
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status == FS_STATUS_OK) return reply(0, 0);
+    if (response->status == FS_STATUS_NOT_FOUND) return reply(errno_noent(), 0);
+    if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
+    if (response->status == FS_STATUS_NOT_SUPPORTED) return reply(errno_opnotsupp(), 0);
+    return reply(errno_acces(), 0);
+}
+
+static struct ipc_message handle_symlinkat(const struct trap_request *req, int old_symlink) {
+    char target[FS_MAX_PATH_BYTES + 1];
+    char path[256];
+    char resolved[FS_MAX_PATH_BYTES + 1];
+    const u64 target_ptr = req->args[0];
+    const u64 dirfd = old_symlink ? AT_FDCWD_U64 : req->args[1];
+    const u64 path_ptr = old_symlink ? req->args[1] : req->args[2];
+    if (!copy_cstr_from_target(target_ptr, target, sizeof(target))) return reply(errno_nametoolong(), 0);
+    if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
+    if (target[0] == 0 || path[0] == 0) return reply(errno_noent(), 0);
+    if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    struct fs_stat_record rec;
+    u64 token = 0;
+    u64 size = 0;
+    u8 kind = FS_OBJECT_NONE;
+    if (vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_exist(), 0);
+    const u64 target_len = cstr_len(target);
+    if (!vfs_create_symlink_path(resolved, target, (u16)target_len)) return reply(errno_io(), 0);
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status == FS_STATUS_OK) return reply(0, 0);
+    if (response->status == FS_STATUS_NOT_FOUND) return reply(errno_noent(), 0);
+    if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
+    if (response->status == FS_STATUS_NOT_SUPPORTED) return reply(errno_opnotsupp(), 0);
+    return reply(errno_acces(), 0);
+}
+
 static int fs_cstr_eq(const char *a, const char *b) {
     u64 i = 0;
     while (a[i] != 0 || b[i] != 0) {
@@ -859,7 +1033,32 @@ static struct ipc_message handle_renameat(const struct trap_request *req, int ol
     if (response->status == FS_STATUS_NOT_SUPPORTED) return reply(errno_opnotsupp(), 0);
     return reply(errno_acces(), 0);
 }
-static struct ipc_message handle_access(const struct trap_request *req) { char path[256]; char resolved[FS_MAX_PATH_BYTES + 1]; if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0); if (path[0] == 0) return reply(errno_noent(), 0); if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0); if (path_is_dev_tty(resolved)) return reply(0, 0); struct fs_stat_record rec; u64 token = 0, size = 0; u8 kind = 0; return reply(vfs_lookup_stat(resolved, &token, &rec, &size, &kind) ? 0 : errno_noent(), 0); }
+static struct ipc_message handle_access_path(u64 dirfd, u64 path_va, u64 mode, u64 flags) {
+    if ((mode & ~(u64)0x7) != 0) return reply(errno_inval(), 0);
+    if ((flags & ~(u64)(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0) return reply(errno_inval(), 0);
+    char path[256];
+    char resolved[FS_MAX_PATH_BYTES + 1];
+    if (!copy_cstr_from_target(path_va, path, sizeof(path))) return reply(errno_fault(), 0);
+    if (path[0] == 0) {
+        if ((flags & AT_EMPTY_PATH) == 0) return reply(errno_noent(), 0);
+        if (!fd_valid(dirfd)) return reply(errno_badf(), 0);
+        return reply(0, 0);
+    }
+    if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    if (path_is_dev_tty(resolved)) return reply(0, 0);
+    struct fs_stat_record rec;
+    u64 token = 0, size = 0;
+    u8 kind = 0;
+    return reply(vfs_lookup_stat(resolved, &token, &rec, &size, &kind) ? 0 : errno_noent(), 0);
+}
+
+static struct ipc_message handle_access(const struct trap_request *req) {
+    return handle_access_path(AT_FDCWD_U64, req->args[0], req->args[1], 0);
+}
+
+static struct ipc_message handle_faccessat(const struct trap_request *req) {
+    return handle_access_path(req->args[0], req->args[1], req->args[2], req->args[3]);
+}
 static struct ipc_message handle_arch_prctl(const struct trap_request *req) {
     if (req->args[0] != ARCH_SET_FS) return reply(errno_inval(), 0);
     const u64 status = set_target_fs_base(req->args[1]);
@@ -895,6 +1094,20 @@ static struct ipc_message handle_rt_sigprocmask(const struct trap_request *req) 
         if (copy_to_target(oldset_va, &empty, sizeof(empty)) != sizeof(empty)) return reply(errno_fault(), 0);
     }
     return reply(0, 0);
+}
+
+static struct ipc_message handle_rt_sigtimedwait(const struct trap_request *req) {
+    const u64 set_va = req->args[0];
+    const u64 timeout_va = req->args[2];
+    if (set_va == 0) return reply(errno_fault(), 0);
+    u64 set_word = 0;
+    if (copy_from_target(set_va, &set_word, sizeof(set_word)) != sizeof(set_word)) return reply(errno_fault(), 0);
+    if (timeout_va != 0) {
+        i64 timeout[2];
+        if (copy_from_target(timeout_va, timeout, sizeof(timeout)) != sizeof(timeout)) return reply(errno_fault(), 0);
+        if (timeout[0] < 0 || timeout[1] < 0 || timeout[1] >= 1000000000LL) return reply(errno_inval(), 0);
+    }
+    return reply(errno_again(), 0);
 }
 
 static struct ipc_message handle_sigaltstack(const struct trap_request *req) {

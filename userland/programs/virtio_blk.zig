@@ -28,7 +28,7 @@ const syscall_ok: u64 = 0;
 const reply_endpoint_id_base: u64 = 0xC0;
 
 const config_page_va: usize = @intCast(process_abi.standard_config_target_va);
-const max_bulk_read_pages: usize = 16;
+const max_bulk_read_pages: usize = max_data_descriptors;
 const session_poll_timeout_ticks: u64 = 1;
 const request_completion_spin_limit: usize = 50_000_000;
 
@@ -49,7 +49,7 @@ const status_driver: u8 = 0x02;
 const status_driver_ok: u8 = 0x04;
 
 const queue_index_request: u16 = 0;
-const queue_size: u16 = 32;
+const queue_size: u16 = 64;
 const max_data_descriptors: usize = queue_size - 2;
 const queue_used_offset: usize = 4096;
 const desc_flag_next: u16 = 1 << 0;
@@ -924,6 +924,96 @@ fn executeBlockReadToDriverBuffer(block_index: u64, block_count: u32, byte_count
     return false;
 }
 
+fn executeBlockWriteFromDriverBuffer(block_index: u64, block_count: u32, byte_count: usize) bool {
+    if (byte_count == 0 or byte_count > max_data_descriptors * block_protocol.page_bytes) return false;
+    if (block_count == 0 or byte_count != @as(usize, block_count) * @as(usize, @intCast(boot_state.logical_block_size))) return false;
+    const page_count = (byte_count + block_protocol.page_bytes - 1) / block_protocol.page_bytes;
+    if (page_count == 0 or page_count > max_data_descriptors) return false;
+    if (!authorizeBlkRequest(request_type_out, true)) return false;
+    if (boot_state.iommu_token != 0 and request_control_mapping_token == 0) return false;
+
+    var data_mapping_tokens: [max_data_descriptors]u64 = [_]u64{0} ** max_data_descriptors;
+    var page_index: usize = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const remaining = byte_count - page_index * block_protocol.page_bytes;
+        const page_bytes = @min(remaining, block_protocol.page_bytes);
+        data_mapping_tokens[page_index] = createBlkDataMappingForPage(boot_state.dma_data_paddrs[page_index], page_bytes, true);
+        if (data_mapping_tokens[page_index] == 0) {
+            completeAndReleaseMappings(data_mapping_tokens[0..page_index]);
+            return false;
+        }
+    }
+
+    const sectors = block_index * boot_state.sectors_per_block;
+    const header = reqHeaderPtr();
+    header.* = .{
+        .request_type = request_type_out,
+        .reserved = 0,
+        .sector = sectors,
+    };
+    const status = reqStatusPtr();
+    status.* = 0xFF;
+
+    const status_desc_index: u16 = @intCast(1 + page_count);
+    queueDescPtr(0).* = .{
+        .addr = reqHeaderPaddr(),
+        .len = @sizeOf(VirtioBlkReqHeader),
+        .flags = desc_flag_next,
+        .next = 1,
+    };
+    page_index = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const desc_index: u16 = @intCast(1 + page_index);
+        const remaining = byte_count - page_index * block_protocol.page_bytes;
+        const page_bytes = @min(remaining, block_protocol.page_bytes);
+        queueDescPtr(desc_index).* = .{
+            .addr = boot_state.dma_data_paddrs[page_index],
+            .len = @intCast(page_bytes),
+            .flags = desc_flag_next,
+            .next = if (page_index + 1 == page_count) status_desc_index else desc_index + 1,
+        };
+    }
+    queueDescPtr(status_desc_index).* = .{
+        .addr = reqStatusPaddr(),
+        .len = 1,
+        .flags = desc_flag_write,
+        .next = 0,
+    };
+
+    page_index = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        if (!setOptionalDmaMappingState(data_mapping_tokens[page_index], .in_flight)) {
+            completeAndReleaseMappings(data_mapping_tokens[0..page_count]);
+            return false;
+        }
+    }
+    if (queueSubmit(boot_state.queue_submit_token, queue_index_request) != syscall_ok) {
+        completeAndReleaseMappings(data_mapping_tokens[0..page_count]);
+        return false;
+    }
+    queuePushAvail(0);
+    if (queueNotify(boot_state.queue_notify_token, queue_index_request) != syscall_ok) {
+        completeAndReleaseMappings(data_mapping_tokens[0..page_count]);
+        return false;
+    }
+    mmioWriteU16(notify_addr, queue_index_request);
+
+    var spins: usize = 0;
+    while (spins < request_completion_spin_limit) : (spins += 1) {
+        if (queueUsedIdxPtr().* != last_used_idx) {
+            if (isr_base != 0) _ = mmioReadU8(isr_base);
+            _ = queueUsedRingPtr()[@intCast(last_used_idx % queue_size)];
+            last_used_idx +%= 1;
+            completeAndReleaseMappings(data_mapping_tokens[0..page_count]);
+            return status.* == request_status_ok;
+        }
+        if (isr_base != 0 and (spins & 0xFF) == 0) _ = mmioReadU8(isr_base);
+        asm volatile ("pause");
+    }
+    completeAndReleaseMappings(data_mapping_tokens[0..page_count]);
+    return false;
+}
+
 fn bulkVaForOffset(session: *const Session, offset: usize) ?u64 {
     const page_index = offset / block_protocol.page_bytes;
     if (page_index >= session.bulk_page_count) return null;
@@ -1250,11 +1340,13 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
     const byte_count = @as(u64, request.block_count) * boot_state.logical_block_size;
     const end_block = request.block_index + request.block_count;
     const page_count: usize = @intCast(request.flags);
+    const byte_capacity = @as(u64, @intCast(page_count * block_protocol.page_bytes));
+    const max_bulk_bytes = @as(u64, @intCast(max_bulk_read_pages * block_protocol.page_bytes));
     if (request.block_count == 0 or
         page_count == 0 or
         page_count > max_bulk_read_pages or
-        byte_count > page_count * block_protocol.page_bytes or
-        byte_count > block_protocol.page_bytes or
+        byte_count > byte_capacity or
+        byte_count > max_bulk_bytes or
         end_block > boot_state.capacity_blocks or
         request.inline_bytes != page_count * @sizeOf(u64))
     {
@@ -1286,13 +1378,20 @@ fn handleWriteBlocksBulk(session: *Session, request_seq: u64) void {
         return;
     }
 
-    const data = @as([*]u8, @ptrCast(@volatileCast(requestDataPtr())));
-    if (!copyBulkToPlain(session, 0, data[0..@intCast(byte_count)])) {
-        _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk copy failed\n");
-        replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
-        return;
+    var copied: usize = 0;
+    const byte_count_usize: usize = @intCast(byte_count);
+    var data_page_index: usize = 0;
+    while (copied < byte_count_usize) : (data_page_index += 1) {
+        const page_bytes = @min(byte_count_usize - copied, block_protocol.page_bytes);
+        const data = @as([*]u8, @ptrCast(@volatileCast(requestDataPagePtr(data_page_index))));
+        if (!copyBulkToPlain(session, copied, data[0..page_bytes])) {
+            _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk copy failed\n");
+            replyStatus(session, .write_blocks_bulk, request_seq, .invalid);
+            return;
+        }
+        copied += page_bytes;
     }
-    if (!executeBlockRequest(request_type_out, request.block_index, request.block_count, true)) {
+    if (!executeBlockWriteFromDriverBuffer(request.block_index, request.block_count, @intCast(byte_count))) {
         _ = userLog("[virtio_blk] VirtioBlk: write_blocks_bulk io error\n");
         replyStatus(session, .write_blocks_bulk, request_seq, .io_error);
         return;

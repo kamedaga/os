@@ -54,6 +54,7 @@ enum fs_object_kind {
     FS_OBJECT_DIRECTORY = 2,
     FS_OBJECT_FILE = 3,
     FS_OBJECT_OPEN_FILE = 4,
+    FS_OBJECT_SYMLINK = 6,
 };
 
 struct fs_request_header {

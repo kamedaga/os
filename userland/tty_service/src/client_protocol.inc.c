@@ -119,6 +119,8 @@ static void handle_client_request(void) {
         volatile u8 *payload = payload_at(g_client.request_va, CONSOLE_REQUEST_HEADER_BYTES);
         const u64 len = min_u64(request->length, CONSOLE_REQUEST_PAYLOAD_BYTES);
         write_client_response(CONSOLE_OP_SET_ATTR, seq, tty_import_attr(payload, len) ? CONSOLE_STATUS_OK : CONSOLE_STATUS_INVALID, 0, 0, 0);
+    } else if (request->op == CONSOLE_OP_POLL) {
+        write_client_response(CONSOLE_OP_POLL, seq, CONSOLE_STATUS_OK, 0, tty_client_readable() ? 1 : 0, 1);
     } else if (request->op == CONSOLE_OP_GET_SIGNAL) {
         const u8 signo = tty_take_signal();
         if (signo != 0) {

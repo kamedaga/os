@@ -52,6 +52,14 @@ static int vm_add_region(u64 start, u64 size, u64 prot) {
     return 0;
 }
 
+static u64 vm_region_used_count(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (g_regions[i].used) count++;
+    }
+    return count;
+}
+
 static int vm_find_free_region_slot(void) {
     for (u64 i = 0; i < VM_REGION_MAX; i++) if (!g_regions[i].used) return (int)i;
     return -1;
@@ -345,6 +353,9 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     const u64 requested_va = req->args[0]; const u64 len = req->args[1]; u64 prot = req->args[2] & (PROT_READ | PROT_WRITE | PROT_EXEC); const u64 flags = req->args[3]; const u64 fd = req->args[4]; const u64 offset = req->args[5]; const u64 map_type = flags & MAP_TYPE;
     const int file_backed = (flags & MAP_ANONYMOUS) == 0;
     if (len == 0) return reply(errno_inval(), 0); if (map_type != MAP_PRIVATE && map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE) return reply(errno_inval(), 0); if ((offset & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0); if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) return reply(errno_inval(), 0); if (file_backed && (!fd_valid(fd) || g_fds[fd].kind != FD_FILE)) return reply(errno_badf(), 0); prot = normalize_linux_prot(prot);
+    if (file_backed && (prot & PROT_WRITE) != 0 && (map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE)) {
+        return reply(errno_acces(), 0);
+    }
     const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : find_mmap_area(size); const u64 map_prot = file_backed ? ((prot | PROT_WRITE) & ~PROT_EXEC) : prot;
     vm_trace4("vm.mmap.begin", requested_va, len, prot, flags);
     if (target_va == 0) return reply(errno_nomem(), 0);
@@ -394,6 +405,11 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
             user_log("LinuxAbiServer: mmap vm_add_region failed\n");
             user_log_hex_value(target_va);
             user_log_hex_value(size);
+            user_log("LinuxAbiServer: vm regions used=");
+            user_log_dec_value(vm_region_used_count());
+            user_log("\n");
+            (void)unmap_reply_target_pages(target_va, page_count);
+            if (!lazy_anon) (void)unmap_target_pages_from_thread_group(target_va, page_count);
             return reply(errno_nomem(), 0);
         }
         if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) g_mmap_next_va = target_va + size;

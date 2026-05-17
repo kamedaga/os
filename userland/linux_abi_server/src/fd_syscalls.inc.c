@@ -3,6 +3,7 @@ static int fd_clone_into(u64 dst, u64 src, u32 descriptor_flags) {
     copy_fd_entry(&g_fds[dst], &g_fds[src]);
     g_fds[dst].fd_flags = (u32)((g_fds[dst].fd_flags & O_NONBLOCK) | descriptor_flags);
     pipe_ref_fd(&g_fds[dst]);
+    socket_ref_fd(&g_fds[dst]);
     sync_fd_to_thread_group(dst);
     return 1;
 }
@@ -71,6 +72,38 @@ static struct ipc_message handle_pipe2(const struct trap_request *req, int has_f
     return reply(0, 0);
 }
 
+static struct ipc_message handle_epoll_create1(const struct trap_request *req) {
+    const u64 flags = req->args[0];
+    if ((flags & ~(u64)O_CLOEXEC) != 0) return reply(errno_inval(), 0);
+    const int fd = alloc_fd();
+    if (fd < 0) return reply(errno_busy(), 0);
+    g_fds[(u64)fd].kind = FD_EPOLL;
+    g_fds[(u64)fd].token = 0;
+    g_fds[(u64)fd].offset = 0;
+    g_fds[(u64)fd].size = 0;
+    g_fds[(u64)fd].fd_flags = (flags & O_CLOEXEC) != 0 ? FD_INTERNAL_CLOEXEC : 0;
+    g_fds[(u64)fd].mode_bits = FS_FILE_MODE;
+    g_fds[(u64)fd].object_kind = FS_OBJECT_FILE;
+    g_fds[(u64)fd].path_len = 0;
+    g_fds[(u64)fd].path[0] = 0;
+    sync_fd_to_thread_group((u64)fd);
+    return reply((u64)fd, 0);
+}
+
+static struct ipc_message handle_epoll_ctl(const struct trap_request *req) {
+    const u64 epfd = req->args[0];
+    const u64 fd = req->args[2];
+    if (!fd_valid(epfd) || g_fds[epfd].kind != FD_EPOLL) return reply(errno_badf(), 0);
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_epoll_wait(const struct trap_request *req) {
+    const u64 epfd = req->args[0];
+    if (!fd_valid(epfd) || g_fds[epfd].kind != FD_EPOLL) return reply(errno_badf(), 0);
+    return reply(0, 0);
+}
+
 static struct ipc_message handle_dup(const struct trap_request *req) {
     const u64 oldfd = req->args[0];
     const int newfd = alloc_fd_at_least(0);
@@ -88,6 +121,7 @@ static struct ipc_message handle_dup2_like(const struct trap_request *req, int d
     if (dup3 && oldfd == newfd) return reply(errno_inval(), 0);
     if (oldfd == newfd) return reply(newfd, 0);
     if (fd_is_pipe(newfd)) close_pipe_fd(newfd);
+    if (fd_valid(newfd) && g_fds[newfd].kind == FD_SOCKET) close_socket_entry(&g_fds[newfd]);
     if (!fd_clone_into(newfd, oldfd, (flags & O_CLOEXEC) != 0 ? FD_INTERNAL_CLOEXEC : 0)) return reply(errno_badf(), 0);
     return reply(newfd, 0);
 }
@@ -109,11 +143,11 @@ static struct ipc_message handle_fcntl(const struct trap_request *req) {
         return reply(0, 0);
     }
     if (cmd == F_GETFL) {
-        const u64 access = g_fds[fd].kind == FD_PIPE_WRITE ? O_WRONLY : (g_fds[fd].kind == FD_SOCKET ? O_RDWR : O_RDONLY);
+        const u64 access = g_fds[fd].kind == FD_PIPE_WRITE ? O_WRONLY : (g_fds[fd].kind == FD_SOCKET ? O_RDWR : (g_fds[fd].fd_flags & O_ACCMODE));
         return reply(access | (g_fds[fd].fd_flags & O_NONBLOCK), 0);
     }
     if (cmd == F_SETFL) {
-        g_fds[fd].fd_flags = (u32)((g_fds[fd].fd_flags & FD_INTERNAL_CLOEXEC) | (arg & O_NONBLOCK));
+        g_fds[fd].fd_flags = (u32)((g_fds[fd].fd_flags & (FD_INTERNAL_CLOEXEC | O_ACCMODE)) | (arg & O_NONBLOCK));
         sync_fd_to_thread_group(fd);
         return reply(0, 0);
     }

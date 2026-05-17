@@ -115,6 +115,7 @@ enum {
     NET_OP_TCP_WRITE = 9,
     NET_OP_TCP_READ = 10,
     NET_OP_TCP_READ_BULK = 11,
+    NET_TCP_READ_FLAG_NOWAIT = 1 << 0,
     NET_STATUS_OK = 0,
     NET_STATUS_INVALID = 2,
     NET_STATUS_NOT_CONNECTED = 4,
@@ -141,16 +142,16 @@ enum {
     NET_TCP_CONNECTIONS = 4,
     NET_TCP_MAX_PAYLOAD = 1200,
     NET_TCP_MSS = 1200,
-    NET_TCP_BULK_READ_PAGE_COUNT = 16,
+    NET_TCP_BULK_READ_PAGE_COUNT = 64,
     NET_TCP_BULK_READ_BYTES = NET_TCP_BULK_READ_PAGE_COUNT * 4096,
     NET_TCP_OOO_SEGMENTS = 8,
     NET_TCP_OOO_BYTES = 4096,
     NET_TCP_RX_BYTES = 4 * 1024 * 1024,
-    NET_TCP_RX_SOFT_LIMIT = 256 * 1024,
+    NET_TCP_RX_SOFT_LIMIT = 1024 * 1024,
     NET_TCP_WINDOW_MAX = 64 * 1024 - 1,
     NET_SESSION_MAX = 4,
     NET_PENDING_READ_ACTIVE_POLL_ROUNDS = 1024,
-    NET_CONNECTION_ACTIVE_POLL_ROUNDS = 16,
+    NET_CONNECTION_ACTIVE_POLL_ROUNDS = 4,
     NET_ACTIVE_POLL_PAUSE = 64,
     NET_UDP_HANDLE_TAG = 0x5544500000000000ULL,
     NET_TCP_HANDLE_TAG = 0x5443500000000000ULL,
@@ -287,6 +288,22 @@ struct net_status_payload {
     u64 net_service_active_poll_rounds;
     u64 net_service_active_poll_hits;
     u64 net_service_active_poll_misses;
+    u64 tcp_pending_read_defers;
+    u64 tcp_pending_read_completions;
+    u64 tcp_pending_read_rx_seen;
+    u64 tcp_pending_read_rx_completed;
+    u64 tcp_pending_read_wait_cycles;
+    u64 tcp_pending_read_wait_max_cycles;
+    u64 tcp_pending_read_rx_to_complete_cycles;
+    u64 tcp_pending_read_rx_to_complete_max_cycles;
+    u64 tcp_read_would_block_blocking;
+    u64 tcp_read_would_block_nowait;
+    u64 tcp_read_bulk_would_block_blocking;
+    u64 tcp_read_bulk_would_block_nowait;
+    u64 tcp_pending_read_defers_read;
+    u64 tcp_pending_read_defers_bulk;
+    u64 tcp_pending_read_retry_would_block_read;
+    u64 tcp_pending_read_retry_would_block_bulk;
 };
 
 struct net_session {
@@ -307,6 +324,8 @@ struct net_session {
     u32 pending_out_cap;
     u64 pending_seq;
     u64 pending_handle;
+    u64 pending_defer_tsc;
+    u64 pending_first_rx_tsc;
     u64 bulk_tokens[NET_TCP_BULK_READ_PAGE_COUNT];
     u64 bulk_vas[NET_TCP_BULK_READ_PAGE_COUNT];
     u8 bulk_mapped;
@@ -426,8 +445,23 @@ static u64 g_net_service_idle_sleeps;
 static u64 g_net_service_active_poll_rounds;
 static u64 g_net_service_active_poll_hits;
 static u64 g_net_service_active_poll_misses;
+static u64 g_tcp_pending_read_defers;
+static u64 g_tcp_pending_read_completions;
+static u64 g_tcp_pending_read_rx_seen;
+static u64 g_tcp_pending_read_rx_completed;
+static u64 g_tcp_pending_read_wait_cycles;
+static u64 g_tcp_pending_read_wait_max_cycles;
+static u64 g_tcp_pending_read_rx_to_complete_cycles;
+static u64 g_tcp_pending_read_rx_to_complete_max_cycles;
+static u64 g_tcp_read_would_block_blocking;
+static u64 g_tcp_read_would_block_nowait;
+static u64 g_tcp_read_bulk_would_block_blocking;
+static u64 g_tcp_read_bulk_would_block_nowait;
+static u64 g_tcp_pending_read_defers_read;
+static u64 g_tcp_pending_read_defers_bulk;
+static u64 g_tcp_pending_read_retry_would_block_read;
+static u64 g_tcp_pending_read_retry_would_block_bulk;
 static int g_msix_enabled;
-static u64 g_tcp_next_progress_log_bytes = 64 * 1024;
 
 void *memset(void *dst, int value, u64 n) {
     u8 *d = (u8 *)dst;
@@ -455,6 +489,13 @@ static u64 cstr_len(const char *s) {
     u64 n = 0;
     while (s[n] != 0) n++;
     return n;
+}
+
+static u64 read_tsc(void) {
+    u32 lo;
+    u32 hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
 }
 
 static void user_log_len(const char *message, u64 len) {
@@ -700,38 +741,11 @@ static void tcp_connection_totals(u64 *active, u64 *established, u64 *buffered, 
 }
 
 static void tcp_log_progress_if_needed(void) {
-    if (g_tcp_rx_in_order_bytes < g_tcp_next_progress_log_bytes) return;
-    while (g_tcp_rx_in_order_bytes >= g_tcp_next_progress_log_bytes) {
-        g_tcp_next_progress_log_bytes += 64 * 1024;
-    }
-    u64 active = 0;
-    u64 established = 0;
-    u64 buffered = 0;
-    u64 max_buffered = 0;
-    u64 ack_pending = 0;
-    tcp_connection_totals(&active, &established, &buffered, &max_buffered, &ack_pending);
-    char line[192];
-    u64 len = 0;
-    line[0] = 0;
-    append_str(line, sizeof(line), &len, "[virtio_net] VirtioNet: tcp progress rx_in=");
-    append_u64_dec(line, sizeof(line), &len, g_tcp_rx_in_order_bytes);
-    append_str(line, sizeof(line), &len, " read=");
-    append_u64_dec(line, sizeof(line), &len, g_tcp_read_bytes);
-    append_str(line, sizeof(line), &len, " tx=");
-    append_u64_dec(line, sizeof(line), &len, g_tcp_tx_payload_bytes);
-    append_str(line, sizeof(line), &len, " queued=");
-    append_u64_dec(line, sizeof(line), &len, buffered);
-    append_str(line, sizeof(line), &len, " active=");
-    append_u64_dec(line, sizeof(line), &len, active);
-    append_str(line, sizeof(line), &len, " est=");
-    append_u64_dec(line, sizeof(line), &len, established);
-    append_str(line, sizeof(line), &len, " ackp=");
-    append_u64_dec(line, sizeof(line), &len, ack_pending);
-    append_char(line, sizeof(line), &len, '\n');
-    user_log_len(line, len);
+    (void)0;
 }
 
 static void tcp_log_rx_full(const struct tcp_connection *conn, u32 append_len) {
+    return;
     if (g_tcp_rx_append_failed > 8) return;
     char line[192];
     u64 len = 0;
@@ -817,6 +831,7 @@ static void log_mac(void) {
 }
 
 static void log_rx_packet(u64 bytes, u16 ethertype) {
+    return;
     char line[128];
     u64 len = 0;
     line[0] = 0;
@@ -830,6 +845,7 @@ static void log_rx_packet(u64 bytes, u16 ethertype) {
 }
 
 static void log_arp(u16 op) {
+    return;
     char line[96];
     u64 len = 0;
     line[0] = 0;
@@ -855,6 +871,7 @@ static void log_arp_reply(const u8 *sha, u32 spa) {
 }
 
 static void log_udp(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port) {
+    return;
     char line[160];
     u64 len = 0;
     line[0] = 0;
@@ -970,6 +987,22 @@ static void write_net_status_payload(void) {
     payload->net_service_active_poll_rounds = g_net_service_active_poll_rounds;
     payload->net_service_active_poll_hits = g_net_service_active_poll_hits;
     payload->net_service_active_poll_misses = g_net_service_active_poll_misses;
+    payload->tcp_pending_read_defers = g_tcp_pending_read_defers;
+    payload->tcp_pending_read_completions = g_tcp_pending_read_completions;
+    payload->tcp_pending_read_rx_seen = g_tcp_pending_read_rx_seen;
+    payload->tcp_pending_read_rx_completed = g_tcp_pending_read_rx_completed;
+    payload->tcp_pending_read_wait_cycles = g_tcp_pending_read_wait_cycles;
+    payload->tcp_pending_read_wait_max_cycles = g_tcp_pending_read_wait_max_cycles;
+    payload->tcp_pending_read_rx_to_complete_cycles = g_tcp_pending_read_rx_to_complete_cycles;
+    payload->tcp_pending_read_rx_to_complete_max_cycles = g_tcp_pending_read_rx_to_complete_max_cycles;
+    payload->tcp_read_would_block_blocking = g_tcp_read_would_block_blocking;
+    payload->tcp_read_would_block_nowait = g_tcp_read_would_block_nowait;
+    payload->tcp_read_bulk_would_block_blocking = g_tcp_read_bulk_would_block_blocking;
+    payload->tcp_read_bulk_would_block_nowait = g_tcp_read_bulk_would_block_nowait;
+    payload->tcp_pending_read_defers_read = g_tcp_pending_read_defers_read;
+    payload->tcp_pending_read_defers_bulk = g_tcp_pending_read_defers_bulk;
+    payload->tcp_pending_read_retry_would_block_read = g_tcp_pending_read_retry_would_block_read;
+    payload->tcp_pending_read_retry_would_block_bulk = g_tcp_pending_read_retry_would_block_bulk;
 }
 
 static const u8 *net_request_payload(void) {
@@ -1626,12 +1659,42 @@ static int tcp_read_bulk(u64 handle, struct net_session *session, u32 out_cap, u
     return NET_STATUS_OK;
 }
 
+static void count_tcp_read_would_block(u16 op, int nowait) {
+    if (op == NET_OP_TCP_READ_BULK) {
+        if (nowait) g_tcp_read_bulk_would_block_nowait++;
+        else g_tcp_read_bulk_would_block_blocking++;
+    } else {
+        if (nowait) g_tcp_read_would_block_nowait++;
+        else g_tcp_read_would_block_blocking++;
+    }
+}
+
+static void count_pending_tcp_read_retry_would_block(u16 op) {
+    if (op == NET_OP_TCP_READ_BULK) g_tcp_pending_read_retry_would_block_bulk++;
+    else g_tcp_pending_read_retry_would_block_read++;
+}
+
 static void defer_tcp_read_response(struct net_session *session, u16 op, u64 seq, u64 handle, u32 out_cap) {
     session->pending_tcp_read = 1;
     session->pending_op = op;
     session->pending_seq = seq;
     session->pending_handle = handle;
     session->pending_out_cap = out_cap;
+    session->pending_defer_tsc = read_tsc();
+    session->pending_first_rx_tsc = 0;
+    g_tcp_pending_read_defers++;
+    if (op == NET_OP_TCP_READ_BULK) g_tcp_pending_read_defers_bulk++;
+    else g_tcp_pending_read_defers_read++;
+}
+
+static void mark_pending_tcp_read_rx_seen(void) {
+    const u64 now = read_tsc();
+    for (u64 i = 0; i < NET_SESSION_MAX; i++) {
+        struct net_session *session = &g_sessions[i];
+        if (!session->active || !session->pending_tcp_read || session->pending_first_rx_tsc != 0) continue;
+        session->pending_first_rx_tsc = now;
+        g_tcp_pending_read_rx_seen++;
+    }
 }
 
 static int finish_tcp_read_response(struct net_session *session) {
@@ -1651,16 +1714,32 @@ static int finish_tcp_read_response(struct net_session *session) {
         if (status == NET_STATUS_OK) write_net_response(NET_OP_TCP_READ_BULK, session->pending_seq, status, 0, out_len, 0, 0);
     }
     if (status == NET_STATUS_WOULD_BLOCK) {
+        count_pending_tcp_read_retry_would_block(session->pending_op);
         g_current_session = 0;
         return 0;
     }
     if (status != NET_STATUS_OK) write_net_response(session->pending_op, session->pending_seq, status, 0, 0, 0, 0);
+    const u64 completed_tsc = read_tsc();
+    if (session->pending_defer_tsc != 0 && completed_tsc >= session->pending_defer_tsc) {
+        const u64 wait_cycles = completed_tsc - session->pending_defer_tsc;
+        g_tcp_pending_read_wait_cycles += wait_cycles;
+        if (wait_cycles > g_tcp_pending_read_wait_max_cycles) g_tcp_pending_read_wait_max_cycles = wait_cycles;
+    }
+    if (session->pending_first_rx_tsc != 0 && completed_tsc >= session->pending_first_rx_tsc) {
+        const u64 rx_cycles = completed_tsc - session->pending_first_rx_tsc;
+        g_tcp_pending_read_rx_completed++;
+        g_tcp_pending_read_rx_to_complete_cycles += rx_cycles;
+        if (rx_cycles > g_tcp_pending_read_rx_to_complete_max_cycles) g_tcp_pending_read_rx_to_complete_max_cycles = rx_cycles;
+    }
+    g_tcp_pending_read_completions++;
     session->last_completed_seq = session->pending_seq;
     session->pending_tcp_read = 0;
     session->pending_op = 0;
     session->pending_seq = 0;
     session->pending_handle = 0;
     session->pending_out_cap = 0;
+    session->pending_defer_tsc = 0;
+    session->pending_first_rx_tsc = 0;
     g_current_session = 0;
     return 1;
 }
@@ -2154,6 +2233,7 @@ static int poll_rx_queue_budget(u32 budget) {
                 }
             }
             parse_ethernet_frame(src + offset, packet_len - offset, checksum_complete);
+            mark_pending_tcp_read_rx_seen();
             (void)finish_pending_tcp_reads();
         }
         queue_push_avail(&g_rx_queue, desc_index);
@@ -2242,6 +2322,8 @@ static int finish_net_connect(
     session->pending_seq = 0;
     session->pending_handle = 0;
     session->pending_out_cap = 0;
+    session->pending_defer_tsc = 0;
+    session->pending_first_rx_tsc = 0;
     g_current_session = session;
     write_net_response(NET_OP_CONNECT, request->request_seq, NET_STATUS_OK, 0, 0, 0, 0);
     session->last_completed_seq = request->request_seq;
@@ -2401,6 +2483,13 @@ static int handle_net_request_for_session(struct net_session *session) {
         if (out_cap > NET_PAYLOAD_BYTES) out_cap = NET_PAYLOAD_BYTES;
         const int status = tcp_read(request->arg0, net_response_payload(), out_cap, &out_len);
         if (status == NET_STATUS_WOULD_BLOCK) {
+            count_tcp_read_would_block(NET_OP_TCP_READ, (request->arg2 & NET_TCP_READ_FLAG_NOWAIT) != 0);
+            if ((request->arg2 & NET_TCP_READ_FLAG_NOWAIT) != 0) {
+                write_net_response(NET_OP_TCP_READ, seq, status, 0, 0, 0, 0);
+                session->last_completed_seq = seq;
+                g_current_session = 0;
+                return 1;
+            }
             defer_tcp_read_response(session, NET_OP_TCP_READ, seq, request->arg0, out_cap);
             g_current_session = 0;
             return 1;
@@ -2412,6 +2501,13 @@ static int handle_net_request_for_session(struct net_session *session) {
         if (out_cap > NET_TCP_BULK_READ_BYTES) out_cap = NET_TCP_BULK_READ_BYTES;
         const int status = tcp_read_bulk(request->arg0, session, out_cap, &out_len);
         if (status == NET_STATUS_WOULD_BLOCK) {
+            count_tcp_read_would_block(NET_OP_TCP_READ_BULK, (request->arg2 & NET_TCP_READ_FLAG_NOWAIT) != 0);
+            if ((request->arg2 & NET_TCP_READ_FLAG_NOWAIT) != 0) {
+                write_net_response(NET_OP_TCP_READ_BULK, seq, status, 0, 0, 0, 0);
+                session->last_completed_seq = seq;
+                g_current_session = 0;
+                return 1;
+            }
             defer_tcp_read_response(session, NET_OP_TCP_READ_BULK, seq, request->arg0, out_cap);
             g_current_session = 0;
             return 1;

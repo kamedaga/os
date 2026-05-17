@@ -45,7 +45,7 @@ void dash_shim_main(void) {
         "PATH=/bin:/usr/bin:/usr/lib/uutils:/cmd",
         "HOME=/",
         "SHELL=/bin/dash",
-        "TERM=virtio-console",
+        "TERM=ansi",
         "PS1=# ",
         "CAPABILITYOS=1",
     };

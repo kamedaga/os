@@ -39,6 +39,7 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->mmap_next_va = 0x29000000ULL;
     proc->brk_next_va = 0x38000000ULL;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
+    proc->root_path[0] = '/'; proc->root_path[1] = 0; proc->root_len = 1;
     proc->cwd[0] = '/'; proc->cwd[1] = 0; proc->cwd_len = 1;
     for (u64 i = 0; i < LINUX_CHILD_MAX; i++) proc->child_used[i] = 0;
     proc->wait_pending = 0;
@@ -63,6 +64,11 @@ static void init_process_tables(void) {
         g_deferred_start_used[i] = 0;
     }
     for (u64 i = 0; i < PIPE_MAX; i++) g_pipes[i].used = 0;
+    for (u64 i = 0; i < SOCKET_REF_MAX; i++) {
+        g_socket_refs[i].used = 0;
+        g_socket_refs[i].refs = 0;
+        g_socket_refs[i].token = 0;
+    }
     for (u64 i = 0; i < FUTEX_WAITER_MAX; i++) g_futex_waiters[i].used = 0;
     g_next_linux_pid = 100;
 }
@@ -154,11 +160,65 @@ static int alloc_pipe_slot(void) {
 }
 static int fd_entry_is_pipe(const struct fd_entry *entry) { return entry != 0 && (entry->kind == FD_PIPE_READ || entry->kind == FD_PIPE_WRITE); }
 static int fd_is_pipe(u64 fd) { return g_proc != 0 && fd < 32 && fd_entry_is_pipe(&g_fds[fd]); }
+static void net_close_udp(u64 handle);
 
 static void pipe_ref_fd(const struct fd_entry *fd) {
     if (fd->pipe_id >= PIPE_MAX || !g_pipes[fd->pipe_id].used) return;
     if (fd->kind == FD_PIPE_READ) g_pipes[fd->pipe_id].read_refs++;
     if (fd->kind == FD_PIPE_WRITE) g_pipes[fd->pipe_id].write_refs++;
+}
+
+static struct socket_ref_entry *socket_ref_find(u64 token) {
+    if (token == 0) return 0;
+    for (u64 i = 0; i < SOCKET_REF_MAX; i++) {
+        if (g_socket_refs[i].used && g_socket_refs[i].token == token) return &g_socket_refs[i];
+    }
+    return 0;
+}
+
+static void socket_ref_add_token(u64 token) {
+    if (token == 0) return;
+    struct socket_ref_entry *entry = socket_ref_find(token);
+    if (entry != 0) {
+        if (entry->refs != 0xffffu) entry->refs++;
+        return;
+    }
+    for (u64 i = 0; i < SOCKET_REF_MAX; i++) {
+        if (g_socket_refs[i].used) continue;
+        g_socket_refs[i].used = 1;
+        g_socket_refs[i].refs = 1;
+        g_socket_refs[i].token = token;
+        return;
+    }
+    user_log("LinuxAbiServer: socket ref table full token=");
+    user_log_hex_value(token);
+}
+
+static void socket_ref_fd(const struct fd_entry *fd) {
+    if (fd != 0 && fd->kind == FD_SOCKET) socket_ref_add_token(fd->token);
+}
+
+static void socket_ref_release_token(u64 token) {
+    if (token == 0) return;
+    struct socket_ref_entry *entry = socket_ref_find(token);
+    if (entry == 0) {
+        net_close_udp(token);
+        return;
+    }
+    if (entry->refs > 1) {
+        entry->refs--;
+        return;
+    }
+    entry->used = 0;
+    entry->refs = 0;
+    entry->token = 0;
+    net_close_udp(token);
+}
+
+static void close_socket_entry(struct fd_entry *entry) {
+    if (entry == 0 || entry->kind != FD_SOCKET) return;
+    socket_ref_release_token(entry->token);
+    entry->token = 0;
 }
 
 static int pipe_has_live_writer(u8 pipe_id);

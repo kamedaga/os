@@ -118,7 +118,7 @@ enum {
     SCRATCH_REGISTRY_COPY_VA = 0x26804000,
     MAX_APP_IMAGE_BYTES = 2 * 1024 * 1024,
     MAX_LD_IMAGE_BYTES = 768 * 1024,
-    MAX_SERVICE_IMAGE_BYTES = 256 * 1024,
+    MAX_SERVICE_IMAGE_BYTES = 512 * 1024,
 };
 
 struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };

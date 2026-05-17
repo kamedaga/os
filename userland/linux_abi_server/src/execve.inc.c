@@ -20,6 +20,15 @@ static const char *g_execve_profile_labels[64];
 static u64 g_execve_profile_tick[64];
 static u64 g_execve_profile_dt[64];
 static u64 g_execve_profile_total[64];
+static char g_execve_path_buf[256];
+static char g_execve_virtual_path_buf[FS_MAX_PATH_BYTES + 1];
+static char g_execve_resolved_path_buf[FS_MAX_PATH_BYTES + 1];
+static char g_execve_uutils_tool_buf[32];
+static char g_execve_target_arg_buf[256];
+static char g_execve_prefix_buf[128];
+static char g_execve_shebang_interpreter_buf[FS_MAX_PATH_BYTES + 1];
+static char g_execve_shebang_arg_buf[FS_MAX_PATH_BYTES + 1];
+static char g_execve_interpreter_resolved_buf[FS_MAX_PATH_BYTES + 1];
 
 static int path_has_prefix(const char *path, const char *prefix) {
     u64 i = 0;
@@ -142,12 +151,73 @@ static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_reco
     return 1;
 }
 
-static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_bytes_out) {
+static int execve_read_symlink_target(const char *path, char *target, u64 target_capacity, u64 *target_len_out) {
+    *target_len_out = 0;
+    if (target_capacity == 0) return 0;
     struct fs_stat_record rec;
+    u64 token = 0;
+    u64 size = 0;
     u8 kind = FS_OBJECT_NONE;
-    if (!vfs_lookup_stat(path, token_out, &rec, file_bytes_out, &kind)) return 0;
-    if (kind != FS_OBJECT_FILE) return 0;
-    return *file_bytes_out != 0;
+    if (!vfs_lookup_stat(path, &token, &rec, &size, &kind)) return 0;
+    if (kind != FS_OBJECT_SYMLINK) return 0;
+    u32 request_len = (u32)target_capacity;
+    if (request_len > FS_RESPONSE_PAYLOAD_BYTES) request_len = FS_RESPONSE_PAYLOAD_BYTES;
+    if (!vfs_request(FS_OP_READ, token, 0, request_len, 0)) return 0;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status != FS_STATUS_OK || response->inline_bytes > request_len) return 0;
+    volatile u8 *payload = (volatile u8 *)vfs_response_payload();
+    for (u16 i = 0; i < response->inline_bytes; i++) target[i] = (char)payload[i];
+    target[response->inline_bytes] = 0;
+    *target_len_out = response->inline_bytes;
+    (void)rec;
+    (void)size;
+    return 1;
+}
+
+static int execve_parent_path(const char *path, char *parent) {
+    u64 last_slash = 0;
+    for (u64 i = 0; path[i] != 0; i++) {
+        if (path[i] == '/') last_slash = i;
+    }
+    if (last_slash == 0) {
+        parent[0] = '/';
+        parent[1] = 0;
+        return 1;
+    }
+    if (last_slash > FS_MAX_PATH_BYTES) return 0;
+    for (u64 i = 0; i < last_slash; i++) parent[i] = path[i];
+    parent[last_slash] = 0;
+    return 1;
+}
+
+static int execve_resolve_symlink_target(const char *link_path, char *out) {
+    char target[FS_MAX_PATH_BYTES + 1];
+    u64 target_len = 0;
+    if (!execve_read_symlink_target(link_path, target, sizeof(target) - 1, &target_len)) return 0;
+    if (target_len == 0) return 0;
+    if (target[0] == '/') return normalize_path("/", target, out);
+    char parent[FS_MAX_PATH_BYTES + 1];
+    if (!execve_parent_path(link_path, parent)) return 0;
+    return normalize_path(parent, target, out);
+}
+
+static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_bytes_out) {
+    char current[FS_MAX_PATH_BYTES + 1];
+    if (!normalize_path("/", path, current)) return 0;
+    for (u32 depth = 0; depth < 16; depth++) {
+        struct fs_stat_record rec;
+        u8 kind = FS_OBJECT_NONE;
+        if (!vfs_lookup_stat(current, token_out, &rec, file_bytes_out, &kind)) return 0;
+        if (kind == FS_OBJECT_FILE) return *file_bytes_out != 0;
+        if (kind != FS_OBJECT_SYMLINK) return 0;
+        char next[FS_MAX_PATH_BYTES + 1];
+        if (!execve_resolve_symlink_target(current, next)) return 0;
+        for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
+            current[i] = next[i];
+            if (next[i] == 0) break;
+        }
+    }
+    return 0;
 }
 
 static int is_vm_object_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG && (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
@@ -389,6 +459,15 @@ static struct exec_cache_entry *exec_cache_find(const char *path, u64 path_len) 
     return 0;
 }
 
+static int exec_path_eq_literal(const char *path, const char *literal) {
+    u64 i = 0;
+    while (path[i] != 0 && literal[i] != 0) {
+        if (path[i] != literal[i]) return 0;
+        i++;
+    }
+    return path[i] == 0 && literal[i] == 0;
+}
+
 static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 file_bytes) {
     if (!EXEC_OPT_MAIN_VM_CACHE && !EXEC_OPT_SERVICE_SOURCE_CACHE) return;
     if (path_len == 0 || path_len > FS_MAX_PATH_BYTES) return;
@@ -413,9 +492,47 @@ static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 f
 
 static void invalidate_exec_cache_for_path(const char *path) {
     path_cache_invalidate(path);
+    if (exec_path_eq_literal(path, "/lib/ld-musl-x86_64.so.1")) {
+        g_standard_interpreter_dirty = 1;
+    }
     const u64 path_len = cstr_len(path);
     struct exec_cache_entry *entry = exec_cache_find(path, path_len);
     if (entry != 0) entry->used = 0;
+}
+
+static int ensure_standard_interpreter_scratch(void) {
+    if (execve_ld_scratch_ready) return 1;
+    const u64 pages = (EXECVE_MAX_LD_BYTES + PAGE_BYTES - 1) / PAGE_BYTES;
+    if (!alloc_map_range_self(EXECVE_LD_IMAGE_VA, pages, 1)) return 0;
+    execve_ld_scratch_ready = 1;
+    return 1;
+}
+
+static int ensure_standard_interpreter_current(void) {
+    if (!g_standard_interpreter_dirty &&
+        is_vm_object_token(g_standard_interpreter_vm_token) &&
+        g_standard_interpreter_bytes != 0) {
+        return 1;
+    }
+    if (!ensure_standard_interpreter_scratch()) {
+        user_log("LinuxAbiServer: ld scratch failed\n");
+        return 0;
+    }
+    u64 file_bytes = 0;
+    if (!vfs_read_file_to_buffer("/lib/ld-musl-x86_64.so.1", EXECVE_LD_IMAGE_VA, EXECVE_MAX_LD_BYTES, &file_bytes)) {
+        user_log("LinuxAbiServer: ld reload read failed\n");
+        return 0;
+    }
+    const u64 vm_token = install_vm_object_from_buffer(EXECVE_LD_IMAGE_VA, file_bytes);
+    if (vm_token == 0) {
+        user_log("LinuxAbiServer: ld reload vm install failed\n");
+        return 0;
+    }
+    g_standard_interpreter_vm_token = vm_token;
+    g_standard_interpreter_bytes = file_bytes;
+    g_standard_interpreter_dirty = 0;
+    user_log("LinuxAbiServer: ld reloaded\n");
+    return 1;
 }
 
 static int get_exec_vm_for_path(const char *path, u64 *vm_token_out, u64 *file_bytes_out) {
@@ -458,6 +575,20 @@ static u64 get_exec_program_token(void) {
 static u64 grant_vm_object_to_exec(u64 vm_token) {
     const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_exec_service_slot, VM_RIGHT_READ_MAP);
     return is_vm_object_token(granted) ? granted : 0;
+}
+
+static u64 grant_standard_interpreter_to_exec_service(void) {
+    if (g_exec_service_interpreter_granted_slot == g_exec_service_slot &&
+        g_exec_service_interpreter_source_token == g_standard_interpreter_vm_token &&
+        is_vm_object_token(g_exec_service_interpreter_granted_token)) {
+        return g_exec_service_interpreter_granted_token;
+    }
+    const u64 granted = grant_vm_object_to_exec(g_standard_interpreter_vm_token);
+    if (granted == 0) return 0;
+    g_exec_service_interpreter_granted_slot = g_exec_service_slot;
+    g_exec_service_interpreter_source_token = g_standard_interpreter_vm_token;
+    g_exec_service_interpreter_granted_token = granted;
+    return granted;
 }
 
 static u64 exec_launch_request_addr(void) { return g_exec_launch_request_map.addr; }
@@ -536,6 +667,7 @@ static int start_exec_service(void) {
 static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct exec_cache_entry *entry, u64 main_vm_token, u64 *spawned_principal_out) {
     if (!ensure_exec_service_pages()) { user_log("LinuxAbiServer: exec service pages failed\n"); return 0; }
     execve_profile_step("exec service pages done");
+    if (!ensure_standard_interpreter_current()) return 0;
     if (!start_exec_service()) return 0;
     execve_profile_step("exec service started");
 
@@ -550,7 +682,13 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
             return 0;
         }
     }
-    cfg->interpreter_vm_token = 0;
+    execve_profile_step("exec service interpreter grant begin");
+    cfg->interpreter_vm_token = grant_standard_interpreter_to_exec_service();
+    execve_profile_step("exec service interpreter grant done");
+    if (cfg->interpreter_vm_token == 0) {
+        user_log("LinuxAbiServer: exec service interpreter grant failed\n");
+        return 0;
+    }
 
     const u64 request_addr = exec_launch_request_addr();
     const u64 response_addr = exec_launch_response_addr();
@@ -799,9 +937,22 @@ static int append_exec_arg(struct exec_bootstrap_config *cfg, u16 *cursor, const
 }
 
 static int append_target_cstr_arg(struct exec_bootstrap_config *cfg, u16 *cursor, u64 target_va, u16 *offset_out, u16 *len_out) {
-    char temp[256];
-    if (!copy_cstr_from_target(target_va, temp, sizeof(temp))) return 0;
+    char *temp = g_execve_target_arg_buf;
+    if (!copy_cstr_from_target(target_va, temp, sizeof(g_execve_target_arg_buf))) return 0;
     return append_exec_arg(cfg, cursor, temp, cstr_len(temp), offset_out, len_out);
+}
+
+static int append_target_argv_tail(struct exec_bootstrap_config *cfg, u16 *cursor, u64 argv_va, u64 source_index, u64 *argv_count) {
+    if (argv_va == 0) return 1;
+    while (*argv_count < EXECVE_MAX_ARGV) {
+        u64 ptr = 0;
+        if (copy_from_target(argv_va + source_index * 8, &ptr, 8) != 8) return 0;
+        if (ptr == 0) return 1;
+        if (!append_target_cstr_arg(cfg, cursor, ptr, &cfg->argv_offsets[*argv_count], &cfg->argv_bytes[*argv_count])) return 0;
+        (*argv_count)++;
+        source_index++;
+    }
+    return 1;
 }
 
 static int configure_exec_args_from_target(struct exec_bootstrap_config *cfg, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override) {
@@ -815,26 +966,7 @@ static int configure_exec_args_from_target(struct exec_bootstrap_config *cfg, co
     }
     if (argv_va != 0) {
         u64 source_index = argv0_override != 0 ? 1 : 0;
-        while (argv_count < EXECVE_MAX_ARGV) {
-            u64 ptr = 0;
-            if (copy_from_target(argv_va + source_index * 8, &ptr, 8) != 8) {
-                user_log("LinuxAbiServer: execve argv ptr copy failed idx=");
-                user_log_hex_value(source_index);
-                user_log("LinuxAbiServer: execve argv ptr va=");
-                user_log_hex_value(argv_va + source_index * 8);
-                return 0;
-            }
-            if (ptr == 0) break;
-            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->argv_offsets[argv_count], &cfg->argv_bytes[argv_count])) {
-                user_log("LinuxAbiServer: execve argv string copy failed idx=");
-                user_log_hex_value(source_index);
-                user_log("LinuxAbiServer: execve argv string va=");
-                user_log_hex_value(ptr);
-                return 0;
-            }
-            argv_count++;
-            source_index++;
-        }
+        if (!append_target_argv_tail(cfg, &cursor, argv_va, source_index, &argv_count)) return 0;
     }
     if (argv_count == 0) {
         if (!append_exec_arg(cfg, &cursor, path, cstr_len(path), &cfg->argv_offsets[0], &cfg->argv_bytes[0])) return 0;
@@ -860,11 +992,51 @@ static int configure_exec_args_from_target(struct exec_bootstrap_config *cfg, co
     return 1;
 }
 
+static int configure_exec_args_for_shebang(
+    struct exec_bootstrap_config *cfg,
+    const char *execfn,
+    const char *interpreter_argv0,
+    const char *interpreter_arg,
+    const char *script_path,
+    u64 argv_va,
+    u64 envp_va
+) {
+    u16 cursor = 0;
+    if (!append_exec_arg(cfg, &cursor, execfn, cstr_len(execfn), &cfg->execfn_offset, &cfg->execfn_bytes)) return 0;
+    u64 argv_count = 0;
+    if (!append_exec_arg(cfg, &cursor, interpreter_argv0, cstr_len(interpreter_argv0), &cfg->argv_offsets[argv_count], &cfg->argv_bytes[argv_count])) return 0;
+    argv_count++;
+    if (interpreter_arg != 0 && interpreter_arg[0] != 0) {
+        if (argv_count >= EXECVE_MAX_ARGV) return 0;
+        if (!append_exec_arg(cfg, &cursor, interpreter_arg, cstr_len(interpreter_arg), &cfg->argv_offsets[argv_count], &cfg->argv_bytes[argv_count])) return 0;
+        argv_count++;
+    }
+    if (argv_count >= EXECVE_MAX_ARGV) return 0;
+    if (!append_exec_arg(cfg, &cursor, script_path, cstr_len(script_path), &cfg->argv_offsets[argv_count], &cfg->argv_bytes[argv_count])) return 0;
+    argv_count++;
+    if (!append_target_argv_tail(cfg, &cursor, argv_va, 1, &argv_count)) return 0;
+    cfg->argv_count = (u16)argv_count;
+
+    u64 envp_count = 0;
+    if (envp_va != 0) {
+        while (envp_count < EXECVE_MAX_ENVP) {
+            u64 ptr = 0;
+            if (copy_from_target(envp_va + envp_count * 8, &ptr, 8) != 8) break;
+            if (ptr == 0) break;
+            if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->envp_offsets[envp_count], &cfg->envp_bytes[envp_count])) break;
+            envp_count++;
+        }
+    }
+    cfg->envp_count = (u16)envp_count;
+    return 1;
+}
+
 static int spawn_exec_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override, u64 *spawned_principal_out) {
     execve_profile_step("scratch begin");
     if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
     execve_profile_step("scratch done");
     if (!is_vm_object_token(g_exec_vm_token)) { user_log("LinuxAbiServer: execve exec token absent\n"); return 0; }
+    if (!ensure_standard_interpreter_current()) return 0;
     if (!is_vm_object_token(g_standard_interpreter_vm_token) || g_standard_interpreter_bytes == 0) { user_log("LinuxAbiServer: execve interpreter token absent\n"); return 0; }
     if (!start_exec_service()) { user_log("LinuxAbiServer: execve exec service absent\n"); return 0; }
     clear_page(EXECVE_CONFIG_VA);
@@ -906,31 +1078,124 @@ static int spawn_exec_for_execve(u64 caller_principal, const char *path, u64 arg
     return send_result == 1;
 }
 
+static int spawn_exec_for_shebang(
+    u64 caller_principal,
+    const char *interpreter_load_path,
+    const char *interpreter_argv0,
+    const char *interpreter_arg,
+    const char *script_path,
+    u64 argv_va,
+    u64 envp_va,
+    u64 *spawned_principal_out
+) {
+    if (!ensure_execve_scratch()) return 0;
+    if (!is_vm_object_token(g_exec_vm_token)) return 0;
+    if (!ensure_standard_interpreter_current()) return 0;
+    if (!is_vm_object_token(g_standard_interpreter_vm_token) || g_standard_interpreter_bytes == 0) return 0;
+    if (!start_exec_service()) return 0;
+    clear_page(EXECVE_CONFIG_VA);
+    struct exec_bootstrap_config *cfg = (struct exec_bootstrap_config *)EXECVE_CONFIG_VA;
+    if (!configure_exec_args_for_shebang(cfg, script_path, interpreter_argv0, interpreter_arg, script_path, argv_va, envp_va)) return 0;
+
+    u64 abi_request_va = 0;
+    if (!ensure_child_trap_request_page(caller_principal, &abi_request_va)) return 0;
+    u64 main_bytes = 0;
+    u64 main_vm_token = 0;
+    if (!get_exec_vm_for_path(interpreter_load_path, &main_vm_token, &main_bytes)) return 0;
+
+    cfg->magic = EXEC_BOOTSTRAP_MAGIC;
+    cfg->version = EXEC_BOOTSTRAP_VERSION;
+    cfg->executable_file_bytes = main_bytes;
+    cfg->interpreter_file_bytes = g_standard_interpreter_bytes;
+    cfg->abi_trap_endpoint_id = LINUX_ABI_ENDPOINT_ID;
+    cfg->abi_trap_endpoint_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    cfg->abi_trap_flavor = 1;
+    cfg->abi_trap_request_page_va = abi_request_va;
+    cfg->fs_endpoint_id = g_vfs.endpoint_id;
+    cfg->fs_compat_process_slot = g_vfs.process_slot;
+
+    struct exec_cache_entry *entry = EXEC_OPT_SERVICE_SOURCE_CACHE ? exec_cache_find(interpreter_load_path, cstr_len(interpreter_load_path)) : 0;
+    int send_result = send_exec_launch_request(cfg, entry, main_vm_token, spawned_principal_out);
+    if (send_result == 2) send_result = send_exec_launch_request(cfg, entry, main_vm_token, spawned_principal_out);
+    return send_result == 1;
+}
+
 static void close_cloexec_fds_for_execve(void) {
     if (!g_proc) return;
     for (u64 fd = 0; fd < 32; fd++) {
         struct fd_entry *entry = &g_fds[fd];
         if (entry->kind == FD_UNUSED || (entry->fd_flags & FD_INTERNAL_CLOEXEC) == 0) continue;
         if (fd_entry_is_pipe(entry)) close_pipe_entry(entry);
-        if (entry->kind == FD_SOCKET) net_close_udp(entry->token);
+        if (entry->kind == FD_SOCKET) close_socket_entry(entry);
         entry->kind = FD_UNUSED;
         entry->fd_flags = 0;
     }
 }
 
+static int read_exec_prefix_from_token(u64 token, char *buf, u16 cap, u16 *bytes_out) {
+    *bytes_out = 0;
+    if (cap == 0) return 0;
+    if (!vfs_request(FS_OP_OPEN, token, 0, 0, 0)) return 0;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
+    const u64 open_token = response->result_token;
+    u32 request_len = cap;
+    if (request_len > FS_RESPONSE_PAYLOAD_BYTES) request_len = FS_RESPONSE_PAYLOAD_BYTES;
+    if (!vfs_request(FS_OP_READ, open_token, 0, request_len, 0)) {
+        (void)vfs_request(FS_OP_CLOSE, open_token, 0, 0, 0);
+        return 0;
+    }
+    response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status != FS_STATUS_OK || response->inline_bytes > request_len) {
+        (void)vfs_request(FS_OP_CLOSE, open_token, 0, 0, 0);
+        return 0;
+    }
+    volatile u8 *payload = (volatile u8 *)vfs_response_payload();
+    for (u16 i = 0; i < response->inline_bytes; i++) buf[i] = (char)payload[i];
+    *bytes_out = response->inline_bytes;
+    (void)vfs_request(FS_OP_CLOSE, open_token, 0, 0, 0);
+    return 1;
+}
+
+static int parse_shebang(const char *buf, u16 len, char *interpreter, char *arg) {
+    interpreter[0] = 0;
+    arg[0] = 0;
+    if (len < 3 || buf[0] != '#' || buf[1] != '!') return 0;
+    u16 pos = 2;
+    while (pos < len && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+    u16 out = 0;
+    while (pos < len && buf[pos] != 0 && buf[pos] != '\n' && buf[pos] != '\r' && buf[pos] != ' ' && buf[pos] != '\t') {
+        if (out + 1 >= FS_MAX_PATH_BYTES) return 0;
+        interpreter[out++] = buf[pos++];
+    }
+    interpreter[out] = 0;
+    while (pos < len && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+    out = 0;
+    while (pos < len && buf[pos] != 0 && buf[pos] != '\n' && buf[pos] != '\r') {
+        if (out + 1 >= FS_MAX_PATH_BYTES) return 0;
+        arg[out++] = buf[pos++];
+    }
+    arg[out] = 0;
+    return interpreter[0] != 0;
+}
+
 static struct ipc_message handle_execve(const struct trap_request *req) {
-    char path[256];
-    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
+    char *path = g_execve_path_buf;
+    if (!copy_cstr_from_target(req->args[0], path, sizeof(g_execve_path_buf))) return reply(errno_fault(), 0);
     if (cstr_len(path) > FS_MAX_PATH_BYTES) return reply(errno_nametoolong(), 0);
+    char *virtual_path = g_execve_virtual_path_buf;
+    char *resolved_path = g_execve_resolved_path_buf;
+    if (!resolve_virtual_path_at(AT_FDCWD_U64, path, virtual_path)) return reply(errno_nametoolong(), 0);
+    if (!map_virtual_path_to_host(virtual_path, resolved_path)) return reply(errno_nametoolong(), 0);
     g_execve_profile_enabled = target_env_has_exec_profile(req->args[2]);
     g_execve_profile_detail = target_env_has_exec_profile_detail(req->args[2]);
     g_execve_profile_verbose = target_env_has_exec_profile_verbose(req->args[2]);
     if (g_execve_profile_verbose) g_profile_trace_verbose = 1;
-    const char *load_path = path;
-    char uutils_tool[32];
+    const char *load_path = resolved_path;
+    char *uutils_tool = g_execve_uutils_tool_buf;
     const char *uutils_tool_ptr = 0;
     const char *argv0_override = 0;
-    if (maybe_uutils_applet_exec(path, uutils_tool, sizeof(uutils_tool))) {
+    if (chroot_is_default() && maybe_uutils_applet_exec(path, uutils_tool, sizeof(g_execve_uutils_tool_buf))) {
         load_path = is_uutils_hot_tool_name(uutils_tool) ? "/cmd/coreutils-hot.elf" :
             (is_uutils_common_tool_name(uutils_tool) ? "/cmd/coreutils-common.elf" : "/cmd/coreutils.elf");
         uutils_tool_ptr = uutils_tool;
@@ -949,7 +1214,49 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     g_exec_path[g_exec_path_len] = 0;
     u64 exec_probe_token = 0;
     u64 exec_probe_bytes = 0;
-    if (!vfs_lookup_file_token(path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
+    if (!vfs_lookup_file_token(resolved_path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
+    char *exec_prefix = g_execve_prefix_buf;
+    u16 exec_prefix_len = 0;
+    char *shebang_interpreter = g_execve_shebang_interpreter_buf;
+    char *shebang_arg = g_execve_shebang_arg_buf;
+    int exec_prefix_ok = read_exec_prefix_from_token(exec_probe_token, exec_prefix, sizeof(g_execve_prefix_buf), &exec_prefix_len);
+    int shebang_ok = exec_prefix_ok ? parse_shebang(exec_prefix, exec_prefix_len, shebang_interpreter, shebang_arg) : 0;
+    if (shebang_ok)
+    {
+        char *interpreter_resolved = g_execve_interpreter_resolved_buf;
+        if (!resolve_path_at(AT_FDCWD_U64, shebang_interpreter, interpreter_resolved)) return reply(errno_noent(), 0);
+        const char *interpreter_load_path = interpreter_resolved;
+        const char *interpreter_argv0 = shebang_interpreter;
+        u64 interpreter_probe_token = 0;
+        u64 interpreter_probe_bytes = 0;
+        if (!vfs_lookup_file_token(interpreter_resolved, &interpreter_probe_token, &interpreter_probe_bytes) &&
+            !chroot_is_default() &&
+            exec_cstr_eq(shebang_interpreter, "/bin/sh"))
+        {
+            interpreter_load_path = "/bin/sh";
+        }
+        const u64 old_principal = req->caller_principal;
+        u64 spawned_principal = 0;
+        if (!spawn_exec_for_shebang(
+            req->caller_principal,
+            interpreter_load_path,
+            interpreter_argv0,
+            shebang_arg[0] != 0 ? shebang_arg : 0,
+            virtual_path,
+            req->args[1],
+            req->args[2],
+            &spawned_principal
+        )) return reply(errno_io(), 0);
+        if (g_proc) {
+            close_cloexec_fds_for_execve();
+            g_proc->principal = 0;
+            g_proc->exec_pending = 1;
+            g_proc->exec_pending_principal = spawned_principal;
+            if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
+        }
+        reset_exec_runtime_state();
+        return exit_trap_target_and_wait(old_principal);
+    }
     if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
     execve_profile_step("probe lookup done");
     const u64 old_principal = req->caller_principal;

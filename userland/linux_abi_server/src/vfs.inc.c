@@ -315,9 +315,43 @@ static u64 g_last_vfs_write_status = FS_STATUS_OK;
 static u64 g_last_vfs_write_offset = 0;
 static u64 g_last_vfs_write_length = 0;
 
-static int vfs_create_path(const char *path, int truncate_existing) {
-    const u32 flags = truncate_existing ? FS_CREATE_FLAG_TRUNCATE : 0;
+static int vfs_create_path_with_flags(const char *path, u32 flags) {
     return vfs_request_full(FS_OP_CREATE, g_vfs.root_token, 0, 0, flags, path, 0, 0);
+}
+
+static int vfs_create_path(const char *path, int truncate_existing) {
+    return vfs_create_path_with_flags(path, truncate_existing ? FS_CREATE_FLAG_TRUNCATE : 0);
+}
+
+static int vfs_create_symlink_path(const char *path, const char *target, u16 target_len) {
+    if (!g_vfs.active) return 0;
+    const u64 path_len = cstr_len(path);
+    if (path_len == 0 || path_len > FS_MAX_PATH_BYTES || target_len > FS_MAX_PATH_BYTES) return 0;
+    if (path_len + target_len > PAGE_BYTES - FS_REQUEST_HEADER_BYTES) return 0;
+    const u64 request_addr = vfs_request_addr();
+    const u64 response_addr = vfs_response_addr();
+    if (request_addr < PAGE_BYTES || response_addr < PAGE_BYTES) return 0;
+    g_prof.vfs_requests++;
+    if (FS_OP_CREATE < FS_PROFILE_OP_COUNT) g_prof.vfs_op_counts[FS_OP_CREATE]++;
+    clear_page(request_addr);
+    clear_page(response_addr);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_addr;
+    const u64 seq = g_vfs.next_seq++;
+    request->magic = FS_REQUEST_MAGIC;
+    request->version = FS_PROTOCOL_VERSION;
+    request->op = FS_OP_CREATE;
+    request->object_token = g_vfs.root_token;
+    request->flags = FS_CREATE_FLAG_SYMLINK;
+    request->path_bytes = (u16)path_len;
+    request->inline_bytes = target_len;
+    request->session_nonce = g_vfs.session_nonce;
+    volatile u8 *payload = (volatile u8 *)(request_addr + FS_REQUEST_HEADER_BYTES);
+    for (u64 i = 0; i < path_len; i++) payload[i] = (u8)path[i];
+    for (u16 i = 0; i < target_len; i++) payload[path_len + i] = (u8)target[i];
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    if (!signal_fs(&g_vfs)) return 0;
+    return wait_vfs_response(seq, FS_OP_CREATE);
 }
 
 static int vfs_rename_paths(const char *old_path, const char *new_path) {

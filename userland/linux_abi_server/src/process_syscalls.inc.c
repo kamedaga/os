@@ -5,7 +5,7 @@ static void close_all_process_fds(struct linux_process_state *proc) {
         if (entry->kind == FD_UNUSED) continue;
         const int is_pipe = fd_entry_is_pipe(entry);
         if (is_pipe) close_pipe_entry(entry);
-        if (entry->kind == FD_SOCKET) net_close_udp(entry->token);
+        if (entry->kind == FD_SOCKET) close_socket_entry(entry);
         if (fd > 2 || is_pipe) entry->kind = FD_UNUSED;
     }
 }
@@ -183,6 +183,8 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
     child->mmap_next_va = parent->mmap_next_va;
     child->brk_next_va = parent->brk_next_va;
     for (u64 i = 0; i < VM_REGION_MAX; i++) child->regions[i] = parent->regions[i];
+    child->root_len = parent->root_len;
+    for (u16 i = 0; i <= parent->root_len && i <= FS_MAX_PATH_BYTES; i++) child->root_path[i] = parent->root_path[i];
     child->cwd_len = parent->cwd_len;
     for (u16 i = 0; i <= parent->cwd_len && i <= FS_MAX_PATH_BYTES; i++) child->cwd[i] = parent->cwd[i];
     for (u64 i = 0; i < LINUX_CHILD_MAX; i++) child->child_used[i] = 0;
@@ -202,7 +204,10 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
     }
     for (u64 fd = 0; fd < 32; fd++) {
         copy_fd_entry(&child->fds[fd], &parent->fds[fd]);
-        if (ref_pipe_fds) pipe_ref_fd(&child->fds[fd]);
+        if (ref_pipe_fds) {
+            pipe_ref_fd(&child->fds[fd]);
+            socket_ref_fd(&child->fds[fd]);
+        }
     }
 }
 

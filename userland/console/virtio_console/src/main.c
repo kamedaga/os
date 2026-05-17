@@ -76,7 +76,8 @@ enum {
     TX_QUEUE_INDEX = 1,
     RX_BUFFER_COUNT = 4,
     RX_BUFFER_BYTES = 256,
-    TX_BUFFER_BYTES = 256,
+    TX_BUFFER_BYTES = PAGE_BYTES,
+    TX_RING_BYTES = 65536,
     RX_RING_BYTES = 4096,
 
     CONSOLE_REQUEST_MAGIC = 0x514E4F43,
@@ -203,6 +204,11 @@ static u64 g_tx_dma_token;
 static u8 g_rx_ring[RX_RING_BYTES];
 static u64 g_rx_ring_head;
 static u64 g_rx_ring_len;
+static u8 g_tx_ring[TX_RING_BYTES];
+static u64 g_tx_ring_head;
+static u64 g_tx_ring_len;
+static u64 g_tx_inflight;
+static u64 g_tx_inflight_len;
 static u64 g_pending_read_seq;
 static u64 g_pending_read_max_len;
 
@@ -539,6 +545,11 @@ static int init_virtio(void) {
     return 1;
 }
 
+static void poll_rx_queue_for_tx_wait(void);
+static int poll_tx_queue(void);
+static int pump_tx_queue(void);
+static void pump_tx_queue_budget(u64 budget);
+
 static int send_bytes(const u8 *bytes, u64 len) {
     if (len == 0 || len > TX_BUFFER_BYTES) return 0;
     memcpy((void *)TX_BUFFER_VA, bytes, len);
@@ -560,9 +571,81 @@ static int send_bytes(const u8 *bytes, u64 len) {
             g_tx_queue.last_used_idx++;
             return 1;
         }
+        if ((spins & 0x3f) == 0) poll_rx_queue_for_tx_wait();
         __asm__ volatile("pause");
     }
     return 0;
+}
+
+static void tx_ring_drop_oldest(u64 bytes) {
+    if (bytes > g_tx_ring_len) bytes = g_tx_ring_len;
+    g_tx_ring_head = (g_tx_ring_head + bytes) % TX_RING_BYTES;
+    g_tx_ring_len -= bytes;
+}
+
+static void tx_ring_push_byte(u8 byte) {
+    if (g_tx_ring_len >= TX_RING_BYTES) tx_ring_drop_oldest(1);
+    const u64 tail = (g_tx_ring_head + g_tx_ring_len) % TX_RING_BYTES;
+    g_tx_ring[tail] = byte;
+    g_tx_ring_len++;
+}
+
+static void tx_ring_push_volatile(volatile u8 *src, u64 len) {
+    for (u64 i = 0; i < len; i++) tx_ring_push_byte(src[i]);
+}
+
+static u64 tx_ring_copy_head_to_buffer(u64 max_len) {
+    const u64 n = g_tx_ring_len < max_len ? g_tx_ring_len : max_len;
+    u8 *dst = (u8 *)TX_BUFFER_VA;
+    for (u64 i = 0; i < n; i++) dst[i] = g_tx_ring[(g_tx_ring_head + i) % TX_RING_BYTES];
+    return n;
+}
+
+static int tx_start_if_idle(void) {
+    if (g_tx_inflight || g_tx_ring_len == 0) return 0;
+    const u64 len = tx_ring_copy_head_to_buffer(TX_BUFFER_BYTES);
+    if (len == 0) return 0;
+
+    volatile struct virtq_desc *desc = desc_ptr(&g_tx_queue, 0);
+    desc->addr = g_tx_buffer_paddr;
+    desc->len = (u32)len;
+    desc->flags = 0;
+    desc->next = 0;
+    if (queue_submit(g_tx_queue.submit_token, g_tx_queue.index) != SYSCALL_OK) return 0;
+    queue_push_avail(&g_tx_queue, 0);
+    if (queue_notify(g_tx_queue.notify_token, g_tx_queue.index) != SYSCALL_OK) return 0;
+    mmio_write_u16(g_tx_queue.notify_addr, g_tx_queue.index);
+    g_tx_inflight = 1;
+    g_tx_inflight_len = len;
+    return 1;
+}
+
+static int poll_tx_queue(void) {
+    int progress = 0;
+    while (*used_idx_ptr(&g_tx_queue) != g_tx_queue.last_used_idx) {
+        if (g_isr_base != 0) (void)mmio_read_u8(g_isr_base);
+        (void)used_ring_ptr(&g_tx_queue)[g_tx_queue.last_used_idx % QUEUE_SIZE];
+        g_tx_queue.last_used_idx++;
+        if (g_tx_inflight) {
+            tx_ring_drop_oldest(g_tx_inflight_len);
+            g_tx_inflight = 0;
+            g_tx_inflight_len = 0;
+        }
+        progress = 1;
+    }
+    return progress;
+}
+
+static int pump_tx_queue(void) {
+    int progress = poll_tx_queue();
+    if (tx_start_if_idle()) progress = 1;
+    return progress;
+}
+
+static void pump_tx_queue_budget(u64 budget) {
+    for (u64 i = 0; i < budget; i++) {
+        if (!pump_tx_queue()) break;
+    }
 }
 
 static struct console_request_header *request_header(void) {
@@ -638,20 +721,12 @@ static void handle_input_byte(u8 byte) {
 static void reset_input_state(void) {
     g_rx_ring_head = 0;
     g_rx_ring_len = 0;
+    g_tx_ring_head = 0;
+    g_tx_ring_len = 0;
+    g_tx_inflight = 0;
+    g_tx_inflight_len = 0;
     g_pending_read_seq = 0;
     g_pending_read_max_len = 0;
-}
-
-static int write_volatile_to_tx(volatile u8 *src, u64 len) {
-    u8 buf[TX_BUFFER_BYTES];
-    u64 done = 0;
-    while (done < len) {
-        const u64 chunk = len - done < sizeof(buf) ? len - done : sizeof(buf);
-        for (u64 i = 0; i < chunk; i++) buf[i] = src[done + i];
-        if (!send_bytes(buf, chunk)) return 0;
-        done += chunk;
-    }
-    return 1;
 }
 
 static void finish_console_connect(
@@ -765,11 +840,9 @@ static void handle_console_request(void) {
         }
     } else if (request->op == CONSOLE_OP_WRITE) {
         const u64 len = request->length < CONSOLE_REQUEST_PAYLOAD_BYTES ? request->length : CONSOLE_REQUEST_PAYLOAD_BYTES;
-        if (write_volatile_to_tx(request_payload(), len)) {
-            write_console_response(CONSOLE_OP_WRITE, seq, CONSOLE_STATUS_OK, 0, len, 0);
-        } else {
-            write_console_response(CONSOLE_OP_WRITE, seq, CONSOLE_STATUS_IO_ERROR, 0, 0, 0);
-        }
+        tx_ring_push_volatile(request_payload(), len);
+        pump_tx_queue_budget(4);
+        write_console_response(CONSOLE_OP_WRITE, seq, CONSOLE_STATUS_OK, 0, len, 0);
     } else if (request->op == CONSOLE_OP_GET_ATTR) {
         write_console_response(CONSOLE_OP_GET_ATTR, seq, CONSOLE_STATUS_OK, 0, 120, 40);
     } else if (request->op == CONSOLE_OP_SET_ATTR) {
@@ -782,7 +855,8 @@ static void handle_console_request(void) {
     g_session.last_completed_seq = seq;
 }
 
-static void poll_rx_queue(void) {
+static void drain_rx_queue(int fulfill_pending) {
+    (void)poll_tx_queue();
     int requeued = 0;
     while (*used_idx_ptr(&g_rx_queue) != g_rx_queue.last_used_idx) {
         volatile struct virtq_used_elem *used = &used_ring_ptr(&g_rx_queue)[g_rx_queue.last_used_idx % QUEUE_SIZE];
@@ -797,11 +871,20 @@ static void poll_rx_queue(void) {
         requeued = 1;
     }
     if (requeued) (void)queue_submit(g_rx_queue.submit_token, g_rx_queue.index);
-    fulfill_pending_read();
+    if (fulfill_pending) fulfill_pending_read();
     if (queue_notify(g_rx_queue.notify_token, g_rx_queue.index) == SYSCALL_OK) {
         mmio_write_u16(g_rx_queue.notify_addr, g_rx_queue.index);
     }
     if (g_isr_base != 0) (void)mmio_read_u8(g_isr_base);
+    pump_tx_queue_budget(4);
+}
+
+static void poll_rx_queue_for_tx_wait(void) {
+    drain_rx_queue(0);
+}
+
+static void poll_rx_queue(void) {
+    drain_rx_queue(1);
 }
 
 void virtio_console_main(void) {
@@ -818,10 +901,13 @@ void virtio_console_main(void) {
     user_log("VirtioConsole: ready\n");
 
     for (;;) {
+        pump_tx_queue_budget(16);
         poll_rx_queue();
         fulfill_pending_read();
-        const u64 received = wait_event(1, 1);
+        u64 received = 0;
+        if (!g_tx_inflight && g_tx_ring_len == 0) received = wait_event(1, 1);
         if (received >= CAP_TRANSFER_ID_MIN) handle_console_connect_transfer(received);
         handle_console_request();
+        pump_tx_queue_budget(16);
     }
 }

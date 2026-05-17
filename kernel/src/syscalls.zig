@@ -284,6 +284,7 @@ const KernelStateSpinLock = struct {
 };
 
 var kernel_state_lock: KernelStateSpinLock = .{};
+var vm_object_page_scratch: [kernel.max_image_backing_pages]u64 = undefined;
 
 const IpcSignalTarget = struct {
     principal: kernel.PrincipalId,
@@ -315,6 +316,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled_by_cpu), &syscall_return_writeback_enabled_by_cpu));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstars), &syscall_entry_is_lstars));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_page_scratch), &vm_object_page_scratch));
     return end;
 }
 
@@ -2168,8 +2170,8 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return abi_trap_runtime.reserveLazyAnonymousPagesForCurrentReplyTarget(state, frame.rdi, frame.rsi, frame.rdx);
         },
         image_abi.syscall_install_vm_object => {
-            var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;
-            const collected = copyUserRangeIntoVmObjectPages(h, proc, frame.rdi, frame.rsi, &page_paddrs) orelse return syscall_err_invalid;
+            const page_paddrs = &vm_object_page_scratch;
+            const collected = copyUserRangeIntoVmObjectPages(h, proc, frame.rdi, frame.rsi, page_paddrs) orelse return syscall_err_invalid;
             const cap_id = state.installVmObjectCap(
                 proc,
                 page_paddrs[0..collected.page_count],
@@ -2190,7 +2192,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             const span_bytes = (size_bytes + 4095) & ~@as(u64, 4095);
             const page_count_u64 = span_bytes / 4096;
             if (page_count_u64 == 0 or page_count_u64 > kernel.max_image_backing_pages) return syscall_err_invalid;
-            var page_paddrs: [kernel.max_image_backing_pages]u64 = undefined;
+            const page_paddrs = &vm_object_page_scratch;
             var i: usize = 0;
             while (i < page_count_u64) : (i += 1) {
                 page_paddrs[i] = base_paddr + (@as(u64, @intCast(i)) * 4096);

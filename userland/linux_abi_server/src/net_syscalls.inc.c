@@ -42,11 +42,60 @@ struct tcp_prefetch_slot {
 enum {
     UDP_NONBLOCK_RECV_GRACE_LOOPS = 256,
     UDP_NONBLOCK_SEND_GRACE_LOOPS = 256,
-    TCP_READ_AGGREGATE_BYTES = 64 * 1024,
+    TCP_READ_AGGREGATE_BYTES = 256 * 1024,
     TCP_PREFETCH_SLOT_COUNT = 32,
 };
 
 static struct tcp_prefetch_slot g_tcp_prefetch_slots[TCP_PREFETCH_SLOT_COUNT];
+static u64 g_net_wait_context;
+
+static u64 tcp_read_size_bucket(u64 bytes) {
+    if (bytes == 0) return 0;
+    if (bytes <= 512) return 1;
+    if (bytes <= 1500) return 2;
+    if (bytes <= 4096) return 3;
+    if (bytes <= 16384) return 4;
+    return 5;
+}
+
+static void profile_tcp_read_request_size(u64 bytes) {
+    const u64 bucket = tcp_read_size_bucket(bytes);
+    g_prof.net_tcp_read_request_bucket_calls[bucket]++;
+    g_prof.net_tcp_read_request_bucket_bytes[bucket] += bytes;
+}
+
+static void profile_tcp_read_return_size(u64 bytes) {
+    const u64 bucket = tcp_read_size_bucket(bytes);
+    g_prof.net_tcp_read_return_bucket_calls[bucket]++;
+    g_prof.net_tcp_read_return_bucket_bytes[bucket] += bytes;
+    if (bytes == 0) g_prof.net_tcp_read_return_zero_calls++;
+}
+
+static void profile_tcp_read_prefetch_return(u64 bytes) {
+    if (bytes == 0) return;
+    g_prof.net_tcp_read_return_prefetch_calls++;
+    g_prof.net_tcp_read_return_prefetch_bytes += bytes;
+}
+
+static void profile_tcp_read_direct_return(u64 bytes) {
+    if (bytes == 0) return;
+    g_prof.net_tcp_read_return_direct_calls++;
+    g_prof.net_tcp_read_return_direct_bytes += bytes;
+}
+
+static void profile_tcp_read_bulk_return(u64 bytes) {
+    if (bytes == 0) return;
+    g_prof.net_tcp_read_return_bulk_calls++;
+    g_prof.net_tcp_read_return_bulk_bytes += bytes;
+}
+
+static void profile_net_wait_context(u64 context, u64 loops, int timeout) {
+    if (context == NET_WAIT_CONTEXT_NONE || context >= NET_WAIT_CONTEXT_COUNT) return;
+    g_prof.net_wait_context_calls[context]++;
+    g_prof.net_wait_context_loops[context] += loops;
+    if (loops > 8) g_prof.net_wait_context_slow[context]++;
+    if (timeout) g_prof.net_wait_context_timeouts[context]++;
+}
 
 static int fd_is_nonblock(u64 fd) {
     return fd_valid(fd) && (g_fds[fd].fd_flags & O_NONBLOCK) != 0;
@@ -166,11 +215,14 @@ static int wait_net_response(u64 expected_seq, u16 expected_op, u64 poll_limit) 
     const u64 response_addr = net_response_addr();
     if (response_addr < PAGE_BYTES) return 0;
     volatile struct net_response_header *response = (volatile struct net_response_header *)response_addr;
+    const u64 wait_context = g_net_wait_context;
+    g_net_wait_context = NET_WAIT_CONTEXT_NONE;
     g_prof.net_wait_calls++;
     if (expected_op < NET_PROFILE_OP_COUNT) g_prof.net_wait_op_calls[expected_op]++;
     for (u64 i = 0; poll_limit == 0 || i < poll_limit; i++) {
         if (response->response_seq == expected_seq) {
             g_prof.net_wait_loops += i;
+            profile_net_wait_context(wait_context, i, 0);
             if (expected_op < NET_PROFILE_OP_COUNT) g_prof.net_wait_op_loops[expected_op] += i;
             if (i > 8) {
                 g_prof.net_wait_slow++;
@@ -183,6 +235,7 @@ static int wait_net_response(u64 expected_seq, u16 expected_op, u64 poll_limit) 
         wait_without_consuming_ipc();
     }
     g_prof.net_wait_loops += poll_limit;
+    profile_net_wait_context(wait_context, poll_limit, 1);
     g_prof.net_wait_timeouts++;
     if (expected_op < NET_PROFILE_OP_COUNT) {
         g_prof.net_wait_op_loops[expected_op] += poll_limit;
@@ -400,9 +453,10 @@ static u64 net_tcp_write(u64 handle, const u8 *payload, u32 payload_len) {
     return response->status == NET_STATUS_OK ? response->arg0 : net_status_to_errno(response->status);
 }
 
-static u64 net_tcp_read(u64 handle, u8 *out, u32 out_cap) {
+static u64 net_tcp_read_with_flags(u64 handle, u8 *out, u32 out_cap, u64 flags, u64 wait_context) {
     u64 seq = 0;
-    if (!net_begin_request(NET_OP_TCP_READ, handle, 0, 0, out_cap, 0, 0, &seq)) return errno_io();
+    if (!net_begin_request(NET_OP_TCP_READ, handle, 0, flags, out_cap, 0, 0, &seq)) return errno_io();
+    g_net_wait_context = wait_context;
     if (!wait_net_response(seq, NET_OP_TCP_READ, 8192)) return errno_timedout();
     volatile struct net_response_header *response = (volatile struct net_response_header *)net_response_addr();
     if (response->status != NET_STATUS_OK) return net_status_to_errno(response->status);
@@ -413,7 +467,7 @@ static u64 net_tcp_read(u64 handle, u8 *out, u32 out_cap) {
     return response->inline_bytes;
 }
 
-static u64 net_tcp_read_bulk_to_target(u64 handle, u64 dst_va, u32 length) {
+static u64 net_tcp_read_bulk_to_target_with_flags(u64 handle, u64 dst_va, u32 length, u64 flags, u64 wait_context) {
     if (length == 0) return 0;
     if (length > NET_TCP_BULK_READ_BYTES) length = NET_TCP_BULK_READ_BYTES;
     const u64 page_count = net_bulk_page_count_for_length(length);
@@ -434,6 +488,7 @@ static u64 net_tcp_read_bulk_to_target(u64 handle, u64 dst_va, u32 length) {
     request->op = NET_OP_TCP_READ_BULK;
     request->arg0 = handle;
     request->arg1 = page_count;
+    request->arg2 = flags;
     request->reserved0 = length;
     request->session_nonce = g_net.session_nonce;
     volatile u64 *payload = (volatile u64 *)(request_addr + NET_REQUEST_HEADER_BYTES);
@@ -441,6 +496,7 @@ static u64 net_tcp_read_bulk_to_target(u64 handle, u64 dst_va, u32 length) {
     __asm__ volatile("" ::: "memory");
     request->request_seq = seq;
     if (signal_net_status() != SYSCALL_OK) return errno_io();
+    g_net_wait_context = wait_context;
     if (!wait_net_response(seq, NET_OP_TCP_READ_BULK, 8192)) return errno_timedout();
     volatile struct net_response_header *response = (volatile struct net_response_header *)response_addr;
     if (response->status != NET_STATUS_OK) return net_status_to_errno(response->status);
@@ -502,7 +558,7 @@ static u64 tcp_prefetch_fill(u64 fd) {
         return slot->len;
     }
     g_prof.net_tcp_prefetch_attempts++;
-    const u64 result = net_tcp_read(token, slot->bytes, NET_TCP_READ_BYTES);
+    const u64 result = net_tcp_read_with_flags(token, slot->bytes, NET_TCP_READ_BYTES, NET_TCP_READ_FLAG_NOWAIT, NET_WAIT_CONTEXT_POLL_PREFETCH_READ);
     if ((i64)result < 0) return result;
     slot->head = 0;
     slot->len = (u32)result;
@@ -615,6 +671,7 @@ static int ensure_socket_bound(u64 fd) {
     u32 local_ip = 0;
     if (!net_bind_udp(0, &handle, &local_port, &local_ip)) return 0;
     g_fds[fd].token = handle;
+    socket_ref_add_token(handle);
     g_fds[fd].socket_local_port = local_port;
     g_fds[fd].socket_local_ip = local_ip;
     sync_fd_to_thread_group(fd);
@@ -670,6 +727,7 @@ static struct ipc_message handle_bind_socket(const struct trap_request *req) {
     u32 local_ip = 0;
     if (!net_bind_udp(port, &handle, &local_port, &local_ip)) return reply(errno_addrinuse(), 0);
     g_fds[fd].token = handle;
+    socket_ref_add_token(handle);
     g_fds[fd].socket_local_port = local_port;
     g_fds[fd].socket_local_ip = local_ip;
     sync_fd_to_thread_group(fd);
@@ -697,6 +755,7 @@ static struct ipc_message handle_connect_socket(const struct trap_request *req) 
         u64 result = net_tcp_begin_connect(remote_ip, remote_port, &handle, &local_port, &local_ip);
         if ((i64)result < 0) return reply(result, 0);
         g_fds[fd].token = handle;
+        socket_ref_add_token(handle);
         g_fds[fd].socket_local_port = local_port;
         g_fds[fd].socket_local_ip = local_ip;
         g_fds[fd].socket_connected = 0;
@@ -712,7 +771,7 @@ static struct ipc_message handle_connect_socket(const struct trap_request *req) 
         }
         result = net_tcp_wait_connected(handle);
         if ((i64)result < 0) {
-            net_close_udp(handle);
+            socket_ref_release_token(handle);
             g_fds[fd].token = 0;
             g_fds[fd].socket_connecting = 0;
             sync_fd_to_thread_group(fd);
@@ -946,21 +1005,53 @@ static struct ipc_message handle_recvmsg_socket(const struct trap_request *req) 
     u32 src_ip = 0;
     u16 src_port = 0;
     u64 result = errno_again();
+    u64 prefetch_bytes = 0;
+    u64 direct_bytes = 0;
+    u64 bulk_bytes = 0;
+    u64 stream_copied_to_target = 0;
 
     if (g_fds[fd].socket_type == SOCK_STREAM) {
         const u64 connect_result = socket_stream_ensure_connected(fd);
         if ((i64)connect_result < 0) return reply(connect_result, 0);
-        result = tcp_prefetch_pop_to_payload(fd, payload, cap);
+        const u64 max_read = min_u64(iov0[1], TCP_READ_AGGREGATE_BYTES);
+        profile_tcp_read_request_size(max_read);
+        if (max_read > NET_TCP_READ_BYTES) {
+            result = tcp_prefetch_copy_to_target(fd, iov0[0], max_read);
+            if ((i64)result < 0) return reply(result, 0);
+            stream_copied_to_target = result;
+            prefetch_bytes = result;
+        } else {
+            result = tcp_prefetch_pop_to_payload(fd, payload, cap);
+            if ((i64)result < 0) return reply(result, 0);
+            if (result != 0) prefetch_bytes = result;
+        }
         if ((i64)result < 0) return reply(result, 0);
-        if (result == 0 && tcp_prefetch_eof(g_fds[fd].token)) {
+        if (stream_copied_to_target >= max_read) {
+            result = stream_copied_to_target;
+        } else if (result == 0 && tcp_prefetch_eof(g_fds[fd].token)) {
             result = 0;
-        } else if (result == 0) {
+        } else if (stream_copied_to_target == 0 && result == 0) {
             const u64 limit = (fd_is_nonblock(fd) || (flags & MSG_DONTWAIT) != 0) ? 0 : 8192;
             for (u64 i = 0; i <= limit; i++) {
-                result = net_tcp_read(g_fds[fd].token, payload, cap);
+                const u64 read_flags = (fd_is_nonblock(fd) || (flags & MSG_DONTWAIT) != 0) ? NET_TCP_READ_FLAG_NOWAIT : 0;
+                if (max_read > NET_TCP_READ_BYTES) {
+                    const u64 wait_context = read_flags != 0 ? NET_WAIT_CONTEXT_READ_BULK_NOWAIT : NET_WAIT_CONTEXT_READ_BULK_BLOCKING;
+                    result = net_tcp_read_bulk_to_target_with_flags(g_fds[fd].token, iov0[0], (u32)max_read, read_flags, wait_context);
+                } else {
+                    const u64 wait_context = read_flags != 0 ? NET_WAIT_CONTEXT_RECVMSG_NOWAIT_READ : NET_WAIT_CONTEXT_RECVMSG_BLOCKING_READ;
+                    result = net_tcp_read_with_flags(g_fds[fd].token, payload, cap, read_flags, wait_context);
+                }
                 if ((i64)result >= 0 || result != errno_again()) break;
                 if (i == limit) break;
                 wait_without_consuming_ipc();
+            }
+            if ((i64)result >= 0 && result != 0) {
+                if (max_read > NET_TCP_READ_BYTES) {
+                    stream_copied_to_target = result;
+                    bulk_bytes = result;
+                } else {
+                    direct_bytes = result;
+                }
             }
         }
     } else {
@@ -974,8 +1065,14 @@ static struct ipc_message handle_recvmsg_socket(const struct trap_request *req) 
         }
     }
     if ((i64)result < 0) return reply(result, 0);
+    if (g_fds[fd].socket_type == SOCK_STREAM) {
+        profile_tcp_read_return_size(result);
+        profile_tcp_read_prefetch_return(prefetch_bytes);
+        profile_tcp_read_direct_return(direct_bytes);
+        profile_tcp_read_bulk_return(bulk_bytes);
+    }
 
-    const u64 copied = copy_payload_to_iov(msg.msg_iov, msg.msg_iovlen, payload, result);
+    const u64 copied = stream_copied_to_target != 0 ? stream_copied_to_target : copy_payload_to_iov(msg.msg_iov, msg.msg_iovlen, payload, result);
     if ((i64)copied < 0) return reply(copied, 0);
 
     if (msg.msg_name != 0 && msg.msg_namelen >= 16 && g_fds[fd].socket_type == SOCK_DGRAM) {
@@ -1035,39 +1132,80 @@ static u64 socket_read_to_target(u64 fd, u64 dst_va, u64 len) {
         u8 *payload = g_net_io_payload;
         const u64 max_read = min_u64(len, TCP_READ_AGGREGATE_BYTES);
         u64 copied = 0;
+        u64 prefetch_bytes = 0;
+        u64 direct_bytes = 0;
+        u64 bulk_bytes = 0;
+        profile_tcp_read_request_size(max_read);
         const u64 cached = tcp_prefetch_copy_to_target(fd, dst_va, max_read);
         if ((i64)cached < 0) return cached;
         copied += cached;
-        if (copied >= max_read || tcp_prefetch_eof(g_fds[fd].token)) return copied;
+        prefetch_bytes += cached;
+        if (copied >= max_read || tcp_prefetch_eof(g_fds[fd].token)) {
+            profile_tcp_read_return_size(copied);
+            profile_tcp_read_prefetch_return(prefetch_bytes);
+            return copied;
+        }
         while (copied < max_read) {
             const u32 cap = (u32)min_u64(max_read - copied, NET_TCP_READ_BYTES);
             u64 result = errno_again();
             int result_from_bulk = 0;
-            const u64 limit = (copied != 0 || fd_is_nonblock(fd)) ? 0 : 8192;
+            const int partial_nowait = copied != 0;
+            const u64 limit = (partial_nowait || fd_is_nonblock(fd)) ? 0 : 8192;
             for (u64 i = 0; i <= limit; i++) {
+                const u64 read_flags = (partial_nowait || fd_is_nonblock(fd)) ? NET_TCP_READ_FLAG_NOWAIT : 0;
                 if (max_read - copied > NET_TCP_READ_BYTES) {
                     result_from_bulk = 1;
-                    result = net_tcp_read_bulk_to_target(g_fds[fd].token, dst_va + copied, (u32)(max_read - copied));
+                    const u64 wait_context = read_flags != 0 ? NET_WAIT_CONTEXT_READ_BULK_NOWAIT : NET_WAIT_CONTEXT_READ_BULK_BLOCKING;
+                    result = net_tcp_read_bulk_to_target_with_flags(g_fds[fd].token, dst_va + copied, (u32)(max_read - copied), read_flags, wait_context);
                 } else {
                     result_from_bulk = 0;
-                    result = net_tcp_read(g_fds[fd].token, payload, cap);
+                    const u64 wait_context = read_flags != 0 ? NET_WAIT_CONTEXT_READ_INLINE_NOWAIT : NET_WAIT_CONTEXT_READ_INLINE_BLOCKING;
+                    result = net_tcp_read_with_flags(g_fds[fd].token, payload, cap, read_flags, wait_context);
                 }
                 if ((i64)result >= 0 || result != errno_again()) break;
                 if (i == limit) break;
                 wait_without_consuming_ipc();
             }
             if ((i64)result < 0) {
-                if (copied != 0 && result == errno_again()) return copied;
+                if (copied != 0 && result == errno_again()) {
+                    profile_tcp_read_return_size(copied);
+                    profile_tcp_read_prefetch_return(prefetch_bytes);
+                    profile_tcp_read_direct_return(direct_bytes);
+                    profile_tcp_read_bulk_return(bulk_bytes);
+                    return copied;
+                }
                 log_socket_error("LinuxAbiServer: socket read failed", fd, result);
                 return result;
             }
-            if (result == 0) return copied;
+            if (result == 0) {
+                profile_tcp_read_return_size(copied);
+                profile_tcp_read_prefetch_return(prefetch_bytes);
+                profile_tcp_read_direct_return(direct_bytes);
+                profile_tcp_read_bulk_return(bulk_bytes);
+                return copied;
+            }
             if (!result_from_bulk) {
-                if (copy_to_target(dst_va + copied, payload, result) != result) return copied != 0 ? copied : errno_fault();
+                if (copy_to_target(dst_va + copied, payload, result) != result) {
+                    if (copied != 0) {
+                        profile_tcp_read_return_size(copied);
+                        profile_tcp_read_prefetch_return(prefetch_bytes);
+                        profile_tcp_read_direct_return(direct_bytes);
+                        profile_tcp_read_bulk_return(bulk_bytes);
+                        return copied;
+                    }
+                    return errno_fault();
+                }
+                direct_bytes += result;
+            } else {
+                bulk_bytes += result;
             }
             copied += result;
             if (result < cap) break;
         }
+        profile_tcp_read_return_size(copied);
+        profile_tcp_read_prefetch_return(prefetch_bytes);
+        profile_tcp_read_direct_return(direct_bytes);
+        profile_tcp_read_bulk_return(bulk_bytes);
         return copied;
     }
     if (!ensure_socket_bound(fd)) return errno_busy();
@@ -1236,7 +1374,15 @@ static u16 fd_poll_revents(u64 fd, u16 requested) {
 
     if (entry->kind == FD_FILE || entry->kind == FD_DIR) return (u16)(requested & (read_mask | write_mask));
     if (entry->kind == FD_RANDOM) return (u16)(requested & read_mask);
-    if (entry->kind == FD_STDIO || entry->kind == FD_TTY) return (u16)(requested & (read_mask | write_mask));
+    if (entry->kind == FD_STDIO || entry->kind == FD_TTY) {
+        u64 readable = 0;
+        u64 writable = 1;
+        if (g_console.is_tty) (void)console_poll_tty(&readable, &writable);
+        u16 revents = 0;
+        if (readable != 0) revents |= (u16)(requested & read_mask);
+        if (writable != 0) revents |= (u16)(requested & write_mask);
+        return revents;
+    }
     return POLLNVAL;
 }
 

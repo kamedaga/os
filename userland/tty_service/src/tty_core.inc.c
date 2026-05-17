@@ -44,6 +44,51 @@ static void tty_core_pump_input(u64 budget) {
     }
 }
 
+static u64 tty_core_input_used(void) {
+    return bsd_ttyinq_bytes_used(&g_tty.inq);
+}
+
+static int tty_core_is_canonical(void) {
+    return (g_tty.termios.lflag & TTY_LFLAG_ICANON) != 0;
+}
+
+static u64 tty_core_vmin(void) {
+    return g_tty.termios.cc[TTY_CC_VMIN];
+}
+
+static u64 tty_core_vtime_ticks(void) {
+    const u64 deciseconds = g_tty.termios.cc[TTY_CC_VTIME];
+    return deciseconds == 0 ? 0 : deciseconds * 100;
+}
+
+static int tty_core_read_ready(void) {
+    if (tty_core_is_canonical()) return bsd_ttydisc_readable(&g_tty);
+    return tty_core_input_used() != 0;
+}
+
+static u64 tty_core_wait_noncanonical_ready(u64 request_len) {
+    const u64 vmin = tty_core_vmin();
+    const u64 timeout_ticks = tty_core_vtime_ticks();
+    if (request_len == 0) return 0;
+
+    if (vmin == 0 && timeout_ticks == 0) return tty_core_input_used();
+
+    const u64 start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    for (;;) {
+        tty_core_pump_input(4);
+        const u64 used = tty_core_input_used();
+        if (used != 0) return used;
+
+        if (vmin == 0 && timeout_ticks != 0) {
+            const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+            if (now - start_tick >= timeout_ticks) return 0;
+        }
+
+        if (vmin == 0 && timeout_ticks == 0) return used;
+        (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+    }
+}
+
 static u64 tty_read_to_client_payload(u64 max_len, u8 *signal_out) {
     const u32 request_len = (u32)min_u64(max_len, CONSOLE_RESPONSE_PAYLOAD_BYTES);
     if (request_len == 0) return 0;
@@ -54,8 +99,14 @@ static u64 tty_read_to_client_payload(u64 max_len, u8 *signal_out) {
             *signal_out = signo;
             return 0;
         }
-        if (bsd_ttydisc_readable(&g_tty) ||
-            bsd_ttyinq_bytes_used(&g_tty.inq) >= bsd_ttyinq_capacity()) {
+        if (tty_core_is_canonical()) {
+            if (bsd_ttydisc_readable(&g_tty) ||
+                bsd_ttyinq_bytes_used(&g_tty.inq) >= bsd_ttyinq_capacity()) {
+                volatile u8 *dst = payload_at(g_client.response_va, CONSOLE_RESPONSE_HEADER_BYTES);
+                return bsd_ttydisc_read(&g_tty, dst, request_len);
+            }
+        } else if (tty_core_wait_noncanonical_ready(request_len) != 0 ||
+            tty_core_vmin() == 0) {
             volatile u8 *dst = payload_at(g_client.response_va, CONSOLE_RESPONSE_HEADER_BYTES);
             return bsd_ttydisc_read(&g_tty, dst, request_len);
         }
@@ -66,6 +117,11 @@ static u64 tty_read_to_client_payload(u64 max_len, u8 *signal_out) {
 
 static u8 tty_take_signal(void) {
     return bsd_ttydisc_take_signal(&g_tty);
+}
+
+static int tty_client_readable(void) {
+    tty_core_pump_input(4);
+    return bsd_ttydisc_peek_signal(&g_tty) != 0 || tty_core_read_ready();
 }
 
 static u64 tty_write_from_client_payload(volatile u8 *payload, u64 len) {

@@ -374,6 +374,21 @@ static void profile_print_net_wait_op(const char *name, u64 op) {
     user_log("\n");
 }
 
+static void profile_print_net_wait_context(const char *name, u64 context) {
+    if (context >= NET_WAIT_CONTEXT_COUNT || g_prof.net_wait_context_calls[context] == 0) return;
+    user_log("LinuxAbiServer.perf.net.wait_context ");
+    user_log(name);
+    user_log(" calls=");
+    user_log_dec_value(g_prof.net_wait_context_calls[context]);
+    user_log(" loops=");
+    user_log_dec_value(g_prof.net_wait_context_loops[context]);
+    user_log(" slow=");
+    user_log_dec_value(g_prof.net_wait_context_slow[context]);
+    user_log(" timeouts=");
+    user_log_dec_value(g_prof.net_wait_context_timeouts[context]);
+    user_log("\n");
+}
+
 static void profile_print_vm_bucket(const char *prefix, const char *name, u64 index, const u64 *calls, const u64 *pages) {
     if (calls[index] == 0) return;
     user_log(prefix);
@@ -382,6 +397,17 @@ static void profile_print_vm_bucket(const char *prefix, const char *name, u64 in
     user_log_dec_value(calls[index]);
     user_log(" pages=");
     user_log_dec_value(pages[index]);
+    user_log("\n");
+}
+
+static void profile_print_byte_bucket(const char *prefix, const char *name, u64 index, const u64 *calls, const u64 *bytes) {
+    if (calls[index] == 0) return;
+    user_log(prefix);
+    user_log(name);
+    user_log(" calls=");
+    user_log_dec_value(calls[index]);
+    user_log(" bytes=");
+    user_log_dec_value(bytes[index]);
     user_log("\n");
 }
 
@@ -436,6 +462,13 @@ static void profile_report_and_reset(void) {
     profile_print_syscall("gettimeofday", LINUX_SYS_GETTIMEOFDAY);
     profile_print_syscall("getrandom", LINUX_SYS_GETRANDOM);
     profile_print_syscall("clock_gettime", LINUX_SYS_CLOCK_GETTIME);
+    profile_print_syscall("nanosleep", LINUX_SYS_NANOSLEEP);
+    profile_print_syscall("clock_nanosleep", LINUX_SYS_CLOCK_NANOSLEEP);
+    profile_print_syscall("setitimer", LINUX_SYS_SETITIMER);
+    profile_print_syscall("rt_sigtimedwait", LINUX_SYS_RT_SIGTIMEDWAIT);
+    profile_print_syscall("timer_create", LINUX_SYS_TIMER_CREATE);
+    profile_print_syscall("timer_settime", LINUX_SYS_TIMER_SETTIME);
+    profile_print_syscall("timer_gettime", LINUX_SYS_TIMER_GETTIME);
     profile_print_syscall("fcntl", LINUX_SYS_FCNTL);
     profile_print_syscall("ioctl", LINUX_SYS_IOCTL);
 
@@ -525,6 +558,13 @@ static void profile_report_and_reset(void) {
     profile_print_net_wait_op("tcp_write", NET_OP_TCP_WRITE);
     profile_print_net_wait_op("tcp_read", NET_OP_TCP_READ);
     profile_print_net_wait_op("tcp_read_bulk", NET_OP_TCP_READ_BULK);
+    profile_print_net_wait_context("poll_prefetch_read", NET_WAIT_CONTEXT_POLL_PREFETCH_READ);
+    profile_print_net_wait_context("recvmsg_blocking_read", NET_WAIT_CONTEXT_RECVMSG_BLOCKING_READ);
+    profile_print_net_wait_context("recvmsg_nowait_read", NET_WAIT_CONTEXT_RECVMSG_NOWAIT_READ);
+    profile_print_net_wait_context("read_inline_blocking", NET_WAIT_CONTEXT_READ_INLINE_BLOCKING);
+    profile_print_net_wait_context("read_inline_nowait", NET_WAIT_CONTEXT_READ_INLINE_NOWAIT);
+    profile_print_net_wait_context("read_bulk_blocking", NET_WAIT_CONTEXT_READ_BULK_BLOCKING);
+    profile_print_net_wait_context("read_bulk_nowait", NET_WAIT_CONTEXT_READ_BULK_NOWAIT);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_connect_attempts=", g_prof.net_tcp_connect_attempts);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_connect_poll_loops=", g_prof.net_tcp_connect_poll_loops);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_attempts=", g_prof.net_tcp_prefetch_attempts);
@@ -532,6 +572,25 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_bytes=", g_prof.net_tcp_prefetch_bytes);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_consumed=", g_prof.net_tcp_prefetch_consumed);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_prefetch_eof=", g_prof.net_tcp_prefetch_eof);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_request_bucket ", "0", 0, g_prof.net_tcp_read_request_bucket_calls, g_prof.net_tcp_read_request_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_request_bucket ", "1_512", 1, g_prof.net_tcp_read_request_bucket_calls, g_prof.net_tcp_read_request_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_request_bucket ", "513_1500", 2, g_prof.net_tcp_read_request_bucket_calls, g_prof.net_tcp_read_request_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_request_bucket ", "1501_4096", 3, g_prof.net_tcp_read_request_bucket_calls, g_prof.net_tcp_read_request_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_request_bucket ", "4097_16384", 4, g_prof.net_tcp_read_request_bucket_calls, g_prof.net_tcp_read_request_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_request_bucket ", "16385_plus", 5, g_prof.net_tcp_read_request_bucket_calls, g_prof.net_tcp_read_request_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_return_bucket ", "0", 0, g_prof.net_tcp_read_return_bucket_calls, g_prof.net_tcp_read_return_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_return_bucket ", "1_512", 1, g_prof.net_tcp_read_return_bucket_calls, g_prof.net_tcp_read_return_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_return_bucket ", "513_1500", 2, g_prof.net_tcp_read_return_bucket_calls, g_prof.net_tcp_read_return_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_return_bucket ", "1501_4096", 3, g_prof.net_tcp_read_return_bucket_calls, g_prof.net_tcp_read_return_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_return_bucket ", "4097_16384", 4, g_prof.net_tcp_read_return_bucket_calls, g_prof.net_tcp_read_return_bucket_bytes);
+    profile_print_byte_bucket("LinuxAbiServer.perf.net.tcp_read_return_bucket ", "16385_plus", 5, g_prof.net_tcp_read_return_bucket_calls, g_prof.net_tcp_read_return_bucket_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_read_return_zero_calls=", g_prof.net_tcp_read_return_zero_calls);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_read_return_prefetch_calls=", g_prof.net_tcp_read_return_prefetch_calls);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_read_return_prefetch_bytes=", g_prof.net_tcp_read_return_prefetch_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_read_return_direct_calls=", g_prof.net_tcp_read_return_direct_calls);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_read_return_direct_bytes=", g_prof.net_tcp_read_return_direct_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_read_return_bulk_calls=", g_prof.net_tcp_read_return_bulk_calls);
+    user_log_dec_line("LinuxAbiServer.perf.net.tcp_read_return_bulk_bytes=", g_prof.net_tcp_read_return_bulk_bytes);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_bulk_cap_pages=", g_prof.net_tcp_bulk_cap_pages);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_bulk_cap_ticks=", g_prof.net_tcp_bulk_cap_ticks);
     user_log_dec_line("LinuxAbiServer.perf.net.tcp_bulk_copy_ticks=", g_prof.net_tcp_bulk_copy_ticks);

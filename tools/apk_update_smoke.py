@@ -81,9 +81,27 @@ class Console:
             time.sleep(0.01)
         raise TimeoutError(f"timeout waiting for {needle!r}; tail={bytes(buf[-2000:])!r}")
 
-    def command(self, text: str, timeout: float) -> bytes:
-        os.write(self.fd, text.encode("ascii") + b"\r")
-        return self.read_until(b"# ", timeout)
+    def command(self, text: str, timeout: float, marker: str) -> tuple[bytes, int]:
+        marker_id = marker.removeprefix("__CAPABILITYOS_SMOKE_DONE_").removesuffix("__")
+        wrapped = f"{text}; printf '\\n__CAPABILITYOS_SMOKE_DONE_%s__:%d\\n' '{marker_id}' $?"
+        os.write(self.fd, wrapped.encode("ascii") + b"\r")
+        out = self.read_until(marker.encode("ascii") + b":", timeout)
+        status = 1
+        marker_bytes = marker.encode("ascii") + b":"
+        marker_pos = out.rfind(marker_bytes)
+        if marker_pos >= 0:
+            status_start = marker_pos + len(marker_bytes)
+            status_end = out.find(b"\n", status_start)
+            if status_end < 0:
+                out += self.read_until(b"\n", 1.0)
+                status_end = out.find(b"\n", status_start)
+            if status_end < 0:
+                status_end = len(out)
+            try:
+                status = int(out[status_start:status_end].strip() or b"1")
+            except ValueError:
+                status = 1
+        return out, status
 
 
 def main() -> int:
@@ -91,6 +109,8 @@ def main() -> int:
     parser.add_argument("--out", default=".artifacts/apk-update-smoke")
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--command", default="apk update")
+    parser.add_argument("--disk", default=None, help="disk image to boot; defaults to .artifacts/disk.img")
+    parser.add_argument("--in-place", action="store_true", help="boot the selected disk directly instead of a temporary copy")
     args = parser.parse_args()
 
     root = Path.cwd()
@@ -100,8 +120,14 @@ def main() -> int:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    disk = runtime_dir / "disk.img"
-    shutil.copyfile(root / ".artifacts" / "disk.img", disk)
+    source_disk = Path(args.disk) if args.disk is not None else root / ".artifacts" / "disk.img"
+    if not source_disk.is_absolute():
+        source_disk = root / source_disk
+    if args.in_place:
+        disk = source_disk
+    else:
+        disk = runtime_dir / "disk.img"
+        shutil.copyfile(source_disk, disk)
     shutil.copyfile(OVMF_VARS_TEMPLATE, runtime_dir / "OVMF_VARS.fd")
 
     proc = subprocess.Popen(
@@ -140,7 +166,8 @@ def main() -> int:
         console.read_until(b"# ", 45.0)
         boot_wait_s = time.monotonic() - boot_start
         command_start = time.monotonic()
-        out = console.command(args.command, args.timeout)
+        marker = f"__CAPABILITYOS_SMOKE_DONE_{os.getpid()}__"
+        out, command_status = console.command(args.command, args.timeout, marker)
         command_s = time.monotonic() - command_start
         print("--- timing ---")
         print(f"boot_wait_s={boot_wait_s:.3f}")
@@ -154,6 +181,8 @@ def main() -> int:
             or b"BAD signature" in out
             or b"temporary error" in out
             or b"unavailable" in out
+            or b"Permission denied" in out
+            or command_status != 0
         ):
             return 1
         return 0

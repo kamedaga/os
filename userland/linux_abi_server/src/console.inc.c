@@ -201,6 +201,20 @@ static int console_take_tty_signal(u64 *signo_out) {
     return 1;
 }
 
+static int console_poll_tty(u64 *readable_out, u64 *writable_out) {
+    *readable_out = 0;
+    *writable_out = 1;
+    if (!g_console.active || !g_console.is_tty) return 0;
+    u64 seq = 0;
+    if (!console_begin_request(CONSOLE_OP_POLL, 0, 0, 0, &seq)) return 0;
+    if (!wait_console_response(seq, CONSOLE_OP_POLL, 8192)) return 0;
+    volatile struct console_response_header *response = (volatile struct console_response_header *)console_response_addr();
+    if (response->status != CONSOLE_STATUS_OK) return 0;
+    *readable_out = response->arg0;
+    *writable_out = response->arg1;
+    return 1;
+}
+
 static int poll_tty_signal_events(void) {
     static u64 next_poll_tick = 0;
     const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);

@@ -36,11 +36,15 @@ enum {
     LINUX_STACK_PAGES = 128,
     LINUX_STACK_BYTES = LINUX_STACK_PAGES * PAGE_BYTES,
     LINUX_STACK_BOTTOM_VA = USER_STACK_TOP - LINUX_STACK_BYTES,
-    SOURCE_IMAGE_BASE_VA = 0x28000000,
-    SOURCE_IMAGE_SLOT_SPAN = 0x02000000,
-    SOURCE_IMAGE_SLOT_COUNT = 8,
+    SOURCE_IMAGE_SMALL_BASE_VA = 0x08000000,
+    SOURCE_IMAGE_SMALL_SLOT_SPAN = 0x01000000,
+    SOURCE_IMAGE_SMALL_SLOT_COUNT = 24,
+    SOURCE_IMAGE_LARGE_BASE_VA = 0x28000000,
+    SOURCE_IMAGE_LARGE_SLOT_SPAN = 0x08000000,
+    SOURCE_IMAGE_LARGE_SLOT_COUNT = 2,
+    SOURCE_IMAGE_SLOT_COUNT = SOURCE_IMAGE_SMALL_SLOT_COUNT + SOURCE_IMAGE_LARGE_SLOT_COUNT,
     SOURCE_IMAGE_PATH_BYTES = 160,
-    SOURCE_SLICE_CACHE_COUNT = 64,
+    SOURCE_SLICE_CACHE_COUNT = 256,
     LINUX_ABI_REQUEST_PAGES_BASE_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
@@ -53,7 +57,7 @@ enum {
     SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
     VM_RIGHT_READ_MAP = 0x5,
     ET_DYN_ALLOC_START_VA = 0x20000000,
-    MAX_CHILD_MAPPED_PAGES = 8192,
+    MAX_CHILD_MAPPED_PAGES = 32768,
     AT_NULL = 0,
     AT_PHDR = 3,
     AT_PHENT = 4,
@@ -896,6 +900,18 @@ static int source_path_matches(u64 slot, struct byte_slice path, u64 file_bytes)
     return 1;
 }
 
+static u64 source_image_slot_va(u64 slot) {
+    if (slot < SOURCE_IMAGE_SMALL_SLOT_COUNT) {
+        return SOURCE_IMAGE_SMALL_BASE_VA + slot * SOURCE_IMAGE_SMALL_SLOT_SPAN;
+    }
+    const u64 large_slot = slot - SOURCE_IMAGE_SMALL_SLOT_COUNT;
+    return SOURCE_IMAGE_LARGE_BASE_VA + large_slot * SOURCE_IMAGE_LARGE_SLOT_SPAN;
+}
+
+static u64 source_image_slot_capacity(u64 slot) {
+    return slot < SOURCE_IMAGE_SMALL_SLOT_COUNT ? SOURCE_IMAGE_SMALL_SLOT_SPAN : SOURCE_IMAGE_LARGE_SLOT_SPAN;
+}
+
 static u64 cached_slice_vm_object(u64 vm_token, u64 offset_bytes, u64 size_bytes, u64 rights_bits) {
     if (!EXEC_OPT_SOURCE_SLICE_CACHE) {
         return slice_vm_object(vm_token, offset_bytes, size_bytes, rights_bits);
@@ -942,7 +958,7 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
         for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
             if (source_path_matches(i, cache_path, file_bytes)) {
                 if (effective_vm_token_out != 0) *effective_vm_token_out = source_image_tokens[i];
-                return SOURCE_IMAGE_BASE_VA + i * SOURCE_IMAGE_SLOT_SPAN;
+                return source_image_slot_va(i);
             }
         }
     }
@@ -950,7 +966,7 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
     for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
         if (source_image_tokens[i] == vm_token && source_image_bytes[i] == file_bytes) {
             if (effective_vm_token_out != 0) *effective_vm_token_out = source_image_tokens[i];
-            return SOURCE_IMAGE_BASE_VA + i * SOURCE_IMAGE_SLOT_SPAN;
+            return source_image_slot_va(i);
         }
     }
 
@@ -958,7 +974,8 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
 
     for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
         if (source_image_tokens[i] != 0) continue;
-        const u64 source_va = SOURCE_IMAGE_BASE_VA + i * SOURCE_IMAGE_SLOT_SPAN;
+        if (file_bytes > source_image_slot_capacity(i)) continue;
+        const u64 source_va = source_image_slot_va(i);
         if (!map_vm_object(vm_token, source_va)) return 0;
         source_image_tokens[i] = vm_token;
         source_image_bytes[i] = file_bytes;
@@ -1049,8 +1066,8 @@ static int direct_map_segment(
 
     const u64 segment_vm = cached_slice_vm_object(source_vm_token, file_page_off, map_bytes, VM_RIGHT_READ_MAP);
     if (segment_vm == 0) {
-        user_log("Exec: direct slice failed\n");
-        return 0;
+        *mapped_out = -1;
+        return 1;
     }
     if (!map_vm_object_to_process(process_token, segment_vm, target_va, prot_bits_from_phdr(phdr))) {
         user_log("Exec: direct process map failed\n");
@@ -1103,6 +1120,7 @@ static int private_map_required_pages(
     const struct exec_elf_header *ehdr,
     u64 file_bytes,
     u64 load_bias,
+    int map_all_load_pages,
     u64 *mapped_count_out
 ) {
     *mapped_count_out = 0;
@@ -1116,7 +1134,7 @@ static int private_map_required_pages(
         for (u64 page_vaddr = segment_start; page_vaddr < segment_end; page_vaddr += PAGE_BYTES) {
             int requires_private = 0;
             if (!page_requires_private_mapping(source_va, ehdr, file_bytes, page_vaddr, &requires_private)) return 0;
-            if (!requires_private) continue;
+            if (!map_all_load_pages && !requires_private) continue;
             u64 target_page_va;
             if (!add_u64(load_bias, page_vaddr, &target_page_va)) return 0;
             int mapped = 0;
@@ -1183,6 +1201,7 @@ static int load_elf_image_into_process(
 
     int ok = 1;
     u64 mapped_count = 0;
+    int map_all_load_pages = 0;
     for (exec_u16 i = 0; i < summary->header.phnum; i++) {
         struct exec_elf_program_header phdr;
         const enum exec_elf_error err = exec_elf_parse_program_header((const void *)source_va, file_bytes, &summary->header, i, &phdr);
@@ -1198,11 +1217,12 @@ static int load_elf_image_into_process(
             ok = 0;
             break;
         }
-        if (mapped) mapped_count++;
+        if (mapped > 0) mapped_count++;
+        if (mapped < 0) map_all_load_pages = 1;
     }
     if (ok) {
         u64 private_count = 0;
-        if (!private_map_required_pages(process_token, tracker, source_va, &summary->header, file_bytes, load_bias, &private_count)) {
+        if (!private_map_required_pages(process_token, tracker, source_va, &summary->header, file_bytes, load_bias, map_all_load_pages, &private_count)) {
             user_log("Exec: private pages failed\n");
             ok = 0;
         } else {

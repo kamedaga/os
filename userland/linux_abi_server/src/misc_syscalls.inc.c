@@ -6,15 +6,46 @@ static struct ipc_message handle_getcwd(const struct trap_request *req) {
 }
 
 static struct ipc_message handle_chdir(const struct trap_request *req) {
-    char path[256]; char resolved[FS_MAX_PATH_BYTES + 1];
+    char path[256]; char virtual_path[FS_MAX_PATH_BYTES + 1]; char resolved[FS_MAX_PATH_BYTES + 1];
     if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
     if (path[0] == 0) return reply(errno_noent(), 0);
-    if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0);
+    if (!resolve_virtual_path_at(AT_FDCWD_U64, path, virtual_path)) return reply(errno_nametoolong(), 0);
+    if (!map_virtual_path_to_host(virtual_path, resolved)) return reply(errno_nametoolong(), 0);
     struct fs_stat_record rec; u64 token = 0, size = 0; u8 kind = 0;
     if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_noent(), 0);
     if (kind != FS_OBJECT_DIRECTORY && kind != FS_OBJECT_MOUNT) return reply(errno_notdir(), 0);
-    g_cwd_len = (u16)cstr_len(resolved);
-    for (u16 i = 0; i <= g_cwd_len; i++) g_cwd[i] = resolved[i];
+    g_cwd_len = (u16)cstr_len(virtual_path);
+    for (u16 i = 0; i <= g_cwd_len; i++) g_cwd[i] = virtual_path[i];
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_fchdir(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    if (g_fds[fd].kind != FD_DIR || g_fds[fd].path_len == 0) return reply(errno_notdir(), 0);
+    char virtual_path[FS_MAX_PATH_BYTES + 1];
+    if (!host_path_to_virtual(g_fds[fd].path, virtual_path)) return reply(errno_noent(), 0);
+    g_cwd_len = (u16)cstr_len(virtual_path);
+    for (u16 i = 0; i <= g_cwd_len; i++) g_cwd[i] = virtual_path[i];
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_chroot(const struct trap_request *req) {
+    char path[256];
+    char resolved[FS_MAX_PATH_BYTES + 1];
+    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
+    if (path[0] == 0) return reply(errno_noent(), 0);
+    if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0);
+    struct fs_stat_record rec;
+    u64 token = 0, size = 0;
+    u8 kind = 0;
+    if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_noent(), 0);
+    if (kind != FS_OBJECT_DIRECTORY && kind != FS_OBJECT_MOUNT) return reply(errno_notdir(), 0);
+    g_proc->root_len = (u16)cstr_len(resolved);
+    for (u16 i = 0; i <= g_proc->root_len; i++) g_proc->root_path[i] = resolved[i];
+    g_cwd[0] = '/';
+    g_cwd[1] = 0;
+    g_cwd_len = 1;
     return reply(0, 0);
 }
 
@@ -27,23 +58,61 @@ static int cstr_eq(const char *a, const char *b) {
     return a[i] == 0 && b[i] == 0;
 }
 
-static struct ipc_message handle_readlink(const struct trap_request *req) {
+static int vfs_readlink_path(const char *path, char *target, u64 target_capacity, u64 *target_len_out) {
+    *target_len_out = 0;
+    if (target_capacity == 0) return 0;
+    struct fs_stat_record rec;
+    u64 token = 0;
+    u64 size = 0;
+    u8 kind = FS_OBJECT_NONE;
+    if (!vfs_lookup_stat(path, &token, &rec, &size, &kind)) return 0;
+    if (kind != FS_OBJECT_SYMLINK) return 0;
+    u32 request_len = (u32)target_capacity;
+    if (request_len > FS_RESPONSE_PAYLOAD_BYTES) request_len = FS_RESPONSE_PAYLOAD_BYTES;
+    if (!vfs_request(FS_OP_READ, token, 0, request_len, 0)) return 0;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status != FS_STATUS_OK || response->inline_bytes > request_len) return 0;
+    volatile u8 *payload = (volatile u8 *)vfs_response_payload();
+    for (u16 i = 0; i < response->inline_bytes; i++) target[i] = (char)payload[i];
+    *target_len_out = response->inline_bytes;
+    (void)rec;
+    (void)size;
+    return 1;
+}
+
+static struct ipc_message handle_readlinkat(const struct trap_request *req, int old_readlink) {
     char path[256]; char resolved[FS_MAX_PATH_BYTES + 1];
-    const u64 dst = req->args[1]; const u64 size = req->args[2];
-    if (!copy_cstr_from_target(req->args[0], path, sizeof(path))) return reply(errno_fault(), 0);
+    const u64 dirfd = old_readlink ? AT_FDCWD_U64 : req->args[0];
+    const u64 path_ptr = old_readlink ? req->args[0] : req->args[1];
+    const u64 dst = old_readlink ? req->args[1] : req->args[2];
+    const u64 size = old_readlink ? req->args[2] : req->args[3];
+    if (!copy_cstr_from_target(path_ptr, path, sizeof(path))) return reply(errno_fault(), 0);
     if (path[0] == 0) return reply(errno_noent(), 0);
-    if (!resolve_path_at(AT_FDCWD_U64, path, resolved)) return reply(errno_nametoolong(), 0);
+    if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
     if (cstr_eq(resolved, "/proc/self/exe")) {
         if (g_exec_path_len == 0) return reply(errno_noent(), 0);
         const u64 n = min_u64(g_exec_path_len, size);
         if (copy_to_target(dst, g_exec_path, n) != n) return reply(errno_fault(), 0);
         return reply(n, 0);
     }
+    char target[FS_MAX_PATH_BYTES + 1];
+    u64 target_len = 0;
+    if (vfs_readlink_path(resolved, target, sizeof(target) - 1, &target_len)) {
+        const u64 n = min_u64(target_len, size);
+        if (copy_to_target(dst, target, n) != n) return reply(errno_fault(), 0);
+        return reply(n, 0);
+    }
     return reply(errno_noent(), 0);
+}
+
+static struct ipc_message handle_readlink(const struct trap_request *req) {
+    return handle_readlinkat(req, 1);
 }
 
 struct linux_timespec { i64 tv_sec; i64 tv_nsec; };
 struct linux_timeval { i64 tv_sec; i64 tv_usec; };
+struct linux_itimerval { struct linux_timeval it_interval; struct linux_timeval it_value; };
+struct linux_itimerspec { struct linux_timespec it_interval; struct linux_timespec it_value; };
 struct linux_timezone { int tz_minuteswest; int tz_dsttime; };
 struct linux_sysinfo {
     i64 uptime;
@@ -65,6 +134,7 @@ enum {
     LINUX_CLOCK_MONOTONIC = 1,
     LINUX_CLOCK_MONOTONIC_RAW = 4,
     LINUX_CLOCK_BOOTTIME = 7,
+    LINUX_TIMER_ABSTIME = 1,
     LINUX_ABI_MONOTONIC_NS_PER_TICK = 1000000,
     CAPABILITYOS_CERT_TIME_UNIX = 1778025600
 };
@@ -80,6 +150,37 @@ static void monotonic_timespec(struct linux_timespec *ts) {
     const u64 ns = ticks * (u64)LINUX_ABI_MONOTONIC_NS_PER_TICK;
     ts->tv_sec = (i64)(ns / 1000000000ULL);
     ts->tv_nsec = (i64)(ns % 1000000000ULL);
+}
+
+static int linux_timespec_valid(const struct linux_timespec *ts) {
+    return ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000LL;
+}
+
+static u64 linux_timespec_to_ticks_ceil(const struct linux_timespec *ts) {
+    const u64 sec = (u64)ts->tv_sec;
+    const u64 nsec = (u64)ts->tv_nsec;
+    return sec * 1000ULL + (nsec + (LINUX_ABI_MONOTONIC_NS_PER_TICK - 1ULL)) / LINUX_ABI_MONOTONIC_NS_PER_TICK;
+}
+
+static i64 linux_timespec_compare(const struct linux_timespec *a, const struct linux_timespec *b) {
+    if (a->tv_sec != b->tv_sec) return a->tv_sec < b->tv_sec ? -1 : 1;
+    if (a->tv_nsec != b->tv_nsec) return a->tv_nsec < b->tv_nsec ? -1 : 1;
+    return 0;
+}
+
+static struct linux_timespec linux_timespec_sub(const struct linux_timespec *a, const struct linux_timespec *b) {
+    struct linux_timespec out;
+    out.tv_sec = a->tv_sec - b->tv_sec;
+    out.tv_nsec = a->tv_nsec - b->tv_nsec;
+    if (out.tv_nsec < 0) {
+        out.tv_sec--;
+        out.tv_nsec += 1000000000LL;
+    }
+    if (out.tv_sec < 0) {
+        out.tv_sec = 0;
+        out.tv_nsec = 0;
+    }
+    return out;
 }
 struct linux_utsname {
     char sysname[65];
@@ -123,6 +224,146 @@ static struct ipc_message handle_clock_gettime(const struct trap_request *req) {
         monotonic_timespec(&ts);
     }
     return copy_to_target(req->args[1], &ts, sizeof(ts)) == sizeof(ts) ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+static struct ipc_message handle_clock_getres(const struct trap_request *req) {
+    const u64 dst = req->args[1];
+    if (dst == 0) return reply(0, 0);
+    struct linux_timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = LINUX_ABI_MONOTONIC_NS_PER_TICK;
+    return copy_to_target(dst, &ts, sizeof(ts)) == sizeof(ts) ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+static struct ipc_message handle_nanosleep(const struct trap_request *req) {
+    struct linux_timespec ts;
+    if (req->args[0] == 0) return reply(errno_fault(), 0);
+    if (copy_from_target(req->args[0], &ts, sizeof(ts)) != sizeof(ts)) return reply(errno_fault(), 0);
+    if (!linux_timespec_valid(&ts)) return reply(errno_inval(), 0);
+    if (req->args[1] != 0) {
+        struct linux_timespec rem;
+        rem.tv_sec = 0;
+        rem.tv_nsec = 0;
+        if (copy_to_target(req->args[1], &rem, sizeof(rem)) != sizeof(rem)) return reply(errno_fault(), 0);
+    }
+
+    u64 ticks = linux_timespec_to_ticks_ceil(&ts);
+    if (ticks != 0) (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, ticks);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_clock_nanosleep(const struct trap_request *req) {
+    const u64 clock_id = req->args[0];
+    const u64 flags = req->args[1];
+    const u64 request_va = req->args[2];
+    const u64 remain_va = req->args[3];
+    if (clock_id != LINUX_CLOCK_REALTIME &&
+        clock_id != LINUX_CLOCK_MONOTONIC &&
+        clock_id != LINUX_CLOCK_MONOTONIC_RAW &&
+        clock_id != LINUX_CLOCK_BOOTTIME)
+    {
+        return reply(errno_inval(), 0);
+    }
+    if ((flags & ~(u64)LINUX_TIMER_ABSTIME) != 0) return reply(errno_inval(), 0);
+    if (request_va == 0) return reply(errno_fault(), 0);
+
+    struct linux_timespec requested;
+    if (copy_from_target(request_va, &requested, sizeof(requested)) != sizeof(requested)) return reply(errno_fault(), 0);
+    if (!linux_timespec_valid(&requested)) return reply(errno_inval(), 0);
+
+    struct linux_timespec duration = requested;
+    if ((flags & LINUX_TIMER_ABSTIME) != 0) {
+        struct linux_timespec now;
+        if (clock_id == LINUX_CLOCK_REALTIME) {
+            now.tv_sec = realtime_unix_seconds();
+            now.tv_nsec = 0;
+        } else {
+            monotonic_timespec(&now);
+        }
+        if (linux_timespec_compare(&requested, &now) <= 0) return reply(0, 0);
+        duration = linux_timespec_sub(&requested, &now);
+    } else if (remain_va != 0) {
+        struct linux_timespec rem;
+        rem.tv_sec = 0;
+        rem.tv_nsec = 0;
+        if (copy_to_target(remain_va, &rem, sizeof(rem)) != sizeof(rem)) return reply(errno_fault(), 0);
+    }
+
+    const u64 ticks = linux_timespec_to_ticks_ceil(&duration);
+    if (ticks != 0) (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, ticks);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_setitimer(const struct trap_request *req) {
+    const u64 which = req->args[0];
+    const u64 new_value_va = req->args[1];
+    const u64 old_value_va = req->args[2];
+    if (which > 2) return reply(errno_inval(), 0);
+    if (old_value_va != 0) {
+        struct linux_itimerval old_value;
+        u8 *p = (u8 *)&old_value;
+        for (u64 i = 0; i < sizeof(old_value); i++) p[i] = 0;
+        if (copy_to_target(old_value_va, &old_value, sizeof(old_value)) != sizeof(old_value)) return reply(errno_fault(), 0);
+    }
+    if (new_value_va != 0) {
+        struct linux_itimerval new_value;
+        if (copy_from_target(new_value_va, &new_value, sizeof(new_value)) != sizeof(new_value)) return reply(errno_fault(), 0);
+        if (new_value.it_interval.tv_sec < 0 || new_value.it_value.tv_sec < 0 ||
+            new_value.it_interval.tv_usec < 0 || new_value.it_interval.tv_usec >= 1000000LL ||
+            new_value.it_value.tv_usec < 0 || new_value.it_value.tv_usec >= 1000000LL)
+        {
+            return reply(errno_inval(), 0);
+        }
+    }
+    return reply(0, 0);
+}
+
+static int itimerspec_valid(const struct linux_itimerspec *its) {
+    if (its->it_interval.tv_sec < 0 || its->it_value.tv_sec < 0) return 0;
+    if (its->it_interval.tv_nsec < 0 || its->it_interval.tv_nsec >= 1000000000LL) return 0;
+    if (its->it_value.tv_nsec < 0 || its->it_value.tv_nsec >= 1000000000LL) return 0;
+    return 1;
+}
+
+static struct ipc_message handle_timer_create(const struct trap_request *req) {
+    const u64 clock_id = req->args[0];
+    const u64 timerid_va = req->args[2];
+    if (clock_id != LINUX_CLOCK_REALTIME &&
+        clock_id != LINUX_CLOCK_MONOTONIC &&
+        clock_id != LINUX_CLOCK_MONOTONIC_RAW &&
+        clock_id != LINUX_CLOCK_BOOTTIME)
+    {
+        return reply(errno_inval(), 0);
+    }
+    if (timerid_va == 0) return reply(errno_fault(), 0);
+    const i32 timerid = 1;
+    return copy_to_target(timerid_va, &timerid, sizeof(timerid)) == sizeof(timerid) ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+static struct ipc_message handle_timer_settime(const struct trap_request *req) {
+    const u64 new_value_va = req->args[2];
+    const u64 old_value_va = req->args[3];
+    if (old_value_va != 0) {
+        struct linux_itimerspec old_value;
+        u8 *p = (u8 *)&old_value;
+        for (u64 i = 0; i < sizeof(old_value); i++) p[i] = 0;
+        if (copy_to_target(old_value_va, &old_value, sizeof(old_value)) != sizeof(old_value)) return reply(errno_fault(), 0);
+    }
+    if (new_value_va != 0) {
+        struct linux_itimerspec new_value;
+        if (copy_from_target(new_value_va, &new_value, sizeof(new_value)) != sizeof(new_value)) return reply(errno_fault(), 0);
+        if (!itimerspec_valid(&new_value)) return reply(errno_inval(), 0);
+    }
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_timer_gettime(const struct trap_request *req) {
+    const u64 dst = req->args[1];
+    if (dst == 0) return reply(errno_fault(), 0);
+    struct linux_itimerspec value;
+    u8 *p = (u8 *)&value;
+    for (u64 i = 0; i < sizeof(value); i++) p[i] = 0;
+    return copy_to_target(dst, &value, sizeof(value)) == sizeof(value) ? reply(0, 0) : reply(errno_fault(), 0);
 }
 
 static struct ipc_message handle_gettimeofday(const struct trap_request *req) {
@@ -364,6 +605,31 @@ static struct ipc_message handle_ioctl(const struct trap_request *req) {
         linux_termios_to_tty_attr(&termios, &attr);
         return reply(console_set_tty_attr(&attr) ? 0 : errno_io(), 0);
     }
-    if (request == TIOCSPGRP || request == TIOCSWINSZ) return reply(0, 0);
+    if (request == TIOCSWINSZ) {
+        struct linux_winsize ws;
+        if (copy_from_target(argp, &ws, sizeof(ws)) != sizeof(ws)) return reply(errno_fault(), 0);
+        struct tty_attr_payload attr;
+        if (!console_get_tty_attr(&attr)) {
+            attr.version = TTY_ATTR_VERSION;
+            attr.iflag = TTY_IFLAG_ICRNL;
+            attr.oflag = TTY_OFLAG_OPOST | TTY_OFLAG_ONLCR;
+            attr.lflag = TTY_LFLAG_ISIG | TTY_LFLAG_ICANON | TTY_LFLAG_ECHO | TTY_LFLAG_ECHOE | TTY_LFLAG_ECHOK | TTY_LFLAG_IEXTEN;
+            for (u64 i = 0; i < sizeof(attr.cc); i++) attr.cc[i] = 0;
+            attr.cc[0] = 3;
+            attr.cc[1] = 28;
+            attr.cc[2] = 127;
+            attr.cc[3] = 21;
+            attr.cc[4] = 4;
+            attr.cc[5] = 0;
+            attr.cc[6] = 1;
+            attr.columns = 120;
+            attr.rows = 40;
+            attr.reserved0 = 0;
+        }
+        if (ws.ws_col != 0) attr.columns = ws.ws_col;
+        if (ws.ws_row != 0) attr.rows = ws.ws_row;
+        return reply(console_set_tty_attr(&attr) ? 0 : errno_io(), 0);
+    }
+    if (request == TIOCSPGRP) return reply(0, 0);
     return reply(errno_inval(), 0);
 }

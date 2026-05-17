@@ -617,8 +617,8 @@ pub const IpcBufferMailbox = struct {
     }
 };
 
-pub const max_image_backing_pages: usize = 4096;
-pub const max_image_backing_store_pages: usize = 65536;
+pub const max_image_backing_pages: usize = 32768;
+pub const max_image_backing_store_pages: usize = 262144;
 
 var image_backing_page_store: [max_image_backing_store_pages]u64 = [_]u64{0} ** max_image_backing_store_pages;
 var image_backing_page_store_next: usize = 0;

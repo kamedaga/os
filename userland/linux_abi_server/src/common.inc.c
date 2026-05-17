@@ -89,7 +89,7 @@ enum {
     FS_RESPONSE_HEADER_BYTES = 72,
     FS_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - FS_RESPONSE_HEADER_BYTES,
     FS_BULK_READ_INITIAL_PAGE_COUNT = 16,
-    FS_BULK_READ_PAGE_COUNT = 16,
+    FS_BULK_READ_PAGE_COUNT = 64,
     FS_BULK_READ_BYTES = FS_BULK_READ_PAGE_COUNT * PAGE_BYTES,
     FS_STAT_RECORD_BYTES = 56,
     FS_DIRENT_RECORD_BYTES = 24,
@@ -119,8 +119,10 @@ enum {
     FS_OBJECT_FILE = 3,
     FS_OBJECT_OPEN_FILE = 4,
     FS_OBJECT_EXEC = 5,
+    FS_OBJECT_SYMLINK = 6,
     FS_DIR_MODE = 0x4000,
     FS_FILE_MODE = 0x8000,
+    FS_SYMLINK_MODE = 0xA000,
 
     CONSOLE_REQUEST_MAGIC = 0x514E4F43,
     CONSOLE_RESPONSE_MAGIC = 0x524E4F43,
@@ -131,6 +133,7 @@ enum {
     CONSOLE_OP_GET_ATTR = 4,
     CONSOLE_OP_SET_ATTR = 5,
     CONSOLE_OP_GET_SIGNAL = 6,
+    CONSOLE_OP_POLL = 7,
     CONSOLE_STATUS_OK = 0,
     CONSOLE_STATUS_AGAIN = 1,
     CONSOLE_STATUS_INVALID = 2,
@@ -154,6 +157,7 @@ enum {
     NET_OP_TCP_WRITE = 9,
     NET_OP_TCP_READ = 10,
     NET_OP_TCP_READ_BULK = 11,
+    NET_TCP_READ_FLAG_NOWAIT = 1 << 0,
     NET_POLL_READABLE = 1 << 0,
     NET_POLL_WRITABLE = 1 << 2,
     NET_STATUS_OK = 0,
@@ -171,7 +175,7 @@ enum {
     NET_UDP_MAX_PAYLOAD = 1200,
     NET_TCP_MAX_PAYLOAD = 1200,
     NET_TCP_READ_BYTES = NET_RESPONSE_PAYLOAD_BYTES,
-    NET_TCP_BULK_READ_PAGE_COUNT = 16,
+    NET_TCP_BULK_READ_PAGE_COUNT = 64,
     NET_TCP_BULK_READ_BYTES = NET_TCP_BULK_READ_PAGE_COUNT * PAGE_BYTES,
 
     LINUX_SYS_READ = 0,
@@ -200,6 +204,7 @@ enum {
     LINUX_SYS_MADVISE = 28,
     LINUX_SYS_DUP = 32,
     LINUX_SYS_DUP2 = 33,
+    LINUX_SYS_NANOSLEEP = 35,
     LINUX_SYS_SETITIMER = 38,
     LINUX_SYS_GETPID = 39,
     LINUX_SYS_SOCKET = 41,
@@ -226,8 +231,11 @@ enum {
     LINUX_SYS_FDATASYNC = 75,
     LINUX_SYS_GETCWD = 79,
     LINUX_SYS_CHDIR = 80,
+    LINUX_SYS_FCHDIR = 81,
     LINUX_SYS_RENAME = 82,
+    LINUX_SYS_MKDIR = 83,
     LINUX_SYS_UNLINK = 87,
+    LINUX_SYS_SYMLINK = 88,
     LINUX_SYS_READLINK = 89,
     LINUX_SYS_CHMOD = 90,
     LINUX_SYS_FCHMOD = 91,
@@ -244,11 +252,15 @@ enum {
     LINUX_SYS_SETPGID = 109,
     LINUX_SYS_GETPPID = 110,
     LINUX_SYS_GETPGID = 121,
+    LINUX_SYS_SETFSUID = 122,
+    LINUX_SYS_SETFSGID = 123,
+    LINUX_SYS_RT_SIGTIMEDWAIT = 128,
     LINUX_SYS_SIGALTSTACK = 131,
     LINUX_SYS_STATFS = 137,
     LINUX_SYS_FSTATFS = 138,
     LINUX_SYS_EXECVE = 59,
     LINUX_SYS_EXIT = 60,
+    LINUX_SYS_CHROOT = 161,
     LINUX_SYS_ARCH_PRCTL = 158,
     LINUX_SYS_SYNC = 162,
     LINUX_SYS_MOUNT = 165,
@@ -260,19 +272,36 @@ enum {
     LINUX_SYS_SCHED_GETAFFINITY = 204,
     LINUX_SYS_GETDENTS64 = 217,
     LINUX_SYS_SET_TID_ADDRESS = 218,
+    LINUX_SYS_TIMER_CREATE = 222,
+    LINUX_SYS_TIMER_SETTIME = 223,
+    LINUX_SYS_TIMER_GETTIME = 224,
+    LINUX_SYS_TIMER_DELETE = 226,
     LINUX_SYS_CLOCK_GETTIME = 228,
+    LINUX_SYS_CLOCK_GETRES = 229,
+    LINUX_SYS_CLOCK_NANOSLEEP = 230,
+    LINUX_SYS_EPOLL_WAIT = 232,
+    LINUX_SYS_EPOLL_CTL = 233,
     LINUX_SYS_EXIT_GROUP = 231,
     LINUX_SYS_TGKILL = 234,
     LINUX_SYS_OPENAT = 257,
+    LINUX_SYS_MKDIRAT = 258,
+    LINUX_SYS_MKNODAT = 259,
+    LINUX_SYS_FCHOWNAT = 260,
     LINUX_SYS_NEWFSTATAT = 262,
     LINUX_SYS_UNLINKAT = 263,
     LINUX_SYS_RENAMEAT = 264,
+    LINUX_SYS_SYMLINKAT = 266,
+    LINUX_SYS_READLINKAT = 267,
+    LINUX_SYS_FCHMODAT = 268,
+    LINUX_SYS_FACCESSAT = 269,
     LINUX_SYS_PSELECT6 = 270,
     LINUX_SYS_PPOLL = 271,
     LINUX_SYS_SET_ROBUST_LIST = 273,
     LINUX_SYS_SPLICE = 275,
     LINUX_SYS_UTIMENSAT = 280,
+    LINUX_SYS_FALLOCATE = 285,
     LINUX_SYS_EVENTFD2 = 290,
+    LINUX_SYS_EPOLL_CREATE1 = 291,
     LINUX_SYS_DUP3 = 292,
     LINUX_SYS_PIPE2 = 293,
     LINUX_SYS_PRLIMIT64 = 302,
@@ -281,8 +310,9 @@ enum {
     LINUX_SYS_RENAMEAT2 = 316,
     LINUX_SYS_MEMBARRIER = 324,
     LINUX_SYS_RSEQ = 334,
-
     AT_FDCWD_U64 = 0xffffffffffffff9cULL,
+    AT_SYMLINK_NOFOLLOW = 0x100,
+    AT_EACCESS = 0x200,
     AT_EMPTY_PATH = 0x1000,
     O_ACCMODE = 00000003,
     O_RDONLY = 0,
@@ -293,6 +323,7 @@ enum {
     O_TRUNC = 00001000,
     O_CLOEXEC = 02000000,
     O_DIRECTORY = 00200000,
+    O_NOFOLLOW = 00400000,
     AF_INET = 2,
     SOCK_STREAM = 1,
     SOCK_DGRAM = 2,
@@ -317,7 +348,9 @@ enum {
     POLLNVAL = 0x020,
     POLLRDNORM = 0x040,
     POLLWRNORM = 0x100,
+    FS_CREATE_FLAG_DIRECTORY = 1 << 0,
     FS_CREATE_FLAG_TRUNCATE = 1 << 1,
+    FS_CREATE_FLAG_SYMLINK = 1 << 2,
     WNOHANG = 1,
     WUNTRACED = 2,
     WCONTINUED = 8,
@@ -379,6 +412,7 @@ enum {
     DT_UNKNOWN = 0,
     DT_DIR = 4,
     DT_REG = 8,
+    DT_LNK = 10,
     FUTEX_WAIT = 0,
     FUTEX_WAKE = 1,
     FUTEX_PRIVATE_FLAG = 128,
@@ -426,7 +460,7 @@ enum {
     LINUX_ABI_CONFIG_TARGET_VA = 0x3C002000,
     LINUX_ABI_ENDPOINT_ID = 0x90,
     LINUX_ABI_SELF_WAKE_ENDPOINT_ID = 0x91,
-    EXECVE_MAIN_IMAGE_VA = 0x24000000,
+    EXECVE_MAIN_IMAGE_VA = 0x14000000,
     EXECVE_LD_IMAGE_VA = 0x26200000,
     EXECVE_CONFIG_VA = 0x26400000,
     EXECVE_TABLE_VA = 0x26401000,
@@ -437,7 +471,7 @@ enum {
     FILE_CACHE_BASE_VA = 0x28000000,
     FILE_CACHE_BYTES = 8 * 1024 * 1024,
     FILE_CACHE_MAX = 12,
-    EXECVE_MAX_IMAGE_BYTES = 16 * 1024 * 1024,
+    EXECVE_MAX_IMAGE_BYTES = 128 * 1024 * 1024,
     EXECVE_MAX_LD_BYTES = 768 * 1024,
     EXECVE_MAX_ARGV = 8,
     EXECVE_MAX_ENVP = 16,
@@ -498,7 +532,7 @@ struct linux_statfs {
     i64 f_spare[4];
 };
 
-enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6, FD_SOCKET = 7, FD_RANDOM = 8 };
+enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6, FD_SOCKET = 7, FD_RANDOM = 8, FD_EPOLL = 9 };
 struct fd_entry {
     enum fd_kind kind;
     u64 token;
@@ -611,6 +645,13 @@ struct pipe_entry {
     u8 bytes[PIPE_BUFFER_BYTES];
 };
 
+enum { SOCKET_REF_MAX = 64 };
+struct socket_ref_entry {
+    u8 used;
+    u16 refs;
+    u64 token;
+};
+
 enum { FUTEX_WAITER_MAX = 32 };
 struct futex_waiter {
     u8 used;
@@ -629,7 +670,7 @@ struct exec_cache_entry {
     char path[FS_MAX_PATH_BYTES + 1];
 };
 
-enum { VM_REGION_MAX = 1024 };
+enum { VM_REGION_MAX = 4096 };
 struct vm_region { u64 start; u64 size; u64 prot; int used; };
 
 enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16 };
@@ -646,6 +687,8 @@ struct linux_process_state {
     u64 mmap_next_va;
     u64 brk_next_va;
     struct vm_region regions[VM_REGION_MAX];
+    u16 root_len;
+    char root_path[FS_MAX_PATH_BYTES + 1];
     u16 cwd_len;
     char cwd[FS_MAX_PATH_BYTES + 1];
     u8 child_used[LINUX_CHILD_MAX];
@@ -670,6 +713,12 @@ struct linux_stack_t {
     u32 reserved0;
     u64 ss_size;
 };
+
+static int resolve_path_at(u64 dirfd, const char *path, char *out);
+static int resolve_virtual_path_at(u64 dirfd, const char *path, char *out);
+static int map_virtual_path_to_host(const char *path, char *out);
+static int normalize_path(const char *base, const char *path, char *out);
+static int chroot_is_default(void);
 
 struct exec_bootstrap_config {
     u64 magic; u64 version; u64 executable_vm_token; u64 executable_file_bytes; u64 flags;
@@ -718,7 +767,17 @@ struct linux_abi_bootstrap_config {
     char exec_path[128];
 };
 
-enum { LINUX_SYSCALL_PROFILE_COUNT = 335, FS_PROFILE_OP_COUNT = 33, NET_PROFILE_OP_COUNT = 12 };
+enum { LINUX_SYSCALL_PROFILE_COUNT = 335, FS_PROFILE_OP_COUNT = 33, NET_PROFILE_OP_COUNT = 12, NET_WAIT_CONTEXT_COUNT = 8 };
+enum {
+    NET_WAIT_CONTEXT_NONE = 0,
+    NET_WAIT_CONTEXT_POLL_PREFETCH_READ = 1,
+    NET_WAIT_CONTEXT_RECVMSG_BLOCKING_READ = 2,
+    NET_WAIT_CONTEXT_RECVMSG_NOWAIT_READ = 3,
+    NET_WAIT_CONTEXT_READ_INLINE_BLOCKING = 4,
+    NET_WAIT_CONTEXT_READ_INLINE_NOWAIT = 5,
+    NET_WAIT_CONTEXT_READ_BULK_BLOCKING = 6,
+    NET_WAIT_CONTEXT_READ_BULK_NOWAIT = 7,
+};
 struct linux_abi_profile {
     u64 syscall_total;
     u64 syscall_counts[LINUX_SYSCALL_PROFILE_COUNT + 1];
@@ -769,6 +828,10 @@ struct linux_abi_profile {
     u64 net_wait_op_loops[NET_PROFILE_OP_COUNT];
     u64 net_wait_op_timeouts[NET_PROFILE_OP_COUNT];
     u64 net_wait_op_slow[NET_PROFILE_OP_COUNT];
+    u64 net_wait_context_calls[NET_WAIT_CONTEXT_COUNT];
+    u64 net_wait_context_loops[NET_WAIT_CONTEXT_COUNT];
+    u64 net_wait_context_slow[NET_WAIT_CONTEXT_COUNT];
+    u64 net_wait_context_timeouts[NET_WAIT_CONTEXT_COUNT];
     u64 net_tcp_connect_attempts;
     u64 net_tcp_connect_poll_loops;
     u64 net_tcp_prefetch_attempts;
@@ -776,6 +839,17 @@ struct linux_abi_profile {
     u64 net_tcp_prefetch_bytes;
     u64 net_tcp_prefetch_consumed;
     u64 net_tcp_prefetch_eof;
+    u64 net_tcp_read_request_bucket_calls[6];
+    u64 net_tcp_read_request_bucket_bytes[6];
+    u64 net_tcp_read_return_bucket_calls[6];
+    u64 net_tcp_read_return_bucket_bytes[6];
+    u64 net_tcp_read_return_zero_calls;
+    u64 net_tcp_read_return_prefetch_calls;
+    u64 net_tcp_read_return_prefetch_bytes;
+    u64 net_tcp_read_return_direct_calls;
+    u64 net_tcp_read_return_direct_bytes;
+    u64 net_tcp_read_return_bulk_calls;
+    u64 net_tcp_read_return_bulk_bytes;
     u64 net_tcp_bulk_cap_pages;
     u64 net_tcp_bulk_cap_ticks;
     u64 net_tcp_bulk_copy_ticks;
@@ -811,12 +885,14 @@ static u8 g_deferred_start_used[LINUX_PROCESS_MAX];
 static u64 g_deferred_start_principal[LINUX_PROCESS_MAX];
 static u32 g_deferred_pipe_wake_mask = 0;
 static struct pipe_entry g_pipes[PIPE_MAX];
+static struct socket_ref_entry g_socket_refs[SOCKET_REF_MAX];
 static struct futex_waiter g_futex_waiters[FUTEX_WAITER_MAX];
 static int g_profile_trace_verbose = 0;
 static u8 g_request_page_mapped[LINUX_ABI_REQUEST_PAGE_COUNT];
 static int execve_scratch_ready = 0;
 static int execve_exec_service_scratch_ready = 0;
 static u64 execve_main_scratch_pages = 0;
+static int execve_ld_scratch_ready = 0;
 static u64 g_exec_vm_token = 0;
 static u64 g_exec_program_token = 0;
 static u64 g_exec_service_slot = 0;
@@ -831,6 +907,10 @@ static int g_exec_service_connected = 0;
 static u64 g_exec_service_seq = 1;
 static u64 g_standard_interpreter_vm_token = 0;
 static u64 g_standard_interpreter_bytes = 0;
+static int g_standard_interpreter_dirty = 0;
+static u64 g_exec_service_interpreter_source_token = 0;
+static u64 g_exec_service_interpreter_granted_token = 0;
+static u64 g_exec_service_interpreter_granted_slot = 0;
 static struct exec_cache_entry g_exec_cache[EXEC_CACHE_MAX];
 static u64 g_root_linux_principal = 0;
 static int g_root_linux_principal_set = 0;
