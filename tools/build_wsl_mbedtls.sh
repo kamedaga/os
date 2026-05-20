@@ -13,7 +13,9 @@ cc_stamp="$build_dir/.capabilityos-cc"
 config_stamp="$build_dir/.capabilityos-config"
 config_id="musl-shared-mbedtls-$version-sysv-v3"
 
-mkdir -p "$src_dir" "$prefix" "$root_dir/userland/fixtures"
+fixture_dir="$root_dir/.artifacts/userland-fixtures"
+
+mkdir -p "$src_dir" "$prefix" "$fixture_dir"
 
 if [ ! -f "$archive" ]; then
   wget -O "$archive" "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$version/mbedtls-$version.tar.bz2"
@@ -33,13 +35,13 @@ if [ ! -d "$build_dir" ]; then
 fi
 
 copy_outputs() {
-  cp "$(readlink -f "$prefix/lib/libmbedcrypto.so.16")" "$root_dir/userland/fixtures/libmbedcrypto.so.16"
-  cp "$(readlink -f "$prefix/lib/libmbedx509.so.7")" "$root_dir/userland/fixtures/libmbedx509.so.7"
-  cp "$(readlink -f "$prefix/lib/libmbedtls.so.21")" "$root_dir/userland/fixtures/libmbedtls.so.21"
+  cp "$(readlink -f "$prefix/lib/libmbedcrypto.so.16")" "$fixture_dir/libmbedcrypto.so.16"
+  cp "$(readlink -f "$prefix/lib/libmbedx509.so.7")" "$fixture_dir/libmbedx509.so.7"
+  cp "$(readlink -f "$prefix/lib/libmbedtls.so.21")" "$fixture_dir/libmbedtls.so.21"
   chmod 755 \
-    "$root_dir/userland/fixtures/libmbedcrypto.so.16" \
-    "$root_dir/userland/fixtures/libmbedx509.so.7" \
-    "$root_dir/userland/fixtures/libmbedtls.so.21"
+    "$fixture_dir/libmbedcrypto.so.16" \
+    "$fixture_dir/libmbedx509.so.7" \
+    "$fixture_dir/libmbedtls.so.21"
 }
 
 if [ -f "$stamp" ] &&

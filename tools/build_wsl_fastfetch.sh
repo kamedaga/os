@@ -7,13 +7,13 @@ version="2.61.0"
 archive="$src_dir/fastfetch-$version.tar.gz"
 build_dir="$src_dir/fastfetch-$version"
 cmake_dir="$build_dir/cap-build"
-output="$root_dir/userland/fixtures/fastfetch.elf"
+output="$root_dir/.artifacts/userland-fixtures/fastfetch.elf"
 stamp="$cmake_dir/.capabilityos-built"
 cc_stamp="$cmake_dir/.capabilityos-cc"
 config_stamp="$cmake_dir/.capabilityos-config"
 config_id="musl-pie-minimal-version-v4-kernel-uapi-asm"
 
-mkdir -p "$src_dir" "$root_dir/userland/fixtures"
+mkdir -p "$src_dir" "$(dirname "$output")"
 
 if [ ! -f "$archive" ]; then
   wget -O "$archive" "https://github.com/fastfetch-cli/fastfetch/archive/refs/tags/$version.tar.gz"

@@ -8,10 +8,10 @@ target="x86_64-unknown-linux-musl"
 archive_name="coreutils-$version-$target.tar.gz"
 archive="$src_dir/$archive_name"
 extract_dir="$src_dir/coreutils-$version-$target"
-output="$root_dir/userland/fixtures/uutils-coreutils.elf"
+output="$root_dir/.artifacts/userland-fixtures/uutils-coreutils.elf"
 expected_sha256="7658be348de0741308f59ddc0ceec0c84a879b5fad575226c4628a5ecd39c06d"
 
-mkdir -p "$src_dir" "$root_dir/userland/fixtures"
+mkdir -p "$src_dir" "$(dirname "$output")"
 
 if [ ! -f "$archive" ]; then
   wget -O "$archive" "https://github.com/uutils/coreutils/releases/download/$version/$archive_name"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="$ROOT/userland/fixtures/ca-certificates.crt"
+OUT="$ROOT/.artifacts/userland-fixtures/ca-certificates.crt"
 
 candidates=(
   /etc/ssl/certs/ca-certificates.crt

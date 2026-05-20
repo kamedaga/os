@@ -2,10 +2,10 @@
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "$0")/.." && pwd)"
-output="$root_dir/userland/fixtures/uutils-shim.elf"
-source="$root_dir/userland/fixtures/wsl_musl/uutils_shim.c"
+output="$root_dir/.artifacts/userland-fixtures/uutils-shim.elf"
+source="$root_dir/userland/fixtures/src/wsl_musl/uutils_shim.c"
 
-mkdir -p "$root_dir/userland/fixtures"
+mkdir -p "$(dirname "$output")"
 
 if command -v musl-gcc >/dev/null 2>&1; then
   cc=musl-gcc

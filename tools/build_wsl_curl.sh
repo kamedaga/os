@@ -6,7 +6,7 @@ src_dir="$root_dir/.artifacts/src"
 version="8.19.0"
 archive="$src_dir/curl-$version.tar.gz"
 build_dir="$src_dir/curl-$version"
-output="$root_dir/userland/fixtures/curl.elf"
+output="$root_dir/.artifacts/userland-fixtures/curl.elf"
 zlib_prefix="$root_dir/.artifacts/zlib-musl"
 mbedtls_prefix="$root_dir/.artifacts/mbedtls-musl"
 stamp="$build_dir/.capabilityos-built"
@@ -14,7 +14,7 @@ cc_stamp="$build_dir/.capabilityos-cc"
 config_stamp="$build_dir/.capabilityos-config"
 config_id="musl-pie-http-zlib-mbedtls-ca-bundle-v11"
 
-mkdir -p "$src_dir" "$root_dir/userland/fixtures"
+mkdir -p "$src_dir" "$(dirname "$output")"
 
 if [ ! -f "$archive" ]; then
   wget -O "$archive" "https://curl.se/download/curl-$version.tar.gz"

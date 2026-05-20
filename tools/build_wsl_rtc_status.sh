@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p userland/fixtures
+mkdir -p .artifacts/userland-fixtures
 
 cc=musl-gcc
 if ! command -v "$cc" >/dev/null 2>&1; then
@@ -18,5 +18,5 @@ fi
   -pie \
   -O2 \
   -Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
-  -o userland/fixtures/rtc_status.elf \
-  userland/fixtures/wsl_musl/rtc_status.c
+  -o .artifacts/userland-fixtures/rtc_status.elf \
+  userland/fixtures/src/wsl_musl/rtc_status.c

@@ -7,9 +7,9 @@ pkg_name="apk-tools-static-2.14.9-r3.apk"
 pkg_url="https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/$pkg_name"
 pkg_path="$src_dir/$pkg_name"
 extract_dir="$src_dir/apk-tools-static-2.14.9-r3"
-output="$root_dir/userland/fixtures/apk.elf"
+output="$root_dir/.artifacts/userland-fixtures/apk.elf"
 
-mkdir -p "$src_dir" "$extract_dir" "$root_dir/userland/fixtures"
+mkdir -p "$src_dir" "$extract_dir" "$(dirname "$output")"
 
 if [ ! -f "$pkg_path" ]; then
   if command -v wget >/dev/null 2>&1; then

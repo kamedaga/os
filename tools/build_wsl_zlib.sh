@@ -7,13 +7,13 @@ prefix="$root_dir/.artifacts/zlib-musl"
 version="1.3.2"
 archive="$src_dir/zlib-$version.tar.gz"
 build_dir="$src_dir/zlib-$version"
-output="$root_dir/userland/fixtures/libz.so.1"
+output="$root_dir/.artifacts/userland-fixtures/libz.so.1"
 stamp="$build_dir/.capabilityos-built"
 cc_stamp="$build_dir/.capabilityos-cc"
 config_stamp="$build_dir/.capabilityos-config"
 config_id="musl-shared-zlib-$version-no-symbol-version-sysv-static-archive-v3"
 
-mkdir -p "$src_dir" "$prefix" "$root_dir/userland/fixtures"
+mkdir -p "$src_dir" "$prefix" "$(dirname "$output")"
 
 if [ ! -f "$archive" ]; then
   wget -O "$archive" "https://zlib.net/zlib-$version.tar.gz"

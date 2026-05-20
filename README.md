@@ -31,6 +31,10 @@ musl libc と動的リンクにより、既存の Linux エコシステムとの
 pactl setup full
 pactl run
 ```
+
+`pactl setup` regenerates external runtime artifacts under `.artifacts/`.
+The public repository intentionally keeps only small base fixtures plus the
+included musl and dash runtime images under `userland/fixtures/`.
 ## Status
 
 Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカがマルチコアで動作し、apkから安定とは言えないけどパッケージを追加して動いています。(nano, w3m, cpython, lua, vimなど)
@@ -48,4 +52,6 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 
 ## License
 
-MIT
+CapabilityOS source code is licensed under the MIT License. Included or
+generated third-party runtime components are documented in
+`THIRD_PARTY_NOTICES.md`.

@@ -6,13 +6,13 @@ src_dir="$root_dir/.artifacts/src"
 version="1.5.7"
 archive="$src_dir/zstd-$version.tar.gz"
 build_dir="$src_dir/zstd-$version"
-output="$root_dir/userland/fixtures/zstd.elf"
+output="$root_dir/.artifacts/userland-fixtures/zstd.elf"
 stamp="$build_dir/.capabilityos-built"
 cc_stamp="$build_dir/.capabilityos-cc"
 config_stamp="$build_dir/.capabilityos-config"
 config_id="musl-pie-cli-no-extra-libs-v1"
 
-mkdir -p "$src_dir" "$root_dir/userland/fixtures"
+mkdir -p "$src_dir" "$(dirname "$output")"
 
 if [ ! -f "$archive" ]; then
   wget -O "$archive" "https://github.com/facebook/zstd/releases/download/v$version/zstd-$version.tar.gz"

@@ -7,7 +7,7 @@ pkg_name="alpine-keys-2.5-r0.apk"
 pkg_url="https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/$pkg_name"
 pkg_path="$src_dir/$pkg_name"
 extract_dir="$src_dir/alpine-keys-2.5-r0"
-output_dir="$root_dir/userland/fixtures/alpine-keys"
+output_dir="$root_dir/.artifacts/userland-fixtures/alpine-keys"
 
 mkdir -p "$src_dir" "$extract_dir" "$output_dir"
 

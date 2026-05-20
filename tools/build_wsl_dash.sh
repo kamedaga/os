@@ -5,11 +5,11 @@ root_dir="$(cd "$(dirname "$0")/.." && pwd)"
 src_dir="$root_dir/.artifacts/src"
 build_dir="$src_dir/dash-0.5.12"
 tarball="$src_dir/dash-0.5.12.tar.gz"
-output="$root_dir/userland/fixtures/dash.elf"
+output="$root_dir/userland/fixtures/shell/dash.elf"
 stamp="$build_dir/.capabilityos-built"
 cc_stamp="$build_dir/.capabilityos-cc"
 
-mkdir -p "$src_dir" "$root_dir/userland/fixtures"
+mkdir -p "$src_dir" "$(dirname "$output")"
 
 if [ ! -f "$tarball" ]; then
   wget -O "$tarball" http://gondor.apana.org.au/~herbert/dash/files/dash-0.5.12.tar.gz

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p userland/fixtures
+mkdir -p .artifacts/userland-fixtures
 
 if command -v musl-clang >/dev/null 2>&1; then
   cc=musl-clang
@@ -28,9 +28,6 @@ if [ -z "$libc_so" ]; then
   exit 1
 fi
 
-cp "$libc_so" userland/fixtures/libc.so
-cp "$libc_so" userland/fixtures/ld-musl-x86_64.so.1
-
 "$cc" \
   -fPIE \
   -pie \
@@ -39,5 +36,5 @@ cp "$libc_so" userland/fixtures/ld-musl-x86_64.so.1
   -Wl,-z,now \
   -Wl,-z,relro \
   -pthread \
-  -o userland/fixtures/musl_smoke.elf \
-  userland/fixtures/wsl_musl/musl_smoke.c
+  -o .artifacts/userland-fixtures/musl_smoke.elf \
+  userland/fixtures/src/wsl_musl/musl_smoke.c

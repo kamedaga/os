@@ -17,7 +17,7 @@ kernel/.zig-cache/
 target/
 **/target/
 .cargo/
-
+.obsidian
 # Runtime and emulator outputs
 *.img
 *.fd
@@ -48,12 +48,21 @@ __pycache__/
 
 # Local notes and private workspace files
 .claude/
+.vscode/
 legacy/
 README-neta.md
 hikitugi.md
 
 # Vendored/generated fixture files
 userland/fixtures/ca-certificates.crt
+userland/fixtures/*.elf
+userland/fixtures/*.so
+userland/fixtures/*.so.*
+userland/fixtures/apk-arch
+userland/fixtures/apk-repositories
+userland/fixtures/apk-world
+userland/fixtures/alpine-keys/
+.artifacts/userland-fixtures/
 
 # OS/editor noise
 .DS_Store

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p userland/fixtures
+mkdir -p .artifacts/userland-fixtures
 
 if command -v musl-clang >/dev/null 2>&1; then
   cc=musl-clang
@@ -19,5 +19,5 @@ fi
   -Wl,-rpath,/lib \
   -Wl,-z,now \
   -Wl,-z,relro \
-  -o userland/fixtures/tcp_http_get.elf \
-  userland/fixtures/wsl_musl/tcp_http_get.c
+  -o .artifacts/userland-fixtures/tcp_http_get.elf \
+  userland/fixtures/src/wsl_musl/tcp_http_get.c
