@@ -56,6 +56,7 @@ enum {
     CONSOLE_OP_GET_SIGNAL = 6,
     CONSOLE_OP_POLL = 7,
     CONSOLE_REQUEST_FLAG_NONBLOCK = 1 << 0,
+    CONSOLE_REQUEST_FLAG_TIMEOUT = 1 << 1,
     CONSOLE_STATUS_OK = 0,
     CONSOLE_STATUS_AGAIN = 1,
     CONSOLE_STATUS_INVALID = 2,
@@ -65,7 +66,13 @@ enum {
     CONSOLE_RESPONSE_HEADER_BYTES = 64,
     CONSOLE_REQUEST_PAYLOAD_BYTES = PAGE_BYTES - CONSOLE_REQUEST_HEADER_BYTES,
     CONSOLE_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - CONSOLE_RESPONSE_HEADER_BYTES,
-    TTY_INPUT_RING_BYTES = 4096,
+    TTY_INPUT_RING_BYTES = 32768,
+    TTY_PUMP_IDLE_BUDGET = 32,
+    TTY_PUMP_READ_BUDGET = 64,
+    TTY_FLUSH_IDLE_BUDGET = 1,
+    TTY_FLUSH_ACTIVE_BUDGET = 32,
+    TTY_RAW_READ_CHUNK_BYTES = 64,
+    TTY_BACKEND_TX_HIGH_WATER_BYTES = 786432,
 };
 
 struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
@@ -203,10 +210,19 @@ void tty_service_main(void) {
     user_log("TtyService: endpoint ready\n");
 
     for (;;) {
-        tty_core_pump_input(4);
-        const u64 received = syscall2(SYSCALL_WAIT_EVENT, 1, 1);
-        if (received >= 0x1000) handle_client_connect_transfer(received);
+        tty_core_pump_input(TTY_PUMP_IDLE_BUDGET);
+        try_complete_pending_read();
+        backend_flush_output_budget(TTY_FLUSH_IDLE_BUDGET);
         handle_client_request();
-        tty_core_pump_input(4);
+        if (backend_output_pending() || g_client.active) {
+            (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+        } else {
+            const u64 received = syscall2(SYSCALL_WAIT_EVENT, 1, 1);
+            if (received >= 0x1000) handle_client_connect_transfer(received);
+        }
+        tty_core_pump_input(TTY_PUMP_READ_BUDGET);
+        try_complete_pending_read();
+        backend_flush_output_budget(TTY_FLUSH_ACTIVE_BUDGET);
+        handle_client_request();
     }
 }

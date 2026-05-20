@@ -177,6 +177,9 @@ pub const ThreadContext = struct {
     ipc_reply_token_valid: bool = false,
     ipc_reply_token_target_thread: usize = 0,
     abi_trap_reply_pending: bool = false,
+    abi_trap_context_reply_pending: bool = false,
+    abi_trap_context_frame: TrapFrame = std.mem.zeroes(TrapFrame),
+    abi_trap_context_fs_base: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
 };
@@ -1590,6 +1593,9 @@ pub fn initThreadContextWithSpaces(
     ctx.wait_preserve_ipc_queue = false;
     ctx.signal_pending = false;
     ctx.wake_tick = 0;
+    ctx.abi_trap_context_reply_pending = false;
+    ctx.abi_trap_context_frame = std.mem.zeroes(TrapFrame);
+    ctx.abi_trap_context_fs_base = 0;
     ctx.frame = initial_frame;
     ctx.fx_state = initial_fx_state;
     syncHotThreadFromContext(thread_index);
@@ -2237,6 +2243,20 @@ fn blockCurrentThreadForEventInternal(frame: *TrapFrame, wait_mailbox: bool, pre
     ctx.ready = false;
     setIpcHotCr3(current_thread, ctx.cr3);
     setIpcHotWaitStateEx(current_thread, wait_mailbox, preserve_ipc_queue, ctx.wake_tick, false);
+    if (ctx.abi_trap_reply_pending and ctx.abi_trap_context_reply_pending) {
+        ctx.frame = ctx.abi_trap_context_frame;
+        ctx.fs_base = ctx.abi_trap_context_fs_base;
+        ctx.abi_trap_context_reply_pending = false;
+        ctx.abi_trap_reply_pending = false;
+        ctx.signal_pending = false;
+        setIpcHotSignalPending(current_thread, false);
+        ctx.wait_mailbox = false;
+        ctx.wait_preserve_ipc_queue = false;
+        ctx.wake_tick = 0;
+        ctx.ready = true;
+        setIpcHotWaitState(current_thread, false, 0, true);
+        return false;
+    }
     if (ctx.abi_trap_reply_pending and ctx.signal_pending) {
         ctx.wait_mailbox = false;
         ctx.wait_preserve_ipc_queue = false;

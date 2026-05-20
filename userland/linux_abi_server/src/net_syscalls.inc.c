@@ -12,6 +12,10 @@ struct linux_pollfd {
     short revents;
 };
 
+enum {
+    LINUX_ABI_WAIT_FOREVER = ~0ULL,
+};
+
 struct linux_msghdr64 {
     u64 msg_name;
     u32 msg_namelen;
@@ -1295,6 +1299,8 @@ static struct ipc_message handle_shutdown_socket(const struct trap_request *req)
     return reply(0, 0);
 }
 
+static u64 g_poll_tty_diag_count;
+
 static u16 fd_poll_revents(u64 fd, u16 requested) {
     const u16 read_mask = (u16)(POLLIN | POLLRDNORM);
     const u16 write_mask = (u16)(POLLOUT | POLLWRNORM);
@@ -1381,28 +1387,84 @@ static u16 fd_poll_revents(u64 fd, u16 requested) {
         u16 revents = 0;
         if (readable != 0) revents |= (u16)(requested & read_mask);
         if (writable != 0) revents |= (u16)(requested & write_mask);
+        if ((requested & read_mask) != 0 && g_poll_tty_diag_count < 128) {
+            g_poll_tty_diag_count++;
+            user_log("LinuxAbiServer.poll tty fd=");
+            user_log_hex_value(fd);
+            user_log("LinuxAbiServer.poll tty requested=");
+            user_log_hex_value(requested);
+            user_log("LinuxAbiServer.poll tty readable=");
+            user_log_hex_value(readable);
+            user_log("LinuxAbiServer.poll tty revents=");
+            user_log_hex_value(revents);
+        }
         return revents;
     }
     return POLLNVAL;
 }
 
-static u64 poll_wait_limit(const struct trap_request *req, int ppoll, int *immediate, int *fault) {
+static u64 poll_timeout_ms_to_ticks(u64 ms) {
+    if (ms == 0) return 0;
+    return ms >= LINUX_ABI_WAIT_FOREVER - 1 ? LINUX_ABI_WAIT_FOREVER - 1 : ms;
+}
+
+static u64 poll_timeout_nsec_to_ticks_ceil(u64 nsec) {
+    return (nsec + 999999ULL) / 1000000ULL;
+}
+
+static u64 poll_timeout_sec_nsec_to_ticks(u64 sec, u64 nsec) {
+    if (sec >= (LINUX_ABI_WAIT_FOREVER - 1000ULL) / 1000ULL) return LINUX_ABI_WAIT_FOREVER - 1;
+    const u64 sec_ticks = sec * 1000ULL;
+    const u64 nsec_ticks = poll_timeout_nsec_to_ticks_ceil(nsec);
+    if (sec_ticks >= LINUX_ABI_WAIT_FOREVER - 1 - nsec_ticks) return LINUX_ABI_WAIT_FOREVER - 1;
+    return sec_ticks + nsec_ticks;
+}
+
+static int poll_wait_expired(u64 wait_ticks, u64 start_tick) {
+    return wait_ticks != LINUX_ABI_WAIT_FOREVER && syscall0(SYSCALL_GET_TICK_COUNT) - start_tick >= wait_ticks;
+}
+
+static void poll_wait_one_tick(void) {
+    (void)syscall2(SYSCALL_WAIT_EVENT, 0, 1);
+}
+
+static u64 g_poll_invalid_diag_count;
+
+static void poll_invalid_diag(const char *name, u64 a, u64 b, u64 c, u64 d) {
+    if (g_poll_invalid_diag_count++ >= 32) return;
+    user_log("LinuxAbiServer.poll invalid ");
+    user_log(name);
+    user_log(" a=");
+    user_log_hex_value(a);
+    user_log(" b=");
+    user_log_hex_value(b);
+    user_log(" c=");
+    user_log_hex_value(c);
+    user_log(" d=");
+    user_log_hex_value(d);
+}
+
+static u64 poll_wait_limit(const struct trap_request *req, int ppoll, int *immediate, int *fault, int *invalid) {
     *immediate = 0;
     *fault = 0;
+    *invalid = 0;
     if (ppoll) {
         const u64 timespec_va = req->args[2];
-        if (timespec_va == 0) return 8192;
+        if (timespec_va == 0) return LINUX_ABI_WAIT_FOREVER;
         i64 pair[2];
         if (copy_from_target(timespec_va, pair, sizeof(pair)) != sizeof(pair)) { *fault = 1; return 0; }
+        if (pair[0] < 0 || pair[1] < 0 || pair[1] >= 1000000000LL) {
+            poll_invalid_diag("ppoll-timeout", (u64)timespec_va, (u64)pair[0], (u64)pair[1], req->args[3]);
+            *invalid = 1;
+            return 0;
+        }
         if (pair[0] == 0 && pair[1] == 0) { *immediate = 1; return 0; }
-        return 8192;
+        return poll_timeout_sec_nsec_to_ticks((u64)pair[0], (u64)pair[1]);
     }
     const i32 timeout_ms = (i32)(u32)req->args[2];
     if (timeout_ms == 0) { *immediate = 1; return 0; }
-    if (timeout_ms < 0) return 8192;
-    u64 attempts = (u64)(u32)timeout_ms * 4 + 1;
-    if (attempts > 8192) attempts = 8192;
-    return attempts;
+    if (timeout_ms < 0) return LINUX_ABI_WAIT_FOREVER;
+    return poll_timeout_ms_to_ticks((u64)(u32)timeout_ms);
 }
 
 static i64 scan_pollfds(u64 fds_va, u64 nfds) {
@@ -1429,25 +1491,51 @@ static struct ipc_message handle_poll(const struct trap_request *req, int ppoll)
     g_prof.poll_calls++;
     int immediate = 0;
     int fault = 0;
-    const u64 wait_limit = poll_wait_limit(req, ppoll, &immediate, &fault);
+    int invalid = 0;
+    const u64 wait_limit = poll_wait_limit(req, ppoll, &immediate, &fault, &invalid);
     if (fault) return reply(errno_fault(), 0);
+    if (invalid) return reply(errno_inval(), 0);
+    const u64 start_tick = (!immediate && wait_limit != LINUX_ABI_WAIT_FOREVER) ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
     for (u64 attempt = 0;; attempt++) {
         const i64 ready = scan_pollfds(fds_va, nfds);
         if (ready < 0) return reply((u64)ready, 0);
-        if (ready != 0 || immediate || attempt >= wait_limit) {
+        if (ready != 0 || immediate || poll_wait_expired(wait_limit, start_tick)) {
             g_prof.poll_wait_loops += attempt;
             return reply((u64)ready, 0);
         }
-        wait_without_consuming_ipc();
+        if (process_itimer_real_expired(g_proc)) {
+            g_prof.poll_wait_loops += attempt;
+            return reply(errno_intr(), 0);
+        }
+        poll_wait_one_tick();
     }
 }
 
-static int select_timeout_is_zero(u64 timeout_va, int *fault) {
+static u64 select_wait_limit(u64 timeout_va, int pselect, int *immediate, int *fault, int *invalid) {
+    *immediate = 0;
     *fault = 0;
-    if (timeout_va == 0) return 0;
+    *invalid = 0;
+    if (timeout_va == 0) return LINUX_ABI_WAIT_FOREVER;
     i64 pair[2];
-    if (copy_from_target(timeout_va, pair, sizeof(pair)) != sizeof(pair)) { *fault = 1; return 1; }
-    return pair[0] == 0 && pair[1] == 0;
+    if (copy_from_target(timeout_va, pair, sizeof(pair)) != sizeof(pair)) { *fault = 1; return 0; }
+    if (pair[0] < 0 || pair[1] < 0) {
+        poll_invalid_diag(pselect ? "pselect-negative" : "select-negative", timeout_va, (u64)pair[0], (u64)pair[1], 0);
+        *invalid = 1;
+        return 0;
+    }
+    if (pselect && pair[1] >= 1000000000LL) {
+        poll_invalid_diag("pselect-nsec", timeout_va, (u64)pair[0], (u64)pair[1], 0);
+        *invalid = 1;
+        return 0;
+    }
+    if (!pselect && pair[1] >= 1000000LL) {
+        poll_invalid_diag("select-usec", timeout_va, (u64)pair[0], (u64)pair[1], 0);
+        *invalid = 1;
+        return 0;
+    }
+    if (pair[0] == 0 && pair[1] == 0) { *immediate = 1; return 0; }
+    const u64 subsec_nsec = pselect ? (u64)pair[1] : (u64)pair[1] * 1000ULL;
+    return poll_timeout_sec_nsec_to_ticks((u64)pair[0], subsec_nsec);
 }
 
 static i64 scan_select_sets(u64 nfds, u64 readfds_va, u64 writefds_va, u64 exceptfds_va, u64 *read_out, u64 *write_out, u64 *except_out) {
@@ -1484,25 +1572,31 @@ static struct ipc_message handle_select(const struct trap_request *req, int psel
     const u64 writefds_va = req->args[2];
     const u64 exceptfds_va = req->args[3];
     const u64 timeout_va = req->args[4];
-    (void)pselect;
     g_prof.select_calls++;
     int fault = 0;
-    const int immediate = select_timeout_is_zero(timeout_va, &fault);
+    int immediate = 0;
+    int invalid = 0;
+    const u64 wait_limit = select_wait_limit(timeout_va, pselect, &immediate, &fault, &invalid);
     if (fault) return reply(errno_fault(), 0);
-    const u64 wait_limit = timeout_va == 0 ? 8192 : (immediate ? 0 : 8192);
+    if (invalid) return reply(errno_inval(), 0);
+    const u64 start_tick = (!immediate && wait_limit != LINUX_ABI_WAIT_FOREVER) ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
     for (u64 attempt = 0;; attempt++) {
         u64 read_out = 0;
         u64 write_out = 0;
         u64 except_out = 0;
         const i64 ready = scan_select_sets(nfds, readfds_va, writefds_va, exceptfds_va, &read_out, &write_out, &except_out);
         if (ready < 0) return reply((u64)ready, 0);
-        if (ready != 0 || immediate || attempt >= wait_limit) {
+        if (ready != 0 || immediate || poll_wait_expired(wait_limit, start_tick)) {
             g_prof.select_wait_loops += attempt;
             if (readfds_va != 0 && copy_to_target(readfds_va, &read_out, sizeof(read_out)) != sizeof(read_out)) return reply(errno_fault(), 0);
             if (writefds_va != 0 && copy_to_target(writefds_va, &write_out, sizeof(write_out)) != sizeof(write_out)) return reply(errno_fault(), 0);
             if (exceptfds_va != 0 && copy_to_target(exceptfds_va, &except_out, sizeof(except_out)) != sizeof(except_out)) return reply(errno_fault(), 0);
             return reply((u64)ready, 0);
         }
-        wait_without_consuming_ipc();
+        if (process_itimer_real_expired(g_proc)) {
+            g_prof.select_wait_loops += attempt;
+            return reply(errno_intr(), 0);
+        }
+        poll_wait_one_tick();
     }
 }

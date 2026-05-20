@@ -197,6 +197,7 @@ fn writeRequest(
     thread_id: u64,
     flavor: u32,
     frame: *const TrapFrame,
+    fs_base: u64,
 ) bool {
     const version_kind = @as(u64, trap_abi.version) |
         (@as(u64, @intFromEnum(trap_abi.TrapKind.abi_syscall)) << 32);
@@ -218,7 +219,58 @@ fn writeRequest(
     if (!writeRequestU64(h, target, request_page_va, 0x68, frame.r10)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x70, frame.r8)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x78, frame.r9)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0x80, frame.r15)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0x88, frame.r14)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0x90, frame.r13)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0x98, frame.r12)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xA0, frame.r11)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xA8, frame.r10)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xB0, frame.r9)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xB8, frame.r8)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xC0, frame.rbp)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xC8, frame.rdi)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xD0, frame.rsi)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xD8, frame.rdx)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xE0, frame.rcx)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xE8, frame.rbx)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xF0, frame.rax)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0xF8, frame.rflags)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0x100, fs_base)) return false;
     return true;
+}
+
+fn sanitizeUserRflags(rflags: u64) u64 {
+    const clear_mask = (@as(u64, 3) << 12) | (@as(u64, 1) << 14) | (@as(u64, 1) << 16) | (@as(u64, 1) << 17);
+    return (rflags | boot_static.user_entry_rflags | @as(u64, 2)) & ~clear_mask;
+}
+
+fn trapFrameFromUserContext(ctx: trap_abi.UserContext) ?TrapFrame {
+    if (ctx.rip == 0 or ctx.rsp == 0) return null;
+    if (!capability.isUserCanonicalVa(ctx.rip) or !capability.isUserCanonicalVa(ctx.rsp)) return null;
+    if (ctx.fs_base != 0 and !capability.isUserCanonicalVa(ctx.fs_base)) return null;
+    const frame: TrapFrame = .{
+        .r15 = ctx.r15,
+        .r14 = ctx.r14,
+        .r13 = ctx.r13,
+        .r12 = ctx.r12,
+        .r11 = ctx.r11,
+        .r10 = ctx.r10,
+        .r9 = ctx.r9,
+        .r8 = ctx.r8,
+        .rbp = ctx.rbp,
+        .rdi = ctx.rdi,
+        .rsi = ctx.rsi,
+        .rdx = ctx.rdx,
+        .rcx = ctx.rcx,
+        .rbx = ctx.rbx,
+        .rax = ctx.rax,
+        .rip = ctx.rip,
+        .cs = @as(u64, boot_static.gdt_user_code_selector) | 0x3,
+        .rflags = sanitizeUserRflags(ctx.rflags),
+        .rsp = ctx.rsp,
+        .ss = @as(u64, boot_static.gdt_user_data_selector) | 0x3,
+    };
+    return frame;
 }
 
 fn findCapLinear(table: *const kernel.CNode, paddr: u64) ?kernel.Capability {
@@ -374,6 +426,43 @@ pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, targe
         return boot_static.syscall_ok;
     }
     return ipc.deliverOrQueueMessageToThread(target.thread, 0, scheduler.currentThreadIndex(), false, result, flags, 0, 0);
+}
+
+pub fn replyToTargetContext(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, context_va: u64, context_len: u64, flags: u64) u64 {
+    _ = flags;
+    if (context_len < @sizeOf(trap_abi.UserContext)) return boot_static.syscall_err_invalid;
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    const target = resolveTarget(h, proc, target_raw, .deferred_reply) orelse return boot_static.syscall_err_endpoint;
+    var user_context: trap_abi.UserContext = .{};
+    const bytes = @as([*]u8, @ptrCast(&user_context))[0..@sizeOf(trap_abi.UserContext)];
+    if (!h.copy_user_bytes_from_va(proc, context_va, bytes)) return boot_static.syscall_err_invalid;
+    const frame = trapFrameFromUserContext(user_context) orelse return boot_static.syscall_err_invalid;
+    if (target.ctx.abi_trap_reply_pending and target.ctx.ready) {
+        target.ctx.abi_trap_context_frame = frame;
+        target.ctx.abi_trap_context_fs_base = user_context.fs_base;
+        target.ctx.abi_trap_context_reply_pending = true;
+        target.ctx.signal_pending = true;
+        scheduler.setIpcHotSignalPending(target.thread, true);
+        scheduler.wakeAssignedApForRunnableThread(target.thread);
+        scheduler.preferIpcSwitchToThread(target.thread);
+        return boot_static.syscall_ok;
+    }
+    scheduler.prepareBlockedThreadForWake(target.thread);
+    target.ctx.frame = frame;
+    target.ctx.fs_base = user_context.fs_base;
+    target.ctx.abi_trap_reply_pending = false;
+    target.ctx.abi_trap_context_reply_pending = false;
+    target.ctx.signal_pending = false;
+    target.ctx.wait_mailbox = false;
+    target.ctx.wait_preserve_ipc_queue = false;
+    target.ctx.wake_tick = 0;
+    if (!scheduler.setThreadReady(target.thread, true)) return boot_static.syscall_err_not_ready;
+    scheduler.setIpcHotSignalPending(target.thread, false);
+    scheduler.setIpcHotWaitState(target.thread, false, 0, true);
+    scheduler.wakeAssignedApForRunnableThread(target.thread);
+    scheduler.preferIpcSwitchToThread(target.thread);
+    return boot_static.syscall_ok;
 }
 
 pub fn startTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64) u64 {
@@ -1017,7 +1106,7 @@ fn deliverDelegateRequestLocked(
     if (stale_replies != 0) current_ctx.abi_trap_reply_pending = false;
     const stale_requests = scheduler.discardIpcMessagesForThreadFromSenderOnEndpoint(target_thread, current_thread, delegate.endpoint_id, true);
     if (stale_requests != 0) current_ctx.abi_trap_reply_pending = false;
-    if (!writeRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame)) {
+    if (!writeRequest(h, target_principal, delegate.request_page_va, proc, @intCast(current_thread), delegate.flavor, frame, current_ctx.fs_base)) {
         h.write("abi_trap request write failed target=");
         h.write(h.principal_label(target_principal));
         h.write("\n");

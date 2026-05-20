@@ -47,6 +47,7 @@ pub const syscall_detach_abi_trap_reply_token: u64 = 0x59;
 pub const syscall_share_abi_trap_reply_target_pages_to_target: u64 = 0x5A;
 pub const syscall_unmap_abi_trap_target_pages: u64 = 0x5B;
 pub const syscall_reserve_abi_trap_reply_target_pages: u64 = 0x63;
+pub const syscall_reply_abi_trap_target_context: u64 = 0x64;
 pub const abi_trap_copy_max_bytes: usize = 4096;
 
 pub const TrapRequest = extern struct {
@@ -63,6 +64,48 @@ pub const TrapRequest = extern struct {
     error_code: u64,
     nr: u64,
     args: [max_args]u64,
+    r15: u64 = 0,
+    r14: u64 = 0,
+    r13: u64 = 0,
+    r12: u64 = 0,
+    r11: u64 = 0,
+    r10: u64 = 0,
+    r9: u64 = 0,
+    r8: u64 = 0,
+    rbp: u64 = 0,
+    rdi: u64 = 0,
+    rsi: u64 = 0,
+    rdx: u64 = 0,
+    rcx: u64 = 0,
+    rbx: u64 = 0,
+    rax: u64 = 0,
+    rflags: u64 = 0,
+    fs_base: u64 = 0,
+};
+
+pub const UserContext = extern struct {
+    flags: u64 = 0,
+    rip: u64 = 0,
+    rsp: u64 = 0,
+    rflags: u64 = 0,
+    rax: u64 = 0,
+    rbx: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+    rsi: u64 = 0,
+    rdi: u64 = 0,
+    rbp: u64 = 0,
+    r8: u64 = 0,
+    r9: u64 = 0,
+    r10: u64 = 0,
+    r11: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
+    fs_base: u64 = 0,
+    reserved0: u64 = 0,
+    reserved1: u64 = 0,
 };
 
 pub const TrapResponse = extern struct {

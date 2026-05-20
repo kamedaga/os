@@ -8,6 +8,7 @@ static u64 console_response_addr(void) { return g_console.response_map.addr; }
 static void *console_response_payload(void) { return (void *)(console_response_addr() + CONSOLE_RESPONSE_HEADER_BYTES); }
 
 static u64 g_console_read_diag_count = 0;
+static char g_console_write_buf[CONSOLE_REQUEST_PAYLOAD_BYTES];
 
 enum {
     TTY_ATTR_VERSION = 2,
@@ -44,6 +45,10 @@ static void log_console_read_diag(const char *reason, u64 detail) {
     user_log(reason);
     user_log(" detail=");
     user_log_hex_value(detail);
+}
+
+static void wait_tty_read_retry(void) {
+    (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, 1);
 }
 
 static int install_console_endpoint(void) {
@@ -134,7 +139,7 @@ static int connect_console_from_registry(void) {
     return 1;
 }
 
-static int console_begin_request(u16 op, u32 length, const char *inline_src, u32 inline_bytes, u64 *seq_out) {
+static int console_begin_request(u16 op, u32 length, u32 flags, u64 arg0, const char *inline_src, u32 inline_bytes, u64 *seq_out) {
     if (!g_console.active) return 0;
     if (inline_bytes > CONSOLE_REQUEST_PAYLOAD_BYTES) return 0;
     const u64 request_addr = console_request_addr();
@@ -149,8 +154,8 @@ static int console_begin_request(u16 op, u32 length, const char *inline_src, u32
     request->op = op;
     request->session_nonce = g_console.session_nonce;
     request->length = length;
-    request->flags = 0;
-    request->arg0 = 0;
+    request->flags = flags;
+    request->arg0 = arg0;
     request->arg1 = 0;
     request->arg2 = 0;
     request->reserved0 = 0;
@@ -168,7 +173,7 @@ static int console_begin_request(u16 op, u32 length, const char *inline_src, u32
 static int console_get_tty_attr(struct tty_attr_payload *out) {
     if (!g_console.active) return 0;
     u64 seq = 0;
-    if (!console_begin_request(CONSOLE_OP_GET_ATTR, sizeof(*out), 0, 0, &seq)) return 0;
+    if (!console_begin_request(CONSOLE_OP_GET_ATTR, sizeof(*out), 0, 0, 0, 0, &seq)) return 0;
     if (!wait_console_response(seq, CONSOLE_OP_GET_ATTR, 8192)) return 0;
     volatile struct console_response_header *response = (volatile struct console_response_header *)console_response_addr();
     if (response->status != CONSOLE_STATUS_OK) return 0;
@@ -182,7 +187,7 @@ static int console_get_tty_attr(struct tty_attr_payload *out) {
 static int console_set_tty_attr(const struct tty_attr_payload *attr) {
     if (!g_console.active) return 0;
     u64 seq = 0;
-    if (!console_begin_request(CONSOLE_OP_SET_ATTR, sizeof(*attr), (const char *)attr, sizeof(*attr), &seq)) return 0;
+    if (!console_begin_request(CONSOLE_OP_SET_ATTR, sizeof(*attr), 0, 0, (const char *)attr, sizeof(*attr), &seq)) return 0;
     if (!wait_console_response(seq, CONSOLE_OP_SET_ATTR, 8192)) return 0;
     volatile struct console_response_header *response = (volatile struct console_response_header *)console_response_addr();
     return response->status == CONSOLE_STATUS_OK;
@@ -192,7 +197,7 @@ static int console_take_tty_signal(u64 *signo_out) {
     *signo_out = 0;
     if (!g_console.active || !g_console.is_tty) return 0;
     u64 seq = 0;
-    if (!console_begin_request(CONSOLE_OP_GET_SIGNAL, 0, 0, 0, &seq)) return 0;
+    if (!console_begin_request(CONSOLE_OP_GET_SIGNAL, 0, 0, 0, 0, 0, &seq)) return 0;
     if (!wait_console_response(seq, CONSOLE_OP_GET_SIGNAL, 8192)) return 0;
     volatile struct console_response_header *response = (volatile struct console_response_header *)console_response_addr();
     if (response->status == CONSOLE_STATUS_AGAIN) return 1;
@@ -206,8 +211,8 @@ static int console_poll_tty(u64 *readable_out, u64 *writable_out) {
     *writable_out = 1;
     if (!g_console.active || !g_console.is_tty) return 0;
     u64 seq = 0;
-    if (!console_begin_request(CONSOLE_OP_POLL, 0, 0, 0, &seq)) return 0;
-    if (!wait_console_response(seq, CONSOLE_OP_POLL, 8192)) return 0;
+    if (!console_begin_request(CONSOLE_OP_POLL, 0, 0, 0, 0, 0, &seq)) return 0;
+    if (!wait_console_response(seq, CONSOLE_OP_POLL, 0)) return 0;
     volatile struct console_response_header *response = (volatile struct console_response_header *)console_response_addr();
     if (response->status != CONSOLE_STATUS_OK) return 0;
     *readable_out = response->arg0;
@@ -237,7 +242,7 @@ static u64 console_write_bytes(const char *bytes, u64 len) {
     while (done < len) {
         u64 chunk = min_u64(len - done, CONSOLE_REQUEST_PAYLOAD_BYTES);
         u64 seq = 0;
-        if (!console_begin_request(CONSOLE_OP_WRITE, (u32)chunk, bytes + done, (u32)chunk, &seq)) {
+        if (!console_begin_request(CONSOLE_OP_WRITE, (u32)chunk, 0, 0, bytes + done, (u32)chunk, &seq)) {
             user_log("LinuxAbiServer: console write begin failed\n");
             return done != 0 ? done : errno_io();
         }
@@ -246,12 +251,19 @@ static u64 console_write_bytes(const char *bytes, u64 len) {
             return done != 0 ? done : errno_io();
         }
         volatile struct console_response_header *response = (volatile struct console_response_header *)console_response_addr();
+        if (response->status == CONSOLE_STATUS_AGAIN) {
+            const u64 accepted = response->arg0 <= chunk ? response->arg0 : 0;
+            done += accepted;
+            wait_tty_read_retry();
+            continue;
+        }
         if (response->status != CONSOLE_STATUS_OK) {
             user_log("LinuxAbiServer: console write status=");
             user_log_hex_value(response->status);
             return done != 0 ? done : errno_io();
         }
-        done += chunk;
+        const u64 accepted = response->arg0 <= chunk ? response->arg0 : chunk;
+        done += accepted == 0 ? chunk : accepted;
     }
     return done;
 }
@@ -260,20 +272,19 @@ static u64 console_write_from_target(u64 src, u64 len, int *fault) {
     *fault = 0;
     u64 done = 0;
     while (done < len) {
-        char buf[128];
-        const u64 chunk = min_u64(len - done, sizeof(buf));
-        if (copy_from_target(src + done, buf, chunk) != chunk) {
+        const u64 chunk = min_u64(len - done, sizeof(g_console_write_buf));
+        if (copy_from_target(src + done, g_console_write_buf, chunk) != chunk) {
             *fault = 1;
             return done;
         }
-        const u64 n = console_write_bytes(buf, chunk);
+        const u64 n = console_write_bytes(g_console_write_buf, chunk);
         if (n != chunk) return done != 0 ? done : n;
         done += chunk;
     }
     return done;
 }
 
-static u64 console_read_to_target(u64 dst, u64 len, int *fault) {
+static u64 console_read_to_target(u64 dst, u64 len, int *fault, u32 fd_flags) {
     *fault = 0;
     if (!g_console.active) {
         log_console_read_diag("inactive", len);
@@ -281,9 +292,17 @@ static u64 console_read_to_target(u64 dst, u64 len, int *fault) {
     }
     if (len == 0) return 0;
     const u32 request_len = (u32)min_u64(len, CONSOLE_RESPONSE_PAYLOAD_BYTES);
+    int use_nonblock_request = (fd_flags & O_NONBLOCK) != 0;
     for (;;) {
         u64 seq = 0;
-        if (!console_begin_request(CONSOLE_OP_READ, request_len, 0, 0, &seq)) {
+        u32 request_flags = use_nonblock_request ? CONSOLE_REQUEST_FLAG_NONBLOCK : 0;
+        u64 request_timeout_ticks = 0;
+        if (!use_nonblock_request && process_next_signal_timer_timeout(g_proc, &request_timeout_ticks)) {
+            if (process_signal_interrupt_pending(g_proc)) return errno_intr();
+            if (request_timeout_ticks == 0) request_timeout_ticks = 1;
+            request_flags |= CONSOLE_REQUEST_FLAG_TIMEOUT;
+        }
+        if (!console_begin_request(CONSOLE_OP_READ, request_len, request_flags, request_timeout_ticks, 0, 0, &seq)) {
             log_console_read_diag("begin-failed", request_len);
             return errno_io();
         }
@@ -293,7 +312,9 @@ static u64 console_read_to_target(u64 dst, u64 len, int *fault) {
         }
         volatile struct console_response_header *response = (volatile struct console_response_header *)console_response_addr();
         if (response->status == CONSOLE_STATUS_AGAIN) {
-            wait_without_consuming_ipc();
+            if ((fd_flags & O_NONBLOCK) != 0) return errno_again();
+            if (process_signal_interrupt_pending(g_proc)) return errno_intr();
+            wait_tty_read_retry();
             continue;
         }
         if (response->status == CONSOLE_STATUS_INTERRUPTED) {

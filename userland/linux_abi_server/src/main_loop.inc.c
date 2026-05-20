@@ -28,6 +28,7 @@ void linux_abi_main(void) {
     for (;;) {
         g_abi_ctx = 0;
         start_deferred_trap_targets();
+        try_satisfy_pending_sigwaits();
         flush_deferred_pipe_wakes();
         if (msg.status != SYSCALL_OK) {
             msg = msg.status == SYSCALL_ERR_NOT_READY ? wait_ipc_timeout(1) : wait_ipc();
@@ -56,6 +57,7 @@ void linux_abi_main(void) {
             g_root_linux_principal_set = 1;
         }
         if (!g_proc) { msg = reply(errno_busy(), 0); continue; }
+        process_timers_update(g_proc);
         const int profile_this_syscall = g_proc->profile_enabled != 0;
         const int profile_trace_this_syscall = profile_trace_enabled();
         if (profile_this_syscall) profile_count_syscall(req->nr);
@@ -99,6 +101,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_FLOCK: msg = handle_flock(req); break;
         case LINUX_SYS_FSYNC: case LINUX_SYS_FDATASYNC: case LINUX_SYS_SYNCFS: msg = handle_fsync_like(req); break;
         case LINUX_SYS_SYNC: msg = reply(0, 0); break;
+        case LINUX_SYS_GETRUSAGE: msg = handle_getrusage(req); break;
         case LINUX_SYS_STAT: case LINUX_SYS_LSTAT: msg = handle_newfstatat(req, 1); break;
         case LINUX_SYS_FSTAT: msg = handle_fstat(req); break;
         case LINUX_SYS_NEWFSTATAT: msg = handle_newfstatat(req, 0); break;
@@ -138,7 +141,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_TIMER_CREATE: msg = handle_timer_create(req); break;
         case LINUX_SYS_TIMER_SETTIME: msg = handle_timer_settime(req); break;
         case LINUX_SYS_TIMER_GETTIME: msg = handle_timer_gettime(req); break;
-        case LINUX_SYS_TIMER_DELETE: msg = reply(0, 0); break;
+        case LINUX_SYS_TIMER_DELETE: msg = handle_timer_delete(req); break;
         case LINUX_SYS_SCHED_GETAFFINITY: msg = handle_sched_getaffinity(req); break;
         case LINUX_SYS_MEMBARRIER: msg = handle_membarrier(req); break;
         case LINUX_SYS_EXECVE: msg = handle_execve(req); break;
@@ -152,6 +155,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_MOUNT: case LINUX_SYS_UMOUNT2: msg = reply(errno_perm(), 0); break;
         case LINUX_SYS_RT_SIGACTION: msg = handle_rt_sigaction(req); break;
         case LINUX_SYS_RT_SIGPROCMASK: msg = handle_rt_sigprocmask(req); break;
+        case LINUX_SYS_RT_SIGRETURN: msg = handle_rt_sigreturn(req); break;
         case LINUX_SYS_RT_SIGTIMEDWAIT: msg = handle_rt_sigtimedwait(req); break;
         case LINUX_SYS_SIGALTSTACK: msg = handle_sigaltstack(req); break;
         case LINUX_SYS_SET_TID_ADDRESS: msg = handle_set_tid_address(req); break;

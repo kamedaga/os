@@ -113,6 +113,12 @@ struct linux_timespec { i64 tv_sec; i64 tv_nsec; };
 struct linux_timeval { i64 tv_sec; i64 tv_usec; };
 struct linux_itimerval { struct linux_timeval it_interval; struct linux_timeval it_value; };
 struct linux_itimerspec { struct linux_timespec it_interval; struct linux_timespec it_value; };
+struct linux_sigevent {
+    u64 sigev_value;
+    i32 sigev_signo;
+    i32 sigev_notify;
+    u8 reserved[48];
+};
 struct linux_timezone { int tz_minuteswest; int tz_dsttime; };
 struct linux_sysinfo {
     i64 uptime;
@@ -156,10 +162,33 @@ static int linux_timespec_valid(const struct linux_timespec *ts) {
     return ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000LL;
 }
 
+static u64 g_timer_invalid_diag_count;
+
+static void timer_invalid_diag(const char *name, u64 a, u64 b, u64 c, u64 d) {
+    if (g_timer_invalid_diag_count++ >= 32) return;
+    user_log("LinuxAbiServer.timer invalid ");
+    user_log(name);
+    user_log(" a=");
+    user_log_hex_value(a);
+    user_log(" b=");
+    user_log_hex_value(b);
+    user_log(" c=");
+    user_log_hex_value(c);
+    user_log(" d=");
+    user_log_hex_value(d);
+}
+
 static u64 linux_timespec_to_ticks_ceil(const struct linux_timespec *ts) {
     const u64 sec = (u64)ts->tv_sec;
     const u64 nsec = (u64)ts->tv_nsec;
     return sec * 1000ULL + (nsec + (LINUX_ABI_MONOTONIC_NS_PER_TICK - 1ULL)) / LINUX_ABI_MONOTONIC_NS_PER_TICK;
+}
+
+static struct linux_timespec ticks_to_linux_timespec(u64 ticks) {
+    struct linux_timespec ts;
+    ts.tv_sec = (i64)(ticks / 1000ULL);
+    ts.tv_nsec = (i64)((ticks % 1000ULL) * LINUX_ABI_MONOTONIC_NS_PER_TICK);
+    return ts;
 }
 
 static i64 linux_timespec_compare(const struct linux_timespec *a, const struct linux_timespec *b) {
@@ -235,11 +264,41 @@ static struct ipc_message handle_clock_getres(const struct trap_request *req) {
     return copy_to_target(dst, &ts, sizeof(ts)) == sizeof(ts) ? reply(0, 0) : reply(errno_fault(), 0);
 }
 
+static int sleep_ticks_interruptible(u64 ticks, u64 *remaining_ticks_out) {
+    if (remaining_ticks_out) *remaining_ticks_out = 0;
+    if (ticks == 0) return 0;
+    const u64 start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    for (;;) {
+        const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+        const u64 elapsed = now - start_tick;
+        if (elapsed >= ticks) return 0;
+        if (process_signal_interrupt_pending(g_proc)) {
+            if (remaining_ticks_out) *remaining_ticks_out = ticks - elapsed;
+            return 1;
+        }
+        const u64 remaining = ticks - elapsed;
+        (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, remaining > 1 ? 1 : remaining);
+    }
+}
+
 static struct ipc_message handle_nanosleep(const struct trap_request *req) {
     struct linux_timespec ts;
     if (req->args[0] == 0) return reply(errno_fault(), 0);
     if (copy_from_target(req->args[0], &ts, sizeof(ts)) != sizeof(ts)) return reply(errno_fault(), 0);
-    if (!linux_timespec_valid(&ts)) return reply(errno_inval(), 0);
+    if (!linux_timespec_valid(&ts)) {
+        timer_invalid_diag("nanosleep", req->args[0], (u64)ts.tv_sec, (u64)ts.tv_nsec, 0);
+        return reply(errno_inval(), 0);
+    }
+
+    u64 ticks = linux_timespec_to_ticks_ceil(&ts);
+    u64 remaining_ticks = 0;
+    if (sleep_ticks_interruptible(ticks, &remaining_ticks)) {
+        if (req->args[1] != 0) {
+            const struct linux_timespec rem = ticks_to_linux_timespec(remaining_ticks);
+            if (copy_to_target(req->args[1], &rem, sizeof(rem)) != sizeof(rem)) return reply(errno_fault(), 0);
+        }
+        return reply(errno_intr(), 0);
+    }
     if (req->args[1] != 0) {
         struct linux_timespec rem;
         rem.tv_sec = 0;
@@ -247,8 +306,6 @@ static struct ipc_message handle_nanosleep(const struct trap_request *req) {
         if (copy_to_target(req->args[1], &rem, sizeof(rem)) != sizeof(rem)) return reply(errno_fault(), 0);
     }
 
-    u64 ticks = linux_timespec_to_ticks_ceil(&ts);
-    if (ticks != 0) (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, ticks);
     return reply(0, 0);
 }
 
@@ -262,14 +319,21 @@ static struct ipc_message handle_clock_nanosleep(const struct trap_request *req)
         clock_id != LINUX_CLOCK_MONOTONIC_RAW &&
         clock_id != LINUX_CLOCK_BOOTTIME)
     {
+        timer_invalid_diag("clock-nanosleep-clock", clock_id, flags, request_va, remain_va);
         return reply(errno_inval(), 0);
     }
-    if ((flags & ~(u64)LINUX_TIMER_ABSTIME) != 0) return reply(errno_inval(), 0);
+    if ((flags & ~(u64)LINUX_TIMER_ABSTIME) != 0) {
+        timer_invalid_diag("clock-nanosleep-flags", clock_id, flags, request_va, remain_va);
+        return reply(errno_inval(), 0);
+    }
     if (request_va == 0) return reply(errno_fault(), 0);
 
     struct linux_timespec requested;
     if (copy_from_target(request_va, &requested, sizeof(requested)) != sizeof(requested)) return reply(errno_fault(), 0);
-    if (!linux_timespec_valid(&requested)) return reply(errno_inval(), 0);
+    if (!linux_timespec_valid(&requested)) {
+        timer_invalid_diag("clock-nanosleep-time", clock_id, (u64)requested.tv_sec, (u64)requested.tv_nsec, flags);
+        return reply(errno_inval(), 0);
+    }
 
     struct linux_timespec duration = requested;
     if ((flags & LINUX_TIMER_ABSTIME) != 0) {
@@ -290,7 +354,14 @@ static struct ipc_message handle_clock_nanosleep(const struct trap_request *req)
     }
 
     const u64 ticks = linux_timespec_to_ticks_ceil(&duration);
-    if (ticks != 0) (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, ticks);
+    u64 remaining_ticks = 0;
+    if (sleep_ticks_interruptible(ticks, &remaining_ticks)) {
+        if ((flags & LINUX_TIMER_ABSTIME) == 0 && remain_va != 0) {
+            const struct linux_timespec rem = ticks_to_linux_timespec(remaining_ticks);
+            if (copy_to_target(remain_va, &rem, sizeof(rem)) != sizeof(rem)) return reply(errno_fault(), 0);
+        }
+        return reply(errno_intr(), 0);
+    }
     return reply(0, 0);
 }
 
@@ -298,11 +369,20 @@ static struct ipc_message handle_setitimer(const struct trap_request *req) {
     const u64 which = req->args[0];
     const u64 new_value_va = req->args[1];
     const u64 old_value_va = req->args[2];
-    if (which > 2) return reply(errno_inval(), 0);
+    if (which > 2) {
+        timer_invalid_diag("setitimer-which", which, new_value_va, old_value_va, 0);
+        return reply(errno_inval(), 0);
+    }
+    if (which != 0) return reply(errno_nosys(), 0);
     if (old_value_va != 0) {
         struct linux_itimerval old_value;
         u8 *p = (u8 *)&old_value;
         for (u64 i = 0; i < sizeof(old_value); i++) p[i] = 0;
+        const u64 remaining = process_itimer_real_remaining_ticks(g_proc);
+        old_value.it_value.tv_sec = (i64)(remaining / 1000ULL);
+        old_value.it_value.tv_usec = (i64)((remaining % 1000ULL) * 1000ULL);
+        old_value.it_interval.tv_sec = (i64)(g_proc->itimer_real_interval_ticks / 1000ULL);
+        old_value.it_interval.tv_usec = (i64)((g_proc->itimer_real_interval_ticks % 1000ULL) * 1000ULL);
         if (copy_to_target(old_value_va, &old_value, sizeof(old_value)) != sizeof(old_value)) return reply(errno_fault(), 0);
     }
     if (new_value_va != 0) {
@@ -312,7 +392,20 @@ static struct ipc_message handle_setitimer(const struct trap_request *req) {
             new_value.it_interval.tv_usec < 0 || new_value.it_interval.tv_usec >= 1000000LL ||
             new_value.it_value.tv_usec < 0 || new_value.it_value.tv_usec >= 1000000LL)
         {
+            timer_invalid_diag("setitimer-time",
+                (u64)new_value.it_interval.tv_sec,
+                (u64)new_value.it_interval.tv_usec,
+                (u64)new_value.it_value.tv_sec,
+                (u64)new_value.it_value.tv_usec);
             return reply(errno_inval(), 0);
+        }
+        const u64 value_ticks = (u64)new_value.it_value.tv_sec * 1000ULL + ((u64)new_value.it_value.tv_usec + 999ULL) / 1000ULL;
+        const u64 interval_ticks = (u64)new_value.it_interval.tv_sec * 1000ULL + ((u64)new_value.it_interval.tv_usec + 999ULL) / 1000ULL;
+        g_proc->itimer_real_interval_ticks = interval_ticks;
+        g_proc->itimer_real_expiry_tick = value_ticks == 0 ? 0 : syscall0(SYSCALL_GET_TICK_COUNT) + value_ticks;
+        if (value_ticks == 0) {
+            g_proc->pending_signals &= ~linux_signal_bit(SIGALRM);
+            g_proc->timer_interrupt_signals &= ~linux_signal_bit(SIGALRM);
         }
     }
     return reply(0, 0);
@@ -325,8 +418,48 @@ static int itimerspec_valid(const struct linux_itimerspec *its) {
     return 1;
 }
 
+static struct linux_posix_timer_state *posix_timer_for_id(struct linux_process_state *proc, i32 timer_id) {
+    if (!proc || timer_id <= 0) return 0;
+    for (u64 i = 0; i < LINUX_POSIX_TIMER_MAX; i++) {
+        if (proc->timers[i].used && proc->timers[i].timer_id == timer_id) return &proc->timers[i];
+    }
+    return 0;
+}
+
+static void fill_itimerspec_from_timer(const struct linux_posix_timer_state *timer, struct linux_itimerspec *out) {
+    u8 *p = (u8 *)out;
+    for (u64 i = 0; i < sizeof(*out); i++) p[i] = 0;
+    if (!timer || !timer->used) return;
+    const struct linux_timespec value = ticks_to_linux_timespec(timer_remaining_ticks(timer->expiry_tick));
+    const struct linux_timespec interval = ticks_to_linux_timespec(timer->interval_ticks);
+    out->it_value.tv_sec = value.tv_sec;
+    out->it_value.tv_nsec = value.tv_nsec;
+    out->it_interval.tv_sec = interval.tv_sec;
+    out->it_interval.tv_nsec = interval.tv_nsec;
+}
+
+static u64 timer_start_tick_for_clock(u64 clock_id, const struct linux_timespec *value, u64 flags) {
+    const u64 value_ticks = linux_timespec_to_ticks_ceil(value);
+    if (value_ticks == 0) return 0;
+    const u64 now_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    if ((flags & LINUX_TIMER_ABSTIME) == 0) return now_tick + value_ticks;
+    if (clock_id == LINUX_CLOCK_REALTIME) {
+        const i64 now_sec = realtime_unix_seconds();
+        if (value->tv_sec < now_sec || (value->tv_sec == now_sec && value->tv_nsec == 0)) return now_tick;
+        const u64 sec_delta = (u64)(value->tv_sec - now_sec);
+        const u64 nsec = (u64)value->tv_nsec;
+        return now_tick + sec_delta * 1000ULL + (nsec + (LINUX_ABI_MONOTONIC_NS_PER_TICK - 1ULL)) / LINUX_ABI_MONOTONIC_NS_PER_TICK;
+    }
+    struct linux_timespec now;
+    monotonic_timespec(&now);
+    if (linux_timespec_compare(value, &now) <= 0) return now_tick;
+    const struct linux_timespec delta = linux_timespec_sub(value, &now);
+    return now_tick + linux_timespec_to_ticks_ceil(&delta);
+}
+
 static struct ipc_message handle_timer_create(const struct trap_request *req) {
     const u64 clock_id = req->args[0];
+    const u64 sigevent_va = req->args[1];
     const u64 timerid_va = req->args[2];
     if (clock_id != LINUX_CLOCK_REALTIME &&
         clock_id != LINUX_CLOCK_MONOTONIC &&
@@ -336,34 +469,96 @@ static struct ipc_message handle_timer_create(const struct trap_request *req) {
         return reply(errno_inval(), 0);
     }
     if (timerid_va == 0) return reply(errno_fault(), 0);
-    const i32 timerid = 1;
+    struct linux_sigevent sev;
+    sev.sigev_value = 0;
+    sev.sigev_signo = SIGALRM;
+    sev.sigev_notify = SIGEV_SIGNAL;
+    if (sigevent_va != 0) {
+        if (copy_from_target(sigevent_va, &sev, sizeof(sev)) != sizeof(sev)) return reply(errno_fault(), 0);
+        if (sev.sigev_notify != SIGEV_SIGNAL && sev.sigev_notify != SIGEV_NONE && sev.sigev_notify != SIGEV_THREAD_ID) {
+            return reply(errno_nosys(), 0);
+        }
+        if ((sev.sigev_notify == SIGEV_SIGNAL || sev.sigev_notify == SIGEV_THREAD_ID) &&
+            (sev.sigev_signo <= 0 || sev.sigev_signo >= 65))
+        {
+            return reply(errno_inval(), 0);
+        }
+    }
+    struct linux_posix_timer_state *slot = 0;
+    for (u64 i = 0; i < LINUX_POSIX_TIMER_MAX; i++) {
+        if (g_proc->timers[i].used) continue;
+        slot = &g_proc->timers[i];
+        break;
+    }
+    if (!slot) return reply(errno_again(), 0);
+    slot->used = 1;
+    slot->clock_id = (u8)clock_id;
+    slot->notify = (u8)sev.sigev_notify;
+    slot->signo = (u8)(sev.sigev_signo == 0 ? SIGALRM : sev.sigev_signo);
+    slot->value = sev.sigev_value;
+    slot->expiry_tick = 0;
+    slot->interval_ticks = 0;
+    slot->overrun = 0;
+    const i32 timerid = slot->timer_id;
     return copy_to_target(timerid_va, &timerid, sizeof(timerid)) == sizeof(timerid) ? reply(0, 0) : reply(errno_fault(), 0);
 }
 
 static struct ipc_message handle_timer_settime(const struct trap_request *req) {
+    const i32 timer_id = (i32)req->args[0];
+    const u64 flags = req->args[1];
     const u64 new_value_va = req->args[2];
     const u64 old_value_va = req->args[3];
+    if ((flags & ~(u64)LINUX_TIMER_ABSTIME) != 0) return reply(errno_inval(), 0);
+    struct linux_posix_timer_state *timer = posix_timer_for_id(g_proc, timer_id);
+    if (!timer) return reply(errno_inval(), 0);
+    process_timers_update(g_proc);
     if (old_value_va != 0) {
         struct linux_itimerspec old_value;
-        u8 *p = (u8 *)&old_value;
-        for (u64 i = 0; i < sizeof(old_value); i++) p[i] = 0;
+        fill_itimerspec_from_timer(timer, &old_value);
         if (copy_to_target(old_value_va, &old_value, sizeof(old_value)) != sizeof(old_value)) return reply(errno_fault(), 0);
     }
-    if (new_value_va != 0) {
-        struct linux_itimerspec new_value;
-        if (copy_from_target(new_value_va, &new_value, sizeof(new_value)) != sizeof(new_value)) return reply(errno_fault(), 0);
-        if (!itimerspec_valid(&new_value)) return reply(errno_inval(), 0);
+    if (new_value_va == 0) return reply(errno_fault(), 0);
+    struct linux_itimerspec new_value;
+    if (copy_from_target(new_value_va, &new_value, sizeof(new_value)) != sizeof(new_value)) return reply(errno_fault(), 0);
+    if (!itimerspec_valid(&new_value)) return reply(errno_inval(), 0);
+    timer->interval_ticks = linux_timespec_to_ticks_ceil(&new_value.it_interval);
+    timer->expiry_tick = timer_start_tick_for_clock(timer->clock_id, &new_value.it_value, flags);
+    timer->overrun = 0;
+    if (timer->expiry_tick == 0 && timer->signo != 0) {
+        g_proc->pending_signals &= ~linux_signal_bit(timer->signo);
+        g_proc->timer_interrupt_signals &= ~linux_signal_bit(timer->signo);
     }
     return reply(0, 0);
 }
 
 static struct ipc_message handle_timer_gettime(const struct trap_request *req) {
+    const i32 timer_id = (i32)req->args[0];
     const u64 dst = req->args[1];
     if (dst == 0) return reply(errno_fault(), 0);
+    struct linux_posix_timer_state *timer = posix_timer_for_id(g_proc, timer_id);
+    if (!timer) return reply(errno_inval(), 0);
+    process_timers_update(g_proc);
     struct linux_itimerspec value;
-    u8 *p = (u8 *)&value;
-    for (u64 i = 0; i < sizeof(value); i++) p[i] = 0;
+    fill_itimerspec_from_timer(timer, &value);
     return copy_to_target(dst, &value, sizeof(value)) == sizeof(value) ? reply(0, 0) : reply(errno_fault(), 0);
+}
+
+static struct ipc_message handle_timer_delete(const struct trap_request *req) {
+    const i32 timer_id = (i32)req->args[0];
+    struct linux_posix_timer_state *timer = posix_timer_for_id(g_proc, timer_id);
+    if (!timer) return reply(errno_inval(), 0);
+    if (timer->signo != 0) {
+        g_proc->pending_signals &= ~linux_signal_bit(timer->signo);
+        g_proc->timer_interrupt_signals &= ~linux_signal_bit(timer->signo);
+    }
+    timer->used = 0;
+    timer->expiry_tick = 0;
+    timer->interval_ticks = 0;
+    timer->overrun = 0;
+    timer->value = 0;
+    timer->signo = 0;
+    timer->notify = SIGEV_NONE;
+    return reply(0, 0);
 }
 
 static struct ipc_message handle_gettimeofday(const struct trap_request *req) {
@@ -552,8 +747,8 @@ static void linux_termios_to_tty_attr(const struct linux_termios_kernel *termios
     if (termios->c_lflag & 0000100) attr->lflag |= TTY_LFLAG_ECHONL;
     if (termios->c_lflag & 0100000) attr->lflag |= TTY_LFLAG_IEXTEN;
     for (u64 i = 0; i < sizeof(attr->cc); i++) attr->cc[i] = i < sizeof(termios->c_cc) ? termios->c_cc[i] : 0;
-    attr->columns = 120;
-    attr->rows = 40;
+    attr->columns = 80;
+    attr->rows = 24;
     attr->reserved0 = 0;
 
     struct tty_attr_payload current;
@@ -587,8 +782,8 @@ static struct ipc_message handle_ioctl(const struct trap_request *req) {
             ws.ws_row = attr.rows;
             ws.ws_col = attr.columns;
         } else {
-            ws.ws_row = 40;
-            ws.ws_col = 120;
+            ws.ws_row = 24;
+            ws.ws_col = 80;
         }
         ws.ws_xpixel = 0;
         ws.ws_ypixel = 0;
@@ -622,8 +817,8 @@ static struct ipc_message handle_ioctl(const struct trap_request *req) {
             attr.cc[4] = 4;
             attr.cc[5] = 0;
             attr.cc[6] = 1;
-            attr.columns = 120;
-            attr.rows = 40;
+            attr.columns = 80;
+            attr.rows = 24;
             attr.reserved0 = 0;
         }
         if (ws.ws_col != 0) attr.columns = ws.ws_col;

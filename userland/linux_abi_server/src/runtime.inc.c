@@ -1,4 +1,15 @@
 static u64 cstr_len(const char *s) { u64 n = 0; while (s[n] != 0) n++; return n; }
+void *memcpy(void *dst, const void *src, u64 len) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    for (u64 i = 0; i < len; i++) d[i] = s[i];
+    return dst;
+}
+void *memset(void *dst, int value, u64 len) {
+    u8 *d = (u8 *)dst;
+    for (u64 i = 0; i < len; i++) d[i] = (u8)value;
+    return dst;
+}
 static void user_log_len(const char *message, u64 len) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"((u64)SYSCALL_LOG), "D"((u64)message), "S"(len) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"); (void)ret; }
 static void user_log(const char *message) { user_log_len(message, cstr_len(message)); }
 static void user_log_dec_value(u64 value) {
@@ -34,6 +45,7 @@ static u64 syscall2(u64 nr, u64 a0, u64 a1) { u64 ret; __asm__ volatile("int $0x
 static u64 syscall3(u64 nr, u64 a0, u64 a1, u64 a2) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3) : "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall4_r10(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { register u64 r10 __asm__("r10") = a3; u64 ret; __asm__ volatile("int $0x80" : "=a"(ret), "+r"(r10) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r11", "memory"); return ret; }
+static u64 detach_reply_token(void);
 static void process_exit(u64 code) { (void)syscall2(SYSCALL_PROCESS_EXIT, code, 0); for (;;) __asm__ volatile("pause"); }
 
 static int profile_trace_enabled(void) {
@@ -96,6 +108,237 @@ static void wait_without_consuming_ipc_no_switch(void) {
     }
 }
 
+static u64 linux_signal_bit(u64 signo) {
+    return (signo == 0 || signo >= 65) ? 0 : (1ULL << (signo - 1ULL));
+}
+
+static u64 linux_unblockable_signal_mask(void) {
+    return linux_signal_bit(SIGKILL) | linux_signal_bit(SIGSTOP);
+}
+
+static int linux_signal_default_ignored_inline(u64 signo) {
+    return signo == SIGCHLD || signo == SIGURG || signo == SIGWINCH;
+}
+
+static void queue_process_signal(struct linux_process_state *proc, u64 signo) {
+    if (!proc || signo == 0 || signo >= 65) return;
+    if (proc->sig_handler[signo] == 1) return;
+    if (proc->sig_handler[signo] == 0 && linux_signal_default_ignored_inline(signo)) return;
+    proc->pending_signals |= linux_signal_bit(signo);
+}
+
+static void queue_timer_interrupt_signal(struct linux_process_state *proc, u64 signo) {
+    if (!proc || signo == 0 || signo >= 65) return;
+    proc->timer_interrupt_signals |= linux_signal_bit(signo);
+}
+
+static u64 dequeue_pending_signal_matching(struct linux_process_state *proc, u64 set_word) {
+    if (!proc) return 0;
+    const u64 pending = proc->pending_signals & set_word;
+    if (pending == 0) return 0;
+    for (u64 signo = 1; signo < 65; signo++) {
+        const u64 bit = linux_signal_bit(signo);
+        if ((pending & bit) == 0) continue;
+        proc->pending_signals &= ~bit;
+        return signo;
+    }
+    return 0;
+}
+
+static void clear_process_timers(struct linux_process_state *proc) {
+    if (!proc) return;
+    proc->pending_signals = 0;
+    proc->timer_interrupt_signals = 0;
+    proc->itimer_real_expiry_tick = 0;
+    proc->itimer_real_interval_ticks = 0;
+    for (u64 i = 0; i < LINUX_POSIX_TIMER_MAX; i++) {
+        proc->timers[i].used = 0;
+        proc->timers[i].timer_id = (i32)(i + 1);
+        proc->timers[i].clock_id = 0;
+        proc->timers[i].signo = 0;
+        proc->timers[i].notify = SIGEV_NONE;
+        proc->timers[i].value = 0;
+        proc->timers[i].expiry_tick = 0;
+        proc->timers[i].interval_ticks = 0;
+        proc->timers[i].overrun = 0;
+    }
+}
+
+static u64 timer_remaining_ticks(u64 expiry_tick) {
+    if (expiry_tick == 0) return 0;
+    const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+    return expiry_tick > now ? expiry_tick - now : 0;
+}
+
+static u64 process_itimer_real_remaining_ticks(struct linux_process_state *proc) {
+    if (!proc) return 0;
+    return timer_remaining_ticks(proc->itimer_real_expiry_tick);
+}
+
+static void process_timers_update(struct linux_process_state *proc) {
+    if (!proc) return;
+    const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (proc->itimer_real_expiry_tick != 0 && now >= proc->itimer_real_expiry_tick) {
+        if (proc->itimer_real_interval_ticks != 0) {
+            const u64 elapsed = now - proc->itimer_real_expiry_tick;
+            const u64 periods = elapsed / proc->itimer_real_interval_ticks + 1ULL;
+            proc->itimer_real_expiry_tick += periods * proc->itimer_real_interval_ticks;
+        } else {
+            proc->itimer_real_expiry_tick = 0;
+        }
+        queue_timer_interrupt_signal(proc, SIGALRM);
+        queue_process_signal(proc, SIGALRM);
+    }
+    for (u64 i = 0; i < LINUX_POSIX_TIMER_MAX; i++) {
+        struct linux_posix_timer_state *timer = &proc->timers[i];
+        if (!timer->used || timer->expiry_tick == 0 || now < timer->expiry_tick) continue;
+        u64 overruns = 0;
+        if (timer->interval_ticks != 0) {
+            const u64 elapsed = now - timer->expiry_tick;
+            const u64 periods = elapsed / timer->interval_ticks + 1ULL;
+            timer->expiry_tick += periods * timer->interval_ticks;
+            overruns = periods - 1ULL;
+        } else {
+            timer->expiry_tick = 0;
+        }
+        timer->overrun = overruns;
+        if (timer->notify == SIGEV_SIGNAL || timer->notify == SIGEV_THREAD_ID) {
+            const u64 signo = timer->signo == 0 ? SIGALRM : timer->signo;
+            queue_timer_interrupt_signal(proc, signo);
+            queue_process_signal(proc, signo);
+        }
+    }
+}
+
+static int process_signal_interrupt_pending(struct linux_process_state *proc) {
+    process_timers_update(proc);
+    if (!proc) return 0;
+    return (proc->pending_signals & ~proc->blocked_signals) != 0;
+}
+
+static int process_next_signal_timer_timeout(struct linux_process_state *proc, u64 *ticks_out) {
+    *ticks_out = 0;
+    if (!proc) return 0;
+    process_timers_update(proc);
+    if (process_signal_interrupt_pending(proc)) return 1;
+    u64 best = 0;
+    if (proc->itimer_real_expiry_tick != 0) best = process_itimer_real_remaining_ticks(proc);
+    for (u64 i = 0; i < LINUX_POSIX_TIMER_MAX; i++) {
+        struct linux_posix_timer_state *timer = &proc->timers[i];
+        if (!timer->used || timer->expiry_tick == 0) continue;
+        if (timer->notify != SIGEV_SIGNAL && timer->notify != SIGEV_THREAD_ID) continue;
+        const u64 remaining = timer_remaining_ticks(timer->expiry_tick);
+        if (best == 0 || remaining < best) best = remaining;
+    }
+    if (best == 0) return 0;
+    *ticks_out = best;
+    return 1;
+}
+
+static int process_itimer_real_expired(struct linux_process_state *proc) {
+    return process_signal_interrupt_pending(proc);
+}
+
+static void fill_user_context_from_request(struct abi_trap_user_context *ctx, const struct trap_request *req, u64 result_rax) {
+    u8 *p = (u8 *)ctx;
+    for (u64 i = 0; i < sizeof(*ctx); i++) p[i] = 0;
+    ctx->rip = req->rip;
+    ctx->rsp = req->rsp;
+    ctx->rflags = req->rflags != 0 ? req->rflags : 0x202ULL;
+    ctx->rax = result_rax;
+    ctx->rbx = req->rbx;
+    ctx->rcx = req->rcx;
+    ctx->rdx = req->rdx;
+    ctx->rsi = req->rsi;
+    ctx->rdi = req->rdi;
+    ctx->rbp = req->rbp;
+    ctx->r8 = req->r8;
+    ctx->r9 = req->r9;
+    ctx->r10 = req->r10;
+    ctx->r11 = req->r11;
+    ctx->r12 = req->r12;
+    ctx->r13 = req->r13;
+    ctx->r14 = req->r14;
+    ctx->r15 = req->r15;
+    ctx->fs_base = req->fs_base;
+}
+
+static u64 reply_trap_target_context(u64 principal, const struct abi_trap_user_context *ctx) {
+    return syscall4_r10(SYSCALL_REPLY_ABI_TRAP_TARGET_CONTEXT, principal, (u64)ctx, sizeof(*ctx), 0);
+}
+
+static int copy_to_current_reply_target(u64 target_va, const void *src, u64 len) {
+    return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len) == len;
+}
+
+static u64 take_deliverable_signal(struct linux_process_state *proc) {
+    process_timers_update(proc);
+    if (!proc) return 0;
+    const u64 deliverable = proc->pending_signals & ~proc->blocked_signals;
+    if (deliverable == 0) return 0;
+    for (u64 signo = 1; signo < 65; signo++) {
+        const u64 bit = linux_signal_bit(signo);
+        if ((deliverable & bit) == 0) continue;
+        if (proc->sig_handler[signo] == 1) {
+            proc->pending_signals &= ~bit;
+            continue;
+        }
+        return signo;
+    }
+    return 0;
+}
+
+static int try_reply_signal_frame(u64 result, u64 flags) {
+    if (flags != 0 || !g_proc || !g_abi_ctx || !g_abi_ctx->request) return 0;
+    const struct trap_request *req = g_abi_ctx->request;
+    if (req->nr == LINUX_SYS_RT_SIGRETURN) return 0;
+    const u64 signo = take_deliverable_signal(g_proc);
+    if (signo == 0) return 0;
+    const u64 handler = g_proc->sig_handler[signo];
+    const u64 restorer = g_proc->sig_restorer[signo];
+    if (handler == 0) {
+        g_proc->pending_signals &= ~linux_signal_bit(signo);
+        return 0;
+    }
+    if (restorer == 0) {
+        g_proc->pending_signals &= ~linux_signal_bit(signo);
+        return 0;
+    }
+
+    struct linux_signal_frame_body body;
+    u8 *body_bytes = (u8 *)&body;
+    for (u64 i = 0; i < sizeof(body); i++) body_bytes[i] = 0;
+    body.magic = LINUX_SIGNAL_FRAME_MAGIC;
+    body.signo = signo;
+    body.info.si_signo = (i32)signo;
+    body.info.si_code = SI_TIMER;
+    fill_user_context_from_request(&body.saved_context, req, result);
+
+    const u64 body_va = (req->rsp - sizeof(body)) & ~15ULL;
+    const u64 return_slot_va = body_va - 8ULL;
+    if (!copy_to_current_reply_target(return_slot_va, &restorer, sizeof(restorer))) return 0;
+    if (!copy_to_current_reply_target(body_va, &body, sizeof(body))) return 0;
+
+    struct abi_trap_user_context handler_context;
+    fill_user_context_from_request(&handler_context, req, result);
+    handler_context.rip = handler;
+    handler_context.rsp = return_slot_va;
+    handler_context.rax = 0;
+    handler_context.rdi = signo;
+    handler_context.rsi = body_va + OFFSETOF(struct linux_signal_frame_body, info);
+    handler_context.rdx = body_va;
+
+    g_proc->pending_signals &= ~linux_signal_bit(signo);
+    const u64 target = abi_reply_target_principal();
+    const u64 status = reply_trap_target_context(target, &handler_context);
+    if (status != SYSCALL_OK) {
+        return 0;
+    }
+    abi_set_reply_target_principal(0);
+    (void)detach_reply_token();
+    return 1;
+}
+
 static struct ipc_message wait_ipc(void) {
     register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 0; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
     __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "=r"(rdx), "=r"(r8) : : "rcx", "r9", "r10", "r11", "memory");
@@ -115,6 +358,7 @@ static struct ipc_message reply_current_token(u64 result, u64 flags) {
 }
 
 static struct ipc_message reply(u64 result, u64 flags) {
+    if (try_reply_signal_frame(result, flags)) return wait_ipc_timeout(1);
     const u64 explicit_target = abi_reply_target_principal();
     if (explicit_target != 0) {
         const u64 target = explicit_target;

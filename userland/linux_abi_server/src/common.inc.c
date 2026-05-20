@@ -49,6 +49,7 @@ enum {
     SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_RESERVE_ABI_TRAP_REPLY_TARGET_PAGES = 0x63,
+    SYSCALL_REPLY_ABI_TRAP_TARGET_CONTEXT = 0x64,
     SYSCALL_OK = 0,
     SYSCALL_ERR_NOT_READY = 2,
     SYSCALL_ERR_MAP = 5,
@@ -134,6 +135,8 @@ enum {
     CONSOLE_OP_SET_ATTR = 5,
     CONSOLE_OP_GET_SIGNAL = 6,
     CONSOLE_OP_POLL = 7,
+    CONSOLE_REQUEST_FLAG_NONBLOCK = 1 << 0,
+    CONSOLE_REQUEST_FLAG_TIMEOUT = 1 << 1,
     CONSOLE_STATUS_OK = 0,
     CONSOLE_STATUS_AGAIN = 1,
     CONSOLE_STATUS_INVALID = 2,
@@ -193,6 +196,7 @@ enum {
     LINUX_SYS_BRK = 12,
     LINUX_SYS_RT_SIGACTION = 13,
     LINUX_SYS_RT_SIGPROCMASK = 14,
+    LINUX_SYS_RT_SIGRETURN = 15,
     LINUX_SYS_IOCTL = 16,
     LINUX_SYS_PREAD64 = 17,
     LINUX_SYS_READV = 19,
@@ -229,6 +233,7 @@ enum {
     LINUX_SYS_FLOCK = 73,
     LINUX_SYS_FSYNC = 74,
     LINUX_SYS_FDATASYNC = 75,
+    LINUX_SYS_GETRUSAGE = 77,
     LINUX_SYS_GETCWD = 79,
     LINUX_SYS_CHDIR = 80,
     LINUX_SYS_FCHDIR = 81,
@@ -373,6 +378,16 @@ enum {
     SIGTTOU = 22,
     SIGURG = 23,
     SIGWINCH = 28,
+    SIGEV_SIGNAL = 0,
+    SIGEV_NONE = 1,
+    SIGEV_THREAD = 2,
+    SIGEV_THREAD_ID = 4,
+    SI_TIMER = -2,
+    SIG_BLOCK = 0,
+    SIG_UNBLOCK = 1,
+    SIG_SETMASK = 2,
+    SA_SIGINFO = 4,
+    SA_RESTORER = 0x04000000,
     SS_ONSTACK = 1,
     SS_DISABLE = 2,
     SS_AUTODISARM = 0x80000000,
@@ -468,6 +483,7 @@ enum {
     EXECVE_EXEC_SERVICE_TABLE_VA = 0x26405000,
     LINUX_ABI_REQUEST_PAGES_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
+    LINUX_SIGNAL_FRAME_MAGIC = 0x5349474652414D45ULL,
     FILE_CACHE_BASE_VA = 0x28000000,
     FILE_CACHE_BYTES = 8 * 1024 * 1024,
     FILE_CACHE_MAX = 12,
@@ -482,6 +498,45 @@ struct ipc_message { u64 status; u64 request_va; u64 reserved0; u64 reserved1; u
 struct trap_request {
     u64 magic; unsigned version; unsigned kind; unsigned flavor; unsigned reserved0;
     u64 caller_principal; u64 thread_id; u64 rip; u64 rsp; u64 fault_addr; u64 error_code; u64 nr; u64 args[6];
+    u64 r15; u64 r14; u64 r13; u64 r12; u64 r11; u64 r10; u64 r9; u64 r8;
+    u64 rbp; u64 rdi; u64 rsi; u64 rdx; u64 rcx; u64 rbx; u64 rax; u64 rflags; u64 fs_base;
+};
+struct abi_trap_user_context {
+    u64 flags;
+    u64 rip;
+    u64 rsp;
+    u64 rflags;
+    u64 rax;
+    u64 rbx;
+    u64 rcx;
+    u64 rdx;
+    u64 rsi;
+    u64 rdi;
+    u64 rbp;
+    u64 r8;
+    u64 r9;
+    u64 r10;
+    u64 r11;
+    u64 r12;
+    u64 r13;
+    u64 r14;
+    u64 r15;
+    u64 fs_base;
+    u64 reserved0;
+    u64 reserved1;
+};
+struct linux_siginfo {
+    i32 si_signo;
+    i32 si_errno;
+    i32 si_code;
+    u32 reserved0;
+    u64 payload[14];
+};
+struct linux_signal_frame_body {
+    u64 magic;
+    u64 signo;
+    struct abi_trap_user_context saved_context;
+    struct linux_siginfo info;
 };
 struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
 struct service_registry_page { u64 magic; u64 version; u64 entry_count; u64 reserved0; struct service_entry entries[SERVICE_REGISTRY_MAX_ENTRIES]; };
@@ -673,7 +728,18 @@ struct exec_cache_entry {
 enum { VM_REGION_MAX = 4096 };
 struct vm_region { u64 start; u64 size; u64 prot; int used; };
 
-enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16 };
+enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16, LINUX_POSIX_TIMER_MAX = 8 };
+struct linux_posix_timer_state {
+    u8 used;
+    u8 clock_id;
+    u8 signo;
+    u8 notify;
+    i32 timer_id;
+    u64 value;
+    u64 expiry_tick;
+    u64 interval_ticks;
+    u64 overrun;
+};
 struct linux_process_state {
     u8 used;
     u8 exec_pending;
@@ -696,6 +762,11 @@ struct linux_process_state {
     u8 wait_pending;
     i64 wait_pid;
     u64 wait_status_va;
+    u64 wait_rusage_va;
+    u8 sigwait_pending;
+    u64 sigwait_set;
+    u64 sigwait_info_va;
+    u64 sigwait_deadline_tick;
     u64 clear_child_tid;
     u8 profile_enabled;
     u8 profile_detail_enabled;
@@ -703,8 +774,15 @@ struct linux_process_state {
     u64 sigaltstack_sp;
     u64 sigaltstack_size;
     u32 sigaltstack_flags;
+    u64 blocked_signals;
+    u64 pending_signals;
+    u64 timer_interrupt_signals;
+    u64 itimer_real_expiry_tick;
+    u64 itimer_real_interval_ticks;
+    struct linux_posix_timer_state timers[LINUX_POSIX_TIMER_MAX];
     u64 sig_handler[65];
     u64 sig_flags[65];
+    u64 sig_restorer[65];
 };
 
 struct linux_stack_t {

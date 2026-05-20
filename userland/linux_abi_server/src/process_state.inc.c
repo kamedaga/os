@@ -45,6 +45,11 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->wait_pending = 0;
     proc->wait_pid = 0;
     proc->wait_status_va = 0;
+    proc->wait_rusage_va = 0;
+    proc->sigwait_pending = 0;
+    proc->sigwait_set = 0;
+    proc->sigwait_info_va = 0;
+    proc->sigwait_deadline_tick = 0;
     proc->clear_child_tid = 0;
     proc->profile_enabled = 0;
     proc->profile_detail_enabled = 0;
@@ -52,9 +57,26 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->sigaltstack_sp = 0;
     proc->sigaltstack_size = 0;
     proc->sigaltstack_flags = SS_DISABLE;
+    proc->blocked_signals = 0;
+    proc->pending_signals = 0;
+    proc->timer_interrupt_signals = 0;
+    proc->itimer_real_expiry_tick = 0;
+    proc->itimer_real_interval_ticks = 0;
+    for (u64 i = 0; i < LINUX_POSIX_TIMER_MAX; i++) {
+        proc->timers[i].used = 0;
+        proc->timers[i].timer_id = (i32)(i + 1);
+        proc->timers[i].clock_id = 0;
+        proc->timers[i].signo = 0;
+        proc->timers[i].notify = SIGEV_NONE;
+        proc->timers[i].value = 0;
+        proc->timers[i].expiry_tick = 0;
+        proc->timers[i].interval_ticks = 0;
+        proc->timers[i].overrun = 0;
+    }
     for (u64 i = 0; i < 65; i++) {
         proc->sig_handler[i] = 0;
         proc->sig_flags[i] = 0;
+        proc->sig_restorer[i] = 0;
     }
 }
 static void init_process_tables(void) {

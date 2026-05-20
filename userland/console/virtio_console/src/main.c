@@ -74,11 +74,15 @@ enum {
     QUEUE_USED_OFFSET = 2048,
     RX_QUEUE_INDEX = 0,
     TX_QUEUE_INDEX = 1,
-    RX_BUFFER_COUNT = 4,
-    RX_BUFFER_BYTES = 256,
+    RX_BUFFER_COUNT = 8,
+    TX_BUFFER_COUNT = 8,
+    RX_BUFFER_BYTES = PAGE_BYTES,
     TX_BUFFER_BYTES = PAGE_BYTES,
-    TX_RING_BYTES = 65536,
-    RX_RING_BYTES = 4096,
+    TX_RING_BYTES = 1048576,
+    TX_ACCEPT_HIGH_WATER_BYTES = 786432,
+    RX_RING_BYTES = 32768,
+    TX_PUSH_PUMP_BUDGET = 64,
+    TX_LOOP_PUMP_BUDGET = 128,
 
     CONSOLE_REQUEST_MAGIC = 0x514E4F43,
     CONSOLE_RESPONSE_MAGIC = 0x524E4F43,
@@ -197,18 +201,20 @@ static struct console_session g_session;
 static u64 g_common_base;
 static u64 g_notify_base;
 static u64 g_isr_base;
+static u64 g_device_base;
 static u64 g_rx_buffer_paddrs[RX_BUFFER_COUNT];
 static u64 g_rx_dma_tokens[RX_BUFFER_COUNT];
-static u64 g_tx_buffer_paddr;
-static u64 g_tx_dma_token;
+static u64 g_tx_buffer_paddrs[TX_BUFFER_COUNT];
+static u64 g_tx_dma_tokens[TX_BUFFER_COUNT];
 static u8 g_rx_ring[RX_RING_BYTES];
 static u64 g_rx_ring_head;
 static u64 g_rx_ring_len;
 static u8 g_tx_ring[TX_RING_BYTES];
 static u64 g_tx_ring_head;
 static u64 g_tx_ring_len;
-static u64 g_tx_inflight;
-static u64 g_tx_inflight_len;
+static u64 g_tx_inflight_mask;
+static u64 g_tx_inflight_count;
+static u64 g_tx_inflight_len[TX_BUFFER_COUNT];
 static u64 g_pending_read_seq;
 static u64 g_pending_read_max_len;
 
@@ -367,6 +373,19 @@ static void mmio_write_u16(u64 addr, u16 value) {
     *p = value;
 }
 
+static void virtio_console_get_size(u64 *columns_out, u64 *rows_out) {
+    u16 columns = 0;
+    u16 rows = 0;
+    if (g_device_base != 0) {
+        columns = mmio_read_u16(g_device_base + 0);
+        rows = mmio_read_u16(g_device_base + 2);
+    }
+    if (columns == 0) columns = 80;
+    if (rows == 0) rows = 24;
+    *columns_out = columns;
+    *rows_out = rows;
+}
+
 static void mmio_write_u32(u64 addr, u32 value) {
     volatile u32 *p = (volatile u32 *)addr;
     *p = value;
@@ -444,6 +463,10 @@ static volatile struct virtq_used_elem *used_ring_ptr(struct queue_state *queue)
     return (volatile struct virtq_used_elem *)(queue->page_va + QUEUE_USED_OFFSET + 4);
 }
 
+static u64 tx_buffer_va(u64 index) {
+    return TX_BUFFER_VA + index * PAGE_BYTES;
+}
+
 static void queue_push_avail(struct queue_state *queue, u16 desc_index) {
     const u16 idx = *avail_idx_ptr(queue);
     avail_ring_ptr(queue)[idx % QUEUE_SIZE] = desc_index;
@@ -478,8 +501,10 @@ static int init_queue_memory(void) {
         if (alloc_map_pages(RX_BUFFER_BASE_VA + i * PAGE_BYTES, 1, 1, (u64)&g_rx_buffer_paddrs[i]) != SYSCALL_OK) return 0;
         memset((void *)(RX_BUFFER_BASE_VA + i * PAGE_BYTES), 0, PAGE_BYTES);
     }
-    if (alloc_map_pages(TX_BUFFER_VA, 1, 1, (u64)&g_tx_buffer_paddr) != SYSCALL_OK) return 0;
-    memset((void *)TX_BUFFER_VA, 0, PAGE_BYTES);
+    for (u64 i = 0; i < TX_BUFFER_COUNT; i++) {
+        if (alloc_map_pages(tx_buffer_va(i), 1, 1, (u64)&g_tx_buffer_paddrs[i]) != SYSCALL_OK) return 0;
+        memset((void *)tx_buffer_va(i), 0, PAGE_BYTES);
+    }
     return 1;
 }
 
@@ -492,9 +517,12 @@ static int authorize_dma(void) {
         if (dma_map_set_state(g_rx_dma_tokens[i], DMA_STATE_IN_FLIGHT) != SYSCALL_OK) return 0;
     }
     if (iommu_authorize(g_boot.iommu_token, g_boot.resource_id, IOMMU_OP_MAP_READ) != SYSCALL_OK) return 0;
-    g_tx_dma_token = dma_map_create(g_boot.resource_id, g_tx_buffer_paddr, TX_BUFFER_BYTES, DMA_DIRECTION_READ);
-    if (g_tx_dma_token == 0) return 0;
-    return dma_map_set_state(g_tx_dma_token, DMA_STATE_IN_FLIGHT) == SYSCALL_OK;
+    for (u64 i = 0; i < TX_BUFFER_COUNT; i++) {
+        g_tx_dma_tokens[i] = dma_map_create(g_boot.resource_id, g_tx_buffer_paddrs[i], TX_BUFFER_BYTES, DMA_DIRECTION_READ);
+        if (g_tx_dma_tokens[i] == 0) return 0;
+        if (dma_map_set_state(g_tx_dma_tokens[i], DMA_STATE_IN_FLIGHT) != SYSCALL_OK) return 0;
+    }
+    return 1;
 }
 
 static int prime_rx_queue(void) {
@@ -527,6 +555,7 @@ static int init_virtio(void) {
     g_common_base = VIRTIO_MMIO_BASE_VA + g_boot.common_page_offset;
     g_notify_base = VIRTIO_MMIO_BASE_VA + 0x1000 + g_boot.notify_page_offset;
     g_isr_base = g_boot.isr_page_paddr != 0 ? VIRTIO_MMIO_BASE_VA + 0x2000 + g_boot.isr_page_offset : 0;
+    g_device_base = g_boot.device_page_paddr != 0 ? VIRTIO_MMIO_BASE_VA + 0x3000 + g_boot.device_page_offset : 0;
 
     mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, 0);
     mmio_write_u8(g_common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
@@ -546,16 +575,19 @@ static int init_virtio(void) {
 }
 
 static void poll_rx_queue_for_tx_wait(void);
+static void poll_rx_queue(void);
+static void fulfill_pending_read(void);
+static void handle_console_connect_transfer(u64 transfer_id);
 static int poll_tx_queue(void);
 static int pump_tx_queue(void);
-static void pump_tx_queue_budget(u64 budget);
+static int pump_tx_queue_budget(u64 budget);
 
 static int send_bytes(const u8 *bytes, u64 len) {
     if (len == 0 || len > TX_BUFFER_BYTES) return 0;
-    memcpy((void *)TX_BUFFER_VA, bytes, len);
+    memcpy((void *)tx_buffer_va(0), bytes, len);
 
     volatile struct virtq_desc *desc = desc_ptr(&g_tx_queue, 0);
-    desc->addr = g_tx_buffer_paddr;
+    desc->addr = g_tx_buffer_paddrs[0];
     desc->len = (u32)len;
     desc->flags = 0;
     desc->next = 0;
@@ -583,40 +615,77 @@ static void tx_ring_drop_oldest(u64 bytes) {
     g_tx_ring_len -= bytes;
 }
 
-static void tx_ring_push_byte(u8 byte) {
-    if (g_tx_ring_len >= TX_RING_BYTES) tx_ring_drop_oldest(1);
+static u64 tx_ring_free(void) {
+    return TX_RING_BYTES - g_tx_ring_len;
+}
+
+static u64 tx_pending_bytes(void) {
+    u64 pending = g_tx_ring_len;
+    for (u64 i = 0; i < TX_BUFFER_COUNT; i++) pending += g_tx_inflight_len[i];
+    return pending;
+}
+
+static int tx_ring_push_byte(u8 byte) {
+    if (g_tx_ring_len >= TX_RING_BYTES) return 0;
     const u64 tail = (g_tx_ring_head + g_tx_ring_len) % TX_RING_BYTES;
     g_tx_ring[tail] = byte;
     g_tx_ring_len++;
+    return 1;
 }
 
-static void tx_ring_push_volatile(volatile u8 *src, u64 len) {
-    for (u64 i = 0; i < len; i++) tx_ring_push_byte(src[i]);
+static u64 tx_ring_try_push_volatile(volatile u8 *src, u64 len) {
+    u64 done = 0;
+    pump_tx_queue_budget(TX_PUSH_PUMP_BUDGET);
+    while (done < len && tx_ring_free() != 0 && tx_pending_bytes() < TX_ACCEPT_HIGH_WATER_BYTES) {
+        if (!tx_ring_push_byte(src[done])) break;
+        done++;
+    }
+    pump_tx_queue_budget(TX_PUSH_PUMP_BUDGET);
+    return done;
 }
 
-static u64 tx_ring_copy_head_to_buffer(u64 max_len) {
+static u64 tx_ring_copy_head_to_buffer(u64 buffer_index, u64 max_len) {
     const u64 n = g_tx_ring_len < max_len ? g_tx_ring_len : max_len;
-    u8 *dst = (u8 *)TX_BUFFER_VA;
+    u8 *dst = (u8 *)tx_buffer_va(buffer_index);
     for (u64 i = 0; i < n; i++) dst[i] = g_tx_ring[(g_tx_ring_head + i) % TX_RING_BYTES];
     return n;
 }
 
+static int tx_desc_busy(u64 index) {
+    return (g_tx_inflight_mask & (1ULL << index)) != 0;
+}
+
+static int tx_find_free_desc(u64 *index_out) {
+    for (u64 i = 0; i < TX_BUFFER_COUNT; i++) {
+        if (!tx_desc_busy(i)) {
+            *index_out = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int tx_start_if_idle(void) {
-    if (g_tx_inflight || g_tx_ring_len == 0) return 0;
-    const u64 len = tx_ring_copy_head_to_buffer(TX_BUFFER_BYTES);
+    if (g_tx_ring_len == 0) return 0;
+    u64 desc_index = 0;
+    if (!tx_find_free_desc(&desc_index)) return 0;
+
+    const u64 len = tx_ring_copy_head_to_buffer(desc_index, TX_BUFFER_BYTES);
     if (len == 0) return 0;
 
-    volatile struct virtq_desc *desc = desc_ptr(&g_tx_queue, 0);
-    desc->addr = g_tx_buffer_paddr;
+    volatile struct virtq_desc *desc = desc_ptr(&g_tx_queue, desc_index);
+    desc->addr = g_tx_buffer_paddrs[desc_index];
     desc->len = (u32)len;
     desc->flags = 0;
     desc->next = 0;
     if (queue_submit(g_tx_queue.submit_token, g_tx_queue.index) != SYSCALL_OK) return 0;
-    queue_push_avail(&g_tx_queue, 0);
+    queue_push_avail(&g_tx_queue, (u16)desc_index);
     if (queue_notify(g_tx_queue.notify_token, g_tx_queue.index) != SYSCALL_OK) return 0;
     mmio_write_u16(g_tx_queue.notify_addr, g_tx_queue.index);
-    g_tx_inflight = 1;
-    g_tx_inflight_len = len;
+    g_tx_inflight_mask |= 1ULL << desc_index;
+    g_tx_inflight_count++;
+    g_tx_inflight_len[desc_index] = len;
+    tx_ring_drop_oldest(len);
     return 1;
 }
 
@@ -624,12 +693,13 @@ static int poll_tx_queue(void) {
     int progress = 0;
     while (*used_idx_ptr(&g_tx_queue) != g_tx_queue.last_used_idx) {
         if (g_isr_base != 0) (void)mmio_read_u8(g_isr_base);
-        (void)used_ring_ptr(&g_tx_queue)[g_tx_queue.last_used_idx % QUEUE_SIZE];
+        volatile struct virtq_used_elem *used = &used_ring_ptr(&g_tx_queue)[g_tx_queue.last_used_idx % QUEUE_SIZE];
+        const u64 desc_index = (u64)(used->id % QUEUE_SIZE);
         g_tx_queue.last_used_idx++;
-        if (g_tx_inflight) {
-            tx_ring_drop_oldest(g_tx_inflight_len);
-            g_tx_inflight = 0;
-            g_tx_inflight_len = 0;
+        if (desc_index < TX_BUFFER_COUNT && tx_desc_busy(desc_index)) {
+            g_tx_inflight_mask &= ~(1ULL << desc_index);
+            if (g_tx_inflight_count != 0) g_tx_inflight_count--;
+            g_tx_inflight_len[desc_index] = 0;
         }
         progress = 1;
     }
@@ -638,14 +708,17 @@ static int poll_tx_queue(void) {
 
 static int pump_tx_queue(void) {
     int progress = poll_tx_queue();
-    if (tx_start_if_idle()) progress = 1;
+    while (tx_start_if_idle()) progress = 1;
     return progress;
 }
 
-static void pump_tx_queue_budget(u64 budget) {
+static int pump_tx_queue_budget(u64 budget) {
+    int progress = 0;
     for (u64 i = 0; i < budget; i++) {
         if (!pump_tx_queue()) break;
+        progress = 1;
     }
+    return progress;
 }
 
 static struct console_request_header *request_header(void) {
@@ -723,8 +796,9 @@ static void reset_input_state(void) {
     g_rx_ring_len = 0;
     g_tx_ring_head = 0;
     g_tx_ring_len = 0;
-    g_tx_inflight = 0;
-    g_tx_inflight_len = 0;
+    g_tx_inflight_mask = 0;
+    g_tx_inflight_count = 0;
+    for (u64 i = 0; i < TX_BUFFER_COUNT; i++) g_tx_inflight_len[i] = 0;
     g_pending_read_seq = 0;
     g_pending_read_max_len = 0;
 }
@@ -840,11 +914,13 @@ static void handle_console_request(void) {
         }
     } else if (request->op == CONSOLE_OP_WRITE) {
         const u64 len = request->length < CONSOLE_REQUEST_PAYLOAD_BYTES ? request->length : CONSOLE_REQUEST_PAYLOAD_BYTES;
-        tx_ring_push_volatile(request_payload(), len);
-        pump_tx_queue_budget(4);
-        write_console_response(CONSOLE_OP_WRITE, seq, CONSOLE_STATUS_OK, 0, len, 0);
+        const u64 done = tx_ring_try_push_volatile(request_payload(), len);
+        write_console_response(CONSOLE_OP_WRITE, seq, done == len ? CONSOLE_STATUS_OK : CONSOLE_STATUS_AGAIN, 0, done, tx_ring_free());
     } else if (request->op == CONSOLE_OP_GET_ATTR) {
-        write_console_response(CONSOLE_OP_GET_ATTR, seq, CONSOLE_STATUS_OK, 0, 120, 40);
+        u64 columns = 0;
+        u64 rows = 0;
+        virtio_console_get_size(&columns, &rows);
+        write_console_response(CONSOLE_OP_GET_ATTR, seq, CONSOLE_STATUS_OK, 0, columns, rows);
     } else if (request->op == CONSOLE_OP_SET_ATTR) {
         write_console_response(CONSOLE_OP_SET_ATTR, seq, CONSOLE_STATUS_OK, 0, 0, 0);
     } else if (request->op == CONSOLE_OP_CONNECT) {
@@ -876,7 +952,6 @@ static void drain_rx_queue(int fulfill_pending) {
         mmio_write_u16(g_rx_queue.notify_addr, g_rx_queue.index);
     }
     if (g_isr_base != 0) (void)mmio_read_u8(g_isr_base);
-    pump_tx_queue_budget(4);
 }
 
 static void poll_rx_queue_for_tx_wait(void) {
@@ -901,13 +976,18 @@ void virtio_console_main(void) {
     user_log("VirtioConsole: ready\n");
 
     for (;;) {
-        pump_tx_queue_budget(16);
+        handle_console_request();
         poll_rx_queue();
         fulfill_pending_read();
+        const int tx_progress = pump_tx_queue_budget(TX_LOOP_PUMP_BUDGET);
+
         u64 received = 0;
-        if (!g_tx_inflight && g_tx_ring_len == 0) received = wait_event(1, 1);
+        if ((g_tx_inflight_count == 0 && g_tx_ring_len == 0) || !tx_progress) received = wait_event(1, 1);
         if (received >= CAP_TRANSFER_ID_MIN) handle_console_connect_transfer(received);
+
         handle_console_request();
-        pump_tx_queue_budget(16);
+        poll_rx_queue();
+        fulfill_pending_read();
+        (void)pump_tx_queue_budget(TX_LOOP_PUMP_BUDGET);
     }
 }

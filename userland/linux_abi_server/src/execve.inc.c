@@ -1249,6 +1249,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
         )) return reply(errno_io(), 0);
         if (g_proc) {
             close_cloexec_fds_for_execve();
+            clear_process_timers(g_proc);
             g_proc->principal = 0;
             g_proc->exec_pending = 1;
             g_proc->exec_pending_principal = spawned_principal;
@@ -1266,6 +1267,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     execve_profile_flush();
     if (g_proc) {
         close_cloexec_fds_for_execve();
+        clear_process_timers(g_proc);
         g_proc->principal = 0;
         g_proc->exec_pending = 1;
         g_proc->exec_pending_principal = spawned_principal;

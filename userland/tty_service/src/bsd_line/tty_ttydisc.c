@@ -97,8 +97,8 @@ static void bsd_ttydisc_init_defaults(struct bsd_tty *tp) {
     tp->termios.cc[TTY_CC_VSUSP] = 26;
     tp->termios.cc[TTY_CC_VREPRINT] = 18;
     tp->termios.cc[TTY_CC_VWERASE] = 23;
-    tp->termios.columns = 120;
-    tp->termios.rows = 40;
+    tp->termios.columns = 80;
+    tp->termios.rows = 24;
     tp->input_prev_was_cr = 0;
     tp->output_prev_was_cr = 0;
     tp->eof_pending = 0;
@@ -119,8 +119,11 @@ static int bsd_ttydisc_is_cc(const struct bsd_tty *tp, u64 index, u8 byte) {
     return index < TTY_CC_COUNT && tp->termios.cc[index] != 0 && tp->termios.cc[index] == byte;
 }
 
+static char g_bsd_ttydisc_output_buf[CONSOLE_REQUEST_PAYLOAD_BYTES];
+static char g_bsd_ttydisc_write_buf[CONSOLE_REQUEST_PAYLOAD_BYTES];
+
 static u64 bsd_ttydisc_output(struct bsd_tty *tp, const char *bytes, u64 len) {
-    char out[256];
+    char *out = g_bsd_ttydisc_output_buf;
     u64 done = 0;
     u64 out_len = 0;
     const int onlcr = (tp->termios.oflag & (TTY_OFLAG_OPOST | TTY_OFLAG_ONLCR)) == (TTY_OFLAG_OPOST | TTY_OFLAG_ONLCR);
@@ -128,13 +131,13 @@ static u64 bsd_ttydisc_output(struct bsd_tty *tp, const char *bytes, u64 len) {
     while (done < len) {
         const char b = bytes[done];
         if (onlcr && b == '\n' && !tp->output_prev_was_cr) {
-            if (out_len == sizeof(out)) {
+            if (out_len == CONSOLE_REQUEST_PAYLOAD_BYTES) {
                 if (backend_write_bytes(out, out_len) != out_len) return done;
                 out_len = 0;
             }
             out[out_len++] = '\r';
         }
-        if (out_len == sizeof(out)) {
+        if (out_len == CONSOLE_REQUEST_PAYLOAD_BYTES) {
             if (backend_write_bytes(out, out_len) != out_len) return done;
             out_len = 0;
         }
@@ -294,10 +297,10 @@ static u64 bsd_ttydisc_read(struct bsd_tty *tp, volatile u8 *dst, u64 max_len) {
 }
 
 static u64 bsd_ttydisc_write(struct bsd_tty *tp, volatile u8 *payload, u64 len) {
-    char buf[256];
+    char *buf = g_bsd_ttydisc_write_buf;
     u64 done = 0;
     while (done < len) {
-        const u64 chunk = min_u64(len - done, sizeof(buf));
+        const u64 chunk = min_u64(len - done, CONSOLE_REQUEST_PAYLOAD_BYTES);
         for (u64 i = 0; i < chunk; i++) buf[i] = (char)payload[done + i];
         const u64 written = bsd_ttydisc_output(tp, buf, chunk);
         if (written != chunk) break;

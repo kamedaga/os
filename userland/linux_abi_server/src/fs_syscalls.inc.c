@@ -444,7 +444,7 @@ static struct ipc_message handle_read(const struct trap_request *req) {
     }
     if (g_fds[fd].kind == FD_TTY) {
         int fault = 0;
-        const u64 n = console_read_to_target(dst, len, &fault);
+        const u64 n = console_read_to_target(dst, len, &fault, g_fds[fd].fd_flags);
         return reply(fault ? errno_fault() : n, 0);
     }
     if (g_fds[fd].kind == FD_PIPE_READ) {
@@ -572,8 +572,9 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
             if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
             if (pair[1] == 0) continue;
             int fault = 0;
-            const u64 n = console_read_to_target(pair[0], pair[1], &fault);
+            const u64 n = console_read_to_target(pair[0], pair[1], &fault, g_fds[fd].fd_flags);
             if (fault) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+            if ((i64)n < 0) return total != 0 ? reply(total, 0) : reply(n, 0);
             total += n;
             if (n != pair[1]) break;
         }
@@ -784,26 +785,36 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
         u64 pair[2];
         if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
         const u64 src = pair[0]; const u64 len = pair[1];
-        u64 done = 0;
+        if (len == 0) continue;
+
         if (g_fds[fd].kind == FD_STDIO && !(fd_valid(0) && g_fds[0].kind == FD_TTY)) {
+            u64 done = 0;
             while (done < len) {
                 char buf[129]; u64 chunk = min_u64(len - done, 128);
-                if (copy_from_target(src + done, buf, chunk) != chunk) return reply(errno_fault(), 0);
+                if (copy_from_target(src + done, buf, chunk) != chunk) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
                 user_log_len(buf, chunk);
                 done += chunk;
             }
-        }
-        if (g_fds[fd].kind == FD_STDIO && fd_valid(0) && g_fds[0].kind == FD_TTY) {
-            int ignored_fault = 0;
-            (void)console_write_from_target(src, len, &ignored_fault);
-        }
-        if (g_fds[fd].kind == FD_TTY) {
-            int ignored_fault = 0;
-            (void)console_write_from_target(src, len, &ignored_fault);
             total += len;
             continue;
         }
-        total += len;
+
+        if (g_fds[fd].kind == FD_STDIO && fd_valid(0) && g_fds[0].kind == FD_TTY) {
+            int fault = 0;
+            const u64 n = console_write_from_target(src, len, &fault);
+            if (fault) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+            if ((i64)n < 0) return total != 0 ? reply(total, 0) : reply(n, 0);
+            total += n;
+            if (n != len) break;
+            continue;
+        }
+
+        int fault = 0;
+        const u64 n = console_write_from_target(src, len, &fault);
+        if (fault) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+        if ((i64)n < 0) return total != 0 ? reply(total, 0) : reply(n, 0);
+        total += n;
+        if (n != len) break;
     }
     return reply(total, 0);
 }
@@ -1074,7 +1085,7 @@ static struct ipc_message handle_rt_sigaction(const struct trap_request *req) {
         u64 out[4];
         out[0] = g_proc->sig_handler[signo];
         out[1] = g_proc->sig_flags[signo];
-        out[2] = 0;
+        out[2] = g_proc->sig_restorer[signo];
         out[3] = 0;
         if (copy_to_target(oldact_va, out, sizeof(out)) != sizeof(out)) return reply(errno_fault(), 0);
     }
@@ -1083,31 +1094,136 @@ static struct ipc_message handle_rt_sigaction(const struct trap_request *req) {
         if (copy_from_target(act_va, in, sizeof(in)) != sizeof(in)) return reply(errno_fault(), 0);
         g_proc->sig_handler[signo] = in[0];
         g_proc->sig_flags[signo] = in[1];
+        g_proc->sig_restorer[signo] = in[2];
     }
     return reply(0, 0);
 }
 
+static struct ipc_message handle_rt_sigreturn(const struct trap_request *req) {
+    if (req->rsp == 0) return reply(errno_fault(), 0);
+    struct linux_signal_frame_body body;
+    if (copy_from_target(req->rsp, &body, sizeof(body)) != sizeof(body)) return reply(errno_fault(), 0);
+    if (body.magic != LINUX_SIGNAL_FRAME_MAGIC) {
+        return reply(errno_inval(), 0);
+    }
+    const u64 target = abi_reply_target_principal();
+    const u64 status = reply_trap_target_context(target, &body.saved_context);
+    if (status != SYSCALL_OK) return reply(errno_io(), 0);
+    abi_set_reply_target_principal(0);
+    (void)detach_reply_token();
+    return wait_ipc_timeout(1);
+}
+
 static struct ipc_message handle_rt_sigprocmask(const struct trap_request *req) {
+    const u64 how = req->args[0];
+    const u64 set_va = req->args[1];
     const u64 oldset_va = req->args[2];
+    const u64 sigset_size = req->args[3];
+    if (sigset_size != 0 && sigset_size < sizeof(u64)) return reply(errno_inval(), 0);
     if (oldset_va != 0) {
-        const u64 empty = 0;
-        if (copy_to_target(oldset_va, &empty, sizeof(empty)) != sizeof(empty)) return reply(errno_fault(), 0);
+        if (copy_to_target(oldset_va, &g_proc->blocked_signals, sizeof(g_proc->blocked_signals)) != sizeof(g_proc->blocked_signals)) return reply(errno_fault(), 0);
+    }
+    if (set_va != 0) {
+        u64 set_word = 0;
+        if (copy_from_target(set_va, &set_word, sizeof(set_word)) != sizeof(set_word)) return reply(errno_fault(), 0);
+        set_word &= ~linux_unblockable_signal_mask();
+        if (how == SIG_BLOCK) {
+            g_proc->blocked_signals |= set_word;
+        } else if (how == SIG_UNBLOCK) {
+            g_proc->blocked_signals &= ~set_word;
+        } else if (how == SIG_SETMASK) {
+            g_proc->blocked_signals = set_word;
+        } else {
+            return reply(errno_inval(), 0);
+        }
     }
     return reply(0, 0);
+}
+
+static void fill_sigwait_info(struct linux_siginfo *info, u64 signo) {
+    u8 *p = (u8 *)info;
+    for (u64 i = 0; i < sizeof(*info); i++) p[i] = 0;
+    info->si_signo = (i32)signo;
+    info->si_code = SI_TIMER;
+}
+
+static void clear_pending_sigwait(struct linux_process_state *proc) {
+    proc->sigwait_pending = 0;
+    proc->sigwait_set = 0;
+    proc->sigwait_info_va = 0;
+    proc->sigwait_deadline_tick = 0;
+}
+
+static void try_satisfy_pending_sigwaits(void) {
+    const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *proc = &g_processes[i];
+        if (!proc->used || proc->exec_pending || !proc->sigwait_pending) continue;
+        process_timers_update(proc);
+        u64 result = 0;
+        u64 signo = dequeue_pending_signal_matching(proc, proc->sigwait_set);
+        if (signo != 0) {
+            if (proc->sigwait_info_va != 0) {
+                struct linux_siginfo info;
+                fill_sigwait_info(&info, signo);
+                if (copy_to_trap_target(proc->principal, proc->sigwait_info_va, &info, sizeof(info)) != sizeof(info)) {
+                    result = errno_fault();
+                } else {
+                    result = signo;
+                }
+            } else {
+                result = signo;
+            }
+        } else if (proc->sigwait_deadline_tick != 0 && now >= proc->sigwait_deadline_tick) {
+            result = errno_again();
+        } else {
+            continue;
+        }
+        const u64 principal = proc->principal;
+        clear_pending_sigwait(proc);
+        (void)reply_trap_target(principal, result, 0);
+    }
 }
 
 static struct ipc_message handle_rt_sigtimedwait(const struct trap_request *req) {
     const u64 set_va = req->args[0];
+    const u64 info_va = req->args[1];
     const u64 timeout_va = req->args[2];
+    const u64 sigset_size = req->args[3];
     if (set_va == 0) return reply(errno_fault(), 0);
+    if (sigset_size != 0 && sigset_size < sizeof(u64)) return reply(errno_inval(), 0);
     u64 set_word = 0;
     if (copy_from_target(set_va, &set_word, sizeof(set_word)) != sizeof(set_word)) return reply(errno_fault(), 0);
+    process_timers_update(g_proc);
+    u64 signo = dequeue_pending_signal_matching(g_proc, set_word);
+    if (signo != 0) {
+        if (info_va != 0) {
+            struct linux_siginfo info;
+            fill_sigwait_info(&info, signo);
+            if (copy_to_target(info_va, &info, sizeof(info)) != sizeof(info)) return reply(errno_fault(), 0);
+        }
+        return reply(signo, 0);
+    }
+    u64 timeout_ticks = 0;
+    int timed = timeout_va != 0;
     if (timeout_va != 0) {
         i64 timeout[2];
         if (copy_from_target(timeout_va, timeout, sizeof(timeout)) != sizeof(timeout)) return reply(errno_fault(), 0);
         if (timeout[0] < 0 || timeout[1] < 0 || timeout[1] >= 1000000000LL) return reply(errno_inval(), 0);
+        timeout_ticks = (u64)timeout[0] * 1000ULL + ((u64)timeout[1] + 999999ULL) / 1000000ULL;
+        if (timeout_ticks == 0) return reply(errno_again(), 0);
     }
-    return reply(errno_again(), 0);
+    if (g_proc->sigwait_pending) return reply(errno_again(), 0);
+    g_proc->sigwait_pending = 1;
+    g_proc->sigwait_set = set_word;
+    g_proc->sigwait_info_va = info_va;
+    g_proc->sigwait_deadline_tick = timed ? syscall0(SYSCALL_GET_TICK_COUNT) + timeout_ticks : 0;
+    const u64 detach_status = detach_reply_token();
+    if (detach_status != SYSCALL_OK) {
+        clear_pending_sigwait(g_proc);
+        return reply(errno_again(), 0);
+    }
+    return wait_ipc_timeout(1);
 }
 
 static struct ipc_message handle_sigaltstack(const struct trap_request *req) {

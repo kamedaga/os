@@ -90,18 +90,82 @@ static struct ipc_message handle_epoll_create1(const struct trap_request *req) {
     return reply((u64)fd, 0);
 }
 
+enum { EPOLL_CTL_ADD = 1, EPOLL_CTL_DEL = 2, EPOLL_CTL_MOD = 3 };
+
+static int read_epoll_event(u64 event_va, u32 *events_out, u64 *data_out) {
+    u32 events = 0;
+    u64 data = 0;
+    if (event_va == 0) return 0;
+    if (copy_from_target(event_va, &events, sizeof(events)) != sizeof(events)) return 0;
+    if (copy_from_target(event_va + 4, &data, sizeof(data)) != sizeof(data)) return 0;
+    *events_out = events;
+    *data_out = data;
+    return 1;
+}
+
+static int write_epoll_event(u64 event_va, u32 events, u64 data) {
+    return copy_to_target(event_va, &events, sizeof(events)) == sizeof(events) &&
+        copy_to_target(event_va + 4, &data, sizeof(data)) == sizeof(data);
+}
+
 static struct ipc_message handle_epoll_ctl(const struct trap_request *req) {
     const u64 epfd = req->args[0];
+    const u64 op = req->args[1];
     const u64 fd = req->args[2];
+    const u64 event_va = req->args[3];
     if (!fd_valid(epfd) || g_fds[epfd].kind != FD_EPOLL) return reply(errno_badf(), 0);
-    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    if (op != EPOLL_CTL_DEL && !fd_valid(fd)) return reply(errno_badf(), 0);
+    if (op == EPOLL_CTL_DEL) {
+        g_fds[epfd].token = 0;
+        g_fds[epfd].mode_bits = 0;
+        g_fds[epfd].offset = 0;
+        return reply(0, 0);
+    }
+    if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD) return reply(errno_inval(), 0);
+    u32 events = 0;
+    u64 data = 0;
+    if (!read_epoll_event(event_va, &events, &data)) return reply(errno_fault(), 0);
+    g_fds[epfd].token = fd + 1;
+    g_fds[epfd].mode_bits = events;
+    g_fds[epfd].offset = data;
     return reply(0, 0);
 }
 
 static struct ipc_message handle_epoll_wait(const struct trap_request *req) {
     const u64 epfd = req->args[0];
+    const u64 events_va = req->args[1];
+    const u64 maxevents = req->args[2];
+    const i32 timeout_ms = (i32)(u32)req->args[3];
     if (!fd_valid(epfd) || g_fds[epfd].kind != FD_EPOLL) return reply(errno_badf(), 0);
-    return reply(0, 0);
+    if (events_va == 0 || maxevents == 0) return reply(errno_inval(), 0);
+
+    u64 wait_limit = 0;
+    int immediate = 0;
+    if (timeout_ms == 0) {
+        immediate = 1;
+    } else if (timeout_ms < 0) {
+        wait_limit = LINUX_ABI_WAIT_FOREVER;
+    } else {
+        wait_limit = poll_timeout_ms_to_ticks((u64)(u32)timeout_ms);
+    }
+
+    const u64 start_tick = (!immediate && wait_limit != LINUX_ABI_WAIT_FOREVER) ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+    for (u64 attempt = 0;; attempt++) {
+        const u64 watched = g_fds[epfd].token;
+        if (watched != 0) {
+            const u64 fd = watched - 1;
+            if (!fd_valid(fd)) return reply(errno_badf(), 0);
+            const u16 revents = fd_poll_revents(fd, (u16)g_fds[epfd].mode_bits);
+            if (revents != 0) {
+                if (!write_epoll_event(events_va, revents, g_fds[epfd].offset)) return reply(errno_fault(), 0);
+                return reply(1, 0);
+            }
+        }
+        if (immediate || poll_wait_expired(wait_limit, start_tick)) return reply(0, 0);
+        if (process_itimer_real_expired(g_proc)) return reply(errno_intr(), 0);
+        (void)attempt;
+        poll_wait_one_tick();
+    }
 }
 
 static struct ipc_message handle_dup(const struct trap_request *req) {

@@ -76,6 +76,59 @@ static int wait_console_response(u64 expected_seq, u16 expected_op, u64 poll_lim
     return 0;
 }
 
+enum {
+    TTY_BACKEND_TX_RING_BYTES = 1048576,
+};
+
+static u8 g_backend_tx_ring[TTY_BACKEND_TX_RING_BYTES];
+static u64 g_backend_tx_head;
+static u64 g_backend_tx_len;
+static char g_backend_tx_flush_buf[CONSOLE_REQUEST_PAYLOAD_BYTES];
+static u64 g_backend_tx_pending_seq;
+static u64 g_backend_tx_pending_chunk;
+
+static void backend_tx_drop_oldest(u64 bytes) {
+    if (bytes > g_backend_tx_len) bytes = g_backend_tx_len;
+    g_backend_tx_head = (g_backend_tx_head + bytes) % TTY_BACKEND_TX_RING_BYTES;
+    g_backend_tx_len -= bytes;
+}
+
+static int backend_flush_output_once(void);
+static void backend_flush_output_budget(u64 budget);
+
+static int console_response_ready(u64 expected_seq, u16 expected_op) {
+    volatile struct console_response_header *response = response_at(g_console.response_va);
+    return response->response_seq == expected_seq &&
+        response->magic == CONSOLE_RESPONSE_MAGIC &&
+        response->version == CONSOLE_PROTOCOL_VERSION &&
+        response->op == expected_op;
+}
+
+static int backend_console_request_pending(void) {
+    return g_backend_tx_pending_seq != 0;
+}
+
+static int backend_tx_push_byte(u8 byte) {
+    if (g_backend_tx_len >= TTY_BACKEND_TX_HIGH_WATER_BYTES) {
+        (void)backend_flush_output_once();
+        if (g_backend_tx_len >= TTY_BACKEND_TX_HIGH_WATER_BYTES) return 0;
+    }
+    if (g_backend_tx_len >= TTY_BACKEND_TX_RING_BYTES) {
+        (void)backend_flush_output_once();
+        if (g_backend_tx_len >= TTY_BACKEND_TX_RING_BYTES) return 0;
+    }
+    const u64 tail = (g_backend_tx_head + g_backend_tx_len) % TTY_BACKEND_TX_RING_BYTES;
+    g_backend_tx_ring[tail] = byte;
+    g_backend_tx_len++;
+    return 1;
+}
+
+static u64 backend_tx_copy_head(char *dst, u64 max_len) {
+    const u64 n = g_backend_tx_len < max_len ? g_backend_tx_len : max_len;
+    for (u64 i = 0; i < n; i++) dst[i] = (char)g_backend_tx_ring[(g_backend_tx_head + i) % TTY_BACKEND_TX_RING_BYTES];
+    return n;
+}
+
 static int console_begin_request(u16 op, u32 length, u32 flags, const char *inline_src, u32 inline_bytes, u64 *seq_out) {
     if (!g_console.active || inline_bytes > CONSOLE_REQUEST_PAYLOAD_BYTES) return 0;
     clear_page(g_console.request_va);
@@ -135,25 +188,76 @@ static int backend_connect_console(void) {
     if (response->status != CONSOLE_STATUS_OK) return 0;
     g_console.next_seq = 2;
     g_console.active = 1;
+    g_backend_tx_head = 0;
+    g_backend_tx_len = 0;
+    g_backend_tx_pending_seq = 0;
+    g_backend_tx_pending_chunk = 0;
     user_log("TtyService: console connect ok\n");
     return 1;
 }
 
 static u64 backend_write_bytes(const char *bytes, u64 len) {
-    u64 done = 0;
-    while (done < len) {
-        const u64 chunk = min_u64(len - done, CONSOLE_REQUEST_PAYLOAD_BYTES);
-        u64 seq = 0;
-        if (!console_begin_request(CONSOLE_OP_WRITE, (u32)chunk, 0, bytes + done, (u32)chunk, &seq)) return done;
-        if (!wait_console_response(seq, CONSOLE_OP_WRITE, 8192)) return done;
-        volatile struct console_response_header *response = response_at(g_console.response_va);
-        if (response->status != CONSOLE_STATUS_OK) return done;
-        done += chunk;
+    for (u64 i = 0; i < len; i++) {
+        if (!backend_tx_push_byte((u8)bytes[i])) return i;
     }
-    return done;
+    return len;
+}
+
+static int backend_flush_output_once(void) {
+    if (g_backend_tx_pending_seq != 0) {
+        if (!console_response_ready(g_backend_tx_pending_seq, CONSOLE_OP_WRITE)) return 0;
+        volatile struct console_response_header *response = response_at(g_console.response_va);
+        const u64 chunk = g_backend_tx_pending_chunk;
+        const u64 accepted = response->arg0 <= chunk ? response->arg0 : 0;
+        if (accepted != 0) backend_tx_drop_oldest(accepted);
+        g_backend_tx_pending_seq = 0;
+        g_backend_tx_pending_chunk = 0;
+        return accepted != 0 || response->status == CONSOLE_STATUS_OK || response->status == CONSOLE_STATUS_AGAIN;
+    }
+    if (g_backend_tx_len == 0) return 0;
+    const u64 chunk = backend_tx_copy_head(g_backend_tx_flush_buf, CONSOLE_REQUEST_PAYLOAD_BYTES);
+    if (chunk == 0) return 0;
+    u64 seq = 0;
+    if (!console_begin_request(CONSOLE_OP_WRITE, (u32)chunk, 0, g_backend_tx_flush_buf, (u32)chunk, &seq)) return 0;
+    g_backend_tx_pending_seq = seq;
+    g_backend_tx_pending_chunk = chunk;
+    return 1;
+}
+
+static void backend_flush_output_budget(u64 budget) {
+    for (u64 i = 0; i < budget; i++) {
+        if (!backend_flush_output_once()) return;
+    }
+}
+
+static int backend_output_pending(void) {
+    return g_backend_tx_len != 0 || g_backend_tx_pending_seq != 0;
+}
+
+static int backend_write_ready(void) {
+    backend_flush_output_budget(TTY_FLUSH_ACTIVE_BUDGET);
+    return g_backend_tx_len < TTY_BACKEND_TX_HIGH_WATER_BYTES &&
+        g_backend_tx_len < TTY_BACKEND_TX_RING_BYTES;
+}
+
+static int backend_get_winsize(u16 *columns_out, u16 *rows_out) {
+    if (backend_console_request_pending()) return 0;
+    u64 seq = 0;
+    if (!console_begin_request(CONSOLE_OP_GET_ATTR, 0, 0, 0, 0, &seq)) return 0;
+    if (!wait_console_response(seq, CONSOLE_OP_GET_ATTR, 8192)) return 0;
+    volatile struct console_response_header *response = response_at(g_console.response_va);
+    if (response->status != CONSOLE_STATUS_OK) return 0;
+    if (response->arg0 == 0 || response->arg1 == 0 || response->arg0 > 0xffff || response->arg1 > 0xffff) return 0;
+    *columns_out = (u16)response->arg0;
+    *rows_out = (u16)response->arg1;
+    return 1;
 }
 
 static u64 backend_try_read_raw(void) {
+    if (backend_console_request_pending()) {
+        (void)backend_flush_output_once();
+        if (backend_console_request_pending()) return 0;
+    }
     u64 seq = 0;
     if (!console_begin_request(CONSOLE_OP_READ, CONSOLE_RESPONSE_PAYLOAD_BYTES,
             CONSOLE_REQUEST_FLAG_NONBLOCK, 0, 0, &seq)) {

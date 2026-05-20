@@ -92,6 +92,7 @@ const syscall_detach_abi_trap_reply_token: u64 = trap_abi.syscall_detach_abi_tra
 const syscall_share_abi_trap_reply_target_pages_to_target: u64 = trap_abi.syscall_share_abi_trap_reply_target_pages_to_target;
 const syscall_unmap_abi_trap_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_target_pages;
 const syscall_reserve_abi_trap_reply_target_pages: u64 = trap_abi.syscall_reserve_abi_trap_reply_target_pages;
+const syscall_reply_abi_trap_target_context: u64 = trap_abi.syscall_reply_abi_trap_target_context;
 
 const syscall_batch_max_pages: usize = 64;
 const user_log_max_bytes: usize = 256;
@@ -539,6 +540,7 @@ fn syscallNeedsKernelStateLock(nr: u64) bool {
         syscall_share_abi_trap_reply_target_pages_to_target,
         syscall_unmap_abi_trap_target_pages,
         syscall_reserve_abi_trap_reply_target_pages,
+        syscall_reply_abi_trap_target_context,
         process_abi.syscall_spawn_exec,
         process_builder_abi.syscall_create_suspended_process,
         process_builder_abi.syscall_map_vm_object_to_process,
@@ -605,6 +607,7 @@ fn kernelExecProfileName(nr: u64) ?[]const u8 {
         syscall_copy_from_abi_trap_reply_target => "abi_copy_from_reply_target",
         syscall_copy_to_abi_trap_reply_target => "abi_copy_to_reply_target",
         syscall_set_abi_trap_reply_target_fs_base => "abi_set_reply_fs_base",
+        syscall_reply_abi_trap_target_context => "abi_reply_target_context",
         syscall_protect_abi_trap_reply_target_pages => "abi_protect_reply_target_pages",
         syscall_unmap_abi_trap_reply_target_pages => "abi_unmap_reply_target_pages",
         syscall_reclaim_abi_trap_reply_target_private_pages => "abi_reclaim_reply_target_pages",
@@ -2147,6 +2150,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         },
         syscall_reply_abi_trap_target => {
             return abi_trap_runtime.replyToTarget(state, proc, frame.rdi, frame.rsi, frame.rdx);
+        },
+        syscall_reply_abi_trap_target_context => {
+            return abi_trap_runtime.replyToTargetContext(state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10);
         },
         syscall_detach_abi_trap_reply_token => {
             return detachCurrentAbiTrapReplyToken();

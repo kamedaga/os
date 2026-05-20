@@ -46,6 +46,7 @@ void dash_shim_main(void) {
         "HOME=/",
         "SHELL=/bin/dash",
         "TERM=ansi",
+        "VIMINIT=set directory=/tmp//",
         "PS1=# ",
         "CAPABILITYOS=1",
     };
@@ -55,7 +56,7 @@ void dash_shim_main(void) {
         .argv = argv,
         .argv_count = 2,
         .envp = envp,
-        .envp_count = 6,
+        .envp_count = 7,
         .wait_ticks = DASH_SHIM_WAIT_TICKS,
     };
 
