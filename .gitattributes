@@ -1,0 +1,10 @@
+/.gitattributes text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.zig text eol=lf
+*.md text eol=lf
+*.tla text eol=lf
+*.cfg text eol=lf
+*.cmd text eol=crlf
