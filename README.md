@@ -40,13 +40,14 @@ Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカ�
 また、muslだけでなく、musl変換レイヤーを介さずglibcの実行ファイルでhello, worldも成功してる(muslと比べたら不安定だと思われ)
 
 # python3(このOS上で動作 まだ内部での名前は旧称)
+```pycon
 Python 3.12.13 (main, Apr 10 2026, 14:16:05) [GCC 14.2.0] on linux
 Type "help", "copyright", "credits" or "license" for more information.
 >>> import os
 >>> print("os.uname():", os.uname())
 os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release='6.0.0-capabilityos', version='CapabilityOS Linux ABI', machine='x86_64')
 >>>
-
+```
 
 ## License
 
