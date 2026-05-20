@@ -10,11 +10,11 @@ musl libc と動的リンクにより、既存の Linux エコシステムとの
 - **Trap delegation** — syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーに委譲
 - **Hardware capabilities** — DMA バッファ・IOMMU マッピング・Virtqueue を capability として抽象化
 - **Linux ABI compatibility** — 無改造の musl libc を動的リンクでロードし、ユーザーランドで Linux syscall を処理
-- **Userland drivers** — virtio-blk / virtio-gpu ドライバはすべてユーザー空間で動作
-- **x86_64 support** — x86_64のみに対応 AArch64に対応予定
+- **Userland drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
+- **x86_64 support** — x86_64のみに対応 いずれAArch64に対応予定
 ## Design
 
-カーネルは Linux syscall の意味を持たない。fd table、errno、パス解決、filesystem semantics はすべてユーザーランドの `linux_abi_server` に閉じる。
+カーネルは Linux syscall の意味を持たない。
 
 カーネルの設計目標は 20,000 行以下。Lean 4 形式検証目標。
 
@@ -31,10 +31,8 @@ musl libc と動的リンクにより、既存の Linux エコシステムとの
 pactl setup full
 pactl run
 ```
+・[ビルド方法](pacha_docs/build.md) : 細かいビルドの方法や、動作確認されたバージョンなど
 
-`pactl setup` regenerates external runtime artifacts under `.artifacts/`.
-The public repository intentionally keeps only small base fixtures plus the
-included musl and dash runtime images under `userland/fixtures/`.
 ## Status
 
 Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカがマルチコアで動作し、apkから安定とは言えないけどパッケージを追加して動いています。(nano, w3m, cpython, lua, vimなど)
@@ -54,4 +52,4 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 
 CapabilityOS source code is licensed under the MIT License. Included or
 generated third-party runtime components are documented in
-`THIRD_PARTY_NOTICES.md`.
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
