@@ -39,7 +39,7 @@ Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカ�
 
 また、muslだけでなく、musl変換レイヤーを介さずglibcの実行ファイルでhello, worldも成功してる(muslと比べたら不安定だと思われ)
 
-# python3(このOS上で動作 まだ内部での名前は旧称)
+## python3 OS上で動作 
 ```pycon
 Python 3.12.13 (main, Apr 10 2026, 14:16:05) [GCC 14.2.0] on linux
 Type "help", "copyright", "credits" or "license" for more information.
