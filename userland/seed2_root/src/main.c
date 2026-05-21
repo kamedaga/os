@@ -67,6 +67,7 @@ enum {
     REPLY_ENDPOINT_ID = 0xEB,
     ROOTFS_VFS_ENDPOINT_ID = 0x90,
     LINUX_ABI_ENDPOINT_ID = 0x90,
+    LINUX_ABI_READY_ENDPOINT_ID = 0x94,
     ROOT_CONSOLE_ENDPOINT_ID = 0x88,
     ROOT_NET_ENDPOINT_ID = 0x89,
     TTY_SERVICE_ENDPOINT_ID = 0x8A,
@@ -197,6 +198,8 @@ struct linux_abi_bootstrap_config {
     u16 exec_path_bytes;
     u8 reserved0[6];
     char exec_path[LINUX_ABI_EXEC_PATH_BYTES];
+    u64 ready_endpoint_id;
+    u64 ready_process_slot;
 };
 
 struct backend_session {
@@ -1388,11 +1391,7 @@ static int startup_node_ready_after_spawn(struct startup_node *node) {
     }
     if (cstr_eq(node->provides, "linux_abi_server")) {
         volatile struct linux_abi_bootstrap_config *cfg = (volatile struct linux_abi_bootstrap_config *)g_linux_abi_config_va;
-        for (u64 i = 0; cfg != 0 && i < 100000; i++) {
-            if (cfg->status == LINUX_ABI_BOOTSTRAP_READY) return 1;
-            (void)wait_event_poll();
-        }
-        return 0;
+        return cfg != 0 && cfg->status == LINUX_ABI_BOOTSTRAP_READY;
     }
     if (cstr_eq(node->provides, "tty_service")) {
         if (syscall2(SYSCALL_SIGNAL_ENDPOINT, TTY_SERVICE_ENDPOINT_ID, 0) != SYSCALL_OK) return 0;
@@ -1541,6 +1540,8 @@ static int launch_linux_abi_server_node(struct startup_node *node, const struct 
     cfg->version = LINUX_ABI_BOOTSTRAP_VERSION;
     cfg->standard_interpreter_file_bytes = g_exec_interpreter_image.file_bytes;
     cfg->abi_trap_request_page_va = LINUX_ABI_BOOT_REQUEST_PAGE_VA;
+    cfg->ready_endpoint_id = LINUX_ABI_READY_ENDPOINT_ID;
+    cfg->ready_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
     copy_cstr_limited(cfg->exec_path, LINUX_ABI_EXEC_PATH_BYTES, "/cmd/dash_interactive.elf", &cfg->exec_path_bytes);
 
     static struct bootstrap_descriptor_table table;

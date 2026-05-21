@@ -274,10 +274,6 @@ static void abort_process(u64 process_token) {
     if (is_process_builder_token(process_token)) (void)syscall1(SYSCALL_ABORT_PROCESS, process_token);
 }
 
-static int map_vm_object_to_process(u64 process_token, u64 vm_token, u64 target_va, u64 prot_bits) {
-    return syscall4(SYSCALL_MAP_VM_OBJECT_TO_PROCESS, process_token, vm_token, target_va, prot_bits) == SYSCALL_OK;
-}
-
 static int alloc_map_pages_to_process(u64 process_token, u64 target_va, u64 page_count, u64 prot_bits) {
     return syscall5(SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS, process_token, target_va, page_count, prot_bits, 0) == SYSCALL_OK;
 }
@@ -452,24 +448,6 @@ static int tracker_add(struct child_map_tracker *tracker, u64 page_va) {
     return 1;
 }
 
-static int tracker_has_range_overlap(const struct child_map_tracker *tracker, u64 start_va, u64 page_count) {
-    for (u64 i = 0; i < page_count; i++) {
-        u64 page_va;
-        if (!add_u64(start_va, i * PAGE_BYTES, &page_va)) return 1;
-        if (tracker_contains(tracker, page_va)) return 1;
-    }
-    return 0;
-}
-
-static int tracker_add_range(struct child_map_tracker *tracker, u64 start_va, u64 page_count) {
-    for (u64 i = 0; i < page_count; i++) {
-        u64 page_va;
-        if (!add_u64(start_va, i * PAGE_BYTES, &page_va)) return 0;
-        if (!tracker_add(tracker, page_va)) return 0;
-    }
-    return 1;
-}
-
 static struct child_map_tracker *tracker_reset(void) {
     struct child_map_tracker *tracker = &child_map_tracker_storage;
     for (u64 i = 0; i < MAX_CHILD_MAPPED_PAGES; i++) tracker->pages[i] = 0;
@@ -479,14 +457,6 @@ static struct child_map_tracker *tracker_reset(void) {
 
 static int ranges_overlap(u64 a_start, u64 a_end, u64 b_start, u64 b_end) {
     return a_start < b_end && b_start < a_end;
-}
-
-static u64 prot_bits_from_phdr(const struct exec_elf_program_header *phdr) {
-    u64 bits = 0;
-    if ((phdr->flags & EXEC_ELF_PF_R) != 0) bits |= 1ULL << 0;
-    if ((phdr->flags & EXEC_ELF_PF_W) != 0) bits |= 1ULL << 1;
-    if ((phdr->flags & EXEC_ELF_PF_X) != 0) bits |= 1ULL << 2;
-    return bits;
 }
 
 static void zero_bytes(unsigned char *dst, u64 len) {

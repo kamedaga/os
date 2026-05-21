@@ -1,3 +1,11 @@
+static void signal_bootstrap_ready(volatile struct linux_abi_bootstrap_config *cfg) {
+    const u64 endpoint_id = cfg->ready_endpoint_id != 0 ? cfg->ready_endpoint_id : LINUX_ABI_READY_ENDPOINT_ID;
+    if (endpoint_id == 0 || cfg->ready_process_slot == 0) return;
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, cfg->ready_process_slot) == SYSCALL_OK) {
+        (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, endpoint_id, 0);
+    }
+}
+
 void linux_abi_main(void) {
     volatile struct linux_abi_bootstrap_config *cfg = (volatile struct linux_abi_bootstrap_config *)LINUX_ABI_CONFIG_TARGET_VA;
     if (cfg->magic != LINUX_ABI_BOOTSTRAP_MAGIC ||
@@ -22,6 +30,7 @@ void linux_abi_main(void) {
     if (!connect_console_from_registry()) user_log("LinuxAbiServer: console connect skipped\n");
     init_process_tables();
     cfg->status = LINUX_ABI_BOOTSTRAP_READY;
+    signal_bootstrap_ready(cfg);
     user_log("LinuxAbiServer: started\n");
     prime_reply_return_signal();
     struct ipc_message msg = reply(0, 0);

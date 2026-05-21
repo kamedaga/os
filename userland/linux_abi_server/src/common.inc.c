@@ -486,6 +486,7 @@ enum {
     LINUX_ABI_CONFIG_TARGET_VA = 0x3C002000,
     LINUX_ABI_ENDPOINT_ID = 0x90,
     LINUX_ABI_SELF_WAKE_ENDPOINT_ID = 0x91,
+    LINUX_ABI_READY_ENDPOINT_ID = 0x94,
     EXECVE_MAIN_IMAGE_VA = 0x14000000,
     EXECVE_LD_IMAGE_VA = 0x26200000,
     EXECVE_CONFIG_VA = 0x26400000,
@@ -878,6 +879,8 @@ struct linux_abi_bootstrap_config {
     u16 exec_path_bytes;
     u8 reserved0[6];
     char exec_path[128];
+    u64 ready_endpoint_id;
+    u64 ready_process_slot;
 };
 
 enum { LINUX_SYSCALL_PROFILE_COUNT = 335, FS_PROFILE_OP_COUNT = 33, NET_PROFILE_OP_COUNT = 12, NET_WAIT_CONTEXT_COUNT = 8 };
