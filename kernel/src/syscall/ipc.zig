@@ -172,7 +172,7 @@ pub fn recvAnyCapTransferImmediate(state: *kernel.KernelState, proc: kernel.Prin
         kernel.KernelError.MailboxEmpty => return .pending,
         else => return .{ .ready = sc.syscall_err_send },
     };
-    return if (received >= abi_root.cap_transfer_abi.transfer_id_min)
+    return if (received >= kernel.cap_transfer_id_min)
         .{ .ready = received }
     else
         .pending;

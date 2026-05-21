@@ -14,7 +14,6 @@ const halt = @import("../halt.zig");
 
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
 const service_registry_abi = boot_abi.service_registry_abi;
-const boot_manifest_abi = boot_abi.boot_manifest_abi;
 
 pub const MmioPageWithOffset = struct {
     page_paddr: u64,
@@ -233,7 +232,7 @@ pub fn publishInitBootstrapDescriptorPage(
     page.magic = init_bootstrap_abi.magic;
     page.version = init_bootstrap_abi.version;
     page.spawn_page_count = init_bootstrap_layout.builtin_spawn_pages.len;
-    page.boot_image_count = boot_manifest_abi.builtin_boot_images.len;
+    page.boot_image_count = init_bootstrap_abi.builtin_boot_images.len;
     page.bootfs_archive = .{
         .flags = init_bootstrap_abi.boot_archive_flag_present,
         .image_va = init_bootstrap_layout.bootfs_image_va,
@@ -259,7 +258,7 @@ pub fn publishInitBootstrapDescriptorPage(
     }
 
     var boot_image_idx: usize = 0;
-    while (boot_image_idx < boot_manifest_abi.max_boot_image_descriptors) : (boot_image_idx += 1) {
+    while (boot_image_idx < init_bootstrap_abi.max_boot_image_descriptors) : (boot_image_idx += 1) {
         page.boot_images[boot_image_idx] = .{ .kind = 0, .payload_kind = 0, .flags = 0 };
     }
     var bootfs_page_idx: usize = 0;
@@ -270,9 +269,9 @@ pub fn publishInitBootstrapDescriptorPage(
     while (page_copy_idx < bootfs_setup.page_count) : (page_copy_idx += 1) {
         page.bootfs_page_paddrs[page_copy_idx] = bootfs_setup.page_paddrs[page_copy_idx];
     }
-    inline for (boot_manifest_abi.builtin_boot_images, 0..) |descriptor, idx| {
+    inline for (init_bootstrap_abi.builtin_boot_images, 0..) |descriptor, idx| {
         var updated = descriptor;
-        const kind: boot_manifest_abi.ImageKind = @enumFromInt(updated.kind);
+        const kind: init_bootstrap_abi.ImageKind = @enumFromInt(updated.kind);
         const present = switch (kind) {
             // boot_display is now spawned by userland init from bootfs, not kernel-loaded
             .boot_log_console => false,
@@ -281,7 +280,7 @@ pub fn publishInitBootstrapDescriptorPage(
             .bootfs_image => true,
         };
         if (present) {
-            updated.flags |= boot_manifest_abi.image_flag_present | boot_manifest_abi.image_flag_kernel_loaded;
+            updated.flags |= init_bootstrap_abi.image_flag_present | init_bootstrap_abi.image_flag_kernel_loaded;
         }
         page.boot_images[idx] = updated;
     }

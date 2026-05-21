@@ -1,10 +1,8 @@
 const abi_root = @import("kernel_abi_root");
 
-const cap_transfer_abi = abi_root.cap_transfer_abi;
 const ipc_buffer_abi = abi_root.ipc_buffer_abi;
 const process_abi = abi_root.process_abi;
 const queue_abi = abi_root.queue_abi;
-const time_abi = abi_root.time_abi;
 const trap_abi = abi_root.trap_abi;
 
 pub const syscall_alloc_page: u64 = 0x1;
@@ -53,7 +51,7 @@ pub const syscall_dma_map_release: u64 = queue_abi.syscall_dma_map_release;
 pub const syscall_revoke_device_cap: u64 = queue_abi.syscall_revoke_cap;
 pub const syscall_derive_command_cap: u64 = queue_abi.syscall_derive_command_cap;
 
-pub const syscall_accept_cap_transfer: u64 = cap_transfer_abi.syscall_accept_cap_transfer;
+pub const syscall_accept_cap_transfer: u64 = 0x2A;
 
 pub const syscall_create_ipc_buffer_from_page: u64 = ipc_buffer_abi.syscall_create_ipc_buffer_from_page;
 pub const syscall_grant_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_grant_ipc_buffer_on_endpoint;
@@ -61,7 +59,7 @@ pub const syscall_share_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_sha
 pub const syscall_accept_ipc_buffer_transfer: u64 = ipc_buffer_abi.syscall_accept_ipc_buffer_transfer;
 pub const syscall_map_ipc_buffer_anywhere: u64 = ipc_buffer_abi.syscall_map_ipc_buffer_anywhere;
 
-pub const syscall_get_rtc_unix_time: u64 = time_abi.syscall_get_rtc_unix_time;
+pub const syscall_get_rtc_unix_time: u64 = 0x3E;
 
 pub const syscall_set_abi_trap_delegate: u64 = trap_abi.syscall_set_abi_trap_delegate;
 pub const syscall_clear_abi_trap_delegate: u64 = trap_abi.syscall_clear_abi_trap_delegate;

@@ -439,10 +439,6 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
 
-    if (scheduler.runtime_priority_principal) |priority_principal| {
-        if (priority_principal == principal) scheduler.setRuntimePriorityPrincipal(null);
-    }
-
     if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
         _ = scheduler.releaseThreadSlot(thread_index);
     }
@@ -490,10 +486,6 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
 fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
-
-    if (scheduler.runtime_priority_principal) |priority_principal| {
-        if (priority_principal == principal) scheduler.setRuntimePriorityPrincipal(null);
-    }
 
     if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
         _ = scheduler.releaseThreadSlot(thread_index);
@@ -840,7 +832,6 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .kernel_state_ready = &kernel_state_ready,
         .state = state,
         .scheduler_quantum_ticks = boot_static.scheduler_quantum_ticks,
-        .priority_hold_quanta = 0,
         .write = kernel_log.write,
         .write_hex_raw = kernel_log.writeHexRaw,
         .write_bool01 = kernel_log.writeBool01,

@@ -1,8 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const capability = @import("capability.zig");
-const abi_root = @import("kernel_abi_root");
-const cap_transfer_abi = abi_root.cap_transfer_abi;
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
 pub const device_capabilities = @import("device_capabilities.zig");
 pub const initial_process_count: usize = 8;
@@ -10,6 +8,7 @@ pub const process_count: usize = 32;
 pub const max_thread_slots: usize = 32;
 pub const device_count: usize = 1;
 pub const principal_count: usize = process_count + device_count;
+pub const cap_transfer_id_min: u64 = 0x1000;
 
 comptime {
     if (principal_count > std.math.maxInt(u8)) @compileError("principal_count must fit in u8");
@@ -940,7 +939,7 @@ pub const KernelState = struct {
     command_caps: device_capabilities.CommandCapabilityTable = .{},
     iommu: IommuNoCapDriverState = .{},
     next_cap_id: u64 = 1,
-    next_transfer_id: u64 = cap_transfer_abi.transfer_id_min,
+    next_transfer_id: u64 = cap_transfer_id_min,
 
     fn allocCapId(self: *KernelState) u64 {
         const id = self.next_cap_id;
@@ -951,8 +950,8 @@ pub const KernelState = struct {
     fn allocTransferId(self: *KernelState) u64 {
         var id = self.next_transfer_id;
         self.next_transfer_id +%= 1;
-        if (id < cap_transfer_abi.transfer_id_min) {
-            id = cap_transfer_abi.transfer_id_min;
+        if (id < cap_transfer_id_min) {
+            id = cap_transfer_id_min;
             self.next_transfer_id = id + 1;
         }
         return id;

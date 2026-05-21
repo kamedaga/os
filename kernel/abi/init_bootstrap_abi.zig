@@ -1,5 +1,8 @@
-const boot_manifest_abi = @import("boot_manifest_abi.zig");
 const process_abi = @import("process_abi.zig");
+
+pub const max_boot_image_descriptors: usize = 4;
+pub const image_flag_present: u64 = 1 << 0;
+pub const image_flag_kernel_loaded: u64 = 1 << 1;
 
 pub const magic: u64 = 0x49425453; // "IBTS"
 pub const version: u64 = 16;
@@ -32,6 +35,47 @@ pub const spawn_page_flag_init_writable: u64 = 1 << 3;
 pub const device_flag_present: u64 = 1 << 0;
 pub const display_flag_present: u64 = 1 << 0;
 pub const boot_archive_flag_present: u64 = 1 << 0;
+pub const ImageKind = enum(u64) {
+    boot_log_console = 1,
+    vfs = 2,
+    init_app = 3,
+    bootfs_image = 4,
+};
+
+pub const ImagePayloadKind = enum(u64) {
+    elf = 1,
+    archive = 2,
+};
+
+pub const BootImageDescriptor = extern struct {
+    kind: u64,
+    payload_kind: u64,
+    flags: u64,
+};
+
+pub const builtin_boot_images = [_]BootImageDescriptor{
+    .{
+        .kind = @intFromEnum(ImageKind.boot_log_console),
+        .payload_kind = @intFromEnum(ImagePayloadKind.elf),
+        .flags = 0,
+    },
+    .{
+        .kind = @intFromEnum(ImageKind.vfs),
+        .payload_kind = @intFromEnum(ImagePayloadKind.elf),
+        .flags = 0,
+    },
+    .{
+        .kind = @intFromEnum(ImageKind.init_app),
+        .payload_kind = @intFromEnum(ImagePayloadKind.elf),
+        .flags = 0,
+    },
+    .{
+        .kind = @intFromEnum(ImageKind.bootfs_image),
+        .payload_kind = @intFromEnum(ImagePayloadKind.archive),
+        .flags = 0,
+    },
+};
+
 pub const SpawnPageKind = enum(u64) {
     ui_config = 1,
     ui_state = 2,
@@ -130,6 +174,6 @@ pub const DescriptorPage = extern struct {
     primary_display: DisplayDescriptor,
     spawn_pages: [max_spawn_page_descriptors]SpawnPageDescriptor,
     devices: [max_device_descriptors]DeviceDescriptor,
-    boot_images: [boot_manifest_abi.max_boot_image_descriptors]boot_manifest_abi.BootImageDescriptor,
+    boot_images: [max_boot_image_descriptors]BootImageDescriptor,
     bootfs_page_paddrs: [max_boot_archive_pages]u64,
 };

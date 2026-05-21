@@ -2,7 +2,6 @@ const std = @import("std");
 const kernel = @import("kernel");
 const capability = kernel.capability;
 const device_capabilities = kernel.device_capabilities;
-const cap_transfer_abi = @import("kernel_abi_root").cap_transfer_abi;
 const process_abi = @import("kernel_abi_root").process_abi;
 const process_builder_abi = @import("kernel_abi_root").process_builder_abi;
 const trap_abi = @import("kernel_abi_root").trap_abi;
@@ -511,7 +510,7 @@ test "sendCapOnEndpoint enqueues mailbox for target" {
     try s.installEndpoint(.Process0, 0x11, .Process1);
     try s.sendCapOnEndpoint(.Process0, 0x11, 0x1000);
     const transfer_id = try s.recvCap(.Process1);
-    try std.testing.expect(transfer_id >= cap_transfer_abi.transfer_id_min);
+    try std.testing.expect(transfer_id >= kernel.cap_transfer_id_min);
     try std.testing.expectEqual(transfer_id, try s.recvCap(.Process1));
     try std.testing.expectEqual(@as(u64, 0x1000), try s.acceptCapTransfer(.Process1, transfer_id));
 }
@@ -521,7 +520,7 @@ test "acceptCapTransfer rejects mismatched transfer token" {
     try s.installEndpoint(.Process0, 0x11, .Process1);
     try s.sendCapOnEndpoint(.Process0, 0x11, 0x1000);
     const transfer_id = try s.recvCap(.Process1);
-    try std.testing.expect(transfer_id >= cap_transfer_abi.transfer_id_min);
+    try std.testing.expect(transfer_id >= kernel.cap_transfer_id_min);
     try std.testing.expectError(KernelError.InvalidState, s.acceptCapTransfer(.Process1, transfer_id + 1));
     try std.testing.expect(s.getTableConst(.Process0).find(0x1000) != null);
     try std.testing.expect(s.getTableConst(.Process1).find(0x1000) == null);

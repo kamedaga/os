@@ -25,7 +25,6 @@ pub const Hooks = struct {
     kernel_state_ready: *const bool,
     state: *kernel.KernelState,
     scheduler_quantum_ticks: u64,
-    priority_hold_quanta: u64,
     write: *const fn ([]const u8) void,
     write_hex_raw: *const fn (u64) void,
     write_bool01: *const fn (bool) void,
@@ -1012,12 +1011,8 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     scheduler.wakeThreadsForTimer(scheduler.lapic_tick_count);
     if (h.scheduler_quantum_ticks == 0) return;
     if (!user_mode) return;
-    scheduler.noteUserTimerTick();
 
-    const next_thread = scheduler.chooseNextThreadForTimerPreempt(
-        h.scheduler_quantum_ticks,
-        h.priority_hold_quanta,
-    ) orelse return;
+    const next_thread = scheduler.chooseNextThreadForTimerPreempt(h.scheduler_quantum_ticks) orelse return;
     if (!h.switch_to_thread(next_thread, frame, null)) return;
     scheduler.scheduler_switch_count +%= 1;
 }

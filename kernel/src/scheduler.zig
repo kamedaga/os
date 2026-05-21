@@ -4,6 +4,7 @@ const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 const interrupts = @import("interrupts.zig");
 const smp = @import("smp.zig");
+const ipc_queue = @import("scheduler_ipc_queue.zig");
 const build_workarounds = @import("build_workarounds");
 const scheduler_observer = @import("scheduler_observer.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
@@ -18,24 +19,9 @@ const all_cpu_affinity_mask: u64 = if (smp.max_cpus >= 64) std.math.maxInt(u64) 
 
 const fx_state_bytes: usize = 512;
 pub const max_thread_slots: usize = kernel.max_thread_slots;
-pub const max_ipc_queue_depth: usize = 128;
 pub const idle_thread_marker: usize = max_thread_slots;
 
-pub const IpcQueuedMessage = struct {
-    endpoint_id: u64 = 0,
-    sender_thread: usize = 0,
-    grants_reply: bool = false,
-    mr0: u64 = 0,
-    mr1: u64 = 0,
-    mr2: u64 = 0,
-    mr3: u64 = 0,
-};
-
-const IpcQueue = struct {
-    entries: [max_ipc_queue_depth]IpcQueuedMessage = [_]IpcQueuedMessage{.{}} ** max_ipc_queue_depth,
-    head: u8 = 0,
-    len: u8 = 0,
-};
+pub const IpcQueuedMessage = ipc_queue.Message;
 
 fn schedulerLocksMaskInterrupts() bool {
     return !builtin.is_test;
@@ -220,20 +206,10 @@ pub fn buildInitialIpcHotThreads() [max_thread_slots]IpcHotThread {
     return hot;
 }
 
-fn buildInitialIpcQueues() [max_thread_slots]IpcQueue {
-    var queues: [max_thread_slots]IpcQueue = undefined;
-    inline for (0..max_thread_slots) |i| {
-        queues[i] = .{};
-    }
-    return queues;
-}
-
 pub var thread_contexts: [max_thread_slots]ThreadContext = buildInitialThreadContexts();
 pub export var thread_contexts_ptr: *anyopaque = @ptrCast(&thread_contexts);
 pub var ipc_hot_threads: [max_thread_slots]IpcHotThread = buildInitialIpcHotThreads();
 pub export var ipc_hot_threads_ptr: *anyopaque = @ptrCast(&ipc_hot_threads);
-var ipc_queues: [max_thread_slots]IpcQueue = buildInitialIpcQueues();
-var delegate_send_queues: [max_thread_slots]IpcQueue = buildInitialIpcQueues();
 var cpu_scheduler_states: [smp.max_cpus]CpuSchedulerState = buildInitialCpuSchedulerStates();
 var ap_runnable_policy_enabled: bool = false;
 var auto_cpu_choice_cursor: usize = 1;
@@ -247,12 +223,6 @@ pub export var current_thread_indices: [smp.max_cpus]usize = [_]usize{0} ** smp.
 pub export var lapic_tick_count: u64 = 0;
 pub var scheduler_tick_accum: u64 = 0;
 pub var scheduler_switch_count: u64 = 0;
-pub var scheduler_perf_user_ticks: u64 = 0;
-pub var scheduler_perf_priority_owner_ticks: u64 = 0;
-pub var scheduler_perf_priority_thread_ticks: u64 = 0;
-pub var runtime_priority_streak: u64 = 0;
-pub var runtime_priority_active = false;
-pub var runtime_priority_principal: ?kernel.PrincipalId = null;
 pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 var preferred_ipc_switch_threads: [max_thread_slots]?usize = [_]?usize{null} ** max_thread_slots;
@@ -271,8 +241,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(thread_contexts_ptr), &thread_contexts_ptr));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ipc_hot_threads), &ipc_hot_threads));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ipc_hot_threads_ptr), &ipc_hot_threads_ptr));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ipc_queues), &ipc_queues));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(delegate_send_queues), &delegate_send_queues));
+    end = maxStaticEnd(end, ipc_queue.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cpu_scheduler_states), &cpu_scheduler_states));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_runnable_policy_enabled), &ap_runnable_policy_enabled));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(auto_cpu_choice_cursor), &auto_cpu_choice_cursor));
@@ -286,12 +255,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lapic_tick_count), &lapic_tick_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_tick_accum), &scheduler_tick_accum));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_switch_count), &scheduler_switch_count));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_perf_user_ticks), &scheduler_perf_user_ticks));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_perf_priority_owner_ticks), &scheduler_perf_priority_owner_ticks));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_perf_priority_thread_ticks), &scheduler_perf_priority_thread_ticks));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_priority_streak), &runtime_priority_streak));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_priority_active), &runtime_priority_active));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_priority_principal), &runtime_priority_principal));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_fx_state), &initial_fx_state));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_interrupt_fx_state), &kernel_interrupt_fx_state));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(preferred_ipc_switch_threads), &preferred_ipc_switch_threads));
@@ -1258,30 +1221,7 @@ pub fn enterReadyThreadFromBootstrapKernelInterrupt(frame: *TrapFrame) bool {
     return loadThreadContextToFrame(next_thread, frame);
 }
 
-pub const PerfReport = struct {
-    ticks: u64,
-    priority_owner_ticks: u64,
-    priority_thread_ticks: u64,
-    switch_delta: u64,
-    runtime_priority_active: bool,
-    runtime_priority_streak: u64,
-};
-
-pub fn noteUserTimerTick() void {
-    if (!schedulerRunsOnCurrentCpu()) return;
-    scheduler_perf_user_ticks +%= 1;
-    if (runtime_priority_principal) |principal| {
-        const current_thread = currentThreadIndex();
-        if (getThreadContextConst(current_thread)) |ctx| {
-            if (ctx.allocated and ctx.owner_process == principal) scheduler_perf_priority_owner_ticks +%= 1;
-        }
-        if (threadSlotForPrincipal(principal)) |slot| {
-            if (current_thread == slot) scheduler_perf_priority_thread_ticks +%= 1;
-        }
-    }
-}
-
-pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, priority_hold_quanta: u64) ?usize {
+pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64) ?usize {
     if (!schedulerRunsOnCurrentCpu()) return null;
     if (quantum_ticks == 0) return null;
 
@@ -1290,62 +1230,9 @@ pub fn chooseNextThreadForTimerPreempt(quantum_ticks: u64, priority_hold_quanta:
     scheduler_tick_accum = 0;
 
     const current_thread = currentThreadIndex();
-    if (!runtime_priority_active) {
-        runtime_priority_streak = 0;
-    } else if (runtime_priority_principal) |priority_principal| {
-        if (threadSlotForPrincipal(priority_principal)) |priority_slot| {
-            if (current_thread != priority_slot) {
-                runtime_priority_streak = 0;
-            } else {
-                const priority_hot = getIpcHotThreadConst(priority_slot) orelse null;
-                if (priority_hot != null and priority_hot.?.allocated != 0 and priority_hot.?.ready != 0 and runtime_priority_streak + 1 < priority_hold_quanta) {
-                    runtime_priority_streak +%= 1;
-                    return null;
-                }
-                runtime_priority_streak = 0;
-            }
-        } else {
-            runtime_priority_streak = 0;
-        }
-    } else {
-        runtime_priority_streak = 0;
-    }
-
     const next_thread = pickNextReadyThreadIndex(current_thread);
     if (next_thread == current_thread) return null;
     return next_thread;
-}
-
-pub fn takePerfReport(report_interval_ticks: u64, last_switch_count: *u64) ?PerfReport {
-    if (scheduler_perf_user_ticks < report_interval_ticks) return null;
-    const report: PerfReport = .{
-        .ticks = scheduler_perf_user_ticks,
-        .priority_owner_ticks = scheduler_perf_priority_owner_ticks,
-        .priority_thread_ticks = scheduler_perf_priority_thread_ticks,
-        .switch_delta = scheduler_switch_count - last_switch_count.*,
-        .runtime_priority_active = runtime_priority_active,
-        .runtime_priority_streak = runtime_priority_streak,
-    };
-    last_switch_count.* = scheduler_switch_count;
-    scheduler_perf_user_ticks = 0;
-    scheduler_perf_priority_owner_ticks = 0;
-    scheduler_perf_priority_thread_ticks = 0;
-    return report;
-}
-
-pub fn setRuntimePriorityPrincipal(principal: ?kernel.PrincipalId) void {
-    runtime_priority_principal = principal;
-    if (principal == null) {
-        runtime_priority_active = false;
-        runtime_priority_streak = 0;
-    }
-}
-
-pub fn refreshRuntimePriorityActive(requested: bool, allow_active: bool) void {
-    runtime_priority_active = requested and allow_active and runtime_priority_principal != null;
-    if (!runtime_priority_active) {
-        runtime_priority_streak = 0;
-    }
 }
 
 fn getUserSpace(user_spaces: []UserAddressSpace, principal: kernel.PrincipalId) ?*UserAddressSpace {
@@ -1634,68 +1521,11 @@ fn waitForReleasedApToPark(cpu_slot: usize) void {
 }
 
 fn resetIpcQueueForThread(thread_index: usize) void {
-    if (thread_index >= max_thread_slots) return;
-    ipc_queues[thread_index] = .{};
-}
-
-fn removeIpcMessagesFromSender(queue: *IpcQueue, sender_thread: usize) void {
-    var compacted: IpcQueue = .{};
-    var index: usize = 0;
-    while (index < queue.len) : (index += 1) {
-        const source_index = (@as(usize, queue.head) + index) % max_ipc_queue_depth;
-        const msg = queue.entries[source_index];
-        if (msg.sender_thread == sender_thread) continue;
-        const tail = (@as(usize, compacted.head) + @as(usize, compacted.len)) % max_ipc_queue_depth;
-        compacted.entries[tail] = msg;
-        compacted.len += 1;
-    }
-    queue.* = compacted;
+    ipc_queue.resetIpc(thread_index);
 }
 
 pub fn purgeIpcMessagesForThread(thread_index: usize) void {
-    if (thread_index >= max_thread_slots) return;
-    resetIpcQueueForThread(thread_index);
-    delegate_send_queues[thread_index] = .{};
-    var i: usize = 0;
-    while (i < max_thread_slots) : (i += 1) {
-        removeIpcMessagesFromSender(&ipc_queues[i], thread_index);
-        removeIpcMessagesFromSender(&delegate_send_queues[i], thread_index);
-    }
-}
-
-fn enqueueMessageInQueue(
-    queue: *IpcQueue,
-    endpoint_id: u64,
-    sender_thread: usize,
-    grants_reply: bool,
-    mr0: u64,
-    mr1: u64,
-    mr2: u64,
-    mr3: u64,
-) bool {
-    if (queue.len >= max_ipc_queue_depth) return false;
-    const tail = (@as(usize, queue.head) + @as(usize, queue.len)) % max_ipc_queue_depth;
-    queue.entries[tail] = .{
-        .endpoint_id = endpoint_id,
-        .sender_thread = sender_thread,
-        .grants_reply = grants_reply,
-        .mr0 = mr0,
-        .mr1 = mr1,
-        .mr2 = mr2,
-        .mr3 = mr3,
-    };
-    queue.len += 1;
-    return true;
-}
-
-fn dequeueMessageFromQueue(queue: *IpcQueue) ?IpcQueuedMessage {
-    if (queue.len == 0) return null;
-    const index: usize = queue.head;
-    const msg = queue.entries[index];
-    queue.entries[index] = .{};
-    queue.head = @intCast((@as(usize, queue.head) + 1) % max_ipc_queue_depth);
-    queue.len -= 1;
-    return msg;
+    ipc_queue.purgeThread(thread_index);
 }
 
 pub fn enqueueDelegateSendPending(
@@ -1708,12 +1538,17 @@ pub fn enqueueDelegateSendPending(
     const target_ctx = getThreadContextConst(target_thread) orelse return false;
     const sender_ctx = getThreadContextConst(sender_thread) orelse return false;
     if (!target_ctx.allocated or !sender_ctx.allocated) return false;
-    return enqueueMessageInQueue(&delegate_send_queues[target_thread], endpoint_id, sender_thread, true, request_va, 0, 0, 0);
+    return ipc_queue.enqueueDelegate(target_thread, .{
+        .endpoint_id = endpoint_id,
+        .sender_thread = sender_thread,
+        .grants_reply = true,
+        .mr0 = request_va,
+    });
 }
 
 pub fn promoteDelegateSendForThread(target_thread: usize) bool {
     if (target_thread >= max_thread_slots) return false;
-    const pending = dequeueMessageFromQueue(&delegate_send_queues[target_thread]) orelse return false;
+    const pending = ipc_queue.dequeueDelegate(target_thread) orelse return false;
     if (!enqueueIpcMessageForThread(
         target_thread,
         pending.endpoint_id,
@@ -1724,18 +1559,14 @@ pub fn promoteDelegateSendForThread(target_thread: usize) bool {
         pending.mr2,
         pending.mr3,
     )) {
-        const head = @as(usize, delegate_send_queues[target_thread].head);
-        delegate_send_queues[target_thread].head = @intCast((head + max_ipc_queue_depth - 1) % max_ipc_queue_depth);
-        delegate_send_queues[target_thread].entries[delegate_send_queues[target_thread].head] = pending;
-        delegate_send_queues[target_thread].len += 1;
+        _ = ipc_queue.restoreDelegateFront(target_thread, pending);
         return false;
     }
     return true;
 }
 
 pub fn delegateSendPendingLenForThread(thread_index: usize) usize {
-    if (thread_index >= max_thread_slots) return 0;
-    return delegate_send_queues[thread_index].len;
+    return ipc_queue.delegateLen(thread_index);
 }
 
 pub fn enqueueIpcMessageForThread(
@@ -1752,8 +1583,15 @@ pub fn enqueueIpcMessageForThread(
     const target_ctx = getThreadContextConst(target_thread) orelse return false;
     const sender_ctx = getThreadContextConst(sender_thread) orelse return false;
     if (!target_ctx.allocated or !sender_ctx.allocated) return false;
-    const queue = &ipc_queues[target_thread];
-    if (!enqueueMessageInQueue(queue, endpoint_id, sender_thread, grants_reply, mr0, mr1, mr2, mr3)) return false;
+    if (!ipc_queue.enqueueIpc(target_thread, .{
+        .endpoint_id = endpoint_id,
+        .sender_thread = sender_thread,
+        .grants_reply = grants_reply,
+        .mr0 = mr0,
+        .mr1 = mr1,
+        .mr2 = mr2,
+        .mr3 = mr3,
+    })) return false;
     if (getThreadContext(target_thread)) |ctx| {
         ctx.signal_pending = true;
     }
@@ -1763,9 +1601,8 @@ pub fn enqueueIpcMessageForThread(
 
 pub fn dequeueIpcMessageForThread(thread_index: usize) ?IpcQueuedMessage {
     if (thread_index >= max_thread_slots) return null;
-    const queue = &ipc_queues[thread_index];
-    const msg = dequeueMessageFromQueue(queue) orelse return null;
-    if (queue.len == 0) {
+    const msg = ipc_queue.dequeueIpc(thread_index) orelse return null;
+    if (ipc_queue.ipcLen(thread_index) == 0) {
         if (getThreadContext(thread_index)) |ctx| {
             ctx.signal_pending = false;
         }
@@ -1776,57 +1613,19 @@ pub fn dequeueIpcMessageForThread(thread_index: usize) ?IpcQueuedMessage {
 }
 
 pub fn dequeueIpcReplyMessageForThreadFromSender(thread_index: usize, sender_thread: usize) ?IpcQueuedMessage {
-    if (thread_index >= max_thread_slots or sender_thread >= max_thread_slots) return null;
-    const queue = &ipc_queues[thread_index];
-    if (queue.len == 0) return null;
-
-    var offset: usize = 0;
-    while (offset < queue.len) : (offset += 1) {
-        const index = (@as(usize, queue.head) + offset) % max_ipc_queue_depth;
-        const msg = queue.entries[index];
-        if (msg.sender_thread != sender_thread or msg.endpoint_id != 0 or msg.grants_reply) continue;
-
-        var shift = offset;
-        while (shift + 1 < queue.len) : (shift += 1) {
-            const dst = (@as(usize, queue.head) + shift) % max_ipc_queue_depth;
-            const src = (@as(usize, queue.head) + shift + 1) % max_ipc_queue_depth;
-            queue.entries[dst] = queue.entries[src];
+    const msg = ipc_queue.dequeueReplyFromSender(thread_index, sender_thread) orelse return null;
+    if (ipc_queue.ipcLen(thread_index) == 0) {
+        if (getThreadContext(thread_index)) |ctx| {
+            ctx.signal_pending = false;
         }
-        const tail = (@as(usize, queue.head) + @as(usize, queue.len) - 1) % max_ipc_queue_depth;
-        queue.entries[tail] = .{};
-        queue.len -= 1;
-        if (queue.len == 0) {
-            if (getThreadContext(thread_index)) |ctx| {
-                ctx.signal_pending = false;
-            }
-            setIpcHotSignalPending(thread_index, false);
-        }
-        return msg;
+        setIpcHotSignalPending(thread_index, false);
     }
-    return null;
+    return msg;
 }
 
 pub fn discardIpcReplyMessagesForThreadFromSender(thread_index: usize, sender_thread: usize) usize {
-    if (thread_index >= max_thread_slots or sender_thread >= max_thread_slots) return 0;
-    const queue = &ipc_queues[thread_index];
-    if (queue.len == 0) return 0;
-
-    var compacted: IpcQueue = .{};
-    var removed: usize = 0;
-    var offset: usize = 0;
-    while (offset < queue.len) : (offset += 1) {
-        const index = (@as(usize, queue.head) + offset) % max_ipc_queue_depth;
-        const msg = queue.entries[index];
-        if (msg.sender_thread == sender_thread and msg.endpoint_id == 0 and !msg.grants_reply) {
-            removed += 1;
-            continue;
-        }
-        const tail = (@as(usize, compacted.head) + @as(usize, compacted.len)) % max_ipc_queue_depth;
-        compacted.entries[tail] = msg;
-        compacted.len += 1;
-    }
-    queue.* = compacted;
-    if (queue.len == 0) {
+    const removed = ipc_queue.discardReplyFromSender(thread_index, sender_thread);
+    if (removed != 0 and ipc_queue.ipcLen(thread_index) == 0) {
         if (getThreadContext(thread_index)) |ctx| {
             ctx.signal_pending = false;
         }
@@ -1836,26 +1635,8 @@ pub fn discardIpcReplyMessagesForThreadFromSender(thread_index: usize, sender_th
 }
 
 pub fn discardIpcMessagesForThreadFromSenderOnEndpoint(thread_index: usize, sender_thread: usize, endpoint_id: u64, grants_reply: bool) usize {
-    if (thread_index >= max_thread_slots or sender_thread >= max_thread_slots) return 0;
-    const queue = &ipc_queues[thread_index];
-    if (queue.len == 0) return 0;
-
-    var compacted: IpcQueue = .{};
-    var removed: usize = 0;
-    var offset: usize = 0;
-    while (offset < queue.len) : (offset += 1) {
-        const index = (@as(usize, queue.head) + offset) % max_ipc_queue_depth;
-        const msg = queue.entries[index];
-        if (msg.sender_thread == sender_thread and msg.endpoint_id == endpoint_id and msg.grants_reply == grants_reply) {
-            removed += 1;
-            continue;
-        }
-        const tail = (@as(usize, compacted.head) + @as(usize, compacted.len)) % max_ipc_queue_depth;
-        compacted.entries[tail] = msg;
-        compacted.len += 1;
-    }
-    queue.* = compacted;
-    if (queue.len == 0) {
+    const removed = ipc_queue.discardFromSenderOnEndpoint(thread_index, sender_thread, endpoint_id, grants_reply);
+    if (removed != 0 and ipc_queue.ipcLen(thread_index) == 0) {
         if (getThreadContext(thread_index)) |ctx| {
             ctx.signal_pending = false;
         }
@@ -1865,21 +1646,11 @@ pub fn discardIpcMessagesForThreadFromSenderOnEndpoint(thread_index: usize, send
 }
 
 pub fn ipcQueueLenForThread(thread_index: usize) usize {
-    if (thread_index >= max_thread_slots) return 0;
-    return ipc_queues[thread_index].len;
+    return ipc_queue.ipcLen(thread_index);
 }
 
 pub fn ipcQueueLenForThreadOnEndpoint(thread_index: usize, endpoint_id: u64, grants_reply: bool) usize {
-    if (thread_index >= max_thread_slots) return 0;
-    const queue = &ipc_queues[thread_index];
-    var count: usize = 0;
-    var offset: usize = 0;
-    while (offset < queue.len) : (offset += 1) {
-        const index = (@as(usize, queue.head) + offset) % max_ipc_queue_depth;
-        const msg = queue.entries[index];
-        if (msg.endpoint_id == endpoint_id and msg.grants_reply == grants_reply) count += 1;
-    }
-    return count;
+    return ipc_queue.ipcLenOnEndpoint(thread_index, endpoint_id, grants_reply);
 }
 
 pub fn dequeueIpcMessageForPrincipal(principal: kernel.PrincipalId) ?IpcQueuedMessage {
@@ -2068,14 +1839,6 @@ pub fn pickNextReadyThreadIndex(current_index: usize) usize {
     lockAllCpuSchedulerStates();
     defer unlockAllCpuSchedulerStates();
     rebuildRunnableQueuesFromHotThreadsLocked();
-    if (runtime_priority_active) {
-        if (runtime_priority_principal) |priority_principal| {
-            if (threadSlotForPrincipal(priority_principal)) |priority_slot| {
-                const priority_hot = getIpcHotThreadConst(priority_slot) orelse return current_index;
-                if (current_index != priority_slot and priority_hot.allocated != 0 and priority_hot.ready != 0 and threadAssignedCpuSlot(priority_slot) == bootstrap_cpu_slot) return priority_slot;
-            }
-        }
-    }
     return primarySchedulerState().run_queue.pickNextAfter(current_index);
 }
 
