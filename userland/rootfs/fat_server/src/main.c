@@ -17,9 +17,8 @@ enum {
     SYSCALL_GRANT_CAP = 0x8,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_ALLOC_MAP_PAGES = 0xC,
-    SYSCALL_INSTALL_VM_OBJECT = 0x1E,
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
-    SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
+    SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
@@ -665,7 +664,7 @@ static u64 install_file_vm_object(u32 start_cluster, u32 size_bytes, u32 *cached
         size_bytes
     );
     if (copied != size_bytes) return 0;
-    const u64 token = syscall3(SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES, g_vm_object_scratch_va, size_bytes, VM_RIGHT_READ_MAP_GRANT);
+    const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, g_vm_object_scratch_va, size_bytes, VM_RIGHT_READ_MAP_GRANT);
     if (is_vm_object_token(token)) g_vm_object_scratch_pages = 0;
     return is_vm_object_token(token) ? token : 0;
 }

@@ -1,5 +1,4 @@
 const abi_root = @import("kernel_abi_root");
-const image_abi = abi_root.image_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 const queue_abi = abi_root.queue_abi;
 
@@ -62,7 +61,6 @@ pub fn needsKernelStateLock(nr: u64) bool {
         sc.syscall_map_current_pages_to_abi_trap_reply_target,
         sc.syscall_cow_abi_trap_reply_target_page,
         sc.syscall_copy_to_abi_trap_reply_target_bulk,
-        sc.syscall_map_vm_object_to_abi_trap_reply_target,
         process_builder_abi.syscall_create_suspended_process,
         process_builder_abi.syscall_map_vm_object_to_process,
         process_builder_abi.syscall_alloc_map_pages_to_process,
@@ -75,12 +73,9 @@ pub fn needsKernelStateLock(nr: u64) bool {
         process_builder_abi.syscall_set_process_abi_trap_delegate,
         process_builder_abi.syscall_fork_abi_trap_reply_target,
         process_builder_abi.syscall_clone_abi_trap_reply_target,
-        image_abi.syscall_install_vm_object,
-        image_abi.syscall_install_vm_object_from_current_pages,
-        image_abi.syscall_install_vm_object_mmio_range,
-        image_abi.syscall_grant_vm_object,
-        image_abi.syscall_slice_vm_object,
-        image_abi.syscall_map_vm_object,
+        sc.syscall_create_vm_object_from_current_pages,
+        sc.syscall_grant_vm_object,
+        sc.syscall_map_vm_object,
         queue_abi.syscall_grant_cap,
         => true,
         else => false,

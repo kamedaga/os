@@ -5,7 +5,6 @@ typedef unsigned long long u64;
 
 enum {
     EXEC_OPT_SOURCE_PATH_CACHE = 1,
-    EXEC_OPT_SOURCE_SLICE_CACHE = 1,
 };
 
 enum {
@@ -13,7 +12,6 @@ enum {
     SYSCALL_LOG = 0x9,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_MAP_VM_OBJECT = 0x28,
-    SYSCALL_SLICE_VM_OBJECT = 0x29,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
@@ -45,7 +43,6 @@ enum {
     SOURCE_IMAGE_LARGE_SLOT_COUNT = 2,
     SOURCE_IMAGE_SLOT_COUNT = SOURCE_IMAGE_SMALL_SLOT_COUNT + SOURCE_IMAGE_LARGE_SLOT_COUNT,
     SOURCE_IMAGE_PATH_BYTES = 160,
-    SOURCE_SLICE_CACHE_COUNT = 256,
     LINUX_ABI_REQUEST_PAGES_BASE_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
@@ -145,11 +142,6 @@ static u64 source_image_tokens[SOURCE_IMAGE_SLOT_COUNT];
 static u64 source_image_bytes[SOURCE_IMAGE_SLOT_COUNT];
 static u64 source_image_path_bytes[SOURCE_IMAGE_SLOT_COUNT];
 static unsigned char source_image_paths[SOURCE_IMAGE_SLOT_COUNT][SOURCE_IMAGE_PATH_BYTES];
-static u64 source_slice_tokens[SOURCE_SLICE_CACHE_COUNT];
-static u64 source_slice_offsets[SOURCE_SLICE_CACHE_COUNT];
-static u64 source_slice_bytes[SOURCE_SLICE_CACHE_COUNT];
-static u64 source_slice_rights[SOURCE_SLICE_CACHE_COUNT];
-static u64 source_slice_vm_tokens[SOURCE_SLICE_CACHE_COUNT];
 static struct child_map_tracker child_map_tracker_storage;
 static unsigned char private_page_buffer[PAGE_BYTES];
 static const unsigned char linux_platform[] = "x86_64";
@@ -262,11 +254,6 @@ static int is_process_builder_token(u64 token) {
 
 static int map_vm_object(u64 token, u64 target_va) {
     return syscall3(SYSCALL_MAP_VM_OBJECT, token, target_va, 0) == SYSCALL_OK;
-}
-
-static u64 slice_vm_object(u64 token, u64 offset_bytes, u64 size_bytes, u64 rights_bits) {
-    const u64 sliced = syscall4(SYSCALL_SLICE_VM_OBJECT, token, offset_bytes, size_bytes, rights_bits);
-    return is_vm_object_token(sliced) ? sliced : 0;
 }
 
 static u64 create_suspended_process(void) {
@@ -959,36 +946,6 @@ static u64 source_image_slot_capacity(u64 slot) {
     return slot < SOURCE_IMAGE_SMALL_SLOT_COUNT ? SOURCE_IMAGE_SMALL_SLOT_SPAN : SOURCE_IMAGE_LARGE_SLOT_SPAN;
 }
 
-static u64 cached_slice_vm_object(u64 vm_token, u64 offset_bytes, u64 size_bytes, u64 rights_bits) {
-    if (!EXEC_OPT_SOURCE_SLICE_CACHE) {
-        return slice_vm_object(vm_token, offset_bytes, size_bytes, rights_bits);
-    }
-    for (u64 i = 0; i < SOURCE_SLICE_CACHE_COUNT; i++) {
-        if (source_slice_vm_tokens[i] != 0 &&
-            source_slice_tokens[i] == vm_token &&
-            source_slice_offsets[i] == offset_bytes &&
-            source_slice_bytes[i] == size_bytes &&
-            source_slice_rights[i] == rights_bits) {
-            return source_slice_vm_tokens[i];
-        }
-    }
-
-    const u64 sliced = slice_vm_object(vm_token, offset_bytes, size_bytes, rights_bits);
-    if (sliced == 0) return 0;
-    for (u64 i = 0; i < SOURCE_SLICE_CACHE_COUNT; i++) {
-        if (source_slice_vm_tokens[i] != 0) continue;
-        source_slice_tokens[i] = vm_token;
-        source_slice_offsets[i] = offset_bytes;
-        source_slice_bytes[i] = size_bytes;
-        source_slice_rights[i] = rights_bits;
-        source_slice_vm_tokens[i] = sliced;
-        return sliced;
-    }
-
-    user_log("Exec: source slice cache full\n");
-    return 0;
-}
-
 static void source_path_store(u64 slot, struct byte_slice path) {
     if (path.len == 0 || path.len > SOURCE_IMAGE_PATH_BYTES) {
         source_image_path_bytes[slot] = 0;
@@ -1052,29 +1009,6 @@ static int map_and_validate_vm_image(u64 vm_token, u64 file_bytes, struct byte_s
     return 1;
 }
 
-static int can_direct_map_segment(const struct exec_elf_program_header *phdr, u64 file_bytes, u64 *file_page_off_out, u64 *segment_page_va_out, u64 *map_bytes_out) {
-    if (phdr->p_type != EXEC_ELF_PT_LOAD || phdr->memsz == 0) return 0;
-    if ((phdr->flags & EXEC_ELF_PF_W) != 0) return 0;
-    if (phdr->memsz != phdr->filesz) return 0;
-    if (((phdr->offset ^ phdr->vaddr) & (PAGE_BYTES - 1)) != 0) return 0;
-
-    const u64 file_page_off = exec_elf_page_down(phdr->offset);
-    const u64 segment_page_va = exec_elf_page_down(phdr->vaddr);
-    const u64 page_delta = phdr->vaddr - segment_page_va;
-    u64 segment_end_delta;
-    u64 map_bytes;
-    u64 file_map_end;
-    if (!add_u64(page_delta, phdr->filesz, &segment_end_delta)) return 0;
-    if (!exec_elf_page_up(segment_end_delta, &map_bytes)) return 0;
-    if (!add_u64(file_page_off, map_bytes, &file_map_end)) return 0;
-    if (file_map_end > file_bytes) return 0;
-
-    *file_page_off_out = file_page_off;
-    *segment_page_va_out = segment_page_va;
-    *map_bytes_out = map_bytes;
-    return map_bytes != 0;
-}
-
 static int direct_map_segment(
     u64 process_token,
     struct child_map_tracker *tracker,
@@ -1086,45 +1020,15 @@ static int direct_map_segment(
     const struct exec_elf_header *ehdr,
     int *mapped_out
 ) {
-    *mapped_out = 0;
-    u64 unused_start;
-    u64 unused_end;
-    if (exec_elf_validate_load_segment(phdr, file_bytes, &unused_start, &unused_end) != EXEC_ELF_OK) return 0;
-
-    u64 file_page_off;
-    u64 segment_page_va;
-    u64 map_bytes;
-    if (!can_direct_map_segment(phdr, file_bytes, &file_page_off, &segment_page_va, &map_bytes)) return 1;
-
-    u64 target_va;
-    if (!add_u64(load_bias, segment_page_va, &target_va)) return 0;
-    const u64 page_count = map_bytes / PAGE_BYTES;
-    for (u64 i = 0; i < page_count; i++) {
-        u64 page_vaddr;
-        if (!add_u64(segment_page_va, i * PAGE_BYTES, &page_vaddr)) return 0;
-        int requires_private = 0;
-        if (!page_requires_private_mapping(source_va, ehdr, file_bytes, page_vaddr, &requires_private)) return 0;
-        if (requires_private) return 1;
-    }
-    if (tracker_has_range_overlap(tracker, target_va, page_count)) {
-        user_log("Exec: direct map overlap\n");
-        return 0;
-    }
-
-    const u64 segment_vm = cached_slice_vm_object(source_vm_token, file_page_off, map_bytes, VM_RIGHT_READ_MAP);
-    if (segment_vm == 0) {
-        *mapped_out = -1;
-        return 1;
-    }
-    if (!map_vm_object_to_process(process_token, segment_vm, target_va, prot_bits_from_phdr(phdr))) {
-        user_log("Exec: direct process map failed\n");
-        return 0;
-    }
-    if (!tracker_add_range(tracker, target_va, page_count)) {
-        user_log("Exec: direct tracker failed\n");
-        return 0;
-    }
-    *mapped_out = 1;
+    (void)process_token;
+    (void)tracker;
+    (void)source_vm_token;
+    (void)phdr;
+    (void)file_bytes;
+    (void)load_bias;
+    (void)source_va;
+    (void)ehdr;
+    *mapped_out = -1;
     return 1;
 }
 

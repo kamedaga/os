@@ -53,7 +53,6 @@ pub const syscall_grant_abi_trap_reply_target_pages_as_ipc_buffers: u64 = 0x65;
 pub const syscall_map_current_pages_to_abi_trap_reply_target: u64 = 0x66;
 pub const syscall_cow_abi_trap_reply_target_page: u64 = 0x67;
 pub const syscall_copy_to_abi_trap_reply_target_bulk: u64 = 0x69;
-pub const syscall_map_vm_object_to_abi_trap_reply_target: u64 = 0x6A;
 pub const abi_trap_copy_max_bytes: usize = 4096;
 pub const abi_trap_bulk_copy_max_bytes: usize = 256 * 4096;
 

@@ -1,6 +1,5 @@
 const abi_root = @import("kernel_abi_root");
 
-pub const image_abi = abi_root.image_abi;
 pub const init_bootstrap_abi = abi_root.init_bootstrap_abi;
 pub const process_abi = abi_root.process_abi;
 pub const process_builder_abi = abi_root.process_builder_abi;

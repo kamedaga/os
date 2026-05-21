@@ -439,7 +439,12 @@ static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bi
 static u64 unmap_reply_target_pages(u64 target_va, u64 page_count) { return syscall2(SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count); }
 static u64 map_current_pages_to_reply_target(u64 source_va, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4(SYSCALL_MAP_CURRENT_PAGES_TO_ABI_TRAP_REPLY_TARGET, source_va, target_va, page_count, prot_bits); }
 static u64 cow_reply_target_page(u64 target_va, u64 prot_bits) { return syscall2(SYSCALL_COW_ABI_TRAP_REPLY_TARGET_PAGE, target_va, prot_bits); }
-static u64 map_vm_object_to_reply_target(u64 vm_token, u64 target_va, u64 prot_bits) { return syscall3(SYSCALL_MAP_VM_OBJECT_TO_ABI_TRAP_REPLY_TARGET, vm_token, target_va, prot_bits); }
+static u64 map_vm_object_to_reply_target(u64 vm_token, u64 target_va, u64 prot_bits) {
+    (void)vm_token;
+    (void)target_va;
+    (void)prot_bits;
+    return SYSCALL_ERR_MAP;
+}
 static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
 static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
 static u64 copy_to_target_bulk(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET_BULK, target_va, (u64)src, len); }

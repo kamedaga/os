@@ -15,7 +15,6 @@ enum {
     SYSCALL_LOG = 0x9,
     SYSCALL_ALLOC_MAP_PAGES = 0xC,
     SYSCALL_WAIT_EVENT = 0x17,
-    SYSCALL_INSTALL_VM_OBJECT = 0x1E,
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
@@ -32,7 +31,7 @@ enum {
     SYSCALL_START_PROCESS = 0x45,
     SYSCALL_ABORT_PROCESS = 0x46,
     SYSCALL_COPY_TO_PROCESS = 0x47,
-    SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
+    SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
     SYSCALL_SET_PROCESS_BOOTSTRAP_OWNER = 0x6B,
     SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
     SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
@@ -433,7 +432,7 @@ static int copy_to_process(u64 process_token, u64 dest_va, u64 src_va, u64 byte_
 
 static u64 install_shared_current_page(u64 source_va) {
     const u64 rights = VM_OBJECT_RIGHT_READ | VM_OBJECT_RIGHT_WRITE | VM_OBJECT_RIGHT_MAP;
-    const u64 token = syscall3(SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES, source_va, 4096, rights);
+    const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, source_va, 4096, rights);
     if (!is_vm_object_token(token)) {
         user_log_hex("[seed2_root] shared page token=", token);
         return 0;
@@ -443,6 +442,13 @@ static u64 install_shared_current_page(u64 source_va) {
         user_log_hex("[seed2_root] shared page remap=", remap);
         return 0;
     }
+    return token;
+}
+
+static u64 create_vm_object_from_current_pages(u64 source_va, u64 size_bytes, u64 rights) {
+    const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, source_va, size_bytes, rights);
+    if (!is_vm_object_token(token)) return 0;
+    if (syscall2(SYSCALL_MAP_VM_OBJECT, token, source_va) != SYSCALL_OK) return 0;
     return token;
 }
 
@@ -842,7 +848,7 @@ static int load_image_from_fat(const char *path, u64 image_va, struct loaded_fil
         offset += response->inline_bytes;
     }
 
-    const u64 vm_token = syscall3(SYSCALL_INSTALL_VM_OBJECT, image_va, file_bytes, VM_RIGHT_READ_MAP_GRANT);
+    const u64 vm_token = create_vm_object_from_current_pages(image_va, file_bytes, 0xF);
     if ((vm_token & VM_OBJECT_TOKEN_TAG) != VM_OBJECT_TOKEN_TAG) return 0;
     out->image_va = image_va;
     out->file_bytes = file_bytes;
@@ -1030,7 +1036,7 @@ static int load_image_from_vfs(const char *path, u64 image_va, struct loaded_fil
         offset += response->inline_bytes;
     }
 
-    const u64 vm_token = syscall3(SYSCALL_INSTALL_VM_OBJECT, image_va, file_bytes, VM_RIGHT_READ_MAP_GRANT);
+    const u64 vm_token = create_vm_object_from_current_pages(image_va, file_bytes, 0xF);
     if ((vm_token & VM_OBJECT_TOKEN_TAG) != VM_OBJECT_TOKEN_TAG) return 0;
     out->image_va = image_va;
     out->file_bytes = file_bytes;

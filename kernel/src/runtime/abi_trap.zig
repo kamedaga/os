@@ -12,7 +12,6 @@ const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 const trap_abi = abi_root.trap_abi;
 const ipc_buffer_abi = abi_root.ipc_buffer_abi;
-const image_abi = abi_root.image_abi;
 const process_abi = abi_root.process_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 
@@ -933,33 +932,6 @@ pub fn mapCurrentPagesToCurrentReplyTarget(state: *kernel.KernelState, proc: ker
         }
     }
     if (!user_vm.mapTrustedUserPaddrsWithProt(target.proc, target_va, paddrs[0..page_count_usize], prot)) return boot_static.syscall_err_map;
-    return boot_static.syscall_ok;
-}
-
-pub fn mapVmObjectToCurrentReplyTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, vm_token: u64, target_va: u64, prot_bits: u64) u64 {
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const cap_id = image_abi.decodeVmObjectToken(vm_token) orelse return boot_static.syscall_err_invalid;
-    const vm_cap = state.getVmObjectTableConst(proc).findByCapId(cap_id) orelse return boot_static.syscall_err_invalid;
-    if (!vm_cap.rights.read or !vm_cap.rights.map) return boot_static.syscall_err_grant;
-    if (prot.write and !vm_cap.rights.write) return boot_static.syscall_err_grant;
-    if (vm_cap.backing.page_offset_bytes != 0) return boot_static.syscall_err_invalid;
-    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
-
-    var page_index: usize = 0;
-    while (page_index < vm_cap.backing.page_count) {
-        const run_start = page_index;
-        const run_paddr = vm_cap.backing.pagePaddr(run_start) orelse return boot_static.syscall_err_invalid;
-        var run_len: usize = 1;
-        while (run_start + run_len < vm_cap.backing.page_count) : (run_len += 1) {
-            const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
-            if ((vm_cap.backing.pagePaddr(run_start + run_len) orelse break) != expected) break;
-        }
-        const run_va = target_va + @as(u64, @intCast(run_start)) * 4096;
-        const run_bytes = run_len * 4096;
-        if (!user_vm.mapUserLinearRegionWithProt(target.proc, run_va, run_paddr, run_bytes, prot)) return boot_static.syscall_err_map;
-        page_index = run_start + run_len;
-    }
     return boot_static.syscall_ok;
 }
 

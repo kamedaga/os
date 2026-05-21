@@ -53,6 +53,10 @@ pub const syscall_derive_command_cap: u64 = queue_abi.syscall_derive_command_cap
 
 pub const syscall_accept_cap_transfer: u64 = 0x2A;
 
+pub const syscall_grant_vm_object: u64 = 0x1F;
+pub const syscall_map_vm_object: u64 = 0x28;
+pub const syscall_create_vm_object_from_current_pages: u64 = 0x3F;
+
 pub const syscall_create_ipc_buffer_from_page: u64 = ipc_buffer_abi.syscall_create_ipc_buffer_from_page;
 pub const syscall_grant_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_grant_ipc_buffer_on_endpoint;
 pub const syscall_share_ipc_buffer_on_endpoint: u64 = ipc_buffer_abi.syscall_share_ipc_buffer_on_endpoint;
@@ -83,7 +87,6 @@ pub const syscall_grant_abi_trap_reply_target_pages_as_ipc_buffers: u64 = trap_a
 pub const syscall_map_current_pages_to_abi_trap_reply_target: u64 = trap_abi.syscall_map_current_pages_to_abi_trap_reply_target;
 pub const syscall_cow_abi_trap_reply_target_page: u64 = trap_abi.syscall_cow_abi_trap_reply_target_page;
 pub const syscall_copy_to_abi_trap_reply_target_bulk: u64 = trap_abi.syscall_copy_to_abi_trap_reply_target_bulk;
-pub const syscall_map_vm_object_to_abi_trap_reply_target: u64 = trap_abi.syscall_map_vm_object_to_abi_trap_reply_target;
 
 pub const syscall_batch_max_pages: usize = 256;
 pub const user_log_max_bytes: usize = 256;

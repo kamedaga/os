@@ -14,17 +14,14 @@ enum {
     SYSCALL_GRANT_CAP = 0x8,
     SYSCALL_GRANT_CAPS_BATCH = 0x14,
     SYSCALL_WAIT_EVENT = 0x17,
-    SYSCALL_INSTALL_VM_OBJECT = 0x1E,
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_MAP_VM_OBJECT = 0x28,
-    SYSCALL_SLICE_VM_OBJECT = 0x29,
     SYSCALL_SHARE_CAP = 0x2B,
     SYSCALL_SIGNAL_ENDPOINT = 0x2C,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_INSTALL_MMIO_CAP = 0x2F,
-    SYSCALL_INSTALL_VM_OBJECT_MMIO_RANGE = 0x31,
     SYSCALL_INSTALL_CAPS_BATCH = 0x32,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
     SYSCALL_GRANT_QUEUE_CAP = 0x23,
@@ -39,7 +36,7 @@ enum {
     SYSCALL_START_PROCESS = 0x45,
     SYSCALL_ABORT_PROCESS = 0x46,
     SYSCALL_COPY_TO_PROCESS = 0x47,
-    SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
+    SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
     SYSCALL_SET_PROCESS_BOOTSTRAP_OWNER = 0x6B,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
@@ -210,6 +207,8 @@ enum {
     DEVICE_CATALOG_KIND_NET = 2,
 
     ROOT_SEED2_IMAGE_VA = 0x28100000,
+    BOOTFS_OBJECT_BASE_VA = 0x28200000,
+    BOOTFS_OBJECT_SLOT_BYTES = 0x00100000,
     ROOT_SEED2_CONFIG_VA = 0x2A000000,
     BOOT_TEXT_FB_VA = 0x3E000000,
     ROOT_SEED2_CONFIG_MAGIC = 0x32545253,
@@ -405,6 +404,9 @@ struct loaded_file {
     u64 vm_token;
 };
 
+static int alloc_root_seed2_image_pages(u64 file_bytes);
+static int alloc_pages_at(u64 base_va, u64 file_bytes);
+
 struct backend_session {
     u8 active;
     u8 reserved0[7];
@@ -511,6 +513,7 @@ static u64 g_device_catalog_source_va;
 static u64 g_device_catalog_paddr;
 static struct backend_session g_fat_session;
 static u64 g_root_seed2_page_paddrs[MAX_ROOT_SEED2_PAGES];
+static u64 g_next_bootfs_object_va = BOOTFS_OBJECT_BASE_VA;
 static unsigned char g_loader_page[4096];
 static volatile u32 *g_boot_fb;
 static u64 g_boot_fb_width;
@@ -700,7 +703,14 @@ static int copy_to_process(u64 process_token, u64 dst_va, u64 src_va, u64 bytes)
 
 static u64 install_shared_current_page(u64 source_va) {
     const u64 rights = VM_OBJECT_RIGHT_READ | VM_OBJECT_RIGHT_WRITE | VM_OBJECT_RIGHT_MAP;
-    const u64 token = syscall3(SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES, source_va, 4096, rights);
+    const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, source_va, 4096, rights);
+    if (!is_vm_object_token(token)) return 0;
+    if (syscall2(SYSCALL_MAP_VM_OBJECT, token, source_va) != SYSCALL_OK) return 0;
+    return token;
+}
+
+static u64 create_vm_object_from_current_pages(u64 source_va, u64 size_bytes, u64 rights) {
+    const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, source_va, size_bytes, rights);
     if (!is_vm_object_token(token)) return 0;
     if (syscall2(SYSCALL_MAP_VM_OBJECT, token, source_va) != SYSCALL_OK) return 0;
     return token;
@@ -1060,14 +1070,13 @@ static void boot_screen_init(void) {
     const u64 base_paddr = display.framebuffer_paddr & ~0xFFFULL;
     const u64 offset = display.framebuffer_paddr - base_paddr;
     const u64 map_bytes = (offset + display.framebuffer_size_bytes + 4095) & ~0xFFFULL;
-    const u64 token = syscall3(
-        SYSCALL_INSTALL_VM_OBJECT_MMIO_RANGE,
-        base_paddr,
-        map_bytes,
-        VM_OBJECT_RIGHT_READ | VM_OBJECT_RIGHT_WRITE | VM_OBJECT_RIGHT_MAP
-    );
-    if ((token & VM_OBJECT_TOKEN_TAG) == 0) return;
-    if (syscall2(SYSCALL_MAP_VM_OBJECT, token, BOOT_TEXT_FB_VA) != SYSCALL_OK) return;
+    const u64 page_count = map_bytes / 4096;
+    for (u64 i = 0; i < page_count; i++) {
+        const u64 paddr = base_paddr + i * 4096;
+        const u64 va = BOOT_TEXT_FB_VA + i * 4096;
+        if (syscall2(SYSCALL_INSTALL_MMIO_CAP, paddr, PAGE_RIGHT_CPU_READ | PAGE_RIGHT_CPU_WRITE) != SYSCALL_OK) return;
+        if (syscall3(SYSCALL_MAP_PAGE, va, paddr, 1) != SYSCALL_OK) return;
+    }
 
     g_boot_fb = (volatile u32 *)(BOOT_TEXT_FB_VA + offset);
     g_boot_fb_width = display.width;
@@ -1128,14 +1137,18 @@ static int open_image_from_bootfs(const char *path, struct loaded_file *out) {
         const u8 *entry_path = (const u8 *)((u64)header + header->string_table_offset + entry->path_offset);
         if (!bytes_eq(path, entry_path, entry->path_bytes)) continue;
         if (entry->data_offset < header->data_offset || entry->data_offset + entry->data_bytes > header->image_bytes) return 0;
-        const u64 vm_token = (g_handoff.bootfs_vm_token & VM_OBJECT_TOKEN_TAG) != 0
-            ? syscall4(SYSCALL_SLICE_VM_OBJECT, g_handoff.bootfs_vm_token, entry->data_offset, entry->data_bytes, 1)
-            : syscall3(SYSCALL_INSTALL_VM_OBJECT, (u64)header + entry->data_offset, entry->data_bytes, 1);
+        const u64 object_va = g_next_bootfs_object_va;
+        g_next_bootfs_object_va += BOOTFS_OBJECT_SLOT_BYTES;
+        if (!alloc_pages_at(object_va, entry->data_bytes)) return 0;
+        const u8 *src = (const u8 *)((u64)header + entry->data_offset);
+        u8 *dst = (u8 *)object_va;
+        for (u64 j = 0; j < entry->data_bytes; j++) dst[j] = src[j];
+        const u64 vm_token = create_vm_object_from_current_pages(object_va, entry->data_bytes, 0xF);
         if ((vm_token & VM_OBJECT_TOKEN_TAG) == 0) {
             user_log("[seed2_boot] bootfs install vm failed\n");
             return 0;
         }
-        out->image_va = (u64)header + entry->data_offset;
+        out->image_va = object_va;
         out->file_bytes = entry->data_bytes;
         out->vm_token = vm_token;
         return 1;
@@ -1627,16 +1640,20 @@ static int fat_request(u16 op, u64 token, u64 offset, u32 length, const char *pa
     return wait_fat_response(seq, op);
 }
 
-static int alloc_root_seed2_image_pages(u64 file_bytes) {
+static int alloc_pages_at(u64 base_va, u64 file_bytes) {
     const u64 pages = (file_bytes + 4095) / 4096;
     if (pages == 0 || pages > MAX_ROOT_SEED2_PAGES) return 0;
     for (u64 i = 0; i < pages; i++) {
-        const u64 va = ROOT_SEED2_IMAGE_VA + i * 4096;
+        const u64 va = base_va + i * 4096;
         g_root_seed2_page_paddrs[i] = 0;
         if (syscall4(SYSCALL_ALLOC_MAP_PAGES, va, 1, 1, (u64)&g_root_seed2_page_paddrs[i]) != SYSCALL_OK) return 0;
         clear_page(va);
     }
     return 1;
+}
+
+static int alloc_root_seed2_image_pages(u64 file_bytes) {
+    return alloc_pages_at(ROOT_SEED2_IMAGE_VA, file_bytes);
 }
 
 static int load_root_seed2_from_fat(struct loaded_file *out) {
@@ -1666,7 +1683,7 @@ static int load_root_seed2_from_fat(struct loaded_file *out) {
         offset += response->inline_bytes;
     }
 
-    const u64 vm_token = syscall3(SYSCALL_INSTALL_VM_OBJECT, ROOT_SEED2_IMAGE_VA, file_bytes, 1);
+    const u64 vm_token = create_vm_object_from_current_pages(ROOT_SEED2_IMAGE_VA, file_bytes, 0xF);
     if ((vm_token & VM_OBJECT_TOKEN_TAG) != VM_OBJECT_TOKEN_TAG) return 0;
     out->image_va = ROOT_SEED2_IMAGE_VA;
     out->file_bytes = file_bytes;

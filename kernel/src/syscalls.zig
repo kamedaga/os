@@ -3,7 +3,6 @@ const kernel = @import("kernel.zig");
 const capability = @import("capability.zig");
 const abi_root = @import("kernel_abi_root");
 const ipc_buffer_abi = abi_root.ipc_buffer_abi;
-const image_abi = abi_root.image_abi;
 const trap_abi = abi_root.trap_abi;
 const process_abi = abi_root.process_abi;
 const process_builder_abi = abi_root.process_builder_abi;
@@ -17,7 +16,7 @@ const syscall_lock_policy = @import("syscall/lock_policy.zig");
 const memory_syscalls = @import("syscall/memory_helpers.zig");
 const device_syscalls = @import("syscall/device.zig");
 const process_syscalls = @import("syscall/process.zig");
-const image_dispatch = @import("syscall/image.zig");
+const vm_object_dispatch = @import("syscall/vm_object.zig");
 const ipc_syscalls = @import("syscall/ipc.zig");
 const abi_trap_syscalls = @import("syscall/abi_trap.zig");
 
@@ -70,7 +69,7 @@ const KernelStateSpinLock = struct {
 };
 
 var kernel_state_lock: KernelStateSpinLock = .{};
-var vm_object_page_scratch: [kernel.max_image_backing_pages]u64 = undefined;
+var vm_object_page_scratch: [kernel.max_vm_object_backing_pages]u64 = undefined;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -484,7 +483,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     if (process_syscalls.dispatch(h, state, proc, frame)) |result| {
         return result;
     }
-    if (image_dispatch.dispatch(h, state, proc, frame, &vm_object_page_scratch)) |result| {
+    if (vm_object_dispatch.dispatch(h, state, proc, frame, &vm_object_page_scratch)) |result| {
         return result;
     }
     if (abi_trap_syscalls.dispatch(state, proc, frame)) |result| {

@@ -109,7 +109,7 @@ pub fn mapVmObjectToProcess(caller: kernel.PrincipalId, token: u64, vm_token: u6
     if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const vm_cap_id = boot_abi.image_abi.decodeVmObjectToken(vm_token) orelse return boot_static.syscall_err_invalid;
+    const vm_cap_id = kernel.decodeVmObjectToken(vm_token) orelse return boot_static.syscall_err_invalid;
     const vm_cap = state_ptr.getVmObjectTableConst(caller).findByCapId(vm_cap_id) orelse return boot_static.syscall_err_invalid;
     if (!vm_cap.rights.read or !vm_cap.rights.map) return boot_static.syscall_err_invalid;
     if (prot.write and !vm_cap.rights.write) return boot_static.syscall_err_invalid;

@@ -79,9 +79,6 @@ pub fn dispatch(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *Tr
         sc.syscall_cow_abi_trap_reply_target_page => {
             return abi_trap_runtime.cowCurrentReplyTargetPage(state, frame.rdi, frame.rsi);
         },
-        sc.syscall_map_vm_object_to_abi_trap_reply_target => {
-            return abi_trap_runtime.mapVmObjectToCurrentReplyTarget(state, proc, frame.rdi, frame.rsi, frame.rdx);
-        },
         else => null,
     };
 }

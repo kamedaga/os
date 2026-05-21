@@ -1,11 +1,8 @@
 const std = @import("std");
 
-pub const syscall_install_vm_object: u64 = 0x1E;
 pub const syscall_grant_vm_object: u64 = 0x1F;
 pub const syscall_map_vm_object: u64 = 0x28;
-pub const syscall_slice_vm_object: u64 = 0x29;
-pub const syscall_install_vm_object_mmio_range: u64 = 0x31;
-pub const syscall_install_vm_object_from_current_pages: u64 = 0x3F;
+pub const syscall_create_vm_object_from_current_pages: u64 = 0x3F;
 
 pub const vm_object_token_tag: u64 = 1 << 62;
 

@@ -9,6 +9,20 @@ pub const max_thread_slots: usize = 32;
 pub const device_count: usize = 1;
 pub const principal_count: usize = process_count + device_count;
 pub const cap_transfer_id_min: u64 = 0x1000;
+pub const vm_object_token_tag: u64 = 1 << 62;
+
+pub fn encodeVmObjectToken(cap_id: u64) u64 {
+    std.debug.assert(cap_id != 0);
+    std.debug.assert((cap_id & vm_object_token_tag) == 0);
+    return vm_object_token_tag | cap_id;
+}
+
+pub fn decodeVmObjectToken(token: u64) ?u64 {
+    if ((token & vm_object_token_tag) == 0) return null;
+    const cap_id = token & ~vm_object_token_tag;
+    if (cap_id == 0) return null;
+    return cap_id;
+}
 
 comptime {
     if (principal_count > std.math.maxInt(u8)) @compileError("principal_count must fit in u8");
@@ -615,21 +629,21 @@ pub const IpcBufferMailbox = struct {
     }
 };
 
-pub const max_image_backing_pages: usize = 65535;
-pub const max_image_backing_store_pages: usize = 262144;
+pub const max_vm_object_backing_pages: usize = 65535;
+pub const max_vm_object_backing_store_pages: usize = 262144;
 
-var image_backing_page_store: [max_image_backing_store_pages]u64 = [_]u64{0} ** max_image_backing_store_pages;
-var image_backing_page_store_next: usize = 0;
+var vm_object_backing_page_store: [max_vm_object_backing_store_pages]u64 = [_]u64{0} ** max_vm_object_backing_store_pages;
+var vm_object_backing_page_store_next: usize = 0;
 
-fn allocImageBackingPageStore(page_paddrs: []const u64) ?u32 {
-    if (page_paddrs.len == 0 or page_paddrs.len > max_image_backing_pages) return null;
-    if (image_backing_page_store_next + page_paddrs.len > image_backing_page_store.len) return null;
-    const start = image_backing_page_store_next;
+fn allocVmObjectBackingPageStore(page_paddrs: []const u64) ?u32 {
+    if (page_paddrs.len == 0 or page_paddrs.len > max_vm_object_backing_pages) return null;
+    if (vm_object_backing_page_store_next + page_paddrs.len > vm_object_backing_page_store.len) return null;
+    const start = vm_object_backing_page_store_next;
     for (page_paddrs, 0..) |paddr, i| {
         if ((paddr & 0xFFF) != 0) return null;
-        image_backing_page_store[start + i] = paddr;
+        vm_object_backing_page_store[start + i] = paddr;
     }
-    image_backing_page_store_next += page_paddrs.len;
+    vm_object_backing_page_store_next += page_paddrs.len;
     return @intCast(start);
 }
 
@@ -641,21 +655,25 @@ pub const VmObjectRights = packed struct(u32) {
     _reserved: u28 = 0,
 };
 
-pub const ImageBacking = struct {
+pub fn vmObjectRightsFromBits(bits: u64) VmObjectRights {
+    return @bitCast(@as(u32, @truncate(bits)));
+}
+
+pub const VmObjectBacking = struct {
     page_offset_bytes: u16 = 0,
     page_count: u16 = 0,
     page_store_start: u32 = 0,
     size_bytes: u64 = 0,
 
-    fn init(page_paddrs: []const u64, page_offset_bytes: u16, size_bytes: u64) ?ImageBacking {
-        if (page_paddrs.len == 0 or page_paddrs.len > max_image_backing_pages) return null;
+    fn init(page_paddrs: []const u64, page_offset_bytes: u16, size_bytes: u64) ?VmObjectBacking {
+        if (page_paddrs.len == 0 or page_paddrs.len > max_vm_object_backing_pages) return null;
         if (size_bytes == 0) return null;
         const first_page_bytes = @as(u64, 4096 - page_offset_bytes);
         const total_capacity = first_page_bytes + (@as(u64, @intCast(page_paddrs.len - 1)) * 4096);
         if (total_capacity < size_bytes) return null;
 
-        const page_store_start = allocImageBackingPageStore(page_paddrs) orelse return null;
-        return ImageBacking{
+        const page_store_start = allocVmObjectBackingPageStore(page_paddrs) orelse return null;
+        return VmObjectBacking{
             .page_offset_bytes = page_offset_bytes,
             .page_count = @intCast(page_paddrs.len),
             .page_store_start = page_store_start,
@@ -663,42 +681,19 @@ pub const ImageBacking = struct {
         };
     }
 
-    pub fn pagePaddr(self: *const ImageBacking, page_index: usize) ?u64 {
+    pub fn pagePaddr(self: *const VmObjectBacking, page_index: usize) ?u64 {
         if (page_index >= self.page_count) return null;
         const store_index = @as(usize, self.page_store_start) + page_index;
-        if (store_index >= image_backing_page_store.len) return null;
-        const paddr = image_backing_page_store[store_index];
+        if (store_index >= vm_object_backing_page_store.len) return null;
+        const paddr = vm_object_backing_page_store[store_index];
         if ((paddr & 0xFFF) != 0) return null;
         return paddr;
     }
 
-    fn slice(self: *const ImageBacking, offset_bytes: u64, size_bytes: u64) ?ImageBacking {
-        if (size_bytes == 0) return null;
-        const end_bytes, const overflow = @addWithOverflow(offset_bytes, size_bytes);
-        if (overflow != 0 or end_bytes > self.size_bytes) return null;
-
-        const absolute_start = @as(u64, self.page_offset_bytes) + offset_bytes;
-        const start_page_index: usize = @intCast(absolute_start / 4096);
-        const start_page_offset: u16 = @intCast(absolute_start % 4096);
-        if (start_page_index >= self.page_count) return null;
-
-        const first_page_bytes = @as(u64, 4096 - start_page_offset);
-        const remaining_after_first = if (size_bytes > first_page_bytes) size_bytes - first_page_bytes else 0;
-        const extra_pages: usize = if (remaining_after_first == 0) 0 else @intCast((remaining_after_first + 4095) / 4096);
-        const page_count = 1 + extra_pages;
-        if (start_page_index + page_count > self.page_count) return null;
-
-        return .{
-            .page_offset_bytes = start_page_offset,
-            .page_count = @intCast(page_count),
-            .page_store_start = self.page_store_start + @as(u32, @intCast(start_page_index)),
-            .size_bytes = size_bytes,
-        };
-    }
 };
 
 pub const VmObjectCapability = struct {
-    backing: ImageBacking,
+    backing: VmObjectBacking,
     rights: VmObjectRights,
     cap_id: u64,
     root_cap_id: u64,
@@ -1804,7 +1799,7 @@ pub const KernelState = struct {
         rights: VmObjectRights,
     ) KernelError!u64 {
         try self.requireActiveProcess(owner);
-        const backing = ImageBacking.init(page_paddrs, page_offset_bytes, size_bytes) orelse return KernelError.InvalidState;
+        const backing = VmObjectBacking.init(page_paddrs, page_offset_bytes, size_bytes) orelse return KernelError.InvalidState;
 
         const root_id = self.allocCapId();
         try self.getVmObjectTable(owner).add(.{
@@ -1835,31 +1830,6 @@ pub const KernelState = struct {
         const child_id = self.allocCapId();
         try self.getVmObjectTable(to).add(.{
             .backing = src_cap.backing,
-            .rights = rights,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-        return child_id;
-    }
-
-    pub fn deriveVmObjectCap(
-        self: *KernelState,
-        owner: PrincipalId,
-        cap_id: u64,
-        offset_bytes: u64,
-        size_bytes: u64,
-        rights: VmObjectRights,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-
-        const src_cap = self.getVmObjectTableConst(owner).findByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
-        if (!isVmObjectRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-        const backing = src_cap.backing.slice(offset_bytes, size_bytes) orelse return KernelError.InvalidState;
-
-        const child_id = self.allocCapId();
-        try self.getVmObjectTable(owner).add(.{
-            .backing = backing,
             .rights = rights,
             .cap_id = child_id,
             .root_cap_id = src_cap.root_cap_id,

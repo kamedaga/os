@@ -623,8 +623,10 @@ static int vfs_read_file_to_buffer(const char *path, u64 buffer_va, u64 buffer_c
 }
 
 static u64 install_vm_object_from_buffer(u64 buffer_va, u64 file_bytes) {
-    const u64 token = syscall3(SYSCALL_INSTALL_VM_OBJECT, buffer_va, file_bytes, VM_RIGHT_READ_MAP_GRANT);
-    return is_vm_object_token(token) ? token : 0;
+    const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, buffer_va, file_bytes, 0xF);
+    if (!is_vm_object_token(token)) return 0;
+    if (syscall2(SYSCALL_MAP_VM_OBJECT, token, buffer_va) != SYSCALL_OK) return 0;
+    return token;
 }
 
 static int cache_entry_path_matches(const struct exec_cache_entry *entry, const char *path, u64 len) {
