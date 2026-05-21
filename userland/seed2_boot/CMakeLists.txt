@@ -8,6 +8,7 @@ project(seed2_boot C ASM)
 add_executable(seed2_boot
   src/entry.S
   src/main.c
+  ../exec/src/elf.c
 )
 
 set_target_properties(seed2_boot PROPERTIES
@@ -15,6 +16,8 @@ set_target_properties(seed2_boot PROPERTIES
   SUFFIX .elf
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
+
+target_include_directories(seed2_boot PRIVATE ../exec/include)
 
 target_compile_options(seed2_boot PRIVATE
   -target x86_64-freestanding-none
@@ -35,6 +38,6 @@ target_link_options(seed2_boot PRIVATE
   -Wl,-e,_start
   -Wl,-pie
   -Wl,--no-dynamic-linker
-  -Wl,-z,common-page-size=16
-  -Wl,-z,max-page-size=16
+  -Wl,-z,common-page-size=4096
+  -Wl,-z,max-page-size=4096
 )

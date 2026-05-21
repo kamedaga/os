@@ -8,8 +8,6 @@ const user_copy = @import("../user_copy.zig");
 const boot_static = @import("../boot/main_static.zig");
 const boot_abi = @import("../boot/abi.zig");
 const process_factory = @import("../boot/process_factory.zig");
-const kernel_log = @import("../kernel_log.zig");
-const log_util = @import("../log_util.zig");
 
 const process_builder_abi = boot_abi.process_builder_abi;
 
@@ -86,7 +84,6 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
     state_ptr.cap_mailboxes[process_index] = .{};
     state_ptr.pending_page_transfers[process_index] = null;
     state_ptr.vm_object_tables[process_index] = .{};
-    state_ptr.exec_image_tables[process_index] = .{};
     _ = state_ptr.removeProcessDescriptor(principal);
 }
 
@@ -225,17 +222,6 @@ pub fn setAbiTrapDelegate(
         kernel.KernelError.EndpointNotFound => return boot_static.syscall_err_endpoint,
         else => return boot_static.syscall_err_invalid,
     };
-    if (scheduler.spawnExecApUserSchedulingEnabled()) {
-        kernel_log.write("process_builder abi_delegate target=");
-        log_util.printNumber(processSlot(target) orelse scheduler.idle_thread_marker);
-        kernel_log.write(" endpoint=");
-        log_util.printHex(endpoint_id);
-        kernel_log.write(" delegate_proc=");
-        log_util.printNumber(target_process_slot);
-        kernel_log.write(" request=");
-        log_util.printHex(request_page_va);
-        kernel_log.write("\n");
-    }
     return boot_static.syscall_ok;
 }
 
@@ -252,6 +238,14 @@ pub fn setInitialContext(caller: kernel.PrincipalId, token: u64, rip: u64, rsp: 
     return boot_static.syscall_ok;
 }
 
+pub fn setBootstrapOwner(caller: kernel.PrincipalId, token: u64, enabled: u64) u64 {
+    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
+    if (enabled > 1) return boot_static.syscall_err_invalid;
+    state_ptr.setBootstrapOwner(target, enabled != 0) catch return boot_static.syscall_err_invalid;
+    return boot_static.syscall_ok;
+}
+
 pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
@@ -259,16 +253,6 @@ pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     const slot = processSlot(target) orelse return boot_static.syscall_err_invalid;
     state_ptr.clearProcessBuilderSuspended(target) catch return boot_static.syscall_err_invalid;
     if (!scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
-    if (scheduler.spawnExecApUserSchedulingEnabled()) {
-        kernel_log.write("process_builder start child=");
-        log_util.printNumber(slot);
-        kernel_log.write(" thread=");
-        log_util.printNumber(@as(u64, @intCast(thread_index)));
-        kernel_log.write(" sched_ap_place=blocked:process_builder_path");
-        kernel_log.write(" assigned_cpu=");
-        log_util.printNumber(@as(u64, @intCast(scheduler.threadCpuSlot(thread_index) orelse scheduler.idle_thread_marker)));
-        kernel_log.write("\n");
-    }
     return boot_abi.process_abi.encodeSpawnedProcess(slot, @intCast(thread_index));
 }
 

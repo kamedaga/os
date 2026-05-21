@@ -63,8 +63,8 @@ target_link_options(esp_server PRIVATE
   -Wl,-e,_start
   -Wl,-pie
   -Wl,--no-dynamic-linker
-  -Wl,-z,common-page-size=16
-  -Wl,-z,max-page-size=16
+  -Wl,-z,common-page-size=4096
+  -Wl,-z,max-page-size=4096
 )
 
 target_link_options(esp_server_smoke PRIVATE
@@ -74,6 +74,6 @@ target_link_options(esp_server_smoke PRIVATE
   -Wl,-e,_start
   -Wl,-pie
   -Wl,--no-dynamic-linker
-  -Wl,-z,common-page-size=16
-  -Wl,-z,max-page-size=16
+  -Wl,-z,common-page-size=4096
+  -Wl,-z,max-page-size=4096
 )

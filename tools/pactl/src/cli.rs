@@ -108,7 +108,7 @@ fn print_help() {
     println!("  pactl sync rootfs");
     println!("  pactl sync bootfs");
     println!("  pactl run [--timed] [--pf-check <jobs>] [--no-kvm] [--dry-run] [--console=off|pty|stdio] [--display=gtk|none] [--split-windows]");
-    println!("    run defaults: --console=stdio --display=gtk; timed/pf-check and --split-windows default to --console=pty");
+    println!("    run uses a cached qcow2 overlay; timed/pf-check and --split-windows default to --console=pty");
     println!("  pactl gen manifests");
 }
 

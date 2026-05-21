@@ -58,6 +58,14 @@ void linux_abi_main(void) {
         }
         if (!g_proc) { msg = reply(errno_busy(), 0); continue; }
         process_timers_update(g_proc);
+        if (req->kind == TRAP_KIND_PAGE_FAULT) {
+            msg = handle_page_fault(req);
+            continue;
+        }
+        if (req->kind != TRAP_KIND_ABI_SYSCALL) {
+            msg = reply(errno_inval(), 0);
+            continue;
+        }
         const int profile_this_syscall = g_proc->profile_enabled != 0;
         const int profile_trace_this_syscall = profile_trace_enabled();
         if (profile_this_syscall) profile_count_syscall(req->nr);
@@ -122,6 +130,8 @@ void linux_abi_main(void) {
         case LINUX_SYS_RENAME: msg = handle_renameat(req, 1, 0); break;
         case LINUX_SYS_MKDIR: msg = handle_mkdirat(req, 1); break;
         case LINUX_SYS_MKDIRAT: msg = handle_mkdirat(req, 0); break;
+        case LINUX_SYS_LINK: msg = handle_linkat(req, 1); break;
+        case LINUX_SYS_LINKAT: msg = handle_linkat(req, 0); break;
         case LINUX_SYS_UNLINK: msg = handle_unlinkat(req, 1); break;
         case LINUX_SYS_UNLINKAT: msg = handle_unlinkat(req, 0); break;
         case LINUX_SYS_RENAMEAT: msg = handle_renameat(req, 0, 0); break;
@@ -193,6 +203,7 @@ void linux_abi_main(void) {
                 const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
                 const int process_exits = exit_group || !exiting_thread;
                 int satisfy_waiters_after_exit_reply = 0;
+                int skip_kernel_exit_reclaim = 0;
                 profile_trace_event_u64("exit.begin principal", exiting_principal);
                 if (g_root_linux_principal_set && (exiting_principal == g_root_linux_principal || exiting_pid == g_root_linux_principal)) {
                     user_log("LinuxAbiServer: root exit nr=");
@@ -235,18 +246,23 @@ void linux_abi_main(void) {
                     if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
                     profile_trace_event_u64("exit.close_fds pid", exiting_pid);
                     close_all_process_fds(g_proc);
+                    const u64 tracked_exit_pages = exiting_proc ? vm_tracked_page_count() : 0;
+                    const int tracked_unmap_ok = unmap_all_tracked_target_ranges();
+                    /* Large Linux VM spaces are cheaper to reclaim from the ABI server's tracked map. */
+                    skip_kernel_exit_reclaim = tracked_unmap_ok && tracked_exit_pages >= LINUX_EXIT_SKIP_RECLAIM_PAGE_THRESHOLD;
                     satisfy_waiters_after_exit_reply = 1;
                 }
                 remove_futex_waiters_for_principal(exiting_principal);
                 if (exiting_proc) exiting_proc->used = 0;
                 prime_reply_return_signal();
-                profile_trace_event_u64("exit.reply principal", exiting_principal);
-                exit_trap_target_no_wait(exiting_principal);
                 if (satisfy_waiters_after_exit_reply) {
                     profile_trace_event_u64("exit.satisfy_waiters pid", exiting_pid);
                     (void)satisfy_pending_waiters_for_child(exiting_pid);
+                    try_satisfy_pending_sigwaits();
                 }
-                msg = wait_ipc();
+                profile_trace_event_u64("exit.reply principal", exiting_principal);
+                const u64 exit_flags = TRAP_RESPONSE_FLAG_EXIT | (skip_kernel_exit_reclaim ? TRAP_RESPONSE_FLAG_SKIP_RECLAIM : 0);
+                msg = reply_current_token(0, exit_flags);
                 (void)msg;
                 int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
                 if (!root_exited && g_root_linux_principal_set) {

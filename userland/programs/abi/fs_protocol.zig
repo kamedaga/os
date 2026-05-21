@@ -1,7 +1,7 @@
 const fs_abi = @import("fs_abi.zig");
 
 pub const page_bytes: usize = 4096;
-pub const max_path_bytes: usize = 128;
+pub const max_path_bytes: usize = 512;
 pub const request_magic: u32 = 0x5153_4653; // "QSFS"
 pub const response_magic: u32 = 0x5253_4653; // "RSFS"
 pub const version: u16 = 1;

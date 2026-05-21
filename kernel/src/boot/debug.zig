@@ -1,55 +1,8 @@
-const kernel = @import("../kernel.zig");
-const capability = @import("../capability.zig");
-const device_capabilities = @import("../device_capabilities.zig");
-
 pub const Hooks = struct {
     write: *const fn ([]const u8) void,
-    print_number: *const fn (u64) void,
-    print_hex: *const fn (u64) void,
-    principal_label: *const fn (kernel.PrincipalId) []const u8,
 };
 
 pub fn logReadyTitle(hooks: Hooks, title: []const u8) void {
     hooks.write(title);
-    hooks.write("\n");
-}
-
-pub fn dumpAllProcessCaps(
-    state: *const kernel.KernelState,
-    process_count: usize,
-    principal_label: *const fn (kernel.PrincipalId) []const u8,
-) void {
-    var i: usize = 0;
-    while (i < process_count) : (i += 1) {
-        const principal = kernel.processPrincipalFromIndex(i) orelse unreachable;
-        capability.dumpPrincipalCaps(state, principal, principal_label(principal));
-    }
-}
-
-fn queueCapOpLabel(op: device_capabilities.QueueOperation) []const u8 {
-    return switch (op) {
-        .submit => "submit",
-        .notify => "notify",
-    };
-}
-
-pub fn logQueueCapDeny(
-    hooks: Hooks,
-    proc: kernel.PrincipalId,
-    token: u64,
-    queue_index: u16,
-    op: device_capabilities.QueueOperation,
-    err: anyerror,
-) void {
-    hooks.write("queue_cap deny proc=");
-    hooks.write(hooks.principal_label(proc));
-    hooks.write(" op=");
-    hooks.write(queueCapOpLabel(op));
-    hooks.write(" q=");
-    hooks.print_number(queue_index);
-    hooks.write(" token=");
-    hooks.print_hex(token);
-    hooks.write(" err=");
-    hooks.write(@errorName(err));
     hooks.write("\n");
 }

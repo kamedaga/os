@@ -291,6 +291,7 @@ static u64 take_deliverable_signal(struct linux_process_state *proc) {
 static int try_reply_signal_frame(u64 result, u64 flags) {
     if (flags != 0 || !g_proc || !g_abi_ctx || !g_abi_ctx->request) return 0;
     const struct trap_request *req = g_abi_ctx->request;
+    if (req->kind != TRAP_KIND_ABI_SYSCALL) return 0;
     if (req->nr == LINUX_SYS_RT_SIGRETURN) return 0;
     const u64 signo = take_deliverable_signal(g_proc);
     if (signo == 0) return 0;
@@ -357,7 +358,32 @@ static struct ipc_message reply_current_token(u64 result, u64 flags) {
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
 
+static void trace_errno_reply(u64 result, u64 flags) {
+    if (result != (u64)(i64)-22 || !profile_trace_enabled() || g_abi_ctx == 0 || g_abi_ctx->request == 0) return;
+    const struct trap_request *req = g_abi_ctx->request;
+    user_log("LinuxAbiServer.trace errno=EINVAL nr=");
+    user_log_dec_value(req->nr);
+    user_log(" principal=");
+    user_log_dec_value(req->caller_principal);
+    user_log(" flags=");
+    user_log_hex_inline(flags);
+    user_log(" a0=");
+    user_log_hex_inline(req->args[0]);
+    user_log(" a1=");
+    user_log_hex_inline(req->args[1]);
+    user_log(" a2=");
+    user_log_hex_inline(req->args[2]);
+    user_log(" a3=");
+    user_log_hex_inline(req->args[3]);
+    user_log(" a4=");
+    user_log_hex_inline(req->args[4]);
+    user_log(" a5=");
+    user_log_hex_inline(req->args[5]);
+    user_log("\n");
+}
+
 static struct ipc_message reply(u64 result, u64 flags) {
+    trace_errno_reply(result, flags);
     if (try_reply_signal_frame(result, flags)) return wait_ipc_timeout(1);
     const u64 explicit_target = abi_reply_target_principal();
     if (explicit_target != 0) {
@@ -390,6 +416,8 @@ static u64 errno_spipe(void) { return (u64)(i64)-29; }
 static u64 errno_pipe(void) { return (u64)(i64)-32; }
 static u64 errno_nosys(void) { return (u64)(i64)-38; }
 static u64 errno_nametoolong(void) { return (u64)(i64)-36; }
+static u64 errno_nospc(void) { return (u64)(i64)-28; }
+static u64 errno_fbig(void) { return (u64)(i64)-27; }
 static u64 errno_range(void) { return (u64)(i64)-34; }
 static u64 errno_destaddrreq(void) { return (u64)(i64)-89; }
 static u64 errno_msgsize(void) { return (u64)(i64)-90; }
@@ -409,8 +437,12 @@ static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) 
 static u64 reserve_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_RESERVE_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 unmap_reply_target_pages(u64 target_va, u64 page_count) { return syscall2(SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count); }
+static u64 map_current_pages_to_reply_target(u64 source_va, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4(SYSCALL_MAP_CURRENT_PAGES_TO_ABI_TRAP_REPLY_TARGET, source_va, target_va, page_count, prot_bits); }
+static u64 cow_reply_target_page(u64 target_va, u64 prot_bits) { return syscall2(SYSCALL_COW_ABI_TRAP_REPLY_TARGET_PAGE, target_va, prot_bits); }
+static u64 map_vm_object_to_reply_target(u64 vm_token, u64 target_va, u64 prot_bits) { return syscall3(SYSCALL_MAP_VM_OBJECT_TO_ABI_TRAP_REPLY_TARGET, vm_token, target_va, prot_bits); }
 static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
 static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
+static u64 copy_to_target_bulk(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET_BULK, target_va, (u64)src, len); }
 static u64 copy_to_trap_target(u64 principal, u64 target_va, const void *src, u64 len) { return syscall4_r10(SYSCALL_COPY_TO_ABI_TRAP_TARGET, principal, target_va, (u64)src, len); }
 static u64 reply_trap_target(u64 principal, u64 result, u64 flags) { return syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, principal, result, flags); }
 static u64 start_trap_target(u64 principal) { return syscall1(SYSCALL_START_ABI_TRAP_TARGET, principal); }
@@ -433,7 +465,6 @@ static void prime_reply_return_signal(void) { (void)syscall2(SYSCALL_SIGNAL_ENDP
 static void exit_trap_target_no_wait(u64 principal) {
     abi_set_reply_target_principal(0);
     const u64 status = reply_trap_target(principal, 0, TRAP_RESPONSE_FLAG_EXIT);
-    (void)detach_reply_token();
     if (status != SYSCALL_OK) {
         user_log("LinuxAbiServer: explicit exit reply failed=");
         user_log_hex_value(status);
@@ -739,6 +770,15 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_cap_ticks=", g_prof.vfs_bulk_cap_ticks);
     user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_request_ticks=", g_prof.vfs_bulk_request_ticks);
     user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_copy_ticks=", g_prof.vfs_bulk_copy_ticks);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_pages=", g_prof.vfs_bulk_direct_pages);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_ticks=", g_prof.vfs_bulk_direct_ticks);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_attempts=", g_prof.vfs_bulk_direct_attempts);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_fallback_pages=", g_prof.vfs_bulk_direct_fallback_pages);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_paddr_fail=", g_prof.vfs_bulk_direct_paddr_fail);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_signal_fail=", g_prof.vfs_bulk_direct_signal_fail);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_wait_fail=", g_prof.vfs_bulk_direct_wait_fail);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_status_fail=", g_prof.vfs_bulk_direct_status_fail);
+    user_log_dec_line("LinuxAbiServer.perf.vfs.bulk_direct_bytes_fail=", g_prof.vfs_bulk_direct_bytes_fail);
 
     user_log_dec_line("LinuxAbiServer.perf.fs.read_bytes=", g_prof.fs_read_bytes);
     user_log_dec_line("LinuxAbiServer.perf.fs.read_cmd_bytes=", g_prof.fs_read_cmd_bytes);
@@ -749,6 +789,32 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.cache.file_hits=", g_prof.file_cache_hits);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_misses=", g_prof.file_cache_misses);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_bytes=", g_prof.file_cache_fill_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_pages=", g_prof.file_cache_map_pages);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_faults=", g_prof.file_cache_cow_faults);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_considered=", g_prof.file_cache_cow_considered);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_candidates=", g_prof.file_cache_cow_candidates);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_skip_peers=", g_prof.file_cache_cow_skip_peers);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_skip_no_path=", g_prof.file_cache_cow_skip_no_path);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_skip_uncacheable=", g_prof.file_cache_cow_skip_uncacheable);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_fallbacks=", g_prof.file_cache_cow_fallbacks);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_considered=", g_prof.file_vm_object_mmap_considered);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_candidates=", g_prof.file_vm_object_mmap_candidates);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_mapped=", g_prof.file_vm_object_mmap_mapped);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_fallbacks=", g_prof.file_vm_object_mmap_fallbacks);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_pages=", g_prof.file_vm_object_mmap_pages);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_tail_pages=", g_prof.file_vm_object_mmap_tail_pages);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_install_fail=", g_prof.file_vm_object_mmap_install_fail);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_map_fail=", g_prof.file_vm_object_mmap_map_fail);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_no_path=", g_prof.file_cache_fill_fail_no_path);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_uncacheable=", g_prof.file_cache_fill_fail_uncacheable);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_size=", g_prof.file_cache_fill_fail_size);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_slot=", g_prof.file_cache_fill_fail_slot);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_alloc=", g_prof.file_cache_fill_fail_alloc);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_read=", g_prof.file_cache_fill_fail_read);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_unaligned=", g_prof.file_cache_map_fail_unaligned);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_fill=", g_prof.file_cache_map_fail_fill);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_range=", g_prof.file_cache_map_fail_range);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_syscall=", g_prof.file_cache_map_fail_syscall);
     user_log_dec_line("LinuxAbiServer.perf.cache.path_hits=", g_prof.path_cache_hits);
     user_log_dec_line("LinuxAbiServer.perf.cache.path_misses=", g_prof.path_cache_misses);
     user_log_dec_line("LinuxAbiServer.perf.cache.open_hits=", g_prof.open_cache_hits);

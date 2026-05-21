@@ -18,6 +18,7 @@ enum {
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_GET_PROCESS_STATUS = 0x30,
+    SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
     SYSCALL_PROCESS_EXIT = 0x34,
     SYSCALL_CREATE_SUSPENDED_PROCESS = 0x41,
     SYSCALL_MAP_VM_OBJECT_TO_PROCESS = 0x42,
@@ -48,7 +49,6 @@ enum {
     LINUX_ABI_REQUEST_PAGES_BASE_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
-    EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
     PROCESS_BUILDER_TOKEN_TAG = 1ULL << 60,
     PROCESS_BUILDER_PROCESS_MASK = 0xffffffffULL,
     IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
@@ -81,8 +81,12 @@ enum {
     DT_RELA = 7,
     DT_RELASZ = 8,
     DT_RELAENT = 9,
+    DT_RELRSZ = 35,
+    DT_RELR = 36,
+    DT_RELRENT = 37,
     ELF_DYN_BYTES = 16,
     ELF_RELA_BYTES = 24,
+    ELF_RELR_BYTES = 8,
     R_X86_64_RELATIVE = 8,
     PROCESS_STATUS_INACTIVE = 0,
     PROCESS_STATUS_ACTIVE = 1,
@@ -247,8 +251,7 @@ static u64 map_ipc_buffer_anywhere(u64 token, u64 writable) {
 }
 
 static int is_vm_object_token(u64 token) {
-    return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG &&
-        (token & VM_OBJECT_TOKEN_TAG) != 0 &&
+    return (token & VM_OBJECT_TOKEN_TAG) != 0 &&
         (token & ~VM_OBJECT_TOKEN_TAG) != 0;
 }
 
@@ -318,6 +321,10 @@ static int set_process_abi_trap_delegate(u64 process_token, u64 endpoint_id, u64
 
 static int install_endpoint(u64 endpoint_id, u64 process_slot) {
     return syscall3(SYSCALL_INSTALL_ENDPOINT, 0, endpoint_id, process_slot) == SYSCALL_OK;
+}
+
+static int publish_service_endpoint(u64 endpoint_id, u64 process_slot) {
+    return syscall2(SYSCALL_PUBLISH_SERVICE_ENDPOINT, endpoint_id, process_slot) == SYSCALL_OK;
 }
 
 static u64 wait_event(int mailbox, u64 ticks) {
@@ -718,6 +725,46 @@ static int find_relative_relocation_table(
     if (rela_ent != ELF_RELA_BYTES || (rela_size % ELF_RELA_BYTES) != 0) return 0;
     if (!file_offset_for_vaddr(source_va, ehdr, rela_va, rela_size, file_bytes, rela_file_off_out)) return 0;
     *rela_size_out = rela_size;
+    return 1;
+}
+
+static int find_packed_relative_relocation_table(
+    u64 source_va,
+    const struct exec_elf_header *ehdr,
+    const struct exec_elf_program_header *dynamic,
+    u64 file_bytes,
+    u64 *relr_file_off_out,
+    u64 *relr_size_out
+) {
+    if (dynamic->filesz == 0) {
+        *relr_file_off_out = 0;
+        *relr_size_out = 0;
+        return 1;
+    }
+    u64 dyn_file_end;
+    if (!add_u64(dynamic->offset, dynamic->filesz, &dyn_file_end) || dyn_file_end > file_bytes) return 0;
+    u64 relr_va = 0;
+    u64 relr_size = 0;
+    u64 relr_ent = ELF_RELR_BYTES;
+
+    for (u64 off = dynamic->offset; off + ELF_DYN_BYTES <= dyn_file_end; off += ELF_DYN_BYTES) {
+        const unsigned char *dyn = (const unsigned char *)(source_va + off);
+        const long long tag = read_i64_le_unchecked(dyn);
+        const u64 value = read_u64_le_unchecked(dyn + 8);
+        if (tag == DT_NULL) break;
+        if (tag == DT_RELR) relr_va = value;
+        if (tag == DT_RELRSZ) relr_size = value;
+        if (tag == DT_RELRENT) relr_ent = value;
+    }
+
+    if (relr_va == 0 || relr_size == 0) {
+        *relr_file_off_out = 0;
+        *relr_size_out = 0;
+        return 1;
+    }
+    if (relr_ent != ELF_RELR_BYTES || (relr_size % ELF_RELR_BYTES) != 0) return 0;
+    if (!file_offset_for_vaddr(source_va, ehdr, relr_va, relr_size, file_bytes, relr_file_off_out)) return 0;
+    *relr_size_out = relr_size;
     return 1;
 }
 
@@ -1183,6 +1230,79 @@ static int apply_relative_relocations(
     return 1;
 }
 
+static int read_image_u64_at_vaddr(
+    u64 source_va,
+    const struct exec_elf_header *ehdr,
+    u64 file_bytes,
+    u64 vaddr,
+    u64 *value_out
+) {
+    u64 file_off = 0;
+    if (!file_offset_for_vaddr(source_va, ehdr, vaddr, 8, file_bytes, &file_off)) {
+        *value_out = 0;
+        return 1;
+    }
+    if (file_off > file_bytes || file_bytes - file_off < 8) return 0;
+    *value_out = read_u64_le_unchecked((const unsigned char *)(source_va + file_off));
+    return 1;
+}
+
+static int apply_packed_relative_reloc_at(
+    u64 process_token,
+    u64 source_va,
+    const struct exec_elf_header *ehdr,
+    u64 file_bytes,
+    u64 load_bias,
+    u64 r_offset
+) {
+    u64 addend = 0;
+    u64 dest_va = 0;
+    u64 relocated = 0;
+    unsigned char bytes[8];
+    if (!read_image_u64_at_vaddr(source_va, ehdr, file_bytes, r_offset, &addend)) return 0;
+    if (!add_u64(load_bias, r_offset, &dest_va)) return 0;
+    if ((dest_va & (PAGE_BYTES - 1)) > PAGE_BYTES - 8) return 0;
+    if (!add_u64(load_bias, addend, &relocated)) return 0;
+    write_u64_le(bytes, relocated);
+    return copy_to_process(process_token, dest_va, (u64)bytes, 8);
+}
+
+static int apply_packed_relative_relocations(
+    u64 process_token,
+    u64 source_va,
+    const struct exec_elf_header *ehdr,
+    u64 file_bytes,
+    u64 load_bias
+) {
+    struct exec_elf_program_header dynamic;
+    if (!find_dynamic_phdr(source_va, ehdr, file_bytes, &dynamic)) return 1;
+
+    u64 relr_file_off = 0;
+    u64 relr_size = 0;
+    if (!find_packed_relative_relocation_table(source_va, ehdr, &dynamic, file_bytes, &relr_file_off, &relr_size)) return 0;
+    if (relr_size == 0) return 1;
+
+    u64 relr_end;
+    if (!add_u64(relr_file_off, relr_size, &relr_end) || relr_end > file_bytes) return 0;
+    u64 next_r_offset = 0;
+    for (u64 off = relr_file_off; off < relr_end; off += ELF_RELR_BYTES) {
+        const u64 entry = read_u64_le_unchecked((const unsigned char *)(source_va + off));
+        if ((entry & 1ULL) == 0) {
+            if (!apply_packed_relative_reloc_at(process_token, source_va, ehdr, file_bytes, load_bias, entry)) return 0;
+            next_r_offset = entry + ELF_RELR_BYTES;
+            continue;
+        }
+        const u64 bitmap = entry >> 1;
+        for (u64 bit = 0; bit < 63; bit++) {
+            if ((bitmap & (1ULL << bit)) == 0) continue;
+            const u64 r_offset = next_r_offset + bit * ELF_RELR_BYTES;
+            if (!apply_packed_relative_reloc_at(process_token, source_va, ehdr, file_bytes, load_bias, r_offset)) return 0;
+        }
+        next_r_offset += 63 * ELF_RELR_BYTES;
+    }
+    return 1;
+}
+
 static int load_elf_image_into_process(
     u64 process_token,
     struct child_map_tracker *tracker,
@@ -1191,6 +1311,7 @@ static int load_elf_image_into_process(
     u64 file_bytes,
     u64 source_va,
     const struct exec_elf_summary *summary,
+    int apply_initial_relocations,
     struct loaded_image *image_out
 ) {
     u64 load_bias = 0;
@@ -1234,9 +1355,15 @@ static int load_elf_image_into_process(
         user_log("Exec: mapped count failed\n");
         return 0;
     }
-    if (!apply_relative_relocations(process_token, source_va, &summary->header, file_bytes, load_bias)) {
-        user_log("Exec: relative reloc failed\n");
-        return 0;
+    if (apply_initial_relocations) {
+        if (!apply_relative_relocations(process_token, source_va, &summary->header, file_bytes, load_bias)) {
+            user_log("Exec: relative reloc failed\n");
+            return 0;
+        }
+        if (!apply_packed_relative_relocations(process_token, source_va, &summary->header, file_bytes, load_bias)) {
+            user_log("Exec: packed relative reloc failed\n");
+            return 0;
+        }
     }
     return init_loaded_image(summary, source_va, file_bytes, load_bias, mapped_count, image_out);
 }
@@ -1259,7 +1386,8 @@ static int prepare_and_start_process(const struct exec_bootstrap_config *cfg, st
     struct load_layout layout;
     layout.next_dyn_base = ET_DYN_ALLOC_START_VA;
 
-    if (!load_elf_image_into_process(process_token, tracker, &layout, main_vm_token, cfg->executable_file_bytes, main_source_va, &main_summary, image_out)) {
+    const int main_apply_initial_relocations = !main_summary.has_interp;
+    if (!load_elf_image_into_process(process_token, tracker, &layout, main_vm_token, cfg->executable_file_bytes, main_source_va, &main_summary, main_apply_initial_relocations, image_out)) {
         abort_process(process_token);
         user_log("Exec: main image map failed\n");
         return 0;
@@ -1281,7 +1409,7 @@ static int prepare_and_start_process(const struct exec_bootstrap_config *cfg, st
             user_log("Exec: interpreter validation failed\n");
             return 0;
         }
-        if (!load_elf_image_into_process(process_token, tracker, &layout, interp_vm_token, cfg->interpreter_file_bytes, interp_source_va, &interp_summary, &interp_image)) {
+        if (!load_elf_image_into_process(process_token, tracker, &layout, interp_vm_token, cfg->interpreter_file_bytes, interp_source_va, &interp_summary, 0, &interp_image)) {
             abort_process(process_token);
             user_log("Exec: interpreter map failed\n");
             return 0;
@@ -1341,18 +1469,18 @@ static int map_service_response_page(u64 response_paddr) {
 
 static int map_service_request_buffer(u64 request_token) {
     if (service_request_token == request_token) return 1;
-    if (service_request_token != 0) return 0;
-    service_request_va = map_ipc_buffer_anywhere(request_token, 0);
-    if (service_request_va < PAGE_BYTES) return 0;
+    const u64 request_va = map_ipc_buffer_anywhere(request_token, 0);
+    if (request_va < PAGE_BYTES) return 0;
+    service_request_va = request_va;
     service_request_token = request_token;
     return 1;
 }
 
 static int map_service_response_buffer(u64 response_token) {
     if (service_response_token == response_token) return 1;
-    if (service_response_token != 0) return 0;
-    service_response_va = map_ipc_buffer_anywhere(response_token, 1);
-    if (service_response_va < PAGE_BYTES) return 0;
+    const u64 response_va = map_ipc_buffer_anywhere(response_token, 1);
+    if (response_va < PAGE_BYTES) return 0;
+    service_response_va = response_va;
     service_response_token = response_token;
     return 1;
 }
@@ -1479,12 +1607,15 @@ static void run_exec_service(const struct exec_bootstrap_config *cfg) {
     service_interpreter_vm_token = cfg->interpreter_vm_token;
     service_interpreter_file_bytes = cfg->interpreter_file_bytes;
     const u64 self_slot = syscall1(SYSCALL_GET_PROCESS_SLOT, 0);
-    if (self_slot == 0 || !install_endpoint(EXEC_LAUNCH_ENDPOINT_ID, self_slot)) {
+    if (self_slot == 0 ||
+        !install_endpoint(EXEC_LAUNCH_ENDPOINT_ID, self_slot) ||
+        !publish_service_endpoint(EXEC_LAUNCH_ENDPOINT_ID, self_slot))
+    {
         user_log("Exec: service endpoint failed\n");
         process_exit(1);
     }
 
-    user_log("Exec: service ready\n");
+    user_log("ExecService: endpoint ready\n");
     for (;;) {
         const u64 received = wait_event(1, 1);
         if (received >= PAGE_BYTES) {

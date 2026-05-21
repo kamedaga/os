@@ -7,6 +7,7 @@ project(seed2_root C ASM)
 
 add_executable(seed2_root
   src/entry.S
+  ../exec/src/elf.c
   src/main.c
 )
 
@@ -16,7 +17,7 @@ set_target_properties(seed2_root PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 
-target_include_directories(seed2_root PRIVATE ../rootfs/fat_server/include)
+target_include_directories(seed2_root PRIVATE ../rootfs/fat_server/include ../exec/include)
 
 target_compile_options(seed2_root PRIVATE
   -target x86_64-freestanding-none
@@ -37,6 +38,6 @@ target_link_options(seed2_root PRIVATE
   -Wl,-e,_start
   -Wl,-pie
   -Wl,--no-dynamic-linker
-  -Wl,-z,common-page-size=16
-  -Wl,-z,max-page-size=16
+  -Wl,-z,common-page-size=4096
+  -Wl,-z,max-page-size=4096
 )

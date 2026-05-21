@@ -181,7 +181,6 @@ pub const KernelError = error{
     RegionNotFound,
     CapabilityNotFound,
     VmObjectCapabilityNotFound,
-    ExecImageCapabilityNotFound,
     EndpointNotFound,
     MailboxEmpty,
     RevokeOverflow,
@@ -617,7 +616,7 @@ pub const IpcBufferMailbox = struct {
     }
 };
 
-pub const max_image_backing_pages: usize = 32768;
+pub const max_image_backing_pages: usize = 65535;
 pub const max_image_backing_store_pages: usize = 262144;
 
 var image_backing_page_store: [max_image_backing_store_pages]u64 = [_]u64{0} ** max_image_backing_store_pages;
@@ -641,12 +640,6 @@ pub const VmObjectRights = packed struct(u32) {
     map: bool = false,
     grant: bool = false,
     _reserved: u28 = 0,
-};
-
-pub const ExecImageRights = packed struct(u32) {
-    exec: bool = false,
-    grant: bool = false,
-    _reserved: u30 = 0,
 };
 
 pub const ImageBacking = struct {
@@ -713,14 +706,6 @@ pub const VmObjectCapability = struct {
     parent_cap_id: u64,
 };
 
-pub const ExecImageCapability = struct {
-    backing: ImageBacking,
-    rights: ExecImageRights,
-    cap_id: u64,
-    root_cap_id: u64,
-    parent_cap_id: u64,
-};
-
 pub const VmObjectCNode = struct {
     pub const max_caps = 64;
 
@@ -740,33 +725,6 @@ pub const VmObjectCNode = struct {
     }
 
     fn findIndexByCapId(self: *const VmObjectCNode, cap_id: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            if (self.caps[i].cap_id == cap_id) return i;
-        }
-        return null;
-    }
-};
-
-pub const ExecImageCNode = struct {
-    pub const max_caps = 64;
-
-    caps: [max_caps]ExecImageCapability = undefined,
-    len: usize = 0,
-
-    pub fn add(self: *ExecImageCNode, cap: ExecImageCapability) KernelError!void {
-        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
-        if (self.len >= self.caps.len) return KernelError.TableFull;
-        self.caps[self.len] = cap;
-        self.len += 1;
-    }
-
-    pub fn findByCapId(self: *const ExecImageCNode, cap_id: u64) ?*const ExecImageCapability {
-        if (self.findIndexByCapId(cap_id)) |index| return &self.caps[index];
-        return null;
-    }
-
-    fn findIndexByCapId(self: *const ExecImageCNode, cap_id: u64) ?usize {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
             if (self.caps[i].cap_id == cap_id) return i;
@@ -968,7 +926,6 @@ pub const KernelState = struct {
     ipc_buffer_mailboxes: [principal_count]IpcBufferMailbox = [_]IpcBufferMailbox{.{}} ** principal_count,
     pending_ipc_buffer_transfers: [principal_count]?PendingIpcBufferTransfer = [_]?PendingIpcBufferTransfer{null} ** principal_count,
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
-    exec_image_tables: [principal_count]ExecImageCNode = [_]ExecImageCNode{.{}} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     debug_alloc_page_hook: ?*const fn (state: *const KernelState, requester: PrincipalId, stage: DebugAllocPageStage, paddr: u64) void = null,
@@ -1173,12 +1130,6 @@ pub const KernelState = struct {
         return (child_bits & ~parent_bits) == 0;
     }
 
-    fn isExecImageRightsSubset(child: ExecImageRights, parent: ExecImageRights) bool {
-        const child_bits: u32 = @bitCast(child);
-        const parent_bits: u32 = @bitCast(parent);
-        return (child_bits & ~parent_bits) == 0;
-    }
-
     fn isIpcBufferRightsSubset(child: IpcBufferRights, parent: IpcBufferRights) bool {
         const child_bits: u32 = @bitCast(child);
         const parent_bits: u32 = @bitCast(parent);
@@ -1245,7 +1196,6 @@ pub const KernelState = struct {
         self.ipc_buffer_mailboxes[index] = .{};
         self.pending_ipc_buffer_transfers[index] = null;
         self.vm_object_tables[index] = .{};
-        self.exec_image_tables[index] = .{};
     }
 
     pub fn createProcessDescriptor(self: *KernelState, label: []const u8) ?PrincipalId {
@@ -1400,7 +1350,6 @@ pub const KernelState = struct {
             self.ipc_buffer_mailboxes[i] = .{};
             self.pending_ipc_buffer_transfers[i] = null;
             self.vm_object_tables[i] = .{};
-            self.exec_image_tables[i] = .{};
         }
         self.published_service_endpoints = .{};
         i = 0;
@@ -1697,14 +1646,6 @@ pub const KernelState = struct {
         return &self.ipc_buffer_tables[self.principalStorageIndex(principal)];
     }
 
-    pub fn getExecImageTable(self: *KernelState, principal: PrincipalId) *ExecImageCNode {
-        return &self.exec_image_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getExecImageTableConst(self: *const KernelState, principal: PrincipalId) *const ExecImageCNode {
-        return &self.exec_image_tables[self.principalStorageIndex(principal)];
-    }
-
     pub fn endpointTargetFor(self: *const KernelState, owner: PrincipalId, endpoint_id: u64) ?PrincipalId {
         if (!self.hasActivePrincipal(owner)) return null;
         return self.endpointTargetForKnownActiveOwner(owner, endpoint_id);
@@ -1735,6 +1676,27 @@ pub const KernelState = struct {
         if (rights.write and !page_cap.rights.cpu_write) return KernelError.InvalidState;
         if (rights.map and !(page_cap.rights.cpu_read or page_cap.rights.cpu_write)) return KernelError.InvalidState;
         if (rights.grant and !page_cap.rights.grant) return KernelError.InvalidState;
+
+        const root_id = self.allocCapId();
+        try self.getIpcBufferTable(owner).add(.{
+            .paddr = paddr,
+            .rights = rights,
+            .role = role,
+            .cap_id = root_id,
+            .root_cap_id = root_id,
+            .parent_cap_id = 0,
+        });
+        return root_id;
+    }
+
+    pub fn installTrustedIpcBufferFromPage(
+        self: *KernelState,
+        owner: PrincipalId,
+        paddr: u64,
+        rights: IpcBufferRights,
+        role: IpcBufferRole,
+    ) KernelError!u64 {
+        try self.requireActiveProcess(owner);
 
         const root_id = self.allocCapId();
         try self.getIpcBufferTable(owner).add(.{
@@ -1899,54 +1861,6 @@ pub const KernelState = struct {
         const child_id = self.allocCapId();
         try self.getVmObjectTable(owner).add(.{
             .backing = backing,
-            .rights = rights,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-        return child_id;
-    }
-
-    pub fn installExecImageCap(
-        self: *KernelState,
-        owner: PrincipalId,
-        vm_cap_id: u64,
-        rights: ExecImageRights,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-
-        const vm_cap = self.getVmObjectTableConst(owner).findByCapId(vm_cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
-        if (!vm_cap.rights.read) return KernelError.InvalidState;
-
-        const root_id = self.allocCapId();
-        try self.getExecImageTable(owner).add(.{
-            .backing = vm_cap.backing,
-            .rights = rights,
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        return root_id;
-    }
-
-    pub fn grantExecImageCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        cap_id: u64,
-        rights: ExecImageRights,
-    ) KernelError!u64 {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getExecImageTableConst(from).findByCapId(cap_id) orelse return KernelError.ExecImageCapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        if (!isExecImageRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-
-        const child_id = self.allocCapId();
-        try self.getExecImageTable(to).add(.{
-            .backing = src_cap.backing,
             .rights = rights,
             .cap_id = child_id,
             .root_cap_id = src_cap.root_cap_id,

@@ -67,3 +67,5 @@ userland/fixtures/alpine-keys/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+AGENTS.md

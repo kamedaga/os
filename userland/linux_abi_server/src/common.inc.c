@@ -13,10 +13,8 @@ enum {
     SYSCALL_LOG = 0x9,
     SYSCALL_ALLOC_MAP_PAGES = 0xC,
     SYSCALL_WAIT_EVENT = 0x17,
-    SYSCALL_SPAWN_EXEC = 0x1D,
     SYSCALL_INSTALL_VM_OBJECT = 0x1E,
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
-    SYSCALL_INSTALL_EXEC_IMAGE = 0x20,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_SHARE_CAP = 0x2B,
@@ -50,6 +48,11 @@ enum {
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_RESERVE_ABI_TRAP_REPLY_TARGET_PAGES = 0x63,
     SYSCALL_REPLY_ABI_TRAP_TARGET_CONTEXT = 0x64,
+    SYSCALL_GRANT_ABI_TRAP_REPLY_TARGET_PAGES_AS_IPC_BUFFERS = 0x65,
+    SYSCALL_MAP_CURRENT_PAGES_TO_ABI_TRAP_REPLY_TARGET = 0x66,
+    SYSCALL_COW_ABI_TRAP_REPLY_TARGET_PAGE = 0x67,
+    SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET_BULK = 0x69,
+    SYSCALL_MAP_VM_OBJECT_TO_ABI_TRAP_REPLY_TARGET = 0x6A,
     SYSCALL_OK = 0,
     SYSCALL_ERR_NOT_READY = 2,
     SYSCALL_ERR_MAP = 5,
@@ -72,6 +75,8 @@ enum {
     IPC_BUFFER_ROLE_BULK = 3,
     TRAP_MAGIC = 0x3149424150415254ULL,
     TRAP_VERSION = 1,
+    TRAP_KIND_ABI_SYSCALL = 1,
+    TRAP_KIND_PAGE_FAULT = 2,
 
     SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
@@ -81,16 +86,17 @@ enum {
     SERVICE_KIND_CONSOLE = 10,
     SERVICE_KIND_NET = 11,
     SERVICE_KIND_TTY = 12,
+    SERVICE_KIND_EXEC = 13,
 
     FS_REQUEST_MAGIC = 0x51534653,
     FS_RESPONSE_MAGIC = 0x52534653,
     FS_PROTOCOL_VERSION = 1,
-    FS_MAX_PATH_BYTES = 128,
+    FS_MAX_PATH_BYTES = 512,
     FS_REQUEST_HEADER_BYTES = 72,
     FS_RESPONSE_HEADER_BYTES = 72,
     FS_RESPONSE_PAYLOAD_BYTES = PAGE_BYTES - FS_RESPONSE_HEADER_BYTES,
     FS_BULK_READ_INITIAL_PAGE_COUNT = 16,
-    FS_BULK_READ_PAGE_COUNT = 64,
+    FS_BULK_READ_PAGE_COUNT = 256,
     FS_BULK_READ_BYTES = FS_BULK_READ_PAGE_COUNT * PAGE_BYTES,
     FS_STAT_RECORD_BYTES = 56,
     FS_DIRENT_RECORD_BYTES = 24,
@@ -112,7 +118,12 @@ enum {
     FS_STATUS_INVALID = 1,
     FS_STATUS_NOT_FOUND = 2,
     FS_STATUS_NOT_DIR = 3,
+    FS_STATUS_IS_DIR = 4,
+    FS_STATUS_NO_RIGHT = 5,
+    FS_STATUS_TOO_BIG = 6,
     FS_STATUS_NOT_SUPPORTED = 7,
+    FS_STATUS_IO_ERROR = 8,
+    FS_STATUS_BUSY = 9,
     FS_STATUS_END_OF_DIR = 10,
     FS_OBJECT_NONE = 0,
     FS_OBJECT_MOUNT = 1,
@@ -239,6 +250,7 @@ enum {
     LINUX_SYS_FCHDIR = 81,
     LINUX_SYS_RENAME = 82,
     LINUX_SYS_MKDIR = 83,
+    LINUX_SYS_LINK = 86,
     LINUX_SYS_UNLINK = 87,
     LINUX_SYS_SYMLINK = 88,
     LINUX_SYS_READLINK = 89,
@@ -295,6 +307,7 @@ enum {
     LINUX_SYS_NEWFSTATAT = 262,
     LINUX_SYS_UNLINKAT = 263,
     LINUX_SYS_RENAMEAT = 264,
+    LINUX_SYS_LINKAT = 265,
     LINUX_SYS_SYMLINKAT = 266,
     LINUX_SYS_READLINKAT = 267,
     LINUX_SYS_FCHMODAT = 268,
@@ -318,6 +331,7 @@ enum {
     AT_FDCWD_U64 = 0xffffffffffffff9cULL,
     AT_SYMLINK_NOFOLLOW = 0x100,
     AT_EACCESS = 0x200,
+    AT_SYMLINK_FOLLOW = 0x400,
     AT_EMPTY_PATH = 0x1000,
     O_ACCMODE = 00000003,
     O_RDONLY = 0,
@@ -439,6 +453,7 @@ enum {
     MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED = 1 << 4,
 
     TRAP_RESPONSE_FLAG_EXIT = 1,
+    TRAP_RESPONSE_FLAG_SKIP_RECLAIM = 8,
     ARCH_SET_FS = 0x1002,
     TCGETS = 0x5401,
     TCSETS = 0x5402,
@@ -451,14 +466,10 @@ enum {
 
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
-    SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1 << 2,
-    SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1 << 3,
     BOOTSTRAP_CAP_KIND_VM_OBJECT = 2,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
-    EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
     VM_RIGHT_READ_MAP = 0x5,
     VM_RIGHT_READ_MAP_GRANT = 0xD,
-    EXEC_RIGHT_EXEC_GRANT = 0x3,
     EXEC_BOOTSTRAP_MAGIC = 0x45584543424F4F54ULL,
     EXEC_BOOTSTRAP_VERSION = 2,
     EXEC_BOOTSTRAP_FLAG_SERVICE_MODE = 1ULL << 0,
@@ -485,8 +496,18 @@ enum {
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
     LINUX_SIGNAL_FRAME_MAGIC = 0x5349474652414D45ULL,
     FILE_CACHE_BASE_VA = 0x28000000,
-    FILE_CACHE_BYTES = 8 * 1024 * 1024,
-    FILE_CACHE_MAX = 12,
+    FILE_CACHE_BYTES = 640 * 1024 * 1024,
+    FILE_CACHE_MAX = 64,
+    LINUX_MMAP_BASE_VA = 0x26800000,
+    LINUX_BRK_INITIAL_VA = 0x3B000000,
+    LINUX_EXIT_SKIP_RECLAIM_PAGE_THRESHOLD = 4096,
+    LINUX_ENABLE_FILE_PAGE_CACHE_COW = 0,
+    LINUX_ENABLE_FILE_VM_OBJECT_MMAP = 1,
+    LINUX_FILE_VM_OBJECT_MAX_PAGES = 4096,
+    LINUX_ENABLE_DIRECT_MMAP_BULK = 0,
+    LINUX_ENABLE_FILE_PAGE_FAULT_LAZY = 0,
+    LINUX_MATERIALIZE_FILE_PREFIX_BEFORE_FIXED = 1,
+    LINUX_FILE_FAULT_CLUSTER_PAGES = 256,
     EXECVE_MAX_IMAGE_BYTES = 128 * 1024 * 1024,
     EXECVE_MAX_LD_BYTES = 768 * 1024,
     EXECVE_MAX_ARGV = 8,
@@ -681,7 +702,10 @@ struct file_cache_entry {
     u16 path_len;
     u64 token;
     u64 size;
+    u64 file_offset;
+    u64 cached_size;
     u64 buffer_va;
+    u64 vm_token;
     struct fs_stat_record stat;
     char path[FS_MAX_PATH_BYTES + 1];
 };
@@ -726,7 +750,18 @@ struct exec_cache_entry {
 };
 
 enum { VM_REGION_MAX = 4096 };
-struct vm_region { u64 start; u64 size; u64 prot; int used; };
+struct vm_region {
+    u64 start;
+    u64 size;
+    u64 prot;
+    u64 file_token;
+    u64 file_offset;
+    u64 file_size;
+    u8 file_backed;
+    u8 file_lazy;
+    u8 file_cow;
+    int used;
+};
 
 enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16, LINUX_POSIX_TIMER_MAX = 8 };
 struct linux_posix_timer_state {
@@ -874,6 +909,41 @@ struct linux_abi_profile {
     u64 vfs_bulk_cap_ticks;
     u64 vfs_bulk_request_ticks;
     u64 vfs_bulk_copy_ticks;
+    u64 vfs_bulk_direct_pages;
+    u64 vfs_bulk_direct_ticks;
+    u64 vfs_bulk_direct_attempts;
+    u64 vfs_bulk_direct_fallback_pages;
+    u64 vfs_bulk_direct_paddr_fail;
+    u64 vfs_bulk_direct_signal_fail;
+    u64 vfs_bulk_direct_wait_fail;
+    u64 vfs_bulk_direct_status_fail;
+    u64 vfs_bulk_direct_bytes_fail;
+    u64 file_cache_map_pages;
+    u64 file_cache_cow_faults;
+    u64 file_cache_cow_considered;
+    u64 file_cache_cow_candidates;
+    u64 file_cache_cow_skip_peers;
+    u64 file_cache_cow_skip_no_path;
+    u64 file_cache_cow_skip_uncacheable;
+    u64 file_cache_cow_fallbacks;
+    u64 file_cache_fill_fail_no_path;
+    u64 file_cache_fill_fail_uncacheable;
+    u64 file_cache_fill_fail_size;
+    u64 file_cache_fill_fail_slot;
+    u64 file_cache_fill_fail_alloc;
+    u64 file_cache_fill_fail_read;
+    u64 file_cache_map_fail_unaligned;
+    u64 file_cache_map_fail_fill;
+    u64 file_cache_map_fail_range;
+    u64 file_cache_map_fail_syscall;
+    u64 file_vm_object_mmap_considered;
+    u64 file_vm_object_mmap_candidates;
+    u64 file_vm_object_mmap_mapped;
+    u64 file_vm_object_mmap_fallbacks;
+    u64 file_vm_object_mmap_pages;
+    u64 file_vm_object_mmap_tail_pages;
+    u64 file_vm_object_mmap_install_fail;
+    u64 file_vm_object_mmap_map_fail;
     u64 fs_read_bytes;
     u64 fs_read_cmd_bytes;
     u64 fs_read_lib_bytes;
@@ -972,7 +1042,6 @@ static int execve_exec_service_scratch_ready = 0;
 static u64 execve_main_scratch_pages = 0;
 static int execve_ld_scratch_ready = 0;
 static u64 g_exec_vm_token = 0;
-static u64 g_exec_program_token = 0;
 static u64 g_exec_service_slot = 0;
 static u64 g_exec_launch_request_paddr = 0;
 static u64 g_exec_launch_response_paddr = 0;
@@ -998,6 +1067,7 @@ static u16 g_exec_path_len = 0;
 static void deliver_tty_signal(u64 signo);
 static void remove_futex_waiters_for_principal(u64 principal);
 static u64 wake_futex_waiters(u64 owner_pid, u64 uaddr, u64 max_wake);
+static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot);
 
 struct linux_abi_context {
     struct linux_process_state *proc;

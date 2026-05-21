@@ -246,6 +246,59 @@ pub fn mapUserPageCapabilitiesWithProt(
     return true;
 }
 
+pub fn mapTrustedUserPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (paddrs.len == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const page_count_u64: u64 = @intCast(paddrs.len);
+    const size_u64 = page_count_u64 * 4096;
+    const map_end_va, const overflow = @addWithOverflow(va_start, size_u64 - 1);
+    if (overflow != 0) return false;
+
+    const user_pdp_index: usize = @intCast((h.user_va >> 30) & 0x1FF);
+    const start_pml4: usize = @intCast((va_start >> 39) & 0x1FF);
+    const start_pdp: usize = @intCast((va_start >> 30) & 0x1FF);
+    const end_pml4: usize = @intCast((map_end_va >> 39) & 0x1FF);
+    const end_pdp: usize = @intCast((map_end_va >> 30) & 0x1FF);
+    if (start_pml4 != 0 or end_pml4 != 0) return false;
+    if (start_pdp != user_pdp_index or end_pdp != user_pdp_index) return false;
+
+    var page_index: usize = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const paddr = paddrs[page_index];
+        if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
+
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = ensureUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const old_entry = pt_page[pt_index];
+        if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
+    }
+    if (!capability.reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
+
+    page_index = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pt_slot = ensureUserPtSlotForPd(space, pd_index) orelse return false;
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        pt_page[pt_index] = paddrs[page_index] | pte_flags;
+    }
+
+    return true;
+}
+
 pub fn mapFreshUserPageCapabilitiesWithProt(
     state: *const kernel.KernelState,
     principal: kernel.PrincipalId,

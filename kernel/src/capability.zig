@@ -66,7 +66,6 @@ pub const PageFaultCapability = struct {
 
 var runtime_ready = false;
 var runtime: RuntimeConfig = undefined;
-var lookup_diag_count: u64 = 0;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -80,52 +79,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_ready), &runtime_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime), &runtime));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lookup_diag_count), &lookup_diag_count));
     return end;
-}
-
-fn shouldLogLookupDiag(principal: kernel.PrincipalId) bool {
-    _ = principal;
-    return false;
-}
-
-fn logLookupSpaceDiag(prefix: []const u8, principal: kernel.PrincipalId, space: *const UserAddressSpace) void {
-    runtime.serial_write(prefix);
-    runtime.serial_write(" proc=");
-    runtime.serial_write(runtime.principal_label(principal));
-    runtime.serial_write(" space=");
-    runtime.print_hex(@intFromPtr(space));
-    runtime.serial_write(" used=");
-    runtime.print_hex(space.pt_page_used_len);
-    runtime.serial_write(" cr3=");
-    runtime.print_hex(space.cr3);
-    runtime.serial_write(" pd256=");
-    runtime.print_hex(space.pd[256]);
-    runtime.serial_write(" pd257=");
-    runtime.print_hex(space.pd[257]);
-    runtime.serial_write(" pd479=");
-    runtime.print_hex(space.pd[479]);
-    runtime.serial_write(" pd480=");
-    runtime.print_hex(space.pd[480]);
-    runtime.serial_write(" meta0=");
-    runtime.print_hex(space.pt_page_pd_index[0]);
-    runtime.serial_write(" meta1=");
-    runtime.print_hex(space.pt_page_pd_index[1]);
-    runtime.serial_write(" meta2=");
-    runtime.print_hex(space.pt_page_pd_index[2]);
-    runtime.serial_write(" meta130=");
-    runtime.print_hex(space.pt_page_pd_index[130]);
-    runtime.serial_write("\n");
-}
-
-fn logByteWindow(prefix: []const u8, bytes: []const u8) void {
-    runtime.serial_write(prefix);
-    runtime.serial_write("=");
-    for (bytes, 0..) |b, i| {
-        if (i != 0) runtime.serial_write(" ");
-        runtime.print_hex(b);
-    }
-    runtime.serial_write("\n");
 }
 
 pub fn init(config: RuntimeConfig) void {
@@ -155,13 +109,6 @@ pub fn isUserCanonicalVa(va: u64) bool {
 
 pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     const space = getUserSpace(principal) orelse return null;
-    if (shouldLogLookupDiag(principal)) {
-        lookup_diag_count +%= 1;
-        runtime.serial_write("lookup enter va=");
-        runtime.print_hex(va);
-        runtime.serial_write("\n");
-        logLookupSpaceDiag("lookup pre", principal, space);
-    }
     const pd_index = userPdIndexForVa(va) orelse return null;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
     const slot = findPtSlotForPd(space, pd_index) orelse return null;
@@ -169,20 +116,6 @@ pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     const entry = pt_page[pt_index];
     const is_user_mapping = (entry & runtime.page_present) != 0 and (entry & runtime.page_user) != 0;
     const paddr = entry & runtime.page_addr_mask;
-    if (shouldLogLookupDiag(principal)) {
-        runtime.serial_write("lookup mid pd=");
-        runtime.print_hex(@intCast(pd_index));
-        runtime.serial_write(" slot=");
-        runtime.print_hex(@intCast(slot));
-        runtime.serial_write(" pt=");
-        runtime.print_hex(@intCast(pt_index));
-        runtime.serial_write(" entry=");
-        runtime.print_hex(entry);
-        runtime.serial_write(" paddr=");
-        runtime.print_hex(paddr);
-        runtime.serial_write("\n");
-        logLookupSpaceDiag("lookup post", principal, space);
-    }
     if (!is_user_mapping or paddr == 0) return null;
     return paddr;
 }
@@ -221,27 +154,6 @@ fn reservationOverlaps(base_a: u64, count_a: u64, base_b: u64, count_b: u64) boo
     const start_a = base_a >> 12;
     const start_b = base_b >> 12;
     return start_a < end_b and start_b < end_a;
-}
-
-fn logReservationOverlap(
-    principal: kernel.PrincipalId,
-    base_va: u64,
-    page_count: u64,
-    existing: *const UserAddressSpace.Reservation,
-) void {
-    runtime.serial_write("user reservation overlap proc=");
-    runtime.serial_write(runtime.principal_label(principal));
-    runtime.serial_write(" base=");
-    runtime.print_hex(base_va);
-    runtime.serial_write(" pages=");
-    runtime.print_hex(page_count);
-    runtime.serial_write(" existing_base=");
-    runtime.print_hex(existing.base_va);
-    runtime.serial_write(" existing_pages=");
-    runtime.print_hex(existing.page_count);
-    runtime.serial_write(" existing_kind=");
-    runtime.print_hex(@intFromEnum(existing.kind));
-    runtime.serial_write("\n");
 }
 
 fn reservationStartPage(reservation: *const UserAddressSpace.Reservation) u64 {
@@ -310,7 +222,6 @@ pub fn canReserveUserMapping(principal: kernel.PrincipalId, base_va: u64, page_c
     for (&space.reservations) |*reservation| {
         if (!reservation.active) continue;
         if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
-        logReservationOverlap(principal, base_va, page_count, reservation);
         return false;
     }
     return true;
@@ -331,7 +242,6 @@ pub fn reserveUserMapping(
     for (&space.reservations) |*reservation| {
         if (!reservation.active) continue;
         if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
-        logReservationOverlap(principal, base_va, page_count, reservation);
         return false;
     }
     if (tryMergeUserReservation(space, base_va, page_count, kind, writable)) return true;
@@ -348,13 +258,6 @@ pub fn reserveUserMapping(
         };
         return true;
     }
-    runtime.serial_write("user reservation table full proc=");
-    runtime.serial_write(runtime.principal_label(principal));
-    runtime.serial_write(" base=");
-    runtime.print_hex(base_va);
-    runtime.serial_write(" pages=");
-    runtime.print_hex(page_count);
-    runtime.serial_write("\n");
     return false;
 }
 
@@ -590,40 +493,12 @@ fn pdIndexForPtSlot(space: *const UserAddressSpace, slot: usize) ?usize {
 fn findPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
     if (pd_index >= 512) return null;
 
-    const principal = blk: {
-        var i: usize = 0;
-        while (i < runtime.user_spaces.len) : (i += 1) {
-            if (&runtime.user_spaces[i] == space) {
-                break :blk principalFromProcessIndex(i);
-            }
-        }
-        break :blk null;
-    };
-    if (principal) |proc| {
-        if (shouldLogLookupDiag(proc)) {
-            runtime.serial_write("findPtSlot enter pd=");
-            runtime.print_hex(@intCast(pd_index));
-            runtime.serial_write("\n");
-            logLookupSpaceDiag("findPtSlot pre", proc, space);
-        }
-    }
-
     const pde = space.pd[pd_index];
     if ((pde & runtime.page_present) != 0 and (pde & (@as(u64, 1) << 7)) == 0) {
         const pt_pa = pde & runtime.page_addr_mask;
         var slot_by_pd: usize = 0;
         while (slot_by_pd < UserAddressSpace.max_dynamic_pt_pages) : (slot_by_pd += 1) {
             if (slotPtPa(space, slot_by_pd) == pt_pa) {
-                if (principal) |proc| {
-                    if (shouldLogLookupDiag(proc)) {
-                        runtime.serial_write("findPtSlot pde_match slot=");
-                        runtime.print_hex(@intCast(slot_by_pd));
-                        runtime.serial_write(" pt_pa=");
-                        runtime.print_hex(pt_pa);
-                        runtime.serial_write("\n");
-                        logLookupSpaceDiag("findPtSlot pde_post", proc, space);
-                    }
-                }
                 return slot_by_pd;
             }
         }
@@ -640,16 +515,6 @@ fn findPtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
             const next_len = slot_meta + 1;
             if (next_len > space.pt_page_used_len) {
                 space.pt_page_used_len = @intCast(next_len);
-            }
-            if (principal) |proc| {
-                if (shouldLogLookupDiag(proc)) {
-                    runtime.serial_write("findPtSlot meta_match slot=");
-                    runtime.print_hex(@intCast(slot_meta));
-                    runtime.serial_write(" pt_pa=");
-                    runtime.print_hex(pt_pa);
-                    runtime.serial_write("\n");
-                    logLookupSpaceDiag("findPtSlot meta_post", proc, space);
-                }
             }
             return slot_meta;
         }
@@ -706,44 +571,6 @@ fn ensurePtSlotForPd(space: *UserAddressSpace, pd_index: usize) ?usize {
         space.pt_page_used_len = @intCast(next_len);
     }
     return slot;
-}
-
-fn shouldLogMapMmioDiag(principal: kernel.PrincipalId, va: u64) bool {
-    _ = principal;
-    _ = va;
-    return false;
-}
-
-noinline fn logMapMmioDiagEnter(va: u64, paddr: u64) void {
-    runtime.serial_write("map_mmio_diag enter va=");
-    runtime.print_hex(va);
-    runtime.serial_write(" paddr=");
-    runtime.print_hex(paddr);
-    runtime.serial_write("\n");
-}
-
-noinline fn logMapMmioDiagPostEnsure(pd_index: usize, pt_index: usize, map_slot: usize) void {
-    runtime.serial_write("map_mmio_diag slot=");
-    runtime.print_hex(@intCast(map_slot));
-    runtime.serial_write(" pd=");
-    runtime.print_hex(@intCast(pd_index));
-    runtime.serial_write(" pt=");
-    runtime.print_hex(@intCast(pt_index));
-    runtime.serial_write("\n");
-}
-
-noinline fn logMapMmioDiagPostAliasLoop(space: *UserAddressSpace, map_slot: usize, pt_index: usize) void {
-    runtime.serial_write("map_mmio_diag dst_pte=");
-    runtime.print_hex(@intFromPtr(&space.pt_pages[map_slot][pt_index]));
-    runtime.serial_write("\n");
-}
-
-noinline fn logMapMmioDiagPostPteWrite() void {
-    runtime.serial_write("map_mmio_diag pte write done\n");
-}
-
-noinline fn logMapMmioDiagPostMap() void {
-    runtime.serial_write("map_mmio_diag map done\n");
 }
 
 noinline fn clearAliasMappings(
@@ -821,8 +648,6 @@ pub fn mapUserPageFromCapability(
 ) bool {
     if (!runtime_ready) return false;
     const space = getUserSpace(principal) orelse return false;
-    const diag = shouldLogMapMmioDiag(principal, va);
-    if (diag) logMapMmioDiagEnter(va, paddr);
     if ((va & 0xFFF) != 0) return false;
     if ((paddr & 0xFFF) != 0) return false;
     if (paddr >= runtime.physical_map_limit) return false;
@@ -830,7 +655,6 @@ pub fn mapUserPageFromCapability(
     const pd_index = userPdIndexForVa(va) orelse return false;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
     const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
-    if (diag) logMapMmioDiagPostEnsure(pd_index, pt_index, map_slot);
 
     const cap = state.getTableConst(principal).find(paddr) orelse return false;
     if (!cap.rights.cpu_read) return false;
@@ -842,12 +666,9 @@ pub fn mapUserPageFromCapability(
     if (!reserveUserMapping(principal, va, 1, .capability_page, writable)) return false;
 
     clearAliasMappings(space, principal, paddr, map_slot, pt_index);
-    if (diag) logMapMmioDiagPostAliasLoop(space, map_slot, pt_index);
 
     map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
-    if (diag) logMapMmioDiagPostPteWrite();
     runtime.flush_user_tlb_for_principal_va(principal, va);
-    if (diag) logMapMmioDiagPostMap();
     return true;
 }
 
@@ -956,43 +777,12 @@ pub fn mapFreshUserPage(
     if ((paddr & 0xFFF) != 0) return false;
     if (paddr >= runtime.physical_map_limit) return false;
 
-    const pd_index = userPdIndexForVa(va) orelse {
-        runtime.serial_write("mapFreshUserPage fail: bad user VA proc=");
-        runtime.serial_write(runtime.principal_label(principal));
-        runtime.serial_write(" va=");
-        runtime.print_hex(va);
-        runtime.serial_write("\n");
-        return false;
-    };
+    const pd_index = userPdIndexForVa(va) orelse return false;
     const pt_index: usize = @intCast((va >> 12) & 0x1FF);
-    const map_slot = ensurePtSlotForPd(space, pd_index) orelse {
-        runtime.serial_write("mapFreshUserPage fail: ensurePtSlot proc=");
-        runtime.serial_write(runtime.principal_label(principal));
-        runtime.serial_write(" va=");
-        runtime.print_hex(va);
-        runtime.serial_write(" pd=");
-        runtime.print_hex(@intCast(pd_index));
-        runtime.serial_write(" used=");
-        runtime.print_hex(space.pt_page_used_len);
-        runtime.serial_write("\n");
-        return false;
-    };
+    const map_slot = ensurePtSlotForPd(space, pd_index) orelse return false;
     const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
     const old_entry = map_pt_page[pt_index];
-    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) {
-        runtime.serial_write("mapFreshUserPage fail: already_present proc=");
-        runtime.serial_write(runtime.principal_label(principal));
-        runtime.serial_write(" va=");
-        runtime.print_hex(va);
-        runtime.serial_write(" paddr=");
-        runtime.print_hex(paddr);
-        runtime.serial_write(" slot=");
-        runtime.print_hex(@intCast(map_slot));
-        runtime.serial_write(" old=");
-        runtime.print_hex(old_entry);
-        runtime.serial_write("\n");
-        return false;
-    }
+    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) return false;
     if (!reserveUserMapping(principal, va, 1, .fresh_page, writable)) return false;
 
     map_pt_page[pt_index] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);

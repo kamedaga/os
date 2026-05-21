@@ -1,3 +1,5 @@
+#include "exec_elf.h"
+
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
@@ -12,9 +14,8 @@ enum {
     SYSCALL_GRANT_CAP = 0x8,
     SYSCALL_GRANT_CAPS_BATCH = 0x14,
     SYSCALL_WAIT_EVENT = 0x17,
-    SYSCALL_SPAWN_EXEC = 0x1D,
     SYSCALL_INSTALL_VM_OBJECT = 0x1E,
-    SYSCALL_INSTALL_EXEC_IMAGE = 0x20,
+    SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_MAP_VM_OBJECT = 0x28,
@@ -31,6 +32,15 @@ enum {
     SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
     SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
+    SYSCALL_CREATE_SUSPENDED_PROCESS = 0x41,
+    SYSCALL_MAP_VM_OBJECT_TO_PROCESS = 0x42,
+    SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS = 0x43,
+    SYSCALL_SET_PROCESS_INITIAL_CONTEXT = 0x44,
+    SYSCALL_START_PROCESS = 0x45,
+    SYSCALL_ABORT_PROCESS = 0x46,
+    SYSCALL_COPY_TO_PROCESS = 0x47,
+    SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
+    SYSCALL_SET_PROCESS_BOOTSTRAP_OWNER = 0x6B,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
 
@@ -48,6 +58,7 @@ enum {
     VM_OBJECT_RIGHT_READ = 0x1,
     VM_OBJECT_RIGHT_WRITE = 0x2,
     VM_OBJECT_RIGHT_MAP = 0x4,
+    VM_RIGHT_READ_MAP = 0x5,
 
     PROCESS_AUX_BASE_VA = 0x3C000000,
     PROCESS_STANDARD_CONFIG_TARGET_VA = 0x3C002000,
@@ -78,13 +89,17 @@ enum {
     BOOTFS_KIND_REGULAR = 1,
 
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
-    EXEC_IMAGE_TOKEN_TAG = (1ULL << 62) | (1ULL << 61),
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xFFFFFFFFULL,
-    SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE = 1ULL << 0,
-    SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE = 1ULL << 2,
-    SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER = 1ULL << 3,
-    SPAWN_FLAG_ALLOW_BOOTSTRAP_AP_PLACEMENT = 1ULL << 4,
+    PROCESS_BUILDER_TOKEN_TAG = 1ULL << 60,
+    PROCESS_BUILDER_PROCESS_MASK = 0xFFFFFFFFULL,
+    BOOTSTRAP_PAGE_WRITABLE = 1ULL << 0,
+    BOOTSTRAP_CAP_KIND_VM_OBJECT = 2,
+    USER_ELF_BASE_VA = 0x20000000,
+    USER_STACK_TOP = 0x3C000000,
+    USER_STACK_PAGES = 128,
+    USER_STACK_BOTTOM_VA = USER_STACK_TOP - USER_STACK_PAGES * 4096,
+    USER_ENTRY_RSP = USER_STACK_TOP - 8,
 
     BLOCK_CONFIG_MAGIC = 0x424C4B43,
     BLOCK_CONFIG_VERSION = 1,
@@ -202,7 +217,7 @@ enum {
     MAX_ROOT_SEED2_PAGES = 256,
 
     FS_PAGE_BYTES = 4096,
-    FS_MAX_PATH_BYTES = 128,
+    FS_MAX_PATH_BYTES = 512,
     FS_REQUEST_MAGIC = 0x51534653u,
     FS_RESPONSE_MAGIC = 0x52534653u,
     FS_PROTOCOL_VERSION = 1,
@@ -384,9 +399,10 @@ struct service_registry_page {
     struct service_entry entries[SERVICE_REGISTRY_MAX_ENTRIES];
 };
 
-struct exec_image {
-    u64 token;
+struct loaded_file {
+    u64 image_va;
     u64 file_bytes;
+    u64 vm_token;
 };
 
 struct backend_session {
@@ -495,6 +511,7 @@ static u64 g_device_catalog_source_va;
 static u64 g_device_catalog_paddr;
 static struct backend_session g_fat_session;
 static u64 g_root_seed2_page_paddrs[MAX_ROOT_SEED2_PAGES];
+static unsigned char g_loader_page[4096];
 static volatile u32 *g_boot_fb;
 static u64 g_boot_fb_width;
 static u64 g_boot_fb_height;
@@ -558,6 +575,12 @@ static u64 syscall0(u64 nr) {
     return ret;
 }
 
+static u64 syscall1(u64 nr, u64 a0) {
+    u64 ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
 static u64 syscall2(u64 nr, u64 a0, u64 a1) {
     u64 ret;
     __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1) : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
@@ -573,6 +596,13 @@ static u64 syscall3(u64 nr, u64 a0, u64 a1, u64 a2) {
 static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) {
     u64 ret;
     __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3) : "r8", "r9", "r10", "r11", "memory");
+    return ret;
+}
+
+static u64 syscall5(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
+    register u64 r8_reg __asm__("r8") = a4;
+    u64 ret;
+    __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3), "r"(r8_reg) : "r9", "r10", "r11", "memory");
     return ret;
 }
 
@@ -634,9 +664,294 @@ static u64 decode_queue_cap(u64 value, u64 kind) {
     return value & ~(QUEUE_CAP_TAG_BASE | QUEUE_CAP_KIND_MASK);
 }
 
-static u64 decode_spawn_process_slot(u64 value) {
+static int is_vm_object_token(u64 token) {
+    return (token & VM_OBJECT_TOKEN_TAG) == VM_OBJECT_TOKEN_TAG;
+}
+
+static int is_process_builder_token(u64 token) {
+    return (token & PROCESS_BUILDER_TOKEN_TAG) == PROCESS_BUILDER_TOKEN_TAG && (token & PROCESS_BUILDER_PROCESS_MASK) != 0;
+}
+
+static u64 process_slot_from_builder_token(u64 token) {
+    return is_process_builder_token(token) ? (token & PROCESS_BUILDER_PROCESS_MASK) : 0;
+}
+
+static u64 decode_started_process_slot(u64 value) {
     if ((value & SPAWN_RESULT_TAG) == 0) return 0;
     return value & SPAWN_RESULT_PROCESS_MASK;
+}
+
+static u64 create_suspended_process(void) {
+    const u64 token = syscall0(SYSCALL_CREATE_SUSPENDED_PROCESS);
+    return is_process_builder_token(token) ? token : 0;
+}
+
+static u64 alloc_map_pages_to_process_raw(u64 process_token, u64 va, u64 pages, u64 prot) {
+    return syscall5(SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS, process_token, va, pages, prot, 0);
+}
+
+static u64 copy_to_process_raw(u64 process_token, u64 dst_va, u64 src_va, u64 bytes) {
+    return syscall4(SYSCALL_COPY_TO_PROCESS, process_token, dst_va, src_va, bytes);
+}
+
+static int copy_to_process(u64 process_token, u64 dst_va, u64 src_va, u64 bytes) {
+    return copy_to_process_raw(process_token, dst_va, src_va, bytes) == SYSCALL_OK;
+}
+
+static u64 install_shared_current_page(u64 source_va) {
+    const u64 rights = VM_OBJECT_RIGHT_READ | VM_OBJECT_RIGHT_WRITE | VM_OBJECT_RIGHT_MAP;
+    const u64 token = syscall3(SYSCALL_INSTALL_VM_OBJECT_FROM_CURRENT_PAGES, source_va, 4096, rights);
+    if (!is_vm_object_token(token)) return 0;
+    if (syscall2(SYSCALL_MAP_VM_OBJECT, token, source_va) != SYSCALL_OK) return 0;
+    return token;
+}
+
+static int map_vm_object_to_process(u64 process_token, u64 vm_token, u64 target_va, u64 prot_bits) {
+    return syscall4(SYSCALL_MAP_VM_OBJECT_TO_PROCESS, process_token, vm_token, target_va, prot_bits) == SYSCALL_OK;
+}
+
+static int set_process_initial_context(u64 process_token, u64 rip, u64 rsp) {
+    return syscall3(SYSCALL_SET_PROCESS_INITIAL_CONTEXT, process_token, rip, rsp) == SYSCALL_OK;
+}
+
+static int set_process_bootstrap_owner(u64 process_token, int enabled) {
+    return syscall2(SYSCALL_SET_PROCESS_BOOTSTRAP_OWNER, process_token, enabled ? 1 : 0) == SYSCALL_OK;
+}
+
+static u64 start_process(u64 process_token) {
+    return decode_started_process_slot(syscall1(SYSCALL_START_PROCESS, process_token));
+}
+
+static void abort_process(u64 process_token) {
+    (void)syscall1(SYSCALL_ABORT_PROCESS, process_token);
+}
+
+static int add_u64(u64 a, u64 b, u64 *out) {
+    *out = a + b;
+    return *out >= a;
+}
+
+static u64 read_u64_le_unchecked(const unsigned char *bytes) {
+    u64 value = 0;
+    for (u64 i = 0; i < 8; i++) value |= (u64)bytes[i] << (i * 8);
+    return value;
+}
+
+static long long read_i64_le_unchecked(const unsigned char *bytes) {
+    return (long long)read_u64_le_unchecked(bytes);
+}
+
+static u64 prot_bits_from_phdr(const struct exec_elf_program_header *phdr) {
+    u64 bits = 0;
+    if ((phdr->flags & EXEC_ELF_PF_R) != 0) bits |= 1ULL << 0;
+    if ((phdr->flags & EXEC_ELF_PF_W) != 0) bits |= 1ULL << 1;
+    if ((phdr->flags & EXEC_ELF_PF_X) != 0) bits |= 1ULL << 2;
+    return bits;
+}
+
+static int file_offset_for_vaddr(u64 source_va, const struct exec_elf_header *ehdr, u64 vaddr, u64 size, u64 file_bytes, u64 *file_off_out) {
+    for (exec_u16 i = 0; i < ehdr->phnum; i++) {
+        struct exec_elf_program_header phdr;
+        if (exec_elf_parse_program_header((const void *)source_va, file_bytes, ehdr, i, &phdr) != EXEC_ELF_OK) return 0;
+        if (phdr.p_type != EXEC_ELF_PT_LOAD) continue;
+        if (vaddr < phdr.vaddr) continue;
+        const u64 delta = vaddr - phdr.vaddr;
+        if (delta > phdr.filesz || size > phdr.filesz - delta) continue;
+        return add_u64(phdr.offset, delta, file_off_out);
+    }
+    return 0;
+}
+
+static int copy_page_from_elf(u64 source_va, const struct exec_elf_header *ehdr, u64 file_bytes, u64 page_vaddr, unsigned char *page) {
+    for (u64 i = 0; i < 4096; i++) page[i] = 0;
+    for (exec_u16 i = 0; i < ehdr->phnum; i++) {
+        struct exec_elf_program_header phdr;
+        if (exec_elf_parse_program_header((const void *)source_va, file_bytes, ehdr, i, &phdr) != EXEC_ELF_OK) return 0;
+        if (phdr.p_type != EXEC_ELF_PT_LOAD || phdr.filesz == 0) continue;
+        u64 file_end = 0;
+        if (!add_u64(phdr.offset, phdr.filesz, &file_end) || file_end > file_bytes) return 0;
+        const u64 seg_file_start = phdr.vaddr;
+        u64 seg_file_end = 0;
+        if (!add_u64(phdr.vaddr, phdr.filesz, &seg_file_end)) return 0;
+        const u64 page_end = page_vaddr + 4096;
+        const u64 copy_start = page_vaddr > seg_file_start ? page_vaddr : seg_file_start;
+        const u64 copy_end = page_end < seg_file_end ? page_end : seg_file_end;
+        if (copy_end <= copy_start) continue;
+        u64 file_offset = 0;
+        if (!file_offset_for_vaddr(source_va, ehdr, copy_start, copy_end - copy_start, file_bytes, &file_offset)) return 0;
+        const unsigned char *src = (const unsigned char *)(source_va + file_offset);
+        for (u64 j = 0; j < copy_end - copy_start; j++) page[(copy_start - page_vaddr) + j] = src[j];
+    }
+    return 1;
+}
+
+static void write_u64_le(unsigned char *dst, u64 value) {
+    for (u64 i = 0; i < 8; i++) dst[i] = (unsigned char)((value >> (i * 8)) & 0xff);
+}
+
+static int apply_relative_relocations(u64 process_token, u64 source_va, const struct exec_elf_header *ehdr, u64 file_bytes, u64 load_bias) {
+    struct exec_elf_program_header dynamic;
+    int have_dynamic = 0;
+    for (exec_u16 i = 0; i < ehdr->phnum; i++) {
+        if (exec_elf_parse_program_header((const void *)source_va, file_bytes, ehdr, i, &dynamic) != EXEC_ELF_OK) return 0;
+        if (dynamic.p_type == EXEC_ELF_PT_DYNAMIC) { have_dynamic = 1; break; }
+    }
+    if (!have_dynamic || dynamic.filesz == 0) return 1;
+    u64 dyn_end = 0;
+    if (!add_u64(dynamic.offset, dynamic.filesz, &dyn_end) || dyn_end > file_bytes) return 0;
+    u64 rela_va = 0, rela_size = 0, rela_ent = 24;
+    for (u64 off = dynamic.offset; off + 16 <= dyn_end; off += 16) {
+        const unsigned char *dyn = (const unsigned char *)(source_va + off);
+        const long long tag = read_i64_le_unchecked(dyn);
+        const u64 value = read_u64_le_unchecked(dyn + 8);
+        if (tag == 0) break;
+        if (tag == 7) rela_va = value;
+        if (tag == 8) rela_size = value;
+        if (tag == 9) rela_ent = value;
+    }
+    if (rela_va == 0 || rela_size == 0) return 1;
+    if (rela_ent != 24 || (rela_size % 24) != 0) return 0;
+    u64 rela_file_off = 0;
+    if (!file_offset_for_vaddr(source_va, ehdr, rela_va, rela_size, file_bytes, &rela_file_off)) return 0;
+    for (u64 off = rela_file_off; off < rela_file_off + rela_size; off += 24) {
+        const unsigned char *rela = (const unsigned char *)(source_va + off);
+        const u64 r_offset = read_u64_le_unchecked(rela);
+        const u64 r_info = read_u64_le_unchecked(rela + 8);
+        const long long r_addend = read_i64_le_unchecked(rela + 16);
+        if ((r_info & 0xffffffffULL) != 8 || (r_info >> 32) != 0) continue;
+        u64 dest_va = 0;
+        if (!add_u64(load_bias, r_offset, &dest_va)) return 0;
+        u64 relocated = load_bias;
+        if (r_addend >= 0) {
+            if (!add_u64(load_bias, (u64)r_addend, &relocated)) return 0;
+        } else {
+            const u64 magnitude = (u64)(-r_addend);
+            if (load_bias < magnitude) return 0;
+            relocated = load_bias - magnitude;
+        }
+        unsigned char bytes[8];
+        write_u64_le(bytes, relocated);
+        if (!copy_to_process(process_token, dest_va, (u64)bytes, 8)) return 0;
+    }
+    return 1;
+}
+
+static int load_elf_private(u64 process_token, const struct loaded_file *image, u64 *entry_out) {
+    struct exec_elf_summary summary;
+    const enum exec_elf_error image_status = exec_elf_validate_image((const void *)image->image_va, image->file_bytes, &summary);
+    if (image_status != EXEC_ELF_OK) {
+        user_log_hex("[seed2_boot] pb elf validate=", (u64)image_status);
+        return 0;
+    }
+    const u64 load_bias = summary.is_pie ? USER_ELF_BASE_VA : 0;
+    for (exec_u16 i = 0; i < summary.header.phnum; i++) {
+        struct exec_elf_program_header phdr;
+        if (exec_elf_parse_program_header((const void *)image->image_va, image->file_bytes, &summary.header, i, &phdr) != EXEC_ELF_OK) return 0;
+        if (phdr.p_type != EXEC_ELF_PT_LOAD) continue;
+        u64 segment_start = 0, segment_end = 0;
+        if (exec_elf_validate_load_segment(&phdr, image->file_bytes, &segment_start, &segment_end) != EXEC_ELF_OK) return 0;
+        for (u64 page_vaddr = segment_start; page_vaddr < segment_end; page_vaddr += 4096) {
+            u64 target_va = 0;
+            if (!add_u64(load_bias, page_vaddr, &target_va)) {
+                user_log("[seed2_boot] pb target va overflow\n");
+                return 0;
+            }
+            if (!copy_page_from_elf(image->image_va, &summary.header, image->file_bytes, page_vaddr, g_loader_page)) {
+                user_log_hex("[seed2_boot] pb copy page fail va=", page_vaddr);
+                return 0;
+            }
+            const u64 map_status = alloc_map_pages_to_process_raw(process_token, target_va, 1, prot_bits_from_phdr(&phdr));
+            if (map_status != SYSCALL_OK) {
+                user_log_hex("[seed2_boot] pb map seg status=", map_status);
+                user_log_hex("[seed2_boot] pb map seg va=", target_va);
+                return 0;
+            }
+            const u64 copy_status = copy_to_process_raw(process_token, target_va, (u64)g_loader_page, 4096);
+            if (copy_status != SYSCALL_OK) {
+                user_log_hex("[seed2_boot] pb copy seg status=", copy_status);
+                user_log_hex("[seed2_boot] pb copy seg va=", target_va);
+                return 0;
+            }
+        }
+    }
+    if (!apply_relative_relocations(process_token, image->image_va, &summary.header, image->file_bytes, load_bias)) {
+        user_log("[seed2_boot] pb rela failed\n");
+        return 0;
+    }
+    return add_u64(load_bias, summary.header.entry, entry_out);
+}
+
+static int install_bootstrap_table(u64 process_token, const struct bootstrap_descriptor_table *table) {
+    const u64 child_slot = process_slot_from_builder_token(process_token);
+    for (u16 i = 0; i < table->page_count; i++) {
+        const u64 prot = (table->pages[i].flags & BOOTSTRAP_PAGE_WRITABLE) != 0 ? 3 : 1;
+        if ((table->pages[i].flags & BOOTSTRAP_PAGE_WRITABLE) != 0) {
+            const u64 shared = install_shared_current_page(table->pages[i].source_va);
+            if (shared == 0 || !map_vm_object_to_process(process_token, shared, table->pages[i].target_va, prot)) {
+                user_log_hex("[seed2_boot] pb share boot va=", table->pages[i].target_va);
+                return 0;
+            }
+            continue;
+        }
+        const u64 map_status = alloc_map_pages_to_process_raw(process_token, table->pages[i].target_va, 1, prot);
+        if (map_status != SYSCALL_OK) {
+            user_log_hex("[seed2_boot] pb map boot status=", map_status);
+            user_log_hex("[seed2_boot] pb map boot va=", table->pages[i].target_va);
+            return 0;
+        }
+        const u64 copy_status = copy_to_process_raw(process_token, table->pages[i].target_va, table->pages[i].source_va, 4096);
+        if (copy_status != SYSCALL_OK) {
+            user_log_hex("[seed2_boot] pb copy boot status=", copy_status);
+            user_log_hex("[seed2_boot] pb copy boot va=", table->pages[i].target_va);
+            return 0;
+        }
+    }
+    for (u16 i = 0; i < table->cap_count; i++) {
+        if (table->caps[i].kind != BOOTSTRAP_CAP_KIND_VM_OBJECT) return 0;
+        const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, table->caps[i].source_token, child_slot, table->caps[i].rights_bits);
+        if (!is_vm_object_token(granted)) return 0;
+        if (!copy_to_process(process_token, table->caps[i].target_token_va, (u64)&granted, sizeof(granted))) return 0;
+    }
+    return 1;
+}
+
+static u64 launch_process_builder_image(const struct loaded_file *image, const struct bootstrap_descriptor_table *table, int bootstrap_owner) {
+    const u64 process_token = create_suspended_process();
+    if (process_token == 0) {
+        user_log("[seed2_boot] pb create failed\n");
+        return 0;
+    }
+    u64 entry = 0;
+    if (!load_elf_private(process_token, image, &entry)) {
+        abort_process(process_token);
+        return 0;
+    }
+    const u64 stack_status = alloc_map_pages_to_process_raw(process_token, USER_STACK_BOTTOM_VA, USER_STACK_PAGES, 3);
+    if (stack_status != SYSCALL_OK) {
+        user_log_hex("[seed2_boot] pb stack status=", stack_status);
+        abort_process(process_token);
+        return 0;
+    }
+    if (!install_bootstrap_table(process_token, table)) {
+        abort_process(process_token);
+        return 0;
+    }
+    if (bootstrap_owner && !set_process_bootstrap_owner(process_token, 1)) {
+        user_log("[seed2_boot] pb owner failed\n");
+        abort_process(process_token);
+        return 0;
+    }
+    if (!set_process_initial_context(process_token, entry, USER_ENTRY_RSP)) {
+        user_log_hex("[seed2_boot] pb ctx entry=", entry);
+        abort_process(process_token);
+        return 0;
+    }
+    const u64 slot = start_process(process_token);
+    if (slot == 0) {
+        user_log("[seed2_boot] pb start failed\n");
+        abort_process(process_token);
+    }
+    return slot;
 }
 
 static struct init_descriptor_page *descriptor_page(void) {
@@ -800,7 +1115,7 @@ static struct bootfs_header *bootfs_header(void) {
     return header;
 }
 
-static int open_exec_from_bootfs(const char *path, struct exec_image *out) {
+static int open_image_from_bootfs(const char *path, struct loaded_file *out) {
     struct bootfs_header *header = bootfs_header();
     if (!header) {
         user_log("[seed2_boot] bootfs header invalid\n");
@@ -820,13 +1135,9 @@ static int open_exec_from_bootfs(const char *path, struct exec_image *out) {
             user_log("[seed2_boot] bootfs install vm failed\n");
             return 0;
         }
-        const u64 exec_token = syscall2(SYSCALL_INSTALL_EXEC_IMAGE, vm_token, 1);
-        if ((exec_token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG) {
-            user_log("[seed2_boot] bootfs install exec failed\n");
-            return 0;
-        }
-        out->token = exec_token;
+        out->image_va = (u64)header + entry->data_offset;
         out->file_bytes = entry->data_bytes;
+        out->vm_token = vm_token;
         return 1;
     }
     user_log("[seed2_boot] bootfs path not found\n");
@@ -1162,10 +1473,6 @@ static int grant_device_catalog_to_child(u64 child_slot) {
     return 1;
 }
 
-static u64 spawn_with_table(u64 exec_token, struct bootstrap_descriptor_table *table) {
-    return syscall4(SYSCALL_SPAWN_EXEC, exec_token, (u64)table, 0, SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE);
-}
-
 static void wait_config_word(u64 va, u64 index, u64 expected) {
     volatile u64 *words = (volatile u64 *)va;
     while (words[index] != expected) {
@@ -1332,7 +1639,7 @@ static int alloc_root_seed2_image_pages(u64 file_bytes) {
     return 1;
 }
 
-static int load_root_seed2_from_fat(u64 *exec_token_out) {
+static int load_root_seed2_from_fat(struct loaded_file *out) {
     if (!fat_request(FS_OP_LOOKUP, g_fat_session.root_token, 0, 0, "/sbin/seed2.elf")) return 0;
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_fat_session.response_va;
     if (response->status != FS_STATUS_OK || response->result_token == 0) return 0;
@@ -1361,9 +1668,9 @@ static int load_root_seed2_from_fat(u64 *exec_token_out) {
 
     const u64 vm_token = syscall3(SYSCALL_INSTALL_VM_OBJECT, ROOT_SEED2_IMAGE_VA, file_bytes, 1);
     if ((vm_token & VM_OBJECT_TOKEN_TAG) != VM_OBJECT_TOKEN_TAG) return 0;
-    const u64 exec_token = syscall2(SYSCALL_INSTALL_EXEC_IMAGE, vm_token, 1);
-    if ((exec_token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG) return 0;
-    *exec_token_out = exec_token;
+    out->image_va = ROOT_SEED2_IMAGE_VA;
+    out->file_bytes = file_bytes;
+    out->vm_token = vm_token;
     return 1;
 }
 
@@ -1374,8 +1681,8 @@ static void spawn_root_seed2_direct(void) {
     }
     user_log("[seed2_boot] fat connect ok\n");
 
-    u64 exec_token = 0;
-    if (!load_root_seed2_from_fat(&exec_token)) {
+    struct loaded_file image;
+    if (!load_root_seed2_from_fat(&image)) {
         user_log("[seed2_boot] root seed2 load failed\n");
         return;
     }
@@ -1409,22 +1716,15 @@ static void spawn_root_seed2_direct(void) {
     table->page_count = 1;
     table->pages[0].source_va = ROOT_SEED2_CONFIG_VA;
     table->pages[0].target_va = PROCESS_STANDARD_CONFIG_TARGET_VA;
-    table->pages[0].flags = SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE;
+    table->pages[0].flags = BOOTSTRAP_PAGE_WRITABLE;
     if (catalog_va != 0) {
         table->page_count = 2;
         table->pages[1].source_va = catalog_va;
         table->pages[1].target_va = DEVICE_CATALOG_TARGET_VA;
-        table->pages[1].flags = SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE;
+        table->pages[1].flags = BOOTSTRAP_PAGE_WRITABLE;
     }
 
-    const u64 spawned = syscall4(
-        SYSCALL_SPAWN_EXEC,
-        exec_token,
-        (u64)table,
-        0,
-        SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER
-    );
-    const u64 child_slot = decode_spawn_process_slot(spawned);
+    const u64 child_slot = launch_process_builder_image(&image, table, 1);
     if (child_slot == 0) {
         user_log("[seed2_boot] root seed2 spawn failed\n");
         return;
@@ -1438,9 +1738,9 @@ static void spawn_root_seed2_direct(void) {
 }
 
 static void launch_block_server(void) {
-    struct exec_image exec;
+    struct loaded_file image;
     struct queue_grant grant;
-    if (!open_exec_from_bootfs("/srv/virtio_blk.elf", &exec)) {
+    if (!open_image_from_bootfs("/srv/virtio_blk.elf", &image)) {
         user_log("[seed2_boot] open block_server failed\n");
         return;
     }
@@ -1479,10 +1779,9 @@ static void launch_block_server(void) {
     table->page_count = 1;
     table->pages[0].source_va = cfg_va;
     table->pages[0].target_va = PROCESS_STANDARD_CONFIG_TARGET_VA;
-    table->pages[0].flags = SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE;
+    table->pages[0].flags = BOOTSTRAP_PAGE_WRITABLE;
 
-    const u64 spawned = spawn_with_table(exec.token, table);
-    const u64 child_slot = decode_spawn_process_slot(spawned);
+    const u64 child_slot = launch_process_builder_image(&image, table, 0);
     if (child_slot == 0) {
         user_log("[seed2_boot] spawn block_server failed\n");
         return;
@@ -1516,9 +1815,9 @@ static void launch_block_server(void) {
     user_log("[seed2_boot] block_server ready\n");
 }
 
-static u64 launch_configured_service(const char *path, const char *label, u64 config_magic, u64 backend_endpoint, u64 backend_slot, u64 ready_index, u64 ready_value, u64 service_kind, u64 spawn_flags) {
-    struct exec_image exec;
-    if (!open_exec_from_bootfs(path, &exec)) {
+static u64 launch_configured_service(const char *path, const char *label, u64 config_magic, u64 backend_endpoint, u64 backend_slot, u64 ready_index, u64 ready_value, u64 service_kind, int bootstrap_owner) {
+    struct loaded_file image;
+    if (!open_image_from_bootfs(path, &image)) {
         user_log("[seed2_boot] open service failed\n");
         return 0;
     }
@@ -1540,19 +1839,12 @@ static u64 launch_configured_service(const char *path, const char *label, u64 co
     table->page_count = 2;
     table->pages[0].source_va = cfg_va;
     table->pages[0].target_va = PROCESS_STANDARD_CONFIG_TARGET_VA;
-    table->pages[0].flags = SPAWN_FLAG_BOOTSTRAP_PAGE_WRITABLE;
+    table->pages[0].flags = BOOTSTRAP_PAGE_WRITABLE;
     table->pages[1].source_va = ensure_service_registry();
     table->pages[1].target_va = PROCESS_SERVICE_REGISTRY_SHADOW_VA;
     table->pages[1].flags = 0;
 
-    const u64 spawned = syscall4(
-        SYSCALL_SPAWN_EXEC,
-        exec.token,
-        (u64)table,
-        0,
-        SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | spawn_flags
-    );
-    const u64 child_slot = decode_spawn_process_slot(spawned);
+    const u64 child_slot = launch_process_builder_image(&image, table, bootstrap_owner);
     if (child_slot == 0) {
         user_log("[seed2_boot] spawn service failed\n");
         return 0;

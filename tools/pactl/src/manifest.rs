@@ -124,11 +124,15 @@ fn render_fs_manifest(
             if publish.fs != fs_name {
                 continue;
             }
-            entries.push(ManifestEntry {
-                image_path: publish.path.clone(),
-                source_path: Some(source_path.clone()),
-                is_dir: false,
-            });
+            if source_path.is_dir() {
+                append_directory_publish_entries(&mut entries, &publish.path, &source_path)?;
+            } else {
+                entries.push(ManifestEntry {
+                    image_path: publish.path.clone(),
+                    source_path: Some(source_path.clone()),
+                    is_dir: false,
+                });
+            }
         }
     }
 
@@ -186,6 +190,61 @@ fn render_fs_manifest(
         out.push('\n');
     }
     Ok(out)
+}
+
+fn append_directory_publish_entries(
+    entries: &mut Vec<ManifestEntry>,
+    image_root: &str,
+    source_root: &Path,
+) -> Result<(), String> {
+    append_directory_publish_entries_inner(entries, image_root, source_root, source_root)
+}
+
+fn append_directory_publish_entries_inner(
+    entries: &mut Vec<ManifestEntry>,
+    image_root: &str,
+    source_root: &Path,
+    current: &Path,
+) -> Result<(), String> {
+    for entry in
+        fs::read_dir(current).map_err(|err| format!("failed to read {}: {err}", current.display()))?
+    {
+        let entry = entry.map_err(|err| format!("failed to read {} entry: {err}", current.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+        if file_type.is_dir() {
+            append_directory_publish_entries_inner(entries, image_root, source_root, &path)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(source_root)
+            .map_err(|err| format!("failed to relativize {}: {err}", path.display()))?;
+        let relative = relative.display().to_string().replace('\\', "/");
+        let image_path = join_image_path(image_root, &relative);
+        entries.push(ManifestEntry {
+            image_path,
+            source_path: Some(path),
+            is_dir: false,
+        });
+    }
+    Ok(())
+}
+
+fn join_image_path(root: &str, relative: &str) -> String {
+    let root = root.trim_end_matches('/');
+    let relative = relative.trim_start_matches('/');
+    if root.is_empty() {
+        format!("/{relative}")
+    } else if relative.is_empty() {
+        root.to_string()
+    } else {
+        format!("{root}/{relative}")
+    }
 }
 
 fn render_startup_manifest(apps: &[AppConfig]) -> Result<String, String> {

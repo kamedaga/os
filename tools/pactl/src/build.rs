@@ -194,8 +194,8 @@ fn build_zig_app(
 
     cmd.arg("-fPIE");
     cmd.arg("-fentry=_start");
-    cmd.arg("-z").arg("common-page-size=16");
-    cmd.arg("-z").arg("max-page-size=16");
+    cmd.arg("-z").arg("common-page-size=4096");
+    cmd.arg("-z").arg("max-page-size=4096");
     if app.build.strip {
         cmd.arg("-fstrip");
     }
@@ -315,6 +315,11 @@ fn build_file_app(
         )?;
     }
 
+    if source_path.is_dir() {
+        copy_dir_if_changed(&source_path, output_path)?;
+        return Ok(());
+    }
+
     if !source_path.is_file() {
         return Err(format!(
             "prebuilt source for app {} does not exist: {}",
@@ -327,7 +332,7 @@ fn build_file_app(
 
 fn output_is_usable(path: &Path) -> Result<bool, String> {
     match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
+        Ok(metadata) => Ok((metadata.is_file() && metadata.len() > 0) || metadata.is_dir()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(format!("failed to inspect {}: {err}", path.display())),
     }
@@ -480,4 +485,45 @@ fn copy_if_changed(source_path: &Path, output_path: &Path) -> Result<(), String>
     }
     fs::write(output_path, source)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))
+}
+
+fn copy_dir_if_changed(source_path: &Path, output_path: &Path) -> Result<(), String> {
+    if output_path.exists() {
+        if output_path.is_dir() {
+            fs::remove_dir_all(output_path)
+                .map_err(|err| format!("failed to remove {}: {err}", output_path.display()))?;
+        } else {
+            fs::remove_file(output_path)
+                .map_err(|err| format!("failed to remove {}: {err}", output_path.display()))?;
+        }
+    }
+    copy_dir_all(source_path, output_path)
+}
+
+fn copy_dir_all(source_path: &Path, output_path: &Path) -> Result<(), String> {
+    fs::create_dir_all(output_path)
+        .map_err(|err| format!("failed to create {}: {err}", output_path.display()))?;
+    for entry in fs::read_dir(source_path)
+        .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?
+    {
+        let entry =
+            entry.map_err(|err| format!("failed to read {} entry: {err}", source_path.display()))?;
+        let source_child = entry.path();
+        let output_child = output_path.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to inspect {}: {err}", source_child.display()))?;
+        if file_type.is_dir() {
+            copy_dir_all(&source_child, &output_child)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_child, &output_child).map_err(|err| {
+                format!(
+                    "failed to copy {} to {}: {err}",
+                    source_child.display(),
+                    output_child.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }

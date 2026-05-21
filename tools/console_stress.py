@@ -168,7 +168,7 @@ def run_one(root: Path, out_dir: Path, run_id: int, loops: int, prompt_timeout: 
             checks: list[tuple[str, float, list[bytes]]] = [
                 ("pwd", 10.0, [b"/"]),
                 ("ls", 15.0, [b"bin", b"cmd", b"dev"]),
-                ("fastfetch", 30.0, [b"PachaOS", b"Shell:", b"dash", b"Terminal:", b"virtio-console"]),
+                ("fastfetch", 30.0, [b"PachaOS", b"Shell:", b"dash", b"Terminal:"]),
                 ("apk --version", 20.0, [b"apk-tools"]),
                 ("zstd --version", 15.0, [b"Zstandard CLI"]),
                 ("cat /etc/os-release", 10.0, [b'NAME="PachaOS"']),

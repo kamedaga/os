@@ -7,7 +7,7 @@ pub const descriptor_page_va: u64 = process_abi.auxPageVa(7);
 pub const source_base_page_index: u64 = 8;
 pub const bootfs_image_va: u64 = 0x3C08_0000;
 /// VA in init's address space where the framebuffer MMIO region is mapped.
-/// Init installs a VM object here and passes it to boot_display via spawn_exec.
+/// Init installs a VM object here and passes it to boot_display during bootstrap.
 pub const init_framebuffer_source_va: u64 = 0x3E00_0000;
 
 pub const SourceSlot = enum(u64) {

@@ -36,8 +36,8 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
     proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->pgid = principal; proc->principal = principal; init_process_fds(proc);
     proc->exec_pending_principal = 0;
-    proc->mmap_next_va = 0x29000000ULL;
-    proc->brk_next_va = 0x38000000ULL;
+    proc->mmap_next_va = LINUX_MMAP_BASE_VA;
+    proc->brk_next_va = LINUX_BRK_INITIAL_VA;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
     proc->root_path[0] = '/'; proc->root_path[1] = 0; proc->root_len = 1;
     proc->cwd[0] = '/'; proc->cwd[1] = 0; proc->cwd_len = 1;
@@ -401,6 +401,15 @@ static struct linux_process_state *process_state_for_tid(u64 tid) {
 
 static void record_process_exit(u64 pid, u32 status) {
     if (pid == 0) return;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *parent = &g_processes[i];
+        if (!parent->used || parent->exec_pending) continue;
+        for (u64 child = 0; child < LINUX_CHILD_MAX; child++) {
+            if (!parent->child_used[child] || parent->child_slot[child] != pid) continue;
+            parent->pending_signals |= linux_signal_bit(SIGCHLD);
+            break;
+        }
+    }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_exit_record_used[i] || g_exit_record_pid[i] != pid) continue;
         g_exit_record_status[i] = status;

@@ -18,7 +18,7 @@ const all_cpu_affinity_mask: u64 = if (smp.max_cpus >= 64) std.math.maxInt(u64) 
 
 const fx_state_bytes: usize = 512;
 pub const max_thread_slots: usize = kernel.max_thread_slots;
-pub const max_ipc_queue_depth: usize = max_thread_slots;
+pub const max_ipc_queue_depth: usize = 128;
 pub const idle_thread_marker: usize = max_thread_slots;
 
 pub const IpcQueuedMessage = struct {
@@ -251,8 +251,6 @@ pub var scheduler_perf_user_ticks: u64 = 0;
 pub var scheduler_perf_priority_owner_ticks: u64 = 0;
 pub var scheduler_perf_priority_thread_ticks: u64 = 0;
 pub var runtime_priority_streak: u64 = 0;
-pub var scheduler_int80_log_count: u64 = 0;
-pub var scheduler_race_log_count: u64 = 0;
 pub var runtime_priority_active = false;
 pub var runtime_priority_principal: ?kernel.PrincipalId = null;
 pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
@@ -292,8 +290,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_perf_priority_owner_ticks), &scheduler_perf_priority_owner_ticks));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_perf_priority_thread_ticks), &scheduler_perf_priority_thread_ticks));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_priority_streak), &runtime_priority_streak));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_int80_log_count), &scheduler_int80_log_count));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_race_log_count), &scheduler_race_log_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_priority_active), &runtime_priority_active));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_priority_principal), &runtime_priority_principal));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_fx_state), &initial_fx_state));
@@ -599,7 +595,7 @@ fn clearCurrentApThreadAssociationForBlock(cpu_slot: usize, thread_index: usize)
 }
 
 pub fn prepareBlockedThreadForWake(thread_index: usize) void {
-    if (!spawnExecApUserSchedulingReady()) return;
+    if (!userApSchedulingReady()) return;
     const ctx = getThreadContextConst(thread_index) orelse return;
     if (!ctx.allocated) return;
     const cpu_slot = ctx.cpu_slot;
@@ -735,29 +731,29 @@ pub fn refreshCpuTopology() void {
     }
 }
 
-pub fn spawnExecApUserSchedulingEnabled() bool {
-    return build_workarounds.spawn_exec_ap_user_scheduling;
+pub fn userApSchedulingEnabled() bool {
+    return build_workarounds.user_ap_scheduling;
 }
 
 fn apUserSchedulingFeatureEnabled() bool {
-    return build_workarounds.spawn_exec_ap_user_scheduling;
+    return build_workarounds.user_ap_scheduling;
 }
 
-pub const SpawnExecApUserSchedulingBlock = enum(u8) {
+pub const UserApSchedulingBlock = enum(u8) {
     none,
     flag_disabled,
     no_ap,
     bootstrap_path,
 };
 
-pub fn spawnExecApUserSchedulingBlockReason() SpawnExecApUserSchedulingBlock {
-    if (!build_workarounds.spawn_exec_ap_user_scheduling) return .flag_disabled;
+pub fn userApSchedulingBlockReason() UserApSchedulingBlock {
+    if (!build_workarounds.user_ap_scheduling) return .flag_disabled;
     if (smp.cpuCount() <= 1) return .no_ap;
     return .none;
 }
 
-pub fn spawnExecApUserSchedulingReady() bool {
-    return spawnExecApUserSchedulingBlockReason() == .none;
+pub fn userApSchedulingReady() bool {
+    return userApSchedulingBlockReason() == .none;
 }
 
 pub fn apUserTimerPreemptionEnabled() bool {
@@ -951,12 +947,12 @@ pub fn assignThreadPairToChosenCpu(first_thread: usize, second_thread: usize, al
     return cpu_slot;
 }
 
-pub fn assignSpawnExecThreadToApIfReady(thread_index: usize) ?usize {
+pub fn assignUserThreadToApIfReady(thread_index: usize) ?usize {
     return assignReadyUserThreadToApIfReady(thread_index);
 }
 
-pub fn readySpawnExecThreadOnApIfReady(thread_index: usize) ?usize {
-    if (!spawnExecApUserSchedulingReady()) return null;
+pub fn readyUserThreadOnApIfReady(thread_index: usize) ?usize {
+    if (!userApSchedulingReady()) return null;
     var chosen_cpu: ?usize = null;
     lockAllCpuSchedulerStates();
     {
@@ -985,7 +981,7 @@ pub fn readySpawnExecThreadOnApIfReady(thread_index: usize) ?usize {
 }
 
 pub fn assignReadyUserThreadToApIfReady(thread_index: usize) ?usize {
-    if (!spawnExecApUserSchedulingReady()) return null;
+    if (!userApSchedulingReady()) return null;
     _ = setApRunnablePolicyEnabled(true);
     const cpu_slot = assignThreadToChosenCpu(thread_index, false) orelse return null;
     if (!requestCpuUserEntry(cpu_slot, true)) return null;
@@ -998,7 +994,7 @@ pub fn wakeAssignedApForRunnableThread(thread_index: usize) void {
     if (!ctx.allocated or !ctx.ready or ctx.abi_trap_reply_pending) return;
     const cpu_slot = ctx.cpu_slot;
     if (cpu_slot == bootstrap_cpu_slot) return;
-    if (!spawnExecApUserSchedulingReady()) return;
+    if (!userApSchedulingReady()) return;
     _ = setApRunnablePolicyEnabled(true);
     if (!requestCpuUserEntry(cpu_slot, true)) return;
     _ = smp.wakeCpu(cpu_slot);
@@ -1033,7 +1029,7 @@ fn parkCurrentApAfterBlocking(cpu_slot: usize, preserve_thread: ?usize) noreturn
 
 pub fn parkCurrentApAfterCurrentThreadStopped() noreturn {
     const cpu_slot = currentCpuSlot();
-    if (cpu_slot != bootstrap_cpu_slot and spawnExecApUserSchedulingReady()) {
+    if (cpu_slot != bootstrap_cpu_slot and userApSchedulingReady()) {
         parkCurrentApAfterBlocking(cpu_slot, null);
     }
     while (true) {
@@ -1261,12 +1257,6 @@ pub fn enterReadyThreadFromBootstrapKernelInterrupt(frame: *TrapFrame) bool {
     if (!activateThread(next_thread)) return false;
     return loadThreadContextToFrame(next_thread, frame);
 }
-
-pub const RaceLogHooks = struct {
-    write: *const fn ([]const u8) void,
-    print_hex: *const fn (u64) void,
-    principal_label: *const fn (kernel.PrincipalId) []const u8,
-};
 
 pub const PerfReport = struct {
     ticks: u64,
@@ -1497,69 +1487,6 @@ pub fn isThreadReady(thread_index: usize) bool {
     return hot.allocated != 0 and hot.ready != 0;
 }
 
-fn threadLabel(thread_index: usize) []const u8 {
-    const labels = comptime blk: {
-        var items: [max_thread_slots][]const u8 = undefined;
-        for (0..max_thread_slots) |i| {
-            items[i] = std.fmt.comptimePrint("Thread{}", .{i});
-        }
-        break :blk items;
-    };
-    if (thread_index < labels.len) return labels[thread_index];
-    return "Thread?";
-}
-
-fn tryBeginSchedulerRaceLog(hooks: RaceLogHooks, max_lines: u64) bool {
-    if (scheduler_race_log_count >= max_lines) return false;
-    scheduler_race_log_count +%= 1;
-    hooks.write("SCHED race ");
-    return true;
-}
-
-pub fn logRaceSendCap(
-    hooks: RaceLogHooks,
-    max_lines: u64,
-    from: kernel.PrincipalId,
-    to: ?kernel.PrincipalId,
-    endpoint_id: u64,
-    paddr: u64,
-    reason: []const u8,
-) void {
-    if (!tryBeginSchedulerRaceLog(hooks, max_lines)) return;
-    hooks.write("send_cap from=");
-    hooks.write(hooks.principal_label(from));
-    hooks.write(" to=");
-    if (to) |target| {
-        hooks.write(hooks.principal_label(target));
-    } else {
-        hooks.write("unknown");
-    }
-    hooks.write(" ep=");
-    hooks.print_hex(endpoint_id);
-    hooks.write(" paddr=");
-    hooks.print_hex(paddr);
-    hooks.write(" reason=");
-    hooks.write(reason);
-    hooks.write("\n");
-}
-
-pub fn logRaceSwitch(
-    hooks: RaceLogHooks,
-    max_lines: u64,
-    current_thread: usize,
-    target_thread: usize,
-    reason: []const u8,
-) void {
-    if (!tryBeginSchedulerRaceLog(hooks, max_lines)) return;
-    hooks.write("switch_thread from=");
-    hooks.write(threadLabel(current_thread));
-    hooks.write(" to=");
-    hooks.write(threadLabel(target_thread));
-    hooks.write(" reason=");
-    hooks.write(reason);
-    hooks.write("\n");
-}
-
 pub fn setThreadReady(thread_index: usize, ready: bool) bool {
     const ctx = getThreadContext(thread_index) orelse return false;
     if (!ctx.allocated) return false;
@@ -1680,7 +1607,7 @@ fn clearThreadFromCpuSchedulerStatesLocked(thread_index: usize) u64 {
 }
 
 fn stopReleasedThreadOnAp(release_cpu_slot: usize, releasing_from_cpu: usize, wake_mask: u64) void {
-    if (!spawnExecApUserSchedulingReady()) return;
+    if (!userApSchedulingReady()) return;
     var target_mask = wake_mask;
     if (release_cpu_slot != bootstrap_cpu_slot and release_cpu_slot != releasing_from_cpu) {
         if (cpuAffinityBit(release_cpu_slot)) |bit| target_mask |= bit;
@@ -2051,7 +1978,7 @@ pub fn activateThread(thread_index: usize) bool {
     state.current_principal = hot.owner_process;
     state.current_cr3 = hot.cr3;
     state.is_idle = false;
-    if (cpu_slot != bootstrap_cpu_slot and spawnExecApUserSchedulingReady()) {
+    if (cpu_slot != bootstrap_cpu_slot and userApSchedulingReady()) {
         state.run_queue.markBlocked(thread_index);
         state.pending_handoff_thread = null;
         state.validated_handoff_thread = null;
@@ -2115,7 +2042,7 @@ pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
 }
 
 pub fn switchToThread(next_thread: usize, frame: *TrapFrame, saved_rax: ?u64) bool {
-    if (!schedulerRunsOnCurrentCpu() and !spawnExecApUserSchedulingReady()) return false;
+    if (!schedulerRunsOnCurrentCpu() and !userApSchedulingReady()) return false;
     if (next_thread >= max_thread_slots) return false;
     const current_thread = currentThreadIndex();
     if (next_thread == current_thread) {
@@ -2227,7 +2154,7 @@ pub fn blockCurrentThreadForEventPreservingIpc(frame: *TrapFrame, timeout_ticks:
 }
 
 fn blockCurrentThreadForEventInternal(frame: *TrapFrame, wait_mailbox: bool, preserve_ipc_queue: bool, timeout_ticks: u64, resume_rax: u64) bool {
-    if (!schedulerRunsOnCurrentCpu() and !spawnExecApUserSchedulingReady()) return false;
+    if (!schedulerRunsOnCurrentCpu() and !userApSchedulingReady()) return false;
     const current_thread = currentThreadIndex();
     const ctx = getThreadContext(current_thread) orelse return false;
     const preferred_thread = preferred_ipc_switch_threads[current_thread];
@@ -2283,7 +2210,7 @@ fn blockCurrentThreadForEventInternal(frame: *TrapFrame, wait_mailbox: bool, pre
     };
     if (next_thread == current_thread) {
         const cpu_slot = currentCpuSlot();
-        if (cpu_slot != bootstrap_cpu_slot and spawnExecApUserSchedulingReady()) {
+        if (cpu_slot != bootstrap_cpu_slot and userApSchedulingReady()) {
             if (threadReadyForCpuLocked(current_thread, cpu_slot)) {
                 if (activateThread(current_thread) and loadThreadContextToFrame(current_thread, frame)) {
                     return true;

@@ -7,6 +7,7 @@ enum {
     SYSCALL_LOG = 0x9,
     SYSCALL_MAP_PAGE = 0x2,
     SYSCALL_WAIT_EVENT = 0x17,
+    SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
@@ -42,7 +43,7 @@ enum {
     IPC_BUFFER_ROLE_RESPONSE = 2,
     VFS_CONFIG_VA = 0x3C002000,
     VFS_MAX_SESSIONS = 8,
-    VFS_BULK_PAGE_COUNT = 128,
+    VFS_BULK_PAGE_COUNT = 256,
     VFS_BULK_BYTES = VFS_BULK_PAGE_COUNT * FS_PAGE_BYTES,
     VFS_REPLY_ENDPOINT_ID = 0xE0,
     VFS_NET_REPLY_ENDPOINT_ID = 0xEA,
@@ -119,6 +120,9 @@ enum {
     VFS_CREATE_FLAG_DIRECTORY = 1 << 0,
     VFS_CREATE_FLAG_TRUNCATE = 1 << 1,
     VFS_CREATE_FLAG_SYMLINK = 1 << 2,
+    VM_OBJECT_TOKEN_TAG = 1ULL << 62,
+    VM_RIGHT_READ_MAP = 0x5,
+    VM_RIGHT_READ_MAP_GRANT = 0xD,
 
     NET_PROTOCOL_REQUEST_MAGIC = 0x514E4554,
     NET_PROTOCOL_RESPONSE_MAGIC = 0x524E4554,
@@ -181,6 +185,7 @@ struct vfs_session {
     u8 bulk_mapped;
     u8 reserved1[7];
     u64 reply_endpoint_id;
+    u64 process_slot;
     u64 session_nonce;
     u64 last_completed_seq;
     u64 root_token;
@@ -789,6 +794,16 @@ static u64 grant_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights) 
 
 static u64 share_ipc_buffer_on_endpoint(u64 token, u64 endpoint_id, u64 rights) {
     return syscall3(SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT, token, endpoint_id, rights);
+}
+
+static int is_vm_object_token(u64 token) {
+    return (token & VM_OBJECT_TOKEN_TAG) == VM_OBJECT_TOKEN_TAG && (token & ~VM_OBJECT_TOKEN_TAG) != 0;
+}
+
+static u64 grant_vm_object_to_client(u64 token) {
+    if (!is_vm_object_token(token) || g_session == 0 || g_session->process_slot == 0) return 0;
+    const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, token, g_session->process_slot, VM_RIGHT_READ_MAP);
+    return is_vm_object_token(granted) ? granted : 0;
 }
 
 static u64 ipc_call_reply_recv_signal_only(u64 endpoint_id, u64 mr0) {
@@ -1608,7 +1623,7 @@ static u64 lookup_path(u64 base_token, const volatile u8 *path, u16 len) {
     return lookup_tmpfs_name(current_object_id, path + second_start, second_len);
 }
 
-static void write_response(
+static void write_response_ex(
     u16 op,
     u64 seq,
     i32 status,
@@ -1616,7 +1631,8 @@ static void write_response(
     u64 file_bytes,
     u64 cursor_next,
     u8 object_kind,
-    u16 inline_bytes
+    u16 inline_bytes,
+    u64 arg0
 ) {
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)g_session->response_va;
     response->magic = FS_RESPONSE_MAGIC;
@@ -1631,13 +1647,26 @@ static void write_response(
     response->object_kind = object_kind;
     response->reserved0 = 0;
     response->reserved1 = 0;
-    response->arg0 = 0;
+    response->arg0 = arg0;
     response->arg1 = 0;
     __asm__ volatile("" ::: "memory");
     response->response_seq = seq;
     if (g_session->reply_endpoint_id != 0) {
         (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, g_session->reply_endpoint_id, 0);
     }
+}
+
+static void write_response(
+    u16 op,
+    u64 seq,
+    i32 status,
+    u64 result_token,
+    u64 file_bytes,
+    u64 cursor_next,
+    u8 object_kind,
+    u16 inline_bytes
+) {
+    write_response_ex(op, seq, status, result_token, file_bytes, cursor_next, object_kind, inline_bytes, 0);
 }
 
 static void reply_status(u16 op, u64 seq, i32 status) {
@@ -3346,6 +3375,10 @@ static void forward_backend_response(u16 op, u64 client_seq, u64 cursor_bias) {
     copy_from_volatile(dst, src, inline_bytes);
 
     u64 result_token = backend->result_token == 0 ? 0 : wrap_backend_token(backend->result_token);
+    u64 arg0 = 0;
+    if (op == FS_OP_OPEN_EXEC && is_vm_object_token(backend->arg0)) {
+        arg0 = grant_vm_object_to_client(backend->arg0);
+    }
     u64 cursor_next = backend->cursor_next;
     if (op == FS_OP_READDIR) {
         cursor_next += cursor_bias;
@@ -3354,7 +3387,7 @@ static void forward_backend_response(u16 op, u64 client_seq, u64 cursor_bias) {
             record->next_cursor += cursor_bias;
         }
     }
-    write_response(op, client_seq, backend->status, result_token, backend->file_bytes, cursor_next, backend->object_kind, inline_bytes);
+    write_response_ex(op, client_seq, backend->status, result_token, backend->file_bytes, cursor_next, backend->object_kind, inline_bytes, arg0);
 }
 
 static int backend_readdir_entry_shadowed_by_builtin_root(void) {
@@ -3783,6 +3816,7 @@ static void handle_connect_token(u64 request_token) {
     session->reply_endpoint_id = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, VFS_REPLY_ENDPOINT_ID + slot, request->arg1) == SYSCALL_OK
         ? VFS_REPLY_ENDPOINT_ID + slot
         : 0;
+    session->process_slot = request->arg1;
     session->session_nonce = request->session_nonce;
     session->last_completed_seq = 0;
     session->root_token = root_token();
@@ -3838,6 +3872,7 @@ static void handle_connect_paddr_transfer(u64 transfer_id) {
     session->reply_endpoint_id = syscall3(SYSCALL_INSTALL_ENDPOINT, 0, VFS_REPLY_ENDPOINT_ID + slot, request->arg1) == SYSCALL_OK
         ? VFS_REPLY_ENDPOINT_ID + slot
         : 0;
+    session->process_slot = request->arg1;
     session->session_nonce = request->session_nonce;
     session->last_completed_seq = 0;
     session->root_token = root_token();

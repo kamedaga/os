@@ -1,6 +1,5 @@
 const std = @import("std");
 
-pub const syscall_spawn_exec: u64 = 0x1D;
 pub const syscall_arm_deferred_compositor: u64 = 0x22;
 pub const syscall_get_process_status: u64 = 0x30;
 pub const syscall_process_exit: u64 = 0x34;

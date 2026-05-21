@@ -3,7 +3,6 @@
 const std = @import("std");
 const kernel = @import("../kernel.zig");
 const capability = @import("../capability.zig");
-const device_capabilities = @import("../device_capabilities.zig");
 const device_events = @import("../device_events.zig");
 const elf_loader = @import("../elf_loader.zig");
 const scheduler = @import("../scheduler.zig");
@@ -30,7 +29,6 @@ const uefi_services = @import("uefi_services.zig");
 const process_factory = @import("process_factory.zig");
 const elf_load = @import("elf_load.zig");
 const init_setup = @import("init_setup.zig");
-const spawn = @import("../runtime/spawn.zig");
 const process_builder = @import("../runtime/process_builder.zig");
 const abi_trap_runtime = @import("../runtime/abi_trap.zig");
 const halt = @import("../halt.zig");
@@ -91,7 +89,6 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, spawn.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, process_builder.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, abi_trap_runtime.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, scheduler.kernelStaticStorageEndAddr());
@@ -133,55 +130,10 @@ fn principalFromProcessSlot(raw: u64) ?kernel.PrincipalId {
     return kernel.processPrincipalFromIndex(idx);
 }
 
-fn dumpAllProcessCaps(state: *const kernel.KernelState) void {
-    boot_debug.dumpAllProcessCaps(state, boot_static.user_process_count, principalLabel);
-}
-
 fn bootDebugHooks() boot_debug.Hooks {
     return .{
         .write = kernel_log.write,
-        .print_number = log_util.printNumberU64,
-        .print_hex = log_util.printHex,
-        .principal_label = principalLabel,
     };
-}
-
-fn logQueueCapDeny(
-    proc: kernel.PrincipalId,
-    token: u64,
-    queue_index: u16,
-    op: device_capabilities.QueueOperation,
-    err: anyerror,
-) void {
-    boot_debug.logQueueCapDeny(bootDebugHooks(), proc, token, queue_index, op, err);
-}
-
-fn logSchedulerRaceSendCap(
-    from: kernel.PrincipalId,
-    to: ?kernel.PrincipalId,
-    endpoint_id: u64,
-    paddr: u64,
-    reason: []const u8,
-) void {
-    scheduler.logRaceSendCap(
-        .{ .write = kernel_log.write, .print_hex = log_util.printHex, .principal_label = principalLabel },
-        boot_static.scheduler_race_log_max_lines,
-        from,
-        to,
-        endpoint_id,
-        paddr,
-        reason,
-    );
-}
-
-fn logSchedulerRaceSwitch(current_thread: usize, target_thread: usize, reason: []const u8) void {
-    scheduler.logRaceSwitch(
-        .{ .write = kernel_log.write, .print_hex = log_util.printHex, .principal_label = principalLabel },
-        boot_static.scheduler_race_log_max_lines,
-        current_thread,
-        target_thread,
-        reason,
-    );
 }
 
 fn iommuAuditHook(
@@ -458,7 +410,7 @@ fn nextReadyThreadAfter(current_thread: usize) ?usize {
 
 fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
     const cpu_slot = scheduler.currentCpuSlot();
-    if (cpu_slot != 0 and scheduler.spawnExecApUserSchedulingReady()) {
+    if (cpu_slot != 0 and scheduler.userApSchedulingReady()) {
         while (true) {
             const current_thread = scheduler.currentThreadIndex();
             if (scheduler.pickNextReadyThreadIndexForCpu(cpu_slot, current_thread)) |thread_index| {
@@ -508,7 +460,6 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;
     kernel_state_global.vm_object_tables[process_index] = .{};
-    kernel_state_global.exec_image_tables[process_index] = .{};
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -561,7 +512,6 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;
     kernel_state_global.vm_object_tables[process_index] = .{};
-    kernel_state_global.exec_image_tables[process_index] = .{};
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -853,8 +803,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;
-    scheduler.scheduler_int80_log_count = 0;
-    scheduler.scheduler_race_log_count = 0;
     boot_debug.logReadyTitle(bootDebugHooks(), "USER_PAGE_READY");
     init_setup.refreshInitBootLogSnapshot(state, init_principal);
 
@@ -884,7 +832,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 // ---------------------------------------------------------------------------
 
 fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
-    spawn.init(state, &global_free_list, user_spaces, boot_init_principal);
     process_builder.init(state, &global_free_list, user_spaces);
     abi_trap_runtime.init(.{
         .state = state,
@@ -906,31 +853,20 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .state = state,
         .free_list = &global_free_list,
         .kernel_state_ready = &kernel_state_ready,
-        .enable_cap_table_dump_logs = false,
-        .enable_switch_thread_syscall_log = boot_static.enable_switch_thread_syscall_log,
-        .scheduler_log_int80 = boot_static.scheduler_log_int80,
-        .scheduler_int80_log_max_lines = boot_static.scheduler_int80_log_max_lines,
         .write = kernel_log.write,
         .print_hex = log_util.printHex,
         .print_number = log_util.printNumberU64,
-        .thread_label = threadLabel,
         .principal_label = principalLabel,
         .principal_from_process_slot = principalFromProcessSlot,
-        .dump_all_process_caps = dumpAllProcessCaps,
         .read_user_u64 = user_copy.readUserU64,
         .write_user_u64 = user_copy.writeUserU64,
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
-        .launch_pie_user_thread = spawn.launchPieUserThread,
-        .spawn_exec = spawn.spawnExecFromSyscall,
         .wake_waiting_thread_for_principal = scheduler.wakeWaitingThreadForPrincipal,
         .wake_blocked_thread_for_principal = scheduler.wakeBlockedThreadForPrincipal,
         .consume_pending_signal_for_principal = scheduler.consumePendingSignalForPrincipal,
         .switch_to_thread = scheduler.switchToThread,
         .block_current_thread_for_event = scheduler.blockCurrentThreadForEvent,
-        .log_queue_cap_deny = logQueueCapDeny,
-        .log_race_send_cap = logSchedulerRaceSendCap,
-        .log_race_switch = logSchedulerRaceSwitch,
         .exit_current_process = exitCurrentProcess,
         .total_usable_memory_bytes = memory_stats.total_usable_bytes,
     });
@@ -940,8 +876,6 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .state = state,
         .scheduler_quantum_ticks = boot_static.scheduler_quantum_ticks,
         .priority_hold_quanta = 0,
-        .scheduler_log_switch = boot_static.scheduler_log_switch,
-        .scheduler_switch_log_max_lines = boot_static.scheduler_switch_log_max_lines,
         .write = kernel_log.write,
         .write_hex_raw = kernel_log.writeHexRaw,
         .write_bool01 = kernel_log.writeBool01,
@@ -954,7 +888,6 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .halt_loop = halt.haltLoop,
         .resume_after_fatal_user_exception = resumeAfterFatalUserException,
         .switch_to_thread = scheduler.switchToThread,
-        .log_race_switch = logSchedulerRaceSwitch,
     });
 }
 

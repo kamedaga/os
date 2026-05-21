@@ -1,6 +1,18 @@
 static u64 page_up(u64 value) { return (value + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1); }
 static u64 page_down(u64 value) { return value & ~(u64)(PAGE_BYTES - 1); }
 
+static int vm_regions_can_merge(u64 left, u64 right) {
+    if (left >= VM_REGION_MAX || right >= VM_REGION_MAX || !g_regions[left].used || !g_regions[right].used) return 0;
+    if (g_regions[left].prot != g_regions[right].prot) return 0;
+    if (g_regions[left].file_backed != g_regions[right].file_backed) return 0;
+    if (g_regions[left].file_lazy != g_regions[right].file_lazy) return 0;
+    if (g_regions[left].file_cow != g_regions[right].file_cow) return 0;
+    if (!g_regions[left].file_backed) return 1;
+    if (g_regions[left].file_token != g_regions[right].file_token) return 0;
+    if (g_regions[left].file_size != g_regions[right].file_size) return 0;
+    return g_regions[left].file_offset + g_regions[left].size == g_regions[right].file_offset;
+}
+
 static void vm_merge_region_at(u64 slot) {
     if (slot >= VM_REGION_MAX || !g_regions[slot].used) return;
     int changed = 1;
@@ -8,8 +20,9 @@ static void vm_merge_region_at(u64 slot) {
         changed = 0;
         const u64 slot_end = g_regions[slot].start + g_regions[slot].size;
         for (u64 j = 0; j < VM_REGION_MAX; j++) {
-            if (slot == j || !g_regions[j].used || g_regions[slot].prot != g_regions[j].prot) continue;
+            if (slot == j || !g_regions[j].used) continue;
             if (slot_end == g_regions[j].start) {
+                if (!vm_regions_can_merge(slot, j)) continue;
                 g_regions[slot].size += g_regions[j].size;
                 g_regions[j].used = 0;
                 changed = 1;
@@ -17,8 +30,10 @@ static void vm_merge_region_at(u64 slot) {
             }
             const u64 j_end = g_regions[j].start + g_regions[j].size;
             if (j_end == g_regions[slot].start) {
+                if (!vm_regions_can_merge(j, slot)) continue;
                 g_regions[slot].start = g_regions[j].start;
                 g_regions[slot].size += g_regions[j].size;
+                if (g_regions[slot].file_backed) g_regions[slot].file_offset = g_regions[j].file_offset;
                 g_regions[j].used = 0;
                 changed = 1;
                 break;
@@ -27,17 +42,27 @@ static void vm_merge_region_at(u64 slot) {
     }
 }
 
-static int vm_add_region(u64 start, u64 size, u64 prot) {
+static int vm_add_region(u64 start, u64 size, u64 prot, u64 file_token, u64 file_offset, u64 file_size, int file_backed, int file_lazy, int file_cow) {
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
-        if (!g_regions[i].used || g_regions[i].prot != prot) continue;
+        if (!g_regions[i].used || g_regions[i].prot != prot || g_regions[i].file_backed != (u8)file_backed || g_regions[i].file_lazy != (u8)file_lazy || g_regions[i].file_cow != (u8)file_cow) continue;
+        if (file_backed && g_regions[i].file_token != file_token) continue;
+        if (file_backed && g_regions[i].file_size != file_size) continue;
         if (g_regions[i].start + g_regions[i].size == start) {
+            if (file_backed && g_regions[i].file_offset + g_regions[i].size != file_offset) continue;
             g_regions[i].size += size;
             vm_merge_region_at(i);
             return 1;
         }
         if (start + size == g_regions[i].start) {
+            if (file_backed && file_offset + size != g_regions[i].file_offset) continue;
             g_regions[i].start = start;
             g_regions[i].size += size;
+            g_regions[i].file_token = file_token;
+            g_regions[i].file_offset = file_offset;
+            g_regions[i].file_size = file_size;
+            g_regions[i].file_backed = (u8)file_backed;
+            g_regions[i].file_lazy = (u8)file_lazy;
+            g_regions[i].file_cow = (u8)file_cow;
             vm_merge_region_at(i);
             return 1;
         }
@@ -45,6 +70,12 @@ static int vm_add_region(u64 start, u64 size, u64 prot) {
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
         if (!g_regions[i].used) {
             g_regions[i].used = 1; g_regions[i].start = start; g_regions[i].size = size; g_regions[i].prot = prot;
+            g_regions[i].file_token = file_backed ? file_token : 0;
+            g_regions[i].file_offset = file_backed ? file_offset : 0;
+            g_regions[i].file_size = file_backed ? file_size : 0;
+            g_regions[i].file_backed = (u8)file_backed;
+            g_regions[i].file_lazy = (u8)file_lazy;
+            g_regions[i].file_cow = (u8)file_cow;
             vm_merge_region_at(i);
             return 1;
         }
@@ -56,6 +87,15 @@ static u64 vm_region_used_count(void) {
     u64 count = 0;
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
         if (g_regions[i].used) count++;
+    }
+    return count;
+}
+
+static u64 vm_tracked_page_count(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used) continue;
+        count += g_regions[i].size / PAGE_BYTES;
     }
     return count;
 }
@@ -77,6 +117,12 @@ static int vm_split_at(u64 point) {
         g_regions[(u64)slot].start = point;
         g_regions[(u64)slot].size = re - point;
         g_regions[(u64)slot].prot = g_regions[i].prot;
+        g_regions[(u64)slot].file_token = g_regions[i].file_token;
+        g_regions[(u64)slot].file_offset = g_regions[i].file_backed ? g_regions[i].file_offset + (point - rs) : 0;
+        g_regions[(u64)slot].file_size = g_regions[i].file_size;
+        g_regions[(u64)slot].file_backed = g_regions[i].file_backed;
+        g_regions[(u64)slot].file_lazy = g_regions[i].file_lazy;
+        g_regions[(u64)slot].file_cow = g_regions[i].file_cow;
         g_regions[i].size = point - rs;
         return 1;
     }
@@ -85,6 +131,23 @@ static int vm_split_at(u64 point) {
 
 static int vm_split_range_boundaries(u64 start, u64 size) {
     return vm_split_at(start) && vm_split_at(start + size);
+}
+
+static int vm_mark_private_page(u64 page) {
+    if ((page & (PAGE_BYTES - 1)) != 0) return 0;
+    if (!vm_split_range_boundaries(page, PAGE_BYTES)) return 0;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used || g_regions[i].start != page || g_regions[i].size != PAGE_BYTES) continue;
+        g_regions[i].file_token = 0;
+        g_regions[i].file_offset = 0;
+        g_regions[i].file_size = 0;
+        g_regions[i].file_backed = 0;
+        g_regions[i].file_lazy = 0;
+        g_regions[i].file_cow = 0;
+        vm_merge_region_at(i);
+        return 1;
+    }
+    return 0;
 }
 
 static int vm_range_covered(u64 start, u64 size) {
@@ -102,6 +165,17 @@ static int vm_range_covered(u64 start, u64 size) {
         cursor = best_end;
     }
     return 1;
+}
+
+static int vm_range_has_file_cow(u64 start, u64 size) {
+    const u64 end = start + size;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used || !g_regions[i].file_cow) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (rs < end && re > start) return 1;
+    }
+    return 0;
 }
 
 static int vm_range_prot(u64 start, u64 size, u64 *prot_out) {
@@ -146,6 +220,37 @@ static int vm_range_uncovered(u64 start, u64 size) {
     return 1;
 }
 
+static int vm_range_has_file_backing(u64 start, u64 size, u64 file_token, u64 file_offset) {
+    const u64 end = start + size;
+    u64 cursor = start;
+    while (cursor < end) {
+        u64 best_end = cursor;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || !g_regions[i].file_backed || g_regions[i].file_token != file_token) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (rs > cursor || re <= cursor) continue;
+            if (g_regions[i].file_offset + (cursor - rs) != file_offset + (cursor - start)) continue;
+            best_end = re < end ? re : end;
+            break;
+        }
+        if (best_end == cursor) return 0;
+        cursor = best_end;
+    }
+    return 1;
+}
+
+static int vm_range_has_lazy_file_backing(u64 start, u64 size) {
+    const u64 end = start + size;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used || !g_regions[i].file_backed || !g_regions[i].file_lazy) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (start < re && end > rs) return 1;
+    }
+    return 0;
+}
+
 static u64 vm_first_overlap_end(u64 start, u64 size) {
     const u64 end = start + size;
     u64 next = 0;
@@ -166,7 +271,7 @@ static u64 mmap_limit_exclusive(void) {
 }
 
 static u64 find_mmap_area(u64 size) {
-    const u64 base = 0x29000000ULL;
+    const u64 base = LINUX_MMAP_BASE_VA;
     const u64 limit = mmap_limit_exclusive();
     if (size == 0 || limit <= base || size > limit - base) return 0;
     for (u64 pass = 0; pass < 2; pass++) {
@@ -216,6 +321,19 @@ static u64 apply_target_pages(u64 start, u64 page_count, u64 prot, u64 (*fn)(u64
         done += chunk;
     }
     return SYSCALL_OK;
+}
+
+static int vm_apply_mapped_pages_in_range(u64 start, u64 size, u64 prot, u64 (*fn)(u64, u64, u64)) {
+    const u64 end = start + size;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (rs < start || re > end) continue;
+        const u64 status = apply_target_pages(rs, g_regions[i].size / PAGE_BYTES, prot, fn);
+        if (status != SYSCALL_OK) return 0;
+    }
+    return 1;
 }
 
 static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot) {
@@ -305,28 +423,55 @@ static u64 unmap_target_pages_from_thread_group(u64 start, u64 page_count) {
 
 static int unmap_tracked_target_range(u64 start, u64 size) {
     vm_trace4("vm.unmap_tracked.begin", start, size, 0, 0);
-    u64 done = 0;
-    const u64 page_count = size / PAGE_BYTES;
-    while (done < page_count) {
-        const u64 chunk = min_u64(page_count - done, 64);
-        const u64 status = unmap_reply_target_pages(start + done * PAGE_BYTES, chunk);
-        if (status != SYSCALL_OK) {
-            vm_trace4("vm.unmap_tracked.current_fail", start + done * PAGE_BYTES, chunk, status, 0);
-            return 0;
-        }
-        done += chunk;
-    }
-    const u64 group_status = unmap_target_pages_from_thread_group(start, page_count);
-    if (group_status != SYSCALL_OK) {
-        vm_trace4("vm.unmap_tracked.group_fail", start, page_count, group_status, 0);
-        return 0;
-    }
     if (!vm_range_covered(start, size)) return 1;
     if (!vm_split_range_boundaries(start, size)) return 0;
+    const u64 end = start + size;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (rs < start || re > end) continue;
+        u64 done = 0;
+        const u64 page_count = g_regions[i].size / PAGE_BYTES;
+        while (done < page_count) {
+            const u64 chunk = min_u64(page_count - done, 64);
+            const u64 va = rs + done * PAGE_BYTES;
+            const u64 status = unmap_reply_target_pages(va, chunk);
+            if (status != SYSCALL_OK) {
+                vm_trace4("vm.unmap_tracked.current_fail", va, chunk, status, 0);
+                return 0;
+            }
+            done += chunk;
+        }
+        const u64 group_status = unmap_target_pages_from_thread_group(rs, page_count);
+        if (group_status != SYSCALL_OK) {
+            vm_trace4("vm.unmap_tracked.group_fail", rs, page_count, group_status, 0);
+            return 0;
+        }
+    }
     vm_remove_range(start, size);
     sync_thread_group_vm_state();
-    vm_trace4("vm.unmap_tracked.done", start, size, page_count, 0);
+    vm_trace4("vm.unmap_tracked.done", start, size, size / PAGE_BYTES, 0);
     return 1;
+}
+
+static int unmap_all_tracked_target_ranges(void) {
+    int ok = 1;
+    for (;;) {
+        u64 slot = VM_REGION_MAX;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used) continue;
+            slot = i;
+            break;
+        }
+        if (slot == VM_REGION_MAX) return ok;
+        const u64 start = g_regions[slot].start;
+        const u64 size = g_regions[slot].size;
+        if (!unmap_tracked_target_range(start, size)) {
+            g_regions[slot].used = 0;
+            ok = 0;
+        }
+    }
 }
 
 static int unmap_overlapping_target_range(u64 start, u64 size) {
@@ -348,6 +493,179 @@ static int unmap_overlapping_target_range(u64 start, u64 size) {
     }
 }
 
+static int copy_zero_to_target_range(u64 dst, u64 len) {
+    u8 zeros[256];
+    for (u64 i = 0; i < sizeof(zeros); i++) zeros[i] = 0;
+    u64 done = 0;
+    while (done < len) {
+        u64 chunk = len - done;
+        if (chunk > sizeof(zeros)) chunk = sizeof(zeros);
+        if (copy_to_target(dst + done, zeros, chunk) != chunk) return 0;
+        done += chunk;
+    }
+    return 1;
+}
+
+static int materialize_lazy_file_range(u64 start, u64 size, u64 prot) {
+    if (!vm_split_range_boundaries(start, size)) return 0;
+    const u64 end = start + size;
+    for (;;) {
+        u64 slot = VM_REGION_MAX;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || !g_regions[i].file_lazy) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (rs >= start && re <= end) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == VM_REGION_MAX) break;
+        struct vm_region region = g_regions[slot];
+        const u64 page_count = region.size / PAGE_BYTES;
+        const u64 map_prot = ((prot | 0x2) & ~0x4);
+        const u64 map_status = map_target_pages_chunked(region.start, page_count, map_prot);
+        if (map_status != SYSCALL_OK) return 0;
+
+        struct fd_entry shadow_fd;
+        memset(&shadow_fd, 0, sizeof(shadow_fd));
+        shadow_fd.kind = FD_FILE;
+        shadow_fd.token = region.file_token;
+        shadow_fd.size = region.file_size;
+        int fault = 0;
+        const u64 expected = region.file_offset < region.file_size ? min_u64(region.size, region.file_size - region.file_offset) : 0;
+        const u64 copied = read_fd_at_to_fresh_target_pages(&shadow_fd, region.file_offset, region.start, expected, &fault);
+        if (fault || copied < expected) {
+            (void)unmap_reply_target_pages(region.start, page_count);
+            return 0;
+        }
+        if (copied < region.size && !copy_zero_to_target_range(region.start + copied, region.size - copied)) {
+            (void)unmap_reply_target_pages(region.start, page_count);
+            return 0;
+        }
+        if (map_prot != prot) {
+            const u64 protect_status = apply_target_pages(region.start, page_count, prot, protect_reply_target_pages);
+            if (protect_status != SYSCALL_OK) {
+                (void)unmap_reply_target_pages(region.start, page_count);
+                return 0;
+            }
+        }
+        g_regions[slot].file_lazy = 0;
+        g_regions[slot].prot = prot;
+    }
+    return 1;
+}
+
+static int materialize_file_cow_range(u64 start, u64 size, u64 prot) {
+    if (!vm_split_range_boundaries(start, size)) return 0;
+    const u64 end = start + size;
+    for (;;) {
+        u64 slot = VM_REGION_MAX;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || g_regions[i].file_lazy || !g_regions[i].file_cow) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (rs >= start && re <= end) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == VM_REGION_MAX) break;
+        struct vm_region region = g_regions[slot];
+        const u64 page_count = region.size / PAGE_BYTES;
+        (void)unmap_reply_target_pages(region.start, page_count);
+
+        const u64 map_prot = ((prot | 0x2) & ~0x4);
+        if (map_target_pages_chunked(region.start, page_count, map_prot) != SYSCALL_OK) return 0;
+
+        struct fd_entry shadow_fd;
+        memset(&shadow_fd, 0, sizeof(shadow_fd));
+        shadow_fd.kind = FD_FILE;
+        shadow_fd.token = region.file_token;
+        shadow_fd.size = region.file_size;
+        int fault = 0;
+        const u64 expected = region.file_offset < region.file_size ? min_u64(region.size, region.file_size - region.file_offset) : 0;
+        const u64 copied = read_fd_at_to_fresh_target_pages(&shadow_fd, region.file_offset, region.start, expected, &fault);
+        if (fault || copied < expected) {
+            (void)unmap_reply_target_pages(region.start, page_count);
+            return 0;
+        }
+        if (copied < region.size && !copy_zero_to_target_range(region.start + copied, region.size - copied)) {
+            (void)unmap_reply_target_pages(region.start, page_count);
+            return 0;
+        }
+        if (map_prot != prot) {
+            const u64 protect_status = apply_target_pages(region.start, page_count, prot, protect_reply_target_pages);
+            if (protect_status != SYSCALL_OK) {
+                (void)unmap_reply_target_pages(region.start, page_count);
+                return 0;
+            }
+        }
+        g_regions[slot].file_cow = 0;
+        g_regions[slot].prot = prot;
+    }
+    return 1;
+}
+
+static int materialize_lazy_file_prefix_before(u64 end_va, u64 file_token, u64 file_offset) {
+    u64 cursor_va = end_va;
+    u64 cursor_offset = file_offset;
+    for (;;) {
+        u64 slot = VM_REGION_MAX;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || !g_regions[i].file_backed || !g_regions[i].file_lazy) continue;
+            if (g_regions[i].file_token != file_token) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (re != cursor_va) continue;
+            if (g_regions[i].file_offset + g_regions[i].size != cursor_offset) continue;
+            slot = i;
+            break;
+        }
+        if (slot == VM_REGION_MAX) return 1;
+        const u64 start = g_regions[slot].start;
+        const u64 size = g_regions[slot].size;
+        const u64 offset = g_regions[slot].file_offset;
+        const u64 prot = g_regions[slot].prot;
+        if (!materialize_lazy_file_range(start, size, prot)) return 0;
+        cursor_va = start;
+        cursor_offset = offset;
+    }
+}
+
+static struct ipc_message handle_page_fault(const struct trap_request *req) {
+    enum { PF_PRESENT = 1 << 0, PF_WRITE = 1 << 1, PF_INSTRUCTION = 1 << 4 };
+    const u64 fault_page = page_down(req->fault_addr);
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (fault_page < rs || fault_page >= re) continue;
+        const u64 prot = g_regions[i].prot;
+        if ((req->error_code & PF_WRITE) != 0 && (prot & 0x2) == 0) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+        if ((req->error_code & PF_INSTRUCTION) != 0 && (prot & 0x4) == 0) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+        if (g_regions[i].file_backed && g_regions[i].file_lazy) {
+            u64 size = LINUX_FILE_FAULT_CLUSTER_PAGES * PAGE_BYTES;
+            if (size > re - fault_page) size = re - fault_page;
+            if (!materialize_lazy_file_range(fault_page, size, prot)) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+            return reply(req->rax, 0);
+        }
+        if ((req->error_code & PF_PRESENT) != 0) {
+            if ((req->error_code & PF_WRITE) != 0 && g_regions[i].file_backed && g_regions[i].file_cow) {
+                const u64 status = cow_reply_target_page(fault_page, prot);
+                if (status != SYSCALL_OK || !vm_mark_private_page(fault_page)) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+                g_prof.file_cache_cow_faults++;
+                return reply(req->rax, 0);
+            }
+            const u64 status = protect_reply_target_pages(fault_page, 1, prot);
+            if (status != SYSCALL_OK) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+            return reply(req->rax, 0);
+        }
+        return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+    }
+    return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+}
+
 static struct ipc_message handle_mmap(const struct trap_request *req) {
     enum { PROT_READ = 0x1, PROT_WRITE = 0x2, PROT_EXEC = 0x4, MAP_SHARED = 0x01, MAP_PRIVATE = 0x02, MAP_SHARED_VALIDATE = 0x03, MAP_TYPE = 0x0F, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_FIXED_NOREPLACE = 0x100000 };
     const u64 requested_va = req->args[0]; const u64 len = req->args[1]; u64 prot = req->args[2] & (PROT_READ | PROT_WRITE | PROT_EXEC); const u64 flags = req->args[3]; const u64 fd = req->args[4]; const u64 offset = req->args[5]; const u64 map_type = flags & MAP_TYPE;
@@ -357,6 +675,36 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
         return reply(errno_acces(), 0);
     }
     const u64 size = page_up(len); const u64 page_count = size / PAGE_BYTES; u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : find_mmap_area(size); const u64 map_prot = file_backed ? ((prot | PROT_WRITE) & ~PROT_EXEC) : prot;
+    const int has_peers = has_thread_group_peers();
+    int cache_cow_file = 0;
+    int cache_vm_object_file = 0;
+    if (LINUX_ENABLE_FILE_VM_OBJECT_MMAP && file_backed && map_type == MAP_PRIVATE) {
+        g_prof.file_vm_object_mmap_considered++;
+        if (!has_peers && (flags & MAP_FIXED) == 0 && g_fds[fd].path_len != 0 &&
+            cacheable_readonly_path(g_fds[fd].path) &&
+            g_fds[fd].size != 0 &&
+            align_up(g_fds[fd].size, PAGE_BYTES) <= (u64)LINUX_FILE_VM_OBJECT_MAX_PAGES * PAGE_BYTES)
+        {
+            g_prof.file_vm_object_mmap_candidates++;
+            cache_vm_object_file = 1;
+        }
+    }
+    if (LINUX_ENABLE_FILE_PAGE_CACHE_COW && file_backed && map_type == MAP_PRIVATE) {
+        g_prof.file_cache_cow_considered++;
+        if (has_peers) {
+            g_prof.file_cache_cow_skip_peers++;
+        } else if (g_fds[fd].path_len == 0) {
+            g_prof.file_cache_cow_skip_no_path++;
+        } else if (!cacheable_readonly_path(g_fds[fd].path)) {
+            g_prof.file_cache_cow_skip_uncacheable++;
+        } else {
+            g_prof.file_cache_cow_candidates++;
+            cache_cow_file = 1;
+        }
+    }
+    const int keep_private_file_writable = file_backed && map_type == MAP_PRIVATE && (prot & PROT_EXEC) == 0;
+    const u64 effective_prot = (cache_cow_file || cache_vm_object_file) ? prot : (keep_private_file_writable ? map_prot : prot);
+    const int lazy_file = !cache_cow_file && !cache_vm_object_file && file_backed && map_type == MAP_PRIVATE && !has_peers && (flags & MAP_FIXED) == 0;
     vm_trace4("vm.mmap.begin", requested_va, len, prot, flags);
     if (target_va == 0) return reply(errno_nomem(), 0);
     g_prof.mmap_calls++;
@@ -370,21 +718,87 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
         g_prof.mmap_file_bytes += len;
     }
     if ((flags & MAP_FIXED_NOREPLACE) != 0 && vm_range_covered(target_va, size)) return reply(errno_exist(), 0);
+    if ((flags & MAP_FIXED) != 0 && file_backed && map_type == MAP_PRIVATE &&
+        vm_range_has_file_backing(target_va, size, g_fds[fd].token, offset))
+    {
+        if (!vm_split_range_boundaries(target_va, size)) return reply(errno_nomem(), 0);
+        if (!(LINUX_ENABLE_FILE_PAGE_FAULT_LAZY && vm_range_has_lazy_file_backing(target_va, size))) {
+            if (LINUX_MATERIALIZE_FILE_PREFIX_BEFORE_FIXED &&
+                !materialize_lazy_file_prefix_before(target_va, g_fds[fd].token, offset))
+            {
+                return reply(errno_nomem(), 0);
+            }
+            if (!materialize_lazy_file_range(target_va, size, effective_prot)) return reply(errno_nomem(), 0);
+        }
+        if ((effective_prot & PROT_WRITE) != 0 && vm_range_has_file_cow(target_va, size)) {
+            if (!materialize_file_cow_range(target_va, size, effective_prot)) return reply(errno_nomem(), 0);
+        }
+        const int has_file_cow = vm_range_has_file_cow(target_va, size);
+        const u64 mapped_prot = has_file_cow ? (effective_prot & ~PROT_WRITE) : effective_prot;
+        if (!vm_apply_mapped_pages_in_range(target_va, size, mapped_prot, protect_reply_target_pages)) return reply(errno_nomem(), 0);
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (rs < target_va || re > target_va + size) continue;
+            const u64 share_prot = g_regions[i].file_cow ? (effective_prot & ~PROT_WRITE) : effective_prot;
+            const u64 share_status = share_target_pages_to_thread_group(rs, g_regions[i].size / PAGE_BYTES, share_prot);
+            if (share_status != SYSCALL_OK) return reply(errno_nomem(), 0);
+        }
+        vm_protect_range(target_va, size, effective_prot);
+        sync_thread_group_vm_state();
+        vm_trace4("vm.mmap.reuse", target_va, size, effective_prot, flags);
+        return reply(target_va, 0);
+    }
     if ((flags & MAP_FIXED) != 0 && !unmap_overlapping_target_range(target_va, size)) return reply(errno_nomem(), 0);
     const int lazy_anon = !file_backed && !has_thread_group_peers();
-    u64 map_status = lazy_anon ? reserve_target_pages_chunked(target_va, page_count, map_prot) : map_target_pages_chunked(target_va, page_count, map_prot);
+    u64 map_status = lazy_anon ? reserve_target_pages_chunked(target_va, page_count, map_prot) : ((lazy_file || cache_cow_file || cache_vm_object_file) ? SYSCALL_OK : map_target_pages_chunked(target_va, page_count, map_prot));
     if (map_status == SYSCALL_ERR_MAP && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) {
         g_mmap_next_va = target_va + size;
         target_va = find_mmap_area(size);
-        if (target_va != 0) map_status = lazy_anon ? reserve_target_pages_chunked(target_va, page_count, map_prot) : map_target_pages_chunked(target_va, page_count, map_prot);
+        if (target_va != 0) map_status = lazy_anon ? reserve_target_pages_chunked(target_va, page_count, map_prot) : ((lazy_file || cache_cow_file || cache_vm_object_file) ? SYSCALL_OK : map_target_pages_chunked(target_va, page_count, map_prot));
     }
     if (map_status == SYSCALL_OK) {
-        if (file_backed) {
+        int mapped_from_cache = 0;
+        if (cache_vm_object_file) {
+            mapped_from_cache = file_vm_object_map_to_target(&g_fds[fd], offset, target_va, size, prot);
+            if (!mapped_from_cache) {
+                g_prof.file_vm_object_mmap_fallbacks++;
+                const u64 fallback_status = map_target_pages_chunked(target_va, page_count, map_prot);
+                if (fallback_status != SYSCALL_OK) return reply(errno_nomem(), 0);
+            }
+        } else if (cache_cow_file) {
+            mapped_from_cache = file_cache_map_to_target(&g_fds[fd], offset, target_va, size, prot);
+            if (!mapped_from_cache) {
+                g_prof.file_cache_cow_fallbacks++;
+                const u64 fallback_status = map_target_pages_chunked(target_va, page_count, map_prot);
+                if (fallback_status != SYSCALL_OK) return reply(errno_nomem(), 0);
+            }
+        }
+        if (file_backed && !lazy_file && !mapped_from_cache) {
             int fault = 0;
-            (void)read_fd_at_to_target(&g_fds[fd], offset, target_va, len, &fault);
+            const u64 copied = read_fd_at_to_fresh_target_pages(&g_fds[fd], offset, target_va, len, &fault);
             if (fault) return reply(errno_fault(), 0);
-            if (map_prot != prot) {
-                const u64 protect_status = apply_target_pages(target_va, page_count, prot, protect_reply_target_pages);
+            const u64 expected = offset < g_fds[fd].size ? min_u64(len, g_fds[fd].size - offset) : 0;
+            const int trace_file_mmap = profile_trace_enabled() && g_proc && g_proc->profile_verbose_enabled && g_fds[fd].path_len != 0;
+            if (trace_file_mmap || copied < expected) {
+                user_log("LinuxAbiServer.trace mmap.file path=");
+                user_log(g_fds[fd].path_len != 0 ? g_fds[fd].path : "(unknown)");
+                user_log(" off=");
+                user_log_hex_inline(offset);
+                user_log(" len=");
+                user_log_hex_inline(len);
+                user_log(" size=");
+                user_log_hex_inline(g_fds[fd].size);
+                user_log(" copied=");
+                user_log_hex_inline(copied);
+                user_log(" expected=");
+                user_log_hex_inline(expected);
+                user_log("\n");
+            }
+            if (copied < expected) return reply(errno_io(), 0);
+            if (map_prot != effective_prot) {
+                const u64 protect_status = apply_target_pages(target_va, page_count, effective_prot, protect_reply_target_pages);
                 if (protect_status != SYSCALL_OK) {
                     user_log("LinuxAbiServer: mmap file-backed protect failed\n");
                     user_log_hex_value(protect_status);
@@ -392,8 +806,8 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
                 }
             }
         }
-        if (!lazy_anon) {
-            const u64 share_prot = file_backed ? prot : map_prot;
+        if (!lazy_anon && !lazy_file && !mapped_from_cache) {
+            const u64 share_prot = file_backed ? effective_prot : map_prot;
             const u64 share_status = share_target_pages_to_thread_group(target_va, page_count, share_prot);
             if (share_status != SYSCALL_OK) {
                 user_log("LinuxAbiServer: mmap thread-group share failed\n");
@@ -401,16 +815,24 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
                 return reply(errno_nomem(), 0);
             }
         }
-        if (!vm_add_region(target_va, size, prot)) {
+        if (!vm_add_region(target_va, size, effective_prot, file_backed ? g_fds[fd].token : 0, file_backed ? offset : 0, file_backed ? g_fds[fd].size : 0, file_backed, lazy_file, mapped_from_cache)) {
             user_log("LinuxAbiServer: mmap vm_add_region failed\n");
             user_log_hex_value(target_va);
             user_log_hex_value(size);
             user_log("LinuxAbiServer: vm regions used=");
             user_log_dec_value(vm_region_used_count());
             user_log("\n");
-            (void)unmap_reply_target_pages(target_va, page_count);
-            if (!lazy_anon) (void)unmap_target_pages_from_thread_group(target_va, page_count);
+            if (!lazy_file) (void)unmap_reply_target_pages(target_va, page_count);
+            if (!lazy_anon && !lazy_file) (void)unmap_target_pages_from_thread_group(target_va, page_count);
             return reply(errno_nomem(), 0);
+        }
+        if (lazy_file) {
+            u64 header_size = 16 * PAGE_BYTES;
+            if (header_size > size) header_size = size;
+            if (!materialize_lazy_file_range(target_va, header_size, effective_prot)) {
+                (void)unmap_tracked_target_range(target_va, size);
+                return reply(errno_nomem(), 0);
+            }
         }
         if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) g_mmap_next_va = target_va + size;
         sync_thread_group_vm_state();
@@ -460,7 +882,7 @@ static struct ipc_message handle_mremap(const struct trap_request *req) {
                 (void)unmap_tracked_target_range(grow_addr, extra_size);
                 return reply(errno_nomem(), 0);
             }
-            if (!vm_add_region(grow_addr, extra_size, prot)) {
+            if (!vm_add_region(grow_addr, extra_size, prot, 0, 0, 0, 0, 0, 0)) {
                 (void)unmap_tracked_target_range(grow_addr, extra_size);
                 return reply(errno_nomem(), 0);
             }
@@ -491,7 +913,7 @@ static struct ipc_message handle_brk(const struct trap_request *req) {
                 user_log_hex_value(share_status);
                 return reply(g_brk_next_va, 0);
             }
-            if (!vm_add_region(from, to - from, 0x3)) {
+            if (!vm_add_region(from, to - from, 0x3, 0, 0, 0, 0, 0, 0)) {
                 user_log("LinuxAbiServer: brk vm_add_region failed\n");
                 user_log_hex_value(from);
                 user_log_hex_value(to - from);
@@ -514,21 +936,36 @@ static struct ipc_message handle_mprotect(const struct trap_request *req) {
     g_prof.mprotect_pages += size / PAGE_BYTES;
     const int tracked = vm_range_covered(start, size);
     if (tracked && !vm_split_range_boundaries(start, size)) return reply(errno_nomem(), 0);
-    const u64 status = apply_target_pages(start, size / PAGE_BYTES, prot, protect_reply_target_pages);
-    if (!tracked && status == SYSCALL_ERR_MAP) return reply(0, 0);
-    if (status != SYSCALL_OK) {
+    const int has_file_cow = tracked && vm_range_has_file_cow(start, size);
+    const u64 mapped_prot = has_file_cow ? (prot & ~0x2ULL) : prot;
+    const int protect_ok = tracked ?
+        vm_apply_mapped_pages_in_range(start, size, mapped_prot, protect_reply_target_pages) :
+        (apply_target_pages(start, size / PAGE_BYTES, mapped_prot, protect_reply_target_pages) == SYSCALL_OK);
+    if (!tracked && !protect_ok) return reply(0, 0);
+    if (!protect_ok) {
         user_log("LinuxAbiServer: mprotect current target failed\n");
-        user_log_hex_value(status);
         user_log_hex_value(start);
         user_log_hex_value(size / PAGE_BYTES);
         user_log_hex_value(prot);
         return reply(errno_nomem(), 0);
     }
-    const u64 share_status = share_target_pages_to_thread_group(start, size / PAGE_BYTES, prot);
-    if (share_status != SYSCALL_OK) {
-        user_log("LinuxAbiServer: mprotect thread-group share failed\n");
-        user_log_hex_value(share_status);
-        return reply(errno_nomem(), 0);
+    if (!tracked) {
+        const u64 share_status = share_target_pages_to_thread_group(start, size / PAGE_BYTES, prot);
+        if (share_status != SYSCALL_OK) {
+            user_log("LinuxAbiServer: mprotect thread-group share failed\n");
+            user_log_hex_value(share_status);
+            return reply(errno_nomem(), 0);
+        }
+    } else {
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (rs < start || re > start + size) continue;
+            const u64 share_prot = g_regions[i].file_cow ? (prot & ~0x2ULL) : prot;
+            const u64 share_status = share_target_pages_to_thread_group(rs, g_regions[i].size / PAGE_BYTES, share_prot);
+            if (share_status != SYSCALL_OK) return reply(errno_nomem(), 0);
+        }
     }
     if (tracked) vm_protect_range(start, size, prot);
     sync_thread_group_vm_state();

@@ -26,8 +26,6 @@ pub const Hooks = struct {
     state: *kernel.KernelState,
     scheduler_quantum_ticks: u64,
     priority_hold_quanta: u64,
-    scheduler_log_switch: bool,
-    scheduler_switch_log_max_lines: u64,
     write: *const fn ([]const u8) void,
     write_hex_raw: *const fn (u64) void,
     write_bool01: *const fn (bool) void,
@@ -40,7 +38,6 @@ pub const Hooks = struct {
     halt_loop: *const fn () noreturn,
     resume_after_fatal_user_exception: *const fn (kernel.PrincipalId, u8, *TrapFrame) void,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
-    log_race_switch: *const fn (usize, usize, []const u8) void,
 };
 
 var trap_hooks_storage: Hooks = undefined;
@@ -58,6 +55,7 @@ pub export var syscall_entry_is_lstars: [smp.max_cpus]u64 = [_]u64{0} ** smp.max
 pub export var ipc_lstar_asm_fastpath_attempts: u64 = 0;
 pub export var ipc_lstar_asm_fastpath_hits: u64 = 0;
 pub export var ipc_lstar_asm_sparse_fallbacks: u64 = 0;
+pub export var ipc_lstar_sparse_probe_enabled: u64 = 0;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -91,6 +89,7 @@ const runtime_storage_ptrs = .{
     &ipc_lstar_asm_fastpath_attempts,
     &ipc_lstar_asm_fastpath_hits,
     &ipc_lstar_asm_sparse_fallbacks,
+    &ipc_lstar_sparse_probe_enabled,
     &user_return_saved_r10,
     &user_return_saved_gprs,
     &user_return_iret_frame,
@@ -131,7 +130,6 @@ extern var current_thread_indices: [smp.max_cpus]usize;
 extern var thread_contexts_ptr: *anyopaque;
 extern var ipc_hot_threads_ptr: *anyopaque;
 extern var endpoint_generation_fast_mirror: u64;
-extern var ipc_lstar_sparse_probe_enabled: u64;
 extern var lapic_tick_count: u64;
 extern var user_return_saved_r10: u64;
 extern var user_return_saved_gprs: [15]u64 align(16);
@@ -889,13 +887,14 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
     );
 }
 
-pub export fn pageFaultDispatch(frame: *const ExceptionTrapFrame) callconv(.c) u64 {
+pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.c) u64 {
     const h = getHooks();
     const cr2 = h.read_cr2();
     const pf_cap = capability.issuePageFaultCapability(scheduler.currentUserPrincipal(), frame, cr2) orelse return 0;
     if (!h.kernel_state_ready.*) return 0;
     if (!capability.resolvePageFaultCapability(h.state, pf_cap) and
-        !abi_trap_runtime.resolveLazyAnonymousPageFault(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code))
+        !abi_trap_runtime.resolveLazyAnonymousPageFault(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code) and
+        !abi_trap_runtime.dispatchPageFaultDelegate(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code, frame))
     {
         return 0;
     }
@@ -1015,29 +1014,12 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     if (!user_mode) return;
     scheduler.noteUserTimerTick();
 
-    const current_thread = scheduler.currentThreadIndex();
     const next_thread = scheduler.chooseNextThreadForTimerPreempt(
         h.scheduler_quantum_ticks,
         h.priority_hold_quanta,
     ) orelse return;
-    if (!h.switch_to_thread(next_thread, frame, null)) {
-        h.log_race_switch(current_thread, next_thread, "timer_preempt_switch_failed");
-        return;
-    }
+    if (!h.switch_to_thread(next_thread, frame, null)) return;
     scheduler.scheduler_switch_count +%= 1;
-    if (h.scheduler_log_switch and scheduler.scheduler_switch_count <= h.scheduler_switch_log_max_lines) {
-        const current_ctx = scheduler.getThreadContextConst(current_thread).?;
-        const next_ctx = scheduler.getThreadContextConst(next_thread).?;
-        h.write("SCHED switch ");
-        h.write(h.thread_label(current_thread));
-        h.write("/");
-        h.write(h.principal_label(current_ctx.owner_process));
-        h.write(" -> ");
-        h.write(h.thread_label(next_thread));
-        h.write("/");
-        h.write(h.principal_label(next_ctx.owner_process));
-        h.write("\n");
-    }
 }
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {

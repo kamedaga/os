@@ -41,10 +41,10 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const spawn_exec_ap_user_scheduling = b.option(
+    const user_ap_scheduling = b.option(
         bool,
-        "spawn-exec-ap-user-scheduling",
-        "Place spawn_exec children on AP scheduler queues when AP user syscall/trap paths are ready",
+        "user-ap-scheduling",
+        "Place user children on AP scheduler queues when AP user syscall/trap paths are ready",
     ) orelse true;
     const ap_user_timer_preemption = b.option(
         bool,
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
         "Allow AP user threads to be preempted by the AP timer",
     ) orelse true;
     const build_workarounds = b.addOptions();
-    build_workarounds.addOption(bool, "spawn_exec_ap_user_scheduling", spawn_exec_ap_user_scheduling);
+    build_workarounds.addOption(bool, "user_ap_scheduling", user_ap_scheduling);
     build_workarounds.addOption(bool, "ap_user_timer_preemption", ap_user_timer_preemption);
 
     const efi_target = b.resolveTargetQuery(.{

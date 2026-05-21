@@ -43,7 +43,9 @@ static int cacheable_readonly_path(const char *path) {
     return path_has_prefix(path, "/lib/") ||
         path_has_prefix(path, "/bin/") ||
         path_has_prefix(path, "/cmd/") ||
-        path_has_prefix(path, "/sbin/");
+        path_has_prefix(path, "/sbin/") ||
+        path_has_prefix(path, "/usr/bin/") ||
+        path_has_prefix(path, "/usr/lib/");
 }
 
 static void profile_fs_read_path(const struct fd_entry *fd, u64 bytes) {
@@ -220,8 +222,7 @@ static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_byt
     return 0;
 }
 
-static int is_vm_object_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) != EXEC_IMAGE_TOKEN_TAG && (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
-static int is_exec_image_token(u64 token) { return (token & EXEC_IMAGE_TOKEN_TAG) == EXEC_IMAGE_TOKEN_TAG && (token & ~EXEC_IMAGE_TOKEN_TAG) != 0; }
+static int is_vm_object_token(u64 token) { return (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
 static u64 decode_spawned_process_slot(u64 value) { if ((value & SPAWN_RESULT_TAG) == 0) return 0; return value & SPAWN_RESULT_PROCESS_MASK; }
 static void execve_profile_begin(const char *path) {
     if (!g_execve_profile_enabled) return;
@@ -297,7 +298,22 @@ static struct file_cache_entry *file_cache_find_by_path(const char *path) {
     const u64 path_len = cstr_len(path);
     for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
         if (!g_file_cache[i].used) continue;
+        if (g_file_cache[i].file_offset != 0) continue;
+        if (g_file_cache[i].cached_size < align_up(g_file_cache[i].size, PAGE_BYTES)) continue;
         if (cache_path_matches(g_file_cache[i].path, g_file_cache[i].path_len, path, path_len)) return &g_file_cache[i];
+    }
+    return 0;
+}
+
+static struct file_cache_entry *file_cache_find_by_range(const struct fd_entry *fd, u64 file_offset, u64 size) {
+    const u64 end = file_offset + size;
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (!g_file_cache[i].used) continue;
+        if (g_file_cache[i].token != fd->token) continue;
+        if (!cache_path_matches(g_file_cache[i].path, g_file_cache[i].path_len, fd->path, fd->path_len)) continue;
+        const u64 cached_start = g_file_cache[i].file_offset;
+        const u64 cached_end = cached_start + g_file_cache[i].cached_size;
+        if (file_offset >= cached_start && end <= cached_end) return &g_file_cache[i];
     }
     return 0;
 }
@@ -306,15 +322,32 @@ static int file_cache_alloc_buffer(u64 size, u64 *buffer_va_out) {
     const u64 aligned = align_up(size, PAGE_BYTES);
     if (aligned == 0 || aligned > FILE_CACHE_BYTES || g_file_cache_next_offset + aligned > FILE_CACHE_BYTES) return 0;
     const u64 va = FILE_CACHE_BASE_VA + g_file_cache_next_offset;
-    if (!alloc_map_range_self(va, aligned / PAGE_BYTES, 1)) return 0;
+    const u64 page_count = aligned / PAGE_BYTES;
+    u64 mapped = 0;
+    while (mapped < page_count) {
+        const u64 chunk = min_u64(page_count - mapped, 64);
+        if (alloc_map_pages(va + mapped * PAGE_BYTES, chunk, 1) != SYSCALL_OK) return 0;
+        mapped += chunk;
+    }
     g_file_cache_next_offset += aligned;
     *buffer_va_out = va;
     return 1;
 }
 
-static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *fd) {
-    if (!EXEC_OPT_FILE_READ_CACHE) return 0;
-    if (fd->path_len == 0 || !cacheable_readonly_path(fd->path) || fd->size == 0) return 0;
+static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *fd, int allow_mmap_cow) {
+    if (!EXEC_OPT_FILE_READ_CACHE && !(allow_mmap_cow && (LINUX_ENABLE_FILE_PAGE_CACHE_COW || LINUX_ENABLE_FILE_VM_OBJECT_MMAP))) return 0;
+    if (fd->path_len == 0) {
+        g_prof.file_cache_fill_fail_no_path++;
+        return 0;
+    }
+    if (!cacheable_readonly_path(fd->path)) {
+        g_prof.file_cache_fill_fail_uncacheable++;
+        return 0;
+    }
+    if (fd->size == 0) {
+        g_prof.file_cache_fill_fail_size++;
+        return 0;
+    }
     struct file_cache_entry *cached = file_cache_find_by_path(fd->path);
     if (cached != 0) {
         g_prof.file_cache_hits++;
@@ -326,11 +359,17 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
     for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
         if (!g_file_cache[i].used) { slot = i; break; }
     }
-    if (slot == FILE_CACHE_MAX) return 0;
+    if (slot == FILE_CACHE_MAX) {
+        g_prof.file_cache_fill_fail_slot++;
+        return 0;
+    }
 
     u64 buffer_va = 0;
     const u64 saved_cache_offset = g_file_cache_next_offset;
-    if (!file_cache_alloc_buffer(fd->size, &buffer_va)) return 0;
+    if (!file_cache_alloc_buffer(fd->size, &buffer_va)) {
+        g_prof.file_cache_fill_fail_alloc++;
+        return 0;
+    }
     u64 copied = 0;
     while (copied < fd->size) {
         u64 chunk = min_u64(fd->size - copied, FS_RESPONSE_PAYLOAD_BYTES);
@@ -345,6 +384,7 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
     }
     if (copied != fd->size) {
         g_file_cache_next_offset = saved_cache_offset;
+        g_prof.file_cache_fill_fail_read++;
         return 0;
     }
 
@@ -352,6 +392,8 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
     g_file_cache[slot].kind = fd->object_kind;
     g_file_cache[slot].token = fd->token;
     g_file_cache[slot].size = fd->size;
+    g_file_cache[slot].file_offset = 0;
+    g_file_cache[slot].cached_size = align_up(fd->size, PAGE_BYTES);
     g_file_cache[slot].buffer_va = buffer_va;
     g_file_cache[slot].stat.object_kind = fd->object_kind;
     g_file_cache[slot].stat.size_bytes = fd->size;
@@ -362,9 +404,79 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
     return &g_file_cache[slot];
 }
 
+static struct file_cache_entry *file_cache_fill_range_from_fd(const struct fd_entry *fd, u64 file_offset, u64 size, int allow_mmap_cow) {
+    if (!EXEC_OPT_FILE_READ_CACHE && !(allow_mmap_cow && (LINUX_ENABLE_FILE_PAGE_CACHE_COW || LINUX_ENABLE_FILE_VM_OBJECT_MMAP))) return 0;
+    if ((file_offset & (PAGE_BYTES - 1)) != 0 || (size & (PAGE_BYTES - 1)) != 0) return 0;
+    if (fd->path_len == 0) {
+        g_prof.file_cache_fill_fail_no_path++;
+        return 0;
+    }
+    if (!cacheable_readonly_path(fd->path)) {
+        g_prof.file_cache_fill_fail_uncacheable++;
+        return 0;
+    }
+    if (fd->size == 0) {
+        g_prof.file_cache_fill_fail_size++;
+        return 0;
+    }
+    struct file_cache_entry *cached = file_cache_find_by_range(fd, file_offset, size);
+    if (cached != 0) {
+        g_prof.file_cache_hits++;
+        return cached;
+    }
+    g_prof.file_cache_misses++;
+
+    u64 slot = FILE_CACHE_MAX;
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (!g_file_cache[i].used) { slot = i; break; }
+    }
+    if (slot == FILE_CACHE_MAX) {
+        g_prof.file_cache_fill_fail_slot++;
+        return 0;
+    }
+
+    u64 buffer_va = 0;
+    const u64 saved_cache_offset = g_file_cache_next_offset;
+    if (!file_cache_alloc_buffer(size, &buffer_va)) {
+        g_prof.file_cache_fill_fail_alloc++;
+        return 0;
+    }
+
+    const u64 readable = file_offset < fd->size ? min_u64(size, fd->size - file_offset) : 0;
+    u64 copied = 0;
+    while (copied < readable) {
+        u64 chunk = min_u64(readable - copied, FS_BULK_READ_BYTES);
+        u64 bulk_bytes = 0;
+        if (!vfs_read_bulk_to_buffer(fd->token, file_offset + copied, (u32)chunk, buffer_va + copied, &bulk_bytes)) break;
+        if (bulk_bytes == 0) break;
+        copied += bulk_bytes;
+    }
+    if (copied != readable) {
+        g_file_cache_next_offset = saved_cache_offset;
+        g_prof.file_cache_fill_fail_read++;
+        return 0;
+    }
+    for (u64 i = readable; i < size; i++) ((u8 *)buffer_va)[i] = 0;
+
+    g_file_cache[slot].used = 1;
+    g_file_cache[slot].kind = fd->object_kind;
+    g_file_cache[slot].token = fd->token;
+    g_file_cache[slot].size = fd->size;
+    g_file_cache[slot].file_offset = file_offset;
+    g_file_cache[slot].cached_size = size;
+    g_file_cache[slot].buffer_va = buffer_va;
+    g_file_cache[slot].stat.object_kind = fd->object_kind;
+    g_file_cache[slot].stat.size_bytes = fd->size;
+    g_file_cache[slot].stat.mode_bits = fd->mode_bits;
+    g_file_cache[slot].stat.mtime_unix_sec = 0;
+    copy_path_to_cache(g_file_cache[slot].path, &g_file_cache[slot].path_len, fd->path, fd->path_len);
+    g_prof.file_cache_fill_bytes += readable;
+    return &g_file_cache[slot];
+}
+
 static u64 file_cache_read_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 len, int *fault) {
     *fault = 0;
-    struct file_cache_entry *cached = file_cache_fill_from_fd(fd);
+    struct file_cache_entry *cached = file_cache_fill_from_fd(fd, 0);
     if (cached == 0) return 0;
     if (file_offset >= cached->size) return 0;
     u64 n = min_u64(len, cached->size - file_offset);
@@ -379,6 +491,83 @@ static u64 file_cache_read_to_target(const struct fd_entry *fd, u64 file_offset,
     }
     profile_fs_read_path(fd, n);
     return n;
+}
+
+static int file_cache_map_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 size, u64 prot) {
+    if (!LINUX_ENABLE_FILE_PAGE_CACHE_COW) return 0;
+    if ((file_offset & (PAGE_BYTES - 1)) != 0 || (dst & (PAGE_BYTES - 1)) != 0 || (size & (PAGE_BYTES - 1)) != 0) {
+        g_prof.file_cache_map_fail_unaligned++;
+        return 0;
+    }
+    if (size == 0) return 1;
+    struct file_cache_entry *cached = file_cache_fill_range_from_fd(fd, file_offset, size, 1);
+    if (cached == 0) {
+        g_prof.file_cache_map_fail_fill++;
+        return 0;
+    }
+    if (file_offset < cached->file_offset || size > cached->cached_size - (file_offset - cached->file_offset)) {
+        g_prof.file_cache_map_fail_range++;
+        return 0;
+    }
+    const u64 page_count = size / PAGE_BYTES;
+    const u64 map_prot = prot & ~0x2ULL;
+    const u64 source_va = cached->buffer_va + (file_offset - cached->file_offset);
+    const u64 status = map_current_pages_to_reply_target(source_va, dst, page_count, map_prot);
+    if (status != SYSCALL_OK) {
+        g_prof.file_cache_map_fail_syscall++;
+        return 0;
+    }
+    const u64 readable = file_offset < cached->size ? min_u64(size, cached->size - file_offset) : 0;
+    profile_fs_read_path(fd, readable);
+    g_prof.file_cache_map_pages += page_count;
+    return 1;
+}
+
+static u64 file_cache_vm_object_token_for_fd(const struct fd_entry *fd) {
+    if (!LINUX_ENABLE_FILE_VM_OBJECT_MMAP) return 0;
+    if (fd->size == 0) return 0;
+    if (align_up(fd->size, PAGE_BYTES) > 65535ULL * PAGE_BYTES) return 0;
+    if (!vfs_request(FS_OP_OPEN_EXEC, fd->token, 0, 0, 0)) return 0;
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status != FS_STATUS_OK) return 0;
+    if (!is_vm_object_token(response->arg0)) {
+        g_prof.file_vm_object_mmap_install_fail++;
+        return 0;
+    }
+    return response->arg0;
+}
+
+static int file_vm_object_map_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 size, u64 prot) {
+    if (!LINUX_ENABLE_FILE_VM_OBJECT_MMAP) return 0;
+    if ((file_offset & (PAGE_BYTES - 1)) != 0 || (dst & (PAGE_BYTES - 1)) != 0 || (size & (PAGE_BYTES - 1)) != 0) return 0;
+    if (file_offset != 0) return 0;
+
+    const u64 vm_token = file_cache_vm_object_token_for_fd(fd);
+    if (!is_vm_object_token(vm_token)) return 0;
+
+    const u64 object_pages = align_up(fd->size, PAGE_BYTES) / PAGE_BYTES;
+    const u64 map_prot = prot & ~0x2ULL;
+    if (map_vm_object_to_reply_target(vm_token, dst, map_prot) != SYSCALL_OK) {
+        g_prof.file_vm_object_mmap_map_fail++;
+        return 0;
+    }
+
+    const u64 requested_pages = size / PAGE_BYTES;
+    if (requested_pages > object_pages) {
+        const u64 tail_pages = requested_pages - object_pages;
+        if (map_target_pages_chunked(dst + object_pages * PAGE_BYTES, tail_pages, map_prot) != SYSCALL_OK) {
+            (void)unmap_reply_target_pages(dst, object_pages);
+            g_prof.file_vm_object_mmap_map_fail++;
+            return 0;
+        }
+        g_prof.file_vm_object_mmap_tail_pages += tail_pages;
+    }
+
+    const u64 readable = file_offset < fd->size ? min_u64(size, fd->size - file_offset) : 0;
+    profile_fs_read_path(fd, readable);
+    g_prof.file_vm_object_mmap_mapped++;
+    g_prof.file_vm_object_mmap_pages += object_pages;
+    return 1;
 }
 
 static int ensure_execve_scratch(void) {
@@ -436,11 +625,6 @@ static int vfs_read_file_to_buffer(const char *path, u64 buffer_va, u64 buffer_c
 static u64 install_vm_object_from_buffer(u64 buffer_va, u64 file_bytes) {
     const u64 token = syscall3(SYSCALL_INSTALL_VM_OBJECT, buffer_va, file_bytes, VM_RIGHT_READ_MAP_GRANT);
     return is_vm_object_token(token) ? token : 0;
-}
-
-static u64 install_exec_image_from_vm(u64 vm_token) {
-    const u64 token = syscall2(SYSCALL_INSTALL_EXEC_IMAGE, vm_token, EXEC_RIGHT_EXEC_GRANT);
-    return is_exec_image_token(token) ? token : 0;
 }
 
 static int cache_entry_path_matches(const struct exec_cache_entry *entry, const char *path, u64 len) {
@@ -561,17 +745,6 @@ static int get_exec_vm_for_path(const char *path, u64 *vm_token_out, u64 *file_b
     return 1;
 }
 
-static u64 get_exec_program_token(void) {
-    if (g_exec_program_token != 0) {
-        execve_profile_step("exec image cache hit");
-        return g_exec_program_token;
-    }
-    execve_profile_step("exec image install begin");
-    g_exec_program_token = install_exec_image_from_vm(g_exec_vm_token);
-    execve_profile_step("exec image install done");
-    return g_exec_program_token;
-}
-
 static u64 grant_vm_object_to_exec(u64 vm_token) {
     const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_exec_service_slot, VM_RIGHT_READ_MAP);
     return is_vm_object_token(granted) ? granted : 0;
@@ -628,39 +801,15 @@ static int ensure_exec_service_scratch(void) {
 
 static int start_exec_service(void) {
     if (g_exec_service_slot != 0) return 1;
-    execve_profile_step("exec service start begin");
+    execve_profile_step("exec service lookup begin");
     if (!ensure_exec_service_scratch()) return 0;
-    const u64 exec_program_token = get_exec_program_token();
-    if (exec_program_token == 0) return 0;
-    clear_page(EXECVE_EXEC_SERVICE_CONFIG_VA);
-    clear_page(EXECVE_EXEC_SERVICE_TABLE_VA);
-    struct exec_bootstrap_config *cfg = (struct exec_bootstrap_config *)EXECVE_EXEC_SERVICE_CONFIG_VA;
-    cfg->magic = EXEC_BOOTSTRAP_MAGIC;
-    cfg->version = EXEC_BOOTSTRAP_VERSION;
-    cfg->flags = EXEC_BOOTSTRAP_FLAG_SERVICE_MODE;
-    cfg->interpreter_file_bytes = g_standard_interpreter_bytes;
-    cfg->fs_endpoint_id = g_vfs.endpoint_id;
-    cfg->fs_compat_process_slot = g_vfs.process_slot;
-
-    struct bootstrap_descriptor_table *table = (struct bootstrap_descriptor_table *)EXECVE_EXEC_SERVICE_TABLE_VA;
-    table->page_count = 1;
-    table->cap_count = 1;
-    table->page_descriptors[0].source_va = EXECVE_EXEC_SERVICE_CONFIG_VA;
-    table->page_descriptors[0].target_va = EXEC_BOOTSTRAP_TARGET_VA;
-    table->cap_descriptors[0].source_token = g_standard_interpreter_vm_token;
-    table->cap_descriptors[0].target_token_va = EXEC_BOOTSTRAP_TARGET_VA + OFFSETOF(struct exec_bootstrap_config, interpreter_vm_token);
-    table->cap_descriptors[0].rights_bits = VM_RIGHT_READ_MAP;
-    table->cap_descriptors[0].kind = BOOTSTRAP_CAP_KIND_VM_OBJECT;
-
-    const u64 flags = SPAWN_FLAG_BOOTSTRAP_EXTENDED_DESCRIPTOR_TABLE | SPAWN_FLAG_CHILD_BOOTSTRAP_OWNER;
-    const u64 spawned = syscall4(SYSCALL_SPAWN_EXEC, exec_program_token, EXECVE_EXEC_SERVICE_TABLE_VA, 0, flags);
-    g_exec_service_slot = decode_spawned_process_slot(spawned);
-    execve_profile_step("exec service start done");
-    if (g_exec_service_slot == 0) {
-        user_log("LinuxAbiServer: exec service spawn failed ret=");
-        user_log_hex_value(spawned);
+    struct service_entry entry;
+    if (!find_service(SERVICE_KIND_EXEC, &entry)) {
+        user_log("LinuxAbiServer: exec service registry missing\n");
         return 0;
     }
+    g_exec_service_slot = entry.process_slot;
+    execve_profile_step("exec service lookup done");
     return 1;
 }
 
@@ -807,8 +956,8 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
 
 static void reset_exec_runtime_state(void) {
     if (!g_proc) return;
-    g_mmap_next_va = 0x29000000ULL;
-    g_brk_next_va = 0x38000000ULL;
+    g_mmap_next_va = LINUX_MMAP_BASE_VA;
+    g_brk_next_va = LINUX_BRK_INITIAL_VA;
     for (u64 i = 0; i < VM_REGION_MAX; i++) g_regions[i].used = 0;
 }
 
@@ -1031,7 +1180,7 @@ static int configure_exec_args_for_shebang(
     return 1;
 }
 
-static int spawn_exec_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override, u64 *spawned_principal_out) {
+static int launch_exec_for_execve(u64 caller_principal, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override, u64 *spawned_principal_out) {
     execve_profile_step("scratch begin");
     if (!ensure_execve_scratch()) { user_log("LinuxAbiServer: execve scratch failed\n"); return 0; }
     execve_profile_step("scratch done");
@@ -1078,7 +1227,7 @@ static int spawn_exec_for_execve(u64 caller_principal, const char *path, u64 arg
     return send_result == 1;
 }
 
-static int spawn_exec_for_shebang(
+static int launch_exec_for_shebang(
     u64 caller_principal,
     const char *interpreter_load_path,
     const char *interpreter_argv0,
@@ -1237,7 +1386,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
         }
         const u64 old_principal = req->caller_principal;
         u64 spawned_principal = 0;
-        if (!spawn_exec_for_shebang(
+        if (!launch_exec_for_shebang(
             req->caller_principal,
             interpreter_load_path,
             interpreter_argv0,
@@ -1262,7 +1411,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     execve_profile_step("probe lookup done");
     const u64 old_principal = req->caller_principal;
     u64 spawned_principal = 0;
-    if (!spawn_exec_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) return reply(errno_io(), 0);
+    if (!launch_exec_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) return reply(errno_io(), 0);
     execve_profile_step("spawn exec done");
     execve_profile_flush();
     if (g_proc) {

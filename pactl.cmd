@@ -7,6 +7,8 @@ set "MANIFEST_PATH=%ROOT%tools\pactl\Cargo.toml"
 set "PACTL_EXE=%CARGO_TARGET_DIR%\debug\pactl.exe"
 set "BUILD_NEEDED=0"
 
+if not defined RUSTUP_TOOLCHAIN set "RUSTUP_TOOLCHAIN=stable"
+
 for /f %%I in ('
     powershell -NoProfile -Command ^
       "$exe = '%PACTL_EXE%';" ^

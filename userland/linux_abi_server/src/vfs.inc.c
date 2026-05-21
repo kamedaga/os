@@ -298,17 +298,16 @@ static int vfs_read_bulk_to_target(u64 token, u64 offset, u32 length, u64 dst_va
     const u64 bytes = response->arg0;
     if (bytes > length || bytes > FS_BULK_READ_BYTES) return 0;
     const u64 copy_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
-    u64 copied = 0;
-    while (copied < bytes) {
-        u64 chunk = bytes - copied;
-        const u64 page_left = PAGE_BYTES - ((dst_va + copied) & (PAGE_BYTES - 1));
-        if (chunk > page_left) chunk = page_left;
-        if (copy_to_target(dst_va + copied, (const void *)(bulk_addr + copied), chunk) != chunk) return 0;
-        copied += chunk;
-    }
+    if (copy_to_target_bulk(dst_va, (const void *)bulk_addr, bytes) != bytes) return 0;
     g_prof.vfs_bulk_copy_ticks += syscall0(SYSCALL_GET_TICK_COUNT) - copy_start_tick;
     *bytes_out = bytes;
     return 1;
+}
+
+static int vfs_read_bulk_direct_to_target(u64 token, u64 offset, u32 length, u64 dst_va, u64 *bytes_out) {
+    g_prof.vfs_bulk_direct_attempts++;
+    g_prof.vfs_bulk_direct_fallback_pages += fs_bulk_page_count_for_length(&g_vfs, length);
+    return vfs_read_bulk_to_target(token, offset, length, dst_va, bytes_out);
 }
 
 static u64 g_last_vfs_write_status = FS_STATUS_OK;
@@ -558,3 +557,31 @@ static u64 vfs_write_from_target(u64 token, u64 offset, u64 src, u64 len, int *f
     return written;
 }
 
+static int vfs_write_inline_local(u64 token, u64 offset, const u8 *src, u16 len) {
+    const u64 request_addr = vfs_request_addr();
+    const u64 response_addr = vfs_response_addr();
+    if (!g_vfs.active || request_addr < PAGE_BYTES || response_addr < PAGE_BYTES) return 0;
+    if (len > PAGE_BYTES - FS_REQUEST_HEADER_BYTES) return 0;
+    g_prof.vfs_requests++;
+    if (FS_OP_WRITE < FS_PROFILE_OP_COUNT) g_prof.vfs_op_counts[FS_OP_WRITE]++;
+    g_prof.vfs_write_request_bytes += len;
+    g_prof.vfs_inline_write_bytes += len;
+    clear_page(request_addr);
+    clear_page(response_addr);
+    volatile struct fs_request_header *request = (volatile struct fs_request_header *)request_addr;
+    const u64 seq = g_vfs.next_seq++;
+    request->magic = FS_REQUEST_MAGIC;
+    request->version = FS_PROTOCOL_VERSION;
+    request->op = FS_OP_WRITE;
+    request->object_token = token;
+    request->offset = offset;
+    request->length = len;
+    request->inline_bytes = len;
+    request->session_nonce = g_vfs.session_nonce;
+    volatile u8 *payload = (volatile u8 *)(request_addr + FS_REQUEST_HEADER_BYTES);
+    for (u16 i = 0; i < len; i++) payload[i] = src[i];
+    __asm__ volatile("" ::: "memory");
+    request->request_seq = seq;
+    if (!signal_fs(&g_vfs)) return 0;
+    return wait_fs_response_at(response_addr, seq, FS_OP_WRITE);
+}

@@ -16,7 +16,7 @@ OVMF_CODE = "/usr/share/OVMF/OVMF_CODE_4M.fd"
 OVMF_VARS_TEMPLATE = "/usr/share/OVMF/OVMF_VARS_4M.fd"
 
 
-def qemu_cmd(run_dir: Path, disk: Path) -> list[str]:
+def qemu_cmd(run_dir: Path, disk: Path, disk_format: str) -> list[str]:
     return [
         "qemu-system-x86_64",
         "-enable-kvm",
@@ -42,7 +42,7 @@ def qemu_cmd(run_dir: Path, disk: Path) -> list[str]:
         "-drive",
         f"if=pflash,format=raw,file={run_dir / 'OVMF_VARS.fd'}",
         "-drive",
-        f"if=none,file={disk},format=raw,id=bootdisk",
+        f"if=none,file={disk},format={disk_format},cache=writeback,aio=threads,id=bootdisk",
         "-device",
         "virtio-blk-pci,drive=bootdisk",
         "-serial",
@@ -110,6 +110,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--command", default="apk update")
     parser.add_argument("--disk", default=None, help="disk image to boot; defaults to .artifacts/disk.img")
+    parser.add_argument("--disk-format", choices=("raw", "qcow2"), default=None, help="QEMU disk format for --in-place; defaults to raw for .img and qcow2 for .qcow2")
     parser.add_argument("--in-place", action="store_true", help="boot the selected disk directly instead of a temporary copy")
     args = parser.parse_args()
 
@@ -123,15 +124,31 @@ def main() -> int:
     source_disk = Path(args.disk) if args.disk is not None else root / ".artifacts" / "disk.img"
     if not source_disk.is_absolute():
         source_disk = root / source_disk
+    disk_format = args.disk_format if args.disk_format is not None else ("qcow2" if source_disk.suffix == ".qcow2" else "raw")
     if args.in_place:
         disk = source_disk
     else:
-        disk = runtime_dir / "disk.img"
-        shutil.copyfile(source_disk, disk)
+        disk = runtime_dir / "disk-overlay.qcow2"
+        subprocess.run(
+            [
+                "qemu-img",
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-F",
+                "raw",
+                "-b",
+                str(source_disk),
+                str(disk),
+            ],
+            check=True,
+        )
+        disk_format = "qcow2"
     shutil.copyfile(OVMF_VARS_TEMPLATE, runtime_dir / "OVMF_VARS.fd")
 
     proc = subprocess.Popen(
-        qemu_cmd(runtime_dir, disk),
+        qemu_cmd(runtime_dir, disk, disk_format),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

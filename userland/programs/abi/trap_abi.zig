@@ -28,6 +28,7 @@ pub const TrapAction = enum(u32) {
 pub const response_flag_exit: u64 = 1 << 0;
 pub const response_flag_block: u64 = 1 << 1;
 pub const response_flag_restart: u64 = 1 << 2;
+pub const response_flag_skip_reclaim: u64 = 1 << 3;
 
 pub const max_args: usize = 6;
 pub const syscall_set_abi_trap_delegate: u64 = 0x49;
@@ -48,7 +49,13 @@ pub const syscall_share_abi_trap_reply_target_pages_to_target: u64 = 0x5A;
 pub const syscall_unmap_abi_trap_target_pages: u64 = 0x5B;
 pub const syscall_reserve_abi_trap_reply_target_pages: u64 = 0x63;
 pub const syscall_reply_abi_trap_target_context: u64 = 0x64;
+pub const syscall_grant_abi_trap_reply_target_pages_as_ipc_buffers: u64 = 0x65;
+pub const syscall_map_current_pages_to_abi_trap_reply_target: u64 = 0x66;
+pub const syscall_cow_abi_trap_reply_target_page: u64 = 0x67;
+pub const syscall_copy_to_abi_trap_reply_target_bulk: u64 = 0x69;
+pub const syscall_map_vm_object_to_abi_trap_reply_target: u64 = 0x6A;
 pub const abi_trap_copy_max_bytes: usize = 4096;
+pub const abi_trap_bulk_copy_max_bytes: usize = 256 * 4096;
 
 pub const TrapRequest = extern struct {
     magic: u64 = magic,

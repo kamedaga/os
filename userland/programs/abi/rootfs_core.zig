@@ -230,16 +230,6 @@ fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRigh
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn installExecImage(vm_token: u64, rights: image_abi.ExecImageRights) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (image_abi.syscall_install_exec_image),
-          [arg0] "{rdi}" (vm_token),
-          [arg1] "{rsi}" (image_abi.execImageRightsToBits(rights)),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
 fn waitMapMmioPage(va: u64, paddr: u64, writable: bool) bool {
     if (paddr == 0) return false;
     var attempt: usize = 0;
@@ -543,10 +533,8 @@ fn loadExec(entry: *const layout.VolumeDirEntry) ?OpenExecResult {
     } else return null;
     const vm_token = installVmObject(slot.base_va, entry.file_size, .{ .read = true });
     if (image_abi.decodeVmObjectToken(vm_token) == null) return null;
-    const exec_token = installExecImage(vm_token, .{ .exec = true });
-    if (image_abi.decodeExecImageToken(exec_token) == null) return null;
     return .{
-        .token = exec_token,
+        .token = vm_token,
         .file_bytes = entry.file_size,
     };
 }

@@ -46,7 +46,7 @@ pub struct RunPlan {
 pub fn invalidate_run_cache(workspace_root: &Path) -> Result<(), String> {
     let slug = runtime_slug(workspace_root);
     let script = format!(
-        "set -e\nCACHE_DIR=${{XDG_CACHE_HOME:-$HOME/.cache}}/capabilityos-qemu/{slug}\nrm -f \"$CACHE_DIR/disk.dirty\" \"$CACHE_DIR/disk.meta\" \"$CACHE_DIR/disk.img\"\n"
+        "set -e\nCACHE_DIR=${{XDG_CACHE_HOME:-$HOME/.cache}}/capabilityos-qemu/{slug}\nCACHE_DISK=\"$CACHE_DIR/disk-overlay.qcow2\"\nif [ -f \"$CACHE_DIR/disk.dirty\" ] && [ -f \"$CACHE_DISK\" ]; then\n  BACKUP=\"$CACHE_DISK.$(date +%Y%m%d-%H%M%S).bak\"\n  mv \"$CACHE_DISK\" \"$BACKUP\"\n  echo \"preserved dirty run overlay: $BACKUP\"\nelse\n  rm -f \"$CACHE_DISK\"\nfi\nrm -f \"$CACHE_DIR/disk.dirty\" \"$CACHE_DIR/disk.meta\" \"$CACHE_DIR/disk.img\" \"$CACHE_DIR/disk-overlay.qcow2.tmp\"\n"
     );
     let status = Command::new("wsl")
         .arg("-e")
@@ -341,7 +341,8 @@ fn build_wsl_script(
             "-drive if=pflash,format=raw,file={}",
             bash_quote(&runtime_ovmf_vars_wsl)
         ),
-        "-drive if=none,file=\"$CACHE_DISK\",format=raw,id=bootdisk".to_string(),
+        "-drive if=none,file=\"$CACHE_DISK\",format=qcow2,cache=writeback,aio=threads,id=bootdisk"
+            .to_string(),
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
         serial_backend,
     ];
@@ -395,7 +396,7 @@ fn build_wsl_script(
     }
     script.push_str(&format!("CACHE_DIR={cache_dir_wsl}\n"));
     script.push_str("CACHE_LOCK=\"$CACHE_DIR/run.lock\"\n");
-    script.push_str("CACHE_DISK=\"$CACHE_DIR/disk.img\"\n");
+    script.push_str("CACHE_DISK=\"$CACHE_DIR/disk-overlay.qcow2\"\n");
     script.push_str("CACHE_META=\"$CACHE_DIR/disk.meta\"\n");
     script.push_str("CACHE_DIRTY=\"$CACHE_DIR/disk.dirty\"\n");
     script.push_str("mkdir -p \"$ARTIFACT_DIR\"\n");
@@ -467,6 +468,9 @@ fn build_wsl_script(
     );
     script
         .push_str("if ! command -v flock >/dev/null 2>&1; then echo 'missing flock'; exit 1; fi\n");
+    script.push_str(
+        "if ! command -v qemu-img >/dev/null 2>&1; then echo 'missing qemu-img'; exit 1; fi\n",
+    );
     script.push_str(&format!(
         "python3 {} ensure --socket \"$LAUNCHER_SOCKET\" --log \"$LAUNCHER_LOG\"\n",
         bash_quote(&launcher_script)
@@ -478,18 +482,16 @@ fn build_wsl_script(
     script.push_str("  [ -f \"$CACHE_META\" ] && cat \"$CACHE_META\"\n");
     script.push_str("}\n");
     script.push_str("refresh_cache_disk() {\n");
-    script.push_str("  cp \"$DISK_IMG\" \"$CACHE_DISK.tmp\"\n");
+    script.push_str("  rm -f \"$CACHE_DISK.tmp\"\n");
+    script.push_str(
+        "  qemu-img create -f qcow2 -F raw -b \"$DISK_IMG\" \"$CACHE_DISK.tmp\" >/dev/null\n",
+    );
     script.push_str("  mv \"$CACHE_DISK.tmp\" \"$CACHE_DISK\"\n");
     script.push_str("  source_disk_sig > \"$CACHE_META\"\n");
     script.push_str("  rm -f \"$CACHE_DIRTY\"\n");
     script.push_str("}\n");
-    script.push_str("schedule_writeback() {\n");
+    script.push_str("mark_overlay_dirty() {\n");
     script.push_str("  : > \"$CACHE_DIRTY\"\n");
-    script.push_str("  flock -u 9\n");
-    script.push_str(&format!(
-        "  python3 {} spawn-writeback --lock \"$CACHE_LOCK\" --source \"$CACHE_DISK\" --dest \"$DISK_IMG\" --meta \"$CACHE_META\" --dirty \"$CACHE_DIRTY\" --log \"$LAUNCHER_LOG\"\n",
-        bash_quote(&launcher_script)
-    ));
     script.push_str("}\n");
     script.push_str("sync_logs() {\n");
     script.push_str(
@@ -520,15 +522,16 @@ fn build_wsl_script(
         script.push_str(" \"$SUMMARY_LOG\" \"$RUNTIME_SUMMARY_LOG\"");
     }
     script.push('\n');
-    script.push_str("if [ -f \"$CACHE_DIRTY\" ]; then\n");
-    script.push_str("  if [ \"$(cached_disk_sig)\" != \"$(source_disk_sig)\" ]; then\n");
+    script.push_str("if [ -f \"$CACHE_DIRTY\" ] && [ \"$(cached_disk_sig)\" != \"$(source_disk_sig)\" ]; then\n");
     script.push_str(
-        "    echo 'disk cache is dirty and the Windows disk image changed outside WSL'\n",
+        "  echo 'qcow2 run overlay is dirty and the Windows disk image changed outside WSL'\n",
     );
-    script.push_str("    echo 'resolve the disk image divergence before running again'\n");
-    script.push_str("    exit 1\n");
-    script.push_str("  fi\n");
-    script.push_str("elif [ ! -f \"$CACHE_DISK\" ] || [ \"$(cached_disk_sig)\" != \"$(source_disk_sig)\" ]; then\n");
+    script.push_str(
+        "  echo 'run pactl setup diff to refresh the disk and invalidate the overlay cache'\n",
+    );
+    script.push_str("  exit 1\n");
+    script.push_str("fi\n");
+    script.push_str("if [ ! -f \"$CACHE_DISK\" ] || [ \"$(cached_disk_sig)\" != \"$(source_disk_sig)\" ]; then\n");
     script.push_str("  refresh_cache_disk\n");
     script.push_str("fi\n");
     script.push_str(&format!(
@@ -571,7 +574,7 @@ fn build_wsl_script(
         ));
         script.push_str("  exit \"$qemu_status\"\n");
         script.push_str("fi\n");
-        script.push_str("schedule_writeback\n");
+        script.push_str("mark_overlay_dirty\n");
         script.push_str("set +e\n");
         script.push_str(&format!(
             "python3 {} --check \"$RUNTIME_SERIAL_LOG\" | tee \"$RUNTIME_SUMMARY_LOG\"\n",
@@ -603,7 +606,7 @@ fn build_wsl_script(
             script.push_str("qemu_status=$?\n");
         }
         script.push_str("set -e\n");
-        script.push_str("schedule_writeback\n");
+        script.push_str("mark_overlay_dirty\n");
         script.push_str("exit \"$qemu_status\"\n");
     }
 
@@ -686,7 +689,8 @@ fn build_wsl_pf_check_script(
             bash_quote(OVMF_CODE_PATH)
         ),
         "-drive if=pflash,format=raw,file=\"$RUN_OVMF_VARS\"".to_string(),
-        "-drive if=none,file=\"$RUN_DISK\",format=raw,id=bootdisk".to_string(),
+        "-drive if=none,file=\"$RUN_DISK\",format=qcow2,cache=writeback,aio=threads,id=bootdisk"
+            .to_string(),
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
         "-serial stdio".to_string(),
     ];
@@ -711,18 +715,23 @@ fn build_wsl_pf_check_script(
     script.push_str(
         "if ! command -v python3 >/dev/null 2>&1; then echo 'missing python3'; exit 1; fi\n",
     );
+    script.push_str(
+        "if ! command -v qemu-img >/dev/null 2>&1; then echo 'missing qemu-img'; exit 1; fi\n",
+    );
     script.push_str("run_one() {\n");
     script.push_str("  id=\"$1\"\n");
     script.push_str("  RUN_DIR=\"$RUNTIME_DIR/run-$id\"\n");
     script.push_str("  OUT_DIR=\"$ARTIFACT_DIR/run-$id\"\n");
     script.push_str("  mkdir -p \"$RUN_DIR\" \"$OUT_DIR\"\n");
     script.push_str("  rm -f \"$OUT_DIR/qemu.log\" \"$OUT_DIR/serial-timed.log\" \"$OUT_DIR/boot-timing-summary.txt\" \"$OUT_DIR/pf-grep.txt\"\n");
-    script.push_str("  RUN_DISK=\"$RUN_DIR/disk.img\"\n");
+    script.push_str("  RUN_DISK=\"$RUN_DIR/disk-overlay.qcow2\"\n");
     script.push_str("  RUN_OVMF_VARS=\"$RUN_DIR/OVMF_VARS.fd\"\n");
     script.push_str("  RUN_QEMU_LOG=\"$RUN_DIR/qemu.log\"\n");
     script.push_str("  RUN_SERIAL_LOG=\"$RUN_DIR/serial-timed.log\"\n");
     script.push_str("  RUN_SUMMARY_LOG=\"$RUN_DIR/boot-timing-summary.txt\"\n");
-    script.push_str("  cp \"$DISK_IMG\" \"$RUN_DISK\"\n");
+    script.push_str("  rm -f \"$RUN_DISK\"\n");
+    script
+        .push_str("  qemu-img create -f qcow2 -F raw -b \"$DISK_IMG\" \"$RUN_DISK\" >/dev/null\n");
     script.push_str(&format!(
         "  cp {} \"$RUN_OVMF_VARS\"\n",
         bash_quote(OVMF_VARS_TEMPLATE_PATH)
