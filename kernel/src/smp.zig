@@ -2,7 +2,6 @@ const std = @import("std");
 const uefi = std.os.uefi;
 const x86_platform = @import("arch/x86_64/platform.zig");
 const lapic = @import("lapic.zig");
-const serial = @import("serial.zig");
 const interrupts = @import("interrupts.zig");
 const build_workarounds = @import("build_workarounds");
 const scheduler_observer = @import("scheduler_observer.zig");
@@ -463,25 +462,8 @@ fn isStarted(cpu_slot: usize) bool {
     return apStartedPtr(cpu_slot).* != 0;
 }
 
-fn logApStart(cpu_slot: usize, apic_id: u8, ok: bool) void {
-    serial.writeRaw("SMP AP start cpu=");
-    serial.printNumber(cpu_slot);
-    serial.writeRaw(" apic=");
-    serial.printNumber(apic_id);
-    if (ok) {
-        serial.writeRaw(" ok state=");
-        serial.printNumber(cpuStatePtr(cpu_slot).*);
-        serial.writeRaw(" runtime_apic=");
-        serial.printNumber(runtimeLapicIdPtr(cpu_slot).*);
-        serial.writeRaw("\n");
-    } else {
-        serial.writeRaw(" timeout\n");
-    }
-}
-
 pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
     if (info.trampoline_base == 0) {
-        serial.writeRaw("SMP disabled: trampoline unavailable\n");
         return;
     }
     if (info.lapic_count == 0) {
@@ -489,11 +471,6 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
     }
     const bsp_id = lapic.localApicId();
     observed_cpu_count = if (info.lapic_count == 0) 1 else info.lapic_count;
-    serial.writeRaw("SMP BSP apic=");
-    serial.printNumber(bsp_id);
-    serial.writeRaw(" detected=");
-    serial.printNumber(info.lapic_count);
-    serial.writeRaw("\n");
     runtimeLapicIdPtr(0).* = bsp_id;
     cpuStatePtr(0).* = cpu_state_idle;
 
@@ -506,12 +483,10 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
         runtimeLapicIdPtr(cpu_slot).* = 0xFF;
         cpuStatePtr(cpu_slot).* = cpu_state_booting;
         if (!x86_platform.mapCpuRuntimeStacks(cpu_slot)) {
-            logApStart(cpu_slot, apic_id, false);
             cpu_slot += 1;
             continue;
         }
         const stack_top = x86_platform.cpuKernelStackTop(cpu_slot) orelse {
-            logApStart(cpu_slot, apic_id, false);
             cpu_slot += 1;
             continue;
         };
@@ -523,12 +498,10 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
             cpu_slot,
             @intFromPtr(&apIdleEntry),
         ) orelse {
-            logApStart(cpu_slot, apic_id, false);
             cpu_slot += 1;
             continue;
         };
         if (!lapic.sendInitSipi(apic_id, vector)) {
-            logApStart(cpu_slot, apic_id, false);
             cpu_slot += 1;
             continue;
         }
@@ -536,7 +509,6 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
         while (!isStarted(cpu_slot) and spins < 10000000) : (spins += 1) {
             asm volatile ("pause");
         }
-        logApStart(cpu_slot, apic_id, isStarted(cpu_slot));
         cpu_slot += 1;
     }
 }

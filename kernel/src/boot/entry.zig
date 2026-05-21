@@ -20,7 +20,6 @@ const kernel_vm = @import("../memory/kernel_vm.zig");
 const pmm = @import("../memory/pmm.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
-const boot_debug = @import("debug.zig");
 const boot_static = @import("main_static.zig");
 const boot_images = @import("boot_images.zig");
 const boot_abi = @import("abi.zig");
@@ -128,12 +127,6 @@ fn principalLabel(principal: kernel.PrincipalId) []const u8 {
 fn principalFromProcessSlot(raw: u64) ?kernel.PrincipalId {
     const idx = std.math.cast(usize, raw) orelse return null;
     return kernel.processPrincipalFromIndex(idx);
-}
-
-fn bootDebugHooks() boot_debug.Hooks {
-    return .{
-        .write = kernel_log.write,
-    };
 }
 
 fn iommuAuditHook(
@@ -654,7 +647,6 @@ fn runBootServicesPhase() BootResources {
     smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
     smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
     scheduler.refreshCpuTopology();
-    logSchedulerCpuTopology();
 
     return .{
         .framebuffer_info = framebuffer_info,
@@ -662,32 +654,6 @@ fn runBootServicesPhase() BootResources {
         .disk_bootfs_image = disk_bootfs_image,
         .memory_stats = memory_stats,
     };
-}
-
-fn logSchedulerCpuTopology() void {
-    var cpu_slot: usize = 0;
-    while (cpu_slot < scheduler.cpuCount()) : (cpu_slot += 1) {
-        const info = scheduler.schedulerCpuInfo(cpu_slot) orelse continue;
-        serial.writeRaw("SCHED CPU cpu=");
-        serial.printNumber(cpu_slot);
-        serial.writeRaw(" smp_state=");
-        serial.printNumber(@intFromEnum(info.smp_state));
-        serial.writeRaw(" current=");
-        serial.printNumber(info.current_thread);
-        serial.writeRaw(" idle_thread=");
-        serial.printNumber(info.idle_thread);
-        serial.writeRaw(" runnable=");
-        serial.printNumber(info.runnable_count);
-        serial.writeRaw(" enabled=");
-        serial.printNumber(if (info.enabled) @as(u64, 1) else @as(u64, 0));
-        serial.writeRaw(" accepts=");
-        serial.printNumber(if (info.accepts_runnable) @as(u64, 1) else @as(u64, 0));
-        serial.writeRaw(" accepts_req=");
-        serial.printNumber(if (info.runnable_acceptance_requested) @as(u64, 1) else @as(u64, 0));
-        serial.writeRaw(" idle=");
-        serial.printNumber(if (info.is_idle) @as(u64, 1) else @as(u64, 0));
-        serial.writeRaw("\n");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +769,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;
-    boot_debug.logReadyTitle(bootDebugHooks(), "USER_PAGE_READY");
     init_setup.refreshInitBootLogSnapshot(state, init_principal);
 
     const loaded_init = elf_load.loadUserElfIntoProcessPagesOrHalt(
@@ -899,10 +864,6 @@ pub fn kernelMain() void {
     asm volatile ("cli");
     lapic.maskLegacyPic();
     kernel_log.reset();
-    serial.writeRaw("RAW ENTER MAIN\n");
-    kernel_log.appendText("RAW ENTER MAIN\n");
-    uefi_services.earlyUefiWrite(&[_:0]u16{ 'E', 'N', 'T', 'E', 'R', ' ', 'M', 'A', 'I', 'N', '\r', '\n' });
-    kernel_log.appendText("ENTER MAIN\n");
     serial.init();
     boot_init_principal = null;
 

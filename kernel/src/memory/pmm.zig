@@ -45,14 +45,12 @@ pub fn collectMemoryStatsAndFreePages(
     user_spaces_end: u64,
 ) ?MemoryStats {
     const h = hooks orelse return null;
-    h.write("[stage] collectMemoryStats begin\n");
     const mmap = bs.getMemoryMap(mmap_buffer) catch |err| {
         h.write("getMemoryMap failed: ");
         h.write(@errorName(err));
         h.write("\n");
         return null;
     };
-    h.write("[stage] collectMemoryStats got map\n");
 
     free_list.* = .{};
     var detected_regions: usize = 0;
