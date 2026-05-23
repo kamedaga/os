@@ -26,33 +26,32 @@ enum {
     SYSCALL_GET_RTC_UNIX_TIME = 0x3E,
     SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
     SYSCALL_IPC_CALL_REPLY_RECV = 0x40,
+    SYSCALL_CREATE_SUSPENDED_PROCESS = 0x41,
+    SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS = 0x43,
+    SYSCALL_SET_PROCESS_INITIAL_CONTEXT = 0x44,
+    SYSCALL_START_PROCESS = 0x45,
+    SYSCALL_ABORT_PROCESS = 0x46,
+    SYSCALL_COPY_TO_PROCESS = 0x47,
+    SYSCALL_COPY_FROM_PROCESS_TO_PROCESS = 0x49,
+    SYSCALL_SHARE_PROCESS_PAGES_TO_PROCESS = 0x4A,
+    SYSCALL_SET_PROCESS_ABI_TRAP_DELEGATE = 0x4B,
     SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES = 0x4C,
     SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET = 0x4D,
     SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET = 0x4E,
     SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE = 0x4F,
     SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES = 0x50,
     SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES = 0x51,
-    SYSCALL_RECLAIM_ABI_TRAP_REPLY_TARGET_PRIVATE_PAGES = 0x52,
-    SYSCALL_FORK_ABI_TRAP_REPLY_TARGET = 0x53,
     SYSCALL_REPLY_ABI_TRAP_TARGET = 0x54,
     SYSCALL_COPY_TO_ABI_TRAP_TARGET = 0x55,
-    SYSCALL_START_ABI_TRAP_TARGET = 0x56,
     SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE = 0x57,
-    SYSCALL_CLONE_ABI_TRAP_REPLY_TARGET = 0x58,
     SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN = 0x59,
-    SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET = 0x5A,
-    SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES = 0x5B,
+    SYSCALL_COPY_FROM_ABI_TRAP_TARGET = 0x5B,
     SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
     SYSCALL_ALLOC_MAP_PAGES_ANYWHERE = 0x5D,
     SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
     SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
-    SYSCALL_RESERVE_ABI_TRAP_REPLY_TARGET_PAGES = 0x63,
     SYSCALL_REPLY_ABI_TRAP_TARGET_CONTEXT = 0x64,
-    SYSCALL_GRANT_ABI_TRAP_REPLY_TARGET_PAGES_AS_IPC_BUFFERS = 0x65,
-    SYSCALL_MAP_CURRENT_PAGES_TO_ABI_TRAP_REPLY_TARGET = 0x66,
-    SYSCALL_COW_ABI_TRAP_REPLY_TARGET_PAGE = 0x67,
-    SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET_BULK = 0x69,
     SYSCALL_OK = 0,
     SYSCALL_ERR_NOT_READY = 2,
     SYSCALL_ERR_MAP = 5,
@@ -73,6 +72,8 @@ enum {
     IPC_BUFFER_ROLE_REQUEST = 1,
     IPC_BUFFER_ROLE_RESPONSE = 2,
     IPC_BUFFER_ROLE_BULK = 3,
+    PROCESS_BUILDER_TOKEN_TAG = 0x1000000000000000ULL,
+    PROCESS_BUILDER_PROCESS_MASK = 0xFFFFFFFFULL,
     TRAP_MAGIC = 0x3149424150415254ULL,
     TRAP_VERSION = 1,
     TRAP_KIND_ABI_SYSCALL = 1,
@@ -283,6 +284,9 @@ enum {
     LINUX_SYS_MOUNT = 165,
     LINUX_SYS_UMOUNT2 = 166,
     LINUX_SYS_GETTID = 186,
+    LINUX_SYS_LISTXATTR = 194,
+    LINUX_SYS_LLISTXATTR = 195,
+    LINUX_SYS_FLISTXATTR = 196,
     LINUX_SYS_TKILL = 200,
     LINUX_SYS_TIME = 201,
     LINUX_SYS_FUTEX = 202,
@@ -312,6 +316,7 @@ enum {
     LINUX_SYS_READLINKAT = 267,
     LINUX_SYS_FCHMODAT = 268,
     LINUX_SYS_FACCESSAT = 269,
+    LINUX_SYS_FACCESSAT2 = 439,
     LINUX_SYS_PSELECT6 = 270,
     LINUX_SYS_PPOLL = 271,
     LINUX_SYS_SET_ROBUST_LIST = 273,
@@ -410,6 +415,7 @@ enum {
     CLONE_FS = 0x00000200,
     CLONE_FILES = 0x00000400,
     CLONE_SIGHAND = 0x00000800,
+    CLONE_VFORK = 0x00004000,
     CLONE_THREAD = 0x00010000,
     CLONE_SYSVSEM = 0x00040000,
     CLONE_SETTLS = 0x00080000,
@@ -453,7 +459,6 @@ enum {
     MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED = 1 << 4,
 
     TRAP_RESPONSE_FLAG_EXIT = 1,
-    TRAP_RESPONSE_FLAG_SKIP_RECLAIM = 8,
     ARCH_SET_FS = 0x1002,
     TCGETS = 0x5401,
     TCSETS = 0x5402,
@@ -501,8 +506,6 @@ enum {
     FILE_CACHE_MAX = 64,
     LINUX_MMAP_BASE_VA = 0x26800000,
     LINUX_BRK_INITIAL_VA = 0x3B000000,
-    LINUX_EXIT_SKIP_RECLAIM_PAGE_THRESHOLD = 4096,
-    LINUX_ENABLE_FILE_PAGE_CACHE_COW = 0,
     LINUX_ENABLE_FILE_VM_OBJECT_MMAP = 1,
     LINUX_FILE_VM_OBJECT_MAX_PAGES = 4096,
     LINUX_ENABLE_DIRECT_MMAP_BULK = 0,
@@ -760,7 +763,6 @@ struct vm_region {
     u64 file_size;
     u8 file_backed;
     u8 file_lazy;
-    u8 file_cow;
     int used;
 };
 
@@ -785,6 +787,8 @@ struct linux_process_state {
     u64 tid;
     u64 pgid;
     u64 principal;
+    u64 vfork_parent_principal;
+    u64 vfork_parent_result;
     struct fd_entry fds[32];
     u64 mmap_next_va;
     u64 brk_next_va;
@@ -921,24 +925,12 @@ struct linux_abi_profile {
     u64 vfs_bulk_direct_wait_fail;
     u64 vfs_bulk_direct_status_fail;
     u64 vfs_bulk_direct_bytes_fail;
-    u64 file_cache_map_pages;
-    u64 file_cache_cow_faults;
-    u64 file_cache_cow_considered;
-    u64 file_cache_cow_candidates;
-    u64 file_cache_cow_skip_peers;
-    u64 file_cache_cow_skip_no_path;
-    u64 file_cache_cow_skip_uncacheable;
-    u64 file_cache_cow_fallbacks;
     u64 file_cache_fill_fail_no_path;
     u64 file_cache_fill_fail_uncacheable;
     u64 file_cache_fill_fail_size;
     u64 file_cache_fill_fail_slot;
     u64 file_cache_fill_fail_alloc;
     u64 file_cache_fill_fail_read;
-    u64 file_cache_map_fail_unaligned;
-    u64 file_cache_map_fail_fill;
-    u64 file_cache_map_fail_range;
-    u64 file_cache_map_fail_syscall;
     u64 file_vm_object_mmap_considered;
     u64 file_vm_object_mmap_candidates;
     u64 file_vm_object_mmap_mapped;
@@ -1032,8 +1024,8 @@ static u8 g_exit_record_used[LINUX_PROCESS_MAX];
 static u64 g_exit_record_pid[LINUX_PROCESS_MAX];
 static u32 g_exit_record_status[LINUX_PROCESS_MAX];
 static u64 g_next_linux_pid = 100;
-static u8 g_deferred_start_used[LINUX_PROCESS_MAX];
-static u64 g_deferred_start_principal[LINUX_PROCESS_MAX];
+static u64 g_vfork_parent_principal[LINUX_ABI_REQUEST_PAGE_COUNT];
+static u64 g_vfork_parent_result[LINUX_ABI_REQUEST_PAGE_COUNT];
 static u32 g_deferred_pipe_wake_mask = 0;
 static struct pipe_entry g_pipes[PIPE_MAX];
 static struct socket_ref_entry g_socket_refs[SOCKET_REF_MAX];

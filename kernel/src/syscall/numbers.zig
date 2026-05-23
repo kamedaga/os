@@ -65,28 +65,18 @@ pub const syscall_map_ipc_buffer_anywhere: u64 = ipc_buffer_abi.syscall_map_ipc_
 
 pub const syscall_get_rtc_unix_time: u64 = 0x3E;
 
-pub const syscall_set_abi_trap_delegate: u64 = trap_abi.syscall_set_abi_trap_delegate;
-pub const syscall_clear_abi_trap_delegate: u64 = trap_abi.syscall_clear_abi_trap_delegate;
 pub const syscall_map_abi_trap_reply_target_pages: u64 = trap_abi.syscall_map_abi_trap_reply_target_pages;
 pub const syscall_copy_from_abi_trap_reply_target: u64 = trap_abi.syscall_copy_from_abi_trap_reply_target;
 pub const syscall_copy_to_abi_trap_reply_target: u64 = trap_abi.syscall_copy_to_abi_trap_reply_target;
 pub const syscall_set_abi_trap_reply_target_fs_base: u64 = trap_abi.syscall_set_abi_trap_reply_target_fs_base;
 pub const syscall_protect_abi_trap_reply_target_pages: u64 = trap_abi.syscall_protect_abi_trap_reply_target_pages;
 pub const syscall_unmap_abi_trap_reply_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_reply_target_pages;
-pub const syscall_reclaim_abi_trap_reply_target_private_pages: u64 = trap_abi.syscall_reclaim_abi_trap_reply_target_private_pages;
 pub const syscall_reply_abi_trap_target: u64 = trap_abi.syscall_reply_abi_trap_target;
 pub const syscall_copy_to_abi_trap_target: u64 = trap_abi.syscall_copy_to_abi_trap_target;
-pub const syscall_start_abi_trap_target: u64 = trap_abi.syscall_start_abi_trap_target;
 pub const syscall_set_abi_trap_target_request_page: u64 = trap_abi.syscall_set_abi_trap_target_request_page;
 pub const syscall_detach_abi_trap_reply_token: u64 = trap_abi.syscall_detach_abi_trap_reply_token;
-pub const syscall_share_abi_trap_reply_target_pages_to_target: u64 = trap_abi.syscall_share_abi_trap_reply_target_pages_to_target;
-pub const syscall_unmap_abi_trap_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_target_pages;
-pub const syscall_reserve_abi_trap_reply_target_pages: u64 = trap_abi.syscall_reserve_abi_trap_reply_target_pages;
+pub const syscall_copy_from_abi_trap_target: u64 = trap_abi.syscall_copy_from_abi_trap_target;
 pub const syscall_reply_abi_trap_target_context: u64 = trap_abi.syscall_reply_abi_trap_target_context;
-pub const syscall_grant_abi_trap_reply_target_pages_as_ipc_buffers: u64 = trap_abi.syscall_grant_abi_trap_reply_target_pages_as_ipc_buffers;
-pub const syscall_map_current_pages_to_abi_trap_reply_target: u64 = trap_abi.syscall_map_current_pages_to_abi_trap_reply_target;
-pub const syscall_cow_abi_trap_reply_target_page: u64 = trap_abi.syscall_cow_abi_trap_reply_target_page;
-pub const syscall_copy_to_abi_trap_reply_target_bulk: u64 = trap_abi.syscall_copy_to_abi_trap_reply_target_bulk;
 
 pub const syscall_batch_max_pages: usize = 256;
 pub const user_log_max_bytes: usize = 256;

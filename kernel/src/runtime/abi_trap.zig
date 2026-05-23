@@ -5,28 +5,14 @@ const scheduler = @import("../scheduler.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const boot_static = @import("../boot/main_static.zig");
 const abi_root = @import("kernel_abi_root");
-const process_factory = @import("../boot/process_factory.zig");
 const ipc = @import("ipc.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 const trap_abi = abi_root.trap_abi;
-const ipc_buffer_abi = abi_root.ipc_buffer_abi;
-const process_abi = abi_root.process_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 
 const delegate_transport_queue_limit: usize = 1;
-
-const lazy_anon_region_capacity: usize = 2048;
-const lazy_fault_cluster_max_pages: usize = boot_static.syscall_batch_max_pages;
-const LazyAnonRegion = struct {
-    active: bool = false,
-    proc: kernel.PrincipalId = @enumFromInt(0),
-    start: u64 = 0,
-    page_count: u64 = 0,
-    prot: kernel.MapProt = .{ .read = false, .write = false, .exec = false },
-};
-var lazy_anon_regions: [lazy_anon_region_capacity]LazyAnonRegion = [_]LazyAnonRegion{.{}} ** lazy_anon_region_capacity;
 
 const AbiTrapSpinLock = struct {
     value: u8 = 0,
@@ -76,7 +62,6 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lazy_anon_regions), &lazy_anon_regions));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(dispatch_delegate_lock), &dispatch_delegate_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_storage), &abi_trap_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(abi_trap_hooks_ready), &abi_trap_hooks_ready));
@@ -330,32 +315,6 @@ pub fn copyToCurrentReplyTarget(proc: kernel.PrincipalId, dst_target_va: u64, sr
     return copyBetweenPrincipals(h, proc, src_current_va, target.proc, dst_target_va, len_u64);
 }
 
-pub fn copyToCurrentReplyTargetBulk(proc: kernel.PrincipalId, dst_target_va: u64, src_current_va: u64, len_u64: u64) u64 {
-    if (len_u64 > @as(u64, trap_abi.abi_trap_bulk_copy_max_bytes)) return boot_static.syscall_err_invalid;
-    if (len_u64 == 0) return 0;
-    const h = getHooks();
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    if (!ensureLazyAnonymousRangeMapped(h, proc, src_current_va, len_u64, false)) return boot_static.syscall_err_invalid;
-    if (!ensureLazyAnonymousRangeMapped(h, target.proc, dst_target_va, len_u64, true)) return boot_static.syscall_err_invalid;
-
-    var scratch: [trap_abi.abi_trap_copy_max_bytes]u8 = undefined;
-    var copied: u64 = 0;
-    while (copied < len_u64) {
-        var chunk = len_u64 - copied;
-        if (chunk > scratch.len) chunk = scratch.len;
-        const src_page_left = 4096 - ((src_current_va + copied) & 0xFFF);
-        if (chunk > src_page_left) chunk = src_page_left;
-        const dst_page_left = 4096 - ((dst_target_va + copied) & 0xFFF);
-        if (chunk > dst_page_left) chunk = dst_page_left;
-        const chunk_usize: usize = @intCast(chunk);
-        const bytes = scratch[0..chunk_usize];
-        if (!h.copy_user_bytes_from_va(proc, src_current_va + copied, bytes)) return copied;
-        if (!h.copy_bytes_to_user_va(target.proc, dst_target_va + copied, bytes)) return copied;
-        copied += chunk;
-    }
-    return copied;
-}
-
 const TargetResolveUse = enum {
     deferred_reply,
     delegated,
@@ -403,9 +362,7 @@ fn copyBetweenPrincipals(h: *const Hooks, src_proc: kernel.PrincipalId, src_va: 
     if (len == 0) return 0;
     var scratch: [trap_abi.abi_trap_copy_max_bytes]u8 = undefined;
     const bytes = scratch[0..len];
-    if (!ensureLazyAnonymousRangeMapped(h, src_proc, src_va, len_u64, false)) return boot_static.syscall_err_invalid;
     if (!h.copy_user_bytes_from_va(src_proc, src_va, bytes)) return boot_static.syscall_err_invalid;
-    if (!ensureLazyAnonymousRangeMapped(h, dst_proc, dst_va, len_u64, true)) return boot_static.syscall_err_invalid;
     if (!h.copy_bytes_to_user_va(dst_proc, dst_va, bytes)) return boot_static.syscall_err_invalid;
     return len_u64;
 }
@@ -417,6 +374,13 @@ pub fn copyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target
     return copyBetweenPrincipals(h, proc, src_current_va, target.proc, dst_target_va, len_u64);
 }
 
+pub fn copyFromTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, dst_current_va: u64, src_target_va: u64, len_u64: u64) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    return copyBetweenPrincipals(h, target.proc, src_target_va, proc, dst_current_va, len_u64);
+}
+
 pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, result: u64, flags: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
@@ -426,9 +390,6 @@ pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, targe
     if (exit_response) {
         _ = scheduler.releaseThreadSlot(target.thread);
         _ = h.state.markProcessExited(target.proc);
-        if ((flags & trap_abi.response_flag_skip_reclaim) == 0) {
-            _ = reclaimPrivatePagesForProcessWithHooks(h, target.proc);
-        }
         return boot_static.syscall_ok;
     }
     return ipc.deliverOrQueueMessageToThread(target.thread, 0, scheduler.currentThreadIndex(), false, result, flags, 0, 0);
@@ -471,17 +432,6 @@ pub fn replyToTargetContext(state: *kernel.KernelState, proc: kernel.PrincipalId
     return boot_static.syscall_ok;
 }
 
-pub fn startTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    if (targetPrincipalFromRaw(target_raw) == null) return boot_static.syscall_err_invalid;
-    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
-    if (target.ctx.ready or target.ctx.abi_trap_reply_pending) return boot_static.syscall_err_invalid;
-    if (!scheduler.setThreadReady(target.thread, true)) return boot_static.syscall_err_not_ready;
-    scheduler.wakeAssignedApForRunnableThread(target.thread);
-    return boot_static.syscall_ok;
-}
-
 pub fn setTargetRequestPage(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, request_page_va: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
@@ -510,203 +460,6 @@ fn pageBatchByteLen(target_va: u64, page_count: u64) ?usize {
     if ((target_va & 0xFFF) != 0) return null;
     if (page_count == 0 or page_count > boot_static.syscall_batch_max_pages) return null;
     return @intCast(page_count * 4096);
-}
-
-fn pageRangeEnd(start: u64, page_count: u64) ?u64 {
-    const bytes, const mul_overflow = @mulWithOverflow(page_count, @as(u64, 4096));
-    if (mul_overflow != 0) return null;
-    const end, const add_overflow = @addWithOverflow(start, bytes);
-    if (add_overflow != 0) return null;
-    return end;
-}
-
-fn lazyRegionEnd(region: *const LazyAnonRegion) u64 {
-    return region.start + region.page_count * 4096;
-}
-
-fn lazyRegionCoversPage(proc: kernel.PrincipalId, va: u64) ?*LazyAnonRegion {
-    const page_va = va & ~@as(u64, 0xFFF);
-    for (&lazy_anon_regions) |*region| {
-        if (!region.active or region.proc != proc) continue;
-        if (page_va >= region.start and page_va < lazyRegionEnd(region)) return region;
-    }
-    return null;
-}
-
-fn lazyRangeIntersects(proc: kernel.PrincipalId, start: u64, page_count: u64) bool {
-    const end = pageRangeEnd(start, page_count) orelse return true;
-    for (&lazy_anon_regions) |*region| {
-        if (!region.active or region.proc != proc) continue;
-        const region_end = lazyRegionEnd(region);
-        if (start < region_end and end > region.start) return true;
-    }
-    return false;
-}
-
-fn removeLazyAnonRange(proc: kernel.PrincipalId, start: u64, page_count: u64) bool {
-    const end = pageRangeEnd(start, page_count) orelse return false;
-    var changed = false;
-    var i: usize = 0;
-    while (i < lazy_anon_regions.len) : (i += 1) {
-        var region = &lazy_anon_regions[i];
-        if (!region.active or region.proc != proc) continue;
-        const region_end = lazyRegionEnd(region);
-        if (start >= region_end or end <= region.start) continue;
-        changed = true;
-
-        if (start <= region.start and end >= region_end) {
-            region.* = .{};
-            continue;
-        }
-        if (start <= region.start) {
-            region.start = end;
-            region.page_count = (region_end - end) / 4096;
-            continue;
-        }
-        if (end >= region_end) {
-            region.page_count = (start - region.start) / 4096;
-            continue;
-        }
-
-        const right_start = end;
-        const right_count = (region_end - end) / 4096;
-        region.page_count = (start - region.start) / 4096;
-        for (&lazy_anon_regions) |*free_region| {
-            if (free_region.active) continue;
-            free_region.* = .{
-                .active = true,
-                .proc = proc,
-                .start = right_start,
-                .page_count = right_count,
-                .prot = region.prot,
-            };
-            break;
-        }
-    }
-    return changed;
-}
-
-fn clearLazyAnonRegionsForProcess(proc: kernel.PrincipalId) void {
-    for (&lazy_anon_regions) |*region| {
-        if (!region.active or region.proc != proc) continue;
-        region.* = .{};
-    }
-}
-
-fn insertLazyAnonRange(proc: kernel.PrincipalId, start: u64, page_count: u64, prot: kernel.MapProt) bool {
-    if ((start & 0xFFF) != 0 or page_count == 0) return false;
-    const end = pageRangeEnd(start, page_count) orelse return false;
-    if (lazyRangeIntersects(proc, start, page_count)) return false;
-    for (&lazy_anon_regions) |*region| {
-        if (!region.active or region.proc != proc) continue;
-        if (region.prot.read != prot.read or region.prot.write != prot.write or region.prot.exec != prot.exec) continue;
-        const region_end = lazyRegionEnd(region);
-        if (region_end == start) {
-            region.page_count += page_count;
-            return true;
-        }
-        if (end == region.start) {
-            region.start = start;
-            region.page_count += page_count;
-            return true;
-        }
-    }
-    for (&lazy_anon_regions) |*region| {
-        if (region.active) continue;
-        region.* = .{
-            .active = true,
-            .proc = proc,
-            .start = start,
-            .page_count = page_count,
-            .prot = prot,
-        };
-        return true;
-    }
-    return false;
-}
-
-fn mapLazyAnonymousPage(h: *const Hooks, proc: kernel.PrincipalId, page_va: u64, write_access: bool, instruction_fetch: bool) bool {
-    const region = lazyRegionCoversPage(proc, page_va) orelse return false;
-    if (write_access and !region.prot.write) return false;
-    if (instruction_fetch and !region.prot.exec) return false;
-    if (capability.lookupUserMappedPaddrForVa(proc, page_va) != null) return true;
-    const page = h.state.allocPageTo(proc, h.free_list) catch return false;
-    if (!user_vm.mapUserLinearRegionWithProt(proc, page_va, page.paddr, 4096, region.prot)) {
-        h.state.reclaimExclusiveRootPage(proc, page.paddr, h.free_list) catch {};
-        return false;
-    }
-    return true;
-}
-
-fn mapLazyAnonymousPageCluster(h: *const Hooks, proc: kernel.PrincipalId, page_va: u64, write_access: bool, instruction_fetch: bool) bool {
-    const region = lazyRegionCoversPage(proc, page_va) orelse return false;
-    if (write_access and !region.prot.write) return false;
-    if (instruction_fetch and !region.prot.exec) return false;
-    if (capability.lookupUserMappedPaddrForVa(proc, page_va) != null) return true;
-
-    const region_end = lazyRegionEnd(region);
-    var map_count: usize = 0;
-    while (map_count < lazy_fault_cluster_max_pages) : (map_count += 1) {
-        const va = page_va + @as(u64, @intCast(map_count)) * 4096;
-        if (va >= region_end) break;
-        if (capability.lookupUserMappedPaddrForVa(proc, va) != null) break;
-    }
-    if (map_count == 0) return false;
-
-    var pages: [lazy_fault_cluster_max_pages]kernel.PageCapability = undefined;
-    var allocated: usize = 0;
-    const cap_table_start_index = h.state.getTableConst(proc).len;
-    while (allocated < map_count) : (allocated += 1) {
-        pages[allocated] = h.state.allocPageTo(proc, h.free_list) catch {
-            for (pages[0..allocated]) |page| {
-                h.state.reclaimExclusiveRootPage(proc, page.paddr, h.free_list) catch {};
-            }
-            return false;
-        };
-    }
-
-    if (!user_vm.mapFreshUserPageCapabilitiesWithProt(h.state, proc, page_va, pages[0..allocated], cap_table_start_index, region.prot)) {
-        for (pages[0..allocated]) |page| {
-            h.state.reclaimExclusiveRootPage(proc, page.paddr, h.free_list) catch {};
-        }
-        return false;
-    }
-    return true;
-}
-
-fn ensureLazyAnonymousRangeMapped(h: *const Hooks, proc: kernel.PrincipalId, va: u64, len_u64: u64, write_access: bool) bool {
-    if (len_u64 == 0) return true;
-    const end, const overflow = @addWithOverflow(va, len_u64 - 1);
-    if (overflow != 0) return false;
-    var page_va = va & ~@as(u64, 0xFFF);
-    const last_page = end & ~@as(u64, 0xFFF);
-    while (true) {
-        if (capability.lookupUserMappedPaddrForVa(proc, page_va) == null and lazyRegionCoversPage(proc, page_va) != null) {
-            if (!mapLazyAnonymousPage(h, proc, page_va, write_access, false)) return false;
-        }
-        if (page_va == last_page) break;
-        page_va += 4096;
-    }
-    return true;
-}
-
-pub fn resolveLazyAnonymousPageFault(state: *kernel.KernelState, proc: kernel.PrincipalId, fault_va: u64, error_code: u64) bool {
-    const write_access = (error_code & (1 << 1)) != 0;
-    const instruction_fetch = (error_code & (1 << 4)) != 0;
-    var h_storage = hooksForState(state);
-    const page_va = fault_va & ~@as(u64, 0xFFF);
-    if (capability.lookupUserMappedPaddrForVa(proc, page_va) != null) return false;
-    if (!mapLazyAnonymousPageCluster(&h_storage, proc, page_va, write_access, instruction_fetch)) return false;
-    return true;
-}
-
-pub fn reserveLazyAnonymousPagesForCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, page_count: u64, prot_bits: u64) u64 {
-    _ = state;
-    _ = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    if (!insertLazyAnonRange(target.proc, target_va, page_count, prot)) return boot_static.syscall_err_map;
-    return boot_static.syscall_ok;
 }
 
 pub fn mapPagesToCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, page_count: u64, prot_bits: u64) u64 {
@@ -741,21 +494,6 @@ pub fn protectCurrentReplyTargetPages(target_va: u64, page_count: u64, prot_bits
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    if (lazyRangeIntersects(target.proc, target_va, page_count)) {
-        var page_index: u64 = 0;
-        while (page_index < page_count) : (page_index += 1) {
-            const va = target_va + page_index * 4096;
-            if (capability.lookupUserMappedPaddrForVa(target.proc, va) != null) {
-                if (!user_vm.protectUserLinearRegionWithProt(target.proc, va, 4096, prot)) return boot_static.syscall_err_map;
-            }
-            if (lazyRegionCoversPage(target.proc, va)) |region| {
-                region.prot = prot;
-            } else {
-                return boot_static.syscall_err_map;
-            }
-        }
-        return boot_static.syscall_ok;
-    }
     if (!user_vm.protectUserLinearRegionWithProt(target.proc, target_va, byte_len, prot)) {
         return boot_static.syscall_err_map;
     }
@@ -766,27 +504,6 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
     _ = state;
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    if (lazyRangeIntersects(target.proc, target_va, page_count)) {
-        var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
-        if (user_vm.collectUserLinearRegionPaddrs(target.proc, target_va, byte_len, paddrs[0..])) |collected| {
-            if (collected == page_count) {
-                if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) return boot_static.syscall_err_map;
-                _ = removeLazyAnonRange(target.proc, target_va, page_count);
-                return boot_static.syscall_ok;
-            }
-        }
-        var page_index: u64 = 0;
-        while (page_index < page_count) : (page_index += 1) {
-            const va = target_va + page_index * 4096;
-            if (capability.lookupUserMappedPaddrForVa(target.proc, va) != null) {
-                if (!user_vm.unmapUserLinearRegion(target.proc, va, 4096)) return boot_static.syscall_err_map;
-            } else if (lazyRegionCoversPage(target.proc, va) == null) {
-                return boot_static.syscall_err_map;
-            }
-        }
-        _ = removeLazyAnonRange(target.proc, target_va, page_count);
-        return boot_static.syscall_ok;
-    }
     var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
     const collected = user_vm.collectUserLinearRegionPaddrs(target.proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
     if (collected != page_count) {
@@ -796,385 +513,6 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
         return boot_static.syscall_err_map;
     }
     return boot_static.syscall_ok;
-}
-
-pub fn unmapTargetPages(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, target_va: u64, page_count: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
-    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
-    if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) {
-        return boot_static.syscall_err_map;
-    }
-    return boot_static.syscall_ok;
-}
-
-pub fn shareCurrentReplyTargetPagesToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, target_va: u64, page_count: u64, prot_bits: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
-    const source = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
-    const target_proc = target.proc;
-    if (target_proc == source.proc) return boot_static.syscall_ok;
-
-    var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
-    const collected = user_vm.collectUserLinearRegionPaddrs(source.proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
-    if (collected != page_count) return boot_static.syscall_err_map;
-
-    var page_index: u64 = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const va = target_va + page_index * 4096;
-        const paddr = paddrs[@intCast(page_index)];
-
-        if (capability.lookupUserMappedPaddrForVa(target_proc, va)) |existing_paddr| {
-            if (existing_paddr != paddr) return boot_static.syscall_err_map;
-            const target_cap = h.state.getTableConst(target_proc).find(paddr) orelse return boot_static.syscall_err_invalid;
-            if (!target_cap.rights.cpu_read or (prot.write and !target_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
-            if (!user_vm.protectUserLinearRegionWithProt(target_proc, va, 4096, prot)) return boot_static.syscall_err_map;
-            continue;
-        }
-
-        if (h.state.getTableConst(target_proc).find(paddr)) |target_cap| {
-            if (!target_cap.rights.cpu_read or (prot.write and !target_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
-        } else {
-            const source_cap = h.state.getTableConst(source.proc).find(paddr) orelse return boot_static.syscall_err_invalid;
-            if (!source_cap.rights.cpu_read or (prot.write and !source_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
-            h.state.deriveCapForSharedAddressSpace(
-                source.proc,
-                target_proc,
-                paddr,
-                .{
-                    .cpu_read = true,
-                    .cpu_write = source_cap.rights.cpu_write,
-                    .dma = false,
-                },
-            ) catch return boot_static.syscall_err_grant;
-        }
-        if (!user_vm.mapUserLinearRegionWithProt(target_proc, va, paddr, 4096, prot)) return boot_static.syscall_err_map;
-    }
-    return boot_static.syscall_ok;
-}
-
-pub fn grantCurrentReplyTargetPagesAsIpcBuffers(state: *kernel.KernelState, proc: kernel.PrincipalId, target_va: u64, page_count: u64, endpoint_id: u64, out_tokens_va: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
-    _ = byte_len;
-    const source = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    const endpoint_target = h.state.endpointTargetFor(proc, endpoint_id) orelse return boot_static.syscall_err_endpoint;
-    const page_count_usize: usize = @intCast(page_count);
-
-    var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
-    var page_index: usize = 0;
-    while (page_index < page_count_usize) : (page_index += 1) {
-        const va = target_va + @as(u64, @intCast(page_index)) * 4096;
-        const paddr = capability.lookupUserMappedPaddrForVa(source.proc, va) orelse return boot_static.syscall_err_map;
-        const page_cap = h.state.getTableConst(source.proc).find(paddr) orelse return boot_static.syscall_err_invalid;
-        if (!page_cap.rights.cpu_read or !page_cap.rights.cpu_write or !page_cap.rights.grant) return boot_static.syscall_err_grant;
-        paddrs[page_index] = paddr;
-    }
-
-    const rights: kernel.IpcBufferRights = .{
-        .read = true,
-        .write = true,
-        .map = true,
-        .grant = true,
-    };
-    page_index = 0;
-    while (page_index < page_count_usize) : (page_index += 1) {
-        const cap_id = h.state.installTrustedIpcBufferFromPage(endpoint_target, paddrs[page_index], rights, .bulk) catch |err| switch (err) {
-            kernel.KernelError.TableFull => return boot_static.syscall_err_alloc,
-            else => return boot_static.syscall_err_grant,
-        };
-        const token = ipc_buffer_abi.encodeIpcBufferToken(cap_id);
-        if (!h.write_user_u64(proc, out_tokens_va + @as(u64, @intCast(page_index)) * 8, token)) return boot_static.syscall_err_invalid;
-    }
-    return boot_static.syscall_ok;
-}
-
-pub fn mapCurrentPagesToCurrentReplyTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, source_va: u64, target_va: u64, page_count: u64, prot_bits: u64) u64 {
-    _ = pageBatchByteLen(source_va, page_count) orelse return boot_static.syscall_err_invalid;
-    _ = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const page_count_usize: usize = @intCast(page_count);
-
-    var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
-    var page_index: usize = 0;
-    while (page_index < page_count_usize) : (page_index += 1) {
-        const va = source_va + @as(u64, @intCast(page_index)) * 4096;
-        const paddr = capability.lookupUserMappedPaddrForVa(proc, va) orelse return boot_static.syscall_err_map;
-        const source_cap = h.state.getTableConst(proc).find(paddr) orelse return boot_static.syscall_err_invalid;
-        if (!source_cap.rights.cpu_read or (prot.write and !source_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
-        paddrs[page_index] = paddr;
-    }
-
-    page_index = 0;
-    while (page_index < page_count_usize) : (page_index += 1) {
-        const paddr = paddrs[page_index];
-        if (h.state.getTableConst(target.proc).find(paddr)) |target_cap| {
-            if (!target_cap.rights.cpu_read or (prot.write and !target_cap.rights.cpu_write)) return boot_static.syscall_err_grant;
-        } else if (target.proc != proc) {
-            h.state.deriveCapForSharedAddressSpace(
-                proc,
-                target.proc,
-                paddr,
-                .{
-                    .cpu_read = true,
-                    .cpu_write = prot.write,
-                    .dma = false,
-                },
-            ) catch return boot_static.syscall_err_grant;
-        }
-    }
-    if (!user_vm.mapTrustedUserPaddrsWithProt(target.proc, target_va, paddrs[0..page_count_usize], prot)) return boot_static.syscall_err_map;
-    return boot_static.syscall_ok;
-}
-
-pub fn cowCurrentReplyTargetPage(state: *kernel.KernelState, target_va: u64, prot_bits: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    _ = pageBatchByteLen(target_va, 1) orelse return boot_static.syscall_err_invalid;
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const old_paddr = capability.lookupUserMappedPaddrForVa(target.proc, target_va) orelse return boot_static.syscall_err_map;
-    const new_page = h.state.allocPageTo(target.proc, h.free_list) catch return boot_static.syscall_err_alloc;
-
-    const src: [*]const u8 = @ptrFromInt(old_paddr);
-    const dst: [*]u8 = @ptrFromInt(new_page.paddr);
-    @memcpy(dst[0..4096], src[0..4096]);
-
-    if (!user_vm.unmapUserLinearRegion(target.proc, target_va, 4096)) {
-        h.state.reclaimExclusiveRootPage(target.proc, new_page.paddr, h.free_list) catch {};
-        return boot_static.syscall_err_map;
-    }
-    if (!user_vm.mapUserLinearRegionWithProt(target.proc, target_va, new_page.paddr, 4096, prot)) {
-        h.state.reclaimExclusiveRootPage(target.proc, new_page.paddr, h.free_list) catch {};
-        return boot_static.syscall_err_map;
-    }
-    return boot_static.syscall_ok;
-}
-
-fn isExclusiveRootMappedPage(h: *const Hooks, target_proc: kernel.PrincipalId, paddr: u64) bool {
-    const cap = h.state.getTableConst(target_proc).find(paddr) orelse return false;
-    if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) return false;
-    switch (h.state.scanCapTables(paddr)) {
-        .owner => |actual_owner| if (actual_owner != target_proc) return false,
-        .shared, .none => return false,
-    }
-    return true;
-}
-
-fn reclaimPrivatePagesForProcessWithHooks(h: *const Hooks, target_proc: kernel.PrincipalId) u64 {
-    var total_reclaimed: u64 = 0;
-    while (true) {
-        var mapped_pages: [512]user_vm.MappedUserPage = undefined;
-        var pages: [boot_static.syscall_batch_max_pages]user_vm.MappedUserPage = undefined;
-        const mapped_count = user_vm.collectUserMappedPages(target_proc, mapped_pages[0..]);
-        var count: usize = 0;
-        var i: usize = 0;
-        while (i < mapped_count) : (i += 1) {
-            const paddr = mapped_pages[i].paddr;
-            if (!isExclusiveRootMappedPage(h, target_proc, paddr)) continue;
-            if (count >= pages.len) break;
-            if (!h.free_list.canAppendPage(0, paddr)) return boot_static.syscall_err_alloc;
-            pages[count] = mapped_pages[i];
-            count += 1;
-        }
-        if (count == 0) break;
-
-        var reclaimed_this_round: u64 = 0;
-        for (pages[0..count]) |page| {
-            if (!user_vm.unmapUserLinearRegion(target_proc, page.va, 4096)) continue;
-            const paddr = page.paddr;
-            h.state.reclaimExclusiveRootPage(target_proc, paddr, h.free_list) catch return boot_static.syscall_err_invalid;
-            reclaimed_this_round += 1;
-        }
-        if (reclaimed_this_round == 0) break;
-        total_reclaimed += reclaimed_this_round;
-    }
-    clearLazyAnonRegionsForProcess(target_proc);
-    return total_reclaimed;
-}
-
-pub fn reclaimPrivatePagesForProcess(state: *kernel.KernelState, target_proc: kernel.PrincipalId) u64 {
-    var h_storage = hooksForState(state);
-    return reclaimPrivatePagesForProcessWithHooks(&h_storage, target_proc);
-}
-
-pub fn reclaimCurrentReplyTargetPrivatePages(state: *kernel.KernelState) u64 {
-    var h_storage = hooksForState(state);
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    return reclaimPrivatePagesForProcessWithHooks(&h_storage, target.proc);
-}
-
-fn abortChildProcess(h: *const Hooks, principal: kernel.PrincipalId, reclaim_pages: bool) void {
-    if (reclaim_pages) _ = reclaimPrivatePagesForProcessWithHooks(h, principal);
-    if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
-        _ = scheduler.releaseThreadSlot(thread_index);
-    }
-    _ = h.state.markProcessExited(principal);
-}
-
-const ReplyTarget = struct {
-    ctx: *scheduler.ThreadContext,
-    proc: kernel.PrincipalId,
-    delegate: kernel.AbiTrapDelegate,
-    delegate_target: kernel.PrincipalId,
-};
-
-fn currentReplyTargetWithDelegate(h: *const Hooks) ?ReplyTarget {
-    const target = currentReplyTarget() orelse return null;
-    const delegate = h.state.abiTrapDelegateFor(target.proc) orelse return null;
-    const delegate_target = h.state.endpointTargetFor(target.proc, delegate.endpoint_id) orelse return null;
-    return .{
-        .ctx = target.ctx,
-        .proc = target.proc,
-        .delegate = delegate,
-        .delegate_target = delegate_target,
-    };
-}
-
-const ChildPageContext = struct {
-    h: *const Hooks,
-    parent: kernel.PrincipalId,
-    child: kernel.PrincipalId,
-    scratch: *[4096]u8,
-    status: u64 = boot_static.syscall_ok,
-
-    fn copyMappedPage(ctx: *ChildPageContext, page: user_vm.MappedUserPage) bool {
-        if (!ctx.h.copy_user_bytes_from_va(ctx.parent, page.va, ctx.scratch[0..])) {
-            ctx.status = boot_static.syscall_err_invalid;
-            return false;
-        }
-        const child_page = ctx.h.state.allocPageTo(ctx.child, ctx.h.free_list) catch {
-            ctx.status = boot_static.syscall_err_alloc;
-            return false;
-        };
-        if (!user_vm.mapUserLinearRegionWithProt(ctx.child, page.va, child_page.paddr, 4096, .{ .read = true, .write = page.writable, .exec = true })) {
-            ctx.h.state.reclaimExclusiveRootPage(ctx.child, child_page.paddr, ctx.h.free_list) catch {};
-            ctx.status = boot_static.syscall_err_map;
-            return false;
-        }
-        if (!ctx.h.copy_bytes_to_user_va(ctx.child, page.va, ctx.scratch[0..])) {
-            ctx.status = boot_static.syscall_err_map;
-            return false;
-        }
-        return true;
-    }
-};
-
-fn copyChildMappedPage(context: *anyopaque, page: user_vm.MappedUserPage) bool {
-    const ctx: *ChildPageContext = @ptrCast(@alignCast(context));
-    return ctx.copyMappedPage(page);
-}
-
-fn shareChildMappedPage(context: *anyopaque, page: user_vm.MappedUserPage) bool {
-    const ctx: *ChildPageContext = @ptrCast(@alignCast(context));
-    const src_cap = ctx.h.state.getTableConst(ctx.parent).find(page.paddr) orelse {
-        return ctx.copyMappedPage(page);
-    };
-    if (!src_cap.rights.cpu_read) {
-        return ctx.copyMappedPage(page);
-    }
-    ctx.h.state.deriveCapForSharedAddressSpace(
-        ctx.parent,
-        ctx.child,
-        page.paddr,
-        .{
-            .cpu_read = true,
-            .cpu_write = src_cap.rights.cpu_write,
-            .dma = false,
-        },
-    ) catch {
-        ctx.status = boot_static.syscall_err_grant;
-        return false;
-    };
-    if (!user_vm.mapUserLinearRegionWithProt(ctx.child, page.va, page.paddr, 4096, .{ .read = true, .write = page.writable, .exec = true })) {
-        ctx.status = boot_static.syscall_err_map;
-        return false;
-    }
-    return true;
-}
-
-fn installChildDelegate(h: *const Hooks, child: kernel.PrincipalId, target: ReplyTarget) u64 {
-    h.state.installEndpoint(child, target.delegate.endpoint_id, target.delegate_target) catch return boot_static.syscall_err_endpoint;
-    h.state.setAbiTrapDelegate(child, target.delegate.endpoint_id, target.delegate.flavor, target.delegate.request_page_va) catch return boot_static.syscall_err_invalid;
-    return boot_static.syscall_ok;
-}
-
-fn initChildThreadFromTarget(child: kernel.PrincipalId, target: ReplyTarget, child_rsp: u64, child_fs_base: u64) ?usize {
-    const child_thread = scheduler.threadSlotForPrincipal(child) orelse return null;
-    const child_ctx = scheduler.getThreadContext(child_thread) orelse return null;
-    child_ctx.frame = target.ctx.frame;
-    child_ctx.frame.rax = 0;
-    if (child_rsp != 0) child_ctx.frame.rsp = child_rsp;
-    child_ctx.fs_base = if (child_fs_base != 0) child_fs_base else target.ctx.fs_base;
-    child_ctx.fx_state = target.ctx.fx_state;
-    child_ctx.abi_trap_reply_pending = false;
-    return child_thread;
-}
-
-fn encodeChildProcess(child: kernel.PrincipalId, child_thread: usize) u64 {
-    const slot = kernel.processIndexFromPrincipal(child) orelse return boot_static.syscall_err_invalid;
-    return process_abi.encodeSpawnedProcess(@intCast(slot), @intCast(child_thread));
-}
-
-const ChildMapMode = enum { copy_private, share_readable };
-
-fn spawnReplyTargetChild(
-    h: *const Hooks,
-    target: ReplyTarget,
-    name: []const u8,
-    mode: ChildMapMode,
-    child_rsp: u64,
-    child_fs_base: u64,
-) u64 {
-    const created = process_factory.tryCreateSuspendedUserProcess(h.state, name, h.user_spaces) catch return boot_static.syscall_err_alloc;
-    const child = created.principal;
-    var scratch: [4096]u8 = undefined;
-    var context = ChildPageContext{
-        .h = h,
-        .parent = target.proc,
-        .child = child,
-        .scratch = &scratch,
-    };
-    const visitor: user_vm.MappedUserPageVisitor = switch (mode) {
-        .copy_private => copyChildMappedPage,
-        .share_readable => shareChildMappedPage,
-    };
-    if (!user_vm.forEachUserMappedPage(target.proc, @ptrCast(&context), visitor)) {
-        abortChildProcess(h, child, mode == .copy_private);
-        return if (context.status != boot_static.syscall_ok) context.status else boot_static.syscall_err_invalid;
-    }
-    const delegate_status = installChildDelegate(h, child, target);
-    if (delegate_status != boot_static.syscall_ok) {
-        abortChildProcess(h, child, mode == .copy_private);
-        return delegate_status;
-    }
-    const child_thread = initChildThreadFromTarget(child, target, child_rsp, child_fs_base) orelse {
-        abortChildProcess(h, child, mode == .copy_private);
-        return boot_static.syscall_err_invalid;
-    };
-    return encodeChildProcess(child, child_thread);
-}
-
-pub fn forkCurrentReplyTarget(state: *kernel.KernelState) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    const target = currentReplyTargetWithDelegate(h) orelse return boot_static.syscall_err_endpoint;
-    return spawnReplyTargetChild(h, target, "forked linux", .copy_private, 0, 0);
-}
-
-pub fn cloneCurrentReplyTargetShared(state: *kernel.KernelState, child_rsp: u64, child_fs_base: u64) u64 {
-    var h_storage = hooksForState(state);
-    const h = &h_storage;
-    const target = currentReplyTargetWithDelegate(h) orelse return boot_static.syscall_err_endpoint;
-    return spawnReplyTargetChild(h, target, "linux thread", .share_readable, child_rsp, child_fs_base);
 }
 
 pub fn dispatchDelegate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {

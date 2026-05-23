@@ -110,6 +110,31 @@ struct loaded_image {
     u64 initial_rsp;
 };
 
+struct initial_user_context {
+    u64 flags;
+    u64 rip;
+    u64 rsp;
+    u64 rflags;
+    u64 rax;
+    u64 rbx;
+    u64 rcx;
+    u64 rdx;
+    u64 rsi;
+    u64 rdi;
+    u64 rbp;
+    u64 r8;
+    u64 r9;
+    u64 r10;
+    u64 r11;
+    u64 r12;
+    u64 r13;
+    u64 r14;
+    u64 r15;
+    u64 fs_base;
+    u64 reserved0;
+    u64 reserved1;
+};
+
 struct load_layout {
     u64 next_dyn_base;
 };
@@ -295,7 +320,13 @@ static int copy_to_process(u64 process_token, u64 dest_va, u64 src_va, u64 byte_
 }
 
 static int set_process_initial_context(u64 process_token, u64 rip, u64 rsp) {
-    return syscall3(SYSCALL_SET_PROCESS_INITIAL_CONTEXT, process_token, rip, rsp) == SYSCALL_OK;
+    struct initial_user_context ctx;
+    unsigned char *bytes = (unsigned char *)&ctx;
+    for (u64 i = 0; i < sizeof(ctx); i++) bytes[i] = 0;
+    ctx.rip = rip;
+    ctx.rsp = rsp;
+    ctx.rflags = 0x202ULL;
+    return syscall4(SYSCALL_SET_PROCESS_INITIAL_CONTEXT, process_token, rip, rsp, (u64)&ctx) == SYSCALL_OK;
 }
 
 static int set_process_abi_trap_delegate(u64 process_token, u64 endpoint_id, u64 target_process_slot, u64 flavor, u64 request_page_va) {
@@ -1242,7 +1273,7 @@ static int load_elf_image_into_process(
     return init_loaded_image(summary, source_va, file_bytes, load_bias, mapped_count, image_out);
 }
 
-static int prepare_and_start_process(const struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *child_process_slot_out) {
+static int prepare_process(const struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *process_token_out, u64 *child_process_slot_out) {
     u64 main_source_va = 0;
     u64 main_vm_token = 0;
     struct exec_elf_summary main_summary;
@@ -1313,14 +1344,29 @@ static int prepare_and_start_process(const struct exec_bootstrap_config *cfg, st
         user_log("Exec: abi trap delegate failed\n");
         return 0;
     }
+    *process_token_out = process_token;
+    *child_process_slot_out = process_slot_from_builder_token(process_token);
+    return 1;
+}
+
+static int start_prepared_process(u64 process_token, u64 expected_child_process_slot) {
     const u64 child_process_slot = start_process(process_token);
     if (child_process_slot == 0) {
         abort_process(process_token);
         user_log("Exec: start process failed\n");
         return 0;
     }
-    *child_process_slot_out = child_process_slot;
+    if (child_process_slot != expected_child_process_slot) {
+        user_log("Exec: child slot mismatch\n");
+        return 0;
+    }
     return 1;
+}
+
+static int prepare_and_start_process(const struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *child_process_slot_out) {
+    u64 process_token = 0;
+    if (!prepare_process(cfg, image_out, &process_token, child_process_slot_out)) return 0;
+    return start_prepared_process(process_token, *child_process_slot_out);
 }
 
 static int map_service_request_page(u64 request_paddr) {

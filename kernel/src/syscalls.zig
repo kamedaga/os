@@ -286,9 +286,6 @@ fn exitAbiTrapReplyTargetIfRequested(
     ipc_syscalls.clearCurrentReplyToken();
     _ = scheduler.releaseThreadSlot(target.thread_index);
     _ = h.state.markProcessExited(target.principal);
-    if ((response_flags & trap_abi.response_flag_skip_reclaim) == 0) {
-        _ = abi_trap_runtime.reclaimPrivatePagesForProcess(h.state, target.principal);
-    }
     return true;
 }
 

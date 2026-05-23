@@ -8,10 +8,10 @@ pub const syscall_start_process: u64 = 0x45;
 pub const syscall_abort_process: u64 = 0x46;
 pub const syscall_copy_to_process: u64 = 0x47;
 pub const syscall_mprotect_self: u64 = 0x48;
+pub const syscall_copy_from_process_to_process: u64 = 0x49;
+pub const syscall_share_process_pages_to_process: u64 = 0x4A;
 pub const syscall_set_process_bootstrap_owner: u64 = 0x6B;
 pub const syscall_set_process_abi_trap_delegate: u64 = 0x4B;
-pub const syscall_fork_abi_trap_reply_target: u64 = 0x53;
-pub const syscall_clone_abi_trap_reply_target: u64 = 0x58;
 
 pub const abi_trap_request_page_bytes: u64 = 4096;
 

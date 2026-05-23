@@ -721,7 +721,7 @@ static int map_vm_object_to_process(u64 process_token, u64 vm_token, u64 target_
 }
 
 static int set_process_initial_context(u64 process_token, u64 rip, u64 rsp) {
-    return syscall3(SYSCALL_SET_PROCESS_INITIAL_CONTEXT, process_token, rip, rsp) == SYSCALL_OK;
+    return syscall4(SYSCALL_SET_PROCESS_INITIAL_CONTEXT, process_token, rip, rsp, 0) == SYSCALL_OK;
 }
 
 static int set_process_bootstrap_owner(u64 process_token, int enabled) {

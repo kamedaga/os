@@ -6,7 +6,10 @@
     },
     "display": {
         "showErrors": true,
-        "noBuffer": true
+        "noBuffer": true,
+        "key": {
+            "width": 15
+        }
     },
     "modules": [
         "title",
@@ -14,12 +17,37 @@
         "os",
         {
             "type": "kernel",
-            "format": "{sysname} {release}"
+            "format": "{sysname} {release} ({arch}, page {page-size})"
         },
+        "uptime",
         "shell",
         "terminal",
-        "cpu",
+        "terminalsize",
+        {
+            "type": "datetime",
+            "key": "Date/Time",
+            "format": "{year}-{month-pretty}-{day-pretty} {hour-pretty}:{minute-pretty}:{second-pretty} UTC{offset-from-utc}"
+        },
+        "locale",
+        {
+            "type": "cpu",
+            "format": "{name} ({cores-logical} threads)"
+        },
         "memory",
-        "uptime"
+        "swap",
+        {
+            "type": "disk",
+            "key": "Disk",
+            "folders": "/",
+            "format": "{size-used} / {size-total} ({filesystem})"
+        },
+        {
+            "type": "packages",
+            "key": "Packages",
+            "format": "{apk} (apk)"
+        },
+        "processes",
+        "dns",
+        "colors"
     ]
 }

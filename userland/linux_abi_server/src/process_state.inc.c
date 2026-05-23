@@ -36,6 +36,8 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
     proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->pgid = principal; proc->principal = principal; init_process_fds(proc);
     proc->exec_pending_principal = 0;
+    proc->vfork_parent_principal = 0;
+    proc->vfork_parent_result = 0;
     proc->mmap_next_va = LINUX_MMAP_BASE_VA;
     proc->brk_next_va = LINUX_BRK_INITIAL_VA;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
@@ -83,7 +85,10 @@ static void init_process_tables(void) {
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         g_processes[i].used = 0;
         g_exit_record_used[i] = 0;
-        g_deferred_start_used[i] = 0;
+    }
+    for (u64 i = 0; i < LINUX_ABI_REQUEST_PAGE_COUNT; i++) {
+        g_vfork_parent_principal[i] = 0;
+        g_vfork_parent_result[i] = 0;
     }
     for (u64 i = 0; i < PIPE_MAX; i++) g_pipes[i].used = 0;
     for (u64 i = 0; i < SOCKET_REF_MAX; i++) {

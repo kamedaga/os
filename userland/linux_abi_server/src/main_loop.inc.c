@@ -36,7 +36,6 @@ void linux_abi_main(void) {
     struct ipc_message msg = reply(0, 0);
     for (;;) {
         g_abi_ctx = 0;
-        start_deferred_trap_targets();
         try_satisfy_pending_sigwaits();
         flush_deferred_pipe_wakes();
         if (msg.status != SYSCALL_OK) {
@@ -133,6 +132,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_LSEEK: msg = handle_lseek(req); break;
         case LINUX_SYS_ACCESS: msg = handle_access(req); break;
         case LINUX_SYS_FACCESSAT: msg = handle_faccessat(req); break;
+        case LINUX_SYS_FACCESSAT2: msg = handle_faccessat(req); break;
         case LINUX_SYS_GETCWD: msg = handle_getcwd(req); break;
         case LINUX_SYS_CHDIR: msg = handle_chdir(req); break;
         case LINUX_SYS_FCHDIR: msg = handle_fchdir(req); break;
@@ -181,6 +181,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_FUTEX: msg = handle_futex(req); break;
         case LINUX_SYS_IOCTL: msg = handle_ioctl(req); break;
         case LINUX_SYS_MADVISE: case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_FCHOWNAT: case LINUX_SYS_FCHMODAT: case LINUX_SYS_FALLOCATE: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_LISTXATTR: case LINUX_SYS_LLISTXATTR: case LINUX_SYS_FLISTXATTR: msg = reply(errno_opnotsupp(), 0); break;
         case LINUX_SYS_RENAMEAT2: msg = handle_renameat(req, 0, 1); break;
         case LINUX_SYS_SPLICE: case LINUX_SYS_EVENTFD2: msg = reply(errno_nosys(), 0); break;
         case LINUX_SYS_GETPID: msg = reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0); break;
@@ -212,23 +213,7 @@ void linux_abi_main(void) {
                 const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
                 const int process_exits = exit_group || !exiting_thread;
                 int satisfy_waiters_after_exit_reply = 0;
-                int skip_kernel_exit_reclaim = 0;
                 profile_trace_event_u64("exit.begin principal", exiting_principal);
-                if (g_root_linux_principal_set && (exiting_principal == g_root_linux_principal || exiting_pid == g_root_linux_principal)) {
-                    user_log("LinuxAbiServer: root exit nr=");
-                    user_log_dec_value(req->nr);
-                    user_log(" principal=");
-                    user_log_hex_value(exiting_principal);
-                    user_log("LinuxAbiServer: root exit pid=");
-                    user_log_hex_value(exiting_pid);
-                    user_log("LinuxAbiServer: root exit status=");
-                    user_log_hex_value(req->args[0] & 0xffu);
-                    user_log("LinuxAbiServer: root exit group=");
-                    user_log_dec_value(exit_group);
-                    user_log(" process=");
-                    user_log_dec_value(process_exits);
-                    user_log("\n");
-                }
                 if (exiting_proc) exiting_proc->exit_status = (u32)((req->args[0] & 0xffu) << 8);
                 if (exit_group && exiting_proc) {
                     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
@@ -255,13 +240,11 @@ void linux_abi_main(void) {
                     if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
                     profile_trace_event_u64("exit.close_fds pid", exiting_pid);
                     close_all_process_fds(g_proc);
-                    const u64 tracked_exit_pages = exiting_proc ? vm_tracked_page_count() : 0;
-                    const int tracked_unmap_ok = unmap_all_tracked_target_ranges();
-                    /* Large Linux VM spaces are cheaper to reclaim from the ABI server's tracked map. */
-                    skip_kernel_exit_reclaim = tracked_unmap_ok && tracked_exit_pages >= LINUX_EXIT_SKIP_RECLAIM_PAGE_THRESHOLD;
+                    (void)unmap_all_tracked_target_ranges();
                     satisfy_waiters_after_exit_reply = 1;
                 }
                 remove_futex_waiters_for_principal(exiting_principal);
+                reply_vfork_parent_if_any(exiting_proc);
                 if (exiting_proc) exiting_proc->used = 0;
                 prime_reply_return_signal();
                 if (satisfy_waiters_after_exit_reply) {
@@ -270,8 +253,7 @@ void linux_abi_main(void) {
                     try_satisfy_pending_sigwaits();
                 }
                 profile_trace_event_u64("exit.reply principal", exiting_principal);
-                const u64 exit_flags = TRAP_RESPONSE_FLAG_EXIT | (skip_kernel_exit_reclaim ? TRAP_RESPONSE_FLAG_SKIP_RECLAIM : 0);
-                msg = reply_current_token(0, exit_flags);
+                msg = reply_current_token(0, TRAP_RESPONSE_FLAG_EXIT);
                 (void)msg;
                 int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
                 if (!root_exited && g_root_linux_principal_set) {

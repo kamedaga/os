@@ -71,6 +71,56 @@ static void print_gateway_from_route(const char *route) {
     }
 }
 
+static const char *find_value(const char *text, const char *key, char *out, size_t cap) {
+    if (cap == 0) return "?";
+    const size_t key_len = strlen(key);
+    const char *line = text;
+    while (*line != 0) {
+        const char *next = strchr(line, '\n');
+        size_t len = next ? (size_t)(next - line) : strlen(line);
+        if (len > key_len && strncmp(line, key, key_len) == 0 && line[key_len] == '=') {
+            size_t value_len = len - key_len - 1;
+            if (value_len >= cap) value_len = cap - 1;
+            memcpy(out, line + key_len + 1, value_len);
+            out[value_len] = 0;
+            return out;
+        }
+        if (!next) break;
+        line = next + 1;
+    }
+    return "?";
+}
+
+static int print_fastfetch_mode(const char *mode) {
+    char cap[2048];
+    if (read_file("/proc/net/capabilityos", cap, sizeof(cap)) != 0) return 1;
+    char a[32], b[32], c[32], d[32], e[32];
+    if (strcmp(mode, "summary") == 0) {
+        printf("%s %s, ip %s, gw %s, dns %s\n",
+            find_value(cap, "link", a, sizeof(a)),
+            find_value(cap, "dhcp", b, sizeof(b)),
+            find_value(cap, "ip", c, sizeof(c)),
+            find_value(cap, "gateway", d, sizeof(d)),
+            find_value(cap, "dns", e, sizeof(e)));
+        return 0;
+    }
+    if (strcmp(mode, "io") == 0) {
+        printf("rx %s, tx %s\n",
+            find_value(cap, "rx_packets", a, sizeof(a)),
+            find_value(cap, "tx_completions", b, sizeof(b)));
+        return 0;
+    }
+    if (strcmp(mode, "tcp") == 0) {
+        printf("active %s, established %s, rx %s, tx %s\n",
+            find_value(cap, "tcp_active_connections", a, sizeof(a)),
+            find_value(cap, "tcp_established_connections", b, sizeof(b)),
+            find_value(cap, "tcp_rx_segments", c, sizeof(c)),
+            find_value(cap, "tcp_tx_segments", d, sizeof(d)));
+        return 0;
+    }
+    return 1;
+}
+
 static int print_capabilityos_status(void) {
     char cap[768];
     if (read_file("/proc/net/capabilityos", cap, sizeof(cap)) != 0) return -1;
@@ -95,7 +145,9 @@ static int print_capabilityos_status(void) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc >= 2) return print_fastfetch_mode(argv[1]);
+
     char dev[768];
     char route[768];
     const int cap_ok = print_capabilityos_status() == 0;

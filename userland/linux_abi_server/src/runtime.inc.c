@@ -45,6 +45,7 @@ static u64 syscall2(u64 nr, u64 a0, u64 a1) { u64 ret; __asm__ volatile("int $0x
 static u64 syscall3(u64 nr, u64 a0, u64 a1, u64 a2) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall4(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { u64 ret; __asm__ volatile("int $0x80" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3) : "r8", "r9", "r10", "r11", "memory"); return ret; }
 static u64 syscall4_r10(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3) { register u64 r10 __asm__("r10") = a3; u64 ret; __asm__ volatile("int $0x80" : "=a"(ret), "+r"(r10) : "a"(nr), "D"(a0), "S"(a1), "d"(a2) : "rcx", "r8", "r9", "r11", "memory"); return ret; }
+static u64 syscall5(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) { register u64 r8 __asm__("r8") = a4; u64 ret; __asm__ volatile("int $0x80" : "=a"(ret), "+r"(r8) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3) : "r9", "r10", "r11", "memory"); return ret; }
 static u64 detach_reply_token(void);
 static void process_exit(u64 code) { (void)syscall2(SYSCALL_PROCESS_EXIT, code, 0); for (;;) __asm__ volatile("pause"); }
 
@@ -434,11 +435,8 @@ static u64 errno_already(void) { return (u64)(i64)-114; }
 static u64 errno_inprogress(void) { return (u64)(i64)-115; }
 
 static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
-static u64 reserve_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_RESERVE_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 unmap_reply_target_pages(u64 target_va, u64 page_count) { return syscall2(SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count); }
-static u64 map_current_pages_to_reply_target(u64 source_va, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4(SYSCALL_MAP_CURRENT_PAGES_TO_ABI_TRAP_REPLY_TARGET, source_va, target_va, page_count, prot_bits); }
-static u64 cow_reply_target_page(u64 target_va, u64 prot_bits) { return syscall2(SYSCALL_COW_ABI_TRAP_REPLY_TARGET_PAGE, target_va, prot_bits); }
 static u64 map_vm_object_to_reply_target(u64 vm_token, u64 target_va, u64 prot_bits) {
     (void)vm_token;
     (void)target_va;
@@ -447,16 +445,61 @@ static u64 map_vm_object_to_reply_target(u64 vm_token, u64 target_va, u64 prot_b
 }
 static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
 static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
-static u64 copy_to_target_bulk(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET_BULK, target_va, (u64)src, len); }
+static u64 copy_from_trap_target(u64 principal, u64 target_va, void *dst, u64 len) { return syscall4_r10(SYSCALL_COPY_FROM_ABI_TRAP_TARGET, principal, (u64)dst, target_va, len); }
+static u64 copy_to_target_bulk(u64 target_va, const void *src, u64 len) {
+    const u8 *bytes = (const u8 *)src;
+    u64 copied = 0;
+    while (copied < len) {
+        u64 chunk = len - copied;
+        if (chunk > PAGE_BYTES) chunk = PAGE_BYTES;
+        const u64 n = copy_to_target(target_va + copied, bytes + copied, chunk);
+        if (n != chunk) return copied + n;
+        copied += chunk;
+    }
+    return copied;
+}
 static u64 copy_to_trap_target(u64 principal, u64 target_va, const void *src, u64 len) { return syscall4_r10(SYSCALL_COPY_TO_ABI_TRAP_TARGET, principal, target_va, (u64)src, len); }
 static u64 reply_trap_target(u64 principal, u64 result, u64 flags) { return syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, principal, result, flags); }
-static u64 start_trap_target(u64 principal) { return syscall1(SYSCALL_START_ABI_TRAP_TARGET, principal); }
+static u64 vfork_parent_for_principal(u64 principal) {
+    if (principal < LINUX_ABI_REQUEST_PAGE_COUNT && g_vfork_parent_principal[principal] != 0) return g_vfork_parent_principal[principal];
+    return 0;
+}
+static void set_vfork_parent_for_principal(u64 child_principal, u64 parent_principal, u64 result) {
+    if (child_principal >= LINUX_ABI_REQUEST_PAGE_COUNT) return;
+    g_vfork_parent_principal[child_principal] = parent_principal;
+    g_vfork_parent_result[child_principal] = result;
+}
+static void reply_vfork_parent_if_any(struct linux_process_state *proc) {
+    if (proc == 0) return;
+    u64 parent = proc->vfork_parent_principal;
+    u64 result = proc->vfork_parent_result;
+    if (parent == 0 && proc->principal < LINUX_ABI_REQUEST_PAGE_COUNT) {
+        parent = g_vfork_parent_principal[proc->principal];
+        result = g_vfork_parent_result[proc->principal];
+    }
+    if (parent == 0) return;
+    (void)reply_trap_target(parent, result, 0);
+    proc->vfork_parent_principal = 0;
+    proc->vfork_parent_result = 0;
+    if (proc->principal < LINUX_ABI_REQUEST_PAGE_COUNT) {
+        g_vfork_parent_principal[proc->principal] = 0;
+        g_vfork_parent_result[proc->principal] = 0;
+    }
+}
 static u64 set_trap_target_request_page(u64 principal, u64 request_page_va) { return syscall2(SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE, principal, request_page_va); }
 static u64 set_target_fs_base(u64 fs_base) { return syscall1(SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE, fs_base); }
-static u64 clone_reply_target(u64 child_stack, u64 tls) { return syscall2(SYSCALL_CLONE_ABI_TRAP_REPLY_TARGET, child_stack, tls); }
 static u64 detach_reply_token(void) { return syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN); }
-static u64 share_reply_target_pages_to_trap_target(u64 principal, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4_r10(SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET, principal, target_va, page_count, prot_bits); }
-static u64 unmap_trap_target_pages(u64 principal, u64 target_va, u64 page_count) { return syscall3(SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES, principal, target_va, page_count); }
+static u64 create_suspended_process(void) { return syscall1(SYSCALL_CREATE_SUSPENDED_PROCESS, 0); }
+static int is_process_builder_token(u64 token) { return (token & PROCESS_BUILDER_TOKEN_TAG) == PROCESS_BUILDER_TOKEN_TAG && (token & PROCESS_BUILDER_PROCESS_MASK) != 0; }
+static u64 process_builder_token_slot(u64 token) { return is_process_builder_token(token) ? (token & PROCESS_BUILDER_PROCESS_MASK) : 0; }
+static u64 alloc_map_pages_to_process(u64 token, u64 target_va, u64 page_count, u64 prot_bits) { return syscall5(SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS, token, target_va, page_count, prot_bits, 0); }
+static u64 copy_to_process(u64 token, u64 dest_va, u64 src_va, u64 byte_len) { return syscall4(SYSCALL_COPY_TO_PROCESS, token, dest_va, src_va, byte_len); }
+static u64 copy_from_process_to_process(u64 token, u64 source_process_slot, u64 dest_va, u64 src_va, u64 byte_len) { return syscall5(SYSCALL_COPY_FROM_PROCESS_TO_PROCESS, token, source_process_slot, dest_va, src_va, byte_len); }
+static u64 share_process_pages_to_process(u64 token, u64 source_process_slot, u64 target_va, u64 page_count, u64 prot_bits) { return syscall5(SYSCALL_SHARE_PROCESS_PAGES_TO_PROCESS, token, source_process_slot, target_va, page_count, prot_bits); }
+static u64 set_process_initial_context(u64 token, const struct abi_trap_user_context *ctx) { return syscall4(SYSCALL_SET_PROCESS_INITIAL_CONTEXT, token, ctx->rip, ctx->rsp, (u64)ctx); }
+static u64 set_process_abi_trap_delegate(u64 token, u64 endpoint_id, u64 target_process_slot, u64 flavor, u64 request_page_va) { return syscall5(SYSCALL_SET_PROCESS_ABI_TRAP_DELEGATE, token, endpoint_id, target_process_slot, flavor, request_page_va); }
+static u64 start_process(u64 token) { return syscall1(SYSCALL_START_PROCESS, token); }
+static void abort_process(u64 token) { if (is_process_builder_token(token)) (void)syscall1(SYSCALL_ABORT_PROCESS, token); }
 static u64 alloc_map_pages(u64 target_va, u64 page_count, u64 flags) { return syscall4(SYSCALL_ALLOC_MAP_PAGES, target_va, page_count, flags, 0); }
 static u64 map_page_anywhere(u64 paddr, u64 flags) { return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, flags); }
 static u64 alloc_map_pages_anywhere(u64 page_count, u64 flags, u64 out_paddr_list_addr) { return syscall3(SYSCALL_ALLOC_MAP_PAGES_ANYWHERE, page_count, flags, out_paddr_list_addr); }
@@ -474,11 +517,6 @@ static void exit_trap_target_no_wait(u64 principal) {
         user_log("LinuxAbiServer: explicit exit reply failed=");
         user_log_hex_value(status);
     }
-}
-
-static struct ipc_message exit_trap_target_and_wait(u64 principal) {
-    exit_trap_target_no_wait(principal);
-    return wait_ipc();
 }
 
 static u64 trap_request_page_for_principal(u64 principal) {
@@ -544,6 +582,19 @@ static int ensure_child_trap_request_page(u64 principal, u64 *request_va_out) {
     return 1;
 }
 
+static int ensure_child_trap_request_page_mapped(u64 principal, u64 *request_va_out) {
+    const u64 request_va = trap_request_page_for_principal(principal);
+    if (request_va == 0) return 0;
+    if (!g_request_page_mapped[principal]) {
+        const u64 status = alloc_map_pages(request_va, 1, 0x3);
+        if (status != SYSCALL_OK) return 0;
+        g_request_page_mapped[principal] = 1;
+    }
+    clear_page(request_va);
+    *request_va_out = request_va;
+    return 1;
+}
+
 static int copy_cstr_from_target(u64 target_va, char *dst, u64 cap) {
     if (target_va == 0 || cap == 0) return 0;
     u64 copied = 0;
@@ -557,6 +608,41 @@ static int copy_cstr_from_target(u64 target_va, char *dst, u64 cap) {
             if (dst[copied + i] == 0) return 1;
         }
         if (got != chunk) return 0;
+        copied += got;
+    }
+    dst[cap - 1] = 0;
+    return 0;
+}
+
+static int copy_cstr_from_trap_target(u64 principal, u64 target_va, char *dst, u64 cap) {
+    if (principal == 0 || target_va == 0 || cap == 0) return 0;
+    u64 copied = 0;
+    while (copied + 1 < cap) {
+        u64 chunk = min_u64(cap - 1 - copied, 64);
+        const u64 page_left = PAGE_BYTES - ((target_va + copied) & (PAGE_BYTES - 1));
+        chunk = min_u64(chunk, page_left);
+        const u64 got = copy_from_trap_target(principal, target_va + copied, dst + copied, chunk);
+        if (got == 0 || got > chunk) {
+            user_log("LinuxAbiServer: explicit target cstr copy failed principal=");
+            user_log_hex_value(principal);
+            user_log("LinuxAbiServer: explicit target cstr va=");
+            user_log_hex_value(target_va + copied);
+            user_log("LinuxAbiServer: explicit target cstr got=");
+            user_log_hex_value(got);
+            return 0;
+        }
+        for (u64 i = 0; i < got; i++) {
+            if (dst[copied + i] == 0) return 1;
+        }
+        if (got != chunk) {
+            user_log("LinuxAbiServer: explicit target cstr short principal=");
+            user_log_hex_value(principal);
+            user_log("LinuxAbiServer: explicit target cstr va=");
+            user_log_hex_value(target_va + copied);
+            user_log("LinuxAbiServer: explicit target cstr got=");
+            user_log_hex_value(got);
+            return 0;
+        }
         copied += got;
     }
     dst[cap - 1] = 0;
@@ -794,14 +880,6 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.cache.file_hits=", g_prof.file_cache_hits);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_misses=", g_prof.file_cache_misses);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_bytes=", g_prof.file_cache_fill_bytes);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_pages=", g_prof.file_cache_map_pages);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_faults=", g_prof.file_cache_cow_faults);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_considered=", g_prof.file_cache_cow_considered);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_candidates=", g_prof.file_cache_cow_candidates);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_skip_peers=", g_prof.file_cache_cow_skip_peers);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_skip_no_path=", g_prof.file_cache_cow_skip_no_path);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_skip_uncacheable=", g_prof.file_cache_cow_skip_uncacheable);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_cow_fallbacks=", g_prof.file_cache_cow_fallbacks);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_considered=", g_prof.file_vm_object_mmap_considered);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_candidates=", g_prof.file_vm_object_mmap_candidates);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_mapped=", g_prof.file_vm_object_mmap_mapped);
@@ -816,10 +894,6 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_slot=", g_prof.file_cache_fill_fail_slot);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_alloc=", g_prof.file_cache_fill_fail_alloc);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_fail_read=", g_prof.file_cache_fill_fail_read);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_unaligned=", g_prof.file_cache_map_fail_unaligned);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_fill=", g_prof.file_cache_map_fail_fill);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_range=", g_prof.file_cache_map_fail_range);
-    user_log_dec_line("LinuxAbiServer.perf.cache.file_map_fail_syscall=", g_prof.file_cache_map_fail_syscall);
     user_log_dec_line("LinuxAbiServer.perf.cache.path_hits=", g_prof.path_cache_hits);
     user_log_dec_line("LinuxAbiServer.perf.cache.path_misses=", g_prof.path_cache_misses);
     user_log_dec_line("LinuxAbiServer.perf.cache.open_hits=", g_prof.open_cache_hits);

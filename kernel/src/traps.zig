@@ -892,7 +892,6 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.c) u64 {
     const pf_cap = capability.issuePageFaultCapability(scheduler.currentUserPrincipal(), frame, cr2) orelse return 0;
     if (!h.kernel_state_ready.*) return 0;
     if (!capability.resolvePageFaultCapability(h.state, pf_cap) and
-        !abi_trap_runtime.resolveLazyAnonymousPageFault(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code) and
         !abi_trap_runtime.dispatchPageFaultDelegate(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code, frame))
     {
         return 0;

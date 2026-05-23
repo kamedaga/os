@@ -8,8 +8,10 @@ const user_copy = @import("../user_copy.zig");
 const boot_static = @import("../boot/main_static.zig");
 const boot_abi = @import("../boot/abi.zig");
 const process_factory = @import("../boot/process_factory.zig");
+const abi_root = @import("kernel_abi_root");
 
 const process_builder_abi = boot_abi.process_builder_abi;
+const trap_abi = abi_root.trap_abi;
 
 var state_ptr: *kernel.KernelState = undefined;
 var free_list_ptr: *kernel.FreePageList = undefined;
@@ -189,6 +191,65 @@ pub fn copyToProcess(caller: kernel.PrincipalId, token: u64, dest_va: u64, src_v
     return boot_static.syscall_ok;
 }
 
+pub fn copyFromProcessToProcess(
+    caller: kernel.PrincipalId,
+    token: u64,
+    source_process_slot: u64,
+    dest_va: u64,
+    src_va: u64,
+    byte_len: u64,
+) u64 {
+    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
+    const source = kernel.processPrincipalFromIndex(@intCast(source_process_slot)) orelse return boot_static.syscall_err_invalid;
+    if (byte_len > process_builder_abi.copy_to_process_max_bytes) return boot_static.syscall_err_invalid;
+    if (byte_len == 0) return boot_static.syscall_ok;
+
+    var buf: [512]u8 = undefined;
+    var copied: u64 = 0;
+    while (copied < byte_len) {
+        const remaining = byte_len - copied;
+        const chunk_len_u64 = if (remaining < buf.len) remaining else buf.len;
+        const chunk_len: usize = @intCast(chunk_len_u64);
+        const src_cur, const src_overflow = @addWithOverflow(src_va, copied);
+        if (src_overflow != 0) return boot_static.syscall_err_invalid;
+        const dest_cur, const dest_overflow = @addWithOverflow(dest_va, copied);
+        if (dest_overflow != 0) return boot_static.syscall_err_invalid;
+
+        const chunk = buf[0..chunk_len];
+        if (!user_copy.copyUserBytesFromVa(source, src_cur, chunk)) return boot_static.syscall_err_invalid;
+        if (!user_copy.copyBytesToUserVa(target, dest_cur, chunk)) return boot_static.syscall_err_map;
+        copied += chunk_len_u64;
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn shareProcessPagesToProcess(
+    caller: kernel.PrincipalId,
+    token: u64,
+    source_process_slot: u64,
+    target_va: u64,
+    page_count: u64,
+    prot_bits: u64,
+) u64 {
+    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
+    const source = kernel.processPrincipalFromIndex(@intCast(source_process_slot)) orelse return boot_static.syscall_err_invalid;
+    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
+    if (page_count == 0 or page_count > boot_static.syscall_batch_max_pages) return boot_static.syscall_err_invalid;
+
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const va = target_va + page_index * 4096;
+        const paddr = capability.lookupUserMappedPaddrForVa(source, va) orelse return boot_static.syscall_err_invalid;
+        if (!user_vm.mapUserLinearRegionWithProt(target, va, paddr, 4096, prot)) {
+            return boot_static.syscall_err_map;
+        }
+    }
+    return boot_static.syscall_ok;
+}
+
 pub fn mprotectSelf(caller: kernel.PrincipalId, target_va: u64, byte_len: u64, prot_bits: u64) u64 {
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
     if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
@@ -225,14 +286,52 @@ pub fn setAbiTrapDelegate(
     return boot_static.syscall_ok;
 }
 
-pub fn setInitialContext(caller: kernel.PrincipalId, token: u64, rip: u64, rsp: u64) u64 {
+fn sanitizeUserRflags(rflags: u64) u64 {
+    const clear_mask = (@as(u64, 3) << 12) | (@as(u64, 1) << 14) | (@as(u64, 1) << 16) | (@as(u64, 1) << 17);
+    return (rflags | boot_static.user_entry_rflags | @as(u64, 2)) & ~clear_mask;
+}
+
+fn applyInitialUserContext(target: kernel.PrincipalId, ctx: *scheduler.ThreadContext, user_context: trap_abi.UserContext) u64 {
+    if (user_context.rip == 0 or user_context.rsp == 0) return boot_static.syscall_err_invalid;
+    if (!capability.isUserCanonicalVa(user_context.rip) or !capability.isUserCanonicalVa(user_context.rsp)) return boot_static.syscall_err_invalid;
+    if (user_context.fs_base != 0 and !capability.isUserCanonicalVa(user_context.fs_base)) return boot_static.syscall_err_invalid;
+    _ = target;
+    ctx.frame.r15 = user_context.r15;
+    ctx.frame.r14 = user_context.r14;
+    ctx.frame.r13 = user_context.r13;
+    ctx.frame.r12 = user_context.r12;
+    ctx.frame.r11 = user_context.r11;
+    ctx.frame.r10 = user_context.r10;
+    ctx.frame.r9 = user_context.r9;
+    ctx.frame.r8 = user_context.r8;
+    ctx.frame.rbp = user_context.rbp;
+    ctx.frame.rdi = user_context.rdi;
+    ctx.frame.rsi = user_context.rsi;
+    ctx.frame.rdx = user_context.rdx;
+    ctx.frame.rcx = user_context.rcx;
+    ctx.frame.rbx = user_context.rbx;
+    ctx.frame.rax = user_context.rax;
+    ctx.frame.rip = user_context.rip;
+    ctx.frame.rflags = sanitizeUserRflags(user_context.rflags);
+    ctx.frame.rsp = user_context.rsp;
+    ctx.fs_base = user_context.fs_base;
+    return boot_static.syscall_ok;
+}
+
+pub fn setInitialContext(caller: kernel.PrincipalId, token: u64, rip: u64, rsp: u64, context_va: u64) u64 {
     if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
     const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
-    if (!capability.isUserCanonicalVa(rip)) return boot_static.syscall_err_invalid;
-    if (!capability.isUserCanonicalVa(rsp)) return boot_static.syscall_err_invalid;
     const thread_index = scheduler.threadSlotForPrincipal(target) orelse return boot_static.syscall_err_invalid;
     const ctx = scheduler.getThreadContext(thread_index) orelse return boot_static.syscall_err_invalid;
     if (!ctx.allocated or ctx.ready) return boot_static.syscall_err_invalid;
+    if (context_va != 0) {
+        var user_context: trap_abi.UserContext = .{};
+        const bytes = @as([*]u8, @ptrCast(&user_context))[0..@sizeOf(trap_abi.UserContext)];
+        if (!user_copy.copyUserBytesFromVa(caller, context_va, bytes)) return boot_static.syscall_err_invalid;
+        return applyInitialUserContext(target, ctx, user_context);
+    }
+    if (!capability.isUserCanonicalVa(rip)) return boot_static.syscall_err_invalid;
+    if (!capability.isUserCanonicalVa(rsp)) return boot_static.syscall_err_invalid;
     ctx.frame.rip = rip;
     ctx.frame.rsp = rsp;
     return boot_static.syscall_ok;
@@ -253,6 +352,8 @@ pub fn startProcess(caller: kernel.PrincipalId, token: u64) u64 {
     const slot = processSlot(target) orelse return boot_static.syscall_err_invalid;
     state_ptr.clearProcessBuilderSuspended(target) catch return boot_static.syscall_err_invalid;
     if (!scheduler.setThreadReady(thread_index, true)) return boot_static.syscall_err_not_ready;
+    scheduler.wakeAssignedApForRunnableThread(thread_index);
+    scheduler.preferIpcSwitchToThread(thread_index);
     return boot_abi.process_abi.encodeSpawnedProcess(slot, @intCast(thread_index));
 }
 

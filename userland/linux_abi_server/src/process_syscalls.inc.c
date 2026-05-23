@@ -202,29 +202,6 @@ static void log_wait_state_for_miss(u64 child_slot) {
     (void)child_slot;
 }
 
-static int defer_trap_target_start(u64 child_slot) {
-    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
-        if (g_deferred_start_used[i]) continue;
-        g_deferred_start_used[i] = 1;
-        g_deferred_start_principal[i] = child_slot;
-        return 1;
-    }
-    return 0;
-}
-
-static void start_deferred_trap_targets(void) {
-    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
-        if (!g_deferred_start_used[i]) continue;
-        const u64 child_slot = g_deferred_start_principal[i];
-        g_deferred_start_used[i] = 0;
-        const u64 status = start_trap_target(child_slot);
-        if (status != SYSCALL_OK) {
-            user_log("LinuxAbiServer: deferred start failed=");
-            user_log_hex_value(status);
-        }
-    }
-}
-
 static void copy_process_state_for_fork_impl(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal, int ref_pipe_fds) {
     child->used = 1;
     child->exec_pending = 0;
@@ -308,6 +285,240 @@ static int supported_clone_thread_flags(u64 flags) {
     return 1;
 }
 
+static int supported_clone_process_flags(u64 flags) {
+    const u64 signal = flags & 0xffu;
+    const u64 supported = (u64)CLONE_VM | CLONE_VFORK | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED;
+    if (signal != SIGCHLD && signal != 0) return 0;
+    if ((flags & ~(supported | (u64)0xff)) != 0) return 0;
+    return 1;
+}
+
+static int materialize_lazy_file_range(u64 start, u64 size, u64 prot);
+
+static u16 read_le16(const u8 *bytes, u64 off) {
+    return (u16)bytes[off] | ((u16)bytes[off + 1] << 8);
+}
+
+static u32 read_le32(const u8 *bytes, u64 off) {
+    return (u32)bytes[off] |
+        ((u32)bytes[off + 1] << 8) |
+        ((u32)bytes[off + 2] << 16) |
+        ((u32)bytes[off + 3] << 24);
+}
+
+static u64 read_le64(const u8 *bytes, u64 off) {
+    u64 value = 0;
+    for (u64 i = 0; i < 8; i++) value |= (u64)bytes[off + i] << (i * 8);
+    return value;
+}
+
+static int materialize_all_spawn_regions(void) {
+    for (;;) {
+        int found = 0;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || !g_regions[i].file_lazy) continue;
+            found = 1;
+            if (!materialize_lazy_file_range(g_regions[i].start, g_regions[i].size, g_regions[i].prot)) return 0;
+            break;
+        }
+        if (!found) return 1;
+    }
+}
+
+static int copy_source_page_to_process(u64 process_token, u64 source_process_slot, u64 va, u64 prot) {
+    const u64 map_status = alloc_map_pages_to_process(process_token, va, 1, prot);
+    if (map_status != SYSCALL_OK && map_status != SYSCALL_ERR_MAP) {
+        user_log("LinuxAbiServer: clone map page failed va=");
+        user_log_hex_value(va);
+        user_log("LinuxAbiServer: clone map status=");
+        user_log_hex_value(map_status);
+        return 0;
+    }
+    const u64 copy_status = copy_from_process_to_process(process_token, source_process_slot, va, va, PAGE_BYTES);
+    if (copy_status == SYSCALL_OK) return 1;
+
+    u8 page[PAGE_BYTES];
+    u64 copied = 0;
+    while (copied < PAGE_BYTES) {
+        const u64 chunk = 512;
+        if (copy_from_target(va + copied, page + copied, chunk) != chunk) break;
+        copied += chunk;
+    }
+    if (copied == PAGE_BYTES && copy_to_process(process_token, va, (u64)page, PAGE_BYTES) == SYSCALL_OK) {
+        user_log("LinuxAbiServer: clone process copy fallback va=");
+        user_log_hex_value(va);
+        return 1;
+    }
+
+    user_log("LinuxAbiServer: clone process copy failed va=");
+    user_log_hex_value(va);
+    user_log("LinuxAbiServer: clone process copy status=");
+    user_log_hex_value(copy_status);
+    user_log("LinuxAbiServer: clone process copy source=");
+    user_log_hex_value(source_process_slot);
+    return 0;
+}
+
+static int copy_present_pages_to_process(u64 process_token, u64 source_process_slot, u64 start, u64 end, u64 prot) {
+    for (u64 va = start; va < end; va += PAGE_BYTES) {
+        u8 probe[16];
+        if (copy_from_target(va, probe, sizeof(probe)) != sizeof(probe)) continue;
+        if (!copy_source_page_to_process(process_token, source_process_slot, va, prot)) return 0;
+    }
+    return 1;
+}
+
+static int share_present_pages_to_process(u64 process_token, u64 source_process_slot, u64 start, u64 end, u64 prot) {
+    for (u64 va = start; va < end; va += PAGE_BYTES) {
+        u8 probe[16];
+        if (copy_from_target(va, probe, sizeof(probe)) != sizeof(probe)) continue;
+        const u64 status = share_process_pages_to_process(process_token, source_process_slot, va, 1, prot);
+        if (status != SYSCALL_OK && status != SYSCALL_ERR_MAP) {
+            user_log("LinuxAbiServer: clone share page failed va=");
+            user_log_hex_value(va);
+            user_log("LinuxAbiServer: clone share status=");
+            user_log_hex_value(status);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int copy_elf_image_pages_to_process(u64 process_token, u64 source_process_slot, u64 base, u64 *next_base_out) {
+    enum { PT_LOAD = 1, PF_X = 1, PF_W = 2 };
+    u8 ehdr[64];
+    *next_base_out = 0;
+    if (copy_from_target(base, ehdr, sizeof(ehdr)) != sizeof(ehdr)) return 1;
+    if (ehdr[0] != 0x7f || ehdr[1] != 'E' || ehdr[2] != 'L' || ehdr[3] != 'F') return 1;
+    if (ehdr[4] != 2 || ehdr[5] != 1 || ehdr[6] != 1) return 0;
+    const u64 phoff = read_le64(ehdr, 32);
+    const u16 phentsize = read_le16(ehdr, 54);
+    const u16 phnum = read_le16(ehdr, 56);
+    if (phentsize < 56 || phnum > 64) return 0;
+
+    u64 image_end = base;
+    u64 max_align = PAGE_BYTES;
+    for (u64 i = 0; i < phnum; i++) {
+        u8 phdr[56];
+        if (copy_from_target(base + phoff + i * phentsize, phdr, sizeof(phdr)) != sizeof(phdr)) return 0;
+        if (read_le32(phdr, 0) != PT_LOAD) continue;
+        const u32 flags = read_le32(phdr, 4);
+        const u64 vaddr = read_le64(phdr, 16);
+        const u64 memsz = read_le64(phdr, 40);
+        const u64 align = read_le64(phdr, 48);
+        if (memsz == 0) continue;
+        if (align > max_align) max_align = align;
+        const u64 seg_start = base + (vaddr & ~(u64)(PAGE_BYTES - 1));
+        const u64 seg_end = align_up(base + vaddr + memsz, PAGE_BYTES);
+        if (seg_end > image_end) image_end = seg_end;
+        u64 prot = 0x1;
+        if ((flags & PF_W) != 0) {
+            prot |= 0x2;
+        } else if ((flags & PF_X) != 0) {
+            prot |= 0x4;
+        }
+        if (!copy_present_pages_to_process(process_token, source_process_slot, seg_start, seg_end, prot)) return 0;
+    }
+    *next_base_out = align_up(image_end, max_align);
+    return 1;
+}
+
+static int copy_loaded_elf_images_to_process(u64 process_token, u64 source_process_slot) {
+    u64 base = 0x20000000ULL;
+    for (u64 i = 0; i < 4 && base < 0x24000000ULL; i++) {
+        u64 next_base = 0;
+        if (!copy_elf_image_pages_to_process(process_token, source_process_slot, base, &next_base)) return 0;
+        if (next_base <= base) break;
+        base = next_base;
+    }
+    return 1;
+}
+
+static int copy_current_vm_to_process(u64 process_token, u64 source_process_slot, u64 parent_rsp, u64 child_rsp, int share_vm) {
+    if (!materialize_all_spawn_regions()) return 0;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+        const u64 start = g_regions[i].start;
+        const u64 page_count = align_up(g_regions[i].size, PAGE_BYTES) / PAGE_BYTES;
+        if (share_vm) {
+            if (!share_present_pages_to_process(process_token, source_process_slot, start, start + page_count * PAGE_BYTES, g_regions[i].prot)) return 0;
+            continue;
+        }
+        u64 mapped = 0;
+        while (mapped < page_count) {
+            const u64 batch = min_u64(page_count - mapped, 64);
+            if (alloc_map_pages_to_process(process_token, start + mapped * PAGE_BYTES, batch, g_regions[i].prot) != SYSCALL_OK) return 0;
+            mapped += batch;
+        }
+        for (u64 page_index = 0; page_index < page_count; page_index++) {
+            const u64 va = start + page_index * PAGE_BYTES;
+            if (!copy_source_page_to_process(process_token, source_process_slot, va, g_regions[i].prot)) return 0;
+        }
+    }
+    if (share_vm) {
+        if (!share_present_pages_to_process(process_token, source_process_slot, 0x20000000ULL, 0x24000000ULL, 0x3)) return 0;
+    } else {
+        if (!copy_present_pages_to_process(process_token, source_process_slot, 0x20000000ULL, 0x20800000ULL, 0x3)) return 0;
+        if (!copy_loaded_elf_images_to_process(process_token, source_process_slot)) return 0;
+    }
+    const u64 parent_stack_page = parent_rsp & ~(u64)(PAGE_BYTES - 1);
+    const u64 parent_stack_start = parent_stack_page > 0x200000 ? parent_stack_page - 0x200000 : 0;
+    if (share_vm) {
+        if (!share_present_pages_to_process(process_token, source_process_slot, parent_stack_start, parent_stack_page + 0x200000, 0x3)) return 0;
+    } else if (!copy_present_pages_to_process(process_token, source_process_slot, parent_stack_start, parent_stack_page + 0x200000, 0x3)) return 0;
+    if (child_rsp != 0) {
+        const u64 child_stack_page = child_rsp & ~(u64)(PAGE_BYTES - 1);
+        const u64 child_stack_start = child_stack_page > 0x200000 ? child_stack_page - 0x200000 : 0;
+        if (share_vm) {
+            if (!share_present_pages_to_process(process_token, source_process_slot, child_stack_start, child_stack_page + 0x200000, 0x3)) return 0;
+        } else if (!copy_present_pages_to_process(process_token, source_process_slot, child_stack_start, child_stack_page + 0x200000, 0x3)) return 0;
+    }
+    return 1;
+}
+
+struct abi_child_spawn {
+    u64 token;
+    u64 slot;
+};
+
+static struct abi_child_spawn prepare_abi_child_from_request(const struct trap_request *req, u64 child_rsp, u64 child_fs_base, int share_vm) {
+    struct abi_child_spawn failed = {0, 0};
+    const u64 process_token = create_suspended_process();
+    const u64 token_slot = process_builder_token_slot(process_token);
+    if (token_slot == 0) return failed;
+
+    u64 request_va = 0;
+    if (!ensure_child_trap_request_page_mapped(token_slot, &request_va)) {
+        abort_process(process_token);
+        return failed;
+    }
+    if (set_process_abi_trap_delegate(process_token, LINUX_ABI_ENDPOINT_ID, syscall0(SYSCALL_GET_PROCESS_SLOT), 1, request_va) != SYSCALL_OK) {
+        abort_process(process_token);
+        return failed;
+    }
+    if (!copy_current_vm_to_process(process_token, req->caller_principal, req->rsp, child_rsp, share_vm)) {
+        abort_process(process_token);
+        return failed;
+    }
+
+    struct abi_trap_user_context ctx;
+    fill_user_context_from_request(&ctx, req, 0);
+    if (child_rsp != 0) ctx.rsp = child_rsp;
+    if (child_fs_base != 0) ctx.fs_base = child_fs_base;
+    if (set_process_initial_context(process_token, &ctx) != SYSCALL_OK) {
+        abort_process(process_token);
+        return failed;
+    }
+    struct abi_child_spawn spawn = {process_token, token_slot};
+    return spawn;
+}
+
+static int start_prepared_abi_child(struct abi_child_spawn spawn) {
+    if (spawn.token == 0 || spawn.slot == 0) return 0;
+    const u64 started = decode_spawned_process_slot(start_process(spawn.token));
+    return started == spawn.slot;
+}
+
 static struct ipc_message handle_clone_thread(const struct trap_request *req) {
     const u64 flags = req->args[0];
     const u64 child_stack = req->args[1];
@@ -316,32 +527,27 @@ static struct ipc_message handle_clone_thread(const struct trap_request *req) {
     const u64 tls = req->args[4];
     if (child_stack == 0 || tls == 0 || !supported_clone_thread_flags(flags)) return reply(errno_inval(), 0);
 
-    const u64 spawned = clone_reply_target(child_stack, tls);
-    const u64 child_slot = decode_spawned_process_slot(spawned);
+    struct abi_child_spawn spawn = prepare_abi_child_from_request(req, child_stack, tls, 1);
+    const u64 child_slot = spawn.slot;
     if (child_slot == 0) {
         user_log("LinuxAbiServer: clone thread spawn failed\n");
-        user_log_hex_value(spawned);
         return reply(errno_busy(), 0);
     }
     struct linux_process_state *child = alloc_process_state_for_new_principal(child_slot);
     if (!child) {
         user_log("LinuxAbiServer: clone thread state failed\n");
         user_log_hex_value(child_slot);
+        abort_process(spawn.token);
         return reply(errno_busy(), 0);
     }
-    u64 child_request_va = 0;
-    if (!ensure_child_trap_request_page(child_slot, &child_request_va)) {
-        user_log("LinuxAbiServer: clone thread request page failed\n");
-        user_log_hex_value(child_slot);
-        return reply(errno_busy(), 0);
-    }
-
     copy_process_state_for_clone_thread(child, g_proc, child_slot, (flags & CLONE_CHILD_CLEARTID) != 0 ? child_tidptr : 0);
     const u32 child_tid32 = (u32)child_slot;
     if ((flags & CLONE_PARENT_SETTID) != 0 && parent_tidptr != 0) {
         if (copy_to_target(parent_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) {
             user_log("LinuxAbiServer: clone parent_tid write failed\n");
             user_log_hex_value(parent_tidptr);
+            abort_process(spawn.token);
+            child->used = 0;
             return reply(errno_fault(), 0);
         }
     }
@@ -349,12 +555,16 @@ static struct ipc_message handle_clone_thread(const struct trap_request *req) {
         if (copy_to_trap_target(child_slot, child_tidptr, &child_tid32, sizeof(child_tid32)) != sizeof(child_tid32)) {
             user_log("LinuxAbiServer: clone child_tid write failed\n");
             user_log_hex_value(child_tidptr);
+            abort_process(spawn.token);
+            child->used = 0;
             return reply(errno_fault(), 0);
         }
     }
-    if (!defer_trap_target_start(child_slot)) {
-        user_log("LinuxAbiServer: clone thread defer start failed\n");
+    if (!start_prepared_abi_child(spawn)) {
+        user_log("LinuxAbiServer: clone thread start failed\n");
         user_log_hex_value(child_slot);
+        abort_process(spawn.token);
+        child->used = 0;
         return reply(errno_busy(), 0);
     }
     prime_reply_return_signal();
@@ -362,29 +572,67 @@ static struct ipc_message handle_clone_thread(const struct trap_request *req) {
 }
 
 static struct ipc_message handle_fork_like(const struct trap_request *req, int clone_form) {
+    u64 child_stack = 0;
+    u64 parent_tidptr = 0;
+    u64 child_tidptr = 0;
+    u64 flags = SIGCHLD;
     if (clone_form) {
-        const u64 flags = req->args[0];
-        const u64 child_stack = req->args[1];
+        flags = req->args[0];
+        child_stack = req->args[1];
+        parent_tidptr = req->args[2];
+        child_tidptr = req->args[3];
         if ((flags & CLONE_THREAD) != 0) return handle_clone_thread(req);
-        if (child_stack != 0) return reply(errno_inval(), 0);
-        if ((flags & ~(u64)0xff) != 0) return reply(errno_inval(), 0);
-        if ((flags & 0xff) != SIGCHLD && (flags & 0xff) != 0) return reply(errno_inval(), 0);
+        if (!supported_clone_process_flags(flags)) return reply(errno_inval(), 0);
     }
-    const u64 spawned = syscall0(SYSCALL_FORK_ABI_TRAP_REPLY_TARGET);
-    const u64 child_slot = decode_spawned_process_slot(spawned);
+    const int share_vm = clone_form && (flags & CLONE_VM) != 0;
+    struct abi_child_spawn spawn = prepare_abi_child_from_request(req, child_stack, 0, share_vm);
+    const u64 child_slot = spawn.slot;
     if (child_slot == 0) return reply(errno_busy(), 0);
     const u64 child_pid = alloc_linux_pid();
-    if (child_pid == 0) return reply(errno_busy(), 0);
+    if (child_pid == 0) {
+        abort_process(spawn.token);
+        return reply(errno_busy(), 0);
+    }
     discard_process_exit_records(child_pid);
     remove_child_slot(g_proc, child_pid);
     struct linux_process_state *child = alloc_process_state_for_new_principal(child_slot);
-    if (!child) return reply(errno_busy(), 0);
-    u64 child_request_va = 0;
-    if (!ensure_child_trap_request_page(child_slot, &child_request_va)) return reply(errno_busy(), 0);
+    if (!child) {
+        abort_process(spawn.token);
+        return reply(errno_busy(), 0);
+    }
     copy_process_state_for_fork(child, g_proc, child_pid);
     child->principal = child_slot;
+    if (clone_form && (flags & CLONE_CHILD_CLEARTID) != 0) child->clear_child_tid = child_tidptr;
+    if (clone_form && (flags & CLONE_VFORK) != 0) {
+        child->vfork_parent_principal = req->caller_principal;
+        child->vfork_parent_result = child_pid;
+        set_vfork_parent_for_principal(child_slot, req->caller_principal, child_pid);
+    }
     (void)add_child_slot(g_proc, child_pid);
-    if (!defer_trap_target_start(child_slot)) return reply(errno_busy(), 0);
+    const u32 child_pid32 = (u32)child_pid;
+    if (clone_form && (flags & CLONE_PARENT_SETTID) != 0 && parent_tidptr != 0) {
+        if (copy_to_target(parent_tidptr, &child_pid32, sizeof(child_pid32)) != sizeof(child_pid32)) {
+            abort_process(spawn.token);
+            remove_child_slot(g_proc, child_pid);
+            child->used = 0;
+            return reply(errno_fault(), 0);
+        }
+    }
+    if (clone_form && (flags & CLONE_CHILD_SETTID) != 0 && child_tidptr != 0) {
+        if (copy_to_trap_target(child_slot, child_tidptr, &child_pid32, sizeof(child_pid32)) != sizeof(child_pid32)) {
+            abort_process(spawn.token);
+            remove_child_slot(g_proc, child_pid);
+            child->used = 0;
+            return reply(errno_fault(), 0);
+        }
+    }
+    if (!start_prepared_abi_child(spawn)) {
+        abort_process(spawn.token);
+        remove_child_slot(g_proc, child_pid);
+        child->used = 0;
+        return reply(errno_busy(), 0);
+    }
+    if (clone_form && (flags & CLONE_VFORK) != 0) return wait_ipc();
     return reply(child_pid, 0);
 }
 

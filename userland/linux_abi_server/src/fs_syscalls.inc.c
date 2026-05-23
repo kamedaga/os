@@ -16,6 +16,14 @@ static void fill_linux_stat_path(struct linux_stat *st, const struct fs_stat_rec
     st->st_dev = 1;
     st->st_ino = linux_ino_from_path(path);
 }
+static void fill_linux_pipe_stat(struct linux_stat *st, u64 fd) {
+    u8 *p = (u8 *)st; for (u64 i = 0; i < sizeof(*st); i++) p[i] = 0;
+    st->st_dev = 1;
+    st->st_ino = 0x200000ULL + fd;
+    st->st_nlink = 1;
+    st->st_mode = 0010000 | 0600;
+    st->st_blksize = 4096;
+}
 static void fill_linux_statfs(struct linux_statfs *st) {
     u8 *p = (u8 *)st; for (u64 i = 0; i < sizeof(*st); i++) p[i] = 0;
     st->f_type = 0x4d44;
@@ -594,7 +602,22 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
         struct pipe_entry *pipe = &g_pipes[pipe_id];
-        if (pipe->len == 0) return reply((pipe->write_refs != 0 || pipe_has_live_writer(pipe_id)) ? errno_again() : 0, 0);
+        if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
+            if (pipe->pending_read) return reply(errno_again(), 0);
+            for (u64 i = 0; i < iovcnt; i++) {
+                u64 pair[2];
+                if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
+                if (pair[1] == 0) continue;
+                pipe->pending_read = 1;
+                pipe->pending_principal = req->caller_principal;
+                pipe->pending_dst = pair[0];
+                pipe->pending_len = pair[1];
+                detach_reply_token();
+                return wait_ipc();
+            }
+            return reply(0, 0);
+        }
+        if (pipe->len == 0) return reply(0, 0);
         for (u64 i = 0; i < iovcnt; i++) {
             u64 pair[2];
             if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
@@ -835,6 +858,11 @@ static struct ipc_message handle_fsync_like(const struct trap_request *req) {
 
 static struct ipc_message handle_fstat(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 stat_va = req->args[1]; if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    if (fd_is_pipe(fd)) {
+        struct linux_stat st;
+        fill_linux_pipe_stat(&st, fd);
+        return copy_to_target(stat_va, &st, sizeof(st)) == sizeof(st) ? reply(0, 0) : reply(errno_fault(), 0);
+    }
     struct fs_stat_record rec; rec.object_kind = g_fds[fd].object_kind; rec.size_bytes = g_fds[fd].size; rec.mode_bits = g_fds[fd].mode_bits; rec.mtime_unix_sec = 0;
     if (g_fds[fd].kind == FD_STDIO || g_fds[fd].kind == FD_TTY || g_fds[fd].kind == FD_RANDOM) { rec.object_kind = FS_OBJECT_FILE; rec.size_bytes = 0; rec.mode_bits = FS_FILE_MODE; }
     struct linux_stat st;
