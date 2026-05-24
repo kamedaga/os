@@ -108,12 +108,12 @@ pub fn tryCreateUserProcess(
         log_util.logPrefixedLabelMessage("ensureProcessDescriptor failed for ", role_label, "");
         return error.CreateFailed;
     }
-    const user_page = state.allocPageTo(principal, free_list) catch |err| {
-        log_util.logLabelStepError("allocPageTo for ", role_label, " user map failed", err);
+    const user_page = state.allocLowPageTo(principal, free_list) catch |err| {
+        log_util.logLabelStepError("allocLowPageTo for ", role_label, " user map failed", err);
         return error.CreateFailed;
     };
-    const user_stack_page = state.allocPageTo(principal, free_list) catch |err| {
-        log_util.logLabelStepError("allocPageTo for ", role_label, " user stack failed", err);
+    const user_stack_page = state.allocLowPageTo(principal, free_list) catch |err| {
+        log_util.logLabelStepError("allocLowPageTo for ", role_label, " user stack failed", err);
         return error.CreateFailed;
     };
     if (!buildUserAddressSpaceFromCapabilities(state, principal, user_page, user_stack_page)) {

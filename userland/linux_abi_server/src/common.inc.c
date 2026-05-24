@@ -482,7 +482,7 @@ enum {
     VM_RIGHT_READ_MAP = 0x5,
     VM_RIGHT_READ_MAP_GRANT = 0xD,
     EXEC_BOOTSTRAP_MAGIC = 0x45584543424F4F54ULL,
-    EXEC_BOOTSTRAP_VERSION = 2,
+    EXEC_BOOTSTRAP_VERSION = 3,
     EXEC_BOOTSTRAP_FLAG_SERVICE_MODE = 1ULL << 0,
     EXEC_LAUNCH_ENDPOINT_ID = 0x93,
     EXEC_LAUNCH_REQUEST_MAGIC = 0x4558454353565251ULL,
@@ -494,14 +494,14 @@ enum {
     EXEC_LAUNCH_STATUS_OK = 0,
     EXEC_LAUNCH_STATUS_START_FAILED = 4,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
-    LINUX_ABI_BOOTSTRAP_VERSION = 2,
+    LINUX_ABI_BOOTSTRAP_VERSION = 3,
     LINUX_ABI_BOOTSTRAP_READY = 0x4C414249524459ULL,
     EXEC_BOOTSTRAP_TARGET_VA = 0x3C002000,
     LINUX_ABI_CONFIG_TARGET_VA = 0x3C002000,
     LINUX_ABI_ENDPOINT_ID = 0x90,
     LINUX_ABI_SELF_WAKE_ENDPOINT_ID = 0x91,
     LINUX_ABI_READY_ENDPOINT_ID = 0x94,
-    EXECVE_MAIN_IMAGE_VA = 0x14000000,
+    EXECVE_MAIN_IMAGE_VA = 0x60000000,
     EXECVE_LD_IMAGE_VA = 0x26200000,
     EXECVE_CONFIG_VA = 0x26400000,
     EXECVE_TABLE_VA = 0x26401000,
@@ -513,7 +513,15 @@ enum {
     FILE_CACHE_BASE_VA = 0x28000000,
     FILE_CACHE_BYTES = 640 * 1024 * 1024,
     FILE_CACHE_MAX = 64,
-    LINUX_MMAP_BASE_VA = 0x26800000,
+    USER_LAYOUT_DEFAULT_LOW_VA = 0x20000000,
+    USER_LAYOUT_DEFAULT_TOP_VA = 0x800000000000ULL,
+    USER_LAYOUT_CANONICAL_TOP_VA = 0x800000000000ULL,
+    USER_LAYOUT_DEFAULT_DYNAMIC_MAP_BASE_VA = 0x23000000,
+    USER_LAYOUT_DEFAULT_DYNAMIC_MAP_END_VA = 0x3C000000,
+    USER_LAYOUT_DEFAULT_ET_DYN_BASE_VA = 0x20000000,
+    USER_LAYOUT_DEFAULT_STACK_TOP_VA = 0x3C000000,
+    USER_LAYOUT_DEFAULT_STACK_PAGES = 128,
+    LINUX_MMAP_BASE_VA = 0x700000000000ULL,
     LINUX_BRK_INITIAL_VA = 0x3B000000,
     LINUX_ENABLE_FILE_VM_OBJECT_MMAP = 1,
     LINUX_FILE_VM_OBJECT_MAX_PAGES = 4096,
@@ -1116,6 +1124,15 @@ struct exec_bootstrap_config {
     u16 argv_offsets[EXECVE_MAX_ARGV]; u16 argv_bytes[EXECVE_MAX_ARGV];
     u16 envp_offsets[EXECVE_MAX_ENVP]; u16 envp_bytes[EXECVE_MAX_ENVP];
     u8 arg_data[EXECVE_MAX_ARG_DATA_BYTES];
+    u64 user_low_va;
+    u64 user_top_va;
+    u64 dynamic_map_base_va;
+    u64 dynamic_map_end_va;
+    u64 et_dyn_base_va;
+    u64 stack_top_va;
+    u64 stack_page_count;
+    u64 mmap_base_va;
+    u64 brk_initial_va;
 };
 struct exec_launch_request {
     u64 magic;
@@ -1154,7 +1171,23 @@ struct linux_abi_bootstrap_config {
     char exec_path[128];
     u64 ready_endpoint_id;
     u64 ready_process_slot;
+    u64 user_low_va;
+    u64 user_top_va;
+    u64 dynamic_map_base_va;
+    u64 dynamic_map_end_va;
+    u64 et_dyn_base_va;
+    u64 stack_top_va;
+    u64 stack_page_count;
+    u64 mmap_base_va;
+    u64 brk_initial_va;
 };
+
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, arg_data) == 228, "exec cfg arg data offset");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, user_low_va) == 2280, "exec cfg layout offset");
+_Static_assert(sizeof(struct exec_bootstrap_config) == 2352, "exec cfg size");
+_Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, exec_path) == 64, "linux abi cfg exec path offset");
+_Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, user_low_va) == 208, "linux abi cfg layout offset");
+_Static_assert(sizeof(struct linux_abi_bootstrap_config) == 280, "linux abi cfg size");
 
 enum { LINUX_SYSCALL_PROFILE_COUNT = 335, FS_PROFILE_OP_COUNT = 33, NET_PROFILE_OP_COUNT = 12, NET_WAIT_CONTEXT_COUNT = 8 };
 enum {
@@ -1351,6 +1384,106 @@ static u64 g_root_linux_principal = 0;
 static int g_root_linux_principal_set = 0;
 static char g_exec_path[FS_MAX_PATH_BYTES + 1];
 static u16 g_exec_path_len = 0;
+static u64 g_user_low_va = USER_LAYOUT_DEFAULT_LOW_VA;
+static u64 g_user_top_va = USER_LAYOUT_DEFAULT_TOP_VA;
+static u64 g_dynamic_map_base_va = USER_LAYOUT_DEFAULT_DYNAMIC_MAP_BASE_VA;
+static u64 g_dynamic_map_end_va = USER_LAYOUT_DEFAULT_DYNAMIC_MAP_END_VA;
+static u64 g_et_dyn_base_va = USER_LAYOUT_DEFAULT_ET_DYN_BASE_VA;
+static u64 g_stack_top_va = USER_LAYOUT_DEFAULT_STACK_TOP_VA;
+static u64 g_stack_page_count = USER_LAYOUT_DEFAULT_STACK_PAGES;
+static u64 g_mmap_base_va = LINUX_MMAP_BASE_VA;
+static u64 g_brk_initial_va = LINUX_BRK_INITIAL_VA;
+
+static u64 layout_value_or_default(u64 value, u64 fallback) {
+    return value != 0 ? value : fallback;
+}
+
+static int u64_add_overflows(u64 a, u64 b, u64 *out) {
+    *out = a + b;
+    return *out < a;
+}
+
+static int layout_page_aligned(u64 value) {
+    return (value & (PAGE_BYTES - 1)) == 0;
+}
+
+static int layout_range_valid(u64 low, u64 top, u64 start, u64 size) {
+    u64 end = 0;
+    if (size == 0) return 0;
+    if (!layout_page_aligned(start) || !layout_page_aligned(size)) return 0;
+    if (u64_add_overflows(start, size, &end)) return 0;
+    return start >= low && end <= top;
+}
+
+static int linux_abi_layout_values_valid(
+    u64 user_low,
+    u64 user_top,
+    u64 dynamic_base,
+    u64 dynamic_end,
+    u64 et_dyn_base,
+    u64 stack_top,
+    u64 stack_pages,
+    u64 mmap_base,
+    u64 brk_initial
+) {
+    if (!layout_page_aligned(user_low) || !layout_page_aligned(user_top)) return 0;
+    if (user_low >= user_top || user_top > USER_LAYOUT_CANONICAL_TOP_VA) return 0;
+    if (!layout_page_aligned(dynamic_base) || !layout_page_aligned(dynamic_end)) return 0;
+    if (dynamic_base >= dynamic_end || dynamic_base < user_low || dynamic_end > user_top) return 0;
+    if (!layout_page_aligned(et_dyn_base) || et_dyn_base < user_low || et_dyn_base >= user_top) return 0;
+    if (!layout_page_aligned(stack_top) || stack_pages == 0) return 0;
+    if (stack_pages > (((u64)1 << 32) / PAGE_BYTES)) return 0;
+    const u64 stack_bytes = stack_pages * PAGE_BYTES;
+    if (stack_top < stack_bytes) return 0;
+    if (!layout_range_valid(user_low, user_top, stack_top - stack_bytes, stack_bytes)) return 0;
+    if (!layout_page_aligned(mmap_base) || mmap_base < user_low || mmap_base >= user_top) return 0;
+    if (!layout_page_aligned(brk_initial) || brk_initial < user_low || brk_initial >= user_top) return 0;
+    return 1;
+}
+
+static void apply_linux_abi_layout_config(volatile const struct linux_abi_bootstrap_config *cfg) {
+    u64 user_low = layout_value_or_default(cfg->user_low_va, USER_LAYOUT_DEFAULT_LOW_VA);
+    u64 user_top = layout_value_or_default(cfg->user_top_va, USER_LAYOUT_DEFAULT_TOP_VA);
+    u64 dynamic_base = layout_value_or_default(cfg->dynamic_map_base_va, USER_LAYOUT_DEFAULT_DYNAMIC_MAP_BASE_VA);
+    u64 dynamic_end = layout_value_or_default(cfg->dynamic_map_end_va, USER_LAYOUT_DEFAULT_DYNAMIC_MAP_END_VA);
+    u64 et_dyn_base = layout_value_or_default(cfg->et_dyn_base_va, USER_LAYOUT_DEFAULT_ET_DYN_BASE_VA);
+    u64 stack_top = layout_value_or_default(cfg->stack_top_va, USER_LAYOUT_DEFAULT_STACK_TOP_VA);
+    u64 stack_pages = layout_value_or_default(cfg->stack_page_count, USER_LAYOUT_DEFAULT_STACK_PAGES);
+    u64 mmap_base = layout_value_or_default(cfg->mmap_base_va, LINUX_MMAP_BASE_VA);
+    u64 brk_initial = layout_value_or_default(cfg->brk_initial_va, LINUX_BRK_INITIAL_VA);
+    if (!linux_abi_layout_values_valid(user_low, user_top, dynamic_base, dynamic_end, et_dyn_base, stack_top, stack_pages, mmap_base, brk_initial)) {
+        user_low = USER_LAYOUT_DEFAULT_LOW_VA;
+        user_top = USER_LAYOUT_DEFAULT_TOP_VA;
+        dynamic_base = USER_LAYOUT_DEFAULT_DYNAMIC_MAP_BASE_VA;
+        dynamic_end = USER_LAYOUT_DEFAULT_DYNAMIC_MAP_END_VA;
+        et_dyn_base = USER_LAYOUT_DEFAULT_ET_DYN_BASE_VA;
+        stack_top = USER_LAYOUT_DEFAULT_STACK_TOP_VA;
+        stack_pages = USER_LAYOUT_DEFAULT_STACK_PAGES;
+        mmap_base = LINUX_MMAP_BASE_VA;
+        brk_initial = LINUX_BRK_INITIAL_VA;
+    }
+    g_user_low_va = user_low;
+    g_user_top_va = user_top;
+    g_dynamic_map_base_va = dynamic_base;
+    g_dynamic_map_end_va = dynamic_end;
+    g_et_dyn_base_va = et_dyn_base;
+    g_stack_top_va = stack_top;
+    g_stack_page_count = stack_pages;
+    g_mmap_base_va = mmap_base;
+    g_brk_initial_va = brk_initial;
+}
+
+static void populate_exec_layout_config(struct exec_bootstrap_config *cfg) {
+    cfg->user_low_va = g_user_low_va;
+    cfg->user_top_va = g_user_top_va;
+    cfg->dynamic_map_base_va = g_dynamic_map_base_va;
+    cfg->dynamic_map_end_va = g_dynamic_map_end_va;
+    cfg->et_dyn_base_va = g_et_dyn_base_va;
+    cfg->stack_top_va = g_stack_top_va;
+    cfg->stack_page_count = g_stack_page_count;
+    cfg->mmap_base_va = g_mmap_base_va;
+    cfg->brk_initial_va = g_brk_initial_va;
+}
 
 static void deliver_tty_signal(u64 signo);
 static void remove_futex_waiters_for_principal(u64 principal);

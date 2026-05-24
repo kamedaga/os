@@ -59,9 +59,13 @@ enum {
     DRIVER_CONFIG_BASE_VA = 0x2A400000,
     PROCESS_STANDARD_CONFIG_TARGET_VA = 0x3C002000,
     PROCESS_SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
-    USER_ELF_BASE_VA = 0x20000000,
-    USER_STACK_TOP = 0x3C000000,
-    USER_STACK_PAGES = 128,
+    USER_ELF_BASE_VA = EXEC_USER_LAYOUT_LOW_VA,
+    USER_LAYOUT_TOP_VA = EXEC_USER_LAYOUT_TOP_VA,
+    USER_DYNAMIC_MAP_BASE_VA = EXEC_USER_DYNAMIC_MAP_BASE_VA,
+    USER_DYNAMIC_MAP_END_VA = EXEC_USER_DYNAMIC_MAP_END_VA,
+    USER_ET_DYN_BASE_VA = EXEC_USER_ET_DYN_BASE_VA,
+    USER_STACK_TOP = EXEC_USER_STACK_TOP_VA,
+    USER_STACK_PAGES = EXEC_USER_STACK_PAGE_COUNT,
     USER_STACK_BOTTOM_VA = USER_STACK_TOP - USER_STACK_PAGES * 4096,
     USER_ENTRY_RSP = USER_STACK_TOP - 8,
     REPLY_ENDPOINT_ID = 0xEB,
@@ -82,11 +86,13 @@ enum {
     SERVICE_KIND_EXEC = 13,
     SERVICE_FLAG_PROCESS_SLOT_COMPAT = 1,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
-    LINUX_ABI_BOOTSTRAP_VERSION = 2,
+    LINUX_ABI_BOOTSTRAP_VERSION = 3,
     LINUX_ABI_BOOTSTRAP_READY = 0x4C414249524459ULL,
     LINUX_ABI_CONFIG_TARGET_VA = 0x3C002000,
     LINUX_ABI_REQUEST_PAGES_VA = 0x26500000,
     LINUX_ABI_BOOT_REQUEST_PAGE_VA = 0x26540000,
+    LINUX_MMAP_BASE_VA = EXEC_LINUX_MMAP_BASE_VA,
+    LINUX_BRK_INITIAL_VA = EXEC_LINUX_BRK_INITIAL_VA,
     LINUX_ABI_EXEC_PATH_BYTES = 128,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     VM_OBJECT_RIGHT_READ = 0x1,
@@ -200,7 +206,44 @@ struct linux_abi_bootstrap_config {
     char exec_path[LINUX_ABI_EXEC_PATH_BYTES];
     u64 ready_endpoint_id;
     u64 ready_process_slot;
+    u64 user_low_va;
+    u64 user_top_va;
+    u64 dynamic_map_base_va;
+    u64 dynamic_map_end_va;
+    u64 et_dyn_base_va;
+    u64 stack_top_va;
+    u64 stack_page_count;
+    u64 mmap_base_va;
+    u64 brk_initial_va;
 };
+
+_Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, exec_path) == 64, "linux abi cfg exec path offset");
+_Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, user_low_va) == 208, "linux abi cfg layout offset");
+_Static_assert(sizeof(struct linux_abi_bootstrap_config) == 280, "linux abi cfg size");
+
+static void populate_exec_layout_config(struct exec_bootstrap_config *cfg) {
+    cfg->user_low_va = USER_ELF_BASE_VA;
+    cfg->user_top_va = USER_LAYOUT_TOP_VA;
+    cfg->dynamic_map_base_va = USER_DYNAMIC_MAP_BASE_VA;
+    cfg->dynamic_map_end_va = USER_DYNAMIC_MAP_END_VA;
+    cfg->et_dyn_base_va = USER_ET_DYN_BASE_VA;
+    cfg->stack_top_va = USER_STACK_TOP;
+    cfg->stack_page_count = USER_STACK_PAGES;
+    cfg->mmap_base_va = LINUX_MMAP_BASE_VA;
+    cfg->brk_initial_va = LINUX_BRK_INITIAL_VA;
+}
+
+static void populate_linux_abi_layout_config(struct linux_abi_bootstrap_config *cfg) {
+    cfg->user_low_va = USER_ELF_BASE_VA;
+    cfg->user_top_va = USER_LAYOUT_TOP_VA;
+    cfg->dynamic_map_base_va = USER_DYNAMIC_MAP_BASE_VA;
+    cfg->dynamic_map_end_va = USER_DYNAMIC_MAP_END_VA;
+    cfg->et_dyn_base_va = USER_ET_DYN_BASE_VA;
+    cfg->stack_top_va = USER_STACK_TOP;
+    cfg->stack_page_count = USER_STACK_PAGES;
+    cfg->mmap_base_va = LINUX_MMAP_BASE_VA;
+    cfg->brk_initial_va = LINUX_BRK_INITIAL_VA;
+}
 
 struct backend_session {
     u8 active;
@@ -1436,14 +1479,23 @@ static int launch_linux_abi_server_node(struct startup_node *node, const struct 
 static int launch_linux_exec_node(struct startup_node *node, const struct loaded_file *image);
 
 static int spawn_manifest_node(struct startup_node *node) {
-    if (cstr_empty(node->path)) return 0;
-    if (!cstr_empty(node->load) && !cstr_eq(node->load, "rootfs") && !cstr_eq(node->load, "bootfs")) return 0;
+    if (cstr_empty(node->path)) {
+        log_startup_node("[seed2_root] manifest missing path ", node);
+        return 0;
+    }
+    if (!cstr_empty(node->load) && !cstr_eq(node->load, "rootfs") && !cstr_eq(node->load, "bootfs")) {
+        log_startup_node("[seed2_root] manifest unsupported load ", node);
+        return 0;
+    }
 
     struct loaded_file image;
     const u64 image_va = g_next_sched_image_va;
     g_next_sched_image_va += MAX_SCHED_IMAGE_PAGES * 4096;
     if (!connect_vfs(ROOTFS_VFS_ENDPOINT_ID, g_rootfs_vfs_process_slot)) return 0;
-    if (!load_image_from_vfs(node->path, image_va, &image)) return 0;
+    if (!load_image_from_vfs(node->path, image_va, &image)) {
+        log_startup_node("[seed2_root] manifest image load failed ", node);
+        return 0;
+    }
     if (cstr_eq(node->provides, "exec_service")) return launch_exec_server_node(node, &image);
     if (cstr_eq(node->action, "linux_abi_server")) return launch_linux_abi_server_node(node, &image);
     if (cstr_eq(node->action, "linux_exec")) return launch_linux_exec_node(node, &image);
@@ -1488,6 +1540,7 @@ static int launch_exec_server_node(struct startup_node *node, const struct loade
     cfg->version = EXEC_BOOTSTRAP_VERSION;
     cfg->flags = EXEC_BOOTSTRAP_FLAG_SERVICE_MODE;
     cfg->interpreter_file_bytes = g_exec_interpreter_image.file_bytes;
+    populate_exec_layout_config(cfg);
 
     static struct bootstrap_descriptor_table table;
     clear_bytes(&table, sizeof(table));
@@ -1552,6 +1605,7 @@ static int launch_linux_abi_server_node(struct startup_node *node, const struct 
     cfg->abi_trap_request_page_va = LINUX_ABI_BOOT_REQUEST_PAGE_VA;
     cfg->ready_endpoint_id = LINUX_ABI_READY_ENDPOINT_ID;
     cfg->ready_process_slot = syscall0(SYSCALL_GET_PROCESS_SLOT);
+    populate_linux_abi_layout_config(cfg);
     copy_cstr_limited(cfg->exec_path, LINUX_ABI_EXEC_PATH_BYTES, "/cmd/dash_interactive.elf", &cfg->exec_path_bytes);
 
     static struct bootstrap_descriptor_table table;
@@ -1618,34 +1672,58 @@ static int configure_dash_exec_args(struct exec_bootstrap_config *cfg, const cha
 }
 
 static int launch_linux_exec_node(struct startup_node *node, const struct loaded_file *image) {
-    if (g_exec_service_process_slot == 0 || g_linux_abi_process_slot == 0) return 0;
-    if (!ensure_exec_interpreter_image()) return 0;
+    if (g_exec_service_process_slot == 0 || g_linux_abi_process_slot == 0) {
+        user_log("[seed2_root] dash exec deferred: service slot missing\n");
+        return 0;
+    }
+    if (!ensure_exec_interpreter_image()) {
+        user_log("[seed2_root] dash exec deferred: interpreter unavailable\n");
+        return 0;
+    }
 
     const u64 request_paddr = syscall0(SYSCALL_ALLOC_PAGE);
     const u64 response_paddr = syscall0(SYSCALL_ALLOC_PAGE);
-    if (request_paddr < 0x1000 || response_paddr < 0x1000) return 0;
+    if (request_paddr < 0x1000 || response_paddr < 0x1000) {
+        user_log("[seed2_root] dash exec deferred: ipc page alloc failed\n");
+        return 0;
+    }
     const u64 request_va = map_page_anywhere(request_paddr, 1);
     const u64 response_va = map_page_anywhere(response_paddr, 1);
-    if (request_va < 0x1000 || response_va < 0x1000) return 0;
+    if (request_va < 0x1000 || response_va < 0x1000) {
+        user_log("[seed2_root] dash exec deferred: ipc page map failed\n");
+        return 0;
+    }
     clear_page(request_va);
     clear_page(response_va);
 
     const u64 owner_rights = IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP | IPC_BUFFER_RIGHT_GRANT;
     const u64 request_token = create_ipc_buffer_from_page(request_paddr, owner_rights, IPC_BUFFER_ROLE_REQUEST);
     const u64 response_token = create_ipc_buffer_from_page(response_paddr, owner_rights, IPC_BUFFER_ROLE_RESPONSE);
-    if (!is_ipc_buffer_token(request_token) || !is_ipc_buffer_token(response_token)) return 0;
+    if (!is_ipc_buffer_token(request_token) || !is_ipc_buffer_token(response_token)) {
+        user_log("[seed2_root] dash exec deferred: ipc buffer create failed\n");
+        return 0;
+    }
 
-    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_LAUNCH_ENDPOINT_ID, g_exec_service_process_slot) != SYSCALL_OK) return 0;
+    if (syscall3(SYSCALL_INSTALL_ENDPOINT, 0, EXEC_LAUNCH_ENDPOINT_ID, g_exec_service_process_slot) != SYSCALL_OK) {
+        user_log("[seed2_root] dash exec deferred: exec endpoint install failed\n");
+        return 0;
+    }
     const u64 remote_response = grant_ipc_buffer_on_endpoint(
         response_token,
         EXEC_LAUNCH_ENDPOINT_ID,
         IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_WRITE | IPC_BUFFER_RIGHT_MAP
     );
-    if (!is_ipc_buffer_token(remote_response)) return 0;
+    if (!is_ipc_buffer_token(remote_response)) {
+        user_log("[seed2_root] dash exec deferred: response grant failed\n");
+        return 0;
+    }
 
     const u64 executable_token = syscall3(SYSCALL_GRANT_VM_OBJECT, image->vm_token, g_exec_service_process_slot, VM_RIGHT_READ_MAP);
     const u64 interpreter_token = syscall3(SYSCALL_GRANT_VM_OBJECT, g_exec_interpreter_image.vm_token, g_exec_service_process_slot, VM_RIGHT_READ_MAP);
-    if (!is_vm_object_token(executable_token) || !is_vm_object_token(interpreter_token)) return 0;
+    if (!is_vm_object_token(executable_token) || !is_vm_object_token(interpreter_token)) {
+        user_log("[seed2_root] dash exec deferred: vm object grant failed\n");
+        return 0;
+    }
 
     volatile struct exec_launch_request *request = (volatile struct exec_launch_request *)request_va;
     request->magic = EXEC_LAUNCH_REQUEST_MAGIC;
@@ -1665,7 +1743,11 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
     cfg.abi_trap_endpoint_process_slot = g_linux_abi_process_slot;
     cfg.abi_trap_flavor = 1;
     cfg.abi_trap_request_page_va = LINUX_ABI_REQUEST_PAGES_VA;
-    if (!configure_dash_exec_args(&cfg, cstr_empty(node->path) ? "/cmd/dash_interactive.elf" : node->path)) return 0;
+    populate_exec_layout_config(&cfg);
+    if (!configure_dash_exec_args(&cfg, cstr_empty(node->path) ? "/cmd/dash_interactive.elf" : node->path)) {
+        user_log("[seed2_root] dash exec deferred: argv config failed\n");
+        return 0;
+    }
     {
         const u8 *src = (const u8 *)&cfg;
         volatile u8 *dst = (volatile u8 *)&request->config;
@@ -1674,7 +1756,10 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
     request->seq = 1;
     exec_launch_publish_request_op(request, EXEC_LAUNCH_OP_START);
 
-    if (share_ipc_buffer_on_endpoint(request_token, EXEC_LAUNCH_ENDPOINT_ID, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP) != SYSCALL_OK) return 0;
+    if (share_ipc_buffer_on_endpoint(request_token, EXEC_LAUNCH_ENDPOINT_ID, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP) != SYSCALL_OK) {
+        user_log("[seed2_root] dash exec deferred: request share failed\n");
+        return 0;
+    }
     (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
 
     volatile struct exec_launch_response *response = (volatile struct exec_launch_response *)response_va;
@@ -1685,7 +1770,11 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
             response->seq == 1)
         {
             exec_launch_full_fence();
-            if (response->status != EXEC_LAUNCH_STATUS_OK || response->child_process_slot == 0) return 0;
+            if (response->status != EXEC_LAUNCH_STATUS_OK || response->child_process_slot == 0) {
+                user_log_hex("[seed2_root] dash exec start status=", response->status);
+                user_log_hex("[seed2_root] dash exec start child=", response->child_process_slot);
+                return 0;
+            }
             exec_launch_publish_request_op(request, EXEC_LAUNCH_OP_START_READY);
             (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
             for (u64 j = 0; j < 2000000; j++) {
@@ -1697,6 +1786,8 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
                     exec_launch_full_fence();
                     if (response->status != EXEC_LAUNCH_STATUS_OK ||
                         response->child_process_slot == 0) {
+                        user_log_hex("[seed2_root] dash exec started status=", response->status);
+                        user_log_hex("[seed2_root] dash exec started child=", response->child_process_slot);
                         return 0;
                     }
                     break;
@@ -1704,7 +1795,10 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
                 if ((j & 0x3ffULL) == 0) (void)wait_event_poll();
                 __asm__ volatile("pause" ::: "memory");
             }
-            if (response->op != EXEC_LAUNCH_OP_STARTED) return 0;
+            if (response->op != EXEC_LAUNCH_OP_STARTED) {
+                user_log_hex("[seed2_root] dash exec started op=", response->op);
+                return 0;
+            }
             node->spawned = 1;
             node->child_slot = response->child_process_slot;
             user_log("DashShim: dash spawned\n");

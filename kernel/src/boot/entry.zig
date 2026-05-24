@@ -323,6 +323,8 @@ fn initMemoryModules() void {
         .user_spaces = user_spaces,
         .four_gib = boot_static.four_gib,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
+        .user_low_va = boot_static.user_low_va,
+        .user_top_va = boot_static.user_top_va,
         .user_va = boot_static.user_va,
         .user_stack_page_va = boot_static.user_stack_page_va,
         .page_entries = boot_static.page_entries,
@@ -444,6 +446,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
         _ = scheduler.releaseThreadSlot(thread_index);
     }
 
+    kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_spaces[process_index] = .{};
     kernel_state_global.cap_tables[process_index].reset();
     kernel_state_global.endpoint_tables[process_index] = .{};
@@ -492,6 +495,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
         _ = scheduler.releaseThreadSlot(thread_index);
     }
 
+    kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_spaces[process_index] = .{};
     kernel_state_global.cap_tables[process_index].reset();
     kernel_state_global.endpoint_tables[process_index] = .{};
@@ -656,6 +660,10 @@ fn runBootServicesPhase() BootResources {
 fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelState {
     capability.init(.{
         .user_spaces = user_spaces,
+        .user_low_va = boot_static.user_low_va,
+        .user_top_va = boot_static.user_top_va,
+        .dynamic_map_base_va = boot_static.dynamic_map_base_va,
+        .dynamic_map_end_va = boot_static.dynamic_map_end_va,
         .user_va = boot_static.user_va,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
         .page_entries = boot_static.page_entries,
@@ -707,6 +715,7 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
     state.debug_alloc_page_hook = null;
     state.debug_process_lifecycle_hook = null;
     state.pte_sync_hook = null;
+    state.zero_physical_page_hook = user_copy.zeroPhysicalPage;
 
     return state;
 }

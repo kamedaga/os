@@ -141,6 +141,15 @@ pub fn writePhysU8(addr: u64, value: u8) bool {
     return true;
 }
 
+pub fn zeroPhysicalPage(page_paddr: u64) bool {
+    if ((page_paddr & 0xFFF) != 0) return false;
+    phys_copy_window_lock.lock();
+    defer phys_copy_window_lock.unlock();
+    const page = mapPhysPageForKernelAccess(page_paddr) orelse return false;
+    @memset(page[0..4096], 0);
+    return true;
+}
+
 pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
     const h = getHooks();
     if (dest.len == 0) return true;

@@ -387,6 +387,7 @@ pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, targe
         return boot_static.syscall_err_endpoint;
     if (exit_response) {
         _ = scheduler.releaseThreadSlot(target.thread);
+        h.state.releasePrincipalPageCaps(target.proc, h.free_list);
         _ = h.state.markProcessExited(target.proc);
         return boot_static.syscall_ok;
     }
@@ -499,7 +500,8 @@ pub fn protectCurrentReplyTargetPages(target_va: u64, page_count: u64, prot_bits
 }
 
 pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, page_count: u64) u64 {
-    _ = state;
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
@@ -509,6 +511,9 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
     }
     if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) {
         return boot_static.syscall_err_map;
+    }
+    for (paddrs[0..@intCast(collected)]) |paddr| {
+        h.state.reclaimExclusiveRootPage(target.proc, paddr, h.free_list) catch {};
     }
     return boot_static.syscall_ok;
 }

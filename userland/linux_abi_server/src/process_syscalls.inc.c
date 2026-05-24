@@ -478,8 +478,9 @@ static int copy_elf_image_pages_to_process(u64 process_token, u64 source_process
 }
 
 static int copy_loaded_elf_images_to_process(u64 process_token, u64 source_process_slot) {
-    u64 base = 0x20000000ULL;
-    for (u64 i = 0; i < 4 && base < 0x24000000ULL; i++) {
+    u64 base = g_et_dyn_base_va;
+    const u64 scan_end = g_et_dyn_base_va + 0x04000000ULL;
+    for (u64 i = 0; i < 4 && base < scan_end; i++) {
         u64 next_base = 0;
         if (!copy_elf_image_pages_to_process(process_token, source_process_slot, base, &next_base)) return 0;
         if (next_base <= base) break;
@@ -510,9 +511,9 @@ static int copy_current_vm_to_process(u64 process_token, u64 source_process_slot
         }
     }
     if (share_vm) {
-        if (!share_present_pages_to_process(process_token, source_process_slot, 0x20000000ULL, 0x24000000ULL, 0x3)) return 0;
+        if (!share_present_pages_to_process(process_token, source_process_slot, g_et_dyn_base_va, g_et_dyn_base_va + 0x04000000ULL, 0x3)) return 0;
     } else {
-        if (!copy_present_pages_to_process(process_token, source_process_slot, 0x20000000ULL, 0x20800000ULL, 0x3)) return 0;
+        if (!copy_present_pages_to_process(process_token, source_process_slot, g_user_low_va, g_user_low_va + 0x00800000ULL, 0x3)) return 0;
         if (!copy_loaded_elf_images_to_process(process_token, source_process_slot)) return 0;
     }
     const u64 parent_stack_page = parent_rsp & ~(u64)(PAGE_BYTES - 1);

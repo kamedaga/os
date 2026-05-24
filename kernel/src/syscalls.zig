@@ -285,6 +285,7 @@ fn exitAbiTrapReplyTargetIfRequested(
 
     ipc_syscalls.clearCurrentReplyToken();
     _ = scheduler.releaseThreadSlot(target.thread_index);
+    h.state.releasePrincipalPageCaps(target.principal, h.free_list);
     _ = h.state.markProcessExited(target.principal);
     return true;
 }

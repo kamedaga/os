@@ -820,6 +820,18 @@ pub const FreePageList = struct {
     ranges: [max_ranges]RegionFreeRange = undefined,
     range_len: usize = 0,
 
+    fn rangeEnd(range: *const RegionFreeRange) u64 {
+        return range.physical_start + (@as(u64, @intCast(range.len)) * 4096);
+    }
+
+    fn removeRangeAt(self: *FreePageList, index: usize) void {
+        var r = index + 1;
+        while (r < self.range_len) : (r += 1) {
+            self.ranges[r - 1] = self.ranges[r];
+        }
+        self.range_len -= 1;
+    }
+
     pub fn appendRegion(
         self: *FreePageList,
         region_id: u64,
@@ -833,14 +845,37 @@ pub const FreePageList = struct {
     }
 
     pub fn appendPage(self: *FreePageList, region_id: u64, paddr: u64) KernelError!void {
-        if (self.range_len > 0) {
-            const last = &self.ranges[self.range_len - 1];
-            const expected_next = last.physical_start + (@as(u64, last.len) * 4096);
-            if (last.region_id == region_id and paddr == expected_next) {
-                self.len += 1;
-                last.len += 1;
-                return;
+        const page_end = paddr + 4096;
+        var extend_before: ?usize = null;
+        var extend_after: ?usize = null;
+        var i: usize = 0;
+        while (i < self.range_len) : (i += 1) {
+            const range = &self.ranges[i];
+            if (range.region_id != region_id) continue;
+            const start = range.physical_start;
+            const end = rangeEnd(range);
+            if (paddr >= start and paddr < end) return KernelError.InvalidState;
+            if (paddr == end) extend_before = i;
+            if (page_end == start) extend_after = i;
+        }
+
+        if (extend_before) |before_index| {
+            self.ranges[before_index].len += 1;
+            self.len += 1;
+            if (extend_after) |after_index| {
+                if (after_index != before_index) {
+                    self.ranges[before_index].len += self.ranges[after_index].len;
+                    self.removeRangeAt(after_index);
+                }
             }
+            return;
+        }
+
+        if (extend_after) |after_index| {
+            self.ranges[after_index].physical_start = paddr;
+            self.ranges[after_index].len += 1;
+            self.len += 1;
+            return;
         }
 
         if (self.range_len >= self.ranges.len) return KernelError.TooManyFreeRanges;
@@ -855,10 +890,15 @@ pub const FreePageList = struct {
     }
 
     pub fn canAppendPage(self: *const FreePageList, region_id: u64, paddr: u64) bool {
-        if (self.range_len > 0) {
-            const last = &self.ranges[self.range_len - 1];
-            const expected_next = last.physical_start + (@as(u64, last.len) * 4096);
-            if (last.region_id == region_id and paddr == expected_next) return true;
+        const page_end = paddr + 4096;
+        var i: usize = 0;
+        while (i < self.range_len) : (i += 1) {
+            const range = &self.ranges[i];
+            if (range.region_id != region_id) continue;
+            const start = range.physical_start;
+            const end = rangeEnd(range);
+            if (paddr >= start and paddr < end) return false;
+            if (paddr == end or page_end == start) return true;
         }
         return self.range_len < self.ranges.len;
     }
@@ -891,6 +931,59 @@ pub const FreePageList = struct {
             const range = &self.ranges[range_index];
             if (range.len == 0) continue;
             if (range.physical_start >= limit_exclusive) continue;
+
+            const paddr = range.physical_start;
+            range.physical_start += 4096;
+            range.len -= 1;
+            self.len -= 1;
+
+            if (range.len == 0) {
+                var r: usize = range_index + 1;
+                while (r < self.range_len) : (r += 1) {
+                    self.ranges[r - 1] = self.ranges[r];
+                }
+                self.range_len -= 1;
+            }
+
+            return paddr;
+        }
+
+        return KernelError.OutOfFreePages;
+    }
+
+    pub fn popFrontAtOrAbove(self: *FreePageList, min_inclusive: u64) KernelError!u64 {
+        if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
+
+        var range_index: usize = 0;
+        while (range_index < self.range_len) : (range_index += 1) {
+            const range = &self.ranges[range_index];
+            if (range.len == 0) continue;
+            const range_end = range.physical_start + (@as(u64, range.len) * 4096);
+            if (range_end <= min_inclusive) continue;
+
+            if (range.physical_start < min_inclusive) {
+                const skip_pages: usize = @intCast((min_inclusive - range.physical_start + 4095) / 4096);
+                if (skip_pages >= range.len) continue;
+                const paddr = range.physical_start + (@as(u64, skip_pages) * 4096);
+                const tail_len = range.len - skip_pages - 1;
+                const head_len = skip_pages;
+                range.len = head_len;
+                self.len -= 1;
+                if (tail_len > 0) {
+                    if (self.range_len >= self.ranges.len) return KernelError.TooManyFreeRanges;
+                    var move_index = self.range_len;
+                    while (move_index > range_index + 1) : (move_index -= 1) {
+                        self.ranges[move_index] = self.ranges[move_index - 1];
+                    }
+                    self.ranges[range_index + 1] = .{
+                        .region_id = range.region_id,
+                        .len = tail_len,
+                        .physical_start = paddr + 4096,
+                    };
+                    self.range_len += 1;
+                }
+                return paddr;
+            }
 
             const paddr = range.physical_start;
             range.physical_start += 4096;
@@ -984,6 +1077,7 @@ const IommuNoCapDriverState = struct {
 
 pub const KernelState = struct {
     pub const max_regions = 256;
+    pub const low_memory_limit: u64 = 4 * 1024 * 1024 * 1024;
     const max_total_caps = 65536;
 
     regions: [max_regions]Region = undefined,
@@ -1002,6 +1096,7 @@ pub const KernelState = struct {
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
+    zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
     debug_alloc_page_hook: ?*const fn (state: *const KernelState, requester: PrincipalId, stage: DebugAllocPageStage, paddr: u64) void = null,
     debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
@@ -1957,29 +2052,43 @@ pub const KernelState = struct {
     ) KernelError!PageCapability {
         _ = requester;
         _ = self;
-        const user_mappable_paddr_limit: u64 = 4 * 1024 * 1024 * 1024;
-        const paddr = try free_list.popFrontBelow(user_mappable_paddr_limit);
+        const paddr = free_list.popFrontAtOrAbove(low_memory_limit) catch |err| switch (err) {
+            KernelError.OutOfFreePages => try free_list.popFrontBelow(low_memory_limit),
+            else => return err,
+        };
         return .{
             .paddr = paddr,
         };
     }
 
-    pub fn allocPageTo(
+    pub fn allocLowPage(
         self: *KernelState,
         requester: PrincipalId,
         free_list: *FreePageList,
     ) KernelError!PageCapability {
+        _ = requester;
+        _ = self;
+        const paddr = try free_list.popFrontBelow(low_memory_limit);
+        return .{
+            .paddr = paddr,
+        };
+    }
+
+    fn zeroAllocatedPage(self: *KernelState, paddr: u64) KernelError!void {
+        if (builtin.is_test) return;
+        if (self.zero_physical_page_hook) |hook| {
+            if (!hook(paddr)) return KernelError.InvalidState;
+            return;
+        }
+        const page_bytes: [*]u8 = @ptrFromInt(paddr);
+        @memset(page_bytes[0..4096], 0);
+    }
+
+    fn installAllocatedPageCap(self: *KernelState, requester: PrincipalId, cap: PageCapability) KernelError!PageCapability {
         try self.requireActiveProcess(requester);
         const table = self.getTable(requester);
         if (table.len >= CNode.max_caps) return KernelError.TableFull;
-        const cap = try self.allocPage(requester, free_list);
-        if (self.debug_alloc_page_hook) |hook| {
-            hook(self, requester, .after_pop, cap.paddr);
-        }
-        if (!builtin.is_test) {
-            const page_bytes: [*]u8 = @ptrFromInt(cap.paddr);
-            @memset(page_bytes[0..4096], 0);
-        }
+        try self.zeroAllocatedPage(cap.paddr);
         if (self.debug_alloc_page_hook) |hook| {
             hook(self, requester, .after_memset, cap.paddr);
         }
@@ -1999,8 +2108,35 @@ pub const KernelState = struct {
         if (self.debug_alloc_page_hook) |hook| {
             hook(self, requester, .after_cap_add, cap.paddr);
         }
-        // Freshly allocated pages are not mapped yet, so no PTE rights sync is needed here.
         return cap;
+    }
+
+    pub fn allocPageTo(
+        self: *KernelState,
+        requester: PrincipalId,
+        free_list: *FreePageList,
+    ) KernelError!PageCapability {
+        try self.requireActiveProcess(requester);
+        if (self.getTable(requester).len >= CNode.max_caps) return KernelError.TableFull;
+        const cap = try self.allocPage(requester, free_list);
+        if (self.debug_alloc_page_hook) |hook| {
+            hook(self, requester, .after_pop, cap.paddr);
+        }
+        return self.installAllocatedPageCap(requester, cap);
+    }
+
+    pub fn allocLowPageTo(
+        self: *KernelState,
+        requester: PrincipalId,
+        free_list: *FreePageList,
+    ) KernelError!PageCapability {
+        try self.requireActiveProcess(requester);
+        if (self.getTable(requester).len >= CNode.max_caps) return KernelError.TableFull;
+        const cap = try self.allocLowPage(requester, free_list);
+        if (self.debug_alloc_page_hook) |hook| {
+            hook(self, requester, .after_pop, cap.paddr);
+        }
+        return self.installAllocatedPageCap(requester, cap);
     }
 
     pub fn reclaimExclusiveRootPage(
@@ -2035,6 +2171,33 @@ pub const KernelState = struct {
         self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
         try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
         try free_list.appendPage(0, paddr);
+    }
+
+    pub fn releasePrincipalPageCaps(
+        self: *KernelState,
+        owner: PrincipalId,
+        free_list: *FreePageList,
+    ) void {
+        const table = self.getTable(owner);
+        while (table.len > 0) {
+            const cap = table.get(table.len - 1) orelse break;
+            const paddr = cap.paddr;
+            const cap_id = cap.cap_id;
+            _ = table.removeByCapId(cap_id);
+            self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
+            device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke) catch {};
+            if (self.pte_sync_hook) |hook| {
+                callPteSyncHook(hook, self, owner, paddr);
+            }
+            switch (self.scanCapTables(paddr)) {
+                .none => {
+                    if (free_list.canAppendPage(0, paddr)) {
+                        free_list.appendPage(0, paddr) catch {};
+                    }
+                },
+                .owner, .shared => {},
+            }
+        }
     }
 
     pub fn installCap(

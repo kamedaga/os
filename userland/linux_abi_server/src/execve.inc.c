@@ -938,8 +938,8 @@ static int start_prepared_exec_launch(u64 expected_child_process_slot) {
 static void reset_exec_runtime_state(void) {
     if (!g_proc) return;
     g_profile_trace_verbose = 0;
-    g_mmap_next_va = LINUX_MMAP_BASE_VA;
-    g_brk_next_va = LINUX_BRK_INITIAL_VA;
+    g_mmap_next_va = g_mmap_base_va;
+    g_brk_next_va = g_brk_initial_va;
     for (u64 i = 0; i < VM_REGION_MAX; i++) g_regions[i].used = 0;
 }
 
@@ -1215,6 +1215,7 @@ static int launch_exec_for_execve(u64 caller_principal, const char *path, u64 ar
     cfg->abi_trap_request_page_va = abi_request_va;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
     cfg->fs_compat_process_slot = g_vfs.process_slot;
+    populate_exec_layout_config(cfg);
     execve_profile_step("config done");
 
     struct exec_cache_entry *entry = EXEC_OPT_SERVICE_SOURCE_CACHE ? exec_cache_find(path, cstr_len(path)) : 0;
@@ -1262,6 +1263,7 @@ static int launch_exec_for_shebang(
     cfg->abi_trap_request_page_va = abi_request_va;
     cfg->fs_endpoint_id = g_vfs.endpoint_id;
     cfg->fs_compat_process_slot = g_vfs.process_slot;
+    populate_exec_layout_config(cfg);
 
     struct exec_cache_entry *entry = EXEC_OPT_SERVICE_SOURCE_CACHE ? exec_cache_find(interpreter_load_path, cstr_len(interpreter_load_path)) : 0;
     int send_result = send_exec_launch_request(cfg, entry, main_vm_token, spawned_principal_out);

@@ -38,8 +38,8 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->exec_pending_principal = 0;
     proc->vfork_parent_principal = 0;
     proc->vfork_parent_result = 0;
-    proc->mmap_next_va = LINUX_MMAP_BASE_VA;
-    proc->brk_next_va = LINUX_BRK_INITIAL_VA;
+    proc->mmap_next_va = g_mmap_base_va;
+    proc->brk_next_va = g_brk_initial_va;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
     proc->root_path[0] = '/'; proc->root_path[1] = 0; proc->root_len = 1;
     proc->cwd[0] = '/'; proc->cwd[1] = 0; proc->cwd_len = 1;
@@ -84,8 +84,8 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
 
 static void reset_process_runtime_for_exec(struct linux_process_state *proc) {
     if (!proc) return;
-    proc->mmap_next_va = LINUX_MMAP_BASE_VA;
-    proc->brk_next_va = LINUX_BRK_INITIAL_VA;
+    proc->mmap_next_va = g_mmap_base_va;
+    proc->brk_next_va = g_brk_initial_va;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
 }
 

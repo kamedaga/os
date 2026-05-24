@@ -31,14 +31,14 @@ enum {
     SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
     SYSCALL_OK = 0,
     PAGE_BYTES = 4096,
-    USER_STACK_TOP = 0x3C000000,
-    LINUX_STACK_PAGES = 128,
-    LINUX_STACK_BYTES = LINUX_STACK_PAGES * PAGE_BYTES,
-    LINUX_STACK_BOTTOM_VA = USER_STACK_TOP - LINUX_STACK_BYTES,
-    SOURCE_IMAGE_SMALL_BASE_VA = 0x08000000,
+    USER_LAYOUT_DEFAULT_LOW_VA = EXEC_USER_LAYOUT_LOW_VA,
+    USER_LAYOUT_DEFAULT_TOP_VA = EXEC_USER_LAYOUT_TOP_VA,
+    USER_STACK_DEFAULT_TOP = EXEC_USER_STACK_TOP_VA,
+    LINUX_STACK_DEFAULT_PAGES = EXEC_USER_STACK_PAGE_COUNT,
+    SOURCE_IMAGE_SMALL_BASE_VA = 0x40000000,
     SOURCE_IMAGE_SMALL_SLOT_SPAN = 0x01000000,
     SOURCE_IMAGE_SMALL_SLOT_COUNT = 24,
-    SOURCE_IMAGE_LARGE_BASE_VA = 0x28000000,
+    SOURCE_IMAGE_LARGE_BASE_VA = 0x58000000,
     SOURCE_IMAGE_LARGE_SLOT_SPAN = 0x08000000,
     SOURCE_IMAGE_LARGE_SLOT_COUNT = 2,
     SOURCE_IMAGE_SLOT_COUNT = SOURCE_IMAGE_SMALL_SLOT_COUNT + SOURCE_IMAGE_LARGE_SLOT_COUNT,
@@ -53,7 +53,7 @@ enum {
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
     VM_RIGHT_READ_MAP = 0x5,
-    ET_DYN_ALLOC_START_VA = 0x20000000,
+    ET_DYN_DEFAULT_ALLOC_START_VA = EXEC_USER_ET_DYN_BASE_VA,
     MAX_CHILD_MAPPED_PAGES = 32768,
     AT_NULL = 0,
     AT_PHDR = 3,
@@ -361,10 +361,86 @@ static u64 accept_cap_transfer(u64 transfer_id) {
     return syscall1(SYSCALL_ACCEPT_CAP_TRANSFER, transfer_id);
 }
 
+static u64 cfg_value_or_default(u64 value, u64 fallback) {
+    return value != 0 ? value : fallback;
+}
+
+static u64 cfg_user_low_va(const struct exec_bootstrap_config *cfg) {
+    return cfg_value_or_default(cfg->user_low_va, USER_LAYOUT_DEFAULT_LOW_VA);
+}
+
+static u64 cfg_user_top_va(const struct exec_bootstrap_config *cfg) {
+    return cfg_value_or_default(cfg->user_top_va, USER_LAYOUT_DEFAULT_TOP_VA);
+}
+
+static u64 cfg_et_dyn_base_va(const struct exec_bootstrap_config *cfg) {
+    return cfg_value_or_default(cfg->et_dyn_base_va, ET_DYN_DEFAULT_ALLOC_START_VA);
+}
+
+static u64 cfg_stack_top_va(const struct exec_bootstrap_config *cfg) {
+    return cfg_value_or_default(cfg->stack_top_va, USER_STACK_DEFAULT_TOP);
+}
+
+static u64 cfg_stack_page_count(const struct exec_bootstrap_config *cfg) {
+    return cfg_value_or_default(cfg->stack_page_count, LINUX_STACK_DEFAULT_PAGES);
+}
+
+static u64 cfg_mmap_base_va(const struct exec_bootstrap_config *cfg) {
+    return cfg_value_or_default(cfg->mmap_base_va, EXEC_LINUX_MMAP_BASE_VA);
+}
+
+static u64 cfg_brk_initial_va(const struct exec_bootstrap_config *cfg) {
+    return cfg_value_or_default(cfg->brk_initial_va, EXEC_LINUX_BRK_INITIAL_VA);
+}
+
+static int checked_stack_layout(const struct exec_bootstrap_config *cfg, u64 *top_out, u64 *bottom_out, u64 *pages_out, u64 *bytes_out) {
+    const u64 top = cfg_stack_top_va(cfg);
+    const u64 pages = cfg_stack_page_count(cfg);
+    if ((top & (PAGE_BYTES - 1)) != 0 || pages == 0) return 0;
+    if (pages > (((u64)1 << 32) / PAGE_BYTES)) return 0;
+    const u64 bytes = pages * PAGE_BYTES;
+    if (top < bytes) return 0;
+    const u64 bottom = top - bytes;
+    const u64 user_low = cfg_user_low_va(cfg);
+    const u64 user_top = cfg_user_top_va(cfg);
+    if (user_low >= user_top) return 0;
+    if (bottom < user_low || top > user_top) return 0;
+    *top_out = top;
+    *bottom_out = bottom;
+    *pages_out = pages;
+    *bytes_out = bytes;
+    return 1;
+}
+
+static int valid_user_layout_config(const struct exec_bootstrap_config *cfg) {
+    const u64 user_low = cfg_user_low_va(cfg);
+    const u64 user_top = cfg_user_top_va(cfg);
+    if ((user_low & (PAGE_BYTES - 1)) != 0 || (user_top & (PAGE_BYTES - 1)) != 0) return 0;
+    if (user_low >= user_top) return 0;
+    const u64 et_dyn = cfg_et_dyn_base_va(cfg);
+    if ((et_dyn & (PAGE_BYTES - 1)) != 0 || et_dyn < user_low || et_dyn >= user_top) return 0;
+    const u64 mmap_base = cfg_mmap_base_va(cfg);
+    if ((mmap_base & (PAGE_BYTES - 1)) != 0 || mmap_base < user_low || mmap_base >= user_top) return 0;
+    const u64 brk_initial = cfg_brk_initial_va(cfg);
+    if ((brk_initial & (PAGE_BYTES - 1)) != 0 || brk_initial < user_low || brk_initial >= user_top) return 0;
+    if (cfg->dynamic_map_base_va != 0 || cfg->dynamic_map_end_va != 0) {
+        if ((cfg->dynamic_map_base_va & (PAGE_BYTES - 1)) != 0) return 0;
+        if ((cfg->dynamic_map_end_va & (PAGE_BYTES - 1)) != 0) return 0;
+        if (cfg->dynamic_map_base_va < user_low || cfg->dynamic_map_end_va > user_top) return 0;
+        if (cfg->dynamic_map_base_va >= cfg->dynamic_map_end_va) return 0;
+    }
+    u64 stack_top = 0;
+    u64 stack_bottom = 0;
+    u64 stack_pages = 0;
+    u64 stack_bytes = 0;
+    return checked_stack_layout(cfg, &stack_top, &stack_bottom, &stack_pages, &stack_bytes);
+}
+
 static int valid_config(const struct exec_bootstrap_config *cfg) {
     if (cfg->magic != EXEC_BOOTSTRAP_MAGIC || cfg->version != EXEC_BOOTSTRAP_VERSION) return 0;
     if (cfg->argv_count > EXEC_MAX_ARGV || cfg->envp_count > EXEC_MAX_ENVP) return 0;
     if (cfg->arg_data_bytes > EXEC_MAX_ARG_DATA_BYTES) return 0;
+    if (!valid_user_layout_config(cfg)) return 0;
     return 1;
 }
 
@@ -524,22 +600,22 @@ static void write_u64_le(unsigned char *bytes, u64 value) {
     for (u64 i = 0; i < 8; i++) bytes[i] = (unsigned char)((value >> (i * 8)) & 0xff);
 }
 
-static int push_stack_bytes(u64 process_token, u64 *sp, const unsigned char *bytes, u64 len, u64 *va_out) {
-    if (len == 0 || *sp < LINUX_STACK_BOTTOM_VA || len > *sp - LINUX_STACK_BOTTOM_VA) return 0;
+static int push_stack_bytes(u64 process_token, u64 *sp, u64 stack_bottom_va, const unsigned char *bytes, u64 len, u64 *va_out) {
+    if (len == 0 || *sp < stack_bottom_va || len > *sp - stack_bottom_va) return 0;
     *sp -= len;
     if (!copy_to_process(process_token, *sp, (u64)bytes, len)) return 0;
     if (va_out != 0) *va_out = *sp;
     return 1;
 }
 
-static int push_stack_string(u64 process_token, u64 *sp, struct byte_slice value, u64 *va_out) {
+static int push_stack_string(u64 process_token, u64 *sp, u64 stack_bottom_va, struct byte_slice value, u64 *va_out) {
     static const unsigned char nul[1] = {0};
-    if (!push_stack_bytes(process_token, sp, nul, 1, 0)) return 0;
+    if (!push_stack_bytes(process_token, sp, stack_bottom_va, nul, 1, 0)) return 0;
     if (value.len == 0) {
         if (va_out != 0) *va_out = *sp;
         return 1;
     }
-    return push_stack_bytes(process_token, sp, value.ptr, value.len, va_out);
+    return push_stack_bytes(process_token, sp, stack_bottom_va, value.ptr, value.len, va_out);
 }
 
 static int append_aux(struct aux_entry *entries, u64 max_entries, u64 *count, u64 tag, u64 value) {
@@ -550,10 +626,10 @@ static int append_aux(struct aux_entry *entries, u64 max_entries, u64 *count, u6
     return 1;
 }
 
-static int push_stack_words(u64 process_token, u64 *sp, const u64 *words, u64 count) {
+static int push_stack_words(u64 process_token, u64 *sp, u64 stack_bottom_va, const u64 *words, u64 count) {
     if (count > 96) return 0;
     const u64 byte_len = count * 8;
-    if (byte_len > *sp - LINUX_STACK_BOTTOM_VA) return 0;
+    if (*sp < stack_bottom_va || byte_len > *sp - stack_bottom_va) return 0;
     *sp -= byte_len;
     return copy_to_process(process_token, *sp, (u64)words, byte_len);
 }
@@ -562,13 +638,19 @@ static int install_linux_initial_stack(
     u64 process_token,
     const struct loaded_image *main_image,
     u64 interp_base,
+    const struct exec_bootstrap_config *bootstrap,
     const struct linux_stack_config *config,
     u64 *initial_rsp_out
 ) {
-    if (!alloc_map_pages_to_process_chunked(process_token, LINUX_STACK_BOTTOM_VA, LINUX_STACK_PAGES, 3)) return 0;
-    if (!zero_process_range(process_token, LINUX_STACK_BOTTOM_VA, LINUX_STACK_BYTES)) return 0;
+    u64 stack_top = 0;
+    u64 stack_bottom = 0;
+    u64 stack_pages = 0;
+    u64 stack_bytes = 0;
+    if (!checked_stack_layout(bootstrap, &stack_top, &stack_bottom, &stack_pages, &stack_bytes)) return 0;
+    if (!alloc_map_pages_to_process_chunked(process_token, stack_bottom, stack_pages, 3)) return 0;
+    if (!zero_process_range(process_token, stack_bottom, stack_bytes)) return 0;
 
-    u64 sp = USER_STACK_TOP;
+    u64 sp = stack_top;
     const unsigned char random_bytes[16] = {
         0x43, 0x61, 0x70, 0x4f, 0x53, 0x2d, 0x6c, 0x69,
         0x6e, 0x75, 0x78, 0x2d, 0x61, 0x62, 0x69, 0x00
@@ -576,9 +658,9 @@ static int install_linux_initial_stack(
     u64 random_va = 0;
     u64 platform_va = 0;
     u64 execfn_va = 0;
-    if (!push_stack_bytes(process_token, &sp, random_bytes, sizeof(random_bytes), &random_va)) return 0;
-    if (!push_stack_string(process_token, &sp, config->platform, &platform_va)) return 0;
-    if (!push_stack_string(process_token, &sp, config->execfn, &execfn_va)) return 0;
+    if (!push_stack_bytes(process_token, &sp, stack_bottom, random_bytes, sizeof(random_bytes), &random_va)) return 0;
+    if (!push_stack_string(process_token, &sp, stack_bottom, config->platform, &platform_va)) return 0;
+    if (!push_stack_string(process_token, &sp, stack_bottom, config->execfn, &execfn_va)) return 0;
 
     u64 argv_ptrs[EXEC_MAX_ARGV];
     u64 envp_ptrs[EXEC_MAX_ENVP];
@@ -588,11 +670,11 @@ static int install_linux_initial_stack(
 
     for (u64 i = config->argv_count; i > 0; i--) {
         const u64 index = i - 1;
-        if (!push_stack_string(process_token, &sp, config->argv[index], &argv_ptrs[index])) return 0;
+        if (!push_stack_string(process_token, &sp, stack_bottom, config->argv[index], &argv_ptrs[index])) return 0;
     }
     for (u64 i = config->envp_count; i > 0; i--) {
         const u64 index = i - 1;
-        if (!push_stack_string(process_token, &sp, config->envp[index], &envp_ptrs[index])) return 0;
+        if (!push_stack_string(process_token, &sp, stack_bottom, config->envp[index], &envp_ptrs[index])) return 0;
     }
 
     sp &= ~15ULL;
@@ -630,7 +712,7 @@ static int install_linux_initial_stack(
         words[count++] = aux[i].tag;
         words[count++] = aux[i].value;
     }
-    if (!push_stack_words(process_token, &sp, words, count)) return 0;
+    if (!push_stack_words(process_token, &sp, stack_bottom, words, count)) return 0;
     *initial_rsp_out = sp;
     return 1;
 }
@@ -988,13 +1070,19 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
         }
     }
 
-    if (!is_vm_object_token(vm_token)) return 0;
+    if (!is_vm_object_token(vm_token)) {
+        user_log("Exec: source token invalid\n");
+        return 0;
+    }
 
     for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
         if (source_image_tokens[i] != 0) continue;
         if (file_bytes > source_image_slot_capacity(i)) continue;
         const u64 source_va = source_image_slot_va(i);
-        if (!map_vm_object(vm_token, source_va)) return 0;
+        if (!map_vm_object(vm_token, source_va)) {
+            user_log("Exec: source vm map failed\n");
+            return 0;
+        }
         source_image_tokens[i] = vm_token;
         source_image_bytes[i] = file_bytes;
         if (EXEC_OPT_SOURCE_PATH_CACHE) source_path_store(i, cache_path);
@@ -1302,7 +1390,7 @@ static int prepare_process(const struct exec_bootstrap_config *cfg, struct loade
     struct child_map_tracker *tracker = tracker_reset();
 
     struct load_layout layout;
-    layout.next_dyn_base = ET_DYN_ALLOC_START_VA;
+    layout.next_dyn_base = cfg_et_dyn_base_va(cfg);
 
     const int main_apply_initial_relocations = !main_summary.has_interp;
     if (!load_elf_image_into_process(process_token, tracker, &layout, main_vm_token, cfg->executable_file_bytes, main_source_va, &main_summary, main_apply_initial_relocations, image_out)) {
@@ -1342,7 +1430,7 @@ static int prepare_process(const struct exec_bootstrap_config *cfg, struct loade
         user_log("Exec: stack config failed\n");
         return 0;
     }
-    if (!install_linux_initial_stack(process_token, image_out, interp_base, &stack_config, &image_out->initial_rsp)) {
+    if (!install_linux_initial_stack(process_token, image_out, interp_base, cfg, &stack_config, &image_out->initial_rsp)) {
         abort_process(process_token);
         user_log("Exec: stack install failed\n");
         return 0;

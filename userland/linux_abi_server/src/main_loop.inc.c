@@ -146,6 +146,7 @@ void linux_abi_main(void) {
     g_exec_vm_token = cfg->exec_vm_token;
     g_standard_interpreter_vm_token = cfg->standard_interpreter_vm_token;
     g_standard_interpreter_bytes = cfg->standard_interpreter_file_bytes;
+    apply_linux_abi_layout_config(cfg);
     g_exec_path_len = cfg->exec_path_bytes <= FS_MAX_PATH_BYTES ? cfg->exec_path_bytes : FS_MAX_PATH_BYTES;
     for (u16 i = 0; i < g_exec_path_len; i++) g_exec_path[i] = cfg->exec_path[i];
     g_exec_path[g_exec_path_len] = 0;

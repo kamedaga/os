@@ -78,6 +78,7 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
     if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
         _ = scheduler.releaseThreadSlot(thread_index);
     }
+    state_ptr.releasePrincipalPageCaps(principal, free_list_ptr);
     if (process_index < user_spaces_ptr.len) {
         user_spaces_ptr[process_index] = .{};
     }

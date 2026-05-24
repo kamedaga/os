@@ -29,6 +29,10 @@ fn testFlushUserTlb(_: PrincipalId, _: u64) void {}
 fn initCapabilityRuntimeForTests() void {
     capability.init(.{
         .user_spaces = test_user_spaces[0..],
+        .user_low_va = 0,
+        .user_top_va = 0x4000_0000,
+        .dynamic_map_base_va = 0x0300_0000,
+        .dynamic_map_end_va = 0x1C00_0000,
         .user_va = 0,
         .physical_map_limit = 0x1_0000_0000,
         .page_entries = 512,
