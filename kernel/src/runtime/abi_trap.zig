@@ -12,8 +12,6 @@ const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 const trap_abi = abi_root.trap_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 
-const delegate_transport_queue_limit: usize = 1;
-
 const AbiTrapSpinLock = struct {
     value: u8 = 0,
 
@@ -615,16 +613,6 @@ fn deliverDelegateRequestLocked(
     }
 
     current_ctx.abi_trap_reply_pending = true;
-    if (scheduler.ipcQueueLenForThreadOnEndpoint(target_thread, delegate.endpoint_id, true) >= delegate_transport_queue_limit) {
-        if (scheduler.enqueueDelegateSendPending(target_thread, delegate.endpoint_id, current_thread, delegate.request_page_va)) {
-            scheduler.wakeAssignedApForRunnableThread(target_thread);
-            scheduler.preferIpcSwitchToThread(target_thread);
-            return boot_static.syscall_ok;
-        }
-        current_ctx.abi_trap_reply_pending = false;
-        return boot_static.syscall_err_not_ready;
-    }
-
     const status = ipc.deliverOrQueueMessageToThread(
         target_thread,
         delegate.endpoint_id,
@@ -636,14 +624,6 @@ fn deliverDelegateRequestLocked(
         0,
     );
     if (status == boot_static.syscall_ok) return boot_static.syscall_ok;
-
-    if (status == boot_static.syscall_err_not_ready) {
-        if (scheduler.enqueueDelegateSendPending(target_thread, delegate.endpoint_id, current_thread, delegate.request_page_va)) {
-            scheduler.wakeAssignedApForRunnableThread(target_thread);
-            scheduler.preferIpcSwitchToThread(target_thread);
-            return boot_static.syscall_ok;
-        }
-    }
     current_ctx.abi_trap_reply_pending = false;
     return status;
 }

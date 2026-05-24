@@ -116,17 +116,13 @@ def base_commands() -> list[tuple[str, str, tuple[bytes, ...]]]:
             "CAPABILITYOS_EXEC_PROFILE=1 CAPABILITYOS_EXEC_PROFILE_VERBOSE=1 seq 1 1000 | CAPABILITYOS_EXEC_PROFILE=1 CAPABILITYOS_EXEC_PROFILE_VERBOSE=1 head -n 1",
             (b"1",),
         ),
-        (
-            "seq-head1-profile-quiet",
-            "CAPABILITYOS_EXEC_PROFILE=1 seq 1 1000 | CAPABILITYOS_EXEC_PROFILE=1 head -n 1",
-            (b"1",),
-        ),
         ("seq-head-wc", "seq 1 20 | head -n 11 | wc -l", (b"11",)),
         ("printf-cat-wc", r"printf 'z\nb\na\n' | cat | wc -l", (b"3",)),
-        ("seq-head-wc3", "seq 1 10 | head -n 3 | wc -l", (b"3",)),
-        ("ls-wc", "ls / | wc -l", ()),
+        ("seq-grep-wc", "seq 1 20 | grep 1 | wc -l", (b"11",)),
+        ("sort", "seq 3 -1 1 | sort -n", (b"1", b"2", b"3")),
+        ("sort-head", "seq 3 -1 1 | sort -n | head -n 2", (b"1", b"2")),
+        ("ls-cat-wc", "ls / | cat | wc -l", ()),
         ("cat-head-wc", "cat /bin/ls | head -c 16 | wc -c", (b"16",)),
-        ("seq-head3-repeat", "seq 1 3 | head -n 3", (b"1", b"2", b"3")),
         ("printf-readv", r"printf '0123456789abcdef\n' | wc -c", (b"17",)),
     ]
 
@@ -162,8 +158,12 @@ def run_pipe_command(console: Console, index: int, label: str, body: str, requir
     missing = [item for item in required if item not in payload]
     if missing:
         raise RuntimeError(f"{label} missing {missing!r}: {plain!r}")
-    if label in ("seq-head1", "seq-head1-profile", "seq-head1-profile-quiet") and b"\n2" in payload.replace(b"\r\n", b"\n"):
+    if label in ("seq-head1", "seq-head1-profile") and b"\n2" in payload.replace(b"\r\n", b"\n"):
         raise RuntimeError(f"{label} produced more than one line: {plain!r}")
+    if label == "sort" and b"\n1\n2\n3" not in payload.replace(b"\r\n", b"\n"):
+        raise RuntimeError(f"{label} did not sort numerically: {plain!r}")
+    if label == "sort-head" and b"\n1\n2\n" not in payload.replace(b"\r\n", b"\n"):
+        raise RuntimeError(f"{label} did not feed sorted output to head: {plain!r}")
     if b":0" not in plain[: plain.find(b"# ") if b"# " in plain else len(plain)]:
         raise RuntimeError(f"{label} non-zero or missing rc: {plain!r}")
     timing = {

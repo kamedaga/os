@@ -393,6 +393,16 @@ static int is_vm_object_token(u64 token) {
     return (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0;
 }
 
+static void exec_launch_full_fence(void) {
+    __sync_synchronize();
+}
+
+static void exec_launch_publish_request_op(volatile struct exec_launch_request *request, u64 op) {
+    exec_launch_full_fence();
+    request->op = op;
+    exec_launch_full_fence();
+}
+
 static int is_process_builder_token(u64 token) {
     return (token & PROCESS_BUILDER_TOKEN_TAG) != 0 && (token & PROCESS_BUILDER_PROCESS_MASK) != 0;
 }
@@ -1640,7 +1650,6 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
     volatile struct exec_launch_request *request = (volatile struct exec_launch_request *)request_va;
     request->magic = EXEC_LAUNCH_REQUEST_MAGIC;
     request->version = EXEC_LAUNCH_VERSION;
-    request->op = EXEC_LAUNCH_OP_START;
     request->response_token = remote_response;
     struct exec_bootstrap_config cfg;
     clear_bytes(&cfg, sizeof(cfg));
@@ -1662,8 +1671,8 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
         volatile u8 *dst = (volatile u8 *)&request->config;
         for (u64 i = 0; i < sizeof(cfg); i++) dst[i] = src[i];
     }
-    __asm__ volatile("" ::: "memory");
     request->seq = 1;
+    exec_launch_publish_request_op(request, EXEC_LAUNCH_OP_START);
 
     if (share_ipc_buffer_on_endpoint(request_token, EXEC_LAUNCH_ENDPOINT_ID, IPC_BUFFER_RIGHT_READ | IPC_BUFFER_RIGHT_MAP) != SYSCALL_OK) return 0;
     (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
@@ -1675,7 +1684,27 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
             response->op == EXEC_LAUNCH_OP_START &&
             response->seq == 1)
         {
+            exec_launch_full_fence();
             if (response->status != EXEC_LAUNCH_STATUS_OK || response->child_process_slot == 0) return 0;
+            exec_launch_publish_request_op(request, EXEC_LAUNCH_OP_START_READY);
+            (void)syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
+            for (u64 j = 0; j < 2000000; j++) {
+                if (response->magic == EXEC_LAUNCH_RESPONSE_MAGIC &&
+                    response->version == EXEC_LAUNCH_VERSION &&
+                    response->op == EXEC_LAUNCH_OP_STARTED &&
+                    response->seq == 1)
+                {
+                    exec_launch_full_fence();
+                    if (response->status != EXEC_LAUNCH_STATUS_OK ||
+                        response->child_process_slot == 0) {
+                        return 0;
+                    }
+                    break;
+                }
+                if ((j & 0x3ffULL) == 0) (void)wait_event_poll();
+                __asm__ volatile("pause" ::: "memory");
+            }
+            if (response->op != EXEC_LAUNCH_OP_STARTED) return 0;
             node->spawned = 1;
             node->child_slot = response->child_process_slot;
             user_log("DashShim: dash spawned\n");

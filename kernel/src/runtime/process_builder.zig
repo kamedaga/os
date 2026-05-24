@@ -85,7 +85,7 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
     state_ptr.endpoint_tables[process_index] = .{};
     state_ptr.cap_mailboxes[process_index] = .{};
     state_ptr.pending_page_transfers[process_index] = null;
-    state_ptr.vm_object_tables[process_index] = .{};
+    state_ptr.vm_object_tables[process_index].reset();
     _ = state_ptr.removeProcessDescriptor(principal);
 }
 

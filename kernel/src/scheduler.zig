@@ -46,6 +46,10 @@ fn enableInterruptsForSchedulerLock() void {
     asm volatile ("sti" ::: .{ .memory = true });
 }
 
+fn schedulerFullMemoryFence() void {
+    asm volatile ("mfence" ::: .{ .memory = true });
+}
+
 const SchedulerSpinLock = struct {
     value: u8 = 0,
     interrupts_were_enabled: bool = false,
@@ -1377,16 +1381,18 @@ pub fn isThreadReady(thread_index: usize) bool {
 pub fn setThreadReady(thread_index: usize, ready: bool) bool {
     const ctx = getThreadContext(thread_index) orelse return false;
     if (!ctx.allocated) return false;
+    if (ready) schedulerFullMemoryFence();
     ctx.ready = ready;
     setIpcHotReady(thread_index, ready);
     return true;
 }
 
-pub fn initThreadContextWithSpaces(
+fn initThreadContextWithSpacesReady(
     thread_index: usize,
     owner_process: kernel.PrincipalId,
     user_spaces: []UserAddressSpace,
     initial_frame: TrapFrame,
+    initial_ready: bool,
 ) bool {
     const space = getUserSpace(user_spaces, owner_process) orelse return false;
     const ctx = getThreadContext(thread_index) orelse return false;
@@ -1402,7 +1408,7 @@ pub fn initThreadContextWithSpaces(
     ctx.cpu_affinity_mask = all_cpu_affinity_mask;
     ctx.cr3 = x86_platform.cr3WithUserPcid(space.cr3, pcidForPrincipal(owner_process));
     ctx.fs_base = 0;
-    ctx.ready = true;
+    ctx.ready = initial_ready;
     ctx.wait_mailbox = false;
     ctx.wait_preserve_ipc_queue = false;
     ctx.signal_pending = false;
@@ -1416,18 +1422,35 @@ pub fn initThreadContextWithSpaces(
     return true;
 }
 
+pub fn initThreadContextWithSpaces(
+    thread_index: usize,
+    owner_process: kernel.PrincipalId,
+    user_spaces: []UserAddressSpace,
+    initial_frame: TrapFrame,
+) bool {
+    return initThreadContextWithSpacesReady(thread_index, owner_process, user_spaces, initial_frame, true);
+}
+
 pub fn threadSlotForPrincipal(principal: kernel.PrincipalId) ?usize {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return null;
     return process_thread_slots[idx];
 }
 
 pub fn allocateThreadSlot(owner_process: kernel.PrincipalId, user_spaces: []UserAddressSpace, initial_frame: TrapFrame) ?usize {
+    return allocateThreadSlotReady(owner_process, user_spaces, initial_frame, true);
+}
+
+pub fn allocateSuspendedThreadSlot(owner_process: kernel.PrincipalId, user_spaces: []UserAddressSpace, initial_frame: TrapFrame) ?usize {
+    return allocateThreadSlotReady(owner_process, user_spaces, initial_frame, false);
+}
+
+fn allocateThreadSlotReady(owner_process: kernel.PrincipalId, user_spaces: []UserAddressSpace, initial_frame: TrapFrame, initial_ready: bool) ?usize {
     if (threadSlotForPrincipal(owner_process)) |existing| return existing;
     var i: usize = 0;
     while (i < max_thread_slots) : (i += 1) {
         const ctx = getThreadContextConst(i) orelse continue;
         if (ctx.allocated) continue;
-        if (!initThreadContextWithSpaces(i, owner_process, user_spaces, initial_frame)) return null;
+        if (!initThreadContextWithSpacesReady(i, owner_process, user_spaces, initial_frame, initial_ready)) return null;
         return i;
     }
     return null;
@@ -1508,7 +1531,15 @@ fn stopReleasedThreadOnAp(release_cpu_slot: usize, releasing_from_cpu: usize, wa
         if ((target_mask & bit) == 0) continue;
         if (cpu_slot == releasing_from_cpu) continue;
         _ = smp.wakeCpu(cpu_slot);
-        if (cpu_slot == release_cpu_slot) waitForReleasedApToPark(cpu_slot);
+    }
+    cpu_slot = 1;
+    while (cpu_slot < cpu_scheduler_states.len) : (cpu_slot += 1) {
+        const bit = cpuAffinityBit(cpu_slot) orelse {
+            continue;
+        };
+        if ((target_mask & bit) == 0) continue;
+        if (cpu_slot == releasing_from_cpu) continue;
+        waitForReleasedApToPark(cpu_slot);
     }
 }
 
@@ -1807,6 +1838,7 @@ pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
     const hot = getIpcHotThreadConst(thread_index) orelse return false;
     if (hot.allocated == 0) return false;
     if (hot.ready == 0) return false;
+    schedulerFullMemoryFence();
     x86_platform.writeFsBase(ctx.fs_base);
     frame.* = ctx.frame;
     return true;

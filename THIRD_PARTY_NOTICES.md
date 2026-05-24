@@ -30,6 +30,7 @@ images as needed.
 | Alpine apk config | `apk-arch`, `apk-repositories`, `apk-world` | CapabilityOS config, MIT | `tools/build_wsl_apk_config.sh` |
 | CA certificates bundle | `ca-certificates.crt` | See the host distribution's CA bundle notices | `tools/build_wsl_ca_certificates.sh` |
 | curl | `curl.elf` | curl license | `tools/build_wsl_curl.sh`, https://curl.se/docs/copyright.html |
+| GNU grep | `gnu-grep.elf` | GPL-3.0-or-later | `tools/build_wsl_gnu_grep.sh`, https://www.gnu.org/software/grep/ |
 | Mbed TLS | `libmbedcrypto.so.16`, `libmbedtls.so.21`, `libmbedx509.so.7` | Apache-2.0 OR GPL-2.0-or-later | `tools/build_wsl_mbedtls.sh`, https://github.com/Mbed-TLS/mbedtls |
 | zlib | `libz.so.1` | zlib license | `tools/build_wsl_zlib.sh`, https://www.zlib.net/zlib_license.html |
 | Zstandard | `zstd.elf` | BSD OR GPL-2.0 | `tools/build_wsl_zstd.sh`, https://github.com/facebook/zstd |

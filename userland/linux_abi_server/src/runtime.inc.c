@@ -290,8 +290,8 @@ static u64 take_deliverable_signal(struct linux_process_state *proc) {
 }
 
 static int try_reply_signal_frame(u64 result, u64 flags) {
-    if (flags != 0 || !g_proc || !g_abi_ctx || !g_abi_ctx->request) return 0;
-    const struct trap_request *req = g_abi_ctx->request;
+    const struct trap_request *req = abi_current_request();
+    if (flags != 0 || !g_proc || req == 0) return 0;
     if (req->kind != TRAP_KIND_ABI_SYSCALL) return 0;
     if (req->nr == LINUX_SYS_RT_SIGRETURN) return 0;
     const u64 signo = take_deliverable_signal(g_proc);
@@ -360,8 +360,8 @@ static struct ipc_message reply_current_token(u64 result, u64 flags) {
 }
 
 static void trace_errno_reply(u64 result, u64 flags) {
-    if (result != (u64)(i64)-22 || !profile_trace_enabled() || g_abi_ctx == 0 || g_abi_ctx->request == 0) return;
-    const struct trap_request *req = g_abi_ctx->request;
+    const struct trap_request *req = abi_current_request();
+    if (result != (u64)(i64)-22 || !profile_trace_enabled() || req == 0) return;
     user_log("LinuxAbiServer.trace errno=EINVAL nr=");
     user_log_dec_value(req->nr);
     user_log(" principal=");
@@ -478,7 +478,13 @@ static void reply_vfork_parent_if_any(struct linux_process_state *proc) {
         result = g_vfork_parent_result[proc->principal];
     }
     if (parent == 0) return;
-    (void)reply_trap_target(parent, result, 0);
+    const u64 reply_status = reply_trap_target(parent, result, 0);
+    if (reply_status != SYSCALL_OK) {
+        user_log("LinuxAbiServer: vfork parent reply failed=");
+        user_log_hex_value(reply_status);
+    } else {
+        (void)detach_reply_token();
+    }
     proc->vfork_parent_principal = 0;
     proc->vfork_parent_result = 0;
     if (proc->principal < LINUX_ABI_REQUEST_PAGE_COUNT) {
@@ -516,6 +522,8 @@ static void exit_trap_target_no_wait(u64 principal) {
     if (status != SYSCALL_OK) {
         user_log("LinuxAbiServer: explicit exit reply failed=");
         user_log_hex_value(status);
+    } else {
+        (void)detach_reply_token();
     }
 }
 
@@ -686,6 +694,10 @@ static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
 static void profile_count_syscall(u64 nr) {
     g_prof.syscall_total++;
     if (nr <= LINUX_SYSCALL_PROFILE_COUNT) g_prof.syscall_counts[nr]++;
+    const struct linux_syscall_metadata *metadata = linux_syscall_metadata_for(nr);
+    if (metadata != 0 && metadata->category < LINUX_SYSCALL_CAT_COUNT) {
+        g_prof.syscall_category_counts[metadata->category]++;
+    }
 }
 
 static void profile_record_syscall_ticks(u64 nr, u64 ticks) {
@@ -705,6 +717,24 @@ static void profile_print_syscall(const char *name, u64 nr) {
     user_log(" max=");
     user_log_dec_value(g_prof.syscall_max_ticks[nr]);
     user_log("\n");
+}
+
+static void profile_print_syscall_category(enum linux_syscall_category category) {
+    if (category >= LINUX_SYSCALL_CAT_COUNT || g_prof.syscall_category_counts[category] == 0) return;
+    user_log("LinuxAbiServer.perf.syscall_category ");
+    user_log(linux_syscall_category_name(category));
+    user_log("=");
+    user_log_dec_value(g_prof.syscall_category_counts[category]);
+    user_log("\n");
+}
+
+static void profile_print_known_syscalls(void) {
+    for (u64 i = 0; i < LINUX_SYSCALL_CAT_COUNT; i++) {
+        profile_print_syscall_category((enum linux_syscall_category)i);
+    }
+    for (u64 i = 0; i < g_linux_syscall_metadata_count; i++) {
+        profile_print_syscall(g_linux_syscall_metadata[i].name, g_linux_syscall_metadata[i].nr);
+    }
 }
 
 static void profile_print_fs_op(const char *name, u64 op) {
@@ -796,47 +826,29 @@ static void profile_report_and_reset(void) {
         return;
     }
     user_log_dec_line("LinuxAbiServer.perf.syscalls.total=", g_prof.syscall_total);
-    profile_print_syscall("read", LINUX_SYS_READ);
-    profile_print_syscall("write", LINUX_SYS_WRITE);
-    profile_print_syscall("readv", LINUX_SYS_READV);
-    profile_print_syscall("writev", LINUX_SYS_WRITEV);
-    profile_print_syscall("open", LINUX_SYS_OPEN);
-    profile_print_syscall("openat", LINUX_SYS_OPENAT);
-    profile_print_syscall("close", LINUX_SYS_CLOSE);
-    profile_print_syscall("stat", LINUX_SYS_STAT);
-    profile_print_syscall("fstat", LINUX_SYS_FSTAT);
-    profile_print_syscall("newfstatat", LINUX_SYS_NEWFSTATAT);
-    profile_print_syscall("access", LINUX_SYS_ACCESS);
-    profile_print_syscall("mmap", LINUX_SYS_MMAP);
-    profile_print_syscall("mprotect", LINUX_SYS_MPROTECT);
-    profile_print_syscall("munmap", LINUX_SYS_MUNMAP);
-    profile_print_syscall("mremap", LINUX_SYS_MREMAP);
-    profile_print_syscall("brk", LINUX_SYS_BRK);
-    profile_print_syscall("poll", LINUX_SYS_POLL);
-    profile_print_syscall("select", LINUX_SYS_SELECT);
-    profile_print_syscall("ppoll", LINUX_SYS_PPOLL);
-    profile_print_syscall("pselect6", LINUX_SYS_PSELECT6);
-    profile_print_syscall("socket", LINUX_SYS_SOCKET);
-    profile_print_syscall("connect", LINUX_SYS_CONNECT);
-    profile_print_syscall("sendto", LINUX_SYS_SENDTO);
-    profile_print_syscall("recvfrom", LINUX_SYS_RECVFROM);
-    profile_print_syscall("sendmsg", LINUX_SYS_SENDMSG);
-    profile_print_syscall("recvmsg", LINUX_SYS_RECVMSG);
-    profile_print_syscall("getsockopt", LINUX_SYS_GETSOCKOPT);
-    profile_print_syscall("setsockopt", LINUX_SYS_SETSOCKOPT);
-    profile_print_syscall("time", LINUX_SYS_TIME);
-    profile_print_syscall("gettimeofday", LINUX_SYS_GETTIMEOFDAY);
-    profile_print_syscall("getrandom", LINUX_SYS_GETRANDOM);
-    profile_print_syscall("clock_gettime", LINUX_SYS_CLOCK_GETTIME);
-    profile_print_syscall("nanosleep", LINUX_SYS_NANOSLEEP);
-    profile_print_syscall("clock_nanosleep", LINUX_SYS_CLOCK_NANOSLEEP);
-    profile_print_syscall("setitimer", LINUX_SYS_SETITIMER);
-    profile_print_syscall("rt_sigtimedwait", LINUX_SYS_RT_SIGTIMEDWAIT);
-    profile_print_syscall("timer_create", LINUX_SYS_TIMER_CREATE);
-    profile_print_syscall("timer_settime", LINUX_SYS_TIMER_SETTIME);
-    profile_print_syscall("timer_gettime", LINUX_SYS_TIMER_GETTIME);
-    profile_print_syscall("fcntl", LINUX_SYS_FCNTL);
-    profile_print_syscall("ioctl", LINUX_SYS_IOCTL);
+    profile_print_known_syscalls();
+
+    user_log_dec_line("LinuxAbiServer.perf.pipe.create_calls=", g_prof.pipe_create_calls);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.create_busy=", g_prof.pipe_create_busy);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.create_faults=", g_prof.pipe_create_faults);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.dup_refs=", g_prof.pipe_dup_refs);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.close_calls=", g_prof.pipe_close_calls);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.deferred_wakes=", g_prof.pipe_deferred_wakes);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.wake_flushes=", g_prof.pipe_wake_flushes);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.wake_replies=", g_prof.pipe_wake_replies);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.read_calls=", g_prof.pipe_read_calls);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.read_bytes=", g_prof.pipe_read_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.read_blocked=", g_prof.pipe_read_blocked);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.read_again=", g_prof.pipe_read_again);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.read_eof=", g_prof.pipe_read_eof);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.read_faults=", g_prof.pipe_read_faults);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.write_calls=", g_prof.pipe_write_calls);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.write_bytes=", g_prof.pipe_write_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.write_again=", g_prof.pipe_write_again);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.write_faults=", g_prof.pipe_write_faults);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.write_broken=", g_prof.pipe_write_broken);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.epoll_wait_calls=", g_prof.pipe_epoll_wait_calls);
+    user_log_dec_line("LinuxAbiServer.perf.pipe.epoll_ready=", g_prof.pipe_epoll_ready);
 
     user_log_dec_line("LinuxAbiServer.perf.vfs.requests=", g_prof.vfs_requests);
     profile_print_fs_op("lookup", FS_OP_LOOKUP);

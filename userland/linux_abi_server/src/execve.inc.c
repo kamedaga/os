@@ -635,8 +635,30 @@ static int get_exec_vm_for_path(const char *path, u64 *vm_token_out, u64 *file_b
     return 1;
 }
 
-static u64 grant_vm_object_to_exec(u64 vm_token) {
+static const char *kernel_syscall_status_name(u64 status) {
+    if (status == SYSCALL_OK) return "ok";
+    if (status == SYSCALL_ERR_INVALID) return "invalid";
+    if (status == SYSCALL_ERR_NOT_READY) return "not_ready";
+    if (status == SYSCALL_ERR_ALLOC) return "alloc";
+    if (status == SYSCALL_ERR_MAP) return "map";
+    if (status == SYSCALL_ERR_SEND) return "send";
+    if (status == SYSCALL_ERR_ENDPOINT) return "endpoint";
+    if (status == SYSCALL_ERR_GRANT) return "grant";
+    return "unknown";
+}
+
+static void log_exec_grant_failure(const char *label, u64 status) {
+    user_log("LinuxAbiServer: ");
+    user_log(label);
+    user_log(" failed status=");
+    user_log(kernel_syscall_status_name(status));
+    user_log(" raw=");
+    user_log_hex_value(status);
+}
+
+static u64 grant_vm_object_to_exec(u64 vm_token, u64 *status_out) {
     const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_exec_service_slot, VM_RIGHT_READ_MAP);
+    if (status_out != 0) *status_out = granted;
     return is_vm_object_token(granted) ? granted : 0;
 }
 
@@ -646,7 +668,9 @@ static u64 grant_standard_interpreter_to_exec_service(void) {
         is_vm_object_token(g_exec_service_interpreter_granted_token)) {
         return g_exec_service_interpreter_granted_token;
     }
-    const u64 granted = grant_vm_object_to_exec(g_standard_interpreter_vm_token);
+    u64 status = 0;
+    const u64 granted = grant_vm_object_to_exec(g_standard_interpreter_vm_token, &status);
+    if (granted == 0) log_exec_grant_failure("exec service interpreter grant", status);
     if (granted == 0) return 0;
     g_exec_service_interpreter_granted_slot = g_exec_service_slot;
     g_exec_service_interpreter_source_token = g_standard_interpreter_vm_token;
@@ -703,7 +727,31 @@ static int start_exec_service(void) {
     return 1;
 }
 
+static void exec_launch_full_fence(void) {
+    __sync_synchronize();
+}
+
+static void exec_launch_publish_request_op(volatile struct exec_launch_request *request, u64 op) {
+    exec_launch_full_fence();
+    request->op = op;
+    exec_launch_full_fence();
+}
+
+static void exec_launch_sequence_acquire(void) {
+    while (__sync_lock_test_and_set(&g_exec_launch_sequence_lock, 1) != 0) {
+        wait_without_consuming_ipc();
+        __asm__ volatile("pause" ::: "memory");
+    }
+    exec_launch_full_fence();
+}
+
+static void exec_launch_sequence_release(void) {
+    exec_launch_full_fence();
+    __sync_lock_release(&g_exec_launch_sequence_lock);
+}
+
 static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct exec_cache_entry *entry, u64 main_vm_token, u64 *spawned_principal_out) {
+    g_exec_launch_pending_start_seq = 0;
     if (!ensure_exec_service_pages()) { user_log("LinuxAbiServer: exec service pages failed\n"); return 0; }
     execve_profile_step("exec service pages done");
     if (!ensure_standard_interpreter_current()) return 0;
@@ -714,10 +762,11 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
     cfg->executable_vm_token = 0;
     if (!exec_has_source) {
         execve_profile_step("exec service grant begin");
-        cfg->executable_vm_token = grant_vm_object_to_exec(main_vm_token);
+        u64 grant_status = 0;
+        cfg->executable_vm_token = grant_vm_object_to_exec(main_vm_token, &grant_status);
         execve_profile_step("exec service grant done");
         if (cfg->executable_vm_token == 0) {
-            user_log("LinuxAbiServer: exec service grant failed\n");
+            log_exec_grant_failure("exec service grant", grant_status);
             return 0;
         }
     }
@@ -725,7 +774,6 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
     cfg->interpreter_vm_token = grant_standard_interpreter_to_exec_service();
     execve_profile_step("exec service interpreter grant done");
     if (cfg->interpreter_vm_token == 0) {
-        user_log("LinuxAbiServer: exec service interpreter grant failed\n");
         return 0;
     }
 
@@ -738,13 +786,11 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
     const u64 request_seq = g_exec_service_seq++;
     request->magic = EXEC_LAUNCH_REQUEST_MAGIC;
     request->version = EXEC_LAUNCH_VERSION;
-    request->op = EXEC_LAUNCH_OP_START;
     {
         const u8 *src = (const u8 *)cfg;
         u8 *dst = (u8 *)&request->config;
         for (u64 i = 0; i < sizeof(*cfg); i++) dst[i] = src[i];
     }
-    __asm__ volatile("" ::: "memory");
     request->seq = request_seq;
 
     execve_profile_step(exec_has_source ? "exec service cached send begin" : "exec service grant send begin");
@@ -763,7 +809,7 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
             if (is_ipc_buffer_token(grant_status)) {
                 g_exec_launch_remote_response_token = grant_status;
                 request->response_token = g_exec_launch_remote_response_token;
-                __asm__ volatile("" ::: "memory");
+                exec_launch_publish_request_op(request, EXEC_LAUNCH_OP_START);
                 share_status = share_ipc_buffer_on_endpoint(
                     g_exec_launch_request_token,
                     EXEC_LAUNCH_ENDPOINT_ID,
@@ -788,7 +834,7 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
         }
     } else {
         request->response_token = g_exec_launch_remote_response_token;
-        __asm__ volatile("" ::: "memory");
+        exec_launch_publish_request_op(request, EXEC_LAUNCH_OP_START);
         u64 signal_status = syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
         if (signal_status == SYSCALL_ERR_ENDPOINT && install_status == SYSCALL_OK) {
             signal_status = syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
@@ -809,6 +855,7 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
             response->version == EXEC_LAUNCH_VERSION &&
             response->op == EXEC_LAUNCH_OP_START &&
             response->seq == request_seq) {
+            exec_launch_full_fence();
             if (response->status != EXEC_LAUNCH_STATUS_OK || response->child_process_slot == 0) {
                 user_log("LinuxAbiServer: exec service failed status=");
                 user_log_hex_value(response->status);
@@ -820,6 +867,7 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
             }
             if (EXEC_OPT_SERVICE_SOURCE_CACHE && entry != 0) entry->exec_service_cached = 1;
             *spawned_principal_out = response->child_process_slot;
+            g_exec_launch_pending_start_seq = request_seq;
             execve_profile_step("exec service reply done");
             return 1;
         }
@@ -841,6 +889,49 @@ static int send_exec_launch_request(struct exec_bootstrap_config *cfg, struct ex
     user_log_hex_value(response->child_process_slot);
     user_log("LinuxAbiServer: exec service request seq=");
     user_log_hex_value(request_seq);
+    return 0;
+}
+
+static int start_prepared_exec_launch(u64 expected_child_process_slot) {
+    const u64 request_seq = g_exec_launch_pending_start_seq;
+    g_exec_launch_pending_start_seq = 0;
+    if (request_seq == 0 || expected_child_process_slot == 0) return 0;
+    const u64 request_addr = exec_launch_request_addr();
+    const u64 response_addr = exec_launch_response_addr();
+    if (request_addr < PAGE_BYTES || response_addr < PAGE_BYTES) return 0;
+    volatile struct exec_launch_request *request = (volatile struct exec_launch_request *)request_addr;
+    volatile struct exec_launch_response *response = (volatile struct exec_launch_response *)response_addr;
+    if (request->magic != EXEC_LAUNCH_REQUEST_MAGIC ||
+        request->version != EXEC_LAUNCH_VERSION ||
+        request->seq != request_seq) {
+        user_log("LinuxAbiServer: exec start request mismatch\n");
+        return 0;
+    }
+    exec_launch_publish_request_op(request, EXEC_LAUNCH_OP_START_READY);
+    const u64 signal_status = syscall2(SYSCALL_SIGNAL_ENDPOINT, EXEC_LAUNCH_ENDPOINT_ID, 0);
+    if (signal_status != SYSCALL_OK && signal_status != SYSCALL_ERR_ENDPOINT) {
+        user_log("LinuxAbiServer: exec start signal failed=");
+        user_log_hex_value(signal_status);
+        return 0;
+    }
+    for (u64 attempts = 0; attempts < 2000000; attempts++) {
+        if (response->magic == EXEC_LAUNCH_RESPONSE_MAGIC &&
+            response->version == EXEC_LAUNCH_VERSION &&
+            response->op == EXEC_LAUNCH_OP_STARTED &&
+            response->seq == request_seq) {
+            exec_launch_full_fence();
+            if (response->status == EXEC_LAUNCH_STATUS_OK &&
+                response->child_process_slot == expected_child_process_slot) {
+                return 1;
+            }
+            user_log("LinuxAbiServer: exec start failed status=");
+            user_log_hex_value(response->status);
+            return 0;
+        }
+        if ((attempts & 0x3ffu) == 0) wait_without_consuming_ipc();
+        __asm__ volatile("pause" ::: "memory");
+    }
+    user_log("LinuxAbiServer: exec start timeout\n");
     return 0;
 }
 
@@ -980,7 +1071,8 @@ static int append_target_cstr_arg(struct exec_bootstrap_config *cfg, u16 *cursor
     char *temp = g_execve_target_arg_buf;
     if (!copy_cstr_from_target(target_va, temp, sizeof(g_execve_target_arg_buf))) {
         u64 vfork_parent = g_proc ? g_proc->vfork_parent_principal : 0;
-        if (vfork_parent == 0 && g_abi_ctx && g_abi_ctx->request) vfork_parent = vfork_parent_for_principal(g_abi_ctx->request->caller_principal);
+        const struct trap_request *req = abi_current_request();
+        if (vfork_parent == 0 && req != 0) vfork_parent = vfork_parent_for_principal(req->caller_principal);
         if (!copy_cstr_from_trap_target(vfork_parent, target_va, temp, sizeof(g_execve_target_arg_buf))) {
             user_log("LinuxAbiServer: execve cstr copy failed va=");
             user_log_hex_value(target_va);
@@ -996,7 +1088,8 @@ static int append_target_argv_tail(struct exec_bootstrap_config *cfg, u16 *curso
         u64 ptr = 0;
         if (copy_from_target(argv_va + source_index * 8, &ptr, 8) != 8) {
             u64 vfork_parent = g_proc ? g_proc->vfork_parent_principal : 0;
-            if (vfork_parent == 0 && g_abi_ctx && g_abi_ctx->request) vfork_parent = vfork_parent_for_principal(g_abi_ctx->request->caller_principal);
+            const struct trap_request *req = abi_current_request();
+            if (vfork_parent == 0 && req != 0) vfork_parent = vfork_parent_for_principal(req->caller_principal);
             if (copy_from_trap_target(vfork_parent, argv_va + source_index * 8, &ptr, 8) != 8) {
                 user_log("LinuxAbiServer: execve argv ptr copy failed va=");
                 user_log_hex_value(argv_va + source_index * 8);
@@ -1293,6 +1386,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
         }
         const u64 old_principal = req->caller_principal;
         u64 spawned_principal = 0;
+        exec_launch_sequence_acquire();
         if (!launch_exec_for_shebang(
             req->caller_principal,
             interpreter_load_path,
@@ -1303,10 +1397,10 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
             req->args[2],
             &spawned_principal
         )) {
+            exec_launch_sequence_release();
             reply_vfork_parent_if_any(g_proc);
             return reply(errno_io(), 0);
         }
-        reply_vfork_parent_if_any(g_proc);
         if (g_proc) {
             close_cloexec_fds_for_execve();
             clear_process_timers(g_proc);
@@ -1316,20 +1410,36 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
             if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
         }
         reset_exec_runtime_state();
+        if (!start_prepared_exec_launch(spawned_principal)) {
+            exec_launch_sequence_release();
+            if (g_proc) {
+                g_proc->principal = old_principal;
+                g_proc->exec_pending = 0;
+                g_proc->exec_pending_principal = 0;
+            }
+            if (!g_root_linux_principal_set || g_root_linux_principal == 0) {
+                g_root_linux_principal = old_principal;
+                g_root_linux_principal_set = 1;
+            }
+            return reply(errno_io(), 0);
+        }
         exit_trap_target_no_wait(old_principal);
+        exec_launch_sequence_release();
+        reply_vfork_parent_if_any(g_proc);
         return wait_ipc();
     }
     if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
     execve_profile_step("probe lookup done");
     const u64 old_principal = req->caller_principal;
     u64 spawned_principal = 0;
+    exec_launch_sequence_acquire();
     if (!launch_exec_for_execve(req->caller_principal, load_path, req->args[1], req->args[2], argv0_override, &spawned_principal)) {
+        exec_launch_sequence_release();
         reply_vfork_parent_if_any(g_proc);
         return reply(errno_io(), 0);
     }
     execve_profile_step("spawn exec done");
     execve_profile_flush();
-    reply_vfork_parent_if_any(g_proc);
     if (g_proc) {
         close_cloexec_fds_for_execve();
         clear_process_timers(g_proc);
@@ -1339,6 +1449,21 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
         if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
     }
     reset_exec_runtime_state();
+    if (!start_prepared_exec_launch(spawned_principal)) {
+        exec_launch_sequence_release();
+        if (g_proc) {
+            g_proc->principal = old_principal;
+            g_proc->exec_pending = 0;
+            g_proc->exec_pending_principal = 0;
+        }
+        if (!g_root_linux_principal_set || g_root_linux_principal == 0) {
+            g_root_linux_principal = old_principal;
+            g_root_linux_principal_set = 1;
+        }
+        return reply(errno_io(), 0);
+    }
     exit_trap_target_no_wait(old_principal);
+    exec_launch_sequence_release();
+    reply_vfork_parent_if_any(g_proc);
     return wait_ipc();
 }

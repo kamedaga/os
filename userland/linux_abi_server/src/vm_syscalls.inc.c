@@ -300,6 +300,27 @@ static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot) {
     return apply_target_pages(start, page_count, prot, map_reply_target_pages);
 }
 
+static int copy_zero_to_target_range(u64 dst, u64 len);
+
+static u64 map_zeroed_target_pages_chunked(u64 start, u64 page_count, u64 prot) {
+    const u64 map_prot = (prot | 0x2) & ~0x4;
+    const u64 status = map_target_pages_chunked(start, page_count, map_prot);
+    if (status != SYSCALL_OK) return status;
+    const u64 size = page_count * PAGE_BYTES;
+    if (!copy_zero_to_target_range(start, size)) {
+        (void)unmap_reply_target_pages(start, page_count);
+        return SYSCALL_ERR_MAP;
+    }
+    if (map_prot != prot) {
+        const u64 protect_status = apply_target_pages(start, page_count, prot, protect_reply_target_pages);
+        if (protect_status != SYSCALL_OK) {
+            (void)unmap_reply_target_pages(start, page_count);
+            return protect_status;
+        }
+    }
+    return SYSCALL_OK;
+}
+
 static int has_thread_group_peers(void) {
     if (!g_proc || g_proc->pid == 0) return 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
@@ -496,22 +517,22 @@ static struct ipc_message handle_page_fault(const struct trap_request *req) {
         const u64 re = rs + g_regions[i].size;
         if (fault_page < rs || fault_page >= re) continue;
         const u64 prot = g_regions[i].prot;
-        if ((req->error_code & PF_WRITE) != 0 && (prot & 0x2) == 0) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
-        if ((req->error_code & PF_INSTRUCTION) != 0 && (prot & 0x4) == 0) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+        if ((req->error_code & PF_WRITE) != 0 && (prot & 0x2) == 0) return terminate_current_linux_process_from_trap(req->caller_principal, 139, 139, TRAP_RESPONSE_FLAG_EXIT);
+        if ((req->error_code & PF_INSTRUCTION) != 0 && (prot & 0x4) == 0) return terminate_current_linux_process_from_trap(req->caller_principal, 139, 139, TRAP_RESPONSE_FLAG_EXIT);
         if (g_regions[i].file_backed && g_regions[i].file_lazy) {
             u64 size = LINUX_FILE_FAULT_CLUSTER_PAGES * PAGE_BYTES;
             if (size > re - fault_page) size = re - fault_page;
-            if (!materialize_lazy_file_range(fault_page, size, prot)) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+            if (!materialize_lazy_file_range(fault_page, size, prot)) return terminate_current_linux_process_from_trap(req->caller_principal, 139, 139, TRAP_RESPONSE_FLAG_EXIT);
             return reply(req->rax, 0);
         }
         if ((req->error_code & PF_PRESENT) != 0) {
             const u64 status = protect_reply_target_pages(fault_page, 1, prot);
-            if (status != SYSCALL_OK) return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+            if (status != SYSCALL_OK) return terminate_current_linux_process_from_trap(req->caller_principal, 139, 139, TRAP_RESPONSE_FLAG_EXIT);
             return reply(req->rax, 0);
         }
-        return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+        return terminate_current_linux_process_from_trap(req->caller_principal, 139, 139, TRAP_RESPONSE_FLAG_EXIT);
     }
-    return reply(139, TRAP_RESPONSE_FLAG_EXIT);
+    return terminate_current_linux_process_from_trap(req->caller_principal, 139, 139, TRAP_RESPONSE_FLAG_EXIT);
 }
 
 static struct ipc_message handle_mmap(const struct trap_request *req) {
@@ -570,11 +591,17 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
         return reply(target_va, 0);
     }
     if ((flags & MAP_FIXED) != 0 && !unmap_overlapping_target_range(target_va, size)) return reply(errno_nomem(), 0);
-    u64 map_status = (lazy_file || cache_vm_object_file) ? SYSCALL_OK : map_target_pages_chunked(target_va, page_count, map_prot);
+    u64 map_status = (lazy_file || cache_vm_object_file) ? SYSCALL_OK :
+        (file_backed ? map_target_pages_chunked(target_va, page_count, map_prot) :
+            map_zeroed_target_pages_chunked(target_va, page_count, prot));
     if (map_status == SYSCALL_ERR_MAP && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) {
         g_mmap_next_va = target_va + size;
         target_va = find_mmap_area(size);
-        if (target_va != 0) map_status = (lazy_file || cache_vm_object_file) ? SYSCALL_OK : map_target_pages_chunked(target_va, page_count, map_prot);
+        if (target_va != 0) {
+            map_status = (lazy_file || cache_vm_object_file) ? SYSCALL_OK :
+                (file_backed ? map_target_pages_chunked(target_va, page_count, map_prot) :
+                    map_zeroed_target_pages_chunked(target_va, page_count, prot));
+        }
     }
     if (map_status == SYSCALL_OK) {
         int mapped_from_cache = 0;
@@ -608,6 +635,10 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
                 user_log("\n");
             }
             if (copied < expected) return reply(errno_io(), 0);
+            if (copied < size && !copy_zero_to_target_range(target_va + copied, size - copied)) {
+                (void)unmap_reply_target_pages(target_va, page_count);
+                return reply(errno_fault(), 0);
+            }
             if (map_prot != effective_prot) {
                 const u64 protect_status = apply_target_pages(target_va, page_count, effective_prot, protect_reply_target_pages);
                 if (protect_status != SYSCALL_OK) {
@@ -675,7 +706,7 @@ static struct ipc_message handle_mremap(const struct trap_request *req) {
     const u64 grow_addr = old_addr + old_size;
     if ((flags & MREMAP_FIXED) == 0 && vm_range_uncovered(grow_addr, extra_size)) {
         const u64 extra_pages = extra_size / PAGE_BYTES;
-        const u64 status = map_target_pages_chunked(grow_addr, extra_pages, prot);
+        const u64 status = map_zeroed_target_pages_chunked(grow_addr, extra_pages, prot);
         if (status == SYSCALL_OK) {
             if (!vm_add_region(grow_addr, extra_size, prot, 0, 0, 0, 0, 0)) {
                 (void)unmap_tracked_target_range(grow_addr, extra_size);
@@ -699,7 +730,7 @@ static struct ipc_message handle_brk(const struct trap_request *req) {
         u64 from = page_up(g_brk_next_va);
         u64 to = page_up(req->args[0]);
         if (to > from) {
-            const u64 status = map_target_pages_chunked(from, (to - from) / PAGE_BYTES, 0x3);
+            const u64 status = map_zeroed_target_pages_chunked(from, (to - from) / PAGE_BYTES, 0x3);
             if (status != SYSCALL_OK) return reply(g_brk_next_va, 0);
             if (!vm_add_region(from, to - from, 0x3, 0, 0, 0, 0, 0)) {
                 user_log("LinuxAbiServer: brk vm_add_region failed\n");
@@ -736,6 +767,28 @@ static struct ipc_message handle_mprotect(const struct trap_request *req) {
     }
     if (tracked) vm_protect_range(start, size, prot);
     vm_trace4("vm.mprotect.done", start, size, prot, 0);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_mincore(const struct trap_request *req) {
+    const u64 start = req->args[0];
+    const u64 len = req->args[1];
+    const u64 vec = req->args[2];
+    if (len == 0) return reply(errno_inval(), 0);
+    if (vec == 0 || (start & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0);
+    const u64 size = page_up(len);
+    const u64 page_count = size / PAGE_BYTES;
+    if (!vm_range_covered(start, size)) return reply(errno_nomem(), 0);
+
+    u8 resident[64];
+    for (u64 i = 0; i < sizeof(resident); i++) resident[i] = 1;
+    u64 done = 0;
+    while (done < page_count) {
+        u64 chunk = page_count - done;
+        if (chunk > sizeof(resident)) chunk = sizeof(resident);
+        if (copy_to_target(vec + done, resident, chunk) != chunk) return reply(errno_fault(), 0);
+        done += chunk;
+    }
     return reply(0, 0);
 }
 

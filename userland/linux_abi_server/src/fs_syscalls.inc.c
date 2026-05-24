@@ -456,11 +456,13 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         return reply(fault ? errno_fault() : n, 0);
     }
     if (g_fds[fd].kind == FD_PIPE_READ) {
+        g_prof.pipe_read_calls++;
         const u8 pipe_id = g_fds[fd].pipe_id;
         if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
         struct pipe_entry *pipe = &g_pipes[pipe_id];
         if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
-            if (pipe->pending_read) return reply(errno_again(), 0);
+            if (pipe->pending_read) { g_prof.pipe_read_again++; return reply(errno_again(), 0); }
+            g_prof.pipe_read_blocked++;
             pipe->pending_read = 1;
             pipe->pending_principal = req->caller_principal;
             pipe->pending_dst = dst;
@@ -599,15 +601,17 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
     }
     u64 total = 0;
     if (g_fds[fd].kind == FD_PIPE_READ) {
+        g_prof.pipe_read_calls++;
         const u8 pipe_id = g_fds[fd].pipe_id;
         if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return reply(errno_badf(), 0);
         struct pipe_entry *pipe = &g_pipes[pipe_id];
         if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
-            if (pipe->pending_read) return reply(errno_again(), 0);
+            if (pipe->pending_read) { g_prof.pipe_read_again++; return reply(errno_again(), 0); }
             for (u64 i = 0; i < iovcnt; i++) {
                 u64 pair[2];
                 if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
                 if (pair[1] == 0) continue;
+                g_prof.pipe_read_blocked++;
                 pipe->pending_read = 1;
                 pipe->pending_principal = req->caller_principal;
                 pipe->pending_dst = pair[0];
@@ -617,7 +621,7 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
             }
             return reply(0, 0);
         }
-        if (pipe->len == 0) return reply(0, 0);
+        if (pipe->len == 0) { g_prof.pipe_read_eof++; return reply(0, 0); }
         for (u64 i = 0; i < iovcnt; i++) {
             u64 pair[2];
             if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
@@ -699,6 +703,7 @@ static struct ipc_message handle_write(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 src = req->args[1]; const u64 len = req->args[2];
     if (fd_valid(fd) && g_fds[fd].kind == FD_SOCKET) return reply(socket_write_from_target(fd, src, len), 0);
     if (fd_valid(fd) && g_fds[fd].kind == FD_PIPE_WRITE) {
+        g_prof.pipe_write_calls++;
         const u8 pipe_id = g_fds[fd].pipe_id;
         int fault = 0; const u64 n = pipe_write_from_target(fd, src, len, &fault);
         if (!fault && (i64)n > 0) try_satisfy_pending_pipe_read(pipe_id);
@@ -739,6 +744,7 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
         return reply(socket_send_iov_from_target(fd, iov, iovcnt), 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_PIPE_WRITE) {
+        g_prof.pipe_write_calls++;
         if (iovcnt > 64) return reply(errno_inval(), 0);
         u64 total = 0;
         const u8 pipe_id = g_fds[fd].pipe_id;

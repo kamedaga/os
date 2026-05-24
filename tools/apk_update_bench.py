@@ -10,6 +10,38 @@ from pathlib import Path
 
 
 COUNTER_KEYS = [
+    "LinuxAbiServer.perf.syscall_category.io",
+    "LinuxAbiServer.perf.syscall_category.fd",
+    "LinuxAbiServer.perf.syscall_category.fs",
+    "LinuxAbiServer.perf.syscall_category.net",
+    "LinuxAbiServer.perf.syscall_category.proc",
+    "LinuxAbiServer.perf.syscall_category.vm",
+    "LinuxAbiServer.perf.syscall_category.time",
+    "LinuxAbiServer.perf.syscall_category.signal",
+    "LinuxAbiServer.perf.syscall_category.misc",
+    "LinuxAbiServer.perf.syscall_category.stub_ok",
+    "LinuxAbiServer.perf.syscall_category.stub_err",
+    "LinuxAbiServer.perf.pipe.create_calls",
+    "LinuxAbiServer.perf.pipe.create_busy",
+    "LinuxAbiServer.perf.pipe.create_faults",
+    "LinuxAbiServer.perf.pipe.dup_refs",
+    "LinuxAbiServer.perf.pipe.close_calls",
+    "LinuxAbiServer.perf.pipe.deferred_wakes",
+    "LinuxAbiServer.perf.pipe.wake_flushes",
+    "LinuxAbiServer.perf.pipe.wake_replies",
+    "LinuxAbiServer.perf.pipe.read_calls",
+    "LinuxAbiServer.perf.pipe.read_bytes",
+    "LinuxAbiServer.perf.pipe.read_blocked",
+    "LinuxAbiServer.perf.pipe.read_again",
+    "LinuxAbiServer.perf.pipe.read_eof",
+    "LinuxAbiServer.perf.pipe.read_faults",
+    "LinuxAbiServer.perf.pipe.write_calls",
+    "LinuxAbiServer.perf.pipe.write_bytes",
+    "LinuxAbiServer.perf.pipe.write_again",
+    "LinuxAbiServer.perf.pipe.write_faults",
+    "LinuxAbiServer.perf.pipe.write_broken",
+    "LinuxAbiServer.perf.pipe.epoll_wait_calls",
+    "LinuxAbiServer.perf.pipe.epoll_ready",
     "LinuxAbiServer.perf.net.requests",
     "LinuxAbiServer.perf.net.wait_calls",
     "LinuxAbiServer.perf.net.wait_loops",
@@ -141,6 +173,8 @@ def parse_serial(text: str) -> dict[str, int]:
     flat = " ".join(clean.split())
     for match in re.finditer(r"(LinuxAbiServer\.perf\.[A-Za-z0-9_.]+)=\s*([0-9,]+)", flat):
         counters[match.group(1)] = parse_number(match.group(2))
+    for match in re.finditer(r"LinuxAbiServer\.perf\.syscall_category\s+([A-Za-z0-9_]+)=\s*([0-9,]+)", flat):
+        counters[f"LinuxAbiServer.perf.syscall_category.{match.group(1)}"] = parse_number(match.group(2))
     for match in re.finditer(r"KernelExecProfile\.ipc\s+([A-Za-z0-9_]+)=\s*([0-9,]+)", flat):
         counters[f"KernelExecProfile.ipc.{match.group(1)}"] = parse_number(match.group(2))
     for match in re.finditer(r"KernelExecProfile\.item\s+([A-Za-z0-9_]+)\s+count=([0-9,]+)\s+", flat):
@@ -181,6 +215,10 @@ def parse_serial(text: str) -> dict[str, int]:
         match = re.match(r"(LinuxAbiServer\.perf\.[A-Za-z0-9_.]+)=([0-9,]+)$", line)
         if match:
             counters[match.group(1)] = parse_number(match.group(2))
+            continue
+        match = re.match(r"LinuxAbiServer\.perf\.syscall_category ([A-Za-z0-9_]+)=([0-9,]+)$", line)
+        if match:
+            counters[f"LinuxAbiServer.perf.syscall_category.{match.group(1)}"] = parse_number(match.group(2))
             continue
         match = re.match(
             r"LinuxAbiServer\.perf\.net\.wait_op ([A-Za-z0-9_]+) "
@@ -297,6 +335,52 @@ def write_summary(out_root: Path, rows: list[dict[str, object]], keys: list[str]
         run_rows,
     ))
     lines.append("")
+
+    category_names = ["io", "fd", "fs", "net", "proc", "vm", "time", "signal", "misc", "stub_ok", "stub_err"]
+    category_rows: list[list[str]] = []
+    for category in category_names:
+        key = f"LinuxAbiServer.perf.syscall_category.{category}"
+        values = [int(row.get(key, 0) or 0) for row in rows]
+        if sum(values) == 0:
+            continue
+        category_rows.append([category, f"{statistics.mean(values):.1f}", str(max(values))])
+    if category_rows:
+        lines.extend(["", "## Syscall Categories", ""])
+        lines.append(markdown_table(["Category", "Avg calls", "Max calls"], category_rows))
+        lines.append("")
+
+    pipe_rows: list[list[str]] = []
+    for label, key in (
+        ("create", "LinuxAbiServer.perf.pipe.create_calls"),
+        ("create_busy", "LinuxAbiServer.perf.pipe.create_busy"),
+        ("create_faults", "LinuxAbiServer.perf.pipe.create_faults"),
+        ("dup_refs", "LinuxAbiServer.perf.pipe.dup_refs"),
+        ("close", "LinuxAbiServer.perf.pipe.close_calls"),
+        ("deferred_wakes", "LinuxAbiServer.perf.pipe.deferred_wakes"),
+        ("wake_flushes", "LinuxAbiServer.perf.pipe.wake_flushes"),
+        ("wake_replies", "LinuxAbiServer.perf.pipe.wake_replies"),
+        ("read_calls", "LinuxAbiServer.perf.pipe.read_calls"),
+        ("read_bytes", "LinuxAbiServer.perf.pipe.read_bytes"),
+        ("read_blocked", "LinuxAbiServer.perf.pipe.read_blocked"),
+        ("read_again", "LinuxAbiServer.perf.pipe.read_again"),
+        ("read_eof", "LinuxAbiServer.perf.pipe.read_eof"),
+        ("read_faults", "LinuxAbiServer.perf.pipe.read_faults"),
+        ("write_calls", "LinuxAbiServer.perf.pipe.write_calls"),
+        ("write_bytes", "LinuxAbiServer.perf.pipe.write_bytes"),
+        ("write_again", "LinuxAbiServer.perf.pipe.write_again"),
+        ("write_faults", "LinuxAbiServer.perf.pipe.write_faults"),
+        ("write_broken", "LinuxAbiServer.perf.pipe.write_broken"),
+        ("epoll_wait", "LinuxAbiServer.perf.pipe.epoll_wait_calls"),
+        ("epoll_ready", "LinuxAbiServer.perf.pipe.epoll_ready"),
+    ):
+        values = [int(row.get(key, 0) or 0) for row in rows]
+        if sum(values) == 0:
+            continue
+        pipe_rows.append([label, f"{statistics.mean(values):.1f}", str(max(values))])
+    if pipe_rows:
+        lines.extend(["", "## Pipe Counters", ""])
+        lines.append(markdown_table(["Counter", "Avg", "Max"], pipe_rows))
+        lines.append("")
 
     corr_rows: list[list[str]] = []
     for key in keys:

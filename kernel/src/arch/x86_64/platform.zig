@@ -308,10 +308,6 @@ pub fn cr3AddressPart(value: u64) u64 {
 pub fn cr3WithUserPcid(raw_cr3: u64, pcid: u16) u64 {
     const raw = cr3AddressPart(raw_cr3);
     if (pcid_enabled == 0 or pcid == 0) return raw;
-    // Process slots and their PCIDs are reused aggressively during exec/spawn
-    // tests. Until we have generation-based INVPCID/TLB shootdown, switching
-    // with CR3.NOFLUSH can let APs observe stale translations for a newly
-    // rebuilt address space.
     return raw | (@as(u64, pcid) & 0xfff);
 }
 

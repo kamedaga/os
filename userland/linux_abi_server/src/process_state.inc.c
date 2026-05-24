@@ -81,6 +81,14 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
         proc->sig_restorer[i] = 0;
     }
 }
+
+static void reset_process_runtime_for_exec(struct linux_process_state *proc) {
+    if (!proc) return;
+    proc->mmap_next_va = LINUX_MMAP_BASE_VA;
+    proc->brk_next_va = LINUX_BRK_INITIAL_VA;
+    for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
+}
+
 static void init_process_tables(void) {
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         g_processes[i].used = 0;
@@ -111,6 +119,7 @@ static struct linux_process_state *process_state_for(u64 principal) {
         g_processes[i].principal = principal;
         g_processes[i].exec_pending = 0;
         g_processes[i].exec_pending_principal = 0;
+        reset_process_runtime_for_exec(&g_processes[i]);
         return &g_processes[i];
     }
     struct linux_process_state *single_pending = 0;
@@ -124,6 +133,7 @@ static struct linux_process_state *process_state_for(u64 principal) {
         single_pending->principal = principal;
         single_pending->exec_pending = 0;
         single_pending->exec_pending_principal = 0;
+        reset_process_runtime_for_exec(single_pending);
         return single_pending;
     }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) { if (g_processes[i].used) continue; init_process_state(&g_processes[i], principal); return &g_processes[i]; }
@@ -249,16 +259,27 @@ static void close_socket_entry(struct fd_entry *entry) {
 }
 
 static int pipe_has_live_writer(u8 pipe_id);
+static int pipe_pending_reader_owns_fd(u8 pipe_id, u64 principal);
 static void try_satisfy_pending_pipe_read(u8 pipe_id);
 
 static void defer_pipe_wake(u8 pipe_id) {
     if (pipe_id < PIPE_MAX) g_deferred_pipe_wake_mask |= (u32)(1u << pipe_id);
+    g_prof.pipe_deferred_wakes++;
     prime_reply_return_signal();
+}
+
+static void clear_pipe_pending_read(struct pipe_entry *pipe) {
+    if (!pipe) return;
+    pipe->pending_read = 0;
+    pipe->pending_principal = 0;
+    pipe->pending_dst = 0;
+    pipe->pending_len = 0;
 }
 
 static void flush_deferred_pipe_wakes(void) {
     const u32 mask = g_deferred_pipe_wake_mask;
     g_deferred_pipe_wake_mask = 0;
+    if (mask != 0) g_prof.pipe_wake_flushes++;
     for (u8 pipe_id = 0; pipe_id < PIPE_MAX; pipe_id++) {
         if ((mask & (u32)(1u << pipe_id)) == 0) continue;
         try_satisfy_pending_pipe_read(pipe_id);
@@ -269,10 +290,17 @@ static void close_pipe_entry(struct fd_entry *entry) {
     if (!fd_entry_is_pipe(entry)) return;
     const u8 pipe_id = entry->pipe_id;
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return;
-    if (entry->kind == FD_PIPE_READ && g_pipes[pipe_id].read_refs != 0) g_pipes[pipe_id].read_refs--;
-    if (entry->kind == FD_PIPE_WRITE && g_pipes[pipe_id].write_refs != 0) g_pipes[pipe_id].write_refs--;
+    struct pipe_entry *pipe = &g_pipes[pipe_id];
+    g_prof.pipe_close_calls++;
+    if (entry->kind == FD_PIPE_READ && pipe->read_refs != 0) {
+        pipe->read_refs--;
+        if (pipe->pending_read && (pipe->pending_principal == (g_proc ? g_proc->principal : 0) || pipe->read_refs == 0)) {
+            clear_pipe_pending_read(pipe);
+        }
+    }
+    if (entry->kind == FD_PIPE_WRITE && pipe->write_refs != 0) pipe->write_refs--;
     defer_pipe_wake(pipe_id);
-    if (g_pipes[pipe_id].read_refs == 0 && g_pipes[pipe_id].write_refs == 0) g_pipes[pipe_id].used = 0;
+    if (pipe->read_refs == 0 && pipe->write_refs == 0) pipe->used = 0;
 }
 static void close_pipe_fd(u64 fd) {
     if (!fd_is_pipe(fd)) return;
@@ -283,6 +311,11 @@ static void try_satisfy_pending_pipe_read(u8 pipe_id) {
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return;
     struct pipe_entry *pipe = &g_pipes[pipe_id];
     if (!pipe->pending_read) return;
+    if (!pipe_pending_reader_owns_fd(pipe_id, pipe->pending_principal)) {
+        clear_pipe_pending_read(pipe);
+        if (pipe->read_refs == 0 && pipe->write_refs == 0) pipe->used = 0;
+        return;
+    }
     if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) return;
     const u64 principal = pipe->pending_principal;
     const u64 dst = pipe->pending_dst;
@@ -304,17 +337,17 @@ static void try_satisfy_pending_pipe_read(u8 pipe_id) {
         }
         if (fault) {
             result = errno_fault();
+            g_prof.pipe_read_faults++;
         } else {
             pipe->head = (pipe->head + n) % PIPE_BUFFER_BYTES;
             pipe->len -= n;
             result = n;
+            g_prof.pipe_read_bytes += n;
         }
     }
 
-    pipe->pending_read = 0;
-    pipe->pending_principal = 0;
-    pipe->pending_dst = 0;
-    pipe->pending_len = 0;
+    clear_pipe_pending_read(pipe);
+    g_prof.pipe_wake_replies++;
     (void)reply_trap_target(principal, result, 0);
 }
 
@@ -325,17 +358,18 @@ static u64 pipe_read_to_target(u64 fd, u64 dst, u64 len, int *fault) {
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used || g_pipes[pipe_id].read_refs == 0) return errno_badf();
     struct pipe_entry *pipe = &g_pipes[pipe_id];
     if (len == 0) return 0;
-    if (pipe->len == 0) return 0;
+    if (pipe->len == 0) { g_prof.pipe_read_eof++; return 0; }
     const u64 n = min_u64(len, pipe->len);
     u64 done = 0;
     while (done < n) {
         const u64 index = (pipe->head + done) % PIPE_BUFFER_BYTES;
         const u64 contiguous = min_u64(n - done, PIPE_BUFFER_BYTES - index);
-        if (copy_to_target(dst + done, &pipe->bytes[index], contiguous) != contiguous) { *fault = 1; return 0; }
+        if (copy_to_target(dst + done, &pipe->bytes[index], contiguous) != contiguous) { *fault = 1; g_prof.pipe_read_faults++; return 0; }
         done += contiguous;
     }
     pipe->head = (pipe->head + n) % PIPE_BUFFER_BYTES;
     pipe->len -= n;
+    g_prof.pipe_read_bytes += n;
     return n;
 }
 
@@ -345,18 +379,19 @@ static u64 pipe_write_from_target(u64 fd, u64 src, u64 len, int *fault) {
     const u8 pipe_id = g_fds[fd].pipe_id;
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used || g_pipes[pipe_id].write_refs == 0) return errno_badf();
     struct pipe_entry *pipe = &g_pipes[pipe_id];
-    if (pipe->read_refs == 0) return errno_pipe();
+    if (pipe->read_refs == 0) { g_prof.pipe_write_broken++; return errno_pipe(); }
     if (len == 0) return 0;
     u64 written = 0;
     while (written < len && pipe->len < PIPE_BUFFER_BYTES) {
         const u64 tail = (pipe->head + pipe->len) % PIPE_BUFFER_BYTES;
         const u64 space = PIPE_BUFFER_BYTES - pipe->len;
         const u64 contiguous = min_u64(min_u64(len - written, PIPE_BUFFER_BYTES - tail), space);
-        if (copy_from_target(src + written, &pipe->bytes[tail], contiguous) != contiguous) { *fault = 1; return written; }
+        if (copy_from_target(src + written, &pipe->bytes[tail], contiguous) != contiguous) { *fault = 1; g_prof.pipe_write_faults++; return written; }
         pipe->len += contiguous;
         written += contiguous;
     }
-    if (written == 0) return errno_again();
+    if (written == 0) { g_prof.pipe_write_again++; return errno_again(); }
+    g_prof.pipe_write_bytes += written;
     return written;
 }
 static int alloc_fd(void) { for (int i = 3; i < 32; i++) if (g_fds[i].kind == FD_UNUSED) return i; return -1; }
@@ -383,6 +418,20 @@ static int pipe_has_live_writer(u8 pipe_id) {
     }
     return 0;
 }
+
+static int pipe_pending_reader_owns_fd(u8 pipe_id, u64 principal) {
+    if (pipe_id >= PIPE_MAX || principal == 0) return 0;
+    for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
+        struct linux_process_state *proc = &g_processes[p];
+        if (!proc->used || proc->principal != principal) continue;
+        for (u64 fd = 0; fd < 32; fd++) {
+            if (proc->fds[fd].kind == FD_PIPE_READ && proc->fds[fd].pipe_id == pipe_id) return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static struct linux_process_state *process_state_for_pid(u64 pid) {
     if (pid == 0) return 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) if (g_processes[i].used && g_processes[i].pid == pid) return &g_processes[i];

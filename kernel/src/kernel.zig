@@ -701,31 +701,111 @@ pub const VmObjectCapability = struct {
 };
 
 pub const VmObjectCNode = struct {
-    pub const max_caps = 64;
+    pub const inline_caps = 64;
+    pub const chunk_caps = 64;
+    pub const chunk_pool_count = 256;
+    pub const max_caps = inline_caps + chunk_pool_count * chunk_caps;
+    const invalid_chunk: u16 = std.math.maxInt(u16);
 
-    caps: [max_caps]VmObjectCapability = undefined,
+    caps: [inline_caps]VmObjectCapability = undefined,
+    overflow_head: u16 = invalid_chunk,
     len: usize = 0,
 
     pub fn add(self: *VmObjectCNode, cap: VmObjectCapability) KernelError!void {
         if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
-        if (self.len >= self.caps.len) return KernelError.TableFull;
-        self.caps[self.len] = cap;
+        const slot = try self.slotAtOrAllocate(self.len);
+        slot.* = cap;
         self.len += 1;
     }
 
+    pub fn reset(self: *VmObjectCNode) void {
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            const next = vm_object_cap_chunk_pool[chunk_index].next;
+            vm_object_cap_chunk_pool[chunk_index] = .{};
+            chunk_index = next;
+        }
+        self.* = .{};
+    }
+
     pub fn findByCapId(self: *const VmObjectCNode, cap_id: u64) ?*const VmObjectCapability {
-        if (self.findIndexByCapId(cap_id)) |index| return &self.caps[index];
+        if (self.findIndexByCapId(cap_id)) |index| return self.slotAtConst(index);
         return null;
     }
 
     fn findIndexByCapId(self: *const VmObjectCNode, cap_id: u64) ?usize {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
-            if (self.caps[i].cap_id == cap_id) return i;
+            const cap = self.slotAtConst(i) orelse return null;
+            if (cap.cap_id == cap_id) return i;
         }
         return null;
     }
+
+    fn slotAtConst(self: *const VmObjectCNode, index: usize) ?*const VmObjectCapability {
+        if (index < inline_caps) return &self.caps[index];
+        var remaining = index - inline_caps;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_caps) return &vm_object_cap_chunk_pool[chunk_index].caps[remaining];
+            remaining -= chunk_caps;
+            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAtOrAllocate(self: *VmObjectCNode, index: usize) KernelError!*VmObjectCapability {
+        if (index < inline_caps) return &self.caps[index];
+        const needed_chunk_offset = (index - inline_caps) / chunk_caps;
+        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
+        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocVmObjectCapChunk();
+
+        var chunk_index = self.overflow_head;
+        var offset: usize = 0;
+        while (offset < needed_chunk_offset) : (offset += 1) {
+            if (vm_object_cap_chunk_pool[chunk_index].next == invalid_chunk) {
+                vm_object_cap_chunk_pool[chunk_index].next = try allocVmObjectCapChunk();
+            }
+            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
+        }
+        return &vm_object_cap_chunk_pool[chunk_index].caps[(index - inline_caps) % chunk_caps];
+    }
 };
+
+const VmObjectCapChunk = struct {
+    used: bool = false,
+    next: u16 = VmObjectCNode.invalid_chunk,
+    caps: [VmObjectCNode.chunk_caps]VmObjectCapability = undefined,
+};
+
+var vm_object_cap_chunk_pool: [VmObjectCNode.chunk_pool_count]VmObjectCapChunk = [_]VmObjectCapChunk{.{}} ** VmObjectCNode.chunk_pool_count;
+
+fn allocVmObjectCapChunk() KernelError!u16 {
+    var i: usize = 0;
+    while (i < vm_object_cap_chunk_pool.len) : (i += 1) {
+        if (vm_object_cap_chunk_pool[i].used) continue;
+        vm_object_cap_chunk_pool[i] = .{ .used = true };
+        return @intCast(i);
+    }
+    return KernelError.TableFull;
+}
+
+fn staticStorageEnd(comptime T: type, ptr: *T) usize {
+    return @intFromPtr(ptr) + @sizeOf(T);
+}
+
+fn maxStaticEnd(a: usize, b: usize) usize {
+    return if (a > b) a else b;
+}
+
+pub fn kernelStaticStorageEndAddr() usize {
+    var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cap_chunk_pool), &cap_chunk_pool));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store), &vm_object_backing_page_store));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store_next), &vm_object_backing_page_store_next));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_cap_chunk_pool), &vm_object_cap_chunk_pool));
+    return end;
+}
 
 pub const RegionFreeRange = struct {
     region_id: u64,
@@ -1189,7 +1269,7 @@ pub const KernelState = struct {
         self.ipc_buffer_tables[index] = .{};
         self.ipc_buffer_mailboxes[index] = .{};
         self.pending_ipc_buffer_transfers[index] = null;
-        self.vm_object_tables[index] = .{};
+        self.vm_object_tables[index].reset();
     }
 
     pub fn createProcessDescriptor(self: *KernelState, label: []const u8) ?PrincipalId {
@@ -1343,7 +1423,7 @@ pub const KernelState = struct {
             self.ipc_buffer_tables[i] = .{};
             self.ipc_buffer_mailboxes[i] = .{};
             self.pending_ipc_buffer_transfers[i] = null;
-            self.vm_object_tables[i] = .{};
+            self.vm_object_tables[i].reset();
         }
         self.published_service_endpoints = .{};
         i = 0;

@@ -83,6 +83,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces_storage), &user_spaces_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(global_free_list), &global_free_list));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_global), &kernel_state_global));
+    end = maxStaticEnd(end, kernel.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_ready), &kernel_state_ready));
     end = maxStaticEnd(end, capability.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
@@ -448,7 +449,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_state_global.endpoint_tables[process_index] = .{};
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;
-    kernel_state_global.vm_object_tables[process_index] = .{};
+    kernel_state_global.vm_object_tables[process_index].reset();
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -496,7 +497,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     kernel_state_global.endpoint_tables[process_index] = .{};
     kernel_state_global.cap_mailboxes[process_index] = .{};
     kernel_state_global.pending_page_transfers[process_index] = null;
-    kernel_state_global.vm_object_tables[process_index] = .{};
+    kernel_state_global.vm_object_tables[process_index].reset();
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;

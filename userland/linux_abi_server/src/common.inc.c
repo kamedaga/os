@@ -53,9 +53,13 @@ enum {
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_REPLY_ABI_TRAP_TARGET_CONTEXT = 0x64,
     SYSCALL_OK = 0,
+    SYSCALL_ERR_INVALID = 1,
     SYSCALL_ERR_NOT_READY = 2,
+    SYSCALL_ERR_ALLOC = 4,
     SYSCALL_ERR_MAP = 5,
+    SYSCALL_ERR_SEND = 8,
     SYSCALL_ERR_ENDPOINT = 9,
+    SYSCALL_ERR_GRANT = 11,
     IPC_CALL_FLAG_SIGNAL_ONLY = 0x2,
     WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE = 0x2,
 
@@ -217,6 +221,7 @@ enum {
     LINUX_SYS_PIPE = 22,
     LINUX_SYS_SELECT = 23,
     LINUX_SYS_MREMAP = 25,
+    LINUX_SYS_MINCORE = 27,
     LINUX_SYS_MADVISE = 28,
     LINUX_SYS_DUP = 32,
     LINUX_SYS_DUP2 = 33,
@@ -333,6 +338,7 @@ enum {
     LINUX_SYS_RENAMEAT2 = 316,
     LINUX_SYS_MEMBARRIER = 324,
     LINUX_SYS_RSEQ = 334,
+    LINUX_SYSCALL_METADATA_MAX_NR = LINUX_SYS_FACCESSAT2,
     AT_FDCWD_U64 = 0xffffffffffffff9cULL,
     AT_SYMLINK_NOFOLLOW = 0x100,
     AT_EACCESS = 0x200,
@@ -483,7 +489,10 @@ enum {
     EXEC_LAUNCH_RESPONSE_MAGIC = 0x4558454353565252ULL,
     EXEC_LAUNCH_VERSION = 1,
     EXEC_LAUNCH_OP_START = 1,
+    EXEC_LAUNCH_OP_START_READY = 2,
+    EXEC_LAUNCH_OP_STARTED = 3,
     EXEC_LAUNCH_STATUS_OK = 0,
+    EXEC_LAUNCH_STATUS_START_FAILED = 4,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
     LINUX_ABI_BOOTSTRAP_VERSION = 2,
     LINUX_ABI_BOOTSTRAP_READY = 0x4C414249524459ULL,
@@ -519,6 +528,209 @@ enum {
     EXECVE_MAX_ARG_DATA_BYTES = 2048,
 };
 
+enum linux_syscall_category {
+    LINUX_SYSCALL_CAT_IO = 0,
+    LINUX_SYSCALL_CAT_FD = 1,
+    LINUX_SYSCALL_CAT_FS = 2,
+    LINUX_SYSCALL_CAT_NET = 3,
+    LINUX_SYSCALL_CAT_PROC = 4,
+    LINUX_SYSCALL_CAT_VM = 5,
+    LINUX_SYSCALL_CAT_TIME = 6,
+    LINUX_SYSCALL_CAT_SIGNAL = 7,
+    LINUX_SYSCALL_CAT_MISC = 8,
+    LINUX_SYSCALL_CAT_STUB_OK = 9,
+    LINUX_SYSCALL_CAT_STUB_ERR = 10,
+    LINUX_SYSCALL_CAT_COUNT = 11,
+};
+
+struct linux_syscall_metadata {
+    u64 nr;
+    const char *name;
+    enum linux_syscall_category category;
+};
+
+#define LINUX_SYSCALL_META(nr, name, category) { (nr), (name), (category) }
+
+static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
+    LINUX_SYSCALL_META(LINUX_SYS_READ, "read", LINUX_SYSCALL_CAT_IO),
+    LINUX_SYSCALL_META(LINUX_SYS_WRITE, "write", LINUX_SYSCALL_CAT_IO),
+    LINUX_SYSCALL_META(LINUX_SYS_READV, "readv", LINUX_SYSCALL_CAT_IO),
+    LINUX_SYSCALL_META(LINUX_SYS_WRITEV, "writev", LINUX_SYSCALL_CAT_IO),
+    LINUX_SYSCALL_META(LINUX_SYS_PREAD64, "pread64", LINUX_SYSCALL_CAT_IO),
+    LINUX_SYSCALL_META(LINUX_SYS_PIPE, "pipe", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_PIPE2, "pipe2", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_EPOLL_CTL, "epoll_ctl", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_EPOLL_WAIT, "epoll_wait", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_POLL, "poll", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_SELECT, "select", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_PSELECT6, "pselect6", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_PPOLL, "ppoll", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_CLOSE, "close", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_DUP, "dup", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_DUP2, "dup2", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_DUP3, "dup3", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_FCNTL, "fcntl", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_FLOCK, "flock", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_FSYNC, "fsync", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_FDATASYNC, "fdatasync", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_SYNCFS, "syncfs", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_OPEN, "open", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_OPENAT, "openat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_STAT, "stat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_LSTAT, "lstat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_FSTAT, "fstat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_NEWFSTATAT, "newfstatat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_STATFS, "statfs", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_FSTATFS, "fstatfs", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_GETDENTS64, "getdents64", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_LSEEK, "lseek", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_ACCESS, "access", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_FACCESSAT, "faccessat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_FACCESSAT2, "faccessat2", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_GETCWD, "getcwd", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_CHDIR, "chdir", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_FCHDIR, "fchdir", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_RENAME, "rename", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_RENAMEAT, "renameat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_RENAMEAT2, "renameat2", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_MKDIR, "mkdir", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_MKDIRAT, "mkdirat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_LINK, "link", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_LINKAT, "linkat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_UNLINK, "unlink", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_UNLINKAT, "unlinkat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_SYMLINK, "symlink", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_SYMLINKAT, "symlinkat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_READLINK, "readlink", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_READLINKAT, "readlinkat", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_CHROOT, "chroot", LINUX_SYSCALL_CAT_FS),
+    LINUX_SYSCALL_META(LINUX_SYS_SOCKET, "socket", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_CONNECT, "connect", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_BIND, "bind", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_SENDTO, "sendto", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_SENDMSG, "sendmsg", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_RECVFROM, "recvfrom", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_RECVMSG, "recvmsg", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_SHUTDOWN, "shutdown", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_GETSOCKNAME, "getsockname", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_GETPEERNAME, "getpeername", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_SETSOCKOPT, "setsockopt", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_GETSOCKOPT, "getsockopt", LINUX_SYSCALL_CAT_NET),
+    LINUX_SYSCALL_META(LINUX_SYS_CLONE, "clone", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_FORK, "fork", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_VFORK, "vfork", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_EXECVE, "execve", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_EXIT, "exit", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_EXIT_GROUP, "exit_group", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_WAIT4, "wait4", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_KILL, "kill", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_GETPID, "getpid", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_GETTID, "gettid", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_TKILL, "tkill", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_TGKILL, "tgkill", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_GETPPID, "getppid", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_SETPGID, "setpgid", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_GETPGID, "getpgid", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_SET_TID_ADDRESS, "set_tid_address", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_MMAP, "mmap", LINUX_SYSCALL_CAT_VM),
+    LINUX_SYSCALL_META(LINUX_SYS_BRK, "brk", LINUX_SYSCALL_CAT_VM),
+    LINUX_SYSCALL_META(LINUX_SYS_MPROTECT, "mprotect", LINUX_SYSCALL_CAT_VM),
+    LINUX_SYSCALL_META(LINUX_SYS_MUNMAP, "munmap", LINUX_SYSCALL_CAT_VM),
+    LINUX_SYSCALL_META(LINUX_SYS_MREMAP, "mremap", LINUX_SYSCALL_CAT_VM),
+    LINUX_SYSCALL_META(LINUX_SYS_MINCORE, "mincore", LINUX_SYSCALL_CAT_VM),
+    LINUX_SYSCALL_META(LINUX_SYS_ARCH_PRCTL, "arch_prctl", LINUX_SYSCALL_CAT_VM),
+    LINUX_SYSCALL_META(LINUX_SYS_TIME, "time", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_GETTIMEOFDAY, "gettimeofday", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_CLOCK_GETTIME, "clock_gettime", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_CLOCK_GETRES, "clock_getres", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_NANOSLEEP, "nanosleep", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_CLOCK_NANOSLEEP, "clock_nanosleep", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_SETITIMER, "setitimer", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_TIMER_CREATE, "timer_create", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_TIMER_SETTIME, "timer_settime", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_TIMER_GETTIME, "timer_gettime", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_TIMER_DELETE, "timer_delete", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_RT_SIGACTION, "rt_sigaction", LINUX_SYSCALL_CAT_SIGNAL),
+    LINUX_SYSCALL_META(LINUX_SYS_RT_SIGPROCMASK, "rt_sigprocmask", LINUX_SYSCALL_CAT_SIGNAL),
+    LINUX_SYSCALL_META(LINUX_SYS_RT_SIGRETURN, "rt_sigreturn", LINUX_SYSCALL_CAT_SIGNAL),
+    LINUX_SYSCALL_META(LINUX_SYS_RT_SIGTIMEDWAIT, "rt_sigtimedwait", LINUX_SYSCALL_CAT_SIGNAL),
+    LINUX_SYSCALL_META(LINUX_SYS_SIGALTSTACK, "sigaltstack", LINUX_SYSCALL_CAT_SIGNAL),
+    LINUX_SYSCALL_META(LINUX_SYS_FUTEX, "futex", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_IOCTL, "ioctl", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_UNAME, "uname", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_GETRUSAGE, "getrusage", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_SYSINFO, "sysinfo", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_SCHED_GETAFFINITY, "sched_getaffinity", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_MEMBARRIER, "membarrier", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_GETRANDOM, "getrandom", LINUX_SYSCALL_CAT_MISC),
+    LINUX_SYSCALL_META(LINUX_SYS_SYNC, "sync", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_MADVISE, "madvise", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_CHMOD, "chmod", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_FCHMOD, "fchmod", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_CHOWN, "chown", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_FCHOWN, "fchown", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_LCHOWN, "lchown", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_FCHOWNAT, "fchownat", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_FCHMODAT, "fchmodat", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_FALLOCATE, "fallocate", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_SET_ROBUST_LIST, "set_robust_list", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_UTIMENSAT, "utimensat", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_PRLIMIT64, "prlimit64", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_RSEQ, "rseq", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_GETUID, "getuid", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_GETGID, "getgid", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_GETEUID, "geteuid", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_GETEGID, "getegid", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_SETFSUID, "setfsuid", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_SETFSGID, "setfsgid", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_UMASK, "umask", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_MOUNT, "mount", LINUX_SYSCALL_CAT_STUB_ERR),
+    LINUX_SYSCALL_META(LINUX_SYS_UMOUNT2, "umount2", LINUX_SYSCALL_CAT_STUB_ERR),
+    LINUX_SYSCALL_META(LINUX_SYS_LISTXATTR, "listxattr", LINUX_SYSCALL_CAT_STUB_ERR),
+    LINUX_SYSCALL_META(LINUX_SYS_LLISTXATTR, "llistxattr", LINUX_SYSCALL_CAT_STUB_ERR),
+    LINUX_SYSCALL_META(LINUX_SYS_FLISTXATTR, "flistxattr", LINUX_SYSCALL_CAT_STUB_ERR),
+    LINUX_SYSCALL_META(LINUX_SYS_SPLICE, "splice", LINUX_SYSCALL_CAT_STUB_ERR),
+    LINUX_SYSCALL_META(LINUX_SYS_EVENTFD2, "eventfd2", LINUX_SYSCALL_CAT_STUB_ERR),
+};
+
+#undef LINUX_SYSCALL_META
+
+static const u64 g_linux_syscall_metadata_count = sizeof(g_linux_syscall_metadata) / sizeof(g_linux_syscall_metadata[0]);
+static const struct linux_syscall_metadata *g_linux_syscall_metadata_by_nr[LINUX_SYSCALL_METADATA_MAX_NR + 1];
+
+static const struct linux_syscall_metadata *linux_syscall_metadata_for(u64 nr) {
+    if (nr > LINUX_SYSCALL_METADATA_MAX_NR) return 0;
+    return g_linux_syscall_metadata_by_nr[nr];
+}
+
+static int linux_syscall_metadata_validate(void) {
+    for (u64 i = 0; i < g_linux_syscall_metadata_count; i++) {
+        const struct linux_syscall_metadata *meta = &g_linux_syscall_metadata[i];
+        if (meta->name == 0 || meta->category >= LINUX_SYSCALL_CAT_COUNT || meta->nr > LINUX_SYSCALL_METADATA_MAX_NR) return 0;
+        if (g_linux_syscall_metadata_by_nr[meta->nr] != 0) return 0;
+        g_linux_syscall_metadata_by_nr[meta->nr] = meta;
+    }
+    return 1;
+}
+
+static const char *linux_syscall_category_name(enum linux_syscall_category category) {
+    switch (category) {
+    case LINUX_SYSCALL_CAT_IO: return "io";
+    case LINUX_SYSCALL_CAT_FD: return "fd";
+    case LINUX_SYSCALL_CAT_FS: return "fs";
+    case LINUX_SYSCALL_CAT_NET: return "net";
+    case LINUX_SYSCALL_CAT_PROC: return "proc";
+    case LINUX_SYSCALL_CAT_VM: return "vm";
+    case LINUX_SYSCALL_CAT_TIME: return "time";
+    case LINUX_SYSCALL_CAT_SIGNAL: return "signal";
+    case LINUX_SYSCALL_CAT_MISC: return "misc";
+    case LINUX_SYSCALL_CAT_STUB_OK: return "stub_ok";
+    case LINUX_SYSCALL_CAT_STUB_ERR: return "stub_err";
+    default: return "unknown";
+    }
+}
+
 struct ipc_message { u64 status; u64 request_va; u64 reserved0; u64 reserved1; u64 reserved2; };
 struct trap_request {
     u64 magic; unsigned version; unsigned kind; unsigned flavor; unsigned reserved0;
@@ -550,6 +762,63 @@ struct abi_trap_user_context {
     u64 reserved0;
     u64 reserved1;
 };
+
+_Static_assert(sizeof(struct trap_request) == 264, "trap_request ABI size drift");
+_Static_assert(OFFSETOF(struct trap_request, magic) == 0x00, "trap_request.magic ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, version) == 0x08, "trap_request.version ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, kind) == 0x0C, "trap_request.kind ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, flavor) == 0x10, "trap_request.flavor ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, reserved0) == 0x14, "trap_request.reserved0 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, caller_principal) == 0x18, "trap_request.caller_principal ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, thread_id) == 0x20, "trap_request.thread_id ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rip) == 0x28, "trap_request.rip ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rsp) == 0x30, "trap_request.rsp ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, fault_addr) == 0x38, "trap_request.fault_addr ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, error_code) == 0x40, "trap_request.error_code ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, nr) == 0x48, "trap_request.nr ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, args) == 0x50, "trap_request.args ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r15) == 0x80, "trap_request.r15 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r14) == 0x88, "trap_request.r14 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r13) == 0x90, "trap_request.r13 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r12) == 0x98, "trap_request.r12 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r11) == 0xA0, "trap_request.r11 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r10) == 0xA8, "trap_request.r10 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r9) == 0xB0, "trap_request.r9 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, r8) == 0xB8, "trap_request.r8 ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rbp) == 0xC0, "trap_request.rbp ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rdi) == 0xC8, "trap_request.rdi ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rsi) == 0xD0, "trap_request.rsi ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rdx) == 0xD8, "trap_request.rdx ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rcx) == 0xE0, "trap_request.rcx ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rbx) == 0xE8, "trap_request.rbx ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rax) == 0xF0, "trap_request.rax ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, rflags) == 0xF8, "trap_request.rflags ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, fs_base) == 0x100, "trap_request.fs_base ABI offset drift");
+
+_Static_assert(sizeof(struct abi_trap_user_context) == 176, "abi_trap_user_context ABI size drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, flags) == 0x00, "abi_trap_user_context.flags ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rip) == 0x08, "abi_trap_user_context.rip ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rsp) == 0x10, "abi_trap_user_context.rsp ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rflags) == 0x18, "abi_trap_user_context.rflags ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rax) == 0x20, "abi_trap_user_context.rax ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rbx) == 0x28, "abi_trap_user_context.rbx ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rcx) == 0x30, "abi_trap_user_context.rcx ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rdx) == 0x38, "abi_trap_user_context.rdx ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rsi) == 0x40, "abi_trap_user_context.rsi ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rdi) == 0x48, "abi_trap_user_context.rdi ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, rbp) == 0x50, "abi_trap_user_context.rbp ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r8) == 0x58, "abi_trap_user_context.r8 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r9) == 0x60, "abi_trap_user_context.r9 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r10) == 0x68, "abi_trap_user_context.r10 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r11) == 0x70, "abi_trap_user_context.r11 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r12) == 0x78, "abi_trap_user_context.r12 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r13) == 0x80, "abi_trap_user_context.r13 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r14) == 0x88, "abi_trap_user_context.r14 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, r15) == 0x90, "abi_trap_user_context.r15 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, fs_base) == 0x98, "abi_trap_user_context.fs_base ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, reserved0) == 0xA0, "abi_trap_user_context.reserved0 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, reserved1) == 0xA8, "abi_trap_user_context.reserved1 ABI offset drift");
+
 struct linux_siginfo {
     i32 si_signo;
     i32 si_errno;
@@ -903,6 +1172,28 @@ struct linux_abi_profile {
     u64 syscall_counts[LINUX_SYSCALL_PROFILE_COUNT + 1];
     u64 syscall_ticks[LINUX_SYSCALL_PROFILE_COUNT + 1];
     u64 syscall_max_ticks[LINUX_SYSCALL_PROFILE_COUNT + 1];
+    u64 syscall_category_counts[LINUX_SYSCALL_CAT_COUNT];
+    u64 pipe_create_calls;
+    u64 pipe_create_busy;
+    u64 pipe_create_faults;
+    u64 pipe_dup_refs;
+    u64 pipe_close_calls;
+    u64 pipe_deferred_wakes;
+    u64 pipe_wake_flushes;
+    u64 pipe_wake_replies;
+    u64 pipe_read_calls;
+    u64 pipe_read_bytes;
+    u64 pipe_read_blocked;
+    u64 pipe_read_again;
+    u64 pipe_read_eof;
+    u64 pipe_read_faults;
+    u64 pipe_write_calls;
+    u64 pipe_write_bytes;
+    u64 pipe_write_again;
+    u64 pipe_write_faults;
+    u64 pipe_write_broken;
+    u64 pipe_epoll_wait_calls;
+    u64 pipe_epoll_ready;
     u64 vfs_requests;
     u64 vfs_op_counts[FS_PROFILE_OP_COUNT];
     u64 vfs_read_request_bytes;
@@ -1047,6 +1338,8 @@ static struct local_mapping g_exec_launch_request_map;
 static struct local_mapping g_exec_launch_response_map;
 static int g_exec_service_connected = 0;
 static u64 g_exec_service_seq = 1;
+static u64 g_exec_launch_pending_start_seq = 0;
+static volatile u64 g_exec_launch_sequence_lock = 0;
 static u64 g_standard_interpreter_vm_token = 0;
 static u64 g_standard_interpreter_bytes = 0;
 static int g_standard_interpreter_dirty = 0;
@@ -1072,22 +1365,74 @@ struct linux_abi_context {
 
 static struct linux_abi_context *g_abi_ctx = 0;
 
+static void abi_context_clear(void) {
+    g_abi_ctx = 0;
+}
+
+static void abi_context_enter(
+    struct linux_abi_context *ctx,
+    struct linux_process_state *proc,
+    const struct trap_request *request,
+    u64 reply_target_principal
+) {
+    ctx->proc = proc;
+    ctx->request = request;
+    ctx->reply_target_principal = reply_target_principal;
+    g_abi_ctx = ctx;
+}
+
+static struct linux_abi_context *abi_current_context(void) {
+    return g_abi_ctx;
+}
+
 static struct linux_process_state *abi_current_proc(void) {
-    return g_abi_ctx != 0 ? g_abi_ctx->proc : 0;
+    struct linux_abi_context *ctx = abi_current_context();
+    return ctx != 0 ? ctx->proc : 0;
+}
+
+static const struct trap_request *abi_current_request(void) {
+    struct linux_abi_context *ctx = abi_current_context();
+    return ctx != 0 ? ctx->request : 0;
+}
+
+static struct fd_entry *abi_current_fds(void) {
+    return abi_current_proc()->fds;
+}
+
+static u64 *abi_current_mmap_next_va(void) {
+    return &abi_current_proc()->mmap_next_va;
+}
+
+static u64 *abi_current_brk_next_va(void) {
+    return &abi_current_proc()->brk_next_va;
+}
+
+static struct vm_region *abi_current_regions(void) {
+    return abi_current_proc()->regions;
+}
+
+static char *abi_current_cwd(void) {
+    return abi_current_proc()->cwd;
+}
+
+static u16 *abi_current_cwd_len(void) {
+    return &abi_current_proc()->cwd_len;
 }
 
 static u64 abi_reply_target_principal(void) {
-    return g_abi_ctx != 0 ? g_abi_ctx->reply_target_principal : 0;
+    struct linux_abi_context *ctx = abi_current_context();
+    return ctx != 0 ? ctx->reply_target_principal : 0;
 }
 
 static void abi_set_reply_target_principal(u64 principal) {
-    if (g_abi_ctx != 0) g_abi_ctx->reply_target_principal = principal;
+    struct linux_abi_context *ctx = abi_current_context();
+    if (ctx != 0) ctx->reply_target_principal = principal;
 }
 
 #define g_proc (abi_current_proc())
-#define g_fds (g_proc->fds)
-#define g_mmap_next_va (g_proc->mmap_next_va)
-#define g_brk_next_va (g_proc->brk_next_va)
-#define g_regions (g_proc->regions)
-#define g_cwd (g_proc->cwd)
-#define g_cwd_len (g_proc->cwd_len)
+#define g_fds (abi_current_fds())
+#define g_mmap_next_va (*abi_current_mmap_next_va())
+#define g_brk_next_va (*abi_current_brk_next_va())
+#define g_regions (abi_current_regions())
+#define g_cwd (abi_current_cwd())
+#define g_cwd_len (*abi_current_cwd_len())

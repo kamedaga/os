@@ -2,6 +2,7 @@ static int fd_clone_into(u64 dst, u64 src, u32 descriptor_flags) {
     if (!fd_valid(src) || dst >= 32) return 0;
     copy_fd_entry(&g_fds[dst], &g_fds[src]);
     g_fds[dst].fd_flags = (u32)((g_fds[dst].fd_flags & O_NONBLOCK) | descriptor_flags);
+    if (fd_entry_is_pipe(&g_fds[dst])) g_prof.pipe_dup_refs++;
     pipe_ref_fd(&g_fds[dst]);
     socket_ref_fd(&g_fds[dst]);
     sync_fd_to_thread_group(dst);
@@ -18,13 +19,14 @@ static struct ipc_message handle_pipe2(const struct trap_request *req, int has_f
     const u64 pipefd_va = req->args[0];
     const u64 flags = has_flags ? req->args[1] : 0;
     if ((flags & ~(u64)(O_CLOEXEC | O_NONBLOCK)) != 0) return reply(errno_inval(), 0);
+    g_prof.pipe_create_calls++;
     const int pipe_slot = alloc_pipe_slot();
-    if (pipe_slot < 0) return reply(errno_busy(), 0);
+    if (pipe_slot < 0) { g_prof.pipe_create_busy++; return reply(errno_busy(), 0); }
     const int read_fd = alloc_fd_at_least(0);
-    if (read_fd < 0) return reply(errno_busy(), 0);
+    if (read_fd < 0) { g_prof.pipe_create_busy++; return reply(errno_busy(), 0); }
     g_fds[(u64)read_fd].kind = FD_PIPE_READ;
     const int write_fd = alloc_fd_at_least(0);
-    if (write_fd < 0) { g_fds[(u64)read_fd].kind = FD_UNUSED; return reply(errno_busy(), 0); }
+    if (write_fd < 0) { g_fds[(u64)read_fd].kind = FD_UNUSED; g_prof.pipe_create_busy++; return reply(errno_busy(), 0); }
 
     g_pipes[(u64)pipe_slot].used = 1;
     g_pipes[(u64)pipe_slot].pending_read = 0;
@@ -67,6 +69,7 @@ static struct ipc_message handle_pipe2(const struct trap_request *req, int has_f
         g_fds[(u64)read_fd].kind = FD_UNUSED;
         g_fds[(u64)write_fd].kind = FD_UNUSED;
         g_pipes[(u64)pipe_slot].used = 0;
+        g_prof.pipe_create_faults++;
         return reply(errno_fault(), 0);
     }
     return reply(0, 0);
@@ -155,8 +158,11 @@ static struct ipc_message handle_epoll_wait(const struct trap_request *req) {
         if (watched != 0) {
             const u64 fd = watched - 1;
             if (!fd_valid(fd)) return reply(errno_badf(), 0);
+            const int watched_pipe = fd_entry_is_pipe(&g_fds[fd]);
+            if (attempt == 0 && watched_pipe) g_prof.pipe_epoll_wait_calls++;
             const u16 revents = fd_poll_revents(fd, (u16)g_fds[epfd].mode_bits);
             if (revents != 0) {
+                if (watched_pipe) g_prof.pipe_epoll_ready++;
                 if (!write_epoll_event(events_va, revents, g_fds[epfd].offset)) return reply(errno_fault(), 0);
                 return reply(1, 0);
             }

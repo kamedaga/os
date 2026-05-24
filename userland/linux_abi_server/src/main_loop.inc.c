@@ -6,6 +6,133 @@ static void signal_bootstrap_ready(volatile struct linux_abi_bootstrap_config *c
     }
 }
 
+struct linux_syscall_dispatch_result {
+    struct ipc_message msg;
+    int profile_recorded;
+};
+
+struct linux_syscall_profile_scope {
+    int enabled;
+    int trace_enabled;
+    u64 profile_start_tick;
+    u64 trace_start_tick;
+};
+
+static struct linux_syscall_profile_scope linux_syscall_profile_begin(const struct trap_request *req) {
+    struct linux_syscall_profile_scope scope;
+    scope.enabled = g_proc->profile_enabled != 0;
+    scope.trace_enabled = profile_trace_enabled();
+    if (scope.enabled) profile_count_syscall(req->nr);
+    scope.profile_start_tick = scope.enabled ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+    scope.trace_start_tick = scope.trace_enabled ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+    return scope;
+}
+
+static void linux_syscall_profile_finish(const struct trap_request *req, const struct linux_syscall_profile_scope *scope, int profile_recorded) {
+    if (scope->trace_enabled) {
+        profile_trace_syscall_span(req->nr, req->caller_principal, scope->trace_start_tick, syscall0(SYSCALL_GET_TICK_COUNT));
+    }
+    if (scope->enabled && !profile_recorded) {
+        const u64 syscall_profile_end_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+        profile_record_syscall_ticks(req->nr, syscall_profile_end_tick - scope->profile_start_tick);
+    }
+}
+
+static struct linux_syscall_dispatch_result handle_exit_syscall(const struct trap_request *req, u64 syscall_profile_start_tick) {
+    struct linux_syscall_dispatch_result result = { { 0, 0, 0, 0, 0 }, 0 };
+    const u64 exiting_principal = req->caller_principal;
+    struct linux_process_state *exiting_proc = g_proc;
+    if (exiting_proc && exiting_proc->profile_enabled) {
+        const u64 syscall_profile_end_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+        profile_record_syscall_ticks(req->nr, syscall_profile_end_tick - syscall_profile_start_tick);
+        result.profile_recorded = 1;
+        profile_report_and_reset();
+        exiting_proc->profile_enabled = 0;
+    } else {
+        profile_clear();
+    }
+    const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
+    const int exiting_thread = exiting_proc && exiting_proc->tid != exiting_proc->pid;
+    const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
+    const int process_exits = exit_group || !exiting_thread;
+    int satisfy_waiters_after_exit_reply = 0;
+    profile_trace_event_u64("exit.begin principal", exiting_principal);
+    if (exiting_proc) exiting_proc->exit_status = (u32)((req->args[0] & 0xffu) << 8);
+    if (exit_group && exiting_proc) {
+        for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+            struct linux_process_state *thread_proc = &g_processes[i];
+            if (!thread_proc->used || thread_proc == exiting_proc || thread_proc->pid != exiting_pid) continue;
+            thread_proc->exit_status = exiting_proc->exit_status;
+            if (thread_proc->clear_child_tid != 0) {
+                const u32 zero = 0;
+                (void)copy_to_trap_target(thread_proc->principal, thread_proc->clear_child_tid, &zero, sizeof(zero));
+            }
+            remove_futex_waiters_for_principal(thread_proc->principal);
+            const u64 reply_status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
+            if (reply_status == SYSCALL_OK) {
+                thread_proc->used = 0;
+            }
+        }
+    }
+    if (exiting_proc && exiting_proc->clear_child_tid != 0) {
+        const u32 zero = 0;
+        (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
+        (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
+    }
+    if (process_exits) {
+        if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
+        profile_trace_event_u64("exit.close_fds pid", exiting_pid);
+        close_all_process_fds(g_proc);
+        (void)unmap_all_tracked_target_ranges();
+        satisfy_waiters_after_exit_reply = 1;
+    }
+    remove_futex_waiters_for_principal(exiting_principal);
+    reply_vfork_parent_if_any(exiting_proc);
+    if (exiting_proc) exiting_proc->used = 0;
+    prime_reply_return_signal();
+    if (satisfy_waiters_after_exit_reply) {
+        profile_trace_event_u64("exit.satisfy_waiters pid", exiting_pid);
+        (void)satisfy_pending_waiters_for_child(exiting_pid);
+        try_satisfy_pending_sigwaits();
+    }
+    profile_trace_event_u64("exit.reply principal", exiting_principal);
+    result.msg = reply_current_token(0, TRAP_RESPONSE_FLAG_EXIT);
+    int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
+    if (!root_exited && g_root_linux_principal_set) {
+        const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);
+        root_exited = (root_status & 0xff) != 1;
+    }
+    if (root_exited && !has_live_linux_process_state() && !has_open_pipe_state() && !has_known_child_slots()) {
+        process_exit(0);
+    }
+    return result;
+}
+
+static int dispatch_fd_syscall(const struct trap_request *req, struct ipc_message *msg) {
+    switch (req->nr) {
+    case LINUX_SYS_READ: *msg = handle_read(req); return 1;
+    case LINUX_SYS_WRITE: *msg = handle_write(req); return 1;
+    case LINUX_SYS_READV: *msg = handle_readv(req); return 1;
+    case LINUX_SYS_WRITEV: *msg = handle_writev(req); return 1;
+    case LINUX_SYS_PIPE: *msg = handle_pipe2(req, 0); return 1;
+    case LINUX_SYS_PIPE2: *msg = handle_pipe2(req, 1); return 1;
+    case LINUX_SYS_EPOLL_CREATE1: *msg = handle_epoll_create1(req); return 1;
+    case LINUX_SYS_EPOLL_CTL: *msg = handle_epoll_ctl(req); return 1;
+    case LINUX_SYS_EPOLL_WAIT: *msg = handle_epoll_wait(req); return 1;
+    case LINUX_SYS_CLOSE: *msg = handle_close(req); return 1;
+    case LINUX_SYS_DUP: *msg = handle_dup(req); return 1;
+    case LINUX_SYS_DUP2: *msg = handle_dup2_like(req, 0); return 1;
+    case LINUX_SYS_DUP3: *msg = handle_dup2_like(req, 1); return 1;
+    case LINUX_SYS_FCNTL: *msg = handle_fcntl(req); return 1;
+    case LINUX_SYS_FLOCK: *msg = handle_flock(req); return 1;
+    case LINUX_SYS_FSYNC:
+    case LINUX_SYS_FDATASYNC:
+    case LINUX_SYS_SYNCFS: *msg = handle_fsync_like(req); return 1;
+    case LINUX_SYS_SYNC: *msg = reply(0, 0); return 1;
+    default: return 0;
+    }
+}
+
 void linux_abi_main(void) {
     volatile struct linux_abi_bootstrap_config *cfg = (volatile struct linux_abi_bootstrap_config *)LINUX_ABI_CONFIG_TARGET_VA;
     if (cfg->magic != LINUX_ABI_BOOTSTRAP_MAGIC ||
@@ -22,6 +149,10 @@ void linux_abi_main(void) {
     g_exec_path_len = cfg->exec_path_bytes <= FS_MAX_PATH_BYTES ? cfg->exec_path_bytes : FS_MAX_PATH_BYTES;
     for (u16 i = 0; i < g_exec_path_len; i++) g_exec_path[i] = cfg->exec_path[i];
     g_exec_path[g_exec_path_len] = 0;
+    if (!linux_syscall_metadata_validate()) {
+        user_log("LinuxAbiServer: syscall metadata invalid\n");
+        for (;;) __asm__ volatile("pause");
+    }
     const u64 request_page_status = alloc_map_pages(trap_request_page_va, 1, 0x1);
     if (request_page_status != SYSCALL_OK) { user_log("LinuxAbiServer: request page map failed\n"); user_log_hex_value(request_page_status); for (;;) __asm__ volatile("pause"); }
     if (!ensure_all_child_trap_request_pages()) { user_log("LinuxAbiServer: request page table map failed\n"); for (;;) __asm__ volatile("pause"); }
@@ -35,7 +166,7 @@ void linux_abi_main(void) {
     prime_reply_return_signal();
     struct ipc_message msg = reply(0, 0);
     for (;;) {
-        g_abi_ctx = 0;
+        abi_context_clear();
         try_satisfy_pending_sigwaits();
         flush_deferred_pipe_wakes();
         if (msg.status != SYSCALL_OK) {
@@ -56,10 +187,7 @@ void linux_abi_main(void) {
         const struct trap_request *req = &req_snapshot;
         if (req->magic != TRAP_MAGIC || req->version != TRAP_VERSION) { user_log("LinuxAbiServer: bad request header\n"); msg = reply(errno_inval(), 0); continue; }
         struct linux_abi_context ctx;
-        ctx.proc = process_state_for(req->caller_principal);
-        ctx.request = req;
-        ctx.reply_target_principal = req->caller_principal;
-        g_abi_ctx = &ctx;
+        abi_context_enter(&ctx, process_state_for(req->caller_principal), req, req->caller_principal);
         if (!g_root_linux_principal_set) {
             g_root_linux_principal = req->caller_principal;
             g_root_linux_principal_set = 1;
@@ -74,28 +202,11 @@ void linux_abi_main(void) {
             msg = reply(errno_inval(), 0);
             continue;
         }
-        const int profile_this_syscall = g_proc->profile_enabled != 0;
-        const int profile_trace_this_syscall = profile_trace_enabled();
-        if (profile_this_syscall) profile_count_syscall(req->nr);
-        const u64 syscall_profile_start_tick = profile_this_syscall ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
-        const u64 syscall_trace_start_tick = profile_trace_this_syscall ? syscall0(SYSCALL_GET_TICK_COUNT) : 0;
+        const struct linux_syscall_profile_scope profile_scope = linux_syscall_profile_begin(req);
         int syscall_profile_recorded = 0;
-        switch (req->nr) {
-        case LINUX_SYS_READ: msg = handle_read(req); break;
-        case LINUX_SYS_WRITE: msg = handle_write(req); break;
-        case LINUX_SYS_READV: msg = handle_readv(req); break;
-        case LINUX_SYS_WRITEV: msg = handle_writev(req); break;
-        case LINUX_SYS_PIPE: msg = handle_pipe2(req, 0); break;
-        case LINUX_SYS_PIPE2: msg = handle_pipe2(req, 1); break;
-        case LINUX_SYS_EPOLL_CREATE1: msg = handle_epoll_create1(req); break;
-        case LINUX_SYS_EPOLL_CTL: msg = handle_epoll_ctl(req); break;
-        case LINUX_SYS_EPOLL_WAIT: msg = handle_epoll_wait(req); break;
+        if (!dispatch_fd_syscall(req, &msg)) switch (req->nr) {
         case LINUX_SYS_OPEN: msg = handle_openat(req, 1); break;
         case LINUX_SYS_OPENAT: msg = handle_openat(req, 0); break;
-        case LINUX_SYS_CLOSE: msg = handle_close(req); break;
-        case LINUX_SYS_DUP: msg = handle_dup(req); break;
-        case LINUX_SYS_DUP2: msg = handle_dup2_like(req, 0); break;
-        case LINUX_SYS_DUP3: msg = handle_dup2_like(req, 1); break;
         case LINUX_SYS_SOCKET: msg = handle_socket(req); break;
         case LINUX_SYS_CONNECT: msg = handle_connect_socket(req); break;
         case LINUX_SYS_BIND: msg = handle_bind_socket(req); break;
@@ -113,10 +224,6 @@ void linux_abi_main(void) {
         case LINUX_SYS_VFORK: msg = handle_fork_like(req, 0); break;
         case LINUX_SYS_WAIT4: msg = handle_wait4(req); break;
         case LINUX_SYS_KILL: msg = handle_kill(req); break;
-        case LINUX_SYS_FCNTL: msg = handle_fcntl(req); break;
-        case LINUX_SYS_FLOCK: msg = handle_flock(req); break;
-        case LINUX_SYS_FSYNC: case LINUX_SYS_FDATASYNC: case LINUX_SYS_SYNCFS: msg = handle_fsync_like(req); break;
-        case LINUX_SYS_SYNC: msg = reply(0, 0); break;
         case LINUX_SYS_GETRUSAGE: msg = handle_getrusage(req); break;
         case LINUX_SYS_STAT: case LINUX_SYS_LSTAT: msg = handle_newfstatat(req, 1); break;
         case LINUX_SYS_FSTAT: msg = handle_fstat(req); break;
@@ -167,6 +274,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_MMAP: msg = handle_mmap(req); break;
         case LINUX_SYS_BRK: msg = handle_brk(req); break;
         case LINUX_SYS_MPROTECT: msg = handle_mprotect(req); break;
+        case LINUX_SYS_MINCORE: msg = handle_mincore(req); break;
         case LINUX_SYS_MUNMAP: msg = handle_munmap(req); break;
         case LINUX_SYS_MREMAP: msg = handle_mremap(req); break;
         case LINUX_SYS_ARCH_PRCTL: msg = handle_arch_prctl(req); break;
@@ -197,82 +305,13 @@ void linux_abi_main(void) {
         case LINUX_SYS_EXIT:
         case LINUX_SYS_EXIT_GROUP:
             {
-                const u64 exiting_principal = req->caller_principal;
-                struct linux_process_state *exiting_proc = g_proc;
-                if (exiting_proc && exiting_proc->profile_enabled) {
-                    const u64 syscall_profile_end_tick = syscall0(SYSCALL_GET_TICK_COUNT);
-                    profile_record_syscall_ticks(req->nr, syscall_profile_end_tick - syscall_profile_start_tick);
-                    syscall_profile_recorded = 1;
-                    profile_report_and_reset();
-                    exiting_proc->profile_enabled = 0;
-                } else {
-                    profile_clear();
-                }
-                const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
-                const int exiting_thread = exiting_proc && exiting_proc->tid != exiting_proc->pid;
-                const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
-                const int process_exits = exit_group || !exiting_thread;
-                int satisfy_waiters_after_exit_reply = 0;
-                profile_trace_event_u64("exit.begin principal", exiting_principal);
-                if (exiting_proc) exiting_proc->exit_status = (u32)((req->args[0] & 0xffu) << 8);
-                if (exit_group && exiting_proc) {
-                    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
-                        struct linux_process_state *thread_proc = &g_processes[i];
-                        if (!thread_proc->used || thread_proc == exiting_proc || thread_proc->pid != exiting_pid) continue;
-                        thread_proc->exit_status = exiting_proc->exit_status;
-                        if (thread_proc->clear_child_tid != 0) {
-                            const u32 zero = 0;
-                            (void)copy_to_trap_target(thread_proc->principal, thread_proc->clear_child_tid, &zero, sizeof(zero));
-                        }
-                        remove_futex_waiters_for_principal(thread_proc->principal);
-                        const u64 reply_status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
-                        if (reply_status == SYSCALL_OK) {
-                            thread_proc->used = 0;
-                        }
-                    }
-                }
-                if (exiting_proc && exiting_proc->clear_child_tid != 0) {
-                    const u32 zero = 0;
-                    (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
-                    (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
-                }
-                if (process_exits) {
-                    if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
-                    profile_trace_event_u64("exit.close_fds pid", exiting_pid);
-                    close_all_process_fds(g_proc);
-                    (void)unmap_all_tracked_target_ranges();
-                    satisfy_waiters_after_exit_reply = 1;
-                }
-                remove_futex_waiters_for_principal(exiting_principal);
-                reply_vfork_parent_if_any(exiting_proc);
-                if (exiting_proc) exiting_proc->used = 0;
-                prime_reply_return_signal();
-                if (satisfy_waiters_after_exit_reply) {
-                    profile_trace_event_u64("exit.satisfy_waiters pid", exiting_pid);
-                    (void)satisfy_pending_waiters_for_child(exiting_pid);
-                    try_satisfy_pending_sigwaits();
-                }
-                profile_trace_event_u64("exit.reply principal", exiting_principal);
-                msg = reply_current_token(0, TRAP_RESPONSE_FLAG_EXIT);
-                (void)msg;
-                int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
-                if (!root_exited && g_root_linux_principal_set) {
-                    const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);
-                    root_exited = (root_status & 0xff) != 1;
-                }
-                if (root_exited && !has_live_linux_process_state() && !has_open_pipe_state() && !has_known_child_slots()) {
-                    process_exit(0);
-                }
+                const struct linux_syscall_dispatch_result exit_result = handle_exit_syscall(req, profile_scope.profile_start_tick);
+                msg = exit_result.msg;
+                syscall_profile_recorded = exit_result.profile_recorded;
             }
             break;
         default: user_log("LinuxAbiServer: unhandled syscall\n"); user_log_hex_value(req->nr); msg = reply(errno_nosys(), 0); break;
         }
-        if (profile_trace_this_syscall) {
-            profile_trace_syscall_span(req->nr, req->caller_principal, syscall_trace_start_tick, syscall0(SYSCALL_GET_TICK_COUNT));
-        }
-        if (profile_this_syscall && !syscall_profile_recorded) {
-            const u64 syscall_profile_end_tick = syscall0(SYSCALL_GET_TICK_COUNT);
-            profile_record_syscall_ticks(req->nr, syscall_profile_end_tick - syscall_profile_start_tick);
-        }
+        linux_syscall_profile_finish(req, &profile_scope, syscall_profile_recorded);
     }
 }

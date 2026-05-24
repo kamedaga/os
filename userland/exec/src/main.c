@@ -319,6 +319,18 @@ static int copy_to_process(u64 process_token, u64 dest_va, u64 src_va, u64 byte_
     return syscall4(SYSCALL_COPY_TO_PROCESS, process_token, dest_va, src_va, byte_len) == SYSCALL_OK;
 }
 
+static int zero_process_range(u64 process_token, u64 dest_va, u64 byte_len) {
+    static const unsigned char zero_page[PAGE_BYTES] = {0};
+    u64 done = 0;
+    while (done < byte_len) {
+        const u64 remaining = byte_len - done;
+        const u64 chunk = remaining < PAGE_BYTES ? remaining : PAGE_BYTES;
+        if (!copy_to_process(process_token, dest_va + done, (u64)zero_page, chunk)) return 0;
+        done += chunk;
+    }
+    return 1;
+}
+
 static int set_process_initial_context(u64 process_token, u64 rip, u64 rsp) {
     struct initial_user_context ctx;
     unsigned char *bytes = (unsigned char *)&ctx;
@@ -554,6 +566,7 @@ static int install_linux_initial_stack(
     u64 *initial_rsp_out
 ) {
     if (!alloc_map_pages_to_process_chunked(process_token, LINUX_STACK_BOTTOM_VA, LINUX_STACK_PAGES, 3)) return 0;
+    if (!zero_process_range(process_token, LINUX_STACK_BOTTOM_VA, LINUX_STACK_BYTES)) return 0;
 
     u64 sp = USER_STACK_TOP;
     const unsigned char random_bytes[16] = {
@@ -1405,14 +1418,35 @@ static int map_service_response_buffer(u64 response_token) {
     return 1;
 }
 
-static void write_service_response(u64 seq, u64 status, u64 child_process_slot) {
+static void exec_launch_full_fence(void) {
+    __sync_synchronize();
+}
+
+static void write_service_response(u64 op, u64 seq, u64 status, u64 child_process_slot) {
     volatile struct exec_launch_response *response = (volatile struct exec_launch_response *)service_response_va;
     response->magic = EXEC_LAUNCH_RESPONSE_MAGIC;
     response->version = EXEC_LAUNCH_VERSION;
-    response->op = EXEC_LAUNCH_OP_START;
     response->seq = seq;
     response->status = status;
     response->child_process_slot = child_process_slot;
+    exec_launch_full_fence();
+    response->op = op;
+    exec_launch_full_fence();
+}
+
+static int wait_for_start_ready(u64 seq) {
+    volatile struct exec_launch_request *request = (volatile struct exec_launch_request *)service_request_va;
+    for (u64 attempts = 0; attempts < 2000000; attempts++) {
+        if (request->magic == EXEC_LAUNCH_REQUEST_MAGIC &&
+            request->version == EXEC_LAUNCH_VERSION &&
+            request->seq == seq &&
+            request->op == EXEC_LAUNCH_OP_START_READY) {
+            return 1;
+        }
+        if ((attempts & 0x3ffu) == 0) (void)wait_event(1, 1);
+        __asm__ volatile("pause" ::: "memory");
+    }
+    return 0;
 }
 
 static u64 pending_mapped_service_request_seq(void) {
@@ -1423,6 +1457,7 @@ static u64 pending_mapped_service_request_seq(void) {
         request->op != EXEC_LAUNCH_OP_START) {
         return 0;
     }
+    exec_launch_full_fence();
     return request->seq;
 }
 
@@ -1435,9 +1470,12 @@ static void handle_mapped_service_request(void) {
         user_log("Exec: service request invalid\n");
         return;
     }
+    exec_launch_full_fence();
 
-    service_last_request_seq = request->seq;
-    if (!map_service_response_buffer(request->response_token)) {
+    const u64 seq = request->seq;
+    const u64 response_token = request->response_token;
+    service_last_request_seq = seq;
+    if (!map_service_response_buffer(response_token)) {
         user_log("Exec: service response map failed\n");
         return;
     }
@@ -1454,20 +1492,32 @@ static void handle_mapped_service_request(void) {
     }
 
     if (!valid_config(config)) {
-        write_service_response(request->seq, EXEC_LAUNCH_STATUS_INVALID, 0);
+        write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_INVALID, 0);
         return;
     }
 
     struct loaded_image image;
+    u64 process_token = 0;
     u64 child_process_slot = 0;
-    if (!prepare_and_start_process(config, &image, &child_process_slot)) {
-        write_service_response(request->seq, EXEC_LAUNCH_STATUS_LAUNCH_FAILED, 0);
+    if (!prepare_process(config, &image, &process_token, &child_process_slot)) {
+        write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_LAUNCH_FAILED, 0);
         return;
     }
     (void)image;
 
+    write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
+    if (!wait_for_start_ready(seq)) {
+        abort_process(process_token);
+        user_log("Exec: start ack timeout\n");
+        return;
+    }
+    if (!start_prepared_process(process_token, child_process_slot)) {
+        write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_START_FAILED, child_process_slot);
+        user_log("Exec: start after response failed\n");
+        return;
+    }
+    write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
     user_log("Exec: launch ok\n");
-    write_service_response(request->seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
 }
 
 static void handle_service_request_token(u64 request_token) {
@@ -1489,8 +1539,11 @@ static void handle_service_request(u64 request_paddr) {
         user_log("Exec: service legacy response invalid\n");
         return;
     }
-    service_last_request_seq = request->seq;
-    if (!map_service_response_page(request->response_token)) {
+    exec_launch_full_fence();
+    const u64 seq = request->seq;
+    const u64 response_paddr = request->response_token;
+    service_last_request_seq = seq;
+    if (!map_service_response_page(response_paddr)) {
         user_log("Exec: service legacy response map failed\n");
         return;
     }
@@ -1507,20 +1560,32 @@ static void handle_service_request(u64 request_paddr) {
     }
 
     if (!valid_config(config)) {
-        write_service_response(request->seq, EXEC_LAUNCH_STATUS_INVALID, 0);
+        write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_INVALID, 0);
         return;
     }
 
     struct loaded_image image;
+    u64 process_token = 0;
     u64 child_process_slot = 0;
-    if (!prepare_and_start_process(config, &image, &child_process_slot)) {
-        write_service_response(request->seq, EXEC_LAUNCH_STATUS_LAUNCH_FAILED, 0);
+    if (!prepare_process(config, &image, &process_token, &child_process_slot)) {
+        write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_LAUNCH_FAILED, 0);
         return;
     }
     (void)image;
 
+    write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
+    if (!wait_for_start_ready(seq)) {
+        abort_process(process_token);
+        user_log("Exec: start ack timeout\n");
+        return;
+    }
+    if (!start_prepared_process(process_token, child_process_slot)) {
+        write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_START_FAILED, child_process_slot);
+        user_log("Exec: start after response failed\n");
+        return;
+    }
+    write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
     user_log("Exec: launch ok\n");
-    write_service_response(request->seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
 }
 
 static void run_exec_service(const struct exec_bootstrap_config *cfg) {

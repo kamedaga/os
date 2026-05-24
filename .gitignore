@@ -1,5 +1,6 @@
 # Build outputs
 .artifacts/
+.temp-docs/
 **/zig-out/
 kernel/.zig-cache/
 .zig-cache/

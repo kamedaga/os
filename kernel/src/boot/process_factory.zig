@@ -167,11 +167,10 @@ pub fn tryCreateSuspendedUserProcess(
         _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     }
-    const thread_slot = scheduler.allocateThreadSlot(principal, user_spaces, buildInitialUserTrapFrame()) orelse {
+    const thread_slot = scheduler.allocateSuspendedThreadSlot(principal, user_spaces, buildInitialUserTrapFrame()) orelse {
         _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     };
-    if (!scheduler.setThreadReady(thread_slot, false)) return error.CreateFailed;
     return .{
         .principal = principal,
         .thread_slot = thread_slot,

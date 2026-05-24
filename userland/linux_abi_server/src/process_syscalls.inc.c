@@ -10,6 +10,8 @@ static void close_all_process_fds(struct linux_process_state *proc) {
     }
 }
 
+static int unmap_all_tracked_target_ranges(void);
+
 static int has_live_linux_process_state(void) {
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_processes[i].used) continue;
@@ -186,6 +188,58 @@ static int satisfy_pending_waiters_for_child(u64 child_slot) {
     }
     if (!satisfied) log_wait_state_for_miss(child_slot);
     return satisfied;
+}
+
+static struct ipc_message terminate_current_linux_process_from_trap(
+    u64 exiting_principal,
+    u32 wait_status,
+    u64 reply_result,
+    u64 reply_flags
+) {
+    struct linux_process_state *exiting_proc = g_proc;
+    const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
+
+    if (exiting_proc) {
+        exiting_proc->exit_status = wait_status;
+        for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+            struct linux_process_state *thread_proc = &g_processes[i];
+            if (!thread_proc->used || thread_proc == exiting_proc || thread_proc->pid != exiting_pid) continue;
+            thread_proc->exit_status = wait_status;
+            if (thread_proc->clear_child_tid != 0) {
+                const u32 zero = 0;
+                (void)copy_to_trap_target(thread_proc->principal, thread_proc->clear_child_tid, &zero, sizeof(zero));
+            }
+            remove_futex_waiters_for_principal(thread_proc->principal);
+            const u64 status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
+            if (status == SYSCALL_OK) thread_proc->used = 0;
+        }
+        if (exiting_proc->clear_child_tid != 0) {
+            const u32 zero = 0;
+            (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
+            (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
+        }
+        record_process_exit(exiting_pid, exiting_proc->exit_status);
+        close_all_process_fds(exiting_proc);
+        (void)unmap_all_tracked_target_ranges();
+        remove_futex_waiters_for_principal(exiting_principal);
+        reply_vfork_parent_if_any(exiting_proc);
+        exiting_proc->used = 0;
+    }
+
+    prime_reply_return_signal();
+    (void)satisfy_pending_waiters_for_child(exiting_pid);
+    try_satisfy_pending_sigwaits();
+    const struct ipc_message msg = reply_current_token(reply_result, reply_flags);
+
+    int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
+    if (!root_exited && g_root_linux_principal_set) {
+        const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);
+        root_exited = (root_status & 0xff) != 1;
+    }
+    if (root_exited && !has_live_linux_process_state() && !has_open_pipe_state() && !has_known_child_slots()) {
+        process_exit(0);
+    }
+    return msg;
 }
 
 static int add_child_slot(struct linux_process_state *proc, u64 child_slot) {
@@ -584,7 +638,8 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
         if ((flags & CLONE_THREAD) != 0) return handle_clone_thread(req);
         if (!supported_clone_process_flags(flags)) return reply(errno_inval(), 0);
     }
-    const int share_vm = clone_form && (flags & CLONE_VM) != 0;
+    const int vfork_form = clone_form && (flags & CLONE_VFORK) != 0;
+    const int share_vm = clone_form && (flags & CLONE_VM) != 0 && !vfork_form;
     struct abi_child_spawn spawn = prepare_abi_child_from_request(req, child_stack, 0, share_vm);
     const u64 child_slot = spawn.slot;
     if (child_slot == 0) return reply(errno_busy(), 0);
@@ -603,7 +658,7 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
     copy_process_state_for_fork(child, g_proc, child_pid);
     child->principal = child_slot;
     if (clone_form && (flags & CLONE_CHILD_CLEARTID) != 0) child->clear_child_tid = child_tidptr;
-    if (clone_form && (flags & CLONE_VFORK) != 0) {
+    if (vfork_form) {
         child->vfork_parent_principal = req->caller_principal;
         child->vfork_parent_result = child_pid;
         set_vfork_parent_for_principal(child_slot, req->caller_principal, child_pid);
@@ -632,7 +687,10 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
         child->used = 0;
         return reply(errno_busy(), 0);
     }
-    if (clone_form && (flags & CLONE_VFORK) != 0) return wait_ipc();
+    if (vfork_form) {
+        (void)detach_reply_token();
+        return wait_ipc();
+    }
     return reply(child_pid, 0);
 }
 
@@ -839,7 +897,10 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
         if (g_proc->child_used[i] && wait_pid_matches_child(pid, g_proc->child_slot[i])) has_matching_child = 1;
     }
     if (!has_matching_child) return reply(errno_child(), 0);
-    if (g_proc->wait_pending) return reply(errno_again(), 0);
+    if (g_proc->wait_pending) {
+        (void)detach_reply_token();
+        return wait_ipc();
+    }
     profile_trace_event_u64("wait4.pending pid", (u64)pid);
     g_proc->wait_pending = 1;
     g_proc->wait_pid = pid;

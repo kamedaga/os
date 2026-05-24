@@ -5,6 +5,23 @@ const sc = @import("numbers.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 
+fn vmObjectInstallError(err: kernel.KernelError) u64 {
+    return switch (err) {
+        kernel.KernelError.InvalidState => sc.syscall_err_invalid,
+        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        else => sc.syscall_err_grant,
+    };
+}
+
+fn vmObjectGrantError(err: kernel.KernelError) u64 {
+    return switch (err) {
+        kernel.KernelError.VmObjectCapabilityNotFound => sc.syscall_err_send,
+        kernel.KernelError.InvalidState => sc.syscall_err_invalid,
+        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        else => sc.syscall_err_grant,
+    };
+}
+
 pub fn dispatch(
     h: anytype,
     state: *kernel.KernelState,
@@ -38,7 +55,7 @@ pub fn dispatch(
                 page_offset_bytes,
                 size_bytes,
                 kernel.vmObjectRightsFromBits(frame.rdx),
-            ) catch return sc.syscall_err_grant;
+            ) catch |err| return vmObjectInstallError(err);
             if (!user_vm.unmapUserLinearRegion(proc, page_base, @intCast(span_bytes))) return sc.syscall_err_map;
             for (page_paddrs[0..page_count]) |paddr| {
                 _ = state.getTable(proc).removeByPaddr(paddr);
@@ -48,7 +65,7 @@ pub fn dispatch(
         sc.syscall_grant_vm_object => {
             const cap_id = kernel.decodeVmObjectToken(frame.rdi) orelse return sc.syscall_err_invalid;
             const to = h.principal_from_process_slot(frame.rsi) orelse return sc.syscall_err_invalid;
-            const child_id = state.grantVmObjectCap(proc, to, cap_id, kernel.vmObjectRightsFromBits(frame.rdx)) catch return sc.syscall_err_grant;
+            const child_id = state.grantVmObjectCap(proc, to, cap_id, kernel.vmObjectRightsFromBits(frame.rdx)) catch |err| return vmObjectGrantError(err);
             return kernel.encodeVmObjectToken(child_id);
         },
         sc.syscall_map_vm_object => blk: {
