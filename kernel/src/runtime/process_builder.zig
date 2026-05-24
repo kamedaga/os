@@ -82,6 +82,7 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
     if (process_index < user_spaces_ptr.len) {
         user_spaces_ptr[process_index] = .{};
     }
+    state_ptr.releasePrincipalVmObjectCaps(principal, free_list_ptr);
     state_ptr.cap_tables[process_index].reset();
     state_ptr.endpoint_tables[process_index] = .{};
     state_ptr.cap_mailboxes[process_index] = .{};

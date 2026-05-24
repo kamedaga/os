@@ -892,6 +892,8 @@ static void profile_report_and_reset(void) {
     user_log_dec_line("LinuxAbiServer.perf.cache.file_hits=", g_prof.file_cache_hits);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_misses=", g_prof.file_cache_misses);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_fill_bytes=", g_prof.file_cache_fill_bytes);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_evictions=", g_prof.file_cache_evictions);
+    user_log_dec_line("LinuxAbiServer.perf.cache.file_reuse_bytes=", g_prof.file_cache_reuse_bytes);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_considered=", g_prof.file_vm_object_mmap_considered);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_candidates=", g_prof.file_vm_object_mmap_candidates);
     user_log_dec_line("LinuxAbiServer.perf.cache.file_vm_object_mapped=", g_prof.file_vm_object_mmap_mapped);

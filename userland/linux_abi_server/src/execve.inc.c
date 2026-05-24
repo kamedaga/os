@@ -4,7 +4,7 @@
 
 enum {
     EXEC_OPT_PATH_CACHE = 0,
-    EXEC_OPT_FILE_READ_CACHE = 0,
+    EXEC_OPT_FILE_READ_CACHE = 1,
     EXEC_OPT_MAIN_VM_CACHE = 1,
     EXEC_OPT_SERVICE_SOURCE_CACHE = 1,
 };
@@ -78,6 +78,84 @@ static void copy_path_to_cache(char *dst, u16 *dst_len, const char *path, u64 pa
     dst[path_len] = 0;
 }
 
+struct file_cache_free_range {
+    u64 offset;
+    u64 size;
+};
+
+static struct file_cache_free_range g_file_cache_free_ranges[FILE_CACHE_MAX];
+static u64 g_file_cache_free_range_count = 0;
+static u64 g_file_cache_evict_cursor = 0;
+
+static int file_cache_range_valid(u64 buffer_va, u64 size) {
+    if (size == 0 || (size & (PAGE_BYTES - 1)) != 0) return 0;
+    if (buffer_va < FILE_CACHE_BASE_VA) return 0;
+    const u64 offset = buffer_va - FILE_CACHE_BASE_VA;
+    return offset <= FILE_CACHE_BYTES && size <= FILE_CACHE_BYTES - offset;
+}
+
+static void file_cache_remove_free_range(u64 index) {
+    if (index >= g_file_cache_free_range_count) return;
+    for (u64 i = index + 1; i < g_file_cache_free_range_count; i++) {
+        g_file_cache_free_ranges[i - 1] = g_file_cache_free_ranges[i];
+    }
+    g_file_cache_free_range_count--;
+}
+
+static int file_cache_add_free_range(u64 buffer_va, u64 size) {
+    if (!file_cache_range_valid(buffer_va, size)) return 0;
+    u64 merged_offset = buffer_va - FILE_CACHE_BASE_VA;
+    u64 merged_size = size;
+    u64 i = 0;
+    while (i < g_file_cache_free_range_count) {
+        const u64 range_offset = g_file_cache_free_ranges[i].offset;
+        const u64 range_size = g_file_cache_free_ranges[i].size;
+        const u64 range_end = range_offset + range_size;
+        const u64 merged_end = merged_offset + merged_size;
+        if (range_end < merged_offset || merged_end < range_offset) {
+            i++;
+            continue;
+        }
+        if (range_offset < merged_offset) merged_offset = range_offset;
+        const u64 new_end = range_end > merged_end ? range_end : merged_end;
+        merged_size = new_end - merged_offset;
+        file_cache_remove_free_range(i);
+    }
+    if (g_file_cache_free_range_count >= FILE_CACHE_MAX) return 0;
+    g_file_cache_free_ranges[g_file_cache_free_range_count].offset = merged_offset;
+    g_file_cache_free_ranges[g_file_cache_free_range_count].size = merged_size;
+    g_file_cache_free_range_count++;
+    return 1;
+}
+
+static void file_cache_clear_slot(u64 slot) {
+    if (slot >= FILE_CACHE_MAX) return;
+    g_file_cache[slot].used = 0;
+    g_file_cache[slot].kind = 0;
+    g_file_cache[slot].path_len = 0;
+    g_file_cache[slot].token = 0;
+    g_file_cache[slot].size = 0;
+    g_file_cache[slot].file_offset = 0;
+    g_file_cache[slot].cached_size = 0;
+    g_file_cache[slot].buffer_va = 0;
+    g_file_cache[slot].vm_token = 0;
+    g_file_cache[slot].path[0] = 0;
+}
+
+static int file_cache_release_slot(u64 slot) {
+    if (slot >= FILE_CACHE_MAX) return 0;
+    if (!g_file_cache[slot].used) {
+        file_cache_clear_slot(slot);
+        return 1;
+    }
+    const u64 buffer_va = g_file_cache[slot].buffer_va;
+    const u64 cached_size = g_file_cache[slot].cached_size;
+    if (cached_size != 0 && !file_cache_add_free_range(buffer_va, cached_size)) return 0;
+    file_cache_clear_slot(slot);
+    g_prof.file_cache_evictions++;
+    return 1;
+}
+
 static struct path_cache_entry *path_cache_find(const char *path) {
     if (!EXEC_OPT_PATH_CACHE) return 0;
     const u64 path_len = cstr_len(path);
@@ -110,7 +188,7 @@ static void path_cache_invalidate(const char *path) {
     const u64 path_len = cstr_len(path);
     for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
         if (g_path_cache[i].used && cache_path_matches(g_path_cache[i].path, g_path_cache[i].path_len, path, path_len)) g_path_cache[i].used = 0;
-        if (g_file_cache[i].used && cache_path_matches(g_file_cache[i].path, g_file_cache[i].path_len, path, path_len)) g_file_cache[i].used = 0;
+        if (g_file_cache[i].used && cache_path_matches(g_file_cache[i].path, g_file_cache[i].path_len, path, path_len)) (void)file_cache_release_slot(i);
     }
 }
 
@@ -305,9 +383,25 @@ static struct file_cache_entry *file_cache_find_by_path(const char *path) {
     return 0;
 }
 
+static int file_cache_take_free_buffer(u64 aligned, u64 *buffer_va_out) {
+    for (u64 i = 0; i < g_file_cache_free_range_count; i++) {
+        if (g_file_cache_free_ranges[i].size < aligned) continue;
+        const u64 offset = g_file_cache_free_ranges[i].offset;
+        g_file_cache_free_ranges[i].offset += aligned;
+        g_file_cache_free_ranges[i].size -= aligned;
+        if (g_file_cache_free_ranges[i].size == 0) file_cache_remove_free_range(i);
+        *buffer_va_out = FILE_CACHE_BASE_VA + offset;
+        g_prof.file_cache_reuse_bytes += aligned;
+        return 1;
+    }
+    return 0;
+}
+
 static int file_cache_alloc_buffer(u64 size, u64 *buffer_va_out) {
     const u64 aligned = align_up(size, PAGE_BYTES);
-    if (aligned == 0 || aligned > FILE_CACHE_BYTES || g_file_cache_next_offset + aligned > FILE_CACHE_BYTES) return 0;
+    if (aligned == 0 || aligned > FILE_CACHE_BYTES) return 0;
+    if (file_cache_take_free_buffer(aligned, buffer_va_out)) return 1;
+    if (g_file_cache_next_offset + aligned > FILE_CACHE_BYTES) return 0;
     const u64 va = FILE_CACHE_BASE_VA + g_file_cache_next_offset;
     const u64 page_count = aligned / PAGE_BYTES;
     u64 mapped = 0;
@@ -319,6 +413,36 @@ static int file_cache_alloc_buffer(u64 size, u64 *buffer_va_out) {
     g_file_cache_next_offset += aligned;
     *buffer_va_out = va;
     return 1;
+}
+
+static int file_cache_evict_one_for_size(u64 aligned) {
+    (void)aligned;
+    for (u64 attempts = 0; attempts < FILE_CACHE_MAX; attempts++) {
+        const u64 slot = (g_file_cache_evict_cursor + attempts) % FILE_CACHE_MAX;
+        if (!g_file_cache[slot].used) continue;
+        if (!file_cache_release_slot(slot)) continue;
+        g_file_cache_evict_cursor = (slot + 1) % FILE_CACHE_MAX;
+        return 1;
+    }
+    return 0;
+}
+
+static int file_cache_find_slot_or_evict(u64 *slot_out) {
+    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
+        if (!g_file_cache[i].used) {
+            *slot_out = i;
+            return 1;
+        }
+    }
+    for (u64 attempts = 0; attempts < FILE_CACHE_MAX; attempts++) {
+        const u64 slot = (g_file_cache_evict_cursor + attempts) % FILE_CACHE_MAX;
+        if (!g_file_cache[slot].used) continue;
+        if (!file_cache_release_slot(slot)) continue;
+        g_file_cache_evict_cursor = (slot + 1) % FILE_CACHE_MAX;
+        *slot_out = slot;
+        return 1;
+    }
+    return 0;
 }
 
 static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *fd, int allow_mmap_cow) {
@@ -342,20 +466,21 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
     }
     g_prof.file_cache_misses++;
 
-    u64 slot = FILE_CACHE_MAX;
-    for (u64 i = 0; i < FILE_CACHE_MAX; i++) {
-        if (!g_file_cache[i].used) { slot = i; break; }
-    }
-    if (slot == FILE_CACHE_MAX) {
+    u64 slot = 0;
+    if (!file_cache_find_slot_or_evict(&slot)) {
         g_prof.file_cache_fill_fail_slot++;
         return 0;
     }
 
     u64 buffer_va = 0;
-    const u64 saved_cache_offset = g_file_cache_next_offset;
     if (!file_cache_alloc_buffer(fd->size, &buffer_va)) {
-        g_prof.file_cache_fill_fail_alloc++;
-        return 0;
+        const u64 aligned = align_up(fd->size, PAGE_BYTES);
+        while (!file_cache_alloc_buffer(fd->size, &buffer_va)) {
+            if (!file_cache_evict_one_for_size(aligned)) {
+                g_prof.file_cache_fill_fail_alloc++;
+                return 0;
+            }
+        }
     }
     u64 copied = 0;
     while (copied < fd->size) {
@@ -370,7 +495,7 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
         if (response->inline_bytes < chunk) break;
     }
     if (copied != fd->size) {
-        g_file_cache_next_offset = saved_cache_offset;
+        (void)file_cache_add_free_range(buffer_va, align_up(fd->size, PAGE_BYTES));
         g_prof.file_cache_fill_fail_read++;
         return 0;
     }

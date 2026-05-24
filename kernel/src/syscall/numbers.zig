@@ -54,6 +54,7 @@ pub const syscall_derive_command_cap: u64 = queue_abi.syscall_derive_command_cap
 pub const syscall_accept_cap_transfer: u64 = 0x2A;
 
 pub const syscall_grant_vm_object: u64 = 0x1F;
+pub const syscall_release_vm_object: u64 = 0x29;
 pub const syscall_map_vm_object: u64 = 0x28;
 pub const syscall_create_vm_object_from_current_pages: u64 = 0x3F;
 

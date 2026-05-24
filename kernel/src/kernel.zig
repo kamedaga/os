@@ -631,20 +631,96 @@ pub const IpcBufferMailbox = struct {
 
 pub const max_vm_object_backing_pages: usize = 65535;
 pub const max_vm_object_backing_store_pages: usize = 262144;
+pub const max_vm_object_backing_store_free_ranges: usize = 1024;
 
 var vm_object_backing_page_store: [max_vm_object_backing_store_pages]u64 = [_]u64{0} ** max_vm_object_backing_store_pages;
 var vm_object_backing_page_store_next: usize = 0;
 
+const VmObjectBackingStoreFreeRange = struct {
+    start: u32 = 0,
+    len: u32 = 0,
+};
+
+var vm_object_backing_page_store_free_ranges: [max_vm_object_backing_store_free_ranges]VmObjectBackingStoreFreeRange = [_]VmObjectBackingStoreFreeRange{.{}} ** max_vm_object_backing_store_free_ranges;
+var vm_object_backing_page_store_free_range_len: usize = 0;
+
+fn removeVmObjectBackingFreeRange(index: usize) void {
+    var i = index + 1;
+    while (i < vm_object_backing_page_store_free_range_len) : (i += 1) {
+        vm_object_backing_page_store_free_ranges[i - 1] = vm_object_backing_page_store_free_ranges[i];
+    }
+    vm_object_backing_page_store_free_range_len -= 1;
+}
+
+fn insertVmObjectBackingFreeRange(start: u32, len: u32) bool {
+    if (len == 0) return true;
+    var merged_start = start;
+    var merged_len = len;
+    var i: usize = 0;
+    while (i < vm_object_backing_page_store_free_range_len) {
+        const range = vm_object_backing_page_store_free_ranges[i];
+        const range_end = range.start + range.len;
+        const merged_end = merged_start + merged_len;
+        if (range_end < merged_start or merged_end < range.start) {
+            i += 1;
+            continue;
+        }
+        if (range.start < merged_start) merged_start = range.start;
+        const new_end = if (range_end > merged_end) range_end else merged_end;
+        merged_len = new_end - merged_start;
+        removeVmObjectBackingFreeRange(i);
+    }
+    if (vm_object_backing_page_store_free_range_len >= vm_object_backing_page_store_free_ranges.len) return false;
+    vm_object_backing_page_store_free_ranges[vm_object_backing_page_store_free_range_len] = .{
+        .start = merged_start,
+        .len = merged_len,
+    };
+    vm_object_backing_page_store_free_range_len += 1;
+    return true;
+}
+
 fn allocVmObjectBackingPageStore(page_paddrs: []const u64) ?u32 {
     if (page_paddrs.len == 0 or page_paddrs.len > max_vm_object_backing_pages) return null;
-    if (vm_object_backing_page_store_next + page_paddrs.len > vm_object_backing_page_store.len) return null;
-    const start = vm_object_backing_page_store_next;
-    for (page_paddrs, 0..) |paddr, i| {
-        if ((paddr & 0xFFF) != 0) return null;
-        vm_object_backing_page_store[start + i] = paddr;
+    var start: usize = 0;
+    var free_index: ?usize = null;
+    var i: usize = 0;
+    while (i < vm_object_backing_page_store_free_range_len) : (i += 1) {
+        if (vm_object_backing_page_store_free_ranges[i].len < page_paddrs.len) continue;
+        start = vm_object_backing_page_store_free_ranges[i].start;
+        free_index = i;
+        break;
     }
-    vm_object_backing_page_store_next += page_paddrs.len;
+    if (free_index) |index| {
+        const consumed: u32 = @intCast(page_paddrs.len);
+        vm_object_backing_page_store_free_ranges[index].start += consumed;
+        vm_object_backing_page_store_free_ranges[index].len -= consumed;
+        if (vm_object_backing_page_store_free_ranges[index].len == 0) removeVmObjectBackingFreeRange(index);
+    } else {
+        if (vm_object_backing_page_store_next + page_paddrs.len > vm_object_backing_page_store.len) return null;
+        start = vm_object_backing_page_store_next;
+        vm_object_backing_page_store_next += page_paddrs.len;
+    }
+    for (page_paddrs, 0..) |paddr, page_index| {
+        if ((paddr & 0xFFF) != 0) return null;
+        vm_object_backing_page_store[start + page_index] = paddr;
+    }
     return @intCast(start);
+}
+
+fn freeVmObjectBackingPageStore(start: u32, page_count: u16) bool {
+    if (page_count == 0) return true;
+    const start_usize: usize = @intCast(start);
+    const count_usize: usize = @intCast(page_count);
+    if (start_usize + count_usize > vm_object_backing_page_store.len) return false;
+    @memset(vm_object_backing_page_store[start_usize .. start_usize + count_usize], 0);
+    return insertVmObjectBackingFreeRange(start, page_count);
+}
+
+fn resetVmObjectBackingPageStore() void {
+    @memset(vm_object_backing_page_store[0..], 0);
+    @memset(vm_object_backing_page_store_free_ranges[0..], .{});
+    vm_object_backing_page_store_next = 0;
+    vm_object_backing_page_store_free_range_len = 0;
 }
 
 pub const VmObjectRights = packed struct(u32) {
@@ -733,6 +809,18 @@ pub const VmObjectCNode = struct {
         return null;
     }
 
+    pub fn removeByCapId(self: *VmObjectCNode, cap_id: u64) ?VmObjectCapability {
+        const index = self.findIndexByCapId(cap_id) orelse return null;
+        const removed = (self.slotAt(index) orelse return null).*;
+        const last_index = self.len - 1;
+        if (index != last_index) {
+            (self.slotAt(index) orelse return null).* = (self.slotAt(last_index) orelse return null).*;
+        }
+        self.len -= 1;
+        self.trimUnusedChunks();
+        return removed;
+    }
+
     fn findIndexByCapId(self: *const VmObjectCNode, cap_id: u64) ?usize {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
@@ -743,6 +831,18 @@ pub const VmObjectCNode = struct {
     }
 
     fn slotAtConst(self: *const VmObjectCNode, index: usize) ?*const VmObjectCapability {
+        if (index < inline_caps) return &self.caps[index];
+        var remaining = index - inline_caps;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_caps) return &vm_object_cap_chunk_pool[chunk_index].caps[remaining];
+            remaining -= chunk_caps;
+            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAt(self: *VmObjectCNode, index: usize) ?*VmObjectCapability {
         if (index < inline_caps) return &self.caps[index];
         var remaining = index - inline_caps;
         var chunk_index = self.overflow_head;
@@ -769,6 +869,35 @@ pub const VmObjectCNode = struct {
             chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
         }
         return &vm_object_cap_chunk_pool[chunk_index].caps[(index - inline_caps) % chunk_caps];
+    }
+
+    fn trimUnusedChunks(self: *VmObjectCNode) void {
+        if (self.overflow_head == invalid_chunk) return;
+        const needed_chunks = if (self.len <= inline_caps) 0 else ((self.len - inline_caps + chunk_caps - 1) / chunk_caps);
+        if (needed_chunks == 0) {
+            var chunk_index = self.overflow_head;
+            while (chunk_index != invalid_chunk) {
+                const next = vm_object_cap_chunk_pool[chunk_index].next;
+                vm_object_cap_chunk_pool[chunk_index] = .{};
+                chunk_index = next;
+            }
+            self.overflow_head = invalid_chunk;
+            return;
+        }
+
+        var chunk_index = self.overflow_head;
+        var offset: usize = 1;
+        while (offset < needed_chunks and chunk_index != invalid_chunk) : (offset += 1) {
+            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
+        }
+        if (chunk_index == invalid_chunk) return;
+        var free_index = vm_object_cap_chunk_pool[chunk_index].next;
+        vm_object_cap_chunk_pool[chunk_index].next = invalid_chunk;
+        while (free_index != invalid_chunk) {
+            const next = vm_object_cap_chunk_pool[free_index].next;
+            vm_object_cap_chunk_pool[free_index] = .{};
+            free_index = next;
+        }
     }
 };
 
@@ -803,6 +932,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cap_chunk_pool), &cap_chunk_pool));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store), &vm_object_backing_page_store));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store_next), &vm_object_backing_page_store_next));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store_free_ranges), &vm_object_backing_page_store_free_ranges));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store_free_range_len), &vm_object_backing_page_store_free_range_len));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_cap_chunk_pool), &vm_object_cap_chunk_pool));
     return end;
 }
@@ -1520,6 +1651,7 @@ pub const KernelState = struct {
             self.pending_ipc_buffer_transfers[i] = null;
             self.vm_object_tables[i].reset();
         }
+        resetVmObjectBackingPageStore();
         self.published_service_endpoints = .{};
         i = 0;
         while (i < self.process_descriptors.len) : (i += 1) {
@@ -2011,6 +2143,118 @@ pub const KernelState = struct {
             .parent_cap_id = src_cap.cap_id,
         });
         return child_id;
+    }
+
+    fn anyVmObjectCapWithRoot(self: *const KernelState, root_cap_id: u64) bool {
+        var pidx: usize = 0;
+        while (pidx < principal_count) : (pidx += 1) {
+            const table = &self.vm_object_tables[pidx];
+            var i: usize = 0;
+            while (i < table.len) : (i += 1) {
+                const cap = table.slotAtConst(i) orelse break;
+                if (cap.root_cap_id == root_cap_id) return true;
+            }
+        }
+        return false;
+    }
+
+    fn anyPrincipalHasMappedPaddr(self: *const KernelState, paddr: u64) bool {
+        _ = self;
+        var pidx: usize = 0;
+        while (pidx < process_count) : (pidx += 1) {
+            const principal = processPrincipal(pidx);
+            if (capability.principalHasMappedPaddr(principal, paddr)) return true;
+        }
+        return false;
+    }
+
+    fn releaseVmObjectBackingIfUnreferenced(
+        self: *KernelState,
+        backing: VmObjectBacking,
+        root_cap_id: u64,
+        free_list: *FreePageList,
+    ) void {
+        if (self.anyVmObjectCapWithRoot(root_cap_id)) return;
+        var i: usize = 0;
+        while (i < backing.page_count) : (i += 1) {
+            const paddr = backing.pagePaddr(i) orelse return;
+            if (self.anyPrincipalHasMappedPaddr(paddr)) return;
+            if (!free_list.canAppendPage(0, paddr)) return;
+        }
+        i = 0;
+        while (i < backing.page_count) : (i += 1) {
+            const paddr = backing.pagePaddr(i) orelse return;
+            free_list.appendPage(0, paddr) catch return;
+        }
+        _ = freeVmObjectBackingPageStore(backing.page_store_start, backing.page_count);
+    }
+
+    pub fn revokeVmObjectCapTree(
+        self: *KernelState,
+        owner: PrincipalId,
+        cap_id: u64,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        const start_cap = self.getVmObjectTableConst(owner).findByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
+        const start_id = start_cap.cap_id;
+
+        const queue = &self.revoke_queue;
+        var queue_len: usize = 0;
+        var queue_head: usize = 0;
+        queue[0] = start_id;
+        queue_len = 1;
+
+        const subtree = &self.revoke_subtree;
+        var subtree_len: usize = 0;
+
+        while (queue_head < queue_len) : (queue_head += 1) {
+            const current_id = queue[queue_head];
+            if (containsCapId(subtree[0..subtree_len], current_id)) continue;
+            if (subtree_len >= self.revoke_subtree.len) return KernelError.RevokeOverflow;
+            subtree[subtree_len] = current_id;
+            subtree_len += 1;
+
+            var pidx: usize = 0;
+            while (pidx < principal_count) : (pidx += 1) {
+                const table = &self.vm_object_tables[pidx];
+                var i: usize = 0;
+                while (i < table.len) : (i += 1) {
+                    const cap = table.slotAtConst(i) orelse break;
+                    if (cap.parent_cap_id != current_id) continue;
+                    if (containsCapId(queue[0..queue_len], cap.cap_id)) continue;
+                    if (queue_len >= self.revoke_queue.len) return KernelError.RevokeOverflow;
+                    queue[queue_len] = cap.cap_id;
+                    queue_len += 1;
+                }
+            }
+        }
+
+        var s: usize = 0;
+        while (s < subtree_len) : (s += 1) {
+            const revoke_id = subtree[s];
+            var pidx: usize = 0;
+            while (pidx < principal_count) : (pidx += 1) {
+                const table = &self.vm_object_tables[pidx];
+                const removed = table.removeByCapId(revoke_id) orelse continue;
+                self.releaseVmObjectBackingIfUnreferenced(removed.backing, removed.root_cap_id, free_list);
+                break;
+            }
+        }
+    }
+
+    pub fn releasePrincipalVmObjectCaps(
+        self: *KernelState,
+        owner: PrincipalId,
+        free_list: *FreePageList,
+    ) void {
+        const table = self.getVmObjectTable(owner);
+        while (table.len > 0) {
+            const cap = table.slotAtConst(table.len - 1) orelse break;
+            const cap_id = cap.cap_id;
+            const removed = table.removeByCapId(cap_id) orelse break;
+            self.releaseVmObjectBackingIfUnreferenced(removed.backing, removed.root_cap_id, free_list);
+        }
     }
 
     pub fn scanCapTables(self: *const KernelState, paddr: u64) OwnershipView {

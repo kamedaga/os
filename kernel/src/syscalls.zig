@@ -481,7 +481,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     if (process_syscalls.dispatch(h, state, proc, frame)) |result| {
         return result;
     }
-    if (vm_object_dispatch.dispatch(h, state, proc, frame, &vm_object_page_scratch)) |result| {
+    if (vm_object_dispatch.dispatch(h, state, proc, frame, &vm_object_page_scratch, h.free_list)) |result| {
         return result;
     }
     if (abi_trap_syscalls.dispatch(state, proc, frame)) |result| {
@@ -774,7 +774,11 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return ipc_syscalls.blockWaitEvent(h, frame, wait_mailbox, false, timeout_ticks);
         },
         sc.syscall_revoke_tree => {
-            state.revokeCapTree(proc, frame.rdi) catch return sc.syscall_err_revoke;
+            if (kernel.decodeVmObjectToken(frame.rdi)) |cap_id| {
+                state.revokeVmObjectCapTree(proc, cap_id, h.free_list) catch return sc.syscall_err_revoke;
+            } else {
+                state.revokeCapTree(proc, frame.rdi) catch return sc.syscall_err_revoke;
+            }
             state.bumpEndpointGeneration();
             scheduler.invalidateAllIpcFastpathState();
             return sc.syscall_ok;

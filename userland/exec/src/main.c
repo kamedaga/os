@@ -18,6 +18,7 @@ enum {
     SYSCALL_GET_PROCESS_STATUS = 0x30,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
     SYSCALL_PROCESS_EXIT = 0x34,
+    SYSCALL_RELEASE_VM_OBJECT = 0x29,
     SYSCALL_CREATE_SUSPENDED_PROCESS = 0x41,
     SYSCALL_MAP_VM_OBJECT_TO_PROCESS = 0x42,
     SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS = 0x43,
@@ -167,6 +168,7 @@ static u64 source_image_tokens[SOURCE_IMAGE_SLOT_COUNT];
 static u64 source_image_bytes[SOURCE_IMAGE_SLOT_COUNT];
 static u64 source_image_path_bytes[SOURCE_IMAGE_SLOT_COUNT];
 static unsigned char source_image_paths[SOURCE_IMAGE_SLOT_COUNT][SOURCE_IMAGE_PATH_BYTES];
+static u64 source_image_evict_cursor;
 static struct child_map_tracker child_map_tracker_storage;
 static unsigned char private_page_buffer[PAGE_BYTES];
 static const unsigned char linux_platform[] = "x86_64";
@@ -279,6 +281,10 @@ static int is_process_builder_token(u64 token) {
 
 static int map_vm_object(u64 token, u64 target_va) {
     return syscall3(SYSCALL_MAP_VM_OBJECT, token, target_va, 0) == SYSCALL_OK;
+}
+
+static int release_vm_object_mapping(u64 token, u64 target_va, u64 size_bytes) {
+    return syscall3(SYSCALL_RELEASE_VM_OBJECT, token, target_va, size_bytes) == SYSCALL_OK;
 }
 
 static u64 create_suspended_process(void) {
@@ -1051,6 +1057,41 @@ static void source_path_store(u64 slot, struct byte_slice path) {
     source_image_path_bytes[slot] = path.len;
 }
 
+static void source_path_clear(u64 slot) {
+    source_image_path_bytes[slot] = 0;
+    if (slot < SOURCE_IMAGE_SLOT_COUNT) source_image_paths[slot][0] = 0;
+}
+
+static int release_source_image_slot(u64 slot) {
+    if (slot >= SOURCE_IMAGE_SLOT_COUNT || source_image_tokens[slot] == 0) return 1;
+    const u64 source_va = source_image_slot_va(slot);
+    const u64 mapped_bytes = (source_image_bytes[slot] + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1);
+    if (mapped_bytes == 0) return 0;
+    if (!release_vm_object_mapping(source_image_tokens[slot], source_va, mapped_bytes)) return 0;
+    source_image_tokens[slot] = 0;
+    source_image_bytes[slot] = 0;
+    source_path_clear(slot);
+    return 1;
+}
+
+static int find_reusable_source_image_slot(u64 file_bytes, u64 *slot_out) {
+    for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
+        if (source_image_tokens[i] != 0) continue;
+        if (file_bytes > source_image_slot_capacity(i)) continue;
+        *slot_out = i;
+        return 1;
+    }
+    for (u64 attempts = 0; attempts < SOURCE_IMAGE_SLOT_COUNT; attempts++) {
+        const u64 slot = (source_image_evict_cursor + attempts) % SOURCE_IMAGE_SLOT_COUNT;
+        if (file_bytes > source_image_slot_capacity(slot)) continue;
+        if (!release_source_image_slot(slot)) continue;
+        source_image_evict_cursor = (slot + 1) % SOURCE_IMAGE_SLOT_COUNT;
+        *slot_out = slot;
+        return 1;
+    }
+    return 0;
+}
+
 static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cache_path, u64 *effective_vm_token_out) {
     if (file_bytes == 0) return 0;
 
@@ -1075,17 +1116,16 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
         return 0;
     }
 
-    for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
-        if (source_image_tokens[i] != 0) continue;
-        if (file_bytes > source_image_slot_capacity(i)) continue;
-        const u64 source_va = source_image_slot_va(i);
+    u64 slot = 0;
+    if (find_reusable_source_image_slot(file_bytes, &slot)) {
+        const u64 source_va = source_image_slot_va(slot);
         if (!map_vm_object(vm_token, source_va)) {
             user_log("Exec: source vm map failed\n");
             return 0;
         }
-        source_image_tokens[i] = vm_token;
-        source_image_bytes[i] = file_bytes;
-        if (EXEC_OPT_SOURCE_PATH_CACHE) source_path_store(i, cache_path);
+        source_image_tokens[slot] = vm_token;
+        source_image_bytes[slot] = file_bytes;
+        if (EXEC_OPT_SOURCE_PATH_CACHE) source_path_store(slot, cache_path);
         if (effective_vm_token_out != 0) *effective_vm_token_out = vm_token;
         return source_va;
     }

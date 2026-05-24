@@ -65,6 +65,7 @@ pub fn needsKernelStateLock(nr: u64) bool {
         process_builder_abi.syscall_set_process_abi_trap_delegate,
         sc.syscall_create_vm_object_from_current_pages,
         sc.syscall_grant_vm_object,
+        sc.syscall_release_vm_object,
         sc.syscall_map_vm_object,
         queue_abi.syscall_grant_cap,
         => true,

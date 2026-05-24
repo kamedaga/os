@@ -1255,6 +1255,8 @@ struct linux_abi_profile {
     u64 file_cache_fill_fail_slot;
     u64 file_cache_fill_fail_alloc;
     u64 file_cache_fill_fail_read;
+    u64 file_cache_evictions;
+    u64 file_cache_reuse_bytes;
     u64 file_vm_object_mmap_considered;
     u64 file_vm_object_mmap_candidates;
     u64 file_vm_object_mmap_mapped;

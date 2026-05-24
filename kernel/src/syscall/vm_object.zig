@@ -28,6 +28,7 @@ pub fn dispatch(
     proc: kernel.PrincipalId,
     frame: *TrapFrame,
     vm_object_page_scratch: *[kernel.max_vm_object_backing_pages]u64,
+    free_list: *kernel.FreePageList,
 ) ?u64 {
     return switch (frame.rax) {
         sc.syscall_create_vm_object_from_current_pages => blk: {
@@ -67,6 +68,18 @@ pub fn dispatch(
             const to = h.principal_from_process_slot(frame.rsi) orelse return sc.syscall_err_invalid;
             const child_id = state.grantVmObjectCap(proc, to, cap_id, kernel.vmObjectRightsFromBits(frame.rdx)) catch |err| return vmObjectGrantError(err);
             return kernel.encodeVmObjectToken(child_id);
+        },
+        sc.syscall_release_vm_object => {
+            const cap_id = kernel.decodeVmObjectToken(frame.rdi) orelse return sc.syscall_err_invalid;
+            const mapped_va = frame.rsi;
+            const size_bytes = frame.rdx;
+            if (mapped_va != 0 or size_bytes != 0) {
+                if (mapped_va == 0 or size_bytes == 0) return sc.syscall_err_invalid;
+                if ((mapped_va & 0xFFF) != 0 or (size_bytes & 0xFFF) != 0) return sc.syscall_err_invalid;
+                if (!user_vm.unmapUserLinearRegion(proc, mapped_va, @intCast(size_bytes))) return sc.syscall_err_map;
+            }
+            state.revokeVmObjectCapTree(proc, cap_id, free_list) catch return sc.syscall_err_revoke;
+            return sc.syscall_ok;
         },
         sc.syscall_map_vm_object => blk: {
             const cap_id = kernel.decodeVmObjectToken(frame.rdi) orelse return sc.syscall_err_invalid;
