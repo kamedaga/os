@@ -12,9 +12,9 @@ typedef unsigned long long exec_u64;
 #define EXEC_BOOTSTRAP_TARGET_VA 0x3C002000ULL
 #define EXEC_BOOTSTRAP_FLAG_SERVICE_MODE (1ULL << 0)
 
-#define EXEC_MAX_ARGV 8
-#define EXEC_MAX_ENVP 16
-#define EXEC_MAX_ARG_DATA_BYTES 2048
+#define EXEC_MAX_ARGV 64
+#define EXEC_MAX_ENVP 32
+#define EXEC_MAX_ARG_DATA_BYTES 3072
 
 #define EXEC_LAUNCH_ENDPOINT_ID 0x93ULL
 #define EXEC_LAUNCH_REQUEST_MAGIC 0x4558454353565251ULL
@@ -30,7 +30,7 @@ typedef unsigned long long exec_u64;
 #define EXEC_LAUNCH_STATUS_LAUNCH_FAILED 3ULL
 #define EXEC_LAUNCH_STATUS_START_FAILED 4ULL
 
-#define EXEC_USER_LAYOUT_LOW_VA 0x20000000ULL
+#define EXEC_USER_LAYOUT_LOW_VA 0x00400000ULL
 #define EXEC_USER_LAYOUT_TOP_VA 0x800000000000ULL
 #define EXEC_USER_DYNAMIC_MAP_BASE_VA 0x23000000ULL
 #define EXEC_USER_DYNAMIC_MAP_END_VA 0x3C000000ULL
@@ -101,10 +101,10 @@ _Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, executable_vm_token) 
 _Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, abi_trap_request_page_va) == 112, "exec cfg abi trap request offset");
 _Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, execfn_offset) == 120, "exec cfg argv header offset");
 _Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, argv_offsets) == 132, "exec cfg argv offsets offset");
-_Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, envp_offsets) == 164, "exec cfg envp offsets offset");
-_Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, arg_data) == 228, "exec cfg arg data offset");
-_Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, user_low_va) == 2280, "exec cfg layout offset");
-_Static_assert(sizeof(struct exec_bootstrap_config) == 2352, "exec cfg size");
+_Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, envp_offsets) == 388, "exec cfg envp offsets offset");
+_Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, arg_data) == 516, "exec cfg arg data offset");
+_Static_assert(EXEC_OFFSETOF(struct exec_bootstrap_config, user_low_va) == 3592, "exec cfg layout offset");
+_Static_assert(sizeof(struct exec_bootstrap_config) == 3664, "exec cfg size");
 _Static_assert(EXEC_OFFSETOF(struct exec_launch_request, config) == 40, "exec request config offset");
 _Static_assert(sizeof(struct exec_launch_response) == 48, "exec response size");
 

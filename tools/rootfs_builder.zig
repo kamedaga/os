@@ -13,7 +13,9 @@ const fixed_date: u16 = ((2026 - 1980) << 9) | (1 << 5) | 1;
 const fixed_time: u16 = 0;
 const dir_attr: u8 = 0x10;
 const archive_attr: u8 = 0x20;
+const symlink_attr: u8 = 0x24;
 const lfn_attr: u8 = 0x0F;
+const symlink_source_marker = "CAPABILITYOS_ROOTFS_SYMLINK\n";
 const dir_entries_per_cluster: usize = (bytes_per_sector * sectors_per_cluster) / 32;
 
 const Dirent = extern struct {
@@ -43,6 +45,7 @@ const LoadedSpec = struct {
     image_path: []u8,
     source_path: []u8,
     data: []u8,
+    is_symlink: bool = false,
     parent_dir_index: usize,
     leaf: []u8,
     short_name: [11]u8,
@@ -214,12 +217,20 @@ fn loadManifest(allocator: std.mem.Allocator, manifest_path: []const u8, dirs: *
         defer allocator.free(resolved_source_path);
         const source_path_copy = try allocator.dupe(u8, resolved_source_path);
         errdefer allocator.free(source_path_copy);
-        const data = try cwd.readFileAlloc(allocator, resolved_source_path, std.math.maxInt(usize));
+        var is_symlink = false;
+        var data = try cwd.readFileAlloc(allocator, resolved_source_path, std.math.maxInt(usize));
+        if (!is_symlink and std.mem.startsWith(u8, data, symlink_source_marker)) {
+            const target = try allocator.dupe(u8, data[symlink_source_marker.len..]);
+            allocator.free(data);
+            data = target;
+            is_symlink = true;
+        }
         errdefer allocator.free(data);
         try specs.append(allocator, .{
             .image_path = image_path_copy,
             .source_path = source_path_copy,
             .data = data,
+            .is_symlink = is_symlink,
             .parent_dir_index = parent_dir_index,
             .leaf = leaf_copy,
             .short_name = makeShortName(serial, false, extensionOf(split.leaf)),
@@ -378,7 +389,8 @@ fn writeDirectoryCluster(file: *std.fs.File, layout: VolumeLayout, allocator: st
     for (specs) |spec| {
         if (spec.parent_dir_index != dir_index) continue;
         if (spec.data.len > std.math.maxInt(u32)) return error.FileTooLarge;
-        try addNamedDirent(&entries, allocator, spec.leaf, spec.short_name, archive_attr, spec.start_cluster, @intCast(spec.data.len));
+        const attr = if (spec.is_symlink) symlink_attr else archive_attr;
+        try addNamedDirent(&entries, allocator, spec.leaf, spec.short_name, attr, spec.start_cluster, @intCast(spec.data.len));
     }
     if (entries.items.len > dir_entries_per_cluster) return error.DirectoryTooLarge;
 

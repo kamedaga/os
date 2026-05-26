@@ -8,6 +8,7 @@ enum {
     SYSCALL_MAP_PAGE = 0x2,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
+    SYSCALL_DROP_VM_OBJECT = 0x31,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
@@ -804,6 +805,10 @@ static u64 grant_vm_object_to_client(u64 token) {
     if (!is_vm_object_token(token) || g_session == 0 || g_session->process_slot == 0) return 0;
     const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, token, g_session->process_slot, VM_RIGHT_READ_MAP);
     return is_vm_object_token(granted) ? granted : 0;
+}
+
+static void drop_vm_object_token(u64 token) {
+    if (is_vm_object_token(token)) (void)syscall3(SYSCALL_DROP_VM_OBJECT, token, 0, 0);
 }
 
 static u64 ipc_call_reply_recv_signal_only(u64 endpoint_id, u64 mr0) {
@@ -3378,6 +3383,7 @@ static void forward_backend_response(u16 op, u64 client_seq, u64 cursor_bias) {
     u64 arg0 = 0;
     if (op == FS_OP_OPEN_EXEC && is_vm_object_token(backend->arg0)) {
         arg0 = grant_vm_object_to_client(backend->arg0);
+        drop_vm_object_token(backend->arg0);
     }
     u64 cursor_next = backend->cursor_next;
     if (op == FS_OP_READDIR) {

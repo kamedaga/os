@@ -55,6 +55,7 @@ pub const syscall_accept_cap_transfer: u64 = 0x2A;
 
 pub const syscall_grant_vm_object: u64 = 0x1F;
 pub const syscall_release_vm_object: u64 = 0x29;
+pub const syscall_drop_vm_object: u64 = 0x31;
 pub const syscall_map_vm_object: u64 = 0x28;
 pub const syscall_create_vm_object_from_current_pages: u64 = 0x3F;
 
@@ -72,6 +73,7 @@ pub const syscall_copy_to_abi_trap_reply_target: u64 = trap_abi.syscall_copy_to_
 pub const syscall_set_abi_trap_reply_target_fs_base: u64 = trap_abi.syscall_set_abi_trap_reply_target_fs_base;
 pub const syscall_protect_abi_trap_reply_target_pages: u64 = trap_abi.syscall_protect_abi_trap_reply_target_pages;
 pub const syscall_unmap_abi_trap_reply_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_reply_target_pages;
+pub const syscall_map_abi_trap_reply_target_vm_object: u64 = trap_abi.syscall_map_abi_trap_reply_target_vm_object;
 pub const syscall_reply_abi_trap_target: u64 = trap_abi.syscall_reply_abi_trap_target;
 pub const syscall_copy_to_abi_trap_target: u64 = trap_abi.syscall_copy_to_abi_trap_target;
 pub const syscall_set_abi_trap_target_request_page: u64 = trap_abi.syscall_set_abi_trap_target_request_page;

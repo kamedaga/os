@@ -1,4 +1,4 @@
-static u32 linux_mode_from_fs(u32 fs_mode, u8 kind) { u32 perm = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0555 : 0444; u32 type = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0040000 : (kind == FS_OBJECT_SYMLINK ? 0120000 : 0100000); const u32 fs_type = fs_mode & 0xF000; if (fs_type == FS_DIR_MODE) type = 0040000; if (fs_type == FS_FILE_MODE) type = 0100000; if (fs_type == FS_SYMLINK_MODE) type = 0120000; return type | perm; }
+static u32 linux_mode_from_fs(u32 fs_mode, u8 kind) { u32 perm = kind == FS_OBJECT_SYMLINK ? 0777 : 0555; u32 type = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0040000 : (kind == FS_OBJECT_SYMLINK ? 0120000 : 0100000); const u32 fs_type = fs_mode & 0xF000; if (fs_type == FS_DIR_MODE) type = 0040000; if (fs_type == FS_FILE_MODE) type = 0100000; if (fs_type == FS_SYMLINK_MODE) type = 0120000; return type | perm; }
 static u64 linux_ino_from_path(const char *path) {
     u64 hash = 1469598103934665603ULL;
     for (u64 i = 0; path[i] != 0; i++) {
@@ -179,6 +179,19 @@ static int path_is_dev_file(const char *path) {
 static int path_is_dev_tty(const char *path) {
     return path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/' &&
         path[5] == 't' && path[6] == 't' && path[7] == 'y' && path[8] == 0;
+}
+
+static int fs_path_eq_literal(const char *path, const char *literal) {
+    u64 i = 0;
+    while (path[i] != 0 && literal[i] != 0) {
+        if (path[i] != literal[i]) return 0;
+        i++;
+    }
+    return path[i] == 0 && literal[i] == 0;
+}
+
+static int path_is_proc_self_exe(const char *path) {
+    return fs_path_eq_literal(path, "/proc/self/exe");
 }
 
 static int path_is_dev_random(const char *path) {
@@ -513,7 +526,9 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
         if (response->status != FS_STATUS_OK) return copied != 0 ? reply(copied, 0) : reply(errno_io(), 0);
         if (response->inline_bytes == 0) break;
-        if (copy_to_target(dst + copied, vfs_response_payload(), response->inline_bytes) != response->inline_bytes) return reply(errno_fault(), 0);
+        if (copy_to_target(dst + copied, vfs_response_payload(), response->inline_bytes) != response->inline_bytes) {
+            return reply(errno_fault(), 0);
+        }
         profile_fs_read_path(&g_fds[fd], response->inline_bytes);
         copied += response->inline_bytes; g_fds[fd].offset += response->inline_bytes; sync_fd_to_thread_group(fd);
         if (response->inline_bytes < request_len) break;
@@ -663,6 +678,19 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
         if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
         u64 copied = 0;
         while (copied < pair[1] && g_fds[fd].offset < g_fds[fd].size) {
+            if (g_fds[fd].path_len != 0 && cacheable_readonly_path(g_fds[fd].path)) {
+                int fault = 0;
+                const u64 n = file_cache_read_to_target(&g_fds[fd], g_fds[fd].offset, pair[0] + copied, pair[1] - copied, &fault);
+                if (fault) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
+                if (n != 0 || g_fds[fd].offset >= g_fds[fd].size) {
+                    copied += n;
+                    total += n;
+                    g_fds[fd].offset += n;
+                    sync_fd_to_thread_group(fd);
+                    if (n == 0 || copied < pair[1]) return reply(total, 0);
+                    continue;
+                }
+            }
             u64 request_len = min_u64(pair[1] - copied, FS_RESPONSE_PAYLOAD_BYTES);
             const u64 remaining = g_fds[fd].size - g_fds[fd].offset;
             if (request_len > remaining) request_len = remaining;
@@ -912,6 +940,7 @@ static struct ipc_message handle_newfstatat(const struct trap_request *req, int 
     if (path[0] == 0 && (flags & AT_EMPTY_PATH) != 0) { struct trap_request f = *req; f.args[0] = old_stat ? 0 : dirfd; f.args[1] = stat_va; return handle_fstat(&f); }
     if (path[0] == 0) return reply(errno_noent(), 0);
     if (!resolve_path_at(dirfd, path, resolved)) return reply(errno_nametoolong(), 0);
+    const int nofollow = (req->nr == LINUX_SYS_LSTAT) || (!old_stat && (flags & AT_SYMLINK_NOFOLLOW) != 0);
     if (path_is_dev_tty(resolved)) {
         struct fs_stat_record rec;
         rec.object_kind = FS_OBJECT_FILE;
@@ -934,8 +963,33 @@ static struct ipc_message handle_newfstatat(const struct trap_request *req, int 
         if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0);
         return reply(0, 0);
     }
-    struct fs_stat_record rec; u64 token = 0; u64 size = 0; u8 kind = FS_OBJECT_NONE; if (!vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_noent(), 0); (void)token;
-    struct linux_stat st; fill_linux_stat_path(&st, &rec, size, kind, resolved); if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0); return reply(0, 0);
+    if (path_is_proc_self_exe(resolved)) {
+        struct fs_stat_record rec;
+        rec.object_kind = FS_OBJECT_SYMLINK;
+        rec.size_bytes = g_exec_path_len;
+        rec.mode_bits = FS_SYMLINK_MODE;
+        rec.mtime_unix_sec = 0;
+        if (!nofollow && g_exec_path_len != 0) {
+            struct fs_stat_record target_rec;
+            u64 token = 0;
+            u64 target_size = 0;
+            u8 target_kind = FS_OBJECT_NONE;
+            char target_resolved[FS_MAX_PATH_BYTES + 1];
+            if (vfs_lookup_stat_follow_final(g_exec_path, 1, target_resolved, &token, &target_rec, &target_size, &target_kind)) {
+                (void)token;
+                struct linux_stat target_st;
+                fill_linux_stat_path(&target_st, &target_rec, target_size, target_kind, target_resolved);
+                if (copy_to_target(stat_va, &target_st, sizeof(target_st)) != sizeof(target_st)) return reply(errno_fault(), 0);
+                return reply(0, 0);
+            }
+        }
+        struct linux_stat st;
+        fill_linux_stat_path(&st, &rec, g_exec_path_len, FS_OBJECT_SYMLINK, resolved);
+        if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0);
+        return reply(0, 0);
+    }
+    struct fs_stat_record rec; u64 token = 0; u64 size = 0; u8 kind = FS_OBJECT_NONE; char final_resolved[FS_MAX_PATH_BYTES + 1]; if (!vfs_lookup_stat_follow_final(resolved, !nofollow, final_resolved, &token, &rec, &size, &kind)) return reply(errno_noent(), 0); (void)token;
+    struct linux_stat st; fill_linux_stat_path(&st, &rec, size, kind, final_resolved); if (copy_to_target(stat_va, &st, sizeof(st)) != sizeof(st)) return reply(errno_fault(), 0); return reply(0, 0);
 }
 
 static struct ipc_message handle_getdents64(const struct trap_request *req) {
@@ -1261,7 +1315,9 @@ static struct ipc_message handle_rt_sigaction(const struct trap_request *req) {
     const u64 signo = req->args[0];
     const u64 act_va = req->args[1];
     const u64 oldact_va = req->args[2];
+    const u64 sigset_size = req->args[3];
     if (signo == 0 || signo >= 65) return reply(errno_inval(), 0);
+    if (sigset_size != sizeof(u64)) return reply(errno_inval(), 0);
     if (oldact_va != 0) {
         u64 out[4];
         out[0] = g_proc->sig_handler[signo];
@@ -1300,7 +1356,19 @@ static struct ipc_message handle_rt_sigprocmask(const struct trap_request *req) 
     const u64 set_va = req->args[1];
     const u64 oldset_va = req->args[2];
     const u64 sigset_size = req->args[3];
-    if (sigset_size != 0 && sigset_size < sizeof(u64)) return reply(errno_inval(), 0);
+    if (sigset_size != sizeof(u64)) return reply(errno_inval(), 0);
+    if (profile_trace_enabled()) {
+        profile_trace_prefix("sigprocmask.args");
+        user_log(" how=");
+        user_log_dec_value(how);
+        user_log(" set=");
+        user_log_hex_inline(set_va);
+        user_log(" old=");
+        user_log_hex_inline(oldset_va);
+        user_log(" size=");
+        user_log_dec_value(sigset_size);
+        user_log("\n");
+    }
     if (oldset_va != 0) {
         if (copy_to_target(oldset_va, &g_proc->blocked_signals, sizeof(g_proc->blocked_signals)) != sizeof(g_proc->blocked_signals)) return reply(errno_fault(), 0);
     }

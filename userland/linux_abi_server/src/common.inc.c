@@ -15,6 +15,7 @@ enum {
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_MAP_VM_OBJECT = 0x28,
+    SYSCALL_DROP_VM_OBJECT = 0x31,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_SHARE_CAP = 0x2B,
@@ -41,6 +42,7 @@ enum {
     SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE = 0x4F,
     SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES = 0x50,
     SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES = 0x51,
+    SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_VM_OBJECT = 0x52,
     SYSCALL_REPLY_ABI_TRAP_TARGET = 0x54,
     SYSCALL_COPY_TO_ABI_TRAP_TARGET = 0x55,
     SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE = 0x57,
@@ -513,7 +515,7 @@ enum {
     FILE_CACHE_BASE_VA = 0x28000000,
     FILE_CACHE_BYTES = 640 * 1024 * 1024,
     FILE_CACHE_MAX = 64,
-    USER_LAYOUT_DEFAULT_LOW_VA = 0x20000000,
+    USER_LAYOUT_DEFAULT_LOW_VA = 0x00400000,
     USER_LAYOUT_DEFAULT_TOP_VA = 0x800000000000ULL,
     USER_LAYOUT_CANONICAL_TOP_VA = 0x800000000000ULL,
     USER_LAYOUT_DEFAULT_DYNAMIC_MAP_BASE_VA = 0x23000000,
@@ -524,16 +526,16 @@ enum {
     LINUX_MMAP_BASE_VA = 0x700000000000ULL,
     LINUX_BRK_INITIAL_VA = 0x3B000000,
     LINUX_ENABLE_FILE_VM_OBJECT_MMAP = 1,
-    LINUX_FILE_VM_OBJECT_MAX_PAGES = 4096,
+    LINUX_FILE_VM_OBJECT_MAX_PAGES = 65535,
     LINUX_ENABLE_DIRECT_MMAP_BULK = 0,
-    LINUX_ENABLE_FILE_PAGE_FAULT_LAZY = 0,
+    LINUX_ENABLE_FILE_PAGE_FAULT_LAZY = 1,
     LINUX_MATERIALIZE_FILE_PREFIX_BEFORE_FIXED = 1,
     LINUX_FILE_FAULT_CLUSTER_PAGES = 256,
     EXECVE_MAX_IMAGE_BYTES = 128 * 1024 * 1024,
     EXECVE_MAX_LD_BYTES = 768 * 1024,
-    EXECVE_MAX_ARGV = 8,
-    EXECVE_MAX_ENVP = 16,
-    EXECVE_MAX_ARG_DATA_BYTES = 2048,
+    EXECVE_MAX_ARGV = 64,
+    EXECVE_MAX_ENVP = 32,
+    EXECVE_MAX_ARG_DATA_BYTES = 3072,
 };
 
 enum linux_syscall_category {
@@ -1040,10 +1042,11 @@ struct vm_region {
     u64 file_size;
     u8 file_backed;
     u8 file_lazy;
+    u8 file_vm_object;
     int used;
 };
 
-enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16, LINUX_POSIX_TIMER_MAX = 8 };
+enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16, LINUX_POSIX_TIMER_MAX = 8, LINUX_PROCESS_VM_OBJECT_TOKEN_MAX = 128 };
 struct linux_posix_timer_state {
     u8 used;
     u8 clock_id;
@@ -1070,6 +1073,8 @@ struct linux_process_state {
     u64 mmap_next_va;
     u64 brk_next_va;
     struct vm_region regions[VM_REGION_MAX];
+    u16 vm_object_token_count;
+    u64 vm_object_tokens[LINUX_PROCESS_VM_OBJECT_TOKEN_MAX];
     u16 root_len;
     char root_path[FS_MAX_PATH_BYTES + 1];
     u16 cwd_len;
@@ -1182,9 +1187,9 @@ struct linux_abi_bootstrap_config {
     u64 brk_initial_va;
 };
 
-_Static_assert(OFFSETOF(struct exec_bootstrap_config, arg_data) == 228, "exec cfg arg data offset");
-_Static_assert(OFFSETOF(struct exec_bootstrap_config, user_low_va) == 2280, "exec cfg layout offset");
-_Static_assert(sizeof(struct exec_bootstrap_config) == 2352, "exec cfg size");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, arg_data) == 516, "exec cfg arg data offset");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, user_low_va) == 3592, "exec cfg layout offset");
+_Static_assert(sizeof(struct exec_bootstrap_config) == 3664, "exec cfg size");
 _Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, exec_path) == 64, "linux abi cfg exec path offset");
 _Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, user_low_va) == 208, "linux abi cfg layout offset");
 _Static_assert(sizeof(struct linux_abi_bootstrap_config) == 280, "linux abi cfg size");
@@ -1491,6 +1496,8 @@ static void deliver_tty_signal(u64 signo);
 static void remove_futex_waiters_for_principal(u64 principal);
 static u64 wake_futex_waiters(u64 owner_pid, u64 uaddr, u64 max_wake);
 static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot);
+static u64 map_zeroed_target_pages_chunked(u64 start, u64 page_count, u64 prot);
+static void clear_tracked_target_ranges(void);
 
 struct linux_abi_context {
     struct linux_process_state *proc;

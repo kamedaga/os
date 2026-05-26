@@ -165,6 +165,29 @@ static void clear_process_timers(struct linux_process_state *proc) {
     }
 }
 
+static void reset_signal_dispositions_for_exec(struct linux_process_state *proc) {
+    if (!proc) return;
+    for (u64 signo = 1; signo < 65; signo++) {
+        if (signo == SIGKILL || signo == SIGSTOP) {
+            proc->sig_handler[signo] = 0;
+            proc->sig_flags[signo] = 0;
+            proc->sig_restorer[signo] = 0;
+            continue;
+        }
+        if (proc->sig_handler[signo] == 1) {
+            proc->sig_flags[signo] = 0;
+            proc->sig_restorer[signo] = 0;
+            continue;
+        }
+        proc->sig_handler[signo] = 0;
+        proc->sig_flags[signo] = 0;
+        proc->sig_restorer[signo] = 0;
+    }
+    proc->sigaltstack_sp = 0;
+    proc->sigaltstack_size = 0;
+    proc->sigaltstack_flags = SS_DISABLE;
+}
+
 static u64 timer_remaining_ticks(u64 expiry_tick) {
     if (expiry_tick == 0) return 0;
     const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
@@ -359,32 +382,7 @@ static struct ipc_message reply_current_token(u64 result, u64 flags) {
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
 
-static void trace_errno_reply(u64 result, u64 flags) {
-    const struct trap_request *req = abi_current_request();
-    if (result != (u64)(i64)-22 || !profile_trace_enabled() || req == 0) return;
-    user_log("LinuxAbiServer.trace errno=EINVAL nr=");
-    user_log_dec_value(req->nr);
-    user_log(" principal=");
-    user_log_dec_value(req->caller_principal);
-    user_log(" flags=");
-    user_log_hex_inline(flags);
-    user_log(" a0=");
-    user_log_hex_inline(req->args[0]);
-    user_log(" a1=");
-    user_log_hex_inline(req->args[1]);
-    user_log(" a2=");
-    user_log_hex_inline(req->args[2]);
-    user_log(" a3=");
-    user_log_hex_inline(req->args[3]);
-    user_log(" a4=");
-    user_log_hex_inline(req->args[4]);
-    user_log(" a5=");
-    user_log_hex_inline(req->args[5]);
-    user_log("\n");
-}
-
 static struct ipc_message reply(u64 result, u64 flags) {
-    trace_errno_reply(result, flags);
     if (try_reply_signal_frame(result, flags)) return wait_ipc_timeout(1);
     const u64 explicit_target = abi_reply_target_principal();
     if (explicit_target != 0) {
@@ -437,12 +435,10 @@ static u64 errno_inprogress(void) { return (u64)(i64)-115; }
 static u64 map_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 protect_reply_target_pages(u64 target_va, u64 page_count, u64 prot_bits) { return syscall3(SYSCALL_PROTECT_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count, prot_bits); }
 static u64 unmap_reply_target_pages(u64 target_va, u64 page_count) { return syscall2(SYSCALL_UNMAP_ABI_TRAP_REPLY_TARGET_PAGES, target_va, page_count); }
-static u64 map_vm_object_to_reply_target(u64 vm_token, u64 target_va, u64 prot_bits) {
-    (void)vm_token;
-    (void)target_va;
-    (void)prot_bits;
-    return SYSCALL_ERR_MAP;
+static u64 map_vm_object_to_reply_target(u64 vm_token, u64 object_page_offset, u64 target_va, u64 page_count, u64 prot_bits) {
+    return syscall5(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_VM_OBJECT, vm_token, object_page_offset, target_va, page_count, prot_bits);
 }
+static u64 drop_vm_object_token(u64 vm_token) { return syscall3(SYSCALL_DROP_VM_OBJECT, vm_token, 0, 0); }
 static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
 static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
 static u64 copy_from_trap_target(u64 principal, u64 target_va, void *dst, u64 len) { return syscall4_r10(SYSCALL_COPY_FROM_ABI_TRAP_TARGET, principal, (u64)dst, target_va, len); }

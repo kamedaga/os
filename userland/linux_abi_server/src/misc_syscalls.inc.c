@@ -102,6 +102,17 @@ static struct ipc_message handle_readlinkat(const struct trap_request *req, int 
         if (copy_to_target(dst, target, n) != n) return reply(errno_fault(), 0);
         return reply(n, 0);
     }
+    struct fs_stat_record rec;
+    u64 token = 0;
+    u64 object_size = 0;
+    u8 kind = FS_OBJECT_NONE;
+    if (vfs_lookup_stat(resolved, &token, &rec, &object_size, &kind)) {
+        (void)token;
+        (void)rec;
+        (void)object_size;
+        (void)kind;
+        return reply(errno_inval(), 0);
+    }
     return reply(errno_noent(), 0);
 }
 

@@ -632,8 +632,13 @@ static int append_aux(struct aux_entry *entries, u64 max_entries, u64 *count, u6
     return 1;
 }
 
+enum {
+    STACK_AUX_ENTRY_MAX = 24,
+    STACK_WORD_MAX = 1 + EXEC_MAX_ARGV + 1 + EXEC_MAX_ENVP + 1 + STACK_AUX_ENTRY_MAX * 2,
+};
+
 static int push_stack_words(u64 process_token, u64 *sp, u64 stack_bottom_va, const u64 *words, u64 count) {
-    if (count > 96) return 0;
+    if (count > STACK_WORD_MAX) return 0;
     const u64 byte_len = count * 8;
     if (*sp < stack_bottom_va || byte_len > *sp - stack_bottom_va) return 0;
     *sp -= byte_len;
@@ -685,29 +690,29 @@ static int install_linux_initial_stack(
 
     sp &= ~15ULL;
 
-    struct aux_entry aux[24];
+    struct aux_entry aux[STACK_AUX_ENTRY_MAX];
     u64 aux_count = 0;
-    if (!append_aux(aux, 24, &aux_count, AT_PHDR, main_image->phdr_va)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_PHENT, main_image->summary.header.phentsize)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_PHNUM, main_image->summary.header.phnum)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_PAGESZ, PAGE_BYTES)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_BASE, interp_base)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_FLAGS, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_ENTRY, main_image->entry_va)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_UID, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_EUID, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_GID, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_EGID, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_HWCAP, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_CLKTCK, 100)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_SECURE, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_RANDOM, random_va)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_EXECFN, execfn_va)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_PLATFORM, platform_va)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_SYSINFO_EHDR, 0)) return 0;
-    if (!append_aux(aux, 24, &aux_count, AT_NULL, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_PHDR, main_image->phdr_va)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_PHENT, main_image->summary.header.phentsize)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_PHNUM, main_image->summary.header.phnum)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_PAGESZ, PAGE_BYTES)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_BASE, interp_base)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_FLAGS, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_ENTRY, main_image->entry_va)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_UID, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_EUID, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_GID, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_EGID, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_HWCAP, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_CLKTCK, 100)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_SECURE, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_RANDOM, random_va)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_EXECFN, execfn_va)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_PLATFORM, platform_va)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_SYSINFO_EHDR, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_NULL, 0)) return 0;
 
-    u64 words[96];
+    u64 words[STACK_WORD_MAX];
     u64 count = 0;
     words[count++] = config->argv_count;
     for (u64 i = 0; i < config->argv_count; i++) words[count++] = argv_ptrs[i];

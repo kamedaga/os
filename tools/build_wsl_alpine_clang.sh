@@ -10,7 +10,7 @@ apk="$fixture_dir/apk.elf"
 repositories="$fixture_dir/apk-repositories"
 keys_dir="$fixture_dir/alpine-keys"
 stamp="$work_dir/.capabilityos-built"
-config_id="alpine-v3.22-clang-host-apk-v7"
+config_id="alpine-v3.22-clang-host-apk-v14"
 
 mkdir -p "$fixture_dir" "$work_dir"
 
@@ -56,8 +56,6 @@ exclude = {
     "etc/apk/repositories",
     "etc/apk/world",
     "lib/ld-musl-x86_64.so.1",
-    "lib/libz.so",
-    "lib/libz.so.1",
     "usr/lib/libLLVM-20.so",
 }
 exclude_dirs = {
@@ -93,17 +91,30 @@ def wanted(path: Path) -> bool:
         return False
     if any(name.startswith(prefix) for prefix in exclude_prefixes):
         return False
-    if name.startswith("lib/libz.so."):
-        return False
     if name.startswith("usr/lib/lib") and ".so." in name:
         leaf = name.rsplit("/", 1)[-1]
         keep = {
             "libclang-cpp.so.20.1",
+            "libctf-nobfd.so.0.0.0",
+            "libctf.so.0.0.0",
+            "libffi.so.8.1.4",
+            "libjansson.so.4.14.1",
             "libLLVM.so.20.1",
+            "liblzma.so.5.8.3",
+            "libsframe.so.1.0.0",
+            "libstdc++.so.6.0.33",
+            "libxml2.so.2.13.9",
+            "libz.so.1.3.2",
+            "libzstd.so.1.5.7",
         }
         if leaf not in keep and leaf.count(".") >= 4:
             return False
-    if name.endswith(".a"):
+    keep_static = {
+        "usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/libgcc.a",
+        "usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/libgcc_eh.a",
+        "usr/lib/libssp_nonshared.a",
+    }
+    if name.endswith(".a") and name not in keep_static:
         return False
     return True
 
@@ -126,10 +137,14 @@ for root, dirnames, filenames in os.walk(src, topdown=True, followlinks=False):
         out = dst / rel(item)
         out.parent.mkdir(parents=True, exist_ok=True)
         if item.is_symlink():
+            target_text = os.readlink(item)
             target = resolve_link(item)
-            if not target.exists() or not target.is_file():
-                raise SystemExit(f"unresolved or non-file symlink: {item} -> {target}")
-            shutil.copy2(target, out)
+            if not target.exists():
+                raise SystemExit(f"unresolved symlink: {item} -> {target}")
+            if rel(item) == "lib/libc.musl-x86_64.so.1":
+                shutil.copy2(target, out)
+            else:
+                out.write_bytes(b"CAPABILITYOS_ROOTFS_SYMLINK\n" + target_text.encode())
         elif item.is_file():
             shutil.copy2(item, out)
 

@@ -41,6 +41,7 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->mmap_next_va = g_mmap_base_va;
     proc->brk_next_va = g_brk_initial_va;
     for (u64 i = 0; i < VM_REGION_MAX; i++) proc->regions[i].used = 0;
+    proc->vm_object_token_count = 0;
     proc->root_path[0] = '/'; proc->root_path[1] = 0; proc->root_len = 1;
     proc->cwd[0] = '/'; proc->cwd[1] = 0; proc->cwd_len = 1;
     for (u64 i = 0; i < LINUX_CHILD_MAX; i++) proc->child_used[i] = 0;
@@ -460,7 +461,7 @@ static void record_process_exit(u64 pid, u32 status) {
         if (!parent->used || parent->exec_pending) continue;
         for (u64 child = 0; child < LINUX_CHILD_MAX; child++) {
             if (!parent->child_used[child] || parent->child_slot[child] != pid) continue;
-            parent->pending_signals |= linux_signal_bit(SIGCHLD);
+            queue_process_signal(parent, SIGCHLD);
             break;
         }
     }

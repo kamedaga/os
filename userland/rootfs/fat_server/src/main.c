@@ -664,6 +664,10 @@ static u64 install_file_vm_object(u32 start_cluster, u32 size_bytes, u32 *cached
         size_bytes
     );
     if (copied != size_bytes) return 0;
+    const u32 aligned_size = (size_bytes + FS_PAGE_BYTES - 1) & ~(FS_PAGE_BYTES - 1);
+    for (u32 i = size_bytes; i < aligned_size; i++) {
+        ((volatile u8 *)g_vm_object_scratch_va)[i] = 0;
+    }
     const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, g_vm_object_scratch_va, size_bytes, VM_RIGHT_READ_MAP_GRANT);
     if (is_vm_object_token(token)) g_vm_object_scratch_pages = 0;
     return is_vm_object_token(token) ? token : 0;
@@ -3840,7 +3844,9 @@ static void reply_file_open(u16 op, u64 seq, const struct fat_cached_file *file)
     clear_page(g_session.response_va);
     u64 granted_vm = 0;
     if (op == FS_OP_OPEN_EXEC) {
-        granted_vm = grant_vm_object_to_client(cached_file_vm_object_token((struct fat_cached_file *)file));
+        struct fat_cached_file *mutable_file = (struct fat_cached_file *)file;
+        const u64 source_vm = cached_file_vm_object_token(mutable_file);
+        granted_vm = grant_vm_object_to_client(source_vm);
     }
     write_response_ex(op, seq, FS_STATUS_OK, token_from_object_id(file->open_object_id), *file->size_bytes, 0, FS_OBJECT_OPEN_FILE, 0, granted_vm);
 }
@@ -3971,7 +3977,8 @@ static void reply_dynamic_open(u16 op, u64 seq, u64 object_id, struct fat_dynami
     const u64 base_id = is_dynamic_open_object_id(object_id) ? FAT_DYNAMIC_OBJECT_ID_BASE + (object_id - FAT_DYNAMIC_OPEN_OBJECT_ID_BASE) : object_id;
     u64 granted_vm = 0;
     if (op == FS_OP_OPEN_EXEC) {
-        granted_vm = grant_vm_object_to_client(dynamic_file_vm_object_token(object));
+        const u64 source_vm = dynamic_file_vm_object_token(object);
+        granted_vm = grant_vm_object_to_client(source_vm);
     }
     write_response_ex(op, seq, FS_STATUS_OK, token_from_object_id(FAT_DYNAMIC_OPEN_OBJECT_ID_BASE + (base_id - FAT_DYNAMIC_OBJECT_ID_BASE)), object->size_bytes, 0, FS_OBJECT_OPEN_FILE, 0, granted_vm);
 }

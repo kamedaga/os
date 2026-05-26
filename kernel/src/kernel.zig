@@ -235,10 +235,16 @@ pub const CNode = struct {
         const slot = try self.slotAtOrAllocate(self.len);
         slot.* = cap;
         self.insertPaddrIndex(cap.paddr, self.len);
+        trackPageCapAdded(cap);
         self.len += 1;
     }
 
     pub fn reset(self: *CNode) void {
+        self.releaseTrackedPageRefs();
+        self.resetStorageOnly();
+    }
+
+    fn resetStorageOnly(self: *CNode) void {
         var chunk_index = self.overflow_head;
         while (chunk_index != invalid_chunk) {
             const next = cap_chunk_pool[chunk_index].next;
@@ -290,11 +296,23 @@ pub const CNode = struct {
         return (self.slotAtConst(index) orelse return null).*;
     }
 
+    pub fn popLast(self: *CNode) ?Capability {
+        if (self.len == 0) return null;
+        const last_index = self.len - 1;
+        const cap = (self.slotAtConst(last_index) orelse return null).*;
+        self.removePaddrIndex(cap.paddr);
+        trackPageCapRemoved(cap);
+        self.len = last_index;
+        if (self.slotAt(self.len)) |slot| slot.* = .{};
+        return cap;
+    }
+
     fn removeIndex(self: *CNode, index: usize) void {
         if (index >= self.len) return;
         const last_index = self.len - 1;
         const removed = (self.slotAtConst(index) orelse return).*;
         self.removePaddrIndex(removed.paddr);
+        trackPageCapRemoved(removed);
         if (index != last_index) {
             const last = (self.slotAtConst(last_index) orelse return).*;
             self.removePaddrIndex(last.paddr);
@@ -443,6 +461,27 @@ pub const CNode = struct {
         }
         return &cap_chunk_pool[chunk_index].caps[(index - inline_caps) % chunk_caps];
     }
+
+    fn releaseTrackedPageRefs(self: *CNode) void {
+        const inline_limit = @min(self.len, inline_caps);
+        var index: usize = 0;
+        while (index < inline_limit) : (index += 1) {
+            trackPageCapRemoved(self.caps[index]);
+        }
+
+        var remaining = self.len - inline_limit;
+        var chunk_index = self.overflow_head;
+        while (remaining > 0 and chunk_index != invalid_chunk) {
+            const chunk = &cap_chunk_pool[chunk_index];
+            const chunk_limit = @min(remaining, chunk_caps);
+            index = 0;
+            while (index < chunk_limit) : (index += 1) {
+                trackPageCapRemoved(chunk.caps[index]);
+            }
+            remaining -= chunk_limit;
+            chunk_index = chunk.next;
+        }
+    }
 };
 
 const CapChunk = struct {
@@ -452,6 +491,110 @@ const CapChunk = struct {
 };
 
 var cap_chunk_pool: [CNode.chunk_pool_count]CapChunk = [_]CapChunk{.{}} ** CNode.chunk_pool_count;
+
+const PageCapRefEntry = struct {
+    paddr: u64 = 0,
+    refs: u32 = 0,
+};
+
+const page_cap_ref_slots: usize = 1 << 19;
+var page_cap_refs: [page_cap_ref_slots]PageCapRefEntry = [_]PageCapRefEntry{.{}} ** page_cap_ref_slots;
+var page_cap_ref_overflow: bool = false;
+
+fn pageCapRefHash(paddr: u64) usize {
+    const page = paddr >> 12;
+    const mixed = page *% 11400714819323198485;
+    return @intCast(mixed & @as(u64, page_cap_ref_slots - 1));
+}
+
+fn pageCapRefProbeDistance(home: usize, slot: usize) usize {
+    return (slot + page_cap_ref_slots - home) & (page_cap_ref_slots - 1);
+}
+
+fn pageCapRefRemoveSlot(remove_slot: usize) void {
+    var hole = remove_slot;
+    var slot = (hole + 1) & (page_cap_ref_slots - 1);
+    while (page_cap_refs[slot].refs != 0) {
+        const home = pageCapRefHash(page_cap_refs[slot].paddr);
+        if (pageCapRefProbeDistance(home, slot) > pageCapRefProbeDistance(home, hole)) {
+            page_cap_refs[hole] = page_cap_refs[slot];
+            hole = slot;
+        }
+        slot = (slot + 1) & (page_cap_ref_slots - 1);
+    }
+    page_cap_refs[hole] = .{};
+}
+
+fn clearPageCapRefTable() void {
+    @memset(page_cap_refs[0..], .{});
+    page_cap_ref_overflow = false;
+}
+
+fn rebuildPageCapRefsExcluding(state: *const KernelState, excluded_owner: PrincipalId) void {
+    clearPageCapRefTable();
+    const excluded_index = state.principalStorageIndex(excluded_owner);
+    var pidx: usize = 0;
+    while (pidx < principal_count) : (pidx += 1) {
+        if (pidx == excluded_index) continue;
+        if (pidx < process_count and !state.process_descriptors[pidx].active) continue;
+        const table = &state.cap_tables[pidx];
+        var index: usize = 0;
+        while (index < table.len) : (index += 1) {
+            const cap = table.get(index) orelse break;
+            trackPageCapAdded(cap);
+        }
+    }
+}
+
+fn trackPageCapAdded(cap: Capability) void {
+    if (cap.cap_id == 0) return;
+    if (page_cap_ref_overflow) return;
+    var slot = pageCapRefHash(cap.paddr);
+    var probes: usize = 0;
+    while (probes < page_cap_ref_slots) : (probes += 1) {
+        const entry = &page_cap_refs[slot];
+        if (entry.refs == 0) {
+            entry.* = .{ .paddr = cap.paddr, .refs = 1 };
+            return;
+        }
+        if (entry.paddr == cap.paddr) {
+            entry.refs +|= 1;
+            return;
+        }
+        slot = (slot + 1) & (page_cap_ref_slots - 1);
+    }
+    page_cap_ref_overflow = true;
+}
+
+fn trackPageCapRemoved(cap: Capability) void {
+    if (cap.cap_id == 0) return;
+    if (page_cap_ref_overflow) return;
+    var slot = pageCapRefHash(cap.paddr);
+    var probes: usize = 0;
+    while (probes < page_cap_ref_slots) : (probes += 1) {
+        const entry = &page_cap_refs[slot];
+        if (entry.refs == 0) return;
+        if (entry.paddr == cap.paddr) {
+            entry.refs -= 1;
+            if (entry.refs == 0) pageCapRefRemoveSlot(slot);
+            return;
+        }
+        slot = (slot + 1) & (page_cap_ref_slots - 1);
+    }
+}
+
+fn pageCapRefCount(paddr: u64) u32 {
+    if (page_cap_ref_overflow) return std.math.maxInt(u32);
+    var slot = pageCapRefHash(paddr);
+    var probes: usize = 0;
+    while (probes < page_cap_ref_slots) : (probes += 1) {
+        const entry = page_cap_refs[slot];
+        if (entry.refs == 0) return 0;
+        if (entry.paddr == paddr) return entry.refs;
+        slot = (slot + 1) & (page_cap_ref_slots - 1);
+    }
+    return std.math.maxInt(u32);
+}
 
 fn allocCapChunk() KernelError!u16 {
     var i: usize = 0;
@@ -547,28 +690,127 @@ pub const PublishedEndpointTable = struct {
 };
 
 pub const CapMailbox = struct {
-    const max_items = 8;
+    const inline_items = 8;
+    const chunk_items = 16;
+    const chunk_pool_count = 512;
+    const invalid_chunk: u16 = std.math.maxInt(u16);
 
-    items: [max_items]PendingCapTransfer = undefined,
+    items: [inline_items]PendingCapTransfer = undefined,
+    overflow_head: u16 = invalid_chunk,
     len: usize = 0,
 
     pub fn push(self: *CapMailbox, transfer: PendingCapTransfer) KernelError!void {
-        if (self.len >= self.items.len) return KernelError.TableFull;
-        self.items[self.len] = transfer;
+        const slot = try self.slotAtOrAllocate(self.len);
+        slot.* = transfer;
         self.len += 1;
     }
 
     pub fn pop(self: *CapMailbox) ?PendingCapTransfer {
         if (self.len == 0) return null;
-        const transfer = self.items[0];
+        const transfer = (self.slotAtConst(0) orelse return null).*;
         var i: usize = 1;
         while (i < self.len) : (i += 1) {
-            self.items[i - 1] = self.items[i];
+            const item = (self.slotAtConst(i) orelse return null).*;
+            (self.slotAt(i - 1) orelse return null).* = item;
         }
         self.len -= 1;
+        if (self.slotAt(self.len)) |slot| slot.* = undefined;
+        self.trimUnusedChunks();
         return transfer;
     }
+
+    pub fn reset(self: *CapMailbox) void {
+        freeCapMailboxChunks(self.overflow_head);
+        self.* = .{};
+    }
+
+    fn slotAt(self: *CapMailbox, index: usize) ?*PendingCapTransfer {
+        if (index < inline_items) return &self.items[index];
+        var remaining = index - inline_items;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_items) return &cap_mailbox_chunk_pool[chunk_index].items[remaining];
+            remaining -= chunk_items;
+            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAtConst(self: *const CapMailbox, index: usize) ?*const PendingCapTransfer {
+        if (index < inline_items) return &self.items[index];
+        var remaining = index - inline_items;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_items) return &cap_mailbox_chunk_pool[chunk_index].items[remaining];
+            remaining -= chunk_items;
+            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAtOrAllocate(self: *CapMailbox, index: usize) KernelError!*PendingCapTransfer {
+        if (index < inline_items) return &self.items[index];
+        const needed_chunk_offset = (index - inline_items) / chunk_items;
+        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
+        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocCapMailboxChunk();
+
+        var chunk_index = self.overflow_head;
+        var offset: usize = 0;
+        while (offset < needed_chunk_offset) : (offset += 1) {
+            if (cap_mailbox_chunk_pool[chunk_index].next == invalid_chunk) {
+                cap_mailbox_chunk_pool[chunk_index].next = try allocCapMailboxChunk();
+            }
+            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
+        }
+        return &cap_mailbox_chunk_pool[chunk_index].items[(index - inline_items) % chunk_items];
+    }
+
+    fn trimUnusedChunks(self: *CapMailbox) void {
+        if (self.overflow_head == invalid_chunk) return;
+        if (self.len <= inline_items) {
+            freeCapMailboxChunks(self.overflow_head);
+            self.overflow_head = invalid_chunk;
+            return;
+        }
+        const needed_chunks = (self.len - inline_items + chunk_items - 1) / chunk_items;
+        var chunk_index = self.overflow_head;
+        var kept: usize = 1;
+        while (kept < needed_chunks and chunk_index != invalid_chunk) : (kept += 1) {
+            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
+        }
+        if (chunk_index == invalid_chunk) return;
+        const free_head = cap_mailbox_chunk_pool[chunk_index].next;
+        cap_mailbox_chunk_pool[chunk_index].next = invalid_chunk;
+        freeCapMailboxChunks(free_head);
+    }
 };
+
+const CapMailboxChunk = struct {
+    used: bool = false,
+    next: u16 = CapMailbox.invalid_chunk,
+    items: [CapMailbox.chunk_items]PendingCapTransfer = undefined,
+};
+
+var cap_mailbox_chunk_pool: [CapMailbox.chunk_pool_count]CapMailboxChunk = [_]CapMailboxChunk{.{}} ** CapMailbox.chunk_pool_count;
+
+fn allocCapMailboxChunk() KernelError!u16 {
+    var i: usize = 0;
+    while (i < cap_mailbox_chunk_pool.len) : (i += 1) {
+        if (cap_mailbox_chunk_pool[i].used) continue;
+        cap_mailbox_chunk_pool[i] = .{ .used = true };
+        return @intCast(i);
+    }
+    return KernelError.TableFull;
+}
+
+fn freeCapMailboxChunks(head: u16) void {
+    var chunk_index = head;
+    while (chunk_index != CapMailbox.invalid_chunk) {
+        const next = cap_mailbox_chunk_pool[chunk_index].next;
+        cap_mailbox_chunk_pool[chunk_index] = .{};
+        chunk_index = next;
+    }
+}
 
 pub const IpcBufferCNode = struct {
     pub const max_caps = 512;
@@ -608,26 +850,127 @@ pub const IpcBufferCNode = struct {
 };
 
 pub const IpcBufferMailbox = struct {
-    const max_items = 8;
+    const inline_items = 8;
+    const chunk_items = 16;
+    const chunk_pool_count = 512;
+    const invalid_chunk: u16 = std.math.maxInt(u16);
 
-    items: [max_items]PendingIpcBufferTransfer = undefined,
+    items: [inline_items]PendingIpcBufferTransfer = undefined,
+    overflow_head: u16 = invalid_chunk,
     len: usize = 0,
 
     pub fn push(self: *IpcBufferMailbox, transfer: PendingIpcBufferTransfer) KernelError!void {
-        if (self.len >= self.items.len) return KernelError.TableFull;
-        self.items[self.len] = transfer;
+        const slot = try self.slotAtOrAllocate(self.len);
+        slot.* = transfer;
         self.len += 1;
     }
 
     pub fn pop(self: *IpcBufferMailbox) ?PendingIpcBufferTransfer {
         if (self.len == 0) return null;
-        const transfer = self.items[0];
+        const transfer = (self.slotAtConst(0) orelse return null).*;
         var i: usize = 1;
-        while (i < self.len) : (i += 1) self.items[i - 1] = self.items[i];
+        while (i < self.len) : (i += 1) {
+            const item = (self.slotAtConst(i) orelse return null).*;
+            (self.slotAt(i - 1) orelse return null).* = item;
+        }
         self.len -= 1;
+        if (self.slotAt(self.len)) |slot| slot.* = undefined;
+        self.trimUnusedChunks();
         return transfer;
     }
+
+    pub fn reset(self: *IpcBufferMailbox) void {
+        freeIpcBufferMailboxChunks(self.overflow_head);
+        self.* = .{};
+    }
+
+    fn slotAt(self: *IpcBufferMailbox, index: usize) ?*PendingIpcBufferTransfer {
+        if (index < inline_items) return &self.items[index];
+        var remaining = index - inline_items;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_items) return &ipc_buffer_mailbox_chunk_pool[chunk_index].items[remaining];
+            remaining -= chunk_items;
+            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAtConst(self: *const IpcBufferMailbox, index: usize) ?*const PendingIpcBufferTransfer {
+        if (index < inline_items) return &self.items[index];
+        var remaining = index - inline_items;
+        var chunk_index = self.overflow_head;
+        while (chunk_index != invalid_chunk) {
+            if (remaining < chunk_items) return &ipc_buffer_mailbox_chunk_pool[chunk_index].items[remaining];
+            remaining -= chunk_items;
+            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
+        }
+        return null;
+    }
+
+    fn slotAtOrAllocate(self: *IpcBufferMailbox, index: usize) KernelError!*PendingIpcBufferTransfer {
+        if (index < inline_items) return &self.items[index];
+        const needed_chunk_offset = (index - inline_items) / chunk_items;
+        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
+        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocIpcBufferMailboxChunk();
+
+        var chunk_index = self.overflow_head;
+        var offset: usize = 0;
+        while (offset < needed_chunk_offset) : (offset += 1) {
+            if (ipc_buffer_mailbox_chunk_pool[chunk_index].next == invalid_chunk) {
+                ipc_buffer_mailbox_chunk_pool[chunk_index].next = try allocIpcBufferMailboxChunk();
+            }
+            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
+        }
+        return &ipc_buffer_mailbox_chunk_pool[chunk_index].items[(index - inline_items) % chunk_items];
+    }
+
+    fn trimUnusedChunks(self: *IpcBufferMailbox) void {
+        if (self.overflow_head == invalid_chunk) return;
+        if (self.len <= inline_items) {
+            freeIpcBufferMailboxChunks(self.overflow_head);
+            self.overflow_head = invalid_chunk;
+            return;
+        }
+        const needed_chunks = (self.len - inline_items + chunk_items - 1) / chunk_items;
+        var chunk_index = self.overflow_head;
+        var kept: usize = 1;
+        while (kept < needed_chunks and chunk_index != invalid_chunk) : (kept += 1) {
+            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
+        }
+        if (chunk_index == invalid_chunk) return;
+        const free_head = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
+        ipc_buffer_mailbox_chunk_pool[chunk_index].next = invalid_chunk;
+        freeIpcBufferMailboxChunks(free_head);
+    }
 };
+
+const IpcBufferMailboxChunk = struct {
+    used: bool = false,
+    next: u16 = IpcBufferMailbox.invalid_chunk,
+    items: [IpcBufferMailbox.chunk_items]PendingIpcBufferTransfer = undefined,
+};
+
+var ipc_buffer_mailbox_chunk_pool: [IpcBufferMailbox.chunk_pool_count]IpcBufferMailboxChunk = [_]IpcBufferMailboxChunk{.{}} ** IpcBufferMailbox.chunk_pool_count;
+
+fn allocIpcBufferMailboxChunk() KernelError!u16 {
+    var i: usize = 0;
+    while (i < ipc_buffer_mailbox_chunk_pool.len) : (i += 1) {
+        if (ipc_buffer_mailbox_chunk_pool[i].used) continue;
+        ipc_buffer_mailbox_chunk_pool[i] = .{ .used = true };
+        return @intCast(i);
+    }
+    return KernelError.TableFull;
+}
+
+fn freeIpcBufferMailboxChunks(head: u16) void {
+    var chunk_index = head;
+    while (chunk_index != IpcBufferMailbox.invalid_chunk) {
+        const next = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
+        ipc_buffer_mailbox_chunk_pool[chunk_index] = .{};
+        chunk_index = next;
+    }
+}
 
 pub const max_vm_object_backing_pages: usize = 65535;
 pub const max_vm_object_backing_store_pages: usize = 262144;
@@ -1020,6 +1363,57 @@ pub const FreePageList = struct {
         self.len += 1;
     }
 
+    pub fn appendContiguousRange(
+        self: *FreePageList,
+        region_id: u64,
+        physical_start: u64,
+        page_count: usize,
+    ) KernelError!void {
+        if (page_count == 0) return;
+        const byte_len = @as(u64, @intCast(page_count)) * 4096;
+        const physical_end = physical_start + byte_len;
+        var extend_before: ?usize = null;
+        var extend_after: ?usize = null;
+        var i: usize = 0;
+        while (i < self.range_len) : (i += 1) {
+            const range = &self.ranges[i];
+            if (range.region_id != region_id) continue;
+            const start = range.physical_start;
+            const end = rangeEnd(range);
+            if (physical_start < end and physical_end > start) return KernelError.InvalidState;
+            if (physical_start == end) extend_before = i;
+            if (physical_end == start) extend_after = i;
+        }
+
+        if (extend_before) |before_index| {
+            self.ranges[before_index].len += page_count;
+            self.len += page_count;
+            if (extend_after) |after_index| {
+                if (after_index != before_index) {
+                    self.ranges[before_index].len += self.ranges[after_index].len;
+                    self.removeRangeAt(after_index);
+                }
+            }
+            return;
+        }
+
+        if (extend_after) |after_index| {
+            self.ranges[after_index].physical_start = physical_start;
+            self.ranges[after_index].len += page_count;
+            self.len += page_count;
+            return;
+        }
+
+        if (self.range_len >= self.ranges.len) return KernelError.TooManyFreeRanges;
+        self.ranges[self.range_len] = .{
+            .region_id = region_id,
+            .len = page_count,
+            .physical_start = physical_start,
+        };
+        self.range_len += 1;
+        self.len += page_count;
+    }
+
     pub fn canAppendPage(self: *const FreePageList, region_id: u64, paddr: u64) bool {
         const page_end = paddr + 4096;
         var i: usize = 0;
@@ -1310,8 +1704,9 @@ pub const KernelState = struct {
         return page >= pageAlignDown(mapping.paddr_start) and page < end;
     }
 
-    pub fn removeDmaMappingsForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64) void {
+    pub fn removeDmaMappingsForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64) bool {
         const owner_raw: u8 = @intCast(@intFromEnum(principal));
+        var removed = false;
         var i: usize = 0;
         while (i < self.dma_mappings.entries.len) : (i += 1) {
             const mapping = self.dma_mappings.entries[i];
@@ -1319,7 +1714,9 @@ pub const KernelState = struct {
             if (mapping.owner_principal_raw != owner_raw) continue;
             if (!dmaMappingContainsPage(mapping, paddr)) continue;
             self.dma_mappings.entries[i] = .{};
+            removed = true;
         }
+        return removed;
     }
 
     pub fn removeDmaMappingsForPrincipalDevice(self: *KernelState, principal: PrincipalId, device: DmaDeviceId) void {
@@ -1490,10 +1887,10 @@ pub const KernelState = struct {
     fn clearPrincipalTablesForReuse(self: *KernelState, index: usize) void {
         self.cap_tables[index].reset();
         self.endpoint_tables[index] = .{};
-        self.cap_mailboxes[index] = .{};
+        self.cap_mailboxes[index].reset();
         self.pending_page_transfers[index] = null;
         self.ipc_buffer_tables[index] = .{};
-        self.ipc_buffer_mailboxes[index] = .{};
+        self.ipc_buffer_mailboxes[index].reset();
         self.pending_ipc_buffer_transfers[index] = null;
         self.vm_object_tables[index].reset();
     }
@@ -1644,10 +2041,10 @@ pub const KernelState = struct {
         while (i < principal_count) : (i += 1) {
             self.cap_tables[i].reset();
             self.endpoint_tables[i] = .{};
-            self.cap_mailboxes[i] = .{};
+            self.cap_mailboxes[i].reset();
             self.pending_page_transfers[i] = null;
             self.ipc_buffer_tables[i] = .{};
-            self.ipc_buffer_mailboxes[i] = .{};
+            self.ipc_buffer_mailboxes[i].reset();
             self.pending_ipc_buffer_transfers[i] = null;
             self.vm_object_tables[i].reset();
         }
@@ -1680,6 +2077,7 @@ pub const KernelState = struct {
 
     pub fn initPhase1InPlace(self: *KernelState) void {
         self.* = .{};
+        clearPageCapRefTable();
         self.next_cap_id = 1;
         self.regions[0] = .{
             .id = 0,
@@ -1707,6 +2105,7 @@ pub const KernelState = struct {
         if (region_count > max_regions) return KernelError.TooManyRegions;
 
         self.* = .{};
+        clearPageCapRefTable();
         self.next_cap_id = 1;
         if (builtin.is_test) {
             self.initPrincipalState();
@@ -2243,6 +2642,17 @@ pub const KernelState = struct {
         }
     }
 
+    pub fn dropVmObjectCap(
+        self: *KernelState,
+        owner: PrincipalId,
+        cap_id: u64,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        const removed = self.getVmObjectTable(owner).removeByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
+        self.releaseVmObjectBackingIfUnreferenced(removed.backing, removed.root_cap_id, free_list);
+    }
+
     pub fn releasePrincipalVmObjectCaps(
         self: *KernelState,
         owner: PrincipalId,
@@ -2398,7 +2808,7 @@ pub const KernelState = struct {
             .shared, .none => return KernelError.InvalidState,
         }
         _ = table.removeByPaddr(paddr);
-        self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
+        _ = self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
         try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
         try free_list.appendPage(0, paddr);
     }
@@ -2412,7 +2822,7 @@ pub const KernelState = struct {
         if (!free_list.canAppendPage(0, paddr)) return KernelError.TooManyFreeRanges;
         const table = self.getTable(owner);
         try table.removeExclusiveRootByPaddr(paddr);
-        self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
+        _ = self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
         try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
         try free_list.appendPage(0, paddr);
     }
@@ -2423,23 +2833,73 @@ pub const KernelState = struct {
         free_list: *FreePageList,
     ) void {
         const table = self.getTable(owner);
-        while (table.len > 0) {
-            const cap = table.get(table.len - 1) orelse break;
-            const paddr = cap.paddr;
-            const cap_id = cap.cap_id;
-            _ = table.removeByCapId(cap_id);
-            self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
-            device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke) catch {};
+        const sync_ptes = self.hasActivePrincipal(owner);
+        rebuildPageCapRefsExcluding(self, owner);
+        var free_run_start: u64 = 0;
+        var free_run_len: usize = 0;
+        const flushFreeRun = struct {
+            fn call(list: *FreePageList, start: *u64, len: *usize) void {
+                if (len.* == 0) return;
+                list.appendContiguousRange(0, start.*, len.*) catch {};
+                start.* = 0;
+                len.* = 0;
+            }
+        }.call;
+
+        const inline_limit = @min(table.len, CNode.inline_caps);
+        var index: usize = 0;
+        while (index < inline_limit) : (index += 1) {
+            self.releasePrincipalPageCap(owner, table.caps[index], sync_ptes, free_list, &free_run_start, &free_run_len, false);
+        }
+
+        var remaining = table.len - inline_limit;
+        var chunk_index = table.overflow_head;
+        while (remaining > 0 and chunk_index != CNode.invalid_chunk) {
+            const chunk = &cap_chunk_pool[chunk_index];
+            const chunk_limit = @min(remaining, CNode.chunk_caps);
+            index = 0;
+            while (index < chunk_limit) : (index += 1) {
+                self.releasePrincipalPageCap(owner, chunk.caps[index], sync_ptes, free_list, &free_run_start, &free_run_len, false);
+            }
+            remaining -= chunk_limit;
+            chunk_index = chunk.next;
+        }
+        flushFreeRun(free_list, &free_run_start, &free_run_len);
+        table.resetStorageOnly();
+    }
+
+    fn releasePrincipalPageCap(
+        self: *KernelState,
+        owner: PrincipalId,
+        cap: Capability,
+        sync_ptes: bool,
+        free_list: *FreePageList,
+        free_run_start: *u64,
+        free_run_len: *usize,
+        update_ref_table: bool,
+    ) void {
+        const paddr = cap.paddr;
+        if (cap.rights.dma) {
+            if (self.removeDmaMappingsForPrincipalPaddr(owner, paddr)) {
+                device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke) catch {};
+            }
+        }
+        if (sync_ptes) {
             if (self.pte_sync_hook) |hook| {
                 callPteSyncHook(hook, self, owner, paddr);
             }
-            switch (self.scanCapTables(paddr)) {
-                .none => {
-                    if (free_list.canAppendPage(0, paddr)) {
-                        free_list.appendPage(0, paddr) catch {};
-                    }
-                },
-                .owner, .shared => {},
+        }
+        if (update_ref_table) trackPageCapRemoved(cap);
+        if (pageCapRefCount(paddr) == 0) {
+            const expected = free_run_start.* + @as(u64, @intCast(free_run_len.*)) * 4096;
+            if (free_run_len.* != 0 and paddr == expected) {
+                free_run_len.* += 1;
+            } else {
+                if (free_run_len.* != 0) {
+                    free_list.appendContiguousRange(0, free_run_start.*, free_run_len.*) catch {};
+                }
+                free_run_start.* = paddr;
+                free_run_len.* = 1;
             }
         }
     }
@@ -2485,7 +2945,7 @@ pub const KernelState = struct {
         moved.rights = rights;
         _ = src.removeByPaddr(paddr);
         try self.getTable(to).add(moved);
-        self.removeDmaMappingsForPrincipalPaddr(from, paddr);
+        _ = self.removeDmaMappingsForPrincipalPaddr(from, paddr);
         try device_capabilities.syncIommuForPrincipalPaddr(self, from, paddr, .move_from);
         try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, .move_to);
         if (self.pte_sync_hook) |hook| {
@@ -2569,7 +3029,10 @@ pub const KernelState = struct {
 
         const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
         if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-        if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
+        if (self.getTableConst(to).find(paddr)) |dst_cap| {
+            if (isRightsSubset(rights, dst_cap.rights)) return;
+            return KernelError.InvalidState;
+        }
 
         const child_id = self.allocCapId();
         try self.getTable(to).addAssumeFresh(.{
@@ -2820,7 +3283,7 @@ pub const KernelState = struct {
                 const cap = table.findByCapId(cap_id) orelse continue;
                 const removed_paddr = cap.paddr;
                 _ = table.removeByCapId(cap_id);
-                self.removeDmaMappingsForPrincipalPaddr(@enumFromInt(pidx), removed_paddr);
+                _ = self.removeDmaMappingsForPrincipalPaddr(@enumFromInt(pidx), removed_paddr);
                 try device_capabilities.syncIommuForPrincipalPaddr(self, @enumFromInt(pidx), removed_paddr, .revoke);
                 if (self.pte_sync_hook) |hook| {
                     callPteSyncHook(hook, self, @enumFromInt(pidx), removed_paddr);

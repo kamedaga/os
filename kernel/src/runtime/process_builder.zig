@@ -245,6 +245,16 @@ pub fn shareProcessPagesToProcess(
     while (page_index < page_count) : (page_index += 1) {
         const va = target_va + page_index * 4096;
         const paddr = capability.lookupUserMappedPaddrForVa(source, va) orelse return boot_static.syscall_err_invalid;
+        state_ptr.deriveCapForSharedAddressSpace(source, target, paddr, .{
+            .cpu_read = true,
+            .cpu_write = prot.write,
+            .dma = false,
+            .grant = false,
+        }) catch |err| switch (err) {
+            kernel.KernelError.CapabilityNotFound => {},
+            kernel.KernelError.TableFull => return boot_static.syscall_err_alloc,
+            else => return boot_static.syscall_err_invalid,
+        };
         if (!user_vm.mapUserLinearRegionWithProt(target, va, paddr, 4096, prot)) {
             return boot_static.syscall_err_map;
         }

@@ -9,7 +9,7 @@ pub const two_mib: u64 = x86_platform.two_mib;
 pub const page_entries: usize = x86_platform.page_entries;
 
 pub const user_va: u64 = 0x20000000;
-pub const user_low_va: u64 = user_va;
+pub const user_low_va: u64 = 0x00400000;
 pub const user_elf_base_va: u64 = user_va;
 pub const user_stack_top: u64 = 0x3C00_0000;
 pub const user_stack_page_va: u64 = user_stack_top - 0x1000;

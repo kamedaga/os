@@ -29,6 +29,7 @@ static char g_execve_prefix_buf[128];
 static char g_execve_shebang_interpreter_buf[FS_MAX_PATH_BYTES + 1];
 static char g_execve_shebang_arg_buf[FS_MAX_PATH_BYTES + 1];
 static char g_execve_interpreter_resolved_buf[FS_MAX_PATH_BYTES + 1];
+static char g_execve_proc_exe_path_buf[FS_MAX_PATH_BYTES + 1];
 
 static int path_has_prefix(const char *path, const char *prefix) {
     u64 i = 0;
@@ -192,6 +193,13 @@ static void path_cache_invalidate(const char *path) {
     }
 }
 
+static u32 fs_mode_bits_for_kind(u8 kind, u32 fallback) {
+    if (kind == FS_OBJECT_SYMLINK) return FS_SYMLINK_MODE;
+    if (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) return FS_DIR_MODE;
+    if (kind == FS_OBJECT_FILE) return FS_FILE_MODE;
+    return fallback;
+}
+
 static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_record *stat_out, u64 *file_bytes_out, u8 *kind_out) {
     struct path_cache_entry *cached = path_cache_find(path);
     if (cached != 0) {
@@ -213,17 +221,19 @@ static int vfs_lookup_stat(const char *path, u64 *token_out, struct fs_stat_reco
     response = (volatile struct fs_response_header *)vfs_response_addr();
     if (response->status == FS_STATUS_OK && response->inline_bytes >= FS_STAT_RECORD_BYTES) {
         volatile struct fs_stat_record *record = (volatile struct fs_stat_record *)vfs_response_payload();
+        const u8 effective_kind = lookup_kind != FS_OBJECT_NONE ? lookup_kind :
+            (response->object_kind != FS_OBJECT_NONE ? response->object_kind : record->object_kind);
         const u64 file_bytes = record->size_bytes != 0 ? record->size_bytes : lookup_file_bytes;
-        token_out[0] = token; stat_out->object_kind = record->object_kind; stat_out->size_bytes = file_bytes; stat_out->mode_bits = record->mode_bits; stat_out->mtime_unix_sec = record->mtime_unix_sec;
-        *file_bytes_out = file_bytes; *kind_out = response->object_kind != FS_OBJECT_NONE ? response->object_kind : record->object_kind;
-        path_cache_store(path, token, stat_out, file_bytes, *kind_out);
+        token_out[0] = token; stat_out->object_kind = effective_kind; stat_out->size_bytes = file_bytes; stat_out->mode_bits = fs_mode_bits_for_kind(effective_kind, record->mode_bits); stat_out->mtime_unix_sec = record->mtime_unix_sec;
+        *file_bytes_out = file_bytes; *kind_out = effective_kind;
+        path_cache_store(path, token, stat_out, file_bytes, effective_kind);
         return 1;
     }
     if (response->status != FS_STATUS_OK || lookup_kind == FS_OBJECT_NONE) { user_log("LinuxAbiServer: stat status failed\n"); user_log_hex_value((u64)(u32)response->status); return 0; }
     token_out[0] = token;
     stat_out->object_kind = lookup_kind;
     stat_out->size_bytes = lookup_file_bytes;
-    stat_out->mode_bits = (lookup_kind == FS_OBJECT_DIRECTORY || lookup_kind == FS_OBJECT_MOUNT) ? FS_DIR_MODE : FS_FILE_MODE;
+    stat_out->mode_bits = fs_mode_bits_for_kind(lookup_kind, FS_FILE_MODE);
     stat_out->mtime_unix_sec = 0;
     *file_bytes_out = lookup_file_bytes;
     *kind_out = lookup_kind;
@@ -300,7 +310,53 @@ static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_byt
     return 0;
 }
 
+static int execve_resolve_file_path(const char *path, char *resolved_out) {
+    char current[FS_MAX_PATH_BYTES + 1];
+    if (!normalize_path("/", path, current)) return 0;
+    for (u32 depth = 0; depth < 16; depth++) {
+        struct fs_stat_record rec;
+        u64 token = 0;
+        u64 file_bytes = 0;
+        u8 kind = FS_OBJECT_NONE;
+        if (!vfs_lookup_stat(current, &token, &rec, &file_bytes, &kind)) return 0;
+        (void)token;
+        (void)rec;
+        (void)file_bytes;
+        if (kind == FS_OBJECT_FILE) {
+            const u64 len = cstr_len(current);
+            if (len > FS_MAX_PATH_BYTES) return 0;
+            for (u64 i = 0; i <= len; i++) resolved_out[i] = current[i];
+            return 1;
+        }
+        if (kind != FS_OBJECT_SYMLINK) return 0;
+        char next[FS_MAX_PATH_BYTES + 1];
+        if (!execve_resolve_symlink_target(current, next)) return 0;
+        for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
+            current[i] = next[i];
+            if (next[i] == 0) break;
+        }
+    }
+    return 0;
+}
+
 static int is_vm_object_token(u64 token) { return (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
+static int track_process_vm_object_token(u64 token) {
+    if (!g_proc || !is_vm_object_token(token)) return 0;
+    for (u64 i = 0; i < g_proc->vm_object_token_count; i++) {
+        if (g_proc->vm_object_tokens[i] == token) return 1;
+    }
+    if (g_proc->vm_object_token_count >= LINUX_PROCESS_VM_OBJECT_TOKEN_MAX) return 0;
+    g_proc->vm_object_tokens[g_proc->vm_object_token_count++] = token;
+    return 1;
+}
+static void release_process_vm_object_tokens(struct linux_process_state *proc) {
+    if (!proc) return;
+    for (u64 i = 0; i < proc->vm_object_token_count; i++) {
+        if (is_vm_object_token(proc->vm_object_tokens[i])) (void)drop_vm_object_token(proc->vm_object_tokens[i]);
+        proc->vm_object_tokens[i] = 0;
+    }
+    proc->vm_object_token_count = 0;
+}
 static u64 decode_spawned_process_slot(u64 value) { if ((value & SPAWN_RESULT_TAG) == 0) return 0; return value & SPAWN_RESULT_PROCESS_MASK; }
 static void execve_profile_begin(const char *path) {
     if (!g_execve_profile_enabled) return;
@@ -445,6 +501,15 @@ static int file_cache_find_slot_or_evict(u64 *slot_out) {
     return 0;
 }
 
+static int file_cache_should_fill_for_read(const struct fd_entry *fd, u64 file_offset, u64 len) {
+    if (len == 0 || fd->size == 0 || file_offset >= fd->size) return 0;
+    if (fd->size <= 1024 * 1024) return 1;
+    const u64 remaining = fd->size - file_offset;
+    if (len >= remaining) return 1;
+    if (len >= 4 * 1024 * 1024 && len >= fd->size / 2) return 1;
+    return 0;
+}
+
 static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *fd, int allow_mmap_cow) {
     if (!EXEC_OPT_FILE_READ_CACHE && !(allow_mmap_cow && LINUX_ENABLE_FILE_VM_OBJECT_MMAP)) return 0;
     if (fd->path_len == 0) {
@@ -484,7 +549,13 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
     }
     u64 copied = 0;
     while (copied < fd->size) {
-        u64 chunk = min_u64(fd->size - copied, FS_RESPONSE_PAYLOAD_BYTES);
+        u64 chunk = min_u64(fd->size - copied, FS_BULK_READ_BYTES);
+        u64 bulk_bytes = 0;
+        if (vfs_read_bulk_to_buffer(fd->token, copied, (u32)chunk, buffer_va + copied, &bulk_bytes) && bulk_bytes != 0) {
+            copied += bulk_bytes;
+            continue;
+        }
+        chunk = min_u64(fd->size - copied, FS_RESPONSE_PAYLOAD_BYTES);
         if (!vfs_request(FS_OP_READ, fd->token, copied, (u32)chunk, 0)) break;
         volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
         if (response->status != FS_STATUS_OK || response->inline_bytes == 0) break;
@@ -498,6 +569,10 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
         (void)file_cache_add_free_range(buffer_va, align_up(fd->size, PAGE_BYTES));
         g_prof.file_cache_fill_fail_read++;
         return 0;
+    }
+    const u64 aligned_size = align_up(fd->size, PAGE_BYTES);
+    for (u64 i = fd->size; i < aligned_size; i++) {
+        ((u8 *)buffer_va)[i] = 0;
     }
 
     g_file_cache[slot].used = 1;
@@ -518,6 +593,7 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
 
 static u64 file_cache_read_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 len, int *fault) {
     *fault = 0;
+    if (!file_cache_should_fill_for_read(fd, file_offset, len)) return 0;
     struct file_cache_entry *cached = file_cache_fill_from_fd(fd, 0);
     if (cached == 0) return 0;
     if (file_offset >= cached->size) return 0;
@@ -552,33 +628,51 @@ static u64 file_cache_vm_object_token_for_fd(const struct fd_entry *fd) {
 static int file_vm_object_map_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 size, u64 prot) {
     if (!LINUX_ENABLE_FILE_VM_OBJECT_MMAP) return 0;
     if ((file_offset & (PAGE_BYTES - 1)) != 0 || (dst & (PAGE_BYTES - 1)) != 0 || (size & (PAGE_BYTES - 1)) != 0) return 0;
-    if (file_offset != 0) return 0;
 
     const u64 vm_token = file_cache_vm_object_token_for_fd(fd);
     if (!is_vm_object_token(vm_token)) return 0;
 
     const u64 object_pages = align_up(fd->size, PAGE_BYTES) / PAGE_BYTES;
+    const u64 object_page_offset = file_offset / PAGE_BYTES;
+    if (object_page_offset >= object_pages) {
+        (void)drop_vm_object_token(vm_token);
+        return 0;
+    }
+    const u64 requested_pages = size / PAGE_BYTES;
+    const u64 available_pages = object_pages - object_page_offset;
+    const u64 map_pages = min_u64(requested_pages, available_pages);
+    if (map_pages == 0) {
+        (void)drop_vm_object_token(vm_token);
+        return 0;
+    }
     const u64 map_prot = prot & ~0x2ULL;
-    if (map_vm_object_to_reply_target(vm_token, dst, map_prot) != SYSCALL_OK) {
+    if (map_vm_object_to_reply_target(vm_token, object_page_offset, dst, map_pages, map_prot) != SYSCALL_OK) {
+        (void)drop_vm_object_token(vm_token);
         g_prof.file_vm_object_mmap_map_fail++;
         return 0;
     }
-
-    const u64 requested_pages = size / PAGE_BYTES;
-    if (requested_pages > object_pages) {
-        const u64 tail_pages = requested_pages - object_pages;
-        if (map_target_pages_chunked(dst + object_pages * PAGE_BYTES, tail_pages, map_prot) != SYSCALL_OK) {
-            (void)unmap_reply_target_pages(dst, object_pages);
+    if (requested_pages > map_pages) {
+        const u64 tail_pages = requested_pages - map_pages;
+        const u64 tail_va = dst + map_pages * PAGE_BYTES;
+        if (map_zeroed_target_pages_chunked(tail_va, tail_pages, prot) != SYSCALL_OK) {
+            (void)unmap_reply_target_pages(dst, map_pages);
+            (void)drop_vm_object_token(vm_token);
             g_prof.file_vm_object_mmap_map_fail++;
             return 0;
         }
         g_prof.file_vm_object_mmap_tail_pages += tail_pages;
     }
+    if (!track_process_vm_object_token(vm_token)) {
+        (void)unmap_reply_target_pages(dst, requested_pages);
+        (void)drop_vm_object_token(vm_token);
+        g_prof.file_vm_object_mmap_map_fail++;
+        return 0;
+    }
 
     const u64 readable = file_offset < fd->size ? min_u64(size, fd->size - file_offset) : 0;
     profile_fs_read_path(fd, readable);
     g_prof.file_vm_object_mmap_mapped++;
-    g_prof.file_vm_object_mmap_pages += object_pages;
+    g_prof.file_vm_object_mmap_pages += map_pages;
     return 1;
 }
 
@@ -1062,6 +1156,8 @@ static int start_prepared_exec_launch(u64 expected_child_process_slot) {
 
 static void reset_exec_runtime_state(void) {
     if (!g_proc) return;
+    clear_tracked_target_ranges();
+    release_process_vm_object_tokens(g_proc);
     g_profile_trace_verbose = 0;
     g_mmap_next_va = g_mmap_base_va;
     g_brk_next_va = g_brk_initial_va;
@@ -1253,7 +1349,12 @@ static int configure_exec_args_from_target(struct exec_bootstrap_config *cfg, co
         while (envp_count < EXECVE_MAX_ENVP) {
             u64 ptr = 0;
             if (copy_from_target(envp_va + envp_count * 8, &ptr, 8) != 8) {
-                break;
+                u64 vfork_parent = g_proc ? g_proc->vfork_parent_principal : 0;
+                const struct trap_request *req = abi_current_request();
+                if (vfork_parent == 0 && req != 0) vfork_parent = vfork_parent_for_principal(req->caller_principal);
+                if (copy_from_trap_target(vfork_parent, envp_va + envp_count * 8, &ptr, 8) != 8) {
+                    break;
+                }
             }
             if (ptr == 0) break;
             if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->envp_offsets[envp_count], &cfg->envp_bytes[envp_count])) {
@@ -1295,7 +1396,12 @@ static int configure_exec_args_for_shebang(
     if (envp_va != 0) {
         while (envp_count < EXECVE_MAX_ENVP) {
             u64 ptr = 0;
-            if (copy_from_target(envp_va + envp_count * 8, &ptr, 8) != 8) break;
+            if (copy_from_target(envp_va + envp_count * 8, &ptr, 8) != 8) {
+                u64 vfork_parent = g_proc ? g_proc->vfork_parent_principal : 0;
+                const struct trap_request *req = abi_current_request();
+                if (vfork_parent == 0 && req != 0) vfork_parent = vfork_parent_for_principal(req->caller_principal);
+                if (copy_from_trap_target(vfork_parent, envp_va + envp_count * 8, &ptr, 8) != 8) break;
+            }
             if (ptr == 0) break;
             if (!append_target_cstr_arg(cfg, &cursor, ptr, &cfg->envp_offsets[envp_count], &cfg->envp_bytes[envp_count])) break;
             envp_count++;
@@ -1485,8 +1591,10 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     }
     execve_profile_begin(load_path);
     execve_profile_step("entry");
-    g_exec_path_len = (u16)cstr_len(load_path);
-    for (u16 i = 0; i < g_exec_path_len; i++) g_exec_path[i] = load_path[i];
+    const char *proc_exe_path = load_path;
+    if (execve_resolve_file_path(load_path, g_execve_proc_exe_path_buf)) proc_exe_path = g_execve_proc_exe_path_buf;
+    g_exec_path_len = (u16)cstr_len(proc_exe_path);
+    for (u16 i = 0; i < g_exec_path_len; i++) g_exec_path[i] = proc_exe_path[i];
     g_exec_path[g_exec_path_len] = 0;
     u64 exec_probe_token = 0;
     u64 exec_probe_bytes = 0;
@@ -1531,13 +1639,14 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
         if (g_proc) {
             close_cloexec_fds_for_execve();
             clear_process_timers(g_proc);
-            g_proc->principal = 0;
+            reset_signal_dispositions_for_exec(g_proc);
             g_proc->exec_pending = 1;
             g_proc->exec_pending_principal = spawned_principal;
             if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
         }
         reset_exec_runtime_state();
         if (!start_prepared_exec_launch(spawned_principal)) {
+            user_log("LinuxAbiServer: exec start failed before old exit\n");
             exec_launch_sequence_release();
             if (g_proc) {
                 g_proc->principal = old_principal;
@@ -1570,13 +1679,14 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     if (g_proc) {
         close_cloexec_fds_for_execve();
         clear_process_timers(g_proc);
-        g_proc->principal = 0;
+        reset_signal_dispositions_for_exec(g_proc);
         g_proc->exec_pending = 1;
         g_proc->exec_pending_principal = spawned_principal;
         if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
     }
     reset_exec_runtime_state();
     if (!start_prepared_exec_launch(spawned_principal)) {
+        user_log("LinuxAbiServer: exec start failed before old exit\n");
         exec_launch_sequence_release();
         if (g_proc) {
             g_proc->principal = old_principal;

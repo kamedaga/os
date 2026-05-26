@@ -10,7 +10,7 @@ static void close_all_process_fds(struct linux_process_state *proc) {
     }
 }
 
-static int unmap_all_tracked_target_ranges(void);
+static void clear_tracked_target_ranges(void);
 
 static int has_live_linux_process_state(void) {
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
@@ -166,8 +166,14 @@ static int satisfy_pending_waiters_for_child(u64 child_slot) {
             if (!proc->child_used[i] || proc->child_slot[i] != child_slot) continue;
             u64 result = child_slot;
             struct linux_process_state *child_proc = process_state_for_pid(child_slot);
-            u32 exit_code = child_proc ? child_proc->exit_status : 0;
-            (void)take_process_exit_record(child_slot, &exit_code);
+            u32 exit_code = 0;
+            if (!take_process_exit_record(child_slot, &exit_code)) {
+                if (child_proc && child_proc->exec_pending) continue;
+                const u64 child_principal = child_proc ? child_proc->principal : child_slot;
+                const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child_principal);
+                if ((st & 0xff) == 1) continue;
+                exit_code = child_proc ? child_proc->exit_status : 0;
+            }
             wait_child_slot_settled(child_slot);
             if (!write_wait_status_to_trap_target(proc->principal, proc->wait_status_va, exit_code)) result = errno_fault();
             if (!zero_linux_rusage_trap_target(proc->principal, proc->wait_rusage_va)) result = errno_fault();
@@ -178,6 +184,7 @@ static int satisfy_pending_waiters_for_child(u64 child_slot) {
             proc->wait_status_va = 0;
             proc->wait_rusage_va = 0;
             const u64 reply_status = reply_trap_target(proc->principal, result, 0);
+            if (reply_status == SYSCALL_OK) (void)detach_reply_token();
             if (reply_status != SYSCALL_OK) {
                 user_log("LinuxAbiServer: wait reply failed=");
                 user_log_hex_value(reply_status);
@@ -186,7 +193,9 @@ static int satisfy_pending_waiters_for_child(u64 child_slot) {
             break;
         }
     }
-    if (!satisfied) log_wait_state_for_miss(child_slot);
+    if (!satisfied) {
+        log_wait_state_for_miss(child_slot);
+    }
     return satisfied;
 }
 
@@ -220,16 +229,25 @@ static struct ipc_message terminate_current_linux_process_from_trap(
         }
         record_process_exit(exiting_pid, exiting_proc->exit_status);
         close_all_process_fds(exiting_proc);
-        (void)unmap_all_tracked_target_ranges();
+        clear_tracked_target_ranges();
+        release_process_vm_object_tokens(exiting_proc);
         remove_futex_waiters_for_principal(exiting_principal);
         reply_vfork_parent_if_any(exiting_proc);
         exiting_proc->used = 0;
     }
 
+    struct ipc_message msg;
     prime_reply_return_signal();
-    (void)satisfy_pending_waiters_for_child(exiting_pid);
-    try_satisfy_pending_sigwaits();
-    const struct ipc_message msg = reply_current_token(reply_result, reply_flags);
+    if ((reply_flags & TRAP_RESPONSE_FLAG_EXIT) != 0) {
+        exit_trap_target_no_wait(exiting_principal);
+        try_satisfy_pending_sigwaits();
+        (void)satisfy_pending_waiters_for_child(exiting_pid);
+        msg = wait_ipc_timeout(1);
+    } else {
+        (void)satisfy_pending_waiters_for_child(exiting_pid);
+        try_satisfy_pending_sigwaits();
+        msg = reply_current_token(reply_result, reply_flags);
+    }
 
     int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
     if (!root_exited && g_root_linux_principal_set) {
@@ -268,6 +286,7 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
     child->mmap_next_va = parent->mmap_next_va;
     child->brk_next_va = parent->brk_next_va;
     for (u64 i = 0; i < VM_REGION_MAX; i++) child->regions[i] = parent->regions[i];
+    child->vm_object_token_count = 0;
     child->root_len = parent->root_len;
     for (u16 i = 0; i <= parent->root_len && i <= FS_MAX_PATH_BYTES; i++) child->root_path[i] = parent->root_path[i];
     child->cwd_len = parent->cwd_len;
@@ -348,6 +367,7 @@ static int supported_clone_process_flags(u64 flags) {
 }
 
 static int materialize_lazy_file_range(u64 start, u64 size, u64 prot);
+static int materialize_file_vm_object_range(u64 start, u64 size, u64 prot);
 
 static u16 read_le16(const u8 *bytes, u64 off) {
     return (u16)bytes[off] | ((u16)bytes[off + 1] << 8);
@@ -366,13 +386,24 @@ static u64 read_le64(const u8 *bytes, u64 off) {
     return value;
 }
 
-static int materialize_all_spawn_regions(void) {
+static int materialize_all_spawn_regions(int share_vm) {
     for (;;) {
         int found = 0;
         for (u64 i = 0; i < VM_REGION_MAX; i++) {
             if (!g_regions[i].used || !g_regions[i].file_lazy) continue;
             found = 1;
             if (!materialize_lazy_file_range(g_regions[i].start, g_regions[i].size, g_regions[i].prot)) return 0;
+            break;
+        }
+        if (!found) break;
+    }
+    if (!share_vm) return 1;
+    for (;;) {
+        int found = 0;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || !g_regions[i].file_vm_object || (g_regions[i].prot & 0x2) == 0) continue;
+            found = 1;
+            if (!materialize_file_vm_object_range(g_regions[i].start, g_regions[i].size, g_regions[i].prot)) return 0;
             break;
         }
         if (!found) return 1;
@@ -477,6 +508,45 @@ static int copy_elf_image_pages_to_process(u64 process_token, u64 source_process
     return 1;
 }
 
+static int share_elf_image_pages_to_process(u64 process_token, u64 source_process_slot, u64 base, u64 *next_base_out) {
+    enum { PT_LOAD = 1, PF_X = 1, PF_W = 2 };
+    u8 ehdr[64];
+    *next_base_out = 0;
+    if (copy_from_target(base, ehdr, sizeof(ehdr)) != sizeof(ehdr)) return 1;
+    if (ehdr[0] != 0x7f || ehdr[1] != 'E' || ehdr[2] != 'L' || ehdr[3] != 'F') return 1;
+    if (ehdr[4] != 2 || ehdr[5] != 1 || ehdr[6] != 1) return 0;
+    const u64 phoff = read_le64(ehdr, 32);
+    const u16 phentsize = read_le16(ehdr, 54);
+    const u16 phnum = read_le16(ehdr, 56);
+    if (phentsize < 56 || phnum > 64) return 0;
+
+    u64 image_end = base;
+    u64 max_align = PAGE_BYTES;
+    for (u64 i = 0; i < phnum; i++) {
+        u8 phdr[56];
+        if (copy_from_target(base + phoff + i * phentsize, phdr, sizeof(phdr)) != sizeof(phdr)) return 0;
+        if (read_le32(phdr, 0) != PT_LOAD) continue;
+        const u32 flags = read_le32(phdr, 4);
+        const u64 vaddr = read_le64(phdr, 16);
+        const u64 memsz = read_le64(phdr, 40);
+        const u64 align = read_le64(phdr, 48);
+        if (memsz == 0) continue;
+        if (align > max_align) max_align = align;
+        const u64 seg_start = base + (vaddr & ~(u64)(PAGE_BYTES - 1));
+        const u64 seg_end = align_up(base + vaddr + memsz, PAGE_BYTES);
+        if (seg_end > image_end) image_end = seg_end;
+        u64 prot = 0x1;
+        if ((flags & PF_W) != 0) {
+            prot |= 0x2;
+        } else if ((flags & PF_X) != 0) {
+            prot |= 0x4;
+        }
+        if (!share_present_pages_to_process(process_token, source_process_slot, seg_start, seg_end, prot)) return 0;
+    }
+    *next_base_out = align_up(image_end, max_align);
+    return 1;
+}
+
 static int copy_loaded_elf_images_to_process(u64 process_token, u64 source_process_slot) {
     u64 base = g_et_dyn_base_va;
     const u64 scan_end = g_et_dyn_base_va + 0x04000000ULL;
@@ -489,8 +559,20 @@ static int copy_loaded_elf_images_to_process(u64 process_token, u64 source_proce
     return 1;
 }
 
+static int share_loaded_elf_images_to_process(u64 process_token, u64 source_process_slot) {
+    u64 base = g_et_dyn_base_va;
+    const u64 scan_end = g_et_dyn_base_va + 0x04000000ULL;
+    for (u64 i = 0; i < 4 && base < scan_end; i++) {
+        u64 next_base = 0;
+        if (!share_elf_image_pages_to_process(process_token, source_process_slot, base, &next_base)) return 0;
+        if (next_base <= base) break;
+        base = next_base;
+    }
+    return 1;
+}
+
 static int copy_current_vm_to_process(u64 process_token, u64 source_process_slot, u64 parent_rsp, u64 child_rsp, int share_vm) {
-    if (!materialize_all_spawn_regions()) return 0;
+    if (!materialize_all_spawn_regions(share_vm)) return 0;
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
         if (!g_regions[i].used || g_regions[i].file_lazy) continue;
         const u64 start = g_regions[i].start;
@@ -511,7 +593,7 @@ static int copy_current_vm_to_process(u64 process_token, u64 source_process_slot
         }
     }
     if (share_vm) {
-        if (!share_present_pages_to_process(process_token, source_process_slot, g_et_dyn_base_va, g_et_dyn_base_va + 0x04000000ULL, 0x3)) return 0;
+        if (!share_loaded_elf_images_to_process(process_token, source_process_slot)) return 0;
     } else {
         if (!copy_present_pages_to_process(process_token, source_process_slot, g_user_low_va, g_user_low_va + 0x00800000ULL, 0x3)) return 0;
         if (!copy_loaded_elf_images_to_process(process_token, source_process_slot)) return 0;
@@ -640,7 +722,7 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
         if (!supported_clone_process_flags(flags)) return reply(errno_inval(), 0);
     }
     const int vfork_form = clone_form && (flags & CLONE_VFORK) != 0;
-    const int share_vm = clone_form && (flags & CLONE_VM) != 0 && !vfork_form;
+    const int share_vm = clone_form && (flags & CLONE_VM) != 0;
     struct abi_child_spawn spawn = prepare_abi_child_from_request(req, child_stack, 0, share_vm);
     const u64 child_slot = spawn.slot;
     if (child_slot == 0) return reply(errno_busy(), 0);
@@ -883,7 +965,6 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
     const u64 options = req->args[2];
     const u64 rusage_va = req->args[3];
     const u64 supported_options = (u64)WNOHANG | (u64)WUNTRACED | (u64)WCONTINUED;
-    profile_trace_event_u64("wait4.begin pid", (u64)pid);
     if ((options & ~supported_options) != 0) return reply(errno_inval(), 0);
     u64 child = 0;
     int fault = 0;
@@ -914,6 +995,10 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
         g_proc->wait_status_va = 0;
         g_proc->wait_rusage_va = 0;
         return reply(errno_again(), 0);
+    }
+    for (u64 i = 0; i < LINUX_CHILD_MAX; i++) {
+        if (!g_proc->child_used[i] || !wait_pid_matches_child(pid, g_proc->child_slot[i])) continue;
+        if (satisfy_pending_waiters_for_child(g_proc->child_slot[i])) return wait_ipc_timeout(1);
     }
     return wait_ipc();
 }

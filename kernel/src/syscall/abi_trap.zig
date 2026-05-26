@@ -26,6 +26,9 @@ pub fn dispatch(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *Tr
         sc.syscall_unmap_abi_trap_reply_target_pages => {
             return abi_trap_runtime.unmapCurrentReplyTargetPages(state, frame.rdi, frame.rsi);
         },
+        sc.syscall_map_abi_trap_reply_target_vm_object => {
+            return abi_trap_runtime.mapVmObjectRangeToCurrentReplyTarget(state, proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8);
+        },
         sc.syscall_reply_abi_trap_target => {
             return abi_trap_runtime.replyToTarget(state, proc, frame.rdi, frame.rsi, frame.rdx);
         },

@@ -83,20 +83,22 @@ static struct linux_syscall_dispatch_result handle_exit_syscall(const struct tra
         if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
         profile_trace_event_u64("exit.close_fds pid", exiting_pid);
         close_all_process_fds(g_proc);
-        (void)unmap_all_tracked_target_ranges();
+        clear_tracked_target_ranges();
+        release_process_vm_object_tokens(exiting_proc);
         satisfy_waiters_after_exit_reply = 1;
     }
     remove_futex_waiters_for_principal(exiting_principal);
     reply_vfork_parent_if_any(exiting_proc);
     if (exiting_proc) exiting_proc->used = 0;
     prime_reply_return_signal();
+    profile_trace_event_u64("exit.reply principal", exiting_principal);
+    exit_trap_target_no_wait(exiting_principal);
     if (satisfy_waiters_after_exit_reply) {
         profile_trace_event_u64("exit.satisfy_waiters pid", exiting_pid);
-        (void)satisfy_pending_waiters_for_child(exiting_pid);
         try_satisfy_pending_sigwaits();
+        (void)satisfy_pending_waiters_for_child(exiting_pid);
     }
-    profile_trace_event_u64("exit.reply principal", exiting_principal);
-    result.msg = reply_current_token(0, TRAP_RESPONSE_FLAG_EXIT);
+    result.msg = wait_ipc_timeout(1);
     int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
     if (!root_exited && g_root_linux_principal_set) {
         const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);

@@ -81,6 +81,11 @@ pub fn dispatch(
             state.revokeVmObjectCapTree(proc, cap_id, free_list) catch return sc.syscall_err_revoke;
             return sc.syscall_ok;
         },
+        sc.syscall_drop_vm_object => {
+            const cap_id = kernel.decodeVmObjectToken(frame.rdi) orelse return sc.syscall_err_invalid;
+            state.dropVmObjectCap(proc, cap_id, free_list) catch return sc.syscall_err_revoke;
+            return sc.syscall_ok;
+        },
         sc.syscall_map_vm_object => blk: {
             const cap_id = kernel.decodeVmObjectToken(frame.rdi) orelse return sc.syscall_err_invalid;
             const target_va = frame.rsi;

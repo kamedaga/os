@@ -597,6 +597,12 @@ fn enqueueRunnableThreadLocked(thread_index: usize) bool {
     return true;
 }
 
+pub fn threadAssociatedWithAnyCpu(thread_index: usize) bool {
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    return threadAssociatedWithAnyCpuLocked(thread_index);
+}
+
 fn setRunnableQueueMembership(thread_index: usize, runnable: bool) void {
     lockAllCpuSchedulerStates();
     defer unlockAllCpuSchedulerStates();
@@ -1492,8 +1498,11 @@ fn clearThreadFromCpuSchedulerStatesLocked(thread_index: usize) u64 {
             state.validated_handoff_thread == thread_index or
             state.consumed_handoff_thread == thread_index or
             state.entered_handoff_thread == thread_index;
+        const entered_on_user_ap = cpu_slot != bootstrap_cpu_slot and
+            state.entered_handoff_thread == thread_index and
+            smp.cpuState(cpu_slot) == .user;
         const running_on_ap = cpu_slot != bootstrap_cpu_slot and
-            (state.current_thread == thread_index or state.entered_handoff_thread == thread_index);
+            (state.current_thread == thread_index or entered_on_user_ap);
         state.run_queue.markBlocked(thread_index);
         if (associated_with_cpu) {
             state.current_thread = state.idle_thread;
@@ -1537,7 +1546,7 @@ fn stopReleasedThreadOnAp(release_cpu_slot: usize, releasing_from_cpu: usize, wa
         const bit = cpuAffinityBit(cpu_slot) orelse {
             continue;
         };
-        if ((target_mask & bit) == 0) continue;
+        if ((wake_mask & bit) == 0) continue;
         if (cpu_slot == releasing_from_cpu) continue;
         waitForReleasedApToPark(cpu_slot);
     }
