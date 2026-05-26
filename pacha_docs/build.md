@@ -32,7 +32,7 @@ sudo apt update
 sudo apt install qemu-system-x86 ovmf build-essential musl-tools cmake pkg-config wget curl python3
 ```
 
-`ninja` はこの確認環境では未導入でした。現在の通常ビルドでは必須ではありません。
+
 
 ## Line Endings
 
@@ -101,8 +101,9 @@ License information is summarized in `THIRD_PARTY_NOTICES.md`.
 `setup full` 後に QEMU で boot して `apk add zlib` を確認します。
 
 ```powershell
-wsl -e bash -lc "cd /mnt/c/Users/kamer/Documents/os && python3 tools/apk_add_smoke.py --timeout 120 --package zlib --out .artifacts/apk-add-smoke"
+...\os> pactl run --split-windows
 ```
+terminalが追加で起動するので、apk update; apk add zlibを試します。
 
 成功すると、OS 内で Alpine v3.22 の index を取得し、temporary root に `musl` と `zlib` を install したあと、`zlib` が表示されます。
 
@@ -116,11 +117,6 @@ zlib
 __CAPABILITYOS_SMOKE_DONE_38196__:0
 ```
 
-`apk update` 単体の smoke も次で確認できます。
-
-```powershell
-wsl -e bash -lc "cd /mnt/c/Users/kamer/Documents/os && python3 tools/apk_update_smoke.py --timeout 90 --out .artifacts/apk-update-smoke --command 'apk update'"
-```
 
 ## Kernel-only Check
 
