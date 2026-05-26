@@ -18,6 +18,37 @@ musl libc と動的リンクにより、既存の Linux エコシステムとの
 
 カーネルの設計目標は 20,000 行以下。Lean 4 形式検証目標。
 
+## python3 OS上で動作 
+```pycon
+Python 3.12.13 (main, Apr 10 2026, 14:16:05) [GCC 14.2.0] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+>>> import os
+>>> print("os.uname():", os.uname())
+os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release='6.0.0-capabilityos', version='CapabilityOS Linux ABI', machine='x86_64')
+>>>
+```
+
+## OS上でclangを用いたコンパイル
+```dash
+# apk add nano
+fetch http://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz
+fetch http://dl-cdn.alpinelinux.org/alpine/v3.22/community/x86_64/APKINDEX.tar.gz
+(1/3) Installing ncurses-terminfo-base (6.5_p20250503-r0)
+(2/3) Installing libncursesw (6.5_p20250503-r0)
+(3/3) Installing nano (8.4-r0)
+OK: 464 MiB in 28 packages
+# nano main.c
+```
+![nano editing main.c](assets/nano-screenshot.png)
+```dash
+# clang main.c
+# ls
+a.out  main.c
+# ./a.out
+hello, world
+```
+
+
 ## Tech Stack
 
 | Layer | Language | Note |
@@ -35,19 +66,10 @@ pactl run
 
 ## Status
 
-Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカがマルチコアで動作し、apkから安定とは言えないけどパッケージを追加して動いています。(nano, w3m, cpython, lua, vimなど)
+Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカがマルチコアで動作し、apkからパッケージを追加して動いています。(nano, w3m, cpython, lua, vimなど)
 
-また、muslだけでなく、musl変換レイヤーを介さずglibcの実行ファイルでhello, worldも成功してる(muslと比べたら不安定だと思われ)
+また、muslだけでなく、musl変換レイヤーを介さずglibcの実行ファイルでhello, worldも成功してる。
 
-## python3 OS上で動作 
-```pycon
-Python 3.12.13 (main, Apr 10 2026, 14:16:05) [GCC 14.2.0] on linux
-Type "help", "copyright", "credits" or "license" for more information.
->>> import os
->>> print("os.uname():", os.uname())
-os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release='6.0.0-capabilityos', version='CapabilityOS Linux ABI', machine='x86_64')
->>>
-```
 
 ## License
 
