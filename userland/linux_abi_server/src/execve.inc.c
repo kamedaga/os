@@ -1161,7 +1161,6 @@ static void reset_exec_runtime_state(void) {
     g_profile_trace_verbose = 0;
     g_mmap_next_va = g_mmap_base_va;
     g_brk_next_va = g_brk_initial_va;
-    for (u64 i = 0; i < VM_REGION_MAX; i++) g_regions[i].used = 0;
 }
 
 static int exec_cstr_eq(const char *a, const char *b) {
@@ -1514,6 +1513,43 @@ static void close_cloexec_fds_for_execve(void) {
     }
 }
 
+static void prepare_process_for_exec_replacement(u64 old_principal, u64 spawned_principal) {
+    if (!g_proc) return;
+    close_cloexec_fds_for_execve();
+    clear_process_timers(g_proc);
+    reset_signal_dispositions_for_exec(g_proc);
+    g_proc->exec_pending = 1;
+    g_proc->exec_pending_principal = spawned_principal;
+    if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
+    reset_exec_runtime_state();
+}
+
+static void rollback_process_exec_replacement(u64 old_principal) {
+    if (g_proc) {
+        g_proc->principal = old_principal;
+        g_proc->exec_pending = 0;
+        g_proc->exec_pending_principal = 0;
+    }
+    if (!g_root_linux_principal_set || g_root_linux_principal == 0) {
+        g_root_linux_principal = old_principal;
+        g_root_linux_principal_set = 1;
+    }
+}
+
+static struct ipc_message commit_exec_replacement(u64 old_principal, u64 spawned_principal) {
+    prepare_process_for_exec_replacement(old_principal, spawned_principal);
+    if (!start_prepared_exec_launch(spawned_principal)) {
+        user_log("LinuxAbiServer: exec start failed before old exit\n");
+        exec_launch_sequence_release();
+        rollback_process_exec_replacement(old_principal);
+        return reply(errno_io(), 0);
+    }
+    exit_trap_target_no_wait(old_principal);
+    exec_launch_sequence_release();
+    reply_vfork_parent_if_any(g_proc);
+    return wait_ipc();
+}
+
 static int read_exec_prefix_from_token(u64 token, char *buf, u16 cap, u16 *bytes_out) {
     *bytes_out = 0;
     if (cap == 0) return 0;
@@ -1636,33 +1672,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
             reply_vfork_parent_if_any(g_proc);
             return reply(errno_io(), 0);
         }
-        if (g_proc) {
-            close_cloexec_fds_for_execve();
-            clear_process_timers(g_proc);
-            reset_signal_dispositions_for_exec(g_proc);
-            g_proc->exec_pending = 1;
-            g_proc->exec_pending_principal = spawned_principal;
-            if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
-        }
-        reset_exec_runtime_state();
-        if (!start_prepared_exec_launch(spawned_principal)) {
-            user_log("LinuxAbiServer: exec start failed before old exit\n");
-            exec_launch_sequence_release();
-            if (g_proc) {
-                g_proc->principal = old_principal;
-                g_proc->exec_pending = 0;
-                g_proc->exec_pending_principal = 0;
-            }
-            if (!g_root_linux_principal_set || g_root_linux_principal == 0) {
-                g_root_linux_principal = old_principal;
-                g_root_linux_principal_set = 1;
-            }
-            return reply(errno_io(), 0);
-        }
-        exit_trap_target_no_wait(old_principal);
-        exec_launch_sequence_release();
-        reply_vfork_parent_if_any(g_proc);
-        return wait_ipc();
+        return commit_exec_replacement(old_principal, spawned_principal);
     }
     if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
     execve_profile_step("probe lookup done");
@@ -1676,31 +1686,5 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     }
     execve_profile_step("spawn exec done");
     execve_profile_flush();
-    if (g_proc) {
-        close_cloexec_fds_for_execve();
-        clear_process_timers(g_proc);
-        reset_signal_dispositions_for_exec(g_proc);
-        g_proc->exec_pending = 1;
-        g_proc->exec_pending_principal = spawned_principal;
-        if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
-    }
-    reset_exec_runtime_state();
-    if (!start_prepared_exec_launch(spawned_principal)) {
-        user_log("LinuxAbiServer: exec start failed before old exit\n");
-        exec_launch_sequence_release();
-        if (g_proc) {
-            g_proc->principal = old_principal;
-            g_proc->exec_pending = 0;
-            g_proc->exec_pending_principal = 0;
-        }
-        if (!g_root_linux_principal_set || g_root_linux_principal == 0) {
-            g_root_linux_principal = old_principal;
-            g_root_linux_principal_set = 1;
-        }
-        return reply(errno_io(), 0);
-    }
-    exit_trap_target_no_wait(old_principal);
-    exec_launch_sequence_release();
-    reply_vfork_parent_if_any(g_proc);
-    return wait_ipc();
+    return commit_exec_replacement(old_principal, spawned_principal);
 }

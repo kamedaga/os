@@ -10,7 +10,7 @@ apk="$fixture_dir/apk.elf"
 repositories="$fixture_dir/apk-repositories"
 keys_dir="$fixture_dir/alpine-keys"
 stamp="$work_dir/.capabilityos-built"
-config_id="alpine-v3.22-clang-host-apk-v14"
+config_id="alpine-v3.22-clang-host-apk-v15-headers"
 
 mkdir -p "$fixture_dir" "$work_dir"
 
@@ -62,12 +62,8 @@ exclude_dirs = {
     "etc/apk/keys",
 }
 exclude_prefixes = (
-    "usr/include/",
     "usr/lib/cmake/",
-    "usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include/",
     "usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/plugin/include/",
-    "usr/lib/llvm20/include/",
-    "usr/lib/llvm20/lib/clang/20/include/",
     "usr/share/",
     "usr/x86_64-alpine-linux-musl/lib/ldscripts/",
     "var/cache/apk/",

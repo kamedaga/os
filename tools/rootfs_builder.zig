@@ -39,6 +39,7 @@ const Directory = struct {
     leaf: []u8,
     short_name: [11]u8,
     cluster: u32 = 0,
+    cluster_count: u32 = 1,
 };
 
 const LoadedSpec = struct {
@@ -349,6 +350,10 @@ fn appendLfnEntries(entries: *std.ArrayList([32]u8), allocator: std.mem.Allocato
     }
 }
 
+fn lfnEntryCount(name: []const u8) usize {
+    return (name.len + 12) / 13;
+}
+
 fn makeDirent(short_name: [11]u8, attr: u8, cluster: u32, file_size: u32) [32]u8 {
     var entry = [_]u8{0} ** 32;
     @memcpy(entry[0..11], &short_name);
@@ -369,7 +374,29 @@ fn addNamedDirent(entries: *std.ArrayList([32]u8), allocator: std.mem.Allocator,
     try entries.append(allocator, makeDirent(short_name, attr, cluster, file_size));
 }
 
-fn writeDirectoryCluster(file: *std.fs.File, layout: VolumeLayout, allocator: std.mem.Allocator, dir_index: usize, dirs: []const Directory, specs: []const LoadedSpec) !void {
+fn directoryEntryCount(dir_index: usize, dirs: []const Directory, specs: []const LoadedSpec) usize {
+    var count: usize = if (dir_index == 0) 0 else 2;
+    for (dirs, 0..) |dir, index| {
+        if (index == 0 or dir.parent_index == null or dir.parent_index.? != dir_index) continue;
+        count += lfnEntryCount(dir.leaf) + 1;
+    }
+    for (specs) |spec| {
+        if (spec.parent_dir_index != dir_index) continue;
+        count += lfnEntryCount(spec.leaf) + 1;
+    }
+    return count;
+}
+
+fn directoryClusterCount(dir_index: usize, dirs: []const Directory, specs: []const LoadedSpec) !u32 {
+    const entries = directoryEntryCount(dir_index, dirs, specs);
+    const bytes = entries * 32;
+    const cluster_bytes = bytes_per_sector * sectors_per_cluster;
+    const count = @max(@as(usize, 1), (bytes + cluster_bytes - 1) / cluster_bytes);
+    if (count > std.math.maxInt(u32)) return error.DirectoryTooLarge;
+    return @intCast(count);
+}
+
+fn writeDirectoryClusters(file: *std.fs.File, layout: VolumeLayout, allocator: std.mem.Allocator, dir_index: usize, dirs: []const Directory, specs: []const LoadedSpec) !void {
     var entries = std.ArrayList([32]u8).empty;
     defer entries.deinit(allocator);
 
@@ -392,14 +419,21 @@ fn writeDirectoryCluster(file: *std.fs.File, layout: VolumeLayout, allocator: st
         const attr = if (spec.is_symlink) symlink_attr else archive_attr;
         try addNamedDirent(&entries, allocator, spec.leaf, spec.short_name, attr, spec.start_cluster, @intCast(spec.data.len));
     }
-    if (entries.items.len > dir_entries_per_cluster) return error.DirectoryTooLarge;
+    const dir = dirs[dir_index];
+    const capacity = @as(usize, dir.cluster_count) * dir_entries_per_cluster;
+    if (entries.items.len > capacity) return error.DirectoryTooLarge;
 
-    var cluster_bytes = [_]u8{0} ** (bytes_per_sector * sectors_per_cluster);
-    for (entries.items, 0..) |entry, i| {
-        const start = i * 32;
-        @memcpy(cluster_bytes[start .. start + 32], &entry);
+    var cluster_offset: u32 = 0;
+    while (cluster_offset < dir.cluster_count) : (cluster_offset += 1) {
+        var cluster_bytes = [_]u8{0} ** (bytes_per_sector * sectors_per_cluster);
+        const first_entry = @as(usize, cluster_offset) * dir_entries_per_cluster;
+        var i: usize = 0;
+        while (i < dir_entries_per_cluster and first_entry + i < entries.items.len) : (i += 1) {
+            const start = i * 32;
+            @memcpy(cluster_bytes[start .. start + 32], &entries.items[first_entry + i]);
+        }
+        try writeAllAt(file, partitionOffset(layout, layout.clusterToSector(dir.cluster + cluster_offset)), &cluster_bytes);
     }
-    try writeAllAt(file, partitionOffset(layout, layout.clusterToSector(dirs[dir_index].cluster)), &cluster_bytes);
 }
 
 fn writeFatTables(file: *std.fs.File, layout: VolumeLayout, fat: []const u32) !void {
@@ -472,13 +506,16 @@ pub fn main() !void {
     const region = try rootfs_host.openPartitionRegion(&disk, partition_index);
     const layout = try computeFat32Layout(region);
 
-    var next_cluster: u32 = 2;
-    for (dirs.items) |*dir| {
-        dir.cluster = next_cluster;
-        next_cluster += 1;
+    for (dirs.items, 0..) |*dir, index| {
+        dir.cluster_count = try directoryClusterCount(index, dirs.items, specs.items);
     }
+
     dirs.items[0].cluster = layout.root_cluster;
-    next_cluster = @max(next_cluster, layout.root_cluster + 1);
+    var next_cluster: u32 = layout.root_cluster + dirs.items[0].cluster_count;
+    for (dirs.items[1..]) |*dir| {
+        dir.cluster = next_cluster;
+        next_cluster += dir.cluster_count;
+    }
     for (specs.items) |*spec| {
         const cluster_bytes = bytes_per_sector * sectors_per_cluster;
         const cluster_count = (spec.data.len + cluster_bytes - 1) / cluster_bytes;
@@ -499,7 +536,13 @@ pub fn main() !void {
     @memset(fat, 0);
     fat[0] = @as(u32, 0x0FFF_FF00) | @as(u32, media_descriptor);
     fat[1] = fat32_eoc;
-    for (dirs.items) |dir| fat[dir.cluster] = fat32_eoc;
+    for (dirs.items) |dir| {
+        var i: u32 = 0;
+        while (i < dir.cluster_count) : (i += 1) {
+            const cluster = dir.cluster + i;
+            fat[cluster] = if (i + 1 == dir.cluster_count) fat32_eoc else cluster + 1;
+        }
+    }
     for (specs.items) |spec| {
         if (spec.cluster_count == 0) continue;
         var i: u32 = 0;
@@ -511,7 +554,7 @@ pub fn main() !void {
 
     try writeBootSector(&disk, layout);
     try writeFatTables(&disk, layout, fat);
-    for (dirs.items, 0..) |_, index| try writeDirectoryCluster(&disk, layout, allocator, index, dirs.items, specs.items);
+    for (dirs.items, 0..) |_, index| try writeDirectoryClusters(&disk, layout, allocator, index, dirs.items, specs.items);
     try writeFileData(&disk, layout, specs.items);
     try disk.sync();
     std.debug.print("rootfs_builder: wrote FAT32 {d} file(s) and {d} dir(s) into partition {d} from {s}\n", .{ specs.items.len, dirs.items.len, partition_index, args[3] });
