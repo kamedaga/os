@@ -45,7 +45,7 @@ OK: 464 MiB in 28 packages
 # ls
 a.out  main.c
 # ./a.out
-hello, world
+hello world
 ```
 
 
