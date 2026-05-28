@@ -64,7 +64,6 @@ enum {
     FAT_WRITE_CACHE_SLOTS = 2,
     FAT_DIR_SECTOR_CACHE_SLOTS = 8,
     FAT_DIR_SECTOR_FLUSH_INTERVAL = 128,
-    FAT_CLOSE_FLUSH_INTERVAL = 64,
     FAT_DIR_FREE_HINTS = 32,
     FAT_LFN_PARENT_ALIAS_HINTS = 64,
     FAT_DYNAMIC_PATH_HASH_SLOTS = 32768,
@@ -245,7 +244,6 @@ static u32 g_dir_sector_cache_sector[FAT_DIR_SECTOR_CACHE_SLOTS];
 static u8 g_dir_sector_cache_valid[FAT_DIR_SECTOR_CACHE_SLOTS];
 static u8 g_dir_sector_cache_dirty[FAT_DIR_SECTOR_CACHE_SLOTS];
 static u32 g_dir_sector_dirty_ops = 0;
-static u32 g_fat_close_flush_pending = 0;
 static u64 g_endpoint_id;
 static u64 g_volume_start_block;
 static u32 g_seed2_start_cluster;
@@ -1828,15 +1826,7 @@ static int flush_fat_write_cache(void) {
     for (u8 slot = 0; slot < FAT_WRITE_CACHE_SLOTS; slot++) {
         if (!flush_fat_write_cache_slot(slot)) return 0;
     }
-    g_fat_close_flush_pending = 0;
     return 1;
-}
-
-static int fat_write_cache_has_dirty(void) {
-    for (u8 slot = 0; slot < FAT_WRITE_CACHE_SLOTS; slot++) {
-        if (g_fat_write_cache_valid[slot] && g_fat_write_cache_dirty[slot]) return 1;
-    }
-    return 0;
 }
 
 static int prepare_fat_write_cache_slot(u8 slot, u32 fat_sector) {
@@ -3020,18 +3010,20 @@ static int ensure_dynamic_object_loc(struct fat_dynamic_object *object, struct f
 }
 
 static int flush_dynamic_object_dirent(struct fat_dynamic_object *object) {
-    if (!object || !object->dirent_dirty) return FS_STATUS_OK;
+    if (!object) return FS_STATUS_OK;
+    if (!object->dirent_dirty) {
+        if (!flush_data_write_cache()) return FS_STATUS_IO_ERROR;
+        if (!flush_fat_write_cache()) return FS_STATUS_IO_ERROR;
+        if (!flush_dir_sector_cache()) return FS_STATUS_IO_ERROR;
+        return FS_STATUS_OK;
+    }
     struct fat_dir_entry_location loc;
     const int loc_status = ensure_dynamic_object_loc(object, &loc);
     if (loc_status != FS_STATUS_OK) return loc_status;
     if (!update_file_dirent(&loc, object->first_cluster, object->size_bytes, (struct fat_dir_entry_view *)0)) return FS_STATUS_IO_ERROR;
-    if (fat_write_cache_has_dirty()) {
-        g_fat_close_flush_pending++;
-        if (g_fat_close_flush_pending >= FAT_CLOSE_FLUSH_INTERVAL) {
-            if (!flush_data_write_cache()) return FS_STATUS_IO_ERROR;
-            if (!flush_fat_write_cache()) return FS_STATUS_IO_ERROR;
-        }
-    }
+    if (!flush_data_write_cache()) return FS_STATUS_IO_ERROR;
+    if (!flush_fat_write_cache()) return FS_STATUS_IO_ERROR;
+    if (!flush_dir_sector_cache()) return FS_STATUS_IO_ERROR;
     object->loc = loc;
     object->loc_valid = 1;
     object->dirent_dirty = 0;

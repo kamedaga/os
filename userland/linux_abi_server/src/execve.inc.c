@@ -593,8 +593,11 @@ static struct file_cache_entry *file_cache_fill_from_fd(const struct fd_entry *f
 
 static u64 file_cache_read_to_target(const struct fd_entry *fd, u64 file_offset, u64 dst, u64 len, int *fault) {
     *fault = 0;
-    if (!file_cache_should_fill_for_read(fd, file_offset, len)) return 0;
-    struct file_cache_entry *cached = file_cache_fill_from_fd(fd, 0);
+    struct file_cache_entry *cached = fd->path_len != 0 ? file_cache_find_by_path(fd->path) : 0;
+    if (cached == 0) {
+        if (!file_cache_should_fill_for_read(fd, file_offset, len)) return 0;
+        cached = file_cache_fill_from_fd(fd, 0);
+    }
     if (cached == 0) return 0;
     if (file_offset >= cached->size) return 0;
     u64 n = min_u64(len, cached->size - file_offset);
@@ -1304,7 +1307,7 @@ static int append_target_cstr_arg(struct exec_bootstrap_config *cfg, u16 *cursor
 
 static int append_target_argv_tail(struct exec_bootstrap_config *cfg, u16 *cursor, u64 argv_va, u64 source_index, u64 *argv_count) {
     if (argv_va == 0) return 1;
-    while (*argv_count < EXECVE_MAX_ARGV) {
+    for (;;) {
         u64 ptr = 0;
         if (copy_from_target(argv_va + source_index * 8, &ptr, 8) != 8) {
             u64 vfork_parent = g_proc ? g_proc->vfork_parent_principal : 0;
@@ -1317,11 +1320,14 @@ static int append_target_argv_tail(struct exec_bootstrap_config *cfg, u16 *curso
             }
         }
         if (ptr == 0) return 1;
+        if (*argv_count >= EXECVE_MAX_ARGV) {
+            user_log("LinuxAbiServer: execve argv limit exceeded\n");
+            return 0;
+        }
         if (!append_target_cstr_arg(cfg, cursor, ptr, &cfg->argv_offsets[*argv_count], &cfg->argv_bytes[*argv_count])) return 0;
         (*argv_count)++;
         source_index++;
     }
-    return 1;
 }
 
 static int configure_exec_args_from_target(struct exec_bootstrap_config *cfg, const char *path, u64 argv_va, u64 envp_va, const char *argv0_override) {

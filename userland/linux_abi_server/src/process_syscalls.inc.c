@@ -4,6 +4,9 @@ static void close_all_process_fds(struct linux_process_state *proc) {
         struct fd_entry *entry = &proc->fds[fd];
         if (entry->kind == FD_UNUSED) continue;
         const int is_pipe = fd_entry_is_pipe(entry);
+        if (entry->kind == FD_FILE && (entry->fd_flags & O_ACCMODE) != O_RDONLY && entry->token != 0) {
+            (void)vfs_request(FS_OP_CLOSE, entry->token, 0, 0, 0);
+        }
         if (is_pipe) close_pipe_entry(entry);
         if (entry->kind == FD_SOCKET) close_socket_entry(entry);
         if (fd > 2 || is_pipe) entry->kind = FD_UNUSED;

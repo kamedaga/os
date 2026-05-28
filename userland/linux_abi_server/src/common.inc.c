@@ -252,7 +252,7 @@ enum {
     LINUX_SYS_FLOCK = 73,
     LINUX_SYS_FSYNC = 74,
     LINUX_SYS_FDATASYNC = 75,
-    LINUX_SYS_GETRUSAGE = 77,
+    LINUX_SYS_GETRUSAGE = 98,
     LINUX_SYS_GETCWD = 79,
     LINUX_SYS_CHDIR = 80,
     LINUX_SYS_FCHDIR = 81,
@@ -484,7 +484,7 @@ enum {
     VM_RIGHT_READ_MAP = 0x5,
     VM_RIGHT_READ_MAP_GRANT = 0xD,
     EXEC_BOOTSTRAP_MAGIC = 0x45584543424F4F54ULL,
-    EXEC_BOOTSTRAP_VERSION = 3,
+    EXEC_BOOTSTRAP_VERSION = 4,
     EXEC_BOOTSTRAP_FLAG_SERVICE_MODE = 1ULL << 0,
     EXEC_LAUNCH_ENDPOINT_ID = 0x93,
     EXEC_LAUNCH_REQUEST_MAGIC = 0x4558454353565251ULL,
@@ -533,9 +533,9 @@ enum {
     LINUX_FILE_FAULT_CLUSTER_PAGES = 256,
     EXECVE_MAX_IMAGE_BYTES = 128 * 1024 * 1024,
     EXECVE_MAX_LD_BYTES = 768 * 1024,
-    EXECVE_MAX_ARGV = 64,
+    EXECVE_MAX_ARGV = 128,
     EXECVE_MAX_ENVP = 32,
-    EXECVE_MAX_ARG_DATA_BYTES = 3072,
+    EXECVE_MAX_ARG_DATA_BYTES = 3208,
 };
 
 enum linux_syscall_category {
@@ -1187,9 +1187,14 @@ struct linux_abi_bootstrap_config {
     u64 brk_initial_va;
 };
 
-_Static_assert(OFFSETOF(struct exec_bootstrap_config, arg_data) == 516, "exec cfg arg data offset");
-_Static_assert(OFFSETOF(struct exec_bootstrap_config, user_low_va) == 3592, "exec cfg layout offset");
-_Static_assert(sizeof(struct exec_bootstrap_config) == 3664, "exec cfg size");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, argv_offsets) == 132, "exec cfg argv offsets offset");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, argv_bytes) == 388, "exec cfg argv bytes offset");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, envp_offsets) == 644, "exec cfg envp offsets offset");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, envp_bytes) == 708, "exec cfg envp bytes offset");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, arg_data) == 772, "exec cfg arg data offset");
+_Static_assert(OFFSETOF(struct exec_bootstrap_config, user_low_va) == 3984, "exec cfg layout offset");
+_Static_assert(sizeof(struct exec_bootstrap_config) == 4056, "exec cfg size");
+_Static_assert(sizeof(struct exec_launch_request) == 4096, "exec request size");
 _Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, exec_path) == 64, "linux abi cfg exec path offset");
 _Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, user_low_va) == 208, "linux abi cfg layout offset");
 _Static_assert(sizeof(struct linux_abi_bootstrap_config) == 280, "linux abi cfg size");

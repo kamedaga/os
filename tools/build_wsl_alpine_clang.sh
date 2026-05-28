@@ -10,7 +10,7 @@ apk="$fixture_dir/apk.elf"
 repositories="$fixture_dir/apk-repositories"
 keys_dir="$fixture_dir/alpine-keys"
 stamp="$work_dir/.capabilityos-built"
-config_id="alpine-v3.22-clang-host-apk-v15-headers"
+config_id="alpine-v3.22-clang-host-apk-v16-libm"
 
 mkdir -p "$fixture_dir" "$work_dir"
 
@@ -108,6 +108,7 @@ def wanted(path: Path) -> bool:
     keep_static = {
         "usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/libgcc.a",
         "usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/libgcc_eh.a",
+        "usr/lib/libm.a",
         "usr/lib/libssp_nonshared.a",
     }
     if name.endswith(".a") and name not in keep_static:

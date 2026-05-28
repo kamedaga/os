@@ -424,7 +424,7 @@ static struct ipc_message handle_openat(const struct trap_request *req, int old_
         if (cached != 0 && cached->size == size) {
             g_prof.open_cache_hits++;
             g_fds[fd].kind = FD_FILE;
-            g_fds[fd].token = token;
+            g_fds[fd].token = cached->token != 0 ? cached->token : token;
             g_fds[fd].offset = 0;
             g_fds[fd].size = size;
             g_fds[fd].fd_flags = new_fd_flags;
