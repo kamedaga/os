@@ -1,3 +1,5 @@
+static u64 errno_from_fs_status(i32 status);
+
 static u32 linux_mode_from_fs(u32 fs_mode, u8 kind) { u32 perm = kind == FS_OBJECT_SYMLINK ? 0777 : 0555; u32 type = (kind == FS_OBJECT_DIRECTORY || kind == FS_OBJECT_MOUNT) ? 0040000 : (kind == FS_OBJECT_SYMLINK ? 0120000 : 0100000); const u32 fs_type = fs_mode & 0xF000; if (fs_type == FS_DIR_MODE) type = 0040000; if (fs_type == FS_FILE_MODE) type = 0100000; if (fs_type == FS_SYMLINK_MODE) type = 0120000; return type | perm; }
 static u64 linux_ino_from_path(const char *path) {
     u64 hash = 1469598103934665603ULL;
@@ -887,6 +889,21 @@ static struct ipc_message handle_writev(const struct trap_request *req) {
 static struct ipc_message handle_fsync_like(const struct trap_request *req) {
     const u64 fd = req->args[0];
     if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    return reply(0, 0);
+}
+
+static struct ipc_message handle_ftruncate(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const i64 length = (i64)req->args[1];
+    if (length < 0) return reply(errno_inval(), 0);
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
+    if ((g_fds[fd].fd_flags & O_ACCMODE) == O_RDONLY) return reply(errno_badf(), 0);
+    if (!vfs_truncate_file(g_fds[fd].token, (u64)length)) return reply(errno_io(), 0);
+    volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+    if (response->status != FS_STATUS_OK) return reply(errno_from_fs_status(response->status), 0);
+    g_fds[fd].size = response->file_bytes;
+    invalidate_exec_cache_for_path(g_fds[fd].path);
+    sync_fd_to_thread_group(fd);
     return reply(0, 0);
 }
 

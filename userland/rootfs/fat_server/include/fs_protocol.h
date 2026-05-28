@@ -33,6 +33,7 @@ enum fs_opcode {
     FS_OP_READ_BULK = 27,
     FS_OP_READDIR_BULK = 28,
     FS_OP_WRITE_BULK = 29,
+    FS_OP_TRUNCATE = 30,
     FS_OP_OPEN_EXEC = 32,
 };
 

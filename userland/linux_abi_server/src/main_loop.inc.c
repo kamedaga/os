@@ -130,6 +130,7 @@ static int dispatch_fd_syscall(const struct trap_request *req, struct ipc_messag
     case LINUX_SYS_FSYNC:
     case LINUX_SYS_FDATASYNC:
     case LINUX_SYS_SYNCFS: *msg = handle_fsync_like(req); return 1;
+    case LINUX_SYS_FTRUNCATE: *msg = handle_ftruncate(req); return 1;
     case LINUX_SYS_SYNC: *msg = reply(0, 0); return 1;
     default: return 0;
     }

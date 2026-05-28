@@ -322,6 +322,10 @@ static int vfs_create_path(const char *path, int truncate_existing) {
     return vfs_create_path_with_flags(path, truncate_existing ? FS_CREATE_FLAG_TRUNCATE : 0);
 }
 
+static int vfs_truncate_file(u64 token, u64 size) {
+    return vfs_request_full(FS_OP_TRUNCATE, token, size, 0, 0, 0, 0, 0);
+}
+
 static int vfs_create_symlink_path(const char *path, const char *target, u16 target_len) {
     if (!g_vfs.active) return 0;
     const u64 path_len = cstr_len(path);

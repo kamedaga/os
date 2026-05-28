@@ -24,6 +24,8 @@ pub const Opcode = enum(u16) {
     // supported FS contract is blocking inline read/write.
     read_bulk = 27,
     readdir_bulk = 28,
+    write_bulk = 29,
+    truncate = 30,
     open_exec = 32,
 };
 

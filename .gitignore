@@ -7,6 +7,7 @@ kernel/.zig-cache/
 .zig-cache-global/
 .zig-cache-local/
 .zig-global-cache/
+.code-workspace
 
 # Object/debug files
 *.o
@@ -70,3 +71,6 @@ userland/fixtures/alpine-keys/
 Thumbs.db
 
 AGENTS.md
+
+# kobox is a separate repository
+/kobox/

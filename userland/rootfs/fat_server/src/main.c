@@ -3412,6 +3412,80 @@ static int fat_write_object(struct fat_dynamic_object *object, u64 offset, u32 l
     return FS_STATUS_OK;
 }
 
+static int fat_zero_object_range(struct fat_dynamic_object *object, u64 start, u64 end) {
+    static const u8 zero_payload[FS_RESPONSE_PAYLOAD_BYTES];
+    u64 cursor = start;
+    while (cursor < end) {
+        u64 chunk = end - cursor;
+        if (chunk > FS_RESPONSE_PAYLOAD_BYTES) chunk = FS_RESPONSE_PAYLOAD_BYTES;
+        u32 size_after = 0;
+        const int status = fat_write_object(
+            object,
+            cursor,
+            (u32)chunk,
+            (const volatile u8 *)zero_payload,
+            (u16)chunk,
+            &size_after
+        );
+        if (status != FS_STATUS_OK) return status;
+        cursor += chunk;
+    }
+    return FS_STATUS_OK;
+}
+
+static int fat_truncate_object(struct fat_dynamic_object *object, u64 size, u32 *size_out) {
+    if (!object || (object->attr & FAT_ATTR_DIRECTORY) != 0 || (object->attr & FAT_ATTR_SYMLINK) == FAT_ATTR_SYMLINK) return FS_STATUS_NOT_FOUND;
+    if (size > 0xffffffffULL) return FS_STATUS_TOO_BIG;
+    const u32 new_size = (u32)size;
+    const u32 old_size = object->size_bytes;
+    if (new_size == old_size) {
+        *size_out = object->size_bytes;
+        return FS_STATUS_OK;
+    }
+    if (new_size > old_size) {
+        const int status = fat_zero_object_range(object, old_size, new_size);
+        *size_out = object->size_bytes;
+        return status;
+    }
+
+    if (!flush_data_write_cache()) return FS_STATUS_IO_ERROR;
+    if (new_size == 0) {
+        if (object->first_cluster >= 2 && !free_cluster_chain(object->first_cluster)) return FS_STATUS_IO_ERROR;
+        object->first_cluster = 0;
+        object->cached_cluster_index = 0;
+        object->cached_cluster = 0;
+    } else if (object->first_cluster >= 2) {
+        const u32 cluster_bytes = (u32)g_bpb.bytes_per_sector * (u32)g_bpb.sectors_per_cluster;
+        if (cluster_bytes == 0) return FS_STATUS_IO_ERROR;
+        const u32 keep_count = (new_size + cluster_bytes - 1u) / cluster_bytes;
+        const u32 last_keep_index = keep_count - 1u;
+        const u64 retained_end = (u64)keep_count * (u64)cluster_bytes;
+        const u64 zero_end = retained_end < old_size ? retained_end : old_size;
+        if (new_size < zero_end) {
+            const int zero_status = fat_zero_object_range(object, new_size, zero_end);
+            if (zero_status != FS_STATUS_OK) return zero_status;
+        }
+        u32 last_cluster = 0;
+        if (!seek_cluster_cached(object->first_cluster, last_keep_index, &object->cached_cluster_index, &object->cached_cluster, &last_cluster)) return FS_STATUS_IO_ERROR;
+        u32 next = 0;
+        if (!read_fat_entry_raw(last_cluster, &next)) return FS_STATUS_IO_ERROR;
+        if (!fat_cluster_is_eoc(next) && next != 0) {
+            if (!write_fat_entry(last_cluster, 0x0FFFFFFFu)) return FS_STATUS_IO_ERROR;
+            if (!free_cluster_chain(next)) return FS_STATUS_IO_ERROR;
+        }
+    } else if (old_size != 0) {
+        return FS_STATUS_IO_ERROR;
+    }
+
+    object->size_bytes = new_size;
+    object->vm_token = 0;
+    object->vm_size_bytes = 0;
+    object->dirent_dirty = 1;
+    if (!flush_fat_write_cache()) return FS_STATUS_IO_ERROR;
+    *size_out = object->size_bytes;
+    return FS_STATUS_OK;
+}
+
 static int fat_write_object_bulk(
     struct fat_dynamic_object *object,
     u64 offset,
@@ -4221,6 +4295,21 @@ static void handle_fs_request(void) {
             u64 bytes = 0;
             const int status = fat_write_object_bulk(dynamic, request->offset, request->length, request, &size_bytes, &bytes);
             write_bulk_response(FS_OP_WRITE_BULK, seq, status, size_bytes, request->offset + bytes, FS_OBJECT_OPEN_FILE, bytes);
+        }
+    } else if (request->op == FS_OP_TRUNCATE) {
+        const u64 object_id = object_id_from_token(request->object_token);
+        struct fat_dynamic_object *dynamic = dynamic_object_by_id(object_id);
+        if (!dynamic || !is_dynamic_open_object_id(object_id)) {
+            reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
+        } else {
+            u32 size_bytes = 0;
+            const int status = fat_truncate_object(dynamic, request->offset, &size_bytes);
+            if (status == FS_STATUS_OK) {
+                clear_page(g_session.response_va);
+                write_response(FS_OP_TRUNCATE, seq, FS_STATUS_OK, 0, size_bytes, size_bytes, FS_OBJECT_OPEN_FILE, 0);
+            } else {
+                reply_status(request->op, seq, status);
+            }
         }
     } else if (request->op == FS_OP_UNLINK) {
         if (!is_dir_token(request->object_token) || request->path_bytes > FS_MAX_PATH_BYTES) {

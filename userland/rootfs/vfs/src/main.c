@@ -2821,6 +2821,46 @@ static void reply_write_bulk_local(u64 seq, u64 token, u64 offset, u32 length, c
     write_bulk_response(FS_OP_WRITE_BULK, seq, FS_STATUS_OK, file->size, offset + length, FS_OBJECT_OPEN_FILE, length);
 }
 
+static int tmpfs_zero_range(u64 file_index, u64 offset, u64 bytes) {
+    if (file_index >= VFS_TMPFS_MAX_FILES || offset > VFS_TMPFS_FILE_BYTES || offset + bytes > VFS_TMPFS_FILE_BYTES) return 0;
+    u64 done = 0;
+    while (done < bytes) {
+        const u64 zero_offset = offset + done;
+        const u64 page_index = zero_offset / FS_PAGE_BYTES;
+        const u64 page_offset = zero_offset & (FS_PAGE_BYTES - 1);
+        if (page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
+        u64 chunk = FS_PAGE_BYTES - page_offset;
+        if (chunk > bytes - done) chunk = bytes - done;
+        const u64 page_va = tmpfs_page_va(file_index, page_index);
+        if (page_va != 0) clear_bytes_volatile((volatile u8 *)(page_va + page_offset), chunk);
+        done += chunk;
+    }
+    return 1;
+}
+
+static void reply_truncate_local(u64 seq, u64 token, u64 size) {
+    const u64 object_id = object_id_from_token(token);
+    const u64 tmpfs_index = tmpfs_index_from_open_object_id(object_id);
+    if (tmpfs_index >= VFS_TMPFS_MAX_FILES || !g_tmpfs_files[tmpfs_index].used ||
+        g_tmpfs_files[tmpfs_index].is_dir || g_tmpfs_files[tmpfs_index].is_symlink)
+    {
+        reply_status(FS_OP_TRUNCATE, seq, FS_STATUS_NOT_FOUND);
+        return;
+    }
+    if (size > VFS_TMPFS_FILE_BYTES) {
+        reply_status(FS_OP_TRUNCATE, seq, FS_STATUS_TOO_BIG);
+        return;
+    }
+    struct vfs_tmpfs_file *file = &g_tmpfs_files[tmpfs_index];
+    if (size < file->size && !tmpfs_zero_range(tmpfs_index, size, file->size - size)) {
+        reply_status(FS_OP_TRUNCATE, seq, FS_STATUS_IO_ERROR);
+        return;
+    }
+    if (size == 0) tmpfs_clear_file_storage(tmpfs_index);
+    file->size = (u32)size;
+    write_response(FS_OP_TRUNCATE, seq, FS_STATUS_OK, 0, file->size, file->size, FS_OBJECT_OPEN_FILE, 0);
+}
+
 static int tmpfs_parent_from_path(const volatile u8 *path, u16 path_len, u64 *parent_out, const volatile u8 **name_out, u16 *name_len_out) {
     if (path_len == 0 || path_len > FS_MAX_PATH_BYTES) return 0;
     return tmpfs_parent_for_path(path, path_len, parent_out, name_out, name_len_out);
@@ -3705,6 +3745,26 @@ static void handle_fs_request(void) {
             );
         } else if (is_open_file_token(request->object_token)) {
             reply_write_bulk_local(seq, request->object_token, request->offset, request->length, request);
+        } else {
+            reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
+        }
+    } else if (request->op == FS_OP_TRUNCATE) {
+        if (is_backend_token(request->object_token)) {
+            forward_backend_request(
+                request->op,
+                seq,
+                unwrap_backend_token(request->object_token),
+                request->offset,
+                0,
+                request->flags,
+                (const volatile u8 *)0,
+                0,
+                (const volatile u8 *)0,
+                0,
+                0
+            );
+        } else if (is_open_file_token(request->object_token)) {
+            reply_truncate_local(seq, request->object_token, request->offset);
         } else {
             reply_status(request->op, seq, FS_STATUS_NOT_FOUND);
         }

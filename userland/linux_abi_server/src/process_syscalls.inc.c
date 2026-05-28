@@ -447,11 +447,21 @@ static int copy_source_page_to_process(u64 process_token, u64 source_process_slo
     return 0;
 }
 
+static u64 vm_tracked_page_prot_or(u64 va, u64 fallback) {
+    for (u64 i = 0; i < VM_REGION_MAX; i++) {
+        if (!g_regions[i].used) continue;
+        const u64 rs = g_regions[i].start;
+        const u64 re = rs + g_regions[i].size;
+        if (va >= rs && va < re) return g_regions[i].prot;
+    }
+    return fallback;
+}
+
 static int copy_present_pages_to_process(u64 process_token, u64 source_process_slot, u64 start, u64 end, u64 prot) {
     for (u64 va = start; va < end; va += PAGE_BYTES) {
         u8 probe[16];
         if (copy_from_target(va, probe, sizeof(probe)) != sizeof(probe)) continue;
-        if (!copy_source_page_to_process(process_token, source_process_slot, va, prot)) return 0;
+        if (!copy_source_page_to_process(process_token, source_process_slot, va, vm_tracked_page_prot_or(va, prot))) return 0;
     }
     return 1;
 }
@@ -460,10 +470,13 @@ static int share_present_pages_to_process(u64 process_token, u64 source_process_
     for (u64 va = start; va < end; va += PAGE_BYTES) {
         u8 probe[16];
         if (copy_from_target(va, probe, sizeof(probe)) != sizeof(probe)) continue;
-        const u64 status = share_process_pages_to_process(process_token, source_process_slot, va, 1, prot);
+        const u64 page_prot = vm_tracked_page_prot_or(va, prot);
+        const u64 status = share_process_pages_to_process(process_token, source_process_slot, va, 1, page_prot);
         if (status != SYSCALL_OK && status != SYSCALL_ERR_MAP) {
             user_log("LinuxAbiServer: clone share page failed va=");
             user_log_hex_value(va);
+            user_log("LinuxAbiServer: clone share prot=");
+            user_log_hex_value(page_prot);
             user_log("LinuxAbiServer: clone share status=");
             user_log_hex_value(status);
             return 0;
