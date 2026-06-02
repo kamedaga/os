@@ -155,6 +155,7 @@ pub const ThreadContext = struct {
     cpu_affinity_mask: u64 = all_cpu_affinity_mask,
     cr3: u64 = 0,
     fs_base: u64 = 0,
+    gs_base: u64 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
     wait_preserve_ipc_queue: bool = false,
@@ -170,6 +171,7 @@ pub const ThreadContext = struct {
     abi_trap_context_reply_pending: bool = false,
     abi_trap_context_frame: TrapFrame = std.mem.zeroes(TrapFrame),
     abi_trap_context_fs_base: u64 = 0,
+    abi_trap_context_gs_base: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
 };
@@ -652,6 +654,7 @@ fn claimIdleUserEntryFromAp(cpu_slot: usize, out_entry: *scheduler_observer.User
         .thread_index = thread_index,
         .cr3 = ctx.cr3,
         .fs_base = ctx.fs_base,
+        .gs_base = ctx.gs_base,
         .fx_state_addr = @intFromPtr(&ctx.fx_state),
         .frame = ctx.frame,
     };
@@ -1414,6 +1417,7 @@ fn initThreadContextWithSpacesReady(
     ctx.cpu_affinity_mask = all_cpu_affinity_mask;
     ctx.cr3 = x86_platform.cr3WithUserPcid(space.cr3, pcidForPrincipal(owner_process));
     ctx.fs_base = 0;
+    ctx.gs_base = 0;
     ctx.ready = initial_ready;
     ctx.wait_mailbox = false;
     ctx.wait_preserve_ipc_queue = false;
@@ -1422,6 +1426,7 @@ fn initThreadContextWithSpacesReady(
     ctx.abi_trap_context_reply_pending = false;
     ctx.abi_trap_context_frame = std.mem.zeroes(TrapFrame);
     ctx.abi_trap_context_fs_base = 0;
+    ctx.abi_trap_context_gs_base = 0;
     ctx.frame = initial_frame;
     ctx.fx_state = initial_fx_state;
     syncHotThreadFromContext(thread_index);
@@ -1809,6 +1814,7 @@ pub fn applyThreadFsBase(thread_index: usize) bool {
     const ctx = getThreadContextConst(thread_index) orelse return false;
     if (!ctx.allocated) return false;
     x86_platform.writeFsBase(ctx.fs_base);
+    x86_platform.writeGsBase(ctx.gs_base);
     return true;
 }
 
@@ -1825,6 +1831,22 @@ pub fn setThreadFsBase(thread_index: usize, fs_base: u64) bool {
     if (!ctx.allocated) return false;
     ctx.fs_base = fs_base;
     if (thread_index == currentThreadIndex()) x86_platform.writeFsBase(fs_base);
+    return true;
+}
+
+pub fn setCurrentThreadGsBase(gs_base: u64) bool {
+    const ctx = getThreadContext(currentThreadIndex()) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.gs_base = gs_base;
+    x86_platform.writeGsBase(gs_base);
+    return true;
+}
+
+pub fn setThreadGsBase(thread_index: usize, gs_base: u64) bool {
+    const ctx = getThreadContext(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.gs_base = gs_base;
+    if (thread_index == currentThreadIndex()) x86_platform.writeGsBase(gs_base);
     return true;
 }
 
@@ -1849,6 +1871,7 @@ pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
     if (hot.ready == 0) return false;
     schedulerFullMemoryFence();
     x86_platform.writeFsBase(ctx.fs_base);
+    x86_platform.writeGsBase(ctx.gs_base);
     frame.* = ctx.frame;
     return true;
 }
@@ -1977,6 +2000,7 @@ fn blockCurrentThreadForEventInternal(frame: *TrapFrame, wait_mailbox: bool, pre
     if (ctx.abi_trap_reply_pending and ctx.abi_trap_context_reply_pending) {
         ctx.frame = ctx.abi_trap_context_frame;
         ctx.fs_base = ctx.abi_trap_context_fs_base;
+        ctx.gs_base = ctx.abi_trap_context_gs_base;
         ctx.abi_trap_context_reply_pending = false;
         ctx.abi_trap_reply_pending = false;
         ctx.signal_pending = false;

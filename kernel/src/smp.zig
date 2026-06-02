@@ -574,6 +574,7 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
         : [ptr] "r" (fx_state),
         : .{ .memory = true });
     x86_platform.writeFsBase(entry.fs_base);
+    x86_platform.writeGsBase(entry.gs_base);
     asm volatile (std.fmt.comptimePrint(
             \\mov %[entry], %%rbx
             \\mov {d}(%%rbx), %%r11

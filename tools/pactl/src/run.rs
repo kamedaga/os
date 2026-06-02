@@ -344,6 +344,9 @@ fn build_wsl_script(
         "-drive if=none,file=\"$CACHE_DISK\",format=qcow2,cache=writeback,aio=threads,id=bootdisk"
             .to_string(),
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
+        "-drive if=none,file=\"$NVME_DISK\",format=raw,cache=writeback,aio=threads,id=nvmetest"
+            .to_string(),
+        "-device nvme,drive=nvmetest,serial=pachaos-nvme0".to_string(),
         serial_backend,
     ];
     append_display_devices(&mut qemu_parts, options.display);
@@ -399,6 +402,7 @@ fn build_wsl_script(
     script.push_str("CACHE_DISK=\"$CACHE_DIR/disk-overlay.qcow2\"\n");
     script.push_str("CACHE_META=\"$CACHE_DIR/disk.meta\"\n");
     script.push_str("CACHE_DIRTY=\"$CACHE_DIR/disk.dirty\"\n");
+    script.push_str("NVME_DISK=\"$RUNTIME_DIR/nvme-test.raw\"\n");
     script.push_str("mkdir -p \"$ARTIFACT_DIR\"\n");
     script.push_str("mkdir -p \"$RUNTIME_DIR\"\n");
     script.push_str("mkdir -p \"$CACHE_DIR\"\n");
@@ -538,6 +542,8 @@ fn build_wsl_script(
         "cp {} \"$RUNTIME_OVMF_VARS\"\n",
         bash_quote(OVMF_VARS_TEMPLATE_PATH)
     ));
+    script.push_str("rm -f \"$NVME_DISK\"\n");
+    script.push_str("qemu-img create -f raw \"$NVME_DISK\" 64M >/dev/null\n");
 
     if options.timed {
         script.push_str("set +e\n");
@@ -692,6 +698,9 @@ fn build_wsl_pf_check_script(
         "-drive if=none,file=\"$RUN_DISK\",format=qcow2,cache=writeback,aio=threads,id=bootdisk"
             .to_string(),
         "-device virtio-blk-pci,drive=bootdisk".to_string(),
+        "-drive if=none,file=\"$NVME_DISK\",format=raw,cache=writeback,aio=threads,id=nvmetest"
+            .to_string(),
+        "-device nvme,drive=nvmetest,serial=pachaos-nvme0".to_string(),
         "-serial stdio".to_string(),
     ];
     append_display_devices(&mut qemu_parts, options.display);
@@ -725,13 +734,15 @@ fn build_wsl_pf_check_script(
     script.push_str("  mkdir -p \"$RUN_DIR\" \"$OUT_DIR\"\n");
     script.push_str("  rm -f \"$OUT_DIR/qemu.log\" \"$OUT_DIR/serial-timed.log\" \"$OUT_DIR/boot-timing-summary.txt\" \"$OUT_DIR/pf-grep.txt\"\n");
     script.push_str("  RUN_DISK=\"$RUN_DIR/disk-overlay.qcow2\"\n");
+    script.push_str("  NVME_DISK=\"$RUN_DIR/nvme-test.raw\"\n");
     script.push_str("  RUN_OVMF_VARS=\"$RUN_DIR/OVMF_VARS.fd\"\n");
     script.push_str("  RUN_QEMU_LOG=\"$RUN_DIR/qemu.log\"\n");
     script.push_str("  RUN_SERIAL_LOG=\"$RUN_DIR/serial-timed.log\"\n");
     script.push_str("  RUN_SUMMARY_LOG=\"$RUN_DIR/boot-timing-summary.txt\"\n");
-    script.push_str("  rm -f \"$RUN_DISK\"\n");
+    script.push_str("  rm -f \"$RUN_DISK\" \"$NVME_DISK\"\n");
     script
         .push_str("  qemu-img create -f qcow2 -F raw -b \"$DISK_IMG\" \"$RUN_DISK\" >/dev/null\n");
+    script.push_str("  qemu-img create -f raw \"$NVME_DISK\" 64M >/dev/null\n");
     script.push_str(&format!(
         "  cp {} \"$RUN_OVMF_VARS\"\n",
         bash_quote(OVMF_VARS_TEMPLATE_PATH)

@@ -44,5 +44,19 @@ read zs < /tmp/zstd.out
 /cmd/musl_smoke.elf argv-smoke && echo musl-smoke-ok || echo musl-smoke-bad
 /cmd/musl_smoke.elf 4-pthread-smoke && echo four-pthread-ok || echo four-pthread-bad
 /cmd/musl_smoke.elf exit-group-smoke && echo exit-group-ok || echo exit-group-bad
+/cmd/capsule_demo.elf && echo capsule-demo-ok || echo capsule-demo-bad
+if [ -n "${KOBOX_PACHAOS_DEVICE_CAPSULE:-}" ]; then
+  /cmd/capsule_demo.elf env-query && echo capsule-device-query-ok || echo capsule-device-query-bad
+  /cmd/kobox-ls-devices.elf pachaos && echo kobox-pachaos-device-ok || echo kobox-pachaos-device-bad
+  if [ -r /usr/lib/kobox/nvme-auth.ko ] && [ -r /usr/lib/kobox/nvme-core.ko ] && [ -r /usr/lib/kobox/nvme.ko ]; then
+    KOBOX_NVME_IO_SMOKE=1 /cmd/kobox-run.elf --backend=pachaos --dep=/usr/lib/kobox/nvme-auth.ko --dep=/usr/lib/kobox/nvme-core.ko run /usr/lib/kobox/nvme.ko > /tmp/kobox-nvme-rw.log 2>&1
+    cat /tmp/kobox-nvme-rw.log
+    if grep -q 'kobox nvme io smoke: cases=.*block-requests=ok' /tmp/kobox-nvme-rw.log && ! grep -q 'init_module returned -' /tmp/kobox-nvme-rw.log; then
+      echo kobox-nvme-rw-ok
+    else
+      echo kobox-nvme-rw-bad
+    fi
+  fi
+fi
 echo pipe-ok | while read x; do echo $x; done
 echo dash-smoke-done

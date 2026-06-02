@@ -5,11 +5,11 @@ pub const image_flag_present: u64 = 1 << 0;
 pub const image_flag_kernel_loaded: u64 = 1 << 1;
 
 pub const magic: u64 = 0x49425453; // "IBTS"
-pub const version: u64 = 16;
+pub const version: u64 = 18;
 pub const config_magic: u64 = 0x49425443; // "IBTC"
 pub const config_version: u64 = 1;
 pub const max_spawn_page_descriptors: usize = 8;
-pub const max_device_descriptors: usize = 6;
+pub const max_device_descriptors: usize = 8;
 pub const max_device_queue_grants: usize = 4;
 pub const max_boot_archive_pages: usize = 128;
 pub const boot_display_shell_height: u64 = 624;
@@ -93,6 +93,7 @@ pub const SpawnPageSubject = enum(u64) {
 
 pub const DeviceTransport = enum(u64) {
     virtio_pci_modern = 1,
+    nvme_pci = 2,
 };
 
 pub const SpawnPageDescriptor = extern struct {
@@ -135,6 +136,7 @@ pub const DeviceDescriptor = extern struct {
     init_queue_grant_count: u64,
     init_queue_grants: [max_device_queue_grants]DeviceQueueGrant,
     init_command_token: u64,
+    init_device_capsule_token: u64,
 };
 
 pub const DisplayDescriptor = extern struct {

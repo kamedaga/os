@@ -1,5 +1,5 @@
 pub const magic: u64 = 0x3149_4241_5041_5254; // TRAPABI1
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 
 pub const TrapKind = enum(u32) {
     abi_syscall = 1,
@@ -43,6 +43,7 @@ pub const syscall_set_abi_trap_target_request_page: u64 = 0x57;
 pub const syscall_detach_abi_trap_reply_token: u64 = 0x59;
 pub const syscall_copy_from_abi_trap_target: u64 = 0x5B;
 pub const syscall_reply_abi_trap_target_context: u64 = 0x64;
+pub const syscall_set_abi_trap_reply_target_gs_base: u64 = 0x65;
 pub const abi_trap_copy_max_bytes: usize = 4096;
 
 pub const TrapRequest = extern struct {
@@ -76,6 +77,7 @@ pub const TrapRequest = extern struct {
     rax: u64 = 0,
     rflags: u64 = 0,
     fs_base: u64 = 0,
+    gs_base: u64 = 0,
 };
 
 pub const UserContext = extern struct {
@@ -99,6 +101,7 @@ pub const UserContext = extern struct {
     r14: u64 = 0,
     r15: u64 = 0,
     fs_base: u64 = 0,
+    gs_base: u64 = 0,
     reserved0: u64 = 0,
     reserved1: u64 = 0,
 };

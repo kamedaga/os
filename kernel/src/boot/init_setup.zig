@@ -13,6 +13,7 @@ const uefi_services = @import("uefi_services.zig");
 const halt = @import("../halt.zig");
 
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
+const capsule_abi = boot_abi.capsule_abi;
 const service_registry_abi = boot_abi.service_registry_abi;
 
 pub const MmioPageWithOffset = struct {
@@ -312,6 +313,7 @@ pub fn publishInitBootstrapDescriptorPage(
             .init_queue_grant_count = 0,
             .init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants,
             .init_command_token = 0,
+            .init_device_capsule_token = 0,
         };
     }
     device_count = 0;
@@ -345,8 +347,13 @@ fn grantInitDeviceQueueTokenOrHalt(
     };
 }
 
-fn bootstrapQueueGrantCountForDevice(device: kernel.DmaDeviceId) usize {
-    _ = device;
+fn descriptorUsesVirtqueues(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
+    const transport = std.meta.intToEnum(init_bootstrap_abi.DeviceTransport, descriptor.transport) catch return false;
+    return transport == .virtio_pci_modern;
+}
+
+fn bootstrapQueueGrantCountForDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) usize {
+    if (!descriptorUsesVirtqueues(descriptor)) return 0;
     return init_bootstrap_abi.max_device_queue_grants;
 }
 
@@ -384,6 +391,33 @@ fn grantInitDeviceCommandTokenOrHalt(
     };
 }
 
+fn grantInitDeviceCapsuleTokenOrHalt(
+    state: *kernel.KernelState,
+    init_process_principal: kernel.PrincipalId,
+    device: kernel.DmaDeviceId,
+    label: []const u8,
+    step_label: []const u8,
+) u64 {
+    const raw_token = state.deviceCapsuleCreate(init_process_principal, device, .{
+        .query = true,
+        .config_read = true,
+        .config_write = true,
+        .bar_info = true,
+        .bar_map = true,
+        .dma_alloc = true,
+        .dma_map_user = true,
+        .irq_bind = true,
+        .bus_master = true,
+        .reset = true,
+        .power = true,
+        .hotplug_observe = true,
+        .grant = true,
+    }) catch |err| {
+        haltInitDeviceBootstrapError(label, step_label, err);
+    };
+    return capsule_abi.encodeCapsuleToken(.device, raw_token);
+}
+
 pub fn setupDeviceBootstrapForInit(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
@@ -401,8 +435,9 @@ pub fn setupDeviceBootstrapForInit(
         free_list,
     );
     var init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants;
-    const queue_limit = bootstrapQueueGrantCountForDevice(device.dma_device);
-    const queue_grant_count = if (device.descriptor.queue_count == 0)
+    const uses_virtqueues = descriptorUsesVirtqueues(device.descriptor);
+    const queue_limit = bootstrapQueueGrantCountForDescriptor(device.descriptor);
+    const queue_grant_count = if (device.descriptor.queue_count == 0 and uses_virtqueues)
         queue_limit
     else
         @min(queue_limit, @as(usize, @intCast(device.descriptor.queue_count)));
@@ -435,25 +470,39 @@ pub fn setupDeviceBootstrapForInit(
             .notify_token = init_notify_token,
         };
     }
-    const init_iommu_token = grantInitDeviceIommuTokenOrHalt(
+    const init_iommu_token = if (uses_virtqueues)
+        grantInitDeviceIommuTokenOrHalt(
+            state,
+            init_process_principal,
+            device.dma_device,
+            label,
+            "iommu grant",
+        )
+    else
+        0;
+    const init_command_token = if (uses_virtqueues)
+        grantInitDeviceCommandTokenOrHalt(
+            state,
+            init_process_principal,
+            device.dma_device,
+            label,
+            "command grant",
+        )
+    else
+        0;
+    const init_device_capsule_token = grantInitDeviceCapsuleTokenOrHalt(
         state,
         init_process_principal,
         device.dma_device,
         label,
-        "iommu grant",
-    );
-    const init_command_token = grantInitDeviceCommandTokenOrHalt(
-        state,
-        init_process_principal,
-        device.dma_device,
-        label,
-        "command grant",
+        "device capsule grant",
     );
     var updated = device;
     updated.descriptor.init_iommu_token = init_iommu_token;
     updated.descriptor.init_queue_grant_count = @intCast(queue_grant_count);
     updated.descriptor.init_queue_grants = init_queue_grants;
     updated.descriptor.init_command_token = init_command_token;
+    updated.descriptor.init_device_capsule_token = init_device_capsule_token;
     return updated;
 }
 

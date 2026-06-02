@@ -2,7 +2,7 @@ const init_bootstrap_abi = @import("init_bootstrap_abi.zig");
 const process_abi = @import("process_abi.zig");
 
 pub const magic: u64 = 0x4D49_4248; // "MIBH"
-pub const version: u64 = 4;
+pub const version: u64 = 6;
 pub const config_target_va: u64 = process_abi.auxPageVa(33);
 pub const max_device_grants: usize = init_bootstrap_abi.max_device_descriptors;
 pub const max_device_queue_grants: usize = init_bootstrap_abi.max_device_queue_grants;
@@ -29,6 +29,7 @@ pub const DeviceGrant = extern struct {
         [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** max_device_queue_grants,
     command_token: u64 = 0,
     input_kind_hint: u64 = 0,
+    device_capsule_token: u64 = 0,
 };
 
 pub const ConfigPage = extern struct {
@@ -68,6 +69,7 @@ pub fn writeDeviceGrant(
     queue_grants: [max_device_queue_grants]init_bootstrap_abi.DeviceQueueGrant,
     command_token: u64,
     input_kind_hint: u64,
+    device_capsule_token: u64,
 ) void {
     if (index >= max_device_grants) return;
     const page: *volatile ConfigPage = @ptrFromInt(config_source_va);
@@ -78,6 +80,7 @@ pub fn writeDeviceGrant(
         .queue_grants = queue_grants,
         .command_token = command_token,
         .input_kind_hint = input_kind_hint,
+        .device_capsule_token = device_capsule_token,
     };
 }
 

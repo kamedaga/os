@@ -38,6 +38,7 @@ enum {
     SYSCALL_COPY_TO_PROCESS = 0x47,
     SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
     SYSCALL_SET_PROCESS_BOOTSTRAP_OWNER = 0x6B,
+    SYSCALL_CAPSULE_GRANT = 0x76,
     SYSCALL_OK = 0,
     SYSCALL_ERR_ENDPOINT = 9,
 
@@ -65,20 +66,22 @@ enum {
     INSPECT_MMIO_BASE_VA = 0x3F000000,
 
     INIT_BOOTSTRAP_MAGIC = 0x49425453,
-    INIT_BOOTSTRAP_VERSION = 16,
+    INIT_BOOTSTRAP_VERSION = 18,
     INIT_CONFIG_MAGIC = 0x49425443,
     INIT_CONFIG_VERSION = 1,
     INIT_BOOT_ARCHIVE_FLAG_PRESENT = 1,
     INIT_DEVICE_FLAG_PRESENT = 1,
     INIT_DISPLAY_FLAG_PRESENT = 1,
     INIT_MAX_SPAWN_PAGE_DESCRIPTORS = 8,
-    INIT_MAX_DEVICE_DESCRIPTORS = 6,
+    INIT_MAX_DEVICE_DESCRIPTORS = 8,
     INIT_MAX_DEVICE_QUEUE_GRANTS = 4,
     INIT_MAX_BOOT_ARCHIVE_PAGES = 128,
+    INIT_DEVICE_TRANSPORT_VIRTIO_PCI_MODERN = 1,
+    INIT_DEVICE_TRANSPORT_NVME_PCI = 2,
 
     MANAGER_INIT_MAGIC = 0x4D494248,
-    MANAGER_INIT_VERSION = 4,
-    MANAGER_INIT_MAX_DEVICE_GRANTS = 6,
+    MANAGER_INIT_VERSION = 6,
+    MANAGER_INIT_MAX_DEVICE_GRANTS = 8,
     MANAGER_INIT_MAX_DEVICE_QUEUE_GRANTS = 4,
 
     BOOTFS_MAGIC = 0x53465442,
@@ -198,6 +201,36 @@ enum {
     QUEUE_CAP_KIND_VIRTQUEUE = 2,
     QUEUE_CAP_KIND_COMMAND = 3,
 
+    CAPSULE_RIGHT_QUERY = 1ULL << 0,
+    CAPSULE_RIGHT_CONFIG_READ = 1ULL << 1,
+    CAPSULE_RIGHT_CONFIG_WRITE = 1ULL << 2,
+    CAPSULE_RIGHT_BAR_INFO = 1ULL << 3,
+    CAPSULE_RIGHT_BAR_MAP = 1ULL << 4,
+    CAPSULE_RIGHT_DMA_ALLOC = 1ULL << 5,
+    CAPSULE_RIGHT_DMA_MAP_USER = 1ULL << 6,
+    CAPSULE_RIGHT_IRQ_BIND = 1ULL << 7,
+    CAPSULE_RIGHT_BUS_MASTER = 1ULL << 8,
+    CAPSULE_RIGHT_RESET = 1ULL << 9,
+    CAPSULE_RIGHT_POWER = 1ULL << 10,
+    CAPSULE_RIGHT_HOTPLUG_OBSERVE = 1ULL << 11,
+    CAPSULE_RIGHT_GRANT = 1ULL << 12,
+    CAPSULE_RIGHT_DEVICE_TO_ROOT =
+        CAPSULE_RIGHT_QUERY |
+        CAPSULE_RIGHT_CONFIG_READ |
+        CAPSULE_RIGHT_CONFIG_WRITE |
+        CAPSULE_RIGHT_BAR_INFO |
+        CAPSULE_RIGHT_BAR_MAP |
+        CAPSULE_RIGHT_DMA_ALLOC |
+        CAPSULE_RIGHT_DMA_MAP_USER |
+        CAPSULE_RIGHT_IRQ_BIND |
+        CAPSULE_RIGHT_BUS_MASTER |
+        CAPSULE_RIGHT_RESET |
+        CAPSULE_RIGHT_POWER |
+        CAPSULE_RIGHT_HOTPLUG_OBSERVE |
+        CAPSULE_RIGHT_GRANT,
+    CAPSULE_TOKEN_MAGIC_MASK = 0xFF00000000000000ULL,
+    CAPSULE_TOKEN_MAGIC_TAG = 0xCA00000000000000ULL,
+
     DEVICE_CATALOG_MAGIC = 0x44455643,
     DEVICE_CATALOG_VERSION = 1,
     DEVICE_CATALOG_TARGET_VA = 0x3C030000,
@@ -205,6 +238,7 @@ enum {
     DEVICE_CATALOG_MAX_ENTRIES = 6,
     DEVICE_CATALOG_KIND_CONSOLE = 1,
     DEVICE_CATALOG_KIND_NET = 2,
+    DEVICE_CATALOG_KIND_NVME = 3,
 
     ROOT_SEED2_IMAGE_VA = 0x28100000,
     BOOTFS_OBJECT_BASE_VA = 0x28200000,
@@ -293,6 +327,7 @@ struct device_descriptor {
     u64 init_queue_grant_count;
     struct device_queue_grant init_queue_grants[INIT_MAX_DEVICE_QUEUE_GRANTS];
     u64 init_command_token;
+    u64 init_device_capsule_token;
 };
 
 struct boot_archive_descriptor {
@@ -349,6 +384,7 @@ struct manager_device_grant {
     struct device_queue_grant queue_grants[MANAGER_INIT_MAX_DEVICE_QUEUE_GRANTS];
     u64 command_token;
     u64 input_kind_hint;
+    u64 device_capsule_token;
 };
 
 struct manager_config_page {
@@ -487,6 +523,7 @@ struct device_catalog_entry {
     u64 queue1_submit_token;
     u64 queue1_notify_token;
     u64 command_token;
+    u64 device_capsule_token;
 };
 
 struct device_catalog_page {
@@ -501,6 +538,7 @@ static struct manager_config_page g_handoff;
 static struct device_descriptor g_block_device;
 static struct device_descriptor g_console_device;
 static struct device_descriptor g_net_device;
+static struct device_descriptor g_nvme_device;
 static u64 g_next_endpoint_id = NEXT_ENDPOINT_BASE;
 static u64 g_next_bootstrap_source_va = DYNAMIC_BOOTSTRAP_SOURCE_BASE_VA;
 static u64 g_next_inspect_mmio_va = INSPECT_MMIO_BASE_VA;
@@ -1189,6 +1227,7 @@ static void init_handoff_from_descriptor_page(void) {
         grant->device_page_paddr = d->device_page_paddr;
         grant->iommu_token = d->init_iommu_token;
         grant->command_token = d->init_command_token;
+        grant->device_capsule_token = d->init_device_capsule_token;
         grant->queue_grant_count = d->init_queue_grant_count;
         if (grant->queue_grant_count > MANAGER_INIT_MAX_DEVICE_QUEUE_GRANTS) {
             grant->queue_grant_count = MANAGER_INIT_MAX_DEVICE_QUEUE_GRANTS;
@@ -1245,6 +1284,20 @@ static int find_net_device(void) {
                 d->subsystem_id == VIRTIO_NET_SUBSYSTEM_ID))
         {
             g_net_device = *d;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int find_nvme_device(void) {
+    struct init_descriptor_page *page = descriptor_page();
+    if (!page) return 0;
+    for (u64 i = 0; i < page->device_count && i < INIT_MAX_DEVICE_DESCRIPTORS; i++) {
+        struct device_descriptor *d = &page->devices[i];
+        if ((d->flags & INIT_DEVICE_FLAG_PRESENT) == 0) continue;
+        if (d->transport == INIT_DEVICE_TRANSPORT_NVME_PCI && d->init_device_capsule_token != 0) {
+            g_nvme_device = *d;
             return 1;
         }
     }
@@ -1404,6 +1457,7 @@ static void device_catalog_add(struct device_descriptor *device, u64 kind) {
     entry->isr_page_offset = device->isr_page_offset;
     entry->device_page_offset = device->device_page_offset;
     entry->notify_off_multiplier = device->notify_off_multiplier;
+    entry->device_capsule_token = device->init_device_capsule_token;
 }
 
 static u64 ensure_device_catalog(void) {
@@ -1430,6 +1484,11 @@ static u64 ensure_device_catalog(void) {
         device_catalog_add(&g_net_device, DEVICE_CATALOG_KIND_NET);
     } else {
         user_log("[seed2_boot] net catalog entry skipped\n");
+    }
+    if (find_nvme_device()) {
+        device_catalog_add(&g_nvme_device, DEVICE_CATALOG_KIND_NVME);
+    } else {
+        user_log("[seed2_boot] nvme catalog entry skipped\n");
     }
     return g_device_catalog_source_va;
 }
@@ -1474,12 +1533,31 @@ static int fill_catalog_queue_tokens_for_child(volatile struct device_catalog_en
     return 1;
 }
 
+static int grant_catalog_capsule_to_child(volatile struct device_catalog_entry *entry, u64 child_slot) {
+    if (entry->device_capsule_token == 0) return 1;
+    const u64 granted = syscall3(
+        SYSCALL_CAPSULE_GRANT,
+        entry->device_capsule_token,
+        child_slot,
+        CAPSULE_RIGHT_DEVICE_TO_ROOT
+    );
+    if ((granted & CAPSULE_TOKEN_MAGIC_MASK) != CAPSULE_TOKEN_MAGIC_TAG) {
+        user_log_hex("[seed2_boot] catalog capsule grant failed kind=", entry->kind);
+        user_log_hex("[seed2_boot] catalog capsule grant status=", granted);
+        return 0;
+    }
+    entry->device_capsule_token = granted;
+    return 1;
+}
+
 static int grant_device_catalog_to_child(u64 child_slot) {
     if (g_device_catalog_source_va == 0) return 1;
     volatile struct device_catalog_page *page = (volatile struct device_catalog_page *)g_device_catalog_source_va;
     for (u64 i = 0; i < page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
         volatile struct device_catalog_entry *entry = &page->entries[i];
         if (entry->present == 0) continue;
+        if (!grant_catalog_capsule_to_child(entry, child_slot)) return 0;
+        if (entry->kind == DEVICE_CATALOG_KIND_NVME) continue;
         if (!grant_device_mmio_with_grant((struct device_catalog_entry *)entry, child_slot)) return 0;
         if (!fill_catalog_queue_tokens_for_child(entry, child_slot)) return 0;
     }

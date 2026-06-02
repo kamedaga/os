@@ -1,6 +1,7 @@
 const abi_root = @import("kernel_abi_root");
 
 const ipc_buffer_abi = abi_root.ipc_buffer_abi;
+const capsule_abi = abi_root.capsule_abi;
 const process_abi = abi_root.process_abi;
 const queue_abi = abi_root.queue_abi;
 const trap_abi = abi_root.trap_abi;
@@ -67,10 +68,25 @@ pub const syscall_map_ipc_buffer_anywhere: u64 = ipc_buffer_abi.syscall_map_ipc_
 
 pub const syscall_get_rtc_unix_time: u64 = 0x3E;
 
+pub const syscall_capsule_query: u64 = capsule_abi.syscall_capsule_query;
+pub const syscall_capsule_derive_mmio: u64 = capsule_abi.syscall_capsule_derive_mmio;
+pub const syscall_capsule_derive_dma_buffer: u64 = capsule_abi.syscall_capsule_derive_dma_buffer;
+pub const syscall_capsule_derive_dma_mapping: u64 = capsule_abi.syscall_capsule_derive_dma_mapping;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = capsule_abi.syscall_capsule_derive_dma_mapping_from_buffer;
+pub const syscall_capsule_derive_irq: u64 = capsule_abi.syscall_capsule_derive_irq;
+pub const syscall_capsule_grant: u64 = capsule_abi.syscall_capsule_grant;
+pub const syscall_capsule_revoke: u64 = capsule_abi.syscall_capsule_revoke;
+pub const syscall_capsule_close: u64 = capsule_abi.syscall_capsule_close;
+pub const syscall_capsule_pci_config_read: u64 = capsule_abi.syscall_capsule_pci_config_read;
+pub const syscall_capsule_pci_config_write: u64 = capsule_abi.syscall_capsule_pci_config_write;
+pub const syscall_capsule_pci_bar_info: u64 = capsule_abi.syscall_capsule_pci_bar_info;
+pub const syscall_capsule_irq_poll: u64 = capsule_abi.syscall_capsule_irq_poll;
+
 pub const syscall_map_abi_trap_reply_target_pages: u64 = trap_abi.syscall_map_abi_trap_reply_target_pages;
 pub const syscall_copy_from_abi_trap_reply_target: u64 = trap_abi.syscall_copy_from_abi_trap_reply_target;
 pub const syscall_copy_to_abi_trap_reply_target: u64 = trap_abi.syscall_copy_to_abi_trap_reply_target;
 pub const syscall_set_abi_trap_reply_target_fs_base: u64 = trap_abi.syscall_set_abi_trap_reply_target_fs_base;
+pub const syscall_set_abi_trap_reply_target_gs_base: u64 = trap_abi.syscall_set_abi_trap_reply_target_gs_base;
 pub const syscall_protect_abi_trap_reply_target_pages: u64 = trap_abi.syscall_protect_abi_trap_reply_target_pages;
 pub const syscall_unmap_abi_trap_reply_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_reply_target_pages;
 pub const syscall_map_abi_trap_reply_target_vm_object: u64 = trap_abi.syscall_map_abi_trap_reply_target_vm_object;

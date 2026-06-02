@@ -33,6 +33,7 @@ enum {
     SYSCALL_COPY_TO_PROCESS = 0x47,
     SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
     SYSCALL_SET_PROCESS_BOOTSTRAP_OWNER = 0x6B,
+    SYSCALL_CAPSULE_GRANT = 0x76,
     SYSCALL_CREATE_IPC_BUFFER_FROM_PAGE = 0x5E,
     SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
@@ -117,12 +118,42 @@ enum {
     DEVICE_CATALOG_MAX_ENTRIES = 6,
     DEVICE_CATALOG_KIND_CONSOLE = 1,
     DEVICE_CATALOG_KIND_NET = 2,
+    DEVICE_CATALOG_KIND_NVME = 3,
     QUEUE_CAP_TAG_BASE = (1ULL << 62) | (1ULL << 60),
     QUEUE_CAP_KIND_SHIFT = 56,
     QUEUE_CAP_KIND_MASK = 0x0FULL << 56,
     QUEUE_CAP_KIND_IOMMU = 1,
     QUEUE_CAP_KIND_VIRTQUEUE = 2,
     QUEUE_CAP_KIND_COMMAND = 3,
+    CAPSULE_RIGHT_QUERY = 1ULL << 0,
+    CAPSULE_RIGHT_CONFIG_READ = 1ULL << 1,
+    CAPSULE_RIGHT_CONFIG_WRITE = 1ULL << 2,
+    CAPSULE_RIGHT_BAR_INFO = 1ULL << 3,
+    CAPSULE_RIGHT_BAR_MAP = 1ULL << 4,
+    CAPSULE_RIGHT_DMA_ALLOC = 1ULL << 5,
+    CAPSULE_RIGHT_DMA_MAP_USER = 1ULL << 6,
+    CAPSULE_RIGHT_IRQ_BIND = 1ULL << 7,
+    CAPSULE_RIGHT_BUS_MASTER = 1ULL << 8,
+    CAPSULE_RIGHT_RESET = 1ULL << 9,
+    CAPSULE_RIGHT_POWER = 1ULL << 10,
+    CAPSULE_RIGHT_HOTPLUG_OBSERVE = 1ULL << 11,
+    CAPSULE_RIGHT_GRANT = 1ULL << 12,
+    CAPSULE_RIGHT_EXEC_SERVICE =
+        CAPSULE_RIGHT_QUERY |
+        CAPSULE_RIGHT_CONFIG_READ |
+        CAPSULE_RIGHT_CONFIG_WRITE |
+        CAPSULE_RIGHT_BAR_INFO |
+        CAPSULE_RIGHT_BAR_MAP |
+        CAPSULE_RIGHT_DMA_ALLOC |
+        CAPSULE_RIGHT_DMA_MAP_USER |
+        CAPSULE_RIGHT_IRQ_BIND |
+        CAPSULE_RIGHT_BUS_MASTER |
+        CAPSULE_RIGHT_RESET |
+        CAPSULE_RIGHT_POWER |
+        CAPSULE_RIGHT_HOTPLUG_OBSERVE |
+        CAPSULE_RIGHT_GRANT,
+    CAPSULE_TOKEN_MAGIC_MASK = 0xFF00000000000000ULL,
+    CAPSULE_TOKEN_MAGIC_TAG = 0xCA00000000000000ULL,
     CONSOLE_CONFIG_MAGIC = 0x434F4E43,
     CONSOLE_CONFIG_VERSION = 1,
     CONSOLE_STATUS_READY = 0x43524459,
@@ -297,6 +328,7 @@ struct device_catalog_entry {
     u64 queue1_submit_token;
     u64 queue1_notify_token;
     u64 command_token;
+    u64 device_capsule_token;
 };
 
 struct device_catalog_page {
@@ -1648,6 +1680,42 @@ static int append_exec_arg(struct exec_bootstrap_config *cfg, u16 *cursor, const
     return 1;
 }
 
+static int is_capsule_token(u64 token) {
+    return (token & CAPSULE_TOKEN_MAGIC_MASK) == CAPSULE_TOKEN_MAGIC_TAG;
+}
+
+static void format_hex_env(const char *prefix, u64 value, char *buf) {
+    u64 n = 0;
+    while (prefix[n] != 0) {
+        buf[n] = prefix[n];
+        n++;
+    }
+    buf[n++] = '0';
+    buf[n++] = 'x';
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        const u8 digit = (u8)((value >> (u64)shift) & 0xF);
+        buf[n++] = (char)(digit < 10 ? ('0' + digit) : ('a' + digit - 10));
+    }
+    buf[n] = 0;
+}
+
+static u64 grant_nvme_capsule_to_exec_service(void) {
+    if (g_exec_service_process_slot == 0) return 0;
+    volatile struct device_catalog_entry *entry = find_device_catalog_entry(DEVICE_CATALOG_KIND_NVME);
+    if (!entry || !is_capsule_token(entry->device_capsule_token)) return 0;
+    const u64 granted = syscall3(
+        SYSCALL_CAPSULE_GRANT,
+        entry->device_capsule_token,
+        g_exec_service_process_slot,
+        CAPSULE_RIGHT_EXEC_SERVICE
+    );
+    if (!is_capsule_token(granted)) {
+        user_log_hex("[seed2_root] nvme capsule grant to exec failed=", granted);
+        return 0;
+    }
+    return granted;
+}
+
 static int configure_dash_exec_args(struct exec_bootstrap_config *cfg, const char *path) {
     u16 cursor = 0;
     if (!append_exec_arg(cfg, &cursor, path, &cfg->execfn_offset, &cfg->execfn_bytes)) return 0;
@@ -1663,10 +1731,23 @@ static int configure_dash_exec_args(struct exec_bootstrap_config *cfg, const cha
         "PS1=# ",
         "CAPABILITYOS=1",
     };
+    u16 env_count = 0;
     for (u16 i = 0; i < 7; i++) {
-        if (!append_exec_arg(cfg, &cursor, envp[i], &cfg->envp_offsets[i], &cfg->envp_bytes[i])) return 0;
+        if (!append_exec_arg(cfg, &cursor, envp[i], &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
+        env_count++;
     }
-    cfg->envp_count = 7;
+    const u64 exec_capsule = grant_nvme_capsule_to_exec_service();
+    if (exec_capsule != 0 && env_count + 2 <= EXEC_MAX_ENVP) {
+        char kobox_env[48];
+        char source_env[64];
+        format_hex_env("KOBOX_PACHAOS_DEVICE_CAPSULE=", 0, kobox_env);
+        format_hex_env("PACHA_EXEC_CAPSULE_SOURCE=", exec_capsule, source_env);
+        if (!append_exec_arg(cfg, &cursor, kobox_env, &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
+        env_count++;
+        if (!append_exec_arg(cfg, &cursor, source_env, &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
+        env_count++;
+    }
+    cfg->envp_count = env_count;
     cfg->arg_data_bytes = cursor;
     return 1;
 }

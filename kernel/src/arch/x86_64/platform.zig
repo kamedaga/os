@@ -248,6 +248,7 @@ const msr_star: u32 = 0xC000_0081;
 const msr_lstar: u32 = 0xC000_0082;
 const msr_fmask: u32 = 0xC000_0084;
 const msr_ia32_fs_base: u32 = 0xC000_0100;
+const msr_ia32_gs_base: u32 = 0xC000_0101;
 const efer_sce: u64 = 1 << 0;
 const cr4_pge: u64 = 1 << 7;
 const cr4_pcide: u64 = 1 << 17;
@@ -333,6 +334,10 @@ fn writeMsr(msr: u32, value: u64) void {
 
 pub fn writeFsBase(value: u64) void {
     writeMsr(msr_ia32_fs_base, value);
+}
+
+pub fn writeGsBase(value: u64) void {
+    writeMsr(msr_ia32_gs_base, value);
 }
 
 fn writeU64LEBytes(ptr: [*]u8, offset: usize, value: u64) void {

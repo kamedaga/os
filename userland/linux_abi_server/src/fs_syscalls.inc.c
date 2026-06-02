@@ -1323,9 +1323,21 @@ static struct ipc_message handle_faccessat(const struct trap_request *req) {
     return handle_access_path(req->args[0], req->args[1], req->args[2], req->args[3]);
 }
 static struct ipc_message handle_arch_prctl(const struct trap_request *req) {
-    if (req->args[0] != ARCH_SET_FS) return reply(errno_inval(), 0);
-    const u64 status = set_target_fs_base(req->args[1]);
-    return reply(status == SYSCALL_OK ? 0 : errno_inval(), 0);
+    const u64 code = req->args[0];
+    const u64 value = req->args[1];
+    if (code == ARCH_SET_FS) {
+        const u64 status = set_target_fs_base(value);
+        return reply(status == SYSCALL_OK ? 0 : errno_inval(), 0);
+    }
+    if (code == ARCH_SET_GS) {
+        const u64 status = set_target_gs_base(value);
+        return reply(status == SYSCALL_OK ? 0 : errno_inval(), 0);
+    }
+    if (code == ARCH_GET_FS || code == ARCH_GET_GS) {
+        const u64 out = code == ARCH_GET_FS ? req->fs_base : req->gs_base;
+        return copy_to_target(value, &out, sizeof(out)) == sizeof(out) ? reply(0, 0) : reply(errno_fault(), 0);
+    }
+    return reply(errno_inval(), 0);
 }
 
 static struct ipc_message handle_rt_sigaction(const struct trap_request *req) {

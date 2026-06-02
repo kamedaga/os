@@ -7,8 +7,8 @@ musl libc と動的リンクにより、既存の Linux エコシステムとの
 ## Features
 
 - **Pure microkernel** — カーネルは capability 管理・スケジューリング・trap delegation のみを担当
-- **Trap delegation** — syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーに委譲
-- **Hardware capabilities** — DMA バッファ・IOMMU マッピング・Virtqueue を capability として抽象化
+- **Trap delegation** — Linux syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーが処理
+- **Hardware capabilities** — capsuleを用いた、DMA バッファ・IOMMU マッピング・Virtqueue を capability として抽象化
 - **Linux ABI compatibility** — 無改造の musl libc を動的リンクでロードし、ユーザーランドで Linux syscall を処理
 - **Userland drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
 - **x86_64 support** — x86_64のみに対応 いずれAArch64に対応予定

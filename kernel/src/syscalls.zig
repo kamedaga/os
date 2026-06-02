@@ -6,6 +6,7 @@ const ipc_buffer_abi = abi_root.ipc_buffer_abi;
 const trap_abi = abi_root.trap_abi;
 const process_abi = abi_root.process_abi;
 const process_builder_abi = abi_root.process_builder_abi;
+const pacha_syscall_abi = abi_root.pacha_syscall_abi;
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
 const smp = @import("smp.zig");
@@ -14,6 +15,7 @@ const abi_trap_runtime = @import("runtime/abi_trap.zig");
 const sc = @import("syscall/numbers.zig");
 const syscall_lock_policy = @import("syscall/lock_policy.zig");
 const memory_syscalls = @import("syscall/memory_helpers.zig");
+const capsule_syscalls = @import("syscall/capsule.zig");
 const device_syscalls = @import("syscall/device.zig");
 const process_syscalls = @import("syscall/process.zig");
 const vm_object_dispatch = @import("syscall/vm_object.zig");
@@ -457,7 +459,17 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     }
     const abi_delegate = state.abiTrapDelegateFor(proc);
     const has_abi_delegate = abi_delegate != null;
-    if (entry_is_lstar or has_abi_delegate) {
+    var native_escape = false;
+    if (has_abi_delegate) {
+        if (pacha_syscall_abi.decodeAbiProcessNativeSyscall(frame.rax)) |native_nr| {
+            frame.rax = native_nr;
+            if (entry_is_lstar) {
+                frame.rcx = frame.r10;
+            }
+            native_escape = true;
+        }
+    }
+    if (!native_escape and (entry_is_lstar or has_abi_delegate)) {
         if (abi_delegate) |delegate| {
             if (abi_trap_runtime.dispatchKnownDelegate(state, proc, delegate, frame)) |result| {
                 return result;
@@ -475,6 +487,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         if (hold_kernel_state_lock) kernel_state_lock.unlock();
     }
 
+    if (capsule_syscalls.dispatch(h, state, proc, frame)) |result| {
+        return result;
+    }
     if (device_syscalls.dispatch(h, state, proc, frame)) |result| {
         return result;
     }
@@ -820,26 +835,8 @@ pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
     return syscallDispatchFrom(frame, currentSyscallEntryIsLstar());
 }
 
-fn syscallLstarDelegateDispatch(frame: *TrapFrame) ?u64 {
-    const h = getHooks();
-    const entry_thread = scheduler.currentThreadIndex();
-    setSyscallReturnWritebackEnabled(true);
-    defer {
-        if (scheduler.currentThreadIndex() != entry_thread) {
-            setSyscallReturnWritebackEnabled(false);
-        }
-    }
-    if (!h.kernel_state_ready.*) return sc.syscall_err_not_ready;
-
-    const proc = scheduler.currentUserPrincipal();
-    const state = h.state;
-    if (abi_trap_runtime.dispatchDelegate(state, proc, frame)) |result| return result;
-    return null;
-}
-
 pub export fn syscallLstarDispatch(frame: *TrapFrame) callconv(.c) u64 {
-    if (syscallLstarDelegateDispatch(frame)) |result| return result;
-    return syscallDispatchFrom(frame, false);
+    return syscallDispatchFrom(frame, true);
 }
 
 test "explicit userlog label detection" {

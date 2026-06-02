@@ -1,0 +1,14 @@
+#ifndef PACHA_SYSCALL_ABI_H
+#define PACHA_SYSCALL_ABI_H
+
+#include <stdint.h>
+
+#define PACHA_NATIVE_SYSCALL_TAG UINT64_C(0x50414348CA000000)
+#define PACHA_NATIVE_SYSCALL_MASK UINT64_C(0xFFFFFFFFFF000000)
+#define PACHA_NATIVE_SYSCALL_NR_MASK UINT64_C(0x0000000000FFFFFF)
+
+static inline uint64_t pacha_native_syscall_encode(uint64_t nr) {
+    return PACHA_NATIVE_SYSCALL_TAG | (nr & PACHA_NATIVE_SYSCALL_NR_MASK);
+}
+
+#endif

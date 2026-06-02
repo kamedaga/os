@@ -20,6 +20,9 @@ pub fn dispatch(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *Tr
         sc.syscall_set_abi_trap_reply_target_fs_base => {
             return abi_trap_runtime.setCurrentReplyTargetFsBase(frame.rdi);
         },
+        sc.syscall_set_abi_trap_reply_target_gs_base => {
+            return abi_trap_runtime.setCurrentReplyTargetGsBase(frame.rdi);
+        },
         sc.syscall_protect_abi_trap_reply_target_pages => {
             return abi_trap_runtime.protectCurrentReplyTargetPages(frame.rdi, frame.rsi, frame.rdx);
         },

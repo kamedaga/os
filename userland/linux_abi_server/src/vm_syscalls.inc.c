@@ -257,22 +257,30 @@ static u64 vm_first_overlap_end(u64 start, u64 size) {
     return next;
 }
 
-static u64 mmap_limit_exclusive(void) {
+static u64 normalized_mmap_base(void) {
+    u64 base = g_mmap_base_va;
+    if (base < LINUX_MMAP_BASE_VA || base < g_user_low_va || base >= g_user_top_va) {
+        base = LINUX_MMAP_BASE_VA;
+    }
+    return page_up(base);
+}
+
+static u64 mmap_limit_exclusive_for_base(u64 base) {
     const u64 reserve_before_boundary = 0x01000000ULL;
     u64 limit = g_user_top_va;
-    if (limit == 0 || limit <= g_mmap_base_va) return 0;
-    if (g_stack_top_va > g_mmap_base_va && g_stack_top_va < limit) {
+    if (limit == 0 || limit <= base) return 0;
+    if (g_stack_top_va > base && g_stack_top_va < limit) {
         limit = g_stack_top_va > reserve_before_boundary ? g_stack_top_va - reserve_before_boundary : g_stack_top_va;
     }
-    if (g_brk_next_va > g_mmap_base_va && g_brk_next_va < limit) {
+    if (g_brk_next_va > base && g_brk_next_va < limit) {
         limit = g_brk_next_va > reserve_before_boundary ? g_brk_next_va - reserve_before_boundary : g_brk_next_va;
     }
     return page_down(limit);
 }
 
 static u64 find_mmap_area(u64 size) {
-    const u64 base = g_mmap_base_va;
-    const u64 limit = mmap_limit_exclusive();
+    const u64 base = normalized_mmap_base();
+    const u64 limit = mmap_limit_exclusive_for_base(base);
     if (size == 0 || limit <= base || size > limit - base) return 0;
     for (u64 pass = 0; pass < 2; pass++) {
         u64 candidate = 0;
@@ -282,6 +290,23 @@ static u64 find_mmap_area(u64 size) {
             if (overlap_end == 0) return candidate;
             if (!page_up_checked(overlap_end, &candidate)) return 0;
         }
+    }
+    return 0;
+}
+
+static u64 find_mmap32_area(u64 size) {
+    u64 base = 0x40000000ULL;
+    const u64 hard_limit = 0x80000000ULL;
+    u64 limit = g_user_top_va < hard_limit ? g_user_top_va : hard_limit;
+    if (base < g_user_low_va) base = g_user_low_va;
+    base = page_up(base);
+    limit = page_down(limit);
+    if (size == 0 || limit <= base || size > limit - base) return 0;
+    u64 candidate = base;
+    while (candidate >= base && candidate <= limit - size) {
+        const u64 overlap_end = vm_first_overlap_end(candidate, size);
+        if (overlap_end == 0) return candidate;
+        if (!page_up_checked(overlap_end, &candidate)) return 0;
     }
     return 0;
 }
@@ -313,11 +338,20 @@ static u64 normalize_linux_prot(u64 prot) {
     return prot;
 }
 
+static u64 linux_prot_for_kernel_map(u64 prot) {
+    /* Linux permits writable executable mappings. PachaOS does not enforce NX
+       yet, and the kernel map API rejects W+X, so keep write access and clear
+       the tracked exec bit only for the internal mapping syscall. */
+    if ((prot & 0x2) != 0) prot &= ~0x4ULL;
+    return prot;
+}
+
 static u64 apply_target_pages(u64 start, u64 page_count, u64 prot, u64 (*fn)(u64, u64, u64)) {
     u64 done = 0;
+    const u64 kernel_prot = linux_prot_for_kernel_map(prot);
     while (done < page_count) {
         const u64 chunk = min_u64(page_count - done, 64);
-        const u64 status = fn(start + done * PAGE_BYTES, chunk, prot);
+        const u64 status = fn(start + done * PAGE_BYTES, chunk, kernel_prot);
         if (status != SYSCALL_OK) return status;
         done += chunk;
     }
@@ -338,7 +372,7 @@ static int vm_apply_mapped_pages_in_range(u64 start, u64 size, u64 prot, u64 (*f
 }
 
 static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot) {
-    if (page_count <= 64) return map_reply_target_pages(start, page_count, prot);
+    if (page_count <= 64) return map_reply_target_pages(start, page_count, linux_prot_for_kernel_map(prot));
     return apply_target_pages(start, page_count, prot, map_reply_target_pages);
 }
 
@@ -563,7 +597,7 @@ static int materialize_file_vm_object_range(u64 start, u64 size, u64 prot) {
                 return 0;
             }
             if (map_prot != prot) {
-                const u64 protect_status = protect_reply_target_pages(va, 1, prot);
+                const u64 protect_status = protect_reply_target_pages(va, 1, linux_prot_for_kernel_map(prot));
                 if (protect_status != SYSCALL_OK) {
                     vm_trace4("vm.object.protect_fail", va, 1, prot, protect_status);
                     (void)unmap_reply_target_pages(va, 1);
@@ -656,7 +690,7 @@ static struct ipc_message handle_page_fault(const struct trap_request *req) {
 }
 
 static struct ipc_message handle_mmap(const struct trap_request *req) {
-    enum { PROT_READ = 0x1, PROT_WRITE = 0x2, PROT_EXEC = 0x4, MAP_SHARED = 0x01, MAP_PRIVATE = 0x02, MAP_SHARED_VALIDATE = 0x03, MAP_TYPE = 0x0F, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_FIXED_NOREPLACE = 0x100000 };
+    enum { PROT_READ = 0x1, PROT_WRITE = 0x2, PROT_EXEC = 0x4, MAP_SHARED = 0x01, MAP_PRIVATE = 0x02, MAP_SHARED_VALIDATE = 0x03, MAP_TYPE = 0x0F, MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_32BIT = 0x40, MAP_FIXED_NOREPLACE = 0x100000 };
     const u64 requested_va = req->args[0]; const u64 len = req->args[1]; u64 prot = req->args[2] & (PROT_READ | PROT_WRITE | PROT_EXEC); const u64 flags = req->args[3]; const u64 fd = req->args[4]; const u64 offset = req->args[5]; const u64 map_type = flags & MAP_TYPE;
     const int file_backed = (flags & MAP_ANONYMOUS) == 0;
     if (len == 0) return reply(errno_inval(), 0); if (map_type != MAP_PRIVATE && map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE) return reply(errno_inval(), 0); if ((offset & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0); if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0 && (requested_va == 0 || (requested_va & (PAGE_BYTES - 1)) != 0)) return reply(errno_inval(), 0); if (file_backed && (!fd_valid(fd) || g_fds[fd].kind != FD_FILE)) return reply(errno_badf(), 0); prot = normalize_linux_prot(prot);
@@ -665,7 +699,14 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     }
     u64 size = 0;
     if (!page_up_checked(len, &size)) return reply(errno_nomem(), 0);
-    const u64 page_count = size / PAGE_BYTES; u64 target_va = ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) ? requested_va : find_mmap_area(size); const u64 map_prot = file_backed ? ((prot | PROT_WRITE) & ~PROT_EXEC) : prot;
+    const u64 page_count = size / PAGE_BYTES;
+    const int fixed_mapping = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
+    u64 target_va = fixed_mapping ? requested_va : (((flags & MAP_32BIT) != 0) ? find_mmap32_area(size) : find_mmap_area(size));
+    if (!fixed_mapping && (flags & MAP_32BIT) == 0 && target_va != 0 && target_va < normalized_mmap_base()) {
+        g_mmap_next_va = normalized_mmap_base();
+        target_va = find_mmap_area(size);
+    }
+    const u64 map_prot = file_backed ? ((prot | PROT_WRITE) & ~PROT_EXEC) : prot;
     const int has_peers = has_thread_group_peers();
     int cache_vm_object_file = 0;
     if (LINUX_ENABLE_FILE_VM_OBJECT_MMAP && file_backed && map_type == MAP_PRIVATE) {
@@ -760,7 +801,7 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
     u64 map_status = (lazy_file || cache_vm_object_file) ? SYSCALL_OK :
         (file_backed ? map_target_pages_chunked(target_va, page_count, map_prot) :
             map_zeroed_target_pages_chunked(target_va, page_count, prot));
-    if (map_status == SYSCALL_ERR_MAP && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) {
+    if (map_status == SYSCALL_ERR_MAP && !fixed_mapping && (flags & MAP_32BIT) == 0) {
         g_mmap_next_va = target_va + size;
         target_va = find_mmap_area(size);
         if (target_va != 0 && linux_user_range_valid(target_va, size)) {

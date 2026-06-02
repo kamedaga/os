@@ -307,6 +307,7 @@ fn applyInitialUserContext(target: kernel.PrincipalId, ctx: *scheduler.ThreadCon
     if (user_context.rip == 0 or user_context.rsp == 0) return boot_static.syscall_err_invalid;
     if (!capability.isUserCanonicalVa(user_context.rip) or !capability.isUserCanonicalVa(user_context.rsp)) return boot_static.syscall_err_invalid;
     if (user_context.fs_base != 0 and !capability.isUserCanonicalVa(user_context.fs_base)) return boot_static.syscall_err_invalid;
+    if (user_context.gs_base != 0 and !capability.isUserCanonicalVa(user_context.gs_base)) return boot_static.syscall_err_invalid;
     _ = target;
     ctx.frame.r15 = user_context.r15;
     ctx.frame.r14 = user_context.r14;
@@ -327,6 +328,7 @@ fn applyInitialUserContext(target: kernel.PrincipalId, ctx: *scheduler.ThreadCon
     ctx.frame.rflags = sanitizeUserRflags(user_context.rflags);
     ctx.frame.rsp = user_context.rsp;
     ctx.fs_base = user_context.fs_base;
+    ctx.gs_base = user_context.gs_base;
     return boot_static.syscall_ok;
 }
 

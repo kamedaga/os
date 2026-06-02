@@ -1,10 +1,12 @@
 const abi_root = @import("kernel_abi_root");
+const capsule_abi = abi_root.capsule_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 const queue_abi = abi_root.queue_abi;
 
 const sc = @import("numbers.zig");
 
 pub fn needsKernelStateLock(nr: u64) bool {
+    if (capsule_abi.isCapsuleSyscall(nr)) return true;
     return switch (nr) {
         sc.syscall_alloc_page,
         sc.syscall_map_page,
@@ -43,6 +45,7 @@ pub fn needsKernelStateLock(nr: u64) bool {
         sc.syscall_copy_from_abi_trap_reply_target,
         sc.syscall_copy_to_abi_trap_reply_target,
         sc.syscall_set_abi_trap_reply_target_fs_base,
+        sc.syscall_set_abi_trap_reply_target_gs_base,
         sc.syscall_protect_abi_trap_reply_target_pages,
         sc.syscall_unmap_abi_trap_reply_target_pages,
         sc.syscall_map_abi_trap_reply_target_vm_object,

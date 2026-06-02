@@ -54,6 +54,7 @@ enum {
     SYSCALL_GRANT_IPC_BUFFER_ON_ENDPOINT = 0x5F,
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_REPLY_ABI_TRAP_TARGET_CONTEXT = 0x64,
+    SYSCALL_SET_ABI_TRAP_REPLY_TARGET_GS_BASE = 0x65,
     SYSCALL_OK = 0,
     SYSCALL_ERR_INVALID = 1,
     SYSCALL_ERR_NOT_READY = 2,
@@ -81,7 +82,7 @@ enum {
     PROCESS_BUILDER_TOKEN_TAG = 0x1000000000000000ULL,
     PROCESS_BUILDER_PROCESS_MASK = 0xFFFFFFFFULL,
     TRAP_MAGIC = 0x3149424150415254ULL,
-    TRAP_VERSION = 1,
+    TRAP_VERSION = 2,
     TRAP_KIND_ABI_SYSCALL = 1,
     TRAP_KIND_PAGE_FAULT = 2,
 
@@ -469,7 +470,10 @@ enum {
     MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED = 1 << 4,
 
     TRAP_RESPONSE_FLAG_EXIT = 1,
+    ARCH_SET_GS = 0x1001,
     ARCH_SET_FS = 0x1002,
+    ARCH_GET_FS = 0x1003,
+    ARCH_GET_GS = 0x1004,
     TCGETS = 0x5401,
     TCSETS = 0x5402,
     TCSETSW = 0x5403,
@@ -749,7 +753,7 @@ struct trap_request {
     u64 magic; unsigned version; unsigned kind; unsigned flavor; unsigned reserved0;
     u64 caller_principal; u64 thread_id; u64 rip; u64 rsp; u64 fault_addr; u64 error_code; u64 nr; u64 args[6];
     u64 r15; u64 r14; u64 r13; u64 r12; u64 r11; u64 r10; u64 r9; u64 r8;
-    u64 rbp; u64 rdi; u64 rsi; u64 rdx; u64 rcx; u64 rbx; u64 rax; u64 rflags; u64 fs_base;
+    u64 rbp; u64 rdi; u64 rsi; u64 rdx; u64 rcx; u64 rbx; u64 rax; u64 rflags; u64 fs_base; u64 gs_base;
 };
 struct abi_trap_user_context {
     u64 flags;
@@ -772,11 +776,12 @@ struct abi_trap_user_context {
     u64 r14;
     u64 r15;
     u64 fs_base;
+    u64 gs_base;
     u64 reserved0;
     u64 reserved1;
 };
 
-_Static_assert(sizeof(struct trap_request) == 264, "trap_request ABI size drift");
+_Static_assert(sizeof(struct trap_request) == 272, "trap_request ABI size drift");
 _Static_assert(OFFSETOF(struct trap_request, magic) == 0x00, "trap_request.magic ABI offset drift");
 _Static_assert(OFFSETOF(struct trap_request, version) == 0x08, "trap_request.version ABI offset drift");
 _Static_assert(OFFSETOF(struct trap_request, kind) == 0x0C, "trap_request.kind ABI offset drift");
@@ -807,8 +812,9 @@ _Static_assert(OFFSETOF(struct trap_request, rbx) == 0xE8, "trap_request.rbx ABI
 _Static_assert(OFFSETOF(struct trap_request, rax) == 0xF0, "trap_request.rax ABI offset drift");
 _Static_assert(OFFSETOF(struct trap_request, rflags) == 0xF8, "trap_request.rflags ABI offset drift");
 _Static_assert(OFFSETOF(struct trap_request, fs_base) == 0x100, "trap_request.fs_base ABI offset drift");
+_Static_assert(OFFSETOF(struct trap_request, gs_base) == 0x108, "trap_request.gs_base ABI offset drift");
 
-_Static_assert(sizeof(struct abi_trap_user_context) == 176, "abi_trap_user_context ABI size drift");
+_Static_assert(sizeof(struct abi_trap_user_context) == 184, "abi_trap_user_context ABI size drift");
 _Static_assert(OFFSETOF(struct abi_trap_user_context, flags) == 0x00, "abi_trap_user_context.flags ABI offset drift");
 _Static_assert(OFFSETOF(struct abi_trap_user_context, rip) == 0x08, "abi_trap_user_context.rip ABI offset drift");
 _Static_assert(OFFSETOF(struct abi_trap_user_context, rsp) == 0x10, "abi_trap_user_context.rsp ABI offset drift");
@@ -829,8 +835,9 @@ _Static_assert(OFFSETOF(struct abi_trap_user_context, r13) == 0x80, "abi_trap_us
 _Static_assert(OFFSETOF(struct abi_trap_user_context, r14) == 0x88, "abi_trap_user_context.r14 ABI offset drift");
 _Static_assert(OFFSETOF(struct abi_trap_user_context, r15) == 0x90, "abi_trap_user_context.r15 ABI offset drift");
 _Static_assert(OFFSETOF(struct abi_trap_user_context, fs_base) == 0x98, "abi_trap_user_context.fs_base ABI offset drift");
-_Static_assert(OFFSETOF(struct abi_trap_user_context, reserved0) == 0xA0, "abi_trap_user_context.reserved0 ABI offset drift");
-_Static_assert(OFFSETOF(struct abi_trap_user_context, reserved1) == 0xA8, "abi_trap_user_context.reserved1 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, gs_base) == 0xA0, "abi_trap_user_context.gs_base ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, reserved0) == 0xA8, "abi_trap_user_context.reserved0 ABI offset drift");
+_Static_assert(OFFSETOF(struct abi_trap_user_context, reserved1) == 0xB0, "abi_trap_user_context.reserved1 ABI offset drift");
 
 struct linux_siginfo {
     i32 si_signo;

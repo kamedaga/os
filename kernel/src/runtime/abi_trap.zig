@@ -95,8 +95,9 @@ fn writeRequest(
     flavor: u32,
     frame: *const TrapFrame,
     fs_base: u64,
+    gs_base: u64,
 ) bool {
-    return writeRequestEx(h, target, request_page_va, caller, thread_id, flavor, @intFromEnum(trap_abi.TrapKind.abi_syscall), 0, 0, frame, fs_base);
+    return writeRequestEx(h, target, request_page_va, caller, thread_id, flavor, @intFromEnum(trap_abi.TrapKind.abi_syscall), 0, 0, frame, fs_base, gs_base);
 }
 
 fn writeRequestEx(
@@ -111,6 +112,7 @@ fn writeRequestEx(
     error_code: u64,
     frame: *const TrapFrame,
     fs_base: u64,
+    gs_base: u64,
 ) bool {
     const version_kind = @as(u64, trap_abi.version) |
         (@as(u64, kind) << 32);
@@ -149,6 +151,7 @@ fn writeRequestEx(
     if (!writeRequestU64(h, target, request_page_va, 0xF0, frame.rax)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0xF8, frame.rflags)) return false;
     if (!writeRequestU64(h, target, request_page_va, 0x100, fs_base)) return false;
+    if (!writeRequestU64(h, target, request_page_va, 0x108, gs_base)) return false;
     return true;
 }
 
@@ -209,6 +212,7 @@ fn trapFrameFromUserContext(ctx: trap_abi.UserContext) ?TrapFrame {
     if (ctx.rip == 0 or ctx.rsp == 0) return null;
     if (!capability.isUserCanonicalVa(ctx.rip) or !capability.isUserCanonicalVa(ctx.rsp)) return null;
     if (ctx.fs_base != 0 and !capability.isUserCanonicalVa(ctx.fs_base)) return null;
+    if (ctx.gs_base != 0 and !capability.isUserCanonicalVa(ctx.gs_base)) return null;
     const frame: TrapFrame = .{
         .r15 = ctx.r15,
         .r14 = ctx.r14,
@@ -298,6 +302,13 @@ pub fn setCurrentReplyTargetFsBase(fs_base: u64) u64 {
     if (fs_base != 0 and !capability.isUserCanonicalVa(fs_base)) return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
     if (!scheduler.setThreadFsBase(target.thread, fs_base)) return boot_static.syscall_err_not_ready;
+    return boot_static.syscall_ok;
+}
+
+pub fn setCurrentReplyTargetGsBase(gs_base: u64) u64 {
+    if (gs_base != 0 and !capability.isUserCanonicalVa(gs_base)) return boot_static.syscall_err_invalid;
+    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
+    if (!scheduler.setThreadGsBase(target.thread, gs_base)) return boot_static.syscall_err_not_ready;
     return boot_static.syscall_ok;
 }
 
@@ -407,6 +418,7 @@ pub fn replyToTargetContext(state: *kernel.KernelState, proc: kernel.PrincipalId
     if (target.ctx.abi_trap_reply_pending and target.ctx.ready) {
         target.ctx.abi_trap_context_frame = frame;
         target.ctx.abi_trap_context_fs_base = user_context.fs_base;
+        target.ctx.abi_trap_context_gs_base = user_context.gs_base;
         target.ctx.abi_trap_context_reply_pending = true;
         target.ctx.signal_pending = true;
         scheduler.setIpcHotSignalPending(target.thread, true);
@@ -417,6 +429,7 @@ pub fn replyToTargetContext(state: *kernel.KernelState, proc: kernel.PrincipalId
     scheduler.prepareBlockedThreadForWake(target.thread);
     target.ctx.frame = frame;
     target.ctx.fs_base = user_context.fs_base;
+    target.ctx.gs_base = user_context.gs_base;
     target.ctx.abi_trap_reply_pending = false;
     target.ctx.abi_trap_context_reply_pending = false;
     target.ctx.signal_pending = false;
@@ -655,6 +668,7 @@ fn deliverDelegateRequestLocked(
         error_code,
         frame,
         current_ctx.fs_base,
+        current_ctx.gs_base,
     )) {
         return boot_static.syscall_err_invalid;
     }

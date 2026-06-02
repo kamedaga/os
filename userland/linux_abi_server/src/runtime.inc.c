@@ -285,6 +285,7 @@ static void fill_user_context_from_request(struct abi_trap_user_context *ctx, co
     ctx->r14 = req->r14;
     ctx->r15 = req->r15;
     ctx->fs_base = req->fs_base;
+    ctx->gs_base = req->gs_base;
 }
 
 static u64 reply_trap_target_context(u64 principal, const struct abi_trap_user_context *ctx) {
@@ -490,6 +491,7 @@ static void reply_vfork_parent_if_any(struct linux_process_state *proc) {
 }
 static u64 set_trap_target_request_page(u64 principal, u64 request_page_va) { return syscall2(SYSCALL_SET_ABI_TRAP_TARGET_REQUEST_PAGE, principal, request_page_va); }
 static u64 set_target_fs_base(u64 fs_base) { return syscall1(SYSCALL_SET_ABI_TRAP_REPLY_TARGET_FS_BASE, fs_base); }
+static u64 set_target_gs_base(u64 gs_base) { return syscall1(SYSCALL_SET_ABI_TRAP_REPLY_TARGET_GS_BASE, gs_base); }
 static u64 detach_reply_token(void) { return syscall0(SYSCALL_DETACH_ABI_TRAP_REPLY_TOKEN); }
 static u64 create_suspended_process(void) { return syscall1(SYSCALL_CREATE_SUSPENDED_PROCESS, 0); }
 static int is_process_builder_token(u64 token) { return (token & PROCESS_BUILDER_TOKEN_TAG) == PROCESS_BUILDER_TOKEN_TAG && (token & PROCESS_BUILDER_PROCESS_MASK) != 0; }

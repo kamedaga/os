@@ -6,6 +6,27 @@ pub const Location = struct {
     function: u8,
 };
 
+pub const pci_resource_id_prefix: u64 = 0x50434900_00000000;
+pub const pci_resource_id_mask: u64 = 0xffffffff_00000000;
+
+pub const bar_flag_io: u64 = 1 << 0;
+pub const bar_flag_mem: u64 = 1 << 1;
+pub const bar_flag_prefetchable: u64 = 1 << 2;
+pub const bar_flag_64bit: u64 = 1 << 3;
+
+pub const BarInfo = struct {
+    start: u64,
+    size: u64,
+    flags: u64,
+
+    pub fn end(self: BarInfo) ?u64 {
+        if (self.size == 0) return null;
+        const value, const overflow = @addWithOverflow(self.start, self.size - 1);
+        if (overflow != 0) return null;
+        return value;
+    }
+};
+
 const config_address_port: u16 = 0xCF8;
 const config_data_port: u16 = 0xCFC;
 
@@ -86,8 +107,117 @@ pub fn readSubsystemId(loc: Location) u16 {
     return readConfigU16(loc, 0x2E);
 }
 
+pub fn readRevisionId(loc: Location) u8 {
+    return readConfigU8(loc, 0x08);
+}
+
+pub fn readProgIf(loc: Location) u8 {
+    return readConfigU8(loc, 0x09);
+}
+
+pub fn readSubclass(loc: Location) u8 {
+    return readConfigU8(loc, 0x0A);
+}
+
+pub fn readClassCode(loc: Location) u8 {
+    return readConfigU8(loc, 0x0B);
+}
+
 pub fn readHeaderType(loc: Location) u8 {
     return readConfigU8(loc, 0x0E);
+}
+
+pub fn resourceIdFromLocation(loc: Location) u64 {
+    return pci_resource_id_prefix |
+        (@as(u64, loc.bus) << 16) |
+        (@as(u64, loc.device) << 8) |
+        @as(u64, loc.function);
+}
+
+pub fn locationFromResourceId(resource_id: u64) ?Location {
+    if ((resource_id & pci_resource_id_mask) != pci_resource_id_prefix) return null;
+    return .{
+        .bus = @intCast((resource_id >> 16) & 0xff),
+        .device = @intCast((resource_id >> 8) & 0xff),
+        .function = @intCast(resource_id & 0xff),
+    };
+}
+
+fn barSizeFromMask32(mask: u32) ?u64 {
+    if (mask == 0) return null;
+    const size = (~mask) +% 1;
+    if (size == 0) return null;
+    return @as(u64, size);
+}
+
+fn barSizeFromMask64(mask: u64) ?u64 {
+    if (mask == 0) return null;
+    const size = (~mask) +% 1;
+    if (size == 0) return null;
+    return size;
+}
+
+pub fn probeBarInfo(loc: Location, bar_index: u8) ?BarInfo {
+    if (bar_index >= 6) return null;
+    if (readVendorId(loc) == 0xFFFF) return null;
+
+    if (bar_index > 0) {
+        const previous_off: u8 = @intCast(0x10 + (bar_index - 1) * 4);
+        const previous = readConfigU32(loc, previous_off);
+        const previous_is_64bit_mem = (previous & 0x1) == 0 and ((previous >> 1) & 0x3) == 0x2;
+        if (previous_is_64bit_mem) return null;
+    }
+
+    const bar_off: u8 = @intCast(0x10 + bar_index * 4);
+    const original = readConfigU32(loc, bar_off);
+    if (original == 0 or original == 0xFFFF_FFFF) return null;
+
+    const command = readConfigU16(loc, 0x04);
+    writeConfigU16(loc, 0x04, command & ~@as(u16, 0x3));
+    defer writeConfigU16(loc, 0x04, command);
+
+    if ((original & 0x1) != 0) {
+        writeConfigU32(loc, bar_off, 0xFFFF_FFFC);
+        const mask = readConfigU32(loc, bar_off) & 0xFFFF_FFFC;
+        writeConfigU32(loc, bar_off, original);
+        const size = barSizeFromMask32(mask) orelse return null;
+        const start = @as(u64, original & 0xFFFF_FFFC);
+        const info: BarInfo = .{ .start = start, .size = size, .flags = bar_flag_io };
+        _ = info.end() orelse return null;
+        return info;
+    }
+
+    const mem_type = (original >> 1) & 0x3;
+    const prefetchable = (original & 0x8) != 0;
+    if (mem_type == 0x2) {
+        if (bar_index >= 5) return null;
+        const original_high = readConfigU32(loc, bar_off + 4);
+        writeConfigU32(loc, bar_off, 0xFFFF_FFFF);
+        writeConfigU32(loc, bar_off + 4, 0xFFFF_FFFF);
+        const mask_low = readConfigU32(loc, bar_off) & 0xFFFF_FFF0;
+        const mask_high = readConfigU32(loc, bar_off + 4);
+        writeConfigU32(loc, bar_off + 4, original_high);
+        writeConfigU32(loc, bar_off, original);
+        const mask = (@as(u64, mask_high) << 32) | @as(u64, mask_low);
+        const size = barSizeFromMask64(mask) orelse return null;
+        const start = (@as(u64, original_high) << 32) | @as(u64, original & 0xFFFF_FFF0);
+        var flags = bar_flag_mem | bar_flag_64bit;
+        if (prefetchable) flags |= bar_flag_prefetchable;
+        const info: BarInfo = .{ .start = start, .size = size, .flags = flags };
+        _ = info.end() orelse return null;
+        return info;
+    }
+
+    writeConfigU32(loc, bar_off, 0xFFFF_FFFF);
+    const mask = readConfigU32(loc, bar_off) & 0xFFFF_FFF0;
+    writeConfigU32(loc, bar_off, original);
+    const size = barSizeFromMask32(mask) orelse return null;
+    const start = @as(u64, original & 0xFFFF_FFF0);
+    var flags = bar_flag_mem;
+    if (prefetchable) flags |= bar_flag_prefetchable;
+    const info: BarInfo = .{ .start = start, .size = size, .flags = flags };
+    _ = info.end() orelse return null;
+    return info;
 }
 
 test "config address encoding" {
@@ -97,4 +227,13 @@ test "config address encoding" {
         .function = 0x04,
     };
     try std.testing.expectEqual(@as(u32, 0x8012_1C20), configAddress(loc, 0x20));
+}
+
+test "PCI resource id encodes location" {
+    const loc = Location{ .bus = 1, .device = 2, .function = 3 };
+    const decoded = locationFromResourceId(resourceIdFromLocation(loc)).?;
+    try std.testing.expectEqual(loc.bus, decoded.bus);
+    try std.testing.expectEqual(loc.device, decoded.device);
+    try std.testing.expectEqual(loc.function, decoded.function);
+    try std.testing.expectEqual(@as(?Location, null), locationFromResourceId(0x1001));
 }

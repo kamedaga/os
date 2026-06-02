@@ -55,6 +55,15 @@ pub fn bindDeviceEvent(owner: kernel.PrincipalId, device: kernel.DmaDeviceId) bo
     return false;
 }
 
+pub fn interruptCountFor(owner: kernel.PrincipalId, device: kernel.DmaDeviceId) ?u64 {
+    if (device == 0) return null;
+    for (&bindings) |*entry| {
+        if (!entry.valid) continue;
+        if (entry.device == device and entry.owner == owner) return entry.interrupts;
+    }
+    return null;
+}
+
 pub fn wakeAllBoundDeviceWaiters() usize {
     interrupt_count +%= 1;
     var woke: usize = 0;

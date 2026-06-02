@@ -30,6 +30,7 @@ enum {
     SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
     SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER = 0x61,
     SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
+    SYSCALL_CAPSULE_GRANT = 0x76,
     SYSCALL_OK = 0,
     PAGE_BYTES = 4096,
     USER_LAYOUT_DEFAULT_LOW_VA = EXEC_USER_LAYOUT_LOW_VA,
@@ -51,6 +52,33 @@ enum {
     PROCESS_BUILDER_PROCESS_MASK = 0xffffffffULL,
     IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
     IPC_BUFFER_TOKEN_MASK = 0x0FFFFFFFFFFFFFFFULL,
+    CAPSULE_TOKEN_MAGIC_MASK = 0xFF00000000000000ULL,
+    CAPSULE_TOKEN_MAGIC_TAG = 0xCA00000000000000ULL,
+    CAPSULE_RIGHT_QUERY = 1ULL << 0,
+    CAPSULE_RIGHT_CONFIG_READ = 1ULL << 1,
+    CAPSULE_RIGHT_CONFIG_WRITE = 1ULL << 2,
+    CAPSULE_RIGHT_BAR_INFO = 1ULL << 3,
+    CAPSULE_RIGHT_BAR_MAP = 1ULL << 4,
+    CAPSULE_RIGHT_DMA_ALLOC = 1ULL << 5,
+    CAPSULE_RIGHT_DMA_MAP_USER = 1ULL << 6,
+    CAPSULE_RIGHT_IRQ_BIND = 1ULL << 7,
+    CAPSULE_RIGHT_BUS_MASTER = 1ULL << 8,
+    CAPSULE_RIGHT_RESET = 1ULL << 9,
+    CAPSULE_RIGHT_POWER = 1ULL << 10,
+    CAPSULE_RIGHT_HOTPLUG_OBSERVE = 1ULL << 11,
+    CAPSULE_RIGHT_CHILD =
+        CAPSULE_RIGHT_QUERY |
+        CAPSULE_RIGHT_CONFIG_READ |
+        CAPSULE_RIGHT_CONFIG_WRITE |
+        CAPSULE_RIGHT_BAR_INFO |
+        CAPSULE_RIGHT_BAR_MAP |
+        CAPSULE_RIGHT_DMA_ALLOC |
+        CAPSULE_RIGHT_DMA_MAP_USER |
+        CAPSULE_RIGHT_IRQ_BIND |
+        CAPSULE_RIGHT_BUS_MASTER |
+        CAPSULE_RIGHT_RESET |
+        CAPSULE_RIGHT_POWER |
+        CAPSULE_RIGHT_HOTPLUG_OBSERVE,
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
     VM_RIGHT_READ_MAP = 0x5,
@@ -164,6 +192,7 @@ static u64 service_last_request_seq;
 static u64 service_interpreter_vm_token;
 static u64 service_interpreter_file_bytes;
 static struct exec_bootstrap_config service_request_config;
+static struct exec_bootstrap_config one_shot_config;
 static u64 source_image_tokens[SOURCE_IMAGE_SLOT_COUNT];
 static u64 source_image_bytes[SOURCE_IMAGE_SLOT_COUNT];
 static u64 source_image_path_bytes[SOURCE_IMAGE_SLOT_COUNT];
@@ -277,6 +306,10 @@ static int is_vm_object_token(u64 token) {
 static int is_process_builder_token(u64 token) {
     return (token & PROCESS_BUILDER_TOKEN_TAG) != 0 &&
         (token & PROCESS_BUILDER_PROCESS_MASK) != 0;
+}
+
+static int is_capsule_token(u64 token) {
+    return (token & CAPSULE_TOKEN_MAGIC_MASK) == CAPSULE_TOKEN_MAGIC_TAG;
 }
 
 static int map_vm_object(u64 token, u64 target_va) {
@@ -1139,6 +1172,95 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
     return 0;
 }
 
+static int env_prefix_match(const struct exec_bootstrap_config *cfg, u64 index, const char *prefix, u64 *value_offset_out, u64 *value_len_out) {
+    if (index >= cfg->envp_count || index >= EXEC_MAX_ENVP) return 0;
+    const u64 offset = cfg->envp_offsets[index];
+    const u64 len = cfg->envp_bytes[index];
+    const u64 prefix_len = cstr_len(prefix);
+    if (len < prefix_len || offset > cfg->arg_data_bytes || len > (u64)cfg->arg_data_bytes - offset) return 0;
+    for (u64 i = 0; i < prefix_len; i++) {
+        if ((char)cfg->arg_data[offset + i] != prefix[i]) return 0;
+    }
+    *value_offset_out = offset + prefix_len;
+    *value_len_out = len - prefix_len;
+    return 1;
+}
+
+static int find_env_value(const struct exec_bootstrap_config *cfg, const char *prefix, u64 *index_out, u64 *value_offset_out, u64 *value_len_out) {
+    for (u64 i = 0; i < cfg->envp_count && i < EXEC_MAX_ENVP; i++) {
+        if (env_prefix_match(cfg, i, prefix, value_offset_out, value_len_out)) {
+            *index_out = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int parse_hex_env_value(const struct exec_bootstrap_config *cfg, u64 value_offset, u64 value_len, u64 *out) {
+    if (value_len < 3 || value_offset > cfg->arg_data_bytes || value_len > (u64)cfg->arg_data_bytes - value_offset) return 0;
+    u64 i = 0;
+    if (value_len >= 2 && cfg->arg_data[value_offset] == '0' && (cfg->arg_data[value_offset + 1] == 'x' || cfg->arg_data[value_offset + 1] == 'X')) {
+        i = 2;
+    }
+    u64 value = 0;
+    for (; i < value_len; i++) {
+        const unsigned char ch = cfg->arg_data[value_offset + i];
+        u64 digit = 0;
+        if (ch >= '0' && ch <= '9') digit = (u64)(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') digit = (u64)(10 + ch - 'a');
+        else if (ch >= 'A' && ch <= 'F') digit = (u64)(10 + ch - 'A');
+        else return 0;
+        value = (value << 4) | digit;
+    }
+    *out = value;
+    return 1;
+}
+
+static int write_hex_env_value(struct exec_bootstrap_config *cfg, u64 value_offset, u64 value_len, u64 value) {
+    if (value_len < 18 || value_offset > cfg->arg_data_bytes || value_len > (u64)cfg->arg_data_bytes - value_offset) return 0;
+    cfg->arg_data[value_offset] = '0';
+    cfg->arg_data[value_offset + 1] = 'x';
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        const unsigned int digit = (unsigned int)((value >> (u64)shift) & 0xFULL);
+        cfg->arg_data[value_offset + 2 + (u64)((60 - shift) / 4)] =
+            (unsigned char)(digit < 10 ? ('0' + digit) : ('a' + digit - 10));
+    }
+    return 1;
+}
+
+static int materialize_capsule_env(struct exec_bootstrap_config *cfg, u64 child_process_slot) {
+    u64 source_index = 0;
+    u64 source_offset = 0;
+    u64 source_len = 0;
+    if (!find_env_value(cfg, "PACHA_EXEC_CAPSULE_SOURCE=", &source_index, &source_offset, &source_len)) return 1;
+    u64 source_token = 0;
+    if (!parse_hex_env_value(cfg, source_offset, source_len, &source_token) || !is_capsule_token(source_token)) {
+        user_log("Exec: capsule source env invalid\n");
+        return 0;
+    }
+
+    u64 kobox_index = 0;
+    u64 kobox_offset = 0;
+    u64 kobox_len = 0;
+    if (!find_env_value(cfg, "KOBOX_PACHAOS_DEVICE_CAPSULE=", &kobox_index, &kobox_offset, &kobox_len)) {
+        user_log("Exec: capsule target env missing\n");
+        return 0;
+    }
+
+    const u64 granted = syscall3(SYSCALL_CAPSULE_GRANT, source_token, child_process_slot, CAPSULE_RIGHT_CHILD);
+    if (!is_capsule_token(granted)) {
+        user_log("Exec: capsule grant failed\n");
+        return 0;
+    }
+    if (!write_hex_env_value(cfg, kobox_offset, kobox_len, granted)) {
+        user_log("Exec: capsule env write failed\n");
+        return 0;
+    }
+    (void)source_index;
+    (void)kobox_index;
+    return 1;
+}
+
 static int map_and_validate_vm_image(u64 vm_token, u64 file_bytes, struct byte_slice cache_path, u64 *source_va_out, u64 *effective_vm_token_out, struct exec_elf_summary *summary_out) {
     u64 effective_vm_token = 0;
     const u64 source_va = map_source_image(vm_token, file_bytes, cache_path, &effective_vm_token);
@@ -1419,7 +1541,7 @@ static int load_elf_image_into_process(
     return init_loaded_image(summary, source_va, file_bytes, load_bias, mapped_count, image_out);
 }
 
-static int prepare_process(const struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *process_token_out, u64 *child_process_slot_out) {
+static int prepare_process(struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *process_token_out, u64 *child_process_slot_out) {
     u64 main_source_va = 0;
     u64 main_vm_token = 0;
     struct exec_elf_summary main_summary;
@@ -1429,6 +1551,11 @@ static int prepare_process(const struct exec_bootstrap_config *cfg, struct loade
     const u64 process_token = create_suspended_process();
     if (process_token == 0) {
         user_log("Exec: create suspended failed\n");
+        return 0;
+    }
+    const u64 child_process_slot = process_slot_from_builder_token(process_token);
+    if (!materialize_capsule_env(cfg, child_process_slot)) {
+        abort_process(process_token);
         return 0;
     }
 
@@ -1491,7 +1618,7 @@ static int prepare_process(const struct exec_bootstrap_config *cfg, struct loade
         return 0;
     }
     *process_token_out = process_token;
-    *child_process_slot_out = process_slot_from_builder_token(process_token);
+    *child_process_slot_out = child_process_slot;
     return 1;
 }
 
@@ -1509,7 +1636,7 @@ static int start_prepared_process(u64 process_token, u64 expected_child_process_
     return 1;
 }
 
-static int prepare_and_start_process(const struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *child_process_slot_out) {
+static int prepare_and_start_process(struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *child_process_slot_out) {
     u64 process_token = 0;
     if (!prepare_process(cfg, image_out, &process_token, child_process_slot_out)) return 0;
     return start_prepared_process(process_token, *child_process_slot_out);
@@ -1758,7 +1885,12 @@ static void run_exec_service(const struct exec_bootstrap_config *cfg) {
 static void run_exec_once(const struct exec_bootstrap_config *cfg) {
     struct loaded_image image;
     u64 child_process_slot = 0;
-    if (!prepare_and_start_process(cfg, &image, &child_process_slot)) {
+    {
+        const volatile unsigned char *src = (const volatile unsigned char *)cfg;
+        volatile unsigned char *dst = (volatile unsigned char *)&one_shot_config;
+        for (u64 i = 0; i < sizeof(one_shot_config); i++) dst[i] = src[i];
+    }
+    if (!prepare_and_start_process(&one_shot_config, &image, &child_process_slot)) {
         user_log("Exec: one-shot launch failed\n");
         process_exit(1);
     }

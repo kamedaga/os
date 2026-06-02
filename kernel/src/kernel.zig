@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const capability = @import("capability.zig");
+pub const capability = @import("capability.zig");
+pub const capsule = @import("capsule.zig");
 const dma_mapping_manager = @import("dma_mapping_manager.zig");
 pub const device_capabilities = @import("device_capabilities.zig");
 pub const initial_process_count: usize = 8;
@@ -90,6 +91,14 @@ pub const Rights = struct {
     dma: bool = false,
     grant: bool = false,
 };
+
+pub const CapsuleKind = capsule.CapsuleKind;
+pub const CapsuleState = capsule.CapsuleState;
+pub const CapsuleRights = capsule.Rights;
+pub const CapsuleMetadata = capsule.Metadata;
+pub const CapsuleSnapshot = capsule.Snapshot;
+pub const CapsuleDmaDirection = capsule.DmaDirection;
+pub const CapsuleIrqKind = capsule.IrqKind;
 
 pub const MapProt = struct {
     read: bool = false,
@@ -205,6 +214,7 @@ pub const KernelError = error{
     TooManyFreePages,
     TooManyFreeRanges,
     OutOfFreePages,
+    CapsuleRevoked,
 };
 
 pub const CNode = struct {
@@ -1108,7 +1118,6 @@ pub const VmObjectBacking = struct {
         if ((paddr & 0xFFF) != 0) return null;
         return paddr;
     }
-
 };
 
 pub const VmObjectCapability = struct {
@@ -1632,6 +1641,7 @@ pub const KernelState = struct {
     iommu_caps: device_capabilities.IommuCapabilityTable = .{},
     queue_caps: device_capabilities.QueueCapabilityTable = .{},
     command_caps: device_capabilities.CommandCapabilityTable = .{},
+    capsules: capsule.CapsuleTable = .{},
     iommu: IommuNoCapDriverState = .{},
     next_cap_id: u64 = 1,
     next_transfer_id: u64 = cap_transfer_id_min,
@@ -1833,6 +1843,16 @@ pub const KernelState = struct {
         return (child_bits & ~parent_bits) == 0;
     }
 
+    fn mapCapsuleError(err: capsule.CapsuleError) KernelError {
+        return switch (err) {
+            error.InvalidState => KernelError.InvalidState,
+            error.TableFull => KernelError.TableFull,
+            error.NotFound => KernelError.CapabilityNotFound,
+            error.Denied => KernelError.InvalidState,
+            error.Revoked => KernelError.CapsuleRevoked,
+        };
+    }
+
     fn processPrincipal(index: usize) PrincipalId {
         return processPrincipalFromIndex(index) orelse unreachable;
     }
@@ -1875,6 +1895,261 @@ pub const KernelState = struct {
         if (!self.process_descriptors[index].active) return KernelError.InvalidState;
     }
 
+    fn requireActivePrincipal(self: *const KernelState, principal: PrincipalId) KernelError!void {
+        if (!self.hasActivePrincipal(principal)) return KernelError.InvalidState;
+    }
+
+    pub fn capsuleCreateRoot(
+        self: *KernelState,
+        owner: PrincipalId,
+        kind: CapsuleKind,
+        rights: CapsuleRights,
+        metadata: CapsuleMetadata,
+    ) KernelError!u64 {
+        try self.requireActivePrincipal(owner);
+        return self.capsules.allocRoot(@intFromEnum(owner), kind, rights, metadata) catch |err| return mapCapsuleError(err);
+    }
+
+    pub fn capsuleDerive(
+        self: *KernelState,
+        owner: PrincipalId,
+        parent_token: u64,
+        kind: CapsuleKind,
+        rights: CapsuleRights,
+        metadata: CapsuleMetadata,
+    ) KernelError!u64 {
+        try self.requireActivePrincipal(owner);
+        return self.capsules.derive(@intFromEnum(owner), parent_token, kind, rights, metadata) catch |err| return mapCapsuleError(err);
+    }
+
+    pub fn capsuleGrant(
+        self: *KernelState,
+        owner: PrincipalId,
+        child: PrincipalId,
+        token: u64,
+        rights: CapsuleRights,
+    ) KernelError!u64 {
+        try self.requireActivePrincipal(owner);
+        try self.requireActivePrincipal(child);
+        return self.capsules.grant(@intFromEnum(owner), @intFromEnum(child), token, rights) catch |err| return mapCapsuleError(err);
+    }
+
+    pub fn capsuleAuthorize(
+        self: *const KernelState,
+        owner: PrincipalId,
+        token: u64,
+        kind: CapsuleKind,
+        required_rights: CapsuleRights,
+    ) KernelError!void {
+        try self.requireActivePrincipal(owner);
+        return self.capsules.authorize(@intFromEnum(owner), token, kind, required_rights) catch |err| return mapCapsuleError(err);
+    }
+
+    pub fn capsuleSnapshot(self: *const KernelState, token: u64) KernelError!CapsuleSnapshot {
+        return self.capsules.snapshot(token) catch |err| return mapCapsuleError(err);
+    }
+
+    pub fn capsuleRevokeSubtree(self: *KernelState, owner: PrincipalId, token: u64) KernelError!usize {
+        try self.requireActivePrincipal(owner);
+        return self.capsules.revokeSubtree(@intFromEnum(owner), token) catch |err| return mapCapsuleError(err);
+    }
+
+    pub fn capsuleCloseSubtree(self: *KernelState, owner: PrincipalId, token: u64) KernelError!usize {
+        try self.requireActivePrincipal(owner);
+        return self.capsules.closeSubtree(@intFromEnum(owner), token) catch |err| return mapCapsuleError(err);
+    }
+
+    pub fn releasePrincipalCapsules(self: *KernelState, owner: PrincipalId) usize {
+        return self.capsules.releaseOwner(@intFromEnum(owner));
+    }
+
+    fn capsuleGrantBitFromParent(parent: CapsuleSnapshot) bool {
+        return parent.rights.grant;
+    }
+
+    fn deviceCapsuleForChild(
+        self: *const KernelState,
+        owner: PrincipalId,
+        device_token: u64,
+        required_rights: CapsuleRights,
+    ) KernelError!CapsuleSnapshot {
+        var effective_rights = required_rights;
+        effective_rights.query = true;
+        try self.capsuleAuthorize(owner, device_token, .device, effective_rights);
+        const device = try self.capsuleSnapshot(device_token);
+        if (device.metadata.device == 0) return KernelError.InvalidState;
+        return device;
+    }
+
+    pub fn deviceCapsuleCreate(
+        self: *KernelState,
+        owner: PrincipalId,
+        device_id: u64,
+        rights: CapsuleRights,
+    ) KernelError!u64 {
+        if (device_id == 0) return KernelError.InvalidState;
+        return self.capsuleCreateRoot(owner, .device, rights, .{ .device = device_id });
+    }
+
+    pub fn deviceCapsuleDeriveMmio(
+        self: *KernelState,
+        owner: PrincipalId,
+        device_token: u64,
+        bar_index: u32,
+        bar_paddr: u64,
+        user_va: u64,
+        size: u64,
+        flags: u32,
+    ) KernelError!u64 {
+        if (bar_paddr == 0 or size == 0) return KernelError.InvalidState;
+        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .bar_map = true });
+        return self.capsuleDerive(owner, device_token, .mmio, .{
+            .query = true,
+            .bar_map = true,
+            .grant = capsuleGrantBitFromParent(device),
+        }, .{
+            .device = device.metadata.device,
+            .object_id = bar_paddr,
+            .user_va = user_va,
+            .size = size,
+            .index = bar_index,
+            .flags = flags,
+        });
+    }
+
+    pub fn deviceCapsuleDeriveDmaBuffer(
+        self: *KernelState,
+        owner: PrincipalId,
+        device_token: u64,
+        user_va: u64,
+        iova: u64,
+        size: u64,
+        flags: u32,
+    ) KernelError!u64 {
+        if (user_va == 0 or iova == 0 or size == 0) return KernelError.InvalidState;
+        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .dma_alloc = true });
+        return self.capsuleDerive(owner, device_token, .dma_buffer, .{
+            .query = true,
+            .dma_alloc = true,
+            .dma_map_user = device.rights.dma_map_user,
+            .grant = capsuleGrantBitFromParent(device),
+        }, .{
+            .device = device.metadata.device,
+            .user_va = user_va,
+            .iova = iova,
+            .size = size,
+            .flags = flags,
+        });
+    }
+
+    pub fn deviceCapsuleDeriveDmaMapping(
+        self: *KernelState,
+        owner: PrincipalId,
+        device_token: u64,
+        user_va: u64,
+        iova: u64,
+        size: u64,
+        direction: CapsuleDmaDirection,
+        flags: u32,
+    ) KernelError!u64 {
+        if (user_va == 0 or iova == 0 or size == 0) return KernelError.InvalidState;
+        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .dma_map_user = true });
+        return self.capsuleDerive(owner, device_token, .dma_mapping, .{
+            .query = true,
+            .dma_map_user = true,
+            .grant = capsuleGrantBitFromParent(device),
+        }, .{
+            .device = device.metadata.device,
+            .user_va = user_va,
+            .iova = iova,
+            .size = size,
+            .flags = flags | (@as(u32, @intFromEnum(direction)) & 0x3),
+        });
+    }
+
+    pub fn dmaBufferCapsuleDeriveMapping(
+        self: *KernelState,
+        owner: PrincipalId,
+        dma_buffer_token: u64,
+        iova: u64,
+        size: u64,
+        direction: CapsuleDmaDirection,
+        flags: u32,
+    ) KernelError!u64 {
+        if (iova == 0 or size == 0) return KernelError.InvalidState;
+        try self.capsuleAuthorize(owner, dma_buffer_token, .dma_buffer, .{ .dma_map_user = true });
+        const buffer = try self.capsuleSnapshot(dma_buffer_token);
+        if (size > buffer.metadata.size) return KernelError.InvalidState;
+        return self.capsuleDerive(owner, dma_buffer_token, .dma_mapping, .{
+            .query = true,
+            .dma_map_user = true,
+            .grant = capsuleGrantBitFromParent(buffer),
+        }, .{
+            .device = buffer.metadata.device,
+            .object_id = dma_buffer_token,
+            .user_va = buffer.metadata.user_va,
+            .iova = iova,
+            .size = size,
+            .flags = flags | (@as(u32, @intFromEnum(direction)) & 0x3),
+        });
+    }
+
+    pub fn deviceCapsuleDeriveIrq(
+        self: *KernelState,
+        owner: PrincipalId,
+        device_token: u64,
+        kind: CapsuleIrqKind,
+        vector: u32,
+        flags: u32,
+    ) KernelError!u64 {
+        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .irq_bind = true });
+        return self.capsuleDerive(owner, device_token, .irq, .{
+            .query = true,
+            .irq_bind = true,
+            .grant = capsuleGrantBitFromParent(device),
+        }, .{
+            .device = device.metadata.device,
+            .index = vector,
+            .flags = flags | ((@as(u32, @intFromEnum(kind)) & 0x3) << 16),
+        });
+    }
+
+    pub fn mmioCapsuleSnapshotForAccess(
+        self: *const KernelState,
+        owner: PrincipalId,
+        token: u64,
+    ) KernelError!CapsuleSnapshot {
+        try self.capsuleAuthorize(owner, token, .mmio, .{ .bar_map = true });
+        return self.capsuleSnapshot(token);
+    }
+
+    pub fn dmaBufferCapsuleSnapshotForAccess(
+        self: *const KernelState,
+        owner: PrincipalId,
+        token: u64,
+    ) KernelError!CapsuleSnapshot {
+        try self.capsuleAuthorize(owner, token, .dma_buffer, .{ .dma_alloc = true });
+        return self.capsuleSnapshot(token);
+    }
+
+    pub fn dmaMappingCapsuleSnapshotForAccess(
+        self: *const KernelState,
+        owner: PrincipalId,
+        token: u64,
+    ) KernelError!CapsuleSnapshot {
+        try self.capsuleAuthorize(owner, token, .dma_mapping, .{ .dma_map_user = true });
+        return self.capsuleSnapshot(token);
+    }
+
+    pub fn irqCapsuleSnapshotForAccess(
+        self: *const KernelState,
+        owner: PrincipalId,
+        token: u64,
+    ) KernelError!CapsuleSnapshot {
+        try self.capsuleAuthorize(owner, token, .irq, .{ .irq_bind = true });
+        return self.capsuleSnapshot(token);
+    }
+
     fn principalStorageIndex(self: *const KernelState, principal: PrincipalId) usize {
         if (processIndexFromPrincipal(principal)) |index| {
             std.debug.assert(self.process_descriptors[index].active);
@@ -1885,6 +2160,8 @@ pub const KernelState = struct {
     }
 
     fn clearPrincipalTablesForReuse(self: *KernelState, index: usize) void {
+        const principal = processPrincipal(index);
+        _ = self.releasePrincipalCapsules(principal);
         self.cap_tables[index].reset();
         self.endpoint_tables[index] = .{};
         self.cap_mailboxes[index].reset();
@@ -1996,6 +2273,7 @@ pub const KernelState = struct {
     pub fn markProcessFaulted(self: *KernelState, principal: PrincipalId, fault_vector: u8) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;
+        _ = self.releasePrincipalCapsules(principal);
         self.process_descriptors[index].active = false;
         self.process_descriptors[index].bootstrap_owner = false;
         self.process_descriptors[index].process_builder_owner = null;
@@ -2013,6 +2291,7 @@ pub const KernelState = struct {
     pub fn markProcessExited(self: *KernelState, principal: PrincipalId) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;
+        _ = self.releasePrincipalCapsules(principal);
         self.process_descriptors[index].active = false;
         self.process_descriptors[index].bootstrap_owner = false;
         self.process_descriptors[index].process_builder_owner = null;
@@ -2030,6 +2309,7 @@ pub const KernelState = struct {
     pub fn removeProcessDescriptor(self: *KernelState, principal: PrincipalId) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         if (!self.process_descriptors[index].active) return false;
+        _ = self.releasePrincipalCapsules(principal);
         self.process_descriptors[index] = .{};
         if (self.active_process_count > 0) self.active_process_count -= 1;
         if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .remove);
@@ -2049,6 +2329,7 @@ pub const KernelState = struct {
             self.vm_object_tables[i].reset();
         }
         resetVmObjectBackingPageStore();
+        self.capsules = .{};
         self.published_service_endpoints = .{};
         i = 0;
         while (i < self.process_descriptors.len) : (i += 1) {

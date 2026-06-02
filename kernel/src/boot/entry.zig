@@ -15,6 +15,7 @@ const serial = @import("../serial.zig");
 const kernel_log = @import("../kernel_log.zig");
 const page_fault_log = @import("../page_fault_log.zig");
 const user_copy = @import("../user_copy.zig");
+const pci = @import("../pci.zig");
 const virtio_probe = @import("../virtio_probe.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
 const pmm = @import("../memory/pmm.zig");
@@ -723,7 +724,7 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
 }
 
 // ---------------------------------------------------------------------------
-// Group 4 — device discovery (virtio probe)
+// Group 4 — device discovery
 // ---------------------------------------------------------------------------
 
 fn discoverDevices() DetectedDevices {
@@ -743,6 +744,8 @@ fn discoverDevices() DetectedDevices {
         });
         descriptor_index += 1;
     }
+
+    appendNvmePciDevices(&result, &descriptor_index);
 
     return result;
 }
@@ -891,11 +894,7 @@ fn noopLog(_: []const u8) void {}
 // ---------------------------------------------------------------------------
 
 fn resourceIdForModernDevice(info: virtio_probe.ModernDeviceInfo) kernel.DmaDeviceId {
-    const loc = info.location;
-    return 0x50434900_00000000 |
-        (@as(u64, loc.bus) << 16) |
-        (@as(u64, loc.device) << 8) |
-        @as(u64, loc.function);
+    return pci.resourceIdFromLocation(info.location);
 }
 
 fn descriptorFromModernDevice(
@@ -932,6 +931,80 @@ fn descriptorFromModernDevice(
         .init_queue_grant_count = 0,
         .init_queue_grants = [_]boot_abi.init_bootstrap_abi.DeviceQueueGrant{.{}} ** boot_abi.init_bootstrap_abi.max_device_queue_grants,
         .init_command_token = 0,
+        .init_device_capsule_token = 0,
+    };
+}
+
+fn appendNvmePciDevices(result: *DetectedDevices, descriptor_index: *usize) void {
+    var bus: u16 = 0;
+    while (bus < 256) : (bus += 1) {
+        var device: u8 = 0;
+        while (device < 32) : (device += 1) {
+            const func0 = pci.Location{
+                .bus = @intCast(bus),
+                .device = device,
+                .function = 0,
+            };
+            if (pci.readVendorId(func0) == 0xFFFF) continue;
+            const header0 = pci.readHeaderType(func0);
+            const function_count: u8 = if ((header0 & 0x80) != 0) 8 else 1;
+            var function: u8 = 0;
+            while (function < function_count) : (function += 1) {
+                const loc = pci.Location{
+                    .bus = @intCast(bus),
+                    .device = device,
+                    .function = function,
+                };
+                const vendor_id = pci.readVendorId(loc);
+                if (vendor_id == 0xFFFF) continue;
+                if (!isNvmePciDevice(loc)) continue;
+                if (descriptor_index.* >= boot_abi.init_bootstrap_abi.max_device_descriptors) return;
+                const resource_id = pci.resourceIdFromLocation(loc);
+                appendDetectedDevice(&result.devices, .{
+                    .descriptor = descriptorFromNvmePciDevice(loc, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index.*), resource_id),
+                    .dma_device = resource_id,
+                });
+                descriptor_index.* += 1;
+            }
+        }
+    }
+}
+
+fn isNvmePciDevice(loc: pci.Location) bool {
+    return pci.readClassCode(loc) == 0x01 and pci.readSubclass(loc) == 0x08;
+}
+
+fn descriptorFromNvmePciDevice(
+    loc: pci.Location,
+    bootstrap_source_va: u64,
+    resource_id: kernel.DmaDeviceId,
+) boot_abi.init_bootstrap_abi.DeviceDescriptor {
+    return .{
+        .transport = @intFromEnum(boot_abi.init_bootstrap_abi.DeviceTransport.nvme_pci),
+        .flags = 0,
+        .bootstrap_source_va = bootstrap_source_va,
+        .vendor_id = pci.readVendorId(loc),
+        .device_id = pci.readDeviceId(loc),
+        .subsystem_id = pci.readSubsystemId(loc),
+        .pci_bus = loc.bus,
+        .pci_device = loc.device,
+        .pci_function = loc.function,
+        .resource_id = resource_id,
+        .queue_count = 0,
+        .common_page_paddr = 0,
+        .notify_page_paddr = 0,
+        .isr_page_paddr = 0,
+        .device_page_paddr = 0,
+        .common_page_offset = 0,
+        .notify_page_offset = 0,
+        .isr_page_offset = 0,
+        .device_page_offset = 0,
+        .notify_off_multiplier = 0,
+        .init_iommu_token = 0,
+        .init_queue_grant_count = 0,
+        .init_queue_grants = [_]boot_abi.init_bootstrap_abi.DeviceQueueGrant{.{}} ** boot_abi.init_bootstrap_abi.max_device_queue_grants,
+        .init_command_token = 0,
+        .init_device_capsule_token = 0,
     };
 }
 
