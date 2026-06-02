@@ -10,10 +10,13 @@ enum {
 enum {
     SYSCALL_MAP_PAGE = 0x2,
     SYSCALL_LOG = 0x9,
+    SYSCALL_ALLOC_MAP_PAGES = 0xC,
+    SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_MAP_VM_OBJECT = 0x28,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
+    SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_GET_PROCESS_STATUS = 0x30,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
@@ -47,7 +50,13 @@ enum {
     SOURCE_IMAGE_PATH_BYTES = 160,
     LINUX_ABI_REQUEST_PAGES_BASE_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
+    EXEC_DEVICE_CATALOG_VA = 0x26700000,
+    EXEC_CHILD_DEVICE_CATALOG_BASE_VA = 0x26800000,
+    DEVICE_CATALOG_MAGIC = 0x44455643,
+    DEVICE_CATALOG_VERSION = 1,
+    DEVICE_CATALOG_MAX_ENTRIES = 23,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
+    VM_RIGHT_READ_MAP_GRANT = 0xD,
     PROCESS_BUILDER_TOKEN_TAG = 1ULL << 60,
     PROCESS_BUILDER_PROCESS_MASK = 0xffffffffULL,
     IPC_BUFFER_TOKEN_TAG = 0xA000000000000000ULL,
@@ -122,6 +131,39 @@ enum {
 struct byte_slice {
     const unsigned char *ptr;
     u64 len;
+};
+
+struct device_catalog_entry {
+    u64 present;
+    u64 kind;
+    u64 vendor_id;
+    u64 device_id;
+    u64 subsystem_id;
+    u64 resource_id;
+    u64 common_page_paddr;
+    u64 notify_page_paddr;
+    u64 isr_page_paddr;
+    u64 device_page_paddr;
+    u64 common_page_offset;
+    u64 notify_page_offset;
+    u64 isr_page_offset;
+    u64 device_page_offset;
+    u64 notify_off_multiplier;
+    u64 iommu_token;
+    u64 queue0_submit_token;
+    u64 queue0_notify_token;
+    u64 queue1_submit_token;
+    u64 queue1_notify_token;
+    u64 command_token;
+    u64 device_capsule_token;
+};
+
+struct device_catalog_page {
+    u64 magic;
+    u64 version;
+    u64 entry_count;
+    u64 reserved0;
+    struct device_catalog_entry entries[DEVICE_CATALOG_MAX_ENTRIES];
 };
 
 struct child_map_tracker {
@@ -1228,7 +1270,182 @@ static int write_hex_env_value(struct exec_bootstrap_config *cfg, u64 value_offs
     return 1;
 }
 
+static int config_execfn_contains(const struct exec_bootstrap_config *cfg, const char *needle) {
+    const u64 needle_len = cstr_len(needle);
+    if (needle_len == 0 || cfg->execfn_offset > cfg->arg_data_bytes ||
+        cfg->execfn_bytes > (u64)cfg->arg_data_bytes - cfg->execfn_offset) {
+        return 0;
+    }
+    for (u64 i = 0; i + needle_len <= cfg->execfn_bytes; i++) {
+        int match = 1;
+        for (u64 j = 0; j < needle_len; j++) {
+            if ((char)cfg->arg_data[cfg->execfn_offset + i + j] != needle[j]) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
+static u64 create_child_device_catalog(
+    const struct device_catalog_page *source,
+    u64 child_process_slot,
+    struct device_catalog_page **out_page
+) {
+    static u64 next_catalog_va = EXEC_CHILD_DEVICE_CATALOG_BASE_VA;
+    if (source == 0 || out_page == 0 ||
+        source->magic != DEVICE_CATALOG_MAGIC || source->version != DEVICE_CATALOG_VERSION) {
+        return 0;
+    }
+
+    const u64 catalog_va = next_catalog_va;
+    next_catalog_va += 4096;
+    u64 catalog_paddr = 0;
+    if (syscall4(SYSCALL_ALLOC_MAP_PAGES, catalog_va, 1, 1, (u64)&catalog_paddr) != SYSCALL_OK || catalog_paddr < 4096) {
+        return 0;
+    }
+
+    struct device_catalog_page *dest = (struct device_catalog_page *)catalog_va;
+    for (u64 i = 0; i < 4096 / sizeof(u64); i++) {
+        ((u64 *)dest)[i] = 0;
+    }
+    dest->magic = DEVICE_CATALOG_MAGIC;
+    dest->version = DEVICE_CATALOG_VERSION;
+
+    u64 count = source->entry_count;
+    if (count > DEVICE_CATALOG_MAX_ENTRIES) count = DEVICE_CATALOG_MAX_ENTRIES;
+    for (u64 i = 0; i < count; i++) {
+        const struct device_catalog_entry *entry = &source->entries[i];
+        if (entry->present == 0 || !is_capsule_token(entry->device_capsule_token)) continue;
+        if (dest->entry_count >= DEVICE_CATALOG_MAX_ENTRIES) break;
+
+        const u64 child_capsule = syscall3(SYSCALL_CAPSULE_GRANT, entry->device_capsule_token, child_process_slot, CAPSULE_RIGHT_CHILD);
+        if (!is_capsule_token(child_capsule)) continue;
+
+        struct device_catalog_entry *child_entry = &dest->entries[dest->entry_count++];
+        const u64 *src_words = (const u64 *)entry;
+        u64 *dst_words = (u64 *)child_entry;
+        for (u64 word = 0; word < sizeof(struct device_catalog_entry) / sizeof(u64); word++) {
+            dst_words[word] = src_words[word];
+        }
+        child_entry->device_capsule_token = child_capsule;
+    }
+    if (dest->entry_count == 0) return 0;
+
+    const u64 local_vm = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, catalog_va, 4096, VM_RIGHT_READ_MAP_GRANT);
+    if (!is_vm_object_token(local_vm)) return 0;
+    if (!map_vm_object(local_vm, catalog_va)) return 0;
+    const u64 child_vm = syscall3(SYSCALL_GRANT_VM_OBJECT, local_vm, child_process_slot, VM_RIGHT_READ_MAP);
+    if (!is_vm_object_token(child_vm)) return 0;
+
+    *out_page = dest;
+    return child_vm;
+}
+
+static struct device_catalog_entry *select_device_catalog_entry(
+    const struct exec_bootstrap_config *cfg,
+    struct device_catalog_page *page
+) {
+    if (page->magic != DEVICE_CATALOG_MAGIC || page->version != DEVICE_CATALOG_VERSION) return 0;
+
+    u64 resource_index = 0;
+    u64 resource_offset = 0;
+    u64 resource_len = 0;
+    if (find_env_value(cfg, "KOBOX_PACHAOS_DEVICE_RESOURCE=", &resource_index, &resource_offset, &resource_len)) {
+        u64 resource_id = 0;
+        if (!parse_hex_env_value(cfg, resource_offset, resource_len, &resource_id)) return 0;
+        for (u64 i = 0; i < page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
+            struct device_catalog_entry *entry = &page->entries[i];
+            if (entry->present != 0 && entry->resource_id == resource_id && is_capsule_token(entry->device_capsule_token)) return entry;
+        }
+        return 0;
+    }
+
+    for (u64 i = 0; i < page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
+        struct device_catalog_entry *entry = &page->entries[i];
+        if (entry->present != 0 && is_capsule_token(entry->device_capsule_token)) return entry;
+    }
+    return 0;
+}
+
+static int materialize_capsule_from_catalog(struct exec_bootstrap_config *cfg, u64 child_process_slot) {
+    u64 catalog_index = 0;
+    u64 catalog_offset = 0;
+    u64 catalog_len = 0;
+    if (!find_env_value(cfg, "PACHA_EXEC_DEVICE_CATALOG=", &catalog_index, &catalog_offset, &catalog_len)) return 1;
+    if (!config_execfn_contains(cfg, "kobox")) return 1;
+
+    u64 catalog_token = 0;
+    if (!parse_hex_env_value(cfg, catalog_offset, catalog_len, &catalog_token) || !is_vm_object_token(catalog_token)) {
+        user_log("Exec: device catalog env invalid\n");
+        return 0;
+    }
+    static u64 mapped_catalog_token;
+    static u64 service_catalog_token;
+    u64 source_catalog_token = catalog_token;
+    if (service_catalog_token != 0 && service_catalog_token != source_catalog_token) {
+        source_catalog_token = service_catalog_token;
+    }
+    if (mapped_catalog_token != source_catalog_token) {
+        if (mapped_catalog_token != 0) {
+            (void)release_vm_object_mapping(mapped_catalog_token, EXEC_DEVICE_CATALOG_VA, 4096);
+            mapped_catalog_token = 0;
+        }
+        if (!map_vm_object(source_catalog_token, EXEC_DEVICE_CATALOG_VA)) {
+            if (service_catalog_token == 0 || service_catalog_token == source_catalog_token) {
+                user_log("Exec: device catalog map failed\n");
+                return 0;
+            }
+            source_catalog_token = service_catalog_token;
+            if (!map_vm_object(source_catalog_token, EXEC_DEVICE_CATALOG_VA)) {
+                user_log("Exec: device catalog source map failed\n");
+                return 0;
+            }
+        }
+        mapped_catalog_token = source_catalog_token;
+    }
+    service_catalog_token = source_catalog_token;
+
+    u64 kobox_index = 0;
+    u64 kobox_offset = 0;
+    u64 kobox_len = 0;
+    if (!find_env_value(cfg, "KOBOX_PACHAOS_DEVICE_CAPSULE=", &kobox_index, &kobox_offset, &kobox_len)) {
+        user_log("Exec: capsule target env missing\n");
+        return 0;
+    }
+
+    struct device_catalog_page *page = (struct device_catalog_page *)EXEC_DEVICE_CATALOG_VA;
+    struct device_catalog_page *child_page = 0;
+    const u64 child_catalog = create_child_device_catalog(page, child_process_slot, &child_page);
+    if (!is_vm_object_token(child_catalog) || child_page == 0) {
+        user_log("Exec: child device catalog create failed\n");
+        return 0;
+    }
+
+    struct device_catalog_entry *entry = select_device_catalog_entry(cfg, child_page);
+    if (entry == 0) {
+        user_log("Exec: device catalog entry missing\n");
+        return 0;
+    }
+
+    if (!write_hex_env_value(cfg, kobox_offset, kobox_len, entry->device_capsule_token)) {
+        user_log("Exec: capsule env write failed\n");
+        return 0;
+    }
+    if (!write_hex_env_value(cfg, catalog_offset, catalog_len, child_catalog)) {
+        user_log("Exec: device catalog env write failed\n");
+        return 0;
+    }
+    (void)catalog_index;
+    (void)kobox_index;
+    return 1;
+}
+
 static int materialize_capsule_env(struct exec_bootstrap_config *cfg, u64 child_process_slot) {
+    if (!materialize_capsule_from_catalog(cfg, child_process_slot)) return 0;
+
     u64 source_index = 0;
     u64 source_offset = 0;
     u64 source_len = 0;

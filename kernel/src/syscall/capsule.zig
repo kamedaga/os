@@ -181,11 +181,36 @@ fn userDmaAddressForRange(proc: kernel.PrincipalId, user_va: u64, size: u64) ?u6
     return first_paddr + offset;
 }
 
-fn cleanupMmioCapsuleMapping(state: *const kernel.KernelState, proc: kernel.PrincipalId, token: u64) void {
-    const snapshot = state.capsuleSnapshot(token) catch return;
+fn snapshotOwner(snapshot: kernel.CapsuleSnapshot) ?kernel.PrincipalId {
+    if (snapshot.owner_principal_raw >= kernel.principal_count) return null;
+    return @enumFromInt(snapshot.owner_principal_raw);
+}
+
+fn cleanupMmioCapsuleMapping(owner: kernel.PrincipalId, snapshot: kernel.CapsuleSnapshot) void {
     if (snapshot.kind != .mmio or snapshot.metadata.user_va == 0 or snapshot.metadata.size == 0) return;
     if (snapshot.metadata.size > @as(u64, std.math.maxInt(usize))) return;
-    _ = user_vm.unmapUserLinearRegion(proc, snapshot.metadata.user_va, @intCast(snapshot.metadata.size));
+    _ = user_vm.unmapUserLinearRegion(owner, snapshot.metadata.user_va, @intCast(snapshot.metadata.size));
+}
+
+fn cleanupCapsuleResource(snapshot: kernel.CapsuleSnapshot) void {
+    const owner = snapshotOwner(snapshot) orelse return;
+    switch (snapshot.kind) {
+        .mmio => cleanupMmioCapsuleMapping(owner, snapshot),
+        .irq => {
+            _ = device_events.releaseDeviceEvent(owner, snapshot.metadata.device);
+        },
+        else => {},
+    }
+}
+
+fn cleanupCapsuleSubtreeResources(state: *const kernel.KernelState, proc: kernel.PrincipalId, token: u64) kernel.KernelError!void {
+    var tokens: [kernel.capsule.CapsuleTable.max_capsules]u64 = undefined;
+    const count = try state.capsuleCollectSubtreeTokens(proc, token, tokens[0..]);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const snapshot = state.capsuleSnapshot(tokens[i]) catch continue;
+        cleanupCapsuleResource(snapshot);
+    }
 }
 
 fn writeCapsuleSnapshot(
@@ -280,8 +305,11 @@ pub fn dispatch(
             const vector = u32Arg(frame.rdx) orelse return sc.syscall_err_invalid;
             const flags = flagsArg(frame.rcx, capsule_abi.irq_known_flags_mask) orelse return sc.syscall_err_invalid;
             const device = pciDeviceSnapshot(state, proc, decoded.token, .{ .irq_bind = true }) catch |err| return capsuleAccessStatus(err);
-            if (!device_events.bindDeviceEvent(proc, device.metadata.device)) return sc.syscall_err_alloc;
-            const child = state.deviceCapsuleDeriveIrq(proc, decoded.token, kind, vector, flags) catch |err| return capsuleAccessStatus(err);
+            if (!device_events.acquireDeviceEvent(proc, device.metadata.device)) return sc.syscall_err_alloc;
+            const child = state.deviceCapsuleDeriveIrq(proc, decoded.token, kind, vector, flags) catch |err| {
+                _ = device_events.releaseDeviceEvent(proc, device.metadata.device);
+                return capsuleAccessStatus(err);
+            };
             return capsule_abi.encodeCapsuleToken(.irq, child);
         },
         sc.syscall_capsule_irq_poll => {
@@ -309,14 +337,14 @@ pub fn dispatch(
         sc.syscall_capsule_revoke => {
             const decoded = decodeCapsuleToken(frame.rdi, null) orelse return sc.syscall_err_invalid;
             state.capsuleAuthorize(proc, decoded.token, kernelCapsuleKindFromAbi(decoded.kind), .{}) catch |err| return capsuleAccessStatus(err);
-            if (decoded.kind == .mmio) cleanupMmioCapsuleMapping(state, proc, decoded.token);
+            cleanupCapsuleSubtreeResources(state, proc, decoded.token) catch |err| return capsuleAccessStatus(err);
             _ = state.capsuleRevokeSubtree(proc, decoded.token) catch |err| return capsuleAccessStatus(err);
             return sc.syscall_ok;
         },
         sc.syscall_capsule_close => {
             const decoded = decodeCapsuleToken(frame.rdi, null) orelse return sc.syscall_err_invalid;
             state.capsuleAuthorize(proc, decoded.token, kernelCapsuleKindFromAbi(decoded.kind), .{}) catch |err| return capsuleAccessStatus(err);
-            if (decoded.kind == .mmio) cleanupMmioCapsuleMapping(state, proc, decoded.token);
+            cleanupCapsuleSubtreeResources(state, proc, decoded.token) catch |err| return capsuleAccessStatus(err);
             _ = state.capsuleCloseSubtree(proc, decoded.token) catch |err| return capsuleAccessStatus(err);
             return sc.syscall_ok;
         },

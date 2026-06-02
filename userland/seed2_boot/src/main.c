@@ -77,7 +77,7 @@ enum {
     INIT_MAX_DEVICE_QUEUE_GRANTS = 4,
     INIT_MAX_BOOT_ARCHIVE_PAGES = 128,
     INIT_DEVICE_TRANSPORT_VIRTIO_PCI_MODERN = 1,
-    INIT_DEVICE_TRANSPORT_NVME_PCI = 2,
+    INIT_DEVICE_TRANSPORT_PCI_FUNCTION = 2,
 
     MANAGER_INIT_MAGIC = 0x4D494248,
     MANAGER_INIT_VERSION = 6,
@@ -235,10 +235,10 @@ enum {
     DEVICE_CATALOG_VERSION = 1,
     DEVICE_CATALOG_TARGET_VA = 0x3C030000,
     DEVICE_CATALOG_READY = 0x44564352,
-    DEVICE_CATALOG_MAX_ENTRIES = 6,
+    DEVICE_CATALOG_MAX_ENTRIES = 23,
     DEVICE_CATALOG_KIND_CONSOLE = 1,
     DEVICE_CATALOG_KIND_NET = 2,
-    DEVICE_CATALOG_KIND_NVME = 3,
+    DEVICE_CATALOG_KIND_PCI_FUNCTION = 3,
 
     ROOT_SEED2_IMAGE_VA = 0x28100000,
     BOOTFS_OBJECT_BASE_VA = 0x28200000,
@@ -538,7 +538,6 @@ static struct manager_config_page g_handoff;
 static struct device_descriptor g_block_device;
 static struct device_descriptor g_console_device;
 static struct device_descriptor g_net_device;
-static struct device_descriptor g_nvme_device;
 static u64 g_next_endpoint_id = NEXT_ENDPOINT_BASE;
 static u64 g_next_bootstrap_source_va = DYNAMIC_BOOTSTRAP_SOURCE_BASE_VA;
 static u64 g_next_inspect_mmio_va = INSPECT_MMIO_BASE_VA;
@@ -1256,6 +1255,8 @@ static int find_block_device(void) {
     return 0;
 }
 
+static void device_catalog_add(struct device_descriptor *device, u64 kind);
+
 static int find_console_device(void) {
     struct init_descriptor_page *page = descriptor_page();
     if (!page) return 0;
@@ -1290,18 +1291,16 @@ static int find_net_device(void) {
     return 0;
 }
 
-static int find_nvme_device(void) {
+static void device_catalog_add_pci_functions(void) {
     struct init_descriptor_page *page = descriptor_page();
-    if (!page) return 0;
+    if (!page) return;
     for (u64 i = 0; i < page->device_count && i < INIT_MAX_DEVICE_DESCRIPTORS; i++) {
         struct device_descriptor *d = &page->devices[i];
         if ((d->flags & INIT_DEVICE_FLAG_PRESENT) == 0) continue;
-        if (d->transport == INIT_DEVICE_TRANSPORT_NVME_PCI && d->init_device_capsule_token != 0) {
-            g_nvme_device = *d;
-            return 1;
-        }
+        if (d->transport != INIT_DEVICE_TRANSPORT_PCI_FUNCTION) continue;
+        if (d->init_device_capsule_token == 0) continue;
+        device_catalog_add(d, DEVICE_CATALOG_KIND_PCI_FUNCTION);
     }
-    return 0;
 }
 
 static int find_block_queue_grant(struct queue_grant *out) {
@@ -1485,11 +1484,7 @@ static u64 ensure_device_catalog(void) {
     } else {
         user_log("[seed2_boot] net catalog entry skipped\n");
     }
-    if (find_nvme_device()) {
-        device_catalog_add(&g_nvme_device, DEVICE_CATALOG_KIND_NVME);
-    } else {
-        user_log("[seed2_boot] nvme catalog entry skipped\n");
-    }
+    device_catalog_add_pci_functions();
     return g_device_catalog_source_va;
 }
 
@@ -1557,7 +1552,7 @@ static int grant_device_catalog_to_child(u64 child_slot) {
         volatile struct device_catalog_entry *entry = &page->entries[i];
         if (entry->present == 0) continue;
         if (!grant_catalog_capsule_to_child(entry, child_slot)) return 0;
-        if (entry->kind == DEVICE_CATALOG_KIND_NVME) continue;
+        if (entry->kind == DEVICE_CATALOG_KIND_PCI_FUNCTION) continue;
         if (!grant_device_mmio_with_grant((struct device_catalog_entry *)entry, child_slot)) return 0;
         if (!fill_catalog_queue_tokens_for_child(entry, child_slot)) return 0;
     }

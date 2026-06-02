@@ -506,8 +506,8 @@ fn copy_dir_all(source_path: &Path, output_path: &Path) -> Result<(), String> {
     for entry in fs::read_dir(source_path)
         .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?
     {
-        let entry =
-            entry.map_err(|err| format!("failed to read {} entry: {err}", source_path.display()))?;
+        let entry = entry
+            .map_err(|err| format!("failed to read {} entry: {err}", source_path.display()))?;
         let source_child = entry.path();
         let output_child = output_path.join(entry.file_name());
         let file_type = entry

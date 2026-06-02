@@ -745,7 +745,7 @@ fn discoverDevices() DetectedDevices {
         descriptor_index += 1;
     }
 
-    appendNvmePciDevices(&result, &descriptor_index);
+    appendGenericPciFunctionDevices(&result, &descriptor_index);
 
     return result;
 }
@@ -893,6 +893,8 @@ fn noopLog(_: []const u8) void {}
 // Helper: generic virtio device export
 // ---------------------------------------------------------------------------
 
+const virtio_vendor_id: u16 = 0x1AF4;
+
 fn resourceIdForModernDevice(info: virtio_probe.ModernDeviceInfo) kernel.DmaDeviceId {
     return pci.resourceIdFromLocation(info.location);
 }
@@ -935,7 +937,7 @@ fn descriptorFromModernDevice(
     };
 }
 
-fn appendNvmePciDevices(result: *DetectedDevices, descriptor_index: *usize) void {
+fn appendGenericPciFunctionDevices(result: *DetectedDevices, descriptor_index: *usize) void {
     var bus: u16 = 0;
     while (bus < 256) : (bus += 1) {
         var device: u8 = 0;
@@ -957,11 +959,11 @@ fn appendNvmePciDevices(result: *DetectedDevices, descriptor_index: *usize) void
                 };
                 const vendor_id = pci.readVendorId(loc);
                 if (vendor_id == 0xFFFF) continue;
-                if (!isNvmePciDevice(loc)) continue;
+                if (!shouldExposeGenericPciFunction(loc, vendor_id)) continue;
                 if (descriptor_index.* >= boot_abi.init_bootstrap_abi.max_device_descriptors) return;
                 const resource_id = pci.resourceIdFromLocation(loc);
                 appendDetectedDevice(&result.devices, .{
-                    .descriptor = descriptorFromNvmePciDevice(loc, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index.*), resource_id),
+                    .descriptor = descriptorFromPciFunction(loc, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index.*), resource_id),
                     .dma_device = resource_id,
                 });
                 descriptor_index.* += 1;
@@ -970,17 +972,19 @@ fn appendNvmePciDevices(result: *DetectedDevices, descriptor_index: *usize) void
     }
 }
 
-fn isNvmePciDevice(loc: pci.Location) bool {
-    return pci.readClassCode(loc) == 0x01 and pci.readSubclass(loc) == 0x08;
+fn shouldExposeGenericPciFunction(loc: pci.Location, vendor_id: u16) bool {
+    if (vendor_id == virtio_vendor_id) return false;
+    if (pci.readClassCode(loc) == 0x06) return false;
+    return true;
 }
 
-fn descriptorFromNvmePciDevice(
+fn descriptorFromPciFunction(
     loc: pci.Location,
     bootstrap_source_va: u64,
     resource_id: kernel.DmaDeviceId,
 ) boot_abi.init_bootstrap_abi.DeviceDescriptor {
     return .{
-        .transport = @intFromEnum(boot_abi.init_bootstrap_abi.DeviceTransport.nvme_pci),
+        .transport = @intFromEnum(boot_abi.init_bootstrap_abi.DeviceTransport.pci_function),
         .flags = 0,
         .bootstrap_source_va = bootstrap_source_va,
         .vendor_id = pci.readVendorId(loc),

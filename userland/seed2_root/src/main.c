@@ -115,10 +115,10 @@ enum {
     DEVICE_CATALOG_MAGIC = 0x44455643,
     DEVICE_CATALOG_VERSION = 1,
     DEVICE_CATALOG_READY = 0x44564352,
-    DEVICE_CATALOG_MAX_ENTRIES = 6,
+    DEVICE_CATALOG_MAX_ENTRIES = 23,
     DEVICE_CATALOG_KIND_CONSOLE = 1,
     DEVICE_CATALOG_KIND_NET = 2,
-    DEVICE_CATALOG_KIND_NVME = 3,
+    DEVICE_CATALOG_KIND_PCI_FUNCTION = 3,
     QUEUE_CAP_TAG_BASE = (1ULL << 62) | (1ULL << 60),
     QUEUE_CAP_KIND_SHIFT = 56,
     QUEUE_CAP_KIND_MASK = 0x0FULL << 56,
@@ -356,6 +356,7 @@ static struct loaded_file g_exec_service_image;
 static u64 g_exec_service_process_slot;
 static u64 g_linux_abi_process_slot;
 static u64 g_linux_abi_config_va;
+static u64 g_exec_device_catalog_vm_token;
 static unsigned char g_loader_page[4096];
 static u32 g_startup_node_count;
 static u32 g_provided_service_count;
@@ -1699,21 +1700,61 @@ static void format_hex_env(const char *prefix, u64 value, char *buf) {
     buf[n] = 0;
 }
 
-static u64 grant_nvme_capsule_to_exec_service(void) {
-    if (g_exec_service_process_slot == 0) return 0;
-    volatile struct device_catalog_entry *entry = find_device_catalog_entry(DEVICE_CATALOG_KIND_NVME);
-    if (!entry || !is_capsule_token(entry->device_capsule_token)) return 0;
-    const u64 granted = syscall3(
-        SYSCALL_CAPSULE_GRANT,
-        entry->device_capsule_token,
-        g_exec_service_process_slot,
-        CAPSULE_RIGHT_EXEC_SERVICE
-    );
-    if (!is_capsule_token(granted)) {
-        user_log_hex("[seed2_root] nvme capsule grant to exec failed=", granted);
+static u64 ensure_exec_device_catalog_vm_object(void) {
+    if (g_exec_device_catalog_vm_token != 0) return g_exec_device_catalog_vm_token;
+    if (g_exec_service_process_slot == 0 || g_device_catalog_va == 0) return 0;
+
+    volatile struct device_catalog_page *source_page = (volatile struct device_catalog_page *)g_device_catalog_va;
+    if (source_page->magic != DEVICE_CATALOG_MAGIC || source_page->version != DEVICE_CATALOG_VERSION) return 0;
+
+    const u64 catalog_paddr = syscall0(SYSCALL_ALLOC_PAGE);
+    if (catalog_paddr < 0x1000) return 0;
+    const u64 catalog_va = map_page_anywhere(catalog_paddr, 1);
+    if (catalog_va < 0x1000) return 0;
+    clear_page(catalog_va);
+
+    volatile struct device_catalog_page *exec_page = (volatile struct device_catalog_page *)catalog_va;
+    exec_page->magic = DEVICE_CATALOG_MAGIC;
+    exec_page->version = DEVICE_CATALOG_VERSION;
+    exec_page->entry_count = 0;
+
+    for (u64 i = 0; i < source_page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
+        volatile struct device_catalog_entry *source = &source_page->entries[i];
+        if (source->present == 0 || source->kind != DEVICE_CATALOG_KIND_PCI_FUNCTION) continue;
+        if (!is_capsule_token(source->device_capsule_token)) continue;
+        if (exec_page->entry_count >= DEVICE_CATALOG_MAX_ENTRIES) break;
+
+        const u64 granted = syscall3(
+            SYSCALL_CAPSULE_GRANT,
+            source->device_capsule_token,
+            g_exec_service_process_slot,
+            CAPSULE_RIGHT_EXEC_SERVICE
+        );
+        if (!is_capsule_token(granted)) {
+            user_log_hex("[seed2_root] device catalog capsule grant to exec failed=", granted);
+            continue;
+        }
+
+        volatile struct device_catalog_entry *dest = &exec_page->entries[exec_page->entry_count++];
+        volatile u64 *dest_words = (volatile u64 *)dest;
+        volatile u64 *source_words = (volatile u64 *)source;
+        for (u64 word = 0; word < sizeof(struct device_catalog_entry) / sizeof(u64); word++) {
+            dest_words[word] = source_words[word];
+        }
+        dest->device_capsule_token = granted;
+    }
+
+    if (exec_page->entry_count == 0) return 0;
+
+    const u64 local_vm = create_vm_object_from_current_pages(catalog_va, 4096, VM_RIGHT_READ_MAP_GRANT);
+    if (!is_vm_object_token(local_vm)) return 0;
+    const u64 remote_vm = syscall3(SYSCALL_GRANT_VM_OBJECT, local_vm, g_exec_service_process_slot, VM_RIGHT_READ_MAP_GRANT);
+    if (!is_vm_object_token(remote_vm)) {
+        user_log_hex("[seed2_root] device catalog vm grant to exec failed=", remote_vm);
         return 0;
     }
-    return granted;
+    g_exec_device_catalog_vm_token = remote_vm;
+    return remote_vm;
 }
 
 static int configure_dash_exec_args(struct exec_bootstrap_config *cfg, const char *path) {
@@ -1736,15 +1777,15 @@ static int configure_dash_exec_args(struct exec_bootstrap_config *cfg, const cha
         if (!append_exec_arg(cfg, &cursor, envp[i], &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
         env_count++;
     }
-    const u64 exec_capsule = grant_nvme_capsule_to_exec_service();
-    if (exec_capsule != 0 && env_count + 2 <= EXEC_MAX_ENVP) {
+    const u64 exec_catalog = ensure_exec_device_catalog_vm_object();
+    if (exec_catalog != 0 && env_count + 2 <= EXEC_MAX_ENVP) {
         char kobox_env[48];
-        char source_env[64];
+        char catalog_env[64];
         format_hex_env("KOBOX_PACHAOS_DEVICE_CAPSULE=", 0, kobox_env);
-        format_hex_env("PACHA_EXEC_CAPSULE_SOURCE=", exec_capsule, source_env);
+        format_hex_env("PACHA_EXEC_DEVICE_CATALOG=", exec_catalog, catalog_env);
         if (!append_exec_arg(cfg, &cursor, kobox_env, &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
         env_count++;
-        if (!append_exec_arg(cfg, &cursor, source_env, &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
+        if (!append_exec_arg(cfg, &cursor, catalog_env, &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
         env_count++;
     }
     cfg->envp_count = env_count;

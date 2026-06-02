@@ -93,7 +93,7 @@ pub const SpawnPageSubject = enum(u64) {
 
 pub const DeviceTransport = enum(u64) {
     virtio_pci_modern = 1,
-    nvme_pci = 2,
+    pci_function = 2,
 };
 
 pub const SpawnPageDescriptor = extern struct {

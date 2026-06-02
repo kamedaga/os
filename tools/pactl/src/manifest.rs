@@ -206,10 +206,11 @@ fn append_directory_publish_entries_inner(
     source_root: &Path,
     current: &Path,
 ) -> Result<(), String> {
-    for entry in
-        fs::read_dir(current).map_err(|err| format!("failed to read {}: {err}", current.display()))?
+    for entry in fs::read_dir(current)
+        .map_err(|err| format!("failed to read {}: {err}", current.display()))?
     {
-        let entry = entry.map_err(|err| format!("failed to read {} entry: {err}", current.display()))?;
+        let entry =
+            entry.map_err(|err| format!("failed to read {} entry: {err}", current.display()))?;
         let path = entry.path();
         let file_type = entry
             .file_type()

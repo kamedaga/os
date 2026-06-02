@@ -318,6 +318,31 @@ pub const CapsuleTable = struct {
         };
     }
 
+    pub fn collectSubtreeTokens(
+        self: *const CapsuleTable,
+        owner_principal_raw: u8,
+        token: u64,
+        out: []u64,
+    ) CapsuleError!usize {
+        const start = self.findByToken(token) orelse return CapsuleError.NotFound;
+        if (start.owner_principal_raw != owner_principal_raw) return CapsuleError.Denied;
+        const root_token = start.root_token;
+        const ancestor_parent = start.parent_token;
+        var count: usize = 0;
+
+        var i: usize = 0;
+        while (i < self.entries.len) : (i += 1) {
+            const entry = self.entries[i];
+            if (!entry.valid) continue;
+            if (entry.root_token != root_token) continue;
+            if (entry.token != token and !isDescendantToken(self.entries[0..], entry.parent_token, token, ancestor_parent)) continue;
+            if (count >= out.len) return CapsuleError.TableFull;
+            out[count] = entry.token;
+            count += 1;
+        }
+        return count;
+    }
+
     pub fn revokeSubtree(self: *CapsuleTable, owner_principal_raw: u8, token: u64) CapsuleError!usize {
         const start = self.findByToken(token) orelse return CapsuleError.NotFound;
         if (start.owner_principal_raw != owner_principal_raw) return CapsuleError.Denied;

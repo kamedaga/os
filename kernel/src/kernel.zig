@@ -1949,6 +1949,16 @@ pub const KernelState = struct {
         return self.capsules.snapshot(token) catch |err| return mapCapsuleError(err);
     }
 
+    pub fn capsuleCollectSubtreeTokens(
+        self: *const KernelState,
+        owner: PrincipalId,
+        token: u64,
+        out: []u64,
+    ) KernelError!usize {
+        try self.requireActivePrincipal(owner);
+        return self.capsules.collectSubtreeTokens(@intFromEnum(owner), token, out) catch |err| return mapCapsuleError(err);
+    }
+
     pub fn capsuleRevokeSubtree(self: *KernelState, owner: PrincipalId, token: u64) KernelError!usize {
         try self.requireActivePrincipal(owner);
         return self.capsules.revokeSubtree(@intFromEnum(owner), token) catch |err| return mapCapsuleError(err);
