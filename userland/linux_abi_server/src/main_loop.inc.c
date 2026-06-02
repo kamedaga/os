@@ -99,14 +99,7 @@ static struct linux_syscall_dispatch_result handle_exit_syscall(const struct tra
         (void)satisfy_pending_waiters_for_child(exiting_pid);
     }
     result.msg = wait_ipc_timeout(1);
-    int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
-    if (!root_exited && g_root_linux_principal_set) {
-        const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);
-        root_exited = (root_status & 0xff) != 1;
-    }
-    if (root_exited && !has_live_linux_process_state() && !has_open_pipe_state() && !has_known_child_slots()) {
-        process_exit(0);
-    }
+    finish_linux_abi_if_root_exited(exiting_principal);
     return result;
 }
 

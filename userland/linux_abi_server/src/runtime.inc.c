@@ -518,8 +518,16 @@ static void exit_trap_target_no_wait(u64 principal) {
     abi_set_reply_target_principal(0);
     const u64 status = reply_trap_target(principal, 0, TRAP_RESPONSE_FLAG_EXIT);
     if (status != SYSCALL_OK) {
-        user_log("LinuxAbiServer: explicit exit reply failed=");
-        user_log_hex_value(status);
+        const u64 process_status = syscall1(SYSCALL_GET_PROCESS_STATUS, principal);
+        if (status != SYSCALL_ERR_ENDPOINT || ((process_status & 0xff) == 1)) {
+            user_log("LinuxAbiServer: explicit exit reply failed principal=");
+            user_log_hex_value(principal);
+            user_log("LinuxAbiServer: explicit exit reply status=");
+            user_log_hex_value(status);
+            user_log("LinuxAbiServer: explicit exit process status=");
+            user_log_hex_value(process_status);
+        }
+        (void)detach_reply_token();
     } else {
         (void)detach_reply_token();
     }

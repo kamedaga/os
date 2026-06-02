@@ -25,22 +25,105 @@ static int has_live_linux_process_state(void) {
     return 0;
 }
 
-static int has_open_pipe_state(void) {
-    for (u64 i = 0; i < PIPE_MAX; i++) {
-        if (!g_pipes[i].used) continue;
-        if (g_pipes[i].read_refs != 0 || g_pipes[i].write_refs != 0 || g_pipes[i].pending_read) return 1;
+static u64 count_live_linux_process_states(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (!g_processes[i].used) continue;
+        if (g_processes[i].exec_pending || g_processes[i].principal == 0) {
+            count++;
+            continue;
+        }
+        const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, g_processes[i].principal);
+        if ((st & 0xff) == 1) count++;
     }
-    return 0;
+    return count;
 }
 
-static int has_known_child_slots(void) {
+static u64 count_open_pipe_states(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < PIPE_MAX; i++) {
+        if (!g_pipes[i].used) continue;
+        if (g_pipes[i].read_refs != 0 || g_pipes[i].write_refs != 0 || g_pipes[i].pending_read) count++;
+    }
+    return count;
+}
+
+static u64 count_known_child_slots(void) {
+    u64 count = 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_processes[i].used) continue;
         for (u64 child = 0; child < LINUX_CHILD_MAX; child++) {
-            if (g_processes[i].child_used[child]) return 1;
+            if (g_processes[i].child_used[child]) count++;
         }
     }
-    return 0;
+    return count;
+}
+
+static u64 count_futex_waiters(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < FUTEX_WAITER_MAX; i++) {
+        if (g_futex_waiters[i].used) count++;
+    }
+    return count;
+}
+
+static u64 count_exit_records(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (g_exit_record_used[i]) count++;
+    }
+    return count;
+}
+
+static u64 count_socket_refs(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < SOCKET_REF_MAX; i++) {
+        if (g_socket_refs[i].used || g_socket_refs[i].refs != 0 || g_socket_refs[i].token != 0) count++;
+    }
+    return count;
+}
+
+static u64 linux_cleanup_residual_count(void) {
+    return count_live_linux_process_states() +
+        count_open_pipe_states() +
+        count_known_child_slots() +
+        count_futex_waiters() +
+        count_exit_records() +
+        count_socket_refs();
+}
+
+static void log_linux_cleanup_residuals(const char *label) {
+    user_log("LinuxAbiServer: residual cleanup label=");
+    user_log(label);
+    user_log("\n");
+    user_log("LinuxAbiServer: residual live_processes=");
+    user_log_hex_value(count_live_linux_process_states());
+    user_log("LinuxAbiServer: residual pipes=");
+    user_log_hex_value(count_open_pipe_states());
+    user_log("LinuxAbiServer: residual child_slots=");
+    user_log_hex_value(count_known_child_slots());
+    user_log("LinuxAbiServer: residual futex_waiters=");
+    user_log_hex_value(count_futex_waiters());
+    user_log("LinuxAbiServer: residual exit_records=");
+    user_log_hex_value(count_exit_records());
+    user_log("LinuxAbiServer: residual socket_refs=");
+    user_log_hex_value(count_socket_refs());
+}
+
+static void finish_linux_abi_if_root_exited(u64 exiting_principal) {
+    int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
+    if (!root_exited && g_root_linux_principal_set) {
+        const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);
+        root_exited = (root_status & 0xff) != 1;
+    }
+    if (!root_exited || has_live_linux_process_state()) return;
+
+    const u64 residuals = linux_cleanup_residual_count();
+    if (residuals == 0) {
+        process_exit(0);
+    }
+    log_linux_cleanup_residuals("root-exit");
+    process_exit(2);
 }
 
 static int wait_pid_matches_child(i64 pid, u64 child_slot) {
@@ -252,14 +335,7 @@ static struct ipc_message terminate_current_linux_process_from_trap(
         msg = reply_current_token(reply_result, reply_flags);
     }
 
-    int root_exited = g_root_linux_principal_set && exiting_principal == g_root_linux_principal;
-    if (!root_exited && g_root_linux_principal_set) {
-        const u64 root_status = syscall1(SYSCALL_GET_PROCESS_STATUS, g_root_linux_principal);
-        root_exited = (root_status & 0xff) != 1;
-    }
-    if (root_exited && !has_live_linux_process_state() && !has_open_pipe_state() && !has_known_child_slots()) {
-        process_exit(0);
-    }
+    finish_linux_abi_if_root_exited(exiting_principal);
     return msg;
 }
 

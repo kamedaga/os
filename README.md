@@ -1,24 +1,44 @@
 # PachaOS
 
-Capability-based pure microkernel OS written in Zig.
+> Capability-based pure microkernel OS written in Zig — Linux ABI compatible, userland-first.
 
-musl libc と動的リンクにより、既存の Linux エコシステムとの互換を目指す。
+![Zig](https://img.shields.io/badge/kernel-Zig-f7a41d?style=flat-square&logo=zig)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-x86__64-lightgrey?style=flat-square)
+![Status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)
+![Linux ABI](https://img.shields.io/badge/Linux%20ABI-compatible-brightgreen?style=flat-square&logo=linux)
+
+既存の Linux エコシステムとの互換を目指すマイクロカーネル。
+
+---
 
 ## Features
 
-- **Pure microkernel** — カーネルは capability 管理・スケジューリング・trap delegation のみを担当
-- **Trap delegation** — Linux syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーが処理
-- **Hardware capabilities** — capsuleを用いた、DMA バッファ・IOMMU マッピング・Virtqueue を capability として抽象化
-- **Linux ABI compatibility** — 無改造の musl libc を動的リンクでロードし、ユーザーランドで Linux syscall を処理
-- **Userland drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
-- **x86_64 support** — x86_64のみに対応 いずれAArch64に対応予定
-## Design
+- **Pure Microkernel** — カーネルは capability 管理・スケジューリング・trap delegation のみを担当
+- **Trap Delegation** — Linux syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーが処理
+- **Hardware Capabilities** — capsule を用いた、DMA バッファ・IOMMU マッピング・Virtqueue の capability 抽象化
+- **Linux ABI Compatibility** — 無改造の musl libc を動的リンクでロードし、Linux syscall をユーザーランドで処理
+- **Userland Drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
+- **x86_64** — x86_64 対応。AArch64 は今後対応予定
 
-カーネルは Linux syscall の意味を持たない。
+## Tech Stack
 
-カーネルの設計目標は 20,000 行以下。Lean 4 形式検証目標。
+| Layer | Language | Detail |
+|---|---|---|
+| Kernel | Zig | Freestanding / UEFI boot / x86_64 |
+| Userland | C / CMake | musl libc / ELF loader / Linux ABI server |
 
-## python3 OS上で動作 
+---
+
+## Linux Applications
+
+Trap delegation により、無改造の Linux バイナリがそのまま動作します。  
+musl ビルドで確認済み（glibc も動作）。
+
+`Python 3` &nbsp; `Vim` &nbsp; `Clang` &nbsp; `apk` &nbsp; `nano` &nbsp; `Lua` &nbsp; `W3M`
+
+### Python3 on PachaOS
+
 ```pycon
 Python 3.12.13 (main, Apr 10 2026, 14:16:05) [GCC 14.2.0] on linux
 Type "help", "copyright", "credits" or "license" for more information.
@@ -28,8 +48,9 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 >>>
 ```
 
-## OS上でclangを用いたコンパイル
-```dash
+### apk + clang on PachaOS
+
+```sh
 # apk add nano
 fetch http://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz
 fetch http://dl-cdn.alpinelinux.org/alpine/v3.22/community/x86_64/APKINDEX.tar.gz
@@ -39,8 +60,10 @@ fetch http://dl-cdn.alpinelinux.org/alpine/v3.22/community/x86_64/APKINDEX.tar.g
 OK: 464 MiB in 28 packages
 # nano main.c
 ```
+
 ![nano editing main.c](assets/nano-screenshot.png)
-```dash
+
+```sh
 # clang main.c
 # ls
 a.out  main.c
@@ -48,13 +71,23 @@ a.out  main.c
 hello world
 ```
 
+---
 
-## Tech Stack
+## kobox — Linux Kernel Driver Runtime
 
-| Layer | Language | Note |
-|---|---|---|
-| Kernel | Zig | Freestanding, UEFI boot, x86_64 |
-| Userland | C / CMake | musl libc, ELF loader, ABI server |
+[![kobox](https://img.shields.io/badge/kobox-GitHub-black?style=flat-square&logo=github)](https://github.com/kamedaga/kobox)
+
+[kobox](https://github.com/kamedaga/kobox) は Linux カーネル向けドライバ (`.ko`) をユーザーランドプロセスとして直接実行するランタイムです。  
+バックエンドを実装することで任意の OS に対応でき、PachaOS では独自 Capsule を用いて動作します。
+
+**PachaOS Capsule バックエンドで動作中:**
+
+| Driver | Module |
+|---|---|
+| NVMe | `nvme.ko` / `nvme-core.ko` |
+| USB Storage | `usbcore.ko` / `usb-storage.ko` / `xhci-hcd.ko` |
+
+---
 
 ## Build
 
@@ -62,17 +95,12 @@ hello world
 pactl setup full
 pactl run
 ```
-・[ビルド方法](pacha_docs/build.md) : 細かいビルドの方法や、動作確認されたバージョンなど
 
-## Status
+詳細は [ビルドガイド](pacha_docs/build.md) を参照してください（動作確認済みバージョン・依存関係など）。
 
-Kernel は安定動作。ユーザー空間 ELF ローダー・動的リンカがマルチコアで動作し、apkからパッケージを追加して動いています。(nano, w3m, cpython, lua, vimなど)
-
-また、muslだけでなく、musl変換レイヤーを介さずglibcの実行ファイルでhello, worldも成功してる。
-
+---
 
 ## License
 
-CapabilityOS source code is licensed under the MIT License. Included or
-generated third-party runtime components are documented in
-[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+PachaOS source code is licensed under the **MIT License**.  
+Third-party runtime components are documented in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
