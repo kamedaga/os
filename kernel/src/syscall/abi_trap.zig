@@ -50,6 +50,15 @@ pub fn dispatch(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *Tr
         sc.syscall_set_abi_trap_target_request_page => {
             return abi_trap_runtime.setTargetRequestPage(state, proc, frame.rdi, frame.rsi);
         },
+        sc.syscall_share_abi_trap_reply_target_pages_to_target => {
+            return abi_trap_runtime.shareCurrentReplyTargetPagesToTarget(state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10);
+        },
+        sc.syscall_protect_abi_trap_target_pages => {
+            return abi_trap_runtime.protectTargetPages(state, proc, frame.rdi, frame.rsi, frame.rdx, frame.r10);
+        },
+        sc.syscall_unmap_abi_trap_target_pages => {
+            return abi_trap_runtime.unmapTargetPages(state, proc, frame.rdi, frame.rsi, frame.rdx);
+        },
         else => null,
     };
 }

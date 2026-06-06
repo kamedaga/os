@@ -1,5 +1,5 @@
 static int fd_clone_into(u64 dst, u64 src, u32 descriptor_flags) {
-    if (!fd_valid(src) || dst >= 32) return 0;
+    if (!fd_valid(src) || dst >= LINUX_FD_MAX) return 0;
     copy_fd_entry(&g_fds[dst], &g_fds[src]);
     g_fds[dst].fd_flags = (u32)((g_fds[dst].fd_flags & O_NONBLOCK) | descriptor_flags);
     if (fd_entry_is_pipe(&g_fds[dst])) g_prof.pipe_dup_refs++;
@@ -10,8 +10,8 @@ static int fd_clone_into(u64 dst, u64 src, u32 descriptor_flags) {
 }
 
 static int alloc_fd_at_least(u64 min_fd) {
-    if (min_fd >= 32) return -1;
-    for (u64 i = min_fd; i < 32; i++) if (g_fds[i].kind == FD_UNUSED) return (int)i;
+    if (min_fd >= LINUX_FD_MAX) return -1;
+    for (u64 i = min_fd; i < LINUX_FD_MAX; i++) if (g_fds[i].kind == FD_UNUSED) return (int)i;
     return -1;
 }
 
@@ -185,7 +185,7 @@ static struct ipc_message handle_dup(const struct trap_request *req) {
 static struct ipc_message handle_dup2_like(const struct trap_request *req, int dup3) {
     const u64 oldfd = req->args[0]; const u64 newfd = req->args[1];
     const u64 flags = dup3 ? req->args[2] : 0;
-    if (newfd >= 32) return reply(errno_badf(), 0);
+    if (newfd >= LINUX_FD_MAX) return reply(errno_badf(), 0);
     if (!fd_valid(oldfd)) return reply(errno_badf(), 0);
     if ((flags & ~(u64)O_CLOEXEC) != 0) return reply(errno_inval(), 0);
     if (dup3 && oldfd == newfd) return reply(errno_inval(), 0);

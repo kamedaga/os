@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_url=${KOBOX_REPO_URL:-https://github.com/kamedaga/kobox.git}
 repo_ref=${KOBOX_REF:-main}
+source_dir=${KOBOX_SOURCE_DIR:-}
 src_dir=.artifacts/src/kobox
 build_dir=.artifacts/cmake/kobox
 out_dir=.artifacts/userland-fixtures/kobox
@@ -12,7 +13,15 @@ uapi_dir=$tool_dir/kobox-linux-uapi
 
 mkdir -p .artifacts/src "$out_dir" "$tool_dir"
 
-if [ ! -d "$src_dir/.git" ]; then
+if [ -z "$source_dir" ] && [ -e "$src_dir" ] && [ ! -d "$src_dir/.git" ] && [ -f _kobox/CMakeLists.txt ]; then
+  source_dir=$PWD/_kobox
+fi
+
+if [ -n "$source_dir" ]; then
+  rm -rf "$src_dir"
+  mkdir -p "$src_dir"
+  (cd "$source_dir" && tar --exclude=.git --exclude=.artifacts -cf - .) | (cd "$src_dir" && tar -xf -)
+elif [ ! -d "$src_dir/.git" ]; then
   if [ -e "$src_dir" ]; then
     echo "$src_dir exists but is not a git checkout" >&2
     exit 1
@@ -20,11 +29,15 @@ if [ ! -d "$src_dir/.git" ]; then
   git clone "$repo_url" "$src_dir"
 fi
 
-git -C "$src_dir" remote set-url origin "$repo_url"
-git -C "$src_dir" fetch --depth 1 origin "$repo_ref"
-git -C "$src_dir" checkout --force --detach FETCH_HEAD
-git -C "$src_dir" clean -fdx
-git -C "$src_dir" rev-parse HEAD > "$out_dir/kobox.commit"
+if [ -z "$source_dir" ]; then
+  git -C "$src_dir" remote set-url origin "$repo_url"
+  git -C "$src_dir" fetch --depth 1 origin "$repo_ref"
+  git -C "$src_dir" checkout --force --detach FETCH_HEAD
+  git -C "$src_dir" clean -fdx
+  git -C "$src_dir" rev-parse HEAD > "$out_dir/kobox.commit"
+else
+  printf 'local:%s\n' "$source_dir" > "$out_dir/kobox.commit"
+fi
 
 if ! command -v clang >/dev/null 2>&1; then
   echo "missing clang in WSL" >&2

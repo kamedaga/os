@@ -258,6 +258,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_SYSINFO: msg = handle_sysinfo(req); break;
         case LINUX_SYS_CLOCK_GETTIME: msg = handle_clock_gettime(req); break;
         case LINUX_SYS_CLOCK_GETRES: msg = handle_clock_getres(req); break;
+        case LINUX_SYS_PAUSE: msg = handle_pause_syscall(req); break;
         case LINUX_SYS_NANOSLEEP: msg = handle_nanosleep(req); break;
         case LINUX_SYS_CLOCK_NANOSLEEP: msg = handle_clock_nanosleep(req); break;
         case LINUX_SYS_SETITIMER: msg = handle_setitimer(req); break;
@@ -281,6 +282,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_RT_SIGPROCMASK: msg = handle_rt_sigprocmask(req); break;
         case LINUX_SYS_RT_SIGRETURN: msg = handle_rt_sigreturn(req); break;
         case LINUX_SYS_RT_SIGTIMEDWAIT: msg = handle_rt_sigtimedwait(req); break;
+        case LINUX_SYS_RT_SIGSUSPEND: msg = handle_rt_sigsuspend(req); break;
         case LINUX_SYS_SIGALTSTACK: msg = handle_sigaltstack(req); break;
         case LINUX_SYS_SET_TID_ADDRESS: msg = handle_set_tid_address(req); break;
         case LINUX_SYS_FUTEX: msg = handle_futex(req); break;

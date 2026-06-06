@@ -1037,7 +1037,7 @@ static struct ipc_message handle_lseek(const struct trap_request *req) {
 
 static struct ipc_message handle_close(const struct trap_request *req) {
     const u64 fd = req->args[0];
-    if (fd >= 32 || g_fds[fd].kind == FD_UNUSED) return reply(errno_badf(), 0);
+    if (fd >= LINUX_FD_MAX || g_fds[fd].kind == FD_UNUSED) return reply(errno_badf(), 0);
     int close_error = 0;
     if (g_fds[fd].kind == FD_FILE && (g_fds[fd].fd_flags & O_ACCMODE) != O_RDONLY && g_fds[fd].token != 0) {
         if (!vfs_request(FS_OP_CLOSE, g_fds[fd].token, 0, 0, 0)) {

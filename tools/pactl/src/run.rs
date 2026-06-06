@@ -1,5 +1,6 @@
 use crate::build::planned_artifact_path;
 use crate::config::{app_is_skipped, discover_apps, WorkspaceConfig};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -354,6 +355,8 @@ fn build_wsl_script(
         serial_backend,
     ];
     append_display_devices(&mut qemu_parts, options.display);
+    append_optional_usb_mouse(&mut qemu_parts, options.display);
+    append_optional_qmp(&mut qemu_parts)?;
     append_console_device(&mut qemu_parts, options.console);
     append_network_device(&mut qemu_parts);
     if options.kvm {
@@ -634,10 +637,45 @@ fn append_display_devices(qemu_parts: &mut Vec<String>, backend: DisplayBackend)
             qemu_parts.push("-device virtio-vga-gl,xres=1920,yres=1080".to_string());
             qemu_parts.push("-device virtio-tablet-pci".to_string());
             qemu_parts.push("-device virtio-keyboard-pci".to_string());
+            qemu_parts.push("-device usb-mouse,bus=xhci0.0".to_string());
         }
         DisplayBackend::None => {
             qemu_parts.push("-display none".to_string());
         }
+    }
+}
+
+fn append_optional_usb_mouse(qemu_parts: &mut Vec<String>, backend: DisplayBackend) {
+    if backend == DisplayBackend::Gtk || !env_flag_enabled("PACHAOS_QEMU_USB_MOUSE") {
+        return;
+    }
+    qemu_parts.push("-device usb-mouse,bus=xhci0.0".to_string());
+}
+
+fn append_optional_qmp(qemu_parts: &mut Vec<String>) -> Result<(), String> {
+    let Some(port_text) = env::var("PACHAOS_QEMU_QMP_PORT").ok() else {
+        return Ok(());
+    };
+    let port_text = port_text.trim();
+    if port_text.is_empty() || port_text == "0" {
+        return Ok(());
+    }
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|_| format!("invalid PACHAOS_QEMU_QMP_PORT: {port_text}"))?;
+    qemu_parts.push(format!(
+        "-qmp tcp:127.0.0.1:{port},server=on,wait=off"
+    ));
+    Ok(())
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        }
+        Err(_) => false,
     }
 }
 
@@ -715,6 +753,8 @@ fn build_wsl_pf_check_script(
         "-serial stdio".to_string(),
     ];
     append_display_devices(&mut qemu_parts, options.display);
+    append_optional_usb_mouse(&mut qemu_parts, options.display);
+    append_optional_qmp(&mut qemu_parts)?;
     append_console_device(&mut qemu_parts, options.console);
     append_network_device(&mut qemu_parts);
     if options.kvm {

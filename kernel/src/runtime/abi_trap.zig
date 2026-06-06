@@ -390,6 +390,24 @@ pub fn copyFromTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, targ
     return copyBetweenPrincipals(h, target.proc, src_target_va, proc, dst_current_va, len_u64);
 }
 
+fn teardownTrapTargetProcess(h: *const Hooks, target_proc: kernel.PrincipalId, target_thread: usize) void {
+    _ = scheduler.releaseThreadSlot(target_thread);
+    h.state.releasePrincipalPageCaps(target_proc, h.free_list);
+    if (kernel.processIndexFromPrincipal(target_proc)) |process_index| {
+        if (process_index < h.user_spaces.len) {
+            h.user_spaces[process_index] = .{};
+        }
+        h.state.releasePrincipalVmObjectCaps(target_proc, h.free_list);
+        h.state.cap_tables[process_index].reset();
+        h.state.endpoint_tables[process_index] = .{};
+        h.state.cap_mailboxes[process_index] = .{};
+        h.state.pending_page_transfers[process_index] = null;
+        h.state.vm_object_tables[process_index].reset();
+    }
+    _ = h.state.unpublishServiceEndpointsForTarget(target_proc);
+    _ = h.state.markProcessExited(target_proc);
+}
+
 pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, result: u64, flags: u64) u64 {
     var h_storage = hooksForState(state);
     const h = &h_storage;
@@ -397,9 +415,7 @@ pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, targe
     const target = resolveTarget(h, proc, target_raw, if (exit_response) .exit_response else .deferred_reply) orelse
         return boot_static.syscall_err_endpoint;
     if (exit_response) {
-        _ = scheduler.releaseThreadSlot(target.thread);
-        _ = h.state.markProcessExited(target.proc);
-        h.state.releasePrincipalPageCaps(target.proc, h.free_list);
+        teardownTrapTargetProcess(h, target.proc, target.thread);
         return boot_static.syscall_ok;
     }
     return ipc.deliverOrQueueMessageToThread(target.thread, 0, scheduler.currentThreadIndex(), false, result, flags, 0, 0);
@@ -472,6 +488,42 @@ fn pageBatchByteLen(target_va: u64, page_count: u64) ?usize {
     if ((target_va & 0xFFF) != 0) return null;
     if (page_count == 0 or page_count > boot_static.syscall_batch_max_pages) return null;
     return @intCast(page_count * 4096);
+}
+
+const PaddrMappedContext = struct {
+    paddr: u64,
+    found: bool = false,
+};
+
+fn paddrStillMappedVisitor(context: *anyopaque, page: user_vm.MappedUserPage) bool {
+    const state: *PaddrMappedContext = @ptrCast(@alignCast(context));
+    if (page.paddr == state.paddr) {
+        state.found = true;
+        return false;
+    }
+    return true;
+}
+
+fn userPaddrStillMapped(principal: kernel.PrincipalId, paddr: u64) bool {
+    var context = PaddrMappedContext{ .paddr = paddr };
+    _ = user_vm.forEachUserMappedPage(principal, &context, paddrStillMappedVisitor);
+    return context.found;
+}
+
+fn dropUnmappedSharedCapIfUnused(h: *const Hooks, target: kernel.PrincipalId, paddr: u64) void {
+    if (userPaddrStillMapped(target, paddr)) return;
+    const cap = h.state.getTableConst(target).find(paddr) orelse return;
+    if (cap.cap_id == cap.root_cap_id and cap.parent_cap_id == 0) return;
+    _ = h.state.getTable(target).removeByPaddr(paddr);
+}
+
+fn sharedRightsForProt(prot: kernel.MapProt) kernel.Rights {
+    return .{
+        .cpu_read = true,
+        .cpu_write = prot.write,
+        .dma = false,
+        .grant = false,
+    };
 }
 
 pub fn mapPagesToCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, page_count: u64, prot_bits: u64) u64 {
@@ -569,6 +621,79 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
     }
     for (paddrs[0..@intCast(collected)]) |paddr| {
         h.state.reclaimExclusiveRootPage(target.proc, paddr, h.free_list) catch {};
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn shareCurrentReplyTargetPagesToTarget(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    target_raw: u64,
+    target_va: u64,
+    page_count: u64,
+    prot_bits: u64,
+) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    _ = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
+    const source = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
+    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    if (source.proc == target.proc) return boot_static.syscall_ok;
+
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const va = target_va + page_index * 4096;
+        const paddr = capability.lookupUserMappedPaddrForVa(source.proc, va) orelse return boot_static.syscall_err_map;
+        h.state.deriveCapForSharedAddressSpace(source.proc, target.proc, paddr, sharedRightsForProt(prot)) catch |err| switch (err) {
+            kernel.KernelError.TableFull => return boot_static.syscall_err_alloc,
+            else => return boot_static.syscall_err_grant,
+        };
+        if (!user_vm.mapUserLinearRegionWithProt(target.proc, va, paddr, 4096, prot)) {
+            return boot_static.syscall_err_map;
+        }
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn protectTargetPages(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    target_raw: u64,
+    target_va: u64,
+    page_count: u64,
+    prot_bits: u64,
+) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
+    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    if (!user_vm.protectUserLinearRegionWithProt(target.proc, target_va, byte_len, prot)) {
+        return boot_static.syscall_err_map;
+    }
+    return boot_static.syscall_ok;
+}
+
+pub fn unmapTargetPages(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    target_raw: u64,
+    target_va: u64,
+    page_count: u64,
+) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
+    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
+    const collected = user_vm.collectUserLinearRegionPaddrs(target.proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
+    if (collected != page_count) return boot_static.syscall_err_map;
+    if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) {
+        return boot_static.syscall_err_map;
+    }
+    for (paddrs[0..@intCast(collected)]) |paddr| {
+        dropUnmappedSharedCapIfUnused(h, target.proc, paddr);
     }
     return boot_static.syscall_ok;
 }

@@ -3,6 +3,7 @@ const abi_root = @import("kernel_abi_root");
 const capsule_abi = abi_root.capsule_abi;
 const capability = @import("../capability.zig");
 const device_events = @import("../device_events.zig");
+const dma_translation = @import("../dma_translation.zig");
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
 const pci = @import("../pci.zig");
@@ -82,6 +83,12 @@ fn parseDmaDirection(value: u64) ?kernel.CapsuleDmaDirection {
 fn parseIrqKind(value: u64) ?kernel.CapsuleIrqKind {
     if (value > @as(u64, std.math.maxInt(u2))) return null;
     return std.meta.intToEnum(kernel.CapsuleIrqKind, @as(u2, @intCast(value))) catch null;
+}
+
+fn irqKindFromSnapshot(snapshot: kernel.CapsuleSnapshot) ?kernel.CapsuleIrqKind {
+    if (snapshot.kind != .irq) return null;
+    const raw = (snapshot.metadata.flags >> 16) & 0x3;
+    return std.meta.intToEnum(kernel.CapsuleIrqKind, @as(u2, @intCast(raw))) catch null;
 }
 
 fn encodeCapsuleTokenForSnapshot(snapshot: kernel.CapsuleSnapshot) ?u64 {
@@ -181,6 +188,10 @@ fn userDmaAddressForRange(proc: kernel.PrincipalId, user_va: u64, size: u64) ?u6
     return first_paddr + offset;
 }
 
+fn dmaIovaOrKernelChoice(iova_arg: u64, paddr: u64) u64 {
+    return if (iova_arg == capsule_abi.dma_iova_kernel_choose) paddr else iova_arg;
+}
+
 fn snapshotOwner(snapshot: kernel.CapsuleSnapshot) ?kernel.PrincipalId {
     if (snapshot.owner_principal_raw >= kernel.principal_count) return null;
     return @enumFromInt(snapshot.owner_principal_raw);
@@ -196,8 +207,12 @@ fn cleanupCapsuleResource(snapshot: kernel.CapsuleSnapshot) void {
     const owner = snapshotOwner(snapshot) orelse return;
     switch (snapshot.kind) {
         .mmio => cleanupMmioCapsuleMapping(owner, snapshot),
+        .dma_buffer, .dma_mapping => {
+            dma_translation.unmapUserRange(snapshot.metadata.device, snapshot.metadata.iova, snapshot.metadata.size);
+        },
         .irq => {
-            _ = device_events.releaseDeviceEvent(owner, snapshot.metadata.device);
+            const kind = irqKindFromSnapshot(snapshot) orelse .auto;
+            _ = device_events.releaseDeviceEvent(owner, snapshot.metadata.device, kind, snapshot.metadata.index);
         },
         else => {},
     }
@@ -280,23 +295,52 @@ pub fn dispatch(
         sc.syscall_capsule_derive_dma_buffer => {
             const decoded = decodeCapsuleToken(frame.rdi, .device) orelse return sc.syscall_err_invalid;
             const flags = flagsArg(frame.r8, capsule_abi.dma_buffer_known_flags_mask) orelse return sc.syscall_err_invalid;
-            const dma_addr = userDmaAddressForRange(proc, frame.rsi, frame.rcx) orelse return sc.syscall_err_invalid;
-            const child = state.deviceCapsuleDeriveDmaBuffer(proc, decoded.token, frame.rsi, dma_addr, frame.rcx, flags) catch |err| return capsuleAccessStatus(err);
+            const paddr = userDmaAddressForRange(proc, frame.rsi, frame.rcx) orelse return sc.syscall_err_invalid;
+            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr);
+            const child = state.deviceCapsuleDeriveDmaBuffer(proc, decoded.token, frame.rsi, iova, frame.rcx, flags) catch |err| return capsuleAccessStatus(err);
+            const snapshot = state.capsuleSnapshot(child) catch {
+                _ = state.capsuleCloseSubtree(proc, child) catch {};
+                return sc.syscall_err_invalid;
+            };
+            if (!dma_translation.mapUserRange(snapshot.metadata.device, iova, paddr, frame.rcx)) {
+                _ = state.capsuleCloseSubtree(proc, child) catch {};
+                return sc.syscall_err_map;
+            }
             return capsule_abi.encodeCapsuleToken(.dma_buffer, child);
         },
         sc.syscall_capsule_derive_dma_mapping => {
             const decoded = decodeCapsuleToken(frame.rdi, .device) orelse return sc.syscall_err_invalid;
             const direction = parseDmaDirection(frame.r8) orelse return sc.syscall_err_invalid;
             const flags = flagsArg(frame.r9, capsule_abi.dma_mapping_known_flags_mask) orelse return sc.syscall_err_invalid;
-            const dma_addr = userDmaAddressForRange(proc, frame.rsi, frame.rcx) orelse return sc.syscall_err_invalid;
-            const child = state.deviceCapsuleDeriveDmaMapping(proc, decoded.token, frame.rsi, dma_addr, frame.rcx, direction, flags) catch |err| return capsuleAccessStatus(err);
+            const paddr = userDmaAddressForRange(proc, frame.rsi, frame.rcx) orelse return sc.syscall_err_invalid;
+            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr);
+            const child = state.deviceCapsuleDeriveDmaMapping(proc, decoded.token, frame.rsi, iova, frame.rcx, direction, flags) catch |err| return capsuleAccessStatus(err);
+            const snapshot = state.capsuleSnapshot(child) catch {
+                _ = state.capsuleCloseSubtree(proc, child) catch {};
+                return sc.syscall_err_invalid;
+            };
+            if (!dma_translation.mapUserRange(snapshot.metadata.device, iova, paddr, frame.rcx)) {
+                _ = state.capsuleCloseSubtree(proc, child) catch {};
+                return sc.syscall_err_map;
+            }
             return capsule_abi.encodeCapsuleToken(.dma_mapping, child);
         },
         sc.syscall_capsule_derive_dma_mapping_from_buffer => {
             const decoded = decodeCapsuleToken(frame.rdi, .dma_buffer) orelse return sc.syscall_err_invalid;
             const direction = parseDmaDirection(frame.rcx) orelse return sc.syscall_err_invalid;
             const flags = flagsArg(frame.r8, capsule_abi.dma_mapping_known_flags_mask) orelse return sc.syscall_err_invalid;
-            const child = state.dmaBufferCapsuleDeriveMapping(proc, decoded.token, frame.rsi, frame.rdx, direction, flags) catch |err| return capsuleAccessStatus(err);
+            const buffer = state.capsuleSnapshot(decoded.token) catch |err| return capsuleAccessStatus(err);
+            const paddr = userDmaAddressForRange(proc, buffer.metadata.user_va, frame.rdx) orelse return sc.syscall_err_invalid;
+            const iova = dmaIovaOrKernelChoice(frame.rsi, paddr);
+            const child = state.dmaBufferCapsuleDeriveMapping(proc, decoded.token, iova, frame.rdx, direction, flags) catch |err| return capsuleAccessStatus(err);
+            const snapshot = state.capsuleSnapshot(child) catch {
+                _ = state.capsuleCloseSubtree(proc, child) catch {};
+                return sc.syscall_err_invalid;
+            };
+            if (!dma_translation.mapUserRange(snapshot.metadata.device, iova, paddr, frame.rdx)) {
+                _ = state.capsuleCloseSubtree(proc, child) catch {};
+                return sc.syscall_err_map;
+            }
             return capsule_abi.encodeCapsuleToken(.dma_mapping, child);
         },
         sc.syscall_capsule_derive_irq => {
@@ -305,9 +349,9 @@ pub fn dispatch(
             const vector = u32Arg(frame.rdx) orelse return sc.syscall_err_invalid;
             const flags = flagsArg(frame.rcx, capsule_abi.irq_known_flags_mask) orelse return sc.syscall_err_invalid;
             const device = pciDeviceSnapshot(state, proc, decoded.token, .{ .irq_bind = true }) catch |err| return capsuleAccessStatus(err);
-            if (!device_events.acquireDeviceEvent(proc, device.metadata.device)) return sc.syscall_err_alloc;
+            if (!device_events.acquireDeviceEvent(proc, device.metadata.device, kind, vector)) return sc.syscall_err_alloc;
             const child = state.deviceCapsuleDeriveIrq(proc, decoded.token, kind, vector, flags) catch |err| {
-                _ = device_events.releaseDeviceEvent(proc, device.metadata.device);
+                _ = device_events.releaseDeviceEvent(proc, device.metadata.device, kind, vector);
                 return capsuleAccessStatus(err);
             };
             return capsule_abi.encodeCapsuleToken(.irq, child);
@@ -319,8 +363,9 @@ pub fn dispatch(
             if (flags != 0 or max_words < 1) return sc.syscall_err_invalid;
             state.capsuleAuthorize(proc, decoded.token, .irq, .{ .irq_bind = true }) catch |err| return capsuleAccessStatus(err);
             const irq = state.capsuleSnapshot(decoded.token) catch |err| return capsuleAccessStatus(err);
-            if (!device_events.bindDeviceEvent(proc, irq.metadata.device)) return sc.syscall_err_alloc;
-            const count = device_events.interruptCountFor(proc, irq.metadata.device) orelse return sc.syscall_err_not_ready;
+            const kind = irqKindFromSnapshot(irq) orelse return sc.syscall_err_invalid;
+            if (!device_events.bindDeviceEvent(proc, irq.metadata.device, kind, irq.metadata.index)) return sc.syscall_err_alloc;
+            const count = device_events.interruptCountFor(proc, irq.metadata.device, kind, irq.metadata.index) orelse return sc.syscall_err_not_ready;
             if (count == frame.rsi) return sc.syscall_err_not_ready;
             if (!h.write_user_u64(proc, frame.rdx, count)) return sc.syscall_err_invalid;
             return 1;

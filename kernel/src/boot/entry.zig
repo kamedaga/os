@@ -4,6 +4,7 @@ const std = @import("std");
 const kernel = @import("../kernel.zig");
 const capability = @import("../capability.zig");
 const device_events = @import("../device_events.zig");
+const dma_translation = @import("../dma_translation.zig");
 const elf_loader = @import("../elf_loader.zig");
 const scheduler = @import("../scheduler.zig");
 const syscalls = @import("../syscalls.zig");
@@ -75,6 +76,7 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_global), &kernel_state_global));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_ready), &kernel_state_ready));
     start = minStaticStart(start, device_events.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, dma_translation.kernelStaticStorageStartAddr());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
@@ -97,6 +99,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, device_events.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, dma_translation.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
 }
@@ -875,6 +878,7 @@ pub fn kernelMain() void {
 
     const resources = runBootServicesPhase();
     const state = initKernelSubsystems(resources.memory_stats);
+    dma_translation.initHardware();
     var devices = discoverDevices();
     constructBootProcesses(state, resources, &devices);
     wireRuntimeSubsystems(state, resources.memory_stats);

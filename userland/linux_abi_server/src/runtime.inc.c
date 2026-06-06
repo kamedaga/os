@@ -456,6 +456,9 @@ static u64 copy_to_target_bulk(u64 target_va, const void *src, u64 len) {
     return copied;
 }
 static u64 copy_to_trap_target(u64 principal, u64 target_va, const void *src, u64 len) { return syscall4_r10(SYSCALL_COPY_TO_ABI_TRAP_TARGET, principal, target_va, (u64)src, len); }
+static u64 share_reply_target_pages_to_trap_target(u64 principal, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4_r10(SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET, principal, target_va, page_count, prot_bits); }
+static u64 protect_trap_target_pages(u64 principal, u64 target_va, u64 page_count, u64 prot_bits) { return syscall4_r10(SYSCALL_PROTECT_ABI_TRAP_TARGET_PAGES, principal, target_va, page_count, prot_bits); }
+static u64 unmap_trap_target_pages(u64 principal, u64 target_va, u64 page_count) { return syscall3(SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES, principal, target_va, page_count); }
 static u64 reply_trap_target(u64 principal, u64 result, u64 flags) { return syscall3(SYSCALL_REPLY_ABI_TRAP_TARGET, principal, result, flags); }
 static u64 vfork_parent_for_principal(u64 principal) {
     if (principal < LINUX_ABI_REQUEST_PAGE_COUNT && g_vfork_parent_principal[principal] != 0) return g_vfork_parent_principal[principal];

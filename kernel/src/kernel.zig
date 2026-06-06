@@ -3322,7 +3322,15 @@ pub const KernelState = struct {
         if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
         if (self.getTableConst(to).find(paddr)) |dst_cap| {
             if (isRightsSubset(rights, dst_cap.rights)) return;
-            return KernelError.InvalidState;
+            var upgraded = dst_cap.*;
+            upgraded.rights.cpu_read = upgraded.rights.cpu_read or rights.cpu_read;
+            upgraded.rights.cpu_write = upgraded.rights.cpu_write or rights.cpu_write;
+            upgraded.rights.dma = upgraded.rights.dma or rights.dma;
+            upgraded.rights.grant = upgraded.rights.grant or rights.grant;
+            if (!isRightsSubset(upgraded.rights, src_cap.rights)) return KernelError.InvalidState;
+            _ = self.getTable(to).removeByPaddr(paddr);
+            try self.getTable(to).addAssumeFresh(upgraded);
+            return;
         }
 
         const child_id = self.allocCapId();

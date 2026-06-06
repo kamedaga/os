@@ -292,6 +292,31 @@ static int sleep_ticks_interruptible(u64 ticks, u64 *remaining_ticks_out) {
     }
 }
 
+static struct ipc_message handle_pause_syscall(const struct trap_request *req) {
+    (void)req;
+    if (!process_signal_interrupt_pending(g_proc)) {
+        (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, 1);
+    }
+    return reply(errno_intr(), 0);
+}
+
+static struct ipc_message handle_rt_sigsuspend(const struct trap_request *req) {
+    const u64 set_va = req->args[0];
+    const u64 sigset_size = req->args[1];
+    if (sigset_size != sizeof(u64)) return reply(errno_inval(), 0);
+
+    u64 new_mask = 0;
+    if (set_va != 0 && copy_from_target(set_va, &new_mask, sizeof(new_mask)) != sizeof(new_mask)) {
+        return reply(errno_fault(), 0);
+    }
+
+    const u64 old_mask = g_proc->blocked_signals;
+    g_proc->blocked_signals = new_mask & ~linux_unblockable_signal_mask();
+    struct ipc_message msg = handle_pause_syscall(req);
+    g_proc->blocked_signals = old_mask;
+    return msg;
+}
+
 static struct ipc_message handle_nanosleep(const struct trap_request *req) {
     struct linux_timespec ts;
     if (req->args[0] == 0) return reply(errno_fault(), 0);

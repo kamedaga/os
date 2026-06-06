@@ -1,6 +1,6 @@
 static void close_all_process_fds(struct linux_process_state *proc) {
     if (!proc) return;
-    for (u64 fd = 0; fd < 32; fd++) {
+    for (u64 fd = 0; fd < LINUX_FD_MAX; fd++) {
         struct fd_entry *entry = &proc->fds[fd];
         if (entry->kind == FD_UNUSED) continue;
         const int is_pipe = fd_entry_is_pipe(entry);
@@ -383,6 +383,7 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
     child->profile_enabled = parent->profile_enabled;
     child->profile_detail_enabled = parent->profile_detail_enabled;
     child->profile_verbose_enabled = parent->profile_verbose_enabled;
+    child->fault_trace_enabled = parent->fault_trace_enabled;
     child->sigaltstack_sp = parent->sigaltstack_sp;
     child->sigaltstack_size = parent->sigaltstack_size;
     child->sigaltstack_flags = parent->sigaltstack_flags;
@@ -407,7 +408,7 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
         child->sig_flags[i] = parent->sig_flags[i];
         child->sig_restorer[i] = parent->sig_restorer[i];
     }
-    for (u64 fd = 0; fd < 32; fd++) {
+    for (u64 fd = 0; fd < LINUX_FD_MAX; fd++) {
         copy_fd_entry(&child->fds[fd], &parent->fds[fd]);
         if (ref_pipe_fds) {
             pipe_ref_fd(&child->fds[fd]);

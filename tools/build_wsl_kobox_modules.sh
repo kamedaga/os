@@ -84,3 +84,6 @@ copy_usb_module kernel/drivers/usb/core/usbcore.ko usbcore.ko
 copy_usb_module kernel/drivers/usb/host/xhci-hcd.ko xhci-hcd.ko
 copy_usb_module kernel/drivers/usb/host/xhci-pci.ko xhci-pci.ko
 copy_usb_module kernel/drivers/usb/storage/usb-storage.ko usb-storage.ko
+copy_usb_module kernel/drivers/hid/hid.ko hid.ko
+copy_usb_module kernel/drivers/hid/hid-generic.ko hid-generic.ko
+copy_usb_module kernel/drivers/hid/usbhid/usbhid.ko usbhid.ko

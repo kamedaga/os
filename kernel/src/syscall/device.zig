@@ -24,7 +24,7 @@ pub fn dispatch(
                 break :blk sc.syscall_err_invalid;
             };
             if (device_capabilities.queueCapDeviceForToken(state, proc, queue_token, queue_index)) |device| {
-                _ = device_events.bindDeviceEvent(proc, device);
+                _ = device_events.bindDeviceEvent(proc, device, .auto, 0);
             }
             break :blk sc.syscall_ok;
         },

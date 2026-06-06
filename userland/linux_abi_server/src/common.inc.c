@@ -55,6 +55,9 @@ enum {
     SYSCALL_SHARE_IPC_BUFFER_ON_ENDPOINT = 0x60,
     SYSCALL_REPLY_ABI_TRAP_TARGET_CONTEXT = 0x64,
     SYSCALL_SET_ABI_TRAP_REPLY_TARGET_GS_BASE = 0x65,
+    SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET = 0x66,
+    SYSCALL_PROTECT_ABI_TRAP_TARGET_PAGES = 0x67,
+    SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES = 0x68,
     SYSCALL_OK = 0,
     SYSCALL_ERR_INVALID = 1,
     SYSCALL_ERR_NOT_READY = 2,
@@ -229,6 +232,7 @@ enum {
     LINUX_SYS_MADVISE = 28,
     LINUX_SYS_DUP = 32,
     LINUX_SYS_DUP2 = 33,
+    LINUX_SYS_PAUSE = 34,
     LINUX_SYS_NANOSLEEP = 35,
     LINUX_SYS_SETITIMER = 38,
     LINUX_SYS_GETPID = 39,
@@ -283,6 +287,7 @@ enum {
     LINUX_SYS_SETFSUID = 122,
     LINUX_SYS_SETFSGID = 123,
     LINUX_SYS_RT_SIGTIMEDWAIT = 128,
+    LINUX_SYS_RT_SIGSUSPEND = 130,
     LINUX_SYS_SIGALTSTACK = 131,
     LINUX_SYS_STATFS = 137,
     LINUX_SYS_FSTATFS = 138,
@@ -661,6 +666,7 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_GETTIMEOFDAY, "gettimeofday", LINUX_SYSCALL_CAT_TIME),
     LINUX_SYSCALL_META(LINUX_SYS_CLOCK_GETTIME, "clock_gettime", LINUX_SYSCALL_CAT_TIME),
     LINUX_SYSCALL_META(LINUX_SYS_CLOCK_GETRES, "clock_getres", LINUX_SYSCALL_CAT_TIME),
+    LINUX_SYSCALL_META(LINUX_SYS_PAUSE, "pause", LINUX_SYSCALL_CAT_SIGNAL),
     LINUX_SYSCALL_META(LINUX_SYS_NANOSLEEP, "nanosleep", LINUX_SYSCALL_CAT_TIME),
     LINUX_SYSCALL_META(LINUX_SYS_CLOCK_NANOSLEEP, "clock_nanosleep", LINUX_SYSCALL_CAT_TIME),
     LINUX_SYSCALL_META(LINUX_SYS_SETITIMER, "setitimer", LINUX_SYSCALL_CAT_TIME),
@@ -672,6 +678,7 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_RT_SIGPROCMASK, "rt_sigprocmask", LINUX_SYSCALL_CAT_SIGNAL),
     LINUX_SYSCALL_META(LINUX_SYS_RT_SIGRETURN, "rt_sigreturn", LINUX_SYSCALL_CAT_SIGNAL),
     LINUX_SYSCALL_META(LINUX_SYS_RT_SIGTIMEDWAIT, "rt_sigtimedwait", LINUX_SYSCALL_CAT_SIGNAL),
+    LINUX_SYSCALL_META(LINUX_SYS_RT_SIGSUSPEND, "rt_sigsuspend", LINUX_SYSCALL_CAT_SIGNAL),
     LINUX_SYSCALL_META(LINUX_SYS_SIGALTSTACK, "sigaltstack", LINUX_SYSCALL_CAT_SIGNAL),
     LINUX_SYSCALL_META(LINUX_SYS_FUTEX, "futex", LINUX_SYSCALL_CAT_MISC),
     LINUX_SYSCALL_META(LINUX_SYS_IOCTL, "ioctl", LINUX_SYSCALL_CAT_MISC),
@@ -1003,6 +1010,8 @@ struct file_cache_entry {
     char path[FS_MAX_PATH_BYTES + 1];
 };
 
+enum { LINUX_FD_MAX = 256 };
+
 enum { PIPE_MAX = 8, PIPE_BUFFER_BYTES = 4096 };
 struct pipe_entry {
     u8 used;
@@ -1079,7 +1088,7 @@ struct linux_process_state {
     u64 principal;
     u64 vfork_parent_principal;
     u64 vfork_parent_result;
-    struct fd_entry fds[32];
+    struct fd_entry fds[LINUX_FD_MAX];
     u64 mmap_next_va;
     u64 brk_next_va;
     struct vm_region regions[VM_REGION_MAX];
@@ -1103,6 +1112,7 @@ struct linux_process_state {
     u8 profile_enabled;
     u8 profile_detail_enabled;
     u8 profile_verbose_enabled;
+    u8 fault_trace_enabled;
     u64 sigaltstack_sp;
     u64 sigaltstack_size;
     u32 sigaltstack_flags;

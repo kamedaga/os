@@ -86,6 +86,9 @@ hello world
 |---|---|
 | NVMe | `nvme.ko` / `nvme-core.ko` |
 | USB Storage | `usbcore.ko` / `usb-storage.ko` / `xhci-hcd.ko` |
+| USB HID(マウスで実験中) | `usbcore.ko` / `hid.ko` / `hid-generic.ko` / `usbhid.ko` / `xhci-hcd.ko`|
+
+※koboxはApache 2.0でライセンスされてます。
 
 ---
 

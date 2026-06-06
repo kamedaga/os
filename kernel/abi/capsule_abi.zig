@@ -149,6 +149,7 @@ pub const known_bar_flags_mask: u64 =
 
 pub const mmio_map_flag_replace_existing: u64 = 1 << 0;
 pub const mmio_map_known_flags_mask: u64 = mmio_map_flag_replace_existing;
+pub const dma_iova_kernel_choose: u64 = 0;
 pub const dma_buffer_known_flags_mask: u64 = 0;
 pub const dma_mapping_known_flags_mask: u64 = 0;
 pub const irq_known_flags_mask: u64 = 0;
