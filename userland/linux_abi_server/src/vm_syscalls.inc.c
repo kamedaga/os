@@ -344,7 +344,6 @@ static void vm_remove_range(u64 start, u64 size) {
 static u64 normalize_linux_prot(u64 prot) {
     prot &= 0x7;
     if ((prot & 0x2) != 0) prot |= 0x1;
-    if (prot == 0) prot = 0x1;
     return prot;
 }
 
@@ -368,10 +367,14 @@ static u64 apply_target_pages(u64 start, u64 page_count, u64 prot, u64 (*fn)(u64
     return SYSCALL_OK;
 }
 
+static int vm_region_has_mapped_pages(const struct vm_region *region) {
+    return !region->file_lazy && !(region->file_backed == 0 && region->prot == 0);
+}
+
 static int vm_apply_mapped_pages_in_range(u64 start, u64 size, u64 prot, u64 (*fn)(u64, u64, u64)) {
     const u64 end = start + size;
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
-        if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+        if (!g_regions[i].used || !vm_region_has_mapped_pages(&g_regions[i])) continue;
         const u64 rs = g_regions[i].start;
         const u64 re = rs + g_regions[i].size;
         if (rs < start || re > end) continue;
@@ -439,17 +442,22 @@ static int share_target_pages_to_thread_group_peers(u64 start, u64 page_count, u
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         struct linux_process_state *peer = &g_processes[i];
         if (!is_thread_group_peer(peer)) continue;
-        const u64 status = share_reply_target_pages_to_trap_target(peer->principal, start, page_count, kernel_prot);
-        if (status != SYSCALL_OK) {
-            user_log("LinuxAbiServer: thread-group share pages failed peer=");
-            user_log_hex_inline(peer->principal);
-            user_log(" va=");
-            user_log_hex_inline(start);
-            user_log(" pages=");
-            user_log_hex_inline(page_count);
-            user_log(" status=");
-            user_log_hex_value(status);
-            return 0;
+        for (u64 done = 0; done < page_count;) {
+            const u64 chunk = min_u64(page_count - done, 64);
+            const u64 va = start + done * PAGE_BYTES;
+            const u64 status = share_reply_target_pages_to_trap_target(peer->principal, va, chunk, kernel_prot);
+            if (status != SYSCALL_OK) {
+                user_log("LinuxAbiServer: thread-group share pages failed peer=");
+                user_log_hex_inline(peer->principal);
+                user_log(" va=");
+                user_log_hex_inline(va);
+                user_log(" pages=");
+                user_log_hex_inline(chunk);
+                user_log(" status=");
+                user_log_hex_value(status);
+                return 0;
+            }
+            done += chunk;
         }
     }
     return 1;
@@ -461,17 +469,22 @@ static int protect_target_pages_to_thread_group_peers(u64 start, u64 page_count,
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         struct linux_process_state *peer = &g_processes[i];
         if (!is_thread_group_peer(peer)) continue;
-        const u64 status = protect_trap_target_pages(peer->principal, start, page_count, kernel_prot);
-        if (status != SYSCALL_OK) {
-            user_log("LinuxAbiServer: thread-group protect pages failed peer=");
-            user_log_hex_inline(peer->principal);
-            user_log(" va=");
-            user_log_hex_inline(start);
-            user_log(" pages=");
-            user_log_hex_inline(page_count);
-            user_log(" status=");
-            user_log_hex_value(status);
-            return 0;
+        for (u64 done = 0; done < page_count;) {
+            const u64 chunk = min_u64(page_count - done, 64);
+            const u64 va = start + done * PAGE_BYTES;
+            const u64 status = protect_trap_target_pages(peer->principal, va, chunk, kernel_prot);
+            if (status != SYSCALL_OK) {
+                user_log("LinuxAbiServer: thread-group protect pages failed peer=");
+                user_log_hex_inline(peer->principal);
+                user_log(" va=");
+                user_log_hex_inline(va);
+                user_log(" pages=");
+                user_log_hex_inline(chunk);
+                user_log(" status=");
+                user_log_hex_value(status);
+                return 0;
+            }
+            done += chunk;
         }
     }
     return 1;
@@ -482,17 +495,22 @@ static int unmap_target_pages_from_thread_group_peers(u64 start, u64 page_count)
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         struct linux_process_state *peer = &g_processes[i];
         if (!is_thread_group_peer(peer)) continue;
-        const u64 status = unmap_trap_target_pages(peer->principal, start, page_count);
-        if (status != SYSCALL_OK) {
-            user_log("LinuxAbiServer: thread-group unmap pages failed peer=");
-            user_log_hex_inline(peer->principal);
-            user_log(" va=");
-            user_log_hex_inline(start);
-            user_log(" pages=");
-            user_log_hex_inline(page_count);
-            user_log(" status=");
-            user_log_hex_value(status);
-            return 0;
+        for (u64 done = 0; done < page_count;) {
+            const u64 chunk = min_u64(page_count - done, 64);
+            const u64 va = start + done * PAGE_BYTES;
+            const u64 status = unmap_trap_target_pages(peer->principal, va, chunk);
+            if (status != SYSCALL_OK) {
+                user_log("LinuxAbiServer: thread-group unmap pages failed peer=");
+                user_log_hex_inline(peer->principal);
+                user_log(" va=");
+                user_log_hex_inline(va);
+                user_log(" pages=");
+                user_log_hex_inline(chunk);
+                user_log(" status=");
+                user_log_hex_value(status);
+                return 0;
+            }
+            done += chunk;
         }
     }
     return 1;
@@ -591,12 +609,12 @@ static int unmap_tracked_target_range(u64 start, u64 size) {
     if (!vm_range_covered(start, size)) return 1;
     if (!vm_split_range_boundaries(start, size)) return 0;
     const u64 end = start + size;
-    if (!unmap_target_pages_from_thread_group_peers(start, size / PAGE_BYTES)) return 0;
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
-        if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+        if (!g_regions[i].used || !vm_region_has_mapped_pages(&g_regions[i])) continue;
         const u64 rs = g_regions[i].start;
         const u64 re = rs + g_regions[i].size;
         if (rs < start || re > end) continue;
+        if (!unmap_target_pages_from_thread_group_peers(rs, g_regions[i].size / PAGE_BYTES)) return 0;
         u64 done = 0;
         const u64 page_count = g_regions[i].size / PAGE_BYTES;
         while (done < page_count) {
@@ -769,6 +787,37 @@ static int materialize_file_vm_object_range(u64 start, u64 size, u64 prot) {
             return 0;
         }
         g_regions[slot].file_vm_object = 0;
+        g_regions[slot].prot = prot;
+    }
+    return 1;
+}
+
+static int materialize_anon_reserved_range(u64 start, u64 size, u64 prot) {
+    if (prot == 0) return 1;
+    if (!vm_split_range_boundaries(start, size)) {
+        vm_trace4("vm.anon_reserved.split_fail", start, size, prot, vm_region_used_count());
+        return 0;
+    }
+    const u64 end = start + size;
+    for (;;) {
+        u64 slot = VM_REGION_MAX;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || g_regions[i].file_backed || g_regions[i].prot != 0) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (rs >= start && re <= end) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == VM_REGION_MAX) break;
+        struct vm_region region = g_regions[slot];
+        const u64 page_count = region.size / PAGE_BYTES;
+        const u64 map_status = map_zeroed_target_pages_chunked(region.start, page_count, prot);
+        if (map_status != SYSCALL_OK) {
+            vm_trace4("vm.anon_reserved.map_fail", region.start, page_count, prot, map_status);
+            return 0;
+        }
         g_regions[slot].prot = prot;
     }
     return 1;
@@ -981,14 +1030,15 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
         return reply(target_va, 0);
     }
     if ((flags & MAP_FIXED) != 0 && !unmap_overlapping_target_range(target_va, size)) return reply(errno_nomem(), 0);
-    u64 map_status = (lazy_file || cache_vm_object_file) ? SYSCALL_OK :
+    const int reserve_only = !file_backed && prot == 0;
+    u64 map_status = (reserve_only || lazy_file || cache_vm_object_file) ? SYSCALL_OK :
         (file_backed ? map_target_pages_chunked(target_va, page_count, map_prot) :
             map_zeroed_target_pages_chunked(target_va, page_count, prot));
     if (map_status == SYSCALL_ERR_MAP && !fixed_mapping && (flags & MAP_32BIT) == 0) {
         g_mmap_next_va = target_va + size;
         target_va = find_mmap_area(size);
         if (target_va != 0 && linux_user_range_valid(target_va, size)) {
-            map_status = (lazy_file || cache_vm_object_file) ? SYSCALL_OK :
+            map_status = (reserve_only || lazy_file || cache_vm_object_file) ? SYSCALL_OK :
                 (file_backed ? map_target_pages_chunked(target_va, page_count, map_prot) :
                     map_zeroed_target_pages_chunked(target_va, page_count, prot));
         }
@@ -1045,11 +1095,11 @@ static struct ipc_message handle_mmap(const struct trap_request *req) {
             user_log("LinuxAbiServer: vm regions used=");
             user_log_dec_value(vm_region_used_count());
             user_log("\n");
-            if (!lazy_file) (void)unmap_reply_target_pages(target_va, page_count);
+            if (!reserve_only && !lazy_file && !cache_vm_object_file) (void)unmap_reply_target_pages(target_va, page_count);
             return reply(errno_nomem(), 0);
         }
         if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) g_mmap_next_va = target_va + size;
-        if (!share_target_pages_to_thread_group_peers(target_va, page_count, effective_prot)) {
+        if (!reserve_only && !share_target_pages_to_thread_group_peers(target_va, page_count, effective_prot)) {
             (void)unmap_tracked_target_range(target_va, size);
             return reply(errno_nomem(), 0);
         }
@@ -1147,6 +1197,67 @@ static struct ipc_message handle_brk(const struct trap_request *req) {
     return reply(g_brk_next_va, 0);
 }
 
+static struct ipc_message handle_madvise(const struct trap_request *req) {
+    enum {
+        LINUX_MADV_NORMAL = 0,
+        LINUX_MADV_RANDOM = 1,
+        LINUX_MADV_SEQUENTIAL = 2,
+        LINUX_MADV_WILLNEED = 3,
+        LINUX_MADV_DONTNEED = 4,
+        LINUX_MADV_FREE = 8,
+        LINUX_MADV_DONTFORK = 10,
+        LINUX_MADV_DOFORK = 11,
+        LINUX_MADV_MERGEABLE = 12,
+        LINUX_MADV_UNMERGEABLE = 13,
+        LINUX_MADV_HUGEPAGE = 14,
+        LINUX_MADV_NOHUGEPAGE = 15,
+        LINUX_MADV_DONTDUMP = 16,
+        LINUX_MADV_DODUMP = 17,
+        LINUX_MADV_WIPEONFORK = 18,
+        LINUX_MADV_KEEPONFORK = 19,
+        LINUX_MADV_COLD = 20,
+        LINUX_MADV_PAGEOUT = 21,
+        LINUX_MADV_POPULATE_READ = 22,
+        LINUX_MADV_POPULATE_WRITE = 23
+    };
+    const u64 start = req->args[0];
+    const u64 len = req->args[1];
+    const u64 advice = req->args[2];
+    vm_trace4("vm.madvise", start, len, advice, 0);
+    if ((start & (PAGE_BYTES - 1)) != 0) return reply(errno_inval(), 0);
+    if (len == 0) return reply(0, 0);
+    u64 size = 0;
+    if (!page_up_checked(len, &size) || !linux_user_range_valid(start, size)) return reply(errno_inval(), 0);
+    switch (advice) {
+        case LINUX_MADV_NORMAL:
+        case LINUX_MADV_RANDOM:
+        case LINUX_MADV_SEQUENTIAL:
+        case LINUX_MADV_WILLNEED:
+        case LINUX_MADV_DONTFORK:
+        case LINUX_MADV_DOFORK:
+        case LINUX_MADV_MERGEABLE:
+        case LINUX_MADV_UNMERGEABLE:
+        case LINUX_MADV_HUGEPAGE:
+        case LINUX_MADV_NOHUGEPAGE:
+        case LINUX_MADV_DONTDUMP:
+        case LINUX_MADV_DODUMP:
+        case LINUX_MADV_WIPEONFORK:
+        case LINUX_MADV_KEEPONFORK:
+        case LINUX_MADV_COLD:
+        case LINUX_MADV_PAGEOUT:
+        case LINUX_MADV_POPULATE_READ:
+        case LINUX_MADV_POPULATE_WRITE:
+            return reply(0, 0);
+        case LINUX_MADV_DONTNEED:
+        case LINUX_MADV_FREE:
+            if (!vm_range_covered(start, size)) return reply(errno_nomem(), 0);
+            if (!copy_zero_to_target_range(start, size)) return reply(errno_fault(), 0);
+            return reply(0, 0);
+        default:
+            return reply(errno_inval(), 0);
+    }
+}
+
 static struct ipc_message handle_mprotect(const struct trap_request *req) {
     const u64 start = req->args[0]; const u64 len = req->args[1]; const u64 prot = normalize_linux_prot(req->args[2]);
     if (len == 0) return reply(0, 0);
@@ -1158,6 +1269,12 @@ static struct ipc_message handle_mprotect(const struct trap_request *req) {
     g_prof.mprotect_pages += size / PAGE_BYTES;
     const int tracked = vm_range_covered(start, size);
     if (tracked && !vm_split_range_boundaries(start, size)) return reply(errno_nomem(), 0);
+    if (tracked && !materialize_anon_reserved_range(start, size, prot)) return reply(errno_nomem(), 0);
+    if (tracked && prot == 0) {
+        vm_protect_range(start, size, prot);
+        sync_current_vm_metadata_to_thread_group_peers();
+        return reply(0, 0);
+    }
     if (tracked && (prot & 0x2) != 0 && !materialize_file_vm_object_range(start, size, prot)) return reply(errno_nomem(), 0);
     const int protect_ok = tracked ?
         vm_apply_mapped_pages_in_range(start, size, prot, protect_reply_target_pages) :

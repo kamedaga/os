@@ -18,16 +18,26 @@ OVMF_CODE = "/usr/share/OVMF/OVMF_CODE_4M.fd"
 OVMF_VARS_TEMPLATE = "/usr/share/OVMF/OVMF_VARS_4M.fd"
 
 
-def qemu_cmd(run_dir: Path, disk: Path, nvme_disk: Path, usb_disk: Path | None, usb_hid: bool, qmp_port: int | None) -> list[str]:
+def qemu_cmd(
+    run_dir: Path,
+    disk: Path,
+    nvme_disk: Path,
+    usb_disk: Path | None,
+    usb_hid: bool,
+    window_title: str,
+    qmp_port: int | None,
+) -> list[str]:
+    machine = os.environ.get("KOBOX_SMOKE_QEMU_MACHINE", "q35,i8042=off" if usb_hid else "q35")
     xhci_device = os.environ.get("KOBOX_SMOKE_XHCI_DEVICE", "qemu-xhci,id=xhci0")
-    usb_mouse_device = os.environ.get("KOBOX_SMOKE_USB_MOUSE_DEVICE", "usb-mouse,bus=xhci0.0")
+    default_usb_pointer = "usb-tablet,bus=xhci0.0" if usb_hid else "usb-mouse,bus=xhci0.0"
+    usb_mouse_device = os.environ.get("KOBOX_SMOKE_USB_MOUSE_DEVICE", default_usb_pointer)
     cmd = [
         "qemu-system-x86_64",
         "-enable-kvm",
         "-cpu",
         "host",
         "-machine",
-        "q35",
+        machine,
         "-smp",
         "4",
         "-m",
@@ -35,8 +45,8 @@ def qemu_cmd(run_dir: Path, disk: Path, nvme_disk: Path, usb_disk: Path | None, 
         "-no-reboot",
         "-monitor",
         "none",
-        "-display",
-        "none",
+        "-name",
+        window_title,
         "-d",
         "guest_errors,cpu_reset",
         "-D",
@@ -73,6 +83,25 @@ def qemu_cmd(run_dir: Path, disk: Path, nvme_disk: Path, usb_disk: Path | None, 
             "usb-storage,drive=usbstor0,bus=xhci0.0",
         ]
     if usb_hid:
+        display_backend = os.environ.get(
+            "KOBOX_SMOKE_QEMU_DISPLAY",
+            "none" if qmp_port is not None else "gtk,grab-on-hover=on",
+        )
+        cmd += [
+            "-display",
+            display_backend,
+        ]
+        if display_backend.startswith("gtk"):
+            cmd += [
+                "-device",
+                "virtio-keyboard-pci",
+            ]
+    else:
+        cmd += [
+            "-display",
+            "none",
+        ]
+    if usb_hid:
         cmd += [
             "-device",
             usb_mouse_device,
@@ -105,8 +134,8 @@ def reserve_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def send_usb_mouse_qmp_events(port: int, delay_s: float, duration_s: float) -> None:
-    deadline = time.monotonic() + 12.0
+def send_usb_tablet_qmp_events(port: int, delay_s: float, duration_s: float) -> None:
+    deadline = time.monotonic() + 20.0
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         while True:
@@ -115,6 +144,7 @@ def send_usb_mouse_qmp_events(port: int, delay_s: float, duration_s: float) -> N
                 break
             except OSError:
                 if time.monotonic() > deadline:
+                    print(f"qmp input: qmp-port-timeout port={port}", flush=True)
                     return
                 time.sleep(0.05)
 
@@ -137,25 +167,83 @@ def send_usb_mouse_qmp_events(port: int, delay_s: float, duration_s: float) -> N
         if not send_qmp({"execute": "qmp_capabilities"}):
             return
         time.sleep(delay_s)
-        pattern = ((24, 6), (18, -5), (-12, 9), (7, -3), (10, 4), (-6, -6))
+        points = (
+            (6000, 5000),
+            (18000, 7000),
+            (26000, 13000),
+            (12000, 19000),
+            (30000, 23000),
+            (8000, 11000),
+        )
         stop = time.monotonic() + duration_s
         index = 0
         while time.monotonic() < stop:
-            dx, dy = pattern[index % len(pattern)]
+            x, y = points[index % len(points)]
+            events = [
+                {"type": "abs", "data": {"axis": "x", "value": x}},
+                {"type": "abs", "data": {"axis": "y", "value": y}},
+            ]
+            if index % 6 == 0:
+                events.insert(0, {"type": "btn", "data": {"button": "left", "down": True}})
+            elif index % 6 == 1:
+                events.insert(0, {"type": "btn", "data": {"button": "left", "down": False}})
             if not send_qmp({
                 "execute": "input-send-event",
-                "arguments": {
-                    "events": [
-                        {"type": "rel", "data": {"axis": "x", "value": dx}},
-                        {"type": "rel", "data": {"axis": "y", "value": dy}},
-                    ],
-                },
+                "arguments": {"events": events},
             }):
                 return
             index += 1
-            time.sleep(0.25)
+            time.sleep(0.20)
+        print(f"qmp input: sent events={index} port={port}", flush=True)
     finally:
         sock.close()
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return max(0.1, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def env_decimal(name: str, default: str) -> str:
+    value = os.environ.get(name, default)
+    return value if re.fullmatch(r"[0-9]+", value) else default
+
+
+def shell_decimal_env_assignment(name: str, default: str) -> str:
+    return env_decimal(name, default)
+
+
+def guest_env_assignments(names: tuple[str, ...]) -> str:
+    assignments: list[str] = []
+    for name in names:
+        value = os.environ.get(name)
+        if value is None or value == "":
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_.,:+=@/-]+", value) is None:
+            continue
+        assignments.append(f"{name}={value}")
+    return (" ".join(assignments) + " ") if assignments else ""
+
+
+def usb_hid_motion_seen(text: str) -> bool:
+    for match in re.finditer(
+        r"kobox-usb-hid-mouse-live: .*?\btype=([23])\b.*?\bcode=([01])\b.*?\bvalue=(-?[0-9]+)\b.*?\bx=(-?[0-9]+)\b.*?\by=(-?[0-9]+)\b",
+        text,
+    ):
+        value = int(match.group(3))
+        x = int(match.group(4))
+        y = int(match.group(5))
+        if value != 0 or x != 0 or y != 0:
+            return True
+    summary = re.search(
+        r"kobox-usb-hid-mouse-live-summary: .*?\bx=(-?[0-9]+)\b.*?\by=(-?[0-9]+)\b.*?\bresult=ok\b",
+        text,
+    )
+    if summary is None:
+        return False
+    return int(summary.group(1)) != 0 or int(summary.group(2)) != 0
 
 
 class Console:
@@ -228,7 +316,11 @@ def main() -> int:
     nvme_disk = run_dir / "nvme-test.raw"
     usb_disk = run_dir / "usb-storage-test.raw" if args.mode == "usb-storage" else None
     usb_hid = args.mode == "usb-hid"
-    qmp_port = reserve_tcp_port() if usb_hid else None
+    window_title = f"PachaOS-kobox-smoke-{os.getpid()}"
+    usb_hid_input = os.environ.get("KOBOX_SMOKE_USB_HID_INPUT", "real").strip().lower()
+    if os.environ.get("KOBOX_SMOKE_USB_HID_QMP") == "1":
+        usb_hid_input = "qmp"
+    qmp_port = reserve_tcp_port() if usb_hid and usb_hid_input == "qmp" else None
     subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "raw", "-b", str(source_disk), str(boot_disk)], check=True)
     subprocess.run(["qemu-img", "create", "-q", "-f", "raw", str(nvme_disk), "64M"], check=True)
     if usb_disk is not None:
@@ -236,7 +328,7 @@ def main() -> int:
     shutil.copyfile(OVMF_VARS_TEMPLATE, run_dir / "OVMF_VARS.fd")
 
     proc = subprocess.Popen(
-        qemu_cmd(run_dir, boot_disk, nvme_disk, usb_disk, usb_hid, qmp_port),
+        qemu_cmd(run_dir, boot_disk, nvme_disk, usb_disk, usb_hid, window_title, qmp_port),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -246,6 +338,7 @@ def main() -> int:
     old_attrs = None
     console = None
     qemu_stdout: list[str] = []
+    qmp_thread = None
     try:
         pty_path = None
         deadline = time.monotonic() + 20.0
@@ -288,18 +381,47 @@ def main() -> int:
                 "done"
             )
         elif args.mode == "usb-hid":
+            hid_live_ms = env_decimal("KOBOX_SMOKE_USB_HID_LIVE_MS", "15000")
+            hid_print_limit = env_decimal("KOBOX_SMOKE_USB_HID_PRINT_LIMIT", "32")
+            hid_arm_delay_s = shell_decimal_env_assignment("KOBOX_SMOKE_USB_HID_ARM_DELAY_S", "3")
+            hid_msi = "1" if os.environ.get("KOBOX_SMOKE_PACHAOS_ENABLE_MSI") == "1" else "0"
+            if os.environ.get("KOBOX_SMOKE_USB_HID_SYNTHETIC") == "1":
+                hid_device_env = (
+                    "KOBOX_USB_REAL_DEVICE=1 KOBOX_USB_PACHAOS_FAKE_ROOT_HUB=1 "
+                    "KOBOX_USB_HID_MOUSE_XHCI_ONLY=0 KOBOX_USB_SYNTHETIC_DEVICE=hid-mouse "
+                )
+            else:
+                hid_device_env = (
+                    f"KOBOX_USB_REAL_DEVICE=1 KOBOX_PACHAOS_ENABLE_MSI={hid_msi} "
+                    "KOBOX_USB_HID_MOUSE_XHCI_ONLY=1 "
+                )
+            hid_trace_env = guest_env_assignments((
+                "KOBOX_TRACE_IRQ",
+                "KOBOX_PACHAOS_TRACE_IRQ",
+                "KOBOX_TRACE_PCI",
+                "KOBOX_TRACE_XHCI",
+                "KOBOX_TRACE_USB",
+                "KOBOX_TRACE_USB_CONTROL",
+                "KOBOX_TRACE_USB_HUB",
+                "KOBOX_TRACE_WORK",
+                "KOBOX_TRACE_DMA",
+                "KOBOX_PACHAOS_TRACE_DMA",
+                "KOBOX_TRACE_INPUT",
+                "KOBOX_TRACE_MOUSE_LIVE",
+            ))
             smoke_cmd = (
-                "KOBOX_USB_REAL_DEVICE=1 KOBOX_USB_PACHAOS_FAKE_ROOT_HUB=1 "
-                "KOBOX_USB_HID_MOUSE_XHCI_ONLY=0 KOBOX_USB_SYNTHETIC_DEVICE=hid-mouse "
-                "KOBOX_USB_HID_MOUSE_LIVE=1 KOBOX_USB_HID_MOUSE_LIVE_MS=1500 "
-                "KOBOX_USB_HID_MOUSE_LIVE_PRINT_LIMIT=32 KOBOX_INPUT_SUMMARY=1 "
-                "/cmd/kobox-run.elf --backend=pachaos --drain-ms=1500 "
-                "--dep=/usr/lib/kobox/usbcore.ko "
-                "--dep=/usr/lib/kobox/hid.ko "
-                "--dep=/usr/lib/kobox/hid-generic.ko "
-                "--dep=/usr/lib/kobox/usbhid.ko "
-                "--dep=/usr/lib/kobox/xhci-hcd.ko "
-                "run /usr/lib/kobox/xhci-pci.ko"
+                f"echo kobox-usb-hid-arm-delay={hid_arm_delay_s}; sleep {hid_arm_delay_s}; "
+                + hid_device_env
+                + hid_trace_env
+                + f"KOBOX_USB_HID_MOUSE_LIVE=1 KOBOX_USB_HID_MOUSE_LIVE_MS={hid_live_ms} "
+                + f"KOBOX_USB_HID_MOUSE_LIVE_PRINT_LIMIT={hid_print_limit} KOBOX_INPUT_SUMMARY=1 "
+                + "/cmd/kobox-run.elf --backend=pachaos --drain-ms=1500 "
+                + "--dep=/usr/lib/kobox/usbcore.ko "
+                + "--dep=/usr/lib/kobox/hid.ko "
+                + "--dep=/usr/lib/kobox/hid-generic.ko "
+                + "--dep=/usr/lib/kobox/usbhid.ko "
+                + "--dep=/usr/lib/kobox/xhci-hcd.ko "
+                + "run /usr/lib/kobox/xhci-pci.ko"
             )
         elif args.mode == "linux-abi":
             smoke_cmd = (
@@ -324,14 +446,22 @@ def main() -> int:
                 "done"
             )
         marker = f"__KOBOX_SMOKE_DONE_{os.getpid()}__"
-        qmp_thread = None
-        if usb_hid and qmp_port is not None:
+        if usb_hid and usb_hid_input == "qmp" and qmp_port is not None:
+            live_s = int(hid_live_ms) / 1000.0
+            qmp_delay_s = env_float("KOBOX_SMOKE_USB_HID_QMP_DELAY_S", float(hid_arm_delay_s) + 6.0)
+            qmp_duration_s = min(max(live_s / 2.0, 3.0), 8.0)
+            print(
+                f"usb-hid smoke: injecting QMP tablet events port={qmp_port} delay_s={qmp_delay_s:.3f}",
+                flush=True,
+            )
             qmp_thread = threading.Thread(
-                target=send_usb_mouse_qmp_events,
-                args=(qmp_port, 1.5, min(max(args.timeout - 3.0, 1.0), 8.0)),
+                target=send_usb_tablet_qmp_events,
+                args=(qmp_port, qmp_delay_s, qmp_duration_s),
                 daemon=True,
             )
             qmp_thread.start()
+        elif usb_hid:
+            print("usb-hid smoke: move the real mouse over the QEMU window while the live capture is running", flush=True)
         start = time.monotonic()
         out, status = console.command(smoke_cmd, args.timeout, marker)
         if qmp_thread is not None:
@@ -350,7 +480,7 @@ def main() -> int:
         if args.mode == "usb-storage":
             ok_count = text.count("kobox-usb-storage-bot:")
         elif args.mode == "usb-hid":
-            ok_count = text.count("kobox-usb-hid-mouse-live-summary:") if "result=ok" in text else 0
+            ok_count = text.count("kobox-usb-hid-mouse-live-summary:") if "result=ok" in text and usb_hid_motion_seen(text) else 0
         elif args.mode == "linux-abi":
             ok_count = text.count("linux_abi_probe: stress ok")
         else:

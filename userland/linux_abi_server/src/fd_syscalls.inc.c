@@ -15,6 +15,63 @@ static int alloc_fd_at_least(u64 min_fd) {
     return -1;
 }
 
+enum { EFD_SEMAPHORE = 1 };
+
+static struct ipc_message handle_eventfd2(const struct trap_request *req) {
+    const u64 initval = req->args[0] & 0xffffffffULL;
+    const u64 flags = req->args[1];
+    if ((flags & ~(u64)(EFD_SEMAPHORE | O_CLOEXEC | O_NONBLOCK)) != 0) return reply(errno_inval(), 0);
+    const int fd = alloc_fd();
+    if (fd < 0) return reply(errno_busy(), 0);
+    g_fds[(u64)fd].kind = FD_EVENTFD;
+    g_fds[(u64)fd].token = initval;
+    g_fds[(u64)fd].offset = 0;
+    g_fds[(u64)fd].size = 0;
+    g_fds[(u64)fd].fd_flags = (u32)((flags & O_NONBLOCK) | ((flags & O_CLOEXEC) != 0 ? FD_INTERNAL_CLOEXEC : 0));
+    g_fds[(u64)fd].mode_bits = (flags & EFD_SEMAPHORE) != 0 ? EFD_SEMAPHORE : 0;
+    g_fds[(u64)fd].object_kind = FS_OBJECT_FILE;
+    g_fds[(u64)fd].path_len = 0;
+    g_fds[(u64)fd].path[0] = 0;
+    sync_fd_to_thread_group((u64)fd);
+    return reply((u64)fd, 0);
+}
+
+static u64 eventfd_read_to_target(u64 fd, u64 dst, u64 len, int *fault) {
+    *fault = 0;
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_EVENTFD) return errno_badf();
+    if (len < sizeof(u64)) return errno_inval();
+    if (g_fds[fd].token == 0) return errno_again();
+    u64 value = g_fds[fd].token;
+    if ((g_fds[fd].mode_bits & EFD_SEMAPHORE) != 0) {
+        value = 1;
+        g_fds[fd].token--;
+    } else {
+        g_fds[fd].token = 0;
+    }
+    if (copy_to_target(dst, &value, sizeof(value)) != sizeof(value)) {
+        *fault = 1;
+        return 0;
+    }
+    sync_fd_to_thread_group(fd);
+    return sizeof(value);
+}
+
+static u64 eventfd_write_from_target(u64 fd, u64 src, u64 len, int *fault) {
+    *fault = 0;
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_EVENTFD) return errno_badf();
+    if (len < sizeof(u64)) return errno_inval();
+    u64 value = 0;
+    if (copy_from_target(src, &value, sizeof(value)) != sizeof(value)) {
+        *fault = 1;
+        return 0;
+    }
+    if (value == ~0ULL) return errno_inval();
+    if (~0ULL - g_fds[fd].token <= value) return errno_again();
+    g_fds[fd].token += value;
+    sync_fd_to_thread_group(fd);
+    return sizeof(value);
+}
+
 static struct ipc_message handle_pipe2(const struct trap_request *req, int has_flags) {
     const u64 pipefd_va = req->args[0];
     const u64 flags = has_flags ? req->args[1] : 0;

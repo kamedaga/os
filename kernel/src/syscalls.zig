@@ -297,6 +297,7 @@ fn markAbiTrapReplyPendingIfDelegated(
     target: ipc_syscalls.SignalTarget,
     target_ctx: *scheduler.ThreadContext,
 ) void {
+    if (target_ctx.ready) return;
     if (h.state.abiTrapDelegateFor(target.principal) != null) {
         target_ctx.abi_trap_reply_pending = true;
     }

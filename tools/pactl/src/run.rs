@@ -9,6 +9,8 @@ use std::time::SystemTime;
 const OVMF_CODE_PATH: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
 const OVMF_VARS_TEMPLATE_PATH: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 const QEMU_DEBUG_FLAGS: &str = "guest_errors,cpu_reset";
+const QEMU_XHCI_DEVICE: &str = "qemu-xhci,id=xhci0";
+const QEMU_USB_POINTER_DEVICE: &str = "usb-tablet,bus=xhci0.0";
 const TIMED_RUN_SECONDS: u32 = 30;
 const PF_CHECK_RUN_SECONDS: u32 = 60;
 
@@ -325,9 +327,10 @@ fn build_wsl_script(
     } else {
         "-serial stdio".to_string()
     };
+    let attach_usb_storage = !options.split_windows;
     let mut qemu_parts = vec![
         "qemu-system-x86_64".to_string(),
-        "-machine q35".to_string(),
+        "-machine q35,i8042=off".to_string(),
         "-smp 4".to_string(),
         "-m 2G".to_string(),
         "-no-reboot".to_string(),
@@ -348,14 +351,21 @@ fn build_wsl_script(
         "-drive if=none,file=\"$NVME_DISK\",format=raw,cache=writeback,aio=threads,id=nvmetest"
             .to_string(),
         "-device nvme,drive=nvmetest,serial=pachaos-nvme0".to_string(),
-        "-device qemu-xhci,id=xhci0,p2=1,p3=1".to_string(),
-        "-drive if=none,file=\"$USB_STORAGE_DISK\",format=raw,cache=writeback,aio=threads,id=usbstor0"
-            .to_string(),
-        "-device usb-storage,drive=usbstor0,bus=xhci0.0".to_string(),
+        "-device intel-iommu,intremap=off".to_string(),
+        format!("-device {QEMU_XHCI_DEVICE}"),
         serial_backend,
     ];
-    append_display_devices(&mut qemu_parts, options.display);
+    if attach_usb_storage {
+        qemu_parts.push(
+            "-drive if=none,file=\"$USB_STORAGE_DISK\",format=raw,cache=writeback,aio=threads,id=usbstor0"
+                .to_string(),
+        );
+    }
+    append_display_devices(&mut qemu_parts, options.display, options.split_windows);
     append_optional_usb_mouse(&mut qemu_parts, options.display);
+    if attach_usb_storage {
+        append_usb_storage_device(&mut qemu_parts);
+    }
     append_optional_qmp(&mut qemu_parts)?;
     append_console_device(&mut qemu_parts, options.console);
     append_network_device(&mut qemu_parts);
@@ -629,15 +639,19 @@ fn build_wsl_script(
     Ok(script)
 }
 
-fn append_display_devices(qemu_parts: &mut Vec<String>, backend: DisplayBackend) {
+fn append_display_devices(
+    qemu_parts: &mut Vec<String>,
+    backend: DisplayBackend,
+    usb_mouse_primary: bool,
+) {
     match backend {
         DisplayBackend::Gtk => {
-            qemu_parts.push("-display gtk,gl=on,grab-on-hover=off".to_string());
-            qemu_parts.push("-vga none".to_string());
-            qemu_parts.push("-device virtio-vga-gl,xres=1920,yres=1080".to_string());
-            qemu_parts.push("-device virtio-tablet-pci".to_string());
+            qemu_parts.push("-display gtk,grab-on-hover=on".to_string());
             qemu_parts.push("-device virtio-keyboard-pci".to_string());
-            qemu_parts.push("-device usb-mouse,bus=xhci0.0".to_string());
+            if !usb_mouse_primary {
+                qemu_parts.push("-device virtio-tablet-pci".to_string());
+            }
+            qemu_parts.push(format!("-device {QEMU_USB_POINTER_DEVICE}"));
         }
         DisplayBackend::None => {
             qemu_parts.push("-display none".to_string());
@@ -649,7 +663,11 @@ fn append_optional_usb_mouse(qemu_parts: &mut Vec<String>, backend: DisplayBacke
     if backend == DisplayBackend::Gtk || !env_flag_enabled("PACHAOS_QEMU_USB_MOUSE") {
         return;
     }
-    qemu_parts.push("-device usb-mouse,bus=xhci0.0".to_string());
+    qemu_parts.push(format!("-device {QEMU_USB_POINTER_DEVICE}"));
+}
+
+fn append_usb_storage_device(qemu_parts: &mut Vec<String>) {
+    qemu_parts.push("-device usb-storage,drive=usbstor0,bus=xhci0.0".to_string());
 }
 
 fn append_optional_qmp(qemu_parts: &mut Vec<String>) -> Result<(), String> {
@@ -663,9 +681,7 @@ fn append_optional_qmp(qemu_parts: &mut Vec<String>) -> Result<(), String> {
     let port = port_text
         .parse::<u16>()
         .map_err(|_| format!("invalid PACHAOS_QEMU_QMP_PORT: {port_text}"))?;
-    qemu_parts.push(format!(
-        "-qmp tcp:127.0.0.1:{port},server=on,wait=off"
-    ));
+    qemu_parts.push(format!("-qmp tcp:127.0.0.1:{port},server=on,wait=off"));
     Ok(())
 }
 
@@ -726,9 +742,10 @@ fn build_wsl_pf_check_script(
         runtime_slug(workspace_root)
     );
 
+    let attach_usb_storage = !options.split_windows;
     let mut qemu_parts = vec![
         "qemu-system-x86_64".to_string(),
-        "-machine q35".to_string(),
+        "-machine q35,i8042=off".to_string(),
         "-smp 4".to_string(),
         "-m 2G".to_string(),
         "-no-reboot".to_string(),
@@ -746,14 +763,21 @@ fn build_wsl_pf_check_script(
         "-drive if=none,file=\"$NVME_DISK\",format=raw,cache=writeback,aio=threads,id=nvmetest"
             .to_string(),
         "-device nvme,drive=nvmetest,serial=pachaos-nvme0".to_string(),
-        "-device qemu-xhci,id=xhci0,p2=1,p3=1".to_string(),
-        "-drive if=none,file=\"$USB_STORAGE_DISK\",format=raw,cache=writeback,aio=threads,id=usbstor0"
-            .to_string(),
-        "-device usb-storage,drive=usbstor0,bus=xhci0.0".to_string(),
+        "-device intel-iommu,intremap=off".to_string(),
+        format!("-device {QEMU_XHCI_DEVICE}"),
         "-serial stdio".to_string(),
     ];
-    append_display_devices(&mut qemu_parts, options.display);
+    if attach_usb_storage {
+        qemu_parts.push(
+            "-drive if=none,file=\"$USB_STORAGE_DISK\",format=raw,cache=writeback,aio=threads,id=usbstor0"
+                .to_string(),
+        );
+    }
+    append_display_devices(&mut qemu_parts, options.display, options.split_windows);
     append_optional_usb_mouse(&mut qemu_parts, options.display);
+    if attach_usb_storage {
+        append_usb_storage_device(&mut qemu_parts);
+    }
     append_optional_qmp(&mut qemu_parts)?;
     append_console_device(&mut qemu_parts, options.console);
     append_network_device(&mut qemu_parts);

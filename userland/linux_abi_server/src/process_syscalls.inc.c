@@ -407,6 +407,7 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
         child->sig_handler[i] = parent->sig_handler[i];
         child->sig_flags[i] = parent->sig_flags[i];
         child->sig_restorer[i] = parent->sig_restorer[i];
+        child->pending_signal_code[i] = 0;
     }
     for (u64 fd = 0; fd < LINUX_FD_MAX; fd++) {
         copy_fd_entry(&child->fds[fd], &parent->fds[fd]);
@@ -668,6 +669,7 @@ static int copy_current_vm_to_process(u64 process_token, u64 source_process_slot
     if (!materialize_all_spawn_regions(share_vm)) return 0;
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
         if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+        if (!g_regions[i].file_backed && g_regions[i].prot == 0) continue;
         const u64 start = g_regions[i].start;
         const u64 page_count = align_up(g_regions[i].size, PAGE_BYTES) / PAGE_BYTES;
         if (share_vm) {
@@ -952,6 +954,31 @@ static void deliver_tty_signal(u64 signo) {
     }
 }
 
+static int linux_signal_default_terminates(u64 sig);
+static struct ipc_message terminate_linux_process_by_signal(const struct trap_request *req, struct linux_process_state *target, u64 sig);
+
+static void trace_signal_target(const char *event, const struct linux_process_state *target, u64 sig) {
+    if (!profile_trace_enabled()) return;
+    profile_trace_prefix(event);
+    user_log(" sig=");
+    user_log_dec_value(sig);
+    if (target) {
+        user_log(" target_pid=");
+        user_log_dec_value(target->pid);
+        user_log(" target_tid=");
+        user_log_dec_value(target->tid);
+        user_log(" target_principal=");
+        user_log_dec_value(target->principal);
+        user_log(" handler=");
+        user_log_hex_inline(sig < 65 ? target->sig_handler[sig] : 0);
+        user_log(" mask=");
+        user_log_hex_inline(target->blocked_signals);
+        user_log(" pending=");
+        user_log_hex_inline(target->pending_signals);
+    }
+    user_log("\n");
+}
+
 static struct ipc_message handle_kill(const struct trap_request *req) {
     const i64 pid = (i64)req->args[0];
     const u64 sig = req->args[1];
@@ -959,10 +986,26 @@ static struct ipc_message handle_kill(const struct trap_request *req) {
     if (pid == 0 || pid == -1) return reply(0, 0);
     const u64 abs_pid = pid < 0 ? (u64)(-pid) : (u64)pid;
     if (abs_pid == 0) return reply(0, 0);
+    struct linux_process_state *target = 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
-        const struct linux_process_state *proc = &g_processes[i];
+        struct linux_process_state *proc = &g_processes[i];
         if (!proc->used) continue;
-        if (proc->pid == abs_pid || proc->tid == abs_pid) return reply(0, 0);
+        if (proc->pid == abs_pid || proc->tid == abs_pid) {
+            target = proc;
+            break;
+        }
+    }
+    if (target) {
+        trace_signal_target("kill.target", target, sig);
+        if (sig == 0) return reply(0, 0);
+        if (target->sig_handler[sig] == 1) return reply(0, 0);
+        if (target->sig_handler[sig] != 0) {
+            queue_process_signal_code(target, sig, SI_USER);
+            prime_reply_return_signal();
+            return reply(0, 0);
+        }
+        if (!linux_signal_default_terminates(sig)) return reply(0, 0);
+        return terminate_linux_process_by_signal(req, target, sig);
     }
     return reply(errno_noent(), 0);
 }
@@ -1034,10 +1077,12 @@ static struct ipc_message handle_thread_signal(u64 tgid, u64 tid, u64 sig, const
     struct linux_process_state *target = process_state_for_tid(tid);
     if (!target) return reply(errno_noent(), 0);
     if (tgid != 0 && target->pid != tgid) return reply(errno_noent(), 0);
+    trace_signal_target("thread_signal.target", target, sig);
     if (sig == 0) return reply(0, 0);
     if (target->sig_handler[sig] == 1) return reply(0, 0);
     if (target->sig_handler[sig] != 0) {
-        queue_process_signal(target, sig);
+        queue_process_signal_code(target, sig, tgid != 0 ? SI_TKILL : SI_USER);
+        prime_reply_return_signal();
         return reply(0, 0);
     }
     if (!linux_signal_default_terminates(sig)) return reply(0, 0);

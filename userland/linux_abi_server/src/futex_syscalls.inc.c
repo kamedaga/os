@@ -27,6 +27,18 @@ static u64 wake_futex_waiters(u64 owner_pid, u64 uaddr, u64 max_wake) {
         g_futex_waiters[i].uaddr = 0;
         if (reply_trap_target(principal, 0, 0) == SYSCALL_OK) woke++;
     }
+    if (profile_trace_enabled()) {
+        profile_trace_prefix("futex.wake");
+        user_log(" owner=");
+        user_log_dec_value(owner_pid);
+        user_log(" uaddr=");
+        user_log_hex_inline(uaddr);
+        user_log(" max=");
+        user_log_dec_value(max_wake);
+        user_log(" woke=");
+        user_log_dec_value(woke);
+        user_log("\n");
+    }
     return woke;
 }
 
@@ -46,11 +58,39 @@ static struct ipc_message handle_futex(const struct trap_request *req) {
     }
 
     if (cmd != FUTEX_WAIT) return reply(errno_nosys(), 0);
-    if (timeout != 0) return reply(errno_timedout(), 0);
+    if (timeout != 0) {
+        if (profile_trace_enabled()) {
+            profile_trace_prefix("futex.wait.timeout_stub");
+            user_log(" owner=");
+            user_log_dec_value(owner_pid);
+            user_log(" uaddr=");
+            user_log_hex_inline(uaddr);
+            user_log(" val=");
+            user_log_hex_inline(val);
+            user_log(" timeout=");
+            user_log_hex_inline(timeout);
+            user_log("\n");
+        }
+        return reply(errno_timedout(), 0);
+    }
 
     u32 current = 0;
     if (copy_from_target(uaddr, &current, sizeof(current)) != sizeof(current)) return reply(errno_fault(), 0);
-    if (current != (u32)val) return reply(errno_again(), 0);
+    if (current != (u32)val) {
+        if (profile_trace_enabled()) {
+            profile_trace_prefix("futex.wait.again");
+            user_log(" owner=");
+            user_log_dec_value(owner_pid);
+            user_log(" uaddr=");
+            user_log_hex_inline(uaddr);
+            user_log(" current=");
+            user_log_hex_inline(current);
+            user_log(" val=");
+            user_log_hex_inline(val);
+            user_log("\n");
+        }
+        return reply(errno_again(), 0);
+    }
 
     remove_futex_waiters_for_principal(req->caller_principal);
     for (u64 i = 0; i < FUTEX_WAITER_MAX; i++) {
@@ -59,6 +99,18 @@ static struct ipc_message handle_futex(const struct trap_request *req) {
         g_futex_waiters[i].principal = req->caller_principal;
         g_futex_waiters[i].owner_pid = owner_pid;
         g_futex_waiters[i].uaddr = uaddr;
+        if (profile_trace_enabled()) {
+            profile_trace_prefix("futex.wait.block");
+            user_log(" owner=");
+            user_log_dec_value(owner_pid);
+            user_log(" waiter=");
+            user_log_dec_value(req->caller_principal);
+            user_log(" uaddr=");
+            user_log_hex_inline(uaddr);
+            user_log(" val=");
+            user_log_hex_inline(val);
+            user_log("\n");
+        }
         detach_reply_token();
         return wait_ipc();
     }

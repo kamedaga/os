@@ -3,6 +3,8 @@ const kernel_log = @import("kernel_log.zig");
 const scheduler = @import("scheduler.zig");
 
 pub const generic_device_interrupt_vector: u8 = 0x41;
+pub const msix_device_interrupt_vector_base: u8 = 0x42;
+pub const msix_device_interrupt_vector_count: u8 = 32;
 const max_device_event_bindings: usize = kernel.capsule.CapsuleTable.max_capsules;
 
 const DeviceEventBinding = struct {
@@ -32,6 +34,10 @@ pub fn kernelStaticStorageStartAddr() usize {
     var start = staticStorageStart(@TypeOf(bindings), &bindings);
     const counter_start = staticStorageStart(@TypeOf(interrupt_count), &interrupt_count);
     if (counter_start < start) start = counter_start;
+    const trace_bind_start = staticStorageStart(@TypeOf(trace_bind_count), &trace_bind_count);
+    if (trace_bind_start < start) start = trace_bind_start;
+    const trace_interrupt_start = staticStorageStart(@TypeOf(trace_interrupt_count), &trace_interrupt_count);
+    if (trace_interrupt_start < start) start = trace_interrupt_start;
     return start;
 }
 
@@ -39,6 +45,10 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end = staticStorageEnd(@TypeOf(bindings), &bindings);
     const counter_end = staticStorageEnd(@TypeOf(interrupt_count), &interrupt_count);
     if (counter_end > end) end = counter_end;
+    const trace_bind_end = staticStorageEnd(@TypeOf(trace_bind_count), &trace_bind_count);
+    if (trace_bind_end > end) end = trace_bind_end;
+    const trace_interrupt_end = staticStorageEnd(@TypeOf(trace_interrupt_count), &trace_interrupt_count);
+    if (trace_interrupt_end > end) end = trace_interrupt_end;
     return end;
 }
 
@@ -122,6 +132,33 @@ pub fn interruptCountFor(owner: kernel.PrincipalId, device: kernel.DmaDeviceId, 
         if (entry.device == device and entry.owner == owner and entry.kind == kind and entry.vector == vector) return entry.interrupts;
     }
     return null;
+}
+
+pub fn msixEntryForInterruptVector(vector: u8) ?u32 {
+    if (vector < msix_device_interrupt_vector_base) return null;
+    const entry = vector - msix_device_interrupt_vector_base;
+    if (entry >= msix_device_interrupt_vector_count) return null;
+    return entry;
+}
+
+pub fn wakeBoundDeviceWaiters(kind: kernel.CapsuleIrqKind, vector: u32) usize {
+    interrupt_count +%= 1;
+    var woke: usize = 0;
+    for (&bindings) |*entry| {
+        if (!entry.valid) continue;
+        if (entry.kind != kind or entry.vector != vector) continue;
+        entry.interrupts +%= 1;
+        scheduler.wakeBlockedThreadForPrincipal(entry.owner);
+        woke += 1;
+    }
+    if (trace_interrupt_count < 32) {
+        trace_interrupt_count += 1;
+        kernel_log.writeFmt(
+            "device-events: interrupt global={} kind={} vector={} woke={}\n",
+            .{ interrupt_count, @intFromEnum(kind), vector, woke },
+        );
+    }
+    return woke;
 }
 
 pub fn wakeAllBoundDeviceWaiters() usize {

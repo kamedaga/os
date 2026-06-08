@@ -1380,6 +1380,11 @@ static u16 fd_poll_revents(u64 fd, u16 requested) {
 
     if (entry->kind == FD_FILE || entry->kind == FD_DIR) return (u16)(requested & (read_mask | write_mask));
     if (entry->kind == FD_RANDOM) return (u16)(requested & read_mask);
+    if (entry->kind == FD_EVENTFD) {
+        u16 revents = (u16)(requested & write_mask);
+        if (entry->token != 0) revents |= (u16)(requested & read_mask);
+        return revents;
+    }
     if (entry->kind == FD_STDIO || entry->kind == FD_TTY) {
         u64 readable = 0;
         u64 writable = 1;

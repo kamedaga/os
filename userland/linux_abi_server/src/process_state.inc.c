@@ -81,6 +81,7 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
         proc->sig_handler[i] = 0;
         proc->sig_flags[i] = 0;
         proc->sig_restorer[i] = 0;
+        proc->pending_signal_code[i] = 0;
     }
 }
 
@@ -122,6 +123,7 @@ static struct linux_process_state *process_state_for(u64 principal) {
         g_processes[i].exec_pending = 0;
         g_processes[i].exec_pending_principal = 0;
         reset_process_runtime_for_exec(&g_processes[i]);
+        register_pending_exec_load_regions_for_process(&g_processes[i]);
         return &g_processes[i];
     }
     struct linux_process_state *single_pending = 0;
@@ -136,6 +138,7 @@ static struct linux_process_state *process_state_for(u64 principal) {
         single_pending->exec_pending = 0;
         single_pending->exec_pending_principal = 0;
         reset_process_runtime_for_exec(single_pending);
+        register_pending_exec_load_regions_for_process(single_pending);
         return single_pending;
     }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) { if (g_processes[i].used) continue; init_process_state(&g_processes[i], principal); return &g_processes[i]; }
@@ -396,7 +399,7 @@ static u64 pipe_write_from_target(u64 fd, u64 src, u64 len, int *fault) {
     g_prof.pipe_write_bytes += written;
     return written;
 }
-static int alloc_fd(void) { for (int i = 3; i < LINUX_FD_MAX; i++) if (g_fds[i].kind == FD_UNUSED) return i; return -1; }
+static int alloc_fd(void) { for (int i = 0; i < LINUX_FD_MAX; i++) if (g_fds[i].kind == FD_UNUSED) return i; return -1; }
 static int fd_valid(u64 fd) { return g_proc != 0 && fd < LINUX_FD_MAX && g_fds[fd].kind != FD_UNUSED; }
 static int fd_is_tty_like(u64 fd) { return fd_valid(fd) && g_fds[fd].kind == FD_TTY; }
 

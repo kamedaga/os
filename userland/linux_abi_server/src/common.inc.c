@@ -227,6 +227,7 @@ enum {
     LINUX_SYS_ACCESS = 21,
     LINUX_SYS_PIPE = 22,
     LINUX_SYS_SELECT = 23,
+    LINUX_SYS_SCHED_YIELD = 24,
     LINUX_SYS_MREMAP = 25,
     LINUX_SYS_MINCORE = 27,
     LINUX_SYS_MADVISE = 28,
@@ -337,6 +338,7 @@ enum {
     LINUX_SYS_SET_ROBUST_LIST = 273,
     LINUX_SYS_SPLICE = 275,
     LINUX_SYS_UTIMENSAT = 280,
+    LINUX_SYS_EPOLL_PWAIT = 281,
     LINUX_SYS_FALLOCATE = 285,
     LINUX_SYS_EVENTFD2 = 290,
     LINUX_SYS_EPOLL_CREATE1 = 291,
@@ -417,12 +419,15 @@ enum {
     SIGEV_NONE = 1,
     SIGEV_THREAD = 2,
     SIGEV_THREAD_ID = 4,
+    SI_USER = 0,
     SI_TIMER = -2,
+    SI_TKILL = -6,
     SIG_BLOCK = 0,
     SIG_UNBLOCK = 1,
     SIG_SETMASK = 2,
     SA_SIGINFO = 4,
     SA_RESTORER = 0x04000000,
+    SA_ONSTACK = 0x08000000,
     SS_ONSTACK = 1,
     SS_DISABLE = 2,
     SS_AUTODISARM = 0x80000000,
@@ -583,8 +588,10 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_EPOLL_CTL, "epoll_ctl", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_EPOLL_WAIT, "epoll_wait", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_EPOLL_PWAIT, "epoll_pwait", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_POLL, "poll", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_SELECT, "select", LINUX_SYSCALL_CAT_FD),
+    LINUX_SYSCALL_META(LINUX_SYS_SCHED_YIELD, "sched_yield", LINUX_SYSCALL_CAT_MISC),
     LINUX_SYSCALL_META(LINUX_SYS_PSELECT6, "pselect6", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_PPOLL, "ppoll", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_CLOSE, "close", LINUX_SYSCALL_CAT_FD),
@@ -715,7 +722,7 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_LLISTXATTR, "llistxattr", LINUX_SYSCALL_CAT_STUB_ERR),
     LINUX_SYSCALL_META(LINUX_SYS_FLISTXATTR, "flistxattr", LINUX_SYSCALL_CAT_STUB_ERR),
     LINUX_SYSCALL_META(LINUX_SYS_SPLICE, "splice", LINUX_SYSCALL_CAT_STUB_ERR),
-    LINUX_SYSCALL_META(LINUX_SYS_EVENTFD2, "eventfd2", LINUX_SYSCALL_CAT_STUB_ERR),
+    LINUX_SYSCALL_META(LINUX_SYS_EVENTFD2, "eventfd2", LINUX_SYSCALL_CAT_FD),
 };
 
 #undef LINUX_SYSCALL_META
@@ -853,11 +860,55 @@ struct linux_siginfo {
     u32 reserved0;
     u64 payload[14];
 };
+struct linux_sigcontext_amd64 {
+    u64 r8;
+    u64 r9;
+    u64 r10;
+    u64 r11;
+    u64 r12;
+    u64 r13;
+    u64 r14;
+    u64 r15;
+    u64 rdi;
+    u64 rsi;
+    u64 rbp;
+    u64 rbx;
+    u64 rdx;
+    u64 rax;
+    u64 rcx;
+    u64 rsp;
+    u64 rip;
+    u64 eflags;
+    u16 cs;
+    u16 gs;
+    u16 fs;
+    u16 pad0;
+    u64 err;
+    u64 trapno;
+    u64 oldmask;
+    u64 cr2;
+    u64 fpstate;
+    u64 reserved1[8];
+};
+struct linux_ucontext_amd64 {
+    u64 uc_flags;
+    u64 uc_link;
+    struct {
+        u64 ss_sp;
+        u32 ss_flags;
+        u32 reserved0;
+        u64 ss_size;
+    } uc_stack;
+    struct linux_sigcontext_amd64 uc_mcontext;
+    u64 uc_sigmask[16];
+    u8 fpregs_mem[512];
+};
 struct linux_signal_frame_body {
     u64 magic;
     u64 signo;
     struct abi_trap_user_context saved_context;
     struct linux_siginfo info;
+    struct linux_ucontext_amd64 ucontext;
 };
 struct service_entry { u64 kind; u64 process_slot; u64 endpoint_id; u64 flags; };
 struct service_registry_page { u64 magic; u64 version; u64 entry_count; u64 reserved0; struct service_entry entries[SERVICE_REGISTRY_MAX_ENTRIES]; };
@@ -908,7 +959,7 @@ struct linux_statfs {
     i64 f_spare[4];
 };
 
-enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6, FD_SOCKET = 7, FD_RANDOM = 8, FD_EPOLL = 9 };
+enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6, FD_SOCKET = 7, FD_RANDOM = 8, FD_EPOLL = 9, FD_EVENTFD = 10 };
 struct fd_entry {
     enum fd_kind kind;
     u64 token;
@@ -1041,13 +1092,24 @@ struct futex_waiter {
     u64 uaddr;
 };
 
-enum { EXEC_CACHE_MAX = 16 };
+enum { EXEC_CACHE_MAX = 16, EXEC_LOAD_REGION_MAX = 16 };
+struct exec_load_region {
+    u64 start;
+    u64 size;
+    u64 prot;
+};
+struct exec_load_metadata {
+    u8 valid;
+    u8 count;
+    struct exec_load_region regions[EXEC_LOAD_REGION_MAX];
+};
 struct exec_cache_entry {
     u8 used;
     u8 exec_service_cached;
     u16 path_len;
     u64 vm_token;
     u64 file_bytes;
+    struct exec_load_metadata load;
     char path[FS_MAX_PATH_BYTES + 1];
 };
 
@@ -1125,6 +1187,7 @@ struct linux_process_state {
     u64 sig_handler[65];
     u64 sig_flags[65];
     u64 sig_restorer[65];
+    i32 pending_signal_code[65];
 };
 
 struct linux_stack_t {
@@ -1523,6 +1586,9 @@ static u64 wake_futex_waiters(u64 owner_pid, u64 uaddr, u64 max_wake);
 static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot);
 static u64 map_zeroed_target_pages_chunked(u64 start, u64 page_count, u64 prot);
 static void clear_tracked_target_ranges(void);
+static void register_pending_exec_load_regions_for_process(struct linux_process_state *proc);
+static u64 eventfd_read_to_target(u64 fd, u64 dst, u64 len, int *fault);
+static u64 eventfd_write_from_target(u64 fd, u64 src, u64 len, int *fault);
 
 struct linux_abi_context {
     struct linux_process_state *proc;

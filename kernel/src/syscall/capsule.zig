@@ -188,8 +188,12 @@ fn userDmaAddressForRange(proc: kernel.PrincipalId, user_va: u64, size: u64) ?u6
     return first_paddr + offset;
 }
 
-fn dmaIovaOrKernelChoice(iova_arg: u64, paddr: u64) u64 {
-    return if (iova_arg == capsule_abi.dma_iova_kernel_choose) paddr else iova_arg;
+fn dmaIovaOrKernelChoice(iova_arg: u64, paddr: u64, size: u64) ?u64 {
+    if (iova_arg == capsule_abi.dma_iova_kernel_choose) {
+        return if (dma_translation.isAddressableRange(paddr, size)) paddr else null;
+    }
+    if (dma_translation.isAddressableRange(iova_arg, size)) return iova_arg;
+    return if (dma_translation.isAddressableRange(paddr, size)) paddr else null;
 }
 
 fn snapshotOwner(snapshot: kernel.CapsuleSnapshot) ?kernel.PrincipalId {
@@ -296,7 +300,7 @@ pub fn dispatch(
             const decoded = decodeCapsuleToken(frame.rdi, .device) orelse return sc.syscall_err_invalid;
             const flags = flagsArg(frame.r8, capsule_abi.dma_buffer_known_flags_mask) orelse return sc.syscall_err_invalid;
             const paddr = userDmaAddressForRange(proc, frame.rsi, frame.rcx) orelse return sc.syscall_err_invalid;
-            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr);
+            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.rcx) orelse return sc.syscall_err_invalid;
             const child = state.deviceCapsuleDeriveDmaBuffer(proc, decoded.token, frame.rsi, iova, frame.rcx, flags) catch |err| return capsuleAccessStatus(err);
             const snapshot = state.capsuleSnapshot(child) catch {
                 _ = state.capsuleCloseSubtree(proc, child) catch {};
@@ -313,7 +317,7 @@ pub fn dispatch(
             const direction = parseDmaDirection(frame.r8) orelse return sc.syscall_err_invalid;
             const flags = flagsArg(frame.r9, capsule_abi.dma_mapping_known_flags_mask) orelse return sc.syscall_err_invalid;
             const paddr = userDmaAddressForRange(proc, frame.rsi, frame.rcx) orelse return sc.syscall_err_invalid;
-            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr);
+            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.rcx) orelse return sc.syscall_err_invalid;
             const child = state.deviceCapsuleDeriveDmaMapping(proc, decoded.token, frame.rsi, iova, frame.rcx, direction, flags) catch |err| return capsuleAccessStatus(err);
             const snapshot = state.capsuleSnapshot(child) catch {
                 _ = state.capsuleCloseSubtree(proc, child) catch {};
@@ -331,7 +335,7 @@ pub fn dispatch(
             const flags = flagsArg(frame.r8, capsule_abi.dma_mapping_known_flags_mask) orelse return sc.syscall_err_invalid;
             const buffer = state.capsuleSnapshot(decoded.token) catch |err| return capsuleAccessStatus(err);
             const paddr = userDmaAddressForRange(proc, buffer.metadata.user_va, frame.rdx) orelse return sc.syscall_err_invalid;
-            const iova = dmaIovaOrKernelChoice(frame.rsi, paddr);
+            const iova = dmaIovaOrKernelChoice(frame.rsi, paddr, frame.rdx) orelse return sc.syscall_err_invalid;
             const child = state.dmaBufferCapsuleDeriveMapping(proc, decoded.token, iova, frame.rdx, direction, flags) catch |err| return capsuleAccessStatus(err);
             const snapshot = state.capsuleSnapshot(child) catch {
                 _ = state.capsuleCloseSubtree(proc, child) catch {};

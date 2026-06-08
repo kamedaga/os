@@ -146,6 +146,10 @@ struct linux_sysinfo {
     u64 freehigh;
     u32 mem_unit;
 };
+struct linux_rlimit64 {
+    u64 rlim_cur;
+    u64 rlim_max;
+};
 enum {
     LINUX_CLOCK_REALTIME = 0,
     LINUX_CLOCK_MONOTONIC = 1,
@@ -153,7 +157,24 @@ enum {
     LINUX_CLOCK_BOOTTIME = 7,
     LINUX_TIMER_ABSTIME = 1,
     LINUX_ABI_MONOTONIC_NS_PER_TICK = 1000000,
-    CAPABILITYOS_CERT_TIME_UNIX = 1778025600
+    CAPABILITYOS_CERT_TIME_UNIX = 1778025600,
+    LINUX_RLIMIT_CPU = 0,
+    LINUX_RLIMIT_FSIZE = 1,
+    LINUX_RLIMIT_DATA = 2,
+    LINUX_RLIMIT_STACK = 3,
+    LINUX_RLIMIT_CORE = 4,
+    LINUX_RLIMIT_RSS = 5,
+    LINUX_RLIMIT_NPROC = 6,
+    LINUX_RLIMIT_NOFILE = 7,
+    LINUX_RLIMIT_MEMLOCK = 8,
+    LINUX_RLIMIT_AS = 9,
+    LINUX_RLIMIT_LOCKS = 10,
+    LINUX_RLIMIT_SIGPENDING = 11,
+    LINUX_RLIMIT_MSGQUEUE = 12,
+    LINUX_RLIMIT_NICE = 13,
+    LINUX_RLIMIT_RTPRIO = 14,
+    LINUX_RLIMIT_RTTIME = 15,
+    LINUX_RLIM_INFINITY64 = 0xffffffffffffffffULL
 };
 
 static i64 realtime_unix_seconds(void) {
@@ -327,6 +348,16 @@ static struct ipc_message handle_nanosleep(const struct trap_request *req) {
     }
 
     u64 ticks = linux_timespec_to_ticks_ceil(&ts);
+    if (profile_trace_enabled()) {
+        profile_trace_prefix("nanosleep.request");
+        user_log(" sec=");
+        user_log_dec_value((u64)ts.tv_sec);
+        user_log(" nsec=");
+        user_log_dec_value((u64)ts.tv_nsec);
+        user_log(" ticks=");
+        user_log_dec_value(ticks);
+        user_log("\n");
+    }
     u64 remaining_ticks = 0;
     if (sleep_ticks_interruptible(ticks, &remaining_ticks)) {
         if (req->args[1] != 0) {
@@ -633,6 +664,44 @@ static struct ipc_message handle_time_syscall(const struct trap_request *req) {
     return reply((u64)now, 0);
 }
 
+static struct linux_rlimit64 linux_default_rlimit(u64 resource) {
+    struct linux_rlimit64 lim;
+    lim.rlim_cur = LINUX_RLIM_INFINITY64;
+    lim.rlim_max = LINUX_RLIM_INFINITY64;
+    if (resource == LINUX_RLIMIT_STACK) {
+        lim.rlim_cur = 8ULL * 1024ULL * 1024ULL;
+        lim.rlim_max = LINUX_RLIM_INFINITY64;
+    } else if (resource == LINUX_RLIMIT_NOFILE) {
+        lim.rlim_cur = LINUX_FD_MAX;
+        lim.rlim_max = LINUX_FD_MAX;
+    } else if (resource == LINUX_RLIMIT_NPROC || resource == LINUX_RLIMIT_SIGPENDING) {
+        lim.rlim_cur = LINUX_PROCESS_MAX;
+        lim.rlim_max = LINUX_PROCESS_MAX;
+    } else if (resource == LINUX_RLIMIT_MEMLOCK) {
+        lim.rlim_cur = 64ULL * 1024ULL;
+        lim.rlim_max = 64ULL * 1024ULL;
+    }
+    return lim;
+}
+
+static struct ipc_message handle_prlimit64(const struct trap_request *req) {
+    const u64 pid = req->args[0];
+    const u64 resource = req->args[1];
+    const u64 new_limit_va = req->args[2];
+    const u64 old_limit_va = req->args[3];
+    if (resource > LINUX_RLIMIT_RTTIME) return reply(errno_inval(), 0);
+    if (pid != 0 && g_proc && pid != g_proc->pid && pid != g_proc->tid) return reply(errno_perm(), 0);
+    if (new_limit_va != 0) {
+        struct linux_rlimit64 ignored;
+        if (copy_from_target(new_limit_va, &ignored, sizeof(ignored)) != sizeof(ignored)) return reply(errno_fault(), 0);
+    }
+    if (old_limit_va != 0) {
+        const struct linux_rlimit64 lim = linux_default_rlimit(resource);
+        if (copy_to_target(old_limit_va, &lim, sizeof(lim)) != sizeof(lim)) return reply(errno_fault(), 0);
+    }
+    return reply(0, 0);
+}
+
 static struct ipc_message handle_membarrier(const struct trap_request *req) {
     const u64 cmd = req->args[0];
     const u64 flags = req->args[1];
@@ -654,7 +723,13 @@ static struct ipc_message handle_sched_getaffinity(const struct trap_request *re
     const u64 n = min_u64(cpu_set_size, sizeof(mask));
     for (u64 i = 0; i < n; i++) mask[i] = 0;
     mask[0] = 1;
-    return copy_to_target(mask_va, mask, n) == n ? reply(0, 0) : reply(errno_fault(), 0);
+    return copy_to_target(mask_va, mask, n) == n ? reply(n, 0) : reply(errno_fault(), 0);
+}
+
+static struct ipc_message handle_sched_yield(const struct trap_request *req) {
+    (void)req;
+    (void)syscall2(SYSCALL_WAIT_EVENT, WAIT_EVENT_FLAG_PRESERVE_IPC_QUEUE, 1);
+    return reply(0, 0);
 }
 
 static int cpu_has_rdrand(void) {

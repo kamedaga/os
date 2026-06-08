@@ -32,6 +32,91 @@ static char g_execve_shebang_interpreter_buf[FS_MAX_PATH_BYTES + 1];
 static char g_execve_shebang_arg_buf[FS_MAX_PATH_BYTES + 1];
 static char g_execve_interpreter_resolved_buf[FS_MAX_PATH_BYTES + 1];
 static char g_execve_proc_exe_path_buf[FS_MAX_PATH_BYTES + 1];
+static char g_execve_pending_load_path[FS_MAX_PATH_BYTES + 1];
+static u16 g_execve_pending_load_path_len = 0;
+
+static u16 exec_read_le16(const u8 *bytes, u64 off) {
+    return (u16)bytes[off] | ((u16)bytes[off + 1] << 8);
+}
+
+static u32 exec_read_le32(const u8 *bytes, u64 off) {
+    return (u32)bytes[off] |
+        ((u32)bytes[off + 1] << 8) |
+        ((u32)bytes[off + 2] << 16) |
+        ((u32)bytes[off + 3] << 24);
+}
+
+static u64 exec_read_le64(const u8 *bytes, u64 off) {
+    u64 value = 0;
+    for (u64 i = 0; i < 8; i++) value |= (u64)bytes[off + i] << (i * 8);
+    return value;
+}
+
+static int exec_add_overflow(u64 a, u64 b, u64 *out) {
+    *out = a + b;
+    return *out < a;
+}
+
+static u64 exec_page_down(u64 value) {
+    return value & ~(u64)(PAGE_BYTES - 1);
+}
+
+static int parse_exec_load_metadata(u64 image_va, u64 file_bytes, struct exec_load_metadata *out) {
+    enum { ET_EXEC = 2, ET_DYN = 3, PT_LOAD = 1, PF_X = 1, PF_W = 2 };
+    out->valid = 0;
+    out->count = 0;
+    if (file_bytes < 64) return 0;
+    const u8 *ehdr = (const u8 *)image_va;
+    if (ehdr[0] != 0x7f || ehdr[1] != 'E' || ehdr[2] != 'L' || ehdr[3] != 'F') return 0;
+    if (ehdr[4] != 2 || ehdr[5] != 1 || ehdr[6] != 1) return 0;
+    const u16 type = exec_read_le16(ehdr, 16);
+    if (type != ET_EXEC && type != ET_DYN) return 0;
+    const u64 phoff = exec_read_le64(ehdr, 32);
+    const u16 phentsize = exec_read_le16(ehdr, 54);
+    const u16 phnum = exec_read_le16(ehdr, 56);
+    if (phentsize < 56 || phnum > 128) return 0;
+    if (phnum != 0 && phentsize > (~0ULL / (u64)phnum)) return 0;
+    u64 ph_table_end = 0;
+    if (exec_add_overflow(phoff, (u64)phentsize * (u64)phnum, &ph_table_end) || ph_table_end > file_bytes) return 0;
+
+    u64 max_align = PAGE_BYTES;
+    for (u64 i = 0; i < phnum; i++) {
+        const u8 *phdr = (const u8 *)(image_va + phoff + i * phentsize);
+        if (exec_read_le32(phdr, 0) != PT_LOAD) continue;
+        const u64 align = exec_read_le64(phdr, 48);
+        if (align > max_align) max_align = align;
+    }
+    const u64 load_bias = type == ET_DYN ? align_up(g_et_dyn_base_va, max_align) : 0;
+
+    for (u64 i = 0; i < phnum; i++) {
+        const u8 *phdr = (const u8 *)(image_va + phoff + i * phentsize);
+        if (exec_read_le32(phdr, 0) != PT_LOAD) continue;
+        const u32 flags = exec_read_le32(phdr, 4);
+        const u64 vaddr = exec_read_le64(phdr, 16);
+        const u64 memsz = exec_read_le64(phdr, 40);
+        if (memsz == 0) continue;
+        if (out->count >= EXEC_LOAD_REGION_MAX) return 0;
+        u64 mapped_start = 0;
+        u64 mapped_end_raw = 0;
+        if (exec_add_overflow(load_bias, vaddr, &mapped_start)) return 0;
+        if (exec_add_overflow(mapped_start, memsz, &mapped_end_raw)) return 0;
+        const u64 start = exec_page_down(mapped_start);
+        const u64 end = align_up(mapped_end_raw, PAGE_BYTES);
+        if (end <= start) return 0;
+        u64 prot = 0x1;
+        if ((flags & PF_W) != 0) {
+            prot |= 0x2;
+        } else if ((flags & PF_X) != 0) {
+            prot |= 0x4;
+        }
+        const u8 slot = out->count++;
+        out->regions[slot].start = start;
+        out->regions[slot].size = end - start;
+        out->regions[slot].prot = prot;
+    }
+    out->valid = out->count != 0;
+    return out->valid != 0;
+}
 
 static int path_has_prefix(const char *path, const char *prefix) {
     u64 i = 0;
@@ -766,7 +851,7 @@ static int exec_path_eq_literal(const char *path, const char *literal) {
     return path[i] == 0 && literal[i] == 0;
 }
 
-static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 file_bytes) {
+static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 file_bytes, const struct exec_load_metadata *load) {
     if (!EXEC_OPT_MAIN_VM_CACHE && !EXEC_OPT_SERVICE_SOURCE_CACHE) return;
     if (path_len == 0 || path_len > FS_MAX_PATH_BYTES) return;
     struct exec_cache_entry *entry = exec_cache_find(path, path_len);
@@ -784,6 +869,12 @@ static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 f
     entry->path_len = (u16)path_len;
     entry->vm_token = vm_token;
     entry->file_bytes = file_bytes;
+    if (load != 0) {
+        entry->load = *load;
+    } else {
+        entry->load.valid = 0;
+        entry->load.count = 0;
+    }
     for (u64 i = 0; i < path_len; i++) entry->path[i] = path[i];
     entry->path[path_len] = 0;
 }
@@ -847,12 +938,14 @@ static int get_exec_vm_for_path(const char *path, u64 *vm_token_out, u64 *file_b
     execve_profile_step("main read begin");
     if (!vfs_read_file_to_buffer(path, EXECVE_MAIN_IMAGE_VA, EXECVE_MAX_IMAGE_BYTES, &file_bytes)) return 0;
     execve_profile_step("main read done");
+    struct exec_load_metadata load;
+    (void)parse_exec_load_metadata(EXECVE_MAIN_IMAGE_VA, file_bytes, &load);
     execve_profile_step("main vm install begin");
     const u64 vm_token = install_vm_object_from_buffer(EXECVE_MAIN_IMAGE_VA, file_bytes);
     if (vm_token == 0) return 0;
     execve_profile_step("main vm install done");
 
-    if (EXEC_OPT_MAIN_VM_CACHE || EXEC_OPT_SERVICE_SOURCE_CACHE) exec_cache_store(path, path_len, vm_token, file_bytes);
+    if (EXEC_OPT_MAIN_VM_CACHE || EXEC_OPT_SERVICE_SOURCE_CACHE) exec_cache_store(path, path_len, vm_token, file_bytes, &load);
 
     *vm_token_out = vm_token;
     *file_bytes_out = file_bytes;
@@ -1166,6 +1259,54 @@ static void reset_exec_runtime_state(void) {
     g_profile_trace_verbose = 0;
     g_mmap_next_va = g_mmap_base_va;
     g_brk_next_va = g_brk_initial_va;
+}
+
+static void remember_pending_exec_load_path(const char *path) {
+    const u64 len = cstr_len(path);
+    if (len == 0 || len > FS_MAX_PATH_BYTES) {
+        g_execve_pending_load_path_len = 0;
+        g_execve_pending_load_path[0] = 0;
+        return;
+    }
+    g_execve_pending_load_path_len = (u16)len;
+    for (u64 i = 0; i < len; i++) g_execve_pending_load_path[i] = path[i];
+    g_execve_pending_load_path[len] = 0;
+}
+
+static void register_pending_exec_load_regions_for_process(struct linux_process_state *proc) {
+    if (proc == 0 || g_execve_pending_load_path_len == 0) return;
+    const struct exec_cache_entry *entry = exec_cache_find(g_execve_pending_load_path, g_execve_pending_load_path_len);
+    if (entry == 0 || !entry->load.valid) {
+        g_execve_pending_load_path_len = 0;
+        g_execve_pending_load_path[0] = 0;
+        return;
+    }
+    for (u64 i = 0; i < entry->load.count; i++) {
+        const struct exec_load_region *region = &entry->load.regions[i];
+        u64 slot = VM_REGION_MAX;
+        for (u64 r = 0; r < VM_REGION_MAX; r++) {
+            if (proc->regions[r].used) continue;
+            slot = r;
+            break;
+        }
+        if (slot == VM_REGION_MAX) {
+            user_log("LinuxAbiServer: exec load region track failed start=");
+            user_log_hex_value(region->start);
+            break;
+        }
+        proc->regions[slot].start = region->start;
+        proc->regions[slot].size = region->size;
+        proc->regions[slot].prot = region->prot;
+        proc->regions[slot].file_token = 0;
+        proc->regions[slot].file_offset = 0;
+        proc->regions[slot].file_size = 0;
+        proc->regions[slot].file_backed = 0;
+        proc->regions[slot].file_lazy = 0;
+        proc->regions[slot].file_vm_object = 0;
+        proc->regions[slot].used = 1;
+    }
+    g_execve_pending_load_path_len = 0;
+    g_execve_pending_load_path[0] = 0;
 }
 
 static int exec_cstr_eq(const char *a, const char *b) {
@@ -1534,7 +1675,7 @@ static void close_cloexec_fds_for_execve(void) {
     }
 }
 
-static void prepare_process_for_exec_replacement(u64 old_principal, u64 spawned_principal) {
+static void prepare_process_for_exec_replacement(u64 old_principal, u64 spawned_principal, const char *load_path) {
     if (!g_proc) return;
     close_cloexec_fds_for_execve();
     clear_process_timers(g_proc);
@@ -1542,6 +1683,7 @@ static void prepare_process_for_exec_replacement(u64 old_principal, u64 spawned_
     g_proc->exec_pending = 1;
     g_proc->exec_pending_principal = spawned_principal;
     if (g_root_linux_principal_set && g_root_linux_principal == old_principal) g_root_linux_principal = 0;
+    remember_pending_exec_load_path(load_path);
     reset_exec_runtime_state();
 }
 
@@ -1551,14 +1693,16 @@ static void rollback_process_exec_replacement(u64 old_principal) {
         g_proc->exec_pending = 0;
         g_proc->exec_pending_principal = 0;
     }
+    g_execve_pending_load_path_len = 0;
+    g_execve_pending_load_path[0] = 0;
     if (!g_root_linux_principal_set || g_root_linux_principal == 0) {
         g_root_linux_principal = old_principal;
         g_root_linux_principal_set = 1;
     }
 }
 
-static struct ipc_message commit_exec_replacement(u64 old_principal, u64 spawned_principal) {
-    prepare_process_for_exec_replacement(old_principal, spawned_principal);
+static struct ipc_message commit_exec_replacement(u64 old_principal, u64 spawned_principal, const char *load_path) {
+    prepare_process_for_exec_replacement(old_principal, spawned_principal, load_path);
     if (!start_prepared_exec_launch(spawned_principal)) {
         user_log("LinuxAbiServer: exec start failed before old exit\n");
         exec_launch_sequence_release();
@@ -1695,7 +1839,7 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
             reply_vfork_parent_if_any(g_proc);
             return reply(errno_io(), 0);
         }
-        return commit_exec_replacement(old_principal, spawned_principal);
+        return commit_exec_replacement(old_principal, spawned_principal, interpreter_load_path);
     }
     if (uutils_tool_ptr != 0 && !vfs_lookup_file_token(load_path, &exec_probe_token, &exec_probe_bytes)) return reply(errno_noent(), 0);
     execve_profile_step("probe lookup done");
@@ -1709,5 +1853,5 @@ static struct ipc_message handle_execve(const struct trap_request *req) {
     }
     execve_profile_step("spawn exec done");
     execve_profile_flush();
-    return commit_exec_replacement(old_principal, spawned_principal);
+    return commit_exec_replacement(old_principal, spawned_principal, load_path);
 }

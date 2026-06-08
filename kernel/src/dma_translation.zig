@@ -39,6 +39,11 @@ pub fn hardwareActive() bool {
     return initialized and vtd.isActive();
 }
 
+pub fn isAddressableRange(iova: u64, size: u64) bool {
+    if (!hardwareActive()) return true;
+    return vtd.isAddressableRange(iova, size);
+}
+
 pub fn mapUserRange(
     device: kernel.DmaDeviceId,
     iova: u64,

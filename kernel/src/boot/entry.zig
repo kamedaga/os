@@ -283,6 +283,7 @@ fn installInterruptTrampolines() void {
         .device_interrupt_stub = @intFromPtr(&traps.deviceInterruptHandlerStub),
         .lapic_timer_vector = boot_static.lapic_timer_vector,
         .device_interrupt_vector = device_events.generic_device_interrupt_vector,
+        .device_interrupt_vector_count = device_events.msix_device_interrupt_vector_count + 1,
     });
 }
 

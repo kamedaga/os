@@ -1,3 +1,5 @@
+const std = @import("std");
+
 const ia32_apic_base_msr: u32 = 0x1B;
 const apic_enable_bit: u64 = 1 << 11;
 const x2apic_enable_bit: u64 = 1 << 10;
@@ -5,6 +7,7 @@ const apic_base_mask: u64 = 0xFFFF_F000;
 
 const lapic_reg_eoi: u32 = 0x0B0;
 const lapic_reg_id: u32 = 0x020;
+const lapic_reg_isr_base: u32 = 0x100;
 const lapic_reg_svr: u32 = 0x0F0;
 const lapic_reg_icr_low: u32 = 0x300;
 const lapic_reg_icr_high: u32 = 0x310;
@@ -150,6 +153,20 @@ pub fn sendFixedIpi(apic_id: u8, vector: u8) bool {
 pub fn eoi() void {
     if (lapic_base_pa == 0) return;
     mmioWrite(lapic_reg_eoi, 0);
+}
+
+pub fn activeInterruptVectorInRange(first: u8, count: u8) ?u8 {
+    if (lapic_base_pa == 0 or count == 0) return null;
+    const first_vec: u16 = first;
+    const end_vec: u16 = first_vec + @as(u16, count);
+    var vec = first_vec;
+    while (vec < end_vec and vec <= std.math.maxInt(u8)) : (vec += 1) {
+        const reg_index: u32 = @intCast(vec / 32);
+        const bit_index: u5 = @intCast(vec & 31);
+        const bits = mmioRead(lapic_reg_isr_base + reg_index * 0x10);
+        if ((bits & (@as(u32, 1) << bit_index)) != 0) return @intCast(vec);
+    }
+    return null;
 }
 
 pub fn eoiLegacyPicMaster() void {

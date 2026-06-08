@@ -492,6 +492,11 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         const u64 n = random_read_to_target(dst, len, &fault);
         return reply(fault ? errno_fault() : (n != 0 ? n : errno_again()), 0);
     }
+    if (g_fds[fd].kind == FD_EVENTFD) {
+        int fault = 0;
+        const u64 n = eventfd_read_to_target(fd, dst, len, &fault);
+        return reply(fault ? errno_fault() : n, 0);
+    }
     if (g_fds[fd].kind == FD_SOCKET) {
         return reply(socket_read_to_target(fd, dst, len), 0);
     }
@@ -737,6 +742,11 @@ static struct ipc_message handle_write(const struct trap_request *req) {
         const u8 pipe_id = g_fds[fd].pipe_id;
         int fault = 0; const u64 n = pipe_write_from_target(fd, src, len, &fault);
         if (!fault && (i64)n > 0) try_satisfy_pending_pipe_read(pipe_id);
+        return reply(fault ? errno_fault() : n, 0);
+    }
+    if (fd_valid(fd) && g_fds[fd].kind == FD_EVENTFD) {
+        int fault = 0;
+        const u64 n = eventfd_write_from_target(fd, src, len, &fault);
         return reply(fault ? errno_fault() : n, 0);
     }
     if (fd_valid(fd) && g_fds[fd].kind == FD_FILE) {
@@ -1361,6 +1371,18 @@ static struct ipc_message handle_rt_sigaction(const struct trap_request *req) {
         g_proc->sig_handler[signo] = in[0];
         g_proc->sig_flags[signo] = in[1];
         g_proc->sig_restorer[signo] = in[2];
+        if (profile_trace_enabled()) {
+            profile_trace_prefix("sigaction.set");
+            user_log(" signo=");
+            user_log_dec_value(signo);
+            user_log(" handler=");
+            user_log_hex_inline(in[0]);
+            user_log(" flags=");
+            user_log_hex_inline(in[1]);
+            user_log(" restorer=");
+            user_log_hex_inline(in[2]);
+            user_log("\n");
+        }
     }
     return reply(0, 0);
 }
@@ -1371,6 +1393,34 @@ static struct ipc_message handle_rt_sigreturn(const struct trap_request *req) {
     if (copy_from_target(req->rsp, &body, sizeof(body)) != sizeof(body)) return reply(errno_fault(), 0);
     if (body.magic != LINUX_SIGNAL_FRAME_MAGIC) {
         return reply(errno_inval(), 0);
+    }
+    body.saved_context.rip = body.ucontext.uc_mcontext.rip;
+    body.saved_context.rsp = body.ucontext.uc_mcontext.rsp;
+    body.saved_context.rflags = body.ucontext.uc_mcontext.eflags;
+    body.saved_context.rax = body.ucontext.uc_mcontext.rax;
+    body.saved_context.rbx = body.ucontext.uc_mcontext.rbx;
+    body.saved_context.rcx = body.ucontext.uc_mcontext.rcx;
+    body.saved_context.rdx = body.ucontext.uc_mcontext.rdx;
+    body.saved_context.rsi = body.ucontext.uc_mcontext.rsi;
+    body.saved_context.rdi = body.ucontext.uc_mcontext.rdi;
+    body.saved_context.rbp = body.ucontext.uc_mcontext.rbp;
+    body.saved_context.r8 = body.ucontext.uc_mcontext.r8;
+    body.saved_context.r9 = body.ucontext.uc_mcontext.r9;
+    body.saved_context.r10 = body.ucontext.uc_mcontext.r10;
+    body.saved_context.r11 = body.ucontext.uc_mcontext.r11;
+    body.saved_context.r12 = body.ucontext.uc_mcontext.r12;
+    body.saved_context.r13 = body.ucontext.uc_mcontext.r13;
+    body.saved_context.r14 = body.ucontext.uc_mcontext.r14;
+    body.saved_context.r15 = body.ucontext.uc_mcontext.r15;
+    if (profile_trace_enabled()) {
+        profile_trace_prefix("signal.return");
+        user_log(" signo=");
+        user_log_dec_value(body.signo);
+        user_log(" rip=");
+        user_log_hex_inline(body.saved_context.rip);
+        user_log(" rsp=");
+        user_log_hex_inline(body.saved_context.rsp);
+        user_log("\n");
     }
     const u64 target = abi_reply_target_principal();
     const u64 status = reply_trap_target_context(target, &body.saved_context);
@@ -1413,6 +1463,12 @@ static struct ipc_message handle_rt_sigprocmask(const struct trap_request *req) 
             g_proc->blocked_signals = set_word;
         } else {
             return reply(errno_inval(), 0);
+        }
+        if (profile_trace_enabled()) {
+            profile_trace_prefix("sigprocmask.state");
+            user_log(" mask=");
+            user_log_hex_inline(g_proc->blocked_signals);
+            user_log("\n");
         }
     }
     return reply(0, 0);

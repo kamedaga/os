@@ -864,8 +864,10 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
         \\mov %r15, %rsp
         \\mov %rax, %rsi
         \\pop %rdi
-        \\pop %rax
-        \\mov %rax, %cr3
+        \\pop %r10
+        \\# Keep user RAX live across the CR3 switch; R10 is restored below.
+        \\mov 112(%rsi), %rax
+        \\mov %r10, %cr3
         \\mov 0(%rsi), %r15
         \\mov 8(%rsi), %r14
         \\mov 16(%rsi), %r13
@@ -877,7 +879,6 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
         \\mov 88(%rsi), %rdx
         \\mov 96(%rsi), %rcx
         \\mov 104(%rsi), %rbx
-        \\mov 112(%rsi), %rax
         \\mov %rdi, %rsp
         \\mov 40(%rsi), %r10
         \\mov 72(%rsi), %rdi
@@ -1018,11 +1019,19 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     const h = getHooks();
+    const active_vector = lapic.activeInterruptVectorInRange(
+        device_events.generic_device_interrupt_vector,
+        device_events.msix_device_interrupt_vector_count + 1,
+    ) orelse device_events.generic_device_interrupt_vector;
     lapic.eoi();
     _ = frame;
     if (!scheduler.schedulerRunsOnCurrentCpu()) return;
     if (!h.kernel_state_ready.*) return;
-    _ = device_events.wakeAllBoundDeviceWaiters();
+    if (device_events.msixEntryForInterruptVector(active_vector)) |entry| {
+        _ = device_events.wakeBoundDeviceWaiters(.msix, entry);
+    } else {
+        _ = device_events.wakeAllBoundDeviceWaiters();
+    }
 }
 
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {

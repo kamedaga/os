@@ -114,6 +114,8 @@ static int dispatch_fd_syscall(const struct trap_request *req, struct ipc_messag
     case LINUX_SYS_EPOLL_CREATE1: *msg = handle_epoll_create1(req); return 1;
     case LINUX_SYS_EPOLL_CTL: *msg = handle_epoll_ctl(req); return 1;
     case LINUX_SYS_EPOLL_WAIT: *msg = handle_epoll_wait(req); return 1;
+    case LINUX_SYS_EPOLL_PWAIT: *msg = handle_epoll_wait(req); return 1;
+    case LINUX_SYS_EVENTFD2: *msg = handle_eventfd2(req); return 1;
     case LINUX_SYS_CLOSE: *msg = handle_close(req); return 1;
     case LINUX_SYS_DUP: *msg = handle_dup(req); return 1;
     case LINUX_SYS_DUP2: *msg = handle_dup2_like(req, 0); return 1;
@@ -266,12 +268,14 @@ void linux_abi_main(void) {
         case LINUX_SYS_TIMER_SETTIME: msg = handle_timer_settime(req); break;
         case LINUX_SYS_TIMER_GETTIME: msg = handle_timer_gettime(req); break;
         case LINUX_SYS_TIMER_DELETE: msg = handle_timer_delete(req); break;
+        case LINUX_SYS_SCHED_YIELD: msg = handle_sched_yield(req); break;
         case LINUX_SYS_SCHED_GETAFFINITY: msg = handle_sched_getaffinity(req); break;
         case LINUX_SYS_MEMBARRIER: msg = handle_membarrier(req); break;
         case LINUX_SYS_EXECVE: msg = handle_execve(req); break;
         case LINUX_SYS_MMAP: msg = handle_mmap(req); break;
         case LINUX_SYS_BRK: msg = handle_brk(req); break;
         case LINUX_SYS_MPROTECT: msg = handle_mprotect(req); break;
+        case LINUX_SYS_MADVISE: msg = handle_madvise(req); break;
         case LINUX_SYS_MINCORE: msg = handle_mincore(req); break;
         case LINUX_SYS_MUNMAP: msg = handle_munmap(req); break;
         case LINUX_SYS_MREMAP: msg = handle_mremap(req); break;
@@ -287,10 +291,11 @@ void linux_abi_main(void) {
         case LINUX_SYS_SET_TID_ADDRESS: msg = handle_set_tid_address(req); break;
         case LINUX_SYS_FUTEX: msg = handle_futex(req); break;
         case LINUX_SYS_IOCTL: msg = handle_ioctl(req); break;
-        case LINUX_SYS_MADVISE: case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_FCHOWNAT: case LINUX_SYS_FCHMODAT: case LINUX_SYS_FALLOCATE: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_PRLIMIT64: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_PRLIMIT64: msg = handle_prlimit64(req); break;
+        case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_FCHOWNAT: case LINUX_SYS_FCHMODAT: case LINUX_SYS_FALLOCATE: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
         case LINUX_SYS_LISTXATTR: case LINUX_SYS_LLISTXATTR: case LINUX_SYS_FLISTXATTR: msg = reply(errno_opnotsupp(), 0); break;
         case LINUX_SYS_RENAMEAT2: msg = handle_renameat(req, 0, 1); break;
-        case LINUX_SYS_SPLICE: case LINUX_SYS_EVENTFD2: msg = reply(errno_nosys(), 0); break;
+        case LINUX_SYS_SPLICE: msg = reply(errno_nosys(), 0); break;
         case LINUX_SYS_GETPID: msg = reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0); break;
         case LINUX_SYS_GETTID: msg = reply(g_proc && g_proc->tid != 0 ? g_proc->tid : 1, 0); break;
         case LINUX_SYS_TKILL: msg = handle_tkill(req); break;

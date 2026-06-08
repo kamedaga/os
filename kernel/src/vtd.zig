@@ -12,6 +12,8 @@ const second_level_write: u64 = 1 << 1;
 const second_level_super_page: u64 = 1 << 7;
 
 const context_agaw_39_bit: u64 = 1;
+const agaw_39_iova_bits: u6 = 39;
+const agaw_39_iova_limit: u64 = @as(u64, 1) << agaw_39_iova_bits;
 const domain_id: u64 = 1;
 const identity_gib: usize = 2;
 const msi_identity_base: u64 = 0xfee0_0000;
@@ -440,6 +442,13 @@ pub fn isActive() bool {
     return initialized;
 }
 
+pub fn isAddressableRange(iova: u64, size: u64) bool {
+    if (size == 0) return false;
+    const last, const overflow = @addWithOverflow(iova, size - 1);
+    if (overflow != 0) return false;
+    return last < agaw_39_iova_limit;
+}
+
 fn l3Index(iova: u64) usize {
     return @intCast((iova >> 30) & 0x1ff);
 }
@@ -598,6 +607,7 @@ fn unmapPage(iova: u64) void {
 pub fn mapRange(iova: u64, paddr: u64, size: u64) bool {
     if (!initialized) return true;
     if (iova == 0 or paddr == 0 or size == 0) return false;
+    if (!isAddressableRange(iova, size)) return false;
     const offset = iova & (page_size - 1);
     if ((paddr & (page_size - 1)) != offset) return false;
     const start_iova = iova - offset;
@@ -636,6 +646,7 @@ pub fn mapRange(iova: u64, paddr: u64, size: u64) bool {
 
 pub fn unmapRange(iova: u64, size: u64) void {
     if (!initialized or iova == 0 or size == 0) return;
+    if (!isAddressableRange(iova, size)) return;
     const offset = iova & (page_size - 1);
     const start_iova = iova - offset;
     const span, const overflow = @addWithOverflow(offset, size);

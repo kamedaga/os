@@ -11,3 +11,5 @@ status: active
 - FAT/VFSの書き込み遅延とスパイクを計測・改善する
 - pty/tty層をLinux互換に近づけ、TUI(主にvim)を安定動作させる
 - APKでどんなパッケージでも追加を成功させる
+- USB HIDのMSI-Xデモを安定させる
+- 

@@ -72,6 +72,7 @@ pub const TrapTargets = struct {
     device_interrupt_stub: usize,
     lapic_timer_vector: u8,
     device_interrupt_vector: u8,
+    device_interrupt_vector_count: u8,
 };
 
 var pml4_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
@@ -414,7 +415,11 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     interrupts.setIdtEntryWithIst(&idt, 8, gdt_kernel_code_selector, df_trampoline_entry, 2, 0x8E);
     interrupts.setIdtEntry(&idt, 0x20, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, targets.lapic_timer_vector, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
-    interrupts.setIdtEntry(&idt, targets.device_interrupt_vector, gdt_kernel_code_selector, targets.device_interrupt_stub, 0x8E);
+    var device_vector_index: u16 = 0;
+    while (device_vector_index < targets.device_interrupt_vector_count) : (device_vector_index += 1) {
+        const vector: usize = @as(usize, targets.device_interrupt_vector) + @as(usize, device_vector_index);
+        interrupts.setIdtEntry(&idt, vector, gdt_kernel_code_selector, targets.device_interrupt_stub, 0x8E);
+    }
     interrupts.setIdtEntry(&idt, 0x80, gdt_kernel_code_selector, int80_trampoline_entry, 0xEE);
     interrupts.loadIdt(&idt);
 }

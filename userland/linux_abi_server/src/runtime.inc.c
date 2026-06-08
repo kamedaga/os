@@ -121,11 +121,16 @@ static int linux_signal_default_ignored_inline(u64 signo) {
     return signo == SIGCHLD || signo == SIGURG || signo == SIGWINCH;
 }
 
-static void queue_process_signal(struct linux_process_state *proc, u64 signo) {
+static void queue_process_signal_code(struct linux_process_state *proc, u64 signo, i32 code) {
     if (!proc || signo == 0 || signo >= 65) return;
     if (proc->sig_handler[signo] == 1) return;
     if (proc->sig_handler[signo] == 0 && linux_signal_default_ignored_inline(signo)) return;
     proc->pending_signals |= linux_signal_bit(signo);
+    proc->pending_signal_code[signo] = code;
+}
+
+static void queue_process_signal(struct linux_process_state *proc, u64 signo) {
+    queue_process_signal_code(proc, signo, SI_USER);
 }
 
 static void queue_timer_interrupt_signal(struct linux_process_state *proc, u64 signo) {
@@ -211,7 +216,7 @@ static void process_timers_update(struct linux_process_state *proc) {
             proc->itimer_real_expiry_tick = 0;
         }
         queue_timer_interrupt_signal(proc, SIGALRM);
-        queue_process_signal(proc, SIGALRM);
+        queue_process_signal_code(proc, SIGALRM, SI_TIMER);
     }
     for (u64 i = 0; i < LINUX_POSIX_TIMER_MAX; i++) {
         struct linux_posix_timer_state *timer = &proc->timers[i];
@@ -229,7 +234,7 @@ static void process_timers_update(struct linux_process_state *proc) {
         if (timer->notify == SIGEV_SIGNAL || timer->notify == SIGEV_THREAD_ID) {
             const u64 signo = timer->signo == 0 ? SIGALRM : timer->signo;
             queue_timer_interrupt_signal(proc, signo);
-            queue_process_signal(proc, signo);
+            queue_process_signal_code(proc, signo, SI_TIMER);
         }
     }
 }
@@ -337,11 +342,49 @@ static int try_reply_signal_frame(u64 result, u64 flags) {
     body.magic = LINUX_SIGNAL_FRAME_MAGIC;
     body.signo = signo;
     body.info.si_signo = (i32)signo;
-    body.info.si_code = SI_TIMER;
+    body.info.si_code = g_proc->pending_signal_code[signo];
     fill_user_context_from_request(&body.saved_context, req, result);
+    body.ucontext.uc_stack.ss_sp = g_proc->sigaltstack_sp;
+    body.ucontext.uc_stack.ss_flags = g_proc->sigaltstack_flags != 0 ? g_proc->sigaltstack_flags : SS_DISABLE;
+    body.ucontext.uc_stack.ss_size = g_proc->sigaltstack_size;
+    body.ucontext.uc_sigmask[0] = g_proc->blocked_signals;
+    body.ucontext.uc_mcontext.r8 = req->r8;
+    body.ucontext.uc_mcontext.r9 = req->r9;
+    body.ucontext.uc_mcontext.r10 = req->r10;
+    body.ucontext.uc_mcontext.r11 = req->r11;
+    body.ucontext.uc_mcontext.r12 = req->r12;
+    body.ucontext.uc_mcontext.r13 = req->r13;
+    body.ucontext.uc_mcontext.r14 = req->r14;
+    body.ucontext.uc_mcontext.r15 = req->r15;
+    body.ucontext.uc_mcontext.rdi = req->rdi;
+    body.ucontext.uc_mcontext.rsi = req->rsi;
+    body.ucontext.uc_mcontext.rbp = req->rbp;
+    body.ucontext.uc_mcontext.rbx = req->rbx;
+    body.ucontext.uc_mcontext.rdx = req->rdx;
+    body.ucontext.uc_mcontext.rax = result;
+    body.ucontext.uc_mcontext.rcx = req->rcx;
+    body.ucontext.uc_mcontext.rsp = req->rsp;
+    body.ucontext.uc_mcontext.rip = req->rip;
+    body.ucontext.uc_mcontext.eflags = req->rflags != 0 ? req->rflags : 0x202ULL;
+    body.ucontext.uc_mcontext.cs = 0x33;
+    body.ucontext.uc_mcontext.fs = 0;
+    body.ucontext.uc_mcontext.gs = 0;
 
-    const u64 body_va = (req->rsp - sizeof(body)) & ~15ULL;
+    u64 frame_stack_top = req->rsp;
+    const u64 altstack_start = g_proc->sigaltstack_sp;
+    const u64 altstack_end = altstack_start + g_proc->sigaltstack_size;
+    const int altstack_valid = altstack_start != 0 &&
+        g_proc->sigaltstack_size >= sizeof(body) + 16 &&
+        (g_proc->sigaltstack_flags & SS_DISABLE) == 0 &&
+        altstack_end > altstack_start;
+    const int on_altstack = altstack_valid && req->rsp >= altstack_start && req->rsp < altstack_end;
+    if ((g_proc->sig_flags[signo] & SA_ONSTACK) != 0 && altstack_valid && !on_altstack) {
+        frame_stack_top = altstack_end;
+        body.ucontext.uc_stack.ss_flags = SS_ONSTACK;
+    }
+    const u64 body_va = (frame_stack_top - sizeof(body)) & ~15ULL;
     const u64 return_slot_va = body_va - 8ULL;
+    if (altstack_valid && frame_stack_top == altstack_end && return_slot_va < altstack_start) return 0;
     if (!copy_to_current_reply_target(return_slot_va, &restorer, sizeof(restorer))) return 0;
     if (!copy_to_current_reply_target(body_va, &body, sizeof(body))) return 0;
 
@@ -352,9 +395,29 @@ static int try_reply_signal_frame(u64 result, u64 flags) {
     handler_context.rax = 0;
     handler_context.rdi = signo;
     handler_context.rsi = body_va + OFFSETOF(struct linux_signal_frame_body, info);
-    handler_context.rdx = body_va;
+    handler_context.rdx = body_va + OFFSETOF(struct linux_signal_frame_body, ucontext);
+
+    if (profile_trace_enabled()) {
+        profile_trace_prefix("signal.deliver");
+        user_log(" signo=");
+        user_log_dec_value(signo);
+        user_log(" code=");
+        user_log_dec_value((u64)(i64)body.info.si_code);
+        user_log(" handler=");
+        user_log_hex_inline(handler);
+        user_log(" restorer=");
+        user_log_hex_inline(restorer);
+        user_log(" from_rip=");
+        user_log_hex_inline(req->rip);
+        user_log(" frame=");
+        user_log_hex_inline(body_va);
+        user_log(" stack=");
+        user_log_hex_inline(frame_stack_top);
+        user_log("\n");
+    }
 
     g_proc->pending_signals &= ~linux_signal_bit(signo);
+    g_proc->pending_signal_code[signo] = 0;
     const u64 target = abi_reply_target_principal();
     const u64 status = reply_trap_target_context(target, &handler_context);
     if (status != SYSCALL_OK) {

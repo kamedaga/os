@@ -1067,6 +1067,7 @@ pub fn saveApUserTimerFrame(frame: *const TrapFrame) bool {
     const ctx = getThreadContext(thread_index) orelse return false;
     const hot = getIpcHotThread(thread_index) orelse return false;
     if (!ctx.allocated or hot.allocated == 0) return false;
+    clearStaleAbiTrapReplyPendingForUserFrame(ctx, frame);
     if (ctx.abi_trap_reply_pending) return false;
     ctx.frame = frame.*;
     state.consumed_handoff_thread = null;
@@ -1850,11 +1851,25 @@ pub fn setThreadGsBase(thread_index: usize, gs_base: u64) bool {
     return true;
 }
 
+fn clearStaleAbiTrapReplyPendingForUserFrame(ctx: *ThreadContext, frame: *const TrapFrame) void {
+    const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
+    if (!user_mode) return;
+    if (!ctx.abi_trap_reply_pending and !ctx.abi_trap_context_reply_pending) return;
+
+    // Once a thread is executing in user mode, it is no longer waiting in the
+    // kernel for an ABI trap reply. Leaving this bit set lets a late reply
+    // overwrite an unrelated preempted user frame.
+    ctx.abi_trap_reply_pending = false;
+    ctx.abi_trap_context_reply_pending = false;
+    ctx.abi_trap_context_frame = std.mem.zeroes(TrapFrame);
+}
+
 pub fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
     const current_thread = currentThreadIndex();
     const ctx = getThreadContext(current_thread) orelse return;
     if (!ctx.allocated) return;
     ctx.frame = frame.*;
+    clearStaleAbiTrapReplyPendingForUserFrame(ctx, frame);
     ctx.cr3 = currentUserCr3();
     setIpcHotCr3(current_thread, ctx.cr3);
     const hot = getIpcHotThreadConst(current_thread) orelse return;
