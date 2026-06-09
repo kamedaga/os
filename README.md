@@ -3,6 +3,8 @@
 > Capability-based pure microkernel OS written in Zig — Linux ABI compatible, userland-first.
 
 ![Zig](https://img.shields.io/badge/kernel-Zig-f7a41d?style=flat-square&logo=zig)
+![Go](https://img.shields.io/badge/tooling-Go-00ADD8?style=flat-square&logo=go)
+![Nix](https://img.shields.io/badge/env-Nix-5277C3?style=flat-square&logo=nixos)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-x86__64-lightgrey?style=flat-square)
 ![Status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)
