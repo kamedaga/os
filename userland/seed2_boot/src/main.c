@@ -101,7 +101,7 @@ enum {
     USER_STACK_BOTTOM_VA = USER_STACK_TOP - USER_STACK_PAGES * 4096,
     USER_ENTRY_RSP = USER_STACK_TOP - 8,
 
-    BLOCK_CONFIG_MAGIC = 0x424C4B43,
+    BLOCK_CONFIG_MAGIC = 0x424C4B43,    
     BLOCK_CONFIG_VERSION = 1,
     BLOCK_STATUS_READY = 0x44524459,
     BLOCK_ENDPOINT_ID_INDEX = 2,
@@ -1826,7 +1826,7 @@ static void spawn_root_seed2_direct(void) {
     config[10] = DEVICE_CATALOG_READY;
     user_log("[seed2_boot] root seed2 spawned from rootfs\n");
 }
-
+//launch block server
 static void launch_block_server(void) {
     struct loaded_file image;
     struct queue_grant grant;

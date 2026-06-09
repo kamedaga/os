@@ -37,6 +37,7 @@ func runPlan(ctx *context) error {
 		{"apps", fmt.Sprintf("%d (%d active, %d skipped)", len(apps), active, skipped)},
 		{"disk", fmt.Sprintf("%s (%d MiB)", ctx.workspace.Disk.Image, ctx.workspace.Disk.SizeMiB)},
 		{"artifacts", ctx.workspace.Artifacts},
+		{"manifests", ctx.workspace.Manifests.Dir},
 		{"skip apps", dash(strings.Join(ctx.workspace.Skip.Apps, ", "))},
 		{"skip kinds", dash(strings.Join(ctx.workspace.Skip.Kinds, ", "))},
 	})

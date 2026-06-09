@@ -3,8 +3,26 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+color_enabled() {
+  if [ -n "${NO_COLOR:-}" ] || [ "${PACGO_COLOR:-}" = "never" ]; then
+    return 1
+  fi
+  if [ "${PACGO_COLOR:-}" = "always" ]; then
+    return 0
+  fi
+  [ -t 1 ] && [ "${TERM:-}" != "dumb" ]
+}
+
+task() {
+  if color_enabled; then
+    printf '\n\033[34m\033[1m> Task\033[0m \033[36m\033[1m:%s\033[0m\n' "$1"
+  else
+    printf '\n> Task :%s\n' "$1"
+  fi
+}
+
 if [ "${PACGO_NIX_DEVELOP:-}" != "1" ]; then
-  echo "> Task :nix:develop"
+  task "nix:develop"
   exec nix develop "$root" --command "$root/pacgo" "$@"
 fi
 
@@ -24,7 +42,7 @@ else
 fi
 
 if [ "$needs_build" = "1" ]; then
-  echo "> Task :pacgo:compile"
+  task "pacgo:compile"
   (cd "$root/pack" && go build -o "$bin" ./cmd/pacgo)
 fi
 

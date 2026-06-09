@@ -32,6 +32,8 @@
         {
           default = pkgs.mkShell {
             packages = toolchains.devPackages;
+            CAPOS_UNWRAPPED_CLANG = "${toolchains.clangFreestanding}/bin/clang";
+            CAPOS_FREESTANDING_CC = "${toolchains.clangFreestanding}/bin/clang";
             CAPOS_QEMU = "${pkgs.qemu}/bin/qemu-system-x86_64";
             CAPOS_QEMU_IMG = "${pkgs.qemu}/bin/qemu-img";
             CAPOS_OVMF_CODE = "${pkgs.OVMF.fd}/FV/OVMF_CODE.fd";

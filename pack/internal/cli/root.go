@@ -25,16 +25,24 @@ func Execute() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	if helpRequested(os.Args[1:]) {
+		return 0
+	}
 	ui.Success(ctx.started, label(os.Args[1:]))
 	return 0
 }
 
 func rootCommand(ctx *context) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:           "pacgo",
-		Short:         "CapabilityOS build and packaging tool",
-		SilenceUsage:  true,
-		SilenceErrors: true,
+		Use:   "pacgo",
+		Short: "CapabilityOS build and packaging tool",
+		Long: `pacgo is the fast local build runner for CapabilityOS.
+
+Nix owns the reproducible WSL Linux toolchain. pacgo owns the day-to-day build,
+packaging, image sync, QEMU, and test tasks.`,
+		SilenceUsage:      true,
+		SilenceErrors:     true,
+		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.CommandPath() == "pacgo help" {
 				return nil
@@ -55,16 +63,18 @@ func rootCommand(ctx *context) *cobra.Command {
 			return runPlan(ctx)
 		},
 	}
+	cmd.SetHelpTemplate(helpTemplate)
 	cmd.AddCommand(planCommand(ctx))
 	cmd.AddCommand(appCommand(ctx))
 	cmd.AddCommand(buildCommand(ctx))
 	cmd.AddCommand(genCommand(ctx))
 	cmd.AddCommand(syncCommand(ctx))
-	cmd.AddCommand(stubCommand(ctx, "image"))
-	cmd.AddCommand(stubCommand(ctx, "qemu"))
-	cmd.AddCommand(stubCommand(ctx, "test"))
-	cmd.AddCommand(stubCommand(ctx, "all"))
-	cmd.AddCommand(stubCommand(ctx, "ci"))
+	cmd.AddCommand(stubCommand(ctx, "image", "Create or update disk image"))
+	cmd.AddCommand(qemuCommand(ctx))
+	cmd.AddCommand(qemuTestCommand(ctx, "qemu-test"))
+	cmd.AddCommand(testCommand(ctx))
+	cmd.AddCommand(stubCommand(ctx, "all", "Run the full local pipeline"))
+	cmd.AddCommand(stubCommand(ctx, "ci", "Run the CI pipeline"))
 	return cmd
 }
 
@@ -75,14 +85,38 @@ func label(args []string) string {
 	return strings.Join(args, ":")
 }
 
-func stubCommand(ctx *context, name string) *cobra.Command {
+func helpRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" || arg == "help" {
+			return true
+		}
+	}
+	return false
+}
+
+func stubCommand(ctx *context, name string, short string) *cobra.Command {
 	return &cobra.Command{
 		Use:   name,
-		Short: name + " task",
+		Short: short,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ui.Task(name)
-			fmt.Println("not implemented yet")
+			ui.Pending("not implemented yet")
 			return nil
 		},
 	}
 }
+
+const helpTemplate = `{{with (or .Long .Short)}}{{. | trimTrailingWhitespaces}}
+
+{{end}}Usage:
+  {{.UseLine}}
+{{if .HasAvailableSubCommands}}
+Tasks:
+{{range .Commands}}{{if (or .IsAvailableCommand (eq .Name "help"))}}  {{rpad .Name .NamePadding }} {{.Short}}
+{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
+Flags:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}
+{{end}}{{if .HasAvailableInheritedFlags}}
+Global Flags:
+{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}
+{{end}}`

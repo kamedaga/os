@@ -3,12 +3,16 @@
 #if defined(__clang__)
 #define FAT_NOINLINE_NOOPT __attribute__((noinline, optnone))
 #define FAT_UNUSED __attribute__((unused))
+#define FAT_USED __attribute__((used))
 #else
 #define FAT_NOINLINE_NOOPT __attribute__((noinline))
 #define FAT_UNUSED
+#define FAT_USED
 #endif
 
 #define FAT_PROFILE_READ_BULK 0
+
+FAT_USED static const char k_pacgo_rootfs_sync_probe[] = "pacgo-rootfs-sync-probe";
 
 enum {
     SYSCALL_ALLOC_PAGE = 0x1,

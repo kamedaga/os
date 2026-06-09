@@ -12,7 +12,7 @@ disk:
   partitions:
     esp:
       index: 1
-      format: "fat16"
+      format: "fat32"
       sizeMiB: 192
       grow: false
     rootfs:
@@ -29,7 +29,7 @@ startupManifest:
   include: ["rootfs"]
 rootfsDirs: ["/cmd", "/bin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
-  apps: ["alpine_clang", "persistent_fs", "seed", "shell"]
+  apps: ["persistent_fs", "seed", "shell"]
   kinds: []
   includeSkippedArtifacts: false
 apps:
@@ -38,6 +38,7 @@ apps:
       path: ".artifacts/userland-fixtures/alpine-clang-root"
       rebuild: ["bash", "tools/build_wsl_alpine_clang.sh"]
     out: "ROOT"
+    rootfs: "/"
   alpine_go:
     file:
       path: ".artifacts/userland-fixtures/alpine-go-root"
@@ -200,11 +201,15 @@ apps:
     out: "GNUGREP.ELF"
     rootfs: "/bin/grep"
   kobox_hid:
-    file: ".artifacts/userland-fixtures/kobox-modules/hid.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/hid.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "HID.KO"
     rootfs: "/usr/lib/kobox/hid.ko"
   kobox_hid_generic:
-    file: ".artifacts/userland-fixtures/kobox-modules/hid-generic.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/hid-generic.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "HIDGEN.KO"
     rootfs: "/usr/lib/kobox/hid-generic.ko"
   kobox_inspect:
@@ -220,15 +225,21 @@ apps:
     out: "KOBOXLSD.ELF"
     rootfs: ["/cmd/kobox-ls-devices.elf", "/bin/kobox-ls-devices"]
   kobox_nvme:
-    file: ".artifacts/userland-fixtures/kobox-modules/nvme.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/nvme.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVME.KO"
     rootfs: "/usr/lib/kobox/nvme.ko"
   kobox_nvme_auth:
-    file: ".artifacts/userland-fixtures/kobox-modules/nvme-auth.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/nvme-auth.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVMEAUTH.KO"
     rootfs: "/usr/lib/kobox/nvme-auth.ko"
   kobox_nvme_core:
-    file: ".artifacts/userland-fixtures/kobox-modules/nvme-core.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/nvme-core.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVMECOR.KO"
     rootfs: "/usr/lib/kobox/nvme-core.ko"
   kobox_run:
@@ -238,23 +249,33 @@ apps:
     out: "KOBOXRUN.ELF"
     rootfs: ["/cmd/kobox-run.elf", "/bin/kobox-run"]
   kobox_usb_storage:
-    file: ".artifacts/userland-fixtures/kobox-modules/usb-storage.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/usb-storage.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "USBSTOR.KO"
     rootfs: "/usr/lib/kobox/usb-storage.ko"
   kobox_usbcore:
-    file: ".artifacts/userland-fixtures/kobox-modules/usbcore.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/usbcore.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "USBCORE.KO"
     rootfs: "/usr/lib/kobox/usbcore.ko"
   kobox_usbhid:
-    file: ".artifacts/userland-fixtures/kobox-modules/usbhid.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/usbhid.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "USBHID.KO"
     rootfs: "/usr/lib/kobox/usbhid.ko"
   kobox_xhci_hcd:
-    file: ".artifacts/userland-fixtures/kobox-modules/xhci-hcd.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/xhci-hcd.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "XHCIHCD.KO"
     rootfs: "/usr/lib/kobox/xhci-hcd.ko"
   kobox_xhci_pci:
-    file: ".artifacts/userland-fixtures/kobox-modules/xhci-pci.ko"
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/xhci-pci.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "XHCIPCI.KO"
     rootfs: "/usr/lib/kobox/xhci-pci.ko"
   ld_musl_path:

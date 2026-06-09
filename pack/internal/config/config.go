@@ -13,18 +13,20 @@ import (
 const PackFile = "pack/pack.yaml"
 
 type Workspace struct {
-	Root       string
-	ConfigPath string
-	Schema     int               `yaml:"schema"`
-	Name       string            `yaml:"name"`
-	Artifacts  string            `yaml:"artifacts"`
-	State      string            `yaml:"state"`
-	Kernel     Kernel            `yaml:"kernel"`
-	Disk       Disk              `yaml:"disk"`
-	Manifests  map[string]string `yaml:"manifests"`
-	RootfsDirs []string          `yaml:"rootfsDirs"`
-	Skip       Skip              `yaml:"skip"`
-	AppsMap    map[string]App    `yaml:"apps"`
+	Root            string
+	ConfigPath      string
+	Schema          int               `yaml:"schema"`
+	Name            string            `yaml:"name"`
+	Artifacts       string            `yaml:"artifacts"`
+	State           string            `yaml:"state"`
+	Kernel          Kernel            `yaml:"kernel"`
+	Disk            Disk              `yaml:"disk"`
+	Manifests       Manifests         `yaml:"manifests"`
+	StartupManifest StartupManifest   `yaml:"startupManifest"`
+	RootfsDirs      []string          `yaml:"rootfsDirs"`
+	Skip            Skip              `yaml:"skip"`
+	AppsMap         map[string]App    `yaml:"apps"`
+	Raw             map[string]string `yaml:"-"`
 }
 
 type Kernel struct {
@@ -50,6 +52,18 @@ type Skip struct {
 	Apps                    []string `yaml:"apps"`
 	Kinds                   []string `yaml:"kinds"`
 	IncludeSkippedArtifacts bool     `yaml:"includeSkippedArtifacts"`
+}
+
+type Manifests struct {
+	Dir     string `yaml:"dir"`
+	Bootfs  string `yaml:"bootfs"`
+	Rootfs  string `yaml:"rootfs"`
+	Startup string `yaml:"startup"`
+}
+
+type StartupManifest struct {
+	Path    string   `yaml:"path"`
+	Include []string `yaml:"include"`
 }
 
 type App struct {
@@ -126,6 +140,21 @@ func (w *Workspace) defaults() {
 	if w.Disk.SizeMiB == 0 {
 		w.Disk.SizeMiB = 512
 	}
+	if w.Manifests.Dir == "" {
+		w.Manifests.Dir = ".artifacts/manifests"
+	}
+	if w.Manifests.Bootfs == "" {
+		w.Manifests.Bootfs = filepath.Join(w.Manifests.Dir, "bootfs.generated.txt")
+	}
+	if w.Manifests.Rootfs == "" {
+		w.Manifests.Rootfs = filepath.Join(w.Manifests.Dir, "rootfs.generated.txt")
+	}
+	if w.Manifests.Startup == "" {
+		w.Manifests.Startup = filepath.Join(w.Manifests.Dir, "startup.generated.txt")
+	}
+	if w.StartupManifest.Path == "" {
+		w.StartupManifest.Path = "/sys/startup_manifest.txt"
+	}
 	for id, app := range w.AppsMap {
 		app.ID = id
 		if app.Role == "" {
@@ -169,6 +198,32 @@ func (w *Workspace) Skipped(app App) bool {
 	return false
 }
 
+func (w *Workspace) Path(parts ...string) string {
+	items := append([]string{w.Root}, parts...)
+	return filepath.Join(items...)
+}
+
+func (w *Workspace) Rel(path string) string {
+	if filepath.IsAbs(path) {
+		if rel, err := filepath.Rel(w.Root, path); err == nil {
+			return filepath.ToSlash(rel)
+		}
+		return filepath.ToSlash(path)
+	}
+	return filepath.ToSlash(path)
+}
+
+func (w *Workspace) ArtifactPath(app App) string {
+	return filepath.Join(w.Root, w.Artifacts, "userland", app.ID, app.OutputName())
+}
+
+func (a App) OutputName() string {
+	if a.Out != "" {
+		return a.Out
+	}
+	return a.ID
+}
+
 func (a App) Kind() string {
 	if a.Zig != nil {
 		return "zig"
@@ -177,6 +232,124 @@ func (a App) Kind() string {
 		return "file"
 	}
 	return "none"
+}
+
+type FileSource struct {
+	Path    string
+	Rebuild []string
+}
+
+type ZigSource struct {
+	Entry   string
+	Module  string
+	Imports []string
+}
+
+type Publish struct {
+	ID   string
+	Path string
+}
+
+type Startup struct {
+	Publish  string
+	Action   string
+	Name     string
+	Label    string
+	Load     string
+	After    []string
+	Requires []string
+	Provides []string
+	Ensure   []string
+	Block    []string
+	Device   []string
+	Input    []string
+}
+
+func (a App) FileSource() (FileSource, error) {
+	switch typed := a.File.(type) {
+	case nil:
+		return FileSource{}, fmt.Errorf("app %s has no file source", a.ID)
+	case string:
+		return FileSource{Path: typed}, nil
+	case map[string]any:
+		src := FileSource{}
+		if value, ok := typed["path"]; ok {
+			src.Path = fmt.Sprint(value)
+		}
+		if value, ok := typed["rebuild"]; ok {
+			src.Rebuild = stringSlice(value)
+		}
+		if src.Path == "" {
+			return FileSource{}, fmt.Errorf("app %s file source is missing path", a.ID)
+		}
+		return src, nil
+	default:
+		return FileSource{}, fmt.Errorf("app %s has unsupported file source", a.ID)
+	}
+}
+
+func (a App) ZigSource() (ZigSource, error) {
+	if a.Zig == nil {
+		return ZigSource{}, fmt.Errorf("app %s has no zig source", a.ID)
+	}
+	src := ZigSource{
+		Entry:   fmt.Sprint(a.Zig["entry"]),
+		Module:  fmt.Sprint(a.Zig["module"]),
+		Imports: stringSlice(a.Zig["imports"]),
+	}
+	if src.Entry == "" || src.Entry == "<nil>" {
+		return ZigSource{}, fmt.Errorf("app %s zig source is missing entry", a.ID)
+	}
+	if src.Module != "" && src.Module != "<nil>" && !contains(src.Imports, src.Module) {
+		src.Imports = append(src.Imports, src.Module)
+	}
+	return src, nil
+}
+
+func (a App) Publishes(fs string) []Publish {
+	var out []Publish
+	for _, publish := range publishEntries(a.publishValue(fs)) {
+		out = append(out, publish)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path == out[j].Path {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
+
+func (a App) StartupConfig() (Startup, bool) {
+	if a.Startup == nil {
+		return Startup{}, false
+	}
+	startup := Startup{
+		Publish:  stringField(a.Startup, "publish"),
+		Action:   stringField(a.Startup, "action"),
+		Name:     stringField(a.Startup, "name"),
+		Label:    stringField(a.Startup, "label"),
+		Load:     stringField(a.Startup, "load"),
+		After:    stringSlice(a.Startup["after"]),
+		Requires: stringSlice(a.Startup["requires"]),
+		Provides: stringSlice(a.Startup["provides"]),
+		Ensure:   stringSlice(a.Startup["ensure"]),
+		Block:    stringSlice(a.Startup["block"]),
+		Device:   stringSlice(a.Startup["device"]),
+		Input:    stringSlice(a.Startup["input"]),
+	}
+	return startup, true
+}
+
+func (a App) publishValue(fs string) any {
+	switch fs {
+	case "bootfs":
+		return a.Bootfs
+	case "rootfs":
+		return a.Rootfs
+	default:
+		return nil
+	}
 }
 
 func (a App) PublishSummary() []string {
@@ -213,4 +386,63 @@ func publishPaths(value any) []string {
 	default:
 		return []string{fmt.Sprint(typed)}
 	}
+}
+
+func publishEntries(value any) []Publish {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		return []Publish{{ID: "default", Path: typed}}
+	case []any:
+		out := make([]Publish, 0, len(typed))
+		for i, item := range typed {
+			out = append(out, Publish{ID: fmt.Sprintf("%d", i), Path: fmt.Sprint(item)})
+		}
+		return out
+	case map[string]any:
+		out := make([]Publish, 0, len(typed))
+		for key, item := range typed {
+			out = append(out, Publish{ID: key, Path: fmt.Sprint(item)})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out
+	default:
+		return []Publish{{ID: "default", Path: fmt.Sprint(typed)}}
+	}
+}
+
+func stringField(values map[string]any, key string) string {
+	if value, ok := values[key]; ok {
+		return fmt.Sprint(value)
+	}
+	return ""
+}
+
+func stringSlice(value any) []string {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		return []string{typed}
+	case []string:
+		return append([]string{}, typed...)
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, fmt.Sprint(item))
+		}
+		return out
+	default:
+		return []string{fmt.Sprint(typed)}
+	}
+}
+
+func contains(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
 }

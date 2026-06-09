@@ -95,8 +95,9 @@ hello world
 ## Build
 
 ```powershell
-pactl setup full
-pactl run
+nix develop
+./pacgo sync rootfs
+./pacgo qemu --new-terminal
 ```
 
 詳細は [ビルドガイド](pacha_docs/build.md) を参照してください（動作確認済みバージョン・依存関係など）。
