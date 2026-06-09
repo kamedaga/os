@@ -36,10 +36,13 @@
             CAPOS_QEMU_IMG = "${pkgs.qemu}/bin/qemu-img";
             CAPOS_OVMF_CODE = "${pkgs.OVMF.fd}/FV/OVMF_CODE.fd";
             CAPOS_OVMF_VARS_TEMPLATE = "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd";
+            PACGO_NIX_DEVELOP = "1";
             shellHook = ''
-              echo "CapabilityOS dev shell"
-              echo "  runner: go run ./pack/cmd/pacgo"
-              echo "  qemu:   $CAPOS_QEMU"
+              if [ -n "''${PS1-}" ]; then
+                echo "CapabilityOS dev shell"
+                echo "  runner: ./pacgo"
+                echo "  qemu:   $CAPOS_QEMU"
+              fi
             '';
           };
         }

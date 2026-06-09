@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "${PACGO_NIX_DEVELOP:-}" != "1" ]; then
+  echo "> Task :nix:develop"
+  exec nix develop "$root" --command "$root/pacgo" "$@"
+fi
+
+bin="$root/.artifacts/bin/pacgo"
+mkdir -p "$(dirname "$bin")"
+
+needs_build=0
+if [ ! -x "$bin" ]; then
+  needs_build=1
+else
+  while IFS= read -r path; do
+    if [ "$path" -nt "$bin" ]; then
+      needs_build=1
+      break
+    fi
+  done < <(find "$root/pack" -type f \( -name '*.go' -o -name go.mod -o -name go.sum \))
+fi
+
+if [ "$needs_build" = "1" ]; then
+  echo "> Task :pacgo:compile"
+  (cd "$root/pack" && go build -o "$bin" ./cmd/pacgo)
+fi
+
+exec "$bin" "$@"
