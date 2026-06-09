@@ -1,14 +1,9 @@
 { pkgs }:
 
 let
-  pythonEnv = pkgs.python3.withPackages (pythonPackages: [
-    pythonPackages.pyyaml
-    pythonPackages.rich
-  ]);
   zig = pkgs.zig_0_15;
 in
 {
-  python = pythonEnv;
   inherit zig;
 
   devPackages = with pkgs; [
@@ -18,12 +13,12 @@ in
     dosfstools
     e2fsprogs
     e2tools
+    go
     gptfdisk
     lld
     mtools
     ninja
     pkg-config
-    pythonEnv
     qemu
     ripgrep
     zig

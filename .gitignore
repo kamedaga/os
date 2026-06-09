@@ -28,6 +28,7 @@ target/
 *.trace
 *.dump
 *.dmp
+*.lock
 _disk_bootx64.efi
 
 # Temporary files
