@@ -1,0 +1,490 @@
+schema: 1
+name: "CapabilityOS"
+artifacts: ".artifacts"
+state: ".artifacts/pack"
+kernel:
+  dir: "kernel"
+  step: "efi"
+disk:
+  image: ".artifacts/disk.img"
+  sizeMiB: 4096
+  recreate: "if-missing"
+  partitions:
+    esp:
+      index: 1
+      format: "fat16"
+      sizeMiB: 192
+      grow: false
+    rootfs:
+      index: 2
+      format: "fat32"
+      grow: true
+manifests:
+  dir: ".artifacts/manifests"
+  bootfs: ".artifacts/manifests/bootfs.generated.txt"
+  rootfs: ".artifacts/manifests/rootfs.generated.txt"
+  startup: ".artifacts/manifests/startup.generated.txt"
+startupManifest:
+  path: "/sys/startup_manifest.txt"
+  include: ["rootfs"]
+rootfsDirs: ["/cmd", "/bin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
+skip:
+  apps: ["alpine_clang", "persistent_fs", "seed", "shell"]
+  kinds: []
+  includeSkippedArtifacts: false
+apps:
+  alpine_clang:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-clang-root"
+      rebuild: ["bash", "tools/build_wsl_alpine_clang.sh"]
+    out: "ROOT"
+  alpine_go:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-go-root"
+      rebuild: ["bash", "tools/build_wsl_alpine_go.sh"]
+    out: "ROOT"
+    rootfs: "/"
+  alpine_key_4a6a0840:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-keys/alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub"
+      rebuild: ["bash", "tools/build_wsl_alpine_keys.sh"]
+    out: "ALPKEY40.PUB"
+    rootfs: "/etc/apk/keys/alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub"
+  alpine_key_5243ef4b:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-keys/alpine-devel@lists.alpinelinux.org-5243ef4b.rsa.pub"
+      rebuild: ["bash", "tools/build_wsl_alpine_keys.sh"]
+    out: "ALPKEY52.PUB"
+    rootfs: "/etc/apk/keys/alpine-devel@lists.alpinelinux.org-5243ef4b.rsa.pub"
+  alpine_key_5261cecb:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-keys/alpine-devel@lists.alpinelinux.org-5261cecb.rsa.pub"
+      rebuild: ["bash", "tools/build_wsl_alpine_keys.sh"]
+    out: "ALPKEYCE.PUB"
+    rootfs: "/etc/apk/keys/alpine-devel@lists.alpinelinux.org-5261cecb.rsa.pub"
+  alpine_key_6165ee59:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub"
+      rebuild: ["bash", "tools/build_wsl_alpine_keys.sh"]
+    out: "ALPKEY65.PUB"
+    rootfs: "/etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub"
+  alpine_key_61666e3f:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-keys/alpine-devel@lists.alpinelinux.org-61666e3f.rsa.pub"
+      rebuild: ["bash", "tools/build_wsl_alpine_keys.sh"]
+    out: "ALPKEY66.PUB"
+    rootfs: "/etc/apk/keys/alpine-devel@lists.alpinelinux.org-61666e3f.rsa.pub"
+  apk:
+    file:
+      path: ".artifacts/userland-fixtures/apk.elf"
+      rebuild: ["bash", "tools/build_wsl_apk_tools.sh"]
+    out: "APK.ELF"
+    rootfs: ["/cmd/apk.elf", "/bin/apk", "/usr/bin/apk"]
+  apk_arch:
+    file:
+      path: ".artifacts/userland-fixtures/apk-arch"
+      rebuild: ["bash", "tools/build_wsl_apk_config.sh"]
+    out: "APKARCH.TXT"
+    rootfs: "/etc/apk/arch"
+  apk_repositories:
+    file:
+      path: ".artifacts/userland-fixtures/apk-repositories"
+      rebuild: ["bash", "tools/build_wsl_apk_config.sh"]
+    out: "APKREPOS.TXT"
+    rootfs: "/etc/apk/repositories"
+  apk_world:
+    file:
+      path: ".artifacts/userland-fixtures/apk-world"
+      rebuild: ["bash", "tools/build_wsl_apk_config.sh"]
+    out: "APKWORLD.TXT"
+    rootfs: "/etc/apk/world"
+  ca_certificates:
+    file:
+      path: ".artifacts/userland-fixtures/ca-certificates.crt"
+      rebuild: ["bash", "tools/build_wsl_ca_certificates.sh"]
+    out: "CA_CERTIFICATES.CRT"
+    rootfs: ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"]
+  capsule_demo:
+    file:
+      path: ".artifacts/userland-fixtures/capsule_demo.elf"
+      rebuild: ["bash", "tools/build_wsl_capsule_demo.sh"]
+    out: "CAPDEMO.ELF"
+    rootfs: ["/cmd/capsule_demo.elf", "/bin/capsule_demo"]
+  curl:
+    file:
+      path: ".artifacts/userland-fixtures/curl.elf"
+      rebuild: ["bash", "tools/build_wsl_curl.sh"]
+    out: "CURL.ELF"
+    rootfs: ["/cmd/curl.elf", "/bin/curl"]
+  dash:
+    file: "userland/fixtures/shell/dash.elf"
+    out: "DASH.ELF"
+    rootfs:
+      rootfs: "/cmd/dash.elf"
+      rootfs_interactive: "/cmd/dash_interactive.elf"
+      bin_dash: "/bin/dash"
+      bin_sh: "/bin/sh"
+    startup:
+      publish: "rootfs_interactive"
+      action: "linux_exec"
+      name: "dash"
+      label: "dash"
+      load: "rootfs"
+      after: ["linux_abi_server"]
+      requires: ["exec_service"]
+  dns_lookup:
+    file:
+      path: ".artifacts/userland-fixtures/dns_lookup.elf"
+      rebuild: ["bash", "tools/build_wsl_dns_lookup.sh"]
+    out: "DNSLOOK.ELF"
+    rootfs: ["/cmd/dns_lookup.elf", "/bin/dns_lookup"]
+  esp_server:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/esp_server/esp_server.elf"
+      rebuild: ["bash", "tools/build_esp_server.sh"]
+    out: "ESPSRV.ELF"
+    rootfs: "/srv/esp_server.elf"
+  esp_server_smoke:
+    role: "test"
+    file:
+      path: ".artifacts/cmake/esp_server/esp_server_smoke.elf"
+      rebuild: ["bash", "tools/build_esp_server.sh"]
+    out: "ESPSMOKE.ELF"
+    rootfs: "/srv/esp_server_smoke.elf"
+  exec:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/exec/exec.elf"
+      rebuild: ["bash", "tools/build_exec.sh"]
+    out: "EXEC.ELF"
+    rootfs: "/srv/exec.elf"
+  exec_service:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/exec/exec.elf"
+      rebuild: ["bash", "tools/build_exec.sh"]
+    out: "EXECSVC.ELF"
+    rootfs:
+      rootfs: "/srv/exec_service.elf"
+    startup:
+      publish: "rootfs"
+      action: "process_builder"
+      name: "exec_service"
+      label: "exec_service"
+      load: "rootfs"
+      requires: ["vfs_service"]
+      provides: ["exec_service"]
+  fastfetch:
+    file:
+      path: ".artifacts/userland-fixtures/fastfetch.elf"
+      rebuild: ["bash", "tools/build_wsl_fastfetch.sh"]
+    out: "FASTFETCH.ELF"
+    rootfs: ["/cmd/fastfetch.elf", "/bin/fastfetch"]
+  fastfetch_config:
+    file: "userland/fixtures/base/fastfetch-capabilityos.jsonc"
+    out: "CAPFF.JSONC"
+    rootfs: ["/share/fastfetch/capabilityos.jsonc", "/etc/fastfetch/config.jsonc"]
+  fat_server:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/rootfs_fat_server/fat_server.elf"
+      rebuild: ["bash", "tools/build_fat_server.sh"]
+    out: "FATSRV.ELF"
+    bootfs: "/srv/fat_server.elf"
+    rootfs: "/srv/fat_server.elf"
+  gnu_grep:
+    file:
+      path: ".artifacts/userland-fixtures/gnu-grep.elf"
+      rebuild: ["bash", "tools/build_wsl_gnu_grep.sh"]
+    out: "GNUGREP.ELF"
+    rootfs: "/bin/grep"
+  kobox_hid:
+    file: ".artifacts/userland-fixtures/kobox-modules/hid.ko"
+    out: "HID.KO"
+    rootfs: "/usr/lib/kobox/hid.ko"
+  kobox_hid_generic:
+    file: ".artifacts/userland-fixtures/kobox-modules/hid-generic.ko"
+    out: "HIDGEN.KO"
+    rootfs: "/usr/lib/kobox/hid-generic.ko"
+  kobox_inspect:
+    file:
+      path: ".artifacts/userland-fixtures/kobox/kobox-inspect.elf"
+      rebuild: ["bash", "tools/build_wsl_kobox.sh"]
+    out: "KOBOXINS.ELF"
+    rootfs: ["/cmd/kobox-inspect.elf", "/bin/kobox-inspect"]
+  kobox_ls_devices:
+    file:
+      path: ".artifacts/userland-fixtures/kobox/kobox-ls-devices.elf"
+      rebuild: ["bash", "tools/build_wsl_kobox.sh"]
+    out: "KOBOXLSD.ELF"
+    rootfs: ["/cmd/kobox-ls-devices.elf", "/bin/kobox-ls-devices"]
+  kobox_nvme:
+    file: ".artifacts/userland-fixtures/kobox-modules/nvme.ko"
+    out: "NVME.KO"
+    rootfs: "/usr/lib/kobox/nvme.ko"
+  kobox_nvme_auth:
+    file: ".artifacts/userland-fixtures/kobox-modules/nvme-auth.ko"
+    out: "NVMEAUTH.KO"
+    rootfs: "/usr/lib/kobox/nvme-auth.ko"
+  kobox_nvme_core:
+    file: ".artifacts/userland-fixtures/kobox-modules/nvme-core.ko"
+    out: "NVMECOR.KO"
+    rootfs: "/usr/lib/kobox/nvme-core.ko"
+  kobox_run:
+    file:
+      path: ".artifacts/userland-fixtures/kobox/kobox-run.elf"
+      rebuild: ["bash", "tools/build_wsl_kobox.sh"]
+    out: "KOBOXRUN.ELF"
+    rootfs: ["/cmd/kobox-run.elf", "/bin/kobox-run"]
+  kobox_usb_storage:
+    file: ".artifacts/userland-fixtures/kobox-modules/usb-storage.ko"
+    out: "USBSTOR.KO"
+    rootfs: "/usr/lib/kobox/usb-storage.ko"
+  kobox_usbcore:
+    file: ".artifacts/userland-fixtures/kobox-modules/usbcore.ko"
+    out: "USBCORE.KO"
+    rootfs: "/usr/lib/kobox/usbcore.ko"
+  kobox_usbhid:
+    file: ".artifacts/userland-fixtures/kobox-modules/usbhid.ko"
+    out: "USBHID.KO"
+    rootfs: "/usr/lib/kobox/usbhid.ko"
+  kobox_xhci_hcd:
+    file: ".artifacts/userland-fixtures/kobox-modules/xhci-hcd.ko"
+    out: "XHCIHCD.KO"
+    rootfs: "/usr/lib/kobox/xhci-hcd.ko"
+  kobox_xhci_pci:
+    file: ".artifacts/userland-fixtures/kobox-modules/xhci-pci.ko"
+    out: "XHCIPCI.KO"
+    rootfs: "/usr/lib/kobox/xhci-pci.ko"
+  ld_musl_path:
+    file: "userland/fixtures/base/ld-musl-x86_64.path"
+    out: "LDMUSL.PATH"
+    rootfs: "/etc/ld-musl-x86_64.path"
+  libc_musl:
+    role: "service"
+    file:
+      path: ".artifacts/userland-fixtures/alpine-go-libc.musl-x86_64.so.1"
+      rebuild: ["bash", "tools/build_wsl_alpine_go.sh"]
+    out: "LIBC.SO"
+    rootfs: ["/lib/libc.so", "/lib/ld-musl-x86_64.so.1"]
+  linux_abi_probe:
+    file:
+      path: ".artifacts/userland-fixtures/linux_abi_probe.elf"
+      rebuild: ["bash", "tools/build_wsl_linux_abi_probe.sh"]
+    out: "LNXABIPR.ELF"
+    rootfs: "/cmd/linux_abi_probe.elf"
+  linux_abi_server:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/linux_abi_server/linux_abi_server.elf"
+      rebuild: ["bash", "tools/build_linux_abi_server.sh"]
+    out: "LINUXABI.ELF"
+    rootfs:
+      rootfs: "/srv/linux_abi_server.elf"
+    startup:
+      publish: "rootfs"
+      action: "linux_abi_server"
+      name: "linux_abi_server"
+      label: "linux_abi_server"
+      load: "rootfs"
+      after: ["exec_service"]
+      requires: ["tty_service"]
+      provides: ["linux_abi_server"]
+  linux_smoke_script:
+    file: "userland/fixtures/base/linux_smoke.sh"
+    out: "LINSMOKE.SH"
+    rootfs: "/cmd/linux_smoke.sh"
+  mbedcrypto:
+    role: "service"
+    file:
+      path: ".artifacts/userland-fixtures/libmbedcrypto.so.16"
+      rebuild: ["bash", "tools/build_wsl_mbedtls.sh"]
+    out: "LIBMBEDCRYPTO.SO.16"
+    rootfs: ["/lib/libmbedcrypto.so.16", "/lib/libmbedcrypto.so"]
+  mbedtls:
+    role: "service"
+    file:
+      path: ".artifacts/userland-fixtures/libmbedtls.so.21"
+      rebuild: ["bash", "tools/build_wsl_mbedtls.sh"]
+    out: "LIBMBEDTLS.SO.21"
+    rootfs: ["/lib/libmbedtls.so.21", "/lib/libmbedtls.so"]
+  mbedx509:
+    role: "service"
+    file:
+      path: ".artifacts/userland-fixtures/libmbedx509.so.7"
+      rebuild: ["bash", "tools/build_wsl_mbedtls.sh"]
+    out: "LIBMBEDX509.SO.7"
+    rootfs: ["/lib/libmbedx509.so.7", "/lib/libmbedx509.so"]
+  musl_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/musl_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_musl_smoke.sh"]
+    out: "MUSLSMOK.ELF"
+    rootfs: "/cmd/musl_smoke.elf"
+  net_bench:
+    file:
+      path: ".artifacts/userland-fixtures/net_bench.elf"
+      rebuild: ["bash", "tools/build_wsl_net_bench.sh"]
+    out: "NETBENCH.ELF"
+    rootfs: ["/cmd/net_bench.elf", "/bin/net_bench"]
+  net_status:
+    file:
+      path: ".artifacts/userland-fixtures/net_status.elf"
+      rebuild: ["bash", "tools/build_wsl_net_status.sh"]
+    out: "NETSTAT.ELF"
+    rootfs: ["/cmd/net_status.elf", "/bin/net_status"]
+  os_release:
+    file: "userland/fixtures/base/os-release"
+    out: "OS-RELEASE"
+    rootfs: "/etc/os-release"
+  persistent_fs:
+    role: "service"
+    zig:
+      entry: "userland/programs/persistent_fs.zig"
+      module: "abi_root"
+      imports: ["abi_root", "persistent_fs_layout"]
+    out: "PERSFS.ELF"
+    target: "x86_64-freestanding-none"
+    optimize: "ReleaseSmall"
+    strip: true
+    bootfs: "/srv/persistent_fs.elf"
+    rootfs: "/srv/persistent_fs.elf"
+  pipe_probe:
+    file:
+      path: ".artifacts/userland-fixtures/pipe_probe.elf"
+      rebuild: ["bash", "tools/build_wsl_pipe_probe.sh"]
+    out: "PIPEPROB.ELF"
+    rootfs: ["/cmd/pipe_probe.elf", "/bin/pipe_probe"]
+  pipe_tools:
+    file:
+      path: ".artifacts/userland-fixtures/pipe_tools.elf"
+      rebuild: ["bash", "tools/build_wsl_pipe_tools.sh"]
+    out: "PIPETOOL.ELF"
+    rootfs: "/cmd/pipe_tools.elf"
+  resolv_conf:
+    file: "userland/fixtures/base/resolv.conf"
+    out: "RESOLV.CONF"
+    rootfs: "/etc/resolv.conf"
+  rootfs_vfs:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/rootfs_vfs/rootfs_vfs.elf"
+      rebuild: ["bash", "tools/build_rootfs_vfs.sh"]
+    out: "ROOTVFS.ELF"
+    rootfs: "/srv/rootfs_vfs.elf"
+  rtc_status:
+    file:
+      path: ".artifacts/userland-fixtures/rtc_status.elf"
+      rebuild: ["bash", "tools/build_wsl_rtc_status.sh"]
+    out: "RTCSTAT.ELF"
+    rootfs: ["/cmd/rtc_status.elf", "/bin/rtc_status"]
+  seed2_boot:
+    role: "boot"
+    file:
+      path: ".artifacts/cmake/seed2_boot/seed2_boot.elf"
+      rebuild: ["bash", "tools/build_seed2_boot.sh"]
+    out: "SEED2BT.ELF"
+    rootfs: "/srv/seed2_boot.elf"
+  seed2_root:
+    role: "boot"
+    file:
+      path: ".artifacts/cmake/seed2_root/seed2_root.elf"
+      rebuild: ["bash", "tools/build_seed2_root.sh"]
+    out: "SEED2RT.ELF"
+    rootfs: "/sbin/seed2.elf"
+  shell:
+    role: "command"
+    zig:
+      entry: "userland/programs/shell.zig"
+      module: "abi_root"
+    out: "SHELL.ELF"
+    target: "x86_64-freestanding-none"
+    optimize: "ReleaseSmall"
+    strip: true
+    bootfs: "/cmd/shell.elf"
+    rootfs: "/cmd/shell.elf"
+  tcp_http_get:
+    file:
+      path: ".artifacts/userland-fixtures/tcp_http_get.elf"
+      rebuild: ["bash", "tools/build_wsl_tcp_http_get.sh"]
+    out: "TCPGET.ELF"
+    rootfs: ["/cmd/tcp_http_get.elf", "/bin/tcp_http_get"]
+  tty_service:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/tty_service/tty_service.elf"
+      rebuild: ["bash", "tools/build_tty_service.sh"]
+    out: "TTYSVC.ELF"
+    rootfs:
+      rootfs: "/srv/tty_service.elf"
+    startup:
+      publish: "rootfs"
+      action: "process_builder"
+      name: "tty_service"
+      label: "tty_service"
+      load: "rootfs"
+      requires: ["vfs_service"]
+      provides: ["tty_service"]
+  uutils_coreutils:
+    file:
+      path: ".artifacts/userland-fixtures/uutils-coreutils.elf"
+      rebuild: ["bash", "tools/build_wsl_uutils_coreutils.sh"]
+    out: "COREUTIL.ELF"
+    rootfs: ["/cmd/coreutils.elf", "/bin/coreutils"]
+  uutils_coreutils_common:
+    file:
+      path: ".artifacts/userland-fixtures/uutils-coreutils-common.elf"
+      rebuild: ["bash", "tools/build_wsl_uutils_coreutils_common.sh"]
+    out: "CORECOMN.ELF"
+    rootfs: "/cmd/coreutils-common.elf"
+  uutils_coreutils_hot:
+    file:
+      path: ".artifacts/userland-fixtures/uutils-coreutils-hot.elf"
+      rebuild: ["bash", "tools/build_wsl_uutils_coreutils_hot.sh"]
+    out: "COREHOT.ELF"
+    rootfs: "/cmd/coreutils-hot.elf"
+  uutils_shim:
+    file:
+      path: ".artifacts/userland-fixtures/uutils-shim.elf"
+      rebuild: ["bash", "tools/build_wsl_uutils_shim.sh"]
+    out: "UUTILSHM.ELF"
+    rootfs: ["/cmd/uutils-shim.elf", "/bin/[", "/usr/lib/uutils/arch", "/usr/lib/uutils/b2sum", "/usr/lib/uutils/base32", "/usr/lib/uutils/base64", "/usr/bin/basename", "/usr/lib/uutils/basenc", "/bin/cat", "/usr/lib/uutils/chgrp", "/bin/chmod", "/usr/lib/uutils/chown", "/usr/lib/uutils/chroot", "/usr/lib/uutils/cksum", "/usr/lib/uutils/comm", "/bin/cp", "/usr/lib/uutils/csplit", "/bin/cut", "/bin/date", "/bin/dd", "/usr/bin/df", "/usr/bin/dir", "/usr/lib/uutils/dircolors", "/usr/bin/dirname", "/usr/lib/uutils/du", "/bin/echo", "/bin/env", "/usr/lib/uutils/expand", "/usr/bin/expr", "/usr/lib/uutils/factor", "/bin/false", "/usr/lib/uutils/fmt", "/usr/lib/uutils/fold", "/usr/lib/uutils/groups", "/usr/lib/uutils/hashsum", "/bin/head", "/usr/lib/uutils/hostid", "/usr/bin/hostname", "/usr/bin/id", "/usr/lib/uutils/install", "/usr/lib/uutils/join", "/usr/bin/kill", "/usr/lib/uutils/link", "/usr/bin/ln", "/usr/lib/uutils/logname", "/bin/ls", "/usr/bin/md5sum", "/bin/mkdir", "/usr/bin/mkfifo", "/usr/bin/mknod", "/usr/bin/mktemp", "/usr/bin/more", "/bin/mv", "/usr/lib/uutils/nice", "/usr/lib/uutils/nl", "/usr/lib/uutils/nohup", "/usr/bin/nproc", "/usr/lib/uutils/numfmt", "/usr/lib/uutils/od", "/usr/bin/paste", "/usr/lib/uutils/pathchk", "/usr/lib/uutils/pinky", "/usr/lib/uutils/pr", "/usr/bin/printenv", "/bin/printf", "/usr/lib/uutils/ptx", "/bin/pwd", "/usr/bin/readlink", "/usr/bin/realpath", "/bin/rm", "/bin/rmdir", "/bin/seq", "/usr/bin/sha1sum", "/usr/lib/uutils/sha224sum", "/usr/bin/sha256sum", "/usr/lib/uutils/sha384sum", "/usr/bin/sha512sum", "/usr/lib/uutils/shred", "/usr/lib/uutils/shuf", "/bin/sleep", "/bin/sort", "/usr/lib/uutils/split", "/usr/bin/stat", "/usr/lib/uutils/stty", "/usr/lib/uutils/sum", "/usr/lib/uutils/sync", "/usr/lib/uutils/tac", "/bin/tail", "/bin/tee", "/bin/test", "/usr/lib/uutils/timeout", "/bin/touch", "/bin/tr", "/bin/true", "/usr/lib/uutils/truncate", "/usr/lib/uutils/tsort", "/usr/bin/tty", "/bin/uname", "/usr/lib/uutils/unexpand", "/usr/bin/uniq", "/usr/bin/unlink", "/usr/bin/uptime", "/usr/lib/uutils/users", "/usr/lib/uutils/vdir", "/bin/wc", "/usr/lib/uutils/who", "/usr/bin/whoami", "/usr/lib/uutils/yes"]
+  virtio_blk:
+    role: "service"
+    zig:
+      entry: "userland/programs/virtio_blk.zig"
+      module: "abi_root"
+    out: "VBLKDRV.ELF"
+    target: "x86_64-freestanding-none"
+    optimize: "ReleaseSmall"
+    strip: true
+    bootfs: "/srv/virtio_blk.elf"
+    rootfs: "/srv/virtio_blk.elf"
+  virtio_console:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/virtio_console/virtio_console.elf"
+      rebuild: ["bash", "tools/build_virtio_console.sh"]
+    out: "VCONDRV.ELF"
+    rootfs: "/srv/virtio_console.elf"
+  virtio_net:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/virtio_net/virtio_net.elf"
+      rebuild: ["bash", "tools/build_virtio_net.sh"]
+    out: "VNETDRV.ELF"
+    rootfs: "/srv/virtio_net.elf"
+  zlib:
+    role: "service"
+    file:
+      path: ".artifacts/userland-fixtures/libz.so.1"
+      rebuild: ["bash", "tools/build_wsl_zlib.sh"]
+    out: "LIBZ.SO.1"
+    rootfs: ["/lib/libz.so.1", "/lib/libz.so"]
+  zstd:
+    file:
+      path: ".artifacts/userland-fixtures/zstd.elf"
+      rebuild: ["bash", "tools/build_wsl_zstd.sh"]
+    out: "ZSTD.ELF"
+    rootfs: ["/cmd/zstd.elf", "/bin/zstd"]
