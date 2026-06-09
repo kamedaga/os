@@ -273,6 +273,76 @@ static int resolve_symlink_target_for_follow(const char *link_path, char *out) {
     return normalize_path(parent, target, out);
 }
 
+static int join_path_suffix(const char *base, const char *suffix, char *out) {
+    char combined[FS_MAX_PATH_BYTES + 1];
+    const u64 base_len = cstr_len(base);
+    const u64 suffix_len = cstr_len(suffix);
+    if (base_len == 0 || base_len + suffix_len > FS_MAX_PATH_BYTES) return 0;
+    u64 pos = 0;
+    for (u64 i = 0; i < base_len && pos < sizeof(combined) - 1; i++) combined[pos++] = base[i];
+    if (suffix_len != 0) {
+        u64 suffix_pos = 0;
+        if (base_len == 1 && base[0] == '/') {
+            while (suffix_pos < suffix_len && suffix[suffix_pos] == '/') suffix_pos++;
+        }
+        for (; suffix_pos < suffix_len && pos < sizeof(combined) - 1; suffix_pos++) combined[pos++] = suffix[suffix_pos];
+    }
+    combined[pos] = 0;
+    return normalize_path("/", combined, out);
+}
+
+static int resolve_path_symlink_components(const char *path, int follow_final, char *out) {
+    char current[FS_MAX_PATH_BYTES + 1];
+    if (!normalize_path("/", path, current)) return 0;
+    for (u32 depth = 0; depth < 16; depth++) {
+        const u64 len = cstr_len(current);
+        u64 pos = current[0] == '/' ? 1 : 0;
+        int restarted = 0;
+        while (pos < len) {
+            while (pos < len && current[pos] == '/') pos++;
+            if (pos >= len) break;
+            const u64 start = pos;
+            while (pos < len && current[pos] != '/') pos++;
+            const u64 component_end = pos;
+            u64 after = pos;
+            while (after < len && current[after] == '/') after++;
+            const int is_final = after >= len;
+            if (!is_final || follow_final) {
+                char prefix[FS_MAX_PATH_BYTES + 1];
+                if (component_end > FS_MAX_PATH_BYTES) return 0;
+                for (u64 i = 0; i < component_end; i++) prefix[i] = current[i];
+                prefix[component_end] = 0;
+                struct fs_stat_record rec;
+                u64 token = 0;
+                u64 size = 0;
+                u8 kind = FS_OBJECT_NONE;
+                if (vfs_lookup_stat(prefix, &token, &rec, &size, &kind) && kind == FS_OBJECT_SYMLINK) {
+                    char target[FS_MAX_PATH_BYTES + 1];
+                    char next[FS_MAX_PATH_BYTES + 1];
+                    if (!resolve_symlink_target_for_follow(prefix, target)) return 0;
+                    if (!join_path_suffix(target, current + component_end, next)) return 0;
+                    for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
+                        current[i] = next[i];
+                        if (next[i] == 0) break;
+                    }
+                    restarted = 1;
+                    break;
+                }
+                (void)start;
+                (void)token;
+                (void)rec;
+                (void)size;
+            }
+            pos = after;
+        }
+        if (restarted) continue;
+        if (len > FS_MAX_PATH_BYTES) return 0;
+        for (u64 i = 0; i <= len; i++) out[i] = current[i];
+        return 1;
+    }
+    return 0;
+}
+
 static int vfs_lookup_stat_follow_final(
     const char *path,
     int follow_final,
@@ -283,23 +353,12 @@ static int vfs_lookup_stat_follow_final(
     u8 *kind_out
 ) {
     char current[FS_MAX_PATH_BYTES + 1];
-    if (!normalize_path("/", path, current)) return 0;
-    for (u32 depth = 0; depth < 16; depth++) {
-        if (!vfs_lookup_stat(current, token_out, rec_out, size_out, kind_out)) return 0;
-        if (!follow_final || *kind_out != FS_OBJECT_SYMLINK) {
-            const u64 len = cstr_len(current);
-            if (len > FS_MAX_PATH_BYTES) return 0;
-            for (u64 i = 0; i <= len; i++) resolved_out[i] = current[i];
-            return 1;
-        }
-        char next[FS_MAX_PATH_BYTES + 1];
-        if (!resolve_symlink_target_for_follow(current, next)) return 0;
-        for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
-            current[i] = next[i];
-            if (next[i] == 0) break;
-        }
-    }
-    return 0;
+    if (!resolve_path_symlink_components(path, follow_final, current)) return 0;
+    if (!vfs_lookup_stat(current, token_out, rec_out, size_out, kind_out)) return 0;
+    const u64 len = cstr_len(current);
+    if (len > FS_MAX_PATH_BYTES) return 0;
+    for (u64 i = 0; i <= len; i++) resolved_out[i] = current[i];
+    return 1;
 }
 
 static u64 random_read_to_target(u64 dst, u64 len, int *fault) {
@@ -478,6 +537,7 @@ static struct ipc_message handle_read(const struct trap_request *req) {
         if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
             if (pipe->pending_read) { g_prof.pipe_read_again++; return reply(errno_again(), 0); }
             g_prof.pipe_read_blocked++;
+            pipe_trace_state("read_block", pipe_id);
             pipe->pending_read = 1;
             pipe->pending_principal = req->caller_principal;
             pipe->pending_dst = dst;
@@ -599,6 +659,28 @@ static struct ipc_message handle_pread64(const struct trap_request *req) {
     return copied != 0 ? reply(copied, 0) : reply(0, 0);
 }
 
+static struct ipc_message handle_pwrite64(const struct trap_request *req) {
+    const u64 fd = req->args[0]; const u64 src = req->args[1]; const u64 len = req->args[2]; const u64 offset = req->args[3];
+    if (!fd_valid(fd)) return reply(errno_badf(), 0);
+    if (len == 0) return reply(0, 0);
+    if (g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
+    int fault = 0;
+    const u64 n = vfs_write_from_target(g_fds[fd].token, offset, src, len, &fault);
+    if (fault) return reply(errno_fault(), 0);
+    if (n == 0) {
+        log_fd_write_failure(fd);
+        return reply(errno_io(), 0);
+    }
+    g_prof.fs_write_bytes += n;
+    invalidate_exec_cache_for_path(g_fds[fd].path);
+    const u64 end = offset + n;
+    if (end > g_fds[fd].size) {
+        g_fds[fd].size = end;
+        sync_fd_to_thread_group(fd);
+    }
+    return reply(n, 0);
+}
+
 static struct ipc_message handle_readv(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 iov = req->args[1]; const u64 iovcnt = req->args[2];
     if (!fd_valid(fd)) return reply(errno_badf(), 0);
@@ -634,6 +716,7 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
                 if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return reply(errno_fault(), 0);
                 if (pair[1] == 0) continue;
                 g_prof.pipe_read_blocked++;
+                pipe_trace_state("readv_block", pipe_id);
                 pipe->pending_read = 1;
                 pipe->pending_principal = req->caller_principal;
                 pipe->pending_dst = pair[0];
@@ -643,7 +726,7 @@ static struct ipc_message handle_readv(const struct trap_request *req) {
             }
             return reply(0, 0);
         }
-        if (pipe->len == 0) { g_prof.pipe_read_eof++; return reply(0, 0); }
+        if (pipe->len == 0) { g_prof.pipe_read_eof++; pipe_trace_state("readv_eof", pipe_id); return reply(0, 0); }
         for (u64 i = 0; i < iovcnt; i++) {
             u64 pair[2];
             if (copy_from_target(iov + i * 16, pair, sizeof(pair)) != sizeof(pair)) return total != 0 ? reply(total, 0) : reply(errno_fault(), 0);
@@ -917,6 +1000,28 @@ static struct ipc_message handle_ftruncate(const struct trap_request *req) {
     return reply(0, 0);
 }
 
+static struct ipc_message handle_fallocate(const struct trap_request *req) {
+    const u64 fd = req->args[0];
+    const u64 mode = req->args[1];
+    const i64 offset = (i64)req->args[2];
+    const i64 len = (i64)req->args[3];
+    if (offset < 0 || len <= 0) return reply(errno_inval(), 0);
+    if (!fd_valid(fd) || g_fds[fd].kind != FD_FILE) return reply(errno_badf(), 0);
+    if ((g_fds[fd].fd_flags & O_ACCMODE) == O_RDONLY) return reply(errno_badf(), 0);
+    if (mode != 0) return reply(errno_opnotsupp(), 0);
+    const u64 end = (u64)offset + (u64)len;
+    if (end < (u64)offset) return reply(errno_fbig(), 0);
+    if (end > g_fds[fd].size) {
+        if (!vfs_truncate_file(g_fds[fd].token, end)) return reply(errno_io(), 0);
+        volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
+        if (response->status != FS_STATUS_OK) return reply(errno_from_fs_status(response->status), 0);
+        g_fds[fd].size = response->file_bytes;
+        sync_fd_to_thread_group(fd);
+    }
+    invalidate_exec_cache_for_path(g_fds[fd].path);
+    return reply(0, 0);
+}
+
 static struct ipc_message handle_fstat(const struct trap_request *req) {
     const u64 fd = req->args[0]; const u64 stat_va = req->args[1]; if (!fd_valid(fd)) return reply(errno_badf(), 0);
     if (fd_is_pipe(fd)) {
@@ -1032,7 +1137,7 @@ static struct ipc_message handle_getdents64(const struct trap_request *req) {
         *((u64 *)(out + 0)) = 1; *((i64 *)(out + 8)) = (i64)record->next_cursor; *((u16 *)(out + 16)) = (u16)reclen; out[18] = (record->object_kind == FS_OBJECT_DIRECTORY || record->object_kind == FS_OBJECT_MOUNT) ? DT_DIR : (record->object_kind == FS_OBJECT_SYMLINK ? DT_LNK : DT_REG);
         volatile u8 *name = (volatile u8 *)(vfs_response_addr() + FS_RESPONSE_HEADER_BYTES + FS_DIRENT_RECORD_BYTES); for (u64 i = 0; i < record->name_bytes && 19 + i < sizeof(out); i++) out[19 + i] = name[i];
         if (copy_to_target(dst + written, out, reclen) != reclen) return reply(errno_fault(), 0);
-        written += reclen; g_fds[fd].offset = record->next_cursor;
+        written += reclen; g_fds[fd].offset = record->next_cursor; sync_fd_to_thread_group(fd);
         if (record->next_cursor == 0) break;
     }
     return reply(written, 0);
@@ -1095,7 +1200,7 @@ static struct ipc_message handle_mkdirat(const struct trap_request *req, int old
     if (vfs_lookup_stat(resolved, &token, &rec, &size, &kind)) return reply(errno_exist(), 0);
     if (!vfs_create_path_with_flags(resolved, FS_CREATE_FLAG_DIRECTORY)) return reply(errno_io(), 0);
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
-    if (response->status == FS_STATUS_OK) return reply(0, 0);
+    if (response->status == FS_STATUS_OK) { invalidate_exec_cache_for_path(resolved); return reply(0, 0); }
     if (response->status == FS_STATUS_NOT_FOUND) return reply(errno_noent(), 0);
     if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
     if (response->status == FS_STATUS_NOT_SUPPORTED) return reply(errno_opnotsupp(), 0);
@@ -1121,7 +1226,7 @@ static struct ipc_message handle_symlinkat(const struct trap_request *req, int o
     const u64 target_len = cstr_len(target);
     if (!vfs_create_symlink_path(resolved, target, (u16)target_len)) return reply(errno_io(), 0);
     volatile struct fs_response_header *response = (volatile struct fs_response_header *)vfs_response_addr();
-    if (response->status == FS_STATUS_OK) return reply(0, 0);
+    if (response->status == FS_STATUS_OK) { invalidate_exec_cache_for_path(resolved); return reply(0, 0); }
     if (response->status == FS_STATUS_NOT_FOUND) return reply(errno_noent(), 0);
     if (response->status == FS_STATUS_NOT_DIR) return reply(errno_notdir(), 0);
     if (response->status == FS_STATUS_NOT_SUPPORTED) return reply(errno_opnotsupp(), 0);
@@ -1188,6 +1293,7 @@ static struct ipc_message copy_regular_file_for_link(const char *old_resolved, c
         if (!vfs_create_symlink_path(new_resolved, target, (u16)target_len)) return reply(errno_io(), 0);
         volatile struct fs_response_header *created_link = (volatile struct fs_response_header *)vfs_response_addr();
         if (created_link->status != FS_STATUS_OK) return reply(errno_from_fs_status(created_link->status), 0);
+        invalidate_exec_cache_for_path(new_resolved);
         return reply(0, 0);
     }
 

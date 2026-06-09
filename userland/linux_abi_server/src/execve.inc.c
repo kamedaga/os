@@ -4,7 +4,7 @@
 #define LINUX_ABI_EXECVE_FAULT_TRACE_ENV "CAPABILITYOS_EXEC_FAULT_TRACE=1"
 
 enum {
-    EXEC_OPT_PATH_CACHE = 0,
+    EXEC_OPT_PATH_CACHE = 1,
     EXEC_OPT_FILE_READ_CACHE = 1,
     EXEC_OPT_MAIN_VM_CACHE = 1,
     EXEC_OPT_SERVICE_SOURCE_CACHE = 1,
@@ -378,52 +378,99 @@ static int execve_resolve_symlink_target(const char *link_path, char *out) {
     return normalize_path(parent, target, out);
 }
 
-static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_bytes_out) {
+static int execve_join_path_suffix(const char *base, const char *suffix, char *out) {
+    char combined[FS_MAX_PATH_BYTES + 1];
+    const u64 base_len = cstr_len(base);
+    const u64 suffix_len = cstr_len(suffix);
+    if (base_len == 0 || base_len + suffix_len > FS_MAX_PATH_BYTES) return 0;
+    u64 pos = 0;
+    for (u64 i = 0; i < base_len && pos < sizeof(combined) - 1; i++) combined[pos++] = base[i];
+    if (suffix_len != 0) {
+        u64 suffix_pos = 0;
+        if (base_len == 1 && base[0] == '/') {
+            while (suffix_pos < suffix_len && suffix[suffix_pos] == '/') suffix_pos++;
+        }
+        for (; suffix_pos < suffix_len && pos < sizeof(combined) - 1; suffix_pos++) combined[pos++] = suffix[suffix_pos];
+    }
+    combined[pos] = 0;
+    return normalize_path("/", combined, out);
+}
+
+static int execve_resolve_path_symlink_components(const char *path, int follow_final, char *out) {
     char current[FS_MAX_PATH_BYTES + 1];
     if (!normalize_path("/", path, current)) return 0;
     for (u32 depth = 0; depth < 16; depth++) {
-        struct fs_stat_record rec;
-        u8 kind = FS_OBJECT_NONE;
-        if (!vfs_lookup_stat(current, token_out, &rec, file_bytes_out, &kind)) return 0;
-        if (kind == FS_OBJECT_FILE) return *file_bytes_out != 0;
-        if (kind != FS_OBJECT_SYMLINK) return 0;
-        char next[FS_MAX_PATH_BYTES + 1];
-        if (!execve_resolve_symlink_target(current, next)) return 0;
-        for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
-            current[i] = next[i];
-            if (next[i] == 0) break;
+        const u64 len = cstr_len(current);
+        u64 pos = current[0] == '/' ? 1 : 0;
+        int restarted = 0;
+        while (pos < len) {
+            while (pos < len && current[pos] == '/') pos++;
+            if (pos >= len) break;
+            while (pos < len && current[pos] != '/') pos++;
+            const u64 component_end = pos;
+            u64 after = pos;
+            while (after < len && current[after] == '/') after++;
+            const int is_final = after >= len;
+            if (!is_final || follow_final) {
+                char prefix[FS_MAX_PATH_BYTES + 1];
+                if (component_end > FS_MAX_PATH_BYTES) return 0;
+                for (u64 i = 0; i < component_end; i++) prefix[i] = current[i];
+                prefix[component_end] = 0;
+                struct fs_stat_record rec;
+                u64 token = 0;
+                u64 size = 0;
+                u8 kind = FS_OBJECT_NONE;
+                if (vfs_lookup_stat(prefix, &token, &rec, &size, &kind) && kind == FS_OBJECT_SYMLINK) {
+                    char target[FS_MAX_PATH_BYTES + 1];
+                    char next[FS_MAX_PATH_BYTES + 1];
+                    if (!execve_resolve_symlink_target(prefix, target)) return 0;
+                    if (!execve_join_path_suffix(target, current + component_end, next)) return 0;
+                    for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
+                        current[i] = next[i];
+                        if (next[i] == 0) break;
+                    }
+                    restarted = 1;
+                    break;
+                }
+                (void)token;
+                (void)rec;
+                (void)size;
+            }
+            pos = after;
         }
+        if (restarted) continue;
+        if (len > FS_MAX_PATH_BYTES) return 0;
+        for (u64 i = 0; i <= len; i++) out[i] = current[i];
+        return 1;
     }
     return 0;
 }
 
+static int vfs_lookup_file_token(const char *path, u64 *token_out, u64 *file_bytes_out) {
+    char current[FS_MAX_PATH_BYTES + 1];
+    if (!execve_resolve_path_symlink_components(path, 1, current)) return 0;
+    struct fs_stat_record rec;
+    u8 kind = FS_OBJECT_NONE;
+    if (!vfs_lookup_stat(current, token_out, &rec, file_bytes_out, &kind)) return 0;
+    return kind == FS_OBJECT_FILE && *file_bytes_out != 0;
+}
+
 static int execve_resolve_file_path(const char *path, char *resolved_out) {
     char current[FS_MAX_PATH_BYTES + 1];
-    if (!normalize_path("/", path, current)) return 0;
-    for (u32 depth = 0; depth < 16; depth++) {
-        struct fs_stat_record rec;
-        u64 token = 0;
-        u64 file_bytes = 0;
-        u8 kind = FS_OBJECT_NONE;
-        if (!vfs_lookup_stat(current, &token, &rec, &file_bytes, &kind)) return 0;
-        (void)token;
-        (void)rec;
-        (void)file_bytes;
-        if (kind == FS_OBJECT_FILE) {
-            const u64 len = cstr_len(current);
-            if (len > FS_MAX_PATH_BYTES) return 0;
-            for (u64 i = 0; i <= len; i++) resolved_out[i] = current[i];
-            return 1;
-        }
-        if (kind != FS_OBJECT_SYMLINK) return 0;
-        char next[FS_MAX_PATH_BYTES + 1];
-        if (!execve_resolve_symlink_target(current, next)) return 0;
-        for (u64 i = 0; i <= FS_MAX_PATH_BYTES; i++) {
-            current[i] = next[i];
-            if (next[i] == 0) break;
-        }
-    }
-    return 0;
+    if (!execve_resolve_path_symlink_components(path, 1, current)) return 0;
+    struct fs_stat_record rec;
+    u64 token = 0;
+    u64 file_bytes = 0;
+    u8 kind = FS_OBJECT_NONE;
+    if (!vfs_lookup_stat(current, &token, &rec, &file_bytes, &kind)) return 0;
+    (void)token;
+    (void)rec;
+    (void)file_bytes;
+    if (kind != FS_OBJECT_FILE) return 0;
+    const u64 len = cstr_len(current);
+    if (len > FS_MAX_PATH_BYTES) return 0;
+    for (u64 i = 0; i <= len; i++) resolved_out[i] = current[i];
+    return 1;
 }
 
 static int is_vm_object_token(u64 token) { return (token & VM_OBJECT_TOKEN_TAG) != 0 && (token & ~VM_OBJECT_TOKEN_TAG) != 0; }
@@ -881,7 +928,9 @@ static void exec_cache_store(const char *path, u64 path_len, u64 vm_token, u64 f
 
 static void invalidate_exec_cache_for_path(const char *path) {
     path_cache_invalidate(path);
-    if (exec_path_eq_literal(path, "/lib/ld-musl-x86_64.so.1")) {
+    if (exec_path_eq_literal(path, "/lib/ld-musl-x86_64.so.1") ||
+        exec_path_eq_literal(path, "/lib/libc.musl-x86_64.so.1"))
+    {
         g_standard_interpreter_dirty = 1;
     }
     const u64 path_len = cstr_len(path);
@@ -1307,6 +1356,36 @@ static void register_pending_exec_load_regions_for_process(struct linux_process_
     }
     g_execve_pending_load_path_len = 0;
     g_execve_pending_load_path[0] = 0;
+}
+
+static void register_exec_stack_region_for_process(struct linux_process_state *proc) {
+    if (proc == 0 || g_stack_page_count == 0) return;
+    if (g_stack_page_count > ~0ULL / PAGE_BYTES) return;
+    const u64 size = g_stack_page_count * PAGE_BYTES;
+    if (g_stack_top_va < size) return;
+    const u64 start = g_stack_top_va - size;
+    if (!layout_range_valid(g_user_low_va, g_user_top_va, start, size)) return;
+    for (u64 r = 0; r < VM_REGION_MAX; r++) {
+        if (!proc->regions[r].used) continue;
+        const u64 rs = proc->regions[r].start;
+        const u64 re = rs + proc->regions[r].size;
+        if (start < re && start + size > rs) return;
+    }
+    for (u64 r = 0; r < VM_REGION_MAX; r++) {
+        if (proc->regions[r].used) continue;
+        proc->regions[r].start = start;
+        proc->regions[r].size = size;
+        proc->regions[r].prot = 0x3;
+        proc->regions[r].file_token = 0;
+        proc->regions[r].file_offset = 0;
+        proc->regions[r].file_size = 0;
+        proc->regions[r].file_backed = 0;
+        proc->regions[r].file_lazy = 0;
+        proc->regions[r].file_vm_object = 0;
+        proc->regions[r].file_shared_write = 0;
+        proc->regions[r].used = 1;
+        return;
+    }
 }
 
 static int exec_cstr_eq(const char *a, const char *b) {

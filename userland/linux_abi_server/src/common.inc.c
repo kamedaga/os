@@ -222,6 +222,7 @@ enum {
     LINUX_SYS_RT_SIGRETURN = 15,
     LINUX_SYS_IOCTL = 16,
     LINUX_SYS_PREAD64 = 17,
+    LINUX_SYS_PWRITE64 = 18,
     LINUX_SYS_READV = 19,
     LINUX_SYS_WRITEV = 20,
     LINUX_SYS_ACCESS = 21,
@@ -284,6 +285,7 @@ enum {
     LINUX_SYS_GETEGID = 108,
     LINUX_SYS_SETPGID = 109,
     LINUX_SYS_GETPPID = 110,
+    LINUX_SYS_SETSID = 112,
     LINUX_SYS_GETPGID = 121,
     LINUX_SYS_SETFSUID = 122,
     LINUX_SYS_SETFSGID = 123,
@@ -320,6 +322,7 @@ enum {
     LINUX_SYS_EPOLL_CTL = 233,
     LINUX_SYS_EXIT_GROUP = 231,
     LINUX_SYS_TGKILL = 234,
+    LINUX_SYS_WAITID = 247,
     LINUX_SYS_OPENAT = 257,
     LINUX_SYS_MKDIRAT = 258,
     LINUX_SYS_MKNODAT = 259,
@@ -350,6 +353,7 @@ enum {
     LINUX_SYS_RENAMEAT2 = 316,
     LINUX_SYS_MEMBARRIER = 324,
     LINUX_SYS_RSEQ = 334,
+    LINUX_SYS_PIDFD_OPEN = 434,
     LINUX_SYSCALL_METADATA_MAX_NR = LINUX_SYS_FACCESSAT2,
     AT_FDCWD_U64 = 0xffffffffffffff9cULL,
     AT_SYMLINK_NOFOLLOW = 0x100,
@@ -395,7 +399,13 @@ enum {
     FS_CREATE_FLAG_SYMLINK = 1 << 2,
     WNOHANG = 1,
     WUNTRACED = 2,
+    WEXITED = 4,
     WCONTINUED = 8,
+    WNOWAIT = 0x01000000,
+    P_ALL = 0,
+    P_PID = 1,
+    P_PGID = 2,
+    P_PIDFD = 3,
     SIGHUP = 1,
     SIGINT = 2,
     SIGQUIT = 3,
@@ -422,6 +432,8 @@ enum {
     SI_USER = 0,
     SI_TIMER = -2,
     SI_TKILL = -6,
+    CLD_EXITED = 1,
+    CLD_KILLED = 2,
     SIG_BLOCK = 0,
     SIG_UNBLOCK = 1,
     SIG_SETMASK = 2,
@@ -583,6 +595,7 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_READV, "readv", LINUX_SYSCALL_CAT_IO),
     LINUX_SYSCALL_META(LINUX_SYS_WRITEV, "writev", LINUX_SYSCALL_CAT_IO),
     LINUX_SYSCALL_META(LINUX_SYS_PREAD64, "pread64", LINUX_SYSCALL_CAT_IO),
+    LINUX_SYSCALL_META(LINUX_SYS_PWRITE64, "pwrite64", LINUX_SYSCALL_CAT_IO),
     LINUX_SYSCALL_META(LINUX_SYS_PIPE, "pipe", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_PIPE2, "pipe2", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LINUX_SYSCALL_CAT_FD),
@@ -653,6 +666,7 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_EXIT, "exit", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_EXIT_GROUP, "exit_group", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_WAIT4, "wait4", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_WAITID, "waitid", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_KILL, "kill", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_GETPID, "getpid", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_GETTID, "gettid", LINUX_SYSCALL_CAT_PROC),
@@ -660,6 +674,7 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_TGKILL, "tgkill", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_GETPPID, "getppid", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_SETPGID, "setpgid", LINUX_SYSCALL_CAT_PROC),
+    LINUX_SYSCALL_META(LINUX_SYS_SETSID, "setsid", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_GETPGID, "getpgid", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_SET_TID_ADDRESS, "set_tid_address", LINUX_SYSCALL_CAT_PROC),
     LINUX_SYSCALL_META(LINUX_SYS_MMAP, "mmap", LINUX_SYSCALL_CAT_VM),
@@ -704,11 +719,12 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_LCHOWN, "lchown", LINUX_SYSCALL_CAT_STUB_OK),
     LINUX_SYSCALL_META(LINUX_SYS_FCHOWNAT, "fchownat", LINUX_SYSCALL_CAT_STUB_OK),
     LINUX_SYSCALL_META(LINUX_SYS_FCHMODAT, "fchmodat", LINUX_SYSCALL_CAT_STUB_OK),
-    LINUX_SYSCALL_META(LINUX_SYS_FALLOCATE, "fallocate", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_FALLOCATE, "fallocate", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_SET_ROBUST_LIST, "set_robust_list", LINUX_SYSCALL_CAT_STUB_OK),
     LINUX_SYSCALL_META(LINUX_SYS_UTIMENSAT, "utimensat", LINUX_SYSCALL_CAT_STUB_OK),
     LINUX_SYSCALL_META(LINUX_SYS_PRLIMIT64, "prlimit64", LINUX_SYSCALL_CAT_STUB_OK),
     LINUX_SYSCALL_META(LINUX_SYS_RSEQ, "rseq", LINUX_SYSCALL_CAT_STUB_OK),
+    LINUX_SYSCALL_META(LINUX_SYS_PIDFD_OPEN, "pidfd_open", LINUX_SYSCALL_CAT_STUB_ERR),
     LINUX_SYSCALL_META(LINUX_SYS_GETUID, "getuid", LINUX_SYSCALL_CAT_STUB_OK),
     LINUX_SYSCALL_META(LINUX_SYS_GETGID, "getgid", LINUX_SYSCALL_CAT_STUB_OK),
     LINUX_SYSCALL_META(LINUX_SYS_GETEUID, "geteuid", LINUX_SYSCALL_CAT_STUB_OK),
@@ -1124,6 +1140,7 @@ struct vm_region {
     u8 file_backed;
     u8 file_lazy;
     u8 file_vm_object;
+    u8 file_shared_write;
     int used;
 };
 
@@ -1163,6 +1180,8 @@ struct linux_process_state {
     u8 child_used[LINUX_CHILD_MAX];
     u64 child_slot[LINUX_CHILD_MAX];
     u8 wait_pending;
+    u8 wait_is_waitid;
+    u64 wait_options;
     i64 wait_pid;
     u64 wait_status_va;
     u64 wait_rusage_va;
@@ -1587,6 +1606,7 @@ static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot);
 static u64 map_zeroed_target_pages_chunked(u64 start, u64 page_count, u64 prot);
 static void clear_tracked_target_ranges(void);
 static void register_pending_exec_load_regions_for_process(struct linux_process_state *proc);
+static void register_exec_stack_region_for_process(struct linux_process_state *proc);
 static u64 eventfd_read_to_target(u64 fd, u64 dst, u64 len, int *fault);
 static u64 eventfd_write_from_target(u64 fd, u64 src, u64 len, int *fault);
 

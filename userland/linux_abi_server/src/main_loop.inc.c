@@ -82,8 +82,8 @@ static struct linux_syscall_dispatch_result handle_exit_syscall(const struct tra
     if (process_exits) {
         if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
         profile_trace_event_u64("exit.close_fds pid", exiting_pid);
-        close_all_process_fds(g_proc);
         clear_tracked_target_ranges();
+        close_all_process_fds(g_proc);
         release_process_vm_object_tokens(exiting_proc);
         satisfy_waiters_after_exit_reply = 1;
     }
@@ -109,6 +109,7 @@ static int dispatch_fd_syscall(const struct trap_request *req, struct ipc_messag
     case LINUX_SYS_WRITE: *msg = handle_write(req); return 1;
     case LINUX_SYS_READV: *msg = handle_readv(req); return 1;
     case LINUX_SYS_WRITEV: *msg = handle_writev(req); return 1;
+    case LINUX_SYS_PWRITE64: *msg = handle_pwrite64(req); return 1;
     case LINUX_SYS_PIPE: *msg = handle_pipe2(req, 0); return 1;
     case LINUX_SYS_PIPE2: *msg = handle_pipe2(req, 1); return 1;
     case LINUX_SYS_EPOLL_CREATE1: *msg = handle_epoll_create1(req); return 1;
@@ -222,6 +223,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_FORK: msg = handle_fork_like(req, 0); break;
         case LINUX_SYS_VFORK: msg = handle_fork_like(req, 0); break;
         case LINUX_SYS_WAIT4: msg = handle_wait4(req); break;
+        case LINUX_SYS_WAITID: msg = handle_waitid(req); break;
         case LINUX_SYS_KILL: msg = handle_kill(req); break;
         case LINUX_SYS_GETRUSAGE: msg = handle_getrusage(req); break;
         case LINUX_SYS_STAT: case LINUX_SYS_LSTAT: msg = handle_newfstatat(req, 1); break;
@@ -234,6 +236,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_PSELECT6: msg = handle_select(req, 1); break;
         case LINUX_SYS_PPOLL: msg = handle_poll(req, 1); break;
         case LINUX_SYS_PREAD64: msg = handle_pread64(req); break;
+        case LINUX_SYS_PWRITE64: msg = handle_pwrite64(req); break;
         case LINUX_SYS_GETDENTS64: msg = handle_getdents64(req); break;
         case LINUX_SYS_LSEEK: msg = handle_lseek(req); break;
         case LINUX_SYS_ACCESS: msg = handle_access(req); break;
@@ -292,8 +295,10 @@ void linux_abi_main(void) {
         case LINUX_SYS_FUTEX: msg = handle_futex(req); break;
         case LINUX_SYS_IOCTL: msg = handle_ioctl(req); break;
         case LINUX_SYS_PRLIMIT64: msg = handle_prlimit64(req); break;
-        case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_FCHOWNAT: case LINUX_SYS_FCHMODAT: case LINUX_SYS_FALLOCATE: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
+        case LINUX_SYS_FALLOCATE: msg = handle_fallocate(req); break;
+        case LINUX_SYS_CHMOD: case LINUX_SYS_FCHMOD: case LINUX_SYS_CHOWN: case LINUX_SYS_FCHOWN: case LINUX_SYS_LCHOWN: case LINUX_SYS_FCHOWNAT: case LINUX_SYS_FCHMODAT: case LINUX_SYS_SET_ROBUST_LIST: case LINUX_SYS_UTIMENSAT: case LINUX_SYS_RSEQ: msg = reply(0, 0); break;
         case LINUX_SYS_LISTXATTR: case LINUX_SYS_LLISTXATTR: case LINUX_SYS_FLISTXATTR: msg = reply(errno_opnotsupp(), 0); break;
+        case LINUX_SYS_PIDFD_OPEN: msg = reply(errno_nosys(), 0); break;
         case LINUX_SYS_RENAMEAT2: msg = handle_renameat(req, 0, 1); break;
         case LINUX_SYS_SPLICE: msg = reply(errno_nosys(), 0); break;
         case LINUX_SYS_GETPID: msg = reply(g_proc && g_proc->pid != 0 ? g_proc->pid : 1, 0); break;
@@ -302,6 +307,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_TGKILL: msg = handle_tgkill(req); break;
         case LINUX_SYS_GETPPID: msg = reply(1, 0); break;
         case LINUX_SYS_SETPGID: msg = handle_setpgid(req); break;
+        case LINUX_SYS_SETSID: msg = handle_setsid(req); break;
         case LINUX_SYS_GETPGID: msg = handle_getpgid(req); break;
         case LINUX_SYS_GETUID: case LINUX_SYS_GETGID: case LINUX_SYS_GETEUID: case LINUX_SYS_GETEGID: case LINUX_SYS_SETFSUID: case LINUX_SYS_SETFSGID: msg = reply(0, 0); break;
         case LINUX_SYS_UMASK: msg = reply(022, 0); break;

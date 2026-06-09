@@ -11,4 +11,4 @@ cat > "$out_dir/apk-repositories" <<'EOF'
 http://dl-cdn.alpinelinux.org/alpine/v3.22/main
 http://dl-cdn.alpinelinux.org/alpine/v3.22/community
 EOF
-printf '%s\n' "clang" > "$out_dir/apk-world"
+: > "$out_dir/apk-world"

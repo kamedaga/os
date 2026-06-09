@@ -10,7 +10,7 @@ apk="$fixture_dir/apk.elf"
 repositories="$fixture_dir/apk-repositories"
 keys_dir="$fixture_dir/alpine-keys"
 stamp="$work_dir/.capabilityos-built"
-config_id="alpine-v3.22-go-1.24-rootfs-toolchain-only-v2"
+config_id="alpine-v3.22-go-1.24-rootfs-with-runtime-archives-build-cache-goroot-wrapper-libc-fixture-v10"
 
 mkdir -p "$fixture_dir" "$work_dir"
 
@@ -42,6 +42,28 @@ if [ ! -f "$stamp" ] || [ "$(cat "$stamp" 2>/dev/null || true)" != "$config_id" 
     --no-chown \
     add go
 fi
+
+stdlib_pkg_dir="$install_root/usr/lib/go/pkg/linux_amd64"
+stdlib_cache_dir="$work_dir/std-cache"
+runtime_exports="$work_dir/runtime.exports"
+rm -rf "$stdlib_pkg_dir" "$stdlib_cache_dir"
+mkdir -p "$stdlib_pkg_dir" "$stdlib_cache_dir"
+
+GOROOT="$install_root/usr/lib/go" \
+GOCACHE="$stdlib_cache_dir" \
+"$install_root/usr/lib/go/bin/go" \
+  list -deps -export -f '{{if .Export}}{{.ImportPath}} {{.Export}}{{end}}' runtime \
+  > "$runtime_exports"
+
+: > "$stdlib_pkg_dir/runtime.importcfg"
+while read -r import_path export_path; do
+  [ -n "$import_path" ] || continue
+  archive_rel="${import_path}.a"
+  mkdir -p "$stdlib_pkg_dir/$(dirname "$archive_rel")"
+  cp "$export_path" "$stdlib_pkg_dir/$archive_rel"
+  printf 'packagefile %s=/usr/lib/go/pkg/linux_amd64/%s\n' "$import_path" "$archive_rel" \
+    >> "$stdlib_pkg_dir/runtime.importcfg"
+done < "$runtime_exports"
 
 rm -rf "$output_root.tmp"
 mkdir -p "$output_root.tmp"
@@ -101,6 +123,16 @@ for root, dirnames, filenames in os.walk(src, topdown=True, followlinks=False):
             shutil.copy2(item, out)
 PY
 
+mkdir -p "$output_root.tmp/.cache"
+cp -a "$stdlib_cache_dir" "$output_root.tmp/.cache/go-build"
+
+cat > "$output_root.tmp/usr/bin/go" <<EOF
+#!/bin/sh
+export GOROOT="/usr/lib/go"
+exec /usr/lib/go/bin/go "\$@"
+EOF
+
 rm -rf "$output_root"
 mv "$output_root.tmp" "$output_root"
+cp "$install_root/lib/libc.musl-x86_64.so.1" "$fixture_dir/alpine-go-libc.musl-x86_64.so.1"
 printf '%s\n' "$config_id" > "$stamp"

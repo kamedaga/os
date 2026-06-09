@@ -46,6 +46,8 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->cwd[0] = '/'; proc->cwd[1] = 0; proc->cwd_len = 1;
     for (u64 i = 0; i < LINUX_CHILD_MAX; i++) proc->child_used[i] = 0;
     proc->wait_pending = 0;
+    proc->wait_is_waitid = 0;
+    proc->wait_options = 0;
     proc->wait_pid = 0;
     proc->wait_status_va = 0;
     proc->wait_rusage_va = 0;
@@ -124,6 +126,7 @@ static struct linux_process_state *process_state_for(u64 principal) {
         g_processes[i].exec_pending_principal = 0;
         reset_process_runtime_for_exec(&g_processes[i]);
         register_pending_exec_load_regions_for_process(&g_processes[i]);
+        register_exec_stack_region_for_process(&g_processes[i]);
         return &g_processes[i];
     }
     struct linux_process_state *single_pending = 0;
@@ -139,6 +142,7 @@ static struct linux_process_state *process_state_for(u64 principal) {
         single_pending->exec_pending_principal = 0;
         reset_process_runtime_for_exec(single_pending);
         register_pending_exec_load_regions_for_process(single_pending);
+        register_exec_stack_region_for_process(single_pending);
         return single_pending;
     }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) { if (g_processes[i].used) continue; init_process_state(&g_processes[i], principal); return &g_processes[i]; }
@@ -281,6 +285,35 @@ static void clear_pipe_pending_read(struct pipe_entry *pipe) {
     pipe->pending_len = 0;
 }
 
+static void pipe_trace_state(const char *event, u8 pipe_id) {
+    if (!profile_detail_enabled()) return;
+    if (pipe_id >= PIPE_MAX) return;
+    struct pipe_entry *pipe = &g_pipes[pipe_id];
+    user_log("LinuxAbiServer.pipe ");
+    user_log(event);
+    user_log(" id=");
+    user_log_dec_value(pipe_id);
+    user_log(" used=");
+    user_log_dec_value(pipe->used);
+    user_log(" read_refs=");
+    user_log_dec_value(pipe->read_refs);
+    user_log(" write_refs=");
+    user_log_dec_value(pipe->write_refs);
+    user_log(" len=");
+    user_log_dec_value(pipe->len);
+    user_log(" pending=");
+    user_log_dec_value(pipe->pending_read);
+    user_log(" live_writer=");
+    user_log_dec_value(pipe_has_live_writer(pipe_id));
+    if (g_proc) {
+        user_log(" pid=");
+        user_log_dec_value(g_proc->pid);
+        user_log(" principal=");
+        user_log_dec_value(g_proc->principal);
+    }
+    user_log("\n");
+}
+
 static void flush_deferred_pipe_wakes(void) {
     const u32 mask = g_deferred_pipe_wake_mask;
     g_deferred_pipe_wake_mask = 0;
@@ -306,6 +339,7 @@ static void close_pipe_entry(struct fd_entry *entry) {
     if (entry->kind == FD_PIPE_WRITE && pipe->write_refs != 0) pipe->write_refs--;
     defer_pipe_wake(pipe_id);
     if (pipe->read_refs == 0 && pipe->write_refs == 0) pipe->used = 0;
+    pipe_trace_state("close", pipe_id);
 }
 static void close_pipe_fd(u64 fd) {
     if (!fd_is_pipe(fd)) return;
@@ -317,11 +351,15 @@ static void try_satisfy_pending_pipe_read(u8 pipe_id) {
     struct pipe_entry *pipe = &g_pipes[pipe_id];
     if (!pipe->pending_read) return;
     if (!pipe_pending_reader_owns_fd(pipe_id, pipe->pending_principal)) {
+        pipe_trace_state("pending_reader_lost", pipe_id);
         clear_pipe_pending_read(pipe);
         if (pipe->read_refs == 0 && pipe->write_refs == 0) pipe->used = 0;
         return;
     }
-    if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) return;
+    if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
+        pipe_trace_state("pending_wait_writer", pipe_id);
+        return;
+    }
     const u64 principal = pipe->pending_principal;
     const u64 dst = pipe->pending_dst;
     const u64 want = pipe->pending_len;
@@ -353,6 +391,7 @@ static void try_satisfy_pending_pipe_read(u8 pipe_id) {
 
     clear_pipe_pending_read(pipe);
     g_prof.pipe_wake_replies++;
+    pipe_trace_state("pending_reply", pipe_id);
     (void)reply_trap_target(principal, result, 0);
 }
 
@@ -363,7 +402,7 @@ static u64 pipe_read_to_target(u64 fd, u64 dst, u64 len, int *fault) {
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used || g_pipes[pipe_id].read_refs == 0) return errno_badf();
     struct pipe_entry *pipe = &g_pipes[pipe_id];
     if (len == 0) return 0;
-    if (pipe->len == 0) { g_prof.pipe_read_eof++; return 0; }
+    if (pipe->len == 0) { g_prof.pipe_read_eof++; pipe_trace_state("read_eof", pipe_id); return 0; }
     const u64 n = min_u64(len, pipe->len);
     u64 done = 0;
     while (done < n) {

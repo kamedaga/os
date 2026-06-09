@@ -179,6 +179,7 @@ static struct ipc_message handle_epoll_ctl(const struct trap_request *req) {
         g_fds[epfd].token = 0;
         g_fds[epfd].mode_bits = 0;
         g_fds[epfd].offset = 0;
+        sync_fd_to_thread_group(epfd);
         return reply(0, 0);
     }
     if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD) return reply(errno_inval(), 0);
@@ -188,6 +189,7 @@ static struct ipc_message handle_epoll_ctl(const struct trap_request *req) {
     g_fds[epfd].token = fd + 1;
     g_fds[epfd].mode_bits = events;
     g_fds[epfd].offset = data;
+    sync_fd_to_thread_group(epfd);
     return reply(0, 0);
 }
 
