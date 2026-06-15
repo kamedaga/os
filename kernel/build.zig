@@ -87,6 +87,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run kernel unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    const fd_ipc_minimal_mod = b.createModule(.{
+        .root_source_file = b.path("../tests/fd_ipc_minimal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fd_ipc_minimal_mod.addOptions("build_workarounds", build_workarounds);
+    fd_ipc_minimal_mod.addImport("kernel", kernel_mod);
+    fd_ipc_minimal_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const fd_ipc_minimal_tests = b.addTest(.{
+        .root_module = fd_ipc_minimal_mod,
+    });
+    fd_ipc_minimal_tests.stack_size = 512 * 1024 * 1024;
+
+    const run_fd_ipc_minimal_tests = b.addRunArtifact(fd_ipc_minimal_tests);
+    test_step.dependOn(&run_fd_ipc_minimal_tests.step);
+
     const efi_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = efi_target,
