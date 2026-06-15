@@ -213,6 +213,10 @@ pkey は authority ではない。
 
 x86 PKU / PKRU は user mode で変更できるため、強い security boundary として扱わない。
 
+untrusted peer 間 IPC では、pkey ではなく fd rights / VMO fd / VMA/PTE permission を境界にする。
+
+詳細は [Phase 5 fast IPC / pkey threat model](./phase5-fast-ipc-pkey-threat-model.md) に固定する。
+
 Fast IPC channel は次を持つ。
 
 ```text

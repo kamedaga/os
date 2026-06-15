@@ -453,6 +453,10 @@ Phase 0 の作業入口は [[phase0-checklist]]。
 - normal IPC fallback を常に維持する
 - fd passing は control plane、fast IPC は data plane として分離する
 
+Phase 5 の pkey 方針は [Phase 5 fast IPC / pkey threat model](./phase5-fast-ipc-pkey-threat-model.md) に固定する。
+
+pkey は untrusted IPC の主境界ではない。untrusted peer 間 IPC は fd rights / VMO fd / VMA/PTE permission で成立させ、pkey は local fast-path guard としてのみ使う。
+
 ### Phase 6: Capsule fd
 
 - capsule object を fd-based model に移す
