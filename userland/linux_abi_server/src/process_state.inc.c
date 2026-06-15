@@ -31,8 +31,22 @@ static void copy_fd_entry(struct fd_entry *dst, const struct fd_entry *src) {
     dst->socket_remote_port = src->socket_remote_port;
     dst->socket_local_ip = src->socket_local_ip;
     dst->socket_remote_ip = src->socket_remote_ip;
+    for (u64 i = 0; i < EPOLL_WATCH_MAX; i++) dst->epoll_watches[i] = src->epoll_watches[i];
     for (u16 i = 0; i <= src->path_len && i <= FS_MAX_PATH_BYTES; i++) dst->path[i] = src->path[i];
 }
+
+static void set_process_exec_path(struct linux_process_state *proc, const char *path) {
+    if (!proc) return;
+    proc->exec_path_len = 0;
+    proc->exec_path[0] = 0;
+    if (!path) return;
+    u64 len = cstr_len(path);
+    if (len > FS_MAX_PATH_BYTES) len = FS_MAX_PATH_BYTES;
+    proc->exec_path_len = (u16)len;
+    for (u16 i = 0; i < proc->exec_path_len; i++) proc->exec_path[i] = path[i];
+    proc->exec_path[proc->exec_path_len] = 0;
+}
+
 static void init_process_state(struct linux_process_state *proc, u64 principal) {
     proc->used = 1; proc->exec_pending = 0; proc->exit_status = 0; proc->pid = principal; proc->tid = principal; proc->pgid = principal; proc->principal = principal; init_process_fds(proc);
     proc->exec_pending_principal = 0;
@@ -44,6 +58,8 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->vm_object_token_count = 0;
     proc->root_path[0] = '/'; proc->root_path[1] = 0; proc->root_len = 1;
     proc->cwd[0] = '/'; proc->cwd[1] = 0; proc->cwd_len = 1;
+    proc->exec_path[0] = 0; proc->exec_path_len = 0;
+    proc->exec_pending_load_path[0] = 0; proc->exec_pending_load_path_len = 0;
     for (u64 i = 0; i < LINUX_CHILD_MAX; i++) proc->child_used[i] = 0;
     proc->wait_pending = 0;
     proc->wait_is_waitid = 0;
@@ -59,6 +75,7 @@ static void init_process_state(struct linux_process_state *proc, u64 principal) 
     proc->profile_enabled = 0;
     proc->profile_detail_enabled = 0;
     proc->profile_verbose_enabled = 0;
+    proc->profile_progress_enabled = 0;
     proc->fault_trace_enabled = 0;
     proc->sigaltstack_sp = 0;
     proc->sigaltstack_size = 0;
@@ -121,29 +138,41 @@ static struct linux_process_state *process_state_for(u64 principal) {
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_processes[i].used || !g_processes[i].exec_pending) continue;
         if (g_processes[i].exec_pending_principal != principal) continue;
+        if (g_processes[i].profile_progress_enabled) {
+            user_log("LinuxAbiServer.exec_pending.bind exact pid=");
+            user_log_dec_value(g_processes[i].pid);
+            user_log(" old_principal=");
+            user_log_dec_value(g_processes[i].principal);
+            user_log(" new_principal=");
+            user_log_dec_value(principal);
+            if (g_processes[i].exec_path_len != 0) {
+                user_log(" exe=");
+                user_log(g_processes[i].exec_path);
+            }
+            user_log("\n");
+        }
         g_processes[i].principal = principal;
         g_processes[i].exec_pending = 0;
         g_processes[i].exec_pending_principal = 0;
         reset_process_runtime_for_exec(&g_processes[i]);
         register_pending_exec_load_regions_for_process(&g_processes[i]);
         register_exec_stack_region_for_process(&g_processes[i]);
+        register_exec_vdso_region_for_process(&g_processes[i]);
         return &g_processes[i];
     }
-    struct linux_process_state *single_pending = 0;
     u64 pending_count = 0;
+    int pending_profile = 0;
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
         if (!g_processes[i].used || !g_processes[i].exec_pending) continue;
-        single_pending = &g_processes[i];
         pending_count++;
+        if (g_processes[i].profile_progress_enabled) pending_profile = 1;
     }
-    if (pending_count == 1 && single_pending) {
-        single_pending->principal = principal;
-        single_pending->exec_pending = 0;
-        single_pending->exec_pending_principal = 0;
-        reset_process_runtime_for_exec(single_pending);
-        register_pending_exec_load_regions_for_process(single_pending);
-        register_exec_stack_region_for_process(single_pending);
-        return single_pending;
+    if (pending_count != 0 && pending_profile) {
+        user_log("LinuxAbiServer.exec_pending.alloc_while_pending principal=");
+        user_log_dec_value(principal);
+        user_log(" pending_count=");
+        user_log_dec_value(pending_count);
+        user_log("\n");
     }
     for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) { if (g_processes[i].used) continue; init_process_state(&g_processes[i], principal); return &g_processes[i]; }
     return 0;
@@ -159,6 +188,25 @@ static struct linux_process_state *alloc_process_state_for_new_principal(u64 pri
     return 0;
 }
 
+static void clear_process_fd_table_no_close(struct linux_process_state *proc) {
+    if (!proc) return;
+    for (u64 fd = 0; fd < LINUX_FD_MAX; fd++) {
+        proc->fds[fd].kind = FD_UNUSED;
+        proc->fds[fd].fd_flags = 0;
+        proc->fds[fd].pipe_id = 0;
+        proc->fds[fd].token = 0;
+    }
+}
+
+static void clear_thread_group_fd_tables_no_close(u64 pid, const struct linux_process_state *except) {
+    if (pid == 0) return;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        struct linux_process_state *peer = &g_processes[i];
+        if (!peer->used || peer == except || peer->pid != pid) continue;
+        clear_process_fd_table_no_close(peer);
+    }
+}
+
 static int pipe_ref_already_counted(u64 proc_index, const struct linux_process_state *proc, u64 fd, enum fd_kind kind, u8 pipe_id) {
     for (u64 i = 0; i < proc_index; i++) {
         const struct linux_process_state *peer = &g_processes[i];
@@ -169,7 +217,7 @@ static int pipe_ref_already_counted(u64 proc_index, const struct linux_process_s
     return 0;
 }
 
-static void reconcile_pipe_refs_for_alloc(void) {
+static void reconcile_pipe_refs(void) {
     u64 read_refs[PIPE_MAX];
     u64 write_refs[PIPE_MAX];
     for (u64 i = 0; i < PIPE_MAX; i++) {
@@ -200,7 +248,7 @@ static void reconcile_pipe_refs_for_alloc(void) {
 }
 
 static int alloc_pipe_slot(void) {
-    reconcile_pipe_refs_for_alloc();
+    reconcile_pipe_refs();
     for (u64 i = 0; i < PIPE_MAX; i++) if (!g_pipes[i].used) return (int)i;
     return -1;
 }
@@ -268,6 +316,8 @@ static void close_socket_entry(struct fd_entry *entry) {
 }
 
 static int pipe_has_live_writer(u8 pipe_id);
+static u64 process_pid_for_principal(u64 principal);
+static int pipe_has_blocking_writer(u8 pipe_id, u64 reader_pid);
 static int pipe_pending_reader_owns_fd(u8 pipe_id, u64 principal);
 static void try_satisfy_pending_pipe_read(u8 pipe_id);
 
@@ -283,6 +333,14 @@ static void clear_pipe_pending_read(struct pipe_entry *pipe) {
     pipe->pending_principal = 0;
     pipe->pending_dst = 0;
     pipe->pending_len = 0;
+}
+
+static void reply_pending_pipe_read(struct pipe_entry *pipe, u64 result) {
+    if (!pipe || !pipe->pending_read || pipe->pending_principal == 0) return;
+    const u64 principal = pipe->pending_principal;
+    clear_pipe_pending_read(pipe);
+    g_prof.pipe_wake_replies++;
+    (void)reply_trap_target(principal, result, 0);
 }
 
 static void pipe_trace_state(const char *event, u8 pipe_id) {
@@ -327,16 +385,30 @@ static void flush_deferred_pipe_wakes(void) {
 static void close_pipe_entry(struct fd_entry *entry) {
     if (!fd_entry_is_pipe(entry)) return;
     const u8 pipe_id = entry->pipe_id;
-    if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return;
+    const enum fd_kind kind = entry->kind;
+    if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) {
+        entry->kind = FD_UNUSED;
+        entry->fd_flags = 0;
+        entry->pipe_id = 0;
+        return;
+    }
     struct pipe_entry *pipe = &g_pipes[pipe_id];
     g_prof.pipe_close_calls++;
-    if (entry->kind == FD_PIPE_READ && pipe->read_refs != 0) {
+    if (kind == FD_PIPE_READ && pipe->read_refs != 0) {
         pipe->read_refs--;
         if (pipe->pending_read && (pipe->pending_principal == (g_proc ? g_proc->principal : 0) || pipe->read_refs == 0)) {
-            clear_pipe_pending_read(pipe);
+            reply_pending_pipe_read(pipe, 0);
         }
     }
-    if (entry->kind == FD_PIPE_WRITE && pipe->write_refs != 0) pipe->write_refs--;
+    if (kind == FD_PIPE_WRITE && pipe->write_refs != 0) {
+        pipe->write_refs--;
+        if (pipe->pending_read && pipe->write_refs == 0 && pipe->len == 0) {
+            reply_pending_pipe_read(pipe, 0);
+        }
+    }
+    entry->kind = FD_UNUSED;
+    entry->fd_flags = 0;
+    entry->pipe_id = 0;
     defer_pipe_wake(pipe_id);
     if (pipe->read_refs == 0 && pipe->write_refs == 0) pipe->used = 0;
     pipe_trace_state("close", pipe_id);
@@ -348,15 +420,16 @@ static void close_pipe_fd(u64 fd) {
 
 static void try_satisfy_pending_pipe_read(u8 pipe_id) {
     if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return;
+    reconcile_pipe_refs();
     struct pipe_entry *pipe = &g_pipes[pipe_id];
     if (!pipe->pending_read) return;
     if (!pipe_pending_reader_owns_fd(pipe_id, pipe->pending_principal)) {
         pipe_trace_state("pending_reader_lost", pipe_id);
-        clear_pipe_pending_read(pipe);
+        reply_pending_pipe_read(pipe, 0);
         if (pipe->read_refs == 0 && pipe->write_refs == 0) pipe->used = 0;
         return;
     }
-    if (pipe->len == 0 && (pipe->write_refs != 0 || pipe_has_live_writer(pipe_id))) {
+    if (pipe->len == 0 && pipe_has_blocking_writer(pipe_id, process_pid_for_principal(pipe->pending_principal))) {
         pipe_trace_state("pending_wait_writer", pipe_id);
         return;
     }
@@ -455,9 +528,36 @@ static int pipe_has_live_writer(u8 pipe_id) {
     if (pipe_id >= PIPE_MAX) return 0;
     for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
         struct linux_process_state *proc = &g_processes[p];
-        if (!proc->used) continue;
+        if (!proc->used || proc->principal == 0) continue;
         for (u64 fd = 0; fd < LINUX_FD_MAX; fd++) {
-            if (proc->fds[fd].kind == FD_PIPE_WRITE && proc->fds[fd].pipe_id == pipe_id) return 1;
+            if (proc->fds[fd].kind != FD_PIPE_WRITE || proc->fds[fd].pipe_id != pipe_id) continue;
+            if (pipe_ref_already_counted(p, proc, fd, FD_PIPE_WRITE, pipe_id)) continue;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static u64 process_pid_for_principal(u64 principal) {
+    if (principal == 0) return 0;
+    for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
+        const struct linux_process_state *proc = &g_processes[p];
+        if (proc->used && proc->principal == principal) return proc->pid;
+    }
+    return 0;
+}
+
+static int pipe_has_blocking_writer(u8 pipe_id, u64 reader_pid) {
+    if (pipe_id >= PIPE_MAX) return 0;
+    for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
+        struct linux_process_state *proc = &g_processes[p];
+        if (!proc->used || proc->principal == 0) continue;
+        for (u64 fd = 0; fd < LINUX_FD_MAX; fd++) {
+            const struct fd_entry *entry = &proc->fds[fd];
+            if (entry->kind != FD_PIPE_WRITE || entry->pipe_id != pipe_id) continue;
+            if (pipe_ref_already_counted(p, proc, fd, FD_PIPE_WRITE, pipe_id)) continue;
+            if (reader_pid != 0 && proc->pid == reader_pid && (entry->fd_flags & FD_INTERNAL_CLOEXEC) != 0) continue;
+            return 1;
         }
     }
     return 0;

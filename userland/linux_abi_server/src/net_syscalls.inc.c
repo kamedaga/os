@@ -1367,7 +1367,8 @@ static u16 fd_poll_revents(u64 fd, u16 requested) {
     if (entry->kind == FD_PIPE_READ) {
         const u8 pipe_id = entry->pipe_id;
         if (pipe_id >= PIPE_MAX || !g_pipes[pipe_id].used) return POLLNVAL;
-        if (g_pipes[pipe_id].len != 0 || (g_pipes[pipe_id].write_refs == 0 && !pipe_has_live_writer(pipe_id))) return (u16)(requested & read_mask);
+        reconcile_pipe_refs();
+        if (g_pipes[pipe_id].len != 0 || !pipe_has_blocking_writer(pipe_id, g_proc ? g_proc->pid : 0)) return (u16)(requested & read_mask);
         return 0;
     }
 

@@ -211,6 +211,7 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "console output substring required for success; repeatable")
 	cmd.Flags().StringVar(&opts.Python, "python", "", "python3 script for detailed TTY testing")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
+	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
 	return cmd
 }
 

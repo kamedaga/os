@@ -100,6 +100,11 @@ pub fn init(config: RuntimeConfig) void {
     runtime_ready = true;
 }
 
+pub fn updateUserSpaces(user_spaces: []UserAddressSpace) void {
+    if (!runtime_ready) return;
+    runtime.user_spaces = user_spaces;
+}
+
 fn processIndex(principal: kernel.PrincipalId) ?usize {
     return kernel.processIndexFromPrincipal(principal);
 }

@@ -197,8 +197,8 @@ fn dmaIovaOrKernelChoice(iova_arg: u64, paddr: u64, size: u64) ?u64 {
 }
 
 fn snapshotOwner(snapshot: kernel.CapsuleSnapshot) ?kernel.PrincipalId {
-    if (snapshot.owner_principal_raw >= kernel.principal_count) return null;
-    return @enumFromInt(snapshot.owner_principal_raw);
+    if (snapshot.owner_principal_raw == kernel.device_principal_raw) return .Device0;
+    return kernel.processPrincipalFromIndex(@intCast(snapshot.owner_principal_raw));
 }
 
 fn cleanupMmioCapsuleMapping(owner: kernel.PrincipalId, snapshot: kernel.CapsuleSnapshot) void {

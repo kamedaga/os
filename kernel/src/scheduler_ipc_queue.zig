@@ -2,6 +2,7 @@ const std = @import("std");
 const kernel = @import("kernel.zig");
 
 pub const max_thread_slots: usize = kernel.max_thread_slots;
+pub const initial_thread_capacity: usize = kernel.initial_thread_capacity;
 pub const inline_queue_depth: usize = 128;
 pub const queue_chunk_entries: usize = 64;
 pub const queue_chunk_pool_count: usize = 512;
@@ -243,16 +244,46 @@ fn freeQueueChunks(head: u16) void {
     }
 }
 
-fn buildInitialQueues() [max_thread_slots]Queue {
-    var queues: [max_thread_slots]Queue = undefined;
-    inline for (0..max_thread_slots) |i| {
+fn buildInitialQueues() [initial_thread_capacity]Queue {
+    var queues: [initial_thread_capacity]Queue = undefined;
+    inline for (0..initial_thread_capacity) |i| {
         queues[i] = .{};
     }
     return queues;
 }
 
-var ipc_queues: [max_thread_slots]Queue = buildInitialQueues();
-var delegate_send_queues: [max_thread_slots]Queue = buildInitialQueues();
+var initial_ipc_queues: [initial_thread_capacity]Queue = buildInitialQueues();
+var initial_delegate_send_queues: [initial_thread_capacity]Queue = buildInitialQueues();
+var ipc_queues: []Queue = initial_ipc_queues[0..];
+var delegate_send_queues: []Queue = initial_delegate_send_queues[0..];
+
+fn allocKernelSlice(comptime T: type, free_list: *kernel.FreePageList, count: usize) ?[]T {
+    if (count == 0) return null;
+    const bytes = @sizeOf(T) * count;
+    const page_count = (bytes + 4095) / 4096;
+    const paddr = free_list.popContiguousAtOrAbove(page_count, 0) catch return null;
+    const raw: [*]u8 = @ptrFromInt(paddr);
+    @memset(raw[0 .. page_count * 4096], 0);
+    const ptr: [*]T = @ptrCast(@alignCast(raw));
+    return ptr[0..count];
+}
+
+pub fn ensureThreadCapacity(capacity: usize, free_list: *kernel.FreePageList) bool {
+    if (capacity <= ipc_queues.len) return true;
+    if (capacity > max_thread_slots) return false;
+    const new_ipc = allocKernelSlice(Queue, free_list, capacity) orelse return false;
+    const new_delegate = allocKernelSlice(Queue, free_list, capacity) orelse return false;
+    @memcpy(new_ipc[0..ipc_queues.len], ipc_queues);
+    @memcpy(new_delegate[0..delegate_send_queues.len], delegate_send_queues);
+    var i = ipc_queues.len;
+    while (i < capacity) : (i += 1) {
+        new_ipc[i] = .{};
+        new_delegate[i] = .{};
+    }
+    ipc_queues = new_ipc;
+    delegate_send_queues = new_delegate;
+    return true;
+}
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -264,83 +295,85 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_ipc_queues), &initial_ipc_queues));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_delegate_send_queues), &initial_delegate_send_queues));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ipc_queues), &ipc_queues));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(delegate_send_queues), &delegate_send_queues));
     return end;
 }
 
 pub fn resetIpc(thread_index: usize) void {
-    if (thread_index >= max_thread_slots) return;
+    if (thread_index >= ipc_queues.len) return;
     ipc_queues[thread_index].reset();
 }
 
 pub fn resetDelegate(thread_index: usize) void {
-    if (thread_index >= max_thread_slots) return;
+    if (thread_index >= delegate_send_queues.len) return;
     delegate_send_queues[thread_index].reset();
 }
 
 pub fn purgeThread(thread_index: usize) void {
-    if (thread_index >= max_thread_slots) return;
+    if (thread_index >= ipc_queues.len) return;
     resetIpc(thread_index);
     resetDelegate(thread_index);
     var i: usize = 0;
-    while (i < max_thread_slots) : (i += 1) {
+    while (i < ipc_queues.len) : (i += 1) {
         ipc_queues[i].removeFromSender(thread_index);
         delegate_send_queues[i].removeFromSender(thread_index);
     }
 }
 
 pub fn enqueueDelegate(target_thread: usize, msg: Message) bool {
-    if (target_thread >= max_thread_slots) return false;
+    if (target_thread >= delegate_send_queues.len) return false;
     return delegate_send_queues[target_thread].enqueue(msg);
 }
 
 pub fn dequeueDelegate(target_thread: usize) ?Message {
-    if (target_thread >= max_thread_slots) return null;
+    if (target_thread >= delegate_send_queues.len) return null;
     return delegate_send_queues[target_thread].dequeue();
 }
 
 pub fn restoreDelegateFront(target_thread: usize, msg: Message) bool {
-    if (target_thread >= max_thread_slots) return false;
+    if (target_thread >= delegate_send_queues.len) return false;
     return delegate_send_queues[target_thread].pushFront(msg);
 }
 
 pub fn delegateLen(thread_index: usize) usize {
-    if (thread_index >= max_thread_slots) return 0;
+    if (thread_index >= delegate_send_queues.len) return 0;
     return delegate_send_queues[thread_index].len;
 }
 
 pub fn enqueueIpc(target_thread: usize, msg: Message) bool {
-    if (target_thread >= max_thread_slots) return false;
+    if (target_thread >= ipc_queues.len) return false;
     return ipc_queues[target_thread].enqueue(msg);
 }
 
 pub fn dequeueIpc(thread_index: usize) ?Message {
-    if (thread_index >= max_thread_slots) return null;
+    if (thread_index >= ipc_queues.len) return null;
     return ipc_queues[thread_index].dequeue();
 }
 
 pub fn dequeueReplyFromSender(thread_index: usize, sender_thread: usize) ?Message {
-    if (thread_index >= max_thread_slots or sender_thread >= max_thread_slots) return null;
+    if (thread_index >= ipc_queues.len or sender_thread >= ipc_queues.len) return null;
     return ipc_queues[thread_index].dequeueReplyFromSender(sender_thread);
 }
 
 pub fn discardReplyFromSender(thread_index: usize, sender_thread: usize) usize {
-    if (thread_index >= max_thread_slots or sender_thread >= max_thread_slots) return 0;
+    if (thread_index >= ipc_queues.len or sender_thread >= ipc_queues.len) return 0;
     return ipc_queues[thread_index].removeMatching(sender_thread, 0, false);
 }
 
 pub fn discardFromSenderOnEndpoint(thread_index: usize, sender_thread: usize, endpoint_id: u64, grants_reply: bool) usize {
-    if (thread_index >= max_thread_slots or sender_thread >= max_thread_slots) return 0;
+    if (thread_index >= ipc_queues.len or sender_thread >= ipc_queues.len) return 0;
     return ipc_queues[thread_index].removeMatching(sender_thread, endpoint_id, grants_reply);
 }
 
 pub fn ipcLen(thread_index: usize) usize {
-    if (thread_index >= max_thread_slots) return 0;
+    if (thread_index >= ipc_queues.len) return 0;
     return ipc_queues[thread_index].len;
 }
 
 pub fn ipcLenOnEndpoint(thread_index: usize, endpoint_id: u64, grants_reply: bool) usize {
-    if (thread_index >= max_thread_slots) return 0;
+    if (thread_index >= ipc_queues.len) return 0;
     return ipc_queues[thread_index].countMatching(endpoint_id, grants_reply);
 }

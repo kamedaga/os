@@ -219,13 +219,19 @@ static struct ipc_message handle_getrusage(const struct trap_request *req) {
     return reply(0, 0);
 }
 
-static void wait_child_slot_settled(u64 child_slot) {
-    for (u64 i = 0; i < 16; i++) {
-        const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child_slot);
-        if ((st & 0xffu) != 1) break;
+static int wait_child_principal_settled(u64 child_principal) {
+    if (child_principal == 0) return 1;
+    for (u64 i = 0; i < 256; i++) {
+        const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child_principal);
+        if ((st & 0xffu) != 1) {
+            wait_without_consuming_ipc_no_switch();
+            return 1;
+        }
         wait_without_consuming_ipc_no_switch();
     }
-    wait_without_consuming_ipc_no_switch();
+    user_log("LinuxAbiServer: child principal still active=");
+    user_log_hex_value(child_principal);
+    return 0;
 }
 
 static void remove_child_slot_from_thread_group(struct linux_process_state *proc, u64 child_slot) {
@@ -266,10 +272,10 @@ static int exited_child_status_for_waitid(struct linux_process_state *proc, i64 
             for (u64 r = 0; r < LINUX_PROCESS_MAX; r++) {
                 if (!g_exit_record_used[r] || g_exit_record_pid[r] != child) continue;
                 *status_out = g_exit_record_status[r];
-                wait_child_slot_settled(child);
+                struct linux_process_state *recorded_proc = process_state_for_pid(child);
+                if (recorded_proc && !wait_child_principal_settled(recorded_proc->principal)) return 0;
                 if (consume) {
                     g_exit_record_used[r] = 0;
-                    struct linux_process_state *recorded_proc = process_state_for_pid(child);
                     if (recorded_proc) recorded_proc->used = 0;
                     remove_child_slot_from_thread_group(proc, child);
                 }
@@ -282,7 +288,7 @@ static int exited_child_status_for_waitid(struct linux_process_state *proc, i64 
             const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child_principal);
             if ((st & 0xff) == 1) continue;
             *status_out = child_proc ? child_proc->exit_status : 0;
-            wait_child_slot_settled(child);
+            if (child_proc && !wait_child_principal_settled(child_principal)) return 0;
             if (consume) {
                 remove_child_slot_from_thread_group(proc, child);
                 if (child_proc) child_proc->used = 0;
@@ -307,7 +313,11 @@ static int reap_exited_child_for_current(struct linux_process_state *proc, i64 p
             if (!wait_pid_matches_child(pid, child)) continue;
             u32 recorded_status = 0;
             if (take_process_exit_record(child, &recorded_status)) {
-                wait_child_slot_settled(child);
+                struct linux_process_state *recorded_proc = process_state_for_pid(child);
+                if (recorded_proc && !wait_child_principal_settled(recorded_proc->principal)) {
+                    record_process_exit(child, recorded_status);
+                    return 0;
+                }
                 if (!write_wait_status_to_current(status_va, recorded_status)) {
                     *fault = 1;
                     return 0;
@@ -316,7 +326,6 @@ static int reap_exited_child_for_current(struct linux_process_state *proc, i64 p
                     *fault = 1;
                     return 0;
                 }
-                struct linux_process_state *recorded_proc = process_state_for_pid(child);
                 if (recorded_proc) recorded_proc->used = 0;
                 remove_child_slot_from_thread_group(proc, child);
                 *child_out = child;
@@ -328,7 +337,7 @@ static int reap_exited_child_for_current(struct linux_process_state *proc, i64 p
             const u64 st = syscall1(SYSCALL_GET_PROCESS_STATUS, child_principal);
             if ((st & 0xff) == 1) continue;
             const u32 exit_code = child_proc ? child_proc->exit_status : 0;
-            wait_child_slot_settled(child);
+            if (child_proc && !wait_child_principal_settled(child_principal)) return 0;
             if (!write_wait_status_to_current(status_va, exit_code)) {
                 *fault = 1;
                 return 0;
@@ -347,6 +356,17 @@ static int reap_exited_child_for_current(struct linux_process_state *proc, i64 p
 }
 
 static void log_wait_state_for_miss(u64 child_slot);
+
+static void clear_child_tid_and_wake(struct linux_process_state *proc, u64 current_principal) {
+    if (!proc || proc->clear_child_tid == 0) return;
+    const u32 zero = 0;
+    if (proc->principal == current_principal) {
+        (void)copy_to_target(proc->clear_child_tid, &zero, sizeof(zero));
+    } else {
+        (void)copy_to_trap_target(proc->principal, proc->clear_child_tid, &zero, sizeof(zero));
+    }
+    (void)wake_futex_waiters(proc->pid, proc->clear_child_tid, 1);
+}
 
 static int satisfy_pending_waiters_for_child(u64 child_slot) {
     int satisfied = 0;
@@ -377,7 +397,10 @@ static int satisfy_pending_waiters_for_child(u64 child_slot) {
                 if ((st & 0xff) == 1) continue;
                 exit_code = child_proc ? child_proc->exit_status : 0;
             }
-            wait_child_slot_settled(child_slot);
+            if (child_proc && !wait_child_principal_settled(child_proc->principal)) {
+                if (have_exit_record && (proc->wait_options & WNOWAIT) == 0) record_process_exit(child_slot, exit_code);
+                return 0;
+            }
             if (proc->wait_is_waitid) {
                 if (!write_waitid_info_to_trap_target(proc->principal, proc->wait_status_va, child_slot, exit_code)) result = errno_fault();
                 else result = 0;
@@ -417,6 +440,8 @@ static struct ipc_message terminate_current_linux_process_from_trap(
 ) {
     struct linux_process_state *exiting_proc = g_proc;
     const u64 exiting_pid = exiting_proc ? exiting_proc->pid : exiting_principal;
+    u8 peer_should_exit[LINUX_PROCESS_MAX];
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) peer_should_exit[i] = 0;
 
     if (exiting_proc) {
         exiting_proc->exit_status = wait_status;
@@ -424,24 +449,24 @@ static struct ipc_message terminate_current_linux_process_from_trap(
             struct linux_process_state *thread_proc = &g_processes[i];
             if (!thread_proc->used || thread_proc == exiting_proc || thread_proc->pid != exiting_pid) continue;
             thread_proc->exit_status = wait_status;
-            if (thread_proc->clear_child_tid != 0) {
-                const u32 zero = 0;
-                (void)copy_to_trap_target(thread_proc->principal, thread_proc->clear_child_tid, &zero, sizeof(zero));
-            }
+            clear_child_tid_and_wake(thread_proc, exiting_principal);
             remove_futex_waiters_for_principal(thread_proc->principal);
-            const u64 status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
-            if (status == SYSCALL_OK) thread_proc->used = 0;
+            remove_epoll_waiters_for_principal(thread_proc->principal);
+            peer_should_exit[i] = 1;
         }
-        if (exiting_proc->clear_child_tid != 0) {
-            const u32 zero = 0;
-            (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
-            (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
-        }
+        clear_child_tid_and_wake(exiting_proc, exiting_principal);
         record_process_exit(exiting_pid, exiting_proc->exit_status);
         clear_tracked_target_ranges();
+        for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+            if (!peer_should_exit[i]) continue;
+            const u64 status = reply_trap_target(g_processes[i].principal, 0, TRAP_RESPONSE_FLAG_EXIT);
+            if (status == SYSCALL_OK) g_processes[i].used = 0;
+        }
         close_all_process_fds(exiting_proc);
+        clear_thread_group_fd_tables_no_close(exiting_pid, exiting_proc);
         release_process_vm_object_tokens(exiting_proc);
         remove_futex_waiters_for_principal(exiting_principal);
+        remove_epoll_waiters_for_principal(exiting_principal);
         reply_vfork_parent_if_any(exiting_proc);
         exiting_proc->used = 0;
     }
@@ -505,6 +530,26 @@ static void log_wait_state_for_miss(u64 child_slot) {
     (void)child_slot;
 }
 
+static int try_satisfy_pending_waiters(void) {
+    int satisfied = 0;
+    for (u64 p = 0; p < LINUX_PROCESS_MAX; p++) {
+        struct linux_process_state *waiter = &g_processes[p];
+        if (!waiter->used || !waiter->wait_pending) continue;
+        const u64 group_pid = waiter->pid;
+        for (u64 q = 0; q < LINUX_PROCESS_MAX; q++) {
+            struct linux_process_state *peer = &g_processes[q];
+            if (!peer->used || peer->pid != group_pid) continue;
+            for (u64 i = 0; i < LINUX_CHILD_MAX; i++) {
+                if (!peer->child_used[i] || !wait_pid_matches_child(waiter->wait_pid, peer->child_slot[i])) continue;
+                if (satisfy_pending_waiters_for_child(peer->child_slot[i])) satisfied = 1;
+                if (!waiter->used || !waiter->wait_pending) break;
+            }
+            if (!waiter->used || !waiter->wait_pending) break;
+        }
+    }
+    return satisfied;
+}
+
 static void copy_process_state_for_fork_impl(struct linux_process_state *child, const struct linux_process_state *parent, u64 child_principal, int ref_pipe_fds) {
     child->used = 1;
     child->exec_pending = 0;
@@ -522,6 +567,10 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
     for (u16 i = 0; i <= parent->root_len && i <= FS_MAX_PATH_BYTES; i++) child->root_path[i] = parent->root_path[i];
     child->cwd_len = parent->cwd_len;
     for (u16 i = 0; i <= parent->cwd_len && i <= FS_MAX_PATH_BYTES; i++) child->cwd[i] = parent->cwd[i];
+    child->exec_path_len = parent->exec_path_len;
+    for (u16 i = 0; i <= parent->exec_path_len && i <= FS_MAX_PATH_BYTES; i++) child->exec_path[i] = parent->exec_path[i];
+    child->exec_pending_load_path_len = 0;
+    child->exec_pending_load_path[0] = 0;
     for (u64 i = 0; i < LINUX_CHILD_MAX; i++) child->child_used[i] = 0;
     child->wait_pending = 0;
     child->wait_is_waitid = 0;
@@ -537,6 +586,7 @@ static void copy_process_state_for_fork_impl(struct linux_process_state *child, 
     child->profile_enabled = parent->profile_enabled;
     child->profile_detail_enabled = parent->profile_detail_enabled;
     child->profile_verbose_enabled = parent->profile_verbose_enabled;
+    child->profile_progress_enabled = parent->profile_progress_enabled;
     child->fault_trace_enabled = parent->fault_trace_enabled;
     child->sigaltstack_sp = parent->sigaltstack_sp;
     child->sigaltstack_size = parent->sigaltstack_size;
@@ -701,7 +751,7 @@ static int copy_present_pages_to_process(u64 process_token, u64 source_process_s
 static int share_present_pages_to_process(u64 process_token, u64 source_process_slot, u64 start, u64 end, u64 prot) {
     for (u64 va = start; va < end; va += PAGE_BYTES) {
         u8 probe[16];
-        if (copy_from_target(va, probe, sizeof(probe)) != sizeof(probe)) continue;
+        if (copy_from_target_raw(va, probe, sizeof(probe)) != sizeof(probe)) continue;
         const u64 page_prot = vm_tracked_page_prot_or(va, prot);
         const u64 status = share_process_pages_to_process(process_token, source_process_slot, va, 1, page_prot);
         if (status != SYSCALL_OK && status != SYSCALL_ERR_MAP) {
@@ -823,6 +873,7 @@ static int copy_current_vm_to_process(u64 process_token, u64 source_process_slot
     if (!materialize_all_spawn_regions(share_vm)) return 0;
     for (u64 i = 0; i < VM_REGION_MAX; i++) {
         if (!g_regions[i].used || g_regions[i].file_lazy) continue;
+        if (!g_regions[i].file_backed && g_regions[i].anon_lazy) continue;
         if (!g_regions[i].file_backed && g_regions[i].prot == 0) continue;
         const u64 start = g_regions[i].start;
         const u64 page_count = align_up(g_regions[i].size, PAGE_BYTES) / PAGE_BYTES;
@@ -975,9 +1026,13 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
     const int share_vm = clone_form && (flags & CLONE_VM) != 0;
     struct abi_child_spawn spawn = prepare_abi_child_from_request(req, child_stack, 0, share_vm);
     const u64 child_slot = spawn.slot;
-    if (child_slot == 0) return reply(errno_busy(), 0);
+    if (child_slot == 0) {
+        user_log("LinuxAbiServer: fork spawn failed\n");
+        return reply(errno_busy(), 0);
+    }
     const u64 child_pid = alloc_linux_pid();
     if (child_pid == 0) {
+        user_log("LinuxAbiServer: fork pid alloc failed\n");
         abort_process(spawn.token);
         return reply(errno_busy(), 0);
     }
@@ -985,6 +1040,8 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
     remove_child_slot_from_thread_group(g_proc, child_pid);
     struct linux_process_state *child = alloc_process_state_for_new_principal(child_slot);
     if (!child) {
+        user_log("LinuxAbiServer: fork state failed\n");
+        user_log_hex_value(child_slot);
         abort_process(spawn.token);
         return reply(errno_busy(), 0);
     }
@@ -1015,6 +1072,8 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
         }
     }
     if (!start_prepared_abi_child(spawn)) {
+        user_log("LinuxAbiServer: fork start failed\n");
+        user_log_hex_value(child_slot);
         abort_process(spawn.token);
         remove_child_slot_from_thread_group(g_proc, child_pid);
         child->used = 0;
@@ -1022,7 +1081,7 @@ static struct ipc_message handle_fork_like(const struct trap_request *req, int c
     }
     if (vfork_form) {
         (void)detach_reply_token();
-        return wait_ipc();
+        return wait_linux_abi_event();
     }
     return reply(child_pid, 0);
 }
@@ -1082,6 +1141,9 @@ static struct ipc_message handle_setpgid(const struct trap_request *req) {
     return reply(0, 0);
 }
 
+static int linux_signal_default_terminates(u64 sig);
+static struct ipc_message terminate_linux_process_by_signal(const struct trap_request *req, struct linux_process_state *target, u64 sig);
+
 static void deliver_tty_signal(u64 signo) {
     if (signo == 0 || signo >= 65) return;
     int delivered = 0;
@@ -1094,13 +1156,24 @@ static void deliver_tty_signal(u64 signo) {
             if (!wait_pid_matches_child(waiter->wait_pid, child_pid)) continue;
             struct linux_process_state *proc = process_state_for_pid(child_pid);
             if (!proc || !proc->used || proc->exec_pending || proc->principal == 0) continue;
+            if (proc->sig_handler[signo] == 1) {
+                delivered = 1;
+                continue;
+            }
+            if (proc->sig_handler[signo] != 0) {
+                queue_process_signal_code(proc, signo, SI_USER);
+                delivered = 1;
+                continue;
+            }
+            if (!linux_signal_default_terminates(signo)) {
+                delivered = 1;
+                continue;
+            }
             proc->exit_status = (u32)(signo & 0x7fu);
             record_process_exit(proc->pid, proc->exit_status);
+            clear_child_tid_and_wake(proc, 0);
             remove_futex_waiters_for_principal(proc->principal);
-            if (proc->clear_child_tid != 0) {
-                const u32 zero = 0;
-                (void)copy_to_trap_target(proc->principal, proc->clear_child_tid, &zero, sizeof(zero));
-            }
+            remove_epoll_waiters_for_principal(proc->principal);
             (void)reply_trap_target(proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
             close_all_process_fds(proc);
             proc->used = 0;
@@ -1120,9 +1193,6 @@ static void deliver_tty_signal(u64 signo) {
         prime_reply_return_signal();
     }
 }
-
-static int linux_signal_default_terminates(u64 sig);
-static struct ipc_message terminate_linux_process_by_signal(const struct trap_request *req, struct linux_process_state *target, u64 sig);
 
 static void trace_signal_target(const char *event, const struct linux_process_state *target, u64 sig) {
     if (!profile_trace_enabled()) return;
@@ -1144,6 +1214,14 @@ static void trace_signal_target(const char *event, const struct linux_process_st
         user_log_hex_inline(target->pending_signals);
     }
     user_log("\n");
+}
+
+static void interrupt_signal_blocked_syscalls(struct linux_process_state *target, u64 current_principal) {
+    if (!target) return;
+    if (target->principal == current_principal) return;
+    (void)interrupt_futex_waiter_for_principal(target->principal);
+    (void)interrupt_sleep_waiter_for_principal(target->principal);
+    (void)interrupt_epoll_waiter_for_principal(target->principal);
 }
 
 static struct ipc_message handle_kill(const struct trap_request *req) {
@@ -1168,6 +1246,7 @@ static struct ipc_message handle_kill(const struct trap_request *req) {
         if (target->sig_handler[sig] == 1) return reply(0, 0);
         if (target->sig_handler[sig] != 0) {
             queue_process_signal_code(target, sig, SI_USER);
+            interrupt_signal_blocked_syscalls(target, req->caller_principal);
             prime_reply_return_signal();
             return reply(0, 0);
         }
@@ -1204,16 +1283,9 @@ static struct ipc_message terminate_linux_process_by_signal(const struct trap_re
         struct linux_process_state *proc = &g_processes[i];
         if (!proc->used || proc->pid != target_pid) continue;
         proc->exit_status = wait_status;
-        if (proc->clear_child_tid != 0) {
-            const u32 zero = 0;
-            if (proc->principal == current_principal) {
-                (void)copy_to_target(proc->clear_child_tid, &zero, sizeof(zero));
-                (void)wake_futex_waiters(proc->pid, proc->clear_child_tid, 1);
-            } else {
-                (void)copy_to_trap_target(proc->principal, proc->clear_child_tid, &zero, sizeof(zero));
-            }
-        }
+        clear_child_tid_and_wake(proc, current_principal);
         remove_futex_waiters_for_principal(proc->principal);
+        remove_epoll_waiters_for_principal(proc->principal);
         if (proc->principal != current_principal) {
             const u64 reply_status = reply_trap_target(proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
             if (reply_status == SYSCALL_OK) proc->used = 0;
@@ -1249,6 +1321,7 @@ static struct ipc_message handle_thread_signal(u64 tgid, u64 tid, u64 sig, const
     if (target->sig_handler[sig] == 1) return reply(0, 0);
     if (target->sig_handler[sig] != 0) {
         queue_process_signal_code(target, sig, tgid != 0 ? SI_TKILL : SI_USER);
+        interrupt_signal_blocked_syscalls(target, req->caller_principal);
         prime_reply_return_signal();
         return reply(0, 0);
     }
@@ -1282,7 +1355,7 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
     if (!thread_group_has_matching_child(g_proc, pid)) return reply(errno_child(), 0);
     if (g_proc->wait_pending) {
         (void)detach_reply_token();
-        return wait_ipc();
+        return wait_linux_abi_event();
     }
     profile_trace_event_u64("wait4.pending pid", (u64)pid);
     g_proc->wait_pending = 1;
@@ -1310,7 +1383,7 @@ static struct ipc_message handle_wait4(const struct trap_request *req) {
             if (satisfy_pending_waiters_for_child(peer->child_slot[i])) return wait_ipc_timeout(1);
         }
     }
-    return wait_ipc();
+    return wait_linux_abi_event();
 }
 
 static int waitid_pid_from_args(u64 which, u64 id, i64 *pid_out) {
@@ -1367,7 +1440,7 @@ static struct ipc_message handle_waitid(const struct trap_request *req) {
     if (!thread_group_has_matching_child(g_proc, pid)) return reply(errno_child(), 0);
     if (g_proc->wait_pending) {
         (void)detach_reply_token();
-        return wait_ipc();
+        return wait_linux_abi_event();
     }
     profile_trace_event_u64("waitid.pending pid", (u64)pid);
     g_proc->wait_pending = 1;
@@ -1395,5 +1468,5 @@ static struct ipc_message handle_waitid(const struct trap_request *req) {
             if (satisfy_pending_waiters_for_child(peer->child_slot[i])) return wait_ipc_timeout(1);
         }
     }
-    return wait_ipc();
+    return wait_linux_abi_event();
 }

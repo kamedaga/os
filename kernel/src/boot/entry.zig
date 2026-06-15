@@ -42,9 +42,10 @@ const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 // Boot globals
 // ---------------------------------------------------------------------------
 
-var user_spaces_storage: [boot_static.user_process_count]boot_static.UserAddressSpace align(4096) =
-    [_]boot_static.UserAddressSpace{.{}} ** boot_static.user_process_count;
-var user_spaces: []boot_static.UserAddressSpace = user_spaces_storage[0..];
+var empty_user_spaces_storage: [0]boot_static.UserAddressSpace align(4096) = .{};
+var user_spaces: []boot_static.UserAddressSpace = empty_user_spaces_storage[0..];
+var empty_kernel_runtime_storage: [0]u8 align(4096) = .{};
+var kernel_runtime_storage: []align(4096) u8 = empty_kernel_runtime_storage[0..];
 
 pub var global_free_list: kernel.FreePageList = .{};
 pub var kernel_state_global: kernel.KernelState = undefined;
@@ -71,7 +72,8 @@ fn minStaticStart(a: usize, b: usize) usize {
 
 fn kernelStaticStorageStartAddr() usize {
     var start = uefi_services.kernelStaticStorageStartAddr();
-    start = minStaticStart(start, staticStorageStart(@TypeOf(user_spaces_storage), &user_spaces_storage));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(user_spaces), &user_spaces));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(global_free_list), &global_free_list));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_global), &kernel_state_global));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_ready), &kernel_state_ready));
@@ -83,7 +85,8 @@ fn kernelStaticStorageStartAddr() usize {
 
 fn kernelStaticStorageEndAddr() usize {
     var end = uefi_services.kernelStaticStorageEndAddr();
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces_storage), &user_spaces_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces), &user_spaces));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(global_free_list), &global_free_list));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_global), &kernel_state_global));
     end = maxStaticEnd(end, kernel.kernelStaticStorageEndAddr());
@@ -110,8 +113,8 @@ fn kernelStaticStorageEndAddr() usize {
 
 fn threadLabel(thread_index: usize) []const u8 {
     const labels = comptime blk: {
-        var items: [boot_static.user_thread_count][]const u8 = undefined;
-        for (0..boot_static.user_thread_count) |i| {
+        var items: [kernel.initial_thread_capacity][]const u8 = undefined;
+        for (0..kernel.initial_thread_capacity) |i| {
             items[i] = std.fmt.comptimePrint("Thread{}", .{i});
         }
         break :blk items;
@@ -303,7 +306,17 @@ fn initKernelRuntimeOrHalt() void {
         if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(&kernel_state_global), @sizeOf(@TypeOf(kernel_state_global)))) {
             halt.haltWithMessage("kernel state runtime mapping failed");
         }
-        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(&user_spaces_storage), @sizeOf(@TypeOf(user_spaces_storage)))) {
+        if (kernel_runtime_storage.len != 0 and
+            !x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(kernel_runtime_storage.ptr), kernel_runtime_storage.len))
+        {
+            halt.haltWithMessage("kernel dynamic runtime mapping failed");
+        }
+        if (user_spaces.len != 0 and
+            !x86_platform.mapKernelRuntimeIdentityRange(
+                @intFromPtr(user_spaces.ptr),
+                user_spaces.len * @sizeOf(boot_static.UserAddressSpace),
+            ))
+        {
             halt.haltWithMessage("user spaces runtime mapping failed");
         }
         _ = x86_platform.enablePcidIfSupported();
@@ -321,7 +334,6 @@ fn initKernelRuntimeOrHalt() void {
 }
 
 fn initMemoryModules() void {
-    user_spaces = user_spaces_storage[0..];
     for (user_spaces) |*space| space.* = .{};
 
     user_vm.init(.{
@@ -353,6 +365,38 @@ fn initMemoryModules() void {
         .kernel_static_end_addr = kernelStaticStorageEndAddr(),
         .reserved_low_mem_end = boot_static.reserved_low_mem_end,
     });
+}
+
+fn allocateBootPagesBelow4GiBOrHalt(
+    bs: *std.os.uefi.tables.BootServices,
+    byte_count: usize,
+    label: []const u8,
+) []align(4096) u8 {
+    const page_count = (byte_count + 4095) / 4096;
+    if (page_count == 0) return empty_kernel_runtime_storage[0..];
+    const max_addr: [*]align(4096) std.os.uefi.Page = @ptrFromInt(boot_static.four_gib - 4096);
+    const pages = bs.allocatePages(.{ .max_address = max_addr }, .loader_data, page_count) catch {
+        kernel_log.write("boot page allocation failed: ");
+        kernel_log.write(label);
+        kernel_log.write("\n");
+        halt.haltWithMessage("boot page allocation failed");
+    };
+    const ptr: [*]align(4096) u8 = @ptrCast(pages.ptr);
+    const bytes = ptr[0 .. page_count * 4096];
+    @memset(bytes, 0);
+    return bytes;
+}
+
+fn allocateDynamicKernelStorageOrHalt(bs: *std.os.uefi.tables.BootServices) void {
+    kernel_runtime_storage = allocateBootPagesBelow4GiBOrHalt(bs, kernel.runtimeStorageBytes(), "kernel runtime storage");
+    if (!kernel.initRuntimeStorage(kernel_runtime_storage)) {
+        halt.haltWithMessage("kernel runtime storage init failed");
+    }
+
+    const user_space_bytes = @sizeOf(boot_static.UserAddressSpace) * boot_static.user_process_count;
+    const raw_user_spaces = allocateBootPagesBelow4GiBOrHalt(bs, user_space_bytes, "user address spaces");
+    const ptr: [*]boot_static.UserAddressSpace = @ptrCast(@alignCast(raw_user_spaces.ptr));
+    user_spaces = ptr[0..boot_static.user_process_count];
 }
 
 fn activateThreadOrHalt(thread_index: usize) void {
@@ -401,8 +445,9 @@ fn scrubEndpointTargets(table: *kernel.EndpointCNode, target: kernel.PrincipalId
 
 fn nextReadyThreadAfter(current_thread: usize) ?usize {
     var step: usize = 1;
-    while (step <= scheduler.max_thread_slots) : (step += 1) {
-        const thread_index = (current_thread + step) % scheduler.max_thread_slots;
+    const capacity = scheduler.threadSlotCapacity();
+    while (step <= capacity) : (step += 1) {
+        const thread_index = (current_thread + step) % capacity;
         if (!scheduler.isThreadReady(thread_index)) continue;
         return thread_index;
     }
@@ -452,13 +497,9 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     }
 
     kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
-    user_spaces[process_index] = .{};
+    user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalVmObjectCaps(principal, &global_free_list);
-    kernel_state_global.cap_tables[process_index].reset();
-    kernel_state_global.endpoint_tables[process_index] = .{};
-    kernel_state_global.cap_mailboxes[process_index] = .{};
-    kernel_state_global.pending_page_transfers[process_index] = null;
-    kernel_state_global.vm_object_tables[process_index].reset();
+    kernel_state_global.resetProcessRuntimeTables(process_index);
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -502,13 +543,9 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     }
 
     kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
-    user_spaces[process_index] = .{};
+    user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalVmObjectCaps(principal, &global_free_list);
-    kernel_state_global.cap_tables[process_index].reset();
-    kernel_state_global.endpoint_tables[process_index] = .{};
-    kernel_state_global.cap_mailboxes[process_index] = .{};
-    kernel_state_global.pending_page_transfers[process_index] = null;
-    kernel_state_global.vm_object_tables[process_index].reset();
+    kernel_state_global.resetProcessRuntimeTables(process_index);
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -630,6 +667,7 @@ const DetectedDevices = struct {
 fn runBootServicesPhase() BootResources {
     const bs = uefi_services.acquireBootServicesOrHalt();
     uefi_services.captureKernelImageRange(bs);
+    allocateDynamicKernelStorageOrHalt(bs);
     initMemoryModules();
 
     const framebuffer_info = uefi_services.acquireFramebufferInfo(bs) orelse {
@@ -759,6 +797,7 @@ fn discoverDevices() DetectedDevices {
 // ---------------------------------------------------------------------------
 
 fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
+    scheduler.initStaticStorage();
     const init_principal = state.createProcessDescriptor("seed2_boot") orelse
         halt.haltWithMessage("seed2_boot process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
@@ -828,6 +867,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
     syscalls.init(.{
         .state = state,
         .free_list = &global_free_list,
+        .user_spaces = user_spaces,
         .kernel_state_ready = &kernel_state_ready,
         .write = kernel_log.write,
         .print_hex = log_util.printHex,

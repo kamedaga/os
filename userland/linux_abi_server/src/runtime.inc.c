@@ -321,8 +321,8 @@ static u64 take_deliverable_signal(struct linux_process_state *proc) {
 static int try_reply_signal_frame(u64 result, u64 flags) {
     const struct trap_request *req = abi_current_request();
     if (flags != 0 || !g_proc || req == 0) return 0;
-    if (req->kind != TRAP_KIND_ABI_SYSCALL) return 0;
-    if (req->nr == LINUX_SYS_RT_SIGRETURN) return 0;
+    if (req->kind != TRAP_KIND_ABI_SYSCALL && req->kind != TRAP_KIND_ASYNC_SIGNAL) return 0;
+    if (req->kind == TRAP_KIND_ABI_SYSCALL && req->nr == LINUX_SYS_RT_SIGRETURN) return 0;
     const u64 signo = take_deliverable_signal(g_proc);
     if (signo == 0) return 0;
     const u64 handler = g_proc->sig_handler[signo];
@@ -429,13 +429,13 @@ static int try_reply_signal_frame(u64 result, u64 flags) {
 }
 
 static struct ipc_message wait_ipc(void) {
-    register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 0; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
+    register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 1; register u64 rsi __asm__("rsi") = 0; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
     __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "=r"(rdx), "=r"(r8) : : "rcx", "r9", "r10", "r11", "memory");
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
 
 static struct ipc_message wait_ipc_timeout(u64 timeout_ticks) {
-    register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 0; register u64 rsi __asm__("rsi") = timeout_ticks; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
+    register u64 rax __asm__("rax") = SYSCALL_WAIT_EVENT; register u64 rdi __asm__("rdi") = 1; register u64 rsi __asm__("rsi") = timeout_ticks; register u64 rdx __asm__("rdx"); register u64 r8 __asm__("r8");
     __asm__ volatile("int $0x80" : "+r"(rax), "+r"(rdi), "+r"(rsi), "=r"(rdx), "=r"(r8) : : "rcx", "r9", "r10", "r11", "memory");
     struct ipc_message msg = { rax, rdi, rsi, rdx, r8 }; return msg;
 }
@@ -503,8 +503,46 @@ static u64 map_vm_object_to_reply_target(u64 vm_token, u64 object_page_offset, u
     return syscall5(SYSCALL_MAP_ABI_TRAP_REPLY_TARGET_VM_OBJECT, vm_token, object_page_offset, target_va, page_count, prot_bits);
 }
 static u64 drop_vm_object_token(u64 vm_token) { return syscall3(SYSCALL_DROP_VM_OBJECT, vm_token, 0, 0); }
-static u64 copy_from_target(u64 target_va, void *dst, u64 len) { return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len); }
-static u64 copy_to_target(u64 target_va, const void *src, u64 len) { return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len); }
+static int fault_in_target_anon_lazy_range(u64 target_va, u64 len, int need_write) {
+    if (len == 0) return 1;
+    u64 end = 0;
+    if (u64_add_overflows(target_va, len, &end)) return 0;
+    for (;;) {
+        int materialized = 0;
+        for (u64 i = 0; i < VM_REGION_MAX; i++) {
+            if (!g_regions[i].used || !g_regions[i].anon_lazy) continue;
+            const u64 rs = g_regions[i].start;
+            const u64 re = rs + g_regions[i].size;
+            if (target_va >= re || end <= rs) continue;
+            if (need_write && (g_regions[i].prot & 0x2) == 0) return 0;
+            if (!need_write && (g_regions[i].prot & 0x1) == 0) return 0;
+            u64 from = target_va > rs ? target_va : rs;
+            u64 to = end < re ? end : re;
+            from &= ~(u64)(PAGE_BYTES - 1);
+            to = (to + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1);
+            if (from < rs) from = rs;
+            if (to > re) to = re;
+            if (to <= from) return 0;
+            if (!materialize_anon_lazy_range(from, to - from, g_regions[i].prot)) return 0;
+            materialized = 1;
+            break;
+        }
+        if (!materialized) return 1;
+    }
+}
+
+static u64 copy_from_target_raw(u64 target_va, void *dst, u64 len) {
+    return syscall3(SYSCALL_COPY_FROM_ABI_TRAP_REPLY_TARGET, (u64)dst, target_va, len);
+}
+
+static u64 copy_from_target(u64 target_va, void *dst, u64 len) {
+    if (!fault_in_target_anon_lazy_range(target_va, len, 0)) return 0;
+    return copy_from_target_raw(target_va, dst, len);
+}
+static u64 copy_to_target(u64 target_va, const void *src, u64 len) {
+    if (!fault_in_target_anon_lazy_range(target_va, len, 1)) return 0;
+    return syscall3(SYSCALL_COPY_TO_ABI_TRAP_REPLY_TARGET, target_va, (u64)src, len);
+}
 static u64 copy_from_trap_target(u64 principal, u64 target_va, void *dst, u64 len) { return syscall4_r10(SYSCALL_COPY_FROM_ABI_TRAP_TARGET, principal, (u64)dst, target_va, len); }
 static u64 copy_to_target_bulk(u64 target_va, const void *src, u64 len) {
     const u8 *bytes = (const u8 *)src;
@@ -615,7 +653,7 @@ static int ensure_all_child_trap_request_pages(void) {
     for (u64 principal = 0; principal < LINUX_ABI_REQUEST_PAGE_COUNT; principal++) {
         if (g_request_page_mapped[principal]) continue;
         const u64 request_va = trap_request_page_for_principal(principal);
-        const u64 status = alloc_map_pages(request_va, 1, 0x3);
+        const u64 status = alloc_map_pages(request_va, 1, 0x1);
         if (status != SYSCALL_OK) {
             user_log("LinuxAbiServer: request page table map failed principal=");
             user_log_hex_value(principal);
@@ -637,7 +675,7 @@ static int ensure_child_trap_request_page(u64 principal, u64 *request_va_out) {
         return 0;
     }
     if (!g_request_page_mapped[principal]) {
-        const u64 status = alloc_map_pages(request_va, 1, 0x3);
+        const u64 status = alloc_map_pages(request_va, 1, 0x1);
         if (status != SYSCALL_OK) {
             user_log("LinuxAbiServer: request page map failed principal=");
             user_log_hex_value(principal);
@@ -666,7 +704,7 @@ static int ensure_child_trap_request_page_mapped(u64 principal, u64 *request_va_
     const u64 request_va = trap_request_page_for_principal(principal);
     if (request_va == 0) return 0;
     if (!g_request_page_mapped[principal]) {
-        const u64 status = alloc_map_pages(request_va, 1, 0x3);
+        const u64 status = alloc_map_pages(request_va, 1, 0x1);
         if (status != SYSCALL_OK) return 0;
         g_request_page_mapped[principal] = 1;
     }
@@ -763,12 +801,28 @@ static int wait_vfs_response(u64 expected_seq, u16 expected_op) {
     return wait_fs_response_at(g_vfs.response_map.addr, expected_seq, expected_op);
 }
 
+static void profile_print_known_syscalls(void);
+
 static void profile_count_syscall(u64 nr) {
     g_prof.syscall_total++;
     if (nr <= LINUX_SYSCALL_PROFILE_COUNT) g_prof.syscall_counts[nr]++;
     const struct linux_syscall_metadata *metadata = linux_syscall_metadata_for(nr);
     if (metadata != 0 && metadata->category < LINUX_SYSCALL_CAT_COUNT) {
         g_prof.syscall_category_counts[metadata->category]++;
+    }
+    if (g_proc && g_proc->profile_progress_enabled && (g_prof.syscall_total % 1000ULL) == 0) {
+        user_log("LinuxAbiServer.perf.progress pid=");
+        user_log_dec_value(g_proc->pid);
+        user_log(" principal=");
+        user_log_dec_value(g_proc->principal);
+        if (g_proc->exec_path_len != 0) {
+            user_log(" exe=");
+            user_log(g_proc->exec_path);
+        }
+        user_log(" syscalls=");
+        user_log_dec_value(g_prof.syscall_total);
+        user_log("\n");
+        profile_print_known_syscalls();
     }
 }
 
@@ -807,6 +861,14 @@ static void profile_print_known_syscalls(void) {
     for (u64 i = 0; i < g_linux_syscall_metadata_count; i++) {
         profile_print_syscall(g_linux_syscall_metadata[i].name, g_linux_syscall_metadata[i].nr);
     }
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.total=", g_prof.page_faults_total);
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.lazy_file=", g_prof.page_faults_lazy_file);
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.file_vm_object=", g_prof.page_faults_file_vm_object);
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.protect=", g_prof.page_faults_protect);
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.zero_fill=", g_prof.page_faults_zero_fill);
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.unhandled=", g_prof.page_faults_unhandled);
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.ticks=", g_prof.page_fault_ticks);
+    user_log_dec_line("LinuxAbiServer.perf.page_faults.max_ticks=", g_prof.page_fault_max_ticks);
 }
 
 static void profile_print_fs_op(const char *name, u64 op) {
@@ -887,6 +949,12 @@ static void profile_clear(void) {
 static void profile_report_and_reset(void) {
     user_log("LinuxAbiServer.perf.begin exec=");
     user_log(g_exec_path);
+    if (g_proc) {
+        user_log(" pid=");
+        user_log_dec_value(g_proc->pid);
+        user_log(" principal=");
+        user_log_dec_value(g_proc->principal);
+    }
     user_log("\n");
     if (!profile_detail_enabled()) {
         user_log_dec_line("LinuxAbiServer.perf.summary.syscalls=", g_prof.syscall_total);

@@ -92,6 +92,7 @@ pub fn build(b: *std.Build) void {
         .target = efi_target,
         .optimize = .ReleaseSmall,
         .code_model = .small,
+        .strip = true,
     });
     efi_mod.addOptions("build_workarounds", build_workarounds);
     efi_mod.addImport("kernel_abi_root", kernel_abi_root_mod);

@@ -295,6 +295,12 @@ apps:
       rebuild: ["bash", "tools/build_wsl_linux_abi_probe.sh"]
     out: "LNXABIPR.ELF"
     rootfs: "/cmd/linux_abi_probe.elf"
+  go_vm_pressure_probe:
+    file:
+      path: ".artifacts/userland-fixtures/go_vm_pressure_probe.elf"
+      rebuild: ["bash", "tools/build_wsl_go_vm_pressure_probe.sh"]
+    out: "GOVMPRB.ELF"
+    rootfs: "/cmd/go_vm_pressure_probe.elf"
   linux_abi_server:
     role: "service"
     file:

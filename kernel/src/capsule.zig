@@ -80,7 +80,7 @@ pub const Capsule = struct {
     token: u64 = invalid_capsule,
     root_token: u64 = invalid_capsule,
     parent_token: u64 = invalid_capsule,
-    owner_principal_raw: u8 = 0,
+    owner_principal_raw: u32 = 0,
     generation: u64 = 0,
     revoke_generation: u64 = 0,
     kind: CapsuleKind = .none,
@@ -93,7 +93,7 @@ pub const Snapshot = struct {
     token: u64 = invalid_capsule,
     root_token: u64 = invalid_capsule,
     parent_token: u64 = invalid_capsule,
-    owner_principal_raw: u8 = 0,
+    owner_principal_raw: u32 = 0,
     generation: u64 = 0,
     revoke_generation: u64 = 0,
     kind: CapsuleKind = .none,
@@ -195,7 +195,7 @@ pub const CapsuleTable = struct {
 
     fn allocWithLineage(
         self: *CapsuleTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         kind: CapsuleKind,
         rights: Rights,
         metadata: Metadata,
@@ -229,7 +229,7 @@ pub const CapsuleTable = struct {
 
     pub fn allocRoot(
         self: *CapsuleTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         kind: CapsuleKind,
         rights: Rights,
         metadata: Metadata,
@@ -246,7 +246,7 @@ pub const CapsuleTable = struct {
 
     pub fn derive(
         self: *CapsuleTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         parent_token: u64,
         kind: CapsuleKind,
         rights: Rights,
@@ -266,8 +266,8 @@ pub const CapsuleTable = struct {
 
     pub fn grant(
         self: *CapsuleTable,
-        owner_principal_raw: u8,
-        child_owner_principal_raw: u8,
+        owner_principal_raw: u32,
+        child_owner_principal_raw: u32,
         token: u64,
         rights: Rights,
     ) CapsuleError!u64 {
@@ -289,7 +289,7 @@ pub const CapsuleTable = struct {
 
     pub fn authorize(
         self: *const CapsuleTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         token: u64,
         kind: CapsuleKind,
         required_rights: Rights,
@@ -320,7 +320,7 @@ pub const CapsuleTable = struct {
 
     pub fn collectSubtreeTokens(
         self: *const CapsuleTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         token: u64,
         out: []u64,
     ) CapsuleError!usize {
@@ -343,7 +343,7 @@ pub const CapsuleTable = struct {
         return count;
     }
 
-    pub fn revokeSubtree(self: *CapsuleTable, owner_principal_raw: u8, token: u64) CapsuleError!usize {
+    pub fn revokeSubtree(self: *CapsuleTable, owner_principal_raw: u32, token: u64) CapsuleError!usize {
         const start = self.findByToken(token) orelse return CapsuleError.NotFound;
         if (start.owner_principal_raw != owner_principal_raw) return CapsuleError.Denied;
         const root_token = start.root_token;
@@ -365,7 +365,7 @@ pub const CapsuleTable = struct {
         return count;
     }
 
-    pub fn closeSubtree(self: *CapsuleTable, owner_principal_raw: u8, token: u64) CapsuleError!usize {
+    pub fn closeSubtree(self: *CapsuleTable, owner_principal_raw: u32, token: u64) CapsuleError!usize {
         const start = self.findByToken(token) orelse return CapsuleError.NotFound;
         if (start.owner_principal_raw != owner_principal_raw) return CapsuleError.Denied;
         const root_token = start.root_token;
@@ -384,7 +384,7 @@ pub const CapsuleTable = struct {
         return count;
     }
 
-    pub fn releaseOwner(self: *CapsuleTable, owner_principal_raw: u8) usize {
+    pub fn releaseOwner(self: *CapsuleTable, owner_principal_raw: u32) usize {
         var total: usize = 0;
         while (true) {
             var token: u64 = invalid_capsule;

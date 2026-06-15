@@ -71,6 +71,11 @@ pub fn init(new_hooks: Hooks) void {
     abi_trap_hooks_ready = true;
 }
 
+pub fn updateUserSpaces(user_spaces: []boot_static.UserAddressSpace) void {
+    if (!abi_trap_hooks_ready) return;
+    abi_trap_hooks_storage.user_spaces = user_spaces;
+}
+
 fn getHooks() *const Hooks {
     if (!abi_trap_hooks_ready) unreachable;
     return &abi_trap_hooks_storage;
@@ -331,8 +336,9 @@ const TargetResolveUse = enum {
 };
 
 fn targetPrincipalFromRaw(target_raw: u64) ?kernel.PrincipalId {
-    if (target_raw >= kernel.process_count) return null;
-    return @enumFromInt(@as(u8, @intCast(target_raw)));
+    if (target_raw > @as(u64, @intCast(@import("std").math.maxInt(usize)))) return null;
+    const index: usize = @intCast(target_raw);
+    return kernel.processPrincipalFromIndex(index);
 }
 
 fn delegateTargetsServer(h: *const Hooks, server_proc: kernel.PrincipalId, target_proc: kernel.PrincipalId) bool {
@@ -392,20 +398,16 @@ pub fn copyFromTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, targ
 
 fn teardownTrapTargetProcess(h: *const Hooks, target_proc: kernel.PrincipalId, target_thread: usize) void {
     _ = scheduler.releaseThreadSlot(target_thread);
+    _ = h.state.markProcessExited(target_proc);
     h.state.releasePrincipalPageCaps(target_proc, h.free_list);
     if (kernel.processIndexFromPrincipal(target_proc)) |process_index| {
         if (process_index < h.user_spaces.len) {
             h.user_spaces[process_index] = .{};
         }
         h.state.releasePrincipalVmObjectCaps(target_proc, h.free_list);
-        h.state.cap_tables[process_index].reset();
-        h.state.endpoint_tables[process_index] = .{};
-        h.state.cap_mailboxes[process_index] = .{};
-        h.state.pending_page_transfers[process_index] = null;
-        h.state.vm_object_tables[process_index].reset();
+        h.state.resetProcessRuntimeTables(process_index);
     }
     _ = h.state.unpublishServiceEndpointsForTarget(target_proc);
-    _ = h.state.markProcessExited(target_proc);
 }
 
 pub fn replyToTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64, result: u64, flags: u64) u64 {
@@ -469,6 +471,17 @@ pub fn setTargetRequestPage(state: *kernel.KernelState, proc: kernel.PrincipalId
     if (target.ctx.ready) return boot_static.syscall_err_invalid;
     const delegate = h.state.abiTrapDelegateFor(target_proc) orelse return boot_static.syscall_err_endpoint;
     h.state.setAbiTrapDelegate(target_proc, delegate.endpoint_id, delegate.flavor, request_page_va) catch return boot_static.syscall_err_invalid;
+    return boot_static.syscall_ok;
+}
+
+pub fn interruptTarget(state: *kernel.KernelState, proc: kernel.PrincipalId, target_raw: u64) u64 {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    const target = resolveTarget(h, proc, target_raw, .delegated) orelse return boot_static.syscall_err_endpoint;
+    target.ctx.signal_pending = true;
+    scheduler.setIpcHotSignalPending(target.thread, true);
+    scheduler.wakeAssignedApForRunnableThread(target.thread);
+    scheduler.preferIpcSwitchToThread(target.thread);
     return boot_static.syscall_ok;
 }
 
@@ -707,6 +720,56 @@ pub fn dispatchDelegate(state: *kernel.KernelState, proc: kernel.PrincipalId, fr
 pub fn dispatchKnownDelegate(state: *kernel.KernelState, proc: kernel.PrincipalId, delegate: kernel.AbiTrapDelegate, frame: *TrapFrame) ?u64 {
     var h_storage = hooksForState(state);
     return dispatchKnownDelegateWithHooks(&h_storage, proc, delegate, frame);
+}
+
+pub fn dispatchPendingSignalDelegate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) bool {
+    var h_storage = hooksForState(state);
+    const h = &h_storage;
+    const delegate = state.abiTrapDelegateFor(proc) orelse return false;
+    const current_thread = scheduler.currentThreadIndex();
+    const current_ctx = scheduler.getThreadContext(current_thread) orelse return false;
+    const current_hot = scheduler.getIpcHotThreadConst(current_thread) orelse return false;
+    if (!current_ctx.allocated or current_hot.signal_pending == 0) return false;
+    const target_principal = h.state.endpointTargetForKnownActiveOwner(proc, delegate.endpoint_id) orelse return false;
+    const target_thread = scheduler.threadSlotForPrincipal(target_principal) orelse return false;
+
+    dispatch_delegate_lock.lock();
+    const status = deliverDelegateRequestLocked(
+        h,
+        proc,
+        target_principal,
+        target_thread,
+        delegate,
+        @intFromEnum(trap_abi.TrapKind.async_signal),
+        0,
+        0,
+        frame,
+        current_thread,
+        current_ctx,
+    );
+    dispatch_delegate_lock.unlock();
+    if (status != boot_static.syscall_ok) {
+        current_ctx.abi_trap_reply_pending = false;
+        return false;
+    }
+
+    current_ctx.signal_pending = false;
+    scheduler.setIpcHotSignalPending(current_thread, false);
+
+    if (consumeQueuedReplyForPrincipalFromSender(h, proc, target_thread, frame)) {
+        current_ctx.abi_trap_reply_pending = false;
+        return true;
+    }
+
+    if (!h.block_current_thread_for_event(frame, false, 0, boot_static.syscall_err_not_ready)) {
+        if (consumeQueuedReplyForPrincipalFromSender(h, proc, target_thread, frame)) {
+            current_ctx.abi_trap_reply_pending = false;
+            return true;
+        }
+        current_ctx.abi_trap_reply_pending = false;
+        return false;
+    }
+    return true;
 }
 
 pub fn dispatchPageFaultDelegate(

@@ -15,6 +15,7 @@ pub fn dispatch(
     return switch (frame.rax) {
         process_builder_abi.syscall_create_suspended_process => process_builder.createSuspendedProcess(proc),
         process_builder_abi.syscall_map_vm_object_to_process => process_builder.mapVmObjectToProcess(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx),
+        process_builder_abi.syscall_map_vm_object_range_to_process => process_builder.mapVmObjectRangeToProcess(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8, frame.r9),
         process_builder_abi.syscall_alloc_map_pages_to_process => process_builder.allocMapPagesToProcess(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8),
         process_builder_abi.syscall_set_process_initial_context => process_builder.setInitialContext(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx),
         process_builder_abi.syscall_start_process => process_builder.startProcess(proc, frame.rdi),

@@ -11,6 +11,7 @@ const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
 const smp = @import("smp.zig");
 const rtc = @import("rtc.zig");
+const boot_static = @import("boot/main_static.zig");
 const abi_trap_runtime = @import("runtime/abi_trap.zig");
 const sc = @import("syscall/numbers.zig");
 const syscall_lock_policy = @import("syscall/lock_policy.zig");
@@ -27,6 +28,7 @@ const TrapFrame = interrupts.TrapFrame;
 pub const Hooks = struct {
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
+    user_spaces: []boot_static.UserAddressSpace,
     kernel_state_ready: *const bool,
     write: *const fn ([]const u8) void,
     print_hex: *const fn (u64) void,
@@ -96,6 +98,11 @@ pub fn kernelStaticStorageEndAddr() usize {
 pub fn init(new_hooks: Hooks) void {
     syscall_hooks_storage = new_hooks;
     syscall_hooks_ready = true;
+}
+
+pub fn updateUserSpaces(user_spaces: []boot_static.UserAddressSpace) void {
+    if (!syscall_hooks_ready) return;
+    syscall_hooks_storage.user_spaces = user_spaces;
 }
 
 fn getHooks() *const Hooks {
@@ -288,6 +295,14 @@ fn exitAbiTrapReplyTargetIfRequested(
     ipc_syscalls.clearCurrentReplyToken();
     _ = scheduler.releaseThreadSlot(target.thread_index);
     h.state.releasePrincipalPageCaps(target.principal, h.free_list);
+    if (kernel.processIndexFromPrincipal(target.principal)) |process_index| {
+        if (process_index < h.user_spaces.len) {
+            h.user_spaces[process_index] = .{};
+        }
+        h.state.releasePrincipalVmObjectCaps(target.principal, h.free_list);
+        h.state.resetProcessRuntimeTables(process_index);
+    }
+    _ = h.state.unpublishServiceEndpointsForTarget(target.principal);
     _ = h.state.markProcessExited(target.principal);
     return true;
 }

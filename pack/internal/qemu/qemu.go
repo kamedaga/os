@@ -68,6 +68,7 @@ type SmokeResult struct {
 type TTYTestOptions struct {
 	Timeout    time.Duration
 	NoKVM      bool
+	ExtraArgs  []string
 	BootMarker string
 	Send       []string
 	Expect     []string
@@ -305,6 +306,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		Console:     "pty",
 		NewTerminal: true,
 		NoKVM:       opts.NoKVM,
+		ExtraArgs:   opts.ExtraArgs,
 	})
 	if err != nil {
 		span.Fail("qemu command failed")
@@ -630,6 +632,7 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		qemuPath,
 		"-machine", "q35",
 		"-m", opts.Memory,
+		"-smp", "4",
 		"-monitor", "none",
 		"-d", "int,guest_errors,cpu_reset",
 		"-D", logPath,

@@ -411,9 +411,6 @@ fn asmIpcCallReplyRecvSignalOnlyNoCr3(
 ) []const u8 {
     _ = user_cs;
     _ = user_ss;
-    comptime {
-        if (@sizeOf(kernel.PrincipalId) != 1) @compileError("asm IPC fastpath expects PrincipalId to fit in one byte");
-    }
     return std.fmt.comptimePrint(
         \\
         \\27:
@@ -447,8 +444,8 @@ fn asmIpcCallReplyRecvSignalOnlyNoCr3(
         \\mov %rdi, %rax
         \\imul ${d}, %rax, %rax
         \\lea (%r9,%rax), %rax
-        \\movzbq {d}(%r10), %r9
-        \\cmpb %r9b, {d}(%rax)
+        \\mov {d}(%r10), %r9d
+        \\cmp %r9d, {d}(%rax)
         \\jne 270f
         \\cmpb $0, {d}(%rax)
         \\je 270f
@@ -488,8 +485,8 @@ fn asmIpcCallReplyRecvSignalOnlyNoCr3(
         \\movq $0, {d}(%r10)
         \\movb $0, {d}(%r10)
         \\mov %rdi, {s}(%rip)
-        \\movb {d}(%rax), %r9b
-        \\movb %r9b, {s}(%rip)
+        \\mov {d}(%rax), %r9d
+        \\mov %r9d, {s}(%rip)
         \\mov {d}(%rax), %r9
         \\mov %r9, {s}(%rip)
         \\mov thread_contexts_ptr(%rip), %r9
@@ -997,6 +994,9 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!scheduler.schedulerRunsOnCurrentCpu()) {
+        if (user_mode and h.kernel_state_ready.* and abi_trap_runtime.dispatchPendingSignalDelegate(h.state, scheduler.currentUserPrincipal(), frame)) {
+            return;
+        }
         if (user_mode and !scheduler.currentApUserThreadCanContinue()) {
             smp.returnCurrentApToIdleFromInterrupt();
         }
@@ -1009,8 +1009,9 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     scheduler.lapic_tick_count +%= 1;
     if (!h.kernel_state_ready.*) return;
     scheduler.wakeThreadsForTimer(scheduler.lapic_tick_count);
-    if (h.scheduler_quantum_ticks == 0) return;
     if (!user_mode) return;
+    if (abi_trap_runtime.dispatchPendingSignalDelegate(h.state, scheduler.currentUserPrincipal(), frame)) return;
+    if (h.scheduler_quantum_ticks == 0) return;
 
     const next_thread = scheduler.chooseNextThreadForTimerPreempt(h.scheduler_quantum_ticks) orelse return;
     if (!h.switch_to_thread(next_thread, frame, null)) return;

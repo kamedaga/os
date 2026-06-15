@@ -47,6 +47,14 @@ enum fs_status {
     FS_STATUS_IO_ERROR = 8,
     FS_STATUS_BUSY = 9,
     FS_STATUS_END_OF_DIR = 10,
+    FS_STATUS_EXISTS = 11,
+};
+
+enum fs_create_flags {
+    FS_CREATE_FLAG_DIRECTORY = 1 << 0,
+    FS_CREATE_FLAG_TRUNCATE = 1 << 1,
+    FS_CREATE_FLAG_SYMLINK = 1 << 2,
+    FS_CREATE_FLAG_EXCLUSIVE = 1 << 3,
 };
 
 enum fs_object_kind {

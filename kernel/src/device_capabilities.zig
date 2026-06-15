@@ -12,7 +12,7 @@ pub const CommandCapability = dma_mapping_manager.CommandCapability;
 pub const CommandCapabilityTable = dma_mapping_manager.CommandCapabilityTable;
 
 pub fn principalHasIommuCapForDevice(state: *const kernel.KernelState, principal: kernel.PrincipalId, device: kernel.DmaDeviceId) bool {
-    const owner_raw: u8 = @intCast(@intFromEnum(principal));
+    const owner_raw: kernel.PrincipalRaw = @intCast(@intFromEnum(principal));
     for (state.iommu_caps.entries) |cap| {
         if (!cap.valid) continue;
         if (cap.owner_principal_raw != owner_raw) continue;
@@ -22,7 +22,7 @@ pub fn principalHasIommuCapForDevice(state: *const kernel.KernelState, principal
 }
 
 pub fn principalHasQueueCapForDevice(state: *const kernel.KernelState, principal: kernel.PrincipalId, device: kernel.DmaDeviceId) bool {
-    const owner_raw: u8 = @intCast(@intFromEnum(principal));
+    const owner_raw: kernel.PrincipalRaw = @intCast(@intFromEnum(principal));
     for (state.queue_caps.entries) |cap| {
         if (!cap.valid) continue;
         if (cap.owner_principal_raw != owner_raw) continue;
@@ -70,7 +70,7 @@ pub fn syncIommuForPrincipalPaddr(
     reason: kernel.IommuSyncReason,
 ) kernel.KernelError!void {
     if (state.iommu.mode == .off) return;
-    const owner_raw: u8 = @intCast(@intFromEnum(principal));
+    const owner_raw: kernel.PrincipalRaw = @intCast(@intFromEnum(principal));
     for (state.iommu_caps.entries) |cap| {
         if (!cap.valid or cap.owner_principal_raw != owner_raw) continue;
         try syncIommuForPrincipalDevicePaddr(state, principal, cap.device, paddr, reason);

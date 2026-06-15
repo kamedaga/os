@@ -38,11 +38,20 @@ pub fn init(new_hooks: Hooks) void {
     hooks = new_hooks;
 }
 
+pub fn updateUserSpaces(user_spaces: []UserAddressSpace) void {
+    if (hooks) |*h| h.user_spaces = user_spaces;
+}
+
 pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
     const h = hooks orelse return null;
     const idx = processIndex(principal) orelse return null;
     if (idx >= h.user_spaces.len) return null;
     return &h.user_spaces[idx];
+}
+
+pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
+    const space = getUserSpace(principal) orelse return;
+    space.* = .{};
 }
 
 pub fn currentUserSpace() *UserAddressSpace {
@@ -80,6 +89,43 @@ fn findUserPtSlotForPd(space: *const UserAddressSpace, pml4_index: usize, pdp_in
         if (space.pt_page_pd_index[slot] == pd_index) return slot;
     }
     return null;
+}
+
+fn userPtSlotHasUserMappings(h: Hooks, space: *const UserAddressSpace, slot: usize) bool {
+    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return true;
+    const pt_page: *const [512]u64 = &space.pt_pages[slot];
+    var i: usize = 0;
+    while (i < h.page_entries) : (i += 1) {
+        const entry = pt_page[i];
+        if ((entry & h.page_present) != 0 and (entry & h.page_user) != 0) return true;
+    }
+    return false;
+}
+
+fn releaseUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) void {
+    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return;
+    if (userPtSlotHasUserMappings(h, space, slot)) return;
+    const pml4_index = space.pt_page_pml4_index[slot];
+    const pdp_index = space.pt_page_pdp_index[slot];
+    const pd_index = space.pt_page_pd_index[slot];
+    if (pml4_index == UserAddressSpace.no_pd_index or
+        pdp_index == UserAddressSpace.no_pd_index or
+        pd_index == UserAddressSpace.no_pd_index)
+    {
+        return;
+    }
+    if (findUserPdSlotForPdp(space, pml4_index, pdp_index)) |pd_slot| {
+        const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
+        const entry = pd_page[pd_index];
+        const pt_pa: u64 = @intFromPtr(&space.pt_pages[slot]);
+        if ((entry & h.page_addr_mask) == pt_pa) {
+            pd_page[pd_index] = 0;
+        }
+    }
+    @memset(space.pt_pages[slot][0..], 0);
+    space.pt_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
+    space.pt_page_pdp_index[slot] = UserAddressSpace.no_pd_index;
+    space.pt_page_pd_index[slot] = UserAddressSpace.no_pd_index;
 }
 
 fn ptSlotScanLimit(space: *const UserAddressSpace) usize {
@@ -223,7 +269,10 @@ pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pml4_index: usize, pdp_in
     if (findUserPtSlotForPd(space, pml4_index, pdp_index, pd_index)) |slot| return slot;
 
     var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages and space.pt_page_pd_index[slot] != UserAddressSpace.no_pd_index) : (slot += 1) {}
+    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
+        if (space.pt_page_pd_index[slot] != UserAddressSpace.no_pd_index) continue;
+        break;
+    }
     if (slot >= UserAddressSpace.max_dynamic_pt_pages) return null;
     space.pt_page_pml4_index[slot] = @intCast(pml4_index);
     space.pt_page_pdp_index[slot] = @intCast(pdp_index);
@@ -514,6 +563,9 @@ pub fn unmapUserLinearRegion(
         if ((old_entry & h.page_user) == 0) return false;
     }
 
+    var touched_slots: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
+    var touched_count: usize = 0;
+
     offset = 0;
     while (offset < size_u64) : (offset += 4096) {
         const va = va_start + offset;
@@ -521,9 +573,25 @@ pub fn unmapUserLinearRegion(
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
         const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
         pt_page[index.pt] = 0;
+        var seen = false;
+        var touched_index: usize = 0;
+        while (touched_index < touched_count) : (touched_index += 1) {
+            if (touched_slots[touched_index] == pt_slot) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen and touched_count < touched_slots.len) {
+            touched_slots[touched_count] = @intCast(pt_slot);
+            touched_count += 1;
+        }
     }
     if (!capability.releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
     h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
+    var touched_index: usize = 0;
+    while (touched_index < touched_count) : (touched_index += 1) {
+        releaseUserPtSlotIfEmpty(h, space, touched_slots[touched_index]);
+    }
 
     return true;
 }

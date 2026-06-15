@@ -58,6 +58,7 @@ enum {
     SYSCALL_SHARE_ABI_TRAP_REPLY_TARGET_PAGES_TO_TARGET = 0x66,
     SYSCALL_PROTECT_ABI_TRAP_TARGET_PAGES = 0x67,
     SYSCALL_UNMAP_ABI_TRAP_TARGET_PAGES = 0x68,
+    SYSCALL_INTERRUPT_ABI_TRAP_TARGET = 0x69,
     SYSCALL_OK = 0,
     SYSCALL_ERR_INVALID = 1,
     SYSCALL_ERR_NOT_READY = 2,
@@ -88,6 +89,7 @@ enum {
     TRAP_VERSION = 2,
     TRAP_KIND_ABI_SYSCALL = 1,
     TRAP_KIND_PAGE_FAULT = 2,
+    TRAP_KIND_ASYNC_SIGNAL = 6,
 
     SERVICE_REGISTRY_SHADOW_VA = 0x3C2C0000,
     SERVICE_REGISTRY_MAGIC = 0x53525643,
@@ -137,6 +139,7 @@ enum {
     FS_STATUS_IO_ERROR = 8,
     FS_STATUS_BUSY = 9,
     FS_STATUS_END_OF_DIR = 10,
+    FS_STATUS_EXISTS = 11,
     FS_OBJECT_NONE = 0,
     FS_OBJECT_MOUNT = 1,
     FS_OBJECT_DIRECTORY = 2,
@@ -352,6 +355,7 @@ enum {
     LINUX_SYS_GETRANDOM = 318,
     LINUX_SYS_RENAMEAT2 = 316,
     LINUX_SYS_MEMBARRIER = 324,
+    LINUX_SYS_COPY_FILE_RANGE = 326,
     LINUX_SYS_RSEQ = 334,
     LINUX_SYS_PIDFD_OPEN = 434,
     LINUX_SYSCALL_METADATA_MAX_NR = LINUX_SYS_FACCESSAT2,
@@ -367,6 +371,7 @@ enum {
     O_NONBLOCK = 00004000,
     O_CREAT = 00000100,
     O_TRUNC = 00001000,
+    O_APPEND = 00002000,
     O_CLOEXEC = 02000000,
     O_DIRECTORY = 00200000,
     O_NOFOLLOW = 00400000,
@@ -397,6 +402,7 @@ enum {
     FS_CREATE_FLAG_DIRECTORY = 1 << 0,
     FS_CREATE_FLAG_TRUNCATE = 1 << 1,
     FS_CREATE_FLAG_SYMLINK = 1 << 2,
+    FS_CREATE_FLAG_EXCLUSIVE = 1 << 3,
     WNOHANG = 1,
     WUNTRACED = 2,
     WEXITED = 4,
@@ -512,8 +518,10 @@ enum {
     VM_RIGHT_READ_MAP = 0x5,
     VM_RIGHT_READ_MAP_GRANT = 0xD,
     EXEC_BOOTSTRAP_MAGIC = 0x45584543424F4F54ULL,
-    EXEC_BOOTSTRAP_VERSION = 4,
+    EXEC_BOOTSTRAP_VERSION = 5,
     EXEC_BOOTSTRAP_FLAG_SERVICE_MODE = 1ULL << 0,
+    EXEC_ARG_BLOCK_MAGIC = 0x4558454341524753ULL,
+    EXEC_ARG_BLOCK_VERSION = 1,
     EXEC_LAUNCH_ENDPOINT_ID = 0x93,
     EXEC_LAUNCH_REQUEST_MAGIC = 0x4558454353565251ULL,
     EXEC_LAUNCH_RESPONSE_MAGIC = 0x4558454353565252ULL,
@@ -521,7 +529,11 @@ enum {
     EXEC_LAUNCH_OP_START = 1,
     EXEC_LAUNCH_OP_START_READY = 2,
     EXEC_LAUNCH_OP_STARTED = 3,
+    EXEC_LAUNCH_OP_TRIM_CACHES = 4,
     EXEC_LAUNCH_STATUS_OK = 0,
+    EXEC_LAUNCH_STATUS_INVALID = 1,
+    EXEC_LAUNCH_STATUS_MAP_FAILED = 2,
+    EXEC_LAUNCH_STATUS_LAUNCH_FAILED = 3,
     EXEC_LAUNCH_STATUS_START_FAILED = 4,
     LINUX_ABI_BOOTSTRAP_MAGIC = 0x4C41424943464731ULL,
     LINUX_ABI_BOOTSTRAP_VERSION = 3,
@@ -537,12 +549,15 @@ enum {
     EXECVE_TABLE_VA = 0x26401000,
     EXECVE_EXEC_SERVICE_CONFIG_VA = 0x26404000,
     EXECVE_EXEC_SERVICE_TABLE_VA = 0x26405000,
+    EXECVE_ARG_DATA_VA = 0x26410000,
     LINUX_ABI_REQUEST_PAGES_VA = 0x26500000,
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
     LINUX_SIGNAL_FRAME_MAGIC = 0x5349474652414D45ULL,
     FILE_CACHE_BASE_VA = 0x28000000,
-    FILE_CACHE_BYTES = 640 * 1024 * 1024,
-    FILE_CACHE_MAX = 64,
+    FILE_CACHE_BYTES = 24 * 1024 * 1024,
+    FILE_CACHE_MAX = 512,
+    PATH_CACHE_MAX = 4096,
+    PATH_CACHE_PROBE_MAX = 8,
     USER_LAYOUT_DEFAULT_LOW_VA = 0x00400000,
     USER_LAYOUT_DEFAULT_TOP_VA = 0x800000000000ULL,
     USER_LAYOUT_CANONICAL_TOP_VA = 0x800000000000ULL,
@@ -559,11 +574,15 @@ enum {
     LINUX_ENABLE_FILE_PAGE_FAULT_LAZY = 1,
     LINUX_MATERIALIZE_FILE_PREFIX_BEFORE_FIXED = 1,
     LINUX_FILE_FAULT_CLUSTER_PAGES = 256,
+    LINUX_ANON_FAULT_CLUSTER_PAGES = 1,
     EXECVE_MAX_IMAGE_BYTES = 128 * 1024 * 1024,
     EXECVE_MAX_LD_BYTES = 768 * 1024,
-    EXECVE_MAX_ARGV = 128,
+    EXECVE_MAX_ARGV = 384,
+    EXECVE_INLINE_MAX_ARGV = 128,
     EXECVE_MAX_ENVP = 32,
-    EXECVE_MAX_ARG_DATA_BYTES = 3208,
+    EXECVE_MAX_ARG_DATA_BYTES = 65535,
+    EXECVE_INLINE_ARG_DATA_BYTES = 3208,
+    VM_RIGHT_READ_WRITE_MAP = 0x7,
 };
 
 enum linux_syscall_category {
@@ -596,6 +615,7 @@ static const struct linux_syscall_metadata g_linux_syscall_metadata[] = {
     LINUX_SYSCALL_META(LINUX_SYS_WRITEV, "writev", LINUX_SYSCALL_CAT_IO),
     LINUX_SYSCALL_META(LINUX_SYS_PREAD64, "pread64", LINUX_SYSCALL_CAT_IO),
     LINUX_SYSCALL_META(LINUX_SYS_PWRITE64, "pwrite64", LINUX_SYSCALL_CAT_IO),
+    LINUX_SYSCALL_META(LINUX_SYS_COPY_FILE_RANGE, "copy_file_range", LINUX_SYSCALL_CAT_IO),
     LINUX_SYSCALL_META(LINUX_SYS_PIPE, "pipe", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_PIPE2, "pipe2", LINUX_SYSCALL_CAT_FD),
     LINUX_SYSCALL_META(LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LINUX_SYSCALL_CAT_FD),
@@ -976,6 +996,13 @@ struct linux_statfs {
 };
 
 enum fd_kind { FD_UNUSED = 0, FD_STDIO = 1, FD_FILE = 2, FD_DIR = 3, FD_PIPE_READ = 4, FD_PIPE_WRITE = 5, FD_TTY = 6, FD_SOCKET = 7, FD_RANDOM = 8, FD_EPOLL = 9, FD_EVENTFD = 10 };
+enum { EPOLL_WATCH_MAX = 16 };
+struct epoll_watch {
+    u64 fd_plus_one;
+    u64 data;
+    u32 events;
+    u32 reserved0;
+};
 struct fd_entry {
     enum fd_kind kind;
     u64 token;
@@ -994,6 +1021,7 @@ struct fd_entry {
     u16 socket_remote_port;
     u32 socket_local_ip;
     u32 socket_remote_ip;
+    struct epoll_watch epoll_watches[EPOLL_WATCH_MAX];
     char path[FS_MAX_PATH_BYTES + 1];
 };
 struct local_mapping {
@@ -1079,7 +1107,7 @@ struct file_cache_entry {
 
 enum { LINUX_FD_MAX = 256 };
 
-enum { PIPE_MAX = 8, PIPE_BUFFER_BYTES = 4096 };
+enum { PIPE_MAX = 32, PIPE_BUFFER_BYTES = 4096 };
 struct pipe_entry {
     u8 used;
     u8 pending_read;
@@ -1100,12 +1128,14 @@ struct socket_ref_entry {
     u64 token;
 };
 
-enum { FUTEX_WAITER_MAX = 32 };
+enum { FUTEX_WAITER_MAX = 128 };
 struct futex_waiter {
     u8 used;
+    u32 expected;
     u64 principal;
     u64 owner_pid;
     u64 uaddr;
+    u64 deadline_tick;
 };
 
 enum { EXEC_CACHE_MAX = 16, EXEC_LOAD_REGION_MAX = 16 };
@@ -1141,10 +1171,11 @@ struct vm_region {
     u8 file_lazy;
     u8 file_vm_object;
     u8 file_shared_write;
+    u8 anon_lazy;
     int used;
 };
 
-enum { LINUX_PROCESS_MAX = 16, LINUX_CHILD_MAX = 16, LINUX_POSIX_TIMER_MAX = 8, LINUX_PROCESS_VM_OBJECT_TOKEN_MAX = 128 };
+enum { LINUX_PROCESS_MAX = 64, LINUX_CHILD_MAX = 64, LINUX_POSIX_TIMER_MAX = 8, LINUX_PROCESS_VM_OBJECT_TOKEN_MAX = 128 };
 struct linux_posix_timer_state {
     u8 used;
     u8 clock_id;
@@ -1177,6 +1208,10 @@ struct linux_process_state {
     char root_path[FS_MAX_PATH_BYTES + 1];
     u16 cwd_len;
     char cwd[FS_MAX_PATH_BYTES + 1];
+    u16 exec_path_len;
+    char exec_path[FS_MAX_PATH_BYTES + 1];
+    u16 exec_pending_load_path_len;
+    char exec_pending_load_path[FS_MAX_PATH_BYTES + 1];
     u8 child_used[LINUX_CHILD_MAX];
     u64 child_slot[LINUX_CHILD_MAX];
     u8 wait_pending;
@@ -1193,6 +1228,7 @@ struct linux_process_state {
     u8 profile_enabled;
     u8 profile_detail_enabled;
     u8 profile_verbose_enabled;
+    u8 profile_progress_enabled;
     u8 fault_trace_enabled;
     u64 sigaltstack_sp;
     u64 sigaltstack_size;
@@ -1224,13 +1260,13 @@ static int chroot_is_default(void);
 
 struct exec_bootstrap_config {
     u64 magic; u64 version; u64 executable_vm_token; u64 executable_file_bytes; u64 flags;
-    u64 interpreter_vm_token; u64 interpreter_file_bytes; u64 bootfs_vm_token; u64 bootfs_file_bytes;
+    u64 interpreter_vm_token; u64 interpreter_file_bytes; u64 arg_data_vm_token; u64 arg_data_vm_bytes;
     u64 fs_endpoint_id; u64 fs_compat_process_slot; u64 abi_trap_endpoint_id; u64 abi_trap_endpoint_process_slot;
     u64 abi_trap_flavor; u64 abi_trap_request_page_va;
     u16 execfn_offset; u16 execfn_bytes; u16 argv_count; u16 envp_count; u16 arg_data_bytes; u16 reserved_arg0;
-    u16 argv_offsets[EXECVE_MAX_ARGV]; u16 argv_bytes[EXECVE_MAX_ARGV];
+    u16 argv_offsets[EXECVE_INLINE_MAX_ARGV]; u16 argv_bytes[EXECVE_INLINE_MAX_ARGV];
     u16 envp_offsets[EXECVE_MAX_ENVP]; u16 envp_bytes[EXECVE_MAX_ENVP];
-    u8 arg_data[EXECVE_MAX_ARG_DATA_BYTES];
+    u8 arg_data[EXECVE_INLINE_ARG_DATA_BYTES];
     u64 user_low_va;
     u64 user_top_va;
     u64 dynamic_map_base_va;
@@ -1240,6 +1276,21 @@ struct exec_bootstrap_config {
     u64 stack_page_count;
     u64 mmap_base_va;
     u64 brk_initial_va;
+};
+struct exec_arg_block {
+    u64 magic;
+    u64 version;
+    u16 execfn_offset;
+    u16 execfn_bytes;
+    u16 argv_count;
+    u16 envp_count;
+    u16 arg_data_bytes;
+    u16 reserved0;
+    u16 argv_offsets[EXECVE_MAX_ARGV];
+    u16 argv_bytes[EXECVE_MAX_ARGV];
+    u16 envp_offsets[EXECVE_MAX_ENVP];
+    u16 envp_bytes[EXECVE_MAX_ENVP];
+    u8 arg_data[EXECVE_MAX_ARG_DATA_BYTES];
 };
 struct exec_launch_request {
     u64 magic;
@@ -1296,6 +1347,8 @@ _Static_assert(OFFSETOF(struct exec_bootstrap_config, envp_bytes) == 708, "exec 
 _Static_assert(OFFSETOF(struct exec_bootstrap_config, arg_data) == 772, "exec cfg arg data offset");
 _Static_assert(OFFSETOF(struct exec_bootstrap_config, user_low_va) == 3984, "exec cfg layout offset");
 _Static_assert(sizeof(struct exec_bootstrap_config) == 4056, "exec cfg size");
+_Static_assert(OFFSETOF(struct exec_arg_block, argv_offsets) == 28, "exec arg block argv offsets offset");
+_Static_assert(OFFSETOF(struct exec_arg_block, arg_data) == 1692, "exec arg block data offset");
 _Static_assert(sizeof(struct exec_launch_request) == 4096, "exec request size");
 _Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, exec_path) == 64, "linux abi cfg exec path offset");
 _Static_assert(OFFSETOF(struct linux_abi_bootstrap_config, user_low_va) == 208, "linux abi cfg layout offset");
@@ -1318,6 +1371,14 @@ struct linux_abi_profile {
     u64 syscall_ticks[LINUX_SYSCALL_PROFILE_COUNT + 1];
     u64 syscall_max_ticks[LINUX_SYSCALL_PROFILE_COUNT + 1];
     u64 syscall_category_counts[LINUX_SYSCALL_CAT_COUNT];
+    u64 page_faults_total;
+    u64 page_faults_lazy_file;
+    u64 page_faults_file_vm_object;
+    u64 page_faults_protect;
+    u64 page_faults_zero_fill;
+    u64 page_faults_unhandled;
+    u64 page_fault_ticks;
+    u64 page_fault_max_ticks;
     u64 pipe_create_calls;
     u64 pipe_create_busy;
     u64 pipe_create_faults;
@@ -1455,7 +1516,7 @@ static struct console_client g_console;
 static struct net_client_state g_net;
 static struct linux_abi_profile g_prof;
 static struct linux_process_state g_processes[LINUX_PROCESS_MAX];
-static struct path_cache_entry g_path_cache[FILE_CACHE_MAX];
+static struct path_cache_entry g_path_cache[PATH_CACHE_MAX];
 static struct file_cache_entry g_file_cache[FILE_CACHE_MAX];
 static u64 g_file_cache_next_offset = 0;
 static u8 g_exit_record_used[LINUX_PROCESS_MAX];
@@ -1602,11 +1663,17 @@ static void populate_exec_layout_config(struct exec_bootstrap_config *cfg) {
 static void deliver_tty_signal(u64 signo);
 static void remove_futex_waiters_for_principal(u64 principal);
 static u64 wake_futex_waiters(u64 owner_pid, u64 uaddr, u64 max_wake);
+static int interrupt_futex_waiter_for_principal(u64 principal);
+static int interrupt_sleep_waiter_for_principal(u64 principal);
+static int interrupt_epoll_waiter_for_principal(u64 principal);
+static struct ipc_message wait_linux_abi_event(void);
 static u64 map_target_pages_chunked(u64 start, u64 page_count, u64 prot);
 static u64 map_zeroed_target_pages_chunked(u64 start, u64 page_count, u64 prot);
+static int materialize_anon_lazy_range(u64 start, u64 size, u64 prot);
 static void clear_tracked_target_ranges(void);
 static void register_pending_exec_load_regions_for_process(struct linux_process_state *proc);
 static void register_exec_stack_region_for_process(struct linux_process_state *proc);
+static void register_exec_vdso_region_for_process(struct linux_process_state *proc);
 static u64 eventfd_read_to_target(u64 fd, u64 dst, u64 len, int *fault);
 static u64 eventfd_write_from_target(u64 fd, u64 src, u64 len, int *fault);
 

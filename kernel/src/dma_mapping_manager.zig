@@ -16,7 +16,7 @@ pub const DmaMappingState = enum(u8) {
 pub const DmaMapping = struct {
     valid: bool = false,
     token: u64 = 0,
-    owner_principal_raw: u8 = 0,
+    owner_principal_raw: u32 = 0,
     device: DmaDeviceId = invalid_dma_device_id,
     paddr_start: u64 = 0,
     length: u64 = 0,
@@ -46,7 +46,7 @@ pub const QueueCapability = struct {
     token: u64 = 0,
     root_token: u64 = 0,
     parent_token: u64 = 0,
-    owner_principal_raw: u8 = 0,
+    owner_principal_raw: u32 = 0,
     device: DmaDeviceId = invalid_dma_device_id,
     queue_index: u16 = 0,
     allow_submit: bool = false,
@@ -58,7 +58,7 @@ pub const IommuCapability = struct {
     token: u64 = 0,
     root_token: u64 = 0,
     parent_token: u64 = 0,
-    owner_principal_raw: u8 = 0,
+    owner_principal_raw: u32 = 0,
     device: DmaDeviceId = invalid_dma_device_id,
     allow_map_read: bool = false,
     allow_map_write: bool = false,
@@ -85,7 +85,7 @@ pub const CommandCapability = struct {
     token: u64 = 0,
     root_token: u64 = 0,
     parent_token: u64 = 0,
-    owner_principal_raw: u8 = 0,
+    owner_principal_raw: u32 = 0,
     device: DmaDeviceId = invalid_dma_device_id,
     opcode_mask: u64 = 0,
 };
@@ -105,7 +105,7 @@ pub const DmaMappingTable = struct {
 
     pub fn alloc(
         self: *DmaMappingTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         device: DmaDeviceId,
         paddr_start: u64,
         length: u64,
@@ -198,7 +198,7 @@ pub const IommuCapabilityTable = struct {
 
     fn allocWithLineage(
         self: *IommuCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         device: DmaDeviceId,
         allow_map_read: bool,
         allow_map_write: bool,
@@ -236,7 +236,7 @@ pub const IommuCapabilityTable = struct {
 
     pub fn alloc(
         self: *IommuCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         device: DmaDeviceId,
         allow_map_read: bool,
         allow_map_write: bool,
@@ -264,7 +264,7 @@ pub const IommuCapabilityTable = struct {
 
     pub fn authorize(
         self: *const IommuCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         token: u64,
         device: DmaDeviceId,
         op: IommuOperation,
@@ -281,8 +281,8 @@ pub const IommuCapabilityTable = struct {
 
     pub fn grant(
         self: *IommuCapabilityTable,
-        owner_principal_raw: u8,
-        child_owner_principal_raw: u8,
+        owner_principal_raw: u32,
+        child_owner_principal_raw: u32,
         token: u64,
     ) DmaMappingError!u64 {
         const cap = self.findByToken(token) orelse return DmaMappingError.NotFound;
@@ -298,7 +298,7 @@ pub const IommuCapabilityTable = struct {
         );
     }
 
-    pub fn revokeSubtree(self: *IommuCapabilityTable, owner_principal_raw: u8, token: u64) DmaMappingError!usize {
+    pub fn revokeSubtree(self: *IommuCapabilityTable, owner_principal_raw: u32, token: u64) DmaMappingError!usize {
         const cap = self.findByToken(token) orelse return DmaMappingError.NotFound;
         if (cap.owner_principal_raw != owner_principal_raw) return DmaMappingError.Denied;
         const root_token = cap.root_token;
@@ -367,7 +367,7 @@ pub const QueueCapabilityTable = struct {
 
     fn allocWithLineage(
         self: *QueueCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         device: DmaDeviceId,
         queue_index: u16,
         allow_submit: bool,
@@ -405,7 +405,7 @@ pub const QueueCapabilityTable = struct {
 
     pub fn alloc(
         self: *QueueCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         device: DmaDeviceId,
         queue_index: u16,
         allow_submit: bool,
@@ -433,7 +433,7 @@ pub const QueueCapabilityTable = struct {
 
     pub fn authorize(
         self: *const QueueCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         token: u64,
         device: DmaDeviceId,
         queue_index: u16,
@@ -451,8 +451,8 @@ pub const QueueCapabilityTable = struct {
 
     pub fn grant(
         self: *QueueCapabilityTable,
-        owner_principal_raw: u8,
-        child_owner_principal_raw: u8,
+        owner_principal_raw: u32,
+        child_owner_principal_raw: u32,
         token: u64,
     ) DmaMappingError!u64 {
         const cap = self.findByToken(token) orelse return DmaMappingError.NotFound;
@@ -468,7 +468,7 @@ pub const QueueCapabilityTable = struct {
         );
     }
 
-    pub fn revokeSubtree(self: *QueueCapabilityTable, owner_principal_raw: u8, token: u64) DmaMappingError!usize {
+    pub fn revokeSubtree(self: *QueueCapabilityTable, owner_principal_raw: u32, token: u64) DmaMappingError!usize {
         const cap = self.findByToken(token) orelse return DmaMappingError.NotFound;
         if (cap.owner_principal_raw != owner_principal_raw) return DmaMappingError.Denied;
         const root_token = cap.root_token;
@@ -500,7 +500,7 @@ pub const CommandCapabilityTable = struct {
 
     fn allocWithLineage(
         self: *CommandCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         device: DmaDeviceId,
         opcode_mask: u64,
         root_token_hint: u64,
@@ -534,7 +534,7 @@ pub const CommandCapabilityTable = struct {
 
     pub fn alloc(
         self: *CommandCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         device: DmaDeviceId,
         opcode_mask: u64,
     ) DmaMappingError!u64 {
@@ -552,7 +552,7 @@ pub const CommandCapabilityTable = struct {
 
     pub fn authorize(
         self: *const CommandCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         token: u64,
         device: DmaDeviceId,
         opcode: CommandOpcodeClass,
@@ -566,8 +566,8 @@ pub const CommandCapabilityTable = struct {
 
     pub fn grant(
         self: *CommandCapabilityTable,
-        owner_principal_raw: u8,
-        child_owner_principal_raw: u8,
+        owner_principal_raw: u32,
+        child_owner_principal_raw: u32,
         token: u64,
     ) DmaMappingError!u64 {
         const cap = self.findByToken(token) orelse return DmaMappingError.NotFound;
@@ -577,7 +577,7 @@ pub const CommandCapabilityTable = struct {
 
     pub fn deriveSubset(
         self: *CommandCapabilityTable,
-        owner_principal_raw: u8,
+        owner_principal_raw: u32,
         token: u64,
         opcode_mask: u64,
     ) DmaMappingError!u64 {
@@ -587,7 +587,7 @@ pub const CommandCapabilityTable = struct {
         return self.allocWithLineage(owner_principal_raw, cap.device, opcode_mask, cap.root_token, cap.token);
     }
 
-    pub fn revokeSubtree(self: *CommandCapabilityTable, owner_principal_raw: u8, token: u64) DmaMappingError!usize {
+    pub fn revokeSubtree(self: *CommandCapabilityTable, owner_principal_raw: u32, token: u64) DmaMappingError!usize {
         const cap = self.findByToken(token) orelse return DmaMappingError.NotFound;
         if (cap.owner_principal_raw != owner_principal_raw) return DmaMappingError.Denied;
         const root_token = cap.root_token;

@@ -110,9 +110,6 @@ enum {
     BLOCK_REQUEST_PAYLOAD_BYTES = 4096 - BLOCK_REQUEST_HEADER_BYTES,
     BLOCK_RESPONSE_HEADER_BYTES = 56,
     BLOCK_RESPONSE_PAYLOAD_BYTES = 4096 - BLOCK_RESPONSE_HEADER_BYTES,
-    FS_CREATE_FLAG_DIRECTORY = 1 << 0,
-    FS_CREATE_FLAG_TRUNCATE = 1 << 1,
-    FS_CREATE_FLAG_SYMLINK = 1 << 2,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     VM_RIGHT_READ_MAP = 0x5,
     VM_RIGHT_READ_MAP_GRANT = 0xD,
@@ -257,6 +254,8 @@ static u32 g_rootfs_vfs_size_bytes;
 static u32 g_startup_manifest_start_cluster;
 static u32 g_startup_manifest_size_bytes;
 static u32 g_next_free_cluster_hint = 2;
+static u32 g_root_readdir_cached_cluster_index = 0;
+static u32 g_root_readdir_cached_cluster = 0;
 
 struct fat_cached_file {
     u64 file_object_id;
@@ -327,6 +326,8 @@ struct fat_dynamic_object {
     u32 size_bytes;
     u32 cached_cluster_index;
     u32 cached_cluster;
+    u32 readdir_cached_cluster_index;
+    u32 readdir_cached_cluster;
     u64 vm_token;
     u32 vm_size_bytes;
     struct fat_dir_entry_location loc;
@@ -350,6 +351,13 @@ static u32 g_data_write_cache_sector_count = 0;
 
 static int ensure_client_bulk_pages(const volatile struct fs_request_header *request, u64 *new_maps_out);
 static int flush_data_write_cache(void);
+
+static void reset_dynamic_object_cluster_caches(struct fat_dynamic_object *object, u32 first_cluster) {
+    object->cached_cluster_index = 0;
+    object->cached_cluster = first_cluster;
+    object->readdir_cached_cluster_index = 0;
+    object->readdir_cached_cluster = first_cluster;
+}
 
 static void copy_dir_entry_view(struct fat_dir_entry_view *dst, const struct fat_dir_entry_view *src) {
     for (u16 i = 0; i < sizeof(dst->name); i++) dst->name[i] = src->name[i];
@@ -807,8 +815,7 @@ static void fill_dynamic_object_slot(
     g_dynamic_objects[slot].path_len = path_len;
     g_dynamic_objects[slot].first_cluster = entry->first_cluster;
     g_dynamic_objects[slot].size_bytes = entry->size_bytes;
-    g_dynamic_objects[slot].cached_cluster_index = 0;
-    g_dynamic_objects[slot].cached_cluster = entry->first_cluster;
+    reset_dynamic_object_cluster_caches(&g_dynamic_objects[slot], entry->first_cluster);
     if (loc != 0) g_dynamic_objects[slot].loc = *loc;
     for (u16 j = 0; j < path_len; j++) g_dynamic_objects[slot].path[j] = path[j];
     g_dynamic_objects[slot].path[path_len] = 0;
@@ -825,9 +832,11 @@ static u64 intern_dynamic_object_with_loc(
     const u32 hashed_slot = dynamic_path_hash_find(path, path_len);
     if (hashed_slot < FAT_MAX_DYNAMIC_OBJECTS) {
         if (!g_dynamic_objects[hashed_slot].dirent_dirty) {
+            const int cluster_changed = g_dynamic_objects[hashed_slot].first_cluster != entry->first_cluster;
             g_dynamic_objects[hashed_slot].attr = entry->attr;
             g_dynamic_objects[hashed_slot].first_cluster = entry->first_cluster;
             g_dynamic_objects[hashed_slot].size_bytes = entry->size_bytes;
+            if (cluster_changed) reset_dynamic_object_cluster_caches(&g_dynamic_objects[hashed_slot], entry->first_cluster);
         }
         if (loc != 0) {
             g_dynamic_objects[hashed_slot].loc = *loc;
@@ -846,9 +855,11 @@ static u64 intern_dynamic_object_with_loc(
         }
         if (same) {
             if (!g_dynamic_objects[i].dirent_dirty) {
+                const int cluster_changed = g_dynamic_objects[i].first_cluster != entry->first_cluster;
                 g_dynamic_objects[i].attr = entry->attr;
                 g_dynamic_objects[i].first_cluster = entry->first_cluster;
                 g_dynamic_objects[i].size_bytes = entry->size_bytes;
+                if (cluster_changed) reset_dynamic_object_cluster_caches(&g_dynamic_objects[i], entry->first_cluster);
             }
             if (loc != 0) {
                 g_dynamic_objects[i].loc = *loc;
@@ -2086,19 +2097,43 @@ static void fill_dir_entry_view(const u8 *entry, const u8 *lfn_name, u16 lfn_len
     }
 }
 
-static int read_dir_visible_entry(u32 dir_cluster, u64 cursor, struct fat_dir_entry_view *out) {
+static int read_dir_visible_entry(
+    u32 dir_cluster,
+    u64 cursor,
+    struct fat_dir_entry_view *out,
+    u64 *next_cursor_out,
+    u32 *cached_cluster_index,
+    u32 *cached_cluster
+) {
     if (!g_bpb.valid || dir_cluster < 2) return 0;
     u8 lfn_name[128];
     u16 lfn_len = 0;
-    u64 visible_index = 0;
-    u32 cluster = dir_cluster;
-    for (u32 cluster_guard = 0; cluster_guard < 65536 && fat_cluster_valid(cluster); cluster_guard++) {
+    if (g_bpb.bytes_per_sector == 0 || g_bpb.sectors_per_cluster == 0) return 0;
+    const u32 entries_per_sector = g_bpb.bytes_per_sector / 32u;
+    const u32 entries_per_cluster = entries_per_sector * g_bpb.sectors_per_cluster;
+    if (entries_per_sector == 0 || entries_per_cluster == 0) return 0;
+    u32 local_cached_cluster_index = 0;
+    u32 local_cached_cluster = dir_cluster;
+    if (cached_cluster_index == 0 || cached_cluster == 0) {
+        cached_cluster_index = &local_cached_cluster_index;
+        cached_cluster = &local_cached_cluster;
+    }
+    const u32 target_cluster_index = (u32)(cursor / entries_per_cluster);
+    u32 entry_in_cluster = (u32)(cursor % entries_per_cluster);
+    u32 cluster = 0;
+    if (!seek_cluster_cached(dir_cluster, target_cluster_index, cached_cluster_index, cached_cluster, &cluster)) return 0;
+    u64 raw_index = (u64)target_cluster_index * entries_per_cluster;
+    for (u32 cluster_guard = target_cluster_index; cluster_guard < 65536 && fat_cluster_valid(cluster); cluster_guard++) {
         const u32 first_sector = cluster_to_sector(cluster);
-        for (u32 sector_offset = 0; sector_offset < g_bpb.sectors_per_cluster; sector_offset++) {
+        u32 sector_offset = entry_in_cluster / entries_per_sector;
+        u32 entry_offset = entry_in_cluster % entries_per_sector;
+        raw_index += entry_in_cluster;
+        for (; sector_offset < g_bpb.sectors_per_cluster; sector_offset++) {
             u8 *sector_data = 0;
             if (!read_dir_sector_cached(first_sector + sector_offset, &sector_data)) return 0;
-            for (u32 off = 0; off < g_bpb.bytes_per_sector; off += 32) {
+            for (u32 off = entry_offset * 32u; off < g_bpb.bytes_per_sector; off += 32) {
                 const u8 *entry = &sector_data[off];
+                const u64 entry_cursor = raw_index++;
                 if (entry[0] == 0x00) return 0;
                 if (entry[0] == 0xE5) {
                     lfn_len = 0;
@@ -2118,18 +2153,22 @@ static int read_dir_visible_entry(u32 dir_cluster, u64 cursor, struct fat_dir_en
                     lfn_len = 0;
                     continue;
                 }
-                if (visible_index == cursor) {
-                    fill_dir_entry_view(entry, lfn_name, lfn_len, out);
-                    return out->name_len != 0;
+                fill_dir_entry_view(entry, lfn_name, lfn_len, out);
+                if (out->name_len != 0) {
+                    *next_cursor_out = entry_cursor + 1;
+                    return 1;
                 }
-                visible_index++;
                 lfn_len = 0;
             }
+            entry_offset = 0;
         }
+        entry_in_cluster = 0;
         u32 next = 0;
         if (!read_fat_next_cluster(cluster, &next)) return 0;
         if (next == 0) break;
         cluster = next;
+        *cached_cluster_index = cluster_guard + 1u;
+        *cached_cluster = cluster;
     }
     return 0;
 }
@@ -2927,8 +2966,7 @@ static void refresh_dynamic_object_by_path(const char *path, u32 first_cluster, 
         g_dynamic_objects[hashed_slot].attr = attr;
         g_dynamic_objects[hashed_slot].first_cluster = first_cluster;
         g_dynamic_objects[hashed_slot].size_bytes = size_bytes;
-        g_dynamic_objects[hashed_slot].cached_cluster_index = 0;
-        g_dynamic_objects[hashed_slot].cached_cluster = first_cluster;
+        reset_dynamic_object_cluster_caches(&g_dynamic_objects[hashed_slot], first_cluster);
         g_dynamic_objects[hashed_slot].vm_token = 0;
         g_dynamic_objects[hashed_slot].vm_size_bytes = 0;
         return;
@@ -2946,8 +2984,7 @@ static void refresh_dynamic_object_by_path(const char *path, u32 first_cluster, 
         g_dynamic_objects[i].attr = attr;
         g_dynamic_objects[i].first_cluster = first_cluster;
         g_dynamic_objects[i].size_bytes = size_bytes;
-        g_dynamic_objects[i].cached_cluster_index = 0;
-        g_dynamic_objects[i].cached_cluster = first_cluster;
+        reset_dynamic_object_cluster_caches(&g_dynamic_objects[i], first_cluster);
         g_dynamic_objects[i].vm_token = 0;
         g_dynamic_objects[i].vm_size_bytes = 0;
     }
@@ -3137,8 +3174,7 @@ static int ensure_file_cluster_at(struct fat_dynamic_object *object, u32 cluster
         u32 first = 0;
         if (!allocate_cluster_with_clear(&first, clear_new_clusters)) return 0;
         object->first_cluster = first;
-        object->cached_cluster_index = 0;
-        object->cached_cluster = first;
+        reset_dynamic_object_cluster_caches(object, first);
     }
     u32 index = 0;
     u32 cluster = object->first_cluster;
@@ -3278,6 +3314,7 @@ static int fat_create_path(
         } else if (create_dir) {
             return FS_STATUS_NOT_DIR;
         }
+        if ((flags & FS_CREATE_FLAG_EXCLUSIVE) != 0) return FS_STATUS_EXISTS;
         if ((flags & FS_CREATE_FLAG_TRUNCATE) != 0) {
             if (existing.first_cluster >= 2 && !free_cluster_chain(existing.first_cluster)) return FS_STATUS_IO_ERROR;
             if (!flush_fat_write_cache()) return FS_STATUS_IO_ERROR;
@@ -3456,8 +3493,7 @@ static int fat_truncate_object(struct fat_dynamic_object *object, u64 size, u32 
     if (new_size == 0) {
         if (object->first_cluster >= 2 && !free_cluster_chain(object->first_cluster)) return FS_STATUS_IO_ERROR;
         object->first_cluster = 0;
-        object->cached_cluster_index = 0;
-        object->cached_cluster = 0;
+        reset_dynamic_object_cluster_caches(object, 0);
     } else if (object->first_cluster >= 2) {
         const u32 cluster_bytes = (u32)g_bpb.bytes_per_sector * (u32)g_bpb.sectors_per_cluster;
         if (cluster_bytes == 0) return FS_STATUS_IO_ERROR;
@@ -4114,6 +4150,8 @@ static void reply_readdir(u64 seq, u64 token, u64 cursor) {
     char parent_path[FS_MAX_PATH_BYTES + 1];
     u16 parent_len = 0;
     const u64 object_id = object_id_from_token(token);
+    u32 *cached_cluster_index = &g_root_readdir_cached_cluster_index;
+    u32 *cached_cluster = &g_root_readdir_cached_cluster;
 
     if (token == root_token()) {
         dir_cluster = g_bpb.root_cluster;
@@ -4127,13 +4165,16 @@ static void reply_readdir(u64 seq, u64 token, u64 cursor) {
             return;
         }
         dir_cluster = dir->first_cluster;
+        cached_cluster_index = &dir->readdir_cached_cluster_index;
+        cached_cluster = &dir->readdir_cached_cluster;
         parent_len = dir->path_len;
         for (u16 i = 0; i < parent_len; i++) parent_path[i] = dir->path[i];
         parent_path[parent_len] = 0;
     }
 
     struct fat_dir_entry_view entry;
-    if (!read_dir_visible_entry(dir_cluster, cursor, &entry)) {
+    u64 next_cursor = cursor;
+    if (!read_dir_visible_entry(dir_cluster, cursor, &entry, &next_cursor, cached_cluster_index, cached_cluster)) {
         write_response(FS_OP_READDIR, seq, FS_STATUS_END_OF_DIR, 0, 0, cursor, FS_OBJECT_DIRECTORY, 0);
         return;
     }
@@ -4157,7 +4198,7 @@ static void reply_readdir(u64 seq, u64 token, u64 cursor) {
     }
     const u8 object_kind = fs_kind_from_fat_attr(entry.attr);
     volatile struct fs_dirent_record *record = (volatile struct fs_dirent_record *)(g_session.response_va + FS_RESPONSE_HEADER_BYTES);
-    record->next_cursor = cursor + 1;
+    record->next_cursor = next_cursor;
     record->object_kind = object_kind;
     for (u8 i = 0; i < 7; i++) record->reserved0[i] = 0;
     record->name_bytes = entry.name_len;
@@ -4171,7 +4212,7 @@ static void reply_readdir(u64 seq, u64 token, u64 cursor) {
         FS_STATUS_OK,
         token_from_object_id(child_object_id),
         entry.size_bytes,
-        cursor + 1,
+        next_cursor,
         object_kind,
         (u16)(FS_DIRENT_RECORD_BYTES + entry.name_len)
     );

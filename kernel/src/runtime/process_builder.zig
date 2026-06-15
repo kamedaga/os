@@ -5,6 +5,8 @@ const capability = @import("../capability.zig");
 const scheduler = @import("../scheduler.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const user_copy = @import("../user_copy.zig");
+const abi_trap_runtime = @import("abi_trap.zig");
+const syscalls = @import("../syscalls.zig");
 const boot_static = @import("../boot/main_static.zig");
 const boot_abi = @import("../boot/abi.zig");
 const process_factory = @import("../boot/process_factory.zig");
@@ -73,6 +75,56 @@ fn processSlot(principal: kernel.PrincipalId) ?u64 {
     return @intCast(kernel.processIndexFromPrincipal(principal) orelse return null);
 }
 
+fn allocUserSpaces(capacity: usize) ?[]boot_static.UserAddressSpace {
+    if (capacity == 0) return null;
+    const bytes = @sizeOf(boot_static.UserAddressSpace) * capacity;
+    const page_count = (bytes + 4095) / 4096;
+    const paddr = free_list_ptr.popContiguousAtOrAbove(page_count, 0) catch return null;
+    const raw: [*]u8 = @ptrFromInt(paddr);
+    @memset(raw[0 .. page_count * 4096], 0);
+    const ptr: [*]boot_static.UserAddressSpace = @ptrCast(@alignCast(raw));
+    return ptr[0..capacity];
+}
+
+fn freeDynamicUserSpaces(spaces: []boot_static.UserAddressSpace) void {
+    if (spaces.len <= boot_static.user_process_count) return;
+    const bytes = @sizeOf(boot_static.UserAddressSpace) * spaces.len;
+    const page_count = (bytes + 4095) / 4096;
+    const paddr = @intFromPtr(spaces.ptr);
+    free_list_ptr.appendContiguousRange(0, paddr, page_count) catch {};
+}
+
+fn ensureUserSpacesCapacity(required: usize) bool {
+    if (required <= user_spaces_ptr.len) return true;
+    if (required > kernel.max_process_slots) return false;
+    var capacity = user_spaces_ptr.len;
+    if (capacity == 0) capacity = kernel.process_count;
+    while (capacity < required) {
+        const doubled = capacity * 2;
+        capacity = if (doubled > kernel.max_process_slots) kernel.max_process_slots else doubled;
+        if (capacity < required and capacity == kernel.max_process_slots) return false;
+    }
+    const new_spaces = allocUserSpaces(capacity) orelse return false;
+    const old_spaces = user_spaces_ptr;
+    @memcpy(new_spaces[0..user_spaces_ptr.len], user_spaces_ptr);
+    var i = user_spaces_ptr.len;
+    while (i < new_spaces.len) : (i += 1) new_spaces[i] = .{};
+    user_spaces_ptr = new_spaces;
+    capability.updateUserSpaces(new_spaces);
+    user_vm.updateUserSpaces(new_spaces);
+    abi_trap_runtime.updateUserSpaces(new_spaces);
+    syscalls.updateUserSpaces(new_spaces);
+    freeDynamicUserSpaces(old_spaces);
+    return true;
+}
+
+fn ensureSpawnCapacity() bool {
+    if (state_ptr.active_process_count >= state_ptr.process_capacity) {
+        if (!state_ptr.ensureProcessCapacity(state_ptr.process_capacity + 1, free_list_ptr)) return false;
+    }
+    return ensureUserSpacesCapacity(state_ptr.process_capacity);
+}
+
 fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
@@ -83,19 +135,17 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
         user_spaces_ptr[process_index] = .{};
     }
     state_ptr.releasePrincipalVmObjectCaps(principal, free_list_ptr);
-    state_ptr.cap_tables[process_index].reset();
-    state_ptr.endpoint_tables[process_index] = .{};
-    state_ptr.cap_mailboxes[process_index] = .{};
-    state_ptr.pending_page_transfers[process_index] = null;
-    state_ptr.vm_object_tables[process_index].reset();
+    state_ptr.resetProcessRuntimeTables(process_index);
     _ = state_ptr.removeProcessDescriptor(principal);
 }
 
 pub fn createSuspendedProcess(caller: kernel.PrincipalId) u64 {
     if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    if (!ensureSpawnCapacity()) return boot_static.syscall_err_alloc;
     const created = process_factory.tryCreateSuspendedUserProcess(
         state_ptr,
         "suspended exec",
+        free_list_ptr,
         user_spaces_ptr,
     ) catch return boot_static.syscall_err_alloc;
     state_ptr.markProcessBuilderSuspended(created.principal, caller) catch {
@@ -139,6 +189,63 @@ pub fn mapVmObjectToProcess(caller: kernel.PrincipalId, token: u64, vm_token: u6
     return boot_static.syscall_ok;
 }
 
+pub fn mapVmObjectRangeToProcess(
+    caller: kernel.PrincipalId,
+    token: u64,
+    vm_token: u64,
+    object_page_offset: u64,
+    target_va: u64,
+    page_count_raw: u64,
+    prot_bits: u64,
+) u64 {
+    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
+    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
+    const vm_cap_id = kernel.decodeVmObjectToken(vm_token) orelse return boot_static.syscall_err_invalid;
+    const vm_cap = state_ptr.getVmObjectTableConst(caller).findByCapId(vm_cap_id) orelse return boot_static.syscall_err_invalid;
+    if (!vm_cap.rights.read or !vm_cap.rights.map) return boot_static.syscall_err_invalid;
+    if (prot.write and !vm_cap.rights.write) return boot_static.syscall_err_invalid;
+    if (vm_cap.backing.page_offset_bytes != 0) return boot_static.syscall_err_invalid;
+    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
+    if (page_count_raw == 0 or page_count_raw > vm_cap.backing.page_count) return boot_static.syscall_err_invalid;
+    if (object_page_offset > vm_cap.backing.page_count) return boot_static.syscall_err_invalid;
+    if (page_count_raw > vm_cap.backing.page_count - object_page_offset) return boot_static.syscall_err_invalid;
+    const end_va, const end_overflow = @addWithOverflow(target_va, page_count_raw * 4096 - 1);
+    if (end_overflow != 0) return boot_static.syscall_err_invalid;
+    if (!capability.isUserCanonicalVa(target_va) or !capability.isUserCanonicalVa(end_va)) return boot_static.syscall_err_invalid;
+
+    const page_count: usize = @intCast(page_count_raw);
+    const offset: usize = @intCast(object_page_offset);
+    var page_index: usize = 0;
+    while (page_index < page_count) {
+        const run_start = page_index;
+        const run_paddr = vm_cap.backing.pagePaddr(offset + run_start) orelse return boot_static.syscall_err_invalid;
+        var run_len: usize = 1;
+        while (run_start + run_len < page_count) : (run_len += 1) {
+            const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
+            if ((vm_cap.backing.pagePaddr(offset + run_start + run_len) orelse break) != expected) break;
+        }
+        const run_va = target_va + @as(u64, @intCast(run_start)) * 4096;
+        const run_bytes = run_len * 4096;
+        if (!user_vm.mapUserLinearRegionWithProt(target, run_va, run_paddr, run_bytes, prot)) {
+            return boot_static.syscall_err_map;
+        }
+        page_index = run_start + run_len;
+    }
+    return boot_static.syscall_ok;
+}
+
+fn rollbackAllocMapPagesToProcess(target: kernel.PrincipalId, target_va: u64, mapped_count: usize, allocated: []const u64) void {
+    if (mapped_count != 0) {
+        _ = user_vm.unmapUserLinearRegion(target, target_va, mapped_count * 4096);
+    }
+    var rollback_index: usize = allocated.len;
+    while (rollback_index > 0) {
+        rollback_index -= 1;
+        state_ptr.reclaimExclusiveRootPage(target, allocated[rollback_index], free_list_ptr) catch {};
+    }
+}
+
 pub fn allocMapPagesToProcess(
     caller: kernel.PrincipalId,
     token: u64,
@@ -153,16 +260,30 @@ pub fn allocMapPagesToProcess(
     if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
     if (page_count == 0 or page_count > boot_static.syscall_batch_max_pages) return boot_static.syscall_err_invalid;
 
+    var allocated: [boot_static.syscall_batch_max_pages]u64 = undefined;
+    var allocated_count: usize = 0;
+    var mapped_count: usize = 0;
+
     var page_index: u64 = 0;
     while (page_index < page_count) : (page_index += 1) {
-        const page = state_ptr.allocPageTo(target, free_list_ptr) catch return boot_static.syscall_err_alloc;
+        const page = state_ptr.allocPageTo(target, free_list_ptr) catch {
+            rollbackAllocMapPagesToProcess(target, target_va, mapped_count, allocated[0..allocated_count]);
+            return boot_static.syscall_err_alloc;
+        };
+        allocated[allocated_count] = page.paddr;
+        allocated_count += 1;
         const map_va = target_va + page_index * 4096;
         if (!user_vm.mapUserLinearRegionWithProt(target, map_va, page.paddr, 4096, prot)) {
+            rollbackAllocMapPagesToProcess(target, target_va, mapped_count, allocated[0..allocated_count]);
             return boot_static.syscall_err_map;
         }
+        mapped_count += 1;
         if (out_paddr_list_va != 0) {
             const list_va = out_paddr_list_va + page_index * @sizeOf(u64);
-            if (!user_copy.writeUserU64(caller, list_va, page.paddr)) return boot_static.syscall_err_map;
+            if (!user_copy.writeUserU64(caller, list_va, page.paddr)) {
+                rollbackAllocMapPagesToProcess(target, target_va, mapped_count, allocated[0..allocated_count]);
+                return boot_static.syscall_err_map;
+            }
         }
     }
     return boot_static.syscall_ok;

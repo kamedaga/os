@@ -59,6 +59,9 @@ pub fn dispatch(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *Tr
         sc.syscall_unmap_abi_trap_target_pages => {
             return abi_trap_runtime.unmapTargetPages(state, proc, frame.rdi, frame.rsi, frame.rdx);
         },
+        sc.syscall_interrupt_abi_trap_target => {
+            return abi_trap_runtime.interruptTarget(state, proc, frame.rdi);
+        },
         else => null,
     };
 }

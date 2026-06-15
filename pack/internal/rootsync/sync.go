@@ -146,7 +146,7 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 			Dirs:      counts.Dirs,
 		}, nil
 	}
-	if !opts.Full {
+	if !opts.Full && !opts.Force {
 		if partitionName == "rootfs" && len(opts.ChangedSources) > 0 {
 			span.Set(4, "trying targeted incremental sync")
 			if result, ok, err := tryTargetedIncrementalPartition(workspace, partitionName, diskPath, manifestPath, partition.Index, layoutFingerprint, opts.ChangedSources, span); err != nil {
@@ -244,8 +244,8 @@ func tryTargetedIncrementalPartition(workspace *config.Workspace, partitionName 
 	for _, record := range cache.Files {
 		recordsBySource[record.SourcePath] = record
 	}
-	var updates []fileUpdate
-	var updatedRecords []layoutCacheFile
+	var changedRecords []layoutCacheFile
+	wantedImages := map[string]bool{}
 	for index, source := range changedSources {
 		if span != nil {
 			span.Message(fmt.Sprintf("checking changed source %d/%d", index+1, len(changedSources)))
@@ -261,11 +261,21 @@ func tryTargetedIncrementalPartition(workspace *config.Workspace, partitionName 
 		if !ok {
 			return Result{}, false, nil
 		}
-		changed, err := fileSpec(record.ImagePath, record.SourcePath, "", 0, 0, LoadOptions{CheckSymlinks: true})
-		if err != nil {
-			return Result{}, false, err
-		}
 		if record.DirentOffset <= 0 {
+			return Result{}, false, nil
+		}
+		changedRecords = append(changedRecords, record)
+		wantedImages[record.ImagePath] = true
+	}
+	specsByImage, counts, err := loadSelectedManifestSpecs(manifestPath, wantedImages)
+	if err != nil {
+		return Result{}, false, err
+	}
+	var updates []fileUpdate
+	var updatedRecords []layoutCacheFile
+	for _, record := range changedRecords {
+		changed, ok := specsByImage[record.ImagePath]
+		if !ok {
 			return Result{}, false, nil
 		}
 		changed.StartCluster = record.StartCluster
@@ -287,10 +297,6 @@ func tryTargetedIncrementalPartition(workspace *config.Workspace, partitionName 
 	}
 	if span != nil {
 		span.Message(fmt.Sprintf("writing %d targeted updates", len(updates)))
-	}
-	counts, err := LoadManifestCounts(manifestPath)
-	if err != nil {
-		return Result{}, false, err
 	}
 	result, writtenRecords, err := writeIncrementalUpdates(workspace, diskPath, partitionIndex, manifestPath, updates, span)
 	if err != nil {
@@ -434,7 +440,10 @@ func writeIncrementalUpdates(workspace *config.Workspace, diskPath string, parti
 		newClusterCount := uint32(divCeil64(spec.Size, layout.ClusterBytes()))
 		chain, err := resizeClusterChain(fat, record.StartCluster, record.ClusterCount, newClusterCount)
 		if err != nil {
-			return Result{}, nil, err
+			chain, err = allocateClusterChain(fat, newClusterCount)
+			if err != nil {
+				return Result{}, nil, err
+			}
 		}
 		newStart := uint32(0)
 		if len(chain) > 0 {
@@ -459,7 +468,7 @@ func writeIncrementalUpdates(workspace *config.Workspace, diskPath string, parti
 			}
 			bytesWritten += spec.Size
 		}
-		if err := writeDirentLocation(disk, record.DirentOffset, newStart, spec.Size); err != nil {
+		if err := writeFileDirent(disk, record.DirentOffset, spec, newStart, spec.Size); err != nil {
 			return Result{}, nil, err
 		}
 		record.Size = spec.Size
@@ -548,6 +557,63 @@ func LoadManifestCounts(manifestPath string) (ManifestCounts, error) {
 	}
 	counts.Dirs = len(dirs)
 	return counts, nil
+}
+
+func loadSelectedManifestSpecs(manifestPath string, wantedImages map[string]bool) (map[string]FileSpec, ManifestCounts, error) {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, ManifestCounts{}, err
+	}
+	specs := map[string]FileSpec{}
+	counts := ManifestCounts{}
+	dirs := []Directory{{
+		Path:        "/",
+		ParentIndex: -1,
+		Leaf:        "",
+		Cluster:     2,
+	}}
+	serial := 1
+	for lineNumber, raw := range bytesSplitLines(data) {
+		line := bytes.TrimSpace(raw)
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		image, source, ok := bytes.Cut(line, []byte("="))
+		if !ok {
+			return nil, ManifestCounts{}, fmt.Errorf("invalid manifest line in %s:%d", manifestPath, lineNumber+1)
+		}
+		imagePath := string(bytes.TrimSpace(image))
+		if err := validateImagePath(imagePath); err != nil {
+			return nil, ManifestCounts{}, fmt.Errorf("%s:%d: %w", manifestPath, lineNumber+1, err)
+		}
+		sourcePath := string(bytes.TrimSpace(source))
+		if sourcePath == "@dir" {
+			if _, err := ensureDirectory(&dirs, imagePath); err != nil {
+				return nil, ManifestCounts{}, err
+			}
+			continue
+		}
+		parent, leaf := splitParent(imagePath)
+		parentIndex, err := ensureDirectory(&dirs, parent)
+		if err != nil {
+			return nil, ManifestCounts{}, err
+		}
+		counts.Files++
+		if wantedImages[imagePath] {
+			resolved := sourcePath
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(manifestPath), resolved)
+			}
+			spec, err := fileSpec(imagePath, resolved, leaf, parentIndex, serial, LoadOptions{CheckSymlinks: true})
+			if err != nil {
+				return nil, ManifestCounts{}, fmt.Errorf("%s:%d: %w", manifestPath, lineNumber+1, err)
+			}
+			specs[imagePath] = spec
+		}
+		serial++
+	}
+	counts.Dirs = len(dirs)
+	return specs, counts, nil
 }
 
 func ManifestContentFingerprint(manifestPath string) ([]byte, error) {

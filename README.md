@@ -37,7 +37,7 @@
 Trap delegation により、無改造の Linux バイナリがそのまま動作します。  
 musl ビルドで確認済み（glibc も動作）。
 
-`Python 3` &nbsp; `Vim` &nbsp; `Clang` &nbsp; `apk` &nbsp; `nano` &nbsp; `Lua` &nbsp; `W3M`
+`Python 3` &nbsp; `Vim` &nbsp; `Clang` &nbsp; `apk` &nbsp; `nano` &nbsp; `Lua` &nbsp; `W3M` &nbsp; `Go`
 
 ### Python3 on PachaOS
 

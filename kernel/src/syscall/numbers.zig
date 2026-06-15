@@ -99,6 +99,7 @@ pub const syscall_reply_abi_trap_target_context: u64 = trap_abi.syscall_reply_ab
 pub const syscall_share_abi_trap_reply_target_pages_to_target: u64 = trap_abi.syscall_share_abi_trap_reply_target_pages_to_target;
 pub const syscall_protect_abi_trap_target_pages: u64 = trap_abi.syscall_protect_abi_trap_target_pages;
 pub const syscall_unmap_abi_trap_target_pages: u64 = trap_abi.syscall_unmap_abi_trap_target_pages;
+pub const syscall_interrupt_abi_trap_target: u64 = trap_abi.syscall_interrupt_abi_trap_target;
 
 pub const syscall_batch_max_pages: usize = 256;
 pub const user_log_max_bytes: usize = 256;

@@ -54,6 +54,10 @@ static volatile int stress_start_gate = 0;
 static volatile int stress_ready_mask = 0;
 static volatile int stress_done_mask = 0;
 static volatile int stress_tls_sum = 0;
+static volatile int postmmap_stage = 0;
+static volatile int postmmap_done = 0;
+static volatile unsigned char *postmmap_main_page = NULL;
+static volatile unsigned char *postmmap_thread_page = NULL;
 
 static uint64_t gs_probe_words[2] = {
     UINT64_C(0x7061636861677331),
@@ -570,6 +574,80 @@ static int stress_probe(unsigned threads, unsigned rounds)
     return ok("stress");
 }
 
+static void *postmmap_thread_entry(void *arg)
+{
+    (void)arg;
+    const size_t page = page_size();
+    while (postmmap_stage == 0) {
+        syscall(SYS_futex, (int *)&postmmap_stage, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, NULL, NULL, 0);
+    }
+    if (postmmap_main_page == NULL || postmmap_main_page[0] != 0x41) {
+        return (void *)301;
+    }
+    postmmap_main_page[page - 1u] = 0x72;
+
+    unsigned char *mapped = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        return (void *)302;
+    }
+    mapped[0] = 0x53;
+    mapped[page - 1u] = 0x54;
+    postmmap_thread_page = mapped;
+    __sync_synchronize();
+    postmmap_done = 1;
+    (void)syscall(SYS_futex, (int *)&postmmap_done, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, 0);
+    return (void *)300;
+}
+
+static int postmmap_probe(void)
+{
+    const size_t page = page_size();
+    pthread_t id;
+    postmmap_stage = 0;
+    postmmap_done = 0;
+    postmmap_main_page = NULL;
+    postmmap_thread_page = NULL;
+
+    int status = pthread_create(&id, NULL, postmmap_thread_entry, NULL);
+    if (status != 0) {
+        errno = status;
+        return fail_errno("postmmap pthread_create", 90);
+    }
+
+    unsigned char *mapped = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        return fail_errno("postmmap main mmap", 91);
+    }
+    mapped[0] = 0x41;
+    postmmap_main_page = mapped;
+    __sync_synchronize();
+    postmmap_stage = 1;
+    (void)syscall(SYS_futex, (int *)&postmmap_stage, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, 0);
+
+    while (!postmmap_done) {
+        syscall(SYS_futex, (int *)&postmmap_done, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, NULL, NULL, 0);
+    }
+
+    void *joined = NULL;
+    status = pthread_join(id, &joined);
+    if (status != 0) {
+        errno = status;
+        return fail_errno("postmmap pthread_join", 92);
+    }
+    if ((long)joined != 300) {
+        return fail_value("postmmap thread return", "value", (long)joined, 93);
+    }
+    if (mapped[page - 1u] != 0x72) {
+        return fail_value("postmmap main page", "value", mapped[page - 1u], 94);
+    }
+    if (postmmap_thread_page == NULL || postmmap_thread_page[0] != 0x53 || postmmap_thread_page[page - 1u] != 0x54) {
+        return fail_value("postmmap thread page", "value", postmmap_thread_page == NULL ? -1 : postmmap_thread_page[0], 95);
+    }
+    (void)munmap(mapped, page);
+    (void)munmap((void *)postmmap_thread_page, page);
+    return ok("postmmap");
+}
+
 static int fd_probe(void)
 {
     const char *path = "/tmp/linux_abi_probe.tmp";
@@ -691,6 +769,37 @@ static int exit_group_probe(void)
     return fail_value("exit_group returned", "value", 1, 71);
 }
 
+static int exit_group_big_anon_probe(void)
+{
+    pthread_t waiter;
+    exit_group_child_ready = 0;
+    exit_group_wait_word = 0;
+    int status = pthread_create(&waiter, NULL, exit_group_waiter, NULL);
+    if (status != 0) {
+        errno = status;
+        return fail_errno("exit_group_big_anon pthread_create", 72);
+    }
+    while (!exit_group_child_ready) {
+        __asm__ volatile("pause");
+    }
+
+    unsigned mb = env_u32("LINUX_ABI_PROBE_BIG_MB", 16, 256);
+    if (mb == 0) mb = 16;
+    size_t length = (size_t)mb * 1024u * 1024u;
+    unsigned char *mapped = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        return fail_errno("exit_group_big_anon mmap", 73);
+    }
+    const size_t page = page_size();
+    for (size_t offset = 0; offset < length; offset += page) {
+        mapped[offset] = (unsigned char)(0x31u + ((offset / page) & 0x0fu));
+    }
+    mapped[length - 1u] = 0x7a;
+    (void)write_all_fd(1, "linux_abi_probe: exit_group big anon ready\n");
+    syscall(SYS_exit_group, 0);
+    return fail_value("exit_group_big_anon returned", "value", 1, 74);
+}
+
 static uint64_t read_gs_u64(unsigned offset)
 {
     uint64_t value = 0;
@@ -768,6 +877,8 @@ static int run_all(unsigned rounds, unsigned threads)
     if (status != 0) return status;
     status = stress_probe(threads, rounds);
     if (status != 0) return status;
+    status = postmmap_probe();
+    if (status != 0) return status;
     status = fd_probe();
     if (status != 0) return status;
     return ok("all");
@@ -788,11 +899,13 @@ int main(int argc, char **argv)
     if (strcmp(mode, "futex") == 0) return futex_probe();
     if (strcmp(mode, "pthread") == 0) return pthread_probe(threads, rounds);
     if (strcmp(mode, "stress") == 0) return stress_probe(threads, rounds);
+    if (strcmp(mode, "postmmap") == 0) return postmmap_probe();
     if (strcmp(mode, "fd") == 0) return fd_probe();
     if (strcmp(mode, "exit-group") == 0) return exit_group_probe();
+    if (strcmp(mode, "exit-group-big-anon") == 0) return exit_group_big_anon_probe();
     if (strcmp(mode, "gs") == 0) return gs_probe();
     if (strcmp(mode, "all") == 0) return run_all(rounds, threads);
 
-    (void)write_all_fd(2, "usage: linux_abi_probe.elf [all|mmap|brk|malloc|futex|pthread|stress|fd|exit-group|gs]\n");
+    (void)write_all_fd(2, "usage: linux_abi_probe.elf [all|mmap|brk|malloc|futex|pthread|stress|postmmap|fd|exit-group|exit-group-big-anon|gs]\n");
     return 2;
 }

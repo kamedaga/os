@@ -38,6 +38,302 @@ static void linux_syscall_profile_finish(const struct trap_request *req, const s
     }
 }
 
+static int wait_diag_enabled(void) {
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (g_processes[i].used && g_processes[i].profile_progress_enabled) return 1;
+    }
+    return 0;
+}
+
+static u64 count_wait_pending_processes(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (g_processes[i].used && g_processes[i].wait_pending) count++;
+    }
+    return count;
+}
+
+static u64 count_exec_pending_processes(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+        if (g_processes[i].used && g_processes[i].exec_pending) count++;
+    }
+    return count;
+}
+
+static u64 count_sleep_waiters(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < LINUX_SLEEP_WAITER_MAX; i++) {
+        if (g_sleep_waiters[i].used) count++;
+    }
+    return count;
+}
+
+static u64 count_epoll_waiters(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < LINUX_EPOLL_WAITER_MAX; i++) {
+        if (g_epoll_waiters[i].used) count++;
+    }
+    return count;
+}
+
+static u64 process_child_slot_count(const struct linux_process_state *proc) {
+    if (!proc) return 0;
+    u64 count = 0;
+    for (u64 i = 0; i < LINUX_CHILD_MAX; i++) {
+        if (proc->child_used[i]) count++;
+    }
+    return count;
+}
+
+static void log_wait_diag_child_slots(const struct linux_process_state *proc) {
+    if (!proc) return;
+    u64 logged = 0;
+    for (u64 i = 0; i < LINUX_CHILD_MAX && logged < 12; i++) {
+        if (!proc->child_used[i]) continue;
+        const u64 child = proc->child_slot[i];
+        struct linux_process_state *child_proc = process_state_for_pid(child);
+        const u64 child_principal = child_proc ? (child_proc->exec_pending ? child_proc->exec_pending_principal : child_proc->principal) : child;
+        u64 status = 0;
+        if (child_principal != 0) status = syscall1(SYSCALL_GET_PROCESS_STATUS, child_principal) & 0xff;
+        user_log("LinuxAbiServer.wait_diag.child parent=");
+        user_log_dec_value(proc->pid);
+        user_log(" child=");
+        user_log_dec_value(child);
+        user_log(" has_state=");
+        user_log_dec_value(child_proc ? 1 : 0);
+        if (child_proc) {
+            user_log(" principal=");
+            user_log_dec_value(child_proc->principal);
+            user_log(" pending_principal=");
+            user_log_dec_value(child_proc->exec_pending_principal);
+            user_log(" exec_pending=");
+            user_log_dec_value(child_proc->exec_pending);
+            if (child_proc->exec_path_len != 0) {
+                user_log(" exe=");
+                user_log(child_proc->exec_path);
+            }
+            user_log(" exit=");
+            user_log_hex_value(child_proc->exit_status);
+        }
+        user_log(" status=");
+        user_log_dec_value(status);
+        user_log("\n");
+        logged++;
+    }
+}
+
+static int process_group_has_futex_waiter(u64 pid) {
+    if (pid == 0) return 0;
+    for (u64 i = 0; i < FUTEX_WAITER_MAX; i++) {
+        const struct futex_waiter *waiter = &g_futex_waiters[i];
+        if (!waiter->used) continue;
+        const struct linux_process_state *proc = process_state_for(waiter->principal);
+        if (proc && proc->pid == pid) return 1;
+    }
+    return 0;
+}
+
+static void log_wait_diag_periodic(void) {
+    static u64 last_tick = 0;
+    if (!wait_diag_enabled()) return;
+    const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (last_tick != 0 && now - last_tick < 5000) return;
+    last_tick = now;
+
+    user_log("LinuxAbiServer.wait_diag tick=");
+    user_log_dec_value(now);
+    user_log(" live=");
+    user_log_dec_value(count_live_linux_process_states());
+    user_log(" wait_pending=");
+    user_log_dec_value(count_wait_pending_processes());
+    user_log(" exec_pending=");
+    user_log_dec_value(count_exec_pending_processes());
+    user_log(" sleep=");
+    user_log_dec_value(count_sleep_waiters());
+    user_log(" futex=");
+    user_log_dec_value(count_futex_waiters());
+    user_log(" epoll=");
+    user_log_dec_value(count_epoll_waiters());
+    user_log(" exit_records=");
+    user_log_dec_value(count_exit_records());
+    user_log(" child_slots=");
+    user_log_dec_value(count_known_child_slots());
+    user_log("\n");
+
+    u64 logged = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX && logged < 4; i++) {
+        const struct linux_process_state *proc = &g_processes[i];
+        if (!proc->used || !proc->exec_pending) continue;
+        user_log("LinuxAbiServer.wait_diag.exec_pending pid=");
+        user_log_dec_value(proc->pid);
+        user_log(" old_principal=");
+        user_log_dec_value(proc->principal);
+        user_log(" expected_principal=");
+        user_log_dec_value(proc->exec_pending_principal);
+        if (proc->exec_pending_principal != 0) {
+            user_log(" status=");
+            user_log_dec_value(syscall1(SYSCALL_GET_PROCESS_STATUS, proc->exec_pending_principal) & 0xff);
+        }
+        if (proc->exec_path_len != 0) {
+            user_log(" exe=");
+            user_log(proc->exec_path);
+        }
+        user_log("\n");
+        logged++;
+    }
+
+    logged = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX && logged < 4; i++) {
+        const struct linux_process_state *proc = &g_processes[i];
+        if (!proc->used || !proc->wait_pending) continue;
+        user_log("LinuxAbiServer.wait_diag.wait pid=");
+        user_log_dec_value(proc->pid);
+        user_log(" tid=");
+        user_log_dec_value(proc->tid);
+        user_log(" principal=");
+        user_log_dec_value(proc->principal);
+        user_log(" wait_pid=");
+        user_log_dec_value((u64)proc->wait_pid);
+        user_log(" waitid=");
+        user_log_dec_value(proc->wait_is_waitid);
+        user_log(" children=");
+        user_log_dec_value(process_child_slot_count(proc));
+        user_log("\n");
+        log_wait_diag_child_slots(proc);
+        logged++;
+    }
+
+    logged = 0;
+    for (u64 i = 0; i < LINUX_PROCESS_MAX && logged < 3; i++) {
+        const struct linux_process_state *proc = &g_processes[i];
+        if (!proc->used || proc->wait_pending || process_child_slot_count(proc) == 0) continue;
+        if (!process_group_has_futex_waiter(proc->pid)) continue;
+        user_log("LinuxAbiServer.wait_diag.children pid=");
+        user_log_dec_value(proc->pid);
+        user_log(" tid=");
+        user_log_dec_value(proc->tid);
+        user_log(" principal=");
+        user_log_dec_value(proc->principal);
+        user_log(" children=");
+        user_log_dec_value(process_child_slot_count(proc));
+        if (proc->exec_path_len != 0) {
+            user_log(" exe=");
+            user_log(proc->exec_path);
+        }
+        user_log("\n");
+        log_wait_diag_child_slots(proc);
+        logged++;
+    }
+
+    logged = 0;
+    for (u64 i = 0; i < LINUX_SLEEP_WAITER_MAX && logged < 4; i++) {
+        const struct linux_sleep_waiter *waiter = &g_sleep_waiters[i];
+        if (!waiter->used) continue;
+        const struct linux_process_state *proc = process_state_for(waiter->principal);
+        user_log("LinuxAbiServer.wait_diag.sleep principal=");
+        user_log_dec_value(waiter->principal);
+        if (proc) {
+            user_log(" pid=");
+            user_log_dec_value(proc->pid);
+            user_log(" tid=");
+            user_log_dec_value(proc->tid);
+        }
+        user_log(" deadline=");
+        user_log_dec_value(waiter->deadline_tick);
+        user_log(" now=");
+        user_log_dec_value(now);
+        user_log("\n");
+        logged++;
+    }
+
+    logged = 0;
+    for (u64 i = 0; i < FUTEX_WAITER_MAX && logged < 8; i++) {
+        const struct futex_waiter *waiter = &g_futex_waiters[i];
+        if (!waiter->used) continue;
+        const struct linux_process_state *proc = process_state_for(waiter->principal);
+        user_log("LinuxAbiServer.wait_diag.futex principal=");
+        user_log_dec_value(waiter->principal);
+        if (proc) {
+            user_log(" pid=");
+            user_log_dec_value(proc->pid);
+            user_log(" tid=");
+            user_log_dec_value(proc->tid);
+            if (proc->exec_path_len != 0) {
+                user_log(" exe=");
+                user_log(proc->exec_path);
+            }
+        }
+        user_log(" owner=");
+        user_log_dec_value(waiter->owner_pid);
+        user_log(" uaddr=");
+        user_log_hex_inline(waiter->uaddr);
+        user_log(" expected=");
+        user_log_hex_inline(waiter->expected);
+        u32 current = 0;
+        if (copy_from_trap_target(waiter->principal, waiter->uaddr, &current, sizeof(current)) == sizeof(current)) {
+            user_log(" current=");
+            user_log_hex_inline(current);
+        } else {
+            user_log(" current=fault");
+        }
+        user_log(" deadline=");
+        user_log_dec_value(waiter->deadline_tick);
+        user_log(" now=");
+        user_log_dec_value(now);
+        user_log("\n");
+        logged++;
+    }
+}
+
+static void linux_abi_wait_maintenance(void) {
+    try_satisfy_pending_sigwaits();
+    (void)try_satisfy_pending_waiters();
+    process_futex_waiters_update();
+    process_sleep_waiters_update();
+    process_epoll_waiters_update();
+    flush_deferred_pipe_wakes();
+    log_wait_diag_periodic();
+}
+
+static struct ipc_message wait_linux_abi_event(void) {
+    for (;;) {
+        linux_abi_wait_maintenance();
+        struct ipc_message msg = wait_ipc_timeout(1);
+        if (msg.status == SYSCALL_ERR_NOT_READY) continue;
+        return msg;
+    }
+}
+
+static u64 g_syscall_diag_logs;
+
+static void log_syscall_diag(const char *phase, const struct trap_request *req) {
+    if (!wait_diag_enabled() || g_syscall_diag_logs >= 4096) return;
+    const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (now < 22500) return;
+    g_syscall_diag_logs++;
+    user_log("LinuxAbiServer.syscall.");
+    user_log(phase);
+    user_log(" tick=");
+    user_log_dec_value(now);
+    user_log(" nr=");
+    user_log_dec_value(req->nr);
+    const struct linux_syscall_metadata *meta = linux_syscall_metadata_for(req->nr);
+    if (meta != 0) {
+        user_log(" name=");
+        user_log(meta->name);
+    }
+    user_log(" principal=");
+    user_log_dec_value(req->caller_principal);
+    if (g_proc) {
+        user_log(" pid=");
+        user_log_dec_value(g_proc->pid);
+        user_log(" tid=");
+        user_log_dec_value(g_proc->tid);
+    }
+    user_log("\n");
+}
+
 static struct linux_syscall_dispatch_result handle_exit_syscall(const struct trap_request *req, u64 syscall_profile_start_tick) {
     struct linux_syscall_dispatch_result result = { { 0, 0, 0, 0, 0 }, 0 };
     const u64 exiting_principal = req->caller_principal;
@@ -56,6 +352,8 @@ static struct linux_syscall_dispatch_result handle_exit_syscall(const struct tra
     const int exit_group = req->nr == LINUX_SYS_EXIT_GROUP;
     const int process_exits = exit_group || !exiting_thread;
     int satisfy_waiters_after_exit_reply = 0;
+    u8 peer_should_exit[LINUX_PROCESS_MAX];
+    for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) peer_should_exit[i] = 0;
     profile_trace_event_u64("exit.begin principal", exiting_principal);
     if (exiting_proc) exiting_proc->exit_status = (u32)((req->args[0] & 0xffu) << 8);
     if (exit_group && exiting_proc) {
@@ -63,31 +361,31 @@ static struct linux_syscall_dispatch_result handle_exit_syscall(const struct tra
             struct linux_process_state *thread_proc = &g_processes[i];
             if (!thread_proc->used || thread_proc == exiting_proc || thread_proc->pid != exiting_pid) continue;
             thread_proc->exit_status = exiting_proc->exit_status;
-            if (thread_proc->clear_child_tid != 0) {
-                const u32 zero = 0;
-                (void)copy_to_trap_target(thread_proc->principal, thread_proc->clear_child_tid, &zero, sizeof(zero));
-            }
+            clear_child_tid_and_wake(thread_proc, exiting_principal);
             remove_futex_waiters_for_principal(thread_proc->principal);
-            const u64 reply_status = reply_trap_target(thread_proc->principal, 0, TRAP_RESPONSE_FLAG_EXIT);
-            if (reply_status == SYSCALL_OK) {
-                thread_proc->used = 0;
-            }
+            remove_sleep_waiters_for_principal(thread_proc->principal);
+            remove_epoll_waiters_for_principal(thread_proc->principal);
+            peer_should_exit[i] = 1;
         }
     }
-    if (exiting_proc && exiting_proc->clear_child_tid != 0) {
-        const u32 zero = 0;
-        (void)copy_to_target(exiting_proc->clear_child_tid, &zero, sizeof(zero));
-        (void)wake_futex_waiters(exiting_pid, exiting_proc->clear_child_tid, 1);
-    }
+    clear_child_tid_and_wake(exiting_proc, exiting_principal);
     if (process_exits) {
         if (exiting_proc) record_process_exit(exiting_pid, exiting_proc->exit_status);
         profile_trace_event_u64("exit.close_fds pid", exiting_pid);
         clear_tracked_target_ranges();
+        for (u64 i = 0; i < LINUX_PROCESS_MAX; i++) {
+            if (!peer_should_exit[i]) continue;
+            const u64 reply_status = reply_trap_target(g_processes[i].principal, 0, TRAP_RESPONSE_FLAG_EXIT);
+            if (reply_status == SYSCALL_OK) g_processes[i].used = 0;
+        }
         close_all_process_fds(g_proc);
+        clear_thread_group_fd_tables_no_close(exiting_pid, exiting_proc);
         release_process_vm_object_tokens(exiting_proc);
         satisfy_waiters_after_exit_reply = 1;
     }
     remove_futex_waiters_for_principal(exiting_principal);
+    remove_sleep_waiters_for_principal(exiting_principal);
+    remove_epoll_waiters_for_principal(exiting_principal);
     reply_vfork_parent_if_any(exiting_proc);
     if (exiting_proc) exiting_proc->used = 0;
     prime_reply_return_signal();
@@ -167,10 +465,9 @@ void linux_abi_main(void) {
     struct ipc_message msg = reply(0, 0);
     for (;;) {
         abi_context_clear();
-        try_satisfy_pending_sigwaits();
-        flush_deferred_pipe_wakes();
+        linux_abi_wait_maintenance();
         if (msg.status != SYSCALL_OK) {
-            msg = msg.status == SYSCALL_ERR_NOT_READY ? wait_ipc_timeout(1) : wait_ipc();
+            msg = wait_ipc_timeout(1);
             continue;
         }
         if (msg.request_va == 0) {
@@ -179,7 +476,34 @@ void linux_abi_main(void) {
                 continue;
             }
             const int polled_tty = g_console.active && g_console.is_tty ? poll_tty_signal_events() : 1;
-            msg = polled_tty ? wait_ipc() : wait_ipc_timeout(1);
+            u64 sleep_timeout = 0;
+            const int sleep_pending = sleep_waiters_next_timeout(&sleep_timeout);
+            u64 futex_timeout = 0;
+            const int futex_pending = futex_waiters_next_timeout(&futex_timeout);
+            u64 epoll_timeout = 0;
+            const int epoll_pending = epoll_waiters_next_timeout(&epoll_timeout);
+            int wait_pending = 0;
+            u64 wait_timeout = 0;
+            if (sleep_pending) {
+                wait_pending = 1;
+                wait_timeout = sleep_timeout;
+            }
+            if (futex_pending && (!wait_pending || futex_timeout < wait_timeout)) {
+                wait_pending = 1;
+                wait_timeout = futex_timeout;
+            }
+            if (epoll_pending && (!wait_pending || epoll_timeout < wait_timeout)) {
+                wait_pending = 1;
+                wait_timeout = epoll_timeout;
+            }
+            if (!polled_tty) {
+                msg = wait_ipc_timeout(1);
+            } else if (wait_pending) {
+                (void)wait_timeout;
+                msg = wait_ipc_timeout(1);
+            } else {
+                msg = wait_ipc_timeout(1);
+            }
             continue;
         }
         if (!is_known_trap_request_page(msg.request_va)) { msg = reply(errno_inval(), 0); continue; }
@@ -192,10 +516,24 @@ void linux_abi_main(void) {
             g_root_linux_principal = req->caller_principal;
             g_root_linux_principal_set = 1;
         }
-        if (!g_proc) { msg = reply(errno_busy(), 0); continue; }
+        if (!g_proc) {
+            user_log("LinuxAbiServer: process state missing principal=");
+            user_log_hex_inline(req->caller_principal);
+            user_log(" live=");
+            user_log_dec_value(count_live_linux_process_states());
+            user_log(" children=");
+            user_log_dec_value(count_known_child_slots());
+            user_log("\n");
+            msg = reply(errno_busy(), 0);
+            continue;
+        }
         process_timers_update(g_proc);
         if (req->kind == TRAP_KIND_PAGE_FAULT) {
             msg = handle_page_fault(req);
+            continue;
+        }
+        if (req->kind == TRAP_KIND_ASYNC_SIGNAL) {
+            msg = reply(req->rax, 0);
             continue;
         }
         if (req->kind != TRAP_KIND_ABI_SYSCALL) {
@@ -203,7 +541,27 @@ void linux_abi_main(void) {
             continue;
         }
         const struct linux_syscall_profile_scope profile_scope = linux_syscall_profile_begin(req);
+        if (profile_scope.trace_enabled) {
+            user_log("LinuxAbiServer.trace syscall.begin nr=");
+            user_log_dec_value(req->nr);
+            user_log(" pid=");
+            user_log_dec_value(g_proc ? g_proc->pid : 0);
+            user_log(" principal=");
+            user_log_dec_value(req->caller_principal);
+            user_log(" a0=");
+            user_log_hex_inline(req->args[0]);
+            user_log(" a1=");
+            user_log_hex_inline(req->args[1]);
+            user_log(" a2=");
+            user_log_hex_inline(req->args[2]);
+            if (g_proc && g_proc->exec_path_len != 0) {
+                user_log(" exe=");
+                user_log(g_proc->exec_path);
+            }
+            user_log("\n");
+        }
         int syscall_profile_recorded = 0;
+        log_syscall_diag("begin", req);
         if (!dispatch_fd_syscall(req, &msg)) switch (req->nr) {
         case LINUX_SYS_OPEN: msg = handle_openat(req, 1); break;
         case LINUX_SYS_OPENAT: msg = handle_openat(req, 0); break;
@@ -237,6 +595,7 @@ void linux_abi_main(void) {
         case LINUX_SYS_PPOLL: msg = handle_poll(req, 1); break;
         case LINUX_SYS_PREAD64: msg = handle_pread64(req); break;
         case LINUX_SYS_PWRITE64: msg = handle_pwrite64(req); break;
+        case LINUX_SYS_COPY_FILE_RANGE: msg = handle_copy_file_range(req); break;
         case LINUX_SYS_GETDENTS64: msg = handle_getdents64(req); break;
         case LINUX_SYS_LSEEK: msg = handle_lseek(req); break;
         case LINUX_SYS_ACCESS: msg = handle_access(req); break;
@@ -322,6 +681,7 @@ void linux_abi_main(void) {
             break;
         default: user_log("LinuxAbiServer: unhandled syscall\n"); user_log_hex_value(req->nr); msg = reply(errno_nosys(), 0); break;
         }
+        log_syscall_diag("done", req);
         linux_syscall_profile_finish(req, &profile_scope, syscall_profile_recorded);
     }
 }

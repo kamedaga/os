@@ -7,6 +7,7 @@ pub const TrapKind = enum(u32) {
     illegal_instruction = 3,
     breakpoint = 4,
     protection_fault = 5,
+    async_signal = 6,
 };
 
 pub const AbiFlavor = enum(u32) {
@@ -47,6 +48,7 @@ pub const syscall_set_abi_trap_reply_target_gs_base: u64 = 0x65;
 pub const syscall_share_abi_trap_reply_target_pages_to_target: u64 = 0x66;
 pub const syscall_protect_abi_trap_target_pages: u64 = 0x67;
 pub const syscall_unmap_abi_trap_target_pages: u64 = 0x68;
+pub const syscall_interrupt_abi_trap_target: u64 = 0x69;
 pub const abi_trap_copy_max_bytes: usize = 4096;
 
 pub const TrapRequest = extern struct {

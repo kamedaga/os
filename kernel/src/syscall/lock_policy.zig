@@ -60,6 +60,7 @@ pub fn needsKernelStateLock(nr: u64) bool {
         sc.syscall_unmap_abi_trap_target_pages,
         process_builder_abi.syscall_create_suspended_process,
         process_builder_abi.syscall_map_vm_object_to_process,
+        process_builder_abi.syscall_map_vm_object_range_to_process,
         process_builder_abi.syscall_alloc_map_pages_to_process,
         process_builder_abi.syscall_set_process_initial_context,
         process_builder_abi.syscall_start_process,

@@ -120,7 +120,7 @@ pub fn tryCreateUserProcess(
         log_util.logLabelMessage(role_label, " process page table build failed");
         return error.CreateFailed;
     }
-    const thread_slot = scheduler.allocateThreadSlot(principal, user_spaces, buildInitialUserTrapFrame()) orelse {
+    const thread_slot = scheduler.allocateThreadSlot(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
         log_util.logLabelMessage(role_label, " thread context init failed");
         return error.CreateFailed;
     };
@@ -147,7 +147,7 @@ pub fn tryCreateDynamicUserProcess(
     free_list: *kernel.FreePageList,
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!DynamicUserProcess {
-    const principal = state.createProcessDescriptor(role_label) orelse return error.NoFreeProcess;
+    const principal = state.createProcessDescriptorWithCapacity(role_label, free_list) orelse return error.NoFreeProcess;
     releaseStaleThreadSlot(principal);
     const process = tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch return error.CreateFailed;
     return .{
@@ -159,15 +159,16 @@ pub fn tryCreateDynamicUserProcess(
 pub fn tryCreateSuspendedUserProcess(
     state: *kernel.KernelState,
     role_label: []const u8,
+    free_list: *kernel.FreePageList,
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!SuspendedUserProcess {
-    const principal = state.createProcessDescriptor(role_label) orelse return error.NoFreeProcess;
+    const principal = state.createProcessDescriptorWithCapacity(role_label, free_list) orelse return error.NoFreeProcess;
     releaseStaleThreadSlot(principal);
     if (!user_vm.buildEmptyUserAddressSpace(principal)) {
         _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     }
-    const thread_slot = scheduler.allocateSuspendedThreadSlot(principal, user_spaces, buildInitialUserTrapFrame()) orelse {
+    const thread_slot = scheduler.allocateSuspendedThreadSlot(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
         _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     };

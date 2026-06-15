@@ -6,6 +6,7 @@ enum {
     SYSCALL_ALLOC_PAGE = 0x1,
     SYSCALL_LOG = 0x9,
     SYSCALL_MAP_PAGE = 0x2,
+    SYSCALL_DROP_PRESENT = 0x4,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_DROP_VM_OBJECT = 0x31,
@@ -112,15 +113,17 @@ enum {
     VFS_TMPFS_FILE_OBJECT_ID_BASE = 0x1000,
     VFS_TMPFS_OPEN_OBJECT_ID_BASE = 0x2000,
     VFS_TMPFS_MAX_FILES = 8192,
-    VFS_TMPFS_MAX_STORAGE_FILES = 4096,
-    VFS_TMPFS_FILE_BYTES = 8 * 1024 * 1024,
+    VFS_TMPFS_FILE_BYTES = 64 * 1024 * 1024,
     VFS_TMPFS_PAGES_PER_FILE = VFS_TMPFS_FILE_BYTES / FS_PAGE_BYTES,
+    VFS_TMPFS_MAX_PAGE_SLOTS = 98304,
+    VFS_TMPFS_PAGE_SLOT_NONE = 0xFFFFFFFFu,
     VFS_DIR_MODE = 0x4000,
     VFS_FILE_MODE = 0x8000,
     VFS_SYMLINK_MODE = 0xA000,
     VFS_CREATE_FLAG_DIRECTORY = 1 << 0,
     VFS_CREATE_FLAG_TRUNCATE = 1 << 1,
     VFS_CREATE_FLAG_SYMLINK = 1 << 2,
+    VFS_CREATE_FLAG_EXCLUSIVE = 1 << 3,
     VM_OBJECT_TOKEN_TAG = 1ULL << 62,
     VM_RIGHT_READ_MAP = 0x5,
     VM_RIGHT_READ_MAP_GRANT = 0xD,
@@ -157,18 +160,23 @@ struct vfs_tmpfs_file {
     u8 reserved0[5];
     u64 parent_object_id;
     u16 name_len;
-    u16 storage_index;
     u16 symlink_target_len;
     u16 reserved1;
+    u32 first_page_slot;
+    u32 last_page_slot;
     u32 size;
     char name[FS_MAX_PATH_BYTES + 1];
     char symlink_target[FS_MAX_PATH_BYTES + 1];
 };
 
-struct vfs_tmpfs_storage {
+struct vfs_tmpfs_page_slot {
     u8 used;
-    u8 reserved0[7];
-    u64 page_vas[VFS_TMPFS_PAGES_PER_FILE];
+    u8 reserved0[3];
+    u32 page_index;
+    u32 next_slot;
+    u32 reserved1;
+    u64 page_va;
+    u64 page_paddr;
 };
 
 struct vfs_session {
@@ -329,7 +337,8 @@ static struct vfs_session *g_session;
 static struct vfs_backend_session g_root_backend;
 static struct net_backend_session g_net_backend;
 static struct vfs_tmpfs_file g_tmpfs_files[VFS_TMPFS_MAX_FILES];
-static struct vfs_tmpfs_storage g_tmpfs_storage[VFS_TMPFS_MAX_STORAGE_FILES];
+static struct vfs_tmpfs_page_slot g_tmpfs_page_slots[VFS_TMPFS_MAX_PAGE_SLOTS];
+static u32 g_tmpfs_page_slot_hint;
 static u64 g_endpoint_id;
 static u64 g_net_endpoint_id;
 static u64 g_net_process_slot;
@@ -777,6 +786,10 @@ static u64 alloc_map_pages_anywhere(u64 page_count, u64 flags, u64 out_paddr_lis
     return syscall3(SYSCALL_ALLOC_MAP_PAGES_ANYWHERE, page_count, flags, out_paddr_list_addr);
 }
 
+static u64 drop_present(u64 paddr) {
+    return syscall1(SYSCALL_DROP_PRESENT, paddr);
+}
+
 static u64 accept_ipc_buffer_transfer(u64 transfer_id) {
     return syscall1(SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER, transfer_id);
 }
@@ -857,43 +870,82 @@ static void clear_page(u64 va) {
     for (u64 i = 0; i < 512; i++) p[i] = 0;
 }
 
-static u64 tmpfs_page_va(u64 file_index, u64 page_index) {
-    if (file_index >= VFS_TMPFS_MAX_FILES || page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
-    const u64 storage_index = g_tmpfs_files[file_index].storage_index;
-    if (storage_index >= VFS_TMPFS_MAX_STORAGE_FILES || !g_tmpfs_storage[storage_index].used) return 0;
-    return g_tmpfs_storage[storage_index].page_vas[page_index];
+static int tmpfs_file_can_store_pages(u64 file_index) {
+    return file_index < VFS_TMPFS_MAX_FILES &&
+        g_tmpfs_files[file_index].used &&
+        !g_tmpfs_files[file_index].is_dir &&
+        !g_tmpfs_files[file_index].is_symlink;
 }
 
-static int ensure_tmpfs_storage(u64 file_index) {
-    if (file_index >= VFS_TMPFS_MAX_FILES ||
-        !g_tmpfs_files[file_index].used ||
-        g_tmpfs_files[file_index].is_dir ||
-        g_tmpfs_files[file_index].is_symlink)
-        return 0;
-    const u64 existing = g_tmpfs_files[file_index].storage_index;
-    if (existing < VFS_TMPFS_MAX_STORAGE_FILES && g_tmpfs_storage[existing].used) return 1;
-    for (u64 i = 0; i < VFS_TMPFS_MAX_STORAGE_FILES; i++) {
-        if (g_tmpfs_storage[i].used) continue;
-        g_tmpfs_storage[i].used = 1;
-        for (u64 page = 0; page < VFS_TMPFS_PAGES_PER_FILE; page++) {
-            if (g_tmpfs_storage[i].page_vas[page] != 0) clear_page(g_tmpfs_storage[i].page_vas[page]);
-        }
-        g_tmpfs_files[file_index].storage_index = (u16)i;
-        return 1;
+static u32 tmpfs_find_page_slot(u64 file_index, u64 page_index) {
+    if (!tmpfs_file_can_store_pages(file_index) || page_index >= VFS_TMPFS_PAGES_PER_FILE) return VFS_TMPFS_PAGE_SLOT_NONE;
+    struct vfs_tmpfs_file *file = &g_tmpfs_files[file_index];
+    u32 slot = file->last_page_slot;
+    if (slot < VFS_TMPFS_MAX_PAGE_SLOTS &&
+        g_tmpfs_page_slots[slot].used &&
+        g_tmpfs_page_slots[slot].page_index == (u32)page_index)
+    {
+        return slot;
     }
-    return 0;
+    for (slot = file->first_page_slot; slot != VFS_TMPFS_PAGE_SLOT_NONE;) {
+        if (slot >= VFS_TMPFS_MAX_PAGE_SLOTS || !g_tmpfs_page_slots[slot].used) return VFS_TMPFS_PAGE_SLOT_NONE;
+        if (g_tmpfs_page_slots[slot].page_index == (u32)page_index) {
+            file->last_page_slot = slot;
+            return slot;
+        }
+        slot = g_tmpfs_page_slots[slot].next_slot;
+    }
+    return VFS_TMPFS_PAGE_SLOT_NONE;
+}
+
+static u64 tmpfs_page_va(u64 file_index, u64 page_index) {
+    const u32 slot = tmpfs_find_page_slot(file_index, page_index);
+    if (slot == VFS_TMPFS_PAGE_SLOT_NONE) return 0;
+    return g_tmpfs_page_slots[slot].page_va;
+}
+
+static u32 tmpfs_alloc_page_slot(u64 file_index, u64 page_index) {
+    if (!tmpfs_file_can_store_pages(file_index) || page_index >= VFS_TMPFS_PAGES_PER_FILE) return VFS_TMPFS_PAGE_SLOT_NONE;
+    for (u64 tries = 0; tries < VFS_TMPFS_MAX_PAGE_SLOTS; tries++) {
+        const u32 slot = (g_tmpfs_page_slot_hint + (u32)tries) % VFS_TMPFS_MAX_PAGE_SLOTS;
+        if (g_tmpfs_page_slots[slot].used) continue;
+        u64 va = g_tmpfs_page_slots[slot].page_va;
+        u64 paddr = g_tmpfs_page_slots[slot].page_paddr;
+        if (va < FS_PAGE_BYTES) {
+            paddr = 0;
+            va = alloc_map_pages_anywhere(1, 1, (u64)&paddr);
+            if (va < FS_PAGE_BYTES) return VFS_TMPFS_PAGE_SLOT_NONE;
+            if (paddr < FS_PAGE_BYTES) {
+                (void)drop_present(paddr);
+                return VFS_TMPFS_PAGE_SLOT_NONE;
+            }
+        }
+        clear_page(va);
+        g_tmpfs_page_slots[slot].used = 1;
+        g_tmpfs_page_slots[slot].page_index = (u32)page_index;
+        g_tmpfs_page_slots[slot].next_slot = VFS_TMPFS_PAGE_SLOT_NONE;
+        g_tmpfs_page_slots[slot].page_va = va;
+        g_tmpfs_page_slots[slot].page_paddr = paddr;
+
+        struct vfs_tmpfs_file *file = &g_tmpfs_files[file_index];
+        if (file->first_page_slot == VFS_TMPFS_PAGE_SLOT_NONE) {
+            file->first_page_slot = slot;
+        } else if (file->last_page_slot < VFS_TMPFS_MAX_PAGE_SLOTS && g_tmpfs_page_slots[file->last_page_slot].used) {
+            g_tmpfs_page_slots[file->last_page_slot].next_slot = slot;
+        } else {
+            g_tmpfs_page_slots[slot].next_slot = file->first_page_slot;
+            file->first_page_slot = slot;
+        }
+        file->last_page_slot = slot;
+        g_tmpfs_page_slot_hint = (slot + 1) % VFS_TMPFS_MAX_PAGE_SLOTS;
+        return slot;
+    }
+    return VFS_TMPFS_PAGE_SLOT_NONE;
 }
 
 static int ensure_tmpfs_page(u64 file_index, u64 page_index) {
-    if (file_index >= VFS_TMPFS_MAX_FILES || page_index >= VFS_TMPFS_PAGES_PER_FILE) return 0;
-    if (!ensure_tmpfs_storage(file_index)) return 0;
-    const u64 storage_index = g_tmpfs_files[file_index].storage_index;
-    if (g_tmpfs_storage[storage_index].page_vas[page_index] != 0) return 1;
-    const u64 va = alloc_map_pages_anywhere(1, 1, 0);
-    if (va < FS_PAGE_BYTES) return 0;
-    clear_page(va);
-    g_tmpfs_storage[storage_index].page_vas[page_index] = va;
-    return 1;
+    if (tmpfs_find_page_slot(file_index, page_index) != VFS_TMPFS_PAGE_SLOT_NONE) return 1;
+    return tmpfs_alloc_page_slot(file_index, page_index) != VFS_TMPFS_PAGE_SLOT_NONE;
 }
 
 static void copy_from_volatile(volatile u8 *dst, const volatile u8 *src, u64 bytes);
@@ -915,23 +967,93 @@ static int tmpfs_write_bytes(u64 file_index, u64 offset, const volatile u8 *src,
     return 1;
 }
 
-static void tmpfs_clear_file_storage(u64 file_index) {
-    if (file_index >= VFS_TMPFS_MAX_FILES) return;
-    const u64 storage_index = g_tmpfs_files[file_index].storage_index;
-    if (storage_index >= VFS_TMPFS_MAX_STORAGE_FILES || !g_tmpfs_storage[storage_index].used) return;
-    for (u64 i = 0; i < VFS_TMPFS_PAGES_PER_FILE; i++) {
-        if (g_tmpfs_storage[storage_index].page_vas[i] != 0) clear_page(g_tmpfs_storage[storage_index].page_vas[i]);
+static void tmpfs_drop_page_slot(u32 slot) {
+    if (slot >= VFS_TMPFS_MAX_PAGE_SLOTS) return;
+    int dropped = 0;
+    if (g_tmpfs_page_slots[slot].page_paddr >= FS_PAGE_BYTES &&
+        drop_present(g_tmpfs_page_slots[slot].page_paddr) == 0)
+    {
+        dropped = 1;
     }
+    g_tmpfs_page_slots[slot].used = 0;
+    g_tmpfs_page_slots[slot].page_index = 0;
+    g_tmpfs_page_slots[slot].next_slot = VFS_TMPFS_PAGE_SLOT_NONE;
+    if (dropped) {
+        g_tmpfs_page_slots[slot].page_va = 0;
+        g_tmpfs_page_slots[slot].page_paddr = 0;
+    } else if (g_tmpfs_page_slots[slot].page_va >= FS_PAGE_BYTES) {
+        clear_page(g_tmpfs_page_slots[slot].page_va);
+    }
+    g_tmpfs_page_slot_hint = slot;
 }
 
 static void tmpfs_release_file_storage(u64 file_index) {
     if (file_index >= VFS_TMPFS_MAX_FILES) return;
-    const u64 storage_index = g_tmpfs_files[file_index].storage_index;
-    if (storage_index < VFS_TMPFS_MAX_STORAGE_FILES && g_tmpfs_storage[storage_index].used) {
-        tmpfs_clear_file_storage(file_index);
-        g_tmpfs_storage[storage_index].used = 0;
+    u32 slot = g_tmpfs_files[file_index].first_page_slot;
+    while (slot != VFS_TMPFS_PAGE_SLOT_NONE) {
+        if (slot >= VFS_TMPFS_MAX_PAGE_SLOTS || !g_tmpfs_page_slots[slot].used) break;
+        const u32 next = g_tmpfs_page_slots[slot].next_slot;
+        tmpfs_drop_page_slot(slot);
+        slot = next;
     }
-    g_tmpfs_files[file_index].storage_index = VFS_TMPFS_MAX_STORAGE_FILES;
+    g_tmpfs_files[file_index].first_page_slot = VFS_TMPFS_PAGE_SLOT_NONE;
+    g_tmpfs_files[file_index].last_page_slot = VFS_TMPFS_PAGE_SLOT_NONE;
+}
+
+static void tmpfs_clear_file_storage(u64 file_index) {
+    tmpfs_release_file_storage(file_index);
+}
+
+static void tmpfs_delete_index_recursive(u64 file_index) {
+    if (file_index >= VFS_TMPFS_MAX_FILES || !g_tmpfs_files[file_index].used) return;
+    const u64 object_id = VFS_TMPFS_FILE_OBJECT_ID_BASE + file_index;
+    for (;;) {
+        u64 child_index = VFS_TMPFS_MAX_FILES;
+        for (u64 i = 0; i < VFS_TMPFS_MAX_FILES; i++) {
+            if (!g_tmpfs_files[i].used || g_tmpfs_files[i].parent_object_id != object_id) continue;
+            child_index = i;
+            break;
+        }
+        if (child_index == VFS_TMPFS_MAX_FILES) break;
+        tmpfs_delete_index_recursive(child_index);
+    }
+    tmpfs_release_file_storage(file_index);
+    g_tmpfs_files[file_index].used = 0;
+    g_tmpfs_files[file_index].is_dir = 0;
+    g_tmpfs_files[file_index].is_symlink = 0;
+    g_tmpfs_files[file_index].parent_object_id = 0;
+    g_tmpfs_files[file_index].name_len = 0;
+    g_tmpfs_files[file_index].symlink_target_len = 0;
+    g_tmpfs_files[file_index].size = 0;
+    g_tmpfs_files[file_index].name[0] = 0;
+    g_tmpfs_files[file_index].symlink_target[0] = 0;
+}
+
+static void tmpfs_release_pages_from(u64 file_index, u64 first_page_index) {
+    if (file_index >= VFS_TMPFS_MAX_FILES) return;
+    u32 prev = VFS_TMPFS_PAGE_SLOT_NONE;
+    u32 slot = g_tmpfs_files[file_index].first_page_slot;
+    while (slot != VFS_TMPFS_PAGE_SLOT_NONE) {
+        if (slot >= VFS_TMPFS_MAX_PAGE_SLOTS || !g_tmpfs_page_slots[slot].used) break;
+        const u32 next = g_tmpfs_page_slots[slot].next_slot;
+        if ((u64)g_tmpfs_page_slots[slot].page_index >= first_page_index) {
+            if (prev == VFS_TMPFS_PAGE_SLOT_NONE) {
+                g_tmpfs_files[file_index].first_page_slot = next;
+            } else if (prev < VFS_TMPFS_MAX_PAGE_SLOTS && g_tmpfs_page_slots[prev].used) {
+                g_tmpfs_page_slots[prev].next_slot = next;
+            }
+            if (g_tmpfs_files[file_index].last_page_slot == slot) {
+                g_tmpfs_files[file_index].last_page_slot = prev;
+            }
+            tmpfs_drop_page_slot(slot);
+        } else {
+            prev = slot;
+        }
+        slot = next;
+    }
+    if (g_tmpfs_files[file_index].first_page_slot == VFS_TMPFS_PAGE_SLOT_NONE) {
+        g_tmpfs_files[file_index].last_page_slot = VFS_TMPFS_PAGE_SLOT_NONE;
+    }
 }
 
 static void copy_from_volatile(volatile u8 *dst, const volatile u8 *src, u64 bytes) {
@@ -2856,7 +2978,10 @@ static void reply_truncate_local(u64 seq, u64 token, u64 size) {
         reply_status(FS_OP_TRUNCATE, seq, FS_STATUS_IO_ERROR);
         return;
     }
-    if (size == 0) tmpfs_clear_file_storage(tmpfs_index);
+    if (size < file->size) {
+        const u64 first_unused_page = (size + FS_PAGE_BYTES - 1) / FS_PAGE_BYTES;
+        tmpfs_release_pages_from(tmpfs_index, first_unused_page);
+    }
     file->size = (u32)size;
     write_response(FS_OP_TRUNCATE, seq, FS_STATUS_OK, 0, file->size, file->size, FS_OBJECT_OPEN_FILE, 0);
 }
@@ -2896,6 +3021,10 @@ static void reply_tmpfs_create(u64 seq, const volatile u8 *path, u16 path_len, u
     const u64 existing = lookup_tmpfs_name(parent, name, name_len);
     if (existing != 0) {
         const u64 index = tmpfs_index_from_file_object_id(object_id_from_token(existing));
+        if ((flags & VFS_CREATE_FLAG_EXCLUSIVE) != 0) {
+            reply_status(FS_OP_CREATE, seq, FS_STATUS_EXISTS);
+            return;
+        }
         if ((flags & VFS_CREATE_FLAG_TRUNCATE) != 0 && index < VFS_TMPFS_MAX_FILES && !g_tmpfs_files[index].is_dir && !g_tmpfs_files[index].is_symlink) {
             g_tmpfs_files[index].size = 0;
             tmpfs_clear_file_storage(index);
@@ -2912,8 +3041,9 @@ static void reply_tmpfs_create(u64 seq, const volatile u8 *path, u16 path_len, u
         g_tmpfs_files[i].is_symlink = create_symlink ? 1 : 0;
         g_tmpfs_files[i].parent_object_id = parent;
         g_tmpfs_files[i].name_len = name_len;
-        g_tmpfs_files[i].storage_index = VFS_TMPFS_MAX_STORAGE_FILES;
         g_tmpfs_files[i].symlink_target_len = create_symlink ? inline_bytes : 0;
+        g_tmpfs_files[i].first_page_slot = VFS_TMPFS_PAGE_SLOT_NONE;
+        g_tmpfs_files[i].last_page_slot = VFS_TMPFS_PAGE_SLOT_NONE;
         g_tmpfs_files[i].size = 0;
         for (u16 j = 0; j < name_len; j++) g_tmpfs_files[i].name[j] = (char)name[j];
         g_tmpfs_files[i].name[name_len] = 0;
@@ -2945,13 +3075,7 @@ static void reply_tmpfs_unlink(u64 seq, const volatile u8 *path, u16 path_len) {
         reply_status(FS_OP_UNLINK, seq, FS_STATUS_NOT_FOUND);
         return;
     }
-    tmpfs_release_file_storage(index);
-    g_tmpfs_files[index].used = 0;
-    g_tmpfs_files[index].is_dir = 0;
-    g_tmpfs_files[index].is_symlink = 0;
-    g_tmpfs_files[index].symlink_target_len = 0;
-    g_tmpfs_files[index].size = 0;
-    tmpfs_clear_file_storage(index);
+    tmpfs_delete_index_recursive(index);
     reply_status(FS_OP_UNLINK, seq, FS_STATUS_OK);
 }
 
@@ -2986,11 +3110,7 @@ static void reply_tmpfs_rename(u64 seq, const volatile u8 *old_path, u16 old_pat
             return;
         }
         if (new_index < VFS_TMPFS_MAX_FILES) {
-            tmpfs_release_file_storage(new_index);
-            g_tmpfs_files[new_index].used = 0;
-            g_tmpfs_files[new_index].is_dir = 0;
-            g_tmpfs_files[new_index].is_symlink = 0;
-            g_tmpfs_files[new_index].symlink_target_len = 0;
+            tmpfs_delete_index_recursive(new_index);
         }
     }
     g_tmpfs_files[old_index].parent_object_id = new_parent;

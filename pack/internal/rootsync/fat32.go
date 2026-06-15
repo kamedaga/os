@@ -562,6 +562,9 @@ func readClusterChain(fat []uint32, start uint32, expectedCount uint32) ([]uint3
 		}
 		seen[cluster] = true
 		chain = append(chain, cluster)
+		if expectedCount > 0 && uint32(len(chain)) > expectedCount {
+			return nil, fmt.Errorf("FAT chain length mismatch: got more than %d", expectedCount)
+		}
 		next := fat[cluster] & 0x0FFFFFFF
 		if next >= 0x0FFFFFF8 {
 			break
@@ -618,6 +621,29 @@ func resizeClusterChain(fat []uint32, start uint32, oldCount uint32, newCount ui
 	return final, nil
 }
 
+func allocateClusterChain(fat []uint32, count uint32) ([]uint32, error) {
+	if count == 0 {
+		return nil, nil
+	}
+	chain := make([]uint32, 0, count)
+	for cluster := uint32(2); cluster < uint32(len(fat)) && uint32(len(chain)) < count; cluster++ {
+		if fat[cluster] == 0 {
+			chain = append(chain, cluster)
+		}
+	}
+	if uint32(len(chain)) != count {
+		return nil, errors.New("rootfs partition has no free clusters")
+	}
+	for i, cluster := range chain {
+		if i+1 == len(chain) {
+			fat[cluster] = fat32EOC
+		} else {
+			fat[cluster] = chain[i+1]
+		}
+	}
+	return chain, nil
+}
+
 func writeDirentLocation(file *os.File, offset int64, startCluster uint32, size uint64) error {
 	if offset <= 0 {
 		return errors.New("missing FAT directory entry offset")
@@ -634,6 +660,30 @@ func writeDirentLocation(file *os.File, offset int64, startCluster uint32, size 
 	putU32(entry, 28, uint32(size))
 	_, err := file.WriteAt(entry, offset)
 	return err
+}
+
+func writeFileDirent(file *os.File, offset int64, spec FileSpec, startCluster uint32, size uint64) error {
+	if offset <= 0 {
+		return errors.New("missing FAT directory entry offset")
+	}
+	if size > math.MaxUint32 {
+		return errors.New("file too large for FAT32 dirent")
+	}
+	attr := byte(archiveAttr)
+	if spec.IsSymlink {
+		attr = symlinkAttr
+	}
+	entries := addNamedDirent(nil, spec.Leaf, spec.ShortName, attr, startCluster, uint32(size), -1)
+	startOffset := offset - int64((len(entries)-1)*32)
+	if startOffset <= 0 {
+		return errors.New("invalid FAT directory entry offset")
+	}
+	for index, entry := range entries {
+		if _, err := file.WriteAt(entry.bytes[:], startOffset+int64(index*32)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type dirEntryRecord struct {

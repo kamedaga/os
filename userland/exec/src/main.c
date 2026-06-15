@@ -19,9 +19,13 @@ enum {
     SYSCALL_GRANT_VM_OBJECT = 0x1F,
     SYSCALL_GET_PROCESS_SLOT = 0x2E,
     SYSCALL_GET_PROCESS_STATUS = 0x30,
+    SYSCALL_GET_TICK_COUNT = 0x2D,
+    SYSCALL_GET_RTC_UNIX_TIME = 0x3E,
+    SYSCALL_GET_MEMORY_STATS = 0x3C,
     SYSCALL_PUBLISH_SERVICE_ENDPOINT = 0x33,
     SYSCALL_PROCESS_EXIT = 0x34,
     SYSCALL_RELEASE_VM_OBJECT = 0x29,
+    SYSCALL_DROP_VM_OBJECT = 0x31,
     SYSCALL_CREATE_SUSPENDED_PROCESS = 0x41,
     SYSCALL_MAP_VM_OBJECT_TO_PROCESS = 0x42,
     SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS = 0x43,
@@ -30,6 +34,7 @@ enum {
     SYSCALL_ABORT_PROCESS = 0x46,
     SYSCALL_COPY_TO_PROCESS = 0x47,
     SYSCALL_SET_PROCESS_ABI_TRAP_DELEGATE = 0x4B,
+    SYSCALL_MAP_VM_OBJECT_RANGE_TO_PROCESS = 0x6A,
     SYSCALL_MAP_PAGE_ANYWHERE = 0x5C,
     SYSCALL_ACCEPT_IPC_BUFFER_TRANSFER = 0x61,
     SYSCALL_MAP_IPC_BUFFER_ANYWHERE = 0x62,
@@ -52,6 +57,8 @@ enum {
     LINUX_ABI_REQUEST_PAGE_COUNT = 64,
     EXEC_DEVICE_CATALOG_VA = 0x26700000,
     EXEC_CHILD_DEVICE_CATALOG_BASE_VA = 0x26800000,
+    EXEC_ARG_DATA_VA = 0x26900000,
+    EXEC_LINUX_VDSO_VA = EXEC_LINUX_MMAP_BASE_VA - 0x2000ULL,
     DEVICE_CATALOG_MAGIC = 0x44455643,
     DEVICE_CATALOG_VERSION = 1,
     DEVICE_CATALOG_MAX_ENTRIES = 23,
@@ -91,6 +98,7 @@ enum {
     SPAWN_RESULT_TAG = 1ULL << 63,
     SPAWN_RESULT_PROCESS_MASK = 0xffffffffULL,
     VM_RIGHT_READ_MAP = 0x5,
+    VM_RIGHT_READ_WRITE_MAP = 0x7,
     ET_DYN_DEFAULT_ALLOC_START_VA = EXEC_USER_ET_DYN_BASE_VA,
     MAX_CHILD_MAPPED_PAGES = 32768,
     AT_NULL = 0,
@@ -233,6 +241,23 @@ static u64 service_response_va;
 static u64 service_last_request_seq;
 static u64 service_interpreter_vm_token;
 static u64 service_interpreter_file_bytes;
+static u64 service_arg_data_vm_token;
+static u64 service_arg_data_vm_bytes;
+static u64 service_vdso_cycles_per_tick;
+static int service_direct_map_enabled;
+static u64 service_direct_attempts;
+static u64 service_direct_mapped_pages;
+static u64 service_direct_fallbacks;
+static u64 service_direct_map_failures;
+static int service_profile_enabled;
+static u64 service_profile_start_tick;
+static u64 service_profile_last_tick;
+static u64 service_profile_count;
+static const char *service_profile_labels[64];
+static u64 service_profile_dt[64];
+static u64 service_profile_total[64];
+static u64 service_source_sweep_log_count;
+static u64 service_source_map_log_count;
 static struct exec_bootstrap_config service_request_config;
 static struct exec_bootstrap_config one_shot_config;
 static u64 source_image_tokens[SOURCE_IMAGE_SLOT_COUNT];
@@ -266,6 +291,42 @@ static void user_log_len(const char *message, u64 len) {
 
 static void user_log(const char *message) {
     user_log_len(message, cstr_len(message));
+}
+
+static void user_log_dec_value(u64 value) {
+    char buf[32];
+    u64 pos = sizeof(buf);
+    if (value == 0) {
+        user_log("0");
+        return;
+    }
+    while (value != 0 && pos != 0) {
+        buf[--pos] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    user_log_len(buf + pos, sizeof(buf) - pos);
+}
+
+static void user_log_hex_value(u64 value) {
+    static const char hex[] = "0123456789ABCDEF";
+    char buf[18];
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (u64 i = 0; i < 16; i++) {
+        const u64 shift = (15 - i) * 4;
+        buf[2 + i] = hex[(value >> shift) & 0xF];
+    }
+    user_log_len(buf, sizeof(buf));
+}
+
+static u64 syscall0(u64 nr) {
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr)
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    return ret;
 }
 
 static u64 syscall1(u64 nr, u64 a0) {
@@ -319,6 +380,36 @@ static u64 syscall5(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     return ret;
 }
 
+static u64 syscall6(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    register u64 r8 __asm__("r8") = a4;
+    register u64 r9 __asm__("r9") = a5;
+    u64 ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3), "r"(r8), "r"(r9)
+        : "r10", "r11", "memory");
+    return ret;
+}
+
+static void log_memory_stats(const char *where) {
+    u64 stats[4] = {0, 0, 0, 0};
+    const u64 status = syscall1(SYSCALL_GET_MEMORY_STATS, (u64)stats);
+    user_log("Exec: mem where=");
+    user_log(where);
+    user_log(" status=");
+    user_log_hex_value(status);
+    user_log(" total=");
+    user_log_dec_value(stats[0]);
+    user_log(" used=");
+    user_log_dec_value(stats[1]);
+    user_log(" free=");
+    user_log_dec_value(stats[2]);
+    user_log(" page=");
+    user_log_dec_value(stats[3]);
+    user_log("\n");
+}
+
 static void process_exit(u64 code) {
     (void)syscall1(SYSCALL_PROCESS_EXIT, code);
     for (;;) __asm__ volatile("pause");
@@ -358,8 +449,130 @@ static int map_vm_object(u64 token, u64 target_va) {
     return syscall3(SYSCALL_MAP_VM_OBJECT, token, target_va, 0) == SYSCALL_OK;
 }
 
+static u64 release_vm_object_mapping_status(u64 token, u64 target_va, u64 size_bytes) {
+    return syscall3(SYSCALL_RELEASE_VM_OBJECT, token, target_va, size_bytes);
+}
+
 static int release_vm_object_mapping(u64 token, u64 target_va, u64 size_bytes) {
-    return syscall3(SYSCALL_RELEASE_VM_OBJECT, token, target_va, size_bytes) == SYSCALL_OK;
+    return release_vm_object_mapping_status(token, target_va, size_bytes) == SYSCALL_OK;
+}
+
+static void drop_vm_object_token(u64 token) {
+    if (is_vm_object_token(token)) (void)syscall3(SYSCALL_DROP_VM_OBJECT, token, 0, 0);
+}
+
+static u64 arg_data_capacity_for_config(const struct exec_bootstrap_config *cfg) {
+    if (is_vm_object_token(cfg->arg_data_vm_token) && cfg->arg_data_vm_bytes != 0) {
+        const struct exec_arg_block *block = (const struct exec_arg_block *)EXEC_ARG_DATA_VA;
+        if (cfg->arg_data_vm_token == service_arg_data_vm_token &&
+            service_arg_data_vm_bytes >= EXEC_OFFSETOF(struct exec_arg_block, arg_data) &&
+            block->magic == EXEC_ARG_BLOCK_MAGIC &&
+            block->version == EXEC_ARG_BLOCK_VERSION) {
+            return block->arg_data_bytes;
+        }
+        return 0;
+    }
+    return EXEC_INLINE_ARG_DATA_BYTES;
+}
+
+static int config_uses_external_arg_block(const struct exec_bootstrap_config *cfg) {
+    if (!is_vm_object_token(cfg->arg_data_vm_token)) return 0;
+    if (cfg->arg_data_vm_token != service_arg_data_vm_token) return 0;
+    if (service_arg_data_vm_bytes < EXEC_OFFSETOF(struct exec_arg_block, arg_data)) return 0;
+    const struct exec_arg_block *block = (const struct exec_arg_block *)EXEC_ARG_DATA_VA;
+    return block->magic == EXEC_ARG_BLOCK_MAGIC && block->version == EXEC_ARG_BLOCK_VERSION;
+}
+
+static const struct exec_arg_block *arg_block_for_config(const struct exec_bootstrap_config *cfg) {
+    return config_uses_external_arg_block(cfg) ? (const struct exec_arg_block *)EXEC_ARG_DATA_VA : (const struct exec_arg_block *)0;
+}
+
+static struct exec_arg_block *mutable_arg_block_for_config(struct exec_bootstrap_config *cfg) {
+    return config_uses_external_arg_block(cfg) ? (struct exec_arg_block *)EXEC_ARG_DATA_VA : (struct exec_arg_block *)0;
+}
+
+static unsigned char *mutable_arg_data_for_config(struct exec_bootstrap_config *cfg) {
+    struct exec_arg_block *block = mutable_arg_block_for_config(cfg);
+    if (block != 0) return block->arg_data;
+    return cfg->arg_data;
+}
+
+static const unsigned char *arg_data_for_config(const struct exec_bootstrap_config *cfg) {
+    const struct exec_arg_block *block = arg_block_for_config(cfg);
+    if (block != 0) return block->arg_data;
+    return cfg->arg_data;
+}
+
+static u64 config_argv_count(const struct exec_bootstrap_config *cfg) {
+    const struct exec_arg_block *block = arg_block_for_config(cfg);
+    return block != 0 ? block->argv_count : cfg->argv_count;
+}
+
+static u64 config_envp_count(const struct exec_bootstrap_config *cfg) {
+    const struct exec_arg_block *block = arg_block_for_config(cfg);
+    return block != 0 ? block->envp_count : cfg->envp_count;
+}
+
+static int config_argv_desc(const struct exec_bootstrap_config *cfg, u64 index, u64 *offset_out, u64 *len_out) {
+    const struct exec_arg_block *block = arg_block_for_config(cfg);
+    if (block != 0) {
+        if (index >= block->argv_count || index >= EXEC_MAX_ARGV) return 0;
+        *offset_out = block->argv_offsets[index];
+        *len_out = block->argv_bytes[index];
+        return 1;
+    }
+    if (index >= cfg->argv_count || index >= EXEC_INLINE_MAX_ARGV) return 0;
+    *offset_out = cfg->argv_offsets[index];
+    *len_out = cfg->argv_bytes[index];
+    return 1;
+}
+
+static int config_envp_desc(const struct exec_bootstrap_config *cfg, u64 index, u64 *offset_out, u64 *len_out) {
+    const struct exec_arg_block *block = arg_block_for_config(cfg);
+    if (block != 0) {
+        if (index >= block->envp_count || index >= EXEC_MAX_ENVP) return 0;
+        *offset_out = block->envp_offsets[index];
+        *len_out = block->envp_bytes[index];
+        return 1;
+    }
+    if (index >= cfg->envp_count || index >= EXEC_MAX_ENVP) return 0;
+    *offset_out = cfg->envp_offsets[index];
+    *len_out = cfg->envp_bytes[index];
+    return 1;
+}
+
+static u64 page_aligned_size(u64 bytes) {
+    return (bytes + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1);
+}
+
+static int map_external_arg_data_for_config(struct exec_bootstrap_config *cfg) {
+    if (!is_vm_object_token(cfg->arg_data_vm_token)) {
+        if (cfg->arg_data_bytes > EXEC_INLINE_ARG_DATA_BYTES) return 0;
+        return 1;
+    }
+    if (cfg->arg_data_vm_bytes < EXEC_OFFSETOF(struct exec_arg_block, arg_data) ||
+        cfg->arg_data_vm_bytes > sizeof(struct exec_arg_block)) return 0;
+    if (service_arg_data_vm_token == cfg->arg_data_vm_token && service_arg_data_vm_bytes == cfg->arg_data_vm_bytes) return 1;
+    if (service_arg_data_vm_token != 0) {
+        const u64 old_token = service_arg_data_vm_token;
+        (void)release_vm_object_mapping(service_arg_data_vm_token, EXEC_ARG_DATA_VA, page_aligned_size(service_arg_data_vm_bytes));
+        service_arg_data_vm_token = 0;
+        service_arg_data_vm_bytes = 0;
+        drop_vm_object_token(old_token);
+    }
+    if (!map_vm_object(cfg->arg_data_vm_token, EXEC_ARG_DATA_VA)) {
+        user_log("Exec: arg data map failed\n");
+        return 0;
+    }
+    service_arg_data_vm_token = cfg->arg_data_vm_token;
+    service_arg_data_vm_bytes = cfg->arg_data_vm_bytes;
+    const struct exec_arg_block *block = (const struct exec_arg_block *)EXEC_ARG_DATA_VA;
+    if (block->magic != EXEC_ARG_BLOCK_MAGIC || block->version != EXEC_ARG_BLOCK_VERSION) return 0;
+    if (block->argv_count != cfg->argv_count || block->envp_count != cfg->envp_count) return 0;
+    if (block->execfn_offset != cfg->execfn_offset || block->execfn_bytes != cfg->execfn_bytes) return 0;
+    if (block->arg_data_bytes != cfg->arg_data_bytes || block->arg_data_bytes > EXEC_MAX_ARG_DATA_BYTES) return 0;
+    if (cfg->arg_data_vm_bytes < EXEC_OFFSETOF(struct exec_arg_block, arg_data) + block->arg_data_bytes) return 0;
+    return 1;
 }
 
 static u64 create_suspended_process(void) {
@@ -380,8 +593,16 @@ static void abort_process(u64 process_token) {
     if (is_process_builder_token(process_token)) (void)syscall1(SYSCALL_ABORT_PROCESS, process_token);
 }
 
+static u64 alloc_map_pages_to_process_status(u64 process_token, u64 target_va, u64 page_count, u64 prot_bits) {
+    return syscall5(SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS, process_token, target_va, page_count, prot_bits, 0);
+}
+
 static int alloc_map_pages_to_process(u64 process_token, u64 target_va, u64 page_count, u64 prot_bits) {
-    return syscall5(SYSCALL_ALLOC_MAP_PAGES_TO_PROCESS, process_token, target_va, page_count, prot_bits, 0) == SYSCALL_OK;
+    return alloc_map_pages_to_process_status(process_token, target_va, page_count, prot_bits) == SYSCALL_OK;
+}
+
+static u64 map_vm_object_range_to_process_raw(u64 process_token, u64 vm_token, u64 object_page_offset, u64 target_va, u64 page_count, u64 prot_bits) {
+    return syscall6(SYSCALL_MAP_VM_OBJECT_RANGE_TO_PROCESS, process_token, vm_token, object_page_offset, target_va, page_count, prot_bits);
 }
 
 static int alloc_map_pages_to_process_chunked(u64 process_token, u64 target_va, u64 page_count, u64 prot_bits) {
@@ -519,17 +740,21 @@ static int valid_user_layout_config(const struct exec_bootstrap_config *cfg) {
 
 static int valid_config(const struct exec_bootstrap_config *cfg) {
     if (cfg->magic != EXEC_BOOTSTRAP_MAGIC || cfg->version != EXEC_BOOTSTRAP_VERSION) return 0;
-    if (cfg->argv_count > EXEC_MAX_ARGV || cfg->envp_count > EXEC_MAX_ENVP) return 0;
-    if (cfg->arg_data_bytes > EXEC_MAX_ARG_DATA_BYTES) return 0;
+    if (config_uses_external_arg_block(cfg)) {
+        if (config_argv_count(cfg) > EXEC_MAX_ARGV || config_envp_count(cfg) > EXEC_MAX_ENVP) return 0;
+    } else {
+        if (cfg->argv_count > EXEC_INLINE_MAX_ARGV || cfg->envp_count > EXEC_MAX_ENVP) return 0;
+    }
+    if (cfg->arg_data_bytes > arg_data_capacity_for_config(cfg)) return 0;
     if (!valid_user_layout_config(cfg)) return 0;
     return 1;
 }
 
 static int bootstrap_slice(const struct exec_bootstrap_config *cfg, u64 offset, u64 len, struct byte_slice *out) {
     if (len == 0) return 0;
-    if (cfg->arg_data_bytes > EXEC_MAX_ARG_DATA_BYTES) return 0;
+    if (cfg->arg_data_bytes > arg_data_capacity_for_config(cfg)) return 0;
     if (offset > cfg->arg_data_bytes || len > (u64)cfg->arg_data_bytes - offset) return 0;
-    out->ptr = cfg->arg_data + offset;
+    out->ptr = arg_data_for_config(cfg) + offset;
     out->len = len;
     return 1;
 }
@@ -565,19 +790,27 @@ static void default_stack_config(struct linux_stack_config *out) {
 }
 
 static int stack_config_from_bootstrap(const struct exec_bootstrap_config *cfg, struct linux_stack_config *out) {
-    if (cfg->arg_data_bytes == 0 || cfg->argv_count == 0) {
+    const u64 argv_count = config_argv_count(cfg);
+    const u64 envp_count = config_envp_count(cfg);
+    if (cfg->arg_data_bytes == 0 || argv_count == 0) {
         default_stack_config(out);
         return 1;
     }
-    if (cfg->argv_count > EXEC_MAX_ARGV || cfg->envp_count > EXEC_MAX_ENVP) return 0;
+    if (argv_count > EXEC_MAX_ARGV || envp_count > EXEC_MAX_ENVP) return 0;
     if (!bootstrap_slice(cfg, cfg->execfn_offset, cfg->execfn_bytes, &out->execfn)) return 0;
-    out->argv_count = cfg->argv_count;
-    out->envp_count = cfg->envp_count;
+    out->argv_count = argv_count;
+    out->envp_count = envp_count;
     for (u64 i = 0; i < out->argv_count; i++) {
-        if (!bootstrap_slice(cfg, cfg->argv_offsets[i], cfg->argv_bytes[i], &out->argv[i])) return 0;
+        u64 offset = 0;
+        u64 len = 0;
+        if (!config_argv_desc(cfg, i, &offset, &len)) return 0;
+        if (!bootstrap_slice(cfg, offset, len, &out->argv[i])) return 0;
     }
     for (u64 i = 0; i < out->envp_count; i++) {
-        if (!bootstrap_slice(cfg, cfg->envp_offsets[i], cfg->envp_bytes[i], &out->envp[i])) return 0;
+        u64 offset = 0;
+        u64 len = 0;
+        if (!config_envp_desc(cfg, i, &offset, &len)) return 0;
+        if (!bootstrap_slice(cfg, offset, len, &out->envp[i])) return 0;
     }
     out->platform.ptr = linux_platform;
     out->platform.len = sizeof(linux_platform) - 1;
@@ -681,6 +914,335 @@ static void write_u64_le(unsigned char *bytes, u64 value) {
     for (u64 i = 0; i < 8; i++) bytes[i] = (unsigned char)((value >> (i * 8)) & 0xff);
 }
 
+static void write_u32_le(unsigned char *bytes, unsigned int value) {
+    for (u64 i = 0; i < 4; i++) bytes[i] = (unsigned char)((value >> (i * 8)) & 0xff);
+}
+
+static void write_u16_le(unsigned char *bytes, unsigned int value) {
+    bytes[0] = (unsigned char)(value & 0xff);
+    bytes[1] = (unsigned char)((value >> 8) & 0xff);
+}
+
+static unsigned int read_u32_le_unchecked(const unsigned char *bytes) {
+    unsigned int value = 0;
+    for (u64 i = 0; i < 4; i++) value |= (unsigned int)bytes[i] << (i * 8);
+    return value;
+}
+
+static u64 read_tsc(void) {
+    unsigned int lo;
+    unsigned int hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((u64)hi << 32) | (u64)lo;
+}
+
+static unsigned int elf_hash_name(const char *name) {
+    unsigned int h = 0;
+    while (*name != 0) {
+        h = (h << 4) + (unsigned char)*name++;
+        const unsigned int g = h & 0xf0000000U;
+        if (g != 0) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
+
+static u64 vdso_cycles_per_tick(void) {
+    if (service_vdso_cycles_per_tick != 0) return service_vdso_cycles_per_tick;
+    enum { VDSO_CALIBRATION_TICKS = 16 };
+    const u64 start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    const u64 start_tsc = read_tsc();
+    u64 end_tick = start_tick;
+    u64 end_tsc = start_tsc;
+    for (u64 spins = 0; spins < 50000000ULL; spins++) {
+        end_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+        end_tsc = read_tsc();
+        if (end_tick >= start_tick + VDSO_CALIBRATION_TICKS) break;
+        __asm__ volatile("pause" ::: "memory");
+    }
+    const u64 delta_ticks = end_tick > start_tick ? end_tick - start_tick : 1;
+    const u64 delta_cycles = end_tsc > start_tsc ? end_tsc - start_tsc : 1000000ULL;
+    u64 cycles_per_tick = delta_cycles / delta_ticks;
+    if (cycles_per_tick < 1000ULL) cycles_per_tick = 1000000ULL;
+    service_vdso_cycles_per_tick = cycles_per_tick;
+    return cycles_per_tick;
+}
+
+static void emit8(unsigned char *page, u64 *off, unsigned int value) {
+    page[(*off)++] = (unsigned char)value;
+}
+
+static void emit32(unsigned char *page, u64 *off, unsigned int value) {
+    write_u32_le(page + *off, value);
+    *off += 4;
+}
+
+static void emit64(unsigned char *page, u64 *off, u64 value) {
+    write_u64_le(page + *off, value);
+    *off += 8;
+}
+
+static u64 emit_jcc32(unsigned char *page, u64 *off, unsigned int cc) {
+    emit8(page, off, 0x0f);
+    emit8(page, off, cc);
+    const u64 patch = *off;
+    emit32(page, off, 0);
+    return patch;
+}
+
+static void patch_rel32(unsigned char *page, u64 patch_off, u64 target_off) {
+    const long long rel = (long long)target_off - (long long)(patch_off + 4);
+    write_u32_le(page + patch_off, (unsigned int)rel);
+}
+
+static void emit_load_r8_from_abs(unsigned char *page, u64 *off, u64 address) {
+    emit8(page, off, 0x49);
+    emit8(page, off, 0xb8);
+    emit64(page, off, address);
+    emit8(page, off, 0x4d);
+    emit8(page, off, 0x8b);
+    emit8(page, off, 0x00);
+}
+
+static void emit_add_rax_mem_r8_abs(unsigned char *page, u64 *off, u64 address) {
+    emit8(page, off, 0x49);
+    emit8(page, off, 0xb8);
+    emit64(page, off, address);
+    emit8(page, off, 0x49);
+    emit8(page, off, 0x03);
+    emit8(page, off, 0x00);
+}
+
+static void emit_vdso_elapsed_ns(unsigned char *page, u64 *off, u64 vdso_va, u64 data_off) {
+    emit8(page, off, 0x0f); emit8(page, off, 0x31);             /* rdtsc */
+    emit8(page, off, 0x48); emit8(page, off, 0xc1); emit8(page, off, 0xe2); emit8(page, off, 0x20);
+    emit8(page, off, 0x48); emit8(page, off, 0x09); emit8(page, off, 0xd0);
+    emit_load_r8_from_abs(page, off, vdso_va + data_off + 0);
+    emit8(page, off, 0x4c); emit8(page, off, 0x29); emit8(page, off, 0xc0);
+    emit8(page, off, 0xb9); emit32(page, off, 1000000U);
+    emit8(page, off, 0x48); emit8(page, off, 0xf7); emit8(page, off, 0xe1);
+    emit8(page, off, 0x48); emit8(page, off, 0xbb); emit64(page, off, vdso_va + data_off + 16);
+    emit8(page, off, 0x48); emit8(page, off, 0x8b); emit8(page, off, 0x1b);
+    emit8(page, off, 0x48); emit8(page, off, 0xf7); emit8(page, off, 0xf3);
+}
+
+static void emit_vdso_div_1e9(unsigned char *page, u64 *off) {
+    emit8(page, off, 0x31); emit8(page, off, 0xd2);
+    emit8(page, off, 0xbb); emit32(page, off, 1000000000U);
+    emit8(page, off, 0x48); emit8(page, off, 0xf7); emit8(page, off, 0xf3);
+}
+
+static void emit_vdso_return0(unsigned char *page, u64 *off) {
+    emit8(page, off, 0x31); emit8(page, off, 0xc0);
+    emit8(page, off, 0x5b);
+    emit8(page, off, 0xc3);
+}
+
+static u64 emit_vdso_clock_gettime(unsigned char *page, u64 off, u64 vdso_va, u64 data_off) {
+    emit8(page, &off, 0x53);
+    emit8(page, &off, 0x83); emit8(page, &off, 0xff); emit8(page, &off, 0x00);
+    const u64 mono_patch = emit_jcc32(page, &off, 0x85);
+
+    emit_vdso_elapsed_ns(page, &off, vdso_va, data_off);
+    emit_add_rax_mem_r8_abs(page, &off, vdso_va + data_off + 32);
+    emit_vdso_div_1e9(page, &off);
+    emit_add_rax_mem_r8_abs(page, &off, vdso_va + data_off + 24);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x89); emit8(page, &off, 0x06);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x89); emit8(page, &off, 0x56); emit8(page, &off, 0x08);
+    emit_vdso_return0(page, &off);
+
+    const u64 mono_off = off;
+    patch_rel32(page, mono_patch, mono_off);
+    emit_vdso_elapsed_ns(page, &off, vdso_va, data_off);
+    emit_add_rax_mem_r8_abs(page, &off, vdso_va + data_off + 8);
+    emit_vdso_div_1e9(page, &off);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x89); emit8(page, &off, 0x06);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x89); emit8(page, &off, 0x56); emit8(page, &off, 0x08);
+    emit_vdso_return0(page, &off);
+    return off;
+}
+
+static u64 emit_vdso_gettimeofday(unsigned char *page, u64 off, u64 vdso_va, u64 data_off) {
+    emit8(page, &off, 0x53);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x85); emit8(page, &off, 0xff);
+    const u64 skip_tv_patch = emit_jcc32(page, &off, 0x84);
+    emit_vdso_elapsed_ns(page, &off, vdso_va, data_off);
+    emit_add_rax_mem_r8_abs(page, &off, vdso_va + data_off + 32);
+    emit_vdso_div_1e9(page, &off);
+    emit_add_rax_mem_r8_abs(page, &off, vdso_va + data_off + 24);
+    emit8(page, &off, 0x49); emit8(page, &off, 0x89); emit8(page, &off, 0xc0);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x89); emit8(page, &off, 0xd0);
+    emit8(page, &off, 0x31); emit8(page, &off, 0xd2);
+    emit8(page, &off, 0xbb); emit32(page, &off, 1000U);
+    emit8(page, &off, 0x48); emit8(page, &off, 0xf7); emit8(page, &off, 0xf3);
+    emit8(page, &off, 0x4c); emit8(page, &off, 0x89); emit8(page, &off, 0x07);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x89); emit8(page, &off, 0x47); emit8(page, &off, 0x08);
+    const u64 skip_tv_off = off;
+    patch_rel32(page, skip_tv_patch, skip_tv_off);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x85); emit8(page, &off, 0xf6);
+    const u64 skip_tz_patch = emit_jcc32(page, &off, 0x84);
+    emit8(page, &off, 0x48); emit8(page, &off, 0xc7); emit8(page, &off, 0x06); emit32(page, &off, 0);
+    patch_rel32(page, skip_tz_patch, off);
+    emit_vdso_return0(page, &off);
+    return off;
+}
+
+static u64 emit_vdso_time(unsigned char *page, u64 off, u64 vdso_va, u64 data_off) {
+    emit8(page, &off, 0x53);
+    emit_vdso_elapsed_ns(page, &off, vdso_va, data_off);
+    emit_add_rax_mem_r8_abs(page, &off, vdso_va + data_off + 32);
+    emit_vdso_div_1e9(page, &off);
+    emit_add_rax_mem_r8_abs(page, &off, vdso_va + data_off + 24);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x85); emit8(page, &off, 0xff);
+    const u64 skip_store_patch = emit_jcc32(page, &off, 0x84);
+    emit8(page, &off, 0x48); emit8(page, &off, 0x89); emit8(page, &off, 0x07);
+    patch_rel32(page, skip_store_patch, off);
+    emit8(page, &off, 0x5b);
+    emit8(page, &off, 0xc3);
+    return off;
+}
+
+static u64 append_vdso_string(unsigned char *page, u64 *off, const char *s) {
+    const u64 start = *off;
+    while (*s != 0) page[(*off)++] = (unsigned char)*s++;
+    page[(*off)++] = 0;
+    return start;
+}
+
+static void write_elf64_sym(unsigned char *page, u64 off, u64 name, unsigned int info, unsigned int shndx, u64 value, u64 size) {
+    write_u32_le(page + off + 0, (unsigned int)name);
+    page[off + 4] = (unsigned char)info;
+    page[off + 5] = 0;
+    write_u16_le(page + off + 6, shndx);
+    write_u64_le(page + off + 8, value);
+    write_u64_le(page + off + 16, size);
+}
+
+static void write_elf64_dyn(unsigned char *page, u64 off, u64 tag, u64 value) {
+    write_u64_le(page + off + 0, tag);
+    write_u64_le(page + off + 8, value);
+}
+
+static void write_elf64_phdr(unsigned char *page, u64 off, unsigned int type, unsigned int flags, u64 file_off, u64 vaddr, u64 filesz, u64 memsz, u64 align) {
+    write_u32_le(page + off + 0, type);
+    write_u32_le(page + off + 4, flags);
+    write_u64_le(page + off + 8, file_off);
+    write_u64_le(page + off + 16, vaddr);
+    write_u64_le(page + off + 24, 0);
+    write_u64_le(page + off + 32, filesz);
+    write_u64_le(page + off + 40, memsz);
+    write_u64_le(page + off + 48, align);
+}
+
+static void vdso_hash_insert(unsigned char *page, u64 hash_off, unsigned int nbucket, unsigned int sym_index, const char *name) {
+    const unsigned int bucket_index = elf_hash_name(name) % nbucket;
+    const u64 buckets_off = hash_off + 8;
+    const u64 chains_off = buckets_off + (u64)nbucket * 4;
+    const unsigned int old_head = read_u32_le_unchecked(page + buckets_off + (u64)bucket_index * 4);
+    write_u32_le(page + chains_off + (u64)sym_index * 4, old_head);
+    write_u32_le(page + buckets_off + (u64)bucket_index * 4, sym_index);
+}
+
+static void build_linux_vdso_page(unsigned char *page, u64 vdso_va) {
+    enum {
+        VDSO_DYNAMIC_OFF = 0x100,
+        VDSO_HASH_OFF = 0x1a0,
+        VDSO_SYMTAB_OFF = 0x200,
+        VDSO_STRTAB_OFF = 0x280,
+        VDSO_VERSYM_OFF = 0x310,
+        VDSO_VERDEF_OFF = 0x320,
+        VDSO_DATA_OFF = 0x380,
+        VDSO_CODE_OFF = 0x400,
+        VDSO_BUCKET_COUNT = 8,
+        VDSO_SYMBOL_COUNT = 4,
+    };
+    zero_bytes(page, PAGE_BYTES);
+
+    page[0] = 0x7f; page[1] = 'E'; page[2] = 'L'; page[3] = 'F';
+    page[4] = 2; page[5] = 1; page[6] = 1;
+    write_u16_le(page + 16, 3);
+    write_u16_le(page + 18, 62);
+    write_u32_le(page + 20, 1);
+    write_u64_le(page + 32, 64);
+    write_u16_le(page + 52, 64);
+    write_u16_le(page + 54, 56);
+    write_u16_le(page + 56, 2);
+    write_elf64_phdr(page, 64, 1, 5, 0, 0, PAGE_BYTES, PAGE_BYTES, PAGE_BYTES);
+    write_elf64_phdr(page, 120, 2, 4, VDSO_DYNAMIC_OFF, VDSO_DYNAMIC_OFF, 9 * 16, 9 * 16, 8);
+
+    u64 code_off = VDSO_CODE_OFF;
+    const u64 clock_off = code_off;
+    code_off = emit_vdso_clock_gettime(page, code_off, vdso_va, VDSO_DATA_OFF);
+    const u64 gettimeofday_off = code_off;
+    code_off = emit_vdso_gettimeofday(page, code_off, vdso_va, VDSO_DATA_OFF);
+    const u64 time_off = code_off;
+    code_off = emit_vdso_time(page, code_off, vdso_va, VDSO_DATA_OFF);
+    (void)code_off;
+
+    u64 str_off = VDSO_STRTAB_OFF;
+    page[str_off++] = 0;
+    const u64 clock_name = append_vdso_string(page, &str_off, "__vdso_clock_gettime");
+    const u64 gettimeofday_name = append_vdso_string(page, &str_off, "__vdso_gettimeofday");
+    const u64 time_name = append_vdso_string(page, &str_off, "__vdso_time");
+    const u64 version_name = append_vdso_string(page, &str_off, "LINUX_2.6");
+
+    write_elf64_sym(page, VDSO_SYMTAB_OFF + 24, clock_name - VDSO_STRTAB_OFF, 0x12, 1, clock_off, gettimeofday_off - clock_off);
+    write_elf64_sym(page, VDSO_SYMTAB_OFF + 48, gettimeofday_name - VDSO_STRTAB_OFF, 0x12, 1, gettimeofday_off, time_off - gettimeofday_off);
+    write_elf64_sym(page, VDSO_SYMTAB_OFF + 72, time_name - VDSO_STRTAB_OFF, 0x12, 1, time_off, 96);
+
+    write_u32_le(page + VDSO_HASH_OFF + 0, VDSO_BUCKET_COUNT);
+    write_u32_le(page + VDSO_HASH_OFF + 4, VDSO_SYMBOL_COUNT);
+    vdso_hash_insert(page, VDSO_HASH_OFF, VDSO_BUCKET_COUNT, 1, "__vdso_clock_gettime");
+    vdso_hash_insert(page, VDSO_HASH_OFF, VDSO_BUCKET_COUNT, 2, "__vdso_gettimeofday");
+    vdso_hash_insert(page, VDSO_HASH_OFF, VDSO_BUCKET_COUNT, 3, "__vdso_time");
+
+    write_u16_le(page + VDSO_VERSYM_OFF + 0, 0);
+    write_u16_le(page + VDSO_VERSYM_OFF + 2, 2);
+    write_u16_le(page + VDSO_VERSYM_OFF + 4, 2);
+    write_u16_le(page + VDSO_VERSYM_OFF + 6, 2);
+    write_u16_le(page + VDSO_VERDEF_OFF + 0, 1);
+    write_u16_le(page + VDSO_VERDEF_OFF + 2, 0);
+    write_u16_le(page + VDSO_VERDEF_OFF + 4, 2);
+    write_u16_le(page + VDSO_VERDEF_OFF + 6, 1);
+    write_u32_le(page + VDSO_VERDEF_OFF + 8, 0x03ae75f6U);
+    write_u32_le(page + VDSO_VERDEF_OFF + 12, 20);
+    write_u32_le(page + VDSO_VERDEF_OFF + 16, 0);
+    write_u32_le(page + VDSO_VERDEF_OFF + 20, (unsigned int)(version_name - VDSO_STRTAB_OFF));
+    write_u32_le(page + VDSO_VERDEF_OFF + 24, 0);
+
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 0, 4, VDSO_HASH_OFF);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 16, 5, VDSO_STRTAB_OFF);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 32, 6, VDSO_SYMTAB_OFF);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 48, 10, str_off - VDSO_STRTAB_OFF);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 64, 11, 24);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 80, 0x6ffffff0ULL, VDSO_VERSYM_OFF);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 96, 0x6ffffffcULL, VDSO_VERDEF_OFF);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 112, 0x6ffffffdULL, 1);
+    write_elf64_dyn(page, VDSO_DYNAMIC_OFF + 128, 0, 0);
+
+    const u64 now_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    const u64 now_tsc = read_tsc();
+    const u64 cycles_per_tick = vdso_cycles_per_tick();
+    const u64 realtime_sec = syscall0(SYSCALL_GET_RTC_UNIX_TIME);
+    write_u64_le(page + VDSO_DATA_OFF + 0, now_tsc);
+    write_u64_le(page + VDSO_DATA_OFF + 8, now_tick * 1000000ULL);
+    write_u64_le(page + VDSO_DATA_OFF + 16, cycles_per_tick);
+    write_u64_le(page + VDSO_DATA_OFF + 24, realtime_sec == 0 ? 1700000000ULL : realtime_sec);
+    write_u64_le(page + VDSO_DATA_OFF + 32, now_tick * 1000000ULL);
+}
+
+static int install_linux_vdso(u64 process_token, const struct exec_bootstrap_config *bootstrap, u64 *vdso_va_out) {
+    const u64 mmap_base = cfg_mmap_base_va(bootstrap);
+    if (mmap_base < PAGE_BYTES * 4) return 0;
+    const u64 vdso_va = mmap_base - PAGE_BYTES * 2;
+    if (vdso_va < cfg_user_low_va(bootstrap) || vdso_va + PAGE_BYTES > cfg_user_top_va(bootstrap)) return 0;
+    build_linux_vdso_page(private_page_buffer, vdso_va);
+    if (!alloc_map_pages_to_process(process_token, vdso_va, 1, 5)) return 0;
+    if (!copy_to_process(process_token, vdso_va, (u64)private_page_buffer, PAGE_BYTES)) return 0;
+    *vdso_va_out = vdso_va;
+    return 1;
+}
+
 static int push_stack_bytes(u64 process_token, u64 *sp, u64 stack_bottom_va, const unsigned char *bytes, u64 len, u64 *va_out) {
     if (len == 0 || *sp < stack_bottom_va || len > *sp - stack_bottom_va) return 0;
     *sp -= len;
@@ -726,6 +1288,7 @@ static int install_linux_initial_stack(
     u64 interp_base,
     const struct exec_bootstrap_config *bootstrap,
     const struct linux_stack_config *config,
+    u64 vdso_va,
     u64 *initial_rsp_out
 ) {
     u64 stack_top = 0;
@@ -784,7 +1347,7 @@ static int install_linux_initial_stack(
     if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_RANDOM, random_va)) return 0;
     if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_EXECFN, execfn_va)) return 0;
     if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_PLATFORM, platform_va)) return 0;
-    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_SYSINFO_EHDR, 0)) return 0;
+    if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_SYSINFO_EHDR, vdso_va)) return 0;
     if (!append_aux(aux, STACK_AUX_ENTRY_MAX, &aux_count, AT_NULL, 0)) return 0;
 
     u64 words[STACK_WORD_MAX];
@@ -957,6 +1520,17 @@ static int page_requires_private_mapping(
         if (exec_elf_validate_load_segment(&phdr, file_bytes, &segment_start, &segment_end) != EXEC_ELF_OK) return 0;
         if (!ranges_overlap(page_vaddr, page_end, segment_start, segment_end)) continue;
         if ((phdr.flags & EXEC_ELF_PF_W) != 0 || phdr.memsz != phdr.filesz) {
+            *requires_private_out = 1;
+            return 1;
+        }
+        u64 file_mem_end = 0;
+        if (!add_u64(phdr.vaddr, phdr.filesz, &file_mem_end)) return 0;
+        if (page_vaddr < phdr.vaddr || page_end > file_mem_end) {
+            *requires_private_out = 1;
+            return 1;
+        }
+        const u64 file_off = phdr.offset + (page_vaddr - phdr.vaddr);
+        if ((file_off & (PAGE_BYTES - 1)) != 0) {
             *requires_private_out = 1;
             return 1;
         }
@@ -1147,11 +1721,41 @@ static int release_source_image_slot(u64 slot) {
     const u64 source_va = source_image_slot_va(slot);
     const u64 mapped_bytes = (source_image_bytes[slot] + PAGE_BYTES - 1) & ~(u64)(PAGE_BYTES - 1);
     if (mapped_bytes == 0) return 0;
-    if (!release_vm_object_mapping(source_image_tokens[slot], source_va, mapped_bytes)) return 0;
+    const u64 status = release_vm_object_mapping_status(source_image_tokens[slot], source_va, mapped_bytes);
+    if (status != SYSCALL_OK) {
+        user_log("Exec: source release failed slot=");
+        user_log_dec_value(slot);
+        user_log(" status=");
+        user_log_hex_value(status);
+        user_log(" va=");
+        user_log_hex_value(source_va);
+        user_log(" bytes=");
+        user_log_dec_value(mapped_bytes);
+        user_log("\n");
+        return 0;
+    }
     source_image_tokens[slot] = 0;
     source_image_bytes[slot] = 0;
     source_path_clear(slot);
     return 1;
+}
+
+static u64 source_image_slots_in_use(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
+        if (source_image_tokens[i] != 0) count++;
+    }
+    return count;
+}
+
+static u64 source_image_releasable_slots_in_use(void) {
+    u64 count = 0;
+    for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
+        if (source_image_tokens[i] == 0) continue;
+        if (source_image_tokens[i] == service_interpreter_vm_token) continue;
+        count++;
+    }
+    return count;
 }
 
 static int find_reusable_source_image_slot(u64 file_bytes, u64 *slot_out) {
@@ -1164,6 +1768,7 @@ static int find_reusable_source_image_slot(u64 file_bytes, u64 *slot_out) {
     for (u64 attempts = 0; attempts < SOURCE_IMAGE_SLOT_COUNT; attempts++) {
         const u64 slot = (source_image_evict_cursor + attempts) % SOURCE_IMAGE_SLOT_COUNT;
         if (file_bytes > source_image_slot_capacity(slot)) continue;
+        if (source_image_tokens[slot] == service_interpreter_vm_token) continue;
         if (!release_source_image_slot(slot)) continue;
         source_image_evict_cursor = (slot + 1) % SOURCE_IMAGE_SLOT_COUNT;
         *slot_out = slot;
@@ -1172,12 +1777,57 @@ static int find_reusable_source_image_slot(u64 file_bytes, u64 *slot_out) {
     return 0;
 }
 
+static u64 release_all_source_image_slots(void) {
+    u64 released = 0;
+    const u64 before = source_image_slots_in_use();
+    for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
+        if (source_image_tokens[i] == 0) continue;
+        if (source_image_tokens[i] == service_interpreter_vm_token) continue;
+        if (release_source_image_slot(i)) released++;
+    }
+    const u64 remaining = source_image_slots_in_use();
+    const u64 remaining_releasable = source_image_releasable_slots_in_use();
+    if (remaining_releasable != 0) {
+        user_log("Exec: source release incomplete released=");
+        user_log_dec_value(released);
+        user_log(" remaining=");
+        user_log_dec_value(remaining_releasable);
+        user_log("\n");
+    }
+    if (service_source_sweep_log_count < 8) {
+        service_source_sweep_log_count++;
+        user_log("Exec: source sweep before=");
+        user_log_dec_value(before);
+        user_log(" released=");
+        user_log_dec_value(released);
+        user_log(" remaining=");
+        user_log_dec_value(remaining);
+        user_log("\n");
+    }
+    return released;
+}
+
+static void release_source_image_slots_except(u64 keep_source_va) {
+    for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
+        if (source_image_tokens[i] == 0) continue;
+        if (source_image_slot_va(i) == keep_source_va) continue;
+        if (source_image_tokens[i] == service_interpreter_vm_token) continue;
+        (void)release_source_image_slot(i);
+    }
+}
+
 static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cache_path, u64 *effective_vm_token_out) {
     if (file_bytes == 0) return 0;
 
     if (EXEC_OPT_SOURCE_PATH_CACHE) {
         for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
             if (source_path_matches(i, cache_path, file_bytes)) {
+                if (service_source_map_log_count < 8) {
+                    service_source_map_log_count++;
+                    user_log("Exec: source reuse path slot=");
+                    user_log_dec_value(i);
+                    user_log("\n");
+                }
                 if (effective_vm_token_out != 0) *effective_vm_token_out = source_image_tokens[i];
                 return source_image_slot_va(i);
             }
@@ -1186,6 +1836,12 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
 
     for (u64 i = 0; i < SOURCE_IMAGE_SLOT_COUNT; i++) {
         if (source_image_tokens[i] == vm_token && source_image_bytes[i] == file_bytes) {
+            if (service_source_map_log_count < 8) {
+                service_source_map_log_count++;
+                user_log("Exec: source reuse token slot=");
+                user_log_dec_value(i);
+                user_log("\n");
+            }
             if (effective_vm_token_out != 0) *effective_vm_token_out = source_image_tokens[i];
             return source_image_slot_va(i);
         }
@@ -1206,6 +1862,14 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
         source_image_tokens[slot] = vm_token;
         source_image_bytes[slot] = file_bytes;
         if (EXEC_OPT_SOURCE_PATH_CACHE) source_path_store(slot, cache_path);
+        if (service_source_map_log_count < 8) {
+            service_source_map_log_count++;
+            user_log("Exec: source mapped slot=");
+            user_log_dec_value(slot);
+            user_log(" bytes=");
+            user_log_dec_value(file_bytes);
+            user_log("\n");
+        }
         if (effective_vm_token_out != 0) *effective_vm_token_out = vm_token;
         return source_va;
     }
@@ -1215,13 +1879,14 @@ static u64 map_source_image(u64 vm_token, u64 file_bytes, struct byte_slice cach
 }
 
 static int env_prefix_match(const struct exec_bootstrap_config *cfg, u64 index, const char *prefix, u64 *value_offset_out, u64 *value_len_out) {
-    if (index >= cfg->envp_count || index >= EXEC_MAX_ENVP) return 0;
-    const u64 offset = cfg->envp_offsets[index];
-    const u64 len = cfg->envp_bytes[index];
+    u64 offset = 0;
+    u64 len = 0;
+    if (!config_envp_desc(cfg, index, &offset, &len)) return 0;
     const u64 prefix_len = cstr_len(prefix);
     if (len < prefix_len || offset > cfg->arg_data_bytes || len > (u64)cfg->arg_data_bytes - offset) return 0;
+    const unsigned char *arg_data = arg_data_for_config(cfg);
     for (u64 i = 0; i < prefix_len; i++) {
-        if ((char)cfg->arg_data[offset + i] != prefix[i]) return 0;
+        if ((char)arg_data[offset + i] != prefix[i]) return 0;
     }
     *value_offset_out = offset + prefix_len;
     *value_len_out = len - prefix_len;
@@ -1229,7 +1894,8 @@ static int env_prefix_match(const struct exec_bootstrap_config *cfg, u64 index, 
 }
 
 static int find_env_value(const struct exec_bootstrap_config *cfg, const char *prefix, u64 *index_out, u64 *value_offset_out, u64 *value_len_out) {
-    for (u64 i = 0; i < cfg->envp_count && i < EXEC_MAX_ENVP; i++) {
+    const u64 envp_count = config_envp_count(cfg);
+    for (u64 i = 0; i < envp_count && i < EXEC_MAX_ENVP; i++) {
         if (env_prefix_match(cfg, i, prefix, value_offset_out, value_len_out)) {
             *index_out = i;
             return 1;
@@ -1238,15 +1904,90 @@ static int find_env_value(const struct exec_bootstrap_config *cfg, const char *p
     return 0;
 }
 
+static int config_has_env_prefix(const struct exec_bootstrap_config *cfg, const char *prefix) {
+    u64 index = 0;
+    u64 value_offset = 0;
+    u64 value_len = 0;
+    return find_env_value(cfg, prefix, &index, &value_offset, &value_len);
+}
+
+static void service_profile_log_execfn(const struct exec_bootstrap_config *cfg) {
+    const u64 len = cfg->execfn_bytes;
+    if (cfg->execfn_offset > cfg->arg_data_bytes || len > (u64)cfg->arg_data_bytes - cfg->execfn_offset) {
+        user_log("?");
+        return;
+    }
+    const unsigned char *arg_data = arg_data_for_config(cfg);
+    u64 printable_len = len;
+    if (printable_len != 0 && arg_data[cfg->execfn_offset + printable_len - 1] == 0) printable_len--;
+    user_log_len((const char *)arg_data + cfg->execfn_offset, printable_len);
+}
+
+static void service_profile_begin(const struct exec_bootstrap_config *cfg) {
+    service_profile_enabled = config_has_env_prefix(cfg, "CAPABILITYOS_EXEC_SERVICE_PROFILE=");
+    if (!service_profile_enabled) return;
+    service_profile_start_tick = syscall0(SYSCALL_GET_TICK_COUNT);
+    service_profile_last_tick = service_profile_start_tick;
+    service_profile_count = 0;
+    user_log("ExecService.profile.begin path=");
+    service_profile_log_execfn(cfg);
+    user_log(" tick=");
+    user_log_dec_value(service_profile_start_tick);
+    user_log("\n");
+}
+
+static void service_profile_step(const char *label) {
+    if (!service_profile_enabled) return;
+    const u64 now = syscall0(SYSCALL_GET_TICK_COUNT);
+    if (service_profile_count < sizeof(service_profile_dt) / sizeof(service_profile_dt[0])) {
+        const u64 slot = service_profile_count++;
+        service_profile_labels[slot] = label;
+        service_profile_dt[slot] = now - service_profile_last_tick;
+        service_profile_total[slot] = now - service_profile_start_tick;
+    }
+    service_profile_last_tick = now;
+}
+
+static void service_profile_flush(const struct exec_bootstrap_config *cfg) {
+    if (!service_profile_enabled) return;
+    u64 max_index = 0;
+    for (u64 i = 0; i < service_profile_count; i++) {
+        if (service_profile_dt[i] > service_profile_dt[max_index]) max_index = i;
+    }
+    const u64 total = service_profile_count == 0 ? 0 : service_profile_total[service_profile_count - 1];
+    user_log("ExecService.profile.summary path=");
+    service_profile_log_execfn(cfg);
+    user_log(" count=");
+    user_log_dec_value(service_profile_count);
+    user_log(" total=");
+    user_log_dec_value(total);
+    user_log(" max_step=");
+    user_log(service_profile_count != 0 ? service_profile_labels[max_index] : "none");
+    user_log(" max_dt=");
+    user_log_dec_value(service_profile_count != 0 ? service_profile_dt[max_index] : 0);
+    if (service_direct_attempts != 0 || service_direct_fallbacks != 0 || service_direct_map_failures != 0) {
+        user_log(" direct_attempts=");
+        user_log_dec_value(service_direct_attempts);
+        user_log(" direct_pages=");
+        user_log_dec_value(service_direct_mapped_pages);
+        user_log(" direct_fallbacks=");
+        user_log_dec_value(service_direct_fallbacks);
+        user_log(" direct_map_fail=");
+        user_log_dec_value(service_direct_map_failures);
+    }
+    user_log("\n");
+}
+
 static int parse_hex_env_value(const struct exec_bootstrap_config *cfg, u64 value_offset, u64 value_len, u64 *out) {
     if (value_len < 3 || value_offset > cfg->arg_data_bytes || value_len > (u64)cfg->arg_data_bytes - value_offset) return 0;
     u64 i = 0;
-    if (value_len >= 2 && cfg->arg_data[value_offset] == '0' && (cfg->arg_data[value_offset + 1] == 'x' || cfg->arg_data[value_offset + 1] == 'X')) {
+    const unsigned char *arg_data = arg_data_for_config(cfg);
+    if (value_len >= 2 && arg_data[value_offset] == '0' && (arg_data[value_offset + 1] == 'x' || arg_data[value_offset + 1] == 'X')) {
         i = 2;
     }
     u64 value = 0;
     for (; i < value_len; i++) {
-        const unsigned char ch = cfg->arg_data[value_offset + i];
+        const unsigned char ch = arg_data[value_offset + i];
         u64 digit = 0;
         if (ch >= '0' && ch <= '9') digit = (u64)(ch - '0');
         else if (ch >= 'a' && ch <= 'f') digit = (u64)(10 + ch - 'a');
@@ -1260,11 +2001,12 @@ static int parse_hex_env_value(const struct exec_bootstrap_config *cfg, u64 valu
 
 static int write_hex_env_value(struct exec_bootstrap_config *cfg, u64 value_offset, u64 value_len, u64 value) {
     if (value_len < 18 || value_offset > cfg->arg_data_bytes || value_len > (u64)cfg->arg_data_bytes - value_offset) return 0;
-    cfg->arg_data[value_offset] = '0';
-    cfg->arg_data[value_offset + 1] = 'x';
+    unsigned char *arg_data = mutable_arg_data_for_config(cfg);
+    arg_data[value_offset] = '0';
+    arg_data[value_offset + 1] = 'x';
     for (int shift = 60; shift >= 0; shift -= 4) {
         const unsigned int digit = (unsigned int)((value >> (u64)shift) & 0xFULL);
-        cfg->arg_data[value_offset + 2 + (u64)((60 - shift) / 4)] =
+        arg_data[value_offset + 2 + (u64)((60 - shift) / 4)] =
             (unsigned char)(digit < 10 ? ('0' + digit) : ('a' + digit - 10));
     }
     return 1;
@@ -1276,10 +2018,11 @@ static int config_execfn_contains(const struct exec_bootstrap_config *cfg, const
         cfg->execfn_bytes > (u64)cfg->arg_data_bytes - cfg->execfn_offset) {
         return 0;
     }
+    const unsigned char *arg_data = arg_data_for_config(cfg);
     for (u64 i = 0; i + needle_len <= cfg->execfn_bytes; i++) {
         int match = 1;
         for (u64 j = 0; j < needle_len; j++) {
-            if ((char)cfg->arg_data[cfg->execfn_offset + i + j] != needle[j]) {
+            if ((char)arg_data[cfg->execfn_offset + i + j] != needle[j]) {
                 match = 0;
                 break;
             }
@@ -1506,15 +2249,62 @@ static int direct_map_segment(
     const struct exec_elf_header *ehdr,
     int *mapped_out
 ) {
-    (void)process_token;
-    (void)tracker;
-    (void)source_vm_token;
-    (void)phdr;
-    (void)file_bytes;
-    (void)load_bias;
-    (void)source_va;
-    (void)ehdr;
-    *mapped_out = -1;
+    *mapped_out = 0;
+    if (!service_direct_map_enabled) {
+        *mapped_out = -1;
+        return 1;
+    }
+    service_direct_attempts++;
+    if ((phdr->flags & EXEC_ELF_PF_W) != 0) return 1;
+    if ((phdr->flags & EXEC_ELF_PF_X) == 0) {
+        *mapped_out = -1;
+        return 1;
+    }
+    if (phdr->filesz == 0 || phdr->memsz != phdr->filesz) return 1;
+
+    u64 file_end = 0;
+    if (!add_u64(phdr->offset, phdr->filesz, &file_end) || file_end > file_bytes) return 0;
+    u64 file_page_start = 0;
+    if (!align_up_u64(phdr->offset, PAGE_BYTES, &file_page_start)) return 0;
+    const u64 file_page_end = file_end & ~(u64)(PAGE_BYTES - 1);
+    if (file_page_end <= file_page_start) return 1;
+
+    const u64 segment_delta = file_page_start - phdr->offset;
+    u64 page_vaddr = 0;
+    if (!add_u64(phdr->vaddr, segment_delta, &page_vaddr)) return 0;
+    u64 target_va = 0;
+    if (!add_u64(load_bias, page_vaddr, &target_va)) return 0;
+    if ((target_va & (PAGE_BYTES - 1)) != 0) return 1;
+
+    u64 prot_bits = 0;
+    if (!page_prot_bits_from_image(source_va, ehdr, file_bytes, page_vaddr, &prot_bits)) return 0;
+
+    const u64 page_count = (file_page_end - file_page_start) / PAGE_BYTES;
+    u64 map_status = map_vm_object_range_to_process_raw(process_token, source_vm_token, file_page_start / PAGE_BYTES, target_va, page_count, prot_bits);
+    if (map_status != SYSCALL_OK) {
+        release_source_image_slots_except(source_va);
+        map_status = map_vm_object_range_to_process_raw(process_token, source_vm_token, file_page_start / PAGE_BYTES, target_va, page_count, prot_bits);
+    }
+    if (map_status != SYSCALL_OK) {
+        user_log("Exec: direct range map failed status=");
+        user_log_hex_value(map_status);
+        user_log(" off=");
+        user_log_hex_value(file_page_start / PAGE_BYTES);
+        user_log(" va=");
+        user_log_hex_value(target_va);
+        user_log(" pages=");
+        user_log_dec_value(page_count);
+        user_log(" prot=");
+        user_log_hex_value(prot_bits);
+        user_log("\n");
+        service_direct_map_failures++;
+        return 0;
+    }
+    for (u64 page = 0; page < page_count; page++) {
+        if (!tracker_add(tracker, target_va + page * PAGE_BYTES)) return 0;
+    }
+    service_direct_mapped_pages += page_count;
+    *mapped_out = (int)page_count;
     return 1;
 }
 
@@ -1534,9 +2324,21 @@ static int private_map_page(
     u64 prot_bits = 0;
     if (!page_prot_bits_from_image(source_va, ehdr, file_bytes, page_vaddr, &prot_bits)) return 0;
     if (!fill_private_page_from_image(source_va, ehdr, file_bytes, load_bias, target_page_va)) return 0;
-    if (!alloc_map_pages_to_process(process_token, target_page_va, 1, prot_bits)) {
-        user_log("Exec: private alloc failed\n");
-        return 0;
+    u64 alloc_status = alloc_map_pages_to_process_status(process_token, target_page_va, 1, prot_bits);
+    if (alloc_status != SYSCALL_OK) {
+        release_source_image_slots_except(source_va);
+        alloc_status = alloc_map_pages_to_process_status(process_token, target_page_va, 1, prot_bits);
+        if (alloc_status != SYSCALL_OK) {
+            user_log("Exec: private alloc failed status=");
+            user_log_hex_value(alloc_status);
+            user_log(" va=");
+            user_log_hex_value(target_page_va);
+            user_log(" prot=");
+            user_log_hex_value(prot_bits);
+            user_log("\n");
+            log_memory_stats("private_alloc");
+            return 0;
+        }
     }
     if (!copy_to_process(process_token, target_page_va, (u64)private_page_buffer, PAGE_BYTES)) {
         user_log("Exec: private copy failed\n");
@@ -1728,7 +2530,7 @@ static int load_elf_image_into_process(
             ok = 0;
             break;
         }
-        if (mapped > 0) mapped_count++;
+        if (mapped > 0) mapped_count += (u64)mapped;
         if (mapped < 0) map_all_load_pages = 1;
     }
     if (ok) {
@@ -1759,11 +2561,19 @@ static int load_elf_image_into_process(
 }
 
 static int prepare_process(struct exec_bootstrap_config *cfg, struct loaded_image *image_out, u64 *process_token_out, u64 *child_process_slot_out) {
+    (void)config_execfn_contains;
+    const int direct_map_main = 0;
+    service_direct_map_enabled = direct_map_main;
+    service_direct_attempts = 0;
+    service_direct_mapped_pages = 0;
+    service_direct_fallbacks = 0;
+    service_direct_map_failures = 0;
     u64 main_source_va = 0;
     u64 main_vm_token = 0;
     struct exec_elf_summary main_summary;
     const struct byte_slice main_cache_path = execfn_cache_key_from_config(cfg);
     if (!map_and_validate_vm_image(cfg->executable_vm_token, cfg->executable_file_bytes, main_cache_path, &main_source_va, &main_vm_token, &main_summary)) return 0;
+    service_profile_step("main image validated");
 
     const u64 process_token = create_suspended_process();
     if (process_token == 0) {
@@ -1771,10 +2581,12 @@ static int prepare_process(struct exec_bootstrap_config *cfg, struct loaded_imag
         return 0;
     }
     const u64 child_process_slot = process_slot_from_builder_token(process_token);
+    service_profile_step("process created");
     if (!materialize_capsule_env(cfg, child_process_slot)) {
         abort_process(process_token);
         return 0;
     }
+    service_profile_step("capsules materialized");
 
     struct child_map_tracker *tracker = tracker_reset();
 
@@ -1787,6 +2599,8 @@ static int prepare_process(struct exec_bootstrap_config *cfg, struct loaded_imag
         user_log("Exec: main image map failed\n");
         return 0;
     }
+    service_profile_step("main image loaded");
+    service_direct_map_enabled = 0;
 
     u64 interp_base = 0;
     if (image_out->summary.has_interp) {
@@ -1804,6 +2618,7 @@ static int prepare_process(struct exec_bootstrap_config *cfg, struct loaded_imag
             user_log("Exec: interpreter validation failed\n");
             return 0;
         }
+        service_profile_step("interpreter validated");
         if (!load_elf_image_into_process(process_token, tracker, &layout, interp_vm_token, cfg->interpreter_file_bytes, interp_source_va, &interp_summary, 0, &interp_image)) {
             abort_process(process_token);
             user_log("Exec: interpreter map failed\n");
@@ -1811,6 +2626,7 @@ static int prepare_process(struct exec_bootstrap_config *cfg, struct loaded_imag
         }
         interp_base = interp_image.load_bias;
         image_out->initial_rip = interp_image.entry_va;
+        service_profile_step("interpreter loaded");
     }
 
     struct linux_stack_config stack_config;
@@ -1819,21 +2635,32 @@ static int prepare_process(struct exec_bootstrap_config *cfg, struct loaded_imag
         user_log("Exec: stack config failed\n");
         return 0;
     }
-    if (!install_linux_initial_stack(process_token, image_out, interp_base, cfg, &stack_config, &image_out->initial_rsp)) {
+    service_profile_step("stack config built");
+    u64 vdso_va = 0;
+    if (!install_linux_vdso(process_token, cfg, &vdso_va)) {
+        abort_process(process_token);
+        user_log("Exec: vdso install failed\n");
+        return 0;
+    }
+    service_profile_step("vdso installed");
+    if (!install_linux_initial_stack(process_token, image_out, interp_base, cfg, &stack_config, vdso_va, &image_out->initial_rsp)) {
         abort_process(process_token);
         user_log("Exec: stack install failed\n");
         return 0;
     }
+    service_profile_step("stack installed");
     if (!set_process_initial_context(process_token, image_out->initial_rip, image_out->initial_rsp)) {
         abort_process(process_token);
         user_log("Exec: set initial context failed\n");
         return 0;
     }
+    service_profile_step("context set");
     if (!configure_abi_trap_delegate(process_token, cfg)) {
         abort_process(process_token);
         user_log("Exec: abi trap delegate failed\n");
         return 0;
     }
+    service_profile_step("abi delegate configured");
     *process_token_out = process_token;
     *child_process_slot_out = child_process_slot;
     return 1;
@@ -1931,7 +2758,7 @@ static u64 pending_mapped_service_request_seq(void) {
     const volatile struct exec_launch_request *request = (const volatile struct exec_launch_request *)service_request_va;
     if (request->magic != EXEC_LAUNCH_REQUEST_MAGIC ||
         request->version != EXEC_LAUNCH_VERSION ||
-        request->op != EXEC_LAUNCH_OP_START) {
+        (request->op != EXEC_LAUNCH_OP_START && request->op != EXEC_LAUNCH_OP_TRIM_CACHES)) {
         return 0;
     }
     exec_launch_full_fence();
@@ -1942,7 +2769,6 @@ static void handle_mapped_service_request(void) {
     const volatile struct exec_launch_request *request = (const volatile struct exec_launch_request *)service_request_va;
     if (request->magic != EXEC_LAUNCH_REQUEST_MAGIC ||
         request->version != EXEC_LAUNCH_VERSION ||
-        request->op != EXEC_LAUNCH_OP_START ||
         !is_ipc_buffer_token(request->response_token)) {
         user_log("Exec: service request invalid\n");
         return;
@@ -1954,6 +2780,15 @@ static void handle_mapped_service_request(void) {
     service_last_request_seq = seq;
     if (!map_service_response_buffer(response_token)) {
         user_log("Exec: service response map failed\n");
+        return;
+    }
+    if (request->op == EXEC_LAUNCH_OP_TRIM_CACHES) {
+        (void)release_all_source_image_slots();
+        write_service_response(EXEC_LAUNCH_OP_TRIM_CACHES, seq, EXEC_LAUNCH_STATUS_OK, 0);
+        return;
+    }
+    if (request->op != EXEC_LAUNCH_OP_START) {
+        write_service_response(request->op, seq, EXEC_LAUNCH_STATUS_INVALID, 0);
         return;
     }
 
@@ -1968,32 +2803,41 @@ static void handle_mapped_service_request(void) {
         config->interpreter_file_bytes = service_interpreter_file_bytes;
     }
 
-    if (!valid_config(config)) {
+    if (!map_external_arg_data_for_config(config) || !valid_config(config)) {
         write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_INVALID, 0);
         return;
     }
+    service_profile_begin(config);
+    service_profile_step("config ready");
 
     struct loaded_image image;
     u64 process_token = 0;
     u64 child_process_slot = 0;
     if (!prepare_process(config, &image, &process_token, &child_process_slot)) {
+        (void)release_all_source_image_slots();
         write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_LAUNCH_FAILED, 0);
         return;
     }
     (void)image;
+    (void)release_all_source_image_slots();
 
     write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
+    service_profile_step("start response written");
     if (!wait_for_start_ready(seq)) {
         abort_process(process_token);
         user_log("Exec: start ack timeout\n");
         return;
     }
+    service_profile_step("start ack received");
     if (!start_prepared_process(process_token, child_process_slot)) {
         write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_START_FAILED, child_process_slot);
         user_log("Exec: start after response failed\n");
         return;
     }
+    service_profile_step("process started");
     write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
+    service_profile_step("started response written");
+    service_profile_flush(config);
     user_log("Exec: launch ok\n");
 }
 
@@ -2024,6 +2868,15 @@ static void handle_service_request(u64 request_paddr) {
         user_log("Exec: service legacy response map failed\n");
         return;
     }
+    if (request->op == EXEC_LAUNCH_OP_TRIM_CACHES) {
+        (void)release_all_source_image_slots();
+        write_service_response(EXEC_LAUNCH_OP_TRIM_CACHES, seq, EXEC_LAUNCH_STATUS_OK, 0);
+        return;
+    }
+    if (request->op != EXEC_LAUNCH_OP_START) {
+        write_service_response(request->op, seq, EXEC_LAUNCH_STATUS_INVALID, 0);
+        return;
+    }
 
     struct exec_bootstrap_config *config = &service_request_config;
     {
@@ -2036,32 +2889,41 @@ static void handle_service_request(u64 request_paddr) {
         config->interpreter_file_bytes = service_interpreter_file_bytes;
     }
 
-    if (!valid_config(config)) {
+    if (!map_external_arg_data_for_config(config) || !valid_config(config)) {
         write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_INVALID, 0);
         return;
     }
+    service_profile_begin(config);
+    service_profile_step("config ready");
 
     struct loaded_image image;
     u64 process_token = 0;
     u64 child_process_slot = 0;
     if (!prepare_process(config, &image, &process_token, &child_process_slot)) {
+        (void)release_all_source_image_slots();
         write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_LAUNCH_FAILED, 0);
         return;
     }
     (void)image;
+    (void)release_all_source_image_slots();
 
     write_service_response(EXEC_LAUNCH_OP_START, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
+    service_profile_step("start response written");
     if (!wait_for_start_ready(seq)) {
         abort_process(process_token);
         user_log("Exec: start ack timeout\n");
         return;
     }
+    service_profile_step("start ack received");
     if (!start_prepared_process(process_token, child_process_slot)) {
         write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_START_FAILED, child_process_slot);
         user_log("Exec: start after response failed\n");
         return;
     }
+    service_profile_step("process started");
     write_service_response(EXEC_LAUNCH_OP_STARTED, seq, EXEC_LAUNCH_STATUS_OK, child_process_slot);
+    service_profile_step("started response written");
+    service_profile_flush(config);
     user_log("Exec: launch ok\n");
 }
 
