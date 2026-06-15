@@ -124,6 +124,7 @@ func buildSmokeELF(workspace *config.Workspace, out string) error {
 		clang = "clang"
 	}
 	srcDir := workspace.Path("tests", "boot", "fd_ipc_smoke")
+	libipcDir := workspace.Path("userland", "libipc")
 	args := []string{
 		"-target", "x86_64-freestanding-none",
 		"-ffreestanding",
@@ -141,8 +142,10 @@ func buildSmokeELF(workspace *config.Workspace, out string) error {
 		"-Wl,--no-dynamic-linker",
 		"-Wl,-z,common-page-size=4096",
 		"-Wl,-z,max-page-size=4096",
+		"-I", filepath.Join(libipcDir, "include"),
 		filepath.Join(srcDir, "entry.S"),
 		filepath.Join(srcDir, "main.c"),
+		filepath.Join(libipcDir, "src", "ipc.c"),
 		"-o", out,
 	}
 	cmd := exec.Command(clang, args...)
