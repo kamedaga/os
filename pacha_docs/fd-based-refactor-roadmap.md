@@ -11,6 +11,8 @@ PachaOS を現在の capability-based microkernel から、fd-based object micro
 - 大量の capability 構造体と権限管理経路を fd table に統一すること
 - page capability を ABI の主役から外し、メモリ管理を VMO / VMA / mmap に整理すること
 - kernel の責務を小さくし、コード量とデバッグ対象を減らすこと
+- userland は C / C ABI を主軸にし、既存の userland Zig 資産は少しずつ廃止すること
+- 既存の PachaOS 専用 userland driver を kobox daemon へ置き換え、Linux kernel driver 資産を `libcapsule` 経由で扱えるようにすること
 
 ## 基本方針
 
@@ -352,6 +354,32 @@ kernel fd table は統一する。
 
 kernel-native object も userland service session も同じ fd table に入る。ただし service object の意味は libc / service client library が解釈する。
 
+userland 実装の主軸は C に寄せる。
+
+- PachaOS native ABI の public surface は C ABI として安定させる
+- `libpacha`, `libipc`, `libcapsule` は C で実装し、C library として提供する
+- musl backend から自然に呼べる header / ABI を優先する
+- 既存の `userland/programs/*.zig` と Zig ABI helper は、対応する C library / C service / generated header へ段階移行する
+- kernel Zig と userland C の境界を明確にし、userland 側で Zig-only な ABI 依存を増やさない
+
+## kobox Driver Daemons
+
+kobox は PachaOS の driver daemon 基盤として扱う。
+
+README の kobox セクションにある通り、kobox は Linux kernel driver (`.ko`) を userland process として直接実行する runtime である。fd-based refactor 後は、既存の PachaOS 専用 driver を少しずつ kobox daemon に置き換える。
+
+目標。
+
+- NVMe / USB / HID などは、可能な範囲で kobox daemon として扱う
+- PachaOS 側の hardware authority は `Device fd`, `MmioRegion fd`, `DmaBuffer fd`, `DmaMapping fd`, `Irq fd` として渡す
+- kobox PachaOS backend は syscall を直接叩かず、`libcapsule` を使う
+- kobox backend が必要とする MMIO / DMA / IRQ / PCI config 操作を `libcapsule` API に反映する
+- driver daemon と他 service の通信は `libipc` を使う
+- `libipc` / `libcapsule` は C 実装なので、kobox backend や daemon から直接 link できる
+- 既存 driver code を kernel に寄せず、userland daemon と fd passing で構成する
+
+これにより、PachaOS 固有 driver を増やすのではなく、Linux driver 資産を userland daemon として再利用する方向へ寄せる。
+
 ## Migration Phases
 
 ### Phase 0: Design Freeze
@@ -361,6 +389,19 @@ kernel-native object も userland service session も同じ fd table に入る�
 - object type の初期集合を決める
 - old capability API との対応表を作る
 - syscall numbering 方針を決める
+- userland C ABI / header 方針を決める
+- kobox backend が `libcapsule` に要求する最小 API を README と既存起動経路から洗い出す
+
+Phase 0 の作業入口は [[phase0-checklist]]。
+
+関連する仕様候補。
+
+- [[phase0-design-freeze]]
+- [[fd-abi-spec]]
+- [[ipc-abi-spec]]
+- [[memory-abi-spec]]
+- [[capsule-fd-spec]]
+- [[capability-to-fd-migration-map]]
 
 ### Phase 1: FD Table Core
 
@@ -370,6 +411,8 @@ kernel-native object も userland service session も同じ fd table に入る�
 - object refcount と lifetime を統一する
 
 この段階では既存 capability path と併存してよい。
+
+実装計画は [[phase1-fd-table-core-plan]] に固定する。
 
 ### Phase 2: Memory Decoupling
 
@@ -410,6 +453,7 @@ kernel-native object も userland service session も同じ fd table に入る�
 - `Device` / `MmioRegion` / `DmaBuffer` / `DmaMapping` / `Irq` fd を作る
 - `libcapsule` を提供する
 - userland driver と kobox backend を `libcapsule` 経由に寄せる
+- kobox を driver daemon として扱えるよう、device fd bootstrap / daemon supervision / IPC protocol を整理する
 
 ### Phase 7: musl Native Backend
 
@@ -422,6 +466,7 @@ kernel-native object も userland service session も同じ fd table に入る�
   - poll
   - spawn / exec
 - libc から syscall 直叩きを減らし、`libipc` / `libcapsule` / `libpacha` に集約する
+- userland Zig で提供していた ABI helper / service code を C library / C service に置き換える
 
 ### Phase 8: Old Capability Removal
 
@@ -429,6 +474,8 @@ kernel-native object も userland service session も同じ fd table に入る�
 - VM object cap table を削除する
 - IPC buffer cap を fd object に統合する
 - device / queue / command cap を capsule fd に統合する
+- PachaOS 専用 driver のうち kobox daemon で置換できるものを削除または compatibility に隔離する
+- userland Zig 資産を native C ABI / C service へ移行し、不要になった Zig app build path を削除する
 - old syscall を削除または compatibility shim に隔離する
 - README / docs / tests を fd-based 設計へ更新する
 
@@ -440,8 +487,11 @@ kernel-native object も userland service session も同じ fd table に入る�
 - VMO fd を fd passing して shared memory が動く
 - `libipc` 経由で request / reply / fd passing が動く
 - `libcapsule` 経由で MMIO / DMA / IRQ を扱える
+- kobox PachaOS backend が `libcapsule` 経由で device fd を扱える
+- 既存 userland driver の一部が kobox daemon に置き換わる
 - Linux ABI server なしで musl hello world が動く
 - libc の `mmap`, `read`, `write`, `poll`, `close`, `dup` が native ABI 上で動く
+- userland Zig helper なしで主要 native ABI smoke が動く
 - 旧 capability syscall と構造体を削除できる
 - kernel の capability 系コード行数が明確に減る
 
