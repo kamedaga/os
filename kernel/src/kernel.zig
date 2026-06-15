@@ -304,6 +304,7 @@ pub const KernelObjectKind = enum(u16) {
     vmo_compat = 3,
     capsule_compat = 4,
     event = 5,
+    vmo = 6,
 };
 
 pub const KernelObjectRef = struct {
@@ -323,6 +324,7 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     vmo_compat: u64,
     capsule_compat: u64,
     event: u64,
+    vmo: NativeVmoRef,
 };
 
 pub const KernelObjectSlot = struct {
@@ -349,6 +351,73 @@ pub const FdTable = struct {
 pub const FdTransferMode = enum(u8) {
     copy,
     move,
+};
+
+pub const native_page_size: u64 = 4096;
+pub const max_native_vmos: usize = 4096;
+pub const max_vmas_per_process: usize = 512;
+
+pub const NativeVmoKind = enum(u8) {
+    none = 0,
+    anonymous = 1,
+};
+
+pub const NativeVmoRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: NativeVmoRef) bool {
+        return self.generation == 0;
+    }
+};
+
+pub const NativeVmoSlot = struct {
+    kind: NativeVmoKind = .none,
+    generation: u32 = 1,
+    size_bytes: u64 = 0,
+    page_count: u16 = 0,
+    page_store_start: u32 = 0,
+    ref_count: u32 = 0,
+};
+
+pub const VmaProt = packed struct(u8) {
+    read: bool = false,
+    write: bool = false,
+    exec: bool = false,
+    _reserved: u5 = 0,
+};
+
+pub const MmapFlags = packed struct(u32) {
+    fixed: bool = false,
+    fixed_noreplace: bool = false,
+    private: bool = false,
+    shared: bool = false,
+    anonymous: bool = false,
+    noreserve: bool = false,
+    _reserved: u26 = 0,
+};
+
+pub const VmaEntry = struct {
+    active: bool = false,
+    start_va: u64 = 0,
+    size_bytes: u64 = 0,
+    prot: VmaProt = .{},
+    flags: MmapFlags = .{},
+    vmo: NativeVmoRef = .{},
+    vmo_offset: u64 = 0,
+
+    pub fn endVa(self: *const VmaEntry) u64 {
+        return self.start_va + self.size_bytes;
+    }
+};
+
+pub const VmaTable = struct {
+    entries: [max_vmas_per_process]VmaEntry = [_]VmaEntry{.{}} ** max_vmas_per_process,
+};
+
+pub const NativeVmaFaultMapping = struct {
+    paddr: u64,
+    prot: MapProt,
 };
 
 pub const CNode = struct {
@@ -1254,6 +1323,49 @@ fn allocVmObjectBackingPageStore(page_paddrs: []const u64) ?u32 {
     return @intCast(start);
 }
 
+fn allocEmptyVmObjectBackingPageStore(page_count: usize) ?u32 {
+    if (page_count == 0 or page_count > max_vm_object_backing_pages) return null;
+    var start: usize = 0;
+    var free_index: ?usize = null;
+    var i: usize = 0;
+    while (i < vm_object_backing_page_store_free_range_len) : (i += 1) {
+        if (vm_object_backing_page_store_free_ranges[i].len < page_count) continue;
+        start = vm_object_backing_page_store_free_ranges[i].start;
+        free_index = i;
+        break;
+    }
+    if (free_index) |index| {
+        const consumed: u32 = @intCast(page_count);
+        vm_object_backing_page_store_free_ranges[index].start += consumed;
+        vm_object_backing_page_store_free_ranges[index].len -= consumed;
+        if (vm_object_backing_page_store_free_ranges[index].len == 0) removeVmObjectBackingFreeRange(index);
+    } else {
+        if (vm_object_backing_page_store_next + page_count > vm_object_backing_page_store.len) return null;
+        start = vm_object_backing_page_store_next;
+        vm_object_backing_page_store_next += page_count;
+    }
+    @memset(vm_object_backing_page_store[start .. start + page_count], 0);
+    return @intCast(start);
+}
+
+fn vmObjectBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize) ?u64 {
+    if (page_index >= page_count) return null;
+    const store_index = @as(usize, start) + page_index;
+    if (store_index >= vm_object_backing_page_store.len) return null;
+    const paddr = vm_object_backing_page_store[store_index];
+    if ((paddr & 0xFFF) != 0) return null;
+    return paddr;
+}
+
+fn setVmObjectBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize, paddr: u64) bool {
+    if ((paddr & 0xFFF) != 0) return false;
+    if (page_index >= page_count) return false;
+    const store_index = @as(usize, start) + page_index;
+    if (store_index >= vm_object_backing_page_store.len) return false;
+    vm_object_backing_page_store[store_index] = paddr;
+    return true;
+}
+
 fn freeVmObjectBackingPageStore(start: u32, page_count: u16) bool {
     if (page_count == 0) return true;
     const start_usize: usize = @intCast(start);
@@ -1858,18 +1970,6 @@ const DmaRestoreEntry = struct {
     rights: Rights = .{ .cpu_read = false, .cpu_write = false, .dma = false },
 };
 
-pub const DebugAllocPageStage = enum(u8) {
-    after_pop,
-    after_memset,
-    after_cap_add,
-};
-
-pub const OwnershipView = union(enum) {
-    owner: PrincipalId,
-    shared: void,
-    none: void,
-};
-
 pub const IommuNoCapDriverMode = enum(u8) {
     off,
     shadow,
@@ -1912,6 +2012,7 @@ var empty_ipc_buffer_mailboxes_extra: [0]IpcBufferMailbox = .{};
 var empty_pending_ipc_buffer_transfers_extra: [0]?PendingIpcBufferTransfer = .{};
 var empty_vm_object_tables_extra: [0]VmObjectCNode = .{};
 var empty_fd_tables_extra: [0]FdTable = .{};
+var empty_vma_tables_extra: [0]VmaTable = .{};
 
 pub const KernelState = struct {
     pub const max_regions = 256;
@@ -1937,6 +2038,7 @@ pub const KernelState = struct {
     pending_ipc_buffer_transfers: [principal_count]?PendingIpcBufferTransfer = [_]?PendingIpcBufferTransfer{null} ** principal_count,
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
     fd_tables: [process_count]FdTable = [_]FdTable{.{}} ** process_count,
+    vma_tables: [process_count]VmaTable = [_]VmaTable{.{}} ** process_count,
     cap_mailboxes_extra: []CapMailbox = empty_cap_mailboxes_extra[0..],
     pending_page_transfers_extra: []?PendingCapTransfer = empty_pending_page_transfers_extra[0..],
     ipc_buffer_tables_extra: []IpcBufferCNode = empty_ipc_buffer_tables_extra[0..],
@@ -1944,12 +2046,14 @@ pub const KernelState = struct {
     pending_ipc_buffer_transfers_extra: []?PendingIpcBufferTransfer = empty_pending_ipc_buffer_transfers_extra[0..],
     vm_object_tables_extra: []VmObjectCNode = empty_vm_object_tables_extra[0..],
     fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
+    vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
     fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
     next_fd_object_scan: usize = 0,
+    native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
+    next_native_vmo_scan: usize = 0,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
-    debug_alloc_page_hook: ?*const fn (state: *const KernelState, requester: PrincipalId, stage: DebugAllocPageStage, paddr: u64) void = null,
     debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
@@ -1988,6 +2092,141 @@ pub const KernelState = struct {
         return value & ~@as(u64, 4095);
     }
 
+    fn isPageAligned(value: u64) bool {
+        return (value & (native_page_size - 1)) == 0;
+    }
+
+    fn checkedEnd(start: u64, size: u64) KernelError!u64 {
+        if (size == 0) return KernelError.InvalidState;
+        if (start > std.math.maxInt(u64) - size) return KernelError.InvalidState;
+        return start + size;
+    }
+
+    fn nativeVmoSlot(self: *KernelState, vmo_ref: NativeVmoRef) ?*NativeVmoSlot {
+        if (vmo_ref.isNull()) return null;
+        const index: usize = @intCast(vmo_ref.index);
+        if (index >= max_native_vmos) return null;
+        const slot = &self.native_vmos[index];
+        if (slot.kind == .none or slot.generation != vmo_ref.generation) return null;
+        return slot;
+    }
+
+    fn nativeVmoSlotConst(self: *const KernelState, vmo_ref: NativeVmoRef) ?*const NativeVmoSlot {
+        if (vmo_ref.isNull()) return null;
+        const index: usize = @intCast(vmo_ref.index);
+        if (index >= max_native_vmos) return null;
+        const slot = &self.native_vmos[index];
+        if (slot.kind == .none or slot.generation != vmo_ref.generation) return null;
+        return slot;
+    }
+
+    fn clearNativeVmoSlot(slot: *NativeVmoSlot) void {
+        const next_generation = nextObjectGeneration(slot.generation);
+        if (slot.page_count != 0) {
+            _ = freeVmObjectBackingPageStore(slot.page_store_start, slot.page_count);
+        }
+        slot.* = .{ .generation = next_generation };
+    }
+
+    fn releaseNativeVmoOwnedPages(slot: *NativeVmoSlot, free_list: *FreePageList) void {
+        var page_index: usize = 0;
+        while (page_index < slot.page_count) : (page_index += 1) {
+            const paddr = vmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse continue;
+            if (paddr == 0) continue;
+            if (free_list.canAppendPage(0, paddr)) {
+                free_list.appendPage(0, paddr) catch {};
+                _ = setVmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index, 0);
+            }
+        }
+    }
+
+    fn createNativeVmo(self: *KernelState, kind: NativeVmoKind, size_bytes: u64) KernelError!NativeVmoRef {
+        if (kind == .none or size_bytes == 0) return KernelError.InvalidState;
+        const aligned_size = pageAlignUp(size_bytes);
+        const page_count_u64 = aligned_size / native_page_size;
+        if (page_count_u64 == 0 or page_count_u64 > max_vm_object_backing_pages) return KernelError.InvalidState;
+        const page_count: u16 = @intCast(page_count_u64);
+        var offset: usize = 0;
+        while (offset < max_native_vmos) : (offset += 1) {
+            const index = (self.next_native_vmo_scan + offset) % max_native_vmos;
+            const slot = &self.native_vmos[index];
+            if (slot.kind != .none or slot.ref_count != 0) continue;
+            const page_store_start = allocEmptyVmObjectBackingPageStore(page_count) orelse return KernelError.TableFull;
+            if (slot.generation == 0) slot.generation = 1;
+            slot.kind = kind;
+            slot.size_bytes = aligned_size;
+            slot.page_count = page_count;
+            slot.page_store_start = page_store_start;
+            slot.ref_count = 0;
+            self.next_native_vmo_scan = (index + 1) % max_native_vmos;
+            return .{
+                .index = @intCast(index),
+                .generation = slot.generation,
+            };
+        }
+        return KernelError.TableFull;
+    }
+
+    fn retainNativeVmo(self: *KernelState, vmo_ref: NativeVmoRef) KernelError!void {
+        const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
+        if (slot.ref_count == std.math.maxInt(u32)) return KernelError.TableFull;
+        slot.ref_count += 1;
+    }
+
+    fn releaseNativeVmo(self: *KernelState, vmo_ref: NativeVmoRef) void {
+        const slot = self.nativeVmoSlot(vmo_ref) orelse return;
+        if (slot.ref_count == 0) return;
+        slot.ref_count -= 1;
+        if (slot.ref_count == 0) clearNativeVmoSlot(slot);
+    }
+
+    fn releaseNativeVmoWithFreeList(self: *KernelState, vmo_ref: NativeVmoRef, free_list: *FreePageList) void {
+        const slot = self.nativeVmoSlot(vmo_ref) orelse return;
+        if (slot.ref_count == 0) return;
+        slot.ref_count -= 1;
+        if (slot.ref_count == 0) {
+            releaseNativeVmoOwnedPages(slot, free_list);
+            clearNativeVmoSlot(slot);
+        }
+    }
+
+    pub fn nativeVmoRefCount(self: *const KernelState, vmo_ref: NativeVmoRef) ?u32 {
+        const slot = self.nativeVmoSlotConst(vmo_ref) orelse return null;
+        return slot.ref_count;
+    }
+
+    pub fn nativeVmoSize(self: *const KernelState, vmo_ref: NativeVmoRef) ?u64 {
+        const slot = self.nativeVmoSlotConst(vmo_ref) orelse return null;
+        return slot.size_bytes;
+    }
+
+    pub fn nativeVmoPagePaddr(self: *const KernelState, vmo_ref: NativeVmoRef, page_index: usize) ?u64 {
+        const slot = self.nativeVmoSlotConst(vmo_ref) orelse return null;
+        const paddr = vmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse return null;
+        if (paddr == 0) return null;
+        return paddr;
+    }
+
+    pub fn installNativeVmoPages(
+        self: *KernelState,
+        vmo_ref: NativeVmoRef,
+        page_offset: usize,
+        paddrs: []const u64,
+    ) KernelError!void {
+        if (paddrs.len == 0) return KernelError.InvalidState;
+        const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
+        if (page_offset > slot.page_count or paddrs.len > @as(usize, slot.page_count) - page_offset) return KernelError.InvalidState;
+        for (paddrs, 0..) |paddr, i| {
+            if ((paddr & 0xFFF) != 0) return KernelError.InvalidState;
+            if (vmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i) != 0) return KernelError.InvalidState;
+        }
+        for (paddrs, 0..) |paddr, i| {
+            if (!setVmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i, paddr)) {
+                return KernelError.InvalidState;
+            }
+        }
+    }
+
     fn fdIndex(fd: Fd) ?usize {
         if (fd >= fd_table_entries) return null;
         return @intCast(fd);
@@ -2011,7 +2250,38 @@ pub const KernelState = struct {
         return std.meta.activeTag(payload) == kind;
     }
 
-    fn clearKernelObjectSlot(slot: *KernelObjectSlot) void {
+    fn releaseKernelObjectPayload(self: *KernelState, slot: *const KernelObjectSlot) void {
+        switch (slot.payload) {
+            .vmo => |vmo_ref| self.releaseNativeVmo(vmo_ref),
+            else => {},
+        }
+    }
+
+    fn releaseKernelObjectPayloadWithFreeList(
+        self: *KernelState,
+        slot: *const KernelObjectSlot,
+        free_list: *FreePageList,
+    ) void {
+        switch (slot.payload) {
+            .vmo => |vmo_ref| self.releaseNativeVmoWithFreeList(vmo_ref, free_list),
+            else => {},
+        }
+    }
+
+    fn clearKernelObjectSlot(self: *KernelState, slot: *KernelObjectSlot) void {
+        self.releaseKernelObjectPayload(slot);
+        slot.kind = .none;
+        slot.ref_count = 0;
+        slot.payload = .{ .none = {} };
+        slot.generation = nextObjectGeneration(slot.generation);
+    }
+
+    fn clearKernelObjectSlotWithFreeList(
+        self: *KernelState,
+        slot: *KernelObjectSlot,
+        free_list: *FreePageList,
+    ) void {
+        self.releaseKernelObjectPayloadWithFreeList(slot, free_list);
         slot.kind = .none;
         slot.ref_count = 0;
         slot.payload = .{ .none = {} };
@@ -2019,8 +2289,16 @@ pub const KernelState = struct {
     }
 
     fn resetKernelObjectTable(self: *KernelState) void {
-        @memset(self.fd_objects[0..], .{});
+        for (self.fd_objects[0..]) |*slot| {
+            if (slot.kind != .none) self.releaseKernelObjectPayload(slot);
+            slot.* = .{};
+        }
         self.next_fd_object_scan = 0;
+    }
+
+    fn resetNativeVmoTable(self: *KernelState) void {
+        @memset(self.native_vmos[0..], .{});
+        self.next_native_vmo_scan = 0;
     }
 
     pub fn createKernelObject(
@@ -2076,7 +2354,18 @@ pub const KernelState = struct {
         const slot = self.kernelObjectSlot(object_ref) orelse return;
         if (slot.ref_count == 0) return;
         slot.ref_count -= 1;
-        if (slot.ref_count == 0) clearKernelObjectSlot(slot);
+        if (slot.ref_count == 0) self.clearKernelObjectSlot(slot);
+    }
+
+    fn releaseKernelObjectWithFreeList(
+        self: *KernelState,
+        object_ref: KernelObjectRef,
+        free_list: *FreePageList,
+    ) void {
+        const slot = self.kernelObjectSlot(object_ref) orelse return;
+        if (slot.ref_count == 0) return;
+        slot.ref_count -= 1;
+        if (slot.ref_count == 0) self.clearKernelObjectSlotWithFreeList(slot, free_list);
     }
 
     pub fn kernelObjectRefCount(self: *const KernelState, object_ref: KernelObjectRef) ?u32 {
@@ -2704,6 +2993,18 @@ pub const KernelState = struct {
         return &self.fd_tables[index];
     }
 
+    fn vmaTableForProcessIndex(self: *KernelState, index: usize) ?*VmaTable {
+        if (index >= self.process_capacity) return null;
+        if (extraIndex(index)) |extra| return &self.vma_tables_extra[extra];
+        return &self.vma_tables[index];
+    }
+
+    fn vmaTableForProcessIndexConst(self: *const KernelState, index: usize) ?*const VmaTable {
+        if (index >= self.process_capacity) return null;
+        if (extraIndex(index)) |extra| return &self.vma_tables_extra[extra];
+        return &self.vma_tables[index];
+    }
+
     pub fn getFdTable(self: *KernelState, principal: PrincipalId) ?*FdTable {
         const index = processIndexFromPrincipal(principal) orelse return null;
         return self.fdTableForProcessIndex(index);
@@ -2712,6 +3013,16 @@ pub const KernelState = struct {
     pub fn getFdTableConst(self: *const KernelState, principal: PrincipalId) ?*const FdTable {
         const index = processIndexFromPrincipal(principal) orelse return null;
         return self.fdTableForProcessIndexConst(index);
+    }
+
+    pub fn getVmaTable(self: *KernelState, principal: PrincipalId) ?*VmaTable {
+        const index = processIndexFromPrincipal(principal) orelse return null;
+        return self.vmaTableForProcessIndex(index);
+    }
+
+    pub fn getVmaTableConst(self: *const KernelState, principal: PrincipalId) ?*const VmaTable {
+        const index = processIndexFromPrincipal(principal) orelse return null;
+        return self.vmaTableForProcessIndexConst(index);
     }
 
     fn fdTableForActiveProcess(self: *KernelState, principal: PrincipalId) KernelError!*FdTable {
@@ -2731,6 +3042,62 @@ pub const KernelState = struct {
         return &table.entries[index];
     }
 
+    pub fn vmaEntryConst(self: *const KernelState, owner: PrincipalId, start_va: u64) ?*const VmaEntry {
+        const table = self.getVmaTableConst(owner) orelse return null;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (entry.start_va == start_va) return entry;
+        }
+        return null;
+    }
+
+    pub fn vmaEntryForVaConst(self: *const KernelState, owner: PrincipalId, va: u64) ?*const VmaEntry {
+        const table = self.getVmaTableConst(owner) orelse return null;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (va >= entry.start_va and va < entry.endVa()) return entry;
+        }
+        return null;
+    }
+
+    fn vmaProtAllowsFault(prot: VmaProt, write_access: bool, instruction_fetch: bool) bool {
+        if (instruction_fetch) return prot.exec;
+        if (write_access) return prot.write;
+        return prot.read;
+    }
+
+    pub fn nativeVmaFaultMapping(
+        self: *const KernelState,
+        owner: PrincipalId,
+        fault_page_va: u64,
+        write_access: bool,
+        instruction_fetch: bool,
+    ) ?NativeVmaFaultMapping {
+        if (!isPageAligned(fault_page_va)) return null;
+        const entry = self.vmaEntryForVaConst(owner, fault_page_va) orelse return null;
+        if (!vmaProtAllowsFault(entry.prot, write_access, instruction_fetch)) return null;
+        const page_delta = (fault_page_va - entry.start_va) / native_page_size;
+        const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
+        const paddr = self.nativeVmoPagePaddr(entry.vmo, @intCast(vmo_page)) orelse return null;
+        return .{
+            .paddr = paddr,
+            .prot = .{
+                .read = entry.prot.read,
+                .write = entry.prot.write,
+                .exec = entry.prot.exec,
+            },
+        };
+    }
+
+    pub fn nativeVmoRefForFd(self: *const KernelState, owner: PrincipalId, fd: Fd) ?NativeVmoRef {
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        return switch (slot.payload) {
+            .vmo => |vmo_ref| vmo_ref,
+            else => null,
+        };
+    }
+
     fn releaseFdTableForProcessIndex(self: *KernelState, index: usize) void {
         const table = self.fdTableForProcessIndex(index) orelse return;
         var fd: usize = 0;
@@ -2742,7 +3109,57 @@ pub const KernelState = struct {
         }
     }
 
+    fn releaseFdTableForProcessIndexWithFreeList(
+        self: *KernelState,
+        index: usize,
+        free_list: *FreePageList,
+    ) void {
+        const table = self.fdTableForProcessIndex(index) orelse return;
+        var fd: usize = 0;
+        while (fd < fd_table_entries) : (fd += 1) {
+            const object_ref = table.entries[fd].object;
+            if (object_ref.isNull()) continue;
+            table.entries[fd] = .{};
+            self.releaseKernelObjectWithFreeList(object_ref, free_list);
+        }
+    }
+
+    fn releaseVmaTableForProcessIndex(self: *KernelState, index: usize) void {
+        const table = self.vmaTableForProcessIndex(index) orelse return;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            const vmo_ref = entry.vmo;
+            entry.* = .{};
+            self.releaseNativeVmo(vmo_ref);
+        }
+    }
+
+    fn releaseVmaTableForProcessIndexWithFreeList(
+        self: *KernelState,
+        index: usize,
+        free_list: *FreePageList,
+    ) void {
+        const table = self.vmaTableForProcessIndex(index) orelse return;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            const vmo_ref = entry.vmo;
+            entry.* = .{};
+            self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
+        }
+    }
+
+    pub fn releasePrincipalNativeMemory(
+        self: *KernelState,
+        owner: PrincipalId,
+        free_list: *FreePageList,
+    ) void {
+        const index = processIndexFromPrincipal(owner) orelse return;
+        self.releaseVmaTableForProcessIndexWithFreeList(index, free_list);
+        self.releaseFdTableForProcessIndexWithFreeList(index, free_list);
+    }
+
     pub fn resetProcessRuntimeTables(self: *KernelState, index: usize) void {
+        self.releaseVmaTableForProcessIndex(index);
         self.releaseFdTableForProcessIndex(index);
         self.capTableForProcessIndex(index).reset();
         self.endpointTableForProcessIndex(index).* = .{};
@@ -2752,6 +3169,130 @@ pub const KernelState = struct {
         self.ipcBufferMailboxForProcessIndex(index).reset();
         self.pendingIpcBufferTransferForProcessIndex(index).* = null;
         self.vmObjectTableForProcessIndex(index).reset();
+    }
+
+    fn findFreeVma(table: *const VmaTable) ?usize {
+        for (table.entries[0..], 0..) |*entry, index| {
+            if (!entry.active) return index;
+        }
+        return null;
+    }
+
+    fn vmaRangeOverlaps(table: *const VmaTable, start_va: u64, size_bytes: u64) KernelError!bool {
+        const end_va = try checkedEnd(start_va, size_bytes);
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (start_va < entry.endVa() and end_va > entry.start_va) return true;
+        }
+        return false;
+    }
+
+    fn vmaProtAllowedByRights(prot: VmaProt, rights: FdRights) bool {
+        if (prot.read and !rights.map_read) return false;
+        if (prot.write and !rights.map_write) return false;
+        if (prot.exec and !rights.map_exec) return false;
+        return true;
+    }
+
+    pub fn createAnonymousVmoFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        size_bytes: u64,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        try self.requireActiveProcess(owner);
+        const vmo_ref = try self.createNativeVmo(.anonymous, size_bytes);
+        try self.retainNativeVmo(vmo_ref);
+        const object_ref = self.createKernelObject(.vmo, .{ .vmo = vmo_ref }) catch |err| {
+            self.releaseNativeVmo(vmo_ref);
+            return err;
+        };
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn mmapFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        start_va: u64,
+        size_bytes: u64,
+        prot: VmaProt,
+        flags: MmapFlags,
+        vmo_offset: u64,
+    ) KernelError!u64 {
+        const fd_table = try self.fdTableForActiveProcessConst(owner);
+        const fd_index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const fd_entry = fd_table.entries[fd_index];
+        if (fd_entry.object.isNull()) return KernelError.InvalidState;
+        if (!vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes) or !isPageAligned(vmo_offset)) return KernelError.InvalidState;
+        const map_end = try checkedEnd(start_va, size_bytes);
+        _ = map_end;
+
+        const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
+        const vmo_ref = switch (object_slot.payload) {
+            .vmo => |ref| ref,
+            else => return KernelError.InvalidState,
+        };
+        const vmo = self.nativeVmoSlotConst(vmo_ref) orelse return KernelError.InvalidState;
+        const vmo_end = try checkedEnd(vmo_offset, size_bytes);
+        if (vmo_end > vmo.size_bytes) return KernelError.InvalidState;
+
+        const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+        if (try vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
+        const vma_index = findFreeVma(vma_table) orelse return KernelError.TableFull;
+        try self.retainNativeVmo(vmo_ref);
+        vma_table.entries[vma_index] = .{
+            .active = true,
+            .start_va = start_va,
+            .size_bytes = size_bytes,
+            .prot = prot,
+            .flags = flags,
+            .vmo = vmo_ref,
+            .vmo_offset = vmo_offset,
+        };
+        return start_va;
+    }
+
+    pub fn munmapExact(self: *KernelState, owner: PrincipalId, start_va: u64, size_bytes: u64) KernelError!void {
+        try self.requireActiveProcess(owner);
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes)) return KernelError.InvalidState;
+        const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (entry.start_va != start_va or entry.size_bytes != size_bytes) continue;
+            const vmo_ref = entry.vmo;
+            entry.* = .{};
+            self.releaseNativeVmo(vmo_ref);
+            return;
+        }
+        return KernelError.InvalidState;
+    }
+
+    pub fn munmapExactWithFreeList(
+        self: *KernelState,
+        owner: PrincipalId,
+        start_va: u64,
+        size_bytes: u64,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes)) return KernelError.InvalidState;
+        const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (entry.start_va != start_va or entry.size_bytes != size_bytes) continue;
+            const vmo_ref = entry.vmo;
+            entry.* = .{};
+            self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
+            return;
+        }
+        return KernelError.InvalidState;
     }
 
     pub fn installFd(
@@ -2780,6 +3321,20 @@ pub const KernelState = struct {
         if (object_ref.isNull()) return KernelError.InvalidState;
         table.entries[index] = .{};
         self.releaseKernelObject(object_ref);
+    }
+
+    pub fn closeFdWithFreeList(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        const table = try self.fdTableForActiveProcess(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const object_ref = table.entries[index].object;
+        if (object_ref.isNull()) return KernelError.InvalidState;
+        table.entries[index] = .{};
+        self.releaseKernelObjectWithFreeList(object_ref, free_list);
     }
 
     pub fn dupFd(
@@ -2917,6 +3472,7 @@ pub const KernelState = struct {
         const new_ipc_pending = allocKernelSlice(?PendingIpcBufferTransfer, free_list, extra_count) orelse return false;
         const new_vm = allocKernelSlice(VmObjectCNode, free_list, extra_count) orelse return false;
         const new_fd = allocKernelSlice(FdTable, free_list, extra_count) orelse return false;
+        const new_vma = allocKernelSlice(VmaTable, free_list, extra_count) orelse return false;
 
         @memcpy(new_desc[0..old_extra_count], self.process_descriptors_extra);
         @memcpy(new_cap[0..old_extra_count], self.cap_tables_extra);
@@ -2928,6 +3484,7 @@ pub const KernelState = struct {
         @memcpy(new_ipc_pending[0..old_extra_count], self.pending_ipc_buffer_transfers_extra);
         @memcpy(new_vm[0..old_extra_count], self.vm_object_tables_extra);
         @memcpy(new_fd[0..old_extra_count], self.fd_tables_extra);
+        @memcpy(new_vma[0..old_extra_count], self.vma_tables_extra);
 
         var i = old_extra_count;
         while (i < extra_count) : (i += 1) {
@@ -2941,6 +3498,7 @@ pub const KernelState = struct {
             new_ipc_pending[i] = null;
             new_vm[i] = .{};
             new_fd[i] = .{};
+            new_vma[i] = .{};
         }
 
         self.process_descriptors_extra = new_desc;
@@ -2953,6 +3511,7 @@ pub const KernelState = struct {
         self.pending_ipc_buffer_transfers_extra = new_ipc_pending;
         self.vm_object_tables_extra = new_vm;
         self.fd_tables_extra = new_fd;
+        self.vma_tables_extra = new_vma;
         self.process_capacity = capacity;
         return true;
     }
@@ -3143,6 +3702,7 @@ pub const KernelState = struct {
         self.capsules = .{};
         self.published_service_endpoints = .{};
         self.resetKernelObjectTable();
+        self.resetNativeVmoTable();
         i = 0;
         while (i < self.process_capacity) : (i += 1) {
             (self.processDescriptorSlot(i) orelse break).* = .{};
@@ -3969,71 +4529,27 @@ pub const KernelState = struct {
         }
     }
 
-    pub fn scanCapTables(self: *const KernelState, paddr: u64) OwnershipView {
-        // デバッグ用: capability 走査から論理的な保持者ビューを作る。
-        var owner: ?PrincipalId = null;
-        var pidx: usize = 0;
-        while (pidx < self.process_capacity) : (pidx += 1) {
-            const principal = processPrincipal(pidx);
-            if (self.capTableForProcessIndexConst(pidx).find(paddr) == null) continue;
-            if (owner != null) return .{ .shared = {} };
-            owner = principal;
-        }
-        if (self.cap_tables[process_count].find(paddr) != null) {
-            if (owner != null) return .{ .shared = {} };
-            owner = .Device0;
-        }
-        if (owner) |principal| return .{ .owner = principal };
-        return .{ .none = {} };
-    }
-
-    fn anyPrincipalHasPageCap(self: *const KernelState, paddr: u64) bool {
-        var pidx: usize = 0;
-        while (pidx < self.process_capacity) : (pidx += 1) {
-            if (self.capTableForProcessIndexConst(pidx).find(paddr) != null) return true;
-        }
-        if (self.cap_tables[process_count].find(paddr) != null) return true;
-        return false;
-    }
-
-    pub fn anyOtherPrincipalHasPageCap(self: *const KernelState, owner: PrincipalId, paddr: u64) bool {
-        const owner_process_index = processIndexFromPrincipal(owner);
-        var pidx: usize = 0;
-        while (pidx < self.process_capacity) : (pidx += 1) {
-            if (owner_process_index != null and pidx == owner_process_index.?) continue;
-            if (self.capTableForProcessIndexConst(pidx).find(paddr) != null) return true;
-        }
-        if (owner != .Device0 and self.cap_tables[process_count].find(paddr) != null) return true;
-        return false;
-    }
-
-    pub fn allocPage(
+    pub fn allocPhysicalPage(
         self: *KernelState,
-        requester: PrincipalId,
         free_list: *FreePageList,
     ) KernelError!PageCapability {
-        _ = requester;
-        _ = self;
         const paddr = free_list.popFrontAtOrAbove(low_memory_limit) catch |err| switch (err) {
             KernelError.OutOfFreePages => try free_list.popFrontBelow(low_memory_limit),
             else => return err,
         };
-        return .{
-            .paddr = paddr,
-        };
+        errdefer free_list.appendPage(0, paddr) catch {};
+        try self.zeroAllocatedPage(paddr);
+        return .{ .paddr = paddr };
     }
 
-    pub fn allocLowPage(
+    pub fn allocLowPhysicalPage(
         self: *KernelState,
-        requester: PrincipalId,
         free_list: *FreePageList,
     ) KernelError!PageCapability {
-        _ = requester;
-        _ = self;
         const paddr = try free_list.popFrontBelow(low_memory_limit);
-        return .{
-            .paddr = paddr,
-        };
+        errdefer free_list.appendPage(0, paddr) catch {};
+        try self.zeroAllocatedPage(paddr);
+        return .{ .paddr = paddr };
     }
 
     fn zeroAllocatedPage(self: *KernelState, paddr: u64) KernelError!void {
@@ -4044,100 +4560,6 @@ pub const KernelState = struct {
         }
         const page_bytes: [*]u8 = @ptrFromInt(paddr);
         @memset(page_bytes[0..4096], 0);
-    }
-
-    fn installAllocatedPageCap(self: *KernelState, requester: PrincipalId, cap: PageCapability) KernelError!PageCapability {
-        try self.requireActiveProcess(requester);
-        const table = self.getTable(requester);
-        if (table.len >= CNode.max_caps) return KernelError.TableFull;
-        try self.zeroAllocatedPage(cap.paddr);
-        if (self.debug_alloc_page_hook) |hook| {
-            hook(self, requester, .after_memset, cap.paddr);
-        }
-        const root_id = self.allocCapId();
-        try table.addAssumeFresh(.{
-            .paddr = cap.paddr,
-            .rights = .{
-                .cpu_read = true,
-                .cpu_write = true,
-                .dma = true,
-                .grant = true,
-            },
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        if (self.debug_alloc_page_hook) |hook| {
-            hook(self, requester, .after_cap_add, cap.paddr);
-        }
-        return cap;
-    }
-
-    pub fn allocPageTo(
-        self: *KernelState,
-        requester: PrincipalId,
-        free_list: *FreePageList,
-    ) KernelError!PageCapability {
-        try self.requireActiveProcess(requester);
-        if (self.getTable(requester).len >= CNode.max_caps) return KernelError.TableFull;
-        const cap = try self.allocPage(requester, free_list);
-        errdefer free_list.appendPage(0, cap.paddr) catch {};
-        if (self.debug_alloc_page_hook) |hook| {
-            hook(self, requester, .after_pop, cap.paddr);
-        }
-        return self.installAllocatedPageCap(requester, cap);
-    }
-
-    pub fn allocLowPageTo(
-        self: *KernelState,
-        requester: PrincipalId,
-        free_list: *FreePageList,
-    ) KernelError!PageCapability {
-        try self.requireActiveProcess(requester);
-        if (self.getTable(requester).len >= CNode.max_caps) return KernelError.TableFull;
-        const cap = try self.allocLowPage(requester, free_list);
-        errdefer free_list.appendPage(0, cap.paddr) catch {};
-        if (self.debug_alloc_page_hook) |hook| {
-            hook(self, requester, .after_pop, cap.paddr);
-        }
-        return self.installAllocatedPageCap(requester, cap);
-    }
-
-    pub fn reclaimExclusiveRootPage(
-        self: *KernelState,
-        owner: PrincipalId,
-        paddr: u64,
-        free_list: *FreePageList,
-    ) KernelError!void {
-        if (!free_list.canAppendPage(0, paddr)) {
-            return KernelError.TooManyFreeRanges;
-        }
-        const table = self.getTable(owner);
-        const cap = table.find(paddr) orelse {
-            return KernelError.CapabilityNotFound;
-        };
-        if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) {
-            return KernelError.InvalidState;
-        }
-        switch (self.scanCapTables(paddr)) {
-            .owner => |actual_owner| if (actual_owner != owner) {
-                return KernelError.InvalidState;
-            },
-            .shared => {
-                return KernelError.InvalidState;
-            },
-            .none => {
-                return KernelError.InvalidState;
-            },
-        }
-        _ = table.removeByPaddr(paddr);
-        _ = self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
-        device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke) catch |err| {
-            return err;
-        };
-        free_list.appendPage(0, paddr) catch |err| {
-            return err;
-        };
     }
 
     pub fn reclaimScannedExclusiveRootPage(

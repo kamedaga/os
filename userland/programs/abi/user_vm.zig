@@ -1,8 +1,5 @@
-const syscall_alloc_page: u64 = 0x1;
-const syscall_map_page: u64 = 0x2;
 const syscall_map_mmio: u64 = 0xB;
 const syscall_alloc_map_pages: u64 = 0xC;
-const syscall_map_page_anywhere: u64 = 0x5C;
 const syscall_alloc_map_pages_anywhere: u64 = 0x5D;
 
 pub const page_bytes: usize = 4096;
@@ -71,9 +68,10 @@ pub fn reservePages(page_count: usize) ?usize {
 }
 
 pub fn allocMapPage(writable: bool) ?MappedPage {
-    const paddr = syscall0(syscall_alloc_page);
-    if (paddr < 0x1000) return null;
-    return mapPageAtDynamicVa(paddr, writable);
+    var paddrs: [1]u64 = .{0};
+    const va = allocMapPagesInto(1, writable, paddrs[0..]) orelse return null;
+    if (paddrs[0] < 0x1000) return null;
+    return .{ .va = va, .paddr = paddrs[0] };
 }
 
 pub fn allocMapPages(page_count: usize, writable: bool) ?usize {
@@ -102,24 +100,22 @@ pub fn allocMapPagesAnywhereInto(page_count: usize, writable: bool, paddrs: []u6
 }
 
 pub fn mapPageAtDynamicVa(paddr: u64, writable: bool) ?MappedPage {
-    if (paddr < 0x1000) return null;
-    const va = reservePages(1) orelse return null;
-    if (!mapPageAtVa(va, paddr, writable)) return null;
-    return .{ .va = va, .paddr = paddr };
+    _ = paddr;
+    _ = writable;
+    return null;
 }
 
 pub fn mapPageAnywhere(paddr: u64, writable: bool) ?MappedPage {
-    if (paddr < 0x1000) return null;
-    const flags: u64 = if (writable) 1 else 0;
-    const va = syscall2(syscall_map_page_anywhere, paddr, flags);
-    if (va < page_bytes) return null;
-    return .{ .va = @intCast(va), .paddr = paddr };
+    _ = paddr;
+    _ = writable;
+    return null;
 }
 
 pub fn mapPageAtVa(va: usize, paddr: u64, writable: bool) bool {
-    if (paddr < 0x1000) return false;
-    const flags: u64 = if (writable) 1 else 0;
-    return syscall3(syscall_map_page, @intCast(va), paddr, flags) == syscall_ok;
+    _ = va;
+    _ = paddr;
+    _ = writable;
+    return false;
 }
 
 pub fn mapMmioPageAtVa(va: usize, paddr: u64, writable: bool) bool {
@@ -129,13 +125,9 @@ pub fn mapMmioPageAtVa(va: usize, paddr: u64, writable: bool) bool {
 }
 
 pub fn mapPagesAtDynamicVa(paddrs: []const u64, writable: bool) ?usize {
-    if (paddrs.len == 0) return null;
-    const va = reservePages(paddrs.len) orelse return null;
-    var index: usize = 0;
-    while (index < paddrs.len) : (index += 1) {
-        if (!mapPageAtVa(va + index * page_bytes, paddrs[index], writable)) return null;
-    }
-    return va;
+    _ = paddrs;
+    _ = writable;
+    return null;
 }
 
 pub fn allocMapPagesInto(page_count: usize, writable: bool, paddrs: []u64) ?usize {

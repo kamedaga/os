@@ -104,7 +104,16 @@ pub fn mapBootFsImageIntoProcessOrHalt(
         const remaining = image.len - copied;
         const chunk_len: usize = if (remaining > 4096) 4096 else remaining;
         @memcpy(dst[0..chunk_len], image[copied .. copied + chunk_len]);
-        process_factory.mapUserPageOrHalt(principal, base_va + @as(u64, @intCast(page_index)) * 4096, page, false, role_label, "bootfs image page");
+        process_factory.mapUserPageOrHalt(
+            state,
+            principal,
+            base_va + @as(u64, @intCast(page_index)) * 4096,
+            page,
+            false,
+            role_label,
+            "bootfs image page",
+            free_list,
+        );
         copied += chunk_len;
     }
     return .{

@@ -300,6 +300,7 @@ fn exitAbiTrapReplyTargetIfRequested(
             h.user_spaces[process_index] = .{};
         }
         h.state.releasePrincipalVmObjectCaps(target.principal, h.free_list);
+        h.state.releasePrincipalNativeMemory(target.principal, h.free_list);
         h.state.resetProcessRuntimeTables(process_index);
     }
     _ = h.state.unpublishServiceEndpointsForTarget(target.principal);
@@ -521,23 +522,16 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
 
     switch (frame.rax) {
         sc.syscall_alloc_page => {
-            const cap = state.allocPageTo(proc, h.free_list) catch return sc.syscall_err_alloc;
-            return cap.paddr;
+            return sc.syscall_err_invalid;
         },
-        sc.syscall_map_page, sc.syscall_map_mmio => {
-            const writable = (frame.rdx & 0x1) != 0;
-            if (capability.mapUserPageFromCapability(state, proc, frame.rdi, frame.rsi, writable)) {
-                return sc.syscall_ok;
-            }
-            return sc.syscall_err_map;
+        sc.syscall_map_page => {
+            return sc.syscall_err_invalid;
+        },
+        sc.syscall_map_mmio => {
+            return sc.syscall_err_invalid;
         },
         sc.syscall_map_page_anywhere => {
-            const writable = (frame.rsi & 0x1) != 0;
-            const map_va = capability.findFreeUserMappingRange(proc, 1, 1) orelse return sc.syscall_err_map;
-            if (capability.mapUserPageFromCapability(state, proc, map_va, frame.rdi, writable)) {
-                return map_va;
-            }
-            return sc.syscall_err_map;
+            return sc.syscall_err_invalid;
         },
         sc.syscall_create_ipc_buffer_from_page => {
             const role = ipc_syscalls.parseIpcBufferRole(frame.rdx) orelse return sc.syscall_err_invalid;
@@ -592,16 +586,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return sc.syscall_err_map;
         },
         sc.syscall_map_pages_batch => {
-            const page_count_u64 = frame.rdx;
-            if (page_count_u64 == 0 or page_count_u64 > sc.syscall_batch_max_pages) return sc.syscall_err_invalid;
-            var paddrs: [sc.syscall_batch_max_pages]u64 = undefined;
-            const page_count: usize = @intCast(page_count_u64);
-            const buf = std.mem.sliceAsBytes(paddrs[0..page_count]);
-            if (!h.copy_user_bytes_from_va(proc, frame.rsi, buf)) return sc.syscall_err_invalid;
-            if (capability.mapUserPagesFromCapabilityBatch(state, proc, frame.rdi, paddrs[0..page_count], (frame.rcx & 0x1) != 0)) {
-                return sc.syscall_ok;
-            }
-            return sc.syscall_err_map;
+            return sc.syscall_err_invalid;
         },
         sc.syscall_alloc_map_pages => {
             const page_count_u64 = frame.rsi;

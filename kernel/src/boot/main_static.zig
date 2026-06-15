@@ -1,6 +1,6 @@
 const abi_root = @import("kernel_abi_root");
 const kernel = @import("../kernel.zig");
-const capability = @import("../capability.zig");
+const address_space = @import("../memory/address_space.zig");
 const pmm = @import("../memory/pmm.zig");
 const scheduler = @import("../scheduler.zig");
 const user_programs = @import("../user_programs.zig");
@@ -62,7 +62,7 @@ pub const debug_skip_cr3_switch = false;
 pub const debug_trigger_page_fault_test = false;
 pub const user_process_count: usize = kernel.process_count;
 pub const user_thread_count: usize = scheduler.max_thread_slots;
-pub const UserAddressSpace = capability.UserAddressSpace;
+pub const UserAddressSpace = address_space.UserAddressSpace;
 
 pub const syscall_alloc_page: u64 = 0x1;
 pub const syscall_map_page: u64 = 0x2;

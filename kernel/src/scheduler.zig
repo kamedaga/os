@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const kernel = @import("kernel.zig");
-const capability = @import("capability.zig");
+const address_space = @import("memory/address_space.zig");
 const interrupts = @import("interrupts.zig");
 const smp = @import("smp.zig");
 const ipc_queue = @import("scheduler_ipc_queue.zig");
@@ -12,7 +12,7 @@ const kernel_log = @import("kernel_log.zig");
 const log_util = @import("log_util.zig");
 
 const TrapFrame = interrupts.TrapFrame;
-const UserAddressSpace = capability.UserAddressSpace;
+const UserAddressSpace = address_space.UserAddressSpace;
 const default_process_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
 const bootstrap_cpu_slot: usize = 0;
 const all_cpu_affinity_mask: u64 = if (smp.max_cpus >= 64) std.math.maxInt(u64) else (@as(u64, 1) << smp.max_cpus) - 1;

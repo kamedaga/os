@@ -10,7 +10,6 @@ const user_vm = @import("abi_root").user_vm;
 
 const syscall_alloc_map_pages: u64 = 0xC;
 const syscall_map_mmio: u64 = 0xB;
-const syscall_map_page: u64 = 0x2;
 const syscall_queue_submit: u64 = 0xE;
 const syscall_queue_notify: u64 = 0xF;
 const syscall_iommu_authorize: u64 = queue_abi.syscall_iommu_authorize;
@@ -266,17 +265,6 @@ fn mapMmioPage(va: u64, paddr: u64, writable: bool) u64 {
         \\syscall
         : [ret] "={rax}" (-> u64),
         : [nr] "{rax}" (syscall_map_mmio),
-          [arg0] "{rdi}" (va),
-          [arg1] "{rsi}" (paddr),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
-    return asm volatile (
-        \\syscall
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_map_page),
           [arg0] "{rdi}" (va),
           [arg1] "{rsi}" (paddr),
           [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
@@ -566,21 +554,13 @@ fn initQueueMemory() bool {
 }
 
 fn initVirtio() bool {
-    while (mapMmioPage(common_page_va, boot_state.common_page_paddr, true) != syscall_ok) {
-        _ = waitEvent(false, 1);
-    }
-    while (mapMmioPage(notify_page_va, boot_state.notify_page_paddr, true) != syscall_ok) {
-        _ = waitEvent(false, 1);
-    }
+    if (mapMmioPage(common_page_va, boot_state.common_page_paddr, true) != syscall_ok) return false;
+    if (mapMmioPage(notify_page_va, boot_state.notify_page_paddr, true) != syscall_ok) return false;
     if (boot_state.isr_page_paddr != 0) {
-        while (mapMmioPage(isr_page_va, boot_state.isr_page_paddr, false) != syscall_ok) {
-            _ = waitEvent(false, 1);
-        }
+        if (mapMmioPage(isr_page_va, boot_state.isr_page_paddr, false) != syscall_ok) return false;
     }
     if (boot_state.device_page_paddr != 0) {
-        while (mapMmioPage(device_page_va, boot_state.device_page_paddr, false) != syscall_ok) {
-            _ = waitEvent(false, 1);
-        }
+        if (mapMmioPage(device_page_va, boot_state.device_page_paddr, false) != syscall_ok) return false;
     }
 
     if (!initQueueMemory()) return false;

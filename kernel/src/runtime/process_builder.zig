@@ -135,6 +135,7 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
         user_spaces_ptr[process_index] = .{};
     }
     state_ptr.releasePrincipalVmObjectCaps(principal, free_list_ptr);
+    state_ptr.releasePrincipalNativeMemory(principal, free_list_ptr);
     state_ptr.resetProcessRuntimeTables(process_index);
     _ = state_ptr.removeProcessDescriptor(principal);
 }
@@ -235,17 +236,6 @@ pub fn mapVmObjectRangeToProcess(
     return boot_static.syscall_ok;
 }
 
-fn rollbackAllocMapPagesToProcess(target: kernel.PrincipalId, target_va: u64, mapped_count: usize, allocated: []const u64) void {
-    if (mapped_count != 0) {
-        _ = user_vm.unmapUserLinearRegion(target, target_va, mapped_count * 4096);
-    }
-    var rollback_index: usize = allocated.len;
-    while (rollback_index > 0) {
-        rollback_index -= 1;
-        state_ptr.reclaimExclusiveRootPage(target, allocated[rollback_index], free_list_ptr) catch {};
-    }
-}
-
 pub fn allocMapPagesToProcess(
     caller: kernel.PrincipalId,
     token: u64,
@@ -262,30 +252,65 @@ pub fn allocMapPagesToProcess(
 
     var allocated: [boot_static.syscall_batch_max_pages]u64 = undefined;
     var allocated_count: usize = 0;
-    var mapped_count: usize = 0;
+    var vma_installed = false;
+    var fd_installed = false;
+    var pages_installed_in_vmo = false;
+    var anon_fd: kernel.Fd = 0;
+    defer {
+        if (vma_installed or fd_installed or !pages_installed_in_vmo) {
+            if (vma_installed) {
+                _ = user_vm.unmapUserLinearRegion(target, target_va, @intCast(page_count * 4096));
+                state_ptr.munmapExactWithFreeList(target, target_va, page_count * 4096, free_list_ptr) catch {};
+            }
+            if (fd_installed) {
+                state_ptr.closeFdWithFreeList(target, anon_fd, free_list_ptr) catch {};
+            }
+            if (!pages_installed_in_vmo) {
+                var rollback_index: usize = allocated_count;
+                while (rollback_index > 0) {
+                    rollback_index -= 1;
+                    free_list_ptr.appendPage(0, allocated[rollback_index]) catch {};
+                }
+            }
+        }
+    }
 
     var page_index: u64 = 0;
     while (page_index < page_count) : (page_index += 1) {
-        const page = state_ptr.allocPageTo(target, free_list_ptr) catch {
-            rollbackAllocMapPagesToProcess(target, target_va, mapped_count, allocated[0..allocated_count]);
-            return boot_static.syscall_err_alloc;
-        };
+        const page = state_ptr.allocPhysicalPage(free_list_ptr) catch return boot_static.syscall_err_alloc;
         allocated[allocated_count] = page.paddr;
         allocated_count += 1;
-        const map_va = target_va + page_index * 4096;
-        if (!user_vm.mapUserLinearRegionWithProt(target, map_va, page.paddr, 4096, prot)) {
-            rollbackAllocMapPagesToProcess(target, target_va, mapped_count, allocated[0..allocated_count]);
-            return boot_static.syscall_err_map;
-        }
-        mapped_count += 1;
         if (out_paddr_list_va != 0) {
             const list_va = out_paddr_list_va + page_index * @sizeOf(u64);
             if (!user_copy.writeUserU64(caller, list_va, page.paddr)) {
-                rollbackAllocMapPagesToProcess(target, target_va, mapped_count, allocated[0..allocated_count]);
                 return boot_static.syscall_err_map;
             }
         }
     }
+
+    anon_fd = state_ptr.createAnonymousVmoFd(target, page_count * 4096, .{
+        .map_read = prot.read,
+        .map_write = prot.write,
+        .map_exec = prot.exec,
+    }, .{ .private = true }, 0) catch return boot_static.syscall_err_alloc;
+    fd_installed = true;
+    const vmo_ref = state_ptr.nativeVmoRefForFd(target, anon_fd) orelse return boot_static.syscall_err_alloc;
+    state_ptr.installNativeVmoPages(vmo_ref, 0, allocated[0..allocated_count]) catch return boot_static.syscall_err_alloc;
+    pages_installed_in_vmo = true;
+
+    _ = state_ptr.mmapFd(target, anon_fd, target_va, page_count * 4096, .{
+        .read = prot.read,
+        .write = prot.write,
+        .exec = prot.exec,
+    }, .{ .anonymous = true, .private = true }, 0) catch return boot_static.syscall_err_map;
+    vma_installed = true;
+
+    if (!user_vm.mapTrustedUserPaddrsWithProt(target, target_va, allocated[0..allocated_count], prot)) {
+        return boot_static.syscall_err_map;
+    }
+    state_ptr.closeFdWithFreeList(target, anon_fd, free_list_ptr) catch return boot_static.syscall_err_map;
+    fd_installed = false;
+    vma_installed = false;
     return boot_static.syscall_ok;
 }
 

@@ -405,6 +405,7 @@ fn teardownTrapTargetProcess(h: *const Hooks, target_proc: kernel.PrincipalId, t
             h.user_spaces[process_index] = .{};
         }
         h.state.releasePrincipalVmObjectCaps(target_proc, h.free_list);
+        h.state.releasePrincipalNativeMemory(target_proc, h.free_list);
         h.state.resetProcessRuntimeTables(process_index);
     }
     _ = h.state.unpublishServiceEndpointsForTarget(target_proc);
@@ -547,23 +548,56 @@ pub fn mapPagesToCurrentReplyTarget(state: *kernel.KernelState, target_va: u64, 
     const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
     const page_count_usize: usize = @intCast(page_count);
 
-    var pages: [boot_static.syscall_batch_max_pages]kernel.PageCapability = undefined;
+    var pages: [boot_static.syscall_batch_max_pages]u64 = undefined;
     var allocated: usize = 0;
-    const cap_table_start_index = h.state.getTableConst(target.proc).len;
-    while (allocated < page_count_usize) : (allocated += 1) {
-        pages[allocated] = h.state.allocPageTo(target.proc, h.free_list) catch {
-            for (pages[0..allocated]) |page| {
-                h.state.reclaimExclusiveRootPage(target.proc, page.paddr, h.free_list) catch {};
+    var vma_installed = false;
+    var fd_installed = false;
+    var pages_installed_in_vmo = false;
+    var anon_fd: kernel.Fd = 0;
+    defer {
+        if (vma_installed or fd_installed or !pages_installed_in_vmo) {
+            if (vma_installed) {
+                _ = user_vm.unmapUserLinearRegion(target.proc, target_va, page_count_usize * 4096);
+                h.state.munmapExactWithFreeList(target.proc, target_va, page_count * 4096, h.free_list) catch {};
             }
-            return boot_static.syscall_err_alloc;
-        };
-    }
-    if (!user_vm.mapFreshUserPageCapabilitiesWithProt(h.state, target.proc, target_va, pages[0..allocated], cap_table_start_index, prot)) {
-        for (pages[0..allocated]) |page| {
-            h.state.reclaimExclusiveRootPage(target.proc, page.paddr, h.free_list) catch {};
+            if (fd_installed) {
+                h.state.closeFdWithFreeList(target.proc, anon_fd, h.free_list) catch {};
+            }
+            if (!pages_installed_in_vmo) {
+                while (allocated > 0) {
+                    allocated -= 1;
+                    h.free_list.appendPage(0, pages[allocated]) catch {};
+                }
+            }
         }
+    }
+    while (allocated < page_count_usize) : (allocated += 1) {
+        pages[allocated] = (h.state.allocPhysicalPage(h.free_list) catch return boot_static.syscall_err_alloc).paddr;
+    }
+
+    anon_fd = h.state.createAnonymousVmoFd(target.proc, page_count * 4096, .{
+        .map_read = prot.read,
+        .map_write = prot.write,
+        .map_exec = prot.exec,
+    }, .{ .private = true }, 0) catch return boot_static.syscall_err_alloc;
+    fd_installed = true;
+    const vmo_ref = h.state.nativeVmoRefForFd(target.proc, anon_fd) orelse return boot_static.syscall_err_alloc;
+    h.state.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]) catch return boot_static.syscall_err_alloc;
+    pages_installed_in_vmo = true;
+
+    _ = h.state.mmapFd(target.proc, anon_fd, target_va, page_count * 4096, .{
+        .read = prot.read,
+        .write = prot.write,
+        .exec = prot.exec,
+    }, .{ .anonymous = true, .private = true }, 0) catch return boot_static.syscall_err_map;
+    vma_installed = true;
+
+    if (!user_vm.mapTrustedUserPaddrsWithProt(target.proc, target_va, pages[0..allocated], prot)) {
         return boot_static.syscall_err_map;
     }
+    h.state.closeFdWithFreeList(target.proc, anon_fd, h.free_list) catch return boot_static.syscall_err_map;
+    fd_installed = false;
+    vma_installed = false;
     return boot_static.syscall_ok;
 }
 
@@ -624,17 +658,10 @@ pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, 
     const h = &h_storage;
     const byte_len = pageBatchByteLen(target_va, page_count) orelse return boot_static.syscall_err_invalid;
     const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    var paddrs: [boot_static.syscall_batch_max_pages]u64 = undefined;
-    const collected = user_vm.collectUserLinearRegionPaddrs(target.proc, target_va, byte_len, paddrs[0..]) orelse return boot_static.syscall_err_map;
-    if (collected != page_count) {
-        return boot_static.syscall_err_map;
-    }
     if (!user_vm.unmapUserLinearRegion(target.proc, target_va, byte_len)) {
         return boot_static.syscall_err_map;
     }
-    for (paddrs[0..@intCast(collected)]) |paddr| {
-        h.state.reclaimExclusiveRootPage(target.proc, paddr, h.free_list) catch {};
-    }
+    h.state.munmapExactWithFreeList(target.proc, target_va, byte_len, h.free_list) catch return boot_static.syscall_err_map;
     return boot_static.syscall_ok;
 }
 

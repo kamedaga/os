@@ -6,8 +6,6 @@ const ipc_buffer_abi = @import("ipc_buffer_abi.zig");
 const service_registry_abi = @import("service_registry_abi.zig");
 const user_vm = @import("user_vm.zig");
 
-const syscall_alloc_page: u64 = 0x1;
-const syscall_map_page: u64 = 0x2;
 const syscall_log: u64 = 0x9;
 const syscall_wait_event: u64 = 0x17;
 const syscall_grant_cap_on_endpoint: u64 = 0x24;
@@ -529,39 +527,7 @@ fn allocConnectPages(request_va: u64, response_va: u64) Error!ConnectPages {
             .response_paddr = paddrs[1],
         };
     }
-    if (request_va == 0 or response_va == 0) return error.Invalid;
-    const request_paddr = allocPage();
-    if (request_paddr < 0x1000) return error.RequestAllocFailed;
-    if (mapPage(request_va, request_paddr, true) != 0) return error.RequestMapFailed;
-
-    const response_paddr = allocPage();
-    if (response_paddr < 0x1000) return error.ResponseAllocFailed;
-    if (mapPage(response_va, response_paddr, true) != 0) return error.ResponseMapFailed;
-    return .{
-        .request_va = request_va,
-        .response_va = response_va,
-        .request_paddr = request_paddr,
-        .response_paddr = response_paddr,
-    };
-}
-
-fn allocPage() u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_alloc_page),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-}
-
-fn mapPage(va: u64, paddr: u64, writable: bool) u64 {
-    return asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (syscall_map_page),
-          [arg0] "{rdi}" (va),
-          [arg1] "{rsi}" (paddr),
-          [arg2] "{rdx}" (@as(u64, if (writable) 1 else 0)),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
+    return error.Invalid;
 }
 
 fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {

@@ -7,6 +7,7 @@ const boot_static = @import("main_static.zig");
 const elf_loader = @import("../elf_loader.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
+const process_factory = @import("process_factory.zig");
 const uefi_services = @import("uefi_services.zig");
 const log_util = @import("../log_util.zig");
 
@@ -71,8 +72,8 @@ pub fn loadUserElfIntoProcessPages(
 
     var page_index: usize = 1;
     while (page_index < required_pages) : (page_index += 1) {
-        const extra_page = state.allocPageTo(principal, free_list) catch |err| {
-            log_util.logIndexedError("loadUserElfIntoProcessPages: allocPageTo failed idx=", page_index, err);
+        const extra_page = state.allocPhysicalPage(free_list) catch |err| {
+            log_util.logIndexedError("loadUserElfIntoProcessPages: allocPhysicalPage failed idx=", page_index, err);
             return null;
         };
         const map_va = boot_static.user_va + (@as(u64, @intCast(page_index)) * 4096);
@@ -80,6 +81,17 @@ pub fn loadUserElfIntoProcessPages(
             log_util.logIndexedMapFailure("loadUserElfIntoProcessPages: map failed idx=", page_index, map_va, extra_page.paddr);
             return null;
         }
+        process_factory.trackMappedNativePageOrHalt(
+            state,
+            principal,
+            map_va,
+            extra_page,
+            true,
+            true,
+            "user elf",
+            "extra load page",
+            free_list,
+        );
         const page_bytes: [*]u8 = @ptrFromInt(extra_page.paddr);
         const off = page_index * 4096;
         @memcpy(page_bytes[0..4096], load_window[off .. off + 4096]);

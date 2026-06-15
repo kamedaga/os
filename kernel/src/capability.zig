@@ -1,50 +1,9 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
+const address_space = @import("memory/address_space.zig");
 
-pub const UserAddressSpace = struct {
-    // Includes user VA mappings plus supervisor-only helper PTs for return stacks.
-    pub const max_dynamic_pdp_pages: usize = 64;
-    pub const max_dynamic_pd_pages: usize = 64;
-    pub const max_dynamic_pt_pages: usize = 512;
-    pub const max_reservations: usize = 2048;
-    pub const no_pd_index: u16 = 0xFFFF;
-
-    pub const ReservationKind = enum(u8) {
-        none = 0,
-        bootstrap = 1,
-        capability_page = 2,
-        fresh_page = 3,
-        linear_region = 4,
-    };
-
-    pub const Reservation = struct {
-        base_va: u64 = 0,
-        page_count: u32 = 0,
-        generation: u32 = 0,
-        kind: ReservationKind = .none,
-        writable: bool = false,
-        active: bool = false,
-    };
-
-    pml4: [512]u64 align(4096) = [_]u64{0} ** 512,
-    pdp_pages: [max_dynamic_pdp_pages][512]u64 align(4096) = [_][512]u64{[_]u64{0} ** 512} ** max_dynamic_pdp_pages,
-    pdp_page_pml4_index: [max_dynamic_pdp_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pdp_pages,
-    pdp_page_used_len: u16 = 0,
-    pd_pages: [max_dynamic_pd_pages][512]u64 align(4096) = [_][512]u64{[_]u64{0} ** 512} ** max_dynamic_pd_pages,
-    pd_page_pml4_index: [max_dynamic_pd_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pd_pages,
-    pd_page_pdp_index: [max_dynamic_pd_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pd_pages,
-    pd_page_used_len: u16 = 0,
-    pt_pages: [max_dynamic_pt_pages][512]u64 align(4096) = [_][512]u64{[_]u64{0} ** 512} ** max_dynamic_pt_pages,
-    pt_page_pml4_index: [max_dynamic_pt_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pt_pages,
-    pt_page_pdp_index: [max_dynamic_pt_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pt_pages,
-    pt_page_pd_index: [max_dynamic_pt_pages]u16 = [_]u16{no_pd_index} ** max_dynamic_pt_pages,
-    pt_page_used_len: u16 = 0,
-    reservations: [max_reservations]Reservation = [_]Reservation{.{}} ** max_reservations,
-    reservation_generation: u32 = 0,
-    next_dynamic_map_page: u64 = 0,
-    cr3: u64 = 0,
-};
+const UserAddressSpace = address_space.UserAddressSpace;
 
 pub const RuntimeConfig = struct {
     user_spaces: []UserAddressSpace,
@@ -804,55 +763,6 @@ pub fn issuePageFaultCapability(
     };
 }
 
-pub fn resolvePageFaultCapability(state: *const kernel.KernelState, pf_cap: PageFaultCapability) bool {
-    if (pf_cap.present_violation) return false;
-    const candidate_paddr = pf_cap.candidate_paddr orelse return false;
-    const cap = state.getTableConst(pf_cap.principal).find(candidate_paddr) orelse return false;
-    if (!cap.rights.cpu_read) return false;
-    if (pf_cap.write_access and !cap.rights.cpu_write) return false;
-    if (pf_cap.instruction_fetch) return false;
-
-    return mapUserPageFromCapability(
-        state,
-        pf_cap.principal,
-        pf_cap.fault_page_va,
-        candidate_paddr,
-        cap.rights.cpu_write,
-    );
-}
-
-pub fn mapUserPageFromCapability(
-    state: *const kernel.KernelState,
-    principal: kernel.PrincipalId,
-    va: u64,
-    paddr: u64,
-    writable: bool,
-) bool {
-    if (!runtime_ready) return false;
-    const space = getUserSpace(principal) orelse return false;
-    if ((va & 0xFFF) != 0) return false;
-    if ((paddr & 0xFFF) != 0) return false;
-    if (paddr >= runtime.physical_map_limit) return false;
-
-    const index = userPageIndexForVa(va) orelse return false;
-    const map_slot = ensurePtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-
-    const cap = state.getTableConst(principal).find(paddr) orelse return false;
-    if (!cap.rights.cpu_read) return false;
-    if (writable and !cap.rights.cpu_write) return false;
-
-    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
-    const old_entry = map_pt_page[index.pt];
-    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) return false;
-    if (!reserveUserMapping(principal, va, 1, .capability_page, writable)) return false;
-
-    clearAliasMappings(space, principal, paddr, map_slot, index.pt);
-
-    map_pt_page[index.pt] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
-    runtime.flush_user_tlb_for_principal_va(principal, va);
-    return true;
-}
-
 pub fn mapTrustedUserPage(
     principal: kernel.PrincipalId,
     va: u64,
@@ -874,95 +784,6 @@ pub fn mapTrustedUserPage(
     if (!reserveUserMapping(principal, va, 1, .capability_page, writable)) return false;
 
     clearAliasMappings(space, principal, paddr, map_slot, index.pt);
-    map_pt_page[index.pt] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
-    runtime.flush_user_tlb_for_principal_va(principal, va);
-    return true;
-}
-
-fn mapUserPageFromCapabilityNoAlias(
-    state: *const kernel.KernelState,
-    principal: kernel.PrincipalId,
-    va: u64,
-    paddr: u64,
-    writable: bool,
-) bool {
-    if (!runtime_ready) return false;
-    const space = getUserSpace(principal) orelse return false;
-    if ((va & 0xFFF) != 0) return false;
-    if ((paddr & 0xFFF) != 0) return false;
-    if (paddr >= runtime.physical_map_limit) return false;
-
-    const index = userPageIndexForVa(va) orelse return false;
-    const map_slot = ensurePtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-
-    const cap = state.getTableConst(principal).find(paddr) orelse return false;
-    if (!cap.rights.cpu_read) return false;
-    if (writable and !cap.rights.cpu_write) return false;
-
-    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
-    const old_entry = map_pt_page[index.pt];
-    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) return false;
-    if (!reserveUserMapping(principal, va, 1, .capability_page, writable)) return false;
-    map_pt_page[index.pt] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
-    runtime.flush_user_tlb_for_principal_va(principal, va);
-    return true;
-}
-
-pub fn mapUserPagesFromCapabilityBatch(
-    state: *const kernel.KernelState,
-    principal: kernel.PrincipalId,
-    base_va: u64,
-    paddrs: []const u64,
-    writable: bool,
-) bool {
-    if (!runtime_ready) return false;
-    if ((base_va & 0xFFF) != 0) return false;
-
-    var i: usize = 0;
-    while (i < paddrs.len) : (i += 1) {
-        const paddr = paddrs[i];
-        if ((paddr & 0xFFF) != 0) return false;
-        if (paddr >= runtime.physical_map_limit) return false;
-
-        var j: usize = 0;
-        while (j < i) : (j += 1) {
-            if (paddrs[j] == paddr) return false;
-        }
-
-        const cap = state.getTableConst(principal).find(paddr) orelse return false;
-        if (!cap.rights.cpu_read) return false;
-        if (writable and !cap.rights.cpu_write) return false;
-    }
-
-    i = 0;
-    while (i < paddrs.len) : (i += 1) {
-        const offset: u64 = @intCast(i * 4096);
-        const va, const va_overflow = @addWithOverflow(base_va, offset);
-        if (va_overflow != 0) return false;
-        if (!mapUserPageFromCapabilityNoAlias(state, principal, va, paddrs[i], writable)) return false;
-    }
-    return true;
-}
-
-pub fn mapFreshUserPage(
-    principal: kernel.PrincipalId,
-    va: u64,
-    paddr: u64,
-    writable: bool,
-) bool {
-    if (!runtime_ready) return false;
-    const space = getUserSpace(principal) orelse return false;
-    if ((va & 0xFFF) != 0) return false;
-    if ((paddr & 0xFFF) != 0) return false;
-    if (paddr >= runtime.physical_map_limit) return false;
-
-    const index = userPageIndexForVa(va) orelse return false;
-    const map_slot = ensurePtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-    const map_pt_page: *[512]u64 = &space.pt_pages[map_slot];
-    const old_entry = map_pt_page[index.pt];
-    if ((old_entry & runtime.page_present) != 0 and (old_entry & runtime.page_user) != 0) return false;
-    if (!reserveUserMapping(principal, va, 1, .fresh_page, writable)) return false;
-
     map_pt_page[index.pt] = paddr | runtime.page_present | runtime.page_user | (if (writable) runtime.page_rw else 0);
     runtime.flush_user_tlb_for_principal_va(principal, va);
     return true;

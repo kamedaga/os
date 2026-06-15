@@ -79,18 +79,13 @@ fn releaseStaleThreadSlot(principal: kernel.PrincipalId) void {
 // Address space helpers
 // ---------------------------------------------------------------------------
 
-pub fn buildUserAddressSpaceFromCapabilities(
-    state: *const kernel.KernelState,
+pub fn buildUserAddressSpaceFromPages(
     principal: kernel.PrincipalId,
     user_page: kernel.PageCapability,
     user_stack_page: kernel.PageCapability,
 ) bool {
-    const table = state.getTableConst(principal);
-    const user_cap = table.find(user_page.paddr) orelse return false;
-    const stack_cap = table.find(user_stack_page.paddr) orelse return false;
-    if (!user_cap.rights.cpu_read or !user_cap.rights.cpu_write) return false;
-    if (!stack_cap.rights.cpu_read or !stack_cap.rights.cpu_write) return false;
-    return user_vm.buildUserAddressSpace(principal, user_cap.paddr, stack_cap.paddr);
+    if ((user_page.paddr & 0xFFF) != 0 or (user_stack_page.paddr & 0xFFF) != 0) return false;
+    return user_vm.buildUserAddressSpace(principal, user_page.paddr, user_stack_page.paddr);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,18 +103,20 @@ pub fn tryCreateUserProcess(
         log_util.logPrefixedLabelMessage("ensureProcessDescriptor failed for ", role_label, "");
         return error.CreateFailed;
     }
-    const user_page = state.allocLowPageTo(principal, free_list) catch |err| {
-        log_util.logLabelStepError("allocLowPageTo for ", role_label, " user map failed", err);
+    const user_page = state.allocLowPhysicalPage(free_list) catch |err| {
+        log_util.logLabelStepError("allocLowPhysicalPage for ", role_label, " user map failed", err);
         return error.CreateFailed;
     };
-    const user_stack_page = state.allocLowPageTo(principal, free_list) catch |err| {
-        log_util.logLabelStepError("allocLowPageTo for ", role_label, " user stack failed", err);
+    const user_stack_page = state.allocLowPhysicalPage(free_list) catch |err| {
+        log_util.logLabelStepError("allocLowPhysicalPage for ", role_label, " user stack failed", err);
         return error.CreateFailed;
     };
-    if (!buildUserAddressSpaceFromCapabilities(state, principal, user_page, user_stack_page)) {
+    if (!buildUserAddressSpaceFromPages(principal, user_page, user_stack_page)) {
         log_util.logLabelMessage(role_label, " process page table build failed");
         return error.CreateFailed;
     }
+    trackMappedNativePageOrHalt(state, principal, boot_static.user_va, user_page, true, true, role_label, "user map", free_list);
+    trackMappedNativePageOrHalt(state, principal, boot_static.user_stack_page_va, user_stack_page, true, false, role_label, "user stack", free_list);
     const thread_slot = scheduler.allocateThreadSlot(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
         log_util.logLabelMessage(role_label, " thread context init failed");
         return error.CreateFailed;
@@ -189,8 +186,11 @@ pub fn allocPageForProcessOrHalt(
     page_label: []const u8,
     free_list: *kernel.FreePageList,
 ) kernel.PageCapability {
-    return state.allocPageTo(principal, free_list) catch |err| {
-        halt.haltWithRolePageError(role_label, page_label, "allocPageTo", err);
+    state.requireActiveProcess(principal) catch |err| {
+        halt.haltWithRolePageError(role_label, page_label, "require active process", err);
+    };
+    return state.allocPhysicalPage(free_list) catch |err| {
+        halt.haltWithRolePageError(role_label, page_label, "allocPhysicalPage", err);
     };
 }
 
@@ -239,16 +239,72 @@ pub fn mapUserLinearRegionOrHalt(
 }
 
 pub fn mapUserPageOrHalt(
+    state: *kernel.KernelState,
     principal: kernel.PrincipalId,
     va_start: u64,
     page: kernel.PageCapability,
     writable: bool,
     role_label: []const u8,
     page_label: []const u8,
+    free_list: *kernel.FreePageList,
 ) void {
     if (!user_vm.mapUserLinearRegion(principal, va_start, page.paddr, 4096, writable)) {
         halt.haltWithRolePageMessage(role_label, page_label, "map failed");
     }
+    trackMappedNativePageOrHalt(state, principal, va_start, page, writable, false, role_label, page_label, free_list);
+}
+
+pub fn trackMappedNativePageOrHalt(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    page: kernel.PageCapability,
+    writable: bool,
+    executable: bool,
+    role_label: []const u8,
+    page_label: []const u8,
+    free_list: *kernel.FreePageList,
+) void {
+    if ((va_start & 0xFFF) != 0 or (page.paddr & 0xFFF) != 0) {
+        halt.haltWithRolePageMessage(role_label, page_label, "unaligned native VMA page");
+    }
+    const fd = state.createAnonymousVmoFd(
+        principal,
+        4096,
+        .{
+            .map_read = true,
+            .map_write = writable,
+            .map_exec = executable,
+            .close = true,
+        },
+        .{ .private = true },
+        0,
+    ) catch |err| {
+        halt.haltWithRolePageError(role_label, page_label, "create native VMO fd", err);
+    };
+    const vmo_ref = state.nativeVmoRefForFd(principal, fd) orelse {
+        halt.haltWithRolePageMessage(role_label, page_label, "native VMO fd missing");
+    };
+    var paddrs = [_]u64{page.paddr};
+    state.installNativeVmoPages(vmo_ref, 0, paddrs[0..]) catch |err| {
+        _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+        halt.haltWithRolePageError(role_label, page_label, "install native VMO page", err);
+    };
+    _ = state.mmapFd(
+        principal,
+        fd,
+        va_start,
+        4096,
+        .{ .read = true, .write = writable, .exec = executable },
+        .{ .anonymous = true, .private = true, .fixed = true },
+        0,
+    ) catch |err| {
+        _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+        halt.haltWithRolePageError(role_label, page_label, "track native VMA", err);
+    };
+    state.closeFdWithFreeList(principal, fd, free_list) catch |err| {
+        halt.haltWithRolePageError(role_label, page_label, "close native VMO fd", err);
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +321,7 @@ pub fn allocAndMapOwnedPageForProcessOrHalt(
     free_list: *kernel.FreePageList,
 ) kernel.PageCapability {
     const page = allocPageForProcessOrHalt(state, principal, role_label, page_label, free_list);
-    mapUserPageOrHalt(principal, va_start, page, writable, role_label, page_label);
+    mapUserPageOrHalt(state, principal, va_start, page, writable, role_label, page_label, free_list);
     return page;
 }
 
@@ -279,7 +335,9 @@ pub fn installAndMapPageForProcessOrHalt(
     page_label: []const u8,
 ) void {
     installPageForProcessOrHalt(state, principal, page, writable, role_label, page_label);
-    mapUserPageOrHalt(principal, va_start, page, writable, role_label, page_label);
+    if (!user_vm.mapUserLinearRegion(principal, va_start, page.paddr, 4096, writable)) {
+        halt.haltWithRolePageMessage(role_label, page_label, "map failed");
+    }
 }
 
 pub fn grantAndMapPageForProcessOrHalt(
@@ -293,7 +351,9 @@ pub fn grantAndMapPageForProcessOrHalt(
     page_label: []const u8,
 ) void {
     grantPageForProcessOrHalt(state, from_principal, to_principal, page, writable, role_label, page_label);
-    mapUserPageOrHalt(to_principal, va_start, page, writable, role_label, page_label);
+    if (!user_vm.mapUserLinearRegion(to_principal, va_start, page.paddr, 4096, writable)) {
+        halt.haltWithRolePageMessage(role_label, page_label, "map failed");
+    }
 }
 
 // ---------------------------------------------------------------------------

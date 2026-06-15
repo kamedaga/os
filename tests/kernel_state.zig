@@ -11,8 +11,10 @@ const p1: PrincipalId = kernel.processPrincipalFromIndex(1) orelse unreachable;
 const p2: PrincipalId = kernel.processPrincipalFromIndex(2) orelse unreachable;
 
 var fd_capacity_backing: [64 * 1024 * 1024]u8 align(4096) = undefined;
+var runtime_storage: [kernel.runtimeStorageBytes()]u8 align(4096) = undefined;
 
 fn initFdState() !KernelState {
+    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
     return KernelState.initFromDetectedRegions(1);
 }
 
@@ -30,6 +32,22 @@ fn fdRights(comptime fields: anytype) kernel.FdRights {
 
 fn fdFlags(comptime fields: anytype) kernel.FdFlags {
     var flags = kernel.FdFlags{};
+    inline for (std.meta.fields(@TypeOf(fields))) |field| {
+        @field(flags, field.name) = @field(fields, field.name);
+    }
+    return flags;
+}
+
+fn vmaProt(comptime fields: anytype) kernel.VmaProt {
+    var prot = kernel.VmaProt{};
+    inline for (std.meta.fields(@TypeOf(fields))) |field| {
+        @field(prot, field.name) = @field(fields, field.name);
+    }
+    return prot;
+}
+
+fn mmapFlags(comptime fields: anytype) kernel.MmapFlags {
+    var flags = kernel.MmapFlags{};
     inline for (std.meta.fields(@TypeOf(fields))) |field| {
         @field(flags, field.name) = @field(fields, field.name);
     }
@@ -172,4 +190,148 @@ test "fd process capacity growth preserves extra fd tables" {
     try std.testing.expect(entry.flags.cloexec);
     try std.testing.expect(entry.rights.dup);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(obj));
+}
+
+test "physical page allocation does not install page capability" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x1_0000_0000, 2);
+    try std.testing.expectEqual(@as(usize, 0), s.getTableConst(p0).len);
+
+    const page = try s.allocPhysicalPage(&free_list);
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000), page.paddr);
+    try std.testing.expectEqual(@as(usize, 0), s.getTableConst(p0).len);
+}
+
+test "anonymous vmo fd maps through vma ledger without page capability install" {
+    var s = try initFdState();
+    const rights = fdRights(.{
+        .dup = true,
+        .map_read = true,
+        .map_write = true,
+        .transfer = true,
+    });
+    const fd = try s.createAnonymousVmoFd(p0, 8192, rights, .{}, 0);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    try std.testing.expectEqual(@as(?u64, 8192), s.nativeVmoSize(vmo));
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
+
+    const mapped = try s.mmapFd(
+        p0,
+        fd,
+        0x4000_0000,
+        8192,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .shared = true }),
+        0,
+    );
+    try std.testing.expectEqual(@as(u64, 0x4000_0000), mapped);
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(vmo));
+    const vma = s.vmaEntryConst(p0, mapped) orelse unreachable;
+    try std.testing.expect(vma.prot.read);
+    try std.testing.expect(vma.prot.write);
+    try std.testing.expect(vma.flags.shared);
+    try std.testing.expectEqual(vmo, vma.vmo);
+}
+
+test "mmap fd rejects rights escalation and overlapping vma" {
+    var s = try initFdState();
+    const fd = try s.createAnonymousVmoFd(p0, 12288, fdRights(.{ .map_read = true }), .{}, 0);
+
+    try std.testing.expectError(KernelError.InvalidState, s.mmapFd(
+        p0,
+        fd,
+        0x4100_0000,
+        4096,
+        vmaProt(.{ .write = true }),
+        .{},
+        0,
+    ));
+
+    _ = try s.mmapFd(p0, fd, 0x4100_0000, 8192, vmaProt(.{ .read = true }), .{}, 0);
+    try std.testing.expectError(KernelError.InvalidState, s.mmapFd(
+        p0,
+        fd,
+        0x4100_1000,
+        4096,
+        vmaProt(.{ .read = true }),
+        .{},
+        0,
+    ));
+}
+
+test "fd close and munmap release native vmo lifetimes independently" {
+    var s = try initFdState();
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    _ = try s.mmapFd(p0, fd, 0x4200_0000, 4096, vmaProt(.{ .read = true }), .{}, 0);
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(vmo));
+
+    try s.closeFd(p0, fd);
+    try std.testing.expect(s.fdEntryConst(p0, fd) == null);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
+
+    try s.munmapExact(p0, 0x4200_0000, 4096);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+    try std.testing.expect(s.vmaEntryConst(p0, 0x4200_0000) == null);
+}
+
+test "process reset releases vma table and native vmo after fd close" {
+    var s = try initFdState();
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    _ = try s.mmapFd(p0, fd, 0x4300_0000, 4096, vmaProt(.{ .read = true }), .{}, 0);
+
+    try s.closeFd(p0, fd);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
+    s.resetProcessRuntimeTables(0);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+    try std.testing.expect(s.vmaEntryConst(p0, 0x4300_0000) == null);
+}
+
+test "native vmo pages return to free list after vma and fd release" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x1_0000_0000, 4);
+    const original_free = free_list.len;
+
+    var pages: [2]u64 = undefined;
+    pages[0] = (try s.allocPhysicalPage(&free_list)).paddr;
+    pages[1] = (try s.allocPhysicalPage(&free_list)).paddr;
+    try std.testing.expectEqual(original_free - 2, free_list.len);
+
+    const fd = try s.createAnonymousVmoFd(p0, 8192, fdRights(.{ .map_read = true, .map_write = true }), .{}, 0);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    try s.installNativeVmoPages(vmo, 0, pages[0..]);
+    try std.testing.expectEqual(@as(?u64, pages[0]), s.nativeVmoPagePaddr(vmo, 0));
+    try std.testing.expectEqual(@as(?u64, pages[1]), s.nativeVmoPagePaddr(vmo, 1));
+
+    _ = try s.mmapFd(p0, fd, 0x4400_0000, 8192, vmaProt(.{ .read = true, .write = true }), mmapFlags(.{ .anonymous = true }), 0);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(original_free - 2, free_list.len);
+    try s.munmapExactWithFreeList(p0, 0x4400_0000, 8192, &free_list);
+    try std.testing.expectEqual(original_free, free_list.len);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+}
+
+test "native vma fault mapping resolves backing page without page capability" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x1_0000_0000, 2);
+    const page = try s.allocPhysicalPage(&free_list);
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    try s.installNativeVmoPages(vmo, 0, &[_]u64{page.paddr});
+    _ = try s.mmapFd(p0, fd, 0x4500_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 0);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+
+    const mapping = s.nativeVmaFaultMapping(p0, 0x4500_0000, false, false) orelse unreachable;
+    try std.testing.expectEqual(page.paddr, mapping.paddr);
+    try std.testing.expect(mapping.prot.read);
+    try std.testing.expect(!mapping.prot.write);
+    try std.testing.expectEqual(@as(usize, 0), s.getTableConst(p0).len);
+
+    try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, true, false) == null);
+    try s.munmapExactWithFreeList(p0, 0x4500_0000, 4096, &free_list);
+    try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, false, false) == null);
 }

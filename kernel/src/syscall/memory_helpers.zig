@@ -28,52 +28,81 @@ pub fn allocMapPages(config: AllocMapPagesConfig) AllocMapPagesError!void {
     var allocated: [sc.syscall_batch_max_pages]u64 = undefined;
     if (config.page_count > allocated.len) return error.InvalidArgument;
     var allocated_count: usize = 0;
-    var mapped_count: usize = 0;
+    var vma_installed = false;
+    var fd_installed = false;
+    var pages_installed_in_vmo = false;
+    var anon_fd: kernel.Fd = 0;
     errdefer {
-        if (mapped_count != 0) {
-            _ = user_vm.unmapUserLinearRegion(config.proc, config.base_va, mapped_count * 4096);
+        if (vma_installed) {
+            _ = user_vm.unmapUserLinearRegion(config.proc, config.base_va, config.page_count * 4096);
+            config.state.munmapExactWithFreeList(config.proc, config.base_va, config.page_count * 4096, config.free_list) catch {};
         }
-        var rollback_index: usize = allocated_count;
-        while (rollback_index > 0) {
-            rollback_index -= 1;
-            config.state.reclaimExclusiveRootPage(config.proc, allocated[rollback_index], config.free_list) catch {};
+        if (fd_installed) {
+            config.state.closeFdWithFreeList(config.proc, anon_fd, config.free_list) catch {};
+        }
+        if (!pages_installed_in_vmo) {
+            var rollback_index: usize = allocated_count;
+            while (rollback_index > 0) {
+                rollback_index -= 1;
+                config.free_list.appendPage(0, allocated[rollback_index]) catch {};
+            }
         }
     }
 
     var i: usize = 0;
     while (i < config.page_count) : (i += 1) {
-        const cap = config.state.allocPageTo(config.proc, config.free_list) catch return error.AllocationFailed;
-        allocated[allocated_count] = cap.paddr;
+        const page = config.state.allocPhysicalPage(config.free_list) catch return error.AllocationFailed;
+        allocated[allocated_count] = page.paddr;
         allocated_count += 1;
         const i_u64: u64 = @intCast(i);
-        const offset_4k, const mul_overflow = @mulWithOverflow(i_u64, @as(u64, 4096));
-        if (mul_overflow != 0) return error.MapFailed;
-        const map_va, const va_overflow = @addWithOverflow(config.base_va, offset_4k);
-        if (va_overflow != 0) return error.MapFailed;
-
-        if (!capability.mapFreshUserPage(config.proc, map_va, cap.paddr, config.writable)) {
-            return error.MapFailed;
-        }
-        mapped_count += 1;
 
         if (config.out_paddr_list_va != 0) {
             const offset_8, const list_mul_overflow = @mulWithOverflow(i_u64, @as(u64, 8));
             if (list_mul_overflow != 0) return error.InvalidArgument;
             const list_va, const list_va_overflow = @addWithOverflow(config.out_paddr_list_va, offset_8);
             if (list_va_overflow != 0) return error.InvalidArgument;
-            if (!config.write_user_u64(config.proc, list_va, cap.paddr)) {
+            if (!config.write_user_u64(config.proc, list_va, page.paddr)) {
                 return error.MapFailed;
             }
         }
 
     }
 
-    if (config.drop_cap_after_map) {
-        var drop_index: usize = 0;
-        while (drop_index < allocated_count) : (drop_index += 1) {
-            _ = config.state.getTable(config.proc).removeByPaddr(allocated[drop_index]);
-        }
+    const byte_count = config.page_count * 4096;
+    var rights = kernel.FdRights{
+        .map_read = true,
+        .map_write = config.writable,
+    };
+    if (config.writable) rights.set_flags = true;
+    anon_fd = config.state.createAnonymousVmoFd(config.proc, byte_count, rights, .{ .private = true }, 0) catch return error.AllocationFailed;
+    fd_installed = true;
+    const vmo_ref = config.state.nativeVmoRefForFd(config.proc, anon_fd) orelse return error.AllocationFailed;
+    config.state.installNativeVmoPages(vmo_ref, 0, allocated[0..allocated_count]) catch return error.AllocationFailed;
+    pages_installed_in_vmo = true;
+
+    _ = config.state.mmapFd(
+        config.proc,
+        anon_fd,
+        config.base_va,
+        byte_count,
+        .{ .read = true, .write = config.writable },
+        .{ .anonymous = true, .private = true },
+        0,
+    ) catch return error.MapFailed;
+    vma_installed = true;
+
+    if (!user_vm.mapTrustedUserPaddrsWithProt(config.proc, config.base_va, allocated[0..config.page_count], .{
+        .read = true,
+        .write = config.writable,
+        .exec = true,
+    })) {
+        return error.MapFailed;
     }
+
+    // Anonymous mmap is owned by the VMA after mapping; no user-visible fd is returned.
+    _ = config.drop_cap_after_map;
+    config.state.closeFdWithFreeList(config.proc, anon_fd, config.free_list) catch return error.MapFailed;
+    fd_installed = false;
 }
 
 pub fn allocMapPagesAnywhere(config: AllocMapPagesConfig) AllocMapPagesError!u64 {

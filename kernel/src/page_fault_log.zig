@@ -100,6 +100,21 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     };
     h.write("  PF_CAP=issued\n");
 
+    if (!h.kernel_state_ready.*) {
+        h.write("  VMA_LOOKUP=kernel_state_not_ready\n");
+        h.write("  CAP_LOOKUP=kernel_state_not_ready\n");
+        return;
+    }
+
+    const vma_mapping = h.state.nativeVmaFaultMapping(
+        pf_cap.principal,
+        pf_cap.fault_page_va,
+        pf_cap.write_access,
+        pf_cap.instruction_fetch,
+    );
+    h.write("  VMA_LOOKUP=");
+    h.write(if (vma_mapping != null) "found(native)\n" else "none(native)\n");
+
     const candidate_paddr = pf_cap.candidate_paddr orelse {
         h.write("  CAND_PADDR=none\n");
         h.write("  CAP_LOOKUP=none\n");
@@ -108,11 +123,6 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     h.write("  CAND_PADDR=");
     h.write_hex_raw(candidate_paddr);
     h.write("\n");
-
-    if (!h.kernel_state_ready.*) {
-        h.write("  CAP_LOOKUP=kernel_state_not_ready\n");
-        return;
-    }
 
     const has_cap = h.state.getTableConst(pf_cap.principal).find(candidate_paddr) != null;
     h.write("  CAP_LOOKUP=");

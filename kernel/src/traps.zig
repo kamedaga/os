@@ -5,6 +5,7 @@ const device_events = @import("device_events.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
 const abi_trap_runtime = @import("runtime/abi_trap.zig");
+const user_vm = @import("memory/user_vm.zig");
 const scheduler = @import("scheduler.zig");
 const smp = @import("smp.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
@@ -889,8 +890,23 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.c) u64 {
     const cr2 = h.read_cr2();
     const pf_cap = capability.issuePageFaultCapability(scheduler.currentUserPrincipal(), frame, cr2) orelse return 0;
     if (!h.kernel_state_ready.*) return 0;
-    if (!capability.resolvePageFaultCapability(h.state, pf_cap) and
-        !abi_trap_runtime.dispatchPageFaultDelegate(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code, frame))
+    if (!pf_cap.present_violation) {
+        if (h.state.nativeVmaFaultMapping(
+            pf_cap.principal,
+            pf_cap.fault_page_va,
+            pf_cap.write_access,
+            pf_cap.instruction_fetch,
+        )) |mapping| {
+            var paddrs = [_]u64{mapping.paddr};
+            if (user_vm.mapTrustedUserPaddrsWithProt(
+                pf_cap.principal,
+                pf_cap.fault_page_va,
+                paddrs[0..],
+                mapping.prot,
+            )) return 1;
+        }
+    }
+    if (!abi_trap_runtime.dispatchPageFaultDelegate(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code, frame))
     {
         return 0;
     }

@@ -499,6 +499,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalVmObjectCaps(principal, &global_free_list);
+    kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
@@ -545,6 +546,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalVmObjectCaps(principal, &global_free_list);
+    kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
@@ -757,7 +759,6 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
         state.setIommuNoCapDriverMode(.off);
         state.iommu_audit_hook = null;
     }
-    state.debug_alloc_page_hook = null;
     state.debug_process_lifecycle_hook = null;
     state.pte_sync_hook = null;
     state.zero_physical_page_hook = user_copy.zeroPhysicalPage;
