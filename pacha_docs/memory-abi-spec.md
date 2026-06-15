@@ -104,6 +104,7 @@ VMA prot <= VMO fd rights
 
 ```text
 vmo_create(size, flags) -> vmo_fd
+vmo_from_current_pages(addr, size, rights, flags) -> vmo_fd
 vmo_resize(vmo_fd, new_size)
 vmo_get_info(vmo_fd, out_info)
 vmo_clone(vmo_fd, offset, size, rights, flags) -> new_vmo_fd
@@ -115,6 +116,8 @@ msync(addr, size, flags)
 ```
 
 `vmo_clone` は rights attenuation と subrange view のために使う。
+
+Phase 3 の実装済み subset は `vmo_create`, `vmo_from_current_pages`, `mmap`, `munmap` である。
 
 ## mmap flags
 

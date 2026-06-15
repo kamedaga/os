@@ -18,6 +18,7 @@ const syscall_lock_policy = @import("syscall/lock_policy.zig");
 const memory_syscalls = @import("syscall/memory_helpers.zig");
 const capsule_syscalls = @import("syscall/capsule.zig");
 const device_syscalls = @import("syscall/device.zig");
+const fd_syscalls = @import("syscall/fd.zig");
 const process_syscalls = @import("syscall/process.zig");
 const vm_object_dispatch = @import("syscall/vm_object.zig");
 const ipc_syscalls = @import("syscall/ipc.zig");
@@ -73,8 +74,6 @@ const KernelStateSpinLock = struct {
 };
 
 var kernel_state_lock: KernelStateSpinLock = .{};
-var vm_object_page_scratch: [kernel.max_vm_object_backing_pages]u64 = undefined;
-
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
 }
@@ -91,7 +90,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_return_writeback_enabled_by_cpu), &syscall_return_writeback_enabled_by_cpu));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_entry_is_lstars), &syscall_entry_is_lstars));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_page_scratch), &vm_object_page_scratch));
     return end;
 }
 
@@ -299,7 +297,6 @@ fn exitAbiTrapReplyTargetIfRequested(
         if (process_index < h.user_spaces.len) {
             h.user_spaces[process_index] = .{};
         }
-        h.state.releasePrincipalVmObjectCaps(target.principal, h.free_list);
         h.state.releasePrincipalNativeMemory(target.principal, h.free_list);
         h.state.resetProcessRuntimeTables(process_index);
     }
@@ -510,10 +507,13 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
     if (device_syscalls.dispatch(h, state, proc, frame)) |result| {
         return result;
     }
+    if (fd_syscalls.dispatch(h, state, proc, frame)) |result| {
+        return result;
+    }
     if (process_syscalls.dispatch(h, state, proc, frame)) |result| {
         return result;
     }
-    if (vm_object_dispatch.dispatch(h, state, proc, frame, &vm_object_page_scratch, h.free_list)) |result| {
+    if (vm_object_dispatch.dispatch(frame)) |result| {
         return result;
     }
     if (abi_trap_syscalls.dispatch(state, proc, frame)) |result| {
@@ -790,11 +790,7 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
             return ipc_syscalls.blockWaitEvent(h, frame, wait_mailbox, false, timeout_ticks);
         },
         sc.syscall_revoke_tree => {
-            if (kernel.decodeVmObjectToken(frame.rdi)) |cap_id| {
-                state.revokeVmObjectCapTree(proc, cap_id, h.free_list) catch return sc.syscall_err_revoke;
-            } else {
-                state.revokeCapTree(proc, frame.rdi) catch return sc.syscall_err_revoke;
-            }
+            state.revokeCapTree(proc, frame.rdi) catch return sc.syscall_err_revoke;
             state.bumpEndpointGeneration();
             scheduler.invalidateAllIpcFastpathState();
             return sc.syscall_ok;

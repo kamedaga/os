@@ -48,6 +48,10 @@ pub const syscall_fd_get_info: u64 = fd_abi.syscall_fd_get_info;
 pub const syscall_fd_set_flags: u64 = fd_abi.syscall_fd_set_flags;
 pub const syscall_fd_wait: u64 = fd_abi.syscall_fd_wait;
 pub const syscall_fd_poll: u64 = fd_abi.syscall_fd_poll;
+pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
+pub const syscall_vmo_from_current_pages: u64 = fd_abi.syscall_vmo_from_current_pages;
+pub const syscall_mmap: u64 = fd_abi.syscall_mmap;
+pub const syscall_munmap: u64 = fd_abi.syscall_munmap;
 
 pub const syscall_set_fs_base_self: u64 = process_abi.syscall_set_fs_base_self;
 pub const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;

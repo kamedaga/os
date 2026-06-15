@@ -134,7 +134,6 @@ fn clearProcessRuntimeState(principal: kernel.PrincipalId) void {
     if (process_index < user_spaces_ptr.len) {
         user_spaces_ptr[process_index] = .{};
     }
-    state_ptr.releasePrincipalVmObjectCaps(principal, free_list_ptr);
     state_ptr.releasePrincipalNativeMemory(principal, free_list_ptr);
     state_ptr.resetProcessRuntimeTables(process_index);
     _ = state_ptr.removeProcessDescriptor(principal);
@@ -161,33 +160,12 @@ pub fn createSuspendedProcess(caller: kernel.PrincipalId) u64 {
 }
 
 pub fn mapVmObjectToProcess(caller: kernel.PrincipalId, token: u64, vm_token: u64, target_va: u64, prot_bits: u64) u64 {
-    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
-    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const vm_cap_id = kernel.decodeVmObjectToken(vm_token) orelse return boot_static.syscall_err_invalid;
-    const vm_cap = state_ptr.getVmObjectTableConst(caller).findByCapId(vm_cap_id) orelse return boot_static.syscall_err_invalid;
-    if (!vm_cap.rights.read or !vm_cap.rights.map) return boot_static.syscall_err_invalid;
-    if (prot.write and !vm_cap.rights.write) return boot_static.syscall_err_invalid;
-    if (vm_cap.backing.page_offset_bytes != 0) return boot_static.syscall_err_invalid;
-    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
-
-    var page_index: usize = 0;
-    while (page_index < vm_cap.backing.page_count) {
-        const run_start = page_index;
-        const run_paddr = vm_cap.backing.pagePaddr(run_start) orelse return boot_static.syscall_err_invalid;
-        var run_len: usize = 1;
-        while (run_start + run_len < vm_cap.backing.page_count) : (run_len += 1) {
-            const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
-            if ((vm_cap.backing.pagePaddr(run_start + run_len) orelse break) != expected) break;
-        }
-        const run_va = target_va + @as(u64, @intCast(run_start)) * 4096;
-        const run_bytes = run_len * 4096;
-        if (!user_vm.mapUserLinearRegionWithProt(target, run_va, run_paddr, run_bytes, prot)) {
-            return boot_static.syscall_err_map;
-        }
-        page_index = run_start + run_len;
-    }
-    return boot_static.syscall_ok;
+    _ = caller;
+    _ = token;
+    _ = vm_token;
+    _ = target_va;
+    _ = prot_bits;
+    return boot_static.syscall_err_invalid;
 }
 
 pub fn mapVmObjectRangeToProcess(
@@ -199,41 +177,14 @@ pub fn mapVmObjectRangeToProcess(
     page_count_raw: u64,
     prot_bits: u64,
 ) u64 {
-    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
-    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const vm_cap_id = kernel.decodeVmObjectToken(vm_token) orelse return boot_static.syscall_err_invalid;
-    const vm_cap = state_ptr.getVmObjectTableConst(caller).findByCapId(vm_cap_id) orelse return boot_static.syscall_err_invalid;
-    if (!vm_cap.rights.read or !vm_cap.rights.map) return boot_static.syscall_err_invalid;
-    if (prot.write and !vm_cap.rights.write) return boot_static.syscall_err_invalid;
-    if (vm_cap.backing.page_offset_bytes != 0) return boot_static.syscall_err_invalid;
-    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
-    if (page_count_raw == 0 or page_count_raw > vm_cap.backing.page_count) return boot_static.syscall_err_invalid;
-    if (object_page_offset > vm_cap.backing.page_count) return boot_static.syscall_err_invalid;
-    if (page_count_raw > vm_cap.backing.page_count - object_page_offset) return boot_static.syscall_err_invalid;
-    const end_va, const end_overflow = @addWithOverflow(target_va, page_count_raw * 4096 - 1);
-    if (end_overflow != 0) return boot_static.syscall_err_invalid;
-    if (!capability.isUserCanonicalVa(target_va) or !capability.isUserCanonicalVa(end_va)) return boot_static.syscall_err_invalid;
-
-    const page_count: usize = @intCast(page_count_raw);
-    const offset: usize = @intCast(object_page_offset);
-    var page_index: usize = 0;
-    while (page_index < page_count) {
-        const run_start = page_index;
-        const run_paddr = vm_cap.backing.pagePaddr(offset + run_start) orelse return boot_static.syscall_err_invalid;
-        var run_len: usize = 1;
-        while (run_start + run_len < page_count) : (run_len += 1) {
-            const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
-            if ((vm_cap.backing.pagePaddr(offset + run_start + run_len) orelse break) != expected) break;
-        }
-        const run_va = target_va + @as(u64, @intCast(run_start)) * 4096;
-        const run_bytes = run_len * 4096;
-        if (!user_vm.mapUserLinearRegionWithProt(target, run_va, run_paddr, run_bytes, prot)) {
-            return boot_static.syscall_err_map;
-        }
-        page_index = run_start + run_len;
-    }
-    return boot_static.syscall_ok;
+    _ = caller;
+    _ = token;
+    _ = vm_token;
+    _ = object_page_offset;
+    _ = target_va;
+    _ = page_count_raw;
+    _ = prot_bits;
+    return boot_static.syscall_err_invalid;
 }
 
 pub fn allocMapPagesToProcess(

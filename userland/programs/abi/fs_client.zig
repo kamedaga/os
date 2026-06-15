@@ -493,7 +493,7 @@ pub const Client = struct {
         if (object_kind != expected_kind) return error.InvalidResponse;
         switch (expected_kind) {
             .open_file => if (!fs_abi.isCapToken(response.result_token)) return error.InvalidResponse,
-            .exec => if (image_abi.decodeVmObjectToken(response.result_token) == null) return error.InvalidResponse,
+            .exec => if (!image_abi.isVmoFd(response.result_token)) return error.InvalidResponse,
             else => return error.InvalidResponse,
         }
         return .{

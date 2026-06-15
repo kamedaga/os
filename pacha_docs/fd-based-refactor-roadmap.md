@@ -432,6 +432,10 @@ Phase 0 の作業入口は [[phase0-checklist]]。
 - shared memory を fd passing で扱う
 - file-backed mmap のための userland FS server protocol を設計する
 
+実装メモは [[phase3-vmo-fd]] に置く。
+
+旧 VM object cap syscall は互換実装を残さず invalid にする。fd passing が入るまでは、別 process userland server からの exec VMO 共有は未完成でよい。
+
 ### Phase 4: FD Passing IPC
 
 - `Endpoint` / `Channel` / `Reply` fd を実装する

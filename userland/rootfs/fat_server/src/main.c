@@ -21,8 +21,7 @@ enum {
     SYSCALL_GRANT_CAP = 0x8,
     SYSCALL_WAIT_EVENT = 0x17,
     SYSCALL_ALLOC_MAP_PAGES = 0xC,
-    SYSCALL_GRANT_VM_OBJECT = 0x1F,
-    SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES = 0x3F,
+    SYSCALL_VMO_FROM_CURRENT_PAGES = 0x108,
     SYSCALL_GRANT_CAP_ON_ENDPOINT = 0x24,
     SYSCALL_INSTALL_ENDPOINT = 0x26,
     SYSCALL_ACCEPT_CAP_TRANSFER = 0x2A,
@@ -56,8 +55,8 @@ enum {
     CAP_TRANSFER_ID_MIN = 0x1000,
     FAT_CONFIG_VA = 0x3C002000,
     FAT_SERVICE_REGISTRY_VA = 0x3C2C0000,
-    FAT_VM_OBJECT_SCRATCH_VA = 0x24000000,
-    FAT_VM_OBJECT_MAX_PAGES = 65535,
+    FAT_VMO_SCRATCH_VA = 0x24000000,
+    FAT_VMO_MAX_PAGES = 65535,
     FAT_CLIENT_BULK_PAGE_COUNT = 256,
     FAT_CLIENT_BULK_BYTES = FAT_CLIENT_BULK_PAGE_COUNT * FS_PAGE_BYTES,
     FAT_BLOCK_BULK_PAGE_COUNT = 32,
@@ -110,9 +109,24 @@ enum {
     BLOCK_REQUEST_PAYLOAD_BYTES = 4096 - BLOCK_REQUEST_HEADER_BYTES,
     BLOCK_RESPONSE_HEADER_BYTES = 56,
     BLOCK_RESPONSE_PAYLOAD_BYTES = 4096 - BLOCK_RESPONSE_HEADER_BYTES,
-    VM_OBJECT_TOKEN_TAG = 1ULL << 62,
-    VM_RIGHT_READ_MAP = 0x5,
-    VM_RIGHT_READ_MAP_GRANT = 0xD,
+    FD_FIRST_DYNAMIC = 16,
+    FD_TABLE_ENTRIES = 256,
+    FD_RIGHT_INSPECT = 1ULL << 0,
+    FD_RIGHT_DUP = 1ULL << 1,
+    FD_RIGHT_TRANSFER = 1ULL << 2,
+    FD_RIGHT_CLOSE = 1ULL << 6,
+    FD_RIGHT_MAP_READ = 1ULL << 13,
+    FD_RIGHT_MAP_WRITE = 1ULL << 14,
+    FD_RIGHT_MAP_EXEC = 1ULL << 15,
+    FD_RIGHT_SHARE = 1ULL << 17,
+    VMO_FD_EXEC_RIGHTS = FD_RIGHT_INSPECT |
+                         FD_RIGHT_DUP |
+                         FD_RIGHT_TRANSFER |
+                         FD_RIGHT_CLOSE |
+                         FD_RIGHT_MAP_READ |
+                         FD_RIGHT_MAP_WRITE |
+                         FD_RIGHT_MAP_EXEC |
+                         FD_RIGHT_SHARE,
 };
 
 struct service_entry {
@@ -266,7 +280,7 @@ struct fat_cached_file {
     u32 *size_bytes;
     u32 cached_cluster_index;
     u32 cached_cluster;
-    u64 vm_token;
+    u64 vmo_fd;
     u32 vm_size_bytes;
 };
 
@@ -328,7 +342,7 @@ struct fat_dynamic_object {
     u32 cached_cluster;
     u32 readdir_cached_cluster_index;
     u32 readdir_cached_cluster;
-    u64 vm_token;
+    u64 vmo_fd;
     u32 vm_size_bytes;
     struct fat_dir_entry_location loc;
     char path[FS_MAX_PATH_BYTES + 1];
@@ -343,8 +357,8 @@ static u32 g_dynamic_object_free_hint = 0;
 static u64 g_prof_block_bulk_requests = 0;
 static u64 g_prof_block_bulk_ticks = 0;
 static u64 g_prof_block_bulk_bytes = 0;
-static u64 g_vm_object_scratch_va = 0;
-static u64 g_vm_object_scratch_pages = 0;
+static u64 g_vmo_scratch_va = 0;
+static u64 g_vmo_scratch_pages = 0;
 static u8 g_data_write_cache[FAT_DATA_WRITE_CACHE_BYTES];
 static u32 g_data_write_cache_first_sector = 0;
 static u32 g_data_write_cache_sector_count = 0;
@@ -466,8 +480,8 @@ static u64 map_page_anywhere(u64 paddr, u64 flags) {
     return syscall2(SYSCALL_MAP_PAGE_ANYWHERE, paddr, flags);
 }
 
-static int is_vm_object_token(u64 token) {
-    return (token & VM_OBJECT_TOKEN_TAG) == VM_OBJECT_TOKEN_TAG && (token & ~VM_OBJECT_TOKEN_TAG) != 0;
+static int is_vmo_fd(u64 fd) {
+    return fd >= FD_FIRST_DYNAMIC && fd < FD_TABLE_ENTRIES;
 }
 
 static u64 alloc_map_pages_anywhere(u64 page_count, u64 flags, u64 out_paddr_list_addr) {
@@ -644,25 +658,25 @@ static int cached_file_ready(const struct fat_cached_file *file) {
     return file && *file->start_cluster >= 2 && *file->size_bytes != 0;
 }
 
-static int ensure_vm_object_scratch(u32 size_bytes) {
+static int ensure_vmo_scratch(u32 size_bytes) {
     const u64 pages = ((u64)size_bytes + FS_PAGE_BYTES - 1) / FS_PAGE_BYTES;
-    if (pages == 0 || pages > FAT_VM_OBJECT_MAX_PAGES) return 0;
-    if (g_vm_object_scratch_va == 0) {
-        g_vm_object_scratch_va = FAT_VM_OBJECT_SCRATCH_VA;
-        g_vm_object_scratch_pages = 0;
+    if (pages == 0 || pages > FAT_VMO_MAX_PAGES) return 0;
+    if (g_vmo_scratch_va == 0) {
+        g_vmo_scratch_va = FAT_VMO_SCRATCH_VA;
+        g_vmo_scratch_pages = 0;
     }
-    while (g_vm_object_scratch_pages < pages) {
-        const u64 remaining = pages - g_vm_object_scratch_pages;
+    while (g_vmo_scratch_pages < pages) {
+        const u64 remaining = pages - g_vmo_scratch_pages;
         const u64 chunk = remaining > 256 ? 256 : remaining;
-        const u64 va = g_vm_object_scratch_va + g_vm_object_scratch_pages * FS_PAGE_BYTES;
+        const u64 va = g_vmo_scratch_va + g_vmo_scratch_pages * FS_PAGE_BYTES;
         if (syscall4(SYSCALL_ALLOC_MAP_PAGES, va, chunk, 1, 0) != SYSCALL_OK) return 0;
-        g_vm_object_scratch_pages += chunk;
+        g_vmo_scratch_pages += chunk;
     }
     return 1;
 }
 
-static u64 install_file_vm_object(u32 start_cluster, u32 size_bytes, u32 *cached_cluster_index, u32 *cached_cluster) {
-    if (!ensure_vm_object_scratch(size_bytes)) return 0;
+static u64 create_file_vmo_fd(u32 start_cluster, u32 size_bytes, u32 *cached_cluster_index, u32 *cached_cluster) {
+    if (!ensure_vmo_scratch(size_bytes)) return 0;
     const u32 copied = read_file_payload_to(
         start_cluster,
         size_bytes,
@@ -670,23 +684,17 @@ static u64 install_file_vm_object(u32 start_cluster, u32 size_bytes, u32 *cached
         size_bytes,
         cached_cluster_index,
         cached_cluster,
-        (volatile u8 *)g_vm_object_scratch_va,
+        (volatile u8 *)g_vmo_scratch_va,
         size_bytes
     );
     if (copied != size_bytes) return 0;
     const u32 aligned_size = (size_bytes + FS_PAGE_BYTES - 1) & ~(FS_PAGE_BYTES - 1);
     for (u32 i = size_bytes; i < aligned_size; i++) {
-        ((volatile u8 *)g_vm_object_scratch_va)[i] = 0;
+        ((volatile u8 *)g_vmo_scratch_va)[i] = 0;
     }
-    const u64 token = syscall3(SYSCALL_CREATE_VM_OBJECT_FROM_CURRENT_PAGES, g_vm_object_scratch_va, size_bytes, VM_RIGHT_READ_MAP_GRANT);
-    if (is_vm_object_token(token)) g_vm_object_scratch_pages = 0;
-    return is_vm_object_token(token) ? token : 0;
-}
-
-static u64 grant_vm_object_to_client(u64 vm_token) {
-    if (!is_vm_object_token(vm_token) || g_session.process_slot == 0) return 0;
-    const u64 granted = syscall3(SYSCALL_GRANT_VM_OBJECT, vm_token, g_session.process_slot, VM_RIGHT_READ_MAP_GRANT);
-    return is_vm_object_token(granted) ? granted : 0;
+    const u64 fd = syscall3(SYSCALL_VMO_FROM_CURRENT_PAGES, g_vmo_scratch_va, size_bytes, VMO_FD_EXEC_RIGHTS);
+    if (is_vmo_fd(fd)) g_vmo_scratch_pages = 0;
+    return is_vmo_fd(fd) ? fd : 0;
 }
 
 static int cached_file_path_equals_cstr(const char *path, const char *cached) {
@@ -2967,7 +2975,7 @@ static void refresh_dynamic_object_by_path(const char *path, u32 first_cluster, 
         g_dynamic_objects[hashed_slot].first_cluster = first_cluster;
         g_dynamic_objects[hashed_slot].size_bytes = size_bytes;
         reset_dynamic_object_cluster_caches(&g_dynamic_objects[hashed_slot], first_cluster);
-        g_dynamic_objects[hashed_slot].vm_token = 0;
+        g_dynamic_objects[hashed_slot].vmo_fd = 0;
         g_dynamic_objects[hashed_slot].vm_size_bytes = 0;
         return;
     }
@@ -2985,7 +2993,7 @@ static void refresh_dynamic_object_by_path(const char *path, u32 first_cluster, 
         g_dynamic_objects[i].first_cluster = first_cluster;
         g_dynamic_objects[i].size_bytes = size_bytes;
         reset_dynamic_object_cluster_caches(&g_dynamic_objects[i], first_cluster);
-        g_dynamic_objects[i].vm_token = 0;
+        g_dynamic_objects[i].vmo_fd = 0;
         g_dynamic_objects[i].vm_size_bytes = 0;
     }
 }
@@ -3518,7 +3526,7 @@ static int fat_truncate_object(struct fat_dynamic_object *object, u64 size, u32 
     }
 
     object->size_bytes = new_size;
-    object->vm_token = 0;
+    object->vmo_fd = 0;
     object->vm_size_bytes = 0;
     object->dirent_dirty = 1;
     if (!flush_fat_write_cache()) return FS_STATUS_IO_ERROR;
@@ -3926,35 +3934,34 @@ static void reply_file_lookup(u16 op, u64 seq, const struct fat_cached_file *fil
     write_response(op, seq, FS_STATUS_OK, token_from_object_id(file->file_object_id), *file->size_bytes, 0, FS_OBJECT_FILE, 0);
 }
 
-static u64 cached_file_vm_object_token(struct fat_cached_file *file) {
+static u64 cached_file_vmo_fd(struct fat_cached_file *file) {
     if (!cached_file_ready(file)) return 0;
-    if (is_vm_object_token(file->vm_token) && file->vm_size_bytes == *file->size_bytes) return file->vm_token;
-    const u64 token = install_file_vm_object(*file->start_cluster, *file->size_bytes, &file->cached_cluster_index, &file->cached_cluster);
-    if (!is_vm_object_token(token)) return 0;
-    file->vm_token = token;
+    if (is_vmo_fd(file->vmo_fd) && file->vm_size_bytes == *file->size_bytes) return file->vmo_fd;
+    const u64 fd = create_file_vmo_fd(*file->start_cluster, *file->size_bytes, &file->cached_cluster_index, &file->cached_cluster);
+    if (!is_vmo_fd(fd)) return 0;
+    file->vmo_fd = fd;
     file->vm_size_bytes = *file->size_bytes;
-    return token;
+    return fd;
 }
 
-static u64 dynamic_file_vm_object_token(struct fat_dynamic_object *object) {
+static u64 dynamic_file_vmo_fd(struct fat_dynamic_object *object) {
     if (!object || fat_attr_is_dir(object->attr) || fat_attr_is_symlink(object->attr) || object->first_cluster < 2 || object->size_bytes == 0) return 0;
-    if (is_vm_object_token(object->vm_token) && object->vm_size_bytes == object->size_bytes) return object->vm_token;
-    const u64 token = install_file_vm_object(object->first_cluster, object->size_bytes, &object->cached_cluster_index, &object->cached_cluster);
-    if (!is_vm_object_token(token)) return 0;
-    object->vm_token = token;
+    if (is_vmo_fd(object->vmo_fd) && object->vm_size_bytes == object->size_bytes) return object->vmo_fd;
+    const u64 fd = create_file_vmo_fd(object->first_cluster, object->size_bytes, &object->cached_cluster_index, &object->cached_cluster);
+    if (!is_vmo_fd(fd)) return 0;
+    object->vmo_fd = fd;
     object->vm_size_bytes = object->size_bytes;
-    return token;
+    return fd;
 }
 
 static void reply_file_open(u16 op, u64 seq, const struct fat_cached_file *file) {
     clear_page(g_session.response_va);
-    u64 granted_vm = 0;
+    u64 exec_vmo_fd = 0;
     if (op == FS_OP_OPEN_EXEC) {
         struct fat_cached_file *mutable_file = (struct fat_cached_file *)file;
-        const u64 source_vm = cached_file_vm_object_token(mutable_file);
-        granted_vm = grant_vm_object_to_client(source_vm);
+        exec_vmo_fd = cached_file_vmo_fd(mutable_file);
     }
-    write_response_ex(op, seq, FS_STATUS_OK, token_from_object_id(file->open_object_id), *file->size_bytes, 0, FS_OBJECT_OPEN_FILE, 0, granted_vm);
+    write_response_ex(op, seq, FS_STATUS_OK, token_from_object_id(file->open_object_id), *file->size_bytes, 0, FS_OBJECT_OPEN_FILE, 0, exec_vmo_fd);
 }
 
 static void reply_file_read(u64 seq, struct fat_cached_file *file, u64 offset, u32 length) {
@@ -4081,12 +4088,11 @@ static void reply_dynamic_lookup(u16 op, u64 seq, u64 object_id, struct fat_dyna
 static void reply_dynamic_open(u16 op, u64 seq, u64 object_id, struct fat_dynamic_object *object) {
     clear_page(g_session.response_va);
     const u64 base_id = is_dynamic_open_object_id(object_id) ? FAT_DYNAMIC_OBJECT_ID_BASE + (object_id - FAT_DYNAMIC_OPEN_OBJECT_ID_BASE) : object_id;
-    u64 granted_vm = 0;
+    u64 exec_vmo_fd = 0;
     if (op == FS_OP_OPEN_EXEC) {
-        const u64 source_vm = dynamic_file_vm_object_token(object);
-        granted_vm = grant_vm_object_to_client(source_vm);
+        exec_vmo_fd = dynamic_file_vmo_fd(object);
     }
-    write_response_ex(op, seq, FS_STATUS_OK, token_from_object_id(FAT_DYNAMIC_OPEN_OBJECT_ID_BASE + (base_id - FAT_DYNAMIC_OBJECT_ID_BASE)), object->size_bytes, 0, FS_OBJECT_OPEN_FILE, 0, granted_vm);
+    write_response_ex(op, seq, FS_STATUS_OK, token_from_object_id(FAT_DYNAMIC_OPEN_OBJECT_ID_BASE + (base_id - FAT_DYNAMIC_OBJECT_ID_BASE)), object->size_bytes, 0, FS_OBJECT_OPEN_FILE, 0, exec_vmo_fd);
 }
 
 static void reply_dynamic_read(u64 seq, struct fat_dynamic_object *object, u64 offset, u32 length) {

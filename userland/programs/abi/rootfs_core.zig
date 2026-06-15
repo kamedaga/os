@@ -1,4 +1,5 @@
 const std = @import("std");
+const fd_abi = @import("fd_abi.zig");
 const image_abi = @import("image_abi.zig");
 const layout = @import("persistent_fs_layout");
 const queue_abi = @import("queue_abi.zig");
@@ -219,24 +220,16 @@ fn waitEvent(wait_mailbox: bool, timeout_ticks: u64) u64 {
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-fn installVmObject(base_va: u64, size_bytes: u64, rights: image_abi.VmObjectRights) u64 {
-    const token = asm volatile (
+fn createVmoFdFromCurrentPages(base_va: u64, size_bytes: u64, rights: u64) u64 {
+    return asm volatile (
         \\int $0x80
         : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (image_abi.syscall_create_vm_object_from_current_pages),
+        : [nr] "{rax}" (fd_abi.syscall_vmo_from_current_pages),
           [arg0] "{rdi}" (base_va),
           [arg1] "{rsi}" (size_bytes),
-          [arg2] "{rdx}" (image_abi.vmObjectRightsToBits(rights)),
+          [arg2] "{rdx}" (rights),
+          [arg3] "{rcx}" (@as(u64, 0)),
         : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-    if (image_abi.decodeVmObjectToken(token) == null) return token;
-    const remap = asm volatile (
-        \\int $0x80
-        : [ret] "={rax}" (-> u64),
-        : [nr] "{rax}" (image_abi.syscall_map_vm_object),
-          [arg0] "{rdi}" (token),
-          [arg1] "{rsi}" (base_va),
-        : .{ .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
-    return if (remap == 0) token else remap;
 }
 
 fn waitMapMmioPage(va: u64, paddr: u64, writable: bool) bool {
@@ -540,10 +533,10 @@ fn loadExec(entry: *const layout.VolumeDirEntry) ?OpenExecResult {
     if (readFileEntry(entry, 0, dst[0..@intCast(entry.file_size)])) |bytes_read| {
         if (bytes_read != entry.file_size) return null;
     } else return null;
-    const vm_token = installVmObject(slot.base_va, entry.file_size, .{ .read = true, .write = true, .map = true, .grant = true });
-    if (image_abi.decodeVmObjectToken(vm_token) == null) return null;
+    const vmo_fd = createVmoFdFromCurrentPages(slot.base_va, entry.file_size, image_abi.exec_vmo_rights);
+    if (!image_abi.isVmoFd(vmo_fd)) return null;
     return .{
-        .token = vm_token,
+        .token = vmo_fd,
         .file_bytes = entry.file_size,
     };
 }

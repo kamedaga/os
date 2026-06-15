@@ -404,7 +404,6 @@ fn teardownTrapTargetProcess(h: *const Hooks, target_proc: kernel.PrincipalId, t
         if (process_index < h.user_spaces.len) {
             h.user_spaces[process_index] = .{};
         }
-        h.state.releasePrincipalVmObjectCaps(target_proc, h.free_list);
         h.state.releasePrincipalNativeMemory(target_proc, h.free_list);
         h.state.resetProcessRuntimeTables(process_index);
     }
@@ -620,37 +619,14 @@ pub fn mapVmObjectRangeToCurrentReplyTarget(
     page_count_raw: u64,
     prot_bits: u64,
 ) u64 {
-    const target = currentReplyTarget() orelse return boot_static.syscall_err_endpoint;
-    const prot = protFromBits(prot_bits) orelse return boot_static.syscall_err_invalid;
-    const vm_cap_id = kernel.decodeVmObjectToken(vm_token) orelse return boot_static.syscall_err_invalid;
-    const vm_cap = state.getVmObjectTableConst(proc).findByCapId(vm_cap_id) orelse return boot_static.syscall_err_invalid;
-    if (!vm_cap.rights.read or !vm_cap.rights.map) return boot_static.syscall_err_invalid;
-    if (prot.write and !vm_cap.rights.write) return boot_static.syscall_err_invalid;
-    if (vm_cap.backing.page_offset_bytes != 0) return boot_static.syscall_err_invalid;
-    if ((target_va & 0xFFF) != 0) return boot_static.syscall_err_invalid;
-    if (page_count_raw == 0 or page_count_raw > vm_cap.backing.page_count) return boot_static.syscall_err_invalid;
-    if (object_page_offset > vm_cap.backing.page_count) return boot_static.syscall_err_invalid;
-    if (page_count_raw > vm_cap.backing.page_count - object_page_offset) return boot_static.syscall_err_invalid;
-
-    const page_count: usize = @intCast(page_count_raw);
-    const offset: usize = @intCast(object_page_offset);
-    var page_index: usize = 0;
-    while (page_index < page_count) {
-        const run_start = page_index;
-        const run_paddr = vm_cap.backing.pagePaddr(offset + run_start) orelse return boot_static.syscall_err_invalid;
-        var run_len: usize = 1;
-        while (run_start + run_len < page_count) : (run_len += 1) {
-            const expected = run_paddr + @as(u64, @intCast(run_len)) * 4096;
-            if ((vm_cap.backing.pagePaddr(offset + run_start + run_len) orelse break) != expected) break;
-        }
-        const run_va = target_va + @as(u64, @intCast(run_start)) * 4096;
-        const run_bytes = run_len * 4096;
-        if (!user_vm.mapUserLinearRegionWithProt(target.proc, run_va, run_paddr, run_bytes, prot)) {
-            return boot_static.syscall_err_map;
-        }
-        page_index = run_start + run_len;
-    }
-    return boot_static.syscall_ok;
+    _ = state;
+    _ = proc;
+    _ = vm_token;
+    _ = object_page_offset;
+    _ = target_va;
+    _ = page_count_raw;
+    _ = prot_bits;
+    return boot_static.syscall_err_invalid;
 }
 
 pub fn unmapCurrentReplyTargetPages(state: *kernel.KernelState, target_va: u64, page_count: u64) u64 {

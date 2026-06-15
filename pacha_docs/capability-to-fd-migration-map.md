@@ -80,6 +80,8 @@ Phase 0 ではこの表を使って、削除対象、互換 shim、先に fd 化
 | `syscall_release_vm_object` | `fd_close` + `munmap` | lifetime と mapping を分離 |
 | `syscall_drop_vm_object` | `fd_close` | close に統合 |
 
+Phase 3 では旧 VM object syscall は互換実装を持たず invalid を返す。`vmo_from_current_pages` は旧 token 生成ではなく VMO fd 生成であり、fd passing がない経路は Phase 4 まで未完成として扱う。
+
 ## Process builder syscalls
 
 | 旧 syscall | 新 API | 方針 |

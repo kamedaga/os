@@ -14,20 +14,6 @@ pub const device_count: usize = 1;
 pub const device_principal_raw: u32 = @intCast(max_process_slots);
 pub const principal_count: usize = process_count + device_count;
 pub const cap_transfer_id_min: u64 = 0x1000;
-pub const vm_object_token_tag: u64 = 1 << 62;
-
-pub fn encodeVmObjectToken(cap_id: u64) u64 {
-    std.debug.assert(cap_id != 0);
-    std.debug.assert((cap_id & vm_object_token_tag) == 0);
-    return vm_object_token_tag | cap_id;
-}
-
-pub fn decodeVmObjectToken(token: u64) ?u64 {
-    if ((token & vm_object_token_tag) == 0) return null;
-    const cap_id = token & ~vm_object_token_tag;
-    if (cap_id == 0) return null;
-    return cap_id;
-}
 
 pub const PrincipalRaw = u32;
 
@@ -200,7 +186,6 @@ pub const DebugProcessLifecycleReason = enum(u8) {
 pub const KernelError = error{
     RegionNotFound,
     CapabilityNotFound,
-    VmObjectCapabilityNotFound,
     EndpointNotFound,
     MailboxEmpty,
     RevokeOverflow,
@@ -342,6 +327,14 @@ pub const FdEntry = struct {
     pub fn isEmpty(self: *const FdEntry) bool {
         return self.object.isNull();
     }
+};
+
+pub const FdInfo = struct {
+    kind: KernelObjectKind = .none,
+    rights_bits: u64 = 0,
+    flags_bits: u32 = 0,
+    size_bytes: u64 = 0,
+    extra: u64 = 0,
 };
 
 pub const FdTable = struct {
@@ -861,8 +854,8 @@ fn pageCapRefUniqueCount() u64 {
 fn vmObjectBackingFreePageCount() u64 {
     var pages: u64 = 0;
     var i: usize = 0;
-    while (i < vm_object_backing_page_store_free_range_len) : (i += 1) {
-        pages += vm_object_backing_page_store_free_ranges[i].len;
+    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
+        pages += vmo_backing_page_store_free_ranges[i].len;
     }
     return pages;
 }
@@ -1243,38 +1236,38 @@ fn freeIpcBufferMailboxChunks(head: u16) void {
     }
 }
 
-pub const max_vm_object_backing_pages: usize = 65535;
-pub const max_vm_object_backing_store_pages: usize = 262144;
-pub const max_vm_object_backing_store_free_ranges: usize = 1024;
+pub const max_vmo_backing_pages: usize = 65535;
+pub const max_vmo_backing_store_pages: usize = 262144;
+pub const max_vmo_backing_store_free_ranges: usize = 1024;
 
-var empty_vm_object_backing_page_store: [0]u64 = .{};
-var vm_object_backing_page_store: []u64 = empty_vm_object_backing_page_store[0..];
-var vm_object_backing_page_store_next: usize = 0;
+var empty_vmo_backing_page_store: [0]u64 = .{};
+var vmo_backing_page_store: []u64 = empty_vmo_backing_page_store[0..];
+var vmo_backing_page_store_next: usize = 0;
 
-const VmObjectBackingStoreFreeRange = struct {
+const VmoBackingStoreFreeRange = struct {
     start: u32 = 0,
     len: u32 = 0,
 };
 
-var empty_vm_object_backing_page_store_free_ranges: [0]VmObjectBackingStoreFreeRange = .{};
-var vm_object_backing_page_store_free_ranges: []VmObjectBackingStoreFreeRange = empty_vm_object_backing_page_store_free_ranges[0..];
-var vm_object_backing_page_store_free_range_len: usize = 0;
+var empty_vmo_backing_page_store_free_ranges: [0]VmoBackingStoreFreeRange = .{};
+var vmo_backing_page_store_free_ranges: []VmoBackingStoreFreeRange = empty_vmo_backing_page_store_free_ranges[0..];
+var vmo_backing_page_store_free_range_len: usize = 0;
 
-fn removeVmObjectBackingFreeRange(index: usize) void {
+fn removeVmoBackingFreeRange(index: usize) void {
     var i = index + 1;
-    while (i < vm_object_backing_page_store_free_range_len) : (i += 1) {
-        vm_object_backing_page_store_free_ranges[i - 1] = vm_object_backing_page_store_free_ranges[i];
+    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
+        vmo_backing_page_store_free_ranges[i - 1] = vmo_backing_page_store_free_ranges[i];
     }
-    vm_object_backing_page_store_free_range_len -= 1;
+    vmo_backing_page_store_free_range_len -= 1;
 }
 
-fn insertVmObjectBackingFreeRange(start: u32, len: u32) bool {
+fn insertVmoBackingFreeRange(start: u32, len: u32) bool {
     if (len == 0) return true;
     var merged_start = start;
     var merged_len = len;
     var i: usize = 0;
-    while (i < vm_object_backing_page_store_free_range_len) {
-        const range = vm_object_backing_page_store_free_ranges[i];
+    while (i < vmo_backing_page_store_free_range_len) {
+        const range = vmo_backing_page_store_free_ranges[i];
         const range_end = range.start + range.len;
         const merged_end = merged_start + merged_len;
         if (range_end < merged_start or merged_end < range.start) {
@@ -1284,298 +1277,74 @@ fn insertVmObjectBackingFreeRange(start: u32, len: u32) bool {
         if (range.start < merged_start) merged_start = range.start;
         const new_end = if (range_end > merged_end) range_end else merged_end;
         merged_len = new_end - merged_start;
-        removeVmObjectBackingFreeRange(i);
+        removeVmoBackingFreeRange(i);
     }
-    if (vm_object_backing_page_store_free_range_len >= vm_object_backing_page_store_free_ranges.len) return false;
-    vm_object_backing_page_store_free_ranges[vm_object_backing_page_store_free_range_len] = .{
+    if (vmo_backing_page_store_free_range_len >= vmo_backing_page_store_free_ranges.len) return false;
+    vmo_backing_page_store_free_ranges[vmo_backing_page_store_free_range_len] = .{
         .start = merged_start,
         .len = merged_len,
     };
-    vm_object_backing_page_store_free_range_len += 1;
+    vmo_backing_page_store_free_range_len += 1;
     return true;
 }
 
-fn allocVmObjectBackingPageStore(page_paddrs: []const u64) ?u32 {
-    if (page_paddrs.len == 0 or page_paddrs.len > max_vm_object_backing_pages) return null;
+fn allocEmptyVmoBackingPageStore(page_count: usize) ?u32 {
+    if (page_count == 0 or page_count > max_vmo_backing_pages) return null;
     var start: usize = 0;
     var free_index: ?usize = null;
     var i: usize = 0;
-    while (i < vm_object_backing_page_store_free_range_len) : (i += 1) {
-        if (vm_object_backing_page_store_free_ranges[i].len < page_paddrs.len) continue;
-        start = vm_object_backing_page_store_free_ranges[i].start;
-        free_index = i;
-        break;
-    }
-    if (free_index) |index| {
-        const consumed: u32 = @intCast(page_paddrs.len);
-        vm_object_backing_page_store_free_ranges[index].start += consumed;
-        vm_object_backing_page_store_free_ranges[index].len -= consumed;
-        if (vm_object_backing_page_store_free_ranges[index].len == 0) removeVmObjectBackingFreeRange(index);
-    } else {
-        if (vm_object_backing_page_store_next + page_paddrs.len > vm_object_backing_page_store.len) return null;
-        start = vm_object_backing_page_store_next;
-        vm_object_backing_page_store_next += page_paddrs.len;
-    }
-    for (page_paddrs, 0..) |paddr, page_index| {
-        if ((paddr & 0xFFF) != 0) return null;
-        vm_object_backing_page_store[start + page_index] = paddr;
-    }
-    return @intCast(start);
-}
-
-fn allocEmptyVmObjectBackingPageStore(page_count: usize) ?u32 {
-    if (page_count == 0 or page_count > max_vm_object_backing_pages) return null;
-    var start: usize = 0;
-    var free_index: ?usize = null;
-    var i: usize = 0;
-    while (i < vm_object_backing_page_store_free_range_len) : (i += 1) {
-        if (vm_object_backing_page_store_free_ranges[i].len < page_count) continue;
-        start = vm_object_backing_page_store_free_ranges[i].start;
+    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
+        if (vmo_backing_page_store_free_ranges[i].len < page_count) continue;
+        start = vmo_backing_page_store_free_ranges[i].start;
         free_index = i;
         break;
     }
     if (free_index) |index| {
         const consumed: u32 = @intCast(page_count);
-        vm_object_backing_page_store_free_ranges[index].start += consumed;
-        vm_object_backing_page_store_free_ranges[index].len -= consumed;
-        if (vm_object_backing_page_store_free_ranges[index].len == 0) removeVmObjectBackingFreeRange(index);
+        vmo_backing_page_store_free_ranges[index].start += consumed;
+        vmo_backing_page_store_free_ranges[index].len -= consumed;
+        if (vmo_backing_page_store_free_ranges[index].len == 0) removeVmoBackingFreeRange(index);
     } else {
-        if (vm_object_backing_page_store_next + page_count > vm_object_backing_page_store.len) return null;
-        start = vm_object_backing_page_store_next;
-        vm_object_backing_page_store_next += page_count;
+        if (vmo_backing_page_store_next + page_count > vmo_backing_page_store.len) return null;
+        start = vmo_backing_page_store_next;
+        vmo_backing_page_store_next += page_count;
     }
-    @memset(vm_object_backing_page_store[start .. start + page_count], 0);
+    @memset(vmo_backing_page_store[start .. start + page_count], 0);
     return @intCast(start);
 }
 
-fn vmObjectBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize) ?u64 {
+fn vmoBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize) ?u64 {
     if (page_index >= page_count) return null;
     const store_index = @as(usize, start) + page_index;
-    if (store_index >= vm_object_backing_page_store.len) return null;
-    const paddr = vm_object_backing_page_store[store_index];
+    if (store_index >= vmo_backing_page_store.len) return null;
+    const paddr = vmo_backing_page_store[store_index];
     if ((paddr & 0xFFF) != 0) return null;
     return paddr;
 }
 
-fn setVmObjectBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize, paddr: u64) bool {
+fn setVmoBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize, paddr: u64) bool {
     if ((paddr & 0xFFF) != 0) return false;
     if (page_index >= page_count) return false;
     const store_index = @as(usize, start) + page_index;
-    if (store_index >= vm_object_backing_page_store.len) return false;
-    vm_object_backing_page_store[store_index] = paddr;
+    if (store_index >= vmo_backing_page_store.len) return false;
+    vmo_backing_page_store[store_index] = paddr;
     return true;
 }
 
-fn freeVmObjectBackingPageStore(start: u32, page_count: u16) bool {
+fn freeVmoBackingPageStore(start: u32, page_count: u16) bool {
     if (page_count == 0) return true;
     const start_usize: usize = @intCast(start);
     const count_usize: usize = @intCast(page_count);
-    if (start_usize + count_usize > vm_object_backing_page_store.len) return false;
-    @memset(vm_object_backing_page_store[start_usize .. start_usize + count_usize], 0);
-    return insertVmObjectBackingFreeRange(start, page_count);
+    if (start_usize + count_usize > vmo_backing_page_store.len) return false;
+    @memset(vmo_backing_page_store[start_usize .. start_usize + count_usize], 0);
+    return insertVmoBackingFreeRange(start, page_count);
 }
 
-fn resetVmObjectBackingPageStore() void {
-    @memset(vm_object_backing_page_store[0..], 0);
-    @memset(vm_object_backing_page_store_free_ranges[0..], .{});
-    vm_object_backing_page_store_next = 0;
-    vm_object_backing_page_store_free_range_len = 0;
-}
-
-pub const VmObjectRights = packed struct(u32) {
-    read: bool = false,
-    write: bool = false,
-    map: bool = false,
-    grant: bool = false,
-    _reserved: u28 = 0,
-};
-
-pub fn vmObjectRightsFromBits(bits: u64) VmObjectRights {
-    return @bitCast(@as(u32, @truncate(bits)));
-}
-
-pub const VmObjectBacking = struct {
-    page_offset_bytes: u16 = 0,
-    page_count: u16 = 0,
-    page_store_start: u32 = 0,
-    size_bytes: u64 = 0,
-
-    fn init(page_paddrs: []const u64, page_offset_bytes: u16, size_bytes: u64) ?VmObjectBacking {
-        if (page_paddrs.len == 0 or page_paddrs.len > max_vm_object_backing_pages) return null;
-        if (size_bytes == 0) return null;
-        const first_page_bytes = @as(u64, 4096 - page_offset_bytes);
-        const total_capacity = first_page_bytes + (@as(u64, @intCast(page_paddrs.len - 1)) * 4096);
-        if (total_capacity < size_bytes) return null;
-
-        const page_store_start = allocVmObjectBackingPageStore(page_paddrs) orelse return null;
-        return VmObjectBacking{
-            .page_offset_bytes = page_offset_bytes,
-            .page_count = @intCast(page_paddrs.len),
-            .page_store_start = page_store_start,
-            .size_bytes = size_bytes,
-        };
-    }
-
-    pub fn pagePaddr(self: *const VmObjectBacking, page_index: usize) ?u64 {
-        if (page_index >= self.page_count) return null;
-        const store_index = @as(usize, self.page_store_start) + page_index;
-        if (store_index >= vm_object_backing_page_store.len) return null;
-        const paddr = vm_object_backing_page_store[store_index];
-        if ((paddr & 0xFFF) != 0) return null;
-        return paddr;
-    }
-};
-
-pub const VmObjectCapability = struct {
-    backing: VmObjectBacking,
-    rights: VmObjectRights,
-    cap_id: u64,
-    root_cap_id: u64,
-    parent_cap_id: u64,
-};
-
-pub const VmObjectCNode = struct {
-    pub const inline_caps = 64;
-    pub const chunk_caps = 64;
-    pub const chunk_pool_count = 256;
-    pub const max_caps = inline_caps + chunk_pool_count * chunk_caps;
-    const invalid_chunk: u16 = std.math.maxInt(u16);
-
-    caps: [inline_caps]VmObjectCapability = undefined,
-    overflow_head: u16 = invalid_chunk,
-    len: usize = 0,
-
-    pub fn add(self: *VmObjectCNode, cap: VmObjectCapability) KernelError!void {
-        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
-        const slot = try self.slotAtOrAllocate(self.len);
-        slot.* = cap;
-        self.len += 1;
-    }
-
-    pub fn reset(self: *VmObjectCNode) void {
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            const next = vm_object_cap_chunk_pool[chunk_index].next;
-            vm_object_cap_chunk_pool[chunk_index] = .{};
-            chunk_index = next;
-        }
-        self.* = .{};
-    }
-
-    pub fn findByCapId(self: *const VmObjectCNode, cap_id: u64) ?*const VmObjectCapability {
-        if (self.findIndexByCapId(cap_id)) |index| return self.slotAtConst(index);
-        return null;
-    }
-
-    pub fn removeByCapId(self: *VmObjectCNode, cap_id: u64) ?VmObjectCapability {
-        const index = self.findIndexByCapId(cap_id) orelse return null;
-        const removed = (self.slotAt(index) orelse return null).*;
-        const last_index = self.len - 1;
-        if (index != last_index) {
-            (self.slotAt(index) orelse return null).* = (self.slotAt(last_index) orelse return null).*;
-        }
-        self.len -= 1;
-        self.trimUnusedChunks();
-        return removed;
-    }
-
-    fn findIndexByCapId(self: *const VmObjectCNode, cap_id: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            const cap = self.slotAtConst(i) orelse return null;
-            if (cap.cap_id == cap_id) return i;
-        }
-        return null;
-    }
-
-    fn slotAtConst(self: *const VmObjectCNode, index: usize) ?*const VmObjectCapability {
-        if (index < inline_caps) return &self.caps[index];
-        var remaining = index - inline_caps;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_caps) return &vm_object_cap_chunk_pool[chunk_index].caps[remaining];
-            remaining -= chunk_caps;
-            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAt(self: *VmObjectCNode, index: usize) ?*VmObjectCapability {
-        if (index < inline_caps) return &self.caps[index];
-        var remaining = index - inline_caps;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_caps) return &vm_object_cap_chunk_pool[chunk_index].caps[remaining];
-            remaining -= chunk_caps;
-            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAtOrAllocate(self: *VmObjectCNode, index: usize) KernelError!*VmObjectCapability {
-        if (index < inline_caps) return &self.caps[index];
-        const needed_chunk_offset = (index - inline_caps) / chunk_caps;
-        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
-        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocVmObjectCapChunk();
-
-        var chunk_index = self.overflow_head;
-        var offset: usize = 0;
-        while (offset < needed_chunk_offset) : (offset += 1) {
-            if (vm_object_cap_chunk_pool[chunk_index].next == invalid_chunk) {
-                vm_object_cap_chunk_pool[chunk_index].next = try allocVmObjectCapChunk();
-            }
-            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
-        }
-        return &vm_object_cap_chunk_pool[chunk_index].caps[(index - inline_caps) % chunk_caps];
-    }
-
-    fn trimUnusedChunks(self: *VmObjectCNode) void {
-        if (self.overflow_head == invalid_chunk) return;
-        const needed_chunks = if (self.len <= inline_caps) 0 else ((self.len - inline_caps + chunk_caps - 1) / chunk_caps);
-        if (needed_chunks == 0) {
-            var chunk_index = self.overflow_head;
-            while (chunk_index != invalid_chunk) {
-                const next = vm_object_cap_chunk_pool[chunk_index].next;
-                vm_object_cap_chunk_pool[chunk_index] = .{};
-                chunk_index = next;
-            }
-            self.overflow_head = invalid_chunk;
-            return;
-        }
-
-        var chunk_index = self.overflow_head;
-        var offset: usize = 1;
-        while (offset < needed_chunks and chunk_index != invalid_chunk) : (offset += 1) {
-            chunk_index = vm_object_cap_chunk_pool[chunk_index].next;
-        }
-        if (chunk_index == invalid_chunk) return;
-        var free_index = vm_object_cap_chunk_pool[chunk_index].next;
-        vm_object_cap_chunk_pool[chunk_index].next = invalid_chunk;
-        while (free_index != invalid_chunk) {
-            const next = vm_object_cap_chunk_pool[free_index].next;
-            vm_object_cap_chunk_pool[free_index] = .{};
-            free_index = next;
-        }
-    }
-};
-
-const VmObjectCapChunk = struct {
-    used: bool = false,
-    next: u16 = VmObjectCNode.invalid_chunk,
-    caps: [VmObjectCNode.chunk_caps]VmObjectCapability = undefined,
-};
-
-var empty_vm_object_cap_chunk_pool: [0]VmObjectCapChunk = .{};
-var vm_object_cap_chunk_pool: []VmObjectCapChunk = empty_vm_object_cap_chunk_pool[0..];
-
-fn allocVmObjectCapChunk() KernelError!u16 {
-    var i: usize = 0;
-    while (i < vm_object_cap_chunk_pool.len) : (i += 1) {
-        if (vm_object_cap_chunk_pool[i].used) continue;
-        vm_object_cap_chunk_pool[i] = .{ .used = true };
-        return @intCast(i);
-    }
-    return KernelError.TableFull;
+fn resetVmoBackingPageStore() void {
+    @memset(vmo_backing_page_store[0..], 0);
+    @memset(vmo_backing_page_store_free_ranges[0..], .{});
+    vmo_backing_page_store_next = 0;
+    vmo_backing_page_store_free_range_len = 0;
 }
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
@@ -1589,11 +1358,10 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cap_chunk_pool), &cap_chunk_pool));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store), &vm_object_backing_page_store));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store_next), &vm_object_backing_page_store_next));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store_free_ranges), &vm_object_backing_page_store_free_ranges));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_backing_page_store_free_range_len), &vm_object_backing_page_store_free_range_len));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vm_object_cap_chunk_pool), &vm_object_cap_chunk_pool));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store), &vmo_backing_page_store));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_next), &vmo_backing_page_store_next));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_free_ranges), &vmo_backing_page_store_free_ranges));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_free_range_len), &vmo_backing_page_store_free_range_len));
     return end;
 }
 
@@ -1618,11 +1386,9 @@ pub fn runtimeStorageBytes() usize {
     cursor = std.mem.alignForward(usize, cursor, @alignOf(PageCapRefEntry));
     cursor += @sizeOf(PageCapRefEntry) * page_cap_ref_slots;
     cursor = std.mem.alignForward(usize, cursor, @alignOf(u64));
-    cursor += @sizeOf(u64) * max_vm_object_backing_store_pages;
-    cursor = std.mem.alignForward(usize, cursor, @alignOf(VmObjectBackingStoreFreeRange));
-    cursor += @sizeOf(VmObjectBackingStoreFreeRange) * max_vm_object_backing_store_free_ranges;
-    cursor = std.mem.alignForward(usize, cursor, @alignOf(VmObjectCapChunk));
-    cursor += @sizeOf(VmObjectCapChunk) * VmObjectCNode.chunk_pool_count;
+    cursor += @sizeOf(u64) * max_vmo_backing_store_pages;
+    cursor = std.mem.alignForward(usize, cursor, @alignOf(VmoBackingStoreFreeRange));
+    cursor += @sizeOf(VmoBackingStoreFreeRange) * max_vmo_backing_store_free_ranges;
     return std.mem.alignForward(usize, cursor, 4096);
 }
 
@@ -1630,18 +1396,16 @@ pub fn initRuntimeStorage(storage: []align(4096) u8) bool {
     var cursor: usize = 0;
     cap_chunk_pool = runtimeStorageSlice(CapChunk, storage, &cursor, CNode.chunk_pool_count) orelse return false;
     page_cap_refs = runtimeStorageSlice(PageCapRefEntry, storage, &cursor, page_cap_ref_slots) orelse return false;
-    vm_object_backing_page_store = runtimeStorageSlice(u64, storage, &cursor, max_vm_object_backing_store_pages) orelse return false;
-    vm_object_backing_page_store_free_ranges = runtimeStorageSlice(VmObjectBackingStoreFreeRange, storage, &cursor, max_vm_object_backing_store_free_ranges) orelse return false;
-    vm_object_cap_chunk_pool = runtimeStorageSlice(VmObjectCapChunk, storage, &cursor, VmObjectCNode.chunk_pool_count) orelse return false;
+    vmo_backing_page_store = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
+    vmo_backing_page_store_free_ranges = runtimeStorageSlice(VmoBackingStoreFreeRange, storage, &cursor, max_vmo_backing_store_free_ranges) orelse return false;
 
     @memset(cap_chunk_pool, .{});
     @memset(page_cap_refs, .{});
-    @memset(vm_object_backing_page_store, 0);
-    @memset(vm_object_backing_page_store_free_ranges, .{});
-    @memset(vm_object_cap_chunk_pool, .{});
+    @memset(vmo_backing_page_store, 0);
+    @memset(vmo_backing_page_store_free_ranges, .{});
     page_cap_ref_overflow = false;
-    vm_object_backing_page_store_next = 0;
-    vm_object_backing_page_store_free_range_len = 0;
+    vmo_backing_page_store_next = 0;
+    vmo_backing_page_store_free_range_len = 0;
     return true;
 }
 
@@ -2010,7 +1774,6 @@ var empty_pending_page_transfers_extra: [0]?PendingCapTransfer = .{};
 var empty_ipc_buffer_tables_extra: [0]IpcBufferCNode = .{};
 var empty_ipc_buffer_mailboxes_extra: [0]IpcBufferMailbox = .{};
 var empty_pending_ipc_buffer_transfers_extra: [0]?PendingIpcBufferTransfer = .{};
-var empty_vm_object_tables_extra: [0]VmObjectCNode = .{};
 var empty_fd_tables_extra: [0]FdTable = .{};
 var empty_vma_tables_extra: [0]VmaTable = .{};
 
@@ -2036,7 +1799,6 @@ pub const KernelState = struct {
     ipc_buffer_tables: [principal_count]IpcBufferCNode = [_]IpcBufferCNode{.{}} ** principal_count,
     ipc_buffer_mailboxes: [principal_count]IpcBufferMailbox = [_]IpcBufferMailbox{.{}} ** principal_count,
     pending_ipc_buffer_transfers: [principal_count]?PendingIpcBufferTransfer = [_]?PendingIpcBufferTransfer{null} ** principal_count,
-    vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
     fd_tables: [process_count]FdTable = [_]FdTable{.{}} ** process_count,
     vma_tables: [process_count]VmaTable = [_]VmaTable{.{}} ** process_count,
     cap_mailboxes_extra: []CapMailbox = empty_cap_mailboxes_extra[0..],
@@ -2044,7 +1806,6 @@ pub const KernelState = struct {
     ipc_buffer_tables_extra: []IpcBufferCNode = empty_ipc_buffer_tables_extra[0..],
     ipc_buffer_mailboxes_extra: []IpcBufferMailbox = empty_ipc_buffer_mailboxes_extra[0..],
     pending_ipc_buffer_transfers_extra: []?PendingIpcBufferTransfer = empty_pending_ipc_buffer_transfers_extra[0..],
-    vm_object_tables_extra: []VmObjectCNode = empty_vm_object_tables_extra[0..],
     fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
     vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
     fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
@@ -2123,7 +1884,7 @@ pub const KernelState = struct {
     fn clearNativeVmoSlot(slot: *NativeVmoSlot) void {
         const next_generation = nextObjectGeneration(slot.generation);
         if (slot.page_count != 0) {
-            _ = freeVmObjectBackingPageStore(slot.page_store_start, slot.page_count);
+            _ = freeVmoBackingPageStore(slot.page_store_start, slot.page_count);
         }
         slot.* = .{ .generation = next_generation };
     }
@@ -2131,11 +1892,11 @@ pub const KernelState = struct {
     fn releaseNativeVmoOwnedPages(slot: *NativeVmoSlot, free_list: *FreePageList) void {
         var page_index: usize = 0;
         while (page_index < slot.page_count) : (page_index += 1) {
-            const paddr = vmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse continue;
+            const paddr = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse continue;
             if (paddr == 0) continue;
             if (free_list.canAppendPage(0, paddr)) {
                 free_list.appendPage(0, paddr) catch {};
-                _ = setVmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index, 0);
+                _ = setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index, 0);
             }
         }
     }
@@ -2144,14 +1905,14 @@ pub const KernelState = struct {
         if (kind == .none or size_bytes == 0) return KernelError.InvalidState;
         const aligned_size = pageAlignUp(size_bytes);
         const page_count_u64 = aligned_size / native_page_size;
-        if (page_count_u64 == 0 or page_count_u64 > max_vm_object_backing_pages) return KernelError.InvalidState;
+        if (page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return KernelError.InvalidState;
         const page_count: u16 = @intCast(page_count_u64);
         var offset: usize = 0;
         while (offset < max_native_vmos) : (offset += 1) {
             const index = (self.next_native_vmo_scan + offset) % max_native_vmos;
             const slot = &self.native_vmos[index];
             if (slot.kind != .none or slot.ref_count != 0) continue;
-            const page_store_start = allocEmptyVmObjectBackingPageStore(page_count) orelse return KernelError.TableFull;
+            const page_store_start = allocEmptyVmoBackingPageStore(page_count) orelse return KernelError.TableFull;
             if (slot.generation == 0) slot.generation = 1;
             slot.kind = kind;
             slot.size_bytes = aligned_size;
@@ -2202,7 +1963,7 @@ pub const KernelState = struct {
 
     pub fn nativeVmoPagePaddr(self: *const KernelState, vmo_ref: NativeVmoRef, page_index: usize) ?u64 {
         const slot = self.nativeVmoSlotConst(vmo_ref) orelse return null;
-        const paddr = vmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse return null;
+        const paddr = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse return null;
         if (paddr == 0) return null;
         return paddr;
     }
@@ -2218,10 +1979,10 @@ pub const KernelState = struct {
         if (page_offset > slot.page_count or paddrs.len > @as(usize, slot.page_count) - page_offset) return KernelError.InvalidState;
         for (paddrs, 0..) |paddr, i| {
             if ((paddr & 0xFFF) != 0) return KernelError.InvalidState;
-            if (vmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i) != 0) return KernelError.InvalidState;
+            if (vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i) != 0) return KernelError.InvalidState;
         }
         for (paddrs, 0..) |paddr, i| {
-            if (!setVmObjectBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i, paddr)) {
+            if (!setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i, paddr)) {
                 return KernelError.InvalidState;
             }
         }
@@ -2543,12 +2304,6 @@ pub const KernelState = struct {
             (!child.cpu_write or parent.cpu_write) and
             (!child.dma or parent.dma) and
             (!child.grant or parent.grant);
-    }
-
-    fn isVmObjectRightsSubset(child: VmObjectRights, parent: VmObjectRights) bool {
-        const child_bits: u32 = @bitCast(child);
-        const parent_bits: u32 = @bitCast(parent);
-        return (child_bits & ~parent_bits) == 0;
     }
 
     fn isIpcBufferRightsSubset(child: IpcBufferRights, parent: IpcBufferRights) bool {
@@ -2971,16 +2726,6 @@ pub const KernelState = struct {
         return &self.pending_ipc_buffer_transfers[self.principalStorageIndex(principal)];
     }
 
-    fn vmObjectTableForProcessIndex(self: *KernelState, index: usize) *VmObjectCNode {
-        if (extraIndex(index)) |extra| return &self.vm_object_tables_extra[extra];
-        return &self.vm_object_tables[index];
-    }
-
-    fn vmObjectTableForProcessIndexConst(self: *const KernelState, index: usize) *const VmObjectCNode {
-        if (extraIndex(index)) |extra| return &self.vm_object_tables_extra[extra];
-        return &self.vm_object_tables[index];
-    }
-
     fn fdTableForProcessIndex(self: *KernelState, index: usize) ?*FdTable {
         if (index >= self.process_capacity) return null;
         if (extraIndex(index)) |extra| return &self.fd_tables_extra[extra];
@@ -3168,7 +2913,6 @@ pub const KernelState = struct {
         self.ipcBufferTableForProcessIndex(index).* = .{};
         self.ipcBufferMailboxForProcessIndex(index).reset();
         self.pendingIpcBufferTransferForProcessIndex(index).* = null;
-        self.vmObjectTableForProcessIndex(index).reset();
     }
 
     fn findFreeVma(table: *const VmaTable) ?usize {
@@ -3213,6 +2957,53 @@ pub const KernelState = struct {
             if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
             return err;
         };
+    }
+
+    pub fn createAnonymousVmoFdWithPages(
+        self: *KernelState,
+        owner: PrincipalId,
+        size_bytes: u64,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+        free_list: *FreePageList,
+    ) KernelError!Fd {
+        const aligned_size = pageAlignUp(size_bytes);
+        const page_count_u64 = aligned_size / native_page_size;
+        if (size_bytes == 0 or page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return KernelError.InvalidState;
+        const fd = try self.createAnonymousVmoFd(owner, aligned_size, rights, flags, min_fd);
+        errdefer self.closeFdWithFreeList(owner, fd, free_list) catch {};
+        const vmo_ref = self.nativeVmoRefForFd(owner, fd) orelse return KernelError.InvalidState;
+        var pages: [max_vmo_backing_pages]u64 = undefined;
+        var allocated: usize = 0;
+        errdefer {
+            while (allocated > 0) {
+                allocated -= 1;
+                free_list.appendPage(0, pages[allocated]) catch {};
+            }
+        }
+        while (allocated < page_count_u64) : (allocated += 1) {
+            pages[allocated] = (try self.allocPhysicalPage(free_list)).paddr;
+        }
+        try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]);
+        return fd;
+    }
+
+    pub fn fdInfo(self: *const KernelState, owner: PrincipalId, fd: Fd) ?FdInfo {
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        var info = FdInfo{
+            .kind = slot.kind,
+            .rights_bits = fdRightsToBits(entry.rights),
+            .flags_bits = fdFlagsToBits(entry.flags),
+        };
+        switch (slot.payload) {
+            .vmo => |vmo_ref| {
+                info.size_bytes = self.nativeVmoSize(vmo_ref) orelse 0;
+            },
+            else => {},
+        }
+        return info;
     }
 
     pub fn mmapFd(
@@ -3470,7 +3261,6 @@ pub const KernelState = struct {
         const new_ipc_buffer = allocKernelSlice(IpcBufferCNode, free_list, extra_count) orelse return false;
         const new_ipc_mailbox = allocKernelSlice(IpcBufferMailbox, free_list, extra_count) orelse return false;
         const new_ipc_pending = allocKernelSlice(?PendingIpcBufferTransfer, free_list, extra_count) orelse return false;
-        const new_vm = allocKernelSlice(VmObjectCNode, free_list, extra_count) orelse return false;
         const new_fd = allocKernelSlice(FdTable, free_list, extra_count) orelse return false;
         const new_vma = allocKernelSlice(VmaTable, free_list, extra_count) orelse return false;
 
@@ -3482,7 +3272,6 @@ pub const KernelState = struct {
         @memcpy(new_ipc_buffer[0..old_extra_count], self.ipc_buffer_tables_extra);
         @memcpy(new_ipc_mailbox[0..old_extra_count], self.ipc_buffer_mailboxes_extra);
         @memcpy(new_ipc_pending[0..old_extra_count], self.pending_ipc_buffer_transfers_extra);
-        @memcpy(new_vm[0..old_extra_count], self.vm_object_tables_extra);
         @memcpy(new_fd[0..old_extra_count], self.fd_tables_extra);
         @memcpy(new_vma[0..old_extra_count], self.vma_tables_extra);
 
@@ -3496,7 +3285,6 @@ pub const KernelState = struct {
             new_ipc_buffer[i] = .{};
             new_ipc_mailbox[i] = .{};
             new_ipc_pending[i] = null;
-            new_vm[i] = .{};
             new_fd[i] = .{};
             new_vma[i] = .{};
         }
@@ -3509,7 +3297,6 @@ pub const KernelState = struct {
         self.ipc_buffer_tables_extra = new_ipc_buffer;
         self.ipc_buffer_mailboxes_extra = new_ipc_mailbox;
         self.pending_ipc_buffer_transfers_extra = new_ipc_pending;
-        self.vm_object_tables_extra = new_vm;
         self.fd_tables_extra = new_fd;
         self.vma_tables_extra = new_vma;
         self.process_capacity = capacity;
@@ -3697,8 +3484,7 @@ pub const KernelState = struct {
         self.ipc_buffer_tables[process_count] = .{};
         self.ipc_buffer_mailboxes[process_count].reset();
         self.pending_ipc_buffer_transfers[process_count] = null;
-        self.vm_object_tables[process_count].reset();
-        resetVmObjectBackingPageStore();
+        resetVmoBackingPageStore();
         self.capsules = .{};
         self.published_service_endpoints = .{};
         self.resetKernelObjectTable();
@@ -3987,16 +3773,6 @@ pub const KernelState = struct {
         return removed;
     }
 
-    pub fn getVmObjectTable(self: *KernelState, principal: PrincipalId) *VmObjectCNode {
-        if (processIndexFromPrincipal(principal)) |index| return self.vmObjectTableForProcessIndex(index);
-        return &self.vm_object_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getVmObjectTableConst(self: *const KernelState, principal: PrincipalId) *const VmObjectCNode {
-        if (processIndexFromPrincipal(principal)) |index| return self.vmObjectTableForProcessIndexConst(index);
-        return &self.vm_object_tables[self.principalStorageIndex(principal)];
-    }
-
     pub fn getIpcBufferTable(self: *KernelState, principal: PrincipalId) *IpcBufferCNode {
         if (processIndexFromPrincipal(principal)) |index| return self.ipcBufferTableForProcessIndex(index);
         return &self.ipc_buffer_tables[self.principalStorageIndex(principal)];
@@ -4157,195 +3933,6 @@ pub const KernelState = struct {
         });
     }
 
-    pub fn installVmObjectCap(
-        self: *KernelState,
-        owner: PrincipalId,
-        page_paddrs: []const u64,
-        page_offset_bytes: u16,
-        size_bytes: u64,
-        rights: VmObjectRights,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-        const backing = VmObjectBacking.init(page_paddrs, page_offset_bytes, size_bytes) orelse return KernelError.InvalidState;
-
-        const root_id = self.allocCapId();
-        try self.getVmObjectTable(owner).add(.{
-            .backing = backing,
-            .rights = rights,
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        return root_id;
-    }
-
-    pub fn grantVmObjectCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        cap_id: u64,
-        rights: VmObjectRights,
-    ) KernelError!u64 {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getVmObjectTableConst(from).findByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        if (!isVmObjectRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-
-        const child_id = self.allocCapId();
-        try self.getVmObjectTable(to).add(.{
-            .backing = src_cap.backing,
-            .rights = rights,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-        return child_id;
-    }
-
-    fn anyVmObjectCapWithRoot(self: *const KernelState, root_cap_id: u64) bool {
-        var pidx: usize = 0;
-        while (pidx < self.process_capacity) : (pidx += 1) {
-            const table = self.vmObjectTableForProcessIndexConst(pidx);
-            var i: usize = 0;
-            while (i < table.len) : (i += 1) {
-                const cap = table.slotAtConst(i) orelse break;
-                if (cap.root_cap_id == root_cap_id) return true;
-            }
-        }
-        const device_table = &self.vm_object_tables[process_count];
-        var i: usize = 0;
-        while (i < device_table.len) : (i += 1) {
-            const cap = device_table.slotAtConst(i) orelse break;
-            if (cap.root_cap_id == root_cap_id) return true;
-        }
-        return false;
-    }
-
-    fn anyPrincipalHasMappedPaddr(self: *const KernelState, paddr: u64) bool {
-        var pidx: usize = 0;
-        while (pidx < self.process_capacity) : (pidx += 1) {
-            const principal = processPrincipal(pidx);
-            if (capability.principalHasMappedPaddr(principal, paddr)) return true;
-        }
-        return false;
-    }
-
-    fn releaseVmObjectBackingIfUnreferenced(
-        self: *KernelState,
-        backing: VmObjectBacking,
-        root_cap_id: u64,
-        free_list: *FreePageList,
-    ) void {
-        if (self.anyVmObjectCapWithRoot(root_cap_id)) return;
-        var i: usize = 0;
-        while (i < backing.page_count) : (i += 1) {
-            const paddr = backing.pagePaddr(i) orelse return;
-            if (self.anyPrincipalHasMappedPaddr(paddr)) return;
-            if (!free_list.canAppendPage(0, paddr)) return;
-        }
-        i = 0;
-        while (i < backing.page_count) : (i += 1) {
-            const paddr = backing.pagePaddr(i) orelse return;
-            free_list.appendPage(0, paddr) catch return;
-        }
-        _ = freeVmObjectBackingPageStore(backing.page_store_start, backing.page_count);
-    }
-
-    pub fn revokeVmObjectCapTree(
-        self: *KernelState,
-        owner: PrincipalId,
-        cap_id: u64,
-        free_list: *FreePageList,
-    ) KernelError!void {
-        try self.requireActiveProcess(owner);
-        const start_cap = self.getVmObjectTableConst(owner).findByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
-        const start_id = start_cap.cap_id;
-
-        const queue = &self.revoke_queue;
-        var queue_len: usize = 0;
-        var queue_head: usize = 0;
-        queue[0] = start_id;
-        queue_len = 1;
-
-        const subtree = &self.revoke_subtree;
-        var subtree_len: usize = 0;
-
-        while (queue_head < queue_len) : (queue_head += 1) {
-            const current_id = queue[queue_head];
-            if (containsCapId(subtree[0..subtree_len], current_id)) continue;
-            if (subtree_len >= self.revoke_subtree.len) return KernelError.RevokeOverflow;
-            subtree[subtree_len] = current_id;
-            subtree_len += 1;
-
-            var pidx: usize = 0;
-            while (pidx < self.process_capacity) : (pidx += 1) {
-                const table = self.vmObjectTableForProcessIndexConst(pidx);
-                var i: usize = 0;
-                while (i < table.len) : (i += 1) {
-                    const cap = table.slotAtConst(i) orelse break;
-                    if (cap.parent_cap_id != current_id) continue;
-                    if (containsCapId(queue[0..queue_len], cap.cap_id)) continue;
-                    if (queue_len >= self.revoke_queue.len) return KernelError.RevokeOverflow;
-                    queue[queue_len] = cap.cap_id;
-                    queue_len += 1;
-                }
-            }
-            const table = &self.vm_object_tables[process_count];
-            var i: usize = 0;
-            while (i < table.len) : (i += 1) {
-                const cap = table.slotAtConst(i) orelse break;
-                if (cap.parent_cap_id != current_id) continue;
-                if (containsCapId(queue[0..queue_len], cap.cap_id)) continue;
-                if (queue_len >= self.revoke_queue.len) return KernelError.RevokeOverflow;
-                queue[queue_len] = cap.cap_id;
-                queue_len += 1;
-            }
-        }
-
-        var s: usize = 0;
-        while (s < subtree_len) : (s += 1) {
-            const revoke_id = subtree[s];
-            var pidx: usize = 0;
-            while (pidx < self.process_capacity) : (pidx += 1) {
-                const table = self.vmObjectTableForProcessIndex(pidx);
-                const removed = table.removeByCapId(revoke_id) orelse continue;
-                self.releaseVmObjectBackingIfUnreferenced(removed.backing, removed.root_cap_id, free_list);
-                break;
-            }
-            const table = &self.vm_object_tables[process_count];
-            const removed = table.removeByCapId(revoke_id) orelse continue;
-            self.releaseVmObjectBackingIfUnreferenced(removed.backing, removed.root_cap_id, free_list);
-        }
-    }
-
-    pub fn dropVmObjectCap(
-        self: *KernelState,
-        owner: PrincipalId,
-        cap_id: u64,
-        free_list: *FreePageList,
-    ) KernelError!void {
-        try self.requireActiveProcess(owner);
-        const removed = self.getVmObjectTable(owner).removeByCapId(cap_id) orelse return KernelError.VmObjectCapabilityNotFound;
-        self.releaseVmObjectBackingIfUnreferenced(removed.backing, removed.root_cap_id, free_list);
-    }
-
-    pub fn releasePrincipalVmObjectCaps(
-        self: *KernelState,
-        owner: PrincipalId,
-        free_list: *FreePageList,
-    ) void {
-        const table = self.getVmObjectTable(owner);
-        while (table.len > 0) {
-            const cap = table.slotAtConst(table.len - 1) orelse break;
-            const cap_id = cap.cap_id;
-            const removed = table.removeByCapId(cap_id) orelse break;
-            self.releaseVmObjectBackingIfUnreferenced(removed.backing, removed.root_cap_id, free_list);
-        }
-    }
-
     fn debugWriteField(
         write: *const fn ([]const u8) void,
         print_number: *const fn (u64) void,
@@ -4358,87 +3945,6 @@ pub const KernelState = struct {
         print_number(value);
     }
 
-    fn debugVmObjectRootSeenBeforeProcess(
-        self: *const KernelState,
-        root_cap_id: u64,
-        owner_index: usize,
-        cap_index: usize,
-    ) bool {
-        var pidx: usize = 0;
-        while (pidx < owner_index) : (pidx += 1) {
-            const table = self.vmObjectTableForProcessIndexConst(pidx);
-            var i: usize = 0;
-            while (i < table.len) : (i += 1) {
-                const cap = table.slotAtConst(i) orelse break;
-                if (cap.root_cap_id == root_cap_id) return true;
-            }
-        }
-        const table = self.vmObjectTableForProcessIndexConst(owner_index);
-        var i: usize = 0;
-        while (i < cap_index) : (i += 1) {
-            const cap = table.slotAtConst(i) orelse break;
-            if (cap.root_cap_id == root_cap_id) return true;
-        }
-        return false;
-    }
-
-    fn debugVmObjectRootSeenBeforeDevice(
-        self: *const KernelState,
-        root_cap_id: u64,
-        cap_index: usize,
-    ) bool {
-        var pidx: usize = 0;
-        while (pidx < self.process_capacity) : (pidx += 1) {
-            const table = self.vmObjectTableForProcessIndexConst(pidx);
-            var i: usize = 0;
-            while (i < table.len) : (i += 1) {
-                const cap = table.slotAtConst(i) orelse break;
-                if (cap.root_cap_id == root_cap_id) return true;
-            }
-        }
-        const table = &self.vm_object_tables[process_count];
-        var i: usize = 0;
-        while (i < cap_index) : (i += 1) {
-            const cap = table.slotAtConst(i) orelse break;
-            if (cap.root_cap_id == root_cap_id) return true;
-        }
-        return false;
-    }
-
-    fn debugVmObjectUniquePagesForProcess(self: *const KernelState, process_index: usize) u64 {
-        const table = self.vmObjectTableForProcessIndexConst(process_index);
-        var pages: u64 = 0;
-        var i: usize = 0;
-        while (i < table.len) : (i += 1) {
-            const cap = table.slotAtConst(i) orelse break;
-            if (self.debugVmObjectRootSeenBeforeProcess(cap.root_cap_id, process_index, i)) continue;
-            pages += cap.backing.page_count;
-        }
-        return pages;
-    }
-
-    fn debugVmObjectUniquePagesForDevice(self: *const KernelState) u64 {
-        const table = &self.vm_object_tables[process_count];
-        var pages: u64 = 0;
-        var i: usize = 0;
-        while (i < table.len) : (i += 1) {
-            const cap = table.slotAtConst(i) orelse break;
-            if (self.debugVmObjectRootSeenBeforeDevice(cap.root_cap_id, i)) continue;
-            pages += cap.backing.page_count;
-        }
-        return pages;
-    }
-
-    fn debugVmObjectBackingPageSum(table: *const VmObjectCNode) u64 {
-        var pages: u64 = 0;
-        var i: usize = 0;
-        while (i < table.len) : (i += 1) {
-            const cap = table.slotAtConst(i) orelse break;
-            pages += cap.backing.page_count;
-        }
-        return pages;
-    }
-
     pub fn debugLogMemoryOwnership(
         self: *const KernelState,
         free_list: *const FreePageList,
@@ -4447,32 +3953,21 @@ pub const KernelState = struct {
         where: []const u8,
     ) void {
         var page_caps_total: u64 = 0;
-        var vm_caps_total: u64 = 0;
-        var vm_cap_pages_total: u64 = 0;
-        var vm_unique_pages_total: u64 = 0;
         var ipc_caps_total: u64 = 0;
         var active_total: u64 = 0;
 
         var pidx: usize = 0;
         while (pidx < self.process_capacity) : (pidx += 1) {
             const page_table = self.capTableForProcessIndexConst(pidx);
-            const vm_table = self.vmObjectTableForProcessIndexConst(pidx);
             const ipc_table = self.ipcBufferTableForProcessIndexConst(pidx);
             page_caps_total += @intCast(page_table.len);
-            vm_caps_total += @intCast(vm_table.len);
-            vm_cap_pages_total += debugVmObjectBackingPageSum(vm_table);
-            vm_unique_pages_total += self.debugVmObjectUniquePagesForProcess(pidx);
             ipc_caps_total += @intCast(ipc_table.len);
             if ((self.processDescriptorSlotConst(pidx) orelse continue).active) active_total += 1;
         }
 
         const device_page_table = &self.cap_tables[process_count];
-        const device_vm_table = &self.vm_object_tables[process_count];
         const device_ipc_table = &self.ipc_buffer_tables[process_count];
         page_caps_total += @intCast(device_page_table.len);
-        vm_caps_total += @intCast(device_vm_table.len);
-        vm_cap_pages_total += debugVmObjectBackingPageSum(device_vm_table);
-        vm_unique_pages_total += self.debugVmObjectUniquePagesForDevice();
         ipc_caps_total += @intCast(device_ipc_table.len);
 
         write("Kernel.mem_diag where=");
@@ -4484,23 +3979,18 @@ pub const KernelState = struct {
         debugWriteField(write, print_number, "tracked_active", @intCast(self.active_process_count));
         debugWriteField(write, print_number, "page_caps", page_caps_total);
         debugWriteField(write, print_number, "page_cap_unique", pageCapRefUniqueCount());
-        debugWriteField(write, print_number, "vm_caps", vm_caps_total);
-        debugWriteField(write, print_number, "vm_cap_pages_sum", vm_cap_pages_total);
-        debugWriteField(write, print_number, "vm_unique_pages", vm_unique_pages_total);
-        debugWriteField(write, print_number, "vm_store_next", @intCast(vm_object_backing_page_store_next));
+        debugWriteField(write, print_number, "vm_store_next", @intCast(vmo_backing_page_store_next));
         debugWriteField(write, print_number, "vm_store_free_pages", vmObjectBackingFreePageCount());
-        debugWriteField(write, print_number, "vm_store_free_ranges", @intCast(vm_object_backing_page_store_free_range_len));
+        debugWriteField(write, print_number, "vm_store_free_ranges", @intCast(vmo_backing_page_store_free_range_len));
         debugWriteField(write, print_number, "ipc_caps", ipc_caps_total);
         write("\n");
 
         pidx = 0;
         while (pidx < self.process_capacity) : (pidx += 1) {
             const page_table = self.capTableForProcessIndexConst(pidx);
-            const vm_table = self.vmObjectTableForProcessIndexConst(pidx);
             const ipc_table = self.ipcBufferTableForProcessIndexConst(pidx);
-            const vm_unique_pages = self.debugVmObjectUniquePagesForProcess(pidx);
             const desc = self.processDescriptorSlotConst(pidx) orelse continue;
-            if (!desc.active and page_table.len == 0 and vm_table.len == 0 and ipc_table.len == 0) continue;
+            if (!desc.active and page_table.len == 0 and ipc_table.len == 0) continue;
 
             write("Kernel.mem_diag.proc");
             debugWriteField(write, print_number, "idx", @intCast(pidx));
@@ -4508,22 +3998,16 @@ pub const KernelState = struct {
             write(" label=");
             write(desc.label);
             debugWriteField(write, print_number, "page_caps", @intCast(page_table.len));
-            debugWriteField(write, print_number, "vm_caps", @intCast(vm_table.len));
-            debugWriteField(write, print_number, "vm_cap_pages_sum", debugVmObjectBackingPageSum(vm_table));
-            debugWriteField(write, print_number, "vm_unique_pages", vm_unique_pages);
             debugWriteField(write, print_number, "ipc_caps", @intCast(ipc_table.len));
             write("\n");
         }
 
-        if (device_page_table.len != 0 or device_vm_table.len != 0 or device_ipc_table.len != 0) {
+        if (device_page_table.len != 0 or device_ipc_table.len != 0) {
             write("Kernel.mem_diag.proc");
             debugWriteField(write, print_number, "idx", @intCast(process_count));
             debugWriteField(write, print_number, "active", 1);
             write(" label=Device0");
             debugWriteField(write, print_number, "page_caps", @intCast(device_page_table.len));
-            debugWriteField(write, print_number, "vm_caps", @intCast(device_vm_table.len));
-            debugWriteField(write, print_number, "vm_cap_pages_sum", debugVmObjectBackingPageSum(device_vm_table));
-            debugWriteField(write, print_number, "vm_unique_pages", self.debugVmObjectUniquePagesForDevice());
             debugWriteField(write, print_number, "ipc_caps", @intCast(device_ipc_table.len));
             write("\n");
         }

@@ -203,6 +203,42 @@ test "physical page allocation does not install page capability" {
     try std.testing.expectEqual(@as(usize, 0), s.getTableConst(p0).len);
 }
 
+test "page-backed vmo fd uses dynamic fd range and reports fd info" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x1_0000_0000, 2);
+    const original_free = free_list.len;
+
+    const rights = fdRights(.{
+        .inspect = true,
+        .transfer = true,
+        .close = true,
+        .map_read = true,
+        .map_write = true,
+        .map_exec = true,
+        .share = true,
+    });
+    const flags = fdFlags(.{ .cloexec = true });
+    const fd = try s.createAnonymousVmoFdWithPages(p0, 6000, rights, flags, 16, &free_list);
+
+    try std.testing.expectEqual(@as(kernel.Fd, 16), fd);
+    try std.testing.expectEqual(original_free - 2, free_list.len);
+
+    const info = s.fdInfo(p0, fd) orelse unreachable;
+    try std.testing.expectEqual(kernel.KernelObjectKind.vmo, info.kind);
+    try std.testing.expectEqual(@as(u64, 8192), info.size_bytes);
+    try std.testing.expectEqual(kernel.fdRightsToBits(rights), info.rights_bits);
+    try std.testing.expectEqual(kernel.fdFlagsToBits(flags), info.flags_bits);
+
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    try std.testing.expect(s.nativeVmoPagePaddr(vmo, 0) != null);
+    try std.testing.expect(s.nativeVmoPagePaddr(vmo, 1) != null);
+
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(original_free, free_list.len);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+}
+
 test "anonymous vmo fd maps through vma ledger without page capability install" {
     var s = try initFdState();
     const rights = fdRights(.{

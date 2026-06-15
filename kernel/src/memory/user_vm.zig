@@ -1,4 +1,5 @@
 const address_space = @import("address_space.zig");
+const capability = @import("../capability.zig");
 const kernel = @import("../kernel.zig");
 const scheduler = @import("../scheduler.zig");
 

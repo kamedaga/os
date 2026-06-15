@@ -498,7 +498,6 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
 
     kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_vm.clearUserAddressSpace(principal);
-    kernel_state_global.releasePrincipalVmObjectCaps(principal, &global_free_list);
     kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
@@ -545,7 +544,6 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
 
     kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_vm.clearUserAddressSpace(principal);
-    kernel_state_global.releasePrincipalVmObjectCaps(principal, &global_free_list);
     kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
