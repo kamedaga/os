@@ -215,6 +215,142 @@ pub const KernelError = error{
     CapsuleRevoked,
 };
 
+pub const Fd = u32;
+pub const fd_table_entries: usize = 256;
+pub const max_fd_objects: usize = 4096;
+pub const fd_known_flags_mask: u32 = (@as(u32, 1) << 4) - 1;
+pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 42) - 1;
+
+pub const FdFlags = packed struct(u32) {
+    cloexec: bool = false,
+    nonblock: bool = false,
+    inherit: bool = false,
+    private: bool = false,
+    _reserved: u28 = 0,
+};
+
+pub fn fdFlagsFromBits(bits: u32) FdFlags {
+    return @bitCast(bits & fd_known_flags_mask);
+}
+
+pub fn fdFlagsToBits(flags: FdFlags) u32 {
+    return @as(u32, @bitCast(flags)) & fd_known_flags_mask;
+}
+
+pub const FdRights = packed struct(u64) {
+    inspect: bool = false,
+    dup: bool = false,
+    transfer: bool = false,
+    wait: bool = false,
+    poll: bool = false,
+    set_flags: bool = false,
+    close: bool = false,
+    send: bool = false,
+    recv: bool = false,
+    call: bool = false,
+    accept: bool = false,
+    bind: bool = false,
+    endpoint_signal: bool = false,
+    map_read: bool = false,
+    map_write: bool = false,
+    map_exec: bool = false,
+    resize: bool = false,
+    share: bool = false,
+    pager_attach: bool = false,
+    pager_fault: bool = false,
+    spawn: bool = false,
+    start: bool = false,
+    kill: bool = false,
+    debug: bool = false,
+    map_into: bool = false,
+    set_context: bool = false,
+    process_signal: bool = false,
+    query: bool = false,
+    config_read: bool = false,
+    config_write: bool = false,
+    derive_mmio: bool = false,
+    derive_dma: bool = false,
+    derive_irq: bool = false,
+    mmio_map_read: bool = false,
+    mmio_map_write: bool = false,
+    cpu_read: bool = false,
+    cpu_write: bool = false,
+    dma_read: bool = false,
+    dma_write: bool = false,
+    irq_wait: bool = false,
+    irq_ack: bool = false,
+    bus_master: bool = false,
+    _reserved: u22 = 0,
+};
+
+pub fn fdRightsFromBits(bits: u64) FdRights {
+    return @bitCast(bits & fd_known_rights_mask);
+}
+
+pub fn fdRightsToBits(rights: FdRights) u64 {
+    return @as(u64, @bitCast(rights)) & fd_known_rights_mask;
+}
+
+pub fn isFdRightsSubset(child: FdRights, parent: FdRights) bool {
+    const child_bits = fdRightsToBits(child);
+    const parent_bits = fdRightsToBits(parent);
+    return (child_bits & ~parent_bits) == 0;
+}
+
+pub const KernelObjectKind = enum(u16) {
+    none = 0,
+    process = 1,
+    endpoint_compat = 2,
+    vmo_compat = 3,
+    capsule_compat = 4,
+    event = 5,
+};
+
+pub const KernelObjectRef = struct {
+    kind: KernelObjectKind = .none,
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: KernelObjectRef) bool {
+        return self.kind == .none;
+    }
+};
+
+pub const KernelObjectPayload = union(KernelObjectKind) {
+    none: void,
+    process: PrincipalId,
+    endpoint_compat: u64,
+    vmo_compat: u64,
+    capsule_compat: u64,
+    event: u64,
+};
+
+pub const KernelObjectSlot = struct {
+    kind: KernelObjectKind = .none,
+    generation: u32 = 1,
+    ref_count: u32 = 0,
+    payload: KernelObjectPayload = .{ .none = {} },
+};
+
+pub const FdEntry = struct {
+    object: KernelObjectRef = .{},
+    rights: FdRights = .{},
+    flags: FdFlags = .{},
+
+    pub fn isEmpty(self: *const FdEntry) bool {
+        return self.object.isNull();
+    }
+};
+
+pub const FdTable = struct {
+    entries: [fd_table_entries]FdEntry = [_]FdEntry{.{}} ** fd_table_entries,
+};
+
+pub const FdTransferMode = enum(u8) {
+    copy,
+    move,
+};
+
 pub const CNode = struct {
     pub const inline_caps = 512;
     pub const chunk_caps = 512;
@@ -1775,6 +1911,7 @@ var empty_ipc_buffer_tables_extra: [0]IpcBufferCNode = .{};
 var empty_ipc_buffer_mailboxes_extra: [0]IpcBufferMailbox = .{};
 var empty_pending_ipc_buffer_transfers_extra: [0]?PendingIpcBufferTransfer = .{};
 var empty_vm_object_tables_extra: [0]VmObjectCNode = .{};
+var empty_fd_tables_extra: [0]FdTable = .{};
 
 pub const KernelState = struct {
     pub const max_regions = 256;
@@ -1799,12 +1936,16 @@ pub const KernelState = struct {
     ipc_buffer_mailboxes: [principal_count]IpcBufferMailbox = [_]IpcBufferMailbox{.{}} ** principal_count,
     pending_ipc_buffer_transfers: [principal_count]?PendingIpcBufferTransfer = [_]?PendingIpcBufferTransfer{null} ** principal_count,
     vm_object_tables: [principal_count]VmObjectCNode = [_]VmObjectCNode{.{}} ** principal_count,
+    fd_tables: [process_count]FdTable = [_]FdTable{.{}} ** process_count,
     cap_mailboxes_extra: []CapMailbox = empty_cap_mailboxes_extra[0..],
     pending_page_transfers_extra: []?PendingCapTransfer = empty_pending_page_transfers_extra[0..],
     ipc_buffer_tables_extra: []IpcBufferCNode = empty_ipc_buffer_tables_extra[0..],
     ipc_buffer_mailboxes_extra: []IpcBufferMailbox = empty_ipc_buffer_mailboxes_extra[0..],
     pending_ipc_buffer_transfers_extra: []?PendingIpcBufferTransfer = empty_pending_ipc_buffer_transfers_extra[0..],
     vm_object_tables_extra: []VmObjectCNode = empty_vm_object_tables_extra[0..],
+    fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
+    fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
+    next_fd_object_scan: usize = 0,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
@@ -1845,6 +1986,102 @@ pub const KernelState = struct {
 
     fn pageAlignDown(value: u64) u64 {
         return value & ~@as(u64, 4095);
+    }
+
+    fn fdIndex(fd: Fd) ?usize {
+        if (fd >= fd_table_entries) return null;
+        return @intCast(fd);
+    }
+
+    fn findFreeFd(table: *const FdTable, min_fd: Fd) ?usize {
+        var index = fdIndex(min_fd) orelse return null;
+        while (index < fd_table_entries) : (index += 1) {
+            if (table.entries[index].isEmpty()) return index;
+        }
+        return null;
+    }
+
+    fn nextObjectGeneration(generation: u32) u32 {
+        var next = generation +% 1;
+        if (next == 0) next = 1;
+        return next;
+    }
+
+    fn objectPayloadMatches(kind: KernelObjectKind, payload: KernelObjectPayload) bool {
+        return std.meta.activeTag(payload) == kind;
+    }
+
+    fn clearKernelObjectSlot(slot: *KernelObjectSlot) void {
+        slot.kind = .none;
+        slot.ref_count = 0;
+        slot.payload = .{ .none = {} };
+        slot.generation = nextObjectGeneration(slot.generation);
+    }
+
+    fn resetKernelObjectTable(self: *KernelState) void {
+        @memset(self.fd_objects[0..], .{});
+        self.next_fd_object_scan = 0;
+    }
+
+    pub fn createKernelObject(
+        self: *KernelState,
+        kind: KernelObjectKind,
+        payload: KernelObjectPayload,
+    ) KernelError!KernelObjectRef {
+        if (kind == .none or !objectPayloadMatches(kind, payload)) return KernelError.InvalidState;
+        var offset: usize = 0;
+        while (offset < max_fd_objects) : (offset += 1) {
+            const index = (self.next_fd_object_scan + offset) % max_fd_objects;
+            const slot = &self.fd_objects[index];
+            if (slot.kind != .none or slot.ref_count != 0) continue;
+            if (slot.generation == 0) slot.generation = 1;
+            slot.kind = kind;
+            slot.payload = payload;
+            slot.ref_count = 0;
+            self.next_fd_object_scan = (index + 1) % max_fd_objects;
+            return .{
+                .kind = kind,
+                .index = @intCast(index),
+                .generation = slot.generation,
+            };
+        }
+        return KernelError.TableFull;
+    }
+
+    fn kernelObjectSlot(self: *KernelState, object_ref: KernelObjectRef) ?*KernelObjectSlot {
+        if (object_ref.kind == .none) return null;
+        const index: usize = @intCast(object_ref.index);
+        if (index >= max_fd_objects) return null;
+        const slot = &self.fd_objects[index];
+        if (slot.kind != object_ref.kind or slot.generation != object_ref.generation) return null;
+        return slot;
+    }
+
+    fn kernelObjectSlotConst(self: *const KernelState, object_ref: KernelObjectRef) ?*const KernelObjectSlot {
+        if (object_ref.kind == .none) return null;
+        const index: usize = @intCast(object_ref.index);
+        if (index >= max_fd_objects) return null;
+        const slot = &self.fd_objects[index];
+        if (slot.kind != object_ref.kind or slot.generation != object_ref.generation) return null;
+        return slot;
+    }
+
+    fn retainKernelObject(self: *KernelState, object_ref: KernelObjectRef) KernelError!void {
+        const slot = self.kernelObjectSlot(object_ref) orelse return KernelError.InvalidState;
+        if (slot.ref_count == std.math.maxInt(u32)) return KernelError.TableFull;
+        slot.ref_count += 1;
+    }
+
+    fn releaseKernelObject(self: *KernelState, object_ref: KernelObjectRef) void {
+        const slot = self.kernelObjectSlot(object_ref) orelse return;
+        if (slot.ref_count == 0) return;
+        slot.ref_count -= 1;
+        if (slot.ref_count == 0) clearKernelObjectSlot(slot);
+    }
+
+    pub fn kernelObjectRefCount(self: *const KernelState, object_ref: KernelObjectRef) ?u32 {
+        const slot = self.kernelObjectSlotConst(object_ref) orelse return null;
+        return slot.ref_count;
     }
 
     fn allocKernelSlice(comptime T: type, free_list: *FreePageList, count: usize) ?[]T {
@@ -2455,7 +2692,58 @@ pub const KernelState = struct {
         return &self.vm_object_tables[index];
     }
 
+    fn fdTableForProcessIndex(self: *KernelState, index: usize) ?*FdTable {
+        if (index >= self.process_capacity) return null;
+        if (extraIndex(index)) |extra| return &self.fd_tables_extra[extra];
+        return &self.fd_tables[index];
+    }
+
+    fn fdTableForProcessIndexConst(self: *const KernelState, index: usize) ?*const FdTable {
+        if (index >= self.process_capacity) return null;
+        if (extraIndex(index)) |extra| return &self.fd_tables_extra[extra];
+        return &self.fd_tables[index];
+    }
+
+    pub fn getFdTable(self: *KernelState, principal: PrincipalId) ?*FdTable {
+        const index = processIndexFromPrincipal(principal) orelse return null;
+        return self.fdTableForProcessIndex(index);
+    }
+
+    pub fn getFdTableConst(self: *const KernelState, principal: PrincipalId) ?*const FdTable {
+        const index = processIndexFromPrincipal(principal) orelse return null;
+        return self.fdTableForProcessIndexConst(index);
+    }
+
+    fn fdTableForActiveProcess(self: *KernelState, principal: PrincipalId) KernelError!*FdTable {
+        try self.requireActiveProcess(principal);
+        return self.getFdTable(principal) orelse KernelError.InvalidState;
+    }
+
+    fn fdTableForActiveProcessConst(self: *const KernelState, principal: PrincipalId) KernelError!*const FdTable {
+        try self.requireActiveProcess(principal);
+        return self.getFdTableConst(principal) orelse KernelError.InvalidState;
+    }
+
+    pub fn fdEntryConst(self: *const KernelState, owner: PrincipalId, fd: Fd) ?*const FdEntry {
+        const table = self.getFdTableConst(owner) orelse return null;
+        const index = fdIndex(fd) orelse return null;
+        if (table.entries[index].isEmpty()) return null;
+        return &table.entries[index];
+    }
+
+    fn releaseFdTableForProcessIndex(self: *KernelState, index: usize) void {
+        const table = self.fdTableForProcessIndex(index) orelse return;
+        var fd: usize = 0;
+        while (fd < fd_table_entries) : (fd += 1) {
+            const object_ref = table.entries[fd].object;
+            if (object_ref.isNull()) continue;
+            table.entries[fd] = .{};
+            self.releaseKernelObject(object_ref);
+        }
+    }
+
     pub fn resetProcessRuntimeTables(self: *KernelState, index: usize) void {
+        self.releaseFdTableForProcessIndex(index);
         self.capTableForProcessIndex(index).reset();
         self.endpointTableForProcessIndex(index).* = .{};
         self.capMailboxForProcessIndex(index).reset();
@@ -2464,6 +2752,141 @@ pub const KernelState = struct {
         self.ipcBufferMailboxForProcessIndex(index).reset();
         self.pendingIpcBufferTransferForProcessIndex(index).* = null;
         self.vmObjectTableForProcessIndex(index).reset();
+    }
+
+    pub fn installFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        object_ref: KernelObjectRef,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        const table = try self.fdTableForActiveProcess(owner);
+        const index = findFreeFd(table, min_fd) orelse return KernelError.TableFull;
+        try self.retainKernelObject(object_ref);
+        table.entries[index] = .{
+            .object = object_ref,
+            .rights = fdRightsFromBits(fdRightsToBits(rights)),
+            .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
+        };
+        return @intCast(index);
+    }
+
+    pub fn closeFd(self: *KernelState, owner: PrincipalId, fd: Fd) KernelError!void {
+        const table = try self.fdTableForActiveProcess(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const object_ref = table.entries[index].object;
+        if (object_ref.isNull()) return KernelError.InvalidState;
+        table.entries[index] = .{};
+        self.releaseKernelObject(object_ref);
+    }
+
+    pub fn dupFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        min_fd: Fd,
+        rights: FdRights,
+        flags: FdFlags,
+    ) KernelError!Fd {
+        const table = try self.fdTableForActiveProcessConst(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const source = table.entries[index];
+        if (source.object.isNull()) return KernelError.InvalidState;
+        if (!source.rights.dup) return KernelError.InvalidState;
+        if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
+        return self.installFd(owner, source.object, rights, flags, min_fd);
+    }
+
+    pub fn replaceFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        dst_fd: Fd,
+        src_fd: Fd,
+        rights: FdRights,
+        flags: FdFlags,
+    ) KernelError!void {
+        if (dst_fd == src_fd) return KernelError.InvalidState;
+        const src_table = try self.fdTableForActiveProcessConst(owner);
+        const src_index = fdIndex(src_fd) orelse return KernelError.InvalidState;
+        const dst_index = fdIndex(dst_fd) orelse return KernelError.InvalidState;
+        const source = src_table.entries[src_index];
+        if (source.object.isNull()) return KernelError.InvalidState;
+        if (!source.rights.dup) return KernelError.InvalidState;
+        if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
+
+        try self.retainKernelObject(source.object);
+        const dst_table = try self.fdTableForActiveProcess(owner);
+        const old_object = dst_table.entries[dst_index].object;
+        dst_table.entries[dst_index] = .{
+            .object = source.object,
+            .rights = fdRightsFromBits(fdRightsToBits(rights)),
+            .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
+        };
+        if (!old_object.isNull()) self.releaseKernelObject(old_object);
+    }
+
+    pub fn setFdFlags(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        flags: FdFlags,
+        mask: FdFlags,
+    ) KernelError!void {
+        const table = try self.fdTableForActiveProcess(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const entry = &table.entries[index];
+        if (entry.object.isNull()) return KernelError.InvalidState;
+        if (!entry.rights.set_flags) return KernelError.InvalidState;
+        const old_bits = fdFlagsToBits(entry.flags);
+        const mask_bits = fdFlagsToBits(mask);
+        const new_bits = (old_bits & ~mask_bits) | (fdFlagsToBits(flags) & mask_bits);
+        entry.flags = fdFlagsFromBits(new_bits);
+    }
+
+    pub fn transferFd(
+        self: *KernelState,
+        from: PrincipalId,
+        to: PrincipalId,
+        fd: Fd,
+        min_fd: Fd,
+        rights: FdRights,
+        flags: FdFlags,
+        mode: FdTransferMode,
+    ) KernelError!Fd {
+        if (from == to) return KernelError.InvalidState;
+        const source_table = try self.fdTableForActiveProcessConst(from);
+        const source_index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const source = source_table.entries[source_index];
+        if (source.object.isNull()) return KernelError.InvalidState;
+        if (!source.rights.transfer) return KernelError.InvalidState;
+        if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
+        if (self.kernelObjectSlotConst(source.object) == null) return KernelError.InvalidState;
+
+        const dest_table = try self.fdTableForActiveProcess(to);
+        const dest_index = findFreeFd(dest_table, min_fd) orelse return KernelError.TableFull;
+
+        switch (mode) {
+            .copy => {
+                try self.retainKernelObject(source.object);
+                dest_table.entries[dest_index] = .{
+                    .object = source.object,
+                    .rights = fdRightsFromBits(fdRightsToBits(rights)),
+                    .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
+                };
+            },
+            .move => {
+                const mutable_source_table = try self.fdTableForActiveProcess(from);
+                dest_table.entries[dest_index] = .{
+                    .object = source.object,
+                    .rights = fdRightsFromBits(fdRightsToBits(rights)),
+                    .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
+                };
+                mutable_source_table.entries[source_index] = .{};
+            },
+        }
+        return @intCast(dest_index);
     }
 
     fn nextProcessCapacity(self: *const KernelState, required: usize) ?usize {
@@ -2493,6 +2916,7 @@ pub const KernelState = struct {
         const new_ipc_mailbox = allocKernelSlice(IpcBufferMailbox, free_list, extra_count) orelse return false;
         const new_ipc_pending = allocKernelSlice(?PendingIpcBufferTransfer, free_list, extra_count) orelse return false;
         const new_vm = allocKernelSlice(VmObjectCNode, free_list, extra_count) orelse return false;
+        const new_fd = allocKernelSlice(FdTable, free_list, extra_count) orelse return false;
 
         @memcpy(new_desc[0..old_extra_count], self.process_descriptors_extra);
         @memcpy(new_cap[0..old_extra_count], self.cap_tables_extra);
@@ -2503,6 +2927,7 @@ pub const KernelState = struct {
         @memcpy(new_ipc_mailbox[0..old_extra_count], self.ipc_buffer_mailboxes_extra);
         @memcpy(new_ipc_pending[0..old_extra_count], self.pending_ipc_buffer_transfers_extra);
         @memcpy(new_vm[0..old_extra_count], self.vm_object_tables_extra);
+        @memcpy(new_fd[0..old_extra_count], self.fd_tables_extra);
 
         var i = old_extra_count;
         while (i < extra_count) : (i += 1) {
@@ -2515,6 +2940,7 @@ pub const KernelState = struct {
             new_ipc_mailbox[i] = .{};
             new_ipc_pending[i] = null;
             new_vm[i] = .{};
+            new_fd[i] = .{};
         }
 
         self.process_descriptors_extra = new_desc;
@@ -2526,6 +2952,7 @@ pub const KernelState = struct {
         self.ipc_buffer_mailboxes_extra = new_ipc_mailbox;
         self.pending_ipc_buffer_transfers_extra = new_ipc_pending;
         self.vm_object_tables_extra = new_vm;
+        self.fd_tables_extra = new_fd;
         self.process_capacity = capacity;
         return true;
     }
@@ -2651,6 +3078,7 @@ pub const KernelState = struct {
         const index = processIndexFromPrincipal(principal) orelse return false;
         const desc = self.processDescriptorSlot(index) orelse return false;
         if (!desc.active) return false;
+        self.releaseFdTableForProcessIndex(index);
         _ = self.releasePrincipalCapsules(principal);
         desc.active = false;
         desc.bootstrap_owner = false;
@@ -2670,6 +3098,7 @@ pub const KernelState = struct {
         const index = processIndexFromPrincipal(principal) orelse return false;
         const desc = self.processDescriptorSlot(index) orelse return false;
         if (!desc.active) return false;
+        self.releaseFdTableForProcessIndex(index);
         _ = self.releasePrincipalCapsules(principal);
         desc.active = false;
         desc.bootstrap_owner = false;
@@ -2689,6 +3118,7 @@ pub const KernelState = struct {
         const index = processIndexFromPrincipal(principal) orelse return false;
         const desc = self.processDescriptorSlot(index) orelse return false;
         if (!desc.active) return false;
+        self.releaseFdTableForProcessIndex(index);
         _ = self.releasePrincipalCapsules(principal);
         desc.* = .{};
         if (self.active_process_count > 0) self.active_process_count -= 1;
@@ -2712,6 +3142,7 @@ pub const KernelState = struct {
         resetVmObjectBackingPageStore();
         self.capsules = .{};
         self.published_service_endpoints = .{};
+        self.resetKernelObjectTable();
         i = 0;
         while (i < self.process_capacity) : (i += 1) {
             (self.processDescriptorSlot(i) orelse break).* = .{};

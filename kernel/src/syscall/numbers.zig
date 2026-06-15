@@ -2,6 +2,7 @@ const abi_root = @import("kernel_abi_root");
 
 const ipc_buffer_abi = abi_root.ipc_buffer_abi;
 const capsule_abi = abi_root.capsule_abi;
+const fd_abi = abi_root.fd_abi;
 const process_abi = abi_root.process_abi;
 const queue_abi = abi_root.queue_abi;
 const trap_abi = abi_root.trap_abi;
@@ -39,6 +40,14 @@ pub const syscall_map_page_anywhere: u64 = 0x5C;
 pub const syscall_alloc_map_pages_anywhere: u64 = 0x5D;
 pub const syscall_ipc_call_reply_recv: u64 = 0x40;
 pub const syscall_ipc_call_reply_recv_fast: u64 = 0x400;
+
+pub const syscall_fd_close: u64 = fd_abi.syscall_fd_close;
+pub const syscall_fd_dup: u64 = fd_abi.syscall_fd_dup;
+pub const syscall_fd_replace: u64 = fd_abi.syscall_fd_replace;
+pub const syscall_fd_get_info: u64 = fd_abi.syscall_fd_get_info;
+pub const syscall_fd_set_flags: u64 = fd_abi.syscall_fd_set_flags;
+pub const syscall_fd_wait: u64 = fd_abi.syscall_fd_wait;
+pub const syscall_fd_poll: u64 = fd_abi.syscall_fd_poll;
 
 pub const syscall_set_fs_base_self: u64 = process_abi.syscall_set_fs_base_self;
 pub const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;
