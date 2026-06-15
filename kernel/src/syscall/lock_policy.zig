@@ -1,6 +1,7 @@
 const abi_root = @import("kernel_abi_root");
 const capsule_abi = abi_root.capsule_abi;
 const fd_abi = abi_root.fd_abi;
+const ipc_abi = abi_root.ipc_abi;
 const process_builder_abi = abi_root.process_builder_abi;
 const queue_abi = abi_root.queue_abi;
 
@@ -9,6 +10,7 @@ const sc = @import("numbers.zig");
 pub fn needsKernelStateLock(nr: u64) bool {
     if (capsule_abi.isCapsuleSyscall(nr)) return true;
     if (fd_abi.isFdSyscall(nr)) return true;
+    if (ipc_abi.isIpcSyscall(nr)) return true;
     return switch (nr) {
         sc.syscall_alloc_page,
         sc.syscall_map_page,

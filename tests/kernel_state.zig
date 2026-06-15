@@ -192,6 +192,85 @@ test "fd process capacity growth preserves extra fd tables" {
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(obj));
 }
 
+test "ipc endpoint fd sends and receives inline words" {
+    var s = try initFdState();
+    const rights = fdRights(.{ .send = true, .recv = true, .close = true });
+    const endpoint = try s.createIpcEndpointFd(p0, rights, .{}, 16);
+
+    try s.ipcSend(p0, endpoint, .{ .words = .{ 11, 22, 33, 44 } });
+    const received = try s.ipcRecv(p0, endpoint, 0, 16);
+    try std.testing.expectEqual(@as(usize, 0), received.fd_count);
+    try std.testing.expectEqual(@as(u64, 11), received.words[0]);
+    try std.testing.expectEqual(@as(u64, 22), received.words[1]);
+    try std.testing.expectEqual(@as(u64, 33), received.words[2]);
+    try std.testing.expectEqual(@as(u64, 44), received.words[3]);
+    try std.testing.expectError(KernelError.MailboxEmpty, s.ipcRecv(p0, endpoint, 0, 16));
+}
+
+test "ipc fd passing moves attenuated vmo fd through endpoint" {
+    var s = try initFdState();
+    const endpoint_rights = fdRights(.{ .send = true, .recv = true, .transfer = true, .close = true });
+    const endpoint = try s.createIpcEndpointFd(p0, endpoint_rights, .{}, 16);
+    const remote_endpoint = try s.transferFd(p0, p1, endpoint, 16, fdRights(.{ .send = true, .close = true }), .{}, .copy);
+
+    const source_rights = fdRights(.{ .transfer = true, .close = true, .map_read = true, .map_write = true });
+    const source_vmo_fd = try s.createAnonymousVmoFd(p1, 4096, source_rights, .{}, 16);
+    const source_vmo = s.nativeVmoRefForFd(p1, source_vmo_fd) orelse unreachable;
+
+    const send_fds = [_]kernel.IpcSendFd{.{
+        .fd = source_vmo_fd,
+        .rights = fdRights(.{ .close = true, .map_read = true }),
+        .flags = fdFlags(.{ .cloexec = true }),
+        .move = true,
+    }};
+    try s.ipcSend(p1, remote_endpoint, .{ .words = .{ 1, 0, 0, 0 }, .fds = send_fds[0..] });
+    try std.testing.expect(s.fdEntryConst(p1, source_vmo_fd) == null);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
+
+    const received = try s.ipcRecv(p0, endpoint, 1, 16);
+    try std.testing.expectEqual(@as(usize, 1), received.fd_count);
+    const received_fd = received.fds[0].fd;
+    const received_entry = s.fdEntryConst(p0, received_fd) orelse unreachable;
+    try std.testing.expect(received_entry.rights.close);
+    try std.testing.expect(received_entry.rights.map_read);
+    try std.testing.expect(!received_entry.rights.map_write);
+    try std.testing.expect(received_entry.flags.cloexec);
+    try std.testing.expectEqual(source_vmo, s.nativeVmoRefForFd(p0, received_fd) orelse unreachable);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
+}
+
+test "ipc channel pair sends to peer receive queue" {
+    var s = try initFdState();
+    const pair = try s.createIpcChannelPairFds(p0, fdRights(.{ .send = true, .recv = true, .close = true }), .{}, 16);
+
+    try s.ipcSend(p0, pair.a, .{ .words = .{ 5, 6, 7, 8 } });
+    try std.testing.expectError(KernelError.MailboxEmpty, s.ipcRecv(p0, pair.a, 0, 16));
+    const received = try s.ipcRecv(p0, pair.b, 0, 16);
+    try std.testing.expectEqual(@as(u64, 5), received.words[0]);
+    try std.testing.expectEqual(@as(u64, 8), received.words[3]);
+}
+
+test "ipc call attaches one-shot reply fd" {
+    var s = try initFdState();
+    const endpoint = try s.createIpcEndpointFd(p0, fdRights(.{ .recv = true, .call = true, .transfer = true, .close = true }), .{}, 16);
+    const client_endpoint = try s.transferFd(p0, p1, endpoint, 16, fdRights(.{ .call = true, .close = true }), .{}, .copy);
+
+    const client_reply = try s.ipcCall(p1, client_endpoint, .{ .words = .{ 99, 0, 0, 0 } }, 16);
+    const request = try s.ipcRecv(p0, endpoint, 1, 16);
+    try std.testing.expectEqual(@as(u64, 99), request.words[0]);
+    try std.testing.expectEqual(@as(usize, 1), request.fd_count);
+    const server_reply = request.fds[0].fd;
+    const server_reply_entry = s.fdEntryConst(p0, server_reply) orelse unreachable;
+    try std.testing.expect(server_reply_entry.rights.send);
+    try std.testing.expect(!server_reply_entry.rights.recv);
+
+    try s.ipcReply(p0, server_reply, .{ .words = .{ 1234, 0, 0, 0 } });
+    try std.testing.expectError(KernelError.InvalidState, s.ipcReply(p0, server_reply, .{ .words = .{ 1, 0, 0, 0 } }));
+
+    const reply = try s.ipcRecv(p1, client_reply, 0, 16);
+    try std.testing.expectEqual(@as(u64, 1234), reply.words[0]);
+}
+
 test "physical page allocation does not install page capability" {
     var s = try initFdState();
     var free_list = FreePageList{};

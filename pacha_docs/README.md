@@ -7,6 +7,7 @@
 - [Phase 0 design freeze](./phase0-design-freeze.md)
 - [Phase 1 FD table core plan](./phase1-fd-table-core-plan.md)
 - [Phase 3 VMO fd](./phase3-vmo-fd.md)
+- [Phase 4 FD passing IPC](./phase4-fd-passing-ipc.md)
 - [FD ABI spec draft](./fd-abi-spec.md)
 - [IPC ABI spec draft](./ipc-abi-spec.md)
 - [Memory ABI spec draft](./memory-abi-spec.md)

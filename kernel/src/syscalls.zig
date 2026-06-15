@@ -19,6 +19,7 @@ const memory_syscalls = @import("syscall/memory_helpers.zig");
 const capsule_syscalls = @import("syscall/capsule.zig");
 const device_syscalls = @import("syscall/device.zig");
 const fd_syscalls = @import("syscall/fd.zig");
+const native_ipc_syscalls = @import("syscall/native_ipc.zig");
 const process_syscalls = @import("syscall/process.zig");
 const vm_object_dispatch = @import("syscall/vm_object.zig");
 const ipc_syscalls = @import("syscall/ipc.zig");
@@ -508,6 +509,9 @@ fn syscallDispatchFrom(frame: *TrapFrame, entry_is_lstar: bool) u64 {
         return result;
     }
     if (fd_syscalls.dispatch(h, state, proc, frame)) |result| {
+        return result;
+    }
+    if (native_ipc_syscalls.dispatch(h, state, proc, frame)) |result| {
         return result;
     }
     if (process_syscalls.dispatch(h, state, proc, frame)) |result| {

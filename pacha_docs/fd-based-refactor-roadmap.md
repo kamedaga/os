@@ -444,6 +444,8 @@ Phase 0 の作業入口は [[phase0-checklist]]。
 - `libipc` を提供する
 - normal IPC を安定させる
 
+実装メモは [[phase4-fd-passing-ipc]] に置く。
+
 ### Phase 5: Fast IPC
 
 - shared VMO ring を使う fast IPC channel を設計する

@@ -1,6 +1,7 @@
 const abi_root = @import("kernel_abi_root");
 
 const ipc_buffer_abi = abi_root.ipc_buffer_abi;
+const ipc_abi = abi_root.ipc_abi;
 const capsule_abi = abi_root.capsule_abi;
 const fd_abi = abi_root.fd_abi;
 const process_abi = abi_root.process_abi;
@@ -52,6 +53,13 @@ pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
 pub const syscall_vmo_from_current_pages: u64 = fd_abi.syscall_vmo_from_current_pages;
 pub const syscall_mmap: u64 = fd_abi.syscall_mmap;
 pub const syscall_munmap: u64 = fd_abi.syscall_munmap;
+
+pub const syscall_ipc_endpoint_create: u64 = ipc_abi.syscall_ipc_endpoint_create;
+pub const syscall_ipc_channel_create: u64 = ipc_abi.syscall_ipc_channel_create;
+pub const syscall_ipc_send: u64 = ipc_abi.syscall_ipc_send;
+pub const syscall_ipc_recv: u64 = ipc_abi.syscall_ipc_recv;
+pub const syscall_ipc_call: u64 = ipc_abi.syscall_ipc_call;
+pub const syscall_ipc_reply: u64 = ipc_abi.syscall_ipc_reply;
 
 pub const syscall_set_fs_base_self: u64 = process_abi.syscall_set_fs_base_self;
 pub const syscall_get_process_status: u64 = process_abi.syscall_get_process_status;

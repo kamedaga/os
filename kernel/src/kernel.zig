@@ -290,6 +290,9 @@ pub const KernelObjectKind = enum(u16) {
     capsule_compat = 4,
     event = 5,
     vmo = 6,
+    endpoint = 7,
+    channel = 8,
+    reply = 9,
 };
 
 pub const KernelObjectRef = struct {
@@ -310,6 +313,9 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     capsule_compat: u64,
     event: u64,
     vmo: NativeVmoRef,
+    endpoint: IpcEndpointRef,
+    channel: IpcChannelHandle,
+    reply: IpcReplyRef,
 };
 
 pub const KernelObjectSlot = struct {
@@ -344,6 +350,144 @@ pub const FdTable = struct {
 pub const FdTransferMode = enum(u8) {
     copy,
     move,
+};
+
+pub const max_ipc_endpoints: usize = 1024;
+pub const max_ipc_channels: usize = 512;
+pub const max_ipc_replies: usize = 1024;
+pub const max_ipc_queue_messages: usize = 16;
+pub const max_ipc_message_fds: usize = 8;
+
+pub const IpcEndpointRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: IpcEndpointRef) bool {
+        return self.generation == 0;
+    }
+};
+
+pub const IpcChannelRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: IpcChannelRef) bool {
+        return self.generation == 0;
+    }
+};
+
+pub const IpcChannelHandle = struct {
+    channel: IpcChannelRef = .{},
+    side: u8 = 0,
+};
+
+pub const IpcReplyRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: IpcReplyRef) bool {
+        return self.generation == 0;
+    }
+};
+
+pub const IpcTransferredFd = struct {
+    object: KernelObjectRef = .{},
+    rights: FdRights = .{},
+    flags: FdFlags = .{},
+};
+
+pub const IpcMessage = struct {
+    active: bool = false,
+    sender: PrincipalId = default_process_principal,
+    words: [4]u64 = .{ 0, 0, 0, 0 },
+    fd_count: u8 = 0,
+    fds: [max_ipc_message_fds]IpcTransferredFd = [_]IpcTransferredFd{.{}} ** max_ipc_message_fds,
+};
+
+pub const IpcQueue = struct {
+    messages: [max_ipc_queue_messages]IpcMessage = [_]IpcMessage{.{}} ** max_ipc_queue_messages,
+    head: u8 = 0,
+    len: u8 = 0,
+
+    pub fn isEmpty(self: *const IpcQueue) bool {
+        return self.len == 0;
+    }
+
+    pub fn isFull(self: *const IpcQueue) bool {
+        return self.len >= max_ipc_queue_messages;
+    }
+
+    fn slotIndex(self: *const IpcQueue, offset: usize) usize {
+        return (@as(usize, self.head) + offset) % max_ipc_queue_messages;
+    }
+
+    pub fn peek(self: *const IpcQueue) ?*const IpcMessage {
+        if (self.len == 0) return null;
+        return &self.messages[self.head];
+    }
+
+    pub fn push(self: *IpcQueue, msg: IpcMessage) KernelError!void {
+        if (self.isFull()) return KernelError.TableFull;
+        const index = self.slotIndex(self.len);
+        self.messages[index] = msg;
+        self.messages[index].active = true;
+        self.len += 1;
+    }
+
+    pub fn pop(self: *IpcQueue) ?IpcMessage {
+        if (self.len == 0) return null;
+        const index = self.head;
+        const msg = self.messages[index];
+        self.messages[index] = .{};
+        self.head = @intCast((@as(usize, self.head) + 1) % max_ipc_queue_messages);
+        self.len -= 1;
+        if (self.len == 0) self.head = 0;
+        return msg;
+    }
+};
+
+pub const IpcEndpointSlot = struct {
+    active: bool = false,
+    generation: u32 = 1,
+    queue: IpcQueue = .{},
+};
+
+pub const IpcChannelSlot = struct {
+    active: bool = false,
+    generation: u32 = 1,
+    ref_count: u8 = 0,
+    queues: [2]IpcQueue = .{ .{}, .{} },
+};
+
+pub const IpcReplySlot = struct {
+    active: bool = false,
+    generation: u32 = 1,
+    sent: bool = false,
+    queue: IpcQueue = .{},
+};
+
+pub const IpcSendFd = struct {
+    fd: Fd,
+    rights: FdRights,
+    flags: FdFlags = .{},
+    move: bool = false,
+};
+
+pub const IpcSendMessage = struct {
+    words: [4]u64 = .{ 0, 0, 0, 0 },
+    fds: []const IpcSendFd = &.{},
+};
+
+pub const IpcRecvFd = struct {
+    fd: Fd = 0,
+    rights: FdRights = .{},
+    flags: FdFlags = .{},
+};
+
+pub const IpcRecvResult = struct {
+    words: [4]u64 = .{ 0, 0, 0, 0 },
+    fd_count: usize = 0,
+    fds: [max_ipc_message_fds]IpcRecvFd = [_]IpcRecvFd{.{}} ** max_ipc_message_fds,
 };
 
 pub const native_page_size: u64 = 4096;
@@ -1812,6 +1956,12 @@ pub const KernelState = struct {
     next_fd_object_scan: usize = 0,
     native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
     next_native_vmo_scan: usize = 0,
+    ipc_endpoints: [max_ipc_endpoints]IpcEndpointSlot = [_]IpcEndpointSlot{.{}} ** max_ipc_endpoints,
+    next_ipc_endpoint_scan: usize = 0,
+    ipc_channels: [max_ipc_channels]IpcChannelSlot = [_]IpcChannelSlot{.{}} ** max_ipc_channels,
+    next_ipc_channel_scan: usize = 0,
+    ipc_replies: [max_ipc_replies]IpcReplySlot = [_]IpcReplySlot{.{}} ** max_ipc_replies,
+    next_ipc_reply_scan: usize = 0,
     pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
     iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
@@ -1951,6 +2101,168 @@ pub const KernelState = struct {
         }
     }
 
+    fn releaseIpcMessage(self: *KernelState, msg: *IpcMessage) void {
+        var i: usize = 0;
+        while (i < msg.fd_count and i < max_ipc_message_fds) : (i += 1) {
+            const object_ref = msg.fds[i].object;
+            if (!object_ref.isNull()) self.releaseKernelObject(object_ref);
+            msg.fds[i] = .{};
+        }
+        msg.* = .{};
+    }
+
+    fn clearIpcQueue(self: *KernelState, queue: *IpcQueue) void {
+        while (queue.pop()) |msg_value| {
+            var msg = msg_value;
+            self.releaseIpcMessage(&msg);
+        }
+        queue.* = .{};
+    }
+
+    fn ipcEndpointSlot(self: *KernelState, endpoint_ref: IpcEndpointRef) ?*IpcEndpointSlot {
+        if (endpoint_ref.isNull()) return null;
+        const index: usize = @intCast(endpoint_ref.index);
+        if (index >= max_ipc_endpoints) return null;
+        const slot = &self.ipc_endpoints[index];
+        if (!slot.active or slot.generation != endpoint_ref.generation) return null;
+        return slot;
+    }
+
+    fn ipcEndpointSlotConst(self: *const KernelState, endpoint_ref: IpcEndpointRef) ?*const IpcEndpointSlot {
+        if (endpoint_ref.isNull()) return null;
+        const index: usize = @intCast(endpoint_ref.index);
+        if (index >= max_ipc_endpoints) return null;
+        const slot = &self.ipc_endpoints[index];
+        if (!slot.active or slot.generation != endpoint_ref.generation) return null;
+        return slot;
+    }
+
+    fn clearIpcEndpointSlot(self: *KernelState, endpoint_ref: IpcEndpointRef) void {
+        const slot = self.ipcEndpointSlot(endpoint_ref) orelse return;
+        self.clearIpcQueue(&slot.queue);
+        slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+    }
+
+    fn createIpcEndpoint(self: *KernelState) KernelError!IpcEndpointRef {
+        var offset: usize = 0;
+        while (offset < max_ipc_endpoints) : (offset += 1) {
+            const index = (self.next_ipc_endpoint_scan + offset) % max_ipc_endpoints;
+            const slot = &self.ipc_endpoints[index];
+            if (slot.active) continue;
+            if (slot.generation == 0) slot.generation = 1;
+            slot.active = true;
+            slot.queue = .{};
+            self.next_ipc_endpoint_scan = (index + 1) % max_ipc_endpoints;
+            return .{ .index = @intCast(index), .generation = slot.generation };
+        }
+        return KernelError.TableFull;
+    }
+
+    fn ipcChannelSlot(self: *KernelState, channel_ref: IpcChannelRef) ?*IpcChannelSlot {
+        if (channel_ref.isNull()) return null;
+        const index: usize = @intCast(channel_ref.index);
+        if (index >= max_ipc_channels) return null;
+        const slot = &self.ipc_channels[index];
+        if (!slot.active or slot.generation != channel_ref.generation) return null;
+        return slot;
+    }
+
+    fn ipcChannelSlotConst(self: *const KernelState, channel_ref: IpcChannelRef) ?*const IpcChannelSlot {
+        if (channel_ref.isNull()) return null;
+        const index: usize = @intCast(channel_ref.index);
+        if (index >= max_ipc_channels) return null;
+        const slot = &self.ipc_channels[index];
+        if (!slot.active or slot.generation != channel_ref.generation) return null;
+        return slot;
+    }
+
+    fn createIpcChannel(self: *KernelState) KernelError!IpcChannelRef {
+        var offset: usize = 0;
+        while (offset < max_ipc_channels) : (offset += 1) {
+            const index = (self.next_ipc_channel_scan + offset) % max_ipc_channels;
+            const slot = &self.ipc_channels[index];
+            if (slot.active) continue;
+            if (slot.generation == 0) slot.generation = 1;
+            slot.active = true;
+            slot.ref_count = 2;
+            slot.queues = .{ .{}, .{} };
+            self.next_ipc_channel_scan = (index + 1) % max_ipc_channels;
+            return .{ .index = @intCast(index), .generation = slot.generation };
+        }
+        return KernelError.TableFull;
+    }
+
+    fn releaseIpcChannelHandle(self: *KernelState, handle: IpcChannelHandle) void {
+        const slot = self.ipcChannelSlot(handle.channel) orelse return;
+        if (slot.ref_count == 0) return;
+        slot.ref_count -= 1;
+        if (slot.ref_count != 0) return;
+        self.clearIpcQueue(&slot.queues[0]);
+        self.clearIpcQueue(&slot.queues[1]);
+        slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+    }
+
+    fn ipcReplySlot(self: *KernelState, reply_ref: IpcReplyRef) ?*IpcReplySlot {
+        if (reply_ref.isNull()) return null;
+        const index: usize = @intCast(reply_ref.index);
+        if (index >= max_ipc_replies) return null;
+        const slot = &self.ipc_replies[index];
+        if (!slot.active or slot.generation != reply_ref.generation) return null;
+        return slot;
+    }
+
+    fn ipcReplySlotConst(self: *const KernelState, reply_ref: IpcReplyRef) ?*const IpcReplySlot {
+        if (reply_ref.isNull()) return null;
+        const index: usize = @intCast(reply_ref.index);
+        if (index >= max_ipc_replies) return null;
+        const slot = &self.ipc_replies[index];
+        if (!slot.active or slot.generation != reply_ref.generation) return null;
+        return slot;
+    }
+
+    fn clearIpcReplySlot(self: *KernelState, reply_ref: IpcReplyRef) void {
+        const slot = self.ipcReplySlot(reply_ref) orelse return;
+        self.clearIpcQueue(&slot.queue);
+        slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+    }
+
+    fn createIpcReply(self: *KernelState) KernelError!IpcReplyRef {
+        var offset: usize = 0;
+        while (offset < max_ipc_replies) : (offset += 1) {
+            const index = (self.next_ipc_reply_scan + offset) % max_ipc_replies;
+            const slot = &self.ipc_replies[index];
+            if (slot.active) continue;
+            if (slot.generation == 0) slot.generation = 1;
+            slot.active = true;
+            slot.sent = false;
+            slot.queue = .{};
+            self.next_ipc_reply_scan = (index + 1) % max_ipc_replies;
+            return .{ .index = @intCast(index), .generation = slot.generation };
+        }
+        return KernelError.TableFull;
+    }
+
+    fn resetNativeIpcObjects(self: *KernelState) void {
+        for (self.ipc_endpoints[0..]) |*slot| {
+            if (slot.active) self.clearIpcQueue(&slot.queue);
+            slot.* = .{};
+        }
+        for (self.ipc_channels[0..]) |*slot| {
+            if (slot.active) {
+                self.clearIpcQueue(&slot.queues[0]);
+                self.clearIpcQueue(&slot.queues[1]);
+            }
+            slot.* = .{};
+        }
+        for (self.ipc_replies[0..]) |*slot| {
+            if (slot.active) self.clearIpcQueue(&slot.queue);
+            slot.* = .{};
+        }
+        self.next_ipc_endpoint_scan = 0;
+        self.next_ipc_channel_scan = 0;
+        self.next_ipc_reply_scan = 0;
+    }
+
     pub fn nativeVmoRefCount(self: *const KernelState, vmo_ref: NativeVmoRef) ?u32 {
         const slot = self.nativeVmoSlotConst(vmo_ref) orelse return null;
         return slot.ref_count;
@@ -2014,6 +2326,9 @@ pub const KernelState = struct {
     fn releaseKernelObjectPayload(self: *KernelState, slot: *const KernelObjectSlot) void {
         switch (slot.payload) {
             .vmo => |vmo_ref| self.releaseNativeVmo(vmo_ref),
+            .endpoint => |endpoint_ref| self.clearIpcEndpointSlot(endpoint_ref),
+            .channel => |channel_handle| self.releaseIpcChannelHandle(channel_handle),
+            .reply => |reply_ref| self.clearIpcReplySlot(reply_ref),
             else => {},
         }
     }
@@ -2025,6 +2340,9 @@ pub const KernelState = struct {
     ) void {
         switch (slot.payload) {
             .vmo => |vmo_ref| self.releaseNativeVmoWithFreeList(vmo_ref, free_list),
+            .endpoint => |endpoint_ref| self.clearIpcEndpointSlot(endpoint_ref),
+            .channel => |channel_handle| self.releaseIpcChannelHandle(channel_handle),
+            .reply => |reply_ref| self.clearIpcReplySlot(reply_ref),
             else => {},
         }
     }
@@ -3235,6 +3553,322 @@ pub const KernelState = struct {
         return @intCast(dest_index);
     }
 
+    fn endpointRights() FdRights {
+        return .{
+            .inspect = true,
+            .dup = true,
+            .transfer = true,
+            .wait = true,
+            .poll = true,
+            .set_flags = true,
+            .close = true,
+            .send = true,
+            .recv = true,
+            .call = true,
+        };
+    }
+
+    fn replyReceiveRights() FdRights {
+        return .{
+            .inspect = true,
+            .wait = true,
+            .poll = true,
+            .close = true,
+            .recv = true,
+        };
+    }
+
+    fn replySendRights() FdRights {
+        return .{
+            .inspect = true,
+            .close = true,
+            .send = true,
+        };
+    }
+
+    pub fn createIpcEndpointFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        try self.requireActiveProcess(owner);
+        const endpoint_ref = try self.createIpcEndpoint();
+        const object_ref = self.createKernelObject(.endpoint, .{ .endpoint = endpoint_ref }) catch |err| {
+            self.clearIpcEndpointSlot(endpoint_ref);
+            return err;
+        };
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub const IpcChannelPair = struct {
+        a: Fd,
+        b: Fd,
+    };
+
+    pub fn createIpcChannelPairFds(
+        self: *KernelState,
+        owner: PrincipalId,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!IpcChannelPair {
+        try self.requireActiveProcess(owner);
+        const channel_ref = try self.createIpcChannel();
+        const object_a = self.createKernelObject(.channel, .{ .channel = .{ .channel = channel_ref, .side = 0 } }) catch |err| {
+            self.releaseIpcChannelHandle(.{ .channel = channel_ref, .side = 0 });
+            self.releaseIpcChannelHandle(.{ .channel = channel_ref, .side = 1 });
+            return err;
+        };
+        errdefer if (self.kernelObjectSlot(object_a)) |slot| self.clearKernelObjectSlot(slot);
+        const object_b = self.createKernelObject(.channel, .{ .channel = .{ .channel = channel_ref, .side = 1 } }) catch |err| {
+            return err;
+        };
+        errdefer if (self.kernelObjectSlot(object_b)) |slot| self.clearKernelObjectSlot(slot);
+        const fd_a = try self.installFd(owner, object_a, rights, flags, min_fd);
+        errdefer self.closeFd(owner, fd_a) catch {};
+        const fd_b = try self.installFd(owner, object_b, rights, flags, min_fd);
+        return .{ .a = fd_a, .b = fd_b };
+    }
+
+    fn ipcMessageQueueForSend(self: *KernelState, object_ref: KernelObjectRef) KernelError!*IpcQueue {
+        const slot = self.kernelObjectSlot(object_ref) orelse return KernelError.InvalidState;
+        return switch (slot.payload) {
+            .endpoint => |endpoint_ref| &(self.ipcEndpointSlot(endpoint_ref) orelse return KernelError.InvalidState).queue,
+            .channel => |handle| blk: {
+                if (handle.side > 1) return KernelError.InvalidState;
+                const channel = self.ipcChannelSlot(handle.channel) orelse return KernelError.InvalidState;
+                break :blk &channel.queues[1 - @as(usize, handle.side)];
+            },
+            .reply => |reply_ref| blk: {
+                const reply = self.ipcReplySlot(reply_ref) orelse return KernelError.InvalidState;
+                if (reply.sent) return KernelError.InvalidState;
+                break :blk &reply.queue;
+            },
+            else => return KernelError.InvalidState,
+        };
+    }
+
+    fn markReplySentIfNeeded(self: *KernelState, object_ref: KernelObjectRef) void {
+        const slot = self.kernelObjectSlot(object_ref) orelse return;
+        switch (slot.payload) {
+            .reply => |reply_ref| {
+                const reply = self.ipcReplySlot(reply_ref) orelse return;
+                reply.sent = true;
+            },
+            else => {},
+        }
+    }
+
+    fn ipcMessageQueueForRecv(self: *KernelState, object_ref: KernelObjectRef) KernelError!*IpcQueue {
+        const slot = self.kernelObjectSlot(object_ref) orelse return KernelError.InvalidState;
+        return switch (slot.payload) {
+            .endpoint => |endpoint_ref| &(self.ipcEndpointSlot(endpoint_ref) orelse return KernelError.InvalidState).queue,
+            .channel => |handle| blk: {
+                if (handle.side > 1) return KernelError.InvalidState;
+                const channel = self.ipcChannelSlot(handle.channel) orelse return KernelError.InvalidState;
+                break :blk &channel.queues[@as(usize, handle.side)];
+            },
+            .reply => |reply_ref| &(self.ipcReplySlot(reply_ref) orelse return KernelError.InvalidState).queue,
+            else => return KernelError.InvalidState,
+        };
+    }
+
+    fn fdFreeCountFrom(self: *const KernelState, owner: PrincipalId, min_fd: Fd) KernelError!usize {
+        const table = try self.fdTableForActiveProcessConst(owner);
+        var index = fdIndex(min_fd) orelse return KernelError.InvalidState;
+        var count: usize = 0;
+        while (index < fd_table_entries) : (index += 1) {
+            if (table.entries[index].isEmpty()) count += 1;
+        }
+        return count;
+    }
+
+    fn validateIpcSendFds(specs: []const IpcSendFd) KernelError!void {
+        if (specs.len > max_ipc_message_fds) return KernelError.InvalidState;
+        for (specs, 0..) |spec, i| {
+            if (!spec.move) continue;
+            for (specs[i + 1 ..]) |later| {
+                if (later.move and later.fd == spec.fd) return KernelError.InvalidState;
+            }
+        }
+    }
+
+    fn appendIpcSendFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        msg: *IpcMessage,
+        spec: IpcSendFd,
+    ) KernelError!void {
+        if (msg.fd_count >= max_ipc_message_fds) return KernelError.InvalidState;
+        const table = try self.fdTableForActiveProcessConst(owner);
+        const index = fdIndex(spec.fd) orelse return KernelError.InvalidState;
+        const source = table.entries[index];
+        if (source.object.isNull()) return KernelError.InvalidState;
+        if (!source.rights.transfer) return KernelError.InvalidState;
+        if (!isFdRightsSubset(spec.rights, source.rights)) return KernelError.InvalidState;
+        if (self.kernelObjectSlotConst(source.object) == null) return KernelError.InvalidState;
+        try self.retainKernelObject(source.object);
+        msg.fds[msg.fd_count] = .{
+            .object = source.object,
+            .rights = fdRightsFromBits(fdRightsToBits(spec.rights)),
+            .flags = fdFlagsFromBits(fdFlagsToBits(spec.flags)),
+        };
+        msg.fd_count += 1;
+    }
+
+    fn closeMovedIpcSendFds(self: *KernelState, owner: PrincipalId, specs: []const IpcSendFd) void {
+        for (specs) |spec| {
+            if (!spec.move) continue;
+            self.closeFd(owner, spec.fd) catch {};
+        }
+    }
+
+    fn buildIpcMessage(
+        self: *KernelState,
+        owner: PrincipalId,
+        send: IpcSendMessage,
+    ) KernelError!IpcMessage {
+        try validateIpcSendFds(send.fds);
+        var msg = IpcMessage{
+            .active = true,
+            .sender = owner,
+            .words = send.words,
+        };
+        errdefer self.releaseIpcMessage(&msg);
+        for (send.fds) |spec| {
+            try self.appendIpcSendFd(owner, &msg, spec);
+        }
+        return msg;
+    }
+
+    fn enqueueIpcMessage(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        send: IpcSendMessage,
+        require_call: bool,
+    ) KernelError!void {
+        const table = try self.fdTableForActiveProcessConst(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const entry = table.entries[index];
+        if (entry.object.isNull()) return KernelError.InvalidState;
+        if (require_call) {
+            if (!entry.rights.call) return KernelError.InvalidState;
+        } else if (!entry.rights.send) {
+            return KernelError.InvalidState;
+        }
+        var msg = try self.buildIpcMessage(owner, send);
+        errdefer self.releaseIpcMessage(&msg);
+        const queue = try self.ipcMessageQueueForSend(entry.object);
+        try queue.push(msg);
+        msg = .{};
+        self.markReplySentIfNeeded(entry.object);
+        self.closeMovedIpcSendFds(owner, send.fds);
+    }
+
+    pub fn ipcSend(self: *KernelState, owner: PrincipalId, fd: Fd, send: IpcSendMessage) KernelError!void {
+        try self.requireActiveProcess(owner);
+        try self.enqueueIpcMessage(owner, fd, send, false);
+    }
+
+    pub fn ipcReply(self: *KernelState, owner: PrincipalId, fd: Fd, send: IpcSendMessage) KernelError!void {
+        const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+        if (slot.kind != .reply) return KernelError.InvalidState;
+        try self.ipcSend(owner, fd, send);
+    }
+
+    pub fn ipcCall(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        send: IpcSendMessage,
+        min_reply_fd: Fd,
+    ) KernelError!Fd {
+        try self.requireActiveProcess(owner);
+        if (send.fds.len >= max_ipc_message_fds) return KernelError.InvalidState;
+        const reply_ref = try self.createIpcReply();
+        const reply_object = self.createKernelObject(.reply, .{ .reply = reply_ref }) catch |err| {
+            self.clearIpcReplySlot(reply_ref);
+            return err;
+        };
+        errdefer if (self.kernelObjectSlot(reply_object)) |slot| self.clearKernelObjectSlot(slot);
+        const reply_fd = try self.installFd(owner, reply_object, replyReceiveRights(), .{ .cloexec = true }, min_reply_fd);
+        errdefer self.closeFd(owner, reply_fd) catch {};
+
+        var msg = try self.buildIpcMessage(owner, send);
+        errdefer self.releaseIpcMessage(&msg);
+        try self.retainKernelObject(reply_object);
+        msg.fds[msg.fd_count] = .{
+            .object = reply_object,
+            .rights = replySendRights(),
+            .flags = .{ .cloexec = true },
+        };
+        msg.fd_count += 1;
+
+        const table = try self.fdTableForActiveProcessConst(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const entry = table.entries[index];
+        if (entry.object.isNull() or !entry.rights.call) return KernelError.InvalidState;
+        const queue = try self.ipcMessageQueueForSend(entry.object);
+        try queue.push(msg);
+        msg = .{};
+        self.closeMovedIpcSendFds(owner, send.fds);
+        return reply_fd;
+    }
+
+    pub fn ipcRecv(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        fd_capacity: usize,
+        min_fd: Fd,
+    ) KernelError!IpcRecvResult {
+        try self.requireActiveProcess(owner);
+        const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        if (!entry.rights.recv) return KernelError.InvalidState;
+        if (fd_capacity > max_ipc_message_fds) return KernelError.InvalidState;
+        const queue = try self.ipcMessageQueueForRecv(entry.object);
+        const pending = queue.peek() orelse return KernelError.MailboxEmpty;
+        if (pending.fd_count > fd_capacity) return KernelError.TableFull;
+        if (try self.fdFreeCountFrom(owner, min_fd) < pending.fd_count) return KernelError.TableFull;
+
+        var installed: [max_ipc_message_fds]Fd = [_]Fd{0} ** max_ipc_message_fds;
+        var installed_count: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < installed_count) : (i += 1) {
+                self.closeFd(owner, installed[i]) catch {};
+            }
+        }
+
+        var result = IpcRecvResult{
+            .words = pending.words,
+            .fd_count = pending.fd_count,
+        };
+        var i: usize = 0;
+        while (i < pending.fd_count) : (i += 1) {
+            const item = pending.fds[i];
+            const new_fd = try self.installFd(owner, item.object, item.rights, item.flags, min_fd);
+            installed[installed_count] = new_fd;
+            installed_count += 1;
+            result.fds[i] = .{
+                .fd = new_fd,
+                .rights = item.rights,
+                .flags = item.flags,
+            };
+        }
+
+        var msg = queue.pop() orelse return KernelError.MailboxEmpty;
+        self.releaseIpcMessage(&msg);
+        return result;
+    }
+
     fn nextProcessCapacity(self: *const KernelState, required: usize) ?usize {
         if (required > max_process_slots) return null;
         var capacity = self.process_capacity;
@@ -3489,6 +4123,7 @@ pub const KernelState = struct {
         self.published_service_endpoints = .{};
         self.resetKernelObjectTable();
         self.resetNativeVmoTable();
+        self.resetNativeIpcObjects();
         i = 0;
         while (i < self.process_capacity) : (i += 1) {
             (self.processDescriptorSlot(i) orelse break).* = .{};

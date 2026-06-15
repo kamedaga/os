@@ -69,6 +69,9 @@ pub const mmap_noreserve: u64 = 1 << 5;
 
 pub const fd_kind_none: u64 = 0;
 pub const fd_kind_vmo: u64 = 6;
+pub const fd_kind_endpoint: u64 = 7;
+pub const fd_kind_channel: u64 = 8;
+pub const fd_kind_reply: u64 = 9;
 
 pub const fd_info_kind_offset: u64 = 0;
 pub const fd_info_rights_offset: u64 = 8;

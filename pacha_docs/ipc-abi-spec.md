@@ -30,20 +30,18 @@ kernel から見ると、それらは endpoint / channel fd に過ぎない。
 
 ## 操作
 
-最小 syscall 案。
+Phase 4 の最小 syscall。
 
 ```text
-ipc_endpoint_create(flags) -> endpoint_fd
-ipc_channel_create(flags) -> channel_a_fd, channel_b_fd
-ipc_accept(endpoint_fd, flags) -> channel_fd
-ipc_connect(endpoint_fd, flags) -> channel_fd
+ipc_endpoint_create(rights, flags) -> endpoint_fd
+ipc_channel_create(out_pair, rights, flags) -> status
 ipc_send(fd, message)
 ipc_recv(fd, message_buf)
-ipc_call(fd, request, reply_buf)
+ipc_call(fd, request) -> reply_fd
 ipc_reply(reply_fd, reply)
 ```
 
-`ipc_call` は内部的に one-shot `Reply fd` を作って送る形にできる。
+`ipc_call` は one-shot `Reply fd` を作り、receiver に send-only Reply fd を添付する。
 
 ## Message Format
 
@@ -62,15 +60,20 @@ struct pacha_ipc_fd {
 };
 
 struct pacha_ipc_msg {
-    struct pacha_ipc_iov *iov;
-    size_t iov_count;
+    uint64_t word0;
+    uint64_t word1;
+    uint64_t word2;
+    uint64_t word3;
     struct pacha_ipc_fd *fds;
-    size_t fd_count;
+    uint64_t fd_count;
+    uint64_t fd_capacity;
     uint64_t flags;
 };
 ```
 
 受信時は同じ構造体に受信用 buffer と fd array を渡す。
+
+Phase 4 では inline payload は 4 words に固定する。large payload は VMO fd / fast IPC data plane に載せる。
 
 ## Atomicity
 
@@ -100,9 +103,7 @@ transfer flags。
 | `CLOEXEC` | 受信 fd に CLOEXEC を付ける |
 | `NONBLOCK` | 受信 fd に NONBLOCK を付ける |
 
-`COPY` には sender fd の `TRANSFER` right が必要。
-
-`MOVE` は fd 自体の移譲であり、`TRANSFER` right が必要かどうかは Phase 0 で決める。安全側では必要にする。
+`COPY` / `MOVE` の両方で sender fd の `TRANSFER` right が必要。
 
 ## Blocking
 
