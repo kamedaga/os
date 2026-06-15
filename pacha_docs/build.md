@@ -113,6 +113,12 @@ boot smoke:
 ./pacgo test smoke
 ```
 
+fd IPC だけを最小 init で確認:
+
+```bash
+./pacgo test fd-ipc-smoke
+```
+
 TTY interaction test:
 
 ```bash

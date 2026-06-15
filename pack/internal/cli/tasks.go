@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"capabilityos/pack/internal/bootfs"
+	"capabilityos/pack/internal/boottest"
 	"capabilityos/pack/internal/buildsys"
 	"capabilityos/pack/internal/diskimage"
 	"capabilityos/pack/internal/manifests"
@@ -146,6 +147,7 @@ func testCommand(ctx *context) *cobra.Command {
 		},
 	}
 	cmd.AddCommand(smokeTestCommand(ctx))
+	cmd.AddCommand(fdIPCSmokeTestCommand(ctx))
 	cmd.AddCommand(qemuTestCommand(ctx, "qemu"))
 	return cmd
 }
@@ -163,6 +165,44 @@ func smokeTestCommand(ctx *context) *cobra.Command {
 	}
 	cmd.Flags().DurationVar(&timeout, "timeout", 45*time.Second, "maximum time to wait for the smoke marker")
 	cmd.Flags().StringVar(&marker, "marker", "[seed2_root] manifest scheduler done", "serial log marker required for success")
+	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
+	return cmd
+}
+
+func fdIPCSmokeTestCommand(ctx *context) *cobra.Command {
+	var timeout time.Duration
+	var noKVM bool
+	cmd := &cobra.Command{
+		Use:   "fd-ipc-smoke",
+		Short: "Boot QEMU with the minimal fd IPC init smoke",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ui.Task("test:fd-ipc-smoke")
+			result, err := boottest.RunFDIPCSmoke(ctx.workspace, boottest.FDIPCSmokeOptions{
+				Timeout: timeout,
+				NoKVM:   noKVM,
+			})
+			state := "passed"
+			if err != nil {
+				state = "failed"
+			}
+			ui.KeyValues("FD IPC Smoke", [][2]string{
+				{"state", state},
+				{"marker", result.Marker},
+				{"timeout", result.Timeout.String()},
+				{"smoke elf", ctx.workspace.Rel(result.SmokeELF)},
+				{"kernel", ctx.workspace.Rel(result.KernelEFI)},
+				{"disk", ctx.workspace.Rel(result.Disk)},
+				{"serial", ctx.workspace.Rel(result.Serial)},
+				{"qemu log", ctx.workspace.Rel(result.Log)},
+				{"restored", fmt.Sprint(result.Restored)},
+			})
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the fd IPC smoke marker")
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
 	return cmd
 }
