@@ -213,7 +213,9 @@ pkey は authority ではない。
 
 x86 PKU / PKRU は user mode で変更できるため、強い security boundary として扱わない。
 
-untrusted peer 間 IPC では、pkey ではなく fd rights / VMO fd / VMA/PTE permission を境界にする。
+別 process の untrusted peer 間 IPC では、raw pkey ではなく fd rights / VMO fd / VMA/PTE permission を境界にする。
+
+同一 process 内の untrusted fast path は Phase 5 では扱わない。Phase 5 は trusted 別 process の `pkey_ring` backend に集中する。
 
 詳細は [Phase 5 fast IPC / pkey threat model](./phase5-fast-ipc-pkey-threat-model.md) に固定する。
 
@@ -230,6 +232,40 @@ channel_fd
 setup は normal IPC で行う。
 
 hot path は `libipc` が pkey access window を開いて ring を操作する。
+
+別 process の fast IPC では、spawn / exec 時に child process が最初の control channel fd を受け取る必要がある。そのため process builder は suspended child へ fd を attenuate して渡す bootstrap ABI を持つ。
+
+```text
+process_builder.transfer_fd_to_process(
+  process_token,
+  source_fd,
+  min_child_fd,
+  child_rights,
+  child_flags
+) -> child_fd
+```
+
+これは fast IPC 専用ではない。`Process fd` 化までの移行中に、fd-based process bootstrap を成立させるための最小 ABI である。authority は source fd の `TRANSFER` right と指定された attenuated rights で決まる。
+process builder API は `libipc` には入れない。loader / process builder library の境界に置く。
+
+`libipc` は次を提供する。
+
+```text
+fast channel offer / accept
+normal backend explicit init
+backend readiness check
+ring backend check
+entry initializer
+fast send / recv
+fast call
+fast serve_once handler
+```
+
+これにより userland service は raw syscall ではなく、`libipc` の backend-neutral request/reply API を使う。
+
+Phase 5 の最初の実装対象は、この pkey shared-memory backend を QEMU 上で動かすことである。
+
+normal IPC は setup / fd passing / fallback の control plane として維持する。
 
 ## Feature Negotiation
 

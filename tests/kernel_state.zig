@@ -115,6 +115,41 @@ test "fd transfer copy and move enforce transfer right and refcounts" {
     try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(obj2));
 }
 
+test "process builder fd bootstrap transfers attenuated fd to suspended child" {
+    var s = try initFdState();
+    try std.testing.expect(s.ensureProcessDescriptor(p1, "suspended child"));
+    try s.markProcessBuilderSuspended(p1, p0);
+    try std.testing.expect(s.processBuilderOwnerMatches(p1, p0));
+    try std.testing.expect(!s.processBuilderOwnerMatches(p1, p2));
+
+    const pair = try s.createIpcChannelPairFds(
+        p0,
+        fdRights(.{ .send = true, .recv = true, .transfer = true, .close = true }),
+        .{},
+        16,
+    );
+    const child_fd = try s.transferFd(
+        p0,
+        p1,
+        pair.b,
+        16,
+        fdRights(.{ .send = true, .recv = true, .close = true }),
+        fdFlags(.{ .cloexec = true }),
+        .copy,
+    );
+    try std.testing.expect(child_fd >= 16);
+    const child_entry = s.fdEntryConst(p1, child_fd) orelse unreachable;
+    try std.testing.expect(child_entry.rights.send);
+    try std.testing.expect(child_entry.rights.recv);
+    try std.testing.expect(child_entry.rights.close);
+    try std.testing.expect(!child_entry.rights.transfer);
+    try std.testing.expect(child_entry.flags.cloexec);
+
+    try s.ipcSend(p1, child_fd, .{ .words = .{ 0xCAFE, 0, 0, 0 } });
+    const received = try s.ipcRecv(p0, pair.a, 0, 16);
+    try std.testing.expectEqual(@as(u64, 0xCAFE), received.words[0]);
+}
+
 test "fd replace releases destination exactly once" {
     var s = try initFdState();
     const obj_a = try createTestFdObject(&s, 30);

@@ -522,6 +522,7 @@ fn apIdleEntry(cpu_slot: usize) callconv(.c) noreturn {
     }
     x86_platform.loadInterruptTableForCurrentCpu();
     _ = x86_platform.enablePcidIfSupported();
+    _ = x86_platform.enablePkuIfSupported();
     if (cpu_slot < lstar_entries.len and lstar_entries[cpu_slot] != 0) {
         x86_platform.installSyscallEntry(lstar_entries[cpu_slot]);
     }
@@ -575,6 +576,7 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
         : .{ .memory = true });
     x86_platform.writeFsBase(entry.fs_base);
     x86_platform.writeGsBase(entry.gs_base);
+    x86_platform.writePkru(entry.pkru);
     asm volatile (std.fmt.comptimePrint(
             \\mov %[entry], %%rbx
             \\mov {d}(%%rbx), %%r11

@@ -11,6 +11,7 @@ pub const UserEntry = extern struct {
     fs_base: u64,
     gs_base: u64,
     fx_state_addr: u64,
+    pkru: u32,
     frame: interrupts.TrapFrame,
 };
 

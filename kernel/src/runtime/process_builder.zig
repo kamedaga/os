@@ -373,6 +373,32 @@ pub fn mprotectSelf(caller: kernel.PrincipalId, target_va: u64, byte_len: u64, p
     return boot_static.syscall_ok;
 }
 
+pub fn transferFdToProcess(
+    caller: kernel.PrincipalId,
+    token: u64,
+    source_fd: u64,
+    min_fd: u64,
+    rights_bits: u64,
+    flags_bits: u64,
+) u64 {
+    if (!isBuilderAuthorized(caller)) return boot_static.syscall_err_invalid;
+    const target = principalFromBuilderToken(caller, token) orelse return boot_static.syscall_err_invalid;
+    if (source_fd > std.math.maxInt(kernel.Fd)) return boot_static.syscall_err_invalid;
+    if (min_fd > std.math.maxInt(kernel.Fd)) return boot_static.syscall_err_invalid;
+    return state_ptr.transferFd(
+        caller,
+        target,
+        @intCast(source_fd),
+        @intCast(min_fd),
+        kernel.fdRightsFromBits(rights_bits),
+        kernel.fdFlagsFromBits(@truncate(flags_bits)),
+        .copy,
+    ) catch |err| switch (err) {
+        kernel.KernelError.TableFull => boot_static.syscall_err_alloc,
+        else => boot_static.syscall_err_invalid,
+    };
+}
+
 pub fn setAbiTrapDelegate(
     caller: kernel.PrincipalId,
     token: u64,

@@ -160,6 +160,7 @@ pub const ThreadContext = struct {
     cr3: u64 = 0,
     fs_base: u64 = 0,
     gs_base: u64 = 0,
+    pkru: u32 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
     wait_preserve_ipc_queue: bool = false,
@@ -769,6 +770,7 @@ fn claimIdleUserEntryFromAp(cpu_slot: usize, out_entry: *scheduler_observer.User
         .fs_base = ctx.fs_base,
         .gs_base = ctx.gs_base,
         .fx_state_addr = @intFromPtr(&ctx.fx_state),
+        .pkru = ctx.pkru,
         .frame = ctx.frame,
     };
     state.current_thread = thread_index;
@@ -1193,6 +1195,7 @@ pub fn saveApUserTimerFrame(frame: *const TrapFrame) bool {
     clearStaleAbiTrapReplyPendingForUserFrame(ctx, frame);
     if (ctx.abi_trap_reply_pending) return false;
     ctx.frame = frame.*;
+    ctx.pkru = x86_platform.readPkru();
     state.consumed_handoff_thread = null;
     state.pending_handoff_thread = null;
     state.validated_handoff_thread = null;
@@ -1543,6 +1546,7 @@ fn initThreadContextWithSpacesReady(
     ctx.cr3 = x86_platform.cr3WithUserPcid(space.cr3, pcidForPrincipal(owner_process));
     ctx.fs_base = 0;
     ctx.gs_base = 0;
+    ctx.pkru = 0;
     ctx.ready = initial_ready;
     ctx.wait_mailbox = false;
     ctx.wait_preserve_ipc_queue = false;
@@ -1935,6 +1939,7 @@ pub fn applyThreadFsBase(thread_index: usize) bool {
     if (!ctx.allocated) return false;
     x86_platform.writeFsBase(ctx.fs_base);
     x86_platform.writeGsBase(ctx.gs_base);
+    x86_platform.writePkru(ctx.pkru);
     return true;
 }
 
@@ -1990,6 +1995,7 @@ pub fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
     ctx.frame = frame.*;
     clearStaleAbiTrapReplyPendingForUserFrame(ctx, frame);
     ctx.cr3 = currentUserCr3();
+    ctx.pkru = x86_platform.readPkru();
     setIpcHotCr3(current_thread, ctx.cr3);
     const hot = getIpcHotThreadConst(current_thread) orelse return;
     if (hot.wait_mailbox == 0 and hot.wait_preserve_ipc_queue == 0 and hot.wake_tick == 0) {
@@ -2006,6 +2012,7 @@ pub fn loadThreadContextToFrame(thread_index: usize, frame: *TrapFrame) bool {
     schedulerFullMemoryFence();
     x86_platform.writeFsBase(ctx.fs_base);
     x86_platform.writeGsBase(ctx.gs_base);
+    x86_platform.writePkru(ctx.pkru);
     frame.* = ctx.frame;
     return true;
 }
@@ -2125,6 +2132,7 @@ fn blockCurrentThreadForEventInternal(frame: *TrapFrame, wait_mailbox: bool, pre
     saved.rax = resume_rax;
     ctx.frame = saved;
     ctx.cr3 = currentUserCr3();
+    ctx.pkru = x86_platform.readPkru();
     ctx.wait_mailbox = wait_mailbox;
     ctx.wait_preserve_ipc_queue = preserve_ipc_queue;
     ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;

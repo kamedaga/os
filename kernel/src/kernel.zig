@@ -88,6 +88,7 @@ pub const MapProt = struct {
     read: bool = false,
     write: bool = false,
     exec: bool = false,
+    pkey: u4 = 0,
 };
 
 pub const Capability = struct {
@@ -521,7 +522,8 @@ pub const VmaProt = packed struct(u8) {
     read: bool = false,
     write: bool = false,
     exec: bool = false,
-    _reserved: u5 = 0,
+    pkey: u4 = 0,
+    _reserved: u1 = 0,
 };
 
 pub const MmapFlags = packed struct(u32) {
@@ -531,7 +533,9 @@ pub const MmapFlags = packed struct(u32) {
     shared: bool = false,
     anonymous: bool = false,
     noreserve: bool = false,
-    _reserved: u26 = 0,
+    _reserved0: u2 = 0,
+    pkey: u4 = 0,
+    _reserved1: u20 = 0,
 };
 
 pub const VmaEntry = struct {
@@ -3148,6 +3152,7 @@ pub const KernelState = struct {
                 .read = entry.prot.read,
                 .write = entry.prot.write,
                 .exec = entry.prot.exec,
+                .pkey = entry.prot.pkey,
             },
         };
     }

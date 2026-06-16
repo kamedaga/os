@@ -228,7 +228,7 @@ fn initFxStateSupport() void {
 }
 
 // ---------------------------------------------------------------------------
-// Exported FX save/restore (called from assembly stubs in traps)
+// Exported extended user-state save/restore (called from assembly stubs in traps)
 // ---------------------------------------------------------------------------
 
 pub export fn saveCurrentThreadFxState() callconv(.c) void {
@@ -236,6 +236,7 @@ pub export fn saveCurrentThreadFxState() callconv(.c) void {
     const thread_index = scheduler.currentThreadIndex();
     const ctx = scheduler.getThreadContext(thread_index) orelse return;
     if (!scheduler.isThreadReady(thread_index)) return;
+    ctx.pkru = x86_platform.readPkru();
     asm volatile ("fxsave64 (%[ptr])"
         :
         : [ptr] "r" (&ctx.fx_state),
@@ -247,6 +248,7 @@ pub export fn restoreCurrentThreadFxState() callconv(.c) void {
     const thread_index = scheduler.currentThreadIndex();
     const ctx = scheduler.getThreadContext(thread_index) orelse return;
     if (!scheduler.isThreadReady(thread_index)) return;
+    x86_platform.writePkru(ctx.pkru);
     asm volatile ("fxrstor64 (%[ptr])"
         :
         : [ptr] "r" (&ctx.fx_state),
@@ -320,6 +322,9 @@ fn initKernelRuntimeOrHalt() void {
             halt.haltWithMessage("user spaces runtime mapping failed");
         }
         _ = x86_platform.enablePcidIfSupported();
+        const pku_enabled = x86_platform.enablePkuIfSupported();
+        kernel_log.write("pku: ");
+        kernel_log.write(if (pku_enabled) "enabled\n" else "unavailable\n");
         x86_platform.hardenKernelMappingsSupervisorOnly();
     }
     installInterruptTrampolines();

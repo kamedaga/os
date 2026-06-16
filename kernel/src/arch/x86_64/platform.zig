@@ -130,6 +130,7 @@ pub export var kernel_cr3_value: u64 = 0;
 pub export var kernel_syscall_stack_top: u64 = 0;
 pub export var kernel_syscall_stack_tops: [max_cpus]u64 = [_]u64{0} ** max_cpus;
 pub export var pcid_enabled: u64 = 0;
+pub export var pku_enabled: u64 = 0;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -192,6 +193,7 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_syscall_stack_top), &kernel_syscall_stack_top));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_syscall_stack_tops), &kernel_syscall_stack_tops));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pcid_enabled), &pcid_enabled));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(pku_enabled), &pku_enabled));
     return start;
 }
 
@@ -241,6 +243,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_syscall_stack_top), &kernel_syscall_stack_top));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_syscall_stack_tops), &kernel_syscall_stack_tops));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pcid_enabled), &pcid_enabled));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pku_enabled), &pku_enabled));
     return end;
 }
 
@@ -253,7 +256,9 @@ const msr_ia32_gs_base: u32 = 0xC000_0101;
 const efer_sce: u64 = 1 << 0;
 const cr4_pge: u64 = 1 << 7;
 const cr4_pcide: u64 = 1 << 17;
+const cr4_pke: u64 = 1 << 22;
 const cpuid_leaf1_ecx_pcid: u32 = 1 << 17;
+const cpuid_leaf7_ecx_pku: u32 = 1 << 3;
 const page_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_no_flush: u64 = 1 << 63;
@@ -300,6 +305,39 @@ pub fn enablePcidIfSupported() bool {
     cr4 |= cr4_pcide;
     writeCr4(cr4);
     pcid_enabled = 1;
+    return true;
+}
+
+pub fn readPkru() u32 {
+    if (pku_enabled == 0) return 0;
+    var eax: u32 = 0;
+    var edx: u32 = 0;
+    asm volatile ("rdpkru"
+        : [eax] "={eax}" (eax),
+          [edx] "={edx}" (edx),
+        : [ecx] "{ecx}" (@as(u32, 0)),
+    );
+    return eax;
+}
+
+pub fn writePkru(value: u32) void {
+    if (pku_enabled == 0) return;
+    asm volatile ("wrpkru"
+        :
+        : [eax] "{eax}" (value),
+          [ecx] "{ecx}" (@as(u32, 0)),
+          [edx] "{edx}" (@as(u32, 0)),
+        : .{ .memory = true });
+}
+
+pub fn enablePkuIfSupported() bool {
+    const features = cpuid(7);
+    if ((features.ecx & cpuid_leaf7_ecx_pku) == 0) return false;
+    var cr4 = readCr4();
+    cr4 |= cr4_pke;
+    writeCr4(cr4);
+    pku_enabled = 1;
+    writePkru(0);
     return true;
 }
 

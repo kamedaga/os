@@ -172,14 +172,16 @@ func smokeTestCommand(ctx *context) *cobra.Command {
 func fdIPCSmokeTestCommand(ctx *context) *cobra.Command {
 	var timeout time.Duration
 	var noKVM bool
+	var extraArgs []string
 	cmd := &cobra.Command{
 		Use:   "fd-ipc-smoke",
 		Short: "Boot QEMU with the minimal fd IPC init smoke",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ui.Task("test:fd-ipc-smoke")
 			result, err := boottest.RunFDIPCSmoke(ctx.workspace, boottest.FDIPCSmokeOptions{
-				Timeout: timeout,
-				NoKVM:   noKVM,
+				Timeout:   timeout,
+				NoKVM:     noKVM,
+				ExtraArgs: extraArgs,
 			})
 			state := "passed"
 			if err != nil {
@@ -204,6 +206,7 @@ func fdIPCSmokeTestCommand(ctx *context) *cobra.Command {
 	}
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the fd IPC smoke marker")
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
+	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
 	return cmd
 }
 

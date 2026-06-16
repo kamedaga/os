@@ -291,11 +291,21 @@ pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pml4_index: usize, pdp_in
     return slot;
 }
 
+const pte_addr_mask: u64 = 0x000f_ffff_ffff_f000;
+const pte_pkey_shift: u6 = 59;
+
+fn ptePaddr(entry: u64) u64 {
+    return entry & pte_addr_mask;
+}
+
 fn pteFlagsForProt(h: Hooks, prot: kernel.MapProt) ?u64 {
     if (!prot.read) return null;
     // NX is not enabled yet, so exec is tracked by ABI but not enforced in PTEs.
     _ = prot.exec;
-    return h.page_present | h.page_user | (if (prot.write) h.page_rw else 0);
+    return h.page_present |
+        h.page_user |
+        (if (prot.write) h.page_rw else 0) |
+        (@as(u64, prot.pkey) << pte_pkey_shift);
 }
 
 fn userRangeEndVa(h: Hooks, va_start: u64, size_bytes: u64) ?u64 {
@@ -483,7 +493,7 @@ pub fn protectUserLinearRegionWithProt(
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) == 0) return false;
         if ((old_entry & h.page_user) == 0) return false;
-        const paddr = old_entry & ~@as(u64, 0xFFF);
+        const paddr = ptePaddr(old_entry);
         pt_page[index.pt] = paddr | pte_flags;
     }
     h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
@@ -574,7 +584,7 @@ pub fn collectUserLinearRegionPaddrs(
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) == 0) return null;
         if ((old_entry & h.page_user) == 0) return null;
-        out_paddrs[page_index] = old_entry & ~@as(u64, 0xFFF);
+        out_paddrs[page_index] = ptePaddr(old_entry);
     }
 
     return page_count;
@@ -604,7 +614,7 @@ pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
             const old_entry = pt_page[pt_index];
             if ((old_entry & h.page_present) == 0) continue;
             if ((old_entry & h.page_user) == 0) continue;
-            if ((old_entry & ~@as(u64, 0xFFF)) != paddr) continue;
+            if (ptePaddr(old_entry) != paddr) continue;
             pt_page[pt_index] = 0;
             const va = (@as(u64, @intCast(pml4_index)) << 39) |
                 (@as(u64, @intCast(pdp_index)) << 30) |
@@ -634,7 +644,7 @@ pub fn collectUserMappedPaddrs(principal: kernel.PrincipalId, out_paddrs: []u64)
             const entry = pt_page[pt_index];
             if ((entry & h.page_present) == 0) continue;
             if ((entry & h.page_user) == 0) continue;
-            const paddr = entry & ~@as(u64, 0xFFF);
+            const paddr = ptePaddr(entry);
             if (paddr == 0) continue;
             var duplicate = false;
             for (out_paddrs[0..count]) |seen| {
@@ -681,7 +691,7 @@ pub fn forEachUserMappedPage(principal: kernel.PrincipalId, context: *anyopaque,
             const entry = pt_page[pt_index];
             if ((entry & h.page_present) == 0) continue;
             if ((entry & h.page_user) == 0) continue;
-            const paddr = entry & ~@as(u64, 0xFFF);
+            const paddr = ptePaddr(entry);
             if (paddr == 0) continue;
             const va = (@as(u64, @intCast(pml4_index)) << 39) |
                 (@as(u64, @intCast(pdp_index)) << 30) |
@@ -719,7 +729,7 @@ pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []Mapped
             const entry = pt_page[pt_index];
             if ((entry & h.page_present) == 0) continue;
             if ((entry & h.page_user) == 0) continue;
-            const paddr = entry & ~@as(u64, 0xFFF);
+            const paddr = ptePaddr(entry);
             if (paddr == 0) continue;
             var duplicate = false;
             for (out_pages[0..count]) |seen| {

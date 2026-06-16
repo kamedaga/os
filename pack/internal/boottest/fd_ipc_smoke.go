@@ -19,8 +19,9 @@ const (
 )
 
 type FDIPCSmokeOptions struct {
-	Timeout time.Duration
-	NoKVM   bool
+	Timeout   time.Duration
+	NoKVM     bool
+	ExtraArgs []string
 }
 
 type FDIPCSmokeResult struct {
@@ -105,10 +106,11 @@ func RunFDIPCSmoke(workspace *config.Workspace, opts FDIPCSmokeOptions) (FDIPCSm
 	}
 
 	smoke, smokeErr := qemu.Smoke(workspace, qemu.SmokeOptions{
-		Timeout: opts.Timeout,
-		NoKVM:   opts.NoKVM,
-		NoNet:   true,
-		Marker:  fdIPCSmokeMarker,
+		Timeout:   opts.Timeout,
+		NoKVM:     opts.NoKVM,
+		NoNet:     true,
+		ExtraArgs: opts.ExtraArgs,
+		Marker:    fdIPCSmokeMarker,
 	})
 	result.Serial = smoke.Serial
 	result.Log = smoke.Log

@@ -50,11 +50,12 @@ type commandPlan struct {
 }
 
 type SmokeOptions struct {
-	Timeout  time.Duration
-	NoKVM    bool
-	NoNet    bool
-	Marker   string
-	Progress progress.Reporter
+	Timeout   time.Duration
+	NoKVM     bool
+	NoNet     bool
+	ExtraArgs []string
+	Marker    string
+	Progress  progress.Reporter
 }
 
 type SmokeResult struct {
@@ -174,10 +175,11 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 	}
 	span.Set(1, "building qemu command")
 	plan, err := commandArgs(workspace, Options{
-		Display: "none",
-		Console: "pty",
-		NoKVM:   opts.NoKVM,
-		NoNet:   opts.NoNet,
+		Display:   "none",
+		Console:   "pty",
+		NoKVM:     opts.NoKVM,
+		NoNet:     opts.NoNet,
+		ExtraArgs: opts.ExtraArgs,
 	})
 	if err != nil {
 		span.Fail("qemu command failed")

@@ -66,6 +66,8 @@ pub const mmap_private: u64 = 1 << 2;
 pub const mmap_shared: u64 = 1 << 3;
 pub const mmap_anonymous: u64 = 1 << 4;
 pub const mmap_noreserve: u64 = 1 << 5;
+pub const mmap_pkey_shift: u64 = 8;
+pub const mmap_pkey_mask: u64 = 0xF << mmap_pkey_shift;
 
 pub const fd_kind_none: u64 = 0;
 pub const fd_kind_vmo: u64 = 6;

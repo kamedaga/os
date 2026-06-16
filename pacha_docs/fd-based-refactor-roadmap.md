@@ -455,7 +455,13 @@ Phase 0 の作業入口は [[phase0-checklist]]。
 
 Phase 5 の pkey 方針は [Phase 5 fast IPC / pkey threat model](./phase5-fast-ipc-pkey-threat-model.md) に固定する。
 
-pkey は untrusted IPC の主境界ではない。untrusted peer 間 IPC は fd rights / VMO fd / VMA/PTE permission で成立させ、pkey は local fast-path guard としてのみ使う。
+Phase 5 は最初から pkey shared-memory fast IPC PoC を攻める。Phase 4 で normal IPC / fd passing はできているため、既存 IPC を setup / fd passing / fallback の control plane として使う。
+
+raw pkey は untrusted IPC の主境界ではない。別 process の untrusted peer 間 IPC は fd rights / VMO fd / VMA/PTE permission で成立させる。
+
+同一 process 内の untrusted fast path は Phase 5 では扱わない。byte pattern 検査や loader / verifier が必要になり、userland runtime の負担が大きいため、Phase 5 は trusted 別 process の `pkey_ring` に集中する。
+
+trusted 別 process の E2E には、spawn 直後の child へ control channel fd を渡す fd bootstrap が必要である。`process_builder.transfer_fd_to_process` は `Process fd` 化までの移行用最小 ABI として追加し、fd rights attenuation は既存 fd transfer ルールに従わせる。
 
 ### Phase 6: Capsule fd
 

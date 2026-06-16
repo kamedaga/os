@@ -24,7 +24,8 @@ fn mmapFlagsFromBits(bits: u64) ?kernel.MmapFlags {
         fd_abi.mmap_private |
         fd_abi.mmap_shared |
         fd_abi.mmap_anonymous |
-        fd_abi.mmap_noreserve;
+        fd_abi.mmap_noreserve |
+        fd_abi.mmap_pkey_mask;
     if ((bits & ~known) != 0) return null;
     if ((bits & fd_abi.mmap_private) != 0 and (bits & fd_abi.mmap_shared) != 0) return null;
     return .{
@@ -34,6 +35,7 @@ fn mmapFlagsFromBits(bits: u64) ?kernel.MmapFlags {
         .shared = (bits & fd_abi.mmap_shared) != 0,
         .anonymous = (bits & fd_abi.mmap_anonymous) != 0,
         .noreserve = (bits & fd_abi.mmap_noreserve) != 0,
+        .pkey = @intCast((bits & fd_abi.mmap_pkey_mask) >> fd_abi.mmap_pkey_shift),
     };
 }
 
@@ -93,10 +95,11 @@ fn mapVmoFd(
     if (size_bytes == 0) return sc.syscall_err_invalid;
     const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
     if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
-    const prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
+    var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
     const flags = mmapFlagsFromBits(flags_bits) orelse return sc.syscall_err_invalid;
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
+    prot.pkey = flags.pkey;
     const base_va = if (requested_va != 0)
         requested_va
     else
@@ -123,6 +126,7 @@ fn mapVmoFd(
         .read = prot.read,
         .write = prot.write,
         .exec = prot.exec,
+        .pkey = prot.pkey,
     })) {
         state.munmapExactWithFreeList(proc, base_va, aligned_size, free_list) catch {};
         return sc.syscall_err_map;

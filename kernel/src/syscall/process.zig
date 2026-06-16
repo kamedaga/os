@@ -25,6 +25,7 @@ pub fn dispatch(
         process_builder_abi.syscall_share_process_pages_to_process => process_builder.shareProcessPagesToProcess(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8),
         process_builder_abi.syscall_mprotect_self => process_builder.mprotectSelf(proc, frame.rdi, frame.rsi, frame.rdx),
         process_builder_abi.syscall_set_process_bootstrap_owner => process_builder.setBootstrapOwner(proc, frame.rdi, frame.rsi),
+        process_builder_abi.syscall_transfer_fd_to_process => process_builder.transferFdToProcess(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8),
         process_builder_abi.syscall_set_process_abi_trap_delegate => process_builder.setAbiTrapDelegate(proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx, frame.r8),
         else => null,
     };
