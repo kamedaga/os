@@ -1,19 +1,17 @@
 /// Init process bootstrap resource setup.
 /// Sets up the init process's bootstrap descriptor page, spawn pages, service
-/// registry, and virtio device capability grants.
+/// registry, and capsule device fd grants.
 const std = @import("std");
-const capability = @import("../capability.zig");
-const device_capabilities = @import("../device_capabilities.zig");
 const kernel = @import("../kernel.zig");
 const kernel_log = @import("../kernel_log.zig");
 const boot_abi = @import("abi.zig");
 const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
 const uefi_services = @import("uefi_services.zig");
+const user_vm = @import("../memory/user_vm.zig");
 const halt = @import("../halt.zig");
 
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
-const capsule_abi = boot_abi.capsule_abi;
 const service_registry_abi = boot_abi.service_registry_abi;
 
 pub const MmioPageWithOffset = struct {
@@ -215,7 +213,7 @@ fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64)
 
 pub fn refreshInitBootLogSnapshot(state: *kernel.KernelState, init_process_principal: kernel.PrincipalId) void {
     _ = state;
-    const page_paddr = capability.lookupUserMappedPaddrForVa(init_process_principal, init_bootstrap_abi.boot_log_user_page_va) orelse
+    const page_paddr = user_vm.lookupUserMappedPaddrForVa(init_process_principal, init_bootstrap_abi.boot_log_user_page_va) orelse
         haltInitBootstrapDescriptor("missing boot log snapshot page");
     const page: [*]u8 = @ptrFromInt(page_paddr);
     @memset(page[0..4096], 0);
@@ -322,7 +320,7 @@ pub fn publishInitBootstrapDescriptorPage(
             .init_queue_grant_count = 0,
             .init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants,
             .init_command_token = 0,
-            .init_device_capsule_token = 0,
+            .init_device_fd = 0,
         };
     }
     device_count = 0;
@@ -341,90 +339,36 @@ pub fn publishInitBootstrapDescriptorPage(
 // Generic device bootstrap for init
 // ---------------------------------------------------------------------------
 
-fn grantInitDeviceQueueTokenOrHalt(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    device: kernel.DmaDeviceId,
-    label: []const u8,
-    step_label: []const u8,
-    queue_index: u16,
-    submit: bool,
-    notify: bool,
-) u64 {
-    return device_capabilities.queueCapGrantStage2(state, init_process_principal, device, queue_index, submit, notify) catch |err| {
-        haltInitDeviceBootstrapError(label, step_label, err);
-    };
-}
-
-fn descriptorUsesVirtqueues(descriptor: init_bootstrap_abi.DeviceDescriptor) bool {
-    const transport = std.meta.intToEnum(init_bootstrap_abi.DeviceTransport, descriptor.transport) catch return false;
-    return transport == .virtio_pci_modern;
-}
-
-fn bootstrapQueueGrantCountForDescriptor(descriptor: init_bootstrap_abi.DeviceDescriptor) usize {
-    if (!descriptorUsesVirtqueues(descriptor)) return 0;
-    return init_bootstrap_abi.max_device_queue_grants;
-}
-
-fn grantInitDeviceIommuTokenOrHalt(
+fn grantInitDeviceFdOrHalt(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
     device: kernel.DmaDeviceId,
     label: []const u8,
     step_label: []const u8,
 ) u64 {
-    return device_capabilities.iommuCapGrantStage2(state, init_process_principal, device, true, true, true) catch |err| {
-        haltInitDeviceBootstrapError(label, step_label, err);
-    };
-}
-
-fn defaultCommandMaskForDevice(device: kernel.DmaDeviceId) u64 {
-    _ = device;
-    return std.math.maxInt(u64);
-}
-
-fn grantInitDeviceCommandTokenOrHalt(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    device: kernel.DmaDeviceId,
-    label: []const u8,
-    step_label: []const u8,
-) u64 {
-    return device_capabilities.commandCapGrantStage2(
-        state,
-        init_process_principal,
-        device,
-        defaultCommandMaskForDevice(device),
-    ) catch |err| {
-        haltInitDeviceBootstrapError(label, step_label, err);
-    };
-}
-
-fn grantInitDeviceCapsuleTokenOrHalt(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    device: kernel.DmaDeviceId,
-    label: []const u8,
-    step_label: []const u8,
-) u64 {
-    const raw_token = state.deviceCapsuleCreate(init_process_principal, device, .{
+    return state.createDeviceFd(init_process_principal, device, .{
+        .inspect = true,
+        .dup = true,
+        .transfer = true,
+        .close = true,
         .query = true,
         .config_read = true,
         .config_write = true,
-        .bar_info = true,
-        .bar_map = true,
-        .dma_alloc = true,
-        .dma_map_user = true,
-        .irq_bind = true,
+        .derive_mmio = true,
+        .derive_dma = true,
+        .derive_irq = true,
+        .mmio_map_read = true,
+        .mmio_map_write = true,
+        .cpu_read = true,
+        .cpu_write = true,
+        .dma_read = true,
+        .dma_write = true,
+        .irq_wait = true,
+        .irq_ack = true,
         .bus_master = true,
-        .reset = true,
-        .power = true,
-        .hotplug_observe = true,
-        .grant = true,
-    }) catch |err| {
+    }, .{}, 16) catch |err| {
         haltInitDeviceBootstrapError(label, step_label, err);
     };
-    return capsule_abi.encodeCapsuleToken(.device, raw_token);
 }
 
 pub fn setupDeviceBootstrapForInit(
@@ -443,75 +387,19 @@ pub fn setupDeviceBootstrapForInit(
         true,
         free_list,
     );
-    var init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants;
-    const uses_virtqueues = descriptorUsesVirtqueues(device.descriptor);
-    const queue_limit = bootstrapQueueGrantCountForDescriptor(device.descriptor);
-    const queue_grant_count = if (device.descriptor.queue_count == 0 and uses_virtqueues)
-        queue_limit
-    else
-        @min(queue_limit, @as(usize, @intCast(device.descriptor.queue_count)));
-    var queue_index: usize = 0;
-    while (queue_index < queue_grant_count and queue_index < init_bootstrap_abi.max_device_queue_grants) : (queue_index += 1) {
-        const queue_index_u16: u16 = @intCast(queue_index);
-        const init_submit_token = grantInitDeviceQueueTokenOrHalt(
-            state,
-            init_process_principal,
-            device.dma_device,
-            label,
-            "queue submit grant",
-            queue_index_u16,
-            true,
-            false,
-        );
-        const init_notify_token = grantInitDeviceQueueTokenOrHalt(
-            state,
-            init_process_principal,
-            device.dma_device,
-            label,
-            "queue notify grant",
-            queue_index_u16,
-            false,
-            true,
-        );
-        init_queue_grants[queue_index] = .{
-            .queue_index = @intCast(queue_index),
-            .submit_token = init_submit_token,
-            .notify_token = init_notify_token,
-        };
-    }
-    const init_iommu_token = if (uses_virtqueues)
-        grantInitDeviceIommuTokenOrHalt(
-            state,
-            init_process_principal,
-            device.dma_device,
-            label,
-            "iommu grant",
-        )
-    else
-        0;
-    const init_command_token = if (uses_virtqueues)
-        grantInitDeviceCommandTokenOrHalt(
-            state,
-            init_process_principal,
-            device.dma_device,
-            label,
-            "command grant",
-        )
-    else
-        0;
-    const init_device_capsule_token = grantInitDeviceCapsuleTokenOrHalt(
+    const init_device_fd = grantInitDeviceFdOrHalt(
         state,
         init_process_principal,
         device.dma_device,
         label,
-        "device capsule grant",
+        "device fd grant",
     );
     var updated = device;
-    updated.descriptor.init_iommu_token = init_iommu_token;
-    updated.descriptor.init_queue_grant_count = @intCast(queue_grant_count);
-    updated.descriptor.init_queue_grants = init_queue_grants;
-    updated.descriptor.init_command_token = init_command_token;
-    updated.descriptor.init_device_capsule_token = init_device_capsule_token;
+    updated.descriptor.init_iommu_token = 0;
+    updated.descriptor.init_queue_grant_count = 0;
+    updated.descriptor.init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants;
+    updated.descriptor.init_command_token = 0;
+    updated.descriptor.init_device_fd = init_device_fd;
     return updated;
 }
 

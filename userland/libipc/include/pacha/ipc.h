@@ -9,14 +9,29 @@ extern "C" {
 #endif
 
 enum {
-    PACHA_IPC_SYSCALL_ENDPOINT_CREATE = 0x140,
-    PACHA_IPC_SYSCALL_CHANNEL_CREATE = 0x141,
-    PACHA_IPC_SYSCALL_SEND = 0x142,
-    PACHA_IPC_SYSCALL_RECV = 0x143,
-    PACHA_IPC_SYSCALL_CALL = 0x144,
-    PACHA_IPC_SYSCALL_REPLY = 0x145,
-    PACHA_FD_SYSCALL_VMO_CREATE = 0x107,
-    PACHA_FD_SYSCALL_MMAP = 0x109,
+    PACHA_PROCESS_SYSCALL_CREATE = 2,
+    PACHA_PROCESS_SYSCALL_KILL = 3,
+    PACHA_PROCESS_SYSCALL_WAIT = 4,
+    PACHA_PROCESS_SYSCALL_EXIT = 5,
+    PACHA_THREAD_SYSCALL_CREATE = 6,
+    PACHA_THREAD_SYSCALL_START = 7,
+    PACHA_THREAD_SYSCALL_KILL = 8,
+    PACHA_THREAD_SYSCALL_WAIT = 9,
+    PACHA_THREAD_SYSCALL_EXIT = 10,
+    PACHA_THREAD_SYSCALL_SET_FS_BASE = 11,
+    PACHA_FD_SYSCALL_CLOSE = 14,
+    PACHA_FD_SYSCALL_DUP = 15,
+    PACHA_FD_SYSCALL_GET_INFO = 16,
+    PACHA_FD_SYSCALL_SET_FLAGS = 17,
+    PACHA_FD_SYSCALL_VMO_CREATE = 18,
+    PACHA_FD_SYSCALL_MMAP = 19,
+    PACHA_FD_SYSCALL_MUNMAP = 20,
+    PACHA_IPC_SYSCALL_ENDPOINT_CREATE = 21,
+    PACHA_IPC_SYSCALL_CHANNEL_CREATE = 22,
+    PACHA_IPC_SYSCALL_SEND = 23,
+    PACHA_IPC_SYSCALL_RECV = 24,
+    PACHA_IPC_SYSCALL_CALL = 25,
+    PACHA_IPC_SYSCALL_REPLY = 26,
 
     PACHA_IPC_MAX_TRANSFER_FDS = 8,
     PACHA_IPC_FAST_RING_ENTRIES = 64,
@@ -43,6 +58,19 @@ enum {
     PACHA_FD_RIGHT_MAP_READ = 1ull << 13,
     PACHA_FD_RIGHT_MAP_WRITE = 1ull << 14,
     PACHA_FD_RIGHT_MAP_EXEC = 1ull << 15,
+    PACHA_FD_RIGHT_SPAWN = 1ull << 20,
+    PACHA_FD_RIGHT_START = 1ull << 21,
+    PACHA_FD_RIGHT_KILL = 1ull << 22,
+    PACHA_FD_RIGHT_DEBUG = 1ull << 23,
+    PACHA_FD_RIGHT_MAP_INTO = 1ull << 24,
+    PACHA_FD_RIGHT_SET_CONTEXT = 1ull << 25,
+
+    PACHA_FD_KIND_PROCESS = 1,
+    PACHA_FD_KIND_THREAD = 2,
+    PACHA_FD_KIND_VMO = 4,
+    PACHA_FD_KIND_ENDPOINT = 5,
+    PACHA_FD_KIND_CHANNEL = 6,
+    PACHA_FD_KIND_REPLY = 7,
 
     PACHA_MMAP_SHARED = 1ull << 3,
     PACHA_MMAP_PKEY_SHIFT = 8,
@@ -74,6 +102,14 @@ struct pacha_ipc_channel_pair {
     int b;
 };
 
+struct pacha_fd_info {
+    uint64_t kind;
+    uint64_t rights;
+    uint64_t flags;
+    uint64_t size;
+    uint64_t extra;
+};
+
 enum pacha_ipc_fast_backend {
     PACHA_IPC_BACKEND_NORMAL = 0,
     PACHA_IPC_BACKEND_SHARED_VMO_RING = 1,
@@ -88,6 +124,8 @@ enum pacha_ipc_fast_fallback_reason {
     PACHA_IPC_FAST_FALLBACK_VMO_CREATE_FAILED = 4,
     PACHA_IPC_FAST_FALLBACK_PKEY_MMAP_FAILED = 5,
     PACHA_IPC_FAST_FALLBACK_RING_MMAP_FAILED = 6,
+    PACHA_IPC_FAST_FALLBACK_REQUEST_MMAP_FAILED = 7,
+    PACHA_IPC_FAST_FALLBACK_COMPLETION_MMAP_FAILED = 8,
 };
 
 enum {
@@ -123,6 +161,7 @@ struct pacha_ipc_fast_channel {
     enum pacha_ipc_fast_fallback_reason fallback_reason;
     uint32_t pkey;
     uint32_t flags;
+    int last_error;
     struct pacha_ipc_fast_ring *request;
     struct pacha_ipc_fast_ring *completion;
     struct pacha_ipc_fast_ring *tx;
@@ -141,6 +180,10 @@ int pacha_ipc_send(int fd, const struct pacha_ipc_msg *msg);
 int pacha_ipc_recv(int fd, struct pacha_ipc_msg *msg);
 int pacha_ipc_call(int fd, const struct pacha_ipc_msg *msg);
 int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg);
+
+int pacha_process_create(uint64_t rights, uint32_t flags);
+int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights);
+int pacha_fd_get_info(int fd, struct pacha_fd_info *out);
 
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags);
 void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset);

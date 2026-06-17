@@ -1,44 +1,5 @@
 #include "pacha/ipc.h"
-
-static long pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1) {
-    uint64_t ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(nr), "D"(a0), "S"(a1)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
-    return (long)ret;
-}
-
-static long pacha_syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2) {
-    uint64_t ret;
-    __asm__ volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
-        : "rcx", "r8", "r9", "r10", "r11", "memory");
-    return (long)ret;
-}
-
-static long pacha_syscall6(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
-    uint64_t ret;
-    __asm__ volatile(
-        "mov %[a4], %%r8\n\t"
-        "mov %[a5], %%r9\n\t"
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "c"(a3), [a4] "r"(a4), [a5] "r"(a5)
-        : "r8", "r9", "r10", "r11", "memory");
-    return (long)ret;
-}
-
-static int pacha_status_to_int(long status) {
-    return status == 0 ? 0 : -(int)status;
-}
-
-static int pacha_fd_result_to_int(long result) {
-    return result >= 16 ? (int)result : -(int)result;
-}
+#include "pacha/syscall.h"
 
 int pacha_ipc_endpoint_create(uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_ENDPOINT_CREATE, rights, flags));
@@ -74,6 +35,27 @@ int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg) {
     return pacha_status_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_REPLY, (uint64_t)(uint32_t)reply_fd, (uint64_t)(uintptr_t)msg));
 }
 
+int pacha_process_create(uint64_t rights, uint32_t flags) {
+    return pacha_fd_result_to_int(pacha_syscall3(PACHA_PROCESS_SYSCALL_CREATE, 0, rights, flags));
+}
+
+int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights) {
+    return pacha_fd_result_to_int(pacha_syscall6(
+        PACHA_THREAD_SYSCALL_CREATE,
+        (uint64_t)(uint32_t)process_fd,
+        entry_rip,
+        stack_rsp,
+        flags,
+        fs_base,
+        rights
+    ));
+}
+
+int pacha_fd_get_info(int fd, struct pacha_fd_info *out) {
+    if (!out) return -1;
+    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)out));
+}
+
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
 }
@@ -82,6 +64,10 @@ void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t 
     const long result = pacha_syscall6(PACHA_FD_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
     if (result < 4096) return (void *)0;
     return (void *)(uintptr_t)result;
+}
+
+static long pacha_mmap_raw(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
+    return pacha_syscall6(PACHA_FD_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
 }
 
 uint64_t pacha_mmap_pkey_flags(uint64_t flags, uint32_t pkey) {
@@ -211,7 +197,7 @@ static int pacha_ipc_normal_send_entry(int fd, const struct pacha_ipc_fast_entry
         .word0 = entry->op,
         .word1 = entry->offset,
         .word2 = entry->len,
-        .word3 = entry->flags,
+        .word3 = (entry->flags & 0xffffffffull) | (entry->status << 32),
     };
     return pacha_ipc_send(fd, &msg);
 }
@@ -225,7 +211,8 @@ static int pacha_ipc_normal_recv_entry(int fd, struct pacha_ipc_fast_entry *out)
         .op = msg.word0,
         .offset = msg.word1,
         .len = msg.word2,
-        .flags = msg.word3,
+        .flags = msg.word3 & 0xffffffffull,
+        .status = msg.word3 >> 32,
     };
     return 0;
 }
@@ -267,18 +254,23 @@ static int pacha_ipc_fast_map_rings(
 
     uint64_t mmap_flags = PACHA_MMAP_SHARED;
     if (can_pkey) mmap_flags = pacha_mmap_pkey_flags(mmap_flags, pkey);
-    struct pacha_ipc_fast_ring *request = (struct pacha_ipc_fast_ring *)pacha_mmap(req_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
-    struct pacha_ipc_fast_ring *completion = (struct pacha_ipc_fast_ring *)pacha_mmap(comp_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
+    long request_raw = pacha_mmap_raw(req_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
+    long completion_raw = pacha_mmap_raw(comp_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
+    struct pacha_ipc_fast_ring *request = request_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)request_raw : 0;
+    struct pacha_ipc_fast_ring *completion = completion_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)completion_raw : 0;
     int mapped_with_pkey = can_pkey > 0 && request && completion;
     if ((!request || !completion) && can_pkey > 0 && !requires_pkey) {
         fast->fallback_reason = PACHA_IPC_FAST_FALLBACK_PKEY_MMAP_FAILED;
         mmap_flags = PACHA_MMAP_SHARED;
-        request = (struct pacha_ipc_fast_ring *)pacha_mmap(req_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
-        completion = (struct pacha_ipc_fast_ring *)pacha_mmap(comp_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
+        request_raw = pacha_mmap_raw(req_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
+        completion_raw = pacha_mmap_raw(comp_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
+        request = request_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)request_raw : 0;
+        completion = completion_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)completion_raw : 0;
         mapped_with_pkey = 0;
     }
     if (!request || !completion) {
-        fast->fallback_reason = PACHA_IPC_FAST_FALLBACK_RING_MMAP_FAILED;
+        fast->last_error = !request ? (int)request_raw : (int)completion_raw;
+        fast->fallback_reason = !request ? PACHA_IPC_FAST_FALLBACK_REQUEST_MMAP_FAILED : PACHA_IPC_FAST_FALLBACK_COMPLETION_MMAP_FAILED;
         return -4;
     }
 
@@ -316,6 +308,7 @@ int pacha_ipc_fast_channel_init_local(struct pacha_ipc_fast_channel *fast, int c
         .fallback_reason = PACHA_IPC_FAST_FALLBACK_NONE,
         .pkey = 0,
         .flags = flags,
+        .last_error = 0,
     };
 
     const int requires_pkey = (flags & PACHA_IPC_FAST_F_REQUIRE_PKEY) != 0;
@@ -348,6 +341,7 @@ int pacha_ipc_fast_channel_init_normal(struct pacha_ipc_fast_channel *fast, int 
         .fallback_reason = PACHA_IPC_FAST_FALLBACK_NONE,
         .pkey = 0,
         .flags = 0,
+        .last_error = 0,
     };
     return 0;
 }
@@ -401,6 +395,7 @@ int pacha_ipc_fast_channel_accept(struct pacha_ipc_fast_channel *fast, int contr
         .backend = PACHA_IPC_BACKEND_NORMAL,
         .fallback_reason = PACHA_IPC_FAST_FALLBACK_NONE,
         .flags = flags,
+        .last_error = 0,
     };
 
     struct pacha_ipc_fd fds[2] = {0};
@@ -510,6 +505,8 @@ const char *pacha_ipc_fast_fallback_reason_name(enum pacha_ipc_fast_fallback_rea
         case PACHA_IPC_FAST_FALLBACK_VMO_CREATE_FAILED: return "vmo_create_failed";
         case PACHA_IPC_FAST_FALLBACK_PKEY_MMAP_FAILED: return "pkey_mmap_failed";
         case PACHA_IPC_FAST_FALLBACK_RING_MMAP_FAILED: return "ring_mmap_failed";
+        case PACHA_IPC_FAST_FALLBACK_REQUEST_MMAP_FAILED: return "request_mmap_failed";
+        case PACHA_IPC_FAST_FALLBACK_COMPLETION_MMAP_FAILED: return "completion_mmap_failed";
         default: return "unknown";
     }
 }

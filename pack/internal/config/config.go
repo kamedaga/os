@@ -67,17 +67,13 @@ type StartupManifest struct {
 }
 
 type App struct {
-	ID       string
-	Role     string         `yaml:"role"`
-	File     any            `yaml:"file"`
-	Zig      map[string]any `yaml:"zig"`
-	Out      string         `yaml:"out"`
-	Target   string         `yaml:"target"`
-	Optimize string         `yaml:"optimize"`
-	Strip    bool           `yaml:"strip"`
-	Bootfs   any            `yaml:"bootfs"`
-	Rootfs   any            `yaml:"rootfs"`
-	Startup  map[string]any `yaml:"startup"`
+	ID      string
+	Role    string         `yaml:"role"`
+	File    any            `yaml:"file"`
+	Out     string         `yaml:"out"`
+	Bootfs  any            `yaml:"bootfs"`
+	Rootfs  any            `yaml:"rootfs"`
+	Startup map[string]any `yaml:"startup"`
 }
 
 func FindRoot(start string) (string, error) {
@@ -160,9 +156,6 @@ func (w *Workspace) defaults() {
 		if app.Role == "" {
 			app.Role = "asset"
 		}
-		if app.Optimize == "" {
-			app.Optimize = "release"
-		}
 		w.AppsMap[id] = app
 	}
 }
@@ -225,9 +218,6 @@ func (a App) OutputName() string {
 }
 
 func (a App) Kind() string {
-	if a.Zig != nil {
-		return "zig"
-	}
 	if a.File != nil {
 		return "file"
 	}
@@ -237,12 +227,6 @@ func (a App) Kind() string {
 type FileSource struct {
 	Path    string
 	Rebuild []string
-}
-
-type ZigSource struct {
-	Entry   string
-	Module  string
-	Imports []string
 }
 
 type Publish struct {
@@ -286,24 +270,6 @@ func (a App) FileSource() (FileSource, error) {
 	default:
 		return FileSource{}, fmt.Errorf("app %s has unsupported file source", a.ID)
 	}
-}
-
-func (a App) ZigSource() (ZigSource, error) {
-	if a.Zig == nil {
-		return ZigSource{}, fmt.Errorf("app %s has no zig source", a.ID)
-	}
-	src := ZigSource{
-		Entry:   fmt.Sprint(a.Zig["entry"]),
-		Module:  fmt.Sprint(a.Zig["module"]),
-		Imports: stringSlice(a.Zig["imports"]),
-	}
-	if src.Entry == "" || src.Entry == "<nil>" {
-		return ZigSource{}, fmt.Errorf("app %s zig source is missing entry", a.ID)
-	}
-	if src.Module != "" && src.Module != "<nil>" && !contains(src.Imports, src.Module) {
-		src.Imports = append(src.Imports, src.Module)
-	}
-	return src, nil
 }
 
 func (a App) Publishes(fs string) []Publish {
@@ -436,13 +402,4 @@ func stringSlice(value any) []string {
 	default:
 		return []string{fmt.Sprint(typed)}
 	}
-}
-
-func contains(values []string, needle string) bool {
-	for _, value := range values {
-		if value == needle {
-			return true
-		}
-	}
-	return false
 }

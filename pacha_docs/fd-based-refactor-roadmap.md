@@ -468,8 +468,54 @@ trusted 別 process の E2E には、spawn 直後の child へ control channel f
 - capsule object を fd-based model に移す
 - `Device` / `MmioRegion` / `DmaBuffer` / `DmaMapping` / `Irq` fd を作る
 - `libcapsule` を提供する
-- userland driver と kobox backend を `libcapsule` 経由に寄せる
-- kobox を driver daemon として扱えるよう、device fd bootstrap / daemon supervision / IPC protocol を整理する
+- capsule token を userland ABI から外し、kernel 内部 authority も fd object payload と per-fd rights に寄せる
+- `syscall_capsule_*` は token syscall ではなく、fd を受け取って fd を返す device operation ABI にする
+- userland driver と将来の kobox backend が `libcapsule` 経由で device authority を扱えるようにする
+- kobox daemon 起動、init の supervision、daemon IPC protocol は Phase 7 以降に送る
+
+Phase 6 の完了条件。
+
+- `KernelState` の runtime authority が capsule token table ではなく fd object で表現される
+- `Device` / `MmioRegion` / `DmaBuffer` / `DmaMapping` / `Irq` が `KernelObjectKind` に存在する
+- fd close / process teardown で MMIO / DMA / IRQ resource cleanup が走る
+- `libcapsule` が C ABI として存在し、driver / kobox backend から直接 link できる
+- 旧 capsule token encode / decode を public ABI として使わない
+- Phase 6 の実行確認は seed / rootfs 経路ではなく、bootfs の `device-fd-smoke` で `DescriptorPage.devices[].init_device_fd` と `libcapsule` query を直接検証する
+
+### Phase 6.5: syscall/sysret Migration
+
+musl native backend を入れる前に、userland ABI の syscall entry を x86_64 の `syscall` / `sysret` に統一する。
+
+Phase 6.5 の目的。
+
+- kernel は LSTAR 経由の syscall entry を標準入口にする
+- `int 0x80` は native userland ABI から外し、kernel IDT entry も持たない
+- userland の raw syscall stub は `libpacha` に集約する
+- `libipc` / `libcapsule` / bootfs smoke は `libpacha` の syscall backend を使う
+- musl backend は `libpacha` または同じ低レベル stub を使い、各 C service が inline asm を持たない
+
+x86_64 syscall ABI。
+
+```text
+rax = syscall number / return value
+rdi = arg0
+rsi = arg1
+rdx = arg2
+r10 = arg3
+r8  = arg4
+r9  = arg5
+rcx, r11 = clobbered by syscall
+```
+
+`rcx` は `syscall` 命令が return RIP 保存に使うため、第 4 引数には使わない。kernel LSTAR entry は userland の `r10` を TrapFrame の第 4 引数スロットとして扱う。
+
+Phase 6.5 の完了条件。
+
+- `libpacha` が `pacha_syscall0..6` を C ABI として提供する
+- `libipc` と `libcapsule` が inline `int 0x80` を持たない
+- `fd-ipc-smoke` と `device-fd-smoke` が bootfs から `syscall` 経由で動く
+- kernel が user callable な `int 0x80` gate を持たない
+- docs 以外の tree に `int $0x80` / `int 0x80` / `0xCD 0x80` syscall path が残っていない
 
 ### Phase 7: musl Native Backend
 
@@ -483,6 +529,8 @@ trusted 別 process の E2E には、spawn 直後の child へ control channel f
   - spawn / exec
 - libc から syscall 直叩きを減らし、`libipc` / `libcapsule` / `libpacha` に集約する
 - userland Zig で提供していた ABI helper / service code を C library / C service に置き換える
+- musl backend が入った後、kobox daemon の init integration を行う
+- kobox daemon への device fd bootstrap / supervision / IPC protocol を `libcapsule` + `libipc` 前提で実装する
 
 ### Phase 8: Old Capability Removal
 
@@ -492,8 +540,147 @@ trusted 別 process の E2E には、spawn 直後の child へ control channel f
 - device / queue / command cap を capsule fd に統合する
 - PachaOS 専用 driver のうち kobox daemon で置換できるものを削除または compatibility に隔離する
 - userland Zig 資産を native C ABI / C service へ移行し、不要になった Zig app build path を削除する
-- old syscall を削除または compatibility shim に隔離する
+- old syscall を削除または明示的な old-only file に隔離する
 - README / docs / tests を fd-based 設計へ更新する
+
+Phase 8 では既存 syscall をすべて棚卸しし、不要なものを削除する。`syscall` / `sysret` 入口への移行は Phase 6.5 で完了しているため、Phase 8 は entry mechanism ではなく syscall surface の整理に集中する。
+
+syscall 整理時の方針。
+
+- surviving syscall は `libpacha` / `libipc` / `libcapsule` / libc backend から呼ぶ
+- userland の raw syscall stub は `libpacha` に集約し、各 smoke / driver / service に散らさない
+- x86_64 syscall ABI は `rax = syscall number`, `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` を引数にする
+- `rcx` と `r11` は `syscall` 命令で破壊されるため、4 番目の引数に使わない
+- kernel は LSTAR 経由の通常 syscall で `r10` を第4引数として扱う
+- `sysret` で戻れない例外経路だけ `iretq` fallback を許す
+- `int 0x80` は Phase 6.5 以降 unsupported とし、互換入口を復活させない
+- Phase 8 完了条件として old capability syscall の reachable path を削除または old-only quarantine に隔離する
+
+既存 syscall 棚卸し。
+
+| nr | syscall | Phase 8 方針 |
+|---:|---|---|
+| `0x01` | `alloc_page` | 削除。page cap ABI は VMO / mmap に置換する |
+| `0x02` | `map_page` | 削除。page cap mapping は `mmap(vmo_fd)` に置換する |
+| `0x03` | `move_cap` | 削除。fd `dup` / `replace` / fd passing に置換する |
+| `0x04` | `drop_present` | 削除。fd `close` に置換する |
+| `0x05` | `switch_thread` | 要再設計。必要なら Thread fd / scheduler ABI として `syscall/sysret` へ移行する |
+| `0x06` | `send_cap` | 削除。IPC fd passing に置換する |
+| `0x07` | `revoke_tree` | 要再設計。必要 object だけ fd revoke/generation として残す |
+| `0x08` | `grant_cap` | 削除。fd rights attenuation に置換する |
+| `0x09` | `log` | 開発用に隔離。最終的には debug console service / early debug ABI へ移す |
+| `0x0A` | `recv_cap` | 削除。IPC fd passing に置換する |
+| `0x0B` | `map_mmio` | 削除。`libcapsule` + `MmioRegion fd` map に置換する |
+| `0x0C` | `alloc_map_pages` | 削除。anonymous VMO / mmap に置換する |
+| `0x0E` | `queue_submit` | 削除。capsule/kobox daemon protocol に置換する |
+| `0x0F` | `queue_notify` | 削除。capsule/kobox daemon protocol に置換する |
+| `0x14` | `grant_caps_batch` | 削除。fd passing batch に置換する |
+| `0x15` | `map_pages_batch` | 削除。VMO / mmap range に置換する |
+| `0x17` | `wait_event` | fd wait / poll として `syscall/sysret` へ移行する |
+| `0x1F` | `grant_vm_object` | 削除。VMO fd passing に置換する |
+| `0x22` | `arm_deferred_compositor` | 削除または GUI service protocol へ移す |
+| `0x23` | `queue.grant_cap` | 削除。capsule fd / fd passing に置換する |
+| `0x24` | `grant_cap_on_endpoint` | 削除。IPC fd passing に置換する |
+| `0x25` | `grant_caps_batch_on_endpoint` | 削除。IPC fd passing batch に置換する |
+| `0x26` | `install_endpoint` | 削除。Endpoint fd create / bootstrap protocol に置換する |
+| `0x27` | `register_iommu_driver` | 削除。device authority は capsule/kobox supervision に移す |
+| `0x28` | `map_vm_object` | 削除。`mmap(vmo_fd)` に置換する |
+| `0x29` | `release_vm_object` | 削除。VMO fd lifetime に置換する |
+| `0x2A` | `accept_cap_transfer` | 削除。IPC fd receive に置換する |
+| `0x2B` | `share_cap` | 削除。fd passing + rights attenuation に置換する |
+| `0x2C` | `signal_endpoint` | 削除または native IPC/eventfd 相当へ統合する |
+| `0x2D` | `get_tick_count` | 必要なら time service / vdso 相当へ移す。kernel syscall として残す場合は `syscall/sysret` へ移行する |
+| `0x2E` | `get_process_slot` | 削除。debug 用なら Process fd inspect へ移す |
+| `0x2F` | `install_mmio_cap` | 削除。capsule fd に置換する |
+| `0x30` | `get_process_status` | Process fd inspect / wait として再設計し、必要なら `syscall/sysret` へ移行する |
+| `0x31` | `drop_vm_object` | 削除。VMO fd `close` に置換する |
+| `0x32` | `install_caps_batch` | 削除。fd table 操作 / fd passing に置換する |
+| `0x33` | `publish_service_endpoint` | userland service registry protocol へ移す。kernel syscall として残さない |
+| `0x34` | `process_exit` | 必要。`syscall/sysret` へ移行する |
+| `0x35` | `iommu_authorize` | 削除。capsule/kobox backend に置換する |
+| `0x36` | `command_authorize` | 削除。capsule/kobox backend に置換する |
+| `0x37` | `dma_map_create` | 削除。`DmaBuffer` / `DmaMapping fd` に置換する |
+| `0x38` | `dma_map_set_state` | 削除。`DmaMapping fd` operation に置換する |
+| `0x39` | `dma_map_release` | 削除。fd `close` に置換する |
+| `0x3A` | `revoke_device_cap` | 削除。capsule fd revoke/generation に置換する |
+| `0x3B` | `derive_command_cap` | 削除。capsule/kobox protocol に置換する |
+| `0x3C` | `get_memory_stats` | debug/info service へ移す。kernel syscall として残す場合は `syscall/sysret` へ移行する |
+| `0x3D` | `set_fs_base_self` | libc / thread ABI に必要。`syscall/sysret` へ移行する |
+| `0x3E` | `get_rtc_unix_time` | time service / vdso 相当へ移す。kernel syscall として残す場合は `syscall/sysret` へ移行する |
+| `0x3F` | `create_vm_object_from_current_pages` | 削除。VMO fd create / file-backed VMO protocol に置換する |
+| `0x40` | `ipc_call_reply_recv` | 削除。Phase 4 native IPC fd ABI に統合する |
+| `0x41` | `create_suspended_process` | Process fd / spawn builder として再設計し、必要なら `syscall/sysret` へ移行する |
+| `0x42` | `map_vm_object_to_process` | 削除。Process fd + VMO fd mapping protocol に置換する |
+| `0x43` | `alloc_map_pages_to_process` | 削除。child address space は VMO / mmap / loader protocol に寄せる |
+| `0x44` | `set_process_initial_context` | Process fd / thread bootstrap ABI として再設計し、必要なら `syscall/sysret` へ移行する |
+| `0x45` | `start_process` | Process fd operation として `syscall/sysret` へ移行する |
+| `0x46` | `abort_process` | Process fd operation として `syscall/sysret` へ移行する |
+| `0x47` | `copy_to_process` | 削除。VMO transfer / loader-owned mapping に置換する |
+| `0x48` | `mprotect_self` | `mprotect` として fd/memory ABI に統合し、`syscall/sysret` へ移行する |
+| `0x49` | `copy_from_process_to_process` | 削除。VMO fd passing に置換する |
+| `0x4A` | `share_process_pages_to_process` | 削除。shared VMO fd passing に置換する |
+| `0x4B` | `set_process_abi_trap_delegate` | Linux ABI compatibility を廃止する流れで削除する |
+| `0x4C` | `map_abi_trap_reply_target_pages` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x4D` | `copy_from_abi_trap_reply_target` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x4E` | `copy_to_abi_trap_reply_target` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x4F` | `set_abi_trap_reply_target_fs_base` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x50` | `protect_abi_trap_reply_target_pages` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x51` | `unmap_abi_trap_reply_target_pages` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x52` | `map_abi_trap_reply_target_vm_object` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x54` | `reply_abi_trap_target` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x55` | `copy_to_abi_trap_target` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x57` | `set_abi_trap_target_request_page` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x59` | `detach_abi_trap_reply_token` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x5B` | `copy_from_abi_trap_target` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x5C` | `map_page_anywhere` | 削除。`mmap` address hint / fixed mapping に置換する |
+| `0x5D` | `alloc_map_pages_anywhere` | 削除。anonymous mmap に置換する |
+| `0x5E` | `create_ipc_buffer_from_page` | 削除。IPC payload / shared VMO ring に置換する |
+| `0x5F` | `grant_ipc_buffer_on_endpoint` | 削除。fd passing に置換する |
+| `0x60` | `share_ipc_buffer_on_endpoint` | 削除。shared VMO fd passing に置換する |
+| `0x61` | `accept_ipc_buffer_transfer` | 削除。IPC fd receive に置換する |
+| `0x62` | `map_ipc_buffer_anywhere` | 削除。`mmap(vmo_fd)` に置換する |
+| `0x64` | `reply_abi_trap_target_context` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x65` | `set_abi_trap_reply_target_gs_base` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x66` | `share_abi_trap_reply_target_pages_to_target` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x67` | `protect_abi_trap_target_pages` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x68` | `unmap_abi_trap_target_pages` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x69` | `interrupt_abi_trap_target` | 削除。Linux ABI trap support と一緒に撤去する |
+| `0x6A` | `map_vm_object_range_to_process` | 削除。Process fd + VMO fd mapping protocol に置換する |
+| `0x6B` | `set_process_bootstrap_owner` | Process fd bootstrap として再設計し、必要なら `syscall/sysret` へ移行する |
+| `0x6C` | `transfer_fd_to_process` | Process fd / spawn bootstrap の fd transfer として `syscall/sysret` へ移行する |
+| `0x70` | `capsule_query` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x71` | `capsule_derive_mmio` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x72` | `capsule_derive_dma_buffer` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x73` | `capsule_derive_dma_mapping` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x74` | `capsule_derive_dma_mapping_from_buffer` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x75` | `capsule_derive_irq` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x76` | `capsule_grant` | 必要性を再評価。残すなら fd rights attenuation として `syscall/sysret` へ移行する |
+| `0x77` | `capsule_revoke` | 必要性を再評価。残すなら capsule fd revoke として `syscall/sysret` へ移行する |
+| `0x78` | `capsule_close` | 削除。共通 fd `close` に統合する |
+| `0x79` | `capsule_pci_config_read` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x7A` | `capsule_pci_config_write` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x7B` | `capsule_pci_bar_info` | `libcapsule` backend syscall として `syscall/sysret` へ移行する |
+| `0x7C` | `capsule_irq_poll` | IRQ fd wait/poll と統合し、必要なら `syscall/sysret` へ移行する |
+| `0x100` | `fd_close` | 必要。`syscall/sysret` へ移行する |
+| `0x101` | `fd_dup` | 必要。`syscall/sysret` へ移行する |
+| `0x102` | `fd_replace` | 必要なら `syscall/sysret` へ移行する |
+| `0x103` | `fd_get_info` | 必要。`syscall/sysret` へ移行する |
+| `0x104` | `fd_set_flags` | 必要。`syscall/sysret` へ移行する |
+| `0x105` | `fd_wait` | 必要。`syscall/sysret` へ移行する |
+| `0x106` | `fd_poll` | 必要。`syscall/sysret` へ移行する |
+| `0x107` | `vmo_create` | 必要。`syscall/sysret` へ移行する |
+| `0x108` | `vmo_from_current_pages` | 移行用。最終的には削除または loader/debug 専用に隔離する |
+| `0x109` | `mmap` | 必要。`syscall/sysret` へ移行する |
+| `0x10A` | `munmap` | 必要。`syscall/sysret` へ移行する |
+| `0x140` | `ipc_endpoint_create` | 必要。`libipc` backend syscall として `syscall/sysret` へ移行する |
+| `0x141` | `ipc_channel_create` | 必要。`libipc` backend syscall として `syscall/sysret` へ移行する |
+| `0x142` | `ipc_send` | 必要。`libipc` backend syscall として `syscall/sysret` へ移行する |
+| `0x143` | `ipc_recv` | 必要。`libipc` backend syscall として `syscall/sysret` へ移行する |
+| `0x144` | `ipc_call` | 必要。`libipc` backend syscall として `syscall/sysret` へ移行する |
+| `0x145` | `ipc_reply` | 必要。`libipc` backend syscall として `syscall/sysret` へ移行する |
+| `0x400` | `ipc_call_reply_recv_fast` | 削除または `libipc` fast backend 内部へ統合する。raw syscall ABI として残さない |
+
+Phase 8 完了後の syscall surface は、fd / VMO / mmap / process bootstrap / IPC / capsule / minimal time-thread-exit だけに絞る。旧 capability、旧 VM object cap、旧 IPC buffer cap、Linux ABI trap delegate、queue command cap 系 syscall は残さない。
 
 ## 成功条件
 

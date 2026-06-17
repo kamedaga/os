@@ -1,6 +1,6 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
-const capability = @import("capability.zig");
+const user_vm = @import("memory/user_vm.zig");
 
 pub const Hooks = struct {
     physical_map_limit: u64,
@@ -175,7 +175,7 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
 
         const page_va = cur_va & ~@as(u64, 0xFFF);
         const page_off: usize = @intCast(cur_va & 0xFFF);
-        const page_paddr = capability.lookupUserMappedPaddrForVa(principal, page_va) orelse return false;
+        const page_paddr = user_vm.lookupUserMappedPaddrForVa(principal, page_va) orelse return false;
         if (page_paddr >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
@@ -225,7 +225,7 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
 
         const page_va = cur_va & ~@as(u64, 0xFFF);
         const page_off: usize = @intCast(cur_va & 0xFFF);
-        const page_paddr = capability.lookupUserMappedPaddrForVa(principal, page_va) orelse return false;
+        const page_paddr = user_vm.lookupUserMappedPaddrForVa(principal, page_va) orelse return false;
         if (page_paddr >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;

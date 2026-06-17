@@ -148,6 +148,7 @@ func testCommand(ctx *context) *cobra.Command {
 	}
 	cmd.AddCommand(smokeTestCommand(ctx))
 	cmd.AddCommand(fdIPCSmokeTestCommand(ctx))
+	cmd.AddCommand(deviceFDSmokeTestCommand(ctx))
 	cmd.AddCommand(qemuTestCommand(ctx, "qemu"))
 	return cmd
 }
@@ -205,6 +206,47 @@ func fdIPCSmokeTestCommand(ctx *context) *cobra.Command {
 		},
 	}
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the fd IPC smoke marker")
+	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
+	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
+	return cmd
+}
+
+func deviceFDSmokeTestCommand(ctx *context) *cobra.Command {
+	var timeout time.Duration
+	var noKVM bool
+	var extraArgs []string
+	cmd := &cobra.Command{
+		Use:   "device-fd-smoke",
+		Short: "Boot QEMU with the minimal device fd init smoke",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ui.Task("test:device-fd-smoke")
+			result, err := boottest.RunDeviceFDSmoke(ctx.workspace, boottest.DeviceFDSmokeOptions{
+				Timeout:   timeout,
+				NoKVM:     noKVM,
+				ExtraArgs: extraArgs,
+			})
+			state := "passed"
+			if err != nil {
+				state = "failed"
+			}
+			ui.KeyValues("Device FD Smoke", [][2]string{
+				{"state", state},
+				{"marker", result.Marker},
+				{"timeout", result.Timeout.String()},
+				{"smoke elf", ctx.workspace.Rel(result.SmokeELF)},
+				{"kernel", ctx.workspace.Rel(result.KernelEFI)},
+				{"disk", ctx.workspace.Rel(result.Disk)},
+				{"serial", ctx.workspace.Rel(result.Serial)},
+				{"qemu log", ctx.workspace.Rel(result.Log)},
+				{"restored", fmt.Sprint(result.Restored)},
+			})
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the device fd smoke marker")
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
 	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
 	return cmd

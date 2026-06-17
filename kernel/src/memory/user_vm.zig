@@ -1,5 +1,4 @@
 const address_space = @import("address_space.zig");
-const capability = @import("../capability.zig");
 const kernel = @import("../kernel.zig");
 const scheduler = @import("../scheduler.zig");
 
@@ -11,8 +10,11 @@ pub const Hooks = struct {
     physical_map_limit: u64,
     user_low_va: u64,
     user_top_va: u64,
+    dynamic_map_base_va: u64,
+    dynamic_map_end_va: u64,
     user_va: u64,
     user_stack_page_va: u64,
+    canonical_user_limit_exclusive: u64,
     page_entries: usize,
     page_addr_mask: u64,
     page_present: u64,
@@ -59,6 +61,11 @@ pub fn currentUserSpace() *UserAddressSpace {
     return getUserSpace(scheduler.currentUserPrincipal()).?;
 }
 
+pub fn isUserCanonicalVa(va: u64) bool {
+    const h = hooks orelse return false;
+    return va < h.canonical_user_limit_exclusive;
+}
+
 const UserPageIndex = struct {
     pml4: usize,
     pdp: usize,
@@ -76,6 +83,277 @@ fn userPageIndexForVa(h: Hooks, va: u64) ?UserPageIndex {
         .pd = @intCast((va >> 21) & 0x1FF),
         .pt = @intCast((va >> 12) & 0x1FF),
     };
+}
+
+pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
+    const h = hooks orelse return null;
+    const space = getUserSpace(principal) orelse return null;
+    const index = userPageIndexForVa(h, va) orelse return null;
+    const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
+    const entry = space.pt_pages[slot][index.pt];
+    const is_user_mapping = (entry & h.page_present) != 0 and (entry & h.page_user) != 0;
+    const paddr = entry & h.page_addr_mask;
+    if (!is_user_mapping or paddr == 0) return null;
+    return paddr;
+}
+
+pub fn resetUserReservations(space: *UserAddressSpace) void {
+    @memset(space.reservations[0..], .{});
+    space.reservation_generation = 0;
+    space.next_dynamic_map_page = 0;
+}
+
+fn reservationEndPage(base_va: u64, page_count: u64) ?u64 {
+    if (page_count == 0) return null;
+    if ((base_va & 0xFFF) != 0) return null;
+    const base_page = base_va >> 12;
+    const end_page, const overflow = @addWithOverflow(base_page, page_count);
+    if (overflow != 0) return null;
+    return end_page;
+}
+
+fn reservationOverlaps(base_a: u64, count_a: u64, base_b: u64, count_b: u64) bool {
+    const end_a = reservationEndPage(base_a, count_a) orelse return true;
+    const end_b = reservationEndPage(base_b, count_b) orelse return true;
+    const start_a = base_a >> 12;
+    const start_b = base_b >> 12;
+    return start_a < end_b and start_b < end_a;
+}
+
+fn reservationStartPage(reservation: *const UserAddressSpace.Reservation) u64 {
+    return reservation.base_va >> 12;
+}
+
+fn tryMergeUserReservation(
+    space: *UserAddressSpace,
+    base_va: u64,
+    page_count: u64,
+    kind: UserAddressSpace.ReservationKind,
+    writable: bool,
+) bool {
+    const new_start_page = base_va >> 12;
+    const new_end_page = reservationEndPage(base_va, page_count) orelse return false;
+    var merge_index: ?usize = null;
+
+    var index: usize = 0;
+    while (index < UserAddressSpace.max_reservations) : (index += 1) {
+        const reservation = &space.reservations[index];
+        if (!reservation.active or reservation.kind != kind or reservation.writable != writable) continue;
+        const record_start_page = reservationStartPage(reservation);
+        const record_end_page = record_start_page + reservation.page_count;
+        if (record_end_page == new_start_page or new_end_page == record_start_page) {
+            merge_index = index;
+            break;
+        }
+    }
+
+    const target_index = merge_index orelse return false;
+    var target = &space.reservations[target_index];
+    var merged_start_page = @min(new_start_page, reservationStartPage(target));
+    var merged_end_page = @max(new_end_page, reservationStartPage(target) + target.page_count);
+
+    while (true) {
+        const merged_count = merged_end_page - merged_start_page;
+        if (merged_count == 0 or merged_count > @import("std").math.maxInt(u32)) return false;
+
+        target.base_va = merged_start_page << 12;
+        target.page_count = @intCast(merged_count);
+
+        var absorbed = false;
+        index = 0;
+        while (index < UserAddressSpace.max_reservations) : (index += 1) {
+            if (index == target_index) continue;
+            const candidate = &space.reservations[index];
+            if (!candidate.active or candidate.kind != kind or candidate.writable != writable) continue;
+            const candidate_start_page = reservationStartPage(candidate);
+            const candidate_end_page = candidate_start_page + candidate.page_count;
+            if (candidate_end_page != merged_start_page and merged_end_page != candidate_start_page) continue;
+
+            merged_start_page = @min(merged_start_page, candidate_start_page);
+            merged_end_page = @max(merged_end_page, candidate_end_page);
+            candidate.* = .{};
+            absorbed = true;
+            break;
+        }
+        if (!absorbed) return true;
+    }
+}
+
+pub fn reserveUserMapping(
+    principal: kernel.PrincipalId,
+    base_va: u64,
+    page_count: u64,
+    kind: UserAddressSpace.ReservationKind,
+    writable: bool,
+) bool {
+    if (kind == .none) return false;
+    if (page_count > @import("std").math.maxInt(u32)) return false;
+    const space = getUserSpace(principal) orelse return false;
+    _ = reservationEndPage(base_va, page_count) orelse return false;
+    for (&space.reservations) |*reservation| {
+        if (!reservation.active) continue;
+        if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
+        return false;
+    }
+    if (tryMergeUserReservation(space, base_va, page_count, kind, writable)) return true;
+    for (&space.reservations) |*reservation| {
+        if (reservation.active) continue;
+        space.reservation_generation +%= 1;
+        reservation.* = .{
+            .base_va = base_va,
+            .page_count = @intCast(page_count),
+            .generation = space.reservation_generation,
+            .kind = kind,
+            .writable = writable,
+            .active = true,
+        };
+        return true;
+    }
+    return false;
+}
+
+fn releaseReservationRecord(
+    space: *UserAddressSpace,
+    index: usize,
+    release_start_page: u64,
+    release_end_page: u64,
+) bool {
+    const reservation = &space.reservations[index];
+    const record_start_page = reservation.base_va >> 12;
+    const record_end_page = record_start_page + reservation.page_count;
+    if (release_start_page <= record_start_page and release_end_page >= record_end_page) {
+        reservation.* = .{};
+        return true;
+    }
+    if (release_start_page <= record_start_page) {
+        reservation.base_va = release_end_page << 12;
+        reservation.page_count = @intCast(record_end_page - release_end_page);
+        return true;
+    }
+    if (release_end_page >= record_end_page) {
+        reservation.page_count = @intCast(release_start_page - record_start_page);
+        return true;
+    }
+
+    const right_count = record_end_page - release_end_page;
+    for (&space.reservations) |*free_record| {
+        if (free_record.active) continue;
+        space.reservation_generation +%= 1;
+        free_record.* = .{
+            .base_va = release_end_page << 12,
+            .page_count = @intCast(right_count),
+            .generation = space.reservation_generation,
+            .kind = reservation.kind,
+            .writable = reservation.writable,
+            .active = true,
+        };
+        reservation.page_count = @intCast(release_start_page - record_start_page);
+        return true;
+    }
+    return false;
+}
+
+pub fn releaseUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
+    const space = getUserSpace(principal) orelse return false;
+    const release_end_page = reservationEndPage(base_va, page_count) orelse return false;
+    const release_start_page = base_va >> 12;
+    var changed = false;
+    var index: usize = 0;
+    while (index < UserAddressSpace.max_reservations) : (index += 1) {
+        const reservation = &space.reservations[index];
+        if (!reservation.active) continue;
+        const record_start_page = reservation.base_va >> 12;
+        const record_end_page = record_start_page + reservation.page_count;
+        if (record_start_page >= release_end_page or release_start_page >= record_end_page) continue;
+        const overlap_start = if (release_start_page > record_start_page) release_start_page else record_start_page;
+        const overlap_end = if (release_end_page < record_end_page) release_end_page else record_end_page;
+        if (!releaseReservationRecord(space, index, overlap_start, overlap_end)) return false;
+        changed = true;
+    }
+    return changed;
+}
+
+fn userDynamicMapRange(h: Hooks) ?struct { start_page: u64, end_page: u64 } {
+    if (h.dynamic_map_base_va >= h.dynamic_map_end_va) return null;
+    if (h.dynamic_map_base_va < h.user_low_va) return null;
+    if (h.dynamic_map_end_va > h.user_top_va) return null;
+    const start_page = (h.dynamic_map_base_va + 0xFFF) >> 12;
+    const end_page = h.dynamic_map_end_va >> 12;
+    if (start_page >= end_page) return null;
+    return .{ .start_page = start_page, .end_page = end_page };
+}
+
+fn rangeOverlappingReservationEndPage(space: *const UserAddressSpace, base_va: u64, page_count: u64) ?u64 {
+    var skip_to_page: u64 = 0;
+    for (&space.reservations) |*reservation| {
+        if (!reservation.active) continue;
+        if (!reservationOverlaps(base_va, page_count, reservation.base_va, reservation.page_count)) continue;
+        const reservation_end_page = reservationStartPage(reservation) + reservation.page_count;
+        if (reservation_end_page > skip_to_page) skip_to_page = reservation_end_page;
+    }
+    return if (skip_to_page == 0) null else skip_to_page;
+}
+
+fn rangeHasPresentUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const va = base_va + page_index * 4096;
+        if (lookupUserMappedPaddrForVa(principal, va) != null) return true;
+    }
+    return false;
+}
+
+fn alignPageForward(page: u64, alignment: u64) u64 {
+    const align_mask = alignment - 1;
+    if ((alignment & align_mask) == 0) return (page + align_mask) & ~align_mask;
+    const rem = page % alignment;
+    return if (rem == 0) page else page + alignment - rem;
+}
+
+fn findFreeUserMappingRangeInSpan(
+    principal: kernel.PrincipalId,
+    space: *UserAddressSpace,
+    page_count: u64,
+    alignment: u64,
+    start_page: u64,
+    end_page: u64,
+) ?u64 {
+    var base_page = alignPageForward(start_page, alignment);
+    while (base_page < end_page and page_count <= end_page - base_page) {
+        const base_va = base_page << 12;
+        if (rangeOverlappingReservationEndPage(space, base_va, page_count)) |skip_to_page| {
+            const next_page = if (skip_to_page > base_page) skip_to_page else base_page + 1;
+            base_page = alignPageForward(next_page, alignment);
+            continue;
+        }
+        if (rangeHasPresentUserMapping(principal, base_va, page_count)) {
+            base_page += alignment;
+            continue;
+        }
+        space.next_dynamic_map_page = base_page + page_count;
+        return base_va;
+    }
+    return null;
+}
+
+pub fn findFreeUserMappingRange(principal: kernel.PrincipalId, page_count: u64, align_pages: u64) ?u64 {
+    const h = hooks orelse return null;
+    if (page_count == 0) return null;
+    const alignment = if (align_pages == 0) @as(u64, 1) else align_pages;
+    const space = getUserSpace(principal) orelse return null;
+    const range = userDynamicMapRange(h) orelse return null;
+    const cursor_page = if (space.next_dynamic_map_page >= range.start_page and space.next_dynamic_map_page < range.end_page)
+        space.next_dynamic_map_page
+    else
+        range.start_page;
+
+    if (findFreeUserMappingRangeInSpan(principal, space, page_count, alignment, cursor_page, range.end_page)) |base_va| {
+        return base_va;
+    }
+    if (cursor_page > range.start_page) {
+        return findFreeUserMappingRangeInSpan(principal, space, page_count, alignment, range.start_page, cursor_page);
+    }
+    return null;
 }
 
 fn findUserPtSlotForPd(space: *const UserAddressSpace, pml4_index: usize, pdp_index: usize, pd_index: usize) ?usize {
@@ -361,7 +639,7 @@ pub fn mapUserLinearRegionWithProt(
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
     }
-    if (!capability.reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
+    if (!reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
 
     offset = 0;
     while (offset < size_bytes) : (offset += 4096) {
@@ -413,7 +691,7 @@ pub fn mapUserPageCapabilitiesWithProt(
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
     }
-    if (!capability.reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
+    if (!reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
 
     page_index = 0;
     while (page_index < pages.len) : (page_index += 1) {
@@ -455,7 +733,7 @@ pub fn mapTrustedUserPaddrsWithProt(
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
     }
-    if (!capability.reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
+    if (!reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
 
     page_index = 0;
     while (page_index < paddrs.len) : (page_index += 1) {
@@ -548,7 +826,7 @@ pub fn unmapUserLinearRegion(
             touched_count += 1;
         }
     }
-    if (!capability.releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
+    if (!releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
     h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
     var touched_index: usize = 0;
     while (touched_index < touched_count) : (touched_index += 1) {
@@ -620,7 +898,7 @@ pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
                 (@as(u64, @intCast(pdp_index)) << 30) |
                 (@as(u64, @intCast(pd_index)) << 21) |
                 (@as(u64, @intCast(pt_index)) << 12);
-            _ = capability.releaseUserMapping(principal, va, 1);
+            _ = releaseUserMapping(principal, va, 1);
             h.flush_user_tlb_for_principal_va(principal, va);
             removed += 1;
         }
@@ -783,7 +1061,7 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     space.pdp_page_used_len = 0;
     space.pd_page_used_len = 0;
     space.pt_page_used_len = 0;
-    capability.resetUserReservations(space);
+    resetUserReservations(space);
 
     const user_pml4_pa: u64 = @intFromPtr(&space.pml4);
     if (user_pml4_pa >= h.four_gib) return false;
@@ -802,8 +1080,8 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     const stack_slot = ensureUserPtSlotForPd(space, stack_pml4_index, stack_pdp_index, stack_pd_index) orelse return false;
     const user_pt_page: *[512]u64 = &space.pt_pages[user_slot];
     const stack_pt_page: *[512]u64 = &space.pt_pages[stack_slot];
-    if (!capability.reserveUserMapping(principal, h.user_va, 1, .bootstrap, true)) return false;
-    if (!capability.reserveUserMapping(principal, h.user_stack_page_va, 1, .bootstrap, true)) return false;
+    if (!reserveUserMapping(principal, h.user_va, 1, .bootstrap, true)) return false;
+    if (!reserveUserMapping(principal, h.user_stack_page_va, 1, .bootstrap, true)) return false;
     user_pt_page[user_pt_index] = user_page_paddr | h.page_present | h.page_rw | h.page_user;
     stack_pt_page[stack_pt_index] = user_stack_paddr | h.page_present | h.page_rw | h.page_user;
     space.cr3 = user_pml4_pa;
@@ -838,7 +1116,7 @@ pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
     space.pdp_page_used_len = 0;
     space.pd_page_used_len = 0;
     space.pt_page_used_len = 0;
-    capability.resetUserReservations(space);
+    resetUserReservations(space);
 
     const user_pml4_pa: u64 = @intFromPtr(&space.pml4);
     if (user_pml4_pa >= h.four_gib) return false;

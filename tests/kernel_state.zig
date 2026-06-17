@@ -115,39 +115,110 @@ test "fd transfer copy and move enforce transfer right and refcounts" {
     try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(obj2));
 }
 
-test "process builder fd bootstrap transfers attenuated fd to suspended child" {
+test "capsule device authority is a native fd object" {
     var s = try initFdState();
-    try std.testing.expect(s.ensureProcessDescriptor(p1, "suspended child"));
-    try s.markProcessBuilderSuspended(p1, p0);
-    try std.testing.expect(s.processBuilderOwnerMatches(p1, p0));
-    try std.testing.expect(!s.processBuilderOwnerMatches(p1, p2));
+    const rights = fdRights(.{
+        .inspect = true,
+        .dup = true,
+        .transfer = true,
+        .close = true,
+        .query = true,
+        .config_read = true,
+        .derive_mmio = true,
+        .derive_dma = true,
+        .derive_irq = true,
+    });
+    const fd = try s.createDeviceFd(p0, 0x1001, rights, .{}, 16);
+    try std.testing.expectEqual(@as(kernel.Fd, 16), fd);
+    const info = s.fdInfo(p0, fd) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(kernel.KernelObjectKind.device, info.kind);
+    try std.testing.expectEqual(kernel.fdRightsToBits(rights), info.rights_bits);
 
-    const pair = try s.createIpcChannelPairFds(
-        p0,
-        fdRights(.{ .send = true, .recv = true, .transfer = true, .close = true }),
-        .{},
-        16,
-    );
-    const child_fd = try s.transferFd(
-        p0,
-        p1,
-        pair.b,
-        16,
-        fdRights(.{ .send = true, .recv = true, .close = true }),
-        fdFlags(.{ .cloexec = true }),
-        .copy,
-    );
-    try std.testing.expect(child_fd >= 16);
-    const child_entry = s.fdEntryConst(p1, child_fd) orelse unreachable;
-    try std.testing.expect(child_entry.rights.send);
-    try std.testing.expect(child_entry.rights.recv);
-    try std.testing.expect(child_entry.rights.close);
-    try std.testing.expect(!child_entry.rights.transfer);
-    try std.testing.expect(child_entry.flags.cloexec);
+    const device = s.deviceObjectForFd(p0, fd, fdRights(.{ .query = true })) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(kernel.DmaDeviceId, 0x1001), device.device);
+    try std.testing.expect(s.deviceObjectForFd(p0, fd, fdRights(.{ .config_write = true })) == null);
 
-    try s.ipcSend(p1, child_fd, .{ .words = .{ 0xCAFE, 0, 0, 0 } });
-    const received = try s.ipcRecv(p0, pair.a, 0, 16);
-    try std.testing.expectEqual(@as(u64, 0xCAFE), received.words[0]);
+    const child_fd = try s.transferFd(p0, p1, fd, 16, fdRights(.{ .query = true, .close = true }), .{}, .copy);
+    try std.testing.expectEqual(@as(kernel.Fd, 16), child_fd);
+    try std.testing.expect((s.deviceObjectForFd(p1, child_fd, fdRights(.{ .query = true })) orelse return error.TestExpectedEqual).device == 0x1001);
+    try std.testing.expect(s.deviceObjectForFd(p1, child_fd, fdRights(.{ .derive_mmio = true })) == null);
+}
+
+test "process fd exposes process object kind and lifecycle state" {
+    var s = try initFdState();
+    const rights = fdRights(.{
+        .inspect = true,
+        .dup = true,
+        .transfer = true,
+        .wait = true,
+        .close = true,
+        .spawn = true,
+        .kill = true,
+        .map_into = true,
+        .set_context = true,
+    });
+    const fd = try s.createProcessFd(p0, .{
+        .principal_raw = @intFromEnum(p1),
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, 16);
+
+    const info = s.fdInfo(p0, fd) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(kernel.KernelObjectKind.process, info.kind);
+    try std.testing.expectEqual(kernel.fdRightsToBits(rights), info.rights_bits);
+    try std.testing.expectEqual(@as(u64, @intFromEnum(kernel.TaskObjectState.active)), info.extra);
+
+    const process = try s.setProcessObjectStateForFd(p0, fd, fdRights(.{ .kill = true }), .killed, 7);
+    try std.testing.expectEqual(@as(kernel.PrincipalRaw, @intFromEnum(p1)), process.principal_raw);
+    try std.testing.expectEqual(kernel.TaskObjectState.killed, process.state);
+    try std.testing.expectEqual(@as(u32, 7), process.exit_code);
+
+    const updated = s.processObjectForFd(p0, fd, fdRights(.{ .wait = true })) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(kernel.TaskObjectState.killed, updated.state);
+    try std.testing.expectEqual(@as(u32, 7), updated.exit_code);
+}
+
+test "thread fd stores owner slot generation and lifecycle state" {
+    var s = try initFdState();
+    const rights = fdRights(.{
+        .inspect = true,
+        .dup = true,
+        .transfer = true,
+        .wait = true,
+        .close = true,
+        .start = true,
+        .kill = true,
+        .set_context = true,
+    });
+    const fd0 = try s.createThreadFd(p0, .{
+        .owner_principal_raw = @intFromEnum(p1),
+        .thread_index = 3,
+        .thread_generation = 10,
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, 16);
+    const fd1 = try s.createThreadFd(p0, .{
+        .owner_principal_raw = @intFromEnum(p1),
+        .thread_index = 4,
+        .thread_generation = 11,
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, 16);
+
+    try std.testing.expect(fd0 != fd1);
+    const info = s.fdInfo(p0, fd0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(kernel.KernelObjectKind.thread, info.kind);
+    try std.testing.expectEqual(@as(u64, @intFromEnum(kernel.TaskObjectState.active)), info.extra);
+
+    const killed = try s.setThreadObjectStateForFd(p0, fd0, fdRights(.{ .kill = true }), .killed, 9);
+    try std.testing.expectEqual(@as(u32, 3), killed.thread_index);
+    try std.testing.expectEqual(@as(u32, 10), killed.thread_generation);
+    try std.testing.expectEqual(kernel.TaskObjectState.killed, killed.state);
+    try std.testing.expectEqual(@as(u32, 9), killed.exit_code);
+
+    const still_active = s.threadObjectForFd(p0, fd1, fdRights(.{ .wait = true })) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(kernel.TaskObjectState.active, still_active.state);
+    try std.testing.expectEqual(@as(u32, 11), still_active.thread_generation);
 }
 
 test "fd replace releases destination exactly once" {
@@ -306,6 +377,26 @@ test "ipc call attaches one-shot reply fd" {
     try std.testing.expectEqual(@as(u64, 1234), reply.words[0]);
 }
 
+test "irq fd records interrupt events by vector" {
+    var s = try initFdState();
+    const irq_fd = try s.createIrqFd(p0, .{
+        .device = 0x1001,
+        .kind = .msix,
+        .vector = 0x41,
+    }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
+
+    try std.testing.expectEqual(@as(?u64, 0), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
+
+    var wake_owners: [4]kernel.PrincipalId = undefined;
+    const wake_count = s.recordDeviceInterruptEvent(0x41, wake_owners[0..]);
+    try std.testing.expectEqual(@as(usize, 1), wake_count);
+    try std.testing.expectEqual(p0, wake_owners[0]);
+    try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
+
+    try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x42, wake_owners[0..]));
+    try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
+}
+
 test "physical page allocation does not install page capability" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -320,7 +411,7 @@ test "physical page allocation does not install page capability" {
 test "page-backed vmo fd uses dynamic fd range and reports fd info" {
     var s = try initFdState();
     var free_list = FreePageList{};
-    try free_list.appendContiguousRange(0, 0x1_0000_0000, 2);
+    try free_list.appendContiguousRange(0, 0x20_0000, 2);
     const original_free = free_list.len;
 
     const rights = fdRights(.{

@@ -1,7 +1,7 @@
 const kernel = @import("kernel.zig");
-const capability = @import("capability.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
+const user_vm = @import("memory/user_vm.zig");
 
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
@@ -84,7 +84,7 @@ pub fn dumpPageWalkForVa(cr3: u64, va: u64) void {
 pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     const h = getHooks();
     const ec_user = (frame.error_code & (1 << 2)) != 0;
-    const va_user = capability.isUserCanonicalVa(cr2);
+    const va_user = user_vm.isUserCanonicalVa(cr2);
 
     h.write("  USER_MODE=");
     h.write_bool01(ec_user);
@@ -93,38 +93,37 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     h.write_bool01(va_user);
     h.write("\n");
 
-    const pf_cap = capability.issuePageFaultCapability(scheduler.currentUserPrincipal(), frame, cr2) orelse {
-        h.write("  PF_CAP=none\n");
-        h.write("  CAP_LOOKUP=skip\n");
+    if (!ec_user or !va_user) {
+        h.write("  USER_FAULT=none\n");
         return;
-    };
-    h.write("  PF_CAP=issued\n");
+    }
+    h.write("  USER_FAULT=observed\n");
+
+    const principal = scheduler.currentUserPrincipal();
+    const fault_page_va = cr2 & ~@as(u64, 4095);
+    const write_access = (frame.error_code & (1 << 1)) != 0;
+    const instruction_fetch = (frame.error_code & (1 << 4)) != 0;
 
     if (!h.kernel_state_ready.*) {
         h.write("  VMA_LOOKUP=kernel_state_not_ready\n");
-        h.write("  CAP_LOOKUP=kernel_state_not_ready\n");
+        h.write("  MAPPED_PADDR=kernel_state_not_ready\n");
         return;
     }
 
     const vma_mapping = h.state.nativeVmaFaultMapping(
-        pf_cap.principal,
-        pf_cap.fault_page_va,
-        pf_cap.write_access,
-        pf_cap.instruction_fetch,
+        principal,
+        fault_page_va,
+        write_access,
+        instruction_fetch,
     );
     h.write("  VMA_LOOKUP=");
     h.write(if (vma_mapping != null) "found(native)\n" else "none(native)\n");
 
-    const candidate_paddr = pf_cap.candidate_paddr orelse {
-        h.write("  CAND_PADDR=none\n");
-        h.write("  CAP_LOOKUP=none\n");
+    const mapped_paddr = user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) orelse {
+        h.write("  MAPPED_PADDR=none\n");
         return;
     };
-    h.write("  CAND_PADDR=");
-    h.write_hex_raw(candidate_paddr);
+    h.write("  MAPPED_PADDR=");
+    h.write_hex_raw(mapped_paddr);
     h.write("\n");
-
-    const has_cap = h.state.getTableConst(pf_cap.principal).find(candidate_paddr) != null;
-    h.write("  CAP_LOOKUP=");
-    h.write(if (has_cap) "found(current)\n" else "none(current)\n");
 }

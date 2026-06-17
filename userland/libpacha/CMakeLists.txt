@@ -3,19 +3,17 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_SYSTEM_NAME Generic)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
-project(pacha_ipc C)
+project(pacha C)
 
-add_library(pacha_ipc STATIC
-  src/ipc.c
-  ../libpacha/src/syscall.c
+add_library(pacha STATIC
+  src/syscall.c
 )
 
-target_include_directories(pacha_ipc PUBLIC
+target_include_directories(pacha PUBLIC
   include
-  ../libpacha/include
 )
 
-target_compile_options(pacha_ipc PRIVATE
+target_compile_options(pacha PRIVATE
   -target x86_64-freestanding-none
   -ffreestanding
   -fno-stack-protector

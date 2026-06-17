@@ -136,7 +136,7 @@ pub const DeviceDescriptor = extern struct {
     init_queue_grant_count: u64,
     init_queue_grants: [max_device_queue_grants]DeviceQueueGrant,
     init_command_token: u64,
-    init_device_capsule_token: u64,
+    init_device_fd: u64,
 };
 
 pub const DisplayDescriptor = extern struct {

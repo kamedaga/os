@@ -214,7 +214,7 @@ enum {
     CAPSULE_RIGHT_POWER = 1ULL << 10,
     CAPSULE_RIGHT_HOTPLUG_OBSERVE = 1ULL << 11,
     CAPSULE_RIGHT_GRANT = 1ULL << 12,
-    CAPSULE_RIGHT_DEVICE_TO_ROOT =
+    DEVICE_FD_RIGHT_DEVICE_TO_ROOT =
         CAPSULE_RIGHT_QUERY |
         CAPSULE_RIGHT_CONFIG_READ |
         CAPSULE_RIGHT_CONFIG_WRITE |
@@ -327,7 +327,7 @@ struct device_descriptor {
     u64 init_queue_grant_count;
     struct device_queue_grant init_queue_grants[INIT_MAX_DEVICE_QUEUE_GRANTS];
     u64 init_command_token;
-    u64 init_device_capsule_token;
+    u64 init_device_fd;
 };
 
 struct boot_archive_descriptor {
@@ -384,7 +384,7 @@ struct manager_device_grant {
     struct device_queue_grant queue_grants[MANAGER_INIT_MAX_DEVICE_QUEUE_GRANTS];
     u64 command_token;
     u64 input_kind_hint;
-    u64 device_capsule_token;
+    u64 device_fd;
 };
 
 struct manager_config_page {
@@ -523,7 +523,7 @@ struct device_catalog_entry {
     u64 queue1_submit_token;
     u64 queue1_notify_token;
     u64 command_token;
-    u64 device_capsule_token;
+    u64 device_fd;
 };
 
 struct device_catalog_page {
@@ -1226,7 +1226,7 @@ static void init_handoff_from_descriptor_page(void) {
         grant->device_page_paddr = d->device_page_paddr;
         grant->iommu_token = d->init_iommu_token;
         grant->command_token = d->init_command_token;
-        grant->device_capsule_token = d->init_device_capsule_token;
+        grant->device_fd = d->init_device_fd;
         grant->queue_grant_count = d->init_queue_grant_count;
         if (grant->queue_grant_count > MANAGER_INIT_MAX_DEVICE_QUEUE_GRANTS) {
             grant->queue_grant_count = MANAGER_INIT_MAX_DEVICE_QUEUE_GRANTS;
@@ -1298,7 +1298,7 @@ static void device_catalog_add_pci_functions(void) {
         struct device_descriptor *d = &page->devices[i];
         if ((d->flags & INIT_DEVICE_FLAG_PRESENT) == 0) continue;
         if (d->transport != INIT_DEVICE_TRANSPORT_PCI_FUNCTION) continue;
-        if (d->init_device_capsule_token == 0) continue;
+        if (d->init_device_fd == 0) continue;
         device_catalog_add(d, DEVICE_CATALOG_KIND_PCI_FUNCTION);
     }
 }
@@ -1456,7 +1456,7 @@ static void device_catalog_add(struct device_descriptor *device, u64 kind) {
     entry->isr_page_offset = device->isr_page_offset;
     entry->device_page_offset = device->device_page_offset;
     entry->notify_off_multiplier = device->notify_off_multiplier;
-    entry->device_capsule_token = device->init_device_capsule_token;
+    entry->device_fd = device->init_device_fd;
 }
 
 static u64 ensure_device_catalog(void) {
@@ -1529,19 +1529,19 @@ static int fill_catalog_queue_tokens_for_child(volatile struct device_catalog_en
 }
 
 static int grant_catalog_capsule_to_child(volatile struct device_catalog_entry *entry, u64 child_slot) {
-    if (entry->device_capsule_token == 0) return 1;
+    if (entry->device_fd == 0) return 1;
     const u64 granted = syscall3(
         SYSCALL_CAPSULE_GRANT,
-        entry->device_capsule_token,
+        entry->device_fd,
         child_slot,
-        CAPSULE_RIGHT_DEVICE_TO_ROOT
+        DEVICE_FD_RIGHT_DEVICE_TO_ROOT
     );
-    if ((granted & CAPSULE_TOKEN_MAGIC_MASK) != CAPSULE_TOKEN_MAGIC_TAG) {
-        user_log_hex("[seed2_boot] catalog capsule grant failed kind=", entry->kind);
-        user_log_hex("[seed2_boot] catalog capsule grant status=", granted);
+    if (granted < 16 || granted >= 256) {
+        user_log_hex("[seed2_boot] catalog device fd transfer failed kind=", entry->kind);
+        user_log_hex("[seed2_boot] catalog device fd transfer status=", granted);
         return 0;
     }
-    entry->device_capsule_token = granted;
+    entry->device_fd = granted;
     return 1;
 }
 

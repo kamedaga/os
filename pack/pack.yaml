@@ -29,7 +29,18 @@ startupManifest:
   include: ["rootfs"]
 rootfsDirs: ["/cmd", "/bin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
-  apps: ["persistent_fs", "seed", "shell"]
+  apps:
+    - "dash"
+    - "esp_server"
+    - "esp_server_smoke"
+    - "exec"
+    - "exec_service"
+    - "fat_server"
+    - "linux_abi_server"
+    - "rootfs_vfs"
+    - "seed2_boot"
+    - "seed2_root"
+    - "tty_service"
   kinds: []
   includeSkippedArtifacts: false
 apps:
@@ -168,14 +179,6 @@ apps:
     out: "EXECSVC.ELF"
     rootfs:
       rootfs: "/srv/exec_service.elf"
-    startup:
-      publish: "rootfs"
-      action: "process_builder"
-      name: "exec_service"
-      label: "exec_service"
-      load: "rootfs"
-      requires: ["vfs_service"]
-      provides: ["exec_service"]
   fastfetch:
     file:
       path: ".artifacts/userland-fixtures/fastfetch.elf"
@@ -365,18 +368,6 @@ apps:
     file: "userland/fixtures/base/os-release"
     out: "OS-RELEASE"
     rootfs: "/etc/os-release"
-  persistent_fs:
-    role: "service"
-    zig:
-      entry: "userland/programs/persistent_fs.zig"
-      module: "abi_root"
-      imports: ["abi_root", "persistent_fs_layout"]
-    out: "PERSFS.ELF"
-    target: "x86_64-freestanding-none"
-    optimize: "ReleaseSmall"
-    strip: true
-    bootfs: "/srv/persistent_fs.elf"
-    rootfs: "/srv/persistent_fs.elf"
   pipe_probe:
     file:
       path: ".artifacts/userland-fixtures/pipe_probe.elf"
@@ -420,17 +411,6 @@ apps:
       rebuild: ["bash", "tools/build_seed2_root.sh"]
     out: "SEED2RT.ELF"
     rootfs: "/sbin/seed2.elf"
-  shell:
-    role: "command"
-    zig:
-      entry: "userland/programs/shell.zig"
-      module: "abi_root"
-    out: "SHELL.ELF"
-    target: "x86_64-freestanding-none"
-    optimize: "ReleaseSmall"
-    strip: true
-    bootfs: "/cmd/shell.elf"
-    rootfs: "/cmd/shell.elf"
   tcp_http_get:
     file:
       path: ".artifacts/userland-fixtures/tcp_http_get.elf"
@@ -445,14 +425,6 @@ apps:
     out: "TTYSVC.ELF"
     rootfs:
       rootfs: "/srv/tty_service.elf"
-    startup:
-      publish: "rootfs"
-      action: "process_builder"
-      name: "tty_service"
-      label: "tty_service"
-      load: "rootfs"
-      requires: ["vfs_service"]
-      provides: ["tty_service"]
   uutils_coreutils:
     file:
       path: ".artifacts/userland-fixtures/uutils-coreutils.elf"
@@ -477,17 +449,6 @@ apps:
       rebuild: ["bash", "tools/build_wsl_uutils_shim.sh"]
     out: "UUTILSHM.ELF"
     rootfs: ["/cmd/uutils-shim.elf", "/bin/[", "/usr/lib/uutils/arch", "/usr/lib/uutils/b2sum", "/usr/lib/uutils/base32", "/usr/lib/uutils/base64", "/usr/bin/basename", "/usr/lib/uutils/basenc", "/bin/cat", "/usr/lib/uutils/chgrp", "/bin/chmod", "/usr/lib/uutils/chown", "/usr/lib/uutils/chroot", "/usr/lib/uutils/cksum", "/usr/lib/uutils/comm", "/bin/cp", "/usr/lib/uutils/csplit", "/bin/cut", "/bin/date", "/bin/dd", "/usr/bin/df", "/usr/bin/dir", "/usr/lib/uutils/dircolors", "/usr/bin/dirname", "/usr/lib/uutils/du", "/bin/echo", "/bin/env", "/usr/lib/uutils/expand", "/usr/bin/expr", "/usr/lib/uutils/factor", "/bin/false", "/usr/lib/uutils/fmt", "/usr/lib/uutils/fold", "/usr/lib/uutils/groups", "/usr/lib/uutils/hashsum", "/bin/head", "/usr/lib/uutils/hostid", "/usr/bin/hostname", "/usr/bin/id", "/usr/lib/uutils/install", "/usr/lib/uutils/join", "/usr/bin/kill", "/usr/lib/uutils/link", "/usr/bin/ln", "/usr/lib/uutils/logname", "/bin/ls", "/usr/bin/md5sum", "/bin/mkdir", "/usr/bin/mkfifo", "/usr/bin/mknod", "/usr/bin/mktemp", "/usr/bin/more", "/bin/mv", "/usr/lib/uutils/nice", "/usr/lib/uutils/nl", "/usr/lib/uutils/nohup", "/usr/bin/nproc", "/usr/lib/uutils/numfmt", "/usr/lib/uutils/od", "/usr/bin/paste", "/usr/lib/uutils/pathchk", "/usr/lib/uutils/pinky", "/usr/lib/uutils/pr", "/usr/bin/printenv", "/bin/printf", "/usr/lib/uutils/ptx", "/bin/pwd", "/usr/bin/readlink", "/usr/bin/realpath", "/bin/rm", "/bin/rmdir", "/bin/seq", "/usr/bin/sha1sum", "/usr/lib/uutils/sha224sum", "/usr/bin/sha256sum", "/usr/lib/uutils/sha384sum", "/usr/bin/sha512sum", "/usr/lib/uutils/shred", "/usr/lib/uutils/shuf", "/bin/sleep", "/bin/sort", "/usr/lib/uutils/split", "/usr/bin/stat", "/usr/lib/uutils/stty", "/usr/lib/uutils/sum", "/usr/lib/uutils/sync", "/usr/lib/uutils/tac", "/bin/tail", "/bin/tee", "/bin/test", "/usr/lib/uutils/timeout", "/bin/touch", "/bin/tr", "/bin/true", "/usr/lib/uutils/truncate", "/usr/lib/uutils/tsort", "/usr/bin/tty", "/bin/uname", "/usr/lib/uutils/unexpand", "/usr/bin/uniq", "/usr/bin/unlink", "/usr/bin/uptime", "/usr/lib/uutils/users", "/usr/lib/uutils/vdir", "/bin/wc", "/usr/lib/uutils/who", "/usr/bin/whoami", "/usr/lib/uutils/yes"]
-  virtio_blk:
-    role: "service"
-    zig:
-      entry: "userland/programs/virtio_blk.zig"
-      module: "abi_root"
-    out: "VBLKDRV.ELF"
-    target: "x86_64-freestanding-none"
-    optimize: "ReleaseSmall"
-    strip: true
-    bootfs: "/srv/virtio_blk.elf"
-    rootfs: "/srv/virtio_blk.elf"
   virtio_console:
     role: "service"
     file:

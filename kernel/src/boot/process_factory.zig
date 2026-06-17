@@ -35,27 +35,6 @@ pub const CreateUserProcessError = error{CreateFailed};
 pub const CreateDynamicUserProcessError = error{ CreateFailed, NoFreeProcess };
 
 // ---------------------------------------------------------------------------
-// Capability rights helpers
-// ---------------------------------------------------------------------------
-
-pub fn ownedUserPageRights(writable: bool) kernel.Rights {
-    return .{
-        .cpu_read = true,
-        .cpu_write = writable,
-        .dma = false,
-        .grant = true,
-    };
-}
-
-pub fn derivedUserPageRights(writable: bool) kernel.Rights {
-    return .{
-        .cpu_read = true,
-        .cpu_write = writable,
-        .dma = false,
-    };
-}
-
-// ---------------------------------------------------------------------------
 // Initial trap frame
 // ---------------------------------------------------------------------------
 
@@ -194,33 +173,6 @@ pub fn allocPageForProcessOrHalt(
     };
 }
 
-pub fn installPageForProcessOrHalt(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    page: kernel.PageCapability,
-    writable: bool,
-    role_label: []const u8,
-    page_label: []const u8,
-) void {
-    state.installCap(principal, page.paddr, ownedUserPageRights(writable)) catch |err| {
-        halt.haltWithRolePageError(role_label, page_label, "cap install", err);
-    };
-}
-
-pub fn grantPageForProcessOrHalt(
-    state: *kernel.KernelState,
-    from_principal: kernel.PrincipalId,
-    to_principal: kernel.PrincipalId,
-    page: kernel.PageCapability,
-    writable: bool,
-    role_label: []const u8,
-    page_label: []const u8,
-) void {
-    state.grantCap(from_principal, to_principal, page.paddr, derivedUserPageRights(writable)) catch |err| {
-        halt.haltWithRolePageError(role_label, page_label, "cap grant", err);
-    };
-}
-
 // ---------------------------------------------------------------------------
 // Page mapping helpers
 // ---------------------------------------------------------------------------
@@ -323,37 +275,6 @@ pub fn allocAndMapOwnedPageForProcessOrHalt(
     const page = allocPageForProcessOrHalt(state, principal, role_label, page_label, free_list);
     mapUserPageOrHalt(state, principal, va_start, page, writable, role_label, page_label, free_list);
     return page;
-}
-
-pub fn installAndMapPageForProcessOrHalt(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    page: kernel.PageCapability,
-    va_start: u64,
-    writable: bool,
-    role_label: []const u8,
-    page_label: []const u8,
-) void {
-    installPageForProcessOrHalt(state, principal, page, writable, role_label, page_label);
-    if (!user_vm.mapUserLinearRegion(principal, va_start, page.paddr, 4096, writable)) {
-        halt.haltWithRolePageMessage(role_label, page_label, "map failed");
-    }
-}
-
-pub fn grantAndMapPageForProcessOrHalt(
-    state: *kernel.KernelState,
-    from_principal: kernel.PrincipalId,
-    to_principal: kernel.PrincipalId,
-    page: kernel.PageCapability,
-    va_start: u64,
-    writable: bool,
-    role_label: []const u8,
-    page_label: []const u8,
-) void {
-    grantPageForProcessOrHalt(state, from_principal, to_principal, page, writable, role_label, page_label);
-    if (!user_vm.mapUserLinearRegion(to_principal, va_start, page.paddr, 4096, writable)) {
-        halt.haltWithRolePageMessage(role_label, page_label, "map failed");
-    }
 }
 
 // ---------------------------------------------------------------------------

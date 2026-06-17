@@ -1,36 +1,22 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 0x70;
-pub const syscall_capsule_query: u64 = 0x70;
-pub const syscall_capsule_derive_mmio: u64 = 0x71;
-pub const syscall_capsule_derive_dma_buffer: u64 = 0x72;
-pub const syscall_capsule_derive_dma_mapping: u64 = 0x73;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 0x74;
-pub const syscall_capsule_derive_irq: u64 = 0x75;
-pub const syscall_capsule_grant: u64 = 0x76;
-pub const syscall_capsule_revoke: u64 = 0x77;
-pub const syscall_capsule_close: u64 = 0x78;
-pub const syscall_capsule_pci_config_read: u64 = 0x79;
-pub const syscall_capsule_pci_config_write: u64 = 0x7a;
-pub const syscall_capsule_pci_bar_info: u64 = 0x7b;
-pub const syscall_capsule_irq_poll: u64 = 0x7c;
+pub const syscall_capsule_first: u64 = 27;
+pub const syscall_capsule_query: u64 = 27;
+pub const syscall_capsule_derive_mmio: u64 = 28;
+pub const syscall_capsule_derive_dma_buffer: u64 = 29;
+pub const syscall_capsule_derive_dma_mapping: u64 = 30;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 31;
+pub const syscall_capsule_derive_irq: u64 = 32;
+pub const syscall_capsule_pci_config_read: u64 = 33;
+pub const syscall_capsule_pci_config_write: u64 = 34;
+pub const syscall_capsule_pci_bar_info: u64 = 35;
+pub const syscall_capsule_irq_poll: u64 = 36;
 pub const syscall_capsule_last: u64 = syscall_capsule_irq_poll;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
 pub fn isCapsuleSyscall(nr: u64) bool {
     return nr >= syscall_capsule_first and nr <= syscall_capsule_last;
 }
-
-pub const token_magic: u8 = 0xCA;
-pub const token_version: u8 = 1;
-pub const token_magic_shift: u6 = 56;
-pub const token_version_shift: u6 = 52;
-pub const token_kind_shift: u6 = 48;
-pub const token_magic_tag: u64 = @as(u64, token_magic) << token_magic_shift;
-pub const token_magic_mask: u64 = 0xFF << token_magic_shift;
-pub const token_version_mask: u64 = 0xF << token_version_shift;
-pub const token_kind_mask: u64 = 0xF << token_kind_shift;
-pub const token_payload_mask: u64 = (@as(u64, 1) << token_kind_shift) - 1;
 
 pub const CapsuleKind = enum(u8) {
     session = 1,
@@ -80,11 +66,6 @@ pub const IrqKind = enum(u2) {
     msix = 3,
 };
 
-pub const DecodedCapsuleToken = struct {
-    kind: CapsuleKind,
-    token: u64,
-};
-
 pub fn rightsFromBits(bits: u64) Rights {
     return @bitCast(bits & known_rights_mask);
 }
@@ -93,30 +74,10 @@ pub fn rightsToBits(rights: Rights) u64 {
     return @as(u64, @bitCast(rights)) & known_rights_mask;
 }
 
-pub fn encodeCapsuleToken(kind: CapsuleKind, token: u64) u64 {
-    std.debug.assert(token != 0);
-    std.debug.assert((token & ~token_payload_mask) == 0);
-    return token_magic_tag |
-        (@as(u64, token_version) << token_version_shift) |
-        (@as(u64, @intFromEnum(kind)) << token_kind_shift) |
-        token;
-}
-
-pub fn decodeCapsuleToken(value: u64) ?DecodedCapsuleToken {
-    if ((value & token_magic_mask) != token_magic_tag) return null;
-    const version = (value & token_version_mask) >> token_version_shift;
-    if (version != @as(u64, token_version)) return null;
-    const kind_raw = @as(u8, @intCast((value & token_kind_mask) >> token_kind_shift));
-    const kind = std.meta.intToEnum(CapsuleKind, kind_raw) catch return null;
-    const token = value & token_payload_mask;
-    if (token == 0) return null;
-    return .{ .kind = kind, .token = token };
-}
-
 pub const snapshot_word_count: usize = 16;
-pub const snapshot_token_index: usize = 0;
-pub const snapshot_root_token_index: usize = 1;
-pub const snapshot_parent_token_index: usize = 2;
+pub const snapshot_fd_index: usize = 0;
+pub const snapshot_root_fd_index: usize = 1;
+pub const snapshot_parent_fd_index: usize = 2;
 pub const snapshot_kind_index: usize = 3;
 pub const snapshot_state_index: usize = 4;
 pub const snapshot_rights_index: usize = 5;
@@ -167,21 +128,10 @@ comptime {
     std.debug.assert(syscall_capsule_derive_dma_mapping == syscall_capsule_first + 3);
     std.debug.assert(syscall_capsule_derive_dma_mapping_from_buffer == syscall_capsule_first + 4);
     std.debug.assert(syscall_capsule_derive_irq == syscall_capsule_first + 5);
-    std.debug.assert(syscall_capsule_grant == syscall_capsule_first + 6);
-    std.debug.assert(syscall_capsule_revoke == syscall_capsule_first + 7);
-    std.debug.assert(syscall_capsule_close == syscall_capsule_first + 8);
-    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 9);
-    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 10);
-    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 11);
-    std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 12);
-}
-
-test "capsule token encodes version kind and payload" {
-    const encoded = encodeCapsuleToken(.dma_mapping, 0x1234);
-    const decoded = decodeCapsuleToken(encoded) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(CapsuleKind.dma_mapping, decoded.kind);
-    try std.testing.expectEqual(@as(u64, 0x1234), decoded.token);
-    try std.testing.expectEqual(@as(?DecodedCapsuleToken, null), decodeCapsuleToken(0x1234));
+    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 6);
+    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 7);
+    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 8);
+    std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 9);
 }
 
 test "capsule rights mask strips reserved bits" {
@@ -194,5 +144,5 @@ test "capsule syscall range is stable and contiguous" {
     try std.testing.expect(isCapsuleSyscall(syscall_capsule_irq_poll));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_first - 1));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_last + 1));
-    try std.testing.expectEqual(@as(usize, 13), syscall_capsule_count);
+    try std.testing.expectEqual(@as(usize, 10), syscall_capsule_count);
 }

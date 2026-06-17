@@ -1,20 +1,17 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
-const capability = @import("capability.zig");
-const device_events = @import("device_events.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
-const abi_trap_runtime = @import("runtime/abi_trap.zig");
 const user_vm = @import("memory/user_vm.zig");
 const scheduler = @import("scheduler.zig");
 const smp = @import("smp.zig");
-const x86_platform = @import("arch/x86_64/platform.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
-const debug_skip_syscall_fx_state = false;
 const debug_skip_timer_fx_state = false;
+const generic_device_interrupt_vector: u8 = 0x41;
+const device_interrupt_vector_count: u8 = 1;
 const trap_frame_qword_count = @sizeOf(TrapFrame) / @sizeOf(u64);
 const exception_trap_frame_qword_count = @sizeOf(ExceptionTrapFrame) / @sizeOf(u64);
 const user_return_gpr_qword_count = @offsetOf(TrapFrame, "rip") / @sizeOf(u64);
@@ -46,16 +43,9 @@ pub export var page_fault_work_frames: [smp.max_cpus]ExceptionTrapFrame = [_]Exc
 pub export var trap_fault_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var fatal_exception_resume_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var timer_interrupt_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
-pub export var syscall_interrupt_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
+pub export var syscall_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
 pub export var user_return_saved_gprs_by_cpu: [smp.max_cpus][16]u64 align(16) = [_][16]u64{[_]u64{0} ** 16} ** smp.max_cpus;
 pub export var user_return_iret_frames_by_cpu: [smp.max_cpus][8]u64 align(16) = [_][8]u64{[_]u64{0} ** 8} ** smp.max_cpus;
-pub export var syscall_entry_user_rsps: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
-pub export var syscall_entry_saved_r15s: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
-pub export var syscall_entry_is_lstars: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
-pub export var ipc_lstar_asm_fastpath_attempts: u64 = 0;
-pub export var ipc_lstar_asm_fastpath_hits: u64 = 0;
-pub export var ipc_lstar_asm_sparse_fallbacks: u64 = 0;
-pub export var ipc_lstar_sparse_probe_enabled: u64 = 0;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -80,20 +70,12 @@ const runtime_storage_ptrs = .{
     &trap_fault_work_frames,
     &fatal_exception_resume_work_frames,
     &timer_interrupt_work_frames,
-    &syscall_interrupt_work_frames,
+    &syscall_work_frame,
     &user_return_saved_gprs_by_cpu,
     &user_return_iret_frames_by_cpu,
-    &syscall_entry_user_rsps,
-    &syscall_entry_saved_r15s,
-    &syscall_entry_is_lstars,
-    &ipc_lstar_asm_fastpath_attempts,
-    &ipc_lstar_asm_fastpath_hits,
-    &ipc_lstar_asm_sparse_fallbacks,
-    &ipc_lstar_sparse_probe_enabled,
     &user_return_saved_r10,
     &user_return_saved_gprs,
     &user_return_iret_frame,
-    &syscall_return_writeback_enabled_by_cpu,
 };
 
 pub fn kernelStaticStorageEndAddr() usize {
@@ -123,39 +105,26 @@ extern var kernel_syscall_stack_top: u64;
 extern var kernel_syscall_stack_tops: [smp.max_cpus]u64;
 extern var user_cr3_value: u64;
 extern var user_cr3_values: [smp.max_cpus]u64;
-extern var current_user_principal: kernel.PrincipalId;
 extern var current_user_principals: [smp.max_cpus]kernel.PrincipalId;
-extern var current_thread_index: usize;
 extern var current_thread_indices: [smp.max_cpus]usize;
 extern var thread_contexts_ptr: *anyopaque;
-extern var ipc_hot_threads_ptr: *anyopaque;
-extern var endpoint_generation_fast_mirror: u64;
 extern var lapic_tick_count: u64;
 extern var user_return_saved_r10: u64;
 extern var user_return_saved_gprs: [15]u64 align(16);
 extern var user_return_iret_frame: [5]u64 align(16);
-extern var syscall_return_writeback_enabled_by_cpu: [smp.max_cpus]u64;
 
 extern fn saveCurrentThreadFxState() callconv(.c) void;
 extern fn restoreCurrentThreadFxState() callconv(.c) void;
 extern fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64;
-extern fn syscallLstarDispatch(frame: *TrapFrame) callconv(.c) u64;
-extern fn syscallIpcDispatch(frame: *TrapFrame) callconv(.c) u64;
-extern fn syscallIpcCallReplyRecvSignalOnlyDispatch(frame: *TrapFrame) callconv(.c) u64;
-extern fn syscallIpcCallReplyRecvSignalOnlySparse(endpoint_id: u64, save: *const anyopaque, out_frame: *TrapFrame) callconv(.c) usize;
-extern fn syscallIpcFastDispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) callconv(.c) u64;
-extern fn schedulerSyncBootstrapCurrentStateFromMirrorFromAsm() callconv(.c) void;
-
-pub export fn syscallInterruptWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
-    const cpu_slot = scheduler.currentCpuSlot();
-    const bounded_slot = if (cpu_slot < syscall_interrupt_work_frames.len) cpu_slot else 0;
-    return &syscall_interrupt_work_frames[bounded_slot];
-}
 
 pub export fn timerInterruptWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
     const cpu_slot = scheduler.currentCpuSlot();
     const bounded_slot = if (cpu_slot < timer_interrupt_work_frames.len) cpu_slot else 0;
     return &timer_interrupt_work_frames[bounded_slot];
+}
+
+pub export fn syscallWorkFrameFromAsm() callconv(.c) *TrapFrame {
+    return &syscall_work_frame;
 }
 
 fn boundedCurrentCpuSlot() usize {
@@ -173,14 +142,6 @@ pub export fn trapFaultWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
 
 pub export fn fatalExceptionResumeWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
     return &fatal_exception_resume_work_frames[boundedCurrentCpuSlot()];
-}
-
-pub export fn markSyscallEntryInt80ForCurrentCpuFromAsm() callconv(.c) void {
-    syscall_entry_is_lstars[boundedCurrentCpuSlot()] = 0;
-}
-
-pub export fn syscallReturnWritebackEnabledForCurrentCpuFromAsm() callconv(.c) u64 {
-    return syscall_return_writeback_enabled_by_cpu[boundedCurrentCpuSlot()];
 }
 
 pub export fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.c) void {
@@ -270,376 +231,6 @@ fn asmCallAligned(comptime target: []const u8) []const u8 {
     , .{target});
 }
 
-fn asmWriteSyscallReturnToWorkFramePointer() []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\push %rax
-        \\push %r10
-        \\
-    , .{}) ++ asmCallAligned("syscallReturnWritebackEnabledForCurrentCpuFromAsm") ++ std.fmt.comptimePrint(
-        \\
-        \\mov %rax, %r11
-        \\pop %r10
-        \\pop %rax
-        \\cmpq $0, %r11
-        \\je 7f
-        \\mov %r10, 112(%rax)
-        \\7:
-        \\
-    , .{});
-}
-
-fn asmCallSyscallDispatchFromStackFrame(comptime target: []const u8) []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\mov %rsp, %r15
-        \\and $-16, %rsp
-        \\sub $32, %rsp
-        \\mov %r15, %rcx
-        \\call {s}
-        \\31:
-        \\mov %r15, %rsp
-        \\
-    , .{target});
-}
-
-fn asmCallIpcFastDispatchNoCr3() []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\push %rax
-        \\push %rdi
-        \\push %rsi
-        \\push %rdx
-        \\push %r8
-        \\push %r9
-        \\push %r10
-        \\push %r12
-        \\push %r13
-        \\push %r15
-        \\mov %rcx, %r12
-        \\mov %r11, %r13
-        \\mov %rax, %rcx
-        \\mov %rdi, %rdx
-        \\mov %rsi, %r8
-        \\mov 48(%rsp), %r9
-        \\mov %rsp, %r15
-        \\and $-16, %rsp
-        \\sub $32, %rsp
-        \\call syscallIpcFastDispatch
-        \\mov %r15, %rsp
-        \\btr $63, %rax
-        \\jnc 25f
-        \\mov %r12, %rcx
-        \\mov %r13, %r11
-        \\pop %r15
-        \\pop %r13
-        \\pop %r12
-        \\pop %r10
-        \\pop %r9
-        \\pop %r8
-        \\pop %rdx
-        \\pop %rsi
-        \\pop %rdi
-        \\add $8, %rsp
-        \\jmp 23b
-        \\25:
-        \\mov %r12, %rcx
-        \\mov %r13, %r11
-        \\pop %r15
-        \\pop %r13
-        \\pop %r12
-        \\pop %r10
-        \\pop %r9
-        \\pop %r8
-        \\pop %rdx
-        \\pop %rsi
-        \\pop %rdi
-        \\pop %rax
-        \\jmp 28f
-        \\
-    , .{});
-}
-
-fn asmIpcFrameDispatchNoCr3(
-    comptime user_cs: u64,
-    comptime user_ss: u64,
-    comptime user_rsp_symbol: []const u8,
-    comptime writeback_symbol: []const u8,
-) []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\28:
-        \\pushq ${d}
-        \\pushq {s}(%rip)
-        \\push %r11
-        \\pushq ${d}
-        \\push %rcx
-        \\push %rax
-        \\push %rbx
-        \\push %r10
-        \\push %rdx
-        \\push %rsi
-        \\push %rdi
-        \\push %rbp
-        \\push %r8
-        \\push %r9
-        \\push %r10
-        \\push %r11
-        \\push %r12
-        \\push %r13
-        \\push %r14
-        \\push %r15
-        \\mov %rsp, %r15
-        \\and $-16, %rsp
-        \\sub $32, %rsp
-        \\mov %r15, %rcx
-        \\call syscallIpcDispatch
-        \\mov %r15, %rsp
-        \\cmpq $0, {s}(%rip)
-        \\je 7f
-        \\mov %rax, 112(%rsp)
-        \\7:
-    , .{ user_ss, user_rsp_symbol, user_cs, writeback_symbol });
-}
-
-fn asmIpcCallReplyRecvSignalOnlyNoCr3(
-    comptime user_cs: u64,
-    comptime user_ss: u64,
-    comptime user_rsp_symbol: []const u8,
-    comptime current_thread_symbol: []const u8,
-    comptime current_principal_symbol: []const u8,
-    comptime user_cr3_symbol: []const u8,
-) []const u8 {
-    _ = user_cs;
-    _ = user_ss;
-    return std.fmt.comptimePrint(
-        \\
-        \\27:
-        \\incq ipc_lstar_asm_fastpath_attempts(%rip)
-        \\test $2, %rdx
-        \\jz 28f
-        \\sub $32, %rsp
-        \\mov %rdi, 0(%rsp)
-        \\mov %r8, 8(%rsp)
-        \\mov %r9, 16(%rsp)
-        \\mov %r10, 24(%rsp)
-        \\cmp $2, %rdx
-        \\jne 270f
-        \\mov {s}(%rip), %r8
-        \\mov ipc_hot_threads_ptr(%rip), %r9
-        \\mov %r8, %r10
-        \\imul ${d}, %r10, %r10
-        \\lea (%r9,%r10), %r10
-        \\cmpb $0, {d}(%r10)
-        \\je 270f
-        \\cmpb $0, {d}(%r10)
-        \\jne 270f
-        \\mov endpoint_generation_fast_mirror(%rip), %rdi
-        \\cmp {d}(%r10), %rdi
-        \\jne 270f
-        \\cmp {d}(%r10), %rsi
-        \\jne 270f
-        \\mov {d}(%r10), %rdi
-        \\cmp %r8, %rdi
-        \\je 270f
-        \\mov %rdi, %rax
-        \\imul ${d}, %rax, %rax
-        \\lea (%r9,%rax), %rax
-        \\mov {d}(%r10), %r9d
-        \\cmp %r9d, {d}(%rax)
-        \\jne 270f
-        \\cmpb $0, {d}(%rax)
-        \\je 270f
-        \\cmpb $0, {d}(%r10)
-        \\je 268f
-    , .{
-        current_thread_symbol,
-        @sizeOf(scheduler.IpcHotThread),
-        @offsetOf(scheduler.IpcHotThread, "allocated"),
-        @offsetOf(scheduler.IpcHotThread, "signal_pending"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_cached_endpoint_generation"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_cached_endpoint_id"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_cached_target_thread"),
-        @sizeOf(scheduler.IpcHotThread),
-        @offsetOf(scheduler.IpcHotThread, "ipc_cached_target"),
-        @offsetOf(scheduler.IpcHotThread, "owner_process"),
-        @offsetOf(scheduler.IpcHotThread, "allocated"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_reply_token_valid"),
-    }) ++ std.fmt.comptimePrint(
-        \\
-        \\cmp {d}(%r10), %rdi
-        \\jne 270f
-        \\movb $0, {d}(%r10)
-        \\movq $0, {d}(%r10)
-        \\268:
-        \\cmpb $0, {d}(%rax)
-        \\jne 270f
-        \\movb $1, {d}(%rax)
-        \\mov %r8, {d}(%rax)
-        \\movb $0, {d}(%rax)
-        \\movq $0, {d}(%rax)
-        \\movb $1, {d}(%rax)
-        \\movb $0, {d}(%rax)
-        \\mov {s}(%rip), %r9
-        \\mov %r9, {d}(%r10)
-        \\movb $0, {d}(%r10)
-        \\movq $0, {d}(%r10)
-        \\movb $0, {d}(%r10)
-        \\mov %rdi, {s}(%rip)
-        \\mov {d}(%rax), %r9d
-        \\mov %r9d, {s}(%rip)
-        \\mov {d}(%rax), %r9
-        \\mov %r9, {s}(%rip)
-        \\mov thread_contexts_ptr(%rip), %r9
-        \\mov %r8, %r10
-        \\imul ${d}, %r10, %r10
-        \\lea (%r9,%r10), %r10
-        \\mov %rdi, %rax
-        \\imul ${d}, %rax, %rax
-        \\lea (%r9,%rax), %rax
-    , .{
-        @offsetOf(scheduler.IpcHotThread, "ipc_reply_token_target_thread"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_reply_token_valid"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_reply_token_target_thread"),
-        @offsetOf(scheduler.IpcHotThread, "ready"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_reply_token_valid"),
-        @offsetOf(scheduler.IpcHotThread, "ipc_reply_token_target_thread"),
-        @offsetOf(scheduler.IpcHotThread, "wait_mailbox"),
-        @offsetOf(scheduler.IpcHotThread, "wake_tick"),
-        @offsetOf(scheduler.IpcHotThread, "ready"),
-        @offsetOf(scheduler.IpcHotThread, "signal_pending"),
-        user_cr3_symbol,
-        @offsetOf(scheduler.IpcHotThread, "cr3"),
-        @offsetOf(scheduler.IpcHotThread, "wait_mailbox"),
-        @offsetOf(scheduler.IpcHotThread, "wake_tick"),
-        @offsetOf(scheduler.IpcHotThread, "ready"),
-        current_thread_symbol,
-        @offsetOf(scheduler.IpcHotThread, "owner_process"),
-        current_principal_symbol,
-        @offsetOf(scheduler.IpcHotThread, "cr3"),
-        user_cr3_symbol,
-        @sizeOf(scheduler.ThreadContext),
-        @sizeOf(scheduler.ThreadContext),
-    }) ++ std.fmt.comptimePrint(
-        \\
-        \\mov %r15, {d}(%r10)
-        \\mov %r14, {d}(%r10)
-        \\mov %r13, {d}(%r10)
-        \\mov %r12, {d}(%r10)
-        \\mov %rbp, {d}(%r10)
-        \\mov %rbx, {d}(%r10)
-        \\mov %rcx, {d}(%r10)
-        \\mov %rcx, {d}(%r10)
-        \\mov %r11, {d}(%r10)
-        \\mov {s}(%rip), %r9
-        \\mov %r9, {d}(%r10)
-        \\movq $0, {d}(%rax)
-        \\mov 0(%rsp), %r9
-        \\mov %r9, {d}(%rax)
-        \\mov 8(%rsp), %r9
-        \\mov %r9, {d}(%rax)
-        \\mov 16(%rsp), %r9
-        \\mov %r9, {d}(%rax)
-        \\mov 24(%rsp), %r9
-        \\mov %r9, {d}(%rax)
-        \\add $32, %rsp
-        \\incq ipc_lstar_asm_fastpath_hits(%rip)
-        \\push %rax
-    ++ asmCallAligned("schedulerSyncBootstrapCurrentStateFromMirrorFromAsm") ++
-        \\pop %rax
-        \\lea {d}(%rax), %rsp
-        \\jmp 273f
-        \\270:
-        \\incq ipc_lstar_asm_sparse_fallbacks(%rip)
-        \\mov 0(%rsp), %rdi
-        \\mov 8(%rsp), %r8
-        \\mov 16(%rsp), %r9
-        \\mov 24(%rsp), %r10
-        \\add $32, %rsp
-        \\sub $264, %rsp
-        \\mov %r15, 160(%rsp)
-        \\mov %r14, 168(%rsp)
-        \\mov %r13, 176(%rsp)
-        \\mov %r12, 184(%rsp)
-        \\mov %rbp, 192(%rsp)
-        \\mov %rbx, 200(%rsp)
-        \\mov %rcx, 208(%rsp)
-        \\mov %r11, 216(%rsp)
-        \\mov {s}(%rip), %r11
-        \\mov %r11, 224(%rsp)
-        \\mov %rdi, 232(%rsp)
-        \\mov %r8, 240(%rsp)
-        \\mov %r9, 248(%rsp)
-        \\mov %r10, 256(%rsp)
-        \\mov %rsp, %r15
-        \\mov %rsi, %rcx
-        \\lea 160(%r15), %rdx
-        \\mov %r15, %r8
-        \\and $-16, %rsp
-        \\sub $32, %rsp
-        \\call syscallIpcCallReplyRecvSignalOnlySparse
-        \\mov %rax, %rsp
-        \\273:
-    , .{
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "r15"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "r14"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "r13"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "r12"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rbp"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rbx"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rcx"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rip"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rflags"),
-        user_rsp_symbol,
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rsp"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rax"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rdi"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rsi"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "rdx"),
-        @offsetOf(scheduler.ThreadContext, "frame") + @offsetOf(TrapFrame, "r8"),
-        @offsetOf(scheduler.ThreadContext, "frame"),
-        user_rsp_symbol,
-    });
-}
-
-fn asmIpcCallReplyRecvSignalOnlySparseOnlyNoCr3(comptime user_rsp_symbol: []const u8, comptime entry_is_lstar_symbol: []const u8) []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\26:
-        \\movq $1, {s}(%rip)
-        \\test $2, %rdx
-        \\jz 29f
-        \\cmp $2, %rdx
-        \\jne 29f
-        \\incq ipc_lstar_asm_sparse_fallbacks(%rip)
-        \\sub $264, %rsp
-        \\mov %r15, 160(%rsp)
-        \\mov %r14, 168(%rsp)
-        \\mov %r13, 176(%rsp)
-        \\mov %r12, 184(%rsp)
-        \\mov %rbp, 192(%rsp)
-        \\mov %rbx, 200(%rsp)
-        \\mov %rcx, 208(%rsp)
-        \\mov %r11, 216(%rsp)
-        \\mov {s}(%rip), %r11
-        \\mov %r11, 224(%rsp)
-        \\mov %rdi, 232(%rsp)
-        \\mov %r8, 240(%rsp)
-        \\mov %r9, 248(%rsp)
-        \\mov %r10, 256(%rsp)
-        \\mov %rsp, %r15
-        \\mov %rsi, %rcx
-        \\lea 160(%r15), %rdx
-        \\mov %r15, %r8
-        \\and $-16, %rsp
-        \\sub $32, %rsp
-        \\call syscallIpcCallReplyRecvSignalOnlySparse
-        \\mov %rax, %rsp
-        \\jmp 274f
-        \\
-    , .{ entry_is_lstar_symbol, user_rsp_symbol });
-}
-
 fn asmStageUserReturnFromWorkFrame(comptime work_frame_symbol: []const u8, comptime iret_offset: usize) []const u8 {
     return std.fmt.comptimePrint(
         \\
@@ -681,61 +272,6 @@ fn asmExceptionWithErrorHandlerBody(comptime vec_number: u64) []const u8 {
         asmCallAligned("exceptionWithErrorCommon") ++
         \\ud2
     ;
-}
-
-fn asmSysretReturnFromWorkFrame(comptime work_frame_symbol: []const u8, comptime user_cr3_symbol: []const u8) []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\mov {s}+120(%rip), %rcx
-        \\mov %rcx, %r10
-        \\shl $16, %r10
-        \\sar $16, %r10
-        \\cmp %rcx, %r10
-        \\jne 8f
-        \\mov {s}+136(%rip), %r11
-        \\mov {s}(%rip), %r10
-        \\mov %r10, %cr3
-        \\mov {s}+0(%rip), %r15
-        \\mov {s}+8(%rip), %r14
-        \\mov {s}+16(%rip), %r13
-        \\mov {s}+24(%rip), %r12
-        \\mov {s}+56(%rip), %r8
-        \\mov {s}+64(%rip), %rbp
-        \\mov {s}+72(%rip), %rdi
-        \\mov {s}+80(%rip), %rsi
-        \\mov {s}+88(%rip), %rdx
-        \\mov {s}+104(%rip), %rbx
-        \\mov {s}+144(%rip), %rsp
-        \\mov {s}+112(%rip), %rax
-        \\mov {s}+48(%rip), %r9
-        \\mov {s}+40(%rip), %r10
-        \\sysretq
-        \\8:
-        \\
-    , .{
-        work_frame_symbol,
-        work_frame_symbol,
-        user_cr3_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-        work_frame_symbol,
-    });
-}
-
-fn asmSysretReturnFromStackFrame(comptime user_cr3_symbol: []const u8) []const u8 {
-    _ = user_cr3_symbol;
-    return "";
 }
 
 fn exceptionName(vec: u64) []const u8 {
@@ -885,33 +421,66 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
     );
 }
 
+pub export fn syscallEntryStub() callconv(.naked) noreturn {
+    asm volatile (
+        \\mov %r15, syscall_work_frame+0(%rip)
+        \\mov %r14, syscall_work_frame+8(%rip)
+        \\mov %r13, syscall_work_frame+16(%rip)
+        \\mov %r12, syscall_work_frame+24(%rip)
+        \\movq $0, syscall_work_frame+32(%rip)
+        \\mov %r10, syscall_work_frame+40(%rip)
+        \\mov %r9, syscall_work_frame+48(%rip)
+        \\mov %r8, syscall_work_frame+56(%rip)
+        \\mov %rbp, syscall_work_frame+64(%rip)
+        \\mov %rdi, syscall_work_frame+72(%rip)
+        \\mov %rsi, syscall_work_frame+80(%rip)
+        \\mov %rdx, syscall_work_frame+88(%rip)
+        \\movq $0, syscall_work_frame+96(%rip)
+        \\mov %rcx, syscall_work_frame+120(%rip)
+        \\mov %rbx, syscall_work_frame+104(%rip)
+        \\mov %rax, syscall_work_frame+112(%rip)
+        \\movq $0x1b, syscall_work_frame+128(%rip)
+        \\mov %r11, syscall_work_frame+136(%rip)
+        \\mov %rsp, syscall_work_frame+144(%rip)
+        \\movq $0x23, syscall_work_frame+152(%rip)
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\mov kernel_syscall_stack_top(%rip), %rsp
+    ++ asmCallAligned("saveCurrentThreadFxState") ++
+        \\lea syscall_work_frame(%rip), %rcx
+    ++ asmCallAligned("syscallDispatch") ++
+        \\mov %rax, syscall_work_frame+112(%rip)
+    ++ asmCallAligned("restoreCurrentThreadFxState") ++
+        \\lea syscall_work_frame(%rip), %rax
+    ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+        \\jmp userReturnToSavedFrame
+    );
+}
+
 pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.c) u64 {
     const h = getHooks();
     const cr2 = h.read_cr2();
-    const pf_cap = capability.issuePageFaultCapability(scheduler.currentUserPrincipal(), frame, cr2) orelse return 0;
+    const ec = frame.error_code;
+    const user_mode = (ec & (1 << 2)) != 0;
+    if (!user_mode or !user_vm.isUserCanonicalVa(cr2)) return 0;
     if (!h.kernel_state_ready.*) return 0;
-    if (!pf_cap.present_violation) {
-        if (h.state.nativeVmaFaultMapping(
-            pf_cap.principal,
-            pf_cap.fault_page_va,
-            pf_cap.write_access,
-            pf_cap.instruction_fetch,
-        )) |mapping| {
+    const present_violation = (ec & (1 << 0)) != 0;
+    if (!present_violation) {
+        const principal = scheduler.currentUserPrincipal();
+        const fault_page_va = cr2 & ~@as(u64, 4095);
+        const write_access = (ec & (1 << 1)) != 0;
+        const instruction_fetch = (ec & (1 << 4)) != 0;
+        if (h.state.nativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch)) |mapping| {
             var paddrs = [_]u64{mapping.paddr};
             if (user_vm.mapTrustedUserPaddrsWithProt(
-                pf_cap.principal,
-                pf_cap.fault_page_va,
+                principal,
+                fault_page_va,
                 paddrs[0..],
                 mapping.prot,
             )) return 1;
         }
     }
-    if (!abi_trap_runtime.dispatchPageFaultDelegate(h.state, pf_cap.principal, pf_cap.fault_va, frame.error_code, frame))
-    {
-        return 0;
-    }
-
-    return 1;
+    return 0;
 }
 
 pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFrame) callconv(.c) noreturn {
@@ -1010,9 +579,6 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!scheduler.schedulerRunsOnCurrentCpu()) {
-        if (user_mode and h.kernel_state_ready.* and abi_trap_runtime.dispatchPendingSignalDelegate(h.state, scheduler.currentUserPrincipal(), frame)) {
-            return;
-        }
         if (user_mode and !scheduler.currentApUserThreadCanContinue()) {
             smp.returnCurrentApToIdleFromInterrupt();
         }
@@ -1026,7 +592,6 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     if (!h.kernel_state_ready.*) return;
     scheduler.wakeThreadsForTimer(scheduler.lapic_tick_count);
     if (!user_mode) return;
-    if (abi_trap_runtime.dispatchPendingSignalDelegate(h.state, scheduler.currentUserPrincipal(), frame)) return;
     if (h.scheduler_quantum_ticks == 0) return;
 
     const next_thread = scheduler.chooseNextThreadForTimerPreempt(h.scheduler_quantum_ticks) orelse return;
@@ -1037,17 +602,18 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     const h = getHooks();
     const active_vector = lapic.activeInterruptVectorInRange(
-        device_events.generic_device_interrupt_vector,
-        device_events.msix_device_interrupt_vector_count + 1,
-    ) orelse device_events.generic_device_interrupt_vector;
+        generic_device_interrupt_vector,
+        device_interrupt_vector_count,
+    ) orelse generic_device_interrupt_vector;
     lapic.eoi();
     _ = frame;
     if (!scheduler.schedulerRunsOnCurrentCpu()) return;
     if (!h.kernel_state_ready.*) return;
-    if (device_events.msixEntryForInterruptVector(active_vector)) |entry| {
-        _ = device_events.wakeBoundDeviceWaiters(.msix, entry);
-    } else {
-        _ = device_events.wakeAllBoundDeviceWaiters();
+    var wake_owners: [16]kernel.PrincipalId = undefined;
+    const wake_count = h.state.recordDeviceInterruptEvent(active_vector, wake_owners[0..]);
+    var i: usize = 0;
+    while (i < wake_count) : (i += 1) {
+        scheduler.wakeWaitingThreadForPrincipal(wake_owners[i]);
     }
 }
 
@@ -1149,373 +715,6 @@ pub export fn doubleFaultHandlerStub() callconv(.naked) noreturn {
         \\and $-16, %rsp
         \\sub $8, %rsp
         \\jmp doubleFaultHandlerCommon
-    );
-}
-
-pub export fn syscallHandlerStub() callconv(.naked) noreturn {
-    if (debug_skip_syscall_fx_state) {
-        asm volatile (
-            \\push %r10
-            \\mov kernel_cr3_value(%rip), %r10
-            \\mov %r10, %cr3
-            \\pop %r10
-            \\push %rax
-            \\push %rbx
-            \\push %rcx
-            \\push %rdx
-            \\push %rsi
-            \\push %rdi
-            \\push %rbp
-            \\push %r8
-            \\push %r9
-            \\push %r10
-            \\push %r11
-            \\push %r12
-            \\push %r13
-            \\push %r14
-            \\push %r15
-        ++ asmCallAligned("markSyscallEntryInt80ForCurrentCpuFromAsm") ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
-            \\mov %rax, %rcx
-        ++ asmCallAligned("syscallDispatch") ++
-            \\push %rax
-        ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++
-            \\pop %r10
-        ++ asmWriteSyscallReturnToWorkFramePointer() ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
-            \\jmp userReturnToSavedFrame
-        );
-    } else {
-        asm volatile (
-            \\push %r10
-            \\mov kernel_cr3_value(%rip), %r10
-            \\mov %r10, %cr3
-            \\pop %r10
-            \\push %rax
-            \\push %rbx
-            \\push %rcx
-            \\push %rdx
-            \\push %rsi
-            \\push %rdi
-            \\push %rbp
-            \\push %r8
-            \\push %r9
-            \\push %r10
-            \\push %r11
-            \\push %r12
-            \\push %r13
-            \\push %r14
-            \\push %r15
-        ++ asmCallAligned("markSyscallEntryInt80ForCurrentCpuFromAsm") ++ asmCallAligned("saveCurrentThreadFxState") ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
-            \\mov %rax, %rcx
-        ++ asmCallAligned("syscallDispatch") ++
-            \\push %rax
-        ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++
-            \\pop %r10
-        ++ asmWriteSyscallReturnToWorkFramePointer() ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("syscallInterruptWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
-            \\jmp userReturnToSavedFrame
-        );
-    }
-}
-
-fn lstarUserRspSymbol(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint("syscall_entry_user_rsps+{d}", .{cpu_slot * @sizeOf(u64)});
-}
-
-fn lstarWorkFrameSymbol(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint("syscall_interrupt_work_frames+{d}", .{cpu_slot * @sizeOf(TrapFrame)});
-}
-
-fn lstarCurrentThreadSymbol(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint("current_thread_indices+{d}", .{cpu_slot * @sizeOf(usize)});
-}
-
-fn lstarCurrentPrincipalSymbol(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint("current_user_principals+{d}", .{cpu_slot * @sizeOf(kernel.PrincipalId)});
-}
-
-fn lstarUserCr3Symbol(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint("user_cr3_values+{d}", .{cpu_slot * @sizeOf(u64)});
-}
-
-fn lstarReturnWritebackSymbol(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint("syscall_return_writeback_enabled_by_cpu+{d}", .{cpu_slot * @sizeOf(u64)});
-}
-
-fn lstarEntryIsLstarSymbol(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint("syscall_entry_is_lstars+{d}", .{cpu_slot * @sizeOf(u64)});
-}
-
-fn asmLstarEntryPrefix(comptime cpu_slot: usize) []const u8 {
-    return std.fmt.comptimePrint(
-        \\
-        \\mov %rsp, syscall_entry_user_rsps+{d}(%rip)
-        \\mov %r15, syscall_entry_saved_r15s+{d}(%rip)
-        \\mov kernel_cr3_value(%rip), %r15
-        \\mov %r15, %cr3
-        \\mov kernel_syscall_stack_tops+{d}(%rip), %rsp
-        \\mov syscall_entry_saved_r15s+{d}(%rip), %r15
-        \\
-    , .{
-        cpu_slot * @sizeOf(u64),
-        cpu_slot * @sizeOf(u64),
-        cpu_slot * @sizeOf(u64),
-        cpu_slot * @sizeOf(u64),
-    });
-}
-
-fn asmLstarHandlerForCpu(comptime cpu_slot: usize, comptime user_cs: u64, comptime user_ss: u64) []const u8 {
-    const user_rsp_symbol = lstarUserRspSymbol(cpu_slot);
-    const work_frame_symbol = lstarWorkFrameSymbol(cpu_slot);
-    const current_thread_symbol = lstarCurrentThreadSymbol(cpu_slot);
-    const current_principal_symbol = lstarCurrentPrincipalSymbol(cpu_slot);
-    const user_cr3_symbol = lstarUserCr3Symbol(cpu_slot);
-    const writeback_symbol = lstarReturnWritebackSymbol(cpu_slot);
-    const entry_is_lstar_symbol = lstarEntryIsLstarSymbol(cpu_slot);
-    // LSTAR is also the Linux ABI syscall entry. Keep CapabilityOS IPC on the
-    // Zig slow path until the asm direct-switch invariants are proven safe.
-    // Route only the explicit 0x400 probe syscall into the sparse C path so
-    // the direct asm hot-mirror mutation remains disabled while its
-    // invariants are investigated.
-    const slowpath_gate =
-        \\cmp $0x400, %rax
-        \\jne 29f
-        \\cmpq $0, ipc_lstar_sparse_probe_enabled(%rip)
-        \\jne 26f
-        \\jmp 29f
-        \\
-    ;
-    if (debug_skip_syscall_fx_state) {
-        return asmLstarEntryPrefix(cpu_slot) ++ slowpath_gate ++ std.fmt.comptimePrint(
-            \\
-            \\cmp $0x2d, %rax
-            \\je 20f
-            \\cmp $0x2e, %rax
-            \\je 21f
-            \\cmp $0xffff, %rax
-            \\je 22f
-            \\cmp $0x17, %rax
-            \\je 28f
-            \\cmp $0x6, %rax
-            \\je 24f
-            \\cmp $0x2a, %rax
-            \\je 24f
-            \\cmp $0x2b, %rax
-            \\je 24f
-            \\cmp $0x2c, %rax
-            \\je 24f
-            \\cmp $0x40, %rax
-            \\je 27f
-            \\jmp 29f
-            \\20:
-            \\mov lapic_tick_count(%rip), %rax
-            \\jmp 23f
-            \\21:
-            \\movzbq {s}(%rip), %rax
-            \\cmp $32, %rax
-            \\jb 23f
-            \\mov $1, %rax
-            \\jmp 23f
-            \\22:
-            \\mov $1, %rax
-            \\23:
-            \\mov {s}(%rip), %r10
-            \\mov %r10, %cr3
-            \\mov {s}(%rip), %rsp
-            \\sysretq
-            \\24:
-        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlySparseOnlyNoCr3(user_rsp_symbol, entry_is_lstar_symbol) ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++
-            \\274:
-            \\
-        ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyFramePointerToWorkFrameOnKernelStack("%rsp", work_frame_symbol, cpu_slot, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
-            \\jmp userReturnToSavedFrame
-            \\
-        ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
-            std.fmt.comptimePrint(
-                \\jmp userReturnToSavedFrame
-                \\29:
-                \\push %r15
-                \\mov kernel_cr3_value(%rip), %r15
-                \\mov %r15, %cr3
-                \\pop %r15
-                \\movq $1, {s}(%rip)
-                \\pushq %[user_ss]
-                \\pushq {s}(%rip)
-                \\push %r11
-                \\pushq %[user_cs]
-                \\push %rcx
-                \\push %rax
-                \\push %rbx
-                \\push %r10
-                \\push %rdx
-                \\push %rsi
-                \\push %rdi
-                \\push %rbp
-                \\push %r8
-                \\push %r9
-                \\push %r10
-                \\push %r11
-                \\push %r12
-                \\push %r13
-                \\push %r14
-                \\push %r15
-                \\mov %rsp, %rcx
-            , .{ entry_is_lstar_symbol, user_rsp_symbol }) ++ asmCallSyscallDispatchFromStackFrame("syscallLstarDispatch") ++
-            std.fmt.comptimePrint(
-                \\cmpq $0, {s}(%rip)
-                \\je 7f
-                \\mov %rax, 112(%rsp)
-                \\7:
-                \\
-            , .{writeback_symbol}) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
-            \\jmp userReturnToSavedFrame
-            \\
-        ;
-    } else {
-        return asmLstarEntryPrefix(cpu_slot) ++ slowpath_gate ++ std.fmt.comptimePrint(
-            \\
-            \\jmp 29f
-            \\cmp $0x2d, %rax
-            \\je 20f
-            \\cmp $0x2e, %rax
-            \\je 21f
-            \\cmp $0xffff, %rax
-            \\je 22f
-            \\cmp $0x17, %rax
-            \\je 28f
-            \\cmp $0x6, %rax
-            \\je 24f
-            \\cmp $0x2a, %rax
-            \\je 24f
-            \\cmp $0x2b, %rax
-            \\je 24f
-            \\cmp $0x2c, %rax
-            \\je 24f
-            \\cmp $0x40, %rax
-            \\je 27f
-            \\jmp 29f
-            \\20:
-            \\mov lapic_tick_count(%rip), %rax
-            \\jmp 23f
-            \\21:
-            \\movzbq {s}(%rip), %rax
-            \\cmp $32, %rax
-            \\jb 23f
-            \\mov $1, %rax
-            \\jmp 23f
-            \\22:
-            \\mov $1, %rax
-            \\23:
-            \\mov {s}(%rip), %r10
-            \\mov %r10, %cr3
-            \\mov {s}(%rip), %rsp
-            \\sysretq
-            \\24:
-        , .{ current_principal_symbol, user_cr3_symbol, user_rsp_symbol }) ++ asmCallIpcFastDispatchNoCr3() ++ asmIpcCallReplyRecvSignalOnlySparseOnlyNoCr3(user_rsp_symbol, entry_is_lstar_symbol) ++ asmIpcCallReplyRecvSignalOnlyNoCr3(user_cs, user_ss, user_rsp_symbol, current_thread_symbol, current_principal_symbol, user_cr3_symbol) ++
-            \\274:
-            \\
-        ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyFramePointerToWorkFrameOnKernelStack("%rsp", work_frame_symbol, cpu_slot, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
-            \\jmp userReturnToSavedFrame
-            \\
-        ++ asmIpcFrameDispatchNoCr3(user_cs, user_ss, user_rsp_symbol, writeback_symbol) ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
-            std.fmt.comptimePrint(
-                \\jmp userReturnToSavedFrame
-                \\29:
-                \\push %r15
-                \\mov kernel_cr3_value(%rip), %r15
-                \\mov %r15, %cr3
-                \\pop %r15
-                \\movq $1, {s}(%rip)
-                \\pushq %[user_ss]
-                \\pushq {s}(%rip)
-                \\push %r11
-                \\pushq %[user_cs]
-                \\push %rcx
-                \\push %rax
-                \\push %rbx
-                \\push %r10
-                \\push %rdx
-                \\push %rsi
-                \\push %rdi
-                \\push %rbp
-                \\push %r8
-                \\push %r9
-                \\push %r10
-                \\push %r11
-                \\push %r12
-                \\push %r13
-                \\push %r14
-                \\push %r15
-            , .{ entry_is_lstar_symbol, user_rsp_symbol }) ++ asmCallAligned("saveCurrentThreadFxState") ++
-            \\mov %rsp, %rcx
-            \\
-        ++ asmCallSyscallDispatchFromStackFrame("syscallLstarDispatch") ++
-            std.fmt.comptimePrint(
-                \\cmpq $0, {s}(%rip)
-                \\je 7f
-                \\mov %rax, 112(%rsp)
-                \\7:
-                \\
-            , .{writeback_symbol}) ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmSysretReturnFromStackFrame(user_cr3_symbol) ++ asmCopyStackFrameToWorkFrame(work_frame_symbol, trap_frame_qword_count) ++ asmStageUserReturnFromWorkFrame(work_frame_symbol, trap_frame_iret_offset) ++
-            \\jmp userReturnToSavedFrame
-            \\
-        ;
-    }
-}
-
-pub fn syscallLstarEntryForCpu(cpu_slot: usize) usize {
-    return switch (cpu_slot) {
-        0 => @intFromPtr(&syscallLstarHandlerStub),
-        1 => @intFromPtr(&syscallLstarHandlerStubCpu1),
-        2 => @intFromPtr(&syscallLstarHandlerStubCpu2),
-        3 => @intFromPtr(&syscallLstarHandlerStubCpu3),
-        else => @intFromPtr(&syscallLstarHandlerStub),
-    };
-}
-
-pub fn syscallLstarEntries() [smp.max_cpus]usize {
-    var entries: [smp.max_cpus]usize = [_]usize{0} ** smp.max_cpus;
-    inline for (0..smp.max_cpus) |cpu_slot| {
-        entries[cpu_slot] = syscallLstarEntryForCpu(cpu_slot);
-    }
-    return entries;
-}
-
-pub export fn syscallLstarHandlerStub() callconv(.naked) noreturn {
-    const user_cs: u64 = @as(u64, x86_platform.gdt_user_code_selector) | 0x3;
-    const user_ss: u64 = @as(u64, x86_platform.gdt_user_data_selector) | 0x3;
-    asm volatile (asmLstarHandlerForCpu(0, user_cs, user_ss)
-        :
-        : [user_cs] "i" (user_cs),
-          [user_ss] "i" (user_ss),
-    );
-}
-
-pub export fn syscallLstarHandlerStubCpu1() callconv(.naked) noreturn {
-    const user_cs: u64 = @as(u64, x86_platform.gdt_user_code_selector) | 0x3;
-    const user_ss: u64 = @as(u64, x86_platform.gdt_user_data_selector) | 0x3;
-    asm volatile (asmLstarHandlerForCpu(1, user_cs, user_ss)
-        :
-        : [user_cs] "i" (user_cs),
-          [user_ss] "i" (user_ss),
-    );
-}
-
-pub export fn syscallLstarHandlerStubCpu2() callconv(.naked) noreturn {
-    const user_cs: u64 = @as(u64, x86_platform.gdt_user_code_selector) | 0x3;
-    const user_ss: u64 = @as(u64, x86_platform.gdt_user_data_selector) | 0x3;
-    asm volatile (asmLstarHandlerForCpu(2, user_cs, user_ss)
-        :
-        : [user_cs] "i" (user_cs),
-          [user_ss] "i" (user_ss),
-    );
-}
-
-pub export fn syscallLstarHandlerStubCpu3() callconv(.naked) noreturn {
-    const user_cs: u64 = @as(u64, x86_platform.gdt_user_code_selector) | 0x3;
-    const user_ss: u64 = @as(u64, x86_platform.gdt_user_data_selector) | 0x3;
-    asm volatile (asmLstarHandlerForCpu(3, user_cs, user_ss)
-        :
-        : [user_cs] "i" (user_cs),
-          [user_ss] "i" (user_ss),
     );
 }
 

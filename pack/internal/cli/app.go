@@ -59,8 +59,6 @@ func appRows(workspace *config.Workspace, app config.App) [][2]string {
 		{"kind", app.Kind()},
 		{"role", app.Role},
 		{"out", app.Out},
-		{"target", dash(app.Target)},
-		{"optimize", app.Optimize},
 		{"publishes", dash(strings.Join(app.PublishSummary(), ", "))},
 	}
 }

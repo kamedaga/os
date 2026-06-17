@@ -2,9 +2,6 @@
 /// kernelMain() is called from main.zig after switching to the ring-0 stack.
 const std = @import("std");
 const kernel = @import("../kernel.zig");
-const capability = @import("../capability.zig");
-const device_events = @import("../device_events.zig");
-const dma_translation = @import("../dma_translation.zig");
 const elf_loader = @import("../elf_loader.zig");
 const scheduler = @import("../scheduler.zig");
 const syscalls = @import("../syscalls.zig");
@@ -17,10 +14,10 @@ const kernel_log = @import("../kernel_log.zig");
 const page_fault_log = @import("../page_fault_log.zig");
 const user_copy = @import("../user_copy.zig");
 const pci = @import("../pci.zig");
-const virtio_probe = @import("../virtio_probe.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
 const pmm = @import("../memory/pmm.zig");
 const user_vm = @import("../memory/user_vm.zig");
+const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const boot_static = @import("main_static.zig");
 const boot_images = @import("boot_images.zig");
@@ -30,8 +27,6 @@ const uefi_services = @import("uefi_services.zig");
 const process_factory = @import("process_factory.zig");
 const elf_load = @import("elf_load.zig");
 const init_setup = @import("init_setup.zig");
-const process_builder = @import("../runtime/process_builder.zig");
-const abi_trap_runtime = @import("../runtime/abi_trap.zig");
 const halt = @import("../halt.zig");
 const log_util = @import("../log_util.zig");
 
@@ -53,6 +48,8 @@ pub var kernel_state_ready: bool = false;
 
 var boot_init_principal: ?kernel.PrincipalId = null;
 const spawn_parent_endpoint_id: u64 = 0x14;
+const generic_device_interrupt_vector: u8 = 0x41;
+const device_interrupt_vector_count: u8 = 1;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -77,8 +74,7 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(global_free_list), &global_free_list));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_global), &kernel_state_global));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_ready), &kernel_state_ready));
-    start = minStaticStart(start, device_events.kernelStaticStorageStartAddr());
-    start = minStaticStart(start, dma_translation.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, vtd.kernelStaticStorageStartAddr());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
@@ -91,18 +87,14 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_global), &kernel_state_global));
     end = maxStaticEnd(end, kernel.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_ready), &kernel_state_ready));
-    end = maxStaticEnd(end, capability.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, process_builder.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, abi_trap_runtime.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, scheduler.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, device_events.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, dma_translation.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, vtd.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
 }
@@ -130,25 +122,6 @@ fn principalLabel(principal: kernel.PrincipalId) []const u8 {
         }
     }
     return kernel.principalLabel(principal);
-}
-
-fn principalFromProcessSlot(raw: u64) ?kernel.PrincipalId {
-    const idx = std.math.cast(usize, raw) orelse return null;
-    return kernel.processPrincipalFromIndex(idx);
-}
-
-fn iommuAuditHook(
-    state: *const kernel.KernelState,
-    principal: kernel.PrincipalId,
-    paddr: u64,
-    mapped: bool,
-    reason: kernel.IommuSyncReason,
-) void {
-    _ = state;
-    _ = principal;
-    _ = paddr;
-    _ = mapped;
-    _ = reason;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +248,6 @@ pub export fn restoreKernelInterruptFxState() callconv(.c) void {
 
 fn installInterruptTrampolines() void {
     x86_platform.installInterruptTrampolines(.{
-        .syscall_stub = @intFromPtr(&traps.syscallHandlerStub),
         .divide_error_stub = @intFromPtr(&traps.divideErrorHandlerStub),
         .page_fault_stub = @intFromPtr(&traps.pageFaultHandlerStub),
         .general_protection_stub = @intFromPtr(&traps.generalProtectionHandlerStub),
@@ -287,8 +259,8 @@ fn installInterruptTrampolines() void {
         .timer_interrupt_stub = @intFromPtr(&traps.timerInterruptHandlerStub),
         .device_interrupt_stub = @intFromPtr(&traps.deviceInterruptHandlerStub),
         .lapic_timer_vector = boot_static.lapic_timer_vector,
-        .device_interrupt_vector = device_events.generic_device_interrupt_vector,
-        .device_interrupt_vector_count = device_events.msix_device_interrupt_vector_count + 1,
+        .device_interrupt_vector = generic_device_interrupt_vector,
+        .device_interrupt_vector_count = device_interrupt_vector_count,
     });
 }
 
@@ -328,7 +300,7 @@ fn initKernelRuntimeOrHalt() void {
         x86_platform.hardenKernelMappingsSupervisorOnly();
     }
     installInterruptTrampolines();
-    x86_platform.installSyscallEntry(traps.syscallLstarEntryForCpu(0));
+    x86_platform.enableSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     asm volatile ("cli");
     if (!lapic.initTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count)) {
         halt.haltWithMessage("LAPIC timer init failed");
@@ -347,8 +319,11 @@ fn initMemoryModules() void {
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
         .user_low_va = boot_static.user_low_va,
         .user_top_va = boot_static.user_top_va,
+        .dynamic_map_base_va = boot_static.dynamic_map_base_va,
+        .dynamic_map_end_va = boot_static.dynamic_map_end_va,
         .user_va = boot_static.user_va,
         .user_stack_page_va = boot_static.user_stack_page_va,
+        .canonical_user_limit_exclusive = boot_static.canonical_user_limit_exclusive,
         .page_entries = boot_static.page_entries,
         .page_addr_mask = boot_static.page_addr_mask,
         .page_present = boot_static.page_present,
@@ -497,11 +472,8 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
 
-    if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
-        _ = scheduler.releaseThreadSlot(thread_index);
-    }
+    _ = scheduler.releaseThreadsForPrincipal(principal);
 
-    kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
@@ -532,9 +504,10 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     }
     if (endpoint_targets_removed) {
         kernel_state_global.bumpEndpointGeneration();
-        scheduler.invalidateAllIpcFastpathState();
     }
 
+    kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .killed, fault_vector);
+    kernel_state_global.markProcessObjectsExited(principal, .killed, fault_vector);
     _ = kernel_state_global.markProcessFaulted(principal, fault_vector);
     if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
 }
@@ -543,11 +516,8 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
 
-    if (scheduler.threadSlotForPrincipal(principal)) |thread_index| {
-        _ = scheduler.releaseThreadSlot(thread_index);
-    }
+    _ = scheduler.releaseThreadsForPrincipal(principal);
 
-    kernel_state_global.releasePrincipalPageCaps(principal, &global_free_list);
     user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
@@ -578,7 +548,6 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     }
     if (endpoint_targets_removed) {
         kernel_state_global.bumpEndpointGeneration();
-        scheduler.invalidateAllIpcFastpathState();
     }
 
     _ = kernel_state_global.markProcessExited(principal);
@@ -604,7 +573,8 @@ fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8
 }
 
 fn exitCurrentProcess(principal: kernel.PrincipalId, exit_code: u8, out_frame: *TrapFrame) void {
-    _ = exit_code;
+    kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .exited, exit_code);
+    kernel_state_global.markProcessObjectsExited(principal, .exited, exit_code);
     teardownExitedProcess(principal);
     loadRunnableThreadOrIdle(out_frame);
 }
@@ -690,7 +660,6 @@ fn runBootServicesPhase() BootResources {
     uefi_services.exitBootServicesOrHalt();
     initKernelRuntimeOrHalt();
     scheduler.installCpuIdleObserver();
-    smp.configureLstarEntries(traps.syscallLstarEntries());
     smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
     smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
     scheduler.refreshCpuTopology();
@@ -708,25 +677,6 @@ fn runBootServicesPhase() BootResources {
 // ---------------------------------------------------------------------------
 
 fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelState {
-    capability.init(.{
-        .user_spaces = user_spaces,
-        .user_low_va = boot_static.user_low_va,
-        .user_top_va = boot_static.user_top_va,
-        .dynamic_map_base_va = boot_static.dynamic_map_base_va,
-        .dynamic_map_end_va = boot_static.dynamic_map_end_va,
-        .user_va = boot_static.user_va,
-        .physical_map_limit = boot_static.physical_map_limit_exclusive,
-        .page_entries = boot_static.page_entries,
-        .page_addr_mask = boot_static.page_addr_mask,
-        .page_present = boot_static.page_present,
-        .page_rw = boot_static.page_rw,
-        .page_user = boot_static.page_user,
-        .canonical_user_limit_exclusive = boot_static.canonical_user_limit_exclusive,
-        .serial_write = kernel_log.write,
-        .print_hex = log_util.printHex,
-        .principal_label = principalLabel,
-        .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
-    });
     user_copy.init(.{
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
         .phys_copy_window_va = boot_static.phys_copy_window_va,
@@ -755,15 +705,7 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
         halt.haltWithError("region init failed: ", err);
     };
     const state = &kernel_state_global;
-    if (boot_static.iommu_no_cap_driver_mode != .off) {
-        state.setIommuNoCapDriverMode(boot_static.iommu_no_cap_driver_mode);
-        state.iommu_audit_hook = iommuAuditHook;
-    } else {
-        state.setIommuNoCapDriverMode(.off);
-        state.iommu_audit_hook = null;
-    }
     state.debug_process_lifecycle_hook = null;
-    state.pte_sync_hook = null;
     state.zero_physical_page_hook = user_copy.zeroPhysicalPage;
 
     return state;
@@ -778,19 +720,7 @@ fn discoverDevices() DetectedDevices {
         .devices = [_]?init_setup.DetectedDeviceBootstrap{null} ** boot_abi.init_bootstrap_abi.max_device_descriptors,
     };
 
-    const probed = virtio_probe.probeModernDevices(noopLog);
     var descriptor_index: usize = 0;
-    for (probed) |entry| {
-        const info = entry orelse continue;
-        if (descriptor_index >= boot_abi.init_bootstrap_abi.max_device_descriptors) break;
-        const resource_id = resourceIdForModernDevice(info);
-        appendDetectedDevice(&result.devices, .{
-            .descriptor = descriptorFromModernDevice(info, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index), resource_id),
-            .dma_device = resource_id,
-        });
-        descriptor_index += 1;
-    }
-
     appendGenericPciFunctionDevices(&result, &descriptor_index);
 
     return result;
@@ -842,7 +772,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     }
     activateThreadOrHalt(init_thread);
 
-    state.pte_sync_hook = capability.syncPageTableRightsForPrincipalPaddr;
     kernel_state_ready = true;
 }
 
@@ -851,23 +780,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 // ---------------------------------------------------------------------------
 
 fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
-    process_builder.init(state, &global_free_list, user_spaces);
-    abi_trap_runtime.init(.{
-        .state = state,
-        .free_list = &global_free_list,
-        .user_spaces = user_spaces,
-        .write = kernel_log.write,
-        .print_hex = log_util.printHex,
-        .print_number = log_util.printNumberU64,
-        .principal_label = principalLabel,
-        .write_user_u64 = user_copy.writeUserU64,
-        .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
-        .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
-        .consume_pending_signal_for_principal = scheduler.consumePendingSignalForPrincipal,
-        .block_current_thread_for_event = scheduler.blockCurrentThreadForEvent,
-        .exit_current_process = exitCurrentProcess,
-    });
-
     syscalls.init(.{
         .state = state,
         .free_list = &global_free_list,
@@ -877,7 +789,6 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .print_hex = log_util.printHex,
         .print_number = log_util.printNumberU64,
         .principal_label = principalLabel,
-        .principal_from_process_slot = principalFromProcessSlot,
         .read_user_u64 = user_copy.readUserU64,
         .write_user_u64 = user_copy.writeUserU64,
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
@@ -923,7 +834,7 @@ pub fn kernelMain() void {
 
     const resources = runBootServicesPhase();
     const state = initKernelSubsystems(resources.memory_stats);
-    dma_translation.initHardware();
+    _ = vtd.init();
     var devices = discoverDevices();
     constructBootProcesses(state, resources, &devices);
     wireRuntimeSubsystems(state, resources.memory_stats);
@@ -933,58 +844,10 @@ pub fn kernelMain() void {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: no-op probe log
-// ---------------------------------------------------------------------------
-
-fn noopLog(_: []const u8) void {}
-
-// ---------------------------------------------------------------------------
-// Helper: generic virtio device export
+// Helper: generic PCI device export
 // ---------------------------------------------------------------------------
 
 const virtio_vendor_id: u16 = 0x1AF4;
-
-fn resourceIdForModernDevice(info: virtio_probe.ModernDeviceInfo) kernel.DmaDeviceId {
-    return pci.resourceIdFromLocation(info.location);
-}
-
-fn descriptorFromModernDevice(
-    info: virtio_probe.ModernDeviceInfo,
-    bootstrap_source_va: u64,
-    resource_id: kernel.DmaDeviceId,
-) boot_abi.init_bootstrap_abi.DeviceDescriptor {
-    const common = mmioPageWithOffset(info.common_cfg);
-    const notify = mmioPageWithOffset(info.notify_cfg);
-    const isr = mmioPageWithOffset(info.isr_cfg);
-    const device = mmioPageWithOffset(info.device_cfg);
-    return .{
-        .transport = @intFromEnum(boot_abi.init_bootstrap_abi.DeviceTransport.virtio_pci_modern),
-        .flags = 0,
-        .bootstrap_source_va = bootstrap_source_va,
-        .vendor_id = info.vendor_id,
-        .device_id = info.device_id,
-        .subsystem_id = info.subsystem_id,
-        .pci_bus = info.location.bus,
-        .pci_device = info.location.device,
-        .pci_function = info.location.function,
-        .resource_id = resource_id,
-        .queue_count = info.queue_count,
-        .common_page_paddr = common.page_paddr,
-        .notify_page_paddr = notify.page_paddr,
-        .isr_page_paddr = isr.page_paddr,
-        .device_page_paddr = device.page_paddr,
-        .common_page_offset = common.page_offset,
-        .notify_page_offset = notify.page_offset,
-        .isr_page_offset = isr.page_offset,
-        .device_page_offset = device.page_offset,
-        .notify_off_multiplier = info.notify_off_multiplier,
-        .init_iommu_token = 0,
-        .init_queue_grant_count = 0,
-        .init_queue_grants = [_]boot_abi.init_bootstrap_abi.DeviceQueueGrant{.{}} ** boot_abi.init_bootstrap_abi.max_device_queue_grants,
-        .init_command_token = 0,
-        .init_device_capsule_token = 0,
-    };
-}
 
 fn appendGenericPciFunctionDevices(result: *DetectedDevices, descriptor_index: *usize) void {
     var bus: u16 = 0;
@@ -1022,7 +885,7 @@ fn appendGenericPciFunctionDevices(result: *DetectedDevices, descriptor_index: *
 }
 
 fn shouldExposeGenericPciFunction(loc: pci.Location, vendor_id: u16) bool {
-    if (vendor_id == virtio_vendor_id) return false;
+    _ = vendor_id;
     if (pci.readClassCode(loc) == 0x06) return false;
     return true;
 }
@@ -1057,7 +920,7 @@ fn descriptorFromPciFunction(
         .init_queue_grant_count = 0,
         .init_queue_grants = [_]boot_abi.init_bootstrap_abi.DeviceQueueGrant{.{}} ** boot_abi.init_bootstrap_abi.max_device_queue_grants,
         .init_command_token = 0,
-        .init_device_capsule_token = 0,
+        .init_device_fd = 0,
     };
 }
 

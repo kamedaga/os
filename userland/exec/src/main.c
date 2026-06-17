@@ -82,7 +82,7 @@ enum {
     CAPSULE_RIGHT_RESET = 1ULL << 9,
     CAPSULE_RIGHT_POWER = 1ULL << 10,
     CAPSULE_RIGHT_HOTPLUG_OBSERVE = 1ULL << 11,
-    CAPSULE_RIGHT_CHILD =
+    DEVICE_FD_RIGHT_CHILD =
         CAPSULE_RIGHT_QUERY |
         CAPSULE_RIGHT_CONFIG_READ |
         CAPSULE_RIGHT_CONFIG_WRITE |
@@ -163,7 +163,7 @@ struct device_catalog_entry {
     u64 queue1_submit_token;
     u64 queue1_notify_token;
     u64 command_token;
-    u64 device_capsule_token;
+    u64 device_fd;
 };
 
 struct device_catalog_page {
@@ -441,8 +441,8 @@ static int is_process_builder_token(u64 token) {
         (token & PROCESS_BUILDER_PROCESS_MASK) != 0;
 }
 
-static int is_capsule_token(u64 token) {
-    return (token & CAPSULE_TOKEN_MAGIC_MASK) == CAPSULE_TOKEN_MAGIC_TAG;
+static int is_fd(u64 token) {
+    return token >= 16 && token < 256;
 }
 
 static int map_vm_object(u64 token, u64 target_va) {
@@ -2061,11 +2061,11 @@ static u64 create_child_device_catalog(
     if (count > DEVICE_CATALOG_MAX_ENTRIES) count = DEVICE_CATALOG_MAX_ENTRIES;
     for (u64 i = 0; i < count; i++) {
         const struct device_catalog_entry *entry = &source->entries[i];
-        if (entry->present == 0 || !is_capsule_token(entry->device_capsule_token)) continue;
+        if (entry->present == 0 || !is_fd(entry->device_fd)) continue;
         if (dest->entry_count >= DEVICE_CATALOG_MAX_ENTRIES) break;
 
-        const u64 child_capsule = syscall3(SYSCALL_CAPSULE_GRANT, entry->device_capsule_token, child_process_slot, CAPSULE_RIGHT_CHILD);
-        if (!is_capsule_token(child_capsule)) continue;
+        const u64 child_fd = syscall3(SYSCALL_CAPSULE_GRANT, entry->device_fd, child_process_slot, DEVICE_FD_RIGHT_CHILD);
+        if (!is_fd(child_fd)) continue;
 
         struct device_catalog_entry *child_entry = &dest->entries[dest->entry_count++];
         const u64 *src_words = (const u64 *)entry;
@@ -2073,7 +2073,7 @@ static u64 create_child_device_catalog(
         for (u64 word = 0; word < sizeof(struct device_catalog_entry) / sizeof(u64); word++) {
             dst_words[word] = src_words[word];
         }
-        child_entry->device_capsule_token = child_capsule;
+        child_entry->device_fd = child_fd;
     }
     if (dest->entry_count == 0) return 0;
 
@@ -2101,14 +2101,14 @@ static struct device_catalog_entry *select_device_catalog_entry(
         if (!parse_hex_env_value(cfg, resource_offset, resource_len, &resource_id)) return 0;
         for (u64 i = 0; i < page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
             struct device_catalog_entry *entry = &page->entries[i];
-            if (entry->present != 0 && entry->resource_id == resource_id && is_capsule_token(entry->device_capsule_token)) return entry;
+            if (entry->present != 0 && entry->resource_id == resource_id && is_fd(entry->device_fd)) return entry;
         }
         return 0;
     }
 
     for (u64 i = 0; i < page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
         struct device_catalog_entry *entry = &page->entries[i];
-        if (entry->present != 0 && is_capsule_token(entry->device_capsule_token)) return entry;
+        if (entry->present != 0 && is_fd(entry->device_fd)) return entry;
     }
     return 0;
 }
@@ -2154,7 +2154,7 @@ static int materialize_capsule_from_catalog(struct exec_bootstrap_config *cfg, u
     u64 kobox_index = 0;
     u64 kobox_offset = 0;
     u64 kobox_len = 0;
-    if (!find_env_value(cfg, "KOBOX_PACHAOS_DEVICE_CAPSULE=", &kobox_index, &kobox_offset, &kobox_len)) {
+    if (!find_env_value(cfg, "KOBOX_PACHAOS_DEVICE_FD=", &kobox_index, &kobox_offset, &kobox_len)) {
         user_log("Exec: capsule target env missing\n");
         return 0;
     }
@@ -2173,8 +2173,8 @@ static int materialize_capsule_from_catalog(struct exec_bootstrap_config *cfg, u
         return 0;
     }
 
-    if (!write_hex_env_value(cfg, kobox_offset, kobox_len, entry->device_capsule_token)) {
-        user_log("Exec: capsule env write failed\n");
+    if (!write_hex_env_value(cfg, kobox_offset, kobox_len, entry->device_fd)) {
+        user_log("Exec: device fd env write failed\n");
         return 0;
     }
     if (!write_hex_env_value(cfg, catalog_offset, catalog_len, child_catalog)) {
@@ -2192,28 +2192,28 @@ static int materialize_capsule_env(struct exec_bootstrap_config *cfg, u64 child_
     u64 source_index = 0;
     u64 source_offset = 0;
     u64 source_len = 0;
-    if (!find_env_value(cfg, "PACHA_EXEC_CAPSULE_SOURCE=", &source_index, &source_offset, &source_len)) return 1;
-    u64 source_token = 0;
-    if (!parse_hex_env_value(cfg, source_offset, source_len, &source_token) || !is_capsule_token(source_token)) {
-        user_log("Exec: capsule source env invalid\n");
+    if (!find_env_value(cfg, "PACHA_EXEC_DEVICE_FD_SOURCE=", &source_index, &source_offset, &source_len)) return 1;
+    u64 source_fd = 0;
+    if (!parse_hex_env_value(cfg, source_offset, source_len, &source_fd) || !is_fd(source_fd)) {
+        user_log("Exec: device fd source env invalid\n");
         return 0;
     }
 
     u64 kobox_index = 0;
     u64 kobox_offset = 0;
     u64 kobox_len = 0;
-    if (!find_env_value(cfg, "KOBOX_PACHAOS_DEVICE_CAPSULE=", &kobox_index, &kobox_offset, &kobox_len)) {
+    if (!find_env_value(cfg, "KOBOX_PACHAOS_DEVICE_FD=", &kobox_index, &kobox_offset, &kobox_len)) {
         user_log("Exec: capsule target env missing\n");
         return 0;
     }
 
-    const u64 granted = syscall3(SYSCALL_CAPSULE_GRANT, source_token, child_process_slot, CAPSULE_RIGHT_CHILD);
-    if (!is_capsule_token(granted)) {
-        user_log("Exec: capsule grant failed\n");
+    const u64 granted = syscall3(SYSCALL_CAPSULE_GRANT, source_fd, child_process_slot, DEVICE_FD_RIGHT_CHILD);
+    if (!is_fd(granted)) {
+        user_log("Exec: device fd transfer failed\n");
         return 0;
     }
     if (!write_hex_env_value(cfg, kobox_offset, kobox_len, granted)) {
-        user_log("Exec: capsule env write failed\n");
+        user_log("Exec: device fd env write failed\n");
         return 0;
     }
     (void)source_index;

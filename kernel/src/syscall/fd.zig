@@ -1,5 +1,4 @@
 const abi_root = @import("kernel_abi_root");
-const capability = @import("../capability.zig");
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
 const user_vm = @import("../memory/user_vm.zig");
@@ -44,43 +43,6 @@ fn pageAlignUp(value: u64) ?u64 {
     return (value + 4095) & ~@as(u64, 4095);
 }
 
-fn createVmoFromCurrentPages(
-    h: anytype,
-    state: *kernel.KernelState,
-    proc: kernel.PrincipalId,
-    source_va: u64,
-    size_bytes: u64,
-    rights_bits: u64,
-    flags_bits: u64,
-) u64 {
-    if (size_bytes == 0) return sc.syscall_err_invalid;
-    const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
-    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
-    const rights = kernel.fdRightsFromBits(rights_bits);
-    const flags = kernel.fdFlagsFromBits(@truncate(flags_bits));
-    const fd = state.createAnonymousVmoFdWithPages(proc, aligned_size, rights, flags, first_dynamic_fd, h.free_list) catch return sc.syscall_err_alloc;
-    const vmo_ref = state.nativeVmoRefForFd(proc, fd) orelse {
-        state.closeFdWithFreeList(proc, fd, h.free_list) catch {};
-        return sc.syscall_err_invalid;
-    };
-
-    var copied: u64 = 0;
-    while (copied < size_bytes) {
-        const page_index: usize = @intCast(copied / 4096);
-        const page_off: usize = @intCast(copied & 0xFFF);
-        const paddr = state.nativeVmoPagePaddr(vmo_ref, page_index) orelse return sc.syscall_err_invalid;
-        const chunk_len_u64 = @min(size_bytes - copied, 4096 - @as(u64, @intCast(page_off)));
-        const chunk_len: usize = @intCast(chunk_len_u64);
-        const dst: [*]u8 = @ptrFromInt(paddr + page_off);
-        if (!h.copy_user_bytes_from_va(proc, source_va + copied, dst[0..chunk_len])) {
-            state.closeFdWithFreeList(proc, fd, h.free_list) catch {};
-            return sc.syscall_err_invalid;
-        }
-        copied += chunk_len_u64;
-    }
-    return fd;
-}
-
 fn mapVmoFd(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
@@ -103,7 +65,7 @@ fn mapVmoFd(
     const base_va = if (requested_va != 0)
         requested_va
     else
-        capability.findFreeUserMappingRange(proc, aligned_size / 4096, 1) orelse return sc.syscall_err_map;
+        user_vm.findFreeUserMappingRange(proc, aligned_size / 4096, 1) orelse return sc.syscall_err_map;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
 
     const vmo_ref = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
@@ -156,14 +118,13 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             @intCast(frame.rdi),
             @intCast(frame.rsi),
             kernel.fdRightsFromBits(frame.rdx),
-            kernel.fdFlagsFromBits(@truncate(frame.rcx)),
+            kernel.fdFlagsFromBits(@truncate(frame.r10)),
         ) catch sc.syscall_err_invalid,
         sc.syscall_fd_get_info => writeFdInfo(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_fd_set_flags => blk: {
             state.setFdFlags(proc, @intCast(frame.rdi), kernel.fdFlagsFromBits(@truncate(frame.rsi)), kernel.fdFlagsFromBits(@truncate(frame.rdx))) catch break :blk sc.syscall_err_invalid;
             break :blk sc.syscall_ok;
         },
-        sc.syscall_fd_replace, sc.syscall_fd_wait, sc.syscall_fd_poll => sc.syscall_err_invalid,
         sc.syscall_vmo_create => state.createAnonymousVmoFdWithPages(
             proc,
             frame.rdi,
@@ -172,8 +133,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             first_dynamic_fd,
             h.free_list,
         ) catch sc.syscall_err_alloc,
-        sc.syscall_vmo_from_current_pages => createVmoFromCurrentPages(h, state, proc, frame.rdi, frame.rsi, frame.rdx, frame.rcx),
-        sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.rcx, frame.r8, frame.r9),
+        sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
             const size = pageAlignUp(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const vma = state.vmaEntryConst(proc, frame.rdi) orelse break :blk sc.syscall_err_invalid;

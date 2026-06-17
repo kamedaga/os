@@ -2,86 +2,11 @@ const abi_root = @import("kernel_abi_root");
 const capsule_abi = abi_root.capsule_abi;
 const fd_abi = abi_root.fd_abi;
 const ipc_abi = abi_root.ipc_abi;
-const process_builder_abi = abi_root.process_builder_abi;
-const queue_abi = abi_root.queue_abi;
-
-const sc = @import("numbers.zig");
+const process_abi = abi_root.process_abi;
 
 pub fn needsKernelStateLock(nr: u64) bool {
-    if (capsule_abi.isCapsuleSyscall(nr)) return true;
-    if (fd_abi.isFdSyscall(nr)) return true;
-    if (ipc_abi.isIpcSyscall(nr)) return true;
-    return switch (nr) {
-        sc.syscall_alloc_page,
-        sc.syscall_map_page,
-        sc.syscall_map_mmio,
-        sc.syscall_alloc_map_pages,
-        sc.syscall_map_page_anywhere,
-        sc.syscall_alloc_map_pages_anywhere,
-        sc.syscall_map_pages_batch,
-        sc.syscall_queue_submit,
-        sc.syscall_queue_notify,
-        sc.syscall_iommu_authorize,
-        sc.syscall_command_authorize,
-        sc.syscall_dma_map_create,
-        sc.syscall_dma_map_set_state,
-        sc.syscall_dma_map_release,
-        sc.syscall_revoke_device_cap,
-        sc.syscall_derive_command_cap,
-        sc.syscall_move_cap,
-        sc.syscall_revoke_tree,
-        sc.syscall_drop_present,
-        sc.syscall_grant_cap,
-        sc.syscall_grant_caps_batch,
-        sc.syscall_grant_cap_on_endpoint,
-        sc.syscall_grant_caps_batch_on_endpoint,
-        sc.syscall_install_caps_batch,
-        sc.syscall_install_endpoint,
-        sc.syscall_install_mmio_cap,
-        sc.syscall_publish_service_endpoint,
-        sc.syscall_create_ipc_buffer_from_page,
-        sc.syscall_grant_ipc_buffer_on_endpoint,
-        sc.syscall_share_ipc_buffer_on_endpoint,
-        sc.syscall_accept_ipc_buffer_transfer,
-        sc.syscall_map_ipc_buffer_anywhere,
-        sc.syscall_get_process_status,
-        sc.syscall_map_abi_trap_reply_target_pages,
-        sc.syscall_copy_from_abi_trap_reply_target,
-        sc.syscall_copy_to_abi_trap_reply_target,
-        sc.syscall_set_abi_trap_reply_target_fs_base,
-        sc.syscall_set_abi_trap_reply_target_gs_base,
-        sc.syscall_protect_abi_trap_reply_target_pages,
-        sc.syscall_unmap_abi_trap_reply_target_pages,
-        sc.syscall_map_abi_trap_reply_target_vm_object,
-        sc.syscall_reply_abi_trap_target,
-        sc.syscall_detach_abi_trap_reply_token,
-        sc.syscall_copy_to_abi_trap_target,
-        sc.syscall_copy_from_abi_trap_target,
-        sc.syscall_set_abi_trap_target_request_page,
-        sc.syscall_reply_abi_trap_target_context,
-        sc.syscall_share_abi_trap_reply_target_pages_to_target,
-        sc.syscall_protect_abi_trap_target_pages,
-        sc.syscall_unmap_abi_trap_target_pages,
-        process_builder_abi.syscall_create_suspended_process,
-        process_builder_abi.syscall_map_vm_object_to_process,
-        process_builder_abi.syscall_map_vm_object_range_to_process,
-        process_builder_abi.syscall_alloc_map_pages_to_process,
-        process_builder_abi.syscall_set_process_initial_context,
-        process_builder_abi.syscall_start_process,
-        process_builder_abi.syscall_abort_process,
-        process_builder_abi.syscall_copy_to_process,
-        process_builder_abi.syscall_copy_from_process_to_process,
-        process_builder_abi.syscall_share_process_pages_to_process,
-        process_builder_abi.syscall_mprotect_self,
-        process_builder_abi.syscall_set_process_bootstrap_owner,
-        process_builder_abi.syscall_set_process_abi_trap_delegate,
-        sc.syscall_create_vm_object_from_current_pages,
-        sc.syscall_grant_vm_object,
-        sc.syscall_release_vm_object,
-        sc.syscall_drop_vm_object,
-        sc.syscall_map_vm_object,
-        queue_abi.syscall_grant_cap,
-        => true,
-        else => false,
-    };
+    return process_abi.isProcessSyscall(nr) or
+        capsule_abi.isCapsuleSyscall(nr) or
+        fd_abi.isFdSyscall(nr) or
+        ipc_abi.isIpcSyscall(nr);
 }

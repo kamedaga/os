@@ -1,9 +1,8 @@
-const abi_root = @import("kernel_abi_root");
 const kernel = @import("../kernel.zig");
 const address_space = @import("../memory/address_space.zig");
 const pmm = @import("../memory/pmm.zig");
 const scheduler = @import("../scheduler.zig");
-const user_programs = @import("../user_programs.zig");
+const syscall_numbers = @import("../syscall/numbers.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const boot_layout = @import("boot_layout.zig");
 
@@ -26,7 +25,6 @@ pub const boot_log_user_va = boot_layout.boot_log_user_va;
 pub const framebuffer_window_bytes = boot_layout.framebuffer_window_bytes;
 pub const phys_copy_window_va = boot_layout.phys_copy_window_va;
 
-pub const iommu_no_cap_driver_mode: kernel.IommuNoCapDriverMode = .shadow;
 pub const user_entry_rflags: u64 = 0x202;
 pub const reserved_low_mem_end: u64 = 64 * 1024 * 1024;
 pub const canonical_user_limit_exclusive: u64 = 0x0000_8000_0000_0000;
@@ -64,61 +62,11 @@ pub const user_process_count: usize = kernel.process_count;
 pub const user_thread_count: usize = scheduler.max_thread_slots;
 pub const UserAddressSpace = address_space.UserAddressSpace;
 
-pub const syscall_alloc_page: u64 = 0x1;
-pub const syscall_map_page: u64 = 0x2;
-pub const syscall_move_cap: u64 = 0x3;
-pub const syscall_drop_present: u64 = 0x4;
-pub const syscall_switch_thread: u64 = 0x5;
-pub const syscall_send_cap: u64 = 0x6;
-pub const syscall_revoke_tree: u64 = 0x7;
-pub const syscall_grant_cap: u64 = 0x8;
-pub const syscall_log: u64 = 0x9;
-pub const syscall_recv_cap: u64 = 0xA;
-pub const syscall_map_mmio: u64 = 0xB;
-pub const syscall_alloc_map_pages: u64 = 0xC;
-pub const syscall_map_page_anywhere: u64 = 0x5C;
-pub const syscall_alloc_map_pages_anywhere: u64 = 0x5D;
-pub const syscall_create_ipc_buffer_from_page: u64 = abi_root.ipc_buffer_abi.syscall_create_ipc_buffer_from_page;
-pub const syscall_grant_ipc_buffer_on_endpoint: u64 = abi_root.ipc_buffer_abi.syscall_grant_ipc_buffer_on_endpoint;
-pub const syscall_share_ipc_buffer_on_endpoint: u64 = abi_root.ipc_buffer_abi.syscall_share_ipc_buffer_on_endpoint;
-pub const syscall_accept_ipc_buffer_transfer: u64 = abi_root.ipc_buffer_abi.syscall_accept_ipc_buffer_transfer;
-pub const syscall_map_ipc_buffer_anywhere: u64 = abi_root.ipc_buffer_abi.syscall_map_ipc_buffer_anywhere;
-pub const syscall_queue_submit: u64 = 0xE;
-pub const syscall_queue_notify: u64 = 0xF;
-pub const syscall_grant_caps_batch: u64 = 0x14;
-pub const syscall_map_pages_batch: u64 = 0x15;
-pub const syscall_wait_event: u64 = 0x17;
-pub const syscall_install_caps_batch: u64 = 0x32;
-pub const syscall_batch_max_pages: usize = 256;
-
-pub const user_program_cfg: user_programs.Config = .{
-    .syscall_alloc_page = syscall_alloc_page,
-    .syscall_map_page = syscall_map_page,
-    .syscall_move_cap = syscall_move_cap,
-    .syscall_drop_present = syscall_drop_present,
-    .syscall_switch_thread = syscall_switch_thread,
-    .syscall_send_cap = syscall_send_cap,
-    .syscall_revoke_tree = syscall_revoke_tree,
-    .syscall_grant_cap = syscall_grant_cap,
-    .syscall_log = syscall_log,
-    .user_unmapped_test_va = user_unmapped_test_va,
-    .user_dma_verify_va = user_dma_verify_va,
-    .user_recovery_stop_va = user_recovery_stop_va,
-};
-
-pub const syscall_ok: u64 = 0;
-pub const syscall_err_invalid = 1;
-pub const syscall_err_not_ready = 2;
-pub const syscall_err_alloc = 4;
-pub const syscall_err_map = 5;
-pub const syscall_err_move = 6;
-pub const syscall_err_drop_present = 7;
-pub const syscall_err_send = 8;
-pub const syscall_err_endpoint = 9;
-pub const syscall_err_revoke = 10;
-pub const syscall_err_grant = 11;
-pub const syscall_err_log = 12;
-pub const syscall_err_empty = 13;
-pub const syscall_alloc_map_drop_cap_flag: u64 = 0x2;
+pub const syscall_ok: u64 = syscall_numbers.syscall_ok;
+pub const syscall_err_invalid = syscall_numbers.syscall_err_invalid;
+pub const syscall_err_not_ready = syscall_numbers.syscall_err_not_ready;
+pub const syscall_err_alloc = syscall_numbers.syscall_err_alloc;
+pub const syscall_err_map = syscall_numbers.syscall_err_map;
+pub const syscall_err_empty = syscall_numbers.syscall_err_empty;
 
 pub const MemoryStats = pmm.MemoryStats;

@@ -1,9 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-pub const capability = @import("capability.zig");
 pub const capsule = @import("capsule.zig");
-const dma_mapping_manager = @import("dma_mapping_manager.zig");
-pub const device_capabilities = @import("device_capabilities.zig");
+const vtd = @import("vtd.zig");
 pub const initial_process_count: usize = 8;
 pub const initial_process_capacity: usize = 32;
 pub const process_count: usize = initial_process_capacity;
@@ -35,7 +33,6 @@ fn PrincipalIdType() type {
 
 pub const PrincipalId = PrincipalIdType();
 const default_process_principal: PrincipalId = processPrincipalFromIndex(0) orelse unreachable;
-pub export var endpoint_generation_fast_mirror: u64 = 0;
 
 const process_labels = blk: {
     var labels: [process_count][]const u8 = undefined;
@@ -113,39 +110,6 @@ pub const PendingCapTransfer = struct {
     retain_sender: bool = false,
 };
 
-pub const IpcBufferRights = packed struct(u32) {
-    read: bool = false,
-    write: bool = false,
-    map: bool = false,
-    grant: bool = false,
-    _reserved: u28 = 0,
-};
-
-pub const IpcBufferRole = enum(u8) {
-    generic = 0,
-    request = 1,
-    response = 2,
-    bulk = 3,
-};
-
-pub const IpcBufferCapability = struct {
-    paddr: u64,
-    rights: IpcBufferRights,
-    role: IpcBufferRole,
-    cap_id: u64,
-    root_cap_id: u64,
-    parent_cap_id: u64,
-};
-
-pub const PendingIpcBufferTransfer = struct {
-    transfer_id: u64,
-    sender: PrincipalId,
-    endpoint_id: u64,
-    cap_id: u64,
-    rights: IpcBufferRights,
-    retain_sender: bool = true,
-};
-
 pub const Region = struct {
     id: u64,
 };
@@ -155,19 +119,8 @@ pub const ProcessDescriptor = struct {
     principal: PrincipalId = @enumFromInt(0),
     label: []const u8 = "",
     bootstrap_owner: bool = false,
-    process_builder_owner: ?PrincipalId = null,
-    process_builder_suspended: bool = false,
-    abi_trap_delegate_endpoint_id: u64 = 0,
-    abi_trap_delegate_flavor: u32 = 0,
-    abi_trap_request_page_va: u64 = 0,
     faulted: bool = false,
     fault_vector: u8 = 0,
-};
-
-pub const AbiTrapDelegate = struct {
-    endpoint_id: u64,
-    flavor: u32,
-    request_page_va: u64,
 };
 
 pub const ProcessStatus = struct {
@@ -198,8 +151,10 @@ pub const KernelError = error{
     TooManyFreePages,
     TooManyFreeRanges,
     OutOfFreePages,
-    CapsuleRevoked,
 };
+
+pub const DmaDeviceId = u64;
+pub const invalid_dma_device_id: DmaDeviceId = 0;
 
 pub const Fd = u32;
 pub const fd_table_entries: usize = 256;
@@ -286,14 +241,80 @@ pub fn isFdRightsSubset(child: FdRights, parent: FdRights) bool {
 pub const KernelObjectKind = enum(u16) {
     none = 0,
     process = 1,
-    endpoint_compat = 2,
-    vmo_compat = 3,
-    capsule_compat = 4,
-    event = 5,
-    vmo = 6,
-    endpoint = 7,
-    channel = 8,
-    reply = 9,
+    thread = 2,
+    event = 3,
+    vmo = 4,
+    endpoint = 5,
+    channel = 6,
+    reply = 7,
+    device = 8,
+    mmio_region = 9,
+    dma_buffer = 10,
+    dma_mapping = 11,
+    irq = 12,
+};
+
+pub const TaskObjectState = enum(u8) {
+    active = 1,
+    exited = 2,
+    killed = 3,
+};
+
+pub const ProcessObject = struct {
+    principal_raw: PrincipalRaw = 0,
+    state: TaskObjectState = .active,
+    exit_code: u32 = 0,
+};
+
+pub const ThreadObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
+    state: TaskObjectState = .active,
+    exit_code: u32 = 0,
+};
+
+pub const DeviceObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+    device: DmaDeviceId = 0,
+};
+
+pub const MmioRegionObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+    device: DmaDeviceId = 0,
+    bar_index: u32 = 0,
+    paddr: u64 = 0,
+    user_va: u64 = 0,
+    size: u64 = 0,
+    flags: u32 = 0,
+};
+
+pub const DmaBufferObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+    device: DmaDeviceId = 0,
+    user_va: u64 = 0,
+    iova: u64 = 0,
+    size: u64 = 0,
+    flags: u32 = 0,
+};
+
+pub const DmaMappingObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+    device: DmaDeviceId = 0,
+    user_va: u64 = 0,
+    iova: u64 = 0,
+    size: u64 = 0,
+    direction: CapsuleDmaDirection = .bidirectional,
+    flags: u32 = 0,
+};
+
+pub const IrqObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+    device: DmaDeviceId = 0,
+    kind: CapsuleIrqKind = .auto,
+    vector: u32 = 0,
+    event_count: u64 = 0,
+    flags: u32 = 0,
 };
 
 pub const KernelObjectRef = struct {
@@ -308,15 +329,18 @@ pub const KernelObjectRef = struct {
 
 pub const KernelObjectPayload = union(KernelObjectKind) {
     none: void,
-    process: PrincipalId,
-    endpoint_compat: u64,
-    vmo_compat: u64,
-    capsule_compat: u64,
+    process: ProcessObject,
+    thread: ThreadObject,
     event: u64,
     vmo: NativeVmoRef,
     endpoint: IpcEndpointRef,
     channel: IpcChannelHandle,
     reply: IpcReplyRef,
+    device: DeviceObject,
+    mmio_region: MmioRegionObject,
+    dma_buffer: DmaBufferObject,
+    dma_mapping: DmaMappingObject,
+    irq: IrqObject,
 };
 
 pub const KernelObjectSlot = struct {
@@ -1224,166 +1248,6 @@ fn freeCapMailboxChunks(head: u16) void {
     }
 }
 
-pub const IpcBufferCNode = struct {
-    pub const max_caps = 512;
-
-    caps: [max_caps]IpcBufferCapability = undefined,
-    len: usize = 0,
-
-    pub fn add(self: *IpcBufferCNode, cap: IpcBufferCapability) KernelError!void {
-        if (self.findByCapId(cap.cap_id) != null) return KernelError.InvalidState;
-        if (self.len >= self.caps.len) return KernelError.TableFull;
-        self.caps[self.len] = cap;
-        self.len += 1;
-    }
-
-    pub fn findByCapId(self: *const IpcBufferCNode, cap_id: u64) ?*const IpcBufferCapability {
-        if (self.findIndexByCapId(cap_id)) |index| return &self.caps[index];
-        return null;
-    }
-
-    pub fn removeByCapId(self: *IpcBufferCNode, cap_id: u64) bool {
-        if (self.findIndexByCapId(cap_id)) |index| {
-            var i = index;
-            while (i + 1 < self.len) : (i += 1) self.caps[i] = self.caps[i + 1];
-            self.len -= 1;
-            return true;
-        }
-        return false;
-    }
-
-    fn findIndexByCapId(self: *const IpcBufferCNode, cap_id: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            if (self.caps[i].cap_id == cap_id) return i;
-        }
-        return null;
-    }
-};
-
-pub const IpcBufferMailbox = struct {
-    const inline_items = 8;
-    const chunk_items = 16;
-    const chunk_pool_count = 512;
-    const invalid_chunk: u16 = std.math.maxInt(u16);
-
-    items: [inline_items]PendingIpcBufferTransfer = undefined,
-    overflow_head: u16 = invalid_chunk,
-    len: usize = 0,
-
-    pub fn push(self: *IpcBufferMailbox, transfer: PendingIpcBufferTransfer) KernelError!void {
-        const slot = try self.slotAtOrAllocate(self.len);
-        slot.* = transfer;
-        self.len += 1;
-    }
-
-    pub fn pop(self: *IpcBufferMailbox) ?PendingIpcBufferTransfer {
-        if (self.len == 0) return null;
-        const transfer = (self.slotAtConst(0) orelse return null).*;
-        var i: usize = 1;
-        while (i < self.len) : (i += 1) {
-            const item = (self.slotAtConst(i) orelse return null).*;
-            (self.slotAt(i - 1) orelse return null).* = item;
-        }
-        self.len -= 1;
-        if (self.slotAt(self.len)) |slot| slot.* = undefined;
-        self.trimUnusedChunks();
-        return transfer;
-    }
-
-    pub fn reset(self: *IpcBufferMailbox) void {
-        freeIpcBufferMailboxChunks(self.overflow_head);
-        self.* = .{};
-    }
-
-    fn slotAt(self: *IpcBufferMailbox, index: usize) ?*PendingIpcBufferTransfer {
-        if (index < inline_items) return &self.items[index];
-        var remaining = index - inline_items;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_items) return &ipc_buffer_mailbox_chunk_pool[chunk_index].items[remaining];
-            remaining -= chunk_items;
-            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAtConst(self: *const IpcBufferMailbox, index: usize) ?*const PendingIpcBufferTransfer {
-        if (index < inline_items) return &self.items[index];
-        var remaining = index - inline_items;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_items) return &ipc_buffer_mailbox_chunk_pool[chunk_index].items[remaining];
-            remaining -= chunk_items;
-            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAtOrAllocate(self: *IpcBufferMailbox, index: usize) KernelError!*PendingIpcBufferTransfer {
-        if (index < inline_items) return &self.items[index];
-        const needed_chunk_offset = (index - inline_items) / chunk_items;
-        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
-        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocIpcBufferMailboxChunk();
-
-        var chunk_index = self.overflow_head;
-        var offset: usize = 0;
-        while (offset < needed_chunk_offset) : (offset += 1) {
-            if (ipc_buffer_mailbox_chunk_pool[chunk_index].next == invalid_chunk) {
-                ipc_buffer_mailbox_chunk_pool[chunk_index].next = try allocIpcBufferMailboxChunk();
-            }
-            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
-        }
-        return &ipc_buffer_mailbox_chunk_pool[chunk_index].items[(index - inline_items) % chunk_items];
-    }
-
-    fn trimUnusedChunks(self: *IpcBufferMailbox) void {
-        if (self.overflow_head == invalid_chunk) return;
-        if (self.len <= inline_items) {
-            freeIpcBufferMailboxChunks(self.overflow_head);
-            self.overflow_head = invalid_chunk;
-            return;
-        }
-        const needed_chunks = (self.len - inline_items + chunk_items - 1) / chunk_items;
-        var chunk_index = self.overflow_head;
-        var kept: usize = 1;
-        while (kept < needed_chunks and chunk_index != invalid_chunk) : (kept += 1) {
-            chunk_index = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
-        }
-        if (chunk_index == invalid_chunk) return;
-        const free_head = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
-        ipc_buffer_mailbox_chunk_pool[chunk_index].next = invalid_chunk;
-        freeIpcBufferMailboxChunks(free_head);
-    }
-};
-
-const IpcBufferMailboxChunk = struct {
-    used: bool = false,
-    next: u16 = IpcBufferMailbox.invalid_chunk,
-    items: [IpcBufferMailbox.chunk_items]PendingIpcBufferTransfer = undefined,
-};
-
-var ipc_buffer_mailbox_chunk_pool: [IpcBufferMailbox.chunk_pool_count]IpcBufferMailboxChunk = [_]IpcBufferMailboxChunk{.{}} ** IpcBufferMailbox.chunk_pool_count;
-
-fn allocIpcBufferMailboxChunk() KernelError!u16 {
-    var i: usize = 0;
-    while (i < ipc_buffer_mailbox_chunk_pool.len) : (i += 1) {
-        if (ipc_buffer_mailbox_chunk_pool[i].used) continue;
-        ipc_buffer_mailbox_chunk_pool[i] = .{ .used = true };
-        return @intCast(i);
-    }
-    return KernelError.TableFull;
-}
-
-fn freeIpcBufferMailboxChunks(head: u16) void {
-    var chunk_index = head;
-    while (chunk_index != IpcBufferMailbox.invalid_chunk) {
-        const next = ipc_buffer_mailbox_chunk_pool[chunk_index].next;
-        ipc_buffer_mailbox_chunk_pool[chunk_index] = .{};
-        chunk_index = next;
-    }
-}
-
 pub const max_vmo_backing_pages: usize = 65535;
 pub const max_vmo_backing_store_pages: usize = 262144;
 pub const max_vmo_backing_store_free_ranges: usize = 1024;
@@ -1875,53 +1739,11 @@ pub const PageCapability = struct {
     paddr: u64,
 };
 
-const DmaRestoreEntry = struct {
-    valid: bool = false,
-    paddr: u64 = 0,
-    owner: PrincipalId = default_process_principal,
-    rights: Rights = .{ .cpu_read = false, .cpu_write = false, .dma = false },
-};
-
-pub const IommuNoCapDriverMode = enum(u8) {
-    off,
-    shadow,
-    enforce,
-};
-
-pub const IommuSyncReason = enum(u8) {
-    grant_dma,
-    grant_no_dma,
-    move_from,
-    move_to,
-    revoke,
-};
-
-pub const DmaDeviceId = dma_mapping_manager.DmaDeviceId;
-pub const DmaDirection = dma_mapping_manager.DmaDirection;
-pub const DmaMappingState = dma_mapping_manager.DmaMappingState;
-pub const DmaMapping = dma_mapping_manager.DmaMapping;
-const IommuMapEntry = struct {
-    valid: bool = false,
-    principal: PrincipalId = default_process_principal,
-    device: DmaDeviceId = 0x1001,
-    paddr: u64 = 0,
-};
-
-const IommuNoCapDriverState = struct {
-    const max_mappings = 512;
-
-    mode: IommuNoCapDriverMode = .off,
-    mappings: [max_mappings]IommuMapEntry = [_]IommuMapEntry{.{}} ** max_mappings,
-};
-
 var empty_process_descriptors_extra: [0]ProcessDescriptor = .{};
 var empty_cap_tables_extra: [0]CNode = .{};
 var empty_endpoint_tables_extra: [0]EndpointCNode = .{};
 var empty_cap_mailboxes_extra: [0]CapMailbox = .{};
 var empty_pending_page_transfers_extra: [0]?PendingCapTransfer = .{};
-var empty_ipc_buffer_tables_extra: [0]IpcBufferCNode = .{};
-var empty_ipc_buffer_mailboxes_extra: [0]IpcBufferMailbox = .{};
-var empty_pending_ipc_buffer_transfers_extra: [0]?PendingIpcBufferTransfer = .{};
 var empty_fd_tables_extra: [0]FdTable = .{};
 var empty_vma_tables_extra: [0]VmaTable = .{};
 
@@ -1944,16 +1766,10 @@ pub const KernelState = struct {
     endpoint_generation: u64 = 0,
     cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
     pending_page_transfers: [principal_count]?PendingCapTransfer = [_]?PendingCapTransfer{null} ** principal_count,
-    ipc_buffer_tables: [principal_count]IpcBufferCNode = [_]IpcBufferCNode{.{}} ** principal_count,
-    ipc_buffer_mailboxes: [principal_count]IpcBufferMailbox = [_]IpcBufferMailbox{.{}} ** principal_count,
-    pending_ipc_buffer_transfers: [principal_count]?PendingIpcBufferTransfer = [_]?PendingIpcBufferTransfer{null} ** principal_count,
     fd_tables: [process_count]FdTable = [_]FdTable{.{}} ** process_count,
     vma_tables: [process_count]VmaTable = [_]VmaTable{.{}} ** process_count,
     cap_mailboxes_extra: []CapMailbox = empty_cap_mailboxes_extra[0..],
     pending_page_transfers_extra: []?PendingCapTransfer = empty_pending_page_transfers_extra[0..],
-    ipc_buffer_tables_extra: []IpcBufferCNode = empty_ipc_buffer_tables_extra[0..],
-    ipc_buffer_mailboxes_extra: []IpcBufferMailbox = empty_ipc_buffer_mailboxes_extra[0..],
-    pending_ipc_buffer_transfers_extra: []?PendingIpcBufferTransfer = empty_pending_ipc_buffer_transfers_extra[0..],
     fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
     vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
     fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
@@ -1966,20 +1782,10 @@ pub const KernelState = struct {
     next_ipc_channel_scan: usize = 0,
     ipc_replies: [max_ipc_replies]IpcReplySlot = [_]IpcReplySlot{.{}} ** max_ipc_replies,
     next_ipc_reply_scan: usize = 0,
-    pte_sync_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void = null,
-    iommu_audit_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, paddr: u64, mapped: bool, reason: IommuSyncReason) void = null,
     zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
     debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
     revoke_queue: [max_total_caps]u64 = undefined,
     revoke_subtree: [max_total_caps]u64 = undefined,
-    dma_restore: [max_total_caps]DmaRestoreEntry = [_]DmaRestoreEntry{.{}} ** max_total_caps,
-    dma_mappings: dma_mapping_manager.DmaMappingTable = .{},
-    dma_device_domains: dma_mapping_manager.DeviceDomainTable = .{},
-    iommu_caps: device_capabilities.IommuCapabilityTable = .{},
-    queue_caps: device_capabilities.QueueCapabilityTable = .{},
-    command_caps: device_capabilities.CommandCapabilityTable = .{},
-    capsules: capsule.CapsuleTable = .{},
-    iommu: IommuNoCapDriverState = .{},
     next_cap_id: u64 = 1,
     next_transfer_id: u64 = cap_transfer_id_min,
 
@@ -2323,6 +2129,39 @@ pub const KernelState = struct {
         return next;
     }
 
+    fn objectOwner(raw: PrincipalRaw) ?PrincipalId {
+        const principal: PrincipalId = @enumFromInt(raw);
+        if (processIndexFromPrincipal(principal) != null or principal == .Device0) return principal;
+        return null;
+    }
+
+    fn releaseMmioRegionObject(self: *KernelState, mmio: MmioRegionObject) void {
+        _ = self;
+        if (mmio.user_va == 0 or mmio.size == 0) return;
+        const owner = objectOwner(mmio.owner_principal_raw) orelse return;
+        if (mmio.size > @as(u64, std.math.maxInt(usize))) return;
+        _ = @import("memory/user_vm.zig").unmapUserLinearRegion(owner, mmio.user_va, @intCast(mmio.size));
+    }
+
+    fn releaseDmaBufferObject(self: *KernelState, dma: DmaBufferObject) void {
+        _ = self;
+        if (dma.iova == 0 or dma.size == 0) return;
+        _ = dma.device;
+        vtd.unmapRange(dma.iova, dma.size);
+    }
+
+    fn releaseDmaMappingObject(self: *KernelState, mapping: DmaMappingObject) void {
+        _ = self;
+        if (mapping.iova == 0 or mapping.size == 0) return;
+        _ = mapping.device;
+        vtd.unmapRange(mapping.iova, mapping.size);
+    }
+
+    fn releaseIrqObject(self: *KernelState, irq: IrqObject) void {
+        _ = self;
+        _ = irq;
+    }
+
     fn objectPayloadMatches(kind: KernelObjectKind, payload: KernelObjectPayload) bool {
         return std.meta.activeTag(payload) == kind;
     }
@@ -2333,6 +2172,10 @@ pub const KernelState = struct {
             .endpoint => |endpoint_ref| self.clearIpcEndpointSlot(endpoint_ref),
             .channel => |channel_handle| self.releaseIpcChannelHandle(channel_handle),
             .reply => |reply_ref| self.clearIpcReplySlot(reply_ref),
+            .mmio_region => |mmio| self.releaseMmioRegionObject(mmio),
+            .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
+            .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
+            .irq => |irq| self.releaseIrqObject(irq),
             else => {},
         }
     }
@@ -2347,6 +2190,10 @@ pub const KernelState = struct {
             .endpoint => |endpoint_ref| self.clearIpcEndpointSlot(endpoint_ref),
             .channel => |channel_handle| self.releaseIpcChannelHandle(channel_handle),
             .reply => |reply_ref| self.clearIpcReplySlot(reply_ref),
+            .mmio_region => |mmio| self.releaseMmioRegionObject(mmio),
+            .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
+            .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
+            .irq => |irq| self.releaseIrqObject(irq),
             else => {},
         }
     }
@@ -2467,181 +2314,11 @@ pub const KernelState = struct {
         return ptr[0..count];
     }
 
-    fn dmaMappingEndExclusive(paddr_start: u64, length: u64) KernelError!u64 {
-        if (length == 0) return KernelError.InvalidState;
-        if (paddr_start > std.math.maxInt(u64) - length) return KernelError.InvalidState;
-        if (paddr_start + length > std.math.maxInt(u64) - 4095) return KernelError.InvalidState;
-        return pageAlignUp(paddr_start + length);
-    }
-
-    fn validateDmaMappingPages(self: *const KernelState, owner: PrincipalId, paddr_start: u64, length: u64) KernelError!void {
-        const end = try dmaMappingEndExclusive(paddr_start, length);
-        var paddr = pageAlignDown(paddr_start);
-        while (paddr < end) : (paddr += 4096) {
-            const cap = self.getTableConst(owner).find(paddr) orelse return KernelError.CapabilityNotFound;
-            if (!cap.rights.dma) return KernelError.NoDmaRight;
-        }
-    }
-
-    fn syncIommuForDmaMapping(self: *KernelState, mapping: DmaMapping, reason: IommuSyncReason) KernelError!void {
-        const principal: PrincipalId = @enumFromInt(mapping.owner_principal_raw);
-        const end = try dmaMappingEndExclusive(mapping.paddr_start, mapping.length);
-        var paddr = pageAlignDown(mapping.paddr_start);
-        while (paddr < end) : (paddr += 4096) {
-            try device_capabilities.syncIommuForPrincipalPaddr(self, principal, paddr, reason);
-        }
-    }
-
-    pub fn hasActiveDmaMappingForPrincipalDevicePaddr(self: *const KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) bool {
-        const owner_raw: PrincipalRaw = @intCast(@intFromEnum(principal));
-        const page = pageAlignDown(paddr);
-        for (self.dma_mappings.entries) |mapping| {
-            if (!mapping.valid) continue;
-            if (mapping.owner_principal_raw != owner_raw) continue;
-            if (mapping.device != device) continue;
-            const end = dmaMappingEndExclusive(mapping.paddr_start, mapping.length) catch continue;
-            if (page >= pageAlignDown(mapping.paddr_start) and page < end) return true;
-        }
-        return false;
-    }
-
-    fn dmaMappingContainsPage(mapping: DmaMapping, paddr: u64) bool {
-        const page = pageAlignDown(paddr);
-        const end = dmaMappingEndExclusive(mapping.paddr_start, mapping.length) catch return false;
-        return page >= pageAlignDown(mapping.paddr_start) and page < end;
-    }
-
-    pub fn removeDmaMappingsForPrincipalPaddr(self: *KernelState, principal: PrincipalId, paddr: u64) bool {
-        const owner_raw: PrincipalRaw = @intCast(@intFromEnum(principal));
-        var removed = false;
-        var i: usize = 0;
-        while (i < self.dma_mappings.entries.len) : (i += 1) {
-            const mapping = self.dma_mappings.entries[i];
-            if (!mapping.valid) continue;
-            if (mapping.owner_principal_raw != owner_raw) continue;
-            if (!dmaMappingContainsPage(mapping, paddr)) continue;
-            self.dma_mappings.entries[i] = .{};
-            removed = true;
-        }
-        return removed;
-    }
-
-    pub fn removeDmaMappingsForPrincipalDevice(self: *KernelState, principal: PrincipalId, device: DmaDeviceId) void {
-        const owner_raw: PrincipalRaw = @intCast(@intFromEnum(principal));
-        var i: usize = 0;
-        while (i < self.dma_mappings.entries.len) : (i += 1) {
-            const mapping = self.dma_mappings.entries[i];
-            if (!mapping.valid) continue;
-            if (mapping.owner_principal_raw != owner_raw) continue;
-            if (mapping.device != device) continue;
-            self.dma_mappings.entries[i] = .{};
-        }
-    }
-
-    fn findDmaRestoreIndex(self: *const KernelState, paddr: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.dma_restore.len) : (i += 1) {
-            if (self.dma_restore[i].valid and self.dma_restore[i].paddr == paddr) return i;
-        }
-        return null;
-    }
-
-    fn saveDmaRestoreEntry(self: *KernelState, owner: PrincipalId, paddr: u64, rights: Rights) KernelError!void {
-        if (self.findDmaRestoreIndex(paddr) != null) return KernelError.InvalidState;
-
-        var i: usize = 0;
-        while (i < self.dma_restore.len) : (i += 1) {
-            if (self.dma_restore[i].valid) continue;
-            self.dma_restore[i] = .{
-                .valid = true,
-                .paddr = paddr,
-                .owner = owner,
-                .rights = rights,
-            };
-            return;
-        }
-        return KernelError.TableFull;
-    }
-
-    fn takeDmaRestoreEntry(self: *KernelState, paddr: u64) ?DmaRestoreEntry {
-        const index = self.findDmaRestoreIndex(paddr) orelse return null;
-        const entry = self.dma_restore[index];
-        self.dma_restore[index] = .{};
-        return entry;
-    }
-
-    pub fn setIommuNoCapDriverMode(self: *KernelState, mode: IommuNoCapDriverMode) void {
-        self.iommu.mode = mode;
-        if (mode == .off) {
-            self.iommu.mappings = [_]IommuMapEntry{.{}} ** IommuNoCapDriverState.max_mappings;
-        }
-    }
-
-    pub fn getIommuNoCapDriverMode(self: *const KernelState) IommuNoCapDriverMode {
-        return self.iommu.mode;
-    }
-
-    pub fn iommuFindMappingIndex(self: *const KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.iommu.mappings.len) : (i += 1) {
-            const entry = self.iommu.mappings[i];
-            if (!entry.valid) continue;
-            if (entry.principal == principal and entry.device == device and entry.paddr == paddr) return i;
-        }
-        return null;
-    }
-
-    pub fn iommuMap(self: *KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) KernelError!void {
-        if (self.iommuFindMappingIndex(principal, device, paddr) != null) return;
-        var i: usize = 0;
-        while (i < self.iommu.mappings.len) : (i += 1) {
-            if (self.iommu.mappings[i].valid) continue;
-            self.iommu.mappings[i] = .{
-                .valid = true,
-                .principal = principal,
-                .device = device,
-                .paddr = paddr,
-            };
-            return;
-        }
-        return KernelError.TableFull;
-    }
-
-    pub fn iommuUnmap(self: *KernelState, principal: PrincipalId, device: DmaDeviceId, paddr: u64) void {
-        const index = self.iommuFindMappingIndex(principal, device, paddr) orelse return;
-        self.iommu.mappings[index] = .{};
-    }
-
-    noinline fn callPteSyncHook(
-        hook: *const fn (state: *const KernelState, principal: PrincipalId, paddr: u64) void,
-        self: *const KernelState,
-        principal: PrincipalId,
-        paddr: u64,
-    ) void {
-        hook(self, principal, paddr);
-    }
-
     fn isRightsSubset(child: Rights, parent: Rights) bool {
         return (!child.cpu_read or parent.cpu_read) and
             (!child.cpu_write or parent.cpu_write) and
             (!child.dma or parent.dma) and
             (!child.grant or parent.grant);
-    }
-
-    fn isIpcBufferRightsSubset(child: IpcBufferRights, parent: IpcBufferRights) bool {
-        const child_bits: u32 = @bitCast(child);
-        const parent_bits: u32 = @bitCast(parent);
-        return (child_bits & ~parent_bits) == 0;
-    }
-
-    fn mapCapsuleError(err: capsule.CapsuleError) KernelError {
-        return switch (err) {
-            error.InvalidState => KernelError.InvalidState,
-            error.TableFull => KernelError.TableFull,
-            error.NotFound => KernelError.CapabilityNotFound,
-            error.Denied => KernelError.InvalidState,
-            error.Revoked => KernelError.CapsuleRevoked,
-        };
     }
 
     fn processPrincipal(index: usize) PrincipalId {
@@ -2689,267 +2366,6 @@ pub const KernelState = struct {
 
     fn requireActivePrincipal(self: *const KernelState, principal: PrincipalId) KernelError!void {
         if (!self.hasActivePrincipal(principal)) return KernelError.InvalidState;
-    }
-
-    pub fn capsuleCreateRoot(
-        self: *KernelState,
-        owner: PrincipalId,
-        kind: CapsuleKind,
-        rights: CapsuleRights,
-        metadata: CapsuleMetadata,
-    ) KernelError!u64 {
-        try self.requireActivePrincipal(owner);
-        return self.capsules.allocRoot(@intFromEnum(owner), kind, rights, metadata) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn capsuleDerive(
-        self: *KernelState,
-        owner: PrincipalId,
-        parent_token: u64,
-        kind: CapsuleKind,
-        rights: CapsuleRights,
-        metadata: CapsuleMetadata,
-    ) KernelError!u64 {
-        try self.requireActivePrincipal(owner);
-        return self.capsules.derive(@intFromEnum(owner), parent_token, kind, rights, metadata) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn capsuleGrant(
-        self: *KernelState,
-        owner: PrincipalId,
-        child: PrincipalId,
-        token: u64,
-        rights: CapsuleRights,
-    ) KernelError!u64 {
-        try self.requireActivePrincipal(owner);
-        try self.requireActivePrincipal(child);
-        return self.capsules.grant(@intFromEnum(owner), @intFromEnum(child), token, rights) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn capsuleAuthorize(
-        self: *const KernelState,
-        owner: PrincipalId,
-        token: u64,
-        kind: CapsuleKind,
-        required_rights: CapsuleRights,
-    ) KernelError!void {
-        try self.requireActivePrincipal(owner);
-        return self.capsules.authorize(@intFromEnum(owner), token, kind, required_rights) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn capsuleSnapshot(self: *const KernelState, token: u64) KernelError!CapsuleSnapshot {
-        return self.capsules.snapshot(token) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn capsuleCollectSubtreeTokens(
-        self: *const KernelState,
-        owner: PrincipalId,
-        token: u64,
-        out: []u64,
-    ) KernelError!usize {
-        try self.requireActivePrincipal(owner);
-        return self.capsules.collectSubtreeTokens(@intFromEnum(owner), token, out) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn capsuleRevokeSubtree(self: *KernelState, owner: PrincipalId, token: u64) KernelError!usize {
-        try self.requireActivePrincipal(owner);
-        return self.capsules.revokeSubtree(@intFromEnum(owner), token) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn capsuleCloseSubtree(self: *KernelState, owner: PrincipalId, token: u64) KernelError!usize {
-        try self.requireActivePrincipal(owner);
-        return self.capsules.closeSubtree(@intFromEnum(owner), token) catch |err| return mapCapsuleError(err);
-    }
-
-    pub fn releasePrincipalCapsules(self: *KernelState, owner: PrincipalId) usize {
-        return self.capsules.releaseOwner(@intFromEnum(owner));
-    }
-
-    fn capsuleGrantBitFromParent(parent: CapsuleSnapshot) bool {
-        return parent.rights.grant;
-    }
-
-    fn deviceCapsuleForChild(
-        self: *const KernelState,
-        owner: PrincipalId,
-        device_token: u64,
-        required_rights: CapsuleRights,
-    ) KernelError!CapsuleSnapshot {
-        var effective_rights = required_rights;
-        effective_rights.query = true;
-        try self.capsuleAuthorize(owner, device_token, .device, effective_rights);
-        const device = try self.capsuleSnapshot(device_token);
-        if (device.metadata.device == 0) return KernelError.InvalidState;
-        return device;
-    }
-
-    pub fn deviceCapsuleCreate(
-        self: *KernelState,
-        owner: PrincipalId,
-        device_id: u64,
-        rights: CapsuleRights,
-    ) KernelError!u64 {
-        if (device_id == 0) return KernelError.InvalidState;
-        return self.capsuleCreateRoot(owner, .device, rights, .{ .device = device_id });
-    }
-
-    pub fn deviceCapsuleDeriveMmio(
-        self: *KernelState,
-        owner: PrincipalId,
-        device_token: u64,
-        bar_index: u32,
-        bar_paddr: u64,
-        user_va: u64,
-        size: u64,
-        flags: u32,
-    ) KernelError!u64 {
-        if (bar_paddr == 0 or size == 0) return KernelError.InvalidState;
-        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .bar_map = true });
-        return self.capsuleDerive(owner, device_token, .mmio, .{
-            .query = true,
-            .bar_map = true,
-            .grant = capsuleGrantBitFromParent(device),
-        }, .{
-            .device = device.metadata.device,
-            .object_id = bar_paddr,
-            .user_va = user_va,
-            .size = size,
-            .index = bar_index,
-            .flags = flags,
-        });
-    }
-
-    pub fn deviceCapsuleDeriveDmaBuffer(
-        self: *KernelState,
-        owner: PrincipalId,
-        device_token: u64,
-        user_va: u64,
-        iova: u64,
-        size: u64,
-        flags: u32,
-    ) KernelError!u64 {
-        if (user_va == 0 or iova == 0 or size == 0) return KernelError.InvalidState;
-        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .dma_alloc = true });
-        return self.capsuleDerive(owner, device_token, .dma_buffer, .{
-            .query = true,
-            .dma_alloc = true,
-            .dma_map_user = device.rights.dma_map_user,
-            .grant = capsuleGrantBitFromParent(device),
-        }, .{
-            .device = device.metadata.device,
-            .user_va = user_va,
-            .iova = iova,
-            .size = size,
-            .flags = flags,
-        });
-    }
-
-    pub fn deviceCapsuleDeriveDmaMapping(
-        self: *KernelState,
-        owner: PrincipalId,
-        device_token: u64,
-        user_va: u64,
-        iova: u64,
-        size: u64,
-        direction: CapsuleDmaDirection,
-        flags: u32,
-    ) KernelError!u64 {
-        if (user_va == 0 or iova == 0 or size == 0) return KernelError.InvalidState;
-        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .dma_map_user = true });
-        return self.capsuleDerive(owner, device_token, .dma_mapping, .{
-            .query = true,
-            .dma_map_user = true,
-            .grant = capsuleGrantBitFromParent(device),
-        }, .{
-            .device = device.metadata.device,
-            .user_va = user_va,
-            .iova = iova,
-            .size = size,
-            .flags = flags | (@as(u32, @intFromEnum(direction)) & 0x3),
-        });
-    }
-
-    pub fn dmaBufferCapsuleDeriveMapping(
-        self: *KernelState,
-        owner: PrincipalId,
-        dma_buffer_token: u64,
-        iova: u64,
-        size: u64,
-        direction: CapsuleDmaDirection,
-        flags: u32,
-    ) KernelError!u64 {
-        if (iova == 0 or size == 0) return KernelError.InvalidState;
-        try self.capsuleAuthorize(owner, dma_buffer_token, .dma_buffer, .{ .dma_map_user = true });
-        const buffer = try self.capsuleSnapshot(dma_buffer_token);
-        if (size > buffer.metadata.size) return KernelError.InvalidState;
-        return self.capsuleDerive(owner, dma_buffer_token, .dma_mapping, .{
-            .query = true,
-            .dma_map_user = true,
-            .grant = capsuleGrantBitFromParent(buffer),
-        }, .{
-            .device = buffer.metadata.device,
-            .object_id = dma_buffer_token,
-            .user_va = buffer.metadata.user_va,
-            .iova = iova,
-            .size = size,
-            .flags = flags | (@as(u32, @intFromEnum(direction)) & 0x3),
-        });
-    }
-
-    pub fn deviceCapsuleDeriveIrq(
-        self: *KernelState,
-        owner: PrincipalId,
-        device_token: u64,
-        kind: CapsuleIrqKind,
-        vector: u32,
-        flags: u32,
-    ) KernelError!u64 {
-        const device = try self.deviceCapsuleForChild(owner, device_token, .{ .irq_bind = true });
-        return self.capsuleDerive(owner, device_token, .irq, .{
-            .query = true,
-            .irq_bind = true,
-            .grant = capsuleGrantBitFromParent(device),
-        }, .{
-            .device = device.metadata.device,
-            .index = vector,
-            .flags = flags | ((@as(u32, @intFromEnum(kind)) & 0x3) << 16),
-        });
-    }
-
-    pub fn mmioCapsuleSnapshotForAccess(
-        self: *const KernelState,
-        owner: PrincipalId,
-        token: u64,
-    ) KernelError!CapsuleSnapshot {
-        try self.capsuleAuthorize(owner, token, .mmio, .{ .bar_map = true });
-        return self.capsuleSnapshot(token);
-    }
-
-    pub fn dmaBufferCapsuleSnapshotForAccess(
-        self: *const KernelState,
-        owner: PrincipalId,
-        token: u64,
-    ) KernelError!CapsuleSnapshot {
-        try self.capsuleAuthorize(owner, token, .dma_buffer, .{ .dma_alloc = true });
-        return self.capsuleSnapshot(token);
-    }
-
-    pub fn dmaMappingCapsuleSnapshotForAccess(
-        self: *const KernelState,
-        owner: PrincipalId,
-        token: u64,
-    ) KernelError!CapsuleSnapshot {
-        try self.capsuleAuthorize(owner, token, .dma_mapping, .{ .dma_map_user = true });
-        return self.capsuleSnapshot(token);
-    }
-
-    pub fn irqCapsuleSnapshotForAccess(
-        self: *const KernelState,
-        owner: PrincipalId,
-        token: u64,
-    ) KernelError!CapsuleSnapshot {
-        try self.capsuleAuthorize(owner, token, .irq, .{ .irq_bind = true });
-        return self.capsuleSnapshot(token);
     }
 
     fn principalStorageIndex(self: *const KernelState, principal: PrincipalId) usize {
@@ -3008,26 +2424,6 @@ pub const KernelState = struct {
         return &self.pending_page_transfers[index];
     }
 
-    fn ipcBufferTableForProcessIndex(self: *KernelState, index: usize) *IpcBufferCNode {
-        if (extraIndex(index)) |extra| return &self.ipc_buffer_tables_extra[extra];
-        return &self.ipc_buffer_tables[index];
-    }
-
-    fn ipcBufferTableForProcessIndexConst(self: *const KernelState, index: usize) *const IpcBufferCNode {
-        if (extraIndex(index)) |extra| return &self.ipc_buffer_tables_extra[extra];
-        return &self.ipc_buffer_tables[index];
-    }
-
-    fn ipcBufferMailboxForProcessIndex(self: *KernelState, index: usize) *IpcBufferMailbox {
-        if (extraIndex(index)) |extra| return &self.ipc_buffer_mailboxes_extra[extra];
-        return &self.ipc_buffer_mailboxes[index];
-    }
-
-    fn pendingIpcBufferTransferForProcessIndex(self: *KernelState, index: usize) *?PendingIpcBufferTransfer {
-        if (extraIndex(index)) |extra| return &self.pending_ipc_buffer_transfers_extra[extra];
-        return &self.pending_ipc_buffer_transfers[index];
-    }
-
     fn capMailboxForPrincipal(self: *KernelState, principal: PrincipalId) *CapMailbox {
         if (processIndexFromPrincipal(principal)) |index| return self.capMailboxForProcessIndex(index);
         return &self.cap_mailboxes[self.principalStorageIndex(principal)];
@@ -3036,16 +2432,6 @@ pub const KernelState = struct {
     fn pendingPageTransferForPrincipal(self: *KernelState, principal: PrincipalId) *?PendingCapTransfer {
         if (processIndexFromPrincipal(principal)) |index| return self.pendingPageTransferForProcessIndex(index);
         return &self.pending_page_transfers[self.principalStorageIndex(principal)];
-    }
-
-    fn ipcBufferMailboxForPrincipal(self: *KernelState, principal: PrincipalId) *IpcBufferMailbox {
-        if (processIndexFromPrincipal(principal)) |index| return self.ipcBufferMailboxForProcessIndex(index);
-        return &self.ipc_buffer_mailboxes[self.principalStorageIndex(principal)];
-    }
-
-    fn pendingIpcBufferTransferForPrincipal(self: *KernelState, principal: PrincipalId) *?PendingIpcBufferTransfer {
-        if (processIndexFromPrincipal(principal)) |index| return self.pendingIpcBufferTransferForProcessIndex(index);
-        return &self.pending_ipc_buffer_transfers[self.principalStorageIndex(principal)];
     }
 
     fn fdTableForProcessIndex(self: *KernelState, index: usize) ?*FdTable {
@@ -3233,9 +2619,6 @@ pub const KernelState = struct {
         self.endpointTableForProcessIndex(index).* = .{};
         self.capMailboxForProcessIndex(index).reset();
         self.pendingPageTransferForProcessIndex(index).* = null;
-        self.ipcBufferTableForProcessIndex(index).* = .{};
-        self.ipcBufferMailboxForProcessIndex(index).reset();
-        self.pendingIpcBufferTransferForProcessIndex(index).* = null;
     }
 
     fn findFreeVma(table: *const VmaTable) ?usize {
@@ -3306,7 +2689,7 @@ pub const KernelState = struct {
             }
         }
         while (allocated < page_count_u64) : (allocated += 1) {
-            pages[allocated] = (try self.allocPhysicalPage(free_list)).paddr;
+            pages[allocated] = (try self.allocLowPhysicalPage(free_list)).paddr;
         }
         try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]);
         return fd;
@@ -3321,12 +2704,329 @@ pub const KernelState = struct {
             .flags_bits = fdFlagsToBits(entry.flags),
         };
         switch (slot.payload) {
+            .process => |process| {
+                info.size_bytes = process.exit_code;
+                info.extra = @intFromEnum(process.state);
+            },
+            .thread => |thread| {
+                info.size_bytes = thread.exit_code;
+                info.extra = @intFromEnum(thread.state);
+            },
             .vmo => |vmo_ref| {
                 info.size_bytes = self.nativeVmoSize(vmo_ref) orelse 0;
             },
             else => {},
         }
         return info;
+    }
+
+    pub fn fdPayloadWithRightsConst(
+        self: *const KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        required_rights: FdRights,
+    ) ?struct { rights: FdRights, payload: *const KernelObjectPayload } {
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        if (!isFdRightsSubset(required_rights, entry.rights)) return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        return .{ .rights = entry.rights, .payload = &slot.payload };
+    }
+
+    pub fn fdPayloadWithRights(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        required_rights: FdRights,
+    ) ?struct { rights: FdRights, payload: *KernelObjectPayload } {
+        const table = self.getFdTable(owner) orelse return null;
+        const index = fdIndex(fd) orelse return null;
+        const entry = &table.entries[index];
+        if (entry.isEmpty()) return null;
+        if (!isFdRightsSubset(required_rights, entry.rights)) return null;
+        const slot = self.kernelObjectSlot(entry.object) orelse return null;
+        return .{ .rights = entry.rights, .payload = &slot.payload };
+    }
+
+    fn processFromPayload(payload: *const KernelObjectPayload) ?ProcessObject {
+        return switch (payload.*) {
+            .process => |process| process,
+            else => null,
+        };
+    }
+
+    fn threadFromPayload(payload: *const KernelObjectPayload) ?ThreadObject {
+        return switch (payload.*) {
+            .thread => |thread| thread,
+            else => null,
+        };
+    }
+
+    pub fn processObjectForFd(self: *const KernelState, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?ProcessObject {
+        const view = self.fdPayloadWithRightsConst(owner, fd, required_rights) orelse return null;
+        return processFromPayload(view.payload);
+    }
+
+    pub fn threadObjectForFd(self: *const KernelState, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?ThreadObject {
+        const view = self.fdPayloadWithRightsConst(owner, fd, required_rights) orelse return null;
+        return threadFromPayload(view.payload);
+    }
+
+    pub fn createProcessFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        process: ProcessObject,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        if (processIndexFromPrincipal(@enumFromInt(process.principal_raw)) == null) return KernelError.InvalidState;
+        const object_ref = try self.createKernelObject(.process, .{ .process = process });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn createThreadFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        thread: ThreadObject,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        if (thread.thread_generation == 0) return KernelError.InvalidState;
+        if (processIndexFromPrincipal(@enumFromInt(thread.owner_principal_raw)) == null) return KernelError.InvalidState;
+        const object_ref = try self.createKernelObject(.thread, .{ .thread = thread });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn setProcessObjectStateForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        required_rights: FdRights,
+        state: TaskObjectState,
+        exit_code: u32,
+    ) KernelError!ProcessObject {
+        const view = self.fdPayloadWithRights(owner, fd, required_rights) orelse return KernelError.InvalidState;
+        var process = processFromPayload(view.payload) orelse return KernelError.InvalidState;
+        process.state = state;
+        process.exit_code = exit_code;
+        view.payload.* = .{ .process = process };
+        return process;
+    }
+
+    pub fn setThreadObjectStateForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        required_rights: FdRights,
+        state: TaskObjectState,
+        exit_code: u32,
+    ) KernelError!ThreadObject {
+        const view = self.fdPayloadWithRights(owner, fd, required_rights) orelse return KernelError.InvalidState;
+        var thread = threadFromPayload(view.payload) orelse return KernelError.InvalidState;
+        thread.state = state;
+        thread.exit_code = exit_code;
+        view.payload.* = .{ .thread = thread };
+        return thread;
+    }
+
+    pub fn markProcessObjectsExited(self: *KernelState, principal: PrincipalId, state: TaskObjectState, exit_code: u32) void {
+        var i: usize = 0;
+        const principal_raw: PrincipalRaw = @intFromEnum(principal);
+        while (i < self.fd_objects.len) : (i += 1) {
+            const slot = &self.fd_objects[i];
+            if (slot.kind != .process) continue;
+            var process = processFromPayload(&slot.payload) orelse continue;
+            if (process.principal_raw != principal_raw) continue;
+            process.state = state;
+            process.exit_code = exit_code;
+            slot.payload = .{ .process = process };
+        }
+    }
+
+    pub fn markThreadObjectsExitedForPrincipal(self: *KernelState, principal: PrincipalId, state: TaskObjectState, exit_code: u32) void {
+        var i: usize = 0;
+        const principal_raw: PrincipalRaw = @intFromEnum(principal);
+        while (i < self.fd_objects.len) : (i += 1) {
+            const slot = &self.fd_objects[i];
+            if (slot.kind != .thread) continue;
+            var thread = threadFromPayload(&slot.payload) orelse continue;
+            if (thread.owner_principal_raw != principal_raw) continue;
+            thread.state = state;
+            thread.exit_code = exit_code;
+            slot.payload = .{ .thread = thread };
+        }
+    }
+
+    pub fn markThreadObjectsExitedBySlot(self: *KernelState, thread_index: usize, thread_generation: u32, state: TaskObjectState, exit_code: u32) void {
+        var i: usize = 0;
+        while (i < self.fd_objects.len) : (i += 1) {
+            const slot = &self.fd_objects[i];
+            if (slot.kind != .thread) continue;
+            var thread = threadFromPayload(&slot.payload) orelse continue;
+            if (thread.thread_index != thread_index or thread.thread_generation != thread_generation) continue;
+            thread.state = state;
+            thread.exit_code = exit_code;
+            slot.payload = .{ .thread = thread };
+        }
+    }
+
+    pub fn deviceObjectForFd(self: *const KernelState, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?DeviceObject {
+        const view = self.fdPayloadWithRightsConst(owner, fd, required_rights) orelse return null;
+        return switch (view.payload.*) {
+            .device => |device| device,
+            else => null,
+        };
+    }
+
+    pub fn dmaBufferObjectForFd(self: *const KernelState, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?DmaBufferObject {
+        const view = self.fdPayloadWithRightsConst(owner, fd, required_rights) orelse return null;
+        return switch (view.payload.*) {
+            .dma_buffer => |buffer| buffer,
+            else => null,
+        };
+    }
+
+    pub fn irqObjectForFd(self: *const KernelState, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?IrqObject {
+        const view = self.fdPayloadWithRightsConst(owner, fd, required_rights) orelse return null;
+        return switch (view.payload.*) {
+            .irq => |irq| irq,
+            else => null,
+        };
+    }
+
+    fn irqMatchesInterrupt(irq: IrqObject, vector: u32) bool {
+        if (irq.kind == .auto) return irq.vector == 0 or irq.vector == vector;
+        return irq.vector == vector;
+    }
+
+    fn appendUniquePrincipal(out: []PrincipalId, count: *usize, principal: PrincipalId) void {
+        var i: usize = 0;
+        while (i < count.*) : (i += 1) {
+            if (out[i] == principal) return;
+        }
+        if (count.* >= out.len) return;
+        out[count.*] = principal;
+        count.* += 1;
+    }
+
+    pub fn recordDeviceInterruptEvent(self: *KernelState, vector: u32, wake_owners: []PrincipalId) usize {
+        var wake_count: usize = 0;
+        for (self.fd_objects[0..]) |*slot| {
+            if (slot.kind != .irq) continue;
+            switch (slot.payload) {
+                .irq => |*irq| {
+                    if (!irqMatchesInterrupt(irq.*, vector)) continue;
+                    irq.event_count +%= 1;
+                    const owner = objectOwner(irq.owner_principal_raw) orelse continue;
+                    appendUniquePrincipal(wake_owners, &wake_count, owner);
+                },
+                else => {},
+            }
+        }
+        return wake_count;
+    }
+
+    pub fn irqEventCountForFd(self: *const KernelState, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?u64 {
+        const irq = self.irqObjectForFd(owner, fd, required_rights) orelse return null;
+        return irq.event_count;
+    }
+
+    pub fn createDeviceFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        device: DmaDeviceId,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        if (device == 0) return KernelError.InvalidState;
+        const object_ref = try self.createKernelObject(.device, .{ .device = .{
+            .owner_principal_raw = @intFromEnum(owner),
+            .device = device,
+        } });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn createMmioRegionFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        mmio: MmioRegionObject,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        if (mmio.device == 0 or mmio.paddr == 0 or mmio.size == 0) return KernelError.InvalidState;
+        var payload = mmio;
+        payload.owner_principal_raw = @intFromEnum(owner);
+        const object_ref = try self.createKernelObject(.mmio_region, .{ .mmio_region = payload });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn createDmaBufferFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        dma: DmaBufferObject,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        if (dma.device == 0 or dma.user_va == 0 or dma.iova == 0 or dma.size == 0) return KernelError.InvalidState;
+        var payload = dma;
+        payload.owner_principal_raw = @intFromEnum(owner);
+        const object_ref = try self.createKernelObject(.dma_buffer, .{ .dma_buffer = payload });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn createDmaMappingFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        mapping: DmaMappingObject,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        if (mapping.device == 0 or mapping.user_va == 0 or mapping.iova == 0 or mapping.size == 0) return KernelError.InvalidState;
+        var payload = mapping;
+        payload.owner_principal_raw = @intFromEnum(owner);
+        const object_ref = try self.createKernelObject(.dma_mapping, .{ .dma_mapping = payload });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn createIrqFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        irq: IrqObject,
+        rights: FdRights,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        if (irq.device == 0) return KernelError.InvalidState;
+        var payload = irq;
+        payload.owner_principal_raw = @intFromEnum(owner);
+        const object_ref = try self.createKernelObject(.irq, .{ .irq = payload });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
     }
 
     pub fn mmapFd(
@@ -3897,9 +3597,6 @@ pub const KernelState = struct {
         const new_endpoint = allocKernelSlice(EndpointCNode, free_list, extra_count) orelse return false;
         const new_cap_mailbox = allocKernelSlice(CapMailbox, free_list, extra_count) orelse return false;
         const new_pending = allocKernelSlice(?PendingCapTransfer, free_list, extra_count) orelse return false;
-        const new_ipc_buffer = allocKernelSlice(IpcBufferCNode, free_list, extra_count) orelse return false;
-        const new_ipc_mailbox = allocKernelSlice(IpcBufferMailbox, free_list, extra_count) orelse return false;
-        const new_ipc_pending = allocKernelSlice(?PendingIpcBufferTransfer, free_list, extra_count) orelse return false;
         const new_fd = allocKernelSlice(FdTable, free_list, extra_count) orelse return false;
         const new_vma = allocKernelSlice(VmaTable, free_list, extra_count) orelse return false;
 
@@ -3908,9 +3605,6 @@ pub const KernelState = struct {
         @memcpy(new_endpoint[0..old_extra_count], self.endpoint_tables_extra);
         @memcpy(new_cap_mailbox[0..old_extra_count], self.cap_mailboxes_extra);
         @memcpy(new_pending[0..old_extra_count], self.pending_page_transfers_extra);
-        @memcpy(new_ipc_buffer[0..old_extra_count], self.ipc_buffer_tables_extra);
-        @memcpy(new_ipc_mailbox[0..old_extra_count], self.ipc_buffer_mailboxes_extra);
-        @memcpy(new_ipc_pending[0..old_extra_count], self.pending_ipc_buffer_transfers_extra);
         @memcpy(new_fd[0..old_extra_count], self.fd_tables_extra);
         @memcpy(new_vma[0..old_extra_count], self.vma_tables_extra);
 
@@ -3921,9 +3615,6 @@ pub const KernelState = struct {
             new_endpoint[i] = .{};
             new_cap_mailbox[i] = .{};
             new_pending[i] = null;
-            new_ipc_buffer[i] = .{};
-            new_ipc_mailbox[i] = .{};
-            new_ipc_pending[i] = null;
             new_fd[i] = .{};
             new_vma[i] = .{};
         }
@@ -3933,9 +3624,6 @@ pub const KernelState = struct {
         self.endpoint_tables_extra = new_endpoint;
         self.cap_mailboxes_extra = new_cap_mailbox;
         self.pending_page_transfers_extra = new_pending;
-        self.ipc_buffer_tables_extra = new_ipc_buffer;
-        self.ipc_buffer_mailboxes_extra = new_ipc_mailbox;
-        self.pending_ipc_buffer_transfers_extra = new_ipc_pending;
         self.fd_tables_extra = new_fd;
         self.vma_tables_extra = new_vma;
         self.process_capacity = capacity;
@@ -3943,8 +3631,6 @@ pub const KernelState = struct {
     }
 
     fn clearPrincipalTablesForReuse(self: *KernelState, index: usize) void {
-        const principal = processPrincipal(index);
-        _ = self.releasePrincipalCapsules(principal);
         self.resetProcessRuntimeTables(index);
     }
 
@@ -3998,80 +3684,13 @@ pub const KernelState = struct {
         desc.bootstrap_owner = enabled;
     }
 
-    pub fn markProcessBuilderSuspended(self: *KernelState, principal: PrincipalId, owner: PrincipalId) KernelError!void {
-        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
-        const desc = self.processDescriptorSlot(index) orelse return KernelError.InvalidState;
-        if (!desc.active) return KernelError.InvalidState;
-        try self.requireActiveProcess(owner);
-        desc.process_builder_owner = owner;
-        desc.process_builder_suspended = true;
-    }
-
-    pub fn processBuilderOwnerMatches(self: *const KernelState, principal: PrincipalId, owner: PrincipalId) bool {
-        const index = processIndexFromPrincipal(principal) orelse return false;
-        const desc = (self.processDescriptorSlotConst(index) orelse return false).*;
-        if (!desc.active or !desc.process_builder_suspended) return false;
-        return desc.process_builder_owner == owner;
-    }
-
-    pub fn clearProcessBuilderSuspended(self: *KernelState, principal: PrincipalId) KernelError!void {
-        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
-        const desc = self.processDescriptorSlot(index) orelse return KernelError.InvalidState;
-        if (!desc.active) return KernelError.InvalidState;
-        desc.process_builder_owner = null;
-        desc.process_builder_suspended = false;
-    }
-
-    pub fn setAbiTrapDelegate(
-        self: *KernelState,
-        principal: PrincipalId,
-        endpoint_id: u64,
-        flavor: u32,
-        request_page_va: u64,
-    ) KernelError!void {
-        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
-        const desc = self.processDescriptorSlot(index) orelse return KernelError.InvalidState;
-        if (!desc.active) return KernelError.InvalidState;
-        if (self.endpointTargetFor(principal, endpoint_id) == null) return KernelError.EndpointNotFound;
-        if (request_page_va == 0 or (request_page_va & 0xFFF) != 0 or !capability.isUserCanonicalVa(request_page_va)) return KernelError.InvalidState;
-        desc.abi_trap_delegate_endpoint_id = endpoint_id;
-        desc.abi_trap_delegate_flavor = flavor;
-        desc.abi_trap_request_page_va = request_page_va;
-    }
-
-    pub fn clearAbiTrapDelegate(self: *KernelState, principal: PrincipalId) KernelError!void {
-        const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
-        const desc = self.processDescriptorSlot(index) orelse return KernelError.InvalidState;
-        if (!desc.active) return KernelError.InvalidState;
-        desc.abi_trap_delegate_endpoint_id = 0;
-        desc.abi_trap_delegate_flavor = 0;
-        desc.abi_trap_request_page_va = 0;
-    }
-
-    pub fn abiTrapDelegateFor(self: *const KernelState, principal: PrincipalId) ?AbiTrapDelegate {
-        const index = processIndexFromPrincipal(principal) orelse return null;
-        const desc = (self.processDescriptorSlotConst(index) orelse return null).*;
-        if (!desc.active or desc.abi_trap_delegate_endpoint_id == 0) return null;
-        return .{
-            .endpoint_id = desc.abi_trap_delegate_endpoint_id,
-            .flavor = desc.abi_trap_delegate_flavor,
-            .request_page_va = desc.abi_trap_request_page_va,
-        };
-    }
-
     pub fn markProcessFaulted(self: *KernelState, principal: PrincipalId, fault_vector: u8) bool {
         const index = processIndexFromPrincipal(principal) orelse return false;
         const desc = self.processDescriptorSlot(index) orelse return false;
         if (!desc.active) return false;
         self.releaseFdTableForProcessIndex(index);
-        _ = self.releasePrincipalCapsules(principal);
         desc.active = false;
         desc.bootstrap_owner = false;
-        desc.process_builder_owner = null;
-        desc.process_builder_suspended = false;
-        desc.abi_trap_delegate_endpoint_id = 0;
-        desc.abi_trap_delegate_flavor = 0;
-        desc.abi_trap_request_page_va = 0;
         desc.faulted = true;
         desc.fault_vector = fault_vector;
         if (self.active_process_count > 0) self.active_process_count -= 1;
@@ -4084,14 +3703,8 @@ pub const KernelState = struct {
         const desc = self.processDescriptorSlot(index) orelse return false;
         if (!desc.active) return false;
         self.releaseFdTableForProcessIndex(index);
-        _ = self.releasePrincipalCapsules(principal);
         desc.active = false;
         desc.bootstrap_owner = false;
-        desc.process_builder_owner = null;
-        desc.process_builder_suspended = false;
-        desc.abi_trap_delegate_endpoint_id = 0;
-        desc.abi_trap_delegate_flavor = 0;
-        desc.abi_trap_request_page_va = 0;
         desc.faulted = false;
         desc.fault_vector = 0;
         if (self.active_process_count > 0) self.active_process_count -= 1;
@@ -4104,7 +3717,6 @@ pub const KernelState = struct {
         const desc = self.processDescriptorSlot(index) orelse return false;
         if (!desc.active) return false;
         self.releaseFdTableForProcessIndex(index);
-        _ = self.releasePrincipalCapsules(principal);
         desc.* = .{};
         if (self.active_process_count > 0) self.active_process_count -= 1;
         if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .remove);
@@ -4120,11 +3732,7 @@ pub const KernelState = struct {
         self.endpoint_tables[process_count] = .{};
         self.cap_mailboxes[process_count].reset();
         self.pending_page_transfers[process_count] = null;
-        self.ipc_buffer_tables[process_count] = .{};
-        self.ipc_buffer_mailboxes[process_count].reset();
-        self.pending_ipc_buffer_transfers[process_count] = null;
         resetVmoBackingPageStore();
-        self.capsules = .{};
         self.published_service_endpoints = .{};
         self.resetKernelObjectTable();
         self.resetNativeVmoTable();
@@ -4207,120 +3815,6 @@ pub const KernelState = struct {
         return state;
     }
 
-    pub fn startDma(self: *KernelState, owner: PrincipalId, paddr: u64) KernelError!void {
-        try self.requireActiveProcess(owner);
-        const owner_table = self.getTable(owner);
-        const owner_cap = owner_table.find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!owner_cap.rights.dma) return KernelError.NoDmaRight;
-        try self.saveDmaRestoreEntry(owner, paddr, owner_cap.rights);
-
-        // DMA 開始時は moveCap 経由で Device0 へ委譲する。
-        try self.moveCap(
-            owner,
-            .Device0,
-            paddr,
-            .{
-                .cpu_read = false,
-                .cpu_write = false,
-                .dma = true,
-            },
-        );
-    }
-
-    pub fn completeDma(self: *KernelState, paddr: u64) KernelError!void {
-        const dev_table = self.getTable(.Device0);
-        const dev_cap = dev_table.find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!dev_cap.rights.dma) return KernelError.NoDmaRight;
-        const restore = self.takeDmaRestoreEntry(paddr) orelse return KernelError.InvalidState;
-        if (self.getTable(restore.owner).find(paddr) != null) return KernelError.InvalidState;
-
-        var restored = dev_cap.*;
-        restored.rights = restore.rights;
-        _ = dev_table.removeByPaddr(paddr);
-        try self.getTable(restore.owner).add(restored);
-        if (self.pte_sync_hook) |hook| {
-            callPteSyncHook(hook, self, .Device0, paddr);
-            callPteSyncHook(hook, self, restore.owner, paddr);
-        }
-    }
-
-    // Stage1: hold DMA mapping metadata before wiring full syscall/IOMMU flow.
-    pub fn dmaMapCreateStage1(
-        self: *KernelState,
-        owner: PrincipalId,
-        device: DmaDeviceId,
-        paddr_start: u64,
-        length: u64,
-        direction: DmaDirection,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-        try self.validateDmaMappingPages(owner, paddr_start, length);
-        const token = self.dma_mappings.alloc(
-            @intFromEnum(owner),
-            device,
-            paddr_start,
-            length,
-            direction,
-        ) catch |err| {
-            return switch (err) {
-                error.InvalidState => KernelError.InvalidState,
-                error.TableFull => KernelError.TableFull,
-                else => KernelError.InvalidState,
-            };
-        };
-        const mapping = self.dma_mappings.findByToken(token) orelse return KernelError.InvalidState;
-        self.syncIommuForDmaMapping(mapping.*, .grant_dma) catch |err| {
-            _ = self.dma_mappings.remove(token);
-            return err;
-        };
-        return token;
-    }
-
-    pub fn dmaMapFindStage1(self: *const KernelState, token: u64) ?*const DmaMapping {
-        return self.dma_mappings.findByToken(token);
-    }
-
-    pub fn dmaMapSetStateStage1(
-        self: *KernelState,
-        token: u64,
-        state: DmaMappingState,
-    ) KernelError!void {
-        self.dma_mappings.setState(token, state) catch |err| switch (err) {
-            error.NotFound => return KernelError.CapabilityNotFound,
-            error.InvalidState => return KernelError.InvalidState,
-            error.TableFull => return KernelError.TableFull,
-            error.Denied => return KernelError.InvalidState,
-        };
-    }
-
-    pub fn dmaMapReleaseStage1(self: *KernelState, token: u64) KernelError!void {
-        const mapping = (self.dma_mappings.findByToken(token) orelse return KernelError.CapabilityNotFound).*;
-        self.dma_mappings.release(token) catch |err| switch (err) {
-            error.NotFound => return KernelError.CapabilityNotFound,
-            error.InvalidState => return KernelError.InvalidState,
-            error.TableFull => return KernelError.TableFull,
-            error.Denied => return KernelError.InvalidState,
-        };
-        try self.syncIommuForDmaMapping(mapping, .revoke);
-    }
-
-    pub fn dmaBindDeviceDomainStage1(
-        self: *KernelState,
-        device: DmaDeviceId,
-        domain_id: u32,
-    ) KernelError!void {
-        self.dma_device_domains.bind(device, domain_id) catch |err| switch (err) {
-            error.TableFull => return KernelError.TableFull,
-            error.Denied => return KernelError.InvalidState,
-            error.InvalidState => return KernelError.InvalidState,
-            error.NotFound => return KernelError.CapabilityNotFound,
-        };
-    }
-
-    pub fn dmaDeviceDomainStage1(self: *const KernelState, device: DmaDeviceId) ?u32 {
-        return self.dma_device_domains.domainFor(device);
-    }
-
     pub fn getRegion(self: *KernelState, region_id: u64) ?*Region {
         var i: usize = 0;
         while (i < self.region_len) : (i += 1) {
@@ -4359,7 +3853,6 @@ pub const KernelState = struct {
 
     pub fn bumpEndpointGeneration(self: *KernelState) void {
         self.endpoint_generation +%= 1;
-        endpoint_generation_fast_mirror = self.endpoint_generation;
     }
 
     pub fn installEndpoint(
@@ -4413,16 +3906,6 @@ pub const KernelState = struct {
         return removed;
     }
 
-    pub fn getIpcBufferTable(self: *KernelState, principal: PrincipalId) *IpcBufferCNode {
-        if (processIndexFromPrincipal(principal)) |index| return self.ipcBufferTableForProcessIndex(index);
-        return &self.ipc_buffer_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getIpcBufferTableConst(self: *const KernelState, principal: PrincipalId) *const IpcBufferCNode {
-        if (processIndexFromPrincipal(principal)) |index| return self.ipcBufferTableForProcessIndexConst(index);
-        return &self.ipc_buffer_tables[self.principalStorageIndex(principal)];
-    }
-
     pub fn endpointTargetFor(self: *const KernelState, owner: PrincipalId, endpoint_id: u64) ?PrincipalId {
         if (!self.hasActivePrincipal(owner)) return null;
         return self.endpointTargetForKnownActiveOwner(owner, endpoint_id);
@@ -4438,139 +3921,6 @@ pub const KernelState = struct {
             return ep.target;
         }
         return null;
-    }
-
-    pub fn createIpcBufferFromPage(
-        self: *KernelState,
-        owner: PrincipalId,
-        paddr: u64,
-        rights: IpcBufferRights,
-        role: IpcBufferRole,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-        const page_cap = self.getTableConst(owner).find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (rights.read and !page_cap.rights.cpu_read) return KernelError.InvalidState;
-        if (rights.write and !page_cap.rights.cpu_write) return KernelError.InvalidState;
-        if (rights.map and !(page_cap.rights.cpu_read or page_cap.rights.cpu_write)) return KernelError.InvalidState;
-        if (rights.grant and !page_cap.rights.grant) return KernelError.InvalidState;
-
-        const root_id = self.allocCapId();
-        try self.getIpcBufferTable(owner).add(.{
-            .paddr = paddr,
-            .rights = rights,
-            .role = role,
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        return root_id;
-    }
-
-    pub fn installTrustedIpcBufferFromPage(
-        self: *KernelState,
-        owner: PrincipalId,
-        paddr: u64,
-        rights: IpcBufferRights,
-        role: IpcBufferRole,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(owner);
-
-        const root_id = self.allocCapId();
-        try self.getIpcBufferTable(owner).add(.{
-            .paddr = paddr,
-            .rights = rights,
-            .role = role,
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        return root_id;
-    }
-
-    pub fn grantIpcBufferCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        cap_id: u64,
-        rights: IpcBufferRights,
-    ) KernelError!u64 {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-        const src_cap = self.getIpcBufferTableConst(from).findByCapId(cap_id) orelse return KernelError.CapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        if (!isIpcBufferRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-
-        const child_id = self.allocCapId();
-        try self.getIpcBufferTable(to).add(.{
-            .paddr = src_cap.paddr,
-            .rights = rights,
-            .role = src_cap.role,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-        return child_id;
-    }
-
-    pub fn moveIpcBufferCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        cap_id: u64,
-        rights: IpcBufferRights,
-    ) KernelError!u64 {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-        const src_cap = self.getIpcBufferTableConst(from).findByCapId(cap_id) orelse return KernelError.CapabilityNotFound;
-        if (!isIpcBufferRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-
-        const moved = IpcBufferCapability{
-            .paddr = src_cap.paddr,
-            .rights = rights,
-            .role = src_cap.role,
-            .cap_id = src_cap.cap_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.parent_cap_id,
-        };
-        try self.getIpcBufferTable(to).add(moved);
-        _ = self.getIpcBufferTable(from).removeByCapId(cap_id);
-        return moved.cap_id;
-    }
-
-    pub fn grantIpcBufferCapOnEndpoint(
-        self: *KernelState,
-        from: PrincipalId,
-        endpoint_id: u64,
-        cap_id: u64,
-        rights: IpcBufferRights,
-    ) KernelError!u64 {
-        try self.requireActiveProcess(from);
-        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        return self.grantIpcBufferCap(from, target, cap_id, rights);
-    }
-
-    pub fn shareIpcBufferCapOnEndpoint(
-        self: *KernelState,
-        from: PrincipalId,
-        endpoint_id: u64,
-        cap_id: u64,
-        rights: IpcBufferRights,
-    ) KernelError!void {
-        try self.requireActiveProcess(from);
-        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        const src_cap = self.getIpcBufferTableConst(from).findByCapId(cap_id) orelse return KernelError.CapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        if (!isIpcBufferRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-        try self.ipcBufferMailboxForPrincipal(target).push(.{
-            .transfer_id = self.allocTransferId(),
-            .sender = from,
-            .endpoint_id = endpoint_id,
-            .cap_id = cap_id,
-            .rights = rights,
-            .retain_sender = true,
-        });
     }
 
     fn debugWriteField(
@@ -4593,22 +3943,17 @@ pub const KernelState = struct {
         where: []const u8,
     ) void {
         var page_caps_total: u64 = 0;
-        var ipc_caps_total: u64 = 0;
         var active_total: u64 = 0;
 
         var pidx: usize = 0;
         while (pidx < self.process_capacity) : (pidx += 1) {
             const page_table = self.capTableForProcessIndexConst(pidx);
-            const ipc_table = self.ipcBufferTableForProcessIndexConst(pidx);
             page_caps_total += @intCast(page_table.len);
-            ipc_caps_total += @intCast(ipc_table.len);
             if ((self.processDescriptorSlotConst(pidx) orelse continue).active) active_total += 1;
         }
 
         const device_page_table = &self.cap_tables[process_count];
-        const device_ipc_table = &self.ipc_buffer_tables[process_count];
         page_caps_total += @intCast(device_page_table.len);
-        ipc_caps_total += @intCast(device_ipc_table.len);
 
         write("Kernel.mem_diag where=");
         write(where);
@@ -4622,15 +3967,13 @@ pub const KernelState = struct {
         debugWriteField(write, print_number, "vm_store_next", @intCast(vmo_backing_page_store_next));
         debugWriteField(write, print_number, "vm_store_free_pages", vmObjectBackingFreePageCount());
         debugWriteField(write, print_number, "vm_store_free_ranges", @intCast(vmo_backing_page_store_free_range_len));
-        debugWriteField(write, print_number, "ipc_caps", ipc_caps_total);
         write("\n");
 
         pidx = 0;
         while (pidx < self.process_capacity) : (pidx += 1) {
             const page_table = self.capTableForProcessIndexConst(pidx);
-            const ipc_table = self.ipcBufferTableForProcessIndexConst(pidx);
             const desc = self.processDescriptorSlotConst(pidx) orelse continue;
-            if (!desc.active and page_table.len == 0 and ipc_table.len == 0) continue;
+            if (!desc.active and page_table.len == 0) continue;
 
             write("Kernel.mem_diag.proc");
             debugWriteField(write, print_number, "idx", @intCast(pidx));
@@ -4638,17 +3981,15 @@ pub const KernelState = struct {
             write(" label=");
             write(desc.label);
             debugWriteField(write, print_number, "page_caps", @intCast(page_table.len));
-            debugWriteField(write, print_number, "ipc_caps", @intCast(ipc_table.len));
             write("\n");
         }
 
-        if (device_page_table.len != 0 or device_ipc_table.len != 0) {
+        if (device_page_table.len != 0) {
             write("Kernel.mem_diag.proc");
             debugWriteField(write, print_number, "idx", @intCast(process_count));
             debugWriteField(write, print_number, "active", 1);
             write(" label=Device0");
             debugWriteField(write, print_number, "page_caps", @intCast(device_page_table.len));
-            debugWriteField(write, print_number, "ipc_caps", @intCast(device_ipc_table.len));
             write("\n");
         }
     }
@@ -4684,495 +4025,6 @@ pub const KernelState = struct {
         }
         const page_bytes: [*]u8 = @ptrFromInt(paddr);
         @memset(page_bytes[0..4096], 0);
-    }
-
-    pub fn reclaimScannedExclusiveRootPage(
-        self: *KernelState,
-        owner: PrincipalId,
-        paddr: u64,
-        free_list: *FreePageList,
-    ) KernelError!void {
-        if (!free_list.canAppendPage(0, paddr)) return KernelError.TooManyFreeRanges;
-        const table = self.getTable(owner);
-        try table.removeExclusiveRootByPaddr(paddr);
-        _ = self.removeDmaMappingsForPrincipalPaddr(owner, paddr);
-        try device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke);
-        try free_list.appendPage(0, paddr);
-    }
-
-    pub fn releasePrincipalPageCaps(
-        self: *KernelState,
-        owner: PrincipalId,
-        free_list: *FreePageList,
-    ) void {
-        const table = self.getTable(owner);
-        const sync_ptes = self.hasActivePrincipal(owner);
-        rebuildPageCapRefsExcluding(self, owner);
-        var free_run_start: u64 = 0;
-        var free_run_len: usize = 0;
-        const flushFreeRun = struct {
-            fn call(list: *FreePageList, start: *u64, len: *usize) void {
-                if (len.* == 0) return;
-                list.appendContiguousRange(0, start.*, len.*) catch {};
-                start.* = 0;
-                len.* = 0;
-            }
-        }.call;
-
-        const inline_limit = @min(table.len, CNode.inline_caps);
-        var index: usize = 0;
-        while (index < inline_limit) : (index += 1) {
-            self.releasePrincipalPageCap(owner, table.caps[index], sync_ptes, free_list, &free_run_start, &free_run_len, false);
-        }
-
-        var remaining = table.len - inline_limit;
-        var chunk_index = table.overflow_head;
-        while (remaining > 0 and chunk_index != CNode.invalid_chunk) {
-            const chunk = &cap_chunk_pool[chunk_index];
-            const chunk_limit = @min(remaining, CNode.chunk_caps);
-            index = 0;
-            while (index < chunk_limit) : (index += 1) {
-                self.releasePrincipalPageCap(owner, chunk.caps[index], sync_ptes, free_list, &free_run_start, &free_run_len, false);
-            }
-            remaining -= chunk_limit;
-            chunk_index = chunk.next;
-        }
-        flushFreeRun(free_list, &free_run_start, &free_run_len);
-        table.resetStorageOnly();
-    }
-
-    fn releasePrincipalPageCap(
-        self: *KernelState,
-        owner: PrincipalId,
-        cap: Capability,
-        sync_ptes: bool,
-        free_list: *FreePageList,
-        free_run_start: *u64,
-        free_run_len: *usize,
-        update_ref_table: bool,
-    ) void {
-        const paddr = cap.paddr;
-        if (cap.rights.dma) {
-            if (self.removeDmaMappingsForPrincipalPaddr(owner, paddr)) {
-                device_capabilities.syncIommuForPrincipalPaddr(self, owner, paddr, .revoke) catch {};
-            }
-        }
-        if (sync_ptes) {
-            if (self.pte_sync_hook) |hook| {
-                callPteSyncHook(hook, self, owner, paddr);
-            }
-        }
-        if (update_ref_table) trackPageCapRemoved(cap);
-        if (pageCapRefCount(paddr) == 0) {
-            const expected = free_run_start.* + @as(u64, @intCast(free_run_len.*)) * 4096;
-            if (free_run_len.* != 0 and paddr == expected) {
-                free_run_len.* += 1;
-            } else {
-                if (free_run_len.* != 0) {
-                    free_list.appendContiguousRange(0, free_run_start.*, free_run_len.*) catch {};
-                }
-                free_run_start.* = paddr;
-                free_run_len.* = 1;
-            }
-        }
-    }
-
-    pub fn installCap(
-        self: *KernelState,
-        owner: PrincipalId,
-        paddr: u64,
-        rights: Rights,
-    ) KernelError!void {
-        if (!self.hasActivePrincipal(owner)) return KernelError.InvalidState;
-        if (self.getTableConst(owner).find(paddr) != null) return;
-        const root_id = self.allocCapId();
-        try self.getTable(owner).add(.{
-            .paddr = paddr,
-            .rights = rights,
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        });
-        if (self.pte_sync_hook) |hook| {
-            callPteSyncHook(hook, self, owner, paddr);
-        }
-    }
-
-    pub fn moveCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        paddr: u64,
-        rights: Rights,
-    ) KernelError!void {
-        if (from == to) return KernelError.InvalidState;
-        if (to == .Device0 and (rights.cpu_read or rights.cpu_write or !rights.dma)) return KernelError.InvalidState;
-        if (!self.hasActivePrincipal(from) or !self.hasActivePrincipal(to)) return KernelError.InvalidState;
-
-        const src = self.getTable(from);
-        const src_cap = src.find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-        if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
-
-        var moved = src_cap.*;
-        moved.rights = rights;
-        _ = src.removeByPaddr(paddr);
-        try self.getTable(to).add(moved);
-        _ = self.removeDmaMappingsForPrincipalPaddr(from, paddr);
-        try device_capabilities.syncIommuForPrincipalPaddr(self, from, paddr, .move_from);
-        try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, .move_to);
-        if (self.pte_sync_hook) |hook| {
-            callPteSyncHook(hook, self, from, paddr);
-            callPteSyncHook(hook, self, to, paddr);
-        }
-    }
-
-    pub fn grantCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        paddr: u64,
-        rights: Rights,
-    ) KernelError!void {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-        if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
-
-        const child_id = self.allocCapId();
-        try self.getTable(to).addAssumeFresh(.{
-            .paddr = paddr,
-            .rights = rights,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-        try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
-        if (self.pte_sync_hook) |hook| {
-            if (!capability.principalHasMappedPaddr(to, paddr)) return;
-            callPteSyncHook(hook, self, to, paddr);
-        }
-    }
-
-    pub fn grantCapToFreshUnmappedProcess(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        paddr: u64,
-        rights: Rights,
-    ) KernelError!void {
-        // For spawn-time bootstrap pages the child has just been created and the
-        // target paddr is not mapped yet, so non-DMA grants do not need IOMMU or
-        // PTE synchronization scans.
-        if (rights.dma) return KernelError.InvalidState;
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-        if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
-
-        const child_id = self.allocCapId();
-        try self.getTable(to).addAssumeFresh(.{
-            .paddr = paddr,
-            .rights = rights,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-    }
-
-    pub fn deriveCapForSharedAddressSpace(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        paddr: u64,
-        rights: Rights,
-    ) KernelError!void {
-        if (rights.dma) return KernelError.InvalidState;
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-        if (self.getTableConst(to).find(paddr)) |dst_cap| {
-            if (isRightsSubset(rights, dst_cap.rights)) return;
-            var upgraded = dst_cap.*;
-            upgraded.rights.cpu_read = upgraded.rights.cpu_read or rights.cpu_read;
-            upgraded.rights.cpu_write = upgraded.rights.cpu_write or rights.cpu_write;
-            upgraded.rights.dma = upgraded.rights.dma or rights.dma;
-            upgraded.rights.grant = upgraded.rights.grant or rights.grant;
-            if (!isRightsSubset(upgraded.rights, src_cap.rights)) return KernelError.InvalidState;
-            _ = self.getTable(to).removeByPaddr(paddr);
-            try self.getTable(to).addAssumeFresh(upgraded);
-            return;
-        }
-
-        const child_id = self.allocCapId();
-        try self.getTable(to).addAssumeFresh(.{
-            .paddr = paddr,
-            .rights = rights,
-            .cap_id = child_id,
-            .root_cap_id = src_cap.root_cap_id,
-            .parent_cap_id = src_cap.cap_id,
-        });
-    }
-
-    pub fn grantCapsBatch(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        paddrs: []const u64,
-        rights: Rights,
-    ) KernelError!void {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-        if (paddrs.len == 0) return KernelError.InvalidState;
-        var i: usize = 0;
-        while (i < paddrs.len) : (i += 1) {
-            const paddr = paddrs[i];
-            const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-            if (!src_cap.rights.grant) return KernelError.InvalidState;
-            if (!isRightsSubset(rights, src_cap.rights)) return KernelError.InvalidState;
-            if (self.getTable(to).find(paddr) != null) return KernelError.InvalidState;
-        }
-        const saved_audit_hook = self.iommu_audit_hook;
-        self.iommu_audit_hook = null;
-        defer {
-            self.iommu_audit_hook = saved_audit_hook;
-        }
-
-        i = 0;
-        while (i < paddrs.len) : (i += 1) {
-            const paddr = paddrs[i];
-            const src_cap = self.getTableConst(from).find(paddr).?;
-            const child_id = self.allocCapId();
-            try self.getTable(to).add(.{
-                .paddr = paddr,
-                .rights = rights,
-                .cap_id = child_id,
-                .root_cap_id = src_cap.root_cap_id,
-                .parent_cap_id = src_cap.cap_id,
-            });
-            try device_capabilities.syncIommuForPrincipalPaddr(self, to, paddr, if (rights.dma) .grant_dma else .grant_no_dma);
-        }
-    }
-
-    pub fn grantCapOnEndpoint(
-        self: *KernelState,
-        from: PrincipalId,
-        endpoint_id: u64,
-        paddr: u64,
-        rights: Rights,
-    ) KernelError!void {
-        try self.requireActiveProcess(from);
-        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        try self.grantCap(from, target, paddr, rights);
-    }
-
-    pub fn grantCapsBatchOnEndpoint(
-        self: *KernelState,
-        from: PrincipalId,
-        endpoint_id: u64,
-        paddrs: []const u64,
-        rights: Rights,
-    ) KernelError!void {
-        try self.requireActiveProcess(from);
-        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        try self.grantCapsBatch(from, target, paddrs, rights);
-    }
-
-    pub fn sendCap(
-        self: *KernelState,
-        from: PrincipalId,
-        to: PrincipalId,
-        paddr: u64,
-    ) KernelError!void {
-        if (from == to) return KernelError.InvalidState;
-        try self.requireActiveProcess(from);
-        try self.requireActiveProcess(to);
-
-        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-        try self.moveCap(from, to, paddr, src_cap.rights);
-    }
-
-    pub fn sendCapOnEndpoint(
-        self: *KernelState,
-        from: PrincipalId,
-        endpoint_id: u64,
-        paddr: u64,
-    ) KernelError!void {
-        try self.requireActiveProcess(from);
-        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-        try self.capMailboxForPrincipal(target).push(.{
-            .transfer_id = self.allocTransferId(),
-            .sender = from,
-            .endpoint_id = endpoint_id,
-            .paddr = paddr,
-            .rights = src_cap.rights,
-            .retain_sender = false,
-        });
-    }
-
-    pub fn shareCapOnEndpoint(
-        self: *KernelState,
-        from: PrincipalId,
-        endpoint_id: u64,
-        paddr: u64,
-    ) KernelError!void {
-        try self.requireActiveProcess(from);
-        const target = self.endpointTargetFor(from, endpoint_id) orelse return KernelError.EndpointNotFound;
-        const src_cap = self.getTableConst(from).find(paddr) orelse return KernelError.CapabilityNotFound;
-        if (!src_cap.rights.grant) return KernelError.InvalidState;
-        try self.capMailboxForPrincipal(target).push(.{
-            .transfer_id = self.allocTransferId(),
-            .sender = from,
-            .endpoint_id = endpoint_id,
-            .paddr = paddr,
-            .rights = src_cap.rights,
-            .retain_sender = true,
-        });
-    }
-
-    pub fn recvCap(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
-        try self.requireActiveProcess(receiver);
-        const pending_slot = self.pendingPageTransferForPrincipal(receiver);
-        if (pending_slot.*) |pending| {
-            return pending.transfer_id;
-        }
-        const received = self.capMailboxForPrincipal(receiver).pop() orelse return KernelError.MailboxEmpty;
-        pending_slot.* = received;
-        return received.transfer_id;
-    }
-
-    pub fn recvIpcBufferTransfer(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
-        try self.requireActiveProcess(receiver);
-        const pending_slot = self.pendingIpcBufferTransferForPrincipal(receiver);
-        if (pending_slot.*) |pending| {
-            return pending.transfer_id;
-        }
-        const received = self.ipcBufferMailboxForPrincipal(receiver).pop() orelse return KernelError.MailboxEmpty;
-        pending_slot.* = received;
-        return received.transfer_id;
-    }
-
-    pub fn recvAnyCapTransfer(self: *KernelState, receiver: PrincipalId) KernelError!u64 {
-        return self.recvCap(receiver) catch |page_err| switch (page_err) {
-            KernelError.MailboxEmpty => self.recvIpcBufferTransfer(receiver),
-            else => page_err,
-        };
-    }
-
-    pub fn acceptCapTransfer(self: *KernelState, receiver: PrincipalId, transfer_id: u64) KernelError!u64 {
-        try self.requireActiveProcess(receiver);
-        const pending_slot = self.pendingPageTransferForPrincipal(receiver);
-        const pending = pending_slot.* orelse return KernelError.MailboxEmpty;
-        if (pending.transfer_id != transfer_id) return KernelError.InvalidState;
-        if (pending.retain_sender) {
-            try self.grantCap(pending.sender, receiver, pending.paddr, pending.rights);
-        } else {
-            try self.moveCap(pending.sender, receiver, pending.paddr, pending.rights);
-        }
-        pending_slot.* = null;
-        return pending.paddr;
-    }
-
-    pub fn acceptIpcBufferTransfer(self: *KernelState, receiver: PrincipalId, transfer_id: u64) KernelError!u64 {
-        try self.requireActiveProcess(receiver);
-        const pending_slot = self.pendingIpcBufferTransferForPrincipal(receiver);
-        const pending = pending_slot.* orelse return KernelError.MailboxEmpty;
-        if (pending.transfer_id != transfer_id) return KernelError.InvalidState;
-        const child_id = if (pending.retain_sender)
-            try self.grantIpcBufferCap(pending.sender, receiver, pending.cap_id, pending.rights)
-        else
-            try self.moveIpcBufferCap(pending.sender, receiver, pending.cap_id, pending.rights);
-        pending_slot.* = null;
-        return child_id;
-    }
-
-    pub fn revokeCapTree(
-        self: *KernelState,
-        owner: PrincipalId,
-        paddr: u64,
-    ) KernelError!void {
-        try self.requireActiveProcess(owner);
-        const start_cap = self.getTableConst(owner).find(paddr) orelse return KernelError.CapabilityNotFound;
-        const start_id = start_cap.cap_id;
-
-        const queue = &self.revoke_queue;
-        var queue_len: usize = 0;
-        var queue_head: usize = 0;
-        queue[0] = start_id;
-        queue_len = 1;
-
-        const subtree = &self.revoke_subtree;
-        var subtree_len: usize = 0;
-
-        while (queue_head < queue_len) : (queue_head += 1) {
-            const current_id = queue[queue_head];
-            var already_in_subtree = false;
-            var chk: usize = 0;
-            while (chk < subtree_len) : (chk += 1) {
-                if (subtree[chk] == current_id) {
-                    already_in_subtree = true;
-                    break;
-                }
-            }
-            if (already_in_subtree) continue;
-            if (subtree_len >= self.revoke_subtree.len) return KernelError.RevokeOverflow;
-            subtree[subtree_len] = current_id;
-            subtree_len += 1;
-
-            var pidx: usize = 0;
-            while (pidx < self.process_capacity) : (pidx += 1) {
-                const table = self.capTableForProcessIndexConst(pidx);
-                var i: usize = 0;
-                while (i < table.len) : (i += 1) {
-                    const cap = table.get(i) orelse break;
-                    if (cap.parent_cap_id != current_id) continue;
-                    var known = false;
-                    var q: usize = 0;
-                    while (q < queue_len) : (q += 1) {
-                        if (queue[q] == cap.cap_id) {
-                            known = true;
-                            break;
-                        }
-                    }
-                    if (known) continue;
-                    if (queue_len >= self.revoke_queue.len) return KernelError.RevokeOverflow;
-                    queue[queue_len] = cap.cap_id;
-                    queue_len += 1;
-                }
-            }
-        }
-
-        var s: usize = 0;
-        while (s < subtree_len) : (s += 1) {
-            const cap_id = subtree[s];
-            var pidx: usize = 0;
-            while (pidx < self.process_capacity) : (pidx += 1) {
-                const table = self.capTableForProcessIndex(pidx);
-                const cap = table.findByCapId(cap_id) orelse continue;
-                const removed_paddr = cap.paddr;
-                _ = table.removeByCapId(cap_id);
-                const principal = processPrincipal(pidx);
-                _ = self.removeDmaMappingsForPrincipalPaddr(principal, removed_paddr);
-                try device_capabilities.syncIommuForPrincipalPaddr(self, principal, removed_paddr, .revoke);
-                if (self.pte_sync_hook) |hook| {
-                    callPteSyncHook(hook, self, principal, removed_paddr);
-                }
-                break;
-            }
-        }
     }
 };
 

@@ -40,7 +40,6 @@ var cpu_states: [max_cpus]u32 = [_]u32{cpu_state_absent} ** max_cpus;
 var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
 var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
-var lstar_entries: [max_cpus]usize = [_]usize{0} ** max_cpus;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -58,17 +57,12 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_lapic_ids), &runtime_lapic_ids));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_vector), &ap_user_timer_vector));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_initial_count), &ap_user_timer_initial_count));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lstar_entries), &lstar_entries));
     return end;
 }
 
 pub fn configureApUserTimer(timer_vector: u8, initial_count: u32) void {
     ap_user_timer_vector = timer_vector;
     ap_user_timer_initial_count = initial_count;
-}
-
-pub fn configureLstarEntries(entries: [max_cpus]usize) void {
-    lstar_entries = entries;
 }
 
 fn stateFromRaw(raw: u32) CpuState {
@@ -523,9 +517,6 @@ fn apIdleEntry(cpu_slot: usize) callconv(.c) noreturn {
     x86_platform.loadInterruptTableForCurrentCpu();
     _ = x86_platform.enablePcidIfSupported();
     _ = x86_platform.enablePkuIfSupported();
-    if (cpu_slot < lstar_entries.len and lstar_entries[cpu_slot] != 0) {
-        x86_platform.installSyscallEntry(lstar_entries[cpu_slot]);
-    }
     _ = lapic.enableLocalApic();
     runtimeLapicIdPtr(cpu_slot).* = lapic.localApicId();
     cpuStatePtr(cpu_slot).* = cpu_state_idle;

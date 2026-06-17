@@ -5,7 +5,6 @@ pub const version: u64 = 1;
 pub const page_va: u64 = process_abi.auxPageVa(5);
 pub const max_entries: usize = 8;
 pub const dynamic_endpoint_id_base: u64 = 0x80;
-pub const syscall_publish_service_endpoint: u64 = 0x33;
 pub const service_flag_process_slot_compat: u64 = 1 << 0;
 
 pub const ServiceKind = enum(u64) {

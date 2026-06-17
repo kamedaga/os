@@ -1,18 +1,14 @@
 pub const fd_table_entries: u32 = 256;
 pub const first_dynamic_fd: u32 = 16;
 
-pub const syscall_fd_first: u64 = 0x100;
-pub const syscall_fd_close: u64 = 0x100;
-pub const syscall_fd_dup: u64 = 0x101;
-pub const syscall_fd_replace: u64 = 0x102;
-pub const syscall_fd_get_info: u64 = 0x103;
-pub const syscall_fd_set_flags: u64 = 0x104;
-pub const syscall_fd_wait: u64 = 0x105;
-pub const syscall_fd_poll: u64 = 0x106;
-pub const syscall_vmo_create: u64 = 0x107;
-pub const syscall_vmo_from_current_pages: u64 = 0x108;
-pub const syscall_mmap: u64 = 0x109;
-pub const syscall_munmap: u64 = 0x10A;
+pub const syscall_fd_first: u64 = 14;
+pub const syscall_fd_close: u64 = 14;
+pub const syscall_fd_dup: u64 = 15;
+pub const syscall_fd_get_info: u64 = 16;
+pub const syscall_fd_set_flags: u64 = 17;
+pub const syscall_vmo_create: u64 = 18;
+pub const syscall_mmap: u64 = 19;
+pub const syscall_munmap: u64 = 20;
 pub const syscall_fd_last: u64 = syscall_munmap;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -70,10 +66,12 @@ pub const mmap_pkey_shift: u64 = 8;
 pub const mmap_pkey_mask: u64 = 0xF << mmap_pkey_shift;
 
 pub const fd_kind_none: u64 = 0;
-pub const fd_kind_vmo: u64 = 6;
-pub const fd_kind_endpoint: u64 = 7;
-pub const fd_kind_channel: u64 = 8;
-pub const fd_kind_reply: u64 = 9;
+pub const fd_kind_process: u64 = 1;
+pub const fd_kind_thread: u64 = 2;
+pub const fd_kind_vmo: u64 = 4;
+pub const fd_kind_endpoint: u64 = 5;
+pub const fd_kind_channel: u64 = 6;
+pub const fd_kind_reply: u64 = 7;
 
 pub const fd_info_kind_offset: u64 = 0;
 pub const fd_info_rights_offset: u64 = 8;

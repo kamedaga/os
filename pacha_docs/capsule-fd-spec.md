@@ -7,19 +7,21 @@ tags:
   - phase0
 ---
 
-# Capsule FD Spec Draft
+# Capsule FD Spec
 
 ## 目的
 
 capsule を fd-based object model に統合する。
 
-`capsule token` を直接 userland が扱う設計から、device authority を fd として扱う設計へ移行する。
+`capsule token` を直接 userland が扱う設計をやめ、device authority を fd として扱う。
+
+Phase 6 では kernel 内部 authority も token table ではなく fd object payload と per-fd rights に寄せる。旧 capsule token は互換対象ではない。
 
 ```text
 Device fd = hardware authority
 ```
 
-driver と kobox backend は syscall を直接叩かず、`libcapsule` を使う。
+driver と将来の kobox backend は syscall を直接叩かず、`libcapsule` を使う。
 
 ## Object
 
@@ -34,17 +36,16 @@ Irq fd
 EventQueue fd
 ```
 
-旧 capsule kind との対応。
+fd object の対応。
 
-| 旧 CapsuleKind | 新 fd object |
+| fd object | 意味 |
 |---|---|
-| `session` | `Device` or service `Channel` |
-| `device` | `Device fd` |
-| `mmio` | `MmioRegion fd` |
-| `dma_buffer` | `DmaBuffer fd` |
-| `dma_mapping` | `DmaMapping fd` |
-| `irq` | `Irq fd` |
-| `event_queue` | `EventQueue fd` or `Event fd` |
+| `Device fd` | PCI/device authority |
+| `MmioRegion fd` | derived MMIO mapping authority |
+| `DmaBuffer fd` | CPU-visible DMA buffer authority |
+| `DmaMapping fd` | device-visible IOVA mapping authority |
+| `Irq fd` | interrupt wait/ack authority |
+| `EventQueue fd` | later event queue authority |
 
 ## Rights
 
@@ -115,9 +116,9 @@ device が memory に書くには `DMA_WRITE` が必要。
 
 userland が buffer に書くには `CPU_WRITE` が必要。
 
-## Syscall 案
+## Syscall
 
-kernel syscall は fd object operation として提供する。
+kernel syscall は fd object operation として提供する。番号は既存 `syscall_capsule_*` range を再利用するが、意味論は token ではなく fd である。
 
 ```text
 device_query(device_fd, out_info)
@@ -139,7 +140,7 @@ irq_ack(irq_fd)
 
 `mmio_mmap` と `dma_buffer_mmap` は汎用 `mmap(fd)` に統合してもよい。
 
-Phase 0 で、device object 固有 syscall と汎用 mmap の境界を決める。
+現在の Phase 6 実装では `device_derive_mmio(device_fd, bar, user_va, size, flags)` が mapping と `MmioRegion fd` 作成を同時に行う。後で `mmap(mmio_fd)` に分ける余地は残すが、userland から token は見せない。
 
 ## libcapsule
 
@@ -147,13 +148,17 @@ driver / kobox backend は `libcapsule` を使う。
 
 `libcapsule` は C で実装し、C ABI として提供する。PachaOS native userland、musl backend、kobox PachaOS backend から同じ header を使えるようにする。
 
+`libcapsule` 自体は inline syscall asm を持たず、低レベル syscall entry は `libpacha` に集約する。これにより capsule API は hardware authority の意味論に集中し、`syscall` / `sysret` の ABI 詳細を driver や kobox backend へ漏らさない。
+
 kobox については README の kobox セクションを入口にし、現在の PachaOS Capsule backend が要求している device access をこの fd API に置き換える。
+
+ただし kobox daemon 起動は init / supervision の修正を伴うため Phase 6 では行わない。musl native backend が入る Phase 7 以降に、device fd bootstrap と daemon IPC protocol を実装する。
 
 目標。
 
 - kobox backend は `Device fd` から MMIO / DMA / IRQ / PCI config を派生する
 - kobox backend は capsule token を直接扱わない
-- kobox modules は driver daemon として起動し、必要な device fd を bootstrap / IPC で受け取る
+- kobox modules は Phase 7 以降に driver daemon として起動し、必要な device fd を bootstrap / IPC で受け取る
 - kobox daemon と FS / block / net / input service の連携は `libipc` で行う
 - 既存の PachaOS 専用 driver は、kobox で置換できるものから段階的に退役させる
 
@@ -180,28 +185,27 @@ int capsule_irq_ack(int irq_fd);
 
 | 旧 syscall | 新 API |
 |---|---|
-| `syscall_capsule_query` | `device_query` / `capsule_query` |
-| `syscall_capsule_derive_mmio` | `device_derive_mmio` |
-| `syscall_capsule_derive_dma_buffer` | `device_derive_dma_buffer` |
-| `syscall_capsule_derive_dma_mapping` | `device_derive_dma_mapping` |
-| `syscall_capsule_derive_dma_mapping_from_buffer` | `device_derive_dma_mapping` |
-| `syscall_capsule_derive_irq` | `device_derive_irq` |
-| `syscall_capsule_grant` | fd passing with rights attenuation |
-| `syscall_capsule_revoke` | fd close / selective revoke |
-| `syscall_capsule_close` | `fd_close` |
-| `syscall_capsule_pci_config_read` | `device_pci_config_read` |
-| `syscall_capsule_pci_config_write` | `device_pci_config_write` |
-| `syscall_capsule_pci_bar_info` | `device_pci_bar_info` |
-| `syscall_capsule_irq_poll` | `irq_wait` / `fd_poll` |
+| `syscall_capsule_query` | `device_query` / `capsule_query(fd)` |
+| `syscall_capsule_derive_mmio` | `device_derive_mmio(device_fd)` -> `MmioRegion fd` |
+| `syscall_capsule_derive_dma_buffer` | `device_derive_dma_buffer(device_fd)` -> `DmaBuffer fd` |
+| `syscall_capsule_derive_dma_mapping` | `device_derive_dma_mapping(device_fd)` -> `DmaMapping fd` |
+| `syscall_capsule_derive_dma_mapping_from_buffer` | `device_derive_dma_mapping(dma_buffer_fd)` -> `DmaMapping fd` |
+| `syscall_capsule_derive_irq` | `device_derive_irq(device_fd)` -> `Irq fd` |
+| `syscall_capsule_grant` | process fd bootstrap / fd transfer。token grant ではない |
+| `syscall_capsule_revoke` | fd close / later selective revoke |
+| `syscall_capsule_close` | fd close |
+| `syscall_capsule_pci_config_read` | `device_pci_config_read(device_fd)` |
+| `syscall_capsule_pci_config_write` | `device_pci_config_write(device_fd)` |
+| `syscall_capsule_pci_bar_info` | `device_pci_bar_info(device_fd)` |
+| `syscall_capsule_irq_poll` | `irq_wait(irq_fd)` / later `fd_poll` |
 
-## Phase 0 決定事項
+## Phase 6 決定事項
 
-- capsule token と fd の併存期間
-- device discovery を service にするか kernel query にするか
-- MMIO mapping を generic mmap に統合するか
-- DMA buffer を VMO subtype にするか独立 object にするか
-- IOMMU mapping state の最小 API
-- IRQ の ack / mask semantics
-- kobox backend の最小要求 API
-- kobox daemon への device fd bootstrap 方法
-- kobox backend が必要とする `libcapsule` header の安定範囲
+- capsule token と fd は併存させない
+- `KernelState` runtime authority は fd object payload を正とする
+- `Device` / `MmioRegion` / `DmaBuffer` / `DmaMapping` / `Irq` を `KernelObjectKind` にする
+- cleanup は fd object release に寄せる
+- `libcapsule` は C 実装として `userland/libcapsule` に置く
+- raw syscall backend は `libpacha` に置き、`libcapsule` はそれを使う
+- Phase 6 の smoke test は seed を通さず、bootfs の `device-fd-smoke` で初期 device fd と `libcapsule` query を確認する
+- kobox daemon への device fd bootstrap は Phase 7 以降に送る

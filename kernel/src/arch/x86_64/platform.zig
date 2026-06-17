@@ -26,9 +26,6 @@ pub const gdt_kernel_data_selector: u16 = 0x10;
 pub const gdt_user_code_selector: u16 = 0x18;
 pub const gdt_user_data_selector: u16 = 0x20;
 pub const gdt_tss_selector: u16 = 0x28;
-pub const gdt_sysret_user_base_selector: u16 = 0x30;
-pub const gdt_sysret_user_data_selector: u16 = 0x38;
-pub const gdt_sysret_user_code_selector: u16 = 0x40;
 
 pub const page_present: u64 = 1 << 0;
 pub const page_rw: u64 = 1 << 1;
@@ -59,7 +56,6 @@ const Tss = packed struct {
 };
 
 pub const TrapTargets = struct {
-    syscall_stub: usize,
     divide_error_stub: usize,
     page_fault_stub: usize,
     general_protection_stub: usize,
@@ -82,7 +78,7 @@ var high_mmio_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entri
 var high_mmio_pd_tables: [high_mmio_pdp_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_mmio_pdp_table_count;
 pub var phys_copy_window_pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
-const gdt_template: [9]u64 = .{
+const gdt_template: [7]u64 = .{
     0x0000000000000000,
     0x00AF9A000000FFFF,
     0x00AF92000000FFFF,
@@ -90,10 +86,8 @@ const gdt_template: [9]u64 = .{
     0x00CFF2000000FFFF,
     0x0000000000000000,
     0x0000000000000000,
-    0x00CFF2000000FFFF,
-    0x00AFFA000000FFFF,
 };
-var gdt_tables: [max_cpus][9]u64 align(16) = [_][9]u64{gdt_template} ** max_cpus;
+var gdt_tables: [max_cpus][7]u64 align(16) = [_][7]u64{gdt_template} ** max_cpus;
 var ring0_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var pf_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var df_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
@@ -106,7 +100,6 @@ var df_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(409
 var runtime_identity_split_pts: [runtime_identity_split_pt_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** runtime_identity_split_pt_count;
 var runtime_identity_split_pt_used: usize = 0;
 var tss_tables: [max_cpus]Tss = [_]Tss{std.mem.zeroes(Tss)} ** max_cpus;
-var int80_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var de_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var pf_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var gp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
@@ -116,7 +109,6 @@ var ts_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var np_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var ss_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var timer_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
-var int80_trampoline_entry: usize = 0;
 var de_trampoline_entry: usize = 0;
 var pf_trampoline_entry: usize = 0;
 var gp_trampoline_entry: usize = 0;
@@ -169,7 +161,6 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pts), &runtime_identity_split_pts));
     start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
     start = minStaticStart(start, staticStorageStart(@TypeOf(tss_tables), &tss_tables));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(int80_trampoline_page), &int80_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_page), &de_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
@@ -179,7 +170,6 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(np_trampoline_page), &np_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(int80_trampoline_entry), &int80_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
@@ -219,7 +209,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pts), &runtime_identity_split_pts));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tss_tables), &tss_tables));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(int80_trampoline_page), &int80_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_page), &de_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
@@ -229,7 +218,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(np_trampoline_page), &np_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(int80_trampoline_entry), &int80_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
@@ -247,13 +235,14 @@ pub fn kernelStaticStorageEndAddr() usize {
     return end;
 }
 
-const msr_efer: u32 = 0xC000_0080;
-const msr_star: u32 = 0xC000_0081;
-const msr_lstar: u32 = 0xC000_0082;
-const msr_fmask: u32 = 0xC000_0084;
 const msr_ia32_fs_base: u32 = 0xC000_0100;
 const msr_ia32_gs_base: u32 = 0xC000_0101;
+const msr_ia32_efer: u32 = 0xC000_0080;
+const msr_ia32_star: u32 = 0xC000_0081;
+const msr_ia32_lstar: u32 = 0xC000_0082;
+const msr_ia32_fmask: u32 = 0xC000_0084;
 const efer_sce: u64 = 1 << 0;
+const rflags_if: u64 = 1 << 9;
 const cr4_pge: u64 = 1 << 7;
 const cr4_pcide: u64 = 1 << 17;
 const cr4_pke: u64 = 1 << 22;
@@ -379,6 +368,14 @@ pub fn writeGsBase(value: u64) void {
     writeMsr(msr_ia32_gs_base, value);
 }
 
+pub fn enableSyscallEntry(entry: usize) void {
+    const star = (@as(u64, gdt_kernel_code_selector) << 32);
+    writeMsr(msr_ia32_star, star);
+    writeMsr(msr_ia32_lstar, @intCast(entry));
+    writeMsr(msr_ia32_fmask, rflags_if);
+    writeMsr(msr_ia32_efer, readMsr(msr_ia32_efer) | efer_sce);
+}
+
 fn writeU64LEBytes(ptr: [*]u8, offset: usize, value: u64) void {
     var i: usize = 0;
     while (i < 8) : (i += 1) {
@@ -432,7 +429,6 @@ fn buildCr3SwitchTrampoline(page: *[4096]u8, target: usize) usize {
 }
 
 pub fn installInterruptTrampolines(targets: TrapTargets) void {
-    int80_trampoline_entry = buildCr3SwitchTrampoline(&int80_trampoline_page, targets.syscall_stub);
     de_trampoline_entry = buildCr3SwitchTrampoline(&de_trampoline_page, targets.divide_error_stub);
     pf_trampoline_entry = buildCr3SwitchTrampoline(&pf_trampoline_page, targets.page_fault_stub);
     gp_trampoline_entry = buildCr3SwitchTrampoline(&gp_trampoline_page, targets.general_protection_stub);
@@ -458,18 +454,7 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
         const vector: usize = @as(usize, targets.device_interrupt_vector) + @as(usize, device_vector_index);
         interrupts.setIdtEntry(&idt, vector, gdt_kernel_code_selector, targets.device_interrupt_stub, 0x8E);
     }
-    interrupts.setIdtEntry(&idt, 0x80, gdt_kernel_code_selector, int80_trampoline_entry, 0xEE);
     interrupts.loadIdt(&idt);
-}
-
-pub fn installSyscallEntry(target: usize) void {
-    const star = (@as(u64, gdt_sysret_user_base_selector | 0x3) << 48) |
-        (@as(u64, gdt_kernel_code_selector) << 32);
-    const fmask: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18);
-    writeMsr(msr_star, star);
-    writeMsr(msr_lstar, @as(u64, @intCast(target)));
-    writeMsr(msr_fmask, fmask);
-    writeMsr(msr_efer, readMsr(msr_efer) | efer_sce);
 }
 
 pub fn readCr2() u64 {
@@ -671,7 +656,6 @@ fn mapPerCpuKernelStorage() bool {
     if (!mapKernelIdentityRange(@intFromPtr(&ap_df_ist_stacks), @sizeOf(@TypeOf(ap_df_ist_stacks)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&runtime_identity_split_pts), @sizeOf(@TypeOf(runtime_identity_split_pts)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&runtime_identity_split_pt_used), @sizeOf(@TypeOf(runtime_identity_split_pt_used)))) return false;
-    if (!mapKernelIdentityRange(@intFromPtr(&int80_trampoline_page), @sizeOf(@TypeOf(int80_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&pf_trampoline_page), @sizeOf(@TypeOf(pf_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&gp_trampoline_page), @sizeOf(@TypeOf(gp_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&df_trampoline_page), @sizeOf(@TypeOf(df_trampoline_page)))) return false;

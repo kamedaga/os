@@ -138,7 +138,7 @@ enum {
     CAPSULE_RIGHT_POWER = 1ULL << 10,
     CAPSULE_RIGHT_HOTPLUG_OBSERVE = 1ULL << 11,
     CAPSULE_RIGHT_GRANT = 1ULL << 12,
-    CAPSULE_RIGHT_EXEC_SERVICE =
+    DEVICE_FD_RIGHT_EXEC_SERVICE =
         CAPSULE_RIGHT_QUERY |
         CAPSULE_RIGHT_CONFIG_READ |
         CAPSULE_RIGHT_CONFIG_WRITE |
@@ -328,7 +328,7 @@ struct device_catalog_entry {
     u64 queue1_submit_token;
     u64 queue1_notify_token;
     u64 command_token;
-    u64 device_capsule_token;
+    u64 device_fd;
 };
 
 struct device_catalog_page {
@@ -1681,8 +1681,8 @@ static int append_exec_arg(struct exec_bootstrap_config *cfg, u16 *cursor, const
     return 1;
 }
 
-static int is_capsule_token(u64 token) {
-    return (token & CAPSULE_TOKEN_MAGIC_MASK) == CAPSULE_TOKEN_MAGIC_TAG;
+static int is_fd(u64 token) {
+    return token >= 16 && token < 256;
 }
 
 static void format_hex_env(const char *prefix, u64 value, char *buf) {
@@ -1721,17 +1721,17 @@ static u64 ensure_exec_device_catalog_vm_object(void) {
     for (u64 i = 0; i < source_page->entry_count && i < DEVICE_CATALOG_MAX_ENTRIES; i++) {
         volatile struct device_catalog_entry *source = &source_page->entries[i];
         if (source->present == 0 || source->kind != DEVICE_CATALOG_KIND_PCI_FUNCTION) continue;
-        if (!is_capsule_token(source->device_capsule_token)) continue;
+        if (!is_fd(source->device_fd)) continue;
         if (exec_page->entry_count >= DEVICE_CATALOG_MAX_ENTRIES) break;
 
         const u64 granted = syscall3(
             SYSCALL_CAPSULE_GRANT,
-            source->device_capsule_token,
+            source->device_fd,
             g_exec_service_process_slot,
-            CAPSULE_RIGHT_EXEC_SERVICE
+            DEVICE_FD_RIGHT_EXEC_SERVICE
         );
-        if (!is_capsule_token(granted)) {
-            user_log_hex("[seed2_root] device catalog capsule grant to exec failed=", granted);
+        if (!is_fd(granted)) {
+            user_log_hex("[seed2_root] device catalog fd transfer to exec failed=", granted);
             continue;
         }
 
@@ -1741,7 +1741,7 @@ static u64 ensure_exec_device_catalog_vm_object(void) {
         for (u64 word = 0; word < sizeof(struct device_catalog_entry) / sizeof(u64); word++) {
             dest_words[word] = source_words[word];
         }
-        dest->device_capsule_token = granted;
+        dest->device_fd = granted;
     }
 
     if (exec_page->entry_count == 0) return 0;
@@ -1781,7 +1781,7 @@ static int configure_dash_exec_args(struct exec_bootstrap_config *cfg, const cha
     if (exec_catalog != 0 && env_count + 2 <= EXEC_MAX_ENVP) {
         char kobox_env[48];
         char catalog_env[64];
-        format_hex_env("KOBOX_PACHAOS_DEVICE_CAPSULE=", 0, kobox_env);
+        format_hex_env("KOBOX_PACHAOS_DEVICE_FD=", 0, kobox_env);
         format_hex_env("PACHA_EXEC_DEVICE_CATALOG=", exec_catalog, catalog_env);
         if (!append_exec_arg(cfg, &cursor, kobox_env, &cfg->envp_offsets[env_count], &cfg->envp_bytes[env_count])) return 0;
         env_count++;

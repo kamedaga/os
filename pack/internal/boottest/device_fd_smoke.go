@@ -10,21 +10,17 @@ import (
 
 	"capabilityos/pack/internal/config"
 	"capabilityos/pack/internal/qemu"
-	"capabilityos/pack/internal/rootsync"
 )
 
-const (
-	fdIPCSmokeMarker = "[fd_ipc_boot_smoke] OK"
-	sectorBytes      = 512
-)
+const deviceFDSmokeMarker = "[device_fd_boot_smoke] OK"
 
-type FDIPCSmokeOptions struct {
+type DeviceFDSmokeOptions struct {
 	Timeout   time.Duration
 	NoKVM     bool
 	ExtraArgs []string
 }
 
-type FDIPCSmokeResult struct {
+type DeviceFDSmokeResult struct {
 	SmokeELF  string
 	KernelEFI string
 	Disk      string
@@ -35,40 +31,40 @@ type FDIPCSmokeResult struct {
 	Restored  bool
 }
 
-func RunFDIPCSmoke(workspace *config.Workspace, opts FDIPCSmokeOptions) (FDIPCSmokeResult, error) {
+func RunDeviceFDSmoke(workspace *config.Workspace, opts DeviceFDSmokeOptions) (DeviceFDSmokeResult, error) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 30 * time.Second
 	}
-	artifactDir := workspace.Path(workspace.Artifacts, "boot-tests", "fd-ipc-smoke")
+	artifactDir := workspace.Path(workspace.Artifacts, "boot-tests", "device-fd-smoke")
 	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
-		return FDIPCSmokeResult{}, err
+		return DeviceFDSmokeResult{}, err
 	}
 
 	smokeELF := filepath.Join(artifactDir, "INITAPP.ELF")
-	if err := buildSmokeELF(workspace, smokeELF); err != nil {
-		return FDIPCSmokeResult{SmokeELF: smokeELF, Marker: fdIPCSmokeMarker, Timeout: opts.Timeout}, err
+	if err := buildDeviceFDSmokeELF(workspace, smokeELF); err != nil {
+		return DeviceFDSmokeResult{SmokeELF: smokeELF, Marker: deviceFDSmokeMarker, Timeout: opts.Timeout}, err
 	}
 
 	kernelEFI := workspace.Path(workspace.Kernel.Dir, "zig-out", "bin", "EFI", "BOOT", "BOOTX64.EFI")
 	if stat, err := os.Stat(kernelEFI); err != nil {
-		return FDIPCSmokeResult{SmokeELF: smokeELF, KernelEFI: kernelEFI, Marker: fdIPCSmokeMarker, Timeout: opts.Timeout}, err
+		return DeviceFDSmokeResult{SmokeELF: smokeELF, KernelEFI: kernelEFI, Marker: deviceFDSmokeMarker, Timeout: opts.Timeout}, err
 	} else if stat.Size() == 0 {
-		return FDIPCSmokeResult{SmokeELF: smokeELF, KernelEFI: kernelEFI, Marker: fdIPCSmokeMarker, Timeout: opts.Timeout}, fmt.Errorf("%s is empty", kernelEFI)
+		return DeviceFDSmokeResult{SmokeELF: smokeELF, KernelEFI: kernelEFI, Marker: deviceFDSmokeMarker, Timeout: opts.Timeout}, fmt.Errorf("%s is empty", kernelEFI)
 	}
 
 	diskPath := workspace.Path(workspace.Disk.Image)
 	mtoolsImage, err := espMToolsImage(workspace, diskPath)
 	if err != nil {
-		return FDIPCSmokeResult{SmokeELF: smokeELF, KernelEFI: kernelEFI, Disk: diskPath, Marker: fdIPCSmokeMarker, Timeout: opts.Timeout}, err
+		return DeviceFDSmokeResult{SmokeELF: smokeELF, KernelEFI: kernelEFI, Disk: diskPath, Marker: deviceFDSmokeMarker, Timeout: opts.Timeout}, err
 	}
 
 	initBackup := filepath.Join(artifactDir, "INITAPP.original.ELF")
 	kernelBackup := filepath.Join(artifactDir, "BOOTX64.original.EFI")
-	result := FDIPCSmokeResult{
+	result := DeviceFDSmokeResult{
 		SmokeELF:  smokeELF,
 		KernelEFI: kernelEFI,
 		Disk:      diskPath,
-		Marker:    fdIPCSmokeMarker,
+		Marker:    deviceFDSmokeMarker,
 		Timeout:   opts.Timeout,
 	}
 
@@ -110,7 +106,7 @@ func RunFDIPCSmoke(workspace *config.Workspace, opts FDIPCSmokeOptions) (FDIPCSm
 		NoKVM:     opts.NoKVM,
 		NoNet:     true,
 		ExtraArgs: opts.ExtraArgs,
-		Marker:    fdIPCSmokeMarker,
+		Marker:    deviceFDSmokeMarker,
 	})
 	result.Serial = smoke.Serial
 	result.Log = smoke.Log
@@ -120,13 +116,13 @@ func RunFDIPCSmoke(workspace *config.Workspace, opts FDIPCSmokeOptions) (FDIPCSm
 	return result, errors.Join(smokeErr, restoreErr)
 }
 
-func buildSmokeELF(workspace *config.Workspace, out string) error {
+func buildDeviceFDSmokeELF(workspace *config.Workspace, out string) error {
 	clang := os.Getenv("CAPOS_CLANG")
 	if clang == "" {
 		clang = "clang"
 	}
-	srcDir := workspace.Path("tests", "boot", "fd_ipc_smoke")
-	libipcDir := workspace.Path("userland", "libipc")
+	srcDir := workspace.Path("tests", "boot", "device_fd_smoke")
+	libcapsuleDir := workspace.Path("userland", "libcapsule")
 	libpachaDir := workspace.Path("userland", "libpacha")
 	args := []string{
 		"-target", "x86_64-freestanding-none",
@@ -145,11 +141,11 @@ func buildSmokeELF(workspace *config.Workspace, out string) error {
 		"-Wl,--no-dynamic-linker",
 		"-Wl,-z,common-page-size=4096",
 		"-Wl,-z,max-page-size=4096",
-		"-I", filepath.Join(libipcDir, "include"),
+		"-I", filepath.Join(libcapsuleDir, "include"),
 		"-I", filepath.Join(libpachaDir, "include"),
 		filepath.Join(srcDir, "entry.S"),
 		filepath.Join(srcDir, "main.c"),
-		filepath.Join(libipcDir, "src", "ipc.c"),
+		filepath.Join(libcapsuleDir, "src", "capsule.c"),
 		filepath.Join(libpachaDir, "src", "syscall.c"),
 		"-o", out,
 	}
@@ -157,40 +153,6 @@ func buildSmokeELF(workspace *config.Workspace, out string) error {
 	cmd.Dir = workspace.Root
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s failed: %w\n%s", clang, err, string(output))
-	}
-	return nil
-}
-
-func espMToolsImage(workspace *config.Workspace, diskPath string) (string, error) {
-	esp, ok := workspace.Disk.Partitions["esp"]
-	if !ok {
-		return "", fmt.Errorf("missing disk.partitions.esp")
-	}
-	disk, err := os.Open(diskPath)
-	if err != nil {
-		return "", err
-	}
-	defer disk.Close()
-	region, err := rootsync.OpenPartitionRegion(disk, esp.Index)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%s@@%d", diskPath, region.FirstLBA*sectorBytes), nil
-}
-
-func mcopyOut(image string, remote string, local string) error {
-	_ = os.Remove(local)
-	return runMcopy("-o", "-i", image, remote, local)
-}
-
-func mcopyIn(image string, local string, remote string) error {
-	return runMcopy("-o", "-i", image, local, remote)
-}
-
-func runMcopy(args ...string) error {
-	cmd := exec.Command("mcopy", args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("mcopy %v failed: %w\n%s", args, err, string(output))
 	}
 	return nil
 }

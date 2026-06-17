@@ -141,23 +141,6 @@ func BuildUserland(workspace *config.Workspace, opts UserlandOptions) (UserlandR
 			} else {
 				result.ReusedArtifacts++
 			}
-		case "zig":
-			span.Message(app.ID + " zig")
-			rebuilt, copied, err := buildZigApp(workspace, app, artifact)
-			if err != nil {
-				span.Fail(app.ID + " failed")
-				return result, err
-			}
-			if rebuilt {
-				result.RebuiltSources++
-				result.RebuiltApps = append(result.RebuiltApps, app.ID)
-			}
-			if copied {
-				result.CopiedArtifacts++
-				result.ChangedArtifacts = append(result.ChangedArtifacts, artifact)
-			} else {
-				result.ReusedArtifacts++
-			}
 		default:
 			span.Fail(app.ID + " unsupported")
 			return result, fmt.Errorf("app %s has unsupported kind %s", app.ID, app.Kind())
@@ -244,87 +227,6 @@ func sameSourceState(lhs sourceState, rhs sourceState) bool {
 		lhs.IsDir == rhs.IsDir &&
 		lhs.Size == rhs.Size &&
 		lhs.ModTime == rhs.ModTime
-}
-
-func buildZigApp(workspace *config.Workspace, app config.App, artifact string) (bool, bool, error) {
-	source, err := app.ZigSource()
-	if err != nil {
-		return false, false, err
-	}
-	inputs := zigInputs(workspace, source)
-	inputs = append(inputs, workspace.ConfigPath)
-	needed, err := outputNeedsBuild(artifact, inputs)
-	if err != nil {
-		return false, false, err
-	}
-	if !needed {
-		return false, false, nil
-	}
-	tmp := artifact + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
-		return false, false, err
-	}
-	localCache := zigCachePath(workspace, "userland-local")
-	globalCache := zigCachePath(workspace, "userland-global")
-	if err := os.MkdirAll(localCache, 0o755); err != nil {
-		return false, false, err
-	}
-	if err := os.MkdirAll(globalCache, 0o755); err != nil {
-		return false, false, err
-	}
-	args := []string{
-		"build-exe",
-		"--name", binaryStem(app.OutputName()),
-		"-target", app.Target,
-		"-O", app.Optimize,
-		"-mcmodel=small",
-		"-mno-red-zone",
-	}
-	for _, importName := range source.Imports {
-		switch importName {
-		case "abi_root", "persistent_fs_layout":
-			args = append(args, "--dep", importName)
-		default:
-			return false, false, fmt.Errorf("app %s has unsupported Zig import %q", app.ID, importName)
-		}
-	}
-	args = append(args, "-Mroot="+filepath.ToSlash(source.Entry))
-	if contains(source.Imports, "abi_root") {
-		args = append(args,
-			"-target", app.Target,
-			"-O", app.Optimize,
-			"-mcmodel=small",
-			"-mno-red-zone",
-			"--dep", "persistent_fs_layout",
-			"-Mabi_root=userland/programs/abi/abi_root.zig",
-		)
-	}
-	if contains(source.Imports, "abi_root") || contains(source.Imports, "persistent_fs_layout") {
-		args = append(args, "-Mpersistent_fs_layout=userland/programs/abi/persistent_fs_layout.zig")
-	}
-	args = append(args,
-		"-fPIE",
-		"-fentry=_start",
-		"-z", "common-page-size=4096",
-		"-z", "max-page-size=4096",
-	)
-	if app.Strip {
-		args = append(args, "-fstrip")
-	}
-	args = append(args,
-		"-femit-bin="+filepath.ToSlash(tmp),
-		"--cache-dir", localCache,
-		"--global-cache-dir", globalCache,
-	)
-	cmd := exec.Command("zig", args...)
-	cmd.Dir = workspace.Root
-	if err := run(cmd); err != nil {
-		_ = os.Remove(tmp)
-		return false, false, err
-	}
-	copied, err := replaceIfChanged(tmp, artifact)
-	_ = os.Remove(tmp)
-	return true, copied, err
 }
 
 func copyFileIfChanged(source string, dest string) (bool, error) {
@@ -741,37 +643,6 @@ func pathExists(path string) bool {
 	return err == nil
 }
 
-func binaryStem(name string) string {
-	ext := filepath.Ext(name)
-	if ext == "" {
-		return name
-	}
-	return strings.TrimSuffix(name, ext)
-}
-
 func zigCachePath(workspace *config.Workspace, name string) string {
 	return filepath.Join(os.TempDir(), "capos-zig-cache", filepath.Base(workspace.Root), name)
-}
-
-func zigInputs(workspace *config.Workspace, source config.ZigSource) []string {
-	inputs := []string{workspace.Path(source.Entry)}
-	for _, importName := range source.Imports {
-		switch importName {
-		case "abi_root":
-			inputs = append(inputs, workspace.Path("userland/programs/abi/abi_root.zig"))
-			inputs = append(inputs, workspace.Path("userland/programs/abi/persistent_fs_layout.zig"))
-		case "persistent_fs_layout":
-			inputs = append(inputs, workspace.Path("userland/programs/abi/persistent_fs_layout.zig"))
-		}
-	}
-	return inputs
-}
-
-func contains(values []string, needle string) bool {
-	for _, value := range values {
-		if value == needle {
-			return true
-		}
-	}
-	return false
 }

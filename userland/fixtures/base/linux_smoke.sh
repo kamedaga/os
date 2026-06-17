@@ -45,7 +45,7 @@ read zs < /tmp/zstd.out
 /cmd/musl_smoke.elf 4-pthread-smoke && echo four-pthread-ok || echo four-pthread-bad
 /cmd/musl_smoke.elf exit-group-smoke && echo exit-group-ok || echo exit-group-bad
 /cmd/capsule_demo.elf && echo capsule-demo-ok || echo capsule-demo-bad
-if [ -n "${KOBOX_PACHAOS_DEVICE_CAPSULE:-}" ]; then
+if [ -n "${KOBOX_PACHAOS_DEVICE_FD:-}" ]; then
   /cmd/capsule_demo.elf env-query && echo capsule-device-query-ok || echo capsule-device-query-bad
   /cmd/kobox-ls-devices.elf pachaos && echo kobox-pachaos-device-ok || echo kobox-pachaos-device-bad
   if [ -r /usr/lib/kobox/nvme-auth.ko ] && [ -r /usr/lib/kobox/nvme-core.ko ] && [ -r /usr/lib/kobox/nvme.ko ]; then
