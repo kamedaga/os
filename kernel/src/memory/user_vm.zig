@@ -747,6 +747,41 @@ pub fn mapTrustedUserPaddrsWithProt(
     return true;
 }
 
+pub fn remapTrustedUserPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (paddrs.len == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const page_count_u64: u64 = @intCast(paddrs.len);
+    const size_u64 = page_count_u64 * 4096;
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+
+    var page_index: usize = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const paddr = paddrs[page_index];
+        if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
+    }
+
+    page_index = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        pt_page[index.pt] = paddrs[page_index] | pte_flags;
+    }
+    h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
+
+    return true;
+}
+
 pub fn protectUserLinearRegionWithProt(
     principal: kernel.PrincipalId,
     va_start: u64,

@@ -1,6 +1,6 @@
 # PachaOS
 
-> Capability-based pure microkernel OS written in Zig — Linux ABI compatible, userland-first.
+> FD pure microkernel OS written in Zig — Linux ABI compatible, userland-first.
 
 ![Zig](https://img.shields.io/badge/kernel-Zig-f7a41d?style=flat-square&logo=zig)
 ![Go](https://img.shields.io/badge/tooling-Go-00ADD8?style=flat-square&logo=go)
@@ -10,19 +10,23 @@
 ![Status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)
 ![Linux ABI](https://img.shields.io/badge/Linux%20ABI-compatible-brightgreen?style=flat-square&logo=linux)
 
-既存の Linux エコシステムとの互換を目指すマイクロカーネル。
+既存の Linux エコシステムとの互換を目指すマイクロカーネル。  
+musl libc をネイティブでサポートし、カーネルのコード量は 20,000 行未満（現在約 16,000 行）に抑えています。
 
 ---
 
 ## Features
 
-- **Pure Microkernel** — カーネルは capability 管理・スケジューリング・trap delegation のみを担当
+- **Pure Microkernel** — カーネルは ファイルディスクリプタ 管理・スケジューリング・trap delegation のみを担当
+- **FD-based Microkernel** — Capabilityとほぼ特性の同じ権限ベースのFD(File Descriptor)を採用していて、厳格なセキュリティとLinux ABIおよびPOSIXの相性の良さを両立しています
 - **Trap Delegation** — Linux syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーが処理
-- **Hardware Capabilities** — capsule を用いた、DMA バッファ・IOMMU マッピング・Virtqueue の capability 抽象化
+- **Hardware FD** — capsule を用いた、デバイスアクセスおよび特権命令の抽象化
 - **Linux ABI Compatibility** — 無改造の musl libc を動的リンクでロードし、Linux syscall をユーザーランドで処理
 - **Userland Drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
 - **x86_64** — x86_64 対応。AArch64 は今後対応予定
-
+- **Native Libc** — musl libcを互換レイヤーを用いず、ネイティブで動かせます
+- **Minimal Kernel** — 20k以下を維持するマイクロカーネルです。(現在16k) 
+  
 ## Tech Stack
 
 | Layer | Language | Detail |

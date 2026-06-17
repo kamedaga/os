@@ -11,6 +11,7 @@ for the full license text and copyright notices.
 
 | Component | Files | License | Source / notes |
 |---|---|---|---|
+| musl libc source | `musl/upstream/` | MIT and compatible permissive notices; see `musl/upstream/COPYRIGHT` | Imported from https://musl.libc.org/releases/musl-1.2.6.tar.gz |
 | musl libc | `userland/fixtures/musl/libc.so`, `userland/fixtures/musl/ld-musl-x86_64.so.1` | MIT | https://musl.libc.org/ |
 | dash | `userland/fixtures/shell/dash.elf` | BSD-3-Clause for the runtime binary | Built from dash 0.5.12. The upstream source tree also contains GPL-2.0+ build helper code in `mksignames.c`, which is not directly linked into dash. |
 | FreeBSD TTY line discipline code | `userland/tty_service/src/bsd_line/` | BSD-2-Clause | Derived from FreeBSD files listed in `userland/tty_service/src/bsd_line/README.md`. |

@@ -18,9 +18,34 @@ pub const DynamicSegment = struct {
 
 pub const Image = struct {
     entry: u64,
+    phoff: u64 = 0,
+    phentsize: u16 = 0,
+    phnum: u16 = 0,
     load_segments: [max_load_segments]LoadSegment = undefined,
     load_segment_len: usize = 0,
     dynamic_segment: ?DynamicSegment = null,
+
+    pub fn programHeaderVirtualAddress(self: Image, load_base_va: u64) ?u64 {
+        const phdr_bytes, const phdr_bytes_overflow = @mulWithOverflow(@as(u64, self.phentsize), @as(u64, self.phnum));
+        if (phdr_bytes_overflow != 0) return null;
+        const phdr_end, const phdr_end_overflow = @addWithOverflow(self.phoff, phdr_bytes);
+        if (phdr_end_overflow != 0) return null;
+
+        var i: usize = 0;
+        while (i < self.load_segment_len) : (i += 1) {
+            const seg = self.load_segments[i];
+            const file_end, const file_end_overflow = @addWithOverflow(seg.file_offset, seg.file_size);
+            if (file_end_overflow != 0) continue;
+            if (self.phoff < seg.file_offset or phdr_end > file_end) continue;
+            const phdr_in_segment = self.phoff - seg.file_offset;
+            const vaddr_with_offset, const vaddr_overflow = @addWithOverflow(seg.vaddr, phdr_in_segment);
+            if (vaddr_overflow != 0) return null;
+            const runtime_va, const runtime_overflow = @addWithOverflow(load_base_va, vaddr_with_offset);
+            if (runtime_overflow != 0) return null;
+            return runtime_va;
+        }
+        return null;
+    }
 };
 
 pub const Error = error{
@@ -185,7 +210,12 @@ fn parseFromReader(reader: Reader) (Error || StreamReadError)!Image {
     if (phnum == 0) return Error.NoLoadSegment;
     if (phentsize < elf_phdr_size) return Error.ProgramHeaderOutOfRange;
 
-    var parsed = Image{ .entry = entry };
+    var parsed = Image{
+        .entry = entry,
+        .phoff = phoff,
+        .phentsize = phentsize,
+        .phnum = phnum,
+    };
     var phdr: [elf_phdr_size]u8 = undefined;
 
     var i: u16 = 0;
@@ -276,7 +306,12 @@ pub fn parse(image: []const u8) Error!Image {
     if (phnum == 0) return Error.NoLoadSegment;
     if (phentsize < elf_phdr_size) return Error.ProgramHeaderOutOfRange;
 
-    var parsed = Image{ .entry = entry };
+    var parsed = Image{
+        .entry = entry,
+        .phoff = phoff,
+        .phentsize = phentsize,
+        .phnum = phnum,
+    };
 
     var i: u16 = 0;
     while (i < phnum) : (i += 1) {

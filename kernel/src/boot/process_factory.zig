@@ -3,6 +3,7 @@
 /// user_spaces explicitly so this module has no global dependencies.
 const kernel = @import("../kernel.zig");
 const boot_static = @import("main_static.zig");
+const elf_loader = @import("../elf_loader.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const scheduler = @import("../scheduler.zig");
 const interrupts = @import("../interrupts.zig");
@@ -46,6 +47,93 @@ pub fn buildInitialUserTrapFrame() TrapFrame {
     frame.rsp = boot_static.user_entry_rsp;
     frame.ss = @as(u64, boot_static.gdt_user_data_selector) | 0x3;
     return frame;
+}
+
+const at_null: u64 = 0;
+const at_phdr: u64 = 3;
+const at_phent: u64 = 4;
+const at_phnum: u64 = 5;
+const at_pagesz: u64 = 6;
+const at_entry: u64 = 9;
+const at_uid: u64 = 11;
+const at_euid: u64 = 12;
+const at_gid: u64 = 13;
+const at_egid: u64 = 14;
+const at_secure: u64 = 23;
+const at_random: u64 = 25;
+const at_execfn: u64 = 31;
+
+const user_stack_bytes: usize = 4096;
+
+fn stackVaFromOffset(offset: usize) u64 {
+    return boot_static.user_stack_page_va + @as(u64, @intCast(offset));
+}
+
+fn pushStackBytes(stack: []u8, cursor: *usize, bytes: []const u8) u64 {
+    if (bytes.len > cursor.*) halt.haltWithMessage("initial user stack overflow");
+    cursor.* -= bytes.len;
+    @memcpy(stack[cursor.* .. cursor.* + bytes.len], bytes);
+    return stackVaFromOffset(cursor.*);
+}
+
+pub fn installInitialUserStackOrHalt(user_stack_paddr: u64, loaded: elf_loader.Image, argv0: []const u8) u64 {
+    if ((user_stack_paddr & 0xFFF) != 0) halt.haltWithMessage("initial user stack paddr unaligned");
+    if (argv0.len == 0 or argv0.len >= 128) halt.haltWithMessage("initial user argv0 invalid");
+
+    const stack_ptr: [*]u8 = @ptrFromInt(user_stack_paddr);
+    const stack = stack_ptr[0..user_stack_bytes];
+    @memset(stack, 0);
+
+    var cursor: usize = user_stack_bytes;
+    var random_seed = [_]u8{0} ** 16;
+    const random_va = pushStackBytes(stack, &cursor, random_seed[0..]);
+    cursor &= ~@as(usize, 15);
+
+    var argv0_buf: [128]u8 = undefined;
+    @memcpy(argv0_buf[0..argv0.len], argv0);
+    argv0_buf[argv0.len] = 0;
+    const argv0_va = pushStackBytes(stack, &cursor, argv0_buf[0 .. argv0.len + 1]);
+
+    const phdr_va = loaded.programHeaderVirtualAddress(boot_static.user_elf_base_va) orelse
+        halt.haltWithMessage("initial user ELF PHDR unavailable");
+
+    const aux_word_count: usize = 13 * 2;
+    const word_count: usize = 1 + 2 + 1 + aux_word_count;
+    if (cursor < word_count * 8) halt.haltWithMessage("initial user stack words overflow");
+    cursor = (cursor - word_count * 8) & ~@as(usize, 15);
+
+    const words: [*]u64 = @ptrCast(@alignCast(stack[cursor..].ptr));
+    var wi: usize = 0;
+    words[wi] = 1;
+    wi += 1;
+    words[wi] = argv0_va;
+    wi += 1;
+    words[wi] = 0;
+    wi += 1;
+    words[wi] = 0;
+    wi += 1;
+
+    const auxv = [_]u64{
+        at_pagesz, 4096,
+        at_phdr,   phdr_va,
+        at_phent,  loaded.phentsize,
+        at_phnum,  loaded.phnum,
+        at_entry,  loaded.entry,
+        at_uid,    0,
+        at_euid,   0,
+        at_gid,    0,
+        at_egid,   0,
+        at_secure, 0,
+        at_random, random_va,
+        at_execfn, argv0_va,
+        at_null,   0,
+    };
+    for (auxv) |value| {
+        words[wi] = value;
+        wi += 1;
+    }
+
+    return stackVaFromOffset(cursor);
 }
 
 fn releaseStaleThreadSlot(principal: kernel.PrincipalId) void {

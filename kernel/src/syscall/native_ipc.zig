@@ -7,6 +7,7 @@ const fd_abi = abi_root.fd_abi;
 const ipc_abi = abi_root.ipc_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
+const max_ipc_wake_owners = kernel.fd_table_entries;
 
 fn mapError(err: kernel.KernelError) u64 {
     return switch (err) {
@@ -95,6 +96,21 @@ fn writeRecvMessage(
     return sc.syscall_ok;
 }
 
+fn collectWakeOwnersForSendFd(
+    state: *const kernel.KernelState,
+    proc: kernel.PrincipalId,
+    fd: kernel.Fd,
+    out: *[max_ipc_wake_owners]kernel.PrincipalId,
+) ?usize {
+    return state.ipcRecvWakeOwnersForSendFd(proc, fd, out[0..]) catch null;
+}
+
+fn wakeOwners(h: anytype, owners: []const kernel.PrincipalId) void {
+    for (owners) |owner| {
+        h.wake_waiting_thread_for_principal(owner);
+    }
+}
+
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
         sc.syscall_ipc_endpoint_create => state.createIpcEndpointFd(
@@ -118,7 +134,10 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_ipc_send => blk: {
             var fd_storage: [kernel.max_ipc_message_fds]kernel.IpcSendFd = undefined;
             const msg = readIpcMessage(h, proc, frame.rsi, &fd_storage) orelse break :blk sc.syscall_err_invalid;
+            var wake_storage: [max_ipc_wake_owners]kernel.PrincipalId = undefined;
+            const wake_count = collectWakeOwnersForSendFd(state, proc, @intCast(frame.rdi), &wake_storage) orelse break :blk sc.syscall_err_invalid;
             state.ipcSend(proc, @intCast(frame.rdi), msg) catch |err| break :blk mapError(err);
+            wakeOwners(h, wake_storage[0..wake_count]);
             break :blk sc.syscall_ok;
         },
         sc.syscall_ipc_recv => blk: {
@@ -138,12 +157,19 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_ipc_call => blk: {
             var fd_storage: [kernel.max_ipc_message_fds]kernel.IpcSendFd = undefined;
             const msg = readIpcMessage(h, proc, frame.rsi, &fd_storage) orelse break :blk sc.syscall_err_invalid;
-            break :blk state.ipcCall(proc, @intCast(frame.rdi), msg, first_dynamic_fd) catch |err| mapError(err);
+            var wake_storage: [max_ipc_wake_owners]kernel.PrincipalId = undefined;
+            const wake_count = collectWakeOwnersForSendFd(state, proc, @intCast(frame.rdi), &wake_storage) orelse break :blk sc.syscall_err_invalid;
+            const reply_fd = state.ipcCall(proc, @intCast(frame.rdi), msg, first_dynamic_fd) catch |err| break :blk mapError(err);
+            wakeOwners(h, wake_storage[0..wake_count]);
+            break :blk reply_fd;
         },
         sc.syscall_ipc_reply => blk: {
             var fd_storage: [kernel.max_ipc_message_fds]kernel.IpcSendFd = undefined;
             const msg = readIpcMessage(h, proc, frame.rsi, &fd_storage) orelse break :blk sc.syscall_err_invalid;
+            var wake_storage: [max_ipc_wake_owners]kernel.PrincipalId = undefined;
+            const wake_count = collectWakeOwnersForSendFd(state, proc, @intCast(frame.rdi), &wake_storage) orelse break :blk sc.syscall_err_invalid;
             state.ipcReply(proc, @intCast(frame.rdi), msg) catch |err| break :blk mapError(err);
+            wakeOwners(h, wake_storage[0..wake_count]);
             break :blk sc.syscall_ok;
         },
         else => null,

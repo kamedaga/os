@@ -1,0 +1,15 @@
+musl upstream license notice
+============================
+
+musl upstream is distributed under the MIT license.
+
+The authoritative license file is the upstream `COPYRIGHT` file. When the
+upstream source tree is imported into `musl/upstream/`, keep that file
+unchanged.
+
+Official references:
+
+- https://musl.libc.org/
+- https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT
+
+This file is only a local tracking note for the PachaOS repository layout.

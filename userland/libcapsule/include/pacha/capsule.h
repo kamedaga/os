@@ -9,17 +9,30 @@ extern "C" {
 #endif
 
 enum {
-    PACHA_FD_SYSCALL_CLOSE = 14,
-    PACHA_CAPSULE_SYSCALL_QUERY = 27,
-    PACHA_CAPSULE_SYSCALL_DERIVE_MMIO = 28,
-    PACHA_CAPSULE_SYSCALL_DERIVE_DMA_BUFFER = 29,
-    PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING = 30,
-    PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING_FROM_BUFFER = 31,
-    PACHA_CAPSULE_SYSCALL_DERIVE_IRQ = 32,
-    PACHA_CAPSULE_SYSCALL_PCI_CONFIG_READ = 33,
-    PACHA_CAPSULE_SYSCALL_PCI_CONFIG_WRITE = 34,
-    PACHA_CAPSULE_SYSCALL_PCI_BAR_INFO = 35,
-    PACHA_CAPSULE_SYSCALL_IRQ_POLL = 36,
+    PACHA_SYSCALL_OK = 0,
+    PACHA_SYSCALL_ERR_INVALID = 1,
+    PACHA_SYSCALL_ERR_NOT_READY = 2,
+    PACHA_SYSCALL_ERR_ALLOC = 3,
+    PACHA_SYSCALL_ERR_MAP = 4,
+    PACHA_SYSCALL_ERR_EMPTY = 5,
+
+    PACHA_ERR_INVALID = -PACHA_SYSCALL_ERR_INVALID,
+    PACHA_ERR_NOT_READY = -PACHA_SYSCALL_ERR_NOT_READY,
+    PACHA_ERR_ALLOC = -PACHA_SYSCALL_ERR_ALLOC,
+    PACHA_ERR_MAP = -PACHA_SYSCALL_ERR_MAP,
+    PACHA_ERR_EMPTY = -PACHA_SYSCALL_ERR_EMPTY,
+
+    PACHA_FD_SYSCALL_CLOSE = 18,
+    PACHA_CAPSULE_SYSCALL_QUERY = 43,
+    PACHA_CAPSULE_SYSCALL_DERIVE_MMIO = 44,
+    PACHA_CAPSULE_SYSCALL_DERIVE_DMA_BUFFER = 45,
+    PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING = 46,
+    PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING_FROM_BUFFER = 47,
+    PACHA_CAPSULE_SYSCALL_DERIVE_IRQ = 48,
+    PACHA_CAPSULE_SYSCALL_PCI_CONFIG_READ = 49,
+    PACHA_CAPSULE_SYSCALL_PCI_CONFIG_WRITE = 50,
+    PACHA_CAPSULE_SYSCALL_PCI_BAR_INFO = 51,
+    PACHA_CAPSULE_SYSCALL_IRQ_POLL = 52,
 
     PACHA_CAPSULE_KIND_DEVICE = 2,
     PACHA_CAPSULE_KIND_MMIO = 3,
@@ -62,6 +75,10 @@ enum {
     PACHA_FD_RIGHT_IRQ_WAIT = 1ull << 39,
     PACHA_FD_RIGHT_IRQ_ACK = 1ull << 40,
     PACHA_FD_RIGHT_BUS_MASTER = 1ull << 41,
+    PACHA_FD_RIGHT_READ = 1ull << 42,
+    PACHA_FD_RIGHT_WRITE = 1ull << 43,
+
+    PACHA_CAPSULE_IRQ_CURRENT_COUNT = UINT64_MAX,
 };
 
 struct pacha_capsule_info {
@@ -89,6 +106,27 @@ struct pacha_capsule_bar_info {
     uint64_t flags;
 };
 
+struct pacha_capsule_mmio {
+    int fd;
+    void *addr;
+    size_t len;
+};
+
+struct pacha_capsule_dma {
+    int fd;
+    void *addr;
+    size_t len;
+    uint64_t iova;
+};
+
+struct pacha_capsule_irq {
+    int fd;
+    uint64_t count;
+};
+
+int pacha_capsule_is_fd(int fd);
+int pacha_capsule_has_rights(const struct pacha_capsule_info *info, uint64_t rights);
+
 int pacha_capsule_query(int fd, struct pacha_capsule_info *out);
 int pacha_capsule_expect_kind(int fd, uint64_t kind, struct pacha_capsule_info *out);
 int pacha_capsule_close(int fd);
@@ -103,9 +141,19 @@ int pacha_capsule_derive_dma_mapping(int device_fd, void *addr, uint64_t iova, s
 int pacha_capsule_derive_dma_mapping_from_buffer(int dma_buffer_fd, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
 int pacha_capsule_derive_irq(int device_fd, unsigned kind, unsigned vector, uint64_t flags);
 
+int pacha_capsule_mmio_from_fd(int mmio_fd, struct pacha_capsule_mmio *out);
 int pacha_capsule_mmio_mapping(int mmio_fd, void **addr, size_t *len);
+int pacha_capsule_dma_from_fd(int dma_fd, struct pacha_capsule_dma *out);
 int pacha_capsule_dma_mapping(int dma_fd, void **addr, size_t *len, uint64_t *iova);
+int pacha_capsule_irq_from_fd(int irq_fd, struct pacha_capsule_irq *out);
+int pacha_capsule_irq_poll(int irq_fd, uint64_t last_count, uint64_t *out_count);
 int pacha_capsule_irq_wait(int irq_fd, uint64_t last_count, uint64_t *out_count);
+
+int pacha_capsule_device_derive_mmio(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags, struct pacha_capsule_mmio *out);
+int pacha_capsule_device_derive_dma_buffer(int device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags, struct pacha_capsule_dma *out);
+int pacha_capsule_dma_derive_mapping(const struct pacha_capsule_dma *buffer, uint64_t iova, size_t len, unsigned direction, uint64_t flags, struct pacha_capsule_dma *out);
+int pacha_capsule_device_derive_irq(int device_fd, unsigned kind, unsigned vector, uint64_t flags, struct pacha_capsule_irq *out);
+int pacha_capsule_irq_next(struct pacha_capsule_irq *irq);
 
 #ifdef __cplusplus
 }

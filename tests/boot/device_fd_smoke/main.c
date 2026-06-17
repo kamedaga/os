@@ -185,5 +185,18 @@ void device_fd_boot_smoke_main(void) {
         return;
     }
 
+    struct pacha_capsule_irq irq = {0};
+    const int irq_status = pacha_capsule_device_derive_irq(fd, PACHA_CAPSULE_IRQ_AUTO, 0x41, 0, &irq);
+    if (irq_status != 0) {
+        log_hex("[device_fd_boot_smoke] irq status=", (u64)(long long)irq_status);
+        return;
+    }
+    if (!is_fd((u64)(unsigned)irq.fd) || irq.count != 0) {
+        log_hex("[device_fd_boot_smoke] irq fd=", (u64)(unsigned)irq.fd);
+        log_hex("[device_fd_boot_smoke] irq count=", irq.count);
+        return;
+    }
+    (void)pacha_capsule_close(irq.fd);
+
     log_text("[device_fd_boot_smoke] OK\n");
 }

@@ -5,6 +5,15 @@ static int pacha_capsule_valid_width(unsigned width) {
     return width == 1 || width == 2 || width == 4;
 }
 
+int pacha_capsule_is_fd(int fd) {
+    return fd >= 16 && fd < 256;
+}
+
+int pacha_capsule_has_rights(const struct pacha_capsule_info *info, uint64_t rights) {
+    if (!info) return 0;
+    return (info->rights & rights) == rights;
+}
+
 int pacha_capsule_query(int fd, struct pacha_capsule_info *out) {
     if (!out) return -1;
     uint64_t words[16] = {0};
@@ -98,28 +107,135 @@ int pacha_capsule_derive_irq(int device_fd, unsigned kind, unsigned vector, uint
     return pacha_fd_result_to_int(pacha_syscall4(PACHA_CAPSULE_SYSCALL_DERIVE_IRQ, (uint64_t)(uint32_t)device_fd, kind, vector, flags));
 }
 
-int pacha_capsule_mmio_mapping(int mmio_fd, void **addr, size_t *len) {
+int pacha_capsule_mmio_from_fd(int mmio_fd, struct pacha_capsule_mmio *out) {
+    if (!out) return -1;
     struct pacha_capsule_info info;
     const int status = pacha_capsule_expect_kind(mmio_fd, PACHA_CAPSULE_KIND_MMIO, &info);
     if (status != 0) return status;
-    if (addr) *addr = (void *)(uintptr_t)info.user_va;
-    if (len) *len = (size_t)info.size;
+    *out = (struct pacha_capsule_mmio){
+        .fd = mmio_fd,
+        .addr = (void *)(uintptr_t)info.user_va,
+        .len = (size_t)info.size,
+    };
     return 0;
 }
 
-int pacha_capsule_dma_mapping(int dma_fd, void **addr, size_t *len, uint64_t *iova) {
+int pacha_capsule_mmio_mapping(int mmio_fd, void **addr, size_t *len) {
+    struct pacha_capsule_mmio mmio;
+    const int status = pacha_capsule_mmio_from_fd(mmio_fd, &mmio);
+    if (status != 0) return status;
+    if (addr) *addr = mmio.addr;
+    if (len) *len = mmio.len;
+    return 0;
+}
+
+int pacha_capsule_dma_from_fd(int dma_fd, struct pacha_capsule_dma *out) {
+    if (!out) return -1;
     struct pacha_capsule_info info;
     const int status = pacha_capsule_query(dma_fd, &info);
     if (status != 0) return status;
     if (info.kind != PACHA_CAPSULE_KIND_DMA_BUFFER && info.kind != PACHA_CAPSULE_KIND_DMA_MAPPING) return -1;
-    if (addr) *addr = (void *)(uintptr_t)info.user_va;
-    if (len) *len = (size_t)info.size;
-    if (iova) *iova = info.iova;
+    *out = (struct pacha_capsule_dma){
+        .fd = dma_fd,
+        .addr = (void *)(uintptr_t)info.user_va,
+        .len = (size_t)info.size,
+        .iova = info.iova,
+    };
     return 0;
+}
+
+int pacha_capsule_dma_mapping(int dma_fd, void **addr, size_t *len, uint64_t *iova) {
+    struct pacha_capsule_dma dma;
+    const int status = pacha_capsule_dma_from_fd(dma_fd, &dma);
+    if (status != 0) return status;
+    if (addr) *addr = dma.addr;
+    if (len) *len = dma.len;
+    if (iova) *iova = dma.iova;
+    return 0;
+}
+
+int pacha_capsule_irq_poll(int irq_fd, uint64_t last_count, uint64_t *out_count) {
+    if (!out_count) return -1;
+    const long ret = pacha_syscall5(PACHA_CAPSULE_SYSCALL_IRQ_POLL, (uint64_t)(uint32_t)irq_fd, last_count, (uint64_t)(uintptr_t)out_count, 1, 0);
+    return ret == 1 ? 0 : pacha_status_to_int(ret);
 }
 
 int pacha_capsule_irq_wait(int irq_fd, uint64_t last_count, uint64_t *out_count) {
     if (!out_count) return -1;
-    const long ret = pacha_syscall5(PACHA_CAPSULE_SYSCALL_IRQ_POLL, (uint64_t)(uint32_t)irq_fd, last_count, (uint64_t)(uintptr_t)out_count, 1, 0);
-    return ret == 1 ? 0 : pacha_status_to_int(ret);
+    for (;;) {
+        const int status = pacha_capsule_irq_poll(irq_fd, last_count, out_count);
+        if (status != PACHA_ERR_NOT_READY) return status;
+    }
+}
+
+int pacha_capsule_irq_from_fd(int irq_fd, struct pacha_capsule_irq *out) {
+    if (!out) return -1;
+    struct pacha_capsule_info info;
+    const int status = pacha_capsule_expect_kind(irq_fd, PACHA_CAPSULE_KIND_IRQ, &info);
+    if (status != 0) return status;
+    uint64_t count = 0;
+    const int poll_status = pacha_capsule_irq_poll(irq_fd, PACHA_CAPSULE_IRQ_CURRENT_COUNT, &count);
+    if (poll_status != 0) return poll_status;
+    *out = (struct pacha_capsule_irq){
+        .fd = irq_fd,
+        .count = count,
+    };
+    return 0;
+}
+
+int pacha_capsule_device_derive_mmio(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags, struct pacha_capsule_mmio *out) {
+    if (!out) return -1;
+    const int fd = pacha_capsule_derive_mmio(device_fd, bar, addr, len, flags);
+    if (!pacha_capsule_is_fd(fd)) return fd;
+    const int status = pacha_capsule_mmio_from_fd(fd, out);
+    if (status != 0) {
+        (void)pacha_capsule_close(fd);
+        return status;
+    }
+    return 0;
+}
+
+int pacha_capsule_device_derive_dma_buffer(int device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags, struct pacha_capsule_dma *out) {
+    if (!out) return -1;
+    const int fd = pacha_capsule_derive_dma_buffer(device_fd, addr, iova, len, flags);
+    if (!pacha_capsule_is_fd(fd)) return fd;
+    const int status = pacha_capsule_dma_from_fd(fd, out);
+    if (status != 0) {
+        (void)pacha_capsule_close(fd);
+        return status;
+    }
+    return 0;
+}
+
+int pacha_capsule_dma_derive_mapping(const struct pacha_capsule_dma *buffer, uint64_t iova, size_t len, unsigned direction, uint64_t flags, struct pacha_capsule_dma *out) {
+    if (!buffer || !out) return -1;
+    const int fd = pacha_capsule_derive_dma_mapping_from_buffer(buffer->fd, iova, len, direction, flags);
+    if (!pacha_capsule_is_fd(fd)) return fd;
+    const int status = pacha_capsule_dma_from_fd(fd, out);
+    if (status != 0) {
+        (void)pacha_capsule_close(fd);
+        return status;
+    }
+    return 0;
+}
+
+int pacha_capsule_device_derive_irq(int device_fd, unsigned kind, unsigned vector, uint64_t flags, struct pacha_capsule_irq *out) {
+    if (!out) return -1;
+    const int fd = pacha_capsule_derive_irq(device_fd, kind, vector, flags);
+    if (!pacha_capsule_is_fd(fd)) return fd;
+    const int status = pacha_capsule_irq_from_fd(fd, out);
+    if (status != 0) {
+        (void)pacha_capsule_close(fd);
+        return status;
+    }
+    return 0;
+}
+
+int pacha_capsule_irq_next(struct pacha_capsule_irq *irq) {
+    if (!irq) return -1;
+    uint64_t next = 0;
+    const int status = pacha_capsule_irq_wait(irq->fd, irq->count, &next);
+    if (status != 0) return status;
+    irq->count = next;
+    return 0;
 }

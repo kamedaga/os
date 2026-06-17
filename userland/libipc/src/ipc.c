@@ -56,6 +56,58 @@ int pacha_fd_get_info(int fd, struct pacha_fd_info *out) {
     return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)out));
 }
 
+int pacha_fd_close(int fd) {
+    return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, (uint64_t)(uint32_t)fd));
+}
+
+long pacha_fd_read(int fd, void *buf, uint64_t len) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_READ, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)buf, len);
+}
+
+long pacha_fd_write(int fd, const void *buf, uint64_t len) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_WRITE, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)buf, len);
+}
+
+long pacha_fd_readv(int fd, const struct pacha_iovec *iov, uint64_t iov_count) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_READV, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)iov, iov_count);
+}
+
+long pacha_fd_writev(int fd, const struct pacha_iovec *iov, uint64_t iov_count) {
+    return pacha_syscall3(PACHA_FD_SYSCALL_WRITEV, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)iov, iov_count);
+}
+
+long pacha_fd_fcntl(int fd, uint64_t cmd, uint64_t arg0, uint64_t arg1) {
+    return pacha_syscall4(PACHA_FD_SYSCALL_FCNTL, (uint64_t)(uint32_t)fd, cmd, arg0, arg1);
+}
+
+long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count) {
+    return pacha_syscall2(PACHA_FD_SYSCALL_POLL, (uint64_t)(uintptr_t)fds, count);
+}
+
+long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks) {
+    for (;;) {
+        const long ret = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY, (uint64_t)(uintptr_t)fds, count, timeout_ticks, 0);
+        if (ret != -2 && ret != 2) return ret;
+        if (timeout_ticks == 0) return ret;
+    }
+}
+
+int pacha_eventfd_create(uint64_t initial_value, uint64_t rights, uint32_t fd_flags) {
+    return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, initial_value, rights, fd_flags));
+}
+
+int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rights, uint32_t fd_flags) {
+    return pacha_fd_result_to_int(pacha_syscall6(
+        PACHA_FD_SYSCALL_TIMERFD_CREATE,
+        PACHA_TIMERFD_CLOCK_MONOTONIC,
+        0,
+        initial_ns,
+        interval_ns,
+        rights,
+        fd_flags
+    ));
+}
+
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
 }
@@ -64,6 +116,16 @@ void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t 
     const long result = pacha_syscall6(PACHA_FD_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
     if (result < 4096) return (void *)0;
     return (void *)(uintptr_t)result;
+}
+
+void *pacha_mmap_anonymous(uint64_t size, uint64_t prot, uint64_t flags) {
+    const long result = pacha_syscall6(PACHA_FD_SYSCALL_MMAP, 0, 0, size, prot, flags | PACHA_MMAP_ANONYMOUS, 0);
+    if (result < 4096) return (void *)0;
+    return (void *)(uintptr_t)result;
+}
+
+int pacha_munmap(void *addr, uint64_t size) {
+    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)addr, size));
 }
 
 static long pacha_mmap_raw(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {

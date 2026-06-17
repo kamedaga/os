@@ -739,6 +739,12 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     };
     boot_init_principal = init_principal;
     const init_process = process_factory.createUserProcess(state, init_principal, "init", &global_free_list, user_spaces);
+    state.createSerialFdAt(init_principal, 1, 1) catch |err| {
+        halt.haltWithError("init stdout fd install failed: ", err);
+    };
+    state.createSerialFdAt(init_principal, 2, 2) catch |err| {
+        halt.haltWithError("init stderr fd install failed: ", err);
+    };
     init_setup.setupInitBootstrapResources(
         state,
         init_principal,
@@ -768,7 +774,11 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     const init_ctx = scheduler.getThreadContext(init_thread).?;
     if (scheduler.isThreadReady(init_thread)) {
         init_ctx.frame.rip = loaded_init.entry;
-        init_ctx.frame.rsp = boot_static.user_entry_rsp;
+        init_ctx.frame.rsp = process_factory.installInitialUserStackOrHalt(
+            init_process.user_stack_page.paddr,
+            loaded_init,
+            "init",
+        );
     }
     activateThreadOrHalt(init_thread);
 

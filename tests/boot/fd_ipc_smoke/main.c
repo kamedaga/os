@@ -66,6 +66,8 @@ static int expect_ok(const char *label, int status) {
     return 0;
 }
 
+static int expect_fd_readable(const char *label, int fd);
+
 static int fast_echo_handler(void *ctx, const struct pacha_ipc_fast_entry *request, struct pacha_ipc_fast_entry *response) {
     (void)ctx;
     pacha_ipc_fast_entry_init(response, request->op + 1, request->offset + 0x1000, request->len * 2, request->flags + 1);
@@ -129,13 +131,162 @@ static int run_process_thread_create_smoke(void) {
     return 1;
 }
 
+static int run_timerfd_wait_smoke(void) {
+    const u64 rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ;
+    const int timer_fd = pacha_timerfd_create(1000000ull, 0, rights, 0);
+    if (timer_fd < 16) {
+        log_hex("[fd_ipc_boot_smoke] timerfd_create failed=", (u64)(long long)timer_fd);
+        return 0;
+    }
+    struct pacha_fd_info timer_info = {0};
+    if (!expect_ok("[fd_ipc_boot_smoke] timer fd_get_info failed\n", pacha_fd_get_info(timer_fd, &timer_info))) return 0;
+    if (!expect_u64("[fd_ipc_boot_smoke] timer fd kind mismatch\n", timer_info.kind, PACHA_FD_KIND_TIMER)) return 0;
+
+    struct pacha_pollfd pfd = {
+        .fd = timer_fd,
+        .events = PACHA_FD_EVENT_READABLE,
+    };
+    const long wait_ready = pacha_fd_wait_many(&pfd, 1, PACHA_FD_WAIT_FOREVER);
+    if (wait_ready < 1) {
+        log_hex("[fd_ipc_boot_smoke] timer wait failed=", (u64)(long long)wait_ready);
+        return 0;
+    }
+    if ((pfd.revents & PACHA_FD_EVENT_READABLE) == 0) {
+        log_hex("[fd_ipc_boot_smoke] timer revents=", pfd.revents);
+        return 0;
+    }
+    u64 expirations = 0;
+    const long read_len = pacha_fd_read(timer_fd, &expirations, sizeof(expirations));
+    if (read_len != 8 || expirations == 0) {
+        log_hex("[fd_ipc_boot_smoke] timer read_len=", (u64)(long long)read_len);
+        log_hex("[fd_ipc_boot_smoke] timer expirations=", expirations);
+        return 0;
+    }
+    (void)pacha_fd_close(timer_fd);
+    log_text("[fd_ipc_boot_smoke] timerfd wait OK\n");
+    return 1;
+}
+
+static int run_eventfd_io_smoke(void) {
+    const u64 rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_WRITE |
+        PACHA_FD_RIGHT_SET_FLAGS;
+    const int event_fd = pacha_eventfd_create(0, rights, 0);
+    if (event_fd < 16) {
+        log_hex("[fd_ipc_boot_smoke] eventfd_create failed=", (u64)(long long)event_fd);
+        return 0;
+    }
+    struct pacha_fd_info event_info = {0};
+    if (!expect_ok("[fd_ipc_boot_smoke] event fd_get_info failed\n", pacha_fd_get_info(event_fd, &event_info))) return 0;
+    if (!expect_u64("[fd_ipc_boot_smoke] event fd kind mismatch\n", event_info.kind, PACHA_FD_KIND_EVENT)) return 0;
+    if (!expect_u64("[fd_ipc_boot_smoke] event fcntl flags mismatch\n", (u64)pacha_fd_fcntl(event_fd, PACHA_FD_FCNTL_GET_FLAGS, 0, 0), 0)) return 0;
+
+    u64 value = 3;
+    const long write_len = pacha_fd_write(event_fd, &value, sizeof(value));
+    if (write_len != 8) {
+        log_hex("[fd_ipc_boot_smoke] event write_len=", (u64)(long long)write_len);
+        return 0;
+    }
+    if (!expect_fd_readable("[fd_ipc_boot_smoke] event fd_poll not readable\n", event_fd)) return 0;
+
+    u64 read_value = 0;
+    const long read_len = pacha_fd_read(event_fd, &read_value, sizeof(read_value));
+    if (read_len != 8 || read_value != 3) {
+        log_hex("[fd_ipc_boot_smoke] event read_len=", (u64)(long long)read_len);
+        log_hex("[fd_ipc_boot_smoke] event read_value=", read_value);
+        return 0;
+    }
+
+    value = 5;
+    const struct pacha_iovec write_iov = {
+        .base = &value,
+        .len = sizeof(value),
+    };
+    const long writev_len = pacha_fd_writev(event_fd, &write_iov, 1);
+    if (writev_len != 8) {
+        log_hex("[fd_ipc_boot_smoke] event writev_len=", (u64)(long long)writev_len);
+        return 0;
+    }
+    read_value = 0;
+    const struct pacha_iovec read_iov = {
+        .base = &read_value,
+        .len = sizeof(read_value),
+    };
+    const long readv_len = pacha_fd_readv(event_fd, &read_iov, 1);
+    if (readv_len != 8 || read_value != 5) {
+        log_hex("[fd_ipc_boot_smoke] event readv_len=", (u64)(long long)readv_len);
+        log_hex("[fd_ipc_boot_smoke] event readv_value=", read_value);
+        return 0;
+    }
+    (void)pacha_fd_close(event_fd);
+    log_text("[fd_ipc_boot_smoke] eventfd IO OK\n");
+    return 1;
+}
+
+static int run_anonymous_mmap_smoke(void) {
+    unsigned char *page = (unsigned char *)pacha_mmap_anonymous(
+        4096,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_PRIVATE
+    );
+    if (!page) {
+        log_text("[fd_ipc_boot_smoke] anonymous mmap failed\n");
+        return 0;
+    }
+
+    page[0] = 0x5a;
+    page[4095] = 0xa5;
+    if (page[0] != 0x5a || page[4095] != 0xa5) {
+        log_hex("[fd_ipc_boot_smoke] anonymous mmap byte0=", page[0]);
+        log_hex("[fd_ipc_boot_smoke] anonymous mmap byte4095=", page[4095]);
+        return 0;
+    }
+    if (!expect_ok("[fd_ipc_boot_smoke] anonymous munmap failed\n", pacha_munmap(page, 4096))) return 0;
+    log_text("[fd_ipc_boot_smoke] anonymous mmap OK\n");
+    return 1;
+}
+
+static int expect_fd_readable(const char *label, int fd) {
+    struct pacha_pollfd pfd = {
+        .fd = fd,
+        .events = PACHA_FD_EVENT_READABLE,
+    };
+    const long ready = pacha_fd_poll(&pfd, 1);
+    if (ready != 1 || (pfd.revents & PACHA_FD_EVENT_READABLE) == 0) {
+        log_text(label);
+        log_hex(" ready=", (u64)(long long)ready);
+        log_hex(" revents=", pfd.revents);
+        return 0;
+    }
+    return 1;
+}
+
 void fd_ipc_boot_smoke_main(void) {
     log_text("[fd_ipc_boot_smoke] start\n");
 
     if (!run_process_thread_create_smoke()) return;
+    if (!run_timerfd_wait_smoke()) return;
+    if (!run_eventfd_io_smoke()) return;
+    if (!run_anonymous_mmap_smoke()) return;
 
     const u64 endpoint_rights =
-        PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE;
+        PACHA_FD_RIGHT_SEND |
+        PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE;
     const int endpoint = pacha_ipc_endpoint_create(endpoint_rights, 0);
     if (endpoint < 16) {
         log_hex("[fd_ipc_boot_smoke] endpoint_create failed=", (u64)(long long)endpoint);
@@ -149,6 +300,7 @@ void fd_ipc_boot_smoke_main(void) {
         .word3 = 44,
     };
     if (!expect_ok("[fd_ipc_boot_smoke] endpoint send failed\n", pacha_ipc_send(endpoint, &send_msg))) return;
+    if (!expect_fd_readable("[fd_ipc_boot_smoke] endpoint fd_poll not readable\n", endpoint)) return;
 
     struct pacha_ipc_msg recv_msg = {
         .fd_capacity = 0,
@@ -162,6 +314,7 @@ void fd_ipc_boot_smoke_main(void) {
     send_msg.word0 = 55;
     send_msg.word3 = 88;
     if (!expect_ok("[fd_ipc_boot_smoke] channel send failed\n", pacha_ipc_send(pair.a, &send_msg))) return;
+    if (!expect_fd_readable("[fd_ipc_boot_smoke] channel fd_poll not readable\n", pair.b)) return;
     recv_msg = (struct pacha_ipc_msg){0};
     if (!expect_ok("[fd_ipc_boot_smoke] channel recv failed\n", pacha_ipc_recv(pair.b, &recv_msg))) return;
     if (!expect_u64("[fd_ipc_boot_smoke] channel word0 mismatch\n", recv_msg.word0, 55)) return;

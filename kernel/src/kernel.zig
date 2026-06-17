@@ -160,7 +160,7 @@ pub const Fd = u32;
 pub const fd_table_entries: usize = 256;
 pub const max_fd_objects: usize = 4096;
 pub const fd_known_flags_mask: u32 = (@as(u32, 1) << 4) - 1;
-pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 42) - 1;
+pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 44) - 1;
 
 pub const FdFlags = packed struct(u32) {
     cloexec: bool = false,
@@ -221,7 +221,9 @@ pub const FdRights = packed struct(u64) {
     irq_wait: bool = false,
     irq_ack: bool = false,
     bus_master: bool = false,
-    _reserved: u22 = 0,
+    read: bool = false,
+    write: bool = false,
+    _reserved: u20 = 0,
 };
 
 pub fn fdRightsFromBits(bits: u64) FdRights {
@@ -252,6 +254,8 @@ pub const KernelObjectKind = enum(u16) {
     dma_buffer = 10,
     dma_mapping = 11,
     irq = 12,
+    timer = 13,
+    serial = 14,
 };
 
 pub const TaskObjectState = enum(u8) {
@@ -317,6 +321,17 @@ pub const IrqObject = struct {
     flags: u32 = 0,
 };
 
+pub const TimerObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+    deadline_tick: u64 = 0,
+    interval_ticks: u64 = 0,
+    flags: u32 = 0,
+};
+
+pub const SerialObject = struct {
+    stream: u8 = 0,
+};
+
 pub const KernelObjectRef = struct {
     kind: KernelObjectKind = .none,
     index: u32 = 0,
@@ -341,6 +356,8 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     dma_buffer: DmaBufferObject,
     dma_mapping: DmaMappingObject,
     irq: IrqObject,
+    timer: TimerObject,
+    serial: SerialObject,
 };
 
 pub const KernelObjectSlot = struct {
@@ -2695,6 +2712,54 @@ pub const KernelState = struct {
         return fd;
     }
 
+    pub fn createAnonymousVmaWithPages(
+        self: *KernelState,
+        owner: PrincipalId,
+        start_va: u64,
+        size_bytes: u64,
+        prot: VmaProt,
+        flags: MmapFlags,
+        free_list: *FreePageList,
+    ) KernelError!NativeVmoRef {
+        try self.requireActiveProcess(owner);
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes)) return KernelError.InvalidState;
+        const page_count_u64 = size_bytes / native_page_size;
+        if (page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return KernelError.InvalidState;
+
+        const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+        if (try vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
+        const vma_index = findFreeVma(vma_table) orelse return KernelError.TableFull;
+
+        const vmo_ref = try self.createNativeVmo(.anonymous, size_bytes);
+        try self.retainNativeVmo(vmo_ref);
+        errdefer self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
+
+        var pages: [max_vmo_backing_pages]u64 = undefined;
+        var allocated: usize = 0;
+        errdefer {
+            while (allocated > 0) {
+                allocated -= 1;
+                free_list.appendPage(0, pages[allocated]) catch {};
+            }
+        }
+        while (allocated < page_count_u64) : (allocated += 1) {
+            pages[allocated] = (try self.allocLowPhysicalPage(free_list)).paddr;
+        }
+        try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]);
+        allocated = 0;
+
+        vma_table.entries[vma_index] = .{
+            .active = true,
+            .start_va = start_va,
+            .size_bytes = size_bytes,
+            .prot = prot,
+            .flags = flags,
+            .vmo = vmo_ref,
+            .vmo_offset = 0,
+        };
+        return vmo_ref;
+    }
+
     pub fn fdInfo(self: *const KernelState, owner: PrincipalId, fd: Fd) ?FdInfo {
         const entry = self.fdEntryConst(owner, fd) orelse return null;
         const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
@@ -2712,12 +2777,182 @@ pub const KernelState = struct {
                 info.size_bytes = thread.exit_code;
                 info.extra = @intFromEnum(thread.state);
             },
+            .event => |counter| {
+                info.size_bytes = counter;
+            },
             .vmo => |vmo_ref| {
                 info.size_bytes = self.nativeVmoSize(vmo_ref) orelse 0;
+            },
+            .timer => |timer| {
+                info.size_bytes = timer.deadline_tick;
+                info.extra = timer.interval_ticks;
+            },
+            .serial => |serial| {
+                info.extra = serial.stream;
             },
             else => {},
         }
         return info;
+    }
+
+    pub fn eventReadCounter(self: *KernelState, owner: PrincipalId, fd: Fd) ?u64 {
+        const view = self.fdPayloadWithRights(owner, fd, .{ .read = true }) orelse return null;
+        const counter = switch (view.payload.*) {
+            .event => |counter| counter,
+            else => return null,
+        };
+        if (counter == 0) return 0;
+        view.payload.* = .{ .event = 0 };
+        return counter;
+    }
+
+    pub fn eventWriteCounter(self: *KernelState, owner: PrincipalId, fd: Fd, value: u64) KernelError!void {
+        if (value == 0) return;
+        const view = self.fdPayloadWithRights(owner, fd, .{ .write = true }) orelse return KernelError.InvalidState;
+        const counter = switch (view.payload.*) {
+            .event => |counter| counter,
+            else => return KernelError.InvalidState,
+        };
+        const next, const overflow = @addWithOverflow(counter, value);
+        if (overflow != 0 or next == std.math.maxInt(u64)) return KernelError.InvalidState;
+        view.payload.* = .{ .event = next };
+    }
+
+    pub fn eventWakeOwnersForFd(
+        self: *const KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        out: []PrincipalId,
+    ) KernelError!usize {
+        const source = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        const slot = self.kernelObjectSlotConst(source.object) orelse return KernelError.InvalidState;
+        if (slot.kind != .event) return KernelError.InvalidState;
+        var count: usize = 0;
+        var process_index: usize = 0;
+        while (process_index < self.process_capacity) : (process_index += 1) {
+            const desc = self.processDescriptorSlotConst(process_index) orelse continue;
+            if (!desc.active) continue;
+            const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
+            var fd_index: usize = 0;
+            while (fd_index < fd_table_entries) : (fd_index += 1) {
+                const candidate = table.entries[fd_index];
+                if (candidate.object.isNull()) continue;
+                if (!candidate.rights.read or (!candidate.rights.wait and !candidate.rights.poll)) continue;
+                if (candidate.object.kind != source.object.kind or
+                    candidate.object.index != source.object.index or
+                    candidate.object.generation != source.object.generation) continue;
+                appendUniquePrincipal(out, &count, desc.principal);
+                break;
+            }
+        }
+        return count;
+    }
+
+    fn timerDueCount(timer: TimerObject, now_tick: u64) u64 {
+        if (timer.deadline_tick == 0 or now_tick < timer.deadline_tick) return 0;
+        if (timer.interval_ticks == 0) return 1;
+        return 1 + (now_tick - timer.deadline_tick) / timer.interval_ticks;
+    }
+
+    fn timerNextWakeTick(timer: TimerObject, now_tick: u64) ?u64 {
+        if (timer.deadline_tick == 0) return null;
+        if (timerDueCount(timer, now_tick) != 0) return now_tick;
+        return timer.deadline_tick;
+    }
+
+    pub fn timerReadExpirations(self: *KernelState, owner: PrincipalId, fd: Fd, now_tick: u64) ?u64 {
+        const view = self.fdPayloadWithRights(owner, fd, .{ .read = true }) orelse return null;
+        var timer = switch (view.payload.*) {
+            .timer => |timer| timer,
+            else => return null,
+        };
+        const count = timerDueCount(timer, now_tick);
+        if (count == 0) return 0;
+        if (timer.interval_ticks == 0) {
+            timer.deadline_tick = 0;
+        } else {
+            timer.deadline_tick +%= count * timer.interval_ticks;
+        }
+        view.payload.* = .{ .timer = timer };
+        return count;
+    }
+
+    fn fdIpcReadable(self: *const KernelState, payload: *const KernelObjectPayload) bool {
+        return switch (payload.*) {
+            .endpoint => |endpoint_ref| blk: {
+                const endpoint = self.ipcEndpointSlotConst(endpoint_ref) orelse break :blk false;
+                break :blk !endpoint.queue.isEmpty();
+            },
+            .channel => |handle| blk: {
+                if (handle.side > 1) break :blk false;
+                const channel = self.ipcChannelSlotConst(handle.channel) orelse break :blk false;
+                break :blk !channel.queues[@as(usize, handle.side)].isEmpty();
+            },
+            .reply => |reply_ref| blk: {
+                const reply = self.ipcReplySlotConst(reply_ref) orelse break :blk false;
+                break :blk !reply.queue.isEmpty();
+            },
+            else => false,
+        };
+    }
+
+    fn fdIpcWritable(self: *const KernelState, payload: *const KernelObjectPayload) bool {
+        return switch (payload.*) {
+            .endpoint => |endpoint_ref| blk: {
+                const endpoint = self.ipcEndpointSlotConst(endpoint_ref) orelse break :blk false;
+                break :blk !endpoint.queue.isFull();
+            },
+            .channel => |handle| blk: {
+                if (handle.side > 1) break :blk false;
+                const channel = self.ipcChannelSlotConst(handle.channel) orelse break :blk false;
+                break :blk !channel.queues[1 - @as(usize, handle.side)].isFull();
+            },
+            .reply => |reply_ref| blk: {
+                const reply = self.ipcReplySlotConst(reply_ref) orelse break :blk false;
+                break :blk !reply.sent;
+            },
+            else => false,
+        };
+    }
+
+    pub fn fdPollEvents(self: *const KernelState, owner: PrincipalId, fd: Fd, requested: u64, now_tick: u64) ?u64 {
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        if (!entry.rights.poll) return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        var ready: u64 = 0;
+        if ((requested & @import("kernel_abi_root").fd_abi.event_readable) != 0) {
+            const readable = switch (slot.payload) {
+                .endpoint, .channel, .reply => self.fdIpcReadable(&slot.payload),
+                .process => |process| process.state != .active,
+                .thread => |thread| thread.state != .active,
+                .event => |counter| entry.rights.read and counter != 0,
+                .irq => |irq| irq.event_count != 0,
+                .timer => |timer| timerDueCount(timer, now_tick) != 0,
+                .serial => false,
+                else => false,
+            };
+            if (readable) ready |= @import("kernel_abi_root").fd_abi.event_readable;
+        }
+        if ((requested & @import("kernel_abi_root").fd_abi.event_writable) != 0) {
+            const writable = switch (slot.payload) {
+                .endpoint, .channel, .reply => self.fdIpcWritable(&slot.payload),
+                .event => entry.rights.write,
+                .serial => entry.rights.write,
+                else => false,
+            };
+            if (writable) ready |= @import("kernel_abi_root").fd_abi.event_writable;
+        }
+        return ready & requested;
+    }
+
+    pub fn fdNextWakeTick(self: *const KernelState, owner: PrincipalId, fd: Fd, now_tick: u64) ?u64 {
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        if (!entry.rights.wait and !entry.rights.poll) return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        return switch (slot.payload) {
+            .timer => |timer| timerNextWakeTick(timer, now_tick),
+            else => null,
+        };
     }
 
     pub fn fdPayloadWithRightsConst(
@@ -3026,6 +3261,73 @@ pub const KernelState = struct {
         return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
             if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
             return err;
+        };
+    }
+
+    pub fn createTimerFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        deadline_tick: u64,
+        interval_ticks: u64,
+        flags: FdFlags,
+        rights: FdRights,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        try self.requireActiveProcess(owner);
+        const object_ref = try self.createKernelObject(.timer, .{ .timer = .{
+            .owner_principal_raw = @intFromEnum(owner),
+            .deadline_tick = deadline_tick,
+            .interval_ticks = interval_ticks,
+        } });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn createEventFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        initial_value: u64,
+        flags: FdFlags,
+        rights: FdRights,
+        min_fd: Fd,
+    ) KernelError!Fd {
+        try self.requireActiveProcess(owner);
+        if (initial_value == std.math.maxInt(u64)) return KernelError.InvalidState;
+        const object_ref = try self.createKernelObject(.event, .{ .event = initial_value });
+        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+            if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+            return err;
+        };
+    }
+
+    pub fn createSerialFdAt(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        stream: u8,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const table = try self.fdTableForActiveProcess(owner);
+        if (!table.entries[index].isEmpty()) return KernelError.InvalidState;
+        const object_ref = try self.createKernelObject(.serial, .{ .serial = .{ .stream = stream } });
+        errdefer if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+        try self.retainKernelObject(object_ref);
+        table.entries[index] = .{
+            .object = object_ref,
+            .rights = .{
+                .inspect = true,
+                .dup = true,
+                .transfer = true,
+                .poll = true,
+                .set_flags = true,
+                .close = true,
+                .read = true,
+                .write = true,
+            },
+            .flags = .{ .inherit = true },
         };
     }
 
@@ -3367,6 +3669,67 @@ pub const KernelState = struct {
             },
             else => {},
         }
+    }
+
+    fn endpointRefEqual(a: IpcEndpointRef, b: IpcEndpointRef) bool {
+        return a.index == b.index and a.generation == b.generation;
+    }
+
+    fn channelRefEqual(a: IpcChannelRef, b: IpcChannelRef) bool {
+        return a.index == b.index and a.generation == b.generation;
+    }
+
+    fn replyRefEqual(a: IpcReplyRef, b: IpcReplyRef) bool {
+        return a.index == b.index and a.generation == b.generation;
+    }
+
+    fn ipcPayloadReceivesFromSendPayload(send_payload: *const KernelObjectPayload, recv_payload: *const KernelObjectPayload) bool {
+        return switch (send_payload.*) {
+            .endpoint => |send_ref| switch (recv_payload.*) {
+                .endpoint => |recv_ref| endpointRefEqual(send_ref, recv_ref),
+                else => false,
+            },
+            .channel => |send_handle| switch (recv_payload.*) {
+                .channel => |recv_handle| send_handle.side <= 1 and
+                    recv_handle.side <= 1 and
+                    channelRefEqual(send_handle.channel, recv_handle.channel) and
+                    recv_handle.side == 1 - send_handle.side,
+                else => false,
+            },
+            .reply => |send_ref| switch (recv_payload.*) {
+                .reply => |recv_ref| replyRefEqual(send_ref, recv_ref),
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    pub fn ipcRecvWakeOwnersForSendFd(
+        self: *const KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        out: []PrincipalId,
+    ) KernelError!usize {
+        const source = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        const send_slot = self.kernelObjectSlotConst(source.object) orelse return KernelError.InvalidState;
+        var count: usize = 0;
+        var process_index: usize = 0;
+        while (process_index < self.process_capacity) : (process_index += 1) {
+            const desc = self.processDescriptorSlotConst(process_index) orelse continue;
+            if (!desc.active) continue;
+            const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
+            var fd_index: usize = 0;
+            while (fd_index < fd_table_entries) : (fd_index += 1) {
+                const candidate = table.entries[fd_index];
+                if (candidate.object.isNull()) continue;
+                if (!candidate.rights.recv or (!candidate.rights.wait and !candidate.rights.poll)) continue;
+                const recv_slot = self.kernelObjectSlotConst(candidate.object) orelse continue;
+                if (!ipcPayloadReceivesFromSendPayload(&send_slot.payload, &recv_slot.payload)) continue;
+                appendUniquePrincipal(out, &count, desc.principal);
+                break;
+            }
+        }
+        return count;
     }
 
     fn ipcMessageQueueForRecv(self: *KernelState, object_ref: KernelObjectRef) KernelError!*IpcQueue {
@@ -4033,4 +4396,46 @@ fn containsCapId(ids: []const u64, target: u64) bool {
         if (id == target) return true;
     }
     return false;
+}
+
+test "ipc send wake owner scan follows channel receive side" {
+    var state = KernelState.initPhase1();
+    const sender = processPrincipalFromIndex(0).?;
+    const receiver = processPrincipalFromIndex(1).?;
+    const rights = FdRights{
+        .inspect = true,
+        .transfer = true,
+        .wait = true,
+        .poll = true,
+        .close = true,
+        .send = true,
+        .recv = true,
+    };
+    const pair = try state.createIpcChannelPairFds(sender, rights, .{}, 16);
+    const receiver_fd = try state.transferFd(sender, receiver, pair.b, 16, rights, .{}, .move);
+    try std.testing.expect(receiver_fd >= 16);
+
+    var owners: [8]PrincipalId = undefined;
+    const count = try state.ipcRecvWakeOwnersForSendFd(sender, pair.a, owners[0..]);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(receiver, owners[0]);
+}
+
+test "ipc send wake owner scan includes endpoint receiver" {
+    var state = KernelState.initPhase1();
+    const owner = processPrincipalFromIndex(0).?;
+    const rights = FdRights{
+        .inspect = true,
+        .wait = true,
+        .poll = true,
+        .close = true,
+        .send = true,
+        .recv = true,
+    };
+    const endpoint = try state.createIpcEndpointFd(owner, rights, .{}, 16);
+
+    var owners: [8]PrincipalId = undefined;
+    const count = try state.ipcRecvWakeOwnersForSendFd(owner, endpoint, owners[0..]);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(owner, owners[0]);
 }

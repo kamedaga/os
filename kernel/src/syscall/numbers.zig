@@ -4,6 +4,7 @@ const capsule_abi = abi_root.capsule_abi;
 const fd_abi = abi_root.fd_abi;
 const ipc_abi = abi_root.ipc_abi;
 const process_abi = abi_root.process_abi;
+const runtime_abi = abi_root.runtime_abi;
 
 pub const syscall_log: u64 = 1;
 pub const syscall_process_create: u64 = process_abi.syscall_process_create;
@@ -16,16 +17,33 @@ pub const syscall_thread_kill: u64 = process_abi.syscall_thread_kill;
 pub const syscall_thread_wait: u64 = process_abi.syscall_thread_wait;
 pub const syscall_thread_exit: u64 = process_abi.syscall_thread_exit;
 pub const syscall_thread_set_fs_base: u64 = process_abi.syscall_thread_set_fs_base;
-pub const syscall_get_tick_count: u64 = 12;
-pub const syscall_get_rtc_unix_time: u64 = 13;
+
+pub const syscall_getpid: u64 = runtime_abi.syscall_getpid;
+pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
+pub const syscall_clock_gettime: u64 = runtime_abi.syscall_clock_gettime;
+pub const syscall_nanosleep: u64 = runtime_abi.syscall_nanosleep;
+pub const syscall_futex_wait: u64 = runtime_abi.syscall_futex_wait;
+pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
 
 pub const syscall_fd_close: u64 = fd_abi.syscall_fd_close;
 pub const syscall_fd_dup: u64 = fd_abi.syscall_fd_dup;
 pub const syscall_fd_get_info: u64 = fd_abi.syscall_fd_get_info;
 pub const syscall_fd_set_flags: u64 = fd_abi.syscall_fd_set_flags;
+pub const syscall_fd_read: u64 = fd_abi.syscall_fd_read;
+pub const syscall_fd_write: u64 = fd_abi.syscall_fd_write;
+pub const syscall_fd_readv: u64 = fd_abi.syscall_fd_readv;
+pub const syscall_fd_writev: u64 = fd_abi.syscall_fd_writev;
+pub const syscall_fd_fcntl: u64 = fd_abi.syscall_fd_fcntl;
+pub const syscall_fd_poll: u64 = fd_abi.syscall_fd_poll;
+pub const syscall_fd_wait_many: u64 = fd_abi.syscall_fd_wait_many;
+pub const syscall_fd_ioctl: u64 = fd_abi.syscall_fd_ioctl;
+pub const syscall_fd_stat: u64 = fd_abi.syscall_fd_stat;
+pub const syscall_eventfd_create: u64 = fd_abi.syscall_eventfd_create;
+pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
 pub const syscall_mmap: u64 = fd_abi.syscall_mmap;
 pub const syscall_munmap: u64 = fd_abi.syscall_munmap;
+pub const syscall_mprotect: u64 = fd_abi.syscall_mprotect;
 
 pub const syscall_ipc_endpoint_create: u64 = ipc_abi.syscall_ipc_endpoint_create;
 pub const syscall_ipc_channel_create: u64 = ipc_abi.syscall_ipc_channel_create;
@@ -70,15 +88,31 @@ test "native syscall numbers are contiguous" {
         syscall_thread_wait,
         syscall_thread_exit,
         syscall_thread_set_fs_base,
-        syscall_get_tick_count,
-        syscall_get_rtc_unix_time,
+        syscall_getpid,
+        syscall_gettid,
+        syscall_clock_gettime,
+        syscall_nanosleep,
+        syscall_futex_wait,
+        syscall_futex_wake,
         syscall_fd_close,
         syscall_fd_dup,
         syscall_fd_get_info,
         syscall_fd_set_flags,
+        syscall_fd_read,
+        syscall_fd_write,
+        syscall_fd_readv,
+        syscall_fd_writev,
+        syscall_fd_fcntl,
+        syscall_fd_poll,
+        syscall_fd_wait_many,
+        syscall_fd_ioctl,
+        syscall_fd_stat,
+        syscall_eventfd_create,
+        syscall_timerfd_create,
         syscall_vmo_create,
         syscall_mmap,
         syscall_munmap,
+        syscall_mprotect,
         syscall_ipc_endpoint_create,
         syscall_ipc_channel_create,
         syscall_ipc_send,

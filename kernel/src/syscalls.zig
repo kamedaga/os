@@ -2,7 +2,6 @@ const std = @import("std");
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig");
-const rtc = @import("rtc.zig");
 const boot_static = @import("boot/main_static.zig");
 const sc = @import("syscall/numbers.zig");
 const syscall_lock_policy = @import("syscall/lock_policy.zig");
@@ -10,6 +9,7 @@ const capsule_syscalls = @import("syscall/capsule.zig");
 const fd_syscalls = @import("syscall/fd.zig");
 const native_ipc_syscalls = @import("syscall/native_ipc.zig");
 const process_syscalls = @import("syscall/process.zig");
+const runtime_syscalls = @import("syscall/runtime.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 
@@ -70,6 +70,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_storage), &syscall_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
+    end = maxStaticEnd(end, runtime_syscalls.kernelStaticStorageEndAddr());
     return end;
 }
 
@@ -137,6 +138,9 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     if (native_ipc_syscalls.dispatch(h, state, proc, frame)) |result| {
         return result;
     }
+    if (runtime_syscalls.dispatch(h, proc, frame)) |result| {
+        return result;
+    }
 
     return switch (frame.rax) {
         sc.syscall_log => blk: {
@@ -153,8 +157,6 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
             h.write(msg);
             break :blk sc.syscall_ok;
         },
-        sc.syscall_get_tick_count => scheduler.lapic_tick_count,
-        sc.syscall_get_rtc_unix_time => rtc.unixTimeSeconds(),
         else => sc.syscall_err_invalid,
     };
 }
