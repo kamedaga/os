@@ -412,6 +412,13 @@ apps:
       rebuild: ["bash", "tools/build_seed0root.sh"]
     out: "SEED0RT.ELF"
     rootfs: "/sbin/seed0root.elf"
+  koboxd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/koboxd/koboxd.elf"
+      rebuild: ["bash", "tools/build_koboxd.sh"]
+    out: "KOBOXD.ELF"
+    rootfs: "/sbin/koboxd.elf"
   net_bench:
     file:
       path: ".artifacts/userland-fixtures/net_bench.elf"

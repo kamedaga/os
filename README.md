@@ -1,6 +1,6 @@
 # PachaOS
 
-> FD pure microkernel OS written in Zig — Linux ABI compatible, userland-first.
+> FD pure microkernel OS written in Zig — Everything is a File Descriptor.
 
 ![Zig](https://img.shields.io/badge/kernel-Zig-f7a41d?style=flat-square&logo=zig)
 ![Go](https://img.shields.io/badge/tooling-Go-00ADD8?style=flat-square&logo=go)
@@ -26,7 +26,13 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 - **x86_64** — x86_64 対応。AArch64 は今後対応予定
 - **Native Libc** — musl libcを互換レイヤーを用いず、ネイティブで動かせます
 - **Minimal Kernel** — 20k以下を維持するマイクロカーネルです。(現在16k) 
-  
+
+## Update
+- カーネルを再設計しFD-based Microkernelへ変更しました
+- 独自ドライバからkoboxに全面移行しました。
+- Linux ABIレイヤーなしで musl libcに対応しました。
+- その影響ですべての既存のソースコードが動かなくなりました。現在修正中です。
+
 ## Tech Stack
 
 | Layer | Language | Detail |
@@ -79,20 +85,24 @@ hello world
 
 ---
 
-## kobox — Linux Kernel Driver Runtime
+## kobox — Linux Kernel Module Runtime
 
 [![kobox](https://img.shields.io/badge/kobox-GitHub-black?style=flat-square&logo=github)](https://github.com/kamedaga/kobox)
 
-[kobox](https://github.com/kamedaga/kobox) は Linux カーネル向けドライバ (`.ko`) をユーザーランドプロセスとして直接実行するランタイムです。  
+[kobox](https://github.com/kamedaga/kobox) は Linux カーネル向けモジュール (`.ko`) をユーザーランドプロセスとして直接実行するランタイムです。  
 バックエンドを実装することで任意の OS に対応でき、PachaOS では独自 Capsule を用いて動作します。
+
 
 **PachaOS Capsule バックエンドで動作中:**
 
-| Driver | Module |
+| Module | Module |
 |---|---|
 | NVMe | `nvme.ko` / `nvme-core.ko` |
 | USB Storage | `usbcore.ko` / `usb-storage.ko` / `xhci-hcd.ko` |
 | USB HID(マウスで実験中) | `usbcore.ko` / `hid.ko` / `hid-generic.ko` / `usbhid.ko` / `xhci-hcd.ko`|
+| Ext4 | `crc16.ko` / `mbcache.ko` / `jbd2.ko` / `ext4.ko`|
+
+koboxはcapabilityベースからFDベースに切り替え、ネイティブABIで自然にlibcが動いたため、daemonとして動くようになりました。
 
 ※koboxはApache 2.0でライセンスされてます。
 

@@ -13,9 +13,13 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libpacha/src/syscall.c"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+    "${REPO_ROOT}/userland/libipc/src/ipc.c"
+    "${REPO_ROOT}/userland/libpacha/src/syscall.c"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
