@@ -232,19 +232,50 @@ apps:
       path: ".artifacts/userland-fixtures/kobox-modules/nvme.ko"
       rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVME.KO"
+    bootfs: "/srv/kobox/nvme.ko"
     rootfs: "/usr/lib/kobox/nvme.ko"
   kobox_nvme_auth:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/nvme-auth.ko"
       rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVMEAUTH.KO"
+    bootfs: "/srv/kobox/nvme-auth.ko"
     rootfs: "/usr/lib/kobox/nvme-auth.ko"
   kobox_nvme_core:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/nvme-core.ko"
       rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVMECOR.KO"
+    bootfs: "/srv/kobox/nvme-core.ko"
     rootfs: "/usr/lib/kobox/nvme-core.ko"
+  kobox_crc16:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/crc16.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
+    out: "CRC16.KO"
+    bootfs: "/srv/kobox/crc16.ko"
+    rootfs: "/usr/lib/kobox/crc16.ko"
+  kobox_mbcache:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/mbcache.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
+    out: "MBCACHE.KO"
+    bootfs: "/srv/kobox/mbcache.ko"
+    rootfs: "/usr/lib/kobox/mbcache.ko"
+  kobox_jbd2:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/jbd2.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
+    out: "JBD2.KO"
+    bootfs: "/srv/kobox/jbd2.ko"
+    rootfs: "/usr/lib/kobox/jbd2.ko"
+  kobox_ext4:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/ext4.ko"
+      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
+    out: "EXT4.KO"
+    bootfs: "/srv/kobox/ext4.ko"
+    rootfs: "/usr/lib/kobox/ext4.ko"
   kobox_run:
     file:
       path: ".artifacts/userland-fixtures/kobox/kobox-run.elf"
@@ -352,6 +383,28 @@ apps:
       rebuild: ["bash", "tools/build_wsl_musl_smoke.sh"]
     out: "MUSLSMOK.ELF"
     rootfs: "/cmd/musl_smoke.elf"
+  pachaos_capsule:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/pachaos_capsule/pachaos_capsule.elf"
+      rebuild: ["bash", "tools/build_pachaos_capsule.sh"]
+    out: "PCAPSULE.ELF"
+    rootfs: "/srv/pachaos_capsule.elf"
+  storage_boot:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/storage_boot/storage_boot.elf"
+      rebuild: ["bash", "tools/build_storage_boot.sh"]
+    out: "STRGBOOT.ELF"
+    bootfs: "/srv/storage_boot.elf"
+    rootfs: "/srv/storage_boot.elf"
+  seed0_next:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/seed0_next/seed0_next.elf"
+      rebuild: ["bash", "tools/build_seed0_next.sh"]
+    out: "SEED0NX.ELF"
+    rootfs: "/srv/seed0_next.elf"
   net_bench:
     file:
       path: ".artifacts/userland-fixtures/net_bench.elf"

@@ -243,6 +243,45 @@ fn nanosToTicks(nsec: u64) ?u64 {
     return (nsec + tick_nsec - 1) / tick_nsec;
 }
 
+fn ticksToTimespec(ticks: u64) struct { sec: u64, nsec: u64 } {
+    return .{
+        .sec = ticks / 1000,
+        .nsec = (ticks % 1000) * 1_000_000,
+    };
+}
+
+fn timespecToTicks(sec: u64, nsec: u64) ?u64 {
+    if (nsec >= 1_000_000_000) return null;
+    const sec_ns, const sec_overflow = @mulWithOverflow(sec, 1_000_000_000);
+    if (sec_overflow != 0) return null;
+    const total_ns, const add_overflow = @addWithOverflow(sec_ns, nsec);
+    if (add_overflow != 0) return null;
+    return nanosToTicks(total_ns);
+}
+
+fn readTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64) ?struct { value_ticks: u64, interval_ticks: u64 } {
+    if (spec_va == 0) return null;
+    const interval_sec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_sec_offset) orelse return null;
+    const interval_nsec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_nsec_offset) orelse return null;
+    const value_sec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_sec_offset) orelse return null;
+    const value_nsec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_nsec_offset) orelse return null;
+    return .{
+        .value_ticks = timespecToTicks(value_sec, value_nsec) orelse return null,
+        .interval_ticks = timespecToTicks(interval_sec, interval_nsec) orelse return null,
+    };
+}
+
+fn writeTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64, state: kernel.TimerFdState) u64 {
+    if (spec_va == 0) return sc.syscall_ok;
+    const interval = ticksToTimespec(state.interval_ticks);
+    const value = ticksToTimespec(state.remaining_ticks);
+    if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_sec_offset, interval.sec)) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_nsec_offset, interval.nsec)) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_sec_offset, value.sec)) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_nsec_offset, value.nsec)) return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
+
 fn timerfdCreate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if (frame.rdi != fd_abi.timerfd_clock_monotonic) return sc.syscall_err_invalid;
     if ((frame.rsi & ~fd_abi.timerfd_known_flags_mask) != 0) return sc.syscall_err_invalid;
@@ -262,6 +301,30 @@ fn timerfdCreate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *T
         kernel.fdRightsFromBits(frame.r8),
         first_dynamic_fd,
     ) catch |err| statusFromKernelError(err);
+}
+
+fn timerfdSettime(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    const fd: kernel.Fd = @intCast(frame.rdi);
+    const flags = frame.rsi;
+    if ((flags & ~fd_abi.timerfd_known_flags_mask) != 0) return sc.syscall_err_invalid;
+    const spec = readTimerSpec(h, proc, frame.rdx) orelse return sc.syscall_err_invalid;
+    const old_state = state.timerFdState(proc, fd, scheduler.lapic_tick_count) orelse return sc.syscall_err_invalid;
+    const old_status = writeTimerSpec(h, proc, frame.r10, old_state);
+    if (old_status != sc.syscall_ok) return old_status;
+    const deadline_tick = if (spec.value_ticks == 0)
+        0
+    else if ((flags & fd_abi.timerfd_flag_abstime) != 0)
+        spec.value_ticks
+    else
+        scheduler.lapic_tick_count + spec.value_ticks;
+    state.setTimerFd(proc, fd, deadline_tick, spec.interval_ticks, @truncate(flags)) catch return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
+
+fn timerfdGettime(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64) u64 {
+    if (out_va == 0) return sc.syscall_err_invalid;
+    const timer_state = state.timerFdState(proc, fd, scheduler.lapic_tick_count) orelse return sc.syscall_err_invalid;
+    return writeTimerSpec(h, proc, out_va, timer_state);
 }
 
 fn eventfdCreate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -501,6 +564,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_fd_stat => writeFdStat(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_eventfd_create => eventfdCreate(state, proc, frame),
         sc.syscall_timerfd_create => timerfdCreate(state, proc, frame),
+        sc.syscall_timerfd_settime => timerfdSettime(h, state, proc, frame),
+        sc.syscall_timerfd_gettime => timerfdGettime(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_vmo_create => state.createAnonymousVmoFdWithPages(
             proc,
             frame.rdi,

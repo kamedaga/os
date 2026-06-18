@@ -17,6 +17,8 @@ pub const syscall_thread_kill: u64 = process_abi.syscall_thread_kill;
 pub const syscall_thread_wait: u64 = process_abi.syscall_thread_wait;
 pub const syscall_thread_exit: u64 = process_abi.syscall_thread_exit;
 pub const syscall_thread_set_fs_base: u64 = process_abi.syscall_thread_set_fs_base;
+pub const syscall_thread_set_gs_base: u64 = process_abi.syscall_thread_set_gs_base;
+pub const syscall_process_map: u64 = process_abi.syscall_process_map;
 
 pub const syscall_getpid: u64 = runtime_abi.syscall_getpid;
 pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
@@ -40,6 +42,8 @@ pub const syscall_fd_ioctl: u64 = fd_abi.syscall_fd_ioctl;
 pub const syscall_fd_stat: u64 = fd_abi.syscall_fd_stat;
 pub const syscall_eventfd_create: u64 = fd_abi.syscall_eventfd_create;
 pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
+pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
+pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
 pub const syscall_mmap: u64 = fd_abi.syscall_mmap;
 pub const syscall_munmap: u64 = fd_abi.syscall_munmap;
@@ -88,6 +92,8 @@ test "native syscall numbers are contiguous" {
         syscall_thread_wait,
         syscall_thread_exit,
         syscall_thread_set_fs_base,
+        syscall_thread_set_gs_base,
+        syscall_process_map,
         syscall_getpid,
         syscall_gettid,
         syscall_clock_gettime,
@@ -109,6 +115,8 @@ test "native syscall numbers are contiguous" {
         syscall_fd_stat,
         syscall_eventfd_create,
         syscall_timerfd_create,
+        syscall_timerfd_settime,
+        syscall_timerfd_gettime,
         syscall_vmo_create,
         syscall_mmap,
         syscall_munmap,

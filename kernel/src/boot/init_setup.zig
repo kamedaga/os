@@ -28,7 +28,6 @@ pub const BootFsImageSetup = struct {
     first_page_paddr: u64,
     size_bytes: u64,
     page_count: usize,
-    page_paddrs: [init_bootstrap_abi.max_boot_archive_pages]u64,
 };
 
 pub const KernelBackedInitSpawnPage = struct {
@@ -86,39 +85,68 @@ pub fn mapBootFsImageIntoProcessOrHalt(
     free_list: *kernel.FreePageList,
 ) BootFsImageSetup {
     const page_count = std.math.divCeil(usize, image.len, 4096) catch unreachable;
-    if (page_count > init_bootstrap_abi.max_boot_archive_pages) {
-        halt.haltWithLabelMessage(role_label, " bootfs image too large for bootstrap descriptor");
-    }
     var first_page_paddr: u64 = 0;
-    var page_paddrs = [_]u64{0} ** init_bootstrap_abi.max_boot_archive_pages;
     var copied: usize = 0;
+    const tracked_size = @as(u64, @intCast(page_count)) * kernel.native_page_size;
+    const fd = state.createAnonymousVmoFd(
+        principal,
+        tracked_size,
+        .{
+            .map_read = true,
+            .close = true,
+        },
+        .{ .private = true },
+        0,
+    ) catch |err| {
+        halt.haltWithRolePageError(role_label, "bootfs image", "create native VMO fd", err);
+    };
+    const vmo_ref = state.nativeVmoRefForFd(principal, fd) orelse {
+        halt.haltWithRolePageMessage(role_label, "bootfs image", "native VMO fd missing");
+    };
     var page_index: usize = 0;
     while (page_index < page_count) : (page_index += 1) {
         const page = process_factory.allocPageForProcessOrHalt(state, principal, role_label, "bootfs image page", free_list);
         if (first_page_paddr == 0) first_page_paddr = page.paddr;
-        page_paddrs[page_index] = page.paddr;
         const dst: [*]u8 = @ptrFromInt(page.paddr);
         @memset(dst[0..4096], 0);
         const remaining = image.len - copied;
         const chunk_len: usize = if (remaining > 4096) 4096 else remaining;
         @memcpy(dst[0..chunk_len], image[copied .. copied + chunk_len]);
-        process_factory.mapUserPageOrHalt(
-            state,
+        if (!user_vm.mapUserLinearRegion(
             principal,
             base_va + @as(u64, @intCast(page_index)) * 4096,
-            page,
+            page.paddr,
+            4096,
             false,
-            role_label,
-            "bootfs image page",
-            free_list,
-        );
+        )) {
+            halt.haltWithRolePageMessage(role_label, "bootfs image page", "map failed");
+        }
+        var paddrs = [_]u64{page.paddr};
+        state.installNativeVmoPages(vmo_ref, page_index, paddrs[0..]) catch |err| {
+            _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+            halt.haltWithRolePageError(role_label, "bootfs image page", "install native VMO page", err);
+        };
         copied += chunk_len;
     }
+    _ = state.mmapFd(
+        principal,
+        fd,
+        base_va,
+        tracked_size,
+        .{ .read = true },
+        .{ .anonymous = true, .private = true, .fixed = true },
+        0,
+    ) catch |err| {
+        _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+        halt.haltWithRolePageError(role_label, "bootfs image", "track native VMA", err);
+    };
+    state.closeFdWithFreeList(principal, fd, free_list) catch |err| {
+        halt.haltWithRolePageError(role_label, "bootfs image", "close native VMO fd", err);
+    };
     return .{
         .first_page_paddr = first_page_paddr,
         .size_bytes = image.len,
         .page_count = page_count,
-        .page_paddrs = page_paddrs,
     };
 }
 
@@ -269,14 +297,6 @@ pub fn publishInitBootstrapDescriptorPage(
     while (boot_image_idx < init_bootstrap_abi.max_boot_image_descriptors) : (boot_image_idx += 1) {
         page.boot_images[boot_image_idx] = .{ .kind = 0, .payload_kind = 0, .flags = 0 };
     }
-    var bootfs_page_idx: usize = 0;
-    while (bootfs_page_idx < init_bootstrap_abi.max_boot_archive_pages) : (bootfs_page_idx += 1) {
-        page.bootfs_page_paddrs[bootfs_page_idx] = 0;
-    }
-    var page_copy_idx: usize = 0;
-    while (page_copy_idx < bootfs_setup.page_count) : (page_copy_idx += 1) {
-        page.bootfs_page_paddrs[page_copy_idx] = bootfs_setup.page_paddrs[page_copy_idx];
-    }
     inline for (init_bootstrap_abi.builtin_boot_images, 0..) |descriptor, idx| {
         var updated = descriptor;
         const kind: init_bootstrap_abi.ImageKind = @enumFromInt(updated.kind);
@@ -350,6 +370,7 @@ fn grantInitDeviceFdOrHalt(
         .inspect = true,
         .dup = true,
         .transfer = true,
+        .set_flags = true,
         .close = true,
         .query = true,
         .config_read = true,

@@ -328,6 +328,11 @@ pub const TimerObject = struct {
     flags: u32 = 0,
 };
 
+pub const TimerFdState = struct {
+    remaining_ticks: u64 = 0,
+    interval_ticks: u64 = 0,
+};
+
 pub const SerialObject = struct {
     stream: u8 = 0,
 };
@@ -2485,6 +2490,24 @@ pub const KernelState = struct {
         return self.fdTableForProcessIndexConst(index);
     }
 
+    pub fn inheritFdsForProcessCreate(self: *KernelState, from: PrincipalId, to: PrincipalId) KernelError!void {
+        if (from == to) return KernelError.InvalidState;
+        const source_table = try self.fdTableForActiveProcessConst(from);
+        const dest_table = try self.fdTableForActiveProcess(to);
+        var fd_index: usize = 0;
+        while (fd_index < fd_table_entries) : (fd_index += 1) {
+            const source = source_table.entries[fd_index];
+            if (source.object.isNull() or !source.flags.inherit or source.flags.private) continue;
+            if (!dest_table.entries[fd_index].isEmpty()) return KernelError.InvalidState;
+            try self.retainKernelObject(source.object);
+            dest_table.entries[fd_index] = .{
+                .object = source.object,
+                .rights = fdRightsFromBits(fdRightsToBits(source.rights)),
+                .flags = fdFlagsFromBits(fdFlagsToBits(source.flags)),
+            };
+        }
+    }
+
     pub fn getVmaTable(self: *KernelState, principal: PrincipalId) ?*VmaTable {
         const index = processIndexFromPrincipal(principal) orelse return null;
         return self.vmaTableForProcessIndex(index);
@@ -2875,6 +2898,38 @@ pub const KernelState = struct {
         }
         view.payload.* = .{ .timer = timer };
         return count;
+    }
+
+    pub fn timerFdState(self: *const KernelState, owner: PrincipalId, fd: Fd, now_tick: u64) ?TimerFdState {
+        const view = self.fdPayloadWithRightsConst(owner, fd, .{ .inspect = true }) orelse return null;
+        const timer = switch (view.payload.*) {
+            .timer => |timer| timer,
+            else => return null,
+        };
+        const remaining = if (timer.deadline_tick == 0 or now_tick >= timer.deadline_tick) 0 else timer.deadline_tick - now_tick;
+        return .{
+            .remaining_ticks = remaining,
+            .interval_ticks = timer.interval_ticks,
+        };
+    }
+
+    pub fn setTimerFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        deadline_tick: u64,
+        interval_ticks: u64,
+        flags: u32,
+    ) KernelError!void {
+        const view = self.fdPayloadWithRights(owner, fd, .{ .write = true }) orelse return KernelError.InvalidState;
+        var timer = switch (view.payload.*) {
+            .timer => |timer| timer,
+            else => return KernelError.InvalidState,
+        };
+        timer.deadline_tick = deadline_tick;
+        timer.interval_ticks = interval_ticks;
+        timer.flags = flags;
+        view.payload.* = .{ .timer = timer };
     }
 
     fn fdIpcReadable(self: *const KernelState, payload: *const KernelObjectPayload) bool {
@@ -3360,6 +3415,50 @@ pub const KernelState = struct {
         if (vmo_end > vmo.size_bytes) return KernelError.InvalidState;
 
         const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+        if (try vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
+        const vma_index = findFreeVma(vma_table) orelse return KernelError.TableFull;
+        try self.retainNativeVmo(vmo_ref);
+        vma_table.entries[vma_index] = .{
+            .active = true,
+            .start_va = start_va,
+            .size_bytes = size_bytes,
+            .prot = prot,
+            .flags = flags,
+            .vmo = vmo_ref,
+            .vmo_offset = vmo_offset,
+        };
+        return start_va;
+    }
+
+    pub fn mmapFdIntoProcess(
+        self: *KernelState,
+        source_owner: PrincipalId,
+        fd: Fd,
+        target_owner: PrincipalId,
+        start_va: u64,
+        size_bytes: u64,
+        prot: VmaProt,
+        flags: MmapFlags,
+        vmo_offset: u64,
+    ) KernelError!u64 {
+        _ = try self.fdTableForActiveProcessConst(source_owner);
+        try self.requireActiveProcess(target_owner);
+        const fd_entry = self.fdEntryConst(source_owner, fd) orelse return KernelError.InvalidState;
+        if (!vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes) or !isPageAligned(vmo_offset)) return KernelError.InvalidState;
+        const map_end = try checkedEnd(start_va, size_bytes);
+        _ = map_end;
+
+        const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
+        const vmo_ref = switch (object_slot.payload) {
+            .vmo => |ref| ref,
+            else => return KernelError.InvalidState,
+        };
+        const vmo = self.nativeVmoSlotConst(vmo_ref) orelse return KernelError.InvalidState;
+        const vmo_end = try checkedEnd(vmo_offset, size_bytes);
+        if (vmo_end > vmo.size_bytes) return KernelError.InvalidState;
+
+        const vma_table = self.getVmaTable(target_owner) orelse return KernelError.InvalidState;
         if (try vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
         const vma_index = findFreeVma(vma_table) orelse return KernelError.TableFull;
         try self.retainNativeVmo(vmo_ref);
@@ -4438,4 +4537,36 @@ test "ipc send wake owner scan includes endpoint receiver" {
     const count = try state.ipcRecvWakeOwnersForSendFd(owner, endpoint, owners[0..]);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(owner, owners[0]);
+}
+
+test "mmapFdIntoProcess installs vmo fd into target vma table" {
+    var state = KernelState.initPhase1();
+    const source = processPrincipalFromIndex(0).?;
+    const target = processPrincipalFromIndex(1).?;
+    const vmo_fd = try state.createAnonymousVmoFd(source, native_page_size, .{
+        .inspect = true,
+        .close = true,
+        .map_read = true,
+        .map_exec = true,
+    }, .{}, 16);
+
+    const mapped = try state.mmapFdIntoProcess(
+        source,
+        vmo_fd,
+        target,
+        0x400000,
+        native_page_size,
+        .{ .read = true, .exec = true },
+        .{ .fixed = true, .shared = true },
+        0,
+    );
+    try std.testing.expectEqual(@as(u64, 0x400000), mapped);
+
+    const vma = state.vmaEntryConst(target, 0x400000) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(native_page_size, vma.size_bytes);
+    try std.testing.expect(vma.prot.read);
+    try std.testing.expect(vma.prot.exec);
+    try std.testing.expect(!vma.prot.write);
+    try std.testing.expect(vma.flags.fixed);
+    try std.testing.expect(vma.flags.shared);
 }

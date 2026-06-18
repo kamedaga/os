@@ -10,6 +10,11 @@ cc="${CAPOS_FREESTANDING_CC:-clang}"
 ar="${CAPOS_AR:-ar}"
 target="${PACHAOS_MUSL_DRIVER_TARGET:-x86_64-linux-musl}"
 upstream="$repo_root/musl/upstream"
+app_src="${PACHAOS_MUSL_APP_SOURCE:-$repo_root/musl/pachaos/smoke/hello.c}"
+app_out="${1:-$out_dir/hello-libc-scaffold.elf}"
+extra_sources="${PACHAOS_MUSL_EXTRA_SOURCES:-}"
+extra_include_dirs="${PACHAOS_MUSL_EXTRA_INCLUDE_DIRS:-}"
+extra_cflags="${PACHAOS_MUSL_EXTRA_CFLAGS:-}"
 
 rm -rf "$obj_dir" "$sysroot"
 mkdir -p \
@@ -20,6 +25,7 @@ mkdir -p \
   "$obj_dir/app" \
   "$sysroot/usr/include" \
   "$sysroot/usr/lib"
+mkdir -p "$(dirname "$app_out")"
 
 sed -f "$upstream/tools/mkalltypes.sed" \
   "$upstream/arch/pachaos/bits/alltypes.h.in" \
@@ -64,6 +70,7 @@ libc_sources=(
   "$upstream/src/internal/defsysinfo.c"
   "$upstream/src/internal/procfdname.c"
   "$upstream/src/env/__environ.c"
+  "$upstream/src/env/getenv.c"
   "$upstream/src/env/__init_tls.c"
   "$upstream/src/thread/default_attr.c"
   "$upstream/src/thread/__syscall_cp.c"
@@ -72,6 +79,7 @@ libc_sources=(
   "$upstream/src/errno/strerror.c"
   "$upstream/src/exit/exit.c"
   "$upstream/src/exit/_Exit.c"
+  "$upstream/src/exit/atexit.c"
   "$upstream/src/unistd/read.c"
   "$upstream/src/unistd/write.c"
   "$upstream/src/unistd/close.c"
@@ -79,6 +87,9 @@ libc_sources=(
   "$upstream/src/unistd/writev.c"
   "$upstream/src/unistd/isatty.c"
   "$upstream/src/select/poll.c"
+  "$upstream/src/time/nanosleep.c"
+  "$upstream/src/time/clock_nanosleep.c"
+  "$upstream/src/unistd/sleep.c"
   "$upstream/src/misc/ioctl.c"
   "$upstream/src/stat/fstat.c"
   "$upstream/src/stat/fstatat.c"
@@ -96,11 +107,15 @@ libc_sources=(
   "$upstream/src/malloc/mallocng/malloc_usable_size.c"
   "$upstream/src/malloc/mallocng/donate.c"
   "$upstream/src/malloc/calloc.c"
+  "$upstream/src/malloc/libc_calloc.c"
   "$upstream/src/malloc/free.c"
   "$upstream/src/malloc/realloc.c"
   "$upstream/src/malloc/reallocarray.c"
   "$upstream/src/malloc/replaced.c"
   "$upstream/src/time/clock_gettime.c"
+  "$upstream/src/time/timespec_get.c"
+  "$upstream/src/linux/eventfd.c"
+  "$upstream/src/linux/timerfd.c"
   "$upstream/src/thread/__lock.c"
   "$upstream/src/unistd/lseek.c"
   "$upstream/src/stdio/__lockfile.c"
@@ -112,11 +127,24 @@ libc_sources=(
   "$upstream/src/stdio/__stdio_write.c"
   "$upstream/src/stdio/__stdout_write.c"
   "$upstream/src/stdio/__towrite.c"
+  "$upstream/src/stdio/__uflow.c"
   "$upstream/src/stdio/fflush.c"
+  "$upstream/src/stdio/fclose.c"
+  "$upstream/src/stdio/fopen.c"
+  "$upstream/src/stdio/fread.c"
+  "$upstream/src/stdio/fseek.c"
+  "$upstream/src/stdio/ftell.c"
+  "$upstream/src/stdio/__fdopen.c"
+  "$upstream/src/stdio/__fmodeflags.c"
+  "$upstream/src/stdio/__toread.c"
   "$upstream/src/stdio/fprintf.c"
+  "$upstream/src/stdio/fputc.c"
+  "$upstream/src/stdio/fputs.c"
   "$upstream/src/stdio/fwrite.c"
   "$upstream/src/stdio/ofl.c"
+  "$upstream/src/stdio/ofl_add.c"
   "$upstream/src/stdio/printf.c"
+  "$upstream/src/stdio/puts.c"
   "$upstream/src/stdio/snprintf.c"
   "$upstream/src/stdio/stderr.c"
   "$upstream/src/stdio/stdout.c"
@@ -131,12 +159,35 @@ libc_sources=(
   "$upstream/src/math/frexpl.c"
   "$upstream/src/math/scalbn.c"
   "$upstream/src/string/memcpy.c"
+  "$upstream/src/string/bcmp.c"
+  "$upstream/src/string/memcmp.c"
   "$upstream/src/string/memchr.c"
+  "$upstream/src/string/memrchr.c"
+  "$upstream/src/string/strchr.c"
+  "$upstream/src/string/strchrnul.c"
+  "$upstream/src/string/strcpy.c"
+  "$upstream/src/string/stpcpy.c"
+  "$upstream/src/string/strncat.c"
+  "$upstream/src/string/strncpy.c"
+  "$upstream/src/string/stpncpy.c"
+  "$upstream/src/string/strrchr.c"
+  "$upstream/src/string/strstr.c"
   "$upstream/src/string/strlen.c"
   "$upstream/src/string/strcmp.c"
+  "$upstream/src/string/strncmp.c"
   "$upstream/src/string/strnlen.c"
   "$upstream/src/string/memmove.c"
   "$upstream/src/string/memset.c"
+  "$upstream/src/ctype/isalnum.c"
+  "$upstream/src/ctype/tolower.c"
+  "$upstream/src/stdlib/bsearch.c"
+  "$upstream/src/stdlib/qsort.c"
+  "$upstream/src/stdlib/qsort_nr.c"
+  "$upstream/src/stdlib/strtol.c"
+  "$upstream/src/internal/intscan.c"
+  "$upstream/src/internal/shgetc.c"
+  "$upstream/src/fcntl/open.c"
+  "$upstream/src/fcntl/fcntl.c"
   "$repo_root/musl/pachaos/syscall/thread_area.c"
 )
 
@@ -174,11 +225,29 @@ app_cflags=(
   -Wextra
   -D_XOPEN_SOURCE=700
 )
+for include_dir in $extra_include_dirs; do
+  app_cflags+=("-I" "$include_dir")
+done
+for flag in $extra_cflags; do
+  app_cflags+=("$flag")
+done
 
 "$cc" \
   "${app_cflags[@]}" \
-  -c "$repo_root/musl/pachaos/smoke/hello.c" \
+  -c "$app_src" \
   -o "$obj_dir/app/hello.o"
+
+app_objects=("$obj_dir/app/hello.o")
+extra_index=0
+for src in $extra_sources; do
+  obj="$obj_dir/app/extra_${extra_index}.o"
+  "$cc" \
+    "${app_cflags[@]}" \
+    -c "$src" \
+    -o "$obj"
+  app_objects+=("$obj")
+  extra_index=$((extra_index + 1))
+done
 
 "$cc" \
   -target "$target" \
@@ -198,11 +267,11 @@ app_cflags=(
   -Wl,-z,max-page-size=4096 \
   "$sysroot/usr/lib/rcrt1.o" \
   "$sysroot/usr/lib/crti.o" \
-  "$obj_dir/app/hello.o" \
+  "${app_objects[@]}" \
   -Wl,--start-group \
   "$sysroot/usr/lib/libc.a" \
   -Wl,--end-group \
   "$sysroot/usr/lib/crtn.o" \
-  -o "$out_dir/hello-libc-scaffold.elf"
+  -o "$app_out"
 
-echo "$out_dir/hello-libc-scaffold.elf"
+echo "$app_out"

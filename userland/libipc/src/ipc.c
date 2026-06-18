@@ -51,6 +51,26 @@ int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, 
     ));
 }
 
+int pacha_thread_start(int thread_fd) {
+    return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_START, (uint64_t)(uint32_t)thread_fd));
+}
+
+int pacha_thread_set_gs_base(uint64_t gs_base) {
+    return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, gs_base));
+}
+
+int pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
+    return pacha_status_to_int(pacha_syscall6(
+        PACHA_PROCESS_SYSCALL_MAP,
+        (uint64_t)(uint32_t)process_fd,
+        (uint64_t)(uint32_t)vmo_fd,
+        target_va,
+        size,
+        prot,
+        vmo_offset
+    ));
+}
+
 int pacha_fd_get_info(int fd, struct pacha_fd_info *out) {
     if (!out) return -1;
     return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)out));
@@ -89,6 +109,7 @@ long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeo
         const long ret = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY, (uint64_t)(uintptr_t)fds, count, timeout_ticks, 0);
         if (ret != -2 && ret != 2) return ret;
         if (timeout_ticks == 0) return ret;
+        if (timeout_ticks != UINT64_MAX) return ret;
     }
 }
 
@@ -105,6 +126,28 @@ int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rig
         interval_ns,
         rights,
         fd_flags
+    ));
+}
+
+int pacha_timerfd_settime(int fd, uint64_t initial_ns, uint64_t interval_ns, uint64_t flags) {
+    struct pacha_timer_spec {
+        uint64_t interval_sec;
+        uint64_t interval_nsec;
+        uint64_t value_sec;
+        uint64_t value_nsec;
+    };
+    const struct pacha_timer_spec spec = {
+        .interval_sec = interval_ns / 1000000000ull,
+        .interval_nsec = interval_ns % 1000000000ull,
+        .value_sec = initial_ns / 1000000000ull,
+        .value_nsec = initial_ns % 1000000000ull,
+    };
+    return pacha_status_to_int(pacha_syscall4(
+        PACHA_FD_SYSCALL_TIMERFD_SETTIME,
+        (uint64_t)(uint32_t)fd,
+        flags,
+        (uint64_t)(uintptr_t)&spec,
+        0
     ));
 }
 

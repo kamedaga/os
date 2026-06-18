@@ -78,7 +78,7 @@ fn timespecToTicks(sec: u64, nsec: u64) ?u64 {
     const extra = nanosToTicks(nsec);
     const ticks, const add_overflow = @addWithOverflow(sec_ticks, extra);
     if (add_overflow != 0) return null;
-    return if (ticks == 0) 1 else ticks;
+    return ticks;
 }
 
 fn nanosleep(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -87,6 +87,7 @@ fn nanosleep(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     const sec = h.read_user_u64(proc, req_va + runtime_abi.timespec_sec_offset) orelse return sc.syscall_err_invalid;
     const nsec = h.read_user_u64(proc, req_va + runtime_abi.timespec_nsec_offset) orelse return sc.syscall_err_invalid;
     const ticks = timespecToTicks(sec, nsec) orelse return sc.syscall_err_invalid;
+    if (ticks == 0) return sc.syscall_ok;
     if (h.block_current_thread_for_event(frame, false, ticks, sc.syscall_ok)) return sc.syscall_ok;
     return sc.syscall_err_not_ready;
 }

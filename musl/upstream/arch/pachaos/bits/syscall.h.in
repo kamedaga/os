@@ -31,3 +31,9 @@
 #define __NR_fstatat 27
 #define __NR_statx 28
 #define __NR_fcntl 29
+#define __NR_eventfd2 30
+#define __NR_timerfd_create 31
+#define __NR_timerfd_settime 32
+#define __NR_timerfd_settime64 __NR_timerfd_settime
+#define __NR_timerfd_gettime 33
+#define __NR_timerfd_gettime64 __NR_timerfd_gettime

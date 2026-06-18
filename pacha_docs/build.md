@@ -97,7 +97,7 @@ build / sync も一緒にやってから起動:
 ./pacgo qemu --prepare
 ```
 
-virtio-console を別 terminal に分ける:
+console を別 terminal に分ける:
 
 ```bash
 ./pacgo qemu --new-terminal

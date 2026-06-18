@@ -1,10 +1,10 @@
-pub const syscall_runtime_first: u64 = 12;
-pub const syscall_getpid: u64 = 12;
-pub const syscall_gettid: u64 = 13;
-pub const syscall_clock_gettime: u64 = 14;
-pub const syscall_nanosleep: u64 = 15;
-pub const syscall_futex_wait: u64 = 16;
-pub const syscall_futex_wake: u64 = 17;
+pub const syscall_runtime_first: u64 = 14;
+pub const syscall_getpid: u64 = 14;
+pub const syscall_gettid: u64 = 15;
+pub const syscall_clock_gettime: u64 = 16;
+pub const syscall_nanosleep: u64 = 17;
+pub const syscall_futex_wait: u64 = 18;
+pub const syscall_futex_wake: u64 = 19;
 pub const syscall_runtime_last: u64 = syscall_futex_wake;
 pub const syscall_runtime_count: u64 = syscall_runtime_last - syscall_runtime_first + 1;
 

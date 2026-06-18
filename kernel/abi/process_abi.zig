@@ -11,7 +11,9 @@ pub const syscall_thread_kill: u64 = 8;
 pub const syscall_thread_wait: u64 = 9;
 pub const syscall_thread_exit: u64 = 10;
 pub const syscall_thread_set_fs_base: u64 = 11;
-pub const syscall_process_last: u64 = syscall_thread_set_fs_base;
+pub const syscall_thread_set_gs_base: u64 = 12;
+pub const syscall_process_map: u64 = 13;
+pub const syscall_process_last: u64 = syscall_process_map;
 pub const syscall_process_count: u64 = syscall_process_last - syscall_process_first + 1;
 
 pub const process_flag_none: u64 = 0;
@@ -29,6 +31,9 @@ pub const status_size: u64 = 32;
 pub const state_active: u64 = 1;
 pub const state_exited: u64 = 2;
 pub const state_killed: u64 = 3;
+
+pub const process_map_flag_none: u64 = 0;
+pub const process_map_known_flags_mask: u64 = process_map_flag_none;
 
 pub const aux_base_va: u64 = 0x3C00_0000;
 pub const aux_page_bytes: u64 = 0x1000;

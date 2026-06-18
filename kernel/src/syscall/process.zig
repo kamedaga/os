@@ -12,6 +12,20 @@ const process_abi = abi_root.process_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 
+fn protFromBits(bits: u64) ?kernel.VmaProt {
+    if ((bits & ~(fd_abi.prot_read | fd_abi.prot_write | fd_abi.prot_exec)) != 0) return null;
+    return .{
+        .read = (bits & fd_abi.prot_read) != 0,
+        .write = (bits & fd_abi.prot_write) != 0,
+        .exec = (bits & fd_abi.prot_exec) != 0,
+    };
+}
+
+fn pageAlignUp(value: u64) ?u64 {
+    if (value > std.math.maxInt(u64) - 4095) return null;
+    return (value + 4095) & ~@as(u64, 4095);
+}
+
 fn isUserEntryVa(va: u64) bool {
     return va != 0 and user_vm.isUserCanonicalVa(va);
 }
@@ -78,6 +92,14 @@ fn createProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalI
         _ = state.removeProcessDescriptor(principal);
         return sc.syscall_err_map;
     }
+    state.inheritFdsForProcessCreate(proc, principal) catch |err| {
+        state.releasePrincipalNativeMemory(principal, h.free_list);
+        _ = state.removeProcessDescriptor(principal);
+        return switch (err) {
+            kernel.KernelError.TableFull => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
+    };
     const rights = kernel.fdRightsFromBits(frame.rsi);
     return state.createProcessFd(proc, .{
         .principal_raw = @intFromEnum(principal),
@@ -149,6 +171,62 @@ fn waitThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     return writeThreadStatus(h, proc, out_va, thread);
 }
 
+fn mapIntoProcess(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    free_list: *kernel.FreePageList,
+    frame: *TrapFrame,
+) u64 {
+    const process_fd: kernel.Fd = @intCast(frame.rdi);
+    const vmo_fd: kernel.Fd = @intCast(frame.rsi);
+    const target_va = frame.rdx;
+    const size_bytes = frame.r10;
+    const prot_bits = frame.r8;
+    const vmo_offset = frame.r9;
+    if (target_va == 0 or (target_va & 0xFFF) != 0 or (vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
+    if (size_bytes == 0) return sc.syscall_err_invalid;
+    const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
+    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
+    const prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
+    const flags: kernel.MmapFlags = .{ .fixed = true, .shared = true };
+
+    const process = state.processObjectForFd(proc, process_fd, .{ .map_into = true }) orelse return sc.syscall_err_invalid;
+    if (process.state != .active) return sc.syscall_err_invalid;
+    const target_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (!state.hasActivePrincipal(target_owner)) return sc.syscall_err_invalid;
+
+    _ = state.mmapFdIntoProcess(proc, vmo_fd, target_owner, target_va, aligned_size, prot, flags, vmo_offset) catch |err| switch (err) {
+        kernel.KernelError.TableFull => return sc.syscall_err_alloc,
+        else => return sc.syscall_err_invalid,
+    };
+
+    var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
+    const page_count: usize = @intCast(aligned_size / 4096);
+    const offset_pages: usize = @intCast(vmo_offset / 4096);
+    const vmo_ref = state.nativeVmoRefForFd(proc, vmo_fd) orelse {
+        state.munmapExactWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
+        return sc.syscall_err_invalid;
+    };
+    var i: usize = 0;
+    while (i < page_count) : (i += 1) {
+        paddrs[i] = state.nativeVmoPagePaddr(vmo_ref, offset_pages + i) orelse {
+            state.munmapExactWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
+            return sc.syscall_err_map;
+        };
+    }
+    if (!prot.read and !prot.write and !prot.exec) return sc.syscall_ok;
+    if (!user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
+        .read = prot.read,
+        .write = prot.write,
+        .exec = prot.exec,
+        .pkey = prot.pkey,
+    })) {
+        state.munmapExactWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
+        return sc.syscall_err_map;
+    }
+    return sc.syscall_ok;
+}
+
 fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame, code: u32) u64 {
     const current = scheduler.currentThreadIndex();
     const generation = scheduler.threadGeneration(current) orelse {
@@ -204,6 +282,13 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             if (!scheduler.setCurrentThreadFsBase(fs_base)) break :blk sc.syscall_err_not_ready;
             break :blk sc.syscall_ok;
         },
+        sc.syscall_thread_set_gs_base => blk: {
+            const gs_base = frame.rdi;
+            if (gs_base != 0 and !user_vm.isUserCanonicalVa(gs_base)) break :blk sc.syscall_err_invalid;
+            if (!scheduler.setCurrentThreadGsBase(gs_base)) break :blk sc.syscall_err_not_ready;
+            break :blk sc.syscall_ok;
+        },
+        sc.syscall_process_map => mapIntoProcess(state, proc, h.free_list, frame),
         else => null,
     };
 }

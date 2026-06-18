@@ -8,6 +8,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -98,6 +100,20 @@ int main(int argc, char **argv, char **envp) {
         log_text("[pachaos-musl-smoke] clock_gettime failed\n");
         return 4;
     }
+    struct timespec rt = {0, 0};
+    if (clock_gettime(CLOCK_REALTIME, &rt) != 0) {
+        log_text("[pachaos-musl-smoke] realtime clock_gettime failed\n");
+        return 22;
+    }
+    const struct timespec tiny_sleep = { .tv_sec = 0, .tv_nsec = 0 };
+    if (nanosleep(&tiny_sleep, 0) != 0) {
+        log_text("[pachaos-musl-smoke] nanosleep failed\n");
+        return 23;
+    }
+    if (sleep(0) != 0) {
+        log_text("[pachaos-musl-smoke] sleep(0) failed\n");
+        return 24;
+    }
 
     unsigned char *heap = (unsigned char *)malloc(128);
     if (heap == 0) {
@@ -130,6 +146,14 @@ int main(int argc, char **argv, char **envp) {
     free(zeroed);
     free(heap);
 
+    void *large_heap = malloc(65536);
+    if (large_heap == 0) {
+        log_text("[pachaos-musl-smoke] large malloc failed\n");
+        return 25;
+    }
+    memset(large_heap, 0x5c, 65536);
+    free(large_heap);
+
     volatile int futex_word = 1;
     long wait_result = syscall(SYS_futex, &futex_word, FUTEX_WAIT, 0, 0);
     if (wait_result != -1) {
@@ -140,6 +164,64 @@ int main(int argc, char **argv, char **envp) {
     if (wake_result < 0) {
         log_text("[pachaos-musl-smoke] futex wake failed\n");
         return 11;
+    }
+
+    int event_fd = eventfd(0, 0);
+    if (event_fd < 0) {
+        log_text("[pachaos-musl-smoke] eventfd failed\n");
+        return 26;
+    }
+    eventfd_t event_value = 7;
+    if (eventfd_write(event_fd, event_value) != 0) {
+        log_text("[pachaos-musl-smoke] eventfd_write failed\n");
+        return 27;
+    }
+    struct pollfd event_pfd = { .fd = event_fd, .events = POLLIN, .revents = 0 };
+    if (poll(&event_pfd, 1, 0) != 1 || (event_pfd.revents & POLLIN) == 0) {
+        log_text("[pachaos-musl-smoke] eventfd poll failed\n");
+        return 28;
+    }
+    event_value = 0;
+    if (eventfd_read(event_fd, &event_value) != 0 || event_value != 7) {
+        log_text("[pachaos-musl-smoke] eventfd_read failed\n");
+        return 29;
+    }
+    if (close(event_fd) != 0) {
+        log_text("[pachaos-musl-smoke] eventfd close failed\n");
+        return 30;
+    }
+
+    int timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (timer_fd < 0) {
+        log_text("[pachaos-musl-smoke] timerfd_create failed\n");
+        return 31;
+    }
+    struct itimerspec timer_spec;
+    memset(&timer_spec, 0, sizeof(timer_spec));
+    timer_spec.it_value.tv_nsec = 1000000;
+    if (timerfd_settime(timer_fd, 0, &timer_spec, 0) != 0) {
+        log_text("[pachaos-musl-smoke] timerfd_settime failed\n");
+        return 32;
+    }
+    struct itimerspec timer_cur;
+    memset(&timer_cur, 0, sizeof(timer_cur));
+    if (timerfd_gettime(timer_fd, &timer_cur) != 0) {
+        log_text("[pachaos-musl-smoke] timerfd_gettime failed\n");
+        return 33;
+    }
+    struct pollfd timer_pfd = { .fd = timer_fd, .events = POLLIN, .revents = 0 };
+    if (poll(&timer_pfd, 1, 50) != 1 || (timer_pfd.revents & POLLIN) == 0) {
+        log_text("[pachaos-musl-smoke] timerfd poll timeout failed\n");
+        return 34;
+    }
+    uint64_t expirations = 0;
+    if (read(timer_fd, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations) || expirations == 0) {
+        log_text("[pachaos-musl-smoke] timerfd read failed\n");
+        return 35;
+    }
+    if (close(timer_fd) != 0) {
+        log_text("[pachaos-musl-smoke] timerfd close failed\n");
+        return 36;
     }
 
     if (close(1) != 0) {

@@ -365,9 +365,6 @@ pub fn dispatch(
                 if (!h.write_user_u64(proc, frame.rdx, count)) break :blk sc.syscall_err_invalid;
                 break :blk 1;
             }
-            if (h.block_current_thread_for_event(frame, true, 0, sc.syscall_err_not_ready)) {
-                break :blk sc.syscall_err_not_ready;
-            }
             break :blk sc.syscall_err_not_ready;
         },
         sc.syscall_capsule_pci_config_read => blk: {

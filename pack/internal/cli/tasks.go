@@ -150,6 +150,7 @@ func testCommand(ctx *context) *cobra.Command {
 	cmd.AddCommand(fdIPCSmokeTestCommand(ctx))
 	cmd.AddCommand(deviceFDSmokeTestCommand(ctx))
 	cmd.AddCommand(muslPachaOSSmokeTestCommand(ctx))
+	cmd.AddCommand(seed0BootTestCommand(ctx))
 	cmd.AddCommand(qemuTestCommand(ctx, "qemu"))
 	return cmd
 }
@@ -291,6 +292,50 @@ func muslPachaOSSmokeTestCommand(ctx *context) *cobra.Command {
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the musl PachaOS smoke marker")
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
 	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
+	return cmd
+}
+
+func seed0BootTestCommand(ctx *context) *cobra.Command {
+	var timeout time.Duration
+	var noKVM bool
+	var extraArgs []string
+	var marker string
+	cmd := &cobra.Command{
+		Use:   "seed0boot",
+		Short: "Boot QEMU with the libc-based seed0boot init",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ui.Task("test:seed0boot")
+			result, err := boottest.RunSeed0Boot(ctx.workspace, boottest.Seed0BootOptions{
+				Timeout:   timeout,
+				NoKVM:     noKVM,
+				ExtraArgs: extraArgs,
+				Marker:    marker,
+			})
+			state := "passed"
+			if err != nil {
+				state = "failed"
+			}
+			ui.KeyValues("Seed0boot", [][2]string{
+				{"state", state},
+				{"marker", result.Marker},
+				{"timeout", result.Timeout.String()},
+				{"seed elf", ctx.workspace.Rel(result.SeedELF)},
+				{"kernel", ctx.workspace.Rel(result.KernelEFI)},
+				{"disk", ctx.workspace.Rel(result.Disk)},
+				{"serial", ctx.workspace.Rel(result.Serial)},
+				{"qemu log", ctx.workspace.Rel(result.Log)},
+				{"restored", fmt.Sprint(result.Restored)},
+			})
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the seed0boot marker")
+	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
+	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
+	cmd.Flags().StringVar(&marker, "marker", "", "serial log marker required for success")
 	return cmd
 }
 

@@ -5,13 +5,12 @@ pub const image_flag_present: u64 = 1 << 0;
 pub const image_flag_kernel_loaded: u64 = 1 << 1;
 
 pub const magic: u64 = 0x49425453; // "IBTS"
-pub const version: u64 = 18;
+pub const version: u64 = 19;
 pub const config_magic: u64 = 0x49425443; // "IBTC"
 pub const config_version: u64 = 1;
 pub const max_spawn_page_descriptors: usize = 8;
 pub const max_device_descriptors: usize = 8;
 pub const max_device_queue_grants: usize = 4;
-pub const max_boot_archive_pages: usize = 128;
 pub const boot_display_shell_height: u64 = 624;
 pub const boot_log_user_page_va: u64 = process_abi.auxPageVa(1);
 pub const boot_log_page_header_bytes: usize = 8;
@@ -177,5 +176,4 @@ pub const DescriptorPage = extern struct {
     spawn_pages: [max_spawn_page_descriptors]SpawnPageDescriptor,
     devices: [max_device_descriptors]DeviceDescriptor,
     boot_images: [max_boot_image_descriptors]BootImageDescriptor,
-    bootfs_page_paddrs: [max_boot_archive_pages]u64,
 };

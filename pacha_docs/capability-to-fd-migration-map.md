@@ -123,7 +123,7 @@ Phase 3 では旧 VM object syscall は互換実装を持たず invalid を返�
 
 | 現在 | 移行先 |
 |---|---|
-| PachaOS 専用 virtio / block driver | kobox daemon or C service |
+| PachaOS 専用 block driver | pachaos_capsule + kobox module daemon |
 | capsule token env passing | device fd bootstrap / fd passing |
 | driver direct syscall | `libcapsule` |
 | driver-private IPC | `libipc` |

@@ -4,23 +4,39 @@
 #define PACHAOS_SYSCALL_LOG 1
 #define PACHAOS_SYSCALL_PROCESS_EXIT 5
 #define PACHAOS_SYSCALL_THREAD_SET_FS_BASE 11
-#define PACHAOS_SYSCALL_GETPID 12
-#define PACHAOS_SYSCALL_GETTID 13
-#define PACHAOS_SYSCALL_CLOCK_GETTIME 14
-#define PACHAOS_SYSCALL_NANOSLEEP 15
-#define PACHAOS_SYSCALL_FUTEX_WAIT 16
-#define PACHAOS_SYSCALL_FUTEX_WAKE 17
-#define PACHAOS_SYSCALL_FD_CLOSE 18
-#define PACHAOS_SYSCALL_FD_READ 22
-#define PACHAOS_SYSCALL_FD_WRITE 23
-#define PACHAOS_SYSCALL_FD_READV 24
-#define PACHAOS_SYSCALL_FD_WRITEV 25
-#define PACHAOS_SYSCALL_FD_POLL 27
-#define PACHAOS_SYSCALL_FD_IOCTL 29
-#define PACHAOS_SYSCALL_FD_STAT 30
-#define PACHAOS_SYSCALL_MMAP 34
-#define PACHAOS_SYSCALL_MUNMAP 35
-#define PACHAOS_SYSCALL_MPROTECT 36
+#define PACHAOS_SYSCALL_THREAD_SET_GS_BASE 12
+#define PACHAOS_SYSCALL_PROCESS_MAP 13
+#define PACHAOS_SYSCALL_GETPID 14
+#define PACHAOS_SYSCALL_GETTID 15
+#define PACHAOS_SYSCALL_CLOCK_GETTIME 16
+#define PACHAOS_SYSCALL_NANOSLEEP 17
+#define PACHAOS_SYSCALL_FUTEX_WAIT 18
+#define PACHAOS_SYSCALL_FUTEX_WAKE 19
+#define PACHAOS_SYSCALL_FD_CLOSE 20
+#define PACHAOS_SYSCALL_FD_READ 24
+#define PACHAOS_SYSCALL_FD_WRITE 25
+#define PACHAOS_SYSCALL_FD_READV 26
+#define PACHAOS_SYSCALL_FD_WRITEV 27
+#define PACHAOS_SYSCALL_FD_POLL 29
+#define PACHAOS_SYSCALL_FD_WAIT_MANY 30
+#define PACHAOS_SYSCALL_FD_IOCTL 31
+#define PACHAOS_SYSCALL_FD_STAT 32
+#define PACHAOS_SYSCALL_EVENTFD_CREATE 33
+#define PACHAOS_SYSCALL_TIMERFD_CREATE 34
+#define PACHAOS_SYSCALL_TIMERFD_SETTIME 35
+#define PACHAOS_SYSCALL_TIMERFD_GETTIME 36
+#define PACHAOS_SYSCALL_MMAP 38
+#define PACHAOS_SYSCALL_MUNMAP 39
+#define PACHAOS_SYSCALL_MPROTECT 40
+
+#define PACHAOS_FD_FLAG_CLOEXEC 1
+#define PACHAOS_FD_FLAG_NONBLOCK 2
+#define PACHAOS_FD_RIGHT_INSPECT (1ULL << 0)
+#define PACHAOS_FD_RIGHT_WAIT (1ULL << 3)
+#define PACHAOS_FD_RIGHT_POLL (1ULL << 4)
+#define PACHAOS_FD_RIGHT_CLOSE (1ULL << 6)
+#define PACHAOS_FD_RIGHT_READ (1ULL << 42)
+#define PACHAOS_FD_RIGHT_WRITE (1ULL << 43)
 
 #define PACHAOS_PROT_READ 1
 #define PACHAOS_PROT_WRITE 2
@@ -44,6 +60,13 @@
 #define LINUX_FUTEX_WAIT 0
 #define LINUX_FUTEX_WAKE 1
 #define LINUX_AT_EMPTY_PATH 0x1000
+#define LINUX_CLOCK_MONOTONIC 1
+#define LINUX_EFD_SEMAPHORE 1
+#define LINUX_EFD_CLOEXEC 0x80000
+#define LINUX_EFD_NONBLOCK 0x800
+#define LINUX_TFD_CLOEXEC 0x80000
+#define LINUX_TFD_NONBLOCK 0x800
+#define LINUX_TFD_TIMER_ABSTIME 1
 #define LINUX_POLLIN 0x001
 #define LINUX_POLLOUT 0x004
 #define LINUX_POLLERR 0x008
@@ -159,10 +182,17 @@ static __inline short __pachaos_poll_events_to_linux(long events)
 	return out;
 }
 
+static __inline long __pachaos_fd_flags_from_linux(long flags, long cloexec_bit, long nonblock_bit)
+{
+	long out = 0;
+	if (flags & cloexec_bit) out |= PACHAOS_FD_FLAG_CLOEXEC;
+	if (flags & nonblock_bit) out |= PACHAOS_FD_FLAG_NONBLOCK;
+	return out;
+}
+
 static __inline long __pachaos_poll(struct __pachaos_linux_pollfd *fds, long n, long timeout)
 {
 	if (n < 0 || n > PACHAOS_MAX_POLLFDS) return -22;
-	if (timeout != 0) return -38;
 	struct __pachaos_pollfd native[PACHAOS_MAX_POLLFDS];
 	for (long i = 0; i < n; i++) {
 		native[i].fd = fds[i].fd;
@@ -170,6 +200,21 @@ static __inline long __pachaos_poll(struct __pachaos_linux_pollfd *fds, long n, 
 		native[i].revents = 0;
 	}
 	long ret = __pachaos_raw2(PACHAOS_SYSCALL_FD_POLL, (long)native, n);
+	if (ret < 0) return ret;
+	for (long i = 0; i < n; i++) fds[i].revents = __pachaos_poll_events_to_linux(native[i].revents);
+	if (ret != 0 || timeout == 0) return ret;
+	if (timeout < 0) {
+		for (;;) {
+			ret = __pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY, (long)native, n, ~0ULL, 0);
+			if (ret != 2) break;
+			ret = __pachaos_raw2(PACHAOS_SYSCALL_FD_POLL, (long)native, n);
+			if (ret != 0) break;
+		}
+	} else {
+		ret = __pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY, (long)native, n, timeout, 0);
+		if (ret == 2) ret = __pachaos_raw2(PACHAOS_SYSCALL_FD_POLL, (long)native, n);
+		if (ret == 0 || ret == 2) ret = 0;
+	}
 	if (ret < 0) return ret;
 	for (long i = 0; i < n; i++) fds[i].revents = __pachaos_poll_events_to_linux(native[i].revents);
 	return ret;
@@ -202,6 +247,19 @@ static __inline long __syscall2(long n, long a1, long a2)
 	case __NR_clock_gettime: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_CLOCK_GETTIME, a1, a2));
 	case __NR_nanosleep: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_NANOSLEEP, a1, a2));
 	case __NR_fstat: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_FD_STAT, a1, a2));
+	case __NR_timerfd_gettime: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_TIMERFD_GETTIME, a1, a2));
+	case __NR_eventfd2:
+		if (a2 & ~(LINUX_EFD_SEMAPHORE|LINUX_EFD_CLOEXEC|LINUX_EFD_NONBLOCK)) return -22;
+		if (a2 & LINUX_EFD_SEMAPHORE) return -38;
+		return __pachaos_raw3(PACHAOS_SYSCALL_EVENTFD_CREATE, a1,
+			PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_WAIT|PACHAOS_FD_RIGHT_POLL|PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_READ|PACHAOS_FD_RIGHT_WRITE,
+			__pachaos_fd_flags_from_linux(a2, LINUX_EFD_CLOEXEC, LINUX_EFD_NONBLOCK));
+	case __NR_timerfd_create:
+		if (a1 != LINUX_CLOCK_MONOTONIC) return -22;
+		if (a2 & ~(LINUX_TFD_CLOEXEC|LINUX_TFD_NONBLOCK)) return -22;
+		return __pachaos_raw6(PACHAOS_SYSCALL_TIMERFD_CREATE, a1, 0, 0, 0,
+			PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_WAIT|PACHAOS_FD_RIGHT_POLL|PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_READ|PACHAOS_FD_RIGHT_WRITE,
+			__pachaos_fd_flags_from_linux(a2, LINUX_TFD_CLOEXEC, LINUX_TFD_NONBLOCK));
 	default: return -38;
 	}
 }
@@ -224,6 +282,9 @@ static __inline long __syscall3(long n, long a1, long a2, long a3)
 static __inline long __syscall4(long n, long a1, long a2, long a3, long a4)
 {
 	switch (n) {
+	case __NR_clock_nanosleep:
+		if (a2 != 0) return -38;
+		return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_NANOSLEEP, a3, a4));
 	case __NR_futex:
 		if ((a2 & 127) == LINUX_FUTEX_WAIT) return __pachaos_status(__pachaos_raw4(PACHAOS_SYSCALL_FUTEX_WAIT, a1, a3, a4, 0));
 		if ((a2 & 127) == LINUX_FUTEX_WAKE) return __pachaos_raw2(PACHAOS_SYSCALL_FUTEX_WAKE, a1, a3);
@@ -233,6 +294,9 @@ static __inline long __syscall4(long n, long a1, long a2, long a3, long a4)
 			return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_FD_STAT, a1, a3));
 		}
 		return -38;
+	case __NR_timerfd_settime:
+		if (a2 & ~LINUX_TFD_TIMER_ABSTIME) return -22;
+		return __pachaos_status(__pachaos_raw4(PACHAOS_SYSCALL_TIMERFD_SETTIME, a1, a2, a3, a4));
 	default: return -38;
 	}
 }
@@ -253,6 +317,9 @@ static __inline long __syscall6(long n, long a1, long a2, long a3, long a4, long
 	case __NR_clock_gettime:
 	case __NR_nanosleep:
 	case __NR_fstat:
+	case __NR_timerfd_gettime:
+	case __NR_eventfd2:
+	case __NR_timerfd_create:
 		return __syscall2(n, a1, a2);
 	case __NR_read:
 	case __NR_write:
@@ -265,6 +332,8 @@ static __inline long __syscall6(long n, long a1, long a2, long a3, long a4, long
 		return __syscall3(n, a1, a2, a3);
 	case __NR_futex:
 	case __NR_fstatat:
+	case __NR_clock_nanosleep:
+	case __NR_timerfd_settime:
 		return __syscall4(n, a1, a2, a3, a4);
 	default: return -38;
 	}
