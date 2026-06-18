@@ -19,6 +19,7 @@ type Seed0BootOptions struct {
 	NoKVM     bool
 	ExtraArgs []string
 	Marker    string
+	BuildInit bool
 }
 
 type Seed0BootResult struct {
@@ -46,7 +47,7 @@ func RunSeed0Boot(workspace *config.Workspace, opts Seed0BootOptions) (Seed0Boot
 	}
 
 	seedELF := filepath.Join(artifactDir, "INITAPP.ELF")
-	if err := buildSeed0BootELF(workspace, seedELF); err != nil {
+	if err := prepareSeed0BootELF(workspace, seedELF, opts.BuildInit); err != nil {
 		return Seed0BootResult{SeedELF: seedELF, Marker: marker, Timeout: opts.Timeout}, err
 	}
 
@@ -121,13 +122,20 @@ func RunSeed0Boot(workspace *config.Workspace, opts Seed0BootOptions) (Seed0Boot
 	return result, errors.Join(smokeErr, restoreErr)
 }
 
-func buildSeed0BootELF(workspace *config.Workspace, out string) error {
-	cmd := exec.Command("bash", workspace.Path("tools", "build_seed0boot.sh"))
-	cmd.Dir = workspace.Root
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("build seed0boot failed: %w\n%s", err, string(output))
-	}
+func prepareSeed0BootELF(workspace *config.Workspace, out string, build bool) error {
 	built := workspace.Path(workspace.Artifacts, "cmake", "seed0boot", "seed0boot.elf")
+	if build {
+		cmd := exec.Command("bash", workspace.Path("tools", "build_seed0boot.sh"))
+		cmd.Dir = workspace.Root
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("build seed0boot failed: %w\n%s", err, string(output))
+		}
+	}
+	if stat, err := os.Stat(built); err != nil {
+		return fmt.Errorf("seed0boot ELF is missing: %s (run tools/build_seed0boot.sh or pass --build-init)", built)
+	} else if stat.Size() == 0 {
+		return fmt.Errorf("seed0boot ELF is empty: %s", built)
+	}
 	if err := copyFile(out, built); err != nil {
 		return err
 	}

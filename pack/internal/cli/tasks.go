@@ -300,6 +300,7 @@ func seed0BootTestCommand(ctx *context) *cobra.Command {
 	var noKVM bool
 	var extraArgs []string
 	var marker string
+	var buildInit bool
 	cmd := &cobra.Command{
 		Use:   "seed0boot",
 		Short: "Boot QEMU with the libc-based seed0boot init",
@@ -310,6 +311,7 @@ func seed0BootTestCommand(ctx *context) *cobra.Command {
 				NoKVM:     noKVM,
 				ExtraArgs: extraArgs,
 				Marker:    marker,
+				BuildInit: buildInit,
 			})
 			state := "passed"
 			if err != nil {
@@ -336,6 +338,7 @@ func seed0BootTestCommand(ctx *context) *cobra.Command {
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
 	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
 	cmd.Flags().StringVar(&marker, "marker", "", "serial log marker required for success")
+	cmd.Flags().BoolVar(&buildInit, "build-init", false, "build seed0boot before launching QEMU")
 	return cmd
 }
 
@@ -552,20 +555,24 @@ func syncRootfsCommand(ctx *context) *cobra.Command {
 
 func syncBootfsCommand(ctx *context) *cobra.Command {
 	var force bool
+	var noBuild bool
 	cmd := &cobra.Command{
 		Use:   "bootfs",
 		Short: "Build BOOTFS.IMG and sync the EFI system partition",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ui.Task("build:userland")
-			userland, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{Progress: ui.NewProgressReporter()})
-			if err != nil {
-				return err
+			if !noBuild {
+				ui.Task("build:userland")
+				userland, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{Progress: ui.NewProgressReporter()})
+				if err != nil {
+					return err
+				}
+				printUserland(userland)
 			}
-			printUserland(userland)
 			return runBootfsSync(ctx, force)
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "force ESP rewrite even when fingerprint is unchanged")
+	cmd.Flags().BoolVar(&noBuild, "no-build", false, "sync bootfs from existing artifacts without building userland")
 	return cmd
 }
 

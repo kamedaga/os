@@ -24,6 +24,7 @@ type Options struct {
 	Console     string
 	NoKVM       bool
 	NoNet       bool
+	Fast        bool
 	DryRun      bool
 	ExtraArgs   []string
 	NewTerminal bool
@@ -179,6 +180,7 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 		Console:   "pty",
 		NoKVM:     opts.NoKVM,
 		NoNet:     opts.NoNet,
+		Fast:      true,
 		ExtraArgs: opts.ExtraArgs,
 	})
 	if err != nil {
@@ -310,6 +312,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		Console:     "pty",
 		NewTerminal: true,
 		NoKVM:       opts.NoKVM,
+		Fast:        true,
 		ExtraArgs:   opts.ExtraArgs,
 	})
 	if err != nil {
@@ -638,19 +641,31 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		"-m", opts.Memory,
 		"-smp", "4",
 		"-monitor", "none",
-		"-d", "int,guest_errors,cpu_reset",
-		"-D", logPath,
+	}
+	if opts.Fast {
+		args = append(args, "-nodefaults", "-no-reboot")
+		_ = os.WriteFile(logPath, nil, 0o644)
+	} else {
+		args = append(args, "-d", "int,guest_errors,cpu_reset", "-D", logPath)
+	}
+	args = append(args,
 		"-display", opts.Display,
 		"-vga", "none",
-		"-device", "virtio-vga",
-		"-device", "virtio-tablet-pci",
-		"-device", "virtio-keyboard-pci",
-		"-drive", "if=pflash,format=raw,readonly=on,file=" + codePath,
-		"-drive", "if=pflash,format=raw,file=" + varsPath,
-		"-drive", "if=none,file=" + diskPath + ",format=raw,id=bootdisk",
+		"-drive", "if=pflash,format=raw,readonly=on,file="+codePath,
+		"-drive", "if=pflash,format=raw,file="+varsPath,
+		"-drive", "if=none,file="+diskPath+",format=raw,id=bootdisk",
 		"-device", "virtio-blk-pci,drive=bootdisk",
 		"-serial", "stdio",
+	)
+	if !opts.Fast {
+		if opts.Display != "none" {
+			args = append(args,
+				"-device", "virtio-tablet-pci",
+				"-device", "virtio-keyboard-pci",
+			)
+		}
 	}
+	args = append(args, "-device", "virtio-vga")
 	console := firstNonEmpty(opts.Console, "pty")
 	consoleSocket := ""
 	switch console {

@@ -405,6 +405,13 @@ apps:
       rebuild: ["bash", "tools/build_seed0_next.sh"]
     out: "SEED0NX.ELF"
     rootfs: "/srv/seed0_next.elf"
+  seed0root:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/seed0root/seed0root.elf"
+      rebuild: ["bash", "tools/build_seed0root.sh"]
+    out: "SEED0RT.ELF"
+    rootfs: "/sbin/seed0root.elf"
   net_bench:
     file:
       path: ".artifacts/userland-fixtures/net_bench.elf"

@@ -1,0 +1,24 @@
+cmake_minimum_required(VERSION 3.16)
+
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+project(seed0root C ASM)
+
+set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(SEED0ROOT_ELF "${CMAKE_BINARY_DIR}/seed0root.elf")
+
+add_custom_command(
+  OUTPUT "${SEED0ROOT_ELF}"
+  COMMAND
+    ${CMAKE_COMMAND} -E env
+      "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+      bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
+  DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
+  WORKING_DIRECTORY "${REPO_ROOT}"
+  VERBATIM
+)
+
+add_custom_target(seed0root ALL DEPENDS "${SEED0ROOT_ELF}")
