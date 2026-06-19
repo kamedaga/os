@@ -5,22 +5,17 @@
 
 enum {
     STORAGE_BOOT_CONFIG_MAGIC = 0x5354424f4f544346ull,
-    STORAGE_BOOT_CONFIG_VERSION = 1,
-    STORAGE_BOOT_CONFIG_VA = 0x3c100000ull,
-    STORAGE_BOOT_MODULE_IMAGE_VA = 0x50000000ull,
-    STORAGE_BOOT_MODULE_IMAGE_STRIDE = 0x01000000ull,
     STORAGE_BOOT_MAX_MODULES = 8,
 };
 
 struct storage_boot_module_config {
-    uint64_t image_va;
+    uint64_t image_fd;
     uint64_t image_size;
     char name[64];
 };
 
 struct storage_boot_config {
     uint64_t magic;
-    uint64_t version;
     uint64_t device_fd;
     uint64_t module_count;
     struct storage_boot_module_config modules[STORAGE_BOOT_MAX_MODULES];

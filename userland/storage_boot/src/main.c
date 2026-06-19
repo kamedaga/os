@@ -5,6 +5,7 @@
 #include "kobox/shim.h"
 #include "linux_subsystem/block/block.h"
 #include "linux_subsystem/fs/fs.h"
+#include "pacha/abi.h"
 #include "pacha/capsule.h"
 #include "storage_boot/boot_config.h"
 
@@ -34,15 +35,7 @@ enum {
     STORAGE_BOOT_ELF_PF_X = 1,
     STORAGE_BOOT_ELF_PF_W = 2,
     STORAGE_BOOT_ELF_PF_R = 4,
-    STORAGE_BOOT_CHILD_LOAD_BASE = 0x28000000ull,
-    STORAGE_BOOT_CHILD_STACK_TOP = 0x78000000ull,
-    STORAGE_BOOT_CHILD_STACK_SIZE = 0x20000ull,
     STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
-    STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_VERSION = 1,
-    STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_VA = 0x3e000000ull,
-    STORAGE_BOOT_SEED0ROOT_KOBOXD_IMAGE_VA = 0x3e100000ull,
-    STORAGE_BOOT_SEED0ROOT_MODULE_TABLE_VA = 0x3e200000ull,
-    STORAGE_BOOT_SEED0ROOT_MODULE_IMAGE_BASE = 0x3e300000ull,
     STORAGE_BOOT_BOOTSTRAP_MAX_MODULES = 8,
     STORAGE_BOOT_BOOTSTRAP_NAME_BYTES = 64,
     STORAGE_BOOT_AT_NULL = 0,
@@ -65,6 +58,7 @@ enum {
     STORAGE_BOOT_FD_RIGHT_KILL = 1ull << 22,
     STORAGE_BOOT_FD_RIGHT_MAP_INTO = 1ull << 24,
     STORAGE_BOOT_FD_RIGHT_SET_CONTEXT = 1ull << 25,
+    STORAGE_BOOT_FD_RIGHT_READ = 1ull << 42,
     STORAGE_BOOT_FD_FCNTL_SET_FLAGS = 2,
     STORAGE_BOOT_FD_FLAG_INHERIT = 1u << 2,
     STORAGE_BOOT_MMAP_SHARED = 1ull << 3,
@@ -110,20 +104,19 @@ typedef struct storage_boot_ext4_operations {
     int dir_operations_has_readdir;
 } storage_boot_ext4_operations_t;
 
-struct storage_boot_seed0root_bootstrap {
-    uint64_t magic;
-    uint64_t version;
-    uint64_t device_fd;
-    uint64_t koboxd_image_va;
-    uint64_t koboxd_image_size;
-    uint64_t module_count;
-    uint64_t modules_va;
-};
-
 struct storage_boot_bootstrap_module {
     char name[STORAGE_BOOT_BOOTSTRAP_NAME_BYTES];
-    uint64_t image_va;
+    uint64_t image_fd;
     uint64_t image_size;
+};
+
+struct storage_boot_seed0root_bootstrap {
+    uint64_t magic;
+    uint64_t device_fd;
+    uint64_t koboxd_image_fd;
+    uint64_t koboxd_image_size;
+    uint64_t module_count;
+    struct storage_boot_bootstrap_module modules[STORAGE_BOOT_BOOTSTRAP_MAX_MODULES];
 };
 
 struct storage_boot_rootfs_module {
@@ -136,7 +129,7 @@ struct storage_boot_module_image {
     const char *path;
     unsigned char *data;
     uint64_t size;
-    uint64_t seed0root_va;
+    int image_fd;
 };
 
 static const struct storage_boot_rootfs_module storage_boot_rootfs_modules[] = {
@@ -154,8 +147,9 @@ static const char *status_name(kb_status_t status);
 int pacha_process_create(uint64_t rights, uint32_t flags);
 int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights);
 int pacha_thread_start(int thread_fd);
-int pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
+long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
 int pacha_fd_close(int fd);
+long pacha_fd_read(int fd, void *buf, uint64_t len);
 long pacha_fd_fcntl(int fd, uint64_t cmd, uint64_t arg0, uint64_t arg1);
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags);
 void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset);
@@ -214,6 +208,96 @@ static int mark_fd_inherit(int fd, const char *label)
         return -2;
     }
     return 0;
+}
+
+static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
+{
+    if (data == NULL || size == 0) {
+        return -1;
+    }
+    if (size > UINT64_MAX - (STORAGE_BOOT_PAGE_SIZE - 1)) {
+        return -2;
+    }
+    const uint64_t map_size = (size + (STORAGE_BOOT_PAGE_SIZE - 1)) & ~(uint64_t)(STORAGE_BOOT_PAGE_SIZE - 1);
+    const uint64_t rights =
+        STORAGE_BOOT_FD_RIGHT_INSPECT |
+        STORAGE_BOOT_FD_RIGHT_TRANSFER |
+        STORAGE_BOOT_FD_RIGHT_CLOSE |
+        STORAGE_BOOT_FD_RIGHT_READ |
+        STORAGE_BOOT_FD_RIGHT_MAP_READ |
+        STORAGE_BOOT_FD_RIGHT_MAP_WRITE;
+    const int fd = pacha_vmo_create(map_size, rights, STORAGE_BOOT_FD_FLAG_INHERIT);
+    if (fd < 16) {
+        fprintf(stderr, "[storage_boot] %s: vmo_create failed status=%d\n", label, fd);
+        return -3;
+    }
+    unsigned char *mapped = pacha_mmap(
+        fd,
+        map_size,
+        STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE,
+        STORAGE_BOOT_MMAP_SHARED,
+        0);
+    if (mapped == NULL) {
+        (void)pacha_fd_close(fd);
+        return -4;
+    }
+    memset(mapped, 0, (size_t)map_size);
+    memcpy(mapped, data, (size_t)size);
+    (void)pacha_munmap(mapped, map_size);
+    return fd;
+}
+
+static int read_fd_exact(int fd, void *out, uint64_t size, const char *label)
+{
+    if (fd < 16 || out == NULL || size == 0) {
+        return -1;
+    }
+    unsigned char *cursor = out;
+    uint64_t done = 0;
+    while (done < size) {
+        const long got = pacha_fd_read(fd, cursor + done, size - done);
+        if (got <= 0) {
+            fprintf(stderr, "[storage_boot] %s: fd_read failed fd=%d got=%ld done=%llu size=%llu\n",
+                label,
+                fd,
+                got,
+                (unsigned long long)done,
+                (unsigned long long)size);
+            return -2;
+        }
+        done += (uint64_t)got;
+    }
+    return 0;
+}
+
+static int find_bootstrap_fd(char **argv, int *out_fd)
+{
+    if (argv == NULL || out_fd == NULL) {
+        return -1;
+    }
+    *out_fd = -1;
+    char **p = argv;
+    while (*p != NULL) {
+        p++;
+    }
+    p++;
+    while (*p != NULL) {
+        p++;
+    }
+    p++;
+    for (;;) {
+        const uint64_t key = (uint64_t)(uintptr_t)p[0];
+        const uint64_t value = (uint64_t)(uintptr_t)p[1];
+        if (key == STORAGE_BOOT_AT_NULL) {
+            break;
+        }
+        if (key == PACHA_AT_BOOTSTRAP_FD && value >= 16 && value <= UINT32_MAX) {
+            *out_fd = (int)value;
+            return 0;
+        }
+        p += 2;
+    }
+    return -2;
 }
 
 static uint16_t rd16(const unsigned char *p)
@@ -845,11 +929,12 @@ static int validate_elf_header(const char *path, const unsigned char *image, uin
 static int map_elf_segment(
     const char *path,
     int process_fd,
-    uint64_t load_bias,
+    uint64_t target_va,
     const unsigned char *image,
     uint64_t image_size,
     const unsigned char *ph,
-    uint16_t index)
+    uint16_t index,
+    uint64_t *out_mapped_va)
 {
     const uint32_t p_flags = rd32(ph + 4);
     const uint64_t p_offset = rd64(ph + 8);
@@ -867,8 +952,7 @@ static int map_elf_segment(
         return 0;
     }
 
-    const uint64_t target_va = align_down(p_vaddr + load_bias);
-    const uint64_t page_offset = (p_vaddr + load_bias) - target_va;
+    const uint64_t page_offset = p_vaddr - align_down(p_vaddr);
     uint64_t map_size = 0;
     if (align_up(page_offset + p_memsz, &map_size) != 0) {
         return -2;
@@ -897,70 +981,28 @@ static int map_elf_segment(
     memcpy(mapped + page_offset, image + p_offset, (size_t)p_filesz);
 
     const uint64_t prot = prot_from_elf_flags(p_flags);
-    const int map_status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
+    const long map_result = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
     (void)pacha_munmap(mapped, map_size);
     (void)pacha_fd_close(vmo_fd);
-    if (map_status != 0) {
+    if (map_result < 4096) {
         fprintf(stderr,
-            "[storage_boot] exec: process_map failed segment=%u process_fd=%d status=%d\n",
+            "[storage_boot] exec: process_map failed segment=%u process_fd=%d status=%ld\n",
             index,
             process_fd,
-            map_status);
+            map_result);
         return -5;
     }
+    if (out_mapped_va != NULL) *out_mapped_va = (uint64_t)map_result;
 
     printf("[storage_boot] exec: mapped PT_LOAD[%u] process_fd=%d target=0x%llx size=%llu prot=0x%llx file=%llu mem=%llu\n",
         index,
         process_fd,
-        (unsigned long long)target_va,
+        (unsigned long long)(uint64_t)map_result,
         (unsigned long long)map_size,
         (unsigned long long)prot,
         (unsigned long long)p_filesz,
         (unsigned long long)p_memsz);
     return 0;
-}
-
-static int map_bytes_into_process(
-    int process_fd,
-    uint64_t target_va,
-    const void *data,
-    uint64_t size,
-    uint64_t prot)
-{
-    if (process_fd < 16 || target_va == 0 || data == NULL || size == 0) {
-        return -1;
-    }
-    uint64_t map_size = 0;
-    if (align_up(size, &map_size) != 0) {
-        return -2;
-    }
-
-    const uint64_t vmo_rights =
-        STORAGE_BOOT_FD_RIGHT_INSPECT |
-        STORAGE_BOOT_FD_RIGHT_TRANSFER |
-        STORAGE_BOOT_FD_RIGHT_CLOSE |
-        STORAGE_BOOT_FD_RIGHT_MAP_READ |
-        STORAGE_BOOT_FD_RIGHT_MAP_WRITE;
-    const int vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
-    if (vmo_fd < 16) {
-        return -3;
-    }
-    unsigned char *mapped = pacha_mmap(
-        vmo_fd,
-        map_size,
-        STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE,
-        STORAGE_BOOT_MMAP_SHARED,
-        0);
-    if (mapped == NULL) {
-        (void)pacha_fd_close(vmo_fd);
-        return -4;
-    }
-    memset(mapped, 0, (size_t)map_size);
-    memcpy(mapped, data, (size_t)size);
-    const int status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
-    (void)pacha_munmap(mapped, map_size);
-    (void)pacha_fd_close(vmo_fd);
-    return status == 0 ? 0 : -5;
 }
 
 static int load_elf_process(
@@ -984,7 +1026,8 @@ static int load_elf_process(
     const uint64_t e_phoff = rd64(image + 32);
     const uint16_t e_phentsize = rd16(image + 54);
     const uint16_t e_phnum = rd16(image + 56);
-    const uint64_t load_bias = e_type == STORAGE_BOOT_ELF_TYPE_DYN ? STORAGE_BOOT_CHILD_LOAD_BASE : 0;
+    uint64_t load_bias = 0;
+    const int use_aslr = e_type == STORAGE_BOOT_ELF_TYPE_DYN;
     const uint64_t process_rights =
         STORAGE_BOOT_FD_RIGHT_INSPECT |
         STORAGE_BOOT_FD_RIGHT_CLOSE |
@@ -1005,10 +1048,16 @@ static int load_elf_process(
         if (rd32(ph + 0) != STORAGE_BOOT_ELF_PT_LOAD) {
             continue;
         }
-        status = map_elf_segment(path, process_fd, load_bias, image, image_size, ph, i);
+        const uint64_t p_vaddr = rd64(ph + 16);
+        const uint64_t requested_va = (use_aslr && load_count == 0) ? 0 : align_down(p_vaddr + load_bias);
+        uint64_t mapped_va = 0;
+        status = map_elf_segment(path, process_fd, requested_va, image, image_size, ph, i, &mapped_va);
         if (status != 0) {
             (void)pacha_fd_close(process_fd);
             return status;
+        }
+        if (use_aslr && load_count == 0) {
+            load_bias = mapped_va - align_down(p_vaddr);
         }
         load_count++;
     }
@@ -1044,7 +1093,10 @@ static int push_u64(unsigned char *stack, uint64_t *sp, uint64_t value)
     return 0;
 }
 
-static int start_loaded_process(const struct storage_boot_loaded_process *loaded, const char *argv0)
+static int start_loaded_process(
+    const struct storage_boot_loaded_process *loaded,
+    const char *argv0,
+    int bootstrap_fd)
 {
     if (loaded == NULL || loaded->process_fd < 16 || loaded->runtime_entry == 0 ||
         loaded->phdr_va == 0 || loaded->phent == 0 || loaded->phnum == 0 || argv0 == NULL) {
@@ -1052,21 +1104,20 @@ static int start_loaded_process(const struct storage_boot_loaded_process *loaded
     }
 
     const int process_fd = loaded->process_fd;
-    const uint64_t stack_base = STORAGE_BOOT_CHILD_STACK_TOP - STORAGE_BOOT_CHILD_STACK_SIZE;
     const uint64_t stack_rights =
         STORAGE_BOOT_FD_RIGHT_INSPECT |
         STORAGE_BOOT_FD_RIGHT_TRANSFER |
         STORAGE_BOOT_FD_RIGHT_CLOSE |
         STORAGE_BOOT_FD_RIGHT_MAP_READ |
         STORAGE_BOOT_FD_RIGHT_MAP_WRITE;
-    const int stack_fd = pacha_vmo_create(STORAGE_BOOT_CHILD_STACK_SIZE, stack_rights, 0);
+    const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
     if (stack_fd < 16) {
         fprintf(stderr, "[storage_boot] exec: stack vmo_create failed status=%d\n", stack_fd);
         return -2;
     }
     unsigned char *stack = pacha_mmap(
         stack_fd,
-        STORAGE_BOOT_CHILD_STACK_SIZE,
+        PACHA_PROCESS_DEFAULT_STACK_SIZE,
         STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE,
         STORAGE_BOOT_MMAP_SHARED,
         0);
@@ -1074,12 +1125,26 @@ static int start_loaded_process(const struct storage_boot_loaded_process *loaded
         (void)pacha_fd_close(stack_fd);
         return -3;
     }
-    memset(stack, 0, (size_t)STORAGE_BOOT_CHILD_STACK_SIZE);
+    memset(stack, 0, (size_t)PACHA_PROCESS_DEFAULT_STACK_SIZE);
+    const long stack_map = pacha_process_map(
+        process_fd,
+        stack_fd,
+        0,
+        PACHA_PROCESS_DEFAULT_STACK_SIZE,
+        STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE,
+        0);
+    if (stack_map < 4096) {
+        fprintf(stderr, "[storage_boot] exec: stack process_map failed status=%ld\n", stack_map);
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_fd_close(stack_fd);
+        return -6;
+    }
+    const uint64_t stack_base = (uint64_t)stack_map;
 
-    uint64_t sp = STORAGE_BOOT_CHILD_STACK_SIZE;
+    uint64_t sp = PACHA_PROCESS_DEFAULT_STACK_SIZE;
     const uint64_t argv0_len = (uint64_t)strlen(argv0) + 1;
     if (argv0_len > 256 || sp < argv0_len + 16) {
-        (void)pacha_munmap(stack, STORAGE_BOOT_CHILD_STACK_SIZE);
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -4;
     }
@@ -1095,6 +1160,7 @@ static int start_loaded_process(const struct storage_boot_loaded_process *loaded
     sp &= ~15ull;
 
     if (push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_NULL) != 0 ||
+        (bootstrap_fd >= 16 && (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 || push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, argv0_va) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_RANDOM) != 0 ||
         push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_BASE) != 0 ||
@@ -1106,24 +1172,13 @@ static int start_loaded_process(const struct storage_boot_loaded_process *loaded
         push_u64(stack, &sp, 0) != 0 ||
         push_u64(stack, &sp, argv0_va) != 0 ||
         push_u64(stack, &sp, 1) != 0) {
-        (void)pacha_munmap(stack, STORAGE_BOOT_CHILD_STACK_SIZE);
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -5;
     }
 
-    const int map_status = pacha_process_map(
-        process_fd,
-        stack_fd,
-        stack_base,
-        STORAGE_BOOT_CHILD_STACK_SIZE,
-        STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE,
-        0);
-    (void)pacha_munmap(stack, STORAGE_BOOT_CHILD_STACK_SIZE);
+    (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
     (void)pacha_fd_close(stack_fd);
-    if (map_status != 0) {
-        fprintf(stderr, "[storage_boot] exec: stack process_map failed status=%d\n", map_status);
-        return -6;
-    }
 
     const uint64_t thread_rights =
         STORAGE_BOOT_FD_RIGHT_INSPECT |
@@ -1232,6 +1287,10 @@ static void free_bootstrap_module_images(struct storage_boot_module_image *image
         free(images[i].data);
         images[i].data = NULL;
         images[i].size = 0;
+        if (images[i].image_fd >= 16) {
+            (void)pacha_fd_close(images[i].image_fd);
+            images[i].image_fd = -1;
+        }
     }
 }
 
@@ -1246,13 +1305,12 @@ static int read_bootstrap_module_images(
         return -22;
     }
 
-    uint64_t next_va = STORAGE_BOOT_SEED0ROOT_MODULE_IMAGE_BASE;
     for (size_t i = 0; i < image_count; i++) {
         images[i].name = storage_boot_rootfs_modules[i].name;
         images[i].path = storage_boot_rootfs_modules[i].path;
         images[i].data = NULL;
         images[i].size = 0;
-        images[i].seed0root_va = next_va;
+        images[i].image_fd = -1;
 
         void *inode = NULL;
         int status = ext4_lookup_path(
@@ -1284,15 +1342,14 @@ static int read_bootstrap_module_images(
             return status;
         }
 
-        uint64_t map_size = 0;
-        if (align_up(images[i].size, &map_size) != 0) {
+        images[i].image_fd = create_inherited_vmo_from_bytes(images[i].data, images[i].size, images[i].name);
+        if (images[i].image_fd < 16) {
             return -12;
         }
-        printf("[storage_boot] seed0root: read %s bytes=%llu seed_va=0x%llx\n",
+        printf("[storage_boot] seed0root: read %s bytes=%llu fd=%d\n",
             images[i].path,
             (unsigned long long)images[i].size,
-            (unsigned long long)images[i].seed0root_va);
-        next_va += map_size;
+            images[i].image_fd);
     }
 
     return 0;
@@ -1405,6 +1462,13 @@ static int launch_seed0root_from_ext4(
         storage_boot_koboxd_file,
         (unsigned long long)koboxd_image_size);
 
+    const int koboxd_image_fd = create_inherited_vmo_from_bytes(koboxd_image, koboxd_image_size, "koboxd.elf");
+    if (koboxd_image_fd < 16) {
+        free(image);
+        free(koboxd_image);
+        return 28;
+    }
+
     enum {
         module_count = sizeof(storage_boot_rootfs_modules) / sizeof(storage_boot_rootfs_modules[0]),
     };
@@ -1419,86 +1483,65 @@ static int launch_seed0root_from_ext4(
     if (status != 0) {
         free(image);
         free(koboxd_image);
+        (void)pacha_fd_close(koboxd_image_fd);
         free_bootstrap_module_images(module_images, module_count);
         return 30;
-    }
-
-    struct storage_boot_loaded_process loaded;
-    status = load_elf_process(storage_boot_seed0root_argv0, image, image_size, &loaded);
-    free(image);
-    if (status != 0) {
-        free(koboxd_image);
-        free_bootstrap_module_images(module_images, module_count);
-        fprintf(stderr, "[storage_boot] seed0root: ELF load failed status=%d\n", status);
-        return 25;
     }
 
     struct storage_boot_bootstrap_module module_table[module_count];
     memset(module_table, 0, sizeof(module_table));
     for (size_t i = 0; i < module_count; i++) {
         snprintf(module_table[i].name, sizeof(module_table[i].name), "%s", module_images[i].name);
-        module_table[i].image_va = module_images[i].seed0root_va;
+        module_table[i].image_fd = (uint64_t)(uint32_t)module_images[i].image_fd;
         module_table[i].image_size = module_images[i].size;
     }
 
     const struct storage_boot_seed0root_bootstrap bootstrap = {
         .magic = STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_MAGIC,
-        .version = STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_VERSION,
         .device_fd = device_fd,
-        .koboxd_image_va = STORAGE_BOOT_SEED0ROOT_KOBOXD_IMAGE_VA,
+        .koboxd_image_fd = (uint64_t)(uint32_t)koboxd_image_fd,
         .koboxd_image_size = koboxd_image_size,
         .module_count = module_count,
-        .modules_va = STORAGE_BOOT_SEED0ROOT_MODULE_TABLE_VA,
     };
-    status = map_bytes_into_process(
-        loaded.process_fd,
-        STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_VA,
-        &bootstrap,
-        sizeof(bootstrap),
-        STORAGE_BOOT_PROT_READ);
-    if (status == 0) {
-        status = map_bytes_into_process(
-            loaded.process_fd,
-            STORAGE_BOOT_SEED0ROOT_KOBOXD_IMAGE_VA,
-            koboxd_image,
-            koboxd_image_size,
-            STORAGE_BOOT_PROT_READ);
-    }
-    if (status == 0) {
-        status = map_bytes_into_process(
-            loaded.process_fd,
-            STORAGE_BOOT_SEED0ROOT_MODULE_TABLE_VA,
-            module_table,
-            sizeof(module_table),
-            STORAGE_BOOT_PROT_READ);
-    }
-    for (size_t i = 0; status == 0 && i < module_count; i++) {
-        status = map_bytes_into_process(
-            loaded.process_fd,
-            module_images[i].seed0root_va,
-            module_images[i].data,
-            module_images[i].size,
-            STORAGE_BOOT_PROT_READ);
-    }
+    struct storage_boot_seed0root_bootstrap bootstrap_package = bootstrap;
+    memcpy(bootstrap_package.modules, module_table, sizeof(module_table));
     free(koboxd_image);
-    free_bootstrap_module_images(module_images, module_count);
-    if (status != 0) {
-        fprintf(stderr, "[storage_boot] seed0root: bootstrap map failed status=%d\n", status);
-        return 29;
-    }
-    printf("[storage_boot] seed0root: bootstrap mapped config=0x%llx koboxd=0x%llx bytes=%llu modules=%llu table=0x%llx\n",
-        (unsigned long long)STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_VA,
-        (unsigned long long)STORAGE_BOOT_SEED0ROOT_KOBOXD_IMAGE_VA,
+    printf("[storage_boot] seed0root: bootstrap prepared koboxd_fd=%d bytes=%llu modules=%llu\n",
+        koboxd_image_fd,
         (unsigned long long)koboxd_image_size,
-        (unsigned long long)module_count,
-        (unsigned long long)STORAGE_BOOT_SEED0ROOT_MODULE_TABLE_VA);
+        (unsigned long long)module_count);
 
     status = mark_fd_inherit((int)device_fd, "seed0root device fd");
     if (status != 0) {
+        free(image);
+        free_bootstrap_module_images(module_images, module_count);
+        (void)pacha_fd_close(koboxd_image_fd);
         return 31;
     }
 
-    status = start_loaded_process(&loaded, storage_boot_seed0root_argv0);
+    const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
+    if (bootstrap_fd < 16) {
+        free(image);
+        free_bootstrap_module_images(module_images, module_count);
+        (void)pacha_fd_close(koboxd_image_fd);
+        return 32;
+    }
+
+    struct storage_boot_loaded_process loaded;
+    status = load_elf_process(storage_boot_seed0root_argv0, image, image_size, &loaded);
+    free(image);
+    if (status != 0) {
+        (void)pacha_fd_close(bootstrap_fd);
+        (void)pacha_fd_close(koboxd_image_fd);
+        free_bootstrap_module_images(module_images, module_count);
+        fprintf(stderr, "[storage_boot] seed0root: ELF load failed status=%d\n", status);
+        return 25;
+    }
+
+    status = start_loaded_process(&loaded, storage_boot_seed0root_argv0, bootstrap_fd);
+    free_bootstrap_module_images(module_images, module_count);
+    (void)pacha_fd_close(bootstrap_fd);
+    (void)pacha_fd_close(koboxd_image_fd);
     if (status != 0) {
         fprintf(stderr, "[storage_boot] seed0root: start failed status=%d\n", status);
         return 26;
@@ -1519,12 +1562,22 @@ static int load_modules(
     }
     for (uint64_t i = 0; i < cfg->module_count; i++) {
         const struct storage_boot_module_config *module_cfg = &cfg->modules[i];
-        if (module_cfg->image_va == 0 || module_cfg->image_size == 0 || module_cfg->name[0] == '\0') {
+        if (module_cfg->image_fd < 16 || module_cfg->image_size == 0 || module_cfg->name[0] == '\0') {
             fprintf(stderr, "[storage_boot] invalid module slot=%llu\n", (unsigned long long)i);
             return 4;
         }
+        void *module_bytes = malloc((size_t)module_cfg->image_size);
+        if (module_bytes == NULL) {
+            fprintf(stderr, "[storage_boot] module alloc failed name=%s bytes=%llu\n",
+                module_cfg->name,
+                (unsigned long long)module_cfg->image_size);
+            return 4;
+        }
+        if (read_fd_exact((int)module_cfg->image_fd, module_bytes, module_cfg->image_size, module_cfg->name) != 0) {
+            return 4;
+        }
         const kb_module_image_t image = {
-            .data = (const void *)(uintptr_t)module_cfg->image_va,
+            .data = module_bytes,
             .size = (size_t)module_cfg->image_size,
             .name = module_cfg->name,
         };
@@ -1583,31 +1636,34 @@ static void *wait_for_first_disk(void)
 int main(int argc, char **argv)
 {
     (void)argc;
-    (void)argv;
 
-    const struct storage_boot_config *cfg =
-        (const struct storage_boot_config *)(uintptr_t)STORAGE_BOOT_CONFIG_VA;
-    if (cfg->magic != STORAGE_BOOT_CONFIG_MAGIC ||
-        cfg->version != STORAGE_BOOT_CONFIG_VERSION ||
-        cfg->device_fd < 16 ||
-        cfg->module_count == 0 ||
-        cfg->module_count > STORAGE_BOOT_MAX_MODULES) {
+    int bootstrap_fd = -1;
+    if (find_bootstrap_fd(argv, &bootstrap_fd) != 0) {
+        fprintf(stderr, "[storage_boot] bootstrap fd missing\n");
+        return 2;
+    }
+    struct storage_boot_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (read_fd_exact(bootstrap_fd, &cfg, sizeof(cfg), "boot config") != 0 ||
+        cfg.magic != STORAGE_BOOT_CONFIG_MAGIC ||
+        cfg.device_fd < 16 ||
+        cfg.module_count == 0 ||
+        cfg.module_count > STORAGE_BOOT_MAX_MODULES) {
         fprintf(stderr,
-            "[storage_boot] invalid boot config magic=0x%llx version=%llu fd=%llu modules=%llu\n",
-            (unsigned long long)cfg->magic,
-            (unsigned long long)cfg->version,
-            (unsigned long long)cfg->device_fd,
-            (unsigned long long)cfg->module_count);
+            "[storage_boot] invalid boot config magic=0x%llx fd=%llu modules=%llu\n",
+            (unsigned long long)cfg.magic,
+            (unsigned long long)cfg.device_fd,
+            (unsigned long long)cfg.module_count);
         return 2;
     }
 
     printf("[storage_boot] start device_fd=%llu modules=%llu loader=%s\n",
-        (unsigned long long)cfg->device_fd,
-        (unsigned long long)cfg->module_count,
+        (unsigned long long)cfg.device_fd,
+        (unsigned long long)cfg.module_count,
         kb_module_loader_version());
 
     kb_device_backend_t *backend = NULL;
-    kb_status_t status = kb_pachaos_capsule_device_create(cfg->device_fd, &backend);
+    kb_status_t status = kb_pachaos_capsule_device_create(cfg.device_fd, &backend);
     if (status != KB_OK || backend == NULL) {
         fprintf(stderr, "[storage_boot] device backend create failed status=%s(%d)\n",
             status_name(status),
@@ -1617,7 +1673,7 @@ int main(int argc, char **argv)
 
     for (unsigned bar_index = 0; bar_index < 2; bar_index++) {
         struct pacha_capsule_bar_info bar = {0};
-        int bar_status = pacha_capsule_pci_bar_info((int)cfg->device_fd, bar_index, &bar);
+        int bar_status = pacha_capsule_pci_bar_info((int)cfg.device_fd, bar_index, &bar);
         printf("[storage_boot] pci bar%u status=%d start=0x%llx end=0x%llx size=0x%llx flags=0x%llx\n",
             bar_index,
             bar_status,
@@ -1628,7 +1684,7 @@ int main(int argc, char **argv)
     }
 
     kb_module_t *ext4_module = NULL;
-    int load_status = load_modules(cfg, backend, &ext4_module);
+    int load_status = load_modules(&cfg, backend, &ext4_module);
     if (load_status != 0) {
         return load_status;
     }
@@ -1687,12 +1743,8 @@ int main(int argc, char **argv)
     }
 
     printf("[storage_boot] ext4 rootfs probe OK\n");
-    int ext4_status = run_ext4_file_ops_smoke(ext4_module, &probe);
-    if (ext4_status != 0) {
-        return ext4_status;
-    }
 
-    int seed0root_status = launch_seed0root_from_ext4(ext4_module, &probe, cfg->device_fd);
+    int seed0root_status = launch_seed0root_from_ext4(ext4_module, &probe, cfg.device_fd);
     if (seed0root_status != 0) {
         return seed0root_status;
     }

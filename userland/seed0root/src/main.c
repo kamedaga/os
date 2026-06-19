@@ -1,4 +1,7 @@
 #include "pacha/ipc.h"
+#include "pacha/syscall.h"
+#include "filed/bootstrap.h"
+#include "koboxd/ipc_protocol.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -8,15 +11,9 @@
 
 enum {
     SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
-    SEED0ROOT_BOOTSTRAP_VERSION = 1,
-    SEED0ROOT_BOOTSTRAP_VA = 0x3e000000ull,
     SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
     SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
     SEED0ROOT_KOBOXD_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
-    SEED0ROOT_KOBOXD_BOOTSTRAP_VERSION = 1,
-    SEED0ROOT_KOBOXD_BOOTSTRAP_VA = 0x3f000000ull,
-    SEED0ROOT_KOBOXD_MODULE_TABLE_VA = 0x3f010000ull,
-    SEED0ROOT_KOBOXD_MODULE_IMAGE_BASE = 0x3f100000ull,
     SEED0ROOT_PAGE_SIZE = 4096,
     SEED0ROOT_ELF64_EHDR_BYTES = 64,
     SEED0ROOT_ELF64_PHDR_BYTES = 56,
@@ -30,9 +27,6 @@ enum {
     SEED0ROOT_ELF_PF_X = 1,
     SEED0ROOT_ELF_PF_W = 2,
     SEED0ROOT_ELF_PF_R = 4,
-    SEED0ROOT_CHILD_LOAD_BASE = 0x30000000ull,
-    SEED0ROOT_CHILD_STACK_TOP = 0x70000000ull,
-    SEED0ROOT_CHILD_STACK_SIZE = 0x20000ull,
     SEED0ROOT_AT_NULL = 0,
     SEED0ROOT_AT_PHDR = 3,
     SEED0ROOT_AT_PHENT = 4,
@@ -43,28 +37,27 @@ enum {
     SEED0ROOT_AT_EXECFN = 31,
 };
 
-struct seed0root_bootstrap {
-    uint64_t magic;
-    uint64_t version;
-    uint64_t device_fd;
-    uint64_t koboxd_image_va;
-    uint64_t koboxd_image_size;
-    uint64_t module_count;
-    uint64_t modules_va;
-};
-
 struct seed0root_bootstrap_module {
     char name[SEED0ROOT_BOOTSTRAP_NAME_BYTES];
-    uint64_t image_va;
+    uint64_t image_fd;
     uint64_t image_size;
+};
+
+struct seed0root_bootstrap {
+    uint64_t magic;
+    uint64_t device_fd;
+    uint64_t koboxd_image_fd;
+    uint64_t koboxd_image_size;
+    uint64_t module_count;
+    struct seed0root_bootstrap_module modules[SEED0ROOT_BOOTSTRAP_MAX_MODULES];
 };
 
 struct seed0root_koboxd_bootstrap {
     uint64_t magic;
-    uint64_t version;
     uint64_t device_fd;
+    uint64_t control_fd;
     uint64_t module_count;
-    uint64_t modules_va;
+    struct seed0root_bootstrap_module modules[SEED0ROOT_BOOTSTRAP_MAX_MODULES];
 };
 
 struct seed0root_loaded_process {
@@ -75,6 +68,17 @@ struct seed0root_loaded_process {
     uint64_t phnum;
     uint16_t load_segments;
 };
+
+static int load_elf_process(
+    const char *path,
+    const unsigned char *image,
+    uint64_t image_size,
+    struct seed0root_loaded_process *out);
+static int mark_fd_inherit(int fd, const char *label);
+static int start_loaded_process(
+    const struct seed0root_loaded_process *loaded,
+    const char *argv0,
+    int bootstrap_fd);
 
 static uint16_t rd16(const unsigned char *p)
 {
@@ -167,11 +171,12 @@ static int validate_elf_header(const char *path, const unsigned char *image, uin
 static int map_elf_segment(
     const char *path,
     int process_fd,
-    uint64_t load_bias,
+    uint64_t target_va,
     const unsigned char *image,
     uint64_t image_size,
     const unsigned char *ph,
-    uint16_t index)
+    uint16_t index,
+    uint64_t *out_mapped_va)
 {
     const uint32_t p_flags = rd32(ph + 4);
     const uint64_t p_offset = rd64(ph + 8);
@@ -187,8 +192,7 @@ static int map_elf_segment(
     }
     if (p_memsz == 0) return 0;
 
-    const uint64_t target_va = align_down(p_vaddr + load_bias);
-    const uint64_t page_offset = (p_vaddr + load_bias) - target_va;
+    const uint64_t page_offset = p_vaddr - align_down(p_vaddr);
     uint64_t map_size = 0;
     if (align_up(page_offset + p_memsz, &map_size) != 0) return -2;
 
@@ -204,14 +208,29 @@ static int map_elf_segment(
         fprintf(stderr, "[seed0root] exec: vmo_create failed segment=%u status=%d\n", index, vmo_fd);
         return -3;
     }
-    unsigned char *mapped = pacha_mmap(vmo_fd, map_size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    const long mmap_result = pacha_syscall6(
+        PACHA_FD_SYSCALL_MMAP,
+        (uint64_t)(uint32_t)vmo_fd,
+        0,
+        map_size,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    unsigned char *mapped = mmap_result < 4096 ? NULL : (unsigned char *)(uintptr_t)mmap_result;
     if (mapped == NULL) {
+        fprintf(stderr,
+            "[seed0root] exec: mmap failed %s PT_LOAD[%u] target=0x%llx size=%llu status=%ld\n",
+            path,
+            index,
+            (unsigned long long)target_va,
+            (unsigned long long)map_size,
+            mmap_result);
         (void)pacha_fd_close(vmo_fd);
         return -4;
     }
     memset(mapped, 0, (size_t)map_size);
     memcpy(mapped + page_offset, image + p_offset, (size_t)p_filesz);
-    const int map_status = pacha_process_map(
+    const long map_result = pacha_process_map(
         process_fd,
         vmo_fd,
         target_va,
@@ -220,60 +239,69 @@ static int map_elf_segment(
         0);
     (void)pacha_munmap(mapped, map_size);
     (void)pacha_fd_close(vmo_fd);
-    if (map_status != 0) return -5;
+    if (map_result < 4096) return -5;
+    if (out_mapped_va != NULL) *out_mapped_va = (uint64_t)map_result;
 
     printf("[seed0root] exec: mapped PT_LOAD[%u] process_fd=%d target=0x%llx size=%llu\n",
         index,
         process_fd,
-        (unsigned long long)target_va,
+        (unsigned long long)(uint64_t)map_result,
         (unsigned long long)map_size);
     return 0;
 }
 
-static int map_bytes_into_process(
-    int process_fd,
-    uint64_t target_va,
-    const void *data,
-    uint64_t size,
-    uint64_t prot)
+static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
 {
-    if (process_fd < 16 || target_va == 0 || data == NULL || size == 0) {
+    if (data == NULL || size == 0) {
         return -1;
     }
-
     uint64_t map_size = 0;
     if (align_up(size, &map_size) != 0) {
         return -2;
     }
-
-    const uint64_t vmo_rights =
+    const uint64_t rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_SET_FLAGS |
         PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
-    if (vmo_fd < 16) {
+    const int fd = pacha_vmo_create(map_size, rights, 0);
+    if (fd < 16) {
         return -3;
     }
-
-    unsigned char *mapped = pacha_mmap(
-        vmo_fd,
-        map_size,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        PACHA_MMAP_SHARED,
-        0);
+    unsigned char *mapped = pacha_mmap(fd, map_size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (mapped == NULL) {
-        (void)pacha_fd_close(vmo_fd);
+        (void)pacha_fd_close(fd);
         return -4;
     }
-
     memset(mapped, 0, (size_t)map_size);
     memcpy(mapped, data, (size_t)size);
-    const int status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
     (void)pacha_munmap(mapped, map_size);
-    (void)pacha_fd_close(vmo_fd);
-    return status == 0 ? 0 : -5;
+    const int inherit_status = mark_fd_inherit(fd, label);
+    if (inherit_status != 0) {
+        (void)pacha_fd_close(fd);
+        return -5;
+    }
+    return fd;
+}
+
+static int read_bootstrap_fd(int fd, void *out, uint64_t size, const char *label)
+{
+    if (fd < 16 || out == NULL || size == 0) {
+        return -1;
+    }
+    const long got = pacha_fd_read(fd, out, size);
+    if (got != (long)size) {
+        fprintf(stderr, "[seed0root] %s: bootstrap fd read failed fd=%d got=%ld size=%llu\n",
+            label,
+            fd,
+            got,
+            (unsigned long long)size);
+        return -2;
+    }
+    return 0;
 }
 
 static int mark_fd_inherit(int fd, const char *label)
@@ -296,6 +324,488 @@ static int mark_fd_inherit(int fd, const char *label)
     return 0;
 }
 
+static int find_seed0root_bootstrap_fd(char **argv, int *out_fd)
+{
+    if (argv == NULL || out_fd == NULL) {
+        return -1;
+    }
+    *out_fd = -1;
+    char **p = argv;
+    while (*p != NULL) {
+        p++;
+    }
+    p++;
+    while (*p != NULL) {
+        p++;
+    }
+    p++;
+
+    uint64_t bootstrap_fd = 0;
+    const uint64_t *auxv = (const uint64_t *)(const void *)p;
+    for (unsigned i = 0; i < 64; i++) {
+        const uint64_t type = auxv[i * 2u];
+        const uint64_t value = auxv[i * 2u + 1u];
+        if (type == 0) {
+            break;
+        }
+        if (type == PACHA_AT_BOOTSTRAP_FD) {
+            bootstrap_fd = value;
+        }
+    }
+    if (bootstrap_fd < 16) {
+        return -2;
+    }
+    *out_fd = (int)bootstrap_fd;
+    return 0;
+}
+
+static const uint64_t seed0root_channel_rights =
+    PACHA_FD_RIGHT_INSPECT |
+    PACHA_FD_RIGHT_WAIT |
+    PACHA_FD_RIGHT_POLL |
+    PACHA_FD_RIGHT_SET_FLAGS |
+    PACHA_FD_RIGHT_CLOSE |
+    PACHA_FD_RIGHT_SEND |
+    PACHA_FD_RIGHT_RECV |
+    PACHA_FD_RIGHT_CALL |
+    PACHA_FD_RIGHT_TRANSFER;
+
+static int recv_ipc_wait(int fd, struct pacha_ipc_msg *msg)
+{
+    if (fd < 16 || msg == NULL) {
+        return -1;
+    }
+    for (unsigned i = 0; i < 262144; i++) {
+        const int status = pacha_ipc_recv(fd, msg);
+        if (status == 0) {
+            return 0;
+        }
+        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
+            return status;
+        }
+        struct pacha_pollfd pollfd = {
+            .fd = fd,
+            .events = PACHA_FD_EVENT_READABLE,
+            .revents = 0,
+        };
+        (void)pacha_fd_wait_many(&pollfd, 1, 1);
+    }
+    return -2;
+}
+
+static int send_ipc_wait(int fd, const struct pacha_ipc_msg *msg)
+{
+    if (fd < 16 || msg == NULL) {
+        return -1;
+    }
+    for (unsigned i = 0; i < 262144; i++) {
+        const int status = pacha_ipc_send(fd, msg);
+        if (status == 0) {
+            return 0;
+        }
+        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
+            return status;
+        }
+        struct pacha_pollfd pollfd = {
+            .fd = fd,
+            .events = PACHA_FD_EVENT_WRITABLE,
+            .revents = 0,
+        };
+        (void)pacha_fd_wait_many(&pollfd, 1, 1);
+    }
+    return -2;
+}
+
+static int seed0root_get_koboxd_endpoint(int control_fd, uint64_t endpoint_kind, int *out_fd)
+{
+    if (control_fd < 16 || out_fd == NULL) {
+        return -1;
+    }
+    *out_fd = -1;
+    const struct pacha_ipc_msg request = {
+        .word0 = KOBOXD_WIRE_CONTROL_MAGIC,
+        .word1 = KOBOXD_WIRE_CONTROL_GET_ENDPOINT,
+        .word2 = endpoint_kind,
+        .word3 = KOBOXD_WIRE_VERSION,
+    };
+    int status = send_ipc_wait(control_fd, &request);
+    if (status != 0) {
+        fprintf(stderr,
+            "[seed0root] koboxd control send failed kind=%llu status=%d\n",
+            (unsigned long long)endpoint_kind,
+            status);
+        return status;
+    }
+
+    struct pacha_ipc_fd fds[1];
+    struct pacha_ipc_msg reply;
+    for (unsigned attempt = 0; attempt < 128; attempt++) {
+        memset(fds, 0, sizeof(fds));
+        memset(&reply, 0, sizeof(reply));
+        reply.fds = fds;
+        reply.fd_capacity = 1;
+        status = recv_ipc_wait(control_fd, &reply);
+        if (status != 0) {
+            return status;
+        }
+        if (reply.word0 == KOBOXD_WIRE_REPLY_MAGIC &&
+            reply.word1 == 0 &&
+            reply.word2 == endpoint_kind &&
+            reply.fd_count == 1 &&
+            fds[0].fd >= 16)
+        {
+            break;
+        }
+        if (attempt == 127) {
+            fprintf(stderr,
+                "[seed0root] koboxd control reply invalid kind=%llu word0=0x%llx word1=%llu word2=%llu fd_count=%llu fd=%llu\n",
+                (unsigned long long)endpoint_kind,
+                (unsigned long long)reply.word0,
+                (unsigned long long)reply.word1,
+                (unsigned long long)reply.word2,
+                (unsigned long long)reply.fd_count,
+                (unsigned long long)fds[0].fd);
+            return -2;
+        }
+    }
+    *out_fd = (int)fds[0].fd;
+    printf("[seed0root] koboxd endpoint kind=%llu fd=%d\n",
+        (unsigned long long)endpoint_kind,
+        *out_fd);
+    return 0;
+}
+
+static int seed0root_koboxd_endpoint_call_with_fd(
+    int endpoint_fd,
+    uint64_t op,
+    uint64_t object_id,
+    int transfer_fd,
+    uint64_t *out_word2)
+{
+    if (endpoint_fd < 16 || out_word2 == NULL) {
+        return -1;
+    }
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    if (transfer_fd >= 16) {
+        fd_item.fd = (uint64_t)(uint32_t)transfer_fd;
+        fd_item.rights =
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ |
+            PACHA_FD_RIGHT_MAP_WRITE;
+        fd_item.flags = 0;
+        fd_item.transfer_flags = 0;
+    }
+    const struct pacha_ipc_msg request = {
+        .word0 = KOBOXD_WIRE_ENDPOINT_MAGIC,
+        .word1 = op,
+        .word2 = object_id,
+        .word3 = KOBOXD_WIRE_VERSION,
+        .fds = transfer_fd >= 16 ? &fd_item : NULL,
+        .fd_count = transfer_fd >= 16 ? 1 : 0,
+    };
+    int status = send_ipc_wait(endpoint_fd, &request);
+    if (status != 0) {
+        fprintf(stderr,
+            "[seed0root] koboxd endpoint send failed fd=%d op=%llu status=%d transfer_fd=%d\n",
+            endpoint_fd,
+            (unsigned long long)op,
+            status,
+            transfer_fd);
+        return status;
+    }
+    struct pacha_ipc_msg reply;
+    for (unsigned attempt = 0; attempt < 128; attempt++) {
+        memset(&reply, 0, sizeof(reply));
+        status = recv_ipc_wait(endpoint_fd, &reply);
+        if (status != 0) {
+            return status;
+        }
+        if (reply.word0 == KOBOXD_WIRE_REPLY_MAGIC &&
+            reply.word3 == KOBOXD_WIRE_VERSION)
+        {
+            break;
+        }
+        if (attempt == 127) {
+            fprintf(stderr,
+                "[seed0root] koboxd endpoint reply invalid fd=%d word0=0x%llx word1=%llu word2=%llu word3=%llu\n",
+                endpoint_fd,
+                (unsigned long long)reply.word0,
+                (unsigned long long)reply.word1,
+                (unsigned long long)reply.word2,
+                (unsigned long long)reply.word3);
+            return -2;
+        }
+    }
+    if ((int64_t)reply.word1 < 0) {
+        return (int)(int64_t)reply.word1;
+    }
+    *out_word2 = reply.word2;
+    return 0;
+}
+
+static int seed0root_koboxd_endpoint_call(int endpoint_fd, uint64_t op, uint64_t *out_word2)
+{
+    return seed0root_koboxd_endpoint_call_with_fd(endpoint_fd, op, 0, -1, out_word2);
+}
+
+static int seed0root_create_wire_page(int *out_fd, void **out_mapped)
+{
+    if (out_fd == NULL || out_mapped == NULL) {
+        return -1;
+    }
+    *out_fd = -1;
+    *out_mapped = NULL;
+    const uint64_t rights =
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const int fd = pacha_vmo_create(KOBOXD_WIRE_FS_PAGE_BYTES, rights, 0);
+    if (fd < 16) {
+        fprintf(stderr,
+            "[seed0root] wire page create failed bytes=%u status=%d\n",
+            (unsigned)KOBOXD_WIRE_FS_PAGE_BYTES,
+            fd);
+        return fd;
+    }
+    const long map_result = pacha_syscall6(
+        PACHA_FD_SYSCALL_MMAP,
+        (uint64_t)(uint32_t)fd,
+        0,
+        KOBOXD_WIRE_FS_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    void *mapped = map_result < 4096 ? NULL : (void *)(uintptr_t)map_result;
+    if (mapped == NULL) {
+        fprintf(stderr,
+            "[seed0root] wire page map failed bytes=%u status=%ld\n",
+            (unsigned)KOBOXD_WIRE_FS_PAGE_BYTES,
+            map_result);
+        (void)pacha_fd_close(fd);
+        return -2;
+    }
+    memset(mapped, 0, KOBOXD_WIRE_FS_PAGE_BYTES);
+    *out_fd = fd;
+    *out_mapped = mapped;
+    return 0;
+}
+
+static void seed0root_destroy_wire_page(int fd, void *mapped)
+{
+    if (mapped != NULL) {
+        (void)pacha_munmap(mapped, KOBOXD_WIRE_FS_PAGE_BYTES);
+    }
+    if (fd >= 16) {
+        (void)pacha_fd_close(fd);
+    }
+}
+
+static int seed0root_fs_lookup_object(int fs_fd, uint64_t parent_object_id, const char *name, uint64_t *out_object_id)
+{
+    if (fs_fd < 16 || name == NULL || out_object_id == NULL) {
+        return -1;
+    }
+    *out_object_id = 0;
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+    koboxd_wire_fs_lookup_t *lookup = (koboxd_wire_fs_lookup_t *)page;
+    lookup->parent_object_id = parent_object_id;
+    snprintf(lookup->name, sizeof(lookup->name), "%s", name);
+    status = seed0root_koboxd_endpoint_call_with_fd(fs_fd, KOBOXD_WIRE_FS_LOOKUP, 0, page_fd, out_object_id);
+    seed0root_destroy_wire_page(page_fd, page);
+    return status;
+}
+
+static int seed0root_fs_stat_object(int fs_fd, uint64_t object_id, koboxd_wire_fs_statx_t *out_stat)
+{
+    if (fs_fd < 16 || object_id == 0 || out_stat == NULL) {
+        return -1;
+    }
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+    uint64_t ignored = 0;
+    status = seed0root_koboxd_endpoint_call_with_fd(fs_fd, KOBOXD_WIRE_FS_STATX, object_id, page_fd, &ignored);
+    if (status == 0) {
+        *out_stat = *(koboxd_wire_fs_statx_t *)page;
+    }
+    seed0root_destroy_wire_page(page_fd, page);
+    return status;
+}
+
+static int seed0root_fs_pread_object(
+    int fs_fd,
+    uint64_t object_id,
+    uint64_t offset,
+    void *buffer,
+    uint64_t length,
+    uint64_t *out_bytes)
+{
+    if (fs_fd < 16 || object_id == 0 || buffer == NULL || out_bytes == NULL) {
+        return -1;
+    }
+    *out_bytes = 0;
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+    koboxd_wire_fs_io_t *io = (koboxd_wire_fs_io_t *)page;
+    io->object_id = object_id;
+    io->offset = offset;
+    io->length = length > KOBOXD_WIRE_FS_IO_BYTES ? KOBOXD_WIRE_FS_IO_BYTES : length;
+    uint64_t bytes = 0;
+    status = seed0root_koboxd_endpoint_call_with_fd(fs_fd, KOBOXD_WIRE_FS_PREAD, 0, page_fd, &bytes);
+    if (status == 0 && bytes > 0) {
+        if (bytes > length) {
+            bytes = length;
+        }
+        memcpy(buffer, io->data, (size_t)bytes);
+        *out_bytes = bytes;
+    }
+    seed0root_destroy_wire_page(page_fd, page);
+    return status;
+}
+
+static int seed0root_read_rootfs_file(int fs_fd, const char *path, unsigned char **out_image, uint64_t *out_size)
+{
+    if (fs_fd < 16 || path == NULL || out_image == NULL || out_size == NULL) {
+        return -1;
+    }
+    *out_image = NULL;
+    *out_size = 0;
+    if (strcmp(path, "/sbin/filed.elf") != 0) {
+        return -2;
+    }
+
+    uint64_t sbin_object = 0;
+    int status = seed0root_fs_lookup_object(fs_fd, KOBOXD_WIRE_FS_ROOT_OBJECT_ID, "sbin", &sbin_object);
+    if (status != 0) {
+        return status;
+    }
+    uint64_t file_object = 0;
+    status = seed0root_fs_lookup_object(fs_fd, sbin_object, "filed.elf", &file_object);
+    if (status != 0) {
+        return status;
+    }
+    koboxd_wire_fs_statx_t stat;
+    memset(&stat, 0, sizeof(stat));
+    status = seed0root_fs_stat_object(fs_fd, file_object, &stat);
+    if (status != 0 || stat.size == 0 || stat.size > 16ull * 1024ull * 1024ull) {
+        return status != 0 ? status : -3;
+    }
+
+    unsigned char *image = malloc((size_t)stat.size);
+    if (image == NULL) {
+        return -4;
+    }
+
+    uint64_t offset = 0;
+    while (offset < stat.size) {
+        uint64_t want = stat.size - offset;
+        if (want > KOBOXD_WIRE_FS_IO_BYTES) {
+            want = KOBOXD_WIRE_FS_IO_BYTES;
+        }
+        uint64_t got = 0;
+        status = seed0root_fs_pread_object(fs_fd, file_object, offset, image + offset, want, &got);
+        if (status != 0 || got == 0) {
+            free(image);
+            return status != 0 ? status : -5;
+        }
+        offset += got;
+    }
+
+    printf("[seed0root] filed: read %s bytes=%llu object=%llu\n",
+        path,
+        (unsigned long long)stat.size,
+        (unsigned long long)file_object);
+    *out_image = image;
+    *out_size = stat.size;
+    return 0;
+}
+
+static int launch_filed_from_rootfs(int fs_fd)
+{
+    if (fs_fd < 16) {
+        return -1;
+    }
+    int status = mark_fd_inherit(fs_fd, "filed fs-backend fd");
+    if (status != 0) {
+        return status;
+    }
+
+    unsigned char *image = NULL;
+    uint64_t image_size = 0;
+    status = seed0root_read_rootfs_file(fs_fd, "/sbin/filed.elf", &image, &image_size);
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] filed read failed status=%d\n", status);
+        return status;
+    }
+
+    const filed_bootstrap_t bootstrap = {
+        .magic = FILED_BOOTSTRAP_MAGIC,
+        .fs_backend_fd = (uint64_t)(uint32_t)fs_fd,
+        .flags = 0,
+    };
+    const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap, sizeof(bootstrap), "filed bootstrap fd");
+    if (bootstrap_fd < 16) {
+        fprintf(stderr, "[seed0root] filed bootstrap fd create failed status=%d\n", bootstrap_fd);
+        return bootstrap_fd;
+    }
+    struct seed0root_loaded_process loaded;
+    status = load_elf_process("/sbin/filed.elf", image, image_size, &loaded);
+    free(image);
+    if (status != 0) {
+        (void)pacha_fd_close(bootstrap_fd);
+        fprintf(stderr, "[seed0root] filed load failed status=%d\n", status);
+        return status;
+    }
+    status = start_loaded_process(&loaded, "/sbin/filed.elf", bootstrap_fd);
+    (void)pacha_fd_close(bootstrap_fd);
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] filed start failed status=%d\n", status);
+        return status;
+    }
+    printf("[seed0root] filed started\n");
+    return 0;
+}
+
+static int seed0root_connect_storage_services(int control_fd)
+{
+    int block_fd = -1;
+    int fs_fd = -1;
+    int status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_BLOCK, &block_fd);
+    if (status != 0) {
+        return status;
+    }
+    uint64_t block_size = 0;
+    status = seed0root_koboxd_endpoint_call(block_fd, KOBOXD_WIRE_BLOCK_IDENTIFY, &block_size);
+    if (status != 0 || block_size != 512) {
+        fprintf(stderr,
+            "[seed0root] koboxd block identify failed status=%d block_size=%llu\n",
+            status,
+            (unsigned long long)block_size);
+        return status != 0 ? status : -2;
+    }
+    printf("[seed0root] koboxd block endpoint identify OK\n");
+
+    status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_FS_BACKEND, &fs_fd);
+    if (status != 0) {
+        return status;
+    }
+    return launch_filed_from_rootfs(fs_fd);
+}
+
 static int load_elf_process(
     const char *path,
     const unsigned char *image,
@@ -312,7 +822,8 @@ static int load_elf_process(
     const uint64_t e_phoff = rd64(image + 32);
     const uint16_t e_phentsize = rd16(image + 54);
     const uint16_t e_phnum = rd16(image + 56);
-    const uint64_t load_bias = e_type == SEED0ROOT_ELF_TYPE_DYN ? SEED0ROOT_CHILD_LOAD_BASE : 0;
+    uint64_t load_bias = 0;
+    const int use_aslr = e_type == SEED0ROOT_ELF_TYPE_DYN;
     const uint64_t process_rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CLOSE |
@@ -331,10 +842,16 @@ static int load_elf_process(
     for (uint16_t i = 0; i < e_phnum; i++) {
         const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
         if (rd32(ph + 0) != SEED0ROOT_ELF_PT_LOAD) continue;
-        status = map_elf_segment(path, process_fd, load_bias, image, image_size, ph, i);
+        const uint64_t p_vaddr = rd64(ph + 16);
+        const uint64_t requested_va = (use_aslr && load_count == 0) ? 0 : align_down(p_vaddr + load_bias);
+        uint64_t mapped_va = 0;
+        status = map_elf_segment(path, process_fd, requested_va, image, image_size, ph, i, &mapped_va);
         if (status != 0) {
             (void)pacha_fd_close(process_fd);
             return status;
+        }
+        if (use_aslr && load_count == 0) {
+            load_bias = mapped_va - align_down(p_vaddr);
         }
         load_count++;
     }
@@ -365,21 +882,26 @@ static int push_u64(unsigned char *stack, uint64_t *sp, uint64_t value)
     return 0;
 }
 
-static int start_loaded_process(const struct seed0root_loaded_process *loaded, const char *argv0)
+static int start_loaded_process(
+    const struct seed0root_loaded_process *loaded,
+    const char *argv0,
+    int bootstrap_fd)
 {
+    if (loaded == NULL || argv0 == NULL) {
+        return -1;
+    }
     const int process_fd = loaded->process_fd;
-    const uint64_t stack_base = SEED0ROOT_CHILD_STACK_TOP - SEED0ROOT_CHILD_STACK_SIZE;
     const uint64_t stack_rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int stack_fd = pacha_vmo_create(SEED0ROOT_CHILD_STACK_SIZE, stack_rights, 0);
+    const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
     if (stack_fd < 16) return -2;
     unsigned char *stack = pacha_mmap(
         stack_fd,
-        SEED0ROOT_CHILD_STACK_SIZE,
+        PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
@@ -387,9 +909,22 @@ static int start_loaded_process(const struct seed0root_loaded_process *loaded, c
         (void)pacha_fd_close(stack_fd);
         return -3;
     }
-    memset(stack, 0, (size_t)SEED0ROOT_CHILD_STACK_SIZE);
+    memset(stack, 0, (size_t)PACHA_PROCESS_DEFAULT_STACK_SIZE);
+    const long stack_map = pacha_process_map(
+        process_fd,
+        stack_fd,
+        0,
+        PACHA_PROCESS_DEFAULT_STACK_SIZE,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        0);
+    if (stack_map < 4096) {
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_fd_close(stack_fd);
+        return -6;
+    }
+    const uint64_t stack_base = (uint64_t)stack_map;
 
-    uint64_t sp = SEED0ROOT_CHILD_STACK_SIZE;
+    uint64_t sp = PACHA_PROCESS_DEFAULT_STACK_SIZE;
     const uint64_t argv0_len = (uint64_t)strlen(argv0) + 1;
     sp -= argv0_len;
     memcpy(stack + sp, argv0, (size_t)argv0_len);
@@ -401,6 +936,7 @@ static int start_loaded_process(const struct seed0root_loaded_process *loaded, c
     sp &= ~15ull;
 
     if (push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_NULL) != 0 ||
+        (bootstrap_fd >= 16 && (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 || push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, argv0_va) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_RANDOM) != 0 ||
         push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_BASE) != 0 ||
@@ -412,21 +948,13 @@ static int start_loaded_process(const struct seed0root_loaded_process *loaded, c
         push_u64(stack, &sp, 0) != 0 ||
         push_u64(stack, &sp, argv0_va) != 0 ||
         push_u64(stack, &sp, 1) != 0) {
-        (void)pacha_munmap(stack, SEED0ROOT_CHILD_STACK_SIZE);
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -5;
     }
 
-    const int map_status = pacha_process_map(
-        process_fd,
-        stack_fd,
-        stack_base,
-        SEED0ROOT_CHILD_STACK_SIZE,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        0);
-    (void)pacha_munmap(stack, SEED0ROOT_CHILD_STACK_SIZE);
+    (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
     (void)pacha_fd_close(stack_fd);
-    if (map_status != 0) return -6;
 
     const uint64_t thread_rights =
         PACHA_FD_RIGHT_INSPECT |
@@ -450,152 +978,139 @@ static int start_loaded_process(const struct seed0root_loaded_process *loaded, c
     return 0;
 }
 
-static int stage_koboxd_bootstrap(
+static int prepare_koboxd_bootstrap(
     const struct seed0root_bootstrap *bootstrap,
-    const struct seed0root_loaded_process *loaded)
+    int control_fd,
+    struct seed0root_koboxd_bootstrap *out_bootstrap)
 {
     if (bootstrap == NULL ||
-        loaded == NULL ||
-        loaded->process_fd < 16 ||
+        out_bootstrap == NULL ||
+        control_fd < 16 ||
         bootstrap->module_count == 0 ||
         bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES ||
-        bootstrap->modules_va == 0)
+        bootstrap->modules[0].name[0] == '\0')
     {
         return -1;
     }
 
-    const struct seed0root_bootstrap_module *source_modules =
-        (const struct seed0root_bootstrap_module *)(uintptr_t)bootstrap->modules_va;
-    struct seed0root_bootstrap_module child_modules[SEED0ROOT_BOOTSTRAP_MAX_MODULES];
-    memset(child_modules, 0, sizeof(child_modules));
-
-    uint64_t next_va = SEED0ROOT_KOBOXD_MODULE_IMAGE_BASE;
+    memset(out_bootstrap, 0, sizeof(*out_bootstrap));
+    out_bootstrap->magic = SEED0ROOT_KOBOXD_BOOTSTRAP_MAGIC;
+    out_bootstrap->device_fd = bootstrap->device_fd;
+    out_bootstrap->control_fd = (uint64_t)(uint32_t)control_fd;
+    out_bootstrap->module_count = bootstrap->module_count;
     for (uint64_t i = 0; i < bootstrap->module_count; i++) {
-        const struct seed0root_bootstrap_module *src = &source_modules[i];
-        if (src->name[0] == '\0' || src->image_va == 0 || src->image_size < 4) {
+        const struct seed0root_bootstrap_module *src = &bootstrap->modules[i];
+        if (src->name[0] == '\0' || src->image_fd < 16 || src->image_size < 4) {
             return -2;
         }
-        const unsigned char *image = (const unsigned char *)(uintptr_t)src->image_va;
-        if (image[0] != 0x7f || image[1] != 'E' || image[2] != 'L' || image[3] != 'F') {
-            fprintf(stderr, "[seed0root] koboxd bootstrap module %s is not ELF\n", src->name);
-            return -3;
-        }
-
-        snprintf(child_modules[i].name, sizeof(child_modules[i].name), "%s", src->name);
-        child_modules[i].image_va = next_va;
-        child_modules[i].image_size = src->image_size;
-
-        const int map_status = map_bytes_into_process(
-            loaded->process_fd,
-            child_modules[i].image_va,
-            image,
-            src->image_size,
-            PACHA_PROT_READ);
-        if (map_status != 0) {
-            fprintf(stderr,
-                "[seed0root] koboxd bootstrap map module=%s target=0x%llx status=%d\n",
-                child_modules[i].name,
-                (unsigned long long)child_modules[i].image_va,
-                map_status);
-            return -4;
-        }
-
-        uint64_t map_size = 0;
-        if (align_up(src->image_size, &map_size) != 0) {
-            return -5;
-        }
-        printf("[seed0root] koboxd bootstrap module=%s source=0x%llx target=0x%llx bytes=%llu\n",
-            child_modules[i].name,
-            (unsigned long long)src->image_va,
-            (unsigned long long)child_modules[i].image_va,
+        snprintf(out_bootstrap->modules[i].name, sizeof(out_bootstrap->modules[i].name), "%s", src->name);
+        out_bootstrap->modules[i].image_fd = src->image_fd;
+        out_bootstrap->modules[i].image_size = src->image_size;
+        printf("[seed0root] koboxd bootstrap module=%s fd=%llu bytes=%llu\n",
+            out_bootstrap->modules[i].name,
+            (unsigned long long)src->image_fd,
             (unsigned long long)src->image_size);
-        next_va += map_size;
     }
 
-    const struct seed0root_koboxd_bootstrap child_bootstrap = {
-        .magic = SEED0ROOT_KOBOXD_BOOTSTRAP_MAGIC,
-        .version = SEED0ROOT_KOBOXD_BOOTSTRAP_VERSION,
-        .device_fd = bootstrap->device_fd,
-        .module_count = bootstrap->module_count,
-        .modules_va = SEED0ROOT_KOBOXD_MODULE_TABLE_VA,
-    };
-
-    int status = map_bytes_into_process(
-        loaded->process_fd,
-        SEED0ROOT_KOBOXD_BOOTSTRAP_VA,
-        &child_bootstrap,
-        sizeof(child_bootstrap),
-        PACHA_PROT_READ);
-    if (status == 0) {
-        status = map_bytes_into_process(
-            loaded->process_fd,
-            SEED0ROOT_KOBOXD_MODULE_TABLE_VA,
-            child_modules,
-            sizeof(child_modules[0]) * bootstrap->module_count,
-            PACHA_PROT_READ);
-    }
-    if (status != 0) {
-        fprintf(stderr, "[seed0root] koboxd bootstrap config map failed status=%d\n", status);
-        return -6;
-    }
-
-    printf("[seed0root] koboxd bootstrap package mapped modules=%llu config=0x%llx table=0x%llx\n",
-        (unsigned long long)bootstrap->module_count,
-        (unsigned long long)SEED0ROOT_KOBOXD_BOOTSTRAP_VA,
-        (unsigned long long)SEED0ROOT_KOBOXD_MODULE_TABLE_VA);
+    printf("[seed0root] koboxd bootstrap package prepared modules=%llu\n",
+        (unsigned long long)bootstrap->module_count);
     return 0;
 }
 
-static int launch_koboxd(void)
+static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
 {
-    const struct seed0root_bootstrap *bootstrap =
-        (const struct seed0root_bootstrap *)(uintptr_t)SEED0ROOT_BOOTSTRAP_VA;
     if (bootstrap->magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
-        bootstrap->version != SEED0ROOT_BOOTSTRAP_VERSION ||
-        bootstrap->koboxd_image_va == 0 ||
+        bootstrap->koboxd_image_fd < 16 ||
         bootstrap->koboxd_image_size == 0 ||
         bootstrap->device_fd < 16 ||
         bootstrap->module_count == 0 ||
-        bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES ||
-        bootstrap->modules_va == 0) {
+        bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES) {
         fprintf(stderr,
-            "[seed0root] bootstrap unavailable magic=0x%llx version=%llu device_fd=%llu koboxd_va=0x%llx size=%llu modules=%llu table=0x%llx\n",
+            "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu koboxd_fd=%llu size=%llu modules=%llu\n",
             (unsigned long long)bootstrap->magic,
-            (unsigned long long)bootstrap->version,
             (unsigned long long)bootstrap->device_fd,
-            (unsigned long long)bootstrap->koboxd_image_va,
+            (unsigned long long)bootstrap->koboxd_image_fd,
             (unsigned long long)bootstrap->koboxd_image_size,
-            (unsigned long long)bootstrap->module_count,
-            (unsigned long long)bootstrap->modules_va);
+            (unsigned long long)bootstrap->module_count);
         return -1;
     }
 
-    const unsigned char *image = (const unsigned char *)(uintptr_t)bootstrap->koboxd_image_va;
+    uint64_t koboxd_map_size = 0;
+    if (align_up(bootstrap->koboxd_image_size, &koboxd_map_size) != 0) {
+        return -1;
+    }
+    unsigned char *image = pacha_mmap(
+        (int)bootstrap->koboxd_image_fd,
+        koboxd_map_size,
+        PACHA_PROT_READ,
+        PACHA_MMAP_SHARED,
+        0);
+    if (image == NULL) {
+        fprintf(stderr, "[seed0root] koboxd image mmap failed fd=%llu\n",
+            (unsigned long long)bootstrap->koboxd_image_fd);
+        return -1;
+    }
+    struct pacha_ipc_channel_pair control_pair = { .a = -1, .b = -1 };
+    int control_status = pacha_ipc_channel_create(&control_pair, seed0root_channel_rights, 0);
+    if (control_status != 0 || control_pair.a < 16 || control_pair.b < 16) {
+        fprintf(stderr,
+            "[seed0root] koboxd control channel create failed status=%d a=%d b=%d\n",
+            control_status,
+            control_pair.a,
+            control_pair.b);
+        (void)pacha_munmap(image, koboxd_map_size);
+        return control_status != 0 ? control_status : -2;
+    }
     int status = mark_fd_inherit((int)bootstrap->device_fd, "koboxd device fd");
     if (status != 0) {
         fprintf(stderr, "[seed0root] koboxd device fd inherit failed status=%d fd=%llu\n",
             status,
             (unsigned long long)bootstrap->device_fd);
+        (void)pacha_munmap(image, koboxd_map_size);
         return status;
     }
-
-    struct seed0root_loaded_process loaded;
-    status = load_elf_process("/sbin/koboxd.elf", image, bootstrap->koboxd_image_size, &loaded);
+    status = mark_fd_inherit(control_pair.b, "koboxd control fd");
     if (status != 0) {
-        fprintf(stderr, "[seed0root] koboxd load failed status=%d\n", status);
+        fprintf(stderr, "[seed0root] koboxd control fd inherit failed status=%d fd=%d\n",
+            status,
+            control_pair.b);
+        (void)pacha_munmap(image, koboxd_map_size);
         return status;
     }
-    status = stage_koboxd_bootstrap(bootstrap, &loaded);
+    struct seed0root_koboxd_bootstrap koboxd_bootstrap;
+    status = prepare_koboxd_bootstrap(bootstrap, control_pair.b, &koboxd_bootstrap);
     if (status != 0) {
+        (void)pacha_munmap(image, koboxd_map_size);
         fprintf(stderr, "[seed0root] koboxd bootstrap package failed status=%d\n", status);
         return status;
     }
-    status = start_loaded_process(&loaded, "/sbin/koboxd.elf");
+    const int bootstrap_fd = create_inherited_vmo_from_bytes(&koboxd_bootstrap, sizeof(koboxd_bootstrap), "koboxd bootstrap fd");
+    if (bootstrap_fd < 16) {
+        (void)pacha_munmap(image, koboxd_map_size);
+        fprintf(stderr, "[seed0root] koboxd bootstrap fd create failed status=%d\n", bootstrap_fd);
+        return bootstrap_fd;
+    }
+    struct seed0root_loaded_process loaded;
+    status = load_elf_process("/sbin/koboxd.elf", image, bootstrap->koboxd_image_size, &loaded);
+    (void)pacha_munmap(image, koboxd_map_size);
+    if (status != 0) {
+        (void)pacha_fd_close(bootstrap_fd);
+        fprintf(stderr, "[seed0root] koboxd load failed status=%d\n", status);
+        return status;
+    }
+    status = start_loaded_process(&loaded, "/sbin/koboxd.elf", bootstrap_fd);
+    (void)pacha_fd_close(bootstrap_fd);
     if (status != 0) {
         fprintf(stderr, "[seed0root] koboxd start failed status=%d\n", status);
         return status;
     }
     printf("[seed0root] koboxd started\n");
+    status = seed0root_connect_storage_services(control_pair.a);
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] koboxd connect failed status=%d\n", status);
+        return status;
+    }
+    printf("[seed0root] koboxd control discover OK\n");
     return 0;
 }
 
@@ -625,10 +1140,29 @@ int main(int argc, char **argv)
     free(buf);
 
     fprintf(stderr, "[seed0root] stderr OK\n");
-    int launch_status = launch_koboxd();
+    int bootstrap_fd = -1;
+    int bootstrap_status = find_seed0root_bootstrap_fd(argv, &bootstrap_fd);
+    if (bootstrap_status != 0) {
+        fprintf(stderr, "[seed0root] bootstrap lookup failed status=%d\n", bootstrap_status);
+        return 4;
+    }
+    struct seed0root_bootstrap bootstrap;
+    bootstrap_status = read_bootstrap_fd(bootstrap_fd, &bootstrap, sizeof(bootstrap), "seed0root");
+    if (bootstrap_status != 0 ||
+        bootstrap.magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
+        bootstrap.device_fd < 16 ||
+        bootstrap.koboxd_image_fd < 16 ||
+        bootstrap.koboxd_image_size == 0 ||
+        bootstrap.module_count == 0 ||
+        bootstrap.module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES)
+    {
+        fprintf(stderr, "[seed0root] bootstrap invalid status=%d\n", bootstrap_status);
+        return 4;
+    }
+    int launch_status = launch_koboxd(&bootstrap);
     if (launch_status != 0) {
         fprintf(stderr, "[seed0root] koboxd launch failed status=%d\n", launch_status);
-        return 4;
+        return 5;
     }
     printf("[seed0root] ready\n");
     fflush(stdout);

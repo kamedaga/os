@@ -69,7 +69,9 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_usb.c
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_input.c
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_work.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.c
 )
 
 string(REPLACE ";" " " KOBOXD_RUNTIME_SOURCES_ENV "${KOBOXD_RUNTIME_SOURCES}")
@@ -80,12 +82,18 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOXD_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${KOBOXD_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/koboxd/ipc_protocol.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOXD_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"

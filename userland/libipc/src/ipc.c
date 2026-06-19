@@ -59,8 +59,8 @@ int pacha_thread_set_gs_base(uint64_t gs_base) {
     return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, gs_base));
 }
 
-int pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
-    return pacha_status_to_int(pacha_syscall6(
+long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
+    return pacha_syscall6(
         PACHA_PROCESS_SYSCALL_MAP,
         (uint64_t)(uint32_t)process_fd,
         (uint64_t)(uint32_t)vmo_fd,
@@ -68,7 +68,7 @@ int pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t s
         size,
         prot,
         vmo_offset
-    ));
+    );
 }
 
 int pacha_fd_get_info(int fd, struct pacha_fd_info *out) {

@@ -7,7 +7,6 @@ const boot_static = @import("main_static.zig");
 const elf_loader = @import("../elf_loader.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
-const process_factory = @import("process_factory.zig");
 const uefi_services = @import("uefi_services.zig");
 const log_util = @import("../log_util.zig");
 
@@ -70,31 +69,76 @@ pub fn loadUserElfIntoProcessPages(
     const page0: [*]u8 = @ptrFromInt(page0_paddr);
     @memcpy(page0[0..4096], load_window[0..4096]);
 
+    var extra_vmo_fd: ?kernel.Fd = null;
+    var extra_vmo_ref: kernel.NativeVmoRef = .{};
+    if (required_pages > 1) {
+        const extra_size = @as(u64, @intCast(required_pages - 1)) * kernel.native_page_size;
+        const fd = state.createAnonymousVmoFd(
+            principal,
+            extra_size,
+            .{
+                .map_read = true,
+                .map_write = true,
+                .map_exec = true,
+                .close = true,
+            },
+            .{ .private = true },
+            0,
+        ) catch |err| {
+            log_util.logError("loadUserElfIntoProcessPages: create extra VMO failed: ", err);
+            return null;
+        };
+        extra_vmo_fd = fd;
+        extra_vmo_ref = state.nativeVmoRefForFd(principal, fd) orelse {
+            log_util.logMessage("loadUserElfIntoProcessPages: extra VMO fd missing");
+            _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+            return null;
+        };
+    }
+
     var page_index: usize = 1;
     while (page_index < required_pages) : (page_index += 1) {
         const extra_page = state.allocPhysicalPage(free_list) catch |err| {
             log_util.logIndexedError("loadUserElfIntoProcessPages: allocPhysicalPage failed idx=", page_index, err);
+            if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             return null;
         };
         const map_va = boot_static.user_va + (@as(u64, @intCast(page_index)) * 4096);
         if (!user_vm.mapUserLinearRegion(principal, map_va, extra_page.paddr, 4096, true)) {
             log_util.logIndexedMapFailure("loadUserElfIntoProcessPages: map failed idx=", page_index, map_va, extra_page.paddr);
+            if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             return null;
         }
-        process_factory.trackMappedNativePageOrHalt(
-            state,
-            principal,
-            map_va,
-            extra_page,
-            true,
-            true,
-            "user elf",
-            "extra load page",
-            free_list,
-        );
+        var paddrs = [_]u64{extra_page.paddr};
+        state.installNativeVmoPages(extra_vmo_ref, page_index - 1, paddrs[0..]) catch |err| {
+            log_util.logIndexedError("loadUserElfIntoProcessPages: install extra VMO page failed idx=", page_index, err);
+            if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+            return null;
+        };
         const page_bytes: [*]u8 = @ptrFromInt(extra_page.paddr);
         const off = page_index * 4096;
         @memcpy(page_bytes[0..4096], load_window[off .. off + 4096]);
+    }
+
+    if (extra_vmo_fd) |fd| {
+        const extra_size = @as(u64, @intCast(required_pages - 1)) * kernel.native_page_size;
+        _ = state.mmapFd(
+            principal,
+            fd,
+            boot_static.user_va + kernel.native_page_size,
+            extra_size,
+            .{ .read = true, .write = true, .exec = true },
+            .{ .anonymous = true, .private = true, .fixed = true },
+            0,
+        ) catch |err| {
+            log_util.logError("loadUserElfIntoProcessPages: track extra native VMA failed: ", err);
+            _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+            return null;
+        };
+        state.closeFdWithFreeList(principal, fd, free_list) catch |err| {
+            log_util.logError("loadUserElfIntoProcessPages: close extra native VMO fd failed: ", err);
+            return null;
+        };
     }
 
     return loaded;

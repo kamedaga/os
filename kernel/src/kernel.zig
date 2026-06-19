@@ -16,19 +16,9 @@ pub const cap_transfer_id_min: u64 = 0x1000;
 pub const PrincipalRaw = u32;
 
 fn PrincipalIdType() type {
-    const fields = [_]std.builtin.Type.EnumField{
-        .{
-            .name = "Device0",
-            .value = device_principal_raw,
-        },
-    };
-
-    return @Type(.{ .@"enum" = .{
-        .tag_type = PrincipalRaw,
-        .fields = &fields,
-        .decls = &.{},
-        .is_exhaustive = false,
-    } });
+    const field_names = [_][]const u8{"Device0"};
+    const field_values = [_]PrincipalRaw{device_principal_raw};
+    return @Enum(PrincipalRaw, .nonexhaustive, &field_names, &field_values);
 }
 
 pub const PrincipalId = PrincipalIdType();
@@ -376,6 +366,7 @@ pub const FdEntry = struct {
     object: KernelObjectRef = .{},
     rights: FdRights = .{},
     flags: FdFlags = .{},
+    offset: u64 = 0,
 
     pub fn isEmpty(self: *const FdEntry) bool {
         return self.object.isNull();
@@ -1798,6 +1789,7 @@ pub const KernelState = struct {
     next_fd_object_scan: usize = 0,
     native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
     next_native_vmo_scan: usize = 0,
+    aslr_sequence: u64 = 1,
     ipc_endpoints: [max_ipc_endpoints]IpcEndpointSlot = [_]IpcEndpointSlot{.{}} ** max_ipc_endpoints,
     next_ipc_endpoint_scan: usize = 0,
     ipc_channels: [max_ipc_channels]IpcChannelSlot = [_]IpcChannelSlot{.{}} ** max_ipc_channels,
@@ -1943,10 +1935,28 @@ pub const KernelState = struct {
         msg.* = .{};
     }
 
+    fn releaseIpcMessageWithFreeList(self: *KernelState, msg: *IpcMessage, free_list: *FreePageList) void {
+        var i: usize = 0;
+        while (i < msg.fd_count and i < max_ipc_message_fds) : (i += 1) {
+            const object_ref = msg.fds[i].object;
+            if (!object_ref.isNull()) self.releaseKernelObjectWithFreeList(object_ref, free_list);
+            msg.fds[i] = .{};
+        }
+        msg.* = .{};
+    }
+
     fn clearIpcQueue(self: *KernelState, queue: *IpcQueue) void {
         while (queue.pop()) |msg_value| {
             var msg = msg_value;
             self.releaseIpcMessage(&msg);
+        }
+        queue.* = .{};
+    }
+
+    fn clearIpcQueueWithFreeList(self: *KernelState, queue: *IpcQueue, free_list: *FreePageList) void {
+        while (queue.pop()) |msg_value| {
+            var msg = msg_value;
+            self.releaseIpcMessageWithFreeList(&msg, free_list);
         }
         queue.* = .{};
     }
@@ -1972,6 +1982,16 @@ pub const KernelState = struct {
     fn clearIpcEndpointSlot(self: *KernelState, endpoint_ref: IpcEndpointRef) void {
         const slot = self.ipcEndpointSlot(endpoint_ref) orelse return;
         self.clearIpcQueue(&slot.queue);
+        slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+    }
+
+    fn clearIpcEndpointSlotWithFreeList(
+        self: *KernelState,
+        endpoint_ref: IpcEndpointRef,
+        free_list: *FreePageList,
+    ) void {
+        const slot = self.ipcEndpointSlot(endpoint_ref) orelse return;
+        self.clearIpcQueueWithFreeList(&slot.queue, free_list);
         slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
     }
 
@@ -2034,6 +2054,20 @@ pub const KernelState = struct {
         slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
     }
 
+    fn releaseIpcChannelHandleWithFreeList(
+        self: *KernelState,
+        handle: IpcChannelHandle,
+        free_list: *FreePageList,
+    ) void {
+        const slot = self.ipcChannelSlot(handle.channel) orelse return;
+        if (slot.ref_count == 0) return;
+        slot.ref_count -= 1;
+        if (slot.ref_count != 0) return;
+        self.clearIpcQueueWithFreeList(&slot.queues[0], free_list);
+        self.clearIpcQueueWithFreeList(&slot.queues[1], free_list);
+        slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+    }
+
     fn ipcReplySlot(self: *KernelState, reply_ref: IpcReplyRef) ?*IpcReplySlot {
         if (reply_ref.isNull()) return null;
         const index: usize = @intCast(reply_ref.index);
@@ -2055,6 +2089,16 @@ pub const KernelState = struct {
     fn clearIpcReplySlot(self: *KernelState, reply_ref: IpcReplyRef) void {
         const slot = self.ipcReplySlot(reply_ref) orelse return;
         self.clearIpcQueue(&slot.queue);
+        slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+    }
+
+    fn clearIpcReplySlotWithFreeList(
+        self: *KernelState,
+        reply_ref: IpcReplyRef,
+        free_list: *FreePageList,
+    ) void {
+        const slot = self.ipcReplySlot(reply_ref) orelse return;
+        self.clearIpcQueueWithFreeList(&slot.queue, free_list);
         slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
     }
 
@@ -2110,6 +2154,41 @@ pub const KernelState = struct {
         const paddr = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse return null;
         if (paddr == 0) return null;
         return paddr;
+    }
+
+    pub fn readFdVmoBytes(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        out: []u8,
+    ) KernelError!usize {
+        if (out.len == 0) return 0;
+        const table = try self.fdTableForActiveProcess(owner);
+        const fd_index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const fd_entry = table.entries[fd_index];
+        if (fd_entry.object.isNull() or !fd_entry.rights.read) return KernelError.InvalidState;
+        const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
+        const vmo_ref = switch (object_slot.payload) {
+            .vmo => |ref| ref,
+            else => return KernelError.InvalidState,
+        };
+        const vmo = self.nativeVmoSlotConst(vmo_ref) orelse return KernelError.InvalidState;
+        if (fd_entry.offset >= vmo.size_bytes) return 0;
+        const max_len: usize = @intCast(@min(@as(u64, @intCast(out.len)), vmo.size_bytes - fd_entry.offset));
+        var copied: usize = 0;
+        while (copied < max_len) {
+            const absolute = fd_entry.offset + @as(u64, @intCast(copied));
+            const page_index: usize = @intCast(absolute / native_page_size);
+            const page_offset: usize = @intCast(absolute % native_page_size);
+            const paddr = self.nativeVmoPagePaddr(vmo_ref, page_index) orelse return KernelError.InvalidState;
+            const page: [*]const u8 = @ptrFromInt(paddr);
+            const chunk = @min(max_len - copied, native_page_size - page_offset);
+            @memcpy(out[copied .. copied + chunk], page[page_offset .. page_offset + chunk]);
+            copied += chunk;
+        }
+        const update_table = try self.fdTableForActiveProcess(owner);
+        update_table.entries[fd_index].offset = fd_entry.offset + @as(u64, @intCast(copied));
+        return copied;
     }
 
     pub fn installNativeVmoPages(
@@ -2209,9 +2288,9 @@ pub const KernelState = struct {
     ) void {
         switch (slot.payload) {
             .vmo => |vmo_ref| self.releaseNativeVmoWithFreeList(vmo_ref, free_list),
-            .endpoint => |endpoint_ref| self.clearIpcEndpointSlot(endpoint_ref),
-            .channel => |channel_handle| self.releaseIpcChannelHandle(channel_handle),
-            .reply => |reply_ref| self.clearIpcReplySlot(reply_ref),
+            .endpoint => |endpoint_ref| self.clearIpcEndpointSlotWithFreeList(endpoint_ref, free_list),
+            .channel => |channel_handle| self.releaseIpcChannelHandleWithFreeList(channel_handle, free_list),
+            .reply => |reply_ref| self.clearIpcReplySlotWithFreeList(reply_ref, free_list),
             .mmio_region => |mmio| self.releaseMmioRegionObject(mmio),
             .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
             .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
@@ -2504,6 +2583,7 @@ pub const KernelState = struct {
                 .object = source.object,
                 .rights = fdRightsFromBits(fdRightsToBits(source.rights)),
                 .flags = fdFlagsFromBits(fdFlagsToBits(source.flags)),
+                .offset = source.offset,
             };
         }
     }
@@ -2675,6 +2755,35 @@ pub const KernelState = struct {
             if (start_va < entry.endVa() and end_va > entry.start_va) return true;
         }
         return false;
+    }
+
+    pub fn findFreeUserMapVa(
+        self: *const KernelState,
+        owner: PrincipalId,
+        size_bytes: u64,
+        seed: u64,
+    ) KernelError!u64 {
+        if (!isPageAligned(size_bytes) or size_bytes == 0) return KernelError.InvalidState;
+        const base = @import("kernel_abi_root").process_abi.user_aslr_base_va;
+        const end = @import("kernel_abi_root").process_abi.user_aslr_end_va;
+        const granule = @import("kernel_abi_root").process_abi.user_aslr_granule;
+        if (end <= base or size_bytes > end - base) return KernelError.InvalidState;
+        const table = self.getVmaTableConst(owner) orelse return KernelError.InvalidState;
+        const slots = ((end - base - size_bytes) / granule) + 1;
+        if (slots == 0) return KernelError.InvalidState;
+        var mixed = seed ^ (@as(u64, @intFromEnum(owner)) *% 0x9e37_79b9_7f4a_7c15);
+        var attempt: u64 = 0;
+        while (attempt < slots) : (attempt += 1) {
+            mixed = mixed *% 0xbf58_476d_1ce4_e5b9 +% 0x94d0_49bb_1331_11eb;
+            const slot = (mixed + attempt) % slots;
+            const candidate = base + slot * granule;
+            if (!try vmaRangeOverlaps(table, candidate, size_bytes)) return candidate;
+        }
+        var candidate = base;
+        while (candidate + size_bytes <= end) : (candidate += granule) {
+            if (!try vmaRangeOverlaps(table, candidate, size_bytes)) return candidate;
+        }
+        return KernelError.TableFull;
     }
 
     fn vmaProtAllowedByRights(prot: VmaProt, rights: FdRights) bool {
@@ -3888,10 +3997,15 @@ pub const KernelState = struct {
         msg.fd_count += 1;
     }
 
-    fn closeMovedIpcSendFds(self: *KernelState, owner: PrincipalId, specs: []const IpcSendFd) void {
+    fn closeMovedIpcSendFdsWithFreeList(
+        self: *KernelState,
+        owner: PrincipalId,
+        specs: []const IpcSendFd,
+        free_list: *FreePageList,
+    ) void {
         for (specs) |spec| {
             if (!spec.move) continue;
-            self.closeFd(owner, spec.fd) catch {};
+            self.closeFdWithFreeList(owner, spec.fd, free_list) catch {};
         }
     }
 
@@ -3899,6 +4013,7 @@ pub const KernelState = struct {
         self: *KernelState,
         owner: PrincipalId,
         send: IpcSendMessage,
+        free_list: *FreePageList,
     ) KernelError!IpcMessage {
         try validateIpcSendFds(send.fds);
         var msg = IpcMessage{
@@ -3906,7 +4021,7 @@ pub const KernelState = struct {
             .sender = owner,
             .words = send.words,
         };
-        errdefer self.releaseIpcMessage(&msg);
+        errdefer self.releaseIpcMessageWithFreeList(&msg, free_list);
         for (send.fds) |spec| {
             try self.appendIpcSendFd(owner, &msg, spec);
         }
@@ -3919,6 +4034,7 @@ pub const KernelState = struct {
         fd: Fd,
         send: IpcSendMessage,
         require_call: bool,
+        free_list: *FreePageList,
     ) KernelError!void {
         const table = try self.fdTableForActiveProcessConst(owner);
         const index = fdIndex(fd) orelse return KernelError.InvalidState;
@@ -3929,25 +4045,37 @@ pub const KernelState = struct {
         } else if (!entry.rights.send) {
             return KernelError.InvalidState;
         }
-        var msg = try self.buildIpcMessage(owner, send);
-        errdefer self.releaseIpcMessage(&msg);
+        var msg = try self.buildIpcMessage(owner, send, free_list);
+        errdefer self.releaseIpcMessageWithFreeList(&msg, free_list);
         const queue = try self.ipcMessageQueueForSend(entry.object);
         try queue.push(msg);
         msg = .{};
         self.markReplySentIfNeeded(entry.object);
-        self.closeMovedIpcSendFds(owner, send.fds);
+        self.closeMovedIpcSendFdsWithFreeList(owner, send.fds, free_list);
     }
 
-    pub fn ipcSend(self: *KernelState, owner: PrincipalId, fd: Fd, send: IpcSendMessage) KernelError!void {
+    pub fn ipcSend(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        send: IpcSendMessage,
+        free_list: *FreePageList,
+    ) KernelError!void {
         try self.requireActiveProcess(owner);
-        try self.enqueueIpcMessage(owner, fd, send, false);
+        try self.enqueueIpcMessage(owner, fd, send, false, free_list);
     }
 
-    pub fn ipcReply(self: *KernelState, owner: PrincipalId, fd: Fd, send: IpcSendMessage) KernelError!void {
+    pub fn ipcReply(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        send: IpcSendMessage,
+        free_list: *FreePageList,
+    ) KernelError!void {
         const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
         const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
         if (slot.kind != .reply) return KernelError.InvalidState;
-        try self.ipcSend(owner, fd, send);
+        try self.ipcSend(owner, fd, send, free_list);
     }
 
     pub fn ipcCall(
@@ -3956,6 +4084,7 @@ pub const KernelState = struct {
         fd: Fd,
         send: IpcSendMessage,
         min_reply_fd: Fd,
+        free_list: *FreePageList,
     ) KernelError!Fd {
         try self.requireActiveProcess(owner);
         if (send.fds.len >= max_ipc_message_fds) return KernelError.InvalidState;
@@ -3966,10 +4095,10 @@ pub const KernelState = struct {
         };
         errdefer if (self.kernelObjectSlot(reply_object)) |slot| self.clearKernelObjectSlot(slot);
         const reply_fd = try self.installFd(owner, reply_object, replyReceiveRights(), .{ .cloexec = true }, min_reply_fd);
-        errdefer self.closeFd(owner, reply_fd) catch {};
+        errdefer self.closeFdWithFreeList(owner, reply_fd, free_list) catch {};
 
-        var msg = try self.buildIpcMessage(owner, send);
-        errdefer self.releaseIpcMessage(&msg);
+        var msg = try self.buildIpcMessage(owner, send, free_list);
+        errdefer self.releaseIpcMessageWithFreeList(&msg, free_list);
         try self.retainKernelObject(reply_object);
         msg.fds[msg.fd_count] = .{
             .object = reply_object,
@@ -3985,7 +4114,7 @@ pub const KernelState = struct {
         const queue = try self.ipcMessageQueueForSend(entry.object);
         try queue.push(msg);
         msg = .{};
-        self.closeMovedIpcSendFds(owner, send.fds);
+        self.closeMovedIpcSendFdsWithFreeList(owner, send.fds, free_list);
         return reply_fd;
     }
 
@@ -3995,6 +4124,7 @@ pub const KernelState = struct {
         fd: Fd,
         fd_capacity: usize,
         min_fd: Fd,
+        free_list: *FreePageList,
     ) KernelError!IpcRecvResult {
         try self.requireActiveProcess(owner);
         const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
@@ -4010,7 +4140,7 @@ pub const KernelState = struct {
         errdefer {
             var i: usize = 0;
             while (i < installed_count) : (i += 1) {
-                self.closeFd(owner, installed[i]) catch {};
+                self.closeFdWithFreeList(owner, installed[i], free_list) catch {};
             }
         }
 
@@ -4032,7 +4162,7 @@ pub const KernelState = struct {
         }
 
         var msg = queue.pop() orelse return KernelError.MailboxEmpty;
-        self.releaseIpcMessage(&msg);
+        self.releaseIpcMessageWithFreeList(&msg, free_list);
         return result;
     }
 

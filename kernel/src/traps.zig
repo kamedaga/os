@@ -44,6 +44,8 @@ pub export var trap_fault_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{st
 pub export var fatal_exception_resume_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var timer_interrupt_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var syscall_work_frame: TrapFrame = std.mem.zeroes(TrapFrame);
+pub export var syscall_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
+pub export var syscall_entry_lock: u64 = 0;
 pub export var user_return_saved_gprs_by_cpu: [smp.max_cpus][16]u64 align(16) = [_][16]u64{[_]u64{0} ** 16} ** smp.max_cpus;
 pub export var user_return_iret_frames_by_cpu: [smp.max_cpus][8]u64 align(16) = [_][8]u64{[_]u64{0} ** 8} ** smp.max_cpus;
 
@@ -71,6 +73,8 @@ const runtime_storage_ptrs = .{
     &fatal_exception_resume_work_frames,
     &timer_interrupt_work_frames,
     &syscall_work_frame,
+    &syscall_work_frames,
+    &syscall_entry_lock,
     &user_return_saved_gprs_by_cpu,
     &user_return_iret_frames_by_cpu,
     &user_return_saved_r10,
@@ -103,10 +107,6 @@ fn getHooks() *const Hooks {
 extern var kernel_cr3_value: u64;
 extern var kernel_syscall_stack_top: u64;
 extern var kernel_syscall_stack_tops: [smp.max_cpus]u64;
-extern var user_cr3_value: u64;
-extern var user_cr3_values: [smp.max_cpus]u64;
-extern var current_user_principals: [smp.max_cpus]kernel.PrincipalId;
-extern var current_thread_indices: [smp.max_cpus]usize;
 extern var thread_contexts_ptr: *anyopaque;
 extern var lapic_tick_count: u64;
 extern var user_return_saved_r10: u64;
@@ -423,6 +423,9 @@ pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
 
 pub export fn syscallEntryStub() callconv(.naked) noreturn {
     asm volatile (
+        \\1:
+        \\lock btsq $0, syscall_entry_lock(%rip)
+        \\jc 1b
         \\mov %r15, syscall_work_frame+0(%rip)
         \\mov %r14, syscall_work_frame+8(%rip)
         \\mov %r13, syscall_work_frame+16(%rip)
@@ -443,17 +446,44 @@ pub export fn syscallEntryStub() callconv(.naked) noreturn {
         \\mov %r11, syscall_work_frame+136(%rip)
         \\mov %rsp, syscall_work_frame+144(%rip)
         \\movq $0x23, syscall_work_frame+152(%rip)
+        \\rdtscp
+        \\cmp %[max_cpus], %ecx
+        \\jb 2f
+        \\xor %ecx, %ecx
+        \\2:
+        \\mov %ecx, %r12d
+        \\mov %r12, %r14
+        \\shl $3, %r14
+        \\imul %[trap_frame_size], %r12, %r13
+        \\lea syscall_work_frames(%rip), %rdi
+        \\add %r13, %rdi
+        \\lea syscall_work_frame(%rip), %rsi
+        \\mov %[trap_frame_qwords], %ecx
+        \\cld
+        \\rep movsq
+        \\lea syscall_work_frames(%rip), %r12
+        \\add %r13, %r12
         \\mov kernel_cr3_value(%rip), %r10
         \\mov %r10, %cr3
-        \\mov kernel_syscall_stack_top(%rip), %rsp
+        \\lea kernel_syscall_stack_tops(%rip), %r13
+        \\mov (%r13,%r14,1), %rsp
+        \\push %r12
+        \\movq $0, syscall_entry_lock(%rip)
     ++ asmCallAligned("saveCurrentThreadFxState") ++
-        \\lea syscall_work_frame(%rip), %rcx
+        \\mov (%rsp), %r12
+        \\mov %r12, %rcx
     ++ asmCallAligned("syscallDispatch") ++
-        \\mov %rax, syscall_work_frame+112(%rip)
+        \\mov (%rsp), %r12
     ++ asmCallAligned("restoreCurrentThreadFxState") ++
-        \\lea syscall_work_frame(%rip), %rax
+        \\mov (%rsp), %r12
+        \\add $8, %rsp
+        \\mov %r12, %rax
     ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
+        :
+        : [max_cpus] "i" (smp.max_cpus),
+          [trap_frame_size] "i" (@sizeOf(TrapFrame)),
+          [trap_frame_qwords] "i" (trap_frame_qword_count),
     );
 }
 

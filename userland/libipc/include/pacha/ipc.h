@@ -1,6 +1,8 @@
 #ifndef PACHA_IPC_H
 #define PACHA_IPC_H
 
+#include "pacha/abi.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -9,52 +11,6 @@ extern "C" {
 #endif
 
 enum {
-    PACHA_PROCESS_SYSCALL_CREATE = 2,
-    PACHA_PROCESS_SYSCALL_KILL = 3,
-    PACHA_PROCESS_SYSCALL_WAIT = 4,
-    PACHA_PROCESS_SYSCALL_EXIT = 5,
-    PACHA_THREAD_SYSCALL_CREATE = 6,
-    PACHA_THREAD_SYSCALL_START = 7,
-    PACHA_THREAD_SYSCALL_KILL = 8,
-    PACHA_THREAD_SYSCALL_WAIT = 9,
-    PACHA_THREAD_SYSCALL_EXIT = 10,
-    PACHA_THREAD_SYSCALL_SET_FS_BASE = 11,
-    PACHA_THREAD_SYSCALL_SET_GS_BASE = 12,
-    PACHA_PROCESS_SYSCALL_MAP = 13,
-    PACHA_RUNTIME_SYSCALL_GETPID = 14,
-    PACHA_RUNTIME_SYSCALL_GETTID = 15,
-    PACHA_RUNTIME_SYSCALL_CLOCK_GETTIME = 16,
-    PACHA_RUNTIME_SYSCALL_NANOSLEEP = 17,
-    PACHA_RUNTIME_SYSCALL_FUTEX_WAIT = 18,
-    PACHA_RUNTIME_SYSCALL_FUTEX_WAKE = 19,
-    PACHA_FD_SYSCALL_CLOSE = 20,
-    PACHA_FD_SYSCALL_DUP = 21,
-    PACHA_FD_SYSCALL_GET_INFO = 22,
-    PACHA_FD_SYSCALL_SET_FLAGS = 23,
-    PACHA_FD_SYSCALL_READ = 24,
-    PACHA_FD_SYSCALL_WRITE = 25,
-    PACHA_FD_SYSCALL_READV = 26,
-    PACHA_FD_SYSCALL_WRITEV = 27,
-    PACHA_FD_SYSCALL_FCNTL = 28,
-    PACHA_FD_SYSCALL_POLL = 29,
-    PACHA_FD_SYSCALL_WAIT_MANY = 30,
-    PACHA_FD_SYSCALL_IOCTL = 31,
-    PACHA_FD_SYSCALL_STAT = 32,
-    PACHA_FD_SYSCALL_EVENTFD_CREATE = 33,
-    PACHA_FD_SYSCALL_TIMERFD_CREATE = 34,
-    PACHA_FD_SYSCALL_TIMERFD_SETTIME = 35,
-    PACHA_FD_SYSCALL_TIMERFD_GETTIME = 36,
-    PACHA_FD_SYSCALL_VMO_CREATE = 37,
-    PACHA_FD_SYSCALL_MMAP = 38,
-    PACHA_FD_SYSCALL_MUNMAP = 39,
-    PACHA_FD_SYSCALL_MPROTECT = 40,
-    PACHA_IPC_SYSCALL_ENDPOINT_CREATE = 41,
-    PACHA_IPC_SYSCALL_CHANNEL_CREATE = 42,
-    PACHA_IPC_SYSCALL_SEND = 43,
-    PACHA_IPC_SYSCALL_RECV = 44,
-    PACHA_IPC_SYSCALL_CALL = 45,
-    PACHA_IPC_SYSCALL_REPLY = 46,
-
     PACHA_IPC_MAX_TRANSFER_FDS = 8,
     PACHA_IPC_FAST_RING_ENTRIES = 64,
 
@@ -63,67 +19,6 @@ enum {
     PACHA_IPC_TRANSFER_NONBLOCK = 1u << 2,
     PACHA_IPC_TRANSFER_INHERIT = 1u << 3,
     PACHA_IPC_TRANSFER_PRIVATE = 1u << 4,
-
-    PACHA_FD_RIGHT_INSPECT = 1ull << 0,
-    PACHA_FD_RIGHT_DUP = 1ull << 1,
-    PACHA_FD_RIGHT_TRANSFER = 1ull << 2,
-    PACHA_FD_RIGHT_WAIT = 1ull << 3,
-    PACHA_FD_RIGHT_POLL = 1ull << 4,
-    PACHA_FD_RIGHT_SET_FLAGS = 1ull << 5,
-    PACHA_FD_RIGHT_CLOSE = 1ull << 6,
-    PACHA_FD_RIGHT_SEND = 1ull << 7,
-    PACHA_FD_RIGHT_RECV = 1ull << 8,
-    PACHA_FD_RIGHT_CALL = 1ull << 9,
-    PACHA_FD_RIGHT_ACCEPT = 1ull << 10,
-    PACHA_FD_RIGHT_BIND = 1ull << 11,
-    PACHA_FD_RIGHT_ENDPOINT_SIGNAL = 1ull << 12,
-    PACHA_FD_RIGHT_MAP_READ = 1ull << 13,
-    PACHA_FD_RIGHT_MAP_WRITE = 1ull << 14,
-    PACHA_FD_RIGHT_MAP_EXEC = 1ull << 15,
-    PACHA_FD_RIGHT_SPAWN = 1ull << 20,
-    PACHA_FD_RIGHT_START = 1ull << 21,
-    PACHA_FD_RIGHT_KILL = 1ull << 22,
-    PACHA_FD_RIGHT_DEBUG = 1ull << 23,
-    PACHA_FD_RIGHT_MAP_INTO = 1ull << 24,
-    PACHA_FD_RIGHT_SET_CONTEXT = 1ull << 25,
-    PACHA_FD_RIGHT_READ = 1ull << 42,
-    PACHA_FD_RIGHT_WRITE = 1ull << 43,
-
-    PACHA_FD_KIND_PROCESS = 1,
-    PACHA_FD_KIND_THREAD = 2,
-    PACHA_FD_KIND_EVENT = 3,
-    PACHA_FD_KIND_VMO = 4,
-    PACHA_FD_KIND_ENDPOINT = 5,
-    PACHA_FD_KIND_CHANNEL = 6,
-    PACHA_FD_KIND_REPLY = 7,
-    PACHA_FD_KIND_TIMER = 13,
-
-    PACHA_MMAP_PRIVATE = 1ull << 2,
-    PACHA_MMAP_SHARED = 1ull << 3,
-    PACHA_MMAP_ANONYMOUS = 1ull << 4,
-    PACHA_MMAP_PKEY_SHIFT = 8,
-    PACHA_MMAP_PKEY_MASK = 0xfull << PACHA_MMAP_PKEY_SHIFT,
-    PACHA_PROT_READ = 1ull << 0,
-    PACHA_PROT_WRITE = 1ull << 1,
-    PACHA_PROT_EXEC = 1ull << 2,
-
-    PACHA_FD_FCNTL_GET_FLAGS = 1,
-    PACHA_FD_FCNTL_SET_FLAGS = 2,
-    PACHA_FD_FCNTL_DUP = 3,
-
-    PACHA_FD_FLAG_CLOEXEC = 1u << 0,
-    PACHA_FD_FLAG_NONBLOCK = 1u << 1,
-    PACHA_FD_FLAG_INHERIT = 1u << 2,
-    PACHA_FD_FLAG_PRIVATE = 1u << 3,
-
-    PACHA_FD_EVENT_READABLE = 1ull << 0,
-    PACHA_FD_EVENT_WRITABLE = 1ull << 1,
-    PACHA_FD_EVENT_ERROR = 1ull << 2,
-    PACHA_FD_EVENT_HANGUP = 1ull << 3,
-
-    PACHA_FD_WAIT_FOREVER = UINT64_MAX,
-    PACHA_TIMERFD_CLOCK_MONOTONIC = 1,
-    PACHA_TIMERFD_ABSTIME = 1ull << 0,
 };
 
 struct pacha_ipc_fd {
@@ -244,7 +139,7 @@ int pacha_process_create(uint64_t rights, uint32_t flags);
 int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights);
 int pacha_thread_start(int thread_fd);
 int pacha_thread_set_gs_base(uint64_t gs_base);
-int pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
+long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
 int pacha_fd_get_info(int fd, struct pacha_fd_info *out);
 int pacha_fd_close(int fd);
 long pacha_fd_read(int fd, void *buf, uint64_t len);

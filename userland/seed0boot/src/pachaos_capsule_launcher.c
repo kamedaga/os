@@ -44,6 +44,35 @@ struct seed0_capsule_module_spec {
     const char *name;
 };
 
+static int seed0_create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
+{
+    if (data == 0 || size == 0 || size > UINT64_MAX - 4095ull) {
+        return -1;
+    }
+    const uint64_t map_size = (size + 4095ull) & ~4095ull;
+    const uint64_t rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const int fd = pacha_vmo_create(map_size, rights, PACHA_FD_FLAG_INHERIT);
+    if (fd < 16) {
+        fprintf(stderr, "[seed0boot] %s: vmo_create failed status=%d\n", label, fd);
+        return -2;
+    }
+    unsigned char *mapped = pacha_mmap(fd, map_size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    if (mapped == 0) {
+        (void)pacha_fd_close(fd);
+        return -3;
+    }
+    memset(mapped, 0, (size_t)map_size);
+    memcpy(mapped, data, (size_t)size);
+    (void)pacha_munmap(mapped, map_size);
+    return fd;
+}
+
 static int mark_device_inherit(int device_fd, const char *label)
 {
     long flag_status = pacha_fd_fcntl(
@@ -157,7 +186,7 @@ int seed0_launch_pachaos_capsule_nvme(void)
         device_fd,
         daemon_size,
         (unsigned long long)module_count);
-    status = seed0_start_process(&loaded, "/srv/pachaos_capsule.elf");
+    status = seed0_start_process(&loaded, "/srv/pachaos_capsule.elf", -1);
     if (status != 0) {
         return status;
     }
@@ -193,8 +222,10 @@ int seed0_launch_storage_boot_nvme(void)
     }
     const unsigned char *module_images[STORAGE_BOOT_MAX_MODULES];
     uint32_t module_sizes[STORAGE_BOOT_MAX_MODULES];
+    int module_fds[STORAGE_BOOT_MAX_MODULES];
     memset(module_images, 0, sizeof(module_images));
     memset(module_sizes, 0, sizeof(module_sizes));
+    memset(module_fds, 0, sizeof(module_fds));
     const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
     for (uint64_t i = 0; i < module_count; i++) {
         status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
@@ -204,17 +235,28 @@ int seed0_launch_storage_boot_nvme(void)
                 status);
             return -3;
         }
-        if ((uint64_t)module_sizes[i] > STORAGE_BOOT_MODULE_IMAGE_STRIDE) {
-            fprintf(stderr, "[seed0boot] storage_boot: %s too large size=%u stride=%llu\n",
-                module_specs[i].path,
-                module_sizes[i],
-                (unsigned long long)STORAGE_BOOT_MODULE_IMAGE_STRIDE);
-            return -3;
-        }
+        module_fds[i] = seed0_create_inherited_vmo_from_bytes(module_images[i], module_sizes[i], module_specs[i].name);
+        if (module_fds[i] < 16) return -3;
     }
 
     status = mark_device_inherit(device_fd, "storage_boot");
     if (status != 0) return status;
+
+    struct storage_boot_config config;
+    memset(&config, 0, sizeof(config));
+    config.magic = STORAGE_BOOT_CONFIG_MAGIC;
+    config.device_fd = (uint64_t)(uint32_t)device_fd;
+    config.module_count = module_count;
+    for (uint64_t i = 0; i < module_count; i++) {
+        config.modules[i].image_fd = (uint64_t)(uint32_t)module_fds[i];
+        config.modules[i].image_size = module_sizes[i];
+        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
+    }
+
+    const int config_fd = seed0_create_inherited_vmo_from_bytes(&config, sizeof(config), "storage_boot config");
+    if (config_fd < 16) {
+        return -5;
+    }
 
     struct seed0_loaded_process loaded;
     status = seed0_load_elf_process("/srv/storage_boot.elf", daemon_image, daemon_size, &loaded);
@@ -222,49 +264,11 @@ int seed0_launch_storage_boot_nvme(void)
         return status;
     }
 
-    struct storage_boot_config config;
-    memset(&config, 0, sizeof(config));
-    config.magic = STORAGE_BOOT_CONFIG_MAGIC;
-    config.version = STORAGE_BOOT_CONFIG_VERSION;
-    config.device_fd = (uint64_t)(uint32_t)device_fd;
-    config.module_count = module_count;
-    for (uint64_t i = 0; i < module_count; i++) {
-        config.modules[i].image_va = STORAGE_BOOT_MODULE_IMAGE_VA +
-            (STORAGE_BOOT_MODULE_IMAGE_STRIDE * i);
-        config.modules[i].image_size = module_sizes[i];
-        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
-    }
-
-    status = seed0_map_bytes_into_process(
-        loaded.process_fd,
-        STORAGE_BOOT_CONFIG_VA,
-        &config,
-        sizeof(config),
-        PACHA_PROT_READ);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] storage_boot: config map failed status=%d\n", status);
-        return -5;
-    }
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_map_bytes_into_process(
-            loaded.process_fd,
-            config.modules[i].image_va,
-            module_images[i],
-            module_sizes[i],
-            PACHA_PROT_READ);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] storage_boot: module map failed name=%s status=%d\n",
-                module_specs[i].name,
-                status);
-            return -6;
-        }
-    }
-
     printf("[seed0boot] storage_boot: launching NVMe storage daemon fd=%d daemon_size=%u modules=%llu\n",
         device_fd,
         daemon_size,
         (unsigned long long)module_count);
-    status = seed0_start_process(&loaded, "/srv/storage_boot.elf");
+    status = seed0_start_process(&loaded, "/srv/storage_boot.elf", config_fd);
     if (status != 0) {
         return status;
     }

@@ -20,9 +20,6 @@ enum {
     SEED0_ELF_PF_X = 1,
     SEED0_ELF_PF_W = 2,
     SEED0_ELF_PF_R = 4,
-    SEED0_NEXT_STAGE_LOAD_BASE = 0x20000000ull,
-    SEED0_CHILD_STACK_TOP = 0x70000000ull,
-    SEED0_CHILD_STACK_SIZE = 0x20000ull,
     SEED0_AT_NULL = 0,
     SEED0_AT_PHDR = 3,
     SEED0_AT_PHENT = 4,
@@ -138,11 +135,12 @@ static int validate_elf_header(const char *path, const unsigned char *image, uin
 static int stage_load_segment(
     const char *path,
     int process_fd,
-    uint64_t load_bias,
+    uint64_t target_va,
     const unsigned char *image,
     uint32_t image_size,
     const unsigned char *ph,
-    uint16_t index)
+    uint16_t index,
+    uint64_t *out_mapped_va)
 {
     const uint32_t p_flags = rd32(ph + 4);
     const uint64_t p_offset = rd64(ph + 8);
@@ -160,8 +158,7 @@ static int stage_load_segment(
         return 0;
     }
 
-    const uint64_t target_va = align_down(p_vaddr + load_bias);
-    const uint64_t page_offset = (p_vaddr + load_bias) - target_va;
+    const uint64_t page_offset = p_vaddr - align_down(p_vaddr);
     uint64_t map_size = 0;
     if (align_up(page_offset + p_memsz, &map_size) != 0) {
         return -2;
@@ -190,10 +187,10 @@ static int stage_load_segment(
     memcpy(mapped + page_offset, image + p_offset, (size_t)p_filesz);
 
     const uint64_t prot = prot_from_elf_flags(p_flags);
-    const int map_status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
-    if (map_status != 0) {
+    const long map_status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
+    if (map_status < 4096) {
         fprintf(stderr,
-            "[seed0boot] next-stage: process_map failed segment=%u process_fd=%d vmo_fd=%d status=%d\n",
+            "[seed0boot] next-stage: process_map failed segment=%u process_fd=%d vmo_fd=%d status=%ld\n",
             index,
             process_fd,
             vmo_fd,
@@ -205,11 +202,14 @@ static int stage_load_segment(
 
     (void)pacha_munmap(mapped, map_size);
     (void)pacha_fd_close(vmo_fd);
+    if (out_mapped_va != 0) {
+        *out_mapped_va = (uint64_t)map_status;
+    }
 
     printf("[seed0boot] next-stage: mapped PT_LOAD[%u] process_fd=%d target=0x%llx size=%llu prot=0x%llx file=%llu mem=%llu\n",
         index,
         process_fd,
-        (unsigned long long)target_va,
+        (unsigned long long)(uint64_t)map_status,
         (unsigned long long)map_size,
         (unsigned long long)prot,
         (unsigned long long)p_filesz,
@@ -250,10 +250,10 @@ int seed0_map_bytes_into_process(
     }
     memset(mapped, 0, (size_t)map_size);
     memcpy(mapped, data, (size_t)size);
-    const int map_status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
+    const long map_status = pacha_process_map(process_fd, vmo_fd, target_va, map_size, prot, 0);
     (void)pacha_munmap(mapped, map_size);
     (void)pacha_fd_close(vmo_fd);
-    return map_status == 0 ? 0 : -5;
+    return map_status >= 4096 ? 0 : -5;
 }
 
 static int push_u64(unsigned char *stack, uint64_t *sp, uint64_t value)
@@ -266,28 +266,27 @@ static int push_u64(unsigned char *stack, uint64_t *sp, uint64_t value)
     return 0;
 }
 
-int seed0_start_process(const struct seed0_loaded_process *loaded, const char *argv0)
+int seed0_start_process(const struct seed0_loaded_process *loaded, const char *argv0, int bootstrap_fd)
 {
     if (loaded == 0 || loaded->process_fd < 16 || loaded->runtime_entry == 0 ||
         loaded->phdr_va == 0 || loaded->phent == 0 || loaded->phnum == 0 || argv0 == 0) {
         return -1;
     }
     const int process_fd = loaded->process_fd;
-    const uint64_t stack_base = SEED0_CHILD_STACK_TOP - SEED0_CHILD_STACK_SIZE;
     const uint64_t stack_rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int stack_fd = pacha_vmo_create(SEED0_CHILD_STACK_SIZE, stack_rights, 0);
+    const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
     if (stack_fd < 16) {
         fprintf(stderr, "[seed0boot] next-stage: stack vmo_create failed status=%d\n", stack_fd);
         return -2;
     }
     unsigned char *stack = pacha_mmap(
         stack_fd,
-        SEED0_CHILD_STACK_SIZE,
+        PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
@@ -295,12 +294,26 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
         (void)pacha_fd_close(stack_fd);
         return -3;
     }
-    memset(stack, 0, (size_t)SEED0_CHILD_STACK_SIZE);
+    memset(stack, 0, (size_t)PACHA_PROCESS_DEFAULT_STACK_SIZE);
+    const long stack_map = pacha_process_map(
+        process_fd,
+        stack_fd,
+        0,
+        PACHA_PROCESS_DEFAULT_STACK_SIZE,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        0);
+    if (stack_map < 4096) {
+        fprintf(stderr, "[seed0boot] next-stage: stack process_map failed status=%ld\n", stack_map);
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_fd_close(stack_fd);
+        return -6;
+    }
+    const uint64_t stack_base = (uint64_t)stack_map;
 
-    uint64_t sp = SEED0_CHILD_STACK_SIZE;
+    uint64_t sp = PACHA_PROCESS_DEFAULT_STACK_SIZE;
     const uint64_t argv0_len = (uint64_t)strlen(argv0) + 1;
     if (argv0_len > 256 || sp < argv0_len + 16) {
-        (void)pacha_munmap(stack, SEED0_CHILD_STACK_SIZE);
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -4;
     }
@@ -316,6 +329,7 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
     sp &= ~15ull;
 
     if (push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_NULL) != 0 ||
+        (bootstrap_fd >= 16 && (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 || push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, argv0_va) != 0 || push_u64(stack, &sp, SEED0_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 || push_u64(stack, &sp, SEED0_AT_RANDOM) != 0 ||
         push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_BASE) != 0 ||
@@ -327,24 +341,13 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
         push_u64(stack, &sp, 0) != 0 ||
         push_u64(stack, &sp, argv0_va) != 0 ||
         push_u64(stack, &sp, 1) != 0) {
-        (void)pacha_munmap(stack, SEED0_CHILD_STACK_SIZE);
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -5;
     }
 
-    const int map_status = pacha_process_map(
-        process_fd,
-        stack_fd,
-        stack_base,
-        SEED0_CHILD_STACK_SIZE,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        0);
-    (void)pacha_munmap(stack, SEED0_CHILD_STACK_SIZE);
+    (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
     (void)pacha_fd_close(stack_fd);
-    if (map_status != 0) {
-        fprintf(stderr, "[seed0boot] next-stage: stack process_map failed status=%d\n", map_status);
-        return -6;
-    }
 
     const uint64_t thread_rights =
         PACHA_FD_RIGHT_INSPECT |
@@ -393,7 +396,8 @@ int seed0_load_elf_process(
     const uint64_t e_phoff = rd64(image + 32);
     const uint16_t e_phentsize = rd16(image + 54);
     const uint16_t e_phnum = rd16(image + 56);
-    const uint64_t load_bias = e_type == SEED0_ELF_TYPE_DYN ? SEED0_NEXT_STAGE_LOAD_BASE : 0;
+    uint64_t load_bias = 0;
+    const int use_aslr = e_type == SEED0_ELF_TYPE_DYN;
     const uint64_t process_rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CLOSE |
@@ -414,10 +418,16 @@ int seed0_load_elf_process(
         if (rd32(ph + 0) != SEED0_ELF_PT_LOAD) {
             continue;
         }
-        status = stage_load_segment(path, process_fd, load_bias, image, image_size, ph, i);
+        const uint64_t p_vaddr = rd64(ph + 16);
+        const uint64_t requested_va = (use_aslr && load_count == 0) ? 0 : align_down(p_vaddr + load_bias);
+        uint64_t mapped_va = 0;
+        status = stage_load_segment(path, process_fd, requested_va, image, image_size, ph, i, &mapped_va);
         if (status != 0) {
             (void)pacha_fd_close(process_fd);
             return status;
+        }
+        if (use_aslr && load_count == 0) {
+            load_bias = mapped_va - align_down(p_vaddr);
         }
         load_count++;
     }
@@ -448,5 +458,5 @@ int seed0_stage_next_elf(const char *path, const unsigned char *image, uint32_t 
     struct seed0_loaded_process loaded;
     int status = seed0_load_elf_process(path, image, image_size, &loaded);
     if (status != 0) return status;
-    return seed0_start_process(&loaded, path);
+    return seed0_start_process(&loaded, path, -1);
 }

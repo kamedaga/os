@@ -380,12 +380,7 @@ fn allocateDynamicKernelStorageOrHalt(bs: *std.os.uefi.tables.BootServices) void
 }
 
 fn activateThreadOrHalt(thread_index: usize) void {
-    if (scheduler.threadContextLooksCorrupted(thread_index)) {
-        _ = scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame());
-    }
     if (scheduler.activateThread(thread_index)) return;
-    if (scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame()) and
-        scheduler.activateThread(thread_index)) return;
     halt.haltWithMessage("activate thread failed");
 }
 
@@ -440,13 +435,8 @@ fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
         while (true) {
             const current_thread = scheduler.currentThreadIndex();
             if (scheduler.pickNextReadyThreadIndexForCpu(cpu_slot, current_thread)) |thread_index| {
-                if (scheduler.threadContextLooksCorrupted(thread_index)) {
-                    _ = scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame());
-                }
                 if (scheduler.activateThread(thread_index) and scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
-                if (scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame()) and
-                    scheduler.activateThread(thread_index) and
-                    scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
+                halt.haltWithMessage("AP fault reschedule failed");
             }
             scheduler.parkCurrentApAfterCurrentThreadStopped();
         }
@@ -455,13 +445,7 @@ fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
     while (true) {
         const current_thread = scheduler.currentThreadIndex();
         if (nextReadyThreadAfter(current_thread)) |thread_index| {
-            if (scheduler.threadContextLooksCorrupted(thread_index)) {
-                _ = scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame());
-            }
             if (scheduler.activateThread(thread_index) and scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
-            if (scheduler.repairThreadContextWithSpaces(thread_index, user_spaces, process_factory.buildInitialUserTrapFrame()) and
-                scheduler.activateThread(thread_index) and
-                scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
             halt.haltWithMessage("fault reschedule failed");
         }
         asm volatile ("sti\nhlt\ncli" ::: .{ .memory = true });
@@ -615,9 +599,11 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
         \\iretq
         :
         : [k_rsp] "r" (kernel_transition_rsp),
-          [ucr3] "r" (scheduler.user_cr3_value),
+          [ucr3] "r" (scheduler.currentUserCr3()),
         : .{ .memory = true });
-    unreachable;
+    while (true) {
+        asm volatile ("hlt");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -754,8 +740,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         &global_free_list,
     );
     activateThreadOrHalt(init_process.thread_slot);
-
-    scheduler.sanitizeAllThreadContextsWithSpaces(user_spaces, process_factory.buildInitialUserTrapFrame());
 
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;

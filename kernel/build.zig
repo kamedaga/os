@@ -1,12 +1,12 @@
 const std = @import("std");
 
-fn pruneZeroSizedBootx64Artifacts() bool {
-    const cwd = std.fs.cwd();
+fn pruneZeroSizedBootx64Artifacts(io: std.Io) bool {
+    const cwd = std.Io.Dir.cwd();
     var repaired = false;
     const installed_bootx64 = "zig-out/bin/EFI/BOOT/BOOTX64.EFI";
-    if (cwd.statFile(installed_bootx64)) |stat| {
+    if (cwd.statFile(io, installed_bootx64, .{})) |stat| {
         if (stat.size == 0) {
-            cwd.deleteFile(installed_bootx64) catch |err| {
+            cwd.deleteFile(io, installed_bootx64) catch |err| {
                 std.debug.print("build.zig: failed to remove zero-byte zig-out BOOTX64.EFI: {s}\n", .{@errorName(err)});
             };
             std.debug.print("build.zig: removed zero-byte zig-out BOOTX64.EFI\n", .{});
@@ -14,19 +14,19 @@ fn pruneZeroSizedBootx64Artifacts() bool {
         }
     } else |_| {}
 
-    var cache_dir = cwd.openDir(".zig-cache/o", .{ .iterate = true }) catch return repaired;
-    defer cache_dir.close();
+    var cache_dir = cwd.openDir(io, ".zig-cache/o", .{ .iterate = true }) catch return repaired;
+    defer cache_dir.close(io);
 
     var walker = cache_dir.walk(std.heap.page_allocator) catch return repaired;
     defer walker.deinit();
 
     var removed_count: usize = 0;
-    while (walker.next() catch null) |entry| {
+    while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(entry.path), "BOOTX64.efi")) continue;
-        const stat = cache_dir.statFile(entry.path) catch continue;
+        const stat = cache_dir.statFile(io, entry.path, .{}) catch continue;
         if (stat.size != 0) continue;
-        cache_dir.deleteFile(entry.path) catch continue;
+        cache_dir.deleteFile(io, entry.path) catch continue;
         removed_count += 1;
         repaired = true;
     }
@@ -37,22 +37,16 @@ fn pruneZeroSizedBootx64Artifacts() bool {
 }
 
 pub fn build(b: *std.Build) void {
-    _ = pruneZeroSizedBootx64Artifacts();
+    _ = pruneZeroSizedBootx64Artifacts(b.graph.io);
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const user_ap_scheduling = b.option(
-        bool,
-        "user-ap-scheduling",
-        "Place user children on AP scheduler queues when AP user syscall/trap paths are ready",
-    ) orelse true;
     const ap_user_timer_preemption = b.option(
         bool,
         "ap-user-timer-preemption",
         "Allow AP user threads to be preempted by the AP timer",
     ) orelse true;
     const build_workarounds = b.addOptions();
-    build_workarounds.addOption(bool, "user_ap_scheduling", user_ap_scheduling);
     build_workarounds.addOption(bool, "ap_user_timer_preemption", ap_user_timer_preemption);
 
     const efi_target = b.resolveTargetQuery(.{

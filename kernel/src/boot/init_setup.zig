@@ -217,7 +217,7 @@ fn publishInitServiceRegistryPage(
         haltInitBootstrapDescriptor("missing window service config page");
     service_registry_abi.initPage(page.page.paddr);
     for (services) |descriptor| {
-        const kind = std.meta.intToEnum(service_registry_abi.ServiceKind, descriptor.kind) catch
+        const kind = std.enums.fromInt(service_registry_abi.ServiceKind, descriptor.kind) orelse
             haltInitBootstrapDescriptor("invalid init service descriptor kind");
         service_registry_abi.addService(
             page.page.paddr,

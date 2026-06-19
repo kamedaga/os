@@ -1,15 +1,9 @@
 #define _GNU_SOURCE
 
-#include <errno.h>
-#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/eventfd.h>
-#include <sys/timerfd.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "pacha/ipc.h"
 #include "pachaos_capsule_launcher.h"
@@ -41,14 +35,6 @@ static const uint64_t seed0_channel_rights =
     PACHA_FD_RIGHT_RECV |
     PACHA_FD_RIGHT_CALL |
     PACHA_FD_RIGHT_TRANSFER;
-
-static int arm_timer(int fd, long nsec)
-{
-    struct itimerspec spec;
-    memset(&spec, 0, sizeof(spec));
-    spec.it_value.tv_nsec = nsec;
-    return timerfd_settime(fd, 0, &spec, 0);
-}
 
 int main(int argc, char **argv)
 {
@@ -118,64 +104,6 @@ int main(int argc, char **argv)
         return 14;
     }
 
-    int event_fd = eventfd(0, EFD_CLOEXEC);
-    if (event_fd < 0) {
-        fprintf(stderr, "[seed0boot] eventfd failed errno=%d\n", errno);
-        return 2;
-    }
-
-    int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
-    if (timer_fd < 0) {
-        fprintf(stderr, "[seed0boot] timerfd_create failed errno=%d\n", errno);
-        return 3;
-    }
-    if (arm_timer(timer_fd, 1000000) != 0) {
-        fprintf(stderr, "[seed0boot] timerfd_settime failed errno=%d\n", errno);
-        return 4;
-    }
-
-    uint64_t kick = 1;
-    if (write(event_fd, &kick, sizeof(kick)) != (ssize_t)sizeof(kick)) {
-        fprintf(stderr, "[seed0boot] eventfd write failed errno=%d\n", errno);
-        return 5;
-    }
-
-    struct pollfd fds[2] = {
-        { .fd = event_fd, .events = POLLIN, .revents = 0 },
-        { .fd = timer_fd, .events = POLLIN, .revents = 0 },
-    };
-    int saw_event = 0;
-    int saw_timer = 0;
-    for (int iter = 0; iter < 8 && (!saw_event || !saw_timer); iter++) {
-        int ready = poll(fds, 2, 50);
-        if (ready < 0) {
-            fprintf(stderr, "[seed0boot] poll failed errno=%d\n", errno);
-            return 6;
-        }
-        if (ready == 0) continue;
-        if (fds[0].revents & POLLIN) {
-            uint64_t value = 0;
-            if (read(event_fd, &value, sizeof(value)) != (ssize_t)sizeof(value) || value != 1) {
-                fprintf(stderr, "[seed0boot] eventfd read failed errno=%d value=%llu\n", errno, (unsigned long long)value);
-                return 7;
-            }
-            saw_event = 1;
-        }
-        if (fds[1].revents & POLLIN) {
-            uint64_t expirations = 0;
-            if (read(timer_fd, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations) || expirations == 0) {
-                fprintf(stderr, "[seed0boot] timerfd read failed errno=%d expirations=%llu\n", errno, (unsigned long long)expirations);
-                return 8;
-            }
-            saw_timer = 1;
-        }
-    }
-
-    if (!saw_event || !saw_timer) {
-        fprintf(stderr, "[seed0boot] readiness loop incomplete event=%d timer=%d\n", saw_event, saw_timer);
-        return 9;
-    }
-
     int capsule_status = seed0_launch_storage_boot_nvme();
     if (capsule_status != 0) {
         fprintf(stderr, "[seed0boot] storage_boot launch failed status=%d\n", capsule_status);
@@ -189,9 +117,6 @@ int main(int argc, char **argv)
             services[i].control_fd,
             services[i].peer_control_fd);
     }
-    close(timer_fd);
-    close(event_fd);
-
     printf("[seed0boot] ready\n");
     fflush(stdout);
     fflush(stderr);

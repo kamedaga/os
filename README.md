@@ -21,7 +21,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 - **FD-based Microkernel** — Capabilityとほぼ特性の同じ権限ベースのFD(File Descriptor)を採用していて、厳格なセキュリティとLinux ABIおよびPOSIXの相性の良さを両立しています
 - **Trap Delegation** — Linux syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーが処理
 - **Hardware FD** — capsule を用いた、デバイスアクセスおよび特権命令の抽象化
-- **Linux ABI Compatibility** — 無改造の musl libc を動的リンクでロードし、Linux syscall をユーザーランドで処理
+- **Linux ABI Compatibility** — 無改造の Linuxバイナリ を動的リンクでロードし、Linux syscall をユーザーランドで処理
 - **Userland Drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
 - **x86_64** — x86_64 対応。AArch64 は今後対応予定
 - **Native Libc** — musl libcを互換レイヤーを用いず、ネイティブで動かせます

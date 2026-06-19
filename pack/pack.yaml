@@ -398,6 +398,12 @@ apps:
     out: "STRGBOOT.ELF"
     bootfs: "/srv/storage_boot.elf"
     rootfs: "/srv/storage_boot.elf"
+  seed0boot:
+    role: "boot"
+    file:
+      path: ".artifacts/cmake/seed0boot/seed0boot.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/seed0boot", "--parallel", "1"]
+    out: "SEED0BT.ELF"
   seed0_next:
     role: "service"
     file:
@@ -419,6 +425,13 @@ apps:
       rebuild: ["bash", "tools/build_koboxd.sh"]
     out: "KOBOXD.ELF"
     rootfs: "/sbin/koboxd.elf"
+  filed:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/filed/filed.elf"
+      rebuild: ["bash", "tools/build_filed.sh"]
+    out: "FILED.ELF"
+    rootfs: "/sbin/filed.elf"
   net_bench:
     file:
       path: ".artifacts/userland-fixtures/net_bench.elf"

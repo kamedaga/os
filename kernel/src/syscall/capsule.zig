@@ -42,12 +42,12 @@ fn pageAlignUp(value: u64) ?u64 {
 
 fn parseDmaDirection(value: u64) ?kernel.CapsuleDmaDirection {
     if (value > @as(u64, std.math.maxInt(u2))) return null;
-    return std.meta.intToEnum(kernel.CapsuleDmaDirection, @as(u2, @intCast(value))) catch null;
+    return std.enums.fromInt(kernel.CapsuleDmaDirection, @as(u2, @intCast(value)));
 }
 
 fn parseIrqKind(value: u64) ?kernel.CapsuleIrqKind {
     if (value > @as(u64, std.math.maxInt(u2))) return null;
-    return std.meta.intToEnum(kernel.CapsuleIrqKind, @as(u2, @intCast(value))) catch null;
+    return std.enums.fromInt(kernel.CapsuleIrqKind, @as(u2, @intCast(value)));
 }
 
 fn deviceRequired(comptime fields: anytype) kernel.FdRights {
