@@ -244,7 +244,6 @@ static int ext4_lookup_name_at(
     }
 
     void *inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
-    printf("[koboxd] fs-backend lookup name=%s result=%p inode=%p\n", name, result, inode);
     if (inode == NULL) {
         free(dentry);
         return -5;
@@ -397,17 +396,10 @@ int koboxd_fs_backend_mount_ext4(
         return status;
     }
     status = kb_fs_subsystem_mount_registered_root("ext4", &backend->mount_result);
-    printf("[koboxd] fs-backend ext4 mount status=%d init=%d get_tree=%d fill_super=%d magic=0x%04x reads=%u get_tree_bdev=%llu\n",
-        status,
-        backend->mount_result.init_result,
-        backend->mount_result.get_tree_result,
-        backend->mount_result.fill_super_result,
-        backend->mount_result.observed_ext4_magic,
-        backend->mount_result.block_read_count,
-        (unsigned long long)backend->mount_result.get_tree_bdev_calls);
     if (backend->mount_result.fill_super_result != 0 || backend->mount_result.observed_ext4_magic != 0xef53u) {
         return -5;
     }
+    printf("[koboxd] rootfs mounted fs=ext4 reads=%u\n", backend->mount_result.block_read_count);
     backend->ext4_module = ext4_module;
     backend->next_object_id = 2;
     fill_object_from_inode(

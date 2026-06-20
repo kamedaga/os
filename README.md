@@ -33,6 +33,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 - Linux ABIレイヤーなしで musl libcに対応しました。
 - その影響ですべての既存のソースコードが動かなくなりました。現在修正中です。
 
+
 ## Tech Stack
 
 | Layer | Language | Detail |
@@ -59,39 +60,6 @@ Type "help", "copyright", "credits" or "license" for more information.
 os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release='6.0.0-capabilityos', version='CapabilityOS Linux ABI', machine='x86_64')
 >>>
 ```
-
-### apk + clang on PachaOS
-
-```sh
-# apk add nano
-fetch http://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz
-fetch http://dl-cdn.alpinelinux.org/alpine/v3.22/community/x86_64/APKINDEX.tar.gz
-(1/3) Installing ncurses-terminfo-base (6.5_p20250503-r0)
-(2/3) Installing libncursesw (6.5_p20250503-r0)
-(3/3) Installing nano (8.4-r0)
-OK: 464 MiB in 28 packages
-# nano main.c
-```
-
-![nano editing main.c](assets/nano-screenshot.png)
-
-```sh
-# clang main.c
-# ls
-a.out  main.c
-# ./a.out
-hello world
-```
-
----
-
-## kobox — Linux Kernel Module Runtime
-
-[![kobox](https://img.shields.io/badge/kobox-GitHub-black?style=flat-square&logo=github)](https://github.com/kamedaga/kobox)
-
-[kobox](https://github.com/kamedaga/kobox) は Linux カーネル向けモジュール (`.ko`) をユーザーランドプロセスとして直接実行するランタイムです。  
-バックエンドを実装することで任意の OS に対応でき、PachaOS では独自 Capsule を用いて動作します。
-
 
 **PachaOS Capsule バックエンドで動作中:**
 

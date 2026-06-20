@@ -69,6 +69,7 @@ packaging, image sync, QEMU, and test tasks.`,
 	cmd.AddCommand(buildCommand(ctx))
 	cmd.AddCommand(genCommand(ctx))
 	cmd.AddCommand(syncCommand(ctx))
+	cmd.AddCommand(runnerCommand(ctx))
 	cmd.AddCommand(stubCommand(ctx, "image", "Create or update disk image"))
 	cmd.AddCommand(qemuCommand(ctx))
 	cmd.AddCommand(qemuTestCommand(ctx, "qemu-test"))

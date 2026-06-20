@@ -19,6 +19,12 @@
           f {
             pkgs = import nixpkgs {
               inherit system;
+              config.allowUnfreePredicate =
+                pkg:
+                builtins.elem (nixpkgs.lib.getName pkg) [
+                  "coq9.1-compcert"
+                  "compcert"
+                ];
             };
           }
         );
@@ -40,6 +46,7 @@
             CAPOS_OVMF_VARS_TEMPLATE = "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd";
             PACGO_NIX_DEVELOP = "1";
             shellHook = ''
+              export ROCQPATH="${toolchains.coqCompCertContrib}''${ROCQPATH:+:''${ROCQPATH}}"
               if [ -n "''${PS1-}" ]; then
                 echo "CapabilityOS dev shell"
                 echo "  runner: ./pacgo"

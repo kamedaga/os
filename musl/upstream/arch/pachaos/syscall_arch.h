@@ -141,6 +141,11 @@ static __inline long __pachaos_status(long status)
 	return status == 0 ? 0 : -22;
 }
 
+static __inline long __pachaos_mmap_result(long result)
+{
+	return result >= 4096 ? result : -12;
+}
+
 static __inline long __pachaos_prot(long prot)
 {
 	long out = 0;
@@ -310,7 +315,7 @@ static __inline long __syscall6(long n, long a1, long a2, long a3, long a4, long
 {
 	switch (n) {
 	case __NR_mmap:
-		return __pachaos_raw6(PACHAOS_SYSCALL_MMAP, a5 < 0 ? 0 : a5, a1, a2, __pachaos_prot(a3), __pachaos_mmap_flags(a4), a6);
+		return __pachaos_mmap_result(__pachaos_raw6(PACHAOS_SYSCALL_MMAP, a5 < 0 ? 0 : a5, a1, a2, __pachaos_prot(a3), __pachaos_mmap_flags(a4), a6));
 	case __NR_close:
 		return __syscall1(n, a1);
 	case __NR_munmap:

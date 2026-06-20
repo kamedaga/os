@@ -7,6 +7,7 @@ const user_vm = @import("../memory/user_vm.zig");
 const sc = @import("numbers.zig");
 
 const fd_abi = abi_root.fd_abi;
+const scheduler_abi = abi_root.scheduler_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_fd_wake_owners = kernel.fd_table_entries;
@@ -88,6 +89,19 @@ fn wakeOwners(h: anytype, owners: []const kernel.PrincipalId) void {
 
 fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64, len: u64) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
+    if (state.fdPayloadWithRightsConst(proc, fd, .{ .read = true })) |view| {
+        switch (view.payload.*) {
+            .sched_event => {
+                var event_buf: [@as(usize, @intCast(scheduler_abi.sched_event_size))]u8 = undefined;
+                const got = scheduler.readExternalSchedulerEventBytes(event_buf[0..]) orelse return sc.syscall_err_invalid;
+                if (got == 0) return sc.syscall_err_not_ready;
+                if (len < got) return sc.syscall_err_invalid;
+                if (!h.copy_bytes_to_user_va(proc, out_va, event_buf[0..got])) return sc.syscall_err_invalid;
+                return got;
+            },
+            else => {},
+        }
+    }
     var vmo_buf: [256]u8 = undefined;
     if (len > 0) {
         var total: u64 = 0;
@@ -529,9 +543,59 @@ fn writeFdStat(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
     return sc.syscall_ok;
 }
 
-fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, request: u64, arg_va: u64) u64 {
+fn writeSchedulerCaps(h: anytype, proc: kernel.PrincipalId, arg_va: u64) u64 {
+    if (arg_va == 0) return sc.syscall_err_invalid;
+    if (!writeUserU32(h, proc, arg_va + scheduler_abi.sched_caps_size_offset, @intCast(scheduler_abi.sched_caps_size))) return sc.syscall_err_invalid;
+    if (!writeUserU16(h, proc, arg_va + scheduler_abi.sched_caps_version_offset, scheduler_abi.abi_version)) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(proc, arg_va + scheduler_abi.sched_caps_event_size_offset, scheduler_abi.sched_event_size)) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(proc, arg_va + scheduler_abi.sched_caps_commit_size_offset, scheduler_abi.sched_commit_size)) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(proc, arg_va + scheduler_abi.sched_caps_weight_size_offset, scheduler_abi.sched_weight_size)) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(proc, arg_va + scheduler_abi.sched_caps_flags_offset, scheduler_abi.flag_bootstrap)) return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
+
+fn readSchedulerCommit(h: anytype, proc: kernel.PrincipalId, arg_va: u64) ?struct {
+    cpu_id: u32,
+    thread_id: u64,
+    generation: u64,
+} {
+    if (arg_va == 0) return null;
+    var bytes: [@as(usize, @intCast(scheduler_abi.sched_commit_size))]u8 = undefined;
+    if (!h.copy_user_bytes_from_va(proc, arg_va, bytes[0..])) return null;
+    const size_off: usize = @intCast(scheduler_abi.sched_commit_size_offset);
+    const version_off: usize = @intCast(scheduler_abi.sched_commit_version_offset);
+    const cpu_off: usize = @intCast(scheduler_abi.sched_commit_cpu_id_offset);
+    const thread_off: usize = @intCast(scheduler_abi.sched_commit_thread_id_offset);
+    const generation_off: usize = @intCast(scheduler_abi.sched_commit_generation_offset);
+    const size = @import("std").mem.readInt(u32, bytes[size_off..][0..4], .little);
+    const version = @import("std").mem.readInt(u16, bytes[version_off..][0..2], .little);
+    if (size < scheduler_abi.sched_commit_size or version != scheduler_abi.abi_version) return null;
+    return .{
+        .cpu_id = @import("std").mem.readInt(u32, bytes[cpu_off..][0..4], .little),
+        .thread_id = @import("std").mem.readInt(u64, bytes[thread_off..][0..8], .little),
+        .generation = @import("std").mem.readInt(u64, bytes[generation_off..][0..8], .little),
+    };
+}
+
+fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, request: u64, arg_va: u64, frame: *TrapFrame) u64 {
     const view = state.fdPayloadWithRightsConst(proc, fd, .{ .inspect = true }) orelse return sc.syscall_err_invalid;
     switch (view.payload.*) {
+        .schedctl => {
+            return switch (request) {
+                scheduler_abi.ioctl_query_caps => writeSchedulerCaps(h, proc, arg_va),
+                scheduler_abi.ioctl_commit => blk: {
+                    const commit = readSchedulerCommit(h, proc, arg_va) orelse break :blk sc.syscall_err_invalid;
+                    const caller_thread = scheduler.currentThreadIndex();
+                    if (!scheduler.commitExternalSchedule(commit.cpu_id, commit.thread_id, commit.generation, frame, sc.syscall_ok)) {
+                        break :blk sc.syscall_err_invalid;
+                    }
+                    const resumed_thread = scheduler.currentThreadIndex();
+                    break :blk if (resumed_thread != caller_thread) frame.rax else sc.syscall_ok;
+                },
+                scheduler_abi.ioctl_set_weight => sc.syscall_ok,
+                else => sc.syscall_err_invalid,
+            };
+        },
         .serial => {},
         else => return sc.syscall_err_invalid,
     }
@@ -574,7 +638,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_fd_fcntl => fdFcntl(state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10),
         sc.syscall_fd_poll => fdPoll(h, state, proc, frame.rdi, frame.rsi),
         sc.syscall_fd_wait_many => fdWaitMany(h, state, proc, frame),
-        sc.syscall_fd_ioctl => fdIoctl(h, state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx),
+        sc.syscall_fd_ioctl => fdIoctl(h, state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx, frame),
         sc.syscall_fd_stat => writeFdStat(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_eventfd_create => eventfdCreate(state, proc, frame),
         sc.syscall_timerfd_create => timerfdCreate(state, proc, frame),

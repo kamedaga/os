@@ -140,7 +140,7 @@ int main(int argc, char **argv)
     kb_shim_set_device_backend(backend);
     for (unsigned i = 0; i < 2048; i++) {
         kb_run_deferred_work();
-        (void)kb_handle_any_irq(1000000ull);
+        (void)kb_handle_any_irq(0);
         if (kb_block_subsystem_first_registered_disk() != NULL) {
             break;
         }

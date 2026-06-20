@@ -16,13 +16,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 enum {
     KOBOXD_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
     KOBOXD_BOOTSTRAP_MAX_MODULES = 8,
     KOBOXD_BOOTSTRAP_NAME_BYTES = 64,
     KOBOXD_PAGE_SIZE = 4096,
+    KOBOXD_ROOTFS_GPT_PARTITION_INDEX = 2,
 };
 
 struct koboxd_bootstrap_module {
@@ -190,13 +190,8 @@ static int validate_bootstrap_package(
             return -4;
         }
         (void)pacha_munmap((void *)image, map_size);
-        printf("[koboxd] bootstrap module=%s fd=%llu bytes=%llu\n",
-            module->name,
-            (unsigned long long)module->image_fd,
-            (unsigned long long)module->image_size);
     }
 
-    printf("[koboxd] bootstrap package OK\n");
     return 0;
 }
 
@@ -269,19 +264,16 @@ static int load_one_module(
     }
 
     int init_result = 0;
-    printf("[koboxd] %s init begin\n", name);
-    fflush(stdout);
     status = kb_module_call_init(module, &init_result);
     if (status == KB_ERR_NOT_FOUND && allow_missing_init) {
-        printf("[koboxd] %s has no init_module\n", name);
         return 0;
     }
-    printf("[koboxd] %s init returned status=%s(%d) result=%d\n",
-        name,
-        status_name(status),
-        status,
-        init_result);
     if (status != KB_OK || init_result != 0) {
+        fprintf(stderr, "[koboxd] %s init failed status=%s(%d) result=%d\n",
+            name,
+            status_name(status),
+            status,
+            init_result);
         return -4;
     }
     return 0;
@@ -291,7 +283,7 @@ static void *wait_for_first_disk(void)
 {
     for (unsigned i = 0; i < 2048; i++) {
         kb_run_deferred_work();
-        (void)kb_handle_any_irq(1000000ull);
+        (void)kb_handle_any_irq(0);
         void *disk = kb_block_subsystem_first_registered_disk();
         if (disk != NULL) {
             return disk;
@@ -464,7 +456,6 @@ static int serve_control_get_endpoint(koboxd_ipc_service_t *ipc_service, int con
             status);
         return status;
     }
-    printf("[koboxd] control exported endpoint=%s server_fd=%d\n", endpoint->name, pair.b);
     return 0;
 }
 
@@ -484,9 +475,6 @@ static int serve_block_identify(koboxd_ipc_service_t *ipc_service, const koboxd_
         return -2;
     }
     status = send_status_reply(endpoint->endpoint_fd, request.word3, block_service->logical_block_size);
-    if (status == 0) {
-        printf("[koboxd] block endpoint identify served\n");
-    }
     return status;
 }
 
@@ -639,11 +627,6 @@ static int serve_fs_backend_once(koboxd_ipc_service_t *ipc_service, koboxd_fs_ba
     }
 
     status = send_status_reply_ex(endpoint->endpoint_fd, request.word3, reply_status, result);
-    if (status == 0 && reply_status == 0) {
-        printf("[koboxd] fs-backend endpoint op=%llu result=%llu served\n",
-            (unsigned long long)request.word1,
-            (unsigned long long)result);
-    }
     return status;
 }
 
@@ -653,9 +636,7 @@ static int run_storage(koboxd_ipc_service_t *ipc_service, const struct koboxd_bo
         return -1;
     }
 
-    printf("[koboxd] NVMe start device_fd=%llu loader=%s\n",
-        (unsigned long long)bootstrap->device_fd,
-        kb_module_loader_version());
+    printf("[koboxd] nvme starting\n");
 
     kb_device_backend_t *backend = NULL;
     kb_status_t status = kb_pachaos_capsule_device_create(bootstrap->device_fd, &backend);
@@ -664,18 +645,6 @@ static int run_storage(koboxd_ipc_service_t *ipc_service, const struct koboxd_bo
             status_name(status),
             status);
         return -2;
-    }
-
-    for (unsigned bar_index = 0; bar_index < 2; bar_index++) {
-        struct pacha_capsule_bar_info bar = {0};
-        int bar_status = pacha_capsule_pci_bar_info((int)bootstrap->device_fd, bar_index, &bar);
-        printf("[koboxd] pci bar%u status=%d start=0x%llx end=0x%llx size=0x%llx flags=0x%llx\n",
-            bar_index,
-            bar_status,
-            (unsigned long long)bar.start,
-            (unsigned long long)bar.end,
-            (unsigned long long)bar.size,
-            (unsigned long long)bar.flags);
     }
 
     kb_shim_set_device_backend(backend);
@@ -691,7 +660,7 @@ static int run_storage(koboxd_ipc_service_t *ipc_service, const struct koboxd_bo
     if (load_status != 0) {
         return load_status;
     }
-    printf("[koboxd] NVMe modules loaded\n");
+    printf("[koboxd] nvme ready\n");
     kb_shim_set_device_backend(backend);
 
     void *disk = wait_for_first_disk();
@@ -725,11 +694,15 @@ static int run_storage(koboxd_ipc_service_t *ipc_service, const struct koboxd_bo
     if (load_status != 0 || ext4_module == NULL) {
         return -9;
     }
-    printf("[koboxd] ext4 modules loaded\n");
+    printf("[koboxd] ext4 ready\n");
     kb_shim_set_device_backend(backend);
 
     kb_fs_block_device_t *root_device = NULL;
-    int fs_status = kb_fs_block_device_create_from_disk("rootfs-nvme", disk, &root_device);
+    int fs_status = kb_fs_block_device_create_from_disk_gpt_partition(
+        "rootfs-nvme",
+        disk,
+        KOBOXD_ROOTFS_GPT_PARTITION_INDEX,
+        &root_device);
     if (fs_status != 0 || root_device == NULL) {
         fprintf(stderr, "[koboxd] rootfs block device create failed status=%d\n", fs_status);
         return -10;
@@ -762,36 +735,28 @@ static int run_storage(koboxd_ipc_service_t *ipc_service, const struct koboxd_bo
 
 int main(int argc, char **argv)
 {
-    printf("[koboxd] start argc=%d argv0=%s\n",
-        argc,
-        (argc > 0 && argv != NULL && argv[0] != NULL) ? argv[0] : "(null)");
-
-    struct timespec ts = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-        printf("[koboxd] monotonic=%llu.%09llu\n",
-            (unsigned long long)ts.tv_sec,
-            (unsigned long long)ts.tv_nsec);
-    } else {
-        fprintf(stderr, "[koboxd] clock_gettime failed\n");
-        return 2;
-    }
-
-    char *buf = malloc(64);
-    if (buf == NULL) {
-        fprintf(stderr, "[koboxd] malloc failed\n");
-        return 3;
-    }
-    snprintf(buf, 64, "[koboxd] malloc/stdout OK\n");
-    fputs(buf, stdout);
-    free(buf);
-
-    fprintf(stderr, "[koboxd] stderr OK\n");
+    (void)argc;
+    printf("[koboxd] start\n");
+    fflush(stdout);
     koboxd_ipc_service_t ipc_service;
     koboxd_ipc_service_init(&ipc_service);
     int bootstrap_fd = -1;
     struct koboxd_bootstrap bootstrap;
-    if (find_bootstrap(argv, &bootstrap_fd) != 0 ||
-        read_bootstrap_fd(bootstrap_fd, &bootstrap) != 0 ||
+    int status = find_bootstrap(argv, &bootstrap_fd);
+    printf("[koboxd] bootstrap fd=%d status=%d\n", bootstrap_fd, status);
+    fflush(stdout);
+    if (status != 0) {
+        return 4;
+    }
+    status = read_bootstrap_fd(bootstrap_fd, &bootstrap);
+    printf("[koboxd] bootstrap read status=%d magic=0x%llx device_fd=%llu control_fd=%llu modules=%llu\n",
+        status,
+        (unsigned long long)bootstrap.magic,
+        (unsigned long long)bootstrap.device_fd,
+        (unsigned long long)bootstrap.control_fd,
+        (unsigned long long)bootstrap.module_count);
+    fflush(stdout);
+    if (status != 0 ||
         validate_bootstrap_package(&bootstrap, sizeof(bootstrap)) != 0) {
         return 4;
     }

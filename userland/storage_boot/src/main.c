@@ -46,9 +46,11 @@ enum {
     STORAGE_BOOT_AT_BASE = 7,
     STORAGE_BOOT_AT_RANDOM = 25,
     STORAGE_BOOT_AT_EXECFN = 31,
+    STORAGE_BOOT_ROOTFS_GPT_PARTITION_INDEX = 2,
     STORAGE_BOOT_FD_RIGHT_INSPECT = 1ull << 0,
     STORAGE_BOOT_FD_RIGHT_TRANSFER = 1ull << 2,
     STORAGE_BOOT_FD_RIGHT_WAIT = 1ull << 3,
+    STORAGE_BOOT_FD_RIGHT_SET_FLAGS = 1ull << 5,
     STORAGE_BOOT_FD_RIGHT_CLOSE = 1ull << 6,
     STORAGE_BOOT_FD_RIGHT_MAP_READ = 1ull << 13,
     STORAGE_BOOT_FD_RIGHT_MAP_WRITE = 1ull << 14,
@@ -222,6 +224,7 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
     const uint64_t rights =
         STORAGE_BOOT_FD_RIGHT_INSPECT |
         STORAGE_BOOT_FD_RIGHT_TRANSFER |
+        STORAGE_BOOT_FD_RIGHT_SET_FLAGS |
         STORAGE_BOOT_FD_RIGHT_CLOSE |
         STORAGE_BOOT_FD_RIGHT_READ |
         STORAGE_BOOT_FD_RIGHT_MAP_READ |
@@ -425,13 +428,6 @@ static int probe_ext4_operation_tables(
     out_ops->dir_operations_has_readdir =
         table_contains_pointer(out_ops->dir_operations, 256u, out_ops->readdir);
 
-    printf("[storage_boot] ext4 ops readdir=%d read_iter=%d write_iter=%d fsync=%d lookup=%d\n",
-        out_ops->dir_operations_has_readdir,
-        out_ops->file_operations_has_read_iter,
-        out_ops->file_operations_has_write_iter,
-        out_ops->file_operations_has_fsync,
-        out_ops->dir_inode_operations_has_lookup);
-
     return out_ops->file_operations_has_read_iter &&
         out_ops->file_operations_has_write_iter &&
         out_ops->file_operations_has_fsync &&
@@ -484,12 +480,6 @@ static int ext4_lookup_name_at(
     }
 
     void *inode = read_pointer_field(dentry, STORAGE_BOOT_DENTRY_INODE_OFFSET);
-    printf("[storage_boot] ext4 lookup name=%s result=%p dentry=%p inode=%p\n",
-        name,
-        result,
-        dentry,
-        inode);
-
     int ok = result == dentry && inode != NULL;
     if (ok) {
         *out_inode = inode;
@@ -643,13 +633,6 @@ static int ext4_file_read_iter(
         kb_shim_leave_kernel_gs(old_gs);
     }
 
-    printf("[storage_boot] ext4 read_iter label=%s offset=%llu result=%ld sample=%.*s\n",
-        label,
-        (unsigned long long)offset,
-        result,
-        result > 0 ? (int)(result < 64 ? result : 64) : 0,
-        read_buffer);
-
     int ok = result == (long)expected_size &&
         memcmp(read_buffer, expected, expected_size) == 0;
 
@@ -684,7 +667,8 @@ static int ext4_file_read_alloc(
     void *kiocb = calloc(1, STORAGE_BOOT_FAKE_KIOCB_BYTES);
     void *iter = calloc(1, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
     void *mapping = calloc(1, STORAGE_BOOT_FAKE_MAPPING_BYTES);
-    unsigned char *read_buffer = calloc(1, max_size);
+    size_t capacity = max_size < STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES ? max_size : STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES;
+    unsigned char *read_buffer = malloc(capacity);
     if (file == NULL || kiocb == NULL || iter == NULL || mapping == NULL || read_buffer == NULL) {
         free(read_buffer);
         free(mapping);
@@ -699,9 +683,24 @@ static int ext4_file_read_alloc(
 
     uint64_t total = 0;
     for (unsigned chunk_index = 0; chunk_index < 1024 && total < max_size; chunk_index++) {
+        if (total == capacity) {
+            size_t next_capacity = capacity + STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES;
+            if (next_capacity > max_size) {
+                next_capacity = max_size;
+            }
+            unsigned char *next_buffer = realloc(read_buffer, next_capacity);
+            if (next_buffer == NULL) {
+                total = 0;
+                break;
+            }
+            read_buffer = next_buffer;
+            capacity = next_capacity;
+        }
+
         const uint64_t remaining = max_size - total;
+        const uint64_t available = (uint64_t)capacity - total;
         const uint64_t request_size =
-            remaining < STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES ? remaining : STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES;
+            remaining < available ? remaining : available;
         memset(file, 0, STORAGE_BOOT_FAKE_FILE_BYTES);
         memset(kiocb, 0, STORAGE_BOOT_FAKE_KIOCB_BYTES);
         memset(iter, 0, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
@@ -723,18 +722,19 @@ static int ext4_file_read_alloc(
             kb_shim_leave_kernel_gs(old_gs);
         }
 
-        printf("[storage_boot] ext4 read_iter label=%s chunk=%u offset=%llu result=%ld sample=%.*s\n",
-            label,
-            chunk_index,
-            (unsigned long long)(offset + total),
-            result,
-            result > 0 ? (int)(result < 64 ? result : 64) : 0,
-            result > 0 ? (const char *)(read_buffer + total) : "");
-
         if (result < 0 && total > 0) {
             break;
         }
         if (result < 0 || (uint64_t)result > request_size) {
+            fprintf(stderr,
+                "[storage_boot] read failed label=%s chunk=%u offset=%llu request=%llu result=%ld total=%llu capacity=%zu\n",
+                label,
+                chunk_index,
+                (unsigned long long)(offset + total),
+                (unsigned long long)request_size,
+                result,
+                (unsigned long long)total,
+                capacity);
             total = 0;
             break;
         }
@@ -994,14 +994,6 @@ static int map_elf_segment(
     }
     if (out_mapped_va != NULL) *out_mapped_va = (uint64_t)map_result;
 
-    printf("[storage_boot] exec: mapped PT_LOAD[%u] process_fd=%d target=0x%llx size=%llu prot=0x%llx file=%llu mem=%llu\n",
-        index,
-        process_fd,
-        (unsigned long long)(uint64_t)map_result,
-        (unsigned long long)map_size,
-        (unsigned long long)prot,
-        (unsigned long long)p_filesz,
-        (unsigned long long)p_memsz);
     return 0;
 }
 
@@ -1073,13 +1065,6 @@ static int load_elf_process(
     out->phent = e_phentsize;
     out->phnum = e_phnum;
     out->load_segments = load_count;
-    printf("[storage_boot] exec: staged %s process_fd=%d entry=0x%llx runtime_entry=0x%llx load_bias=0x%llx load_segments=%u\n",
-        path,
-        process_fd,
-        (unsigned long long)e_entry,
-        (unsigned long long)(e_entry + load_bias),
-        (unsigned long long)load_bias,
-        load_count);
     return 0;
 }
 
@@ -1198,11 +1183,6 @@ static int start_loaded_process(
         (void)pacha_fd_close(thread_fd);
         return -8;
     }
-    printf("[storage_boot] exec: started process_fd=%d thread_fd=%d entry=0x%llx stack=0x%llx\n",
-        process_fd,
-        thread_fd,
-        (unsigned long long)loaded->runtime_entry,
-        (unsigned long long)(stack_base + sp));
     return 0;
 }
 
@@ -1341,15 +1321,10 @@ static int read_bootstrap_module_images(
                 status);
             return status;
         }
-
         images[i].image_fd = create_inherited_vmo_from_bytes(images[i].data, images[i].size, images[i].name);
         if (images[i].image_fd < 16) {
             return -12;
         }
-        printf("[storage_boot] seed0root: read %s bytes=%llu fd=%d\n",
-            images[i].path,
-            (unsigned long long)images[i].size,
-            images[i].image_fd);
     }
 
     return 0;
@@ -1436,10 +1411,6 @@ static int launch_seed0root_from_ext4(
             status);
         return 24;
     }
-    printf("[storage_boot] seed0root: read %s bytes=%llu\n",
-        storage_boot_seed0root_file,
-        (unsigned long long)image_size);
-
     unsigned char *koboxd_image = NULL;
     uint64_t koboxd_image_size = 0;
     status = ext4_file_read_alloc(
@@ -1458,10 +1429,6 @@ static int launch_seed0root_from_ext4(
             status);
         return 28;
     }
-    printf("[storage_boot] seed0root: read %s bytes=%llu\n",
-        storage_boot_koboxd_file,
-        (unsigned long long)koboxd_image_size);
-
     const int koboxd_image_fd = create_inherited_vmo_from_bytes(koboxd_image, koboxd_image_size, "koboxd.elf");
     if (koboxd_image_fd < 16) {
         free(image);
@@ -1487,7 +1454,6 @@ static int launch_seed0root_from_ext4(
         free_bootstrap_module_images(module_images, module_count);
         return 30;
     }
-
     struct storage_boot_bootstrap_module module_table[module_count];
     memset(module_table, 0, sizeof(module_table));
     for (size_t i = 0; i < module_count; i++) {
@@ -1506,11 +1472,6 @@ static int launch_seed0root_from_ext4(
     struct storage_boot_seed0root_bootstrap bootstrap_package = bootstrap;
     memcpy(bootstrap_package.modules, module_table, sizeof(module_table));
     free(koboxd_image);
-    printf("[storage_boot] seed0root: bootstrap prepared koboxd_fd=%d bytes=%llu modules=%llu\n",
-        koboxd_image_fd,
-        (unsigned long long)koboxd_image_size,
-        (unsigned long long)module_count);
-
     status = mark_fd_inherit((int)device_fd, "seed0root device fd");
     if (status != 0) {
         free(image);
@@ -1537,7 +1498,6 @@ static int launch_seed0root_from_ext4(
         fprintf(stderr, "[storage_boot] seed0root: ELF load failed status=%d\n", status);
         return 25;
     }
-
     status = start_loaded_process(&loaded, storage_boot_seed0root_argv0, bootstrap_fd);
     free_bootstrap_module_images(module_images, module_count);
     (void)pacha_fd_close(bootstrap_fd);
@@ -1546,7 +1506,7 @@ static int launch_seed0root_from_ext4(
         fprintf(stderr, "[storage_boot] seed0root: start failed status=%d\n", status);
         return 26;
     }
-    printf("[storage_boot] seed0root: started\n");
+    printf("[storage_boot] seed0root started\n");
     return 0;
 }
 
@@ -1594,19 +1554,12 @@ static int load_modules(
         }
 
         int init_result = 0;
-        printf("[storage_boot] %s init begin\n", module_cfg->name);
-        fflush(stdout);
+        printf("[storage_boot] module starting name=%s\n", module_cfg->name);
         status = kb_module_call_init(modules[i], &init_result);
         if (status == KB_ERR_NOT_FOUND && i + 1u < cfg->module_count) {
-            printf("[storage_boot] %s has no init_module\n", module_cfg->name);
+            printf("[storage_boot] module ready name=%s init=missing\n", module_cfg->name);
             continue;
         }
-        printf("[storage_boot] %s init returned status=%s(%d) result=%d\n",
-            module_cfg->name,
-            status_name(status),
-            status,
-            init_result);
-        fflush(stdout);
         if (status != KB_OK || init_result != 0) {
             fprintf(stderr,
                 "[storage_boot] %s init failed status=%s(%d) result=%d\n",
@@ -1616,6 +1569,7 @@ static int load_modules(
                 init_result);
             return 5;
         }
+        printf("[storage_boot] module ready name=%s\n", module_cfg->name);
     }
     return 0;
 }
@@ -1657,10 +1611,8 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    printf("[storage_boot] start device_fd=%llu modules=%llu loader=%s\n",
-        (unsigned long long)cfg.device_fd,
-        (unsigned long long)cfg.module_count,
-        kb_module_loader_version());
+    printf("[storage_boot] start modules=%llu\n",
+        (unsigned long long)cfg.module_count);
 
     kb_device_backend_t *backend = NULL;
     kb_status_t status = kb_pachaos_capsule_device_create(cfg.device_fd, &backend);
@@ -1669,18 +1621,6 @@ int main(int argc, char **argv)
             status_name(status),
             status);
         return 3;
-    }
-
-    for (unsigned bar_index = 0; bar_index < 2; bar_index++) {
-        struct pacha_capsule_bar_info bar = {0};
-        int bar_status = pacha_capsule_pci_bar_info((int)cfg.device_fd, bar_index, &bar);
-        printf("[storage_boot] pci bar%u status=%d start=0x%llx end=0x%llx size=0x%llx flags=0x%llx\n",
-            bar_index,
-            bar_status,
-            (unsigned long long)bar.start,
-            (unsigned long long)bar.end,
-            (unsigned long long)bar.size,
-            (unsigned long long)bar.flags);
     }
 
     kb_module_t *ext4_module = NULL;
@@ -1693,7 +1633,7 @@ int main(int argc, char **argv)
         return 5;
     }
 
-    printf("[storage_boot] module stack loaded\n");
+    printf("[storage_boot] modules ready\n");
     kb_shim_set_device_backend(backend);
     void *disk = wait_for_first_disk();
     if (disk == NULL) {
@@ -1708,14 +1648,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "[storage_boot] NVMe disk read sector0 failed status=%d\n", read_status);
         return 7;
     }
-    printf("[storage_boot] NVMe disk read sector0=%02x %02x %02x %02x OK\n",
-        sector[0],
-        sector[1],
-        sector[2],
-        sector[3]);
+    printf("[storage_boot] disk ready\n");
 
     kb_fs_block_device_t *root_device = NULL;
-    int fs_status = kb_fs_block_device_create_from_disk("rootfs-nvme", disk, &root_device);
+    int fs_status = kb_fs_block_device_create_from_disk_gpt_partition(
+        "rootfs-nvme",
+        disk,
+        STORAGE_BOOT_ROOTFS_GPT_PARTITION_INDEX,
+        &root_device);
     if (fs_status != 0 || root_device == NULL) {
         fprintf(stderr, "[storage_boot] rootfs block device create failed status=%d\n", fs_status);
         return 8;
@@ -1729,27 +1669,20 @@ int main(int argc, char **argv)
     kb_fs_mount_path_probe_t probe;
     memset(&probe, 0, sizeof(probe));
     fs_status = kb_fs_subsystem_probe_registered_mount_path("ext4", &probe);
-    printf("[storage_boot] ext4 probe status=%d init=%d get_tree=%d fill_super=%d magic=0x%04x reads=%u get_tree_bdev=%llu\n",
-        fs_status,
-        probe.init_result,
-        probe.get_tree_result,
-        probe.fill_super_result,
-        probe.observed_ext4_magic,
-        probe.block_read_count,
-        (unsigned long long)probe.get_tree_bdev_calls);
+    (void)fs_status;
     if (probe.fill_super_result != 0 || probe.observed_ext4_magic != 0xef53u) {
         fprintf(stderr, "[storage_boot] ext4 rootfs probe failed\n");
         return 10;
     }
 
-    printf("[storage_boot] ext4 rootfs probe OK\n");
+    printf("[storage_boot] rootfs ready fs=ext4 reads=%u\n", probe.block_read_count);
 
     int seed0root_status = launch_seed0root_from_ext4(ext4_module, &probe, cfg.device_fd);
     if (seed0root_status != 0) {
         return seed0root_status;
     }
 
-    printf("[storage_boot] bootstrap complete; exiting\n");
+    printf("[storage_boot] done\n");
     fflush(stdout);
     fflush(stderr);
     return 0;

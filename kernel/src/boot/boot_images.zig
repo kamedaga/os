@@ -10,6 +10,13 @@ pub const init_app = DiskFile{
     .log_path = "\\EFI\\BOOT\\INITAPP.ELF",
 };
 
+pub const scheduler_policy = DiskFile{
+    .uefi_path = &[_:0]u16{
+        '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'S', 'C', 'H', 'E', 'D', 'D', '.', 'E', 'L', 'F',
+    },
+    .log_path = "\\EFI\\BOOT\\SCHEDD.ELF",
+};
+
 pub const bootfs_image = DiskFile{
     .uefi_path = &[_:0]u16{
         '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\', 'B', 'O', 'O', 'T', 'F', 'S', '.', 'I', 'M', 'G',

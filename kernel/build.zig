@@ -41,14 +41,6 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const ap_user_timer_preemption = b.option(
-        bool,
-        "ap-user-timer-preemption",
-        "Allow AP user threads to be preempted by the AP timer",
-    ) orelse true;
-    const build_workarounds = b.addOptions();
-    build_workarounds.addOption(bool, "ap_user_timer_preemption", ap_user_timer_preemption);
-
     const efi_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .uefi,
@@ -69,7 +61,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addOptions("build_workarounds", build_workarounds);
     test_mod.addImport("kernel", kernel_mod);
     test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     const unit_tests = b.addTest(.{
@@ -86,7 +77,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    fd_ipc_minimal_mod.addOptions("build_workarounds", build_workarounds);
     fd_ipc_minimal_mod.addImport("kernel", kernel_mod);
     fd_ipc_minimal_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     const fd_ipc_minimal_tests = b.addTest(.{
@@ -104,7 +94,6 @@ pub fn build(b: *std.Build) void {
         .code_model = .small,
         .strip = true,
     });
-    efi_mod.addOptions("build_workarounds", build_workarounds);
     efi_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     const efi_app = b.addExecutable(.{
         .name = "BOOTX64",

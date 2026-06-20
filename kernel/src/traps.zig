@@ -200,6 +200,32 @@ fn asmCopyStackFrameToWorkFramePointer(comptime qword_count: usize) []const u8 {
     , .{qword_count});
 }
 
+fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\
+        \\rdtscp
+        \\cmp ${d}, %ecx
+        \\jb 2f
+        \\xor %ecx, %ecx
+        \\2:
+        \\mov %ecx, %r14d
+        \\mov %r14, %r13
+        \\shl $3, %r13
+        \\imul ${d}, %r14, %r14
+        \\lea {s}(%rip), %r12
+        \\add %r14, %r12
+        \\mov %r12, %rdi
+        \\mov %rsp, %rsi
+        \\mov ${d}, %ecx
+        \\cld
+        \\rep movsq
+        \\lea kernel_syscall_stack_tops(%rip), %r14
+        \\mov (%r14,%r13,1), %rsp
+        \\push %r12
+        \\
+    , .{ smp.max_cpus, @sizeOf(TrapFrame), work_frame_symbol, trap_frame_qword_count });
+}
+
 fn asmCopyFramePointerToWorkFrameOnKernelStack(
     comptime frame_reg: []const u8,
     comptime work_frame_symbol: []const u8,
@@ -609,24 +635,27 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
     if (!scheduler.schedulerRunsOnCurrentCpu()) {
-        if (user_mode and !scheduler.currentApUserThreadCanContinue()) {
-            smp.returnCurrentApToIdleFromInterrupt();
-        }
-        if (user_mode and scheduler.apUserTimerPreemptionEnabled() and scheduler.shouldPreemptCurrentApUserThread() and scheduler.saveApUserTimerFrame(frame)) {
-            smp.returnCurrentApToIdleFromInterrupt();
+        if (user_mode) {
+            if (!scheduler.currentApUserThreadCanContinue()) {
+                smp.returnCurrentApToIdleFromInterrupt();
+            }
+            if (scheduler.preemptCurrentApThreadForExternalScheduler(h.scheduler_quantum_ticks, frame)) {
+                smp.returnCurrentApToIdleFromInterrupt();
+            }
+            return;
         }
         scheduler.noteCurrentCpuIdleTick();
         return;
     }
     scheduler.lapic_tick_count +%= 1;
+    if (@cmpxchgStrong(u8, &scheduler.scheduler_timer_log_once, 0, 1, .acq_rel, .monotonic) == null) {
+        h.write("[sched] timer tick\n");
+    }
     if (!h.kernel_state_ready.*) return;
     scheduler.wakeThreadsForTimer(scheduler.lapic_tick_count);
     if (!user_mode) return;
     if (h.scheduler_quantum_ticks == 0) return;
-
-    const next_thread = scheduler.chooseNextThreadForTimerPreempt(h.scheduler_quantum_ticks) orelse return;
-    if (!h.switch_to_thread(next_thread, frame, null)) return;
-    scheduler.scheduler_switch_count +%= 1;
+    _ = scheduler.preemptCurrentThreadForExternalScheduler(h.scheduler_quantum_ticks, frame);
 }
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
@@ -637,7 +666,6 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     ) orelse generic_device_interrupt_vector;
     lapic.eoi();
     _ = frame;
-    if (!scheduler.schedulerRunsOnCurrentCpu()) return;
     if (!h.kernel_state_ready.*) return;
     var wake_owners: [16]kernel.PrincipalId = undefined;
     const wake_count = h.state.recordDeviceInterruptEvent(active_vector, wake_owners[0..]);
@@ -774,11 +802,12 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCallAligned("timerInterruptWorkFrameForCurrentCpuFromAsm") ++
-            \\mov %rax, %r12
-        ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+            \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("timerInterruptDispatch") ++
+            \\mov (%rsp), %r12
+            \\add $8, %rsp
             \\mov %r12, %rax
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
@@ -834,11 +863,13 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCallAligned("saveCurrentThreadFxState") ++ asmCallAligned("timerInterruptWorkFrameForCurrentCpuFromAsm") ++
-            \\mov %rax, %r12
-        ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        asmCallAligned("saveCurrentThreadFxState") ++
+            \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("timerInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
+            \\mov (%rsp), %r12
+            \\add $8, %rsp
             \\mov %r12, %rax
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
@@ -898,11 +929,12 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCallAligned("timerInterruptWorkFrameForCurrentCpuFromAsm") ++
-            \\mov %rax, %r12
-        ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+            \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("deviceInterruptDispatch") ++
+            \\mov (%rsp), %r12
+            \\add $8, %rsp
             \\mov %r12, %rax
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
@@ -958,11 +990,13 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 9f
-        ++ asmCallAligned("saveCurrentThreadFxState") ++ asmCallAligned("timerInterruptWorkFrameForCurrentCpuFromAsm") ++
-            \\mov %rax, %r12
-        ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+        ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        asmCallAligned("saveCurrentThreadFxState") ++
+            \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("deviceInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
+            \\mov (%rsp), %r12
+            \\add $8, %rsp
             \\mov %r12, %rax
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame

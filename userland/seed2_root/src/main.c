@@ -1936,8 +1936,6 @@ static int launch_linux_exec_node(struct startup_node *node, const struct loaded
 static void run_startup_scheduler(void) {
     seed_existing_services();
     parse_startup_manifest();
-    user_log("[seed2_root] manifest scheduler begin\n");
-
     for (;;) {
         int progressed = 0;
         for (u32 i = 0; i < g_startup_node_count; i++) {
@@ -1946,7 +1944,6 @@ static void run_startup_scheduler(void) {
             if (node->spawned) {
                 if (startup_node_ready_after_spawn(node)) {
                     mark_node_completed(node);
-                    log_startup_node("[seed2_root] manifest ready ", node);
                     progressed = 1;
                 }
                 continue;
@@ -1958,14 +1955,10 @@ static void run_startup_scheduler(void) {
                 continue;
             }
             if (spawn_manifest_node(node)) {
-                log_startup_node("[seed2_root] manifest spawned ", node);
                 if (startup_node_ready_after_spawn(node)) {
                     mark_node_completed(node);
-                    log_startup_node("[seed2_root] manifest ready ", node);
                 }
                 progressed = 1;
-            } else {
-                log_startup_node("[seed2_root] manifest node deferred ", node);
             }
         }
         if (!startup_has_pending_nodes()) break;
@@ -1981,7 +1974,7 @@ static void run_startup_scheduler(void) {
 }
 
 void seed2_root_main(void) {
-    user_log("[seed2_root] started\n");
+    user_log("[seed2_root] start\n");
     service_registry_init();
     volatile u64 *config = (volatile u64 *)ROOT_CONFIG_VA;
     const u64 fat_endpoint_id = config[3];
@@ -1996,7 +1989,6 @@ void seed2_root_main(void) {
     g_net_endpoint_id = net_endpoint_id;
     g_net_process_slot = net_process_slot;
     if (connect_fat(fat_endpoint_id, fat_process_slot)) {
-        user_log("[seed2_root] fat connect ok\n");
         service_registry_set(SERVICE_KIND_FAT_FS, fat_process_slot, fat_endpoint_id);
         if (g_console_endpoint_id != 0 && g_console_process_slot != 0) service_registry_set(SERVICE_KIND_CONSOLE, g_console_process_slot, g_console_endpoint_id);
         if (g_net_endpoint_id != 0 && g_net_process_slot != 0) service_registry_set(SERVICE_KIND_NET, g_net_process_slot, g_net_endpoint_id);

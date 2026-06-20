@@ -246,6 +246,8 @@ pub const KernelObjectKind = enum(u16) {
     irq = 12,
     timer = 13,
     serial = 14,
+    schedctl = 15,
+    sched_event = 16,
 };
 
 pub const TaskObjectState = enum(u8) {
@@ -327,6 +329,14 @@ pub const SerialObject = struct {
     stream: u8 = 0,
 };
 
+pub const SchedulerControlObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+};
+
+pub const SchedulerEventObject = struct {
+    owner_principal_raw: PrincipalRaw = 0,
+};
+
 pub const KernelObjectRef = struct {
     kind: KernelObjectKind = .none,
     index: u32 = 0,
@@ -353,6 +363,8 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     irq: IrqObject,
     timer: TimerObject,
     serial: SerialObject,
+    schedctl: SchedulerControlObject,
+    sched_event: SchedulerEventObject,
 };
 
 pub const KernelObjectSlot = struct {
@@ -2922,6 +2934,9 @@ pub const KernelState = struct {
             .serial => |serial| {
                 info.extra = serial.stream;
             },
+            .sched_event => {
+                info.size_bytes = @import("scheduler.zig").externalSchedulerPendingEventCount();
+            },
             else => {},
         }
         return info;
@@ -3093,6 +3108,7 @@ pub const KernelState = struct {
                 .irq => |irq| irq.event_count != 0,
                 .timer => |timer| timerDueCount(timer, now_tick) != 0,
                 .serial => false,
+                .sched_event => entry.rights.read and @import("scheduler.zig").externalSchedulerEventReadable(),
                 else => false,
             };
             if (readable) ready |= @import("kernel_abi_root").fd_abi.event_readable;
@@ -3102,6 +3118,7 @@ pub const KernelState = struct {
                 .endpoint, .channel, .reply => self.fdIpcWritable(&slot.payload),
                 .event => entry.rights.write,
                 .serial => entry.rights.write,
+                .schedctl => entry.rights.write,
                 else => false,
             };
             if (writable) ready |= @import("kernel_abi_root").fd_abi.event_writable;
@@ -3492,6 +3509,58 @@ pub const KernelState = struct {
                 .write = true,
             },
             .flags = .{ .inherit = true },
+        };
+    }
+
+    pub fn createSchedulerControlFdAt(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const table = try self.fdTableForActiveProcess(owner);
+        if (!table.entries[index].isEmpty()) return KernelError.InvalidState;
+        const object_ref = try self.createKernelObject(.schedctl, .{ .schedctl = .{
+            .owner_principal_raw = @intFromEnum(owner),
+        } });
+        errdefer if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+        try self.retainKernelObject(object_ref);
+        table.entries[index] = .{
+            .object = object_ref,
+            .rights = .{
+                .inspect = true,
+                .close = true,
+                .read = true,
+                .write = true,
+                .poll = true,
+            },
+        };
+    }
+
+    pub fn createSchedulerEventFdAt(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        const index = fdIndex(fd) orelse return KernelError.InvalidState;
+        const table = try self.fdTableForActiveProcess(owner);
+        if (!table.entries[index].isEmpty()) return KernelError.InvalidState;
+        const object_ref = try self.createKernelObject(.sched_event, .{ .sched_event = .{
+            .owner_principal_raw = @intFromEnum(owner),
+        } });
+        errdefer if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+        try self.retainKernelObject(object_ref);
+        table.entries[index] = .{
+            .object = object_ref,
+            .rights = .{
+                .inspect = true,
+                .close = true,
+                .read = true,
+                .wait = true,
+                .poll = true,
+            },
         };
     }
 

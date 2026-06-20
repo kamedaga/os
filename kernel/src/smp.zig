@@ -3,7 +3,6 @@ const uefi = std.os.uefi;
 const x86_platform = @import("arch/x86_64/platform.zig");
 const lapic = @import("lapic.zig");
 const interrupts = @import("interrupts.zig");
-const build_workarounds = @import("build_workarounds");
 const scheduler_observer = @import("scheduler_observer.zig");
 
 pub const max_cpus: usize = x86_platform.max_cpus;
@@ -40,6 +39,9 @@ var cpu_states: [max_cpus]u32 = [_]u32{cpu_state_absent} ** max_cpus;
 var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
 var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
+var ap_syscall_entry: usize = 0;
+
+extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.c) void;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -63,6 +65,10 @@ pub fn kernelStaticStorageEndAddr() usize {
 pub fn configureApUserTimer(timer_vector: u8, initial_count: u32) void {
     ap_user_timer_vector = timer_vector;
     ap_user_timer_initial_count = initial_count;
+}
+
+pub fn configureApSyscallEntry(entry: usize) void {
+    ap_syscall_entry = entry;
 }
 
 fn stateFromRaw(raw: u32) CpuState {
@@ -515,6 +521,9 @@ fn apIdleEntry(cpu_slot: usize) callconv(.c) noreturn {
         while (true) asm volatile ("hlt");
     }
     x86_platform.loadInterruptTableForCurrentCpu();
+    if (ap_syscall_entry != 0) {
+        x86_platform.enableSyscallEntry(ap_syscall_entry);
+    }
     _ = x86_platform.enablePcidIfSupported();
     _ = x86_platform.enablePkuIfSupported();
     _ = lapic.enableLocalApic();
@@ -533,9 +542,8 @@ pub fn returnCurrentApToIdleFromInterrupt() noreturn {
 
 pub fn wakeCpu(cpu_slot: usize) bool {
     if (cpu_slot == 0 or cpu_slot >= runtime_lapic_ids.len) return false;
-    const apic_id = runtime_lapic_ids[cpu_slot];
-    if (apic_id == 0xFF or ap_user_timer_vector == 0) return false;
-    return lapic.sendFixedIpi(apic_id, ap_user_timer_vector);
+    if (runtime_lapic_ids[cpu_slot] == 0xFF) return false;
+    return cpuState(cpu_slot) != .absent;
 }
 
 fn apIdleLoop(cpu_slot: usize) noreturn {
@@ -551,19 +559,7 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
     }
 }
 
-fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
-    asm volatile ("cli");
-    if (build_workarounds.ap_user_timer_preemption and ap_user_timer_vector != 0) {
-        _ = lapic.initTimer(ap_user_timer_vector, ap_user_timer_initial_count);
-    }
-    const fx_state: *const [512]u8 align(16) = @ptrFromInt(entry.fx_state_addr);
-    asm volatile ("fxrstor64 (%[ptr])"
-        :
-        : [ptr] "r" (fx_state),
-        : .{ .memory = true });
-    x86_platform.writeFsBase(entry.fs_base);
-    x86_platform.writeGsBase(entry.gs_base);
-    x86_platform.writePkru(entry.pkru);
+fn apIretToUser(entry: *const scheduler_observer.UserEntry) callconv(.c) void {
     asm volatile (std.fmt.comptimePrint(
             \\mov %[entry], %%rbx
             \\mov {d}(%%rbx), %%r11
@@ -632,5 +628,29 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
         :
         : [entry] "r" (entry),
         : .{ .memory = true });
-    unreachable;
+}
+
+fn jumpToUserReturn() callconv(.c) void {
+    asm volatile ("jmp userReturnToSavedFrame" ::: .{ .memory = true });
+}
+
+fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
+    asm volatile ("cli");
+    if (ap_user_timer_vector != 0) {
+        _ = lapic.initTimer(ap_user_timer_vector, ap_user_timer_initial_count);
+    }
+    const fx_state: *const [512]u8 align(16) = @ptrFromInt(entry.fx_state_addr);
+    asm volatile ("fxrstor64 (%[ptr])"
+        :
+        : [ptr] "r" (fx_state),
+        : .{ .memory = true });
+    x86_platform.writeFsBase(entry.fs_base);
+    x86_platform.writeGsBase(entry.gs_base);
+    x86_platform.writePkru(entry.pkru);
+    stageUserReturnFromFramePointerForCurrentCpu(
+        @intFromPtr(&entry.frame),
+        @offsetOf(interrupts.TrapFrame, "rip"),
+    );
+    jumpToUserReturn();
+    while (true) asm volatile ("hlt");
 }

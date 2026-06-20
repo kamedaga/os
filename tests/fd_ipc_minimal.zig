@@ -4,6 +4,7 @@ const kernel = @import("kernel");
 const KernelError = kernel.KernelError;
 const KernelState = kernel.KernelState;
 const PrincipalId = kernel.PrincipalId;
+const FreePageList = kernel.FreePageList;
 
 const p0: PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
 const p1: PrincipalId = kernel.processPrincipalFromIndex(1) orelse unreachable;
@@ -25,6 +26,7 @@ fn rights(comptime fields: anytype) kernel.FdRights {
 
 test "minimal fd ipc call moves vmo fd and receives reply" {
     var s = try initState();
+    var free_list = FreePageList{};
 
     const server_endpoint = try s.createIpcEndpointFd(
         p0,
@@ -62,10 +64,11 @@ test "minimal fd ipc call moves vmo fd and receives reply" {
         client_endpoint,
         .{ .words = .{ 42, 7, 0, 0 }, .fds = request_fds[0..] },
         16,
+        &free_list,
     );
     try std.testing.expect(s.fdEntryConst(p1, client_vmo) == null);
 
-    const request = try s.ipcRecv(p0, server_endpoint, 2, 16);
+    const request = try s.ipcRecv(p0, server_endpoint, 2, 16, &free_list);
     try std.testing.expectEqual(@as(u64, 42), request.words[0]);
     try std.testing.expectEqual(@as(u64, 7), request.words[1]);
     try std.testing.expectEqual(@as(usize, 2), request.fd_count);
@@ -82,10 +85,10 @@ test "minimal fd ipc call moves vmo fd and receives reply" {
     try std.testing.expect(reply_entry.rights.send);
     try std.testing.expect(!reply_entry.rights.recv);
 
-    try s.ipcReply(p0, server_reply, .{ .words = .{ 99, 0, 0, 0 } });
-    try std.testing.expectError(KernelError.InvalidState, s.ipcReply(p0, server_reply, .{}));
+    try s.ipcReply(p0, server_reply, .{ .words = .{ 99, 0, 0, 0 } }, &free_list);
+    try std.testing.expectError(KernelError.InvalidState, s.ipcReply(p0, server_reply, .{}, &free_list));
 
-    const reply = try s.ipcRecv(p1, client_reply, 0, 16);
+    const reply = try s.ipcRecv(p1, client_reply, 0, 16, &free_list);
     try std.testing.expectEqual(@as(u64, 99), reply.words[0]);
-    try std.testing.expectError(KernelError.MailboxEmpty, s.ipcRecv(p1, client_reply, 0, 16));
+    try std.testing.expectError(KernelError.MailboxEmpty, s.ipcRecv(p1, client_reply, 0, 16, &free_list));
 }

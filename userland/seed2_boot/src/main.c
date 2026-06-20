@@ -1769,15 +1769,11 @@ static void spawn_root_seed2_direct(void) {
         user_log("[seed2_boot] fat connect failed\n");
         return;
     }
-    user_log("[seed2_boot] fat connect ok\n");
-
     struct loaded_file image;
     if (!load_root_seed2_from_fat(&image)) {
         user_log("[seed2_boot] root seed2 load failed\n");
         return;
     }
-    user_log("[seed2_boot] root seed2 exec ready\n");
-
     u64 config_paddr = 0;
     if (syscall4(SYSCALL_ALLOC_MAP_PAGES, ROOT_SEED2_CONFIG_VA, 1, 1, (u64)&config_paddr) != SYSCALL_OK || config_paddr < 0x1000) {
         user_log("[seed2_boot] root seed2 config alloc failed\n");
@@ -1957,7 +1953,7 @@ static void launch_fat_server(void) {
 }
 
 void seed2_boot_main(void) {
-    user_log("[seed2_boot] started\n");
+    user_log("[seed2_boot] start\n");
     boot_screen_init();
     init_handoff_from_descriptor_page();
     if (!map_bootfs_archive()) {
@@ -1965,7 +1961,6 @@ void seed2_boot_main(void) {
         boot_screen_line("BOOTFS FAILED");
         for (;;) wait_event_poll();
     }
-    user_log("[seed2_boot] bootfs ready\n");
     boot_screen_line("BOOTFS READY");
     launch_block_server();
     boot_screen_line("BLOCK READY");

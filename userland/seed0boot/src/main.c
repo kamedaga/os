@@ -42,7 +42,6 @@ int main(int argc, char **argv)
     (void)argv;
 
     printf("[seed0boot] start\n");
-    fprintf(stderr, "[seed0boot] stderr online\n");
 
     enum { seed0_service_count = 1 };
     struct seed0_service *services = calloc(seed0_service_count, sizeof(*services));
@@ -104,19 +103,14 @@ int main(int argc, char **argv)
         return 14;
     }
 
+    printf("[seed0boot] storage_boot starting\n");
     int capsule_status = seed0_launch_storage_boot_nvme();
     if (capsule_status != 0) {
         fprintf(stderr, "[seed0boot] storage_boot launch failed status=%d\n", capsule_status);
         return 17;
     }
 
-    for (int i = 0; i < seed0_service_count; i++) {
-        printf("[seed0boot] service table: %s endpoint_fd=%d control_fd=%d peer_fd=%d\n",
-            services[i].name,
-            services[i].endpoint_fd,
-            services[i].control_fd,
-            services[i].peer_control_fd);
-    }
+    printf("[seed0boot] storage_boot started\n");
     printf("[seed0boot] ready\n");
     fflush(stdout);
     fflush(stderr);

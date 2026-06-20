@@ -39,6 +39,7 @@ type Result struct {
 
 type layoutCache struct {
 	ManifestHash string            `json:"manifestHash"`
+	Filesystem   string            `json:"filesystem"`
 	Files        []layoutCacheFile `json:"files"`
 }
 
@@ -79,6 +80,7 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 		span.Fail("invalid partition")
 		return Result{}, fmt.Errorf("%s partition index is 0", partitionName)
 	}
+	filesystem := normalizeFilesystem(partition.Format)
 	diskPath := workspace.Path(workspace.Disk.Image)
 	span.Set(2, "fingerprinting manifest")
 	layoutFingerprint, err := ManifestContentFingerprint(manifestPath)
@@ -104,10 +106,11 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 			}
 		}
 	}
+	syncFingerprint := syncCacheFingerprint(contentFingerprint, filesystem)
 	cachePath := workspace.Path(workspace.State, partitionName+".sync.sha256")
 	span.Set(3, "checking sync cache")
-	if !opts.Force && len(opts.ChangedSources) == 0 && fingerprintMatches(cachePath, contentFingerprint) {
-		if opts.Full || layoutCacheMatches(workspace, partitionName, layoutFingerprint) {
+	if !opts.Force && len(opts.ChangedSources) == 0 && fingerprintMatches(cachePath, syncFingerprint) {
+		if opts.Full || layoutCacheMatches(workspace, partitionName, layoutFingerprint, filesystem) {
 			span.Message("counting manifest entries")
 			counts, err := LoadManifestCounts(manifestPath)
 			if err != nil {
@@ -116,37 +119,39 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 			}
 			span.Done(partitionName + " up-to-date")
 			return Result{
-				Disk:      diskPath,
-				Manifest:  manifestPath,
-				Partition: partition.Index,
-				Skipped:   true,
-				Files:     counts.Files,
-				Dirs:      counts.Dirs,
+				Disk:       diskPath,
+				Manifest:   manifestPath,
+				Partition:  partition.Index,
+				Skipped:    true,
+				Files:      counts.Files,
+				Dirs:       counts.Dirs,
+				Filesystem: filesystem,
 			}, nil
 		}
 	}
-	if partitionName == "rootfs" && !opts.Force && len(opts.ChangedSources) == 0 && layoutCacheMatches(workspace, partitionName, layoutFingerprint) {
+	if partitionName == "rootfs" && !opts.Force && len(opts.ChangedSources) == 0 && layoutCacheMatches(workspace, partitionName, layoutFingerprint, filesystem) {
 		span.Message("counting cached rootfs entries")
 		counts, err := LoadManifestCounts(manifestPath)
 		if err != nil {
 			span.Fail("manifest count failed")
 			return Result{}, err
 		}
-		if err := writeFingerprint(cachePath, contentFingerprint); err != nil {
+		if err := writeFingerprint(cachePath, syncFingerprint); err != nil {
 			span.Fail("cache write failed")
 			return Result{}, err
 		}
 		span.Done("rootfs up-to-date")
 		return Result{
-			Disk:      diskPath,
-			Manifest:  manifestPath,
-			Partition: partition.Index,
-			Skipped:   true,
-			Files:     counts.Files,
-			Dirs:      counts.Dirs,
+			Disk:       diskPath,
+			Manifest:   manifestPath,
+			Partition:  partition.Index,
+			Skipped:    true,
+			Files:      counts.Files,
+			Dirs:       counts.Dirs,
+			Filesystem: filesystem,
 		}, nil
 	}
-	if !opts.Full && !opts.Force {
+	if !opts.Full && !opts.Force && filesystem == "fat32" {
 		if partitionName == "rootfs" && len(opts.ChangedSources) > 0 {
 			span.Set(4, "trying targeted incremental sync")
 			if result, ok, err := tryTargetedIncrementalPartition(workspace, partitionName, diskPath, manifestPath, partition.Index, layoutFingerprint, opts.ChangedSources, span); err != nil {
@@ -156,7 +161,7 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 				}
 				span.Message("targeted incremental cache stale; falling back to full rewrite")
 			} else if ok {
-				if err := writeFingerprint(cachePath, contentFingerprint); err != nil {
+				if err := writeFingerprint(cachePath, syncFingerprint); err != nil {
 					span.Fail("cache write failed")
 					return Result{}, err
 				}
@@ -172,7 +177,7 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 			}
 			span.Message("incremental cache stale; falling back to full rewrite")
 		} else if ok {
-			if err := writeFingerprint(cachePath, contentFingerprint); err != nil {
+			if err := writeFingerprint(cachePath, syncFingerprint); err != nil {
 				span.Fail("cache write failed")
 				return Result{}, err
 			}
@@ -198,22 +203,17 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 		span.Fail("partition open failed")
 		return Result{}, err
 	}
-	layout, err := ComputeLayout(region)
+	span.Set(8, "writing "+filesystem+" image")
+	writeResult, err := writeFilesystemWithProgress(disk, region, filesystem, manifest, span)
 	if err != nil {
-		span.Fail("layout compute failed")
+		span.Fail(filesystem + " write failed")
 		return Result{}, err
 	}
-	span.Set(8, "writing FAT32 image")
-	writeResult, err := WriteFAT32WithProgress(disk, layout, manifest, span)
-	if err != nil {
-		span.Fail("FAT32 write failed")
-		return Result{}, err
-	}
-	if err := writeFingerprint(cachePath, contentFingerprint); err != nil {
+	if err := writeFingerprint(cachePath, syncFingerprint); err != nil {
 		span.Fail("cache write failed")
 		return Result{}, err
 	}
-	if err := writeLayoutCache(workspace, partitionName, layoutFingerprint, manifest); err != nil {
+	if err := writeLayoutCache(workspace, partitionName, layoutFingerprint, filesystem, manifest); err != nil {
 		span.Fail("layout cache write failed")
 		return Result{}, err
 	}
@@ -230,6 +230,38 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 		FirstLBA:   writeResult.FirstLBA,
 		LastLBA:    writeResult.LastLBA,
 	}, nil
+}
+
+func normalizeFilesystem(value string) string {
+	filesystem := strings.ToLower(strings.TrimSpace(value))
+	if filesystem == "" {
+		return "fat32"
+	}
+	return filesystem
+}
+
+func syncCacheFingerprint(contentFingerprint []byte, filesystem string) []byte {
+	h := sha256.New()
+	writeStringHash(h, "rootsync-cache-v2\n")
+	writeStringHash(h, filesystem)
+	writeStringHash(h, "\n")
+	_, _ = h.Write(contentFingerprint)
+	return h.Sum(nil)
+}
+
+func writeFilesystemWithProgress(file *os.File, region PartitionRegion, filesystem string, manifest Manifest, span progress.Span) (WriteResult, error) {
+	switch filesystem {
+	case "fat32":
+		layout, err := ComputeLayout(region)
+		if err != nil {
+			return WriteResult{}, err
+		}
+		return WriteFAT32WithProgress(file, layout, manifest, span)
+	case "ext4":
+		return WriteExt4WithProgress(file, region, manifest, span)
+	default:
+		return WriteResult{}, fmt.Errorf("unsupported filesystem format %q", filesystem)
+	}
 }
 
 func tryTargetedIncrementalPartition(workspace *config.Workspace, partitionName string, diskPath string, manifestPath string, partitionIndex int, layoutFingerprint []byte, changedSources []string, span progress.Span) (Result, bool, error) {
@@ -692,14 +724,15 @@ func readLayoutCache(workspace *config.Workspace, partitionName string) (layoutC
 	return cache, nil
 }
 
-func layoutCacheMatches(workspace *config.Workspace, partitionName string, fingerprint []byte) bool {
+func layoutCacheMatches(workspace *config.Workspace, partitionName string, fingerprint []byte, filesystem string) bool {
 	cache, err := readLayoutCache(workspace, partitionName)
-	return err == nil && cache.ManifestHash == hex.EncodeToString(fingerprint)
+	return err == nil && cache.ManifestHash == hex.EncodeToString(fingerprint) && cache.Filesystem == filesystem
 }
 
-func writeLayoutCache(workspace *config.Workspace, partitionName string, fingerprint []byte, manifest Manifest) error {
+func writeLayoutCache(workspace *config.Workspace, partitionName string, fingerprint []byte, filesystem string, manifest Manifest) error {
 	cache := layoutCache{
 		ManifestHash: hex.EncodeToString(fingerprint),
+		Filesystem:   filesystem,
 		Files:        make([]layoutCacheFile, 0, len(manifest.Files)),
 	}
 	for _, spec := range manifest.Files {

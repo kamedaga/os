@@ -17,7 +17,7 @@ disk:
       grow: false
     rootfs:
       index: 2
-      format: "fat32"
+      format: "ext4"
       grow: true
 manifests:
   dir: ".artifacts/manifests"
@@ -30,17 +30,67 @@ startupManifest:
 rootfsDirs: ["/cmd", "/bin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
   apps:
+    - "alpine_clang"
+    - "alpine_go"
+    - "alpine_key_4a6a0840"
+    - "alpine_key_5243ef4b"
+    - "alpine_key_5261cecb"
+    - "alpine_key_6165ee59"
+    - "alpine_key_61666e3f"
+    - "apk"
+    - "apk_arch"
+    - "apk_repositories"
+    - "apk_world"
+    - "ca_certificates"
+    - "capsule_demo"
+    - "curl"
     - "dash"
+    - "dns_lookup"
     - "esp_server"
     - "esp_server_smoke"
     - "exec"
     - "exec_service"
+    - "fastfetch"
     - "fat_server"
+    - "gnu_grep"
+    - "go_vm_pressure_probe"
+    - "kobox_hid"
+    - "kobox_hid_generic"
+    - "kobox_inspect"
+    - "kobox_ls_devices"
+    - "kobox_run"
+    - "kobox_usb_storage"
+    - "kobox_usbcore"
+    - "kobox_usbhid"
+    - "kobox_xhci_hcd"
+    - "kobox_xhci_pci"
+    - "libc_musl"
+    - "linux_abi_probe"
     - "linux_abi_server"
+    - "mbedcrypto"
+    - "mbedtls"
+    - "mbedx509"
+    - "musl_smoke"
+    - "net_bench"
+    - "net_status"
+    - "pachaos_capsule"
+    - "pipe_probe"
+    - "pipe_tools"
     - "rootfs_vfs"
+    - "rtc_status"
+    - "seed0_next"
     - "seed2_boot"
     - "seed2_root"
+    - "tcp_http_get"
     - "tty_service"
+    - "uutils_coreutils"
+    - "uutils_coreutils_common"
+    - "uutils_coreutils_hot"
+    - "uutils_shim"
+    - "virtio_console"
+    - "virtio_net"
+    - "zlib"
+    - "zstd"
   kinds: []
   includeSkippedArtifacts: false
 apps:
@@ -230,49 +280,42 @@ apps:
   kobox_nvme:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/nvme.ko"
-      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVME.KO"
     bootfs: "/srv/kobox/nvme.ko"
     rootfs: "/usr/lib/kobox/nvme.ko"
   kobox_nvme_auth:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/nvme-auth.ko"
-      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVMEAUTH.KO"
     bootfs: "/srv/kobox/nvme-auth.ko"
     rootfs: "/usr/lib/kobox/nvme-auth.ko"
   kobox_nvme_core:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/nvme-core.ko"
-      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "NVMECOR.KO"
     bootfs: "/srv/kobox/nvme-core.ko"
     rootfs: "/usr/lib/kobox/nvme-core.ko"
   kobox_crc16:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/crc16.ko"
-      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "CRC16.KO"
     bootfs: "/srv/kobox/crc16.ko"
     rootfs: "/usr/lib/kobox/crc16.ko"
   kobox_mbcache:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/mbcache.ko"
-      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "MBCACHE.KO"
     bootfs: "/srv/kobox/mbcache.ko"
     rootfs: "/usr/lib/kobox/mbcache.ko"
   kobox_jbd2:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/jbd2.ko"
-      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "JBD2.KO"
     bootfs: "/srv/kobox/jbd2.ko"
     rootfs: "/usr/lib/kobox/jbd2.ko"
   kobox_ext4:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/ext4.ko"
-      rebuild: ["bash", "tools/build_wsl_kobox_modules.sh"]
     out: "EXT4.KO"
     bootfs: "/srv/kobox/ext4.ko"
     rootfs: "/usr/lib/kobox/ext4.ko"
@@ -390,11 +433,17 @@ apps:
       rebuild: ["bash", "tools/build_pachaos_capsule.sh"]
     out: "PCAPSULE.ELF"
     rootfs: "/srv/pachaos_capsule.elf"
+  schedulerd:
+    role: "scheduler"
+    file:
+      path: ".artifacts/cmake/schedulerd/schedulerd.elf"
+      rebuild: ["cmake", "-P", "userland/schedulerd/build.cmake"]
+    out: "SCHEDD.ELF"
+    bootfs: "/srv/schedulerd.elf"
   storage_boot:
     role: "service"
     file:
       path: ".artifacts/cmake/storage_boot/storage_boot.elf"
-      rebuild: ["bash", "tools/build_storage_boot.sh"]
     out: "STRGBOOT.ELF"
     bootfs: "/srv/storage_boot.elf"
     rootfs: "/srv/storage_boot.elf"
@@ -415,21 +464,18 @@ apps:
     role: "service"
     file:
       path: ".artifacts/cmake/seed0root/seed0root.elf"
-      rebuild: ["bash", "tools/build_seed0root.sh"]
     out: "SEED0RT.ELF"
     rootfs: "/sbin/seed0root.elf"
   koboxd:
     role: "service"
     file:
       path: ".artifacts/cmake/koboxd/koboxd.elf"
-      rebuild: ["bash", "tools/build_koboxd.sh"]
     out: "KOBOXD.ELF"
     rootfs: "/sbin/koboxd.elf"
   filed:
     role: "service"
     file:
       path: ".artifacts/cmake/filed/filed.elf"
-      rebuild: ["bash", "tools/build_filed.sh"]
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
   net_bench:

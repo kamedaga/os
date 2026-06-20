@@ -6,6 +6,7 @@ const process_abi = abi_root.process_abi;
 const runtime_abi = abi_root.runtime_abi;
 
 pub fn needsKernelStateLock(nr: u64) bool {
+    if (nr == runtime_abi.syscall_nanosleep) return false;
     return process_abi.isProcessSyscall(nr) or
         capsule_abi.isCapsuleSyscall(nr) or
         fd_abi.isFdSyscall(nr) or

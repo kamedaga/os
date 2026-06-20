@@ -418,38 +418,9 @@ fn scrubEndpointTargets(table: *kernel.EndpointCNode, target: kernel.PrincipalId
     return changed;
 }
 
-fn nextReadyThreadAfter(current_thread: usize) ?usize {
-    var step: usize = 1;
-    const capacity = scheduler.threadSlotCapacity();
-    while (step <= capacity) : (step += 1) {
-        const thread_index = (current_thread + step) % capacity;
-        if (!scheduler.isThreadReady(thread_index)) continue;
-        return thread_index;
-    }
-    return null;
-}
-
 fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
-    const cpu_slot = scheduler.currentCpuSlot();
-    if (cpu_slot != 0 and scheduler.userApSchedulingReady()) {
-        while (true) {
-            const current_thread = scheduler.currentThreadIndex();
-            if (scheduler.pickNextReadyThreadIndexForCpu(cpu_slot, current_thread)) |thread_index| {
-                if (scheduler.activateThread(thread_index) and scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
-                halt.haltWithMessage("AP fault reschedule failed");
-            }
-            scheduler.parkCurrentApAfterCurrentThreadStopped();
-        }
-    }
-
-    while (true) {
-        const current_thread = scheduler.currentThreadIndex();
-        if (nextReadyThreadAfter(current_thread)) |thread_index| {
-            if (scheduler.activateThread(thread_index) and scheduler.loadThreadContextToFrame(thread_index, out_frame)) return;
-            halt.haltWithMessage("fault reschedule failed");
-        }
-        asm volatile ("sti\nhlt\ncli" ::: .{ .memory = true });
-    }
+    if (scheduler.loadExternalSchedulerPolicyThread(out_frame)) return;
+    halt.haltWithMessage("external scheduler unavailable");
 }
 
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
@@ -553,6 +524,9 @@ fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8
     kernel_log.writeHexRaw(out_frame.rsp);
     kernel_log.write("\n");
     teardownFaultedProcess(principal, fault_vector);
+    if (!scheduler.schedulerRunsOnCurrentCpu()) {
+        smp.returnCurrentApToIdleFromInterrupt();
+    }
     loadRunnableThreadOrIdle(out_frame);
 }
 
@@ -560,6 +534,9 @@ fn exitCurrentProcess(principal: kernel.PrincipalId, exit_code: u8, out_frame: *
     kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .exited, exit_code);
     kernel_state_global.markProcessObjectsExited(principal, .exited, exit_code);
     teardownExitedProcess(principal);
+    if (!scheduler.schedulerRunsOnCurrentCpu()) {
+        smp.returnCurrentApToIdleFromInterrupt();
+    }
     loadRunnableThreadOrIdle(out_frame);
 }
 
@@ -612,6 +589,7 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
 
 const BootResources = struct {
     framebuffer_info: uefi_services.FramebufferInfo,
+    disk_scheduler_policy_elf: []const u8,
     disk_init_elf: []const u8,
     disk_bootfs_image: []const u8,
     memory_stats: boot_static.MemoryStats,
@@ -634,6 +612,9 @@ fn runBootServicesPhase() BootResources {
     const framebuffer_info = uefi_services.acquireFramebufferInfo(bs) orelse {
         halt.haltWithMessage("GraphicsOutput unavailable or mode unsupported");
     };
+    const disk_scheduler_policy_elf = uefi_services.loadBootDiskFile(bs, boot_images.scheduler_policy) orelse {
+        halt.haltWithMessage("disk scheduler policy ELF load failed");
+    };
     const disk_init_elf = uefi_services.loadBootDiskFile(bs, boot_images.init_app) orelse {
         halt.haltWithMessage("disk init ELF load failed");
     };
@@ -645,13 +626,16 @@ fn runBootServicesPhase() BootResources {
     const memory_stats = uefi_services.collectBootMemoryStatsOrHalt(bs, &global_free_list, user_spaces);
     uefi_services.exitBootServicesOrHalt();
     initKernelRuntimeOrHalt();
+    scheduler.initStaticStorage();
     scheduler.installCpuIdleObserver();
+    smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
     smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
     scheduler.refreshCpuTopology();
 
     return .{
         .framebuffer_info = framebuffer_info,
+        .disk_scheduler_policy_elf = disk_scheduler_policy_elf,
         .disk_init_elf = disk_init_elf,
         .disk_bootfs_image = disk_bootfs_image,
         .memory_stats = memory_stats,
@@ -717,7 +701,52 @@ fn discoverDevices() DetectedDevices {
 // ---------------------------------------------------------------------------
 
 fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
-    scheduler.initStaticStorage();
+    const scheduler_principal = state.createProcessDescriptor("scheduler_policy") orelse
+        halt.haltWithMessage("scheduler policy process descriptor alloc failed");
+    const scheduler_process = process_factory.createUserProcess(
+        state,
+        scheduler_principal,
+        "scheduler_policy",
+        &global_free_list,
+        user_spaces,
+    );
+    state.createSerialFdAt(scheduler_principal, 1, 1) catch |err| {
+        halt.haltWithError("scheduler stdout fd install failed: ", err);
+    };
+    state.createSerialFdAt(scheduler_principal, 2, 2) catch |err| {
+        halt.haltWithError("scheduler stderr fd install failed: ", err);
+    };
+    state.createSchedulerControlFdAt(scheduler_principal, 16) catch |err| {
+        halt.haltWithError("scheduler control fd install failed: ", err);
+    };
+    state.createSchedulerEventFdAt(scheduler_principal, 17) catch |err| {
+        halt.haltWithError("scheduler event fd install failed: ", err);
+    };
+
+    const loaded_scheduler = elf_load.loadUserElfIntoProcessPagesOrHalt(
+        state,
+        scheduler_principal,
+        scheduler_process.user_page.paddr,
+        scheduler_process.user_stack_page.paddr,
+        res.disk_scheduler_policy_elf,
+        "scheduler policy ELF load failed\n",
+        &global_free_list,
+    );
+    const scheduler_thread = scheduler.threadSlotForPrincipal(scheduler_principal).?;
+    const scheduler_ctx = scheduler.getThreadContext(scheduler_thread).?;
+    if (scheduler.isThreadReady(scheduler_thread)) {
+        scheduler_ctx.frame.rip = loaded_scheduler.entry;
+        scheduler_ctx.frame.rsp = process_factory.installInitialUserStackOrHalt(
+            scheduler_process.user_stack_page.paddr,
+            loaded_scheduler,
+            "schedulerd",
+        );
+    }
+    if (!scheduler.installExternalSchedulerPolicyThread(scheduler_thread)) {
+        halt.haltWithMessage("external scheduler policy install failed");
+    }
+    activateThreadOrHalt(scheduler_thread);
+
     const init_principal = state.createProcessDescriptor("seed2_boot") orelse
         halt.haltWithMessage("seed2_boot process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
@@ -739,8 +768,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         res.framebuffer_info,
         &global_free_list,
     );
-    activateThreadOrHalt(init_process.thread_slot);
-
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;
     init_setup.refreshInitBootLogSnapshot(state, init_principal);
@@ -756,15 +783,13 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     );
     const init_thread = scheduler.threadSlotForPrincipal(init_principal).?;
     const init_ctx = scheduler.getThreadContext(init_thread).?;
-    if (scheduler.isThreadReady(init_thread)) {
-        init_ctx.frame.rip = loaded_init.entry;
-        init_ctx.frame.rsp = process_factory.installInitialUserStackOrHalt(
-            init_process.user_stack_page.paddr,
-            loaded_init,
-            "init",
-        );
-    }
-    activateThreadOrHalt(init_thread);
+    init_ctx.frame.rip = loaded_init.entry;
+    init_ctx.frame.rsp = process_factory.installInitialUserStackOrHalt(
+        init_process.user_stack_page.paddr,
+        loaded_init,
+        "init",
+    );
+    scheduler.notifyExternalThreadReady(init_thread);
 
     kernel_state_ready = true;
 }

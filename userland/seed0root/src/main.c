@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 enum {
     SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
@@ -242,11 +241,6 @@ static int map_elf_segment(
     if (map_result < 4096) return -5;
     if (out_mapped_va != NULL) *out_mapped_va = (uint64_t)map_result;
 
-    printf("[seed0root] exec: mapped PT_LOAD[%u] process_fd=%d target=0x%llx size=%llu\n",
-        index,
-        process_fd,
-        (unsigned long long)(uint64_t)map_result,
-        (unsigned long long)map_size);
     return 0;
 }
 
@@ -254,6 +248,11 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
 {
     if (data == NULL || size == 0) {
         return -1;
+    }
+    const int trace = label != NULL && strcmp(label, "koboxd bootstrap fd") == 0;
+    if (trace) {
+        printf("[seed0root] %s create size=%llu\n", label, (unsigned long long)size);
+        fflush(stdout);
     }
     uint64_t map_size = 0;
     if (align_up(size, &map_size) != 0) {
@@ -271,10 +270,18 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
     if (fd < 16) {
         return -3;
     }
+    if (trace) {
+        printf("[seed0root] %s vmo fd=%d map_size=%llu\n", label, fd, (unsigned long long)map_size);
+        fflush(stdout);
+    }
     unsigned char *mapped = pacha_mmap(fd, map_size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (mapped == NULL) {
         (void)pacha_fd_close(fd);
         return -4;
+    }
+    if (trace) {
+        printf("[seed0root] %s mapped\n", label);
+        fflush(stdout);
     }
     memset(mapped, 0, (size_t)map_size);
     memcpy(mapped, data, (size_t)size);
@@ -283,6 +290,10 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
     if (inherit_status != 0) {
         (void)pacha_fd_close(fd);
         return -5;
+    }
+    if (trace) {
+        printf("[seed0root] %s inherit ready\n", label);
+        fflush(stdout);
     }
     return fd;
 }
@@ -469,9 +480,6 @@ static int seed0root_get_koboxd_endpoint(int control_fd, uint64_t endpoint_kind,
         }
     }
     *out_fd = (int)fds[0].fd;
-    printf("[seed0root] koboxd endpoint kind=%llu fd=%d\n",
-        (unsigned long long)endpoint_kind,
-        *out_fd);
     return 0;
 }
 
@@ -725,10 +733,6 @@ static int seed0root_read_rootfs_file(int fs_fd, const char *path, unsigned char
         offset += got;
     }
 
-    printf("[seed0root] filed: read %s bytes=%llu object=%llu\n",
-        path,
-        (unsigned long long)stat.size,
-        (unsigned long long)file_object);
     *out_image = image;
     *out_size = stat.size;
     return 0;
@@ -776,7 +780,7 @@ static int launch_filed_from_rootfs(int fs_fd)
         fprintf(stderr, "[seed0root] filed start failed status=%d\n", status);
         return status;
     }
-    printf("[seed0root] filed started\n");
+    printf("[seed0root] filed ready\n");
     return 0;
 }
 
@@ -797,8 +801,6 @@ static int seed0root_connect_storage_services(int control_fd)
             (unsigned long long)block_size);
         return status != 0 ? status : -2;
     }
-    printf("[seed0root] koboxd block endpoint identify OK\n");
-
     status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_FS_BACKEND, &fs_fd);
     if (status != 0) {
         return status;
@@ -866,11 +868,6 @@ static int load_elf_process(
     out->phent = e_phentsize;
     out->phnum = e_phnum;
     out->load_segments = load_count;
-    printf("[seed0root] exec: staged %s process_fd=%d entry=0x%llx load_segments=%u\n",
-        path,
-        process_fd,
-        (unsigned long long)out->runtime_entry,
-        load_count);
     return 0;
 }
 
@@ -970,11 +967,6 @@ static int start_loaded_process(
         (void)pacha_fd_close(thread_fd);
         return -8;
     }
-    printf("[seed0root] exec: started process_fd=%d thread_fd=%d entry=0x%llx stack=0x%llx\n",
-        process_fd,
-        thread_fd,
-        (unsigned long long)loaded->runtime_entry,
-        (unsigned long long)(stack_base + sp));
     return 0;
 }
 
@@ -1006,14 +998,8 @@ static int prepare_koboxd_bootstrap(
         snprintf(out_bootstrap->modules[i].name, sizeof(out_bootstrap->modules[i].name), "%s", src->name);
         out_bootstrap->modules[i].image_fd = src->image_fd;
         out_bootstrap->modules[i].image_size = src->image_size;
-        printf("[seed0root] koboxd bootstrap module=%s fd=%llu bytes=%llu\n",
-            out_bootstrap->modules[i].name,
-            (unsigned long long)src->image_fd,
-            (unsigned long long)src->image_size);
     }
 
-    printf("[seed0root] koboxd bootstrap package prepared modules=%llu\n",
-        (unsigned long long)bootstrap->module_count);
     return 0;
 }
 
@@ -1039,19 +1025,28 @@ static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
     if (align_up(bootstrap->koboxd_image_size, &koboxd_map_size) != 0) {
         return -1;
     }
+    printf("[seed0root] koboxd image mmap begin fd=%llu size=%llu map=%llu\n",
+        (unsigned long long)bootstrap->koboxd_image_fd,
+        (unsigned long long)bootstrap->koboxd_image_size,
+        (unsigned long long)koboxd_map_size);
+    fflush(stdout);
     unsigned char *image = pacha_mmap(
         (int)bootstrap->koboxd_image_fd,
         koboxd_map_size,
         PACHA_PROT_READ,
         PACHA_MMAP_SHARED,
         0);
+    printf("[seed0root] koboxd image mmap returned ptr=%p\n", (void *)image);
+    fflush(stdout);
     if (image == NULL) {
         fprintf(stderr, "[seed0root] koboxd image mmap failed fd=%llu\n",
             (unsigned long long)bootstrap->koboxd_image_fd);
         return -1;
     }
+    printf("[seed0root] koboxd image ready\n");
+    fflush(stdout);
     struct pacha_ipc_channel_pair control_pair = { .a = -1, .b = -1 };
-    int control_status = pacha_ipc_channel_create(&control_pair, seed0root_channel_rights, 0);
+    int control_status = pacha_ipc_channel_create(&control_pair, seed0root_channel_rights, PACHA_FD_FLAG_INHERIT);
     if (control_status != 0 || control_pair.a < 16 || control_pair.b < 16) {
         fprintf(stderr,
             "[seed0root] koboxd control channel create failed status=%d a=%d b=%d\n",
@@ -1061,6 +1056,8 @@ static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
         (void)pacha_munmap(image, koboxd_map_size);
         return control_status != 0 ? control_status : -2;
     }
+    printf("[seed0root] koboxd control ready\n");
+    fflush(stdout);
     int status = mark_fd_inherit((int)bootstrap->device_fd, "koboxd device fd");
     if (status != 0) {
         fprintf(stderr, "[seed0root] koboxd device fd inherit failed status=%d fd=%llu\n",
@@ -1069,14 +1066,8 @@ static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
         (void)pacha_munmap(image, koboxd_map_size);
         return status;
     }
-    status = mark_fd_inherit(control_pair.b, "koboxd control fd");
-    if (status != 0) {
-        fprintf(stderr, "[seed0root] koboxd control fd inherit failed status=%d fd=%d\n",
-            status,
-            control_pair.b);
-        (void)pacha_munmap(image, koboxd_map_size);
-        return status;
-    }
+    printf("[seed0root] koboxd device fd ready\n");
+    fflush(stdout);
     struct seed0root_koboxd_bootstrap koboxd_bootstrap;
     status = prepare_koboxd_bootstrap(bootstrap, control_pair.b, &koboxd_bootstrap);
     if (status != 0) {
@@ -1084,12 +1075,16 @@ static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
         fprintf(stderr, "[seed0root] koboxd bootstrap package failed status=%d\n", status);
         return status;
     }
+    printf("[seed0root] koboxd bootstrap ready\n");
+    fflush(stdout);
     const int bootstrap_fd = create_inherited_vmo_from_bytes(&koboxd_bootstrap, sizeof(koboxd_bootstrap), "koboxd bootstrap fd");
     if (bootstrap_fd < 16) {
         (void)pacha_munmap(image, koboxd_map_size);
         fprintf(stderr, "[seed0root] koboxd bootstrap fd create failed status=%d\n", bootstrap_fd);
         return bootstrap_fd;
     }
+    printf("[seed0root] koboxd bootstrap fd=%d\n", bootstrap_fd);
+    fflush(stdout);
     struct seed0root_loaded_process loaded;
     status = load_elf_process("/sbin/koboxd.elf", image, bootstrap->koboxd_image_size, &loaded);
     (void)pacha_munmap(image, koboxd_map_size);
@@ -1098,6 +1093,8 @@ static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
         fprintf(stderr, "[seed0root] koboxd load failed status=%d\n", status);
         return status;
     }
+    printf("[seed0root] koboxd image loaded\n");
+    fflush(stdout);
     status = start_loaded_process(&loaded, "/sbin/koboxd.elf", bootstrap_fd);
     (void)pacha_fd_close(bootstrap_fd);
     if (status != 0) {
@@ -1105,49 +1102,39 @@ static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
         return status;
     }
     printf("[seed0root] koboxd started\n");
+    fflush(stdout);
     status = seed0root_connect_storage_services(control_pair.a);
     if (status != 0) {
         fprintf(stderr, "[seed0root] koboxd connect failed status=%d\n", status);
         return status;
     }
-    printf("[seed0root] koboxd control discover OK\n");
+    printf("[seed0root] storage ready\n");
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    printf("[seed0root] start argc=%d argv0=%s\n",
-        argc,
-        (argc > 0 && argv != NULL && argv[0] != NULL) ? argv[0] : "(null)");
-
-    struct timespec ts = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-        printf("[seed0root] monotonic=%llu.%09llu\n",
-            (unsigned long long)ts.tv_sec,
-            (unsigned long long)ts.tv_nsec);
-    } else {
-        fprintf(stderr, "[seed0root] clock_gettime failed\n");
-        return 2;
-    }
-
-    char *buf = malloc(64);
-    if (buf == NULL) {
-        fprintf(stderr, "[seed0root] malloc failed\n");
-        return 3;
-    }
-    snprintf(buf, 64, "[seed0root] malloc/stdout OK\n");
-    fputs(buf, stdout);
-    free(buf);
-
-    fprintf(stderr, "[seed0root] stderr OK\n");
+    (void)argc;
+    printf("[seed0root] start\n");
+    fflush(stdout);
     int bootstrap_fd = -1;
     int bootstrap_status = find_seed0root_bootstrap_fd(argv, &bootstrap_fd);
     if (bootstrap_status != 0) {
         fprintf(stderr, "[seed0root] bootstrap lookup failed status=%d\n", bootstrap_status);
         return 4;
     }
+    printf("[seed0root] bootstrap fd=%d\n", bootstrap_fd);
+    fflush(stdout);
     struct seed0root_bootstrap bootstrap;
     bootstrap_status = read_bootstrap_fd(bootstrap_fd, &bootstrap, sizeof(bootstrap), "seed0root");
+    printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu koboxd_fd=%llu koboxd_size=%llu modules=%llu\n",
+        bootstrap_status,
+        (unsigned long long)bootstrap.magic,
+        (unsigned long long)bootstrap.device_fd,
+        (unsigned long long)bootstrap.koboxd_image_fd,
+        (unsigned long long)bootstrap.koboxd_image_size,
+        (unsigned long long)bootstrap.module_count);
+    fflush(stdout);
     if (bootstrap_status != 0 ||
         bootstrap.magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap.device_fd < 16 ||
@@ -1157,8 +1144,11 @@ int main(int argc, char **argv)
         bootstrap.module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES)
     {
         fprintf(stderr, "[seed0root] bootstrap invalid status=%d\n", bootstrap_status);
+        fflush(stderr);
         return 4;
     }
+    printf("[seed0root] koboxd launching\n");
+    fflush(stdout);
     int launch_status = launch_koboxd(&bootstrap);
     if (launch_status != 0) {
         fprintf(stderr, "[seed0root] koboxd launch failed status=%d\n", launch_status);

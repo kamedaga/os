@@ -361,8 +361,16 @@ fn writeMsr(msr: u32, value: u64) void {
         : .{ .memory = true });
 }
 
+pub fn readFsBase() u64 {
+    return readMsr(msr_ia32_fs_base);
+}
+
 pub fn writeFsBase(value: u64) void {
     writeMsr(msr_ia32_fs_base, value);
+}
+
+pub fn readGsBase() u64 {
+    return readMsr(msr_ia32_gs_base);
 }
 
 pub fn writeGsBase(value: u64) void {
@@ -833,13 +841,13 @@ fn loadGdtAndReloadSegmentsForCpuInternal(cpu_slot: usize) bool {
         :
         : [kcs] "i" (@as(u64, gdt_kernel_code_selector)),
           [kds] "i" (gdt_kernel_data_selector),
-        : .{ .memory = true });
+        : .{ .memory = true, .rax = true });
     asm volatile (
         \\mov %[tss_sel], %%ax
         \\ltr %%ax
         :
         : [tss_sel] "i" (gdt_tss_selector),
-        : .{ .memory = true });
+        : .{ .memory = true, .rax = true });
     return true;
 }
 

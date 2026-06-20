@@ -5,3 +5,4 @@ pub const capsule_abi = @import("capsule_abi.zig");
 pub const process_abi = @import("process_abi.zig");
 pub const service_registry_abi = @import("service_registry_abi.zig");
 pub const runtime_abi = @import("runtime_abi.zig");
+pub const scheduler_abi = @import("scheduler_abi.zig");

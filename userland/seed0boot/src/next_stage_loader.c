@@ -206,14 +206,11 @@ static int stage_load_segment(
         *out_mapped_va = (uint64_t)map_status;
     }
 
-    printf("[seed0boot] next-stage: mapped PT_LOAD[%u] process_fd=%d target=0x%llx size=%llu prot=0x%llx file=%llu mem=%llu\n",
-        index,
-        process_fd,
-        (unsigned long long)(uint64_t)map_status,
-        (unsigned long long)map_size,
-        (unsigned long long)prot,
-        (unsigned long long)p_filesz,
-        (unsigned long long)p_memsz);
+    (void)index;
+    (void)process_fd;
+    (void)prot;
+    (void)p_filesz;
+    (void)p_memsz;
     return 0;
 }
 
@@ -367,11 +364,9 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
         (void)pacha_fd_close(thread_fd);
         return -8;
     }
-    printf("[seed0boot] next-stage: started process_fd=%d thread_fd=%d entry=0x%llx stack=0x%llx\n",
-        process_fd,
-        thread_fd,
-        (unsigned long long)loaded->runtime_entry,
-        (unsigned long long)(stack_base + sp));
+    (void)thread_fd;
+    printf("[seed0boot] next-stage started entry=0x%llx\n",
+        (unsigned long long)loaded->runtime_entry);
     return 0;
 }
 
@@ -443,12 +438,8 @@ int seed0_load_elf_process(
     out->phent = e_phentsize;
     out->phnum = e_phnum;
     out->load_segments = load_count;
-    printf("[seed0boot] next-stage: staged %s process_fd=%d entry=0x%llx runtime_entry=0x%llx load_bias=0x%llx load_segments=%u process_map=ok start=pending\n",
+    printf("[seed0boot] next-stage loaded path=%s segments=%u\n",
         path,
-        process_fd,
-        (unsigned long long)e_entry,
-        (unsigned long long)(e_entry + load_bias),
-        (unsigned long long)load_bias,
         load_count);
     return 0;
 }

@@ -287,13 +287,7 @@ fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.Princi
         h.exit_current_process(proc, @truncate(code), frame);
         return sc.syscall_ok;
     }
-    const next = scheduler.nextReadyThreadForPrincipalAfter(proc, current) orelse {
-        state.markProcessObjectsExited(proc, .exited, code);
-        h.exit_current_process(proc, @truncate(code), frame);
-        return sc.syscall_ok;
-    };
-    _ = scheduler.releaseThreadSlot(current);
-    if (!scheduler.activateThread(next) or !scheduler.loadThreadContextToFrame(next, frame)) {
+    if (!scheduler.exitCurrentThreadToExternalScheduler(frame, sc.syscall_ok)) {
         h.exit_current_process(proc, @truncate(code), frame);
     }
     return sc.syscall_ok;

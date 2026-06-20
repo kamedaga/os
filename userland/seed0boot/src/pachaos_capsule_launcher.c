@@ -182,9 +182,9 @@ int seed0_launch_pachaos_capsule_nvme(void)
         }
     }
 
-    printf("[seed0boot] pachaos_capsule: launching NVMe daemon fd=%d daemon_size=%u modules=%llu\n",
-        device_fd,
-        daemon_size,
+    (void)device_fd;
+    (void)daemon_size;
+    printf("[seed0boot] pachaos_capsule modules=%llu\n",
         (unsigned long long)module_count);
     status = seed0_start_process(&loaded, "/srv/pachaos_capsule.elf", -1);
     if (status != 0) {
@@ -264,9 +264,8 @@ int seed0_launch_storage_boot_nvme(void)
         return status;
     }
 
-    printf("[seed0boot] storage_boot: launching NVMe storage daemon fd=%d daemon_size=%u modules=%llu\n",
-        device_fd,
-        daemon_size,
+    (void)daemon_size;
+    printf("[seed0boot] storage_boot modules=%llu\n",
         (unsigned long long)module_count);
     status = seed0_start_process(&loaded, "/srv/storage_boot.elf", config_fd);
     if (status != 0) {

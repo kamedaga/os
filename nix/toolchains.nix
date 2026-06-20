@@ -18,15 +18,42 @@ let
     '';
   };
   clangFreestanding = pkgs.llvmPackages.clang-unwrapped;
+  coqCompCert = pkgs.coqPackages.compcert;
+  coqCompCertContrib =
+    "${coqCompCert.lib}/lib/coq/${pkgs.coq.coq-version}/user-contrib";
+  coqWithStdlib = pkgs.coq.withPackages (ps: [
+    ps.compcert
+    ps.stdlib
+    ps.VST
+  ]);
+  coqVstTools = pkgs.runCommand "coq-vst-tools"
+    {
+      nativeBuildInputs = [ pkgs.makeWrapper ];
+    }
+    ''
+      mkdir -p "$out/bin"
+      for tool in "${coqWithStdlib}"/bin/*; do
+        ln -s "$tool" "$out/bin/$(basename "$tool")"
+      done
+      for tool in coqc coqtop coqdep coq_makefile clightgen; do
+        if [ -e "${coqWithStdlib}/bin/$tool" ]; then
+          rm -f "$out/bin/$tool"
+          makeWrapper "${coqWithStdlib}/bin/$tool" "$out/bin/$tool" \
+            --set ROCQPATH "${coqCompCertContrib}"
+        fi
+      done
+    '';
 in
 {
   inherit zig;
   inherit clangFreestanding;
+  inherit coqCompCertContrib;
 
   devPackages = with pkgs; [
     bash
     clang
     cmake
+    coqVstTools
     dosfstools
     e2fsprogs
     e2tools

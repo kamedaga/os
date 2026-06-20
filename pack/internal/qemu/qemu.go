@@ -654,7 +654,7 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		"-drive", "if=pflash,format=raw,readonly=on,file="+codePath,
 		"-drive", "if=pflash,format=raw,file="+varsPath,
 		"-drive", "if=none,file="+diskPath+",format=raw,id=bootdisk",
-		"-device", "virtio-blk-pci,drive=bootdisk",
+		"-device", "nvme,drive=bootdisk,serial=capos-root",
 		"-serial", "stdio",
 	)
 	if !opts.Fast {
@@ -703,10 +703,72 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		)
 	}
 	if !opts.NoKVM {
+		if err := validateKVMAvailable(); err != nil {
+			return commandPlan{}, err
+		}
 		args = append([]string{args[0], "-enable-kvm", "-cpu", "host"}, args[1:]...)
 	}
 	args = append(args, opts.ExtraArgs...)
 	return commandPlan{Args: args, LogPath: logPath, VarsPath: varsPath, ConsoleSocket: consoleSocket}, nil
+}
+
+func validateKVMAvailable() error {
+	info, err := os.Stat("/dev/kvm")
+	if err != nil {
+		return fmt.Errorf("KVM requested but /dev/kvm is unavailable: %w%s", err, kvmDiagnostics())
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf("KVM requested but /dev/kvm is not a character device%s", kvmDiagnostics())
+	}
+	file, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("KVM requested but /dev/kvm cannot be opened: %w%s", err, kvmDiagnostics())
+	}
+	_ = file.Close()
+	return nil
+}
+
+func kvmDiagnostics() string {
+	var detail strings.Builder
+	if data, err := os.ReadFile("/sys/devices/virtual/misc/kvm/dev"); err == nil {
+		detail.WriteString("; kernel registered kvm misc device ")
+		detail.WriteString(strings.TrimSpace(string(data)))
+	}
+	if line := devMountInfo(); line != "" {
+		detail.WriteString("; /dev mount: ")
+		detail.WriteString(line)
+	}
+	detail.WriteString("; if this is a Codex sandbox with KVM hidden, run './pacgo runner serve' in a normal WSL terminal and submit fixed KVM tasks with './pacgo runner run smoke --timeout 60s --marker \"[seed0root] ready\"'")
+	return detail.String()
+}
+
+func devMountInfo() string {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return ""
+	}
+	match := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && fields[4] == "/dev" {
+			match = summarizeMountInfo(fields)
+		}
+	}
+	return match
+}
+
+func summarizeMountInfo(fields []string) string {
+	separator := -1
+	for i, field := range fields {
+		if field == "-" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || separator+3 >= len(fields) {
+		return strings.Join(fields, " ")
+	}
+	return fmt.Sprintf("%s %s opts=%s", fields[separator+1], fields[separator+2], fields[5])
 }
 
 func consoleSocketPath(workspace *config.Workspace) (string, error) {
