@@ -2,7 +2,7 @@ const abi_root = @import("kernel_abi_root");
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
 const kernel_log = @import("../kernel_log.zig");
-const scheduler = @import("../scheduler.zig");
+const scheduler = @import("../scheduler.zig").connection;
 const user_vm = @import("../memory/user_vm.zig");
 const sc = @import("numbers.zig");
 
@@ -93,7 +93,7 @@ fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: 
         switch (view.payload.*) {
             .sched_event => {
                 var event_buf: [@as(usize, @intCast(scheduler_abi.sched_event_size))]u8 = undefined;
-                const got = scheduler.readExternalSchedulerEventBytes(event_buf[0..]) orelse return sc.syscall_err_invalid;
+                const got = scheduler.readPolicyEventBytes(event_buf[0..]) orelse return sc.syscall_err_invalid;
                 if (got == 0) return sc.syscall_err_not_ready;
                 if (len < got) return sc.syscall_err_invalid;
                 if (!h.copy_bytes_to_user_va(proc, out_va, event_buf[0..got])) return sc.syscall_err_invalid;
@@ -260,7 +260,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     if (nextPollWakeDelta(h, state, proc, pollfds_va, count, now)) |delta| {
         if (block_ticks == 0 or delta < block_ticks) block_ticks = delta;
     }
-    if (h.block_current_thread_for_event(frame, true, block_ticks, sc.syscall_err_not_ready)) return frame.rax;
+    if (h.block_current_thread_for_event(frame, true, block_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
     return sc.syscall_err_not_ready;
 }
 
@@ -405,8 +405,11 @@ fn mapVmoFd(
     const base_va = if (requested_va != 0)
         requested_va
     else
-        user_vm.findFreeUserMappingRange(proc, aligned_size / 4096, 1) orelse return sc.syscall_err_map;
+        state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch return sc.syscall_err_map;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
+
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
 
     const vmo_ref = if (flags.anonymous) blk: {
         if (vmo_offset != 0) return sc.syscall_err_invalid;
@@ -458,8 +461,15 @@ fn mprotectVmaRange(
     if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
     const prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
 
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
+
+    const exact_vma = state.vmaEntryConst(proc, base_va) orelse return sc.syscall_err_invalid;
+    if (exact_vma.size_bytes != aligned_size) return sc.syscall_err_invalid;
+
     if (!prot.read and !prot.write and !prot.exec) {
         if (!user_vm.unmapUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_map;
+        state.setVmaProtExact(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
         return sc.syscall_ok;
     }
 
@@ -481,6 +491,7 @@ fn mprotectVmaRange(
         .exec = prot.exec,
         .pkey = prot.pkey,
     })) return sc.syscall_err_map;
+    state.setVmaProtExact(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
 
@@ -585,11 +596,11 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
                 scheduler_abi.ioctl_query_caps => writeSchedulerCaps(h, proc, arg_va),
                 scheduler_abi.ioctl_commit => blk: {
                     const commit = readSchedulerCommit(h, proc, arg_va) orelse break :blk sc.syscall_err_invalid;
-                    const caller_thread = scheduler.currentThreadIndex();
-                    if (!scheduler.commitExternalSchedule(commit.cpu_id, commit.thread_id, commit.generation, frame, sc.syscall_ok)) {
+                    const caller_thread = scheduler.currentThread();
+                    if (!scheduler.commitPolicyDecision(commit.cpu_id, commit.thread_id, commit.generation, frame, sc.syscall_ok)) {
                         break :blk sc.syscall_err_invalid;
                     }
-                    const resumed_thread = scheduler.currentThreadIndex();
+                    const resumed_thread = scheduler.currentThread();
                     break :blk if (resumed_thread != caller_thread) frame.rax else sc.syscall_ok;
                 },
                 scheduler_abi.ioctl_set_weight => sc.syscall_ok,
@@ -655,6 +666,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
             const size = pageAlignUp(frame.rsi) orelse break :blk sc.syscall_err_invalid;
+            user_vm.lockAddressSpaces();
+            defer user_vm.unlockAddressSpaces();
             const vma = state.vmaEntryConst(proc, frame.rdi) orelse break :blk sc.syscall_err_invalid;
             if (vma.size_bytes != size) break :blk sc.syscall_err_invalid;
             if (!user_vm.unmapUserLinearRegion(proc, frame.rdi, @intCast(size))) break :blk sc.syscall_err_map;

@@ -3,7 +3,7 @@ const abi_root = @import("kernel_abi_root");
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
 const rtc = @import("../rtc.zig");
-const scheduler = @import("../scheduler.zig");
+const scheduler = @import("../scheduler.zig").connection;
 const sc = @import("numbers.zig");
 
 const runtime_abi = abi_root.runtime_abi;
@@ -88,7 +88,7 @@ fn nanosleep(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     const nsec = h.read_user_u64(proc, req_va + runtime_abi.timespec_nsec_offset) orelse return sc.syscall_err_invalid;
     const ticks = timespecToTicks(sec, nsec) orelse return sc.syscall_err_invalid;
     if (ticks == 0) return sc.syscall_ok;
-    if (h.block_current_thread_for_event(frame, false, ticks, sc.syscall_ok)) return frame.rax;
+    if (h.block_current_thread_for_event(frame, false, ticks, sc.syscall_ok, h.before_current_thread_leave)) return frame.rax;
     return sc.syscall_err_not_ready;
 }
 
@@ -129,9 +129,9 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     const current = readUserU32(h, proc, user_va) orelse return sc.syscall_err_invalid;
     if (current != expected) return sc.syscall_err_not_ready;
 
-    const thread_index = scheduler.currentThreadIndex();
+    const thread_index = scheduler.currentThread();
     if (!recordFutexWaiter(proc, thread_index, user_va)) return sc.syscall_err_alloc;
-    if (h.block_current_thread_for_event(frame, true, timeout_ticks, sc.syscall_err_not_ready)) return frame.rax;
+    if (h.block_current_thread_for_event(frame, true, timeout_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
     clearFutexWaiter(proc, thread_index, user_va);
     return sc.syscall_err_not_ready;
 }
@@ -144,21 +144,41 @@ fn futexWake(proc: kernel.PrincipalId, user_va: u64, max_count: u64) u64 {
         if (waiter.principal != proc or waiter.user_va != user_va) continue;
         const thread_index = waiter.thread_index;
         waiter.* = .{};
-        scheduler.wakeThreadIfWaiting(thread_index);
+        scheduler.wakeIfWaiting(thread_index);
         woke += 1;
         if (max_count != runtime_abi.futex_wake_all and woke >= max_count) break;
     }
     return woke;
 }
 
-pub fn dispatch(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
+fn getRandom(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    const out_va = frame.rdi;
+    const len = frame.rsi;
+    const flags = frame.rdx;
+    if (flags != 0) return sc.syscall_err_invalid;
+    if (len == 0) return 0;
+    if (out_va == 0 or len > 4096) return sc.syscall_err_invalid;
+
+    var written: u64 = 0;
+    var chunk: [64]u8 = undefined;
+    while (written < len) {
+        const chunk_len: usize = @intCast(@min(len - written, chunk.len));
+        state.fillRandomBytes(proc, chunk[0..chunk_len]);
+        if (!h.copy_bytes_to_user_va(proc, out_va + written, chunk[0..chunk_len])) return sc.syscall_err_invalid;
+        written += chunk_len;
+    }
+    return written;
+}
+
+pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
         sc.syscall_getpid => @intFromEnum(proc),
-        sc.syscall_gettid => @as(u64, @intCast(scheduler.currentThreadIndex())),
+        sc.syscall_gettid => @as(u64, @intCast(scheduler.currentThread())),
         sc.syscall_clock_gettime => clockGettime(h, proc, frame.rdi, frame.rsi),
         sc.syscall_nanosleep => nanosleep(h, proc, frame),
         sc.syscall_futex_wait => futexWait(h, proc, frame),
         sc.syscall_futex_wake => futexWake(proc, frame.rdi, frame.rsi),
+        sc.syscall_getrandom => getRandom(h, state, proc, frame),
         else => null,
     };
 }

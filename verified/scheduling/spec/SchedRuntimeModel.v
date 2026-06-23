@@ -37,6 +37,7 @@ Record sched_result : Type := {
 Record sched_cpu : Type := {
   sc_has_current : bool;
   sc_current_thread_id : Z;
+  sc_current_generation : Z;
 }.
 
 Record sched_state : Type := {
@@ -107,6 +108,7 @@ Definition sched_empty_cpu : sched_cpu :=
   {|
     sc_has_current := false;
     sc_current_thread_id := no_thread_id;
+    sc_current_generation := 0;
   |}.
 
 Definition sched_empty_state
@@ -175,23 +177,62 @@ Definition set_cpu_current
     (sched : sched_state)
     (cpu_id : nat)
     (thread_id : Z)
+    (generation : Z)
   : sched_state :=
   replace_cpu sched cpu_id
     {|
       sc_has_current := true;
       sc_current_thread_id := thread_id;
+      sc_current_generation := generation;
     |}.
+
+Definition cpu_current_thread
+    (sched : sched_state)
+    (cpu_id : nat)
+  : option (Z * Z) :=
+  if cpu_has_current sched cpu_id then
+    match lookup_cpu sched cpu_id with
+    | Some cpu => Some (sc_current_thread_id cpu, sc_current_generation cpu)
+    | None => None
+    end
+  else None.
 
 Definition cpu_current_thread_id
     (sched : sched_state)
     (cpu_id : nat)
   : option Z :=
-  if cpu_has_current sched cpu_id then
-    match lookup_cpu sched cpu_id with
-    | Some cpu => Some (sc_current_thread_id cpu)
-    | None => None
-    end
-  else None.
+  match cpu_current_thread sched cpu_id with
+  | Some (thread_id, _generation) => Some thread_id
+  | None => None
+  end.
+
+Definition is_running_entity
+    (entity : eevdf_entity)
+  : bool :=
+  match ee_state entity with
+  | ERunning => true
+  | _ => false
+  end.
+
+Definition current_running_thread_id
+    (sched : sched_state)
+    (cpu_id : nat)
+  : option Z :=
+  match cpu_current_thread sched cpu_id with
+  | None => None
+  | Some (thread_id, generation) =>
+      match find_entity_index (ss_runqueue sched) thread_id with
+      | None => None
+      | Some index =>
+          let entity := nth index (er_entities (ss_runqueue sched))
+            eevdf_empty_entity in
+          if andb
+            (Z.eqb (ee_generation entity) generation)
+            (is_running_entity entity)
+          then Some thread_id
+          else None
+      end
+  end.
 
 Fixpoint clear_current_if_matches_from
     (cpus : list sched_cpu)
@@ -275,11 +316,15 @@ Definition sched_on_timer
   if negb (valid_cpu sched cpu_id) then
     (sched, sched_fail SchedErrInvalid)
   else
-    match cpu_current_thread_id sched cpu_id with
+    match cpu_current_thread sched cpu_id with
     | None => (sched, sched_ok sched_no_decision)
-    | Some thread_id =>
-        sched_apply_eevdf_result sched
-          (eevdf_charge (ss_runqueue sched) thread_id runtime_ns)
+    | Some _ =>
+        match current_running_thread_id sched cpu_id with
+        | None => (clear_cpu_current sched cpu_id, sched_ok sched_no_decision)
+        | Some thread_id =>
+            sched_apply_eevdf_result sched
+              (eevdf_charge (ss_runqueue sched) thread_id runtime_ns)
+        end
     end.
 
 Definition sched_pick
@@ -302,7 +347,8 @@ Definition sched_pick
         with
         | {| eevdf_result_rc := EevdfOk; eevdf_result_rq := rq |} =>
             (set_cpu_current (with_runqueue sched_after_pick rq) cpu_id
-              (ee_thread_id entity),
+              (ee_thread_id entity)
+              (ee_generation entity),
              sched_ok (sched_run_thread_decision cpu_id entity))
         | {| eevdf_result_rc := rc |} =>
             (sched_after_pick, sched_fail (map_eevdf_rc rc))
@@ -316,14 +362,18 @@ Definition sched_finish_current
   if negb (valid_cpu sched cpu_id) then
     (sched, sched_fail SchedErrInvalid)
   else
-    match cpu_current_thread_id sched cpu_id with
+    match cpu_current_thread sched cpu_id with
     | None => (sched, sched_ok sched_no_decision)
-    | Some thread_id =>
-        match eevdf_requeue_running (ss_runqueue sched) thread_id with
-        | {| eevdf_result_rc := EevdfOk; eevdf_result_rq := rq |} =>
-            (clear_cpu_current (with_runqueue sched rq) cpu_id,
-             sched_ok sched_no_decision)
-        | {| eevdf_result_rc := rc |} =>
-            (sched, sched_fail (map_eevdf_rc rc))
+    | Some _ =>
+        match current_running_thread_id sched cpu_id with
+        | None => (clear_cpu_current sched cpu_id, sched_ok sched_no_decision)
+        | Some thread_id =>
+            match eevdf_requeue_running (ss_runqueue sched) thread_id with
+            | {| eevdf_result_rc := EevdfOk; eevdf_result_rq := rq |} =>
+                (clear_cpu_current (with_runqueue sched rq) cpu_id,
+                 sched_ok sched_no_decision)
+            | {| eevdf_result_rc := rc |} =>
+                (sched, sched_fail (map_eevdf_rc rc))
+            end
         end
     end.

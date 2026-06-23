@@ -3,7 +3,7 @@
 const std = @import("std");
 const kernel = @import("../kernel.zig");
 const elf_loader = @import("../elf_loader.zig");
-const scheduler = @import("../scheduler.zig");
+const scheduler = @import("../scheduler.zig").connection;
 const syscalls = @import("../syscalls.zig");
 const traps = @import("../traps.zig");
 const interrupts = @import("../interrupts.zig");
@@ -90,7 +90,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, scheduler.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, scheduler.staticStorageEndAddr());
     end = maxStaticEnd(end, syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
@@ -206,9 +206,9 @@ fn initFxStateSupport() void {
 
 pub export fn saveCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
-    const thread_index = scheduler.currentThreadIndex();
-    const ctx = scheduler.getThreadContext(thread_index) orelse return;
-    if (!scheduler.isThreadReady(thread_index)) return;
+    const thread_index = scheduler.currentThread();
+    const ctx = scheduler.threadContextMutable(thread_index) orelse return;
+    if (!scheduler.threadReady(thread_index)) return;
     ctx.pkru = x86_platform.readPkru();
     asm volatile ("fxsave64 (%[ptr])"
         :
@@ -218,9 +218,9 @@ pub export fn saveCurrentThreadFxState() callconv(.c) void {
 
 pub export fn restoreCurrentThreadFxState() callconv(.c) void {
     if (!kernel_state_ready) return;
-    const thread_index = scheduler.currentThreadIndex();
-    const ctx = scheduler.getThreadContext(thread_index) orelse return;
-    if (!scheduler.isThreadReady(thread_index)) return;
+    const thread_index = scheduler.currentThread();
+    const ctx = scheduler.threadContextMutable(thread_index) orelse return;
+    if (!scheduler.threadReady(thread_index)) return;
     x86_platform.writePkru(ctx.pkru);
     asm volatile ("fxrstor64 (%[ptr])"
         :
@@ -257,8 +257,10 @@ fn installInterruptTrampolines() void {
         .segment_not_present_stub = @intFromPtr(&traps.segmentNotPresentHandlerStub),
         .stack_segment_fault_stub = @intFromPtr(&traps.stackSegmentFaultHandlerStub),
         .timer_interrupt_stub = @intFromPtr(&traps.timerInterruptHandlerStub),
+        .scheduler_wake_ipi_stub = @intFromPtr(&traps.schedulerWakeIpiHandlerStub),
         .device_interrupt_stub = @intFromPtr(&traps.deviceInterruptHandlerStub),
         .lapic_timer_vector = boot_static.lapic_timer_vector,
+        .scheduler_wake_ipi_vector = boot_static.scheduler_wake_ipi_vector,
         .device_interrupt_vector = generic_device_interrupt_vector,
         .device_interrupt_vector_count = device_interrupt_vector_count,
     });
@@ -379,29 +381,12 @@ fn allocateDynamicKernelStorageOrHalt(bs: *std.os.uefi.tables.BootServices) void
     user_spaces = ptr[0..boot_static.user_process_count];
 }
 
-fn activateThreadOrHalt(thread_index: usize) void {
-    if (scheduler.activateThread(thread_index)) return;
+fn activateOrHalt(thread_index: usize) void {
+    if (scheduler.activate(thread_index)) return;
     halt.haltWithMessage("activate thread failed");
 }
 
-fn scrubMailboxSender(mailbox: *kernel.CapMailbox, sender: kernel.PrincipalId) bool {
-    var out: usize = 0;
-    var changed = false;
-    var i: usize = 0;
-    while (i < mailbox.len) : (i += 1) {
-        const item = mailbox.items[i];
-        if (item.sender == sender) {
-            changed = true;
-            continue;
-        }
-        mailbox.items[out] = item;
-        out += 1;
-    }
-    mailbox.len = out;
-    return changed;
-}
-
-fn scrubEndpointTargets(table: *kernel.EndpointCNode, target: kernel.PrincipalId) bool {
+fn scrubEndpointTargets(table: *kernel.EndpointTable, target: kernel.PrincipalId) bool {
     var out: usize = 0;
     var changed = false;
     var i: usize = 0;
@@ -419,7 +404,7 @@ fn scrubEndpointTargets(table: *kernel.EndpointCNode, target: kernel.PrincipalId
 }
 
 fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
-    if (scheduler.loadExternalSchedulerPolicyThread(out_frame)) return;
+    if (scheduler.loadPolicyThread(out_frame)) return;
     halt.haltWithMessage("external scheduler unavailable");
 }
 
@@ -427,11 +412,13 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
 
-    _ = scheduler.releaseThreadsForPrincipal(principal);
+    _ = scheduler.releasePrincipalThreads(principal);
 
+    user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
+    user_vm.unlockAddressSpaces();
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -443,19 +430,10 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
             if (removed) endpoint_targets_removed = true;
             wake_owner = removed;
         }
-        if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
-            wake_owner = true;
-        }
-        if (kernel_state_global.pending_page_transfers[storage_index]) |pending| {
-            if (pending.sender == principal) {
-                kernel_state_global.pending_page_transfers[storage_index] = null;
-                wake_owner = true;
-            }
-        }
         if (!wake_owner) continue;
         if (storage_index >= kernel.process_count) continue;
         const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
-        scheduler.wakeBlockedThreadForPrincipal(owner);
+        scheduler.wakeBlockedThread(owner);
     }
     if (endpoint_targets_removed) {
         kernel_state_global.bumpEndpointGeneration();
@@ -464,18 +442,20 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .killed, fault_vector);
     kernel_state_global.markProcessObjectsExited(principal, .killed, fault_vector);
     _ = kernel_state_global.markProcessFaulted(principal, fault_vector);
-    if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
+    if (spawn_parent) |parent| scheduler.wakeBlockedThread(parent);
 }
 
 fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
 
-    _ = scheduler.releaseThreadsForPrincipal(principal);
+    _ = scheduler.releasePrincipalThreads(principal);
 
+    user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
     kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
+    user_vm.unlockAddressSpaces();
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -487,35 +467,26 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
             if (removed) endpoint_targets_removed = true;
             wake_owner = removed;
         }
-        if (scrubMailboxSender(&kernel_state_global.cap_mailboxes[storage_index], principal)) {
-            wake_owner = true;
-        }
-        if (kernel_state_global.pending_page_transfers[storage_index]) |pending| {
-            if (pending.sender == principal) {
-                kernel_state_global.pending_page_transfers[storage_index] = null;
-                wake_owner = true;
-            }
-        }
         if (!wake_owner) continue;
         if (storage_index >= kernel.process_count) continue;
         const owner = kernel.processPrincipalFromIndex(storage_index) orelse continue;
-        scheduler.wakeBlockedThreadForPrincipal(owner);
+        scheduler.wakeBlockedThread(owner);
     }
     if (endpoint_targets_removed) {
         kernel_state_global.bumpEndpointGeneration();
     }
 
     _ = kernel_state_global.markProcessExited(principal);
-    if (spawn_parent) |parent| scheduler.wakeBlockedThreadForPrincipal(parent);
+    if (spawn_parent) |parent| scheduler.wakeBlockedThread(parent);
 }
 
 fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) void {
     kernel_log.write("USER fault principal=");
     kernel_log.write(principalLabel(principal));
     kernel_log.write(" thread=");
-    log_util.printNumber(@as(u64, @intCast(scheduler.currentThreadIndex())));
+    log_util.printNumber(@as(u64, @intCast(scheduler.currentThread())));
     kernel_log.write(" cpu=");
-    log_util.printNumber(@as(u64, @intCast(scheduler.currentCpuSlot())));
+    log_util.printNumber(@as(u64, @intCast(scheduler.currentCpu())));
     kernel_log.write(" vector=");
     log_util.printNumber(@as(u64, fault_vector));
     kernel_log.write(" rip=");
@@ -524,17 +495,23 @@ fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8
     kernel_log.writeHexRaw(out_frame.rsp);
     kernel_log.write("\n");
     teardownFaultedProcess(principal, fault_vector);
-    if (!scheduler.schedulerRunsOnCurrentCpu()) {
+    if (!scheduler.isBootstrapSchedulerCpu()) {
         smp.returnCurrentApToIdleFromInterrupt();
     }
     loadRunnableThreadOrIdle(out_frame);
 }
 
-fn exitCurrentProcess(principal: kernel.PrincipalId, exit_code: u8, out_frame: *TrapFrame) void {
+fn exitCurrentProcess(
+    principal: kernel.PrincipalId,
+    exit_code: u8,
+    out_frame: *TrapFrame,
+    before_ap_idle: ?scheduler.BeforeCurrentThreadLeaveCallback,
+) void {
     kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .exited, exit_code);
     kernel_state_global.markProcessObjectsExited(principal, .exited, exit_code);
     teardownExitedProcess(principal);
-    if (!scheduler.schedulerRunsOnCurrentCpu()) {
+    if (!scheduler.isBootstrapSchedulerCpu()) {
+        if (before_ap_idle) |callback| callback.run(callback.context);
         smp.returnCurrentApToIdleFromInterrupt();
     }
     loadRunnableThreadOrIdle(out_frame);
@@ -576,7 +553,7 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
         \\iretq
         :
         : [k_rsp] "r" (kernel_transition_rsp),
-          [ucr3] "r" (scheduler.currentUserCr3()),
+          [ucr3] "r" (scheduler.currentCr3()),
         : .{ .memory = true });
     while (true) {
         asm volatile ("hlt");
@@ -626,12 +603,13 @@ fn runBootServicesPhase() BootResources {
     const memory_stats = uefi_services.collectBootMemoryStatsOrHalt(bs, &global_free_list, user_spaces);
     uefi_services.exitBootServicesOrHalt();
     initKernelRuntimeOrHalt();
-    scheduler.initStaticStorage();
-    scheduler.installCpuIdleObserver();
+    scheduler.initializeStaticStorage();
+    scheduler.installIdleHooks();
     smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
+    smp.configureWakeIpiVector(boot_static.scheduler_wake_ipi_vector);
     smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
-    scheduler.refreshCpuTopology();
+    scheduler.refreshTopology();
 
     return .{
         .framebuffer_info = framebuffer_info,
@@ -732,20 +710,22 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         "scheduler policy ELF load failed\n",
         &global_free_list,
     );
-    const scheduler_thread = scheduler.threadSlotForPrincipal(scheduler_principal).?;
-    const scheduler_ctx = scheduler.getThreadContext(scheduler_thread).?;
-    if (scheduler.isThreadReady(scheduler_thread)) {
+    const scheduler_thread = scheduler.threadForPrincipal(scheduler_principal).?;
+    const scheduler_ctx = scheduler.threadContextMutable(scheduler_thread).?;
+    if (scheduler.threadReady(scheduler_thread)) {
         scheduler_ctx.frame.rip = loaded_scheduler.entry;
         scheduler_ctx.frame.rsp = process_factory.installInitialUserStackOrHalt(
+            state,
+            scheduler_principal,
             scheduler_process.user_stack_page.paddr,
             loaded_scheduler,
             "schedulerd",
         );
     }
-    if (!scheduler.installExternalSchedulerPolicyThread(scheduler_thread)) {
+    if (!scheduler.attachPolicyThread(scheduler_thread)) {
         halt.haltWithMessage("external scheduler policy install failed");
     }
-    activateThreadOrHalt(scheduler_thread);
+    activateOrHalt(scheduler_thread);
 
     const init_principal = state.createProcessDescriptor("seed2_boot") orelse
         halt.haltWithMessage("seed2_boot process descriptor alloc failed");
@@ -781,15 +761,17 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         "init ELF load failed\n",
         &global_free_list,
     );
-    const init_thread = scheduler.threadSlotForPrincipal(init_principal).?;
-    const init_ctx = scheduler.getThreadContext(init_thread).?;
+    const init_thread = scheduler.threadForPrincipal(init_principal).?;
+    const init_ctx = scheduler.threadContextMutable(init_thread).?;
     init_ctx.frame.rip = loaded_init.entry;
     init_ctx.frame.rsp = process_factory.installInitialUserStackOrHalt(
+        state,
+        init_principal,
         init_process.user_stack_page.paddr,
         loaded_init,
         "init",
     );
-    scheduler.notifyExternalThreadReady(init_thread);
+    scheduler.publishThreadReady(init_thread);
 
     kernel_state_ready = true;
 }
@@ -812,11 +794,11 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .write_user_u64 = user_copy.writeUserU64,
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
-        .wake_waiting_thread_for_principal = scheduler.wakeWaitingThreadForPrincipal,
-        .wake_blocked_thread_for_principal = scheduler.wakeBlockedThreadForPrincipal,
-        .consume_pending_signal_for_principal = scheduler.consumePendingSignalForPrincipal,
-        .switch_to_thread = scheduler.switchToThread,
-        .block_current_thread_for_event = scheduler.blockCurrentThreadForEvent,
+        .wake_waiting_thread_for_principal = scheduler.wakeMailboxWaiter,
+        .wake_blocked_thread_for_principal = scheduler.wakeBlockedThread,
+        .consume_pending_signal_for_principal = scheduler.consumeSignal,
+        .switch_to_thread = scheduler.switchTo,
+        .block_current_thread_for_event = scheduler.blockCurrentThread,
         .exit_current_process = exitCurrentProcess,
         .total_usable_memory_bytes = memory_stats.total_usable_bytes,
     });
@@ -836,7 +818,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .log_page_fault_step2 = page_fault_log.logStep2,
         .halt_loop = halt.haltLoop,
         .resume_after_fatal_user_exception = resumeAfterFatalUserException,
-        .switch_to_thread = scheduler.switchToThread,
+        .switch_to_thread = scheduler.switchTo,
     });
 }
 
@@ -858,7 +840,7 @@ pub fn kernelMain() void {
     constructBootProcesses(state, resources, &devices);
     wireRuntimeSubsystems(state, resources.memory_stats);
 
-    const boot_ctx = scheduler.getThreadContextConst(scheduler.currentThreadIndex()).?;
+    const boot_ctx = scheduler.threadContext(scheduler.currentThread()).?;
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
 }
 

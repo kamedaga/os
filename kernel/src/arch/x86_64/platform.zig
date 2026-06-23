@@ -65,8 +65,10 @@ pub const TrapTargets = struct {
     segment_not_present_stub: usize,
     stack_segment_fault_stub: usize,
     timer_interrupt_stub: usize,
+    scheduler_wake_ipi_stub: usize,
     device_interrupt_stub: usize,
     lapic_timer_vector: u8,
+    scheduler_wake_ipi_vector: u8,
     device_interrupt_vector: u8,
     device_interrupt_vector_count: u8,
 };
@@ -458,6 +460,7 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     interrupts.setIdtEntryWithIst(&idt, 8, gdt_kernel_code_selector, df_trampoline_entry, 2, 0x8E);
     interrupts.setIdtEntry(&idt, 0x20, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, targets.lapic_timer_vector, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
+    interrupts.setIdtEntry(&idt, targets.scheduler_wake_ipi_vector, gdt_kernel_code_selector, targets.scheduler_wake_ipi_stub, 0x8E);
     var device_vector_index: u16 = 0;
     while (device_vector_index < targets.device_interrupt_vector_count) : (device_vector_index += 1) {
         const vector: usize = @as(usize, targets.device_interrupt_vector) + @as(usize, device_vector_index);
@@ -487,6 +490,16 @@ pub fn readCr3() u64 {
         : [out] "=r" (value),
     );
     return value;
+}
+
+pub fn readTimestampCounter() u64 {
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | @as(u64, lo);
 }
 
 pub fn invlpg(addr: u64) void {

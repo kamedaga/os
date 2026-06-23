@@ -19,15 +19,11 @@ static int is_fd(int fd) {
 }
 
 static void print_info(const struct pacha_capsule_info *info) {
-    printf("fd=%" PRIu64 " parent-fd=%" PRIu64 "\n", info->fd, info->parent_fd);
-    printf("kind=%" PRIu64 " state=%" PRIu64 " rights=0x%016" PRIx64 "\n",
+    printf("fd=%" PRIu64 "\n", info->fd);
+    printf("kind=%" PRIu64 " rights=0x%016" PRIx64 "\n",
         info->kind,
-        info->state,
         info->rights);
-    printf("owner=%" PRIu64 " generation=%" PRIu64 " revoke-generation=%" PRIu64 "\n",
-        info->owner,
-        info->generation,
-        info->revoke_generation);
+    printf("owner=%" PRIu64 "\n", info->owner);
     printf("device=0x%016" PRIx64 " object=%" PRIu64 " user-va=0x%016" PRIx64 "\n",
         info->device,
         info->object_id,

@@ -74,14 +74,17 @@ static int cpu_has_current(const pacha_sched_state *sched, size_t cpu_id) {
 static void clear_cpu_current(pacha_sched_cpu *cpu) {
   cpu->has_current = 0;
   cpu->current_thread_id = PACHA_EEVDF_NO_THREAD_ID;
+  cpu->current_generation = 0;
   return;
 }
 
 static void set_cpu_current(
     pacha_sched_cpu *cpu,
-    int64_t thread_id) {
+    int64_t thread_id,
+    int64_t generation) {
   cpu->has_current = 1;
   cpu->current_thread_id = thread_id;
+  cpu->current_generation = generation;
   return;
 }
 
@@ -96,6 +99,25 @@ static void clear_current_if_matches(
   }
 }
 
+static int current_entity_index(
+    const pacha_sched_state *sched,
+    const pacha_sched_cpu *cpu,
+    size_t *index_out) {
+  if (!sched_cpu_has_current(cpu)) {
+    return 0;
+  }
+  for (size_t i = 0; i < sched->runqueue.entity_count; ++i) {
+    const pacha_eevdf_entity *entity = sched->runqueue.entities + i;
+    if (entity->thread_id == cpu->current_thread_id &&
+        entity->generation == cpu->current_generation &&
+        entity->state == PACHA_EEVDF_RUNNING) {
+      *index_out = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 void pacha_sched_empty_state(size_t cpu_count, pacha_sched_state *out) {
   pacha_eevdf_empty_runqueue(&out->runqueue);
   out->cpu_count = cpu_count;
@@ -105,6 +127,7 @@ void pacha_sched_empty_state(size_t cpu_count, pacha_sched_state *out) {
   for (size_t i = 0; i < PACHA_SCHED_MAX_CPUS; ++i) {
     out->cpus[i].has_current = 0;
     out->cpus[i].current_thread_id = PACHA_EEVDF_NO_THREAD_ID;
+    out->cpus[i].current_generation = 0;
   }
   return;
 }
@@ -176,8 +199,14 @@ static pacha_sched_rc on_timer_valid(
     size_t cpu_id,
     int64_t runtime_ns,
     pacha_eevdf_runqueue *scratch) {
-  if (sched->cpus[cpu_id].has_current) {
-    int64_t thread_id = sched->cpus[cpu_id].current_thread_id;
+  pacha_sched_cpu *cpu = sched_cpu_ptr(sched, cpu_id);
+  if (sched_cpu_has_current(cpu)) {
+    size_t current_index = 0;
+    if (!current_entity_index(sched, cpu, &current_index)) {
+      clear_cpu_current(cpu);
+      return PACHA_SCHED_OK;
+    }
+    int64_t thread_id = sched->runqueue.entities[current_index].thread_id;
     pacha_eevdf_rc rc =
         pacha_eevdf_charge(&sched->runqueue, thread_id, runtime_ns, scratch);
     if (rc != PACHA_EEVDF_OK) {
@@ -236,7 +265,10 @@ pacha_sched_rc pacha_sched_pick(
     return map_eevdf_rc(mark);
   }
   pacha_eevdf_copy_runqueue(scratch, &sched->runqueue);
-  set_cpu_current(&sched->cpus[cpu_id], pick_scratch->entity.thread_id);
+  set_cpu_current(
+      &sched->cpus[cpu_id],
+      pick_scratch->entity.thread_id,
+      pick_scratch->entity.generation);
   run_thread_decision(cpu_id, &pick_scratch->entity, decision_out);
   return PACHA_SCHED_OK;
 }
@@ -247,7 +279,12 @@ static pacha_sched_rc finish_current_valid(
     pacha_eevdf_runqueue *scratch) {
   pacha_sched_cpu *cpu = sched_cpu_ptr(sched, cpu_id);
   if (sched_cpu_has_current(cpu)) {
-    int64_t thread_id = cpu->current_thread_id;
+    size_t current_index = 0;
+    if (!current_entity_index(sched, cpu, &current_index)) {
+      clear_cpu_current(cpu);
+      return PACHA_SCHED_OK;
+    }
+    int64_t thread_id = sched->runqueue.entities[current_index].thread_id;
     pacha_eevdf_rc rc =
         pacha_eevdf_requeue_running(&sched->runqueue, thread_id, scratch);
     if (rc != PACHA_EEVDF_OK) {

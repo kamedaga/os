@@ -5,7 +5,7 @@ const kernel = @import("../kernel.zig");
 const boot_static = @import("main_static.zig");
 const elf_loader = @import("../elf_loader.zig");
 const user_vm = @import("../memory/user_vm.zig");
-const scheduler = @import("../scheduler.zig");
+const scheduler = @import("../scheduler.zig").connection;
 const interrupts = @import("../interrupts.zig");
 const halt = @import("../halt.zig");
 const log_util = @import("../log_util.zig");
@@ -76,7 +76,13 @@ fn pushStackBytes(stack: []u8, cursor: *usize, bytes: []const u8) u64 {
     return stackVaFromOffset(cursor.*);
 }
 
-pub fn installInitialUserStackOrHalt(user_stack_paddr: u64, loaded: elf_loader.Image, argv0: []const u8) u64 {
+pub fn installInitialUserStackOrHalt(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    user_stack_paddr: u64,
+    loaded: elf_loader.Image,
+    argv0: []const u8,
+) u64 {
     if ((user_stack_paddr & 0xFFF) != 0) halt.haltWithMessage("initial user stack paddr unaligned");
     if (argv0.len == 0 or argv0.len >= 128) halt.haltWithMessage("initial user argv0 invalid");
 
@@ -86,6 +92,7 @@ pub fn installInitialUserStackOrHalt(user_stack_paddr: u64, loaded: elf_loader.I
 
     var cursor: usize = user_stack_bytes;
     var random_seed = [_]u8{0} ** 16;
+    state.fillRandomBytes(principal, random_seed[0..]);
     const random_va = pushStackBytes(stack, &cursor, random_seed[0..]);
     cursor &= ~@as(usize, 15);
 
@@ -137,8 +144,8 @@ pub fn installInitialUserStackOrHalt(user_stack_paddr: u64, loaded: elf_loader.I
 }
 
 fn releaseStaleThreadSlot(principal: kernel.PrincipalId) void {
-    if (scheduler.threadSlotForPrincipal(principal)) |thread_slot| {
-        _ = scheduler.releaseThreadSlot(thread_slot);
+    if (scheduler.threadForPrincipal(principal)) |thread_slot| {
+        _ = scheduler.releaseThread(thread_slot);
     }
 }
 
@@ -153,6 +160,32 @@ pub fn buildUserAddressSpaceFromPages(
 ) bool {
     if ((user_page.paddr & 0xFFF) != 0 or (user_stack_page.paddr & 0xFFF) != 0) return false;
     return user_vm.buildUserAddressSpace(principal, user_page.paddr, user_stack_page.paddr);
+}
+
+fn mapAdditionalInitialStackPagesOrHalt(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    role_label: []const u8,
+    free_list: *kernel.FreePageList,
+) void {
+    var page_index: usize = 1;
+    while (page_index < boot_static.initial_user_stack_pages) : (page_index += 1) {
+        const page = state.allocLowPhysicalPage(free_list) catch |err| {
+            log_util.logIndexedError("allocLowPhysicalPage for initial stack failed idx=", page_index, err);
+            halt.haltWithRolePageError(role_label, "user stack", "alloc lower stack page", err);
+        };
+        const va_start = boot_static.user_stack_page_va - (@as(u64, @intCast(page_index)) * 4096);
+        mapUserPageOrHalt(
+            state,
+            principal,
+            va_start,
+            page,
+            true,
+            role_label,
+            "user stack",
+            free_list,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +217,8 @@ pub fn tryCreateUserProcess(
     }
     trackMappedNativePageOrHalt(state, principal, boot_static.user_va, user_page, true, true, role_label, "user map", free_list);
     trackMappedNativePageOrHalt(state, principal, boot_static.user_stack_page_va, user_stack_page, true, false, role_label, "user stack", free_list);
-    const thread_slot = scheduler.allocateThreadSlot(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
+    mapAdditionalInitialStackPagesOrHalt(state, principal, role_label, free_list);
+    const thread_slot = scheduler.allocateReadyThread(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
         log_util.logLabelMessage(role_label, " thread context init failed");
         return error.CreateFailed;
     };
@@ -232,7 +266,7 @@ pub fn tryCreateSuspendedUserProcess(
         _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     }
-    const thread_slot = scheduler.allocateSuspendedThreadSlot(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
+    const thread_slot = scheduler.allocateSuspendedThread(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
         _ = state.removeProcessDescriptor(principal);
         return error.CreateFailed;
     };

@@ -41,7 +41,17 @@ func WriteExt4WithProgress(disk *os.File, region PartitionRegion, manifest Manif
 		return WriteResult{}, err
 	}
 
-	if err := runExt4Tool("mkfs.ext4", "-q", "-F", "-m", "0", "-L", "pacha-rootfs", imagePath); err != nil {
+	if err := runExt4Tool(
+		"mkfs.ext4",
+		"-q",
+		"-F",
+		"-m", "0",
+		"-b", "4096",
+		"-O", "^64bit,^metadata_csum,^metadata_csum_seed,^orphan_file",
+		"-E", "lazy_itable_init=0,lazy_journal_init=0",
+		"-L", "pacha-rootfs",
+		imagePath,
+	); err != nil {
 		return WriteResult{}, err
 	}
 

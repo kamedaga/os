@@ -320,8 +320,10 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
     sp &= ~15ull;
     sp -= 16;
     const uint64_t random_va = stack_base + sp;
-    for (unsigned i = 0; i < 16; i++) {
-        stack[sp + i] = (unsigned char)(0x51u + i * 13u);
+    if (pacha_getrandom(stack + sp, 16, 0) != 16) {
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_fd_close(stack_fd);
+        return -5;
     }
     sp &= ~15ull;
 

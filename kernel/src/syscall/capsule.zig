@@ -189,10 +189,7 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
     const kind = capsuleKindForPayload(view.payload) orelse return sc.syscall_err_invalid;
     var words: [capsule_abi.snapshot_word_count]u64 = [_]u64{0} ** capsule_abi.snapshot_word_count;
     words[capsule_abi.snapshot_fd_index] = fd;
-    words[capsule_abi.snapshot_root_fd_index] = fd;
-    words[capsule_abi.snapshot_parent_fd_index] = 0;
     words[capsule_abi.snapshot_kind_index] = @intFromEnum(kind);
-    words[capsule_abi.snapshot_state_index] = @intFromEnum(capsule_abi.CapsuleState.active);
     words[capsule_abi.snapshot_rights_index] = kernel.fdRightsToBits(view.rights);
     words[capsule_abi.snapshot_owner_index] = @intFromEnum(proc);
     switch (view.payload.*) {

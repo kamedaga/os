@@ -5,7 +5,8 @@ pub const syscall_clock_gettime: u64 = 16;
 pub const syscall_nanosleep: u64 = 17;
 pub const syscall_futex_wait: u64 = 18;
 pub const syscall_futex_wake: u64 = 19;
-pub const syscall_runtime_last: u64 = syscall_futex_wake;
+pub const syscall_getrandom: u64 = 20;
+pub const syscall_runtime_last: u64 = syscall_getrandom;
 pub const syscall_runtime_count: u64 = syscall_runtime_last - syscall_runtime_first + 1;
 
 pub const clock_realtime: u64 = 0;
@@ -30,6 +31,7 @@ test "runtime syscall range is contiguous" {
         syscall_nanosleep,
         syscall_futex_wait,
         syscall_futex_wake,
+        syscall_getrandom,
     };
     try std.testing.expectEqual(@as(usize, syscall_runtime_count), expected.len);
     for (expected, 0..) |nr, offset| {

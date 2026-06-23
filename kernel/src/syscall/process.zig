@@ -2,7 +2,7 @@ const std = @import("std");
 const abi_root = @import("kernel_abi_root");
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
-const scheduler = @import("../scheduler.zig");
+const scheduler = @import("../scheduler.zig").connection;
 const user_vm = @import("../memory/user_vm.zig");
 const boot_static = @import("../boot/main_static.zig");
 const kernel_log = @import("../kernel_log.zig");
@@ -70,18 +70,20 @@ fn writeThreadStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, thread: 
 fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
     const index: usize = @intCast(thread.thread_index);
     const owner: kernel.PrincipalId = @enumFromInt(thread.owner_principal_raw);
-    const generation = scheduler.threadGeneration(index) orelse return false;
-    return generation == thread.thread_generation and scheduler.threadBelongsToPrincipal(index, owner);
+    const generation = scheduler.generationOfThread(index) orelse return false;
+    return generation == thread.thread_generation and scheduler.threadOwnedBy(index, owner);
 }
 
 fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId, exit_state: kernel.TaskObjectState, exit_code: u32) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     state.markThreadObjectsExitedForPrincipal(principal, exit_state, exit_code);
     state.markProcessObjectsExited(principal, exit_state, exit_code);
-    _ = scheduler.releaseThreadsForPrincipal(principal);
+    _ = scheduler.releasePrincipalThreads(principal);
+    user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
     state.releasePrincipalNativeMemory(principal, h.free_list);
     state.resetProcessRuntimeTables(process_index);
+    user_vm.unlockAddressSpaces();
     _ = state.unpublishServiceEndpointsForTarget(principal);
     _ = state.markProcessExited(principal);
 }
@@ -120,13 +122,13 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
     if (process.state != .active) return sc.syscall_err_invalid;
     const owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
     if (!state.hasActivePrincipal(owner)) return sc.syscall_err_invalid;
-    const thread_index = scheduler.allocateSuspendedThreadSlot(owner, h.user_spaces, buildUserTrapFrame(frame.rsi, frame.rdx), h.free_list) orelse return sc.syscall_err_alloc;
-    if (!scheduler.setThreadFsBase(thread_index, frame.r8)) {
-        _ = scheduler.releaseThreadSlot(thread_index);
+    const thread_index = scheduler.allocateSuspendedThread(owner, h.user_spaces, buildUserTrapFrame(frame.rsi, frame.rdx), h.free_list) orelse return sc.syscall_err_alloc;
+    if (!scheduler.setFsBase(thread_index, frame.r8)) {
+        _ = scheduler.releaseThread(thread_index);
         return sc.syscall_err_invalid;
     }
-    const generation = scheduler.threadGeneration(thread_index) orelse {
-        _ = scheduler.releaseThreadSlot(thread_index);
+    const generation = scheduler.generationOfThread(thread_index) orelse {
+        _ = scheduler.releaseThread(thread_index);
         return sc.syscall_err_invalid;
     };
     const rights = kernel.fdRightsFromBits(frame.r9);
@@ -137,7 +139,7 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         .state = .active,
         .exit_code = 0,
     }, rights, .{}, first_dynamic_fd) catch |err| {
-        _ = scheduler.releaseThreadSlot(thread_index);
+        _ = scheduler.releaseThread(thread_index);
         return switch (err) {
             kernel.KernelError.TableFull => sc.syscall_err_alloc,
             else => sc.syscall_err_invalid,
@@ -148,14 +150,14 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
 fn startThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) u64 {
     const thread = state.threadObjectForFd(proc, fd, .{ .start = true }) orelse return sc.syscall_err_invalid;
     if (thread.state != .active or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
-    if (!scheduler.setThreadReady(@intCast(thread.thread_index), true)) return sc.syscall_err_invalid;
+    if (!scheduler.markThreadReady(@intCast(thread.thread_index), true)) return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
 
 fn killThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
     const thread = state.setThreadObjectStateForFd(proc, fd, .{ .kill = true }, .killed, code) catch return sc.syscall_err_invalid;
     if (threadObjectIsLive(thread)) {
-        _ = scheduler.releaseThreadSlot(@intCast(thread.thread_index));
+        _ = scheduler.releaseThread(@intCast(thread.thread_index));
     }
     return sc.syscall_ok;
 }
@@ -219,10 +221,11 @@ fn mapIntoProcess(
         kernel_log.write("process.map failed inactive-target\n");
         return sc.syscall_err_invalid;
     }
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
     if (target_va == 0) {
-        state.aslr_sequence +%= 1;
-        const seed = state.aslr_sequence ^ scheduler.lapic_tick_count ^ (@as(u64, process_fd) << 32) ^ @as(u64, vmo_fd);
-        target_va = state.findFreeUserMapVa(target_owner, aligned_size, seed) catch |err| switch (err) {
+        const purpose = 0x5052_4f43_4d41_5000 ^ scheduler.lapic_tick_count ^ (@as(u64, process_fd) << 32) ^ @as(u64, vmo_fd);
+        target_va = state.findRandomizedFreeUserMapVa(target_owner, aligned_size, purpose) catch |err| switch (err) {
             kernel.KernelError.TableFull => {
                 kernel_log.write("process.map failed aslr-full\n");
                 return sc.syscall_err_alloc;
@@ -276,19 +279,19 @@ fn mapIntoProcess(
 }
 
 fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame, code: u32) u64 {
-    const current = scheduler.currentThreadIndex();
-    const generation = scheduler.threadGeneration(current) orelse {
-        h.exit_current_process(proc, @truncate(code), frame);
+    const current = scheduler.currentThread();
+    const generation = scheduler.generationOfThread(current) orelse {
+        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
         return sc.syscall_ok;
     };
     state.markThreadObjectsExitedBySlot(current, generation, .exited, code);
-    if (scheduler.liveThreadCountForPrincipal(proc) <= 1) {
+    if (scheduler.liveThreadCount(proc) <= 1) {
         state.markProcessObjectsExited(proc, .exited, code);
-        h.exit_current_process(proc, @truncate(code), frame);
+        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
         return sc.syscall_ok;
     }
-    if (!scheduler.exitCurrentThreadToExternalScheduler(frame, sc.syscall_ok)) {
-        h.exit_current_process(proc, @truncate(code), frame);
+    if (!scheduler.exitCurrentThread(frame, sc.syscall_ok, h.before_current_thread_leave)) {
+        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
     }
     return sc.syscall_ok;
 }
@@ -300,7 +303,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             const process = state.setProcessObjectStateForFd(proc, @intCast(frame.rdi), .{ .kill = true }, .killed, @truncate(frame.rsi)) catch break :blk sc.syscall_err_invalid;
             const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
             if (target == proc) {
-                h.exit_current_process(proc, @truncate(frame.rsi), frame);
+                h.exit_current_process(proc, @truncate(frame.rsi), frame, h.before_current_thread_leave);
             } else {
                 cleanupProcess(h, state, target, .killed, @truncate(frame.rsi));
             }
@@ -310,7 +313,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_process_exit => blk: {
             state.markProcessObjectsExited(proc, .exited, @truncate(frame.rdi));
             state.markThreadObjectsExitedForPrincipal(proc, .exited, @truncate(frame.rdi));
-            h.exit_current_process(proc, @truncate(frame.rdi), frame);
+            h.exit_current_process(proc, @truncate(frame.rdi), frame, h.before_current_thread_leave);
             break :blk sc.syscall_ok;
         },
         sc.syscall_thread_create => createThread(h, state, proc, frame),
@@ -321,13 +324,13 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_thread_set_fs_base => blk: {
             const fs_base = frame.rdi;
             if (fs_base != 0 and !user_vm.isUserCanonicalVa(fs_base)) break :blk sc.syscall_err_invalid;
-            if (!scheduler.setThreadFsBase(scheduler.currentThreadIndex(), fs_base)) break :blk sc.syscall_err_not_ready;
+            if (!scheduler.setFsBase(scheduler.currentThread(), fs_base)) break :blk sc.syscall_err_not_ready;
             break :blk sc.syscall_ok;
         },
         sc.syscall_thread_set_gs_base => blk: {
             const gs_base = frame.rdi;
             if (gs_base != 0 and !user_vm.isUserCanonicalVa(gs_base)) break :blk sc.syscall_err_invalid;
-            if (!scheduler.setCurrentThreadGsBase(gs_base)) break :blk sc.syscall_err_not_ready;
+            if (!scheduler.setCurrentGsBase(gs_base)) break :blk sc.syscall_err_not_ready;
             break :blk sc.syscall_ok;
         },
         sc.syscall_process_map => mapIntoProcess(state, proc, h.free_list, frame),

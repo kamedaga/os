@@ -141,7 +141,8 @@ Module SchedClight.
       (cpu : sched_cpu)
     : reptype t_sched_cpu :=
     (v_bool (sc_has_current cpu),
-     v_i64 (sc_current_thread_id cpu)).
+     (v_i64 (sc_current_thread_id cpu),
+      v_i64 (sc_current_generation cpu))).
 
   Definition sched_decision_data
       (decision : sched_decision)
@@ -232,7 +233,10 @@ Module SchedClight.
       (v_bool (sc_has_current cpu)) ptr *
     field_at sh t_sched_cpu
       [StructField C._current_thread_id]
-      (v_i64 (sc_current_thread_id cpu)) ptr.
+      (v_i64 (sc_current_thread_id cpu)) ptr *
+    field_at sh t_sched_cpu
+      [StructField C._current_generation]
+      (v_i64 (sc_current_generation cpu)) ptr.
 
   Definition sched_cpu_array_element_field_rep
       (sh : share)
@@ -249,7 +253,12 @@ Module SchedClight.
       [StructField C._current_thread_id;
        ArraySubsc (Z.of_nat cpu_id);
        StructField C._cpus]
-      (v_i64 (sc_current_thread_id cpu)) sched_ptr.
+      (v_i64 (sc_current_thread_id cpu)) sched_ptr *
+    field_at sh t_sched_state
+      [StructField C._current_generation;
+       ArraySubsc (Z.of_nat cpu_id);
+       StructField C._cpus]
+      (v_i64 (sc_current_generation cpu)) sched_ptr.
 
   Definition sched_cpu_array_element_rep
       (sh : share)

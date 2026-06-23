@@ -26,6 +26,20 @@ static void test_reset_and_add(void) {
   assert(rc == PACHA_EEVDF_ERR_INVALID);
   assert(duplicate.entity_count == next.entity_count);
 
+  pacha_eevdf_runqueue exited;
+  rc = pacha_eevdf_exit(&next, 42, &exited);
+  assert(rc == PACHA_EEVDF_OK);
+
+  pacha_eevdf_runqueue reused;
+  rc = pacha_eevdf_add(&exited, 42, 8, 2048, 1000000, &reused);
+  assert(rc == PACHA_EEVDF_OK);
+  assert(reused.entity_count == 1);
+  assert(reused.runnable_count == 1);
+  assert(reused.entities[0].thread_id == 42);
+  assert(reused.entities[0].generation == 8);
+  assert(reused.entities[0].weight == 2048);
+  assert(reused.entities[0].slice_ns == 1000000);
+
   pacha_eevdf_runqueue reset;
   rc = pacha_eevdf_reset(&next, &reset);
   assert(rc == PACHA_EEVDF_OK);

@@ -333,7 +333,25 @@ pacha_eevdf_rc pacha_eevdf_add(
     return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   if (find_entity_index(rq, thread_id, &existing)) {
-    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
+    if (rq->entities[existing].state != PACHA_EEVDF_EXITED) {
+      return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
+    }
+    pacha_eevdf_empty_entity(&entity);
+    entity.thread_id = thread_id;
+    entity.generation = generation;
+    entity.weight = weight;
+    entity.slice_ns = slice_ns;
+    entity.vruntime = rq->min_vruntime;
+    entity.eligible_time = rq->min_vruntime;
+    entity.deadline = rq->min_vruntime;
+    entity.state = PACHA_EEVDF_RUNNABLE;
+    if (!refresh_deadline(&entity, rq->min_vruntime, &refreshed)) {
+      return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
+    }
+    pacha_eevdf_runqueue next = *rq;
+    next.entities[existing] = refreshed;
+    refresh_runqueue(&next);
+    return ok_runqueue(&next, out);
   }
   if (rq->entity_count >= PACHA_EEVDF_MAX_ENTITIES) {
     return fail_runqueue(PACHA_EEVDF_ERR_FULL, rq, out);

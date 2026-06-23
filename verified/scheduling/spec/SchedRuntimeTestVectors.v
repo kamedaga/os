@@ -34,6 +34,15 @@ Proof.
   reflexivity.
 Qed.
 
+Example tv_sched_pick_marks_cpu_generation :
+  sc_current_generation
+    (nth 0 (ss_cpus (fst tv_sched_pick_result)) sched_empty_cpu) =
+  1.
+Proof.
+  vm_compute.
+  reflexivity.
+Qed.
+
 Example tv_sched_pick_reduces_runnable_count :
   er_runnable_count (ss_runqueue (fst tv_sched_pick_result)) = 1%nat.
 Proof.

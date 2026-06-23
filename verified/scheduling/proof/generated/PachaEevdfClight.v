@@ -126,6 +126,7 @@ Definition _live_for_min : ident := $"live_for_min".
 Definition _main : ident := $"main".
 Definition _min_vruntime : ident := $"min_vruntime".
 Definition _next : ident := $"next".
+Definition _next__1 : ident := $"next__1".
 Definition _next_time : ident := $"next_time".
 Definition _ok_runqueue : ident := $"ok_runqueue".
 Definition _out : ident := $"out".
@@ -190,6 +191,12 @@ Definition _t'2 : ident := 129%positive.
 Definition _t'20 : ident := 147%positive.
 Definition _t'21 : ident := 148%positive.
 Definition _t'22 : ident := 149%positive.
+Definition _t'23 : ident := 150%positive.
+Definition _t'24 : ident := 151%positive.
+Definition _t'25 : ident := 152%positive.
+Definition _t'26 : ident := 153%positive.
+Definition _t'27 : ident := 154%positive.
+Definition _t'28 : ident := 155%positive.
 Definition _t'3 : ident := 130%positive.
 Definition _t'4 : ident := 131%positive.
 Definition _t'5 : ident := 132%positive.
@@ -1672,13 +1679,18 @@ Definition f_pacha_eevdf_add := {|
   fn_vars := ((_existing, tulong) ::
               (_entity, (Tstruct _pacha_eevdf_entity noattr)) ::
               (_refreshed, (Tstruct _pacha_eevdf_entity noattr)) ::
-              (_next, (Tstruct _pacha_eevdf_runqueue noattr)) :: nil);
-  fn_temps := ((_t'11, tint) :: (_t'10, tint) :: (_t'9, tint) ::
+              (_next, (Tstruct _pacha_eevdf_runqueue noattr)) ::
+              (_next__1, (Tstruct _pacha_eevdf_runqueue noattr)) :: nil);
+  fn_temps := ((_t'14, tint) :: (_t'13, tint) :: (_t'12, tint) ::
+               (_t'11, tint) :: (_t'10, tint) :: (_t'9, tint) ::
                (_t'8, tint) :: (_t'7, tint) :: (_t'6, tint) ::
                (_t'5, tint) :: (_t'4, tint) :: (_t'3, tint) ::
-               (_t'2, tint) :: (_t'1, tint) :: (_t'18, tulong) ::
-               (_t'17, tlong) :: (_t'16, tlong) :: (_t'15, tlong) ::
-               (_t'14, tlong) :: (_t'13, tulong) :: (_t'12, tulong) :: nil);
+               (_t'2, tint) :: (_t'1, tint) :: (_t'28, tint) ::
+               (_t'27, tulong) :: (_t'26, tlong) :: (_t'25, tlong) ::
+               (_t'24, tlong) :: (_t'23, tlong) :: (_t'22, tulong) ::
+               (_t'21, tulong) :: (_t'20, tlong) :: (_t'19, tlong) ::
+               (_t'18, tlong) :: (_t'17, tlong) :: (_t'16, tulong) ::
+               (_t'15, tulong) :: nil);
   fn_body :=
 (Ssequence
   (Ssequence
@@ -1716,7 +1728,7 @@ Definition f_pacha_eevdf_add := {|
       Sskip))
   (Ssequence
     (Ssequence
-      (Scall (Some _t'7)
+      (Scall (Some _t'10)
         (Evar _find_entity_index (Tfunction
                                    ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
                                     tlong :: (tptr tulong) :: nil) tint
@@ -1724,31 +1736,199 @@ Definition f_pacha_eevdf_add := {|
         ((Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
          (Etempvar _thread_id tlong) ::
          (Eaddrof (Evar _existing tulong) (tptr tulong)) :: nil))
-      (Sifthenelse (Etempvar _t'7 tint)
+      (Sifthenelse (Etempvar _t'10 tint)
         (Ssequence
-          (Scall (Some _t'6)
-            (Evar _fail_runqueue (Tfunction
-                                   (tint ::
-                                    (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                    (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                    nil) tint cc_default))
-            ((Econst_int (Int.repr 1) tint) ::
-             (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-             (Etempvar _out (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-             nil))
-          (Sreturn (Some (Etempvar _t'6 tint))))
+          (Ssequence
+            (Sset _t'27 (Evar _existing tulong))
+            (Ssequence
+              (Sset _t'28
+                (Efield
+                  (Ederef
+                    (Ebinop Oadd
+                      (Efield
+                        (Ederef
+                          (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
+                          (Tstruct _pacha_eevdf_runqueue noattr)) _entities
+                        (tarray (Tstruct _pacha_eevdf_entity noattr) 256))
+                      (Etempvar _t'27 tulong)
+                      (tptr (Tstruct _pacha_eevdf_entity noattr)))
+                    (Tstruct _pacha_eevdf_entity noattr)) _state tint))
+              (Sifthenelse (Ebinop One (Etempvar _t'28 tint)
+                             (Econst_int (Int.repr 4) tint) tint)
+                (Ssequence
+                  (Scall (Some _t'6)
+                    (Evar _fail_runqueue (Tfunction
+                                           (tint ::
+                                            (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                            (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                            nil) tint cc_default))
+                    ((Econst_int (Int.repr 1) tint) ::
+                     (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                     (Etempvar _out (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                     nil))
+                  (Sreturn (Some (Etempvar _t'6 tint))))
+                Sskip)))
+          (Ssequence
+            (Scall None
+              (Evar _pacha_eevdf_empty_entity (Tfunction
+                                                ((tptr (Tstruct _pacha_eevdf_entity noattr)) ::
+                                                 nil) tvoid cc_default))
+              ((Eaddrof (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                 (tptr (Tstruct _pacha_eevdf_entity noattr))) :: nil))
+            (Ssequence
+              (Sassign
+                (Efield (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                  _thread_id tlong) (Etempvar _thread_id tlong))
+              (Ssequence
+                (Sassign
+                  (Efield (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                    _generation tlong) (Etempvar _generation tlong))
+                (Ssequence
+                  (Sassign
+                    (Efield
+                      (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                      _weight tlong) (Etempvar _weight tlong))
+                  (Ssequence
+                    (Sassign
+                      (Efield
+                        (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                        _slice_ns tlong) (Etempvar _slice_ns tlong))
+                    (Ssequence
+                      (Ssequence
+                        (Sset _t'26
+                          (Efield
+                            (Ederef
+                              (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
+                              (Tstruct _pacha_eevdf_runqueue noattr))
+                            _min_vruntime tlong))
+                        (Sassign
+                          (Efield
+                            (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                            _vruntime tlong) (Etempvar _t'26 tlong)))
+                      (Ssequence
+                        (Ssequence
+                          (Sset _t'25
+                            (Efield
+                              (Ederef
+                                (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
+                                (Tstruct _pacha_eevdf_runqueue noattr))
+                              _min_vruntime tlong))
+                          (Sassign
+                            (Efield
+                              (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                              _eligible_time tlong) (Etempvar _t'25 tlong)))
+                        (Ssequence
+                          (Ssequence
+                            (Sset _t'24
+                              (Efield
+                                (Ederef
+                                  (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
+                                  (Tstruct _pacha_eevdf_runqueue noattr))
+                                _min_vruntime tlong))
+                            (Sassign
+                              (Efield
+                                (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                                _deadline tlong) (Etempvar _t'24 tlong)))
+                          (Ssequence
+                            (Sassign
+                              (Efield
+                                (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                                _state tint) (Econst_int (Int.repr 1) tint))
+                            (Ssequence
+                              (Ssequence
+                                (Ssequence
+                                  (Sset _t'23
+                                    (Efield
+                                      (Ederef
+                                        (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
+                                        (Tstruct _pacha_eevdf_runqueue noattr))
+                                      _min_vruntime tlong))
+                                  (Scall (Some _t'8)
+                                    (Evar _refresh_deadline (Tfunction
+                                                              ((tptr (Tstruct _pacha_eevdf_entity noattr)) ::
+                                                               tlong ::
+                                                               (tptr (Tstruct _pacha_eevdf_entity noattr)) ::
+                                                               nil) tint
+                                                              cc_default))
+                                    ((Eaddrof
+                                       (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
+                                       (tptr (Tstruct _pacha_eevdf_entity noattr))) ::
+                                     (Etempvar _t'23 tlong) ::
+                                     (Eaddrof
+                                       (Evar _refreshed (Tstruct _pacha_eevdf_entity noattr))
+                                       (tptr (Tstruct _pacha_eevdf_entity noattr))) ::
+                                     nil)))
+                                (Sifthenelse (Eunop Onotbool
+                                               (Etempvar _t'8 tint) tint)
+                                  (Ssequence
+                                    (Scall (Some _t'7)
+                                      (Evar _fail_runqueue (Tfunction
+                                                             (tint ::
+                                                              (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                              (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                              nil) tint
+                                                             cc_default))
+                                      ((Econst_int (Int.repr 3) tint) ::
+                                       (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                                       (Etempvar _out (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                                       nil))
+                                    (Sreturn (Some (Etempvar _t'7 tint))))
+                                  Sskip))
+                              (Ssequence
+                                (Sassign
+                                  (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                  (Ederef
+                                    (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
+                                    (Tstruct _pacha_eevdf_runqueue noattr)))
+                                (Ssequence
+                                  (Ssequence
+                                    (Sset _t'22 (Evar _existing tulong))
+                                    (Sassign
+                                      (Ederef
+                                        (Ebinop Oadd
+                                          (Efield
+                                            (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                            _entities
+                                            (tarray (Tstruct _pacha_eevdf_entity noattr) 256))
+                                          (Etempvar _t'22 tulong)
+                                          (tptr (Tstruct _pacha_eevdf_entity noattr)))
+                                        (Tstruct _pacha_eevdf_entity noattr))
+                                      (Evar _refreshed (Tstruct _pacha_eevdf_entity noattr))))
+                                  (Ssequence
+                                    (Scall None
+                                      (Evar _refresh_runqueue (Tfunction
+                                                                ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                                 nil) tvoid
+                                                                cc_default))
+                                      ((Eaddrof
+                                         (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                         (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                                       nil))
+                                    (Ssequence
+                                      (Scall (Some _t'9)
+                                        (Evar _ok_runqueue (Tfunction
+                                                             ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                              (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                              nil) tint
+                                                             cc_default))
+                                        ((Eaddrof
+                                           (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                           (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                                         (Etempvar _out (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                                         nil))
+                                      (Sreturn (Some (Etempvar _t'9 tint))))))))))))))))))
         Sskip))
     (Ssequence
       (Ssequence
-        (Sset _t'18
+        (Sset _t'21
           (Efield
             (Ederef
               (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
               (Tstruct _pacha_eevdf_runqueue noattr)) _entity_count tulong))
-        (Sifthenelse (Ebinop Oge (Etempvar _t'18 tulong)
+        (Sifthenelse (Ebinop Oge (Etempvar _t'21 tulong)
                        (Econst_int (Int.repr 256) tuint) tint)
           (Ssequence
-            (Scall (Some _t'8)
+            (Scall (Some _t'11)
               (Evar _fail_runqueue (Tfunction
                                      (tint ::
                                       (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
@@ -1758,7 +1938,7 @@ Definition f_pacha_eevdf_add := {|
                (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                (Etempvar _out (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                nil))
-            (Sreturn (Some (Etempvar _t'8 tint))))
+            (Sreturn (Some (Etempvar _t'11 tint))))
           Sskip))
       (Ssequence
         (Scall None
@@ -1785,7 +1965,7 @@ Definition f_pacha_eevdf_add := {|
                     _slice_ns tlong) (Etempvar _slice_ns tlong))
                 (Ssequence
                   (Ssequence
-                    (Sset _t'17
+                    (Sset _t'20
                       (Efield
                         (Ederef
                           (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
@@ -1794,10 +1974,10 @@ Definition f_pacha_eevdf_add := {|
                     (Sassign
                       (Efield
                         (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
-                        _vruntime tlong) (Etempvar _t'17 tlong)))
+                        _vruntime tlong) (Etempvar _t'20 tlong)))
                   (Ssequence
                     (Ssequence
-                      (Sset _t'16
+                      (Sset _t'19
                         (Efield
                           (Ederef
                             (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
@@ -1806,10 +1986,10 @@ Definition f_pacha_eevdf_add := {|
                       (Sassign
                         (Efield
                           (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
-                          _eligible_time tlong) (Etempvar _t'16 tlong)))
+                          _eligible_time tlong) (Etempvar _t'19 tlong)))
                     (Ssequence
                       (Ssequence
-                        (Sset _t'15
+                        (Sset _t'18
                           (Efield
                             (Ederef
                               (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
@@ -1818,7 +1998,7 @@ Definition f_pacha_eevdf_add := {|
                         (Sassign
                           (Efield
                             (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
-                            _deadline tlong) (Etempvar _t'15 tlong)))
+                            _deadline tlong) (Etempvar _t'18 tlong)))
                       (Ssequence
                         (Sassign
                           (Efield
@@ -1827,13 +2007,13 @@ Definition f_pacha_eevdf_add := {|
                         (Ssequence
                           (Ssequence
                             (Ssequence
-                              (Sset _t'14
+                              (Sset _t'17
                                 (Efield
                                   (Ederef
                                     (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
                                     (Tstruct _pacha_eevdf_runqueue noattr))
                                   _min_vruntime tlong))
-                              (Scall (Some _t'10)
+                              (Scall (Some _t'13)
                                 (Evar _refresh_deadline (Tfunction
                                                           ((tptr (Tstruct _pacha_eevdf_entity noattr)) ::
                                                            tlong ::
@@ -1843,15 +2023,15 @@ Definition f_pacha_eevdf_add := {|
                                 ((Eaddrof
                                    (Evar _entity (Tstruct _pacha_eevdf_entity noattr))
                                    (tptr (Tstruct _pacha_eevdf_entity noattr))) ::
-                                 (Etempvar _t'14 tlong) ::
+                                 (Etempvar _t'17 tlong) ::
                                  (Eaddrof
                                    (Evar _refreshed (Tstruct _pacha_eevdf_entity noattr))
                                    (tptr (Tstruct _pacha_eevdf_entity noattr))) ::
                                  nil)))
                             (Sifthenelse (Eunop Onotbool
-                                           (Etempvar _t'10 tint) tint)
+                                           (Etempvar _t'13 tint) tint)
                               (Ssequence
-                                (Scall (Some _t'9)
+                                (Scall (Some _t'12)
                                   (Evar _fail_runqueue (Tfunction
                                                          (tint ::
                                                           (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
@@ -1862,42 +2042,42 @@ Definition f_pacha_eevdf_add := {|
                                    (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                                    (Etempvar _out (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                                    nil))
-                                (Sreturn (Some (Etempvar _t'9 tint))))
+                                (Sreturn (Some (Etempvar _t'12 tint))))
                               Sskip))
                           (Ssequence
                             (Sassign
-                              (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                              (Evar _next__1 (Tstruct _pacha_eevdf_runqueue noattr))
                               (Ederef
                                 (Etempvar _rq (tptr (Tstruct _pacha_eevdf_runqueue noattr)))
                                 (Tstruct _pacha_eevdf_runqueue noattr)))
                             (Ssequence
                               (Ssequence
-                                (Sset _t'13
+                                (Sset _t'16
                                   (Efield
-                                    (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                    (Evar _next__1 (Tstruct _pacha_eevdf_runqueue noattr))
                                     _entity_count tulong))
                                 (Sassign
                                   (Ederef
                                     (Ebinop Oadd
                                       (Efield
-                                        (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                        (Evar _next__1 (Tstruct _pacha_eevdf_runqueue noattr))
                                         _entities
                                         (tarray (Tstruct _pacha_eevdf_entity noattr) 256))
-                                      (Etempvar _t'13 tulong)
+                                      (Etempvar _t'16 tulong)
                                       (tptr (Tstruct _pacha_eevdf_entity noattr)))
                                     (Tstruct _pacha_eevdf_entity noattr))
                                   (Evar _refreshed (Tstruct _pacha_eevdf_entity noattr))))
                               (Ssequence
                                 (Ssequence
-                                  (Sset _t'12
+                                  (Sset _t'15
                                     (Efield
-                                      (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                      (Evar _next__1 (Tstruct _pacha_eevdf_runqueue noattr))
                                       _entity_count tulong))
                                   (Sassign
                                     (Efield
-                                      (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                      (Evar _next__1 (Tstruct _pacha_eevdf_runqueue noattr))
                                       _entity_count tulong)
-                                    (Ebinop Oadd (Etempvar _t'12 tulong)
+                                    (Ebinop Oadd (Etempvar _t'15 tulong)
                                       (Econst_int (Int.repr 1) tint) tulong)))
                                 (Ssequence
                                   (Scall None
@@ -1906,22 +2086,22 @@ Definition f_pacha_eevdf_add := {|
                                                                nil) tvoid
                                                               cc_default))
                                     ((Eaddrof
-                                       (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                       (Evar _next__1 (Tstruct _pacha_eevdf_runqueue noattr))
                                        (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                                      nil))
                                   (Ssequence
-                                    (Scall (Some _t'11)
+                                    (Scall (Some _t'14)
                                       (Evar _ok_runqueue (Tfunction
                                                            ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
                                                             (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
                                                             nil) tint
                                                            cc_default))
                                       ((Eaddrof
-                                         (Evar _next (Tstruct _pacha_eevdf_runqueue noattr))
+                                         (Evar _next__1 (Tstruct _pacha_eevdf_runqueue noattr))
                                          (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                                        (Etempvar _out (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                                        nil))
-                                    (Sreturn (Some (Etempvar _t'11 tint)))))))))))))))))))))
+                                    (Sreturn (Some (Etempvar _t'14 tint)))))))))))))))))))))
 |}.
 
 Definition f_pacha_eevdf_wake := {|

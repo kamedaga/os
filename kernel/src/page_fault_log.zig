@@ -1,6 +1,6 @@
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
-const scheduler = @import("scheduler.zig");
+const scheduler = @import("scheduler.zig").connection;
 const user_vm = @import("memory/user_vm.zig");
 
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
@@ -99,7 +99,7 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     }
     h.write("  USER_FAULT=observed\n");
 
-    const principal = scheduler.currentUserPrincipal();
+    const principal = scheduler.currentPrincipal();
     const fault_page_va = cr2 & ~@as(u64, 4095);
     const write_access = (frame.error_code & (1 << 1)) != 0;
     const instruction_fetch = (frame.error_code & (1 << 4)) != 0;
@@ -109,6 +109,9 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
         h.write("  MAPPED_PADDR=kernel_state_not_ready\n");
         return;
     }
+
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
 
     const vma_mapping = h.state.nativeVmaFaultMapping(
         principal,

@@ -34,6 +34,7 @@ static void test_pick_and_finish_current(void) {
   assert(decision.generation == 1);
   assert(sched.cpus[0].has_current);
   assert(sched.cpus[0].current_thread_id == 10);
+  assert(sched.cpus[0].current_generation == 1);
   assert(sched.runqueue.runnable_count == 1);
 
   assert(pacha_sched_pick(&sched, 0, &decision, &pick_scratch, &scratch) ==
@@ -103,10 +104,73 @@ static void test_block_wake_exit_lifecycle(void) {
   assert(sched.runqueue.runnable_count == 0);
 }
 
+static void test_readd_exited_thread_slot(void) {
+  pacha_sched_state sched;
+  pacha_sched_decision decision;
+  pacha_eevdf_runqueue scratch;
+  pacha_eevdf_pick_result pick_scratch;
+  pacha_sched_empty_state(1, &sched);
+
+  assert(pacha_sched_add_thread(
+      &sched, 1, 7, 1024, 4000000, &decision, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(pacha_sched_exit_thread(&sched, 1, &decision, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(pacha_sched_add_thread(
+      &sched, 1, 8, 2048, 1000000, &decision, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(sched.runqueue.entity_count == 1);
+  assert(sched.runqueue.runnable_count == 1);
+
+  assert(pacha_sched_pick(&sched, 0, &decision, &pick_scratch, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(decision.kind == PACHA_SCHED_DECISION_RUN_THREAD);
+  assert(decision.thread_id == 1);
+  assert(decision.generation == 8);
+}
+
+static void test_stale_current_generation_does_not_charge_reused_slot(void) {
+  pacha_sched_state sched;
+  pacha_sched_decision decision;
+  pacha_eevdf_runqueue scratch;
+  pacha_eevdf_pick_result pick_scratch;
+  pacha_sched_empty_state(1, &sched);
+
+  assert(pacha_sched_add_thread(
+      &sched, 1, 7, 1024, 4000000, &decision, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(pacha_sched_pick(&sched, 0, &decision, &pick_scratch, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(decision.thread_id == 1);
+  assert(decision.generation == 7);
+
+  assert(pacha_sched_exit_thread(&sched, 1, &decision, &scratch) ==
+      PACHA_SCHED_OK);
+  sched.cpus[0].has_current = 1;
+  sched.cpus[0].current_thread_id = 1;
+  sched.cpus[0].current_generation = 7;
+
+  assert(pacha_sched_add_thread(
+      &sched, 1, 8, 1024, 4000000, &decision, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(pacha_sched_on_timer(&sched, 0, 1000, &decision, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(!sched.cpus[0].has_current);
+  assert(sched.runqueue.entities[0].generation == 8);
+  assert(sched.runqueue.entities[0].service_ns == 0);
+
+  assert(pacha_sched_pick(&sched, 0, &decision, &pick_scratch, &scratch) ==
+      PACHA_SCHED_OK);
+  assert(decision.thread_id == 1);
+  assert(decision.generation == 8);
+}
+
 int main(void) {
   test_write_no_decision();
   test_pick_and_finish_current();
   test_idle_and_invalid_cpu();
   test_block_wake_exit_lifecycle();
+  test_readd_exited_thread_slot();
+  test_stale_current_generation_does_not_charge_reused_slot();
   return 0;
 }

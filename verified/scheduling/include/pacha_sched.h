@@ -37,6 +37,7 @@ typedef struct pacha_sched_decision {
 typedef struct pacha_sched_cpu {
   int has_current;
   int64_t current_thread_id;
+  int64_t current_generation;
 } pacha_sched_cpu;
 
 typedef struct pacha_sched_state {

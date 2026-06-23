@@ -40,6 +40,7 @@ var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
 var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
 var ap_syscall_entry: usize = 0;
+var wake_ipi_vector: u8 = 0;
 
 extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.c) void;
 
@@ -59,6 +60,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_lapic_ids), &runtime_lapic_ids));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_vector), &ap_user_timer_vector));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_initial_count), &ap_user_timer_initial_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_vector), &wake_ipi_vector));
     return end;
 }
 
@@ -69,6 +71,10 @@ pub fn configureApUserTimer(timer_vector: u8, initial_count: u32) void {
 
 pub fn configureApSyscallEntry(entry: usize) void {
     ap_syscall_entry = entry;
+}
+
+pub fn configureWakeIpiVector(vector: u8) void {
+    wake_ipi_vector = vector;
 }
 
 fn stateFromRaw(raw: u32) CpuState {
@@ -542,8 +548,11 @@ pub fn returnCurrentApToIdleFromInterrupt() noreturn {
 
 pub fn wakeCpu(cpu_slot: usize) bool {
     if (cpu_slot == 0 or cpu_slot >= runtime_lapic_ids.len) return false;
-    if (runtime_lapic_ids[cpu_slot] == 0xFF) return false;
-    return cpuState(cpu_slot) != .absent;
+    const apic_id = runtime_lapic_ids[cpu_slot];
+    if (apic_id == 0xFF) return false;
+    if (cpuState(cpu_slot) == .absent) return false;
+    if (wake_ipi_vector == 0) return true;
+    return lapic.sendFixedIpi(apic_id, wake_ipi_vector);
 }
 
 fn apIdleLoop(cpu_slot: usize) noreturn {
@@ -555,7 +564,7 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
             cpuStatePtr(cpu_slot).* = cpu_state_user;
             enterUserModeFromIdle(&user_entry);
         }
-        asm volatile ("pause");
+        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
     }
 }
 

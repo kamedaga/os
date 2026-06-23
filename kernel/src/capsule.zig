@@ -6,32 +6,20 @@ pub const known_rights_mask: u64 = (1 << 13) - 1;
 
 pub const CapsuleKind = enum(u8) {
     none = 0,
-    session = 1,
     device = 2,
     mmio = 3,
     dma_buffer = 4,
     dma_mapping = 5,
     irq = 6,
-    event_queue = 7,
-};
-
-pub const CapsuleState = enum(u8) {
-    empty = 0,
-    active = 1,
-    revoked = 2,
 };
 
 comptime {
     std.debug.assert(known_rights_mask == capsule_abi.known_rights_mask);
-    std.debug.assert(@intFromEnum(CapsuleKind.session) == @intFromEnum(capsule_abi.CapsuleKind.session));
     std.debug.assert(@intFromEnum(CapsuleKind.device) == @intFromEnum(capsule_abi.CapsuleKind.device));
     std.debug.assert(@intFromEnum(CapsuleKind.mmio) == @intFromEnum(capsule_abi.CapsuleKind.mmio));
     std.debug.assert(@intFromEnum(CapsuleKind.dma_buffer) == @intFromEnum(capsule_abi.CapsuleKind.dma_buffer));
     std.debug.assert(@intFromEnum(CapsuleKind.dma_mapping) == @intFromEnum(capsule_abi.CapsuleKind.dma_mapping));
     std.debug.assert(@intFromEnum(CapsuleKind.irq) == @intFromEnum(capsule_abi.CapsuleKind.irq));
-    std.debug.assert(@intFromEnum(CapsuleKind.event_queue) == @intFromEnum(capsule_abi.CapsuleKind.event_queue));
-    std.debug.assert(@intFromEnum(CapsuleState.active) == @intFromEnum(capsule_abi.CapsuleState.active));
-    std.debug.assert(@intFromEnum(CapsuleState.revoked) == @intFromEnum(capsule_abi.CapsuleState.revoked));
 }
 
 pub const Rights = packed struct(u64) {
@@ -65,7 +53,6 @@ pub const Snapshot = struct {
     fd: u64 = 0,
     owner_principal_raw: u32 = 0,
     kind: CapsuleKind = .none,
-    state: CapsuleState = .empty,
     rights: Rights = .{},
     metadata: Metadata = .{},
 };

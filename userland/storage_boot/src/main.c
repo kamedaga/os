@@ -156,6 +156,7 @@ long pacha_fd_fcntl(int fd, uint64_t cmd, uint64_t arg0, uint64_t arg1);
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags);
 void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset);
 int pacha_munmap(void *addr, uint64_t size);
+long pacha_getrandom(void *buf, uint64_t len, uint64_t flags);
 
 static void write_pointer_field(void *base, size_t offset, void *value)
 {
@@ -1139,8 +1140,10 @@ static int start_loaded_process(
     sp &= ~15ull;
     sp -= 16;
     const uint64_t random_va = stack_base + sp;
-    for (unsigned i = 0; i < 16; i++) {
-        stack[sp + i] = (unsigned char)(0x73u + i * 11u);
+    if (pacha_getrandom(stack + sp, 16, 0) != 16) {
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_fd_close(stack_fd);
+        return -5;
     }
     sp &= ~15ull;
 

@@ -81,6 +81,7 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 		return Result{}, fmt.Errorf("%s partition index is 0", partitionName)
 	}
 	filesystem := normalizeFilesystem(partition.Format)
+	cacheFilesystem := cacheFilesystemKey(filesystem)
 	diskPath := workspace.Path(workspace.Disk.Image)
 	span.Set(2, "fingerprinting manifest")
 	layoutFingerprint, err := ManifestContentFingerprint(manifestPath)
@@ -106,11 +107,11 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 			}
 		}
 	}
-	syncFingerprint := syncCacheFingerprint(contentFingerprint, filesystem)
+	syncFingerprint := syncCacheFingerprint(contentFingerprint, cacheFilesystem)
 	cachePath := workspace.Path(workspace.State, partitionName+".sync.sha256")
 	span.Set(3, "checking sync cache")
 	if !opts.Force && len(opts.ChangedSources) == 0 && fingerprintMatches(cachePath, syncFingerprint) {
-		if opts.Full || layoutCacheMatches(workspace, partitionName, layoutFingerprint, filesystem) {
+		if opts.Full || layoutCacheMatches(workspace, partitionName, layoutFingerprint, cacheFilesystem) {
 			span.Message("counting manifest entries")
 			counts, err := LoadManifestCounts(manifestPath)
 			if err != nil {
@@ -129,7 +130,7 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 			}, nil
 		}
 	}
-	if partitionName == "rootfs" && !opts.Force && len(opts.ChangedSources) == 0 && layoutCacheMatches(workspace, partitionName, layoutFingerprint, filesystem) {
+	if partitionName == "rootfs" && !opts.Force && len(opts.ChangedSources) == 0 && layoutCacheMatches(workspace, partitionName, layoutFingerprint, cacheFilesystem) {
 		span.Message("counting cached rootfs entries")
 		counts, err := LoadManifestCounts(manifestPath)
 		if err != nil {
@@ -213,7 +214,7 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 		span.Fail("cache write failed")
 		return Result{}, err
 	}
-	if err := writeLayoutCache(workspace, partitionName, layoutFingerprint, filesystem, manifest); err != nil {
+	if err := writeLayoutCache(workspace, partitionName, layoutFingerprint, cacheFilesystem, manifest); err != nil {
 		span.Fail("layout cache write failed")
 		return Result{}, err
 	}
@@ -236,6 +237,13 @@ func normalizeFilesystem(value string) string {
 	filesystem := strings.ToLower(strings.TrimSpace(value))
 	if filesystem == "" {
 		return "fat32"
+	}
+	return filesystem
+}
+
+func cacheFilesystemKey(filesystem string) string {
+	if filesystem == "ext4" {
+		return "ext4:pacha-compat-v1"
 	}
 	return filesystem
 }

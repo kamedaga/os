@@ -71,6 +71,10 @@ long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t 
     );
 }
 
+long pacha_getrandom(void *buf, uint64_t len, uint64_t flags) {
+    return pacha_syscall3(PACHA_RUNTIME_SYSCALL_GETRANDOM, (uint64_t)(uintptr_t)buf, len, flags);
+}
+
 int pacha_fd_get_info(int fd, struct pacha_fd_info *out) {
     if (!out) return -1;
     return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)out));

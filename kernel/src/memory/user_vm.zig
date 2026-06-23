@@ -1,6 +1,7 @@
+const std = @import("std");
 const address_space = @import("address_space.zig");
 const kernel = @import("../kernel.zig");
-const scheduler = @import("../scheduler.zig");
+const scheduler = @import("../scheduler.zig").connection;
 
 pub const UserAddressSpace = address_space.UserAddressSpace;
 
@@ -29,12 +30,59 @@ pub const Hooks = struct {
 
 var hooks: ?Hooks = null;
 
+const AddressSpaceSpinLock = struct {
+    value: u8 = 0,
+    owner_cpu: usize = std.math.maxInt(usize),
+    depth: u32 = 0,
+
+    fn lock(self: *AddressSpaceSpinLock) void {
+        const cpu = scheduler.currentCpu();
+        if (@atomicLoad(u8, &self.value, .acquire) != 0 and self.owner_cpu == cpu) {
+            self.depth +%= 1;
+            return;
+        }
+        while (true) {
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
+                self.owner_cpu = cpu;
+                self.depth = 1;
+                return;
+            }
+            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
+                asm volatile ("pause");
+            }
+        }
+    }
+
+    fn unlock(self: *AddressSpaceSpinLock) void {
+        if (self.depth > 1) {
+            self.depth -= 1;
+            return;
+        }
+        self.owner_cpu = std.math.maxInt(usize);
+        self.depth = 0;
+        @atomicStore(u8, &self.value, 0, .release);
+    }
+};
+
+var address_space_lock: AddressSpaceSpinLock = .{};
+
+pub fn lockAddressSpaces() void {
+    address_space_lock.lock();
+}
+
+pub fn unlockAddressSpaces() void {
+    address_space_lock.unlock();
+}
+
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
 }
 
 pub fn kernelStaticStorageEndAddr() usize {
-    return staticStorageEnd(@TypeOf(hooks), &hooks);
+    var end = staticStorageEnd(@TypeOf(hooks), &hooks);
+    const lock_end = staticStorageEnd(@TypeOf(address_space_lock), &address_space_lock);
+    if (lock_end > end) end = lock_end;
+    return end;
 }
 
 pub fn init(new_hooks: Hooks) void {
@@ -53,12 +101,14 @@ pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
 }
 
 pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
     const space = getUserSpace(principal) orelse return;
     space.* = .{};
 }
 
 pub fn currentUserSpace() *UserAddressSpace {
-    return getUserSpace(scheduler.currentUserPrincipal()).?;
+    return getUserSpace(scheduler.currentPrincipal()).?;
 }
 
 pub fn isUserCanonicalVa(va: u64) bool {
@@ -86,6 +136,8 @@ fn userPageIndexForVa(h: Hooks, va: u64) ?UserPageIndex {
 }
 
 pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
     const h = hooks orelse return null;
     const space = getUserSpace(principal) orelse return null;
     const index = userPageIndexForVa(h, va) orelse return null;
@@ -617,6 +669,8 @@ pub fn mapUserLinearRegionWithProt(
     size_bytes: usize,
     prot: kernel.MapProt,
 ) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -654,63 +708,14 @@ pub fn mapUserLinearRegionWithProt(
     return true;
 }
 
-pub fn mapUserPageCapabilitiesWithProt(
-    state: *const kernel.KernelState,
-    principal: kernel.PrincipalId,
-    va_start: u64,
-    pages: []const kernel.PageCapability,
-    prot: kernel.MapProt,
-) bool {
-    const h = hooks orelse return false;
-    const space = getUserSpace(principal) orelse return false;
-    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
-    if (pages.len == 0) return false;
-    if ((va_start & 0xFFF) != 0) return false;
-
-    const page_count_u64: u64 = @intCast(pages.len);
-    const size_u64 = page_count_u64 * 4096;
-    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
-
-    var page_index: usize = 0;
-    while (page_index < pages.len) : (page_index += 1) {
-        const paddr = pages[page_index].paddr;
-        if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
-        const cap = state.getTableConst(principal).find(paddr) orelse return false;
-        if (!cap.rights.cpu_read) return false;
-        if (prot.write and !cap.rights.cpu_write) return false;
-
-        var previous_index: usize = 0;
-        while (previous_index < page_index) : (previous_index += 1) {
-            if (pages[previous_index].paddr == paddr) return false;
-        }
-
-        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
-        const index = userPageIndexForVa(h, va) orelse return false;
-        const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
-        const old_entry = pt_page[index.pt];
-        if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
-    }
-    if (!reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
-
-    page_index = 0;
-    while (page_index < pages.len) : (page_index += 1) {
-        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
-        const index = userPageIndexForVa(h, va) orelse return false;
-        const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
-        pt_page[index.pt] = pages[page_index].paddr | pte_flags;
-    }
-
-    return true;
-}
-
 pub fn mapTrustedUserPaddrsWithProt(
     principal: kernel.PrincipalId,
     va_start: u64,
     paddrs: []const u64,
     prot: kernel.MapProt,
 ) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -753,6 +758,8 @@ pub fn remapTrustedUserPaddrsWithProt(
     paddrs: []const u64,
     prot: kernel.MapProt,
 ) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -788,6 +795,8 @@ pub fn protectUserLinearRegionWithProt(
     size_bytes: usize,
     prot: kernel.MapProt,
 ) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -819,6 +828,8 @@ pub fn unmapUserLinearRegion(
     va_start: u64,
     size_bytes: usize,
 ) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     if (size_bytes == 0) return false;

@@ -381,6 +381,9 @@ func fileSourceDependencies(workspace *config.Workspace, source config.FileSourc
 			}
 		}
 	}
+	for _, input := range source.Input {
+		add(input)
+	}
 	return deps
 }
 
@@ -389,6 +392,9 @@ func fileSourceFingerprint(workspace *config.Workspace, source config.FileSource
 	writeHashString(hash, "pacgo-file-source-v1\n")
 	for _, arg := range source.Rebuild {
 		writeHashString(hash, "arg\x00"+arg+"\n")
+	}
+	for _, input := range source.Input {
+		writeHashString(hash, "input\x00"+input+"\n")
 	}
 	for _, dep := range fileSourceDependencies(workspace, source) {
 		if err := hashPath(hash, dep); err != nil {

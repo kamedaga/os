@@ -38,13 +38,9 @@ enum {
 
 struct pacha_capsule_info {
     uint64_t fd;
-    uint64_t parent_fd;
     uint64_t kind;
-    uint64_t state;
     uint64_t rights;
     uint64_t owner;
-    uint64_t generation;
-    uint64_t revoke_generation;
     uint64_t device;
     uint64_t object_id;
     uint64_t user_va;

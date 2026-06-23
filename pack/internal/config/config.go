@@ -227,6 +227,7 @@ func (a App) Kind() string {
 type FileSource struct {
 	Path    string
 	Rebuild []string
+	Input   []string
 }
 
 type Publish struct {
@@ -262,6 +263,9 @@ func (a App) FileSource() (FileSource, error) {
 		}
 		if value, ok := typed["rebuild"]; ok {
 			src.Rebuild = stringSlice(value)
+		}
+		if value, ok := typed["input"]; ok {
+			src.Input = stringSlice(value)
 		}
 		if src.Path == "" {
 			return FileSource{}, fmt.Errorf("app %s file source is missing path", a.ID)

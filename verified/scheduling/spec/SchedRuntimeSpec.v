@@ -152,7 +152,7 @@ Qed.
 Theorem sched_on_timer_no_current_spec :
   forall sched cpu_id runtime_ns,
     valid_cpu sched cpu_id = true ->
-    cpu_current_thread_id sched cpu_id = None ->
+    cpu_current_thread sched cpu_id = None ->
     sched_on_timer sched cpu_id runtime_ns =
       (sched, sched_ok sched_no_decision).
 Proof.
@@ -163,36 +163,58 @@ Proof.
   reflexivity.
 Qed.
 
-Theorem sched_on_timer_success_spec :
-  forall sched cpu_id runtime_ns thread_id rq',
+Theorem sched_on_timer_stale_current_spec :
+  forall sched cpu_id runtime_ns current,
     valid_cpu sched cpu_id = true ->
-    cpu_current_thread_id sched cpu_id = Some thread_id ->
+    cpu_current_thread sched cpu_id = Some current ->
+    current_running_thread_id sched cpu_id = None ->
+    sched_on_timer sched cpu_id runtime_ns =
+      (clear_cpu_current sched cpu_id, sched_ok sched_no_decision).
+Proof.
+  intros sched cpu_id runtime_ns current Hvalid Hcurrent Hrunning.
+  unfold sched_on_timer.
+  rewrite Hvalid.
+  rewrite Hcurrent.
+  rewrite Hrunning.
+  reflexivity.
+Qed.
+
+Theorem sched_on_timer_success_spec :
+  forall sched cpu_id runtime_ns current thread_id rq',
+    valid_cpu sched cpu_id = true ->
+    cpu_current_thread sched cpu_id = Some current ->
+    current_running_thread_id sched cpu_id = Some thread_id ->
     eevdf_charge (ss_runqueue sched) thread_id runtime_ns = ok rq' ->
     sched_on_timer sched cpu_id runtime_ns =
       (with_runqueue sched rq', sched_ok sched_no_decision).
 Proof.
-  intros sched cpu_id runtime_ns thread_id rq' Hvalid Hcurrent Hcharge.
+  intros sched cpu_id runtime_ns current thread_id rq'
+    Hvalid Hcurrent Hrunning Hcharge.
   unfold sched_on_timer, sched_apply_eevdf_result.
   rewrite Hvalid.
   rewrite Hcurrent.
+  rewrite Hrunning.
   rewrite Hcharge.
   reflexivity.
 Qed.
 
 Theorem sched_on_timer_failure_spec :
-  forall sched cpu_id runtime_ns thread_id rc,
+  forall sched cpu_id runtime_ns current thread_id rc,
     valid_cpu sched cpu_id = true ->
-    cpu_current_thread_id sched cpu_id = Some thread_id ->
+    cpu_current_thread sched cpu_id = Some current ->
+    current_running_thread_id sched cpu_id = Some thread_id ->
     rc <> EevdfOk ->
     eevdf_charge (ss_runqueue sched) thread_id runtime_ns =
       fail rc (ss_runqueue sched) ->
     sched_on_timer sched cpu_id runtime_ns =
       (sched, sched_fail (map_eevdf_rc rc)).
 Proof.
-  intros sched cpu_id runtime_ns thread_id rc Hvalid Hcurrent Hnot_ok Hcharge.
+  intros sched cpu_id runtime_ns current thread_id rc
+    Hvalid Hcurrent Hrunning Hnot_ok Hcharge.
   unfold sched_on_timer, sched_apply_eevdf_result.
   rewrite Hvalid.
   rewrite Hcurrent.
+  rewrite Hrunning.
   rewrite Hcharge.
   destruct rc; try contradiction; reflexivity.
 Qed.
@@ -250,7 +272,7 @@ Theorem sched_pick_run_thread_spec :
       ok rq_after_mark ->
     sched_pick sched cpu_id =
       (set_cpu_current (with_runqueue (with_runqueue sched rq_after_pick)
-        rq_after_mark) cpu_id (ee_thread_id entity),
+        rq_after_mark) cpu_id (ee_thread_id entity) (ee_generation entity),
        sched_ok (sched_run_thread_decision cpu_id entity)).
 Proof.
   intros sched cpu_id rq_after_pick index entity rq_after_mark
@@ -302,7 +324,7 @@ Qed.
 Theorem sched_finish_current_no_current_spec :
   forall sched cpu_id,
     valid_cpu sched cpu_id = true ->
-    cpu_current_thread_id sched cpu_id = None ->
+    cpu_current_thread sched cpu_id = None ->
     sched_finish_current sched cpu_id =
       (sched, sched_ok sched_no_decision).
 Proof.
@@ -313,37 +335,57 @@ Proof.
   reflexivity.
 Qed.
 
-Theorem sched_finish_current_success_spec :
-  forall sched cpu_id thread_id rq',
+Theorem sched_finish_current_stale_current_spec :
+  forall sched cpu_id current,
     valid_cpu sched cpu_id = true ->
-    cpu_current_thread_id sched cpu_id = Some thread_id ->
+    cpu_current_thread sched cpu_id = Some current ->
+    current_running_thread_id sched cpu_id = None ->
+    sched_finish_current sched cpu_id =
+      (clear_cpu_current sched cpu_id, sched_ok sched_no_decision).
+Proof.
+  intros sched cpu_id current Hvalid Hcurrent Hrunning.
+  unfold sched_finish_current.
+  rewrite Hvalid.
+  rewrite Hcurrent.
+  rewrite Hrunning.
+  reflexivity.
+Qed.
+
+Theorem sched_finish_current_success_spec :
+  forall sched cpu_id current thread_id rq',
+    valid_cpu sched cpu_id = true ->
+    cpu_current_thread sched cpu_id = Some current ->
+    current_running_thread_id sched cpu_id = Some thread_id ->
     eevdf_requeue_running (ss_runqueue sched) thread_id = ok rq' ->
     sched_finish_current sched cpu_id =
       (clear_cpu_current (with_runqueue sched rq') cpu_id,
        sched_ok sched_no_decision).
 Proof.
-  intros sched cpu_id thread_id rq' Hvalid Hcurrent Hrequeue.
+  intros sched cpu_id current thread_id rq' Hvalid Hcurrent Hrunning Hrequeue.
   unfold sched_finish_current.
   rewrite Hvalid.
   rewrite Hcurrent.
+  rewrite Hrunning.
   rewrite Hrequeue.
   reflexivity.
 Qed.
 
 Theorem sched_finish_current_failure_spec :
-  forall sched cpu_id thread_id rc,
+  forall sched cpu_id current thread_id rc,
     valid_cpu sched cpu_id = true ->
-    cpu_current_thread_id sched cpu_id = Some thread_id ->
+    cpu_current_thread sched cpu_id = Some current ->
+    current_running_thread_id sched cpu_id = Some thread_id ->
     rc <> EevdfOk ->
     eevdf_requeue_running (ss_runqueue sched) thread_id =
       fail rc (ss_runqueue sched) ->
     sched_finish_current sched cpu_id =
       (sched, sched_fail (map_eevdf_rc rc)).
 Proof.
-  intros sched cpu_id thread_id rc Hvalid Hcurrent Hnot_ok Hrequeue.
+  intros sched cpu_id current thread_id rc Hvalid Hcurrent Hrunning Hnot_ok Hrequeue.
   unfold sched_finish_current.
   rewrite Hvalid.
   rewrite Hcurrent.
+  rewrite Hrunning.
   rewrite Hrequeue.
   destruct rc; try contradiction; reflexivity.
 Qed.

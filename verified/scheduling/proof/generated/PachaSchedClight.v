@@ -82,6 +82,9 @@ Definition _cpu_count : ident := $"cpu_count".
 Definition _cpu_has_current : ident := $"cpu_has_current".
 Definition _cpu_id : ident := $"cpu_id".
 Definition _cpus : ident := $"cpus".
+Definition _current_entity_index : ident := $"current_entity_index".
+Definition _current_generation : ident := $"current_generation".
+Definition _current_index : ident := $"current_index".
 Definition _current_thread_id : ident := $"current_thread_id".
 Definition _deadline : ident := $"deadline".
 Definition _decision_out : ident := $"decision_out".
@@ -96,6 +99,7 @@ Definition _has_entity : ident := $"has_entity".
 Definition _i : ident := $"i".
 Definition _idle_decision : ident := $"idle_decision".
 Definition _index : ident := $"index".
+Definition _index_out : ident := $"index_out".
 Definition _kind : ident := $"kind".
 Definition _main : ident := $"main".
 Definition _map_eevdf_rc : ident := $"map_eevdf_rc".
@@ -153,6 +157,7 @@ Definition _virtual_time : ident := $"virtual_time".
 Definition _vruntime : ident := $"vruntime".
 Definition _weight : ident := $"weight".
 Definition _t'1 : ident := 128%positive.
+Definition _t'10 : ident := 137%positive.
 Definition _t'2 : ident := 129%positive.
 Definition _t'3 : ident := 130%positive.
 Definition _t'4 : ident := 131%positive.
@@ -436,14 +441,20 @@ Definition f_clear_cpu_current := {|
         (Ederef (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr)))
           (Tstruct _pacha_sched_cpu noattr)) _current_thread_id tlong)
       (Econst_int (Int.repr 0) tint))
-    (Sreturn None)))
+    (Ssequence
+      (Sassign
+        (Efield
+          (Ederef (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr)))
+            (Tstruct _pacha_sched_cpu noattr)) _current_generation tlong)
+        (Econst_int (Int.repr 0) tint))
+      (Sreturn None))))
 |}.
 
 Definition f_set_cpu_current := {|
   fn_return := tvoid;
   fn_callconv := cc_default;
   fn_params := ((_cpu, (tptr (Tstruct _pacha_sched_cpu noattr))) ::
-                (_thread_id, tlong) :: nil);
+                (_thread_id, tlong) :: (_generation, tlong) :: nil);
   fn_vars := nil;
   fn_temps := nil;
   fn_body :=
@@ -459,7 +470,13 @@ Definition f_set_cpu_current := {|
         (Ederef (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr)))
           (Tstruct _pacha_sched_cpu noattr)) _current_thread_id tlong)
       (Etempvar _thread_id tlong))
-    (Sreturn None)))
+    (Ssequence
+      (Sassign
+        (Efield
+          (Ederef (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr)))
+            (Tstruct _pacha_sched_cpu noattr)) _current_generation tlong)
+        (Etempvar _generation tlong))
+      (Sreturn None))))
 |}.
 
 Definition f_clear_current_if_matches := {|
@@ -533,6 +550,121 @@ Definition f_clear_current_if_matches := {|
         tulong))))
 |}.
 
+Definition f_current_entity_index := {|
+  fn_return := tint;
+  fn_callconv := cc_default;
+  fn_params := ((_sched, (tptr (Tstruct _pacha_sched_state noattr))) ::
+                (_cpu, (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+                (_index_out, (tptr tulong)) :: nil);
+  fn_vars := nil;
+  fn_temps := ((_i, tulong) ::
+               (_entity, (tptr (Tstruct _pacha_eevdf_entity noattr))) ::
+               (_t'3, tint) :: (_t'2, tint) :: (_t'1, tint) ::
+               (_t'9, tulong) :: (_t'8, tlong) :: (_t'7, tlong) ::
+               (_t'6, tlong) :: (_t'5, tlong) :: (_t'4, tint) :: nil);
+  fn_body :=
+(Ssequence
+  (Ssequence
+    (Scall (Some _t'1)
+      (Evar _sched_cpu_has_current (Tfunction
+                                     ((tptr (Tstruct _pacha_sched_cpu noattr)) ::
+                                      nil) tint cc_default))
+      ((Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) :: nil))
+    (Sifthenelse (Eunop Onotbool (Etempvar _t'1 tint) tint)
+      (Sreturn (Some (Econst_int (Int.repr 0) tint)))
+      Sskip))
+  (Ssequence
+    (Ssequence
+      (Sset _i (Ecast (Econst_int (Int.repr 0) tint) tulong))
+      (Sloop
+        (Ssequence
+          (Ssequence
+            (Sset _t'9
+              (Efield
+                (Efield
+                  (Ederef
+                    (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                    (Tstruct _pacha_sched_state noattr)) _runqueue
+                  (Tstruct _pacha_eevdf_runqueue noattr)) _entity_count
+                tulong))
+            (Sifthenelse (Ebinop Olt (Etempvar _i tulong)
+                           (Etempvar _t'9 tulong) tint)
+              Sskip
+              Sbreak))
+          (Ssequence
+            (Sset _entity
+              (Ebinop Oadd
+                (Efield
+                  (Efield
+                    (Ederef
+                      (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                      (Tstruct _pacha_sched_state noattr)) _runqueue
+                    (Tstruct _pacha_eevdf_runqueue noattr)) _entities
+                  (tarray (Tstruct _pacha_eevdf_entity noattr) 256))
+                (Etempvar _i tulong)
+                (tptr (Tstruct _pacha_eevdf_entity noattr))))
+            (Ssequence
+              (Ssequence
+                (Ssequence
+                  (Sset _t'5
+                    (Efield
+                      (Ederef
+                        (Etempvar _entity (tptr (Tstruct _pacha_eevdf_entity noattr)))
+                        (Tstruct _pacha_eevdf_entity noattr)) _thread_id
+                      tlong))
+                  (Ssequence
+                    (Sset _t'6
+                      (Efield
+                        (Ederef
+                          (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr)))
+                          (Tstruct _pacha_sched_cpu noattr))
+                        _current_thread_id tlong))
+                    (Sifthenelse (Ebinop Oeq (Etempvar _t'5 tlong)
+                                   (Etempvar _t'6 tlong) tint)
+                      (Ssequence
+                        (Sset _t'7
+                          (Efield
+                            (Ederef
+                              (Etempvar _entity (tptr (Tstruct _pacha_eevdf_entity noattr)))
+                              (Tstruct _pacha_eevdf_entity noattr))
+                            _generation tlong))
+                        (Ssequence
+                          (Sset _t'8
+                            (Efield
+                              (Ederef
+                                (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr)))
+                                (Tstruct _pacha_sched_cpu noattr))
+                              _current_generation tlong))
+                          (Sset _t'2
+                            (Ecast
+                              (Ebinop Oeq (Etempvar _t'7 tlong)
+                                (Etempvar _t'8 tlong) tint) tbool))))
+                      (Sset _t'2 (Econst_int (Int.repr 0) tint)))))
+                (Sifthenelse (Etempvar _t'2 tint)
+                  (Ssequence
+                    (Sset _t'4
+                      (Efield
+                        (Ederef
+                          (Etempvar _entity (tptr (Tstruct _pacha_eevdf_entity noattr)))
+                          (Tstruct _pacha_eevdf_entity noattr)) _state tint))
+                    (Sset _t'3
+                      (Ecast
+                        (Ebinop Oeq (Etempvar _t'4 tint)
+                          (Econst_int (Int.repr 2) tint) tint) tbool)))
+                  (Sset _t'3 (Econst_int (Int.repr 0) tint))))
+              (Sifthenelse (Etempvar _t'3 tint)
+                (Ssequence
+                  (Sassign
+                    (Ederef (Etempvar _index_out (tptr tulong)) tulong)
+                    (Etempvar _i tulong))
+                  (Sreturn (Some (Econst_int (Int.repr 1) tint))))
+                Sskip))))
+        (Sset _i
+          (Ebinop Oadd (Etempvar _i tulong) (Econst_int (Int.repr 1) tint)
+            tulong))))
+    (Sreturn (Some (Econst_int (Int.repr 0) tint)))))
+|}.
+
 Definition f_pacha_sched_empty_state := {|
   fn_return := tvoid;
   fn_callconv := cc_default;
@@ -597,19 +729,34 @@ Definition f_pacha_sched_empty_state := {|
                         (tptr (Tstruct _pacha_sched_cpu noattr)))
                       (Tstruct _pacha_sched_cpu noattr)) _has_current tint)
                   (Econst_int (Int.repr 0) tint))
-                (Sassign
-                  (Efield
-                    (Ederef
-                      (Ebinop Oadd
-                        (Efield
-                          (Ederef
-                            (Etempvar _out (tptr (Tstruct _pacha_sched_state noattr)))
-                            (Tstruct _pacha_sched_state noattr)) _cpus
-                          (tarray (Tstruct _pacha_sched_cpu noattr) 256))
-                        (Etempvar _i tulong)
-                        (tptr (Tstruct _pacha_sched_cpu noattr)))
-                      (Tstruct _pacha_sched_cpu noattr)) _current_thread_id
-                    tlong) (Econst_int (Int.repr 0) tint))))
+                (Ssequence
+                  (Sassign
+                    (Efield
+                      (Ederef
+                        (Ebinop Oadd
+                          (Efield
+                            (Ederef
+                              (Etempvar _out (tptr (Tstruct _pacha_sched_state noattr)))
+                              (Tstruct _pacha_sched_state noattr)) _cpus
+                            (tarray (Tstruct _pacha_sched_cpu noattr) 256))
+                          (Etempvar _i tulong)
+                          (tptr (Tstruct _pacha_sched_cpu noattr)))
+                        (Tstruct _pacha_sched_cpu noattr)) _current_thread_id
+                      tlong) (Econst_int (Int.repr 0) tint))
+                  (Sassign
+                    (Efield
+                      (Ederef
+                        (Ebinop Oadd
+                          (Efield
+                            (Ederef
+                              (Etempvar _out (tptr (Tstruct _pacha_sched_state noattr)))
+                              (Tstruct _pacha_sched_state noattr)) _cpus
+                            (tarray (Tstruct _pacha_sched_cpu noattr) 256))
+                          (Etempvar _i tulong)
+                          (tptr (Tstruct _pacha_sched_cpu noattr)))
+                        (Tstruct _pacha_sched_cpu noattr))
+                      _current_generation tlong)
+                    (Econst_int (Int.repr 0) tint)))))
             (Sset _i
               (Ebinop Oadd (Etempvar _i tulong)
                 (Econst_int (Int.repr 1) tint) tulong))))
@@ -897,84 +1044,122 @@ Definition f_on_timer_valid := {|
                 (_cpu_id, tulong) :: (_runtime_ns, tlong) ::
                 (_scratch, (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                 nil);
-  fn_vars := nil;
-  fn_temps := ((_thread_id, tlong) :: (_rc, tint) :: (_t'2, tint) ::
-               (_t'1, tint) :: (_t'3, tint) :: nil);
+  fn_vars := ((_current_index, tulong) :: nil);
+  fn_temps := ((_cpu, (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+               (_thread_id, tlong) :: (_rc, tint) :: (_t'5, tint) ::
+               (_t'4, tint) :: (_t'3, tint) :: (_t'2, tint) ::
+               (_t'1, (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+               (_t'6, tulong) :: nil);
   fn_body :=
 (Ssequence
   (Ssequence
-    (Sset _t'3
-      (Efield
-        (Ederef
-          (Ebinop Oadd
-            (Efield
-              (Ederef
-                (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
-                (Tstruct _pacha_sched_state noattr)) _cpus
-              (tarray (Tstruct _pacha_sched_cpu noattr) 256))
-            (Etempvar _cpu_id tulong)
-            (tptr (Tstruct _pacha_sched_cpu noattr)))
-          (Tstruct _pacha_sched_cpu noattr)) _has_current tint))
-    (Sifthenelse (Etempvar _t'3 tint)
-      (Ssequence
-        (Sset _thread_id
-          (Efield
-            (Ederef
-              (Ebinop Oadd
-                (Efield
-                  (Ederef
-                    (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
-                    (Tstruct _pacha_sched_state noattr)) _cpus
-                  (tarray (Tstruct _pacha_sched_cpu noattr) 256))
-                (Etempvar _cpu_id tulong)
-                (tptr (Tstruct _pacha_sched_cpu noattr)))
-              (Tstruct _pacha_sched_cpu noattr)) _current_thread_id tlong))
+    (Scall (Some _t'1)
+      (Evar _sched_cpu_ptr (Tfunction
+                             ((tptr (Tstruct _pacha_sched_state noattr)) ::
+                              tulong :: nil)
+                             (tptr (Tstruct _pacha_sched_cpu noattr))
+                             cc_default))
+      ((Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr))) ::
+       (Etempvar _cpu_id tulong) :: nil))
+    (Sset _cpu (Etempvar _t'1 (tptr (Tstruct _pacha_sched_cpu noattr)))))
+  (Ssequence
+    (Ssequence
+      (Scall (Some _t'5)
+        (Evar _sched_cpu_has_current (Tfunction
+                                       ((tptr (Tstruct _pacha_sched_cpu noattr)) ::
+                                        nil) tint cc_default))
+        ((Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) :: nil))
+      (Sifthenelse (Etempvar _t'5 tint)
         (Ssequence
+          (Sassign (Evar _current_index tulong)
+            (Econst_int (Int.repr 0) tint))
           (Ssequence
-            (Scall (Some _t'1)
-              (Evar _pacha_eevdf_charge (Tfunction
-                                          ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                           tlong :: tlong ::
-                                           (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                           nil) tint cc_default))
-              ((Eaddrof
-                 (Efield
-                   (Ederef
-                     (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
-                     (Tstruct _pacha_sched_state noattr)) _runqueue
-                   (Tstruct _pacha_eevdf_runqueue noattr))
-                 (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-               (Etempvar _thread_id tlong) :: (Etempvar _runtime_ns tlong) ::
-               (Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-               nil))
-            (Sset _rc (Etempvar _t'1 tint)))
-          (Ssequence
-            (Sifthenelse (Ebinop One (Etempvar _rc tint)
-                           (Econst_int (Int.repr 0) tint) tint)
-              (Ssequence
-                (Scall (Some _t'2)
-                  (Evar _map_eevdf_rc (Tfunction (tint :: nil) tint
-                                        cc_default))
-                  ((Etempvar _rc tint) :: nil))
-                (Sreturn (Some (Etempvar _t'2 tint))))
-              Sskip)
             (Ssequence
-              (Scall None
-                (Evar _pacha_eevdf_copy_runqueue (Tfunction
-                                                   ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                                    (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                                    nil) tvoid cc_default))
-                ((Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-                 (Eaddrof
-                   (Efield
-                     (Ederef
-                       (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
-                       (Tstruct _pacha_sched_state noattr)) _runqueue
-                     (Tstruct _pacha_eevdf_runqueue noattr))
-                   (tptr (Tstruct _pacha_eevdf_runqueue noattr))) :: nil))
-              (Sreturn (Some (Econst_int (Int.repr 0) tint)))))))
-      Sskip))
-  (Sreturn (Some (Econst_int (Int.repr 0) tint))))
+              (Scall (Some _t'2)
+                (Evar _current_entity_index (Tfunction
+                                              ((tptr (Tstruct _pacha_sched_state noattr)) ::
+                                               (tptr (Tstruct _pacha_sched_cpu noattr)) ::
+                                               (tptr tulong) :: nil) tint
+                                              cc_default))
+                ((Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr))) ::
+                 (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+                 (Eaddrof (Evar _current_index tulong) (tptr tulong)) :: nil))
+              (Sifthenelse (Eunop Onotbool (Etempvar _t'2 tint) tint)
+                (Ssequence
+                  (Scall None
+                    (Evar _clear_cpu_current (Tfunction
+                                               ((tptr (Tstruct _pacha_sched_cpu noattr)) ::
+                                                nil) tvoid cc_default))
+                    ((Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+                     nil))
+                  (Sreturn (Some (Econst_int (Int.repr 0) tint))))
+                Sskip))
+            (Ssequence
+              (Ssequence
+                (Sset _t'6 (Evar _current_index tulong))
+                (Sset _thread_id
+                  (Efield
+                    (Ederef
+                      (Ebinop Oadd
+                        (Efield
+                          (Efield
+                            (Ederef
+                              (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                              (Tstruct _pacha_sched_state noattr)) _runqueue
+                            (Tstruct _pacha_eevdf_runqueue noattr)) _entities
+                          (tarray (Tstruct _pacha_eevdf_entity noattr) 256))
+                        (Etempvar _t'6 tulong)
+                        (tptr (Tstruct _pacha_eevdf_entity noattr)))
+                      (Tstruct _pacha_eevdf_entity noattr)) _thread_id tlong)))
+              (Ssequence
+                (Ssequence
+                  (Scall (Some _t'3)
+                    (Evar _pacha_eevdf_charge (Tfunction
+                                                ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                 tlong :: tlong ::
+                                                 (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                 nil) tint cc_default))
+                    ((Eaddrof
+                       (Efield
+                         (Ederef
+                           (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                           (Tstruct _pacha_sched_state noattr)) _runqueue
+                         (Tstruct _pacha_eevdf_runqueue noattr))
+                       (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                     (Etempvar _thread_id tlong) ::
+                     (Etempvar _runtime_ns tlong) ::
+                     (Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                     nil))
+                  (Sset _rc (Etempvar _t'3 tint)))
+                (Ssequence
+                  (Sifthenelse (Ebinop One (Etempvar _rc tint)
+                                 (Econst_int (Int.repr 0) tint) tint)
+                    (Ssequence
+                      (Scall (Some _t'4)
+                        (Evar _map_eevdf_rc (Tfunction (tint :: nil) tint
+                                              cc_default))
+                        ((Etempvar _rc tint) :: nil))
+                      (Sreturn (Some (Etempvar _t'4 tint))))
+                    Sskip)
+                  (Ssequence
+                    (Scall None
+                      (Evar _pacha_eevdf_copy_runqueue (Tfunction
+                                                         ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                          (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                          nil) tvoid
+                                                         cc_default))
+                      ((Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                       (Eaddrof
+                         (Efield
+                           (Ederef
+                             (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                             (Tstruct _pacha_sched_state noattr)) _runqueue
+                           (Tstruct _pacha_eevdf_runqueue noattr))
+                         (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                       nil))
+                    (Sreturn (Some (Econst_int (Int.repr 0) tint)))))))))
+        Sskip))
+    (Sreturn (Some (Econst_int (Int.repr 0) tint)))))
 |}.
 
 Definition f_pacha_sched_on_timer := {|
@@ -1035,8 +1220,8 @@ Definition f_pacha_sched_pick := {|
   fn_vars := nil;
   fn_temps := ((_pick_rc, tint) :: (_mark, tint) :: (_t'6, tint) ::
                (_t'5, tint) :: (_t'4, tint) :: (_t'3, tint) ::
-               (_t'2, tint) :: (_t'1, tint) :: (_t'9, tint) ::
-               (_t'8, tlong) :: (_t'7, tlong) :: nil);
+               (_t'2, tint) :: (_t'1, tint) :: (_t'10, tint) ::
+               (_t'9, tlong) :: (_t'8, tlong) :: (_t'7, tlong) :: nil);
   fn_body :=
 (Ssequence
   (Scall None
@@ -1115,13 +1300,13 @@ Definition f_pacha_sched_pick := {|
                  (tptr (Tstruct _pacha_eevdf_runqueue noattr))) :: nil))
             (Ssequence
               (Ssequence
-                (Sset _t'9
+                (Sset _t'10
                   (Efield
                     (Ederef
                       (Etempvar _pick_scratch (tptr (Tstruct _pacha_eevdf_pick_result noattr)))
                       (Tstruct _pacha_eevdf_pick_result noattr)) _has_entity
                     tint))
-                (Sifthenelse (Eunop Onotbool (Etempvar _t'9 tint) tint)
+                (Sifthenelse (Eunop Onotbool (Etempvar _t'10 tint) tint)
                   (Ssequence
                     (Scall None
                       (Evar _idle_decision (Tfunction
@@ -1136,7 +1321,7 @@ Definition f_pacha_sched_pick := {|
               (Ssequence
                 (Ssequence
                   (Ssequence
-                    (Sset _t'8
+                    (Sset _t'9
                       (Efield
                         (Efield
                           (Ederef
@@ -1158,7 +1343,7 @@ Definition f_pacha_sched_pick := {|
                              (Tstruct _pacha_sched_state noattr)) _runqueue
                            (Tstruct _pacha_eevdf_runqueue noattr))
                          (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-                       (Etempvar _t'8 tlong) ::
+                       (Etempvar _t'9 tlong) ::
                        (Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                        nil)))
                   (Sset _mark (Etempvar _t'5 tint)))
@@ -1206,20 +1391,30 @@ Definition f_pacha_sched_pick := {|
                                 (Tstruct _pacha_eevdf_pick_result noattr))
                               _entity (Tstruct _pacha_eevdf_entity noattr))
                             _thread_id tlong))
-                        (Scall None
-                          (Evar _set_cpu_current (Tfunction
-                                                   ((tptr (Tstruct _pacha_sched_cpu noattr)) ::
-                                                    tlong :: nil) tvoid
-                                                   cc_default))
-                          ((Ebinop Oadd
-                             (Efield
-                               (Ederef
-                                 (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
-                                 (Tstruct _pacha_sched_state noattr)) _cpus
-                               (tarray (Tstruct _pacha_sched_cpu noattr) 256))
-                             (Etempvar _cpu_id tulong)
-                             (tptr (Tstruct _pacha_sched_cpu noattr))) ::
-                           (Etempvar _t'7 tlong) :: nil)))
+                        (Ssequence
+                          (Sset _t'8
+                            (Efield
+                              (Efield
+                                (Ederef
+                                  (Etempvar _pick_scratch (tptr (Tstruct _pacha_eevdf_pick_result noattr)))
+                                  (Tstruct _pacha_eevdf_pick_result noattr))
+                                _entity (Tstruct _pacha_eevdf_entity noattr))
+                              _generation tlong))
+                          (Scall None
+                            (Evar _set_cpu_current (Tfunction
+                                                     ((tptr (Tstruct _pacha_sched_cpu noattr)) ::
+                                                      tlong :: tlong :: nil)
+                                                     tvoid cc_default))
+                            ((Ebinop Oadd
+                               (Efield
+                                 (Ederef
+                                   (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                                   (Tstruct _pacha_sched_state noattr)) _cpus
+                                 (tarray (Tstruct _pacha_sched_cpu noattr) 256))
+                               (Etempvar _cpu_id tulong)
+                               (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+                             (Etempvar _t'7 tlong) ::
+                             (Etempvar _t'8 tlong) :: nil))))
                       (Ssequence
                         (Scall None
                           (Evar _run_thread_decision (Tfunction
@@ -1248,11 +1443,12 @@ Definition f_finish_current_valid := {|
                 (_cpu_id, tulong) ::
                 (_scratch, (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
                 nil);
-  fn_vars := nil;
+  fn_vars := ((_current_index, tulong) :: nil);
   fn_temps := ((_cpu, (tptr (Tstruct _pacha_sched_cpu noattr))) ::
-               (_thread_id, tlong) :: (_rc, tint) :: (_t'4, tint) ::
-               (_t'3, tint) :: (_t'2, tint) ::
-               (_t'1, (tptr (Tstruct _pacha_sched_cpu noattr))) :: nil);
+               (_thread_id, tlong) :: (_rc, tint) :: (_t'5, tint) ::
+               (_t'4, tint) :: (_t'3, tint) :: (_t'2, tint) ::
+               (_t'1, (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+               (_t'6, tulong) :: nil);
   fn_body :=
 (Ssequence
   (Ssequence
@@ -1267,61 +1463,27 @@ Definition f_finish_current_valid := {|
     (Sset _cpu (Etempvar _t'1 (tptr (Tstruct _pacha_sched_cpu noattr)))))
   (Ssequence
     (Ssequence
-      (Scall (Some _t'4)
+      (Scall (Some _t'5)
         (Evar _sched_cpu_has_current (Tfunction
                                        ((tptr (Tstruct _pacha_sched_cpu noattr)) ::
                                         nil) tint cc_default))
         ((Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) :: nil))
-      (Sifthenelse (Etempvar _t'4 tint)
+      (Sifthenelse (Etempvar _t'5 tint)
         (Ssequence
-          (Sset _thread_id
-            (Efield
-              (Ederef
-                (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr)))
-                (Tstruct _pacha_sched_cpu noattr)) _current_thread_id tlong))
+          (Sassign (Evar _current_index tulong)
+            (Econst_int (Int.repr 0) tint))
           (Ssequence
             (Ssequence
               (Scall (Some _t'2)
-                (Evar _pacha_eevdf_requeue_running (Tfunction
-                                                     ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                                      tlong ::
-                                                      (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                                      nil) tint cc_default))
-                ((Eaddrof
-                   (Efield
-                     (Ederef
-                       (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
-                       (Tstruct _pacha_sched_state noattr)) _runqueue
-                     (Tstruct _pacha_eevdf_runqueue noattr))
-                   (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-                 (Etempvar _thread_id tlong) ::
-                 (Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-                 nil))
-              (Sset _rc (Etempvar _t'2 tint)))
-            (Ssequence
-              (Sifthenelse (Ebinop One (Etempvar _rc tint)
-                             (Econst_int (Int.repr 0) tint) tint)
-                (Ssequence
-                  (Scall (Some _t'3)
-                    (Evar _map_eevdf_rc (Tfunction (tint :: nil) tint
-                                          cc_default))
-                    ((Etempvar _rc tint) :: nil))
-                  (Sreturn (Some (Etempvar _t'3 tint))))
-                Sskip)
-              (Ssequence
-                (Scall None
-                  (Evar _pacha_eevdf_copy_runqueue (Tfunction
-                                                     ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                                      (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
-                                                      nil) tvoid cc_default))
-                  ((Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
-                   (Eaddrof
-                     (Efield
-                       (Ederef
-                         (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
-                         (Tstruct _pacha_sched_state noattr)) _runqueue
-                       (Tstruct _pacha_eevdf_runqueue noattr))
-                     (tptr (Tstruct _pacha_eevdf_runqueue noattr))) :: nil))
+                (Evar _current_entity_index (Tfunction
+                                              ((tptr (Tstruct _pacha_sched_state noattr)) ::
+                                               (tptr (Tstruct _pacha_sched_cpu noattr)) ::
+                                               (tptr tulong) :: nil) tint
+                                              cc_default))
+                ((Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr))) ::
+                 (Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+                 (Eaddrof (Evar _current_index tulong) (tptr tulong)) :: nil))
+              (Sifthenelse (Eunop Onotbool (Etempvar _t'2 tint) tint)
                 (Ssequence
                   (Scall None
                     (Evar _clear_cpu_current (Tfunction
@@ -1329,7 +1491,79 @@ Definition f_finish_current_valid := {|
                                                 nil) tvoid cc_default))
                     ((Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) ::
                      nil))
-                  (Sreturn (Some (Econst_int (Int.repr 0) tint))))))))
+                  (Sreturn (Some (Econst_int (Int.repr 0) tint))))
+                Sskip))
+            (Ssequence
+              (Ssequence
+                (Sset _t'6 (Evar _current_index tulong))
+                (Sset _thread_id
+                  (Efield
+                    (Ederef
+                      (Ebinop Oadd
+                        (Efield
+                          (Efield
+                            (Ederef
+                              (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                              (Tstruct _pacha_sched_state noattr)) _runqueue
+                            (Tstruct _pacha_eevdf_runqueue noattr)) _entities
+                          (tarray (Tstruct _pacha_eevdf_entity noattr) 256))
+                        (Etempvar _t'6 tulong)
+                        (tptr (Tstruct _pacha_eevdf_entity noattr)))
+                      (Tstruct _pacha_eevdf_entity noattr)) _thread_id tlong)))
+              (Ssequence
+                (Ssequence
+                  (Scall (Some _t'3)
+                    (Evar _pacha_eevdf_requeue_running (Tfunction
+                                                         ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                          tlong ::
+                                                          (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                          nil) tint
+                                                         cc_default))
+                    ((Eaddrof
+                       (Efield
+                         (Ederef
+                           (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                           (Tstruct _pacha_sched_state noattr)) _runqueue
+                         (Tstruct _pacha_eevdf_runqueue noattr))
+                       (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                     (Etempvar _thread_id tlong) ::
+                     (Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                     nil))
+                  (Sset _rc (Etempvar _t'3 tint)))
+                (Ssequence
+                  (Sifthenelse (Ebinop One (Etempvar _rc tint)
+                                 (Econst_int (Int.repr 0) tint) tint)
+                    (Ssequence
+                      (Scall (Some _t'4)
+                        (Evar _map_eevdf_rc (Tfunction (tint :: nil) tint
+                                              cc_default))
+                        ((Etempvar _rc tint) :: nil))
+                      (Sreturn (Some (Etempvar _t'4 tint))))
+                    Sskip)
+                  (Ssequence
+                    (Scall None
+                      (Evar _pacha_eevdf_copy_runqueue (Tfunction
+                                                         ((tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                          (tptr (Tstruct _pacha_eevdf_runqueue noattr)) ::
+                                                          nil) tvoid
+                                                         cc_default))
+                      ((Etempvar _scratch (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                       (Eaddrof
+                         (Efield
+                           (Ederef
+                             (Etempvar _sched (tptr (Tstruct _pacha_sched_state noattr)))
+                             (Tstruct _pacha_sched_state noattr)) _runqueue
+                           (Tstruct _pacha_eevdf_runqueue noattr))
+                         (tptr (Tstruct _pacha_eevdf_runqueue noattr))) ::
+                       nil))
+                    (Ssequence
+                      (Scall None
+                        (Evar _clear_cpu_current (Tfunction
+                                                   ((tptr (Tstruct _pacha_sched_cpu noattr)) ::
+                                                    nil) tvoid cc_default))
+                        ((Etempvar _cpu (tptr (Tstruct _pacha_sched_cpu noattr))) ::
+                         nil))
+                      (Sreturn (Some (Econst_int (Int.repr 0) tint))))))))))
         Sskip))
     (Sreturn (Some (Econst_int (Int.repr 0) tint)))))
 |}.
@@ -1404,7 +1638,8 @@ Definition composites : list composite_definition :=
    noattr ::
  Composite _pacha_sched_cpu Struct
    (Member_plain _has_current tint ::
-    Member_plain _current_thread_id tlong :: nil)
+    Member_plain _current_thread_id tlong ::
+    Member_plain _current_generation tlong :: nil)
    noattr ::
  Composite _pacha_sched_state Struct
    (Member_plain _runqueue (Tstruct _pacha_eevdf_runqueue noattr) ::
@@ -1744,6 +1979,7 @@ Definition global_definitions : list (ident * globdef fundef type) :=
  (_clear_cpu_current, Gfun(Internal f_clear_cpu_current)) ::
  (_set_cpu_current, Gfun(Internal f_set_cpu_current)) ::
  (_clear_current_if_matches, Gfun(Internal f_clear_current_if_matches)) ::
+ (_current_entity_index, Gfun(Internal f_current_entity_index)) ::
  (_pacha_sched_empty_state, Gfun(Internal f_pacha_sched_empty_state)) ::
  (_pacha_sched_add_thread, Gfun(Internal f_pacha_sched_add_thread)) ::
  (_pacha_sched_wake_thread, Gfun(Internal f_pacha_sched_wake_thread)) ::

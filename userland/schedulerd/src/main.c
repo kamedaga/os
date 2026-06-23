@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 
-#include "eevdf.h"
 #include "sched_loop.h"
 
 #include <stdint.h>
@@ -16,11 +15,6 @@ int main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-
-    const int self_check = pacha_eevdf_self_check();
-    if (self_check != 0) {
-        return 1;
-    }
 
     pacha_sched_loop_t *loop = &g_sched_loop;
     pacha_sched_loop_init(loop, PACHA_SCHEDULERD_SCHEDCTL_FD, PACHA_SCHEDULERD_EVENT_FD);

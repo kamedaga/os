@@ -16,25 +16,21 @@ int pacha_capsule_has_rights(const struct pacha_capsule_info *info, uint64_t rig
 
 int pacha_capsule_query(int fd, struct pacha_capsule_info *out) {
     if (!out) return -1;
-    uint64_t words[16] = {0};
-    const long ret = pacha_syscall3(PACHA_CAPSULE_SYSCALL_QUERY, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)words, 16);
-    if (ret < 0 || ret < 16) return pacha_status_to_int(ret);
+    uint64_t words[11] = {0};
+    const long ret = pacha_syscall3(PACHA_CAPSULE_SYSCALL_QUERY, (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)words, 11);
+    if (ret < 0 || ret < 11) return pacha_status_to_int(ret);
     *out = (struct pacha_capsule_info){
         .fd = words[0],
-        .parent_fd = words[2],
-        .kind = words[3],
-        .state = words[4],
-        .rights = words[5],
-        .owner = words[6],
-        .generation = words[7],
-        .revoke_generation = words[8],
-        .device = words[9],
-        .object_id = words[10],
-        .user_va = words[11],
-        .iova = words[12],
-        .size = words[13],
-        .index = words[14],
-        .flags = words[15],
+        .kind = words[1],
+        .rights = words[2],
+        .owner = words[3],
+        .device = words[4],
+        .object_id = words[5],
+        .user_va = words[6],
+        .iova = words[7],
+        .size = words[8],
+        .index = words[9],
+        .flags = words[10],
     };
     return 0;
 }

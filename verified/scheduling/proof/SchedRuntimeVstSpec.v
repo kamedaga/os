@@ -97,7 +97,8 @@ Definition sched_cpu_c_shape
     (cpu : sched_cpu)
   : Prop :=
   c_bool_int_value (if sc_has_current cpu then 1 else 0) /\
-  c_int64_value (sc_current_thread_id cpu).
+  c_int64_value (sc_current_thread_id cpu) /\
+  c_int64_value (sc_current_generation cpu).
 
 Definition sched_decision_c_shape
     (decision : sched_decision)

@@ -1,22 +1,10 @@
 #include "sched_loop.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-
-static void debug_log(const char *label, const pacha_sched_event_t *event, uint32_t cpu, uint64_t thread_id, int status)
-{
-    (void)label;
-    (void)event;
-    (void)cpu;
-    (void)thread_id;
-    (void)status;
-}
-
-static void debug_mark(const char *message)
-{
-    (void)message;
-}
 
 static uint64_t event_weight(const pacha_sched_event_t *event)
 {
@@ -28,260 +16,176 @@ static uint64_t event_slice(const pacha_sched_event_t *event)
     return event->slice_ns == 0 ? PACHA_EEVDF_DEFAULT_SLICE_NS : event->slice_ns;
 }
 
-static uint32_t event_cpu(const pacha_sched_event_t *event)
+static uint32_t event_cpu(const pacha_sched_loop_t *loop, const pacha_sched_event_t *event)
 {
-    return event->cpu_id < PACHA_SCHED_LOOP_MAX_CPUS ? event->cpu_id : 0;
+    if (loop == 0 || event == 0 || loop->cpu_count == 0) return 0;
+    return event->cpu_id < loop->cpu_count ? event->cpu_id : 0;
 }
 
-static void note_cpu(pacha_sched_loop_t *loop, uint32_t cpu)
+static int event_i64(uint64_t value, int64_t *out)
 {
-    if (cpu < PACHA_SCHED_LOOP_MAX_CPUS) {
-        loop->known_cpu_mask |= 1ull << cpu;
-    }
+    if (out == 0 || value > (uint64_t)INT64_MAX) return 0;
+    *out = (int64_t)value;
+    return 1;
 }
 
-static uint32_t choose_ready_cpu(pacha_sched_loop_t *loop, uint32_t preferred)
+static int event_positive_i64(uint64_t value, int64_t fallback, int64_t *out)
 {
-    if (preferred >= PACHA_SCHED_LOOP_MAX_CPUS) preferred = 0;
-    note_cpu(loop, preferred);
-    uint64_t idle = loop->idle_cpu_mask & loop->known_cpu_mask;
-    if (idle != 0) {
-        for (uint32_t cpu = 0; cpu < PACHA_SCHED_LOOP_MAX_CPUS; cpu++) {
-            if ((idle & (1ull << cpu)) != 0) return cpu;
-        }
-    }
-    return preferred;
+    uint64_t selected = value == 0 ? (uint64_t)fallback : value;
+    if (!event_i64(selected, out)) return 0;
+    return *out > 0;
 }
 
-static uint32_t first_cpu_in_mask(uint64_t mask)
-{
-    for (uint32_t cpu = 1; cpu < PACHA_SCHED_LOOP_MAX_CPUS; cpu++) {
-        if ((mask & (1ull << cpu)) != 0) return cpu;
-    }
-    return PACHA_SCHED_LOOP_MAX_CPUS;
-}
-
-static uint32_t running_cpu_for(
-    const pacha_sched_loop_t *loop,
-    uint64_t thread_id,
-    uint64_t generation)
-{
-    if (loop == 0 || thread_id == PACHA_SCHED_NO_THREAD) {
-        return PACHA_SCHED_LOOP_MAX_CPUS;
-    }
-    for (uint32_t cpu = 0; cpu < PACHA_SCHED_LOOP_MAX_CPUS; cpu++) {
-        if (loop->running_thread[cpu] == thread_id &&
-            loop->running_generation[cpu] == generation) {
-            return cpu;
-        }
-    }
-    return PACHA_SCHED_LOOP_MAX_CPUS;
-}
-
-static void clear_running_cpu(pacha_sched_loop_t *loop, uint32_t cpu)
-{
-    if (loop == 0 || cpu >= PACHA_SCHED_LOOP_MAX_CPUS) return;
-    loop->running_thread[cpu] = PACHA_SCHED_NO_THREAD;
-    loop->running_generation[cpu] = 0;
-}
-
-static void note_running_cpu(
+static int commit_decision(
     pacha_sched_loop_t *loop,
-    uint32_t cpu,
-    uint64_t thread_id,
-    uint64_t generation)
-{
-    if (loop == 0 || cpu >= PACHA_SCHED_LOOP_MAX_CPUS) return;
-    loop->running_thread[cpu] = thread_id;
-    loop->running_generation[cpu] = generation;
-}
-
-static pacha_eevdf_entity_t *find_entity_on_cpu(pacha_sched_loop_t *loop, uint64_t thread_id, uint32_t *cpu_out)
-{
-    for (uint32_t cpu = 0; cpu < PACHA_SCHED_LOOP_MAX_CPUS; cpu++) {
-        pacha_eevdf_entity_t *entity = pacha_eevdf_find(&loop->runqueues[cpu], thread_id);
-        if (entity == 0) continue;
-        if (entity->state == PACHA_EEVDF_EMPTY || entity->state == PACHA_EEVDF_EXITED) continue;
-        if (cpu_out != 0) *cpu_out = cpu;
-        return entity;
-    }
-    return 0;
-}
-
-static int ensure_entity_on_cpu(pacha_sched_loop_t *loop, const pacha_sched_event_t *event, uint32_t cpu)
-{
-    const uint32_t running_cpu = running_cpu_for(loop, event->thread_id, event->generation);
-    if (running_cpu != PACHA_SCHED_LOOP_MAX_CPUS && running_cpu != cpu) {
-        return -6;
-    }
-    uint32_t existing_cpu = 0;
-    pacha_eevdf_entity_t *entity = find_entity_on_cpu(loop, event->thread_id, &existing_cpu);
-    if (entity != 0) {
-        if (existing_cpu != cpu) {
-            (void)pacha_eevdf_exit(&loop->runqueues[existing_cpu], event->thread_id);
-            return pacha_eevdf_reset(
-                &loop->runqueues[cpu],
-                event->thread_id,
-                event->generation,
-                event_weight(event),
-                event_slice(event));
-        }
-        if (entity->generation != event->generation || entity->state == PACHA_EEVDF_EXITED) {
-            return pacha_eevdf_reset(
-                &loop->runqueues[cpu],
-                event->thread_id,
-                event->generation,
-                event_weight(event),
-                event_slice(event));
-        }
-        entity->generation = event->generation;
-        entity->weight = event_weight(event);
-        entity->slice_ns = event_slice(event);
-        return pacha_eevdf_wake(&loop->runqueues[cpu], event->thread_id);
-    }
-    return pacha_eevdf_reset(
-        &loop->runqueues[cpu],
-        event->thread_id,
-        event->generation,
-        event_weight(event),
-        event_slice(event));
-}
-
-static int charge_running(pacha_sched_loop_t *loop, const pacha_sched_event_t *event)
-{
-    uint32_t cpu = event_cpu(event);
-    pacha_eevdf_entity_t *entity = pacha_eevdf_find(&loop->runqueues[cpu], event->thread_id);
-    if (entity == 0 || entity->generation != event->generation || entity->state == PACHA_EEVDF_EXITED) {
-        const uint32_t running_cpu = running_cpu_for(loop, event->thread_id, event->generation);
-        if (running_cpu != PACHA_SCHED_LOOP_MAX_CPUS && running_cpu != cpu) {
-            return -5;
-        }
-        int status = ensure_entity_on_cpu(loop, event, cpu);
-        if (status != 0) return status;
-        entity = pacha_eevdf_find(&loop->runqueues[cpu], event->thread_id);
-        if (entity == 0) return -1;
-    }
-    if (entity->state == PACHA_EEVDF_RUNNABLE) {
-        if (pacha_eevdf_mark_running(&loop->runqueues[cpu], event->thread_id) != 0) return -2;
-    }
-    if (event->runtime_ns != 0) {
-        if (pacha_eevdf_charge(&loop->runqueues[cpu], event->thread_id, event->runtime_ns) != 0) return -3;
-    }
-    if (entity->state == PACHA_EEVDF_RUNNING) {
-        if (pacha_eevdf_requeue_running(&loop->runqueues[cpu], event->thread_id) != 0) return -4;
-    }
-    return 0;
-}
-
-static int move_pick_to_commit_cpu(
-    pacha_sched_loop_t *loop,
-    uint32_t commit_cpu,
-    uint32_t *pick_cpu,
-    pacha_eevdf_entity_t **picked)
-{
-    if (loop == 0 || pick_cpu == 0 || picked == 0 || *picked == 0) return -1;
-    if (commit_cpu >= PACHA_SCHED_LOOP_MAX_CPUS || *pick_cpu >= PACHA_SCHED_LOOP_MAX_CPUS) return -2;
-    if (*pick_cpu == commit_cpu) return 0;
-
-    pacha_eevdf_entity_t snapshot = **picked;
-    snapshot.state = PACHA_EEVDF_RUNNABLE;
-    if (pacha_eevdf_exit(&loop->runqueues[*pick_cpu], snapshot.thread_id) != 0) return -3;
-    if (pacha_eevdf_import_runnable(&loop->runqueues[commit_cpu], &snapshot) != 0) return -4;
-
-    *pick_cpu = commit_cpu;
-    *picked = pacha_eevdf_find(&loop->runqueues[commit_cpu], snapshot.thread_id);
-    return *picked == 0 ? -5 : 0;
-}
-
-static int submit_pick(
-    pacha_sched_loop_t *loop,
-    uint32_t commit_cpu,
-    uint32_t *pick_cpu,
-    pacha_eevdf_entity_t **picked,
+    const pacha_sched_decision *decision,
     uint64_t sequence)
 {
-    if (loop == 0 || pick_cpu == 0 || picked == 0) return -1;
-    if (*picked != 0 && move_pick_to_commit_cpu(loop, commit_cpu, pick_cpu, picked) != 0) {
-        return -2;
-    }
+    if (loop == 0 || decision == 0) return -1;
+    if (decision->kind == PACHA_SCHED_DECISION_NONE) return 0;
 
     pacha_sched_commit_t commit;
     memset(&commit, 0, sizeof(commit));
     commit.size = sizeof(commit);
     commit.version = PACHA_SCHED_ABI_VERSION;
-    commit.cpu_id = commit_cpu;
-    commit.thread_id = *picked == 0 ? PACHA_SCHED_NO_THREAD : (*picked)->thread_id;
-    commit.generation = *picked == 0 ? 0 : (*picked)->generation;
     commit.sequence = sequence;
 
-    if (*picked != 0) {
-        const uint32_t running_cpu = running_cpu_for(loop, commit.thread_id, commit.generation);
-        if (running_cpu != PACHA_SCHED_LOOP_MAX_CPUS && running_cpu != commit_cpu) {
-            debug_log("commit-running", 0, commit_cpu, commit.thread_id, -5);
-            return -5;
-        }
+    switch (decision->kind) {
+    case PACHA_SCHED_DECISION_RUN_THREAD:
+        if (decision->cpu_id >= loop->cpu_count) return -2;
+        if (decision->thread_id <= 0 || decision->generation < 0) return -3;
+        commit.cpu_id = (uint32_t)decision->cpu_id;
+        commit.thread_id = (uint64_t)decision->thread_id;
+        commit.generation = (uint64_t)decision->generation;
+        break;
+    case PACHA_SCHED_DECISION_IDLE:
+        if (decision->cpu_id >= loop->cpu_count) return -4;
+        commit.cpu_id = (uint32_t)decision->cpu_id;
+        commit.thread_id = PACHA_SCHED_NO_THREAD;
+        commit.generation = 0;
+        break;
+    case PACHA_SCHED_DECISION_NONE:
+    default:
+        return -5;
     }
 
-    if (loop->schedctl_fd >= 0 && ioctl(loop->schedctl_fd, PACHA_SCHED_IOCTL_COMMIT, &commit) != 0) {
-        debug_log("commit-failed", 0, commit_cpu, commit.thread_id, -3);
-        return -3;
-    }
-    if (*picked != 0) {
-        if (pacha_eevdf_mark_running(&loop->runqueues[*pick_cpu], (*picked)->thread_id) != 0) return -4;
-        note_running_cpu(loop, commit_cpu, (*picked)->thread_id, (*picked)->generation);
-        if (commit_cpu < PACHA_SCHED_LOOP_MAX_CPUS) loop->idle_cpu_mask &= ~(1ull << commit_cpu);
-    } else {
-        clear_running_cpu(loop, commit_cpu);
+    if (loop->schedctl_fd >= 0 &&
+        ioctl(loop->schedctl_fd, PACHA_SCHED_IOCTL_COMMIT, &commit) != 0) {
+        return -6;
     }
     loop->commit_count++;
-    debug_log("commit", 0, commit_cpu, commit.thread_id, 0);
     return 0;
 }
 
-static int commit_pick(pacha_sched_loop_t *loop, uint32_t cpu_id, uint64_t sequence)
+static int pick_and_commit(pacha_sched_loop_t *loop, uint32_t cpu, uint64_t sequence)
 {
-    uint32_t target_cpu = cpu_id < PACHA_SCHED_LOOP_MAX_CPUS ? cpu_id : 0;
-    note_cpu(loop, target_cpu);
+    if (loop == 0 || cpu >= loop->cpu_count) return -1;
+    pacha_sched_rc rc = pacha_sched_pick(
+        &loop->sched,
+        cpu,
+        &loop->decision,
+        &loop->pick_scratch,
+        &loop->runqueue_scratch);
+    if (rc != PACHA_SCHED_OK) return -10 - (int)rc;
+    return commit_decision(loop, &loop->decision, sequence);
+}
 
-    uint64_t eligible_mask = loop->idle_cpu_mask & loop->known_cpu_mask & ~1ull;
-    if (eligible_mask == 0) return 0;
+static int add_or_wake(pacha_sched_loop_t *loop, const pacha_sched_event_t *event)
+{
+    int64_t thread_id;
+    int64_t generation;
+    int64_t weight;
+    int64_t slice_ns;
+    if (!event_i64(event->thread_id, &thread_id)) return -1;
+    if (!event_i64(event->generation, &generation)) return -2;
+    if (!event_positive_i64(event_weight(event), PACHA_EEVDF_DEFAULT_WEIGHT, &weight)) return -3;
+    if (!event_positive_i64(event_slice(event), PACHA_EEVDF_DEFAULT_SLICE_NS, &slice_ns)) return -4;
 
-    for (unsigned attempt = 0; attempt < PACHA_SCHED_LOOP_MAX_CPUS; attempt++) {
-        uint32_t commit_cpu = ((eligible_mask & (1ull << target_cpu)) != 0)
-            ? target_cpu
-            : first_cpu_in_mask(eligible_mask);
-        if (commit_cpu >= PACHA_SCHED_LOOP_MAX_CPUS) return 0;
+    pacha_sched_rc rc = pacha_sched_add_thread(
+        &loop->sched,
+        thread_id,
+        generation,
+        weight,
+        slice_ns,
+        &loop->decision,
+        &loop->runqueue_scratch);
+    if (rc == PACHA_SCHED_OK) return 0;
 
-        uint32_t pick_cpu = commit_cpu;
-        pacha_eevdf_entity_t *picked = pacha_eevdf_pick(&loop->runqueues[pick_cpu]);
-        for (uint32_t cpu = 0; picked == 0 && cpu < PACHA_SCHED_LOOP_MAX_CPUS; cpu++) {
-            if (cpu == pick_cpu) continue;
-            picked = pacha_eevdf_pick(&loop->runqueues[cpu]);
-            if (picked != 0) pick_cpu = cpu;
-        }
-        if (picked == 0) {
-            debug_log("no-pick", 0, commit_cpu, 0, 0);
-            return 0;
-        }
+    rc = pacha_sched_wake_thread(
+        &loop->sched,
+        thread_id,
+        &loop->decision,
+        &loop->runqueue_scratch);
+    if (rc == PACHA_SCHED_OK || rc == PACHA_SCHED_ERR_STATE) return 0;
+    return -10 - (int)rc;
+}
 
-        if (submit_pick(loop, commit_cpu, &pick_cpu, &picked, sequence) == 0) {
-            return 0;
-        }
-
-        eligible_mask &= ~(1ull << commit_cpu);
+static int block_thread(pacha_sched_loop_t *loop, uint64_t raw_thread_id)
+{
+    int64_t thread_id;
+    if (!event_i64(raw_thread_id, &thread_id)) return -1;
+    pacha_sched_rc rc = pacha_sched_block_thread(
+        &loop->sched,
+        thread_id,
+        &loop->decision,
+        &loop->runqueue_scratch);
+    if (rc == PACHA_SCHED_OK ||
+        rc == PACHA_SCHED_ERR_INVALID ||
+        rc == PACHA_SCHED_ERR_STATE) {
+        return 0;
     }
-    return 0;
+    return -10 - (int)rc;
+}
+
+static int exit_thread(pacha_sched_loop_t *loop, uint64_t raw_thread_id)
+{
+    int64_t thread_id;
+    if (!event_i64(raw_thread_id, &thread_id)) return -1;
+    pacha_sched_rc rc = pacha_sched_exit_thread(
+        &loop->sched,
+        thread_id,
+        &loop->decision,
+        &loop->runqueue_scratch);
+    if (rc == PACHA_SCHED_OK ||
+        rc == PACHA_SCHED_ERR_INVALID ||
+        rc == PACHA_SCHED_ERR_STATE) {
+        return 0;
+    }
+    return -10 - (int)rc;
+}
+
+static int finish_cpu(pacha_sched_loop_t *loop, uint32_t cpu)
+{
+    pacha_sched_rc rc = pacha_sched_finish_current(
+        &loop->sched,
+        cpu,
+        &loop->decision,
+        &loop->runqueue_scratch);
+    if (rc == PACHA_SCHED_OK || rc == PACHA_SCHED_ERR_STATE) return 0;
+    return -10 - (int)rc;
+}
+
+static int charge_and_finish(pacha_sched_loop_t *loop, const pacha_sched_event_t *event)
+{
+    const uint32_t cpu = event_cpu(loop, event);
+    if (event->runtime_ns > (uint64_t)INT64_MAX) return -1;
+    pacha_sched_rc rc = pacha_sched_on_timer(
+        &loop->sched,
+        cpu,
+        (int64_t)event->runtime_ns,
+        &loop->decision,
+        &loop->runqueue_scratch);
+    if (rc != PACHA_SCHED_OK) return -10 - (int)rc;
+    return finish_cpu(loop, cpu);
 }
 
 void pacha_sched_loop_init(pacha_sched_loop_t *loop, int schedctl_fd, int event_fd)
 {
     memset(loop, 0, sizeof(*loop));
-    for (uint32_t cpu = 0; cpu < PACHA_SCHED_LOOP_MAX_CPUS; cpu++) {
-        pacha_eevdf_init(&loop->runqueues[cpu]);
-    }
     loop->schedctl_fd = schedctl_fd;
     loop->event_fd = event_fd;
-    loop->known_cpu_mask = 1ull;
+    loop->cpu_count = PACHA_SCHED_LOOP_MAX_CPUS;
+    pacha_sched_empty_state(loop->cpu_count, &loop->sched);
 }
 
 int pacha_sched_loop_dispatch(pacha_sched_loop_t *loop, const pacha_sched_event_t *event)
@@ -289,88 +193,42 @@ int pacha_sched_loop_dispatch(pacha_sched_loop_t *loop, const pacha_sched_event_
     if (loop == 0 || event == 0) return -1;
     if (event->size < sizeof(*event) || event->version != PACHA_SCHED_ABI_VERSION) return -2;
     loop->dispatch_count++;
-    const uint32_t cpu = event_cpu(event);
-    note_cpu(loop, cpu);
-    debug_log("event", event, cpu, event->thread_id, 0);
+    const uint32_t cpu = event_cpu(loop, event);
 
     switch (event->type) {
     case PACHA_SCHED_EVENT_THREAD_READY:
         if (event->thread_id == PACHA_SCHED_NO_THREAD) return -3;
         {
-            uint32_t target_cpu = choose_ready_cpu(loop, cpu);
-            debug_log("ready-target", event, target_cpu, event->thread_id, 0);
-            int status = ensure_entity_on_cpu(loop, event, target_cpu);
-            if (status != 0) {
-                debug_log("ready-ensure-failed", event, target_cpu, event->thread_id, status);
-                return status;
-            }
-            if ((loop->idle_cpu_mask & (1ull << target_cpu)) != 0) {
-                return commit_pick(loop, target_cpu, event->sequence);
-            }
+            int status = add_or_wake(loop, event);
+            if (status != 0) return status;
         }
-        return commit_pick(loop, cpu, event->sequence);
+        return pick_and_commit(loop, cpu, event->sequence);
     case PACHA_SCHED_EVENT_THREAD_BLOCKED:
         if (event->thread_id == PACHA_SCHED_NO_THREAD) return -3;
-        loop->idle_cpu_mask |= 1ull << cpu;
-        if (loop->running_thread[cpu] == event->thread_id &&
-            loop->running_generation[cpu] == event->generation) {
-            clear_running_cpu(loop, cpu);
-        }
         {
-            uint32_t entity_cpu = cpu;
-            pacha_eevdf_entity_t *entity = find_entity_on_cpu(loop, event->thread_id, &entity_cpu);
-            if (entity != 0 && entity->generation == event->generation) {
-                int status = pacha_eevdf_block(&loop->runqueues[entity_cpu], event->thread_id);
-                if (status != 0) return status;
-            }
+            int status = block_thread(loop, event->thread_id);
+            if (status != 0) return status;
         }
-        return commit_pick(loop, cpu, event->sequence);
+        return pick_and_commit(loop, cpu, event->sequence);
     case PACHA_SCHED_EVENT_THREAD_EXITED:
         if (event->thread_id == PACHA_SCHED_NO_THREAD) return -3;
-        loop->idle_cpu_mask |= 1ull << cpu;
-        if (loop->running_thread[cpu] == event->thread_id &&
-            loop->running_generation[cpu] == event->generation) {
-            clear_running_cpu(loop, cpu);
-        }
         {
-            uint32_t entity_cpu = cpu;
-            pacha_eevdf_entity_t *entity = find_entity_on_cpu(loop, event->thread_id, &entity_cpu);
-            if (entity != 0 && entity->generation == event->generation) {
-                int status = pacha_eevdf_exit(&loop->runqueues[entity_cpu], event->thread_id);
-                if (status != 0) return status;
-            }
+            int status = exit_thread(loop, event->thread_id);
+            if (status != 0) return status;
         }
-        return commit_pick(loop, cpu, event->sequence);
+        return pick_and_commit(loop, cpu, event->sequence);
     case PACHA_SCHED_EVENT_THREAD_YIELD:
     case PACHA_SCHED_EVENT_TICK:
-        loop->idle_cpu_mask |= 1ull << cpu;
-        if (event->thread_id >= 4) debug_mark("[schedulerd] tick enter\n");
         if (event->thread_id != PACHA_SCHED_NO_THREAD) {
-            if (loop->running_thread[cpu] == event->thread_id &&
-                loop->running_generation[cpu] == event->generation) {
-                clear_running_cpu(loop, cpu);
-            }
-            int status = charge_running(loop, event);
-            if (event->thread_id >= 4) debug_mark("[schedulerd] tick charged\n");
-            if (status != 0) {
-                debug_log("charge-failed", event, cpu, event->thread_id, status);
-            }
-            debug_log("charge-done", event, cpu, event->thread_id, status);
-            status = ensure_entity_on_cpu(loop, event, cpu);
-            if (event->thread_id >= 4) debug_mark("[schedulerd] tick requeued\n");
-            if (status != 0) {
-                debug_log("requeue-failed", event, cpu, event->thread_id, status);
-                return status;
-            }
-            debug_log("requeue-done", event, cpu, event->thread_id, status);
+            int status = charge_and_finish(loop, event);
+            if (status != 0) return status;
+        } else {
+            int status = finish_cpu(loop, cpu);
+            if (status != 0) return status;
         }
-        debug_log("commit-pick", event, cpu, event->thread_id, 0);
-        if (event->thread_id >= 4) debug_mark("[schedulerd] tick commit\n");
-        return commit_pick(loop, cpu, event->sequence);
+        return pick_and_commit(loop, cpu, event->sequence);
     case PACHA_SCHED_EVENT_CPU_IDLE:
-        loop->idle_cpu_mask |= 1ull << cpu;
-        clear_running_cpu(loop, cpu);
-        return commit_pick(loop, cpu, event->sequence);
+        return pick_and_commit(loop, cpu, event->sequence);
     default:
         return -4;
     }
@@ -381,11 +239,12 @@ int pacha_sched_loop_run_once(pacha_sched_loop_t *loop)
     if (loop == 0 || loop->event_fd < 0) return -1;
     pacha_sched_event_t event;
     ssize_t nread = read(loop->event_fd, &event, sizeof(event));
-    if (nread < 0) return -5;
+    if (nread < 0) {
+        return errno == EAGAIN || errno == EWOULDBLOCK ? -5 : -6;
+    }
     if (nread >= 0 && nread < (ssize_t)sizeof(event)) return -5;
     if (nread != (ssize_t)sizeof(event)) return -3;
-    const int status = pacha_sched_loop_dispatch(loop, &event);
-    return status;
+    return pacha_sched_loop_dispatch(loop, &event);
 }
 
 int pacha_sched_loop_demo(pacha_sched_loop_t *loop)
@@ -426,7 +285,7 @@ int pacha_sched_loop_demo(pacha_sched_loop_t *loop)
             .type = PACHA_SCHED_EVENT_TICK,
             .sequence = 4,
             .cpu_id = 0,
-            .thread_id = 2,
+            .thread_id = 1,
             .generation = 1,
             .runtime_ns = 750000,
         },

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 pub const capsule = @import("capsule.zig");
 const vtd = @import("vtd.zig");
+const x86_platform = @import("arch/x86_64/platform.zig");
 pub const initial_process_count: usize = 8;
 pub const initial_process_capacity: usize = 32;
 pub const process_count: usize = initial_process_capacity;
@@ -11,7 +12,6 @@ pub const max_thread_slots: usize = 65536;
 pub const device_count: usize = 1;
 pub const device_principal_raw: u32 = @intCast(max_process_slots);
 pub const principal_count: usize = process_count + device_count;
-pub const cap_transfer_id_min: u64 = 0x1000;
 
 pub const PrincipalRaw = u32;
 
@@ -56,15 +56,7 @@ fn isProcessPrincipal(principal: PrincipalId) bool {
     return processIndexFromPrincipal(principal) != null;
 }
 
-pub const Rights = struct {
-    cpu_read: bool = false,
-    cpu_write: bool = false,
-    dma: bool = false,
-    grant: bool = false,
-};
-
 pub const CapsuleKind = capsule.CapsuleKind;
-pub const CapsuleState = capsule.CapsuleState;
 pub const CapsuleRights = capsule.Rights;
 pub const CapsuleMetadata = capsule.Metadata;
 pub const CapsuleSnapshot = capsule.Snapshot;
@@ -78,26 +70,9 @@ pub const MapProt = struct {
     pkey: u4 = 0,
 };
 
-pub const Capability = struct {
-    paddr: u64 = 0,
-    rights: Rights = .{},
-    cap_id: u64 = 0,
-    root_cap_id: u64 = 0,
-    parent_cap_id: u64 = 0,
-};
-
-pub const EndpointCapability = struct {
+pub const EndpointRoute = struct {
     endpoint_id: u64,
     target: PrincipalId,
-};
-
-pub const PendingCapTransfer = struct {
-    transfer_id: u64,
-    sender: PrincipalId,
-    endpoint_id: u64,
-    paddr: u64,
-    rights: Rights,
-    retain_sender: bool = false,
 };
 
 pub const Region = struct {
@@ -129,7 +104,6 @@ pub const DebugProcessLifecycleReason = enum(u8) {
 
 pub const KernelError = error{
     RegionNotFound,
-    CapabilityNotFound,
     EndpointNotFound,
     MailboxEmpty,
     RevokeOverflow,
@@ -311,6 +285,15 @@ pub const IrqObject = struct {
     vector: u32 = 0,
     event_count: u64 = 0,
     flags: u32 = 0,
+};
+
+const IrqPublishSlot = struct {
+    active: u8 = 0,
+    generation: u32 = 0,
+    owner_principal_raw: PrincipalRaw = 0,
+    kind: u8 = 0,
+    vector: u32 = 0,
+    event_count: u64 = 0,
 };
 
 pub const TimerObject = struct {
@@ -610,444 +593,6 @@ pub const NativeVmaFaultMapping = struct {
     prot: MapProt,
 };
 
-pub const CNode = struct {
-    pub const inline_caps = 512;
-    pub const chunk_caps = 512;
-    pub const chunk_pool_count = 8192;
-    pub const max_caps = inline_caps + chunk_pool_count * chunk_caps;
-    pub const paddr_index_slots = 65536;
-    const invalid_chunk: u16 = std.math.maxInt(u16);
-    const invalid_index: u32 = std.math.maxInt(u32);
-
-    caps: [inline_caps]Capability = [_]Capability{.{}} ** inline_caps,
-    paddr_index: [paddr_index_slots]u32 = [_]u32{invalid_index} ** paddr_index_slots,
-    paddr_index_overflow: bool = false,
-    overflow_head: u16 = invalid_chunk,
-    len: usize = 0,
-
-    pub fn add(self: *CNode, cap: Capability) KernelError!void {
-        if (self.findIndex(cap.paddr) != null) return KernelError.InvalidState;
-        try self.putFresh(cap);
-    }
-
-    pub fn addAssumeFresh(self: *CNode, cap: Capability) KernelError!void {
-        try self.putFresh(cap);
-    }
-
-    fn putFresh(self: *CNode, cap: Capability) KernelError!void {
-        const slot = try self.slotAtOrAllocate(self.len);
-        slot.* = cap;
-        self.insertPaddrIndex(cap.paddr, self.len);
-        trackPageCapAdded(cap);
-        self.len += 1;
-    }
-
-    pub fn reset(self: *CNode) void {
-        self.releaseTrackedPageRefs();
-        self.resetStorageOnly();
-    }
-
-    fn resetStorageOnly(self: *CNode) void {
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            const next = cap_chunk_pool[chunk_index].next;
-            cap_chunk_pool[chunk_index] = .{};
-            chunk_index = next;
-        }
-        self.* = .{};
-    }
-
-    pub fn removeByPaddr(self: *CNode, paddr: u64) bool {
-        if (self.findIndex(paddr)) |index| {
-            self.removeIndex(index);
-            return true;
-        }
-        return false;
-    }
-
-    pub fn find(self: *const CNode, paddr: u64) ?*const Capability {
-        if (self.findIndex(paddr)) |index| {
-            return self.slotAtConst(index);
-        }
-        return null;
-    }
-
-    pub fn findByCapId(self: *const CNode, cap_id: u64) ?*const Capability {
-        if (self.findIndexByCapId(cap_id)) |index| {
-            return self.slotAtConst(index);
-        }
-        return null;
-    }
-
-    pub fn removeByCapId(self: *CNode, cap_id: u64) bool {
-        if (self.findIndexByCapId(cap_id)) |index| {
-            self.removeIndex(index);
-            return true;
-        }
-        return false;
-    }
-
-    pub fn removeExclusiveRootByPaddr(self: *CNode, paddr: u64) KernelError!void {
-        const index = self.findIndex(paddr) orelse return KernelError.CapabilityNotFound;
-        const cap = (self.slotAtConst(index) orelse return KernelError.CapabilityNotFound).*;
-        if (cap.cap_id != cap.root_cap_id or cap.parent_cap_id != 0) return KernelError.InvalidState;
-        self.removeIndex(index);
-    }
-
-    pub fn get(self: *const CNode, index: usize) ?Capability {
-        if (index >= self.len) return null;
-        return (self.slotAtConst(index) orelse return null).*;
-    }
-
-    pub fn popLast(self: *CNode) ?Capability {
-        if (self.len == 0) return null;
-        const last_index = self.len - 1;
-        const cap = (self.slotAtConst(last_index) orelse return null).*;
-        self.removePaddrIndex(cap.paddr);
-        trackPageCapRemoved(cap);
-        self.len = last_index;
-        if (self.slotAt(self.len)) |slot| slot.* = .{};
-        self.trimUnusedChunks();
-        return cap;
-    }
-
-    fn removeIndex(self: *CNode, index: usize) void {
-        if (index >= self.len) return;
-        const last_index = self.len - 1;
-        const removed = (self.slotAtConst(index) orelse return).*;
-        self.removePaddrIndex(removed.paddr);
-        trackPageCapRemoved(removed);
-        if (index != last_index) {
-            const last = (self.slotAtConst(last_index) orelse return).*;
-            self.removePaddrIndex(last.paddr);
-            (self.slotAt(index) orelse return).* = last;
-            self.insertPaddrIndex(last.paddr, index);
-        }
-        self.len -= 1;
-        if (self.slotAt(self.len)) |slot| slot.* = .{};
-        self.trimUnusedChunks();
-    }
-
-    fn findIndex(self: *const CNode, paddr: u64) ?usize {
-        if (self.findIndexByPaddrIndex(paddr)) |index| return index;
-        if (!self.paddr_index_overflow) return null;
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            const cap = self.slotAtConst(i) orelse return null;
-            if (cap.paddr == paddr) return i;
-        }
-        return null;
-    }
-
-    fn paddrHash(paddr: u64) usize {
-        const page = paddr >> 12;
-        const mixed = page *% 11400714819323198485;
-        return @intCast(mixed & @as(u64, paddr_index_slots - 1));
-    }
-
-    fn probeDistance(home: usize, slot: usize) usize {
-        return (slot + paddr_index_slots - home) & (paddr_index_slots - 1);
-    }
-
-    fn findIndexByPaddrIndex(self: *const CNode, paddr: u64) ?usize {
-        var slot = paddrHash(paddr);
-        var probes: usize = 0;
-        while (probes < paddr_index_slots) : (probes += 1) {
-            const stored = self.paddr_index[slot];
-            if (stored == invalid_index) return null;
-            const index: usize = @intCast(stored);
-            if (index < self.len) {
-                const cap = self.slotAtConst(index) orelse return null;
-                if (cap.paddr == paddr) return index;
-            }
-            slot = (slot + 1) & (paddr_index_slots - 1);
-        }
-        return null;
-    }
-
-    fn insertPaddrIndex(self: *CNode, paddr: u64, index: usize) void {
-        if (index > std.math.maxInt(u32)) {
-            self.paddr_index_overflow = true;
-            return;
-        }
-        var slot = paddrHash(paddr);
-        var probes: usize = 0;
-        while (probes < paddr_index_slots) : (probes += 1) {
-            if (self.paddr_index[slot] == invalid_index) {
-                self.paddr_index[slot] = @intCast(index);
-                return;
-            }
-            slot = (slot + 1) & (paddr_index_slots - 1);
-        }
-        self.paddr_index_overflow = true;
-    }
-
-    fn removePaddrIndex(self: *CNode, paddr: u64) void {
-        var slot = paddrHash(paddr);
-        var probes: usize = 0;
-        while (probes < paddr_index_slots) : (probes += 1) {
-            const stored = self.paddr_index[slot];
-            if (stored == invalid_index) return;
-            const index: usize = @intCast(stored);
-            if (index < self.len) {
-                if (self.slotAtConst(index)) |cap| {
-                    if (cap.paddr == paddr) {
-                        self.removePaddrIndexSlot(slot);
-                        return;
-                    }
-                }
-            }
-            slot = (slot + 1) & (paddr_index_slots - 1);
-        }
-    }
-
-    fn removePaddrIndexSlot(self: *CNode, remove_slot: usize) void {
-        var hole = remove_slot;
-        var slot = (hole + 1) & (paddr_index_slots - 1);
-        while (self.paddr_index[slot] != invalid_index) {
-            const index: usize = @intCast(self.paddr_index[slot]);
-            const cap = self.slotAtConst(index) orelse break;
-            const home = paddrHash(cap.paddr);
-            if (probeDistance(home, slot) > probeDistance(home, hole)) {
-                self.paddr_index[hole] = self.paddr_index[slot];
-                hole = slot;
-            }
-            slot = (slot + 1) & (paddr_index_slots - 1);
-        }
-        self.paddr_index[hole] = invalid_index;
-    }
-
-    fn findIndexByCapId(self: *const CNode, cap_id: u64) ?usize {
-        var i: usize = 0;
-        while (i < self.len) : (i += 1) {
-            const cap = self.slotAtConst(i) orelse return null;
-            if (cap.cap_id == cap_id) return i;
-        }
-        return null;
-    }
-
-    fn slotAt(self: *CNode, index: usize) ?*Capability {
-        if (index < inline_caps) return &self.caps[index];
-        var remaining = index - inline_caps;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_caps) return &cap_chunk_pool[chunk_index].caps[remaining];
-            remaining -= chunk_caps;
-            chunk_index = cap_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAtConst(self: *const CNode, index: usize) ?*const Capability {
-        if (index < inline_caps) return &self.caps[index];
-        var remaining = index - inline_caps;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_caps) return &cap_chunk_pool[chunk_index].caps[remaining];
-            remaining -= chunk_caps;
-            chunk_index = cap_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAtOrAllocate(self: *CNode, index: usize) KernelError!*Capability {
-        if (index < inline_caps) return &self.caps[index];
-        const needed_chunk_offset = (index - inline_caps) / chunk_caps;
-        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
-        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocCapChunk();
-
-        var chunk_index = self.overflow_head;
-        var offset: usize = 0;
-        while (offset < needed_chunk_offset) : (offset += 1) {
-            if (cap_chunk_pool[chunk_index].next == invalid_chunk) {
-                cap_chunk_pool[chunk_index].next = try allocCapChunk();
-            }
-            chunk_index = cap_chunk_pool[chunk_index].next;
-        }
-        return &cap_chunk_pool[chunk_index].caps[(index - inline_caps) % chunk_caps];
-    }
-
-    fn trimUnusedChunks(self: *CNode) void {
-        if (self.overflow_head == invalid_chunk) return;
-        if (self.len <= inline_caps) {
-            freeCapChunks(self.overflow_head);
-            self.overflow_head = invalid_chunk;
-            return;
-        }
-        const needed_chunks = (self.len - inline_caps + chunk_caps - 1) / chunk_caps;
-        var chunk_index = self.overflow_head;
-        var kept: usize = 1;
-        while (kept < needed_chunks and chunk_index != invalid_chunk) : (kept += 1) {
-            chunk_index = cap_chunk_pool[chunk_index].next;
-        }
-        if (chunk_index == invalid_chunk) return;
-        const free_head = cap_chunk_pool[chunk_index].next;
-        cap_chunk_pool[chunk_index].next = invalid_chunk;
-        freeCapChunks(free_head);
-    }
-
-    fn releaseTrackedPageRefs(self: *CNode) void {
-        const inline_limit = @min(self.len, inline_caps);
-        var index: usize = 0;
-        while (index < inline_limit) : (index += 1) {
-            trackPageCapRemoved(self.caps[index]);
-        }
-
-        var remaining = self.len - inline_limit;
-        var chunk_index = self.overflow_head;
-        while (remaining > 0 and chunk_index != invalid_chunk) {
-            const chunk = &cap_chunk_pool[chunk_index];
-            const chunk_limit = @min(remaining, chunk_caps);
-            index = 0;
-            while (index < chunk_limit) : (index += 1) {
-                trackPageCapRemoved(chunk.caps[index]);
-            }
-            remaining -= chunk_limit;
-            chunk_index = chunk.next;
-        }
-    }
-};
-
-const CapChunk = struct {
-    used: bool = false,
-    next: u16 = CNode.invalid_chunk,
-    caps: [CNode.chunk_caps]Capability = [_]Capability{.{}} ** CNode.chunk_caps,
-};
-
-var empty_cap_chunk_pool: [0]CapChunk = .{};
-var cap_chunk_pool: []CapChunk = empty_cap_chunk_pool[0..];
-
-fn freeCapChunks(head: u16) void {
-    var chunk_index = head;
-    while (chunk_index != CNode.invalid_chunk) {
-        const next = cap_chunk_pool[chunk_index].next;
-        cap_chunk_pool[chunk_index] = .{};
-        chunk_index = next;
-    }
-}
-
-const PageCapRefEntry = struct {
-    paddr: u64 = 0,
-    refs: u32 = 0,
-};
-
-const page_cap_ref_slots: usize = 1 << 19;
-var empty_page_cap_refs: [0]PageCapRefEntry = .{};
-var page_cap_refs: []PageCapRefEntry = empty_page_cap_refs[0..];
-var page_cap_ref_overflow: bool = false;
-
-fn pageCapRefHash(paddr: u64) usize {
-    const page = paddr >> 12;
-    const mixed = page *% 11400714819323198485;
-    return @intCast(mixed & @as(u64, page_cap_ref_slots - 1));
-}
-
-fn pageCapRefProbeDistance(home: usize, slot: usize) usize {
-    return (slot + page_cap_ref_slots - home) & (page_cap_ref_slots - 1);
-}
-
-fn pageCapRefRemoveSlot(remove_slot: usize) void {
-    var hole = remove_slot;
-    var slot = (hole + 1) & (page_cap_ref_slots - 1);
-    while (page_cap_refs[slot].refs != 0) {
-        const home = pageCapRefHash(page_cap_refs[slot].paddr);
-        if (pageCapRefProbeDistance(home, slot) > pageCapRefProbeDistance(home, hole)) {
-            page_cap_refs[hole] = page_cap_refs[slot];
-            hole = slot;
-        }
-        slot = (slot + 1) & (page_cap_ref_slots - 1);
-    }
-    page_cap_refs[hole] = .{};
-}
-
-fn clearPageCapRefTable() void {
-    @memset(page_cap_refs[0..], .{});
-    page_cap_ref_overflow = false;
-}
-
-fn rebuildPageCapRefsExcluding(state: *const KernelState, excluded_owner: PrincipalId) void {
-    clearPageCapRefTable();
-    const excluded_index = state.principalStorageIndex(excluded_owner);
-    var pidx: usize = 0;
-    while (pidx < state.process_capacity) : (pidx += 1) {
-        if (pidx == excluded_index) continue;
-        if (!(state.processDescriptorSlotConst(pidx) orelse continue).active) continue;
-        const table = state.capTableForProcessIndexConst(pidx);
-        var index: usize = 0;
-        while (index < table.len) : (index += 1) {
-            const cap = table.get(index) orelse break;
-            trackPageCapAdded(cap);
-        }
-    }
-    if (excluded_owner != .Device0) {
-        const table = &state.cap_tables[process_count];
-        var index: usize = 0;
-        while (index < table.len) : (index += 1) {
-            const cap = table.get(index) orelse break;
-            trackPageCapAdded(cap);
-        }
-    }
-}
-
-fn trackPageCapAdded(cap: Capability) void {
-    if (cap.cap_id == 0) return;
-    if (page_cap_ref_overflow) return;
-    var slot = pageCapRefHash(cap.paddr);
-    var probes: usize = 0;
-    while (probes < page_cap_ref_slots) : (probes += 1) {
-        const entry = &page_cap_refs[slot];
-        if (entry.refs == 0) {
-            entry.* = .{ .paddr = cap.paddr, .refs = 1 };
-            return;
-        }
-        if (entry.paddr == cap.paddr) {
-            entry.refs +|= 1;
-            return;
-        }
-        slot = (slot + 1) & (page_cap_ref_slots - 1);
-    }
-    page_cap_ref_overflow = true;
-}
-
-fn trackPageCapRemoved(cap: Capability) void {
-    if (cap.cap_id == 0) return;
-    if (page_cap_ref_overflow) return;
-    var slot = pageCapRefHash(cap.paddr);
-    var probes: usize = 0;
-    while (probes < page_cap_ref_slots) : (probes += 1) {
-        const entry = &page_cap_refs[slot];
-        if (entry.refs == 0) return;
-        if (entry.paddr == cap.paddr) {
-            entry.refs -= 1;
-            if (entry.refs == 0) pageCapRefRemoveSlot(slot);
-            return;
-        }
-        slot = (slot + 1) & (page_cap_ref_slots - 1);
-    }
-}
-
-fn pageCapRefCount(paddr: u64) u32 {
-    if (page_cap_ref_overflow) return std.math.maxInt(u32);
-    var slot = pageCapRefHash(paddr);
-    var probes: usize = 0;
-    while (probes < page_cap_ref_slots) : (probes += 1) {
-        const entry = page_cap_refs[slot];
-        if (entry.refs == 0) return 0;
-        if (entry.paddr == paddr) return entry.refs;
-        slot = (slot + 1) & (page_cap_ref_slots - 1);
-    }
-    return std.math.maxInt(u32);
-}
-
-fn pageCapRefUniqueCount() u64 {
-    if (page_cap_ref_overflow) return std.math.maxInt(u64);
-    var count: u64 = 0;
-    for (page_cap_refs) |entry| {
-        if (entry.refs != 0) count += 1;
-    }
-    return count;
-}
-
 fn vmObjectBackingFreePageCount() u64 {
     var pages: u64 = 0;
     var i: usize = 0;
@@ -1057,23 +602,13 @@ fn vmObjectBackingFreePageCount() u64 {
     return pages;
 }
 
-fn allocCapChunk() KernelError!u16 {
-    var i: usize = 0;
-    while (i < cap_chunk_pool.len) : (i += 1) {
-        if (cap_chunk_pool[i].used) continue;
-        cap_chunk_pool[i] = .{ .used = true };
-        return @intCast(i);
-    }
-    return KernelError.TableFull;
-}
-
-pub const EndpointCNode = struct {
+pub const EndpointTable = struct {
     const max_caps = 8;
 
-    caps: [max_caps]EndpointCapability = undefined,
+    caps: [max_caps]EndpointRoute = undefined,
     len: usize = 0,
 
-    pub fn add(self: *EndpointCNode, cap: EndpointCapability) KernelError!void {
+    pub fn add(self: *EndpointTable, cap: EndpointRoute) KernelError!void {
         if (self.findIndex(cap.endpoint_id)) |index| {
             self.caps[index] = cap;
             return;
@@ -1083,14 +618,14 @@ pub const EndpointCNode = struct {
         self.len += 1;
     }
 
-    pub fn find(self: *const EndpointCNode, endpoint_id: u64) ?*const EndpointCapability {
+    pub fn find(self: *const EndpointTable, endpoint_id: u64) ?*const EndpointRoute {
         if (self.findIndex(endpoint_id)) |index| {
             return &self.caps[index];
         }
         return null;
     }
 
-    fn findIndex(self: *const EndpointCNode, endpoint_id: u64) ?usize {
+    fn findIndex(self: *const EndpointTable, endpoint_id: u64) ?usize {
         var i: usize = 0;
         const limit = @min(self.len, self.caps.len);
         while (i < limit) : (i += 1) {
@@ -1103,10 +638,10 @@ pub const EndpointCNode = struct {
 pub const PublishedEndpointTable = struct {
     const max_caps = 64;
 
-    caps: [max_caps]EndpointCapability = undefined,
+    caps: [max_caps]EndpointRoute = undefined,
     len: usize = 0,
 
-    pub fn publish(self: *PublishedEndpointTable, cap: EndpointCapability) KernelError!void {
+    pub fn publish(self: *PublishedEndpointTable, cap: EndpointRoute) KernelError!void {
         if (self.findIndex(cap.endpoint_id)) |index| {
             self.caps[index] = cap;
             return;
@@ -1116,7 +651,7 @@ pub const PublishedEndpointTable = struct {
         self.len += 1;
     }
 
-    pub fn find(self: *const PublishedEndpointTable, endpoint_id: u64) ?*const EndpointCapability {
+    pub fn find(self: *const PublishedEndpointTable, endpoint_id: u64) ?*const EndpointRoute {
         if (self.findIndex(endpoint_id)) |index| {
             return &self.caps[index];
         }
@@ -1149,129 +684,6 @@ pub const PublishedEndpointTable = struct {
         return null;
     }
 };
-
-pub const CapMailbox = struct {
-    const inline_items = 8;
-    const chunk_items = 16;
-    const chunk_pool_count = 512;
-    const invalid_chunk: u16 = std.math.maxInt(u16);
-
-    items: [inline_items]PendingCapTransfer = undefined,
-    overflow_head: u16 = invalid_chunk,
-    len: usize = 0,
-
-    pub fn push(self: *CapMailbox, transfer: PendingCapTransfer) KernelError!void {
-        const slot = try self.slotAtOrAllocate(self.len);
-        slot.* = transfer;
-        self.len += 1;
-    }
-
-    pub fn pop(self: *CapMailbox) ?PendingCapTransfer {
-        if (self.len == 0) return null;
-        const transfer = (self.slotAtConst(0) orelse return null).*;
-        var i: usize = 1;
-        while (i < self.len) : (i += 1) {
-            const item = (self.slotAtConst(i) orelse return null).*;
-            (self.slotAt(i - 1) orelse return null).* = item;
-        }
-        self.len -= 1;
-        if (self.slotAt(self.len)) |slot| slot.* = undefined;
-        self.trimUnusedChunks();
-        return transfer;
-    }
-
-    pub fn reset(self: *CapMailbox) void {
-        freeCapMailboxChunks(self.overflow_head);
-        self.* = .{};
-    }
-
-    fn slotAt(self: *CapMailbox, index: usize) ?*PendingCapTransfer {
-        if (index < inline_items) return &self.items[index];
-        var remaining = index - inline_items;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_items) return &cap_mailbox_chunk_pool[chunk_index].items[remaining];
-            remaining -= chunk_items;
-            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAtConst(self: *const CapMailbox, index: usize) ?*const PendingCapTransfer {
-        if (index < inline_items) return &self.items[index];
-        var remaining = index - inline_items;
-        var chunk_index = self.overflow_head;
-        while (chunk_index != invalid_chunk) {
-            if (remaining < chunk_items) return &cap_mailbox_chunk_pool[chunk_index].items[remaining];
-            remaining -= chunk_items;
-            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
-        }
-        return null;
-    }
-
-    fn slotAtOrAllocate(self: *CapMailbox, index: usize) KernelError!*PendingCapTransfer {
-        if (index < inline_items) return &self.items[index];
-        const needed_chunk_offset = (index - inline_items) / chunk_items;
-        if (needed_chunk_offset >= chunk_pool_count) return KernelError.TableFull;
-        if (self.overflow_head == invalid_chunk) self.overflow_head = try allocCapMailboxChunk();
-
-        var chunk_index = self.overflow_head;
-        var offset: usize = 0;
-        while (offset < needed_chunk_offset) : (offset += 1) {
-            if (cap_mailbox_chunk_pool[chunk_index].next == invalid_chunk) {
-                cap_mailbox_chunk_pool[chunk_index].next = try allocCapMailboxChunk();
-            }
-            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
-        }
-        return &cap_mailbox_chunk_pool[chunk_index].items[(index - inline_items) % chunk_items];
-    }
-
-    fn trimUnusedChunks(self: *CapMailbox) void {
-        if (self.overflow_head == invalid_chunk) return;
-        if (self.len <= inline_items) {
-            freeCapMailboxChunks(self.overflow_head);
-            self.overflow_head = invalid_chunk;
-            return;
-        }
-        const needed_chunks = (self.len - inline_items + chunk_items - 1) / chunk_items;
-        var chunk_index = self.overflow_head;
-        var kept: usize = 1;
-        while (kept < needed_chunks and chunk_index != invalid_chunk) : (kept += 1) {
-            chunk_index = cap_mailbox_chunk_pool[chunk_index].next;
-        }
-        if (chunk_index == invalid_chunk) return;
-        const free_head = cap_mailbox_chunk_pool[chunk_index].next;
-        cap_mailbox_chunk_pool[chunk_index].next = invalid_chunk;
-        freeCapMailboxChunks(free_head);
-    }
-};
-
-const CapMailboxChunk = struct {
-    used: bool = false,
-    next: u16 = CapMailbox.invalid_chunk,
-    items: [CapMailbox.chunk_items]PendingCapTransfer = undefined,
-};
-
-var cap_mailbox_chunk_pool: [CapMailbox.chunk_pool_count]CapMailboxChunk = [_]CapMailboxChunk{.{}} ** CapMailbox.chunk_pool_count;
-
-fn allocCapMailboxChunk() KernelError!u16 {
-    var i: usize = 0;
-    while (i < cap_mailbox_chunk_pool.len) : (i += 1) {
-        if (cap_mailbox_chunk_pool[i].used) continue;
-        cap_mailbox_chunk_pool[i] = .{ .used = true };
-        return @intCast(i);
-    }
-    return KernelError.TableFull;
-}
-
-fn freeCapMailboxChunks(head: u16) void {
-    var chunk_index = head;
-    while (chunk_index != CapMailbox.invalid_chunk) {
-        const next = cap_mailbox_chunk_pool[chunk_index].next;
-        cap_mailbox_chunk_pool[chunk_index] = .{};
-        chunk_index = next;
-    }
-}
 
 pub const max_vmo_backing_pages: usize = 65535;
 pub const max_vmo_backing_store_pages: usize = 262144;
@@ -1394,7 +806,6 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cap_chunk_pool), &cap_chunk_pool));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store), &vmo_backing_page_store));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_next), &vmo_backing_page_store_next));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_free_ranges), &vmo_backing_page_store_free_ranges));
@@ -1418,10 +829,6 @@ fn runtimeStorageSlice(
 
 pub fn runtimeStorageBytes() usize {
     var cursor: usize = 0;
-    cursor = std.mem.alignForward(usize, cursor, @alignOf(CapChunk));
-    cursor += @sizeOf(CapChunk) * CNode.chunk_pool_count;
-    cursor = std.mem.alignForward(usize, cursor, @alignOf(PageCapRefEntry));
-    cursor += @sizeOf(PageCapRefEntry) * page_cap_ref_slots;
     cursor = std.mem.alignForward(usize, cursor, @alignOf(u64));
     cursor += @sizeOf(u64) * max_vmo_backing_store_pages;
     cursor = std.mem.alignForward(usize, cursor, @alignOf(VmoBackingStoreFreeRange));
@@ -1431,16 +838,11 @@ pub fn runtimeStorageBytes() usize {
 
 pub fn initRuntimeStorage(storage: []align(4096) u8) bool {
     var cursor: usize = 0;
-    cap_chunk_pool = runtimeStorageSlice(CapChunk, storage, &cursor, CNode.chunk_pool_count) orelse return false;
-    page_cap_refs = runtimeStorageSlice(PageCapRefEntry, storage, &cursor, page_cap_ref_slots) orelse return false;
     vmo_backing_page_store = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
     vmo_backing_page_store_free_ranges = runtimeStorageSlice(VmoBackingStoreFreeRange, storage, &cursor, max_vmo_backing_store_free_ranges) orelse return false;
 
-    @memset(cap_chunk_pool, .{});
-    @memset(page_cap_refs, .{});
     @memset(vmo_backing_page_store, 0);
     @memset(vmo_backing_page_store_free_ranges, .{});
-    page_cap_ref_overflow = false;
     vmo_backing_page_store_next = 0;
     vmo_backing_page_store_free_range_len = 0;
     return true;
@@ -1765,17 +1167,13 @@ pub const PageCapability = struct {
 };
 
 var empty_process_descriptors_extra: [0]ProcessDescriptor = .{};
-var empty_cap_tables_extra: [0]CNode = .{};
-var empty_endpoint_tables_extra: [0]EndpointCNode = .{};
-var empty_cap_mailboxes_extra: [0]CapMailbox = .{};
-var empty_pending_page_transfers_extra: [0]?PendingCapTransfer = .{};
+var empty_endpoint_tables_extra: [0]EndpointTable = .{};
 var empty_fd_tables_extra: [0]FdTable = .{};
 var empty_vma_tables_extra: [0]VmaTable = .{};
 
 pub const KernelState = struct {
     pub const max_regions = 256;
     pub const low_memory_limit: u64 = 4 * 1024 * 1024 * 1024;
-    const max_total_caps = 65536;
 
     regions: [max_regions]Region = undefined,
     region_len: usize = 0,
@@ -1783,24 +1181,20 @@ pub const KernelState = struct {
     process_descriptors_extra: []ProcessDescriptor = empty_process_descriptors_extra[0..],
     process_capacity: usize = process_count,
     active_process_count: usize = 0,
-    cap_tables: [principal_count]CNode = [_]CNode{.{}} ** principal_count,
-    endpoint_tables: [principal_count]EndpointCNode = [_]EndpointCNode{.{}} ** principal_count,
-    cap_tables_extra: []CNode = empty_cap_tables_extra[0..],
-    endpoint_tables_extra: []EndpointCNode = empty_endpoint_tables_extra[0..],
+    endpoint_tables: [principal_count]EndpointTable = [_]EndpointTable{.{}} ** principal_count,
+    endpoint_tables_extra: []EndpointTable = empty_endpoint_tables_extra[0..],
     published_service_endpoints: PublishedEndpointTable = .{},
     endpoint_generation: u64 = 0,
-    cap_mailboxes: [principal_count]CapMailbox = [_]CapMailbox{.{}} ** principal_count,
-    pending_page_transfers: [principal_count]?PendingCapTransfer = [_]?PendingCapTransfer{null} ** principal_count,
     fd_tables: [process_count]FdTable = [_]FdTable{.{}} ** process_count,
     vma_tables: [process_count]VmaTable = [_]VmaTable{.{}} ** process_count,
-    cap_mailboxes_extra: []CapMailbox = empty_cap_mailboxes_extra[0..],
-    pending_page_transfers_extra: []?PendingCapTransfer = empty_pending_page_transfers_extra[0..],
     fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
     vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
     fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
+    irq_publish_slots: [max_fd_objects]IrqPublishSlot = [_]IrqPublishSlot{.{}} ** max_fd_objects,
     next_fd_object_scan: usize = 0,
     native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
     next_native_vmo_scan: usize = 0,
+    aslr_secret: u64 = 0x6a09_e667_f3bc_c909,
     aslr_sequence: u64 = 1,
     ipc_endpoints: [max_ipc_endpoints]IpcEndpointSlot = [_]IpcEndpointSlot{.{}} ** max_ipc_endpoints,
     next_ipc_endpoint_scan: usize = 0,
@@ -1810,26 +1204,6 @@ pub const KernelState = struct {
     next_ipc_reply_scan: usize = 0,
     zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
     debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
-    revoke_queue: [max_total_caps]u64 = undefined,
-    revoke_subtree: [max_total_caps]u64 = undefined,
-    next_cap_id: u64 = 1,
-    next_transfer_id: u64 = cap_transfer_id_min,
-
-    fn allocCapId(self: *KernelState) u64 {
-        const id = self.next_cap_id;
-        self.next_cap_id +%= 1;
-        return id;
-    }
-
-    fn allocTransferId(self: *KernelState) u64 {
-        var id = self.next_transfer_id;
-        self.next_transfer_id +%= 1;
-        if (id < cap_transfer_id_min) {
-            id = cap_transfer_id_min;
-            self.next_transfer_id = id + 1;
-        }
-        return id;
-    }
 
     fn pageAlignUp(value: u64) u64 {
         return (value + 4095) & ~@as(u64, 4095);
@@ -1841,6 +1215,53 @@ pub const KernelState = struct {
 
     fn isPageAligned(value: u64) bool {
         return (value & (native_page_size - 1)) == 0;
+    }
+
+    fn mixAslr64(value: u64) u64 {
+        var x = value;
+        x ^= x >> 30;
+        x *%= 0xbf58_476d_1ce4_e5b9;
+        x ^= x >> 27;
+        x *%= 0x94d0_49bb_1331_11eb;
+        x ^= x >> 31;
+        return x;
+    }
+
+    fn nextAslrWord(self: *KernelState, owner: PrincipalId, purpose: u64) u64 {
+        self.aslr_sequence +%= 1;
+        const entropy = self.aslr_secret ^
+            self.aslr_sequence ^
+            x86_platform.readTimestampCounter() ^
+            (@as(u64, @intFromEnum(owner)) << 32) ^
+            purpose ^
+            @intFromPtr(self);
+        self.aslr_secret = mixAslr64(entropy);
+        return mixAslr64(self.aslr_secret ^ (self.aslr_sequence *% 0x9e37_79b9_7f4a_7c15));
+    }
+
+    pub fn fillRandomBytes(self: *KernelState, owner: PrincipalId, out: []u8) void {
+        var offset: usize = 0;
+        var word_index: u64 = 0;
+        while (offset < out.len) : (word_index += 1) {
+            var word = self.nextAslrWord(owner, 0x524e_4442_5954_4553 ^ word_index);
+            var byte_index: usize = 0;
+            while (byte_index < 8 and offset < out.len) : ({
+                byte_index += 1;
+                offset += 1;
+            }) {
+                out[offset] = @truncate(word);
+                word >>= 8;
+            }
+        }
+    }
+
+    pub fn findRandomizedFreeUserMapVa(
+        self: *KernelState,
+        owner: PrincipalId,
+        size_bytes: u64,
+        purpose: u64,
+    ) KernelError!u64 {
+        return self.findFreeUserMapVa(owner, size_bytes, self.nextAslrWord(owner, purpose));
     }
 
     fn checkedEnd(start: u64, size: u64) KernelError!u64 {
@@ -2248,6 +1669,45 @@ pub const KernelState = struct {
         return null;
     }
 
+    fn irqPublishSlotForRef(self: *KernelState, object_ref: KernelObjectRef) ?*IrqPublishSlot {
+        if (object_ref.kind != .irq) return null;
+        const index: usize = @intCast(object_ref.index);
+        if (index >= self.irq_publish_slots.len) return null;
+        return &self.irq_publish_slots[index];
+    }
+
+    fn irqPublishSlotForRefConst(self: *const KernelState, object_ref: KernelObjectRef) ?*const IrqPublishSlot {
+        if (object_ref.kind != .irq) return null;
+        const index: usize = @intCast(object_ref.index);
+        if (index >= self.irq_publish_slots.len) return null;
+        return &self.irq_publish_slots[index];
+    }
+
+    fn publishIrqObject(self: *KernelState, object_ref: KernelObjectRef, irq: IrqObject) void {
+        const slot = self.irqPublishSlotForRef(object_ref) orelse return;
+        @atomicStore(u8, &slot.active, 0, .release);
+        @atomicStore(u64, &slot.event_count, 0, .release);
+        @atomicStore(u32, &slot.generation, object_ref.generation, .release);
+        @atomicStore(PrincipalRaw, &slot.owner_principal_raw, irq.owner_principal_raw, .release);
+        @atomicStore(u8, &slot.kind, @intFromEnum(irq.kind), .release);
+        @atomicStore(u32, &slot.vector, irq.vector, .release);
+        @atomicStore(u8, &slot.active, 1, .release);
+    }
+
+    fn unpublishIrqObject(self: *KernelState, object_ref: KernelObjectRef) void {
+        const slot = self.irqPublishSlotForRef(object_ref) orelse return;
+        const generation = @atomicLoad(u32, &slot.generation, .acquire);
+        if (generation != object_ref.generation) return;
+        @atomicStore(u8, &slot.active, 0, .release);
+    }
+
+    fn irqPublishedEventCount(self: *const KernelState, object_ref: KernelObjectRef) ?u64 {
+        const slot = self.irqPublishSlotForRefConst(object_ref) orelse return null;
+        if (@atomicLoad(u8, &slot.active, .acquire) == 0) return 0;
+        if (@atomicLoad(u32, &slot.generation, .acquire) != object_ref.generation) return 0;
+        return @atomicLoad(u64, &slot.event_count, .acquire);
+    }
+
     fn releaseMmioRegionObject(self: *KernelState, mmio: MmioRegionObject) void {
         _ = self;
         if (mmio.user_va == 0 or mmio.size == 0) return;
@@ -2332,6 +1792,10 @@ pub const KernelState = struct {
     }
 
     fn resetKernelObjectTable(self: *KernelState) void {
+        for (self.irq_publish_slots[0..]) |*slot| {
+            @atomicStore(u8, &slot.active, 0, .release);
+            slot.* = .{};
+        }
         for (self.fd_objects[0..]) |*slot| {
             if (slot.kind != .none) self.releaseKernelObjectPayload(slot);
             slot.* = .{};
@@ -2397,7 +1861,10 @@ pub const KernelState = struct {
         const slot = self.kernelObjectSlot(object_ref) orelse return;
         if (slot.ref_count == 0) return;
         slot.ref_count -= 1;
-        if (slot.ref_count == 0) self.clearKernelObjectSlot(slot);
+        if (slot.ref_count == 0) {
+            self.unpublishIrqObject(object_ref);
+            self.clearKernelObjectSlot(slot);
+        }
     }
 
     fn releaseKernelObjectWithFreeList(
@@ -2408,7 +1875,10 @@ pub const KernelState = struct {
         const slot = self.kernelObjectSlot(object_ref) orelse return;
         if (slot.ref_count == 0) return;
         slot.ref_count -= 1;
-        if (slot.ref_count == 0) self.clearKernelObjectSlotWithFreeList(slot, free_list);
+        if (slot.ref_count == 0) {
+            self.unpublishIrqObject(object_ref);
+            self.clearKernelObjectSlotWithFreeList(slot, free_list);
+        }
     }
 
     pub fn kernelObjectRefCount(self: *const KernelState, object_ref: KernelObjectRef) ?u32 {
@@ -2425,13 +1895,6 @@ pub const KernelState = struct {
         @memset(raw[0 .. page_count * 4096], 0);
         const ptr: [*]T = @ptrCast(@alignCast(raw));
         return ptr[0..count];
-    }
-
-    fn isRightsSubset(child: Rights, parent: Rights) bool {
-        return (!child.cpu_read or parent.cpu_read) and
-            (!child.cpu_write or parent.cpu_write) and
-            (!child.dma or parent.dma) and
-            (!child.grant or parent.grant);
     }
 
     fn processPrincipal(index: usize) PrincipalId {
@@ -2507,44 +1970,14 @@ pub const KernelState = struct {
         return &self.process_descriptors[index];
     }
 
-    fn capTableForProcessIndex(self: *KernelState, index: usize) *CNode {
-        if (extraIndex(index)) |extra| return &self.cap_tables_extra[extra];
-        return &self.cap_tables[index];
-    }
-
-    fn capTableForProcessIndexConst(self: *const KernelState, index: usize) *const CNode {
-        if (extraIndex(index)) |extra| return &self.cap_tables_extra[extra];
-        return &self.cap_tables[index];
-    }
-
-    fn endpointTableForProcessIndex(self: *KernelState, index: usize) *EndpointCNode {
+    fn endpointTableForProcessIndex(self: *KernelState, index: usize) *EndpointTable {
         if (extraIndex(index)) |extra| return &self.endpoint_tables_extra[extra];
         return &self.endpoint_tables[index];
     }
 
-    fn endpointTableForProcessIndexConst(self: *const KernelState, index: usize) *const EndpointCNode {
+    fn endpointTableForProcessIndexConst(self: *const KernelState, index: usize) *const EndpointTable {
         if (extraIndex(index)) |extra| return &self.endpoint_tables_extra[extra];
         return &self.endpoint_tables[index];
-    }
-
-    fn capMailboxForProcessIndex(self: *KernelState, index: usize) *CapMailbox {
-        if (extraIndex(index)) |extra| return &self.cap_mailboxes_extra[extra];
-        return &self.cap_mailboxes[index];
-    }
-
-    fn pendingPageTransferForProcessIndex(self: *KernelState, index: usize) *?PendingCapTransfer {
-        if (extraIndex(index)) |extra| return &self.pending_page_transfers_extra[extra];
-        return &self.pending_page_transfers[index];
-    }
-
-    fn capMailboxForPrincipal(self: *KernelState, principal: PrincipalId) *CapMailbox {
-        if (processIndexFromPrincipal(principal)) |index| return self.capMailboxForProcessIndex(index);
-        return &self.cap_mailboxes[self.principalStorageIndex(principal)];
-    }
-
-    fn pendingPageTransferForPrincipal(self: *KernelState, principal: PrincipalId) *?PendingCapTransfer {
-        if (processIndexFromPrincipal(principal)) |index| return self.pendingPageTransferForProcessIndex(index);
-        return &self.pending_page_transfers[self.principalStorageIndex(principal)];
     }
 
     fn fdTableForProcessIndex(self: *KernelState, index: usize) ?*FdTable {
@@ -2675,6 +2108,18 @@ pub const KernelState = struct {
         };
     }
 
+    pub fn setVmaProtExact(self: *KernelState, owner: PrincipalId, start_va: u64, size_bytes: u64, prot: VmaProt) KernelError!void {
+        try self.requireActiveProcess(owner);
+        const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (entry.start_va != start_va or entry.size_bytes != size_bytes) continue;
+            entry.prot = prot;
+            return;
+        }
+        return KernelError.InvalidState;
+    }
+
     pub fn nativeVmoRefForFd(self: *const KernelState, owner: PrincipalId, fd: Fd) ?NativeVmoRef {
         const entry = self.fdEntryConst(owner, fd) orelse return null;
         const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
@@ -2747,10 +2192,7 @@ pub const KernelState = struct {
     pub fn resetProcessRuntimeTables(self: *KernelState, index: usize) void {
         self.releaseVmaTableForProcessIndex(index);
         self.releaseFdTableForProcessIndex(index);
-        self.capTableForProcessIndex(index).reset();
         self.endpointTableForProcessIndex(index).* = .{};
-        self.capMailboxForProcessIndex(index).reset();
-        self.pendingPageTransferForProcessIndex(index).* = null;
     }
 
     fn findFreeVma(table: *const VmaTable) ?usize {
@@ -2935,7 +2377,7 @@ pub const KernelState = struct {
                 info.extra = serial.stream;
             },
             .sched_event => {
-                info.size_bytes = @import("scheduler.zig").externalSchedulerPendingEventCount();
+                info.size_bytes = @import("scheduler.zig").connection.pendingEventCount();
             },
             else => {},
         }
@@ -3105,10 +2547,10 @@ pub const KernelState = struct {
                 .process => |process| process.state != .active,
                 .thread => |thread| thread.state != .active,
                 .event => |counter| entry.rights.read and counter != 0,
-                .irq => |irq| irq.event_count != 0,
+                .irq => (self.irqPublishedEventCount(entry.object) orelse 0) != 0,
                 .timer => |timer| timerDueCount(timer, now_tick) != 0,
                 .serial => false,
-                .sched_event => entry.rights.read and @import("scheduler.zig").externalSchedulerEventReadable(),
+                .sched_event => entry.rights.read and @import("scheduler.zig").connection.eventQueueReadable(),
                 else => false,
             };
             if (readable) ready |= @import("kernel_abi_root").fd_abi.event_readable;
@@ -3317,9 +2759,9 @@ pub const KernelState = struct {
         };
     }
 
-    fn irqMatchesInterrupt(irq: IrqObject, vector: u32) bool {
-        if (irq.kind == .auto) return irq.vector == 0 or irq.vector == vector;
-        return irq.vector == vector;
+    fn irqKindMatchesInterrupt(kind: u8, irq_vector: u32, vector: u32) bool {
+        if (kind == @intFromEnum(CapsuleIrqKind.auto)) return irq_vector == 0 or irq_vector == vector;
+        return irq_vector == vector;
     }
 
     fn appendUniquePrincipal(out: []PrincipalId, count: *usize, principal: PrincipalId) void {
@@ -3334,24 +2776,28 @@ pub const KernelState = struct {
 
     pub fn recordDeviceInterruptEvent(self: *KernelState, vector: u32, wake_owners: []PrincipalId) usize {
         var wake_count: usize = 0;
-        for (self.fd_objects[0..]) |*slot| {
-            if (slot.kind != .irq) continue;
-            switch (slot.payload) {
-                .irq => |*irq| {
-                    if (!irqMatchesInterrupt(irq.*, vector)) continue;
-                    irq.event_count +%= 1;
-                    const owner = objectOwner(irq.owner_principal_raw) orelse continue;
-                    appendUniquePrincipal(wake_owners, &wake_count, owner);
-                },
-                else => {},
-            }
+        for (self.irq_publish_slots[0..]) |*slot| {
+            if (@atomicLoad(u8, &slot.active, .acquire) == 0) continue;
+            const generation = @atomicLoad(u32, &slot.generation, .acquire);
+            const kind = @atomicLoad(u8, &slot.kind, .acquire);
+            const irq_vector = @atomicLoad(u32, &slot.vector, .acquire);
+            if (!irqKindMatchesInterrupt(kind, irq_vector, vector)) continue;
+            if (@atomicLoad(u8, &slot.active, .acquire) == 0) continue;
+            if (@atomicLoad(u32, &slot.generation, .acquire) != generation) continue;
+            _ = @atomicRmw(u64, &slot.event_count, .Add, 1, .acq_rel);
+            const owner_raw = @atomicLoad(PrincipalRaw, &slot.owner_principal_raw, .acquire);
+            const owner = objectOwner(owner_raw) orelse continue;
+            appendUniquePrincipal(wake_owners, &wake_count, owner);
         }
         return wake_count;
     }
 
     pub fn irqEventCountForFd(self: *const KernelState, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?u64 {
-        const irq = self.irqObjectForFd(owner, fd, required_rights) orelse return null;
-        return irq.event_count;
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        if (!isFdRightsSubset(required_rights, entry.rights)) return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        if (slot.kind != .irq) return null;
+        return self.irqPublishedEventCount(entry.object);
     }
 
     pub fn createDeviceFd(
@@ -3439,10 +2885,12 @@ pub const KernelState = struct {
         var payload = irq;
         payload.owner_principal_raw = @intFromEnum(owner);
         const object_ref = try self.createKernelObject(.irq, .{ .irq = payload });
-        return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+        const fd = self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
             if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
             return err;
         };
+        self.publishIrqObject(object_ref, payload);
+        return fd;
     }
 
     pub fn createTimerFd(
@@ -4254,37 +3702,25 @@ pub const KernelState = struct {
         const old_extra_count = self.process_capacity - process_count;
 
         const new_desc = allocKernelSlice(ProcessDescriptor, free_list, extra_count) orelse return false;
-        const new_cap = allocKernelSlice(CNode, free_list, extra_count) orelse return false;
-        const new_endpoint = allocKernelSlice(EndpointCNode, free_list, extra_count) orelse return false;
-        const new_cap_mailbox = allocKernelSlice(CapMailbox, free_list, extra_count) orelse return false;
-        const new_pending = allocKernelSlice(?PendingCapTransfer, free_list, extra_count) orelse return false;
+        const new_endpoint = allocKernelSlice(EndpointTable, free_list, extra_count) orelse return false;
         const new_fd = allocKernelSlice(FdTable, free_list, extra_count) orelse return false;
         const new_vma = allocKernelSlice(VmaTable, free_list, extra_count) orelse return false;
 
         @memcpy(new_desc[0..old_extra_count], self.process_descriptors_extra);
-        @memcpy(new_cap[0..old_extra_count], self.cap_tables_extra);
         @memcpy(new_endpoint[0..old_extra_count], self.endpoint_tables_extra);
-        @memcpy(new_cap_mailbox[0..old_extra_count], self.cap_mailboxes_extra);
-        @memcpy(new_pending[0..old_extra_count], self.pending_page_transfers_extra);
         @memcpy(new_fd[0..old_extra_count], self.fd_tables_extra);
         @memcpy(new_vma[0..old_extra_count], self.vma_tables_extra);
 
         var i = old_extra_count;
         while (i < extra_count) : (i += 1) {
             new_desc[i] = .{};
-            new_cap[i] = .{};
             new_endpoint[i] = .{};
-            new_cap_mailbox[i] = .{};
-            new_pending[i] = null;
             new_fd[i] = .{};
             new_vma[i] = .{};
         }
 
         self.process_descriptors_extra = new_desc;
-        self.cap_tables_extra = new_cap;
         self.endpoint_tables_extra = new_endpoint;
-        self.cap_mailboxes_extra = new_cap_mailbox;
-        self.pending_page_transfers_extra = new_pending;
         self.fd_tables_extra = new_fd;
         self.vma_tables_extra = new_vma;
         self.process_capacity = capacity;
@@ -4389,10 +3825,7 @@ pub const KernelState = struct {
         while (i < self.process_capacity) : (i += 1) {
             self.resetProcessRuntimeTables(i);
         }
-        self.cap_tables[process_count].reset();
         self.endpoint_tables[process_count] = .{};
-        self.cap_mailboxes[process_count].reset();
-        self.pending_page_transfers[process_count] = null;
         resetVmoBackingPageStore();
         self.published_service_endpoints = .{};
         self.resetKernelObjectTable();
@@ -4425,21 +3858,11 @@ pub const KernelState = struct {
 
     pub fn initPhase1InPlace(self: *KernelState) void {
         self.* = .{};
-        clearPageCapRefTable();
-        self.next_cap_id = 1;
         self.regions[0] = .{
             .id = 0,
         };
         self.region_len = 1;
         self.initPrincipalState();
-        const root_id = self.allocCapId();
-        self.getTable(default_process_principal).add(.{
-            .paddr = 0x1000,
-            .rights = .{ .cpu_read = true, .cpu_write = true, .dma = true, .grant = true },
-            .cap_id = root_id,
-            .root_cap_id = root_id,
-            .parent_cap_id = 0,
-        }) catch unreachable;
     }
 
     pub fn initPhase1() KernelState {
@@ -4453,8 +3876,6 @@ pub const KernelState = struct {
         if (region_count > max_regions) return KernelError.TooManyRegions;
 
         self.* = .{};
-        clearPageCapRefTable();
-        self.next_cap_id = 1;
         if (builtin.is_test) {
             self.initPrincipalState();
         } else {
@@ -4492,22 +3913,12 @@ pub const KernelState = struct {
         return null;
     }
 
-    pub fn getTable(self: *KernelState, principal: PrincipalId) *CNode {
-        if (processIndexFromPrincipal(principal)) |index| return self.capTableForProcessIndex(index);
-        return &self.cap_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getTableConst(self: *const KernelState, principal: PrincipalId) *const CNode {
-        if (processIndexFromPrincipal(principal)) |index| return self.capTableForProcessIndexConst(index);
-        return &self.cap_tables[self.principalStorageIndex(principal)];
-    }
-
-    pub fn getEndpointTable(self: *KernelState, principal: PrincipalId) *EndpointCNode {
+    pub fn getEndpointTable(self: *KernelState, principal: PrincipalId) *EndpointTable {
         if (processIndexFromPrincipal(principal)) |index| return self.endpointTableForProcessIndex(index);
         return &self.endpoint_tables[self.principalStorageIndex(principal)];
     }
 
-    pub fn getEndpointTableConst(self: *const KernelState, principal: PrincipalId) *const EndpointCNode {
+    pub fn getEndpointTableConst(self: *const KernelState, principal: PrincipalId) *const EndpointTable {
         if (processIndexFromPrincipal(principal)) |index| return self.endpointTableForProcessIndexConst(index);
         return &self.endpoint_tables[self.principalStorageIndex(principal)];
     }
@@ -4603,18 +4014,12 @@ pub const KernelState = struct {
         print_number: *const fn (u64) void,
         where: []const u8,
     ) void {
-        var page_caps_total: u64 = 0;
         var active_total: u64 = 0;
 
         var pidx: usize = 0;
         while (pidx < self.process_capacity) : (pidx += 1) {
-            const page_table = self.capTableForProcessIndexConst(pidx);
-            page_caps_total += @intCast(page_table.len);
             if ((self.processDescriptorSlotConst(pidx) orelse continue).active) active_total += 1;
         }
-
-        const device_page_table = &self.cap_tables[process_count];
-        page_caps_total += @intCast(device_page_table.len);
 
         write("Kernel.mem_diag where=");
         write(where);
@@ -4623,8 +4028,6 @@ pub const KernelState = struct {
         debugWriteField(write, print_number, "process_capacity", @intCast(self.process_capacity));
         debugWriteField(write, print_number, "active_processes", active_total);
         debugWriteField(write, print_number, "tracked_active", @intCast(self.active_process_count));
-        debugWriteField(write, print_number, "page_caps", page_caps_total);
-        debugWriteField(write, print_number, "page_cap_unique", pageCapRefUniqueCount());
         debugWriteField(write, print_number, "vm_store_next", @intCast(vmo_backing_page_store_next));
         debugWriteField(write, print_number, "vm_store_free_pages", vmObjectBackingFreePageCount());
         debugWriteField(write, print_number, "vm_store_free_ranges", @intCast(vmo_backing_page_store_free_range_len));
@@ -4632,25 +4035,14 @@ pub const KernelState = struct {
 
         pidx = 0;
         while (pidx < self.process_capacity) : (pidx += 1) {
-            const page_table = self.capTableForProcessIndexConst(pidx);
             const desc = self.processDescriptorSlotConst(pidx) orelse continue;
-            if (!desc.active and page_table.len == 0) continue;
+            if (!desc.active) continue;
 
             write("Kernel.mem_diag.proc");
             debugWriteField(write, print_number, "idx", @intCast(pidx));
             debugWriteField(write, print_number, "active", if (desc.active) 1 else 0);
             write(" label=");
             write(desc.label);
-            debugWriteField(write, print_number, "page_caps", @intCast(page_table.len));
-            write("\n");
-        }
-
-        if (device_page_table.len != 0) {
-            write("Kernel.mem_diag.proc");
-            debugWriteField(write, print_number, "idx", @intCast(process_count));
-            debugWriteField(write, print_number, "active", 1);
-            write(" label=Device0");
-            debugWriteField(write, print_number, "page_caps", @intCast(device_page_table.len));
             write("\n");
         }
     }

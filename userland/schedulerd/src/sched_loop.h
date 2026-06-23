@@ -1,21 +1,21 @@
 #ifndef PACHA_SCHEDULERD_SCHED_LOOP_H
 #define PACHA_SCHEDULERD_SCHED_LOOP_H
 
-#include "eevdf.h"
 #include "pacha/scheduler_abi.h"
+#include "pacha_sched.h"
 
 #include <stdint.h>
 
 #define PACHA_SCHED_LOOP_MAX_CPUS 64u
 
 typedef struct pacha_sched_loop {
-    pacha_eevdf_runqueue_t runqueues[PACHA_SCHED_LOOP_MAX_CPUS];
+    pacha_sched_state sched;
+    pacha_sched_decision decision;
+    pacha_eevdf_pick_result pick_scratch;
+    pacha_eevdf_runqueue runqueue_scratch;
     int schedctl_fd;
     int event_fd;
-    uint64_t known_cpu_mask;
-    uint64_t idle_cpu_mask;
-    uint64_t running_thread[PACHA_SCHED_LOOP_MAX_CPUS];
-    uint64_t running_generation[PACHA_SCHED_LOOP_MAX_CPUS];
+    uint32_t cpu_count;
     uint64_t dispatch_count;
     uint64_t commit_count;
 } pacha_sched_loop_t;

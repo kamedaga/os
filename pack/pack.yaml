@@ -431,6 +431,13 @@ apps:
     file:
       path: ".artifacts/cmake/pachaos_capsule/pachaos_capsule.elf"
       rebuild: ["bash", "tools/build_pachaos_capsule.sh"]
+      input:
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/pachaos_capsule/src"
+        - "userland/pachaos_capsule/include"
     out: "PCAPSULE.ELF"
     rootfs: "/srv/pachaos_capsule.elf"
   schedulerd:
@@ -438,12 +445,28 @@ apps:
     file:
       path: ".artifacts/cmake/schedulerd/schedulerd.elf"
       rebuild: ["cmake", "-P", "userland/schedulerd/build.cmake"]
+      input:
+        - "verified/scheduling/src/pacha_eevdf.c"
+        - "verified/scheduling/src/pacha_sched.c"
+        - "verified/scheduling/include/pacha_eevdf.h"
+        - "verified/scheduling/include/pacha_sched.h"
+        - "userland/schedulerd/CMakeLists.txt"
+        - "userland/schedulerd/src"
     out: "SCHEDD.ELF"
     bootfs: "/srv/schedulerd.elf"
   storage_boot:
     role: "service"
     file:
       path: ".artifacts/cmake/storage_boot/storage_boot.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/storage_boot", "--parallel", "1"]
+      input:
+        - "userland/storage_boot/CMakeLists.txt"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/storage_boot/src"
+        - "userland/storage_boot/include"
     out: "STRGBOOT.ELF"
     bootfs: "/srv/storage_boot.elf"
     rootfs: "/srv/storage_boot.elf"
@@ -452,6 +475,16 @@ apps:
     file:
       path: ".artifacts/cmake/seed0boot/seed0boot.elf"
       rebuild: ["cmake", "--build", ".artifacts/cmake/seed0boot", "--parallel", "1"]
+      input:
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/seed0boot/src"
+        - "userland/pachaos_capsule/include"
+        - "userland/storage_boot/include"
     out: "SEED0BT.ELF"
   seed0_next:
     role: "service"
@@ -464,18 +497,60 @@ apps:
     role: "service"
     file:
       path: ".artifacts/cmake/seed0root/seed0root.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/seed0root", "--parallel", "1"]
+      input:
+        - "userland/seed0root/CMakeLists.txt"
+        - "userland/seed0root/src"
+        - "userland/filed/include"
+        - "userland/koboxd/include"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
     out: "SEED0RT.ELF"
     rootfs: "/sbin/seed0root.elf"
+  smp_stress:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/smp_stress/smp_stress.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/smp_stress", "--parallel", "1"]
+      input:
+        - "userland/smp_stress/CMakeLists.txt"
+        - "userland/smp_stress/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+    out: "SMPSTRS.ELF"
+    rootfs: "/sbin/smp_stress.elf"
   koboxd:
     role: "service"
     file:
       path: ".artifacts/cmake/koboxd/koboxd.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/koboxd", "--parallel", "1"]
+      input:
+        - "userland/koboxd/CMakeLists.txt"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/koboxd/src"
     out: "KOBOXD.ELF"
     rootfs: "/sbin/koboxd.elf"
   filed:
     role: "service"
     file:
       path: ".artifacts/cmake/filed/filed.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/filed", "--parallel", "1"]
+      input:
+        - "userland/filed/CMakeLists.txt"
+        - "userland/filed/include"
+        - "userland/filed/src"
+        - "userland/koboxd/include"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
   net_bench:

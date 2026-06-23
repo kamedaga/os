@@ -1,16 +1,16 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 47;
-pub const syscall_capsule_query: u64 = 47;
-pub const syscall_capsule_derive_mmio: u64 = 48;
-pub const syscall_capsule_derive_dma_buffer: u64 = 49;
-pub const syscall_capsule_derive_dma_mapping: u64 = 50;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 51;
-pub const syscall_capsule_derive_irq: u64 = 52;
-pub const syscall_capsule_pci_config_read: u64 = 53;
-pub const syscall_capsule_pci_config_write: u64 = 54;
-pub const syscall_capsule_pci_bar_info: u64 = 55;
-pub const syscall_capsule_irq_poll: u64 = 56;
+pub const syscall_capsule_first: u64 = 48;
+pub const syscall_capsule_query: u64 = 48;
+pub const syscall_capsule_derive_mmio: u64 = 49;
+pub const syscall_capsule_derive_dma_buffer: u64 = 50;
+pub const syscall_capsule_derive_dma_mapping: u64 = 51;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 52;
+pub const syscall_capsule_derive_irq: u64 = 53;
+pub const syscall_capsule_pci_config_read: u64 = 54;
+pub const syscall_capsule_pci_config_write: u64 = 55;
+pub const syscall_capsule_pci_bar_info: u64 = 56;
+pub const syscall_capsule_irq_poll: u64 = 57;
 pub const syscall_capsule_last: u64 = syscall_capsule_irq_poll;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
@@ -19,18 +19,11 @@ pub fn isCapsuleSyscall(nr: u64) bool {
 }
 
 pub const CapsuleKind = enum(u8) {
-    session = 1,
     device = 2,
     mmio = 3,
     dma_buffer = 4,
     dma_mapping = 5,
     irq = 6,
-    event_queue = 7,
-};
-
-pub const CapsuleState = enum(u8) {
-    active = 1,
-    revoked = 2,
 };
 
 pub const Rights = packed struct(u64) {
@@ -74,23 +67,18 @@ pub fn rightsToBits(rights: Rights) u64 {
     return @as(u64, @bitCast(rights)) & known_rights_mask;
 }
 
-pub const snapshot_word_count: usize = 16;
+pub const snapshot_word_count: usize = 11;
 pub const snapshot_fd_index: usize = 0;
-pub const snapshot_root_fd_index: usize = 1;
-pub const snapshot_parent_fd_index: usize = 2;
-pub const snapshot_kind_index: usize = 3;
-pub const snapshot_state_index: usize = 4;
-pub const snapshot_rights_index: usize = 5;
-pub const snapshot_owner_index: usize = 6;
-pub const snapshot_generation_index: usize = 7;
-pub const snapshot_revoke_generation_index: usize = 8;
-pub const snapshot_device_index: usize = 9;
-pub const snapshot_object_id_index: usize = 10;
-pub const snapshot_user_va_index: usize = 11;
-pub const snapshot_iova_index: usize = 12;
-pub const snapshot_size_index: usize = 13;
-pub const snapshot_index_index: usize = 14;
-pub const snapshot_flags_index: usize = 15;
+pub const snapshot_kind_index: usize = 1;
+pub const snapshot_rights_index: usize = 2;
+pub const snapshot_owner_index: usize = 3;
+pub const snapshot_device_index: usize = 4;
+pub const snapshot_object_id_index: usize = 5;
+pub const snapshot_user_va_index: usize = 6;
+pub const snapshot_iova_index: usize = 7;
+pub const snapshot_size_index: usize = 8;
+pub const snapshot_index_index: usize = 9;
+pub const snapshot_flags_index: usize = 10;
 
 pub const bar_info_word_count: usize = 4;
 pub const bar_info_start_index: usize = 0;

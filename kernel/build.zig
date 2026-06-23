@@ -1,5 +1,73 @@
 const std = @import("std");
 
+fn addVerifiedSchedulerObject(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    source: []const u8,
+    basename: []const u8,
+) void {
+    const clang_path = freestandingClang(b);
+    const clang = b.addSystemCommand(&.{
+        clang_path,
+        "-target",
+        "x86_64-unknown-windows-msvc",
+        "-ffreestanding",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-fno-exceptions",
+        "-mno-red-zone",
+        "-mno-stack-arg-probe",
+        "-O2",
+        "-g0",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I../verified/scheduling/include",
+        "-c",
+        source,
+        "-o",
+    });
+    clang.addFileInput(b.path(source));
+    clang.addFileInput(b.path("../verified/scheduling/include/pacha_eevdf.h"));
+    clang.addFileInput(b.path("../verified/scheduling/include/pacha_sched.h"));
+    const object = clang.addOutputFileArg(basename);
+    mod.addObjectFile(object);
+}
+
+fn addVerifiedSchedulerHostObject(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    source: []const u8,
+    basename: []const u8,
+) void {
+    const clang_path = freestandingClang(b);
+    const clang = b.addSystemCommand(&.{
+        clang_path,
+        "-ffreestanding",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-O2",
+        "-g0",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I../verified/scheduling/include",
+        "-c",
+        source,
+        "-o",
+    });
+    clang.addFileInput(b.path(source));
+    clang.addFileInput(b.path("../verified/scheduling/include/pacha_eevdf.h"));
+    clang.addFileInput(b.path("../verified/scheduling/include/pacha_sched.h"));
+    const object = clang.addOutputFileArg(basename);
+    mod.addObjectFile(object);
+}
+
+fn freestandingClang(b: *std.Build) []const u8 {
+    return b.graph.environ_map.get("CAPOS_UNWRAPPED_CLANG") orelse
+        (b.graph.environ_map.get("CAPOS_FREESTANDING_CC") orelse "clang");
+}
+
 fn pruneZeroSizedBootx64Artifacts(io: std.Io) bool {
     const cwd = std.Io.Dir.cwd();
     var repaired = false;
@@ -55,6 +123,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     kernel_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    addVerifiedSchedulerHostObject(b, kernel_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf.o");
+    addVerifiedSchedulerHostObject(b, kernel_mod, "../verified/scheduling/src/pacha_sched.c", "pacha_sched.o");
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("../tests/kernel_state.zig"),
@@ -95,6 +165,8 @@ pub fn build(b: *std.Build) void {
         .strip = true,
     });
     efi_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    addVerifiedSchedulerObject(b, efi_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf.obj");
+    addVerifiedSchedulerObject(b, efi_mod, "../verified/scheduling/src/pacha_sched.c", "pacha_sched.obj");
     const efi_app = b.addExecutable(.{
         .name = "BOOTX64",
         .root_module = efi_mod,

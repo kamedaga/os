@@ -401,15 +401,13 @@ test "irq fd records interrupt events by vector" {
     try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
 }
 
-test "physical page allocation does not install page capability" {
+test "physical page allocation returns a page handle" {
     var s = try initFdState();
     var free_list = FreePageList{};
     try free_list.appendContiguousRange(0, 0x1_0000_0000, 2);
-    try std.testing.expectEqual(@as(usize, 0), s.getTableConst(p0).len);
 
     const page = try s.allocPhysicalPage(&free_list);
     try std.testing.expectEqual(@as(u64, 0x1_0000_0000), page.paddr);
-    try std.testing.expectEqual(@as(usize, 0), s.getTableConst(p0).len);
 }
 
 test "page-backed vmo fd uses dynamic fd range and reports fd info" {
@@ -574,7 +572,6 @@ test "native vma fault mapping resolves backing page without page capability" {
     try std.testing.expectEqual(page.paddr, mapping.paddr);
     try std.testing.expect(mapping.prot.read);
     try std.testing.expect(!mapping.prot.write);
-    try std.testing.expectEqual(@as(usize, 0), s.getTableConst(p0).len);
 
     try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, true, false) == null);
     try s.munmapExactWithFreeList(p0, 0x4500_0000, 4096, &free_list);

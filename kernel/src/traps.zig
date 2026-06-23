@@ -3,7 +3,7 @@ const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
 const user_vm = @import("memory/user_vm.zig");
-const scheduler = @import("scheduler.zig");
+const scheduler = @import("scheduler.zig").connection;
 const smp = @import("smp.zig");
 
 const TrapFrame = interrupts.TrapFrame;
@@ -118,7 +118,7 @@ extern fn restoreCurrentThreadFxState() callconv(.c) void;
 extern fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64;
 
 pub export fn timerInterruptWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
-    const cpu_slot = scheduler.currentCpuSlot();
+    const cpu_slot = scheduler.currentCpu();
     const bounded_slot = if (cpu_slot < timer_interrupt_work_frames.len) cpu_slot else 0;
     return &timer_interrupt_work_frames[bounded_slot];
 }
@@ -128,7 +128,7 @@ pub export fn syscallWorkFrameFromAsm() callconv(.c) *TrapFrame {
 }
 
 fn boundedCurrentCpuSlot() usize {
-    const cpu_slot = scheduler.currentCpuSlot();
+    const cpu_slot = scheduler.currentCpu();
     return if (cpu_slot < smp.max_cpus) cpu_slot else 0;
 }
 
@@ -169,11 +169,11 @@ pub export fn userReturnIretFrameForCurrentCpuFromAsm() callconv(.c) *u64 {
 }
 
 pub export fn userReturnCr3ForCurrentCpuFromAsm() callconv(.c) u64 {
-    return scheduler.currentUserCr3();
+    return scheduler.currentCr3();
 }
 
 pub export fn applyCurrentThreadFsBaseForUserReturnFromAsm() callconv(.c) void {
-    _ = scheduler.applyThreadFsBase(scheduler.currentThreadIndex());
+    _ = scheduler.applyThreadBases(scheduler.currentThread());
 }
 
 fn asmCopyStackFrameToWorkFrame(comptime work_frame_symbol: []const u8, comptime qword_count: usize) []const u8 {
@@ -327,9 +327,9 @@ fn writeByteHex(h: *const Hooks, byte: u8) void {
 }
 
 fn writeCommonTrapRegs(h: *const Hooks, frame: anytype) void {
-    const cpu_slot = scheduler.currentCpuSlot();
+    const cpu_slot = scheduler.currentCpu();
     writeReg(h, "CPU", @intCast(cpu_slot));
-    if (scheduler.getThreadContextConst(scheduler.currentThreadIndex())) |ctx| {
+    if (scheduler.threadContext(scheduler.currentThread())) |ctx| {
         writeReg(h, "FS_BASE", ctx.fs_base);
     }
     writeReg(h, "RAX", frame.rax);
@@ -354,10 +354,10 @@ fn writeExceptionWithErrorSummary(h: *const Hooks, vec: u64, frame: *const Excep
     h.write(exceptionName(vec));
     h.write("\n");
     h.write("  THREAD=");
-    h.write(h.thread_label(scheduler.currentThreadIndex()));
+    h.write(h.thread_label(scheduler.currentThread()));
     h.write("\n");
     h.write("  PRINCIPAL=");
-    h.write(h.principal_label(scheduler.currentUserPrincipal()));
+    h.write(h.principal_label(scheduler.currentPrincipal()));
     h.write("\n");
     if (vec == 14) {
         const cr2 = h.read_cr2();
@@ -365,7 +365,7 @@ fn writeExceptionWithErrorSummary(h: *const Hooks, vec: u64, frame: *const Excep
         h.write("  CR2=");
         h.write_hex_raw(cr2);
         h.write("\n");
-        h.dump_page_walk_for_va(if (user_mode) scheduler.currentUserCr3() else h.read_cr3(), cr2);
+        h.dump_page_walk_for_va(if (user_mode) scheduler.currentCr3() else h.read_cr3(), cr2);
         h.log_page_fault_step2(cr2, frame);
     }
     h.write("  EC=");
@@ -387,10 +387,10 @@ fn writeTrapSummary(h: *const Hooks, label: []const u8, frame: *const TrapFrame)
     h.write(label);
     h.write("\n");
     h.write("  THREAD=");
-    h.write(h.thread_label(scheduler.currentThreadIndex()));
+    h.write(h.thread_label(scheduler.currentThread()));
     h.write("\n");
     h.write("  PRINCIPAL=");
-    h.write(h.principal_label(scheduler.currentUserPrincipal()));
+    h.write(h.principal_label(scheduler.currentPrincipal()));
     h.write("\n");
     h.write("  RIP=");
     h.write_hex_raw(frame.rip);
@@ -522,10 +522,13 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.c) u64 {
     if (!h.kernel_state_ready.*) return 0;
     const present_violation = (ec & (1 << 0)) != 0;
     if (!present_violation) {
-        const principal = scheduler.currentUserPrincipal();
+        const principal = scheduler.currentPrincipal();
         const fault_page_va = cr2 & ~@as(u64, 4095);
         const write_access = (ec & (1 << 1)) != 0;
         const instruction_fetch = (ec & (1 << 4)) != 0;
+        user_vm.lockAddressSpaces();
+        defer user_vm.unlockAddressSpaces();
+        if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) return 1;
         if (h.state.nativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch)) |mapping| {
             var paddrs = [_]u64{mapping.paddr};
             if (user_vm.mapTrustedUserPaddrsWithProt(
@@ -552,7 +555,7 @@ pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const Except
     writeExceptionWithErrorSummary(h, vec, frame);
     h.write("  ACTION=terminate process\n");
     h.resume_after_fatal_user_exception(
-        scheduler.currentUserPrincipal(),
+        scheduler.currentPrincipal(),
         @intCast(vec),
         fatalExceptionResumeWorkFrameForCurrentCpuFromAsm(),
     );
@@ -623,7 +626,7 @@ pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(
     writeTrapSummary(h, label, frame);
     h.write("  ACTION=terminate process\n");
     h.resume_after_fatal_user_exception(
-        scheduler.currentUserPrincipal(),
+        scheduler.currentPrincipal(),
         @intCast(vec),
         fatalExceptionResumeWorkFrameForCurrentCpuFromAsm(),
     );
@@ -634,28 +637,27 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
-    if (!scheduler.schedulerRunsOnCurrentCpu()) {
+    if (!scheduler.isBootstrapSchedulerCpu()) {
         if (user_mode) {
-            if (!scheduler.currentApUserThreadCanContinue()) {
+            if (!scheduler.apUserThreadCanContinue()) {
                 smp.returnCurrentApToIdleFromInterrupt();
             }
-            if (scheduler.preemptCurrentApThreadForExternalScheduler(h.scheduler_quantum_ticks, frame)) {
+            if (scheduler.preemptApUserThread(h.scheduler_quantum_ticks, frame)) {
                 smp.returnCurrentApToIdleFromInterrupt();
             }
             return;
         }
-        scheduler.noteCurrentCpuIdleTick();
+        // AP timer interrupts can arrive while a user thread is executing a
+        // syscall or another kernel path. That CPU is not idle; keep its
+        // current thread/cr3 intact and return to the interrupted kernel frame.
         return;
     }
     scheduler.lapic_tick_count +%= 1;
-    if (@cmpxchgStrong(u8, &scheduler.scheduler_timer_log_once, 0, 1, .acq_rel, .monotonic) == null) {
-        h.write("[sched] timer tick\n");
-    }
     if (!h.kernel_state_ready.*) return;
-    scheduler.wakeThreadsForTimer(scheduler.lapic_tick_count);
+    scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
     if (!user_mode) return;
     if (h.scheduler_quantum_ticks == 0) return;
-    _ = scheduler.preemptCurrentThreadForExternalScheduler(h.scheduler_quantum_ticks, frame);
+    _ = scheduler.preemptBootstrapThread(h.scheduler_quantum_ticks, frame);
 }
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
@@ -671,8 +673,13 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     const wake_count = h.state.recordDeviceInterruptEvent(active_vector, wake_owners[0..]);
     var i: usize = 0;
     while (i < wake_count) : (i += 1) {
-        scheduler.wakeWaitingThreadForPrincipal(wake_owners[i]);
+        scheduler.wakeMailboxWaiter(wake_owners[i]);
     }
+}
+
+pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.c) void {
+    _ = frame;
+    lapic.eoi();
 }
 
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
@@ -1028,6 +1035,69 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\iretq
         );
     }
+}
+
+pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
+    asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
+        \\push %rax
+        \\push %rbx
+        \\push %rcx
+        \\push %rdx
+        \\push %rsi
+        \\push %rdi
+        \\push %rbp
+        \\push %r8
+        \\push %r9
+        \\push %r10
+        \\push %r11
+        \\push %r12
+        \\push %r13
+        \\push %r14
+        \\push %r15
+        \\mov 128(%rsp), %rax
+        \\and $0x3, %rax
+        \\cmp $0x3, %rax
+        \\jne 9f
+    ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        \\mov (%rsp), %r12
+        \\mov %r12, %rcx
+    ++ asmCallAligned("schedulerWakeIpiDispatch") ++
+        \\mov (%rsp), %r12
+        \\add $8, %rsp
+        \\mov %r12, %rax
+    ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+        \\jmp userReturnToSavedFrame
+        \\9:
+        \\sub $512, %rsp
+        \\lea 512(%rsp), %rdi
+        \\mov %rdi, %rcx
+        \\call schedulerWakeIpiDispatch
+        \\add $512, %rsp
+        \\pop %r15
+        \\pop %r14
+        \\pop %r13
+        \\pop %r12
+        \\pop %r11
+        \\pop %r10
+        \\pop %r9
+        \\pop %r8
+        \\pop %rbp
+        \\pop %rdi
+        \\pop %rsi
+        \\pop %rdx
+        \\pop %rcx
+        \\pop %rbx
+        \\pop %rax
+        \\mov %r10, user_return_saved_r10(%rip)
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\mov user_return_saved_r10(%rip), %r10
+        \\iretq
+    );
 }
 
 pub export fn generalProtectionHandlerStub() callconv(.naked) noreturn {
