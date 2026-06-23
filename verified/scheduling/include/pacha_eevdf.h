@@ -49,11 +49,6 @@ typedef struct pacha_eevdf_runqueue {
   int64_t min_vruntime;
 } pacha_eevdf_runqueue;
 
-typedef struct pacha_eevdf_result {
-  pacha_eevdf_rc rc;
-  pacha_eevdf_runqueue rq;
-} pacha_eevdf_result;
-
 typedef struct pacha_eevdf_pick_result {
   pacha_eevdf_runqueue rq;
   int has_entity;
@@ -61,36 +56,50 @@ typedef struct pacha_eevdf_pick_result {
   pacha_eevdf_entity entity;
 } pacha_eevdf_pick_result;
 
-pacha_eevdf_entity pacha_eevdf_empty_entity(void);
-pacha_eevdf_runqueue pacha_eevdf_empty_runqueue(void);
+void pacha_eevdf_empty_entity(pacha_eevdf_entity *out);
+void pacha_eevdf_empty_runqueue(pacha_eevdf_runqueue *out);
+void pacha_eevdf_copy_runqueue(
+    const pacha_eevdf_runqueue *src,
+    pacha_eevdf_runqueue *dst);
 
-pacha_eevdf_result pacha_eevdf_reset(const pacha_eevdf_runqueue *rq);
-pacha_eevdf_result pacha_eevdf_add(
+pacha_eevdf_rc pacha_eevdf_reset(
+    const pacha_eevdf_runqueue *rq,
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_add(
     const pacha_eevdf_runqueue *rq,
     int64_t thread_id,
     int64_t generation,
     int64_t weight,
-    int64_t slice_ns);
-pacha_eevdf_result pacha_eevdf_wake(
-    const pacha_eevdf_runqueue *rq,
-    int64_t thread_id);
-pacha_eevdf_result pacha_eevdf_block(
-    const pacha_eevdf_runqueue *rq,
-    int64_t thread_id);
-pacha_eevdf_result pacha_eevdf_exit(
-    const pacha_eevdf_runqueue *rq,
-    int64_t thread_id);
-pacha_eevdf_result pacha_eevdf_charge(
+    int64_t slice_ns,
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_wake(
     const pacha_eevdf_runqueue *rq,
     int64_t thread_id,
-    int64_t runtime_ns);
-pacha_eevdf_result pacha_eevdf_mark_running(
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_block(
     const pacha_eevdf_runqueue *rq,
-    int64_t thread_id);
-pacha_eevdf_result pacha_eevdf_requeue_running(
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_exit(
     const pacha_eevdf_runqueue *rq,
-    int64_t thread_id);
-pacha_eevdf_pick_result pacha_eevdf_pick(const pacha_eevdf_runqueue *rq);
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_charge(
+    const pacha_eevdf_runqueue *rq,
+    int64_t thread_id,
+    int64_t runtime_ns,
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_mark_running(
+    const pacha_eevdf_runqueue *rq,
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_requeue_running(
+    const pacha_eevdf_runqueue *rq,
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out);
+pacha_eevdf_rc pacha_eevdf_pick(
+    const pacha_eevdf_runqueue *rq,
+    pacha_eevdf_pick_result *out);
 
 #ifdef __cplusplus
 }

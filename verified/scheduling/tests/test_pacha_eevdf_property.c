@@ -92,15 +92,17 @@ static int64_t choose_known_thread(const pacha_eevdf_runqueue *rq) {
 
 static void apply_success_if_ok(
     pacha_eevdf_runqueue *rq,
-    pacha_eevdf_result result) {
-  if (result.rc == PACHA_EEVDF_OK) {
-    *rq = result.rq;
+    pacha_eevdf_rc rc,
+    const pacha_eevdf_runqueue *next) {
+  if (rc == PACHA_EEVDF_OK) {
+    *rq = *next;
   }
-  assert_invariant(&result.rq);
+  assert_invariant(next);
 }
 
 static void run_property_sequence(void) {
-  pacha_eevdf_runqueue rq = pacha_eevdf_empty_runqueue();
+  pacha_eevdf_runqueue rq;
+  pacha_eevdf_empty_runqueue(&rq);
   assert_invariant(&rq);
 
   int64_t next_thread_id = 1;
@@ -111,49 +113,66 @@ static void run_property_sequence(void) {
     switch (op) {
     case 0:
       if (rq.entity_count < 80) {
-        apply_success_if_ok(&rq, pacha_eevdf_add(
+        pacha_eevdf_runqueue next;
+        pacha_eevdf_rc rc = pacha_eevdf_add(
             &rq,
             next_thread_id++,
             (int64_t)step,
             1 + (int64_t)(next_rand() % 4096),
-            1 + (int64_t)(next_rand() % 8000000)));
+            1 + (int64_t)(next_rand() % 8000000),
+            &next);
+        apply_success_if_ok(&rq, rc, &next);
       }
       break;
     case 1:
       if (thread_id != PACHA_EEVDF_NO_THREAD_ID) {
-        apply_success_if_ok(&rq, pacha_eevdf_mark_running(&rq, thread_id));
+        pacha_eevdf_runqueue next;
+        pacha_eevdf_rc rc = pacha_eevdf_mark_running(&rq, thread_id, &next);
+        apply_success_if_ok(&rq, rc, &next);
       }
       break;
     case 2:
       if (thread_id != PACHA_EEVDF_NO_THREAD_ID) {
-        apply_success_if_ok(&rq, pacha_eevdf_requeue_running(&rq, thread_id));
+        pacha_eevdf_runqueue next;
+        pacha_eevdf_rc rc = pacha_eevdf_requeue_running(&rq, thread_id, &next);
+        apply_success_if_ok(&rq, rc, &next);
       }
       break;
     case 3:
       if (thread_id != PACHA_EEVDF_NO_THREAD_ID) {
-        apply_success_if_ok(&rq, pacha_eevdf_block(&rq, thread_id));
+        pacha_eevdf_runqueue next;
+        pacha_eevdf_rc rc = pacha_eevdf_block(&rq, thread_id, &next);
+        apply_success_if_ok(&rq, rc, &next);
       }
       break;
     case 4:
       if (thread_id != PACHA_EEVDF_NO_THREAD_ID) {
-        apply_success_if_ok(&rq, pacha_eevdf_wake(&rq, thread_id));
+        pacha_eevdf_runqueue next;
+        pacha_eevdf_rc rc = pacha_eevdf_wake(&rq, thread_id, &next);
+        apply_success_if_ok(&rq, rc, &next);
       }
       break;
     case 5:
       if (thread_id != PACHA_EEVDF_NO_THREAD_ID) {
-        apply_success_if_ok(&rq, pacha_eevdf_charge(
+        pacha_eevdf_runqueue next;
+        pacha_eevdf_rc rc = pacha_eevdf_charge(
             &rq,
             thread_id,
-            (int64_t)(next_rand() % 100000)));
+            (int64_t)(next_rand() % 100000),
+            &next);
+        apply_success_if_ok(&rq, rc, &next);
       }
       break;
     case 6:
       if (thread_id != PACHA_EEVDF_NO_THREAD_ID) {
-        apply_success_if_ok(&rq, pacha_eevdf_exit(&rq, thread_id));
+        pacha_eevdf_runqueue next;
+        pacha_eevdf_rc rc = pacha_eevdf_exit(&rq, thread_id, &next);
+        apply_success_if_ok(&rq, rc, &next);
       }
       break;
     default: {
-      pacha_eevdf_pick_result pick = pacha_eevdf_pick(&rq);
+      pacha_eevdf_pick_result pick;
+      assert(pacha_eevdf_pick(&rq, &pick) == PACHA_EEVDF_OK);
       assert_invariant(&pick.rq);
       if (pick.has_entity) {
         assert(pick.entity.state == PACHA_EEVDF_RUNNABLE);

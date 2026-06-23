@@ -14,23 +14,50 @@ static int i64_nonnegative(int64_t value) {
   return value >= 0;
 }
 
+static int i64_less(int64_t lhs, int64_t rhs) {
+  return lhs < rhs;
+}
+
+static int i64_equal(int64_t lhs, int64_t rhs) {
+  return lhs == rhs;
+}
+
+static int checked_add_i64_overflows(int64_t lhs, int64_t rhs) {
+  if (i64_less(0, rhs)) {
+    return i64_less(INT64_MAX - rhs, lhs);
+  }
+  if (i64_less(rhs, 0)) {
+    return i64_less(lhs, INT64_MIN - rhs);
+  }
+  return 0;
+}
+
 static int checked_add_i64(int64_t lhs, int64_t rhs, int64_t *out) {
-  if ((rhs > 0 && lhs > INT64_MAX - rhs) ||
-      (rhs < 0 && lhs < INT64_MIN - rhs)) {
+  if (checked_add_i64_overflows(lhs, rhs)) {
     return 0;
   }
   *out = lhs + rhs;
   return 1;
 }
 
+static int checked_mul_i64_nonnegative_overflows(int64_t lhs, int64_t rhs) {
+  if (rhs == 0) {
+    return 0;
+  }
+  return lhs > INT64_MAX / rhs;
+}
+
 static int checked_mul_i64_nonnegative(
     int64_t lhs,
     int64_t rhs,
     int64_t *out) {
-  if (lhs < 0 || rhs < 0) {
+  if (!i64_nonnegative(lhs)) {
     return 0;
   }
-  if (rhs != 0 && lhs > INT64_MAX / rhs) {
+  if (!i64_nonnegative(rhs)) {
+    return 0;
+  }
+  if (checked_mul_i64_nonnegative_overflows(lhs, rhs)) {
     return 0;
   }
   *out = lhs * rhs;
@@ -38,7 +65,10 @@ static int checked_mul_i64_nonnegative(
 }
 
 static int64_t z_max(int64_t lhs, int64_t rhs) {
-  return lhs < rhs ? rhs : lhs;
+  if (i64_less(lhs, rhs)) {
+    return rhs;
+  }
+  return lhs;
 }
 
 static int is_runnable(const pacha_eevdf_entity *entity) {
@@ -59,20 +89,40 @@ static int runnable_or_running(const pacha_eevdf_entity *entity) {
          entity->state == PACHA_EEVDF_RUNNING;
 }
 
-static pacha_eevdf_result ok_result(pacha_eevdf_runqueue rq) {
-  pacha_eevdf_result result;
-  result.rc = PACHA_EEVDF_OK;
-  result.rq = rq;
-  return result;
+static pacha_eevdf_rc ok_runqueue(
+    const pacha_eevdf_runqueue *rq,
+    pacha_eevdf_runqueue *out) {
+  *out = *rq;
+  return PACHA_EEVDF_OK;
 }
 
-static pacha_eevdf_result fail_result(
+static pacha_eevdf_rc fail_runqueue(
     pacha_eevdf_rc rc,
-    const pacha_eevdf_runqueue *rq) {
-  pacha_eevdf_result result;
-  result.rc = rc;
-  result.rq = *rq;
-  return result;
+    const pacha_eevdf_runqueue *rq,
+    pacha_eevdf_runqueue *out) {
+  *out = *rq;
+  return rc;
+}
+
+void pacha_eevdf_copy_runqueue(
+    const pacha_eevdf_runqueue *src,
+    pacha_eevdf_runqueue *dst) {
+  for (size_t i = 0; i < PACHA_EEVDF_MAX_ENTITIES; ++i) {
+    dst->entities[i].thread_id = src->entities[i].thread_id;
+    dst->entities[i].generation = src->entities[i].generation;
+    dst->entities[i].weight = src->entities[i].weight;
+    dst->entities[i].slice_ns = src->entities[i].slice_ns;
+    dst->entities[i].service_ns = src->entities[i].service_ns;
+    dst->entities[i].vruntime = src->entities[i].vruntime;
+    dst->entities[i].eligible_time = src->entities[i].eligible_time;
+    dst->entities[i].deadline = src->entities[i].deadline;
+    dst->entities[i].state = src->entities[i].state;
+  }
+  dst->entity_count = src->entity_count;
+  dst->runnable_count = src->runnable_count;
+  dst->virtual_time = src->virtual_time;
+  dst->min_vruntime = src->min_vruntime;
+  return;
 }
 
 static size_t count_runnable(const pacha_eevdf_runqueue *rq) {
@@ -85,20 +135,10 @@ static size_t count_runnable(const pacha_eevdf_runqueue *rq) {
   return count;
 }
 
-static int weighted_delta(int64_t runtime_ns, int64_t weight, int64_t *out) {
-  if (!i64_nonnegative(runtime_ns) || !valid_positive(weight)) {
-    return 0;
-  }
-  int64_t quotient = runtime_ns / weight;
-  int64_t remainder = runtime_ns % weight;
-  int64_t whole;
-  if (!checked_mul_i64_nonnegative(
-          quotient,
-          PACHA_EEVDF_DEFAULT_WEIGHT,
-          &whole)) {
-    return 0;
-  }
-
+static int weighted_fractional_10(
+    int64_t remainder,
+    int64_t weight,
+    int64_t *out) {
   int64_t fractional = 0;
   for (int bit = 0; bit < 10; ++bit) {
     fractional = fractional * 2;
@@ -109,7 +149,37 @@ static int weighted_delta(int64_t runtime_ns, int64_t weight, int64_t *out) {
       remainder = remainder + remainder;
     }
   }
-  return checked_add_i64(whole, fractional, out);
+  *out = fractional;
+  return 1;
+}
+
+static int weighted_delta(int64_t runtime_ns, int64_t weight, int64_t *out) {
+  if (!i64_nonnegative(runtime_ns)) {
+    return 0;
+  }
+  if (!valid_positive(weight)) {
+    return 0;
+  }
+  int64_t quotient = runtime_ns / weight;
+  int64_t remainder = runtime_ns % weight;
+  int64_t whole = 0;
+  if (!checked_mul_i64_nonnegative(
+          quotient,
+          PACHA_EEVDF_DEFAULT_WEIGHT,
+          &whole)) {
+    return 0;
+  }
+
+  int64_t fractional = 0;
+  if (!weighted_fractional_10(remainder, weight, &fractional)) {
+    return 0;
+  }
+  int64_t delta = 0;
+  if (!checked_add_i64(whole, fractional, &delta)) {
+    return 0;
+  }
+  *out = delta;
+  return 1;
 }
 
 static int weighted_slice(int64_t slice_ns, int64_t weight, int64_t *out) {
@@ -140,41 +210,37 @@ static int refresh_deadline(
   return 1;
 }
 
-static pacha_eevdf_runqueue refresh_runqueue(pacha_eevdf_runqueue rq) {
+static void refresh_runqueue(pacha_eevdf_runqueue *rq) {
   int found = 0;
-  int64_t min_vruntime = rq.min_vruntime;
-  for (size_t i = 0; i < rq.entity_count; ++i) {
-    if (!live_for_min(&rq.entities[i])) {
+  int64_t min_vruntime = rq->min_vruntime;
+  for (size_t i = 0; i < rq->entity_count; ++i) {
+    if (!live_for_min(&rq->entities[i])) {
       continue;
     }
-    if (!found || rq.entities[i].vruntime < min_vruntime) {
-      min_vruntime = rq.entities[i].vruntime;
+    if (!found || rq->entities[i].vruntime < min_vruntime) {
+      min_vruntime = rq->entities[i].vruntime;
     }
     found = 1;
   }
-  rq.runnable_count = count_runnable(&rq);
-  rq.virtual_time = z_max(rq.virtual_time, min_vruntime);
-  rq.min_vruntime = min_vruntime;
-  return rq;
+  rq->runnable_count = count_runnable(rq);
+  rq->virtual_time = z_max(rq->virtual_time, min_vruntime);
+  rq->min_vruntime = min_vruntime;
 }
 
-static pacha_eevdf_runqueue recount_runqueue(pacha_eevdf_runqueue rq) {
-  rq.runnable_count = count_runnable(&rq);
-  return rq;
+static void recount_runqueue(pacha_eevdf_runqueue *rq) {
+  rq->runnable_count = count_runnable(rq);
 }
 
-static pacha_eevdf_entity set_entity_state(
-    pacha_eevdf_entity entity,
+static void set_entity_state(
+    pacha_eevdf_entity *entity,
     pacha_eevdf_state state) {
-  entity.state = state;
-  return entity;
+  entity->state = state;
 }
 
-static pacha_eevdf_entity place_entity_at_floor(
-    pacha_eevdf_entity entity,
+static void place_entity_at_floor(
+    pacha_eevdf_entity *entity,
     int64_t floor_vruntime) {
-  entity.vruntime = z_max(entity.vruntime, floor_vruntime);
-  return entity;
+  entity->vruntime = z_max(entity->vruntime, floor_vruntime);
 }
 
 static int find_entity_index(
@@ -194,68 +260,85 @@ static int find_entity_index(
   return 0;
 }
 
+static int entity_better_values(
+    int64_t candidate_deadline,
+    int64_t current_deadline,
+    int64_t candidate_thread_id,
+    int64_t current_thread_id) {
+  int result = 0;
+  if (i64_less(candidate_deadline, current_deadline)) {
+    result = 1;
+  } else if (i64_equal(candidate_deadline, current_deadline)) {
+    result = i64_less(candidate_thread_id, current_thread_id);
+  }
+  return result;
+}
+
 static int entity_better(
     const pacha_eevdf_entity *candidate,
     const pacha_eevdf_entity *current) {
-  if (candidate->deadline < current->deadline) {
-    return 1;
-  }
-  return candidate->deadline == current->deadline &&
-         candidate->thread_id < current->thread_id;
+  int result = entity_better_values(
+      candidate->deadline,
+      current->deadline,
+      candidate->thread_id,
+      current->thread_id);
+  return result;
 }
 
-pacha_eevdf_entity pacha_eevdf_empty_entity(void) {
-  pacha_eevdf_entity entity;
-  entity.thread_id = PACHA_EEVDF_NO_THREAD_ID;
-  entity.generation = 0;
-  entity.weight = 0;
-  entity.slice_ns = 0;
-  entity.service_ns = 0;
-  entity.vruntime = 0;
-  entity.eligible_time = 0;
-  entity.deadline = 0;
-  entity.state = PACHA_EEVDF_EMPTY;
-  return entity;
+void pacha_eevdf_empty_entity(pacha_eevdf_entity *out) {
+  out->thread_id = PACHA_EEVDF_NO_THREAD_ID;
+  out->generation = 0;
+  out->weight = 0;
+  out->slice_ns = 0;
+  out->service_ns = 0;
+  out->vruntime = 0;
+  out->eligible_time = 0;
+  out->deadline = 0;
+  out->state = PACHA_EEVDF_EMPTY;
+  return;
 }
 
-pacha_eevdf_runqueue pacha_eevdf_empty_runqueue(void) {
-  pacha_eevdf_runqueue rq;
+void pacha_eevdf_empty_runqueue(pacha_eevdf_runqueue *out) {
   for (size_t i = 0; i < PACHA_EEVDF_MAX_ENTITIES; ++i) {
-    rq.entities[i] = pacha_eevdf_empty_entity();
+    pacha_eevdf_empty_entity(&out->entities[i]);
   }
-  rq.entity_count = 0;
-  rq.runnable_count = 0;
-  rq.virtual_time = 0;
-  rq.min_vruntime = 0;
-  return rq;
+  out->entity_count = 0;
+  out->runnable_count = 0;
+  out->virtual_time = 0;
+  out->min_vruntime = 0;
+  return;
 }
 
-pacha_eevdf_result pacha_eevdf_reset(const pacha_eevdf_runqueue *rq) {
+pacha_eevdf_rc pacha_eevdf_reset(
+    const pacha_eevdf_runqueue *rq,
+    pacha_eevdf_runqueue *out) {
   (void)rq;
-  return ok_result(pacha_eevdf_empty_runqueue());
+  pacha_eevdf_empty_runqueue(out);
+  return PACHA_EEVDF_OK;
 }
 
-pacha_eevdf_result pacha_eevdf_add(
+pacha_eevdf_rc pacha_eevdf_add(
     const pacha_eevdf_runqueue *rq,
     int64_t thread_id,
     int64_t generation,
     int64_t weight,
-    int64_t slice_ns) {
+    int64_t slice_ns,
+    pacha_eevdf_runqueue *out) {
   size_t existing;
   pacha_eevdf_entity entity;
   pacha_eevdf_entity refreshed;
   if (thread_id == PACHA_EEVDF_NO_THREAD_ID ||
       !valid_positive(weight) ||
       !valid_positive(slice_ns)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   if (find_entity_index(rq, thread_id, &existing)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   if (rq->entity_count >= PACHA_EEVDF_MAX_ENTITIES) {
-    return fail_result(PACHA_EEVDF_ERR_FULL, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_FULL, rq, out);
   }
-  entity = pacha_eevdf_empty_entity();
+  pacha_eevdf_empty_entity(&entity);
   entity.thread_id = thread_id;
   entity.generation = generation;
   entity.weight = weight;
@@ -265,76 +348,84 @@ pacha_eevdf_result pacha_eevdf_add(
   entity.deadline = rq->min_vruntime;
   entity.state = PACHA_EEVDF_RUNNABLE;
   if (!refresh_deadline(&entity, rq->min_vruntime, &refreshed)) {
-    return fail_result(PACHA_EEVDF_ERR_OVERFLOW, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
   next.entities[next.entity_count] = refreshed;
   ++next.entity_count;
-  return ok_result(refresh_runqueue(next));
+  refresh_runqueue(&next);
+  return ok_runqueue(&next, out);
 }
 
-pacha_eevdf_result pacha_eevdf_wake(
+pacha_eevdf_rc pacha_eevdf_wake(
     const pacha_eevdf_runqueue *rq,
-    int64_t thread_id) {
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out) {
   size_t index;
   pacha_eevdf_entity entity;
   pacha_eevdf_entity refreshed;
   if (!find_entity_index(rq, thread_id, &index)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   entity = rq->entities[index];
   if (entity.state != PACHA_EEVDF_BLOCKED) {
-    return fail_result(PACHA_EEVDF_ERR_STATE, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
-  entity = place_entity_at_floor(entity, rq->min_vruntime);
-  entity = set_entity_state(entity, PACHA_EEVDF_RUNNABLE);
+  place_entity_at_floor(&entity, rq->min_vruntime);
+  set_entity_state(&entity, PACHA_EEVDF_RUNNABLE);
   if (!refresh_deadline(&entity, rq->min_vruntime, &refreshed)) {
-    return fail_result(PACHA_EEVDF_ERR_OVERFLOW, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
   next.entities[index] = refreshed;
-  return ok_result(refresh_runqueue(next));
+  refresh_runqueue(&next);
+  return ok_runqueue(&next, out);
 }
 
-pacha_eevdf_result pacha_eevdf_block(
+pacha_eevdf_rc pacha_eevdf_block(
     const pacha_eevdf_runqueue *rq,
-    int64_t thread_id) {
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out) {
   size_t index;
   pacha_eevdf_entity entity;
   if (!find_entity_index(rq, thread_id, &index)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   entity = rq->entities[index];
   if (!runnable_or_running(&entity)) {
-    return fail_result(PACHA_EEVDF_ERR_STATE, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
-  next.entities[index] = set_entity_state(entity, PACHA_EEVDF_BLOCKED);
-  return ok_result(refresh_runqueue(next));
+  set_entity_state(&next.entities[index], PACHA_EEVDF_BLOCKED);
+  refresh_runqueue(&next);
+  return ok_runqueue(&next, out);
 }
 
-pacha_eevdf_result pacha_eevdf_exit(
+pacha_eevdf_rc pacha_eevdf_exit(
     const pacha_eevdf_runqueue *rq,
-    int64_t thread_id) {
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out) {
   size_t index;
   pacha_eevdf_entity entity;
   if (!find_entity_index(rq, thread_id, &index)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   entity = rq->entities[index];
   if (entity.state == PACHA_EEVDF_EMPTY ||
       entity.state == PACHA_EEVDF_EXITED) {
-    return fail_result(PACHA_EEVDF_ERR_STATE, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
-  next.entities[index] = set_entity_state(entity, PACHA_EEVDF_EXITED);
-  return ok_result(refresh_runqueue(next));
+  set_entity_state(&next.entities[index], PACHA_EEVDF_EXITED);
+  refresh_runqueue(&next);
+  return ok_runqueue(&next, out);
 }
 
-pacha_eevdf_result pacha_eevdf_charge(
+pacha_eevdf_rc pacha_eevdf_charge(
     const pacha_eevdf_runqueue *rq,
     int64_t thread_id,
-    int64_t runtime_ns) {
+    int64_t runtime_ns,
+    pacha_eevdf_runqueue *out) {
   size_t index;
   int64_t delta;
   int64_t vruntime;
@@ -342,76 +433,82 @@ pacha_eevdf_result pacha_eevdf_charge(
   pacha_eevdf_entity entity;
   pacha_eevdf_entity refreshed;
   if (!find_entity_index(rq, thread_id, &index)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   entity = rq->entities[index];
   if (!runnable_or_running(&entity)) {
-    return fail_result(PACHA_EEVDF_ERR_STATE, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
   if (!weighted_delta(runtime_ns, entity.weight, &delta)) {
-    return fail_result(PACHA_EEVDF_ERR_OVERFLOW, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   if (!checked_add_i64(entity.vruntime, delta, &vruntime)) {
-    return fail_result(PACHA_EEVDF_ERR_OVERFLOW, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   if (!checked_add_i64(entity.service_ns, runtime_ns, &service_ns)) {
-    return fail_result(PACHA_EEVDF_ERR_OVERFLOW, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   entity.service_ns = service_ns;
   entity.vruntime = vruntime;
   if (!refresh_deadline(&entity, rq->min_vruntime, &refreshed)) {
-    return fail_result(PACHA_EEVDF_ERR_OVERFLOW, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
   next.entities[index] = refreshed;
-  return ok_result(refresh_runqueue(next));
+  refresh_runqueue(&next);
+  return ok_runqueue(&next, out);
 }
 
-pacha_eevdf_result pacha_eevdf_mark_running(
+pacha_eevdf_rc pacha_eevdf_mark_running(
     const pacha_eevdf_runqueue *rq,
-    int64_t thread_id) {
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out) {
   size_t index;
   pacha_eevdf_entity entity;
   if (!find_entity_index(rq, thread_id, &index)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   entity = rq->entities[index];
   if (entity.state != PACHA_EEVDF_RUNNABLE) {
-    return fail_result(PACHA_EEVDF_ERR_STATE, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
-  next.entities[index] = set_entity_state(entity, PACHA_EEVDF_RUNNING);
-  return ok_result(recount_runqueue(next));
+  set_entity_state(&next.entities[index], PACHA_EEVDF_RUNNING);
+  recount_runqueue(&next);
+  return ok_runqueue(&next, out);
 }
 
-pacha_eevdf_result pacha_eevdf_requeue_running(
+pacha_eevdf_rc pacha_eevdf_requeue_running(
     const pacha_eevdf_runqueue *rq,
-    int64_t thread_id) {
+    int64_t thread_id,
+    pacha_eevdf_runqueue *out) {
   size_t index;
   pacha_eevdf_entity entity;
   pacha_eevdf_entity refreshed;
   if (!find_entity_index(rq, thread_id, &index)) {
-    return fail_result(PACHA_EEVDF_ERR_INVALID, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   entity = rq->entities[index];
   if (entity.state != PACHA_EEVDF_RUNNING) {
-    return fail_result(PACHA_EEVDF_ERR_STATE, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
-  entity = set_entity_state(entity, PACHA_EEVDF_RUNNABLE);
+  set_entity_state(&entity, PACHA_EEVDF_RUNNABLE);
   if (!refresh_deadline(&entity, rq->min_vruntime, &refreshed)) {
-    return fail_result(PACHA_EEVDF_ERR_OVERFLOW, rq);
+    return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
   next.entities[index] = refreshed;
-  return ok_result(refresh_runqueue(next));
+  refresh_runqueue(&next);
+  return ok_runqueue(&next, out);
 }
 
-pacha_eevdf_pick_result pacha_eevdf_pick(const pacha_eevdf_runqueue *rq) {
-  pacha_eevdf_pick_result result;
-  result.rq = *rq;
-  result.has_entity = 0;
-  result.index = 0;
-  result.entity = pacha_eevdf_empty_entity();
+pacha_eevdf_rc pacha_eevdf_pick(
+    const pacha_eevdf_runqueue *rq,
+    pacha_eevdf_pick_result *out) {
+  out->rq = *rq;
+  out->has_entity = 0;
+  out->index = 0;
+  pacha_eevdf_empty_entity(&out->entity);
 
   size_t best_index = 0;
   int have_best = 0;
@@ -420,16 +517,16 @@ pacha_eevdf_pick_result pacha_eevdf_pick(const pacha_eevdf_runqueue *rq) {
     if (!is_runnable(entity) || entity->eligible_time > rq->virtual_time) {
       continue;
     }
-    if (!have_best || entity_better(entity, &result.entity)) {
-      result.entity = *entity;
+    if (!have_best || entity_better(entity, &out->entity)) {
+      out->entity = *entity;
       best_index = i;
       have_best = 1;
     }
   }
   if (have_best) {
-    result.has_entity = 1;
-    result.index = best_index;
-    return result;
+    out->has_entity = 1;
+    out->index = best_index;
+    return PACHA_EEVDF_OK;
   }
 
   int have_next = 0;
@@ -445,20 +542,20 @@ pacha_eevdf_pick_result pacha_eevdf_pick(const pacha_eevdf_runqueue *rq) {
     }
   }
   if (!have_next) {
-    return result;
+    return PACHA_EEVDF_OK;
   }
 
-  result.rq.virtual_time = next_time;
-  for (size_t i = 0; i < result.rq.entity_count; ++i) {
-    const pacha_eevdf_entity *entity = &result.rq.entities[i];
+  out->rq.virtual_time = next_time;
+  for (size_t i = 0; i < out->rq.entity_count; ++i) {
+    const pacha_eevdf_entity *entity = &out->rq.entities[i];
     if (!is_runnable(entity) || entity->eligible_time > next_time) {
       continue;
     }
-    if (!result.has_entity || entity_better(entity, &result.entity)) {
-      result.entity = *entity;
-      result.index = i;
-      result.has_entity = 1;
+    if (!out->has_entity || entity_better(entity, &out->entity)) {
+      out->entity = *entity;
+      out->index = i;
+      out->has_entity = 1;
     }
   }
-  return result;
+  return PACHA_EEVDF_OK;
 }

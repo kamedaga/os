@@ -47,6 +47,18 @@ tla/states/
 states/
 .pytest_cache/
 
+# Coq/Rocq proof build outputs
+*.vo
+*.vos
+*.vok
+*.glob
+.*.aux
+.lia.cache
+.nia.cache
+**/Makefile.coq
+**/Makefile.coq.conf
+**/.Makefile.coq.d
+
 # Python cache
 __pycache__/
 *.py[cod]

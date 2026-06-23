@@ -119,6 +119,11 @@ work.
 the C scalar bounds and enum encodings, names the model-to-memory representation
 predicates that will become `data_at` layouts, and gives one logical VST-facing
 postcondition per scheduler runtime API function.
+`proof/generated/` is produced by `proof/gen-clight.sh` with `clightgen`.
+The verified C ABI uses explicit result codes plus out-parameters instead of
+returning structs by value, so generated Clight functions expose `tint`/`tvoid`
+returns. `proof/PachaSchedVst.v` imports that AST, builds `CompSpecs`, and
+defines `data_at` representations for scheduler structs.
 
 The current model-correspondence layer is `spec/EevdfTestVectors.v`: it mirrors
 the C boundary cases as Coq examples. It is intentionally simple for now, so it
@@ -130,9 +135,11 @@ VST preparation constraints for the C core:
 - no dynamic allocation
 - fixed-size entity table
 - explicit result codes for all public transitions
+- VST-facing public functions should use out-parameters instead of returning
+  structs by value
 - no `__int128` or compiler-specific integer extension in the core
 - signed arithmetic goes through checked helpers before committing a result
-- failed transitions return the original runqueue copy
+- failed EEVDF transitions write the original runqueue copy to the out-parameter
 - platform work remains outside the verified core
 
 Kernel-owned responsibilities remain outside this directory:

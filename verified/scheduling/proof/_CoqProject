@@ -1,3 +1,8 @@
 -Q ../spec Pacha.Scheduling
 -Q . Pacha.Scheduling.Proof
+-Q generated Pacha.Scheduling.Clight
+generated/PachaEevdfClight.v
+generated/PachaSchedClight.v
 SchedRuntimeVstSpec.v
+PachaEevdfVst.v
+PachaSchedVst.v

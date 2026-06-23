@@ -11,7 +11,7 @@ extern "C" {
 #endif
 
 #define PACHA_SCHED_MAX_CPUS 256u
-#define PACHA_SCHED_NO_CPU SIZE_MAX
+#define PACHA_SCHED_NO_CPU PACHA_SCHED_MAX_CPUS
 
 typedef enum pacha_sched_rc {
   PACHA_SCHED_OK = 0,
@@ -34,11 +34,6 @@ typedef struct pacha_sched_decision {
   int64_t generation;
 } pacha_sched_decision;
 
-typedef struct pacha_sched_result {
-  pacha_sched_rc rc;
-  pacha_sched_decision decision;
-} pacha_sched_result;
-
 typedef struct pacha_sched_cpu {
   int has_current;
   int64_t current_thread_id;
@@ -50,34 +45,49 @@ typedef struct pacha_sched_state {
   size_t cpu_count;
 } pacha_sched_state;
 
-pacha_sched_decision pacha_sched_no_decision(void);
-pacha_sched_state pacha_sched_empty_state(size_t cpu_count);
+void pacha_sched_no_decision(pacha_sched_decision *out);
+void pacha_sched_empty_state(size_t cpu_count, pacha_sched_state *out);
 
-pacha_sched_result pacha_sched_add_thread(
+pacha_sched_rc pacha_sched_add_thread(
     pacha_sched_state *sched,
     int64_t thread_id,
     int64_t generation,
     int64_t weight,
-    int64_t slice_ns);
-pacha_sched_result pacha_sched_wake_thread(
+    int64_t slice_ns,
+    pacha_sched_decision *decision_out,
+    pacha_eevdf_runqueue *scratch);
+pacha_sched_rc pacha_sched_wake_thread(
     pacha_sched_state *sched,
-    int64_t thread_id);
-pacha_sched_result pacha_sched_block_thread(
+    int64_t thread_id,
+    pacha_sched_decision *decision_out,
+    pacha_eevdf_runqueue *scratch);
+pacha_sched_rc pacha_sched_block_thread(
     pacha_sched_state *sched,
-    int64_t thread_id);
-pacha_sched_result pacha_sched_exit_thread(
+    int64_t thread_id,
+    pacha_sched_decision *decision_out,
+    pacha_eevdf_runqueue *scratch);
+pacha_sched_rc pacha_sched_exit_thread(
     pacha_sched_state *sched,
-    int64_t thread_id);
-pacha_sched_result pacha_sched_on_timer(
+    int64_t thread_id,
+    pacha_sched_decision *decision_out,
+    pacha_eevdf_runqueue *scratch);
+pacha_sched_rc pacha_sched_on_timer(
     pacha_sched_state *sched,
     size_t cpu_id,
-    int64_t runtime_ns);
-pacha_sched_result pacha_sched_pick(
+    int64_t runtime_ns,
+    pacha_sched_decision *decision_out,
+    pacha_eevdf_runqueue *scratch);
+pacha_sched_rc pacha_sched_pick(
     pacha_sched_state *sched,
-    size_t cpu_id);
-pacha_sched_result pacha_sched_finish_current(
+    size_t cpu_id,
+    pacha_sched_decision *decision_out,
+    pacha_eevdf_pick_result *pick_scratch,
+    pacha_eevdf_runqueue *scratch);
+pacha_sched_rc pacha_sched_finish_current(
     pacha_sched_state *sched,
-    size_t cpu_id);
+    size_t cpu_id,
+    pacha_sched_decision *decision_out,
+    pacha_eevdf_runqueue *scratch);
 
 #ifdef __cplusplus
 }
