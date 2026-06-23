@@ -1205,6 +1205,23 @@ pub const KernelState = struct {
     zero_physical_page_hook: ?*const fn (paddr: u64) bool = null,
     debug_process_lifecycle_hook: ?*const fn (state: *const KernelState, principal: PrincipalId, reason: DebugProcessLifecycleReason) void = null,
 
+    fn resetStorageInPlace(self: *KernelState) void {
+        @memset(std.mem.asBytes(self), 0);
+        self.process_descriptors_extra = empty_process_descriptors_extra[0..];
+        self.endpoint_tables_extra = empty_endpoint_tables_extra[0..];
+        self.fd_tables_extra = empty_fd_tables_extra[0..];
+        self.vma_tables_extra = empty_vma_tables_extra[0..];
+        self.process_capacity = process_count;
+        self.aslr_secret = 0x6a09_e667_f3bc_c909;
+        self.aslr_sequence = 1;
+
+        for (&self.fd_objects) |*slot| slot.generation = 1;
+        for (&self.native_vmos) |*slot| slot.generation = 1;
+        for (&self.ipc_endpoints) |*slot| slot.generation = 1;
+        for (&self.ipc_channels) |*slot| slot.generation = 1;
+        for (&self.ipc_replies) |*slot| slot.generation = 1;
+    }
+
     fn pageAlignUp(value: u64) u64 {
         return (value + 4095) & ~@as(u64, 4095);
     }
@@ -2115,6 +2132,59 @@ pub const KernelState = struct {
             if (!entry.active) continue;
             if (entry.start_va != start_va or entry.size_bytes != size_bytes) continue;
             entry.prot = prot;
+            return;
+        }
+        return KernelError.InvalidState;
+    }
+
+    pub fn setVmaProtRange(self: *KernelState, owner: PrincipalId, start_va: u64, size_bytes: u64, prot: VmaProt) KernelError!void {
+        try self.requireActiveProcess(owner);
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes)) return KernelError.InvalidState;
+        const end_va = try checkedEnd(start_va, size_bytes);
+        const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            const entry_end = entry.endVa();
+            if (start_va < entry.start_va or end_va > entry_end) continue;
+
+            if (entry.start_va == start_va and entry.size_bytes == size_bytes) {
+                entry.prot = prot;
+                return;
+            }
+
+            const original = entry.*;
+            const has_before = start_va > original.start_va;
+            const has_after = end_va < entry_end;
+            const before_size = start_va - original.start_va;
+            const target_offset = start_va - original.start_va;
+            const after_size = entry_end - end_va;
+
+            const before_index = if (has_before) findFreeVma(table) orelse return KernelError.TableFull else 0;
+            if (has_before) try self.retainNativeVmo(original.vmo);
+            errdefer if (has_before) {
+                table.entries[before_index] = .{};
+                self.releaseNativeVmo(original.vmo);
+            };
+            if (has_before) {
+                table.entries[before_index] = original;
+                table.entries[before_index].size_bytes = before_size;
+            }
+
+            const after_index = if (has_after) findFreeVma(table) orelse return KernelError.TableFull else 0;
+            if (has_after) try self.retainNativeVmo(original.vmo);
+            errdefer if (has_after) self.releaseNativeVmo(original.vmo);
+            if (has_after) {
+                table.entries[after_index] = original;
+                table.entries[after_index].start_va = end_va;
+                table.entries[after_index].size_bytes = after_size;
+                table.entries[after_index].vmo_offset = original.vmo_offset + target_offset + size_bytes;
+            }
+
+            entry.start_va = start_va;
+            entry.size_bytes = size_bytes;
+            entry.prot = prot;
+            entry.vmo_offset = original.vmo_offset + target_offset;
             return;
         }
         return KernelError.InvalidState;
@@ -3857,7 +3927,7 @@ pub const KernelState = struct {
     }
 
     pub fn initPhase1InPlace(self: *KernelState) void {
-        self.* = .{};
+        self.resetStorageInPlace();
         self.regions[0] = .{
             .id = 0,
         };
@@ -3875,7 +3945,7 @@ pub const KernelState = struct {
         if (region_count == 0) return KernelError.EmptyRegionSet;
         if (region_count > max_regions) return KernelError.TooManyRegions;
 
-        self.* = .{};
+        self.resetStorageInPlace();
         if (builtin.is_test) {
             self.initPrincipalState();
         } else {

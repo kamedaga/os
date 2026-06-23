@@ -24,12 +24,10 @@ pub var kernel_image_size_bytes_ref: usize = 0;
 var uefi_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
 var uefi_exitbs_mmap_buffer: [64 * 1024]u8 align(@alignOf(uefi.tables.MemoryDescriptor)) = undefined;
 // Scratch region used for ELF loading after ExitBootServices.
-var post_exit_load_scratch: [8 * 1024 * 1024]u8 align(4096) = [_]u8{0} ** (8 * 1024 * 1024);
+const post_exit_load_scratch_bytes: usize = 8 * 1024 * 1024;
+var empty_post_exit_load_scratch: [0]u8 align(4096) = .{};
+var post_exit_load_scratch: []align(4096) u8 = empty_post_exit_load_scratch[0..];
 var post_exit_load_scratch_used: usize = 0;
-
-pub fn postExitLoadScratchEndAddr() usize {
-    return @intFromPtr(&post_exit_load_scratch) + post_exit_load_scratch.len;
-}
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -59,7 +57,7 @@ pub fn kernelStaticStorageStartAddr() usize {
 }
 
 pub fn kernelStaticStorageEndAddr() usize {
-    var end = postExitLoadScratchEndAddr();
+    var end = staticStorageEnd(@TypeOf(boot_services_cache), &boot_services_cache);
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_services_cache), &boot_services_cache));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_image_base_paddr_ref), &kernel_image_base_paddr_ref));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_image_size_bytes_ref), &kernel_image_size_bytes_ref));
@@ -105,6 +103,17 @@ pub fn acquireBootServicesOrHalt() *uefi.tables.BootServices {
     };
     boot_services_cache = bs;
     return bs;
+}
+
+pub fn allocatePostExitLoadScratchOrHalt(bs: *uefi.tables.BootServices) void {
+    if (post_exit_load_scratch.len != 0) return;
+    const page_count = (post_exit_load_scratch_bytes + 4095) / 4096;
+    const pages = bs.allocatePages(.{ .any = {} }, .loader_data, page_count) catch {
+        halt.haltWithMessage("post-exit load scratch allocation failed");
+    };
+    const ptr: [*]align(4096) u8 = @ptrCast(pages.ptr);
+    post_exit_load_scratch = ptr[0 .. page_count * 4096];
+    post_exit_load_scratch_used = 0;
 }
 
 pub fn exitBootServicesOrHalt() void {
@@ -261,7 +270,7 @@ pub fn allocateBootScratch(bytes: usize) ?[]align(8) u8 {
     const start = std.mem.alignForward(usize, post_exit_load_scratch_used, 8);
     if (aligned_bytes > post_exit_load_scratch.len - start) return null;
     post_exit_load_scratch_used = start + aligned_bytes;
-    const ptr: [*]align(8) u8 = @ptrCast(@alignCast(&post_exit_load_scratch[start]));
+    const ptr: [*]align(8) u8 = @ptrCast(@alignCast(post_exit_load_scratch.ptr + start));
     return ptr[0..bytes];
 }
 
@@ -270,7 +279,8 @@ pub fn freeBootScratch(buf: []align(8) u8) void {
         bs.freePool(buf.ptr) catch {};
         return;
     }
-    const base = @intFromPtr(&post_exit_load_scratch[0]);
+    if (post_exit_load_scratch.len == 0) return;
+    const base = @intFromPtr(post_exit_load_scratch.ptr);
     const limit = base + post_exit_load_scratch.len;
     const ptr = @intFromPtr(buf.ptr);
     if (ptr < base or ptr > limit) return;

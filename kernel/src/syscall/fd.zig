@@ -464,12 +464,12 @@ fn mprotectVmaRange(
     user_vm.lockAddressSpaces();
     defer user_vm.unlockAddressSpaces();
 
-    const exact_vma = state.vmaEntryConst(proc, base_va) orelse return sc.syscall_err_invalid;
-    if (exact_vma.size_bytes != aligned_size) return sc.syscall_err_invalid;
+    const start_vma = state.vmaEntryForVaConst(proc, base_va) orelse return sc.syscall_err_invalid;
+    if (base_va + aligned_size > start_vma.endVa()) return sc.syscall_err_invalid;
 
     if (!prot.read and !prot.write and !prot.exec) {
         if (!user_vm.unmapUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_map;
-        state.setVmaProtExact(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
+        state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
         return sc.syscall_ok;
     }
 
@@ -491,7 +491,7 @@ fn mprotectVmaRange(
         .exec = prot.exec,
         .pkey = prot.pkey,
     })) return sc.syscall_err_map;
-    state.setVmaProtExact(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
+    state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
 

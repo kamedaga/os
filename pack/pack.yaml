@@ -502,6 +502,7 @@ apps:
         - "userland/seed0root/CMakeLists.txt"
         - "userland/seed0root/src"
         - "userland/filed/include"
+        - "userland/filed_smoke/include"
         - "userland/koboxd/include"
         - "userland/libipc/include"
         - "userland/libipc/src"
@@ -509,20 +510,6 @@ apps:
         - "userland/libpacha/src"
     out: "SEED0RT.ELF"
     rootfs: "/sbin/seed0root.elf"
-  smp_stress:
-    role: "service"
-    file:
-      path: ".artifacts/cmake/smp_stress/smp_stress.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/smp_stress", "--parallel", "1"]
-      input:
-        - "userland/smp_stress/CMakeLists.txt"
-        - "userland/smp_stress/src"
-        - "userland/libipc/include"
-        - "userland/libipc/src"
-        - "userland/libpacha/include"
-        - "userland/libpacha/src"
-    out: "SMPSTRS.ELF"
-    rootfs: "/sbin/smp_stress.elf"
   koboxd:
     role: "service"
     file:
@@ -553,6 +540,22 @@ apps:
         - "userland/libpacha/src"
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
+  filed_smoke:
+    role: "test"
+    file:
+      path: ".artifacts/cmake/filed_smoke/filed_smoke.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/filed_smoke", "--parallel", "1"]
+      input:
+        - "userland/filed_smoke/CMakeLists.txt"
+        - "userland/filed_smoke/include"
+        - "userland/filed_smoke/src"
+        - "userland/filed/include"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+    out: "FDSMOKE.ELF"
+    rootfs: "/sbin/filed_smoke.elf"
   net_bench:
     file:
       path: ".artifacts/userland-fixtures/net_bench.elf"

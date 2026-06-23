@@ -39,9 +39,46 @@ storage_boot
 - ext4 / btrfs backend endpoint を mount する
 - vnode / mount / open file description / handle table / path walk を持つ
 - `libvfs` / musl から呼ばれる file service endpoint を公開する
+- pathname based process exec service を公開する
+- executable file read, ELF validation, process image construction, initial stack / auxv construction を行う
 - VFS cache と namespace policy を所有する
 
 この分離により、`koboxd` が VFS server まで兼任して肥大化することと、Linux `.ko` runtime が複数 daemon に散らばることの両方を避ける。将来 `netd`, `inputd`, `displayd` などを増やす場合も、`koboxd` は Linux `.ko` backend runtime、`filed` は file namespace server という役割が保たれる。
+
+### bootstrap exec exception
+
+`seed0root` には bootstrap 用の最小 exec 実装を残す。
+
+理由は起動順にある。
+
+```text
+seed0boot
+  -> storage_boot
+    -> seed0root
+      -> koboxd
+      -> filed
+```
+
+`filed` が起動する前に、`seed0root` は少なくとも `koboxd` と `filed` 自身を起動しなければならない。そのため、`seed0root` の ELF load / process start は完全には消せない。
+
+ただしこれは通常の process exec authority ではない。`seed0root` の exec は bootstrap executor としての例外であり、通常の `/sbin/...`、service spawn、user process exec は `filed` に集約する。
+
+恒久的な責務分離。
+
+```text
+seed0root:
+  - bootstrap fd を読む
+  - koboxd を起動する
+  - filed を起動する
+  - filed に fs backend endpoint / control endpoint を渡す
+
+filed:
+  - namespace / VFS handle / vnode / mount を管理する
+  - path lookup と file read を行う
+  - exec by path を提供する
+  - argv/env/auxv/bootstrap fd/inherit fd policy を決める
+  - process/thread fd を返す
+```
 
 ## 基本方針
 
@@ -54,6 +91,387 @@ storage_boot
 - POSIX 互換 API は musl layer で提供し、`libvfs` を POSIX API そのものにしない
 - `filed` との高速 IPC は trusted 専用の pkey shared-memory backend を使えるようにする
 - normal IPC / fd passing は control plane と fallback として維持する
+- `filed` の VFS core と exec core は Coq 抽象モデルを先に作り、C 実装はそのモデルに寄せる
+- VST は初期対象にしない。まず Coq の executable model、invariant preservation、同一ケースの C differential test で設計の有効性を見る
+
+## Coq 抽象モデル方針
+
+`filed` は scheduler と同じく、バグると OS 全体の足場が崩れる領域である。特に VFS と exec は、path walk、handle lifetime、rights、fd inheritance、ELF segment validation、process construction が絡むため、C を直接育てると状態遷移の見落としが起きやすい。
+
+そのため、VST までは行かずに、まず Coq の抽象モデルを設計の中心に置く。
+
+目的。
+
+- C 実装前に VFS / exec の状態遷移を固定する
+- C が壊してはいけない invariant を先に列挙する
+- `filed` の dirty な helper 群を、モデル由来の小さい関数へ自然に分解する
+- 仕様とテストケースを同じ形で Coq / C に持てるようにする
+- kernel に逃げず、userland service として正しく解く
+- SMP では複数 core/client からの request を filed 境界で sequence 付きに直列化し、pure VFS / exec state への適用順を明示する
+
+非目的。
+
+- 初期段階で VST proof を作ること
+- Linux VFS を Coq で完全再現すること
+- ext4 / btrfs 内部構造を Coq model に入れること
+- IPC data plane や pkey ring のメモリ安全性をこの model で証明すること
+- kernel process object / fd table の正しさを filed model が証明すること
+
+Coq model は `filed` の pure core を扱う。kernel syscall、IPC、pkey ring、VMO map、process/thread create は adapter の effect として外に出す。
+
+```text
+verified/filed/
+  spec/
+    FiledTypes.v
+    VfsModel.v
+    VfsSpec.v
+    ExecModel.v
+    ExecSpec.v
+    FiledRuntimeSpec.v
+    MulticoreModel.v
+    MulticoreSpec.v
+  tests/
+    cases/
+```
+
+`verified/filed/spec` は Coq 抽象モデルを置く場所である。C 実装は `userland/filed` に集約する。`filed` は実装量が大きく、bootstrap、IPC、pkey ring、rootfs integration、daemon lifecycle と密接に絡むため、`verified/filed/c` のような別実装ツリーには分けない。
+
+恒久方針。
+
+- `verified/filed/spec`: 仕様、抽象モデル、補題
+- `userland/filed`: C 実装、daemon glue、IPC、backend adapter
+- `pacha_docs/filed-vfs-design.md`: 設計判断と段階計画
+
+開発段階の Markdown は増やさない。`filed` / VFS / exec / verified filed に関する設計判断、段階計画、モデルと C の対応、検証コマンドはこの `pacha_docs/filed-vfs-design.md` に集約する。`userland/filed` や `verified/filed` 配下には、必要なソース、テスト、Coq ファイル、スクリプトだけを置く。
+
+C 側は `verified/filed/spec` の関数分解に寄せる。たとえば path walk、open file description、handle table、rename commit、exec plan は model と同じ責務境界を持つ。ただし C source の実体は `userland/filed` に置く。
+
+### SMP / multicore model
+
+`filed` は userland daemon なので、複数 CPU が同時に VFS state を直接更新する構造にはしない。SMP で model 化する対象は、複数 core/client から届く request を filed core がどの順序で pure state transition に適用するかである。
+
+抽象化するもの。
+
+```text
+FiledRequest:
+  core_id
+  client_id
+  op
+
+FiledRuntimeState:
+  vfs_state
+  next_sequence
+  request_log
+```
+
+基本 invariant。
+
+- `next_sequence` は monotonic
+- request log の sequence は一意
+- log entry の sequence は常に `next_sequence` より小さい
+- 1 request は 1 pure VFS / exec operation として直列化される
+- operation が `well_formed_state` を保存するなら、multicore runtime も `well_formed_state` を保存する
+
+この model は lock-free ring、mutex、worker thread 数、pkey IPC layout を固定しない。C 実装ではそれらを変えられるが、filed core に入る直前で sequence を切り、`state + request -> state + response` の形に落とす。
+
+### VFS model
+
+VFS 抽象状態。
+
+```text
+VfsState:
+  mounts
+  vnodes
+  handles
+  cwd table later
+  next ids
+```
+
+最小 entity。
+
+```text
+Mount:
+  mount_id
+  root_vnode
+  backend_id
+  fs_kind
+  flags
+
+Vnode:
+  vnode_id
+  mount_id
+  backend_object_id
+  kind
+  parent
+  name
+  linked
+  symlink_target
+  generation
+  refcount
+  cached_stat
+
+Vfile:
+  file_id
+  vnode_id
+  offset
+  status_flags
+  rights
+  refcount
+
+VfsHandle:
+  handle_id
+  file_id | vnode_id | mount_id
+  rights
+  fd_flags
+  generation
+```
+
+基本 invariant。
+
+- mount id は一意
+- active vnode id は一意
+- `(mount_id, backend_object_id)` は active vnode 内で一意
+- active handle id は一意
+- active handle は存在する object を指す
+- active file は存在する vnode を指す
+- file offset は non-negative
+- unlink / rmdir は vnode object を即座に消さず、directory lookup から外すために `linked=false` にする
+- open file description が参照する vnode は unlink 後も state 内に残る
+- `Vfile` は Unix の open file description であり、`offset` と file status flags を持つ
+- `VfsHandle` は fd 相当であり、`CLOEXEC` など fd-local flags を持つ
+- `dup` / attenuation は同じ `Vfile` を共有し、fd-local flags は新しい handle 側で独立する
+- `CLOEXEC` handle は exec inheritance set に入らない
+- directory-only operation は directory vnode にだけ成功する
+- regular-file read/write は regular vnode にだけ成功する
+- rights の attenuation は rights を増やさない
+- closed handle は lookup できない
+- stale generation の handle は使えない
+- path walk は root / cwd / mount boundary / `.` / `..` を仕様通り処理する
+- path walk は budget を持ち、symlink loop / excessive expansion を `LOOP` 相当で止める
+- mount root での `..` はその mount root に留まり、親 mount へ暗黙に脱出しない
+- final symlink は通常 follow するが、`O_NOFOLLOW` では follow せず `openat` 側で拒否する
+- cross-mount rename は `VFS_CROSS_MOUNT`
+- backend object id の内容は opaque で、VFS core は比較以外に解釈しない
+- `O_CREAT` は parent path が存在し、caller に create right があり、final component が存在しない場合だけ regular vnode を作る
+- `O_EXCL | O_CREAT` は final component が既に存在する場合 `EXIST` 相当で失敗する
+- `O_DIRECTORY` は non-directory target を拒否する
+- `O_NOFOLLOW` は final symlink target を拒否する
+- `O_TRUNC` は write right と regular vnode を要求し、許可された場合は truncate backend decision を返す
+
+最初に Coq 関数として定義する操作。
+
+```text
+mount_root
+lookup_component
+path_walk
+openat
+close
+dup_attenuate
+read_prepare
+pread_prepare
+pwrite_prepare
+getdents_prepare
+statx
+rename
+unlink
+mkdir
+rmdir
+```
+
+`path_walk_context` は root start / cwd start を明示する。相対 path は cwd から、絶対相当の path は root から開始する。symlink 展開は budget を消費し、loop / excessive expansion は `FiledErrLoop` に落とす。
+
+`*_prepare` は backend I/O を直接行わない。VFS model は「この backend request を出してよい」という decision を返す。実際の `koboxd` request は C adapter が実行する。
+
+`read_prepare` は Unix `read` 相当として `Vfile.offset` を使い、成功時に共有 open file description の offset を進める。`pread_prepare` は caller supplied offset を使い、`Vfile.offset` を更新しない。
+
+現在の C 実装では `filed_open_file_t` がこの `Vfile` に対応する。
+
+- `filed_open_file_t.vnode_id` は backend object ではなく filed 内部 vnode handle を指す
+- `filed_open_file_t.offset` は `READ` / `GETDENTS` が共有する open file description offset
+- `filed_open_file_t.status_flags` は `APPEND` / `NONBLOCK` / `SYNC` など file status flags
+- `filed_open_file_t.rights` は open file description が backend I/O に使える権限
+- `filed_handle_t.fd_flags` は `CLOEXEC` など fd-local flags
+
+`OPENAT` は vnode handle ではなく、常に open file handle を返す。`READ` は `read_prepare` で現在 offset を backend request に変換し、backend が実際に返した byte 数だけ `read_commit` で offset を進める。`PREAD` は caller supplied offset を使い、commit を持たない。`GETDENTS` も directory open file description の offset を使い、返した entry 数だけ `getdents_commit` で進める。
+
+`DUP` は `filed_vfs_dup_handle` で同じ `filed_open_file_t` を指す新しい `filed_handle_t` を作る。新 handle の `CLOEXEC` は caller が明示する。`GET_FLAGS` / `SET_FLAGS` は `CLOEXEC` を handle-local に、`APPEND` / `NONBLOCK` / `SYNC` を共有 open file description に反映する。これにより、`dup` 後に offset と file status flags は共有され、exec inheritance policy は fd ごとに独立する。
+
+### Exec model
+
+exec は `filed` の責務に入れる。ただし model は process creation syscall そのものを証明しない。`filed` が正しい exec plan を作ることを扱う。
+
+抽象状態。
+
+```text
+ExecRequest:
+  path
+  argv
+  env
+  argc/envc consistency
+  cwd/root handle later
+  bootstrap_fd optional
+  inherit fd list
+  flags
+
+ElfImage:
+  bytes
+  ehdr
+  phdrs
+
+ExecPlan:
+  process_rights
+  thread_rights
+  mappings
+  stack_image
+  entry
+  initial_sp
+  auxv
+  argv_layout
+  env_layout
+  inherited_fds
+  inherited_handles
+```
+
+ELF / process image invariant。
+
+- ELF magic / class / endian / version / machine が一致する
+- ELF type は `EXEC` または `DYN`
+- program header table は image 範囲内
+- `PT_LOAD` segment は image 範囲内
+- `memsz >= filesz`
+- load segment の virtual range は page-aligned mapping に収まる
+- load segments は overflow しない
+- load segments は互いに不正に overlap しない
+- writable/executable permission は segment flags からだけ作る
+- stack は page aligned VMO として作る
+- initial stack は argc/argv/env/auxv を含む
+- argc/envc は argv/env の list length と一致する
+- auxv は pagesz / entry / phent / phnum を含む
+- `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_RANDOM`, `AT_EXECFN` が一貫する
+- optional bootstrap fd は `PACHA_AT_BOOTSTRAP_FD` としてだけ渡る
+- inherit fd list は明示された fd だけを含む
+- `CLOEXEC` 相当の fd は通常 exec plan に含まれない
+- filed の VFS handle table から exec inherit plan を作る場合、`VfsFdCloseOnExec` handle は inherited handle set に入らない
+- ASLR が有効な場合でも segment 間の相対配置は保持される
+
+最初に Coq 関数として定義する操作。
+
+```text
+validate_elf_header
+collect_load_segments
+choose_load_bias
+build_mapping_plan
+build_stack_plan
+build_fd_inherit_plan
+build_handle_inherit_plan
+build_exec_plan
+```
+
+`build_exec_plan_with_handles` は effect を実行しない。返すのは「どの VMO を作るか」「どこへ map するか」「どの fd / filed handle を inherit するか」「どの argv/env/auxv を stack に置くか」「どの entry/sp で thread を作るか」という plan である。C adapter はこの plan を順に実行し、失敗したら作成済み fd を閉じる。
+
+`build_exec_plan` は handle table を持たない互換 wrapper とする。通常の filed exec path は `filed_exec_path_with_handles` を使い、現在の VFS handle table から `CLOEXEC` filtering 済み inherited handles を作る。
+
+現在の `EXEC_PATH` ABI は kernel fd inheritance と filed open file handle inheritance を分けて扱う。
+
+- kernel fd は IPC fd passing で child process に渡す
+- filed open file handle は `inherit_handles[]` で指定し、`filed_vfs_dup_handle_for_exec` が child 用 filed handle id を作る
+- duplicated filed handle は同じ `filed_open_file_t` を指すため offset / status flags を共有する
+- duplicated handle の `CLOEXEC` は落とす
+- source handle に `CLOEXEC` が付いている場合、filed handle inheritance は拒否する
+- bootstrap payload には kernel fd id と filed handle id の両方を patch できる
+
+### VFS と exec の接続
+
+`exec_path` は VFS model と Exec model の合成として扱う。
+
+```text
+exec_path(state, request):
+  path_walk(open executable)
+  check execute/read rights
+  read file image or create file-backed image source
+  build_exec_plan
+  return decision
+```
+
+最初の仕様。
+
+- path が存在しないなら `VFS_NOT_FOUND`
+- path が directory なら `VFS_IS_DIR`
+- execute/read 権限がなければ `VFS_DENIED`
+- ELF が不正なら `EXEC_BAD_FORMAT`
+- process image plan が overflow するなら `EXEC_INVALID_IMAGE`
+- 成功時は VFS state を壊さない
+- 成功時の plan は Exec invariant を満たす
+- backend read が必要な場合、VFS model は read request decision を返すだけで payload は adapter が読む
+
+### C 実装への落とし方
+
+VST をしない代わりに、C 実装は model に寄せた小さい pure-ish 関数へ分ける。
+
+```text
+filed_vfs_mount_root
+filed_vfs_lookup_component
+filed_vfs_path_walk
+filed_vfs_openat
+filed_vfs_close
+
+filed_exec_validate_elf
+filed_exec_collect_segments
+filed_exec_build_mapping_plan
+filed_exec_build_stack_plan
+filed_exec_build_fd_plan
+filed_exec_start_plan
+```
+
+C 側の制約。
+
+- dynamic allocation は adapter 境界に寄せ、core は固定長 table で始める
+- result code は明示する
+- out parameter を使う
+- integer overflow check を明示する
+- pointer を model の identity として扱わない
+- backend object は opaque id と generation で扱う
+- side effect をする関数と plan を作る関数を分ける
+- failure unwind を一箇所に集約する
+
+### differential / property test
+
+VST なしで効果を見るため、最初は同じケースを Coq と C の両方に持つ。
+
+VFS cases。
+
+- root lookup
+- missing path
+- non-directory component
+- `.` / `..`
+- cross-mount traversal
+- handle close then use
+- rights attenuation
+- duplicate handle generation
+- regular file `pread_prepare`
+- directory `getdents_prepare`
+
+Exec cases。
+
+- valid static executable
+- invalid magic
+- unsupported machine
+- truncated phdr table
+- segment filesz out of range
+- `memsz < filesz`
+- segment address overflow
+- segment overlap
+- no `PT_LOAD`
+- bootstrap fd present / absent
+- fd inherit list with cloexec filtering
+- ASLR load bias preserves relative layout
+
+合格条件。
+
+- Coq examples が通る
+- C unit test が同じ期待結果を返す
+- rootfs 上の `/sbin/filed.elf` や `/sbin/koboxd.elf` に対して `build_exec_plan` smoke が通る
+- seed0root の bootstrap exec と filed の normal exec の差分が文書化されている
 
 ## 対応 filesystem
 
@@ -130,12 +548,12 @@ cross-mount operation は VFS core が判断する。`rename` の cross-mount �
 
 - vnode pointer
 - current offset
-- open flags
+- file status flags (`APPEND`, `NONBLOCK`, `SYNC`)
 - rights
 - backend file handle
 - refcount
 
-`dup` 相当では `Vfile` を共有し、file offset も共有する。`open` し直した場合は別の `Vfile` になる。
+`dup` 相当では `Vfile` を共有し、file offset と file status flags も共有する。`open` し直した場合は別の `Vfile` になる。
 
 ### VfsHandle
 
@@ -146,6 +564,7 @@ cross-mount operation は VFS core が判断する。`rename` の cross-mount �
 - handle id
 - points to `Vfile`, directory cursor, mount, or control object
 - per-handle rights
+- fd-local flags (`CLOEXEC`)
 - close / transfer / inherit policy
 
 client に vnode pointer や backend pointer は見せない。
@@ -259,9 +678,21 @@ unlink 済みでも open されている file は `Vfile` / `Vnode` refcount に
 
 cross-mount rename は失敗する。copy fallback は VFS core が勝手に行わない。
 
+Coq model では `rename_commit` を単一 transition として扱う。destination が存在する場合は、同じ transition 内で destination を `linked=false` にし、source の `(parent, name)` を target へ更新する。cross-mount は `FiledErrCrossMount`、non-empty directory overwrite は `FiledErrNotEmpty` で失敗する。
+
+### unlink / rmdir lifetime
+
+`unlink` は regular / symlink / device など directory 以外の linked entry を `linked=false` にする。`rmdir` は directory だけを対象にし、linked child が残っていれば `FiledErrNotEmpty` で失敗する。
+
+directory lookup は `linked=true` の vnode だけを返す。open file description は vnode id を保持するため、unlink 後も open file は read/write/fsync/close 可能である。
+
 ### open file description
 
 `Vfile` が offset を持つ。handle duplicate は同じ `Vfile` を参照するため offset を共有する。
+
+fd-local な `CLOEXEC` は `VfsHandle` が持つ。`APPEND`, `NONBLOCK`, `SYNC` のような file status flags は `Vfile` が持つ。これにより `dup` 後の offset / status 共有と、fd ごとの exec inheritance policy を分離する。
+
+`read` / `write` / `lseek` は `Vfile.offset` を更新する。`pread` / `pwrite` は明示 offset を使い、`Vfile.offset` を更新しない。
 
 ### metadata consistency
 
@@ -787,19 +1218,30 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 - root mount registry と handle table を作る
 - `filed` 側も request id / timeout / cancellation / worker queue を持つ
 
-### Step 5: filed receives FS backend endpoint
+### Step 5: Coq abstract model first
+
+- `verified/filed/spec` を作る
+- `FiledTypes.v` に共通 id / rights / status / table model を置く
+- `VfsModel.v` に mount / vnode / file / handle の抽象状態を置く
+- `VfsSpec.v` に path walk / open / close / rights attenuation の invariant preservation を置く
+- `ExecModel.v` に ELF image / mapping plan / stack plan / fd inherit plan を置く
+- `ExecSpec.v` に `build_exec_plan` の基本仕様を置く
+- まず VST は作らない
+- Coq examples と C unit test が同じケースを通る状態を最初のゴールにする
+
+### Step 6: filed receives FS backend endpoint
 
 - `seed0root` または service table 経由で `filed` に `koboxd` FS backend endpoint を渡す
 - debug 用に block endpoint も受け取れるようにする
 - `filed` から `fs_mount_root` smoke を通す
 
-### Step 6: ext4 backend mount through koboxd
+### Step 7: ext4 backend mount through koboxd
 
 - `filed` が `koboxd` FS backend endpoint 経由で ext4 rootfs を mount する
 - `filed` は Linux inode/dentry/file を持たない
 - `koboxd` が返す root backend object id から root vnode を作る
 
-### Step 7: vnode lookup/read
+### Step 8: vnode lookup/read
 
 - component lookup
 - regular file open
@@ -808,21 +1250,32 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 - root directory `getdents`
 - `pread` / `getdents` は `client <-> filed` data plane と `filed <-> koboxd` data plane を通す
 
-### Step 8: libvfs IPC backend
+### Step 9: libvfs IPC backend
 
 - `libvfs` を追加する
 - control plane / data plane 両対応で `openat/pread/close/statx/getdents` を通す
 - normal IPC fallback を同一意味論で通す
 - `seed0root` から `/sbin/koboxd.elf` または `/etc/pacha-release` を read する smoke を作る
 
-### Step 9: client <-> filed pkey data plane
+### Step 10: filed exec service
+
+- `filed` bootstrap に control endpoint fd を追加する
+- `filed` が `EXEC_PATH` request を受け取る
+- VFS model に従って path walk / read rights / execute rights を確認する
+- Exec model に従って ELF validation / mapping plan / stack plan / fd inherit plan を作る
+- C adapter が VMO create / process map / thread create / thread start を実行する
+- 成功時は process fd / thread fd を caller に返す
+- 失敗時は作成済み fd をすべて閉じる
+- `seed0root` の bootstrap exec は `koboxd` と `filed` 起動用にだけ残す
+
+### Step 11: client <-> filed pkey data plane
 
 - trusted client 用 pkey ring setup
 - normal IPC control message から ring を確立
 - `pread` payload を pkey data plane に移す
 - fallback と同じ意味論を保つ
 
-### Step 10: write path
+### Step 12: write path
 
 - `pwrite`
 - file offset update
@@ -831,33 +1284,33 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 - `fsync`
 - basic write smoke
 
-### Step 11: POSIX/musl integration
+### Step 13: POSIX/musl integration
 
 - musl file backend を `libvfs` に接続
 - `open/read/write/close/lseek/stat/readdir/fsync` を通す
 - stdio smoke を rootfs file に対して行う
 
-### Step 12: filed <-> koboxd pkey data plane
+### Step 14: filed <-> koboxd pkey data plane
 
 - `fs_pread` / `fs_pwrite` / `fs_getdents` payload を pkey data plane に移す
 - `filed` VFS semantics と `koboxd` Linux FS backend semantics を変えずに高速化する
 - normal IPC fallback を維持する
 
-### Step 13: RCU path walk
+### Step 15: RCU path walk
 
 - race / stress test を増やす
 - path walk read-side を RCU 化する
 - rename / unlink / mount crossing との整合性を検証する
 - fallback lock path を残しながら段階的に hot path を移行する
 
-### Step 14: lock-free vnode cache
+### Step 16: lock-free vnode cache
 
 - vnode cache lookup を lock-free / mostly lock-free 化する
 - cache miss / insert / eviction は既存 lock path で保守的に扱う
 - negative dentry / negative lookup cache を入れる
 - metadata snapshot に seqlock を導入する
 
-### Step 15: per-worker cache
+### Step 17: per-worker cache
 
 - per-worker small cache を入れる
 - hot directory / vnode lookup の局所性を使う
@@ -888,6 +1341,17 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 [seed0root] vfs pread /tmp/vfs-smoke.txt OK
 ```
 
+exec service の最初の成功条件。
+
+```text
+[filed] exec model examples OK
+[filed] exec C unit cases OK
+[seed0root] filed exec /sbin/seed0_next.elf plan OK
+[seed0root] filed exec /sbin/seed0_next.elf started
+```
+
+ここで `seed0root` の bootstrap exec と `filed` の normal exec は分けて見る。`seed0root` は `koboxd` と `filed` を起動するための最小 loader を持つ。`filed` exec は rootfs path, rights, fd inheritance, argv/env/auxv を含む通常の process exec とする。
+
 ## 非目標
 
 初期 VFS でやらないこと。
@@ -902,6 +1366,8 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 - overlayfs
 - FUSE compatibility
 - Linux VFS の完全再実装
+- 初期段階での VST proof
+- `seed0root` bootstrap exec の完全削除
 
 ## 決定事項
 
@@ -919,3 +1385,7 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 - `client <-> filed` IPC は normal IPC control plane と pkey shared-memory data plane に分ける
 - `filed <-> koboxd` は FS backend service IPC とし、初期実装から pkey data plane と normal IPC fallback を同一意味論で持つ
 - pkey backend は trusted 専用であり、untrusted isolation として扱わない
+- `filed` は通常の pathname based process exec を提供する
+- `seed0root` の exec は `koboxd` と `filed` を起動する bootstrap exception として残す
+- VFS と exec は Coq 抽象モデルを先に作り、C 実装をその分解に合わせる
+- 初期検証は VST ではなく、Coq executable model / invariant preservation / C differential test で行う

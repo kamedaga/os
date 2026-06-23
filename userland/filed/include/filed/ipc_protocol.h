@@ -1,0 +1,132 @@
+#pragma once
+
+#include <stdint.h>
+
+enum {
+    FILED_WIRE_VERSION = 1,
+    FILED_WIRE_REQUEST_MAGIC = 0x31465152444c4946ull,
+    FILED_WIRE_REPLY_MAGIC = 0x31595052444c4946ull,
+
+    FILED_WIRE_OP_HELLO = 1,
+    FILED_WIRE_OP_ROOT_STAT = 2,
+    FILED_WIRE_OP_ROOT_GETDENTS = 3,
+    FILED_WIRE_OP_OPENAT = 4,
+    FILED_WIRE_OP_STAT = 5,
+    FILED_WIRE_OP_PREAD = 6,
+    FILED_WIRE_OP_GETDENTS = 7,
+    FILED_WIRE_OP_CLOSE = 8,
+    FILED_WIRE_OP_EXEC_PATH = 9,
+    FILED_WIRE_OP_READ = 10,
+    FILED_WIRE_OP_DUP = 11,
+    FILED_WIRE_OP_GET_FLAGS = 12,
+    FILED_WIRE_OP_SET_FLAGS = 13,
+
+    FILED_WIRE_NAME_BYTES = 96,
+    FILED_WIRE_IO_BYTES = 7680,
+    FILED_WIRE_DIRENT_NAME_BYTES = 96,
+    FILED_WIRE_DIRENT_CAPACITY = 16,
+    FILED_WIRE_PAGE_BYTES = 8192,
+
+    FILED_WIRE_RIGHT_LOOKUP = 1u << 0,
+    FILED_WIRE_RIGHT_READ = 1u << 1,
+    FILED_WIRE_RIGHT_WRITE = 1u << 2,
+    FILED_WIRE_RIGHT_EXEC = 1u << 3,
+    FILED_WIRE_RIGHT_STAT = 1u << 4,
+    FILED_WIRE_RIGHT_GETDENTS = 1u << 5,
+    FILED_WIRE_RIGHT_CREATE = 1u << 6,
+    FILED_WIRE_RIGHT_REMOVE = 1u << 7,
+    FILED_WIRE_RIGHT_RENAME = 1u << 8,
+
+    FILED_WIRE_OPEN_CREATE = 1u << 0,
+    FILED_WIRE_OPEN_EXCLUSIVE = 1u << 1,
+    FILED_WIRE_OPEN_TRUNCATE = 1u << 2,
+    FILED_WIRE_OPEN_DIRECTORY = 1u << 3,
+    FILED_WIRE_OPEN_NOFOLLOW = 1u << 4,
+    FILED_WIRE_OPEN_CLOEXEC = 1u << 5,
+    FILED_WIRE_OPEN_APPEND = 1u << 6,
+    FILED_WIRE_OPEN_NONBLOCK = 1u << 7,
+    FILED_WIRE_OPEN_SYNC = 1u << 8,
+
+    FILED_WIRE_FD_CLOEXEC = 1u << 0,
+
+    FILED_WIRE_FILE_APPEND = 1u << 0,
+    FILED_WIRE_FILE_NONBLOCK = 1u << 1,
+    FILED_WIRE_FILE_SYNC = 1u << 2,
+
+    FILED_WIRE_EXEC_BOOTSTRAP_FD = 1u << 0,
+    FILED_WIRE_EXEC_INHERIT_FDS = 1u << 1,
+    FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS = 1u << 2,
+    FILED_WIRE_EXEC_INHERIT_HANDLES = 1u << 3,
+    FILED_WIRE_EXEC_MAX_INHERIT_FDS = 4,
+    FILED_WIRE_EXEC_MAX_INHERIT_HANDLES = 4,
+    FILED_WIRE_EXEC_MAX_FD_PATCHES = 4,
+
+    FILED_WIRE_EXEC_PATCH_INHERIT_FD = 1,
+    FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FD = 2,
+    FILED_WIRE_EXEC_PATCH_INHERIT_HANDLE = 3,
+};
+
+typedef struct filed_wire_openat {
+    uint64_t dir_handle;
+    uint64_t rights;
+    uint64_t open_flags;
+    char name[FILED_WIRE_NAME_BYTES];
+} filed_wire_openat_t;
+
+typedef struct filed_wire_io {
+    uint64_t handle;
+    uint64_t offset;
+    uint64_t length;
+    uint8_t data[FILED_WIRE_IO_BYTES];
+} filed_wire_io_t;
+
+typedef struct filed_wire_statx {
+    uint64_t handle;
+    uint64_t mode;
+    uint64_t size;
+    uint64_t blocks;
+    uint64_t nlink;
+    uint64_t kind;
+} filed_wire_statx_t;
+
+typedef struct filed_wire_handle_flags {
+    uint64_t handle;
+    uint64_t fd_flags;
+    uint64_t status_flags;
+    uint64_t reserved0;
+} filed_wire_handle_flags_t;
+
+typedef struct filed_wire_dirent {
+    uint64_t handle;
+    uint64_t kind;
+    uint64_t name_len;
+    char name[FILED_WIRE_DIRENT_NAME_BYTES];
+} filed_wire_dirent_t;
+
+typedef struct filed_wire_getdents {
+    uint64_t dir_handle;
+    uint64_t offset;
+    uint64_t capacity;
+    uint64_t count;
+    filed_wire_dirent_t entries[FILED_WIRE_DIRENT_CAPACITY];
+} filed_wire_getdents_t;
+
+typedef struct filed_wire_exec_fd_patch {
+    uint64_t kind;
+    uint64_t index;
+    uint64_t offset;
+    uint64_t reserved0;
+} filed_wire_exec_fd_patch_t;
+
+typedef struct filed_wire_exec_path {
+    uint64_t dir_handle;
+    uint64_t flags;
+    uint64_t inherit_fd_count;
+    uint64_t fd_patch_count;
+    uint64_t inherit_handle_count;
+    uint64_t reserved1;
+    uint64_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
+    filed_wire_exec_fd_patch_t fd_patches[FILED_WIRE_EXEC_MAX_FD_PATCHES];
+    char path[FILED_WIRE_NAME_BYTES];
+    char argv0[FILED_WIRE_NAME_BYTES];
+} filed_wire_exec_path_t;

@@ -104,7 +104,7 @@ pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
     lockAddressSpaces();
     defer unlockAddressSpaces();
     const space = getUserSpace(principal) orelse return;
-    space.* = .{};
+    resetUserAddressSpaceStorage(space);
 }
 
 pub fn currentUserSpace() *UserAddressSpace {
@@ -153,6 +153,33 @@ pub fn resetUserReservations(space: *UserAddressSpace) void {
     @memset(space.reservations[0..], .{});
     space.reservation_generation = 0;
     space.next_dynamic_map_page = 0;
+}
+
+pub fn resetUserAddressSpaceStorage(space: *UserAddressSpace) void {
+    @memset(space.pml4[0..], 0);
+    var pdp_slot_init: usize = 0;
+    while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
+        space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
+        @memset(space.pdp_pages[pdp_slot_init][0..], 0);
+    }
+    var pd_slot_init: usize = 0;
+    while (pd_slot_init < UserAddressSpace.max_dynamic_pd_pages) : (pd_slot_init += 1) {
+        space.pd_page_pml4_index[pd_slot_init] = UserAddressSpace.no_pd_index;
+        space.pd_page_pdp_index[pd_slot_init] = UserAddressSpace.no_pd_index;
+        @memset(space.pd_pages[pd_slot_init][0..], 0);
+    }
+    var pt_slot_init: usize = 0;
+    while (pt_slot_init < UserAddressSpace.max_dynamic_pt_pages) : (pt_slot_init += 1) {
+        space.pt_page_pml4_index[pt_slot_init] = UserAddressSpace.no_pd_index;
+        space.pt_page_pdp_index[pt_slot_init] = UserAddressSpace.no_pd_index;
+        space.pt_page_pd_index[pt_slot_init] = UserAddressSpace.no_pd_index;
+        @memset(space.pt_pages[pt_slot_init][0..], 0);
+    }
+    space.pdp_page_used_len = 0;
+    space.pd_page_used_len = 0;
+    space.pt_page_used_len = 0;
+    space.cr3 = 0;
+    resetUserReservations(space);
 }
 
 fn reservationEndPage(base_va: u64, page_count: u64) ?u64 {

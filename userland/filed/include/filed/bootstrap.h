@@ -11,5 +11,6 @@ enum {
 typedef struct filed_bootstrap {
     uint64_t magic;
     uint64_t fs_backend_fd;
+    uint64_t public_endpoint_fd;
     uint64_t flags;
 } filed_bootstrap_t;

@@ -52,7 +52,8 @@ pub fn collectMemoryStatsAndFreePages(
         return null;
     };
 
-    free_list.* = .{};
+    free_list.len = 0;
+    free_list.range_len = 0;
     var detected_regions: usize = 0;
     var total_usable_bytes: u64 = 0;
     const fallback_kernel_start = kernel_vm.pageAlignDown(@min(h.main_addr, h.kernel_cr3_addr));

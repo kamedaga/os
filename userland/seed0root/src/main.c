@@ -1,11 +1,14 @@
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 #include "filed/bootstrap.h"
+#include "filed/ipc_protocol.h"
+#include "filed_smoke/bootstrap.h"
 #include "koboxd/ipc_protocol.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 
 enum {
@@ -13,9 +16,6 @@ enum {
     SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
     SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
     SEED0ROOT_PATH_COMPONENT_BYTES = 128,
-    SEED0ROOT_SMP_STRESS_PROCESSES = 16,
-    SEED0ROOT_SMP_STRESS_WAVES = 6,
-    SEED0ROOT_SMP_STRESS_WAIT_ATTEMPTS = 30000,
     SEED0ROOT_KOBOXD_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
     SEED0ROOT_PAGE_SIZE = 4096,
     SEED0ROOT_ELF64_EHDR_BYTES = 64,
@@ -38,6 +38,9 @@ enum {
     SEED0ROOT_AT_BASE = 7,
     SEED0ROOT_AT_RANDOM = 25,
     SEED0ROOT_AT_EXECFN = 31,
+    SEED0ROOT_PROCESS_STATE_EXITED = 2,
+    SEED0ROOT_PROCESS_STATE_KILLED = 3,
+    SEED0ROOT_PROCESS_WAIT_ATTEMPTS = 30000,
 };
 
 struct seed0root_bootstrap_module {
@@ -78,30 +81,6 @@ struct seed0root_started_process {
     uint64_t start_ms;
 };
 
-struct seed0root_smp_wave_metrics {
-    uint64_t start_ms;
-    uint64_t end_ms;
-    uint64_t min_process_ms;
-    uint64_t max_process_ms;
-    unsigned attempts;
-    unsigned wait_many_calls;
-    unsigned not_ready;
-    unsigned completed;
-};
-
-struct seed0root_smp_run_metrics {
-    uint64_t start_ms;
-    uint64_t end_ms;
-    uint64_t min_process_ms;
-    uint64_t max_process_ms;
-    unsigned total_processes;
-    unsigned process_fd_reuse;
-    unsigned thread_fd_reuse;
-    unsigned total_attempts;
-    unsigned total_wait_many_calls;
-    unsigned total_not_ready;
-};
-
 static int load_elf_process(
     const char *path,
     const unsigned char *image,
@@ -113,6 +92,7 @@ static int start_loaded_process(
     const char *argv0,
     int bootstrap_fd,
     struct seed0root_started_process *out_started);
+static int wait_started_process(const char *label, const struct seed0root_started_process *started);
 
 static uint16_t rd16(const unsigned char *p)
 {
@@ -142,19 +122,6 @@ static void wr64(unsigned char *p, uint64_t value)
 static uint64_t align_down(uint64_t value)
 {
     return value & ~(uint64_t)(SEED0ROOT_PAGE_SIZE - 1);
-}
-
-static uint64_t seed0root_now_ms(void)
-{
-    uint64_t ts[2] = {0, 0};
-    const long status = pacha_syscall2(
-        PACHA_RUNTIME_SYSCALL_CLOCK_GETTIME,
-        PACHA_TIMERFD_CLOCK_MONOTONIC,
-        (uint64_t)(uintptr_t)ts);
-    if (status != PACHA_SYSCALL_OK) {
-        return 0;
-    }
-    return ts[0] * 1000ull + ts[1] / 1000000ull;
 }
 
 static int align_up(uint64_t value, uint64_t *out)
@@ -807,275 +774,175 @@ static int seed0root_read_rootfs_file(int fs_fd, const char *path, unsigned char
     return 0;
 }
 
-static int wait_smp_stress_wave(
-    struct seed0root_started_process *started,
-    unsigned count,
-    unsigned wave,
-    struct seed0root_smp_wave_metrics *metrics)
+static int wait_started_process(const char *label, const struct seed0root_started_process *started)
 {
-    unsigned pending = count;
-    uint64_t status_words[SEED0ROOT_SMP_STRESS_PROCESSES][4];
-    for (unsigned i = 0; i < count; i++) {
-        memset(status_words[i], 0, sizeof(status_words[i]));
-    }
-    if (metrics != NULL) {
-        metrics->end_ms = 0;
-        metrics->min_process_ms = UINT64_MAX;
-        metrics->max_process_ms = 0;
-        metrics->attempts = 0;
-        metrics->wait_many_calls = 0;
-        metrics->not_ready = 0;
-        metrics->completed = 0;
-    }
-
-    for (unsigned attempt = 0; attempt < SEED0ROOT_SMP_STRESS_WAIT_ATTEMPTS && pending != 0; attempt++) {
-        if (metrics != NULL) {
-            metrics->attempts = attempt + 1;
-        }
-        struct pacha_pollfd pollfds[SEED0ROOT_SMP_STRESS_PROCESSES];
-        unsigned poll_count = 0;
-        for (unsigned i = 0; i < count; i++) {
-            if (started[i].process_fd < 16) {
-                continue;
-            }
-            pollfds[poll_count].fd = started[i].process_fd;
-            pollfds[poll_count].reserved0 = 0;
-            pollfds[poll_count].events = PACHA_FD_EVENT_READABLE;
-            pollfds[poll_count].revents = 0;
-            poll_count++;
-        }
-        if (poll_count != 0) {
-            if (metrics != NULL) {
-                metrics->wait_many_calls++;
-            }
-            (void)pacha_fd_wait_many(pollfds, poll_count, 1);
-        }
-
-        for (unsigned i = 0; i < count; i++) {
-            if (started[i].process_fd < 16) {
-                continue;
-            }
-            const long wait_status = pacha_syscall2(
-                PACHA_PROCESS_SYSCALL_WAIT,
-                (uint64_t)(uint32_t)started[i].process_fd,
-                (uint64_t)(uintptr_t)status_words[i]);
-            if (wait_status == PACHA_SYSCALL_ERR_NOT_READY || wait_status == -PACHA_SYSCALL_ERR_NOT_READY) {
-                if (metrics != NULL) {
-                    metrics->not_ready++;
-                }
-                continue;
-            }
-            if (wait_status != 0) {
-                fprintf(stderr,
-                    "[seed0root] smp stress wait failed wave=%u index=%u fd=%d status=%ld\n",
-                    wave,
-                    i,
-                    started[i].process_fd,
-                    wait_status);
-                return -1;
-            }
-            if (status_words[i][0] != 2 || status_words[i][1] != 0) {
-                fprintf(stderr,
-                    "[seed0root] smp stress exit unexpected wave=%u index=%u state=%llu code=%llu id=%llu\n",
-                    wave,
-                    i,
-                    (unsigned long long)status_words[i][0],
-                    (unsigned long long)status_words[i][1],
-                    (unsigned long long)status_words[i][2]);
-                return -2;
-            }
-            const uint64_t done_ms = seed0root_now_ms();
-            const uint64_t process_ms =
-                done_ms >= started[i].start_ms && started[i].start_ms != 0 ? done_ms - started[i].start_ms : 0;
-            if (metrics != NULL) {
-                if (process_ms < metrics->min_process_ms) {
-                    metrics->min_process_ms = process_ms;
-                }
-                if (process_ms > metrics->max_process_ms) {
-                    metrics->max_process_ms = process_ms;
-                }
-                metrics->completed++;
-                metrics->end_ms = done_ms;
-            }
-            (void)pacha_fd_close(started[i].process_fd);
-            (void)pacha_fd_close(started[i].thread_fd);
-            started[i].process_fd = -1;
-            started[i].thread_fd = -1;
-            pending--;
-        }
-    }
-
-    if (pending != 0) {
-        fprintf(stderr, "[seed0root] smp stress wait timeout wave=%u pending=%u\n", wave, pending);
-        return -3;
-    }
-    if (metrics != NULL && metrics->min_process_ms == UINT64_MAX) {
-        metrics->min_process_ms = 0;
-    }
-    printf("[seed0root] smp stress wave done wave=%u count=%u elapsed_ms=%llu proc_ms=%llu..%llu attempts=%u wait_many=%u not_ready=%u\n",
-        wave,
-        count,
-        (unsigned long long)(metrics != NULL && metrics->end_ms >= metrics->start_ms ? metrics->end_ms - metrics->start_ms : 0),
-        (unsigned long long)(metrics != NULL ? metrics->min_process_ms : 0),
-        (unsigned long long)(metrics != NULL ? metrics->max_process_ms : 0),
-        metrics != NULL ? metrics->attempts : 0,
-        metrics != NULL ? metrics->wait_many_calls : 0,
-        metrics != NULL ? metrics->not_ready : 0);
-    fflush(stdout);
-    return 0;
-}
-
-static void close_smp_stress_started(struct seed0root_started_process *started, unsigned count)
-{
-    for (unsigned i = 0; i < count; i++) {
-        if (started[i].thread_fd >= 16) {
-            (void)pacha_fd_close(started[i].thread_fd);
-            started[i].thread_fd = -1;
-        }
-        if (started[i].process_fd >= 16) {
-            (void)pacha_fd_close(started[i].process_fd);
-            started[i].process_fd = -1;
-        }
-    }
-}
-
-static int run_smp_stress_waves(const unsigned char *image, uint64_t image_size)
-{
-    if (image == NULL || image_size == 0) {
+    if (label == NULL || started == NULL || started->process_fd < 16) {
         return -1;
     }
 
-    struct seed0root_smp_run_metrics run_metrics = {
-        .start_ms = seed0root_now_ms(),
-        .end_ms = 0,
-        .min_process_ms = UINT64_MAX,
-        .max_process_ms = 0,
-        .total_processes = 0,
-        .process_fd_reuse = 0,
-        .thread_fd_reuse = 0,
-        .total_attempts = 0,
-        .total_wait_many_calls = 0,
-        .total_not_ready = 0,
-    };
-    int previous_process_fds[SEED0ROOT_SMP_STRESS_PROCESSES];
-    int previous_thread_fds[SEED0ROOT_SMP_STRESS_PROCESSES];
-    for (unsigned i = 0; i < SEED0ROOT_SMP_STRESS_PROCESSES; i++) {
-        previous_process_fds[i] = -1;
-        previous_thread_fds[i] = -1;
-    }
+    uint64_t status_words[4] = {0, 0, 0, 0};
+    for (unsigned attempt = 0; attempt < SEED0ROOT_PROCESS_WAIT_ATTEMPTS; attempt++) {
+        const long wait_status = pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_WAIT,
+            (uint64_t)(uint32_t)started->process_fd,
+            (uint64_t)(uintptr_t)status_words);
+        if (wait_status == 0) {
+            if (status_words[0] == SEED0ROOT_PROCESS_STATE_EXITED && status_words[1] == 0) {
+                return 0;
+            }
+            fprintf(stderr,
+                "[seed0root] %s exited state=%llu code=%llu id=%llu gen=%llu\n",
+                label,
+                (unsigned long long)status_words[0],
+                (unsigned long long)status_words[1],
+                (unsigned long long)status_words[2],
+                (unsigned long long)status_words[3]);
+            return -2;
+        }
+        if (wait_status != PACHA_SYSCALL_ERR_NOT_READY && wait_status != PACHA_ERR_NOT_READY) {
+            fprintf(stderr, "[seed0root] %s wait failed status=%ld\n", label, wait_status);
+            return -3;
+        }
 
-    for (unsigned wave = 0; wave < SEED0ROOT_SMP_STRESS_WAVES; wave++) {
-        struct seed0root_started_process started[SEED0ROOT_SMP_STRESS_PROCESSES];
-        for (unsigned i = 0; i < SEED0ROOT_SMP_STRESS_PROCESSES; i++) {
-            started[i].process_fd = -1;
-            started[i].thread_fd = -1;
-            started[i].start_ms = 0;
-        }
-        unsigned process_fd_reuse = 0;
-        unsigned thread_fd_reuse = 0;
-        int min_process_fd = 0x7fffffff;
-        int max_process_fd = 0;
-        int min_thread_fd = 0x7fffffff;
-        int max_thread_fd = 0;
-        const uint64_t wave_start_ms = seed0root_now_ms();
-        for (unsigned i = 0; i < SEED0ROOT_SMP_STRESS_PROCESSES; i++) {
-            struct seed0root_loaded_process loaded;
-            int status = load_elf_process("/sbin/smp_stress.elf", image, image_size, &loaded);
-            if (status != 0) {
-                fprintf(stderr, "[seed0root] smp stress load failed wave=%u index=%u status=%d\n", wave, i, status);
-                close_smp_stress_started(started, SEED0ROOT_SMP_STRESS_PROCESSES);
-                return status;
-            }
-            status = start_loaded_process(&loaded, "/sbin/smp_stress.elf", -1, &started[i]);
-            if (status != 0) {
-                fprintf(stderr, "[seed0root] smp stress start failed wave=%u index=%u status=%d\n", wave, i, status);
-                if (loaded.process_fd >= 16) {
-                    (void)pacha_fd_close(loaded.process_fd);
-                }
-                close_smp_stress_started(started, SEED0ROOT_SMP_STRESS_PROCESSES);
-                return status;
-            }
-            started[i].start_ms = seed0root_now_ms();
-            if (started[i].process_fd == previous_process_fds[i]) {
-                process_fd_reuse++;
-            }
-            if (started[i].thread_fd == previous_thread_fds[i]) {
-                thread_fd_reuse++;
-            }
-            previous_process_fds[i] = started[i].process_fd;
-            previous_thread_fds[i] = started[i].thread_fd;
-            if (started[i].process_fd < min_process_fd) {
-                min_process_fd = started[i].process_fd;
-            }
-            if (started[i].process_fd > max_process_fd) {
-                max_process_fd = started[i].process_fd;
-            }
-            if (started[i].thread_fd < min_thread_fd) {
-                min_thread_fd = started[i].thread_fd;
-            }
-            if (started[i].thread_fd > max_thread_fd) {
-                max_thread_fd = started[i].thread_fd;
-            }
-        }
-        printf("[seed0root] smp stress wave started wave=%u count=%u process_fd=%d..%d thread_fd=%d..%d reused=%u/%u\n",
-            wave,
-            SEED0ROOT_SMP_STRESS_PROCESSES,
-            min_process_fd,
-            max_process_fd,
-            min_thread_fd,
-            max_thread_fd,
-            process_fd_reuse,
-            thread_fd_reuse);
-        fflush(stdout);
-        struct seed0root_smp_wave_metrics wave_metrics = {
-            .start_ms = wave_start_ms,
-            .end_ms = 0,
-            .min_process_ms = UINT64_MAX,
-            .max_process_ms = 0,
-            .attempts = 0,
-            .wait_many_calls = 0,
-            .not_ready = 0,
-            .completed = 0,
+        struct pacha_pollfd pollfd = {
+            .fd = started->process_fd,
+            .events = PACHA_FD_EVENT_READABLE,
+            .revents = 0,
         };
-        const int wait_status = wait_smp_stress_wave(
-            started,
-            SEED0ROOT_SMP_STRESS_PROCESSES,
-            wave,
-            &wave_metrics);
-        if (wait_status != 0) {
-            close_smp_stress_started(started, SEED0ROOT_SMP_STRESS_PROCESSES);
-            return wait_status;
-        }
-        run_metrics.total_processes += wave_metrics.completed;
-        run_metrics.process_fd_reuse += process_fd_reuse;
-        run_metrics.thread_fd_reuse += thread_fd_reuse;
-        run_metrics.total_attempts += wave_metrics.attempts;
-        run_metrics.total_wait_many_calls += wave_metrics.wait_many_calls;
-        run_metrics.total_not_ready += wave_metrics.not_ready;
-        if (wave_metrics.min_process_ms < run_metrics.min_process_ms) {
-            run_metrics.min_process_ms = wave_metrics.min_process_ms;
-        }
-        if (wave_metrics.max_process_ms > run_metrics.max_process_ms) {
-            run_metrics.max_process_ms = wave_metrics.max_process_ms;
-        }
+        (void)pacha_fd_wait_many(&pollfd, 1, 1);
     }
 
-    run_metrics.end_ms = seed0root_now_ms();
-    if (run_metrics.min_process_ms == UINT64_MAX) {
-        run_metrics.min_process_ms = 0;
+    fprintf(stderr, "[seed0root] %s wait timed out attempts=%u\n",
+        label,
+        (unsigned)SEED0ROOT_PROCESS_WAIT_ATTEMPTS);
+    return -4;
+}
+
+static int launch_filed_smoke_via_filed(int filed_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16) {
+        return -1;
     }
-    printf("[seed0root] smp stress complete waves=%u count=%u elapsed_ms=%llu proc_ms=%llu..%llu fd_reuse=%u/%u attempts=%u wait_many=%u not_ready=%u\n",
-        SEED0ROOT_SMP_STRESS_WAVES,
-        SEED0ROOT_SMP_STRESS_PROCESSES,
-        (unsigned long long)(run_metrics.end_ms >= run_metrics.start_ms ? run_metrics.end_ms - run_metrics.start_ms : 0),
-        (unsigned long long)run_metrics.min_process_ms,
-        (unsigned long long)run_metrics.max_process_ms,
-        run_metrics.process_fd_reuse,
-        run_metrics.thread_fd_reuse,
-        run_metrics.total_attempts,
-        run_metrics.total_wait_many_calls,
-        run_metrics.total_not_ready);
-    fflush(stdout);
+
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    memset(exec, 0, sizeof(*exec));
+    exec->dir_handle = 0;
+    exec->flags =
+        FILED_WIRE_EXEC_BOOTSTRAP_FD |
+        FILED_WIRE_EXEC_INHERIT_FDS |
+        FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS;
+    exec->inherit_fd_count = 1;
+    exec->fd_patch_count = 1;
+    exec->fd_patches[0].kind = FILED_WIRE_EXEC_PATCH_INHERIT_FD;
+    exec->fd_patches[0].index = 0;
+    exec->fd_patches[0].offset = offsetof(filed_smoke_bootstrap_t, public_endpoint_fd);
+    snprintf(exec->path, sizeof(exec->path), "%s", "/sbin/filed_smoke.elf");
+    snprintf(exec->argv0, sizeof(exec->argv0), "%s", "/sbin/filed_smoke.elf");
+
+    const filed_smoke_bootstrap_t bootstrap = {
+        .magic = FILED_SMOKE_BOOTSTRAP_MAGIC,
+        .public_endpoint_fd = 0,
+        .flags = 0,
+        .reserved0 = 0,
+    };
+    const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap, sizeof(bootstrap), "filed smoke bootstrap fd");
+    if (bootstrap_fd < 16) {
+        seed0root_destroy_wire_page(page_fd, page);
+        fprintf(stderr, "[seed0root] filed smoke bootstrap fd create failed status=%d\n", bootstrap_fd);
+        return bootstrap_fd;
+    }
+
+    struct pacha_ipc_fd request_fds[3];
+    memset(request_fds, 0, sizeof(request_fds));
+    request_fds[0].fd = (uint64_t)(uint32_t)page_fd;
+    request_fds[0].rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    request_fds[0].flags = 0;
+    request_fds[0].transfer_flags = 0;
+    request_fds[1].fd = (uint64_t)(uint32_t)filed_endpoint_fd;
+    request_fds[1].rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_CALL;
+    request_fds[1].flags = 0;
+    request_fds[1].transfer_flags = 0;
+    request_fds[2].fd = (uint64_t)(uint32_t)bootstrap_fd;
+    request_fds[2].rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    request_fds[2].flags = 0;
+    request_fds[2].transfer_flags = 0;
+
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = FILED_WIRE_OP_EXEC_PATH,
+        .word2 = 0,
+        .word3 = 1,
+        .fds = request_fds,
+        .fd_count = 3,
+    };
+    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
+    seed0root_destroy_wire_page(page_fd, page);
+    (void)pacha_fd_close(bootstrap_fd);
+    if (reply_fd < 16) {
+        fprintf(stderr, "[seed0root] filed smoke exec call failed status=%d\n", reply_fd);
+        return reply_fd;
+    }
+
+    struct pacha_ipc_fd reply_fds[2];
+    struct pacha_ipc_msg reply;
+    memset(reply_fds, 0, sizeof(reply_fds));
+    memset(&reply, 0, sizeof(reply));
+    reply.fds = reply_fds;
+    reply.fd_capacity = 2;
+    status = recv_ipc_wait(reply_fd, &reply);
+    (void)pacha_fd_close(reply_fd);
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] filed smoke exec recv failed status=%d\n", status);
+        return status;
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
+        reply.word1 != 0 ||
+        reply.word3 != 1 ||
+        reply.fd_count != 2 ||
+        reply_fds[0].fd < 16 ||
+        reply_fds[1].fd < 16)
+    {
+        fprintf(stderr,
+            "[seed0root] filed smoke exec reply invalid word0=0x%llx status=%lld fd_count=%llu\n",
+            (unsigned long long)reply.word0,
+            (long long)(int64_t)reply.word1,
+            (unsigned long long)reply.fd_count);
+        if (reply_fds[0].fd >= 16) (void)pacha_fd_close((int)reply_fds[0].fd);
+        if (reply_fds[1].fd >= 16) (void)pacha_fd_close((int)reply_fds[1].fd);
+        return -2;
+    }
+
+    struct seed0root_started_process started;
+    memset(&started, 0, sizeof(started));
+    started.process_fd = (int)reply_fds[0].fd;
+    started.thread_fd = (int)reply_fds[1].fd;
+    status = wait_started_process("filed smoke", &started);
+    (void)pacha_fd_close(started.thread_fd);
+    (void)pacha_fd_close(started.process_fd);
+    if (status != 0) {
+        return status;
+    }
+    printf("[seed0root] filed smoke ready\n");
     return 0;
 }
 
@@ -1096,14 +963,41 @@ static int launch_filed_from_rootfs(int fs_fd)
         fprintf(stderr, "[seed0root] filed read failed status=%d\n", status);
         return status;
     }
+    const uint64_t filed_endpoint_rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_SEND |
+        PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_TRANSFER;
+    const int filed_endpoint_fd = pacha_ipc_endpoint_create(
+        filed_endpoint_rights,
+        PACHA_FD_FLAG_INHERIT);
+    if (filed_endpoint_fd < 16) {
+        free(image);
+        fprintf(stderr, "[seed0root] filed endpoint create failed status=%d\n", filed_endpoint_fd);
+        return filed_endpoint_fd;
+    }
+    status = mark_fd_inherit(filed_endpoint_fd, "filed public endpoint fd");
+    if (status != 0) {
+        free(image);
+        (void)pacha_fd_close(filed_endpoint_fd);
+        return status;
+    }
 
     const filed_bootstrap_t bootstrap = {
         .magic = FILED_BOOTSTRAP_MAGIC,
         .fs_backend_fd = (uint64_t)(uint32_t)fs_fd,
+        .public_endpoint_fd = (uint64_t)(uint32_t)filed_endpoint_fd,
         .flags = 0,
     };
     const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap, sizeof(bootstrap), "filed bootstrap fd");
     if (bootstrap_fd < 16) {
+        free(image);
+        (void)pacha_fd_close(filed_endpoint_fd);
         fprintf(stderr, "[seed0root] filed bootstrap fd create failed status=%d\n", bootstrap_fd);
         return bootstrap_fd;
     }
@@ -1112,15 +1006,24 @@ static int launch_filed_from_rootfs(int fs_fd)
     free(image);
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
+        (void)pacha_fd_close(filed_endpoint_fd);
         fprintf(stderr, "[seed0root] filed load failed status=%d\n", status);
         return status;
     }
     status = start_loaded_process(&loaded, "/sbin/filed.elf", bootstrap_fd, NULL);
     (void)pacha_fd_close(bootstrap_fd);
     if (status != 0) {
+        (void)pacha_fd_close(filed_endpoint_fd);
         fprintf(stderr, "[seed0root] filed start failed status=%d\n", status);
         return status;
     }
+    status = launch_filed_smoke_via_filed(filed_endpoint_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(filed_endpoint_fd);
+        fprintf(stderr, "[seed0root] filed smoke failed status=%d\n", status);
+        return status;
+    }
+    (void)pacha_fd_close(filed_endpoint_fd);
     printf("[seed0root] filed ready\n");
     return 0;
 }
@@ -1147,28 +1050,8 @@ static int seed0root_connect_storage_services(int control_fd)
         return status;
     }
 
-    unsigned char *stress_image = NULL;
-    uint64_t stress_image_size = 0;
-    const int stress_read_status = seed0root_read_rootfs_file(
-        fs_fd,
-        "/sbin/smp_stress.elf",
-        &stress_image,
-        &stress_image_size);
-    if (stress_read_status != 0) {
-        fprintf(stderr, "[seed0root] smp stress unavailable status=%d\n", stress_read_status);
-    }
-
     status = launch_filed_from_rootfs(fs_fd);
-    if (status != 0) {
-        free(stress_image);
-        return status;
-    }
-    if (stress_read_status == 0) {
-        status = run_smp_stress_waves(stress_image, stress_image_size);
-        free(stress_image);
-        return status;
-    }
-    return 0;
+    return status;
 }
 
 static int load_elf_process(

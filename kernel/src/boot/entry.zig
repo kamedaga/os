@@ -42,8 +42,8 @@ var user_spaces: []boot_static.UserAddressSpace = empty_user_spaces_storage[0..]
 var empty_kernel_runtime_storage: [0]u8 align(4096) = .{};
 var kernel_runtime_storage: []align(4096) u8 = empty_kernel_runtime_storage[0..];
 
-pub var global_free_list: kernel.FreePageList = .{};
-pub var kernel_state_global: kernel.KernelState = undefined;
+pub var global_free_list: *kernel.FreePageList = undefined;
+pub var kernel_state_global: *kernel.KernelState = undefined;
 pub var kernel_state_ready: bool = false;
 
 var boot_init_principal: ?kernel.PrincipalId = null;
@@ -279,8 +279,11 @@ fn initKernelRuntimeOrHalt() void {
         if (!traps.mapKernelRuntimeStorage(x86_platform.mapKernelRuntimeIdentityRange)) {
             halt.haltWithMessage("trap runtime mapping failed");
         }
-        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(&kernel_state_global), @sizeOf(@TypeOf(kernel_state_global)))) {
+        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(kernel_state_global), @sizeOf(kernel.KernelState))) {
             halt.haltWithMessage("kernel state runtime mapping failed");
+        }
+        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(global_free_list), @sizeOf(kernel.FreePageList))) {
+            halt.haltWithMessage("free list runtime mapping failed");
         }
         if (kernel_runtime_storage.len != 0 and
             !x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(kernel_runtime_storage.ptr), kernel_runtime_storage.len))
@@ -313,7 +316,7 @@ fn initKernelRuntimeOrHalt() void {
 }
 
 fn initMemoryModules() void {
-    for (user_spaces) |*space| space.* = .{};
+    for (user_spaces) |*space| user_vm.resetUserAddressSpaceStorage(space);
 
     user_vm.init(.{
         .user_spaces = user_spaces,
@@ -370,6 +373,14 @@ fn allocateBootPagesBelow4GiBOrHalt(
 }
 
 fn allocateDynamicKernelStorageOrHalt(bs: *std.os.uefi.tables.BootServices) void {
+    const raw_free_list = allocateBootPagesBelow4GiBOrHalt(bs, @sizeOf(kernel.FreePageList), "kernel free page list");
+    global_free_list = @ptrCast(@alignCast(raw_free_list.ptr));
+    global_free_list.len = 0;
+    global_free_list.range_len = 0;
+
+    const raw_kernel_state = allocateBootPagesBelow4GiBOrHalt(bs, @sizeOf(kernel.KernelState), "kernel state");
+    kernel_state_global = @ptrCast(@alignCast(raw_kernel_state.ptr));
+
     kernel_runtime_storage = allocateBootPagesBelow4GiBOrHalt(bs, kernel.runtimeStorageBytes(), "kernel runtime storage");
     if (!kernel.initRuntimeStorage(kernel_runtime_storage)) {
         halt.haltWithMessage("kernel runtime storage init failed");
@@ -416,7 +427,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
 
     user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
-    kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
+    kernel_state_global.releasePrincipalNativeMemory(principal, global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.unlockAddressSpaces();
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
@@ -453,7 +464,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
 
     user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
-    kernel_state_global.releasePrincipalNativeMemory(principal, &global_free_list);
+    kernel_state_global.releasePrincipalNativeMemory(principal, global_free_list);
     kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.unlockAddressSpaces();
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
@@ -584,6 +595,7 @@ fn runBootServicesPhase() BootResources {
     const bs = uefi_services.acquireBootServicesOrHalt();
     uefi_services.captureKernelImageRange(bs);
     allocateDynamicKernelStorageOrHalt(bs);
+    uefi_services.allocatePostExitLoadScratchOrHalt(bs);
     initMemoryModules();
 
     const framebuffer_info = uefi_services.acquireFramebufferInfo(bs) orelse {
@@ -600,7 +612,7 @@ fn runBootServicesPhase() BootResources {
     };
     var smp_info = smp.prepareBootInfo(bs);
 
-    const memory_stats = uefi_services.collectBootMemoryStatsOrHalt(bs, &global_free_list, user_spaces);
+    const memory_stats = uefi_services.collectBootMemoryStatsOrHalt(bs, global_free_list, user_spaces);
     uefi_services.exitBootServicesOrHalt();
     initKernelRuntimeOrHalt();
     scheduler.initializeStaticStorage();
@@ -643,7 +655,7 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
         .page_present = boot_static.page_present,
         .page_ps = boot_static.page_ps,
         .kernel_state_ready = &kernel_state_ready,
-        .state = &kernel_state_global,
+        .state = kernel_state_global,
         .write = kernel_log.write,
         .write_hex_raw = kernel_log.writeHexRaw,
         .write_bool01 = kernel_log.writeBool01,
@@ -652,7 +664,7 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
     kernel_state_global.initFromDetectedRegionsInPlace(memory_stats.detected_regions) catch |err| {
         halt.haltWithError("region init failed: ", err);
     };
-    const state = &kernel_state_global;
+    const state = kernel_state_global;
     state.debug_process_lifecycle_hook = null;
     state.zero_physical_page_hook = user_copy.zeroPhysicalPage;
 
@@ -685,7 +697,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         state,
         scheduler_principal,
         "scheduler_policy",
-        &global_free_list,
+        global_free_list,
         user_spaces,
     );
     state.createSerialFdAt(scheduler_principal, 1, 1) catch |err| {
@@ -708,7 +720,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         scheduler_process.user_stack_page.paddr,
         res.disk_scheduler_policy_elf,
         "scheduler policy ELF load failed\n",
-        &global_free_list,
+        global_free_list,
     );
     const scheduler_thread = scheduler.threadForPrincipal(scheduler_principal).?;
     const scheduler_ctx = scheduler.threadContextMutable(scheduler_thread).?;
@@ -733,7 +745,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         halt.haltWithError("init bootstrap owner mark failed: ", err);
     };
     boot_init_principal = init_principal;
-    const init_process = process_factory.createUserProcess(state, init_principal, "init", &global_free_list, user_spaces);
+    const init_process = process_factory.createUserProcess(state, init_principal, "init", global_free_list, user_spaces);
     state.createSerialFdAt(init_principal, 1, 1) catch |err| {
         halt.haltWithError("init stdout fd install failed: ", err);
     };
@@ -746,7 +758,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         devs.devices[0..],
         res.disk_bootfs_image,
         res.framebuffer_info,
-        &global_free_list,
+        global_free_list,
     );
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;
@@ -759,7 +771,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         init_process.user_stack_page.paddr,
         res.disk_init_elf,
         "init ELF load failed\n",
-        &global_free_list,
+        global_free_list,
     );
     const init_thread = scheduler.threadForPrincipal(init_principal).?;
     const init_ctx = scheduler.threadContextMutable(init_thread).?;
@@ -783,7 +795,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
     syscalls.init(.{
         .state = state,
-        .free_list = &global_free_list,
+        .free_list = global_free_list,
         .user_spaces = user_spaces,
         .kernel_state_ready = &kernel_state_ready,
         .write = kernel_log.write,
