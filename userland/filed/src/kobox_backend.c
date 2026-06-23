@@ -211,6 +211,75 @@ int filed_kobox_backend_pread(
     return status;
 }
 
+int filed_kobox_backend_pwrite(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint64_t offset,
+    const void *buffer,
+    uint64_t length,
+    uint64_t *out_bytes)
+{
+    filed_wire_page_t page;
+    uint64_t bytes = 0;
+
+    if (backend == NULL || object_id == 0 || out_bytes == NULL) {
+        return -1;
+    }
+    if (buffer == NULL && length != 0) {
+        return -1;
+    }
+    *out_bytes = 0;
+    if (length == 0) {
+        return 0;
+    }
+
+    int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_io_t *io = (koboxd_wire_fs_io_t *)page.addr;
+    io->object_id = object_id;
+    io->offset = offset;
+    io->length = length > KOBOXD_WIRE_FS_IO_BYTES ? KOBOXD_WIRE_FS_IO_BYTES : length;
+    memcpy(io->data, buffer, (size_t)io->length);
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_PWRITE,
+        0,
+        page.fd,
+        &bytes);
+    if (status == 0) {
+        if (bytes > length) {
+            bytes = length;
+        }
+        backend->bytes_written += bytes;
+        *out_bytes = bytes;
+    }
+
+    filed_ipc_destroy_wire_page(&page);
+    return status;
+}
+
+int filed_kobox_backend_fsync(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id)
+{
+    uint64_t ignored = 0;
+
+    if (backend == NULL || object_id == 0) {
+        return -1;
+    }
+
+    return filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_FSYNC,
+        object_id,
+        -1,
+        &ignored);
+}
+
 int filed_kobox_backend_getdents(
     filed_kobox_backend_t *backend,
     uint64_t dir_object_id,

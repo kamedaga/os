@@ -733,6 +733,120 @@ static int filed_dispatch_read(
     return filed_send_reply(reply_fd, request->word3, reply_status, bytes);
 }
 
+static int filed_dispatch_pwrite(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    filed_vfs_io_decision_t decision;
+    uint64_t bytes = 0;
+    filed_status_t status = filed_vfs_pwrite_prepare(
+        &runtime->vfs,
+        (filed_handle_id_t)(uint32_t)io->handle,
+        io->offset,
+        io->length,
+        &decision);
+    int64_t reply_status = filed_status_to_wire(status);
+    if (status == FILED_OK) {
+        uint64_t length = decision.length;
+        if (length > FILED_WIRE_IO_BYTES) {
+            length = FILED_WIRE_IO_BYTES;
+        }
+        reply_status = filed_kobox_backend_pwrite(
+            &runtime->backend,
+            decision.backend_object,
+            decision.offset,
+            io->data,
+            length,
+            &bytes);
+        if (reply_status == 0) {
+            io->offset = decision.offset;
+            io->length = bytes;
+        }
+    }
+
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, reply_status, bytes);
+}
+
+static int filed_dispatch_write(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    filed_vfs_io_decision_t decision;
+    uint64_t bytes = 0;
+    filed_status_t status = filed_vfs_write_prepare(
+        &runtime->vfs,
+        (filed_handle_id_t)(uint32_t)io->handle,
+        io->length,
+        &decision);
+    int64_t reply_status = filed_status_to_wire(status);
+    if (status == FILED_OK) {
+        uint64_t length = decision.length;
+        if (length > FILED_WIRE_IO_BYTES) {
+            length = FILED_WIRE_IO_BYTES;
+        }
+        reply_status = filed_kobox_backend_pwrite(
+            &runtime->backend,
+            decision.backend_object,
+            decision.offset,
+            io->data,
+            length,
+            &bytes);
+        if (reply_status == 0) {
+            io->offset = decision.offset;
+            io->length = bytes;
+            status = filed_vfs_write_commit(
+                &runtime->vfs,
+                (filed_handle_id_t)(uint32_t)io->handle,
+                bytes);
+            if (status != FILED_OK) {
+                reply_status = filed_status_to_wire(status);
+            }
+        }
+    }
+
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, reply_status, bytes);
+}
+
+static int filed_dispatch_fsync(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    filed_vfs_io_decision_t decision;
+    const filed_handle_id_t handle_id = (filed_handle_id_t)(uint32_t)request->word2;
+    filed_status_t status = filed_vfs_fsync_prepare(
+        &runtime->vfs,
+        handle_id,
+        &decision);
+    int64_t reply_status = filed_status_to_wire(status);
+    if (status == FILED_OK) {
+        reply_status = filed_kobox_backend_fsync(
+            &runtime->backend,
+            decision.backend_object);
+    }
+    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+}
+
 static int filed_dispatch_getdents(
     filed_runtime_t *runtime,
     int reply_fd,
@@ -1156,6 +1270,12 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
         return filed_dispatch_pread(runtime, reply_fd, &request);
     case FILED_WIRE_OP_READ:
         return filed_dispatch_read(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_PWRITE:
+        return filed_dispatch_pwrite(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_WRITE:
+        return filed_dispatch_write(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_FSYNC:
+        return filed_dispatch_fsync(runtime, reply_fd, &request);
     case FILED_WIRE_OP_GETDENTS:
         return filed_dispatch_getdents(runtime, reply_fd, &request);
     case FILED_WIRE_OP_CLOSE:

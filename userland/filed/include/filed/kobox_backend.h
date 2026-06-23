@@ -11,6 +11,7 @@ typedef struct filed_kobox_backend {
     uint64_t ext4_magic;
     uint64_t calls;
     uint64_t bytes_read;
+    uint64_t bytes_written;
 } filed_kobox_backend_t;
 
 void filed_kobox_backend_init(filed_kobox_backend_t *backend, int fs_fd);
@@ -31,6 +32,16 @@ int filed_kobox_backend_pread(
     void *buffer,
     uint64_t length,
     uint64_t *out_bytes);
+int filed_kobox_backend_pwrite(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint64_t offset,
+    const void *buffer,
+    uint64_t length,
+    uint64_t *out_bytes);
+int filed_kobox_backend_fsync(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id);
 int filed_kobox_backend_getdents(
     filed_kobox_backend_t *backend,
     uint64_t dir_object_id,

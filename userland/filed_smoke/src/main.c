@@ -320,13 +320,128 @@ static int smoke_filed_endpoint(int endpoint_fd)
     result = 0;
     status = filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 9, -1, dup_handle, &result);
     const uint64_t bytes_read = io->length;
-    destroy_wire_page(page_fd, page);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close failed status=%d\n", status);
+        destroy_wire_page(page_fd, page);
         return status;
     }
 
-    printf("[filed-smoke] ready path=/sbin/filed.elf bytes=%llu\n",
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    openat = (filed_wire_openat_t *)page;
+    openat->dir_handle = 0;
+    openat->rights =
+        FILED_WIRE_RIGHT_READ |
+        FILED_WIRE_RIGHT_WRITE |
+        FILED_WIRE_RIGHT_STAT;
+    openat->open_flags = 0;
+    snprintf(openat->name, sizeof(openat->name), "/etc/os-release");
+
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_OPENAT, 10, page_fd, 0, &result);
+    if (status != 0 || result == 0) {
+        fprintf(stderr,
+            "[filed-smoke] write-open failed status=%d handle=%llu\n",
+            status,
+            (unsigned long long)result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -9;
+    }
+    const uint64_t write_handle = result;
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    io = (filed_wire_io_t *)page;
+    io->handle = write_handle;
+    io->offset = 0;
+    io->length = 16;
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_PREAD, 11, page_fd, 0, &result);
+    if (status != 0 || result < 8) {
+        fprintf(stderr,
+            "[filed-smoke] write pread failed status=%d bytes=%llu\n",
+            status,
+            (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 17, -1, write_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -10;
+    }
+    const uint64_t original_len = result;
+    uint8_t original[16];
+    memcpy(original, io->data, sizeof(original));
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    io = (filed_wire_io_t *)page;
+    io->handle = write_handle;
+    io->offset = 0;
+    io->length = original_len;
+    memcpy(io->data, original, (size_t)original_len);
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_PWRITE, 12, page_fd, 0, &result);
+    if (status != 0 || result != original_len) {
+        fprintf(stderr,
+            "[filed-smoke] pwrite failed status=%d bytes=%llu expected=%llu\n",
+            status,
+            (unsigned long long)result,
+            (unsigned long long)original_len);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 17, -1, write_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -11;
+    }
+
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_FSYNC, 13, -1, write_handle, &result);
+    if (status != 0) {
+        fprintf(stderr, "[filed-smoke] fsync failed status=%d\n", status);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 17, -1, write_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status;
+    }
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    io = (filed_wire_io_t *)page;
+    io->handle = write_handle;
+    io->length = 4;
+    memcpy(io->data, original, 4);
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_WRITE, 14, page_fd, 0, &result);
+    if (status != 0 || result != 4 || io->offset != 0) {
+        fprintf(stderr,
+            "[filed-smoke] write failed status=%d bytes=%llu offset=%llu\n",
+            status,
+            (unsigned long long)result,
+            (unsigned long long)io->offset);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 17, -1, write_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -12;
+    }
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    io = (filed_wire_io_t *)page;
+    io->handle = write_handle;
+    io->length = 4;
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_READ, 15, page_fd, 0, &result);
+    if (status != 0 ||
+        result != 4 ||
+        memcmp(io->data, original + 4, 4) != 0)
+    {
+        fprintf(stderr,
+            "[filed-smoke] write offset readback failed status=%d bytes=%llu\n",
+            status,
+            (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 17, -1, write_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -13;
+    }
+
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 16, -1, write_handle, &result);
+    destroy_wire_page(page_fd, page);
+    if (status != 0) {
+        fprintf(stderr, "[filed-smoke] close write handle failed status=%d\n", status);
+        return status;
+    }
+
+    printf("[filed-smoke] ready path=/sbin/filed.elf bytes=%llu write=ok\n",
         (unsigned long long)bytes_read);
     return 0;
 }

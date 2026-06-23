@@ -249,6 +249,13 @@ filed_status_t filed_vfs_pread_prepare(
     uint64_t length,
     filed_vfs_io_decision_t *out_decision);
 
+filed_status_t filed_vfs_pwrite_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t offset,
+    uint64_t length,
+    filed_vfs_io_decision_t *out_decision);
+
 filed_status_t filed_vfs_read_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -259,6 +266,22 @@ filed_status_t filed_vfs_read_commit(
     filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
     uint64_t bytes_read);
+
+filed_status_t filed_vfs_write_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t length,
+    filed_vfs_io_decision_t *out_decision);
+
+filed_status_t filed_vfs_write_commit(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t bytes_written);
+
+filed_status_t filed_vfs_fsync_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_io_decision_t *out_decision);
 
 filed_status_t filed_vfs_getdents_prepare(
     const filed_vfs_t *vfs,

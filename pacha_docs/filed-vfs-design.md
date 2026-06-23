@@ -296,6 +296,10 @@ rmdir
 
 `DUP` は `filed_vfs_dup_handle` で同じ `filed_open_file_t` を指す新しい `filed_handle_t` を作る。新 handle の `CLOEXEC` は caller が明示する。`GET_FLAGS` / `SET_FLAGS` は `CLOEXEC` を handle-local に、`APPEND` / `NONBLOCK` / `SYNC` を共有 open file description に反映する。これにより、`dup` 後に offset と file status flags は共有され、exec inheritance policy は fd ごとに独立する。
 
+`PWRITE` / `WRITE` / `FSYNC` は `koboxd` の ext4 backend write path に接続する。`PWRITE` は caller supplied offset を使い、`filed_open_file_t.offset` を更新しない。`WRITE` は current offset を使い、backend が実際に書けた byte 数だけ offset を進める。`FSYNC` は write 権限のある regular file handle に対して backend `fsync` を発行する。
+
+初期実装では `APPEND` 付き `WRITE` は未対応として明示的に拒否する。append write は EOF 決定と write ordering policy が必要なので、`statx` / backend size refresh / write lock policy を固めてから入れる。
+
 ### Exec model
 
 exec は `filed` の責務に入れる。ただし model は process creation syscall そのものを証明しない。`filed` が正しい exec plan を作ることを扱う。

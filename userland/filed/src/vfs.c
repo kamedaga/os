@@ -859,6 +859,30 @@ filed_status_t filed_vfs_pread_prepare(
     return FILED_OK;
 }
 
+filed_status_t filed_vfs_pwrite_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t offset,
+    uint64_t length,
+    filed_vfs_io_decision_t *out_decision)
+{
+    filed_status_t status = filed_prepare_file_handle(
+        vfs,
+        handle_id,
+        FILED_RIGHT_WRITE,
+        out_decision);
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (out_decision->kind == FILED_VNODE_DIRECTORY) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_IS_DIR;
+    }
+    out_decision->offset = offset;
+    out_decision->length = length;
+    return FILED_OK;
+}
+
 filed_status_t filed_vfs_read_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -920,6 +944,74 @@ filed_status_t filed_vfs_read_commit(
         return FILED_ERR_OVERFLOW;
     }
     file->offset = (int64_t)(old_offset + bytes_read);
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_write_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t length,
+    filed_vfs_io_decision_t *out_decision)
+{
+    const filed_handle_t *handle;
+    const filed_file_t *file;
+    filed_status_t status = filed_prepare_file_handle(
+        vfs,
+        handle_id,
+        FILED_RIGHT_WRITE,
+        out_decision);
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (out_decision->kind == FILED_VNODE_DIRECTORY) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_IS_DIR;
+    }
+
+    handle = filed_find_handle_const(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_INVALID;
+    }
+    file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL || file->offset < 0) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_INVALID;
+    }
+    if ((file->status_flags & FILED_FILE_APPEND) != 0) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_UNSUPPORTED;
+    }
+    out_decision->offset = (uint64_t)file->offset;
+    out_decision->length = length;
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_write_commit(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t bytes_written)
+{
+    return filed_vfs_read_commit(vfs, handle_id, bytes_written);
+}
+
+filed_status_t filed_vfs_fsync_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_io_decision_t *out_decision)
+{
+    filed_status_t status = filed_prepare_file_handle(
+        vfs,
+        handle_id,
+        FILED_RIGHT_WRITE,
+        out_decision);
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (out_decision->kind == FILED_VNODE_DIRECTORY) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_IS_DIR;
+    }
     return FILED_OK;
 }
 

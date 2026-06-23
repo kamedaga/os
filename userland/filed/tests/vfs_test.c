@@ -454,6 +454,107 @@ static void test_dup_and_flags(void)
     expect_status("dup flags preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
 }
 
+static void test_write_pwrite_and_fsync(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    filed_vfs_open_result_t file;
+    filed_vfs_open_result_t append_file;
+    filed_vfs_io_decision_t decision;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for write",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for write",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_STAT | FILED_RIGHT_GETDENTS,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+    expect_status(
+        "open writable child",
+        filed_vfs_open_backend_child(
+            &vfs,
+            root.handle_id,
+            48,
+            FILED_VNODE_REGULAR,
+            "write.txt",
+            FILED_RIGHT_READ | FILED_RIGHT_WRITE | FILED_RIGHT_STAT,
+            0,
+            &file),
+        FILED_OK);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "pwrite prepare",
+        filed_vfs_pwrite_prepare(&vfs, file.handle_id, 9, 5, &decision),
+        FILED_OK);
+    expect_true("pwrite decision", decision.backend_object == 48 && decision.offset == 9 && decision.length == 5);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "write initial offset",
+        filed_vfs_write_prepare(&vfs, file.handle_id, 6, &decision),
+        FILED_OK);
+    expect_true("write starts at zero", decision.offset == 0 && decision.length == 6);
+    expect_status("write commit", filed_vfs_write_commit(&vfs, file.handle_id, 6), FILED_OK);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "pwrite after write",
+        filed_vfs_pwrite_prepare(&vfs, file.handle_id, 2, 3, &decision),
+        FILED_OK);
+    expect_true("pwrite ignores shared offset", decision.offset == 2 && decision.length == 3);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "write after commit",
+        filed_vfs_write_prepare(&vfs, file.handle_id, 1, &decision),
+        FILED_OK);
+    expect_true("write offset advanced", decision.offset == 6 && decision.length == 1);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "fsync prepare",
+        filed_vfs_fsync_prepare(&vfs, file.handle_id, &decision),
+        FILED_OK);
+    expect_true("fsync backend object", decision.backend_object == 48);
+
+    expect_status(
+        "read-only fsync denied",
+        filed_vfs_fsync_prepare(&vfs, root.handle_id, &decision),
+        FILED_ERR_DENIED);
+
+    expect_status(
+        "open append child",
+        filed_vfs_open_backend_child(
+            &vfs,
+            root.handle_id,
+            49,
+            FILED_VNODE_REGULAR,
+            "append.txt",
+            FILED_RIGHT_WRITE | FILED_RIGHT_STAT,
+            FILED_OPEN_APPEND,
+            &append_file),
+        FILED_OK);
+    expect_status(
+        "append write unsupported until eof decision",
+        filed_vfs_write_prepare(&vfs, append_file.handle_id, 1, &decision),
+        FILED_ERR_UNSUPPORTED);
+
+    expect_status(
+        "directory pwrite denied",
+        filed_vfs_pwrite_prepare(&vfs, root.handle_id, 0, 1, &decision),
+        FILED_ERR_DENIED);
+    expect_status("write preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
 static void test_rights_and_flags(void)
 {
     uint32_t rights = FILED_RIGHT_LOOKUP | FILED_RIGHT_READ | FILED_RIGHT_STAT;
@@ -493,6 +594,7 @@ int main(void)
     test_self_and_parent_open();
     test_directory_offset_and_exec_dup();
     test_dup_and_flags();
+    test_write_pwrite_and_fsync();
     test_rights_and_flags();
     test_invalid_arguments();
 
