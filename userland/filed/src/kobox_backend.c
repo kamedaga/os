@@ -280,6 +280,244 @@ int filed_kobox_backend_fsync(
         &ignored);
 }
 
+int filed_kobox_backend_create(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t *out_object_id)
+{
+    filed_wire_page_t page;
+    uint64_t object_id = 0;
+
+    if (backend == NULL || parent_object_id == 0 || name == NULL || out_object_id == NULL) {
+        return -1;
+    }
+    *out_object_id = 0;
+
+    int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_create_t *create = (koboxd_wire_fs_create_t *)page.addr;
+    create->parent_object_id = parent_object_id;
+    create->mode = mode;
+    snprintf(create->name, sizeof(create->name), "%s", name);
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_CREATE,
+        0,
+        page.fd,
+        &object_id);
+    filed_ipc_destroy_wire_page(&page);
+    if (status != 0) {
+        return status;
+    }
+
+    *out_object_id = object_id;
+    return 0;
+}
+
+int filed_kobox_backend_truncate(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint64_t size)
+{
+    filed_wire_page_t page;
+    uint64_t ignored = 0;
+
+    if (backend == NULL || object_id == 0) {
+        return -1;
+    }
+
+    int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_truncate_t *truncate = (koboxd_wire_fs_truncate_t *)page.addr;
+    truncate->object_id = object_id;
+    truncate->size = size;
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_TRUNCATE,
+        0,
+        page.fd,
+        &ignored);
+    filed_ipc_destroy_wire_page(&page);
+    return status;
+}
+
+int filed_kobox_backend_unlink(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name)
+{
+    filed_wire_page_t page;
+    uint64_t ignored = 0;
+
+    if (backend == NULL || parent_object_id == 0 || name == NULL) {
+        return -1;
+    }
+
+    int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_unlink_t *unlink = (koboxd_wire_fs_unlink_t *)page.addr;
+    unlink->parent_object_id = parent_object_id;
+    snprintf(unlink->name, sizeof(unlink->name), "%s", name);
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_UNLINK,
+        0,
+        page.fd,
+        &ignored);
+    filed_ipc_destroy_wire_page(&page);
+    return status;
+}
+
+int filed_kobox_backend_mkdir(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t *out_object_id)
+{
+    filed_wire_page_t page;
+    uint64_t object_id = 0;
+
+    if (backend == NULL || parent_object_id == 0 || name == NULL || out_object_id == NULL) {
+        return -1;
+    }
+    *out_object_id = 0;
+
+    int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_mkdir_t *mkdir = (koboxd_wire_fs_mkdir_t *)page.addr;
+    mkdir->parent_object_id = parent_object_id;
+    mkdir->mode = mode;
+    snprintf(mkdir->name, sizeof(mkdir->name), "%s", name);
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_MKDIR,
+        0,
+        page.fd,
+        &object_id);
+    filed_ipc_destroy_wire_page(&page);
+    if (status != 0) {
+        return status;
+    }
+
+    *out_object_id = object_id;
+    return 0;
+}
+
+int filed_kobox_backend_rmdir(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name)
+{
+    filed_wire_page_t page;
+    uint64_t ignored = 0;
+
+    if (backend == NULL || parent_object_id == 0 || name == NULL) {
+        return -1;
+    }
+
+    int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_rmdir_t *rmdir = (koboxd_wire_fs_rmdir_t *)page.addr;
+    rmdir->parent_object_id = parent_object_id;
+    snprintf(rmdir->name, sizeof(rmdir->name), "%s", name);
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_RMDIR,
+        0,
+        page.fd,
+        &ignored);
+    filed_ipc_destroy_wire_page(&page);
+    return status;
+}
+
+int filed_kobox_backend_rename(
+    filed_kobox_backend_t *backend,
+    uint64_t old_parent_object_id,
+    const char *old_name,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id)
+{
+    filed_wire_page_t page;
+    uint64_t object_id = 0;
+
+    if (backend == NULL ||
+        old_parent_object_id == 0 ||
+        old_name == NULL ||
+        new_parent_object_id == 0 ||
+        new_name == NULL ||
+        out_object_id == NULL)
+    {
+        return -1;
+    }
+    *out_object_id = 0;
+
+    int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_rename_t *rename = (koboxd_wire_fs_rename_t *)page.addr;
+    rename->old_parent_object_id = old_parent_object_id;
+    rename->new_parent_object_id = new_parent_object_id;
+    snprintf(rename->old_name, sizeof(rename->old_name), "%s", old_name);
+    snprintf(rename->new_name, sizeof(rename->new_name), "%s", new_name);
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_RENAME,
+        0,
+        page.fd,
+        &object_id);
+    filed_ipc_destroy_wire_page(&page);
+    if (status != 0) {
+        return status;
+    }
+    *out_object_id = object_id;
+    return 0;
+}
+
+int filed_kobox_backend_release_object(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id)
+{
+    uint64_t ignored = 0;
+
+    if (backend == NULL || object_id == 0) {
+        return -1;
+    }
+
+    return filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_RELEASE_OBJECT,
+        object_id,
+        -1,
+        &ignored);
+}
+
 int filed_kobox_backend_getdents(
     filed_kobox_backend_t *backend,
     uint64_t dir_object_id,

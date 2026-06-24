@@ -177,7 +177,14 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
     vfs_status = filed_vfs_open_root(
         &runtime->vfs,
         root_mount,
-        FILED_RIGHT_LOOKUP | FILED_RIGHT_READ | FILED_RIGHT_STAT | FILED_RIGHT_GETDENTS | FILED_RIGHT_EXEC,
+            FILED_RIGHT_LOOKUP |
+            FILED_RIGHT_READ |
+            FILED_RIGHT_EXEC |
+            FILED_RIGHT_STAT |
+            FILED_RIGHT_GETDENTS |
+            FILED_RIGHT_CREATE |
+            FILED_RIGHT_REMOVE |
+            FILED_RIGHT_RENAME,
         FILED_OPEN_DIRECTORY,
         &root_open);
     if (vfs_status != FILED_OK) {

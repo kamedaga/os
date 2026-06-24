@@ -116,6 +116,32 @@ static int64_t filed_status_to_wire(filed_status_t status)
     return -22;
 }
 
+static int filed_release_reclaimed_object(
+    filed_runtime_t *runtime,
+    const filed_vfs_reclaim_result_t *reclaim)
+{
+    if (runtime == NULL || reclaim == NULL || !reclaim->released || reclaim->backend_object == 0) {
+        return 0;
+    }
+    return filed_kobox_backend_release_object(&runtime->backend, reclaim->backend_object);
+}
+
+static int64_t filed_close_handle_runtime(
+    filed_runtime_t *runtime,
+    filed_handle_id_t handle_id)
+{
+    filed_vfs_reclaim_result_t reclaim;
+    if (runtime == NULL) {
+        return filed_status_to_wire(FILED_ERR_INVALID);
+    }
+    memset(&reclaim, 0, sizeof(reclaim));
+    const filed_status_t status = filed_vfs_close_handle_ex(&runtime->vfs, handle_id, &reclaim);
+    if (status != FILED_OK) {
+        return filed_status_to_wire(status);
+    }
+    return filed_release_reclaimed_object(runtime, &reclaim);
+}
+
 static void filed_write_u64_le(void *base, uint64_t offset, uint64_t value)
 {
     unsigned char *p = (unsigned char *)base + offset;
@@ -379,7 +405,152 @@ static void filed_close_walk_handle(
         handle_id != 0 &&
         handle_id != runtime->root_handle_id)
     {
-        (void)filed_vfs_close_handle(&runtime->vfs, handle_id);
+        (void)filed_close_handle_runtime(runtime, handle_id);
+    }
+}
+
+static int64_t filed_lookup_and_open_component(
+    filed_runtime_t *runtime,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    uint32_t rights,
+    uint32_t open_flags,
+    filed_vfs_open_result_t *out_open);
+
+static int64_t filed_resolve_parent_path(
+    filed_runtime_t *runtime,
+    filed_handle_id_t base_dir_handle,
+    const char *path,
+    filed_handle_id_t *out_parent_handle,
+    int *out_parent_owned,
+    char *out_name,
+    size_t out_name_size)
+{
+    int absolute;
+    filed_handle_id_t current_handle;
+    int current_owned = 0;
+
+    if (runtime == NULL ||
+        path == NULL ||
+        out_parent_handle == NULL ||
+        out_parent_owned == NULL ||
+        out_name == NULL ||
+        out_name_size == 0 ||
+        path[0] == '\0')
+    {
+        return filed_status_to_wire(FILED_ERR_INVALID);
+    }
+
+    absolute = path[0] == '/';
+    current_handle =
+        absolute || base_dir_handle == 0 ?
+            runtime->root_handle_id :
+            base_dir_handle;
+
+    *out_parent_handle = 0;
+    *out_parent_owned = 0;
+    out_name[0] = '\0';
+
+    if (absolute) {
+        path = filed_skip_slashes(path);
+        if (*path == '\0') {
+            return filed_status_to_wire(FILED_ERR_INVALID);
+        }
+    }
+
+    for (;;) {
+        char component[FILED_WIRE_NAME_BYTES];
+        const char *component_start;
+        const char *after_slashes;
+        size_t component_len;
+        int has_more;
+        int trailing_slash;
+
+        path = filed_skip_slashes(path);
+        if (*path == '\0') {
+            filed_close_walk_handle(runtime, current_handle, current_owned);
+            return filed_status_to_wire(FILED_ERR_INVALID);
+        }
+
+        component_start = path;
+        while (*path != '\0' && *path != '/') {
+            ++path;
+        }
+        component_len = (size_t)(path - component_start);
+        if (component_len == 0 || component_len >= sizeof(component)) {
+            filed_close_walk_handle(runtime, current_handle, current_owned);
+            return filed_status_to_wire(FILED_ERR_INVALID);
+        }
+
+        after_slashes = filed_skip_slashes(path);
+        has_more = *after_slashes != '\0';
+        trailing_slash = *path == '/' && !has_more;
+
+        memset(component, 0, sizeof(component));
+        memcpy(component, component_start, component_len);
+
+        if (component_len == 1 && component[0] == '.') {
+            if (!has_more) {
+                filed_close_walk_handle(runtime, current_handle, current_owned);
+                return filed_status_to_wire(FILED_ERR_INVALID);
+            }
+            path = after_slashes;
+            continue;
+        }
+
+        if (component_len == 2 && component[0] == '.' && component[1] == '.') {
+            filed_vfs_open_result_t parent_open;
+            filed_status_t status;
+
+            if (!has_more) {
+                filed_close_walk_handle(runtime, current_handle, current_owned);
+                return filed_status_to_wire(FILED_ERR_INVALID);
+            }
+
+            memset(&parent_open, 0, sizeof(parent_open));
+            status = filed_vfs_open_parent(
+                &runtime->vfs,
+                current_handle,
+                FILED_WALK_RIGHTS,
+                FILED_OPEN_DIRECTORY,
+                &parent_open);
+            filed_close_walk_handle(runtime, current_handle, current_owned);
+            if (status != FILED_OK) {
+                return filed_status_to_wire(status);
+            }
+            current_handle = parent_open.handle_id;
+            current_owned = 1;
+            path = after_slashes;
+            continue;
+        }
+
+        if (!has_more) {
+            if (trailing_slash || component_len >= out_name_size) {
+                filed_close_walk_handle(runtime, current_handle, current_owned);
+                return filed_status_to_wire(FILED_ERR_INVALID);
+            }
+            memset(out_name, 0, out_name_size);
+            memcpy(out_name, component, component_len);
+            *out_parent_handle = current_handle;
+            *out_parent_owned = current_owned;
+            return 0;
+        } else {
+            filed_vfs_open_result_t next_open;
+            const int64_t reply_status = filed_lookup_and_open_component(
+                runtime,
+                current_handle,
+                component,
+                FILED_WALK_RIGHTS,
+                FILED_OPEN_DIRECTORY,
+                &next_open);
+            filed_close_walk_handle(runtime, current_handle, current_owned);
+            if (reply_status != 0) {
+                return reply_status;
+            }
+            current_handle = next_open.handle_id;
+            current_owned = 1;
+            path = after_slashes;
+        }
     }
 }
 
@@ -408,8 +579,44 @@ static int64_t filed_lookup_and_open_component(
         parent_decision.backend_object,
         name,
         &object_id);
+    if (reply_status != 0 &&
+        (open_flags & FILED_OPEN_CREATE) != 0)
+    {
+        reply_status = filed_kobox_backend_create(
+            &runtime->backend,
+            parent_decision.backend_object,
+            name,
+            0100644u,
+            &object_id);
+        if (reply_status != 0) {
+            return reply_status;
+        }
+        memset(&backend_stat, 0, sizeof(backend_stat));
+        reply_status = filed_kobox_backend_statx(
+            &runtime->backend,
+            object_id,
+            &backend_stat);
+        if (reply_status != 0) {
+            return reply_status;
+        }
+        status = filed_vfs_create_backend_child(
+            &runtime->vfs,
+            parent_handle,
+            object_id,
+            filed_kind_from_unix_type(backend_stat.kind),
+            name,
+            rights,
+            open_flags,
+            out_open);
+        return filed_status_to_wire(status);
+    }
     if (reply_status != 0) {
         return reply_status;
+    }
+    if ((open_flags & (FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE)) ==
+        (FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE))
+    {
+        return filed_status_to_wire(FILED_ERR_EXISTS);
     }
 
     memset(&backend_stat, 0, sizeof(backend_stat));
@@ -430,6 +637,17 @@ static int64_t filed_lookup_and_open_component(
         rights,
         open_flags,
         out_open);
+    if (status == FILED_OK && (open_flags & FILED_OPEN_TRUNCATE) != 0) {
+        reply_status = filed_kobox_backend_truncate(
+            &runtime->backend,
+            object_id,
+            0);
+        if (reply_status != 0) {
+            (void)filed_vfs_close_handle(&runtime->vfs, out_open->handle_id);
+            memset(out_open, 0, sizeof(*out_open));
+            return reply_status;
+        }
+    }
     return filed_status_to_wire(status);
 }
 
@@ -759,6 +977,20 @@ static int filed_dispatch_pwrite(
         if (length > FILED_WIRE_IO_BYTES) {
             length = FILED_WIRE_IO_BYTES;
         }
+        if (decision.offset == UINT64_MAX) {
+            koboxd_wire_fs_statx_t backend_stat;
+            memset(&backend_stat, 0, sizeof(backend_stat));
+            reply_status = filed_kobox_backend_statx(
+                &runtime->backend,
+                decision.backend_object,
+                &backend_stat);
+            if (reply_status != 0) {
+                (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+                (void)pacha_fd_close(page_fd);
+                return filed_send_reply(reply_fd, request->word3, reply_status, bytes);
+            }
+            decision.offset = backend_stat.size;
+        }
         reply_status = filed_kobox_backend_pwrite(
             &runtime->backend,
             decision.backend_object,
@@ -801,6 +1033,20 @@ static int filed_dispatch_write(
         uint64_t length = decision.length;
         if (length > FILED_WIRE_IO_BYTES) {
             length = FILED_WIRE_IO_BYTES;
+        }
+        if (decision.offset == UINT64_MAX) {
+            koboxd_wire_fs_statx_t backend_stat;
+            memset(&backend_stat, 0, sizeof(backend_stat));
+            reply_status = filed_kobox_backend_statx(
+                &runtime->backend,
+                decision.backend_object,
+                &backend_stat);
+            if (reply_status != 0) {
+                (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+                (void)pacha_fd_close(page_fd);
+                return filed_send_reply(reply_fd, request->word3, reply_status, bytes);
+            }
+            decision.offset = backend_stat.size;
         }
         reply_status = filed_kobox_backend_pwrite(
             &runtime->backend,
@@ -845,6 +1091,355 @@ static int filed_dispatch_fsync(
             decision.backend_object);
     }
     return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+}
+
+static int filed_dispatch_truncate(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_truncate_t *truncate = (filed_wire_truncate_t *)page;
+    filed_vfs_io_decision_t decision;
+    filed_status_t status = FILED_ERR_INVALID;
+    int64_t reply_status = -22;
+    if (truncate->reserved0 == 0 && truncate->reserved1 == 0) {
+        status = filed_vfs_truncate_prepare(
+            &runtime->vfs,
+            (filed_handle_id_t)(uint32_t)truncate->handle,
+            truncate->size,
+            &decision);
+        reply_status = filed_status_to_wire(status);
+        if (status == FILED_OK) {
+            reply_status = filed_kobox_backend_truncate(
+                &runtime->backend,
+                decision.backend_object,
+                truncate->size);
+        }
+    }
+
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+}
+
+static int filed_dispatch_unlink(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_unlink_t *unlink = (filed_wire_unlink_t *)page;
+    filed_vfs_io_decision_t decision;
+    filed_status_t status = FILED_ERR_INVALID;
+    int64_t reply_status = -22;
+    if (unlink->reserved0 == 0 &&
+        filed_name_is_terminated(unlink->name, sizeof(unlink->name)))
+    {
+        filed_handle_id_t dir_handle = 0;
+        int dir_owned = 0;
+        char name[FILED_WIRE_NAME_BYTES];
+        const filed_handle_id_t base_dir =
+            unlink->dir_handle == 0 ?
+                runtime->root_handle_id :
+                (filed_handle_id_t)(uint32_t)unlink->dir_handle;
+
+        memset(name, 0, sizeof(name));
+        reply_status = filed_resolve_parent_path(
+            runtime,
+            base_dir,
+            unlink->name,
+            &dir_handle,
+            &dir_owned,
+            name,
+            sizeof(name));
+        if (reply_status == 0) {
+            status = filed_vfs_unlink_prepare(&runtime->vfs, dir_handle, name, &decision);
+            reply_status = filed_status_to_wire(status);
+            if (status == FILED_OK) {
+                reply_status = filed_kobox_backend_unlink(
+                    &runtime->backend,
+                    decision.backend_object,
+                    name);
+                if (reply_status == 0) {
+                    filed_vfs_reclaim_result_t reclaim;
+                    memset(&reclaim, 0, sizeof(reclaim));
+                    status = filed_vfs_unlink_commit_ex(&runtime->vfs, dir_handle, name, &reclaim);
+                    if (status != FILED_OK) {
+                        reply_status = filed_status_to_wire(status);
+                    } else {
+                        const int release_status = filed_release_reclaimed_object(runtime, &reclaim);
+                        if (release_status != 0) {
+                            reply_status = release_status;
+                        }
+                    }
+                }
+            }
+            filed_close_walk_handle(runtime, dir_handle, dir_owned);
+        }
+    }
+
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+}
+
+static int filed_dispatch_mkdir(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_mkdir_t *mkdir = (filed_wire_mkdir_t *)page;
+    filed_vfs_io_decision_t decision;
+    filed_status_t status = FILED_ERR_INVALID;
+    int64_t reply_status = -22;
+    uint64_t object_id = 0;
+    if (filed_name_is_terminated(mkdir->name, sizeof(mkdir->name))) {
+        filed_handle_id_t dir_handle = 0;
+        int dir_owned = 0;
+        char name[FILED_WIRE_NAME_BYTES];
+        const filed_handle_id_t base_dir =
+            mkdir->dir_handle == 0 ?
+                runtime->root_handle_id :
+                (filed_handle_id_t)(uint32_t)mkdir->dir_handle;
+
+        memset(name, 0, sizeof(name));
+        reply_status = filed_resolve_parent_path(
+            runtime,
+            base_dir,
+            mkdir->name,
+            &dir_handle,
+            &dir_owned,
+            name,
+            sizeof(name));
+        if (reply_status == 0) {
+            status = filed_vfs_create_prepare(&runtime->vfs, dir_handle, name, &decision);
+            reply_status = filed_status_to_wire(status);
+            if (status == FILED_OK) {
+                reply_status = filed_kobox_backend_mkdir(
+                    &runtime->backend,
+                    decision.backend_object,
+                    name,
+                    mkdir->mode,
+                    &object_id);
+                if (reply_status == 0 && object_id != 0) {
+                    koboxd_wire_fs_statx_t backend_stat;
+                    filed_vfs_open_result_t opened;
+                    memset(&backend_stat, 0, sizeof(backend_stat));
+                    memset(&opened, 0, sizeof(opened));
+                    if (filed_kobox_backend_statx(&runtime->backend, object_id, &backend_stat) == 0 &&
+                        filed_vfs_create_backend_child(
+                            &runtime->vfs,
+                            dir_handle,
+                            object_id,
+                            filed_kind_from_unix_type(backend_stat.kind),
+                            name,
+                            FILED_RIGHT_LOOKUP |
+                                FILED_RIGHT_STAT |
+                                FILED_RIGHT_GETDENTS |
+                                FILED_RIGHT_CREATE |
+                                FILED_RIGHT_REMOVE |
+                                FILED_RIGHT_RENAME,
+                            FILED_OPEN_DIRECTORY,
+                            &opened) == FILED_OK)
+                    {
+                        (void)filed_vfs_close_handle(&runtime->vfs, opened.handle_id);
+                    }
+                }
+            }
+            filed_close_walk_handle(runtime, dir_handle, dir_owned);
+        }
+    }
+
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+}
+
+static int filed_dispatch_rmdir(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_rmdir_t *rmdir = (filed_wire_rmdir_t *)page;
+    filed_vfs_io_decision_t decision;
+    filed_status_t status = FILED_ERR_INVALID;
+    int64_t reply_status = -22;
+    if (rmdir->reserved0 == 0 &&
+        filed_name_is_terminated(rmdir->name, sizeof(rmdir->name)))
+    {
+        filed_handle_id_t dir_handle = 0;
+        int dir_owned = 0;
+        char name[FILED_WIRE_NAME_BYTES];
+        const filed_handle_id_t base_dir =
+            rmdir->dir_handle == 0 ?
+                runtime->root_handle_id :
+                (filed_handle_id_t)(uint32_t)rmdir->dir_handle;
+
+        memset(name, 0, sizeof(name));
+        reply_status = filed_resolve_parent_path(
+            runtime,
+            base_dir,
+            rmdir->name,
+            &dir_handle,
+            &dir_owned,
+            name,
+            sizeof(name));
+        if (reply_status == 0) {
+            status = filed_vfs_unlink_prepare(&runtime->vfs, dir_handle, name, &decision);
+            reply_status = filed_status_to_wire(status);
+            if (status == FILED_OK) {
+                reply_status = filed_kobox_backend_rmdir(
+                    &runtime->backend,
+                    decision.backend_object,
+                    name);
+                if (reply_status == 0) {
+                    filed_vfs_reclaim_result_t reclaim;
+                    memset(&reclaim, 0, sizeof(reclaim));
+                    status = filed_vfs_unlink_commit_ex(&runtime->vfs, dir_handle, name, &reclaim);
+                    if (status != FILED_OK) {
+                        reply_status = filed_status_to_wire(status);
+                    } else {
+                        const int release_status = filed_release_reclaimed_object(runtime, &reclaim);
+                        if (release_status != 0) {
+                            reply_status = release_status;
+                        }
+                    }
+                }
+            }
+            filed_close_walk_handle(runtime, dir_handle, dir_owned);
+        }
+    }
+
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+}
+
+static int filed_dispatch_rename(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_rename_t *rename = (filed_wire_rename_t *)page;
+    filed_vfs_io_decision_t old_parent;
+    filed_vfs_io_decision_t new_parent;
+    filed_status_t status = FILED_ERR_INVALID;
+    int64_t reply_status = -22;
+    uint64_t object_id = 0;
+    if (filed_name_is_terminated(rename->old_name, sizeof(rename->old_name)) &&
+        filed_name_is_terminated(rename->new_name, sizeof(rename->new_name)))
+    {
+        filed_handle_id_t old_dir_handle = 0;
+        filed_handle_id_t new_dir_handle = 0;
+        int old_dir_owned = 0;
+        int new_dir_owned = 0;
+        char old_name[FILED_WIRE_NAME_BYTES];
+        char new_name[FILED_WIRE_NAME_BYTES];
+        const filed_handle_id_t old_base_dir =
+            rename->old_dir_handle == 0 ?
+                runtime->root_handle_id :
+                (filed_handle_id_t)(uint32_t)rename->old_dir_handle;
+        const filed_handle_id_t new_base_dir =
+            rename->new_dir_handle == 0 ?
+                runtime->root_handle_id :
+                (filed_handle_id_t)(uint32_t)rename->new_dir_handle;
+
+        memset(old_name, 0, sizeof(old_name));
+        memset(new_name, 0, sizeof(new_name));
+        reply_status = filed_resolve_parent_path(
+            runtime,
+            old_base_dir,
+            rename->old_name,
+            &old_dir_handle,
+            &old_dir_owned,
+            old_name,
+            sizeof(old_name));
+        if (reply_status == 0) {
+            reply_status = filed_resolve_parent_path(
+                runtime,
+                new_base_dir,
+                rename->new_name,
+                &new_dir_handle,
+                &new_dir_owned,
+                new_name,
+                sizeof(new_name));
+        }
+        if (reply_status == 0) {
+            status = filed_vfs_rename_prepare(
+                &runtime->vfs,
+                old_dir_handle,
+                new_dir_handle,
+                old_name,
+                new_name,
+                &old_parent,
+                &new_parent);
+            reply_status = filed_status_to_wire(status);
+            if (status == FILED_OK) {
+                reply_status = filed_kobox_backend_rename(
+                    &runtime->backend,
+                    old_parent.backend_object,
+                    old_name,
+                    new_parent.backend_object,
+                    new_name,
+                    &object_id);
+                if (reply_status == 0) {
+                    filed_vfs_reclaim_result_t reclaim;
+                    memset(&reclaim, 0, sizeof(reclaim));
+                    status = filed_vfs_rename_commit_ex(
+                        &runtime->vfs,
+                        old_dir_handle,
+                        new_dir_handle,
+                        old_name,
+                        new_name,
+                        object_id,
+                        &reclaim);
+                    if (status != FILED_OK) {
+                        reply_status = filed_status_to_wire(status);
+                    } else {
+                        const int release_status = filed_release_reclaimed_object(runtime, &reclaim);
+                        if (release_status != 0) {
+                            reply_status = release_status;
+                        }
+                    }
+                }
+            }
+        }
+        filed_close_walk_handle(runtime, old_dir_handle, old_dir_owned);
+        filed_close_walk_handle(runtime, new_dir_handle, new_dir_owned);
+    }
+
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, reply_status, object_id);
 }
 
 static int filed_dispatch_getdents(
@@ -919,8 +1514,7 @@ static int filed_dispatch_close(
     if (handle_id == runtime->root_handle_id) {
         return filed_send_reply(reply_fd, request->word3, -13, 0);
     }
-    const filed_status_t status = filed_vfs_close_handle(&runtime->vfs, handle_id);
-    return filed_send_reply(reply_fd, request->word3, filed_status_to_wire(status), 0);
+    return filed_send_reply(reply_fd, request->word3, filed_close_handle_runtime(runtime, handle_id), 0);
 }
 
 static int filed_dispatch_dup(
@@ -1276,6 +1870,16 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
         return filed_dispatch_write(runtime, reply_fd, &request);
     case FILED_WIRE_OP_FSYNC:
         return filed_dispatch_fsync(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_TRUNCATE:
+        return filed_dispatch_truncate(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_UNLINK:
+        return filed_dispatch_unlink(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_RENAME:
+        return filed_dispatch_rename(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_MKDIR:
+        return filed_dispatch_mkdir(runtime, reply_fd, &request);
+    case FILED_WIRE_OP_RMDIR:
+        return filed_dispatch_rmdir(runtime, reply_fd, &request);
     case FILED_WIRE_OP_GETDENTS:
         return filed_dispatch_getdents(runtime, reply_fd, &request);
     case FILED_WIRE_OP_CLOSE:

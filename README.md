@@ -38,7 +38,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 
 | Layer | Language | Detail |
 |---|---|---|
-| Kernel | Zig | Freestanding / UEFI boot / x86_64 |
+| Kernel | Zig / C / Rocq | Freestanding / UEFI boot / x86_64 |
 | Userland | C / CMake | musl libc / ELF loader / Linux ABI server |
 
 ---

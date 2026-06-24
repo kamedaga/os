@@ -15,6 +15,8 @@ enum {
 
 typedef struct koboxd_fs_object {
     uint64_t object_id;
+    uint64_t parent_object_id;
+    uint64_t inode_number;
     void *inode;
     void *dentry;
     uint16_t mode;
@@ -23,6 +25,7 @@ typedef struct koboxd_fs_object {
     uint64_t blocks;
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
     uint8_t used;
+    uint8_t linked;
 } koboxd_fs_object_t;
 
 typedef struct koboxd_fs_backend {
@@ -69,6 +72,38 @@ int koboxd_fs_backend_pwrite(
     uint64_t offset,
     const void *buffer,
     size_t length);
+int koboxd_fs_backend_create(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint16_t mode,
+    uint64_t *out_object_id);
+int koboxd_fs_backend_truncate(
+    koboxd_fs_backend_t *backend,
+    uint64_t object_id,
+    uint64_t size);
+int koboxd_fs_backend_unlink(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name);
+int koboxd_fs_backend_mkdir(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint16_t mode,
+    uint64_t *out_object_id);
+int koboxd_fs_backend_rmdir(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name);
+int koboxd_fs_backend_rename(
+    koboxd_fs_backend_t *backend,
+    uint64_t old_parent_object_id,
+    const char *old_name,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id);
+int koboxd_fs_backend_release_object(koboxd_fs_backend_t *backend, uint64_t object_id);
 int koboxd_fs_backend_fsync(koboxd_fs_backend_t *backend, uint64_t object_id);
 int koboxd_fs_backend_statx(
     koboxd_fs_backend_t *backend,

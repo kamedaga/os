@@ -42,6 +42,40 @@ int filed_kobox_backend_pwrite(
 int filed_kobox_backend_fsync(
     filed_kobox_backend_t *backend,
     uint64_t object_id);
+int filed_kobox_backend_create(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t *out_object_id);
+int filed_kobox_backend_truncate(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint64_t size);
+int filed_kobox_backend_unlink(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name);
+int filed_kobox_backend_mkdir(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t *out_object_id);
+int filed_kobox_backend_rmdir(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name);
+int filed_kobox_backend_rename(
+    filed_kobox_backend_t *backend,
+    uint64_t old_parent_object_id,
+    const char *old_name,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id);
+int filed_kobox_backend_release_object(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id);
 int filed_kobox_backend_getdents(
     filed_kobox_backend_t *backend,
     uint64_t dir_object_id,

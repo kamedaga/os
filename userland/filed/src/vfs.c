@@ -19,6 +19,20 @@ static filed_status_t filed_copy_name(char *dst, size_t dst_size, const char *sr
     return FILED_OK;
 }
 
+static bool filed_name_is_dot_or_dotdot(const char *name)
+{
+    return name != NULL &&
+        (strcmp(name, ".") == 0 || strcmp(name, "..") == 0);
+}
+
+static bool filed_name_is_component(const char *name)
+{
+    return name != NULL &&
+        name[0] != '\0' &&
+        !filed_name_is_dot_or_dotdot(name) &&
+        strchr(name, '/') == NULL;
+}
+
 const char *filed_status_name(filed_status_t status)
 {
     switch (status) {
@@ -272,6 +286,7 @@ static filed_vnode_t *filed_find_backend_vnode(
 
     for (i = 0; i < FILED_MAX_VNODES; ++i) {
         if (vfs->vnodes[i].active &&
+            vfs->vnodes[i].linked &&
             vfs->vnodes[i].mount_id == mount_id &&
             vfs->vnodes[i].backend_object == backend_object)
         {
@@ -279,6 +294,78 @@ static filed_vnode_t *filed_find_backend_vnode(
         }
     }
 
+    return NULL;
+}
+
+static uint32_t filed_vnode_mount_pins(const filed_vfs_t *vfs, filed_vnode_id_t vnode_id)
+{
+    uint32_t pins = 0;
+    size_t i;
+
+    if (vfs == NULL || vnode_id == 0) {
+        return 0;
+    }
+    for (i = 0; i < FILED_MAX_MOUNTS; ++i) {
+        if (vfs->mounts[i].active && vfs->mounts[i].root_vnode == vnode_id) {
+            ++pins;
+        }
+    }
+    return pins;
+}
+
+static bool filed_vnode_is_dead(const filed_vfs_t *vfs, const filed_vnode_t *vnode)
+{
+    if (vfs == NULL || vnode == NULL || !vnode->active) {
+        return false;
+    }
+    if (vnode->linked || vnode->refcount != 0 || filed_vnode_mount_pins(vfs, vnode->id) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static void filed_reclaim_result_set(
+    filed_vfs_reclaim_result_t *out_reclaim,
+    const filed_vnode_t *vnode)
+{
+    if (out_reclaim == NULL || vnode == NULL || vnode->backend_object == 0) {
+        return;
+    }
+    out_reclaim->released = true;
+    out_reclaim->backend_object = vnode->backend_object;
+}
+
+static void filed_reclaim_vnode_if_dead_ex(
+    filed_vfs_t *vfs,
+    filed_vnode_t *vnode,
+    filed_vfs_reclaim_result_t *out_reclaim)
+{
+    if (!filed_vnode_is_dead(vfs, vnode)) {
+        return;
+    }
+    filed_reclaim_result_set(out_reclaim, vnode);
+    memset(vnode, 0, sizeof(*vnode));
+}
+
+static filed_vnode_t *filed_find_child_vnode(
+    filed_vfs_t *vfs,
+    filed_vnode_id_t parent,
+    const char *name)
+{
+    size_t i;
+
+    if (vfs == NULL || parent == 0 || name == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < FILED_MAX_VNODES; ++i) {
+        if (vfs->vnodes[i].active &&
+            vfs->vnodes[i].linked &&
+            vfs->vnodes[i].parent == parent &&
+            strcmp(vfs->vnodes[i].name, name) == 0)
+        {
+            return &vfs->vnodes[i];
+        }
+    }
     return NULL;
 }
 
@@ -495,6 +582,9 @@ filed_status_t filed_vfs_open_backend_child(
     {
         return FILED_ERR_INVALID;
     }
+    if (!filed_name_is_component(name)) {
+        return FILED_ERR_INVALID;
+    }
 
     parent = filed_find_handle_const(vfs, parent_handle);
     if (parent == NULL || parent->target_kind != FILED_HANDLE_FILE) {
@@ -533,7 +623,7 @@ filed_status_t filed_vfs_open_backend_child(
         child->kind = child_kind;
         child->parent = parent_vnode->id;
         child->generation = 1;
-        child->refcount = 1;
+        child->refcount = 0;
         status = filed_copy_name(child->name, sizeof(child->name), name);
         if (status != FILED_OK) {
             memset(child, 0, sizeof(*child));
@@ -543,6 +633,58 @@ filed_status_t filed_vfs_open_backend_child(
     }
 
     return filed_open_vnode(vfs, child, rights, open_flags, out_open);
+}
+
+filed_status_t filed_vfs_create_backend_child(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
+    filed_backend_object_id_t child_backend_object,
+    filed_vnode_kind_t child_kind,
+    const char *name,
+    uint32_t rights,
+    uint32_t open_flags,
+    filed_vfs_open_result_t *out_open)
+{
+    const filed_handle_t *parent;
+    const filed_file_t *parent_file;
+    filed_vnode_t *parent_vnode;
+
+    if (vfs == NULL || name == NULL || out_open == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_name_is_component(name)) {
+        return FILED_ERR_INVALID;
+    }
+    parent = filed_find_handle_const(vfs, parent_handle);
+    if (parent == NULL || parent->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_rights_include(parent->rights, FILED_RIGHT_CREATE)) {
+        return FILED_ERR_DENIED;
+    }
+    parent_file = filed_find_file_const(vfs, (filed_file_id_t)parent->target_id);
+    if (parent_file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    parent_vnode = filed_find_vnode(vfs, parent_file->vnode_id);
+    if (parent_vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    if (parent_vnode->kind != FILED_VNODE_DIRECTORY) {
+        return FILED_ERR_NOT_DIR;
+    }
+    if (filed_find_child_vnode(vfs, parent_vnode->id, name) != NULL) {
+        return FILED_ERR_EXISTS;
+    }
+    return filed_vfs_open_backend_child(
+        vfs,
+        parent_handle,
+        child_backend_object,
+        child_kind,
+        name,
+        rights,
+        open_flags,
+        out_open);
 }
 
 filed_status_t filed_vfs_open_existing(
@@ -600,12 +742,18 @@ filed_status_t filed_vfs_open_parent(
     return filed_open_vnode(vfs, parent, rights, open_flags, out_open);
 }
 
-filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle_id)
+filed_status_t filed_vfs_close_handle_ex(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_reclaim_result_t *out_reclaim)
 {
     filed_handle_t *handle;
     filed_file_t *file;
     filed_vnode_t *vnode;
 
+    if (out_reclaim != NULL) {
+        memset(out_reclaim, 0, sizeof(*out_reclaim));
+    }
     if (vfs == NULL || handle_id == 0) {
         return FILED_ERR_INVALID;
     }
@@ -624,6 +772,7 @@ filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle
                 vnode = filed_find_vnode(vfs, file->vnode_id);
                 if (vnode != NULL && vnode->refcount > 0) {
                     --vnode->refcount;
+                    filed_reclaim_vnode_if_dead_ex(vfs, vnode, out_reclaim);
                 }
                 memset(file, 0, sizeof(*file));
             }
@@ -632,6 +781,11 @@ filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle
 
     memset(handle, 0, sizeof(*handle));
     return FILED_OK;
+}
+
+filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle_id)
+{
+    return filed_vfs_close_handle_ex(vfs, handle_id, NULL);
 }
 
 filed_status_t filed_vfs_dup_handle(
@@ -835,6 +989,31 @@ filed_status_t filed_vfs_lookup_prepare(
     return FILED_OK;
 }
 
+filed_status_t filed_vfs_create_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name,
+    filed_vfs_io_decision_t *out_decision)
+{
+    filed_status_t status = filed_prepare_file_handle(
+        vfs,
+        parent_handle_id,
+        FILED_RIGHT_CREATE,
+        out_decision);
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (!filed_name_is_component(name)) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_INVALID;
+    }
+    if (out_decision->kind != FILED_VNODE_DIRECTORY) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_NOT_DIR;
+    }
+    return FILED_OK;
+}
+
 filed_status_t filed_vfs_pread_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -979,10 +1158,10 @@ filed_status_t filed_vfs_write_prepare(
         return FILED_ERR_INVALID;
     }
     if ((file->status_flags & FILED_FILE_APPEND) != 0) {
-        memset(out_decision, 0, sizeof(*out_decision));
-        return FILED_ERR_UNSUPPORTED;
+        out_decision->offset = UINT64_MAX;
+    } else {
+        out_decision->offset = (uint64_t)file->offset;
     }
-    out_decision->offset = (uint64_t)file->offset;
     out_decision->length = length;
     return FILED_OK;
 }
@@ -1013,6 +1192,189 @@ filed_status_t filed_vfs_fsync_prepare(
         return FILED_ERR_IS_DIR;
     }
     return FILED_OK;
+}
+
+filed_status_t filed_vfs_truncate_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t size,
+    filed_vfs_io_decision_t *out_decision)
+{
+    filed_status_t status = filed_prepare_file_handle(
+        vfs,
+        handle_id,
+        FILED_RIGHT_WRITE,
+        out_decision);
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (out_decision->kind == FILED_VNODE_DIRECTORY) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_IS_DIR;
+    }
+    out_decision->offset = 0;
+    out_decision->length = size;
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_unlink_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name,
+    filed_vfs_io_decision_t *out_decision)
+{
+    filed_status_t status = filed_prepare_file_handle(
+        vfs,
+        parent_handle_id,
+        FILED_RIGHT_REMOVE,
+        out_decision);
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (!filed_name_is_component(name)) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_INVALID;
+    }
+    if (out_decision->kind != FILED_VNODE_DIRECTORY) {
+        memset(out_decision, 0, sizeof(*out_decision));
+        return FILED_ERR_NOT_DIR;
+    }
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_unlink_commit_ex(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name,
+    filed_vfs_reclaim_result_t *out_reclaim)
+{
+    filed_vnode_t *parent_vnode;
+    filed_vnode_t *child;
+    filed_status_t status = filed_handle_vnode(vfs, parent_handle_id, FILED_RIGHT_REMOVE, &parent_vnode);
+    if (out_reclaim != NULL) {
+        memset(out_reclaim, 0, sizeof(*out_reclaim));
+    }
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (!filed_name_is_component(name)) {
+        return FILED_ERR_INVALID;
+    }
+    child = filed_find_child_vnode(vfs, parent_vnode->id, name);
+    if (child != NULL) {
+        child->linked = false;
+        ++child->generation;
+        filed_reclaim_vnode_if_dead_ex(vfs, child, out_reclaim);
+    }
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_unlink_commit(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name)
+{
+    return filed_vfs_unlink_commit_ex(vfs, parent_handle_id, name, NULL);
+}
+
+filed_status_t filed_vfs_rename_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t old_parent_handle_id,
+    filed_handle_id_t new_parent_handle_id,
+    const char *old_name,
+    const char *new_name,
+    filed_vfs_io_decision_t *out_old_parent,
+    filed_vfs_io_decision_t *out_new_parent)
+{
+    filed_status_t status = filed_prepare_file_handle(
+        vfs,
+        old_parent_handle_id,
+        FILED_RIGHT_RENAME,
+        out_old_parent);
+    if (status != FILED_OK) {
+        return status;
+    }
+    status = filed_prepare_file_handle(
+        vfs,
+        new_parent_handle_id,
+        FILED_RIGHT_RENAME,
+        out_new_parent);
+    if (status != FILED_OK) {
+        memset(out_old_parent, 0, sizeof(*out_old_parent));
+        return status;
+    }
+    if (!filed_name_is_component(old_name) || !filed_name_is_component(new_name)) {
+        memset(out_old_parent, 0, sizeof(*out_old_parent));
+        memset(out_new_parent, 0, sizeof(*out_new_parent));
+        return FILED_ERR_INVALID;
+    }
+    if (out_old_parent->kind != FILED_VNODE_DIRECTORY || out_new_parent->kind != FILED_VNODE_DIRECTORY) {
+        memset(out_old_parent, 0, sizeof(*out_old_parent));
+        memset(out_new_parent, 0, sizeof(*out_new_parent));
+        return FILED_ERR_NOT_DIR;
+    }
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_rename_commit_ex(
+    filed_vfs_t *vfs,
+    filed_handle_id_t old_parent_handle_id,
+    filed_handle_id_t new_parent_handle_id,
+    const char *old_name,
+    const char *new_name,
+    filed_backend_object_id_t backend_object,
+    filed_vfs_reclaim_result_t *out_reclaim)
+{
+    filed_vnode_t *old_parent;
+    filed_vnode_t *new_parent;
+    filed_vnode_t *old_child;
+    filed_vnode_t *replaced;
+    filed_status_t status = filed_handle_vnode(vfs, old_parent_handle_id, FILED_RIGHT_RENAME, &old_parent);
+    if (out_reclaim != NULL) {
+        memset(out_reclaim, 0, sizeof(*out_reclaim));
+    }
+    if (status != FILED_OK) {
+        return status;
+    }
+    status = filed_handle_vnode(vfs, new_parent_handle_id, FILED_RIGHT_RENAME, &new_parent);
+    if (status != FILED_OK) {
+        return status;
+    }
+    old_child = filed_find_child_vnode(vfs, old_parent->id, old_name);
+    if (!filed_name_is_component(old_name) || !filed_name_is_component(new_name)) {
+        return FILED_ERR_INVALID;
+    }
+    replaced = filed_find_child_vnode(vfs, new_parent->id, new_name);
+    if (replaced != NULL && replaced != old_child) {
+        replaced->linked = false;
+        ++replaced->generation;
+        filed_reclaim_vnode_if_dead_ex(vfs, replaced, out_reclaim);
+    }
+    if (old_child != NULL) {
+        old_child->parent = new_parent->id;
+        old_child->backend_object = backend_object;
+        ++old_child->generation;
+        return filed_copy_name(old_child->name, sizeof(old_child->name), new_name);
+    }
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_rename_commit(
+    filed_vfs_t *vfs,
+    filed_handle_id_t old_parent_handle_id,
+    filed_handle_id_t new_parent_handle_id,
+    const char *old_name,
+    const char *new_name,
+    filed_backend_object_id_t backend_object)
+{
+    return filed_vfs_rename_commit_ex(
+        vfs,
+        old_parent_handle_id,
+        new_parent_handle_id,
+        old_name,
+        new_name,
+        backend_object,
+        NULL);
 }
 
 filed_status_t filed_vfs_getdents_prepare(
@@ -1079,16 +1441,51 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
 
     for (i = 0; i < FILED_MAX_VNODES; ++i) {
         const filed_vnode_t *node = &vfs->vnodes[i];
+        uint32_t expected_refcount;
+        size_t j;
         if (!node->active) {
             continue;
         }
         if (node->id == 0 || !filed_mount_id_exists(vfs, node->mount_id)) {
             return FILED_ERR_INVALID;
         }
+        if (node->refcount == 0 && !node->linked) {
+            return FILED_ERR_INVALID;
+        }
+        if (node->parent != 0 && !filed_vnode_id_exists(vfs, node->parent)) {
+            return FILED_ERR_INVALID;
+        }
+        if (node->linked && node->name[0] == '\0') {
+            return FILED_ERR_INVALID;
+        }
+        expected_refcount = filed_vnode_mount_pins(vfs, node->id);
+        for (j = 0; j < FILED_MAX_FILES; ++j) {
+            if (vfs->files[j].active && vfs->files[j].vnode_id == node->id) {
+                ++expected_refcount;
+            }
+        }
+        if (node->refcount != expected_refcount) {
+            return FILED_ERR_INVALID;
+        }
+        if (node->linked) {
+            for (j = i + 1; j < FILED_MAX_VNODES; ++j) {
+                const filed_vnode_t *other = &vfs->vnodes[j];
+                if (other->active &&
+                    other->linked &&
+                    other->mount_id == node->mount_id &&
+                    other->parent == node->parent &&
+                    strcmp(other->name, node->name) == 0)
+                {
+                    return FILED_ERR_INVALID;
+                }
+            }
+        }
     }
 
     for (i = 0; i < FILED_MAX_FILES; ++i) {
         const filed_file_t *file = &vfs->files[i];
+        uint32_t handle_count = 0;
+        size_t j;
         if (!file->active) {
             continue;
         }
@@ -1097,6 +1494,17 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
             file->refcount == 0 ||
             !filed_vnode_id_exists(vfs, file->vnode_id))
         {
+            return FILED_ERR_INVALID;
+        }
+        for (j = 0; j < FILED_MAX_HANDLES; ++j) {
+            if (vfs->handles[j].active &&
+                vfs->handles[j].target_kind == FILED_HANDLE_FILE &&
+                vfs->handles[j].target_id == file->id)
+            {
+                ++handle_count;
+            }
+        }
+        if (file->refcount != handle_count) {
             return FILED_ERR_INVALID;
         }
     }

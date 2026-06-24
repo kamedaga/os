@@ -56,8 +56,10 @@ typedef enum koboxd_fs_backend_op {
     KOBOXD_FS_STATX = 6,
     KOBOXD_FS_GETDENTS = 7,
     KOBOXD_FS_FSYNC = 8,
-    KOBOXD_FS_UNLINK = 9,
-    KOBOXD_FS_RENAME = 10,
+    KOBOXD_FS_CREATE = 9,
+    KOBOXD_FS_TRUNCATE = 10,
+    KOBOXD_FS_UNLINK = 11,
+    KOBOXD_FS_RENAME = 12,
 } koboxd_fs_backend_op_t;
 
 typedef enum koboxd_event_op {

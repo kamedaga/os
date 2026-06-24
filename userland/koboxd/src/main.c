@@ -581,6 +581,106 @@ static int serve_fs_backend_once(koboxd_ipc_service_t *ipc_service, koboxd_fs_ba
     case KOBOXD_WIRE_FS_FSYNC:
         reply_status = koboxd_fs_backend_fsync(fs_backend, request.word2);
         break;
+    case KOBOXD_WIRE_FS_RELEASE_OBJECT:
+        reply_status = koboxd_fs_backend_release_object(fs_backend, request.word2);
+        break;
+    case KOBOXD_WIRE_FS_CREATE: {
+        mapped = map_wire_vmo_from_msg(&request, KOBOXD_WIRE_FS_PAGE_BYTES, &vmo_fd);
+        if (mapped == NULL) {
+            reply_status = -22;
+            break;
+        }
+        koboxd_wire_fs_create_t *create = (koboxd_wire_fs_create_t *)mapped;
+        create->name[KOBOXD_WIRE_FS_NAME_BYTES - 1] = '\0';
+        uint64_t object_id = 0;
+        reply_status = koboxd_fs_backend_create(
+            fs_backend,
+            create->parent_object_id,
+            create->name,
+            (uint16_t)create->mode,
+            &object_id);
+        result = object_id;
+        break;
+    }
+    case KOBOXD_WIRE_FS_TRUNCATE: {
+        mapped = map_wire_vmo_from_msg(&request, KOBOXD_WIRE_FS_PAGE_BYTES, &vmo_fd);
+        if (mapped == NULL) {
+            reply_status = -22;
+            break;
+        }
+        koboxd_wire_fs_truncate_t *truncate = (koboxd_wire_fs_truncate_t *)mapped;
+        reply_status = koboxd_fs_backend_truncate(
+            fs_backend,
+            truncate->object_id,
+            truncate->size);
+        break;
+    }
+    case KOBOXD_WIRE_FS_UNLINK: {
+        mapped = map_wire_vmo_from_msg(&request, KOBOXD_WIRE_FS_PAGE_BYTES, &vmo_fd);
+        if (mapped == NULL) {
+            reply_status = -22;
+            break;
+        }
+        koboxd_wire_fs_unlink_t *unlink = (koboxd_wire_fs_unlink_t *)mapped;
+        unlink->name[KOBOXD_WIRE_FS_NAME_BYTES - 1] = '\0';
+        reply_status = koboxd_fs_backend_unlink(
+            fs_backend,
+            unlink->parent_object_id,
+            unlink->name);
+        break;
+    }
+    case KOBOXD_WIRE_FS_MKDIR: {
+        mapped = map_wire_vmo_from_msg(&request, KOBOXD_WIRE_FS_PAGE_BYTES, &vmo_fd);
+        if (mapped == NULL) {
+            reply_status = -22;
+            break;
+        }
+        koboxd_wire_fs_mkdir_t *mkdir = (koboxd_wire_fs_mkdir_t *)mapped;
+        mkdir->name[KOBOXD_WIRE_FS_NAME_BYTES - 1] = '\0';
+        uint64_t object_id = 0;
+        reply_status = koboxd_fs_backend_mkdir(
+            fs_backend,
+            mkdir->parent_object_id,
+            mkdir->name,
+            (uint16_t)mkdir->mode,
+            &object_id);
+        result = object_id;
+        break;
+    }
+    case KOBOXD_WIRE_FS_RMDIR: {
+        mapped = map_wire_vmo_from_msg(&request, KOBOXD_WIRE_FS_PAGE_BYTES, &vmo_fd);
+        if (mapped == NULL) {
+            reply_status = -22;
+            break;
+        }
+        koboxd_wire_fs_rmdir_t *rmdir = (koboxd_wire_fs_rmdir_t *)mapped;
+        rmdir->name[KOBOXD_WIRE_FS_NAME_BYTES - 1] = '\0';
+        reply_status = koboxd_fs_backend_rmdir(
+            fs_backend,
+            rmdir->parent_object_id,
+            rmdir->name);
+        break;
+    }
+    case KOBOXD_WIRE_FS_RENAME: {
+        mapped = map_wire_vmo_from_msg(&request, KOBOXD_WIRE_FS_PAGE_BYTES, &vmo_fd);
+        if (mapped == NULL) {
+            reply_status = -22;
+            break;
+        }
+        koboxd_wire_fs_rename_t *rename = (koboxd_wire_fs_rename_t *)mapped;
+        rename->old_name[KOBOXD_WIRE_FS_NAME_BYTES - 1] = '\0';
+        rename->new_name[KOBOXD_WIRE_FS_NAME_BYTES - 1] = '\0';
+        uint64_t object_id = 0;
+        reply_status = koboxd_fs_backend_rename(
+            fs_backend,
+            rename->old_parent_object_id,
+            rename->old_name,
+            rename->new_parent_object_id,
+            rename->new_name,
+            &object_id);
+        result = object_id;
+        break;
+    }
     case KOBOXD_WIRE_FS_GETDENTS: {
         mapped = map_wire_vmo_from_msg(&request, KOBOXD_WIRE_FS_PAGE_BYTES, &vmo_fd);
         if (mapped == NULL) {

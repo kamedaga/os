@@ -23,6 +23,11 @@ enum {
     FILED_WIRE_OP_PWRITE = 14,
     FILED_WIRE_OP_WRITE = 15,
     FILED_WIRE_OP_FSYNC = 16,
+    FILED_WIRE_OP_TRUNCATE = 17,
+    FILED_WIRE_OP_UNLINK = 18,
+    FILED_WIRE_OP_RENAME = 19,
+    FILED_WIRE_OP_MKDIR = 20,
+    FILED_WIRE_OP_RMDIR = 21,
 
     FILED_WIRE_NAME_BYTES = 96,
     FILED_WIRE_IO_BYTES = 7680,
@@ -91,6 +96,38 @@ typedef struct filed_wire_statx {
     uint64_t nlink;
     uint64_t kind;
 } filed_wire_statx_t;
+
+typedef struct filed_wire_truncate {
+    uint64_t handle;
+    uint64_t size;
+    uint64_t reserved0;
+    uint64_t reserved1;
+} filed_wire_truncate_t;
+
+typedef struct filed_wire_unlink {
+    uint64_t dir_handle;
+    uint64_t reserved0;
+    char name[FILED_WIRE_NAME_BYTES];
+} filed_wire_unlink_t;
+
+typedef struct filed_wire_mkdir {
+    uint64_t dir_handle;
+    uint64_t mode;
+    char name[FILED_WIRE_NAME_BYTES];
+} filed_wire_mkdir_t;
+
+typedef struct filed_wire_rmdir {
+    uint64_t dir_handle;
+    uint64_t reserved0;
+    char name[FILED_WIRE_NAME_BYTES];
+} filed_wire_rmdir_t;
+
+typedef struct filed_wire_rename {
+    uint64_t old_dir_handle;
+    uint64_t new_dir_handle;
+    char old_name[FILED_WIRE_NAME_BYTES];
+    char new_name[FILED_WIRE_NAME_BYTES];
+} filed_wire_rename_t;
 
 typedef struct filed_wire_handle_flags {
     uint64_t handle;

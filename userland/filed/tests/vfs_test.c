@@ -544,15 +544,236 @@ static void test_write_pwrite_and_fsync(void)
             &append_file),
         FILED_OK);
     expect_status(
-        "append write unsupported until eof decision",
+        "append write uses eof sentinel",
         filed_vfs_write_prepare(&vfs, append_file.handle_id, 1, &decision),
-        FILED_ERR_UNSUPPORTED);
+        FILED_OK);
+    expect_true("append write sentinel", decision.offset == UINT64_MAX && decision.length == 1);
 
     expect_status(
         "directory pwrite denied",
         filed_vfs_pwrite_prepare(&vfs, root.handle_id, 0, 1, &decision),
         FILED_ERR_DENIED);
     expect_status("write preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
+static void test_unlink_keeps_open_files_alive(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    filed_vfs_open_result_t file;
+    filed_vfs_io_decision_t decision;
+    filed_handle_id_t dup_handle = 0;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for unlink lifetime",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for unlink lifetime",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_STAT | FILED_RIGHT_REMOVE,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+    expect_status(
+        "open unlink lifetime child",
+        filed_vfs_open_backend_child(
+            &vfs,
+            root.handle_id,
+            60,
+            FILED_VNODE_REGULAR,
+            "unlink-open.txt",
+            FILED_RIGHT_READ | FILED_RIGHT_STAT,
+            0,
+            &file),
+        FILED_OK);
+    expect_status(
+        "dup unlink lifetime child",
+        filed_vfs_dup_handle(&vfs, file.handle_id, 0, &dup_handle),
+        FILED_OK);
+
+    expect_status(
+        "unlink prepare lifetime child",
+        filed_vfs_unlink_prepare(&vfs, root.handle_id, "unlink-open.txt", &decision),
+        FILED_OK);
+    expect_status(
+        "unlink commit lifetime child",
+        filed_vfs_unlink_commit(&vfs, root.handle_id, "unlink-open.txt"),
+        FILED_OK);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "unlinked source remains readable",
+        filed_vfs_pread_prepare(&vfs, file.handle_id, 0, 1, &decision),
+        FILED_OK);
+    expect_true("unlinked source backend remains", decision.backend_object == 60);
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "unlinked dup remains readable",
+        filed_vfs_pread_prepare(&vfs, dup_handle, 0, 1, &decision),
+        FILED_OK);
+    expect_true("unlinked dup backend remains", decision.backend_object == 60);
+
+    expect_status("close unlink lifetime source", filed_vfs_close_handle(&vfs, file.handle_id), FILED_OK);
+    expect_status("close unlink lifetime dup", filed_vfs_close_handle(&vfs, dup_handle), FILED_OK);
+    expect_status("unlink lifetime preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
+static void test_rename_replace_keeps_replaced_open_file_alive(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    filed_vfs_open_result_t old_file;
+    filed_vfs_open_result_t replaced_file;
+    filed_vfs_open_result_t reopened;
+    filed_vfs_io_decision_t old_parent;
+    filed_vfs_io_decision_t new_parent;
+    filed_vfs_io_decision_t decision;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for rename lifetime",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for rename lifetime",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_STAT | FILED_RIGHT_RENAME,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+    expect_status(
+        "open old rename child",
+        filed_vfs_open_backend_child(
+            &vfs,
+            root.handle_id,
+            61,
+            FILED_VNODE_REGULAR,
+            "old-name.txt",
+            FILED_RIGHT_READ | FILED_RIGHT_STAT,
+            0,
+            &old_file),
+        FILED_OK);
+    expect_status(
+        "open replaced rename child",
+        filed_vfs_open_backend_child(
+            &vfs,
+            root.handle_id,
+            62,
+            FILED_VNODE_REGULAR,
+            "new-name.txt",
+            FILED_RIGHT_READ | FILED_RIGHT_STAT,
+            0,
+            &replaced_file),
+        FILED_OK);
+    expect_status(
+        "rename prepare replaces child",
+        filed_vfs_rename_prepare(
+            &vfs,
+            root.handle_id,
+            root.handle_id,
+            "old-name.txt",
+            "new-name.txt",
+            &old_parent,
+            &new_parent),
+        FILED_OK);
+    expect_status(
+        "rename commit replaces child",
+        filed_vfs_rename_commit(
+            &vfs,
+            root.handle_id,
+            root.handle_id,
+            "old-name.txt",
+            "new-name.txt",
+            61),
+        FILED_OK);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "replaced open file remains readable",
+        filed_vfs_pread_prepare(&vfs, replaced_file.handle_id, 0, 1, &decision),
+        FILED_OK);
+    expect_true("replaced open file backend remains", decision.backend_object == 62);
+
+    expect_status(
+        "renamed child reopens by new name",
+        filed_vfs_open_backend_child(
+            &vfs,
+            root.handle_id,
+            61,
+            FILED_VNODE_REGULAR,
+            "new-name.txt",
+            FILED_RIGHT_READ | FILED_RIGHT_STAT,
+            0,
+            &reopened),
+        FILED_OK);
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "reopened renamed child readable",
+        filed_vfs_pread_prepare(&vfs, reopened.handle_id, 0, 1, &decision),
+        FILED_OK);
+    expect_true("reopened renamed backend", decision.backend_object == 61);
+
+    expect_status("close old rename file", filed_vfs_close_handle(&vfs, old_file.handle_id), FILED_OK);
+    expect_status("close replaced rename file", filed_vfs_close_handle(&vfs, replaced_file.handle_id), FILED_OK);
+    expect_status("close reopened rename file", filed_vfs_close_handle(&vfs, reopened.handle_id), FILED_OK);
+    expect_status("rename lifetime preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
+static void test_mutation_component_validation(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    filed_vfs_io_decision_t first;
+    filed_vfs_io_decision_t second;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for mutation validation",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for mutation validation",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_REMOVE | FILED_RIGHT_RENAME,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+
+    expect_status(
+        "unlink rejects dot",
+        filed_vfs_unlink_prepare(&vfs, root.handle_id, ".", &first),
+        FILED_ERR_INVALID);
+    expect_status(
+        "unlink rejects dotdot",
+        filed_vfs_unlink_prepare(&vfs, root.handle_id, "..", &first),
+        FILED_ERR_INVALID);
+    expect_status(
+        "unlink rejects slash component",
+        filed_vfs_unlink_prepare(&vfs, root.handle_id, "a/b", &first),
+        FILED_ERR_INVALID);
+    expect_status(
+        "rename rejects slash component",
+        filed_vfs_rename_prepare(
+            &vfs,
+            root.handle_id,
+            root.handle_id,
+            "a/b",
+            "c",
+            &first,
+            &second),
+        FILED_ERR_INVALID);
+    expect_status("mutation validation preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
 }
 
 static void test_rights_and_flags(void)
@@ -595,6 +816,9 @@ int main(void)
     test_directory_offset_and_exec_dup();
     test_dup_and_flags();
     test_write_pwrite_and_fsync();
+    test_unlink_keeps_open_files_alive();
+    test_rename_replace_keeps_replaced_open_file_alive();
+    test_mutation_component_validation();
     test_rights_and_flags();
     test_invalid_arguments();
 

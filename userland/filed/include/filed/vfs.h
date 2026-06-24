@@ -165,6 +165,11 @@ typedef struct filed_vfs_handle_flags {
     uint32_t status_flags;
 } filed_vfs_handle_flags_t;
 
+typedef struct filed_vfs_reclaim_result {
+    bool released;
+    filed_backend_object_id_t backend_object;
+} filed_vfs_reclaim_result_t;
+
 const char *filed_status_name(filed_status_t status);
 void filed_vfs_init(filed_vfs_t *vfs);
 bool filed_rights_include(uint32_t available, uint32_t requested);
@@ -195,6 +200,16 @@ filed_status_t filed_vfs_open_backend_child(
     uint32_t open_flags,
     filed_vfs_open_result_t *out_open);
 
+filed_status_t filed_vfs_create_backend_child(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
+    filed_backend_object_id_t child_backend_object,
+    filed_vnode_kind_t child_kind,
+    const char *name,
+    uint32_t rights,
+    uint32_t open_flags,
+    filed_vfs_open_result_t *out_open);
+
 filed_status_t filed_vfs_open_existing(
     filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -210,6 +225,10 @@ filed_status_t filed_vfs_open_parent(
     filed_vfs_open_result_t *out_open);
 
 filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle_id);
+filed_status_t filed_vfs_close_handle_ex(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_reclaim_result_t *out_reclaim);
 
 filed_status_t filed_vfs_dup_handle(
     filed_vfs_t *vfs,
@@ -242,6 +261,12 @@ filed_status_t filed_vfs_lookup_prepare(
     filed_handle_id_t handle_id,
     filed_vfs_io_decision_t *out_decision);
 
+filed_status_t filed_vfs_create_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name,
+    filed_vfs_io_decision_t *out_decision);
+
 filed_status_t filed_vfs_pread_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -255,6 +280,53 @@ filed_status_t filed_vfs_pwrite_prepare(
     uint64_t offset,
     uint64_t length,
     filed_vfs_io_decision_t *out_decision);
+
+filed_status_t filed_vfs_truncate_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t size,
+    filed_vfs_io_decision_t *out_decision);
+
+filed_status_t filed_vfs_unlink_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name,
+    filed_vfs_io_decision_t *out_decision);
+
+filed_status_t filed_vfs_unlink_commit(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name);
+filed_status_t filed_vfs_unlink_commit_ex(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle_id,
+    const char *name,
+    filed_vfs_reclaim_result_t *out_reclaim);
+
+filed_status_t filed_vfs_rename_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t old_parent_handle_id,
+    filed_handle_id_t new_parent_handle_id,
+    const char *old_name,
+    const char *new_name,
+    filed_vfs_io_decision_t *out_old_parent,
+    filed_vfs_io_decision_t *out_new_parent);
+
+filed_status_t filed_vfs_rename_commit(
+    filed_vfs_t *vfs,
+    filed_handle_id_t old_parent_handle_id,
+    filed_handle_id_t new_parent_handle_id,
+    const char *old_name,
+    const char *new_name,
+    filed_backend_object_id_t backend_object);
+filed_status_t filed_vfs_rename_commit_ex(
+    filed_vfs_t *vfs,
+    filed_handle_id_t old_parent_handle_id,
+    filed_handle_id_t new_parent_handle_id,
+    const char *old_name,
+    const char *new_name,
+    filed_backend_object_id_t backend_object,
+    filed_vfs_reclaim_result_t *out_reclaim);
 
 filed_status_t filed_vfs_read_prepare(
     const filed_vfs_t *vfs,

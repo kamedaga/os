@@ -24,6 +24,13 @@ enum {
     KOBOXD_WIRE_FS_STATX = 6,
     KOBOXD_WIRE_FS_GETDENTS = 7,
     KOBOXD_WIRE_FS_FSYNC = 8,
+    KOBOXD_WIRE_FS_CREATE = 9,
+    KOBOXD_WIRE_FS_TRUNCATE = 10,
+    KOBOXD_WIRE_FS_UNLINK = 11,
+    KOBOXD_WIRE_FS_RENAME = 12,
+    KOBOXD_WIRE_FS_MKDIR = 13,
+    KOBOXD_WIRE_FS_RMDIR = 14,
+    KOBOXD_WIRE_FS_RELEASE_OBJECT = 15,
 
     KOBOXD_WIRE_FS_ROOT_OBJECT_ID = 1,
     KOBOXD_WIRE_FS_NAME_BYTES = 96,
@@ -37,6 +44,40 @@ typedef struct koboxd_wire_fs_lookup {
     uint64_t parent_object_id;
     char name[KOBOXD_WIRE_FS_NAME_BYTES];
 } koboxd_wire_fs_lookup_t;
+
+typedef struct koboxd_wire_fs_create {
+    uint64_t parent_object_id;
+    uint64_t mode;
+    char name[KOBOXD_WIRE_FS_NAME_BYTES];
+} koboxd_wire_fs_create_t;
+
+typedef struct koboxd_wire_fs_truncate {
+    uint64_t object_id;
+    uint64_t size;
+} koboxd_wire_fs_truncate_t;
+
+typedef struct koboxd_wire_fs_unlink {
+    uint64_t parent_object_id;
+    char name[KOBOXD_WIRE_FS_NAME_BYTES];
+} koboxd_wire_fs_unlink_t;
+
+typedef struct koboxd_wire_fs_mkdir {
+    uint64_t parent_object_id;
+    uint64_t mode;
+    char name[KOBOXD_WIRE_FS_NAME_BYTES];
+} koboxd_wire_fs_mkdir_t;
+
+typedef struct koboxd_wire_fs_rmdir {
+    uint64_t parent_object_id;
+    char name[KOBOXD_WIRE_FS_NAME_BYTES];
+} koboxd_wire_fs_rmdir_t;
+
+typedef struct koboxd_wire_fs_rename {
+    uint64_t old_parent_object_id;
+    uint64_t new_parent_object_id;
+    char old_name[KOBOXD_WIRE_FS_NAME_BYTES];
+    char new_name[KOBOXD_WIRE_FS_NAME_BYTES];
+} koboxd_wire_fs_rename_t;
 
 typedef struct koboxd_wire_fs_io {
     uint64_t object_id;
