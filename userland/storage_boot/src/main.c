@@ -23,6 +23,9 @@ enum {
     STORAGE_BOOT_MAX_ROOTFS_ELF_BYTES = 16 * 1024 * 1024,
     STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES = 1024 * 1024,
     STORAGE_BOOT_PAGE_SIZE = 4096,
+    STORAGE_BOOT_USER_ASLR_BASE_VA = 0x10000000ull,
+    STORAGE_BOOT_USER_ASLR_END_VA = 0x3b000000ull,
+    STORAGE_BOOT_USER_ASLR_GRANULE = 0x200000ull,
     STORAGE_BOOT_ELF64_EHDR_BYTES = 64,
     STORAGE_BOOT_ELF64_PHDR_BYTES = 56,
     STORAGE_BOOT_ELF_CLASS_64 = 2,
@@ -32,9 +35,17 @@ enum {
     STORAGE_BOOT_ELF_TYPE_DYN = 3,
     STORAGE_BOOT_ELF_MACHINE_X86_64 = 0x3e,
     STORAGE_BOOT_ELF_PT_LOAD = 1,
+    STORAGE_BOOT_ELF_PT_DYNAMIC = 2,
     STORAGE_BOOT_ELF_PF_X = 1,
     STORAGE_BOOT_ELF_PF_W = 2,
     STORAGE_BOOT_ELF_PF_R = 4,
+    STORAGE_BOOT_ELF_DT_NULL = 0,
+    STORAGE_BOOT_ELF_DT_RELA = 7,
+    STORAGE_BOOT_ELF_DT_RELASZ = 8,
+    STORAGE_BOOT_ELF_DT_RELAENT = 9,
+    STORAGE_BOOT_ELF_DT_RELACOUNT = 0x6ffffff9,
+    STORAGE_BOOT_ELF_RELA_BYTES = 24,
+    STORAGE_BOOT_ELF_R_X86_64_RELATIVE = 8,
     STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
     STORAGE_BOOT_BOOTSTRAP_MAX_MODULES = 8,
     STORAGE_BOOT_BOOTSTRAP_NAME_BYTES = 64,
@@ -44,6 +55,12 @@ enum {
     STORAGE_BOOT_AT_PHNUM = 5,
     STORAGE_BOOT_AT_PAGESZ = 6,
     STORAGE_BOOT_AT_BASE = 7,
+    STORAGE_BOOT_AT_ENTRY = 9,
+    STORAGE_BOOT_AT_UID = 11,
+    STORAGE_BOOT_AT_EUID = 12,
+    STORAGE_BOOT_AT_GID = 13,
+    STORAGE_BOOT_AT_EGID = 14,
+    STORAGE_BOOT_AT_SECURE = 23,
     STORAGE_BOOT_AT_RANDOM = 25,
     STORAGE_BOOT_AT_EXECFN = 31,
     STORAGE_BOOT_ROOTFS_GPT_PARTITION_INDEX = 2,
@@ -72,7 +89,8 @@ enum {
     STORAGE_BOOT_DENTRY_NAME_HASH_OFFSET = 0x20,
     STORAGE_BOOT_DENTRY_NAME_LEN_OFFSET = 0x24,
     STORAGE_BOOT_DENTRY_NAME_PTR_OFFSET = 0x28,
-    STORAGE_BOOT_DENTRY_INODE_OFFSET = 0x38,
+    STORAGE_BOOT_DENTRY_INODE_OFFSET = 0x30,
+    STORAGE_BOOT_INODE_MAPPING_OFFSET = 0x30,
     STORAGE_BOOT_FILE_PATH_DENTRY_OFFSET = 0x18,
     STORAGE_BOOT_FILE_MAPPING_OFFSET = 0x20,
     STORAGE_BOOT_FILE_INODE_OFFSET = 0x28,
@@ -81,6 +99,7 @@ enum {
     STORAGE_BOOT_KIOCB_FLAGS_OFFSET = 0x20,
     STORAGE_BOOT_IOV_ITER_COUNT_OFFSET = 0x18,
     STORAGE_BOOT_IOV_ITER_BUFFER_OFFSET = 0x20,
+    STORAGE_BOOT_IOV_ITER_BUFFER_CAPACITY_OFFSET = 0x78,
 };
 
 static const char storage_boot_ext4_file[] = "hello.txt";
@@ -121,27 +140,11 @@ struct storage_boot_seed0root_bootstrap {
     struct storage_boot_bootstrap_module modules[STORAGE_BOOT_BOOTSTRAP_MAX_MODULES];
 };
 
-struct storage_boot_rootfs_module {
-    const char *name;
-    const char *path;
-};
-
 struct storage_boot_module_image {
     const char *name;
-    const char *path;
     unsigned char *data;
     uint64_t size;
     int image_fd;
-};
-
-static const struct storage_boot_rootfs_module storage_boot_rootfs_modules[] = {
-    { "nvme-auth.ko", "/usr/lib/kobox/nvme-auth.ko" },
-    { "nvme-core.ko", "/usr/lib/kobox/nvme-core.ko" },
-    { "nvme.ko", "/usr/lib/kobox/nvme.ko" },
-    { "crc16.ko", "/usr/lib/kobox/crc16.ko" },
-    { "mbcache.ko", "/usr/lib/kobox/mbcache.ko" },
-    { "jbd2.ko", "/usr/lib/kobox/jbd2.ko" },
-    { "ext4.ko", "/usr/lib/kobox/ext4.ko" },
 };
 
 static const char *status_name(kb_status_t status);
@@ -480,9 +483,9 @@ static int ext4_lookup_name_at(
         kb_shim_leave_kernel_gs(old_gs);
     }
 
+    (void)result;
     void *inode = read_pointer_field(dentry, STORAGE_BOOT_DENTRY_INODE_OFFSET);
-    int ok = result == dentry && inode != NULL;
-    if (ok) {
+    if (inode != NULL) {
         *out_inode = inode;
         *out_dentry = dentry;
         return 0;
@@ -605,11 +608,14 @@ static int ext4_file_read_iter(
     void *file = calloc(1, STORAGE_BOOT_FAKE_FILE_BYTES);
     void *kiocb = calloc(1, STORAGE_BOOT_FAKE_KIOCB_BYTES);
     void *iter = calloc(1, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-    void *mapping = calloc(1, STORAGE_BOOT_FAKE_MAPPING_BYTES);
-    uint8_t *read_buffer = calloc(1, expected_size + 1u);
+    void *mapping = read_pointer_field(inode, STORAGE_BOOT_INODE_MAPPING_OFFSET);
+    size_t read_capacity = expected_size + 1u;
+    if (read_capacity < 4096u) {
+        read_capacity = 4096u;
+    }
+    uint8_t *read_buffer = calloc(1, read_capacity);
     if (file == NULL || kiocb == NULL || iter == NULL || mapping == NULL || read_buffer == NULL) {
         free(read_buffer);
-        free(mapping);
         free(iter);
         free(kiocb);
         free(file);
@@ -623,6 +629,7 @@ static int ext4_file_read_iter(
     write_u32_field(kiocb, STORAGE_BOOT_KIOCB_FLAGS_OFFSET, 0);
     write_u64_field(iter, STORAGE_BOOT_IOV_ITER_COUNT_OFFSET, (uint64_t)expected_size);
     write_pointer_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_OFFSET, read_buffer);
+    write_u64_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_CAPACITY_OFFSET, (uint64_t)read_capacity);
 
     unsigned long old_gs = 0;
     unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_read_iter);
@@ -638,7 +645,6 @@ static int ext4_file_read_iter(
         memcmp(read_buffer, expected, expected_size) == 0;
 
     free(read_buffer);
-    free(mapping);
     free(iter);
     free(kiocb);
     free(file);
@@ -667,12 +673,14 @@ static int ext4_file_read_alloc(
     void *file = calloc(1, STORAGE_BOOT_FAKE_FILE_BYTES);
     void *kiocb = calloc(1, STORAGE_BOOT_FAKE_KIOCB_BYTES);
     void *iter = calloc(1, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-    void *mapping = calloc(1, STORAGE_BOOT_FAKE_MAPPING_BYTES);
+    void *mapping = read_pointer_field(inode, STORAGE_BOOT_INODE_MAPPING_OFFSET);
     size_t capacity = max_size < STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES ? max_size : STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES;
+    if (capacity < 4096u) {
+        capacity = 4096u;
+    }
     unsigned char *read_buffer = malloc(capacity);
     if (file == NULL || kiocb == NULL || iter == NULL || mapping == NULL || read_buffer == NULL) {
         free(read_buffer);
-        free(mapping);
         free(iter);
         free(kiocb);
         free(file);
@@ -700,12 +708,13 @@ static int ext4_file_read_alloc(
 
         const uint64_t remaining = max_size - total;
         const uint64_t available = (uint64_t)capacity - total;
-        const uint64_t request_size =
-            remaining < available ? remaining : available;
+        uint64_t request_size = remaining < available ? remaining : available;
+        if (request_size > STORAGE_BOOT_PAGE_SIZE) {
+            request_size = STORAGE_BOOT_PAGE_SIZE;
+        }
         memset(file, 0, STORAGE_BOOT_FAKE_FILE_BYTES);
         memset(kiocb, 0, STORAGE_BOOT_FAKE_KIOCB_BYTES);
         memset(iter, 0, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-        memset(mapping, 0, STORAGE_BOOT_FAKE_MAPPING_BYTES);
 
         write_pointer_field(file, STORAGE_BOOT_FILE_MAPPING_OFFSET, mapping);
         write_pointer_field(file, STORAGE_BOOT_FILE_INODE_OFFSET, inode);
@@ -714,6 +723,7 @@ static int ext4_file_read_alloc(
         write_u32_field(kiocb, STORAGE_BOOT_KIOCB_FLAGS_OFFSET, 0);
         write_u64_field(iter, STORAGE_BOOT_IOV_ITER_COUNT_OFFSET, request_size);
         write_pointer_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_OFFSET, read_buffer + total);
+        write_u64_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_CAPACITY_OFFSET, request_size);
 
         unsigned long old_gs = 0;
         unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_read_iter);
@@ -745,7 +755,6 @@ static int ext4_file_read_alloc(
         total += (uint64_t)result;
     }
 
-    free(mapping);
     free(iter);
     free(kiocb);
     free(file);
@@ -778,9 +787,8 @@ static int ext4_file_write_iter(
     void *file = calloc(1, STORAGE_BOOT_FAKE_FILE_BYTES);
     void *kiocb = calloc(1, STORAGE_BOOT_FAKE_KIOCB_BYTES);
     void *iter = calloc(1, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-    void *mapping = calloc(1, STORAGE_BOOT_FAKE_MAPPING_BYTES);
+    void *mapping = read_pointer_field(inode, STORAGE_BOOT_INODE_MAPPING_OFFSET);
     if (file == NULL || kiocb == NULL || iter == NULL || mapping == NULL) {
-        free(mapping);
         free(iter);
         free(kiocb);
         free(file);
@@ -812,7 +820,6 @@ static int ext4_file_write_iter(
         result > 0 ? (int)(result < 64 ? result : 64) : 0,
         (const char *)payload);
 
-    free(mapping);
     free(iter);
     free(kiocb);
     free(file);
@@ -873,6 +880,7 @@ static int ext4_file_fsync(
 struct storage_boot_loaded_process {
     int process_fd;
     uint64_t runtime_entry;
+    uint64_t load_bias;
     uint64_t phdr_va;
     uint64_t phent;
     uint64_t phnum;
@@ -998,6 +1006,344 @@ static int map_elf_segment(
     return 0;
 }
 
+static int elf_vaddr_to_file_offset(
+    const unsigned char *image,
+    uint64_t image_size,
+    uint64_t vaddr,
+    uint64_t length,
+    uint64_t *out_offset)
+{
+    if (image == NULL || out_offset == NULL || length > image_size) {
+        return -1;
+    }
+    const uint64_t e_phoff = rd64(image + 32);
+    const uint16_t e_phentsize = rd16(image + 54);
+    const uint16_t e_phnum = rd16(image + 56);
+    for (uint16_t i = 0; i < e_phnum; i++) {
+        const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
+        if (rd32(ph + 0) != STORAGE_BOOT_ELF_PT_LOAD) {
+            continue;
+        }
+        const uint64_t p_offset = rd64(ph + 8);
+        const uint64_t p_vaddr = rd64(ph + 16);
+        const uint64_t p_filesz = rd64(ph + 32);
+        if (vaddr < p_vaddr) {
+            continue;
+        }
+        const uint64_t in_segment = vaddr - p_vaddr;
+        if (in_segment > p_filesz || length > p_filesz - in_segment) {
+            continue;
+        }
+        if (p_offset > image_size || in_segment > image_size - p_offset || length > image_size - p_offset - in_segment) {
+            return -1;
+        }
+        *out_offset = p_offset + in_segment;
+        return 0;
+    }
+    return -1;
+}
+
+static int apply_elf_relative_relocations(unsigned char *image, uint64_t image_size, uint64_t load_bias)
+{
+    if (image == NULL || load_bias == 0) {
+        return 0;
+    }
+
+    const uint64_t e_phoff = rd64(image + 32);
+    const uint16_t e_phentsize = rd16(image + 54);
+    const uint16_t e_phnum = rd16(image + 56);
+    uint64_t dynamic_vaddr = 0;
+    uint64_t dynamic_size = 0;
+    for (uint16_t i = 0; i < e_phnum; i++) {
+        const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
+        if (rd32(ph + 0) != STORAGE_BOOT_ELF_PT_DYNAMIC) {
+            continue;
+        }
+        dynamic_vaddr = rd64(ph + 16);
+        dynamic_size = rd64(ph + 40);
+        break;
+    }
+    if (dynamic_vaddr == 0 || dynamic_size < 16) {
+        return 0;
+    }
+
+    uint64_t rela_vaddr = 0;
+    uint64_t rela_size = 0;
+    uint64_t rela_ent = STORAGE_BOOT_ELF_RELA_BYTES;
+    uint64_t rela_count = 0;
+    for (uint64_t cursor = 0; cursor + 16 <= dynamic_size; cursor += 16) {
+        uint64_t dyn_off = 0;
+        if (elf_vaddr_to_file_offset(image, image_size, dynamic_vaddr + cursor, 16, &dyn_off) != 0) {
+            return -1;
+        }
+        const uint64_t tag = rd64(image + dyn_off);
+        const uint64_t value = rd64(image + dyn_off + 8);
+        if (tag == STORAGE_BOOT_ELF_DT_NULL) {
+            break;
+        }
+        switch (tag) {
+        case STORAGE_BOOT_ELF_DT_RELA:
+            rela_vaddr = value;
+            break;
+        case STORAGE_BOOT_ELF_DT_RELASZ:
+            rela_size = value;
+            break;
+        case STORAGE_BOOT_ELF_DT_RELAENT:
+            rela_ent = value;
+            break;
+        case STORAGE_BOOT_ELF_DT_RELACOUNT:
+            rela_count = value;
+            break;
+        default:
+            break;
+        }
+    }
+    if (rela_vaddr == 0 || rela_size == 0) {
+        return 0;
+    }
+    if (rela_ent != STORAGE_BOOT_ELF_RELA_BYTES || (rela_size % rela_ent) != 0) {
+        return -1;
+    }
+
+    uint64_t total = rela_size / rela_ent;
+    if (rela_count != 0) {
+        if (rela_count > total) {
+            return -1;
+        }
+        total = rela_count;
+    }
+    for (uint64_t i = 0; i < total; i++) {
+        uint64_t rela_off = 0;
+        if (elf_vaddr_to_file_offset(image, image_size, rela_vaddr + i * rela_ent, STORAGE_BOOT_ELF_RELA_BYTES, &rela_off) != 0) {
+            return -1;
+        }
+        const uint64_t r_offset = rd64(image + rela_off);
+        const uint64_t r_info = rd64(image + rela_off + 8);
+        const uint64_t r_addend = rd64(image + rela_off + 16);
+        const uint32_t r_type = (uint32_t)(r_info & 0xffffffffu);
+        const uint64_t r_sym = r_info >> 32;
+        if (r_type != STORAGE_BOOT_ELF_R_X86_64_RELATIVE || r_sym != 0) {
+            return -1;
+        }
+        uint64_t target_off = 0;
+        if (elf_vaddr_to_file_offset(image, image_size, r_offset, 8, &target_off) != 0 ||
+            r_addend > UINT64_MAX - load_bias)
+        {
+            return -1;
+        }
+        wr64(image + target_off, load_bias + r_addend);
+    }
+    return 0;
+}
+
+static int apply_elf_relative_relocations_to_window(
+    const unsigned char *image,
+    uint64_t image_size,
+    unsigned char *window,
+    uint64_t window_size,
+    uint64_t min_vaddr,
+    uint64_t load_bias)
+{
+    if (image == NULL || window == NULL || load_bias == 0) {
+        return 0;
+    }
+    const uint64_t e_phoff = rd64(image + 32);
+    const uint16_t e_phentsize = rd16(image + 54);
+    const uint16_t e_phnum = rd16(image + 56);
+    uint64_t dynamic_vaddr = 0;
+    uint64_t dynamic_size = 0;
+    for (uint16_t i = 0; i < e_phnum; i++) {
+        const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
+        if (rd32(ph + 0) == STORAGE_BOOT_ELF_PT_DYNAMIC) {
+            dynamic_vaddr = rd64(ph + 16);
+            dynamic_size = rd64(ph + 40);
+            break;
+        }
+    }
+    if (dynamic_vaddr == 0 || dynamic_size < 16 || dynamic_vaddr < min_vaddr) {
+        return 0;
+    }
+    uint64_t dyn_base = dynamic_vaddr - min_vaddr;
+    if (dyn_base > window_size || dynamic_size > window_size - dyn_base) {
+        return -1;
+    }
+
+    uint64_t rela_vaddr = 0;
+    uint64_t rela_size = 0;
+    uint64_t rela_ent = STORAGE_BOOT_ELF_RELA_BYTES;
+    uint64_t rela_count = 0;
+    for (uint64_t cursor = 0; cursor + 16 <= dynamic_size; cursor += 16) {
+        const uint64_t dyn_off = dyn_base + cursor;
+        const uint64_t tag = rd64(window + dyn_off);
+        const uint64_t value = rd64(window + dyn_off + 8);
+        if (tag == STORAGE_BOOT_ELF_DT_NULL) {
+            break;
+        }
+        switch (tag) {
+        case STORAGE_BOOT_ELF_DT_RELA:
+            rela_vaddr = value;
+            break;
+        case STORAGE_BOOT_ELF_DT_RELASZ:
+            rela_size = value;
+            break;
+        case STORAGE_BOOT_ELF_DT_RELAENT:
+            rela_ent = value;
+            break;
+        case STORAGE_BOOT_ELF_DT_RELACOUNT:
+            rela_count = value;
+            break;
+        default:
+            break;
+        }
+    }
+    if (rela_vaddr == 0 || rela_size == 0) {
+        return 0;
+    }
+    if (rela_ent != STORAGE_BOOT_ELF_RELA_BYTES || (rela_size % rela_ent) != 0 || rela_vaddr < min_vaddr) {
+        return -1;
+    }
+    uint64_t rela_base = rela_vaddr - min_vaddr;
+    if (rela_base > window_size || rela_size > window_size - rela_base) {
+        return -1;
+    }
+    uint64_t total = rela_size / rela_ent;
+    if (rela_count != 0) {
+        if (rela_count > total) {
+            return -1;
+        }
+        total = rela_count;
+    }
+    for (uint64_t i = 0; i < total; i++) {
+        const uint64_t rela_off = rela_base + i * rela_ent;
+        const uint64_t r_offset = rd64(window + rela_off);
+        const uint64_t r_info = rd64(window + rela_off + 8);
+        const uint64_t r_addend = rd64(window + rela_off + 16);
+        const uint32_t r_type = (uint32_t)(r_info & 0xffffffffu);
+        const uint64_t r_sym = r_info >> 32;
+        if (r_type != STORAGE_BOOT_ELF_R_X86_64_RELATIVE || r_sym != 0 ||
+            r_offset < min_vaddr || r_addend > UINT64_MAX - load_bias)
+        {
+            return -1;
+        }
+        const uint64_t target_off = r_offset - min_vaddr;
+        if (target_off > window_size || 8 > window_size - target_off) {
+            return -1;
+        }
+        wr64(window + target_off, load_bias + r_addend);
+    }
+    return 0;
+}
+
+static int load_elf_process_single_window(
+    const char *path,
+    const unsigned char *image,
+    uint64_t image_size,
+    struct storage_boot_loaded_process *out)
+{
+    const uint64_t e_entry = rd64(image + 24);
+    const uint64_t e_phoff = rd64(image + 32);
+    const uint16_t e_phentsize = rd16(image + 54);
+    const uint16_t e_phnum = rd16(image + 56);
+    uint64_t min_vaddr = UINT64_MAX;
+    uint64_t max_vaddr = 0;
+    uint16_t load_count = 0;
+    for (uint16_t i = 0; i < e_phnum; i++) {
+        const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
+        if (rd32(ph + 0) != STORAGE_BOOT_ELF_PT_LOAD) {
+            continue;
+        }
+        const uint64_t p_vaddr = rd64(ph + 16);
+        const uint64_t p_memsz = rd64(ph + 40);
+        const uint64_t start = align_down(p_vaddr);
+        uint64_t end = 0;
+        if (p_memsz == 0 || p_vaddr > UINT64_MAX - p_memsz ||
+            align_up(p_vaddr + p_memsz, &end) != 0) {
+            return -1;
+        }
+        if (start < min_vaddr) min_vaddr = start;
+        if (end > max_vaddr) max_vaddr = end;
+        load_count++;
+    }
+    if (load_count == 0 || min_vaddr == UINT64_MAX || max_vaddr <= min_vaddr) {
+        return -1;
+    }
+    const uint64_t window_size = max_vaddr - min_vaddr;
+    const uint64_t vmo_rights =
+        STORAGE_BOOT_FD_RIGHT_INSPECT |
+        STORAGE_BOOT_FD_RIGHT_TRANSFER |
+        STORAGE_BOOT_FD_RIGHT_CLOSE |
+        STORAGE_BOOT_FD_RIGHT_MAP_READ |
+        STORAGE_BOOT_FD_RIGHT_MAP_WRITE |
+        STORAGE_BOOT_FD_RIGHT_MAP_EXEC;
+    const int vmo_fd = pacha_vmo_create(window_size, vmo_rights, 0);
+    if (vmo_fd < 16) {
+        return -2;
+    }
+    unsigned char *window = pacha_mmap(vmo_fd, window_size, STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE, STORAGE_BOOT_MMAP_SHARED, 0);
+    if (window == NULL) {
+        (void)pacha_fd_close(vmo_fd);
+        return -3;
+    }
+    memset(window, 0, (size_t)window_size);
+    for (uint16_t i = 0; i < e_phnum; i++) {
+        const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
+        if (rd32(ph + 0) != STORAGE_BOOT_ELF_PT_LOAD) {
+            continue;
+        }
+        const uint64_t p_offset = rd64(ph + 8);
+        const uint64_t p_vaddr = rd64(ph + 16);
+        const uint64_t p_filesz = rd64(ph + 32);
+        const uint64_t dst_off = p_vaddr - min_vaddr;
+        if (p_offset > image_size || p_filesz > image_size - p_offset ||
+            dst_off > window_size || p_filesz > window_size - dst_off) {
+            (void)pacha_munmap(window, window_size);
+            (void)pacha_fd_close(vmo_fd);
+            return -4;
+        }
+        memcpy(window + dst_off, image + p_offset, (size_t)p_filesz);
+    }
+    if (window_size > STORAGE_BOOT_USER_ASLR_END_VA - STORAGE_BOOT_USER_ASLR_BASE_VA) {
+        (void)pacha_munmap(window, window_size);
+        (void)pacha_fd_close(vmo_fd);
+        return -5;
+    }
+    const uint64_t target_base = 0x20000000ull;
+    const uint64_t load_bias = target_base - min_vaddr;
+    const int reloc_status = apply_elf_relative_relocations_to_window(
+        image,
+        image_size,
+        window,
+        window_size,
+        min_vaddr,
+        load_bias);
+    if (reloc_status != 0) {
+        (void)pacha_munmap(window, window_size);
+        (void)pacha_fd_close(vmo_fd);
+        return -6;
+    }
+    const long map_result = pacha_process_map(
+        out->process_fd,
+        vmo_fd,
+        target_base,
+        window_size,
+        STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE | STORAGE_BOOT_PROT_EXEC,
+        0);
+    if (map_result < 4096) {
+        (void)pacha_munmap(window, window_size);
+        (void)pacha_fd_close(vmo_fd);
+        return -7;
+    }
+    (void)pacha_munmap(window, window_size);
+    (void)pacha_fd_close(vmo_fd);
+    out->runtime_entry = e_entry + load_bias;
+    out->load_bias = load_bias;
+    out->phdr_va = load_bias + e_phoff;
+    out->phent = e_phentsize;
+    out->phnum = e_phnum;
+    out->load_segments = load_count;
+    return 0;
+}
+
 static int load_elf_process(
     const char *path,
     const unsigned char *image,
@@ -1034,8 +1380,22 @@ static int load_elf_process(
         fprintf(stderr, "[storage_boot] exec: process_create failed status=%d\n", process_fd);
         return -7;
     }
+    out->process_fd = process_fd;
+
+    if (use_aslr) {
+        status = load_elf_process_single_window(path, image, image_size, out);
+        if (status != 0) {
+            fprintf(stderr, "[storage_boot] exec: %s single-window load failed status=%d\n", path, status);
+            (void)pacha_fd_close(process_fd);
+            memset(out, 0, sizeof(*out));
+            out->process_fd = -1;
+            return status;
+        }
+        return 0;
+    }
 
     uint16_t load_count = 0;
+    int relocated = 0;
     for (uint16_t i = 0; i < e_phnum; i++) {
         const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
         if (rd32(ph + 0) != STORAGE_BOOT_ELF_PT_LOAD) {
@@ -1051,6 +1411,13 @@ static int load_elf_process(
         }
         if (use_aslr && load_count == 0) {
             load_bias = mapped_va - align_down(p_vaddr);
+            status = apply_elf_relative_relocations((unsigned char *)image, image_size, load_bias);
+            if (status != 0) {
+                fprintf(stderr, "[storage_boot] exec: %s relocation failed status=%d\n", path, status);
+                (void)pacha_fd_close(process_fd);
+                return -8;
+            }
+            relocated = 1;
         }
         load_count++;
     }
@@ -1059,9 +1426,17 @@ static int load_elf_process(
         (void)pacha_fd_close(process_fd);
         return -6;
     }
+    if (!relocated) {
+        status = apply_elf_relative_relocations((unsigned char *)image, image_size, load_bias);
+        if (status != 0) {
+            fprintf(stderr, "[storage_boot] exec: %s relocation failed status=%d\n", path, status);
+            (void)pacha_fd_close(process_fd);
+            return -8;
+        }
+    }
 
-    out->process_fd = process_fd;
     out->runtime_entry = e_entry + load_bias;
+    out->load_bias = load_bias;
     out->phdr_va = load_bias + e_phoff;
     out->phent = e_phentsize;
     out->phnum = e_phnum;
@@ -1151,6 +1526,12 @@ static int start_loaded_process(
         (bootstrap_fd >= 16 && (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 || push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, argv0_va) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_RANDOM) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_SECURE) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_EGID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_GID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_EUID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_UID) != 0 ||
+        push_u64(stack, &sp, loaded->runtime_entry) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_ENTRY) != 0 ||
         push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_BASE) != 0 ||
         push_u64(stack, &sp, STORAGE_BOOT_PAGE_SIZE) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_PAGESZ) != 0 ||
         push_u64(stack, &sp, loaded->phnum) != 0 || push_u64(stack, &sp, STORAGE_BOOT_AT_PHNUM) != 0 ||
@@ -1277,67 +1658,16 @@ static void free_bootstrap_module_images(struct storage_boot_module_image *image
     }
 }
 
-static int read_bootstrap_module_images(
-    kb_module_t *ext4_module,
-    const storage_boot_ext4_operations_t *ops,
-    const kb_fs_mount_path_probe_t *probe,
-    struct storage_boot_module_image *images,
-    size_t image_count)
-{
-    if (images == NULL || image_count > STORAGE_BOOT_BOOTSTRAP_MAX_MODULES) {
-        return -22;
-    }
-
-    for (size_t i = 0; i < image_count; i++) {
-        images[i].name = storage_boot_rootfs_modules[i].name;
-        images[i].path = storage_boot_rootfs_modules[i].path;
-        images[i].data = NULL;
-        images[i].size = 0;
-        images[i].image_fd = -1;
-
-        void *inode = NULL;
-        int status = ext4_lookup_path(
-            ext4_module,
-            ops,
-            probe,
-            images[i].path,
-            &inode);
-        if (status != 0) {
-            fprintf(stderr, "[storage_boot] seed0root: lookup %s failed status=%d\n",
-                images[i].path,
-                status);
-            return status;
-        }
-
-        status = ext4_file_read_alloc(
-            ext4_module,
-            ops,
-            inode,
-            0,
-            STORAGE_BOOT_MAX_ROOTFS_ELF_BYTES,
-            &images[i].data,
-            &images[i].size,
-            images[i].name);
-        if (status != 0) {
-            fprintf(stderr, "[storage_boot] seed0root: read %s failed status=%d\n",
-                images[i].path,
-                status);
-            return status;
-        }
-        images[i].image_fd = create_inherited_vmo_from_bytes(images[i].data, images[i].size, images[i].name);
-        if (images[i].image_fd < 16) {
-            return -12;
-        }
-    }
-
-    return 0;
-}
-
 static int launch_seed0root_from_ext4(
     kb_module_t *ext4_module,
     const kb_fs_mount_path_probe_t *probe,
-    uint64_t device_fd)
+    uint64_t device_fd,
+    const struct storage_boot_module_image *module_images,
+    size_t module_count)
 {
+    if (module_images == NULL || module_count == 0 || module_count > STORAGE_BOOT_BOOTSTRAP_MAX_MODULES) {
+        return 21;
+    }
     storage_boot_ext4_operations_t ops;
     if (!probe_ext4_operation_tables(ext4_module, &ops)) {
         fprintf(stderr, "[storage_boot] seed0root: ext4 operation table probe failed\n");
@@ -1439,27 +1769,15 @@ static int launch_seed0root_from_ext4(
         return 28;
     }
 
-    enum {
-        module_count = sizeof(storage_boot_rootfs_modules) / sizeof(storage_boot_rootfs_modules[0]),
-    };
-    struct storage_boot_module_image module_images[module_count];
-    memset(module_images, 0, sizeof(module_images));
-    status = read_bootstrap_module_images(
-        ext4_module,
-        &ops,
-        probe,
-        module_images,
-        module_count);
-    if (status != 0) {
-        free(image);
-        free(koboxd_image);
-        (void)pacha_fd_close(koboxd_image_fd);
-        free_bootstrap_module_images(module_images, module_count);
-        return 30;
-    }
     struct storage_boot_bootstrap_module module_table[module_count];
     memset(module_table, 0, sizeof(module_table));
     for (size_t i = 0; i < module_count; i++) {
+        if (module_images[i].name == NULL || module_images[i].image_fd < 16 || module_images[i].size == 0) {
+            free(image);
+            free(koboxd_image);
+            (void)pacha_fd_close(koboxd_image_fd);
+            return 30;
+        }
         snprintf(module_table[i].name, sizeof(module_table[i].name), "%s", module_images[i].name);
         module_table[i].image_fd = (uint64_t)(uint32_t)module_images[i].image_fd;
         module_table[i].image_size = module_images[i].size;
@@ -1478,7 +1796,6 @@ static int launch_seed0root_from_ext4(
     status = mark_fd_inherit((int)device_fd, "seed0root device fd");
     if (status != 0) {
         free(image);
-        free_bootstrap_module_images(module_images, module_count);
         (void)pacha_fd_close(koboxd_image_fd);
         return 31;
     }
@@ -1486,7 +1803,6 @@ static int launch_seed0root_from_ext4(
     const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
     if (bootstrap_fd < 16) {
         free(image);
-        free_bootstrap_module_images(module_images, module_count);
         (void)pacha_fd_close(koboxd_image_fd);
         return 32;
     }
@@ -1497,12 +1813,10 @@ static int launch_seed0root_from_ext4(
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
         (void)pacha_fd_close(koboxd_image_fd);
-        free_bootstrap_module_images(module_images, module_count);
         fprintf(stderr, "[storage_boot] seed0root: ELF load failed status=%d\n", status);
         return 25;
     }
     status = start_loaded_process(&loaded, storage_boot_seed0root_argv0, bootstrap_fd);
-    free_bootstrap_module_images(module_images, module_count);
     (void)pacha_fd_close(bootstrap_fd);
     (void)pacha_fd_close(koboxd_image_fd);
     if (status != 0) {
@@ -1516,12 +1830,17 @@ static int launch_seed0root_from_ext4(
 static int load_modules(
     const struct storage_boot_config *cfg,
     kb_device_backend_t *backend,
-    kb_module_t **out_ext4_module)
+    kb_module_t **out_ext4_module,
+    struct storage_boot_module_image *out_seed0root_modules,
+    size_t out_seed0root_module_count)
 {
     kb_module_t *modules[STORAGE_BOOT_MAX_MODULES];
     memset(modules, 0, sizeof(modules));
     if (out_ext4_module != NULL) {
         *out_ext4_module = NULL;
+    }
+    if (out_seed0root_modules != NULL && out_seed0root_module_count < cfg->module_count) {
+        return 4;
     }
     for (uint64_t i = 0; i < cfg->module_count; i++) {
         const struct storage_boot_module_config *module_cfg = &cfg->modules[i];
@@ -1537,7 +1856,21 @@ static int load_modules(
             return 4;
         }
         if (read_fd_exact((int)module_cfg->image_fd, module_bytes, module_cfg->image_size, module_cfg->name) != 0) {
+            free(module_bytes);
             return 4;
+        }
+        if (out_seed0root_modules != NULL) {
+            out_seed0root_modules[i].name = module_cfg->name;
+            out_seed0root_modules[i].data = NULL;
+            out_seed0root_modules[i].size = module_cfg->image_size;
+            out_seed0root_modules[i].image_fd = create_inherited_vmo_from_bytes(
+                module_bytes,
+                module_cfg->image_size,
+                module_cfg->name);
+            if (out_seed0root_modules[i].image_fd < 16) {
+                free(module_bytes);
+                return 4;
+            }
         }
         const kb_module_image_t image = {
             .data = module_bytes,
@@ -1550,6 +1883,7 @@ static int load_modules(
                 module_cfg->name,
                 status_name(status),
                 status);
+            free(module_bytes);
             return 4;
         }
         if (out_ext4_module != NULL && strcmp(module_cfg->name, "ext4.ko") == 0) {
@@ -1627,12 +1961,21 @@ int main(int argc, char **argv)
     }
 
     kb_module_t *ext4_module = NULL;
-    int load_status = load_modules(&cfg, backend, &ext4_module);
+    struct storage_boot_module_image seed0root_modules[STORAGE_BOOT_MAX_MODULES];
+    memset(seed0root_modules, 0, sizeof(seed0root_modules));
+    int load_status = load_modules(
+        &cfg,
+        backend,
+        &ext4_module,
+        seed0root_modules,
+        STORAGE_BOOT_MAX_MODULES);
     if (load_status != 0) {
+        free_bootstrap_module_images(seed0root_modules, cfg.module_count);
         return load_status;
     }
     if (ext4_module == NULL) {
         fprintf(stderr, "[storage_boot] ext4.ko was not loaded\n");
+        free_bootstrap_module_images(seed0root_modules, cfg.module_count);
         return 5;
     }
 
@@ -1680,7 +2023,13 @@ int main(int argc, char **argv)
 
     printf("[storage_boot] rootfs ready fs=ext4 reads=%u\n", probe.block_read_count);
 
-    int seed0root_status = launch_seed0root_from_ext4(ext4_module, &probe, cfg.device_fd);
+    int seed0root_status = launch_seed0root_from_ext4(
+        ext4_module,
+        &probe,
+        cfg.device_fd,
+        seed0root_modules,
+        cfg.module_count);
+    free_bootstrap_module_images(seed0root_modules, cfg.module_count);
     if (seed0root_status != 0) {
         return seed0root_status;
     }

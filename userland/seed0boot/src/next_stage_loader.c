@@ -26,6 +26,12 @@ enum {
     SEED0_AT_PHNUM = 5,
     SEED0_AT_PAGESZ = 6,
     SEED0_AT_BASE = 7,
+    SEED0_AT_ENTRY = 9,
+    SEED0_AT_UID = 11,
+    SEED0_AT_EUID = 12,
+    SEED0_AT_GID = 13,
+    SEED0_AT_EGID = 14,
+    SEED0_AT_SECURE = 23,
     SEED0_AT_RANDOM = 25,
     SEED0_AT_EXECFN = 31,
 };
@@ -331,6 +337,12 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
         (bootstrap_fd >= 16 && (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 || push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, argv0_va) != 0 || push_u64(stack, &sp, SEED0_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 || push_u64(stack, &sp, SEED0_AT_RANDOM) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_SECURE) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_EGID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_GID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_EUID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_UID) != 0 ||
+        push_u64(stack, &sp, loaded->runtime_entry) != 0 || push_u64(stack, &sp, SEED0_AT_ENTRY) != 0 ||
         push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0_AT_BASE) != 0 ||
         push_u64(stack, &sp, SEED0_PAGE_SIZE) != 0 || push_u64(stack, &sp, SEED0_AT_PAGESZ) != 0 ||
         push_u64(stack, &sp, loaded->phnum) != 0 || push_u64(stack, &sp, SEED0_AT_PHNUM) != 0 ||
@@ -436,6 +448,7 @@ int seed0_load_elf_process(
 
     out->process_fd = process_fd;
     out->runtime_entry = e_entry + load_bias;
+    out->load_bias = load_bias;
     out->phdr_va = load_bias + e_phoff;
     out->phent = e_phentsize;
     out->phnum = e_phnum;

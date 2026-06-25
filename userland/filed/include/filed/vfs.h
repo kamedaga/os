@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #define FILED_MAX_MOUNTS 16u
 #define FILED_MAX_VNODES 256u
@@ -16,6 +17,10 @@ typedef uint32_t filed_handle_id_t;
 typedef uint32_t filed_backend_id_t;
 typedef uint64_t filed_backend_object_id_t;
 typedef uint32_t filed_generation_t;
+
+typedef struct filed_lock {
+    atomic_flag flag;
+} filed_lock_t;
 
 typedef enum filed_status {
     FILED_OK = 0,
@@ -111,6 +116,7 @@ typedef struct filed_vnode {
     char name[64];
     filed_generation_t generation;
     uint32_t refcount;
+    filed_lock_t lock;
 } filed_vnode_t;
 
 typedef struct filed_open_file {
@@ -121,6 +127,8 @@ typedef struct filed_open_file {
     uint32_t status_flags;
     uint32_t rights;
     uint32_t refcount;
+    filed_lock_t lock;
+    filed_lock_t offset_lock;
 } filed_open_file_t;
 
 typedef filed_open_file_t filed_file_t;

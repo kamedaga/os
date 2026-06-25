@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -25,9 +27,12 @@ static void log_text(const char *s) {
 }
 
 int main(int argc, char **argv, char **envp) {
-    (void)argc;
-    (void)argv;
     (void)envp;
+    const int exit_after_ok =
+        argc > 1 &&
+        argv != NULL &&
+        argv[1] != NULL &&
+        strcmp(argv[1], "--exit-after-ok") == 0;
 
     printf("[pachaos-musl-smoke] hello from crt/syscall scaffold stdout=%d\n", 1);
     fprintf(stderr, "[pachaos-musl-smoke] stderr online\n");
@@ -224,11 +229,89 @@ int main(int argc, char **argv, char **envp) {
         return 36;
     }
 
+    const char *fs_path = "/lib/pachaos-libc-smoke.txt";
+    int fs_fd = open(fs_path, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    if (fs_fd < 0) {
+        if (errno == EBADF || errno == ENOSYS || errno == ENOTSUP || errno == EOPNOTSUPP) {
+            log_text("[pachaos-musl-smoke] filed backend skipped\n");
+            goto filed_backend_done;
+        }
+        log_text("[pachaos-musl-smoke] filed open create failed\n");
+        return 37;
+    }
+    const char *fs_msg = "filed-libc-ok\n";
+    const size_t fs_len = strlen(fs_msg);
+    if (write(fs_fd, fs_msg, fs_len) != (ssize_t)fs_len) {
+        log_text("[pachaos-musl-smoke] filed write failed\n");
+        return 38;
+    }
+    memset(&st, 0, sizeof(st));
+    errno = 0;
+    int fs_stat_status = fstat(fs_fd, &st);
+    if (fs_stat_status != 0 || st.st_size < (off_t)fs_len) {
+        fprintf(stderr,
+            "[pachaos-musl-smoke] filed fstat failed status=%d errno=%d size=%lld want=%llu\n",
+            fs_stat_status,
+            errno,
+            (long long)st.st_size,
+            (unsigned long long)fs_len);
+        log_text("[pachaos-musl-smoke] filed fstat failed\n");
+        return 39;
+    }
+    if (close(fs_fd) != 0) {
+        log_text("[pachaos-musl-smoke] filed close write failed\n");
+        return 40;
+    }
+
+    int root_fd = open("/", O_RDONLY | O_DIRECTORY);
+    if (root_fd < 0) {
+        log_text("[pachaos-musl-smoke] filed open root dir failed\n");
+        return 41;
+    }
+    struct dirent dents[16];
+    int dent_bytes = getdents(root_fd, dents, sizeof(dents));
+    if (dent_bytes <= 0) {
+        log_text("[pachaos-musl-smoke] filed getdents failed\n");
+        return 42;
+    }
+    int rel_fd = openat(root_fd, "lib/pachaos-libc-smoke.txt", O_RDONLY);
+    if (rel_fd < 0) {
+        log_text("[pachaos-musl-smoke] filed openat relative failed\n");
+        return 43;
+    }
+    char fs_buf[32];
+    memset(fs_buf, 0, sizeof(fs_buf));
+    if (read(rel_fd, fs_buf, fs_len) != (ssize_t)fs_len ||
+        memcmp(fs_buf, fs_msg, fs_len) != 0)
+    {
+        log_text("[pachaos-musl-smoke] filed read failed\n");
+        return 44;
+    }
+    if (close(rel_fd) != 0 || close(root_fd) != 0) {
+        log_text("[pachaos-musl-smoke] filed close read failed\n");
+        return 45;
+    }
+
+    errno = 0;
+    char *const exec_argv[] = { (char *)"/no-such-pachaos-libc-exec", 0 };
+    char *const exec_envp[] = { 0 };
+    int exec_status = execve("/no-such-pachaos-libc-exec", exec_argv, exec_envp);
+    if (exec_status != -1 || errno != ENOENT) {
+        fprintf(stderr,
+            "[pachaos-musl-smoke] filed execve negative path failed status=%d errno=%d\n",
+            exec_status,
+            errno);
+        log_text("[pachaos-musl-smoke] filed execve negative path failed\n");
+        return 46;
+    }
+filed_backend_done:
+
     if (close(1) != 0) {
         log_text("[pachaos-musl-smoke] close stdout failed\n");
         return 18;
     }
     fprintf(stderr, "[pachaos-musl-smoke] OK\n");
     fflush(stderr);
+    if (exit_after_ok) return 0;
     for (;;) __asm__ volatile("pause");
 }

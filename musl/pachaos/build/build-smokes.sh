@@ -15,6 +15,7 @@ app_out="${1:-$out_dir/hello-libc-scaffold.elf}"
 extra_sources="${PACHAOS_MUSL_EXTRA_SOURCES:-}"
 extra_include_dirs="${PACHAOS_MUSL_EXTRA_INCLUDE_DIRS:-}"
 extra_cflags="${PACHAOS_MUSL_EXTRA_CFLAGS:-}"
+static_pie="${PACHAOS_MUSL_STATIC_PIE:-1}"
 
 rm -rf "$obj_dir" "$sysroot"
 mkdir -p \
@@ -187,7 +188,11 @@ libc_sources=(
   "$upstream/src/internal/intscan.c"
   "$upstream/src/internal/shgetc.c"
   "$upstream/src/fcntl/open.c"
+  "$upstream/src/fcntl/openat.c"
   "$upstream/src/fcntl/fcntl.c"
+  "$upstream/src/linux/getdents.c"
+  "$upstream/src/process/execve.c"
+  "$upstream/src/thread/pachaos/filed_runtime.c"
   "$repo_root/musl/pachaos/syscall/thread_area.c"
 )
 
@@ -218,13 +223,17 @@ app_cflags=(
   -std=c99
   -fno-stack-protector
   -fno-plt
-  -fPIE
   -mno-red-zone
   -O2
   -Wall
   -Wextra
   -D_XOPEN_SOURCE=700
 )
+if [ "$static_pie" != "0" ]; then
+  app_cflags+=("-fPIE")
+else
+  app_cflags+=("-fno-pie")
+fi
 for include_dir in $extra_include_dirs; do
   app_cflags+=("-I" "$include_dir")
 done
@@ -249,23 +258,32 @@ for src in $extra_sources; do
   extra_index=$((extra_index + 1))
 done
 
+link_flags=(
+  -target "$target"
+  --sysroot "$sysroot"
+  -nostdlib
+  -nostartfiles
+  -static
+  -fuse-ld=lld
+  -fno-stack-protector
+  -fno-plt
+  -mno-red-zone
+  -Wl,-e,_start
+  -Wl,--no-dynamic-linker
+  -Wl,-z,common-page-size=4096
+  -Wl,-z,max-page-size=4096
+)
+if [ "$static_pie" != "0" ]; then
+  link_flags+=("-fPIE" "-Wl,-pie")
+  crt_start="$sysroot/usr/lib/rcrt1.o"
+else
+  link_flags+=("-fno-pie" "-Wl,-no-pie")
+  crt_start="$sysroot/usr/lib/crt1.o"
+fi
+
 "$cc" \
-  -target "$target" \
-  --sysroot "$sysroot" \
-  -nostdlib \
-  -nostartfiles \
-  -static \
-  -fuse-ld=lld \
-  -fno-stack-protector \
-  -fno-plt \
-  -fPIE \
-  -mno-red-zone \
-  -Wl,-e,_start \
-  -Wl,-pie \
-  -Wl,--no-dynamic-linker \
-  -Wl,-z,common-page-size=4096 \
-  -Wl,-z,max-page-size=4096 \
-  "$sysroot/usr/lib/rcrt1.o" \
+  "${link_flags[@]}" \
+  "$crt_start" \
   "$sysroot/usr/lib/crti.o" \
   "${app_objects[@]}" \
   -Wl,--start-group \

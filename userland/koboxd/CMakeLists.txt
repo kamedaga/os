@@ -70,8 +70,11 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_input.c
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_work.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/control_endpoint.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/fs_endpoint.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_wire.c
 )
 
 string(REPLACE ";" " " KOBOXD_RUNTIME_SOURCES_ENV "${KOBOXD_RUNTIME_SOURCES}")
@@ -90,10 +93,16 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/koboxd/ipc_protocol.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/control_endpoint.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/control_endpoint.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_endpoint.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_endpoint.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_wire.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_wire.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOXD_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"

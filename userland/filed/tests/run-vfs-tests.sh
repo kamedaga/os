@@ -12,6 +12,7 @@ mkdir -p "${build_dir}"
   -Wall \
   -Wextra \
   -Werror \
+  -pthread \
   -I"${repo_root}/userland/filed/include" \
   "${repo_root}/userland/filed/src/vfs.c" \
   "${repo_root}/userland/filed/tests/vfs_test.c" \

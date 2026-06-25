@@ -6,6 +6,7 @@
 struct seed0_loaded_process {
     int process_fd;
     uint64_t runtime_entry;
+    uint64_t load_bias;
     uint64_t phdr_va;
     uint64_t phent;
     uint64_t phnum;

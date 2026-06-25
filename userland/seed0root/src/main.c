@@ -1,8 +1,6 @@
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 #include "filed/bootstrap.h"
-#include "filed/ipc_protocol.h"
-#include "filed_smoke/bootstrap.h"
 #include "koboxd/ipc_protocol.h"
 
 #include <stdint.h>
@@ -36,11 +34,14 @@ enum {
     SEED0ROOT_AT_PHNUM = 5,
     SEED0ROOT_AT_PAGESZ = 6,
     SEED0ROOT_AT_BASE = 7,
+    SEED0ROOT_AT_ENTRY = 9,
+    SEED0ROOT_AT_UID = 11,
+    SEED0ROOT_AT_EUID = 12,
+    SEED0ROOT_AT_GID = 13,
+    SEED0ROOT_AT_EGID = 14,
+    SEED0ROOT_AT_SECURE = 23,
     SEED0ROOT_AT_RANDOM = 25,
     SEED0ROOT_AT_EXECFN = 31,
-    SEED0ROOT_PROCESS_STATE_EXITED = 2,
-    SEED0ROOT_PROCESS_STATE_KILLED = 3,
-    SEED0ROOT_PROCESS_WAIT_ATTEMPTS = 30000,
 };
 
 struct seed0root_bootstrap_module {
@@ -69,6 +70,7 @@ struct seed0root_koboxd_bootstrap {
 struct seed0root_loaded_process {
     int process_fd;
     uint64_t runtime_entry;
+    uint64_t load_bias;
     uint64_t phdr_va;
     uint64_t phent;
     uint64_t phnum;
@@ -92,7 +94,6 @@ static int start_loaded_process(
     const char *argv0,
     int bootstrap_fd,
     struct seed0root_started_process *out_started);
-static int wait_started_process(const char *label, const struct seed0root_started_process *started);
 
 static uint16_t rd16(const unsigned char *p)
 {
@@ -774,178 +775,6 @@ static int seed0root_read_rootfs_file(int fs_fd, const char *path, unsigned char
     return 0;
 }
 
-static int wait_started_process(const char *label, const struct seed0root_started_process *started)
-{
-    if (label == NULL || started == NULL || started->process_fd < 16) {
-        return -1;
-    }
-
-    uint64_t status_words[4] = {0, 0, 0, 0};
-    for (unsigned attempt = 0; attempt < SEED0ROOT_PROCESS_WAIT_ATTEMPTS; attempt++) {
-        const long wait_status = pacha_syscall2(
-            PACHA_PROCESS_SYSCALL_WAIT,
-            (uint64_t)(uint32_t)started->process_fd,
-            (uint64_t)(uintptr_t)status_words);
-        if (wait_status == 0) {
-            if (status_words[0] == SEED0ROOT_PROCESS_STATE_EXITED && status_words[1] == 0) {
-                return 0;
-            }
-            fprintf(stderr,
-                "[seed0root] %s exited state=%llu code=%llu id=%llu gen=%llu\n",
-                label,
-                (unsigned long long)status_words[0],
-                (unsigned long long)status_words[1],
-                (unsigned long long)status_words[2],
-                (unsigned long long)status_words[3]);
-            return -2;
-        }
-        if (wait_status != PACHA_SYSCALL_ERR_NOT_READY && wait_status != PACHA_ERR_NOT_READY) {
-            fprintf(stderr, "[seed0root] %s wait failed status=%ld\n", label, wait_status);
-            return -3;
-        }
-
-        struct pacha_pollfd pollfd = {
-            .fd = started->process_fd,
-            .events = PACHA_FD_EVENT_READABLE,
-            .revents = 0,
-        };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
-    }
-
-    fprintf(stderr, "[seed0root] %s wait timed out attempts=%u\n",
-        label,
-        (unsigned)SEED0ROOT_PROCESS_WAIT_ATTEMPTS);
-    return -4;
-}
-
-static int launch_filed_smoke_via_filed(int filed_endpoint_fd)
-{
-    if (filed_endpoint_fd < 16) {
-        return -1;
-    }
-
-    int page_fd = -1;
-    void *page = NULL;
-    int status = seed0root_create_wire_page(&page_fd, &page);
-    if (status != 0) {
-        return status;
-    }
-
-    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
-    memset(exec, 0, sizeof(*exec));
-    exec->dir_handle = 0;
-    exec->flags =
-        FILED_WIRE_EXEC_BOOTSTRAP_FD |
-        FILED_WIRE_EXEC_INHERIT_FDS |
-        FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS;
-    exec->inherit_fd_count = 1;
-    exec->fd_patch_count = 1;
-    exec->fd_patches[0].kind = FILED_WIRE_EXEC_PATCH_INHERIT_FD;
-    exec->fd_patches[0].index = 0;
-    exec->fd_patches[0].offset = offsetof(filed_smoke_bootstrap_t, public_endpoint_fd);
-    snprintf(exec->path, sizeof(exec->path), "%s", "/sbin/filed_smoke.elf");
-    snprintf(exec->argv0, sizeof(exec->argv0), "%s", "/sbin/filed_smoke.elf");
-
-    const filed_smoke_bootstrap_t bootstrap = {
-        .magic = FILED_SMOKE_BOOTSTRAP_MAGIC,
-        .public_endpoint_fd = 0,
-        .flags = 0,
-        .reserved0 = 0,
-    };
-    const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap, sizeof(bootstrap), "filed smoke bootstrap fd");
-    if (bootstrap_fd < 16) {
-        seed0root_destroy_wire_page(page_fd, page);
-        fprintf(stderr, "[seed0root] filed smoke bootstrap fd create failed status=%d\n", bootstrap_fd);
-        return bootstrap_fd;
-    }
-
-    struct pacha_ipc_fd request_fds[3];
-    memset(request_fds, 0, sizeof(request_fds));
-    request_fds[0].fd = (uint64_t)(uint32_t)page_fd;
-    request_fds[0].rights =
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-    request_fds[0].flags = 0;
-    request_fds[0].transfer_flags = 0;
-    request_fds[1].fd = (uint64_t)(uint32_t)filed_endpoint_fd;
-    request_fds[1].rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_SET_FLAGS |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_CALL;
-    request_fds[1].flags = 0;
-    request_fds[1].transfer_flags = 0;
-    request_fds[2].fd = (uint64_t)(uint32_t)bootstrap_fd;
-    request_fds[2].rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_SET_FLAGS |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_READ |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-    request_fds[2].flags = 0;
-    request_fds[2].transfer_flags = 0;
-
-    const struct pacha_ipc_msg request = {
-        .word0 = FILED_WIRE_REQUEST_MAGIC,
-        .word1 = FILED_WIRE_OP_EXEC_PATH,
-        .word2 = 0,
-        .word3 = 1,
-        .fds = request_fds,
-        .fd_count = 3,
-    };
-    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
-    seed0root_destroy_wire_page(page_fd, page);
-    (void)pacha_fd_close(bootstrap_fd);
-    if (reply_fd < 16) {
-        fprintf(stderr, "[seed0root] filed smoke exec call failed status=%d\n", reply_fd);
-        return reply_fd;
-    }
-
-    struct pacha_ipc_fd reply_fds[2];
-    struct pacha_ipc_msg reply;
-    memset(reply_fds, 0, sizeof(reply_fds));
-    memset(&reply, 0, sizeof(reply));
-    reply.fds = reply_fds;
-    reply.fd_capacity = 2;
-    status = recv_ipc_wait(reply_fd, &reply);
-    (void)pacha_fd_close(reply_fd);
-    if (status != 0) {
-        fprintf(stderr, "[seed0root] filed smoke exec recv failed status=%d\n", status);
-        return status;
-    }
-    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
-        reply.word1 != 0 ||
-        reply.word3 != 1 ||
-        reply.fd_count != 2 ||
-        reply_fds[0].fd < 16 ||
-        reply_fds[1].fd < 16)
-    {
-        fprintf(stderr,
-            "[seed0root] filed smoke exec reply invalid word0=0x%llx status=%lld fd_count=%llu\n",
-            (unsigned long long)reply.word0,
-            (long long)(int64_t)reply.word1,
-            (unsigned long long)reply.fd_count);
-        if (reply_fds[0].fd >= 16) (void)pacha_fd_close((int)reply_fds[0].fd);
-        if (reply_fds[1].fd >= 16) (void)pacha_fd_close((int)reply_fds[1].fd);
-        return -2;
-    }
-
-    struct seed0root_started_process started;
-    memset(&started, 0, sizeof(started));
-    started.process_fd = (int)reply_fds[0].fd;
-    started.thread_fd = (int)reply_fds[1].fd;
-    status = wait_started_process("filed smoke", &started);
-    (void)pacha_fd_close(started.thread_fd);
-    (void)pacha_fd_close(started.process_fd);
-    if (status != 0) {
-        return status;
-    }
-    printf("[seed0root] filed smoke ready\n");
-    return 0;
-}
-
 static int launch_filed_from_rootfs(int fs_fd)
 {
     if (fs_fd < 16) {
@@ -965,6 +794,7 @@ static int launch_filed_from_rootfs(int fs_fd)
     }
     const uint64_t filed_endpoint_rights =
         PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL |
         PACHA_FD_RIGHT_SET_FLAGS |
@@ -1015,12 +845,6 @@ static int launch_filed_from_rootfs(int fs_fd)
     if (status != 0) {
         (void)pacha_fd_close(filed_endpoint_fd);
         fprintf(stderr, "[seed0root] filed start failed status=%d\n", status);
-        return status;
-    }
-    status = launch_filed_smoke_via_filed(filed_endpoint_fd);
-    if (status != 0) {
-        (void)pacha_fd_close(filed_endpoint_fd);
-        fprintf(stderr, "[seed0root] filed smoke failed status=%d\n", status);
         return status;
     }
     (void)pacha_fd_close(filed_endpoint_fd);
@@ -1111,6 +935,7 @@ static int load_elf_process(
 
     out->process_fd = process_fd;
     out->runtime_entry = e_entry + load_bias;
+    out->load_bias = load_bias;
     out->phdr_va = load_bias + e_phoff;
     out->phent = e_phentsize;
     out->phnum = e_phnum;
@@ -1188,6 +1013,12 @@ static int start_loaded_process(
         (bootstrap_fd >= 16 && (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 || push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, argv0_va) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_RANDOM) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_SECURE) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_EGID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_GID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_EUID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_UID) != 0 ||
+        push_u64(stack, &sp, loaded->runtime_entry) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_ENTRY) != 0 ||
         push_u64(stack, &sp, 0) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_BASE) != 0 ||
         push_u64(stack, &sp, SEED0ROOT_PAGE_SIZE) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_PAGESZ) != 0 ||
         push_u64(stack, &sp, loaded->phnum) != 0 || push_u64(stack, &sp, SEED0ROOT_AT_PHNUM) != 0 ||

@@ -38,6 +38,7 @@ type Result struct {
 	ConsoleCommand []string
 	ConsoleSocket  string
 	Log            string
+	HostTimeLog    string
 	Vars           string
 	DryRun         bool
 	Started        bool
@@ -46,6 +47,7 @@ type Result struct {
 type commandPlan struct {
 	Args          []string
 	LogPath       string
+	HostTimeLog   string
 	VarsPath      string
 	ConsoleSocket string
 }
@@ -94,6 +96,71 @@ type TTYTestResult struct {
 	Python        string
 }
 
+type hostTimeLog struct {
+	file    *os.File
+	started time.Time
+	mu      sync.Mutex
+}
+
+type hostTimeLineWriter struct {
+	log    *hostTimeLog
+	stream string
+	buf    []byte
+}
+
+func newHostTimeLineWriter(log *hostTimeLog, stream string) *hostTimeLineWriter {
+	return &hostTimeLineWriter{log: log, stream: stream}
+}
+
+func (w *hostTimeLineWriter) Write(p []byte) (int, error) {
+	if w == nil || w.log == nil || w.log.file == nil {
+		return len(p), nil
+	}
+	consumed := len(p)
+	for len(p) > 0 {
+		next := -1
+		for i, b := range p {
+			if b == '\n' {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			w.buf = append(w.buf, p...)
+			break
+		}
+		w.buf = append(w.buf, p[:next]...)
+		w.writeLine(w.buf)
+		w.buf = w.buf[:0]
+		p = p[next+1:]
+	}
+	return consumed, nil
+}
+
+func (w *hostTimeLineWriter) Close() error {
+	if w == nil || len(w.buf) == 0 {
+		return nil
+	}
+	w.writeLine(w.buf)
+	w.buf = w.buf[:0]
+	return nil
+}
+
+func (w *hostTimeLineWriter) writeLine(line []byte) {
+	now := time.Now()
+	text := strings.TrimRight(string(line), "\r")
+	w.log.mu.Lock()
+	defer w.log.mu.Unlock()
+	_, _ = fmt.Fprintf(
+		w.log.file,
+		"%s +%s %s | %s\n",
+		now.Format("2006-01-02T15:04:05.000000000-07:00"),
+		now.Sub(w.log.started).Round(time.Microsecond),
+		w.stream,
+		text,
+	)
+}
+
 func Run(workspace *config.Workspace, opts Options) (Result, error) {
 	span := progress.Use(opts.Progress).Start("qemu", 4)
 	defer span.Close()
@@ -119,14 +186,26 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 	}
 	if opts.DryRun {
 		span.Done("qemu dry-run ready")
-		return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, Vars: plan.VarsPath, DryRun: true}, nil
+		return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, Vars: plan.VarsPath, DryRun: true}, nil
 	}
 	span.Set(3, "starting qemu")
+	hostLogFile, err := os.Create(plan.HostTimeLog)
+	if err != nil {
+		span.Fail("host timestamp log create failed")
+		return Result{}, err
+	}
+	defer hostLogFile.Close()
+	hostLog := &hostTimeLog{file: hostLogFile, started: time.Now()}
+	_, _ = fmt.Fprintf(hostLogFile, "%s +0s host | qemu start\n", hostLog.started.Format("2006-01-02T15:04:05.000000000-07:00"))
+	stdoutLog := newHostTimeLineWriter(hostLog, "stdout")
+	stderrLog := newHostTimeLineWriter(hostLog, "stderr")
+	defer stdoutLog.Close()
+	defer stderrLog.Close()
 	cmd := exec.Command(plan.Args[0], plan.Args[1:]...)
 	cmd.Dir = workspace.Root
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = io.MultiWriter(os.Stdout, stdoutLog)
+	cmd.Stderr = io.MultiWriter(os.Stderr, stderrLog)
 	if err := cmd.Start(); err != nil {
 		span.Fail("qemu start failed")
 		return Result{}, err
@@ -146,7 +225,7 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 			return Result{}, err
 		} else if exited {
 			span.Done("qemu exited")
-			return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, Vars: plan.VarsPath}, nil
+			return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, Vars: plan.VarsPath}, nil
 		}
 		span.Message("starting console terminal")
 		consoleCmd := exec.Command(consoleArgs[0], consoleArgs[1:]...)
@@ -162,7 +241,7 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 	if err := <-done; err != nil {
 		return Result{}, err
 	}
-	return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, Vars: plan.VarsPath}, nil
+	return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, Vars: plan.VarsPath}, nil
 }
 
 func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) {
@@ -631,6 +710,7 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		return commandPlan{}, err
 	}
 	logPath := filepath.Join(artifacts, "qemu.log")
+	hostTimeLogPath := filepath.Join(artifacts, "qemu-host-time.log")
 	varsPath := filepath.Join(artifacts, "OVMF_VARS.fd")
 	if err := copyFile(varsTemplate, varsPath); err != nil {
 		return commandPlan{}, err
@@ -709,7 +789,7 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		args = append([]string{args[0], "-enable-kvm", "-cpu", "host"}, args[1:]...)
 	}
 	args = append(args, opts.ExtraArgs...)
-	return commandPlan{Args: args, LogPath: logPath, VarsPath: varsPath, ConsoleSocket: consoleSocket}, nil
+	return commandPlan{Args: args, LogPath: logPath, HostTimeLog: hostTimeLogPath, VarsPath: varsPath, ConsoleSocket: consoleSocket}, nil
 }
 
 func validateKVMAvailable() error {

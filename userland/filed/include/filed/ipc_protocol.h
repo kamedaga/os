@@ -68,6 +68,10 @@ enum {
     FILED_WIRE_EXEC_MAX_INHERIT_FDS = 4,
     FILED_WIRE_EXEC_MAX_INHERIT_HANDLES = 4,
     FILED_WIRE_EXEC_MAX_FD_PATCHES = 4,
+    FILED_WIRE_EXEC_MAX_ARGS = 8,
+    FILED_WIRE_EXEC_MAX_ENVS = 8,
+    FILED_WIRE_EXEC_ARG_BYTES = 128,
+    FILED_WIRE_EXEC_ENV_BYTES = 128,
 
     FILED_WIRE_EXEC_PATCH_INHERIT_FD = 1,
     FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FD = 2,
@@ -165,8 +169,12 @@ typedef struct filed_wire_exec_path {
     uint64_t fd_patch_count;
     uint64_t inherit_handle_count;
     uint64_t reserved1;
+    uint64_t argc;
+    uint64_t envc;
     uint64_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
     filed_wire_exec_fd_patch_t fd_patches[FILED_WIRE_EXEC_MAX_FD_PATCHES];
     char path[FILED_WIRE_NAME_BYTES];
     char argv0[FILED_WIRE_NAME_BYTES];
+    char argv[FILED_WIRE_EXEC_MAX_ARGS][FILED_WIRE_EXEC_ARG_BYTES];
+    char envp[FILED_WIRE_EXEC_MAX_ENVS][FILED_WIRE_EXEC_ENV_BYTES];
 } filed_wire_exec_path_t;

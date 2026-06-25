@@ -13,6 +13,7 @@
 
 enum {
     FILED_BOOTSTRAP_PATCH_BYTES = 4096,
+    FILED_EXEC_FILED_ENDPOINT_FD = 240,
 };
 
 static int filed_send_reply(int reply_fd, uint64_t request_id, int64_t status, uint64_t result)
@@ -76,6 +77,19 @@ static int filed_send_exec_reply(
         (void)pacha_fd_close(process_fd);
     }
     return status;
+}
+
+static int filed_dispatch_set_inherit(int fd, int enabled)
+{
+    if (fd < 16) {
+        return -22;
+    }
+    const long status = pacha_fd_fcntl(
+        fd,
+        PACHA_FD_FCNTL_SET_FLAGS,
+        enabled ? PACHA_FD_FLAG_INHERIT : 0,
+        PACHA_FD_FLAG_INHERIT);
+    return status == 0 ? 0 : -22;
 }
 
 static int64_t filed_status_to_wire(filed_status_t status)
@@ -393,6 +407,19 @@ static const char *filed_skip_slashes(const char *path)
         ++path;
     }
     return path;
+}
+
+static int filed_path_is_single_component(const char *path)
+{
+    path = filed_skip_slashes(path);
+    if (path == NULL || *path == '\0') {
+        return 0;
+    }
+    while (*path != '\0' && *path != '/') {
+        ++path;
+    }
+    path = filed_skip_slashes(path);
+    return path != NULL && *path == '\0';
 }
 
 static void filed_close_walk_handle(
@@ -773,11 +800,17 @@ static int64_t filed_openat_path(
             return reply_status;
         } else {
             filed_vfs_open_result_t next_open;
+            uint32_t next_rights = FILED_WALK_RIGHTS;
+            if ((open_flags & FILED_OPEN_CREATE) != 0 &&
+                filed_path_is_single_component(after_slashes))
+            {
+                next_rights |= FILED_RIGHT_CREATE;
+            }
             const int64_t reply_status = filed_lookup_and_open_component(
                 runtime,
                 current_handle,
                 component,
-                FILED_WALK_RIGHTS,
+                next_rights,
                 FILED_OPEN_DIRECTORY,
                 &next_open);
             filed_close_walk_handle(runtime, current_handle, current_owned);
@@ -1643,6 +1676,7 @@ static int filed_dispatch_exec_path(
     int process_fd = -1;
     int thread_fd = -1;
     int bootstrap_fd = -1;
+    int exec_filed_endpoint_fd = -1;
     int inherit_fds[FILED_WIRE_EXEC_MAX_INHERIT_FDS];
     filed_handle_id_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
     memset(inherit_fds, 0, sizeof(inherit_fds));
@@ -1652,11 +1686,23 @@ static int filed_dispatch_exec_path(
         exec->inherit_fd_count > FILED_WIRE_EXEC_MAX_INHERIT_FDS ||
         exec->inherit_handle_count > FILED_WIRE_EXEC_MAX_INHERIT_HANDLES ||
         exec->fd_patch_count > FILED_WIRE_EXEC_MAX_FD_PATCHES ||
+        exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
+        exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
         exec->reserved1 != 0 ||
         !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
         !filed_name_is_terminated(exec->argv0, sizeof(exec->argv0)))
     {
         goto out;
+    }
+    for (uint64_t i = 0; i < exec->argc; ++i) {
+        if (!filed_name_is_terminated(exec->argv[i], sizeof(exec->argv[i]))) {
+            goto out;
+        }
+    }
+    for (uint64_t i = 0; i < exec->envc; ++i) {
+        if (!filed_name_is_terminated(exec->envp[i], sizeof(exec->envp[i]))) {
+            goto out;
+        }
     }
     const uint64_t inherit_fd_count = exec->inherit_fd_count;
     const uint64_t inherit_handle_count = exec->inherit_handle_count;
@@ -1708,6 +1754,33 @@ static int filed_dispatch_exec_path(
             goto out;
         }
         inherit_handles[i] = dup_handle;
+    }
+
+    if ((exec->flags & FILED_WIRE_EXEC_INHERIT_FDS) == 0 &&
+        inherit_fd_count == 0 &&
+        runtime->client_endpoint_fd >= 16)
+    {
+        const uint64_t endpoint_rights =
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_SET_FLAGS |
+            PACHA_FD_RIGHT_CALL;
+        const long dup_fd = pacha_fd_fcntl(
+            runtime->client_endpoint_fd,
+            PACHA_FD_FCNTL_DUP,
+            FILED_EXEC_FILED_ENDPOINT_FD,
+            endpoint_rights);
+        if (dup_fd != FILED_EXEC_FILED_ENDPOINT_FD) {
+            if (dup_fd >= 16) {
+                (void)pacha_fd_close((int)dup_fd);
+            }
+            reply_status = -24;
+            goto out;
+        }
+        exec_filed_endpoint_fd = (int)dup_fd;
+        if (filed_dispatch_set_inherit(exec_filed_endpoint_fd, 1) != 0) {
+            reply_status = -13;
+            goto out;
+        }
     }
 
     if ((exec->flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
@@ -1790,6 +1863,10 @@ static int filed_dispatch_exec_path(
     }
 
 out:
+    if (exec_filed_endpoint_fd >= 16) {
+        (void)filed_dispatch_set_inherit(exec_filed_endpoint_fd, 0);
+        (void)pacha_fd_close(exec_filed_endpoint_fd);
+    }
     (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (bootstrap_fd >= 16) {

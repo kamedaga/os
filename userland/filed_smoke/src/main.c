@@ -13,6 +13,19 @@ enum {
     FILED_SMOKE_MAX_READ = 64,
 };
 
+static int has_env_value(char **envp, const char *expected)
+{
+    if (envp == NULL || expected == NULL) {
+        return 0;
+    }
+    for (char **p = envp; *p != NULL; ++p) {
+        if (strcmp(*p, expected) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int find_bootstrap_fd(char **argv, int *out_fd)
 {
     if (argv == NULL || out_fd == NULL) {
@@ -206,6 +219,389 @@ static void filed_smoke_best_effort_rmdir(
     rmdir->dir_handle = dir_handle;
     snprintf(rmdir->name, sizeof(rmdir->name), "%s", name);
     (void)filed_call(endpoint_fd, FILED_WIRE_OP_RMDIR, request_id, page_fd, 0, &result);
+}
+
+static int filed_smoke_mutation_stress(
+    int endpoint_fd,
+    int page_fd,
+    void *page,
+    uint64_t root_dir_handle)
+{
+    uint64_t request_id = 120;
+    uint64_t result = 0;
+
+    for (unsigned int i = 0; i < 3; ++i) {
+        char tmp_name[FILED_WIRE_NAME_BYTES];
+        char done_name[FILED_WIRE_NAME_BYTES];
+        char dir_name[FILED_WIRE_NAME_BYTES];
+        char payload[32];
+        snprintf(tmp_name, sizeof(tmp_name), "filed-mut-%u.tmp", i);
+        snprintf(done_name, sizeof(done_name), "filed-mut-%u.done", i);
+        snprintf(dir_name, sizeof(dir_name), "filed-mut-dir-%u", i);
+        snprintf(payload, sizeof(payload), "mutation-%u", i);
+        const uint64_t payload_len = strlen(payload);
+
+        filed_smoke_best_effort_unlink(
+            endpoint_fd,
+            page_fd,
+            page,
+            request_id++,
+            root_dir_handle,
+            tmp_name);
+        filed_smoke_best_effort_unlink(
+            endpoint_fd,
+            page_fd,
+            page,
+            request_id++,
+            root_dir_handle,
+            done_name);
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        filed_wire_openat_t *openat = (filed_wire_openat_t *)page;
+        openat->dir_handle = root_dir_handle;
+        openat->rights =
+            FILED_WIRE_RIGHT_LOOKUP |
+            FILED_WIRE_RIGHT_STAT |
+            FILED_WIRE_RIGHT_CREATE |
+            FILED_WIRE_RIGHT_REMOVE |
+            FILED_WIRE_RIGHT_RENAME;
+        openat->open_flags = FILED_WIRE_OPEN_DIRECTORY;
+        snprintf(openat->name, sizeof(openat->name), "%s", dir_name);
+        result = 0;
+        int status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_OPENAT,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status == 0 && result != 0) {
+            const uint64_t old_dir_handle = result;
+            filed_smoke_best_effort_unlink(
+                endpoint_fd,
+                page_fd,
+                page,
+                request_id++,
+                old_dir_handle,
+                "child.tmp");
+            (void)filed_call(
+                endpoint_fd,
+                FILED_WIRE_OP_CLOSE,
+                request_id++,
+                -1,
+                old_dir_handle,
+                &result);
+        }
+        filed_smoke_best_effort_rmdir(
+            endpoint_fd,
+            page_fd,
+            page,
+            request_id++,
+            root_dir_handle,
+            dir_name);
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        openat = (filed_wire_openat_t *)page;
+        openat->dir_handle = root_dir_handle;
+        openat->rights =
+            FILED_WIRE_RIGHT_READ |
+            FILED_WIRE_RIGHT_WRITE |
+            FILED_WIRE_RIGHT_STAT;
+        openat->open_flags = FILED_WIRE_OPEN_CREATE | FILED_WIRE_OPEN_TRUNCATE;
+        snprintf(openat->name, sizeof(openat->name), "%s", tmp_name);
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_OPENAT,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0 || result == 0) {
+            fprintf(stderr,
+                "[filed-smoke] mutation create failed i=%u status=%d handle=%llu\n",
+                i,
+                status,
+                (unsigned long long)result);
+            return status != 0 ? status : -70;
+        }
+        const uint64_t file_handle = result;
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        filed_wire_io_t *io = (filed_wire_io_t *)page;
+        io->handle = file_handle;
+        io->length = payload_len;
+        memcpy(io->data, payload, (size_t)payload_len);
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_WRITE,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0 || result != payload_len) {
+            fprintf(stderr,
+                "[filed-smoke] mutation write failed i=%u status=%d bytes=%llu\n",
+                i,
+                status,
+                (unsigned long long)result);
+            (void)filed_call(
+                endpoint_fd,
+                FILED_WIRE_OP_CLOSE,
+                request_id++,
+                -1,
+                file_handle,
+                &result);
+            return status != 0 ? status : -71;
+        }
+
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_CLOSE,
+            request_id++,
+            -1,
+            file_handle,
+            &result);
+        if (status != 0) {
+            fprintf(stderr, "[filed-smoke] mutation close failed i=%u status=%d\n", i, status);
+            return status;
+        }
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        filed_wire_rename_t *rename = (filed_wire_rename_t *)page;
+        rename->old_dir_handle = root_dir_handle;
+        rename->new_dir_handle = root_dir_handle;
+        snprintf(rename->old_name, sizeof(rename->old_name), "%s", tmp_name);
+        snprintf(rename->new_name, sizeof(rename->new_name), "%s", done_name);
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_RENAME,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0) {
+            fprintf(stderr, "[filed-smoke] mutation rename failed i=%u status=%d\n", i, status);
+            return status;
+        }
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        openat = (filed_wire_openat_t *)page;
+        openat->dir_handle = root_dir_handle;
+        openat->rights = FILED_WIRE_RIGHT_READ | FILED_WIRE_RIGHT_STAT;
+        openat->open_flags = 0;
+        snprintf(openat->name, sizeof(openat->name), "%s", done_name);
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_OPENAT,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0 || result == 0) {
+            fprintf(stderr,
+                "[filed-smoke] mutation reopen failed i=%u status=%d handle=%llu\n",
+                i,
+                status,
+                (unsigned long long)result);
+            return status != 0 ? status : -72;
+        }
+        const uint64_t read_handle = result;
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        io = (filed_wire_io_t *)page;
+        io->handle = read_handle;
+        io->offset = 0;
+        io->length = payload_len;
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_PREAD,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0 ||
+            result != payload_len ||
+            memcmp(io->data, payload, (size_t)payload_len) != 0)
+        {
+            fprintf(stderr,
+                "[filed-smoke] mutation readback failed i=%u status=%d bytes=%llu\n",
+                i,
+                status,
+                (unsigned long long)result);
+            (void)filed_call(
+                endpoint_fd,
+                FILED_WIRE_OP_CLOSE,
+                request_id++,
+                -1,
+                read_handle,
+                &result);
+            return status != 0 ? status : -73;
+        }
+
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_CLOSE,
+            request_id++,
+            -1,
+            read_handle,
+            &result);
+        if (status != 0) {
+            fprintf(stderr,
+                "[filed-smoke] mutation close read handle failed i=%u status=%d\n",
+                i,
+                status);
+            return status;
+        }
+        filed_smoke_best_effort_unlink(
+            endpoint_fd,
+            page_fd,
+            page,
+            request_id++,
+            root_dir_handle,
+            done_name);
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        filed_wire_mkdir_t *mkdir = (filed_wire_mkdir_t *)page;
+        mkdir->dir_handle = root_dir_handle;
+        mkdir->mode = 0755;
+        snprintf(mkdir->name, sizeof(mkdir->name), "%s", dir_name);
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_MKDIR,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0) {
+            fprintf(stderr, "[filed-smoke] mutation mkdir failed i=%u status=%d\n", i, status);
+            return status;
+        }
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        openat = (filed_wire_openat_t *)page;
+        openat->dir_handle = root_dir_handle;
+        openat->rights =
+            FILED_WIRE_RIGHT_LOOKUP |
+            FILED_WIRE_RIGHT_STAT |
+            FILED_WIRE_RIGHT_CREATE |
+            FILED_WIRE_RIGHT_REMOVE;
+        openat->open_flags = FILED_WIRE_OPEN_DIRECTORY;
+        snprintf(openat->name, sizeof(openat->name), "%s", dir_name);
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_OPENAT,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0 || result == 0) {
+            fprintf(stderr,
+                "[filed-smoke] mutation open dir failed i=%u status=%d handle=%llu\n",
+                i,
+                status,
+                (unsigned long long)result);
+            return status != 0 ? status : -74;
+        }
+        const uint64_t dir_handle = result;
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        openat = (filed_wire_openat_t *)page;
+        openat->dir_handle = dir_handle;
+        openat->rights = FILED_WIRE_RIGHT_READ | FILED_WIRE_RIGHT_WRITE | FILED_WIRE_RIGHT_STAT;
+        openat->open_flags = FILED_WIRE_OPEN_CREATE | FILED_WIRE_OPEN_TRUNCATE;
+        snprintf(openat->name, sizeof(openat->name), "%s", "child.tmp");
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_OPENAT,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0 || result == 0) {
+            fprintf(stderr,
+                "[filed-smoke] mutation create child failed i=%u status=%d handle=%llu\n",
+                i,
+                status,
+                (unsigned long long)result);
+            (void)filed_call(
+                endpoint_fd,
+                FILED_WIRE_OP_CLOSE,
+                request_id++,
+                -1,
+                dir_handle,
+                &result);
+            return status != 0 ? status : -75;
+        }
+        const uint64_t child_handle = result;
+
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_CLOSE,
+            request_id++,
+            -1,
+            child_handle,
+            &result);
+        if (status != 0) {
+            fprintf(stderr,
+                "[filed-smoke] mutation close child failed i=%u status=%d\n",
+                i,
+                status);
+            (void)filed_call(
+                endpoint_fd,
+                FILED_WIRE_OP_CLOSE,
+                request_id++,
+                -1,
+                dir_handle,
+                &result);
+            return status;
+        }
+        filed_smoke_best_effort_unlink(
+            endpoint_fd,
+            page_fd,
+            page,
+            request_id++,
+            dir_handle,
+            "child.tmp");
+
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_CLOSE,
+            request_id++,
+            -1,
+            dir_handle,
+            &result);
+        if (status != 0) {
+            fprintf(stderr, "[filed-smoke] mutation close dir failed i=%u status=%d\n", i, status);
+            return status;
+        }
+
+        memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+        filed_wire_rmdir_t *rmdir = (filed_wire_rmdir_t *)page;
+        rmdir->dir_handle = root_dir_handle;
+        snprintf(rmdir->name, sizeof(rmdir->name), "%s", dir_name);
+        result = 0;
+        status = filed_call(
+            endpoint_fd,
+            FILED_WIRE_OP_RMDIR,
+            request_id++,
+            page_fd,
+            0,
+            &result);
+        if (status != 0) {
+            fprintf(stderr, "[filed-smoke] mutation rmdir failed i=%u status=%d\n", i, status);
+            return status;
+        }
+    }
+
+    return 0;
 }
 
 static int smoke_filed_endpoint(int endpoint_fd)
@@ -1745,6 +2141,30 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    openat = (filed_wire_openat_t *)page;
+    openat->dir_handle = root_dir_handle;
+    openat->rights =
+        FILED_WIRE_RIGHT_LOOKUP |
+        FILED_WIRE_RIGHT_STAT |
+        FILED_WIRE_RIGHT_CREATE |
+        FILED_WIRE_RIGHT_REMOVE;
+    openat->open_flags = FILED_WIRE_OPEN_DIRECTORY;
+    snprintf(openat->name, sizeof(openat->name), "%s", "filed-dir-rename-old");
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_OPENAT, 108, page_fd, 0, &result);
+    if (status != 0 || result == 0) {
+        fprintf(stderr,
+            "[filed-smoke] open directory before rename failed status=%d handle=%llu\n",
+            status,
+            (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 109, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 110, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -59;
+    }
+    const uint64_t dir_rename_open_handle = result;
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
     rename = (filed_wire_rename_t *)page;
     rename->old_dir_handle = root_dir_handle;
     rename->new_dir_handle = root_dir_handle;
@@ -1754,6 +2174,7 @@ static int smoke_filed_endpoint(int endpoint_fd)
     status = filed_call(endpoint_fd, FILED_WIRE_OP_RENAME, 99, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] directory rename failed status=%d\n", status);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 110, -1, dir_rename_open_handle, &result);
         (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 100, -1, mkdir_dir_handle, &result);
         (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 101, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
@@ -1773,6 +2194,7 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] old directory rename path unexpectedly exists status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 110, -1, dir_rename_open_handle, &result);
         (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 101, -1, mkdir_dir_handle, &result);
         (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 102, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
@@ -1798,12 +2220,148 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] new directory rename path open failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 110, -1, dir_rename_open_handle, &result);
         (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 102, -1, mkdir_dir_handle, &result);
         (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 103, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -58;
     }
     const uint64_t renamed_dir_handle = result;
+
+    const char dir_lifetime_payload[] = "directory-handle-live";
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    openat = (filed_wire_openat_t *)page;
+    openat->dir_handle = dir_rename_open_handle;
+    openat->rights =
+        FILED_WIRE_RIGHT_READ |
+        FILED_WIRE_RIGHT_WRITE |
+        FILED_WIRE_RIGHT_STAT;
+    openat->open_flags = FILED_WIRE_OPEN_CREATE | FILED_WIRE_OPEN_TRUNCATE;
+    snprintf(openat->name, sizeof(openat->name), "%s", "alive.tmp");
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_OPENAT, 109, page_fd, 0, &result);
+    if (status != 0 || result == 0) {
+        fprintf(stderr,
+            "[filed-smoke] create through renamed open directory failed status=%d handle=%llu\n",
+            status,
+            (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 110, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 111, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 112, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 113, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -60;
+    }
+    const uint64_t dir_lifetime_child_handle = result;
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    io = (filed_wire_io_t *)page;
+    io->handle = dir_lifetime_child_handle;
+    io->length = sizeof(dir_lifetime_payload) - 1u;
+    memcpy(io->data, dir_lifetime_payload, sizeof(dir_lifetime_payload) - 1u);
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_WRITE, 110, page_fd, 0, &result);
+    if (status != 0 || result != sizeof(dir_lifetime_payload) - 1u) {
+        fprintf(stderr,
+            "[filed-smoke] write through renamed open directory failed status=%d bytes=%llu\n",
+            status,
+            (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 111, -1, dir_lifetime_child_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 112, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 113, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 114, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 115, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -61;
+    }
+
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 111, -1, dir_lifetime_child_handle, &result);
+    if (status != 0) {
+        fprintf(stderr, "[filed-smoke] close renamed directory child failed status=%d\n", status);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 112, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 113, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 114, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 115, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status;
+    }
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    openat = (filed_wire_openat_t *)page;
+    openat->dir_handle = renamed_dir_handle;
+    openat->rights = FILED_WIRE_RIGHT_READ | FILED_WIRE_RIGHT_STAT;
+    openat->open_flags = 0;
+    snprintf(openat->name, sizeof(openat->name), "%s", "alive.tmp");
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_OPENAT, 112, page_fd, 0, &result);
+    if (status != 0 || result == 0) {
+        fprintf(stderr,
+            "[filed-smoke] reopen renamed directory child failed status=%d handle=%llu\n",
+            status,
+            (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 113, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 114, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 115, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 116, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -62;
+    }
+    const uint64_t dir_lifetime_reopen_handle = result;
+
+    memset(page, 0, FILED_SMOKE_PAGE_SIZE);
+    io = (filed_wire_io_t *)page;
+    io->handle = dir_lifetime_reopen_handle;
+    io->offset = 0;
+    io->length = sizeof(dir_lifetime_payload) - 1u;
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_PREAD, 113, page_fd, 0, &result);
+    if (status != 0 ||
+        result != sizeof(dir_lifetime_payload) - 1u ||
+        memcmp(io->data, dir_lifetime_payload, sizeof(dir_lifetime_payload) - 1u) != 0)
+    {
+        fprintf(stderr,
+            "[filed-smoke] renamed directory child readback failed status=%d bytes=%llu\n",
+            status,
+            (unsigned long long)result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 114, -1, dir_lifetime_reopen_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 115, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 116, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 117, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 118, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status != 0 ? status : -63;
+    }
+
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 114, -1, dir_lifetime_reopen_handle, &result);
+    if (status != 0) {
+        fprintf(stderr, "[filed-smoke] close renamed directory child reopen failed status=%d\n", status);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 115, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 116, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 117, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 118, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status;
+    }
+    filed_smoke_best_effort_unlink(
+        endpoint_fd,
+        page_fd,
+        page,
+        115,
+        renamed_dir_handle,
+        "alive.tmp");
+
+    result = 0;
+    status = filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 116, -1, dir_rename_open_handle, &result);
+    if (status != 0) {
+        fprintf(stderr, "[filed-smoke] close old renamed directory handle failed status=%d\n", status);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 117, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 118, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 119, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status;
+    }
 
     result = 0;
     status = filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 102, -1, renamed_dir_handle, &result);
@@ -1862,6 +2420,13 @@ static int smoke_filed_endpoint(int endpoint_fd)
         return -44;
     }
 
+    status = filed_smoke_mutation_stress(endpoint_fd, page_fd, page, root_dir_handle);
+    if (status != 0) {
+        (void)filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 99, -1, root_dir_handle, &result);
+        destroy_wire_page(page_fd, page);
+        return status;
+    }
+
     result = 0;
     status = filed_call(endpoint_fd, FILED_WIRE_OP_CLOSE, 107, -1, root_dir_handle, &result);
     if (status != 0) {
@@ -1877,9 +2442,23 @@ static int smoke_filed_endpoint(int endpoint_fd)
     return 0;
 }
 
-int main(int argc, char **argv)
+int main(int argc, char **argv, char **envp)
 {
-    (void)argc;
+    if (argc < 2 ||
+        argv == NULL ||
+        argv[0] == NULL ||
+        argv[1] == NULL ||
+        strcmp(argv[0], "/sbin/filed_smoke.elf") != 0 ||
+        strcmp(argv[1], "--execve-smoke") != 0 ||
+        !has_env_value(envp, "PACHA_FILED_EXEC_SMOKE=1"))
+    {
+        fprintf(stderr,
+            "[filed-smoke] exec argv/env failed argc=%d argv0=%s argv1=%s\n",
+            argc,
+            argv != NULL && argv[0] != NULL ? argv[0] : "(null)",
+            argv != NULL && argv[1] != NULL ? argv[1] : "(null)");
+        return 2;
+    }
 
     int bootstrap_fd = -1;
     int status = find_bootstrap_fd(argv, &bootstrap_fd);

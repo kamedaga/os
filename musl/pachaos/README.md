@@ -41,3 +41,17 @@ The sysroot contains upstream musl headers, PachaOS arch bits, generated
 `libc.a`. Smoke programs are linked through the compiler's normal musl driver
 path instead of `-nostdlib`; PachaOS-specific code is limited to the
 `arch/pachaos` target files and OS syscall glue.
+
+`build/build-runtime.sh` builds the fuller PachaOS native musl runtime:
+
+```text
+.artifacts/musl-pachaos-runtime/install/usr/lib/crt1.o
+.artifacts/musl-pachaos-runtime/install/usr/lib/crti.o
+.artifacts/musl-pachaos-runtime/install/usr/lib/crtn.o
+.artifacts/musl-pachaos-runtime/install/usr/lib/Scrt1.o
+.artifacts/musl-pachaos-runtime/install/usr/lib/rcrt1.o
+.artifacts/musl-pachaos-runtime/install/usr/lib/libc.a
+.artifacts/musl-pachaos-runtime/install/usr/lib/libc.so
+.artifacts/musl-pachaos-runtime/rootfs/lib/libc.so
+.artifacts/musl-pachaos-runtime/rootfs/lib/ld-musl-x86_64.so.1
+```

@@ -112,6 +112,7 @@ func qemuCommand(ctx *context) *cobra.Command {
 			ui.KeyValues("QEMU", [][2]string{
 				{"state", state},
 				{"log", ctx.workspace.Rel(result.Log)},
+				{"host time log", ctx.workspace.Rel(result.HostTimeLog)},
 				{"vars", ctx.workspace.Rel(result.Vars)},
 				{"command", qemuCommandLine(result.Command)},
 			})
@@ -131,6 +132,7 @@ func qemuCommand(ctx *context) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.NewTerminal, "terminal", false, "alias for --new-terminal")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
 	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without virtio-net")
+	cmd.Flags().BoolVar(&opts.Fast, "fast", false, "reduce QEMU-side diagnostics while keeping OVMF boot")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the QEMU command without launching")
 	cmd.Flags().StringVar(&opts.Memory, "memory", "2G", "QEMU memory size")
 	cmd.Flags().StringVar(&opts.Display, "display", "gtk,grab-on-hover=off", "QEMU display backend")

@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 enum {
     KOBOXD_FS_BACKEND_NAME_BYTES = 64,
@@ -28,7 +29,12 @@ typedef struct koboxd_fs_object {
     uint8_t linked;
 } koboxd_fs_object_t;
 
+typedef struct koboxd_fs_lock {
+    atomic_flag flag;
+} koboxd_fs_lock_t;
+
 typedef struct koboxd_fs_backend {
+    koboxd_fs_lock_t lock;
     kb_module_t *ext4_module;
     kb_fs_mount_result_t mount_result;
     koboxd_fs_object_t objects[KOBOXD_FS_BACKEND_MAX_OBJECTS];
@@ -55,6 +61,8 @@ int koboxd_fs_backend_mount_ext4(
     koboxd_fs_backend_t *backend,
     kb_module_t *ext4_module,
     kb_fs_block_device_t *root_device);
+void koboxd_fs_backend_lock(koboxd_fs_backend_t *backend);
+void koboxd_fs_backend_unlock(koboxd_fs_backend_t *backend);
 int koboxd_fs_backend_lookup(
     koboxd_fs_backend_t *backend,
     uint64_t parent_object_id,
@@ -65,7 +73,8 @@ int koboxd_fs_backend_pread(
     uint64_t object_id,
     uint64_t offset,
     void *buffer,
-    size_t length);
+    size_t length,
+    size_t buffer_capacity);
 int koboxd_fs_backend_pwrite(
     koboxd_fs_backend_t *backend,
     uint64_t object_id,

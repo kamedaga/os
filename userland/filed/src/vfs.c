@@ -2,6 +2,97 @@
 
 #include <string.h>
 
+static void filed_lock_init(filed_lock_t *lock)
+{
+    if (lock != NULL) {
+        atomic_flag_clear_explicit(&lock->flag, memory_order_release);
+    }
+}
+
+static void filed_lock_acquire(filed_lock_t *lock)
+{
+    if (lock == NULL) {
+        return;
+    }
+    while (atomic_flag_test_and_set_explicit(&lock->flag, memory_order_acquire)) {
+    }
+}
+
+static void filed_lock_release(filed_lock_t *lock)
+{
+    if (lock != NULL) {
+        atomic_flag_clear_explicit(&lock->flag, memory_order_release);
+    }
+}
+
+static filed_lock_t *filed_mutable_lock(const filed_lock_t *lock)
+{
+    return (filed_lock_t *)(uintptr_t)lock;
+}
+
+static void filed_vnode_write_lock(filed_vnode_t *vnode)
+{
+    if (vnode != NULL) {
+        filed_lock_acquire(&vnode->lock);
+    }
+}
+
+static void filed_vnode_write_unlock(filed_vnode_t *vnode)
+{
+    if (vnode != NULL) {
+        filed_lock_release(&vnode->lock);
+    }
+}
+
+static bool filed_vnode_lock_before(const filed_vnode_t *a, const filed_vnode_t *b)
+{
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    if (a->mount_id != b->mount_id) {
+        return a->mount_id < b->mount_id;
+    }
+    return a->id < b->id;
+}
+
+static void filed_vnode_write_lock_pair(filed_vnode_t *a, filed_vnode_t *b)
+{
+    if (a == NULL || b == NULL) {
+        filed_vnode_write_lock(a != NULL ? a : b);
+        return;
+    }
+    if (a == b) {
+        filed_vnode_write_lock(a);
+        return;
+    }
+    if (filed_vnode_lock_before(b, a)) {
+        filed_vnode_write_lock(b);
+        filed_vnode_write_lock(a);
+    } else {
+        filed_vnode_write_lock(a);
+        filed_vnode_write_lock(b);
+    }
+}
+
+static void filed_vnode_write_unlock_pair(filed_vnode_t *a, filed_vnode_t *b)
+{
+    if (a == NULL || b == NULL) {
+        filed_vnode_write_unlock(a != NULL ? a : b);
+        return;
+    }
+    if (a == b) {
+        filed_vnode_write_unlock(a);
+        return;
+    }
+    if (filed_vnode_lock_before(b, a)) {
+        filed_vnode_write_unlock(a);
+        filed_vnode_write_unlock(b);
+    } else {
+        filed_vnode_write_unlock(b);
+        filed_vnode_write_unlock(a);
+    }
+}
+
 static filed_status_t filed_copy_name(char *dst, size_t dst_size, const char *src)
 {
     size_t len;
@@ -130,6 +221,160 @@ static bool filed_file_status_flags_are_known(uint32_t flags)
         FILED_FILE_NONBLOCK |
         FILED_FILE_SYNC;
     return (flags & ~known) == 0;
+}
+
+static void filed_vnode_init_lock(filed_vnode_t *vnode)
+{
+    if (vnode != NULL) {
+        filed_lock_init(&vnode->lock);
+    }
+}
+
+static filed_status_t filed_vnode_ref_inc(filed_vnode_t *vnode)
+{
+    filed_status_t status = FILED_OK;
+
+    if (vnode == NULL || !vnode->active) {
+        return FILED_ERR_INVALID;
+    }
+    filed_lock_acquire(&vnode->lock);
+    if (vnode->refcount == UINT32_MAX) {
+        status = FILED_ERR_OVERFLOW;
+    } else {
+        ++vnode->refcount;
+    }
+    filed_lock_release(&vnode->lock);
+    return status;
+}
+
+static uint32_t filed_vnode_ref_dec_if_nonzero(filed_vnode_t *vnode)
+{
+    uint32_t refcount = 0;
+
+    if (vnode == NULL || !vnode->active) {
+        return 0;
+    }
+    filed_lock_acquire(&vnode->lock);
+    if (vnode->refcount > 0) {
+        --vnode->refcount;
+    }
+    refcount = vnode->refcount;
+    filed_lock_release(&vnode->lock);
+    return refcount;
+}
+
+static bool filed_vnode_mark_unlinked(filed_vnode_t *vnode)
+{
+    bool changed = false;
+
+    if (vnode == NULL || !vnode->active) {
+        return false;
+    }
+    filed_lock_acquire(&vnode->lock);
+    if (vnode->linked) {
+        vnode->linked = false;
+        ++vnode->generation;
+        changed = true;
+    }
+    filed_lock_release(&vnode->lock);
+    return changed;
+}
+
+static void filed_file_init_locks(filed_file_t *file)
+{
+    if (file != NULL) {
+        filed_lock_init(&file->lock);
+        filed_lock_init(&file->offset_lock);
+    }
+}
+
+static filed_status_t filed_file_ref_inc(filed_file_t *file)
+{
+    filed_status_t status = FILED_OK;
+
+    if (file == NULL || !file->active) {
+        return FILED_ERR_INVALID;
+    }
+    filed_lock_acquire(&file->lock);
+    if (file->refcount == UINT32_MAX) {
+        status = FILED_ERR_OVERFLOW;
+    } else {
+        ++file->refcount;
+    }
+    filed_lock_release(&file->lock);
+    return status;
+}
+
+static uint32_t filed_file_ref_dec_if_nonzero(filed_file_t *file)
+{
+    uint32_t refcount = 0;
+
+    if (file == NULL || !file->active) {
+        return 0;
+    }
+    filed_lock_acquire(&file->lock);
+    if (file->refcount > 0) {
+        --file->refcount;
+    }
+    refcount = file->refcount;
+    filed_lock_release(&file->lock);
+    return refcount;
+}
+
+static filed_status_t filed_file_offset_snapshot(
+    const filed_file_t *file,
+    uint64_t *out_offset)
+{
+    if (file == NULL || out_offset == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(filed_mutable_lock(&file->offset_lock));
+    if (file->offset < 0) {
+        filed_lock_release(filed_mutable_lock(&file->offset_lock));
+        return FILED_ERR_INVALID;
+    }
+    *out_offset = (uint64_t)file->offset;
+    filed_lock_release(filed_mutable_lock(&file->offset_lock));
+    return FILED_OK;
+}
+
+static filed_status_t filed_file_offset_advance(
+    filed_file_t *file,
+    uint64_t amount)
+{
+    uint64_t old_offset;
+
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(&file->offset_lock);
+    if (file->offset < 0) {
+        filed_lock_release(&file->offset_lock);
+        return FILED_ERR_INVALID;
+    }
+    old_offset = (uint64_t)file->offset;
+    if (amount > (uint64_t)INT64_MAX - old_offset) {
+        filed_lock_release(&file->offset_lock);
+        return FILED_ERR_OVERFLOW;
+    }
+    file->offset = (int64_t)(old_offset + amount);
+    filed_lock_release(&file->offset_lock);
+    return FILED_OK;
+}
+
+static uint32_t filed_file_status_flags_snapshot(const filed_file_t *file)
+{
+    uint32_t flags = 0;
+
+    if (file == NULL) {
+        return 0;
+    }
+    filed_lock_acquire(filed_mutable_lock(&file->lock));
+    flags = file->status_flags;
+    filed_lock_release(filed_mutable_lock(&file->lock));
+    return flags;
 }
 
 static filed_mount_t *filed_alloc_mount(filed_vfs_t *vfs)
@@ -280,15 +525,22 @@ static const filed_handle_t *filed_find_handle_const(const filed_vfs_t *vfs, fil
 static filed_vnode_t *filed_find_backend_vnode(
     filed_vfs_t *vfs,
     filed_mount_id_t mount_id,
-    filed_backend_object_id_t backend_object)
+    filed_backend_object_id_t backend_object,
+    filed_vnode_id_t parent,
+    const char *name)
 {
     size_t i;
 
+    if (vfs == NULL || backend_object == 0 || parent == 0 || name == NULL) {
+        return NULL;
+    }
     for (i = 0; i < FILED_MAX_VNODES; ++i) {
         if (vfs->vnodes[i].active &&
             vfs->vnodes[i].linked &&
             vfs->vnodes[i].mount_id == mount_id &&
-            vfs->vnodes[i].backend_object == backend_object)
+            vfs->vnodes[i].backend_object == backend_object &&
+            vfs->vnodes[i].parent == parent &&
+            strcmp(vfs->vnodes[i].name, name) == 0)
         {
             return &vfs->vnodes[i];
         }
@@ -415,6 +667,7 @@ static filed_status_t filed_open_vnode(
     filed_handle_t *handle;
     filed_file_id_t file_id;
     filed_handle_id_t handle_id;
+    filed_status_t status;
 
     if (vfs == NULL || vnode == NULL || out_open == NULL || rights == 0) {
         return FILED_ERR_INVALID;
@@ -439,10 +692,16 @@ static filed_status_t filed_open_vnode(
         return FILED_ERR_FULL;
     }
 
+    status = filed_vnode_ref_inc(vnode);
+    if (status != FILED_OK) {
+        return status;
+    }
+
     file_id = vfs->next_file_id;
     handle_id = vfs->next_handle_id;
 
     memset(file, 0, sizeof(*file));
+    filed_file_init_locks(file);
     file->active = true;
     file->id = file_id;
     file->vnode_id = vnode->id;
@@ -460,7 +719,6 @@ static filed_status_t filed_open_vnode(
     handle->fd_flags = filed_fd_flags_from_open(open_flags);
     handle->generation = 1;
 
-    ++vnode->refcount;
     ++vfs->next_file_id;
     ++vfs->next_handle_id;
 
@@ -470,6 +728,65 @@ static filed_status_t filed_open_vnode(
     out_open->backend_object = vnode->backend_object;
     out_open->kind = vnode->kind;
     return FILED_OK;
+}
+
+static filed_status_t filed_open_backend_child_at(
+    filed_vfs_t *vfs,
+    filed_vnode_t *parent_vnode,
+    filed_backend_object_id_t child_backend_object,
+    filed_vnode_kind_t child_kind,
+    const char *name,
+    uint32_t rights,
+    uint32_t open_flags,
+    filed_vfs_open_result_t *out_open)
+{
+    filed_vnode_t *child;
+    filed_status_t status;
+
+    if (vfs == NULL ||
+        parent_vnode == NULL ||
+        child_backend_object == 0 ||
+        child_kind == 0 ||
+        name == NULL ||
+        out_open == NULL)
+    {
+        return FILED_ERR_INVALID;
+    }
+
+    child = filed_find_backend_vnode(
+        vfs,
+        parent_vnode->mount_id,
+        child_backend_object,
+        parent_vnode->id,
+        name);
+    if (child == NULL) {
+        if (vfs->next_vnode_id == 0) {
+            return FILED_ERR_OVERFLOW;
+        }
+        child = filed_alloc_vnode(vfs);
+        if (child == NULL) {
+            return FILED_ERR_FULL;
+        }
+        memset(child, 0, sizeof(*child));
+        filed_vnode_init_lock(child);
+        child->active = true;
+        child->linked = true;
+        child->id = vfs->next_vnode_id;
+        child->mount_id = parent_vnode->mount_id;
+        child->backend_object = child_backend_object;
+        child->kind = child_kind;
+        child->parent = parent_vnode->id;
+        child->generation = 1;
+        child->refcount = 0;
+        status = filed_copy_name(child->name, sizeof(child->name), name);
+        if (status != FILED_OK) {
+            memset(child, 0, sizeof(*child));
+            return status;
+        }
+        ++vfs->next_vnode_id;
+    }
+
+    return filed_open_vnode(vfs, child, rights, open_flags, out_open);
 }
 
 filed_status_t filed_vfs_mount_root(
@@ -509,6 +826,7 @@ filed_status_t filed_vfs_mount_root(
     mount->fs_kind = fs_kind;
 
     memset(root, 0, sizeof(*root));
+    filed_vnode_init_lock(root);
     root->active = true;
     root->linked = true;
     root->id = root_id;
@@ -571,7 +889,6 @@ filed_status_t filed_vfs_open_backend_child(
     const filed_handle_t *parent;
     const filed_file_t *parent_file;
     filed_vnode_t *parent_vnode;
-    filed_vnode_t *child;
     filed_status_t status;
 
     if (vfs == NULL ||
@@ -605,34 +922,18 @@ filed_status_t filed_vfs_open_backend_child(
         return FILED_ERR_NOT_DIR;
     }
 
-    child = filed_find_backend_vnode(vfs, parent_vnode->mount_id, child_backend_object);
-    if (child == NULL) {
-        if (vfs->next_vnode_id == 0) {
-            return FILED_ERR_OVERFLOW;
-        }
-        child = filed_alloc_vnode(vfs);
-        if (child == NULL) {
-            return FILED_ERR_FULL;
-        }
-        memset(child, 0, sizeof(*child));
-        child->active = true;
-        child->linked = true;
-        child->id = vfs->next_vnode_id;
-        child->mount_id = parent_vnode->mount_id;
-        child->backend_object = child_backend_object;
-        child->kind = child_kind;
-        child->parent = parent_vnode->id;
-        child->generation = 1;
-        child->refcount = 0;
-        status = filed_copy_name(child->name, sizeof(child->name), name);
-        if (status != FILED_OK) {
-            memset(child, 0, sizeof(*child));
-            return status;
-        }
-        ++vfs->next_vnode_id;
-    }
-
-    return filed_open_vnode(vfs, child, rights, open_flags, out_open);
+    filed_vnode_write_lock(parent_vnode);
+    status = filed_open_backend_child_at(
+        vfs,
+        parent_vnode,
+        child_backend_object,
+        child_kind,
+        name,
+        rights,
+        open_flags,
+        out_open);
+    filed_vnode_write_unlock(parent_vnode);
+    return status;
 }
 
 filed_status_t filed_vfs_create_backend_child(
@@ -648,6 +949,7 @@ filed_status_t filed_vfs_create_backend_child(
     const filed_handle_t *parent;
     const filed_file_t *parent_file;
     filed_vnode_t *parent_vnode;
+    filed_status_t status;
 
     if (vfs == NULL || name == NULL || out_open == NULL) {
         return FILED_ERR_INVALID;
@@ -673,18 +975,22 @@ filed_status_t filed_vfs_create_backend_child(
     if (parent_vnode->kind != FILED_VNODE_DIRECTORY) {
         return FILED_ERR_NOT_DIR;
     }
+    filed_vnode_write_lock(parent_vnode);
     if (filed_find_child_vnode(vfs, parent_vnode->id, name) != NULL) {
+        filed_vnode_write_unlock(parent_vnode);
         return FILED_ERR_EXISTS;
     }
-    return filed_vfs_open_backend_child(
+    status = filed_open_backend_child_at(
         vfs,
-        parent_handle,
+        parent_vnode,
         child_backend_object,
         child_kind,
         name,
         rights,
         open_flags,
         out_open);
+    filed_vnode_write_unlock(parent_vnode);
+    return status;
 }
 
 filed_status_t filed_vfs_open_existing(
@@ -765,13 +1071,10 @@ filed_status_t filed_vfs_close_handle_ex(
     if (handle->target_kind == FILED_HANDLE_FILE) {
         file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
         if (file != NULL) {
-            if (file->refcount > 0) {
-                --file->refcount;
-            }
-            if (file->refcount == 0) {
+            if (filed_file_ref_dec_if_nonzero(file) == 0) {
                 vnode = filed_find_vnode(vfs, file->vnode_id);
-                if (vnode != NULL && vnode->refcount > 0) {
-                    --vnode->refcount;
+                if (vnode != NULL) {
+                    (void)filed_vnode_ref_dec_if_nonzero(vnode);
                     filed_reclaim_vnode_if_dead_ex(vfs, vnode, out_reclaim);
                 }
                 memset(file, 0, sizeof(*file));
@@ -798,6 +1101,7 @@ filed_status_t filed_vfs_dup_handle(
     filed_file_t *file;
     filed_handle_t *handle;
     filed_handle_id_t handle_id;
+    filed_status_t status;
 
     if (vfs == NULL || source_handle_id == 0 || out_handle_id == NULL) {
         return FILED_ERR_INVALID;
@@ -815,7 +1119,7 @@ filed_status_t filed_vfs_dup_handle(
     if (file == NULL) {
         return FILED_ERR_INVALID;
     }
-    if (file->refcount == UINT32_MAX || vfs->next_handle_id == 0) {
+    if (vfs->next_handle_id == 0) {
         return FILED_ERR_OVERFLOW;
     }
 
@@ -834,7 +1138,11 @@ filed_status_t filed_vfs_dup_handle(
     handle->fd_flags = fd_flags;
     handle->generation = 1;
 
-    ++file->refcount;
+    status = filed_file_ref_inc(file);
+    if (status != FILED_OK) {
+        memset(handle, 0, sizeof(*handle));
+        return status;
+    }
     ++vfs->next_handle_id;
     *out_handle_id = handle_id;
     return FILED_OK;
@@ -890,7 +1198,9 @@ filed_status_t filed_vfs_get_handle_flags(
     }
 
     out_flags->fd_flags = handle->fd_flags;
+    filed_lock_acquire(filed_mutable_lock(&file->lock));
     out_flags->status_flags = file->status_flags;
+    filed_lock_release(filed_mutable_lock(&file->lock));
     return FILED_OK;
 }
 
@@ -921,7 +1231,9 @@ filed_status_t filed_vfs_set_handle_flags(
     }
 
     handle->fd_flags = flags->fd_flags;
+    filed_lock_acquire(&file->lock);
     file->status_flags = flags->status_flags;
+    filed_lock_release(&file->lock);
     return FILED_OK;
 }
 
@@ -1070,6 +1382,7 @@ filed_status_t filed_vfs_read_prepare(
 {
     const filed_handle_t *handle;
     const filed_file_t *file;
+    uint64_t offset;
     filed_status_t status = filed_prepare_file_handle(
         vfs,
         handle_id,
@@ -1089,11 +1402,12 @@ filed_status_t filed_vfs_read_prepare(
         return FILED_ERR_INVALID;
     }
     file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
-    if (file == NULL || file->offset < 0) {
+    status = filed_file_offset_snapshot(file, &offset);
+    if (status != FILED_OK) {
         memset(out_decision, 0, sizeof(*out_decision));
-        return FILED_ERR_INVALID;
+        return status;
     }
-    out_decision->offset = (uint64_t)file->offset;
+    out_decision->offset = offset;
     out_decision->length = length;
     return FILED_OK;
 }
@@ -1105,7 +1419,6 @@ filed_status_t filed_vfs_read_commit(
 {
     const filed_handle_t *handle;
     filed_file_t *file;
-    uint64_t old_offset;
 
     if (vfs == NULL || handle_id == 0) {
         return FILED_ERR_INVALID;
@@ -1115,15 +1428,7 @@ filed_status_t filed_vfs_read_commit(
         return FILED_ERR_INVALID;
     }
     file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
-    if (file == NULL || file->offset < 0) {
-        return FILED_ERR_INVALID;
-    }
-    old_offset = (uint64_t)file->offset;
-    if (bytes_read > (uint64_t)INT64_MAX - old_offset) {
-        return FILED_ERR_OVERFLOW;
-    }
-    file->offset = (int64_t)(old_offset + bytes_read);
-    return FILED_OK;
+    return filed_file_offset_advance(file, bytes_read);
 }
 
 filed_status_t filed_vfs_write_prepare(
@@ -1134,6 +1439,7 @@ filed_status_t filed_vfs_write_prepare(
 {
     const filed_handle_t *handle;
     const filed_file_t *file;
+    uint64_t offset;
     filed_status_t status = filed_prepare_file_handle(
         vfs,
         handle_id,
@@ -1153,14 +1459,15 @@ filed_status_t filed_vfs_write_prepare(
         return FILED_ERR_INVALID;
     }
     file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
-    if (file == NULL || file->offset < 0) {
+    status = filed_file_offset_snapshot(file, &offset);
+    if (status != FILED_OK) {
         memset(out_decision, 0, sizeof(*out_decision));
-        return FILED_ERR_INVALID;
+        return status;
     }
-    if ((file->status_flags & FILED_FILE_APPEND) != 0) {
+    if ((filed_file_status_flags_snapshot(file) & FILED_FILE_APPEND) != 0) {
         out_decision->offset = UINT64_MAX;
     } else {
-        out_decision->offset = (uint64_t)file->offset;
+        out_decision->offset = offset;
     }
     out_decision->length = length;
     return FILED_OK;
@@ -1260,12 +1567,13 @@ filed_status_t filed_vfs_unlink_commit_ex(
     if (!filed_name_is_component(name)) {
         return FILED_ERR_INVALID;
     }
+    filed_vnode_write_lock(parent_vnode);
     child = filed_find_child_vnode(vfs, parent_vnode->id, name);
     if (child != NULL) {
-        child->linked = false;
-        ++child->generation;
+        (void)filed_vnode_mark_unlinked(child);
         filed_reclaim_vnode_if_dead_ex(vfs, child, out_reclaim);
     }
+    filed_vnode_write_unlock(parent_vnode);
     return FILED_OK;
 }
 
@@ -1340,22 +1648,28 @@ filed_status_t filed_vfs_rename_commit_ex(
     if (status != FILED_OK) {
         return status;
     }
-    old_child = filed_find_child_vnode(vfs, old_parent->id, old_name);
     if (!filed_name_is_component(old_name) || !filed_name_is_component(new_name)) {
         return FILED_ERR_INVALID;
     }
+    filed_vnode_write_lock_pair(old_parent, new_parent);
+    old_child = filed_find_child_vnode(vfs, old_parent->id, old_name);
     replaced = filed_find_child_vnode(vfs, new_parent->id, new_name);
     if (replaced != NULL && replaced != old_child) {
-        replaced->linked = false;
-        ++replaced->generation;
+        (void)filed_vnode_mark_unlinked(replaced);
         filed_reclaim_vnode_if_dead_ex(vfs, replaced, out_reclaim);
     }
     if (old_child != NULL) {
+        filed_status_t copy_status;
+        filed_lock_acquire(&old_child->lock);
         old_child->parent = new_parent->id;
         old_child->backend_object = backend_object;
         ++old_child->generation;
-        return filed_copy_name(old_child->name, sizeof(old_child->name), new_name);
+        copy_status = filed_copy_name(old_child->name, sizeof(old_child->name), new_name);
+        filed_lock_release(&old_child->lock);
+        filed_vnode_write_unlock_pair(old_parent, new_parent);
+        return copy_status;
     }
+    filed_vnode_write_unlock_pair(old_parent, new_parent);
     return FILED_OK;
 }
 
@@ -1384,6 +1698,7 @@ filed_status_t filed_vfs_getdents_prepare(
 {
     const filed_handle_t *handle;
     const filed_file_t *file;
+    uint64_t offset;
     filed_status_t status = filed_prepare_file_handle(
         vfs,
         handle_id,
@@ -1402,11 +1717,12 @@ filed_status_t filed_vfs_getdents_prepare(
         return FILED_ERR_INVALID;
     }
     file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
-    if (file == NULL || file->offset < 0) {
+    status = filed_file_offset_snapshot(file, &offset);
+    if (status != FILED_OK) {
         memset(out_decision, 0, sizeof(*out_decision));
-        return FILED_ERR_INVALID;
+        return status;
     }
-    out_decision->offset = (uint64_t)file->offset;
+    out_decision->offset = offset;
     return FILED_OK;
 }
 
