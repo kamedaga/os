@@ -319,7 +319,7 @@ func runnerEnv(workspace *config.Workspace) []string {
 		"PACGO_NIX_DEVELOP=1",
 		"GOCACHE=" + filepath.Join(workspace.Path(workspace.Artifacts), "go-build"),
 	}
-	for _, name := range []string{"CAPOS_QEMU", "CAPOS_OVMF_CODE", "CAPOS_OVMF_VARS_TEMPLATE"} {
+	for _, name := range []string{"CAPOS_QEMU"} {
 		if value := os.Getenv(name); value != "" {
 			env = append(env, name+"="+value)
 		}

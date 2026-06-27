@@ -66,6 +66,28 @@ Definition fail
     eevdf_result_rq := rq;
   |}.
 
+Definition eevdf_empty_entity : eevdf_entity :=
+  {|
+    ee_thread_id := no_thread_id;
+    ee_generation := 0;
+    ee_weight := 0;
+    ee_slice_ns := 0;
+    ee_service_ns := 0;
+    ee_vruntime := 0;
+    ee_eligible_time := 0;
+    ee_deadline := 0;
+    ee_state := EEmpty;
+  |}.
+
+Definition eevdf_empty_runqueue : eevdf_runqueue :=
+  {|
+    er_entities := repeat eevdf_empty_entity eevdf_max_entities;
+    er_entity_count := 0%nat;
+    er_runnable_count := 0%nat;
+    er_virtual_time := 0;
+    er_min_vruntime := 0;
+  |}.
+
 Definition z_max
     (lhs rhs : Z)
   : Z :=
@@ -284,6 +306,23 @@ Definition replace_entity
   {|
     er_entities := replace_nth (er_entities rq) index entity;
     er_entity_count := er_entity_count rq;
+    er_runnable_count := er_runnable_count rq;
+    er_virtual_time := er_virtual_time rq;
+    er_min_vruntime := er_min_vruntime rq;
+  |}.
+
+Definition remove_entity_at
+    (rq : eevdf_runqueue)
+    (index : nat)
+  : eevdf_runqueue :=
+  let active := firstn (er_entity_count rq) (er_entities rq) in
+  let compacted := firstn index active ++ skipn (S index) active in
+  {|
+    er_entities :=
+      compacted ++
+      repeat eevdf_empty_entity
+        (eevdf_max_entities - length compacted)%nat;
+    er_entity_count := (er_entity_count rq - 1)%nat;
     er_runnable_count := er_runnable_count rq;
     er_virtual_time := er_virtual_time rq;
     er_min_vruntime := er_min_vruntime rq;

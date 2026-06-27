@@ -34,6 +34,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/fd_ipc.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/ipc_protocol.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/kobox_backend.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/page_cache.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/runtime.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/vfs.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"

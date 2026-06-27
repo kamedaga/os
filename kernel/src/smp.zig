@@ -1,5 +1,4 @@
 const std = @import("std");
-const uefi = std.os.uefi;
 const x86_platform = @import("arch/x86_64/platform.zig");
 const lapic = @import("lapic.zig");
 const interrupts = @import("interrupts.zig");
@@ -42,7 +41,7 @@ var ap_user_timer_initial_count: u32 = 0;
 var ap_syscall_entry: usize = 0;
 var wake_ipi_vector: u8 = 0;
 
-extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.c) void;
+extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -128,92 +127,6 @@ pub fn isCpuIdle(cpu_slot: usize) bool {
     return cpuState(cpu_slot) == .idle;
 }
 
-fn readU16(addr: u64) u16 {
-    const p: [*]const u8 = @ptrFromInt(addr);
-    return @as(u16, p[0]) | (@as(u16, p[1]) << 8);
-}
-
-fn readU32(addr: u64) u32 {
-    const p: [*]const u8 = @ptrFromInt(addr);
-    return @as(u32, p[0]) |
-        (@as(u32, p[1]) << 8) |
-        (@as(u32, p[2]) << 16) |
-        (@as(u32, p[3]) << 24);
-}
-
-fn readU64(addr: u64) u64 {
-    return @as(u64, readU32(addr)) | (@as(u64, readU32(addr + 4)) << 32);
-}
-
-fn bytesEqual(addr: u64, expected: []const u8) bool {
-    const p: [*]const u8 = @ptrFromInt(addr);
-    var i: usize = 0;
-    while (i < expected.len) : (i += 1) {
-        if (p[i] != expected[i]) return false;
-    }
-    return true;
-}
-
-fn checksumOk(addr: u64, len: usize) bool {
-    const p: [*]const u8 = @ptrFromInt(addr);
-    var sum: u8 = 0;
-    var i: usize = 0;
-    while (i < len) : (i += 1) sum +%= p[i];
-    return sum == 0;
-}
-
-fn tableLength(addr: u64) usize {
-    return @intCast(readU32(addr + 4));
-}
-
-fn findRsdp() ?u64 {
-    const ct = uefi.tables.ConfigurationTable;
-    const st = uefi.system_table;
-    var fallback: ?u64 = null;
-    var i: usize = 0;
-    while (i < st.number_of_table_entries) : (i += 1) {
-        const entry = st.configuration_table[i];
-        if (std.meta.eql(entry.vendor_guid, ct.acpi_20_table_guid)) {
-            return @intFromPtr(entry.vendor_table);
-        }
-        if (std.meta.eql(entry.vendor_guid, ct.acpi_10_table_guid)) {
-            fallback = @intFromPtr(entry.vendor_table);
-        }
-    }
-    return fallback;
-}
-
-fn findMadtFromRoot(root_addr: u64, xsdt: bool) ?u64 {
-    if (!bytesEqual(root_addr, if (xsdt) "XSDT" else "RSDT")) return null;
-    const len = tableLength(root_addr);
-    if (len < 36 or !checksumOk(root_addr, len)) return null;
-    const entry_size: usize = if (xsdt) 8 else 4;
-    var off: usize = 36;
-    while (off + entry_size <= len) : (off += entry_size) {
-        const table_addr = if (xsdt) readU64(root_addr + off) else @as(u64, readU32(root_addr + off));
-        if (table_addr == 0) continue;
-        if (bytesEqual(table_addr, "APIC")) return table_addr;
-    }
-    return null;
-}
-
-fn findMadt() ?u64 {
-    const rsdp = findRsdp() orelse return null;
-    if (!bytesEqual(rsdp, "RSD PTR ")) return null;
-    const revision = (@as([*]const u8, @ptrFromInt(rsdp)))[15];
-    if (!checksumOk(rsdp, 20)) return null;
-    if (revision >= 2) {
-        const len = readU32(rsdp + 20);
-        const xsdt_addr = readU64(rsdp + 24);
-        if (len >= 36 and xsdt_addr != 0 and checksumOk(rsdp, @intCast(len))) {
-            if (findMadtFromRoot(xsdt_addr, true)) |madt| return madt;
-        }
-    }
-    const rsdt_addr = readU32(rsdp + 16);
-    if (rsdt_addr == 0) return null;
-    return findMadtFromRoot(rsdt_addr, false);
-}
-
 fn appendLapicId(info: *BootInfo, id: u8) void {
     var i: usize = 0;
     while (i < info.lapic_count) : (i += 1) {
@@ -222,50 +135,6 @@ fn appendLapicId(info: *BootInfo, id: u8) void {
     if (info.lapic_count >= max_cpus) return;
     info.lapic_ids[info.lapic_count] = id;
     info.lapic_count += 1;
-}
-
-fn collectMadtLapicIds(info: *BootInfo) void {
-    const madt = findMadt() orelse return;
-    const len = tableLength(madt);
-    if (len < 44 or !checksumOk(madt, len)) return;
-    var off: usize = 44;
-    while (off + 2 <= len) {
-        const entry_addr = madt + off;
-        const entry_type = (@as([*]const u8, @ptrFromInt(entry_addr)))[0];
-        const entry_len = (@as([*]const u8, @ptrFromInt(entry_addr)))[1];
-        if (entry_len < 2 or off + entry_len > len) break;
-        switch (entry_type) {
-            0 => {
-                if (entry_len >= 8) {
-                    const flags = readU32(entry_addr + 4);
-                    if ((flags & 0x1) != 0) appendLapicId(info, (@as([*]const u8, @ptrFromInt(entry_addr)))[3]);
-                }
-            },
-            9 => {
-                if (entry_len >= 16) {
-                    const flags = readU32(entry_addr + 4);
-                    const x2apic_id = readU32(entry_addr + 8);
-                    if ((flags & 0x1) != 0 and x2apic_id <= std.math.maxInt(u8)) {
-                        appendLapicId(info, @intCast(x2apic_id));
-                    }
-                }
-            },
-            else => {},
-        }
-        off += entry_len;
-    }
-}
-
-pub fn prepareBootInfo(bs: *uefi.tables.BootServices) BootInfo {
-    var info = BootInfo{};
-    collectMadtLapicIds(&info);
-
-    const max_addr: [*]align(4096) uefi.Page = @ptrFromInt(0x9F000);
-    const page = bs.allocatePages(.{ .max_address = max_addr }, .loader_data, max_cpus) catch return info;
-    info.trampoline_base = @intFromPtr(page.ptr);
-    const bytes: [*]u8 = @ptrCast(page.ptr);
-    @memset(bytes[0 .. trampoline_page_bytes * max_cpus], 0);
-    return info;
 }
 
 fn emit8(page: [*]u8, off: *usize, value: u8) void {
@@ -468,8 +337,16 @@ fn isStarted(cpu_slot: usize) bool {
     return apStartedPtr(cpu_slot).* != 0;
 }
 
+pub fn markBootstrapCpuReady() void {
+    observed_cpu_count = 1;
+    runtimeLapicIdPtr(0).* = lapic.localApicId();
+    cpuStatePtr(0).* = cpu_state_idle;
+    apStartedPtr(0).* = 1;
+}
+
 pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
     if (info.trampoline_base == 0) {
+        markBootstrapCpuReady();
         return;
     }
     if (info.lapic_count == 0) {
@@ -479,6 +356,7 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
     observed_cpu_count = if (info.lapic_count == 0) 1 else info.lapic_count;
     runtimeLapicIdPtr(0).* = bsp_id;
     cpuStatePtr(0).* = cpu_state_idle;
+    apStartedPtr(0).* = 1;
 
     var cpu_slot: usize = 1;
     var i: usize = 0;
@@ -519,7 +397,7 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
     }
 }
 
-fn apIdleEntry(cpu_slot: usize) callconv(.c) noreturn {
+fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     asm volatile ("cli");
     if (!x86_platform.loadGdtAndReloadSegmentsForCpu(cpu_slot)) {
         cpuStatePtr(cpu_slot).* = cpu_state_absent;
@@ -568,7 +446,7 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
     }
 }
 
-fn apIretToUser(entry: *const scheduler_observer.UserEntry) callconv(.c) void {
+fn apIretToUser(entry: *const scheduler_observer.UserEntry) callconv(.winapi) void {
     asm volatile (std.fmt.comptimePrint(
             \\mov %[entry], %%rbx
             \\mov {d}(%%rbx), %%r11
@@ -639,7 +517,7 @@ fn apIretToUser(entry: *const scheduler_observer.UserEntry) callconv(.c) void {
         : .{ .memory = true });
 }
 
-fn jumpToUserReturn() callconv(.c) void {
+fn jumpToUserReturn() callconv(.winapi) void {
     asm volatile ("jmp userReturnToSavedFrame" ::: .{ .memory = true });
 }
 

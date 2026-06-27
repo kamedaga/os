@@ -1,6 +1,7 @@
 #include "filed/fd_ipc.h"
 
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "pacha/abi.h"
@@ -12,7 +13,7 @@ int filed_ipc_recv_wait(int fd, struct pacha_ipc_msg *msg)
     }
 
     for (unsigned int i = 0; i < FILED_IPC_WAIT_SPINS; ++i) {
-        const int status = pacha_ipc_recv(fd, msg);
+        const int status = pacha_ipc_recv_wait(fd, msg, UINT64_MAX);
         if (status == 0) {
             return 0;
         }

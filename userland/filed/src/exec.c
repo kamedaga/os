@@ -4,8 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "filed/runtime.h"
+#include "filed/page_cache.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
@@ -73,6 +75,26 @@ typedef struct filed_exec_loaded_image {
 
 static int filed_exec_validate_elf_header(const filed_exec_image_t *image);
 
+static uint64_t filed_exec_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void filed_exec_metric(const char *op, uint64_t start_ns, uint64_t end_ns)
+{
+    if (op == NULL || start_ns == 0 || end_ns < start_ns) {
+        return;
+    }
+    printf(
+        "[filed] metric scope=exec op=%s ns=%llu\n",
+        op,
+        (unsigned long long)(end_ns - start_ns));
+}
+
 static uint16_t filed_exec_rd16(const unsigned char *p)
 {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -110,6 +132,11 @@ static int filed_exec_align_up(uint64_t value, uint64_t *out)
     }
     *out = (value + (FILED_EXEC_PAGE_SIZE - 1)) & ~(uint64_t)(FILED_EXEC_PAGE_SIZE - 1);
     return 0;
+}
+
+static uint64_t filed_exec_max_u64(uint64_t a, uint64_t b)
+{
+    return a > b ? a : b;
 }
 
 static uint64_t filed_exec_prot_from_elf_flags(uint32_t flags)
@@ -491,56 +518,59 @@ static int filed_exec_read_range(
     unsigned char *buffer,
     uint64_t length)
 {
-    uint64_t offset = 0;
+    filed_vfs_io_decision_t read_decision;
+    uint64_t got = 0;
 
     if (runtime == NULL || buffer == NULL || start_offset > file_size ||
         length > file_size - start_offset)
     {
         return -22;
     }
+    if (length == 0) {
+        return 0;
+    }
 
-    while (offset < length) {
-        filed_vfs_io_decision_t read_decision;
-        uint64_t got = 0;
-        uint64_t want = length - offset;
-        if (want > FILED_EXEC_PAGE_SIZE) {
-            want = FILED_EXEC_PAGE_SIZE;
-        }
-        const filed_status_t vfs_status = filed_vfs_pread_prepare(
-            &runtime->vfs,
-            handle_id,
-            start_offset + offset,
-            want,
-            &read_decision);
-        if (vfs_status != FILED_OK) {
-            fprintf(stderr,
-                "[filed] exec read prepare failed handle=%u offset=%llu want=%llu status=%d\n",
-                (unsigned)handle_id,
-                (unsigned long long)(start_offset + offset),
-                (unsigned long long)want,
-                (int)vfs_status);
-            return -13;
-        }
-        const int status = filed_kobox_backend_pread(
-            &runtime->backend,
-            backend_object,
-            read_decision.offset,
-            buffer + offset,
-            read_decision.length,
-            &got);
-        if (status != 0 || got == 0 || got > want) {
-            fprintf(stderr,
-                "[filed] exec pread failed object=%llu offset=%llu want=%llu decision_offset=%llu decision_length=%llu status=%d got=%llu\n",
-                (unsigned long long)backend_object,
-                (unsigned long long)(start_offset + offset),
-                (unsigned long long)want,
-                (unsigned long long)read_decision.offset,
-                (unsigned long long)read_decision.length,
-                status,
-                (unsigned long long)got);
-            return status != 0 ? status : -5;
-        }
-        offset += got;
+    const filed_status_t vfs_status = filed_vfs_pread_prepare(
+        &runtime->vfs,
+        handle_id,
+        start_offset,
+        length,
+        &read_decision);
+    if (vfs_status != FILED_OK) {
+        fprintf(stderr,
+            "[filed] exec read prepare failed handle=%u offset=%llu want=%llu status=%d\n",
+            (unsigned)handle_id,
+            (unsigned long long)start_offset,
+            (unsigned long long)length,
+            (int)vfs_status);
+        return -13;
+    }
+    if (read_decision.backend_object != backend_object) {
+        fprintf(stderr,
+            "[filed] exec read object changed expected=%llu actual=%llu\n",
+            (unsigned long long)backend_object,
+            (unsigned long long)read_decision.backend_object);
+        return -13;
+    }
+
+    const int status = filed_cached_pread(
+        runtime,
+        backend_object,
+        read_decision.offset,
+        buffer,
+        read_decision.length,
+        &got);
+    if (status != 0 || got != length) {
+        fprintf(stderr,
+            "[filed] exec pread failed object=%llu offset=%llu want=%llu decision_offset=%llu decision_length=%llu status=%d got=%llu\n",
+            (unsigned long long)backend_object,
+            (unsigned long long)start_offset,
+            (unsigned long long)length,
+            (unsigned long long)read_decision.offset,
+            (unsigned long long)read_decision.length,
+            status,
+            (unsigned long long)got);
+        return status != 0 ? status : -5;
     }
     return 0;
 }
@@ -551,11 +581,12 @@ static int filed_exec_read_image(
     filed_exec_image_t *out_image)
 {
     filed_vfs_io_decision_t stat_decision;
+    filed_vfs_stat_snapshot_t snapshot;
     koboxd_wire_fs_statx_t stat;
     filed_status_t vfs_status;
     unsigned char ehdr[FILED_EXEC_ELF64_EHDR_BYTES];
-    unsigned char *metadata = NULL;
     unsigned char *image;
+    int status;
 
     if (runtime == NULL || out_image == NULL) {
         return -22;
@@ -566,10 +597,33 @@ static int filed_exec_read_image(
     if (vfs_status != FILED_OK) {
         return -13;
     }
+    memset(&snapshot, 0, sizeof(snapshot));
+    vfs_status = filed_vfs_get_stat_snapshot(&runtime->vfs, handle_id, &snapshot);
+    if (vfs_status != FILED_OK) {
+        return -13;
+    }
     memset(&stat, 0, sizeof(stat));
-    int status = filed_kobox_backend_statx(&runtime->backend, stat_decision.backend_object, &stat);
-    if (status != 0) {
-        return status;
+    if (snapshot.valid) {
+        stat.mode = snapshot.mode;
+        stat.size = snapshot.size;
+        stat.blocks = snapshot.blocks;
+        stat.nlink = snapshot.nlink;
+        stat.kind = snapshot.kind;
+    } else {
+        status = filed_kobox_backend_statx(&runtime->backend, stat_decision.backend_object, &stat);
+        if (status != 0) {
+            return status;
+        }
+        snapshot.valid = true;
+        snapshot.mode = stat.mode;
+        snapshot.size = stat.size;
+        snapshot.blocks = stat.blocks;
+        snapshot.nlink = stat.nlink;
+        snapshot.kind = stat.kind;
+        (void)filed_vfs_update_stat_snapshot(
+            &runtime->vfs,
+            stat_decision.backend_object,
+            &snapshot);
     }
     if ((stat.kind & 0170000u) != 0100000u || stat.size < FILED_EXEC_ELF64_EHDR_BYTES ||
         stat.size > FILED_EXEC_MAX_IMAGE_BYTES)
@@ -600,50 +654,54 @@ static int filed_exec_read_image(
     if (e_phoff > stat.size || phdr_bytes > stat.size - e_phoff) {
         return -8;
     }
-    const uint64_t metadata_size = e_phoff + phdr_bytes;
-    if (metadata_size > FILED_EXEC_MAX_IMAGE_BYTES) {
+    const uint64_t metadata_size =
+        filed_exec_max_u64(e_phoff + phdr_bytes, FILED_EXEC_ELF64_EHDR_BYTES);
+    if (metadata_size > FILED_EXEC_MAX_IMAGE_BYTES || metadata_size > stat.size) {
         return -8;
     }
 
-    metadata = malloc((size_t)metadata_size);
-    if (metadata == NULL) {
+    image = malloc((size_t)metadata_size);
+    if (image == NULL) {
         return -12;
     }
-    status = filed_exec_read_range(
-        runtime,
-        handle_id,
-        stat_decision.backend_object,
-        stat.size,
-        0,
-        metadata,
-        metadata_size);
-    if (status != 0) {
-        free(metadata);
-        return status;
+    memcpy(image, ehdr, sizeof(ehdr));
+    if (metadata_size > sizeof(ehdr)) {
+        status = filed_exec_read_range(
+            runtime,
+            handle_id,
+            stat_decision.backend_object,
+            stat.size,
+            sizeof(ehdr),
+            image + sizeof(ehdr),
+            metadata_size - sizeof(ehdr));
+        if (status != 0) {
+            free(image);
+            return status;
+        }
     }
 
     filed_exec_image_t metadata_image = {
-        .bytes = metadata,
+        .bytes = image,
         .size = metadata_size,
     };
     if (filed_exec_validate_elf_header(&metadata_image) != 0) {
-        free(metadata);
+        free(image);
         return -8;
     }
 
     uint64_t needed_size = metadata_size;
     for (uint16_t i = 0; i < e_phnum; ++i) {
-        const unsigned char *ph = metadata + e_phoff + (uint64_t)i * e_phentsize;
+        const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
         const uint32_t p_type = filed_exec_rd32(ph);
         if (p_type == FILED_EXEC_ELF_PT_LOAD || p_type == FILED_EXEC_ELF_PT_INTERP) {
             const uint64_t p_offset = filed_exec_rd64(ph + 8);
             const uint64_t p_filesz = filed_exec_rd64(ph + 32);
             if (p_offset > stat.size || p_filesz > stat.size - p_offset) {
-                free(metadata);
+                free(image);
                 return -8;
             }
             if (p_offset > UINT64_MAX - p_filesz) {
-                free(metadata);
+                free(image);
                 return -75;
             }
             const uint64_t end = p_offset + p_filesz;
@@ -653,27 +711,29 @@ static int filed_exec_read_image(
         }
     }
     if (needed_size < metadata_size || needed_size > FILED_EXEC_MAX_IMAGE_BYTES) {
-        free(metadata);
+        free(image);
         return -8;
     }
 
-    image = malloc((size_t)needed_size);
-    if (image == NULL) {
-        free(metadata);
-        return -12;
-    }
-    status = filed_exec_read_range(
-        runtime,
-        handle_id,
-        stat_decision.backend_object,
-        stat.size,
-        0,
-        image,
-        needed_size);
-    free(metadata);
-    if (status != 0) {
-        free(image);
-        return status;
+    if (needed_size > metadata_size) {
+        unsigned char *expanded = realloc(image, (size_t)needed_size);
+        if (expanded == NULL) {
+            free(image);
+            return -12;
+        }
+        image = expanded;
+        status = filed_exec_read_range(
+            runtime,
+            handle_id,
+            stat_decision.backend_object,
+            stat.size,
+            metadata_size,
+            image + metadata_size,
+            needed_size - metadata_size);
+        if (status != 0) {
+            free(image);
+            return status;
+        }
     }
 
     out_image->bytes = image;
@@ -1277,6 +1337,7 @@ int filed_exec_handle(
     }
 
     memset(prepared, 0, sizeof(prepared));
+    uint64_t stage_start = filed_exec_now_ns();
     int status = filed_exec_prepare_inherit_fds(
         request,
         inherit_fds,
@@ -1284,18 +1345,23 @@ int filed_exec_handle(
         bootstrap_fd,
         prepared,
         &prepared_count);
+    filed_exec_metric("prepare_inherit_fds", stage_start, filed_exec_now_ns());
     if (status != 0) {
         return status;
     }
 
+    stage_start = filed_exec_now_ns();
     status = filed_exec_read_image(runtime, handle_id, &image);
+    filed_exec_metric("read_image", stage_start, filed_exec_now_ns());
     if (status != 0) {
         fprintf(stderr, "[filed] exec read image failed status=%d\n", status);
         filed_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
 
+    stage_start = filed_exec_now_ns();
     status = filed_exec_load_image(runtime, &image, &plan);
+    filed_exec_metric("load_image", stage_start, filed_exec_now_ns());
     free(image.bytes);
     if (status != 0) {
         fprintf(stderr, "[filed] exec load image failed status=%d\n", status);
@@ -1303,7 +1369,9 @@ int filed_exec_handle(
         return status;
     }
 
+    stage_start = filed_exec_now_ns();
     status = filed_exec_start_plan(&plan, request, bootstrap_fd);
+    filed_exec_metric("start_plan", stage_start, filed_exec_now_ns());
     filed_exec_clear_prepared_inherit_fds(prepared, prepared_count);
     if (status != 0) {
         fprintf(stderr, "[filed] exec start failed status=%d\n", status);

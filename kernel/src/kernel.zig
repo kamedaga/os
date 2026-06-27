@@ -390,6 +390,7 @@ pub const max_ipc_channels: usize = 512;
 pub const max_ipc_replies: usize = 1024;
 pub const max_ipc_queue_messages: usize = 16;
 pub const max_ipc_message_fds: usize = 8;
+pub const max_ipc_waiters: usize = 256;
 
 pub const IpcEndpointRef = struct {
     index: u32 = 0,
@@ -420,6 +421,158 @@ pub const IpcReplyRef = struct {
 
     pub fn isNull(self: IpcReplyRef) bool {
         return self.generation == 0;
+    }
+};
+
+pub const IpcWaitKey = struct {
+    kind: KernelObjectKind = .none,
+    index: u32 = 0,
+    generation: u32 = 0,
+    side: u8 = 0,
+
+    fn matches(self: IpcWaitKey, other: IpcWaitKey) bool {
+        return self.kind == other.kind and
+            self.index == other.index and
+            self.generation == other.generation and
+            self.side == other.side;
+    }
+};
+
+pub const IpcWaiter = struct {
+    active: bool = false,
+    owner: PrincipalId = default_process_principal,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
+    pollfd_va: u64 = 0,
+    recv_msg_va: u64 = 0,
+    recv_fd: Fd = 0,
+    recv_fd_capacity: u8 = 0,
+    events: u64 = 0,
+    key: IpcWaitKey = .{},
+};
+
+pub const ThreadWakeTarget = struct {
+    owner: PrincipalId = default_process_principal,
+    thread_index: usize = 0,
+    thread_generation: u32 = 0,
+    hint_only: bool = false,
+    pollfd_va: u64 = 0,
+    recv_msg_va: u64 = 0,
+    recv_fd: Fd = 0,
+    recv_fd_capacity: u8 = 0,
+    revents: u64 = 0,
+};
+
+const max_ipc_object_waiters: usize = 8;
+
+const IpcWaitList = struct {
+    waiters: [max_ipc_object_waiters]IpcWaiter = [_]IpcWaiter{.{}} ** max_ipc_object_waiters,
+    handoff_hint_valid: bool = false,
+    handoff_hint: ThreadWakeTarget = .{},
+
+    fn rememberHandoffHint(
+        self: *IpcWaitList,
+        owner: PrincipalId,
+        thread_index: usize,
+        thread_generation: u32,
+    ) void {
+        self.handoff_hint = .{
+            .owner = owner,
+            .thread_index = thread_index,
+            .thread_generation = thread_generation,
+            .hint_only = true,
+        };
+        self.handoff_hint_valid = true;
+    }
+
+    fn register(
+        self: *IpcWaitList,
+        key: IpcWaitKey,
+        owner: PrincipalId,
+        pollfd_va: u64,
+        recv_msg_va: u64,
+        recv_fd: Fd,
+        recv_fd_capacity: u8,
+        events: u64,
+        thread_index: usize,
+        thread_generation: u32,
+    ) KernelError!void {
+        if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+        const thread_index_u32: u32 = @intCast(thread_index);
+        self.rememberHandoffHint(owner, thread_index, thread_generation);
+        var free_index: ?usize = null;
+        var i: usize = 0;
+        while (i < self.waiters.len) : (i += 1) {
+            const waiter = &self.waiters[i];
+            if (!waiter.active) {
+                if (free_index == null) free_index = i;
+                continue;
+            }
+            if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
+                waiter.events |= events;
+                waiter.key = key;
+                waiter.owner = owner;
+                waiter.pollfd_va = pollfd_va;
+                waiter.recv_msg_va = recv_msg_va;
+                waiter.recv_fd = recv_fd;
+                waiter.recv_fd_capacity = recv_fd_capacity;
+                return;
+            }
+        }
+        const target = free_index orelse return KernelError.TableFull;
+        self.waiters[target] = .{
+            .active = true,
+            .owner = owner,
+            .thread_index = thread_index_u32,
+            .thread_generation = thread_generation,
+            .pollfd_va = pollfd_va,
+            .recv_msg_va = recv_msg_va,
+            .recv_fd = recv_fd,
+            .recv_fd_capacity = recv_fd_capacity,
+            .events = events,
+            .key = key,
+        };
+    }
+
+    fn handoffHint(self: *const IpcWaitList) ?ThreadWakeTarget {
+        if (!self.handoff_hint_valid) return null;
+        return self.handoff_hint;
+    }
+
+    fn unregister(self: *IpcWaitList, thread_index: usize, thread_generation: u32) void {
+        if (thread_index > std.math.maxInt(u32)) return;
+        const thread_index_u32: u32 = @intCast(thread_index);
+        for (self.waiters[0..]) |*waiter| {
+            if (!waiter.active) continue;
+            if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
+                waiter.* = .{};
+            }
+        }
+    }
+
+    fn takeReadable(self: *IpcWaitList, out: []ThreadWakeTarget) usize {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        var count: usize = 0;
+        for (self.waiters[0..]) |*waiter| {
+            if (!waiter.active) continue;
+            if ((waiter.events & fd_abi.event_readable) == 0) continue;
+            const target = ThreadWakeTarget{
+                .owner = waiter.owner,
+                .thread_index = waiter.thread_index,
+                .thread_generation = waiter.thread_generation,
+                .pollfd_va = waiter.pollfd_va,
+                .recv_msg_va = waiter.recv_msg_va,
+                .recv_fd = waiter.recv_fd,
+                .recv_fd_capacity = waiter.recv_fd_capacity,
+                .revents = fd_abi.event_readable,
+            };
+            waiter.* = .{};
+            if (count < out.len) {
+                out[count] = target;
+                count += 1;
+            }
+        }
+        return count;
     }
 };
 
@@ -483,6 +636,7 @@ pub const IpcEndpointSlot = struct {
     active: bool = false,
     generation: u32 = 1,
     queue: IpcQueue = .{},
+    waiters: IpcWaitList = .{},
 };
 
 pub const IpcChannelSlot = struct {
@@ -490,6 +644,7 @@ pub const IpcChannelSlot = struct {
     generation: u32 = 1,
     ref_count: u8 = 0,
     queues: [2]IpcQueue = .{ .{}, .{} },
+    waiters: [2]IpcWaitList = .{ .{}, .{} },
 };
 
 pub const IpcReplySlot = struct {
@@ -497,6 +652,7 @@ pub const IpcReplySlot = struct {
     generation: u32 = 1,
     sent: bool = false,
     queue: IpcQueue = .{},
+    waiters: IpcWaitList = .{},
 };
 
 pub const IpcSendFd = struct {
@@ -3497,6 +3653,166 @@ pub const KernelState = struct {
             },
             else => false,
         };
+    }
+
+    fn ipcRecvWaitKeyFromPayload(payload: *const KernelObjectPayload) ?IpcWaitKey {
+        return switch (payload.*) {
+            .endpoint => |endpoint_ref| .{
+                .kind = .endpoint,
+                .index = endpoint_ref.index,
+                .generation = endpoint_ref.generation,
+                .side = 0,
+            },
+            .channel => |handle| blk: {
+                if (handle.side > 1) break :blk null;
+                break :blk .{
+                    .kind = .channel,
+                    .index = handle.channel.index,
+                    .generation = handle.channel.generation,
+                    .side = handle.side,
+                };
+            },
+            .reply => |reply_ref| .{
+                .kind = .reply,
+                .index = reply_ref.index,
+                .generation = reply_ref.generation,
+                .side = 0,
+            },
+            else => null,
+        };
+    }
+
+    fn ipcRecvWaitKeyFromSendPayload(payload: *const KernelObjectPayload) ?IpcWaitKey {
+        return switch (payload.*) {
+            .endpoint => |endpoint_ref| .{
+                .kind = .endpoint,
+                .index = endpoint_ref.index,
+                .generation = endpoint_ref.generation,
+                .side = 0,
+            },
+            .channel => |handle| blk: {
+                if (handle.side > 1) break :blk null;
+                break :blk .{
+                    .kind = .channel,
+                    .index = handle.channel.index,
+                    .generation = handle.channel.generation,
+                    .side = 1 - handle.side,
+                };
+            },
+            .reply => |reply_ref| .{
+                .kind = .reply,
+                .index = reply_ref.index,
+                .generation = reply_ref.generation,
+                .side = 0,
+            },
+            else => null,
+        };
+    }
+
+    fn ipcWaitListForRecvPayload(self: *KernelState, payload: *const KernelObjectPayload) ?*IpcWaitList {
+        return switch (payload.*) {
+            .endpoint => |endpoint_ref| &(self.ipcEndpointSlot(endpoint_ref) orelse return null).waiters,
+            .channel => |handle| blk: {
+                if (handle.side > 1) break :blk null;
+                const channel = self.ipcChannelSlot(handle.channel) orelse break :blk null;
+                break :blk &channel.waiters[@as(usize, handle.side)];
+            },
+            .reply => |reply_ref| &(self.ipcReplySlot(reply_ref) orelse return null).waiters,
+            else => null,
+        };
+    }
+
+    fn ipcWaitListForSendPayload(self: *KernelState, payload: *const KernelObjectPayload) ?*IpcWaitList {
+        return switch (payload.*) {
+            .endpoint => |endpoint_ref| &(self.ipcEndpointSlot(endpoint_ref) orelse return null).waiters,
+            .channel => |handle| blk: {
+                if (handle.side > 1) break :blk null;
+                const channel = self.ipcChannelSlot(handle.channel) orelse break :blk null;
+                break :blk &channel.waiters[1 - @as(usize, handle.side)];
+            },
+            .reply => |reply_ref| &(self.ipcReplySlot(reply_ref) orelse return null).waiters,
+            else => null,
+        };
+    }
+
+    pub fn registerIpcReadableWaiterForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        requested_events: u64,
+        pollfd_va: u64,
+        thread_index: usize,
+        thread_generation: u32,
+    ) KernelError!void {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        if ((requested_events & fd_abi.event_readable) == 0) return;
+        if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+        const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        if (!entry.rights.recv or (!entry.rights.wait and !entry.rights.poll)) return;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+        const key = ipcRecvWaitKeyFromPayload(&slot.payload) orelse return;
+        const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return KernelError.InvalidState;
+        try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, thread_index, thread_generation);
+    }
+
+    pub fn registerIpcRecvCompletionWaiterForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        msg_va: u64,
+        fd_capacity: u8,
+        thread_index: usize,
+        thread_generation: u32,
+    ) KernelError!void {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        if (msg_va == 0) return KernelError.InvalidState;
+        if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+        const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        if (!entry.rights.recv or !entry.rights.wait) return KernelError.InvalidState;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+        const key = ipcRecvWaitKeyFromPayload(&slot.payload) orelse return;
+        const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return KernelError.InvalidState;
+        try waiters.register(key, owner, 0, msg_va, fd, fd_capacity, fd_abi.event_readable, thread_index, thread_generation);
+    }
+
+    pub fn unregisterIpcReadableWaiterForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        requested_events: u64,
+        thread_index: usize,
+        thread_generation: u32,
+    ) void {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        if ((requested_events & fd_abi.event_readable) == 0) return;
+        const entry = self.fdEntryConst(owner, fd) orelse return;
+        if (!entry.rights.recv or (!entry.rights.wait and !entry.rights.poll)) return;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return;
+        const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return;
+        waiters.unregister(thread_index, thread_generation);
+    }
+
+    pub fn wakeIpcWaitersForSendFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        out: []ThreadWakeTarget,
+    ) KernelError!usize {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        const source = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        const send_slot = self.kernelObjectSlotConst(source.object) orelse return KernelError.InvalidState;
+        const key = ipcRecvWaitKeyFromSendPayload(&send_slot.payload) orelse return KernelError.InvalidState;
+        _ = fd_abi;
+        const waiters = self.ipcWaitListForSendPayload(&send_slot.payload) orelse return KernelError.InvalidState;
+        _ = key;
+        const count = waiters.takeReadable(out);
+        if (count == 0 and out.len != 0) {
+            if (waiters.handoffHint()) |hint| {
+                out[0] = hint;
+                return 1;
+            }
+        }
+        return count;
     }
 
     pub fn ipcRecvWakeOwnersForSendFd(

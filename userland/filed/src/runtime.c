@@ -89,6 +89,10 @@ void filed_runtime_init(filed_runtime_t *runtime)
     memset(runtime, 0, sizeof(*runtime));
     runtime->bootstrap_fd = -1;
     runtime->client_endpoint_fd = -1;
+    for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
+        runtime->sessions[i].channel_fd = -1;
+        runtime->sessions[i].page_fd = -1;
+    }
     filed_vfs_init(&runtime->vfs);
     filed_kobox_backend_init(&runtime->backend, -1);
 }
@@ -171,6 +175,20 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
     if (vfs_status != FILED_OK) {
         return -20 - (int)vfs_status;
     }
+    {
+        filed_vfs_stat_snapshot_t root_snapshot;
+        memset(&root_snapshot, 0, sizeof(root_snapshot));
+        root_snapshot.valid = true;
+        root_snapshot.mode = root_stat.mode;
+        root_snapshot.size = root_stat.size;
+        root_snapshot.blocks = root_stat.blocks;
+        root_snapshot.nlink = root_stat.nlink;
+        root_snapshot.kind = root_stat.kind;
+        (void)filed_vfs_update_stat_snapshot(
+            &runtime->vfs,
+            runtime->backend.root_object_id,
+            &root_snapshot);
+    }
     runtime->root_mount_id = root_mount;
 
     memset(&root_open, 0, sizeof(root_open));
@@ -207,14 +225,55 @@ int filed_runtime_serve(filed_runtime_t *runtime)
     }
 
     for (;;) {
-        const int status = filed_dispatch_client_once(runtime, runtime->client_endpoint_fd);
-        if (status == 0 ||
-            status == PACHA_ERR_EMPTY ||
-            status == PACHA_ERR_NOT_READY ||
-            status == -2)
-        {
-            continue;
+        struct pacha_pollfd fds[1 + FILED_RUNTIME_MAX_SESSIONS];
+        uint64_t session_indices[FILED_RUNTIME_MAX_SESSIONS];
+        uint64_t count = 0;
+        fds[count++] = (struct pacha_pollfd){
+            .fd = runtime->client_endpoint_fd,
+            .events = PACHA_FD_EVENT_READABLE,
+            .revents = 0,
+        };
+        for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
+            if (!runtime->sessions[i].active) {
+                continue;
+            }
+            fds[count++] = (struct pacha_pollfd){
+                .fd = runtime->sessions[i].channel_fd,
+                .events = PACHA_FD_EVENT_READABLE,
+                .revents = 0,
+            };
+            session_indices[count - 2u] = i;
         }
-        return status;
+
+        const long wait_status = pacha_fd_wait_many(fds, count, PACHA_FD_WAIT_FOREVER);
+        if (wait_status < 0) {
+            return (int)wait_status;
+        }
+
+        if ((fds[0].revents & (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP)) != 0) {
+            const int status = filed_dispatch_client_once(runtime, runtime->client_endpoint_fd);
+            if (status != 0 &&
+                status != PACHA_ERR_EMPTY &&
+                status != PACHA_ERR_NOT_READY &&
+                status != -2)
+            {
+                return status;
+            }
+        }
+
+        for (uint64_t pos = 1; pos < count; ++pos) {
+            if ((fds[pos].revents & (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP)) == 0) {
+                continue;
+            }
+            const uint64_t session_index = session_indices[pos - 1u];
+            const int status = filed_dispatch_session_once(runtime, session_index);
+            if (status != 0 &&
+                status != PACHA_ERR_EMPTY &&
+                status != PACHA_ERR_NOT_READY &&
+                status != -2)
+            {
+                return status;
+            }
+        }
     }
 }

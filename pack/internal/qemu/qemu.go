@@ -22,6 +22,7 @@ type Options struct {
 	Memory      string
 	Display     string
 	Console     string
+	Firmware    string
 	NoKVM       bool
 	NoNet       bool
 	Fast        bool
@@ -30,6 +31,7 @@ type Options struct {
 	NewTerminal bool
 	Prepare     bool
 	NoBuild     bool
+	LimineImage string
 	Progress    progress.Reporter
 }
 
@@ -39,7 +41,6 @@ type Result struct {
 	ConsoleSocket  string
 	Log            string
 	HostTimeLog    string
-	Vars           string
 	DryRun         bool
 	Started        bool
 }
@@ -48,7 +49,6 @@ type commandPlan struct {
 	Args          []string
 	LogPath       string
 	HostTimeLog   string
-	VarsPath      string
 	ConsoleSocket string
 }
 
@@ -186,7 +186,7 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 	}
 	if opts.DryRun {
 		span.Done("qemu dry-run ready")
-		return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, Vars: plan.VarsPath, DryRun: true}, nil
+		return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, DryRun: true}, nil
 	}
 	span.Set(3, "starting qemu")
 	hostLogFile, err := os.Create(plan.HostTimeLog)
@@ -225,7 +225,7 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 			return Result{}, err
 		} else if exited {
 			span.Done("qemu exited")
-			return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, Vars: plan.VarsPath}, nil
+			return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog}, nil
 		}
 		span.Message("starting console terminal")
 		consoleCmd := exec.Command(consoleArgs[0], consoleArgs[1:]...)
@@ -241,7 +241,7 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 	if err := <-done; err != nil {
 		return Result{}, err
 	}
-	return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, Vars: plan.VarsPath}, nil
+	return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog}, nil
 }
 
 func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) {
@@ -687,13 +687,37 @@ func terminateQEMU(cmd *exec.Cmd, done <-chan error) {
 
 func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error) {
 	qemuPath := firstNonEmpty(os.Getenv("CAPOS_QEMU"), "qemu-system-x86_64")
-	codePath := firstExisting(os.Getenv("CAPOS_OVMF_CODE"), "/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd")
-	varsTemplate := firstExisting(os.Getenv("CAPOS_OVMF_VARS_TEMPLATE"), "/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd")
-	if codePath == "" {
-		return commandPlan{}, fmt.Errorf("missing OVMF code firmware; set CAPOS_OVMF_CODE")
+	if opts.LimineImage == "" {
+		opts.LimineImage = workspace.Path(workspace.Artifacts, "limine-boot.img")
 	}
-	if varsTemplate == "" {
-		return commandPlan{}, fmt.Errorf("missing OVMF vars template; set CAPOS_OVMF_VARS_TEMPLATE")
+	switch firstNonEmpty(opts.Firmware, "bios") {
+	case "bios":
+		return limineBiosCommandArgs(workspace, qemuPath, opts)
+	case "uefi":
+		return limineUefiCommandArgs(workspace, qemuPath, opts)
+	default:
+		return commandPlan{}, fmt.Errorf("invalid firmware %q; expected bios or uefi", opts.Firmware)
+	}
+}
+
+func limineImagePath(workspace *config.Workspace, image string) (string, error) {
+	if image == "" {
+		image = workspace.Path(workspace.Artifacts, "limine-boot.img")
+	}
+	if !filepath.IsAbs(image) {
+		image = workspace.Path(image)
+	}
+	if _, err := os.Stat(image); err != nil {
+		return "", err
+	}
+	return image, nil
+}
+
+func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Options) (commandPlan, error) {
+	imagePath := opts.LimineImage
+	imagePath, err := limineImagePath(workspace, imagePath)
+	if err != nil {
+		return commandPlan{}, err
 	}
 	diskPath := workspace.Path(workspace.Disk.Image)
 	if _, err := os.Stat(diskPath); err != nil {
@@ -703,18 +727,15 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		opts.Memory = "2G"
 	}
 	if opts.Display == "" {
-		opts.Display = "gtk,grab-on-hover=off"
+		opts.Display = "none"
 	}
 	artifacts := workspace.Path(workspace.Artifacts)
 	if err := os.MkdirAll(artifacts, 0o755); err != nil {
 		return commandPlan{}, err
 	}
-	logPath := filepath.Join(artifacts, "qemu.log")
-	hostTimeLogPath := filepath.Join(artifacts, "qemu-host-time.log")
-	varsPath := filepath.Join(artifacts, "OVMF_VARS.fd")
-	if err := copyFile(varsTemplate, varsPath); err != nil {
-		return commandPlan{}, err
-	}
+	logPath := filepath.Join(artifacts, "qemu-limine.log")
+	hostTimeLogPath := filepath.Join(artifacts, "qemu-limine-host-time.log")
+	_ = os.WriteFile(logPath, nil, 0o644)
 	args := []string{
 		qemuPath,
 		"-machine", "q35",
@@ -722,74 +743,98 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 		"-smp", "4",
 		"-monitor", "none",
 	}
-	if opts.Fast {
-		args = append(args, "-nodefaults", "-no-reboot")
-		_ = os.WriteFile(logPath, nil, 0o644)
-	} else {
-		args = append(args, "-d", "int,guest_errors,cpu_reset", "-D", logPath)
-	}
 	args = append(args,
-		"-display", opts.Display,
-		"-vga", "none",
-		"-drive", "if=pflash,format=raw,readonly=on,file="+codePath,
-		"-drive", "if=pflash,format=raw,file="+varsPath,
-		"-drive", "if=none,file="+diskPath+",format=raw,id=bootdisk",
-		"-device", "nvme,drive=bootdisk,serial=capos-root",
-		"-serial", "stdio",
+		"-drive", "file="+imagePath+",format=raw,if=ide",
+		"-drive", "if=none,file="+diskPath+",format=raw,id=rootdisk",
+		"-device", "nvme,drive=rootdisk,serial=capos-root",
+		"-boot", "order=c",
+		"-no-reboot",
 	)
-	if !opts.Fast {
-		if opts.Display != "none" {
-			args = append(args,
-				"-device", "virtio-tablet-pci",
-				"-device", "virtio-keyboard-pci",
-			)
-		}
-	}
-	args = append(args, "-device", "virtio-vga")
-	console := firstNonEmpty(opts.Console, "pty")
-	consoleSocket := ""
-	switch console {
-	case "off":
-		if opts.NewTerminal {
-			return commandPlan{}, fmt.Errorf("--new-terminal requires virtio-console; remove --console off")
-		}
-	case "pty":
-		if opts.NewTerminal {
-			var err error
-			consoleSocket, err = consoleSocketPath(workspace)
-			if err != nil {
-				return commandPlan{}, err
-			}
-			_ = os.Remove(consoleSocket)
-			args = append(args,
-				"-device", "virtio-serial-pci",
-				"-chardev", "socket,id=capconsole,path="+consoleSocket+",server=on,wait=off",
-				"-device", "virtconsole,chardev=capconsole,name=capabilityos.console.0",
-			)
-			break
-		}
-		args = append(args,
-			"-device", "virtio-serial-pci",
-			"-chardev", "pty,id=capconsole",
-			"-device", "virtconsole,chardev=capconsole,name=capabilityos.console.0",
-		)
-	default:
-		return commandPlan{}, fmt.Errorf("invalid console backend: %s", console)
-	}
-	if !opts.NoNet {
-		args = append(args,
-			"-netdev", "user,id=capnet0,ipv6=off,dhcpstart=10.0.2.15",
-			"-device", "virtio-net-pci,netdev=capnet0,mac=52:54:00:12:34:56",
-		)
+	if opts.Display == "none" {
+		args = append(args, "-nographic")
+	} else {
+		args = append(args, "-display", opts.Display, "-serial", "stdio")
 	}
 	if !opts.NoKVM {
-		if err := validateKVMAvailable(); err != nil {
-			return commandPlan{}, err
-		}
-		args = append([]string{args[0], "-enable-kvm", "-cpu", "host"}, args[1:]...)
+		args = append(args, "-enable-kvm")
+	}
+	if opts.NoNet {
+		args = append(args, "-net", "none")
 	}
 	args = append(args, opts.ExtraArgs...)
-	return commandPlan{Args: args, LogPath: logPath, HostTimeLog: hostTimeLogPath, VarsPath: varsPath, ConsoleSocket: consoleSocket}, nil
+	return commandPlan{
+		Args:        args,
+		LogPath:     logPath,
+		HostTimeLog: hostTimeLogPath,
+	}, nil
+}
+
+func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Options) (commandPlan, error) {
+	imagePath, err := limineImagePath(workspace, opts.LimineImage)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	diskPath := workspace.Path(workspace.Disk.Image)
+	if _, err := os.Stat(diskPath); err != nil {
+		return commandPlan{}, err
+	}
+	codePath := firstExisting(os.Getenv("CAPOS_OVMF_CODE"), "/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd")
+	varsTemplate := firstExisting(os.Getenv("CAPOS_OVMF_VARS_TEMPLATE"), "/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd")
+	if codePath == "" {
+		return commandPlan{}, fmt.Errorf("missing OVMF code firmware for Limine UEFI boot; set CAPOS_OVMF_CODE")
+	}
+	if varsTemplate == "" {
+		return commandPlan{}, fmt.Errorf("missing OVMF vars template for Limine UEFI boot; set CAPOS_OVMF_VARS_TEMPLATE")
+	}
+	if opts.Memory == "" {
+		opts.Memory = "2G"
+	}
+	if opts.Display == "" {
+		opts.Display = "none"
+	}
+	artifacts := workspace.Path(workspace.Artifacts)
+	if err := os.MkdirAll(artifacts, 0o755); err != nil {
+		return commandPlan{}, err
+	}
+	logPath := filepath.Join(artifacts, "qemu-limine-uefi.log")
+	hostTimeLogPath := filepath.Join(artifacts, "qemu-limine-uefi-host-time.log")
+	varsPath := filepath.Join(artifacts, "OVMF_LIMINE_VARS.fd")
+	if err := copyFile(varsTemplate, varsPath); err != nil {
+		return commandPlan{}, err
+	}
+	_ = os.WriteFile(logPath, nil, 0o644)
+	args := []string{
+		qemuPath,
+		"-machine", "q35",
+		"-m", opts.Memory,
+		"-smp", "4",
+		"-monitor", "none",
+		"-drive", "if=pflash,format=raw,readonly=on,file=" + codePath,
+		"-drive", "if=pflash,format=raw,file=" + varsPath,
+		"-drive", "if=none,file=" + imagePath + ",format=raw,id=limineboot",
+		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
+		"-drive", "if=none,file=" + diskPath + ",format=raw,id=rootdisk",
+		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
+		"-boot", "order=c",
+		"-no-reboot",
+	}
+	if opts.Display == "none" {
+		args = append(args, "-nographic")
+	} else {
+		args = append(args, "-display", opts.Display, "-serial", "stdio")
+	}
+	if !opts.NoKVM {
+		args = append(args, "-enable-kvm")
+	}
+	if opts.NoNet {
+		args = append(args, "-net", "none")
+	}
+	args = append(args, opts.ExtraArgs...)
+	return commandPlan{
+		Args:        args,
+		LogPath:     logPath,
+		HostTimeLog: hostTimeLogPath,
+	}, nil
 }
 
 func validateKVMAvailable() error {
@@ -849,6 +894,26 @@ func summarizeMountInfo(fields []string) string {
 		return strings.Join(fields, " ")
 	}
 	return fmt.Sprintf("%s %s opts=%s", fields[separator+1], fields[separator+2], fields[5])
+}
+
+func copyFile(source string, dest string) error {
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dest, data, 0o644)
+}
+
+func firstExisting(paths ...string) string {
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
 }
 
 func consoleSocketPath(workspace *config.Workspace) (string, error) {
@@ -930,26 +995,6 @@ func consoleTerminalScript(workspace *config.Workspace, socketPath string) strin
 		"echo virtio-console exited: $status",
 		"exec bash",
 	}, "; ")
-}
-
-func copyFile(source string, dest string) error {
-	data, err := os.ReadFile(source)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dest, data, 0o644)
-}
-
-func firstExisting(paths ...string) string {
-	for _, path := range paths {
-		if path == "" {
-			continue
-		}
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-	return ""
 }
 
 func firstNonEmpty(values ...string) string {

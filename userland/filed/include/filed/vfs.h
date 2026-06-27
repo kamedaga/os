@@ -9,6 +9,7 @@
 #define FILED_MAX_VNODES 256u
 #define FILED_MAX_FILES 256u
 #define FILED_MAX_HANDLES 256u
+#define FILED_ID_HINT_SLOTS 1024u
 
 typedef uint32_t filed_mount_id_t;
 typedef uint32_t filed_vnode_id_t;
@@ -108,13 +109,21 @@ typedef struct filed_mount {
 typedef struct filed_vnode {
     bool active;
     bool linked;
+    bool stat_valid;
     filed_vnode_id_t id;
     filed_mount_id_t mount_id;
     filed_backend_object_id_t backend_object;
     filed_vnode_kind_t kind;
+    uint64_t stat_mode;
+    uint64_t stat_size;
+    uint64_t stat_blocks;
+    uint64_t stat_nlink;
+    uint64_t stat_kind;
     filed_vnode_id_t parent;
     char name[64];
     filed_generation_t generation;
+    filed_generation_t object_generation;
+    filed_generation_t dir_generation;
     uint32_t refcount;
     filed_lock_t lock;
 } filed_vnode_t;
@@ -148,6 +157,9 @@ typedef struct filed_vfs {
     filed_vnode_t vnodes[FILED_MAX_VNODES];
     filed_file_t files[FILED_MAX_FILES];
     filed_handle_t handles[FILED_MAX_HANDLES];
+    uint16_t vnode_slot_hints[FILED_ID_HINT_SLOTS];
+    uint16_t file_slot_hints[FILED_ID_HINT_SLOTS];
+    uint16_t handle_slot_hints[FILED_ID_HINT_SLOTS];
     filed_mount_id_t next_mount_id;
     filed_vnode_id_t next_vnode_id;
     filed_file_id_t next_file_id;
@@ -159,6 +171,8 @@ typedef struct filed_vfs_open_result {
     filed_vnode_id_t vnode_id;
     filed_backend_object_id_t backend_object;
     filed_vnode_kind_t kind;
+    filed_generation_t object_generation;
+    filed_generation_t dir_generation;
 } filed_vfs_open_result_t;
 
 typedef struct filed_vfs_io_decision {
@@ -166,12 +180,26 @@ typedef struct filed_vfs_io_decision {
     filed_vnode_kind_t kind;
     uint64_t offset;
     uint64_t length;
+    filed_generation_t object_generation;
+    filed_generation_t dir_generation;
 } filed_vfs_io_decision_t;
 
 typedef struct filed_vfs_handle_flags {
     uint32_t fd_flags;
     uint32_t status_flags;
 } filed_vfs_handle_flags_t;
+
+typedef struct filed_vfs_stat_snapshot {
+    bool valid;
+    uint64_t handle_id;
+    uint64_t mode;
+    uint64_t size;
+    uint64_t blocks;
+    uint64_t nlink;
+    uint64_t kind;
+    filed_generation_t object_generation;
+    filed_generation_t dir_generation;
+} filed_vfs_stat_snapshot_t;
 
 typedef struct filed_vfs_reclaim_result {
     bool released;
@@ -203,6 +231,14 @@ filed_status_t filed_vfs_open_backend_child(
     filed_handle_id_t parent_handle,
     filed_backend_object_id_t child_backend_object,
     filed_vnode_kind_t child_kind,
+    const char *name,
+    uint32_t rights,
+    uint32_t open_flags,
+    filed_vfs_open_result_t *out_open);
+
+filed_status_t filed_vfs_open_cached_child(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
     const char *name,
     uint32_t rights,
     uint32_t open_flags,
@@ -263,6 +299,23 @@ filed_status_t filed_vfs_stat_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
     filed_vfs_io_decision_t *out_decision);
+filed_status_t filed_vfs_get_stat_snapshot(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_stat_snapshot_t *out_snapshot);
+filed_status_t filed_vfs_update_stat_snapshot(
+    filed_vfs_t *vfs,
+    filed_backend_object_id_t backend_object,
+    const filed_vfs_stat_snapshot_t *snapshot);
+filed_status_t filed_vfs_note_write(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t offset,
+    uint64_t bytes_written);
+filed_status_t filed_vfs_note_truncate(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t size);
 
 filed_status_t filed_vfs_lookup_prepare(
     const filed_vfs_t *vfs,
@@ -358,7 +411,19 @@ filed_status_t filed_vfs_write_commit(
     filed_handle_id_t handle_id,
     uint64_t bytes_written);
 
+filed_status_t filed_vfs_seek(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    int64_t offset,
+    int whence,
+    uint64_t file_size,
+    int64_t *out_offset);
+
 filed_status_t filed_vfs_fsync_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_io_decision_t *out_decision);
+filed_status_t filed_vfs_close_flush_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
     filed_vfs_io_decision_t *out_decision);

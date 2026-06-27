@@ -56,6 +56,7 @@ pub const syscall_ipc_send: u64 = ipc_abi.syscall_ipc_send;
 pub const syscall_ipc_recv: u64 = ipc_abi.syscall_ipc_recv;
 pub const syscall_ipc_call: u64 = ipc_abi.syscall_ipc_call;
 pub const syscall_ipc_reply: u64 = ipc_abi.syscall_ipc_reply;
+pub const syscall_ipc_recv_wait: u64 = ipc_abi.syscall_ipc_recv_wait;
 
 pub const syscall_capsule_query: u64 = capsule_abi.syscall_capsule_query;
 pub const syscall_capsule_derive_mmio: u64 = capsule_abi.syscall_capsule_derive_mmio;
@@ -129,6 +130,7 @@ test "native syscall numbers are contiguous" {
         syscall_ipc_recv,
         syscall_ipc_call,
         syscall_ipc_reply,
+        syscall_ipc_recv_wait,
         syscall_capsule_query,
         syscall_capsule_derive_mmio,
         syscall_capsule_derive_dma_buffer,

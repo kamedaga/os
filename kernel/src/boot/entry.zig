@@ -1,5 +1,6 @@
 /// Kernel boot entry point and primary boot globals.
-/// kernelMain() is called from main.zig after switching to the ring-0 stack.
+/// Bootloader-specific entry code switches to the ring-0 stack before entering
+/// this module.
 const std = @import("std");
 const kernel = @import("../kernel.zig");
 const elf_loader = @import("../elf_loader.zig");
@@ -17,13 +18,13 @@ const pci = @import("../pci.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
 const pmm = @import("../memory/pmm.zig");
 const user_vm = @import("../memory/user_vm.zig");
-const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const boot_static = @import("main_static.zig");
-const boot_images = @import("boot_images.zig");
+const boot_resources = @import("boot_resources.zig");
+const boot_scratch = @import("boot_scratch.zig");
+const image_range = @import("image_range.zig");
 const boot_abi = @import("abi.zig");
 const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
-const uefi_services = @import("uefi_services.zig");
 const process_factory = @import("process_factory.zig");
 const elf_load = @import("elf_load.zig");
 const init_setup = @import("init_setup.zig");
@@ -41,6 +42,13 @@ var empty_user_spaces_storage: [0]boot_static.UserAddressSpace align(4096) = .{}
 var user_spaces: []boot_static.UserAddressSpace = empty_user_spaces_storage[0..];
 var empty_kernel_runtime_storage: [0]u8 align(4096) = .{};
 var kernel_runtime_storage: []align(4096) u8 = empty_kernel_runtime_storage[0..];
+
+const limine_runtime_storage_bytes: usize = kernel.runtimeStorageBytes();
+var limine_free_list_storage: kernel.FreePageList align(4096) = undefined;
+var limine_kernel_state_storage: kernel.KernelState align(4096) = undefined;
+var limine_kernel_runtime_storage: [limine_runtime_storage_bytes]u8 align(4096) = undefined;
+var limine_user_spaces_storage: [boot_static.user_process_count]boot_static.UserAddressSpace align(4096) = undefined;
+var limine_boot_scratch_storage: [boot_scratch.default_bytes]u8 align(4096) = undefined;
 
 pub var global_free_list: *kernel.FreePageList = undefined;
 pub var kernel_state_global: *kernel.KernelState = undefined;
@@ -68,25 +76,38 @@ fn minStaticStart(a: usize, b: usize) usize {
 }
 
 fn kernelStaticStorageStartAddr() usize {
-    var start = uefi_services.kernelStaticStorageStartAddr();
+    var start = boot_scratch.kernelStaticStorageStartAddr();
+    start = minStaticStart(start, boot_scratch.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, image_range.kernelStaticStorageStartAddr());
     start = minStaticStart(start, staticStorageStart(@TypeOf(user_spaces), &user_spaces));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(global_free_list), &global_free_list));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_global), &kernel_state_global));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_ready), &kernel_state_ready));
-    start = minStaticStart(start, vtd.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, staticStorageStart(@TypeOf(limine_free_list_storage), &limine_free_list_storage));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(limine_kernel_state_storage), &limine_kernel_state_storage));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(limine_kernel_runtime_storage), &limine_kernel_runtime_storage));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
 
 fn kernelStaticStorageEndAddr() usize {
-    var end = uefi_services.kernelStaticStorageEndAddr();
+    var end = boot_scratch.kernelStaticStorageEndAddr();
+    end = maxStaticEnd(end, boot_scratch.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, image_range.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces), &user_spaces));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(global_free_list), &global_free_list));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_global), &kernel_state_global));
     end = maxStaticEnd(end, kernel.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_ready), &kernel_state_ready));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_free_list_storage), &limine_free_list_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_kernel_state_storage), &limine_kernel_state_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_kernel_runtime_storage), &limine_kernel_runtime_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
@@ -94,7 +115,6 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, vtd.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
 }
@@ -204,7 +224,7 @@ fn initFxStateSupport() void {
 // Exported extended user-state save/restore (called from assembly stubs in traps)
 // ---------------------------------------------------------------------------
 
-pub export fn saveCurrentThreadFxState() callconv(.c) void {
+pub export fn saveCurrentThreadFxState() callconv(.winapi) void {
     if (!kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;
@@ -216,7 +236,7 @@ pub export fn saveCurrentThreadFxState() callconv(.c) void {
         : .{ .memory = true });
 }
 
-pub export fn restoreCurrentThreadFxState() callconv(.c) void {
+pub export fn restoreCurrentThreadFxState() callconv(.winapi) void {
     if (!kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;
@@ -228,14 +248,14 @@ pub export fn restoreCurrentThreadFxState() callconv(.c) void {
         : .{ .memory = true });
 }
 
-pub export fn saveKernelInterruptFxState() callconv(.c) void {
+pub export fn saveKernelInterruptFxState() callconv(.winapi) void {
     asm volatile ("fxsave64 (%[ptr])"
         :
         : [ptr] "r" (&scheduler.kernel_interrupt_fx_state),
         : .{ .memory = true });
 }
 
-pub export fn restoreKernelInterruptFxState() callconv(.c) void {
+pub export fn restoreKernelInterruptFxState() callconv(.winapi) void {
     asm volatile ("fxrstor64 (%[ptr])"
         :
         : [ptr] "r" (&scheduler.kernel_interrupt_fx_state),
@@ -267,7 +287,6 @@ fn installInterruptTrampolines() void {
 }
 
 fn initKernelRuntimeOrHalt() void {
-    x86_platform.loadGdtAndReloadSegments();
     initFxStateSupport();
     if (!boot_static.debug_skip_cr3_switch) {
         if (!x86_platform.installIdentityPageTables0To1GiB()) {
@@ -298,12 +317,14 @@ fn initKernelRuntimeOrHalt() void {
         {
             halt.haltWithMessage("user spaces runtime mapping failed");
         }
+        _ = x86_platform.detectRdtscpSupport();
         _ = x86_platform.enablePcidIfSupported();
         const pku_enabled = x86_platform.enablePkuIfSupported();
         kernel_log.write("pku: ");
         kernel_log.write(if (pku_enabled) "enabled\n" else "unavailable\n");
         x86_platform.hardenKernelMappingsSupervisorOnly();
     }
+    x86_platform.loadGdtAndReloadSegments();
     installInterruptTrampolines();
     x86_platform.enableSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     asm volatile ("cli");
@@ -316,7 +337,9 @@ fn initKernelRuntimeOrHalt() void {
 }
 
 fn initMemoryModules() void {
-    for (user_spaces) |*space| user_vm.resetUserAddressSpaceStorage(space);
+    for (user_spaces) |*space| {
+        user_vm.resetUserAddressSpaceStorage(space);
+    }
 
     user_vm.init(.{
         .user_spaces = user_spaces,
@@ -337,59 +360,71 @@ fn initMemoryModules() void {
         .page_ps = boot_static.page_ps,
         .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
         .flush_user_tlb_for_principal_range = user_copy.flushUserTlbForPrincipalRange,
+        .kernel_pointer_paddr = x86_platform.kernelPointerPaddr,
+        .seed_user_pml4_with_kernel = x86_platform.seedUserPml4WithKernel,
         .seed_user_pdp_with_kernel_identity = x86_platform.seedUserPdpWithKernelIdentity,
         .seed_user_pd_with_kernel_identity = x86_platform.seedUserPdWithKernelIdentity,
     });
     pmm.init(.{
         .write = kernel_log.write,
-        .main_addr = @intFromPtr(&kernelMain),
+        .main_addr = @intFromPtr(&bootWithResources),
         .kernel_cr3_addr = @intFromPtr(&x86_platform.kernel_cr3_value),
-        .kernel_image_base_paddr = &uefi_services.kernel_image_base_paddr_ref,
-        .kernel_image_size_bytes = &uefi_services.kernel_image_size_bytes_ref,
+        .kernel_image_base_paddr = &image_range.base_paddr,
+        .kernel_image_size_bytes = &image_range.size_bytes,
         .kernel_static_start_addr = kernelStaticStorageStartAddr(),
         .kernel_static_end_addr = kernelStaticStorageEndAddr(),
         .reserved_low_mem_end = boot_static.reserved_low_mem_end,
     });
 }
 
-fn allocateBootPagesBelow4GiBOrHalt(
-    bs: *std.os.uefi.tables.BootServices,
-    byte_count: usize,
-    label: []const u8,
-) []align(4096) u8 {
-    const page_count = (byte_count + 4095) / 4096;
-    if (page_count == 0) return empty_kernel_runtime_storage[0..];
-    const max_addr: [*]align(4096) std.os.uefi.Page = @ptrFromInt(boot_static.four_gib - 4096);
-    const pages = bs.allocatePages(.{ .max_address = max_addr }, .loader_data, page_count) catch {
-        kernel_log.write("boot page allocation failed: ");
-        kernel_log.write(label);
-        kernel_log.write("\n");
-        halt.haltWithMessage("boot page allocation failed");
-    };
-    const ptr: [*]align(4096) u8 = @ptrCast(pages.ptr);
-    const bytes = ptr[0 .. page_count * 4096];
-    @memset(bytes, 0);
-    return bytes;
-}
-
-fn allocateDynamicKernelStorageOrHalt(bs: *std.os.uefi.tables.BootServices) void {
-    const raw_free_list = allocateBootPagesBelow4GiBOrHalt(bs, @sizeOf(kernel.FreePageList), "kernel free page list");
-    global_free_list = @ptrCast(@alignCast(raw_free_list.ptr));
+pub fn prepareLimineKernelStorageOrHalt() void {
+    global_free_list = &limine_free_list_storage;
     global_free_list.len = 0;
     global_free_list.range_len = 0;
 
-    const raw_kernel_state = allocateBootPagesBelow4GiBOrHalt(bs, @sizeOf(kernel.KernelState), "kernel state");
-    kernel_state_global = @ptrCast(@alignCast(raw_kernel_state.ptr));
+    kernel_state_global = &limine_kernel_state_storage;
 
-    kernel_runtime_storage = allocateBootPagesBelow4GiBOrHalt(bs, kernel.runtimeStorageBytes(), "kernel runtime storage");
+    kernel_runtime_storage = limine_kernel_runtime_storage[0..];
+    @memset(kernel_runtime_storage, 0);
     if (!kernel.initRuntimeStorage(kernel_runtime_storage)) {
         halt.haltWithMessage("kernel runtime storage init failed");
     }
 
-    const user_space_bytes = @sizeOf(boot_static.UserAddressSpace) * boot_static.user_process_count;
-    const raw_user_spaces = allocateBootPagesBelow4GiBOrHalt(bs, user_space_bytes, "user address spaces");
-    const ptr: [*]boot_static.UserAddressSpace = @ptrCast(@alignCast(raw_user_spaces.ptr));
-    user_spaces = ptr[0..boot_static.user_process_count];
+    user_spaces = limine_user_spaces_storage[0..];
+    @memset(user_spaces, .{});
+    boot_scratch.install(limine_boot_scratch_storage[0..]);
+    initMemoryModules();
+    if (image_range.virtual_base != 0) {
+        const static_end = kernel_vm.pageAlignUp(kernelStaticStorageEndAddr());
+        if (static_end > image_range.virtual_base) {
+            const required_size: usize = @intCast(static_end - image_range.virtual_base);
+            if (required_size > image_range.size_bytes) image_range.size_bytes = required_size;
+        }
+    }
+}
+
+pub fn currentUserSpaces() []boot_static.UserAddressSpace {
+    return user_spaces;
+}
+
+fn copyBootBytesToScratchOrHalt(bytes: []const u8, label: []const u8) []const u8 {
+    const out = boot_scratch.allocate(bytes.len) orelse {
+        kernel_log.write("boot resource copy failed: ");
+        kernel_log.write(label);
+        kernel_log.write("\n");
+        halt.haltWithMessage("boot resource copy failed");
+    };
+    @memcpy(out[0..bytes.len], bytes);
+    return out[0..bytes.len];
+}
+
+pub fn persistBootResourcesOrHalt(resources: BootResources) BootResources {
+    return .{
+        .framebuffer_info = resources.framebuffer_info,
+        .init_elf = copyBootBytesToScratchOrHalt(resources.init_elf, "init"),
+        .bootfs_image = copyBootBytesToScratchOrHalt(resources.bootfs_image, "bootfs"),
+        .memory_stats = resources.memory_stats,
+    };
 }
 
 fn activateOrHalt(thread_index: usize) void {
@@ -415,8 +450,8 @@ fn scrubEndpointTargets(table: *kernel.EndpointTable, target: kernel.PrincipalId
 }
 
 fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
-    if (scheduler.loadPolicyThread(out_frame)) return;
-    halt.haltWithMessage("external scheduler unavailable");
+    if (scheduler.loadNextReadyThread(out_frame)) return;
+    halt.haltWithMessage("kernel scheduler unavailable");
 }
 
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
@@ -575,11 +610,10 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
 // Boot resource types
 // ---------------------------------------------------------------------------
 
-const BootResources = struct {
-    framebuffer_info: uefi_services.FramebufferInfo,
-    disk_scheduler_policy_elf: []const u8,
-    disk_init_elf: []const u8,
-    disk_bootfs_image: []const u8,
+pub const BootResources = struct {
+    framebuffer_info: boot_resources.FramebufferInfo,
+    init_elf: []const u8,
+    bootfs_image: []const u8,
     memory_stats: boot_static.MemoryStats,
 };
 
@@ -587,49 +621,12 @@ const DetectedDevices = struct {
     devices: [boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
 };
 
-// ---------------------------------------------------------------------------
-// Group 1 — UEFI / platform boot services
-// ---------------------------------------------------------------------------
-
-fn runBootServicesPhase() BootResources {
-    const bs = uefi_services.acquireBootServicesOrHalt();
-    uefi_services.captureKernelImageRange(bs);
-    allocateDynamicKernelStorageOrHalt(bs);
-    uefi_services.allocatePostExitLoadScratchOrHalt(bs);
-    initMemoryModules();
-
-    const framebuffer_info = uefi_services.acquireFramebufferInfo(bs) orelse {
-        halt.haltWithMessage("GraphicsOutput unavailable or mode unsupported");
-    };
-    const disk_scheduler_policy_elf = uefi_services.loadBootDiskFile(bs, boot_images.scheduler_policy) orelse {
-        halt.haltWithMessage("disk scheduler policy ELF load failed");
-    };
-    const disk_init_elf = uefi_services.loadBootDiskFile(bs, boot_images.init_app) orelse {
-        halt.haltWithMessage("disk init ELF load failed");
-    };
-    const disk_bootfs_image = uefi_services.loadBootDiskFile(bs, boot_images.bootfs_image) orelse {
-        halt.haltWithMessage("disk bootfs image load failed");
-    };
-    var smp_info = smp.prepareBootInfo(bs);
-
-    const memory_stats = uefi_services.collectBootMemoryStatsOrHalt(bs, global_free_list, user_spaces);
-    uefi_services.exitBootServicesOrHalt();
+pub fn initializeLimineRuntimeOrHalt() void {
     initKernelRuntimeOrHalt();
     scheduler.initializeStaticStorage();
     scheduler.installIdleHooks();
-    smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
-    smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
-    smp.configureWakeIpiVector(boot_static.scheduler_wake_ipi_vector);
-    smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value);
+    smp.markBootstrapCpuReady();
     scheduler.refreshTopology();
-
-    return .{
-        .framebuffer_info = framebuffer_info,
-        .disk_scheduler_policy_elf = disk_scheduler_policy_elf,
-        .disk_init_elf = disk_init_elf,
-        .disk_bootfs_image = disk_bootfs_image,
-        .memory_stats = memory_stats,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -691,54 +688,6 @@ fn discoverDevices() DetectedDevices {
 // ---------------------------------------------------------------------------
 
 fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
-    const scheduler_principal = state.createProcessDescriptor("scheduler_policy") orelse
-        halt.haltWithMessage("scheduler policy process descriptor alloc failed");
-    const scheduler_process = process_factory.createUserProcess(
-        state,
-        scheduler_principal,
-        "scheduler_policy",
-        global_free_list,
-        user_spaces,
-    );
-    state.createSerialFdAt(scheduler_principal, 1, 1) catch |err| {
-        halt.haltWithError("scheduler stdout fd install failed: ", err);
-    };
-    state.createSerialFdAt(scheduler_principal, 2, 2) catch |err| {
-        halt.haltWithError("scheduler stderr fd install failed: ", err);
-    };
-    state.createSchedulerControlFdAt(scheduler_principal, 16) catch |err| {
-        halt.haltWithError("scheduler control fd install failed: ", err);
-    };
-    state.createSchedulerEventFdAt(scheduler_principal, 17) catch |err| {
-        halt.haltWithError("scheduler event fd install failed: ", err);
-    };
-
-    const loaded_scheduler = elf_load.loadUserElfIntoProcessPagesOrHalt(
-        state,
-        scheduler_principal,
-        scheduler_process.user_page.paddr,
-        scheduler_process.user_stack_page.paddr,
-        res.disk_scheduler_policy_elf,
-        "scheduler policy ELF load failed\n",
-        global_free_list,
-    );
-    const scheduler_thread = scheduler.threadForPrincipal(scheduler_principal).?;
-    const scheduler_ctx = scheduler.threadContextMutable(scheduler_thread).?;
-    if (scheduler.threadReady(scheduler_thread)) {
-        scheduler_ctx.frame.rip = loaded_scheduler.entry;
-        scheduler_ctx.frame.rsp = process_factory.installInitialUserStackOrHalt(
-            state,
-            scheduler_principal,
-            scheduler_process.user_stack_page.paddr,
-            loaded_scheduler,
-            "schedulerd",
-        );
-    }
-    if (!scheduler.attachPolicyThread(scheduler_thread)) {
-        halt.haltWithMessage("external scheduler policy install failed");
-    }
-    activateOrHalt(scheduler_thread);
-
     const init_principal = state.createProcessDescriptor("seed2_boot") orelse
         halt.haltWithMessage("seed2_boot process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
@@ -756,7 +705,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         state,
         init_principal,
         devs.devices[0..],
-        res.disk_bootfs_image,
+        res.bootfs_image,
         res.framebuffer_info,
         global_free_list,
     );
@@ -769,7 +718,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         init_principal,
         init_process.user_page.paddr,
         init_process.user_stack_page.paddr,
-        res.disk_init_elf,
+        res.init_elf,
         "init ELF load failed\n",
         global_free_list,
     );
@@ -784,6 +733,9 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         "init",
     );
     scheduler.publishThreadReady(init_thread);
+    if (!scheduler.activateNextReadyOnCurrentCpu()) {
+        halt.haltWithMessage("kernel scheduler failed to activate init");
+    }
 
     kernel_state_ready = true;
 }
@@ -807,6 +759,8 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
         .wake_waiting_thread_for_principal = scheduler.wakeMailboxWaiter,
+        .wake_waiting_thread_generation = scheduler.wakeIfWaitingGeneration,
+        .wake_waiting_thread_generation_with_rax = scheduler.wakeIfWaitingGenerationWithRax,
         .wake_blocked_thread_for_principal = scheduler.wakeBlockedThread,
         .consume_pending_signal_for_principal = scheduler.consumeSignal,
         .switch_to_thread = scheduler.switchTo,
@@ -834,20 +788,17 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
     });
 }
 
-// ---------------------------------------------------------------------------
-// kernelMain — boot sequence
-// ---------------------------------------------------------------------------
-
-pub fn kernelMain() void {
+pub fn prepareBootPrelude() void {
     asm volatile ("cli");
+    initFxStateSupport();
     lapic.maskLegacyPic();
     kernel_log.reset();
     serial.init();
     boot_init_principal = null;
+}
 
-    const resources = runBootServicesPhase();
+pub fn bootWithResources(resources: BootResources) noreturn {
     const state = initKernelSubsystems(resources.memory_stats);
-    _ = vtd.init();
     var devices = discoverDevices();
     constructBootProcesses(state, resources, &devices);
     wireRuntimeSubsystems(state, resources.memory_stats);

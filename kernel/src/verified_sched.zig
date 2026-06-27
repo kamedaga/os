@@ -71,19 +71,22 @@ pub const Cpu = extern struct {
     has_current: c_int,
     current_thread_id: i64,
     current_generation: i64,
+    activation_pending: c_int,
 };
 
 pub const State = extern struct {
-    runqueue: Runqueue,
+    runqueues: [sched_max_cpus]Runqueue,
     cpus: [sched_max_cpus]Cpu,
     cpu_count: usize,
+    balance_cursor: usize,
 };
 
-pub extern fn pacha_sched_no_decision(out: *Decision) void;
-pub extern fn pacha_sched_empty_state(cpu_count: usize, out: *State) void;
+pub extern fn pacha_kernel_sched_no_decision(out: *Decision) void;
+pub extern fn pacha_kernel_sched_empty_state(cpu_count: usize, out: *State) void;
 
-pub extern fn pacha_sched_add_thread(
+pub extern fn pacha_kernel_sched_add_thread(
     sched: *State,
+    cpu_id: usize,
     thread_id: i64,
     generation: i64,
     weight: i64,
@@ -92,28 +95,49 @@ pub extern fn pacha_sched_add_thread(
     scratch: *Runqueue,
 ) SchedRc;
 
-pub extern fn pacha_sched_wake_thread(
+pub extern fn pacha_kernel_sched_wake_thread(
     sched: *State,
     thread_id: i64,
     decision_out: *Decision,
     scratch: *Runqueue,
 ) SchedRc;
 
-pub extern fn pacha_sched_block_thread(
+pub extern fn pacha_kernel_sched_wake_thread_on_cpu(
+    sched: *State,
+    cpu_id: usize,
+    thread_id: i64,
+    decision_out: *Decision,
+) SchedRc;
+
+pub extern fn pacha_kernel_sched_block_thread(
     sched: *State,
     thread_id: i64,
     decision_out: *Decision,
     scratch: *Runqueue,
 ) SchedRc;
 
-pub extern fn pacha_sched_exit_thread(
+pub extern fn pacha_kernel_sched_block_thread_on_cpu(
+    sched: *State,
+    cpu_id: usize,
+    thread_id: i64,
+    decision_out: *Decision,
+) SchedRc;
+
+pub extern fn pacha_kernel_sched_exit_thread(
     sched: *State,
     thread_id: i64,
     decision_out: *Decision,
     scratch: *Runqueue,
 ) SchedRc;
 
-pub extern fn pacha_sched_on_timer(
+pub extern fn pacha_kernel_sched_exit_thread_on_cpu(
+    sched: *State,
+    cpu_id: usize,
+    thread_id: i64,
+    decision_out: *Decision,
+) SchedRc;
+
+pub extern fn pacha_kernel_sched_on_timer(
     sched: *State,
     cpu_id: usize,
     runtime_ns: i64,
@@ -121,7 +145,7 @@ pub extern fn pacha_sched_on_timer(
     scratch: *Runqueue,
 ) SchedRc;
 
-pub extern fn pacha_sched_pick(
+pub extern fn pacha_kernel_sched_pick_cpu(
     sched: *State,
     cpu_id: usize,
     decision_out: *Decision,
@@ -129,9 +153,43 @@ pub extern fn pacha_sched_pick(
     scratch: *Runqueue,
 ) SchedRc;
 
-pub extern fn pacha_sched_finish_current(
+pub extern fn pacha_kernel_sched_finish_current(
     sched: *State,
     cpu_id: usize,
     decision_out: *Decision,
     scratch: *Runqueue,
 ) SchedRc;
+
+pub extern fn pacha_kernel_sched_handoff_to_thread_on_cpu(
+    sched: *State,
+    cpu_id: usize,
+    thread_id: i64,
+    decision_out: *Decision,
+    scratch: *Runqueue,
+) SchedRc;
+
+pub extern fn pacha_kernel_sched_request_activation(
+    sched: *State,
+    cpu_id: usize,
+    decision_out: *Decision,
+) SchedRc;
+
+pub extern fn pacha_kernel_sched_claim_activation(
+    sched: *State,
+    cpu_id: usize,
+    decision_out: *Decision,
+    pick_scratch: *PickResult,
+    scratch: *Runqueue,
+) SchedRc;
+
+pub extern fn pacha_kernel_sched_migrate_runnable(
+    sched: *State,
+    src_cpu: usize,
+    dst_cpu: usize,
+    thread_id: i64,
+    decision_out: *Decision,
+    src_scratch: *Runqueue,
+    dst_scratch: *Runqueue,
+) SchedRc;
+
+pub extern fn pacha_kernel_sched_validate(sched: *const State) SchedRc;

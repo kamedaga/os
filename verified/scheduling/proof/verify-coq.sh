@@ -21,9 +21,16 @@ case "${1:-build}" in
       spec/EevdfModel.v \
       spec/EevdfInvariants.v \
       spec/EevdfTransitions.v \
+      spec/EevdfCharge.v \
       spec/EevdfPick.v \
+      spec/EevdfPreservation.v \
       spec/SchedRuntimeModel.v \
       spec/SchedRuntimeSpec.v \
+      spec/KernelSchedModel.v \
+      spec/KernelSchedInvariants.v \
+      spec/KernelSchedSpec.v \
+      spec/KernelSchedPreservation.v \
+      spec/KernelSchedTestVectors.v \
       proof/SchedRuntimeVstSpec.v \
       proof/generated/PachaEevdfClight.v \
       proof/generated/PachaSchedClight.v \
@@ -36,12 +43,15 @@ case "${1:-build}" in
     if [ -f "$makefile" ]; then
       make -f "$makefile" clean
     fi
-    find proof spec \
+    find . proof spec \
       \( -name '*.vo' -o -name '*.vos' -o -name '*.vok' \
          -o -name '*.glob' -o -name '.*.aux' \
-         -o -name '.lia.cache' -o -name '.nia.cache' \) \
+         -o -name '.lia.cache' -o -name '.nia.cache' \
+         -o -name '.Makefile.coq.d' \) \
       -delete
-    rm -f "$makefile" "$makefile.conf" proof/Makefile.coq proof/Makefile.coq.conf
+    rm -f "$makefile" "$makefile.conf" \
+      proof/Makefile.coq proof/Makefile.coq.conf \
+      spec/Makefile.coq spec/Makefile.coq.conf
     ;;
   *)
     echo "usage: $0 [build|clean]" >&2

@@ -2,9 +2,83 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+enum {
+    PACHA_SCHED_METRIC_REPORT_EVERY = 4096,
+};
+
+static uint64_t sched_rdtsc(void)
+{
+    uint32_t lo;
+    uint32_t hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void metric_add(uint64_t *count, uint64_t *total, uint64_t *max_value, uint64_t cycles)
+{
+    if (count != 0) (*count)++;
+    if (total != 0) *total += cycles;
+    if (max_value != 0 && cycles > *max_value) *max_value = cycles;
+}
+
+static uint64_t metric_avg(uint64_t total, uint64_t count)
+{
+    return count == 0 ? 0 : total / count;
+}
+
+static uint32_t metric_event_bucket(uint16_t event_type)
+{
+    return event_type < PACHA_SCHED_LOOP_EVENT_BUCKETS - 1
+        ? event_type
+        : PACHA_SCHED_LOOP_EVENT_BUCKETS - 1;
+}
+
+static void maybe_report_metrics(pacha_sched_loop_t *loop)
+{
+    if (loop == 0 || loop->dispatch_count < loop->metric_next_report) return;
+    printf(
+        "[schedulerd] metric events=%llu commits=%llu read_avg=%llu read_max=%llu dispatch_avg=%llu dispatch_max=%llu pick_avg=%llu pick_max=%llu commit_avg=%llu commit_max=%llu\n",
+        (unsigned long long)loop->dispatch_count,
+        (unsigned long long)loop->commit_count,
+        (unsigned long long)metric_avg(loop->metric_read_cycles, loop->metric_read_count),
+        (unsigned long long)loop->metric_read_max_cycles,
+        (unsigned long long)metric_avg(loop->metric_dispatch_cycles, loop->dispatch_count),
+        (unsigned long long)loop->metric_dispatch_max_cycles,
+        (unsigned long long)metric_avg(loop->metric_pick_cycles, loop->metric_pick_count),
+        (unsigned long long)loop->metric_pick_max_cycles,
+        (unsigned long long)metric_avg(loop->metric_commit_cycles, loop->commit_count),
+        (unsigned long long)loop->metric_commit_max_cycles);
+    printf(
+        "[schedulerd] events ready=%llu blocked=%llu exited=%llu yield=%llu tick=%llu idle=%llu other=%llu\n",
+        (unsigned long long)loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_READY],
+        (unsigned long long)loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_BLOCKED],
+        (unsigned long long)loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_EXITED],
+        (unsigned long long)loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_YIELD],
+        (unsigned long long)loop->metric_event_type_count[PACHA_SCHED_EVENT_TICK],
+        (unsigned long long)loop->metric_event_type_count[PACHA_SCHED_EVENT_CPU_IDLE],
+        (unsigned long long)loop->metric_event_type_count[PACHA_SCHED_LOOP_EVENT_BUCKETS - 1]);
+    printf(
+        "[schedulerd] dispatch_by_event ready=%llu blocked=%llu exited=%llu yield=%llu tick=%llu idle=%llu other=%llu max_ready=%llu max_blocked=%llu max_tick=%llu\n",
+        (unsigned long long)metric_avg(loop->metric_dispatch_type_cycles[PACHA_SCHED_EVENT_THREAD_READY], loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_READY]),
+        (unsigned long long)metric_avg(loop->metric_dispatch_type_cycles[PACHA_SCHED_EVENT_THREAD_BLOCKED], loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_BLOCKED]),
+        (unsigned long long)metric_avg(loop->metric_dispatch_type_cycles[PACHA_SCHED_EVENT_THREAD_EXITED], loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_EXITED]),
+        (unsigned long long)metric_avg(loop->metric_dispatch_type_cycles[PACHA_SCHED_EVENT_THREAD_YIELD], loop->metric_event_type_count[PACHA_SCHED_EVENT_THREAD_YIELD]),
+        (unsigned long long)metric_avg(loop->metric_dispatch_type_cycles[PACHA_SCHED_EVENT_TICK], loop->metric_event_type_count[PACHA_SCHED_EVENT_TICK]),
+        (unsigned long long)metric_avg(loop->metric_dispatch_type_cycles[PACHA_SCHED_EVENT_CPU_IDLE], loop->metric_event_type_count[PACHA_SCHED_EVENT_CPU_IDLE]),
+        (unsigned long long)metric_avg(loop->metric_dispatch_type_cycles[PACHA_SCHED_LOOP_EVENT_BUCKETS - 1], loop->metric_event_type_count[PACHA_SCHED_LOOP_EVENT_BUCKETS - 1]),
+        (unsigned long long)loop->metric_dispatch_type_max_cycles[PACHA_SCHED_EVENT_THREAD_READY],
+        (unsigned long long)loop->metric_dispatch_type_max_cycles[PACHA_SCHED_EVENT_THREAD_BLOCKED],
+        (unsigned long long)loop->metric_dispatch_type_max_cycles[PACHA_SCHED_EVENT_TICK]);
+    fflush(stdout);
+    while (loop->metric_next_report <= loop->dispatch_count) {
+        loop->metric_next_report += PACHA_SCHED_METRIC_REPORT_EVERY;
+    }
+}
 
 static uint64_t event_weight(const pacha_sched_event_t *event)
 {
@@ -69,9 +143,12 @@ static int commit_decision(
         return -5;
     }
 
-    if (loop->schedctl_fd >= 0 &&
-        ioctl(loop->schedctl_fd, PACHA_SCHED_IOCTL_COMMIT, &commit) != 0) {
-        return -6;
+    if (loop->schedctl_fd >= 0) {
+        const uint64_t metric_start = sched_rdtsc();
+        const int metric_status = ioctl(loop->schedctl_fd, PACHA_SCHED_IOCTL_COMMIT, &commit);
+        const uint64_t metric_end = sched_rdtsc();
+        metric_add(0, &loop->metric_commit_cycles, &loop->metric_commit_max_cycles, metric_end - metric_start);
+        if (metric_status != 0) return -6;
     }
     loop->commit_count++;
     return 0;
@@ -80,12 +157,15 @@ static int commit_decision(
 static int pick_and_commit(pacha_sched_loop_t *loop, uint32_t cpu, uint64_t sequence)
 {
     if (loop == 0 || cpu >= loop->cpu_count) return -1;
+    const uint64_t pick_start = sched_rdtsc();
     pacha_sched_rc rc = pacha_sched_pick(
         &loop->sched,
         cpu,
         &loop->decision,
         &loop->pick_scratch,
         &loop->runqueue_scratch);
+    const uint64_t pick_end = sched_rdtsc();
+    metric_add(&loop->metric_pick_count, &loop->metric_pick_cycles, &loop->metric_pick_max_cycles, pick_end - pick_start);
     if (rc != PACHA_SCHED_OK) return -10 - (int)rc;
     return commit_decision(loop, &loop->decision, sequence);
 }
@@ -185,6 +265,7 @@ void pacha_sched_loop_init(pacha_sched_loop_t *loop, int schedctl_fd, int event_
     loop->schedctl_fd = schedctl_fd;
     loop->event_fd = event_fd;
     loop->cpu_count = PACHA_SCHED_LOOP_MAX_CPUS;
+    loop->metric_next_report = PACHA_SCHED_METRIC_REPORT_EVERY;
     pacha_sched_empty_state(loop->cpu_count, &loop->sched);
 }
 
@@ -193,6 +274,7 @@ int pacha_sched_loop_dispatch(pacha_sched_loop_t *loop, const pacha_sched_event_
     if (loop == 0 || event == 0) return -1;
     if (event->size < sizeof(*event) || event->version != PACHA_SCHED_ABI_VERSION) return -2;
     loop->dispatch_count++;
+    loop->metric_event_type_count[metric_event_bucket(event->type)]++;
     const uint32_t cpu = event_cpu(loop, event);
 
     switch (event->type) {
@@ -238,13 +320,24 @@ int pacha_sched_loop_run_once(pacha_sched_loop_t *loop)
 {
     if (loop == 0 || loop->event_fd < 0) return -1;
     pacha_sched_event_t event;
+    const uint64_t read_start = sched_rdtsc();
     ssize_t nread = read(loop->event_fd, &event, sizeof(event));
+    const uint64_t read_end = sched_rdtsc();
     if (nread < 0) {
         return errno == EAGAIN || errno == EWOULDBLOCK ? -5 : -6;
     }
     if (nread >= 0 && nread < (ssize_t)sizeof(event)) return -5;
     if (nread != (ssize_t)sizeof(event)) return -3;
-    return pacha_sched_loop_dispatch(loop, &event);
+    metric_add(&loop->metric_read_count, &loop->metric_read_cycles, &loop->metric_read_max_cycles, read_end - read_start);
+    const uint64_t dispatch_start = sched_rdtsc();
+    const int status = pacha_sched_loop_dispatch(loop, &event);
+    const uint64_t dispatch_end = sched_rdtsc();
+    const uint64_t dispatch_cycles = dispatch_end - dispatch_start;
+    metric_add(0, &loop->metric_dispatch_cycles, &loop->metric_dispatch_max_cycles, dispatch_cycles);
+    const uint32_t bucket = metric_event_bucket(event.type);
+    metric_add(0, &loop->metric_dispatch_type_cycles[bucket], &loop->metric_dispatch_type_max_cycles[bucket], dispatch_cycles);
+    maybe_report_metrics(loop);
+    return status;
 }
 
 int pacha_sched_loop_demo(pacha_sched_loop_t *loop)

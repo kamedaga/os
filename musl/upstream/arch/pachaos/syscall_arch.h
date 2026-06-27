@@ -18,6 +18,7 @@
 #define PACHAOS_SYSCALL_FD_WRITE 26
 #define PACHAOS_SYSCALL_FD_READV 27
 #define PACHAOS_SYSCALL_FD_WRITEV 28
+#define PACHAOS_SYSCALL_FD_FCNTL 29
 #define PACHAOS_SYSCALL_FD_POLL 30
 #define PACHAOS_SYSCALL_FD_WAIT_MANY 31
 #define PACHAOS_SYSCALL_FD_IOCTL 32
@@ -30,8 +31,11 @@
 #define PACHAOS_SYSCALL_MMAP 39
 #define PACHAOS_SYSCALL_MUNMAP 40
 #define PACHAOS_SYSCALL_MPROTECT 41
+#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 43
+#define PACHAOS_SYSCALL_IPC_SEND 44
 #define PACHAOS_SYSCALL_IPC_RECV 45
 #define PACHAOS_SYSCALL_IPC_CALL 46
+#define PACHAOS_SYSCALL_IPC_RECV_WAIT 48
 
 #define PACHAOS_FD_FLAG_CLOEXEC 1
 #define PACHAOS_FD_FLAG_NONBLOCK 2
@@ -41,6 +45,8 @@
 #define PACHAOS_FD_RIGHT_WAIT (1ULL << 3)
 #define PACHAOS_FD_RIGHT_POLL (1ULL << 4)
 #define PACHAOS_FD_RIGHT_CLOSE (1ULL << 6)
+#define PACHAOS_FD_RIGHT_SEND (1ULL << 7)
+#define PACHAOS_FD_RIGHT_RECV (1ULL << 8)
 #define PACHAOS_FD_RIGHT_CALL (1ULL << 9)
 #define PACHAOS_FD_RIGHT_READ (1ULL << 42)
 #define PACHAOS_FD_RIGHT_WRITE (1ULL << 43)
@@ -86,11 +92,20 @@
 #define LINUX_O_WRONLY 01
 #define LINUX_O_RDWR 02
 #define LINUX_O_CREAT 0100
+#define LINUX_O_EXCL 0200
 #define LINUX_O_TRUNC 01000
 #define LINUX_O_APPEND 02000
 #define LINUX_O_NONBLOCK 04000
+#define LINUX_O_LARGEFILE 0100000
 #define LINUX_O_DIRECTORY 0200000
 #define LINUX_O_CLOEXEC 02000000
+#define LINUX_F_DUPFD 0
+#define LINUX_F_GETFD 1
+#define LINUX_F_SETFD 2
+#define LINUX_F_GETFL 3
+#define LINUX_F_SETFL 4
+#define LINUX_F_DUPFD_CLOEXEC 1030
+#define LINUX_FD_CLOEXEC 1
 
 #define PACHAOS_POLL_READABLE 1
 #define PACHAOS_POLL_WRITABLE 2
@@ -114,7 +129,15 @@
 #define PACHAOS_FILED_OP_CLOSE 8
 #define PACHAOS_FILED_OP_EXEC_PATH 9
 #define PACHAOS_FILED_OP_READ 10
+#define PACHAOS_FILED_OP_DUP 11
+#define PACHAOS_FILED_OP_GET_FLAGS 12
+#define PACHAOS_FILED_OP_SET_FLAGS 13
+#define PACHAOS_FILED_OP_PWRITE 14
 #define PACHAOS_FILED_OP_WRITE 15
+#define PACHAOS_FILED_OP_SEEK 22
+#define PACHAOS_FILED_OP_CONNECT 25
+#define PACHAOS_FILED_OP_FAST_DOORBELL 27
+#define PACHAOS_FILED_OP_VALIDATE_OPEN_CACHE 28
 #define PACHAOS_FILED_RIGHT_LOOKUP (1U << 0)
 #define PACHAOS_FILED_RIGHT_READ (1U << 1)
 #define PACHAOS_FILED_RIGHT_WRITE (1U << 2)
@@ -128,10 +151,34 @@
 #define PACHAOS_FILED_OPEN_CLOEXEC (1U << 5)
 #define PACHAOS_FILED_OPEN_APPEND (1U << 6)
 #define PACHAOS_FILED_OPEN_NONBLOCK (1U << 7)
+#define PACHAOS_FILED_FD_CLOEXEC (1U << 0)
+#define PACHAOS_FILED_FILE_APPEND (1U << 0)
+#define PACHAOS_FILED_FILE_NONBLOCK (1U << 1)
+#define PACHAOS_FILED_FILE_SYNC (1U << 2)
+#define PACHAOS_FILED_FILE_NEEDS_REWIND (1U << 30)
+#define PACHAOS_FILED_FILE_DIR_EOF (1U << 31)
 #define PACHAOS_FILED_EXEC_MAX_ARGS 8
 #define PACHAOS_FILED_EXEC_MAX_ENVS 8
 #define PACHAOS_FILED_EXEC_ARG_BYTES 128
 #define PACHAOS_FILED_EXEC_ENV_BYTES 128
+#define PACHAOS_FILED_SESSION_PAGE_BYTES 40960
+#define PACHAOS_FILED_FAST_MAGIC 0x31545341464c4446ULL
+#define PACHAOS_FILED_FAST_VERSION 1
+#define PACHAOS_FILED_FAST_REQUEST_CAPACITY 8
+#define PACHAOS_FILED_FAST_COMPLETION_CAPACITY 8
+#define PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT 4
+#define PACHAOS_FILED_FAST_PAYLOAD_OFFSET 4096
+#define PACHAOS_FILED_FAST_GENERATION_OFFSET (PACHAOS_FILED_FAST_PAYLOAD_OFFSET + PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT * PACHAOS_FILED_PAGE_BYTES)
+#define PACHAOS_FILED_FAST_GENERATION_CAPACITY 64
+#define PACHAOS_FILED_OPEN_CACHE_CAP 8
+#ifndef PACHAOS_FILED_READ_CACHE_BYTES
+#define PACHAOS_FILED_READ_CACHE_BYTES 4096
+#endif
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+#define PACHAOS_FILED_READ_CACHE_STORAGE_BYTES PACHAOS_FILED_READ_CACHE_BYTES
+#else
+#define PACHAOS_FILED_READ_CACHE_STORAGE_BYTES 1
+#endif
 
 struct __pachaos_linux_pollfd {
 	int fd;
@@ -167,6 +214,21 @@ struct __pachaos_filed_openat {
 	unsigned long long dir_handle;
 	unsigned long long rights;
 	unsigned long long open_flags;
+	unsigned long long object_generation;
+	unsigned long long dir_generation;
+	unsigned long long reserved0;
+	char name[PACHAOS_FILED_NAME_BYTES];
+};
+
+struct __pachaos_filed_validate_open_cache {
+	unsigned long long cached_handle;
+	unsigned long long dir_handle;
+	unsigned long long rights;
+	unsigned long long open_flags;
+	unsigned long long object_generation;
+	unsigned long long dir_generation;
+	unsigned long long reserved0;
+	unsigned long long reserved1;
 	char name[PACHAOS_FILED_NAME_BYTES];
 };
 
@@ -177,6 +239,53 @@ struct __pachaos_filed_io {
 	unsigned char data[PACHAOS_FILED_IO_BYTES];
 };
 
+struct __pachaos_filed_fast_header {
+	unsigned long long magic;
+	unsigned long long version;
+	unsigned long long flags;
+	unsigned long long request_capacity;
+	unsigned long long completion_capacity;
+	unsigned long long payload_slot_count;
+	unsigned long long payload_slot_size;
+	unsigned long long payload_offset;
+	unsigned long long request_head;
+	unsigned long long request_tail;
+	unsigned long long completion_head;
+	unsigned long long completion_tail;
+	unsigned long long doorbell_seq;
+	unsigned long long completion_seq;
+	unsigned long long generation_offset;
+	unsigned long long generation_capacity;
+};
+
+struct __pachaos_filed_fast_request {
+	unsigned long long request_id;
+	unsigned long long opcode;
+	unsigned long long flags;
+	unsigned long long handle;
+	unsigned long long word2;
+	unsigned long long offset;
+	unsigned long long length;
+	unsigned long long payload_slot;
+	unsigned long long payload_length;
+	unsigned long long timeout_ns;
+};
+
+struct __pachaos_filed_fast_completion {
+	unsigned long long request_id;
+	long long status;
+	unsigned long long result;
+	unsigned long long bytes;
+	unsigned long long flags;
+};
+
+struct __pachaos_filed_generation_entry {
+	unsigned long long seq;
+	unsigned long long handle;
+	unsigned long long object_generation;
+	unsigned long long dir_generation;
+};
+
 struct __pachaos_filed_statx {
 	unsigned long long handle;
 	unsigned long long mode;
@@ -184,6 +293,22 @@ struct __pachaos_filed_statx {
 	unsigned long long blocks;
 	unsigned long long nlink;
 	unsigned long long kind;
+	unsigned long long object_generation;
+	unsigned long long dir_generation;
+};
+
+struct __pachaos_filed_seek {
+	unsigned long long handle;
+	long long offset;
+	unsigned long long whence;
+	unsigned long long reserved0;
+};
+
+struct __pachaos_filed_handle_flags {
+	unsigned long long handle;
+	unsigned long long fd_flags;
+	unsigned long long status_flags;
+	unsigned long long reserved0;
 };
 
 struct __pachaos_filed_dirent {
@@ -198,6 +323,8 @@ struct __pachaos_filed_getdents {
 	unsigned long long offset;
 	unsigned long long capacity;
 	unsigned long long count;
+	unsigned long long dir_generation;
+	unsigned long long reserved0;
 	struct __pachaos_filed_dirent entries[PACHAOS_FILED_DIRENT_CAPACITY];
 };
 
@@ -256,11 +383,53 @@ struct __pachaos_dirent {
 
 struct __pachaos_filed_fd_entry {
 	unsigned char used;
+	unsigned char stat_valid;
+	unsigned char read_cache_valid;
+	unsigned char read_cache_eof;
+	unsigned char open_cacheable;
+	unsigned short read_cache_len;
+	unsigned int fd_flags;
+	unsigned int status_flags;
+	unsigned int open_cache_rights;
+	unsigned int open_cache_open_flags;
+	unsigned long long offset;
 	unsigned long long handle;
+	unsigned long long stat_mode;
+	unsigned long long stat_size;
+	unsigned long long stat_blocks;
+	unsigned long long stat_nlink;
+	unsigned long long stat_kind;
+	unsigned long long read_cache_offset;
+	unsigned long long object_generation;
+	unsigned long long dir_generation;
+	unsigned char read_cache[PACHAOS_FILED_READ_CACHE_STORAGE_BYTES];
+	char open_cache_path[PACHAOS_FILED_NAME_BYTES];
+};
+
+struct __pachaos_filed_open_cache_entry {
+	unsigned char used;
+	unsigned int rights;
+	unsigned int open_flags;
+	unsigned long long handle;
+	unsigned long long object_generation;
+	unsigned long long dir_generation;
+	char path[PACHAOS_FILED_NAME_BYTES];
+};
+
+struct __pachaos_iovec {
+	void *base;
+	unsigned long len;
 };
 
 extern struct __pachaos_filed_fd_entry __pachaos_filed_fds[PACHAOS_FILED_FD_CAP];
+extern unsigned char __pachaos_filed_fd_used[PACHAOS_FILED_FD_CAP];
+extern struct __pachaos_filed_open_cache_entry __pachaos_filed_open_cache[PACHAOS_FILED_OPEN_CACHE_CAP];
 extern unsigned long long __pachaos_filed_request_id;
+extern long __pachaos_filed_page_fd;
+extern unsigned char *__pachaos_filed_page_addr;
+extern unsigned char *__pachaos_filed_session_page_addr;
+extern int __pachaos_filed_page_lock;
+extern long __pachaos_filed_session_fd;
 
 static __inline long __pachaos_raw0(long n)
 {
@@ -327,6 +496,16 @@ static __inline long __pachaos_copy_path(char *dst, const char *src, long cap)
 	return src[i] ? -36 : 0;
 }
 
+static __inline int __pachaos_str_equal(const char *a, const char *b)
+{
+	if (!a || !b) return 0;
+	for (long i = 0; i < PACHAOS_FILED_NAME_BYTES; i++) {
+		if (a[i] != b[i]) return 0;
+		if (a[i] == 0) return 1;
+	}
+	return 1;
+}
+
 static __inline unsigned short __pachaos_rd16(const unsigned char *p)
 {
 	return (unsigned short)p[0] | ((unsigned short)p[1] << 8);
@@ -377,13 +556,270 @@ static __inline unsigned long long __pachaos_elf_mapping_size(const unsigned cha
 	return __pachaos_page_align_up(max_end);
 }
 
-static __inline long __pachaos_filed_call(long op, long word2, long request_id, long page_fd, struct __pachaos_ipc_msg *reply)
+static __inline long __pachaos_filed_next_request_id(void);
+
+static __inline long __pachaos_filed_session_connect(long page_fd)
 {
+	if (__pachaos_filed_session_fd >= 16) return 0;
+	if (page_fd < 16) return -22;
+
+	unsigned long long pair[2] = {0, 0};
+	unsigned long long channel_rights =
+		PACHAOS_FD_RIGHT_INSPECT |
+		PACHAOS_FD_RIGHT_WAIT |
+		PACHAOS_FD_RIGHT_POLL |
+		PACHAOS_FD_RIGHT_CLOSE |
+		PACHAOS_FD_RIGHT_SEND |
+		PACHAOS_FD_RIGHT_RECV |
+		PACHAOS_FD_RIGHT_TRANSFER;
+	long status = __pachaos_raw3(PACHAOS_SYSCALL_IPC_CHANNEL_CREATE, (long)pair, channel_rights, PACHAOS_FD_FLAG_CLOEXEC);
+	if (status != 0 || pair[0] < 16 || pair[1] < 16) return status != 0 ? status : -23;
+
+	struct __pachaos_ipc_fd request_fds[2];
+	struct __pachaos_ipc_msg request;
+	struct __pachaos_ipc_msg reply;
+	__pachaos_bzero(request_fds, sizeof request_fds);
+	__pachaos_bzero(&request, sizeof request);
+	__pachaos_bzero(&reply, sizeof reply);
+
+	request_fds[0].fd = pair[1];
+	request_fds[0].rights =
+		PACHAOS_FD_RIGHT_CLOSE |
+		PACHAOS_FD_RIGHT_WAIT |
+		PACHAOS_FD_RIGHT_POLL |
+		PACHAOS_FD_RIGHT_SEND |
+		PACHAOS_FD_RIGHT_RECV;
+	request_fds[1].fd = page_fd;
+	request_fds[1].rights =
+		PACHAOS_FD_RIGHT_CLOSE |
+		PACHAOS_FD_RIGHT_MAP_READ |
+		PACHAOS_FD_RIGHT_MAP_WRITE;
+	request.word0 = PACHAOS_FILED_REQUEST_MAGIC;
+	request.word1 = PACHAOS_FILED_OP_CONNECT;
+	request.word3 = __pachaos_filed_next_request_id();
+	request.fds = request_fds;
+	request.fd_count = 2;
+
+	long reply_fd = __pachaos_raw2(PACHAOS_SYSCALL_IPC_CALL, PACHAOS_FILED_ENDPOINT_FD, (long)&request);
+	(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, (long)pair[1]);
+	if (reply_fd < 16) {
+		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, (long)pair[0]);
+		return -9;
+	}
+	for (;;) {
+		status = __pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT, reply_fd, (long)&reply, (long)~0ULL, 0);
+		if (status == 0) break;
+		if (status != 2 && status != -2 && status != 5 && status != -5) break;
+	}
+	(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, reply_fd);
+	if (status != 0 ||
+		reply.word0 != PACHAOS_FILED_REPLY_MAGIC ||
+		reply.word1 != 0 ||
+		reply.word3 != request.word3)
+	{
+		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, (long)pair[0]);
+		return status != 0 ? (status > 0 ? -status : status) : -71;
+	}
+
+	__pachaos_filed_session_fd = (long)pair[0];
+	return 0;
+}
+
+static __inline long __pachaos_filed_fast_layout(
+	struct __pachaos_filed_fast_header **out_header,
+	struct __pachaos_filed_fast_request **out_requests,
+	struct __pachaos_filed_fast_completion **out_completions)
+{
+	if ((unsigned long)__pachaos_filed_session_page_addr < 4096) return -14;
+	struct __pachaos_filed_fast_header *header =
+		(struct __pachaos_filed_fast_header *)__pachaos_filed_session_page_addr;
+	if (header->magic != PACHAOS_FILED_FAST_MAGIC ||
+		header->version != PACHAOS_FILED_FAST_VERSION ||
+		header->request_capacity != PACHAOS_FILED_FAST_REQUEST_CAPACITY ||
+		header->completion_capacity != PACHAOS_FILED_FAST_COMPLETION_CAPACITY ||
+		header->payload_slot_count == 0 ||
+		header->payload_slot_size != PACHAOS_FILED_PAGE_BYTES ||
+		header->payload_offset != PACHAOS_FILED_FAST_PAYLOAD_OFFSET ||
+		header->generation_offset != PACHAOS_FILED_FAST_GENERATION_OFFSET ||
+		header->generation_capacity != PACHAOS_FILED_FAST_GENERATION_CAPACITY)
+	{
+		return -71;
+	}
+	struct __pachaos_filed_fast_request *requests =
+		(struct __pachaos_filed_fast_request *)(__pachaos_filed_session_page_addr + sizeof(struct __pachaos_filed_fast_header));
+	struct __pachaos_filed_fast_completion *completions =
+		(struct __pachaos_filed_fast_completion *)((unsigned char *)requests +
+			sizeof(struct __pachaos_filed_fast_request) * PACHAOS_FILED_FAST_REQUEST_CAPACITY);
+	if (out_header) *out_header = header;
+	if (out_requests) *out_requests = requests;
+	if (out_completions) *out_completions = completions;
+	return 0;
+}
+
+static __inline unsigned char *__pachaos_filed_fast_payload_slot(unsigned long long slot)
+{
+	struct __pachaos_filed_fast_header *header = 0;
+	if (__pachaos_filed_fast_layout(&header, 0, 0) != 0) return 0;
+	if (slot >= header->payload_slot_count) return 0;
+	return __pachaos_filed_session_page_addr + header->payload_offset + slot * header->payload_slot_size;
+}
+
+static __inline long __pachaos_filed_shared_generation_lookup(
+	unsigned long long handle,
+	unsigned long long *object_generation,
+	unsigned long long *dir_generation)
+{
+	if (!handle || !object_generation || !dir_generation) return 0;
+	struct __pachaos_filed_fast_header *header = 0;
+	if (__pachaos_filed_fast_layout(&header, 0, 0) != 0) return 0;
+	struct __pachaos_filed_generation_entry *entries =
+		(struct __pachaos_filed_generation_entry *)(__pachaos_filed_session_page_addr + header->generation_offset);
+	for (unsigned long long i = 0; i < header->generation_capacity; i++) {
+		struct __pachaos_filed_generation_entry *entry = &entries[i];
+		unsigned long long seq0 = entry->seq;
+		__sync_synchronize();
+		unsigned long long entry_handle = entry->handle;
+		unsigned long long entry_object_generation = entry->object_generation;
+		unsigned long long entry_dir_generation = entry->dir_generation;
+		__sync_synchronize();
+		unsigned long long seq1 = entry->seq;
+		if (seq0 == seq1 &&
+			(seq0 & 1ULL) == 0 &&
+			entry_handle == handle &&
+			entry_object_generation != 0)
+		{
+			*object_generation = entry_object_generation;
+			*dir_generation = entry_dir_generation;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static __inline long __pachaos_filed_fast_enqueue(
+	long op,
+	long word2,
+	long request_id,
+	unsigned long long payload_slot,
+	unsigned long long payload_length)
+{
+	struct __pachaos_filed_fast_header *header = 0;
+	struct __pachaos_filed_fast_request *requests = 0;
+	long status = __pachaos_filed_fast_layout(&header, &requests, 0);
+	if (status != 0) return status;
+	if (payload_slot >= header->payload_slot_count) return -22;
+	if (payload_length > header->payload_slot_size) return -22;
+	if (header->request_tail - header->request_head >= header->request_capacity) return -11;
+
+	unsigned long long tail = header->request_tail;
+	struct __pachaos_filed_fast_request *slot =
+		&requests[tail % header->request_capacity];
+	__pachaos_bzero(slot, sizeof *slot);
+	slot->request_id = (unsigned long long)request_id;
+	slot->opcode = (unsigned long long)op;
+	slot->word2 = (unsigned long long)word2;
+	slot->payload_slot = payload_slot;
+	slot->payload_length = payload_length;
+	__sync_synchronize();
+	header->request_tail = tail + 1;
+	return 0;
+}
+
+static __inline long __pachaos_filed_fast_doorbell(long request_id, struct __pachaos_ipc_msg *reply)
+{
+	struct __pachaos_filed_fast_header *header = 0;
+	long status = __pachaos_filed_fast_layout(&header, 0, 0);
+	if (status != 0) return status;
+
+	struct __pachaos_ipc_msg request;
+	__pachaos_bzero(&request, sizeof request);
+	__pachaos_bzero(reply, sizeof *reply);
+	request.word0 = PACHAOS_FILED_REQUEST_MAGIC;
+	request.word1 = PACHAOS_FILED_OP_FAST_DOORBELL;
+	request.word2 = ++header->doorbell_seq;
+	request.word3 = (unsigned long long)request_id;
+
+	for (;;) {
+		status = __pachaos_raw2(PACHAOS_SYSCALL_IPC_SEND, __pachaos_filed_session_fd, (long)&request);
+		if (status == 0) break;
+		if (status != 2 && status != -2 && status != 5 && status != -5) return status > 0 ? -status : status;
+		struct __pachaos_pollfd wait_fd;
+		wait_fd.fd = __pachaos_filed_session_fd;
+		wait_fd.events = PACHAOS_POLL_WRITABLE;
+		wait_fd.revents = 0;
+		(void)__pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY, (long)&wait_fd, 1, 1, 0);
+	}
+	for (;;) {
+		status = __pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT, __pachaos_filed_session_fd, (long)reply, (long)~0ULL, 0);
+		if (status == 0) break;
+		if (status != 2 && status != -2 && status != 5 && status != -5) return status > 0 ? -status : status;
+	}
+	if (reply->word0 != PACHAOS_FILED_REPLY_MAGIC) return -71;
+	return (long)reply->word1;
+}
+
+static __inline long __pachaos_filed_fast_wait_completion(long request_id, struct __pachaos_ipc_msg *reply)
+{
+	struct __pachaos_filed_fast_header *header = 0;
+	struct __pachaos_filed_fast_completion *completions = 0;
+	long status = __pachaos_filed_fast_layout(&header, 0, &completions);
+	if (status != 0) return status;
+	while (header->completion_head == header->completion_tail) {
+		status = __pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT, __pachaos_filed_session_fd, (long)reply, (long)~0ULL, 0);
+		if (status != 0 && status != 2 && status != -2 && status != 5 && status != -5) return status > 0 ? -status : status;
+	}
+	__sync_synchronize();
+	struct __pachaos_filed_fast_completion *completion =
+		&completions[header->completion_head % header->completion_capacity];
+	if (completion->request_id != (unsigned long long)request_id) return -71;
+	reply->word0 = PACHAOS_FILED_REPLY_MAGIC;
+	reply->word1 = (unsigned long long)completion->status;
+	reply->word2 = completion->result;
+	reply->word3 = completion->request_id;
+	header->completion_head++;
+	return (long)completion->status;
+}
+
+static __inline long __pachaos_filed_session_call(long op, long word2, long request_id, long page_fd, struct __pachaos_ipc_msg *reply)
+{
+	long status = __pachaos_filed_session_connect(page_fd);
+	if (status != 0) return status;
+
+	struct __pachaos_filed_fast_header *header = 0;
+	status = __pachaos_filed_fast_layout(&header, 0, 0);
+	if (status != 0) return status;
+	while (header->request_tail - header->request_head >= header->request_capacity) {
+		status = __pachaos_filed_fast_doorbell(request_id, reply);
+		if (status != 0) return status;
+	}
+
+	status = __pachaos_filed_fast_enqueue(op, word2, request_id, 0, PACHAOS_FILED_PAGE_BYTES);
+	if (status != 0) return status;
+	status = __pachaos_filed_fast_doorbell(request_id, reply);
+	if (status != 0) return status;
+	return __pachaos_filed_fast_wait_completion(request_id, reply);
+}
+
+static __inline long __pachaos_filed_call_with_fds(
+	long op,
+	long word2,
+	long request_id,
+	long page_fd,
+	struct __pachaos_ipc_msg *reply,
+	struct __pachaos_ipc_fd *reply_fds,
+	unsigned long long reply_fd_capacity)
+{
+	if (reply_fd_capacity == 0 && op != PACHAOS_FILED_OP_CONNECT) {
+		return __pachaos_filed_session_call(op, word2, request_id, page_fd, reply);
+	}
+
 	struct __pachaos_ipc_fd request_fd;
 	struct __pachaos_ipc_msg request;
 	__pachaos_bzero(&request_fd, sizeof request_fd);
 	__pachaos_bzero(&request, sizeof request);
 	__pachaos_bzero(reply, sizeof *reply);
+	reply->fds = reply_fds;
+	reply->fd_capacity = reply_fd_capacity;
 
 	request_fd.fd = page_fd;
 	request_fd.rights =
@@ -401,23 +837,19 @@ static __inline long __pachaos_filed_call(long op, long word2, long request_id, 
 	if (reply_fd < 16) return -9;
 	long status = -22;
 	for (;;) {
-		status = __pachaos_raw2(PACHAOS_SYSCALL_IPC_RECV, reply_fd, (long)reply);
+		status = __pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT, reply_fd, (long)reply, (long)~0ULL, 0);
 		if (status == 0) break;
 		if (status != 2 && status != -2 && status != 5 && status != -5) break;
-		struct __pachaos_pollfd wait_fd;
-		wait_fd.fd = reply_fd;
-		wait_fd.events = PACHAOS_POLL_READABLE;
-		wait_fd.revents = 0;
-		long wait_status = __pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY, (long)&wait_fd, 1, 1, 0);
-		if (wait_status != 0 && wait_status != 2 && wait_status != -2 && wait_status != 5 && wait_status != -5) {
-			status = wait_status;
-			break;
-		}
 	}
 	(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, reply_fd);
-	if (status != 0) return -5;
+	if (status != 0) return status > 0 ? -status : status;
 	if (reply->word0 != PACHAOS_FILED_REPLY_MAGIC || reply->word3 != (unsigned long long)request_id) return -71;
 	return (long)reply->word1;
+}
+
+static __inline long __pachaos_filed_call(long op, long word2, long request_id, long page_fd, struct __pachaos_ipc_msg *reply)
+{
+	return __pachaos_filed_call_with_fds(op, word2, request_id, page_fd, reply, 0, 0);
 }
 
 static __inline long __pachaos_filed_next_request_id(void)
@@ -429,57 +861,130 @@ static __inline long __pachaos_filed_next_request_id(void)
 
 static __inline long __pachaos_filed_page_create(long *out_fd, unsigned char **out_page)
 {
-	long page_fd = __pachaos_raw3(
-		PACHAOS_SYSCALL_VMO_CREATE,
-		PACHAOS_FILED_PAGE_BYTES,
-		PACHAOS_FD_RIGHT_TRANSFER|PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_MAP_READ|PACHAOS_FD_RIGHT_MAP_WRITE,
-		0);
-	if (page_fd < 16) return -23;
-	long page_addr = __pachaos_raw6(
-		PACHAOS_SYSCALL_MMAP,
-		page_fd,
-		0,
-		PACHAOS_FILED_PAGE_BYTES,
-		PACHAOS_PROT_READ|PACHAOS_PROT_WRITE,
-		PACHAOS_MMAP_SHARED,
-		0);
-	if (page_addr < 4096) {
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
-		return -14;
+	if (!out_fd || !out_page) return -22;
+
+	while (__sync_lock_test_and_set(&__pachaos_filed_page_lock, 1)) {
+		__asm__ __volatile__("pause");
 	}
-	*out_fd = page_fd;
-	*out_page = (unsigned char *)page_addr;
+
+	if (__pachaos_filed_page_fd < 16 || (unsigned long)__pachaos_filed_session_page_addr < 4096) {
+		long page_fd = __pachaos_raw3(
+			PACHAOS_SYSCALL_VMO_CREATE,
+			PACHAOS_FILED_SESSION_PAGE_BYTES,
+			PACHAOS_FD_RIGHT_TRANSFER|PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_MAP_READ|PACHAOS_FD_RIGHT_MAP_WRITE,
+			0);
+		if (page_fd < 16) {
+			__sync_lock_release(&__pachaos_filed_page_lock);
+			return -23;
+		}
+		long page_addr = __pachaos_raw6(
+			PACHAOS_SYSCALL_MMAP,
+			page_fd,
+			0,
+			PACHAOS_FILED_SESSION_PAGE_BYTES,
+			PACHAOS_PROT_READ|PACHAOS_PROT_WRITE,
+			PACHAOS_MMAP_SHARED,
+			0);
+		if (page_addr < 4096) {
+			(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
+			__sync_lock_release(&__pachaos_filed_page_lock);
+			return -14;
+		}
+		__pachaos_filed_page_fd = page_fd;
+		__pachaos_filed_session_page_addr = (unsigned char *)page_addr;
+		__pachaos_bzero(__pachaos_filed_session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
+		struct __pachaos_filed_fast_header *header =
+			(struct __pachaos_filed_fast_header *)__pachaos_filed_session_page_addr;
+		header->magic = PACHAOS_FILED_FAST_MAGIC;
+		header->version = PACHAOS_FILED_FAST_VERSION;
+		header->request_capacity = PACHAOS_FILED_FAST_REQUEST_CAPACITY;
+		header->completion_capacity = PACHAOS_FILED_FAST_COMPLETION_CAPACITY;
+		header->payload_slot_count = PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT;
+		header->payload_slot_size = PACHAOS_FILED_PAGE_BYTES;
+		header->payload_offset = PACHAOS_FILED_FAST_PAYLOAD_OFFSET;
+		header->generation_offset = PACHAOS_FILED_FAST_GENERATION_OFFSET;
+		header->generation_capacity = PACHAOS_FILED_FAST_GENERATION_CAPACITY;
+		__pachaos_filed_page_addr = __pachaos_filed_session_page_addr + PACHAOS_FILED_FAST_PAYLOAD_OFFSET;
+	}
+
+	*out_fd = __pachaos_filed_page_fd;
+	*out_page = __pachaos_filed_page_addr;
 	return 0;
 }
 
 static __inline void __pachaos_filed_page_destroy(long page_fd, unsigned char *page)
 {
-	if (page && (unsigned long)page >= 4096) {
-		(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, (long)page, PACHAOS_FILED_PAGE_BYTES);
-	}
-	if (page_fd >= 16) {
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
-	}
+	(void)page_fd;
+	(void)page;
+	__sync_lock_release(&__pachaos_filed_page_lock);
 }
 
 static __inline int __pachaos_filed_fd_index(long fd)
 {
 	if (fd < PACHAOS_FILED_FD_BASE || fd >= PACHAOS_FILED_FD_BASE + PACHAOS_FILED_FD_CAP) return -1;
 	int idx = (int)(fd - PACHAOS_FILED_FD_BASE);
-	return __pachaos_filed_fds[idx].used ? idx : -1;
+	return __pachaos_filed_fd_used[idx] ? idx : -1;
 }
 
-static __inline long __pachaos_filed_fd_alloc(unsigned long long handle)
+static __inline unsigned int __pachaos_filed_fd_flags_from_open(long flags)
+{
+	return (flags & LINUX_O_CLOEXEC) ? PACHAOS_FILED_FD_CLOEXEC : 0;
+}
+
+static __inline unsigned int __pachaos_filed_status_flags_from_open(long flags)
+{
+	unsigned int out = 0;
+	if (flags & LINUX_O_APPEND) out |= PACHAOS_FILED_FILE_APPEND;
+	if (flags & LINUX_O_NONBLOCK) out |= PACHAOS_FILED_FILE_NONBLOCK;
+	return out;
+}
+
+static __inline long __pachaos_filed_fd_alloc_from(
+	unsigned long long handle,
+	long min_fd,
+	unsigned int fd_flags,
+	unsigned int status_flags)
 {
 	if (!handle) return -22;
-	for (int i = 0; i < PACHAOS_FILED_FD_CAP; i++) {
-		if (!__pachaos_filed_fds[i].used) {
+	if (min_fd < 0) return -22;
+	int start = 0;
+	if (min_fd > PACHAOS_FILED_FD_BASE) {
+		start = (int)(min_fd - PACHAOS_FILED_FD_BASE);
+	}
+	if (start >= PACHAOS_FILED_FD_CAP) return -24;
+	for (int i = start; i < PACHAOS_FILED_FD_CAP; i++) {
+		if (!__pachaos_filed_fd_used[i]) {
+			__pachaos_filed_fd_used[i] = 1;
 			__pachaos_filed_fds[i].used = 1;
+			__pachaos_filed_fds[i].fd_flags = fd_flags;
+			__pachaos_filed_fds[i].status_flags = status_flags;
+			__pachaos_filed_fds[i].open_cache_rights = 0;
+			__pachaos_filed_fds[i].open_cache_open_flags = 0;
+			__pachaos_filed_fds[i].offset = 0;
 			__pachaos_filed_fds[i].handle = handle;
+			__pachaos_filed_fds[i].stat_valid = 0;
+			__pachaos_filed_fds[i].read_cache_valid = 0;
+			__pachaos_filed_fds[i].read_cache_eof = 0;
+			__pachaos_filed_fds[i].open_cacheable = 0;
+			__pachaos_filed_fds[i].read_cache_len = 0;
+			__pachaos_filed_fds[i].stat_mode = 0;
+			__pachaos_filed_fds[i].stat_size = 0;
+			__pachaos_filed_fds[i].stat_blocks = 0;
+			__pachaos_filed_fds[i].stat_nlink = 0;
+			__pachaos_filed_fds[i].stat_kind = 0;
+			__pachaos_filed_fds[i].read_cache_offset = 0;
+			__pachaos_filed_fds[i].object_generation = 0;
+			__pachaos_filed_fds[i].dir_generation = 0;
+			__pachaos_bzero(__pachaos_filed_fds[i].open_cache_path, PACHAOS_FILED_NAME_BYTES);
 			return PACHAOS_FILED_FD_BASE + i;
 		}
 	}
 	return -24;
+}
+
+static __inline long __pachaos_filed_fd_alloc(unsigned long long handle)
+{
+	return __pachaos_filed_fd_alloc_from(handle, 0, 0, 0);
 }
 
 static __inline unsigned long long __pachaos_filed_fd_handle(long fd)
@@ -488,12 +993,571 @@ static __inline unsigned long long __pachaos_filed_fd_handle(long fd)
 	return idx < 0 ? 0 : __pachaos_filed_fds[idx].handle;
 }
 
+static __inline unsigned int __pachaos_filed_fd_flags(long fd)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	return idx < 0 ? 0 : __pachaos_filed_fds[idx].fd_flags;
+}
+
+static __inline void __pachaos_filed_fd_set_flags(long fd, unsigned int fd_flags)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	if (idx >= 0) __pachaos_filed_fds[idx].fd_flags = fd_flags;
+}
+
+static __inline unsigned int __pachaos_filed_status_flags(long fd)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	return idx < 0 ? 0 : __pachaos_filed_fds[idx].status_flags;
+}
+
+static __inline void __pachaos_filed_fd_set_status_flags(long fd, unsigned int status_flags)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	if (idx >= 0) __pachaos_filed_fds[idx].status_flags = status_flags;
+}
+
+static __inline unsigned long long __pachaos_filed_fd_offset(long fd)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	return idx < 0 ? 0 : __pachaos_filed_fds[idx].offset;
+}
+
+static __inline void __pachaos_filed_fd_set_offset(long fd, unsigned long long offset)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	if (idx >= 0) {
+		__pachaos_filed_fds[idx].offset = offset;
+		__pachaos_filed_fds[idx].status_flags &= ~PACHAOS_FILED_FILE_DIR_EOF;
+	}
+}
+
+static __inline void __pachaos_filed_fd_advance_offset(long fd, unsigned long long amount)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	if (idx < 0) return;
+	if (amount > ~0ULL - __pachaos_filed_fds[idx].offset) {
+		__pachaos_filed_fds[idx].offset = ~0ULL;
+		return;
+	}
+	__pachaos_filed_fds[idx].offset += amount;
+}
+
+static __inline void __pachaos_filed_fd_invalidate_cached_state_idx(int idx)
+{
+	if (idx < 0) return;
+	__pachaos_filed_fds[idx].stat_valid = 0;
+	__pachaos_filed_fds[idx].read_cache_valid = 0;
+	__pachaos_filed_fds[idx].read_cache_eof = 0;
+	__pachaos_filed_fds[idx].read_cache_len = 0;
+	__pachaos_filed_fds[idx].read_cache_offset = 0;
+	__pachaos_filed_fds[idx].status_flags &= ~PACHAOS_FILED_FILE_DIR_EOF;
+}
+
+static __inline void __pachaos_filed_fd_invalidate_stat_idx(int idx)
+{
+	if (idx >= 0) __pachaos_filed_fds[idx].stat_valid = 0;
+}
+
+static __inline void __pachaos_filed_fd_invalidate_stat(long fd)
+{
+	__pachaos_filed_fd_invalidate_stat_idx(__pachaos_filed_fd_index(fd));
+}
+
+static __inline void __pachaos_filed_fd_invalidate_cached_state(long fd)
+{
+	__pachaos_filed_fd_invalidate_cached_state_idx(__pachaos_filed_fd_index(fd));
+}
+
+static __inline unsigned long long __pachaos_min_ull(unsigned long long a, unsigned long long b)
+{
+	return a < b ? a : b;
+}
+
+static __inline unsigned long long __pachaos_max_ull(unsigned long long a, unsigned long long b)
+{
+	return a > b ? a : b;
+}
+
+static __inline long __pachaos_filed_fd_read_cache_copy_to_linear(
+	int idx,
+	unsigned long long offset,
+	unsigned long long len,
+	unsigned char *dst)
+{
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+	if (idx < 0 || !dst || !__pachaos_filed_fds[idx].read_cache_valid) return -1;
+	unsigned long long cache_start = __pachaos_filed_fds[idx].read_cache_offset;
+	unsigned long long cache_len = __pachaos_filed_fds[idx].read_cache_len;
+	if (offset < cache_start || offset - cache_start > cache_len) return -1;
+	unsigned long long rel = offset - cache_start;
+	unsigned long long avail = cache_len - rel;
+	if (len > avail) {
+		if (!__pachaos_filed_fds[idx].read_cache_eof) return -1;
+		len = avail;
+	}
+	for (unsigned long long i = 0; i < len; i++) {
+		dst[i] = __pachaos_filed_fds[idx].read_cache[rel + i];
+	}
+	return (long)len;
+#else
+	(void)idx;
+	(void)offset;
+	(void)len;
+	(void)dst;
+	return -1;
+#endif
+}
+
+static __inline int __pachaos_filed_fd_read_cache_equals_linear(
+	int idx,
+	unsigned long long offset,
+	unsigned long long len,
+	const unsigned char *src)
+{
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+	if (idx < 0 || (len > 0 && !src) || !__pachaos_filed_fds[idx].read_cache_valid) return 0;
+	unsigned long long cache_start = __pachaos_filed_fds[idx].read_cache_offset;
+	unsigned long long cache_len = __pachaos_filed_fds[idx].read_cache_len;
+	if (offset < cache_start || offset - cache_start > cache_len) return 0;
+	unsigned long long rel = offset - cache_start;
+	unsigned long long avail = cache_len - rel;
+	if (len > avail) return 0;
+	for (unsigned long long i = 0; i < len; i++) {
+		if (__pachaos_filed_fds[idx].read_cache[rel + i] != src[i]) return 0;
+	}
+	return 1;
+#else
+	(void)idx;
+	(void)offset;
+	(void)len;
+	(void)src;
+	return 0;
+#endif
+}
+
+static __inline long __pachaos_filed_fd_read_cache_copy_to_iov(
+	int idx,
+	unsigned long long offset,
+	const struct __pachaos_iovec *iov,
+	long count)
+{
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+	if (idx < 0 || count < 0 || (count > 0 && !iov)) return -1;
+	unsigned long long len = 0;
+	for (long i = 0; i < count; i++) {
+		if (iov[i].len != 0 && !iov[i].base) return -1;
+		if (iov[i].len > ~0ULL - len) return -1;
+		len += iov[i].len;
+	}
+	if (!__pachaos_filed_fds[idx].read_cache_valid) return -1;
+	unsigned long long cache_start = __pachaos_filed_fds[idx].read_cache_offset;
+	unsigned long long cache_len = __pachaos_filed_fds[idx].read_cache_len;
+	if (offset < cache_start || offset - cache_start > cache_len) return -1;
+	unsigned long long rel = offset - cache_start;
+	unsigned long long avail = cache_len - rel;
+	if (len > avail) {
+		if (!__pachaos_filed_fds[idx].read_cache_eof) return -1;
+		len = avail;
+	}
+	unsigned long long copied = 0;
+	for (long i = 0; i < count && copied < len; i++) {
+		unsigned long long take = iov[i].len;
+		if (take > len - copied) take = len - copied;
+		for (unsigned long long j = 0; j < take; j++) {
+			((unsigned char *)iov[i].base)[j] = __pachaos_filed_fds[idx].read_cache[rel + copied + j];
+		}
+		copied += take;
+	}
+	return (long)copied;
+#else
+	(void)idx;
+	(void)offset;
+	(void)iov;
+	(void)count;
+	return -1;
+#endif
+}
+
+static __inline void __pachaos_filed_fd_store_read_cache_idx(
+	int idx,
+	unsigned long long offset,
+	const unsigned char *src,
+	unsigned long long len,
+	int eof)
+{
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+	if (idx < 0 || !src) return;
+	if (len > PACHAOS_FILED_READ_CACHE_BYTES) {
+		__pachaos_filed_fds[idx].read_cache_valid = 0;
+		__pachaos_filed_fds[idx].read_cache_eof = 0;
+		__pachaos_filed_fds[idx].read_cache_len = 0;
+		return;
+	}
+	if (offset > ~0ULL - len) return;
+	unsigned long long write_start = offset;
+	unsigned long long write_end = offset + len;
+	unsigned long long new_start = write_start;
+	unsigned long long new_end = write_end;
+	int new_eof = eof ? 1 : 0;
+	if (__pachaos_filed_fds[idx].read_cache_valid) {
+		unsigned long long cache_start = __pachaos_filed_fds[idx].read_cache_offset;
+		unsigned long long cache_len = __pachaos_filed_fds[idx].read_cache_len;
+		if (cache_start <= ~0ULL - cache_len) {
+			unsigned long long cache_end = cache_start + cache_len;
+			if (write_start <= cache_end && cache_start <= write_end) {
+				new_start = __pachaos_min_ull(cache_start, write_start);
+				new_end = __pachaos_max_ull(cache_end, write_end);
+				if (new_end >= new_start && new_end - new_start <= PACHAOS_FILED_READ_CACHE_BYTES) {
+					if (new_start < cache_start) {
+						unsigned long long shift = cache_start - new_start;
+						for (unsigned long long i = cache_len; i > 0; i--) {
+							__pachaos_filed_fds[idx].read_cache[shift + i - 1] =
+								__pachaos_filed_fds[idx].read_cache[i - 1];
+						}
+					}
+					new_eof = eof || (__pachaos_filed_fds[idx].read_cache_eof && write_start <= cache_end);
+				} else {
+					new_start = write_start;
+					new_end = write_end;
+				}
+			}
+		}
+	}
+	__pachaos_filed_fds[idx].read_cache_valid = 1;
+	__pachaos_filed_fds[idx].read_cache_eof = (unsigned char)new_eof;
+	__pachaos_filed_fds[idx].read_cache_offset = new_start;
+	__pachaos_filed_fds[idx].read_cache_len = (unsigned short)(new_end - new_start);
+	for (unsigned long long i = 0; i < len; i++) {
+		__pachaos_filed_fds[idx].read_cache[write_start - new_start + i] = src[i];
+	}
+#else
+	(void)idx;
+	(void)offset;
+	(void)src;
+	(void)len;
+	(void)eof;
+#endif
+}
+
+static __inline void __pachaos_filed_fd_store_read_cache_from_iov_idx(
+	int idx,
+	unsigned long long offset,
+	const struct __pachaos_iovec *iov,
+	long count,
+	unsigned long long len,
+	int eof)
+{
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+	if (idx < 0 || !iov || len > PACHAOS_FILED_READ_CACHE_BYTES) {
+		if (idx >= 0 && len > PACHAOS_FILED_READ_CACHE_BYTES) {
+			__pachaos_filed_fds[idx].read_cache_valid = 0;
+			__pachaos_filed_fds[idx].read_cache_eof = 0;
+			__pachaos_filed_fds[idx].read_cache_len = 0;
+		}
+		return;
+	}
+	unsigned char tmp[PACHAOS_FILED_READ_CACHE_STORAGE_BYTES];
+	unsigned long long copied = 0;
+	for (long i = 0; i < count && copied < len; i++) {
+		unsigned long long take = iov[i].len;
+		if (take > len - copied) take = len - copied;
+		for (unsigned long long j = 0; j < take; j++) {
+			tmp[copied + j] = ((const unsigned char *)iov[i].base)[j];
+		}
+		copied += take;
+	}
+	if (copied == len) __pachaos_filed_fd_store_read_cache_idx(idx, offset, tmp, len, eof);
+#else
+	(void)idx;
+	(void)offset;
+	(void)iov;
+	(void)count;
+	(void)len;
+	(void)eof;
+#endif
+}
+
+static __inline long __pachaos_filed_refresh_generation_from_stat_idx(int idx)
+{
+	if (idx < 0 || !__pachaos_filed_fd_used[idx]) return 0;
+	unsigned long long handle = __pachaos_filed_fds[idx].handle;
+	unsigned long long old_generation = __pachaos_filed_fds[idx].object_generation;
+	if (!handle || old_generation == 0) return 0;
+
+	unsigned long long shared_object_generation = 0;
+	unsigned long long shared_dir_generation = 0;
+	if (__pachaos_filed_shared_generation_lookup(
+			handle,
+			&shared_object_generation,
+			&shared_dir_generation))
+	{
+		if (shared_object_generation == old_generation) return 1;
+		__pachaos_filed_fds[idx].object_generation = shared_object_generation;
+		__pachaos_filed_fds[idx].dir_generation = shared_dir_generation;
+		return 2;
+	}
+
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return 0;
+	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+	struct __pachaos_filed_statx *st = (struct __pachaos_filed_statx *)page;
+	st->handle = handle;
+	struct __pachaos_ipc_msg reply;
+	status = __pachaos_filed_call(PACHAOS_FILED_OP_STAT, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+	unsigned long long new_generation = 0;
+	if (status == 0) {
+		new_generation = st->object_generation;
+		__pachaos_filed_fds[idx].stat_valid = 1;
+		__pachaos_filed_fds[idx].stat_mode = st->mode;
+		__pachaos_filed_fds[idx].stat_size = st->size;
+		__pachaos_filed_fds[idx].stat_blocks = st->blocks;
+		__pachaos_filed_fds[idx].stat_nlink = st->nlink ? st->nlink : 1;
+		__pachaos_filed_fds[idx].stat_kind = st->kind;
+		__pachaos_filed_fds[idx].object_generation = st->object_generation;
+		__pachaos_filed_fds[idx].dir_generation = st->dir_generation;
+	}
+	__pachaos_filed_page_destroy(page_fd, page);
+	if (status != 0) return 0;
+	return new_generation == old_generation ? 1 : 2;
+}
+
+static __inline void __pachaos_filed_fd_validate_read_cache_idx(int idx)
+{
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+	if (idx < 0 || !__pachaos_filed_fds[idx].read_cache_valid) return;
+	if (__pachaos_filed_refresh_generation_from_stat_idx(idx) != 1) {
+		__pachaos_filed_fds[idx].read_cache_valid = 0;
+		__pachaos_filed_fds[idx].read_cache_eof = 0;
+		__pachaos_filed_fds[idx].read_cache_len = 0;
+		__pachaos_filed_fds[idx].read_cache_offset = 0;
+	}
+#else
+	(void)idx;
+#endif
+}
+
+static __inline void __pachaos_filed_close_handle(unsigned long long handle, long page_fd);
+
+static __inline int __pachaos_filed_open_can_use_cache(long dirfd, const char *path, long flags)
+{
+	if (!path || path[0] != '/') return 0;
+	if (dirfd != LINUX_AT_FDCWD) return 0;
+	if ((flags & LINUX_O_ACCMODE) != 0) return 0;
+	if (flags & (LINUX_O_CREAT|LINUX_O_EXCL|LINUX_O_TRUNC|LINUX_O_APPEND)) return 0;
+	return 1;
+}
+
+static __inline int __pachaos_filed_relative_open_name_ok(const char *path)
+{
+	if (!path || !path[0]) return 0;
+	if (path[0] == '.' && (!path[1] || (path[1] == '.' && !path[2]))) return 0;
+	for (long i = 0; i < PACHAOS_FILED_NAME_BYTES; i++) {
+		char c = path[i];
+		if (!c) return 1;
+		if (c == '/') return 0;
+	}
+	return 0;
+}
+
+static __inline int __pachaos_filed_make_open_cache_key(
+	long dirfd,
+	const char *path,
+	long flags,
+	char *out)
+{
+	if (!out) return -22;
+	out[0] = 0;
+	if (!path) return 0;
+	if ((flags & LINUX_O_ACCMODE) != 0) return 0;
+	if (flags & (LINUX_O_CREAT|LINUX_O_EXCL|LINUX_O_TRUNC|LINUX_O_APPEND)) return 0;
+	if (path[0] == '/') {
+		if (dirfd != LINUX_AT_FDCWD) return 0;
+		long status = __pachaos_copy_path(out, path, PACHAOS_FILED_NAME_BYTES);
+		return status == 0 ? 1 : (int)status;
+	}
+	if (dirfd == LINUX_AT_FDCWD) return 0;
+	if (!__pachaos_filed_relative_open_name_ok(path)) return 0;
+	int dir_idx = __pachaos_filed_fd_index(dirfd);
+	if (dir_idx < 0) return 0;
+	const char *base = __pachaos_filed_fds[dir_idx].open_cache_path;
+	if (!base || base[0] != '/') return 0;
+	long pos = 0;
+	for (; pos < PACHAOS_FILED_NAME_BYTES - 1 && base[pos]; pos++) {
+		out[pos] = base[pos];
+	}
+	if (pos == 0 || pos >= PACHAOS_FILED_NAME_BYTES - 1) {
+		out[0] = 0;
+		return 0;
+	}
+	if (out[pos - 1] != '/') {
+		if (pos >= PACHAOS_FILED_NAME_BYTES - 1) {
+			out[0] = 0;
+			return 0;
+		}
+		out[pos++] = '/';
+	}
+	for (long i = 0; i < PACHAOS_FILED_NAME_BYTES; i++) {
+		char c = path[i];
+		if (pos >= PACHAOS_FILED_NAME_BYTES - 1) {
+			out[0] = 0;
+			return -36;
+		}
+		out[pos++] = c;
+		if (!c) return 1;
+	}
+	out[0] = 0;
+	return -36;
+}
+
+static __inline long __pachaos_filed_open_cache_take(
+	const char *path,
+	unsigned int rights,
+	unsigned int open_flags,
+	struct __pachaos_filed_open_cache_entry *out_entry)
+{
+	if (out_entry) __pachaos_bzero(out_entry, sizeof(*out_entry));
+	for (int i = 0; i < PACHAOS_FILED_OPEN_CACHE_CAP; i++) {
+		if (__pachaos_filed_open_cache[i].used &&
+			__pachaos_filed_open_cache[i].rights == rights &&
+			__pachaos_filed_open_cache[i].open_flags == open_flags &&
+			__pachaos_str_equal(__pachaos_filed_open_cache[i].path, path))
+		{
+			unsigned long long handle = __pachaos_filed_open_cache[i].handle;
+			if (out_entry) *out_entry = __pachaos_filed_open_cache[i];
+			__pachaos_bzero(&__pachaos_filed_open_cache[i], sizeof(__pachaos_filed_open_cache[i]));
+			return (long)handle;
+		}
+	}
+	return 0;
+}
+
+static __inline void __pachaos_filed_open_cache_store(
+	unsigned long long handle,
+	const char *path,
+	unsigned int rights,
+	unsigned int open_flags,
+	unsigned long long object_generation,
+	unsigned long long dir_generation)
+{
+	if (!handle || !path) return;
+	int slot = -1;
+	for (int i = 0; i < PACHAOS_FILED_OPEN_CACHE_CAP; i++) {
+		if (!__pachaos_filed_open_cache[i].used) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0) {
+		slot = 0;
+		__pachaos_filed_close_handle(__pachaos_filed_open_cache[slot].handle, -1);
+	}
+	__pachaos_bzero(&__pachaos_filed_open_cache[slot], sizeof(__pachaos_filed_open_cache[slot]));
+	__pachaos_filed_open_cache[slot].used = 1;
+	__pachaos_filed_open_cache[slot].rights = rights;
+	__pachaos_filed_open_cache[slot].open_flags = open_flags;
+	__pachaos_filed_open_cache[slot].handle = handle;
+	__pachaos_filed_open_cache[slot].object_generation = object_generation;
+	__pachaos_filed_open_cache[slot].dir_generation = dir_generation;
+	(void)__pachaos_copy_path(__pachaos_filed_open_cache[slot].path, path, PACHAOS_FILED_NAME_BYTES);
+}
+
+static __inline void __pachaos_filed_fd_mark_open_cacheable(
+	long fd,
+	const char *path,
+	unsigned int rights,
+	unsigned int open_flags)
+{
+	int idx = __pachaos_filed_fd_index(fd);
+	if (idx < 0 || !path) return;
+	__pachaos_filed_fds[idx].open_cacheable = 1;
+	__pachaos_filed_fds[idx].open_cache_rights = rights;
+	__pachaos_filed_fds[idx].open_cache_open_flags = open_flags;
+	(void)__pachaos_copy_path(__pachaos_filed_fds[idx].open_cache_path, path, PACHAOS_FILED_NAME_BYTES);
+}
+
+static __inline void __pachaos_filed_write_kstat_from_fd_cache(int idx, struct __pachaos_kstat *out)
+{
+	__pachaos_bzero(out, sizeof(*out));
+	out->st_ino = __pachaos_filed_fds[idx].handle;
+	out->st_nlink = __pachaos_filed_fds[idx].stat_nlink ? __pachaos_filed_fds[idx].stat_nlink : 1;
+	out->st_mode = (unsigned int)__pachaos_filed_fds[idx].stat_mode;
+	out->st_size = (long long)__pachaos_filed_fds[idx].stat_size;
+	out->st_blksize = 4096;
+	out->st_blocks = (long long)__pachaos_filed_fds[idx].stat_blocks;
+}
+
 static __inline void __pachaos_filed_close_handle(unsigned long long handle, long page_fd)
 {
 	if (!handle) return;
+	unsigned char *page = 0;
+	int owned_page = 0;
+	if (page_fd < 16 && __pachaos_filed_session_fd < 16) {
+		if (__pachaos_filed_page_create(&page_fd, &page) != 0) return;
+		owned_page = 1;
+	}
 	struct __pachaos_ipc_msg reply;
-	(void)__pachaos_filed_call(PACHAOS_FILED_OP_CLOSE, (long)handle, __pachaos_filed_next_request_id(), -1, &reply);
-	(void)page_fd;
+	(void)__pachaos_filed_call(PACHAOS_FILED_OP_CLOSE, (long)handle, __pachaos_filed_next_request_id(), page_fd, &reply);
+	if (owned_page) __pachaos_filed_page_destroy(page_fd, page);
+}
+
+static __inline long __pachaos_filed_seek_handle(unsigned long long handle, long offset, long whence)
+{
+	if (!handle) return -22;
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
+	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+	struct __pachaos_filed_seek *seek = (struct __pachaos_filed_seek *)page;
+	seek->handle = handle;
+	seek->offset = offset;
+	seek->whence = (unsigned long long)whence;
+	struct __pachaos_ipc_msg reply;
+	status = __pachaos_filed_call(PACHAOS_FILED_OP_SEEK, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+	__pachaos_filed_page_destroy(page_fd, page);
+	return status == 0 ? (long)reply.word2 : status;
+}
+
+static __inline long __pachaos_filed_validate_open_cache(
+	unsigned long long cached_handle,
+	const char *path,
+	unsigned int rights,
+	unsigned int open_flags,
+	unsigned long long object_generation,
+	unsigned long long dir_generation)
+{
+	if (!cached_handle || !path || object_generation == 0) return 0;
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
+	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+	struct __pachaos_filed_validate_open_cache *validate =
+		(struct __pachaos_filed_validate_open_cache *)page;
+	validate->cached_handle = cached_handle;
+	validate->dir_handle = 0;
+	validate->rights = rights;
+	validate->open_flags = open_flags;
+	validate->object_generation = object_generation;
+	validate->dir_generation = dir_generation;
+	status = __pachaos_copy_path(validate->name, path, PACHAOS_FILED_NAME_BYTES);
+	if (status != 0) {
+		__pachaos_filed_page_destroy(page_fd, page);
+		return status;
+	}
+	struct __pachaos_ipc_msg reply;
+	status = __pachaos_filed_call(
+		PACHAOS_FILED_OP_VALIDATE_OPEN_CACHE,
+		0,
+		__pachaos_filed_next_request_id(),
+		page_fd,
+		&reply);
+	__pachaos_filed_page_destroy(page_fd, page);
+	if (status != 0) return status;
+	return reply.word2 == 1 ? 1 : 0;
 }
 
 static __inline unsigned int __pachaos_filed_rights_from_linux(long flags)
@@ -531,12 +1595,65 @@ static __inline unsigned int __pachaos_filed_open_flags_from_linux(long flags)
 static __inline long __pachaos_openat_filed_fd(long dirfd, const char *path, long flags)
 {
 	if (!path) return -22;
+	const unsigned int rights = __pachaos_filed_rights_from_linux(flags);
+	const unsigned int open_flags = __pachaos_filed_open_flags_from_linux(flags);
+	char path_key[PACHAOS_FILED_NAME_BYTES];
+	int cacheable = __pachaos_filed_make_open_cache_key(dirfd, path, flags, path_key);
+	if (cacheable < 0) return cacheable;
+	long status;
+	if (cacheable) {
+		struct __pachaos_filed_open_cache_entry cached_entry;
+		long cached_handle = __pachaos_filed_open_cache_take(
+			path_key,
+			rights,
+			open_flags,
+			&cached_entry);
+		if (cached_handle > 0) {
+			long valid = __pachaos_filed_validate_open_cache(
+				(unsigned long long)cached_handle,
+				path_key,
+				rights,
+				open_flags,
+				cached_entry.object_generation,
+				cached_entry.dir_generation);
+			if (valid != 1) {
+				__pachaos_filed_close_handle((unsigned long long)cached_handle, -1);
+			} else {
+			unsigned int status_flags = __pachaos_filed_status_flags_from_open(flags);
+			if (open_flags & PACHAOS_FILED_OPEN_DIRECTORY) {
+				status_flags |= PACHAOS_FILED_FILE_NEEDS_REWIND;
+			}
+			long fd = __pachaos_filed_fd_alloc_from(
+				(unsigned long long)cached_handle,
+				0,
+				__pachaos_filed_fd_flags_from_open(flags),
+				status_flags);
+			if (fd >= 0) {
+				int fd_idx = __pachaos_filed_fd_index(fd);
+				if (fd_idx >= 0) {
+					__pachaos_filed_fds[fd_idx].object_generation = cached_entry.object_generation;
+					__pachaos_filed_fds[fd_idx].dir_generation = cached_entry.dir_generation;
+				}
+				__pachaos_filed_fd_mark_open_cacheable(fd, path_key, rights, open_flags);
+				return fd;
+			}
+			__pachaos_filed_open_cache_store(
+				(unsigned long long)cached_handle,
+				path_key,
+				rights,
+				open_flags,
+				cached_entry.object_generation,
+				cached_entry.dir_generation);
+			return fd;
+			}
+		}
+	}
 	long page_fd = -1;
 	unsigned char *page = 0;
-	long status = __pachaos_filed_page_create(&page_fd, &page);
+	status = __pachaos_filed_page_create(&page_fd, &page);
 	if (status != 0) return status;
-
 	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+
 	struct __pachaos_filed_openat *openat = (struct __pachaos_filed_openat *)page;
 	if (path[0] == '/') {
 		openat->dir_handle = 0;
@@ -549,8 +1666,8 @@ static __inline long __pachaos_openat_filed_fd(long dirfd, const char *path, lon
 			return -95;
 		}
 	}
-	openat->rights = __pachaos_filed_rights_from_linux(flags);
-	openat->open_flags = __pachaos_filed_open_flags_from_linux(flags);
+	openat->rights = rights;
+	openat->open_flags = open_flags;
 	status = __pachaos_copy_path(openat->name, path, PACHAOS_FILED_NAME_BYTES);
 	if (status != 0) {
 		__pachaos_filed_page_destroy(page_fd, page);
@@ -561,7 +1678,24 @@ static __inline long __pachaos_openat_filed_fd(long dirfd, const char *path, lon
 	status = __pachaos_filed_call(PACHAOS_FILED_OP_OPENAT, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
 	__pachaos_filed_page_destroy(page_fd, page);
 	if (status != 0) return status;
-	return __pachaos_filed_fd_alloc(reply.word2);
+	status = __pachaos_filed_fd_alloc_from(
+		reply.word2,
+		0,
+		__pachaos_filed_fd_flags_from_open(flags),
+		__pachaos_filed_status_flags_from_open(flags));
+	if (status < 0) {
+		__pachaos_filed_close_handle(reply.word2, -1);
+	} else {
+		int fd_idx = __pachaos_filed_fd_index(status);
+		if (fd_idx >= 0) {
+			__pachaos_filed_fds[fd_idx].object_generation = openat->object_generation;
+			__pachaos_filed_fds[fd_idx].dir_generation = openat->dir_generation;
+		}
+	}
+	if (status >= 0 && cacheable) {
+		__pachaos_filed_fd_mark_open_cacheable(status, path_key, rights, open_flags);
+	}
+	return status;
 }
 
 static __inline long __pachaos_filed_read(long fd, void *buf, long len)
@@ -569,6 +1703,19 @@ static __inline long __pachaos_filed_read(long fd, void *buf, long len)
 	unsigned long long handle = __pachaos_filed_fd_handle(fd);
 	if (!handle) return __pachaos_raw3(PACHAOS_SYSCALL_FD_READ, fd, (long)buf, len);
 	if (len < 0 || (len > 0 && !buf)) return -22;
+	if (len == 0) return 0;
+	int idx = __pachaos_filed_fd_index(fd);
+	unsigned long long original_offset = __pachaos_filed_fd_offset(fd);
+	__pachaos_filed_fd_validate_read_cache_idx(idx);
+	long cached = __pachaos_filed_fd_read_cache_copy_to_linear(
+		idx,
+		original_offset,
+		(unsigned long long)len,
+		(unsigned char *)buf);
+	if (cached >= 0) {
+		__pachaos_filed_fd_advance_offset(fd, (unsigned long long)cached);
+		return cached;
+	}
 	long page_fd = -1;
 	unsigned char *page = 0;
 	long status = __pachaos_filed_page_create(&page_fd, &page);
@@ -580,9 +1727,10 @@ static __inline long __pachaos_filed_read(long fd, void *buf, long len)
 		__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
 		struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)page;
 		io->handle = handle;
+		io->offset = __pachaos_filed_fd_offset(fd) + (unsigned long long)done;
 		io->length = (unsigned long long)want;
 		struct __pachaos_ipc_msg reply;
-		status = __pachaos_filed_call(PACHAOS_FILED_OP_READ, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+		status = __pachaos_filed_call(PACHAOS_FILED_OP_PREAD, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
 		if (status != 0) break;
 		long got = (long)reply.word2;
 		if (got <= 0) break;
@@ -592,6 +1740,15 @@ static __inline long __pachaos_filed_read(long fd, void *buf, long len)
 		if (got < want) break;
 	}
 	__pachaos_filed_page_destroy(page_fd, page);
+	if (done > 0) {
+		__pachaos_filed_fd_advance_offset(fd, (unsigned long long)done);
+		__pachaos_filed_fd_store_read_cache_idx(
+			idx,
+			original_offset,
+			(const unsigned char *)buf,
+			(unsigned long long)done,
+			done < len);
+	}
 	return done > 0 ? done : status;
 }
 
@@ -600,6 +1757,24 @@ static __inline long __pachaos_filed_write(long fd, const void *buf, long len)
 	unsigned long long handle = __pachaos_filed_fd_handle(fd);
 	if (!handle) return __pachaos_raw3(PACHAOS_SYSCALL_FD_WRITE, fd, (long)buf, len);
 	if (len < 0 || (len > 0 && !buf)) return -22;
+	if (len == 0) return 0;
+	int idx = __pachaos_filed_fd_index(fd);
+	unsigned long long original_offset = __pachaos_filed_fd_offset(fd);
+	int append = (__pachaos_filed_status_flags(fd) & PACHAOS_FILED_FILE_APPEND) != 0;
+	if (!append) {
+		__pachaos_filed_fd_validate_read_cache_idx(idx);
+	}
+	if (!append &&
+		original_offset <= ~0ULL - (unsigned long long)len &&
+		__pachaos_filed_fd_read_cache_equals_linear(
+			idx,
+			original_offset,
+			(unsigned long long)len,
+			(const unsigned char *)buf))
+	{
+		__pachaos_filed_fd_advance_offset(fd, (unsigned long long)len);
+		return len;
+	}
 	long page_fd = -1;
 	unsigned char *page = 0;
 	long status = __pachaos_filed_page_create(&page_fd, &page);
@@ -611,10 +1786,18 @@ static __inline long __pachaos_filed_write(long fd, const void *buf, long len)
 		__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
 		struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)page;
 		io->handle = handle;
+		if (!append) {
+			io->offset = __pachaos_filed_fd_offset(fd) + (unsigned long long)done;
+		}
 		io->length = (unsigned long long)want;
 		for (long i = 0; i < want; i++) io->data[i] = ((const unsigned char *)buf)[done + i];
 		struct __pachaos_ipc_msg reply;
-		status = __pachaos_filed_call(PACHAOS_FILED_OP_WRITE, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+		status = __pachaos_filed_call(
+			append ? PACHAOS_FILED_OP_WRITE : PACHAOS_FILED_OP_PWRITE,
+			0,
+			__pachaos_filed_next_request_id(),
+			page_fd,
+			&reply);
 		if (status != 0) break;
 		long wrote = (long)reply.word2;
 		if (wrote <= 0) break;
@@ -623,7 +1806,345 @@ static __inline long __pachaos_filed_write(long fd, const void *buf, long len)
 		if (wrote < want) break;
 	}
 	__pachaos_filed_page_destroy(page_fd, page);
+	if (done > 0) {
+		__pachaos_filed_fd_advance_offset(fd, (unsigned long long)done);
+		__pachaos_filed_fd_invalidate_stat_idx(idx);
+		if (append) {
+			__pachaos_filed_fd_invalidate_cached_state_idx(idx);
+		} else {
+			__pachaos_filed_fd_store_read_cache_idx(
+				idx,
+				original_offset,
+				(const unsigned char *)buf,
+				(unsigned long long)done,
+				0);
+		}
+		if (idx >= 0 && __pachaos_filed_fds[idx].object_generation != 0) {
+			++__pachaos_filed_fds[idx].object_generation;
+		}
+	}
 	return done > 0 ? done : status;
+}
+
+static __inline long __pachaos_filed_readv(long fd, const struct __pachaos_iovec *iov, long count)
+{
+	unsigned long long handle = __pachaos_filed_fd_handle(fd);
+	if (!handle) {
+		return __pachaos_raw3(PACHAOS_SYSCALL_FD_READV, fd, (long)iov, count);
+	}
+	if (count < 0 || (count > 0 && !iov)) return -22;
+	for (long i = 0; i < count; i++) {
+		if (iov[i].len != 0 && !iov[i].base) return -22;
+	}
+	int idx = __pachaos_filed_fd_index(fd);
+	unsigned long long original_offset = __pachaos_filed_fd_offset(fd);
+	unsigned long long requested = 0;
+	for (long j = 0; j < count; j++) {
+		if (iov[j].len > ~0ULL - requested) return -22;
+		requested += iov[j].len;
+	}
+	__pachaos_filed_fd_validate_read_cache_idx(idx);
+	long cached = __pachaos_filed_fd_read_cache_copy_to_iov(idx, original_offset, iov, count);
+	if (cached >= 0) {
+		__pachaos_filed_fd_advance_offset(fd, (unsigned long long)cached);
+		return cached;
+	}
+
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
+
+	long done = 0;
+	long i = 0;
+	unsigned long iov_off = 0;
+	while (i < count) {
+		while (i < count && iov[i].len == iov_off) {
+			i++;
+			iov_off = 0;
+		}
+		if (i >= count) break;
+
+		unsigned long want = 0;
+		for (long j = i; j < count && want < PACHAOS_FILED_IO_BYTES; j++) {
+			unsigned long off = j == i ? iov_off : 0;
+			unsigned long avail = iov[j].len - off;
+			unsigned long room = PACHAOS_FILED_IO_BYTES - want;
+			want += avail < room ? avail : room;
+			if (avail >= room) break;
+		}
+		if (want == 0) break;
+
+		__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+		struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)page;
+		io->handle = handle;
+		io->offset = __pachaos_filed_fd_offset(fd) + (unsigned long long)done;
+		io->length = want;
+		struct __pachaos_ipc_msg reply;
+		status = __pachaos_filed_call(PACHAOS_FILED_OP_PREAD, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+		if (status != 0) break;
+
+		long got = (long)reply.word2;
+		if (got <= 0) break;
+		if ((unsigned long)got > want) got = (long)want;
+
+		long copied = 0;
+		while (copied < got && i < count) {
+			unsigned long avail = iov[i].len - iov_off;
+			unsigned long take = (unsigned long)(got - copied);
+			if (take > avail) take = avail;
+			for (unsigned long k = 0; k < take; k++) {
+				((unsigned char *)iov[i].base)[iov_off + k] = io->data[copied + (long)k];
+			}
+			copied += (long)take;
+			iov_off += take;
+			if (iov_off == iov[i].len) {
+				i++;
+				iov_off = 0;
+			}
+		}
+		done += got;
+		if ((unsigned long)got < want) break;
+	}
+	__pachaos_filed_page_destroy(page_fd, page);
+	if (done > 0) {
+		__pachaos_filed_fd_advance_offset(fd, (unsigned long long)done);
+		__pachaos_filed_fd_store_read_cache_from_iov_idx(
+			idx,
+			original_offset,
+			iov,
+			count,
+			(unsigned long long)done,
+			(unsigned long long)done < requested);
+	}
+	return done > 0 ? done : status;
+}
+
+static __inline long __pachaos_filed_writev(long fd, const struct __pachaos_iovec *iov, long count)
+{
+	unsigned long long handle = __pachaos_filed_fd_handle(fd);
+	if (!handle) {
+		return __pachaos_raw3(PACHAOS_SYSCALL_FD_WRITEV, fd, (long)iov, count);
+	}
+	if (count < 0 || (count > 0 && !iov)) return -22;
+	for (long i = 0; i < count; i++) {
+		if (iov[i].len != 0 && !iov[i].base) return -22;
+	}
+	int idx = __pachaos_filed_fd_index(fd);
+	unsigned long long original_offset = __pachaos_filed_fd_offset(fd);
+	int append = (__pachaos_filed_status_flags(fd) & PACHAOS_FILED_FILE_APPEND) != 0;
+
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
+
+	long done = 0;
+	long i = 0;
+	unsigned long iov_off = 0;
+	while (i < count) {
+		while (i < count && iov[i].len == iov_off) {
+			i++;
+			iov_off = 0;
+		}
+		if (i >= count) break;
+
+		__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+		struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)page;
+		io->handle = handle;
+		if (!append) {
+			io->offset = __pachaos_filed_fd_offset(fd) + (unsigned long long)done;
+		}
+
+		unsigned long want = 0;
+		long gather_i = i;
+		unsigned long gather_off = iov_off;
+		while (gather_i < count && want < PACHAOS_FILED_IO_BYTES) {
+			unsigned long avail = iov[gather_i].len - gather_off;
+			unsigned long room = PACHAOS_FILED_IO_BYTES - want;
+			unsigned long take = avail < room ? avail : room;
+			for (unsigned long k = 0; k < take; k++) {
+				io->data[want + k] = ((const unsigned char *)iov[gather_i].base)[gather_off + k];
+			}
+			want += take;
+			gather_off += take;
+			if (gather_off == iov[gather_i].len) {
+				gather_i++;
+				gather_off = 0;
+			}
+			if (take < avail) break;
+		}
+		if (want == 0) break;
+
+		io->length = want;
+		struct __pachaos_ipc_msg reply;
+		status = __pachaos_filed_call(
+			append ? PACHAOS_FILED_OP_WRITE : PACHAOS_FILED_OP_PWRITE,
+			0,
+			__pachaos_filed_next_request_id(),
+			page_fd,
+			&reply);
+		if (status != 0) break;
+
+		long wrote = (long)reply.word2;
+		if (wrote <= 0) break;
+		if ((unsigned long)wrote > want) wrote = (long)want;
+		done += wrote;
+		long advance = wrote;
+		while (advance > 0 && i < count) {
+			unsigned long avail = iov[i].len - iov_off;
+			unsigned long take = (unsigned long)advance;
+			if (take > avail) take = avail;
+			iov_off += take;
+			advance -= (long)take;
+			if (iov_off == iov[i].len) {
+				i++;
+				iov_off = 0;
+			}
+		}
+		if ((unsigned long)wrote < want) break;
+	}
+	__pachaos_filed_page_destroy(page_fd, page);
+	if (done > 0) {
+		__pachaos_filed_fd_advance_offset(fd, (unsigned long long)done);
+		__pachaos_filed_fd_invalidate_stat_idx(idx);
+		if (append) {
+			__pachaos_filed_fd_invalidate_cached_state_idx(idx);
+		} else {
+			__pachaos_filed_fd_store_read_cache_from_iov_idx(
+				idx,
+				original_offset,
+				iov,
+				count,
+				(unsigned long long)done,
+				0);
+		}
+		if (idx >= 0 && __pachaos_filed_fds[idx].object_generation != 0) {
+			++__pachaos_filed_fds[idx].object_generation;
+		}
+	}
+	return done > 0 ? done : status;
+}
+
+static __inline long __pachaos_filed_pread(long fd, void *buf, long len, long offset)
+{
+	unsigned long long handle = __pachaos_filed_fd_handle(fd);
+	if (!handle) return -29;
+	if (len < 0 || offset < 0 || (len > 0 && !buf)) return -22;
+	if (len == 0) return 0;
+	int idx = __pachaos_filed_fd_index(fd);
+	__pachaos_filed_fd_validate_read_cache_idx(idx);
+	long cached = __pachaos_filed_fd_read_cache_copy_to_linear(
+		idx,
+		(unsigned long long)offset,
+		(unsigned long long)len,
+		(unsigned char *)buf);
+	if (cached >= 0) {
+		return cached;
+	}
+	long original_len = len;
+	long original_offset = offset;
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
+	long done = 0;
+	while (done < len) {
+		long want = len - done;
+		if (want > PACHAOS_FILED_IO_BYTES) want = PACHAOS_FILED_IO_BYTES;
+		__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+		struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)page;
+		io->handle = handle;
+		io->offset = (unsigned long long)(offset + done);
+		io->length = (unsigned long long)want;
+		struct __pachaos_ipc_msg reply;
+		status = __pachaos_filed_call(PACHAOS_FILED_OP_PREAD, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+		if (status != 0) break;
+		long got = (long)reply.word2;
+		if (got <= 0) break;
+		if (got > want) got = want;
+		for (long i = 0; i < got; i++) ((unsigned char *)buf)[done + i] = io->data[i];
+		done += got;
+		if (got < want) break;
+	}
+	__pachaos_filed_page_destroy(page_fd, page);
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+	if (done > 0) {
+		__pachaos_filed_fd_store_read_cache_idx(
+			idx,
+			(unsigned long long)original_offset,
+			(const unsigned char *)buf,
+			(unsigned long long)done,
+			done < original_len);
+	}
+#endif
+	return done > 0 ? done : status;
+}
+
+static __inline long __pachaos_filed_pwrite(long fd, const void *buf, long len, long offset)
+{
+	unsigned long long handle = __pachaos_filed_fd_handle(fd);
+	if (!handle) return -29;
+	if (len < 0 || offset < 0 || (len > 0 && !buf)) return -22;
+	if (len == 0) return 0;
+	int idx = __pachaos_filed_fd_index(fd);
+	long original_offset = offset;
+	__pachaos_filed_fd_validate_read_cache_idx(idx);
+	if ((unsigned long long)offset <= ~0ULL - (unsigned long long)len &&
+		__pachaos_filed_fd_read_cache_equals_linear(
+			idx,
+			(unsigned long long)offset,
+			(unsigned long long)len,
+			(const unsigned char *)buf))
+	{
+		return len;
+	}
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
+	long done = 0;
+	while (done < len) {
+		long want = len - done;
+		if (want > PACHAOS_FILED_IO_BYTES) want = PACHAOS_FILED_IO_BYTES;
+		__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+		struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)page;
+		io->handle = handle;
+		io->offset = (unsigned long long)(offset + done);
+		io->length = (unsigned long long)want;
+		for (long i = 0; i < want; i++) io->data[i] = ((const unsigned char *)buf)[done + i];
+		struct __pachaos_ipc_msg reply;
+		status = __pachaos_filed_call(PACHAOS_FILED_OP_PWRITE, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+		if (status != 0) break;
+		long wrote = (long)reply.word2;
+		if (wrote <= 0) break;
+		if (wrote > want) wrote = want;
+		done += wrote;
+		if (wrote < want) break;
+	}
+	__pachaos_filed_page_destroy(page_fd, page);
+	if (done > 0) {
+		__pachaos_filed_fd_invalidate_stat_idx(idx);
+		__pachaos_filed_fd_store_read_cache_idx(
+			idx,
+			(unsigned long long)original_offset,
+			(const unsigned char *)buf,
+			(unsigned long long)done,
+			0);
+		if (idx >= 0 && __pachaos_filed_fds[idx].object_generation != 0) {
+			++__pachaos_filed_fds[idx].object_generation;
+		}
+	}
+	return done > 0 ? done : status;
+}
+
+static __inline int __pachaos_filed_handle_has_other_fd(unsigned long long handle)
+{
+	if (!handle) return 0;
+	for (int i = 0; i < PACHAOS_FILED_FD_CAP; i++) {
+		if (__pachaos_filed_fd_used[i] && __pachaos_filed_fds[i].handle == handle) return 1;
+	}
+	return 0;
 }
 
 static __inline long __pachaos_filed_close_fd(long fd)
@@ -634,9 +2155,42 @@ static __inline long __pachaos_filed_close_fd(long fd)
 		return status == 0 ? 0 : -22;
 	}
 	unsigned long long handle = __pachaos_filed_fds[idx].handle;
+	unsigned char cacheable = __pachaos_filed_fds[idx].open_cacheable;
+	unsigned int cache_rights = __pachaos_filed_fds[idx].open_cache_rights;
+	unsigned int cache_open_flags = __pachaos_filed_fds[idx].open_cache_open_flags;
+	unsigned long long cache_object_generation = __pachaos_filed_fds[idx].object_generation;
+	unsigned long long cache_dir_generation = __pachaos_filed_fds[idx].dir_generation;
+	char cache_path[PACHAOS_FILED_NAME_BYTES];
+	for (long i = 0; i < PACHAOS_FILED_NAME_BYTES; i++) {
+		cache_path[i] = __pachaos_filed_fds[idx].open_cache_path[i];
+	}
+	__pachaos_filed_fd_used[idx] = 0;
 	__pachaos_filed_fds[idx].used = 0;
+	__pachaos_filed_fds[idx].open_cacheable = 0;
+	__pachaos_filed_fds[idx].fd_flags = 0;
+	__pachaos_filed_fds[idx].status_flags = 0;
+	__pachaos_filed_fds[idx].open_cache_rights = 0;
+	__pachaos_filed_fds[idx].open_cache_open_flags = 0;
+	__pachaos_filed_fds[idx].offset = 0;
 	__pachaos_filed_fds[idx].handle = 0;
-	__pachaos_filed_close_handle(handle, -1);
+	__pachaos_filed_fds[idx].object_generation = 0;
+	__pachaos_filed_fds[idx].dir_generation = 0;
+	__pachaos_filed_fd_invalidate_cached_state_idx(idx);
+	__pachaos_bzero(__pachaos_filed_fds[idx].open_cache_path, PACHAOS_FILED_NAME_BYTES);
+	if (__pachaos_filed_handle_has_other_fd(handle)) {
+		return 0;
+	}
+	if (cacheable && cache_path[0] == '/') {
+		__pachaos_filed_open_cache_store(
+			handle,
+			cache_path,
+			cache_rights,
+			cache_open_flags,
+			cache_object_generation,
+			cache_dir_generation);
+	} else {
+		__pachaos_filed_close_handle(handle, -1);
+	}
 	return 0;
 }
 
@@ -661,6 +2215,15 @@ static __inline long __pachaos_filed_fstat(long fd, void *kst)
 		return status == 0 ? 0 : -22;
 	}
 	if (!kst) return -22;
+	int idx = __pachaos_filed_fd_index(fd);
+	if (idx >= 0 && __pachaos_filed_fds[idx].stat_valid) {
+		if (__pachaos_filed_refresh_generation_from_stat_idx(idx) == 1 &&
+			__pachaos_filed_fds[idx].stat_valid)
+		{
+			__pachaos_filed_write_kstat_from_fd_cache(idx, (struct __pachaos_kstat *)kst);
+			return 0;
+		}
+	}
 	long page_fd = -1;
 	unsigned char *page = 0;
 	long status = __pachaos_filed_page_create(&page_fd, &page);
@@ -670,37 +2233,64 @@ static __inline long __pachaos_filed_fstat(long fd, void *kst)
 	st->handle = handle;
 	struct __pachaos_ipc_msg reply;
 	status = __pachaos_filed_call(PACHAOS_FILED_OP_STAT, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
-	if (status == 0) {
-		struct __pachaos_kstat *out = (struct __pachaos_kstat *)kst;
-		__pachaos_bzero(out, sizeof(*out));
-		out->st_ino = handle;
-		out->st_nlink = st->nlink ? st->nlink : 1;
-		out->st_mode = (unsigned int)st->mode;
-		out->st_size = (long long)st->size;
-		out->st_blksize = 4096;
-		out->st_blocks = (long long)st->blocks;
+		if (status == 0) {
+			struct __pachaos_kstat *out = (struct __pachaos_kstat *)kst;
+			__pachaos_bzero(out, sizeof(*out));
+			out->st_ino = handle;
+			out->st_nlink = st->nlink ? st->nlink : 1;
+			out->st_mode = (unsigned int)st->mode;
+			out->st_size = (long long)st->size;
+			out->st_blksize = 4096;
+			out->st_blocks = (long long)st->blocks;
+			if (idx >= 0) {
+				__pachaos_filed_fds[idx].stat_valid = 1;
+				__pachaos_filed_fds[idx].stat_mode = st->mode;
+				__pachaos_filed_fds[idx].stat_size = st->size;
+				__pachaos_filed_fds[idx].stat_blocks = st->blocks;
+				__pachaos_filed_fds[idx].stat_nlink = st->nlink ? st->nlink : 1;
+				__pachaos_filed_fds[idx].stat_kind = st->kind;
+				__pachaos_filed_fds[idx].object_generation = st->object_generation;
+				__pachaos_filed_fds[idx].dir_generation = st->dir_generation;
+			}
+		}
+		__pachaos_filed_page_destroy(page_fd, page);
+		return status;
 	}
-	__pachaos_filed_page_destroy(page_fd, page);
-	return status;
-}
 
 static __inline long __pachaos_filed_getdents(long fd, void *buf, long len)
 {
 	unsigned long long handle = __pachaos_filed_fd_handle(fd);
 	if (!handle) return -9;
 	if (len < (long)sizeof(struct __pachaos_dirent) || !buf) return -22;
+	if ((__pachaos_filed_status_flags(fd) & PACHAOS_FILED_FILE_DIR_EOF) != 0) return 0;
+	long status = 0;
+	if (__pachaos_filed_fd_offset(fd) == 0 &&
+		(__pachaos_filed_status_flags(fd) & PACHAOS_FILED_FILE_NEEDS_REWIND) != 0)
+	{
+		status = __pachaos_filed_seek_handle(handle, 0, 0);
+		if (status != 0) return status;
+		__pachaos_filed_fd_set_status_flags(
+			fd,
+			__pachaos_filed_status_flags(fd) & ~PACHAOS_FILED_FILE_NEEDS_REWIND);
+	}
 	long page_fd = -1;
 	unsigned char *page = 0;
-	long status = __pachaos_filed_page_create(&page_fd, &page);
+	status = __pachaos_filed_page_create(&page_fd, &page);
 	if (status != 0) return status;
 	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
 	struct __pachaos_filed_getdents *gd = (struct __pachaos_filed_getdents *)page;
 	gd->dir_handle = handle;
+	gd->offset = __pachaos_filed_fd_offset(fd);
 	gd->capacity = PACHAOS_FILED_DIRENT_CAPACITY;
 	struct __pachaos_ipc_msg reply;
 	status = __pachaos_filed_call(PACHAOS_FILED_OP_GETDENTS, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
 	long out_bytes = 0;
+	unsigned long long emitted = 0;
 	if (status == 0) {
+		int idx = __pachaos_filed_fd_index(fd);
+		if (idx >= 0 && gd->dir_generation != 0) {
+			__pachaos_filed_fds[idx].dir_generation = gd->dir_generation;
+		}
 		unsigned long long count = gd->count;
 		if (count > PACHAOS_FILED_DIRENT_CAPACITY) count = PACHAOS_FILED_DIRENT_CAPACITY;
 		for (unsigned long long i = 0; i < count; i++) {
@@ -716,10 +2306,170 @@ static __inline long __pachaos_filed_getdents(long fd, void *buf, long len)
 			for (unsigned long long j = 0; j < n; j++) de->d_name[j] = gd->entries[i].name[j];
 			de->d_name[n] = 0;
 			out_bytes += (long)sizeof(*de);
+			emitted++;
+		}
+		if (emitted == count && count < PACHAOS_FILED_DIRENT_CAPACITY) {
+			__pachaos_filed_fd_set_status_flags(
+				fd,
+				__pachaos_filed_status_flags(fd) | PACHAOS_FILED_FILE_DIR_EOF);
 		}
 	}
 	__pachaos_filed_page_destroy(page_fd, page);
+	if (status == 0 && emitted != 0) {
+		__pachaos_filed_fd_advance_offset(fd, emitted);
+	}
 	return status == 0 ? out_bytes : status;
+}
+
+static __inline long __pachaos_filed_lseek(long fd, long offset, long whence)
+{
+	unsigned long long handle = __pachaos_filed_fd_handle(fd);
+	if (!handle) return -29;
+	long long base = 0;
+	switch (whence) {
+	case 0:
+		base = 0;
+		break;
+	case 1:
+		base = (long long)__pachaos_filed_fd_offset(fd);
+		break;
+	case 2: {
+		struct __pachaos_kstat st;
+		long status = __pachaos_filed_fstat(fd, &st);
+		if (status != 0) return status;
+		base = st.st_size;
+		break;
+	}
+	default:
+		return -22;
+	}
+	if ((offset > 0 && base > 0x7fffffffffffffffLL - offset) ||
+		(offset < 0 && base < (-0x7fffffffffffffffLL - 1LL) - offset))
+	{
+		return -22;
+	}
+	long long next = base + offset;
+	if (next < 0) return -22;
+	__pachaos_filed_fd_set_offset(fd, (unsigned long long)next);
+	(void)handle;
+	return (long)next;
+}
+
+static __inline unsigned long long __pachaos_filed_fd_flags_from_linux_fcntl(long flags)
+{
+	return (flags & LINUX_FD_CLOEXEC) ? PACHAOS_FILED_FD_CLOEXEC : 0;
+}
+
+static __inline unsigned long long __pachaos_filed_status_flags_from_linux_fcntl(long flags)
+{
+	unsigned long long out = 0;
+	if (flags & LINUX_O_APPEND) out |= PACHAOS_FILED_FILE_APPEND;
+	if (flags & LINUX_O_NONBLOCK) out |= PACHAOS_FILED_FILE_NONBLOCK;
+	return out;
+}
+
+static __inline long __pachaos_filed_set_flags(const struct __pachaos_filed_handle_flags *flags)
+{
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
+	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
+	*(struct __pachaos_filed_handle_flags *)page = *flags;
+	struct __pachaos_ipc_msg reply;
+	status = __pachaos_filed_call(PACHAOS_FILED_OP_SET_FLAGS, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+	__pachaos_filed_page_destroy(page_fd, page);
+	return status;
+}
+
+static __inline long __pachaos_filed_dup_fd(long fd, long min_fd, long flags)
+{
+	unsigned long long handle = __pachaos_filed_fd_handle(fd);
+	if (!handle) return -9;
+	long status = __pachaos_filed_fd_alloc_from(
+		handle,
+		min_fd,
+		(unsigned int)__pachaos_filed_fd_flags_from_linux_fcntl(flags),
+		__pachaos_filed_status_flags(fd));
+	if (status >= 0) {
+		__pachaos_filed_fd_set_offset(status, __pachaos_filed_fd_offset(fd));
+		int src_idx = __pachaos_filed_fd_index(fd);
+		int dst_idx = __pachaos_filed_fd_index(status);
+		if (src_idx >= 0 && dst_idx >= 0) {
+			__pachaos_filed_fds[dst_idx].stat_valid = __pachaos_filed_fds[src_idx].stat_valid;
+			__pachaos_filed_fds[dst_idx].read_cache_valid = __pachaos_filed_fds[src_idx].read_cache_valid;
+			__pachaos_filed_fds[dst_idx].read_cache_eof = __pachaos_filed_fds[src_idx].read_cache_eof;
+			__pachaos_filed_fds[dst_idx].read_cache_len = __pachaos_filed_fds[src_idx].read_cache_len;
+			__pachaos_filed_fds[dst_idx].stat_mode = __pachaos_filed_fds[src_idx].stat_mode;
+			__pachaos_filed_fds[dst_idx].stat_size = __pachaos_filed_fds[src_idx].stat_size;
+			__pachaos_filed_fds[dst_idx].stat_blocks = __pachaos_filed_fds[src_idx].stat_blocks;
+			__pachaos_filed_fds[dst_idx].stat_nlink = __pachaos_filed_fds[src_idx].stat_nlink;
+			__pachaos_filed_fds[dst_idx].stat_kind = __pachaos_filed_fds[src_idx].stat_kind;
+			__pachaos_filed_fds[dst_idx].read_cache_offset = __pachaos_filed_fds[src_idx].read_cache_offset;
+			__pachaos_filed_fds[dst_idx].object_generation = __pachaos_filed_fds[src_idx].object_generation;
+			__pachaos_filed_fds[dst_idx].dir_generation = __pachaos_filed_fds[src_idx].dir_generation;
+			__pachaos_filed_fds[dst_idx].open_cacheable = __pachaos_filed_fds[src_idx].open_cacheable;
+			__pachaos_filed_fds[dst_idx].open_cache_rights = __pachaos_filed_fds[src_idx].open_cache_rights;
+			__pachaos_filed_fds[dst_idx].open_cache_open_flags = __pachaos_filed_fds[src_idx].open_cache_open_flags;
+			for (long i = 0; i < PACHAOS_FILED_NAME_BYTES; i++) {
+				__pachaos_filed_fds[dst_idx].open_cache_path[i] =
+					__pachaos_filed_fds[src_idx].open_cache_path[i];
+			}
+#if PACHAOS_FILED_READ_CACHE_BYTES > 0
+			if (__pachaos_filed_fds[dst_idx].read_cache_len > PACHAOS_FILED_READ_CACHE_BYTES) {
+				__pachaos_filed_fds[dst_idx].read_cache_valid = 0;
+				__pachaos_filed_fds[dst_idx].read_cache_len = 0;
+			}
+			for (unsigned int i = 0; i < __pachaos_filed_fds[dst_idx].read_cache_len; i++) {
+				__pachaos_filed_fds[dst_idx].read_cache[i] = __pachaos_filed_fds[src_idx].read_cache[i];
+			}
+#else
+			__pachaos_filed_fds[dst_idx].read_cache_valid = 0;
+			__pachaos_filed_fds[dst_idx].read_cache_len = 0;
+#endif
+		}
+	}
+	return status;
+}
+
+static __inline long __pachaos_filed_fcntl(long fd, long cmd, long arg)
+{
+	unsigned long long handle = __pachaos_filed_fd_handle(fd);
+	if (!handle) return __pachaos_raw3(PACHAOS_SYSCALL_FD_FCNTL, fd, cmd, arg);
+
+	struct __pachaos_filed_handle_flags flags;
+	long status;
+	__pachaos_bzero(&flags, sizeof flags);
+	switch (cmd) {
+	case LINUX_F_DUPFD:
+		return __pachaos_filed_dup_fd(fd, arg, 0);
+	case LINUX_F_DUPFD_CLOEXEC:
+		return __pachaos_filed_dup_fd(fd, arg, LINUX_FD_CLOEXEC);
+	case LINUX_F_GETFD:
+		return (__pachaos_filed_fd_flags(fd) & PACHAOS_FILED_FD_CLOEXEC) ? LINUX_FD_CLOEXEC : 0;
+	case LINUX_F_SETFD:
+		flags.handle = handle;
+		flags.fd_flags = __pachaos_filed_fd_flags_from_linux_fcntl(arg);
+		if ((unsigned int)flags.fd_flags == __pachaos_filed_fd_flags(fd)) return 0;
+		flags.status_flags = __pachaos_filed_status_flags(fd) &
+			(PACHAOS_FILED_FILE_APPEND|PACHAOS_FILED_FILE_NONBLOCK|PACHAOS_FILED_FILE_SYNC);
+		status = __pachaos_filed_set_flags(&flags);
+		if (status == 0) __pachaos_filed_fd_set_flags(fd, (unsigned int)flags.fd_flags);
+		return status;
+	case LINUX_F_GETFL:
+		return ((__pachaos_filed_status_flags(fd) & PACHAOS_FILED_FILE_APPEND) ? LINUX_O_APPEND : 0) |
+			((__pachaos_filed_status_flags(fd) & PACHAOS_FILED_FILE_NONBLOCK) ? LINUX_O_NONBLOCK : 0) |
+			LINUX_O_LARGEFILE;
+	case LINUX_F_SETFL:
+		flags.handle = handle;
+		flags.fd_flags = __pachaos_filed_fd_flags(fd);
+		flags.status_flags = __pachaos_filed_status_flags_from_linux_fcntl(arg);
+		status = __pachaos_filed_set_flags(&flags);
+		if (status == 0) __pachaos_filed_fd_set_status_flags(fd, (unsigned int)flags.status_flags);
+		return status;
+	default:
+		return -38;
+	}
 }
 
 static __inline long __pachaos_filed_copy_exec_string(char *dst, const char *src, long cap)
@@ -788,76 +2538,37 @@ static __inline long __pachaos_filed_execve(const char *path, char *const argv[]
 	exec->envc = envc;
 
 	struct __pachaos_ipc_msg reply;
-	status = __pachaos_filed_call(PACHAOS_FILED_OP_EXEC_PATH, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
+	status = __pachaos_filed_call(
+		PACHAOS_FILED_OP_EXEC_PATH,
+		0,
+		__pachaos_filed_next_request_id(),
+		page_fd,
+		&reply);
 	__pachaos_filed_page_destroy(page_fd, page);
 	if (status != 0) return status;
 	(void)__pachaos_raw1(PACHAOS_SYSCALL_PROCESS_EXIT, 0);
 	for (;;) __asm__ __volatile__("pause");
 }
 
-static __inline long __pachaos_openat_file_vmo(long dirfd, const char *path, long flags)
+static __inline long __pachaos_filed_handle_vmo(unsigned long long handle)
 {
-	if (!path) return -22;
-	if ((flags & LINUX_O_ACCMODE) != 0) return -95;
-	if (flags & (LINUX_O_CREAT|LINUX_O_TRUNC|LINUX_O_APPEND|LINUX_O_DIRECTORY)) return -95;
-	if (dirfd != LINUX_AT_FDCWD && path[0] != '/') return -95;
+	if (!handle) return -22;
 
-	long page_fd = __pachaos_raw3(
-		PACHAOS_SYSCALL_VMO_CREATE,
-		PACHAOS_FILED_PAGE_BYTES,
-		PACHAOS_FD_RIGHT_TRANSFER|PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_MAP_READ|PACHAOS_FD_RIGHT_MAP_WRITE,
-		0);
-	if (page_fd < 16) return -23;
-
-	long page_addr = __pachaos_raw6(
-		PACHAOS_SYSCALL_MMAP,
-		page_fd,
-		0,
-		PACHAOS_FILED_PAGE_BYTES,
-		PACHAOS_PROT_READ|PACHAOS_PROT_WRITE,
-		PACHAOS_MMAP_SHARED,
-		0);
-	if (page_addr < 4096) {
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
-		return -14;
-	}
-
-	unsigned char *page = (unsigned char *)page_addr;
-	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
-	struct __pachaos_filed_openat *openat = (struct __pachaos_filed_openat *)page;
-	openat->dir_handle = 0;
-	openat->rights = PACHAOS_FILED_RIGHT_READ|PACHAOS_FILED_RIGHT_EXEC|PACHAOS_FILED_RIGHT_STAT;
-	long status = __pachaos_copy_path(openat->name, path, PACHAOS_FILED_NAME_BYTES);
-	if (status != 0) {
-		(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
-		return status;
-	}
+	long page_fd = -1;
+	unsigned char *page = 0;
+	long status = __pachaos_filed_page_create(&page_fd, &page);
+	if (status != 0) return status;
 
 	struct __pachaos_ipc_msg reply;
-	status = __pachaos_filed_call(PACHAOS_FILED_OP_OPENAT, 0, 1, page_fd, &reply);
-	if (status != 0) {
-		(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
-		return status;
-	}
-	unsigned long long handle = reply.word2;
-	if (!handle) {
-		(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
-		return -2;
-	}
-
 	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
 	struct __pachaos_filed_statx *st = (struct __pachaos_filed_statx *)page;
 	st->handle = handle;
-	status = __pachaos_filed_call(PACHAOS_FILED_OP_STAT, 0, 2, page_fd, &reply);
+	status = __pachaos_filed_call(PACHAOS_FILED_OP_STAT, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
 	if (status != 0) {
-		__pachaos_filed_close_handle(handle, page_fd);
-		(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
+		__pachaos_filed_page_destroy(page_fd, page);
 		return status;
 	}
+
 	unsigned long long file_size = reply.word2;
 	unsigned long long header_bytes = file_size;
 	if (header_bytes > PACHAOS_FILED_IO_BYTES) header_bytes = PACHAOS_FILED_IO_BYTES;
@@ -867,14 +2578,13 @@ static __inline long __pachaos_openat_file_vmo(long dirfd, const char *path, lon
 		header_io->handle = handle;
 		header_io->offset = 0;
 		header_io->length = header_bytes;
-		status = __pachaos_filed_call(PACHAOS_FILED_OP_PREAD, 0, 6, page_fd, &reply);
+		status = __pachaos_filed_call(PACHAOS_FILED_OP_PREAD, 0, __pachaos_filed_next_request_id(), page_fd, &reply);
 		if (status != 0 || reply.word2 < header_bytes) {
-			__pachaos_filed_close_handle(handle, page_fd);
-			(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-			(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
+			__pachaos_filed_page_destroy(page_fd, page);
 			return status != 0 ? status : -5;
 		}
 	}
+
 	unsigned long long map_size = __pachaos_elf_mapping_size(((struct __pachaos_filed_io *)page)->data, header_bytes, file_size);
 	long file_fd = __pachaos_raw3(
 		PACHAOS_SYSCALL_VMO_CREATE,
@@ -882,9 +2592,7 @@ static __inline long __pachaos_openat_file_vmo(long dirfd, const char *path, lon
 		PACHAOS_FD_RIGHT_CLOSE|PACHAOS_FD_RIGHT_READ|PACHAOS_FD_RIGHT_MAP_READ|PACHAOS_FD_RIGHT_MAP_WRITE|PACHAOS_FD_RIGHT_MAP_EXEC,
 		0);
 	if (file_fd < 16) {
-		__pachaos_filed_close_handle(handle, page_fd);
-		(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
+		__pachaos_filed_page_destroy(page_fd, page);
 		return -28;
 	}
 
@@ -900,54 +2608,82 @@ static __inline long __pachaos_openat_file_vmo(long dirfd, const char *path, lon
 			0);
 		if (file_addr < 4096) {
 			(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, file_fd);
-			__pachaos_filed_close_handle(handle, page_fd);
-			(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-			(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
+			__pachaos_filed_page_destroy(page_fd, page);
 			return -12;
 		}
 	}
 
 	unsigned long long offset = 0;
 	while (offset < file_size) {
-		unsigned long long want = file_size - offset;
-		if (want > PACHAOS_FILED_IO_BYTES) want = PACHAOS_FILED_IO_BYTES;
-		__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
-		struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)page;
-		io->handle = handle;
-		io->offset = offset;
-		io->length = want;
-		status = __pachaos_filed_call(PACHAOS_FILED_OP_PREAD, 0, 3, page_fd, &reply);
-		if (status != 0 || reply.word2 == 0) {
+		unsigned long long batch_count = 0;
+		unsigned long long batch_ids[PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT];
+		unsigned long long batch_offsets[PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT];
+		unsigned long long batch_lengths[PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT];
+
+		while (offset < file_size && batch_count < PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT) {
+			unsigned long long want = file_size - offset;
+			if (want > PACHAOS_FILED_IO_BYTES) want = PACHAOS_FILED_IO_BYTES;
+			unsigned char *slot_page = __pachaos_filed_fast_payload_slot(batch_count);
+			if (!slot_page) {
+				status = -14;
+				break;
+			}
+			__pachaos_bzero(slot_page, PACHAOS_FILED_PAGE_BYTES);
+			struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)slot_page;
+			io->handle = handle;
+			io->offset = offset;
+			io->length = want;
+			const unsigned long long request_id = (unsigned long long)__pachaos_filed_next_request_id();
+			status = __pachaos_filed_fast_enqueue(
+				PACHAOS_FILED_OP_PREAD,
+				0,
+				(long)request_id,
+				batch_count,
+				PACHAOS_FILED_PAGE_BYTES);
+			if (status != 0) break;
+			batch_ids[batch_count] = request_id;
+			batch_offsets[batch_count] = offset;
+			batch_lengths[batch_count] = want;
+			offset += want;
+			batch_count++;
+		}
+		if (status != 0 || batch_count == 0) {
 			if (map_size != 0) (void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, file_addr, (long)map_size);
 			(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, file_fd);
-			__pachaos_filed_close_handle(handle, page_fd);
-			(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-			(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
-			return status != 0 ? status : -5;
+			__pachaos_filed_page_destroy(page_fd, page);
+			return status != 0 ? status : -14;
 		}
-		unsigned long long got = reply.word2;
-		if (got > want) got = want;
-		for (unsigned long long i = 0; i < got; i++) {
-			((unsigned char *)file_addr)[offset + i] = io->data[i];
+		status = __pachaos_filed_fast_doorbell((long)batch_ids[batch_count - 1], &reply);
+		if (status != 0) {
+			if (map_size != 0) (void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, file_addr, (long)map_size);
+			(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, file_fd);
+			__pachaos_filed_page_destroy(page_fd, page);
+			return status;
 		}
-		offset += got;
+		for (unsigned long long batch_index = 0; batch_index < batch_count; batch_index++) {
+			status = __pachaos_filed_fast_wait_completion((long)batch_ids[batch_index], &reply);
+			if (status != 0 || reply.word2 < batch_lengths[batch_index]) {
+				if (map_size != 0) (void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, file_addr, (long)map_size);
+				(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, file_fd);
+				__pachaos_filed_page_destroy(page_fd, page);
+				return status != 0 ? status : -5;
+			}
+			unsigned char *slot_page = __pachaos_filed_fast_payload_slot(batch_index);
+			struct __pachaos_filed_io *io = (struct __pachaos_filed_io *)slot_page;
+			for (unsigned long long i = 0; i < batch_lengths[batch_index]; i++) {
+				((unsigned char *)file_addr)[batch_offsets[batch_index] + i] = io->data[i];
+			}
+		}
 	}
 
 	if (map_size != 0) (void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, file_addr, (long)map_size);
-	__pachaos_filed_close_handle(handle, page_fd);
-	(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, page_addr, PACHAOS_FILED_PAGE_BYTES);
-	(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, page_fd);
+	__pachaos_filed_page_destroy(page_fd, page);
 	return file_fd;
 }
 
 static __inline long __pachaos_openat_dispatch(long dirfd, const char *path, long flags)
 {
-	if ((flags & (LINUX_O_WRONLY|LINUX_O_RDWR|LINUX_O_CREAT|LINUX_O_TRUNC|LINUX_O_APPEND|LINUX_O_DIRECTORY)) ||
-		__pachaos_filed_fd_handle(dirfd))
-	{
-		return __pachaos_openat_filed_fd(dirfd, path, flags);
-	}
-	return __pachaos_openat_file_vmo(dirfd, path, flags);
+	return __pachaos_openat_filed_fd(dirfd, path, flags);
 }
 
 static __inline long __pachaos_status(long status)
@@ -979,6 +2715,34 @@ static __inline long __pachaos_mmap_flags(long flags)
 	if (flags & LINUX_MAP_FIXED_NOREPLACE) out |= PACHAOS_MMAP_FIXED_NOREPLACE;
 	if (flags & LINUX_MAP_NORESERVE) out |= PACHAOS_MMAP_NORESERVE;
 	return out;
+}
+
+static __inline long __pachaos_mmap_fd(long addr, long len, long prot, long flags, long fd, long offset)
+{
+	unsigned long long handle = fd >= 0 ? __pachaos_filed_fd_handle(fd) : 0;
+	if (!handle) {
+		return __pachaos_mmap_result(__pachaos_raw6(
+			PACHAOS_SYSCALL_MMAP,
+			fd < 0 ? 0 : fd,
+			addr,
+			len,
+			__pachaos_prot(prot),
+			__pachaos_mmap_flags(flags),
+			offset));
+	}
+
+	long vmo_fd = __pachaos_filed_handle_vmo(handle);
+	if (vmo_fd < 16) return vmo_fd;
+	long result = __pachaos_mmap_result(__pachaos_raw6(
+		PACHAOS_SYSCALL_MMAP,
+		vmo_fd,
+		addr,
+		len,
+		__pachaos_prot(prot),
+		__pachaos_mmap_flags(flags),
+		offset));
+	(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, vmo_fd);
+	return result;
 }
 
 static __inline long __pachaos_poll_events_from_linux(long events)
@@ -1088,12 +2852,14 @@ static __inline long __syscall3(long n, long a1, long a2, long a3)
 	switch (n) {
 	case __NR_read: return __pachaos_filed_read(a1, (void *)a2, a3);
 	case __NR_write: return __pachaos_filed_write(a1, (const void *)a2, a3);
-	case __NR_readv: return __pachaos_raw3(PACHAOS_SYSCALL_FD_READV, a1, a2, a3);
-	case __NR_writev: return __pachaos_raw3(PACHAOS_SYSCALL_FD_WRITEV, a1, a2, a3);
+	case __NR_readv: return __pachaos_filed_readv(a1, (const struct __pachaos_iovec *)a2, a3);
+	case __NR_writev: return __pachaos_filed_writev(a1, (const struct __pachaos_iovec *)a2, a3);
 	case __NR_ioctl: return __pachaos_status(__pachaos_raw3(PACHAOS_SYSCALL_FD_IOCTL, a1, a2, a3));
 	case __NR_poll: return __pachaos_poll((struct __pachaos_linux_pollfd *)a1, a2, a3);
 	case __NR_mprotect: return __pachaos_status(__pachaos_raw3(PACHAOS_SYSCALL_MPROTECT, a1, a2, __pachaos_prot(a3)));
 	case __NR_open: return __pachaos_openat_dispatch(LINUX_AT_FDCWD, (const char *)a1, a2);
+	case __NR_lseek: return __pachaos_filed_lseek(a1, a2, a3);
+	case __NR_fcntl: return __pachaos_filed_fcntl(a1, a2, a3);
 	case __NR_getdents:
 	case __NR_getdents64: return __pachaos_filed_getdents(a1, (void *)a2, a3);
 	case __NR_execve: return __pachaos_filed_execve((const char *)a1, (char *const *)a2, (char *const *)a3);
@@ -1121,6 +2887,10 @@ static __inline long __syscall4(long n, long a1, long a2, long a3, long a4)
 		return __pachaos_status(__pachaos_raw4(PACHAOS_SYSCALL_TIMERFD_SETTIME, a1, a2, a3, a4));
 	case __NR_openat:
 		return __pachaos_openat_dispatch(a1, (const char *)a2, a3);
+	case __NR_pread64:
+		return __pachaos_filed_pread(a1, (void *)a2, a3, a4);
+	case __NR_pwrite64:
+		return __pachaos_filed_pwrite(a1, (const void *)a2, a3, a4);
 	default: return -38;
 	}
 }
@@ -1134,7 +2904,7 @@ static __inline long __syscall6(long n, long a1, long a2, long a3, long a4, long
 {
 	switch (n) {
 	case __NR_mmap:
-		return __pachaos_mmap_result(__pachaos_raw6(PACHAOS_SYSCALL_MMAP, a5 < 0 ? 0 : a5, a1, a2, __pachaos_prot(a3), __pachaos_mmap_flags(a4), a6));
+		return __pachaos_mmap_fd(a1, a2, a3, a4, a5, a6);
 	case __NR_close:
 		return __syscall1(n, a1);
 	case __NR_munmap:
@@ -1153,6 +2923,8 @@ static __inline long __syscall6(long n, long a1, long a2, long a3, long a4, long
 	case __NR_poll:
 	case __NR_open:
 	case __NR_mprotect:
+	case __NR_lseek:
+	case __NR_fcntl:
 	case __NR_getdents:
 	case __NR_getdents64:
 	case __NR_execve:
@@ -1162,6 +2934,8 @@ static __inline long __syscall6(long n, long a1, long a2, long a3, long a4, long
 	case __NR_clock_nanosleep:
 	case __NR_timerfd_settime:
 	case __NR_openat:
+	case __NR_pread64:
+	case __NR_pwrite64:
 		return __syscall4(n, a1, a2, a3, a4);
 	default: return -38;
 	}

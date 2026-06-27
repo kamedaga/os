@@ -1,5 +1,7 @@
 #include "filed/vfs.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 static void filed_lock_init(filed_lock_t *lock)
@@ -274,10 +276,29 @@ static bool filed_vnode_mark_unlinked(filed_vnode_t *vnode)
     if (vnode->linked) {
         vnode->linked = false;
         ++vnode->generation;
+        ++vnode->object_generation;
         changed = true;
     }
     filed_lock_release(&vnode->lock);
     return changed;
+}
+
+static void filed_vnode_bump_object_generation_locked(filed_vnode_t *vnode)
+{
+    if (vnode == NULL || !vnode->active) {
+        return;
+    }
+    ++vnode->generation;
+    ++vnode->object_generation;
+}
+
+static void filed_vnode_bump_dir_generation_locked(filed_vnode_t *vnode)
+{
+    if (vnode == NULL || !vnode->active) {
+        return;
+    }
+    ++vnode->generation;
+    ++vnode->dir_generation;
 }
 
 static void filed_file_init_locks(filed_file_t *file)
@@ -429,6 +450,47 @@ static filed_handle_t *filed_alloc_handle(filed_vfs_t *vfs)
     return NULL;
 }
 
+static size_t filed_id_hint_index(uint32_t id)
+{
+    return ((uint32_t)(id * 2654435761u)) & (FILED_ID_HINT_SLOTS - 1u);
+}
+
+static void filed_remember_vnode_slot(filed_vfs_t *vfs, const filed_vnode_t *vnode)
+{
+    if (vfs == NULL || vnode == NULL || vnode->id == 0) {
+        return;
+    }
+    const ptrdiff_t slot = vnode - vfs->vnodes;
+    if (slot < 0 || slot >= (ptrdiff_t)FILED_MAX_VNODES) {
+        return;
+    }
+    vfs->vnode_slot_hints[filed_id_hint_index(vnode->id)] = (uint16_t)(slot + 1);
+}
+
+static void filed_remember_file_slot(filed_vfs_t *vfs, const filed_file_t *file)
+{
+    if (vfs == NULL || file == NULL || file->id == 0) {
+        return;
+    }
+    const ptrdiff_t slot = file - vfs->files;
+    if (slot < 0 || slot >= (ptrdiff_t)FILED_MAX_FILES) {
+        return;
+    }
+    vfs->file_slot_hints[filed_id_hint_index(file->id)] = (uint16_t)(slot + 1);
+}
+
+static void filed_remember_handle_slot(filed_vfs_t *vfs, const filed_handle_t *handle)
+{
+    if (vfs == NULL || handle == NULL || handle->id == 0) {
+        return;
+    }
+    const ptrdiff_t slot = handle - vfs->handles;
+    if (slot < 0 || slot >= (ptrdiff_t)FILED_MAX_HANDLES) {
+        return;
+    }
+    vfs->handle_slot_hints[filed_id_hint_index(handle->id)] = (uint16_t)(slot + 1);
+}
+
 static bool filed_mount_id_exists(const filed_vfs_t *vfs, filed_mount_id_t id)
 {
     size_t i;
@@ -471,9 +533,23 @@ static filed_mount_t *filed_find_mount(filed_vfs_t *vfs, filed_mount_id_t id)
 static filed_vnode_t *filed_find_vnode(filed_vfs_t *vfs, filed_vnode_id_t id)
 {
     size_t i;
+    uint16_t hinted_slot;
+
+    if (vfs == NULL || id == 0) {
+        return NULL;
+    }
+
+    hinted_slot = vfs->vnode_slot_hints[filed_id_hint_index(id)];
+    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_VNODES) {
+        filed_vnode_t *candidate = &vfs->vnodes[hinted_slot - 1u];
+        if (candidate->active && candidate->id == id) {
+            return candidate;
+        }
+    }
 
     for (i = 0; i < FILED_MAX_VNODES; ++i) {
         if (vfs->vnodes[i].active && vfs->vnodes[i].id == id) {
+            filed_remember_vnode_slot(vfs, &vfs->vnodes[i]);
             return &vfs->vnodes[i];
         }
     }
@@ -489,9 +565,23 @@ static const filed_vnode_t *filed_find_vnode_const(const filed_vfs_t *vfs, filed
 static filed_file_t *filed_find_file(filed_vfs_t *vfs, filed_file_id_t id)
 {
     size_t i;
+    uint16_t hinted_slot;
+
+    if (vfs == NULL || id == 0) {
+        return NULL;
+    }
+
+    hinted_slot = vfs->file_slot_hints[filed_id_hint_index(id)];
+    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_FILES) {
+        filed_file_t *candidate = &vfs->files[hinted_slot - 1u];
+        if (candidate->active && candidate->id == id) {
+            return candidate;
+        }
+    }
 
     for (i = 0; i < FILED_MAX_FILES; ++i) {
         if (vfs->files[i].active && vfs->files[i].id == id) {
+            filed_remember_file_slot(vfs, &vfs->files[i]);
             return &vfs->files[i];
         }
     }
@@ -507,9 +597,23 @@ static const filed_file_t *filed_find_file_const(const filed_vfs_t *vfs, filed_f
 static filed_handle_t *filed_find_handle(filed_vfs_t *vfs, filed_handle_id_t id)
 {
     size_t i;
+    uint16_t hinted_slot;
+
+    if (vfs == NULL || id == 0) {
+        return NULL;
+    }
+
+    hinted_slot = vfs->handle_slot_hints[filed_id_hint_index(id)];
+    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_HANDLES) {
+        filed_handle_t *candidate = &vfs->handles[hinted_slot - 1u];
+        if (candidate->active && candidate->id == id) {
+            return candidate;
+        }
+    }
 
     for (i = 0; i < FILED_MAX_HANDLES; ++i) {
         if (vfs->handles[i].active && vfs->handles[i].id == id) {
+            filed_remember_handle_slot(vfs, &vfs->handles[i]);
             return &vfs->handles[i];
         }
     }
@@ -546,6 +650,23 @@ static filed_vnode_t *filed_find_backend_vnode(
         }
     }
 
+    return NULL;
+}
+
+static filed_vnode_t *filed_find_backend_object_vnode(
+    filed_vfs_t *vfs,
+    filed_backend_object_id_t backend_object)
+{
+    if (vfs == NULL || backend_object == 0) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+        if (vfs->vnodes[i].active &&
+            vfs->vnodes[i].backend_object == backend_object)
+        {
+            return &vfs->vnodes[i];
+        }
+    }
     return NULL;
 }
 
@@ -719,6 +840,9 @@ static filed_status_t filed_open_vnode(
     handle->fd_flags = filed_fd_flags_from_open(open_flags);
     handle->generation = 1;
 
+    filed_remember_file_slot(vfs, file);
+    filed_remember_handle_slot(vfs, handle);
+
     ++vfs->next_file_id;
     ++vfs->next_handle_id;
 
@@ -727,6 +851,10 @@ static filed_status_t filed_open_vnode(
     out_open->vnode_id = vnode->id;
     out_open->backend_object = vnode->backend_object;
     out_open->kind = vnode->kind;
+    filed_lock_acquire(&vnode->lock);
+    out_open->object_generation = vnode->object_generation;
+    out_open->dir_generation = vnode->dir_generation;
+    filed_lock_release(&vnode->lock);
     return FILED_OK;
 }
 
@@ -777,12 +905,15 @@ static filed_status_t filed_open_backend_child_at(
         child->kind = child_kind;
         child->parent = parent_vnode->id;
         child->generation = 1;
+        child->object_generation = 1;
+        child->dir_generation = 1;
         child->refcount = 0;
         status = filed_copy_name(child->name, sizeof(child->name), name);
         if (status != FILED_OK) {
             memset(child, 0, sizeof(*child));
             return status;
         }
+        filed_remember_vnode_slot(vfs, child);
         ++vfs->next_vnode_id;
     }
 
@@ -835,6 +966,8 @@ filed_status_t filed_vfs_mount_root(
     root->kind = FILED_VNODE_DIRECTORY;
     root->parent = 0;
     root->generation = 1;
+    root->object_generation = 1;
+    root->dir_generation = 1;
     root->refcount = 1;
 
     status = filed_copy_name(root->name, sizeof(root->name), "/");
@@ -843,6 +976,8 @@ filed_status_t filed_vfs_mount_root(
         memset(root, 0, sizeof(*root));
         return status;
     }
+
+    filed_remember_vnode_slot(vfs, root);
 
     ++vfs->next_mount_id;
     ++vfs->next_vnode_id;
@@ -936,6 +1071,57 @@ filed_status_t filed_vfs_open_backend_child(
     return status;
 }
 
+filed_status_t filed_vfs_open_cached_child(
+    filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    uint32_t rights,
+    uint32_t open_flags,
+    filed_vfs_open_result_t *out_open)
+{
+    const filed_handle_t *parent;
+    const filed_file_t *parent_file;
+    filed_vnode_t *parent_vnode;
+    filed_vnode_t *child;
+    filed_status_t status;
+
+    if (vfs == NULL || name == NULL || out_open == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_name_is_component(name)) {
+        return FILED_ERR_INVALID;
+    }
+
+    parent = filed_find_handle_const(vfs, parent_handle);
+    if (parent == NULL || parent->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_rights_include(parent->rights, FILED_RIGHT_LOOKUP)) {
+        return FILED_ERR_DENIED;
+    }
+    parent_file = filed_find_file_const(vfs, (filed_file_id_t)parent->target_id);
+    if (parent_file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    parent_vnode = filed_find_vnode(vfs, parent_file->vnode_id);
+    if (parent_vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    if (parent_vnode->kind != FILED_VNODE_DIRECTORY) {
+        return FILED_ERR_NOT_DIR;
+    }
+
+    filed_vnode_write_lock(parent_vnode);
+    child = filed_find_child_vnode(vfs, parent_vnode->id, name);
+    if (child == NULL) {
+        filed_vnode_write_unlock(parent_vnode);
+        return FILED_ERR_NOT_FOUND;
+    }
+    status = filed_open_vnode(vfs, child, rights, open_flags, out_open);
+    filed_vnode_write_unlock(parent_vnode);
+    return status;
+}
+
 filed_status_t filed_vfs_create_backend_child(
     filed_vfs_t *vfs,
     filed_handle_id_t parent_handle,
@@ -989,6 +1175,9 @@ filed_status_t filed_vfs_create_backend_child(
         rights,
         open_flags,
         out_open);
+    if (status == FILED_OK) {
+        filed_vnode_bump_dir_generation_locked(parent_vnode);
+    }
     filed_vnode_write_unlock(parent_vnode);
     return status;
 }
@@ -1143,6 +1332,7 @@ filed_status_t filed_vfs_dup_handle(
         memset(handle, 0, sizeof(*handle));
         return status;
     }
+    filed_remember_handle_slot(vfs, handle);
     ++vfs->next_handle_id;
     *out_handle_id = handle_id;
     return FILED_OK;
@@ -1270,6 +1460,10 @@ static filed_status_t filed_prepare_file_handle(
     memset(out_decision, 0, sizeof(*out_decision));
     out_decision->backend_object = vnode->backend_object;
     out_decision->kind = vnode->kind;
+    filed_lock_acquire(filed_mutable_lock(&vnode->lock));
+    out_decision->object_generation = vnode->object_generation;
+    out_decision->dir_generation = vnode->dir_generation;
+    filed_lock_release(filed_mutable_lock(&vnode->lock));
     return FILED_OK;
 }
 
@@ -1279,6 +1473,152 @@ filed_status_t filed_vfs_stat_prepare(
     filed_vfs_io_decision_t *out_decision)
 {
     return filed_prepare_file_handle(vfs, handle_id, FILED_RIGHT_STAT, out_decision);
+}
+
+filed_status_t filed_vfs_get_stat_snapshot(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_stat_snapshot_t *out_snapshot)
+{
+    const filed_handle_t *handle;
+    const filed_file_t *file;
+    const filed_vnode_t *vnode;
+
+    if (vfs == NULL || handle_id == 0 || out_snapshot == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+
+    handle = filed_find_handle_const(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_rights_include(handle->rights, FILED_RIGHT_STAT)) {
+        return FILED_ERR_DENIED;
+    }
+    file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_vnode_const(vfs, file->vnode_id);
+    if (vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(filed_mutable_lock(&vnode->lock));
+    out_snapshot->object_generation = vnode->object_generation;
+    out_snapshot->dir_generation = vnode->dir_generation;
+    if (vnode->stat_valid) {
+        out_snapshot->valid = true;
+        out_snapshot->handle_id = handle_id;
+        out_snapshot->mode = vnode->stat_mode;
+        out_snapshot->size = vnode->stat_size;
+        out_snapshot->blocks = vnode->stat_blocks;
+        out_snapshot->nlink = vnode->stat_nlink;
+        out_snapshot->kind = vnode->stat_kind;
+    }
+    filed_lock_release(filed_mutable_lock(&vnode->lock));
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_update_stat_snapshot(
+    filed_vfs_t *vfs,
+    filed_backend_object_id_t backend_object,
+    const filed_vfs_stat_snapshot_t *snapshot)
+{
+    filed_vnode_t *vnode;
+
+    if (vfs == NULL || backend_object == 0 || snapshot == NULL || !snapshot->valid) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_backend_object_vnode(vfs, backend_object);
+    if (vnode == NULL) {
+        return FILED_ERR_NOT_FOUND;
+    }
+
+    filed_lock_acquire(&vnode->lock);
+    vnode->stat_valid = true;
+    vnode->stat_mode = snapshot->mode;
+    vnode->stat_size = snapshot->size;
+    vnode->stat_blocks = snapshot->blocks;
+    vnode->stat_nlink = snapshot->nlink;
+    vnode->stat_kind = snapshot->kind;
+    filed_lock_release(&vnode->lock);
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_note_write(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t offset,
+    uint64_t bytes_written)
+{
+    filed_handle_t *handle;
+    filed_file_t *file;
+    filed_vnode_t *vnode;
+    uint64_t end;
+
+    if (vfs == NULL || handle_id == 0) {
+        return FILED_ERR_INVALID;
+    }
+    if (bytes_written > UINT64_MAX - offset) {
+        return FILED_ERR_OVERFLOW;
+    }
+    end = offset + bytes_written;
+    handle = filed_find_handle(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_vnode(vfs, file->vnode_id);
+    if (vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(&vnode->lock);
+    if (vnode->stat_valid && end > vnode->stat_size) {
+        vnode->stat_size = end;
+    }
+    filed_vnode_bump_object_generation_locked(vnode);
+    filed_lock_release(&vnode->lock);
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_note_truncate(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t size)
+{
+    filed_handle_t *handle;
+    filed_file_t *file;
+    filed_vnode_t *vnode;
+
+    if (vfs == NULL || handle_id == 0) {
+        return FILED_ERR_INVALID;
+    }
+    handle = filed_find_handle(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_vnode(vfs, file->vnode_id);
+    if (vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(&vnode->lock);
+    if (vnode->stat_valid) {
+        vnode->stat_size = size;
+    }
+    filed_vnode_bump_object_generation_locked(vnode);
+    filed_lock_release(&vnode->lock);
+    return FILED_OK;
 }
 
 filed_status_t filed_vfs_lookup_prepare(
@@ -1481,6 +1821,70 @@ filed_status_t filed_vfs_write_commit(
     return filed_vfs_read_commit(vfs, handle_id, bytes_written);
 }
 
+filed_status_t filed_vfs_seek(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    int64_t offset,
+    int whence,
+    uint64_t file_size,
+    int64_t *out_offset)
+{
+    const filed_handle_t *handle;
+    filed_file_t *file;
+    int64_t base;
+    int64_t next;
+
+    if (vfs == NULL || handle_id == 0 || out_offset == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    handle = filed_find_handle_const(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(&file->offset_lock);
+    switch (whence) {
+    case 0:
+        base = 0;
+        break;
+    case 1:
+        base = file->offset;
+        break;
+    case 2:
+        if (file_size > (uint64_t)INT64_MAX) {
+            filed_lock_release(&file->offset_lock);
+            return FILED_ERR_OVERFLOW;
+        }
+        base = (int64_t)file_size;
+        break;
+    default:
+        filed_lock_release(&file->offset_lock);
+        return FILED_ERR_INVALID;
+    }
+
+    if ((offset > 0 && base > INT64_MAX - offset) ||
+        (offset < 0 && base < INT64_MIN - offset))
+    {
+        filed_lock_release(&file->offset_lock);
+        return FILED_ERR_OVERFLOW;
+    }
+    next = base + offset;
+    if (next < 0) {
+        filed_lock_release(&file->offset_lock);
+        return FILED_ERR_INVALID;
+    }
+
+    file->offset = next;
+    *out_offset = next;
+    filed_lock_release(&file->offset_lock);
+    return FILED_OK;
+}
+
 filed_status_t filed_vfs_fsync_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -1498,6 +1902,45 @@ filed_status_t filed_vfs_fsync_prepare(
         memset(out_decision, 0, sizeof(*out_decision));
         return FILED_ERR_IS_DIR;
     }
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_close_flush_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_io_decision_t *out_decision)
+{
+    const filed_handle_t *handle;
+    const filed_file_t *file;
+    const filed_vnode_t *vnode;
+
+    if (vfs == NULL || handle_id == 0 || out_decision == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    memset(out_decision, 0, sizeof(*out_decision));
+    handle = filed_find_handle_const(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_rights_include(handle->rights, FILED_RIGHT_WRITE)) {
+        return FILED_OK;
+    }
+
+    file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_vnode_const(vfs, file->vnode_id);
+    if (vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    if (vnode->kind == FILED_VNODE_DIRECTORY) {
+        return FILED_OK;
+    }
+
+    out_decision->backend_object = vnode->backend_object;
+    out_decision->kind = vnode->kind;
     return FILED_OK;
 }
 
@@ -1573,6 +2016,7 @@ filed_status_t filed_vfs_unlink_commit_ex(
         (void)filed_vnode_mark_unlinked(child);
         filed_reclaim_vnode_if_dead_ex(vfs, child, out_reclaim);
     }
+    filed_vnode_bump_dir_generation_locked(parent_vnode);
     filed_vnode_write_unlock(parent_vnode);
     return FILED_OK;
 }
@@ -1660,10 +2104,14 @@ filed_status_t filed_vfs_rename_commit_ex(
     }
     if (old_child != NULL) {
         filed_status_t copy_status;
+        filed_vnode_bump_dir_generation_locked(old_parent);
+        if (new_parent != old_parent) {
+            filed_vnode_bump_dir_generation_locked(new_parent);
+        }
         filed_lock_acquire(&old_child->lock);
         old_child->parent = new_parent->id;
         old_child->backend_object = backend_object;
-        ++old_child->generation;
+        filed_vnode_bump_object_generation_locked(old_child);
         copy_status = filed_copy_name(old_child->name, sizeof(old_child->name), new_name);
         filed_lock_release(&old_child->lock);
         filed_vnode_write_unlock_pair(old_parent, new_parent);
@@ -1772,6 +2220,12 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
             return FILED_ERR_INVALID;
         }
         if (node->linked && node->name[0] == '\0') {
+            return FILED_ERR_INVALID;
+        }
+        if (node->generation == 0 ||
+            node->object_generation == 0 ||
+            node->dir_generation == 0)
+        {
             return FILED_ERR_INVALID;
         }
         expected_refcount = filed_vnode_mount_pins(vfs, node->id);

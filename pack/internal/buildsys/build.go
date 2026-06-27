@@ -24,8 +24,9 @@ type UserlandOptions struct {
 }
 
 type KernelOptions struct {
-	Force    bool
-	Progress progress.Reporter
+	Force        bool
+	StepOverride string
+	Progress     progress.Reporter
 }
 
 type UserlandResult struct {
@@ -60,12 +61,15 @@ func BuildKernel(workspace *config.Workspace, opts KernelOptions) (KernelResult,
 	span := progress.Use(opts.Progress).Start("kernel", 3)
 	defer span.Close()
 	step := workspace.Kernel.Step
+	if opts.StepOverride != "" {
+		step = opts.StepOverride
+	}
 	if step == "" {
-		step = "efi"
+		step = "limine"
 	}
 	span.Set(1, "checking kernel inputs")
 	kernelDir := workspace.Path(workspace.Kernel.Dir)
-	output := filepath.Join(kernelDir, "zig-out", "bin", "EFI", "BOOT", "BOOTX64.EFI")
+	output := kernelOutputForStep(kernelDir, step)
 	if !opts.Force {
 		upToDate, err := outputUpToDate(output, []string{
 			filepath.Join(kernelDir, "build.zig"),
@@ -101,6 +105,13 @@ func BuildKernel(workspace *config.Workspace, opts KernelOptions) (KernelResult,
 	}
 	span.Done("kernel built")
 	return KernelResult{Step: step, Output: output}, nil
+}
+
+func kernelOutputForStep(kernelDir string, step string) string {
+	if step == "limine" {
+		return filepath.Join(kernelDir, "zig-out", "bin", "limine", "pacha-kernel.elf")
+	}
+	return filepath.Join(kernelDir, "zig-out", "bin", step)
 }
 
 func BuildUserland(workspace *config.Workspace, opts UserlandOptions) (UserlandResult, error) {

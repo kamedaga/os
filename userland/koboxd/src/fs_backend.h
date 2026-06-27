@@ -27,6 +27,7 @@ typedef struct koboxd_fs_object {
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
     uint8_t used;
     uint8_t linked;
+    uint8_t dirty;
 } koboxd_fs_object_t;
 
 typedef struct koboxd_fs_lock {
@@ -114,6 +115,7 @@ int koboxd_fs_backend_rename(
     uint64_t *out_object_id);
 int koboxd_fs_backend_release_object(koboxd_fs_backend_t *backend, uint64_t object_id);
 int koboxd_fs_backend_fsync(koboxd_fs_backend_t *backend, uint64_t object_id);
+int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend);
 int koboxd_fs_backend_statx(
     koboxd_fs_backend_t *backend,
     uint64_t object_id,

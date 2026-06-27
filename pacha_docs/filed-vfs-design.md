@@ -90,7 +90,7 @@ filed:
 - PachaOS native daemon 向けに `libvfs` を提供する
 - POSIX 互換 API は musl layer で提供し、`libvfs` を POSIX API そのものにしない
 - `filed` との高速 IPC は trusted 専用の pkey shared-memory backend を使えるようにする
-- normal IPC / fd passing は control plane と fallback として維持する
+- normal IPC / fd passing は control plane としてだけ維持する
 - `filed` の VFS core と exec core は Coq 抽象モデルを先に作り、C 実装はそのモデルに寄せる
 - VST は初期対象にしない。まず Coq の executable model、invariant preservation、同一ケースの C differential test で設計の有効性を見る
 
@@ -803,6 +803,166 @@ pkey data plane は per-client/per-service ring を基本にする。
 
 trusted client の `client <-> filed` fast path は pkey ring を使えるが、VFS object lifetime と rights は常に `filed` 側の handle table が所有する。shared memory 上に vnode pointer, Vfile pointer, backend pointer を置かない。
 
+### filed session fast path
+
+現状の `FILED_WIRE_OP_CONNECT` session は shared page を使って payload copy は減らしているが、request metadata と completion は still normal IPC である。
+
+```text
+client:
+  shared page に payload を書く
+  IPC_SEND request metadata
+  IPC_RECV reply
+
+filed:
+  wait_many(session channel)
+  IPC_RECV request metadata
+  shared page を読む/書く
+  IPC_SEND reply
+```
+
+この形は correctness は良いが、`stat`, cached `pread`, dirty cached `pwrite`, `getdents` のように filed 内で完結する操作でも、最低 2 syscall と scheduler wakeup を払う。operation-level 計測ではこの床が 50us から 80us 付近に出ている。
+
+fast path は現行 session protocol を置き換える。互換性維持用の別 protocol は作らない。`CONNECT` 後の session operation は request metadata と completion も shared memory に置く ring-only protocol にする。
+
+```text
+session page:
+  header
+  request ring
+  completion ring
+  payload slots
+
+control channel:
+  connect
+  fd passing
+  rights attenuation
+  cancellation
+  close/session teardown
+  ring doorbell
+  metrics/debug
+```
+
+古い session call path は残さない。normal IPC request/reply は session 確立、fd passing、権限変更、debug/metrics、exec のような control operation に限定する。VFS data operation の標準経路は ring である。
+
+shared memory に置いてよいものは value semantics の descriptor だけである。
+
+- request id
+- opcode
+- handle id
+- rights-independent flags
+- offset / length
+- payload slot index / payload length
+- timeout
+- completion status / result
+
+shared memory に置いてはいけないもの。
+
+- vnode pointer
+- Vfile pointer
+- backend pointer
+- kernel fd
+- authority を増やせる token
+- parent/child cap 関係
+
+#### Ring layout
+
+ring は per-session SPSC を基本にする。1 process から複数 thread が libc を呼ぶ場合は、libc 側で session lock を持つか、thread-local session を作る。最初は global session lock でよい。
+
+```text
+filed_fast_header:
+  magic
+  version
+  flags
+  request_capacity
+  completion_capacity
+  payload_slot_count
+  request_head
+  request_tail
+  completion_head
+  completion_tail
+  doorbell_seq
+  completion_seq
+
+filed_fast_request:
+  request_id
+  opcode
+  flags
+  handle
+  aux_handle
+  offset
+  length
+  payload_slot
+  payload_length
+  timeout_ns
+
+filed_fast_completion:
+  request_id
+  status
+  result
+  bytes
+  flags
+```
+
+request ring と completion ring は固定 slot 数にするが、batch 回数は固定しない。libc は ring が空いている限り enqueue し、同期 syscall の意味が必要なところで flush/wait する。つまり `readv` や stdio flush のような自然なまとまりでは複数 request を一回の doorbell にまとめられるが、単発 syscall は単発のままでも動く。
+
+#### Doorbell and completion
+
+初期実装は kernel ABI を変えない。
+
+1. client が request ring に 1 個以上 enqueue する
+2. client が session channel に `FILED_WIRE_OP_FAST_DOORBELL` を 1 回送る
+3. filed が ring を drain し、completion ring に結果を書く
+4. filed が session channel に completion notification を 1 回送る
+5. client が completion ring を読む
+
+これで N 個の VFS operation を `2N syscall` から、おおよそ `2 syscall + shared memory polling` に落とせる。batch 数は固定しない。
+
+ring full は normal session call に戻さない。client は doorbell して completion を回収するか、空きができるまで待つ。timeout / cancellation は control channel へ送る。fd passing と exec は control operation として ring protocol の外に置く。
+
+single operation の latency をさらに落とすには、channel doorbell を event counter / futex / eventfd 相当へ置き換える必要がある。これは kernel notification primitive の話になるため、userland fast path で効果を見てから別途判断する。
+
+#### Fast eligible operations
+
+最初に fast path に載せる操作。
+
+- `STAT`
+- `PREAD` cache hit
+- `PREAD` cache miss request enqueue
+- `PWRITE` dirty cache hit
+- `GETDENTS`
+- `SET_FLAGS`
+- `PING`
+
+後続で ring に載せる操作。
+
+- `OPENAT`: path walk と handle allocation があるため、ring descriptor 化はできるが completion 順序と handle id 発行を厳密にする
+- `CLOSE`: lifetime operation だが、session fd table の `closing` state と completion ordering を入れて ring に載せる
+- `DUP`: handle table mutation を伴うので completion ordering が必要
+
+ring に載せない操作。
+
+- `EXEC_PATH`: fd passing / process creation / bootstrap patch があるため control path のまま
+- fd passing を伴う operation
+- rights attenuation / handle export / debug / metrics
+
+#### Ordering
+
+同一 session 内では request id order を維持する。worker に投げた場合でも completion ring へ publish する順序は request order にする。将来 out-of-order completion を許す場合は flag で明示し、libc 側が request id lookup を持つ。
+
+handle lifetime は filed 側が所有する。client が `CLOSE` を enqueue した後、その completion より前に同じ fd slot を再利用してはいけない。libc 側 fd table は `closing` state を持つ。
+
+#### Metrics
+
+fast path には operation-level とは別に ring metrics を持つ。
+
+- `filed_fast_enqueued`
+- `filed_fast_completed`
+- `filed_fast_batches`
+- `filed_fast_ring_full`
+- `filed_fast_wait_ns`
+- `filed_fast_dispatch_ns`
+
+`hikitugi.md` には従来通り operation-level の数値だけを残す。ring metrics は調査ログに出す。
+
 ### 実装順
 
 multi-thread 対応の実装順。
@@ -899,7 +1059,7 @@ VFS 関連 IPC は初期実装から final-shape protocol とする。
 
 temporary shortcut は作らない。bring-up smoke でも versioned header、request id、timeout、cancellation、endpoint worker queue、control/data plane 分離を通す。
 
-normal IPC は fallback であり、設計の後回しではない。pkey data plane と normal IPC fallback は同一の request model / status model / lifetime model を共有する。
+normal IPC は control plane である。trusted data operation は pkey/shared-memory data plane を標準経路にし、旧 data operation path は残さない。
 
 ### koboxd IPC substrate
 
@@ -953,7 +1113,6 @@ koboxd
 - object handle / rights / lifetime
 - control plane / data plane 分離
 - pkey shared-memory data plane
-- normal IPC fallback with identical semantics
 
 ### Message header
 
@@ -1039,7 +1198,7 @@ trusted domain の data plane は pkey shared-memory ring を使う。
 
 ring は per-client/per-service を基本にする。複数 client が同じ ring を共有しない。
 
-pkey は trusted 別 process の高速 IPC として扱い、untrusted security boundary とはしない。untrusted process は normal IPC fallback に落とすが、request/reply/status/lifetime の意味論は変えない。
+pkey は trusted 別 process の高速 IPC として扱い、untrusted security boundary とはしない。untrusted process は別の normal IPC endpoint を使う。これは trusted path の互換経路ではない。
 
 ### Cancellation and timeout
 
@@ -1090,7 +1249,7 @@ data plane 対象。
 - stat result batch
 - larger request/response buffer
 
-`filed` と seed/init/native daemon は trusted domain として pkey backend を使う。untrusted application や unknown process は normal IPC fallback を使う。
+`filed` と seed/init/native daemon は trusted domain として pkey backend を使う。untrusted application や unknown process は別 endpoint の normal IPC control/data protocol を使う。
 
 ### filed <-> koboxd
 
@@ -1191,7 +1350,6 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 - request id / timeout / cancellation を入れる
 - per-endpoint worker queue を作る
 - pkey shared-memory data plane を作る
-- normal IPC fallback を同一意味論で実装する
 - per-endpoint metrics/debug dump を入れる
 
 ### Step 2: koboxd block provider
@@ -1257,8 +1415,7 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 ### Step 9: libvfs IPC backend
 
 - `libvfs` を追加する
-- control plane / data plane 両対応で `openat/pread/close/statx/getdents` を通す
-- normal IPC fallback を同一意味論で通す
+- control plane と pkey/shared-memory data plane で `openat/pread/close/statx/getdents` を通す
 - `seed0root` から `/sbin/koboxd.elf` または `/etc/pacha-release` を read する smoke を作る
 
 ### Step 10: filed exec service
@@ -1277,7 +1434,7 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 - trusted client 用 pkey ring setup
 - normal IPC control message から ring を確立
 - `pread` payload を pkey data plane に移す
-- fallback と同じ意味論を保つ
+- 旧 session data path は残さない
 
 ### Step 12: write path
 
@@ -1298,14 +1455,13 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 
 - `fs_pread` / `fs_pwrite` / `fs_getdents` payload を pkey data plane に移す
 - `filed` VFS semantics と `koboxd` Linux FS backend semantics を変えずに高速化する
-- normal IPC fallback を維持する
 
 ### Step 15: RCU path walk
 
 - race / stress test を増やす
 - path walk read-side を RCU 化する
 - rename / unlink / mount crossing との整合性を検証する
-- fallback lock path を残しながら段階的に hot path を移行する
+- lock-based path から RCU path へ置き換える
 
 ### Step 16: lock-free vnode cache
 
@@ -1387,7 +1543,7 @@ exec service の最初の成功条件。
 - `koboxd` は control / block / fs-backend / event endpoint を分ける
 - `koboxd` は endpoint ごとの worker queue を持つ
 - `client <-> filed` IPC は normal IPC control plane と pkey shared-memory data plane に分ける
-- `filed <-> koboxd` は FS backend service IPC とし、初期実装から pkey data plane と normal IPC fallback を同一意味論で持つ
+- `filed <-> koboxd` は FS backend service IPC とし、初期実装から pkey data plane を標準経路にする
 - pkey backend は trusted 専用であり、untrusted isolation として扱わない
 - `filed` は通常の pathname based process exec を提供する
 - `seed0root` の exec は `koboxd` と `filed` を起動する bootstrap exception として残す

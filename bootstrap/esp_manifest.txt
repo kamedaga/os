@@ -1,6 +1,5 @@
 # EFI system partition contents
 /EFI/BOOT/BOOTX64.EFI=../kernel/zig-out/bin/EFI/BOOT/BOOTX64.EFI
 /EFI/BOOT/SHELL.ELF=../kernel/zig-out/bin/EFI/BOOT/SHELL.ELF
-/EFI/BOOT/SCHEDD.ELF=../.artifacts/cmake/schedulerd/schedulerd.elf
 /EFI/BOOT/INITAPP.ELF=../.artifacts/userland/seed2_boot/SEED2BT.ELF
 /EFI/BOOT/BOOTFS.IMG=../kernel/zig-out/bin/EFI/BOOT/BOOTFS.IMG

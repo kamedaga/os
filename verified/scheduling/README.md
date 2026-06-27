@@ -1,32 +1,35 @@
 # Verified Scheduling
 
-This directory is the canonical implementation home for scheduling logic that
-is shared by the kernel and `userland/schedulerd`.
+This directory is the canonical implementation home for scheduling logic used
+by the kernel scheduler.
 
-The code here is intended to be linked directly by both sides after it has a
-matching formal model and proof story. Kernel and userland code should not fork
-or reimplement this logic; they should adapt their platform state to this API
-and execute the decisions returned by it.
+The code here is intended to become the implementation and proof source for
+kernel scheduling decisions. Older userland-scheduler experiments can still be
+useful as tests or trace generators, but the long-term scheduler boundary is no
+longer a split `schedulerd` policy daemon. The kernel owns scheduler activation,
+per-CPU dispatch, and context-switch integration.
 
 The scheduling implementation is split into two layers:
 
 - EEVDF core: runqueue ordering, charging, eligibility, and pick rules
-- Protocol core: thread ownership, CPU ownership, commit/claim/preempt/block/wake
-  state transitions
+- Kernel scheduler core: per-CPU runqueues, CPU current-thread bookkeeping,
+  activation, preempt/block/wake state transitions, and migration policy
 
 The verified implementation must not know about:
 
 - kernel trap frames
 - CR3, PKRU, FS/GS MSRs
-- AP startup or IPIs
 - file descriptors or syscalls
 - serial output or logging
-- kernel/userland allocation strategies
+- allocation strategies
 
-Those belong in adapters:
+These remain outside the verified scheduling core:
 
-- kernel adapter: `kernel/src/...`
-- userland adapter: `userland/schedulerd/src/...`
+- trap frame save/restore
+- CR3, PKRU, FS/GS MSRs
+- AP startup, IPIs, and interrupt plumbing
+- fd/event queue exposure
+- actual context switch execution
 
 The implementation should expose pure or almost-pure transition functions. A
 typical shape is:
@@ -44,6 +47,9 @@ Important invariants:
 - generation mismatches are rejected
 - a CPU can claim only a thread pending for that CPU
 - EEVDF pick chooses an eligible entity with the smallest deadline
+- per-CPU EEVDF runqueues preserve their local invariants
+- a thread exists in at most one CPU runqueue
+- balancing migrates only runnable entities and preserves global ownership
 
 Suggested layout:
 
@@ -60,13 +66,33 @@ Current EEVDF C core:
 - `src/pacha_eevdf.c`
 - `include/pacha_sched.h`
 - `src/pacha_sched.c`
+- `include/pacha_kernel_sched.h`
+- `src/pacha_kernel_sched.c`
 - `tests/test_pacha_eevdf.c`
 - `tests/test_pacha_eevdf_property.c`
 - `tests/test_pacha_sched.c`
+- `tests/test_pacha_kernel_sched.c`
+- `tests/test_pacha_kernel_sched_property.c`
 - `spec/EevdfTestVectors.v`
 - `spec/SchedRuntimeModel.v`
 - `spec/SchedRuntimeSpec.v`
 - `spec/SchedRuntimeTestVectors.v`
+- `spec/KernelSchedModel.v`
+- `spec/KernelSchedInvariants.v`
+- `spec/KernelSchedSpec.v`
+- `spec/KernelSchedPreservation.v`
+- `spec/KernelSchedTestVectors.v`
+
+Run the kernel-scheduler pre-integration gate:
+
+```sh
+./verified/scheduling/verify-kernel-sched.sh
+```
+
+This builds and runs the C smoke/property tests with `clang
+-std=c11 -Wall -Wextra -Werror`, then builds the EEVDF and kernel scheduler Coq
+targets. If `coq_makefile` is not already available, the script falls back to
+`nix develop` for the Coq part.
 
 Build the current C smoke test into `.artifacts/`:
 
@@ -103,17 +129,62 @@ clang -std=c11 -Wall -Wextra -Werror \
 .artifacts/verified-scheduling/test_pacha_sched
 ```
 
-`pacha_sched` is the platform-independent scheduler runtime layer above
-`pacha_eevdf`. It owns CPU current-thread bookkeeping, accepts thread/timer
-events, and returns decisions for the kernel or userland adapter to execute. It
-does not own trap frames, address spaces, fd state, logging, IPIs, or context
-switch execution.
+Build the kernel scheduler smoke test:
+
+```sh
+clang -std=c11 -Wall -Wextra -Werror \
+  -Iverified/scheduling/include \
+  verified/scheduling/src/pacha_eevdf.c \
+  verified/scheduling/src/pacha_kernel_sched.c \
+  verified/scheduling/tests/test_pacha_kernel_sched.c \
+  -o .artifacts/verified-scheduling/test_pacha_kernel_sched
+.artifacts/verified-scheduling/test_pacha_kernel_sched
+```
+
+Build the deterministic kernel scheduler property smoke test:
+
+```sh
+clang -std=c11 -Wall -Wextra -Werror \
+  -Iverified/scheduling/include \
+  verified/scheduling/src/pacha_eevdf.c \
+  verified/scheduling/src/pacha_kernel_sched.c \
+  verified/scheduling/tests/test_pacha_kernel_sched_property.c \
+  -o .artifacts/verified-scheduling/test_pacha_kernel_sched_property
+.artifacts/verified-scheduling/test_pacha_kernel_sched_property
+```
+
+`pacha_sched` is the older platform-independent scheduler runtime layer above
+`pacha_eevdf`. It remains useful as an executable C model while the kernel
+scheduler model is redesigned. Long-term kernel scheduling should follow
+`spec/KernelSchedModel.v`: per-CPU EEVDF runqueues, per-CPU current-thread
+bookkeeping, scheduler activation, and explicit migration.
+
+`pacha_kernel_sched` is the C implementation shaped after
+`spec/KernelSchedModel.v`. It keeps one EEVDF runqueue per CPU, tracks per-CPU
+current thread and activation-pending state, exposes explicit transition
+functions, and keeps trap-frame/IPI/context-switch work outside the verified
+core. This is the implementation candidate for kernel integration before VST.
+`pacha_kernel_sched_validate` is a C-side invariant checker mirroring the Coq
+kernel scheduler invariants; smoke tests call it after transitions and also
+check that corrupt states are rejected.
 
 `spec/SchedRuntimeModel.v` is the Coq model for the C scheduler runtime API.
 `spec/SchedRuntimeSpec.v` gives one Coq-level spec theorem per C runtime
 function. `spec/SchedRuntimeTestVectors.v` mirrors `tests/test_pacha_sched.c`
 lifecycle cases so the runtime behavior is represented on both sides before VST
 work.
+
+`spec/KernelSchedModel.v` is the new long-term abstract model for the in-kernel
+scheduler. It composes CPU-local EEVDF runqueues with kernel-level current CPU
+ownership, activation, timer/block/wake transitions, and runnable migration.
+`spec/KernelSchedInvariants.v` records the cross-CPU invariants that the kernel
+implementation must preserve. `spec/KernelSchedSpec.v` gives Coq-level function
+specifications for the model transitions. `spec/KernelSchedPreservation.v`
+starts the preservation layer with the empty state and failure/no-op paths,
+successful activation request, duplicate add rejection, busy pick rejection, and
+idle pick/claim success paths.
+`spec/KernelSchedTestVectors.v` mirrors the kernel scheduler C smoke test cases
+for per-CPU pick, duplicate rejection, and activation state.
 
 `proof/SchedRuntimeVstSpec.v` is the first VST bridge: it imports VST, records
 the C scalar bounds and enum encodings, names the model-to-memory representation
@@ -142,7 +213,7 @@ VST preparation constraints for the C core:
 - failed EEVDF transitions write the original runqueue copy to the out-parameter
 - platform work remains outside the verified core
 
-Kernel-owned responsibilities remain outside this directory:
+Kernel platform responsibilities remain outside this directory:
 
 - trap frame save/restore
 - CR3/PKRU/FS/GS handling
@@ -150,9 +221,6 @@ Kernel-owned responsibilities remain outside this directory:
 - fd/event queue exposure
 - actual context switch execution
 
-Userland-owned responsibilities remain outside this directory:
-
-- daemon lifecycle
-- event fd reads
-- commit ioctl writes
-- configuration and diagnostics
+Userland scheduling daemon responsibilities are no longer part of the long-term
+design. Userland code may still consume diagnostics or replay traces, but it is
+not the owner of scheduling policy.

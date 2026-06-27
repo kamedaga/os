@@ -107,23 +107,24 @@ fn getHooks() *const Hooks {
 extern var kernel_cr3_value: u64;
 extern var kernel_syscall_stack_top: u64;
 extern var kernel_syscall_stack_tops: [smp.max_cpus]u64;
+extern var x86_rdtscp_supported: u64;
 extern var thread_contexts_ptr: *anyopaque;
 extern var lapic_tick_count: u64;
 extern var user_return_saved_r10: u64;
 extern var user_return_saved_gprs: [15]u64 align(16);
 extern var user_return_iret_frame: [5]u64 align(16);
 
-extern fn saveCurrentThreadFxState() callconv(.c) void;
-extern fn restoreCurrentThreadFxState() callconv(.c) void;
-extern fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64;
+extern fn saveCurrentThreadFxState() callconv(.winapi) void;
+extern fn restoreCurrentThreadFxState() callconv(.winapi) void;
+extern fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64;
 
-pub export fn timerInterruptWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
+pub export fn timerInterruptWorkFrameForCurrentCpuFromAsm() callconv(.winapi) *TrapFrame {
     const cpu_slot = scheduler.currentCpu();
     const bounded_slot = if (cpu_slot < timer_interrupt_work_frames.len) cpu_slot else 0;
     return &timer_interrupt_work_frames[bounded_slot];
 }
 
-pub export fn syscallWorkFrameFromAsm() callconv(.c) *TrapFrame {
+pub export fn syscallWorkFrameFromAsm() callconv(.winapi) *TrapFrame {
     return &syscall_work_frame;
 }
 
@@ -132,19 +133,19 @@ fn boundedCurrentCpuSlot() usize {
     return if (cpu_slot < smp.max_cpus) cpu_slot else 0;
 }
 
-pub export fn pageFaultWorkFrameForCurrentCpuFromAsm() callconv(.c) *ExceptionTrapFrame {
+pub export fn pageFaultWorkFrameForCurrentCpuFromAsm() callconv(.winapi) *ExceptionTrapFrame {
     return &page_fault_work_frames[boundedCurrentCpuSlot()];
 }
 
-pub export fn trapFaultWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
+pub export fn trapFaultWorkFrameForCurrentCpuFromAsm() callconv(.winapi) *TrapFrame {
     return &trap_fault_work_frames[boundedCurrentCpuSlot()];
 }
 
-pub export fn fatalExceptionResumeWorkFrameForCurrentCpuFromAsm() callconv(.c) *TrapFrame {
+pub export fn fatalExceptionResumeWorkFrameForCurrentCpuFromAsm() callconv(.winapi) *TrapFrame {
     return &fatal_exception_resume_work_frames[boundedCurrentCpuSlot()];
 }
 
-pub export fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.c) void {
+pub export fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void {
     const cpu_slot = boundedCurrentCpuSlot();
     const src: [*]const u64 = @ptrFromInt(frame_addr);
     const iret_src: [*]const u64 = @ptrFromInt(frame_addr + iret_offset);
@@ -158,21 +159,21 @@ pub export fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, ir
     }
 }
 
-pub export fn userReturnSavedGprsForCurrentCpuFromAsm() callconv(.c) *u64 {
+pub export fn userReturnSavedGprsForCurrentCpuFromAsm() callconv(.winapi) *u64 {
     const cpu_slot = boundedCurrentCpuSlot();
     return &user_return_saved_gprs_by_cpu[cpu_slot][0];
 }
 
-pub export fn userReturnIretFrameForCurrentCpuFromAsm() callconv(.c) *u64 {
+pub export fn userReturnIretFrameForCurrentCpuFromAsm() callconv(.winapi) *u64 {
     const cpu_slot = boundedCurrentCpuSlot();
     return &user_return_iret_frames_by_cpu[cpu_slot][0];
 }
 
-pub export fn userReturnCr3ForCurrentCpuFromAsm() callconv(.c) u64 {
+pub export fn userReturnCr3ForCurrentCpuFromAsm() callconv(.winapi) u64 {
     return scheduler.currentCr3();
 }
 
-pub export fn applyCurrentThreadFsBaseForUserReturnFromAsm() callconv(.c) void {
+pub export fn applyCurrentThreadFsBaseForUserReturnFromAsm() callconv(.winapi) void {
     _ = scheduler.applyThreadBases(scheduler.currentThread());
 }
 
@@ -200,14 +201,25 @@ fn asmCopyStackFrameToWorkFramePointer(comptime qword_count: usize) []const u8 {
     , .{qword_count});
 }
 
-fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u8) []const u8 {
+fn asmCpuSlotIntoEcx() []const u8 {
     return std.fmt.comptimePrint(
         \\
+        \\cmpq $0, x86_rdtscp_supported(%rip)
+        \\je 3f
         \\rdtscp
         \\cmp ${d}, %ecx
-        \\jb 2f
+        \\jb 4f
+        \\3:
         \\xor %ecx, %ecx
-        \\2:
+        \\4:
+        \\
+    , .{smp.max_cpus});
+}
+
+fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        asmCpuSlotIntoEcx() ++
+        \\
         \\mov %ecx, %r14d
         \\mov %r14, %r13
         \\shl $3, %r13
@@ -223,7 +235,7 @@ fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u
         \\mov (%r14,%r13,1), %rsp
         \\push %r12
         \\
-    , .{ smp.max_cpus, @sizeOf(TrapFrame), work_frame_symbol, trap_frame_qword_count });
+    , .{ @sizeOf(TrapFrame), work_frame_symbol, trap_frame_qword_count });
 }
 
 fn asmCopyFramePointerToWorkFrameOnKernelStack(
@@ -472,11 +484,8 @@ pub export fn syscallEntryStub() callconv(.naked) noreturn {
         \\mov %r11, syscall_work_frame+136(%rip)
         \\mov %rsp, syscall_work_frame+144(%rip)
         \\movq $0x23, syscall_work_frame+152(%rip)
-        \\rdtscp
-        \\cmp %[max_cpus], %ecx
-        \\jb 2f
-        \\xor %ecx, %ecx
-        \\2:
+    ++ asmCpuSlotIntoEcx() ++
+        \\
         \\mov %ecx, %r12d
         \\mov %r12, %r14
         \\shl $3, %r14
@@ -507,13 +516,12 @@ pub export fn syscallEntryStub() callconv(.naked) noreturn {
     ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         :
-        : [max_cpus] "i" (smp.max_cpus),
-          [trap_frame_size] "i" (@sizeOf(TrapFrame)),
+        : [trap_frame_size] "i" (@sizeOf(TrapFrame)),
           [trap_frame_qwords] "i" (trap_frame_qword_count),
     );
 }
 
-pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.c) u64 {
+pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u64 {
     const h = getHooks();
     const cr2 = h.read_cr2();
     const ec = frame.error_code;
@@ -542,14 +550,14 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.c) u64 {
     return 0;
 }
 
-pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFrame) callconv(.c) noreturn {
+pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) noreturn {
     const h = getHooks();
     asm volatile ("cli");
     writeExceptionWithErrorSummary(h, vec, frame);
     h.halt_loop();
 }
 
-pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const ExceptionTrapFrame) callconv(.c) void {
+pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) void {
     const h = getHooks();
     asm volatile ("cli");
     writeExceptionWithErrorSummary(h, vec, frame);
@@ -561,7 +569,7 @@ pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const Except
     );
 }
 
-pub export fn doubleFaultHandlerCommon(error_code: u64) callconv(.c) noreturn {
+pub export fn doubleFaultHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
     const h = getHooks();
     asm volatile ("cli");
     h.write("DOUBLE FAULT\n");
@@ -571,7 +579,7 @@ pub export fn doubleFaultHandlerCommon(error_code: u64) callconv(.c) noreturn {
     h.halt_loop();
 }
 
-pub export fn invalidTssHandlerCommon(error_code: u64) callconv(.c) noreturn {
+pub export fn invalidTssHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
     const h = getHooks();
     asm volatile ("cli");
     h.write("INVALID TSS\n");
@@ -581,7 +589,7 @@ pub export fn invalidTssHandlerCommon(error_code: u64) callconv(.c) noreturn {
     h.halt_loop();
 }
 
-pub export fn segmentNotPresentHandlerCommon(error_code: u64) callconv(.c) noreturn {
+pub export fn segmentNotPresentHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
     const h = getHooks();
     asm volatile ("cli");
     h.write("SEGMENT NOT PRESENT\n");
@@ -591,7 +599,7 @@ pub export fn segmentNotPresentHandlerCommon(error_code: u64) callconv(.c) noret
     h.halt_loop();
 }
 
-pub export fn stackSegmentFaultHandlerCommon(error_code: u64) callconv(.c) noreturn {
+pub export fn stackSegmentFaultHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
     const h = getHooks();
     asm volatile ("cli");
     h.write("STACK SEGMENT FAULT\n");
@@ -601,21 +609,21 @@ pub export fn stackSegmentFaultHandlerCommon(error_code: u64) callconv(.c) noret
     h.halt_loop();
 }
 
-pub export fn invalidOpcodeHandlerCommon(frame: *const TrapFrame) callconv(.c) noreturn {
+pub export fn invalidOpcodeHandlerCommon(frame: *const TrapFrame) callconv(.winapi) noreturn {
     const h = getHooks();
     asm volatile ("cli");
     writeTrapSummary(h, "INVALID OPCODE", frame);
     h.halt_loop();
 }
 
-pub export fn divideErrorHandlerCommon(frame: *const TrapFrame) callconv(.c) noreturn {
+pub export fn divideErrorHandlerCommon(frame: *const TrapFrame) callconv(.winapi) noreturn {
     const h = getHooks();
     asm volatile ("cli");
     writeTrapSummary(h, "DIVIDE ERROR", frame);
     h.halt_loop();
 }
 
-pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(.c) void {
+pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(.winapi) void {
     const h = getHooks();
     asm volatile ("cli");
     const label = switch (vec) {
@@ -632,7 +640,7 @@ pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(
     );
 }
 
-pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
+pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     const h = getHooks();
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
@@ -660,7 +668,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     _ = scheduler.preemptBootstrapThread(h.scheduler_quantum_ticks, frame);
 }
 
-pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
+pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     const h = getHooks();
     const active_vector = lapic.activeInterruptVectorInRange(
         generic_device_interrupt_vector,
@@ -677,7 +685,7 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.c) void {
     }
 }
 
-pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.c) void {
+pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
     _ = frame;
     lapic.eoi();
 }

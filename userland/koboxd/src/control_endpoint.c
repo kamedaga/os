@@ -30,22 +30,47 @@ int koboxd_control_serve_get_endpoint(
         return -2;
     }
 
-    struct pacha_ipc_channel_pair pair;
-    status = koboxd_create_service_channel_pair(&pair);
-    if (status != 0) {
-        fprintf(stderr, "[koboxd] service channel create failed status=%d\n", status);
-        return status;
-    }
     koboxd_ipc_endpoint_t *endpoint =
         koboxd_ipc_service_endpoint(ipc_service, (koboxd_ipc_endpoint_kind_t)expected_kind);
     if (endpoint == NULL) {
         return -3;
     }
-    endpoint->endpoint_fd = pair.b;
+    int client_fd = -1;
+    if (expected_kind == KOBOXD_WIRE_ENDPOINT_FILED) {
+        const int endpoint_fd = pacha_ipc_endpoint_create(koboxd_service_channel_rights, 0);
+        if (endpoint_fd < 16) {
+            fprintf(stderr, "[koboxd] filed endpoint create failed status=%d\n", endpoint_fd);
+            return endpoint_fd < 0 ? endpoint_fd : -1;
+        }
+        const long dup_fd = pacha_fd_fcntl(
+            endpoint_fd,
+            PACHA_FD_FCNTL_DUP,
+            16,
+            koboxd_service_channel_rights);
+        if (dup_fd < 16) {
+            (void)pacha_fd_close(endpoint_fd);
+            fprintf(stderr, "[koboxd] filed endpoint dup failed status=%ld\n", dup_fd);
+            return dup_fd < 0 ? (int)dup_fd : -1;
+        }
+        endpoint->endpoint_fd = endpoint_fd;
+        client_fd = (int)dup_fd;
+    } else {
+        struct pacha_ipc_channel_pair pair;
+        status = koboxd_create_service_channel_pair(&pair);
+        if (status != 0) {
+            fprintf(stderr, "[koboxd] service channel create failed status=%d\n", status);
+            return status;
+        }
+        endpoint->endpoint_fd = pair.b;
+        client_fd = pair.a;
+    }
     endpoint->ready = 1;
 
-    status = koboxd_send_endpoint_fd(control_fd, request.word3, expected_kind, pair.a);
+    status = koboxd_send_endpoint_fd(control_fd, request.word3, expected_kind, client_fd);
     if (status != 0) {
+        if (client_fd >= 16) {
+            (void)pacha_fd_close(client_fd);
+        }
         fprintf(stderr,
             "[koboxd] endpoint fd send failed kind=%llu status=%d\n",
             (unsigned long long)expected_kind,

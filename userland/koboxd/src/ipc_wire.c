@@ -5,6 +5,7 @@
 
 const uint64_t koboxd_service_channel_rights =
     PACHA_FD_RIGHT_INSPECT |
+    PACHA_FD_RIGHT_DUP |
     PACHA_FD_RIGHT_WAIT |
     PACHA_FD_RIGHT_POLL |
     PACHA_FD_RIGHT_SET_FLAGS |

@@ -18,6 +18,7 @@ typedef enum koboxd_ipc_endpoint_kind {
     KOBOXD_IPC_ENDPOINT_BLOCK = 2,
     KOBOXD_IPC_ENDPOINT_FS_BACKEND = 3,
     KOBOXD_IPC_ENDPOINT_EVENT = 4,
+    KOBOXD_IPC_ENDPOINT_FILED = 5,
 } koboxd_ipc_endpoint_kind_t;
 
 typedef enum koboxd_ipc_transport {
@@ -159,6 +160,7 @@ typedef struct koboxd_ipc_service {
     koboxd_ipc_endpoint_t block;
     koboxd_ipc_endpoint_t fs_backend;
     koboxd_ipc_endpoint_t event;
+    koboxd_ipc_endpoint_t filed;
 } koboxd_ipc_service_t;
 
 typedef int (*koboxd_ipc_endpoint_handler_fn)(

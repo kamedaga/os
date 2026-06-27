@@ -14,3 +14,8 @@ EevdfTestVectors.v
 SchedRuntimeModel.v
 SchedRuntimeSpec.v
 SchedRuntimeTestVectors.v
+KernelSchedModel.v
+KernelSchedInvariants.v
+KernelSchedSpec.v
+KernelSchedPreservation.v
+KernelSchedTestVectors.v

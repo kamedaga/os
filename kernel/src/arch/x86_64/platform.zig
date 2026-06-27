@@ -1,5 +1,6 @@
 const std = @import("std");
 const interrupts = @import("../../interrupts.zig");
+const image_range = @import("../../boot/image_range.zig");
 
 pub const max_cpus: usize = 4;
 pub const page_entries: usize = 512;
@@ -19,6 +20,8 @@ pub const ist_stack_bytes: usize = 2 * 1024 * 1024;
 const ap_ring0_stack_bytes: usize = 2 * 1024 * 1024;
 const ap_ist_stack_bytes: usize = 256 * 1024;
 const runtime_identity_split_pt_count: usize = 256;
+const high_kernel_pd_table_count: usize = 4;
+const high_kernel_pt_table_count: usize = 128;
 pub const phys_copy_window_va: u64 = (@as(u64, @intCast(high_mmio_pml4_index)) << 39);
 
 pub const gdt_kernel_code_selector: u16 = 0x08;
@@ -78,6 +81,9 @@ var pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var pd_tables: [pd_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** pd_table_count;
 var high_mmio_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var high_mmio_pd_tables: [high_mmio_pdp_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_mmio_pdp_table_count;
+var high_kernel_pdp_table: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
+var high_kernel_pd_tables: [high_kernel_pd_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_kernel_pd_table_count;
+var high_kernel_pt_tables: [high_kernel_pt_table_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** high_kernel_pt_table_count;
 pub var phys_copy_window_pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
 var idt: [256]interrupts.IdtEntry align(16) = [_]interrupts.IdtEntry{interrupts.zeroIdtEntry()} ** 256;
 const gdt_template: [7]u64 = .{
@@ -125,6 +131,7 @@ pub export var kernel_syscall_stack_top: u64 = 0;
 pub export var kernel_syscall_stack_tops: [max_cpus]u64 = [_]u64{0} ** max_cpus;
 pub export var pcid_enabled: u64 = 0;
 pub export var pku_enabled: u64 = 0;
+pub export var x86_rdtscp_supported: u64 = 0;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -148,6 +155,9 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(pd_tables), &pd_tables));
     start = minStaticStart(start, staticStorageStart(@TypeOf(high_mmio_pdp_table), &high_mmio_pdp_table));
     start = minStaticStart(start, staticStorageStart(@TypeOf(high_mmio_pd_tables), &high_mmio_pd_tables));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(high_kernel_pdp_table), &high_kernel_pdp_table));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(high_kernel_pd_tables), &high_kernel_pd_tables));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(high_kernel_pt_tables), &high_kernel_pt_tables));
     start = minStaticStart(start, staticStorageStart(@TypeOf(phys_copy_window_pt), &phys_copy_window_pt));
     start = minStaticStart(start, staticStorageStart(@TypeOf(idt), &idt));
     start = minStaticStart(start, staticStorageStart(@TypeOf(gdt_tables), &gdt_tables));
@@ -186,6 +196,7 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_syscall_stack_tops), &kernel_syscall_stack_tops));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pcid_enabled), &pcid_enabled));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pku_enabled), &pku_enabled));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(x86_rdtscp_supported), &x86_rdtscp_supported));
     return start;
 }
 
@@ -196,6 +207,9 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pd_tables), &pd_tables));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(high_mmio_pdp_table), &high_mmio_pdp_table));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(high_mmio_pd_tables), &high_mmio_pd_tables));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(high_kernel_pdp_table), &high_kernel_pdp_table));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(high_kernel_pd_tables), &high_kernel_pd_tables));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(high_kernel_pt_tables), &high_kernel_pt_tables));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(phys_copy_window_pt), &phys_copy_window_pt));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(idt), &idt));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gdt_tables), &gdt_tables));
@@ -234,6 +248,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_syscall_stack_tops), &kernel_syscall_stack_tops));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pcid_enabled), &pcid_enabled));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pku_enabled), &pku_enabled));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(x86_rdtscp_supported), &x86_rdtscp_supported));
     return end;
 }
 
@@ -251,6 +266,7 @@ const cr4_pcide: u64 = 1 << 17;
 const cr4_pke: u64 = 1 << 22;
 const cpuid_leaf1_ecx_pcid: u32 = 1 << 17;
 const cpuid_leaf7_ecx_pku: u32 = 1 << 3;
+const cpuid_leaf80000001_edx_rdtscp: u32 = 1 << 27;
 const page_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_no_flush: u64 = 1 << 63;
@@ -269,6 +285,21 @@ fn cpuid(leaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
           [subleaf] "{ecx}" (@as(u32, 0)),
     );
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+fn cpuidMaxExtendedLeaf() u32 {
+    return cpuid(0x8000_0000).eax;
+}
+
+fn cpuHasRdtscp() bool {
+    if (cpuidMaxExtendedLeaf() < 0x8000_0001) return false;
+    return (cpuid(0x8000_0001).edx & cpuid_leaf80000001_edx_rdtscp) != 0;
+}
+
+pub fn detectRdtscpSupport() bool {
+    const supported = cpuHasRdtscp();
+    x86_rdtscp_supported = if (supported) 1 else 0;
+    return supported;
 }
 
 fn readCr4() u64 {
@@ -582,6 +613,25 @@ fn cpuDoubleFaultIstTop(cpu_slot: usize) ?u64 {
     return (@intFromPtr(stack) + ap_ist_stack_bytes) & ~@as(u64, 0xF);
 }
 
+fn kernelHighMappingActive() bool {
+    return image_range.virtual_base >= 0xffff_8000_0000_0000 and image_range.base_paddr != 0;
+}
+
+fn kernelVirtToPhys(addr: u64) ?u64 {
+    if (kernelHighMappingActive() and addr >= image_range.virtual_base) {
+        const offset = addr - image_range.virtual_base;
+        if (image_range.size_bytes == 0 or offset < image_range.size_bytes) {
+            return image_range.base_paddr + offset;
+        }
+    }
+    if (addr < four_gib) return addr;
+    return null;
+}
+
+fn kernelPtrPaddr(ptr: anytype) ?u64 {
+    return kernelVirtToPhys(@intFromPtr(ptr));
+}
+
 fn installGuardedIdentityStackRegion(region: []u8, usable_bytes: usize, pt_tables: *[stack_region_chunk_count][page_entries]u64) bool {
     if (region.len != stack_region_bytes) return false;
     if (usable_bytes == 0) return false;
@@ -613,7 +663,7 @@ fn installGuardedIdentityStackRegion(region: []u8, usable_bytes: usize, pt_table
             }
         }
 
-        const pt_pa = @intFromPtr(pt);
+        const pt_pa = kernelPtrPaddr(pt) orelse return false;
         if (pt_pa >= four_gib) return false;
         pd_tables[pdp_index][pd_index + chunk_index] = pt_pa | page_present | page_rw;
     }
@@ -634,7 +684,8 @@ fn splitLargeKernelIdentityPage(pd_entry: *u64) bool {
         const page_base = large_base + (@as(u64, @intCast(page_index)) * 4096);
         pt[page_index] = page_base | pte_flags;
     }
-    pd_entry.* = @intFromPtr(pt) | pte_flags;
+    const pt_pa = kernelPtrPaddr(pt) orelse return false;
+    pd_entry.* = pt_pa | pte_flags;
     return true;
 }
 
@@ -665,11 +716,74 @@ fn mapKernelIdentityRange(base: u64, bytes: usize) bool {
     return true;
 }
 
+fn highKernelPdSlot(first_pdp_index: usize, pdp_index: usize) ?usize {
+    if (pdp_index < first_pdp_index) return null;
+    const slot = pdp_index - first_pdp_index;
+    if (slot >= high_kernel_pd_table_count) return null;
+    return slot;
+}
+
+fn installHighKernelMapping() bool {
+    if (!kernelHighMappingActive()) return true;
+    const kernel_table_flags = page_present | page_rw;
+    @memset(high_kernel_pdp_table[0..], 0);
+    var pd_slot: usize = 0;
+    while (pd_slot < high_kernel_pd_table_count) : (pd_slot += 1) {
+        @memset(high_kernel_pd_tables[pd_slot][0..], 0);
+    }
+    var pt_slot_clear: usize = 0;
+    while (pt_slot_clear < high_kernel_pt_table_count) : (pt_slot_clear += 1) {
+        @memset(high_kernel_pt_tables[pt_slot_clear][0..], 0);
+    }
+
+    const vbase = image_range.virtual_base & ~@as(u64, 0xFFF);
+    const base_delta = image_range.virtual_base - vbase;
+    const pbase = image_range.base_paddr - base_delta;
+    const bytes = if (image_range.size_bytes == 0) @as(usize, @intCast(256 * 1024 * 1024)) else image_range.size_bytes + @as(usize, @intCast(base_delta));
+    const vend = (vbase + @as(u64, @intCast(bytes)) + 0xFFF) & ~@as(u64, 0xFFF);
+
+    const pml4_index: usize = @intCast((vbase >> 39) & 0x1FF);
+    if (pml4_index >= page_entries) return false;
+    const first_pdp_index: usize = @intCast((vbase >> 30) & 0x1FF);
+    const high_pdp_pa = kernelPtrPaddr(&high_kernel_pdp_table) orelse return false;
+    pml4_table[pml4_index] = high_pdp_pa | kernel_table_flags;
+
+    var va = vbase;
+    while (va < vend) {
+        const pdp_index: usize = @intCast((va >> 30) & 0x1FF);
+        const pd_index: usize = @intCast((va >> 21) & 0x1FF);
+        const pd_table_slot = highKernelPdSlot(first_pdp_index, pdp_index) orelse return false;
+        const pt_slot: usize = @intCast((va - vbase) >> 21);
+        if (pt_slot >= high_kernel_pt_table_count) return false;
+        if (high_kernel_pdp_table[pdp_index] == 0) {
+            const pd_pa = kernelPtrPaddr(&high_kernel_pd_tables[pd_table_slot]) orelse return false;
+            high_kernel_pdp_table[pdp_index] = pd_pa | kernel_table_flags;
+        }
+        if (high_kernel_pd_tables[pd_table_slot][pd_index] == 0) {
+            const pt_pa = kernelPtrPaddr(&high_kernel_pt_tables[pt_slot]) orelse return false;
+            high_kernel_pd_tables[pd_table_slot][pd_index] = pt_pa | kernel_table_flags;
+        }
+        const pt = &high_kernel_pt_tables[pt_slot];
+        const pt_index: usize = @intCast((va >> 12) & 0x1FF);
+        const phys = pbase + (va - vbase);
+        pt[pt_index] = phys | page_present | page_rw;
+        va += 4096;
+    }
+    return true;
+}
+
 pub fn mapKernelRuntimeIdentityRange(base: u64, bytes: usize) bool {
+    if (kernelHighMappingActive()) {
+        if (bytes == 0) return true;
+        if (base < image_range.virtual_base) return false;
+        const offset = base - image_range.virtual_base;
+        return image_range.size_bytes == 0 or offset + @as(u64, @intCast(bytes)) <= image_range.size_bytes;
+    }
     return mapKernelIdentityRange(base, bytes);
 }
 
 fn mapPerCpuKernelStorage() bool {
+    if (kernelHighMappingActive()) return true;
     if (!mapKernelIdentityRange(@intFromPtr(&phys_copy_window_pt), @sizeOf(@TypeOf(phys_copy_window_pt)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&gdt_tables), @sizeOf(@TypeOf(gdt_tables)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&tss_tables), @sizeOf(@TypeOf(tss_tables)))) return false;
@@ -716,12 +830,12 @@ pub fn installIdentityPageTables0To1GiB() bool {
         @memset(high_mmio_pd_tables[pd_idx][0..], 0);
     }
 
-    const pml4_pa: u64 = @intFromPtr(&pml4_table);
-    const pdp_pa: u64 = @intFromPtr(&pdp_table);
-    const pd0_pa: u64 = @intFromPtr(&pd_tables[0]);
-    const high_pdp_pa: u64 = @intFromPtr(&high_mmio_pdp_table);
-    const high_pd0_pa: u64 = @intFromPtr(&high_mmio_pd_tables[0]);
-    const phys_copy_window_pt_pa: u64 = @intFromPtr(&phys_copy_window_pt);
+    const pml4_pa: u64 = kernelPtrPaddr(&pml4_table) orelse return false;
+    const pdp_pa: u64 = kernelPtrPaddr(&pdp_table) orelse return false;
+    const pd0_pa: u64 = kernelPtrPaddr(&pd_tables[0]) orelse return false;
+    const high_pdp_pa: u64 = kernelPtrPaddr(&high_mmio_pdp_table) orelse return false;
+    const high_pd0_pa: u64 = kernelPtrPaddr(&high_mmio_pd_tables[0]) orelse return false;
+    const phys_copy_window_pt_pa: u64 = kernelPtrPaddr(&phys_copy_window_pt) orelse return false;
     if (pml4_pa >= four_gib or pdp_pa >= four_gib or pd0_pa >= four_gib or high_pdp_pa >= four_gib or high_pd0_pa >= four_gib or phys_copy_window_pt_pa >= four_gib) return false;
 
     const kernel_table_flags = page_present | page_rw;
@@ -730,7 +844,7 @@ pub fn installIdentityPageTables0To1GiB() bool {
     pml4_table[0] = pdp_pa | kernel_table_flags;
     pd_idx = 0;
     while (pd_idx < pd_table_count) : (pd_idx += 1) {
-        const pd_pa: u64 = @intFromPtr(&pd_tables[pd_idx]);
+        const pd_pa: u64 = kernelPtrPaddr(&pd_tables[pd_idx]) orelse return false;
         pdp_table[pd_idx] = pd_pa | kernel_table_flags;
 
         var i: usize = 0;
@@ -744,7 +858,7 @@ pub fn installIdentityPageTables0To1GiB() bool {
     @memset(phys_copy_window_pt[0..], 0);
     var high_pdp_idx: usize = 0;
     while (high_pdp_idx < high_mmio_pdp_table_count) : (high_pdp_idx += 1) {
-        const high_pd_pa: u64 = @intFromPtr(&high_mmio_pd_tables[high_pdp_idx]);
+        const high_pd_pa: u64 = kernelPtrPaddr(&high_mmio_pd_tables[high_pdp_idx]) orelse return false;
         high_mmio_pdp_table[high_pdp_idx] = high_pd_pa | kernel_table_flags;
 
         const region_base = (@as(u64, @intCast(high_mmio_pml4_index)) << 39) + (@as(u64, @intCast(high_pdp_idx)) << 30);
@@ -756,9 +870,12 @@ pub fn installIdentityPageTables0To1GiB() bool {
     }
     high_mmio_pd_tables[0][0] = phys_copy_window_pt_pa | kernel_table_flags;
 
-    if (!installGuardedIdentityStackRegion(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes, &ring0_stack_guard_pt)) return false;
-    if (!installGuardedIdentityStackRegion(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes, &pf_ist_stack_guard_pt)) return false;
-    if (!installGuardedIdentityStackRegion(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes, &df_ist_stack_guard_pt)) return false;
+    if (!installHighKernelMapping()) return false;
+    if (!kernelHighMappingActive()) {
+        if (!installGuardedIdentityStackRegion(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes, &ring0_stack_guard_pt)) return false;
+        if (!installGuardedIdentityStackRegion(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes, &pf_ist_stack_guard_pt)) return false;
+        if (!installGuardedIdentityStackRegion(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes, &df_ist_stack_guard_pt)) return false;
+    }
     if (!mapPerCpuKernelStorage()) return false;
 
     writeCr3(pml4_pa);
@@ -769,6 +886,10 @@ pub fn installIdentityPageTables0To1GiB() bool {
 pub fn hardenKernelMappingsSupervisorOnly() void {
     pml4_table[0] &= ~page_user;
     pml4_table[high_mmio_pml4_index] &= ~page_user;
+    if (kernelHighMappingActive()) {
+        const high_index: usize = @intCast((image_range.virtual_base >> 39) & 0x1FF);
+        pml4_table[high_index] &= ~page_user;
+    }
 
     var pdp_idx: usize = 0;
     while (pdp_idx < pd_table_count) : (pdp_idx += 1) {
@@ -788,6 +909,18 @@ pub fn hardenKernelMappingsSupervisorOnly() void {
     }
 }
 
+pub fn kernelPointerPaddr(addr: usize) ?u64 {
+    return kernelVirtToPhys(@intCast(addr));
+}
+
+pub fn seedUserPml4WithKernel(pml4: []u64) void {
+    if (!kernelHighMappingActive()) return;
+    const pml4_index: usize = @intCast((image_range.virtual_base >> 39) & 0x1FF);
+    if (pml4_index >= pml4.len) return;
+    const high_pdp_pa = kernelPtrPaddr(&high_kernel_pdp_table) orelse return;
+    pml4[pml4_index] = high_pdp_pa | page_present | page_rw;
+}
+
 pub fn seedUserPdWithKernelIdentity(pd: []u64) void {
     var i: usize = 0;
     while (i < page_entries and i < pd.len) : (i += 1) {
@@ -799,7 +932,7 @@ pub fn seedUserPdpWithKernelIdentity(pdp: []u64) void {
     const kernel_table_flags = page_present | page_rw;
     var pdp_idx: usize = 1;
     while (pdp_idx < pd_table_count and pdp_idx < pdp.len) : (pdp_idx += 1) {
-        const pd_pa: u64 = @intFromPtr(&pd_tables[pdp_idx]);
+        const pd_pa: u64 = kernelPtrPaddr(&pd_tables[pdp_idx]) orelse return;
         pdp[pdp_idx] = pd_pa | kernel_table_flags;
     }
 }
@@ -831,7 +964,9 @@ fn installTssDescriptor(cpu_slot: usize) bool {
 
 fn loadGdtAndReloadSegmentsForCpuInternal(cpu_slot: usize) bool {
     if (!installTssDescriptor(cpu_slot)) return false;
-    writeMsr(msr_ia32_tsc_aux, @intCast(cpu_slot));
+    if (cpuHasRdtscp()) {
+        writeMsr(msr_ia32_tsc_aux, @intCast(cpu_slot));
+    }
 
     const gdt_ptr = GdtPtr{
         .limit = @as(u16, @intCast(@sizeOf(@TypeOf(gdt_tables[0])) - 1)),

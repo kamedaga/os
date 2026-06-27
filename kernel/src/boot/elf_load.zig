@@ -1,13 +1,13 @@
 /// ELF loading into user process pages.
-/// Uses uefi_services for scratch allocation, so safe to call both before and
-/// after ExitBootServices.
+/// Uses boot_scratch for load staging, so boot protocols can provide the
+/// backing storage independently.
 const std = @import("std");
 const kernel = @import("../kernel.zig");
 const boot_static = @import("main_static.zig");
 const elf_loader = @import("../elf_loader.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
-const uefi_services = @import("uefi_services.zig");
+const boot_scratch = @import("boot_scratch.zig");
 const log_util = @import("../log_util.zig");
 
 // ---------------------------------------------------------------------------
@@ -53,11 +53,11 @@ pub fn loadUserElfIntoProcessPages(
         return null;
     }
 
-    const load_window = uefi_services.allocateBootScratch(required_bytes) orelse {
+    const load_window = boot_scratch.allocate(required_bytes) orelse {
         log_util.logRequiredBytes("loadUserElfIntoProcessPages: scratch alloc failed bytes=", required_bytes);
         return null;
     };
-    defer uefi_services.freeBootScratch(load_window);
+    defer boot_scratch.free(load_window);
 
     @memset(load_window[0..required_bytes], 0);
     const loaded = elf_loader.loadToSinglePage(image_bytes, boot_static.user_elf_base_va, load_window[0..required_bytes]) catch |err| {

@@ -1,7 +1,11 @@
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
-#include "filed/bootstrap.h"
+#include "filed/ipc_protocol.h"
 #include "koboxd/ipc_protocol.h"
+
+#ifndef SEED0ROOT_BOOT_BENCH
+#define SEED0ROOT_BOOT_BENCH 0
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -13,7 +17,6 @@ enum {
     SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
     SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
     SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
-    SEED0ROOT_PATH_COMPONENT_BYTES = 128,
     SEED0ROOT_KOBOXD_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
     SEED0ROOT_PAGE_SIZE = 4096,
     SEED0ROOT_ELF64_EHDR_BYTES = 64,
@@ -42,6 +45,7 @@ enum {
     SEED0ROOT_AT_SECURE = 23,
     SEED0ROOT_AT_RANDOM = 25,
     SEED0ROOT_AT_EXECFN = 31,
+    SEED0ROOT_TASK_STATE_EXITED = 2,
 };
 
 struct seed0root_bootstrap_module {
@@ -573,9 +577,269 @@ static int seed0root_koboxd_endpoint_call(int endpoint_fd, uint64_t op, uint64_t
     return seed0root_koboxd_endpoint_call_with_fd(endpoint_fd, op, 0, -1, out_word2);
 }
 
-static int seed0root_create_wire_page(int *out_fd, void **out_mapped)
+static int seed0root_fs_sync_all(int fs_fd)
 {
-    if (out_fd == NULL || out_mapped == NULL) {
+    uint64_t ignored = 0;
+    return seed0root_koboxd_endpoint_call(fs_fd, KOBOXD_WIRE_FS_SYNC_ALL, &ignored);
+}
+
+static int seed0root_filed_call(
+    int endpoint_fd,
+    uint64_t op,
+    uint64_t request_id,
+    int transfer_fd,
+    uint64_t word2,
+    struct pacha_ipc_msg *out_reply,
+    struct pacha_ipc_fd *reply_fds,
+    uint64_t reply_fd_capacity)
+{
+    if (endpoint_fd < 16 || request_id == 0 || out_reply == NULL) {
+        return -1;
+    }
+
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    if (transfer_fd >= 16) {
+        fd_item.fd = (uint64_t)(uint32_t)transfer_fd;
+        fd_item.rights =
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ |
+            PACHA_FD_RIGHT_MAP_WRITE;
+        fd_item.flags = 0;
+        fd_item.transfer_flags = 0;
+    }
+
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = op,
+        .word2 = word2,
+        .word3 = request_id,
+        .fds = transfer_fd >= 16 ? &fd_item : NULL,
+        .fd_count = transfer_fd >= 16 ? 1 : 0,
+    };
+    const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+
+    memset(out_reply, 0, sizeof(*out_reply));
+    out_reply->fds = reply_fds;
+    out_reply->fd_capacity = reply_fd_capacity;
+    const int recv_status = recv_ipc_wait(reply_fd, out_reply);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (out_reply->word0 != FILED_WIRE_REPLY_MAGIC || out_reply->word3 != request_id) {
+        return -2;
+    }
+    if ((int64_t)out_reply->word1 < 0) {
+        return (int)(int64_t)out_reply->word1;
+    }
+    return 0;
+}
+
+static int seed0root_create_filed_wire_page(int *out_fd, void **out_mapped);
+static void seed0root_destroy_filed_wire_page(int fd, void *mapped);
+
+static int seed0root_dump_filed_metrics(int filed_endpoint_fd)
+{
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    return seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_DUMP_METRICS,
+        0x5eed0f12u,
+        -1,
+        0,
+        &reply,
+        NULL,
+        0);
+}
+
+static int seed0root_set_filed_cache_slots(int filed_endpoint_fd, uint64_t slots)
+{
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_SET_CACHE_SLOTS,
+        0x5eed0f10u,
+        -1,
+        slots,
+        &reply,
+        NULL,
+        0);
+    if (status == 0) {
+        printf("[seed0root] filed cache slots=%llu\n", (unsigned long long)reply.word2);
+    }
+    return status;
+}
+
+static int seed0root_run_filed_no_cache_probe(int filed_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16) {
+        return -1;
+    }
+
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_set_filed_cache_slots(filed_endpoint_fd, 0);
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] filed cache disable failed status=%d\n", status);
+        return status;
+    }
+
+    status = seed0root_create_filed_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    filed_wire_openat_t *openat = (filed_wire_openat_t *)page;
+    openat->dir_handle = 0;
+    openat->rights =
+        FILED_WIRE_RIGHT_READ |
+        FILED_WIRE_RIGHT_STAT |
+        FILED_WIRE_RIGHT_EXEC;
+    openat->open_flags = FILED_WIRE_OPEN_CLOEXEC;
+    snprintf(openat->name, sizeof(openat->name), "%s", "/cmd/libc_vfs_exec_smoke.elf");
+
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_OPENAT,
+        0x5eed0f13u,
+        page_fd,
+        0,
+        &reply,
+        NULL,
+        0);
+    seed0root_destroy_filed_wire_page(page_fd, page);
+    page_fd = -1;
+    page = NULL;
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] filed no-cache open failed status=%d\n", status);
+        (void)seed0root_set_filed_cache_slots(filed_endpoint_fd, 64);
+        return status;
+    }
+
+    const uint64_t handle = reply.word2;
+    status = seed0root_create_filed_wire_page(&page_fd, &page);
+    if (status != 0) {
+        (void)seed0root_filed_call(
+            filed_endpoint_fd,
+            FILED_WIRE_OP_CLOSE,
+            0x5eed0f15u,
+            -1,
+            handle,
+            &reply,
+            NULL,
+            0);
+        (void)seed0root_set_filed_cache_slots(filed_endpoint_fd, 64);
+        return status;
+    }
+
+    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    io->handle = handle;
+    io->offset = 0;
+    io->length = 4;
+    memset(&reply, 0, sizeof(reply));
+    status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_PREAD,
+        0x5eed0f14u,
+        page_fd,
+        0,
+        &reply,
+        NULL,
+        0);
+
+    int probe_status = status;
+    if (probe_status == 0 &&
+        (reply.word2 != 4 ||
+            io->data[0] != 0x7f ||
+            io->data[1] != 'E' ||
+            io->data[2] != 'L' ||
+            io->data[3] != 'F'))
+    {
+        fprintf(stderr,
+            "[seed0root] filed no-cache probe invalid result bytes=%llu magic=%02x %02x %02x %02x\n",
+            (unsigned long long)reply.word2,
+            io->data[0],
+            io->data[1],
+            io->data[2],
+            io->data[3]);
+        probe_status = -2;
+    }
+    seed0root_destroy_filed_wire_page(page_fd, page);
+
+    memset(&reply, 0, sizeof(reply));
+    const int close_status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_CLOSE,
+        0x5eed0f15u,
+        -1,
+        handle,
+        &reply,
+        NULL,
+        0);
+    const int restore_status = seed0root_set_filed_cache_slots(filed_endpoint_fd, 64);
+    if (probe_status == 0) {
+        probe_status = close_status;
+    }
+    if (probe_status == 0) {
+        probe_status = restore_status;
+    }
+    printf("[seed0root] filed no-cache probe status=%d\n", probe_status);
+    return probe_status;
+}
+
+static int seed0root_wait_process(int process_fd, const char *label)
+{
+    if (process_fd < 16) {
+        return -1;
+    }
+    uint64_t status_words[4] = {0, 0, 0, 0};
+    for (;;) {
+        const long wait_status = pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_WAIT,
+            (uint64_t)(uint32_t)process_fd,
+            (uint64_t)(uintptr_t)status_words);
+        if (wait_status == 0) {
+            const uint64_t state = status_words[0];
+            const uint64_t exit_code = status_words[1];
+            printf("[seed0root] %s completed state=%llu exit=%llu\n",
+                label != NULL ? label : "process",
+                (unsigned long long)state,
+                (unsigned long long)exit_code);
+            if (state == SEED0ROOT_TASK_STATE_EXITED && exit_code == 0) {
+                return 0;
+            }
+            return -5;
+        }
+        if (wait_status != PACHA_SYSCALL_ERR_NOT_READY &&
+            wait_status != PACHA_ERR_NOT_READY)
+        {
+            fprintf(stderr,
+                "[seed0root] %s wait failed status=%ld\n",
+                label != NULL ? label : "process",
+                wait_status);
+            return -(int)wait_status;
+        }
+
+        struct pacha_pollfd pollfd = {
+            .fd = process_fd,
+            .events = 0,
+            .revents = 0,
+        };
+        (void)pacha_fd_wait_many(&pollfd, 1, 1);
+    }
+}
+
+static int seed0root_create_wire_page(uint64_t size, int *out_fd, void **out_mapped)
+{
+    if (size == 0 || out_fd == NULL || out_mapped == NULL) {
         return -1;
     }
     *out_fd = -1;
@@ -585,11 +849,11 @@ static int seed0root_create_wire_page(int *out_fd, void **out_mapped)
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int fd = pacha_vmo_create(KOBOXD_WIRE_FS_PAGE_BYTES, rights, 0);
+    const int fd = pacha_vmo_create(size, rights, 0);
     if (fd < 16) {
         fprintf(stderr,
-            "[seed0root] wire page create failed bytes=%u status=%d\n",
-            (unsigned)KOBOXD_WIRE_FS_PAGE_BYTES,
+            "[seed0root] wire page create failed bytes=%llu status=%d\n",
+            (unsigned long long)size,
             fd);
         return fd;
     }
@@ -597,265 +861,118 @@ static int seed0root_create_wire_page(int *out_fd, void **out_mapped)
         PACHA_FD_SYSCALL_MMAP,
         (uint64_t)(uint32_t)fd,
         0,
-        KOBOXD_WIRE_FS_PAGE_BYTES,
+        size,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
     void *mapped = map_result < 4096 ? NULL : (void *)(uintptr_t)map_result;
     if (mapped == NULL) {
         fprintf(stderr,
-            "[seed0root] wire page map failed bytes=%u status=%ld\n",
-            (unsigned)KOBOXD_WIRE_FS_PAGE_BYTES,
+            "[seed0root] wire page map failed bytes=%llu status=%ld\n",
+            (unsigned long long)size,
             map_result);
         (void)pacha_fd_close(fd);
         return -2;
     }
-    memset(mapped, 0, KOBOXD_WIRE_FS_PAGE_BYTES);
+    memset(mapped, 0, (size_t)size);
     *out_fd = fd;
     *out_mapped = mapped;
     return 0;
 }
 
-static void seed0root_destroy_wire_page(int fd, void *mapped)
+static void seed0root_destroy_wire_page(uint64_t size, int fd, void *mapped)
 {
     if (mapped != NULL) {
-        (void)pacha_munmap(mapped, KOBOXD_WIRE_FS_PAGE_BYTES);
+        (void)pacha_munmap(mapped, size);
     }
     if (fd >= 16) {
         (void)pacha_fd_close(fd);
     }
 }
 
-static int seed0root_fs_lookup_object(int fs_fd, uint64_t parent_object_id, const char *name, uint64_t *out_object_id)
+static int seed0root_create_filed_wire_page(int *out_fd, void **out_mapped)
 {
-    if (fs_fd < 16 || name == NULL || out_object_id == NULL) {
-        return -1;
-    }
-    *out_object_id = 0;
-    int page_fd = -1;
-    void *page = NULL;
-    int status = seed0root_create_wire_page(&page_fd, &page);
-    if (status != 0) {
-        return status;
-    }
-    koboxd_wire_fs_lookup_t *lookup = (koboxd_wire_fs_lookup_t *)page;
-    lookup->parent_object_id = parent_object_id;
-    snprintf(lookup->name, sizeof(lookup->name), "%s", name);
-    status = seed0root_koboxd_endpoint_call_with_fd(fs_fd, KOBOXD_WIRE_FS_LOOKUP, 0, page_fd, out_object_id);
-    seed0root_destroy_wire_page(page_fd, page);
-    return status;
+    return seed0root_create_wire_page(FILED_WIRE_PAGE_BYTES, out_fd, out_mapped);
 }
 
-static int seed0root_fs_stat_object(int fs_fd, uint64_t object_id, koboxd_wire_fs_statx_t *out_stat)
+static void seed0root_destroy_filed_wire_page(int fd, void *mapped)
 {
-    if (fs_fd < 16 || object_id == 0 || out_stat == NULL) {
-        return -1;
-    }
-    int page_fd = -1;
-    void *page = NULL;
-    int status = seed0root_create_wire_page(&page_fd, &page);
-    if (status != 0) {
-        return status;
-    }
-    uint64_t ignored = 0;
-    status = seed0root_koboxd_endpoint_call_with_fd(fs_fd, KOBOXD_WIRE_FS_STATX, object_id, page_fd, &ignored);
-    if (status == 0) {
-        *out_stat = *(koboxd_wire_fs_statx_t *)page;
-    }
-    seed0root_destroy_wire_page(page_fd, page);
-    return status;
+    seed0root_destroy_wire_page(FILED_WIRE_PAGE_BYTES, fd, mapped);
 }
 
-static int seed0root_fs_pread_object(
-    int fs_fd,
-    uint64_t object_id,
-    uint64_t offset,
-    void *buffer,
-    uint64_t length,
-    uint64_t *out_bytes)
+static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
 {
-    if (fs_fd < 16 || object_id == 0 || buffer == NULL || out_bytes == NULL) {
-        return -1;
-    }
-    *out_bytes = 0;
-    int page_fd = -1;
-    void *page = NULL;
-    int status = seed0root_create_wire_page(&page_fd, &page);
-    if (status != 0) {
-        return status;
-    }
-    koboxd_wire_fs_io_t *io = (koboxd_wire_fs_io_t *)page;
-    io->object_id = object_id;
-    io->offset = offset;
-    io->length = length > KOBOXD_WIRE_FS_IO_BYTES ? KOBOXD_WIRE_FS_IO_BYTES : length;
-    uint64_t bytes = 0;
-    status = seed0root_koboxd_endpoint_call_with_fd(fs_fd, KOBOXD_WIRE_FS_PREAD, 0, page_fd, &bytes);
-    if (status == 0 && bytes > 0) {
-        if (bytes > length) {
-            bytes = length;
-        }
-        memcpy(buffer, io->data, (size_t)bytes);
-        *out_bytes = bytes;
-    }
-    seed0root_destroy_wire_page(page_fd, page);
-    return status;
-}
-
-static int seed0root_read_rootfs_file(int fs_fd, const char *path, unsigned char **out_image, uint64_t *out_size)
-{
-    if (fs_fd < 16 || path == NULL || out_image == NULL || out_size == NULL) {
-        return -1;
-    }
-    *out_image = NULL;
-    *out_size = 0;
-
-    uint64_t file_object = 0;
-    uint64_t object = KOBOXD_WIRE_FS_ROOT_OBJECT_ID;
-    const char *cursor = path;
-    if (*cursor != '/') {
-        return -2;
-    }
-    while (*cursor == '/') {
-        cursor++;
-    }
-    while (*cursor != '\0') {
-        const char *start = cursor;
-        while (*cursor != '\0' && *cursor != '/') {
-            cursor++;
-        }
-        const uint64_t len = (uint64_t)(cursor - start);
-        if (len == 0 || len >= SEED0ROOT_PATH_COMPONENT_BYTES) {
-            return -2;
-        }
-        char name[SEED0ROOT_PATH_COMPONENT_BYTES];
-        memcpy(name, start, (size_t)len);
-        name[len] = '\0';
-        const int status = seed0root_fs_lookup_object(fs_fd, object, name, &file_object);
-        if (status != 0) {
-            return status;
-        }
-        object = file_object;
-        while (*cursor == '/') {
-            cursor++;
-        }
-    }
-    if (object == KOBOXD_WIRE_FS_ROOT_OBJECT_ID) {
-        return -2;
-    }
-
-    koboxd_wire_fs_statx_t stat;
-    memset(&stat, 0, sizeof(stat));
-    int status = seed0root_fs_stat_object(fs_fd, object, &stat);
-    if (status != 0 || stat.size == 0 || stat.size > 16ull * 1024ull * 1024ull) {
-        return status != 0 ? status : -3;
-    }
-
-    unsigned char *image = malloc((size_t)stat.size);
-    if (image == NULL) {
-        return -4;
-    }
-
-    uint64_t offset = 0;
-    while (offset < stat.size) {
-        uint64_t want = stat.size - offset;
-        if (want > KOBOXD_WIRE_FS_IO_BYTES) {
-            want = KOBOXD_WIRE_FS_IO_BYTES;
-        }
-        uint64_t got = 0;
-        status = seed0root_fs_pread_object(fs_fd, object, offset, image + offset, want, &got);
-        if (status != 0 || got == 0) {
-            free(image);
-            return status != 0 ? status : -5;
-        }
-        offset += got;
-    }
-
-    *out_image = image;
-    *out_size = stat.size;
-    return 0;
-}
-
-static int launch_filed_from_rootfs(int fs_fd)
-{
-    if (fs_fd < 16) {
-        return -1;
-    }
-    int status = mark_fd_inherit(fs_fd, "filed fs-backend fd");
-    if (status != 0) {
-        return status;
-    }
-
-    unsigned char *image = NULL;
-    uint64_t image_size = 0;
-    status = seed0root_read_rootfs_file(fs_fd, "/sbin/filed.elf", &image, &image_size);
-    if (status != 0) {
-        fprintf(stderr, "[seed0root] filed read failed status=%d\n", status);
-        return status;
-    }
-    const uint64_t filed_endpoint_rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_DUP |
-        PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL |
-        PACHA_FD_RIGHT_SET_FLAGS |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_SEND |
-        PACHA_FD_RIGHT_RECV |
-        PACHA_FD_RIGHT_CALL |
-        PACHA_FD_RIGHT_TRANSFER;
-    const int filed_endpoint_fd = pacha_ipc_endpoint_create(
-        filed_endpoint_rights,
-        PACHA_FD_FLAG_INHERIT);
     if (filed_endpoint_fd < 16) {
-        free(image);
-        fprintf(stderr, "[seed0root] filed endpoint create failed status=%d\n", filed_endpoint_fd);
-        return filed_endpoint_fd;
+        return -1;
     }
-    status = mark_fd_inherit(filed_endpoint_fd, "filed public endpoint fd");
+
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_filed_wire_page(&page_fd, &page);
     if (status != 0) {
-        free(image);
-        (void)pacha_fd_close(filed_endpoint_fd);
         return status;
     }
 
-    const filed_bootstrap_t bootstrap = {
-        .magic = FILED_BOOTSTRAP_MAGIC,
-        .fs_backend_fd = (uint64_t)(uint32_t)fs_fd,
-        .public_endpoint_fd = (uint64_t)(uint32_t)filed_endpoint_fd,
-        .flags = 0,
-    };
-    const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap, sizeof(bootstrap), "filed bootstrap fd");
-    if (bootstrap_fd < 16) {
-        free(image);
-        (void)pacha_fd_close(filed_endpoint_fd);
-        fprintf(stderr, "[seed0root] filed bootstrap fd create failed status=%d\n", bootstrap_fd);
-        return bootstrap_fd;
+    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    exec->dir_handle = 0;
+    exec->flags = 0;
+    exec->argc = 1;
+    exec->envc = 1;
+    snprintf(exec->path, sizeof(exec->path), "%s", "/cmd/libc_vfs_exec_smoke.elf");
+    snprintf(exec->argv0, sizeof(exec->argv0), "%s", "/cmd/libc_vfs_exec_smoke.elf");
+    snprintf(exec->argv[0], sizeof(exec->argv[0]), "%s", "/cmd/libc_vfs_exec_smoke.elf");
+    snprintf(exec->envp[0], sizeof(exec->envp[0]), "%s", "PACHA_LIBC_VFS_EXEC_PARENT=1");
+
+    struct pacha_ipc_fd reply_fds[2];
+    memset(reply_fds, 0, sizeof(reply_fds));
+    struct pacha_ipc_msg reply;
+    status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_EXEC_PATH,
+        0x5eed0f11u,
+        page_fd,
+        0,
+        &reply,
+        reply_fds,
+        2);
+    seed0root_destroy_filed_wire_page(page_fd, page);
+    if (status == -2) {
+        return 0;
     }
-    struct seed0root_loaded_process loaded;
-    status = load_elf_process("/sbin/filed.elf", image, image_size, &loaded);
-    free(image);
     if (status != 0) {
-        (void)pacha_fd_close(bootstrap_fd);
-        (void)pacha_fd_close(filed_endpoint_fd);
-        fprintf(stderr, "[seed0root] filed load failed status=%d\n", status);
+        fprintf(stderr, "[seed0root] libc vfs exec smoke failed status=%d\n", status);
         return status;
     }
-    status = start_loaded_process(&loaded, "/sbin/filed.elf", bootstrap_fd, NULL);
-    (void)pacha_fd_close(bootstrap_fd);
-    if (status != 0) {
-        (void)pacha_fd_close(filed_endpoint_fd);
-        fprintf(stderr, "[seed0root] filed start failed status=%d\n", status);
-        return status;
+    if (reply.fd_count < 2 || reply_fds[0].fd < 16 || reply_fds[1].fd < 16) {
+        fprintf(stderr,
+            "[seed0root] libc vfs exec smoke reply invalid fd_count=%llu process_fd=%llu thread_fd=%llu\n",
+            (unsigned long long)reply.fd_count,
+            (unsigned long long)reply_fds[0].fd,
+            (unsigned long long)reply_fds[1].fd);
+        if (reply_fds[1].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[1].fd);
+        }
+        if (reply_fds[0].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[0].fd);
+        }
+        return -2;
     }
-    (void)pacha_fd_close(filed_endpoint_fd);
-    printf("[seed0root] filed ready\n");
-    return 0;
+
+    const int process_fd = (int)reply_fds[0].fd;
+    const int thread_fd = (int)reply_fds[1].fd;
+    printf("[seed0root] libc vfs exec smoke started process_fd=%d thread_fd=%d\n", process_fd, thread_fd);
+
+    status = seed0root_wait_process(process_fd, "libc vfs exec smoke");
+    (void)pacha_fd_close(thread_fd);
+    (void)pacha_fd_close(process_fd);
+    return status;
 }
 
 static int seed0root_connect_storage_services(int control_fd)
 {
     int block_fd = -1;
     int fs_fd = -1;
+    int filed_endpoint_fd = -1;
     int status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_BLOCK, &block_fd);
     if (status != 0) {
         return status;
@@ -873,8 +990,25 @@ static int seed0root_connect_storage_services(int control_fd)
     if (status != 0) {
         return status;
     }
-
-    status = launch_filed_from_rootfs(fs_fd);
+    status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_FILED, &filed_endpoint_fd);
+    if (status == 0 && filed_endpoint_fd >= 16) {
+        printf("[seed0root] filed ready\n");
+    }
+    if (SEED0ROOT_BOOT_BENCH && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_filed_no_cache_probe(filed_endpoint_fd);
+    }
+    if (SEED0ROOT_BOOT_BENCH && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_libc_vfs_exec_smoke(filed_endpoint_fd);
+        const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
+        printf("[seed0root] filed metrics dump status=%d\n", metrics_status);
+    }
+    if (filed_endpoint_fd >= 16) {
+        (void)pacha_fd_close(filed_endpoint_fd);
+    }
+    if (SEED0ROOT_BOOT_BENCH && status == 0) {
+        status = seed0root_fs_sync_all(fs_fd);
+        printf("[seed0root] storage clean checkpoint status=%d\n", status);
+    }
     return status;
 }
 

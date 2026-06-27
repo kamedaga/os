@@ -132,6 +132,7 @@ int pacha_ipc_endpoint_create(uint64_t rights, uint32_t flags);
 int pacha_ipc_channel_create(struct pacha_ipc_channel_pair *out, uint64_t rights, uint32_t flags);
 int pacha_ipc_send(int fd, const struct pacha_ipc_msg *msg);
 int pacha_ipc_recv(int fd, struct pacha_ipc_msg *msg);
+int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *msg, uint64_t timeout_ticks);
 int pacha_ipc_call(int fd, const struct pacha_ipc_msg *msg);
 int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg);
 

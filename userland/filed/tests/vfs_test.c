@@ -620,6 +620,88 @@ static void test_write_pwrite_and_fsync(void)
     expect_status("write preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
 }
 
+static void test_generation_updates(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    filed_vfs_open_result_t file;
+    filed_vfs_io_decision_t decision;
+    uint32_t root_dir_gen;
+    uint32_t file_obj_gen;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for generation",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for generation",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP |
+                FILED_RIGHT_STAT |
+                FILED_RIGHT_GETDENTS |
+                FILED_RIGHT_CREATE |
+                FILED_RIGHT_REMOVE,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status("generation root getdents", filed_vfs_getdents_prepare(&vfs, root.handle_id, &decision), FILED_OK);
+    root_dir_gen = decision.dir_generation;
+    expect_true("generation root starts nonzero", root_dir_gen != 0);
+
+    expect_status(
+        "generation create child",
+        filed_vfs_create_backend_child(
+            &vfs,
+            root.handle_id,
+            400,
+            FILED_VNODE_REGULAR,
+            "gen.txt",
+            FILED_RIGHT_READ | FILED_RIGHT_WRITE | FILED_RIGHT_STAT,
+            0,
+            &file),
+        FILED_OK);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status("generation root after create", filed_vfs_getdents_prepare(&vfs, root.handle_id, &decision), FILED_OK);
+    expect_true("generation create bumps dir", decision.dir_generation > root_dir_gen);
+    root_dir_gen = decision.dir_generation;
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status("generation file prepare", filed_vfs_pwrite_prepare(&vfs, file.handle_id, 0, 4, &decision), FILED_OK);
+    file_obj_gen = decision.object_generation;
+    expect_true("generation file starts nonzero", file_obj_gen != 0);
+
+    expect_status("generation note write", filed_vfs_note_write(&vfs, file.handle_id, 0, 4), FILED_OK);
+    memset(&decision, 0, sizeof(decision));
+    expect_status("generation file after write", filed_vfs_pwrite_prepare(&vfs, file.handle_id, 0, 4, &decision), FILED_OK);
+    expect_true("generation write bumps object", decision.object_generation > file_obj_gen);
+    file_obj_gen = decision.object_generation;
+
+    expect_status("generation note truncate", filed_vfs_note_truncate(&vfs, file.handle_id, 1), FILED_OK);
+    memset(&decision, 0, sizeof(decision));
+    expect_status("generation file after truncate", filed_vfs_pwrite_prepare(&vfs, file.handle_id, 0, 4, &decision), FILED_OK);
+    expect_true("generation truncate bumps object", decision.object_generation > file_obj_gen);
+    file_obj_gen = decision.object_generation;
+
+    expect_status("generation unlink child", filed_vfs_unlink_commit(&vfs, root.handle_id, "gen.txt"), FILED_OK);
+    memset(&decision, 0, sizeof(decision));
+    expect_status("generation root after unlink", filed_vfs_getdents_prepare(&vfs, root.handle_id, &decision), FILED_OK);
+    expect_true("generation unlink bumps dir", decision.dir_generation > root_dir_gen);
+
+    memset(&decision, 0, sizeof(decision));
+    expect_status("generation unlinked file alive", filed_vfs_pwrite_prepare(&vfs, file.handle_id, 0, 4, &decision), FILED_OK);
+    expect_true("generation unlink bumps object", decision.object_generation > file_obj_gen);
+
+    expect_status("close generation file", filed_vfs_close_handle(&vfs, file.handle_id), FILED_OK);
+    expect_status("generation preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
 static void test_concurrent_open_file_offset(void)
 {
     enum {
@@ -1280,6 +1362,7 @@ int main(void)
     test_directory_offset_and_exec_dup();
     test_dup_and_flags();
     test_write_pwrite_and_fsync();
+    test_generation_updates();
     test_concurrent_open_file_offset();
     test_concurrent_directory_unlink_parent_lock();
     test_concurrent_cross_directory_rename_ordering();

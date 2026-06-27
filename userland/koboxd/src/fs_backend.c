@@ -282,12 +282,14 @@ static void fs_object_refresh(koboxd_fs_object_t *object)
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
     uint64_t parent_object_id;
     uint8_t linked;
+    uint8_t dirty;
     if (object == NULL || !object->used) {
         return;
     }
     snprintf(name, sizeof(name), "%s", object->name);
     parent_object_id = object->parent_object_id;
     linked = object->linked;
+    dirty = object->dirty;
     fill_object_from_inode(
         object,
         object->object_id,
@@ -296,6 +298,7 @@ static void fs_object_refresh(koboxd_fs_object_t *object)
         object->dentry,
         name);
     object->linked = linked;
+    object->dirty = dirty;
 }
 
 static int module_symbol(kb_module_t *module, const char *name, void **out_address)
@@ -762,6 +765,10 @@ static int fs_file_writeback_inode(const koboxd_ext4_operations_t *ops, void *in
     if (commit_result != 0) {
         return commit_result;
     }
+    int group_result = kb_fs_subsystem_ext4_sync_group_free_counts(super_block);
+    if (group_result != 0) {
+        return group_result;
+    }
     return fs_sync_super_free_blocks(ops, super_block);
 }
 
@@ -1177,6 +1184,18 @@ int koboxd_fs_backend_release_object(koboxd_fs_backend_t *backend, uint64_t obje
         return -2;
     }
     if (object->linked) {
+        if (object->dirty && object->inode != NULL) {
+            koboxd_ext4_operations_t ops;
+            if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
+                return -5;
+            }
+            int flush_status = fs_file_writeback_inode(&ops, object->inode);
+            if (flush_status != 0) {
+                return flush_status;
+            }
+            object->dirty = 0;
+            fs_object_refresh(object);
+        }
         return 0;
     }
     if (object->inode == NULL) {
@@ -1266,10 +1285,7 @@ int koboxd_fs_backend_pwrite(
     }
     const int status = fs_file_write(&ops, object->inode, offset, buffer, length);
     if (status >= 0) {
-        int sync_status = fs_file_writeback_inode(&ops, object->inode);
-        if (sync_status != 0) {
-            return sync_status;
-        }
+        object->dirty = 1;
         fs_object_refresh(object);
     }
     return status;
@@ -1284,11 +1300,56 @@ int koboxd_fs_backend_fsync(koboxd_fs_backend_t *backend, uint64_t object_id)
     if (object == NULL || object->inode == NULL) {
         return -2;
     }
+    if (!object->dirty) {
+        return 0;
+    }
     koboxd_ext4_operations_t ops;
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
     }
-    return fs_file_fsync(&ops, object->inode);
+    int status = fs_file_fsync(&ops, object->inode);
+    if (status == 0) {
+        status = fs_file_writeback_inode(&ops, object->inode);
+    }
+    if (status == 0) {
+        object->dirty = 0;
+        fs_object_refresh(object);
+    }
+    return status;
+}
+
+int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
+{
+    if (backend == NULL || !backend->mounted) {
+        return -22;
+    }
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
+        return -5;
+    }
+    for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
+        koboxd_fs_object_t *object = &backend->objects[i];
+        if (!object->used || !object->dirty || object->inode == NULL) {
+            continue;
+        }
+        int status = fs_file_fsync(&ops, object->inode);
+        if (status == 0) {
+            status = fs_file_writeback_inode(&ops, object->inode);
+        }
+        if (status != 0) {
+            return status;
+        }
+        object->dirty = 0;
+        fs_object_refresh(object);
+    }
+    if (backend->mount_result.super_block != NULL) {
+        int status = kb_fs_subsystem_ext4_recount_allocator_counts(backend->mount_result.super_block);
+        if (status != 0) {
+            return status;
+        }
+        return fs_commit_superblock(&ops, backend->mount_result.super_block);
+    }
+    return 0;
 }
 
 int koboxd_fs_backend_statx(
@@ -1320,12 +1381,22 @@ int koboxd_fs_backend_getdents(
         return -22;
     }
     *out_count = 0;
-    if (dir_object_id != 1) {
-        return -95;
+
+    koboxd_fs_object_t *dir = fs_object_by_id(backend, dir_object_id);
+    if (dir == NULL || dir->inode == NULL || dir->dentry == NULL) {
+        return -2;
     }
+    if ((dir->mode & KOBOXD_MODE_TYPE_MASK) != 0040000u) {
+        return -20;
+    }
+
     size_t skipped = 0;
     for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS && *out_count < capacity; i++) {
-        if (!backend->objects[i].used || backend->objects[i].object_id == dir_object_id) {
+        if (!backend->objects[i].used ||
+            !backend->objects[i].linked ||
+            backend->objects[i].object_id == dir_object_id ||
+            backend->objects[i].parent_object_id != dir_object_id)
+        {
             continue;
         }
         if (skipped < offset) {

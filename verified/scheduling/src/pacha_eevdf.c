@@ -237,6 +237,18 @@ static void set_entity_state(
   entity->state = state;
 }
 
+static void remove_entity_at(
+    const pacha_eevdf_runqueue *rq,
+    size_t index,
+    pacha_eevdf_runqueue *out) {
+  *out = *rq;
+  for (size_t i = index; i + 1 < rq->entity_count; ++i) {
+    out->entities[i] = rq->entities[i + 1];
+  }
+  --out->entity_count;
+  pacha_eevdf_empty_entity(&out->entities[out->entity_count]);
+}
+
 static void place_entity_at_floor(
     pacha_eevdf_entity *entity,
     int64_t floor_vruntime) {
@@ -333,25 +345,8 @@ pacha_eevdf_rc pacha_eevdf_add(
     return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   if (find_entity_index(rq, thread_id, &existing)) {
-    if (rq->entities[existing].state != PACHA_EEVDF_EXITED) {
-      return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
-    }
-    pacha_eevdf_empty_entity(&entity);
-    entity.thread_id = thread_id;
-    entity.generation = generation;
-    entity.weight = weight;
-    entity.slice_ns = slice_ns;
-    entity.vruntime = rq->min_vruntime;
-    entity.eligible_time = rq->min_vruntime;
-    entity.deadline = rq->min_vruntime;
-    entity.state = PACHA_EEVDF_RUNNABLE;
-    if (!refresh_deadline(&entity, rq->min_vruntime, &refreshed)) {
-      return fail_runqueue(PACHA_EEVDF_ERR_OVERFLOW, rq, out);
-    }
-    pacha_eevdf_runqueue next = *rq;
-    next.entities[existing] = refreshed;
-    refresh_runqueue(&next);
-    return ok_runqueue(&next, out);
+    (void)existing;
+    return fail_runqueue(PACHA_EEVDF_ERR_INVALID, rq, out);
   }
   if (rq->entity_count >= PACHA_EEVDF_MAX_ENTITIES) {
     return fail_runqueue(PACHA_EEVDF_ERR_FULL, rq, out);
@@ -434,7 +429,7 @@ pacha_eevdf_rc pacha_eevdf_exit(
     return fail_runqueue(PACHA_EEVDF_ERR_STATE, rq, out);
   }
   pacha_eevdf_runqueue next = *rq;
-  set_entity_state(&next.entities[index], PACHA_EEVDF_EXITED);
+  remove_entity_at(rq, index, &next);
   refresh_runqueue(&next);
   return ok_runqueue(&next, out);
 }

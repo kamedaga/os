@@ -30,6 +30,7 @@ void koboxd_ipc_service_init(koboxd_ipc_service_t *service)
     endpoint_init(&service->block, KOBOXD_IPC_ENDPOINT_BLOCK, "block", 1);
     endpoint_init(&service->fs_backend, KOBOXD_IPC_ENDPOINT_FS_BACKEND, "fs-backend", 1);
     endpoint_init(&service->event, KOBOXD_IPC_ENDPOINT_EVENT, "event", 0);
+    endpoint_init(&service->filed, KOBOXD_IPC_ENDPOINT_FILED, "filed", 0);
     service->control.ready = 1;
 }
 
@@ -41,6 +42,7 @@ void koboxd_ipc_service_mark_storage_ready(koboxd_ipc_service_t *service)
     service->block.ready = 1;
     service->fs_backend.ready = 1;
     service->event.ready = 1;
+    service->filed.ready = 1;
 }
 
 koboxd_ipc_endpoint_t *koboxd_ipc_service_endpoint(koboxd_ipc_service_t *service, koboxd_ipc_endpoint_kind_t kind)
@@ -53,6 +55,7 @@ koboxd_ipc_endpoint_t *koboxd_ipc_service_endpoint(koboxd_ipc_service_t *service
     case KOBOXD_IPC_ENDPOINT_BLOCK: return &service->block;
     case KOBOXD_IPC_ENDPOINT_FS_BACKEND: return &service->fs_backend;
     case KOBOXD_IPC_ENDPOINT_EVENT: return &service->event;
+    case KOBOXD_IPC_ENDPOINT_FILED: return &service->filed;
     default: return NULL;
     }
 }
@@ -71,6 +74,7 @@ const char *koboxd_ipc_endpoint_kind_name(koboxd_ipc_endpoint_kind_t kind)
     case KOBOXD_IPC_ENDPOINT_BLOCK: return "block";
     case KOBOXD_IPC_ENDPOINT_FS_BACKEND: return "fs-backend";
     case KOBOXD_IPC_ENDPOINT_EVENT: return "event";
+    case KOBOXD_IPC_ENDPOINT_FILED: return "filed";
     default: return "unknown";
     }
 }
@@ -119,6 +123,7 @@ void koboxd_ipc_service_debug_dump(const koboxd_ipc_service_t *service, FILE *ou
     dump_endpoint(&service->block, out);
     dump_endpoint(&service->fs_backend, out);
     dump_endpoint(&service->event, out);
+    dump_endpoint(&service->filed, out);
 }
 
 int koboxd_ipc_make_request(

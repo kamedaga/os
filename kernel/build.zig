@@ -1,39 +1,5 @@
 const std = @import("std");
 
-fn addVerifiedSchedulerObject(
-    b: *std.Build,
-    mod: *std.Build.Module,
-    source: []const u8,
-    basename: []const u8,
-) void {
-    const clang_path = freestandingClang(b);
-    const clang = b.addSystemCommand(&.{
-        clang_path,
-        "-target",
-        "x86_64-unknown-windows-msvc",
-        "-ffreestanding",
-        "-fno-builtin",
-        "-fno-stack-protector",
-        "-fno-exceptions",
-        "-mno-red-zone",
-        "-mno-stack-arg-probe",
-        "-O2",
-        "-g0",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        "-I../verified/scheduling/include",
-        "-c",
-        source,
-        "-o",
-    });
-    clang.addFileInput(b.path(source));
-    clang.addFileInput(b.path("../verified/scheduling/include/pacha_eevdf.h"));
-    clang.addFileInput(b.path("../verified/scheduling/include/pacha_sched.h"));
-    const object = clang.addOutputFileArg(basename);
-    mod.addObjectFile(object);
-}
-
 fn addVerifiedSchedulerHostObject(
     b: *std.Build,
     mod: *std.Build.Module,
@@ -58,7 +24,40 @@ fn addVerifiedSchedulerHostObject(
     });
     clang.addFileInput(b.path(source));
     clang.addFileInput(b.path("../verified/scheduling/include/pacha_eevdf.h"));
-    clang.addFileInput(b.path("../verified/scheduling/include/pacha_sched.h"));
+    clang.addFileInput(b.path("../verified/scheduling/include/pacha_kernel_sched.h"));
+    const object = clang.addOutputFileArg(basename);
+    mod.addObjectFile(object);
+}
+
+fn addVerifiedSchedulerElfObject(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    source: []const u8,
+    basename: []const u8,
+) void {
+    const clang_path = freestandingClang(b);
+    const clang = b.addSystemCommand(&.{
+        clang_path,
+        "-target",
+        "x86_64-unknown-none-elf",
+        "-ffreestanding",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-fno-exceptions",
+        "-mno-red-zone",
+        "-O2",
+        "-g0",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I../verified/scheduling/include",
+        "-c",
+        source,
+        "-o",
+    });
+    clang.addFileInput(b.path(source));
+    clang.addFileInput(b.path("../verified/scheduling/include/pacha_eevdf.h"));
+    clang.addFileInput(b.path("../verified/scheduling/include/pacha_kernel_sched.h"));
     const object = clang.addOutputFileArg(basename);
     mod.addObjectFile(object);
 }
@@ -68,51 +67,13 @@ fn freestandingClang(b: *std.Build) []const u8 {
         (b.graph.environ_map.get("CAPOS_FREESTANDING_CC") orelse "clang");
 }
 
-fn pruneZeroSizedBootx64Artifacts(io: std.Io) bool {
-    const cwd = std.Io.Dir.cwd();
-    var repaired = false;
-    const installed_bootx64 = "zig-out/bin/EFI/BOOT/BOOTX64.EFI";
-    if (cwd.statFile(io, installed_bootx64, .{})) |stat| {
-        if (stat.size == 0) {
-            cwd.deleteFile(io, installed_bootx64) catch |err| {
-                std.debug.print("build.zig: failed to remove zero-byte zig-out BOOTX64.EFI: {s}\n", .{@errorName(err)});
-            };
-            std.debug.print("build.zig: removed zero-byte zig-out BOOTX64.EFI\n", .{});
-            repaired = true;
-        }
-    } else |_| {}
-
-    var cache_dir = cwd.openDir(io, ".zig-cache/o", .{ .iterate = true }) catch return repaired;
-    defer cache_dir.close(io);
-
-    var walker = cache_dir.walk(std.heap.page_allocator) catch return repaired;
-    defer walker.deinit();
-
-    var removed_count: usize = 0;
-    while (walker.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(entry.path), "BOOTX64.efi")) continue;
-        const stat = cache_dir.statFile(io, entry.path, .{}) catch continue;
-        if (stat.size != 0) continue;
-        cache_dir.deleteFile(io, entry.path) catch continue;
-        removed_count += 1;
-        repaired = true;
-    }
-    if (removed_count != 0) {
-        std.debug.print("build.zig: removed {d} zero-byte BOOTX64 cache artifact(s)\n", .{removed_count});
-    }
-    return repaired;
-}
-
 pub fn build(b: *std.Build) void {
-    _ = pruneZeroSizedBootx64Artifacts(b.graph.io);
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const efi_target = b.resolveTargetQuery(.{
+    const limine_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
-        .os_tag = .uefi,
-        .abi = .msvc,
+        .os_tag = .freestanding,
+        .abi = .none,
     });
     const kernel_abi_root_mod = b.createModule(.{
         .root_source_file = b.path("abi/kernel_abi_root.zig"),
@@ -124,7 +85,7 @@ pub fn build(b: *std.Build) void {
     });
     kernel_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     addVerifiedSchedulerHostObject(b, kernel_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf.o");
-    addVerifiedSchedulerHostObject(b, kernel_mod, "../verified/scheduling/src/pacha_sched.c", "pacha_sched.o");
+    addVerifiedSchedulerHostObject(b, kernel_mod, "../verified/scheduling/src/pacha_kernel_sched.c", "pacha_kernel_sched.o");
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("../tests/kernel_state.zig"),
@@ -157,26 +118,37 @@ pub fn build(b: *std.Build) void {
     const run_fd_ipc_minimal_tests = b.addRunArtifact(fd_ipc_minimal_tests);
     test_step.dependOn(&run_fd_ipc_minimal_tests.step);
 
-    const efi_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = efi_target,
+    const limine_mod = b.createModule(.{
+        .root_source_file = b.path("../bootloader/limine/kernel_entry.zig"),
+        .target = limine_target,
         .optimize = .ReleaseSmall,
-        .code_model = .small,
-        .strip = true,
+        .code_model = .kernel,
+        .strip = false,
     });
-    efi_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
-    addVerifiedSchedulerObject(b, efi_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf.obj");
-    addVerifiedSchedulerObject(b, efi_mod, "../verified/scheduling/src/pacha_sched.c", "pacha_sched.obj");
-    const efi_app = b.addExecutable(.{
-        .name = "BOOTX64",
-        .root_module = efi_mod,
+    const kernel_boot_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/bootloader_api.zig"),
+        .target = limine_target,
+        .optimize = .ReleaseSmall,
+        .code_model = .kernel,
     });
+    kernel_boot_api_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    limine_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    limine_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
+    addVerifiedSchedulerElfObject(b, limine_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_limine.o");
+    addVerifiedSchedulerElfObject(b, limine_mod, "../verified/scheduling/src/pacha_kernel_sched.c", "pacha_kernel_sched_limine.o");
+    const limine_kernel = b.addExecutable(.{
+        .name = "pacha-kernel",
+        .root_module = limine_mod,
+    });
+    limine_kernel.entry = .{ .symbol_name = "_start" };
+    limine_kernel.setLinkerScript(b.path("../bootloader/limine/kernel.ld"));
+    const install_limine = b.addInstallArtifact(limine_kernel, .{
+        .dest_sub_path = "limine/pacha-kernel.elf",
+    });
+    const limine_step = b.step("limine", "Build Limine kernel ELF");
+    limine_step.dependOn(&install_limine.step);
 
-    const install_efi = b.addInstallArtifact(efi_app, .{
-        .dest_sub_path = "EFI/BOOT/BOOTX64.EFI",
-    });
-    // `pactl` owns userland, bootfs/rootfs packaging, and host tools.
-    // Keep `zig build efi` focused on kernel-side boot artifacts only.
-    const efi_step = b.step("efi", "Build UEFI kernel application");
-    efi_step.dependOn(&install_efi.step);
+    const default_step = b.step("kernel", "Build bootable kernel ELF");
+    default_step.dependOn(&install_limine.step);
+    b.default_step.dependOn(&install_limine.step);
 }

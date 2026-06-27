@@ -12,6 +12,12 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/libipc/src/ipc.c
   ${REPO_ROOT}/userland/libcapsule/src/capsule.c
   ${REPO_ROOT}/userland/libpacha/src/syscall.c
+  ${REPO_ROOT}/userland/filed/src/dispatch.c
+  ${REPO_ROOT}/userland/filed/src/exec.c
+  ${REPO_ROOT}/userland/filed/src/fd_ipc.c
+  ${REPO_ROOT}/userland/filed/src/kobox_backend.c
+  ${REPO_ROOT}/userland/filed/src/runtime.c
+  ${REPO_ROOT}/userland/filed/src/vfs.c
   ${REPO_ROOT}/_kobox/src/device/device_backend.c
   ${REPO_ROOT}/_kobox/src/device/pachaos_capsule/device_pachaos_capsule.c
   ${REPO_ROOT}/_kobox/src/host_interface/interface.c
@@ -69,12 +75,15 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_usb.c
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_input.c
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_work.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/control_endpoint.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/filed_direct_backend.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/fs_endpoint.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_wire.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/storage_runtime.c
 )
 
 string(REPLACE ";" " " KOBOXD_RUNTIME_SOURCES_ENV "${KOBOXD_RUNTIME_SOURCES}")
@@ -85,16 +94,35 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOXD_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${KOBOXD_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/koboxd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/filed/include/filed/bootstrap.h"
+    "${REPO_ROOT}/userland/filed/include/filed/dispatch.h"
+    "${REPO_ROOT}/userland/filed/include/filed/exec.h"
+    "${REPO_ROOT}/userland/filed/include/filed/fd_ipc.h"
+    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
+    "${REPO_ROOT}/userland/filed/include/filed/kobox_backend.h"
+    "${REPO_ROOT}/userland/filed/include/filed/page_cache.h"
+    "${REPO_ROOT}/userland/filed/include/filed/runtime.h"
+    "${REPO_ROOT}/userland/filed/include/filed/vfs.h"
+    "${REPO_ROOT}/userland/filed/src/dispatch.c"
+    "${REPO_ROOT}/userland/filed/src/exec.c"
+    "${REPO_ROOT}/userland/filed/src/fd_ipc.c"
+    "${REPO_ROOT}/userland/filed/src/kobox_backend.c"
+    "${REPO_ROOT}/userland/filed/src/runtime.c"
+    "${REPO_ROOT}/userland/filed/src/vfs.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/control_endpoint.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/control_endpoint.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/filed_direct_backend.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/filed_direct_backend.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_backend.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fs_endpoint.c"
@@ -103,6 +131,8 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_service.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_wire.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc_wire.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/storage_runtime.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/storage_runtime.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOXD_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"

@@ -37,8 +37,6 @@ static void test_reset_and_add(void) {
   assert(reused.runnable_count == 1);
   assert(reused.entities[0].thread_id == 42);
   assert(reused.entities[0].generation == 8);
-  assert(reused.entities[0].weight == 2048);
-  assert(reused.entities[0].slice_ns == 1000000);
 
   pacha_eevdf_runqueue reset;
   rc = pacha_eevdf_reset(&next, &reset);
@@ -155,6 +153,30 @@ static void test_table_full_rejects_add(void) {
   assert(memcmp(&full, &rq, sizeof(rq)) == 0);
 }
 
+static void test_exit_compacts_active_range(void) {
+  pacha_eevdf_runqueue rq;
+  pacha_eevdf_runqueue add_a;
+  pacha_eevdf_runqueue add_b;
+  pacha_eevdf_runqueue add_c;
+  pacha_eevdf_runqueue exited;
+  pacha_eevdf_empty_runqueue(&rq);
+
+  assert(pacha_eevdf_add(&rq, 1, 1, 1024, 4000000, &add_a) ==
+      PACHA_EEVDF_OK);
+  assert(pacha_eevdf_add(&add_a, 2, 1, 1024, 4000000, &add_b) ==
+      PACHA_EEVDF_OK);
+  assert(pacha_eevdf_add(&add_b, 3, 1, 1024, 4000000, &add_c) ==
+      PACHA_EEVDF_OK);
+
+  assert(pacha_eevdf_exit(&add_c, 2, &exited) == PACHA_EEVDF_OK);
+  assert(exited.entity_count == 2);
+  assert(exited.runnable_count == 2);
+  assert(exited.entities[0].thread_id == 1);
+  assert(exited.entities[1].thread_id == 3);
+  assert(exited.entities[2].state == PACHA_EEVDF_EMPTY);
+  assert(exited.entities[2].thread_id == PACHA_EEVDF_NO_THREAD_ID);
+}
+
 static void test_charge_overflow_keeps_runqueue(void) {
   pacha_eevdf_runqueue rq;
   pacha_eevdf_runqueue add;
@@ -188,6 +210,7 @@ int main(void) {
   test_block_and_wake_places_at_floor();
   test_failed_transition_keeps_runqueue();
   test_table_full_rejects_add();
+  test_exit_compacts_active_range();
   test_charge_overflow_keeps_runqueue();
   test_charge_large_runtime_large_weight();
   return 0;

@@ -5,7 +5,8 @@ pub const syscall_ipc_send: u64 = 44;
 pub const syscall_ipc_recv: u64 = 45;
 pub const syscall_ipc_call: u64 = 46;
 pub const syscall_ipc_reply: u64 = 47;
-pub const syscall_ipc_last: u64 = syscall_ipc_reply;
+pub const syscall_ipc_recv_wait: u64 = 48;
+pub const syscall_ipc_last: u64 = syscall_ipc_recv_wait;
 pub const syscall_ipc_count: u64 = syscall_ipc_last - syscall_ipc_first + 1;
 
 pub const max_inline_words: u64 = 4;

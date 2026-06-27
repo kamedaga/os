@@ -4,28 +4,6 @@ From Pacha.Scheduling Require Import ProtocolModel EevdfModel EevdfInvariants.
 Import ListNotations.
 Open Scope Z_scope.
 
-Definition eevdf_empty_entity : eevdf_entity :=
-  {|
-    ee_thread_id := no_thread_id;
-    ee_generation := 0;
-    ee_weight := 0;
-    ee_slice_ns := 0;
-    ee_service_ns := 0;
-    ee_vruntime := 0;
-    ee_eligible_time := 0;
-    ee_deadline := 0;
-    ee_state := EEmpty;
-  |}.
-
-Definition eevdf_empty_runqueue : eevdf_runqueue :=
-  {|
-    er_entities := repeat eevdf_empty_entity eevdf_max_entities;
-    er_entity_count := 0%nat;
-    er_runnable_count := 0%nat;
-    er_virtual_time := 0;
-    er_min_vruntime := 0;
-  |}.
-
 Definition eevdf_valid_entity_params
     (weight slice_ns : Z)
   : bool :=
@@ -143,9 +121,7 @@ Definition eevdf_exit
           match ee_state entity with
           | EExited => fail EevdfErrState rq
           | EEmpty => fail EevdfErrState rq
-          | _ =>
-              ok (refresh_runqueue
-                (replace_entity rq index (set_entity_state entity EExited)))
+          | _ => ok (refresh_runqueue (remove_entity_at rq index))
           end
       end
   end.
@@ -369,8 +345,7 @@ Theorem eevdf_exit_success_spec :
     ee_state entity <> EEmpty ->
     ee_state entity <> EExited ->
     eevdf_exit rq thread_id =
-      ok (refresh_runqueue
-        (replace_entity rq index (set_entity_state entity EExited))).
+      ok (refresh_runqueue (remove_entity_at rq index)).
 Proof.
   intros rq thread_id index entity Hfind Hlookup Hnot_empty Hnot_exited.
   unfold eevdf_exit.
@@ -387,9 +362,7 @@ Theorem eevdf_exit_success_formula :
       lookup_entity rq index = Some entity /\
       ee_state entity <> EEmpty /\
       ee_state entity <> EExited /\
-      rq' =
-        refresh_runqueue
-          (replace_entity rq index (set_entity_state entity EExited)).
+      rq' = refresh_runqueue (remove_entity_at rq index).
 Proof.
   intros rq thread_id rq' Hexit.
   unfold eevdf_exit in Hexit.

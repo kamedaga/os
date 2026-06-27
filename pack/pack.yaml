@@ -4,7 +4,7 @@ artifacts: ".artifacts"
 state: ".artifacts/pack"
 kernel:
   dir: "kernel"
-  step: "efi"
+  step: "limine"
 disk:
   image: ".artifacts/disk.img"
   sizeMiB: 4096
@@ -438,6 +438,21 @@ apps:
       rebuild: ["bash", "tools/build_wsl_musl_smoke.sh"]
     out: "MUSLSMOK.ELF"
     rootfs: "/cmd/musl_smoke.elf"
+  libc_vfs_exec_smoke:
+    file:
+      path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"
+      rebuild: ["bash", "-lc", "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ PACHAOS_MUSL_APP_SOURCE=musl/pachaos/smoke/libc_vfs_exec.c bash musl/pachaos/build/build-smokes.sh .artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"]
+      input:
+        - "musl/pachaos/smoke/libc_vfs_exec.c"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/upstream/src/dirent/closedir.c"
+        - "musl/upstream/src/dirent/opendir.c"
+        - "musl/upstream/src/fcntl/open.c"
+        - "musl/upstream/src/stat/fstat.c"
+        - "musl/upstream/src/unistd/pwrite.c"
+    out: "LIBCVFEX.ELF"
+    rootfs: "/cmd/libc_vfs_exec_smoke.elf"
   pachaos_capsule:
     role: "service"
     file:
@@ -452,20 +467,6 @@ apps:
         - "userland/pachaos_capsule/include"
     out: "PCAPSULE.ELF"
     rootfs: "/srv/pachaos_capsule.elf"
-  schedulerd:
-    role: "scheduler"
-    file:
-      path: ".artifacts/cmake/schedulerd/schedulerd.elf"
-      rebuild: ["cmake", "-P", "userland/schedulerd/build.cmake"]
-      input:
-        - "verified/scheduling/src/pacha_eevdf.c"
-        - "verified/scheduling/src/pacha_sched.c"
-        - "verified/scheduling/include/pacha_eevdf.h"
-        - "verified/scheduling/include/pacha_sched.h"
-        - "userland/schedulerd/CMakeLists.txt"
-        - "userland/schedulerd/src"
-    out: "SCHEDD.ELF"
-    bootfs: "/srv/schedulerd.elf"
   storage_boot:
     role: "service"
     file:
@@ -528,6 +529,7 @@ apps:
       rebuild: ["cmake", "--build", ".artifacts/cmake/koboxd", "--parallel", "1"]
       input:
         - "userland/koboxd/CMakeLists.txt"
+        - "userland/koboxd/include"
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
         - "userland/libpacha/include"

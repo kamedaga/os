@@ -1,5 +1,6 @@
 const abi_root = @import("kernel_abi_root");
 const interrupts = @import("../interrupts.zig");
+const ipc_metric = @import("../ipc_metric.zig");
 const kernel = @import("../kernel.zig");
 const kernel_log = @import("../kernel_log.zig");
 const scheduler = @import("../scheduler.zig").connection;
@@ -228,6 +229,48 @@ fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, po
     return ready_count;
 }
 
+fn registerIpcWaitersForPoll(
+    h: anytype,
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    pollfds_va: u64,
+    count: u64,
+    timeout_ticks: u64,
+    thread_index: usize,
+    thread_generation: u32,
+) kernel.KernelError!void {
+    if (pollfds_va == 0 or count > fd_abi.max_pollfds) return kernel.KernelError.InvalidState;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const item_va = pollfds_va + i * fd_abi.pollfd_size;
+        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return kernel.KernelError.InvalidState;
+        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return kernel.KernelError.InvalidState;
+        if ((events & ~fd_abi.event_known_mask) != 0) return kernel.KernelError.InvalidState;
+        _ = timeout_ticks;
+        try state.registerIpcReadableWaiterForFd(proc, @intCast(fd_u64), events, item_va, thread_index, thread_generation);
+    }
+}
+
+fn unregisterIpcWaitersForPoll(
+    h: anytype,
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    pollfds_va: u64,
+    count: u64,
+    thread_index: usize,
+    thread_generation: u32,
+) void {
+    if (pollfds_va == 0 or count > fd_abi.max_pollfds) return;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const item_va = pollfds_va + i * fd_abi.pollfd_size;
+        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return;
+        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return;
+        if ((events & ~fd_abi.event_known_mask) != 0) return;
+        state.unregisterIpcReadableWaiterForFd(proc, @intCast(fd_u64), events, thread_index, thread_generation);
+    }
+}
+
 fn nextPollWakeDelta(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64, now_tick: u64) ?u64 {
     var min_delta: ?u64 = null;
     var i: u64 = 0;
@@ -256,11 +299,31 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     if (ready != 0) return ready;
     if (timeout_ticks == 0) return sc.syscall_err_not_ready;
 
+    const current_thread = scheduler.currentThread();
+    const current_generation = scheduler.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
+    const register_start = ipc_metric.timestamp();
+    registerIpcWaitersForPoll(h, state, proc, pollfds_va, count, timeout_ticks, current_thread, current_generation) catch |err| {
+        unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
+        return statusFromKernelError(err);
+    };
+    ipc_metric.record(.wait_register, register_start);
+    const repoll_start = ipc_metric.timestamp();
+    const ready_after_register = pollOnce(h, state, proc, pollfds_va, count, scheduler.lapic_tick_count) orelse {
+        unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
+        return sc.syscall_err_invalid;
+    };
+    ipc_metric.record(.wait_repoll, repoll_start);
+    if (ready_after_register != 0) {
+        unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
+        return ready_after_register;
+    }
+
     var block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
     if (nextPollWakeDelta(h, state, proc, pollfds_va, count, now)) |delta| {
         if (block_ticks == 0 or delta < block_ticks) block_ticks = delta;
     }
     if (h.block_current_thread_for_event(frame, true, block_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
+    unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
     return sc.syscall_err_not_ready;
 }
 
@@ -595,11 +658,17 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
             return switch (request) {
                 scheduler_abi.ioctl_query_caps => writeSchedulerCaps(h, proc, arg_va),
                 scheduler_abi.ioctl_commit => blk: {
-                    const commit = readSchedulerCommit(h, proc, arg_va) orelse break :blk sc.syscall_err_invalid;
+                    const metric_start = scheduler.externalSchedulerMetricTimestamp();
+                    const commit = readSchedulerCommit(h, proc, arg_va) orelse {
+                        scheduler.noteExternalSchedulerCommitIoctlCycles(metric_start);
+                        break :blk sc.syscall_err_invalid;
+                    };
                     const caller_thread = scheduler.currentThread();
                     if (!scheduler.commitPolicyDecision(commit.cpu_id, commit.thread_id, commit.generation, frame, sc.syscall_ok)) {
+                        scheduler.noteExternalSchedulerCommitIoctlCycles(metric_start);
                         break :blk sc.syscall_err_invalid;
                     }
+                    scheduler.noteExternalSchedulerCommitIoctlCycles(metric_start);
                     const resumed_thread = scheduler.currentThread();
                     break :blk if (resumed_thread != caller_thread) frame.rax else sc.syscall_ok;
                 },

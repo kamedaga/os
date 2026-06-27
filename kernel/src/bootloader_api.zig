@@ -1,0 +1,9 @@
+pub const boot_resources = @import("boot/boot_resources.zig");
+pub const boot_static = @import("boot/main_static.zig");
+pub const entry = @import("boot/entry.zig");
+pub const halt = @import("halt.zig");
+pub const image_range = @import("boot/image_range.zig");
+pub const kernel = @import("kernel.zig");
+pub const kernel_vm = @import("memory/kernel_vm.zig");
+pub const pmm = @import("memory/pmm.zig");
+pub const x86_platform = @import("arch/x86_64/platform.zig");

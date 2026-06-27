@@ -24,6 +24,8 @@ pub const Hooks = struct {
     page_ps: u64,
     flush_user_tlb_for_principal_va: *const fn (principal: kernel.PrincipalId, va: u64) void,
     flush_user_tlb_for_principal_range: *const fn (principal: kernel.PrincipalId, va: u64, size_bytes: usize) void,
+    kernel_pointer_paddr: *const fn (addr: usize) ?u64,
+    seed_user_pml4_with_kernel: *const fn ([]u64) void,
     seed_user_pdp_with_kernel_identity: *const fn ([]u64) void,
     seed_user_pd_with_kernel_identity: *const fn ([]u64) void,
 };
@@ -150,7 +152,15 @@ pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
 }
 
 pub fn resetUserReservations(space: *UserAddressSpace) void {
-    @memset(space.reservations[0..], .{});
+    var index: usize = 0;
+    while (index < UserAddressSpace.max_reservations) : (index += 1) {
+        space.reservations[index].base_va = 0;
+        space.reservations[index].page_count = 0;
+        space.reservations[index].generation = 0;
+        space.reservations[index].kind = .none;
+        space.reservations[index].writable = false;
+        space.reservations[index].active = false;
+    }
     space.reservation_generation = 0;
     space.next_dynamic_map_page = 0;
 }
@@ -475,7 +485,7 @@ fn releaseUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) voi
     if (findUserPdSlotForPdp(space, pml4_index, pdp_index)) |pd_slot| {
         const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
         const entry = pd_page[pd_index];
-        const pt_pa: u64 = @intFromPtr(&space.pt_pages[slot]);
+        const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pt_pages[slot])) orelse return;
         if ((entry & h.page_addr_mask) == pt_pa) {
             pd_page[pd_index] = 0;
         }
@@ -556,7 +566,7 @@ fn ensureUserPdpSlotForPml4(space: *UserAddressSpace, pml4_index: usize) ?usize 
     if (pml4_index == 0) {
         h.seed_user_pdp_with_kernel_identity(pdp_page[0..]);
     }
-    const pdp_pa: u64 = @intFromPtr(pdp_page);
+    const pdp_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(pdp_page)) orelse return null;
     if (pdp_pa >= h.four_gib) return null;
     space.pml4[pml4_index] = pdp_pa | h.page_present | h.page_rw | h.page_user;
     const next_len = slot + 1;
@@ -581,7 +591,7 @@ fn ensureUserPdSlotForPdp(space: *UserAddressSpace, pml4_index: usize, pdp_index
     const pdp_page: *[512]u64 = &space.pdp_pages[pdp_slot];
     const existing_pdpe = pdp_page[pdp_index];
     seedPdSlotFromExistingPdp(h, space, slot, pdp_index, existing_pdpe);
-    const pd_pa: u64 = @intFromPtr(&space.pd_pages[slot]);
+    const pd_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pd_pages[slot])) orelse return null;
     if (pd_pa >= h.four_gib) return null;
     pdp_page[pdp_index] = pd_pa | h.page_present | h.page_rw | h.page_user;
     const next_len = slot + 1;
@@ -638,7 +648,7 @@ pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pml4_index: usize, pdp_in
     const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
     const existing_pde = pd_page[pd_index];
     seedPtSlotFromExistingPd(space, slot, existing_pde);
-    const pt_pa: u64 = @intFromPtr(&space.pt_pages[slot]);
+    const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pt_pages[slot])) orelse return null;
     if (pt_pa >= h.four_gib) return null;
     pd_page[pd_index] = pt_pa | h.page_present | h.page_rw | h.page_user;
     const next_len = slot + 1;
@@ -1110,6 +1120,7 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     @memset(space.pml4[0..], 0);
+    h.seed_user_pml4_with_kernel(space.pml4[0..]);
     var pdp_slot_init: usize = 0;
     while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
         space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
@@ -1136,7 +1147,7 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     space.pt_page_used_len = 0;
     resetUserReservations(space);
 
-    const user_pml4_pa: u64 = @intFromPtr(&space.pml4);
+    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
     if (user_pml4_pa >= h.four_gib) return false;
     if (user_page_paddr >= h.four_gib or user_stack_paddr >= h.four_gib) return false;
 
@@ -1165,6 +1176,7 @@ pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     @memset(space.pml4[0..], 0);
+    h.seed_user_pml4_with_kernel(space.pml4[0..]);
     var pdp_slot_init: usize = 0;
     while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
         space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
@@ -1191,7 +1203,7 @@ pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
     space.pt_page_used_len = 0;
     resetUserReservations(space);
 
-    const user_pml4_pa: u64 = @intFromPtr(&space.pml4);
+    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
     if (user_pml4_pa >= h.four_gib) return false;
 
     _ = ensureUserPdpSlotForPml4(space, 0) orelse return false;

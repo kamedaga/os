@@ -7,7 +7,7 @@ const kernel_log = @import("../kernel_log.zig");
 const boot_abi = @import("abi.zig");
 const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
-const uefi_services = @import("uefi_services.zig");
+const boot_resources = @import("boot_resources.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const halt = @import("../halt.zig");
 
@@ -262,7 +262,7 @@ pub fn publishInitBootstrapDescriptorPage(
     user_page_paddr: u64,
     devices: []const ?DetectedDeviceBootstrap,
     bootfs_setup: BootFsImageSetup,
-    framebuffer_info: ?uefi_services.FramebufferInfo,
+    framebuffer_info: ?boot_resources.FramebufferInfo,
 ) void {
     const page: *volatile init_bootstrap_abi.DescriptorPage = @ptrFromInt(user_page_paddr);
     page.magic = init_bootstrap_abi.magic;
@@ -433,7 +433,7 @@ pub fn setupInitBootstrapResources(
     init_process_principal: kernel.PrincipalId,
     devices: []?DetectedDeviceBootstrap,
     bootfs_image: []const u8,
-    framebuffer_info: ?uefi_services.FramebufferInfo,
+    framebuffer_info: ?boot_resources.FramebufferInfo,
     free_list: *kernel.FreePageList,
 ) void {
     const config_page = process_factory.allocAndMapOwnedPageForProcessOrHalt(

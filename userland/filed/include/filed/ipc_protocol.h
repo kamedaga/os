@@ -28,12 +28,30 @@ enum {
     FILED_WIRE_OP_RENAME = 19,
     FILED_WIRE_OP_MKDIR = 20,
     FILED_WIRE_OP_RMDIR = 21,
+    FILED_WIRE_OP_SEEK = 22,
+    FILED_WIRE_OP_DUMP_METRICS = 23,
+    FILED_WIRE_OP_SET_CACHE_SLOTS = 24,
+    FILED_WIRE_OP_CONNECT = 25,
+    FILED_WIRE_OP_PING = 26,
+    FILED_WIRE_OP_FAST_DOORBELL = 27,
+    FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 28,
 
     FILED_WIRE_NAME_BYTES = 96,
     FILED_WIRE_IO_BYTES = 7680,
     FILED_WIRE_DIRENT_NAME_BYTES = 96,
     FILED_WIRE_DIRENT_CAPACITY = 16,
     FILED_WIRE_PAGE_BYTES = 8192,
+    FILED_WIRE_SESSION_PAGE_BYTES = 40960,
+    FILED_WIRE_FAST_MAGIC = 0x31545341464c4446ull,
+    FILED_WIRE_FAST_VERSION = 1,
+    FILED_WIRE_FAST_REQUEST_CAPACITY = 8,
+    FILED_WIRE_FAST_COMPLETION_CAPACITY = 8,
+    FILED_WIRE_FAST_PAYLOAD_SLOT_COUNT = 4,
+    FILED_WIRE_FAST_PAYLOAD_OFFSET = 4096,
+    FILED_WIRE_FAST_GENERATION_OFFSET =
+        FILED_WIRE_FAST_PAYLOAD_OFFSET +
+        FILED_WIRE_FAST_PAYLOAD_SLOT_COUNT * FILED_WIRE_PAGE_BYTES,
+    FILED_WIRE_FAST_GENERATION_CAPACITY = 64,
 
     FILED_WIRE_RIGHT_LOOKUP = 1u << 0,
     FILED_WIRE_RIGHT_READ = 1u << 1,
@@ -82,8 +100,23 @@ typedef struct filed_wire_openat {
     uint64_t dir_handle;
     uint64_t rights;
     uint64_t open_flags;
+    uint64_t object_generation;
+    uint64_t dir_generation;
+    uint64_t reserved0;
     char name[FILED_WIRE_NAME_BYTES];
 } filed_wire_openat_t;
+
+typedef struct filed_wire_validate_open_cache {
+    uint64_t cached_handle;
+    uint64_t dir_handle;
+    uint64_t rights;
+    uint64_t open_flags;
+    uint64_t object_generation;
+    uint64_t dir_generation;
+    uint64_t reserved0;
+    uint64_t reserved1;
+    char name[FILED_WIRE_NAME_BYTES];
+} filed_wire_validate_open_cache_t;
 
 typedef struct filed_wire_io {
     uint64_t handle;
@@ -92,6 +125,53 @@ typedef struct filed_wire_io {
     uint8_t data[FILED_WIRE_IO_BYTES];
 } filed_wire_io_t;
 
+typedef struct filed_wire_fast_header {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t flags;
+    uint64_t request_capacity;
+    uint64_t completion_capacity;
+    uint64_t payload_slot_count;
+    uint64_t payload_slot_size;
+    uint64_t payload_offset;
+    uint64_t request_head;
+    uint64_t request_tail;
+    uint64_t completion_head;
+    uint64_t completion_tail;
+    uint64_t doorbell_seq;
+    uint64_t completion_seq;
+    uint64_t generation_offset;
+    uint64_t generation_capacity;
+} filed_wire_fast_header_t;
+
+typedef struct filed_wire_fast_request {
+    uint64_t request_id;
+    uint64_t opcode;
+    uint64_t flags;
+    uint64_t handle;
+    uint64_t word2;
+    uint64_t offset;
+    uint64_t length;
+    uint64_t payload_slot;
+    uint64_t payload_length;
+    uint64_t timeout_ns;
+} filed_wire_fast_request_t;
+
+typedef struct filed_wire_fast_completion {
+    uint64_t request_id;
+    int64_t status;
+    uint64_t result;
+    uint64_t bytes;
+    uint64_t flags;
+} filed_wire_fast_completion_t;
+
+typedef struct filed_wire_generation_entry {
+    uint64_t seq;
+    uint64_t handle;
+    uint64_t object_generation;
+    uint64_t dir_generation;
+} filed_wire_generation_entry_t;
+
 typedef struct filed_wire_statx {
     uint64_t handle;
     uint64_t mode;
@@ -99,6 +179,8 @@ typedef struct filed_wire_statx {
     uint64_t blocks;
     uint64_t nlink;
     uint64_t kind;
+    uint64_t object_generation;
+    uint64_t dir_generation;
 } filed_wire_statx_t;
 
 typedef struct filed_wire_truncate {
@@ -107,6 +189,13 @@ typedef struct filed_wire_truncate {
     uint64_t reserved0;
     uint64_t reserved1;
 } filed_wire_truncate_t;
+
+typedef struct filed_wire_seek {
+    uint64_t handle;
+    int64_t offset;
+    uint64_t whence;
+    uint64_t reserved0;
+} filed_wire_seek_t;
 
 typedef struct filed_wire_unlink {
     uint64_t dir_handle;
@@ -152,6 +241,8 @@ typedef struct filed_wire_getdents {
     uint64_t offset;
     uint64_t capacity;
     uint64_t count;
+    uint64_t dir_generation;
+    uint64_t reserved0;
     filed_wire_dirent_t entries[FILED_WIRE_DIRENT_CAPACITY];
 } filed_wire_getdents_t;
 

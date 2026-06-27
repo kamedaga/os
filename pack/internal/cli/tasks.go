@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"capabilityos/pack/internal/bootfs"
-	"capabilityos/pack/internal/boottest"
+	bootloaderlimine "capabilityos/pack/internal/bootloader/limine"
 	"capabilityos/pack/internal/buildsys"
 	"capabilityos/pack/internal/config"
 	"capabilityos/pack/internal/diskimage"
@@ -49,6 +49,127 @@ func syncCommand(ctx *context) *cobra.Command {
 	return cmd
 }
 
+func qemuLimineCommand(ctx *context) *cobra.Command {
+	var opts qemu.Options
+	var prepare bool
+	cmd := &cobra.Command{
+		Use:   "qemu-limine",
+		Short: "Boot QEMU through Limine BIOS",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if prepare {
+				if err := prepareLimineBootImage(ctx, &opts); err != nil {
+					return err
+				}
+			} else if opts.LimineImage == "" {
+				opts.LimineImage = filepath.Join(ctx.workspace.Artifacts, "limine-boot.img")
+			}
+			ui.Task("qemu:limine")
+			opts.Progress = ui.NewProgressReporter()
+			result, err := qemu.Run(ctx.workspace, opts)
+			if err != nil {
+				return err
+			}
+			state := "finished"
+			if result.DryRun {
+				state = "dry-run"
+			} else if result.Started {
+				state = "started"
+			}
+			ui.KeyValues("QEMU Limine", [][2]string{
+				{"state", state},
+				{"firmware", firstNonEmpty(opts.Firmware, "bios")},
+				{"image", ctx.workspace.Rel(opts.LimineImage)},
+				{"log", ctx.workspace.Rel(result.Log)},
+				{"host time log", ctx.workspace.Rel(result.HostTimeLog)},
+				{"command", qemuCommandLine(result.Command)},
+			})
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&prepare, "prepare", false, "build Limine kernel/userland/bootfs image before booting")
+	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
+	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without network")
+	cmd.Flags().BoolVar(&opts.Fast, "fast", true, "reduce QEMU-side diagnostics")
+	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the QEMU command without launching")
+	cmd.Flags().StringVar(&opts.Memory, "memory", "2G", "QEMU memory size")
+	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
+	cmd.Flags().StringVar(&opts.Firmware, "firmware", "bios", "firmware path: bios or uefi")
+	cmd.Flags().StringVar(&opts.LimineImage, "image", "", "Limine boot image path")
+	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
+	return cmd
+}
+
+func prepareLimineBootImage(ctx *context, opts *qemu.Options) error {
+	ui.Task("build:kernel:limine")
+	kernel, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{
+		StepOverride: "limine",
+		Progress:     ui.NewProgressReporter(),
+	})
+	if err != nil {
+		return err
+	}
+	ui.KeyValues("Kernel", [][2]string{
+		{"step", kernel.Step},
+		{"output", ctx.workspace.Rel(kernel.Output)},
+	})
+
+	ui.Task("build:userland")
+	userland, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{Progress: ui.NewProgressReporter()})
+	if err != nil {
+		return err
+	}
+	printUserland(userland)
+
+	if err := runRootfsSync(ctx, userland, false); err != nil {
+		return err
+	}
+
+	ui.Task("gen:manifests")
+	generated, err := generateOrReuseManifests(ctx, userland.DirectoryArtifactsChanged == 0)
+	if err != nil {
+		return err
+	}
+	ui.KeyValues("Manifests", [][2]string{
+		{"bootfs", ctx.workspace.Rel(generated.Outputs.Bootfs)},
+		{"bootfs entries", fmt.Sprint(generated.Bootfs)},
+	})
+
+	ui.Task("build:bootfs")
+	bootfsPath := ctx.workspace.Path(ctx.workspace.Artifacts, "BOOTFS.IMG")
+	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter()})
+	if err != nil {
+		return err
+	}
+	ui.KeyValues("Bootfs", [][2]string{
+		{"image", ctx.workspace.Rel(image.Path)},
+		{"entries", fmt.Sprint(image.Entries)},
+		{"bytes", fmt.Sprint(image.Bytes)},
+	})
+
+	initApp, ok := bootInitApp(ctx)
+	if !ok {
+		return fmt.Errorf("missing enabled boot app")
+	}
+
+	ui.Task("build:limine-image")
+	limine, err := bootloaderlimine.BuildImageWithOptions(ctx.workspace, bootloaderlimine.Inputs{
+		KernelELF:   kernel.Output,
+		InitELF:     ctx.workspace.ArtifactPath(initApp),
+		BootfsImage: image.Path,
+	}, bootloaderlimine.Options{Progress: ui.NewProgressReporter()})
+	if err != nil {
+		return err
+	}
+	opts.LimineImage = limine.Image
+	ui.KeyValues("Limine", [][2]string{
+		{"image", ctx.workspace.Rel(limine.Image)},
+		{"config", ctx.workspace.Rel(limine.Config)},
+		{"limine", limine.Limine},
+		{"bytes", fmt.Sprint(limine.FilesBytes)},
+	})
+	return nil
+}
+
 func taskStub(task string, use string) *cobra.Command {
 	return &cobra.Command{
 		Use:   use,
@@ -65,35 +186,14 @@ func qemuCommand(ctx *context) *cobra.Command {
 	var opts qemu.Options
 	cmd := &cobra.Command{
 		Use:   "qemu",
-		Short: "Boot QEMU",
+		Short: "Boot QEMU through Limine",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.Prepare {
-				ui.Task("build:kernel")
-				kernel, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{Progress: ui.NewProgressReporter()})
-				if err != nil {
+				if err := prepareLimineBootImage(ctx, &opts); err != nil {
 					return err
 				}
-				kernelState := "built"
-				if kernel.Skipped {
-					kernelState = "up-to-date"
-				}
-				ui.KeyValues("Kernel", [][2]string{
-					{"state", kernelState},
-					{"output", ctx.workspace.Rel(kernel.Output)},
-				})
-
-				ui.Task("build:userland")
-				userland, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{Progress: ui.NewProgressReporter()})
-				if err != nil {
-					return err
-				}
-				printUserland(userland)
-				if err := runRootfsSync(ctx, userland, false); err != nil {
-					return err
-				}
-				if err := runBootfsSync(ctx, false); err != nil {
-					return err
-				}
+			} else if opts.LimineImage == "" {
+				opts.LimineImage = filepath.Join(ctx.workspace.Artifacts, "limine-boot.img")
 			}
 			ui.Task("qemu")
 			var result qemu.Result
@@ -111,9 +211,10 @@ func qemuCommand(ctx *context) *cobra.Command {
 			}
 			ui.KeyValues("QEMU", [][2]string{
 				{"state", state},
+				{"firmware", firstNonEmpty(opts.Firmware, "bios")},
+				{"image", ctx.workspace.Rel(opts.LimineImage)},
 				{"log", ctx.workspace.Rel(result.Log)},
 				{"host time log", ctx.workspace.Rel(result.HostTimeLog)},
-				{"vars", ctx.workspace.Rel(result.Vars)},
 				{"command", qemuCommandLine(result.Command)},
 			})
 			if len(result.ConsoleCommand) > 0 {
@@ -132,11 +233,13 @@ func qemuCommand(ctx *context) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.NewTerminal, "terminal", false, "alias for --new-terminal")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
 	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without virtio-net")
-	cmd.Flags().BoolVar(&opts.Fast, "fast", false, "reduce QEMU-side diagnostics while keeping OVMF boot")
+	cmd.Flags().BoolVar(&opts.Fast, "fast", true, "reduce QEMU-side diagnostics")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the QEMU command without launching")
 	cmd.Flags().StringVar(&opts.Memory, "memory", "2G", "QEMU memory size")
-	cmd.Flags().StringVar(&opts.Display, "display", "gtk,grab-on-hover=off", "QEMU display backend")
+	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
 	cmd.Flags().StringVar(&opts.Console, "console", "pty", "virtio console backend: pty or off")
+	cmd.Flags().StringVar(&opts.Firmware, "firmware", "bios", "firmware path: bios or uefi")
+	cmd.Flags().StringVar(&opts.LimineImage, "image", "", "Limine boot image path")
 	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
 	return cmd
 }
@@ -150,10 +253,6 @@ func testCommand(ctx *context) *cobra.Command {
 		},
 	}
 	cmd.AddCommand(smokeTestCommand(ctx))
-	cmd.AddCommand(fdIPCSmokeTestCommand(ctx))
-	cmd.AddCommand(deviceFDSmokeTestCommand(ctx))
-	cmd.AddCommand(muslPachaOSSmokeTestCommand(ctx))
-	cmd.AddCommand(seed0BootTestCommand(ctx))
 	cmd.AddCommand(qemuTestCommand(ctx, "qemu"))
 	return cmd
 }
@@ -172,176 +271,6 @@ func smokeTestCommand(ctx *context) *cobra.Command {
 	cmd.Flags().DurationVar(&timeout, "timeout", 45*time.Second, "maximum time to wait for the smoke marker")
 	cmd.Flags().StringVar(&marker, "marker", "[seed2_root] manifest scheduler done", "serial log marker required for success")
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
-	return cmd
-}
-
-func fdIPCSmokeTestCommand(ctx *context) *cobra.Command {
-	var timeout time.Duration
-	var noKVM bool
-	var extraArgs []string
-	cmd := &cobra.Command{
-		Use:   "fd-ipc-smoke",
-		Short: "Boot QEMU with the minimal fd IPC init smoke",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ui.Task("test:fd-ipc-smoke")
-			result, err := boottest.RunFDIPCSmoke(ctx.workspace, boottest.FDIPCSmokeOptions{
-				Timeout:   timeout,
-				NoKVM:     noKVM,
-				ExtraArgs: extraArgs,
-			})
-			state := "passed"
-			if err != nil {
-				state = "failed"
-			}
-			ui.KeyValues("FD IPC Smoke", [][2]string{
-				{"state", state},
-				{"marker", result.Marker},
-				{"timeout", result.Timeout.String()},
-				{"smoke elf", ctx.workspace.Rel(result.SmokeELF)},
-				{"kernel", ctx.workspace.Rel(result.KernelEFI)},
-				{"disk", ctx.workspace.Rel(result.Disk)},
-				{"serial", ctx.workspace.Rel(result.Serial)},
-				{"qemu log", ctx.workspace.Rel(result.Log)},
-				{"restored", fmt.Sprint(result.Restored)},
-			})
-			if err != nil {
-				return err
-			}
-			return nil
-		},
-	}
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the fd IPC smoke marker")
-	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
-	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
-	return cmd
-}
-
-func deviceFDSmokeTestCommand(ctx *context) *cobra.Command {
-	var timeout time.Duration
-	var noKVM bool
-	var extraArgs []string
-	cmd := &cobra.Command{
-		Use:   "device-fd-smoke",
-		Short: "Boot QEMU with the minimal device fd init smoke",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ui.Task("test:device-fd-smoke")
-			result, err := boottest.RunDeviceFDSmoke(ctx.workspace, boottest.DeviceFDSmokeOptions{
-				Timeout:   timeout,
-				NoKVM:     noKVM,
-				ExtraArgs: extraArgs,
-			})
-			state := "passed"
-			if err != nil {
-				state = "failed"
-			}
-			ui.KeyValues("Device FD Smoke", [][2]string{
-				{"state", state},
-				{"marker", result.Marker},
-				{"timeout", result.Timeout.String()},
-				{"smoke elf", ctx.workspace.Rel(result.SmokeELF)},
-				{"kernel", ctx.workspace.Rel(result.KernelEFI)},
-				{"disk", ctx.workspace.Rel(result.Disk)},
-				{"serial", ctx.workspace.Rel(result.Serial)},
-				{"qemu log", ctx.workspace.Rel(result.Log)},
-				{"restored", fmt.Sprint(result.Restored)},
-			})
-			if err != nil {
-				return err
-			}
-			return nil
-		},
-	}
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the device fd smoke marker")
-	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
-	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
-	return cmd
-}
-
-func muslPachaOSSmokeTestCommand(ctx *context) *cobra.Command {
-	var timeout time.Duration
-	var noKVM bool
-	var extraArgs []string
-	cmd := &cobra.Command{
-		Use:   "musl-pachaos-smoke",
-		Short: "Boot QEMU with the PachaOS musl crt/syscall scaffold",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ui.Task("test:musl-pachaos-smoke")
-			result, err := boottest.RunMuslPachaOSSmoke(ctx.workspace, boottest.MuslPachaOSSmokeOptions{
-				Timeout:   timeout,
-				NoKVM:     noKVM,
-				ExtraArgs: extraArgs,
-			})
-			state := "passed"
-			if err != nil {
-				state = "failed"
-			}
-			ui.KeyValues("Musl PachaOS Smoke", [][2]string{
-				{"state", state},
-				{"marker", result.Marker},
-				{"timeout", result.Timeout.String()},
-				{"smoke elf", ctx.workspace.Rel(result.SmokeELF)},
-				{"kernel", ctx.workspace.Rel(result.KernelEFI)},
-				{"disk", ctx.workspace.Rel(result.Disk)},
-				{"serial", ctx.workspace.Rel(result.Serial)},
-				{"qemu log", ctx.workspace.Rel(result.Log)},
-				{"restored", fmt.Sprint(result.Restored)},
-			})
-			if err != nil {
-				return err
-			}
-			return nil
-		},
-	}
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the musl PachaOS smoke marker")
-	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
-	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
-	return cmd
-}
-
-func seed0BootTestCommand(ctx *context) *cobra.Command {
-	var timeout time.Duration
-	var noKVM bool
-	var extraArgs []string
-	var marker string
-	var buildInit bool
-	cmd := &cobra.Command{
-		Use:   "seed0boot",
-		Short: "Boot QEMU with the libc-based seed0boot init",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ui.Task("test:seed0boot")
-			result, err := boottest.RunSeed0Boot(ctx.workspace, boottest.Seed0BootOptions{
-				Timeout:   timeout,
-				NoKVM:     noKVM,
-				ExtraArgs: extraArgs,
-				Marker:    marker,
-				BuildInit: buildInit,
-			})
-			state := "passed"
-			if err != nil {
-				state = "failed"
-			}
-			ui.KeyValues("Seed0boot", [][2]string{
-				{"state", state},
-				{"marker", result.Marker},
-				{"timeout", result.Timeout.String()},
-				{"seed elf", ctx.workspace.Rel(result.SeedELF)},
-				{"kernel", ctx.workspace.Rel(result.KernelEFI)},
-				{"disk", ctx.workspace.Rel(result.Disk)},
-				{"serial", ctx.workspace.Rel(result.Serial)},
-				{"qemu log", ctx.workspace.Rel(result.Log)},
-				{"restored", fmt.Sprint(result.Restored)},
-			})
-			if err != nil {
-				return err
-			}
-			return nil
-		},
-	}
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the seed0boot marker")
-	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
-	cmd.Flags().StringArrayVar(&extraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
-	cmd.Flags().StringVar(&marker, "marker", "", "serial log marker required for success")
-	cmd.Flags().BoolVar(&buildInit, "build-init", false, "build seed0boot before launching QEMU")
 	return cmd
 }
 
@@ -698,7 +627,7 @@ func runBootfsSync(ctx *context, force bool) error {
 	})
 
 	ui.Task("build:bootfs")
-	bootfsPath := ctx.workspace.Path(ctx.workspace.Kernel.Dir, "zig-out", "bin", "EFI", "BOOT", "BOOTFS.IMG")
+	bootfsPath := ctx.workspace.Path(ctx.workspace.Artifacts, "BOOTFS.IMG")
 	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter()})
 	if err != nil {
 		return err
@@ -714,71 +643,7 @@ func runBootfsSync(ctx *context, force bool) error {
 		{"bytes", fmt.Sprint(image.Bytes)},
 	})
 
-	ui.Task("sync:bootfs")
-	espManifest, err := writeESPManifest(ctx, bootfsPath)
-	if err != nil {
-		return err
-	}
-	result, err := rootsync.SyncBootfs(ctx.workspace, espManifest, rootsync.Options{Force: force, Progress: ui.NewProgressReporter()})
-	if err != nil {
-		return err
-	}
-	state := "synced"
-	if result.Skipped {
-		state = "up-to-date"
-	}
-	ui.KeyValues("ESP", [][2]string{
-		{"state", state},
-		{"disk", ctx.workspace.Rel(result.Disk)},
-		{"partition", fmt.Sprint(result.Partition)},
-		{"filesystem", dash(result.Filesystem)},
-		{"files", fmt.Sprint(result.Files)},
-		{"dirs", fmt.Sprint(result.Dirs)},
-		{"updated files", fmt.Sprint(result.Updated)},
-		{"bytes", fmt.Sprint(result.Bytes)},
-	})
 	return nil
-}
-
-func writeESPManifest(ctx *context, bootfsPath string) (string, error) {
-	bootx64 := ctx.workspace.Path(ctx.workspace.Kernel.Dir, "zig-out", "bin", "EFI", "BOOT", "BOOTX64.EFI")
-	initApp, ok := bootInitApp(ctx)
-	if !ok {
-		return "", fmt.Errorf("missing enabled boot app")
-	}
-	schedulerApp, ok := bootSchedulerApp(ctx)
-	if !ok {
-		return "", fmt.Errorf("missing enabled scheduler app")
-	}
-	initAppPath := ctx.workspace.ArtifactPath(initApp)
-	schedulerAppPath := ctx.workspace.ArtifactPath(schedulerApp)
-	for _, path := range []string{bootx64, schedulerAppPath, initAppPath, bootfsPath} {
-		info, err := os.Stat(path)
-		if err != nil {
-			return "", err
-		}
-		if info.Size() == 0 {
-			return "", fmt.Errorf("empty ESP source: %s", path)
-		}
-	}
-	path := ctx.workspace.Path(ctx.workspace.Manifests.Dir, "esp.generated.txt")
-	content := fmt.Sprintf("# Generated by pacgo. DO NOT EDIT.\n/EFI/BOOT/BOOTX64.EFI=%s\n/EFI/BOOT/SCHEDD.ELF=%s\n/EFI/BOOT/INITAPP.ELF=%s\n/EFI/BOOT/BOOTFS.IMG=%s\n", filepath.ToSlash(bootx64), filepath.ToSlash(schedulerAppPath), filepath.ToSlash(initAppPath), filepath.ToSlash(bootfsPath))
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
-		return path, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
-	}
-	return path, os.WriteFile(path, []byte(content), 0o644)
-}
-
-func bootSchedulerApp(ctx *context) (config.App, bool) {
-	for _, app := range ctx.workspace.Apps() {
-		if app.Role == "scheduler" && !ctx.workspace.Skipped(app) {
-			return app, true
-		}
-	}
-	return config.App{}, false
 }
 
 func bootInitApp(ctx *context) (config.App, bool) {
@@ -876,6 +741,15 @@ func hasDirectoryPath(paths []string) bool {
 		}
 	}
 	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func qemuCommandLine(args []string) string {

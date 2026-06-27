@@ -72,6 +72,7 @@ packaging, image sync, QEMU, and test tasks.`,
 	cmd.AddCommand(runnerCommand(ctx))
 	cmd.AddCommand(stubCommand(ctx, "image", "Create or update disk image"))
 	cmd.AddCommand(qemuCommand(ctx))
+	cmd.AddCommand(qemuLimineCommand(ctx))
 	cmd.AddCommand(qemuTestCommand(ctx, "qemu-test"))
 	cmd.AddCommand(testCommand(ctx))
 	cmd.AddCommand(stubCommand(ctx, "all", "Run the full local pipeline"))

@@ -131,7 +131,7 @@ func (w *Workspace) defaults() {
 		w.Kernel.Dir = "kernel"
 	}
 	if w.Kernel.Step == "" {
-		w.Kernel.Step = "efi"
+		w.Kernel.Step = "limine"
 	}
 	if w.Disk.SizeMiB == 0 {
 		w.Disk.SizeMiB = 512

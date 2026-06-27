@@ -27,6 +27,8 @@ pub const Hooks = struct {
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
     copy_bytes_to_user_va: *const fn (kernel.PrincipalId, u64, []const u8) bool,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
+    wake_waiting_thread_generation: *const fn (usize, u32) bool,
+    wake_waiting_thread_generation_with_rax: *const fn (usize, u32, u64) bool,
     wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
     consume_pending_signal_for_principal: *const fn (kernel.PrincipalId) bool,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
@@ -190,7 +192,7 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     };
 }
 
-pub export fn syscallDispatch(frame: *TrapFrame) callconv(.c) u64 {
+pub export fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64 {
     const result = dispatchCompactSyscall(frame);
     frame.rax = result;
     return result;

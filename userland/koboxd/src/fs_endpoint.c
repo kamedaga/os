@@ -6,6 +6,115 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+enum {
+    KOBOXD_FS_METRIC_OP_MAX = 32,
+};
+
+typedef struct koboxd_fs_metric {
+    uint64_t count;
+    uint64_t total_ns;
+    uint64_t max_ns;
+    uint64_t total_cycles;
+    uint64_t max_cycles;
+    uint64_t errors;
+} koboxd_fs_metric_t;
+
+static koboxd_fs_metric_t koboxd_fs_metrics[KOBOXD_FS_METRIC_OP_MAX];
+
+static uint64_t koboxd_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t koboxd_read_tsc(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+#else
+    return 0;
+#endif
+}
+
+static const char *koboxd_fs_op_name(uint64_t op)
+{
+    switch (op) {
+    case KOBOXD_WIRE_FS_MOUNT_ROOT: return "mount_root";
+    case KOBOXD_WIRE_FS_LOOKUP: return "lookup";
+    case KOBOXD_WIRE_FS_OPEN: return "open";
+    case KOBOXD_WIRE_FS_PREAD: return "pread";
+    case KOBOXD_WIRE_FS_PWRITE: return "pwrite";
+    case KOBOXD_WIRE_FS_STATX: return "statx";
+    case KOBOXD_WIRE_FS_GETDENTS: return "getdents";
+    case KOBOXD_WIRE_FS_FSYNC: return "fsync";
+    case KOBOXD_WIRE_FS_CREATE: return "create";
+    case KOBOXD_WIRE_FS_TRUNCATE: return "truncate";
+    case KOBOXD_WIRE_FS_UNLINK: return "unlink";
+    case KOBOXD_WIRE_FS_RENAME: return "rename";
+    case KOBOXD_WIRE_FS_MKDIR: return "mkdir";
+    case KOBOXD_WIRE_FS_RMDIR: return "rmdir";
+    case KOBOXD_WIRE_FS_RELEASE_OBJECT: return "release_object";
+    case KOBOXD_WIRE_FS_SYNC_ALL: return "sync_all";
+    default: return "unknown";
+    }
+}
+
+static void koboxd_record_fs_metric(
+    uint64_t op,
+    uint64_t start_ns,
+    uint64_t end_ns,
+    uint64_t start_cycles,
+    uint64_t end_cycles,
+    int64_t reply_status)
+{
+    if (op >= KOBOXD_FS_METRIC_OP_MAX || start_ns == 0 || end_ns < start_ns) {
+        return;
+    }
+    koboxd_fs_metric_t *metric = &koboxd_fs_metrics[op];
+    const uint64_t elapsed_ns = end_ns - start_ns;
+    metric->count++;
+    metric->total_ns += elapsed_ns;
+    if (elapsed_ns > metric->max_ns) {
+        metric->max_ns = elapsed_ns;
+    }
+    if (start_cycles != 0 && end_cycles >= start_cycles) {
+        const uint64_t elapsed_cycles = end_cycles - start_cycles;
+        metric->total_cycles += elapsed_cycles;
+        if (elapsed_cycles > metric->max_cycles) {
+            metric->max_cycles = elapsed_cycles;
+        }
+    }
+    if (reply_status != 0) {
+        metric->errors++;
+    }
+}
+
+static void koboxd_dump_fs_metrics(void)
+{
+    for (uint64_t op = 0; op < KOBOXD_FS_METRIC_OP_MAX; ++op) {
+        const koboxd_fs_metric_t *metric = &koboxd_fs_metrics[op];
+        if (metric->count == 0) {
+            continue;
+        }
+        printf(
+            "[koboxd] metric scope=fs op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu errors=%llu\n",
+            koboxd_fs_op_name(op),
+            (unsigned long long)metric->count,
+            (unsigned long long)(metric->total_ns / metric->count),
+            (unsigned long long)metric->max_ns,
+            (unsigned long long)(metric->total_cycles / metric->count),
+            (unsigned long long)metric->max_cycles,
+            (unsigned long long)metric->errors);
+    }
+}
 
 typedef struct koboxd_fs_request_ctx {
     koboxd_fs_backend_t *backend;
@@ -270,6 +379,9 @@ static void dispatch_fs_request(koboxd_fs_request_ctx_t *ctx)
     case KOBOXD_WIRE_FS_RELEASE_OBJECT:
         ctx->reply_status = koboxd_fs_backend_release_object(ctx->backend, ctx->request->word2);
         break;
+    case KOBOXD_WIRE_FS_SYNC_ALL:
+        ctx->reply_status = koboxd_fs_backend_sync_all(ctx->backend);
+        break;
     case KOBOXD_WIRE_FS_CREATE:
         handle_create(ctx);
         break;
@@ -341,10 +453,24 @@ int koboxd_fs_endpoint_serve_once(
         .reply_status = 0,
         .result = 0,
     };
+    const uint64_t op = request.word1;
+    const uint64_t start_ns = koboxd_now_ns();
+    const uint64_t start_cycles = koboxd_read_tsc();
     koboxd_fs_backend_lock(fs_backend);
     dispatch_fs_request(&ctx);
     koboxd_fs_backend_unlock(fs_backend);
+    koboxd_record_fs_metric(
+        op,
+        start_ns,
+        koboxd_now_ns(),
+        start_cycles,
+        koboxd_read_tsc(),
+        ctx.reply_status);
     cleanup_fs_request(&ctx);
+
+    if (op == KOBOXD_WIRE_FS_SYNC_ALL) {
+        koboxd_dump_fs_metrics();
+    }
 
     return koboxd_send_status_reply_ex(endpoint->endpoint_fd, request.word3, ctx.reply_status, ctx.result);
 }

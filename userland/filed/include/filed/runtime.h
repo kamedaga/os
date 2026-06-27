@@ -6,12 +6,25 @@
 #include "filed/kobox_backend.h"
 #include "filed/vfs.h"
 
+enum {
+    FILED_RUNTIME_MAX_SESSIONS = 32,
+};
+
+typedef struct filed_session {
+    int channel_fd;
+    int page_fd;
+    void *page;
+    uint64_t page_size;
+    uint8_t active;
+} filed_session_t;
+
 typedef struct filed_runtime {
     filed_vfs_t vfs;
     filed_bootstrap_t bootstrap;
     filed_kobox_backend_t backend;
     int bootstrap_fd;
     int client_endpoint_fd;
+    filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
     uint64_t request_sequence;
     uint64_t root_size;
     filed_mount_id_t root_mount_id;
