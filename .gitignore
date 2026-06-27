@@ -1,7 +1,6 @@
 # Build outputs
 .artifacts/
 .temp-docs/
-flake.lock
 tools/
 **/zig-out/
 kernel/.zig-cache/
@@ -31,6 +30,7 @@ target/
 *.dump
 *.dmp
 *.lock
+!flake.lock
 _disk_bootx64.efi
 
 # Temporary files
