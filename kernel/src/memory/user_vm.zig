@@ -126,8 +126,13 @@ const UserPageIndex = struct {
 };
 
 fn userPageIndexForVa(h: Hooks, va: u64) ?UserPageIndex {
+    return userPageIndexForVaWithLowPageZero(h, va, false);
+}
+
+fn userPageIndexForVaWithLowPageZero(h: Hooks, va: u64, allow_low_page_zero: bool) ?UserPageIndex {
     const pml4_index: usize = @intCast((va >> 39) & 0x1FF);
-    if (va < h.user_low_va or va >= h.user_top_va) return null;
+    if (va < h.user_low_va and !(allow_low_page_zero and va < 4096)) return null;
+    if (va >= h.user_top_va) return null;
     if (pml4_index >= 256) return null;
     return .{
         .pml4 = pml4_index,
@@ -676,12 +681,16 @@ fn pteFlagsForProt(h: Hooks, prot: kernel.MapProt) ?u64 {
 }
 
 fn userRangeEndVa(h: Hooks, va_start: u64, size_bytes: u64) ?u64 {
+    return userRangeEndVaWithLowPageZero(h, va_start, size_bytes, false);
+}
+
+fn userRangeEndVaWithLowPageZero(h: Hooks, va_start: u64, size_bytes: u64, allow_low_page_zero: bool) ?u64 {
     if (size_bytes == 0) return null;
     if ((va_start & 0xFFF) != 0) return null;
     const end_va, const overflow = @addWithOverflow(va_start, size_bytes - 1);
     if (overflow != 0) return null;
-    _ = userPageIndexForVa(h, va_start) orelse return null;
-    _ = userPageIndexForVa(h, end_va) orelse return null;
+    _ = userPageIndexForVaWithLowPageZero(h, va_start, allow_low_page_zero) orelse return null;
+    _ = userPageIndexForVaWithLowPageZero(h, end_va, allow_low_page_zero) orelse return null;
     return end_va;
 }
 
@@ -751,6 +760,7 @@ fn mapTrustedUserPaddrsWithProtInternal(
     paddrs: []const u64,
     prot: kernel.MapProt,
     reserve_pages: bool,
+    allow_low_page_zero: bool,
 ) bool {
     lockAddressSpaces();
     defer unlockAddressSpaces();
@@ -762,7 +772,7 @@ fn mapTrustedUserPaddrsWithProtInternal(
 
     const page_count_u64: u64 = @intCast(paddrs.len);
     const size_u64 = page_count_u64 * 4096;
-    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+    _ = userRangeEndVaWithLowPageZero(h, va_start, size_u64, allow_low_page_zero) orelse return false;
 
     var page_index: usize = 0;
     while (page_index < paddrs.len) : (page_index += 1) {
@@ -770,7 +780,7 @@ fn mapTrustedUserPaddrsWithProtInternal(
         if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
 
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
-        const index = userPageIndexForVa(h, va) orelse return false;
+        const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
         const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
         const old_entry = pt_page[index.pt];
@@ -781,7 +791,7 @@ fn mapTrustedUserPaddrsWithProtInternal(
     page_index = 0;
     while (page_index < paddrs.len) : (page_index += 1) {
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
-        const index = userPageIndexForVa(h, va) orelse return false;
+        const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
         const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
         pt_page[index.pt] = paddrs[page_index] | pte_flags;
@@ -796,7 +806,18 @@ pub fn mapTrustedUserPaddrsWithProt(
     paddrs: []const u64,
     prot: kernel.MapProt,
 ) bool {
-    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, true);
+    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, true, false);
+}
+
+pub fn mapTrustedLowPageZeroPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    if (va_start != 0 or paddrs.len != 1) return false;
+    if (!prot.read or prot.write or !prot.exec) return false;
+    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, true, true);
 }
 
 pub fn mapLazyUserPaddrsWithProt(
@@ -805,7 +826,7 @@ pub fn mapLazyUserPaddrsWithProt(
     paddrs: []const u64,
     prot: kernel.MapProt,
 ) bool {
-    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, false);
+    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, false, false);
 }
 
 pub fn remapTrustedUserPaddrsWithProt(

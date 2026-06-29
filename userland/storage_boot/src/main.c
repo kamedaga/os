@@ -1402,7 +1402,7 @@ static int load_elf_process(
             continue;
         }
         const uint64_t p_vaddr = rd64(ph + 16);
-        const uint64_t requested_va = (use_aslr && load_count == 0) ? 0 : align_down(p_vaddr + load_bias);
+        const uint64_t requested_va = (use_aslr && load_count == 0) ? PACHA_PROCESS_MAP_ANYWHERE : align_down(p_vaddr + load_bias);
         uint64_t mapped_va = 0;
         status = map_elf_segment(path, process_fd, requested_va, image, image_size, ph, i, &mapped_va);
         if (status != 0) {
@@ -1490,7 +1490,7 @@ static int start_loaded_process(
     const long stack_map = pacha_process_map(
         process_fd,
         stack_fd,
-        0,
+        PACHA_PROCESS_MAP_ANYWHERE,
         PACHA_PROCESS_DEFAULT_STACK_SIZE,
         STORAGE_BOOT_PROT_READ | STORAGE_BOOT_PROT_WRITE,
         0);

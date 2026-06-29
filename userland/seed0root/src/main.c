@@ -49,6 +49,7 @@ enum {
     SEED0ROOT_BOOT_PROFILE_MEMORY = 1u << 0,
     SEED0ROOT_BOOT_PROFILE_BENCH = 1u << 1,
     SEED0ROOT_BOOT_PROFILE_FS_WRITE = 1u << 2,
+    SEED0ROOT_BOOT_PROFILE_LPR = 1u << 3,
 };
 
 struct seed0root_bootstrap_module {
@@ -932,7 +933,8 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
         flags |=
             SEED0ROOT_BOOT_PROFILE_MEMORY |
             SEED0ROOT_BOOT_PROFILE_BENCH |
-            SEED0ROOT_BOOT_PROFILE_FS_WRITE;
+            SEED0ROOT_BOOT_PROFILE_FS_WRITE |
+            SEED0ROOT_BOOT_PROFILE_LPR;
     }
     if (seed0root_profile_has_token(profile, "memory")) {
         flags |= SEED0ROOT_BOOT_PROFILE_MEMORY;
@@ -942,6 +944,9 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
     }
     if (seed0root_profile_has_token(profile, "fs-write")) {
         flags |= SEED0ROOT_BOOT_PROFILE_FS_WRITE;
+    }
+    if (seed0root_profile_has_token(profile, "lpr")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_LPR;
     }
     printf("[seed0root] boot profile flags=%u\n", flags);
     return flags;
@@ -1063,7 +1068,8 @@ static int seed0root_run_exec_path_smoke(
     const char *const *argv,
     uint64_t argc,
     const char *env,
-    const char *label)
+    const char *label,
+    uint64_t exec_flags)
 {
     if (filed_endpoint_fd < 16 || path == NULL || label == NULL ||
         argc > FILED_WIRE_EXEC_MAX_ARGS)
@@ -1080,7 +1086,7 @@ static int seed0root_run_exec_path_smoke(
 
     filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
     exec->dir_handle = 0;
-    exec->flags = 0;
+    exec->flags = exec_flags;
     exec->argc = argc == 0 ? 1 : argc;
     exec->envc = env != NULL ? 1 : 0;
     snprintf(exec->path, sizeof(exec->path), "%s", path);
@@ -1148,7 +1154,8 @@ static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
         argv,
         1,
         "PACHA_LIBC_VFS_EXEC_PARENT=1",
-        "libc vfs exec smoke");
+        "libc vfs exec smoke",
+        0);
 }
 
 static int seed0root_run_libc_mix_bench(int filed_endpoint_fd)
@@ -1160,7 +1167,8 @@ static int seed0root_run_libc_mix_bench(int filed_endpoint_fd)
         argv,
         1,
         "PACHA_LIBC_MIX_BENCH=1",
-        "libc mix bench");
+        "libc mix bench",
+        0);
 }
 
 static int seed0root_run_libc_alloc_probe(int filed_endpoint_fd)
@@ -1172,7 +1180,21 @@ static int seed0root_run_libc_alloc_probe(int filed_endpoint_fd)
         argv,
         1,
         "PACHA_LIBC_ALLOC_PROBE=1",
-        "libc alloc probe");
+        "libc alloc probe",
+        0);
+}
+
+static int seed0root_run_lpr_minimal_smoke(int filed_endpoint_fd)
+{
+    const char *argv[] = { "/cmd/lpr_minimal_linux.elf" };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/lpr_minimal_linux.elf",
+        argv,
+        1,
+        NULL,
+        "lpr minimal smoke",
+        FILED_WIRE_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_lua_cli_bench(int filed_endpoint_fd)
@@ -1187,7 +1209,8 @@ static int seed0root_run_lua_cli_bench(int filed_endpoint_fd)
         argv,
         2,
         "PACHA_LUA_CLI_BENCH=1",
-        "lua cli bench");
+        "lua cli bench",
+        0);
 }
 
 static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
@@ -1207,7 +1230,8 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         argv,
         7,
         "PACHA_CHIBICC_CLI_BENCH=1",
-        "chibicc cli bench");
+        "chibicc cli bench",
+        0);
 }
 
 static int seed0root_connect_storage_services(int control_fd)
@@ -1244,6 +1268,9 @@ static int seed0root_connect_storage_services(int control_fd)
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_FS_WRITE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_libc_vfs_exec_smoke(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_lpr_minimal_smoke(filed_endpoint_fd);
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_MEMORY) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_libc_alloc_probe(filed_endpoint_fd);
@@ -1309,7 +1336,7 @@ static int load_elf_process(
         const unsigned char *ph = image + e_phoff + (uint64_t)i * e_phentsize;
         if (rd32(ph + 0) != SEED0ROOT_ELF_PT_LOAD) continue;
         const uint64_t p_vaddr = rd64(ph + 16);
-        const uint64_t requested_va = (use_aslr && load_count == 0) ? 0 : align_down(p_vaddr + load_bias);
+        const uint64_t requested_va = (use_aslr && load_count == 0) ? PACHA_PROCESS_MAP_ANYWHERE : align_down(p_vaddr + load_bias);
         uint64_t mapped_va = 0;
         status = map_elf_segment(path, process_fd, requested_va, image, image_size, ph, i, &mapped_va);
         if (status != 0) {
@@ -1376,7 +1403,7 @@ static int start_loaded_process(
     const long stack_map = pacha_process_map(
         process_fd,
         stack_fd,
-        0,
+        PACHA_PROCESS_MAP_ANYWHERE,
         PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         0);

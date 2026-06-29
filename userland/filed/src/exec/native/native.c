@@ -1,4 +1,4 @@
-#include "filed/exec.h"
+#include "filed/exec_native.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1169,7 +1169,7 @@ static int filed_exec_start_plan(
     const long stack_map = pacha_process_map(
         plan->process_fd,
         stack_fd,
-        0,
+        PACHA_PROCESS_MAP_ANYWHERE,
         PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         0);
@@ -1315,7 +1315,7 @@ static int filed_exec_start_plan(
     return 0;
 }
 
-int filed_exec_handle(
+int filed_exec_native_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_wire_exec_path_t *request,

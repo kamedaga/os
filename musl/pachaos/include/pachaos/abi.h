@@ -60,6 +60,8 @@ enum {
     PACHAOS_SYSCALL_IPC_RECV_WAIT = 50,
 };
 
+#define PACHAOS_PROCESS_MAP_ANYWHERE 0xffffffffffffffffull
+
 enum {
     PACHAOS_SYSCALL_OK = 0,
     PACHAOS_SYSCALL_ERR_INVALID = 1,

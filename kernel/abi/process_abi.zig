@@ -34,6 +34,7 @@ pub const state_killed: u64 = 3;
 
 pub const process_map_flag_none: u64 = 0;
 pub const process_map_known_flags_mask: u64 = process_map_flag_none;
+pub const process_map_anywhere_va: u64 = 0xffff_ffff_ffff_ffff;
 
 pub const aux_base_va: u64 = 0x0000_7000_0000_0000;
 pub const aux_page_bytes: u64 = 0x1000;

@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
   apps:
     - "alpine_clang"
@@ -378,6 +378,25 @@ apps:
       rebuild: ["bash", "musl/pachaos/build/build-runtime.sh"]
     out: "PAMUSLLD.SO"
     rootfs: "/lib/ld-musl-x86_64.so.1"
+  linux_lpr_runtime:
+    file:
+      path: ".artifacts/lpr-linux-x86_64.so"
+      rebuild: ["bash", "userland/personality/linux/build-lpr.sh", ".artifacts/lpr-linux-x86_64.so"]
+      input:
+        - "userland/personality/include"
+        - "userland/personality/linux/runtime"
+        - "userland/personality/linux/build-lpr.sh"
+    out: "LPRLINUX.SO"
+    rootfs: "/lib/pacha/lpr-linux-x86_64.so"
+  lpr_minimal_linux:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_minimal_linux.elf"
+      rebuild: ["bash", "tools/build_lpr_minimal_linux.sh", ".artifacts/userland-fixtures/lpr_minimal_linux.elf"]
+      input:
+        - "tools/build_lpr_minimal_linux.sh"
+        - "userland/fixtures/linux/lpr_minimal.S"
+    out: "LPRMIN.ELF"
+    rootfs: "/cmd/lpr_minimal_linux.elf"
   linux_abi_probe:
     file:
       path: ".artifacts/userland-fixtures/linux_abi_probe.elf"

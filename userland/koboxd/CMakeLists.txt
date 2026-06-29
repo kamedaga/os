@@ -13,7 +13,13 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/libcapsule/src/capsule.c
   ${REPO_ROOT}/userland/libpacha/src/syscall.c
   ${REPO_ROOT}/userland/filed/src/dispatch.c
-  ${REPO_ROOT}/userland/filed/src/exec.c
+  ${REPO_ROOT}/userland/filed/src/exec/router.c
+  ${REPO_ROOT}/userland/filed/src/exec/linux_lpr/elf.c
+  ${REPO_ROOT}/userland/filed/src/exec/linux_lpr/image.c
+  ${REPO_ROOT}/userland/filed/src/exec/linux_lpr/map.c
+  ${REPO_ROOT}/userland/filed/src/exec/linux_lpr/plan.c
+  ${REPO_ROOT}/userland/filed/src/exec/linux_lpr/start.c
+  ${REPO_ROOT}/userland/filed/src/exec/native/native.c
   ${REPO_ROOT}/userland/filed/src/fd_ipc.c
   ${REPO_ROOT}/userland/filed/src/kobox_backend.c
   ${REPO_ROOT}/userland/filed/src/runtime.c
@@ -94,7 +100,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOXD_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${KOBOXD_ELF}"
   DEPENDS
@@ -103,6 +109,8 @@ add_custom_command(
     "${REPO_ROOT}/userland/filed/include/filed/bootstrap.h"
     "${REPO_ROOT}/userland/filed/include/filed/dispatch.h"
     "${REPO_ROOT}/userland/filed/include/filed/exec.h"
+    "${REPO_ROOT}/userland/filed/include/filed/exec_native.h"
+    "${REPO_ROOT}/userland/filed/include/filed/exec_linux_lpr.h"
     "${REPO_ROOT}/userland/filed/include/filed/fd_ipc.h"
     "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
     "${REPO_ROOT}/userland/filed/include/filed/kobox_backend.h"
@@ -110,7 +118,14 @@ add_custom_command(
     "${REPO_ROOT}/userland/filed/include/filed/runtime.h"
     "${REPO_ROOT}/userland/filed/include/filed/vfs.h"
     "${REPO_ROOT}/userland/filed/src/dispatch.c"
-    "${REPO_ROOT}/userland/filed/src/exec.c"
+    "${REPO_ROOT}/userland/filed/src/exec/router.c"
+    "${REPO_ROOT}/userland/filed/src/exec/linux_lpr/elf.c"
+    "${REPO_ROOT}/userland/filed/src/exec/linux_lpr/image.c"
+    "${REPO_ROOT}/userland/filed/src/exec/linux_lpr/internal.h"
+    "${REPO_ROOT}/userland/filed/src/exec/linux_lpr/map.c"
+    "${REPO_ROOT}/userland/filed/src/exec/linux_lpr/plan.c"
+    "${REPO_ROOT}/userland/filed/src/exec/linux_lpr/start.c"
+    "${REPO_ROOT}/userland/filed/src/exec/native/native.c"
     "${REPO_ROOT}/userland/filed/src/fd_ipc.c"
     "${REPO_ROOT}/userland/filed/src/kobox_backend.c"
     "${REPO_ROOT}/userland/filed/src/runtime.c"

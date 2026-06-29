@@ -3616,7 +3616,8 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
 {
     filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
     const uint64_t known_flags =
-        FILED_WIRE_EXEC_INHERIT_HANDLES;
+        FILED_WIRE_EXEC_INHERIT_HANDLES |
+        FILED_WIRE_EXEC_LINUX_LPR;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
@@ -3761,7 +3762,8 @@ static int filed_dispatch_exec_path(
         FILED_WIRE_EXEC_BOOTSTRAP_FD |
         FILED_WIRE_EXEC_INHERIT_FDS |
         FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS |
-        FILED_WIRE_EXEC_INHERIT_HANDLES;
+        FILED_WIRE_EXEC_INHERIT_HANDLES |
+        FILED_WIRE_EXEC_LINUX_LPR;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;

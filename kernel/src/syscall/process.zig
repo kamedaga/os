@@ -184,10 +184,11 @@ fn mapIntoProcess(
     const process_fd: kernel.Fd = @intCast(frame.rdi);
     const vmo_fd: kernel.Fd = @intCast(frame.rsi);
     var target_va = frame.rdx;
+    const anywhere = target_va == process_abi.process_map_anywhere_va;
     const size_bytes = frame.r10;
     const prot_bits = frame.r8;
     const vmo_offset = frame.r9;
-    if ((target_va & 0xFFF) != 0 or (vmo_offset & 0xFFF) != 0) {
+    if ((!anywhere and (target_va & 0xFFF) != 0) or (vmo_offset & 0xFFF) != 0) {
         kernel_log.write("process.map failed args\n");
         return sc.syscall_err_invalid;
     }
@@ -207,6 +208,14 @@ fn mapIntoProcess(
         kernel_log.write("process.map failed prot\n");
         return sc.syscall_err_invalid;
     };
+    const low_page_zero_map =
+        !anywhere and
+        target_va == 0 and
+        aligned_size == 4096 and
+        vmo_offset == 0 and
+        prot.read and
+        !prot.write and
+        prot.exec;
     const flags: kernel.MmapFlags = .{ .fixed = true, .shared = true };
 
     const process = state.processObjectForFd(proc, process_fd, .{ .map_into = true }) orelse {
@@ -224,7 +233,7 @@ fn mapIntoProcess(
     }
     user_vm.lockAddressSpaces();
     defer user_vm.unlockAddressSpaces();
-    if (target_va == 0) {
+    if (anywhere) {
         const purpose = 0x5052_4f43_4d41_5000 ^ scheduler.lapic_tick_count ^ (@as(u64, process_fd) << 32) ^ @as(u64, vmo_fd);
         target_va = state.findRandomizedFreeUserMapVa(target_owner, aligned_size, purpose) catch |err| switch (err) {
             kernel.KernelError.TableFull => {
@@ -249,6 +258,8 @@ fn mapIntoProcess(
         },
     };
 
+    if (!prot.read and !prot.write and !prot.exec) return target_va;
+
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
     const offset_pages: usize = @intCast(vmo_offset / 4096);
@@ -265,13 +276,21 @@ fn mapIntoProcess(
             return sc.syscall_err_map;
         };
     }
-    if (!prot.read and !prot.write and !prot.exec) return target_va;
-    if (!user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
-        .read = prot.read,
-        .write = prot.write,
-        .exec = prot.exec,
-        .pkey = prot.pkey,
-    })) {
+    const map_ok = if (low_page_zero_map)
+        user_vm.mapTrustedLowPageZeroPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
+            .read = prot.read,
+            .write = prot.write,
+            .exec = prot.exec,
+            .pkey = prot.pkey,
+        })
+    else
+        user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
+            .read = prot.read,
+            .write = prot.write,
+            .exec = prot.exec,
+            .pkey = prot.pkey,
+        });
+    if (!map_ok) {
         kernel_log.write("process.map failed map-paddrs\n");
         state.munmapRangeWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
         return sc.syscall_err_map;
