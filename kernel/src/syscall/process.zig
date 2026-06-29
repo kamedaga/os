@@ -10,15 +10,16 @@ const sc = @import("numbers.zig");
 
 const fd_abi = abi_root.fd_abi;
 const process_abi = abi_root.process_abi;
+const vm_abi = abi_root.vm_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 
 fn protFromBits(bits: u64) ?kernel.VmaProt {
-    if ((bits & ~(fd_abi.prot_read | fd_abi.prot_write | fd_abi.prot_exec)) != 0) return null;
+    if ((bits & ~(vm_abi.prot_read | vm_abi.prot_write | vm_abi.prot_exec)) != 0) return null;
     return .{
-        .read = (bits & fd_abi.prot_read) != 0,
-        .write = (bits & fd_abi.prot_write) != 0,
-        .exec = (bits & fd_abi.prot_exec) != 0,
+        .read = (bits & vm_abi.prot_read) != 0,
+        .write = (bits & vm_abi.prot_write) != 0,
+        .exec = (bits & vm_abi.prot_exec) != 0,
     };
 }
 
@@ -253,14 +254,14 @@ fn mapIntoProcess(
     const offset_pages: usize = @intCast(vmo_offset / 4096);
     const vmo_ref = state.nativeVmoRefForFd(proc, vmo_fd) orelse {
         kernel_log.write("process.map failed vmo-fd\n");
-        state.munmapExactWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
+        state.munmapRangeWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
         return sc.syscall_err_invalid;
     };
     var i: usize = 0;
     while (i < page_count) : (i += 1) {
         paddrs[i] = state.nativeVmoPagePaddr(vmo_ref, offset_pages + i) orelse {
             kernel_log.write("process.map failed missing-page\n");
-            state.munmapExactWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
+            state.munmapRangeWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
             return sc.syscall_err_map;
         };
     }
@@ -272,7 +273,7 @@ fn mapIntoProcess(
         .pkey = prot.pkey,
     })) {
         kernel_log.write("process.map failed map-paddrs\n");
-        state.munmapExactWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
+        state.munmapRangeWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
         return sc.syscall_err_map;
     }
     return target_va;

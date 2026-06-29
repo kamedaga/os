@@ -20,10 +20,7 @@ pub const syscall_timerfd_create: u64 = 35;
 pub const syscall_timerfd_settime: u64 = 36;
 pub const syscall_timerfd_gettime: u64 = 37;
 pub const syscall_vmo_create: u64 = 38;
-pub const syscall_mmap: u64 = 39;
-pub const syscall_munmap: u64 = 40;
-pub const syscall_mprotect: u64 = 41;
-pub const syscall_fd_last: u64 = syscall_mprotect;
+pub const syscall_fd_last: u64 = syscall_vmo_create;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
 pub const flag_cloexec: u32 = 1 << 0;
@@ -69,19 +66,6 @@ pub const known_common_rights_mask: u64 =
     right_share |
     right_pager_attach |
     right_pager_fault;
-
-pub const prot_read: u64 = 1 << 0;
-pub const prot_write: u64 = 1 << 1;
-pub const prot_exec: u64 = 1 << 2;
-
-pub const mmap_fixed: u64 = 1 << 0;
-pub const mmap_fixed_noreplace: u64 = 1 << 1;
-pub const mmap_private: u64 = 1 << 2;
-pub const mmap_shared: u64 = 1 << 3;
-pub const mmap_anonymous: u64 = 1 << 4;
-pub const mmap_noreserve: u64 = 1 << 5;
-pub const mmap_pkey_shift: u64 = 8;
-pub const mmap_pkey_mask: u64 = 0xF << mmap_pkey_shift;
 
 pub const fd_kind_none: u64 = 0;
 pub const fd_kind_process: u64 = 1;

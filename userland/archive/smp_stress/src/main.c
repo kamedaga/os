@@ -100,7 +100,7 @@ static int exercise_memory(unsigned iteration)
     }
 
     int status = expect_status_ok(pacha_syscall3(
-        PACHA_FD_SYSCALL_MPROTECT,
+        PACHA_VM_SYSCALL_MPROTECT,
         (uint64_t)(uintptr_t)mem,
         size,
         PACHA_PROT_READ));
@@ -113,7 +113,7 @@ static int exercise_memory(unsigned iteration)
     (void)sample;
 
     status = expect_status_ok(pacha_syscall3(
-        PACHA_FD_SYSCALL_MPROTECT,
+        PACHA_VM_SYSCALL_MPROTECT,
         (uint64_t)(uintptr_t)mem,
         size,
         PACHA_PROT_READ | PACHA_PROT_WRITE));

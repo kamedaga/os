@@ -514,7 +514,8 @@ test "fd close and munmap release native vmo lifetimes independently" {
     try std.testing.expect(s.fdEntryConst(p0, fd) == null);
     try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
 
-    try s.munmapExact(p0, 0x4200_0000, 4096);
+    var free_list = FreePageList{};
+    try s.munmapRangeWithFreeList(p0, 0x4200_0000, 4096, &free_list);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
     try std.testing.expect(s.vmaEntryConst(p0, 0x4200_0000) == null);
 }
@@ -552,7 +553,7 @@ test "native vmo pages return to free list after vma and fd release" {
     _ = try s.mmapFd(p0, fd, 0x4400_0000, 8192, vmaProt(.{ .read = true, .write = true }), mmapFlags(.{ .anonymous = true }), 0);
     try s.closeFdWithFreeList(p0, fd, &free_list);
     try std.testing.expectEqual(original_free - 2, free_list.len);
-    try s.munmapExactWithFreeList(p0, 0x4400_0000, 8192, &free_list);
+    try s.munmapRangeWithFreeList(p0, 0x4400_0000, 8192, &free_list);
     try std.testing.expectEqual(original_free, free_list.len);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
 }
@@ -574,6 +575,6 @@ test "native vma fault mapping resolves backing page without page capability" {
     try std.testing.expect(!mapping.prot.write);
 
     try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, true, false) == null);
-    try s.munmapExactWithFreeList(p0, 0x4500_0000, 4096, &free_list);
+    try s.munmapRangeWithFreeList(p0, 0x4500_0000, 4096, &free_list);
     try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, false, false) == null);
 }

@@ -31,11 +31,13 @@
 #define PACHAOS_SYSCALL_MMAP 39
 #define PACHAOS_SYSCALL_MUNMAP 40
 #define PACHAOS_SYSCALL_MPROTECT 41
-#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 43
-#define PACHAOS_SYSCALL_IPC_SEND 44
-#define PACHAOS_SYSCALL_IPC_RECV 45
-#define PACHAOS_SYSCALL_IPC_CALL 46
-#define PACHAOS_SYSCALL_IPC_RECV_WAIT 48
+#define PACHAOS_SYSCALL_MREMAP 42
+#define PACHAOS_SYSCALL_MADVISE 43
+#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 45
+#define PACHAOS_SYSCALL_IPC_SEND 46
+#define PACHAOS_SYSCALL_IPC_RECV 47
+#define PACHAOS_SYSCALL_IPC_CALL 48
+#define PACHAOS_SYSCALL_IPC_RECV_WAIT 50
 
 #define PACHAOS_FD_FLAG_CLOEXEC 1
 #define PACHAOS_FD_FLAG_NONBLOCK 2
@@ -73,6 +75,9 @@
 #define LINUX_MAP_ANONYMOUS 32
 #define LINUX_MAP_NORESERVE 0x4000
 #define LINUX_MAP_FIXED_NOREPLACE 0x100000
+#define LINUX_MREMAP_MAYMOVE 1
+#define LINUX_MREMAP_FIXED 2
+#define LINUX_MREMAP_DONTUNMAP 4
 #define LINUX_FUTEX_WAIT 0
 #define LINUX_FUTEX_WAKE 1
 #define LINUX_AT_SYMLINK_NOFOLLOW 0x100
@@ -516,6 +521,15 @@ static __inline long __pachaos_raw4(long n, long a1, long a2, long a3, long a4)
 	unsigned long ret;
 	register long r10 __asm__("r10") = a4;
 	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10) : "rcx", "r11", "memory");
+	return ret;
+}
+
+static __inline long __pachaos_raw5(long n, long a1, long a2, long a3, long a4, long a5)
+{
+	unsigned long ret;
+	register long r10 __asm__("r10") = a4;
+	register long r8 __asm__("r8") = a5;
+	__asm__ __volatile__ ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
 	return ret;
 }
 
@@ -3337,15 +3351,27 @@ static __inline long __pachaos_brk(long requested)
 	if (__pachaos_brk_base && requested != 0) {
 		unsigned char *want = (unsigned char *)requested;
 		if (want >= __pachaos_brk_base && want <= __pachaos_brk_limit) {
+			unsigned long old_page = __pachaos_page_align_up((unsigned long)__pachaos_brk_cur);
+			unsigned long new_page = __pachaos_page_align_up((unsigned long)want);
 			if (want > __pachaos_brk_cur) {
-				unsigned long old_page = __pachaos_page_align_up((unsigned long)__pachaos_brk_cur);
-				unsigned long new_page = __pachaos_page_align_up((unsigned long)want);
 				if (new_page > old_page) {
 					long status = __pachaos_raw3(
 						PACHAOS_SYSCALL_MPROTECT,
 						(long)old_page,
 						(long)(new_page - old_page),
 						PACHAOS_PROT_READ|PACHAOS_PROT_WRITE);
+					if (status != 0) {
+						__sync_lock_release(&__pachaos_brk_lock);
+						return result;
+					}
+				}
+			} else if (want < __pachaos_brk_cur) {
+				if (old_page > new_page) {
+					long status = __pachaos_raw3(
+						PACHAOS_SYSCALL_MPROTECT,
+						(long)new_page,
+						(long)(old_page - new_page),
+						0);
 					if (status != 0) {
 						__sync_lock_release(&__pachaos_brk_lock);
 						return result;
@@ -3359,6 +3385,35 @@ static __inline long __pachaos_brk(long requested)
 
 	__sync_lock_release(&__pachaos_brk_lock);
 	return result;
+}
+
+static __inline long __pachaos_madvise(long addr, long len, long advice)
+{
+	switch (advice) {
+	case 0:  /* MADV_NORMAL */
+	case 1:  /* MADV_RANDOM */
+	case 2:  /* MADV_SEQUENTIAL */
+	case 3:  /* MADV_WILLNEED */
+	case 4:  /* MADV_DONTNEED */
+	case 8:  /* MADV_FREE */
+	case 14: /* MADV_HUGEPAGE */
+	case 15: /* MADV_NOHUGEPAGE */
+	case 16: /* MADV_DONTDUMP */
+	case 17: /* MADV_DODUMP */
+	case 20: /* MADV_COLD */
+	case 21: /* MADV_PAGEOUT */
+		return __pachaos_status(__pachaos_raw3(PACHAOS_SYSCALL_MADVISE, addr, len, advice));
+	default:
+		return -22;
+	}
+}
+
+static __inline long __pachaos_mremap(long old_addr, long old_len, long new_len, long flags, long new_addr)
+{
+	if (flags & ~(LINUX_MREMAP_MAYMOVE|LINUX_MREMAP_FIXED)) return -22;
+	if ((flags & LINUX_MREMAP_FIXED) && !(flags & LINUX_MREMAP_MAYMOVE)) return -22;
+	if (!(flags & LINUX_MREMAP_FIXED) && new_addr != 0) return -22;
+	return __pachaos_mmap_result(__pachaos_raw5(PACHAOS_SYSCALL_MREMAP, old_addr, old_len, new_len, flags, new_addr));
 }
 
 static __inline long __pachaos_poll_events_from_linux(long events)
@@ -3447,6 +3502,7 @@ static __inline long __syscall2(long n, long a1, long a2)
 	case __NR_getcwd: return __pachaos_getcwd((char *)a1, a2);
 	case __NR_brk: return __pachaos_brk(a1);
 	case __NR_munmap: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, a1, a2));
+	case __NR_madvise: return __pachaos_madvise(a1, a2, 0);
 	case __NR_clock_gettime: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_CLOCK_GETTIME, a1, a2));
 	case __NR_nanosleep: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_NANOSLEEP, a1, a2));
 	case __NR_fstat: return __pachaos_filed_fstat(a1, (void *)a2);
@@ -3487,6 +3543,7 @@ static __inline long __syscall3(long n, long a1, long a2, long a3)
 	case __NR_ioctl: return __pachaos_status(__pachaos_raw3(PACHAOS_SYSCALL_FD_IOCTL, a1, a2, a3));
 	case __NR_poll: return __pachaos_poll((struct __pachaos_linux_pollfd *)a1, a2, a3);
 	case __NR_mprotect: return __pachaos_status(__pachaos_raw3(PACHAOS_SYSCALL_MPROTECT, a1, a2, __pachaos_prot(a3)));
+	case __NR_madvise: return __pachaos_madvise(a1, a2, a3);
 	case __NR_open: return __pachaos_openat_dispatch(LINUX_AT_FDCWD, (const char *)a1, a2);
 	case __NR_lseek: return __pachaos_filed_lseek(a1, a2, a3);
 	case __NR_fcntl: return __pachaos_filed_fcntl(a1, a2, a3);
@@ -3537,6 +3594,8 @@ static __inline long __syscall4(long n, long a1, long a2, long a3, long a4)
 static __inline long __syscall5(long n, long a1, long a2, long a3, long a4, long a5)
 {
 	switch (n) {
+	case __NR_mremap:
+		return __pachaos_mremap(a1, a2, a3, a4, a5);
 	case __NR_renameat2:
 		if (a5 != 0) return -22;
 		return __pachaos_filed_renameat(a1, (const char *)a2, a3, (const char *)a4);

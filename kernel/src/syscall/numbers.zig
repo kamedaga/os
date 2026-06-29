@@ -5,6 +5,7 @@ const fd_abi = abi_root.fd_abi;
 const ipc_abi = abi_root.ipc_abi;
 const process_abi = abi_root.process_abi;
 const runtime_abi = abi_root.runtime_abi;
+const vm_abi = abi_root.vm_abi;
 
 pub const syscall_log: u64 = 1;
 pub const syscall_process_create: u64 = process_abi.syscall_process_create;
@@ -46,9 +47,11 @@ pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
-pub const syscall_mmap: u64 = fd_abi.syscall_mmap;
-pub const syscall_munmap: u64 = fd_abi.syscall_munmap;
-pub const syscall_mprotect: u64 = fd_abi.syscall_mprotect;
+pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
+pub const syscall_munmap: u64 = vm_abi.syscall_munmap;
+pub const syscall_mprotect: u64 = vm_abi.syscall_mprotect;
+pub const syscall_mremap: u64 = vm_abi.syscall_mremap;
+pub const syscall_madvise: u64 = vm_abi.syscall_madvise;
 
 pub const syscall_ipc_endpoint_create: u64 = ipc_abi.syscall_ipc_endpoint_create;
 pub const syscall_ipc_channel_create: u64 = ipc_abi.syscall_ipc_channel_create;
@@ -124,6 +127,8 @@ test "native syscall numbers are contiguous" {
         syscall_mmap,
         syscall_munmap,
         syscall_mprotect,
+        syscall_mremap,
+        syscall_madvise,
         syscall_ipc_endpoint_create,
         syscall_ipc_channel_create,
         syscall_ipc_send,

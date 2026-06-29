@@ -170,23 +170,23 @@ int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
 }
 
 void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
-    const long result = pacha_syscall6(PACHA_FD_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
+    const long result = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
     if (result < 4096) return (void *)0;
     return (void *)(uintptr_t)result;
 }
 
 void *pacha_mmap_anonymous(uint64_t size, uint64_t prot, uint64_t flags) {
-    const long result = pacha_syscall6(PACHA_FD_SYSCALL_MMAP, 0, 0, size, prot, flags | PACHA_MMAP_ANONYMOUS, 0);
+    const long result = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, 0, 0, size, prot, flags | PACHA_MMAP_ANONYMOUS, 0);
     if (result < 4096) return (void *)0;
     return (void *)(uintptr_t)result;
 }
 
 int pacha_munmap(void *addr, uint64_t size) {
-    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)addr, size));
+    return pacha_status_to_int(pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)addr, size));
 }
 
 static long pacha_mmap_raw(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
-    return pacha_syscall6(PACHA_FD_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
+    return pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
 }
 
 uint64_t pacha_mmap_pkey_flags(uint64_t flags, uint32_t pkey) {

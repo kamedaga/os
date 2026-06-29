@@ -250,7 +250,7 @@ static int map_elf_segment(
         return -3;
     }
     const long mmap_result = pacha_syscall6(
-        PACHA_FD_SYSCALL_MMAP,
+        PACHA_VM_SYSCALL_MMAP,
         (uint64_t)(uint32_t)vmo_fd,
         0,
         map_size,
@@ -1015,7 +1015,7 @@ static int seed0root_create_wire_page(uint64_t size, int *out_fd, void **out_map
         return fd;
     }
     const long map_result = pacha_syscall6(
-        PACHA_FD_SYSCALL_MMAP,
+        PACHA_VM_SYSCALL_MMAP,
         (uint64_t)(uint32_t)fd,
         0,
         size,

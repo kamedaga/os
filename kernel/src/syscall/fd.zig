@@ -9,37 +9,38 @@ const sc = @import("numbers.zig");
 
 const fd_abi = abi_root.fd_abi;
 const scheduler_abi = abi_root.scheduler_abi;
+const vm_abi = abi_root.vm_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_fd_wake_owners = kernel.fd_table_entries;
 
 fn protFromBits(bits: u64) ?kernel.VmaProt {
-    if ((bits & ~(fd_abi.prot_read | fd_abi.prot_write | fd_abi.prot_exec)) != 0) return null;
+    if ((bits & ~(vm_abi.prot_read | vm_abi.prot_write | vm_abi.prot_exec)) != 0) return null;
     return .{
-        .read = (bits & fd_abi.prot_read) != 0,
-        .write = (bits & fd_abi.prot_write) != 0,
-        .exec = (bits & fd_abi.prot_exec) != 0,
+        .read = (bits & vm_abi.prot_read) != 0,
+        .write = (bits & vm_abi.prot_write) != 0,
+        .exec = (bits & vm_abi.prot_exec) != 0,
     };
 }
 
 fn mmapFlagsFromBits(bits: u64) ?kernel.MmapFlags {
-    const known = fd_abi.mmap_fixed |
-        fd_abi.mmap_fixed_noreplace |
-        fd_abi.mmap_private |
-        fd_abi.mmap_shared |
-        fd_abi.mmap_anonymous |
-        fd_abi.mmap_noreserve |
-        fd_abi.mmap_pkey_mask;
+    const known = vm_abi.mmap_fixed |
+        vm_abi.mmap_fixed_noreplace |
+        vm_abi.mmap_private |
+        vm_abi.mmap_shared |
+        vm_abi.mmap_anonymous |
+        vm_abi.mmap_noreserve |
+        vm_abi.mmap_pkey_mask;
     if ((bits & ~known) != 0) return null;
-    if ((bits & fd_abi.mmap_private) != 0 and (bits & fd_abi.mmap_shared) != 0) return null;
+    if ((bits & vm_abi.mmap_private) != 0 and (bits & vm_abi.mmap_shared) != 0) return null;
     return .{
-        .fixed = (bits & fd_abi.mmap_fixed) != 0,
-        .fixed_noreplace = (bits & fd_abi.mmap_fixed_noreplace) != 0,
-        .private = (bits & fd_abi.mmap_private) != 0,
-        .shared = (bits & fd_abi.mmap_shared) != 0,
-        .anonymous = (bits & fd_abi.mmap_anonymous) != 0,
-        .noreserve = (bits & fd_abi.mmap_noreserve) != 0,
-        .pkey = @intCast((bits & fd_abi.mmap_pkey_mask) >> fd_abi.mmap_pkey_shift),
+        .fixed = (bits & vm_abi.mmap_fixed) != 0,
+        .fixed_noreplace = (bits & vm_abi.mmap_fixed_noreplace) != 0,
+        .private = (bits & vm_abi.mmap_private) != 0,
+        .shared = (bits & vm_abi.mmap_shared) != 0,
+        .anonymous = (bits & vm_abi.mmap_anonymous) != 0,
+        .noreserve = (bits & vm_abi.mmap_noreserve) != 0,
+        .pkey = @intCast((bits & vm_abi.mmap_pkey_mask) >> vm_abi.mmap_pkey_shift),
     };
 }
 
@@ -486,32 +487,30 @@ fn mapVmoFd(
         if (!(state.userMapRangeIsFree(proc, base_va, aligned_size) catch false)) return sc.syscall_err_invalid;
     }
 
-    const vmo_ref = if (flags.anonymous) blk: {
+    if (flags.anonymous) {
         if (vmo_offset != 0) return sc.syscall_err_invalid;
-        break :blk state.createAnonymousVmaWithPages(proc, base_va, aligned_size, prot, flags, free_list) catch |err| {
+        _ = state.createAnonymousVmaWithPages(proc, base_va, aligned_size, prot, flags, free_list) catch |err| {
             switch (err) {
                 kernel.KernelError.TableFull => return sc.syscall_err_alloc,
                 else => return sc.syscall_err_invalid,
             }
         };
-    } else blk: {
-        const ref = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
-        _ = state.mmapFd(proc, fd, base_va, aligned_size, prot, flags, vmo_offset) catch |err| switch (err) {
-            kernel.KernelError.TableFull => return sc.syscall_err_alloc,
-            else => return sc.syscall_err_invalid,
-        };
-        break :blk ref;
-    };
+        return base_va;
+    }
 
-    if (flags.anonymous) return base_va;
+    const vmo_ref = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
+    _ = state.mmapFd(proc, fd, base_va, aligned_size, prot, flags, vmo_offset) catch |err| switch (err) {
+        kernel.KernelError.TableFull => return sc.syscall_err_alloc,
+        else => return sc.syscall_err_invalid,
+    };
 
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
-    const offset_pages: usize = if (flags.anonymous) 0 else @intCast(vmo_offset / 4096);
+    const offset_pages: usize = @intCast(vmo_offset / 4096);
     var i: usize = 0;
     while (i < page_count) : (i += 1) {
         paddrs[i] = state.nativeVmoPagePaddr(vmo_ref, offset_pages + i) orelse {
-            state.munmapExactWithFreeList(proc, base_va, aligned_size, free_list) catch {};
+            state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
             return sc.syscall_err_map;
         };
     }
@@ -522,7 +521,7 @@ fn mapVmoFd(
         .exec = prot.exec,
         .pkey = prot.pkey,
     })) {
-        state.munmapExactWithFreeList(proc, base_va, aligned_size, free_list) catch {};
+        state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
         return sc.syscall_err_map;
     }
     return base_va;
@@ -567,6 +566,56 @@ fn mprotectVmaRange(
         .pkey = prot.pkey,
     })) return sc.syscall_err_map;
     state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
+
+fn mremapVmaRange(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    free_list: *kernel.FreePageList,
+    old_va: u64,
+    old_len: u64,
+    new_len: u64,
+    flags_bits: u64,
+    new_va: u64,
+) u64 {
+    if ((old_va & 0xFFF) != 0 or old_len == 0 or new_len == 0) return sc.syscall_err_invalid;
+    if (new_va != 0 and (new_va & 0xFFF) != 0) return sc.syscall_err_invalid;
+    const old_size = pageAlignUp(old_len) orelse return sc.syscall_err_invalid;
+    const new_size = pageAlignUp(new_len) orelse return sc.syscall_err_invalid;
+    if (old_size / 4096 > kernel.max_vmo_backing_pages or new_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
+    if ((flags_bits & ~vm_abi.mremap_known_flags) != 0) return sc.syscall_err_invalid;
+    const may_move = (flags_bits & vm_abi.mremap_maymove) != 0;
+    const fixed = (flags_bits & vm_abi.mremap_fixed) != 0;
+    if (fixed and !may_move) return sc.syscall_err_invalid;
+    if (!fixed and new_va != 0) return sc.syscall_err_invalid;
+
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
+
+    const result = state.mremapRangeWithFreeList(proc, old_va, old_size, new_size, new_va, may_move, fixed, free_list) catch |err| switch (err) {
+        kernel.KernelError.OutOfFreePages => return sc.syscall_err_alloc,
+        kernel.KernelError.TableFull => return sc.syscall_err_alloc,
+        else => return sc.syscall_err_invalid,
+    };
+    if (fixed and !user_vm.unmapPresentUserLinearRegion(proc, new_va, @intCast(new_size))) return sc.syscall_err_map;
+    if (result != old_va or new_size < old_size) {
+        const unmap_va = if (result == old_va) old_va + new_size else old_va;
+        const unmap_size = if (result == old_va) old_size - new_size else old_size;
+        if (unmap_size != 0 and !user_vm.unmapPresentUserLinearRegion(proc, unmap_va, @intCast(unmap_size))) return sc.syscall_err_map;
+    }
+    return result;
+}
+
+fn madviseVmaRange(
+    base_va: u64,
+    size_bytes: u64,
+    advice: u64,
+) u64 {
+    if (size_bytes == 0) return sc.syscall_ok;
+    if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
+    if (!(advice <= 4 or advice == 8 or (advice >= 14 and advice <= 17) or advice == 20 or advice == 21)) return sc.syscall_err_invalid;
+    _ = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
 
@@ -746,16 +795,17 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         ) catch sc.syscall_err_alloc,
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
+            if (frame.rsi == 0 or (frame.rdi & 0xFFF) != 0) break :blk sc.syscall_err_invalid;
             const size = pageAlignUp(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             user_vm.lockAddressSpaces();
             defer user_vm.unlockAddressSpaces();
-            const vma = state.vmaEntryConst(proc, frame.rdi) orelse break :blk sc.syscall_err_invalid;
-            if (vma.size_bytes != size) break :blk sc.syscall_err_invalid;
             if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) break :blk sc.syscall_err_map;
-            state.munmapExactWithFreeList(proc, frame.rdi, size, h.free_list) catch break :blk sc.syscall_err_map;
+            state.munmapRangeWithFreeList(proc, frame.rdi, size, h.free_list) catch break :blk sc.syscall_err_map;
             break :blk sc.syscall_ok;
         },
         sc.syscall_mprotect => mprotectVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
+        sc.syscall_mremap => mremapVmaRange(state, proc, h.free_list, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8),
+        sc.syscall_madvise => madviseVmaRange(frame.rdi, frame.rsi, frame.rdx),
         else => null,
     };
 }
