@@ -23,6 +23,8 @@ type Options struct {
 	Display     string
 	Console     string
 	Firmware    string
+	DiskImage   string
+	DiskFormat  string
 	NoKVM       bool
 	NoNet       bool
 	Fast        bool
@@ -53,12 +55,15 @@ type commandPlan struct {
 }
 
 type SmokeOptions struct {
-	Timeout   time.Duration
-	NoKVM     bool
-	NoNet     bool
-	ExtraArgs []string
-	Marker    string
-	Progress  progress.Reporter
+	Timeout     time.Duration
+	NoKVM       bool
+	NoNet       bool
+	LimineImage string
+	DiskImage   string
+	DiskFormat  string
+	ExtraArgs   []string
+	Marker      string
+	Progress    progress.Reporter
 }
 
 type SmokeResult struct {
@@ -255,12 +260,15 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 	}
 	span.Set(1, "building qemu command")
 	plan, err := commandArgs(workspace, Options{
-		Display:   "none",
-		Console:   "pty",
-		NoKVM:     opts.NoKVM,
-		NoNet:     opts.NoNet,
-		Fast:      true,
-		ExtraArgs: opts.ExtraArgs,
+		Display:     "none",
+		Console:     "pty",
+		NoKVM:       opts.NoKVM,
+		NoNet:       opts.NoNet,
+		Fast:        true,
+		LimineImage: opts.LimineImage,
+		DiskImage:   opts.DiskImage,
+		DiskFormat:  opts.DiskFormat,
+		ExtraArgs:   opts.ExtraArgs,
 	})
 	if err != nil {
 		span.Fail("qemu command failed")
@@ -713,14 +721,33 @@ func limineImagePath(workspace *config.Workspace, image string) (string, error) 
 	return image, nil
 }
 
+func qemuDiskPathAndFormat(workspace *config.Workspace, opts Options) (string, string, error) {
+	diskPath := workspace.Path(workspace.Disk.Image)
+	if opts.DiskImage != "" {
+		if filepath.IsAbs(opts.DiskImage) {
+			diskPath = opts.DiskImage
+		} else {
+			diskPath = workspace.Path(opts.DiskImage)
+		}
+	}
+	if _, err := os.Stat(diskPath); err != nil {
+		return "", "", err
+	}
+	diskFormat := opts.DiskFormat
+	if diskFormat == "" {
+		diskFormat = "raw"
+	}
+	return diskPath, diskFormat, nil
+}
+
 func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Options) (commandPlan, error) {
 	imagePath := opts.LimineImage
 	imagePath, err := limineImagePath(workspace, imagePath)
 	if err != nil {
 		return commandPlan{}, err
 	}
-	diskPath := workspace.Path(workspace.Disk.Image)
-	if _, err := os.Stat(diskPath); err != nil {
+	diskPath, diskFormat, err := qemuDiskPathAndFormat(workspace, opts)
+	if err != nil {
 		return commandPlan{}, err
 	}
 	if opts.Memory == "" {
@@ -745,7 +772,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	}
 	args = append(args,
 		"-drive", "file="+imagePath+",format=raw,if=ide",
-		"-drive", "if=none,file="+diskPath+",format=raw,id=rootdisk",
+		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root",
 		"-boot", "order=c",
 		"-no-reboot",
@@ -774,8 +801,8 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if err != nil {
 		return commandPlan{}, err
 	}
-	diskPath := workspace.Path(workspace.Disk.Image)
-	if _, err := os.Stat(diskPath); err != nil {
+	diskPath, diskFormat, err := qemuDiskPathAndFormat(workspace, opts)
+	if err != nil {
 		return commandPlan{}, err
 	}
 	codePath := firstExisting(os.Getenv("CAPOS_OVMF_CODE"), "/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd")
@@ -813,7 +840,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "if=pflash,format=raw,file=" + varsPath,
 		"-drive", "if=none,file=" + imagePath + ",format=raw,id=limineboot",
 		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
-		"-drive", "if=none,file=" + diskPath + ",format=raw,id=rootdisk",
+		"-drive", "if=none,file=" + diskPath + ",format=" + diskFormat + ",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
 		"-boot", "order=c",
 		"-no-reboot",

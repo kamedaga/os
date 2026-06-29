@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -272,6 +273,148 @@ func smokeTestCommand(ctx *context) *cobra.Command {
 	cmd.Flags().StringVar(&marker, "marker", "[seed2_root] manifest scheduler done", "serial log marker required for success")
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
 	return cmd
+}
+
+func profileSmokeCommand(ctx *context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "smoke",
+		Short: "Run focused boot smoke profiles",
+	}
+	cmd.AddCommand(profileRunCommand(ctx, "memory", "memory", "[seed0root] libc alloc probe completed state=2 exit=0", 30*time.Second))
+	cmd.AddCommand(profileRunCommand(ctx, "fs-write", "fs-write", "[seed0root] storage clean checkpoint status=0", 30*time.Second))
+	cmd.AddCommand(profileRunCommand(ctx, "all", "all", "[seed0root] storage clean checkpoint status=0", 30*time.Second))
+	return cmd
+}
+
+func profileBenchCommand(ctx *context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "bench",
+		Short: "Run focused boot benchmark profiles",
+	}
+	cmd.AddCommand(profileRunCommand(ctx, "runtime", "bench", "[seed0root] chibicc cli bench completed state=2 exit=0", 30*time.Second))
+	return cmd
+}
+
+func profileRunCommand(ctx *context, use string, profile string, marker string, defaultTimeout time.Duration) *cobra.Command {
+	var timeout time.Duration
+	var noKVM bool
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: "Boot with seed0root profile " + profile,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSeed0rootProfile(ctx, profile, marker, timeout, noKVM)
+		},
+	}
+	cmd.Flags().DurationVar(&timeout, "timeout", defaultTimeout, "maximum time to wait for the profile marker")
+	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
+	return cmd
+}
+
+func runSeed0rootProfile(ctx *context, profile string, marker string, timeout time.Duration, noKVM bool) (err error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if err := writeSeed0rootBootProfile(ctx, profile); err != nil {
+		return err
+	}
+	defer func() {
+		restoreErr := restoreSeed0rootBootProfile(ctx)
+		if err == nil {
+			err = restoreErr
+		}
+	}()
+
+	var prepareOpts qemu.Options
+	if err := prepareLimineBootImage(ctx, &prepareOpts); err != nil {
+		return err
+	}
+	scratchImage, err := copySeed0rootProfileBootImage(ctx, profile, prepareOpts.LimineImage)
+	if err != nil {
+		return err
+	}
+	scratchDisk, err := createSeed0rootProfileDiskScratch(ctx, profile)
+	if err != nil {
+		return err
+	}
+
+	ui.Task("smoke:" + profile)
+	result, smokeErr := qemu.Smoke(ctx.workspace, qemu.SmokeOptions{
+		Timeout:     timeout,
+		NoKVM:       noKVM,
+		LimineImage: scratchImage,
+		DiskImage:   scratchDisk,
+		Marker:      marker,
+		Progress:    ui.NewProgressReporter(),
+	})
+	state := "passed"
+	if smokeErr != nil {
+		state = "failed"
+	}
+	ui.KeyValues("Boot Profile", [][2]string{
+		{"state", state},
+		{"profile", profile},
+		{"marker", result.Marker},
+		{"timeout", result.Timeout.String()},
+		{"serial", ctx.workspace.Rel(result.Serial)},
+		{"qemu log", ctx.workspace.Rel(result.Log)},
+	})
+	return smokeErr
+}
+
+func writeSeed0rootBootProfile(ctx *context, profile string) error {
+	path := ctx.workspace.Path(".artifacts", "seed0root_boot_profile.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if !strings.HasSuffix(profile, "\n") {
+		profile += "\n"
+	}
+	return os.WriteFile(path, []byte(profile), 0o644)
+}
+
+func copySeed0rootProfileBootImage(ctx *context, profile string, source string) (string, error) {
+	if source == "" {
+		source = ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot.img")
+	}
+	cleanProfile := strings.NewReplacer("/", "_", "\\", "_", " ", "_").Replace(profile)
+	dest := ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot-profile-"+cleanProfile+".img")
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+func createSeed0rootProfileDiskScratch(ctx *context, profile string) (string, error) {
+	cleanProfile := strings.NewReplacer("/", "_", "\\", "_", " ", "_").Replace(profile)
+	source := ctx.workspace.Path(ctx.workspace.Disk.Image)
+	dest := ctx.workspace.Path(ctx.workspace.Artifacts, "disk-profile-"+cleanProfile+".img")
+	_ = os.Remove(dest)
+	cmd := exec.Command("cp", "--reflink=auto", "--sparse=always", source, dest)
+	cmd.Dir = ctx.workspace.Root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("disk scratch copy failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return dest, nil
+}
+
+func restoreSeed0rootBootProfile(ctx *context) error {
+	if err := writeSeed0rootBootProfile(ctx, "normal"); err != nil {
+		return err
+	}
+	ui.Task("restore:seed0root-profile")
+	userland, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{
+		AppID:    "seed0root_boot_profile",
+		Progress: ui.NewProgressReporter(),
+	})
+	if err != nil {
+		return err
+	}
+	printUserland(userland)
+	return runRootfsSync(ctx, userland, false)
 }
 
 func qemuTestCommand(ctx *context, use string) *cobra.Command {

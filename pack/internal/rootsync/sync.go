@@ -243,7 +243,7 @@ func normalizeFilesystem(value string) string {
 
 func cacheFilesystemKey(filesystem string) string {
 	if filesystem == "ext4" {
-		return "ext4:pacha-compat-v1"
+		return "ext4:pacha-compat-v2"
 	}
 	return filesystem
 }

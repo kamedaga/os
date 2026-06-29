@@ -303,6 +303,12 @@ filed_status_t filed_vfs_get_stat_snapshot(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
     filed_vfs_stat_snapshot_t *out_snapshot);
+filed_status_t filed_vfs_validate_cached_handle_path(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    const char *absolute_path,
+    uint32_t rights,
+    filed_generation_t object_generation);
 filed_status_t filed_vfs_update_stat_snapshot(
     filed_vfs_t *vfs,
     filed_backend_object_id_t backend_object,

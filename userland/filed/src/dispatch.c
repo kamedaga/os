@@ -67,6 +67,7 @@ typedef struct filed_page_cache_slot {
     uint64_t page_index;
     uint64_t last_used;
     uint32_t bytes;
+    uint32_t valid_start;
     uint32_t dirty_start;
     uint32_t dirty_end;
     uint8_t data[FILED_PAGE_CACHE_BYTES];
@@ -200,6 +201,8 @@ static const char *filed_op_name(uint64_t op)
     case FILED_WIRE_OP_PING: return "ping";
     case FILED_WIRE_OP_FAST_DOORBELL: return "fast_doorbell";
     case FILED_WIRE_OP_VALIDATE_OPEN_CACHE: return "validate_open_cache";
+    case FILED_WIRE_OP_PWRITE_BATCH: return "pwrite_batch";
+    case FILED_WIRE_OP_WRITE_BATCH: return "write_batch";
     default: return "unknown";
     }
 }
@@ -656,6 +659,21 @@ static filed_page_cache_slot_t *filed_page_cache_find(
     return NULL;
 }
 
+static bool filed_page_cache_object_dirty(uint64_t backend_object)
+{
+    filed_page_cache_ensure_configured();
+    if (backend_object == 0 || filed_page_cache.active_slots == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < filed_page_cache.active_slots; ++i) {
+        const filed_page_cache_slot_t *slot = &filed_page_cache.slots[i];
+        if (slot->valid && slot->dirty && slot->backend_object == backend_object) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int filed_page_cache_flush_slot(
     filed_runtime_t *runtime,
     filed_page_cache_slot_t *slot)
@@ -666,6 +684,7 @@ static int filed_page_cache_flush_slot(
     if (runtime == NULL ||
         slot->backend_object == 0 ||
         slot->dirty_start >= slot->dirty_end ||
+        slot->dirty_start < slot->valid_start ||
         slot->dirty_end > slot->bytes ||
         slot->dirty_end > FILED_PAGE_CACHE_BYTES ||
         slot->page_index > UINT64_MAX / FILED_PAGE_CACHE_BYTES)
@@ -775,6 +794,7 @@ static void filed_page_cache_store(
     slot->backend_object = backend_object;
     slot->page_index = page_index;
     slot->bytes = (uint32_t)bytes;
+    slot->valid_start = 0;
     slot->dirty_start = 0;
     slot->dirty_end = 0;
     slot->last_used = filed_page_cache_next_clock(runtime);
@@ -808,7 +828,8 @@ static int filed_page_cache_try_dirty_write(
     uint64_t backend_object,
     uint64_t offset,
     const void *data,
-    uint64_t length)
+    uint64_t length,
+    bool allow_extend_slot)
 {
     uint64_t total = 0;
 
@@ -834,7 +855,14 @@ static int filed_page_cache_try_dirty_write(
 
         filed_page_cache_slot_t *slot =
             filed_page_cache_find(runtime, backend_object, page_index);
-        if (slot == NULL || page_offset + chunk > slot->bytes) {
+        if (slot == NULL) {
+            if (!allow_extend_slot || page_offset + chunk > FILED_PAGE_CACHE_BYTES) {
+                return 0;
+            }
+        } else if (page_offset < slot->valid_start ||
+            page_offset > slot->bytes ||
+            page_offset + chunk > FILED_PAGE_CACHE_BYTES)
+        {
             return 0;
         }
         total += chunk;
@@ -852,7 +880,28 @@ static int filed_page_cache_try_dirty_write(
 
         filed_page_cache_slot_t *slot =
             filed_page_cache_find(runtime, backend_object, page_index);
+        if (slot == NULL) {
+            slot = filed_page_cache_choose_slot(runtime);
+            if (slot == NULL) {
+                return 0;
+            }
+            memset(slot, 0, sizeof(*slot));
+            slot->valid = true;
+            slot->backend_object = backend_object;
+            slot->page_index = page_index;
+            slot->valid_start = (uint32_t)page_offset;
+            slot->bytes = (uint32_t)page_offset;
+        }
+        if (page_offset < slot->valid_start ||
+            page_offset > slot->bytes ||
+            page_offset + chunk > FILED_PAGE_CACHE_BYTES)
+        {
+            return 0;
+        }
         memcpy(slot->data + page_offset, (const uint8_t *)data + total, (size_t)chunk);
+        if (page_offset + chunk > slot->bytes) {
+            slot->bytes = (uint32_t)(page_offset + chunk);
+        }
         slot->dirty = true;
         if (slot->dirty_start == slot->dirty_end) {
             slot->dirty_start = (uint32_t)page_offset;
@@ -905,7 +954,8 @@ static void filed_page_cache_note_write(
         }
 
         if (slot != NULL && !slot->dirty) {
-            if (page_offset <= slot->bytes &&
+            if (page_offset >= slot->valid_start &&
+                page_offset <= slot->bytes &&
                 chunk <= FILED_PAGE_CACHE_BYTES - page_offset)
             {
                 memcpy(slot->data + page_offset, (const uint8_t *)data + total, (size_t)chunk);
@@ -961,6 +1011,15 @@ int filed_cached_pread(
         filed_page_cache_slot_t *slot =
             filed_page_cache_find(runtime, backend_object, page_index);
 
+        if (slot != NULL && page_offset < slot->valid_start) {
+            const int flush_status = filed_page_cache_flush_slot(runtime, slot);
+            if (flush_status != 0) {
+                return flush_status;
+            }
+            memset(slot, 0, sizeof(*slot));
+            slot = NULL;
+        }
+
         if (slot != NULL) {
             filed_page_cache.hits++;
             slot->last_used = filed_page_cache_next_clock(runtime);
@@ -1005,7 +1064,7 @@ int filed_cached_pread(
             }
         }
 
-        if (page_offset >= slot->bytes) {
+        if (page_offset < slot->valid_start || page_offset >= slot->bytes) {
             break;
         }
         uint64_t available = (uint64_t)slot->bytes - page_offset;
@@ -1025,13 +1084,14 @@ int filed_cached_pread(
     return 0;
 }
 
-int filed_cached_pwrite(
+static int filed_cached_pwrite_ex(
     filed_runtime_t *runtime,
     uint64_t backend_object,
     uint64_t offset,
     const void *buffer,
     uint64_t length,
-    uint64_t *out_bytes)
+    uint64_t *out_bytes,
+    bool allow_extend_slot)
 {
     if (runtime == NULL || backend_object == 0 || buffer == NULL || out_bytes == NULL) {
         return -1;
@@ -1043,7 +1103,14 @@ int filed_cached_pwrite(
     if (offset + length < offset) {
         return -75;
     }
-    if (filed_page_cache_try_dirty_write(runtime, backend_object, offset, buffer, length)) {
+    if (filed_page_cache_try_dirty_write(
+            runtime,
+            backend_object,
+            offset,
+            buffer,
+            length,
+            allow_extend_slot))
+    {
         *out_bytes = length;
         return 0;
     }
@@ -1064,6 +1131,24 @@ int filed_cached_pwrite(
         filed_page_cache_note_write(runtime, backend_object, offset, buffer, *out_bytes);
     }
     return status;
+}
+
+int filed_cached_pwrite(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint64_t offset,
+    const void *buffer,
+    uint64_t length,
+    uint64_t *out_bytes)
+{
+    return filed_cached_pwrite_ex(
+        runtime,
+        backend_object,
+        offset,
+        buffer,
+        length,
+        out_bytes,
+        false);
 }
 
 void filed_dump_cache_metrics(const filed_runtime_t *runtime)
@@ -1244,25 +1329,20 @@ static int64_t filed_close_handle_runtime(
     filed_handle_id_t handle_id)
 {
     filed_vfs_reclaim_result_t reclaim;
-    filed_vfs_io_decision_t decision;
     if (runtime == NULL) {
         return filed_status_to_wire(FILED_ERR_INVALID);
-    }
-
-    memset(&decision, 0, sizeof(decision));
-    if (filed_vfs_close_flush_prepare(&runtime->vfs, handle_id, &decision) == FILED_OK &&
-        decision.backend_object != 0)
-    {
-        const int flush_status = filed_page_cache_flush_object(runtime, decision.backend_object);
-        if (flush_status != 0) {
-            return flush_status;
-        }
     }
 
     memset(&reclaim, 0, sizeof(reclaim));
     const filed_status_t status = filed_vfs_close_handle_ex(&runtime->vfs, handle_id, &reclaim);
     if (status != FILED_OK) {
         return filed_status_to_wire(status);
+    }
+    if (reclaim.released && reclaim.backend_object != 0) {
+        const int flush_status = filed_page_cache_flush_object(runtime, reclaim.backend_object);
+        if (flush_status != 0) {
+            return flush_status;
+        }
     }
     return filed_release_reclaimed_object(runtime, &reclaim);
 }
@@ -1657,6 +1737,7 @@ static int64_t filed_resolve_parent_path(
     filed_runtime_t *runtime,
     filed_handle_id_t base_dir_handle,
     const char *path,
+    uint32_t parent_rights,
     filed_handle_id_t *out_parent_handle,
     int *out_parent_owned,
     char *out_name,
@@ -1737,6 +1818,11 @@ static int64_t filed_resolve_parent_path(
         if (component_len == 2 && component[0] == '.' && component[1] == '.') {
             filed_vfs_open_result_t parent_open;
             filed_status_t status;
+            uint32_t next_rights = FILED_WALK_RIGHTS;
+
+            if (filed_path_is_single_component(after_slashes)) {
+                next_rights |= parent_rights;
+            }
 
             if (!has_more) {
                 filed_close_walk_handle(runtime, current_handle, current_owned);
@@ -1747,7 +1833,7 @@ static int64_t filed_resolve_parent_path(
             status = filed_vfs_open_parent(
                 &runtime->vfs,
                 current_handle,
-                FILED_WALK_RIGHTS,
+                next_rights,
                 FILED_OPEN_DIRECTORY,
                 &parent_open);
             filed_close_walk_handle(runtime, current_handle, current_owned);
@@ -1772,11 +1858,15 @@ static int64_t filed_resolve_parent_path(
             return 0;
         } else {
             filed_vfs_open_result_t next_open;
+            uint32_t next_rights = FILED_WALK_RIGHTS;
+            if (filed_path_is_single_component(after_slashes)) {
+                next_rights |= parent_rights;
+            }
             const int64_t reply_status = filed_lookup_and_open_component(
                 runtime,
                 current_handle,
                 component,
-                FILED_WALK_RIGHTS,
+                next_rights,
                 FILED_OPEN_DIRECTORY,
                 &next_open);
             filed_close_walk_handle(runtime, current_handle, current_owned);
@@ -1903,16 +1993,29 @@ static int64_t filed_lookup_and_open_component(
         open_flags,
         out_open);
     if (status == FILED_OK) {
-        const filed_vfs_stat_snapshot_t snapshot =
-            filed_stat_snapshot_from_backend(
-                &backend_stat,
+        filed_vfs_stat_snapshot_t current_snapshot;
+        memset(&current_snapshot, 0, sizeof(current_snapshot));
+        if (filed_page_cache_object_dirty(object_id) &&
+            filed_vfs_get_stat_snapshot(
+                &runtime->vfs,
                 out_open->handle_id,
-                out_open->object_generation,
-                out_open->dir_generation);
-        (void)filed_vfs_update_stat_snapshot(
-            &runtime->vfs,
-            object_id,
-            &snapshot);
+                &current_snapshot) == FILED_OK &&
+            current_snapshot.valid)
+        {
+            out_open->object_generation = current_snapshot.object_generation;
+            out_open->dir_generation = current_snapshot.dir_generation;
+        } else {
+            const filed_vfs_stat_snapshot_t snapshot =
+                filed_stat_snapshot_from_backend(
+                    &backend_stat,
+                    out_open->handle_id,
+                    out_open->object_generation,
+                    out_open->dir_generation);
+            (void)filed_vfs_update_stat_snapshot(
+                &runtime->vfs,
+                object_id,
+                &snapshot);
+        }
     }
     if (status == FILED_OK && (open_flags & FILED_OPEN_TRUNCATE) != 0) {
         reply_status = filed_page_cache_flush_object(runtime, object_id);
@@ -2147,6 +2250,18 @@ static filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
         &cached_decision);
     if (cached_status != FILED_OK) {
         return filed_page_result(0, 0);
+    }
+    if (cached_decision.object_generation == validate->object_generation &&
+        filed_vfs_validate_cached_handle_path(
+            &runtime->vfs,
+            (filed_handle_id_t)(uint32_t)validate->cached_handle,
+            validate->name,
+            (uint32_t)validate->rights,
+            (filed_generation_t)validate->object_generation) == FILED_OK)
+    {
+        validate->object_generation = cached_decision.object_generation;
+        validate->dir_generation = cached_decision.dir_generation;
+        return filed_page_result(0, 1);
     }
 
     memset(&openat, 0, sizeof(openat));
@@ -2468,13 +2583,14 @@ static filed_page_dispatch_result_t filed_dispatch_pwrite_page(
                 return filed_page_result(reply_status, bytes);
             }
         }
-        reply_status = filed_cached_pwrite(
+        reply_status = filed_cached_pwrite_ex(
             runtime,
             decision.backend_object,
             decision.offset,
             io->data,
             length,
-            &bytes);
+            &bytes,
+            true);
         if (reply_status == 0) {
             io->offset = decision.offset;
             io->length = bytes;
@@ -2564,13 +2680,14 @@ static filed_page_dispatch_result_t filed_dispatch_write_page(
                 return filed_page_result(reply_status, bytes);
             }
         }
-        reply_status = filed_cached_pwrite(
+        reply_status = filed_cached_pwrite_ex(
             runtime,
             decision.backend_object,
             decision.offset,
             io->data,
             length,
-            &bytes);
+            &bytes,
+            true);
         if (reply_status == 0) {
             io->offset = decision.offset;
             io->length = bytes;
@@ -2722,17 +2839,10 @@ static int filed_dispatch_fsync(
     return filed_send_reply(reply_fd, request->word3, reply_status, 0);
 }
 
-static int filed_dispatch_truncate(
+static filed_page_dispatch_result_t filed_dispatch_truncate_page(
     filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
+    void *page)
 {
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
     filed_wire_truncate_t *truncate = (filed_wire_truncate_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
@@ -2765,9 +2875,24 @@ static int filed_dispatch_truncate(
         }
     }
 
+    return filed_page_result(reply_status, 0);
+}
+
+static int filed_dispatch_truncate(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    const filed_page_dispatch_result_t result = filed_dispatch_truncate_page(runtime, page);
     (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
 static uint64_t filed_lookup_cache_target_object(
@@ -2804,17 +2929,10 @@ static int filed_flush_mutated_object(
     return filed_page_cache_flush_object(runtime, backend_object);
 }
 
-static int filed_dispatch_unlink(
+static filed_page_dispatch_result_t filed_dispatch_unlink_page(
     filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
+    void *page)
 {
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
     filed_wire_unlink_t *unlink = (filed_wire_unlink_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
@@ -2836,6 +2954,7 @@ static int filed_dispatch_unlink(
             runtime,
             base_dir,
             unlink->name,
+            FILED_RIGHT_REMOVE,
             &dir_handle,
             &dir_owned,
             name,
@@ -2883,12 +3002,10 @@ static int filed_dispatch_unlink(
         }
     }
 
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+    return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_mkdir(
+static int filed_dispatch_unlink(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request)
@@ -2899,6 +3016,16 @@ static int filed_dispatch_mkdir(
         return filed_send_reply(reply_fd, request->word3, -22, 0);
     }
 
+    const filed_page_dispatch_result_t result = filed_dispatch_unlink_page(runtime, page);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+}
+
+static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
     filed_wire_mkdir_t *mkdir = (filed_wire_mkdir_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
@@ -2918,6 +3045,7 @@ static int filed_dispatch_mkdir(
             runtime,
             base_dir,
             mkdir->name,
+            FILED_RIGHT_CREATE,
             &dir_handle,
             &dir_owned,
             name,
@@ -2975,12 +3103,10 @@ static int filed_dispatch_mkdir(
         }
     }
 
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+    return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_rmdir(
+static int filed_dispatch_mkdir(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request)
@@ -2991,6 +3117,16 @@ static int filed_dispatch_rmdir(
         return filed_send_reply(reply_fd, request->word3, -22, 0);
     }
 
+    const filed_page_dispatch_result_t result = filed_dispatch_mkdir_page(runtime, page);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+}
+
+static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
     filed_wire_rmdir_t *rmdir = (filed_wire_rmdir_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
@@ -3012,6 +3148,7 @@ static int filed_dispatch_rmdir(
             runtime,
             base_dir,
             rmdir->name,
+            FILED_RIGHT_REMOVE,
             &dir_handle,
             &dir_owned,
             name,
@@ -3059,12 +3196,10 @@ static int filed_dispatch_rmdir(
         }
     }
 
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+    return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_rename(
+static int filed_dispatch_rmdir(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request)
@@ -3075,6 +3210,16 @@ static int filed_dispatch_rename(
         return filed_send_reply(reply_fd, request->word3, -22, 0);
     }
 
+    const filed_page_dispatch_result_t result = filed_dispatch_rmdir_page(runtime, page);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+}
+
+static filed_page_dispatch_result_t filed_dispatch_rename_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
     filed_wire_rename_t *rename = (filed_wire_rename_t *)page;
     filed_vfs_io_decision_t old_parent;
     filed_vfs_io_decision_t new_parent;
@@ -3106,6 +3251,7 @@ static int filed_dispatch_rename(
             runtime,
             old_base_dir,
             rename->old_name,
+            FILED_RIGHT_RENAME,
             &old_dir_handle,
             &old_dir_owned,
             old_name,
@@ -3115,6 +3261,7 @@ static int filed_dispatch_rename(
                 runtime,
                 new_base_dir,
                 rename->new_name,
+                FILED_RIGHT_RENAME,
                 &new_dir_handle,
                 &new_dir_owned,
                 new_name,
@@ -3207,9 +3354,24 @@ static int filed_dispatch_rename(
         filed_close_walk_handle(runtime, new_dir_handle, new_dir_owned);
     }
 
+    return filed_page_result(reply_status, object_id);
+}
+
+static int filed_dispatch_rename(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    const filed_page_dispatch_result_t result = filed_dispatch_rename_page(runtime, page);
     (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, reply_status, object_id);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
 static filed_page_dispatch_result_t filed_dispatch_getdents_page(
@@ -3926,6 +4088,16 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_pwrite_page(runtime, page);
     case FILED_WIRE_OP_WRITE:
         return filed_dispatch_write_page(runtime, page);
+    case FILED_WIRE_OP_TRUNCATE:
+        return filed_dispatch_truncate_page(runtime, page);
+    case FILED_WIRE_OP_UNLINK:
+        return filed_dispatch_unlink_page(runtime, page);
+    case FILED_WIRE_OP_RENAME:
+        return filed_dispatch_rename_page(runtime, page);
+    case FILED_WIRE_OP_MKDIR:
+        return filed_dispatch_mkdir_page(runtime, page);
+    case FILED_WIRE_OP_RMDIR:
+        return filed_dispatch_rmdir_page(runtime, page);
     case FILED_WIRE_OP_GETDENTS:
         return filed_dispatch_getdents_page(runtime, page);
     case FILED_WIRE_OP_DUP:
@@ -4002,6 +4174,51 @@ static void *filed_session_fast_payload(
     return (uint8_t *)session->page + offset;
 }
 
+static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
+    filed_runtime_t *runtime,
+    filed_session_t *session,
+    filed_wire_fast_header_t *header,
+    uint64_t batch_count,
+    bool append)
+{
+    if (batch_count == 0 || batch_count > header->payload_slot_count) {
+        return filed_page_result(-22, 0);
+    }
+
+    uint64_t total = 0;
+    int64_t status = 0;
+    const uint64_t op = append ? FILED_WIRE_OP_WRITE : FILED_WIRE_OP_PWRITE;
+    for (uint64_t slot = 0; slot < batch_count; slot++) {
+        void *payload = filed_session_fast_payload(session, header, slot);
+        if (payload == NULL) {
+            status = -22;
+            break;
+        }
+
+        filed_wire_io_t *io = (filed_wire_io_t *)payload;
+        const uint64_t requested = io->length;
+        const uint64_t start_cycles = filed_read_tsc();
+        const filed_page_dispatch_result_t result = append ?
+            filed_dispatch_write_page(runtime, payload) :
+            filed_dispatch_pwrite_page(runtime, payload);
+        filed_record_dispatch_metric_cycles(
+            op,
+            start_cycles,
+            filed_read_tsc(),
+            result.status);
+
+        if (result.status != 0) {
+            status = result.status;
+            break;
+        }
+        total += result.result;
+        if (result.result < requested) {
+            break;
+        }
+    }
+    return filed_page_result(status, total);
+}
+
 static uint64_t filed_dispatch_session_fast_drain(
     filed_runtime_t *runtime,
     filed_session_t *session,
@@ -4039,12 +4256,28 @@ static uint64_t filed_dispatch_session_fast_drain(
             pseudo_request.word3 = fast_request->request_id;
 
             const uint64_t start_cycles = filed_read_tsc();
-            result = filed_dispatch_session_page(runtime, &pseudo_request, payload);
-            filed_record_dispatch_metric_cycles(
-                pseudo_request.word1,
-                start_cycles,
-                filed_read_tsc(),
-                result.status);
+            if (fast_request->opcode == FILED_WIRE_OP_PWRITE_BATCH ||
+                fast_request->opcode == FILED_WIRE_OP_WRITE_BATCH)
+            {
+                result = filed_dispatch_session_write_batch(
+                    runtime,
+                    session,
+                    header,
+                    fast_request->word2,
+                    fast_request->opcode == FILED_WIRE_OP_WRITE_BATCH);
+                filed_record_dispatch_metric_cycles(
+                    pseudo_request.word1,
+                    start_cycles,
+                    filed_read_tsc(),
+                    result.status);
+            } else {
+                result = filed_dispatch_session_page(runtime, &pseudo_request, payload);
+                filed_record_dispatch_metric_cycles(
+                    pseudo_request.word1,
+                    start_cycles,
+                    filed_read_tsc(),
+                    result.status);
+            }
         }
 
         filed_wire_fast_completion_t *completion =

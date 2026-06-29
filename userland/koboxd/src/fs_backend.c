@@ -355,8 +355,15 @@ static void prepare_named_dentry(
 
 static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operations_t *out_ops)
 {
+    static kb_module_t *cached_module;
+    static koboxd_ext4_operations_t cached_ops;
+    static int cached_ready;
     if (module == NULL || out_ops == NULL) {
         return 0;
+    }
+    if (cached_ready && cached_module == module) {
+        *out_ops = cached_ops;
+        return 1;
     }
     memset(out_ops, 0, sizeof(*out_ops));
     if (!(module_symbol(module, "ext4_dir_operations", &out_ops->dir_operations) &&
@@ -382,11 +389,17 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
     out_ops->mkdir = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_MKDIR_OFFSET);
     out_ops->rmdir = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RMDIR_OFFSET);
     out_ops->rename = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RENAME_OFFSET);
-    return out_ops->create != NULL &&
+    const int ready = out_ops->create != NULL &&
         out_ops->unlink != NULL &&
         out_ops->mkdir != NULL &&
         out_ops->rmdir != NULL &&
         out_ops->rename != NULL;
+    if (ready) {
+        cached_module = module;
+        cached_ops = *out_ops;
+        cached_ready = 1;
+    }
+    return ready;
 }
 
 static int fs_sync_super_free_blocks(const koboxd_ext4_operations_t *ops, void *super_block)
@@ -639,16 +652,16 @@ static int fs_file_read(
     if (ops == NULL || ops->file_read_iter == NULL || inode == NULL || buffer == NULL) {
         return -22;
     }
-    void *file = calloc(1, KOBOXD_FAKE_FILE_BYTES);
-    void *kiocb = calloc(1, KOBOXD_FAKE_KIOCB_BYTES);
-    void *iter = calloc(1, KOBOXD_FAKE_IOV_ITER_BYTES);
+    uint8_t file[KOBOXD_FAKE_FILE_BYTES];
+    uint8_t kiocb[KOBOXD_FAKE_KIOCB_BYTES];
+    uint8_t iter[KOBOXD_FAKE_IOV_ITER_BYTES];
     void *mapping = read_pointer_field(inode, KOBOXD_INODE_MAPPING_OFFSET);
-    if (file == NULL || kiocb == NULL || iter == NULL || mapping == NULL) {
-        free(iter);
-        free(kiocb);
-        free(file);
+    if (mapping == NULL) {
         return -12;
     }
+    memset(file, 0, sizeof(file));
+    memset(kiocb, 0, sizeof(kiocb));
+    memset(iter, 0, sizeof(iter));
 
     write_pointer_field(file, KOBOXD_FILE_MAPPING_OFFSET, mapping);
     write_pointer_field(file, KOBOXD_FILE_INODE_OFFSET, inode);
@@ -667,9 +680,6 @@ static int fs_file_read(
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
-    free(iter);
-    free(kiocb);
-    free(file);
     return result >= 0 ? (int)result : (int)result;
 }
 
@@ -680,33 +690,42 @@ static int fs_file_write(
     const void *buffer,
     size_t length)
 {
-    (void)ops;
-    if (inode == NULL || buffer == NULL) {
+    if (ops == NULL || ops->file_write_iter == NULL || inode == NULL || buffer == NULL) {
         return -22;
     }
-    void *file = calloc(1, KOBOXD_FAKE_FILE_BYTES);
-    void *kiocb = calloc(1, KOBOXD_FAKE_KIOCB_BYTES);
-    void *iter = calloc(1, KOBOXD_FAKE_IOV_ITER_BYTES);
+    uint8_t file[KOBOXD_FAKE_FILE_BYTES];
+    uint8_t kiocb[KOBOXD_FAKE_KIOCB_BYTES];
+    uint8_t iter[KOBOXD_FAKE_IOV_ITER_BYTES];
+    uint8_t dentry[KOBOXD_FAKE_DENTRY_BYTES];
     void *mapping = read_pointer_field(inode, KOBOXD_INODE_MAPPING_OFFSET);
-    if (file == NULL || kiocb == NULL || iter == NULL || mapping == NULL) {
-        free(iter);
-        free(kiocb);
-        free(file);
+    if (mapping == NULL) {
         return -12;
     }
+    memset(file, 0, sizeof(file));
+    memset(kiocb, 0, sizeof(kiocb));
+    memset(iter, 0, sizeof(iter));
+    memset(dentry, 0, sizeof(dentry));
 
+    write_pointer_field(dentry, 0, inode);
+    write_pointer_field(file, KOBOXD_FILE_PATH_DENTRY_OFFSET, dentry);
     write_pointer_field(file, KOBOXD_FILE_MAPPING_OFFSET, mapping);
     write_pointer_field(file, KOBOXD_FILE_INODE_OFFSET, inode);
     write_pointer_field(kiocb, KOBOXD_KIOCB_FILE_OFFSET, file);
     write_u64_field(kiocb, KOBOXD_KIOCB_POS_OFFSET, offset);
     write_u64_field(iter, KOBOXD_IOV_ITER_COUNT_OFFSET, (uint64_t)length);
     write_pointer_field(iter, KOBOXD_IOV_ITER_BUFFER_OFFSET, (void *)(uintptr_t)buffer);
+    write_u64_field(iter, KOBOXD_IOV_ITER_BUFFER_CAPACITY_OFFSET, (uint64_t)length);
 
-    long result = kb_fs_subsystem_generic_perform_write(kiocb, iter);
+    unsigned long old_gs = 0;
+    unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_write_iter);
+    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
+    long (*write_iter_fn)(void *, void *) = NULL;
+    memcpy(&write_iter_fn, &ops->file_write_iter, sizeof(write_iter_fn));
+    long result = write_iter_fn(kiocb, iter);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
 
-    free(iter);
-    free(kiocb);
-    free(file);
     return result >= 0 ? (int)result : (int)result;
 }
 

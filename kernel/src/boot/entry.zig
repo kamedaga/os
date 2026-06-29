@@ -635,6 +635,8 @@ pub fn initializeLimineRuntimeOrHalt() void {
 
 fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelState {
     user_copy.init(.{
+        .state = kernel_state_global,
+        .free_list = global_free_list,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
         .phys_copy_window_va = boot_static.phys_copy_window_va,
         .page_present = boot_static.page_present,
@@ -772,6 +774,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
     traps.init(.{
         .kernel_state_ready = &kernel_state_ready,
         .state = state,
+        .free_list = global_free_list,
         .scheduler_quantum_ticks = boot_static.scheduler_quantum_ticks,
         .write = kernel_log.write,
         .write_hex_raw = kernel_log.writeHexRaw,

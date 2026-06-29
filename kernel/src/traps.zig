@@ -22,6 +22,7 @@ const exception_trap_frame_iret_offset = @offsetOf(ExceptionTrapFrame, "rip");
 pub const Hooks = struct {
     kernel_state_ready: *const bool,
     state: *kernel.KernelState,
+    free_list: *kernel.FreePageList,
     scheduler_quantum_ticks: u64,
     write: *const fn ([]const u8) void,
     write_hex_raw: *const fn (u64) void,
@@ -528,24 +529,21 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     const user_mode = (ec & (1 << 2)) != 0;
     if (!user_mode or !user_vm.isUserCanonicalVa(cr2)) return 0;
     if (!h.kernel_state_ready.*) return 0;
-    const present_violation = (ec & (1 << 0)) != 0;
-    if (!present_violation) {
-        const principal = scheduler.currentPrincipal();
-        const fault_page_va = cr2 & ~@as(u64, 4095);
-        const write_access = (ec & (1 << 1)) != 0;
-        const instruction_fetch = (ec & (1 << 4)) != 0;
-        user_vm.lockAddressSpaces();
-        defer user_vm.unlockAddressSpaces();
-        if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) return 1;
-        if (h.state.nativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch)) |mapping| {
-            var paddrs = [_]u64{mapping.paddr};
-            if (user_vm.mapTrustedUserPaddrsWithProt(
-                principal,
-                fault_page_va,
-                paddrs[0..],
-                mapping.prot,
-            )) return 1;
-        }
+    const principal = scheduler.currentPrincipal();
+    const fault_page_va = cr2 & ~@as(u64, 4095);
+    const write_access = (ec & (1 << 1)) != 0;
+    const instruction_fetch = (ec & (1 << 4)) != 0;
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
+    if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) return 0;
+    if (h.state.ensureNativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {
+        var paddrs = [_]u64{mapping.paddr};
+        if (user_vm.mapLazyUserPaddrsWithProt(
+            principal,
+            fault_page_va,
+            paddrs[0..],
+            mapping.prot,
+        )) return 1;
     }
     return 0;
 }

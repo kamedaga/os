@@ -35,14 +35,14 @@ pub const state_killed: u64 = 3;
 pub const process_map_flag_none: u64 = 0;
 pub const process_map_known_flags_mask: u64 = process_map_flag_none;
 
-pub const aux_base_va: u64 = 0x3C00_0000;
+pub const aux_base_va: u64 = 0x0000_7000_0000_0000;
 pub const aux_page_bytes: u64 = 0x1000;
 pub const standard_config_target_va: u64 = auxPageVa(2);
 pub const default_stack_top_va: u64 = aux_base_va;
 pub const default_stack_bytes: u64 = 0x2_0000;
-pub const user_aslr_base_va: u64 = 0x1000_0000;
-pub const user_aslr_end_va: u64 = 0x3B00_0000;
-pub const user_aslr_granule: u64 = 0x20_0000;
+pub const user_aslr_base_va: u64 = 0x0000_0100_0000_0000;
+pub const user_aslr_end_va: u64 = 0x0000_0100_4000_0000;
+pub const user_aslr_granule: u64 = 0x1_0000;
 pub const at_pacha_bootstrap_fd: u64 = 0x7000_0000;
 
 pub fn auxPageVa(page_index: u64) u64 {

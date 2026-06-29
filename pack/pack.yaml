@@ -451,8 +451,70 @@ apps:
         - "musl/upstream/src/fcntl/open.c"
         - "musl/upstream/src/stat/fstat.c"
         - "musl/upstream/src/unistd/pwrite.c"
+        - "musl/upstream/src/unistd/ftruncate.c"
     out: "LIBCVFEX.ELF"
     rootfs: "/cmd/libc_vfs_exec_smoke.elf"
+  libc_mix_bench:
+    file:
+      path: ".artifacts/musl-pachaos/libc_mix_bench.elf"
+      rebuild: ["bash", "-lc", "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ PACHAOS_MUSL_APP_SOURCE=musl/pachaos/smoke/libc_mix_bench.c bash musl/pachaos/build/build-smokes.sh .artifacts/musl-pachaos/libc_mix_bench.elf"]
+      input:
+        - "musl/pachaos/smoke/libc_mix_bench.c"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/upstream/src/dirent/closedir.c"
+        - "musl/upstream/src/dirent/opendir.c"
+        - "musl/upstream/src/dirent/readdir.c"
+        - "musl/upstream/src/fcntl/open.c"
+        - "musl/upstream/src/stat/fstat.c"
+        - "musl/upstream/src/unistd/read.c"
+        - "musl/upstream/src/unistd/readv.c"
+        - "musl/upstream/src/unistd/writev.c"
+        - "musl/upstream/src/unistd/pread.c"
+        - "musl/upstream/src/unistd/pwrite.c"
+    out: "LIBCMIX.ELF"
+    rootfs: "/cmd/libc_mix_bench.elf"
+  libc_alloc_probe:
+    file:
+      path: ".artifacts/musl-pachaos/libc_alloc_probe.elf"
+      rebuild: ["bash", "-lc", "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ PACHAOS_MUSL_APP_SOURCE=musl/pachaos/smoke/libc_alloc_probe.c bash musl/pachaos/build/build-smokes.sh .artifacts/musl-pachaos/libc_alloc_probe.elf"]
+      input:
+        - "musl/pachaos/smoke/libc_alloc_probe.c"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/pachaos/cli/pachaos_cli_shim.c"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "LIBCALOC.ELF"
+    rootfs: "/cmd/libc_alloc_probe.elf"
+  lua_cli:
+    file:
+      path: ".artifacts/musl-pachaos/lua.elf"
+      rebuild: ["bash", "tools/build_pachaos_lua.sh", ".artifacts/musl-pachaos/lua.elf"]
+      input:
+        - "tools/build_pachaos_lua.sh"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/pachaos/cli/pachaos_cli_shim.c"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "LUA.ELF"
+    rootfs: "/cmd/lua.elf"
+  lua_cli_workload:
+    file: "musl/pachaos/smoke/lua_workload.lua"
+    out: "LUAWORK.LUA"
+    rootfs: "/cmd/lua_workload.lua"
+  chibicc_cli:
+    file:
+      path: ".artifacts/musl-pachaos/chibicc.elf"
+      rebuild: ["bash", "tools/build_pachaos_chibicc.sh", ".artifacts/musl-pachaos/chibicc.elf"]
+      input:
+        - "tools/build_pachaos_chibicc.sh"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/pachaos/cli/pachaos_cli_shim.c"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "CHIBICC.ELF"
+    rootfs: "/cmd/chibicc.elf"
+  chibicc_cli_workload:
+    file: "musl/pachaos/smoke/chibicc_workload.c"
+    out: "CHIBIWORK.C"
+    rootfs: "/cmd/chibicc_workload.c"
   pachaos_capsule:
     role: "service"
     file:
@@ -522,6 +584,12 @@ apps:
         - "userland/libpacha/src"
     out: "SEED0RT.ELF"
     rootfs: "/sbin/seed0root.elf"
+  seed0root_boot_profile:
+    file:
+      path: ".artifacts/seed0root_boot_profile.txt"
+      rebuild: ["bash", "-lc", "mkdir -p .artifacts && printf 'normal\\n' > .artifacts/seed0root_boot_profile.txt"]
+    out: "BOOTPROFILE.TXT"
+    rootfs: "/etc/pacha_boot_profile"
   koboxd:
     role: "service"
     file:
@@ -535,6 +603,8 @@ apps:
         - "userland/libpacha/include"
         - "userland/libpacha/src"
         - "userland/koboxd/src"
+        - "userland/filed/include"
+        - "userland/filed/src"
     out: "KOBOXD.ELF"
     rootfs: "/sbin/koboxd.elf"
   filed:

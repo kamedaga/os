@@ -533,7 +533,7 @@ fn findUserPdSlotForPdp(space: *const UserAddressSpace, pml4_index: usize, pdp_i
     return null;
 }
 
-fn seedPdSlotFromExistingPdp(h: Hooks, space: *UserAddressSpace, slot: usize, pdp_index: usize, existing_pdpe: u64) void {
+fn seedPdSlotFromExistingPdp(h: Hooks, space: *UserAddressSpace, slot: usize, pml4_index: usize, pdp_index: usize, existing_pdpe: u64) void {
     const pd_page: *[512]u64 = &space.pd_pages[slot];
     @memset(pd_page[0..], 0);
     if ((existing_pdpe & h.page_present) != 0 and (existing_pdpe & h.page_ps) == 0 and (existing_pdpe & h.page_user) == 0) {
@@ -547,7 +547,7 @@ fn seedPdSlotFromExistingPdp(h: Hooks, space: *UserAddressSpace, slot: usize, pd
             return;
         }
     }
-    if (pdp_index == 0) {
+    if (pml4_index == 0 and pdp_index == 0) {
         h.seed_user_pd_with_kernel_identity(pd_page[0..]);
     }
 }
@@ -567,7 +567,7 @@ fn ensureUserPdpSlotForPml4(space: *UserAddressSpace, pml4_index: usize) ?usize 
         h.seed_user_pdp_with_kernel_identity(pdp_page[0..]);
     }
     const pdp_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(pdp_page)) orelse return null;
-    if (pdp_pa >= h.four_gib) return null;
+    if (pdp_pa >= h.physical_map_limit) return null;
     space.pml4[pml4_index] = pdp_pa | h.page_present | h.page_rw | h.page_user;
     const next_len = slot + 1;
     if (next_len > space.pdp_page_used_len) {
@@ -590,9 +590,9 @@ fn ensureUserPdSlotForPdp(space: *UserAddressSpace, pml4_index: usize, pdp_index
     space.pd_page_pdp_index[slot] = @intCast(pdp_index);
     const pdp_page: *[512]u64 = &space.pdp_pages[pdp_slot];
     const existing_pdpe = pdp_page[pdp_index];
-    seedPdSlotFromExistingPdp(h, space, slot, pdp_index, existing_pdpe);
+    seedPdSlotFromExistingPdp(h, space, slot, pml4_index, pdp_index, existing_pdpe);
     const pd_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pd_pages[slot])) orelse return null;
-    if (pd_pa >= h.four_gib) return null;
+    if (pd_pa >= h.physical_map_limit) return null;
     pdp_page[pdp_index] = pd_pa | h.page_present | h.page_rw | h.page_user;
     const next_len = slot + 1;
     if (next_len > space.pd_page_used_len) {
@@ -649,7 +649,7 @@ pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pml4_index: usize, pdp_in
     const existing_pde = pd_page[pd_index];
     seedPtSlotFromExistingPd(space, slot, existing_pde);
     const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pt_pages[slot])) orelse return null;
-    if (pt_pa >= h.four_gib) return null;
+    if (pt_pa >= h.physical_map_limit) return null;
     pd_page[pd_index] = pt_pa | h.page_present | h.page_rw | h.page_user;
     const next_len = slot + 1;
     if (next_len > space.pt_page_used_len) {
@@ -745,11 +745,12 @@ pub fn mapUserLinearRegionWithProt(
     return true;
 }
 
-pub fn mapTrustedUserPaddrsWithProt(
+fn mapTrustedUserPaddrsWithProtInternal(
     principal: kernel.PrincipalId,
     va_start: u64,
     paddrs: []const u64,
     prot: kernel.MapProt,
+    reserve_pages: bool,
 ) bool {
     lockAddressSpaces();
     defer unlockAddressSpaces();
@@ -775,7 +776,7 @@ pub fn mapTrustedUserPaddrsWithProt(
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
     }
-    if (!reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
+    if (reserve_pages and !reserveUserMapping(principal, va_start, page_count_u64, .linear_region, prot.write)) return false;
 
     page_index = 0;
     while (page_index < paddrs.len) : (page_index += 1) {
@@ -787,6 +788,24 @@ pub fn mapTrustedUserPaddrsWithProt(
     }
 
     return true;
+}
+
+pub fn mapTrustedUserPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, true);
+}
+
+pub fn mapLazyUserPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, false);
 }
 
 pub fn remapTrustedUserPaddrsWithProt(
@@ -826,6 +845,73 @@ pub fn remapTrustedUserPaddrsWithProt(
     return true;
 }
 
+pub fn mapOrRemapTrustedUserPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (paddrs.len == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const page_count_u64: u64 = @intCast(paddrs.len);
+    const size_u64 = page_count_u64 * 4096;
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+
+    var page_index: usize = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const paddr = paddrs[page_index];
+        if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |pt_slot| {
+            const old_entry = space.pt_pages[pt_slot][index.pt];
+            if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) == 0) return false;
+        }
+    }
+
+    page_index = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        var present = false;
+        if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |pt_slot| {
+            const old_entry = space.pt_pages[pt_slot][index.pt];
+            present = (old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0;
+        }
+        if (!present and !reserveUserMapping(principal, va, 1, .linear_region, prot.write)) {
+            var rollback_index: usize = 0;
+            while (rollback_index < page_index) : (rollback_index += 1) {
+                const rollback_va = va_start + @as(u64, @intCast(rollback_index)) * 4096;
+                const rollback_page = userPageIndexForVa(h, rollback_va) orelse continue;
+                var rollback_present = false;
+                if (findUserPtSlotForPd(space, rollback_page.pml4, rollback_page.pdp, rollback_page.pd)) |pt_slot| {
+                    const old_entry = space.pt_pages[pt_slot][rollback_page.pt];
+                    rollback_present = (old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0;
+                }
+                if (!rollback_present) _ = releaseUserMapping(principal, rollback_va, 1);
+            }
+            return false;
+        }
+    }
+
+    page_index = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
+        space.pt_pages[pt_slot][index.pt] = paddrs[page_index] | pte_flags;
+    }
+    h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
+
+    return true;
+}
+
 pub fn protectUserLinearRegionWithProt(
     principal: kernel.PrincipalId,
     va_start: u64,
@@ -854,6 +940,39 @@ pub fn protectUserLinearRegionWithProt(
         if ((old_entry & h.page_user) == 0) return false;
         const paddr = ptePaddr(old_entry);
         pt_page[index.pt] = paddr | pte_flags;
+    }
+    h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
+
+    return true;
+}
+
+pub fn protectPresentUserLinearRegionWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+    prot: kernel.MapProt,
+) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (size_bytes == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const size_u64: u64 = @intCast(size_bytes);
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+
+    var offset: u64 = 0;
+    while (offset < size_u64) : (offset += 4096) {
+        const va = va_start + offset;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const old_entry = pt_page[index.pt];
+        if ((old_entry & h.page_present) == 0) continue;
+        if ((old_entry & h.page_user) == 0) return false;
+        pt_page[index.pt] = ptePaddr(old_entry) | pte_flags;
     }
     h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
 
@@ -910,6 +1029,59 @@ pub fn unmapUserLinearRegion(
         }
     }
     if (!releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
+    h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
+    var touched_index: usize = 0;
+    while (touched_index < touched_count) : (touched_index += 1) {
+        releaseUserPtSlotIfEmpty(h, space, touched_slots[touched_index]);
+    }
+
+    return true;
+}
+
+pub fn unmapPresentUserLinearRegion(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (size_bytes == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const size_u64: u64 = @intCast(size_bytes);
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+
+    var touched_slots: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
+    var touched_count: usize = 0;
+
+    var offset: u64 = 0;
+    while (offset < size_u64) : (offset += 4096) {
+        const va = va_start + offset;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const old_entry = pt_page[index.pt];
+        if ((old_entry & h.page_present) == 0) continue;
+        if ((old_entry & h.page_user) == 0) return false;
+        pt_page[index.pt] = 0;
+
+        var seen = false;
+        var touched_index: usize = 0;
+        while (touched_index < touched_count) : (touched_index += 1) {
+            if (touched_slots[touched_index] == pt_slot) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen and touched_count < touched_slots.len) {
+            touched_slots[touched_count] = @intCast(pt_slot);
+            touched_count += 1;
+        }
+    }
+
+    _ = releaseUserMapping(principal, va_start, size_u64 / 4096);
     h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
     var touched_index: usize = 0;
     while (touched_index < touched_count) : (touched_index += 1) {

@@ -465,20 +465,34 @@ fn mapVmoFd(
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
     prot.pkey = flags.pkey;
-    const base_va = if (requested_va != 0)
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
+
+    const use_requested_hint =
+        requested_va != 0 and
+        !flags.fixed and
+        !flags.fixed_noreplace and
+        (requested_va & 0xFFF) == 0 and
+        (state.userMapRangeIsFree(proc, requested_va, aligned_size) catch false);
+    const base_va = if (flags.fixed or flags.fixed_noreplace or use_requested_hint)
         requested_va
     else
         state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch return sc.syscall_err_map;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
-
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (flags.fixed) {
+        if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_map;
+        state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch return sc.syscall_err_map;
+    } else if (flags.fixed_noreplace) {
+        if (!(state.userMapRangeIsFree(proc, base_va, aligned_size) catch false)) return sc.syscall_err_invalid;
+    }
 
     const vmo_ref = if (flags.anonymous) blk: {
         if (vmo_offset != 0) return sc.syscall_err_invalid;
-        break :blk state.createAnonymousVmaWithPages(proc, base_va, aligned_size, prot, flags, free_list) catch |err| switch (err) {
-            kernel.KernelError.TableFull => return sc.syscall_err_alloc,
-            else => return sc.syscall_err_invalid,
+        break :blk state.createAnonymousVmaWithPages(proc, base_va, aligned_size, prot, flags, free_list) catch |err| {
+            switch (err) {
+                kernel.KernelError.TableFull => return sc.syscall_err_alloc,
+                else => return sc.syscall_err_invalid,
+            }
         };
     } else blk: {
         const ref = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
@@ -488,6 +502,8 @@ fn mapVmoFd(
         };
         break :blk ref;
     };
+
+    if (flags.anonymous) return base_va;
 
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
@@ -531,24 +547,20 @@ fn mprotectVmaRange(
     if (base_va + aligned_size > start_vma.endVa()) return sc.syscall_err_invalid;
 
     if (!prot.read and !prot.write and !prot.exec) {
-        if (!user_vm.unmapUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_map;
+        if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_map;
         state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
         return sc.syscall_ok;
     }
 
     const page_count: usize = @intCast(aligned_size / 4096);
-    var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     var page_index: usize = 0;
     while (page_index < page_count) : (page_index += 1) {
         const va = base_va + @as(u64, @intCast(page_index)) * 4096;
         const vma = state.vmaEntryForVaConst(proc, va) orelse return sc.syscall_err_invalid;
         if (va + 4096 > vma.endVa()) return sc.syscall_err_invalid;
-        const vmo_page_u64 = (vma.vmo_offset + (va - vma.start_va)) / 4096;
-        if (vmo_page_u64 > @as(u64, @intCast(kernel.max_vmo_backing_pages))) return sc.syscall_err_invalid;
-        paddrs[page_index] = state.nativeVmoPagePaddr(vma.vmo, @intCast(vmo_page_u64)) orelse return sc.syscall_err_map;
     }
 
-    if (!user_vm.remapTrustedUserPaddrsWithProt(proc, base_va, paddrs[0..page_count], .{
+    if (!user_vm.protectPresentUserLinearRegionWithProt(proc, base_va, @intCast(aligned_size), .{
         .read = prot.read,
         .write = prot.write,
         .exec = prot.exec,
@@ -739,7 +751,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             defer user_vm.unlockAddressSpaces();
             const vma = state.vmaEntryConst(proc, frame.rdi) orelse break :blk sc.syscall_err_invalid;
             if (vma.size_bytes != size) break :blk sc.syscall_err_invalid;
-            if (!user_vm.unmapUserLinearRegion(proc, frame.rdi, @intCast(size))) break :blk sc.syscall_err_map;
+            if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) break :blk sc.syscall_err_map;
             state.munmapExactWithFreeList(proc, frame.rdi, size, h.free_list) catch break :blk sc.syscall_err_map;
             break :blk sc.syscall_ok;
         },

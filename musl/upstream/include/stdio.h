@@ -47,7 +47,11 @@ extern "C" {
 #define _IOLBF 1
 #define _IONBF 2
 
+#ifdef __pachaos__
+#define BUFSIZ 16384
+#else
 #define BUFSIZ 1024
+#endif
 #define FILENAME_MAX 4096
 #define FOPEN_MAX 1000
 #define TMP_MAX 10000

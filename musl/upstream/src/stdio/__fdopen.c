@@ -43,8 +43,12 @@ FILE *__fdopen(int fd, const char *mode)
 
 	/* Activate line buffered mode for terminals */
 	f->lbf = EOF;
+#ifndef __pachaos__
 	if (!(f->flags & F_NOWR) && !__syscall(SYS_ioctl, fd, TIOCGWINSZ, &wsz))
 		f->lbf = '\n';
+#else
+	(void)wsz;
+#endif
 
 	/* Initialize op ptrs. No problem if some are unneeded. */
 	f->read = __stdio_read;

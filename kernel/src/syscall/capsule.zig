@@ -12,6 +12,8 @@ const TrapFrame = interrupts.TrapFrame;
 const pci_config_size: usize = 256;
 const page_size: u64 = 4096;
 const first_dynamic_fd: kernel.Fd = abi_root.fd_abi.first_dynamic_fd;
+var dma_pack_old_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
+var dma_pack_new_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
 
 fn statusFromKernelError(err: kernel.KernelError) u64 {
     return switch (err) {
@@ -101,7 +103,13 @@ fn mapPciBarIntoUser(proc: kernel.PrincipalId, user_va: u64, map_size: u64, flag
     return user_vm.mapUserLinearRegion(proc, user_va, paddr, size_usize, true);
 }
 
-fn userDmaAddressForRange(proc: kernel.PrincipalId, user_va: u64, size: u64) ?u64 {
+fn userDmaAddressForRange(
+    state: *kernel.KernelState,
+    free_list: *kernel.FreePageList,
+    proc: kernel.PrincipalId,
+    user_va: u64,
+    size: u64,
+) ?u64 {
     if (user_va == 0 or size == 0) return null;
     const first_page_va = pageAlignDown(user_va);
     const offset = user_va - first_page_va;
@@ -110,9 +118,50 @@ fn userDmaAddressForRange(proc: kernel.PrincipalId, user_va: u64, size: u64) ?u6
     const page_span = pageAlignUp(span) orelse return null;
     const page_count = page_span / page_size;
     if (page_count == 0) return null;
+    if (page_span > std.math.maxInt(usize)) return null;
 
-    const first_paddr = user_vm.lookupUserMappedPaddrForVa(proc, first_page_va) orelse return null;
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
+
+    const existing_first_paddr = user_vm.lookupUserMappedPaddrForVa(proc, first_page_va);
+    if (existing_first_paddr) |first_paddr| {
+        if ((first_paddr & (page_size - 1)) != 0) return null;
+        var existing_page_index: u64 = 1;
+        while (existing_page_index < page_count) : (existing_page_index += 1) {
+            const va = first_page_va + existing_page_index * page_size;
+            const paddr = user_vm.lookupUserMappedPaddrForVa(proc, va) orelse break;
+            if (paddr != first_paddr + existing_page_index * page_size) break;
+        } else {
+            return first_paddr + offset;
+        }
+    }
+
+    const page_count_usize: usize = @intCast(page_count);
+    const first_paddr = state.packNativeVmaContiguousMapping(
+        proc,
+        first_page_va,
+        page_span,
+        true,
+        free_list,
+        dma_pack_old_paddrs[0..page_count_usize],
+        dma_pack_new_paddrs[0..page_count_usize],
+    ) orelse return null;
     if ((first_paddr & (page_size - 1)) != 0) return null;
+
+    if (!user_vm.mapOrRemapTrustedUserPaddrsWithProt(proc, first_page_va, dma_pack_new_paddrs[0..page_count_usize], .{
+        .read = true,
+        .write = true,
+        .exec = false,
+    })) return null;
+
+    var free_index: usize = 0;
+    while (free_index < page_count_usize) : (free_index += 1) {
+        const old_paddr = dma_pack_old_paddrs[free_index];
+        if (old_paddr != 0 and old_paddr != dma_pack_new_paddrs[free_index]) {
+            free_list.appendPage(0, old_paddr) catch {};
+        }
+    }
+
     var page_index: u64 = 1;
     while (page_index < page_count) : (page_index += 1) {
         const va = first_page_va + page_index * page_size;
@@ -271,7 +320,7 @@ pub fn dispatch(
                 else => break :blk sc.syscall_err_invalid,
             };
             const flags = flagsArg(frame.r8, capsule_abi.dma_buffer_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(proc, frame.rsi, frame.r10) orelse break :blk sc.syscall_err_invalid;
+            const paddr = userDmaAddressForRange(state, h.free_list, proc, frame.rsi, frame.r10) orelse break :blk sc.syscall_err_invalid;
             const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.r10) orelse break :blk sc.syscall_err_invalid;
             if (!vtd.mapRange(iova, paddr, frame.r10)) break :blk sc.syscall_err_map;
             break :blk state.createDmaBufferFd(proc, .{
@@ -294,7 +343,7 @@ pub fn dispatch(
             };
             const direction = parseDmaDirection(frame.r8) orelse break :blk sc.syscall_err_invalid;
             const flags = flagsArg(frame.r9, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(proc, frame.rsi, frame.r10) orelse break :blk sc.syscall_err_invalid;
+            const paddr = userDmaAddressForRange(state, h.free_list, proc, frame.rsi, frame.r10) orelse break :blk sc.syscall_err_invalid;
             const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.r10) orelse break :blk sc.syscall_err_invalid;
             if (!vtd.mapRange(iova, paddr, frame.r10)) break :blk sc.syscall_err_map;
             break :blk state.createDmaMappingFd(proc, .{
@@ -314,7 +363,7 @@ pub fn dispatch(
             const direction = parseDmaDirection(frame.r10) orelse break :blk sc.syscall_err_invalid;
             const flags = flagsArg(frame.r8, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
             if (frame.rdx == 0 or frame.rdx > buffer.size) break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(proc, buffer.user_va, frame.rdx) orelse break :blk sc.syscall_err_invalid;
+            const paddr = userDmaAddressForRange(state, h.free_list, proc, buffer.user_va, frame.rdx) orelse break :blk sc.syscall_err_invalid;
             const iova = dmaIovaOrKernelChoice(frame.rsi, paddr, frame.rdx) orelse break :blk sc.syscall_err_invalid;
             if (!vtd.mapRange(iova, paddr, frame.rdx)) break :blk sc.syscall_err_map;
             break :blk state.createDmaMappingFd(proc, .{

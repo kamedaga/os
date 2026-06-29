@@ -36,20 +36,36 @@ struct __pachaos_filed_fd_entry {
 
 struct __pachaos_filed_open_cache_entry {
 	unsigned char used;
+	unsigned char stat_valid;
+	unsigned char read_cache_valid;
+	unsigned char read_cache_eof;
+	unsigned char slot_index;
+	unsigned short read_cache_len;
 	unsigned int rights;
 	unsigned int open_flags;
 	unsigned long long handle;
 	unsigned long long object_generation;
 	unsigned long long dir_generation;
+	unsigned long long stat_mode;
+	unsigned long long stat_size;
+	unsigned long long stat_blocks;
+	unsigned long long stat_nlink;
+	unsigned long long stat_kind;
+	unsigned long long read_cache_offset;
 	char path[PACHAOS_FILED_NAME_BYTES];
 };
 
 struct __pachaos_filed_fd_entry __pachaos_filed_fds[128];
 unsigned char __pachaos_filed_fd_used[128];
 struct __pachaos_filed_open_cache_entry __pachaos_filed_open_cache[PACHAOS_FILED_OPEN_CACHE_CAP];
+unsigned char __pachaos_filed_open_cache_read_data[PACHAOS_FILED_OPEN_CACHE_CAP][PACHAOS_FILED_READ_CACHE_STORAGE_BYTES];
 unsigned long long __pachaos_filed_request_id = 100;
 long __pachaos_filed_page_fd = -1;
 unsigned char *__pachaos_filed_page_addr;
 unsigned char *__pachaos_filed_session_page_addr;
 int __pachaos_filed_page_lock;
 long __pachaos_filed_session_fd = -1;
+unsigned char *__pachaos_brk_base;
+unsigned char *__pachaos_brk_cur;
+unsigned char *__pachaos_brk_limit;
+int __pachaos_brk_lock;

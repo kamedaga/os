@@ -1521,6 +1521,100 @@ filed_status_t filed_vfs_get_stat_snapshot(
     return FILED_OK;
 }
 
+static bool filed_path_component_equals(
+    const char *path,
+    size_t start,
+    size_t end,
+    const char *name)
+{
+    size_t name_len;
+
+    if (path == NULL || name == NULL || end <= start) {
+        return false;
+    }
+    name_len = strlen(name);
+    if (name_len != end - start) {
+        return false;
+    }
+    return memcmp(path + start, name, name_len) == 0;
+}
+
+filed_status_t filed_vfs_validate_cached_handle_path(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    const char *absolute_path,
+    uint32_t rights,
+    filed_generation_t object_generation)
+{
+    const filed_handle_t *handle;
+    const filed_file_t *file;
+    const filed_vnode_t *vnode;
+    const filed_vnode_t *current;
+    size_t end;
+
+    if (vfs == NULL ||
+        handle_id == 0 ||
+        absolute_path == NULL ||
+        absolute_path[0] != '/')
+    {
+        return FILED_ERR_INVALID;
+    }
+
+    handle = filed_find_handle_const(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_NOT_FOUND;
+    }
+    if (!filed_rights_include(handle->rights, rights)) {
+        return FILED_ERR_DENIED;
+    }
+    file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_NOT_FOUND;
+    }
+    vnode = filed_find_vnode_const(vfs, file->vnode_id);
+    if (vnode == NULL || !vnode->active || !vnode->linked) {
+        return FILED_ERR_NOT_FOUND;
+    }
+    if (object_generation != 0 && vnode->object_generation != object_generation) {
+        return FILED_ERR_NOT_FOUND;
+    }
+
+    end = 0;
+    while (end < 256 && absolute_path[end] != '\0') {
+        ++end;
+    }
+    if (end == 0 || end >= 256) {
+        return FILED_ERR_INVALID;
+    }
+    if (end == 1) {
+        return vnode->parent == 0 ? FILED_OK : FILED_ERR_NOT_FOUND;
+    }
+    if (absolute_path[end - 1] == '/') {
+        return FILED_ERR_NOT_FOUND;
+    }
+
+    current = vnode;
+    while (current != NULL && current->parent != 0) {
+        size_t slash = end;
+        while (slash > 0 && absolute_path[slash - 1] != '/') {
+            --slash;
+        }
+        if (slash == 0 || slash == end) {
+            return FILED_ERR_NOT_FOUND;
+        }
+        if (!filed_path_component_equals(absolute_path, slash, end, current->name)) {
+            return FILED_ERR_NOT_FOUND;
+        }
+        current = filed_find_vnode_const(vfs, current->parent);
+        end = slash - 1;
+    }
+
+    if (current == NULL || current->parent != 0) {
+        return FILED_ERR_NOT_FOUND;
+    }
+    return end == 0 ? FILED_OK : FILED_ERR_NOT_FOUND;
+}
+
 filed_status_t filed_vfs_update_stat_snapshot(
     filed_vfs_t *vfs,
     filed_backend_object_id_t backend_object,

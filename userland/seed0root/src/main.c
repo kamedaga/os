@@ -3,8 +3,8 @@
 #include "filed/ipc_protocol.h"
 #include "koboxd/ipc_protocol.h"
 
-#ifndef SEED0ROOT_BOOT_BENCH
-#define SEED0ROOT_BOOT_BENCH 0
+#ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
+#define SEED0ROOT_DEFAULT_BOOT_PROFILE 0u
 #endif
 
 #include <stdint.h>
@@ -46,6 +46,9 @@ enum {
     SEED0ROOT_AT_RANDOM = 25,
     SEED0ROOT_AT_EXECFN = 31,
     SEED0ROOT_TASK_STATE_EXITED = 2,
+    SEED0ROOT_BOOT_PROFILE_MEMORY = 1u << 0,
+    SEED0ROOT_BOOT_PROFILE_BENCH = 1u << 1,
+    SEED0ROOT_BOOT_PROFILE_FS_WRITE = 1u << 2,
 };
 
 struct seed0root_bootstrap_module {
@@ -85,6 +88,11 @@ struct seed0root_started_process {
     int process_fd;
     int thread_fd;
     uint64_t start_ms;
+};
+
+struct seed0root_timespec {
+    int64_t tv_sec;
+    int64_t tv_nsec;
 };
 
 static int load_elf_process(
@@ -127,6 +135,20 @@ static void wr64(unsigned char *p, uint64_t value)
 static uint64_t align_down(uint64_t value)
 {
     return value & ~(uint64_t)(SEED0ROOT_PAGE_SIZE - 1);
+}
+
+static uint64_t seed0root_now_ns(void)
+{
+    struct seed0root_timespec ts;
+    memset(&ts, 0, sizeof(ts));
+    const long status = pacha_syscall2(
+        PACHA_RUNTIME_SYSCALL_CLOCK_GETTIME,
+        PACHA_TIMERFD_CLOCK_MONOTONIC,
+        (uint64_t)(uintptr_t)&ts);
+    if (status != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 static int align_up(uint64_t value, uint64_t *out)
@@ -795,11 +817,142 @@ static int seed0root_run_filed_no_cache_probe(int filed_endpoint_fd)
     return probe_status;
 }
 
+static int seed0root_read_filed_text(
+    int filed_endpoint_fd,
+    const char *path,
+    char *out,
+    size_t out_capacity)
+{
+    if (filed_endpoint_fd < 16 || path == NULL || out == NULL || out_capacity == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_filed_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    filed_wire_openat_t *openat = (filed_wire_openat_t *)page;
+    openat->dir_handle = 0;
+    openat->rights = FILED_WIRE_RIGHT_READ | FILED_WIRE_RIGHT_STAT;
+    openat->open_flags = FILED_WIRE_OPEN_CLOEXEC;
+    snprintf(openat->name, sizeof(openat->name), "%s", path);
+
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_OPENAT,
+        0x5eed0f21u,
+        page_fd,
+        0,
+        &reply,
+        NULL,
+        0);
+    seed0root_destroy_filed_wire_page(page_fd, page);
+    page_fd = -1;
+    page = NULL;
+    if (status != 0) {
+        return status;
+    }
+
+    const uint64_t handle = reply.word2;
+    status = seed0root_create_filed_wire_page(&page_fd, &page);
+    if (status != 0) {
+        (void)seed0root_filed_call(
+            filed_endpoint_fd,
+            FILED_WIRE_OP_CLOSE,
+            0x5eed0f23u,
+            -1,
+            handle,
+            &reply,
+            NULL,
+            0);
+        return status;
+    }
+
+    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    io->handle = handle;
+    io->offset = 0;
+    io->length = out_capacity - 1;
+    memset(&reply, 0, sizeof(reply));
+    status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_PREAD,
+        0x5eed0f22u,
+        page_fd,
+        0,
+        &reply,
+        NULL,
+        0);
+    if (status == 0) {
+        size_t copied = (size_t)reply.word2;
+        if (copied >= out_capacity) {
+            copied = out_capacity - 1;
+        }
+        memcpy(out, io->data, copied);
+        out[copied] = '\0';
+    }
+    seed0root_destroy_filed_wire_page(page_fd, page);
+
+    memset(&reply, 0, sizeof(reply));
+    const int close_status = seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_CLOSE,
+        0x5eed0f23u,
+        -1,
+        handle,
+        &reply,
+        NULL,
+        0);
+    return status == 0 ? close_status : status;
+}
+
+static int seed0root_profile_has_token(const char *profile, const char *token)
+{
+    return profile != NULL && token != NULL && strstr(profile, token) != NULL;
+}
+
+static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
+{
+    unsigned flags = SEED0ROOT_DEFAULT_BOOT_PROFILE;
+    char profile[128];
+    const int status = seed0root_read_filed_text(
+        filed_endpoint_fd,
+        "/etc/pacha_boot_profile",
+        profile,
+        sizeof(profile));
+    if (status != 0) {
+        return flags;
+    }
+    if (seed0root_profile_has_token(profile, "all")) {
+        flags |=
+            SEED0ROOT_BOOT_PROFILE_MEMORY |
+            SEED0ROOT_BOOT_PROFILE_BENCH |
+            SEED0ROOT_BOOT_PROFILE_FS_WRITE;
+    }
+    if (seed0root_profile_has_token(profile, "memory")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_MEMORY;
+    }
+    if (seed0root_profile_has_token(profile, "bench")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_BENCH;
+    }
+    if (seed0root_profile_has_token(profile, "fs-write")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_FS_WRITE;
+    }
+    printf("[seed0root] boot profile flags=%u\n", flags);
+    return flags;
+}
+
 static int seed0root_wait_process(int process_fd, const char *label)
 {
     if (process_fd < 16) {
         return -1;
     }
+    const uint64_t start_ns = seed0root_now_ns();
     uint64_t status_words[4] = {0, 0, 0, 0};
     for (;;) {
         const long wait_status = pacha_syscall2(
@@ -809,10 +962,14 @@ static int seed0root_wait_process(int process_fd, const char *label)
         if (wait_status == 0) {
             const uint64_t state = status_words[0];
             const uint64_t exit_code = status_words[1];
-            printf("[seed0root] %s completed state=%llu exit=%llu\n",
+            const uint64_t end_ns = seed0root_now_ns();
+            const uint64_t elapsed_ns =
+                (start_ns != 0 && end_ns >= start_ns) ? end_ns - start_ns : 0;
+            printf("[seed0root] %s completed state=%llu exit=%llu ns=%llu\n",
                 label != NULL ? label : "process",
                 (unsigned long long)state,
-                (unsigned long long)exit_code);
+                (unsigned long long)exit_code,
+                (unsigned long long)elapsed_ns);
             if (state == SEED0ROOT_TASK_STATE_EXITED && exit_code == 0) {
                 return 0;
             }
@@ -900,9 +1057,17 @@ static void seed0root_destroy_filed_wire_page(int fd, void *mapped)
     seed0root_destroy_wire_page(FILED_WIRE_PAGE_BYTES, fd, mapped);
 }
 
-static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
+static int seed0root_run_exec_path_smoke(
+    int filed_endpoint_fd,
+    const char *path,
+    const char *const *argv,
+    uint64_t argc,
+    const char *env,
+    const char *label)
 {
-    if (filed_endpoint_fd < 16) {
+    if (filed_endpoint_fd < 16 || path == NULL || label == NULL ||
+        argc > FILED_WIRE_EXEC_MAX_ARGS)
+    {
         return -1;
     }
 
@@ -916,12 +1081,17 @@ static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
     filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
     exec->dir_handle = 0;
     exec->flags = 0;
-    exec->argc = 1;
-    exec->envc = 1;
-    snprintf(exec->path, sizeof(exec->path), "%s", "/cmd/libc_vfs_exec_smoke.elf");
-    snprintf(exec->argv0, sizeof(exec->argv0), "%s", "/cmd/libc_vfs_exec_smoke.elf");
-    snprintf(exec->argv[0], sizeof(exec->argv[0]), "%s", "/cmd/libc_vfs_exec_smoke.elf");
-    snprintf(exec->envp[0], sizeof(exec->envp[0]), "%s", "PACHA_LIBC_VFS_EXEC_PARENT=1");
+    exec->argc = argc == 0 ? 1 : argc;
+    exec->envc = env != NULL ? 1 : 0;
+    snprintf(exec->path, sizeof(exec->path), "%s", path);
+    snprintf(exec->argv0, sizeof(exec->argv0), "%s", argc > 0 && argv != NULL ? argv[0] : path);
+    for (uint64_t i = 0; i < exec->argc; i++) {
+        const char *arg = (argc > 0 && argv != NULL && argv[i] != NULL) ? argv[i] : path;
+        snprintf(exec->argv[i], sizeof(exec->argv[i]), "%s", arg);
+    }
+    if (env != NULL) {
+        snprintf(exec->envp[0], sizeof(exec->envp[0]), "%s", env);
+    }
 
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
@@ -940,12 +1110,13 @@ static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
         return 0;
     }
     if (status != 0) {
-        fprintf(stderr, "[seed0root] libc vfs exec smoke failed status=%d\n", status);
+        fprintf(stderr, "[seed0root] %s failed status=%d\n", label, status);
         return status;
     }
     if (reply.fd_count < 2 || reply_fds[0].fd < 16 || reply_fds[1].fd < 16) {
         fprintf(stderr,
-            "[seed0root] libc vfs exec smoke reply invalid fd_count=%llu process_fd=%llu thread_fd=%llu\n",
+            "[seed0root] %s reply invalid fd_count=%llu process_fd=%llu thread_fd=%llu\n",
+            label,
             (unsigned long long)reply.fd_count,
             (unsigned long long)reply_fds[0].fd,
             (unsigned long long)reply_fds[1].fd);
@@ -960,12 +1131,83 @@ static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
 
     const int process_fd = (int)reply_fds[0].fd;
     const int thread_fd = (int)reply_fds[1].fd;
-    printf("[seed0root] libc vfs exec smoke started process_fd=%d thread_fd=%d\n", process_fd, thread_fd);
+    printf("[seed0root] %s started process_fd=%d thread_fd=%d\n", label, process_fd, thread_fd);
 
-    status = seed0root_wait_process(process_fd, "libc vfs exec smoke");
+    status = seed0root_wait_process(process_fd, label);
     (void)pacha_fd_close(thread_fd);
     (void)pacha_fd_close(process_fd);
     return status;
+}
+
+static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
+{
+    const char *argv[] = { "/cmd/libc_vfs_exec_smoke.elf" };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/libc_vfs_exec_smoke.elf",
+        argv,
+        1,
+        "PACHA_LIBC_VFS_EXEC_PARENT=1",
+        "libc vfs exec smoke");
+}
+
+static int seed0root_run_libc_mix_bench(int filed_endpoint_fd)
+{
+    const char *argv[] = { "/cmd/libc_mix_bench.elf" };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/libc_mix_bench.elf",
+        argv,
+        1,
+        "PACHA_LIBC_MIX_BENCH=1",
+        "libc mix bench");
+}
+
+static int seed0root_run_libc_alloc_probe(int filed_endpoint_fd)
+{
+    const char *argv[] = { "/cmd/libc_alloc_probe.elf" };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/libc_alloc_probe.elf",
+        argv,
+        1,
+        "PACHA_LIBC_ALLOC_PROBE=1",
+        "libc alloc probe");
+}
+
+static int seed0root_run_lua_cli_bench(int filed_endpoint_fd)
+{
+    const char *argv[] = {
+        "/cmd/lua.elf",
+        "/cmd/lua_workload.lua",
+    };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/lua.elf",
+        argv,
+        2,
+        "PACHA_LUA_CLI_BENCH=1",
+        "lua cli bench");
+}
+
+static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
+{
+    const char *argv[] = {
+        "/cmd/chibicc.elf",
+        "-cc1",
+        "-cc1-input",
+        "/cmd/chibicc_workload.c",
+        "-cc1-output",
+        "/tmp/chibicc_workload.s",
+        "/cmd/chibicc_workload.c",
+    };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/chibicc.elf",
+        argv,
+        7,
+        "PACHA_CHIBICC_CLI_BENCH=1",
+        "chibicc cli bench");
 }
 
 static int seed0root_connect_storage_services(int control_fd)
@@ -994,18 +1236,35 @@ static int seed0root_connect_storage_services(int control_fd)
     if (status == 0 && filed_endpoint_fd >= 16) {
         printf("[seed0root] filed ready\n");
     }
-    if (SEED0ROOT_BOOT_BENCH && status == 0 && filed_endpoint_fd >= 16) {
+    const unsigned boot_profile = (status == 0 && filed_endpoint_fd >= 16) ?
+        seed0root_boot_profile_flags(filed_endpoint_fd) :
+        SEED0ROOT_DEFAULT_BOOT_PROFILE;
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_FS_WRITE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_filed_no_cache_probe(filed_endpoint_fd);
     }
-    if (SEED0ROOT_BOOT_BENCH && status == 0 && filed_endpoint_fd >= 16) {
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_FS_WRITE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_libc_vfs_exec_smoke(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_MEMORY) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_libc_alloc_probe(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_libc_mix_bench(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_lua_cli_bench(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_chibicc_cli_bench(filed_endpoint_fd);
+    }
+    if (boot_profile != 0 && status == 0 && filed_endpoint_fd >= 16) {
         const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
         printf("[seed0root] filed metrics dump status=%d\n", metrics_status);
     }
     if (filed_endpoint_fd >= 16) {
         (void)pacha_fd_close(filed_endpoint_fd);
     }
-    if (SEED0ROOT_BOOT_BENCH && status == 0) {
+    if (boot_profile != 0 && status == 0) {
         status = seed0root_fs_sync_all(fs_fd);
         printf("[seed0root] storage clean checkpoint status=%d\n", status);
     }

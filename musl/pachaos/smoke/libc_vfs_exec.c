@@ -1558,6 +1558,174 @@ static int run_child(int argc, char **argv, char **envp)
     return 0;
 }
 
+static void fill_stress_page(char *page, size_t page_size, unsigned long long file_index, unsigned long long page_index)
+{
+    for (size_t i = 0; i < page_size; i++) {
+        page[i] = (char)('A' + ((file_index + page_index + i) % 26));
+    }
+}
+
+static int run_fs_write_stress(void)
+{
+    enum {
+        stress_files = 16,
+        stress_pages_per_file = 8,
+        stress_page_size = 4096,
+    };
+    char page[stress_page_size];
+    char readback[stress_page_size];
+    unsigned long long create_ns = 0;
+    unsigned long long write_ns = 0;
+    unsigned long long read_ns = 0;
+    unsigned long long truncate_ns = 0;
+    unsigned long long truncate_skipped = 0;
+    unsigned long long close_ns = 0;
+    unsigned long long rename_ns = 0;
+    unsigned long long rename_skipped = 0;
+    unsigned long long reopen_ns = 0;
+    unsigned long long unlink_ns = 0;
+    unsigned long long unlink_skipped = 0;
+    unsigned long long checksum = 0;
+    const unsigned long long tag = now_ns();
+    unsigned long long t0 = now_ns();
+
+    for (unsigned long long file_index = 0; file_index < stress_files; file_index++) {
+        char path[128];
+        char renamed[128];
+        snprintf(path, sizeof(path), "/tmp/libc-vfs-write-stress-%llx-%llu.tmp", tag, file_index);
+        snprintf(renamed, sizeof(renamed), "/tmp/libc-vfs-write-stress-%llx-%llu.renamed", tag, file_index);
+        (void)unlink(path);
+        (void)unlink(renamed);
+
+        unsigned long long part0 = now_ns();
+        int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        unsigned long long part1 = now_ns();
+        create_ns += part1 - part0;
+        if (fd < 0) return fail("fs write stress create");
+
+        for (unsigned long long page_index = 0; page_index < stress_pages_per_file; page_index++) {
+            fill_stress_page(page, sizeof(page), file_index, page_index);
+            part0 = now_ns();
+            ssize_t wrote = write(fd, page, sizeof(page));
+            part1 = now_ns();
+            write_ns += part1 - part0;
+            if (wrote != (ssize_t)sizeof(page)) {
+                (void)close(fd);
+                return fail("fs write stress write");
+            }
+        }
+
+        if (lseek(fd, 0, SEEK_SET) != 0) {
+            (void)close(fd);
+            return fail("fs write stress seek readback");
+        }
+        memset(readback, 0, sizeof(readback));
+        part0 = now_ns();
+        ssize_t got = read(fd, readback, sizeof(readback));
+        part1 = now_ns();
+        read_ns += part1 - part0;
+        if (got != (ssize_t)sizeof(readback)) {
+            (void)close(fd);
+            return fail("fs write stress readback");
+        }
+        fill_stress_page(page, sizeof(page), file_index, 0);
+        if (memcmp(page, readback, sizeof(page)) != 0) {
+            (void)close(fd);
+            return fail("fs write stress content");
+        }
+        checksum += (unsigned char)readback[0];
+        checksum += (unsigned char)readback[sizeof(readback) - 1];
+
+        off_t expected_size = (off_t)(stress_page_size * stress_pages_per_file);
+        part0 = now_ns();
+        if (ftruncate(fd, (off_t)(stress_page_size * 4)) == 0) {
+            part1 = now_ns();
+            truncate_ns += part1 - part0;
+            expected_size = (off_t)(stress_page_size * 4);
+        } else if (errno == ENOSYS || errno == ENOTSUP || errno == EOPNOTSUPP) {
+            part1 = now_ns();
+            truncate_ns += part1 - part0;
+            truncate_skipped++;
+        } else {
+            (void)close(fd);
+            return fail("fs write stress truncate");
+        }
+
+        part0 = now_ns();
+        if (close(fd) != 0) return fail("fs write stress close");
+        part1 = now_ns();
+        close_ns += part1 - part0;
+
+        const char *final_path = renamed;
+        part0 = now_ns();
+        if (rename(path, renamed) == 0) {
+            part1 = now_ns();
+            rename_ns += part1 - part0;
+        } else if (errno == ENOSYS || errno == ENOTSUP || errno == EOPNOTSUPP) {
+            part1 = now_ns();
+            rename_ns += part1 - part0;
+            rename_skipped++;
+            final_path = path;
+        } else {
+            return fail("fs write stress rename");
+        }
+
+        part0 = now_ns();
+        fd = open(final_path, O_RDONLY | O_CLOEXEC);
+        part1 = now_ns();
+        reopen_ns += part1 - part0;
+        if (fd < 0) return fail("fs write stress reopen");
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        if (fstat(fd, &st) != 0 || st.st_size != expected_size) {
+            (void)close(fd);
+            return fail("fs write stress stat");
+        }
+        if (close(fd) != 0) return fail("fs write stress close reopen");
+
+        part0 = now_ns();
+        if (unlink(final_path) == 0) {
+            part1 = now_ns();
+            unlink_ns += part1 - part0;
+        } else if (errno == ENOSYS || errno == ENOTSUP || errno == EOPNOTSUPP) {
+            part1 = now_ns();
+            unlink_ns += part1 - part0;
+            unlink_skipped++;
+        } else {
+            return fail("fs write stress unlink");
+        }
+    }
+
+    unsigned long long t1 = now_ns();
+    metric_avg("fs_write_stress", t0, t1, stress_files);
+    metric_total_avg("fs_write_stress.create", create_ns, stress_files);
+    metric_total_avg("fs_write_stress.write_page", write_ns, stress_files * stress_pages_per_file);
+    metric_total_avg("fs_write_stress.readback", read_ns, stress_files);
+    metric_total_avg("fs_write_stress.truncate", truncate_ns, stress_files);
+    printf(
+        "[libc-vfs-exec-smoke] metric op=fs_write_stress.truncate_skipped iterations=%d total=%llu avg=%llu\n",
+        stress_files,
+        truncate_skipped,
+        truncate_skipped == 0 ? 0ull : 1ull);
+    metric_total_avg("fs_write_stress.close", close_ns, stress_files);
+    metric_total_avg("fs_write_stress.rename", rename_ns, stress_files);
+    printf(
+        "[libc-vfs-exec-smoke] metric op=fs_write_stress.rename_skipped iterations=%d total=%llu avg=%llu\n",
+        stress_files,
+        rename_skipped,
+        rename_skipped == 0 ? 0ull : 1ull);
+    metric_total_avg("fs_write_stress.reopen", reopen_ns, stress_files);
+    metric_total_avg("fs_write_stress.unlink", unlink_ns, stress_files);
+    printf(
+        "[libc-vfs-exec-smoke] metric op=fs_write_stress.unlink_skipped iterations=%d total=%llu avg=%llu\n",
+        stress_files,
+        unlink_skipped,
+        unlink_skipped == 0 ? 0ull : 1ull);
+    printf("[libc-vfs-exec-smoke] metric op=fs_write_stress_checksum total=%llu\n", checksum);
+    fflush(stdout);
+    return 0;
+}
+
 static int run_vfs(void)
 {
     const char *path = "/tmp/libc-vfs-exec-smoke.txt";
@@ -2522,6 +2690,10 @@ static int run_vfs(void)
     fflush(stdout);
 
     if (run_filed_raw_operation_bench(path) != 0) {
+        return 1;
+    }
+
+    if (run_fs_write_stress() != 0) {
         return 1;
     }
 

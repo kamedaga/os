@@ -680,8 +680,8 @@ pub const IpcRecvResult = struct {
 };
 
 pub const native_page_size: u64 = 4096;
-pub const max_native_vmos: usize = 4096;
-pub const max_vmas_per_process: usize = 512;
+pub const max_native_vmos: usize = 32768;
+pub const max_vmas_per_process: usize = 8192;
 
 pub const NativeVmoKind = enum(u8) {
     none = 0,
@@ -701,7 +701,7 @@ pub const NativeVmoSlot = struct {
     kind: NativeVmoKind = .none,
     generation: u32 = 1,
     size_bytes: u64 = 0,
-    page_count: u16 = 0,
+    page_count: u32 = 0,
     page_store_start: u32 = 0,
     ref_count: u32 = 0,
 };
@@ -742,6 +742,7 @@ pub const VmaEntry = struct {
 
 pub const VmaTable = struct {
     entries: [max_vmas_per_process]VmaEntry = [_]VmaEntry{.{}} ** max_vmas_per_process,
+    next_user_map_va: u64 = 0,
 };
 
 pub const NativeVmaFaultMapping = struct {
@@ -841,8 +842,8 @@ pub const PublishedEndpointTable = struct {
     }
 };
 
-pub const max_vmo_backing_pages: usize = 65535;
-pub const max_vmo_backing_store_pages: usize = 262144;
+pub const max_vmo_backing_pages: usize = 131072;
+pub const max_vmo_backing_store_pages: usize = 1048576;
 pub const max_vmo_backing_store_free_ranges: usize = 1024;
 
 var empty_vmo_backing_page_store: [0]u64 = .{};
@@ -918,7 +919,7 @@ fn allocEmptyVmoBackingPageStore(page_count: usize) ?u32 {
     return @intCast(start);
 }
 
-fn vmoBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize) ?u64 {
+fn vmoBackingPageStorePaddr(start: u32, page_count: u32, page_index: usize) ?u64 {
     if (page_index >= page_count) return null;
     const store_index = @as(usize, start) + page_index;
     if (store_index >= vmo_backing_page_store.len) return null;
@@ -927,7 +928,7 @@ fn vmoBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize) ?u64
     return paddr;
 }
 
-fn setVmoBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize, paddr: u64) bool {
+fn setVmoBackingPageStorePaddr(start: u32, page_count: u32, page_index: usize, paddr: u64) bool {
     if ((paddr & 0xFFF) != 0) return false;
     if (page_index >= page_count) return false;
     const store_index = @as(usize, start) + page_index;
@@ -936,13 +937,13 @@ fn setVmoBackingPageStorePaddr(start: u32, page_count: u16, page_index: usize, p
     return true;
 }
 
-fn freeVmoBackingPageStore(start: u32, page_count: u16) bool {
+fn freeVmoBackingPageStore(start: u32, page_count: u32) bool {
     if (page_count == 0) return true;
     const start_usize: usize = @intCast(start);
     const count_usize: usize = @intCast(page_count);
     if (start_usize + count_usize > vmo_backing_page_store.len) return false;
     @memset(vmo_backing_page_store[start_usize .. start_usize + count_usize], 0);
-    return insertVmoBackingFreeRange(start, page_count);
+    return insertVmoBackingFreeRange(start, @intCast(page_count));
 }
 
 fn resetVmoBackingPageStore() void {
@@ -1316,6 +1317,35 @@ pub const FreePageList = struct {
         }
         return KernelError.OutOfFreePages;
     }
+
+    pub fn popContiguousBelow(
+        self: *FreePageList,
+        page_count: usize,
+        limit_exclusive: u64,
+    ) KernelError!u64 {
+        if (page_count == 0) return KernelError.InvalidState;
+        if (self.len < page_count or self.range_len == 0) return KernelError.OutOfFreePages;
+        const size_bytes = @as(u64, @intCast(page_count)) * 4096;
+
+        var range_index: usize = 0;
+        while (range_index < self.range_len) : (range_index += 1) {
+            const range = &self.ranges[range_index];
+            if (range.len == 0) continue;
+            const range_start = range.physical_start;
+            const range_bytes = @as(u64, @intCast(range.len)) * 4096;
+            const range_end = range_start + range_bytes;
+            const usable_end = @min(range_end, limit_exclusive);
+            if (usable_end <= range_start or usable_end - range_start < size_bytes) continue;
+
+            const alloc_start = range_start;
+            range.physical_start += size_bytes;
+            range.len -= page_count;
+            if (range.len == 0) self.removeRangeAt(range_index);
+            self.len -= page_count;
+            return alloc_start;
+        }
+        return KernelError.OutOfFreePages;
+    }
 };
 
 pub const PageCapability = struct {
@@ -1486,7 +1516,7 @@ pub const KernelState = struct {
         const aligned_size = pageAlignUp(size_bytes);
         const page_count_u64 = aligned_size / native_page_size;
         if (page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return KernelError.InvalidState;
-        const page_count: u16 = @intCast(page_count_u64);
+        const page_count: u32 = @intCast(page_count_u64);
         var offset: usize = 0;
         while (offset < max_native_vmos) : (offset += 1) {
             const index = (self.next_native_vmo_scan + offset) % max_native_vmos;
@@ -1762,6 +1792,48 @@ pub const KernelState = struct {
         return paddr;
     }
 
+    fn nativeVmoPagePaddrOrHole(self: *const KernelState, vmo_ref: NativeVmoRef, page_index: usize) ?u64 {
+        const slot = self.nativeVmoSlotConst(vmo_ref) orelse return null;
+        return vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index);
+    }
+
+    fn releaseUnmappedAnonymousVmoPageRange(
+        self: *KernelState,
+        owner: PrincipalId,
+        vmo_ref: NativeVmoRef,
+        first_page: usize,
+        page_count: usize,
+        free_list: *FreePageList,
+    ) void {
+        if (page_count == 0) return;
+        const slot = self.nativeVmoSlot(vmo_ref) orelse return;
+        if (slot.kind != .anonymous) return;
+        if (first_page >= slot.page_count or page_count > @as(usize, slot.page_count) - first_page) return;
+        const table = self.getVmaTableConst(owner) orelse return;
+        const release_end = first_page + page_count;
+
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (!entry.flags.anonymous) continue;
+            if (entry.vmo.index != vmo_ref.index or entry.vmo.generation != vmo_ref.generation) continue;
+            const entry_first_page: usize = @intCast(entry.vmo_offset / native_page_size);
+            const entry_page_count: usize = @intCast(entry.size_bytes / native_page_size);
+            const entry_end_page = entry_first_page + entry_page_count;
+            if (first_page < entry_end_page and release_end > entry_first_page) return;
+        }
+
+        var page_index: usize = 0;
+        while (page_index < page_count) : (page_index += 1) {
+            const vmo_page = first_page + page_index;
+            const paddr = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, vmo_page) orelse continue;
+            if (paddr == 0) continue;
+            if (free_list.canAppendPage(0, paddr)) {
+                free_list.appendPage(0, paddr) catch {};
+                _ = setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, vmo_page, 0);
+            }
+        }
+    }
+
     pub fn readFdVmoBytes(
         self: *KernelState,
         owner: PrincipalId,
@@ -1811,6 +1883,25 @@ pub const KernelState = struct {
             if (vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i) != 0) return KernelError.InvalidState;
         }
         for (paddrs, 0..) |paddr, i| {
+            if (!setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i, paddr)) {
+                return KernelError.InvalidState;
+            }
+        }
+    }
+
+    fn replaceNativeVmoContiguousPages(
+        self: *KernelState,
+        vmo_ref: NativeVmoRef,
+        page_offset: usize,
+        new_paddrs: []const u64,
+    ) KernelError!void {
+        if (new_paddrs.len == 0) return KernelError.InvalidState;
+        const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
+        if (page_offset > slot.page_count or new_paddrs.len > @as(usize, slot.page_count) - page_offset) return KernelError.InvalidState;
+        for (new_paddrs) |paddr| {
+            if ((paddr & 0xFFF) != 0) return KernelError.InvalidState;
+        }
+        for (new_paddrs, 0..) |paddr, i| {
             if (!setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i, paddr)) {
                 return KernelError.InvalidState;
             }
@@ -2270,6 +2361,7 @@ pub const KernelState = struct {
         const page_delta = (fault_page_va - entry.start_va) / native_page_size;
         const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
         const paddr = self.nativeVmoPagePaddr(entry.vmo, @intCast(vmo_page)) orelse return null;
+        if (paddr == 0) return null;
         return .{
             .paddr = paddr,
             .prot = .{
@@ -2279,6 +2371,125 @@ pub const KernelState = struct {
                 .pkey = entry.prot.pkey,
             },
         };
+    }
+
+    pub fn ensureNativeVmaFaultMapping(
+        self: *KernelState,
+        owner: PrincipalId,
+        fault_page_va: u64,
+        write_access: bool,
+        instruction_fetch: bool,
+        free_list: *FreePageList,
+    ) ?NativeVmaFaultMapping {
+        if (!isPageAligned(fault_page_va)) return null;
+        const table = self.getVmaTable(owner) orelse return null;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (fault_page_va < entry.start_va or fault_page_va >= entry.endVa()) continue;
+            if (!vmaProtAllowsFault(entry.prot, write_access, instruction_fetch)) return null;
+
+            const page_delta = (fault_page_va - entry.start_va) / native_page_size;
+            const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
+            const vmo_page_index: usize = @intCast(vmo_page);
+            var paddr = self.nativeVmoPagePaddrOrHole(entry.vmo, vmo_page_index) orelse return null;
+            if (paddr == 0) {
+                if (!entry.flags.anonymous) return null;
+                paddr = (self.allocPhysicalPage(free_list) catch return null).paddr;
+                var page = [_]u64{paddr};
+                self.installNativeVmoPages(entry.vmo, vmo_page_index, page[0..]) catch {
+                    free_list.appendPage(0, paddr) catch {};
+                    return null;
+                };
+            }
+            return .{
+                .paddr = paddr,
+                .prot = .{
+                    .read = entry.prot.read,
+                    .write = entry.prot.write,
+                    .exec = entry.prot.exec,
+                    .pkey = entry.prot.pkey,
+                },
+            };
+        }
+        return null;
+    }
+
+    pub fn packNativeVmaContiguousMapping(
+        self: *KernelState,
+        owner: PrincipalId,
+        start_va: u64,
+        size_bytes: u64,
+        write_access: bool,
+        free_list: *FreePageList,
+        old_paddrs: []u64,
+        new_paddrs: []u64,
+    ) ?u64 {
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes) or size_bytes == 0) return null;
+        const page_count_u64 = size_bytes / native_page_size;
+        if (page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return null;
+        const page_count: usize = @intCast(page_count_u64);
+        if (old_paddrs.len < page_count or new_paddrs.len < page_count) return null;
+        const end_va = checkedEnd(start_va, size_bytes) catch return null;
+        const table = self.getVmaTable(owner) orelse return null;
+        for (table.entries[0..]) |*entry| {
+            if (!entry.active) continue;
+            if (start_va < entry.start_va or end_va > entry.endVa()) continue;
+            if (!entry.flags.anonymous) return null;
+            if (!vmaProtAllowsFault(entry.prot, write_access, false)) return null;
+
+            const first_vmo_page_u64 = (entry.vmo_offset + (start_va - entry.start_va)) / native_page_size;
+            if (first_vmo_page_u64 > std.math.maxInt(usize)) return null;
+            const first_vmo_page: usize = @intCast(first_vmo_page_u64);
+
+            var first_paddr: u64 = 0;
+            var already_contiguous = true;
+            var i: usize = 0;
+            while (i < page_count) : (i += 1) {
+                const paddr = self.nativeVmoPagePaddrOrHole(entry.vmo, first_vmo_page + i) orelse return null;
+                old_paddrs[i] = paddr;
+                if (paddr == 0) {
+                    already_contiguous = false;
+                    continue;
+                }
+                if ((paddr & 0xFFF) != 0) return null;
+                if (i == 0) {
+                    first_paddr = paddr;
+                } else if (paddr != first_paddr + @as(u64, @intCast(i)) * native_page_size) {
+                    already_contiguous = false;
+                }
+            }
+            if (already_contiguous and first_paddr != 0) {
+                i = 0;
+                while (i < page_count) : (i += 1) {
+                    new_paddrs[i] = first_paddr + @as(u64, @intCast(i)) * native_page_size;
+                }
+                return first_paddr;
+            }
+
+            const base_paddr = free_list.popContiguousBelow(page_count, low_memory_limit) catch return null;
+            i = 0;
+            while (i < page_count) : (i += 1) {
+                const new_paddr = base_paddr + @as(u64, @intCast(i)) * native_page_size;
+                new_paddrs[i] = new_paddr;
+                const dst: [*]u8 = @ptrFromInt(new_paddr);
+                if (old_paddrs[i] == 0) {
+                    @memset(dst[0..native_page_size], 0);
+                } else {
+                    const src: [*]const u8 = @ptrFromInt(old_paddrs[i]);
+                    @memcpy(dst[0..native_page_size], src[0..native_page_size]);
+                }
+            }
+
+            self.replaceNativeVmoContiguousPages(entry.vmo, first_vmo_page, new_paddrs[0..page_count]) catch {
+                var release: usize = 0;
+                while (release < page_count) : (release += 1) {
+                    free_list.appendPage(0, new_paddrs[release]) catch {};
+                }
+                return null;
+            };
+            return base_paddr;
+        }
+        return null;
     }
 
     pub fn setVmaProtExact(self: *KernelState, owner: PrincipalId, start_va: u64, size_bytes: u64, prot: VmaProt) KernelError!void {
@@ -2438,7 +2649,7 @@ pub const KernelState = struct {
     }
 
     pub fn findFreeUserMapVa(
-        self: *const KernelState,
+        self: *KernelState,
         owner: PrincipalId,
         size_bytes: u64,
         seed: u64,
@@ -2448,22 +2659,40 @@ pub const KernelState = struct {
         const end = @import("kernel_abi_root").process_abi.user_aslr_end_va;
         const granule = @import("kernel_abi_root").process_abi.user_aslr_granule;
         if (end <= base or size_bytes > end - base) return KernelError.InvalidState;
-        const table = self.getVmaTableConst(owner) orelse return KernelError.InvalidState;
+        const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
         const slots = ((end - base - size_bytes) / granule) + 1;
         if (slots == 0) return KernelError.InvalidState;
-        var mixed = seed ^ (@as(u64, @intFromEnum(owner)) *% 0x9e37_79b9_7f4a_7c15);
-        var attempt: u64 = 0;
-        while (attempt < slots) : (attempt += 1) {
-            mixed = mixed *% 0xbf58_476d_1ce4_e5b9 +% 0x94d0_49bb_1331_11eb;
-            const slot = (mixed + attempt) % slots;
-            const candidate = base + slot * granule;
-            if (!try vmaRangeOverlaps(table, candidate, size_bytes)) return candidate;
-        }
-        var candidate = base;
+        _ = seed;
+        const cursor = if (table.next_user_map_va >= base and table.next_user_map_va + size_bytes <= end)
+            table.next_user_map_va
+        else
+            base;
+        var candidate = cursor;
         while (candidate + size_bytes <= end) : (candidate += granule) {
-            if (!try vmaRangeOverlaps(table, candidate, size_bytes)) return candidate;
+            if (!try vmaRangeOverlaps(table, candidate, size_bytes)) {
+                table.next_user_map_va = candidate + pageAlignUp(size_bytes);
+                return candidate;
+            }
+        }
+        candidate = base;
+        while (candidate < cursor and candidate + size_bytes <= end) : (candidate += granule) {
+            if (!try vmaRangeOverlaps(table, candidate, size_bytes)) {
+                table.next_user_map_va = candidate + pageAlignUp(size_bytes);
+                return candidate;
+            }
         }
         return KernelError.TableFull;
+    }
+
+    pub fn userMapRangeIsFree(
+        self: *const KernelState,
+        owner: PrincipalId,
+        start_va: u64,
+        size_bytes: u64,
+    ) KernelError!bool {
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes) or size_bytes == 0) return KernelError.InvalidState;
+        const table = self.getVmaTableConst(owner) orelse return KernelError.InvalidState;
+        return !(try vmaRangeOverlaps(table, start_va, size_bytes));
     }
 
     fn vmaProtAllowedByRights(prot: VmaProt, rights: FdRights) bool {
@@ -2545,20 +2774,6 @@ pub const KernelState = struct {
         const vmo_ref = try self.createNativeVmo(.anonymous, size_bytes);
         try self.retainNativeVmo(vmo_ref);
         errdefer self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
-
-        var pages: [max_vmo_backing_pages]u64 = undefined;
-        var allocated: usize = 0;
-        errdefer {
-            while (allocated > 0) {
-                allocated -= 1;
-                free_list.appendPage(0, pages[allocated]) catch {};
-            }
-        }
-        while (allocated < page_count_u64) : (allocated += 1) {
-            pages[allocated] = (try self.allocLowPhysicalPage(free_list)).paddr;
-        }
-        try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]);
-        allocated = 0;
 
         vma_table.entries[vma_index] = .{
             .active = true,
@@ -3360,6 +3575,74 @@ pub const KernelState = struct {
             return;
         }
         return KernelError.InvalidState;
+    }
+
+    pub fn munmapRangeWithFreeList(
+        self: *KernelState,
+        owner: PrincipalId,
+        start_va: u64,
+        size_bytes: u64,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        try self.requireActiveProcess(owner);
+        if (!isPageAligned(start_va) or !isPageAligned(size_bytes)) return KernelError.InvalidState;
+        const end_va = try checkedEnd(start_va, size_bytes);
+        const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
+
+        var index: usize = 0;
+        while (index < table.entries.len) : (index += 1) {
+            var entry = &table.entries[index];
+            if (!entry.active) continue;
+            const entry_start = entry.start_va;
+            const entry_end = entry.endVa();
+            if (start_va >= entry_end or end_va <= entry_start) continue;
+
+            const cut_start = @max(start_va, entry_start);
+            const cut_end = @min(end_va, entry_end);
+            const cut_vmo_first_page: usize = @intCast((entry.vmo_offset + (cut_start - entry_start)) / native_page_size);
+            const cut_page_count: usize = @intCast((cut_end - cut_start) / native_page_size);
+            if (cut_start <= entry_start and cut_end >= entry_end) {
+                const vmo_ref = entry.vmo;
+                entry.* = .{};
+                self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
+                continue;
+            }
+
+            if (cut_start <= entry_start) {
+                const trim = cut_end - entry_start;
+                entry.start_va = cut_end;
+                entry.size_bytes = entry_end - cut_end;
+                entry.vmo_offset += trim;
+                if (entry.flags.anonymous) {
+                    self.releaseUnmappedAnonymousVmoPageRange(owner, entry.vmo, cut_vmo_first_page, cut_page_count, free_list);
+                }
+                continue;
+            }
+
+            if (cut_end >= entry_end) {
+                const vmo_ref = entry.vmo;
+                const was_anonymous = entry.flags.anonymous;
+                entry.size_bytes = cut_start - entry_start;
+                if (was_anonymous) {
+                    self.releaseUnmappedAnonymousVmoPageRange(owner, vmo_ref, cut_vmo_first_page, cut_page_count, free_list);
+                }
+                continue;
+            }
+
+            const after_index = findFreeVma(table) orelse return KernelError.TableFull;
+            const original = entry.*;
+            try self.retainNativeVmo(original.vmo);
+            table.entries[after_index] = original;
+            table.entries[after_index].start_va = cut_end;
+            table.entries[after_index].size_bytes = entry_end - cut_end;
+            table.entries[after_index].vmo_offset = original.vmo_offset + (cut_end - entry_start);
+
+            entry = &table.entries[index];
+            entry.size_bytes = cut_start - entry_start;
+            if (original.flags.anonymous) {
+                self.releaseUnmappedAnonymousVmoPageRange(owner, original.vmo, cut_vmo_first_page, cut_page_count, free_list);
+            }
+        }
     }
 
     pub fn installFd(
