@@ -18,7 +18,7 @@ func WriteExt4WithProgress(disk *os.File, region PartitionRegion, manifest Manif
 		return WriteResult{}, fmt.Errorf("invalid ext4 partition size: %d", partitionBytes)
 	}
 	if span != nil {
-		span.SetTotal(int64(len(manifest.Dirs) + len(manifest.Files) + 5))
+		span.SetTotal(int64(len(manifest.Dirs) + len(manifest.Files) + 6))
 		span.Set(0, "creating ext4 staging image")
 	}
 
@@ -63,15 +63,21 @@ func WriteExt4WithProgress(disk *os.File, region PartitionRegion, manifest Manif
 	if err := runExt4Tool("debugfs", "-w", "-f", cmdPath, imagePath); err != nil {
 		return WriteResult{}, err
 	}
+	if span != nil {
+		span.Set(int64(len(manifest.Dirs)+len(manifest.Files)+3), "checking ext4 image")
+	}
+	if err := runExt4Tool("e2fsck", "-fn", imagePath); err != nil {
+		return WriteResult{}, err
+	}
 
 	if span != nil {
-		span.Set(int64(len(manifest.Dirs)+len(manifest.Files)+3), "copying ext4 image into partition")
+		span.Set(int64(len(manifest.Dirs)+len(manifest.Files)+4), "copying ext4 image into partition")
 	}
 	if err := copyImageToPartition(disk, imagePath, region); err != nil {
 		return WriteResult{}, err
 	}
 	if span != nil {
-		span.Set(int64(len(manifest.Dirs)+len(manifest.Files)+4), "syncing disk")
+		span.Set(int64(len(manifest.Dirs)+len(manifest.Files)+5), "syncing disk")
 	}
 	if err := disk.Sync(); err != nil {
 		return WriteResult{}, err

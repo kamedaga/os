@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
   apps:
     - "alpine_clang"
@@ -385,7 +385,10 @@ apps:
       input:
         - "userland/personality/include"
         - "userland/personality/linux/runtime"
+        - "musl/pachaos/include"
         - "userland/personality/linux/build-lpr.sh"
+        - "userland/personality/linux/check-lpr-namespace.sh"
+        - "userland/personality/linux/runtime/lpr_namespace.map"
     out: "LPRLINUX.SO"
     rootfs: "/lib/pacha/lpr-linux-x86_64.so"
   lpr_minimal_linux:
@@ -397,6 +400,31 @@ apps:
         - "userland/fixtures/linux/lpr_minimal.S"
     out: "LPRMIN.ELF"
     rootfs: "/cmd/lpr_minimal_linux.elf"
+  lpr_linux_musl_libc:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
+      rebuild: ["bash", "tools/copy_lpr_linux_musl.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
+      input:
+        - "tools/copy_lpr_linux_musl.sh"
+    out: "LPRMUSL.SO"
+    rootfs: ["/lib/linux/libc.so", "/lib/linux/ld-musl-x86_64.so.1"]
+  lpr_ldmusl_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_ldmusl_smoke.elf"
+      rebuild: ["bash", "tools/build_lpr_ldmusl_smoke.sh", ".artifacts/userland-fixtures/lpr_ldmusl_smoke.elf"]
+      input:
+        - "tools/build_lpr_ldmusl_smoke.sh"
+        - "userland/fixtures/linux/lpr_ldmusl_smoke.c"
+    out: "LPRLDMUS.ELF"
+    rootfs: "/cmd/lpr_ldmusl_smoke.elf"
+  lpr_busybox_dynamic:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-busybox-dynamic-root"
+      rebuild: ["bash", "pack/scripts/download_lpr_busybox_dynamic.sh", ".artifacts/userland-fixtures/lpr-busybox-dynamic-root"]
+      input:
+        - "pack/scripts/download_lpr_busybox_dynamic.sh"
+    out: "LPRBBROOT"
+    rootfs: "/"
   linux_abi_probe:
     file:
       path: ".artifacts/userland-fixtures/linux_abi_probe.elf"
@@ -559,6 +587,8 @@ apps:
         - "userland/libcapsule/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/storage_boot/src"
         - "userland/storage_boot/include"
     out: "STRGBOOT.ELF"
@@ -576,6 +606,8 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/seed0boot/src"
         - "userland/pachaos_capsule/include"
         - "userland/storage_boot/include"
@@ -601,12 +633,14 @@ apps:
         - "userland/libipc/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "SEED0RT.ELF"
     rootfs: "/sbin/seed0root.elf"
   seed0root_boot_profile:
     file:
       path: ".artifacts/seed0root_boot_profile.txt"
-      rebuild: ["bash", "-lc", "mkdir -p .artifacts && printf 'normal\\n' > .artifacts/seed0root_boot_profile.txt"]
+      rebuild: ["bash", "-lc", "mkdir -p .artifacts && printf 'lpr\\n' > .artifacts/seed0root_boot_profile.txt"]
     out: "BOOTPROFILE.TXT"
     rootfs: "/etc/pacha_boot_profile"
   koboxd:
@@ -621,6 +655,10 @@ apps:
         - "userland/libcapsule/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
+        - "_kobox/include"
+        - "_kobox/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/koboxd/src"
         - "userland/filed/include"
         - "userland/filed/src"
@@ -640,6 +678,8 @@ apps:
         - "userland/libipc/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
   net_bench:

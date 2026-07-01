@@ -55,6 +55,8 @@ static const char *koboxd_fs_op_name(uint64_t op)
     case KOBOXD_WIRE_FS_STATX: return "statx";
     case KOBOXD_WIRE_FS_GETDENTS: return "getdents";
     case KOBOXD_WIRE_FS_FSYNC: return "fsync";
+    case KOBOXD_WIRE_FS_UTIMENS: return "utimens";
+    case KOBOXD_WIRE_FS_CHMOD: return "chmod";
     case KOBOXD_WIRE_FS_CREATE: return "create";
     case KOBOXD_WIRE_FS_TRUNCATE: return "truncate";
     case KOBOXD_WIRE_FS_UNLINK: return "unlink";
@@ -183,6 +185,12 @@ static void handle_statx(koboxd_fs_request_ctx_t *ctx)
     wire_stat->blocks = stat.blocks;
     wire_stat->nlink = stat.nlink;
     wire_stat->kind = (stat.mode & 0170000u);
+    wire_stat->atime_sec = stat.atime_sec;
+    wire_stat->atime_nsec = stat.atime_nsec;
+    wire_stat->mtime_sec = stat.mtime_sec;
+    wire_stat->mtime_nsec = stat.mtime_nsec;
+    wire_stat->ctime_sec = stat.ctime_sec;
+    wire_stat->ctime_nsec = stat.ctime_nsec;
     ctx->result = stat.size;
 }
 
@@ -258,6 +266,34 @@ static void handle_truncate(koboxd_fs_request_ctx_t *ctx)
         ctx->backend,
         truncate->object_id,
         truncate->size);
+}
+
+static void handle_utimens(koboxd_fs_request_ctx_t *ctx)
+{
+    if (map_fs_wire_page(ctx) != 0) {
+        return;
+    }
+    koboxd_wire_fs_utimens_t *utimens = (koboxd_wire_fs_utimens_t *)ctx->mapped;
+    ctx->reply_status = koboxd_fs_backend_utimens(
+        ctx->backend,
+        utimens->object_id,
+        (uint32_t)utimens->mask,
+        utimens->atime_sec,
+        utimens->atime_nsec,
+        utimens->mtime_sec,
+        utimens->mtime_nsec);
+}
+
+static void handle_chmod(koboxd_fs_request_ctx_t *ctx)
+{
+    if (map_fs_wire_page(ctx) != 0) {
+        return;
+    }
+    koboxd_wire_fs_chmod_t *chmod_req = (koboxd_wire_fs_chmod_t *)ctx->mapped;
+    ctx->reply_status = koboxd_fs_backend_chmod(
+        ctx->backend,
+        chmod_req->object_id,
+        (uint16_t)chmod_req->mode);
 }
 
 static void handle_unlink(koboxd_fs_request_ctx_t *ctx)
@@ -387,6 +423,12 @@ static void dispatch_fs_request(koboxd_fs_request_ctx_t *ctx)
         break;
     case KOBOXD_WIRE_FS_TRUNCATE:
         handle_truncate(ctx);
+        break;
+    case KOBOXD_WIRE_FS_UTIMENS:
+        handle_utimens(ctx);
+        break;
+    case KOBOXD_WIRE_FS_CHMOD:
+        handle_chmod(ctx);
         break;
     case KOBOXD_WIRE_FS_UNLINK:
         handle_unlink(ctx);

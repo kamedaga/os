@@ -13,7 +13,8 @@ pub const syscall_thread_exit: u64 = 10;
 pub const syscall_thread_set_fs_base: u64 = 11;
 pub const syscall_thread_set_gs_base: u64 = 12;
 pub const syscall_process_map: u64 = 13;
-pub const syscall_process_last: u64 = syscall_process_map;
+pub const syscall_process_map_batch: u64 = 14;
+pub const syscall_process_last: u64 = syscall_process_map_batch;
 pub const syscall_process_count: u64 = syscall_process_last - syscall_process_first + 1;
 
 pub const process_flag_none: u64 = 0;
@@ -33,8 +34,19 @@ pub const state_exited: u64 = 2;
 pub const state_killed: u64 = 3;
 
 pub const process_map_flag_none: u64 = 0;
-pub const process_map_known_flags_mask: u64 = process_map_flag_none;
+pub const process_map_flag_private: u64 = 1 << 0;
+pub const process_map_flag_shared: u64 = 1 << 1;
+pub const process_map_known_flags_mask: u64 = process_map_flag_private | process_map_flag_shared;
+pub const process_map_offset_low_bits: u64 = 0xfff;
 pub const process_map_anywhere_va: u64 = 0xffff_ffff_ffff_ffff;
+pub const process_map_batch_max_entries: u64 = 32;
+pub const process_map_batch_entry_vmo_fd_offset: u64 = 0;
+pub const process_map_batch_entry_target_va_offset: u64 = 8;
+pub const process_map_batch_entry_size_offset: u64 = 16;
+pub const process_map_batch_entry_prot_offset: u64 = 24;
+pub const process_map_batch_entry_vmo_offset_offset: u64 = 32;
+pub const process_map_batch_entry_flags_offset: u64 = 40;
+pub const process_map_batch_entry_size: u64 = 48;
 
 pub const aux_base_va: u64 = 0x0000_7000_0000_0000;
 pub const aux_page_bytes: u64 = 0x1000;

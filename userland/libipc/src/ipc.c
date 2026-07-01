@@ -70,6 +70,18 @@ int pacha_thread_set_gs_base(uint64_t gs_base) {
 }
 
 long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
+    return pacha_process_map_flags(process_fd, vmo_fd, target_va, size, prot, vmo_offset, PACHA_PROCESS_MAP_SHARED);
+}
+
+long pacha_process_map_flags(
+    int process_fd,
+    int vmo_fd,
+    uint64_t target_va,
+    uint64_t size,
+    uint64_t prot,
+    uint64_t vmo_offset,
+    uint64_t flags)
+{
     return pacha_syscall6(
         PACHA_PROCESS_SYSCALL_MAP,
         (uint64_t)(uint32_t)process_fd,
@@ -77,8 +89,21 @@ long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t 
         target_va,
         size,
         prot,
-        vmo_offset
+        vmo_offset | flags
     );
+}
+
+int pacha_process_map_batch(
+    int process_fd,
+    const struct pacha_process_map_batch_entry *entries,
+    uint64_t entry_count)
+{
+    return pacha_status_to_int(pacha_syscall3(
+        PACHA_PROCESS_SYSCALL_MAP_BATCH,
+        (uint64_t)(uint32_t)process_fd,
+        (uint64_t)(uintptr_t)entries,
+        entry_count
+    ));
 }
 
 long pacha_getrandom(void *buf, uint64_t len, uint64_t flags) {

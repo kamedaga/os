@@ -91,6 +91,15 @@ struct seed0root_started_process {
     uint64_t start_ms;
 };
 
+struct seed0root_wait_result {
+    uint64_t state;
+    uint64_t exit_code;
+    uint64_t end_ns;
+    uint64_t end_cycles;
+    uint64_t elapsed_ns;
+    uint64_t elapsed_cycles;
+};
+
 struct seed0root_timespec {
     int64_t tv_sec;
     int64_t tv_nsec;
@@ -150,6 +159,29 @@ static uint64_t seed0root_now_ns(void)
         return 0;
     }
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t seed0root_read_tsc(void)
+{
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+static int seed0root_starts_with(const char *text, const char *prefix)
+{
+    if (text == NULL || prefix == NULL) {
+        return 0;
+    }
+    while (*prefix != '\0') {
+        if (*text != *prefix) {
+            return 0;
+        }
+        text++;
+        prefix++;
+    }
+    return 1;
 }
 
 static int align_up(uint64_t value, uint64_t *out)
@@ -952,12 +984,17 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
     return flags;
 }
 
-static int seed0root_wait_process(int process_fd, const char *label)
+static int seed0root_wait_process(int process_fd, const char *label, struct seed0root_wait_result *out_result)
 {
     if (process_fd < 16) {
         return -1;
     }
+    if (out_result != NULL) {
+        memset(out_result, 0, sizeof(*out_result));
+    }
+    const int quiet_bench = seed0root_starts_with(label, "lpr busybox ");
     const uint64_t start_ns = seed0root_now_ns();
+    const uint64_t start_cycles = seed0root_read_tsc();
     uint64_t status_words[4] = {0, 0, 0, 0};
     for (;;) {
         const long wait_status = pacha_syscall2(
@@ -970,11 +1007,25 @@ static int seed0root_wait_process(int process_fd, const char *label)
             const uint64_t end_ns = seed0root_now_ns();
             const uint64_t elapsed_ns =
                 (start_ns != 0 && end_ns >= start_ns) ? end_ns - start_ns : 0;
-            printf("[seed0root] %s completed state=%llu exit=%llu ns=%llu\n",
-                label != NULL ? label : "process",
-                (unsigned long long)state,
-                (unsigned long long)exit_code,
-                (unsigned long long)elapsed_ns);
+            const uint64_t end_cycles = seed0root_read_tsc();
+            const uint64_t elapsed_cycles =
+                (start_cycles != 0 && end_cycles >= start_cycles) ? end_cycles - start_cycles : 0;
+            if (out_result != NULL) {
+                out_result->state = state;
+                out_result->exit_code = exit_code;
+                out_result->end_ns = end_ns;
+                out_result->end_cycles = end_cycles;
+                out_result->elapsed_ns = elapsed_ns;
+                out_result->elapsed_cycles = elapsed_cycles;
+            }
+            if (!quiet_bench) {
+                printf("[seed0root] %s completed state=%llu exit=%llu ns=%llu cycles=%llu\n",
+                    label != NULL ? label : "process",
+                    (unsigned long long)state,
+                    (unsigned long long)exit_code,
+                    (unsigned long long)elapsed_ns,
+                    (unsigned long long)elapsed_cycles);
+            }
             if (state == SEED0ROOT_TASK_STATE_EXITED && exit_code == 0) {
                 return 0;
             }
@@ -992,7 +1043,7 @@ static int seed0root_wait_process(int process_fd, const char *label)
 
         struct pacha_pollfd pollfd = {
             .fd = process_fd,
-            .events = 0,
+            .events = PACHA_FD_EVENT_READABLE,
             .revents = 0,
         };
         (void)pacha_fd_wait_many(&pollfd, 1, 1);
@@ -1099,6 +1150,8 @@ static int seed0root_run_exec_path_smoke(
         snprintf(exec->envp[0], sizeof(exec->envp[0]), "%s", env);
     }
 
+    const uint64_t exec_start_ns = seed0root_now_ns();
+    const uint64_t exec_start_cycles = seed0root_read_tsc();
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
     struct pacha_ipc_msg reply;
@@ -1111,6 +1164,8 @@ static int seed0root_run_exec_path_smoke(
         &reply,
         reply_fds,
         2);
+    const uint64_t exec_reply_ns = seed0root_now_ns();
+    const uint64_t exec_reply_cycles = seed0root_read_tsc();
     seed0root_destroy_filed_wire_page(page_fd, page);
     if (status == -2) {
         return 0;
@@ -1137,9 +1192,39 @@ static int seed0root_run_exec_path_smoke(
 
     const int process_fd = (int)reply_fds[0].fd;
     const int thread_fd = (int)reply_fds[1].fd;
-    printf("[seed0root] %s started process_fd=%d thread_fd=%d\n", label, process_fd, thread_fd);
+    const int quiet_bench = seed0root_starts_with(label, "lpr busybox ");
+    if (!quiet_bench) {
+        printf("[seed0root] %s started process_fd=%d thread_fd=%d\n", label, process_fd, thread_fd);
+    }
 
-    status = seed0root_wait_process(process_fd, label);
+    struct seed0root_wait_result wait_result;
+    status = seed0root_wait_process(process_fd, label, &wait_result);
+    if (quiet_bench) {
+        const uint64_t exec_end_ns = wait_result.end_ns != 0 ? wait_result.end_ns : seed0root_now_ns();
+        const uint64_t exec_end_cycles = wait_result.end_cycles != 0 ? wait_result.end_cycles : seed0root_read_tsc();
+        const uint64_t elapsed_ns =
+            (exec_start_ns != 0 && exec_end_ns >= exec_start_ns) ? exec_end_ns - exec_start_ns : 0;
+        const uint64_t reply_ns =
+            (exec_start_ns != 0 && exec_reply_ns >= exec_start_ns) ? exec_reply_ns - exec_start_ns : 0;
+        const uint64_t wait_ns =
+            (exec_reply_ns != 0 && exec_end_ns >= exec_reply_ns) ? exec_end_ns - exec_reply_ns : 0;
+        const uint64_t elapsed_cycles =
+            (exec_start_cycles != 0 && exec_end_cycles >= exec_start_cycles) ? exec_end_cycles - exec_start_cycles : 0;
+        const uint64_t reply_cycles =
+            (exec_start_cycles != 0 && exec_reply_cycles >= exec_start_cycles) ? exec_reply_cycles - exec_start_cycles : 0;
+        const uint64_t wait_cycles =
+            (exec_reply_cycles != 0 && exec_end_cycles >= exec_reply_cycles) ? exec_end_cycles - exec_reply_cycles : 0;
+        printf("[seed0root] %s exec_to_exit ns=%llu us=%llu exec_reply_us=%llu wait_after_reply_us=%llu cycles=%llu exec_reply_cycles=%llu wait_after_reply_cycles=%llu status=%d\n",
+            label,
+            (unsigned long long)elapsed_ns,
+            (unsigned long long)(elapsed_ns / 1000ull),
+            (unsigned long long)(reply_ns / 1000ull),
+            (unsigned long long)(wait_ns / 1000ull),
+            (unsigned long long)elapsed_cycles,
+            (unsigned long long)reply_cycles,
+            (unsigned long long)wait_cycles,
+            status);
+    }
     (void)pacha_fd_close(thread_fd);
     (void)pacha_fd_close(process_fd);
     return status;
@@ -1195,6 +1280,225 @@ static int seed0root_run_lpr_minimal_smoke(int filed_endpoint_fd)
         NULL,
         "lpr minimal smoke",
         FILED_WIRE_EXEC_LINUX_LPR);
+}
+
+static int seed0root_run_lpr_ldmusl_smoke(int filed_endpoint_fd)
+{
+    const char *argv[] = {
+        "/cmd/lpr_ldmusl_smoke.elf",
+        "--self",
+        "/cmd/lpr_ldmusl_smoke.elf",
+        "--write",
+        "/tmp/lpr_cli_out.txt",
+    };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/lpr_ldmusl_smoke.elf",
+        argv,
+        5,
+        "LD_LIBRARY_PATH=/lib/linux",
+        "lpr ld-musl smoke",
+        FILED_WIRE_EXEC_LINUX_LPR);
+}
+
+static int seed0root_run_lpr_busybox_command(
+    int filed_endpoint_fd,
+    const char *label,
+    const char *const *argv,
+    uint64_t argc)
+{
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/alpine-busybox.elf",
+        argv,
+        argc,
+        "LD_LIBRARY_PATH=/lib:/lib/linux",
+        label,
+        FILED_WIRE_EXEC_LINUX_LPR);
+}
+
+static int seed0root_run_lpr_busybox_cold_echo_smoke(int filed_endpoint_fd)
+{
+    const char *argv[] = {
+        "busybox",
+        "echo",
+        "lpr-busybox-cold-ok",
+    };
+    return seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox cold echo", argv, 3);
+}
+
+static int seed0root_run_lpr_busybox_dynamic_smoke(int filed_endpoint_fd)
+{
+    const char *echo_argv[] = {
+        "busybox",
+        "echo",
+        "lpr-busybox-dynamic-ok",
+    };
+    int status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox echo", echo_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *ls_argv[] = {
+        "busybox",
+        "ls",
+        "/cmd",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox ls", ls_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *cat_argv[] = {
+        "busybox",
+        "cat",
+        "/etc/pacha_boot_profile",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox cat", cat_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *dirname_argv[] = {
+        "busybox",
+        "dirname",
+        "/tmp/lpr-busybox-dir/file.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox dirname", dirname_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *basename_argv[] = {
+        "busybox",
+        "basename",
+        "/tmp/lpr-busybox-dir/file.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox basename", basename_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *mkdir_argv[] = {
+        "busybox",
+        "mkdir",
+        "/tmp/lpr-busybox-dir",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox mkdir", mkdir_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *touch_argv[] = {
+        "busybox",
+        "touch",
+        "/tmp/lpr-busybox-dir/touched.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox touch", touch_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *touch_time_argv[] = {
+        "busybox",
+        "touch",
+        "-t",
+        "197001020304.05",
+        "/tmp/lpr-busybox-dir/touched.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox touch time", touch_time_argv, 5);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *stat_touched_argv[] = {
+        "busybox",
+        "stat",
+        "/tmp/lpr-busybox-dir/touched.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox stat touched", stat_touched_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *chmod_argv[] = {
+        "busybox",
+        "chmod",
+        "600",
+        "/tmp/lpr-busybox-dir/touched.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox chmod", chmod_argv, 4);
+    if (status != 0) {
+        return status;
+    }
+
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox stat chmod", stat_touched_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *test_touched_argv[] = {
+        "busybox",
+        "test",
+        "-f",
+        "/tmp/lpr-busybox-dir/touched.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox test touched", test_touched_argv, 4);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *cp_argv[] = {
+        "busybox",
+        "cp",
+        "/etc/pacha_boot_profile",
+        "/tmp/lpr-busybox-dir/copy.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox cp", cp_argv, 4);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *test_file_argv[] = {
+        "busybox",
+        "test",
+        "-f",
+        "/tmp/lpr-busybox-dir/copy.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox test file", test_file_argv, 4);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *mv_argv[] = {
+        "busybox",
+        "mv",
+        "/tmp/lpr-busybox-dir/copy.txt",
+        "/tmp/lpr-busybox-dir/moved.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox mv", mv_argv, 4);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *stat_argv[] = {
+        "busybox",
+        "stat",
+        "/tmp/lpr-busybox-dir/moved.txt",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox stat", stat_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *rm_dir_argv[] = {
+        "busybox",
+        "rm",
+        "-r",
+        "/tmp/lpr-busybox-dir",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox rm dir", rm_dir_argv, 4);
+    return status;
 }
 
 static int seed0root_run_lua_cli_bench(int filed_endpoint_fd)
@@ -1270,7 +1574,16 @@ static int seed0root_connect_storage_services(int control_fd)
         status = seed0root_run_libc_vfs_exec_smoke(filed_endpoint_fd);
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_lpr_busybox_cold_echo_smoke(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_lpr_minimal_smoke(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_lpr_ldmusl_smoke(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_lpr_busybox_dynamic_smoke(filed_endpoint_fd);
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_MEMORY) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_libc_alloc_probe(filed_endpoint_fd);
@@ -1284,16 +1597,33 @@ static int seed0root_connect_storage_services(int control_fd)
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_chibicc_cli_bench(filed_endpoint_fd);
     }
-    if (boot_profile != 0 && status == 0 && filed_endpoint_fd >= 16) {
+    const unsigned metrics_profile =
+        boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
+                        SEED0ROOT_BOOT_PROFILE_MEMORY |
+                        SEED0ROOT_BOOT_PROFILE_BENCH |
+                        SEED0ROOT_BOOT_PROFILE_LPR);
+    const unsigned sync_profile =
+        boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
+                        SEED0ROOT_BOOT_PROFILE_MEMORY |
+                        SEED0ROOT_BOOT_PROFILE_BENCH |
+                        SEED0ROOT_BOOT_PROFILE_LPR);
+    if (metrics_profile != 0 && status == 0 && filed_endpoint_fd >= 16) {
         const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
         printf("[seed0root] filed metrics dump status=%d\n", metrics_status);
     }
     if (filed_endpoint_fd >= 16) {
         (void)pacha_fd_close(filed_endpoint_fd);
     }
-    if (boot_profile != 0 && status == 0) {
+    if (sync_profile != 0 && status == 0) {
+        const uint64_t sync_start_ns = seed0root_now_ns();
         status = seed0root_fs_sync_all(fs_fd);
-        printf("[seed0root] storage clean checkpoint status=%d\n", status);
+        const uint64_t sync_end_ns = seed0root_now_ns();
+        const uint64_t sync_elapsed_ns =
+            (sync_start_ns != 0 && sync_end_ns >= sync_start_ns) ? sync_end_ns - sync_start_ns : 0;
+        printf("[seed0root] storage clean checkpoint status=%d ns=%llu us=%llu\n",
+            status,
+            (unsigned long long)sync_elapsed_ns,
+            (unsigned long long)(sync_elapsed_ns / 1000ull));
     }
     return status;
 }

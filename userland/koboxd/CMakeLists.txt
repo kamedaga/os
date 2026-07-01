@@ -12,6 +12,7 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/libipc/src/ipc.c
   ${REPO_ROOT}/userland/libcapsule/src/capsule.c
   ${REPO_ROOT}/userland/libpacha/src/syscall.c
+  ${REPO_ROOT}/userland/filed/src/backend_router.c
   ${REPO_ROOT}/userland/filed/src/dispatch.c
   ${REPO_ROOT}/userland/filed/src/exec/router.c
   ${REPO_ROOT}/userland/filed/src/exec/linux_lpr/elf.c
@@ -23,6 +24,7 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/filed/src/fd_ipc.c
   ${REPO_ROOT}/userland/filed/src/kobox_backend.c
   ${REPO_ROOT}/userland/filed/src/runtime.c
+  ${REPO_ROOT}/userland/filed/src/tmpfs_backend.c
   ${REPO_ROOT}/userland/filed/src/vfs.c
   ${REPO_ROOT}/_kobox/src/device/device_backend.c
   ${REPO_ROOT}/_kobox/src/device/pachaos_capsule/device_pachaos_capsule.c
@@ -107,6 +109,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/koboxd/ipc_protocol.h"
     "${REPO_ROOT}/userland/filed/include/filed/bootstrap.h"
+    "${REPO_ROOT}/userland/filed/include/filed/backend_router.h"
     "${REPO_ROOT}/userland/filed/include/filed/dispatch.h"
     "${REPO_ROOT}/userland/filed/include/filed/exec.h"
     "${REPO_ROOT}/userland/filed/include/filed/exec_native.h"
@@ -116,7 +119,9 @@ add_custom_command(
     "${REPO_ROOT}/userland/filed/include/filed/kobox_backend.h"
     "${REPO_ROOT}/userland/filed/include/filed/page_cache.h"
     "${REPO_ROOT}/userland/filed/include/filed/runtime.h"
+    "${REPO_ROOT}/userland/filed/include/filed/tmpfs_backend.h"
     "${REPO_ROOT}/userland/filed/include/filed/vfs.h"
+    "${REPO_ROOT}/userland/filed/src/backend_router.c"
     "${REPO_ROOT}/userland/filed/src/dispatch.c"
     "${REPO_ROOT}/userland/filed/src/exec/router.c"
     "${REPO_ROOT}/userland/filed/src/exec/linux_lpr/elf.c"
@@ -129,6 +134,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/filed/src/fd_ipc.c"
     "${REPO_ROOT}/userland/filed/src/kobox_backend.c"
     "${REPO_ROOT}/userland/filed/src/runtime.c"
+    "${REPO_ROOT}/userland/filed/src/tmpfs_backend.c"
     "${REPO_ROOT}/userland/filed/src/vfs.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.h"

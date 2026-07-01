@@ -63,6 +63,12 @@ static int direct_statx(void *ctx, uint64_t object_id, koboxd_wire_fs_statx_t *o
     out_stat->blocks = stat.blocks;
     out_stat->nlink = stat.nlink;
     out_stat->kind = stat.mode & 0170000u;
+    out_stat->atime_sec = stat.atime_sec;
+    out_stat->atime_nsec = stat.atime_nsec;
+    out_stat->mtime_sec = stat.mtime_sec;
+    out_stat->mtime_nsec = stat.mtime_nsec;
+    out_stat->ctime_sec = stat.ctime_sec;
+    out_stat->ctime_nsec = stat.ctime_nsec;
     return 0;
 }
 
@@ -163,6 +169,44 @@ static int direct_truncate(void *ctx, uint64_t object_id, uint64_t size)
     }
     koboxd_fs_backend_lock(backend);
     const int status = koboxd_fs_backend_truncate(backend, object_id, size);
+    koboxd_fs_backend_unlock(backend);
+    return status;
+}
+
+static int direct_utimens(
+    void *ctx,
+    uint64_t object_id,
+    uint32_t mask,
+    int64_t atime_sec,
+    int64_t atime_nsec,
+    int64_t mtime_sec,
+    int64_t mtime_nsec)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL) {
+        return -22;
+    }
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_utimens(
+        backend,
+        object_id,
+        mask,
+        atime_sec,
+        atime_nsec,
+        mtime_sec,
+        mtime_nsec);
+    koboxd_fs_backend_unlock(backend);
+    return status;
+}
+
+static int direct_chmod(void *ctx, uint64_t object_id, uint64_t mode)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL) {
+        return -22;
+    }
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_chmod(backend, object_id, (uint16_t)mode);
     koboxd_fs_backend_unlock(backend);
     return status;
 }
@@ -304,6 +348,8 @@ static const filed_kobox_direct_ops_t direct_ops = {
     .fsync = direct_fsync,
     .create = direct_create,
     .truncate = direct_truncate,
+    .utimens = direct_utimens,
+    .chmod = direct_chmod,
     .unlink = direct_unlink,
     .mkdir = direct_mkdir,
     .rmdir = direct_rmdir,

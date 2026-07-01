@@ -7,8 +7,10 @@
 
 #include "filed/fd_ipc.h"
 #include "filed/exec.h"
+#include "filed/exec_linux_lpr.h"
 #include "filed/ipc_protocol.h"
 #include "filed/page_cache.h"
+#include "filed/tmpfs_backend.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
@@ -108,6 +110,248 @@ static filed_fast_metric_t filed_fast_metrics;
 static filed_fast_op_metric_t filed_fast_op_metrics[FILED_METRIC_OP_MAX];
 static filed_page_cache_t filed_page_cache;
 static filed_dir_cache_t filed_dir_cache;
+static uint64_t filed_target_lookup_vfs_hits;
+static uint64_t filed_target_lookup_backend_hits;
+static uint64_t filed_target_lookup_misses;
+
+static bool filed_backend_object_is_tmpfs(uint64_t backend_object)
+{
+    return backend_object != 0 && filed_tmpfs_backend_is_object(backend_object);
+}
+
+static int filed_backend_lookup(
+    filed_runtime_t *runtime,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t *out_object_id)
+{
+    if (filed_tmpfs_backend_is_object(parent_object_id)) {
+        return filed_tmpfs_backend_lookup(&runtime->tmpfs, parent_object_id, name, out_object_id);
+    }
+    return filed_kobox_backend_lookup(&runtime->backend, parent_object_id, name, out_object_id);
+}
+
+static int filed_backend_statx(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    koboxd_wire_fs_statx_t *out_stat)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_statx(&runtime->tmpfs, object_id, out_stat);
+    }
+    return filed_kobox_backend_statx(&runtime->backend, object_id, out_stat);
+}
+
+static int filed_backend_pread(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    uint64_t offset,
+    void *buffer,
+    uint64_t length,
+    uint64_t *out_bytes)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_pread(&runtime->tmpfs, object_id, offset, buffer, length, out_bytes);
+    }
+    return filed_kobox_backend_pread(&runtime->backend, object_id, offset, buffer, length, out_bytes);
+}
+
+static int filed_backend_pwrite(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    uint64_t offset,
+    const void *buffer,
+    uint64_t length,
+    uint64_t *out_bytes)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_pwrite(&runtime->tmpfs, object_id, offset, buffer, length, out_bytes);
+    }
+    return filed_kobox_backend_pwrite(&runtime->backend, object_id, offset, buffer, length, out_bytes);
+}
+
+static int filed_backend_fsync(filed_runtime_t *runtime, uint64_t object_id)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_fsync(&runtime->tmpfs, object_id);
+    }
+    return filed_kobox_backend_fsync(&runtime->backend, object_id);
+}
+
+static int filed_backend_create(
+    filed_runtime_t *runtime,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t *out_object_id)
+{
+    if (filed_tmpfs_backend_is_object(parent_object_id)) {
+        return filed_tmpfs_backend_create(&runtime->tmpfs, parent_object_id, name, mode, out_object_id);
+    }
+    return filed_kobox_backend_create(&runtime->backend, parent_object_id, name, mode, out_object_id);
+}
+
+static int filed_backend_truncate(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    uint64_t size)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_truncate(&runtime->tmpfs, object_id, size);
+    }
+    return filed_kobox_backend_truncate(&runtime->backend, object_id, size);
+}
+
+static int filed_backend_utimens(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    uint32_t mask,
+    int64_t atime_sec,
+    int64_t atime_nsec,
+    int64_t mtime_sec,
+    int64_t mtime_nsec)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_utimens(
+            &runtime->tmpfs,
+            object_id,
+            mask,
+            atime_sec,
+            atime_nsec,
+            mtime_sec,
+            mtime_nsec);
+    }
+    return filed_kobox_backend_utimens(
+        &runtime->backend,
+        object_id,
+        mask,
+        atime_sec,
+        atime_nsec,
+        mtime_sec,
+        mtime_nsec);
+}
+
+static int filed_backend_chmod(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    uint64_t mode)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_chmod(&runtime->tmpfs, object_id, mode);
+    }
+    return filed_kobox_backend_chmod(&runtime->backend, object_id, mode);
+}
+
+static int filed_backend_unlink(
+    filed_runtime_t *runtime,
+    uint64_t parent_object_id,
+    const char *name)
+{
+    if (filed_tmpfs_backend_is_object(parent_object_id)) {
+        return filed_tmpfs_backend_unlink(&runtime->tmpfs, parent_object_id, name);
+    }
+    return filed_kobox_backend_unlink(&runtime->backend, parent_object_id, name);
+}
+
+static int filed_backend_mkdir(
+    filed_runtime_t *runtime,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t *out_object_id)
+{
+    if (filed_tmpfs_backend_is_object(parent_object_id)) {
+        return filed_tmpfs_backend_mkdir(&runtime->tmpfs, parent_object_id, name, mode, out_object_id);
+    }
+    return filed_kobox_backend_mkdir(&runtime->backend, parent_object_id, name, mode, out_object_id);
+}
+
+static int filed_backend_rmdir(
+    filed_runtime_t *runtime,
+    uint64_t parent_object_id,
+    const char *name)
+{
+    if (filed_tmpfs_backend_is_object(parent_object_id)) {
+        return filed_tmpfs_backend_rmdir(&runtime->tmpfs, parent_object_id, name);
+    }
+    return filed_kobox_backend_rmdir(&runtime->backend, parent_object_id, name);
+}
+
+static int filed_backend_rename(
+    filed_runtime_t *runtime,
+    uint64_t old_parent_object_id,
+    const char *old_name,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id)
+{
+    const bool old_tmpfs = filed_tmpfs_backend_is_object(old_parent_object_id);
+    const bool new_tmpfs = filed_tmpfs_backend_is_object(new_parent_object_id);
+    if (old_tmpfs != new_tmpfs) {
+        return -18;
+    }
+    if (old_tmpfs) {
+        return filed_tmpfs_backend_rename(
+            &runtime->tmpfs,
+            old_parent_object_id,
+            old_name,
+            new_parent_object_id,
+            new_name,
+            out_object_id);
+    }
+    return filed_kobox_backend_rename(
+        &runtime->backend,
+        old_parent_object_id,
+        old_name,
+        new_parent_object_id,
+        new_name,
+        out_object_id);
+}
+
+static int filed_backend_release_object(filed_runtime_t *runtime, uint64_t object_id)
+{
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_release_object(&runtime->tmpfs, object_id);
+    }
+    return filed_kobox_backend_release_object(&runtime->backend, object_id);
+}
+
+static int filed_backend_getdents(
+    filed_runtime_t *runtime,
+    uint64_t dir_object_id,
+    uint64_t offset,
+    koboxd_wire_fs_getdents_t *out_entries)
+{
+    if (filed_tmpfs_backend_is_object(dir_object_id)) {
+        return filed_tmpfs_backend_getdents(&runtime->tmpfs, dir_object_id, offset, out_entries);
+    }
+    return filed_kobox_backend_getdents(&runtime->backend, dir_object_id, offset, out_entries);
+}
+
+static bool filed_root_getdents_splices_tmpfs(
+    filed_runtime_t *runtime,
+    uint64_t dir_object_id)
+{
+    if (runtime == NULL ||
+        dir_object_id != runtime->backend.root_object_id ||
+        runtime->tmpfs.root_object_id == 0 ||
+        runtime->root_tmpfs_synthetic_dirent == 0)
+    {
+        return false;
+    }
+    return true;
+}
+
+static uint64_t filed_root_getdents_backend_offset(
+    filed_runtime_t *runtime,
+    uint64_t dir_object_id,
+    uint64_t logical_offset)
+{
+    if (filed_root_getdents_splices_tmpfs(runtime, dir_object_id) && logical_offset > 0) {
+        return logical_offset - 1u;
+    }
+    return logical_offset;
+}
 
 static void filed_dispatch_lock_acquire(filed_lock_t *lock)
 {
@@ -178,6 +422,8 @@ static const char *filed_op_name(uint64_t op)
     case FILED_WIRE_OP_ROOT_GETDENTS: return "root_getdents";
     case FILED_WIRE_OP_OPENAT: return "openat";
     case FILED_WIRE_OP_STAT: return "stat";
+    case FILED_WIRE_OP_UTIMENS: return "utimens";
+    case FILED_WIRE_OP_CHMOD: return "chmod";
     case FILED_WIRE_OP_PREAD: return "pread";
     case FILED_WIRE_OP_GETDENTS: return "getdents";
     case FILED_WIRE_OP_CLOSE: return "close";
@@ -420,6 +666,7 @@ static void filed_runtime_publish_backend_object_generation(
     if (runtime == NULL || backend_object == 0) {
         return;
     }
+    filed_exec_invalidate_backend_object(runtime, backend_object);
     for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
         filed_handle_t *handle = &runtime->vfs.handles[i];
         filed_vnode_t *vnode = filed_dispatch_handle_vnode(&runtime->vfs, handle);
@@ -507,6 +754,15 @@ static void filed_dump_dispatch_metrics(void)
             (unsigned long long)metric->max_cycles,
             (unsigned long long)metric->errors);
     }
+    printf(
+        "[filed] metric scope=vfs op=target_lookup_vfs_hit count=%llu\n",
+        (unsigned long long)filed_target_lookup_vfs_hits);
+    printf(
+        "[filed] metric scope=vfs op=target_lookup_backend_hit count=%llu\n",
+        (unsigned long long)filed_target_lookup_backend_hits);
+    printf(
+        "[filed] metric scope=vfs op=target_lookup_miss count=%llu\n",
+        (unsigned long long)filed_target_lookup_misses);
 }
 
 static uint64_t filed_page_cache_next_clock(filed_runtime_t *runtime)
@@ -662,6 +918,9 @@ static filed_page_cache_slot_t *filed_page_cache_find(
 static bool filed_page_cache_object_dirty(uint64_t backend_object)
 {
     filed_page_cache_ensure_configured();
+    if (filed_backend_object_is_tmpfs(backend_object)) {
+        return false;
+    }
     if (backend_object == 0 || filed_page_cache.active_slots == 0) {
         return false;
     }
@@ -697,8 +956,8 @@ static int filed_page_cache_flush_slot(
     const uint64_t offset = page_start + slot->dirty_start;
     const uint64_t length = (uint64_t)slot->dirty_end - slot->dirty_start;
     uint64_t bytes = 0;
-    const int status = filed_kobox_backend_pwrite(
-        &runtime->backend,
+    const int status = filed_backend_pwrite(
+        runtime,
         slot->backend_object,
         offset,
         slot->data + slot->dirty_start,
@@ -719,6 +978,9 @@ static int filed_page_cache_flush_slot(
 int filed_page_cache_flush_object(filed_runtime_t *runtime, uint64_t backend_object)
 {
     filed_page_cache_ensure_configured();
+    if (filed_backend_object_is_tmpfs(backend_object)) {
+        return 0;
+    }
     if (filed_page_cache.active_slots == 0) {
         return 0;
     }
@@ -781,6 +1043,9 @@ static void filed_page_cache_store(
     }
 
     filed_page_cache_slot_t *slot = filed_page_cache_find(runtime, backend_object, page_index);
+    if (slot != NULL && slot->dirty) {
+        return;
+    }
     if (slot == NULL) {
         slot = filed_page_cache_choose_slot(runtime);
     }
@@ -804,6 +1069,9 @@ void filed_page_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backe
 {
     (void)runtime;
     filed_page_cache_ensure_configured();
+    if (filed_backend_object_is_tmpfs(backend_object)) {
+        return;
+    }
     for (size_t i = 0; i < filed_page_cache.active_slots; ++i) {
         filed_page_cache_slot_t *slot = &filed_page_cache.slots[i];
         if (slot->valid && (backend_object == 0 || slot->backend_object == backend_object)) {
@@ -989,18 +1257,27 @@ int filed_cached_pread(
     if (length == 0) {
         return 0;
     }
-    filed_page_cache_ensure_configured();
-    if (filed_page_cache.active_slots == 0) {
+    if (filed_backend_object_is_tmpfs(backend_object)) {
         filed_page_cache.direct_reads++;
-        return filed_kobox_backend_pread(
-            &runtime->backend,
+        return filed_backend_pread(
+            runtime,
             backend_object,
             offset,
             buffer,
             length,
             out_bytes);
     }
-
+    filed_page_cache_ensure_configured();
+    if (filed_page_cache.active_slots == 0) {
+        filed_page_cache.direct_reads++;
+        return filed_backend_pread(
+            runtime,
+            backend_object,
+            offset,
+            buffer,
+            length,
+            out_bytes);
+    }
     while (total < length) {
         const uint64_t absolute_offset = offset + total;
         if (absolute_offset < offset) {
@@ -1028,8 +1305,8 @@ int filed_cached_pread(
             const uint64_t page_start = absolute_offset - page_offset;
             filed_page_cache.misses++;
             memset(page_buffer, 0, sizeof(page_buffer));
-            const int status = filed_kobox_backend_pread(
-                &runtime->backend,
+            const int status = filed_backend_pread(
+                runtime,
                 backend_object,
                 page_start,
                 page_buffer,
@@ -1103,6 +1380,15 @@ static int filed_cached_pwrite_ex(
     if (offset + length < offset) {
         return -75;
     }
+    if (filed_backend_object_is_tmpfs(backend_object)) {
+        return filed_backend_pwrite(
+            runtime,
+            backend_object,
+            offset,
+            buffer,
+            length,
+            out_bytes);
+    }
     if (filed_page_cache_try_dirty_write(
             runtime,
             backend_object,
@@ -1120,8 +1406,8 @@ static int filed_cached_pwrite_ex(
         return status;
     }
 
-    status = filed_kobox_backend_pwrite(
-        &runtime->backend,
+    status = filed_backend_pwrite(
+        runtime,
         backend_object,
         offset,
         buffer,
@@ -1321,7 +1607,7 @@ static int filed_release_reclaimed_object(
     if (runtime == NULL || reclaim == NULL || !reclaim->released || reclaim->backend_object == 0) {
         return 0;
     }
-    return filed_kobox_backend_release_object(&runtime->backend, reclaim->backend_object);
+    return filed_backend_release_object(runtime, reclaim->backend_object);
 }
 
 static int64_t filed_close_handle_runtime(
@@ -1500,6 +1786,12 @@ static int filed_write_stat_from_backend(
     out->blocks = stat->blocks;
     out->nlink = stat->nlink;
     out->kind = stat->kind;
+    out->atime_sec = stat->atime_sec;
+    out->atime_nsec = stat->atime_nsec;
+    out->mtime_sec = stat->mtime_sec;
+    out->mtime_nsec = stat->mtime_nsec;
+    out->ctime_sec = stat->ctime_sec;
+    out->ctime_nsec = stat->ctime_nsec;
     out->object_generation = object_generation;
     out->dir_generation = dir_generation;
     return 0;
@@ -1523,6 +1815,34 @@ static filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
     snapshot.blocks = stat->blocks;
     snapshot.nlink = stat->nlink;
     snapshot.kind = stat->kind;
+    snapshot.times_valid = true;
+    snapshot.atime_sec = stat->atime_sec;
+    snapshot.atime_nsec = stat->atime_nsec;
+    snapshot.mtime_sec = stat->mtime_sec;
+    snapshot.mtime_nsec = stat->mtime_nsec;
+    snapshot.ctime_sec = stat->ctime_sec;
+    snapshot.ctime_nsec = stat->ctime_nsec;
+    snapshot.object_generation = (filed_generation_t)object_generation;
+    snapshot.dir_generation = (filed_generation_t)dir_generation;
+    return snapshot;
+}
+
+static filed_vfs_stat_snapshot_t filed_directory_snapshot_from_create(
+    uint64_t handle_id,
+    uint64_t mode,
+    uint64_t object_generation,
+    uint64_t dir_generation)
+{
+    filed_vfs_stat_snapshot_t snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.valid = true;
+    snapshot.handle_id = handle_id;
+    snapshot.mode = 0040000u | (mode & 07777u);
+    snapshot.size = 0;
+    snapshot.blocks = 0;
+    snapshot.nlink = 2;
+    snapshot.kind = 0040000u;
+    snapshot.times_valid = true;
     snapshot.object_generation = (filed_generation_t)object_generation;
     snapshot.dir_generation = (filed_generation_t)dir_generation;
     return snapshot;
@@ -1543,9 +1863,29 @@ static int filed_write_stat_from_snapshot(
     out->blocks = snapshot->blocks;
     out->nlink = snapshot->nlink;
     out->kind = snapshot->kind;
+    if (snapshot->times_valid) {
+        out->atime_sec = snapshot->atime_sec;
+        out->atime_nsec = snapshot->atime_nsec;
+        out->mtime_sec = snapshot->mtime_sec;
+        out->mtime_nsec = snapshot->mtime_nsec;
+        out->ctime_sec = snapshot->ctime_sec;
+        out->ctime_nsec = snapshot->ctime_nsec;
+    }
     out->object_generation = snapshot->object_generation;
     out->dir_generation = snapshot->dir_generation;
     return 0;
+}
+
+static int filed_backend_object_for_handle(
+    filed_runtime_t *runtime,
+    filed_handle_id_t handle_id,
+    filed_vfs_io_decision_t *out_decision)
+{
+    if (runtime == NULL || out_decision == NULL) {
+        return -22;
+    }
+    filed_status_t status = filed_vfs_stat_prepare(&runtime->vfs, handle_id, out_decision);
+    return filed_status_to_wire(status);
 }
 
 static int filed_dispatch_root_stat(
@@ -1581,8 +1921,8 @@ static int filed_dispatch_root_stat(
             result = snapshot.size;
         } else if (vfs_status == FILED_OK) {
         memset(&backend_stat, 0, sizeof(backend_stat));
-        reply_status = filed_kobox_backend_statx(
-            &runtime->backend,
+        reply_status = filed_backend_statx(
+            runtime,
             decision.backend_object,
             &backend_stat);
         if (reply_status == 0) {
@@ -1632,37 +1972,60 @@ static int filed_dispatch_root_getdents(
         &runtime->vfs,
         runtime->root_handle_id,
         &decision);
+    bool splice_tmpfs = false;
+    uint64_t backend_offset = 0;
+    if (vfs_status == FILED_OK) {
+        splice_tmpfs = filed_root_getdents_splices_tmpfs(runtime, decision.backend_object);
+        backend_offset = filed_root_getdents_backend_offset(
+            runtime,
+            decision.backend_object,
+            decision.offset);
+    }
     int64_t reply_status = filed_status_to_wire(vfs_status);
     uint64_t result = 0;
     if (vfs_status == FILED_OK &&
-        !filed_dir_cache_get(decision.backend_object, decision.offset, &backend_entries))
+        !filed_dir_cache_get(decision.backend_object, backend_offset, &backend_entries))
     {
-        reply_status = filed_kobox_backend_getdents(
-            &runtime->backend,
+        reply_status = filed_backend_getdents(
+            runtime,
             decision.backend_object,
-            decision.offset,
+            backend_offset,
             &backend_entries);
         if (reply_status == 0) {
-            filed_dir_cache_store(decision.backend_object, decision.offset, &backend_entries);
+            filed_dir_cache_store(decision.backend_object, backend_offset, &backend_entries);
         }
     }
     if (reply_status == 0) {
-        const uint64_t count =
-            backend_entries.count > FILED_WIRE_DIRENT_CAPACITY ?
-                FILED_WIRE_DIRENT_CAPACITY :
+        const uint64_t backend_start = splice_tmpfs && decision.offset == 0 ? 1u : 0u;
+        const uint64_t backend_capacity = FILED_WIRE_DIRENT_CAPACITY - backend_start;
+        const uint64_t backend_count =
+            backend_entries.count > backend_capacity ?
+                backend_capacity :
                 backend_entries.count;
+        const uint64_t count = backend_start + backend_count;
         memset(out, 0, sizeof(*out));
         out->dir_handle = runtime->root_handle_id;
         out->offset = decision.offset;
         out->count = count;
         out->dir_generation = decision.dir_generation;
-        for (uint64_t i = 0; i < count; ++i) {
-            out->entries[i].handle = 0;
-            out->entries[i].kind = backend_entries.entries[i].kind;
-            out->entries[i].name_len = backend_entries.entries[i].name_len;
+        if (backend_start != 0) {
+            out->entries[0].handle = 0;
+            out->entries[0].kind = 0040000u;
+            out->entries[0].name_len = 3;
             snprintf(
-                out->entries[i].name,
-                sizeof(out->entries[i].name),
+                out->entries[0].name,
+                sizeof(out->entries[0].name),
+                "%s",
+                "tmp");
+        }
+        for (uint64_t i = 0; i < backend_count; ++i) {
+            const uint64_t out_index = backend_start + i;
+            out->entries[out_index].handle = 0;
+            out->entries[out_index].kind = backend_entries.entries[i].kind;
+            out->entries[out_index].name_len = backend_entries.entries[i].name_len;
+            snprintf(
+                out->entries[out_index].name,
+                sizeof(out->entries[out_index].name),
                 "%s",
                 backend_entries.entries[i].name);
         }
@@ -1711,6 +2074,14 @@ static int filed_path_is_single_component(const char *path)
     return path != NULL && *path == '\0';
 }
 
+static int filed_path_component_is_tmp(const char *component, size_t len)
+{
+    return len == 3u &&
+        component[0] == 't' &&
+        component[1] == 'm' &&
+        component[2] == 'p';
+}
+
 static void filed_close_walk_handle(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id,
@@ -1719,7 +2090,8 @@ static void filed_close_walk_handle(
     if (runtime != NULL &&
         owned &&
         handle_id != 0 &&
-        handle_id != runtime->root_handle_id)
+        handle_id != runtime->root_handle_id &&
+        (!runtime->tmpfs_root_handle_valid || handle_id != runtime->tmpfs_root_handle_id))
     {
         (void)filed_close_handle_runtime(runtime, handle_id);
     }
@@ -1805,6 +2177,17 @@ static int64_t filed_resolve_parent_path(
 
         memset(component, 0, sizeof(component));
         memcpy(component, component_start, component_len);
+
+        if (current_handle == runtime->root_handle_id &&
+            !current_owned &&
+            runtime->tmpfs_root_handle_valid &&
+            has_more &&
+            filed_path_component_is_tmp(component, component_len))
+        {
+            current_handle = runtime->tmpfs_root_handle_id;
+            path = after_slashes;
+            continue;
+        }
 
         if (component_len == 1 && component[0] == '.') {
             if (!has_more) {
@@ -1894,12 +2277,6 @@ static int64_t filed_lookup_and_open_component(
     filed_status_t status;
     int64_t reply_status;
 
-    status = filed_vfs_lookup_prepare(&runtime->vfs, parent_handle, &parent_decision);
-    reply_status = filed_status_to_wire(status);
-    if (status != FILED_OK) {
-        return reply_status;
-    }
-
     if ((open_flags & (FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE | FILED_OPEN_TRUNCATE)) == 0) {
         status = filed_vfs_open_cached_child(
             &runtime->vfs,
@@ -1916,16 +2293,22 @@ static int64_t filed_lookup_and_open_component(
         }
     }
 
-    reply_status = filed_kobox_backend_lookup(
-        &runtime->backend,
+    status = filed_vfs_lookup_prepare(&runtime->vfs, parent_handle, &parent_decision);
+    reply_status = filed_status_to_wire(status);
+    if (status != FILED_OK) {
+        return reply_status;
+    }
+
+    reply_status = filed_backend_lookup(
+        runtime,
         parent_decision.backend_object,
         name,
         &object_id);
     if (reply_status != 0 &&
         (open_flags & FILED_OPEN_CREATE) != 0)
     {
-        reply_status = filed_kobox_backend_create(
-            &runtime->backend,
+        reply_status = filed_backend_create(
+            runtime,
             parent_decision.backend_object,
             name,
             0100644u,
@@ -1935,8 +2318,8 @@ static int64_t filed_lookup_and_open_component(
         }
         filed_dir_cache_invalidate_dir(parent_decision.backend_object);
         memset(&backend_stat, 0, sizeof(backend_stat));
-        reply_status = filed_kobox_backend_statx(
-            &runtime->backend,
+        reply_status = filed_backend_statx(
+            runtime,
             object_id,
             &backend_stat);
         if (reply_status != 0) {
@@ -1975,8 +2358,8 @@ static int64_t filed_lookup_and_open_component(
     }
 
     memset(&backend_stat, 0, sizeof(backend_stat));
-    reply_status = filed_kobox_backend_statx(
-        &runtime->backend,
+    reply_status = filed_backend_statx(
+        runtime,
         object_id,
         &backend_stat);
     if (reply_status != 0) {
@@ -2024,8 +2407,8 @@ static int64_t filed_lookup_and_open_component(
             memset(out_open, 0, sizeof(*out_open));
             return reply_status;
         }
-        reply_status = filed_kobox_backend_truncate(
-            &runtime->backend,
+        reply_status = filed_backend_truncate(
+            runtime,
             object_id,
             0);
         if (reply_status != 0) {
@@ -2365,8 +2748,8 @@ static filed_page_dispatch_result_t filed_dispatch_stat_page(
     }
     if (status == FILED_OK) {
         memset(&backend_stat, 0, sizeof(backend_stat));
-        reply_status = filed_kobox_backend_statx(
-            &runtime->backend,
+        reply_status = filed_backend_statx(
+            runtime,
             decision.backend_object,
             &backend_stat);
         if (reply_status == 0) {
@@ -2379,12 +2762,23 @@ static filed_page_dispatch_result_t filed_dispatch_stat_page(
                 &runtime->vfs,
                 decision.backend_object,
                 &snapshot);
-            (void)filed_write_stat_from_backend(
-                wire_stat,
-                &backend_stat,
-                handle_id,
-                decision.object_generation,
-                decision.dir_generation);
+            filed_vfs_stat_snapshot_t merged_snapshot;
+            memset(&merged_snapshot, 0, sizeof(merged_snapshot));
+            if (filed_vfs_get_stat_snapshot(
+                    &runtime->vfs,
+                    (filed_handle_id_t)(uint32_t)handle_id,
+                    &merged_snapshot) == FILED_OK &&
+                merged_snapshot.valid)
+            {
+                (void)filed_write_stat_from_snapshot(wire_stat, &merged_snapshot, handle_id);
+            } else {
+                (void)filed_write_stat_from_backend(
+                    wire_stat,
+                    &backend_stat,
+                    handle_id,
+                    decision.object_generation,
+                    decision.dir_generation);
+            }
             result = backend_stat.size;
             filed_runtime_publish_generation(
                 runtime,
@@ -2408,6 +2802,156 @@ static int filed_dispatch_stat(
     }
 
     const filed_page_dispatch_result_t result = filed_dispatch_stat_page(runtime, page);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+}
+
+static filed_page_dispatch_result_t filed_dispatch_utimens_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
+    filed_wire_utimens_t *utimens = (filed_wire_utimens_t *)page;
+    if (runtime == NULL || utimens == NULL) {
+        return filed_page_result(-22, 0);
+    }
+    if ((utimens->mask & ~((uint64_t)FILED_WIRE_UTIMENS_ATIME | (uint64_t)FILED_WIRE_UTIMENS_MTIME)) != 0) {
+        return filed_page_result(-22, 0);
+    }
+    filed_vfs_io_decision_t decision;
+    int backend_status = filed_backend_object_for_handle(
+        runtime,
+        (filed_handle_id_t)(uint32_t)utimens->handle,
+        &decision);
+    if (backend_status != 0) {
+        return filed_page_result(backend_status, 0);
+    }
+    backend_status = filed_backend_utimens(
+        runtime,
+        decision.backend_object,
+        (uint32_t)utimens->mask,
+        utimens->atime_sec,
+        utimens->atime_nsec,
+        utimens->mtime_sec,
+        utimens->mtime_nsec);
+    if (backend_status != 0) {
+        return filed_page_result(backend_status, 0);
+    }
+    filed_status_t status = filed_vfs_update_times(
+        &runtime->vfs,
+        (filed_handle_id_t)(uint32_t)utimens->handle,
+        (uint32_t)utimens->mask,
+        utimens->atime_sec,
+        utimens->atime_nsec,
+        utimens->mtime_sec,
+        utimens->mtime_nsec);
+    return filed_page_result(filed_status_to_wire(status), 0);
+}
+
+static int filed_dispatch_utimens(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    const filed_page_dispatch_result_t result = filed_dispatch_utimens_page(runtime, page);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+}
+
+static int filed_ensure_stat_snapshot(
+    filed_runtime_t *runtime,
+    filed_handle_id_t handle_id)
+{
+    filed_vfs_io_decision_t decision;
+    filed_vfs_stat_snapshot_t snapshot;
+    koboxd_wire_fs_statx_t backend_stat;
+    filed_status_t status = filed_vfs_stat_prepare(&runtime->vfs, handle_id, &decision);
+    if (status != FILED_OK) {
+        return filed_status_to_wire(status);
+    }
+    memset(&snapshot, 0, sizeof(snapshot));
+    status = filed_vfs_get_stat_snapshot(&runtime->vfs, handle_id, &snapshot);
+    if (status != FILED_OK) {
+        return filed_status_to_wire(status);
+    }
+    if (snapshot.valid) {
+        return 0;
+    }
+    memset(&backend_stat, 0, sizeof(backend_stat));
+    int64_t reply_status = filed_backend_statx(
+        runtime,
+        decision.backend_object,
+        &backend_stat);
+    if (reply_status != 0) {
+        return (int)reply_status;
+    }
+    snapshot = filed_stat_snapshot_from_backend(
+        &backend_stat,
+        handle_id,
+        decision.object_generation,
+        decision.dir_generation);
+    status = filed_vfs_update_stat_snapshot(
+        &runtime->vfs,
+        decision.backend_object,
+        &snapshot);
+    return filed_status_to_wire(status);
+}
+
+static filed_page_dispatch_result_t filed_dispatch_chmod_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
+    filed_wire_chmod_t *chmod_req = (filed_wire_chmod_t *)page;
+    if (runtime == NULL || chmod_req == NULL || chmod_req->reserved0 != 0 || chmod_req->reserved1 != 0) {
+        return filed_page_result(-22, 0);
+    }
+    int status = filed_ensure_stat_snapshot(
+        runtime,
+        (filed_handle_id_t)(uint32_t)chmod_req->handle);
+    if (status != 0) {
+        return filed_page_result(status, 0);
+    }
+    filed_vfs_io_decision_t decision;
+    status = filed_backend_object_for_handle(
+        runtime,
+        (filed_handle_id_t)(uint32_t)chmod_req->handle,
+        &decision);
+    if (status != 0) {
+        return filed_page_result(status, 0);
+    }
+    status = filed_backend_chmod(
+        runtime,
+        decision.backend_object,
+        chmod_req->mode);
+    if (status != 0) {
+        return filed_page_result(status, 0);
+    }
+    filed_status_t vfs_status = filed_vfs_update_mode(
+        &runtime->vfs,
+        (filed_handle_id_t)(uint32_t)chmod_req->handle,
+        chmod_req->mode);
+    return filed_page_result(filed_status_to_wire(vfs_status), 0);
+}
+
+static int filed_dispatch_chmod(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    const filed_page_dispatch_result_t result = filed_dispatch_chmod_page(runtime, page);
     (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     return filed_send_reply(reply_fd, request->word3, result.status, result.result);
@@ -2562,8 +3106,8 @@ static filed_page_dispatch_result_t filed_dispatch_pwrite_page(
                 decision.offset = snapshot.size;
             } else if (status == FILED_OK) {
                 memset(&backend_stat, 0, sizeof(backend_stat));
-                reply_status = filed_kobox_backend_statx(
-                    &runtime->backend,
+                reply_status = filed_backend_statx(
+                    runtime,
                     decision.backend_object,
                     &backend_stat);
                 if (reply_status != 0) {
@@ -2659,8 +3203,8 @@ static filed_page_dispatch_result_t filed_dispatch_write_page(
                 decision.offset = snapshot.size;
             } else if (status == FILED_OK) {
                 memset(&backend_stat, 0, sizeof(backend_stat));
-                reply_status = filed_kobox_backend_statx(
-                    &runtime->backend,
+                reply_status = filed_backend_statx(
+                    runtime,
                     decision.backend_object,
                     &backend_stat);
                 if (reply_status != 0) {
@@ -2764,8 +3308,8 @@ static filed_page_dispatch_result_t filed_dispatch_seek_page(
             } else if (status == FILED_OK) {
                 koboxd_wire_fs_statx_t backend_stat;
                 memset(&backend_stat, 0, sizeof(backend_stat));
-                reply_status = filed_kobox_backend_statx(
-                    &runtime->backend,
+                reply_status = filed_backend_statx(
+                    runtime,
                     decision.backend_object,
                     &backend_stat);
                 if (reply_status == 0) {
@@ -2816,9 +3360,8 @@ static int filed_dispatch_seek(
     return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
-static int filed_dispatch_fsync(
+static filed_page_dispatch_result_t filed_dispatch_fsync_page(
     filed_runtime_t *runtime,
-    int reply_fd,
     const struct pacha_ipc_msg *request)
 {
     filed_vfs_io_decision_t decision;
@@ -2831,12 +3374,21 @@ static int filed_dispatch_fsync(
     if (status == FILED_OK) {
         reply_status = filed_page_cache_flush_object(runtime, decision.backend_object);
         if (reply_status == 0) {
-            reply_status = filed_kobox_backend_fsync(
-                &runtime->backend,
+            reply_status = filed_backend_fsync(
+                runtime,
                 decision.backend_object);
         }
     }
-    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+    return filed_page_result(reply_status, 0);
+}
+
+static int filed_dispatch_fsync(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    const filed_page_dispatch_result_t result = filed_dispatch_fsync_page(runtime, request);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
 static filed_page_dispatch_result_t filed_dispatch_truncate_page(
@@ -2857,8 +3409,8 @@ static filed_page_dispatch_result_t filed_dispatch_truncate_page(
         if (status == FILED_OK) {
             reply_status = filed_page_cache_flush_object(runtime, decision.backend_object);
             if (reply_status == 0) {
-                reply_status = filed_kobox_backend_truncate(
-                    &runtime->backend,
+                reply_status = filed_backend_truncate(
+                    runtime,
                     decision.backend_object,
                     truncate->size);
                 if (reply_status == 0) {
@@ -2897,6 +3449,7 @@ static int filed_dispatch_truncate(
 
 static uint64_t filed_lookup_cache_target_object(
     filed_runtime_t *runtime,
+    filed_handle_id_t parent_handle,
     uint64_t parent_backend_object,
     const char *name)
 {
@@ -2904,13 +3457,30 @@ static uint64_t filed_lookup_cache_target_object(
     if (runtime == NULL || parent_backend_object == 0 || name == NULL) {
         return 0;
     }
-    if (filed_kobox_backend_lookup(
-            &runtime->backend,
+    if (parent_handle != 0 &&
+        filed_vfs_cached_child_backend_object(
+            &runtime->vfs,
+            parent_handle,
+            name,
+            &object_id) == FILED_OK &&
+        object_id != 0)
+    {
+        filed_target_lookup_vfs_hits++;
+        return object_id;
+    }
+    if (            filed_backend_lookup(
+            runtime,
             parent_backend_object,
             name,
             &object_id) != 0)
     {
+        filed_target_lookup_misses++;
         return 0;
+    }
+    if (object_id != 0) {
+        filed_target_lookup_backend_hits++;
+    } else {
+        filed_target_lookup_misses++;
     }
     return object_id;
 }
@@ -2965,12 +3535,13 @@ static filed_page_dispatch_result_t filed_dispatch_unlink_page(
             if (status == FILED_OK) {
                 target_object = filed_lookup_cache_target_object(
                     runtime,
+                    dir_handle,
                     decision.backend_object,
                     name);
                 reply_status = filed_flush_mutated_object(runtime, target_object);
                 if (reply_status == 0) {
-                    reply_status = filed_kobox_backend_unlink(
-                        &runtime->backend,
+                    reply_status = filed_backend_unlink(
+                        runtime,
                         decision.backend_object,
                         name);
                 }
@@ -3054,24 +3625,21 @@ static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
             status = filed_vfs_create_prepare(&runtime->vfs, dir_handle, name, &decision);
             reply_status = filed_status_to_wire(status);
             if (status == FILED_OK) {
-                reply_status = filed_kobox_backend_mkdir(
-                    &runtime->backend,
+                reply_status = filed_backend_mkdir(
+                    runtime,
                     decision.backend_object,
                     name,
                     mkdir->mode,
                     &object_id);
                 if (reply_status == 0 && object_id != 0) {
                     filed_dir_cache_invalidate_dir(decision.backend_object);
-                    koboxd_wire_fs_statx_t backend_stat;
                     filed_vfs_open_result_t opened;
-                    memset(&backend_stat, 0, sizeof(backend_stat));
                     memset(&opened, 0, sizeof(opened));
-                    if (filed_kobox_backend_statx(&runtime->backend, object_id, &backend_stat) == 0 &&
-                        filed_vfs_create_backend_child(
+                    if (filed_vfs_create_backend_child(
                             &runtime->vfs,
                             dir_handle,
                             object_id,
-                            filed_kind_from_unix_type(backend_stat.kind),
+                            FILED_VNODE_DIRECTORY,
                             name,
                             FILED_RIGHT_LOOKUP |
                                 FILED_RIGHT_STAT |
@@ -3079,24 +3647,24 @@ static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
                                 FILED_RIGHT_CREATE |
                                 FILED_RIGHT_REMOVE |
                                 FILED_RIGHT_RENAME,
-	                            FILED_OPEN_DIRECTORY,
-	                            &opened) == FILED_OK)
-	                    {
-	                        const filed_vfs_stat_snapshot_t snapshot =
-	                            filed_stat_snapshot_from_backend(
-	                                &backend_stat,
-	                                opened.handle_id,
-	                                opened.object_generation,
-	                                opened.dir_generation);
-		                        (void)filed_vfs_update_stat_snapshot(
-		                            &runtime->vfs,
-		                            object_id,
-		                            &snapshot);
-		                        filed_runtime_publish_backend_object_generation(
-		                            runtime,
-		                            decision.backend_object);
-		                        (void)filed_vfs_close_handle(&runtime->vfs, opened.handle_id);
-		                    }
+                            FILED_OPEN_DIRECTORY,
+                            &opened) == FILED_OK)
+                    {
+                        const filed_vfs_stat_snapshot_t snapshot =
+                            filed_directory_snapshot_from_create(
+                                opened.handle_id,
+                                mkdir->mode,
+                                opened.object_generation,
+                                opened.dir_generation);
+                        (void)filed_vfs_update_stat_snapshot(
+                            &runtime->vfs,
+                            object_id,
+                            &snapshot);
+                        filed_runtime_publish_backend_object_generation(
+                            runtime,
+                            decision.backend_object);
+                        (void)filed_vfs_close_handle(&runtime->vfs, opened.handle_id);
+                    }
                 }
             }
             filed_close_walk_handle(runtime, dir_handle, dir_owned);
@@ -3159,12 +3727,13 @@ static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
             if (status == FILED_OK) {
                 target_object = filed_lookup_cache_target_object(
                     runtime,
+                    dir_handle,
                     decision.backend_object,
                     name);
                 reply_status = filed_flush_mutated_object(runtime, target_object);
                 if (reply_status == 0) {
-                    reply_status = filed_kobox_backend_rmdir(
-                        &runtime->backend,
+                    reply_status = filed_backend_rmdir(
+                        runtime,
                         decision.backend_object,
                         name);
                 }
@@ -3280,22 +3849,22 @@ static filed_page_dispatch_result_t filed_dispatch_rename_page(
             if (status == FILED_OK) {
                 replaced_object_id = filed_lookup_cache_target_object(
                     runtime,
+                    new_dir_handle,
                     new_parent.backend_object,
                     new_name);
                 object_id = filed_lookup_cache_target_object(
                     runtime,
+                    old_dir_handle,
                     old_parent.backend_object,
                     old_name);
-                reply_status = filed_flush_mutated_object(runtime, object_id);
-                if (reply_status == 0 &&
-                    replaced_object_id != 0 &&
+                if (replaced_object_id != 0 &&
                     replaced_object_id != object_id)
                 {
                     reply_status = filed_flush_mutated_object(runtime, replaced_object_id);
                 }
                 if (reply_status == 0) {
-                    reply_status = filed_kobox_backend_rename(
-                        &runtime->backend,
+                    reply_status = filed_backend_rename(
+                        runtime,
                         old_parent.backend_object,
                         old_name,
                         new_parent.backend_object,
@@ -3307,7 +3876,6 @@ static filed_page_dispatch_result_t filed_dispatch_rename_page(
                     if (new_parent.backend_object != old_parent.backend_object) {
                         filed_dir_cache_invalidate_dir(new_parent.backend_object);
                     }
-                    filed_invalidate_mutated_object(runtime, object_id);
                     if (replaced_object_id != 0 && replaced_object_id != object_id) {
                         filed_invalidate_mutated_object(runtime, replaced_object_id);
                     }
@@ -3385,40 +3953,63 @@ static filed_page_dispatch_result_t filed_dispatch_getdents_page(
         &runtime->vfs,
         (filed_handle_id_t)(uint32_t)out->dir_handle,
         &decision);
+    bool splice_tmpfs = false;
+    uint64_t backend_offset = 0;
+    if (status == FILED_OK) {
+        splice_tmpfs = filed_root_getdents_splices_tmpfs(runtime, decision.backend_object);
+        backend_offset = filed_root_getdents_backend_offset(
+            runtime,
+            decision.backend_object,
+            decision.offset);
+    }
     int64_t reply_status = filed_status_to_wire(status);
     uint64_t result = 0;
     memset(&backend_entries, 0, sizeof(backend_entries));
     backend_entries.capacity = FILED_WIRE_DIRENT_CAPACITY;
     if (status == FILED_OK &&
-        !filed_dir_cache_get(decision.backend_object, decision.offset, &backend_entries))
+        !filed_dir_cache_get(decision.backend_object, backend_offset, &backend_entries))
     {
-        reply_status = filed_kobox_backend_getdents(
-            &runtime->backend,
+        reply_status = filed_backend_getdents(
+            runtime,
             decision.backend_object,
-            decision.offset,
+            backend_offset,
             &backend_entries);
         if (reply_status == 0) {
-            filed_dir_cache_store(decision.backend_object, decision.offset, &backend_entries);
+            filed_dir_cache_store(decision.backend_object, backend_offset, &backend_entries);
         }
     }
     if (reply_status == 0) {
-        const uint64_t count =
-            backend_entries.count > FILED_WIRE_DIRENT_CAPACITY ?
-                FILED_WIRE_DIRENT_CAPACITY :
+        const uint64_t backend_start = splice_tmpfs && decision.offset == 0 ? 1u : 0u;
+        const uint64_t backend_capacity = FILED_WIRE_DIRENT_CAPACITY - backend_start;
+        const uint64_t backend_count =
+            backend_entries.count > backend_capacity ?
+                backend_capacity :
                 backend_entries.count;
+        const uint64_t count = backend_start + backend_count;
         const uint64_t dir_handle = out->dir_handle;
         memset(out, 0, sizeof(*out));
         out->dir_handle = dir_handle;
         out->offset = decision.offset;
         out->count = count;
         out->dir_generation = decision.dir_generation;
-        for (uint64_t i = 0; i < count; ++i) {
-            out->entries[i].handle = 0;
-            out->entries[i].kind = backend_entries.entries[i].kind;
-            out->entries[i].name_len = backend_entries.entries[i].name_len;
+        if (backend_start != 0) {
+            out->entries[0].handle = 0;
+            out->entries[0].kind = 0040000u;
+            out->entries[0].name_len = 3;
             snprintf(
-                out->entries[i].name,
-                sizeof(out->entries[i].name),
+                out->entries[0].name,
+                sizeof(out->entries[0].name),
+                "%s",
+                "tmp");
+        }
+        for (uint64_t i = 0; i < backend_count; ++i) {
+            const uint64_t out_index = backend_start + i;
+            out->entries[out_index].handle = 0;
+            out->entries[out_index].kind = backend_entries.entries[i].kind;
+            out->entries[out_index].name_len = backend_entries.entries[i].name_len;
+            snprintf(
+                out->entries[out_index].name,
+                sizeof(out->entries[out_index].name),
                 "%s",
                 backend_entries.entries[i].name);
         }
@@ -4082,6 +4673,10 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_validate_open_cache_page(runtime, page);
     case FILED_WIRE_OP_STAT:
         return filed_dispatch_stat_page(runtime, page);
+    case FILED_WIRE_OP_UTIMENS:
+        return filed_dispatch_utimens_page(runtime, page);
+    case FILED_WIRE_OP_CHMOD:
+        return filed_dispatch_chmod_page(runtime, page);
     case FILED_WIRE_OP_PREAD:
         return filed_dispatch_pread_page(runtime, page);
     case FILED_WIRE_OP_READ:
@@ -4108,6 +4703,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_get_flags_page(runtime, page);
     case FILED_WIRE_OP_SET_FLAGS:
         return filed_dispatch_set_flags_page(runtime, page);
+    case FILED_WIRE_OP_FSYNC:
+        return filed_dispatch_fsync_page(runtime, request);
     case FILED_WIRE_OP_SEEK:
         return filed_dispatch_seek_page(runtime, page);
     case FILED_WIRE_OP_EXEC_PATH:
@@ -4452,6 +5049,12 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
     case FILED_WIRE_OP_STAT:
         dispatch_status = filed_dispatch_stat(runtime, reply_fd, &request);
         break;
+    case FILED_WIRE_OP_UTIMENS:
+        dispatch_status = filed_dispatch_utimens(runtime, reply_fd, &request);
+        break;
+    case FILED_WIRE_OP_CHMOD:
+        dispatch_status = filed_dispatch_chmod(runtime, reply_fd, &request);
+        break;
     case FILED_WIRE_OP_PREAD:
         dispatch_status = filed_dispatch_pread(runtime, reply_fd, &request);
         break;
@@ -4506,6 +5109,7 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
     case FILED_WIRE_OP_DUMP_METRICS:
         filed_dump_dispatch_metrics();
         filed_dump_cache_metrics(runtime);
+        filed_exec_linux_lpr_dump_metrics();
         filed_kobox_backend_dump_metrics(&runtime->backend);
         dispatch_status = filed_send_reply(reply_fd, request.word3, 0, 0);
         break;

@@ -1,6 +1,7 @@
 const kernel_log = @import("kernel_log.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 
+const enable_periodic_reports = false;
 const report_every: u64 = 4096;
 
 pub const Op = enum(usize) {
@@ -66,6 +67,8 @@ fn totalCountLocked() u64 {
 }
 
 fn reportLocked() void {
+    if (!enable_periodic_reports) return;
+
     const total = totalCountLocked();
     if (total < next_report) return;
     kernel_log.writeFmt(

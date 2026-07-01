@@ -69,6 +69,7 @@ packaging, image sync, QEMU, and test tasks.`,
 	cmd.AddCommand(buildCommand(ctx))
 	cmd.AddCommand(genCommand(ctx))
 	cmd.AddCommand(syncCommand(ctx))
+	cmd.AddCommand(fsckCommand(ctx))
 	cmd.AddCommand(profileSmokeCommand(ctx))
 	cmd.AddCommand(profileBenchCommand(ctx))
 	cmd.AddCommand(runnerCommand(ctx))

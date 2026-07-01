@@ -19,3 +19,17 @@ mkdir -p "${build_dir}"
   -o "${build_dir}/vfs_test"
 
 "${build_dir}/vfs_test"
+
+"${cc_bin}" \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -pthread \
+  -I"${repo_root}/userland/filed/include" \
+  -I"${repo_root}/userland/koboxd/include" \
+  "${repo_root}/userland/filed/src/tmpfs_backend.c" \
+  "${repo_root}/userland/filed/tests/tmpfs_backend_test.c" \
+  -o "${build_dir}/tmpfs_backend_test"
+
+"${build_dir}/tmpfs_backend_test"

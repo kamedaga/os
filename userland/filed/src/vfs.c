@@ -1122,6 +1122,47 @@ filed_status_t filed_vfs_open_cached_child(
     return status;
 }
 
+filed_status_t filed_vfs_cached_child_backend_object(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    filed_backend_object_id_t *out_backend_object)
+{
+    filed_vnode_t *parent_vnode;
+    filed_vnode_t *child;
+    filed_status_t status;
+
+    if (vfs == NULL || parent_handle == 0 || name == NULL || out_backend_object == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    *out_backend_object = 0;
+    if (!filed_name_is_component(name)) {
+        return FILED_ERR_INVALID;
+    }
+
+    status = filed_handle_vnode(
+        (filed_vfs_t *)(uintptr_t)vfs,
+        parent_handle,
+        FILED_RIGHT_LOOKUP,
+        &parent_vnode);
+    if (status != FILED_OK) {
+        return status;
+    }
+    if (parent_vnode->kind != FILED_VNODE_DIRECTORY) {
+        return FILED_ERR_NOT_DIR;
+    }
+
+    filed_vnode_write_lock(parent_vnode);
+    child = filed_find_child_vnode((filed_vfs_t *)(uintptr_t)vfs, parent_vnode->id, name);
+    if (child != NULL) {
+        filed_lock_acquire(&child->lock);
+        *out_backend_object = child->backend_object;
+        filed_lock_release(&child->lock);
+    }
+    filed_vnode_write_unlock(parent_vnode);
+    return child != NULL && *out_backend_object != 0 ? FILED_OK : FILED_ERR_NOT_FOUND;
+}
+
 filed_status_t filed_vfs_create_backend_child(
     filed_vfs_t *vfs,
     filed_handle_id_t parent_handle,
@@ -1516,6 +1557,13 @@ filed_status_t filed_vfs_get_stat_snapshot(
         out_snapshot->blocks = vnode->stat_blocks;
         out_snapshot->nlink = vnode->stat_nlink;
         out_snapshot->kind = vnode->stat_kind;
+        out_snapshot->times_valid = vnode->stat_times_valid;
+        out_snapshot->atime_sec = vnode->stat_atime_sec;
+        out_snapshot->atime_nsec = vnode->stat_atime_nsec;
+        out_snapshot->mtime_sec = vnode->stat_mtime_sec;
+        out_snapshot->mtime_nsec = vnode->stat_mtime_nsec;
+        out_snapshot->ctime_sec = vnode->stat_ctime_sec;
+        out_snapshot->ctime_nsec = vnode->stat_ctime_nsec;
     }
     filed_lock_release(filed_mutable_lock(&vnode->lock));
     return FILED_OK;
@@ -1637,6 +1685,15 @@ filed_status_t filed_vfs_update_stat_snapshot(
     vnode->stat_blocks = snapshot->blocks;
     vnode->stat_nlink = snapshot->nlink;
     vnode->stat_kind = snapshot->kind;
+    if (snapshot->times_valid) {
+        vnode->stat_times_valid = true;
+        vnode->stat_atime_sec = snapshot->atime_sec;
+        vnode->stat_atime_nsec = snapshot->atime_nsec;
+        vnode->stat_mtime_sec = snapshot->mtime_sec;
+        vnode->stat_mtime_nsec = snapshot->mtime_nsec;
+        vnode->stat_ctime_sec = snapshot->ctime_sec;
+        vnode->stat_ctime_nsec = snapshot->ctime_nsec;
+    }
     filed_lock_release(&vnode->lock);
     return FILED_OK;
 }
@@ -1710,6 +1767,107 @@ filed_status_t filed_vfs_note_truncate(
     if (vnode->stat_valid) {
         vnode->stat_size = size;
     }
+    filed_vnode_bump_object_generation_locked(vnode);
+    filed_lock_release(&vnode->lock);
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_update_times(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint32_t mask,
+    int64_t atime_sec,
+    int64_t atime_nsec,
+    int64_t mtime_sec,
+    int64_t mtime_nsec)
+{
+    filed_handle_t *handle;
+    filed_file_t *file;
+    filed_vnode_t *vnode;
+
+    if (vfs == NULL || handle_id == 0) {
+        return FILED_ERR_INVALID;
+    }
+    if ((mask & ~((uint32_t)FILED_TIME_UPDATE_ATIME | (uint32_t)FILED_TIME_UPDATE_MTIME)) != 0) {
+        return FILED_ERR_INVALID;
+    }
+    if (mask == 0) {
+        return FILED_OK;
+    }
+    if (atime_nsec < 0 || atime_nsec >= 1000000000ll ||
+        mtime_nsec < 0 || mtime_nsec >= 1000000000ll)
+    {
+        return FILED_ERR_INVALID;
+    }
+    handle = filed_find_handle(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_rights_include(handle->rights, FILED_RIGHT_WRITE)) {
+        return FILED_ERR_DENIED;
+    }
+    file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_vnode(vfs, file->vnode_id);
+    if (vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(&vnode->lock);
+    vnode->stat_times_valid = true;
+    if ((mask & (uint32_t)FILED_TIME_UPDATE_ATIME) != 0) {
+        vnode->stat_atime_sec = atime_sec;
+        vnode->stat_atime_nsec = atime_nsec;
+    }
+    if ((mask & (uint32_t)FILED_TIME_UPDATE_MTIME) != 0) {
+        vnode->stat_mtime_sec = mtime_sec;
+        vnode->stat_mtime_nsec = mtime_nsec;
+    }
+    vnode->stat_ctime_sec =
+        (mask & (uint32_t)FILED_TIME_UPDATE_MTIME) != 0 ? mtime_sec : atime_sec;
+    vnode->stat_ctime_nsec =
+        (mask & (uint32_t)FILED_TIME_UPDATE_MTIME) != 0 ? mtime_nsec : atime_nsec;
+    filed_vnode_bump_object_generation_locked(vnode);
+    filed_lock_release(&vnode->lock);
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_update_mode(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t mode)
+{
+    filed_handle_t *handle;
+    filed_file_t *file;
+    filed_vnode_t *vnode;
+
+    if (vfs == NULL || handle_id == 0 || (mode & ~07777ull) != 0) {
+        return FILED_ERR_INVALID;
+    }
+    handle = filed_find_handle(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_rights_include(handle->rights, FILED_RIGHT_WRITE)) {
+        return FILED_ERR_DENIED;
+    }
+    file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_vnode(vfs, file->vnode_id);
+    if (vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(&vnode->lock);
+    if (!vnode->stat_valid) {
+        filed_lock_release(&vnode->lock);
+        return FILED_ERR_NOT_FOUND;
+    }
+    vnode->stat_mode = (vnode->stat_mode & 0170000ull) | (mode & 07777ull);
     filed_vnode_bump_object_generation_locked(vnode);
     filed_lock_release(&vnode->lock);
     return FILED_OK;

@@ -95,6 +95,7 @@ void filed_runtime_init(filed_runtime_t *runtime)
     }
     filed_vfs_init(&runtime->vfs);
     filed_kobox_backend_init(&runtime->backend, -1);
+    filed_tmpfs_backend_init(&runtime->tmpfs);
 }
 
 int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
@@ -184,6 +185,13 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         root_snapshot.blocks = root_stat.blocks;
         root_snapshot.nlink = root_stat.nlink;
         root_snapshot.kind = root_stat.kind;
+        root_snapshot.times_valid = true;
+        root_snapshot.atime_sec = root_stat.atime_sec;
+        root_snapshot.atime_nsec = root_stat.atime_nsec;
+        root_snapshot.mtime_sec = root_stat.mtime_sec;
+        root_snapshot.mtime_nsec = root_stat.mtime_nsec;
+        root_snapshot.ctime_sec = root_stat.ctime_sec;
+        root_snapshot.ctime_nsec = root_stat.ctime_nsec;
         (void)filed_vfs_update_stat_snapshot(
             &runtime->vfs,
             runtime->backend.root_object_id,
@@ -209,6 +217,68 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         return -30 - (int)vfs_status;
     }
     runtime->root_handle_id = root_open.handle_id;
+
+    {
+        uint64_t tmpfs_root = 0;
+        uint64_t root_tmp_object = 0;
+        filed_vfs_open_result_t tmp_open;
+        memset(&tmp_open, 0, sizeof(tmp_open));
+        status = filed_tmpfs_backend_mount_root(&runtime->tmpfs, &tmpfs_root);
+        if (status != 0) {
+            return status;
+        }
+        runtime->root_tmpfs_synthetic_dirent =
+            filed_kobox_backend_lookup(
+                &runtime->backend,
+                runtime->backend.root_object_id,
+                "tmp",
+                &root_tmp_object) == 0 ? 0u : 1u;
+        vfs_status = filed_vfs_open_backend_child(
+            &runtime->vfs,
+            runtime->root_handle_id,
+            tmpfs_root,
+            FILED_VNODE_DIRECTORY,
+            "tmp",
+            FILED_RIGHT_LOOKUP |
+                FILED_RIGHT_READ |
+                FILED_RIGHT_EXEC |
+                FILED_RIGHT_STAT |
+                FILED_RIGHT_GETDENTS |
+                FILED_RIGHT_CREATE |
+                FILED_RIGHT_REMOVE |
+                FILED_RIGHT_RENAME,
+            FILED_OPEN_DIRECTORY,
+            &tmp_open);
+        if (vfs_status != FILED_OK) {
+            return -50 - (int)vfs_status;
+        }
+        runtime->tmpfs_root_handle_id = tmp_open.handle_id;
+        runtime->tmpfs_root_handle_valid = 1u;
+        {
+            koboxd_wire_fs_statx_t tmp_stat;
+            filed_vfs_stat_snapshot_t tmp_snapshot;
+            memset(&tmp_stat, 0, sizeof(tmp_stat));
+            status = filed_tmpfs_backend_statx(&runtime->tmpfs, tmpfs_root, &tmp_stat);
+            if (status != 0) {
+                return status;
+            }
+            memset(&tmp_snapshot, 0, sizeof(tmp_snapshot));
+            tmp_snapshot.valid = true;
+            tmp_snapshot.handle_id = tmp_open.handle_id;
+            tmp_snapshot.mode = tmp_stat.mode;
+            tmp_snapshot.size = tmp_stat.size;
+            tmp_snapshot.blocks = tmp_stat.blocks;
+            tmp_snapshot.nlink = tmp_stat.nlink;
+            tmp_snapshot.kind = tmp_stat.kind;
+            tmp_snapshot.times_valid = true;
+            tmp_snapshot.object_generation = tmp_open.object_generation;
+            tmp_snapshot.dir_generation = tmp_open.dir_generation;
+            (void)filed_vfs_update_stat_snapshot(
+                &runtime->vfs,
+                tmpfs_root,
+                &tmp_snapshot);
+        }
+    }
 
     vfs_status = filed_vfs_check_basic(&runtime->vfs);
     if (vfs_status != FILED_OK) {

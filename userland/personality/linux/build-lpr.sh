@@ -10,6 +10,7 @@ clang \
   -Wall -Wextra -Werror \
   -ffreestanding \
   -fPIC \
+  -fvisibility=hidden \
   -fno-stack-protector \
   -fno-builtin \
   -nostdlib \
@@ -18,12 +19,25 @@ clang \
   -Wl,--no-undefined \
   -Wl,-Bsymbolic \
   -Wl,-Bsymbolic-functions \
+  -Wl,--version-script="$repo_root/userland/personality/linux/runtime/lpr_namespace.map" \
   -Wl,-soname,lpr-linux-x86_64.so \
   -I"$repo_root/userland/personality/include" \
   -I"$repo_root/musl/pachaos/include" \
+  -I"$repo_root/userland/libpacha/include" \
+  -I"$repo_root/userland/libipc/include" \
+  -I"$repo_root/userland/filed/include" \
   "$repo_root/userland/personality/linux/runtime/lpr_runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_zpoline.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_syscall_catalog.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_memory.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_vfs_local.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_filed.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_dispatch.c" \
-  "$repo_root/userland/personality/linux/runtime/lpr_pacha_syscall.c" \
+  "$repo_root/userland/personality/linux/runtime/support/arena.c" \
+  "$repo_root/userland/personality/linux/runtime/support/elf.c" \
+  "$repo_root/userland/personality/linux/runtime/support/string.c" \
+  "$repo_root/userland/personality/linux/runtime/support/syscall.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_entry.S" \
   -o "$repo_root/$out"
+
+bash "$repo_root/userland/personality/linux/check-lpr-namespace.sh" "$repo_root/$out"

@@ -1,5 +1,6 @@
 .text
 .globl lpr_syscall_entry
+.hidden lpr_syscall_entry
 .type lpr_syscall_entry, @function
 lpr_syscall_entry:
     push %rdi
@@ -29,6 +30,7 @@ lpr_syscall_entry:
 .size lpr_syscall_entry, .-lpr_syscall_entry
 
 .globl lpr_trap_entry
+.hidden lpr_trap_entry
 .type lpr_trap_entry, @function
 lpr_trap_entry:
     jmp lpr_syscall_entry

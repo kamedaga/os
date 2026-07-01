@@ -20,6 +20,7 @@ pub const syscall_thread_exit: u64 = process_abi.syscall_thread_exit;
 pub const syscall_thread_set_fs_base: u64 = process_abi.syscall_thread_set_fs_base;
 pub const syscall_thread_set_gs_base: u64 = process_abi.syscall_thread_set_gs_base;
 pub const syscall_process_map: u64 = process_abi.syscall_process_map;
+pub const syscall_process_map_batch: u64 = process_abi.syscall_process_map_batch;
 
 pub const syscall_getpid: u64 = runtime_abi.syscall_getpid;
 pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
@@ -99,6 +100,7 @@ test "native syscall numbers are contiguous" {
         syscall_thread_set_fs_base,
         syscall_thread_set_gs_base,
         syscall_process_map,
+        syscall_process_map_batch,
         syscall_getpid,
         syscall_gettid,
         syscall_clock_gettime,

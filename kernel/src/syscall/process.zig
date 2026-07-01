@@ -13,6 +13,8 @@ const process_abi = abi_root.process_abi;
 const vm_abi = abi_root.vm_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
+const max_process_map_batch_entries: usize = @intCast(process_abi.process_map_batch_max_entries);
+const process_map_batch_entry_size: usize = @intCast(process_abi.process_map_batch_entry_size);
 
 fn protFromBits(bits: u64) ?kernel.VmaProt {
     if ((bits & ~(vm_abi.prot_read | vm_abi.prot_write | vm_abi.prot_exec)) != 0) return null;
@@ -68,6 +70,17 @@ fn writeThreadStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, thread: 
     return sc.syscall_ok;
 }
 
+fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId) void {
+    var wake_targets: [kernel.max_task_fd_waiters]kernel.ThreadWakeTarget = undefined;
+    const wake_count = state.takeTaskReadableWaitersForPrincipal(principal, wake_targets[0..]);
+    for (wake_targets[0..wake_count]) |target| {
+        if (target.pollfd_va != 0) {
+            _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
+        }
+        _ = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
+    }
+}
+
 fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
     const index: usize = @intCast(thread.thread_index);
     const owner: kernel.PrincipalId = @enumFromInt(thread.owner_principal_raw);
@@ -79,6 +92,7 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     state.markThreadObjectsExitedForPrincipal(principal, exit_state, exit_code);
     state.markProcessObjectsExited(principal, exit_state, exit_code);
+    wakeTaskFdWaiters(h, state, principal);
     _ = scheduler.releasePrincipalThreads(principal);
     user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
@@ -175,6 +189,166 @@ fn waitThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     return writeThreadStatus(h, proc, out_va, thread);
 }
 
+const ProcessMapRequest = struct {
+    vmo_fd: kernel.Fd,
+    target_va: u64,
+    size_bytes: u64,
+    aligned_size: u64,
+    prot: kernel.VmaProt,
+    flags: kernel.MmapFlags,
+    vmo_offset: u64,
+};
+
+const ProcessMapPrepareResult = struct {
+    status: u64,
+    request: ProcessMapRequest = undefined,
+};
+
+const ProcessMapInstallResult = struct {
+    status: u64,
+    mapped_va: u64 = 0,
+};
+
+fn prepareProcessMapRequest(
+    vmo_fd: kernel.Fd,
+    target_va: u64,
+    size_bytes: u64,
+    prot_bits: u64,
+    vmo_offset: u64,
+    map_flags_bits: u64,
+    allow_anywhere: bool,
+) ProcessMapPrepareResult {
+    const anywhere = target_va == process_abi.process_map_anywhere_va;
+    if (anywhere and !allow_anywhere) return .{ .status = sc.syscall_err_invalid };
+    if ((map_flags_bits & ~process_abi.process_map_known_flags_mask) != 0) return .{ .status = sc.syscall_err_invalid };
+    if ((map_flags_bits & process_abi.process_map_flag_private) != 0 and
+        (map_flags_bits & process_abi.process_map_flag_shared) != 0)
+    {
+        return .{ .status = sc.syscall_err_invalid };
+    }
+    if ((!anywhere and (target_va & 0xFFF) != 0) or (vmo_offset & 0xFFF) != 0) {
+        kernel_log.write("process.map failed args\n");
+        return .{ .status = sc.syscall_err_invalid };
+    }
+    if (size_bytes == 0) {
+        kernel_log.write("process.map failed size\n");
+        return .{ .status = sc.syscall_err_invalid };
+    }
+    const aligned_size = pageAlignUp(size_bytes) orelse {
+        kernel_log.write("process.map failed align\n");
+        return .{ .status = sc.syscall_err_invalid };
+    };
+    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) {
+        kernel_log.write("process.map failed too-large\n");
+        return .{ .status = sc.syscall_err_alloc };
+    }
+    const prot = protFromBits(prot_bits) orelse {
+        kernel_log.write("process.map failed prot\n");
+        return .{ .status = sc.syscall_err_invalid };
+    };
+    const private_map = (map_flags_bits & process_abi.process_map_flag_private) != 0;
+    return .{
+        .status = sc.syscall_ok,
+        .request = .{
+            .vmo_fd = vmo_fd,
+            .target_va = target_va,
+            .size_bytes = size_bytes,
+            .aligned_size = aligned_size,
+            .prot = prot,
+            .flags = .{
+                .fixed = true,
+                .private = private_map,
+                .shared = !private_map,
+            },
+            .vmo_offset = vmo_offset,
+        },
+    };
+}
+
+fn installProcessMapLocked(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    free_list: *kernel.FreePageList,
+    process_fd: kernel.Fd,
+    target_owner: kernel.PrincipalId,
+    req: ProcessMapRequest,
+) ProcessMapInstallResult {
+    var target_va = req.target_va;
+    const anywhere = target_va == process_abi.process_map_anywhere_va;
+    if (anywhere) {
+        const purpose = 0x5052_4f43_4d41_5000 ^ scheduler.lapic_tick_count ^ (@as(u64, process_fd) << 32) ^ @as(u64, req.vmo_fd);
+        target_va = state.findRandomizedFreeUserMapVa(target_owner, req.aligned_size, purpose) catch |err| switch (err) {
+            kernel.KernelError.TableFull => {
+                kernel_log.write("process.map failed aslr-full\n");
+                return .{ .status = sc.syscall_err_alloc };
+            },
+            else => {
+                kernel_log.write("process.map failed aslr\n");
+                return .{ .status = sc.syscall_err_map };
+            },
+        };
+    }
+
+    _ = state.mmapFdIntoProcess(proc, req.vmo_fd, target_owner, target_va, req.aligned_size, req.prot, req.flags, req.vmo_offset) catch |err| switch (err) {
+        kernel.KernelError.TableFull => {
+            kernel_log.write("process.map failed vma-table-full\n");
+            return .{ .status = sc.syscall_err_alloc };
+        },
+        else => {
+            kernel_log.write("process.map failed vma-install\n");
+            return .{ .status = sc.syscall_err_invalid };
+        },
+    };
+
+    if (!req.prot.read and !req.prot.write and !req.prot.exec) return .{ .status = sc.syscall_ok, .mapped_va = target_va };
+
+    var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
+    const page_count: usize = @intCast(req.aligned_size / 4096);
+    const offset_pages: usize = @intCast(req.vmo_offset / 4096);
+    const vmo_ref = state.nativeVmoRefForFd(proc, req.vmo_fd) orelse {
+        kernel_log.write("process.map failed vmo-fd\n");
+        state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
+        return .{ .status = sc.syscall_err_invalid };
+    };
+    var i: usize = 0;
+    while (i < page_count) : (i += 1) {
+        paddrs[i] = state.nativeVmoPagePaddr(vmo_ref, offset_pages + i) orelse {
+            kernel_log.write("process.map failed missing-page\n");
+            state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
+            return .{ .status = sc.syscall_err_map };
+        };
+    }
+    const pte_prot: kernel.MapProt = .{
+        .read = req.prot.read,
+        .write = req.prot.write and !req.flags.private,
+        .exec = req.prot.exec,
+        .pkey = req.prot.pkey,
+    };
+    const low_page_zero_map =
+        !anywhere and
+        target_va == 0 and
+        req.aligned_size == 4096 and
+        req.vmo_offset == 0 and
+        req.prot.read and
+        !req.prot.write and
+        req.prot.exec;
+    const map_ok = if (low_page_zero_map)
+        user_vm.mapTrustedLowPageZeroPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
+            .read = pte_prot.read,
+            .write = pte_prot.write,
+            .exec = pte_prot.exec,
+            .pkey = pte_prot.pkey,
+        })
+    else
+        user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], pte_prot);
+    if (!map_ok) {
+        kernel_log.write("process.map failed map-paddrs\n");
+        state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
+        return .{ .status = sc.syscall_err_map };
+    }
+    return .{ .status = sc.syscall_ok, .mapped_va = target_va };
+}
+
 fn mapIntoProcess(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
@@ -183,40 +357,10 @@ fn mapIntoProcess(
 ) u64 {
     const process_fd: kernel.Fd = @intCast(frame.rdi);
     const vmo_fd: kernel.Fd = @intCast(frame.rsi);
-    var target_va = frame.rdx;
-    const anywhere = target_va == process_abi.process_map_anywhere_va;
-    const size_bytes = frame.r10;
-    const prot_bits = frame.r8;
-    const vmo_offset = frame.r9;
-    if ((!anywhere and (target_va & 0xFFF) != 0) or (vmo_offset & 0xFFF) != 0) {
-        kernel_log.write("process.map failed args\n");
-        return sc.syscall_err_invalid;
-    }
-    if (size_bytes == 0) {
-        kernel_log.write("process.map failed size\n");
-        return sc.syscall_err_invalid;
-    }
-    const aligned_size = pageAlignUp(size_bytes) orelse {
-        kernel_log.write("process.map failed align\n");
-        return sc.syscall_err_invalid;
-    };
-    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) {
-        kernel_log.write("process.map failed too-large\n");
-        return sc.syscall_err_invalid;
-    }
-    const prot = protFromBits(prot_bits) orelse {
-        kernel_log.write("process.map failed prot\n");
-        return sc.syscall_err_invalid;
-    };
-    const low_page_zero_map =
-        !anywhere and
-        target_va == 0 and
-        aligned_size == 4096 and
-        vmo_offset == 0 and
-        prot.read and
-        !prot.write and
-        prot.exec;
-    const flags: kernel.MmapFlags = .{ .fixed = true, .shared = true };
+    const map_flags_bits = frame.r9 & process_abi.process_map_offset_low_bits;
+    const vmo_offset = frame.r9 & ~process_abi.process_map_offset_low_bits;
+    const prepared = prepareProcessMapRequest(vmo_fd, frame.rdx, frame.r10, frame.r8, vmo_offset, map_flags_bits, true);
+    if (prepared.status != sc.syscall_ok) return prepared.status;
 
     const process = state.processObjectForFd(proc, process_fd, .{ .map_into = true }) orelse {
         kernel_log.write("process.map failed process-fd\n");
@@ -233,80 +377,90 @@ fn mapIntoProcess(
     }
     user_vm.lockAddressSpaces();
     defer user_vm.unlockAddressSpaces();
-    if (anywhere) {
-        const purpose = 0x5052_4f43_4d41_5000 ^ scheduler.lapic_tick_count ^ (@as(u64, process_fd) << 32) ^ @as(u64, vmo_fd);
-        target_va = state.findRandomizedFreeUserMapVa(target_owner, aligned_size, purpose) catch |err| switch (err) {
-            kernel.KernelError.TableFull => {
-                kernel_log.write("process.map failed aslr-full\n");
-                return sc.syscall_err_alloc;
-            },
-            else => {
-                kernel_log.write("process.map failed aslr\n");
-                return sc.syscall_err_map;
-            },
-        };
-    }
+    const installed = installProcessMapLocked(state, proc, free_list, process_fd, target_owner, prepared.request);
+    return if (installed.status == sc.syscall_ok) installed.mapped_va else installed.status;
+}
 
-    _ = state.mmapFdIntoProcess(proc, vmo_fd, target_owner, target_va, aligned_size, prot, flags, vmo_offset) catch |err| switch (err) {
-        kernel.KernelError.TableFull => {
-            kernel_log.write("process.map failed vma-table-full\n");
-            return sc.syscall_err_alloc;
-        },
-        else => {
-            kernel_log.write("process.map failed vma-install\n");
-            return sc.syscall_err_invalid;
-        },
-    };
+fn readBatchEntryU64(bytes: []const u8, entry_index: usize, field_offset: u64) u64 {
+    const offset = entry_index * process_map_batch_entry_size + @as(usize, @intCast(field_offset));
+    return std.mem.readInt(u64, bytes[offset..][0..8], .little);
+}
 
-    if (!prot.read and !prot.write and !prot.exec) return target_va;
-
-    var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
-    const page_count: usize = @intCast(aligned_size / 4096);
-    const offset_pages: usize = @intCast(vmo_offset / 4096);
-    const vmo_ref = state.nativeVmoRefForFd(proc, vmo_fd) orelse {
-        kernel_log.write("process.map failed vmo-fd\n");
-        state.munmapRangeWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
+fn mapBatchIntoProcess(
+    h: anytype,
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    free_list: *kernel.FreePageList,
+    frame: *TrapFrame,
+) u64 {
+    const process_fd: kernel.Fd = @intCast(frame.rdi);
+    const entries_va = frame.rsi;
+    const entry_count_u64 = frame.rdx;
+    if (entries_va == 0 or entry_count_u64 == 0 or entry_count_u64 > process_abi.process_map_batch_max_entries) {
         return sc.syscall_err_invalid;
-    };
+    }
+    const entry_count: usize = @intCast(entry_count_u64);
+    var bytes: [max_process_map_batch_entries * process_map_batch_entry_size]u8 = undefined;
+    const bytes_len = entry_count * process_map_batch_entry_size;
+    if (!h.copy_user_bytes_from_va(proc, entries_va, bytes[0..bytes_len])) return sc.syscall_err_invalid;
+
+    var requests: [max_process_map_batch_entries]ProcessMapRequest = undefined;
     var i: usize = 0;
-    while (i < page_count) : (i += 1) {
-        paddrs[i] = state.nativeVmoPagePaddr(vmo_ref, offset_pages + i) orelse {
-            kernel_log.write("process.map failed missing-page\n");
-            state.munmapRangeWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
-            return sc.syscall_err_map;
-        };
+    while (i < entry_count) : (i += 1) {
+        const vmo_fd_raw = readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_vmo_fd_offset);
+        if (vmo_fd_raw > std.math.maxInt(kernel.Fd)) return sc.syscall_err_invalid;
+        const prepared = prepareProcessMapRequest(
+            @intCast(vmo_fd_raw),
+            readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_target_va_offset),
+            readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_size_offset),
+            readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_prot_offset),
+            readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_vmo_offset_offset),
+            readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_flags_offset),
+            false);
+        if (prepared.status != sc.syscall_ok) return prepared.status;
+        requests[i] = prepared.request;
     }
-    const map_ok = if (low_page_zero_map)
-        user_vm.mapTrustedLowPageZeroPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
-            .read = prot.read,
-            .write = prot.write,
-            .exec = prot.exec,
-            .pkey = prot.pkey,
-        })
-    else
-        user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
-            .read = prot.read,
-            .write = prot.write,
-            .exec = prot.exec,
-            .pkey = prot.pkey,
-        });
-    if (!map_ok) {
-        kernel_log.write("process.map failed map-paddrs\n");
-        state.munmapRangeWithFreeList(target_owner, target_va, aligned_size, free_list) catch {};
-        return sc.syscall_err_map;
+
+    const process = state.processObjectForFd(proc, process_fd, .{ .map_into = true }) orelse return sc.syscall_err_invalid;
+    if (process.state != .active) return sc.syscall_err_invalid;
+    const target_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (!state.hasActivePrincipal(target_owner)) return sc.syscall_err_invalid;
+
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
+    var mapped_vas: [max_process_map_batch_entries]u64 = undefined;
+    var mapped_sizes: [max_process_map_batch_entries]u64 = undefined;
+    var mapped_count: usize = 0;
+    i = 0;
+    while (i < entry_count) : (i += 1) {
+        const installed = installProcessMapLocked(state, proc, free_list, process_fd, target_owner, requests[i]);
+        if (installed.status != sc.syscall_ok) {
+            while (mapped_count > 0) {
+                mapped_count -= 1;
+                state.munmapRangeWithFreeList(target_owner, mapped_vas[mapped_count], mapped_sizes[mapped_count], free_list) catch {};
+            }
+            return installed.status;
+        }
+        mapped_vas[mapped_count] = installed.mapped_va;
+        mapped_sizes[mapped_count] = requests[i].aligned_size;
+        mapped_count += 1;
     }
-    return target_va;
+    return sc.syscall_ok;
 }
 
 fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame, code: u32) u64 {
     const current = scheduler.currentThread();
     const generation = scheduler.generationOfThread(current) orelse {
+        state.markThreadObjectsExitedForPrincipal(proc, .exited, code);
+        state.markProcessObjectsExited(proc, .exited, code);
+        wakeTaskFdWaiters(h, state, proc);
         h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
         return sc.syscall_ok;
     };
     state.markThreadObjectsExitedBySlot(current, generation, .exited, code);
     if (scheduler.liveThreadCount(proc) <= 1) {
         state.markProcessObjectsExited(proc, .exited, code);
+        wakeTaskFdWaiters(h, state, proc);
         h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
         return sc.syscall_ok;
     }
@@ -323,6 +477,9 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             const process = state.setProcessObjectStateForFd(proc, @intCast(frame.rdi), .{ .kill = true }, .killed, @truncate(frame.rsi)) catch break :blk sc.syscall_err_invalid;
             const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
             if (target == proc) {
+                state.markProcessObjectsExited(proc, .killed, @truncate(frame.rsi));
+                state.markThreadObjectsExitedForPrincipal(proc, .killed, @truncate(frame.rsi));
+                wakeTaskFdWaiters(h, state, proc);
                 h.exit_current_process(proc, @truncate(frame.rsi), frame, h.before_current_thread_leave);
             } else {
                 cleanupProcess(h, state, target, .killed, @truncate(frame.rsi));
@@ -333,6 +490,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_process_exit => blk: {
             state.markProcessObjectsExited(proc, .exited, @truncate(frame.rdi));
             state.markThreadObjectsExitedForPrincipal(proc, .exited, @truncate(frame.rdi));
+            wakeTaskFdWaiters(h, state, proc);
             h.exit_current_process(proc, @truncate(frame.rdi), frame, h.before_current_thread_leave);
             break :blk sc.syscall_ok;
         },
@@ -354,6 +512,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             break :blk sc.syscall_ok;
         },
         sc.syscall_process_map => mapIntoProcess(state, proc, h.free_list, frame),
+        sc.syscall_process_map_batch => mapBatchIntoProcess(h, state, proc, h.free_list, frame),
         else => null,
     };
 }

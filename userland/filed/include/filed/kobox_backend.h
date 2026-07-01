@@ -44,6 +44,8 @@ typedef struct filed_kobox_direct_ops {
     int (*fsync)(void *ctx, uint64_t object_id);
     int (*create)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);
     int (*truncate)(void *ctx, uint64_t object_id, uint64_t size);
+    int (*utimens)(void *ctx, uint64_t object_id, uint32_t mask, int64_t atime_sec, int64_t atime_nsec, int64_t mtime_sec, int64_t mtime_nsec);
+    int (*chmod)(void *ctx, uint64_t object_id, uint64_t mode);
     int (*unlink)(void *ctx, uint64_t parent_object_id, const char *name);
     int (*mkdir)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);
     int (*rmdir)(void *ctx, uint64_t parent_object_id, const char *name);
@@ -95,6 +97,18 @@ int filed_kobox_backend_truncate(
     filed_kobox_backend_t *backend,
     uint64_t object_id,
     uint64_t size);
+int filed_kobox_backend_utimens(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint32_t mask,
+    int64_t atime_sec,
+    int64_t atime_nsec,
+    int64_t mtime_sec,
+    int64_t mtime_nsec);
+int filed_kobox_backend_chmod(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint64_t mode);
 int filed_kobox_backend_unlink(
     filed_kobox_backend_t *backend,
     uint64_t parent_object_id,

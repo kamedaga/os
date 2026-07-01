@@ -46,6 +46,8 @@ static const char *filed_kobox_backend_op_name(uint64_t op)
     case KOBOXD_WIRE_FS_STATX: return "statx";
     case KOBOXD_WIRE_FS_GETDENTS: return "getdents";
     case KOBOXD_WIRE_FS_FSYNC: return "fsync";
+    case KOBOXD_WIRE_FS_UTIMENS: return "utimens";
+    case KOBOXD_WIRE_FS_CHMOD: return "chmod";
     case KOBOXD_WIRE_FS_CREATE: return "create";
     case KOBOXD_WIRE_FS_TRUNCATE: return "truncate";
     case KOBOXD_WIRE_FS_UNLINK: return "unlink";
@@ -693,6 +695,100 @@ int filed_kobox_backend_truncate(
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
     return status;
+}
+
+int filed_kobox_backend_utimens(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint32_t mask,
+    int64_t atime_sec,
+    int64_t atime_nsec,
+    int64_t mtime_sec,
+    int64_t mtime_nsec)
+{
+    filed_wire_page_t *page = NULL;
+    uint64_t ignored = 0;
+
+    if (backend == NULL || object_id == 0) {
+        return -1;
+    }
+    if (filed_kobox_backend_is_direct(backend)) {
+        if (backend->direct_ops->utimens == NULL) {
+            return -95;
+        }
+        uint64_t start_cycles = 0;
+        const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
+        const int status = backend->direct_ops->utimens(
+            backend->direct_ctx,
+            object_id,
+            mask,
+            atime_sec,
+            atime_nsec,
+            mtime_sec,
+            mtime_nsec);
+        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_UTIMENS, start_ns, start_cycles, status);
+    }
+
+    int status = filed_kobox_wire_page(backend, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_utimens_t *utimens = (koboxd_wire_fs_utimens_t *)page->addr;
+    utimens->object_id = object_id;
+    utimens->mask = mask;
+    utimens->atime_sec = atime_sec;
+    utimens->atime_nsec = atime_nsec;
+    utimens->mtime_sec = mtime_sec;
+    utimens->mtime_nsec = mtime_nsec;
+
+    return filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_UTIMENS,
+        0,
+        filed_kobox_wire_page_fd(backend, page),
+        &ignored);
+}
+
+int filed_kobox_backend_chmod(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    uint64_t mode)
+{
+    filed_wire_page_t *page = NULL;
+    uint64_t ignored = 0;
+
+    if (backend == NULL || object_id == 0) {
+        return -1;
+    }
+    if (filed_kobox_backend_is_direct(backend)) {
+        if (backend->direct_ops->chmod == NULL) {
+            return -95;
+        }
+        uint64_t start_cycles = 0;
+        const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
+        const int status = backend->direct_ops->chmod(
+            backend->direct_ctx,
+            object_id,
+            mode);
+        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_CHMOD, start_ns, start_cycles, status);
+    }
+
+    int status = filed_kobox_wire_page(backend, &page);
+    if (status != 0) {
+        return status;
+    }
+
+    koboxd_wire_fs_chmod_t *chmod_req = (koboxd_wire_fs_chmod_t *)page->addr;
+    chmod_req->object_id = object_id;
+    chmod_req->mode = mode;
+
+    return filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_CHMOD,
+        0,
+        filed_kobox_wire_page_fd(backend, page),
+        &ignored);
 }
 
 int filed_kobox_backend_unlink(

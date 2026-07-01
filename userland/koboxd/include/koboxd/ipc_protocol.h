@@ -25,14 +25,16 @@ enum {
     KOBOXD_WIRE_FS_STATX = 6,
     KOBOXD_WIRE_FS_GETDENTS = 7,
     KOBOXD_WIRE_FS_FSYNC = 8,
-    KOBOXD_WIRE_FS_CREATE = 9,
-    KOBOXD_WIRE_FS_TRUNCATE = 10,
-    KOBOXD_WIRE_FS_UNLINK = 11,
-    KOBOXD_WIRE_FS_RENAME = 12,
-    KOBOXD_WIRE_FS_MKDIR = 13,
-    KOBOXD_WIRE_FS_RMDIR = 14,
-    KOBOXD_WIRE_FS_RELEASE_OBJECT = 15,
-    KOBOXD_WIRE_FS_SYNC_ALL = 16,
+    KOBOXD_WIRE_FS_UTIMENS = 9,
+    KOBOXD_WIRE_FS_CHMOD = 10,
+    KOBOXD_WIRE_FS_CREATE = 11,
+    KOBOXD_WIRE_FS_TRUNCATE = 12,
+    KOBOXD_WIRE_FS_UNLINK = 13,
+    KOBOXD_WIRE_FS_RENAME = 14,
+    KOBOXD_WIRE_FS_MKDIR = 15,
+    KOBOXD_WIRE_FS_RMDIR = 16,
+    KOBOXD_WIRE_FS_RELEASE_OBJECT = 17,
+    KOBOXD_WIRE_FS_SYNC_ALL = 18,
 
     KOBOXD_WIRE_FS_ROOT_OBJECT_ID = 1,
     KOBOXD_WIRE_FS_NAME_BYTES = 96,
@@ -57,6 +59,20 @@ typedef struct koboxd_wire_fs_truncate {
     uint64_t object_id;
     uint64_t size;
 } koboxd_wire_fs_truncate_t;
+
+typedef struct koboxd_wire_fs_utimens {
+    uint64_t object_id;
+    uint64_t mask;
+    int64_t atime_sec;
+    int64_t atime_nsec;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+} koboxd_wire_fs_utimens_t;
+
+typedef struct koboxd_wire_fs_chmod {
+    uint64_t object_id;
+    uint64_t mode;
+} koboxd_wire_fs_chmod_t;
 
 typedef struct koboxd_wire_fs_unlink {
     uint64_t parent_object_id;
@@ -95,6 +111,12 @@ typedef struct koboxd_wire_fs_statx {
     uint64_t blocks;
     uint64_t nlink;
     uint64_t kind;
+    int64_t atime_sec;
+    int64_t atime_nsec;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    int64_t ctime_sec;
+    int64_t ctime_nsec;
 } koboxd_wire_fs_statx_t;
 
 typedef struct koboxd_wire_fs_dirent {

@@ -463,6 +463,17 @@ pub const ThreadWakeTarget = struct {
     revents: u64 = 0,
 };
 
+pub const TaskFdWaiter = struct {
+    active: bool = false,
+    principal_raw: PrincipalRaw = 0,
+    owner: PrincipalId = default_process_principal,
+    pollfd_va: u64 = 0,
+    events: u64 = 0,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
+};
+
+pub const max_task_fd_waiters: usize = 64;
 const max_ipc_object_waiters: usize = 8;
 
 const IpcWaitList = struct {
@@ -1376,6 +1387,7 @@ pub const KernelState = struct {
     fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
     vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
     fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
+    task_fd_waiters: [max_task_fd_waiters]TaskFdWaiter = [_]TaskFdWaiter{.{}} ** max_task_fd_waiters,
     irq_publish_slots: [max_fd_objects]IrqPublishSlot = [_]IrqPublishSlot{.{}} ** max_fd_objects,
     next_fd_object_scan: usize = 0,
     native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
@@ -2403,6 +2415,131 @@ pub const KernelState = struct {
             }
             return .{
                 .paddr = paddr,
+                .prot = .{
+                    .read = entry.prot.read,
+                    .write = entry.prot.write,
+                    .exec = entry.prot.exec,
+                    .pkey = entry.prot.pkey,
+                },
+            };
+        }
+        return null;
+    }
+
+    fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) void {
+        if (builtin.is_test) return;
+        const dst: [*]u8 = @ptrFromInt(dst_paddr);
+        const src: [*]const u8 = @ptrFromInt(src_paddr);
+        @memcpy(dst[0..4096], src[0..4096]);
+    }
+
+    fn replaceVmaPageWithAnonymousPrivatePage(
+        self: *KernelState,
+        table: *VmaTable,
+        entry_index: usize,
+        fault_page_va: u64,
+        new_paddr: u64,
+        free_list: *FreePageList,
+    ) KernelError!NativeVmoRef {
+        if (entry_index >= table.entries.len) return KernelError.InvalidState;
+        var entry = &table.entries[entry_index];
+        if (!entry.active) return KernelError.InvalidState;
+        if (fault_page_va < entry.start_va or fault_page_va >= entry.endVa()) return KernelError.InvalidState;
+
+        const original = entry.*;
+        const page_end_va = fault_page_va + native_page_size;
+        const has_before = fault_page_va > original.start_va;
+        const has_after = page_end_va < original.endVa();
+        const target_offset = fault_page_va - original.start_va;
+        const before_size = fault_page_va - original.start_va;
+        const after_size = original.endVa() - page_end_va;
+
+        const before_index = if (has_before) findFreeVma(table) orelse return KernelError.TableFull else 0;
+        const after_index = if (has_after) blk: {
+            for (table.entries[0..], 0..) |candidate, candidate_index| {
+                if (has_before and candidate_index == before_index) continue;
+                if (!candidate.active) break :blk candidate_index;
+            }
+            return KernelError.TableFull;
+        } else 0;
+
+        const private_vmo = try self.createNativeVmo(.anonymous, native_page_size);
+        try self.retainNativeVmo(private_vmo);
+        errdefer self.releaseNativeVmoWithFreeList(private_vmo, free_list);
+        var page = [_]u64{new_paddr};
+        try self.installNativeVmoPages(private_vmo, 0, page[0..]);
+
+        if (has_before) try self.retainNativeVmo(original.vmo);
+        errdefer if (has_before) self.releaseNativeVmo(original.vmo);
+        if (has_after) try self.retainNativeVmo(original.vmo);
+        errdefer if (has_after) self.releaseNativeVmo(original.vmo);
+
+        if (has_before) {
+            table.entries[before_index] = original;
+            table.entries[before_index].size_bytes = before_size;
+        }
+        if (has_after) {
+            table.entries[after_index] = original;
+            table.entries[after_index].start_va = page_end_va;
+            table.entries[after_index].size_bytes = after_size;
+            table.entries[after_index].vmo_offset = original.vmo_offset + target_offset + native_page_size;
+        }
+
+        entry = &table.entries[entry_index];
+        entry.* = .{
+            .active = true,
+            .start_va = fault_page_va,
+            .size_bytes = native_page_size,
+            .prot = original.prot,
+            .flags = .{
+                .fixed = original.flags.fixed,
+                .fixed_noreplace = original.flags.fixed_noreplace,
+                .private = true,
+                .shared = false,
+                .anonymous = true,
+                .noreserve = original.flags.noreserve,
+                .pkey = original.flags.pkey,
+            },
+            .vmo = private_vmo,
+            .vmo_offset = 0,
+        };
+        self.releaseNativeVmo(original.vmo);
+        return private_vmo;
+    }
+
+    pub fn ensureNativeVmaCowMapping(
+        self: *KernelState,
+        owner: PrincipalId,
+        fault_page_va: u64,
+        write_access: bool,
+        instruction_fetch: bool,
+        free_list: *FreePageList,
+    ) ?NativeVmaFaultMapping {
+        if (!isPageAligned(fault_page_va) or !write_access or instruction_fetch) return null;
+        const table = self.getVmaTable(owner) orelse return null;
+        for (table.entries[0..], 0..) |*entry, entry_index| {
+            if (!entry.active) continue;
+            if (fault_page_va < entry.start_va or fault_page_va >= entry.endVa()) continue;
+            if (!entry.flags.private or entry.flags.shared or !entry.prot.write) return null;
+
+            const page_delta = (fault_page_va - entry.start_va) / native_page_size;
+            const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
+            const src_paddr = self.nativeVmoPagePaddr(entry.vmo, @intCast(vmo_page)) orelse return null;
+            const new_paddr = (self.allocPhysicalPage(free_list) catch return null).paddr;
+            var installed = false;
+            defer if (!installed) free_list.appendPage(0, new_paddr) catch {};
+
+            copyPhysicalPage(new_paddr, src_paddr);
+            _ = self.replaceVmaPageWithAnonymousPrivatePage(
+                table,
+                entry_index,
+                fault_page_va,
+                new_paddr,
+                free_list,
+            ) catch return null;
+            installed = true;
+            return .{
+                .paddr = new_paddr,
                 .prot = .{
                     .read = entry.prot.read,
                     .write = entry.prot.write,
@@ -4094,6 +4231,97 @@ pub const KernelState = struct {
         const slot = self.kernelObjectSlotConst(entry.object) orelse return;
         const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return;
         waiters.unregister(thread_index, thread_generation);
+    }
+
+    pub fn registerTaskReadableWaiterForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        requested_events: u64,
+        pollfd_va: u64,
+        thread_index: usize,
+        thread_generation: u32,
+    ) KernelError!bool {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        if ((requested_events & fd_abi.event_readable) == 0) return false;
+        if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+        const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        if (!entry.rights.poll and !entry.rights.wait) return KernelError.InvalidState;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+        const principal_raw: PrincipalRaw = switch (slot.payload) {
+            .process => |process| process.principal_raw,
+            .thread => |thread| thread.owner_principal_raw,
+            else => return false,
+        };
+        const thread_index_u32: u32 = @intCast(thread_index);
+        var free_index: ?usize = null;
+        for (&self.task_fd_waiters, 0..) |*waiter, i| {
+            if (!waiter.active) {
+                if (free_index == null) free_index = i;
+                continue;
+            }
+            if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
+                waiter.principal_raw = principal_raw;
+                waiter.owner = owner;
+                waiter.pollfd_va = pollfd_va;
+                waiter.events |= requested_events;
+                return true;
+            }
+        }
+        const target = free_index orelse return KernelError.TableFull;
+        self.task_fd_waiters[target] = .{
+            .active = true,
+            .principal_raw = principal_raw,
+            .owner = owner,
+            .pollfd_va = pollfd_va,
+            .events = requested_events,
+            .thread_index = thread_index_u32,
+            .thread_generation = thread_generation,
+        };
+        return true;
+    }
+
+    pub fn unregisterTaskReadableWaiterForThread(
+        self: *KernelState,
+        thread_index: usize,
+        thread_generation: u32,
+    ) void {
+        if (thread_index > std.math.maxInt(u32)) return;
+        const thread_index_u32: u32 = @intCast(thread_index);
+        for (&self.task_fd_waiters) |*waiter| {
+            if (!waiter.active) continue;
+            if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
+                waiter.* = .{};
+            }
+        }
+    }
+
+    pub fn takeTaskReadableWaitersForPrincipal(
+        self: *KernelState,
+        principal: PrincipalId,
+        out: []ThreadWakeTarget,
+    ) usize {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        const principal_raw: PrincipalRaw = @intFromEnum(principal);
+        var count: usize = 0;
+        for (&self.task_fd_waiters) |*waiter| {
+            if (!waiter.active) continue;
+            if (waiter.principal_raw != principal_raw) continue;
+            if ((waiter.events & fd_abi.event_readable) == 0) continue;
+            const target = ThreadWakeTarget{
+                .owner = waiter.owner,
+                .thread_index = @intCast(waiter.thread_index),
+                .thread_generation = waiter.thread_generation,
+                .pollfd_va = waiter.pollfd_va,
+                .revents = fd_abi.event_readable,
+            };
+            waiter.* = .{};
+            if (count < out.len) {
+                out[count] = target;
+                count += 1;
+            }
+        }
+        return count;
     }
 
     pub fn wakeIpcWaitersForSendFd(

@@ -12,31 +12,33 @@ enum {
     FILED_WIRE_OP_ROOT_GETDENTS = 3,
     FILED_WIRE_OP_OPENAT = 4,
     FILED_WIRE_OP_STAT = 5,
-    FILED_WIRE_OP_PREAD = 6,
-    FILED_WIRE_OP_GETDENTS = 7,
-    FILED_WIRE_OP_CLOSE = 8,
-    FILED_WIRE_OP_EXEC_PATH = 9,
-    FILED_WIRE_OP_READ = 10,
-    FILED_WIRE_OP_DUP = 11,
-    FILED_WIRE_OP_GET_FLAGS = 12,
-    FILED_WIRE_OP_SET_FLAGS = 13,
-    FILED_WIRE_OP_PWRITE = 14,
-    FILED_WIRE_OP_WRITE = 15,
-    FILED_WIRE_OP_FSYNC = 16,
-    FILED_WIRE_OP_TRUNCATE = 17,
-    FILED_WIRE_OP_UNLINK = 18,
-    FILED_WIRE_OP_RENAME = 19,
-    FILED_WIRE_OP_MKDIR = 20,
-    FILED_WIRE_OP_RMDIR = 21,
-    FILED_WIRE_OP_SEEK = 22,
-    FILED_WIRE_OP_DUMP_METRICS = 23,
-    FILED_WIRE_OP_SET_CACHE_SLOTS = 24,
-    FILED_WIRE_OP_CONNECT = 25,
-    FILED_WIRE_OP_PING = 26,
-    FILED_WIRE_OP_FAST_DOORBELL = 27,
-    FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 28,
-    FILED_WIRE_OP_PWRITE_BATCH = 29,
-    FILED_WIRE_OP_WRITE_BATCH = 30,
+    FILED_WIRE_OP_UTIMENS = 6,
+    FILED_WIRE_OP_CHMOD = 7,
+    FILED_WIRE_OP_PREAD = 8,
+    FILED_WIRE_OP_GETDENTS = 9,
+    FILED_WIRE_OP_CLOSE = 10,
+    FILED_WIRE_OP_EXEC_PATH = 11,
+    FILED_WIRE_OP_READ = 12,
+    FILED_WIRE_OP_DUP = 13,
+    FILED_WIRE_OP_GET_FLAGS = 14,
+    FILED_WIRE_OP_SET_FLAGS = 15,
+    FILED_WIRE_OP_PWRITE = 16,
+    FILED_WIRE_OP_WRITE = 17,
+    FILED_WIRE_OP_FSYNC = 18,
+    FILED_WIRE_OP_TRUNCATE = 19,
+    FILED_WIRE_OP_UNLINK = 20,
+    FILED_WIRE_OP_RENAME = 21,
+    FILED_WIRE_OP_MKDIR = 22,
+    FILED_WIRE_OP_RMDIR = 23,
+    FILED_WIRE_OP_SEEK = 24,
+    FILED_WIRE_OP_DUMP_METRICS = 25,
+    FILED_WIRE_OP_SET_CACHE_SLOTS = 26,
+    FILED_WIRE_OP_CONNECT = 27,
+    FILED_WIRE_OP_PING = 28,
+    FILED_WIRE_OP_FAST_DOORBELL = 29,
+    FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 30,
+    FILED_WIRE_OP_PWRITE_BATCH = 31,
+    FILED_WIRE_OP_WRITE_BATCH = 32,
 
     FILED_WIRE_NAME_BYTES = 96,
     FILED_WIRE_IO_BYTES = 7680,
@@ -80,6 +82,9 @@ enum {
     FILED_WIRE_FILE_APPEND = 1u << 0,
     FILED_WIRE_FILE_NONBLOCK = 1u << 1,
     FILED_WIRE_FILE_SYNC = 1u << 2,
+
+    FILED_WIRE_UTIMENS_ATIME = 1u << 0,
+    FILED_WIRE_UTIMENS_MTIME = 1u << 1,
 
     FILED_WIRE_EXEC_BOOTSTRAP_FD = 1u << 0,
     FILED_WIRE_EXEC_INHERIT_FDS = 1u << 1,
@@ -182,9 +187,31 @@ typedef struct filed_wire_statx {
     uint64_t blocks;
     uint64_t nlink;
     uint64_t kind;
+    int64_t atime_sec;
+    int64_t atime_nsec;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    int64_t ctime_sec;
+    int64_t ctime_nsec;
     uint64_t object_generation;
     uint64_t dir_generation;
 } filed_wire_statx_t;
+
+typedef struct filed_wire_utimens {
+    uint64_t handle;
+    uint64_t mask;
+    int64_t atime_sec;
+    int64_t atime_nsec;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+} filed_wire_utimens_t;
+
+typedef struct filed_wire_chmod {
+    uint64_t handle;
+    uint64_t mode;
+    uint64_t reserved0;
+    uint64_t reserved1;
+} filed_wire_chmod_t;
 
 typedef struct filed_wire_truncate {
     uint64_t handle;

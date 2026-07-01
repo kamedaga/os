@@ -8,6 +8,7 @@ project(filed C ASM)
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
 set(FILED_EXTRA_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/backend_router.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/router.c"
@@ -20,6 +21,7 @@ set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fd_ipc.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/kobox_backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs_backend.c"
   "${REPO_ROOT}/userland/libipc/src/ipc.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
 )
@@ -35,6 +37,7 @@ add_custom_command(
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/bootstrap.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/backend_router.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/dispatch.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/exec.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/exec_linux_lpr.h"
@@ -44,6 +47,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/kobox_backend.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/page_cache.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/runtime.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/tmpfs_backend.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/vfs.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/internal.h"

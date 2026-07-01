@@ -248,6 +248,9 @@ fn registerIpcWaitersForPoll(
         const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return kernel.KernelError.InvalidState;
         if ((events & ~fd_abi.event_known_mask) != 0) return kernel.KernelError.InvalidState;
         _ = timeout_ticks;
+        if (try state.registerTaskReadableWaiterForFd(proc, @intCast(fd_u64), events, item_va, thread_index, thread_generation)) {
+            continue;
+        }
         try state.registerIpcReadableWaiterForFd(proc, @intCast(fd_u64), events, item_va, thread_index, thread_generation);
     }
 }
@@ -270,6 +273,7 @@ fn unregisterIpcWaitersForPoll(
         if ((events & ~fd_abi.event_known_mask) != 0) return;
         state.unregisterIpcReadableWaiterForFd(proc, @intCast(fd_u64), events, thread_index, thread_generation);
     }
+    state.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
 }
 
 fn nextPollWakeDelta(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64, now_tick: u64) ?u64 {
@@ -517,7 +521,7 @@ fn mapVmoFd(
     if (!prot.read and !prot.write and !prot.exec) return base_va;
     if (!user_vm.mapTrustedUserPaddrsWithProt(proc, base_va, paddrs[0..page_count], .{
         .read = prot.read,
-        .write = prot.write,
+        .write = prot.write and !flags.private,
         .exec = prot.exec,
         .pkey = prot.pkey,
     })) {

@@ -141,6 +141,26 @@ int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, 
 int pacha_thread_start(int thread_fd);
 int pacha_thread_set_gs_base(uint64_t gs_base);
 long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
+struct pacha_process_map_batch_entry {
+    uint64_t vmo_fd;
+    uint64_t target_va;
+    uint64_t size;
+    uint64_t prot;
+    uint64_t vmo_offset;
+    uint64_t flags;
+};
+long pacha_process_map_flags(
+    int process_fd,
+    int vmo_fd,
+    uint64_t target_va,
+    uint64_t size,
+    uint64_t prot,
+    uint64_t vmo_offset,
+    uint64_t flags);
+int pacha_process_map_batch(
+    int process_fd,
+    const struct pacha_process_map_batch_entry *entries,
+    uint64_t entry_count);
 long pacha_getrandom(void *buf, uint64_t len, uint64_t flags);
 int pacha_fd_get_info(int fd, struct pacha_fd_info *out);
 int pacha_fd_close(int fd);

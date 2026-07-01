@@ -24,6 +24,12 @@ typedef struct koboxd_fs_object {
     uint32_t nlink;
     uint64_t size;
     uint64_t blocks;
+    int64_t atime_sec;
+    int64_t atime_nsec;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    int64_t ctime_sec;
+    int64_t ctime_nsec;
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
     uint8_t used;
     uint8_t linked;
@@ -41,6 +47,8 @@ typedef struct koboxd_fs_backend {
     koboxd_fs_object_t objects[KOBOXD_FS_BACKEND_MAX_OBJECTS];
     uint64_t next_object_id;
     uint8_t mounted;
+    uint8_t metadata_dirty;
+    uint32_t deferred_unlinked_count;
 } koboxd_fs_backend_t;
 
 typedef struct koboxd_fs_lookup_request {
@@ -92,6 +100,18 @@ int koboxd_fs_backend_truncate(
     koboxd_fs_backend_t *backend,
     uint64_t object_id,
     uint64_t size);
+int koboxd_fs_backend_utimens(
+    koboxd_fs_backend_t *backend,
+    uint64_t object_id,
+    uint32_t mask,
+    int64_t atime_sec,
+    int64_t atime_nsec,
+    int64_t mtime_sec,
+    int64_t mtime_nsec);
+int koboxd_fs_backend_chmod(
+    koboxd_fs_backend_t *backend,
+    uint64_t object_id,
+    uint16_t mode);
 int koboxd_fs_backend_unlink(
     koboxd_fs_backend_t *backend,
     uint64_t parent_object_id,

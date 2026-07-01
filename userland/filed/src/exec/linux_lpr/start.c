@@ -126,21 +126,30 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
+    uint64_t stage_start = lpr_exec_now_ns();
+    uint64_t stage_start_cycles = lpr_exec_now_cycles();
     const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
+    lpr_exec_metric("start_stack_vmo", stage_start, lpr_exec_now_ns());
+    lpr_exec_metric_cycles("start_stack_vmo", stage_start_cycles, lpr_exec_now_cycles());
     if (stack_fd < 16) {
         return -12;
     }
+    stage_start = lpr_exec_now_ns();
+    stage_start_cycles = lpr_exec_now_cycles();
     unsigned char *stack = pacha_mmap(
         stack_fd,
         PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
+    lpr_exec_metric("start_stack_mmap", stage_start, lpr_exec_now_ns());
+    lpr_exec_metric_cycles("start_stack_mmap", stage_start_cycles, lpr_exec_now_cycles());
     if (stack == NULL) {
         (void)pacha_fd_close(stack_fd);
         return -12;
     }
-    memset(stack, 0, (size_t)PACHA_PROCESS_DEFAULT_STACK_SIZE);
+    stage_start = lpr_exec_now_ns();
+    stage_start_cycles = lpr_exec_now_cycles();
     const long stack_map = pacha_process_map(
         plan->process_fd,
         stack_fd,
@@ -148,6 +157,8 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
         PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         0);
+    lpr_exec_metric("start_stack_map_child", stage_start, lpr_exec_now_ns());
+    lpr_exec_metric_cycles("start_stack_map_child", stage_start_cycles, lpr_exec_now_cycles());
     if (stack_map < 4096) {
         (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
@@ -162,6 +173,8 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
     memset(argv_va, 0, sizeof(argv_va));
     memset(envp_va, 0, sizeof(envp_va));
 
+    stage_start = lpr_exec_now_ns();
+    stage_start_cycles = lpr_exec_now_cycles();
     for (uint64_t i = envc; i > 0; --i) {
         const int status = copy_stack_string(stack, &sp, stack_base, request->envp[i - 1u], &envp_va[i - 1u]);
         if (status != 0) {
@@ -242,9 +255,15 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
         (void)pacha_fd_close(stack_fd);
         return -12;
     }
+    lpr_exec_metric("start_stack_build", stage_start, lpr_exec_now_ns());
+    lpr_exec_metric_cycles("start_stack_build", stage_start_cycles, lpr_exec_now_cycles());
 
+    stage_start = lpr_exec_now_ns();
+    stage_start_cycles = lpr_exec_now_cycles();
     (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
     (void)pacha_fd_close(stack_fd);
+    lpr_exec_metric("start_stack_unmap", stage_start, lpr_exec_now_ns());
+    lpr_exec_metric_cycles("start_stack_unmap", stage_start_cycles, lpr_exec_now_cycles());
 
     const uint64_t thread_rights =
         PACHA_FD_RIGHT_INSPECT |
@@ -254,11 +273,19 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
         PACHA_FD_RIGHT_KILL |
         PACHA_FD_RIGHT_START |
         PACHA_FD_RIGHT_SET_CONTEXT;
+    stage_start = lpr_exec_now_ns();
+    stage_start_cycles = lpr_exec_now_cycles();
     const int thread_fd = pacha_thread_create(plan->process_fd, plan->runtime_entry, stack_base + sp, 0, 0, thread_rights);
+    lpr_exec_metric("start_thread_create", stage_start, lpr_exec_now_ns());
+    lpr_exec_metric_cycles("start_thread_create", stage_start_cycles, lpr_exec_now_cycles());
     if (thread_fd < 16) {
         return -12;
     }
+    stage_start = lpr_exec_now_ns();
+    stage_start_cycles = lpr_exec_now_cycles();
     const int start_status = pacha_thread_start(thread_fd);
+    lpr_exec_metric("start_thread_start", stage_start, lpr_exec_now_ns());
+    lpr_exec_metric_cycles("start_thread_start", stage_start_cycles, lpr_exec_now_cycles());
     if (start_status != 0) {
         (void)pacha_fd_close(thread_fd);
         return -5;

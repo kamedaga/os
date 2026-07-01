@@ -76,6 +76,57 @@ int lpr_exec_get_interp_path(const lpr_exec_image_t *image, char *out_path, size
     return 0;
 }
 
+int lpr_exec_meta_get_interp_path(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    const lpr_exec_meta_t *meta,
+    char *out_path,
+    size_t out_size)
+{
+    if (out_path == NULL || out_size == 0) {
+        return -22;
+    }
+    out_path[0] = '\0';
+    if (runtime == NULL || file == NULL || meta == NULL || meta->phdrs == NULL) {
+        return -22;
+    }
+    if (meta->interp_path[0] != '\0') {
+        const size_t cached_len = strnlen(meta->interp_path, sizeof(meta->interp_path));
+        if (cached_len == 0 || cached_len >= out_size || cached_len >= sizeof(meta->interp_path)) {
+            return -8;
+        }
+        memcpy(out_path, meta->interp_path, cached_len + 1u);
+        return 0;
+    }
+    for (uint16_t i = 0; i < meta->phnum; ++i) {
+        const unsigned char *ph = meta->phdrs + (uint64_t)i * meta->phent;
+        if (lpr_exec_rd32(ph) != LPR_EXEC_PT_INTERP) {
+            continue;
+        }
+        const uint64_t p_offset = lpr_exec_rd64(ph + 8);
+        const uint64_t p_filesz = lpr_exec_rd64(ph + 32);
+        if (out_path[0] != '\0' ||
+            p_filesz == 0 ||
+            p_filesz >= out_size ||
+            p_filesz > LPR_EXEC_MAX_INTERP_BYTES ||
+            p_offset > file->size ||
+            p_filesz > file->size - p_offset)
+        {
+            return -8;
+        }
+        int status = lpr_exec_read_file_range(runtime, file, p_offset, (unsigned char *)out_path, p_filesz);
+        if (status != 0) {
+            out_path[0] = '\0';
+            return status;
+        }
+        if (out_path[p_filesz - 1u] != '\0' || out_path[0] != '/') {
+            out_path[0] = '\0';
+            return -8;
+        }
+    }
+    return 0;
+}
+
 int lpr_exec_image_find_symbol(const lpr_exec_image_t *image, const char *symbol, uint64_t *out_value)
 {
     if (image == NULL || image->bytes == NULL || symbol == NULL || out_value == NULL) {

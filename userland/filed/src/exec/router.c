@@ -34,3 +34,8 @@ int filed_exec_handle(
         out_process_fd,
         out_thread_fd);
 }
+
+void filed_exec_invalidate_backend_object(struct filed_runtime *runtime, uint64_t backend_object)
+{
+    filed_exec_linux_lpr_invalidate_backend_object(runtime, backend_object);
+}

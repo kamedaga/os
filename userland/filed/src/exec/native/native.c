@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "filed/backend_router.h"
 #include "filed/runtime.h"
 #include "filed/page_cache.h"
 #include "pacha/abi.h"
@@ -267,8 +268,8 @@ static int filed_exec_lookup_and_open_component(
         return filed_exec_status_to_errno(status);
     }
 
-    int result = filed_kobox_backend_lookup(
-        &runtime->backend,
+    int result = filed_runtime_backend_lookup(
+        runtime,
         parent_decision.backend_object,
         name,
         &object_id);
@@ -277,7 +278,7 @@ static int filed_exec_lookup_and_open_component(
     }
 
     memset(&backend_stat, 0, sizeof(backend_stat));
-    result = filed_kobox_backend_statx(&runtime->backend, object_id, &backend_stat);
+    result = filed_runtime_backend_statx(runtime, object_id, &backend_stat);
     if (result != 0) {
         return result;
     }
@@ -610,7 +611,7 @@ static int filed_exec_read_image(
         stat.nlink = snapshot.nlink;
         stat.kind = snapshot.kind;
     } else {
-        status = filed_kobox_backend_statx(&runtime->backend, stat_decision.backend_object, &stat);
+        status = filed_runtime_backend_statx(runtime, stat_decision.backend_object, &stat);
         if (status != 0) {
             return status;
         }

@@ -15,7 +15,7 @@
 #define LPR_ZPOLINE_PATCH_TO0 0xffu
 #define LPR_ZPOLINE_PATCH_TO1 0xd0u
 #define LPR_ZPOLINE_SHIM_SIZE 13u
-#define LPR_ZPOLINE_SHIM_OFFSET (LPR_ZPOLINE_PAGE_SIZE - LPR_ZPOLINE_SHIM_SIZE)
+#define LPR_ZPOLINE_SHIM_OFFSET 512u
 #define LPR_ZPOLINE_DIRECT_LIMIT LPR_ZPOLINE_SHIM_OFFSET
 #define LPR_ZPOLINE_MAX_SYSCALL_NR LPR_ZPOLINE_DIRECT_LIMIT
 
@@ -51,7 +51,7 @@ _Static_assert(sizeof(struct lpr_patch_mapping_result) == 32, "lpr_patch_mapping
 _Static_assert(LPR_LOW_GUARD_START_VA == PERSONALITY_PAGE_SIZE, "zpoline page must be first");
 _Static_assert((LPR_LOW_GUARD_END_VA & (PERSONALITY_PAGE_SIZE - 1)) == 0, "low guard end page aligned");
 _Static_assert(LPR_LOW_GUARD_SIZE >= PERSONALITY_PAGE_SIZE, "low guard must contain at least one page");
-_Static_assert(LPR_ZPOLINE_SHIM_OFFSET > 1024, "zpoline shim should leave a wide sled");
-_Static_assert(LPR_ZPOLINE_SHIM_OFFSET + LPR_ZPOLINE_SHIM_SIZE == LPR_ZPOLINE_PAGE_SIZE, "zpoline shim must end at page boundary");
+_Static_assert(LPR_ZPOLINE_SHIM_OFFSET == 512, "zpoline shim should keep normal Linux syscall numbers short");
+_Static_assert(LPR_ZPOLINE_SHIM_OFFSET + LPR_ZPOLINE_SHIM_SIZE < LPR_ZPOLINE_PAGE_SIZE, "zpoline shim must fit in the low page");
 
 #endif

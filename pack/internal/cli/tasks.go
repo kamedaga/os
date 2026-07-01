@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,6 +49,82 @@ func syncCommand(ctx *context) *cobra.Command {
 	cmd.AddCommand(syncBootfsCommand(ctx))
 	cmd.AddCommand(syncRootfsCommand(ctx))
 	return cmd
+}
+
+func fsckCommand(ctx *context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "fsck",
+		Short: "Check filesystem images",
+	}
+	cmd.AddCommand(fsckRootfsCommand(ctx))
+	return cmd
+}
+
+func fsckRootfsCommand(ctx *context) *cobra.Command {
+	return &cobra.Command{
+		Use:   "rootfs",
+		Short: "Run e2fsck against the ext4 rootfs partition",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			partition, ok := ctx.workspace.Disk.Partitions["rootfs"]
+			if !ok {
+				return fmt.Errorf("missing disk.partitions.rootfs")
+			}
+			if strings.ToLower(partition.Format) != "ext4" {
+				return fmt.Errorf("rootfs fsck currently supports ext4, got %q", partition.Format)
+			}
+			diskPath := ctx.workspace.Path(ctx.workspace.Disk.Image)
+			disk, err := os.Open(diskPath)
+			if err != nil {
+				return err
+			}
+			defer disk.Close()
+
+			region, err := rootsync.OpenPartitionRegion(disk, partition.Index)
+			if err != nil {
+				return err
+			}
+			partitionBytes := (region.LastLBA - region.FirstLBA + 1) * 512
+			if partitionBytes == 0 || partitionBytes > uint64(^uint(0)>>1) {
+				return fmt.Errorf("invalid rootfs partition size: %d", partitionBytes)
+			}
+
+			tempDir := ctx.workspace.Path(ctx.workspace.Artifacts, "tmp")
+			if err := os.MkdirAll(tempDir, 0o755); err != nil {
+				return err
+			}
+			imagePath := filepath.Join(tempDir, "rootfs-fsck.ext4")
+			image, err := os.Create(imagePath)
+			if err != nil {
+				return err
+			}
+			reader := io.NewSectionReader(
+				disk,
+				int64(region.FirstLBA*512),
+				int64(partitionBytes))
+			if _, err := io.Copy(image, reader); err != nil {
+				_ = image.Close()
+				return err
+			}
+			if err := image.Close(); err != nil {
+				return err
+			}
+			defer os.Remove(imagePath)
+
+			ui.Task("fsck:rootfs")
+			fsck := exec.Command("e2fsck", "-fn", imagePath)
+			output, err := fsck.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("e2fsck failed: %w\n%s", err, string(output))
+			}
+			ui.KeyValues("Rootfs fsck", [][2]string{
+				{"disk", ctx.workspace.Rel(diskPath)},
+				{"partition", fmt.Sprint(partition.Index)},
+				{"filesystem", "ext4"},
+				{"state", "clean"},
+			})
+			return nil
+		},
+	}
 }
 
 func qemuLimineCommand(ctx *context) *cobra.Command {

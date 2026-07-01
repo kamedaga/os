@@ -78,6 +78,11 @@ typedef enum filed_file_status_flags {
     FILED_FILE_SYNC = 1u << 2,
 } filed_file_status_flags_t;
 
+typedef enum filed_time_update_flags {
+    FILED_TIME_UPDATE_ATIME = 1u << 0,
+    FILED_TIME_UPDATE_MTIME = 1u << 1,
+} filed_time_update_flags_t;
+
 typedef enum filed_open_flags {
     FILED_OPEN_CREATE = 1u << 0,
     FILED_OPEN_EXCLUSIVE = 1u << 1,
@@ -119,6 +124,13 @@ typedef struct filed_vnode {
     uint64_t stat_blocks;
     uint64_t stat_nlink;
     uint64_t stat_kind;
+    bool stat_times_valid;
+    int64_t stat_atime_sec;
+    int64_t stat_atime_nsec;
+    int64_t stat_mtime_sec;
+    int64_t stat_mtime_nsec;
+    int64_t stat_ctime_sec;
+    int64_t stat_ctime_nsec;
     filed_vnode_id_t parent;
     char name[64];
     filed_generation_t generation;
@@ -197,6 +209,13 @@ typedef struct filed_vfs_stat_snapshot {
     uint64_t blocks;
     uint64_t nlink;
     uint64_t kind;
+    bool times_valid;
+    int64_t atime_sec;
+    int64_t atime_nsec;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    int64_t ctime_sec;
+    int64_t ctime_nsec;
     filed_generation_t object_generation;
     filed_generation_t dir_generation;
 } filed_vfs_stat_snapshot_t;
@@ -243,6 +262,11 @@ filed_status_t filed_vfs_open_cached_child(
     uint32_t rights,
     uint32_t open_flags,
     filed_vfs_open_result_t *out_open);
+filed_status_t filed_vfs_cached_child_backend_object(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    filed_backend_object_id_t *out_backend_object);
 
 filed_status_t filed_vfs_create_backend_child(
     filed_vfs_t *vfs,
@@ -322,6 +346,18 @@ filed_status_t filed_vfs_note_truncate(
     filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
     uint64_t size);
+filed_status_t filed_vfs_update_times(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint32_t mask,
+    int64_t atime_sec,
+    int64_t atime_nsec,
+    int64_t mtime_sec,
+    int64_t mtime_nsec);
+filed_status_t filed_vfs_update_mode(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint64_t mode);
 
 filed_status_t filed_vfs_lookup_prepare(
     const filed_vfs_t *vfs,

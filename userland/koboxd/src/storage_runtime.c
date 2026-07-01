@@ -2,6 +2,7 @@
 
 #include "control_endpoint.h"
 #include "filed/dispatch.h"
+#include "filed/exec_linux_lpr.h"
 #include "filed_direct_backend.h"
 #include "fs_endpoint.h"
 #include "kobox/device_pachaos_capsule.h"
@@ -281,6 +282,12 @@ static int koboxd_storage_runtime_start_filed(koboxd_storage_runtime_t *runtime)
     const int status = filed_runtime_mount_root(&runtime->filed_runtime);
     if (status != 0) {
         return status;
+    }
+    const int prewarm_status = filed_exec_linux_lpr_prewarm(&runtime->filed_runtime);
+    if (prewarm_status != 0) {
+        printf("[filed] lpr prewarm status=%d\n", prewarm_status);
+    } else {
+        printf("[filed] lpr prewarm ready\n");
     }
     runtime->filed_ready = 1;
     printf("[filed] ready\n");

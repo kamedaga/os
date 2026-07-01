@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #include <personality/zpoline.h>
 
@@ -9,6 +10,7 @@
 #include "filed/runtime.h"
 #include "filed/vfs.h"
 #include "pacha/abi.h"
+#include "pacha/ipc.h"
 
 enum {
     LPR_EXEC_PAGE_SIZE = 4096,
@@ -54,8 +56,29 @@ enum {
 
 typedef struct lpr_exec_image {
     unsigned char *bytes;
+    uint64_t backend_object;
+    uint64_t object_generation;
     uint64_t size;
 } lpr_exec_image_t;
+
+typedef struct lpr_exec_file {
+    filed_handle_id_t handle_id;
+    uint64_t backend_object;
+    uint64_t object_generation;
+    uint64_t size;
+} lpr_exec_file_t;
+
+typedef struct lpr_exec_meta {
+    unsigned char ehdr[LPR_EXEC_EHDR_BYTES];
+    unsigned char *phdrs;
+    char interp_path[LPR_EXEC_MAX_INTERP_BYTES];
+    uint64_t phdr_bytes;
+    uint64_t entry;
+    uint64_t phoff;
+    uint16_t type;
+    uint16_t phent;
+    uint16_t phnum;
+} lpr_exec_meta_t;
 
 typedef struct lpr_exec_loaded {
     uint64_t entry;
@@ -65,6 +88,12 @@ typedef struct lpr_exec_loaded {
     uint16_t phnum;
     uint16_t load_segments;
 } lpr_exec_loaded_t;
+
+typedef struct lpr_exec_pending_map_batch {
+    struct pacha_process_map_batch_entry entries[PACHA_PROCESS_MAP_BATCH_MAX_ENTRIES];
+    int close_fds[PACHA_PROCESS_MAP_BATCH_MAX_ENTRIES];
+    uint64_t count;
+} lpr_exec_pending_map_batch_t;
 
 typedef struct lpr_exec_plan {
     int process_fd;
@@ -155,19 +184,82 @@ static inline int lpr_exec_status_to_errno(filed_status_t status)
 }
 
 int lpr_exec_read_full_image(filed_runtime_t *runtime, filed_handle_id_t handle_id, lpr_exec_image_t *out_image);
+int lpr_exec_read_full_file_image(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    lpr_exec_image_t *out_image);
+uint64_t lpr_exec_now_ns(void);
+uint64_t lpr_exec_now_cycles(void);
+void lpr_exec_metric(const char *label, uint64_t start_ns, uint64_t end_ns);
+void lpr_exec_metric_cycles(const char *label, uint64_t start_cycles, uint64_t end_cycles);
 int lpr_exec_read_absolute_image(filed_runtime_t *runtime, const char *path, lpr_exec_image_t *out_image);
+int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t handle_id, lpr_exec_file_t *out_file);
+int lpr_exec_open_absolute_file(filed_runtime_t *runtime, const char *path, lpr_exec_file_t *out_file);
+void lpr_exec_close_file(filed_runtime_t *runtime, lpr_exec_file_t *file);
+int lpr_exec_read_file_range(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    uint64_t offset,
+    unsigned char *buffer,
+    uint64_t length);
+int lpr_exec_read_file_range_for_load(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    uint64_t offset,
+    uint64_t length,
+    unsigned char **out_buffer,
+    bool *out_owned);
+int lpr_exec_read_meta(filed_runtime_t *runtime, const lpr_exec_file_t *file, lpr_exec_meta_t *out_meta);
+void lpr_exec_free_meta(lpr_exec_meta_t *meta);
 
 int lpr_exec_validate_elf(const lpr_exec_image_t *image);
 int lpr_exec_get_interp_path(const lpr_exec_image_t *image, char *out_path, size_t out_size);
+int lpr_exec_meta_get_interp_path(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    const lpr_exec_meta_t *meta,
+    char *out_path,
+    size_t out_size);
 int lpr_exec_image_find_symbol(const lpr_exec_image_t *image, const char *symbol, uint64_t *out_value);
 void lpr_exec_patch_syscalls(unsigned char *bytes, uint64_t size);
+void lpr_exec_image_dump_metrics(void);
+void lpr_exec_map_dump_metrics(void);
 
+void lpr_exec_invalidate_segment_vmo_cache(uint64_t backend_object);
+void lpr_exec_invalidate_runtime_image_cache(uint64_t backend_object);
+void lpr_exec_invalidate_interpreter_cache(filed_runtime_t *runtime, uint64_t backend_object);
 int lpr_exec_install_low_layout(int process_fd, uint64_t syscall_entry_va);
 int lpr_exec_load_image_into_process(
     int process_fd,
     const lpr_exec_image_t *image,
     uint64_t dyn_base,
     int patch_text,
+    lpr_exec_loaded_t *loaded);
+int lpr_exec_load_image_with_low_layout_into_process(
+    int process_fd,
+    const lpr_exec_image_t *image,
+    uint64_t dyn_base,
+    int patch_text,
+    uint64_t syscall_entry_offset,
+    lpr_exec_loaded_t *loaded);
+int lpr_exec_load_file_into_process(
+    filed_runtime_t *runtime,
+    int process_fd,
+    const lpr_exec_file_t *file,
+    const lpr_exec_meta_t *meta,
+    uint64_t dyn_base,
+    int patch_text,
+    lpr_exec_loaded_t *loaded);
+void lpr_exec_pending_map_batch_init(lpr_exec_pending_map_batch_t *batch);
+void lpr_exec_pending_map_batch_discard(lpr_exec_pending_map_batch_t *batch);
+int lpr_exec_pending_map_batch_commit(int process_fd, lpr_exec_pending_map_batch_t *batch);
+int lpr_exec_prepare_file_into_map_batch(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    const lpr_exec_meta_t *meta,
+    uint64_t dyn_base,
+    int patch_text,
+    lpr_exec_pending_map_batch_t *batch,
     lpr_exec_loaded_t *loaded);
 
 int lpr_exec_prepare_inherit_fds(

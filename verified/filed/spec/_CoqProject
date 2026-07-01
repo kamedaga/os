@@ -1,6 +1,8 @@
 -Q . Pacha.Filed
 FiledTypes.v
 VfsModel.v
+TmpfsModel.v
+TmpfsSpec.v
 VfsSpec.v
 ExecModel.v
 ExecSpec.v
