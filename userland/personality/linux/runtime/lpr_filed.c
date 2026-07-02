@@ -1,4 +1,5 @@
 #include "lpr_filed.h"
+#include "lpr_linux_syscall.h"
 #include "support/string.h"
 #include "support/syscall.h"
 #include <filed/ipc_protocol.h>
@@ -47,6 +48,7 @@ void *memset(void *dst, int c, size_t n)
 #define LPR_FILED_READV_TO_VMO_MIN (16ull * 1024ull)
 #define LPR_FILED_READV_TO_VMO_MAX (256ull * 1024ull)
 #define LPR_LINUX_PIPE_BUF_BYTES 4096ull
+#define LPR_LINUX_PIPE_MAP_BYTES 8192ull
 #define LPR_LINUX_PIPE_COUNT 16u
 
 #define LPR_LINUX_S_IFMT 0170000ull
@@ -90,6 +92,7 @@ typedef struct lpr_pipe_entry {
     uint8_t read_refs;
     uint8_t write_refs;
     uint8_t reserved0;
+    int32_t vmo_fd;
     uint32_t head;
     uint32_t tail;
     uint32_t used;
@@ -153,7 +156,7 @@ enum {
 
 static lpr_filed_fd_t lpr_fds[LPR_FD_TABLE_SIZE];
 static lpr_pipe_fd_t lpr_pipe_fds[LPR_FD_TABLE_SIZE];
-static lpr_pipe_entry_t lpr_pipes[LPR_LINUX_PIPE_COUNT];
+static lpr_pipe_entry_t *lpr_pipes[LPR_LINUX_PIPE_COUNT];
 static lpr_readlink_cache_entry_t lpr_readlink_cache[LPR_READLINK_CACHE_ENTRIES];
 static lpr_filed_page_cache_entry_t lpr_page_cache[LPR_FILED_PAGE_CACHE_ENTRIES];
 static uint64_t lpr_readlink_cache_clock;
@@ -197,6 +200,45 @@ static void lpr_zero_bytes(void *ptr, uint64_t len)
         *p++ = 0;
         len--;
     }
+}
+
+static char *lpr_clone_trace_append_literal(char *out, const char *end, const char *text)
+{
+    while (out < end && *text != 0) {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_clone_trace_append_u64(char *out, const char *end, uint64_t value)
+{
+    char tmp[20];
+    uint64_t n = 0;
+    do {
+        tmp[n++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && n < sizeof(tmp));
+    while (out < end && n != 0) {
+        *out++ = tmp[--n];
+    }
+    return out;
+}
+
+static void lpr_trace_clone_args(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid)
+{
+    char line[224];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_clone_trace_append_literal(out, end, "[lpr_runtime] clone flags=");
+    out = lpr_clone_trace_append_u64(out, end, flags);
+    out = lpr_clone_trace_append_literal(out, end, " child_stack=");
+    out = lpr_clone_trace_append_u64(out, end, child_stack);
+    out = lpr_clone_trace_append_literal(out, end, " parent_tid=");
+    out = lpr_clone_trace_append_u64(out, end, parent_tid);
+    out = lpr_clone_trace_append_literal(out, end, " child_tid=");
+    out = lpr_clone_trace_append_u64(out, end, child_tid);
+    out = lpr_clone_trace_append_literal(out, end, "\n");
+    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
 }
 
 #if LPR_TRACE_READV_SIZES || LPR_TRACE_READV_CACHE_STATS
@@ -396,7 +438,7 @@ static lpr_pipe_entry_t *lpr_pipe_for_fd(uint64_t fd)
     if (!lpr_pipe_fd_is_active(fd) || lpr_pipe_fds[fd].pipe_id >= LPR_LINUX_PIPE_COUNT) {
         return 0;
     }
-    lpr_pipe_entry_t *pipe = &lpr_pipes[lpr_pipe_fds[fd].pipe_id];
+    lpr_pipe_entry_t *pipe = lpr_pipes[lpr_pipe_fds[fd].pipe_id];
     return pipe->active != 0 ? pipe : 0;
 }
 
@@ -411,10 +453,55 @@ static void lpr_pipe_close_fd(uint64_t fd)
             pipe->write_refs--;
         }
         if (pipe->read_refs == 0 && pipe->write_refs == 0) {
+            const int vmo_fd = pipe->vmo_fd;
             lpr_memset(pipe, 0, sizeof(*pipe));
+            lpr_pipes[lpr_pipe_fds[fd].pipe_id] = 0;
+            (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)pipe, LPR_LINUX_PIPE_MAP_BYTES);
+            if (vmo_fd >= 16) {
+                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
+            }
         }
     }
     lpr_memset(&lpr_pipe_fds[fd], 0, sizeof(lpr_pipe_fds[fd]));
+}
+
+static void lpr_pipe_after_fork_child(void)
+{
+    for (uint64_t fd = 0; fd < LPR_FD_TABLE_SIZE; fd += 1) {
+        if (!lpr_pipe_fd_is_active(fd)) {
+            continue;
+        }
+        lpr_pipe_entry_t *pipe = lpr_pipe_for_fd(fd);
+        if (pipe == 0) {
+            continue;
+        }
+        if (lpr_pipe_fds[fd].readable && pipe->read_refs != UINT8_MAX) {
+            pipe->read_refs++;
+        }
+        if (lpr_pipe_fds[fd].writable && pipe->write_refs != UINT8_MAX) {
+            pipe->write_refs++;
+        }
+    }
+}
+
+static void lpr_close_cloexec_fds(void)
+{
+    for (uint64_t fd = 3; fd < LPR_FD_TABLE_SIZE; fd += 1) {
+        if (lpr_pipe_fd_is_active(fd) &&
+            (lpr_pipe_fds[fd].flags & LPR_LINUX_O_CLOEXEC) != 0)
+        {
+            lpr_pipe_close_fd(fd);
+        }
+        if (lpr_fd_is_filed(fd) &&
+            (lpr_fds[fd].flags & LPR_LINUX_O_CLOEXEC) != 0)
+        {
+            const uint64_t handle = lpr_fds[fd].handle;
+            lpr_memset(&lpr_fds[fd], 0, sizeof(lpr_fds[fd]));
+            if (handle != 0) {
+                (void)lpr_filed_close_handle(handle);
+            }
+        }
+    }
 }
 
 int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags)
@@ -428,7 +515,7 @@ int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags)
     }
     uint64_t pipe_id = LPR_LINUX_PIPE_COUNT;
     for (uint64_t i = 0; i < LPR_LINUX_PIPE_COUNT; i += 1) {
-        if (lpr_pipes[i].active == 0) {
+        if (lpr_pipes[i] == 0 || lpr_pipes[i]->active == 0) {
             pipe_id = i;
             break;
         }
@@ -447,10 +534,35 @@ int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags)
         return write_fd;
     }
 
-    lpr_memset(&lpr_pipes[pipe_id], 0, sizeof(lpr_pipes[pipe_id]));
-    lpr_pipes[pipe_id].active = 1;
-    lpr_pipes[pipe_id].read_refs = 1;
-    lpr_pipes[pipe_id].write_refs = 1;
+    const int64_t vmo_fd = lpr_pacha_syscall3(
+        PACHAOS_SYSCALL_VMO_CREATE,
+        LPR_LINUX_PIPE_MAP_BYTES,
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE,
+        0);
+    if (vmo_fd < 16) {
+        lpr_memset(&lpr_pipe_fds[read_fd], 0, sizeof(lpr_pipe_fds[read_fd]));
+        return lpr_pacha_status_to_errno(vmo_fd);
+    }
+    const int64_t mapped = lpr_pacha_syscall6(
+        PACHAOS_SYSCALL_MMAP,
+        (uint64_t)(uint32_t)vmo_fd,
+        0,
+        LPR_LINUX_PIPE_MAP_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (mapped == 0 || (uint64_t)mapped > UINT64_MAX - LPR_LINUX_PIPE_MAP_BYTES) {
+        lpr_memset(&lpr_pipe_fds[read_fd], 0, sizeof(lpr_pipe_fds[read_fd]));
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
+        return mapped == 0 ? -LPR_LINUX_ENOMEM : lpr_pacha_status_to_errno(mapped);
+    }
+    lpr_pipe_entry_t *pipe = (lpr_pipe_entry_t *)(uintptr_t)mapped;
+    lpr_memset(pipe, 0, sizeof(*pipe));
+    pipe->active = 1;
+    pipe->read_refs = 1;
+    pipe->write_refs = 1;
+    pipe->vmo_fd = (int32_t)vmo_fd;
+    lpr_pipes[pipe_id] = pipe;
     lpr_pipe_fds[read_fd].active = 1;
     lpr_pipe_fds[read_fd].pipe_id = (uint8_t)pipe_id;
     lpr_pipe_fds[read_fd].readable = 1;
@@ -2102,6 +2214,300 @@ int64_t lpr_linux_pread_to_vmo(
         return (int64_t)reply.word1;
     }
     return (int64_t)reply.word2;
+}
+
+typedef struct lpr_pacha_process_status {
+    uint64_t state;
+    uint64_t exit_code;
+    uint64_t id;
+    uint64_t generation;
+} lpr_pacha_process_status_t;
+
+static int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
+{
+    if (process_fd < 16) {
+        return -LPR_LINUX_ECHILD;
+    }
+    lpr_pacha_process_status_t st;
+    for (;;) {
+        lpr_memset(&st, 0, sizeof(st));
+        const int64_t wait_status = lpr_pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_WAIT,
+            process_fd,
+            (uint64_t)(uintptr_t)&st);
+        if (wait_status == 0) {
+            if (out_exit_code != 0) {
+                *out_exit_code = st.exit_code & 0xffu;
+            }
+            return 0;
+        }
+        const int64_t errno_status = lpr_pacha_status_to_errno(wait_status);
+        if (errno_status != -LPR_LINUX_EAGAIN) {
+            return errno_status;
+        }
+        struct pacha_pollfd pollfd;
+        lpr_memset(&pollfd, 0, sizeof(pollfd));
+        pollfd.fd = (int)(uint32_t)process_fd;
+        pollfd.events = PACHA_FD_EVENT_READABLE;
+        (void)lpr_pacha_syscall4(
+            PACHA_FD_SYSCALL_WAIT_MANY,
+            (uint64_t)(uintptr_t)&pollfd,
+            1,
+            PACHA_FD_WAIT_FOREVER,
+            0);
+    }
+}
+
+static int lpr_exec_add_string(filed_wire_exec_path_t *exec, filed_wire_exec_string_ref_t *ref, const char *value)
+{
+    if (exec == 0 || ref == 0 || value == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    const uint64_t length = (uint64_t)lpr_strnlen(value, FILED_WIRE_EXEC_STRING_BYTES) + 1u;
+    if (length == 0 || length > UINT16_MAX) {
+        return -LPR_LINUX_E2BIG;
+    }
+    if (exec->string_bytes + length > FILED_WIRE_EXEC_STRING_BYTES) {
+        return -LPR_LINUX_E2BIG;
+    }
+    ref->offset = (uint16_t)exec->string_bytes;
+    ref->length = (uint16_t)length;
+    lpr_memcpy(exec->strings + exec->string_bytes, value, (size_t)length);
+    exec->string_bytes += length;
+    return 0;
+}
+
+static int lpr_exec_copy_string_vector(
+    filed_wire_exec_path_t *exec,
+    filed_wire_exec_string_ref_t *refs,
+    uint64_t max_refs,
+    uint64_t vector_raw,
+    uint64_t *out_count)
+{
+    if (out_count == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    *out_count = 0;
+    if (vector_raw == 0) {
+        return 0;
+    }
+    const char *const *vector = (const char *const *)(uintptr_t)vector_raw;
+    uint64_t count = 0;
+    while (count < max_refs) {
+        const char *value = vector[count];
+        if (value == 0) {
+            *out_count = count;
+            return 0;
+        }
+        const int status = lpr_exec_add_string(exec, &refs[count], value);
+        if (status != 0) {
+            return status;
+        }
+        count++;
+    }
+    if (vector[count] != 0) {
+        return -LPR_LINUX_E2BIG;
+    }
+    *out_count = count;
+    return 0;
+}
+
+static int64_t lpr_filed_exec_path(filed_wire_exec_path_t *exec, int *out_process_fd, int *out_thread_fd)
+{
+    if (exec == 0 || out_process_fd == 0 || out_thread_fd == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    *out_process_fd = -1;
+    *out_thread_fd = -1;
+
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    lpr_memcpy(page, exec, sizeof(*exec));
+
+    struct pacha_ipc_fd request_fd;
+    lpr_memset(&request_fd, 0, sizeof(request_fd));
+    request_fd.fd = (uint64_t)(uint32_t)page_fd;
+    request_fd.rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+
+    const uint64_t request_id = ++lpr_request_id;
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = FILED_WIRE_OP_EXEC_PATH,
+        .word2 = 0,
+        .word3 = request_id,
+        .fds = &request_fd,
+        .fd_count = 1,
+    };
+    const int64_t reply_fd = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_IPC_CALL,
+        LPR_FILED_ENDPOINT_FD,
+        (uint64_t)(uintptr_t)&request);
+    if (reply_fd < 16) {
+        lpr_destroy_wire_page(page_fd, page);
+        return lpr_pacha_status_to_errno(reply_fd);
+    }
+
+    struct pacha_ipc_fd reply_fds[2];
+    struct pacha_ipc_msg reply;
+    lpr_memset(reply_fds, 0, sizeof(reply_fds));
+    lpr_memset(&reply, 0, sizeof(reply));
+    reply.fds = reply_fds;
+    reply.fd_capacity = 2;
+    const int64_t recv_status = lpr_pacha_syscall4(
+        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)(uint32_t)reply_fd,
+        (uint64_t)(uintptr_t)&reply,
+        UINT64_MAX,
+        0);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
+    lpr_destroy_wire_page(page_fd, page);
+    if (recv_status != 0) {
+        return lpr_pacha_status_to_errno(recv_status);
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC || reply.word3 != request_id) {
+        return -LPR_LINUX_EIO;
+    }
+    if ((int64_t)reply.word1 < 0) {
+        return (int64_t)reply.word1;
+    }
+    if (reply.fd_count < 2 || reply_fds[0].fd < 16 || reply_fds[1].fd < 16) {
+        return -LPR_LINUX_EIO;
+    }
+    *out_process_fd = (int)(uint32_t)reply_fds[0].fd;
+    *out_thread_fd = (int)(uint32_t)reply_fds[1].fd;
+    return 0;
+}
+
+int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
+{
+    (void)parent_tid;
+    (void)child_tid;
+    (void)tls;
+    lpr_trace_clone_args(flags, child_stack, parent_tid, child_tid);
+    const uint64_t signal = flags & 0xffu;
+    const uint64_t clone_vm = 0x100ull;
+    const uint64_t clone_vfork = 0x4000ull;
+    const uint64_t clone_thread = 0x10000ull;
+    const uint64_t known_process_flags = clone_vm | clone_vfork | 0x00100000ull | 0x01000000ull | 0x00200000ull;
+    if (signal != 0 && signal != 17u) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if ((flags & clone_thread) != 0) {
+        return -LPR_LINUX_ENOSYS;
+    }
+    if ((flags & ~(known_process_flags | 0xffull)) != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    const struct lpr_linux_user_frame *user_frame = lpr_current_linux_user_frame();
+    if (user_frame == 0) {
+        return -LPR_LINUX_ENOSYS;
+    }
+    const int64_t ret = lpr_pacha_syscall3(
+        PACHAOS_SYSCALL_PROCESS_CLONE,
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_KILL,
+        PACHA_PROCESS_CLONE_CURRENT_THREAD | PACHA_PROCESS_CLONE_USER_FRAME,
+        (uint64_t)(uintptr_t)user_frame);
+    if (ret == 0) {
+        lpr_pipe_after_fork_child();
+        return 0;
+    }
+    if (ret >= 16) {
+        return ret;
+    }
+    return lpr_pacha_status_to_errno(ret);
+}
+
+int64_t lpr_linux_fork(void)
+{
+    return lpr_linux_clone(17u, 0, 0, 0, 0);
+}
+
+int64_t lpr_linux_vfork(void)
+{
+    return lpr_linux_clone(0x4000ull | 0x100ull | 17u, 0, 0, 0, 0);
+}
+
+int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage)
+{
+    (void)rusage;
+    if (options != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    uint64_t exit_code = 0;
+    const int64_t status = lpr_linux_wait_process_fd(pid, &exit_code);
+    if (status != 0) {
+        return status;
+    }
+    if (status_raw != 0) {
+        int *out_status = (int *)(uintptr_t)status_raw;
+        *out_status = (int)((exit_code & 0xffu) << 8);
+    }
+    return (int64_t)pid;
+}
+
+int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw)
+{
+    const char *path = (const char *)(uintptr_t)path_raw;
+    if (path == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    const uint64_t path_len = (uint64_t)lpr_strnlen(path, FILED_WIRE_NAME_BYTES);
+    if (path_len == 0 || path_len >= FILED_WIRE_NAME_BYTES) {
+        return -LPR_LINUX_ENAMETOOLONG;
+    }
+
+    filed_wire_exec_path_t exec;
+    lpr_memset(&exec, 0, sizeof(exec));
+    exec.dir_handle = 0;
+    exec.flags = FILED_WIRE_EXEC_LINUX_LPR;
+    lpr_memcpy(exec.path, path, (size_t)path_len + 1u);
+
+    int status = lpr_exec_copy_string_vector(
+        &exec,
+        exec.argv,
+        FILED_WIRE_EXEC_MAX_ARGS,
+        argv_raw,
+        &exec.argc);
+    if (status != 0) {
+        return status;
+    }
+    if (exec.argc == 0) {
+        status = lpr_exec_add_string(&exec, &exec.argv[0], path);
+        if (status != 0) {
+            return status;
+        }
+        exec.argc = 1;
+    }
+    status = lpr_exec_copy_string_vector(
+        &exec,
+        exec.envp,
+        FILED_WIRE_EXEC_MAX_ENVS,
+        envp_raw,
+        &exec.envc);
+    if (status != 0) {
+        return status;
+    }
+
+    int process_fd = -1;
+    int thread_fd = -1;
+    lpr_close_cloexec_fds();
+    const int64_t exec_status = lpr_filed_exec_path(&exec, &process_fd, &thread_fd);
+    if (exec_status != 0) {
+        return exec_status;
+    }
+    uint64_t exit_code = 127;
+    const int64_t wait_status = lpr_linux_wait_process_fd((uint64_t)(uint32_t)process_fd, &exit_code);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)thread_fd);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)process_fd);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, wait_status == 0 ? exit_code : 127u);
+    for (;;) {
+    }
 }
 
 int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded)

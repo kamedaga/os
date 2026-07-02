@@ -1914,6 +1914,24 @@ pub fn setCurrentGsBase(gs_base: u64) bool {
     return true;
 }
 
+pub fn setThreadGsBase(thread_index: usize, gs_base: u64) bool {
+    thread_table_lock.lock();
+    defer thread_table_lock.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.gs_base = gs_base;
+    if (thread_index == currentThread()) x86_platform.writeGsBase(gs_base);
+    return true;
+}
+
+pub fn currentFsBase() u64 {
+    return x86_platform.readFsBase();
+}
+
+pub fn currentGsBase() u64 {
+    return x86_platform.readGsBase();
+}
+
 fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
     const current_thread = currentThread();
     thread_table_lock.lock();

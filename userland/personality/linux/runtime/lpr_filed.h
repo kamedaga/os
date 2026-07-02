@@ -35,6 +35,11 @@ int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64
 int64_t lpr_linux_symlinkat(uint64_t target, uint64_t new_dirfd, uint64_t linkpath);
 int64_t lpr_linux_pipe2(uint64_t fds, uint64_t flags);
 int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec);
+int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls);
+int64_t lpr_linux_fork(void);
+int64_t lpr_linux_vfork(void);
+int64_t lpr_linux_wait4(uint64_t pid, uint64_t status, uint64_t options, uint64_t rusage);
+int64_t lpr_linux_execve(uint64_t path, uint64_t argv, uint64_t envp);
 int lpr_linux_filed_fd_active(uint64_t fd);
 uint64_t lpr_linux_filed_fd_handle(uint64_t fd);
 void lpr_linux_readv_cache_trace_dump(void);

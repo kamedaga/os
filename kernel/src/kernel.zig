@@ -753,7 +753,8 @@ pub const MmapFlags = packed struct(u32) {
     shared: bool = false,
     anonymous: bool = false,
     noreserve: bool = false,
-    _reserved0: u2 = 0,
+    fork_cow: bool = false,
+    _reserved0: u1 = 0,
     pkey: u4 = 0,
     _reserved1: u20 = 0,
 };
@@ -2532,6 +2533,93 @@ pub const KernelState = struct {
         }
     }
 
+    pub fn cloneFdTableForFork(self: *KernelState, from: PrincipalId, to: PrincipalId) KernelError!void {
+        if (from == to) return KernelError.InvalidState;
+        const source_table = try self.fdTableForActiveProcessConst(from);
+        const dest_table = try self.fdTableForActiveProcess(to);
+        var fd_index: usize = 0;
+        errdefer {
+            var release_index: usize = 0;
+            while (release_index < fd_table_entries) : (release_index += 1) {
+                const object_ref = dest_table.entries[release_index].object;
+                if (object_ref.isNull()) continue;
+                dest_table.entries[release_index] = .{};
+                self.releaseKernelObject(object_ref);
+            }
+        }
+        while (fd_index < fd_table_entries) : (fd_index += 1) {
+            const source = source_table.entries[fd_index];
+            if (source.object.isNull()) continue;
+            if (!dest_table.entries[fd_index].isEmpty()) return KernelError.InvalidState;
+            try self.retainKernelObject(source.object);
+            dest_table.entries[fd_index] = .{
+                .object = source.object,
+                .rights = fdRightsFromBits(fdRightsToBits(source.rights)),
+                .flags = fdFlagsFromBits(fdFlagsToBits(source.flags)),
+                .offset = source.offset,
+            };
+        }
+    }
+
+    pub fn cloneVmaTableForFork(self: *KernelState, from: PrincipalId, to: PrincipalId) KernelError!void {
+        if (from == to) return KernelError.InvalidState;
+        const source_table = self.getVmaTable(from) orelse return KernelError.InvalidState;
+        const dest_table = self.getVmaTable(to) orelse return KernelError.InvalidState;
+        if (dest_table.active_count != 0) return KernelError.InvalidState;
+        errdefer {
+            while (dest_table.active_count != 0) {
+                const vma_index: usize = @intCast(dest_table.active_indices[dest_table.active_count - 1]);
+                const entry = &dest_table.entries[vma_index];
+                const vmo_ref = entry.vmo;
+                self.releaseVmaCowResources(entry, null);
+                clearVmaEntry(dest_table, vma_index);
+                self.releaseNativeVmo(vmo_ref);
+            }
+        }
+
+        var active_index: usize = 0;
+        while (active_index < source_table.active_count) : (active_index += 1) {
+            const entry_index: usize = @intCast(source_table.active_indices[active_index]);
+            var source_entry = source_table.entries[entry_index];
+            if (!source_entry.active) continue;
+            if (source_entry.flags.private and !source_entry.flags.shared and source_entry.prot.write) {
+                source_entry.flags.fork_cow = true;
+                source_table.entries[entry_index].flags.fork_cow = true;
+            }
+            try self.retainNativeVmo(source_entry.vmo);
+            if (!source_entry.cow_table.isNull()) {
+                self.retainNativeCowTable(source_entry.cow_table) catch |err| {
+                    self.releaseNativeVmo(source_entry.vmo);
+                    return err;
+                };
+            }
+            installVmaEntry(dest_table, entry_index, source_entry);
+        }
+        dest_table.next_user_map_va = source_table.next_user_map_va;
+    }
+
+    pub fn copyForkAnonymousPresentPageToChild(
+        self: *KernelState,
+        to: PrincipalId,
+        entry_index: usize,
+        va: u64,
+        src_paddr: u64,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        const dest_table = self.getVmaTable(to) orelse return KernelError.InvalidState;
+        if (entry_index >= dest_table.entries.len) return KernelError.InvalidState;
+        const dest_entry = &dest_table.entries[entry_index];
+        if (!dest_entry.active or !dest_entry.flags.fork_cow) return KernelError.InvalidState;
+        const copied_paddr = (self.allocPhysicalPage(free_list) catch return KernelError.OutOfFreePages).paddr;
+        var installed = false;
+        defer if (!installed) free_list.appendPage(0, copied_paddr) catch {};
+        copyPhysicalPage(copied_paddr, src_paddr);
+        self.ensureEntryCowTable(dest_entry) catch return KernelError.TableFull;
+        const cow_page = entryCowPageIndex(dest_entry, va) orelse return KernelError.InvalidState;
+        self.setNativeCowPagePaddr(dest_entry.cow_table, cow_page, copied_paddr) catch return KernelError.TableFull;
+        installed = true;
+    }
+
     pub fn getVmaTable(self: *KernelState, principal: PrincipalId) ?*VmaTable {
         const index = processIndexFromPrincipal(principal) orelse return null;
         return self.vmaTableForProcessIndex(index);
@@ -2589,7 +2677,7 @@ pub const KernelState = struct {
 
     fn nativeFaultMappingProt(entry: *const VmaEntry) MapProt {
         var write = entry.prot.write;
-        if (entry.flags.private and !entry.flags.shared and !entry.flags.anonymous) {
+        if (entry.flags.private and !entry.flags.shared and (entry.flags.fork_cow or !entry.flags.anonymous)) {
             write = false;
         }
         return .{
@@ -2785,6 +2873,7 @@ pub const KernelState = struct {
             const entry = &table.entries[entry_index];
             if (fault_page_va < entry.start_va or fault_page_va >= entry.endVa()) continue;
             if (!entry.flags.private or entry.flags.shared or !entry.prot.write) return null;
+            if (entry.flags.anonymous and !entry.flags.fork_cow) return null;
 
             const page_delta = (fault_page_va - entry.start_va) / native_page_size;
             const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
@@ -2799,12 +2888,15 @@ pub const KernelState = struct {
                     },
                 };
             }
-            const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse return null;
+            const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
+            if (src_paddr == 0 and !entry.flags.anonymous) return null;
             const new_paddr = (self.allocPhysicalPage(free_list) catch return null).paddr;
             var installed = false;
             defer if (!installed) free_list.appendPage(0, new_paddr) catch {};
 
-            copyPhysicalPage(new_paddr, src_paddr);
+            if (src_paddr != 0) {
+                copyPhysicalPage(new_paddr, src_paddr);
+            }
             self.ensureEntryCowTable(entry) catch return null;
             const cow_page = entryCowPageIndex(entry, fault_page_va) orelse return null;
             self.setNativeCowPagePaddr(entry.cow_table, cow_page, new_paddr) catch return null;

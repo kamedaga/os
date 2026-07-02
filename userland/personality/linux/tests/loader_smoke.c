@@ -50,8 +50,8 @@ int main(void) {
 
     const uint64_t shim = lpr_zpoline_common_offset();
     if (expect(trace.zpoline_copy[0] == 0x90)) return 1;
-    if (expect(trace.zpoline_copy[shim + 0] == 0x49 && trace.zpoline_copy[shim + 1] == 0xbb)) return 1;
-    if (expect(trace.zpoline_copy[shim + 10] == 0x41 && trace.zpoline_copy[shim + 11] == 0xff && trace.zpoline_copy[shim + 12] == 0xe3)) return 1;
+    if (expect(trace.zpoline_copy[shim + 0] == 0x59 && trace.zpoline_copy[shim + 1] == 0x49 && trace.zpoline_copy[shim + 2] == 0xbb)) return 1;
+    if (expect(trace.zpoline_copy[shim + 11] == 0x41 && trace.zpoline_copy[shim + 12] == 0xff && trace.zpoline_copy[shim + 13] == 0xe3)) return 1;
 
     uint8_t code[] = {0x90, 0x0f, 0x05, 0x90};
     struct lpr_patch_mapping_result patch;

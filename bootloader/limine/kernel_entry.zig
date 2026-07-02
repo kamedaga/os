@@ -126,5 +126,6 @@ fn limineKernelMain() noreturn {
     serialWrite("pacha: limine resources ready\n");
     entry.initializeLimineRuntimeOrHalt();
     serialWrite("pacha: limine runtime ready\n");
+    serialWrite("pacha: entering boot resources\n");
     entry.bootWithResources(resources);
 }

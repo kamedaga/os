@@ -39,9 +39,15 @@ enum {
 
 static lpr_file_map_cache_entry_t lpr_file_map_cache[LPR_FILE_MAP_CACHE_ENTRIES];
 static uint64_t lpr_file_map_cache_clock;
+static const struct lpr_linux_user_frame *lpr_active_user_frame;
 
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status);
 static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
+
+const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
+{
+    return lpr_active_user_frame;
+}
 
 #if LPR_TRACE_PATCH_MAPPING || LPR_TRACE_SYSCALL_METRICS || LPR_TRACE_MMAP_LOADS || LPR_TRACE_MMAP_CALLS || LPR_TRACE_ENOSYS
 static char *lpr_append_literal(char *out, const char *end, const char *text)
@@ -163,6 +169,11 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_READV },
     { .nr = LPR_LINUX_SYS_WRITEV },
     { .nr = LPR_LINUX_SYS_ACCESS },
+    { .nr = LPR_LINUX_SYS_CLONE },
+    { .nr = LPR_LINUX_SYS_FORK },
+    { .nr = LPR_LINUX_SYS_VFORK },
+    { .nr = LPR_LINUX_SYS_EXECVE },
+    { .nr = LPR_LINUX_SYS_WAIT4 },
     { .nr = LPR_LINUX_SYS_GETPID },
     { .nr = LPR_LINUX_SYS_EXIT },
     { .nr = LPR_LINUX_SYS_FCNTL },
@@ -257,6 +268,11 @@ static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t 
     case LPR_LINUX_SYS_ACCESS: return lpr_append_literal(out, end, "access");
     case LPR_LINUX_SYS_PIPE: return lpr_append_literal(out, end, "pipe");
     case LPR_LINUX_SYS_DUP: return lpr_append_literal(out, end, "dup");
+    case LPR_LINUX_SYS_CLONE: return lpr_append_literal(out, end, "clone");
+    case LPR_LINUX_SYS_FORK: return lpr_append_literal(out, end, "fork");
+    case LPR_LINUX_SYS_VFORK: return lpr_append_literal(out, end, "vfork");
+    case LPR_LINUX_SYS_EXECVE: return lpr_append_literal(out, end, "execve");
+    case LPR_LINUX_SYS_WAIT4: return lpr_append_literal(out, end, "wait4");
     case LPR_LINUX_SYS_GETPID: return lpr_append_literal(out, end, "getpid");
     case LPR_LINUX_SYS_EXIT: return lpr_append_literal(out, end, "exit");
     case LPR_LINUX_SYS_FCNTL: return lpr_append_literal(out, end, "fcntl");
@@ -999,6 +1015,16 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
         return lpr_linux_pipe2(a0, a1);
     case LPR_LINUX_SYS_DUP:
         return lpr_linux_dup(a0, 0, 0);
+    case LPR_LINUX_SYS_CLONE:
+        return lpr_linux_clone(a0, a1, a2, a3, a4);
+    case LPR_LINUX_SYS_FORK:
+        return lpr_linux_fork();
+    case LPR_LINUX_SYS_VFORK:
+        return lpr_linux_vfork();
+    case LPR_LINUX_SYS_EXECVE:
+        return lpr_linux_execve(a0, a1, a2);
+    case LPR_LINUX_SYS_WAIT4:
+        return lpr_linux_wait4(a0, a1, a2, a3);
     case LPR_LINUX_SYS_DUP3:
         return -LPR_LINUX_ENOTSUP;
     case LPR_LINUX_SYS_READLINK:
@@ -1057,6 +1083,19 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
                              uint64_t a3,
                              uint64_t a4,
                              uint64_t a5) {
+    return lpr_dispatch_syscall_frame(0, nr, a0, a1, a2, a3, a4, a5);
+}
+
+int64_t lpr_dispatch_syscall_frame(const struct lpr_linux_user_frame *frame,
+                                   uint64_t nr,
+                                   uint64_t a0,
+                                   uint64_t a1,
+                                   uint64_t a2,
+                                   uint64_t a3,
+                                   uint64_t a4,
+                                   uint64_t a5) {
+    const struct lpr_linux_user_frame *saved_frame = lpr_active_user_frame;
+    lpr_active_user_frame = frame;
 #if LPR_TRACE_SYSCALL_METRICS
     if (nr == LPR_LINUX_SYS_EXIT || nr == LPR_LINUX_SYS_EXIT_GROUP) {
         lpr_trace_syscall_record(nr, 0, 0);
@@ -1076,6 +1115,7 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
         lpr_trace_slow_syscall(nr, a0, a1, a2, a3, a4, a5, result, cycles);
     }
 #endif
+    lpr_active_user_frame = saved_frame;
     return result;
 #else
     const int64_t result = lpr_dispatch_syscall_inner(nr, a0, a1, a2, a3, a4, a5);
@@ -1084,6 +1124,7 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
         lpr_trace_enosys_syscall(nr, a0, a1, a2, a3, a4, a5);
     }
 #endif
+    lpr_active_user_frame = saved_frame;
     return result;
 #endif
 }

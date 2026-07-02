@@ -197,6 +197,64 @@ pub fn resetUserAddressSpaceStorage(space: *UserAddressSpace) void {
     resetUserReservations(space);
 }
 
+fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
+    const h = hooks orelse return false;
+    @memset(space.pml4[0..], 0);
+    h.seed_user_pml4_with_kernel(space.pml4[0..]);
+    var pdp_slot_init: usize = 0;
+    while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
+        space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
+        @memset(space.pdp_pages[pdp_slot_init][0..], 0);
+    }
+    var pd_slot_init: usize = 0;
+    while (pd_slot_init < UserAddressSpace.max_dynamic_pd_pages) : (pd_slot_init += 1) {
+        space.pd_page_pml4_index[pd_slot_init] = UserAddressSpace.no_pd_index;
+        space.pd_page_pdp_index[pd_slot_init] = UserAddressSpace.no_pd_index;
+        @memset(space.pd_pages[pd_slot_init][0..], 0);
+    }
+    var pt_slot_init: usize = 0;
+    while (pt_slot_init < UserAddressSpace.max_dynamic_pt_pages) : (pt_slot_init += 1) {
+        space.pt_page_pml4_index[pt_slot_init] = UserAddressSpace.no_pd_index;
+        space.pt_page_pdp_index[pt_slot_init] = UserAddressSpace.no_pd_index;
+        space.pt_page_pd_index[pt_slot_init] = UserAddressSpace.no_pd_index;
+        @memset(space.pt_pages[pt_slot_init][0..], 0);
+    }
+    space.pdp_page_used_len = 0;
+    space.pd_page_used_len = 0;
+    space.pt_page_used_len = 0;
+    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
+    if (user_pml4_pa >= h.four_gib) return false;
+    _ = ensureUserPdpSlotForPml4(space, 0) orelse return false;
+    space.cr3 = user_pml4_pa;
+    return true;
+}
+
+pub fn cloneAddressSpaceMetadataForFork(from: kernel.PrincipalId, to: kernel.PrincipalId) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
+    const source = getUserSpace(from) orelse return false;
+    const dest = getUserSpace(to) orelse return false;
+    dest.reservations = source.reservations;
+    dest.reservation_generation = source.reservation_generation;
+    dest.next_dynamic_map_page = source.next_dynamic_map_page;
+    if (!resetUserPageTablesPreserveReservations(dest)) return false;
+    return true;
+}
+
+pub fn presentUserPagePaddr(principal: kernel.PrincipalId, va: u64) ?u64 {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
+    const h = hooks orelse return null;
+    const space = getUserSpace(principal) orelse return null;
+    if ((va & 0xFFF) != 0) return null;
+    const index = userPageIndexForVa(h, va) orelse return null;
+    const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
+    const pt_page: *const [512]u64 = &space.pt_pages[pt_slot];
+    const entry = pt_page[index.pt];
+    if ((entry & h.page_present) == 0 or (entry & h.page_user) == 0) return null;
+    return ptePaddr(entry);
+}
+
 fn reservationEndPage(base_va: u64, page_count: u64) ?u64 {
     if (page_count == 0) return null;
     if ((base_va & 0xFFF) != 0) return null;
@@ -818,6 +876,17 @@ pub fn mapTrustedLowPageZeroPaddrsWithProt(
     if (va_start != 0 or paddrs.len != 1) return false;
     if (!prot.read or prot.write or !prot.exec) return false;
     return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, true, true);
+}
+
+pub fn mapLazyLowPageZeroPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    if (va_start != 0 or paddrs.len != 1) return false;
+    if (!prot.read or prot.write or !prot.exec) return false;
+    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, false, true);
 }
 
 pub fn mapLazyUserPaddrsWithProt(

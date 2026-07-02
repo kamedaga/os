@@ -137,6 +137,7 @@ int pacha_ipc_call(int fd, const struct pacha_ipc_msg *msg);
 int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg);
 
 int pacha_process_create(uint64_t rights, uint32_t flags);
+int pacha_process_clone(uint64_t rights, uint32_t flags);
 int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights);
 int pacha_thread_start(int thread_fd);
 int pacha_thread_set_gs_base(uint64_t gs_base);

@@ -2,6 +2,7 @@
 #include <personality/linux_lpr.h>
 
 #define LPR_X86_NOP 0x90u
+#define LPR_X86_POP_RCX 0x59u
 #define LPR_X86_MOVABS_R11_0 0x49u
 #define LPR_X86_MOVABS_R11_1 0xbbu
 #define LPR_X86_JMP_R11_0 0x41u
@@ -18,14 +19,15 @@ int64_t lpr_build_zpoline_page(uint8_t *page, uint64_t handler_va) {
     }
 
     uint8_t *common = page + LPR_ZPOLINE_SHIM_OFFSET;
-    common[0] = LPR_X86_MOVABS_R11_0;
-    common[1] = LPR_X86_MOVABS_R11_1;
+    common[0] = LPR_X86_POP_RCX;
+    common[1] = LPR_X86_MOVABS_R11_0;
+    common[2] = LPR_X86_MOVABS_R11_1;
     for (uint32_t i = 0; i < 8; i++) {
-        common[2 + i] = (uint8_t)((handler_va >> (i * 8)) & 0xffu);
+        common[3 + i] = (uint8_t)((handler_va >> (i * 8)) & 0xffu);
     }
-    common[10] = LPR_X86_JMP_R11_0;
-    common[11] = LPR_X86_JMP_R11_1;
-    common[12] = LPR_X86_JMP_R11_2;
+    common[11] = LPR_X86_JMP_R11_0;
+    common[12] = LPR_X86_JMP_R11_1;
+    common[13] = LPR_X86_JMP_R11_2;
     return PERSONALITY_STATUS_OK;
 }
 

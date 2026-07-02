@@ -560,12 +560,21 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     }
     if (h.state.ensureNativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {
         var paddrs = [_]u64{mapping.paddr};
-        if (user_vm.mapLazyUserPaddrsWithProt(
-            principal,
-            fault_page_va,
-            paddrs[0..],
-            mapping.prot,
-        )) return 1;
+        const mapped = if (fault_page_va == 0 and mapping.prot.read and !mapping.prot.write and mapping.prot.exec)
+            user_vm.mapLazyLowPageZeroPaddrsWithProt(
+                principal,
+                fault_page_va,
+                paddrs[0..],
+                mapping.prot,
+            )
+        else
+            user_vm.mapLazyUserPaddrsWithProt(
+                principal,
+                fault_page_va,
+                paddrs[0..],
+                mapping.prot,
+            );
+        if (mapped) return 1;
     }
     return 0;
 }

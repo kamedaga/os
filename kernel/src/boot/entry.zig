@@ -704,10 +704,15 @@ const DetectedDevices = struct {
 
 pub fn initializeLimineRuntimeOrHalt() void {
     initKernelRuntimeOrHalt();
+    kernel_log.write("boot: scheduler static\n");
     scheduler.initializeStaticStorage();
+    kernel_log.write("boot: idle hooks\n");
     scheduler.installIdleHooks();
+    kernel_log.write("boot: bootstrap cpu ready\n");
     smp.markBootstrapCpuReady();
+    kernel_log.write("boot: topology\n");
     scheduler.refreshTopology();
+    kernel_log.write("boot: limine runtime done\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -882,12 +887,18 @@ pub fn prepareBootPrelude() void {
 }
 
 pub fn bootWithResources(resources: BootResources) noreturn {
+    kernel_log.writeOnly("boot: bootWithResources entry\n");
+    kernel_log.write("boot: init subsystems\n");
     const state = initKernelSubsystems(resources.memory_stats);
+    kernel_log.write("boot: discover devices\n");
     var devices = discoverDevices();
+    kernel_log.write("boot: construct processes\n");
     constructBootProcesses(state, resources, &devices);
+    kernel_log.write("boot: wire runtime\n");
     wireRuntimeSubsystems(state, resources.memory_stats);
 
     const boot_ctx = scheduler.threadContext(scheduler.currentThread()).?;
+    kernel_log.write("boot: enter user\n");
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
 }
 

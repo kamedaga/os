@@ -49,6 +49,10 @@ int pacha_process_create(uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_PROCESS_SYSCALL_CREATE, 0, rights, flags));
 }
 
+int pacha_process_clone(uint64_t rights, uint32_t flags) {
+    return pacha_fd_result_to_int(pacha_syscall2(PACHA_PROCESS_SYSCALL_CLONE, rights, flags));
+}
+
 int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights) {
     return pacha_fd_result_to_int(pacha_syscall6(
         PACHA_THREAD_SYSCALL_CREATE,

@@ -37,7 +37,7 @@ int main(void) {
     if (expect(common == LPR_ZPOLINE_SHIM_OFFSET)) return 1;
     if (expect(page[0] == 0x90 && page[LPR_ZPOLINE_SHIM_OFFSET - 1] == 0x90)) return 1;
     if (expect(LPR_ZPOLINE_DIRECT_LIMIT == 512)) return 1;
-    if (expect(page[common + 0] == 0x49 && page[common + 1] == 0xbb)) return 1;
-    if (expect(page[common + 10] == 0x41 && page[common + 11] == 0xff && page[common + 12] == 0xe3)) return 1;
+    if (expect(page[common + 0] == 0x59 && page[common + 1] == 0x49 && page[common + 2] == 0xbb)) return 1;
+    if (expect(page[common + 11] == 0x41 && page[common + 12] == 0xff && page[common + 13] == 0xe3)) return 1;
     return 0;
 }

@@ -732,7 +732,6 @@ static int ext4_file_read_alloc(
         if (has_gs) {
             kb_shim_leave_kernel_gs(old_gs);
         }
-
         if (result < 0 && total > 0) {
             break;
         }
@@ -1688,6 +1687,7 @@ static int launch_seed0root_from_ext4(
         fprintf(stderr, "[storage_boot] seed0root: lookup /sbin failed status=%d\n", status);
         return 22;
     }
+    fprintf(stderr, "[storage_boot] seed0root: lookup /sbin ok dentry=%p inode=%p\n", sbin_dentry, sbin_inode);
 
     void *seed_inode = NULL;
     void *seed_dentry = NULL;
@@ -1706,7 +1706,10 @@ static int launch_seed0root_from_ext4(
             status);
         return 23;
     }
+    fprintf(stderr, "[storage_boot] seed0root: lookup seed ok dentry=%p inode=%p\n", seed_dentry, seed_inode);
+    fprintf(stderr, "[storage_boot] seed0root: free seed dentry\n");
     free(seed_dentry);
+    fprintf(stderr, "[storage_boot] seed0root: free seed dentry done\n");
 
     void *koboxd_inode = NULL;
     void *koboxd_dentry = NULL;
@@ -1718,14 +1721,19 @@ static int launch_seed0root_from_ext4(
         "koboxd.elf",
         &koboxd_inode,
         &koboxd_dentry);
+    fprintf(stderr, "[storage_boot] seed0root: free sbin dentry\n");
     free(sbin_dentry);
+    fprintf(stderr, "[storage_boot] seed0root: free sbin dentry done\n");
     if (status != 0) {
         fprintf(stderr, "[storage_boot] seed0root: lookup %s failed status=%d\n",
             storage_boot_koboxd_file,
             status);
         return 27;
     }
+    fprintf(stderr, "[storage_boot] seed0root: lookup koboxd ok dentry=%p inode=%p\n", koboxd_dentry, koboxd_inode);
+    fprintf(stderr, "[storage_boot] seed0root: free koboxd dentry\n");
     free(koboxd_dentry);
+    fprintf(stderr, "[storage_boot] seed0root: free koboxd dentry done\n");
 
     unsigned char *image = NULL;
     uint64_t image_size = 0;

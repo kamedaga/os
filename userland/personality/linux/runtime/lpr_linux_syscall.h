@@ -27,9 +27,32 @@ struct lpr_linux_syscall_info {
     enum lpr_linux_syscall_backend backend;
 };
 
+struct lpr_linux_user_frame {
+    uint64_t r15;
+    uint64_t r14;
+    uint64_t r13;
+    uint64_t r12;
+    uint64_t rbp;
+    uint64_t rbx;
+    uint64_t r11;
+    uint64_t r10;
+    uint64_t r9;
+    uint64_t r8;
+    uint64_t rdi;
+    uint64_t rsi;
+    uint64_t rdx;
+    uint64_t rcx;
+    uint64_t rax;
+    uint64_t rip;
+    uint64_t rsp;
+    uint64_t rflags;
+};
+
 const struct lpr_linux_syscall_info *lpr_linux_syscall_lookup(uint64_t nr);
 const char *lpr_linux_syscall_class_name(enum lpr_linux_syscall_class cls);
 const char *lpr_linux_syscall_backend_name(enum lpr_linux_syscall_backend backend);
+
+const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void);
 
 int64_t lpr_dispatch_syscall(uint64_t nr,
                              uint64_t a0,
@@ -38,5 +61,13 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
                              uint64_t a3,
                              uint64_t a4,
                              uint64_t a5);
+int64_t lpr_dispatch_syscall_frame(const struct lpr_linux_user_frame *frame,
+                                   uint64_t nr,
+                                   uint64_t a0,
+                                   uint64_t a1,
+                                   uint64_t a2,
+                                   uint64_t a3,
+                                   uint64_t a4,
+                                   uint64_t a5);
 
 #endif

@@ -200,12 +200,13 @@ static int build_zpoline_page(unsigned char *page, uint64_t handler_va)
         return -22;
     }
     memset(page, 0x90, LPR_ZPOLINE_PAGE_SIZE);
-    page[LPR_ZPOLINE_SHIM_OFFSET + 0] = 0x49;
-    page[LPR_ZPOLINE_SHIM_OFFSET + 1] = 0xbb;
-    lpr_exec_wr64(page + LPR_ZPOLINE_SHIM_OFFSET + 2, handler_va);
-    page[LPR_ZPOLINE_SHIM_OFFSET + 10] = 0x41;
-    page[LPR_ZPOLINE_SHIM_OFFSET + 11] = 0xff;
-    page[LPR_ZPOLINE_SHIM_OFFSET + 12] = 0xe3;
+    page[LPR_ZPOLINE_SHIM_OFFSET + 0] = 0x59;
+    page[LPR_ZPOLINE_SHIM_OFFSET + 1] = 0x49;
+    page[LPR_ZPOLINE_SHIM_OFFSET + 2] = 0xbb;
+    lpr_exec_wr64(page + LPR_ZPOLINE_SHIM_OFFSET + 3, handler_va);
+    page[LPR_ZPOLINE_SHIM_OFFSET + 11] = 0x41;
+    page[LPR_ZPOLINE_SHIM_OFFSET + 12] = 0xff;
+    page[LPR_ZPOLINE_SHIM_OFFSET + 13] = 0xe3;
     return 0;
 }
 

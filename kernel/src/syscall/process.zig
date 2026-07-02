@@ -16,6 +16,31 @@ const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_process_map_batch_entries: usize = @intCast(process_abi.process_map_batch_max_entries);
 const process_map_batch_entry_size: usize = @intCast(process_abi.process_map_batch_entry_size);
 
+const ProcessCloneUserFrame = extern struct {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rax: u64,
+    rip: u64,
+    rsp: u64,
+    rflags: u64,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ProcessCloneUserFrame) == process_abi.process_clone_user_frame_size);
+}
+
 fn protFromBits(bits: u64) ?kernel.VmaProt {
     if ((bits & ~(vm_abi.prot_read | vm_abi.prot_write | vm_abi.prot_exec)) != 0) return null;
     return .{
@@ -42,6 +67,62 @@ fn buildUserTrapFrame(entry_rip: u64, stack_rsp: u64) TrapFrame {
     frame.rsp = stack_rsp;
     frame.ss = @as(u64, boot_static.gdt_user_data_selector) | 0x3;
     return frame;
+}
+
+fn cloneUserFrameFromVa(h: anytype, proc: kernel.PrincipalId, frame_va: u64, syscall_frame: *const TrapFrame) ?TrapFrame {
+    if (frame_va == 0 or !user_vm.isUserCanonicalVa(frame_va)) return null;
+    var user_frame: ProcessCloneUserFrame = undefined;
+    const bytes = std.mem.asBytes(&user_frame);
+    if (!h.copy_user_bytes_from_va(proc, frame_va, bytes)) return null;
+    if (!isUserEntryVa(user_frame.rip) or !isUserEntryVa(user_frame.rsp)) return null;
+
+    var child = syscall_frame.*;
+    child.r15 = user_frame.r15;
+    child.r14 = user_frame.r14;
+    child.r13 = user_frame.r13;
+    child.r12 = user_frame.r12;
+    child.rbp = user_frame.rbp;
+    child.rbx = user_frame.rbx;
+    child.r11 = user_frame.r11;
+    child.r10 = user_frame.r10;
+    child.r9 = user_frame.r9;
+    child.r8 = user_frame.r8;
+    child.rdi = user_frame.rdi;
+    child.rsi = user_frame.rsi;
+    child.rdx = user_frame.rdx;
+    child.rcx = user_frame.rcx;
+    child.rax = 0;
+    child.rip = user_frame.rip;
+    child.rsp = user_frame.rsp;
+    child.rflags = (user_frame.rflags & 0x0000000000200ed5) | 0x2;
+    child.cs = @as(u64, boot_static.gdt_user_code_selector) | 0x3;
+    child.ss = @as(u64, boot_static.gdt_user_data_selector) | 0x3;
+    return child;
+}
+
+fn copyForkAnonymousPresentPages(state: *kernel.KernelState, from: kernel.PrincipalId, to: kernel.PrincipalId, free_list: *kernel.FreePageList) u64 {
+    const source_table = state.getVmaTable(from) orelse return sc.syscall_err_invalid;
+    var copied_pages: u64 = 0;
+    var scanned_vmas: u64 = 0;
+    var active_index: usize = 0;
+    while (active_index < source_table.active_count) : (active_index += 1) {
+        const entry_index: usize = @intCast(source_table.active_indices[active_index]);
+        const source_entry = &source_table.entries[entry_index];
+        if (!source_entry.active) continue;
+        if (!source_entry.flags.fork_cow) continue;
+        scanned_vmas += 1;
+        var va = source_entry.start_va;
+        while (va < source_entry.endVa()) : (va += kernel.native_page_size) {
+            const src_paddr = user_vm.presentUserPagePaddr(from, va) orelse continue;
+            state.copyForkAnonymousPresentPageToChild(to, entry_index, va, src_paddr, free_list) catch |err| return switch (err) {
+                kernel.KernelError.OutOfFreePages, kernel.KernelError.TableFull => sc.syscall_err_alloc,
+                else => sc.syscall_err_invalid,
+            };
+            copied_pages += 1;
+        }
+    }
+    kernel_log.writeFmt("[process.clone] fork anon copy vmas={} pages={}\n", .{ scanned_vmas, copied_pages });
+    return sc.syscall_ok;
 }
 
 fn stateWord(state: kernel.TaskObjectState) u64 {
@@ -165,6 +246,66 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             else => sc.syscall_err_invalid,
         };
     };
+}
+
+fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    const rights = kernel.fdRightsFromBits(frame.rdi);
+    if ((frame.rsi & ~process_abi.process_clone_known_flags_mask) != 0) return sc.syscall_err_invalid;
+    if ((frame.rsi & process_abi.process_clone_flag_current_thread) == 0) return sc.syscall_err_invalid;
+
+    const child = state.createProcessDescriptorWithCapacity("fd-process-clone", h.free_list) orelse return sc.syscall_err_alloc;
+    var child_active = true;
+    defer if (child_active) {
+        if (kernel.processIndexFromPrincipal(child)) |child_index| {
+            state.releasePrincipalNativeMemory(child, h.free_list);
+            state.resetProcessRuntimeTables(child_index);
+        }
+        user_vm.lockAddressSpaces();
+        user_vm.clearUserAddressSpace(child);
+        user_vm.unlockAddressSpaces();
+        _ = state.removeProcessDescriptor(child);
+    };
+
+    if (!user_vm.buildEmptyUserAddressSpace(child)) return sc.syscall_err_map;
+    state.cloneFdTableForFork(proc, child) catch |err| return switch (err) {
+        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        else => sc.syscall_err_invalid,
+    };
+    state.cloneVmaTableForFork(proc, child) catch |err| return switch (err) {
+        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        else => sc.syscall_err_invalid,
+    };
+    const copy_status = copyForkAnonymousPresentPages(state, proc, child, h.free_list);
+    if (copy_status != sc.syscall_ok) return copy_status;
+    if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) return sc.syscall_err_map;
+
+    const child_frame = if ((frame.rsi & process_abi.process_clone_flag_user_frame) != 0)
+        cloneUserFrameFromVa(h, proc, frame.rdx, frame) orelse return sc.syscall_err_invalid
+    else blk: {
+        var copied = frame.*;
+        copied.rax = 0;
+        break :blk copied;
+    };
+    const thread_index = scheduler.allocateReadyThread(child, h.user_spaces, child_frame, h.free_list) orelse return sc.syscall_err_alloc;
+    if (!scheduler.setFsBase(thread_index, scheduler.currentFsBase())) {
+        _ = scheduler.releaseThread(thread_index);
+        return sc.syscall_err_invalid;
+    }
+    if (!scheduler.setThreadGsBase(thread_index, scheduler.currentGsBase())) {
+        _ = scheduler.releaseThread(thread_index);
+        return sc.syscall_err_invalid;
+    }
+
+    const process_fd = state.createProcessFd(proc, .{
+        .principal_raw = @intFromEnum(child),
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, first_dynamic_fd) catch |err| switch (err) {
+        kernel.KernelError.TableFull => return sc.syscall_err_alloc,
+        else => return sc.syscall_err_invalid,
+    };
+    child_active = false;
+    return process_fd;
 }
 
 fn startThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) u64 {
@@ -512,6 +653,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             if (!scheduler.setCurrentGsBase(gs_base)) break :blk sc.syscall_err_not_ready;
             break :blk sc.syscall_ok;
         },
+        sc.syscall_process_clone => cloneCurrentProcessForFork(h, state, proc, frame),
         sc.syscall_process_map => mapIntoProcess(state, proc, h.free_list, frame),
         sc.syscall_process_map_batch => mapBatchIntoProcess(h, state, proc, h.free_list, frame),
         else => null,

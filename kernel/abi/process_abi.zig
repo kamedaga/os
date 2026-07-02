@@ -12,13 +12,39 @@ pub const syscall_thread_wait: u64 = 9;
 pub const syscall_thread_exit: u64 = 10;
 pub const syscall_thread_set_fs_base: u64 = 11;
 pub const syscall_thread_set_gs_base: u64 = 12;
-pub const syscall_process_map: u64 = 13;
-pub const syscall_process_map_batch: u64 = 14;
+pub const syscall_process_clone: u64 = 13;
+pub const syscall_process_map: u64 = 14;
+pub const syscall_process_map_batch: u64 = 15;
 pub const syscall_process_last: u64 = syscall_process_map_batch;
 pub const syscall_process_count: u64 = syscall_process_last - syscall_process_first + 1;
 
 pub const process_flag_none: u64 = 0;
 pub const process_known_flags_mask: u64 = process_flag_none;
+
+pub const process_clone_flag_none: u64 = 0;
+pub const process_clone_flag_current_thread: u64 = 1 << 0;
+pub const process_clone_flag_user_frame: u64 = 1 << 1;
+pub const process_clone_known_flags_mask: u64 = process_clone_flag_current_thread | process_clone_flag_user_frame;
+
+pub const process_clone_user_frame_size: u64 = 18 * 8;
+pub const process_clone_user_frame_r15_offset: u64 = 0 * 8;
+pub const process_clone_user_frame_r14_offset: u64 = 1 * 8;
+pub const process_clone_user_frame_r13_offset: u64 = 2 * 8;
+pub const process_clone_user_frame_r12_offset: u64 = 3 * 8;
+pub const process_clone_user_frame_rbp_offset: u64 = 4 * 8;
+pub const process_clone_user_frame_rbx_offset: u64 = 5 * 8;
+pub const process_clone_user_frame_r11_offset: u64 = 6 * 8;
+pub const process_clone_user_frame_r10_offset: u64 = 7 * 8;
+pub const process_clone_user_frame_r9_offset: u64 = 8 * 8;
+pub const process_clone_user_frame_r8_offset: u64 = 9 * 8;
+pub const process_clone_user_frame_rdi_offset: u64 = 10 * 8;
+pub const process_clone_user_frame_rsi_offset: u64 = 11 * 8;
+pub const process_clone_user_frame_rdx_offset: u64 = 12 * 8;
+pub const process_clone_user_frame_rcx_offset: u64 = 13 * 8;
+pub const process_clone_user_frame_rax_offset: u64 = 14 * 8;
+pub const process_clone_user_frame_rip_offset: u64 = 15 * 8;
+pub const process_clone_user_frame_rsp_offset: u64 = 16 * 8;
+pub const process_clone_user_frame_rflags_offset: u64 = 17 * 8;
 
 pub const thread_flag_none: u64 = 0;
 pub const thread_known_flags_mask: u64 = thread_flag_none;
