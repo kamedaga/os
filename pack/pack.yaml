@@ -407,7 +407,7 @@ apps:
       input:
         - "tools/copy_lpr_linux_musl.sh"
     out: "LPRMUSL.SO"
-    rootfs: ["/lib/linux/libc.so", "/lib/linux/ld-musl-x86_64.so.1"]
+    rootfs: ["/lib/linux/libc.so", "/lib/linux/ld-musl-x86_64.so.1", "/lib/libc.musl-x86_64.so.1"]
   lpr_ldmusl_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_ldmusl_smoke.elf"
@@ -424,6 +424,18 @@ apps:
       input:
         - "pack/scripts/download_lpr_busybox_dynamic.sh"
     out: "LPRBBROOT"
+    rootfs: "/"
+  lpr_dyn_needed_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-dyn-needed-root"
+      rebuild: ["bash", "pack/scripts/build_lpr_dyn_needed.sh", ".artifacts/userland-fixtures/lpr-dyn-needed-root"]
+      input:
+        - "pack/scripts/build_lpr_dyn_needed.sh"
+        - "userland/fixtures/linux/lpr_dyn_needed_lib.c"
+        - "userland/fixtures/linux/lpr_dyn_needed_main.c"
+        - "tools/build_lpr_lua_launcher.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+    out: "LPRDYNROOT"
     rootfs: "/"
   linux_abi_probe:
     file:
@@ -532,16 +544,23 @@ apps:
         - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "LIBCALOC.ELF"
     rootfs: "/cmd/libc_alloc_probe.elf"
+  lua_runtime:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-lua-dynamic-root"
+      rebuild: ["bash", "pack/scripts/download_lpr_lua_dynamic.sh", ".artifacts/userland-fixtures/lpr-lua-dynamic-root"]
+      input:
+        - "pack/scripts/download_lpr_lua_dynamic.sh"
+    out: "LUALINUX"
+    rootfs: "/"
   lua_cli:
     file:
-      path: ".artifacts/musl-pachaos/lua.elf"
-      rebuild: ["bash", "tools/build_pachaos_lua.sh", ".artifacts/musl-pachaos/lua.elf"]
+      path: ".artifacts/userland-fixtures/lpr_lua_launcher.elf"
+      rebuild: ["bash", "tools/build_lpr_lua_launcher.sh", ".artifacts/userland-fixtures/lpr_lua_launcher.elf"]
       input:
-        - "tools/build_pachaos_lua.sh"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/pachaos/cli/pachaos_cli_shim.c"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
-    out: "LUA.ELF"
+        - "tools/build_lpr_lua_launcher.sh"
+        - "userland/fixtures/linux/lpr_lua_launcher.c"
+        - "pack/scripts/download_lpr_lua_dynamic.sh"
+    out: "LUALAUNC.ELF"
     rootfs: "/cmd/lua.elf"
   lua_cli_workload:
     file: "musl/pachaos/smoke/lua_workload.lua"

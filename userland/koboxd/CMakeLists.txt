@@ -26,6 +26,7 @@ set(KOBOXD_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/filed/src/runtime.c
   ${REPO_ROOT}/userland/filed/src/tmpfs_backend.c
   ${REPO_ROOT}/userland/filed/src/vfs.c
+  ${REPO_ROOT}/userland/personality/linux/hde/hde64.c
   ${REPO_ROOT}/_kobox/src/device/device_backend.c
   ${REPO_ROOT}/_kobox/src/device/pachaos_capsule/device_pachaos_capsule.c
   ${REPO_ROOT}/_kobox/src/host_interface/interface.c
@@ -102,7 +103,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOXD_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/hde ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${KOBOXD_ELF}"
   DEPENDS
@@ -136,6 +137,9 @@ add_custom_command(
     "${REPO_ROOT}/userland/filed/src/runtime.c"
     "${REPO_ROOT}/userland/filed/src/tmpfs_backend.c"
     "${REPO_ROOT}/userland/filed/src/vfs.c"
+    "${REPO_ROOT}/userland/personality/linux/hde/hde64.c"
+    "${REPO_ROOT}/userland/personality/linux/hde/hde64.h"
+    "${REPO_ROOT}/userland/personality/linux/hde/table64.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c"

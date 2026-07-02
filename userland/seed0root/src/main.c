@@ -50,6 +50,8 @@ enum {
     SEED0ROOT_BOOT_PROFILE_BENCH = 1u << 1,
     SEED0ROOT_BOOT_PROFILE_FS_WRITE = 1u << 2,
     SEED0ROOT_BOOT_PROFILE_LPR = 1u << 3,
+    SEED0ROOT_BOOT_PROFILE_LUA = 1u << 4,
+    SEED0ROOT_BOOT_PROFILE_DYN_NEEDED = 1u << 5,
 };
 
 struct seed0root_bootstrap_module {
@@ -980,6 +982,12 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
     if (seed0root_profile_has_token(profile, "lpr")) {
         flags |= SEED0ROOT_BOOT_PROFILE_LPR;
     }
+    if (seed0root_profile_has_token(profile, "lua")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_LUA;
+    }
+    if (seed0root_profile_has_token(profile, "dyn-needed")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_DYN_NEEDED;
+    }
     printf("[seed0root] boot profile flags=%u\n", flags);
     return flags;
 }
@@ -1514,7 +1522,22 @@ static int seed0root_run_lua_cli_bench(int filed_endpoint_fd)
         2,
         "PACHA_LUA_CLI_BENCH=1",
         "lua cli bench",
-        0);
+        FILED_WIRE_EXEC_LINUX_LPR);
+}
+
+static int seed0root_run_lpr_dyn_needed_smoke(int filed_endpoint_fd)
+{
+    const char *argv[] = {
+        "/cmd/lpr_dyn_needed.elf",
+    };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/lpr_dyn_needed.elf",
+        argv,
+        1,
+        "LD_LIBRARY_PATH=/lib:/lib/linux:/usr/lib",
+        "lpr dyn needed smoke",
+        FILED_WIRE_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
@@ -1591,7 +1614,12 @@ static int seed0root_connect_storage_services(int control_fd)
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_libc_mix_bench(filed_endpoint_fd);
     }
-    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_DYN_NEEDED) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_lpr_dyn_needed_smoke(filed_endpoint_fd);
+    }
+    if ((boot_profile & (SEED0ROOT_BOOT_PROFILE_BENCH | SEED0ROOT_BOOT_PROFILE_LUA)) != 0 &&
+        status == 0 &&
+        filed_endpoint_fd >= 16) {
         status = seed0root_run_lua_cli_bench(filed_endpoint_fd);
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
@@ -1601,12 +1629,16 @@ static int seed0root_connect_storage_services(int control_fd)
         boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
                         SEED0ROOT_BOOT_PROFILE_MEMORY |
                         SEED0ROOT_BOOT_PROFILE_BENCH |
-                        SEED0ROOT_BOOT_PROFILE_LPR);
+                        SEED0ROOT_BOOT_PROFILE_LPR |
+                        SEED0ROOT_BOOT_PROFILE_LUA |
+                        SEED0ROOT_BOOT_PROFILE_DYN_NEEDED);
     const unsigned sync_profile =
         boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
                         SEED0ROOT_BOOT_PROFILE_MEMORY |
                         SEED0ROOT_BOOT_PROFILE_BENCH |
-                        SEED0ROOT_BOOT_PROFILE_LPR);
+                        SEED0ROOT_BOOT_PROFILE_LPR |
+                        SEED0ROOT_BOOT_PROFILE_LUA |
+                        SEED0ROOT_BOOT_PROFILE_DYN_NEEDED);
     if (metrics_profile != 0 && status == 0 && filed_endpoint_fd >= 16) {
         const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
         printf("[seed0root] filed metrics dump status=%d\n", metrics_status);

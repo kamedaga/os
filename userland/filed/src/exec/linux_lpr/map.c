@@ -401,6 +401,8 @@ typedef struct lpr_exec_file_map_segment_plan {
     uint64_t target_va;
     uint64_t page_offset;
     uint64_t map_size;
+    uint64_t patch_file_offset;
+    uint64_t patch_file_size;
     uint64_t prot;
     int patch_text;
     int cached_vmo_fd;
@@ -461,6 +463,62 @@ typedef struct lpr_exec_memory_span_vmo_cache_slot {
 static lpr_exec_memory_span_vmo_cache_slot_t lpr_exec_memory_span_vmo_cache[LPR_EXEC_MEMORY_SPAN_VMO_CACHE_SLOTS];
 static uint64_t lpr_exec_memory_span_vmo_cache_clock;
 static uint64_t lpr_exec_memory_span_vmo_cache_bytes;
+
+static int lpr_exec_text_file_intersection(
+    uint64_t segment_file_offset,
+    uint64_t segment_file_size,
+    uint64_t text_offset,
+    uint64_t text_size,
+    uint64_t *out_offset,
+    uint64_t *out_size)
+{
+    if (out_offset == NULL || out_size == NULL) {
+        return 0;
+    }
+    *out_offset = 0;
+    *out_size = 0;
+    if (segment_file_size == 0 || text_size == 0 ||
+        segment_file_offset > UINT64_MAX - segment_file_size ||
+        text_offset > UINT64_MAX - text_size)
+    {
+        return 0;
+    }
+    const uint64_t segment_end = segment_file_offset + segment_file_size;
+    const uint64_t text_end = text_offset + text_size;
+    const uint64_t start = segment_file_offset > text_offset ? segment_file_offset : text_offset;
+    const uint64_t end = segment_end < text_end ? segment_end : text_end;
+    if (start >= end) {
+        return 0;
+    }
+    *out_offset = start;
+    *out_size = end - start;
+    return 1;
+}
+
+static void lpr_exec_patch_segment_text_range(
+    unsigned char *mapped,
+    uint64_t map_size,
+    uint64_t segment_file_offset,
+    uint64_t page_offset,
+    uint64_t patch_file_offset,
+    uint64_t patch_file_size)
+{
+    if (mapped == NULL || patch_file_size == 0 || patch_file_offset < segment_file_offset) {
+        return;
+    }
+    const uint64_t file_delta = patch_file_offset - segment_file_offset;
+    if (page_offset > map_size || file_delta > map_size - page_offset) {
+        return;
+    }
+    const uint64_t mapped_offset = page_offset + file_delta;
+    if (patch_file_size > map_size - mapped_offset) {
+        return;
+    }
+    const uint64_t patched = lpr_exec_patch_syscalls(mapped + mapped_offset, patch_file_size);
+    if (patched != 0) {
+        lpr_exec_map_metric_count("patch_syscalls", patched);
+    }
+}
 
 static void lpr_exec_memory_span_vmo_cache_clear_slot(lpr_exec_memory_span_vmo_cache_slot_t *slot);
 static int phdr_va_from_phdrs(
@@ -928,6 +986,19 @@ static int build_file_map_plan(
             }
         }
 
+        uint64_t patch_file_offset = 0;
+        uint64_t patch_file_size = 0;
+        const int patch_segment_text =
+            patch_text &&
+            (p_flags & LPR_EXEC_PF_X) != 0 &&
+            lpr_exec_text_file_intersection(
+                p_offset,
+                p_filesz,
+                meta->text_offset,
+                meta->text_size,
+                &patch_file_offset,
+                &patch_file_size);
+
         plan->segments[plan->segment_count++] = (lpr_exec_file_map_segment_plan_t){
             .file_offset = p_offset,
             .file_size = p_filesz,
@@ -935,8 +1006,10 @@ static int build_file_map_plan(
             .target_va = target_va,
             .page_offset = page_offset,
             .map_size = map_size,
+            .patch_file_offset = patch_file_offset,
+            .patch_file_size = patch_file_size,
             .prot = lpr_exec_prot_from_elf_flags(p_flags),
-            .patch_text = patch_text && (p_flags & LPR_EXEC_PF_X) != 0,
+            .patch_text = patch_segment_text,
             .cached_vmo_fd = -1,
         };
         plan->load_segments++;
@@ -1075,9 +1148,12 @@ int lpr_exec_pending_map_batch_commit(int process_fd, lpr_exec_pending_map_batch
 static int create_segment_vmo_from_bytes(
     const unsigned char *bytes,
     uint64_t bytes_size,
+    uint64_t file_offset,
     uint64_t page_offset,
     uint64_t map_size,
     int patch_text,
+    uint64_t patch_file_offset,
+    uint64_t patch_file_size,
     int *out_vmo_fd)
 {
     if ((bytes == NULL && bytes_size != 0) ||
@@ -1096,11 +1172,18 @@ static int create_segment_vmo_from_bytes(
     if (status != 0) {
         return status;
     }
+    memset(mapped, 0, (size_t)map_size);
     if (bytes_size != 0) {
         memcpy(mapped + page_offset, bytes, (size_t)bytes_size);
     }
     if (patch_text) {
-        lpr_exec_patch_syscalls(mapped, map_size);
+        lpr_exec_patch_segment_text_range(
+            mapped,
+            map_size,
+            file_offset,
+            page_offset,
+            patch_file_offset,
+            patch_file_size);
     }
     (void)pacha_munmap(mapped, map_size);
     *out_vmo_fd = vmo_fd;
@@ -1196,9 +1279,12 @@ static int cached_readonly_segment_vmo_from_plan(
     int status = create_segment_vmo_from_bytes(
         source,
         segment->file_size,
+        segment->file_offset,
         segment->page_offset,
         segment->map_size,
         segment->patch_text,
+        segment->patch_file_offset,
+        segment->patch_file_size,
         &vmo_fd);
     if (status != 0) {
         return status;
@@ -1321,6 +1407,17 @@ static int lpr_exec_load_memory_image_into_process(
     if (status != 0) {
         return status;
     }
+    uint64_t text_offset = 0;
+    uint64_t text_size = 0;
+    if (patch_text) {
+        status = lpr_exec_image_find_text_section(image, &text_offset, &text_size);
+        if (status != 0) {
+            (void)pacha_munmap(mapped, span_size);
+            (void)pacha_fd_close(vmo_fd);
+            return status;
+        }
+    }
+    memset(mapped, 0, (size_t)span_size);
     for (uint16_t i = 0; i < phnum; ++i) {
         const unsigned char *ph = phdrs + (uint64_t)i * phent;
         if (lpr_exec_rd32(ph) != LPR_EXEC_PT_LOAD) {
@@ -1345,7 +1442,24 @@ static int lpr_exec_load_memory_image_into_process(
         }
         memcpy(mapped + (target_va - span_base) + page_offset, image->bytes + p_offset, (size_t)p_filesz);
         if (patch_text && (lpr_exec_rd32(ph + 4) & LPR_EXEC_PF_X) != 0) {
-            lpr_exec_patch_syscalls(mapped + (target_va - span_base), map_size);
+            uint64_t patch_file_offset = 0;
+            uint64_t patch_file_size = 0;
+            if (lpr_exec_text_file_intersection(
+                    p_offset,
+                    p_filesz,
+                    text_offset,
+                    text_size,
+                    &patch_file_offset,
+                    &patch_file_size))
+            {
+                lpr_exec_patch_segment_text_range(
+                    mapped + (target_va - span_base),
+                    map_size,
+                    p_offset,
+                    page_offset,
+                    patch_file_offset,
+                    patch_file_size);
+            }
         }
     }
     (void)pacha_munmap(mapped, span_size);
@@ -1464,6 +1578,7 @@ static int lpr_exec_load_file_span_vmo_into_process(
     if (status != 0) {
         return status;
     }
+    memset(mapped, 0, (size_t)span_size);
     for (uint16_t i = 0; i < meta->phnum; ++i) {
         const unsigned char *ph = meta->phdrs + (uint64_t)i * meta->phent;
         if (lpr_exec_rd32(ph) != LPR_EXEC_PT_LOAD) {
@@ -1507,7 +1622,24 @@ static int lpr_exec_load_file_span_vmo_into_process(
                 (size_t)p_filesz);
         }
         if (patch_text && (lpr_exec_rd32(ph + 4) & LPR_EXEC_PF_X) != 0) {
-            lpr_exec_patch_syscalls(mapped + (target_va - span_base), map_size);
+            uint64_t patch_file_offset = 0;
+            uint64_t patch_file_size = 0;
+            if (lpr_exec_text_file_intersection(
+                    p_offset,
+                    p_filesz,
+                    meta->text_offset,
+                    meta->text_size,
+                    &patch_file_offset,
+                    &patch_file_size))
+            {
+                lpr_exec_patch_segment_text_range(
+                    mapped + (target_va - span_base),
+                    map_size,
+                    p_offset,
+                    page_offset,
+                    patch_file_offset,
+                    patch_file_size);
+            }
         }
     }
     (void)pacha_munmap(mapped, span_size);
@@ -1728,9 +1860,12 @@ static int lpr_exec_load_file_image_into_process(
                 status = create_segment_vmo_from_bytes(
                     source,
                     segment->file_size,
+                    segment->file_offset,
                     segment->page_offset,
                     segment->map_size,
                     segment->patch_text,
+                    segment->patch_file_offset,
+                    segment->patch_file_size,
                     &segment_vmo_fd);
                 if (status != 0) {
                     break;
@@ -1874,9 +2009,12 @@ int lpr_exec_prepare_file_into_map_batch(
             status = create_segment_vmo_from_bytes(
                 source,
                 segment->file_size,
+                segment->file_offset,
                 segment->page_offset,
                 segment->map_size,
                 segment->patch_text,
+                segment->patch_file_offset,
+                segment->patch_file_size,
                 &segment_vmo_fd);
             if (status != 0) {
                 if (source_span_owned) {

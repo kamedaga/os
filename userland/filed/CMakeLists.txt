@@ -24,6 +24,7 @@ set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs_backend.c"
   "${REPO_ROOT}/userland/libipc/src/ipc.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
+  "${REPO_ROOT}/userland/personality/linux/hde/hde64.c"
 )
 string(REPLACE ";" " " FILED_EXTRA_SOURCES_ENV "${FILED_EXTRA_SOURCES}")
 
@@ -33,7 +34,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/hde"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/bootstrap.h"

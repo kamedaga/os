@@ -217,6 +217,20 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
         push_u64(stack, &sp, LPR_EXEC_AT_ENTRY) != 0 ||
         push_u64(stack, &sp, plan->interpreter_base) != 0 ||
         push_u64(stack, &sp, LPR_EXEC_AT_BASE) != 0 ||
+        push_u64(stack, &sp, 0) != 0 ||
+        push_u64(stack, &sp, LPR_EXEC_AT_SECURE) != 0 ||
+        push_u64(stack, &sp, 100) != 0 ||
+        push_u64(stack, &sp, LPR_EXEC_AT_CLKTCK) != 0 ||
+        push_u64(stack, &sp, 0) != 0 ||
+        push_u64(stack, &sp, LPR_EXEC_AT_HWCAP) != 0 ||
+        push_u64(stack, &sp, 0) != 0 ||
+        push_u64(stack, &sp, LPR_EXEC_AT_EGID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 ||
+        push_u64(stack, &sp, LPR_EXEC_AT_GID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 ||
+        push_u64(stack, &sp, LPR_EXEC_AT_EUID) != 0 ||
+        push_u64(stack, &sp, 0) != 0 ||
+        push_u64(stack, &sp, LPR_EXEC_AT_UID) != 0 ||
         push_u64(stack, &sp, LPR_EXEC_PAGE_SIZE) != 0 ||
         push_u64(stack, &sp, LPR_EXEC_AT_PAGESZ) != 0 ||
         push_u64(stack, &sp, plan->phnum) != 0 ||
@@ -224,9 +238,13 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
         push_u64(stack, &sp, plan->phent) != 0 ||
         push_u64(stack, &sp, LPR_EXEC_AT_PHENT) != 0 ||
         push_u64(stack, &sp, plan->phdr_va) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_PHDR) != 0 ||
-        push_u64(stack, &sp, 0) != 0)
+        push_u64(stack, &sp, LPR_EXEC_AT_PHDR) != 0)
     {
+        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_fd_close(stack_fd);
+        return -12;
+    }
+    if (push_u64(stack, &sp, 0) != 0) {
         (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -12;

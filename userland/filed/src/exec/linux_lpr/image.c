@@ -632,6 +632,97 @@ static bool lpr_exec_range_cache_store_take(
     return true;
 }
 
+static int lpr_exec_meta_read_text_section(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    const unsigned char *prefix,
+    uint64_t prefix_size,
+    lpr_exec_meta_t *meta)
+{
+    if (runtime == NULL || file == NULL || prefix == NULL || meta == NULL) {
+        return -22;
+    }
+    meta->text_offset = 0;
+    meta->text_size = 0;
+
+    const unsigned char *ehdr = meta->ehdr;
+    const uint64_t e_shoff = lpr_exec_rd64(ehdr + 40);
+    const uint16_t e_shentsize = lpr_exec_rd16(ehdr + 58);
+    const uint16_t e_shnum = lpr_exec_rd16(ehdr + 60);
+    const uint16_t e_shstrndx = lpr_exec_rd16(ehdr + 62);
+    if (e_shoff == 0 || e_shnum == 0) {
+        return 0;
+    }
+    if (e_shentsize < LPR_EXEC_SHDR_BYTES || e_shstrndx >= e_shnum || e_shoff > file->size) {
+        return -8;
+    }
+    const uint64_t shdr_bytes = (uint64_t)e_shentsize * (uint64_t)e_shnum;
+    if (shdr_bytes > file->size - e_shoff || shdr_bytes > SIZE_MAX) {
+        return -8;
+    }
+
+    unsigned char *shdrs = malloc((size_t)shdr_bytes);
+    if (shdrs == NULL) {
+        return -12;
+    }
+    int status = 0;
+    if (e_shoff <= prefix_size && shdr_bytes <= prefix_size - e_shoff) {
+        memcpy(shdrs, prefix + e_shoff, (size_t)shdr_bytes);
+    } else {
+        status = lpr_exec_read_file_range(runtime, file, e_shoff, shdrs, shdr_bytes);
+        if (status != 0) {
+            free(shdrs);
+            return status;
+        }
+    }
+
+    const unsigned char *shstr = shdrs + (uint64_t)e_shstrndx * e_shentsize;
+    const uint64_t shstr_offset = lpr_exec_rd64(shstr + 24);
+    const uint64_t shstr_size = lpr_exec_rd64(shstr + 32);
+    if (shstr_offset > file->size || shstr_size > file->size - shstr_offset || shstr_size > SIZE_MAX) {
+        free(shdrs);
+        return -8;
+    }
+
+    unsigned char *names = malloc((size_t)shstr_size);
+    if (names == NULL) {
+        free(shdrs);
+        return -12;
+    }
+    if (shstr_offset <= prefix_size && shstr_size <= prefix_size - shstr_offset) {
+        memcpy(names, prefix + shstr_offset, (size_t)shstr_size);
+    } else {
+        status = lpr_exec_read_file_range(runtime, file, shstr_offset, names, shstr_size);
+        if (status != 0) {
+            free(names);
+            free(shdrs);
+            return status;
+        }
+    }
+
+    for (uint16_t i = 0; i < e_shnum; ++i) {
+        const unsigned char *sh = shdrs + (uint64_t)i * e_shentsize;
+        const uint32_t sh_name = lpr_exec_rd32(sh);
+        const uint64_t sh_offset = lpr_exec_rd64(sh + 24);
+        const uint64_t sh_size = lpr_exec_rd64(sh + 32);
+        if (sh_name >= shstr_size || strcmp((const char *)(const void *)(names + sh_name), ".text") != 0) {
+            continue;
+        }
+        if (sh_offset > file->size || sh_size > file->size - sh_offset) {
+            free(names);
+            free(shdrs);
+            return -8;
+        }
+        meta->text_offset = sh_offset;
+        meta->text_size = sh_size;
+        break;
+    }
+
+    free(names);
+    free(shdrs);
+    return 0;
+}
+
 void filed_exec_linux_lpr_invalidate_backend_object(filed_runtime_t *runtime, uint64_t backend_object)
 {
     if (backend_object == 0) {
@@ -1255,6 +1346,11 @@ int lpr_exec_read_meta(filed_runtime_t *runtime, const lpr_exec_file_t *file, lp
             lpr_exec_free_meta(out_meta);
             return status;
         }
+    }
+    status = lpr_exec_meta_read_text_section(runtime, file, prefix, prefix_size, out_meta);
+    if (status != 0) {
+        lpr_exec_free_meta(out_meta);
+        return status;
     }
     for (uint16_t i = 0; i < out_meta->phnum; ++i) {
         const unsigned char *ph = out_meta->phdrs + (uint64_t)i * out_meta->phent;

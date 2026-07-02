@@ -39,6 +39,13 @@ enum {
     LPR_EXEC_AT_PAGESZ = 6,
     LPR_EXEC_AT_BASE = 7,
     LPR_EXEC_AT_ENTRY = 9,
+    LPR_EXEC_AT_UID = 11,
+    LPR_EXEC_AT_EUID = 12,
+    LPR_EXEC_AT_GID = 13,
+    LPR_EXEC_AT_EGID = 14,
+    LPR_EXEC_AT_HWCAP = 16,
+    LPR_EXEC_AT_CLKTCK = 17,
+    LPR_EXEC_AT_SECURE = 23,
     LPR_EXEC_AT_RANDOM = 25,
     LPR_EXEC_AT_EXECFN = 31,
     LPR_EXEC_MAX_IMAGE_BYTES = 64ull * 1024ull * 1024ull,
@@ -73,6 +80,8 @@ typedef struct lpr_exec_meta {
     unsigned char *phdrs;
     char interp_path[LPR_EXEC_MAX_INTERP_BYTES];
     uint64_t phdr_bytes;
+    uint64_t text_offset;
+    uint64_t text_size;
     uint64_t entry;
     uint64_t phoff;
     uint16_t type;
@@ -220,8 +229,9 @@ int lpr_exec_meta_get_interp_path(
     const lpr_exec_meta_t *meta,
     char *out_path,
     size_t out_size);
+int lpr_exec_image_find_text_section(const lpr_exec_image_t *image, uint64_t *out_offset, uint64_t *out_size);
 int lpr_exec_image_find_symbol(const lpr_exec_image_t *image, const char *symbol, uint64_t *out_value);
-void lpr_exec_patch_syscalls(unsigned char *bytes, uint64_t size);
+uint64_t lpr_exec_patch_syscalls(unsigned char *bytes, uint64_t size);
 void lpr_exec_image_dump_metrics(void);
 void lpr_exec_map_dump_metrics(void);
 

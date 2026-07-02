@@ -4,6 +4,7 @@
 #include "lpr_vfs_local.h"
 #include "support/syscall.h"
 #include <pachaos/abi.h>
+#include <personality/linux_lpr.h>
 
 #define LPR_LINUX_PROT_READ 0x1ull
 #define LPR_LINUX_PROT_WRITE 0x2ull
@@ -166,6 +167,19 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
                 break;
             }
         }
+        if ((prot & LPR_LINUX_PROT_EXEC) != 0 && done != 0) {
+            struct lpr_patch_mapping_result patch_result;
+            const struct lpr_patch_mapping_request patch_request = {
+                .start_va = (uint64_t)mapped,
+                .size_bytes = done,
+                .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE,
+            };
+            const int64_t patch_status = lpr_patch_mapping(&patch_request, &patch_result);
+            if (patch_status != PERSONALITY_STATUS_OK) {
+                (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
+                return -LPR_LINUX_EINVAL;
+            }
+        }
         const int64_t protect_status = lpr_pacha_syscall3(
             PACHAOS_SYSCALL_MPROTECT,
             (uint64_t)mapped,
@@ -202,6 +216,7 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
     case LPR_LINUX_SYS_GETPID:
         return lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID);
     case LPR_LINUX_SYS_GETTID:
+    case LPR_LINUX_SYS_SET_TID_ADDRESS:
         return lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
     case LPR_LINUX_SYS_WRITE:
         return lpr_linux_write(a0, a1, a2);

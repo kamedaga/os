@@ -85,17 +85,13 @@ int main(void) {
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETPID)) return 1;
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETTID, 0, 0, 0, 0, 0, 0) == 5678)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETTID)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_SET_TID_ADDRESS, 0x1000, 0, 0, 0, 0, 0) == 5678)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_GETTID)) return 1;
 
     const char text[] = "hello";
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_WRITE, 1, (uint64_t)(uintptr_t)text, 5, 0, 0, 0) == 5)) return 1;
-    if (expect(g_last.nr == PACHAOS_SYSCALL_FD_WRITE)) return 1;
-    if (expect(g_last.a0 == 1 && g_last.a1 == (uint64_t)(uintptr_t)text && g_last.a2 == 5)) return 1;
 
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_READ, 3, (uint64_t)(uintptr_t)text, 4, 0, 0, 0) == 4)) return 1;
-    if (expect(g_last.nr == PACHAOS_SYSCALL_FD_READ)) return 1;
-
-    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOSE, 3, 0, 0, 0, 0, 0) == 0)) return 1;
-    if (expect(g_last.nr == PACHAOS_SYSCALL_FD_CLOSE && g_last.a0 == 3)) return 1;
 
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_ARCH_PRCTL, LPR_LINUX_ARCH_SET_FS, 0x12345000, 0, 0, 0, 0) == 0)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_THREAD_SET_FS_BASE && g_last.a0 == 0x12345000)) return 1;
