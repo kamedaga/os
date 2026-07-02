@@ -5,6 +5,14 @@
 extern void lpr_syscall_entry(void);
 extern void lpr_trap_entry(void);
 
+static uint64_t lpr_read_tsc(void)
+{
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
 static uint64_t lpr_hde_opcode_offset(const uint8_t *bytes, uint64_t len)
 {
     uint64_t off = 0;
@@ -72,12 +80,14 @@ int64_t lpr_patch_mapping(const struct lpr_patch_mapping_request *request,
     result->patched_sites = 0;
     result->skipped_sites = 0;
     result->failed_sites = 0;
+    result->cycles = 0;
     if ((request->flags & LPR_PATCH_FLAG_EXECUTABLE) == 0) {
         return LPR_PATCH_STATUS_NOT_EXECUTABLE;
     }
     if (request->start_va == 0 || request->size_bytes == 0) {
         return PERSONALITY_STATUS_OK;
     }
+    const uint64_t patch_start_cycles = lpr_read_tsc();
     uint8_t *bytes = (uint8_t *)(uintptr_t)request->start_va;
     result->scanned_bytes = request->size_bytes;
     for (uint64_t i = 0; i < request->size_bytes;) {
@@ -105,6 +115,10 @@ int64_t lpr_patch_mapping(const struct lpr_patch_mapping_request *request,
             }
         }
         i += (uint64_t)insn_len;
+    }
+    const uint64_t patch_end_cycles = lpr_read_tsc();
+    if (patch_end_cycles >= patch_start_cycles) {
+        result->cycles = patch_end_cycles - patch_start_cycles;
     }
     return PERSONALITY_STATUS_OK;
 }

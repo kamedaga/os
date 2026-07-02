@@ -44,10 +44,11 @@ struct lpr_patch_mapping_result {
     uint64_t patched_sites;
     uint64_t skipped_sites;
     uint64_t failed_sites;
+    uint64_t cycles;
 };
 
 _Static_assert(sizeof(struct lpr_patch_mapping_request) == 24, "lpr_patch_mapping_request size");
-_Static_assert(sizeof(struct lpr_patch_mapping_result) == 32, "lpr_patch_mapping_result size");
+_Static_assert(sizeof(struct lpr_patch_mapping_result) == 40, "lpr_patch_mapping_result size");
 _Static_assert(LPR_LOW_GUARD_START_VA == PERSONALITY_PAGE_SIZE, "zpoline page must be first");
 _Static_assert((LPR_LOW_GUARD_END_VA & (PERSONALITY_PAGE_SIZE - 1)) == 0, "low guard end page aligned");
 _Static_assert(LPR_LOW_GUARD_SIZE >= PERSONALITY_PAGE_SIZE, "low guard must contain at least one page");

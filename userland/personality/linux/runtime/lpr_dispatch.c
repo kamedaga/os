@@ -18,6 +18,53 @@
 #define LPR_LINUX_AT_FDCWD ((uint64_t)(int64_t)-100)
 #define LPR_LINUX_AT_REMOVEDIR 0x200ull
 
+#if LPR_TRACE_PATCH_MAPPING
+static char *lpr_append_literal(char *out, const char *end, const char *text)
+{
+    while (out < end && *text != 0) {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_append_u64(char *out, const char *end, uint64_t value)
+{
+    char tmp[20];
+    uint64_t n = 0;
+    do {
+        tmp[n++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && n < sizeof(tmp));
+    while (out < end && n != 0) {
+        *out++ = tmp[--n];
+    }
+    return out;
+}
+
+static void lpr_trace_patch_mapping(const struct lpr_patch_mapping_result *result)
+{
+    if (result == 0) {
+        return;
+    }
+    char line[192];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_append_literal(out, end, "[lpr_runtime] metric scope=lpr_runtime op=patch_mapping");
+    out = lpr_append_literal(out, end, " scanned_bytes=");
+    out = lpr_append_u64(out, end, result->scanned_bytes);
+    out = lpr_append_literal(out, end, " patched_sites=");
+    out = lpr_append_u64(out, end, result->patched_sites);
+    out = lpr_append_literal(out, end, " skipped_sites=");
+    out = lpr_append_u64(out, end, result->skipped_sites);
+    out = lpr_append_literal(out, end, " cycles=");
+    out = lpr_append_u64(out, end, result->cycles);
+    out = lpr_append_literal(out, end, "\n");
+    if (out > line) {
+        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    }
+}
+#endif
+
 static uint64_t lpr_page_align_up(uint64_t value)
 {
     const uint64_t mask = 4095ull;
@@ -175,6 +222,9 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
                 .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE,
             };
             const int64_t patch_status = lpr_patch_mapping(&patch_request, &patch_result);
+#if LPR_TRACE_PATCH_MAPPING
+            lpr_trace_patch_mapping(&patch_result);
+#endif
             if (patch_status != PERSONALITY_STATUS_OK) {
                 (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
                 return -LPR_LINUX_EINVAL;

@@ -12,6 +12,8 @@ typedef struct lpr_exec_map_metric_record {
     uint64_t count;
     uint64_t total_ns;
     uint64_t max_ns;
+    uint64_t total_cycles;
+    uint64_t max_cycles;
     uint64_t total_bytes;
 } lpr_exec_map_metric_record_t;
 
@@ -29,6 +31,14 @@ static uint64_t lpr_exec_map_now_ns(void)
         return 0;
     }
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t lpr_exec_map_now_cycles(void)
+{
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
 }
 
 static lpr_exec_map_metric_record_t *lpr_exec_map_metric_slot(const char *label)
@@ -80,6 +90,28 @@ static void lpr_exec_map_metric_time(const char *label, uint64_t start_ns, uint6
     metric->total_bytes += bytes;
 }
 
+static void lpr_exec_map_metric_time_cycles(
+    const char *label,
+    uint64_t start_cycles,
+    uint64_t end_cycles,
+    uint64_t bytes)
+{
+    if (start_cycles == 0 || end_cycles < start_cycles) {
+        return;
+    }
+    lpr_exec_map_metric_record_t *metric = lpr_exec_map_metric_slot(label);
+    if (metric == NULL) {
+        return;
+    }
+    const uint64_t elapsed_cycles = end_cycles - start_cycles;
+    metric->count++;
+    metric->total_cycles += elapsed_cycles;
+    if (elapsed_cycles > metric->max_cycles) {
+        metric->max_cycles = elapsed_cycles;
+    }
+    metric->total_bytes += bytes;
+}
+
 void lpr_exec_map_dump_metrics(void)
 {
     for (size_t i = 0; i < LPR_EXEC_MAP_METRIC_SLOTS; ++i) {
@@ -88,11 +120,13 @@ void lpr_exec_map_dump_metrics(void)
             continue;
         }
         printf(
-            "[filed] metric scope=lpr_map op=%s count=%llu avg_ns=%llu max_ns=%llu bytes=%llu\n",
+            "[filed] metric scope=lpr_map op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu bytes=%llu\n",
             metric->name,
             (unsigned long long)metric->count,
             (unsigned long long)(metric->total_ns / metric->count),
             (unsigned long long)metric->max_ns,
+            (unsigned long long)(metric->total_cycles / metric->count),
+            (unsigned long long)metric->max_cycles,
             (unsigned long long)metric->total_bytes);
     }
 }
@@ -514,7 +548,13 @@ static void lpr_exec_patch_segment_text_range(
     if (patch_file_size > map_size - mapped_offset) {
         return;
     }
+    const uint64_t patch_start_cycles = lpr_exec_map_now_cycles();
     const uint64_t patched = lpr_exec_patch_syscalls(mapped + mapped_offset, patch_file_size);
+    lpr_exec_map_metric_time_cycles(
+        "patch_syscalls_scan",
+        patch_start_cycles,
+        lpr_exec_map_now_cycles(),
+        patch_file_size);
     if (patched != 0) {
         lpr_exec_map_metric_count("patch_syscalls", patched);
     }

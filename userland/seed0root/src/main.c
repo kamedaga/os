@@ -1054,7 +1054,7 @@ static int seed0root_wait_process(int process_fd, const char *label, struct seed
             .events = PACHA_FD_EVENT_READABLE,
             .revents = 0,
         };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
+        (void)pacha_fd_wait_many(&pollfd, 1, PACHA_FD_WAIT_FOREVER);
     }
 }
 

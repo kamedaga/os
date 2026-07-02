@@ -230,6 +230,20 @@ typedef struct lpr_exec_stage_metric {
     uint64_t max_cycles;
 } lpr_exec_stage_metric_t;
 
+typedef struct lpr_exec_one_metric {
+    char path[FILED_WIRE_NAME_BYTES];
+    uint64_t total_before_reply_cycles;
+    uint64_t prepare_inherit_cycles;
+    uint64_t init_main_file_cycles;
+    uint64_t read_main_meta_cycles;
+    uint64_t load_plan_cycles;
+    uint64_t start_plan_cycles;
+} lpr_exec_one_metric_t;
+
+enum {
+    LPR_EXEC_ONE_METRIC_SLOTS = 64,
+};
+
 static lpr_exec_stage_metric_t lpr_exec_stage_metrics[LPR_EXEC_STAGE_MAX] = {
     [LPR_EXEC_STAGE_PREPARE_INHERIT_FDS] = { .name = "prepare_inherit_fds" },
     [LPR_EXEC_STAGE_INIT_MAIN_FILE] = { .name = "init_main_file" },
@@ -257,6 +271,8 @@ static lpr_exec_stage_metric_t lpr_exec_stage_metrics[LPR_EXEC_STAGE_MAX] = {
     [LPR_EXEC_STAGE_START_THREAD_START] = { .name = "start_thread_start" },
     [LPR_EXEC_STAGE_TOTAL_BEFORE_REPLY] = { .name = "total_before_reply" },
 };
+static lpr_exec_one_metric_t lpr_exec_one_metrics[LPR_EXEC_ONE_METRIC_SLOTS];
+static uint64_t lpr_exec_one_metric_count;
 
 uint64_t lpr_exec_now_ns(void)
 {
@@ -326,7 +342,7 @@ void lpr_exec_metric_cycles(const char *label, uint64_t start_cycles, uint64_t e
     }
 }
 
-static void lpr_exec_metric_span(
+static uint64_t lpr_exec_metric_span(
     const char *label,
     uint64_t start_ns,
     uint64_t end_ns,
@@ -335,6 +351,10 @@ static void lpr_exec_metric_span(
 {
     lpr_exec_metric(label, start_ns, end_ns);
     lpr_exec_metric_cycles(label, start_cycles, end_cycles);
+    if (start_cycles == 0 || end_cycles < start_cycles) {
+        return 0;
+    }
+    return end_cycles - start_cycles;
 }
 
 #define LPR_EXEC_STAGE_BEGIN(ns_var, cycles_var) \
@@ -347,11 +367,39 @@ static void lpr_exec_metric_span(
     do { \
         const uint64_t lpr_exec_stage_end_ns__ = lpr_exec_now_ns(); \
         const uint64_t lpr_exec_stage_end_cycles__ = lpr_exec_now_cycles(); \
-        lpr_exec_metric_span((label), (ns_var), lpr_exec_stage_end_ns__, (cycles_var), lpr_exec_stage_end_cycles__); \
+        (void)lpr_exec_metric_span((label), (ns_var), lpr_exec_stage_end_ns__, (cycles_var), lpr_exec_stage_end_cycles__); \
+    } while (0)
+
+#define LPR_EXEC_STAGE_RECORD_TO(label, ns_var, cycles_var, out_cycles) \
+    do { \
+        const uint64_t lpr_exec_stage_end_ns__ = lpr_exec_now_ns(); \
+        const uint64_t lpr_exec_stage_end_cycles__ = lpr_exec_now_cycles(); \
+        (out_cycles) = lpr_exec_metric_span((label), (ns_var), lpr_exec_stage_end_ns__, (cycles_var), lpr_exec_stage_end_cycles__); \
     } while (0)
 
 void filed_exec_linux_lpr_dump_metrics(void)
 {
+    const uint64_t one_count = lpr_exec_one_metric_count < LPR_EXEC_ONE_METRIC_SLOTS ?
+        lpr_exec_one_metric_count :
+        LPR_EXEC_ONE_METRIC_SLOTS;
+    const uint64_t one_start = lpr_exec_one_metric_count > LPR_EXEC_ONE_METRIC_SLOTS ?
+        lpr_exec_one_metric_count - LPR_EXEC_ONE_METRIC_SLOTS :
+        0;
+    for (uint64_t i = 0; i < one_count; ++i) {
+        const uint64_t logical = one_start + i;
+        const lpr_exec_one_metric_t *metric =
+            &lpr_exec_one_metrics[logical % LPR_EXEC_ONE_METRIC_SLOTS];
+        printf(
+            "[filed] metric scope=lpr_exec_one index=%llu path=%s total_before_reply_cycles=%llu prepare_inherit_cycles=%llu init_main_file_cycles=%llu read_main_meta_cycles=%llu load_plan_cycles=%llu start_plan_cycles=%llu\n",
+            (unsigned long long)logical,
+            metric->path,
+            (unsigned long long)metric->total_before_reply_cycles,
+            (unsigned long long)metric->prepare_inherit_cycles,
+            (unsigned long long)metric->init_main_file_cycles,
+            (unsigned long long)metric->read_main_meta_cycles,
+            (unsigned long long)metric->load_plan_cycles,
+            (unsigned long long)metric->start_plan_cycles);
+    }
     for (int i = 0; i < LPR_EXEC_STAGE_MAX; ++i) {
         const lpr_exec_stage_metric_t *metric = &lpr_exec_stage_metrics[i];
         if (metric->count == 0 || metric->name == NULL) {
@@ -368,6 +416,30 @@ void filed_exec_linux_lpr_dump_metrics(void)
     }
     lpr_exec_image_dump_metrics();
     lpr_exec_map_dump_metrics();
+}
+
+static void lpr_exec_record_one_metric(
+    const filed_wire_exec_path_t *request,
+    uint64_t total_before_reply_cycles,
+    uint64_t prepare_inherit_cycles,
+    uint64_t init_main_file_cycles,
+    uint64_t read_main_meta_cycles,
+    uint64_t load_plan_cycles,
+    uint64_t start_plan_cycles)
+{
+    lpr_exec_one_metric_t *metric =
+        &lpr_exec_one_metrics[lpr_exec_one_metric_count % LPR_EXEC_ONE_METRIC_SLOTS];
+    memset(metric, 0, sizeof(*metric));
+    if (request != NULL) {
+        snprintf(metric->path, sizeof(metric->path), "%s", request->path);
+    }
+    metric->total_before_reply_cycles = total_before_reply_cycles;
+    metric->prepare_inherit_cycles = prepare_inherit_cycles;
+    metric->init_main_file_cycles = init_main_file_cycles;
+    metric->read_main_meta_cycles = read_main_meta_cycles;
+    metric->load_plan_cycles = load_plan_cycles;
+    metric->start_plan_cycles = start_plan_cycles;
+    lpr_exec_one_metric_count++;
 }
 
 static int load_plan(
@@ -628,28 +700,34 @@ int filed_exec_linux_lpr_handle(
     uint64_t total_start_cycles = lpr_exec_now_cycles();
     uint64_t stage_start = total_start;
     uint64_t stage_start_cycles = total_start_cycles;
+    uint64_t prepare_inherit_cycles = 0;
+    uint64_t init_main_file_cycles = 0;
+    uint64_t read_main_meta_cycles = 0;
+    uint64_t load_plan_cycles = 0;
+    uint64_t start_plan_cycles = 0;
+    uint64_t total_before_reply_cycles = 0;
     int status = lpr_exec_prepare_inherit_fds(request, inherit_fds, inherit_fd_count, bootstrap_fd, prepared, &prepared_count);
-    LPR_EXEC_STAGE_RECORD("prepare_inherit_fds", stage_start, stage_start_cycles);
+    LPR_EXEC_STAGE_RECORD_TO("prepare_inherit_fds", stage_start, stage_start_cycles, prepare_inherit_cycles);
     if (status != 0) {
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
     status = lpr_exec_init_file_from_handle(runtime, handle_id, &file);
-    LPR_EXEC_STAGE_RECORD("init_main_file", stage_start, stage_start_cycles);
+    LPR_EXEC_STAGE_RECORD_TO("init_main_file", stage_start, stage_start_cycles, init_main_file_cycles);
     if (status != 0) {
         lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
     status = lpr_exec_read_meta(runtime, &file, &meta);
-    LPR_EXEC_STAGE_RECORD("read_main_meta", stage_start, stage_start_cycles);
+    LPR_EXEC_STAGE_RECORD_TO("read_main_meta", stage_start, stage_start_cycles, read_main_meta_cycles);
     if (status != 0) {
         lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
     status = load_plan(runtime, &file, &meta, &plan);
-    LPR_EXEC_STAGE_RECORD("load_plan", stage_start, stage_start_cycles);
+    LPR_EXEC_STAGE_RECORD_TO("load_plan", stage_start, stage_start_cycles, load_plan_cycles);
     lpr_exec_free_meta(&meta);
     if (status != 0) {
         lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
@@ -657,7 +735,7 @@ int filed_exec_linux_lpr_handle(
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
     status = lpr_exec_start_plan(&plan, request, bootstrap_fd);
-    LPR_EXEC_STAGE_RECORD("start_plan", stage_start, stage_start_cycles);
+    LPR_EXEC_STAGE_RECORD_TO("start_plan", stage_start, stage_start_cycles, start_plan_cycles);
     lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
     if (status != 0) {
         if (plan.thread_fd >= 16) {
@@ -668,6 +746,19 @@ int filed_exec_linux_lpr_handle(
     }
     *out_process_fd = plan.process_fd;
     *out_thread_fd = plan.thread_fd;
-    lpr_exec_metric_span("total_before_reply", total_start, lpr_exec_now_ns(), total_start_cycles, lpr_exec_now_cycles());
+    total_before_reply_cycles = lpr_exec_metric_span(
+        "total_before_reply",
+        total_start,
+        lpr_exec_now_ns(),
+        total_start_cycles,
+        lpr_exec_now_cycles());
+    lpr_exec_record_one_metric(
+        request,
+        total_before_reply_cycles,
+        prepare_inherit_cycles,
+        init_main_file_cycles,
+        read_main_meta_cycles,
+        load_plan_cycles,
+        start_plan_cycles);
     return 0;
 }
