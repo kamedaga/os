@@ -2101,7 +2101,7 @@ static int phdr_va_from_phdrs(
     const unsigned char *phdrs,
     uint16_t phnum,
     uint16_t phent,
-    uint64_t fallback,
+    uint64_t phoff,
     uint64_t *out_phdr_va)
 {
     if (out_phdr_va == NULL) {
@@ -2115,7 +2115,33 @@ static int phdr_va_from_phdrs(
             break;
         }
     }
-    *out_phdr_va = phdr_va == 0 ? fallback : phdr_va;
+    if (phdr_va == 0) {
+        const uint64_t phdr_bytes = (uint64_t)phnum * (uint64_t)phent;
+        for (uint16_t i = 0; i < phnum; ++i) {
+            const unsigned char *ph = phdrs + (uint64_t)i * phent;
+            if (lpr_exec_rd32(ph) != LPR_EXEC_PT_LOAD) {
+                continue;
+            }
+            const uint64_t p_offset = lpr_exec_rd64(ph + 8);
+            const uint64_t p_vaddr = lpr_exec_rd64(ph + 16);
+            const uint64_t p_filesz = lpr_exec_rd64(ph + 32);
+            if (phoff >= p_offset &&
+                phoff - p_offset <= p_filesz &&
+                phdr_bytes <= p_filesz - (phoff - p_offset))
+            {
+                const uint64_t phdr_delta = phoff - p_offset;
+                if (p_vaddr > UINT64_MAX - phdr_delta) {
+                    return -75;
+                }
+                phdr_va = p_vaddr + phdr_delta;
+                break;
+            }
+        }
+    }
+    if (phdr_va == 0) {
+        return -8;
+    }
+    *out_phdr_va = phdr_va;
     return 0;
 }
 

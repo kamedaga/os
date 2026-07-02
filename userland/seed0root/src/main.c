@@ -52,6 +52,7 @@ enum {
     SEED0ROOT_BOOT_PROFILE_LPR = 1u << 3,
     SEED0ROOT_BOOT_PROFILE_LUA = 1u << 4,
     SEED0ROOT_BOOT_PROFILE_DYN_NEEDED = 1u << 5,
+    SEED0ROOT_BOOT_PROFILE_CHIBICC = 1u << 6,
 };
 
 struct seed0root_bootstrap_module {
@@ -988,6 +989,9 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
     if (seed0root_profile_has_token(profile, "dyn-needed")) {
         flags |= SEED0ROOT_BOOT_PROFILE_DYN_NEEDED;
     }
+    if (seed0root_profile_has_token(profile, "chibicc")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_CHIBICC;
+    }
     printf("[seed0root] boot profile flags=%u\n", flags);
     return flags;
 }
@@ -1121,14 +1125,37 @@ static void seed0root_destroy_filed_wire_page(int fd, void *mapped)
     seed0root_destroy_wire_page(FILED_WIRE_PAGE_BYTES, fd, mapped);
 }
 
-static int seed0root_run_exec_path_smoke(
+static int seed0root_exec_add_string(
+    filed_wire_exec_path_t *exec,
+    filed_wire_exec_string_ref_t *ref,
+    const char *value)
+{
+    if (exec == NULL || ref == NULL || value == NULL) {
+        return -22;
+    }
+    const uint64_t length = (uint64_t)strlen(value) + 1u;
+    if (length == 0 ||
+        length > UINT16_MAX ||
+        exec->string_bytes + length > FILED_WIRE_EXEC_STRING_BYTES)
+    {
+        return -7;
+    }
+    ref->offset = (uint16_t)exec->string_bytes;
+    ref->length = (uint16_t)length;
+    memcpy(exec->strings + exec->string_bytes, value, (size_t)length);
+    exec->string_bytes += length;
+    return 0;
+}
+
+static int seed0root_run_exec_path_smoke_expect(
     int filed_endpoint_fd,
     const char *path,
     const char *const *argv,
     uint64_t argc,
     const char *env,
     const char *label,
-    uint64_t exec_flags)
+    uint64_t exec_flags,
+    uint64_t expected_exit)
 {
     if (filed_endpoint_fd < 16 || path == NULL || label == NULL ||
         argc > FILED_WIRE_EXEC_MAX_ARGS)
@@ -1149,13 +1176,20 @@ static int seed0root_run_exec_path_smoke(
     exec->argc = argc == 0 ? 1 : argc;
     exec->envc = env != NULL ? 1 : 0;
     snprintf(exec->path, sizeof(exec->path), "%s", path);
-    snprintf(exec->argv0, sizeof(exec->argv0), "%s", argc > 0 && argv != NULL ? argv[0] : path);
     for (uint64_t i = 0; i < exec->argc; i++) {
         const char *arg = (argc > 0 && argv != NULL && argv[i] != NULL) ? argv[i] : path;
-        snprintf(exec->argv[i], sizeof(exec->argv[i]), "%s", arg);
+        status = seed0root_exec_add_string(exec, &exec->argv[i], arg);
+        if (status != 0) {
+            seed0root_destroy_filed_wire_page(page_fd, page);
+            return status;
+        }
     }
     if (env != NULL) {
-        snprintf(exec->envp[0], sizeof(exec->envp[0]), "%s", env);
+        status = seed0root_exec_add_string(exec, &exec->envp[0], env);
+        if (status != 0) {
+            seed0root_destroy_filed_wire_page(page_fd, page);
+            return status;
+        }
     }
 
     const uint64_t exec_start_ns = seed0root_now_ns();
@@ -1207,6 +1241,12 @@ static int seed0root_run_exec_path_smoke(
 
     struct seed0root_wait_result wait_result;
     status = seed0root_wait_process(process_fd, label, &wait_result);
+    if (status == -5 &&
+        wait_result.state == SEED0ROOT_TASK_STATE_EXITED &&
+        wait_result.exit_code == expected_exit)
+    {
+        status = 0;
+    }
     if (quiet_bench) {
         const uint64_t exec_end_ns = wait_result.end_ns != 0 ? wait_result.end_ns : seed0root_now_ns();
         const uint64_t exec_end_cycles = wait_result.end_cycles != 0 ? wait_result.end_cycles : seed0root_read_tsc();
@@ -1236,6 +1276,26 @@ static int seed0root_run_exec_path_smoke(
     (void)pacha_fd_close(thread_fd);
     (void)pacha_fd_close(process_fd);
     return status;
+}
+
+static int seed0root_run_exec_path_smoke(
+    int filed_endpoint_fd,
+    const char *path,
+    const char *const *argv,
+    uint64_t argc,
+    const char *env,
+    const char *label,
+    uint64_t exec_flags)
+{
+    return seed0root_run_exec_path_smoke_expect(
+        filed_endpoint_fd,
+        path,
+        argv,
+        argc,
+        env,
+        label,
+        exec_flags,
+        0);
 }
 
 static int seed0root_run_libc_vfs_exec_smoke(int filed_endpoint_fd)
@@ -1542,7 +1602,7 @@ static int seed0root_run_lpr_dyn_needed_smoke(int filed_endpoint_fd)
 
 static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
 {
-    const char *argv[] = {
+    const char *cc1_argv[] = {
         "/cmd/chibicc.elf",
         "-cc1",
         "-cc1-input",
@@ -1551,14 +1611,72 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         "/tmp/chibicc_workload.s",
         "/cmd/chibicc_workload.c",
     };
-    return seed0root_run_exec_path_smoke(
+    int status = seed0root_run_exec_path_smoke(
         filed_endpoint_fd,
         "/cmd/chibicc.elf",
-        argv,
+        cc1_argv,
         7,
         "PACHA_CHIBICC_CLI_BENCH=1",
-        "chibicc cli bench",
-        0);
+        "chibicc cc1 workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *as_argv[] = {
+        "/usr/bin/as",
+        "-o",
+        "/tmp/chibicc_workload.o",
+        "/tmp/chibicc_workload.s",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/usr/bin/as",
+        as_argv,
+        4,
+        "PACHA_CHIBICC_AS_BENCH=1",
+        "chibicc as workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *ld_argv[] = {
+        "/usr/bin/ld",
+        "-static",
+        "-o",
+        "/tmp/chibicc_workload.elf",
+        "/usr/lib/crt1.o",
+        "/usr/lib/crti.o",
+        "/tmp/chibicc_workload.o",
+        "-L/usr/lib",
+        "-lc",
+        "/usr/lib/crtn.o",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/usr/bin/ld",
+        ld_argv,
+        10,
+        "PACHA_CHIBICC_LD_BENCH=1",
+        "chibicc ld workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *run_argv[] = {
+        "/tmp/chibicc_workload.elf",
+    };
+    return seed0root_run_exec_path_smoke_expect(
+        filed_endpoint_fd,
+        "/tmp/chibicc_workload.elf",
+        run_argv,
+        1,
+        "PACHA_CHIBICC_RUN_BENCH=1",
+        "chibicc linked workload",
+        FILED_WIRE_EXEC_LINUX_LPR,
+        191);
 }
 
 static int seed0root_connect_storage_services(int control_fd)
@@ -1622,7 +1740,9 @@ static int seed0root_connect_storage_services(int control_fd)
         filed_endpoint_fd >= 16) {
         status = seed0root_run_lua_cli_bench(filed_endpoint_fd);
     }
-    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_BENCH) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+    if ((boot_profile & (SEED0ROOT_BOOT_PROFILE_BENCH | SEED0ROOT_BOOT_PROFILE_CHIBICC)) != 0 &&
+        status == 0 &&
+        filed_endpoint_fd >= 16) {
         status = seed0root_run_chibicc_cli_bench(filed_endpoint_fd);
     }
     const unsigned metrics_profile =
@@ -1631,14 +1751,16 @@ static int seed0root_connect_storage_services(int control_fd)
                         SEED0ROOT_BOOT_PROFILE_BENCH |
                         SEED0ROOT_BOOT_PROFILE_LPR |
                         SEED0ROOT_BOOT_PROFILE_LUA |
-                        SEED0ROOT_BOOT_PROFILE_DYN_NEEDED);
+                        SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
+                        SEED0ROOT_BOOT_PROFILE_CHIBICC);
     const unsigned sync_profile =
         boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
                         SEED0ROOT_BOOT_PROFILE_MEMORY |
                         SEED0ROOT_BOOT_PROFILE_BENCH |
                         SEED0ROOT_BOOT_PROFILE_LPR |
                         SEED0ROOT_BOOT_PROFILE_LUA |
-                        SEED0ROOT_BOOT_PROFILE_DYN_NEEDED);
+                        SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
+                        SEED0ROOT_BOOT_PROFILE_CHIBICC);
     if (metrics_profile != 0 && status == 0 && filed_endpoint_fd >= 16) {
         const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
         printf("[seed0root] filed metrics dump status=%d\n", metrics_status);

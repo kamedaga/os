@@ -449,6 +449,7 @@ static const char *filed_op_name(uint64_t op)
     case FILED_WIRE_OP_VALIDATE_OPEN_CACHE: return "validate_open_cache";
     case FILED_WIRE_OP_PWRITE_BATCH: return "pwrite_batch";
     case FILED_WIRE_OP_WRITE_BATCH: return "write_batch";
+    case FILED_WIRE_OP_PREAD_TO_VMO: return "pread_to_vmo";
     default: return "unknown";
     }
 }
@@ -1268,6 +1269,20 @@ int filed_cached_pread(
             out_bytes);
     }
     filed_page_cache_ensure_configured();
+    if (length >= 65536u) {
+        const int flush_status = filed_page_cache_flush_object(runtime, backend_object);
+        if (flush_status != 0) {
+            return flush_status;
+        }
+        filed_page_cache.direct_reads++;
+        return filed_backend_pread(
+            runtime,
+            backend_object,
+            offset,
+            buffer,
+            length,
+            out_bytes);
+    }
     if (filed_page_cache.active_slots == 0) {
         filed_page_cache.direct_reads++;
         return filed_backend_pread(
@@ -3012,6 +3027,97 @@ static int filed_dispatch_pread(
     return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
+static filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
+    filed_runtime_t *runtime,
+    void *page,
+    int vmo_fd)
+{
+    filed_wire_pread_vmo_t *pread_vmo = (filed_wire_pread_vmo_t *)page;
+    filed_vfs_io_decision_t decision;
+    uint64_t bytes = 0;
+
+    if (vmo_fd < 16 ||
+        pread_vmo->reserved0 != 0 ||
+        pread_vmo->reserved1 != 0 ||
+        pread_vmo->vmo_offset + pread_vmo->length < pread_vmo->vmo_offset)
+    {
+        return filed_page_result(-22, 0);
+    }
+    if (pread_vmo->length == 0) {
+        return filed_page_result(0, 0);
+    }
+
+    filed_status_t status = filed_vfs_pread_prepare(
+        &runtime->vfs,
+        (filed_handle_id_t)(uint32_t)pread_vmo->handle,
+        pread_vmo->file_offset,
+        pread_vmo->length,
+        &decision);
+    int64_t reply_status = filed_status_to_wire(status);
+    if (status != FILED_OK) {
+        return filed_page_result(reply_status, 0);
+    }
+
+    const uint64_t length = decision.length;
+    if (length == 0 || pread_vmo->vmo_offset + length < pread_vmo->vmo_offset) {
+        return filed_page_result(0, 0);
+    }
+
+    unsigned char *mapped = pacha_mmap(
+        vmo_fd,
+        pread_vmo->vmo_offset + length,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (mapped == NULL) {
+        return filed_page_result(-12, 0);
+    }
+
+    reply_status = filed_cached_pread(
+        runtime,
+        decision.backend_object,
+        decision.offset,
+        mapped + pread_vmo->vmo_offset,
+        length,
+        &bytes);
+    (void)pacha_munmap(mapped, pread_vmo->vmo_offset + length);
+    if (reply_status == 0) {
+        filed_runtime_publish_generation(
+            runtime,
+            (filed_handle_id_t)(uint32_t)pread_vmo->handle,
+            decision.object_generation,
+            decision.dir_generation);
+    }
+    return filed_page_result(reply_status, bytes);
+}
+
+static int filed_dispatch_pread_to_vmo(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    if (request == NULL ||
+        request->fd_count < 2 ||
+        request->fds == NULL ||
+        request->fds[1].fd < 16)
+    {
+        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
+    }
+
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    const int vmo_fd = (int)request->fds[1].fd;
+    const filed_page_dispatch_result_t result = filed_dispatch_pread_to_vmo_page(runtime, page, vmo_fd);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    (void)pacha_fd_close(vmo_fd);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+}
+
 static filed_page_dispatch_result_t filed_dispatch_read_page(
     filed_runtime_t *runtime,
     void *page)
@@ -4222,19 +4328,18 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
         exec->inherit_handle_count > FILED_WIRE_EXEC_MAX_INHERIT_HANDLES ||
         exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
         exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
-        exec->reserved1 != 0 ||
-        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        !filed_name_is_terminated(exec->argv0, sizeof(exec->argv0)))
+        exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)))
     {
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_name_is_terminated(exec->argv[i], sizeof(exec->argv[i]))) {
+        if (!filed_wire_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_name_is_terminated(exec->envp[i], sizeof(exec->envp[i]))) {
+        if (!filed_wire_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
@@ -4371,19 +4476,18 @@ static int filed_dispatch_exec_path(
         exec->fd_patch_count > FILED_WIRE_EXEC_MAX_FD_PATCHES ||
         exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
         exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
-        exec->reserved1 != 0 ||
-        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        !filed_name_is_terminated(exec->argv0, sizeof(exec->argv0)))
+        exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)))
     {
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_name_is_terminated(exec->argv[i], sizeof(exec->argv[i]))) {
+        if (!filed_wire_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_name_is_terminated(exec->envp[i], sizeof(exec->envp[i]))) {
+        if (!filed_wire_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
@@ -4681,6 +4785,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_pread_page(runtime, page);
     case FILED_WIRE_OP_READ:
         return filed_dispatch_read_page(runtime, page);
+    case FILED_WIRE_OP_PREAD_TO_VMO:
+        return filed_page_result(-95, 0);
     case FILED_WIRE_OP_PWRITE:
         return filed_dispatch_pwrite_page(runtime, page);
     case FILED_WIRE_OP_WRITE:
@@ -5060,6 +5166,9 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
         break;
     case FILED_WIRE_OP_READ:
         dispatch_status = filed_dispatch_read(runtime, reply_fd, &request);
+        break;
+    case FILED_WIRE_OP_PREAD_TO_VMO:
+        dispatch_status = filed_dispatch_pread_to_vmo(runtime, reply_fd, &request);
         break;
     case FILED_WIRE_OP_PWRITE:
         dispatch_status = filed_dispatch_pwrite(runtime, reply_fd, &request);

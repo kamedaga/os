@@ -19,7 +19,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 
 - **Pure Microkernel** — カーネルは ファイルディスクリプタ 管理・スケジューリング・trap delegation のみを担当
 - **FD-based Microkernel** — Capabilityとほぼ特性の同じ権限ベースのFD(File Descriptor)を採用していて、厳格なセキュリティとLinux ABIおよびPOSIXの相性の良さを両立しています
-- **Trap Delegation** — Linux syscall をカーネルが解釈せず、capability で制御されたユーザーランドサーバーが処理
+- **Linux Personality Runtime** — Linux syscallをzpolineを用いてcallqに置き換えることで、動的にリンクされるshimが呼び出されprocess内で完結します。
 - **Hardware FD** — capsule を用いた、デバイスアクセスおよび特権命令の抽象化
 - **Linux ABI Compatibility** — 無改造の Linuxバイナリ を動的リンクでロードし、Linux syscall をユーザーランドで処理
 - **Userland Drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
@@ -28,6 +28,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 - **Minimal Kernel** — 20k以下を維持するマイクロカーネルです。(現在16k) 
 
 ## Update
+- Linux Personality Runtimeを実装しました
 - カーネルを再設計しFD-based Microkernelへ変更しました
 - 独自ドライバからkoboxに全面移行しました。
 - Linux ABIレイヤーなしで musl libcに対応しました。

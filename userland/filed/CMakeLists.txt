@@ -54,6 +54,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/internal.h"
     ${FILED_EXTRA_SOURCES}
     "${REPO_ROOT}/userland/koboxd/include/koboxd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/personality/include/personality/zpoline.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM

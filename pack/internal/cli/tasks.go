@@ -688,20 +688,26 @@ func genManifestsCommand(ctx *context) *cobra.Command {
 
 func syncRootfsCommand(ctx *context) *cobra.Command {
 	var force bool
+	var noBuild bool
 	cmd := &cobra.Command{
 		Use:   "rootfs",
 		Short: "Sync generated rootfs manifest into the FAT32 rootfs partition",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ui.Task("build:userland")
-			userland, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{Progress: ui.NewProgressReporter()})
-			if err != nil {
-				return err
+			var userland buildsys.UserlandResult
+			if !noBuild {
+				ui.Task("build:userland")
+				result, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{Progress: ui.NewProgressReporter()})
+				if err != nil {
+					return err
+				}
+				printUserland(result)
+				userland = result
 			}
-			printUserland(userland)
-			return runRootfsSync(ctx, userland, force)
+			return runRootfsSyncWithOptions(ctx, userland, force, noBuild)
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "force rootfs rewrite even when fingerprint is unchanged")
+	cmd.Flags().BoolVar(&noBuild, "no-build", false, "sync rootfs from existing artifacts without building userland")
 	return cmd
 }
 
@@ -743,6 +749,10 @@ func printUserland(result buildsys.UserlandResult) {
 }
 
 func runRootfsSync(ctx *context, userland buildsys.UserlandResult, force bool) error {
+	return runRootfsSyncWithOptions(ctx, userland, force, false)
+}
+
+func runRootfsSyncWithOptions(ctx *context, userland buildsys.UserlandResult, force bool, noBuild bool) error {
 	ui.Task("init:disk")
 	disk, err := diskimage.EnsureWithOptions(ctx.workspace, diskimage.Options{Progress: ui.NewProgressReporter()})
 	if err != nil {
@@ -768,7 +778,7 @@ func runRootfsSync(ctx *context, userland buildsys.UserlandResult, force bool) e
 		return err
 	}
 	rootfsForce := force
-	manifestReuse := !force && userland.DirectoryArtifactsChanged == 0 && !hasDirectoryPath(changedSources)
+	manifestReuse := !force && !noBuild && userland.DirectoryArtifactsChanged == 0 && !hasDirectoryPath(changedSources)
 	generated, err := generateOrReuseManifests(ctx, manifestReuse)
 	if err != nil {
 		return err

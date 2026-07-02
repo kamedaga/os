@@ -754,6 +754,7 @@ pub const VmaEntry = struct {
 pub const VmaTable = struct {
     entries: [max_vmas_per_process]VmaEntry = [_]VmaEntry{.{}} ** max_vmas_per_process,
     next_user_map_va: u64 = 0,
+    active_count: usize = 0,
 };
 
 pub const NativeVmaFaultMapping = struct {
@@ -2475,18 +2476,18 @@ pub const KernelState = struct {
         errdefer if (has_after) self.releaseNativeVmo(original.vmo);
 
         if (has_before) {
-            table.entries[before_index] = original;
+            installVmaEntry(table, before_index, original);
             table.entries[before_index].size_bytes = before_size;
         }
         if (has_after) {
-            table.entries[after_index] = original;
+            installVmaEntry(table, after_index, original);
             table.entries[after_index].start_va = page_end_va;
             table.entries[after_index].size_bytes = after_size;
             table.entries[after_index].vmo_offset = original.vmo_offset + target_offset + native_page_size;
         }
 
         entry = &table.entries[entry_index];
-        entry.* = .{
+        installVmaEntry(table, entry_index, .{
             .active = true,
             .start_va = fault_page_va,
             .size_bytes = native_page_size,
@@ -2502,7 +2503,7 @@ pub const KernelState = struct {
             },
             .vmo = private_vmo,
             .vmo_offset = 0,
-        };
+        });
         self.releaseNativeVmo(original.vmo);
         return private_vmo;
     }
@@ -2655,11 +2656,11 @@ pub const KernelState = struct {
             const before_index = if (has_before) findFreeVma(table) orelse return KernelError.TableFull else 0;
             if (has_before) try self.retainNativeVmo(original.vmo);
             errdefer if (has_before) {
-                table.entries[before_index] = .{};
+                clearVmaEntry(table, before_index);
                 self.releaseNativeVmo(original.vmo);
             };
             if (has_before) {
-                table.entries[before_index] = original;
+                installVmaEntry(table, before_index, original);
                 table.entries[before_index].size_bytes = before_size;
             }
 
@@ -2667,7 +2668,7 @@ pub const KernelState = struct {
             if (has_after) try self.retainNativeVmo(original.vmo);
             errdefer if (has_after) self.releaseNativeVmo(original.vmo);
             if (has_after) {
-                table.entries[after_index] = original;
+                installVmaEntry(table, after_index, original);
                 table.entries[after_index].start_va = end_va;
                 table.entries[after_index].size_bytes = after_size;
                 table.entries[after_index].vmo_offset = original.vmo_offset + target_offset + size_bytes;
@@ -2719,12 +2720,13 @@ pub const KernelState = struct {
 
     fn releaseVmaTableForProcessIndex(self: *KernelState, index: usize) void {
         const table = self.vmaTableForProcessIndex(index) orelse return;
-        for (table.entries[0..]) |*entry| {
+        for (table.entries[0..], 0..) |*entry, vma_index| {
             if (!entry.active) continue;
             const vmo_ref = entry.vmo;
-            entry.* = .{};
+            clearVmaEntry(table, vma_index);
             self.releaseNativeVmo(vmo_ref);
         }
+        table.active_count = 0;
     }
 
     fn releaseVmaTableForProcessIndexWithFreeList(
@@ -2733,12 +2735,13 @@ pub const KernelState = struct {
         free_list: *FreePageList,
     ) void {
         const table = self.vmaTableForProcessIndex(index) orelse return;
-        for (table.entries[0..]) |*entry| {
+        for (table.entries[0..], 0..) |*entry, vma_index| {
             if (!entry.active) continue;
             const vmo_ref = entry.vmo;
-            entry.* = .{};
+            clearVmaEntry(table, vma_index);
             self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
         }
+        table.active_count = 0;
     }
 
     pub fn releasePrincipalNativeMemory(
@@ -2764,11 +2767,33 @@ pub const KernelState = struct {
         return null;
     }
 
+    fn installVmaEntry(table: *VmaTable, index: usize, entry: VmaEntry) void {
+        if (index >= table.entries.len) return;
+        const was_active = table.entries[index].active;
+        table.entries[index] = entry;
+        if (!was_active and entry.active) {
+            table.active_count += 1;
+        } else if (was_active and !entry.active and table.active_count != 0) {
+            table.active_count -= 1;
+        }
+    }
+
+    fn clearVmaEntry(table: *VmaTable, index: usize) void {
+        if (index >= table.entries.len) return;
+        if (table.entries[index].active and table.active_count != 0) {
+            table.active_count -= 1;
+        }
+        table.entries[index] = .{};
+    }
+
     fn vmaRangeOverlaps(table: *const VmaTable, start_va: u64, size_bytes: u64) KernelError!bool {
         const end_va = try checkedEnd(start_va, size_bytes);
+        var seen_active: usize = 0;
         for (table.entries[0..]) |*entry| {
             if (!entry.active) continue;
+            seen_active += 1;
             if (start_va < entry.endVa() and end_va > entry.start_va) return true;
+            if (seen_active >= table.active_count) break;
         }
         return false;
     }
@@ -2900,7 +2925,7 @@ pub const KernelState = struct {
         try self.retainNativeVmo(vmo_ref);
         errdefer self.releaseNativeVmoWithFreeList(vmo_ref, free_list);
 
-        vma_table.entries[vma_index] = .{
+        installVmaEntry(vma_table, vma_index, .{
             .active = true,
             .start_va = start_va,
             .size_bytes = size_bytes,
@@ -2908,7 +2933,7 @@ pub const KernelState = struct {
             .flags = flags,
             .vmo = vmo_ref,
             .vmo_offset = 0,
-        };
+        });
         return vmo_ref;
     }
 
@@ -2932,7 +2957,7 @@ pub const KernelState = struct {
         if (try vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
         const vma_index = findFreeVma(vma_table) orelse return KernelError.TableFull;
         try self.retainNativeVmo(vmo_ref);
-        vma_table.entries[vma_index] = .{
+        installVmaEntry(vma_table, vma_index, .{
             .active = true,
             .start_va = start_va,
             .size_bytes = size_bytes,
@@ -2940,7 +2965,7 @@ pub const KernelState = struct {
             .flags = flags,
             .vmo = vmo_ref,
             .vmo_offset = vmo_offset,
-        };
+        });
     }
 
     pub fn fdInfo(self: *const KernelState, owner: PrincipalId, fd: Fd) ?FdInfo {
@@ -3681,7 +3706,7 @@ pub const KernelState = struct {
             if (cut_start <= entry_start and cut_end >= entry_end) {
                 const vmo_ref = entry.vmo;
                 const was_anonymous = entry.flags.anonymous;
-                entry.* = .{};
+                clearVmaEntry(table, index);
                 if (was_anonymous) {
                     self.releaseUnmappedAnonymousVmoPageRange(owner, vmo_ref, cut_vmo_first_page, cut_page_count, free_list);
                 }
@@ -3713,7 +3738,7 @@ pub const KernelState = struct {
             const after_index = findFreeVma(table) orelse return KernelError.TableFull;
             const original = entry.*;
             try self.retainNativeVmo(original.vmo);
-            table.entries[after_index] = original;
+            installVmaEntry(table, after_index, original);
             table.entries[after_index].start_va = cut_end;
             table.entries[after_index].size_bytes = entry_end - cut_end;
             table.entries[after_index].vmo_offset = original.vmo_offset + (cut_end - entry_start);

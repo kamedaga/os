@@ -1191,7 +1191,11 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
         stat.blocks = snapshot.blocks;
         stat.nlink = snapshot.nlink;
         stat.kind = snapshot.kind;
-    } else {
+    }
+    if (!snapshot.valid ||
+        (stat.kind & 0170000u) == 0 ||
+        stat.size < LPR_EXEC_EHDR_BYTES)
+    {
         stage_start = lpr_exec_image_now_ns();
         const int status = filed_runtime_backend_statx(runtime, stat_decision.backend_object, &stat);
         lpr_exec_image_metric("backend_statx", stage_start, lpr_exec_image_now_ns(), 0);
@@ -1210,6 +1214,14 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
         stat.size < LPR_EXEC_EHDR_BYTES ||
         stat.size > LPR_EXEC_MAX_IMAGE_BYTES)
     {
+        fprintf(stderr,
+            "[filed] linux-lpr: exec stat invalid handle=%u backend=0x%llx kind=0%llo mode=0%llo size=%llu snapshot_valid=%u\n",
+            (unsigned)handle_id,
+            (unsigned long long)stat_decision.backend_object,
+            (unsigned long long)stat.kind,
+            (unsigned long long)stat.mode,
+            (unsigned long long)stat.size,
+            snapshot.valid ? 1u : 0u);
         return -8;
     }
     out_file->handle_id = handle_id;

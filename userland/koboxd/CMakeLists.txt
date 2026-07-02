@@ -140,6 +140,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/personality/linux/hde/hde64.c"
     "${REPO_ROOT}/userland/personality/linux/hde/hde64.h"
     "${REPO_ROOT}/userland/personality/linux/hde/table64.h"
+    "${REPO_ROOT}/userland/personality/include/personality/zpoline.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/block_service.c"

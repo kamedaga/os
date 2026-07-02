@@ -106,10 +106,13 @@ static uint64_t request_argc(const filed_wire_exec_path_t *request)
 
 static const char *request_arg(const filed_wire_exec_path_t *request, uint64_t index)
 {
-    if (index == 0) {
-        return request->argv0[0] != '\0' ? request->argv0 : request->path;
+    if (request == NULL) {
+        return "";
     }
-    return request->argv[index];
+    if (request->argc != 0 && index < request->argc) {
+        return filed_wire_exec_string(request, request->argv[index]);
+    }
+    return request->path;
 }
 
 int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *request, int bootstrap_fd)
@@ -176,7 +179,12 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
     stage_start = lpr_exec_now_ns();
     stage_start_cycles = lpr_exec_now_cycles();
     for (uint64_t i = envc; i > 0; --i) {
-        const int status = copy_stack_string(stack, &sp, stack_base, request->envp[i - 1u], &envp_va[i - 1u]);
+        const int status = copy_stack_string(
+            stack,
+            &sp,
+            stack_base,
+            filed_wire_exec_string(request, request->envp[i - 1u]),
+            &envp_va[i - 1u]);
         if (status != 0) {
             (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
             (void)pacha_fd_close(stack_fd);

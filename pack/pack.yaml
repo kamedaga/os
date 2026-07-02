@@ -568,19 +568,27 @@ apps:
     rootfs: "/cmd/lua_workload.lua"
   chibicc_cli:
     file:
-      path: ".artifacts/musl-pachaos/chibicc.elf"
-      rebuild: ["bash", "tools/build_pachaos_chibicc.sh", ".artifacts/musl-pachaos/chibicc.elf"]
+      path: ".artifacts/userland-fixtures/lpr_chibicc_dynamic.elf"
+      rebuild: ["bash", "tools/build_lpr_chibicc_dynamic.sh", ".artifacts/userland-fixtures/lpr_chibicc_dynamic.elf"]
       input:
-        - "tools/build_pachaos_chibicc.sh"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/pachaos/cli/pachaos_cli_shim.c"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "tools/build_lpr_chibicc_dynamic.sh"
+        - "tools/build_lpr_lua_launcher.sh"
+        - "tools/copy_lpr_linux_musl.sh"
     out: "CHIBICC.ELF"
     rootfs: "/cmd/chibicc.elf"
   chibicc_cli_workload:
     file: "musl/pachaos/smoke/chibicc_workload.c"
     out: "CHIBIWORK.C"
     rootfs: "/cmd/chibicc_workload.c"
+  chibicc_toolchain_root:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-chibicc-toolchain-root"
+      rebuild: ["bash", "tools/download_lpr_chibicc_toolchain.sh", ".artifacts/userland-fixtures/lpr-chibicc-toolchain-root"]
+      input:
+        - "tools/download_lpr_chibicc_toolchain.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+    out: "ROOT"
+    rootfs: "/"
   pachaos_capsule:
     role: "service"
     file:
@@ -681,6 +689,7 @@ apps:
         - "userland/koboxd/src"
         - "userland/filed/include"
         - "userland/filed/src"
+        - "userland/personality/include"
     out: "KOBOXD.ELF"
     rootfs: "/sbin/koboxd.elf"
   filed:
@@ -699,6 +708,7 @@ apps:
         - "userland/libpacha/src"
         - "musl/pachaos/include"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "userland/personality/include"
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
   net_bench:

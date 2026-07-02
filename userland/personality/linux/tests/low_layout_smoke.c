@@ -34,7 +34,7 @@ int main(void) {
 
     if (expect(lpr_low_region_allowed_for_linux_mapping(0, 1) == LPR_LOW_LAYOUT_RESERVED)) return 1;
     if (expect(lpr_low_region_allowed_for_linux_mapping(0x1000, 0x1000) == LPR_LOW_LAYOUT_RESERVED)) return 1;
-    if (expect(lpr_low_region_allowed_for_linux_mapping(0x400000, 0x1000) == LPR_LOW_LAYOUT_RESERVED)) return 1;
+    if (expect(lpr_low_region_allowed_for_linux_mapping(0x400000, 0x1000) == LPR_LOW_LAYOUT_OK)) return 1;
     if (expect(lpr_low_region_allowed_for_linux_mapping(LPR_LOW_USER_MIN_VA, 0x1000) == LPR_LOW_LAYOUT_OK)) return 1;
     if (expect(lpr_low_region_allowed_for_linux_mapping(UINT64_MAX, 2) == LPR_LOW_LAYOUT_OVERFLOW)) return 1;
 

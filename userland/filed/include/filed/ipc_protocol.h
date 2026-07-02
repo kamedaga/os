@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 enum {
@@ -39,6 +40,7 @@ enum {
     FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 30,
     FILED_WIRE_OP_PWRITE_BATCH = 31,
     FILED_WIRE_OP_WRITE_BATCH = 32,
+    FILED_WIRE_OP_PREAD_TO_VMO = 33,
 
     FILED_WIRE_NAME_BYTES = 96,
     FILED_WIRE_IO_BYTES = 7680,
@@ -94,10 +96,9 @@ enum {
     FILED_WIRE_EXEC_MAX_INHERIT_FDS = 4,
     FILED_WIRE_EXEC_MAX_INHERIT_HANDLES = 4,
     FILED_WIRE_EXEC_MAX_FD_PATCHES = 4,
-    FILED_WIRE_EXEC_MAX_ARGS = 8,
-    FILED_WIRE_EXEC_MAX_ENVS = 8,
-    FILED_WIRE_EXEC_ARG_BYTES = 128,
-    FILED_WIRE_EXEC_ENV_BYTES = 128,
+    FILED_WIRE_EXEC_MAX_ARGS = 128,
+    FILED_WIRE_EXEC_MAX_ENVS = 64,
+    FILED_WIRE_EXEC_STRING_BYTES = 6144,
 
     FILED_WIRE_EXEC_PATCH_INHERIT_FD = 1,
     FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FD = 2,
@@ -132,6 +133,15 @@ typedef struct filed_wire_io {
     uint64_t length;
     uint8_t data[FILED_WIRE_IO_BYTES];
 } filed_wire_io_t;
+
+typedef struct filed_wire_pread_vmo {
+    uint64_t handle;
+    uint64_t file_offset;
+    uint64_t vmo_offset;
+    uint64_t length;
+    uint64_t reserved0;
+    uint64_t reserved1;
+} filed_wire_pread_vmo_t;
 
 typedef struct filed_wire_fast_header {
     uint64_t magic;
@@ -283,19 +293,46 @@ typedef struct filed_wire_exec_fd_patch {
     uint64_t reserved0;
 } filed_wire_exec_fd_patch_t;
 
+typedef struct filed_wire_exec_string_ref {
+    uint16_t offset;
+    uint16_t length;
+} filed_wire_exec_string_ref_t;
+
 typedef struct filed_wire_exec_path {
     uint64_t dir_handle;
     uint64_t flags;
     uint64_t inherit_fd_count;
     uint64_t fd_patch_count;
     uint64_t inherit_handle_count;
-    uint64_t reserved1;
+    uint64_t string_bytes;
     uint64_t argc;
     uint64_t envc;
     uint64_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
     filed_wire_exec_fd_patch_t fd_patches[FILED_WIRE_EXEC_MAX_FD_PATCHES];
     char path[FILED_WIRE_NAME_BYTES];
-    char argv0[FILED_WIRE_NAME_BYTES];
-    char argv[FILED_WIRE_EXEC_MAX_ARGS][FILED_WIRE_EXEC_ARG_BYTES];
-    char envp[FILED_WIRE_EXEC_MAX_ENVS][FILED_WIRE_EXEC_ENV_BYTES];
+    filed_wire_exec_string_ref_t argv[FILED_WIRE_EXEC_MAX_ARGS];
+    filed_wire_exec_string_ref_t envp[FILED_WIRE_EXEC_MAX_ENVS];
+    char strings[FILED_WIRE_EXEC_STRING_BYTES];
 } filed_wire_exec_path_t;
+
+static inline int filed_wire_exec_string_ref_valid(
+    const filed_wire_exec_path_t *request,
+    filed_wire_exec_string_ref_t ref)
+{
+    if (request == NULL ||
+        request->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
+        ref.length == 0 ||
+        ref.offset >= request->string_bytes ||
+        (uint64_t)ref.offset + (uint64_t)ref.length > request->string_bytes)
+    {
+        return 0;
+    }
+    return request->strings[(uint64_t)ref.offset + (uint64_t)ref.length - 1u] == '\0';
+}
+
+static inline const char *filed_wire_exec_string(
+    const filed_wire_exec_path_t *request,
+    filed_wire_exec_string_ref_t ref)
+{
+    return &request->strings[ref.offset];
+}

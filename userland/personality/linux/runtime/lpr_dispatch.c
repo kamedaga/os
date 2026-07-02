@@ -2,9 +2,12 @@
 #include "lpr_filed.h"
 #include "lpr_memory.h"
 #include "lpr_vfs_local.h"
+#include "support/string.h"
 #include "support/syscall.h"
+#include <pacha/ipc.h>
 #include <pachaos/abi.h>
 #include <personality/linux_lpr.h>
+#include <stddef.h>
 
 #define LPR_LINUX_PROT_READ 0x1ull
 #define LPR_LINUX_PROT_WRITE 0x2ull
@@ -18,7 +21,27 @@
 #define LPR_LINUX_AT_FDCWD ((uint64_t)(int64_t)-100)
 #define LPR_LINUX_AT_REMOVEDIR 0x200ull
 
-#if LPR_TRACE_PATCH_MAPPING || LPR_TRACE_SYSCALL_METRICS
+typedef struct lpr_file_map_cache_entry {
+    uint8_t active;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    uint32_t vmo_fd;
+    uint64_t handle;
+    uint64_t length;
+} lpr_file_map_cache_entry_t;
+
+enum {
+    LPR_FILE_MAP_CACHE_ENTRIES = 4,
+    LPR_FILE_MAP_CACHE_MIN_BYTES = 65536,
+};
+
+static lpr_file_map_cache_entry_t lpr_file_map_cache[LPR_FILE_MAP_CACHE_ENTRIES];
+static uint64_t lpr_file_map_cache_clock;
+
+static int64_t lpr_linux_pacha_status_to_errno(int64_t status);
+static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
+
+#if LPR_TRACE_PATCH_MAPPING || LPR_TRACE_SYSCALL_METRICS || LPR_TRACE_MMAP_LOADS || LPR_TRACE_MMAP_CALLS
 static char *lpr_append_literal(char *out, const char *end, const char *text)
 {
     while (out < end && *text != 0) {
@@ -39,6 +62,50 @@ static char *lpr_append_u64(char *out, const char *end, uint64_t value)
         *out++ = tmp[--n];
     }
     return out;
+}
+#endif
+
+#if LPR_TRACE_MMAP_CALLS
+static char *lpr_append_i64(char *out, const char *end, int64_t value)
+{
+    if (value < 0) {
+        out = lpr_append_literal(out, end, "-");
+        return lpr_append_u64(out, end, (uint64_t)(-value));
+    }
+    return lpr_append_u64(out, end, (uint64_t)value);
+}
+
+static void lpr_trace_mmap_call(
+    const char *op,
+    uint64_t addr,
+    uint64_t len,
+    uint64_t prot,
+    uint64_t flags,
+    uint64_t fd,
+    uint64_t offset,
+    int64_t result)
+{
+    char line[320];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_append_literal(out, end, "[lpr_runtime] mmap_call op=");
+    out = lpr_append_literal(out, end, op);
+    out = lpr_append_literal(out, end, " addr=");
+    out = lpr_append_u64(out, end, addr);
+    out = lpr_append_literal(out, end, " len=");
+    out = lpr_append_u64(out, end, len);
+    out = lpr_append_literal(out, end, " prot=");
+    out = lpr_append_u64(out, end, prot);
+    out = lpr_append_literal(out, end, " flags=");
+    out = lpr_append_u64(out, end, flags);
+    out = lpr_append_literal(out, end, " fd=");
+    out = lpr_append_u64(out, end, fd);
+    out = lpr_append_literal(out, end, " offset=");
+    out = lpr_append_u64(out, end, offset);
+    out = lpr_append_literal(out, end, " result=");
+    out = lpr_append_i64(out, end, result);
+    out = lpr_append_literal(out, end, "\n");
+    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
 }
 #endif
 
@@ -265,6 +332,116 @@ static void lpr_trace_syscall_dump(uint64_t exit_nr)
     out = lpr_append_literal(out, end, "\n");
     lpr_trace_write_line(line, (uint64_t)(out - line));
 }
+
+#if LPR_TRACE_SLOW_SYSCALLS
+static void lpr_trace_slow_syscall(
+    uint64_t nr,
+    uint64_t a0,
+    uint64_t a1,
+    uint64_t a2,
+    uint64_t a3,
+    uint64_t a4,
+    uint64_t a5,
+    int64_t result,
+    uint64_t cycles)
+{
+    char line[384];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_append_literal(out, end, "[lpr_runtime] slow_syscall nr=");
+    out = lpr_append_u64(out, end, nr);
+    out = lpr_append_literal(out, end, " a0=");
+    out = lpr_append_u64(out, end, a0);
+    out = lpr_append_literal(out, end, " a1=");
+    out = lpr_append_u64(out, end, a1);
+    out = lpr_append_literal(out, end, " a2=");
+    out = lpr_append_u64(out, end, a2);
+    out = lpr_append_literal(out, end, " a3=");
+    out = lpr_append_u64(out, end, a3);
+    out = lpr_append_literal(out, end, " a4=");
+    out = lpr_append_u64(out, end, a4);
+    out = lpr_append_literal(out, end, " a5=");
+    out = lpr_append_u64(out, end, a5);
+    out = lpr_append_literal(out, end, " result=");
+    if (result < 0) {
+        out = lpr_append_literal(out, end, "-");
+        out = lpr_append_u64(out, end, (uint64_t)(-result));
+    } else {
+        out = lpr_append_u64(out, end, (uint64_t)result);
+    }
+    out = lpr_append_literal(out, end, " cycles=");
+    out = lpr_append_u64(out, end, cycles);
+    out = lpr_append_literal(out, end, "\n");
+    lpr_trace_write_line(line, (uint64_t)(out - line));
+}
+#endif
+
+static void lpr_trace_mmap_error(
+    const char *stage,
+    uint64_t addr,
+    uint64_t len,
+    uint64_t prot,
+    uint64_t flags,
+    uint64_t fd,
+    uint64_t offset,
+    int64_t status)
+{
+    char line[320];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_append_literal(out, end, "[lpr_runtime] mmap_error stage=");
+    out = lpr_append_literal(out, end, stage);
+    out = lpr_append_literal(out, end, " addr=");
+    out = lpr_append_u64(out, end, addr);
+    out = lpr_append_literal(out, end, " len=");
+    out = lpr_append_u64(out, end, len);
+    out = lpr_append_literal(out, end, " prot=");
+    out = lpr_append_u64(out, end, prot);
+    out = lpr_append_literal(out, end, " flags=");
+    out = lpr_append_u64(out, end, flags);
+    out = lpr_append_literal(out, end, " fd=");
+    out = lpr_append_u64(out, end, fd);
+    out = lpr_append_literal(out, end, " offset=");
+    out = lpr_append_u64(out, end, offset);
+    out = lpr_append_literal(out, end, " status=");
+    if (status < 0) {
+        out = lpr_append_literal(out, end, "-");
+        out = lpr_append_u64(out, end, (uint64_t)(-status));
+    } else {
+        out = lpr_append_u64(out, end, (uint64_t)status);
+    }
+    out = lpr_append_literal(out, end, "\n");
+    lpr_trace_write_line(line, (uint64_t)(out - line));
+}
+#endif
+
+#if LPR_TRACE_MMAP_LOADS
+static void lpr_trace_mmap_load(
+    uint64_t len,
+    uint64_t loaded,
+    uint64_t prot,
+    uint64_t flags,
+    uint64_t fd,
+    uint64_t offset)
+{
+    char line[240];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_append_literal(out, end, "[lpr_runtime] mmap_load len=");
+    out = lpr_append_u64(out, end, len);
+    out = lpr_append_literal(out, end, " loaded=");
+    out = lpr_append_u64(out, end, loaded);
+    out = lpr_append_literal(out, end, " prot=");
+    out = lpr_append_u64(out, end, prot);
+    out = lpr_append_literal(out, end, " flags=");
+    out = lpr_append_u64(out, end, flags);
+    out = lpr_append_literal(out, end, " fd=");
+    out = lpr_append_u64(out, end, fd);
+    out = lpr_append_literal(out, end, " offset=");
+    out = lpr_append_u64(out, end, offset);
+    out = lpr_append_literal(out, end, "\n");
+    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+}
 #endif
 
 static uint64_t lpr_page_align_up(uint64_t value)
@@ -274,6 +451,50 @@ static uint64_t lpr_page_align_up(uint64_t value)
         return 0;
     }
     return (value + mask) & ~mask;
+}
+
+static lpr_file_map_cache_entry_t *lpr_file_map_cache_find(uint64_t handle, uint64_t offset, uint64_t length)
+{
+    if (handle == 0 || offset + length < offset) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < LPR_FILE_MAP_CACHE_ENTRIES; i += 1) {
+        lpr_file_map_cache_entry_t *entry = &lpr_file_map_cache[i];
+        if (entry->active &&
+            entry->handle == handle &&
+            offset + length <= entry->length)
+        {
+            return entry;
+        }
+    }
+    return 0;
+}
+
+static void lpr_file_map_cache_store(uint64_t handle, int64_t vmo_fd, uint64_t length)
+{
+    if (handle == 0 || vmo_fd < 16 || length < LPR_FILE_MAP_CACHE_MIN_BYTES) {
+        return;
+    }
+    for (uint64_t i = 0; i < LPR_FILE_MAP_CACHE_ENTRIES; i += 1) {
+        lpr_file_map_cache_entry_t *entry = &lpr_file_map_cache[i];
+        if (entry->active && entry->handle == handle) {
+            if (entry->vmo_fd >= 16 && entry->vmo_fd != (uint32_t)vmo_fd) {
+                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, entry->vmo_fd);
+            }
+            entry->vmo_fd = (uint32_t)vmo_fd;
+            entry->length = length;
+            return;
+        }
+    }
+    const uint64_t slot = lpr_file_map_cache_clock++ % LPR_FILE_MAP_CACHE_ENTRIES;
+    lpr_file_map_cache_entry_t *entry = &lpr_file_map_cache[slot];
+    if (entry->active && entry->vmo_fd >= 16) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, entry->vmo_fd);
+    }
+    entry->active = 1;
+    entry->vmo_fd = (uint32_t)vmo_fd;
+    entry->handle = handle;
+    entry->length = length;
 }
 
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status)
@@ -385,37 +606,152 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
             PACHAOS_PROT_READ |
             PACHAOS_PROT_WRITE |
             (lpr_linux_prot_to_pacha(prot) & PACHAOS_PROT_EXEC);
-        const int64_t mapped = lpr_pacha_syscall6(
+        const uint64_t final_prot = lpr_linux_prot_to_pacha(prot);
+        const uint64_t handle = lpr_linux_filed_fd_handle(fd);
+        uint64_t done = 0;
+        int64_t mapped = 0;
+        int64_t vmo_fd = -1;
+        const uint64_t direct_map_flags =
+            (pacha_flags & (PACHAOS_MMAP_FIXED | PACHAOS_MMAP_FIXED_NOREPLACE | PACHAOS_MMAP_NORESERVE)) |
+            PACHAOS_MMAP_SHARED;
+        lpr_file_map_cache_entry_t *cache = lpr_file_map_cache_find(handle, offset, map_len);
+        if (cache != 0) {
+            if ((prot & (LPR_LINUX_PROT_WRITE | LPR_LINUX_PROT_EXEC)) == 0) {
+                const uint64_t cached_map_flags =
+                    (pacha_flags & (PACHAOS_MMAP_FIXED | PACHAOS_MMAP_FIXED_NOREPLACE | PACHAOS_MMAP_NORESERVE)) |
+                    PACHAOS_MMAP_SHARED;
+                mapped = lpr_pacha_syscall6(
+                    PACHAOS_SYSCALL_MMAP,
+                    cache->vmo_fd,
+                    addr,
+                    map_len,
+                    load_prot,
+                    cached_map_flags,
+                    offset);
+                if (mapped >= 4096) {
+                    done = len;
+                    goto file_mapping_ready;
+                }
+            }
+            const uint64_t target_map_flags =
+                (pacha_flags | PACHAOS_MMAP_ANONYMOUS) & ~PACHAOS_MMAP_SHARED;
+            mapped = lpr_pacha_syscall6(
+                PACHAOS_SYSCALL_MMAP,
+                0,
+                addr,
+                map_len,
+                load_prot,
+                target_map_flags,
+                0);
+            if (mapped >= 4096) {
+                const int64_t source = lpr_pacha_syscall6(
+                    PACHAOS_SYSCALL_MMAP,
+                    cache->vmo_fd,
+                    0,
+                    map_len,
+                    PACHAOS_PROT_READ,
+                    PACHAOS_MMAP_SHARED,
+                    offset);
+                if (source >= 4096) {
+                    lpr_memcpy((void *)(uintptr_t)mapped, (const void *)(uintptr_t)source, (size_t)map_len);
+                    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)source, map_len);
+                    done = len;
+                    goto file_mapping_ready;
+                }
+                (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
+                mapped = 0;
+            }
+        }
+        const uint64_t vmo_rights =
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_TRANSFER |
+            PACHA_FD_RIGHT_MAP_READ |
+            PACHA_FD_RIGHT_MAP_WRITE |
+            PACHA_FD_RIGHT_MAP_EXEC;
+        vmo_fd = lpr_pacha_syscall3(
+            PACHAOS_SYSCALL_VMO_CREATE,
+            map_len,
+            vmo_rights,
+            0);
+        if (vmo_fd < 16) {
+#if LPR_TRACE_SYSCALL_METRICS
+            lpr_trace_mmap_error("vmo_create", addr, len, prot, flags, fd, offset, vmo_fd);
+#endif
+            return lpr_linux_pacha_status_to_errno(vmo_fd);
+        }
+        const int64_t loaded = lpr_linux_pread_to_vmo(fd, (uint64_t)(uint32_t)vmo_fd, 0, len, offset);
+        if (loaded < 0) {
+#if LPR_TRACE_SYSCALL_METRICS
+            lpr_trace_mmap_error("pread_to_vmo", addr, len, prot, flags, fd, offset, loaded);
+#endif
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
+            return loaded;
+        }
+        done = (uint64_t)loaded;
+#if LPR_TRACE_MMAP_LOADS
+        lpr_trace_mmap_load(len, done, prot, flags, fd, offset);
+#endif
+        mapped = lpr_pacha_syscall6(
             PACHAOS_SYSCALL_MMAP,
-            0,
+            (uint64_t)(uint32_t)vmo_fd,
             addr,
             map_len,
             load_prot,
-            (pacha_flags | PACHAOS_MMAP_ANONYMOUS) & ~PACHAOS_MMAP_SHARED,
+            direct_map_flags,
             0);
         if (mapped < 4096) {
-            return lpr_linux_pacha_status_to_errno(mapped);
-        }
-        uint64_t done = 0;
-        while (done < len) {
-            const uint64_t chunk = len - done > 7680ull ? 7680ull : len - done;
-            const int64_t bytes = lpr_linux_pread64(
-                fd,
-                (uint64_t)mapped + done,
-                chunk,
-                offset + done);
-            if (bytes < 0) {
+#if LPR_TRACE_SYSCALL_METRICS
+            lpr_trace_mmap_error("direct_vmo_mmap", addr, len, prot, flags, fd, offset, mapped);
+#endif
+            mapped = lpr_pacha_syscall6(
+                PACHAOS_SYSCALL_MMAP,
+                0,
+                addr,
+                map_len,
+                load_prot,
+                (pacha_flags | PACHAOS_MMAP_ANONYMOUS) & ~PACHAOS_MMAP_SHARED,
+                0);
+            if (mapped < 4096) {
+#if LPR_TRACE_SYSCALL_METRICS
+                lpr_trace_mmap_error("target_mmap", addr, len, prot, flags, fd, offset, mapped);
+#endif
+                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
+                return lpr_linux_pacha_status_to_errno(mapped);
+            }
+            const int64_t source = lpr_pacha_syscall6(
+                PACHAOS_SYSCALL_MMAP,
+                (uint64_t)(uint32_t)vmo_fd,
+                0,
+                map_len,
+                PACHAOS_PROT_READ,
+                PACHAOS_MMAP_SHARED,
+                0);
+            if (source < 4096) {
+#if LPR_TRACE_SYSCALL_METRICS
+                lpr_trace_mmap_error("source_mmap", addr, len, prot, flags, fd, offset, source);
+#endif
+                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
                 (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
-                return bytes;
+                return lpr_linux_pacha_status_to_errno(source);
             }
-            if (bytes == 0) {
-                break;
+            if (done != 0) {
+                lpr_memcpy((void *)(uintptr_t)mapped, (const void *)(uintptr_t)source, (size_t)done);
             }
-            done += (uint64_t)bytes;
-            if ((uint64_t)bytes < chunk) {
-                break;
-            }
+            (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)source, map_len);
         }
+        if (mapped >= 4096 &&
+            offset == 0 &&
+            prot == LPR_LINUX_PROT_READ &&
+            (pacha_flags & (PACHAOS_MMAP_FIXED | PACHAOS_MMAP_FIXED_NOREPLACE)) == 0 &&
+            done != 0)
+        {
+            lpr_file_map_cache_store(handle, vmo_fd, map_len);
+            vmo_fd = -1;
+        }
+        if (vmo_fd >= 16) {
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
+        }
+file_mapping_ready:
         if ((prot & LPR_LINUX_PROT_EXEC) != 0 && done != 0) {
             struct lpr_patch_mapping_result patch_result;
             const struct lpr_patch_mapping_request patch_request = {
@@ -432,16 +768,22 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
                 return -LPR_LINUX_EINVAL;
             }
         }
-        const int64_t protect_status = lpr_pacha_syscall3(
-            PACHAOS_SYSCALL_MPROTECT,
-            (uint64_t)mapped,
-            map_len,
-            lpr_linux_prot_to_pacha(prot));
-        if (protect_status != 0) {
-            (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
-            return lpr_linux_pacha_status_to_errno(protect_status);
+        if (final_prot != load_prot) {
+            const int64_t protect_status = lpr_pacha_syscall3(
+                PACHAOS_SYSCALL_MPROTECT,
+                (uint64_t)mapped,
+                map_len,
+                final_prot);
+            if (protect_status != 0) {
+                (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
+                return lpr_linux_pacha_status_to_errno(protect_status);
+            }
         }
-        return mapped;
+        const int64_t mmap_result = mapped;
+#if LPR_TRACE_MMAP_CALLS
+        lpr_trace_mmap_call("mmap", addr, len, prot, flags, fd, offset, mmap_result);
+#endif
+        return mmap_result;
     }
     const uint64_t pacha_fd = (flags & LPR_LINUX_MAP_ANONYMOUS) != 0 ? 0 : fd;
     const int64_t ret = lpr_pacha_syscall6(
@@ -452,7 +794,11 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
         lpr_linux_prot_to_pacha(prot),
         pacha_flags,
         offset);
-    return lpr_linux_pacha_status_to_errno(ret);
+    const int64_t result = lpr_linux_pacha_status_to_errno(ret);
+#if LPR_TRACE_MMAP_CALLS
+    lpr_trace_mmap_call("mmap", addr, len, prot, flags, fd, offset, result);
+#endif
+    return result;
 }
 
 static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
@@ -487,8 +833,13 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
     case LPR_LINUX_SYS_MPROTECT:
         return lpr_linux_pacha_status_to_errno(
             lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT, a0, a1, lpr_linux_prot_to_pacha(a2)));
-    case LPR_LINUX_SYS_MUNMAP:
-        return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, a0, a1));
+    case LPR_LINUX_SYS_MUNMAP: {
+        const int64_t result = lpr_linux_pacha_status_to_errno(lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, a0, a1));
+#if LPR_TRACE_MMAP_CALLS
+        lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result);
+#endif
+        return result;
+    }
     case LPR_LINUX_SYS_ARCH_PRCTL:
         return lpr_dispatch_arch_prctl(a0, a1);
     case LPR_LINUX_SYS_CLOCK_GETTIME:
@@ -574,7 +925,13 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
     const uint64_t start_cycles = lpr_trace_read_tsc();
     const int64_t result = lpr_dispatch_syscall_inner(nr, a0, a1, a2, a3, a4, a5);
     const uint64_t end_cycles = lpr_trace_read_tsc();
-    lpr_trace_syscall_record(nr, end_cycles >= start_cycles ? end_cycles - start_cycles : 0, result);
+    const uint64_t cycles = end_cycles >= start_cycles ? end_cycles - start_cycles : 0;
+    lpr_trace_syscall_record(nr, cycles, result);
+#if LPR_TRACE_SLOW_SYSCALLS
+    if (cycles >= 10000000ull) {
+        lpr_trace_slow_syscall(nr, a0, a1, a2, a3, a4, a5, result, cycles);
+    }
+#endif
     return result;
 #else
     return lpr_dispatch_syscall_inner(nr, a0, a1, a2, a3, a4, a5);

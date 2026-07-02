@@ -715,6 +715,7 @@ int filed_exec_linux_lpr_handle(
     status = lpr_exec_init_file_from_handle(runtime, handle_id, &file);
     LPR_EXEC_STAGE_RECORD_TO("init_main_file", stage_start, stage_start_cycles, init_main_file_cycles);
     if (status != 0) {
+        fprintf(stderr, "[filed] linux-lpr: init main file failed status=%d\n", status);
         lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
@@ -722,6 +723,12 @@ int filed_exec_linux_lpr_handle(
     status = lpr_exec_read_meta(runtime, &file, &meta);
     LPR_EXEC_STAGE_RECORD_TO("read_main_meta", stage_start, stage_start_cycles, read_main_meta_cycles);
     if (status != 0) {
+        fprintf(stderr,
+            "[filed] linux-lpr: read main meta failed status=%d size=%llu backend=0x%llx generation=%llu\n",
+            status,
+            (unsigned long long)file.size,
+            (unsigned long long)file.backend_object,
+            (unsigned long long)file.object_generation);
         lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
@@ -730,6 +737,12 @@ int filed_exec_linux_lpr_handle(
     LPR_EXEC_STAGE_RECORD_TO("load_plan", stage_start, stage_start_cycles, load_plan_cycles);
     lpr_exec_free_meta(&meta);
     if (status != 0) {
+        fprintf(stderr,
+            "[filed] linux-lpr: load plan failed status=%d size=%llu backend=0x%llx generation=%llu\n",
+            status,
+            (unsigned long long)file.size,
+            (unsigned long long)file.backend_object,
+            (unsigned long long)file.object_generation);
         lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
@@ -738,6 +751,7 @@ int filed_exec_linux_lpr_handle(
     LPR_EXEC_STAGE_RECORD_TO("start_plan", stage_start, stage_start_cycles, start_plan_cycles);
     lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
     if (status != 0) {
+        fprintf(stderr, "[filed] linux-lpr: start plan failed status=%d\n", status);
         if (plan.thread_fd >= 16) {
             (void)pacha_fd_close(plan.thread_fd);
         }

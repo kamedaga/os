@@ -16,8 +16,9 @@ Responsibilities:
 Low address layout:
 
 - `0x00000000..0x00000fff`: executable zpoline page
-- `0x00001000..0x03ffffff`: no-access guard hole
-- `0x04000000..`: normal Linux mappings
+- `0x00001000..0x000fffff`: no-access guard hole
+- `0x00100000..`: normal Linux mappings, including the usual `ET_EXEC`
+  base at `0x00400000`
 
 The loader should apply this layout before mapping the Linux main executable or
 interpreter. Linux mappings that overlap the reserved low range must be rejected

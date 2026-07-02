@@ -1128,9 +1128,9 @@ static const char *filed_exec_request_arg(
         return "";
     }
     if (request->argc != 0 && index < request->argc) {
-        return request->argv[index];
+        return filed_wire_exec_string(request, request->argv[index]);
     }
-    return request->argv0[0] != '\0' ? request->argv0 : request->path;
+    return request->path;
 }
 
 static int filed_exec_start_plan(
@@ -1194,7 +1194,7 @@ static int filed_exec_start_plan(
             stack,
             &sp,
             stack_base,
-            request->envp[i - 1u],
+            filed_wire_exec_string(request, request->envp[i - 1u]),
             &envp_va[i - 1u]);
         if (status != 0) {
             (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);

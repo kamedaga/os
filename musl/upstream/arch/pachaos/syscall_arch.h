@@ -184,10 +184,9 @@ extern int __pachaos_brk_lock;
 #define PACHAOS_FILED_FILE_SYNC (1U << 2)
 #define PACHAOS_FILED_FILE_NEEDS_REWIND (1U << 30)
 #define PACHAOS_FILED_FILE_DIR_EOF (1U << 31)
-#define PACHAOS_FILED_EXEC_MAX_ARGS 8
-#define PACHAOS_FILED_EXEC_MAX_ENVS 8
-#define PACHAOS_FILED_EXEC_ARG_BYTES 128
-#define PACHAOS_FILED_EXEC_ENV_BYTES 128
+#define PACHAOS_FILED_EXEC_MAX_ARGS 128
+#define PACHAOS_FILED_EXEC_MAX_ENVS 64
+#define PACHAOS_FILED_EXEC_STRING_BYTES 6144
 #define PACHAOS_FILED_EXEC_LINUX_LPR (1ull << 4)
 #define PACHAOS_FILED_SESSION_PAGE_BYTES 40960
 #define PACHAOS_FILED_FAST_MAGIC 0x31545341464c4446ULL
@@ -383,21 +382,26 @@ struct __pachaos_filed_exec_fd_patch {
 	unsigned long long reserved0;
 };
 
+struct __pachaos_filed_exec_string_ref {
+	unsigned short offset;
+	unsigned short length;
+};
+
 struct __pachaos_filed_exec_path {
 	unsigned long long dir_handle;
 	unsigned long long flags;
 	unsigned long long inherit_fd_count;
 	unsigned long long fd_patch_count;
 	unsigned long long inherit_handle_count;
-	unsigned long long reserved1;
+	unsigned long long string_bytes;
 	unsigned long long argc;
 	unsigned long long envc;
 	unsigned long long inherit_handles[4];
 	struct __pachaos_filed_exec_fd_patch fd_patches[4];
 	char path[PACHAOS_FILED_NAME_BYTES];
-	char argv0[PACHAOS_FILED_NAME_BYTES];
-	char argv[PACHAOS_FILED_EXEC_MAX_ARGS][PACHAOS_FILED_EXEC_ARG_BYTES];
-	char envp[PACHAOS_FILED_EXEC_MAX_ENVS][PACHAOS_FILED_EXEC_ENV_BYTES];
+	struct __pachaos_filed_exec_string_ref argv[PACHAOS_FILED_EXEC_MAX_ARGS];
+	struct __pachaos_filed_exec_string_ref envp[PACHAOS_FILED_EXEC_MAX_ENVS];
+	char strings[PACHAOS_FILED_EXEC_STRING_BYTES];
 };
 
 struct __pachaos_kstat {
@@ -3060,6 +3064,26 @@ static __inline long __pachaos_filed_copy_exec_string(char *dst, const char *src
 	return __pachaos_copy_path(dst, src ? src : "", cap);
 }
 
+static __inline long __pachaos_filed_exec_add_string(
+	struct __pachaos_filed_exec_path *exec,
+	struct __pachaos_filed_exec_string_ref *ref,
+	const char *src)
+{
+	if (!exec || !ref || !src) return -22;
+	unsigned long long len = 0;
+	while (src[len]) len++;
+	len++;
+	if (len > 65535ULL ||
+	    exec->string_bytes + len > PACHAOS_FILED_EXEC_STRING_BYTES)
+		return -7;
+	ref->offset = (unsigned short)exec->string_bytes;
+	ref->length = (unsigned short)len;
+	for (unsigned long long i = 0; i < len; i++)
+		exec->strings[exec->string_bytes + i] = src[i];
+	exec->string_bytes += len;
+	return 0;
+}
+
 static __inline long __pachaos_filed_execve(const char *path, char *const argv[], char *const envp[])
 {
 	if (!path) return -22;
@@ -3075,11 +3099,6 @@ static __inline long __pachaos_filed_execve(const char *path, char *const argv[]
 		return status;
 	}
 	const char *argv0 = (argv && argv[0]) ? argv[0] : path;
-	status = __pachaos_filed_copy_exec_string(exec->argv0, argv0, PACHAOS_FILED_NAME_BYTES);
-	if (status != 0) {
-		__pachaos_filed_page_destroy(page_fd, page);
-		return status;
-	}
 	unsigned long long argc = 0;
 	if (argv) {
 		while (argv[argc]) {
@@ -3087,7 +3106,7 @@ static __inline long __pachaos_filed_execve(const char *path, char *const argv[]
 				__pachaos_filed_page_destroy(page_fd, page);
 				return -7;
 			}
-			status = __pachaos_filed_copy_exec_string(exec->argv[argc], argv[argc], PACHAOS_FILED_EXEC_ARG_BYTES);
+			status = __pachaos_filed_exec_add_string(exec, &exec->argv[argc], argv[argc]);
 			if (status != 0) {
 				__pachaos_filed_page_destroy(page_fd, page);
 				return status;
@@ -3095,7 +3114,7 @@ static __inline long __pachaos_filed_execve(const char *path, char *const argv[]
 			argc++;
 		}
 	} else {
-		status = __pachaos_filed_copy_exec_string(exec->argv[0], argv0, PACHAOS_FILED_EXEC_ARG_BYTES);
+		status = __pachaos_filed_exec_add_string(exec, &exec->argv[0], argv0);
 		if (status != 0) {
 			__pachaos_filed_page_destroy(page_fd, page);
 			return status;
@@ -3109,7 +3128,7 @@ static __inline long __pachaos_filed_execve(const char *path, char *const argv[]
 				__pachaos_filed_page_destroy(page_fd, page);
 				return -7;
 			}
-			status = __pachaos_filed_copy_exec_string(exec->envp[envc], envp[envc], PACHAOS_FILED_EXEC_ENV_BYTES);
+			status = __pachaos_filed_exec_add_string(exec, &exec->envp[envc], envp[envc]);
 			if (status != 0) {
 				__pachaos_filed_page_destroy(page_fd, page);
 				return status;
