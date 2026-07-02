@@ -53,6 +53,7 @@ enum {
     SEED0ROOT_BOOT_PROFILE_LUA = 1u << 4,
     SEED0ROOT_BOOT_PROFILE_DYN_NEEDED = 1u << 5,
     SEED0ROOT_BOOT_PROFILE_CHIBICC = 1u << 6,
+    SEED0ROOT_BOOT_PROFILE_APK = 1u << 7,
 };
 
 struct seed0root_bootstrap_module {
@@ -992,6 +993,9 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
     if (seed0root_profile_has_token(profile, "chibicc")) {
         flags |= SEED0ROOT_BOOT_PROFILE_CHIBICC;
     }
+    if (seed0root_profile_has_token(profile, "apk")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_APK;
+    }
     printf("[seed0root] boot profile flags=%u\n", flags);
     return flags;
 }
@@ -1679,6 +1683,180 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         191);
 }
 
+static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
+{
+    const char *mkdir_root_argv[] = {
+        "busybox", "mkdir", "/tmp/apk-root",
+    };
+    int status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/alpine-busybox.elf",
+        mkdir_root_argv,
+        3,
+        "PACHA_APK_OFFLINE_PREP_ROOT=1",
+        "apk offline prep mkdir root",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *mkdir_var_argv[] = {
+        "busybox", "mkdir", "/tmp/apk-root/var",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/alpine-busybox.elf",
+        mkdir_var_argv,
+        3,
+        "PACHA_APK_OFFLINE_PREP_VAR=1",
+        "apk offline prep mkdir var",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *mkdir_cache_parent_argv[] = {
+        "busybox", "mkdir", "/tmp/apk-root/var/cache",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/alpine-busybox.elf",
+        mkdir_cache_parent_argv,
+        3,
+        "PACHA_APK_OFFLINE_PREP_CACHE_PARENT=1",
+        "apk offline prep mkdir cache parent",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *mkdir_cache_argv[] = {
+        "busybox", "mkdir", "/tmp/apk-root/var/cache/apk",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/alpine-busybox.elf",
+        mkdir_cache_argv,
+        3,
+        "PACHA_APK_OFFLINE_PREP_CACHE=1",
+        "apk offline prep mkdir cache",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *apk_env = "LD_LIBRARY_PATH=/tmp/apk-root/lib:/tmp/apk-root/usr/lib:/opt/apk-offline/lib:/lib:/lib/linux:/usr/lib";
+    const char *apk_argv[] = {
+        "/cmd/apk-offline.elf",
+        "--root",
+        "/tmp/apk-root",
+        "--initdb",
+        "--no-network",
+        "--no-scripts",
+        "--allow-untrusted",
+        "--repository",
+        "/var/cache/apk/offline",
+        "--cache-dir",
+        "/tmp/apk-root/var/cache/apk",
+        "add",
+        "zstd",
+        "grep",
+        "sed",
+        "tar",
+        "xz",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/apk-offline.elf",
+        apk_argv,
+        17,
+        apk_env,
+        "apk offline add workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *grep_argv[] = {
+        "grep", "--version",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/tmp/apk-root/bin/grep",
+        grep_argv,
+        2,
+        apk_env,
+        "apk installed grep version",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *sed_argv[] = {
+        "sed", "--version",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/tmp/apk-root/bin/sed",
+        sed_argv,
+        2,
+        apk_env,
+        "apk installed sed version",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *tar_create_argv[] = {
+        "tar", "-cf", "/tmp/apk-root/apk-world.tar", "-C", "/tmp/apk-root", "etc/apk/world",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/tmp/apk-root/bin/tar",
+        tar_create_argv,
+        6,
+        apk_env,
+        "apk installed tar create",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *tar_list_argv[] = {
+        "tar", "-tf", "/tmp/apk-root/apk-world.tar",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/tmp/apk-root/bin/tar",
+        tar_list_argv,
+        3,
+        apk_env,
+        "apk installed tar list",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *xz_argv[] = {
+        "xz", "--version",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/tmp/apk-root/usr/bin/xz",
+        xz_argv,
+        2,
+        apk_env,
+        "apk installed xz version",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+    const char *zstd_argv[] = {
+        "zstd", "--version",
+    };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/tmp/apk-root/usr/bin/zstd",
+        zstd_argv,
+        2,
+        apk_env,
+        "apk installed zstd version",
+        FILED_WIRE_EXEC_LINUX_LPR);
+}
+
 static int seed0root_connect_storage_services(int control_fd)
 {
     int block_fd = -1;
@@ -1745,6 +1923,9 @@ static int seed0root_connect_storage_services(int control_fd)
         filed_endpoint_fd >= 16) {
         status = seed0root_run_chibicc_cli_bench(filed_endpoint_fd);
     }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_APK) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_apk_offline_bench(filed_endpoint_fd);
+    }
     const unsigned metrics_profile =
         boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
                         SEED0ROOT_BOOT_PROFILE_MEMORY |
@@ -1752,7 +1933,8 @@ static int seed0root_connect_storage_services(int control_fd)
                         SEED0ROOT_BOOT_PROFILE_LPR |
                         SEED0ROOT_BOOT_PROFILE_LUA |
                         SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
-                        SEED0ROOT_BOOT_PROFILE_CHIBICC);
+                        SEED0ROOT_BOOT_PROFILE_CHIBICC |
+                        SEED0ROOT_BOOT_PROFILE_APK);
     const unsigned sync_profile =
         boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
                         SEED0ROOT_BOOT_PROFILE_MEMORY |
@@ -1760,7 +1942,8 @@ static int seed0root_connect_storage_services(int control_fd)
                         SEED0ROOT_BOOT_PROFILE_LPR |
                         SEED0ROOT_BOOT_PROFILE_LUA |
                         SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
-                        SEED0ROOT_BOOT_PROFILE_CHIBICC);
+                        SEED0ROOT_BOOT_PROFILE_CHIBICC |
+                        SEED0ROOT_BOOT_PROFILE_APK);
     if (metrics_profile != 0 && status == 0 && filed_endpoint_fd >= 16) {
         const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
         printf("[seed0root] filed metrics dump status=%d\n", metrics_status);

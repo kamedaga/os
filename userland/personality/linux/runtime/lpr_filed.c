@@ -46,6 +46,8 @@ void *memset(void *dst, int c, size_t n)
 #define LPR_FILED_PAGE_CACHE_BYTES 4096ull
 #define LPR_FILED_READV_TO_VMO_MIN (16ull * 1024ull)
 #define LPR_FILED_READV_TO_VMO_MAX (256ull * 1024ull)
+#define LPR_LINUX_PIPE_BUF_BYTES 4096ull
+#define LPR_LINUX_PIPE_COUNT 16u
 
 #define LPR_LINUX_S_IFMT 0170000ull
 #define LPR_LINUX_S_IFIFO 0010000ull
@@ -74,6 +76,25 @@ typedef struct lpr_filed_fd {
     uint64_t handle;
     uint64_t offset;
 } lpr_filed_fd_t;
+
+typedef struct lpr_pipe_fd {
+    uint8_t active;
+    uint8_t pipe_id;
+    uint8_t readable;
+    uint8_t writable;
+    uint32_t flags;
+} lpr_pipe_fd_t;
+
+typedef struct lpr_pipe_entry {
+    uint8_t active;
+    uint8_t read_refs;
+    uint8_t write_refs;
+    uint8_t reserved0;
+    uint32_t head;
+    uint32_t tail;
+    uint32_t used;
+    uint8_t data[LPR_LINUX_PIPE_BUF_BYTES];
+} lpr_pipe_entry_t;
 
 typedef struct lpr_linux_stat {
     uint64_t st_dev;
@@ -131,6 +152,8 @@ enum {
 };
 
 static lpr_filed_fd_t lpr_fds[LPR_FD_TABLE_SIZE];
+static lpr_pipe_fd_t lpr_pipe_fds[LPR_FD_TABLE_SIZE];
+static lpr_pipe_entry_t lpr_pipes[LPR_LINUX_PIPE_COUNT];
 static lpr_readlink_cache_entry_t lpr_readlink_cache[LPR_READLINK_CACHE_ENTRIES];
 static lpr_filed_page_cache_entry_t lpr_page_cache[LPR_FILED_PAGE_CACHE_ENTRIES];
 static uint64_t lpr_readlink_cache_clock;
@@ -152,6 +175,11 @@ static int lpr_pread_vmo_page_fd = -1;
 static void *lpr_pread_vmo_page;
 static int lpr_pread_vmo_page_busy;
 
+static int lpr_create_wire_page(void **out_page);
+static void lpr_destroy_wire_page(int page_fd, void *page);
+static int64_t lpr_filed_call(uint64_t op, int page_fd, uint64_t word2, uint64_t *out_result);
+static int64_t lpr_filed_close_handle(uint64_t handle);
+
 static void *lpr_session_payload_slot(uint64_t slot)
 {
     if (lpr_session_page == 0 || slot >= FILED_WIRE_FAST_PAYLOAD_SLOT_COUNT) {
@@ -171,7 +199,7 @@ static void lpr_zero_bytes(void *ptr, uint64_t len)
     }
 }
 
-#if LPR_TRACE_READV_SIZES
+#if LPR_TRACE_READV_SIZES || LPR_TRACE_READV_CACHE_STATS
 static char *lpr_trace_append_literal(char *out, const char *end, const char *text)
 {
     while (out < end && *text != 0) {
@@ -193,7 +221,9 @@ static char *lpr_trace_append_u64(char *out, const char *end, uint64_t value)
     }
     return out;
 }
+#endif
 
+#if LPR_TRACE_READV_SIZES
 static void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, uint64_t coalesced, uint64_t offset)
 {
     char line[224];
@@ -231,6 +261,47 @@ static void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64
     }
     out = lpr_trace_append_literal(out, end, "\n");
     (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+}
+#endif
+
+#if LPR_TRACE_READV_CACHE_STATS
+static uint64_t lpr_readv_cache_total;
+static uint64_t lpr_readv_cache_coalesced;
+static uint64_t lpr_readv_cache_hit;
+static uint64_t lpr_readv_cache_fill;
+static uint64_t lpr_readv_cache_fallback;
+static uint64_t lpr_readv_cache_cross_page;
+static uint64_t lpr_readv_cache_to_vmo;
+static uint64_t lpr_readv_cache_bytes;
+
+static char *lpr_trace_append_field_u64(char *out, const char *end, const char *name, uint64_t value)
+{
+    out = lpr_trace_append_literal(out, end, " ");
+    out = lpr_trace_append_literal(out, end, name);
+    out = lpr_trace_append_literal(out, end, "=");
+    return lpr_trace_append_u64(out, end, value);
+}
+
+void lpr_linux_readv_cache_trace_dump(void)
+{
+    char line[384];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_trace_append_literal(out, end, "[lpr_runtime] metric scope=lpr_readv_cache");
+    out = lpr_trace_append_field_u64(out, end, "total", lpr_readv_cache_total);
+    out = lpr_trace_append_field_u64(out, end, "coalesced", lpr_readv_cache_coalesced);
+    out = lpr_trace_append_field_u64(out, end, "hit", lpr_readv_cache_hit);
+    out = lpr_trace_append_field_u64(out, end, "fill", lpr_readv_cache_fill);
+    out = lpr_trace_append_field_u64(out, end, "fallback", lpr_readv_cache_fallback);
+    out = lpr_trace_append_field_u64(out, end, "cross_page", lpr_readv_cache_cross_page);
+    out = lpr_trace_append_field_u64(out, end, "to_vmo", lpr_readv_cache_to_vmo);
+    out = lpr_trace_append_field_u64(out, end, "bytes", lpr_readv_cache_bytes);
+    out = lpr_trace_append_literal(out, end, "\n");
+    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+}
+#else
+void lpr_linux_readv_cache_trace_dump(void)
+{
 }
 #endif
 
@@ -300,6 +371,148 @@ static int lpr_fd_alloc(uint64_t handle, uint64_t flags)
         }
     }
     return -LPR_LINUX_ENOMEM;
+}
+
+static int lpr_fd_slot_alloc(void)
+{
+    for (uint64_t fd = 3; fd < LPR_FD_TABLE_SIZE; fd += 1) {
+        if (fd == LPR_FILED_ENDPOINT_FD) {
+            continue;
+        }
+        if (lpr_fds[fd].active == 0 && lpr_pipe_fds[fd].active == 0) {
+            return (int)fd;
+        }
+    }
+    return -LPR_LINUX_ENOMEM;
+}
+
+static int lpr_pipe_fd_is_active(uint64_t fd)
+{
+    return fd < LPR_FD_TABLE_SIZE && lpr_pipe_fds[fd].active != 0;
+}
+
+static lpr_pipe_entry_t *lpr_pipe_for_fd(uint64_t fd)
+{
+    if (!lpr_pipe_fd_is_active(fd) || lpr_pipe_fds[fd].pipe_id >= LPR_LINUX_PIPE_COUNT) {
+        return 0;
+    }
+    lpr_pipe_entry_t *pipe = &lpr_pipes[lpr_pipe_fds[fd].pipe_id];
+    return pipe->active != 0 ? pipe : 0;
+}
+
+static void lpr_pipe_close_fd(uint64_t fd)
+{
+    lpr_pipe_entry_t *pipe = lpr_pipe_for_fd(fd);
+    if (pipe != 0) {
+        if (lpr_pipe_fds[fd].readable && pipe->read_refs != 0) {
+            pipe->read_refs--;
+        }
+        if (lpr_pipe_fds[fd].writable && pipe->write_refs != 0) {
+            pipe->write_refs--;
+        }
+        if (pipe->read_refs == 0 && pipe->write_refs == 0) {
+            lpr_memset(pipe, 0, sizeof(*pipe));
+        }
+    }
+    lpr_memset(&lpr_pipe_fds[fd], 0, sizeof(lpr_pipe_fds[fd]));
+}
+
+int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags)
+{
+    const uint64_t known_flags = LPR_LINUX_O_CLOEXEC | LPR_LINUX_O_NONBLOCK;
+    if (fds_raw == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    if ((flags & ~known_flags) != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    uint64_t pipe_id = LPR_LINUX_PIPE_COUNT;
+    for (uint64_t i = 0; i < LPR_LINUX_PIPE_COUNT; i += 1) {
+        if (lpr_pipes[i].active == 0) {
+            pipe_id = i;
+            break;
+        }
+    }
+    if (pipe_id == LPR_LINUX_PIPE_COUNT) {
+        return -LPR_LINUX_ENOMEM;
+    }
+    const int read_fd = lpr_fd_slot_alloc();
+    if (read_fd < 0) {
+        return read_fd;
+    }
+    lpr_pipe_fds[read_fd].active = 1;
+    const int write_fd = lpr_fd_slot_alloc();
+    if (write_fd < 0) {
+        lpr_memset(&lpr_pipe_fds[read_fd], 0, sizeof(lpr_pipe_fds[read_fd]));
+        return write_fd;
+    }
+
+    lpr_memset(&lpr_pipes[pipe_id], 0, sizeof(lpr_pipes[pipe_id]));
+    lpr_pipes[pipe_id].active = 1;
+    lpr_pipes[pipe_id].read_refs = 1;
+    lpr_pipes[pipe_id].write_refs = 1;
+    lpr_pipe_fds[read_fd].active = 1;
+    lpr_pipe_fds[read_fd].pipe_id = (uint8_t)pipe_id;
+    lpr_pipe_fds[read_fd].readable = 1;
+    lpr_pipe_fds[read_fd].flags = (uint32_t)flags;
+    lpr_pipe_fds[write_fd].active = 1;
+    lpr_pipe_fds[write_fd].pipe_id = (uint8_t)pipe_id;
+    lpr_pipe_fds[write_fd].writable = 1;
+    lpr_pipe_fds[write_fd].flags = (uint32_t)flags;
+
+    int *fds = (int *)(uintptr_t)fds_raw;
+    fds[0] = read_fd;
+    fds[1] = write_fd;
+    return 0;
+}
+
+int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec)
+{
+    (void)min_fd;
+    if (lpr_pipe_fd_is_active(fd)) {
+        const int dup_fd = lpr_fd_slot_alloc();
+        if (dup_fd < 0) {
+            return dup_fd;
+        }
+        lpr_pipe_fds[dup_fd] = lpr_pipe_fds[fd];
+        if (cloexec) {
+            lpr_pipe_fds[dup_fd].flags |= LPR_LINUX_O_CLOEXEC;
+        }
+        lpr_pipe_entry_t *pipe = lpr_pipe_for_fd(dup_fd);
+        if (pipe != 0) {
+            if (lpr_pipe_fds[dup_fd].readable) {
+                pipe->read_refs++;
+            }
+            if (lpr_pipe_fds[dup_fd].writable) {
+                pipe->write_refs++;
+            }
+        }
+        return dup_fd;
+    }
+    if (lpr_fd_is_filed(fd)) {
+        void *page = 0;
+        const int page_fd = lpr_create_wire_page(&page);
+        if (page_fd < 0) {
+            return page_fd;
+        }
+        filed_wire_handle_flags_t *flags = (filed_wire_handle_flags_t *)page;
+        lpr_memset(flags, 0, sizeof(*flags));
+        flags->handle = lpr_fds[fd].handle;
+        flags->fd_flags = cloexec ? FILED_WIRE_FD_CLOEXEC : 0;
+        uint64_t dup_handle = 0;
+        const int64_t status = lpr_filed_call(FILED_WIRE_OP_DUP, page_fd, 0, &dup_handle);
+        lpr_destroy_wire_page(page_fd, page);
+        if (status != 0) {
+            return status;
+        }
+        const int dup_fd = lpr_fd_alloc(dup_handle, lpr_fds[fd].flags | (cloexec ? LPR_LINUX_O_CLOEXEC : 0));
+        if (dup_fd < 0) {
+            (void)lpr_filed_close_handle(dup_handle);
+            return dup_fd;
+        }
+        return dup_fd;
+    }
+    return lpr_pacha_syscall4(PACHAOS_SYSCALL_FD_FCNTL, fd, PACHA_FD_FCNTL_DUP, 0, 0);
 }
 
 static void lpr_readlink_cache_clear(void)
@@ -1217,7 +1430,68 @@ int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t n
     return status;
 }
 
-int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
+int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64_t group, uint64_t flags)
+{
+    (void)owner;
+    (void)group;
+    const uint64_t known_flags = LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EMPTY_PATH;
+    if ((flags & ~known_flags) != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path != 0 && ((const char *)(uintptr_t)path)[0] == 0) {
+        return lpr_fd_is_filed(dirfd) || lpr_pipe_fd_is_active(dirfd) ? 0 : -LPR_LINUX_EBADF;
+    }
+    if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
+        return path != 0 ? 0 : -LPR_LINUX_EFAULT;
+    }
+    return lpr_linux_faccessat(dirfd, path, 0, flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW);
+}
+
+int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t dev)
+{
+    (void)mode;
+    (void)dev;
+    return lpr_linux_faccessat(dirfd, path, 0, 0) == 0 ? -LPR_LINUX_EEXIST : 0;
+}
+
+int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t linkpath_raw)
+{
+    const char *target = (const char *)(uintptr_t)target_raw;
+    const char *linkpath = (const char *)(uintptr_t)linkpath_raw;
+    if (target == 0 || linkpath == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    lpr_readlink_cache_clear();
+    lpr_page_cache_clear();
+    uint64_t dir_handle = 0;
+    int64_t status = lpr_dir_handle_for(new_dirfd, linkpath, &dir_handle);
+    if (status != 0) {
+        return status;
+    }
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    filed_wire_symlink_t *symlink_req = (filed_wire_symlink_t *)page;
+    lpr_memset(symlink_req, 0, sizeof(*symlink_req));
+    symlink_req->dir_handle = dir_handle;
+    status = lpr_copy_path(symlink_req->name, linkpath);
+    const uint64_t target_len = (uint64_t)lpr_strnlen(target, FILED_WIRE_NAME_BYTES);
+    if (status == 0 && (target_len == 0 || target_len >= FILED_WIRE_NAME_BYTES)) {
+        status = target_len == 0 ? -LPR_LINUX_EINVAL : -LPR_LINUX_ENAMETOOLONG;
+    }
+    if (status == 0) {
+        symlink_req->target_length = target_len;
+        lpr_memcpy(symlink_req->target, target, target_len + 1u);
+        uint64_t ignored = 0;
+        status = lpr_filed_call(FILED_WIRE_OP_SYMLINK, page_fd, 0, &ignored);
+    }
+    lpr_destroy_wire_page(page_fd, page);
+    return status;
+}
+
+static int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
 {
     (void)mode;
     if ((flags & (LPR_LINUX_O_CREAT | LPR_LINUX_O_TRUNC)) != 0) {
@@ -1260,6 +1534,101 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
         return fd;
     }
     return fd;
+}
+
+static int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity)
+{
+    if (target == 0 || capacity == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    const char *path = (const char *)(uintptr_t)path_raw;
+    uint64_t dir_handle = 0;
+    int64_t status = lpr_dir_handle_for(dirfd, path, &dir_handle);
+    if (status != 0) {
+        return status;
+    }
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    filed_wire_readlink_t *readlink_req = (filed_wire_readlink_t *)page;
+    lpr_memset(readlink_req, 0, sizeof(*readlink_req));
+    readlink_req->dir_handle = dir_handle;
+    status = lpr_copy_path(readlink_req->name, path);
+    uint64_t length = 0;
+    if (status == 0) {
+        status = lpr_filed_call(FILED_WIRE_OP_READLINK, page_fd, 0, &length);
+    }
+    if (status == 0) {
+        if (length > capacity) {
+            length = capacity;
+        }
+        lpr_memcpy(target, readlink_req->target, length);
+    }
+    lpr_destroy_wire_page(page_fd, page);
+    return status == 0 ? (int64_t)length : status;
+}
+
+static int lpr_resolve_final_symlink_path(const char *path, const char *target, char out[FILED_WIRE_NAME_BYTES])
+{
+    if (path == 0 || target == 0 || out == 0) {
+        return 0;
+    }
+    const uint64_t target_len = (uint64_t)lpr_strnlen(target, FILED_WIRE_NAME_BYTES);
+    if (target_len == 0 || target_len >= FILED_WIRE_NAME_BYTES) {
+        return 0;
+    }
+    lpr_memset(out, 0, FILED_WIRE_NAME_BYTES);
+    if (target[0] == '/') {
+        lpr_memcpy(out, target, target_len + 1u);
+        return 1;
+    }
+    uint64_t prefix_len = 0;
+    for (uint64_t i = 0; path[i] != 0 && i < FILED_WIRE_NAME_BYTES; i += 1) {
+        if (path[i] == '/') {
+            prefix_len = i + 1u;
+        }
+    }
+    if (prefix_len + target_len >= FILED_WIRE_NAME_BYTES) {
+        return 0;
+    }
+    if (prefix_len != 0) {
+        lpr_memcpy(out, path, prefix_len);
+    }
+    lpr_memcpy(out + prefix_len, target, target_len + 1u);
+    return 1;
+}
+
+int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
+{
+    int64_t fd = lpr_linux_openat_once(dirfd, path_raw, flags, mode);
+    if (fd < 0 ||
+        (flags & (LPR_LINUX_O_NOFOLLOW | LPR_LINUX_O_CREAT | LPR_LINUX_O_TRUNC)) != 0)
+    {
+        return fd;
+    }
+    lpr_linux_stat_t st;
+    const int64_t stat_status = lpr_linux_fstat((uint64_t)fd, (uint64_t)(uintptr_t)&st);
+    if (stat_status != 0 ||
+        (((uint64_t)st.st_mode & LPR_LINUX_S_IFMT) != LPR_LINUX_S_IFLNK))
+    {
+        return fd;
+    }
+    char target[FILED_WIRE_NAME_BYTES];
+    lpr_memset(target, 0, sizeof(target));
+    const int64_t len = lpr_linux_readlinkat_to_buffer(dirfd, path_raw, target, sizeof(target) - 1u);
+    (void)lpr_linux_close((uint64_t)fd);
+    if (len <= 0) {
+        return len == 0 ? -LPR_LINUX_EINVAL : len;
+    }
+    target[len < (int64_t)(sizeof(target) - 1u) ? (uint64_t)len : sizeof(target) - 1u] = 0;
+    const char *path = (const char *)(uintptr_t)path_raw;
+    char resolved[FILED_WIRE_NAME_BYTES];
+    if (!lpr_resolve_final_symlink_path(path, target, resolved)) {
+        return -LPR_LINUX_ENAMETOOLONG;
+    }
+    return lpr_linux_openat_once(dirfd, (uint64_t)(uintptr_t)resolved, flags, mode);
 }
 
 static int64_t lpr_filed_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
@@ -1332,9 +1701,99 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
     return entry;
 }
 
+static lpr_filed_page_cache_entry_t *lpr_page_cache_get(uint64_t fd, uint64_t offset, uint64_t requested, int *out_hit)
+{
+    lpr_filed_page_cache_entry_t *entry =
+        lpr_page_cache_lookup(lpr_fds[fd].handle, offset, requested);
+    if (entry != 0) {
+        if (out_hit != 0) {
+            *out_hit = 1;
+        }
+        return entry;
+    }
+    if (out_hit != 0) {
+        *out_hit = 0;
+    }
+    return lpr_page_cache_fill(fd, offset, requested);
+}
+
+static int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, uint64_t offset)
+{
+    if (requested == 0) {
+        return 0;
+    }
+    if (buf == 0 || requested > LPR_FILED_PAGE_CACHE_BYTES) {
+        return -1;
+    }
+    const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
+    const uint64_t page_offset = offset - page_start;
+    if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
+        lpr_filed_page_cache_entry_t *entry = lpr_page_cache_get(fd, offset, requested, 0);
+        if (entry == 0) {
+            return -1;
+        }
+        lpr_memcpy((void *)(uintptr_t)buf, entry->data + page_offset, (size_t)requested);
+        return (int64_t)requested;
+    }
+
+    const uint64_t first_len = LPR_FILED_PAGE_CACHE_BYTES - page_offset;
+    const uint64_t second_len = requested - first_len;
+    lpr_filed_page_cache_entry_t *first = lpr_page_cache_get(fd, offset, first_len, 0);
+    lpr_filed_page_cache_entry_t *second =
+        first != 0 ? lpr_page_cache_get(fd, offset + first_len, second_len, 0) : 0;
+    if (first == 0 || second == 0) {
+        return -1;
+    }
+    unsigned char *dst = (unsigned char *)(uintptr_t)buf;
+    lpr_memcpy(dst, first->data + page_offset, (size_t)first_len);
+    lpr_memcpy(dst + first_len, second->data, (size_t)second_len);
+    return (int64_t)requested;
+}
+
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
+    if (lpr_pipe_fd_is_active(fd)) {
+        lpr_pipe_entry_t *pipe = lpr_pipe_for_fd(fd);
+        if (pipe == 0 || !lpr_pipe_fds[fd].readable) {
+            return -LPR_LINUX_EBADF;
+        }
+        if (count == 0) {
+            return 0;
+        }
+        if (buf == 0) {
+            return -LPR_LINUX_EFAULT;
+        }
+        if (pipe->used == 0) {
+            return pipe->write_refs == 0 ? 0 : -LPR_LINUX_EAGAIN;
+        }
+        const uint64_t n = count < pipe->used ? count : pipe->used;
+        uint8_t *dst = (uint8_t *)(uintptr_t)buf;
+        for (uint64_t i = 0; i < n; i += 1) {
+            dst[i] = pipe->data[pipe->head];
+            pipe->head = (pipe->head + 1u) % LPR_LINUX_PIPE_BUF_BYTES;
+        }
+        pipe->used -= (uint32_t)n;
+        return (int64_t)n;
+    }
     if (lpr_fd_is_filed(fd)) {
+        if (count == 0) {
+            return 0;
+        }
+        if (lpr_fd_shadow_offset_eligible(fd) &&
+            lpr_fds[fd].offset_valid &&
+            count <= LPR_FILED_PAGE_CACHE_BYTES)
+        {
+            const uint64_t offset = lpr_fds[fd].offset;
+            const int64_t cached = lpr_read_from_page_cache(fd, buf, count, offset);
+            if (cached >= 0) {
+                lpr_fds[fd].offset = offset + (uint64_t)cached;
+                lpr_fds[fd].pread_active = 1;
+                if (lpr_fds[fd].offset < offset) {
+                    lpr_fds[fd].offset_valid = 0;
+                }
+                return cached;
+            }
+        }
         if (lpr_fd_shadow_offset_eligible(fd) &&
             lpr_fds[fd].offset_valid &&
             lpr_fds[fd].pread_active)
@@ -1364,8 +1823,26 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 
 int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 {
+#if LPR_TRACE_READV_CACHE_STATS
+    lpr_readv_cache_total++;
+#endif
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    if (lpr_pipe_fd_is_active(fd)) {
+        int64_t total = 0;
+        const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
+        for (uint64_t i = 0; i < iov_count; i += 1) {
+            const int64_t n = lpr_linux_read(fd, iov[i].base, iov[i].len);
+            if (n < 0) {
+                return total != 0 ? total : n;
+            }
+            total += n;
+            if ((uint64_t)n < iov[i].len) {
+                break;
+            }
+        }
+        return total;
     }
     if (!lpr_fd_is_filed(fd)) {
         return lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_READV, fd, iov_raw, iov_count);
@@ -1395,26 +1872,72 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         }
         if (requested != 0 && requested <= FILED_WIRE_IO_BYTES) {
             const uint64_t offset = lpr_fds[fd].offset;
+#if LPR_TRACE_READV_CACHE_STATS
+            lpr_readv_cache_coalesced++;
+            lpr_readv_cache_bytes += requested;
+#endif
 #if LPR_TRACE_READV_SIZES
             lpr_trace_readv_size(fd, iov_count, requested, 1, offset);
 #endif
             if (requested <= LPR_FILED_PAGE_CACHE_BYTES) {
-                lpr_filed_page_cache_entry_t *entry =
-                    lpr_page_cache_lookup(lpr_fds[fd].handle, offset, requested);
-                if (entry == 0) {
-                    entry = lpr_page_cache_fill(fd, offset, requested);
-                }
-                if (entry != 0) {
-                    const uint64_t page_offset = offset - entry->page_start;
-                    (void)lpr_scatter_iov(iov, iov_count, entry->data + page_offset, requested);
-                    lpr_fds[fd].offset = offset + requested;
-                    lpr_fds[fd].pread_active = 1;
-                    if (lpr_fds[fd].offset < offset) {
-                        lpr_fds[fd].offset_valid = 0;
+                const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
+                const uint64_t page_offset = offset - page_start;
+                if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
+                    int cache_hit = 0;
+                    lpr_filed_page_cache_entry_t *entry =
+                        lpr_page_cache_get(fd, offset, requested, &cache_hit);
+                    if (entry != 0) {
+#if LPR_TRACE_READV_CACHE_STATS
+                        if (cache_hit) {
+                            lpr_readv_cache_hit++;
+                        } else {
+                            lpr_readv_cache_fill++;
+                        }
+#endif
+                        (void)lpr_scatter_iov(iov, iov_count, entry->data + page_offset, requested);
+                        lpr_fds[fd].offset = offset + requested;
+                        lpr_fds[fd].pread_active = 1;
+                        if (lpr_fds[fd].offset < offset) {
+                            lpr_fds[fd].offset_valid = 0;
+                        }
+                        return (int64_t)requested;
                     }
-                    return (int64_t)requested;
+                } else {
+#if LPR_TRACE_READV_CACHE_STATS
+                    lpr_readv_cache_cross_page++;
+#endif
+                    const uint64_t first_len = LPR_FILED_PAGE_CACHE_BYTES - page_offset;
+                    const uint64_t second_len = requested - first_len;
+                    int first_hit = 0;
+                    int second_hit = 0;
+                    lpr_filed_page_cache_entry_t *first =
+                        lpr_page_cache_get(fd, offset, first_len, &first_hit);
+                    lpr_filed_page_cache_entry_t *second =
+                        first != 0 ? lpr_page_cache_get(fd, offset + first_len, second_len, &second_hit) : 0;
+                    if (first != 0 && second != 0) {
+                        uint8_t cache_scratch[LPR_FILED_PAGE_CACHE_BYTES];
+                        lpr_memcpy(cache_scratch, first->data + page_offset, (size_t)first_len);
+                        lpr_memcpy(cache_scratch + first_len, second->data, (size_t)second_len);
+#if LPR_TRACE_READV_CACHE_STATS
+                        if (first_hit && second_hit) {
+                            lpr_readv_cache_hit++;
+                        } else {
+                            lpr_readv_cache_fill++;
+                        }
+#endif
+                        (void)lpr_scatter_iov(iov, iov_count, cache_scratch, requested);
+                        lpr_fds[fd].offset = offset + requested;
+                        lpr_fds[fd].pread_active = 1;
+                        if (lpr_fds[fd].offset < offset) {
+                            lpr_fds[fd].offset_valid = 0;
+                        }
+                        return (int64_t)requested;
+                    }
                 }
             }
+#if LPR_TRACE_READV_CACHE_STATS
+            lpr_readv_cache_fallback++;
+#endif
             uint8_t scratch[FILED_WIRE_IO_BYTES];
             const int64_t n = lpr_filed_io(FILED_WIRE_OP_PREAD, fd, (uint64_t)(uintptr_t)scratch, requested, offset);
             if (n < 0) {
@@ -1434,6 +1957,9 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             unsigned char *mapped = 0;
             uint64_t map_len = 0;
             if (lpr_readv_scratch_vmo(requested, &vmo_fd, &mapped, &map_len) == 0) {
+#if LPR_TRACE_READV_CACHE_STATS
+                lpr_readv_cache_to_vmo++;
+#endif
 #if LPR_TRACE_READV_SIZES
                 lpr_trace_readv_size(fd, iov_count, requested, 2, lpr_fds[fd].offset);
 #endif
@@ -1578,8 +2104,118 @@ int64_t lpr_linux_pread_to_vmo(
     return (int64_t)reply.word2;
 }
 
+int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded)
+{
+    if (out_loaded != 0) {
+        *out_loaded = 0;
+    }
+    if (!lpr_fd_is_filed(fd)) {
+        return -LPR_LINUX_EBADF;
+    }
+    if (length == 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+
+    void *page = 0;
+    const int page_fd = lpr_create_pread_vmo_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+
+    filed_wire_file_vmo_t *file_vmo = (filed_wire_file_vmo_t *)page;
+    lpr_memset(file_vmo, 0, sizeof(*file_vmo));
+    file_vmo->handle = lpr_fds[fd].handle;
+    file_vmo->file_offset = file_offset;
+    file_vmo->length = length;
+
+    struct pacha_ipc_fd request_fd;
+    struct pacha_ipc_fd reply_fd_items[1];
+    struct pacha_ipc_msg request;
+    struct pacha_ipc_msg reply;
+    lpr_zero_bytes(&request_fd, sizeof(request_fd));
+    lpr_zero_bytes(reply_fd_items, sizeof(reply_fd_items));
+    lpr_zero_bytes(&request, sizeof(request));
+    lpr_zero_bytes(&reply, sizeof(reply));
+
+    request_fd.fd = (uint64_t)(uint32_t)page_fd;
+    request_fd.rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+
+    const uint64_t request_id = ++lpr_request_id;
+    request.word0 = FILED_WIRE_REQUEST_MAGIC;
+    request.word1 = FILED_WIRE_OP_FILE_VMO;
+    request.word3 = request_id;
+    request.fds = &request_fd;
+    request.fd_count = 1;
+
+    const int64_t call_reply_fd = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_IPC_CALL,
+        LPR_FILED_ENDPOINT_FD,
+        (uint64_t)(uintptr_t)&request);
+    if (call_reply_fd < 16) {
+        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        return lpr_pacha_status_to_errno(call_reply_fd);
+    }
+
+    reply.fds = reply_fd_items;
+    reply.fd_capacity = 1;
+    const int64_t recv_status = lpr_pacha_syscall4(
+        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+        (uint64_t)(uint32_t)call_reply_fd,
+        (uint64_t)(uintptr_t)&reply,
+        UINT64_MAX,
+        0);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)call_reply_fd);
+    lpr_destroy_pread_vmo_wire_page(page_fd, page);
+    if (recv_status != 0) {
+        return lpr_pacha_status_to_errno(recv_status);
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC || reply.word3 != request_id) {
+        return -LPR_LINUX_EIO;
+    }
+    if ((int64_t)reply.word1 < 0) {
+        return (int64_t)reply.word1;
+    }
+    if (reply.fd_count != 1 || reply_fd_items[0].fd < 16) {
+        return -LPR_LINUX_EIO;
+    }
+    if (out_loaded != 0) {
+        *out_loaded = reply.word2;
+    }
+    return (int64_t)reply_fd_items[0].fd;
+}
+
 int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)
 {
+    if (lpr_pipe_fd_is_active(fd)) {
+        lpr_pipe_entry_t *pipe = lpr_pipe_for_fd(fd);
+        if (pipe == 0 || !lpr_pipe_fds[fd].writable) {
+            return -LPR_LINUX_EBADF;
+        }
+        if (pipe->read_refs == 0) {
+            return -LPR_LINUX_EPIPE;
+        }
+        if (count == 0) {
+            return 0;
+        }
+        if (buf == 0) {
+            return -LPR_LINUX_EFAULT;
+        }
+        const uint64_t space = LPR_LINUX_PIPE_BUF_BYTES - pipe->used;
+        if (space == 0) {
+            return -LPR_LINUX_EAGAIN;
+        }
+        const uint64_t n = count < space ? count : space;
+        const uint8_t *src = (const uint8_t *)(uintptr_t)buf;
+        for (uint64_t i = 0; i < n; i += 1) {
+            pipe->data[pipe->tail] = src[i];
+            pipe->tail = (pipe->tail + 1u) % LPR_LINUX_PIPE_BUF_BYTES;
+        }
+        pipe->used += (uint32_t)n;
+        return (int64_t)n;
+    }
     if (lpr_fd_is_filed(fd)) {
         if (count != 0) {
             lpr_page_cache_invalidate_handle(lpr_fds[fd].handle);
@@ -1598,6 +2234,21 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         return -LPR_LINUX_EFAULT;
     }
     if (!lpr_fd_is_filed(fd)) {
+        if (lpr_pipe_fd_is_active(fd)) {
+            int64_t total = 0;
+            const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
+            for (uint64_t i = 0; i < iov_count; i += 1) {
+                const int64_t n = lpr_linux_write(fd, iov[i].base, iov[i].len);
+                if (n < 0) {
+                    return total != 0 ? total : n;
+                }
+                total += n;
+                if ((uint64_t)n < iov[i].len) {
+                    break;
+                }
+            }
+            return total;
+        }
         if (fd == 1) {
             const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
             uint64_t total = 0;
@@ -1632,6 +2283,10 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 
 int64_t lpr_linux_close(uint64_t fd)
 {
+    if (lpr_pipe_fd_is_active(fd)) {
+        lpr_pipe_close_fd(fd);
+        return 0;
+    }
     if (lpr_fd_is_filed(fd)) {
         const uint64_t handle = lpr_fds[fd].handle;
         lpr_memset(&lpr_fds[fd], 0, sizeof(lpr_fds[fd]));
@@ -1645,6 +2300,9 @@ int64_t lpr_linux_close(uint64_t fd)
 
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 {
+    if (lpr_pipe_fd_is_active(fd)) {
+        return -LPR_LINUX_ESPIPE;
+    }
     if (!lpr_fd_is_filed(fd)) {
         return -LPR_LINUX_ESPIPE;
     }
@@ -1732,7 +2390,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         return 0;
     case LPR_LINUX_F_DUPFD:
     case LPR_LINUX_F_DUPFD_CLOEXEC:
-        return -LPR_LINUX_ENOTSUP;
+        return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
     default:
         return -LPR_LINUX_EINVAL;
     }
@@ -1841,13 +2499,19 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
 
 int64_t lpr_linux_access(uint64_t path, uint64_t mode)
 {
-    (void)mode;
-    const int64_t fd = lpr_linux_openat((uint64_t)(int64_t)LPR_LINUX_AT_FDCWD, path, LPR_LINUX_O_RDONLY, 0);
-    if (fd < 0) {
-        return fd;
+    return lpr_linux_faccessat((uint64_t)(int64_t)LPR_LINUX_AT_FDCWD, path, mode, 0);
+}
+
+int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags)
+{
+    const uint64_t known_mode = 0x7ull;
+    const uint64_t known_flags = LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EMPTY_PATH;
+    if ((mode & ~known_mode) != 0 || (flags & ~known_flags) != 0) {
+        return -LPR_LINUX_EINVAL;
     }
-    (void)lpr_linux_close((uint64_t)fd);
-    return 0;
+    struct lpr_linux_stat statbuf;
+    lpr_memset(&statbuf, 0, sizeof(statbuf));
+    return lpr_linux_newfstatat(dirfd, path, (uint64_t)(uintptr_t)&statbuf, flags);
 }
 
 static int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw)
@@ -2046,22 +2710,25 @@ int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
         (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)suffix, sizeof(suffix) - 1u);
     }
 #endif
-    lpr_linux_stat_t st;
-    const int64_t status = lpr_linux_newfstatat(
+    char target[FILED_WIRE_NAME_BYTES];
+    lpr_memset(target, 0, sizeof(target));
+    const int64_t status = lpr_linux_readlinkat_to_buffer(
         (uint64_t)(int64_t)LPR_LINUX_AT_FDCWD,
         path,
-        (uint64_t)(uintptr_t)&st,
-        0);
-    if (status != 0) {
+        target,
+        sizeof(target) - 1u);
+    if (status < 0) {
         lpr_readlink_cache_store(path_string, path_len, status);
         return status;
     }
-    if (((uint64_t)st.st_mode & LPR_LINUX_S_IFMT) != LPR_LINUX_S_IFLNK) {
-        lpr_readlink_cache_store(path_string, path_len, -LPR_LINUX_EINVAL);
-        return -LPR_LINUX_EINVAL;
+    uint64_t copy_len = (uint64_t)status;
+    if (copy_len > bufsiz) {
+        copy_len = bufsiz;
     }
-    lpr_readlink_cache_store(path_string, path_len, -LPR_LINUX_ENOTSUP);
-    return -LPR_LINUX_ENOTSUP;
+    if (copy_len != 0) {
+        lpr_memcpy((void *)(uintptr_t)buf, target, copy_len);
+    }
+    return (int64_t)copy_len;
 }
 
 static uint16_t lpr_dirent_reclen(uint64_t name_len)

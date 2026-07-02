@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/home", "/share", "/share/fastfetch", "/share/fonts"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
   apps:
     - "alpine_clang"
@@ -424,6 +424,14 @@ apps:
       input:
         - "pack/scripts/download_lpr_busybox_dynamic.sh"
     out: "LPRBBROOT"
+    rootfs: "/"
+  lpr_apk_offline:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-apk-offline-root"
+      rebuild: ["bash", "pack/scripts/download_lpr_apk_offline.sh", ".artifacts/userland-fixtures/lpr-apk-offline-root"]
+      input:
+        - "pack/scripts/download_lpr_apk_offline.sh"
+    out: "LPRAPKROOT"
     rootfs: "/"
   lpr_dyn_needed_smoke:
     file:

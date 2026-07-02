@@ -31,16 +31,19 @@ enum {
     FILED_WIRE_OP_RENAME = 21,
     FILED_WIRE_OP_MKDIR = 22,
     FILED_WIRE_OP_RMDIR = 23,
-    FILED_WIRE_OP_SEEK = 24,
-    FILED_WIRE_OP_DUMP_METRICS = 25,
-    FILED_WIRE_OP_SET_CACHE_SLOTS = 26,
-    FILED_WIRE_OP_CONNECT = 27,
-    FILED_WIRE_OP_PING = 28,
-    FILED_WIRE_OP_FAST_DOORBELL = 29,
-    FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 30,
-    FILED_WIRE_OP_PWRITE_BATCH = 31,
-    FILED_WIRE_OP_WRITE_BATCH = 32,
-    FILED_WIRE_OP_PREAD_TO_VMO = 33,
+    FILED_WIRE_OP_SYMLINK = 24,
+    FILED_WIRE_OP_READLINK = 25,
+    FILED_WIRE_OP_SEEK = 26,
+    FILED_WIRE_OP_DUMP_METRICS = 27,
+    FILED_WIRE_OP_SET_CACHE_SLOTS = 28,
+    FILED_WIRE_OP_CONNECT = 29,
+    FILED_WIRE_OP_PING = 30,
+    FILED_WIRE_OP_FAST_DOORBELL = 31,
+    FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 32,
+    FILED_WIRE_OP_PWRITE_BATCH = 33,
+    FILED_WIRE_OP_WRITE_BATCH = 34,
+    FILED_WIRE_OP_PREAD_TO_VMO = 35,
+    FILED_WIRE_OP_FILE_VMO = 36,
 
     FILED_WIRE_NAME_BYTES = 96,
     FILED_WIRE_IO_BYTES = 7680,
@@ -142,6 +145,15 @@ typedef struct filed_wire_pread_vmo {
     uint64_t reserved0;
     uint64_t reserved1;
 } filed_wire_pread_vmo_t;
+
+typedef struct filed_wire_file_vmo {
+    uint64_t handle;
+    uint64_t file_offset;
+    uint64_t length;
+    uint64_t flags;
+    uint64_t reserved0;
+    uint64_t reserved1;
+} filed_wire_file_vmo_t;
 
 typedef struct filed_wire_fast_header {
     uint64_t magic;
@@ -254,6 +266,20 @@ typedef struct filed_wire_rmdir {
     uint64_t reserved0;
     char name[FILED_WIRE_NAME_BYTES];
 } filed_wire_rmdir_t;
+
+typedef struct filed_wire_symlink {
+    uint64_t dir_handle;
+    uint64_t target_length;
+    char name[FILED_WIRE_NAME_BYTES];
+    char target[FILED_WIRE_NAME_BYTES];
+} filed_wire_symlink_t;
+
+typedef struct filed_wire_readlink {
+    uint64_t dir_handle;
+    uint64_t target_length;
+    char name[FILED_WIRE_NAME_BYTES];
+    char target[FILED_WIRE_NAME_BYTES];
+} filed_wire_readlink_t;
 
 typedef struct filed_wire_rename {
     uint64_t old_dir_handle;

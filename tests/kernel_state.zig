@@ -558,6 +558,41 @@ test "native vmo pages return to free list after vma and fd release" {
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
 }
 
+test "shared vmo fd pages survive munmap while fd remains open" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x20_0000, 2);
+    const original_free = free_list.len;
+
+    const fd = try s.createAnonymousVmoFdWithPages(
+        p0,
+        4096,
+        fdRights(.{ .map_read = true, .map_write = true, .read = true, .close = true }),
+        .{},
+        0,
+        &free_list,
+    );
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    const page = s.nativeVmoPagePaddr(vmo, 0) orelse unreachable;
+    try std.testing.expectEqual(original_free - 1, free_list.len);
+
+    _ = try s.mmapFd(
+        p0,
+        fd,
+        0x4700_0000,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .shared = true }),
+        0,
+    );
+    try s.munmapRangeWithFreeList(p0, 0x4700_0000, 4096, &free_list);
+    try std.testing.expectEqual(page, s.nativeVmoPagePaddr(vmo, 0) orelse unreachable);
+    try std.testing.expectEqual(original_free - 1, free_list.len);
+
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(original_free, free_list.len);
+}
+
 test "native vma fault mapping resolves backing page without page capability" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -577,4 +612,64 @@ test "native vma fault mapping resolves backing page without page capability" {
     try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, true, false) == null);
     try s.munmapRangeWithFreeList(p0, 0x4500_0000, 4096, &free_list);
     try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, false, false) == null);
+}
+
+test "private file vma faults read-only then COWs on write" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x1_0000_0000, 4);
+    const source_page = (try s.allocPhysicalPage(&free_list)).paddr;
+
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{
+        .map_read = true,
+        .map_write = true,
+    }), .{}, 0);
+    const source_vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    try s.installNativeVmoPages(source_vmo, 0, &[_]u64{source_page});
+
+    _ = try s.mmapFd(
+        p0,
+        fd,
+        0x4600_0000,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true }),
+        0,
+    );
+
+    const read_mapping = s.nativeVmaFaultMapping(p0, 0x4600_0000, false, false) orelse unreachable;
+    try std.testing.expectEqual(source_page, read_mapping.paddr);
+    try std.testing.expect(read_mapping.prot.read);
+    try std.testing.expect(!read_mapping.prot.write);
+    const private_vma_before = s.vmaEntryConst(p0, 0x4600_0000) orelse unreachable;
+    try std.testing.expect(private_vma_before.flags.private);
+    try std.testing.expect(!private_vma_before.flags.anonymous);
+    try std.testing.expectEqual(source_vmo.index, private_vma_before.vmo.index);
+    try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(private_vma_before.vmo, 1));
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(source_vmo));
+
+    const write_mapping = s.ensureNativeVmaCowMapping(
+        p0,
+        0x4600_0000,
+        true,
+        false,
+        &free_list,
+    ) orelse unreachable;
+    try std.testing.expect(write_mapping.paddr != source_page);
+    try std.testing.expect(write_mapping.prot.write);
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(source_vmo));
+
+    const private_vma = s.vmaEntryConst(p0, 0x4600_0000) orelse unreachable;
+    try std.testing.expect(private_vma.flags.private);
+    try std.testing.expect(!private_vma.flags.anonymous);
+    try std.testing.expectEqual(source_vmo.index, private_vma.vmo.index);
+    try std.testing.expectEqual(source_page, s.nativeVmoPagePaddr(private_vma.vmo, 0) orelse unreachable);
+    const reread_mapping = s.nativeVmaFaultMapping(p0, 0x4600_0000, false, false) orelse unreachable;
+    try std.testing.expectEqual(write_mapping.paddr, reread_mapping.paddr);
+    try std.testing.expect(reread_mapping.prot.write);
+
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
+    try s.munmapRangeWithFreeList(p0, 0x4600_0000, 4096, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(source_vmo));
 }

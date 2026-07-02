@@ -535,18 +535,27 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     const instruction_fetch = (ec & (1 << 4)) != 0;
     user_vm.lockAddressSpaces();
     defer user_vm.unlockAddressSpaces();
-    if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) {
-        if (write_access) {
-            if (h.state.ensureNativeVmaCowMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {
-                var paddrs = [_]u64{mapping.paddr};
+    if (write_access) {
+        if (h.state.ensureNativeVmaCowMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {
+            var paddrs = [_]u64{mapping.paddr};
+            if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) {
                 if (user_vm.remapTrustedUserPaddrsWithProt(
                     principal,
                     fault_page_va,
                     paddrs[0..],
                     mapping.prot,
                 )) return 1;
+            } else if (user_vm.mapLazyUserPaddrsWithProt(
+                principal,
+                fault_page_va,
+                paddrs[0..],
+                mapping.prot,
+            )) {
+                return 1;
             }
         }
+    }
+    if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) {
         return 0;
     }
     if (h.state.ensureNativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {

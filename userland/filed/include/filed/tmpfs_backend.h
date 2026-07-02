@@ -65,6 +65,8 @@ int filed_tmpfs_backend_pread(filed_tmpfs_backend_t *backend, uint64_t object_id
 int filed_tmpfs_backend_pwrite(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_tmpfs_backend_fsync(filed_tmpfs_backend_t *backend, uint64_t object_id);
 int filed_tmpfs_backend_create(filed_tmpfs_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);
+int filed_tmpfs_backend_symlink(filed_tmpfs_backend_t *backend, uint64_t parent_object_id, const char *name, const char *target, uint64_t target_length, uint64_t *out_object_id);
+int filed_tmpfs_backend_readlink(filed_tmpfs_backend_t *backend, uint64_t object_id, char *out_target, uint64_t target_capacity, uint64_t *out_length);
 int filed_tmpfs_backend_truncate(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t size);
 int filed_tmpfs_backend_utimens(filed_tmpfs_backend_t *backend, uint64_t object_id, uint32_t mask, int64_t atime_sec, int64_t atime_nsec, int64_t mtime_sec, int64_t mtime_nsec);
 int filed_tmpfs_backend_chmod(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t mode);

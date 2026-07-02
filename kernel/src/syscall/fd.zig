@@ -517,29 +517,28 @@ fn mapVmoFd(
         return base_va;
     }
 
-    const vmo_ref = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
     _ = state.mmapFd(proc, fd, base_va, aligned_size, prot, flags, vmo_offset) catch |err| switch (err) {
         kernel.KernelError.TableFull => return sc.syscall_err_alloc,
         else => return sc.syscall_err_invalid,
     };
 
+    if (flags.private and !flags.shared) {
+        return base_va;
+    }
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
-    const offset_pages: usize = @intCast(vmo_offset / 4096);
+    var map_prot: ?kernel.MapProt = null;
     var i: usize = 0;
     while (i < page_count) : (i += 1) {
-        paddrs[i] = state.nativeVmoPagePaddr(vmo_ref, offset_pages + i) orelse {
+        const mapping = state.nativeVmaInitialMapping(proc, base_va + @as(u64, @intCast(i)) * 4096) orelse {
             state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
             return sc.syscall_err_map;
         };
+        paddrs[i] = mapping.paddr;
+        if (map_prot == null) map_prot = mapping.prot;
     }
     if (!prot.read and !prot.write and !prot.exec) return base_va;
-    if (!user_vm.mapTrustedUserPaddrsWithProt(proc, base_va, paddrs[0..page_count], .{
-        .read = prot.read,
-        .write = prot.write and !flags.private,
-        .exec = prot.exec,
-        .pkey = prot.pkey,
-    })) {
+    if (!user_vm.mapTrustedUserPaddrsWithProt(proc, base_va, paddrs[0..page_count], map_prot orelse .{})) {
         state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch {};
         return sc.syscall_err_map;
     }

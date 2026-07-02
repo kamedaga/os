@@ -6,7 +6,6 @@
 #include <time.h>
 
 #include "pacha/ipc.h"
-
 typedef struct lpr_exec_map_metric_record {
     const char *name;
     uint64_t count;
@@ -18,7 +17,7 @@ typedef struct lpr_exec_map_metric_record {
 } lpr_exec_map_metric_record_t;
 
 enum {
-    LPR_EXEC_MAP_METRIC_SLOTS = 32,
+    LPR_EXEC_MAP_METRIC_SLOTS = 64,
 };
 
 static lpr_exec_map_metric_record_t lpr_exec_map_metrics[LPR_EXEC_MAP_METRIC_SLOTS];
@@ -163,16 +162,28 @@ static int create_segment_vmo(uint64_t map_size, int *out_vmo_fd, unsigned char 
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
+    uint64_t metric_start = lpr_exec_map_now_cycles();
     const int vmo_fd = pacha_vmo_create(map_size, rights, 0);
+    lpr_exec_map_metric_time_cycles(
+        "segment_vmo_create_syscall",
+        metric_start,
+        lpr_exec_map_now_cycles(),
+        map_size);
     if (vmo_fd < 16) {
         return -12;
     }
+    metric_start = lpr_exec_map_now_cycles();
     unsigned char *mapped = pacha_mmap(
         vmo_fd,
         map_size,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
+    lpr_exec_map_metric_time_cycles(
+        "segment_vmo_mmap_syscall",
+        metric_start,
+        lpr_exec_map_now_cycles(),
+        map_size);
     if (mapped == NULL) {
         (void)pacha_fd_close(vmo_fd);
         return -12;
@@ -1208,13 +1219,43 @@ static int create_segment_vmo_from_bytes(
     *out_vmo_fd = -1;
     int vmo_fd = -1;
     unsigned char *mapped = NULL;
+    uint64_t metric_start = lpr_exec_map_now_cycles();
     int status = create_segment_vmo(map_size, &vmo_fd, &mapped);
+    lpr_exec_map_metric_time_cycles(
+        "segment_vmo_create_map",
+        metric_start,
+        lpr_exec_map_now_cycles(),
+        map_size);
     if (status != 0) {
         return status;
     }
-    memset(mapped, 0, (size_t)map_size);
+    if (page_offset != 0) {
+        metric_start = lpr_exec_map_now_cycles();
+        memset(mapped, 0, (size_t)page_offset);
+        lpr_exec_map_metric_time_cycles(
+            "segment_vmo_zero_prefix",
+            metric_start,
+            lpr_exec_map_now_cycles(),
+            page_offset);
+    }
     if (bytes_size != 0) {
+        metric_start = lpr_exec_map_now_cycles();
         memcpy(mapped + page_offset, bytes, (size_t)bytes_size);
+        lpr_exec_map_metric_time_cycles(
+            "segment_vmo_copy_file",
+            metric_start,
+            lpr_exec_map_now_cycles(),
+            bytes_size);
+    }
+    const uint64_t data_end = page_offset + bytes_size;
+    if (data_end < map_size) {
+        metric_start = lpr_exec_map_now_cycles();
+        memset(mapped + data_end, 0, (size_t)(map_size - data_end));
+        lpr_exec_map_metric_time_cycles(
+            "segment_vmo_zero_suffix",
+            metric_start,
+            lpr_exec_map_now_cycles(),
+            map_size - data_end);
     }
     if (patch_text) {
         lpr_exec_patch_segment_text_range(
@@ -1225,7 +1266,13 @@ static int create_segment_vmo_from_bytes(
             patch_file_offset,
             patch_file_size);
     }
+    metric_start = lpr_exec_map_now_cycles();
     (void)pacha_munmap(mapped, map_size);
+    lpr_exec_map_metric_time_cycles(
+        "segment_vmo_munmap_syscall",
+        metric_start,
+        lpr_exec_map_now_cycles(),
+        map_size);
     *out_vmo_fd = vmo_fd;
     return 0;
 }

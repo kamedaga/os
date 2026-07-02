@@ -11,6 +11,7 @@ enum {
     FILED_TMPFS_MODE_TYPE_MASK = 0170000u,
     FILED_TMPFS_MODE_REGULAR = 0100000u,
     FILED_TMPFS_MODE_DIRECTORY = 0040000u,
+    FILED_TMPFS_MODE_SYMLINK = 0120000u,
 };
 
 static void filed_tmpfs_lock_acquire(filed_lock_t *lock)
@@ -53,6 +54,9 @@ static uint64_t filed_tmpfs_mode_for_kind(filed_vnode_kind_t kind, uint64_t mode
     const uint64_t perms = mode & 07777u;
     if (kind == FILED_VNODE_DIRECTORY) {
         return FILED_TMPFS_MODE_DIRECTORY | (perms == 0 ? 0755u : perms);
+    }
+    if (kind == FILED_VNODE_SYMLINK) {
+        return FILED_TMPFS_MODE_SYMLINK | 0777u;
     }
     return FILED_TMPFS_MODE_REGULAR | (perms == 0 ? 0644u : perms);
 }
@@ -454,7 +458,7 @@ int filed_tmpfs_backend_pread(filed_tmpfs_backend_t *backend, uint64_t object_id
         filed_tmpfs_lock_release(&backend->lock);
         return -21;
     }
-    if (node->kind != FILED_VNODE_REGULAR) {
+    if (node->kind != FILED_VNODE_REGULAR && node->kind != FILED_VNODE_SYMLINK) {
         filed_tmpfs_lock_release(&backend->lock);
         return -22;
     }
@@ -508,7 +512,7 @@ int filed_tmpfs_backend_pwrite(filed_tmpfs_backend_t *backend, uint64_t object_i
         filed_tmpfs_lock_release(&backend->lock);
         return -21;
     }
-    if (node->kind != FILED_VNODE_REGULAR) {
+    if (node->kind != FILED_VNODE_REGULAR && node->kind != FILED_VNODE_SYMLINK) {
         filed_tmpfs_lock_release(&backend->lock);
         return -22;
     }
@@ -628,6 +632,88 @@ int filed_tmpfs_backend_create(filed_tmpfs_backend_t *backend, uint64_t parent_o
 int filed_tmpfs_backend_mkdir(filed_tmpfs_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id)
 {
     return filed_tmpfs_create_kind(backend, parent_object_id, name, mode, FILED_VNODE_DIRECTORY, out_object_id);
+}
+
+int filed_tmpfs_backend_symlink(
+    filed_tmpfs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    const char *target,
+    uint64_t target_length,
+    uint64_t *out_object_id)
+{
+    uint64_t object_id = 0;
+    uint64_t written = 0;
+    if (target == NULL || target_length == 0 || target_length >= FILED_TMPFS_NAME_BYTES) {
+        return -22;
+    }
+    int status = filed_tmpfs_create_kind(
+        backend,
+        parent_object_id,
+        name,
+        FILED_TMPFS_MODE_SYMLINK | 0777u,
+        FILED_VNODE_SYMLINK,
+        &object_id);
+    if (status != 0) {
+        return status;
+    }
+    status = filed_tmpfs_backend_pwrite(backend, object_id, 0, target, target_length, &written);
+    if (status != 0 || written != target_length) {
+        (void)filed_tmpfs_backend_unlink(backend, parent_object_id, name);
+        return status != 0 ? status : -5;
+    }
+    if (out_object_id != NULL) {
+        *out_object_id = object_id;
+    }
+    return 0;
+}
+
+int filed_tmpfs_backend_readlink(
+    filed_tmpfs_backend_t *backend,
+    uint64_t object_id,
+    char *out_target,
+    uint64_t target_capacity,
+    uint64_t *out_length)
+{
+    if (backend == NULL || out_target == NULL || out_length == NULL || target_capacity == 0) {
+        return -22;
+    }
+    *out_length = 0;
+    filed_tmpfs_lock_acquire(&backend->lock);
+    filed_tmpfs_node_t *node = filed_tmpfs_find_node(backend, object_id);
+    if (node == NULL) {
+        filed_tmpfs_lock_release(&backend->lock);
+        return -2;
+    }
+    if (node->kind != FILED_VNODE_SYMLINK) {
+        filed_tmpfs_lock_release(&backend->lock);
+        return -22;
+    }
+    uint64_t length = node->size;
+    if (length > target_capacity) {
+        length = target_capacity;
+    }
+    uint64_t total = 0;
+    while (total < length) {
+        const uint64_t absolute = total;
+        const uint64_t page_index = absolute / FILED_TMPFS_PAGE_BYTES;
+        const uint64_t page_offset = absolute % FILED_TMPFS_PAGE_BYTES;
+        uint64_t chunk = length - total;
+        if (chunk > FILED_TMPFS_PAGE_BYTES - page_offset) {
+            chunk = FILED_TMPFS_PAGE_BYTES - page_offset;
+        }
+        const uint16_t page_id = page_index < FILED_TMPFS_NODE_MAX_PAGES ? node->pages[page_index] : 0;
+        filed_tmpfs_page_t *page = filed_tmpfs_page_by_id(backend, page_id);
+        if (page != NULL) {
+            memcpy(out_target + total, page->data + page_offset, (size_t)chunk);
+        } else {
+            memset(out_target + total, 0, (size_t)chunk);
+        }
+        total += chunk;
+    }
+    *out_length = total;
+    filed_tmpfs_lock_release(&backend->lock);
+    return 0;
 }
 
 int filed_tmpfs_backend_truncate(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t size)

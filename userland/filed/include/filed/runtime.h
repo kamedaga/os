@@ -9,6 +9,7 @@
 
 enum {
     FILED_RUNTIME_MAX_SESSIONS = 32,
+    FILED_RUNTIME_FILE_VMO_CACHE_SLOTS = 16,
 };
 
 typedef struct filed_session {
@@ -19,6 +20,18 @@ typedef struct filed_session {
     uint8_t active;
 } filed_session_t;
 
+typedef struct filed_file_vmo_cache_entry {
+    uint8_t active;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    int vmo_fd;
+    uint64_t backend_object;
+    uint64_t object_generation;
+    uint64_t file_offset;
+    uint64_t length;
+    uint64_t clock;
+} filed_file_vmo_cache_entry_t;
+
 typedef struct filed_runtime {
     filed_vfs_t vfs;
     filed_bootstrap_t bootstrap;
@@ -27,7 +40,9 @@ typedef struct filed_runtime {
     int bootstrap_fd;
     int client_endpoint_fd;
     filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
+    filed_file_vmo_cache_entry_t file_vmo_cache[FILED_RUNTIME_FILE_VMO_CACHE_SLOTS];
     uint64_t request_sequence;
+    uint64_t file_vmo_cache_clock;
     uint64_t root_size;
     filed_mount_id_t root_mount_id;
     filed_handle_id_t root_handle_id;

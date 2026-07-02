@@ -111,10 +111,37 @@ fn physWindowAddr(addr: u64, access_len: usize) ?u64 {
 }
 
 fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, write_access: bool) ?u64 {
-    if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
+    if (!write_access) {
+        if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
+    }
     const h = getHooks();
     user_vm.lockAddressSpaces();
     defer user_vm.unlockAddressSpaces();
+    if (write_access) {
+        if (h.state.ensureNativeVmaCowMapping(
+            principal,
+            page_va,
+            true,
+            false,
+            h.free_list,
+        )) |mapping| {
+            var paddrs = [_]u64{mapping.paddr};
+            if (user_vm.lookupUserMappedPaddrForVa(principal, page_va) != null) {
+                if (!user_vm.remapTrustedUserPaddrsWithProt(
+                    principal,
+                    page_va,
+                    paddrs[0..],
+                    mapping.prot,
+                )) return null;
+            } else if (!user_vm.mapLazyUserPaddrsWithProt(
+                principal,
+                page_va,
+                paddrs[0..],
+                mapping.prot,
+            )) return null;
+            return mapping.paddr;
+        }
+    }
     if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
     const mapping = h.state.ensureNativeVmaFaultMapping(
         principal,

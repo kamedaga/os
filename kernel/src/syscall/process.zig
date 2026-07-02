@@ -305,30 +305,24 @@ fn installProcessMapLocked(
         },
     };
 
+    if (req.flags.private and !req.flags.shared) {
+        return .{ .status = sc.syscall_ok, .mapped_va = target_va };
+    }
     if (!req.prot.read and !req.prot.write and !req.prot.exec) return .{ .status = sc.syscall_ok, .mapped_va = target_va };
 
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(req.aligned_size / 4096);
-    const offset_pages: usize = @intCast(req.vmo_offset / 4096);
-    const vmo_ref = state.nativeVmoRefForFd(proc, req.vmo_fd) orelse {
-        kernel_log.write("process.map failed vmo-fd\n");
-        state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
-        return .{ .status = sc.syscall_err_invalid };
-    };
+    var pte_prot: ?kernel.MapProt = null;
     var i: usize = 0;
     while (i < page_count) : (i += 1) {
-        paddrs[i] = state.nativeVmoPagePaddr(vmo_ref, offset_pages + i) orelse {
+        const mapping = state.nativeVmaInitialMapping(target_owner, target_va + @as(u64, @intCast(i)) * 4096) orelse {
             kernel_log.write("process.map failed missing-page\n");
             state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
             return .{ .status = sc.syscall_err_map };
         };
+        paddrs[i] = mapping.paddr;
+        if (pte_prot == null) pte_prot = mapping.prot;
     }
-    const pte_prot: kernel.MapProt = .{
-        .read = req.prot.read,
-        .write = req.prot.write and !req.flags.private,
-        .exec = req.prot.exec,
-        .pkey = req.prot.pkey,
-    };
     const low_page_zero_map =
         !anywhere and
         target_va == 0 and
@@ -337,15 +331,16 @@ fn installProcessMapLocked(
         req.prot.read and
         !req.prot.write and
         req.prot.exec;
+    const initial_prot = pte_prot orelse kernel.MapProt{};
     const map_ok = if (low_page_zero_map)
         user_vm.mapTrustedLowPageZeroPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], .{
-            .read = pte_prot.read,
-            .write = pte_prot.write,
-            .exec = pte_prot.exec,
-            .pkey = pte_prot.pkey,
+            .read = initial_prot.read,
+            .write = initial_prot.write,
+            .exec = initial_prot.exec,
+            .pkey = initial_prot.pkey,
         })
     else
-        user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], pte_prot);
+        user_vm.mapTrustedUserPaddrsWithProt(target_owner, target_va, paddrs[0..page_count], initial_prot);
     if (!map_ok) {
         kernel_log.write("process.map failed map-paddrs\n");
         state.munmapRangeWithFreeList(target_owner, target_va, req.aligned_size, free_list) catch {};
