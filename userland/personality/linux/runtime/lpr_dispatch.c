@@ -18,7 +18,7 @@
 #define LPR_LINUX_AT_FDCWD ((uint64_t)(int64_t)-100)
 #define LPR_LINUX_AT_REMOVEDIR 0x200ull
 
-#if LPR_TRACE_PATCH_MAPPING
+#if LPR_TRACE_PATCH_MAPPING || LPR_TRACE_SYSCALL_METRICS
 static char *lpr_append_literal(char *out, const char *end, const char *text)
 {
     while (out < end && *text != 0) {
@@ -40,7 +40,9 @@ static char *lpr_append_u64(char *out, const char *end, uint64_t value)
     }
     return out;
 }
+#endif
 
+#if LPR_TRACE_PATCH_MAPPING
 static void lpr_trace_patch_mapping(const struct lpr_patch_mapping_result *result)
 {
     if (result == 0) {
@@ -62,6 +64,206 @@ static void lpr_trace_patch_mapping(const struct lpr_patch_mapping_result *resul
     if (out > line) {
         (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
     }
+}
+#endif
+
+#if LPR_TRACE_SYSCALL_METRICS
+typedef struct lpr_trace_syscall_metric {
+    uint64_t nr;
+    uint64_t count;
+    uint64_t total_cycles;
+    uint64_t max_cycles;
+    uint64_t errors;
+} lpr_trace_syscall_metric_t;
+
+static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
+    { .nr = LPR_LINUX_SYS_READ },
+    { .nr = LPR_LINUX_SYS_WRITE },
+    { .nr = LPR_LINUX_SYS_OPEN },
+    { .nr = LPR_LINUX_SYS_CLOSE },
+    { .nr = LPR_LINUX_SYS_STAT },
+    { .nr = LPR_LINUX_SYS_FSTAT },
+    { .nr = LPR_LINUX_SYS_LSTAT },
+    { .nr = LPR_LINUX_SYS_LSEEK },
+    { .nr = LPR_LINUX_SYS_MMAP },
+    { .nr = LPR_LINUX_SYS_MPROTECT },
+    { .nr = LPR_LINUX_SYS_MUNMAP },
+    { .nr = LPR_LINUX_SYS_BRK },
+    { .nr = LPR_LINUX_SYS_IOCTL },
+    { .nr = LPR_LINUX_SYS_PREAD64 },
+    { .nr = LPR_LINUX_SYS_READV },
+    { .nr = LPR_LINUX_SYS_WRITEV },
+    { .nr = LPR_LINUX_SYS_ACCESS },
+    { .nr = LPR_LINUX_SYS_GETPID },
+    { .nr = LPR_LINUX_SYS_EXIT },
+    { .nr = LPR_LINUX_SYS_FCNTL },
+    { .nr = LPR_LINUX_SYS_FSYNC },
+    { .nr = LPR_LINUX_SYS_FDATASYNC },
+    { .nr = LPR_LINUX_SYS_GETCWD },
+    { .nr = LPR_LINUX_SYS_RENAME },
+    { .nr = LPR_LINUX_SYS_MKDIR },
+    { .nr = LPR_LINUX_SYS_RMDIR },
+    { .nr = LPR_LINUX_SYS_UNLINK },
+    { .nr = LPR_LINUX_SYS_READLINK },
+    { .nr = LPR_LINUX_SYS_CHMOD },
+    { .nr = LPR_LINUX_SYS_FCHMOD },
+    { .nr = LPR_LINUX_SYS_ARCH_PRCTL },
+    { .nr = LPR_LINUX_SYS_GETTID },
+    { .nr = LPR_LINUX_SYS_GETDENTS64 },
+    { .nr = LPR_LINUX_SYS_SET_TID_ADDRESS },
+    { .nr = LPR_LINUX_SYS_CLOCK_GETTIME },
+    { .nr = LPR_LINUX_SYS_EXIT_GROUP },
+    { .nr = LPR_LINUX_SYS_OPENAT },
+    { .nr = LPR_LINUX_SYS_MKDIRAT },
+    { .nr = LPR_LINUX_SYS_NEWFSTATAT },
+    { .nr = LPR_LINUX_SYS_UNLINKAT },
+    { .nr = LPR_LINUX_SYS_RENAMEAT },
+    { .nr = LPR_LINUX_SYS_FCHMODAT },
+    { .nr = LPR_LINUX_SYS_UTIMENSAT },
+    { .nr = LPR_LINUX_SYS_GETRANDOM },
+};
+
+static uint64_t lpr_trace_read_tsc(void)
+{
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+static lpr_trace_syscall_metric_t *lpr_trace_syscall_metric_slot(uint64_t nr)
+{
+    for (uint64_t i = 0; i < sizeof(lpr_trace_syscall_metrics) / sizeof(lpr_trace_syscall_metrics[0]); ++i) {
+        if (lpr_trace_syscall_metrics[i].nr == nr) {
+            return &lpr_trace_syscall_metrics[i];
+        }
+    }
+    return 0;
+}
+
+static void lpr_trace_syscall_record(uint64_t nr, uint64_t cycles, int64_t result)
+{
+    lpr_trace_syscall_metric_t *metric = lpr_trace_syscall_metric_slot(nr);
+    if (metric == 0) {
+        return;
+    }
+    metric->count++;
+    metric->total_cycles += cycles;
+    if (cycles > metric->max_cycles) {
+        metric->max_cycles = cycles;
+    }
+    if (result < 0) {
+        metric->errors++;
+    }
+}
+
+static void lpr_trace_write_line(const char *line, uint64_t size)
+{
+    if (line != 0 && size != 0) {
+        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, size);
+    }
+}
+
+static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t nr)
+{
+    switch (nr) {
+    case LPR_LINUX_SYS_READ: return lpr_append_literal(out, end, "read");
+    case LPR_LINUX_SYS_WRITE: return lpr_append_literal(out, end, "write");
+    case LPR_LINUX_SYS_OPEN: return lpr_append_literal(out, end, "open");
+    case LPR_LINUX_SYS_CLOSE: return lpr_append_literal(out, end, "close");
+    case LPR_LINUX_SYS_STAT: return lpr_append_literal(out, end, "stat");
+    case LPR_LINUX_SYS_FSTAT: return lpr_append_literal(out, end, "fstat");
+    case LPR_LINUX_SYS_LSTAT: return lpr_append_literal(out, end, "lstat");
+    case LPR_LINUX_SYS_LSEEK: return lpr_append_literal(out, end, "lseek");
+    case LPR_LINUX_SYS_MMAP: return lpr_append_literal(out, end, "mmap");
+    case LPR_LINUX_SYS_MPROTECT: return lpr_append_literal(out, end, "mprotect");
+    case LPR_LINUX_SYS_MUNMAP: return lpr_append_literal(out, end, "munmap");
+    case LPR_LINUX_SYS_BRK: return lpr_append_literal(out, end, "brk");
+    case LPR_LINUX_SYS_IOCTL: return lpr_append_literal(out, end, "ioctl");
+    case LPR_LINUX_SYS_PREAD64: return lpr_append_literal(out, end, "pread64");
+    case LPR_LINUX_SYS_READV: return lpr_append_literal(out, end, "readv");
+    case LPR_LINUX_SYS_WRITEV: return lpr_append_literal(out, end, "writev");
+    case LPR_LINUX_SYS_ACCESS: return lpr_append_literal(out, end, "access");
+    case LPR_LINUX_SYS_GETPID: return lpr_append_literal(out, end, "getpid");
+    case LPR_LINUX_SYS_EXIT: return lpr_append_literal(out, end, "exit");
+    case LPR_LINUX_SYS_FCNTL: return lpr_append_literal(out, end, "fcntl");
+    case LPR_LINUX_SYS_FSYNC: return lpr_append_literal(out, end, "fsync");
+    case LPR_LINUX_SYS_FDATASYNC: return lpr_append_literal(out, end, "fdatasync");
+    case LPR_LINUX_SYS_GETCWD: return lpr_append_literal(out, end, "getcwd");
+    case LPR_LINUX_SYS_RENAME: return lpr_append_literal(out, end, "rename");
+    case LPR_LINUX_SYS_MKDIR: return lpr_append_literal(out, end, "mkdir");
+    case LPR_LINUX_SYS_RMDIR: return lpr_append_literal(out, end, "rmdir");
+    case LPR_LINUX_SYS_UNLINK: return lpr_append_literal(out, end, "unlink");
+    case LPR_LINUX_SYS_READLINK: return lpr_append_literal(out, end, "readlink");
+    case LPR_LINUX_SYS_CHMOD: return lpr_append_literal(out, end, "chmod");
+    case LPR_LINUX_SYS_FCHMOD: return lpr_append_literal(out, end, "fchmod");
+    case LPR_LINUX_SYS_ARCH_PRCTL: return lpr_append_literal(out, end, "arch_prctl");
+    case LPR_LINUX_SYS_GETTID: return lpr_append_literal(out, end, "gettid");
+    case LPR_LINUX_SYS_GETDENTS64: return lpr_append_literal(out, end, "getdents64");
+    case LPR_LINUX_SYS_SET_TID_ADDRESS: return lpr_append_literal(out, end, "set_tid_address");
+    case LPR_LINUX_SYS_CLOCK_GETTIME: return lpr_append_literal(out, end, "clock_gettime");
+    case LPR_LINUX_SYS_EXIT_GROUP: return lpr_append_literal(out, end, "exit_group");
+    case LPR_LINUX_SYS_OPENAT: return lpr_append_literal(out, end, "openat");
+    case LPR_LINUX_SYS_MKDIRAT: return lpr_append_literal(out, end, "mkdirat");
+    case LPR_LINUX_SYS_NEWFSTATAT: return lpr_append_literal(out, end, "newfstatat");
+    case LPR_LINUX_SYS_UNLINKAT: return lpr_append_literal(out, end, "unlinkat");
+    case LPR_LINUX_SYS_RENAMEAT: return lpr_append_literal(out, end, "renameat");
+    case LPR_LINUX_SYS_FCHMODAT: return lpr_append_literal(out, end, "fchmodat");
+    case LPR_LINUX_SYS_UTIMENSAT: return lpr_append_literal(out, end, "utimensat");
+    case LPR_LINUX_SYS_GETRANDOM: return lpr_append_literal(out, end, "getrandom");
+    default: return lpr_append_literal(out, end, "unknown");
+    }
+}
+
+static void lpr_trace_syscall_dump(uint64_t exit_nr)
+{
+    const uint64_t pid = (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID);
+    const uint64_t tid = (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
+    uint64_t total_count = 0;
+    uint64_t total_cycles = 0;
+    char line[256];
+    for (uint64_t i = 0; i < sizeof(lpr_trace_syscall_metrics) / sizeof(lpr_trace_syscall_metrics[0]); ++i) {
+        const lpr_trace_syscall_metric_t *metric = &lpr_trace_syscall_metrics[i];
+        if (metric->count == 0) {
+            continue;
+        }
+        total_count += metric->count;
+        total_cycles += metric->total_cycles;
+        char *out = line;
+        const char *end = line + sizeof(line);
+        out = lpr_append_literal(out, end, "[lpr_runtime] metric scope=lpr_syscall pid=");
+        out = lpr_append_u64(out, end, pid);
+        out = lpr_append_literal(out, end, " tid=");
+        out = lpr_append_u64(out, end, tid);
+        out = lpr_append_literal(out, end, " op=");
+        out = lpr_trace_append_syscall_name(out, end, metric->nr);
+        out = lpr_append_literal(out, end, " nr=");
+        out = lpr_append_u64(out, end, metric->nr);
+        out = lpr_append_literal(out, end, " count=");
+        out = lpr_append_u64(out, end, metric->count);
+        out = lpr_append_literal(out, end, " avg_cycles=");
+        out = lpr_append_u64(out, end, metric->total_cycles / metric->count);
+        out = lpr_append_literal(out, end, " max_cycles=");
+        out = lpr_append_u64(out, end, metric->max_cycles);
+        out = lpr_append_literal(out, end, " errors=");
+        out = lpr_append_u64(out, end, metric->errors);
+        out = lpr_append_literal(out, end, "\n");
+        lpr_trace_write_line(line, (uint64_t)(out - line));
+    }
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_append_literal(out, end, "[lpr_runtime] metric scope=lpr_syscall_summary pid=");
+    out = lpr_append_u64(out, end, pid);
+    out = lpr_append_literal(out, end, " tid=");
+    out = lpr_append_u64(out, end, tid);
+    out = lpr_append_literal(out, end, " exit_nr=");
+    out = lpr_append_u64(out, end, exit_nr);
+    out = lpr_append_literal(out, end, " total_count=");
+    out = lpr_append_u64(out, end, total_count);
+    out = lpr_append_literal(out, end, " total_cycles=");
+    out = lpr_append_u64(out, end, total_cycles);
+    out = lpr_append_literal(out, end, "\n");
+    lpr_trace_write_line(line, (uint64_t)(out - line));
 }
 #endif
 
@@ -253,13 +455,13 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
     return lpr_linux_pacha_status_to_errno(ret);
 }
 
-int64_t lpr_dispatch_syscall(uint64_t nr,
-                             uint64_t a0,
-                             uint64_t a1,
-                             uint64_t a2,
-                             uint64_t a3,
-                             uint64_t a4,
-                             uint64_t a5) {
+static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
+                                          uint64_t a0,
+                                          uint64_t a1,
+                                          uint64_t a2,
+                                          uint64_t a3,
+                                          uint64_t a4,
+                                          uint64_t a5) {
     switch (nr) {
     case LPR_LINUX_SYS_READ:
         return lpr_linux_read(a0, a1, a2);
@@ -352,4 +554,29 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
     default:
         return -LPR_LINUX_ENOSYS;
     }
+}
+
+int64_t lpr_dispatch_syscall(uint64_t nr,
+                             uint64_t a0,
+                             uint64_t a1,
+                             uint64_t a2,
+                             uint64_t a3,
+                             uint64_t a4,
+                             uint64_t a5) {
+#if LPR_TRACE_SYSCALL_METRICS
+    if (nr == LPR_LINUX_SYS_EXIT || nr == LPR_LINUX_SYS_EXIT_GROUP) {
+        lpr_trace_syscall_record(nr, 0, 0);
+        lpr_trace_syscall_dump(nr);
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, a0);
+        for (;;) {
+        }
+    }
+    const uint64_t start_cycles = lpr_trace_read_tsc();
+    const int64_t result = lpr_dispatch_syscall_inner(nr, a0, a1, a2, a3, a4, a5);
+    const uint64_t end_cycles = lpr_trace_read_tsc();
+    lpr_trace_syscall_record(nr, end_cycles >= start_cycles ? end_cycles - start_cycles : 0, result);
+    return result;
+#else
+    return lpr_dispatch_syscall_inner(nr, a0, a1, a2, a3, a4, a5);
+#endif
 }

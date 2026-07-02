@@ -34,7 +34,7 @@ pub const Hooks = struct {
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     before_current_thread_leave: ?scheduler.BeforeCurrentThreadLeaveCallback = null,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64, ?scheduler.BeforeCurrentThreadLeaveCallback) bool,
-    exit_current_process: *const fn (kernel.PrincipalId, u8, *TrapFrame, ?scheduler.BeforeCurrentThreadLeaveCallback) void,
+    exit_current_process: *const fn (kernel.PrincipalId, u8, *TrapFrame, ?scheduler.BeforeCurrentThreadLeaveCallback, ?kernel.ThreadWakeTarget) void,
     total_usable_memory_bytes: u64,
 };
 
@@ -153,7 +153,7 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
             kernel_state_lock.unlock();
             lock_held = false;
         }
-        base_hooks.exit_current_process(proc, 0, frame, null);
+        base_hooks.exit_current_process(proc, 0, frame, null, null);
         return sc.syscall_ok;
     }
 

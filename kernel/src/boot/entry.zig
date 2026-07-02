@@ -33,6 +33,7 @@ const log_util = @import("../log_util.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
+const enable_exit_teardown_metrics = false;
 
 // ---------------------------------------------------------------------------
 // Boot globals
@@ -494,15 +495,21 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
 fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
+    const metric_start = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
     _ = scheduler.releasePrincipalThreads(principal);
+    const metric_after_release_threads = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
     user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
+    const metric_after_clear_as = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     kernel_state_global.releasePrincipalNativeMemory(principal, global_free_list);
+    const metric_after_release_mem = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     kernel_state_global.resetProcessRuntimeTables(process_index);
+    const metric_after_reset_tables = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     user_vm.unlockAddressSpaces();
     _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
+    const metric_after_unpublish = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
     var endpoint_targets_removed = false;
     var storage_index: usize = 0;
@@ -521,8 +528,26 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     if (endpoint_targets_removed) {
         kernel_state_global.bumpEndpointGeneration();
     }
+    const metric_after_scrub = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
     _ = kernel_state_global.markProcessExited(principal);
+    const metric_after_mark = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
+    if (enable_exit_teardown_metrics) {
+        kernel_log.writeFmt(
+            "[kernel] metric scope=process_exit principal={} total_cycles={} release_threads={} clear_as={} release_mem={} reset_tables={} unpublish={} scrub_endpoints={} mark_exit={}\n",
+            .{
+                @intFromEnum(principal),
+                metric_after_mark -% metric_start,
+                metric_after_release_threads -% metric_start,
+                metric_after_clear_as -% metric_after_release_threads,
+                metric_after_release_mem -% metric_after_clear_as,
+                metric_after_reset_tables -% metric_after_release_mem,
+                metric_after_unpublish -% metric_after_reset_tables,
+                metric_after_scrub -% metric_after_unpublish,
+                metric_after_mark -% metric_after_scrub,
+            },
+        );
+    }
     if (spawn_parent) |parent| scheduler.wakeBlockedThread(parent);
 }
 
@@ -552,13 +577,69 @@ fn exitCurrentProcess(
     exit_code: u8,
     out_frame: *TrapFrame,
     before_ap_idle: ?scheduler.BeforeCurrentThreadLeaveCallback,
+    exit_handoff_target: ?kernel.ThreadWakeTarget,
 ) void {
+    const exit_cpu = if (enable_exit_teardown_metrics) scheduler.currentCpu() else 0;
+    const bootstrap_cpu = scheduler.isBootstrapSchedulerCpu();
+    const handoff_prepared = if (exit_handoff_target) |target|
+        scheduler.prepareExitHandoffToReadyThreadGeneration(target.thread_index, target.thread_generation)
+    else
+        false;
     kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .exited, exit_code);
     kernel_state_global.markProcessObjectsExited(principal, .exited, exit_code);
     teardownExitedProcess(principal);
-    if (!scheduler.isBootstrapSchedulerCpu()) {
+    var handoff_loaded = false;
+    if (handoff_prepared) {
+        if (exit_handoff_target) |target| {
+            handoff_loaded = scheduler.loadExitHandoffThread(out_frame, target.thread_index, target.thread_generation);
+            if (handoff_loaded) {
+                if (enable_exit_teardown_metrics) {
+                    kernel_log.writeFmt(
+                        "[kernel] metric scope=process_exit_handoff principal={} cpu={} has_target={} prepared={} loaded={} bootstrap={}\n",
+                        .{
+                            @intFromEnum(principal),
+                            exit_cpu,
+                            @as(u8, 1),
+                            @as(u8, 1),
+                            @as(u8, 1),
+                            if (bootstrap_cpu) @as(u8, 1) else @as(u8, 0),
+                        },
+                    );
+                }
+                return;
+            }
+            halt.haltWithMessage("exit handoff load failed");
+        }
+    }
+    if (!bootstrap_cpu) {
+        if (enable_exit_teardown_metrics) {
+            kernel_log.writeFmt(
+                "[kernel] metric scope=process_exit_handoff principal={} cpu={} has_target={} prepared={} loaded={} bootstrap={}\n",
+                .{
+                    @intFromEnum(principal),
+                    exit_cpu,
+                    if (exit_handoff_target == null) @as(u8, 0) else @as(u8, 1),
+                    if (handoff_prepared) @as(u8, 1) else @as(u8, 0),
+                    @as(u8, 0),
+                    @as(u8, 0),
+                },
+            );
+        }
         if (before_ap_idle) |callback| callback.run(callback.context);
         smp.returnCurrentApToIdleFromInterrupt();
+    }
+    if (enable_exit_teardown_metrics) {
+        kernel_log.writeFmt(
+            "[kernel] metric scope=process_exit_handoff principal={} cpu={} has_target={} prepared={} loaded={} bootstrap={}\n",
+            .{
+                @intFromEnum(principal),
+                exit_cpu,
+                if (exit_handoff_target == null) @as(u8, 0) else @as(u8, 1),
+                if (handoff_prepared) @as(u8, 1) else @as(u8, 0),
+                if (handoff_loaded) @as(u8, 1) else @as(u8, 0),
+                @as(u8, 1),
+            },
+        );
     }
     loadRunnableThreadOrIdle(out_frame);
 }

@@ -70,15 +70,20 @@ fn writeThreadStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, thread: 
     return sc.syscall_ok;
 }
 
-fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId) void {
+fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId) ?kernel.ThreadWakeTarget {
     var wake_targets: [kernel.max_task_fd_waiters]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.takeTaskReadableWaitersForPrincipal(principal, wake_targets[0..]);
+    var handoff_target: ?kernel.ThreadWakeTarget = null;
     for (wake_targets[0..wake_count]) |target| {
         if (target.pollfd_va != 0) {
             _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
         }
-        _ = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
+        const woke = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
+        if (woke and handoff_target == null) {
+            handoff_target = target;
+        }
     }
+    return handoff_target;
 }
 
 fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
@@ -92,7 +97,7 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     state.markThreadObjectsExitedForPrincipal(principal, exit_state, exit_code);
     state.markProcessObjectsExited(principal, exit_state, exit_code);
-    wakeTaskFdWaiters(h, state, principal);
+    _ = wakeTaskFdWaiters(h, state, principal);
     _ = scheduler.releasePrincipalThreads(principal);
     user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
@@ -416,7 +421,8 @@ fn mapBatchIntoProcess(
             readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_prot_offset),
             readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_vmo_offset_offset),
             readBatchEntryU64(bytes[0..bytes_len], i, process_abi.process_map_batch_entry_flags_offset),
-            false);
+            false,
+        );
         if (prepared.status != sc.syscall_ok) return prepared.status;
         requests[i] = prepared.request;
     }
@@ -453,19 +459,19 @@ fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.Princi
     const generation = scheduler.generationOfThread(current) orelse {
         state.markThreadObjectsExitedForPrincipal(proc, .exited, code);
         state.markProcessObjectsExited(proc, .exited, code);
-        wakeTaskFdWaiters(h, state, proc);
-        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
+        const handoff_target = wakeTaskFdWaiters(h, state, proc);
+        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave, handoff_target);
         return sc.syscall_ok;
     };
     state.markThreadObjectsExitedBySlot(current, generation, .exited, code);
     if (scheduler.liveThreadCount(proc) <= 1) {
         state.markProcessObjectsExited(proc, .exited, code);
-        wakeTaskFdWaiters(h, state, proc);
-        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
+        const handoff_target = wakeTaskFdWaiters(h, state, proc);
+        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave, handoff_target);
         return sc.syscall_ok;
     }
     if (!scheduler.exitCurrentThread(frame, sc.syscall_ok, h.before_current_thread_leave)) {
-        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave);
+        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave, null);
     }
     return sc.syscall_ok;
 }
@@ -479,8 +485,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             if (target == proc) {
                 state.markProcessObjectsExited(proc, .killed, @truncate(frame.rsi));
                 state.markThreadObjectsExitedForPrincipal(proc, .killed, @truncate(frame.rsi));
-                wakeTaskFdWaiters(h, state, proc);
-                h.exit_current_process(proc, @truncate(frame.rsi), frame, h.before_current_thread_leave);
+                const handoff_target = wakeTaskFdWaiters(h, state, proc);
+                h.exit_current_process(proc, @truncate(frame.rsi), frame, h.before_current_thread_leave, handoff_target);
             } else {
                 cleanupProcess(h, state, target, .killed, @truncate(frame.rsi));
             }
@@ -490,8 +496,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_process_exit => blk: {
             state.markProcessObjectsExited(proc, .exited, @truncate(frame.rdi));
             state.markThreadObjectsExitedForPrincipal(proc, .exited, @truncate(frame.rdi));
-            wakeTaskFdWaiters(h, state, proc);
-            h.exit_current_process(proc, @truncate(frame.rdi), frame, h.before_current_thread_leave);
+            const handoff_target = wakeTaskFdWaiters(h, state, proc);
+            h.exit_current_process(proc, @truncate(frame.rdi), frame, h.before_current_thread_leave, handoff_target);
             break :blk sc.syscall_ok;
         },
         sc.syscall_thread_create => createThread(h, state, proc, frame),

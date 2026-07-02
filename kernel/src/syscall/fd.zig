@@ -13,6 +13,13 @@ const vm_abi = abi_root.vm_abi;
 const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_fd_wake_owners = kernel.fd_table_entries;
+const max_pollfds: usize = @intCast(fd_abi.max_pollfds);
+
+const PollItem = struct {
+    fd: kernel.Fd = 0,
+    events: u64 = 0,
+    item_va: u64 = 0,
+};
 
 fn protFromBits(bits: u64) ?kernel.VmaProt {
     if ((bits & ~(vm_abi.prot_read | vm_abi.prot_write | vm_abi.prot_exec)) != 0) return null;
@@ -63,7 +70,7 @@ fn writeUserU64Bytes(h: anytype, proc: kernel.PrincipalId, out_va: u64, len: u64
     if (!h.copy_bytes_to_user_va(proc, out_va, bytes[0..])) return sc.syscall_err_invalid;
     return 8;
 }
- 
+
 fn writeUserU16(h: anytype, proc: kernel.PrincipalId, out_va: u64, value: u16) bool {
     var bytes: [2]u8 = undefined;
     @import("std").mem.writeInt(u16, &bytes, value, .little);
@@ -230,59 +237,65 @@ fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, po
     return ready_count;
 }
 
-fn registerIpcWaitersForPoll(
-    h: anytype,
+fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u64, out: []PollItem) ?[]PollItem {
+    if (pollfds_va == 0 or count > fd_abi.max_pollfds or count > out.len) return null;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const item_va = pollfds_va + @as(u64, @intCast(i)) * fd_abi.pollfd_size;
+        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
+        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return null;
+        if ((events & ~fd_abi.event_known_mask) != 0) return null;
+        out[i] = .{
+            .fd = @intCast(fd_u64),
+            .events = events,
+            .item_va = item_va,
+        };
+    }
+    return out[0..@intCast(count)];
+}
+
+fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, now_tick: u64) ?u64 {
+    var ready_count: u64 = 0;
+    for (items) |item| {
+        const revents = state.fdPollEvents(proc, item.fd, item.events, now_tick) orelse return null;
+        if (!h.write_user_u64(proc, item.item_va + fd_abi.pollfd_revents_offset, revents)) return null;
+        if (revents != 0) ready_count += 1;
+    }
+    return ready_count;
+}
+
+fn registerCachedWaitersForPoll(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
-    pollfds_va: u64,
-    count: u64,
-    timeout_ticks: u64,
+    items: []const PollItem,
     thread_index: usize,
     thread_generation: u32,
 ) kernel.KernelError!void {
-    if (pollfds_va == 0 or count > fd_abi.max_pollfds) return kernel.KernelError.InvalidState;
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const item_va = pollfds_va + i * fd_abi.pollfd_size;
-        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return kernel.KernelError.InvalidState;
-        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return kernel.KernelError.InvalidState;
-        if ((events & ~fd_abi.event_known_mask) != 0) return kernel.KernelError.InvalidState;
-        _ = timeout_ticks;
-        if (try state.registerTaskReadableWaiterForFd(proc, @intCast(fd_u64), events, item_va, thread_index, thread_generation)) {
+    for (items) |item| {
+        if (try state.registerTaskReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation)) {
             continue;
         }
-        try state.registerIpcReadableWaiterForFd(proc, @intCast(fd_u64), events, item_va, thread_index, thread_generation);
+        try state.registerIpcReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation);
     }
 }
 
-fn unregisterIpcWaitersForPoll(
-    h: anytype,
+fn unregisterCachedWaitersForPoll(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
-    pollfds_va: u64,
-    count: u64,
+    items: []const PollItem,
     thread_index: usize,
     thread_generation: u32,
 ) void {
-    if (pollfds_va == 0 or count > fd_abi.max_pollfds) return;
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const item_va = pollfds_va + i * fd_abi.pollfd_size;
-        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return;
-        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return;
-        if ((events & ~fd_abi.event_known_mask) != 0) return;
-        state.unregisterIpcReadableWaiterForFd(proc, @intCast(fd_u64), events, thread_index, thread_generation);
+    for (items) |item| {
+        state.unregisterIpcReadableWaiterForFd(proc, item.fd, item.events, thread_index, thread_generation);
     }
     state.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
 }
 
-fn nextPollWakeDelta(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64, now_tick: u64) ?u64 {
+fn nextCachedPollWakeDelta(state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, now_tick: u64) ?u64 {
     var min_delta: ?u64 = null;
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const item_va = pollfds_va + i * fd_abi.pollfd_size;
-        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
-        const wake_tick = state.fdNextWakeTick(proc, @intCast(fd_u64), now_tick) orelse continue;
+    for (items) |item| {
+        const wake_tick = state.fdNextWakeTick(proc, item.fd, now_tick) orelse continue;
         const delta = if (wake_tick <= now_tick) 1 else wake_tick - now_tick;
         if (min_delta == null or delta < min_delta.?) min_delta = delta;
     }
@@ -300,35 +313,37 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const flags = frame.r10;
     if (flags != 0) return sc.syscall_err_invalid;
     const now = scheduler.lapic_tick_count;
-    const ready = pollOnce(h, state, proc, pollfds_va, count, now) orelse return sc.syscall_err_invalid;
+    var poll_items_storage: [max_pollfds]PollItem = undefined;
+    const poll_items = readPollItems(h, proc, pollfds_va, count, poll_items_storage[0..]) orelse return sc.syscall_err_invalid;
+    const ready = pollCached(h, state, proc, poll_items, now) orelse return sc.syscall_err_invalid;
     if (ready != 0) return ready;
     if (timeout_ticks == 0) return sc.syscall_err_not_ready;
 
     const current_thread = scheduler.currentThread();
     const current_generation = scheduler.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
     const register_start = ipc_metric.timestamp();
-    registerIpcWaitersForPoll(h, state, proc, pollfds_va, count, timeout_ticks, current_thread, current_generation) catch |err| {
-        unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
+    registerCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation) catch |err| {
+        unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
         return statusFromKernelError(err);
     };
     ipc_metric.record(.wait_register, register_start);
     const repoll_start = ipc_metric.timestamp();
-    const ready_after_register = pollOnce(h, state, proc, pollfds_va, count, scheduler.lapic_tick_count) orelse {
-        unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
+    const ready_after_register = pollCached(h, state, proc, poll_items, scheduler.lapic_tick_count) orelse {
+        unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
         return sc.syscall_err_invalid;
     };
     ipc_metric.record(.wait_repoll, repoll_start);
     if (ready_after_register != 0) {
-        unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
+        unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
         return ready_after_register;
     }
 
     var block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
-    if (nextPollWakeDelta(h, state, proc, pollfds_va, count, now)) |delta| {
+    if (nextCachedPollWakeDelta(state, proc, poll_items, now)) |delta| {
         if (block_ticks == 0 or delta < block_ticks) block_ticks = delta;
     }
     if (h.block_current_thread_for_event(frame, true, block_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
-    unregisterIpcWaitersForPoll(h, state, proc, pollfds_va, count, current_thread, current_generation);
+    unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
     return sc.syscall_err_not_ready;
 }
 

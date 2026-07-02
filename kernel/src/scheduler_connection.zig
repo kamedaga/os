@@ -2024,6 +2024,58 @@ pub fn handoffToReadyThreadGenerationWithRax(
     return false;
 }
 
+pub fn prepareExitHandoffToReadyThreadGeneration(target_thread: usize, target_generation: u32) bool {
+    if (policyActive() or !verifiedCoreReady()) return false;
+    const cpu_id = currentCpu();
+    if (cpu_id >= verifiedCoreCpuCount()) return false;
+    const current_thread = currentThread();
+    if (target_thread == current_thread) return false;
+    if (externalSchedulerOwnsThread(current_thread) or externalSchedulerOwnsThread(target_thread)) return false;
+
+    thread_table_lock.lock();
+    const current_ctx = threadContext(current_thread) orelse {
+        thread_table_lock.unlock();
+        return false;
+    };
+    const target_ctx = threadContext(target_thread) orelse {
+        thread_table_lock.unlock();
+        return false;
+    };
+    const current_generation = current_ctx.generation;
+    const can_handoff =
+        current_ctx.allocated and
+        target_ctx.allocated and
+        target_ctx.generation == target_generation and
+        target_ctx.ready and
+        current_ctx.cpu_slot == cpu_id and
+        target_ctx.cpu_slot == cpu_id;
+    thread_table_lock.unlock();
+    if (!can_handoff) return false;
+    if (threadActiveOnDifferentCpu(target_thread, cpu_id)) {
+        noteVerifiedCoreIssue("exit-handoff-active-other-cpu", .state, target_thread);
+        return false;
+    }
+    return verifiedHandoffToThreadOnCpu(cpu_id, target_thread, target_generation, current_thread, current_generation);
+}
+
+pub fn loadExitHandoffThread(frame: *TrapFrame, target_thread: usize, target_generation: u32) bool {
+    const cpu_id = currentCpu();
+    thread_table_lock.lock();
+    const target_ctx = threadContext(target_thread) orelse {
+        thread_table_lock.unlock();
+        return false;
+    };
+    const can_load =
+        target_ctx.allocated and
+        target_ctx.generation == target_generation and
+        target_ctx.ready and
+        target_ctx.cpu_slot == cpu_id;
+    thread_table_lock.unlock();
+    if (!can_load) return false;
+    if (!activate(target_thread)) return false;
+    return loadContextIntoFrame(target_thread, frame);
+}
+
 pub fn exitCurrentThread(frame: *TrapFrame, saved_rax: u64, before_ap_idle: ?BeforeCurrentThreadLeaveCallback) bool {
     if (!policyActive()) return false;
     if (!isBootstrapSchedulerCpu()) {
