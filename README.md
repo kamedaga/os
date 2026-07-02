@@ -46,10 +46,10 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 
 ## Linux Applications
 
-Trap delegation により、無改造の Linux バイナリがそのまま動作します。  
-musl ビルドで確認済み（glibc も動作）。
+Trap delegation からLinux Personality Runtimeに切り替え、高速でシンプルに互換レイヤーが処理できるようになりました。以前動いたバイナリも、段階的に動くようにします。
+musl ビルドで確認済み。
 
-`Python 3` &nbsp; `Vim` &nbsp; `Clang` &nbsp; `apk` &nbsp; `nano` &nbsp; `Lua` &nbsp; `W3M`
+`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `grep` &nbsp; `Python3`
 
 ### Python3 on PachaOS
 
