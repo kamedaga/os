@@ -280,6 +280,36 @@ static int filed_backend_unlink(
     return filed_kobox_backend_unlink(&runtime->backend, parent_object_id, name);
 }
 
+static int filed_backend_link(
+    filed_runtime_t *runtime,
+    uint64_t old_object_id,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id)
+{
+    if (filed_tmpfs_backend_is_object(old_object_id) &&
+        filed_tmpfs_backend_is_object(new_parent_object_id))
+    {
+        return filed_tmpfs_backend_link(
+            &runtime->tmpfs,
+            old_object_id,
+            new_parent_object_id,
+            new_name,
+            out_object_id);
+    }
+    if (filed_tmpfs_backend_is_object(old_object_id) ||
+        filed_tmpfs_backend_is_object(new_parent_object_id))
+    {
+        return -18;
+    }
+    (void)runtime;
+    (void)old_object_id;
+    (void)new_parent_object_id;
+    (void)new_name;
+    (void)out_object_id;
+    return -95;
+}
+
 static int filed_backend_mkdir(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,
@@ -410,7 +440,7 @@ static bool filed_root_getdents_splices_tmpfs(
 {
     if (runtime == NULL ||
         dir_object_id != runtime->backend.root_object_id ||
-        runtime->tmpfs.root_object_id == 0 ||
+        filed_tmpfs_backend_root_object(&runtime->tmpfs) == 0 ||
         runtime->root_tmpfs_synthetic_dirent == 0)
     {
         return false;
@@ -518,6 +548,7 @@ static const char *filed_op_name(uint64_t op)
     case FILED_WIRE_OP_RMDIR: return "rmdir";
     case FILED_WIRE_OP_SYMLINK: return "symlink";
     case FILED_WIRE_OP_READLINK: return "readlink";
+    case FILED_WIRE_OP_LINK: return "link";
     case FILED_WIRE_OP_SEEK: return "seek";
     case FILED_WIRE_OP_DUMP_METRICS: return "dump_metrics";
     case FILED_WIRE_OP_SET_CACHE_SLOTS: return "set_cache_slots";
@@ -529,6 +560,7 @@ static const char *filed_op_name(uint64_t op)
     case FILED_WIRE_OP_WRITE_BATCH: return "write_batch";
     case FILED_WIRE_OP_PREAD_TO_VMO: return "pread_to_vmo";
     case FILED_WIRE_OP_FILE_VMO: return "file_vmo";
+    case FILED_WIRE_OP_SYNC_ALL: return "sync_all";
     default: return "unknown";
     }
 }
@@ -2471,6 +2503,83 @@ static int64_t filed_lookup_and_open_component(
     uint32_t open_flags,
     filed_vfs_open_result_t *out_open);
 
+static int64_t filed_lookup_component_stat(
+    filed_runtime_t *runtime,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    uint64_t *out_object_id,
+    koboxd_wire_fs_statx_t *out_stat)
+{
+    filed_vfs_io_decision_t parent_decision;
+    filed_status_t status;
+    int64_t reply_status;
+
+    if (runtime == NULL || name == NULL || out_object_id == NULL || out_stat == NULL) {
+        return filed_status_to_wire(FILED_ERR_INVALID);
+    }
+    *out_object_id = 0;
+    memset(out_stat, 0, sizeof(*out_stat));
+    status = filed_vfs_lookup_prepare(&runtime->vfs, parent_handle, &parent_decision);
+    reply_status = filed_status_to_wire(status);
+    if (status != FILED_OK) {
+        return reply_status;
+    }
+    reply_status = filed_backend_lookup(runtime, parent_decision.backend_object, name, out_object_id);
+    if (reply_status != 0) {
+        return reply_status;
+    }
+    return filed_backend_statx(runtime, *out_object_id, out_stat);
+}
+
+static int64_t filed_splice_symlink_target(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    const char *rest,
+    char *out_path,
+    size_t out_path_size)
+{
+    char target[FILED_WIRE_SYMLINK_TARGET_BYTES];
+    uint64_t target_length = 0;
+    int64_t reply_status;
+    size_t rest_length;
+
+    if (runtime == NULL || object_id == 0 || rest == NULL || out_path == NULL || out_path_size == 0) {
+        return filed_status_to_wire(FILED_ERR_INVALID);
+    }
+    memset(target, 0, sizeof(target));
+    reply_status = filed_backend_readlink(
+        runtime,
+        object_id,
+        target,
+        sizeof(target) - 1u,
+        &target_length);
+    if (reply_status != 0) {
+        return reply_status;
+    }
+    if (target_length == 0 || target_length >= sizeof(target)) {
+        return filed_status_to_wire(FILED_ERR_INVALID);
+    }
+    target[target_length] = '\0';
+    rest = filed_skip_slashes(rest);
+    rest_length = strlen(rest);
+    if (rest_length != 0) {
+        if (target_length + 1u + rest_length >= out_path_size) {
+            return filed_status_to_wire(FILED_ERR_INVALID);
+        }
+        memset(out_path, 0, out_path_size);
+        memcpy(out_path, target, (size_t)target_length);
+        out_path[target_length] = '/';
+        memcpy(out_path + target_length + 1u, rest, rest_length + 1u);
+    } else {
+        if (target_length >= out_path_size) {
+            return filed_status_to_wire(FILED_ERR_INVALID);
+        }
+        memset(out_path, 0, out_path_size);
+        memcpy(out_path, target, (size_t)target_length + 1u);
+    }
+    return 0;
+}
+
 static int64_t filed_resolve_parent_path(
     filed_runtime_t *runtime,
     filed_handle_id_t base_dir_handle,
@@ -2484,6 +2593,8 @@ static int64_t filed_resolve_parent_path(
     int absolute;
     filed_handle_id_t current_handle;
     int current_owned = 0;
+    unsigned int symlink_budget = 16;
+    char symlink_path[FILED_WIRE_PATH_BYTES];
 
     if (runtime == NULL ||
         path == NULL ||
@@ -2608,8 +2719,45 @@ static int64_t filed_resolve_parent_path(
         } else {
             filed_vfs_open_result_t next_open;
             uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint64_t object_id = 0;
+            koboxd_wire_fs_statx_t stat;
+            int64_t symlink_status;
             if (filed_path_is_single_component(after_slashes)) {
                 next_rights |= parent_rights;
+            }
+            symlink_status = filed_lookup_component_stat(
+                runtime,
+                current_handle,
+                component,
+                &object_id,
+                &stat);
+            if (symlink_status != 0) {
+                filed_close_walk_handle(runtime, current_handle, current_owned);
+                return symlink_status;
+            }
+            if (filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK) {
+                if (symlink_budget == 0) {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    return filed_status_to_wire(FILED_ERR_LOOP);
+                }
+                --symlink_budget;
+                symlink_status = filed_splice_symlink_target(
+                    runtime,
+                    object_id,
+                    after_slashes,
+                    symlink_path,
+                    sizeof(symlink_path));
+                if (symlink_status != 0) {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    return symlink_status;
+                }
+                if (symlink_path[0] == '/') {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    current_handle = runtime->root_handle_id;
+                    current_owned = 0;
+                }
+                path = symlink_path;
+                continue;
             }
             const int64_t reply_status = filed_lookup_and_open_component(
                 runtime,
@@ -2829,6 +2977,8 @@ static int64_t filed_openat_path(
             runtime->root_handle_id :
             (filed_handle_id_t)(uint32_t)openat->dir_handle;
     int current_owned = 0;
+    unsigned int symlink_budget = 16;
+    char symlink_path[FILED_WIRE_PATH_BYTES];
 
     if (path[0] == '\0') {
         return filed_status_to_wire(FILED_ERR_INVALID);
@@ -2938,10 +3088,47 @@ static int64_t filed_openat_path(
         } else {
             filed_vfs_open_result_t next_open;
             uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint64_t object_id = 0;
+            koboxd_wire_fs_statx_t stat;
+            int64_t symlink_status;
             if ((open_flags & FILED_OPEN_CREATE) != 0 &&
                 filed_path_is_single_component(after_slashes))
             {
                 next_rights |= FILED_RIGHT_CREATE;
+            }
+            symlink_status = filed_lookup_component_stat(
+                runtime,
+                current_handle,
+                component,
+                &object_id,
+                &stat);
+            if (symlink_status != 0) {
+                filed_close_walk_handle(runtime, current_handle, current_owned);
+                return symlink_status;
+            }
+            if (filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK) {
+                if (symlink_budget == 0) {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    return filed_status_to_wire(FILED_ERR_LOOP);
+                }
+                --symlink_budget;
+                symlink_status = filed_splice_symlink_target(
+                    runtime,
+                    object_id,
+                    after_slashes,
+                    symlink_path,
+                    sizeof(symlink_path));
+                if (symlink_status != 0) {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    return symlink_status;
+                }
+                if (symlink_path[0] == '/') {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    current_handle = runtime->root_handle_id;
+                    current_owned = 0;
+                }
+                path = symlink_path;
+                continue;
             }
             const int64_t reply_status = filed_lookup_and_open_component(
                 runtime,
@@ -4478,6 +4665,159 @@ static int filed_dispatch_readlink(
     return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
+static filed_page_dispatch_result_t filed_dispatch_link_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
+    filed_wire_link_t *link = (filed_wire_link_t *)page;
+    filed_vfs_io_decision_t old_parent;
+    filed_vfs_io_decision_t new_parent;
+    filed_vfs_open_result_t opened;
+    koboxd_wire_fs_statx_t backend_stat;
+    uint64_t old_object_id = 0;
+    uint64_t linked_object_id = 0;
+    int64_t reply_status = -22;
+
+    if (filed_name_is_terminated(link->old_name, sizeof(link->old_name)) &&
+        filed_name_is_terminated(link->new_name, sizeof(link->new_name)))
+    {
+        filed_handle_id_t old_dir_handle = 0;
+        filed_handle_id_t new_dir_handle = 0;
+        int old_dir_owned = 0;
+        int new_dir_owned = 0;
+        char old_name[FILED_WIRE_NAME_BYTES];
+        char new_name[FILED_WIRE_NAME_BYTES];
+        const filed_handle_id_t old_base_dir =
+            link->old_dir_handle == 0 ?
+                runtime->root_handle_id :
+                (filed_handle_id_t)(uint32_t)link->old_dir_handle;
+        const filed_handle_id_t new_base_dir =
+            link->new_dir_handle == 0 ?
+                runtime->root_handle_id :
+                (filed_handle_id_t)(uint32_t)link->new_dir_handle;
+
+        memset(old_name, 0, sizeof(old_name));
+        memset(new_name, 0, sizeof(new_name));
+        reply_status = filed_resolve_parent_path(
+            runtime,
+            old_base_dir,
+            link->old_name,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_STAT,
+            &old_dir_handle,
+            &old_dir_owned,
+            old_name,
+            sizeof(old_name));
+        if (reply_status == 0) {
+            reply_status = filed_resolve_parent_path(
+                runtime,
+                new_base_dir,
+                link->new_name,
+                FILED_RIGHT_CREATE,
+                &new_dir_handle,
+                &new_dir_owned,
+                new_name,
+                sizeof(new_name));
+        }
+        if (reply_status == 0) {
+            filed_status_t status = filed_vfs_link_prepare(
+                &runtime->vfs,
+                old_dir_handle,
+                new_dir_handle,
+                old_name,
+                new_name,
+                &old_parent,
+                &new_parent);
+            reply_status = filed_status_to_wire(status);
+        }
+        if (reply_status == 0) {
+            reply_status = filed_backend_lookup(
+                runtime,
+                old_parent.backend_object,
+                old_name,
+                &old_object_id);
+        }
+        if (reply_status == 0) {
+            memset(&backend_stat, 0, sizeof(backend_stat));
+            reply_status = filed_backend_statx(runtime, old_object_id, &backend_stat);
+        }
+        if (reply_status == 0) {
+            reply_status = filed_backend_link(
+                runtime,
+                old_object_id,
+                new_parent.backend_object,
+                new_name,
+                &linked_object_id);
+        }
+        if (reply_status == 0 && linked_object_id != 0) {
+            filed_dir_cache_invalidate_dir(new_parent.backend_object);
+            memset(&opened, 0, sizeof(opened));
+            filed_status_t status = filed_vfs_link_commit(
+                &runtime->vfs,
+                new_dir_handle,
+                linked_object_id,
+                filed_kind_from_unix_type(backend_stat.kind),
+                new_name,
+                FILED_RIGHT_LOOKUP | FILED_RIGHT_READ | FILED_RIGHT_WRITE | FILED_RIGHT_STAT,
+                (filed_kind_from_unix_type(backend_stat.kind) == FILED_VNODE_SYMLINK) ? FILED_OPEN_NOFOLLOW : 0,
+                &opened);
+            reply_status = filed_status_to_wire(status);
+            if (status == FILED_OK) {
+                koboxd_wire_fs_statx_t linked_stat;
+                memset(&linked_stat, 0, sizeof(linked_stat));
+                if (filed_backend_statx(runtime, linked_object_id, &linked_stat) == 0) {
+                    filed_vfs_stat_snapshot_t snapshot;
+                    memset(&snapshot, 0, sizeof(snapshot));
+                    snapshot.valid = true;
+                    snapshot.handle_id = opened.handle_id;
+                    snapshot.mode = linked_stat.mode;
+                    snapshot.size = linked_stat.size;
+                    snapshot.blocks = linked_stat.blocks;
+                    snapshot.nlink = linked_stat.nlink;
+                    snapshot.kind = linked_stat.kind;
+                    snapshot.times_valid = true;
+                    snapshot.atime_sec = linked_stat.atime_sec;
+                    snapshot.atime_nsec = linked_stat.atime_nsec;
+                    snapshot.mtime_sec = linked_stat.mtime_sec;
+                    snapshot.mtime_nsec = linked_stat.mtime_nsec;
+                    snapshot.ctime_sec = linked_stat.ctime_sec;
+                    snapshot.ctime_nsec = linked_stat.ctime_nsec;
+                    snapshot.object_generation = opened.object_generation;
+                    snapshot.dir_generation = opened.dir_generation;
+                    (void)filed_vfs_update_stat_snapshot(&runtime->vfs, linked_object_id, &snapshot);
+                }
+                filed_runtime_publish_backend_object_generation(runtime, linked_object_id);
+                filed_runtime_publish_backend_object_generation(runtime, new_parent.backend_object);
+                (void)filed_vfs_close_handle(&runtime->vfs, opened.handle_id);
+            }
+        }
+        if (new_dir_handle != 0) {
+            filed_close_walk_handle(runtime, new_dir_handle, new_dir_owned);
+        }
+        if (old_dir_handle != 0) {
+            filed_close_walk_handle(runtime, old_dir_handle, old_dir_owned);
+        }
+    }
+
+    return filed_page_result(reply_status, linked_object_id);
+}
+
+static int filed_dispatch_link(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    const filed_page_dispatch_result_t result = filed_dispatch_link_page(runtime, page);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+}
+
 static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     filed_runtime_t *runtime,
     void *page)
@@ -5486,6 +5826,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_symlink_page(runtime, page);
     case FILED_WIRE_OP_READLINK:
         return filed_dispatch_readlink_page(runtime, page);
+    case FILED_WIRE_OP_LINK:
+        return filed_dispatch_link_page(runtime, page);
     case FILED_WIRE_OP_GETDENTS:
         return filed_dispatch_getdents_page(runtime, page);
     case FILED_WIRE_OP_DUP:
@@ -5502,6 +5844,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_exec_path_session_page(runtime, page);
     case FILED_WIRE_OP_CLOSE:
         return filed_dispatch_close_page(runtime, request);
+    case FILED_WIRE_OP_SYNC_ALL:
+        return filed_page_result(filed_kobox_backend_sync_all(&runtime->backend), 0);
     default:
         return filed_page_result(-95, 0);
     }
@@ -5891,6 +6235,9 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
     case FILED_WIRE_OP_READLINK:
         dispatch_status = filed_dispatch_readlink(runtime, reply_fd, &request);
         break;
+    case FILED_WIRE_OP_LINK:
+        dispatch_status = filed_dispatch_link(runtime, reply_fd, &request);
+        break;
     case FILED_WIRE_OP_GETDENTS:
         dispatch_status = filed_dispatch_getdents(runtime, reply_fd, &request);
         break;
@@ -5928,6 +6275,13 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
         } else {
             dispatch_status = filed_send_reply(reply_fd, request.word3, dispatch_status, 0);
         }
+        break;
+    case FILED_WIRE_OP_SYNC_ALL:
+        dispatch_status = filed_send_reply(
+            reply_fd,
+            request.word3,
+            filed_kobox_backend_sync_all(&runtime->backend),
+            0);
         break;
     case FILED_WIRE_OP_CONNECT:
         dispatch_status = filed_dispatch_connect(runtime, reply_fd, &request);

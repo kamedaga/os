@@ -1,7 +1,6 @@
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 #include "filed/ipc_protocol.h"
-#include "koboxd/ipc_protocol.h"
 
 #ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
 #define SEED0ROOT_DEFAULT_BOOT_PROFILE 0u
@@ -17,7 +16,7 @@ enum {
     SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
     SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
     SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
-    SEED0ROOT_KOBOXD_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
+    SEED0ROOT_FILED_STORAGE_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
     SEED0ROOT_PAGE_SIZE = 4096,
     SEED0ROOT_ELF64_EHDR_BYTES = 64,
     SEED0ROOT_ELF64_PHDR_BYTES = 56,
@@ -65,16 +64,16 @@ struct seed0root_bootstrap_module {
 struct seed0root_bootstrap {
     uint64_t magic;
     uint64_t device_fd;
-    uint64_t koboxd_image_fd;
-    uint64_t koboxd_image_size;
+    uint64_t filed_image_fd;
+    uint64_t filed_image_size;
     uint64_t module_count;
     struct seed0root_bootstrap_module modules[SEED0ROOT_BOOTSTRAP_MAX_MODULES];
 };
 
-struct seed0root_koboxd_bootstrap {
+struct seed0root_filed_storage_bootstrap {
     uint64_t magic;
     uint64_t device_fd;
-    uint64_t control_fd;
+    uint64_t filed_endpoint_fd;
     uint64_t module_count;
     struct seed0root_bootstrap_module modules[SEED0ROOT_BOOTSTRAP_MAX_MODULES];
 };
@@ -328,7 +327,7 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
     if (data == NULL || size == 0) {
         return -1;
     }
-    const int trace = label != NULL && strcmp(label, "koboxd bootstrap fd") == 0;
+    const int trace = label != NULL && strcmp(label, "filed bootstrap fd") == 0;
     if (trace) {
         printf("[seed0root] %s create size=%llu\n", label, (unsigned long long)size);
         fflush(stdout);
@@ -451,6 +450,7 @@ static int find_seed0root_bootstrap_fd(char **argv, int *out_fd)
 
 static const uint64_t seed0root_channel_rights =
     PACHA_FD_RIGHT_INSPECT |
+    PACHA_FD_RIGHT_DUP |
     PACHA_FD_RIGHT_WAIT |
     PACHA_FD_RIGHT_POLL |
     PACHA_FD_RIGHT_SET_FLAGS |
@@ -481,165 +481,6 @@ static int recv_ipc_wait(int fd, struct pacha_ipc_msg *msg)
         (void)pacha_fd_wait_many(&pollfd, 1, 1);
     }
     return -2;
-}
-
-static int send_ipc_wait(int fd, const struct pacha_ipc_msg *msg)
-{
-    if (fd < 16 || msg == NULL) {
-        return -1;
-    }
-    for (unsigned i = 0; i < 262144; i++) {
-        const int status = pacha_ipc_send(fd, msg);
-        if (status == 0) {
-            return 0;
-        }
-        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
-            return status;
-        }
-        struct pacha_pollfd pollfd = {
-            .fd = fd,
-            .events = PACHA_FD_EVENT_WRITABLE,
-            .revents = 0,
-        };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
-    }
-    return -2;
-}
-
-static int seed0root_get_koboxd_endpoint(int control_fd, uint64_t endpoint_kind, int *out_fd)
-{
-    if (control_fd < 16 || out_fd == NULL) {
-        return -1;
-    }
-    *out_fd = -1;
-    const struct pacha_ipc_msg request = {
-        .word0 = KOBOXD_WIRE_CONTROL_MAGIC,
-        .word1 = KOBOXD_WIRE_CONTROL_GET_ENDPOINT,
-        .word2 = endpoint_kind,
-        .word3 = KOBOXD_WIRE_VERSION,
-    };
-    int status = send_ipc_wait(control_fd, &request);
-    if (status != 0) {
-        fprintf(stderr,
-            "[seed0root] koboxd control send failed kind=%llu status=%d\n",
-            (unsigned long long)endpoint_kind,
-            status);
-        return status;
-    }
-
-    struct pacha_ipc_fd fds[1];
-    struct pacha_ipc_msg reply;
-    for (unsigned attempt = 0; attempt < 128; attempt++) {
-        memset(fds, 0, sizeof(fds));
-        memset(&reply, 0, sizeof(reply));
-        reply.fds = fds;
-        reply.fd_capacity = 1;
-        status = recv_ipc_wait(control_fd, &reply);
-        if (status != 0) {
-            return status;
-        }
-        if (reply.word0 == KOBOXD_WIRE_REPLY_MAGIC &&
-            reply.word1 == 0 &&
-            reply.word2 == endpoint_kind &&
-            reply.fd_count == 1 &&
-            fds[0].fd >= 16)
-        {
-            break;
-        }
-        if (attempt == 127) {
-            fprintf(stderr,
-                "[seed0root] koboxd control reply invalid kind=%llu word0=0x%llx word1=%llu word2=%llu fd_count=%llu fd=%llu\n",
-                (unsigned long long)endpoint_kind,
-                (unsigned long long)reply.word0,
-                (unsigned long long)reply.word1,
-                (unsigned long long)reply.word2,
-                (unsigned long long)reply.fd_count,
-                (unsigned long long)fds[0].fd);
-            return -2;
-        }
-    }
-    *out_fd = (int)fds[0].fd;
-    return 0;
-}
-
-static int seed0root_koboxd_endpoint_call_with_fd(
-    int endpoint_fd,
-    uint64_t op,
-    uint64_t object_id,
-    int transfer_fd,
-    uint64_t *out_word2)
-{
-    if (endpoint_fd < 16 || out_word2 == NULL) {
-        return -1;
-    }
-    struct pacha_ipc_fd fd_item;
-    memset(&fd_item, 0, sizeof(fd_item));
-    if (transfer_fd >= 16) {
-        fd_item.fd = (uint64_t)(uint32_t)transfer_fd;
-        fd_item.rights =
-            PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_MAP_READ |
-            PACHA_FD_RIGHT_MAP_WRITE;
-        fd_item.flags = 0;
-        fd_item.transfer_flags = 0;
-    }
-    const struct pacha_ipc_msg request = {
-        .word0 = KOBOXD_WIRE_ENDPOINT_MAGIC,
-        .word1 = op,
-        .word2 = object_id,
-        .word3 = KOBOXD_WIRE_VERSION,
-        .fds = transfer_fd >= 16 ? &fd_item : NULL,
-        .fd_count = transfer_fd >= 16 ? 1 : 0,
-    };
-    int status = send_ipc_wait(endpoint_fd, &request);
-    if (status != 0) {
-        fprintf(stderr,
-            "[seed0root] koboxd endpoint send failed fd=%d op=%llu status=%d transfer_fd=%d\n",
-            endpoint_fd,
-            (unsigned long long)op,
-            status,
-            transfer_fd);
-        return status;
-    }
-    struct pacha_ipc_msg reply;
-    for (unsigned attempt = 0; attempt < 128; attempt++) {
-        memset(&reply, 0, sizeof(reply));
-        status = recv_ipc_wait(endpoint_fd, &reply);
-        if (status != 0) {
-            return status;
-        }
-        if (reply.word0 == KOBOXD_WIRE_REPLY_MAGIC &&
-            reply.word3 == KOBOXD_WIRE_VERSION)
-        {
-            break;
-        }
-        if (attempt == 127) {
-            fprintf(stderr,
-                "[seed0root] koboxd endpoint reply invalid fd=%d word0=0x%llx word1=%llu word2=%llu word3=%llu\n",
-                endpoint_fd,
-                (unsigned long long)reply.word0,
-                (unsigned long long)reply.word1,
-                (unsigned long long)reply.word2,
-                (unsigned long long)reply.word3);
-            return -2;
-        }
-    }
-    if ((int64_t)reply.word1 < 0) {
-        return (int)(int64_t)reply.word1;
-    }
-    *out_word2 = reply.word2;
-    return 0;
-}
-
-static int seed0root_koboxd_endpoint_call(int endpoint_fd, uint64_t op, uint64_t *out_word2)
-{
-    return seed0root_koboxd_endpoint_call_with_fd(endpoint_fd, op, 0, -1, out_word2);
-}
-
-static int seed0root_fs_sync_all(int fs_fd)
-{
-    uint64_t ignored = 0;
-    return seed0root_koboxd_endpoint_call(fs_fd, KOBOXD_WIRE_FS_SYNC_ALL, &ignored);
 }
 
 static int seed0root_filed_call(
@@ -709,6 +550,21 @@ static int seed0root_dump_filed_metrics(int filed_endpoint_fd)
         filed_endpoint_fd,
         FILED_WIRE_OP_DUMP_METRICS,
         0x5eed0f12u,
+        -1,
+        0,
+        &reply,
+        NULL,
+        0);
+}
+
+static int seed0root_filed_sync_all(int filed_endpoint_fd)
+{
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    return seed0root_filed_call(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_SYNC_ALL,
+        0x5eed0f16u,
         -1,
         0,
         &reply,
@@ -1857,31 +1713,13 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         FILED_WIRE_EXEC_LINUX_LPR);
 }
 
-static int seed0root_connect_storage_services(int control_fd)
+static int seed0root_run_storage_services(int filed_endpoint_fd)
 {
-    int block_fd = -1;
-    int fs_fd = -1;
-    int filed_endpoint_fd = -1;
-    int status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_BLOCK, &block_fd);
-    if (status != 0) {
-        return status;
-    }
-    uint64_t block_size = 0;
-    status = seed0root_koboxd_endpoint_call(block_fd, KOBOXD_WIRE_BLOCK_IDENTIFY, &block_size);
-    if (status != 0 || block_size != 512) {
-        fprintf(stderr,
-            "[seed0root] koboxd block identify failed status=%d block_size=%llu\n",
-            status,
-            (unsigned long long)block_size);
-        return status != 0 ? status : -2;
-    }
-    status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_FS_BACKEND, &fs_fd);
-    if (status != 0) {
-        return status;
-    }
-    status = seed0root_get_koboxd_endpoint(control_fd, KOBOXD_WIRE_ENDPOINT_FILED, &filed_endpoint_fd);
-    if (status == 0 && filed_endpoint_fd >= 16) {
+    int status = 0;
+    if (filed_endpoint_fd >= 16) {
         printf("[seed0root] filed ready\n");
+    } else {
+        return -1;
     }
     const unsigned boot_profile = (status == 0 && filed_endpoint_fd >= 16) ?
         seed0root_boot_profile_flags(filed_endpoint_fd) :
@@ -1948,12 +1786,9 @@ static int seed0root_connect_storage_services(int control_fd)
         const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
         printf("[seed0root] filed metrics dump status=%d\n", metrics_status);
     }
-    if (filed_endpoint_fd >= 16) {
-        (void)pacha_fd_close(filed_endpoint_fd);
-    }
     if (sync_profile != 0 && status == 0) {
         const uint64_t sync_start_ns = seed0root_now_ns();
-        status = seed0root_fs_sync_all(fs_fd);
+        status = seed0root_filed_sync_all(filed_endpoint_fd);
         const uint64_t sync_end_ns = seed0root_now_ns();
         const uint64_t sync_elapsed_ns =
             (sync_start_ns != 0 && sync_end_ns >= sync_start_ns) ? sync_end_ns - sync_start_ns : 0;
@@ -1961,6 +1796,9 @@ static int seed0root_connect_storage_services(int control_fd)
             status,
             (unsigned long long)sync_elapsed_ns,
             (unsigned long long)(sync_elapsed_ns / 1000ull));
+    }
+    if (filed_endpoint_fd >= 16) {
+        (void)pacha_fd_close(filed_endpoint_fd);
     }
     return status;
 }
@@ -2144,14 +1982,14 @@ static int start_loaded_process(
     return 0;
 }
 
-static int prepare_koboxd_bootstrap(
+static int prepare_filed_storage_bootstrap(
     const struct seed0root_bootstrap *bootstrap,
-    int control_fd,
-    struct seed0root_koboxd_bootstrap *out_bootstrap)
+    int filed_endpoint_fd,
+    struct seed0root_filed_storage_bootstrap *out_bootstrap)
 {
     if (bootstrap == NULL ||
         out_bootstrap == NULL ||
-        control_fd < 16 ||
+        filed_endpoint_fd < 16 ||
         bootstrap->module_count == 0 ||
         bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES ||
         bootstrap->modules[0].name[0] == '\0')
@@ -2160,9 +1998,9 @@ static int prepare_koboxd_bootstrap(
     }
 
     memset(out_bootstrap, 0, sizeof(*out_bootstrap));
-    out_bootstrap->magic = SEED0ROOT_KOBOXD_BOOTSTRAP_MAGIC;
+    out_bootstrap->magic = SEED0ROOT_FILED_STORAGE_BOOTSTRAP_MAGIC;
     out_bootstrap->device_fd = bootstrap->device_fd;
-    out_bootstrap->control_fd = (uint64_t)(uint32_t)control_fd;
+    out_bootstrap->filed_endpoint_fd = (uint64_t)(uint32_t)filed_endpoint_fd;
     out_bootstrap->module_count = bootstrap->module_count;
     for (uint64_t i = 0; i < bootstrap->module_count; i++) {
         const struct seed0root_bootstrap_module *src = &bootstrap->modules[i];
@@ -2177,109 +2015,131 @@ static int prepare_koboxd_bootstrap(
     return 0;
 }
 
-static int launch_koboxd(const struct seed0root_bootstrap *bootstrap)
+static int launch_filed(const struct seed0root_bootstrap *bootstrap)
 {
     if (bootstrap->magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
-        bootstrap->koboxd_image_fd < 16 ||
-        bootstrap->koboxd_image_size == 0 ||
+        bootstrap->filed_image_fd < 16 ||
+        bootstrap->filed_image_size == 0 ||
         bootstrap->device_fd < 16 ||
         bootstrap->module_count == 0 ||
         bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES) {
         fprintf(stderr,
-            "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu koboxd_fd=%llu size=%llu modules=%llu\n",
+            "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu filed_fd=%llu size=%llu modules=%llu\n",
             (unsigned long long)bootstrap->magic,
             (unsigned long long)bootstrap->device_fd,
-            (unsigned long long)bootstrap->koboxd_image_fd,
-            (unsigned long long)bootstrap->koboxd_image_size,
+            (unsigned long long)bootstrap->filed_image_fd,
+            (unsigned long long)bootstrap->filed_image_size,
             (unsigned long long)bootstrap->module_count);
         return -1;
     }
 
-    uint64_t koboxd_map_size = 0;
-    if (align_up(bootstrap->koboxd_image_size, &koboxd_map_size) != 0) {
+    uint64_t filed_map_size = 0;
+    if (align_up(bootstrap->filed_image_size, &filed_map_size) != 0) {
         return -1;
     }
-    printf("[seed0root] koboxd image mmap begin fd=%llu size=%llu map=%llu\n",
-        (unsigned long long)bootstrap->koboxd_image_fd,
-        (unsigned long long)bootstrap->koboxd_image_size,
-        (unsigned long long)koboxd_map_size);
+    printf("[seed0root] filed image mmap begin fd=%llu size=%llu map=%llu\n",
+        (unsigned long long)bootstrap->filed_image_fd,
+        (unsigned long long)bootstrap->filed_image_size,
+        (unsigned long long)filed_map_size);
     fflush(stdout);
     unsigned char *image = pacha_mmap(
-        (int)bootstrap->koboxd_image_fd,
-        koboxd_map_size,
+        (int)bootstrap->filed_image_fd,
+        filed_map_size,
         PACHA_PROT_READ,
         PACHA_MMAP_SHARED,
         0);
-    printf("[seed0root] koboxd image mmap returned ptr=%p\n", (void *)image);
+    printf("[seed0root] filed image mmap returned ptr=%p\n", (void *)image);
     fflush(stdout);
     if (image == NULL) {
-        fprintf(stderr, "[seed0root] koboxd image mmap failed fd=%llu\n",
-            (unsigned long long)bootstrap->koboxd_image_fd);
+        fprintf(stderr, "[seed0root] filed image mmap failed fd=%llu\n",
+            (unsigned long long)bootstrap->filed_image_fd);
         return -1;
     }
-    printf("[seed0root] koboxd image ready\n");
+    printf("[seed0root] filed image ready\n");
     fflush(stdout);
-    struct pacha_ipc_channel_pair control_pair = { .a = -1, .b = -1 };
-    int control_status = pacha_ipc_channel_create(&control_pair, seed0root_channel_rights, PACHA_FD_FLAG_INHERIT);
-    if (control_status != 0 || control_pair.a < 16 || control_pair.b < 16) {
+    const int filed_endpoint_fd =
+        pacha_ipc_endpoint_create(seed0root_channel_rights, PACHA_FD_FLAG_INHERIT);
+    if (filed_endpoint_fd < 16) {
         fprintf(stderr,
-            "[seed0root] koboxd control channel create failed status=%d a=%d b=%d\n",
-            control_status,
-            control_pair.a,
-            control_pair.b);
-        (void)pacha_munmap(image, koboxd_map_size);
-        return control_status != 0 ? control_status : -2;
+            "[seed0root] filed endpoint create failed status=%d\n",
+            filed_endpoint_fd);
+        (void)pacha_munmap(image, filed_map_size);
+        return filed_endpoint_fd < 0 ? filed_endpoint_fd : -2;
     }
-    printf("[seed0root] koboxd control ready\n");
+    const long filed_client_dup =
+        pacha_fd_fcntl(filed_endpoint_fd, PACHA_FD_FCNTL_DUP, 16, seed0root_channel_rights);
+    if (filed_client_dup < 16) {
+        fprintf(stderr,
+            "[seed0root] filed endpoint dup failed status=%ld endpoint_fd=%d\n",
+            filed_client_dup,
+            filed_endpoint_fd);
+        (void)pacha_fd_close(filed_endpoint_fd);
+        (void)pacha_munmap(image, filed_map_size);
+        return filed_client_dup < 0 ? (int)filed_client_dup : -2;
+    }
+    const int filed_client_fd = (int)filed_client_dup;
+    printf("[seed0root] filed endpoint ready\n");
     fflush(stdout);
-    int status = mark_fd_inherit((int)bootstrap->device_fd, "koboxd device fd");
+    int status = mark_fd_inherit((int)bootstrap->device_fd, "filed device fd");
     if (status != 0) {
-        fprintf(stderr, "[seed0root] koboxd device fd inherit failed status=%d fd=%llu\n",
+        fprintf(stderr, "[seed0root] filed device fd inherit failed status=%d fd=%llu\n",
             status,
             (unsigned long long)bootstrap->device_fd);
-        (void)pacha_munmap(image, koboxd_map_size);
+        (void)pacha_fd_close(filed_client_fd);
+        (void)pacha_fd_close(filed_endpoint_fd);
+        (void)pacha_munmap(image, filed_map_size);
         return status;
     }
-    printf("[seed0root] koboxd device fd ready\n");
+    printf("[seed0root] filed device fd ready\n");
     fflush(stdout);
-    struct seed0root_koboxd_bootstrap koboxd_bootstrap;
-    status = prepare_koboxd_bootstrap(bootstrap, control_pair.b, &koboxd_bootstrap);
+    struct seed0root_filed_storage_bootstrap filed_bootstrap;
+    status = prepare_filed_storage_bootstrap(bootstrap, filed_endpoint_fd, &filed_bootstrap);
     if (status != 0) {
-        (void)pacha_munmap(image, koboxd_map_size);
-        fprintf(stderr, "[seed0root] koboxd bootstrap package failed status=%d\n", status);
+        (void)pacha_fd_close(filed_client_fd);
+        (void)pacha_fd_close(filed_endpoint_fd);
+        (void)pacha_munmap(image, filed_map_size);
+        fprintf(stderr, "[seed0root] filed bootstrap package failed status=%d\n", status);
         return status;
     }
-    printf("[seed0root] koboxd bootstrap ready\n");
+    printf("[seed0root] filed bootstrap ready\n");
     fflush(stdout);
-    const int bootstrap_fd = create_inherited_vmo_from_bytes(&koboxd_bootstrap, sizeof(koboxd_bootstrap), "koboxd bootstrap fd");
+    const int bootstrap_fd = create_inherited_vmo_from_bytes(&filed_bootstrap, sizeof(filed_bootstrap), "filed bootstrap fd");
     if (bootstrap_fd < 16) {
-        (void)pacha_munmap(image, koboxd_map_size);
-        fprintf(stderr, "[seed0root] koboxd bootstrap fd create failed status=%d\n", bootstrap_fd);
+        (void)pacha_fd_close(filed_client_fd);
+        (void)pacha_fd_close(filed_endpoint_fd);
+        (void)pacha_munmap(image, filed_map_size);
+        fprintf(stderr, "[seed0root] filed bootstrap fd create failed status=%d\n", bootstrap_fd);
         return bootstrap_fd;
     }
-    printf("[seed0root] koboxd bootstrap fd=%d\n", bootstrap_fd);
+    printf("[seed0root] filed bootstrap fd=%d\n", bootstrap_fd);
     fflush(stdout);
     struct seed0root_loaded_process loaded;
-    status = load_elf_process("/sbin/koboxd.elf", image, bootstrap->koboxd_image_size, &loaded);
-    (void)pacha_munmap(image, koboxd_map_size);
+    status = load_elf_process("/sbin/filed.elf", image, bootstrap->filed_image_size, &loaded);
+    (void)pacha_munmap(image, filed_map_size);
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
-        fprintf(stderr, "[seed0root] koboxd load failed status=%d\n", status);
+        (void)pacha_fd_close(filed_client_fd);
+        (void)pacha_fd_close(filed_endpoint_fd);
+        fprintf(stderr, "[seed0root] filed load failed status=%d\n", status);
         return status;
     }
-    printf("[seed0root] koboxd image loaded\n");
+    printf("[seed0root] filed image loaded\n");
     fflush(stdout);
-    status = start_loaded_process(&loaded, "/sbin/koboxd.elf", bootstrap_fd, NULL);
+    status = start_loaded_process(&loaded, "/sbin/filed.elf", bootstrap_fd, NULL);
     (void)pacha_fd_close(bootstrap_fd);
     if (status != 0) {
-        fprintf(stderr, "[seed0root] koboxd start failed status=%d\n", status);
+        (void)pacha_fd_close(filed_client_fd);
+        (void)pacha_fd_close(filed_endpoint_fd);
+        fprintf(stderr, "[seed0root] filed start failed status=%d\n", status);
         return status;
     }
-    printf("[seed0root] koboxd started\n");
+    (void)pacha_fd_close(filed_endpoint_fd);
+    printf("[seed0root] filed started\n");
     fflush(stdout);
-    status = seed0root_connect_storage_services(control_pair.a);
+    status = seed0root_run_storage_services(filed_client_fd);
+    (void)pacha_fd_close(filed_client_fd);
     if (status != 0) {
-        fprintf(stderr, "[seed0root] koboxd connect failed status=%d\n", status);
+        fprintf(stderr, "[seed0root] filed service failed status=%d\n", status);
         return status;
     }
     printf("[seed0root] storage ready\n");
@@ -2301,19 +2161,19 @@ int main(int argc, char **argv)
     fflush(stdout);
     struct seed0root_bootstrap bootstrap;
     bootstrap_status = read_bootstrap_fd(bootstrap_fd, &bootstrap, sizeof(bootstrap), "seed0root");
-    printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu koboxd_fd=%llu koboxd_size=%llu modules=%llu\n",
+    printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu filed_fd=%llu filed_size=%llu modules=%llu\n",
         bootstrap_status,
         (unsigned long long)bootstrap.magic,
         (unsigned long long)bootstrap.device_fd,
-        (unsigned long long)bootstrap.koboxd_image_fd,
-        (unsigned long long)bootstrap.koboxd_image_size,
+        (unsigned long long)bootstrap.filed_image_fd,
+        (unsigned long long)bootstrap.filed_image_size,
         (unsigned long long)bootstrap.module_count);
     fflush(stdout);
     if (bootstrap_status != 0 ||
         bootstrap.magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap.device_fd < 16 ||
-        bootstrap.koboxd_image_fd < 16 ||
-        bootstrap.koboxd_image_size == 0 ||
+        bootstrap.filed_image_fd < 16 ||
+        bootstrap.filed_image_size == 0 ||
         bootstrap.module_count == 0 ||
         bootstrap.module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES)
     {
@@ -2321,11 +2181,11 @@ int main(int argc, char **argv)
         fflush(stderr);
         return 4;
     }
-    printf("[seed0root] koboxd launching\n");
+    printf("[seed0root] filed launching\n");
     fflush(stdout);
-    int launch_status = launch_koboxd(&bootstrap);
+    int launch_status = launch_filed(&bootstrap);
     if (launch_status != 0) {
-        fprintf(stderr, "[seed0root] koboxd launch failed status=%d\n", launch_status);
+        fprintf(stderr, "[seed0root] filed launch failed status=%d\n", launch_status);
         return 5;
     }
     printf("[seed0root] ready\n");

@@ -18,6 +18,7 @@ void *memset(void *dst, int c, size_t n)
 #define LPR_FD_TABLE_SIZE 128u
 #define LPR_LINUX_AT_FDCWD (-100)
 #define LPR_LINUX_AT_SYMLINK_NOFOLLOW 0x100ull
+#define LPR_LINUX_AT_SYMLINK_FOLLOW 0x400ull
 #define LPR_LINUX_AT_EMPTY_PATH 0x1000ull
 #define LPR_LINUX_AT_REMOVEDIR 0x200ull
 #define LPR_LINUX_O_ACCMODE 00000003ull
@@ -135,7 +136,7 @@ typedef struct lpr_readlink_cache_entry {
     uint8_t reserved0;
     uint16_t length;
     int64_t status;
-    char path[FILED_WIRE_NAME_BYTES];
+    char path[FILED_WIRE_PATH_BYTES];
 } lpr_readlink_cache_entry_t;
 
 typedef struct lpr_filed_page_cache_entry {
@@ -635,7 +636,7 @@ static void lpr_readlink_cache_clear(void)
 
 static int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_status)
 {
-    if (path == 0 || out_status == 0 || length == 0 || length >= FILED_WIRE_NAME_BYTES) {
+    if (path == 0 || out_status == 0 || length == 0 || length >= FILED_WIRE_PATH_BYTES) {
         return 0;
     }
     for (uint64_t i = 0; i < LPR_READLINK_CACHE_ENTRIES; i += 1) {
@@ -653,7 +654,7 @@ static int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t 
 
 static void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status)
 {
-    if (path == 0 || length == 0 || length >= FILED_WIRE_NAME_BYTES || status >= 0) {
+    if (path == 0 || length == 0 || length >= FILED_WIRE_PATH_BYTES || status >= 0) {
         return;
     }
     const uint64_t slot = lpr_readlink_cache_clock++ % LPR_READLINK_CACHE_ENTRIES;
@@ -1392,16 +1393,19 @@ static uint64_t lpr_open_flags(uint64_t flags)
     return out;
 }
 
-static int64_t lpr_copy_path(char out[FILED_WIRE_NAME_BYTES], const char *path)
+static int64_t lpr_copy_path(char *out, uint64_t capacity, const char *path)
 {
-    if (path == 0) {
+    if (out == 0 || path == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    const size_t len = lpr_strnlen(path, FILED_WIRE_NAME_BYTES);
-    if (len == FILED_WIRE_NAME_BYTES) {
+    if (capacity == 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    const size_t len = lpr_strnlen(path, capacity);
+    if (len == capacity) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
-    lpr_memset(out, 0, FILED_WIRE_NAME_BYTES);
+    lpr_memset(out, 0, capacity);
     lpr_memcpy(out, path, len + 1u);
     return 0;
 }
@@ -1456,7 +1460,7 @@ int64_t lpr_linux_mkdirat(uint64_t dirfd, uint64_t path_raw, uint64_t mode)
     lpr_memset(mkdir_req, 0, sizeof(*mkdir_req));
     mkdir_req->dir_handle = dir_handle;
     mkdir_req->mode = mode;
-    status = lpr_copy_path(mkdir_req->name, path);
+    status = lpr_copy_path(mkdir_req->name, sizeof(mkdir_req->name), path);
     uint64_t ignored = 0;
     if (status == 0) {
         status = lpr_filed_call(FILED_WIRE_OP_MKDIR, page_fd, 0, &ignored);
@@ -1489,13 +1493,13 @@ int64_t lpr_linux_unlinkat(uint64_t dirfd, uint64_t path_raw, uint64_t flags)
         filed_wire_rmdir_t *rmdir_req = (filed_wire_rmdir_t *)page;
         lpr_memset(rmdir_req, 0, sizeof(*rmdir_req));
         rmdir_req->dir_handle = dir_handle;
-        status = lpr_copy_path(rmdir_req->name, path);
+        status = lpr_copy_path(rmdir_req->name, sizeof(rmdir_req->name), path);
         op = FILED_WIRE_OP_RMDIR;
     } else {
         filed_wire_unlink_t *unlink_req = (filed_wire_unlink_t *)page;
         lpr_memset(unlink_req, 0, sizeof(*unlink_req));
         unlink_req->dir_handle = dir_handle;
-        status = lpr_copy_path(unlink_req->name, path);
+        status = lpr_copy_path(unlink_req->name, sizeof(unlink_req->name), path);
     }
     uint64_t ignored = 0;
     if (status == 0) {
@@ -1530,9 +1534,9 @@ int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t n
     lpr_memset(rename_req, 0, sizeof(*rename_req));
     rename_req->old_dir_handle = old_dir_handle;
     rename_req->new_dir_handle = new_dir_handle;
-    status = lpr_copy_path(rename_req->old_name, old_path);
+    status = lpr_copy_path(rename_req->old_name, sizeof(rename_req->old_name), old_path);
     if (status == 0) {
-        status = lpr_copy_path(rename_req->new_name, new_path);
+        status = lpr_copy_path(rename_req->new_name, sizeof(rename_req->new_name), new_path);
     }
     uint64_t ignored = 0;
     if (status == 0) {
@@ -1566,6 +1570,9 @@ int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t
     return lpr_linux_faccessat(dirfd, path, 0, 0) == 0 ? -LPR_LINUX_EEXIST : 0;
 }
 
+static int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
+static int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity);
+
 int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t linkpath_raw)
 {
     const char *target = (const char *)(uintptr_t)target_raw;
@@ -1588,9 +1595,9 @@ int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t li
     filed_wire_symlink_t *symlink_req = (filed_wire_symlink_t *)page;
     lpr_memset(symlink_req, 0, sizeof(*symlink_req));
     symlink_req->dir_handle = dir_handle;
-    status = lpr_copy_path(symlink_req->name, linkpath);
-    const uint64_t target_len = (uint64_t)lpr_strnlen(target, FILED_WIRE_NAME_BYTES);
-    if (status == 0 && (target_len == 0 || target_len >= FILED_WIRE_NAME_BYTES)) {
+    status = lpr_copy_path(symlink_req->name, sizeof(symlink_req->name), linkpath);
+    const uint64_t target_len = (uint64_t)lpr_strnlen(target, FILED_WIRE_SYMLINK_TARGET_BYTES);
+    if (status == 0 && (target_len == 0 || target_len >= FILED_WIRE_SYMLINK_TARGET_BYTES)) {
         status = target_len == 0 ? -LPR_LINUX_EINVAL : -LPR_LINUX_ENAMETOOLONG;
     }
     if (status == 0) {
@@ -1598,6 +1605,69 @@ int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t li
         lpr_memcpy(symlink_req->target, target, target_len + 1u);
         uint64_t ignored = 0;
         status = lpr_filed_call(FILED_WIRE_OP_SYMLINK, page_fd, 0, &ignored);
+    }
+    lpr_destroy_wire_page(page_fd, page);
+    return status;
+}
+
+int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new_dirfd, uint64_t new_path_raw, uint64_t flags)
+{
+    const uint64_t known_flags = LPR_LINUX_AT_SYMLINK_FOLLOW;
+    const char *old_path = (const char *)(uintptr_t)old_path_raw;
+    const char *new_path = (const char *)(uintptr_t)new_path_raw;
+    char followed_old_path[FILED_WIRE_PATH_BYTES];
+    if (old_path == 0 || new_path == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    if ((flags & ~known_flags) != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if ((flags & LPR_LINUX_AT_SYMLINK_FOLLOW) != 0) {
+        char target[FILED_WIRE_SYMLINK_TARGET_BYTES];
+        lpr_memset(target, 0, sizeof(target));
+        const int64_t len = lpr_linux_readlinkat_to_buffer(old_dirfd, old_path_raw, target, sizeof(target) - 1u);
+        if (len > 0) {
+            target[(uint64_t)len < sizeof(target) ? (uint64_t)len : sizeof(target) - 1u] = 0;
+            if (!lpr_resolve_final_symlink_path(old_path, target, followed_old_path, sizeof(followed_old_path))) {
+                return -LPR_LINUX_ENAMETOOLONG;
+            }
+            old_dirfd = LPR_LINUX_AT_FDCWD;
+            old_path_raw = (uint64_t)(uintptr_t)followed_old_path;
+            old_path = followed_old_path;
+        } else if (len != -LPR_LINUX_EINVAL) {
+            return len == 0 ? -LPR_LINUX_EINVAL : len;
+        }
+    }
+    lpr_readlink_cache_clear();
+    lpr_page_cache_clear();
+
+    uint64_t old_dir_handle = 0;
+    int64_t status = lpr_dir_handle_for(old_dirfd, old_path, &old_dir_handle);
+    if (status != 0) {
+        return status;
+    }
+    uint64_t new_dir_handle = 0;
+    status = lpr_dir_handle_for(new_dirfd, new_path, &new_dir_handle);
+    if (status != 0) {
+        return status;
+    }
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    filed_wire_link_t *link_req = (filed_wire_link_t *)page;
+    lpr_memset(link_req, 0, sizeof(*link_req));
+    link_req->old_dir_handle = old_dir_handle;
+    link_req->new_dir_handle = new_dir_handle;
+    link_req->flags = flags;
+    status = lpr_copy_path(link_req->old_name, sizeof(link_req->old_name), old_path);
+    if (status == 0) {
+        status = lpr_copy_path(link_req->new_name, sizeof(link_req->new_name), new_path);
+    }
+    if (status == 0) {
+        uint64_t ignored = 0;
+        status = lpr_filed_call(FILED_WIRE_OP_LINK, page_fd, 0, &ignored);
     }
     lpr_destroy_wire_page(page_fd, page);
     return status;
@@ -1631,7 +1701,7 @@ static int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t
     open_req->dir_handle = dir_handle;
     open_req->rights = lpr_open_rights(flags);
     open_req->open_flags = lpr_open_flags(flags);
-    status = lpr_copy_path(open_req->name, path);
+    status = lpr_copy_path(open_req->name, sizeof(open_req->name), path);
     uint64_t handle = 0;
     if (status == 0) {
         status = lpr_filed_call(FILED_WIRE_OP_OPENAT, page_fd, 0, &handle);
@@ -1667,7 +1737,7 @@ static int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw,
     filed_wire_readlink_t *readlink_req = (filed_wire_readlink_t *)page;
     lpr_memset(readlink_req, 0, sizeof(*readlink_req));
     readlink_req->dir_handle = dir_handle;
-    status = lpr_copy_path(readlink_req->name, path);
+    status = lpr_copy_path(readlink_req->name, sizeof(readlink_req->name), path);
     uint64_t length = 0;
     if (status == 0) {
         status = lpr_filed_call(FILED_WIRE_OP_READLINK, page_fd, 0, &length);
@@ -1682,27 +1752,30 @@ static int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw,
     return status == 0 ? (int64_t)length : status;
 }
 
-static int lpr_resolve_final_symlink_path(const char *path, const char *target, char out[FILED_WIRE_NAME_BYTES])
+static int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity)
 {
     if (path == 0 || target == 0 || out == 0) {
         return 0;
     }
-    const uint64_t target_len = (uint64_t)lpr_strnlen(target, FILED_WIRE_NAME_BYTES);
-    if (target_len == 0 || target_len >= FILED_WIRE_NAME_BYTES) {
+    if (capacity == 0) {
         return 0;
     }
-    lpr_memset(out, 0, FILED_WIRE_NAME_BYTES);
+    const uint64_t target_len = (uint64_t)lpr_strnlen(target, capacity);
+    if (target_len == 0 || target_len >= capacity) {
+        return 0;
+    }
+    lpr_memset(out, 0, capacity);
     if (target[0] == '/') {
         lpr_memcpy(out, target, target_len + 1u);
         return 1;
     }
     uint64_t prefix_len = 0;
-    for (uint64_t i = 0; path[i] != 0 && i < FILED_WIRE_NAME_BYTES; i += 1) {
+    for (uint64_t i = 0; path[i] != 0 && i < capacity; i += 1) {
         if (path[i] == '/') {
             prefix_len = i + 1u;
         }
     }
-    if (prefix_len + target_len >= FILED_WIRE_NAME_BYTES) {
+    if (prefix_len + target_len >= capacity) {
         return 0;
     }
     if (prefix_len != 0) {
@@ -1727,7 +1800,7 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
     {
         return fd;
     }
-    char target[FILED_WIRE_NAME_BYTES];
+    char target[FILED_WIRE_SYMLINK_TARGET_BYTES];
     lpr_memset(target, 0, sizeof(target));
     const int64_t len = lpr_linux_readlinkat_to_buffer(dirfd, path_raw, target, sizeof(target) - 1u);
     (void)lpr_linux_close((uint64_t)fd);
@@ -1736,8 +1809,8 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
     }
     target[len < (int64_t)(sizeof(target) - 1u) ? (uint64_t)len : sizeof(target) - 1u] = 0;
     const char *path = (const char *)(uintptr_t)path_raw;
-    char resolved[FILED_WIRE_NAME_BYTES];
-    if (!lpr_resolve_final_symlink_path(path, target, resolved)) {
+    char resolved[FILED_WIRE_PATH_BYTES];
+    if (!lpr_resolve_final_symlink_path(path, target, resolved, sizeof(resolved))) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
     return lpr_linux_openat_once(dirfd, (uint64_t)(uintptr_t)resolved, flags, mode);
@@ -2457,8 +2530,8 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    const uint64_t path_len = (uint64_t)lpr_strnlen(path, FILED_WIRE_NAME_BYTES);
-    if (path_len == 0 || path_len >= FILED_WIRE_NAME_BYTES) {
+    const uint64_t path_len = (uint64_t)lpr_strnlen(path, FILED_WIRE_PATH_BYTES);
+    if (path_len == 0 || path_len >= FILED_WIRE_PATH_BYTES) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
 
@@ -3100,7 +3173,7 @@ int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
     }
     const char *path_string = (const char *)(uintptr_t)path;
     const uint64_t path_len = path_string != 0 ?
-        (uint64_t)lpr_strnlen(path_string, FILED_WIRE_NAME_BYTES) :
+        (uint64_t)lpr_strnlen(path_string, FILED_WIRE_PATH_BYTES) :
         0;
     int64_t cached_status = 0;
     if (lpr_readlink_cache_lookup(path_string, path_len, &cached_status)) {
@@ -3112,17 +3185,17 @@ int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
         const char prefix[] = "[lpr_runtime] readlink path=";
         const char suffix[] = "\n";
         (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)prefix, sizeof(prefix) - 1u);
-        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)trace_path, (uint64_t)lpr_strnlen(trace_path, FILED_WIRE_NAME_BYTES));
+        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)trace_path, (uint64_t)lpr_strnlen(trace_path, FILED_WIRE_PATH_BYTES));
         (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)suffix, sizeof(suffix) - 1u);
     }
 #endif
-    char target[FILED_WIRE_NAME_BYTES];
+    char target[FILED_WIRE_SYMLINK_TARGET_BYTES];
     lpr_memset(target, 0, sizeof(target));
     const int64_t status = lpr_linux_readlinkat_to_buffer(
         (uint64_t)(int64_t)LPR_LINUX_AT_FDCWD,
         path,
         target,
-        sizeof(target) - 1u);
+        sizeof(target));
     if (status < 0) {
         lpr_readlink_cache_store(path_string, path_len, status);
         return status;

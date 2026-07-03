@@ -785,9 +785,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if !opts.NoKVM {
 		args = append(args, "-enable-kvm")
 	}
-	if opts.NoNet {
-		args = append(args, "-net", "none")
-	}
+	args = appendNetworkArgs(args, opts.NoNet)
 	args = append(args, opts.ExtraArgs...)
 	return commandPlan{
 		Args:        args,
@@ -853,15 +851,24 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if !opts.NoKVM {
 		args = append(args, "-enable-kvm")
 	}
-	if opts.NoNet {
-		args = append(args, "-net", "none")
-	}
+	args = appendNetworkArgs(args, opts.NoNet)
 	args = append(args, opts.ExtraArgs...)
 	return commandPlan{
 		Args:        args,
 		LogPath:     logPath,
 		HostTimeLog: hostTimeLogPath,
 	}, nil
+}
+
+func appendNetworkArgs(args []string, noNet bool) []string {
+	if noNet {
+		return append(args, "-net", "none")
+	}
+	return append(args,
+		"-net", "none",
+		"-netdev", "user,id=net0",
+		"-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56,disable-legacy=on",
+	)
 }
 
 func validateKVMAvailable() error {

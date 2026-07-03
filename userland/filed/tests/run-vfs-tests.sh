@@ -14,7 +14,8 @@ mkdir -p "${build_dir}"
   -Werror \
   -pthread \
   -I"${repo_root}/userland/filed/include" \
-  "${repo_root}/userland/filed/src/vfs.c" \
+  "${repo_root}/userland/filed/src/vfs/core.c" \
+  "${repo_root}/userland/filed/src/vfs/object.c" \
   "${repo_root}/userland/filed/tests/vfs_test.c" \
   -o "${build_dir}/vfs_test"
 
@@ -28,7 +29,12 @@ mkdir -p "${build_dir}"
   -pthread \
   -I"${repo_root}/userland/filed/include" \
   -I"${repo_root}/userland/koboxd/include" \
-  "${repo_root}/userland/filed/src/tmpfs_backend.c" \
+  "${repo_root}/userland/filed/src/tmpfs/backend.c" \
+  "${repo_root}/userland/filed/src/tmpfs/dir.c" \
+  "${repo_root}/userland/filed/src/tmpfs/file.c" \
+  "${repo_root}/userland/filed/src/tmpfs/meta.c" \
+  "${repo_root}/userland/filed/src/tmpfs/node.c" \
+  "${repo_root}/userland/filed/src/tmpfs/page.c" \
   "${repo_root}/userland/filed/tests/tmpfs_backend_test.c" \
   -o "${build_dir}/tmpfs_backend_test"
 

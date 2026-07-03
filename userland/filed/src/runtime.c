@@ -4,8 +4,15 @@
 
 #include "filed/dispatch.h"
 #include "filed/fd_ipc.h"
+#include "filed_direct_backend.h"
+#include "storage_runtime.h"
+#include "bootstrap.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
+
+enum {
+    FILED_RUNTIME_EXEC_ENDPOINT_FD = 240,
+};
 
 static int filed_clear_inherit_flag(int fd)
 {
@@ -18,6 +25,59 @@ static int filed_clear_inherit_flag(int fd)
         0,
         PACHA_FD_FLAG_INHERIT);
     return status == 0 ? 0 : -2;
+}
+
+static int filed_set_inherit_flag(int fd)
+{
+    if (fd < 16) {
+        return -1;
+    }
+    const long status = pacha_fd_fcntl(
+        fd,
+        PACHA_FD_FCNTL_SET_FLAGS,
+        PACHA_FD_FLAG_INHERIT,
+        PACHA_FD_FLAG_INHERIT);
+    return status == 0 ? 0 : -2;
+}
+
+static int filed_pin_exec_endpoint_fd(int endpoint_fd, int *out_fd)
+{
+    if (out_fd != NULL) {
+        *out_fd = -1;
+    }
+    if (endpoint_fd < 16 || out_fd == NULL) {
+        return -1;
+    }
+    if (endpoint_fd == FILED_RUNTIME_EXEC_ENDPOINT_FD) {
+        *out_fd = endpoint_fd;
+        return 0;
+    }
+
+    const uint64_t endpoint_rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_SEND |
+        PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_TRANSFER;
+    const long dup_fd = pacha_fd_fcntl(
+        endpoint_fd,
+        PACHA_FD_FCNTL_DUP,
+        FILED_RUNTIME_EXEC_ENDPOINT_FD,
+        endpoint_rights);
+    if (dup_fd != FILED_RUNTIME_EXEC_ENDPOINT_FD) {
+        if (dup_fd >= 16) {
+            (void)pacha_fd_close((int)dup_fd);
+        }
+        return -24;
+    }
+    (void)pacha_fd_close(endpoint_fd);
+    *out_fd = (int)dup_fd;
+    return 0;
 }
 
 static int filed_find_bootstrap_fd(char **argv, int *out_fd)
@@ -66,6 +126,24 @@ static int filed_read_bootstrap_fd(int fd, filed_bootstrap_t *out_bootstrap)
     return got == (long)sizeof(*out_bootstrap) ? 0 : -2;
 }
 
+static koboxd_storage_runtime_t filed_storage_runtime;
+
+static int filed_read_storage_bootstrap_fd(int fd, koboxd_bootstrap_t *out_bootstrap, long *out_got)
+{
+    if (out_got != NULL) {
+        *out_got = -1;
+    }
+    if (fd < 16 || out_bootstrap == NULL) {
+        return -1;
+    }
+
+    const long got = pacha_fd_read(fd, out_bootstrap, sizeof(*out_bootstrap));
+    if (out_got != NULL) {
+        *out_got = got;
+    }
+    return got == (long)sizeof(*out_bootstrap) ? 0 : -2;
+}
+
 static int filed_validate_bootstrap(const filed_bootstrap_t *bootstrap)
 {
     if (bootstrap == NULL) {
@@ -101,6 +179,8 @@ void filed_runtime_init(filed_runtime_t *runtime)
 int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
 {
     int status;
+    koboxd_bootstrap_t storage_bootstrap;
+    long bootstrap_bytes = -1;
 
     if (runtime == NULL) {
         return -1;
@@ -111,9 +191,48 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
         return status;
     }
 
-    status = filed_read_bootstrap_fd(runtime->bootstrap_fd, &runtime->bootstrap);
-    if (status != 0) {
-        return status;
+    memset(&storage_bootstrap, 0, sizeof(storage_bootstrap));
+    status = filed_read_storage_bootstrap_fd(runtime->bootstrap_fd, &storage_bootstrap, &bootstrap_bytes);
+    if (status == 0 && storage_bootstrap.magic == KOBOXD_BOOTSTRAP_MAGIC) {
+        status = koboxd_validate_bootstrap_package(&storage_bootstrap, sizeof(storage_bootstrap));
+        if (status != 0) {
+            return status;
+        }
+        status = koboxd_storage_runtime_init(
+            &filed_storage_runtime,
+            &storage_bootstrap);
+        if (status != 0) {
+            return status;
+        }
+        filed_kobox_backend_init_direct(
+            &runtime->backend,
+            koboxd_storage_runtime_fs_backend(&filed_storage_runtime),
+            koboxd_filed_direct_ops());
+        status = filed_pin_exec_endpoint_fd(
+            (int)(uint32_t)storage_bootstrap.control_fd,
+            &runtime->client_endpoint_fd);
+        if (status != 0) {
+            return status;
+        }
+        status = filed_clear_inherit_flag(runtime->bootstrap_fd);
+        if (status != 0) {
+            return status;
+        }
+        status = filed_set_inherit_flag(runtime->client_endpoint_fd);
+        if (status != 0) {
+            return status;
+        }
+        return 0;
+    }
+
+    if (bootstrap_bytes == (long)sizeof(runtime->bootstrap)) {
+        memcpy(&runtime->bootstrap, &storage_bootstrap, sizeof(runtime->bootstrap));
+        status = 0;
+    } else {
+        status = filed_read_bootstrap_fd(runtime->bootstrap_fd, &runtime->bootstrap);
+        if (status != 0) {
+            return status;
+        }
     }
 
     status = filed_validate_bootstrap(&runtime->bootstrap);
@@ -129,9 +248,11 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
     if (status != 0) {
         return status;
     }
-    status = filed_clear_inherit_flag(runtime->backend.fs_fd);
-    if (status != 0) {
-        return status;
+    if (runtime->backend.fs_fd >= 16) {
+        status = filed_clear_inherit_flag(runtime->backend.fs_fd);
+        if (status != 0) {
+            return status;
+        }
     }
     status = filed_clear_inherit_flag(runtime->client_endpoint_fd);
     if (status != 0) {

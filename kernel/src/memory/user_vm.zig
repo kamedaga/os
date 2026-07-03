@@ -722,6 +722,8 @@ pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pml4_index: usize, pdp_in
 }
 
 const pte_addr_mask: u64 = 0x000f_ffff_ffff_f000;
+const pte_cache_write_through: u64 = 1 << 3;
+const pte_cache_disable: u64 = 1 << 4;
 const pte_pkey_shift: u6 = 59;
 
 fn ptePaddr(entry: u64) u64 {
@@ -736,6 +738,11 @@ fn pteFlagsForProt(h: Hooks, prot: kernel.MapProt) ?u64 {
         h.page_user |
         (if (prot.write) h.page_rw else 0) |
         (@as(u64, prot.pkey) << pte_pkey_shift);
+}
+
+fn pteFlagsForUncachedProt(h: Hooks, prot: kernel.MapProt) ?u64 {
+    const flags = pteFlagsForProt(h, prot) orelse return null;
+    return flags | pte_cache_write_through | pte_cache_disable;
 }
 
 fn userRangeEndVa(h: Hooks, va_start: u64, size_bytes: u64) ?u64 {
@@ -773,11 +780,32 @@ pub fn mapUserLinearRegionWithProt(
     size_bytes: usize,
     prot: kernel.MapProt,
 ) bool {
+    return mapUserLinearRegionWithPteFlags(principal, va_start, paddr_start, size_bytes, prot, false);
+}
+
+pub fn mapUserUncachedLinearRegionWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddr_start: u64,
+    size_bytes: usize,
+    prot: kernel.MapProt,
+) bool {
+    return mapUserLinearRegionWithPteFlags(principal, va_start, paddr_start, size_bytes, prot, true);
+}
+
+fn mapUserLinearRegionWithPteFlags(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddr_start: u64,
+    size_bytes: usize,
+    prot: kernel.MapProt,
+    uncached: bool,
+) bool {
     lockAddressSpaces();
     defer unlockAddressSpaces();
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
-    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    const pte_flags = if (uncached) pteFlagsForUncachedProt(h, prot) orelse return false else pteFlagsForProt(h, prot) orelse return false;
     if (size_bytes == 0) return false;
     if ((va_start & 0xFFF) != 0 or (paddr_start & 0xFFF) != 0) return false;
 

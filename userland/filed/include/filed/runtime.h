@@ -4,7 +4,7 @@
 
 #include "filed/bootstrap.h"
 #include "filed/kobox_backend.h"
-#include "filed/tmpfs_backend.h"
+#include "filed/tmpfs_internal.h"
 #include "filed/vfs.h"
 
 enum {

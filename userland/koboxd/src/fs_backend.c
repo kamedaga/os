@@ -382,7 +382,7 @@ static int module_symbol(kb_module_t *module, const char *name, void **out_addre
 {
     kb_status_t status = kb_module_find_symbol(module, name, out_address);
     if (status != KB_OK || out_address == NULL || *out_address == NULL) {
-        fprintf(stderr, "[koboxd] fs-backend missing symbol %s status=%s(%d)\n",
+        fprintf(stderr, "[filed-storage] fs-backend missing symbol %s status=%s(%d)\n",
             name,
             status_name(status),
             status);
@@ -1072,7 +1072,7 @@ int koboxd_fs_backend_mount_ext4(
     if (status != 0) {
         return status;
     }
-    printf("[koboxd] rootfs mounted fs=ext4 reads=%u\n", backend->mount_result.block_read_count);
+    printf("[filed-storage] rootfs mounted fs=ext4 reads=%u\n", backend->mount_result.block_read_count);
     backend->ext4_module = ext4_module;
     backend->next_object_id = 2;
     fill_object_from_inode(
@@ -1837,79 +1837,4 @@ int koboxd_fs_backend_getdents(
         *out_count += 1;
     }
     return 0;
-}
-
-int koboxd_fs_backend_handle_ipc(void *ctx, const koboxd_ipc_request_t *request, koboxd_ipc_reply_t *reply)
-{
-    koboxd_fs_backend_t *backend = (koboxd_fs_backend_t *)ctx;
-    if (backend == NULL || request == NULL || reply == NULL || !backend->mounted) {
-        return -1;
-    }
-    int status = koboxd_ipc_validate_request(request, KOBOXD_IPC_ENDPOINT_FS_BACKEND);
-    if (status != 0) {
-        return status;
-    }
-
-    switch (request->header.op) {
-    case KOBOXD_FS_MOUNT_ROOT:
-        return koboxd_ipc_make_reply(request, 0, backend->mount_result.observed_ext4_magic, 0, NULL, 0, reply);
-    case KOBOXD_FS_LOOKUP: {
-        const koboxd_fs_lookup_request_t *lookup =
-            (const koboxd_fs_lookup_request_t *)(const void *)request->inline_payload;
-        if (request->header.inline_bytes < sizeof(*lookup)) {
-            return koboxd_ipc_make_reply(request, -22, 0, 0, NULL, 0, reply);
-        }
-        uint64_t object_id = 0;
-        status = koboxd_fs_backend_lookup(backend, 1, lookup->name, &object_id);
-        if (status != 0) {
-            return koboxd_ipc_make_reply(request, status, 0, 0, NULL, 0, reply);
-        }
-        return koboxd_ipc_make_reply(request, 0, object_id, 0, NULL, 0, reply);
-    }
-    case KOBOXD_FS_PREAD: {
-        const koboxd_fs_io_request_t *io =
-            (const koboxd_fs_io_request_t *)(const void *)request->inline_payload;
-        if (request->header.inline_bytes < sizeof(*io)) {
-            return koboxd_ipc_make_reply(request, -22, 0, 0, NULL, 0, reply);
-        }
-        koboxd_fs_io_reply_t payload;
-        memset(&payload, 0, sizeof(payload));
-        size_t length = io->length;
-        if (length > sizeof(payload.data)) {
-            length = sizeof(payload.data);
-        }
-        status = koboxd_fs_backend_pread(backend, io->object_id, io->offset, payload.data, length, sizeof(payload.data));
-        if (status < 0) {
-            return koboxd_ipc_make_reply(request, status, 0, 0, NULL, 0, reply);
-        }
-        return koboxd_ipc_make_reply(request, 0, (uint64_t)status, 0, &payload, sizeof(payload), reply);
-    }
-    case KOBOXD_FS_PWRITE: {
-        const koboxd_fs_io_request_t *io =
-            (const koboxd_fs_io_request_t *)(const void *)request->inline_payload;
-        if (request->header.inline_bytes < sizeof(*io)) {
-            return koboxd_ipc_make_reply(request, -22, 0, 0, NULL, 0, reply);
-        }
-        size_t length = io->length;
-        if (length > sizeof(io->data)) {
-            length = sizeof(io->data);
-        }
-        status = koboxd_fs_backend_pwrite(backend, io->object_id, io->offset, io->data, length);
-        if (status < 0) {
-            return koboxd_ipc_make_reply(request, status, 0, 0, NULL, 0, reply);
-        }
-        return koboxd_ipc_make_reply(request, 0, (uint64_t)status, 0, NULL, 0, reply);
-    }
-    case KOBOXD_FS_FSYNC: {
-        const koboxd_fs_io_request_t *io =
-            (const koboxd_fs_io_request_t *)(const void *)request->inline_payload;
-        if (request->header.inline_bytes < sizeof(*io)) {
-            return koboxd_ipc_make_reply(request, -22, 0, 0, NULL, 0, reply);
-        }
-        status = koboxd_fs_backend_fsync(backend, io->object_id);
-        return koboxd_ipc_make_reply(request, status, 0, 0, NULL, 0, reply);
-    }
-    default:
-        return koboxd_ipc_make_reply(request, -95, 0, 0, NULL, 0, reply);
-    }
 }

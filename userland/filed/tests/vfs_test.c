@@ -1030,6 +1030,109 @@ static void test_unlink_keeps_open_files_alive(void)
     expect_status("unlink lifetime preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
 }
 
+static void test_hardlink_alias_lifetime_and_stat(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    filed_vfs_open_result_t file;
+    filed_vfs_open_result_t alias;
+    filed_vfs_io_decision_t old_parent;
+    filed_vfs_io_decision_t new_parent;
+    filed_vfs_io_decision_t decision;
+    filed_vfs_stat_snapshot_t snapshot;
+    filed_vfs_reclaim_result_t reclaim;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for hardlink alias",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for hardlink alias",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_CREATE | FILED_RIGHT_REMOVE | FILED_RIGHT_RENAME | FILED_RIGHT_STAT,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+    expect_status(
+        "create hardlink cached source",
+        filed_vfs_create_backend_child(
+            &vfs,
+            root.handle_id,
+            90,
+            FILED_VNODE_REGULAR,
+            "file",
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_READ | FILED_RIGHT_WRITE | FILED_RIGHT_STAT,
+            0,
+            &file),
+        FILED_OK);
+    expect_status(
+        "link prepare cached alias",
+        filed_vfs_link_prepare(
+            &vfs,
+            root.handle_id,
+            root.handle_id,
+            "file",
+            "alias",
+            &old_parent,
+            &new_parent),
+        FILED_OK);
+    expect_true("link prepare parents", old_parent.backend_object == 11 && new_parent.backend_object == 11);
+    expect_status(
+        "link commit cached alias",
+        filed_vfs_link_commit(
+            &vfs,
+            root.handle_id,
+            90,
+            FILED_VNODE_REGULAR,
+            "alias",
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_READ | FILED_RIGHT_WRITE | FILED_RIGHT_STAT,
+            0,
+            &alias),
+        FILED_OK);
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.valid = true;
+    snapshot.mode = 0100644;
+    snapshot.size = 7;
+    snapshot.blocks = 1;
+    snapshot.nlink = 2;
+    snapshot.kind = 0100000;
+    expect_status("update alias stat", filed_vfs_update_stat_snapshot(&vfs, 90, &snapshot), FILED_OK);
+    expect_status("stat source alias", filed_vfs_stat_prepare(&vfs, file.handle_id, &decision), FILED_OK);
+    expect_true("stat source nlink", decision.backend_object == 90);
+    expect_status("stat hardlink alias", filed_vfs_stat_prepare(&vfs, alias.handle_id, &decision), FILED_OK);
+    expect_true("stat alias backend", decision.backend_object == 90);
+    memset(&reclaim, 0, sizeof(reclaim));
+    expect_status(
+        "rename hardlink alias no-op",
+        filed_vfs_rename_commit_ex(&vfs, root.handle_id, root.handle_id, "file", "alias", 90, &reclaim),
+        FILED_OK);
+    expect_true("rename hardlink alias keeps backend", !reclaim.released);
+    expect_status("source remains after hardlink rename no-op", filed_vfs_pwrite_prepare(&vfs, file.handle_id, 0, 1, &decision), FILED_OK);
+    expect_status("alias remains after hardlink rename no-op", filed_vfs_pwrite_prepare(&vfs, alias.handle_id, 0, 1, &decision), FILED_OK);
+
+    memset(&reclaim, 0, sizeof(reclaim));
+    expect_status(
+        "unlink source keeps backend via alias",
+        filed_vfs_unlink_commit_ex(&vfs, root.handle_id, "file", &reclaim),
+        FILED_OK);
+    expect_true("unlink source does not release backend", !reclaim.released);
+    expect_status("alias remains readable", filed_vfs_pwrite_prepare(&vfs, alias.handle_id, 0, 1, &decision), FILED_OK);
+    expect_status("close source hardlink handle", filed_vfs_close_handle(&vfs, file.handle_id), FILED_OK);
+    expect_status("close alias hardlink handle", filed_vfs_close_handle(&vfs, alias.handle_id), FILED_OK);
+    memset(&reclaim, 0, sizeof(reclaim));
+    expect_status(
+        "unlink final alias releases backend",
+        filed_vfs_unlink_commit_ex(&vfs, root.handle_id, "alias", &reclaim),
+        FILED_OK);
+    expect_true("unlink final alias release object", reclaim.released && reclaim.backend_object == 90);
+    expect_status("hardlink alias preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
 static void test_rename_replace_keeps_replaced_open_file_alive(void)
 {
     filed_vfs_t vfs;
@@ -1367,6 +1470,7 @@ int main(void)
     test_concurrent_directory_unlink_parent_lock();
     test_concurrent_cross_directory_rename_ordering();
     test_unlink_keeps_open_files_alive();
+    test_hardlink_alias_lifetime_and_stat();
     test_rename_replace_keeps_replaced_open_file_alive();
     test_rename_keeps_open_directory_handle_alive();
     test_mutation_component_validation();

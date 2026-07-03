@@ -62,7 +62,7 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 >>>
 ```
 
-**PachaOS Capsule バックエンドで動作中:**
+**PachaOS Capsule バックエンドで動作中**
 
 | Module | Module |
 |---|---|
@@ -70,6 +70,7 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 | USB Storage | `usbcore.ko` / `usb-storage.ko` / `xhci-hcd.ko` |
 | USB HID(マウスで実験中) | `usbcore.ko` / `hid.ko` / `hid-generic.ko` / `usbhid.ko` / `xhci-hcd.ko`|
 | Ext4 | `crc16.ko` / `mbcache.ko` / `jbd2.ko` / `ext4.ko`|
+| virtio-net| `virtio.ko` / `virtio_ring` / `virtio_pci.ko` / `failover.ko` / `net_failover.ko `/ `virtio_net.ko` |
 
 koboxはcapabilityベースからFDベースに切り替え、ネイティブABIで自然にlibcが動いたため、daemonとして動くようになりました。
 

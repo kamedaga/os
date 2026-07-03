@@ -339,6 +339,18 @@ static int direct_getdents(
     return 0;
 }
 
+static int direct_sync_all(void *ctx)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL) {
+        return -22;
+    }
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_sync_all(backend);
+    koboxd_fs_backend_unlock(backend);
+    return status;
+}
+
 static const filed_kobox_direct_ops_t direct_ops = {
     .mount_root = direct_mount_root,
     .lookup = direct_lookup,
@@ -356,6 +368,7 @@ static const filed_kobox_direct_ops_t direct_ops = {
     .rename = direct_rename,
     .release_object = direct_release_object,
     .getdents = direct_getdents,
+    .sync_all = direct_sync_all,
 };
 
 const filed_kobox_direct_ops_t *koboxd_filed_direct_ops(void)

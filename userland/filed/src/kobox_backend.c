@@ -1064,3 +1064,28 @@ int filed_kobox_backend_getdents(
 
     return status;
 }
+
+int filed_kobox_backend_sync_all(filed_kobox_backend_t *backend)
+{
+    uint64_t ignored = 0;
+
+    if (backend == NULL) {
+        return -1;
+    }
+    if (filed_kobox_backend_is_direct(backend)) {
+        if (backend->direct_ops->sync_all == NULL) {
+            return 0;
+        }
+        uint64_t start_cycles = 0;
+        const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
+        const int status = backend->direct_ops->sync_all(backend->direct_ctx);
+        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_SYNC_ALL, start_ns, start_cycles, status);
+    }
+
+    return filed_kobox_call_with_fd(
+        backend,
+        KOBOXD_WIRE_FS_SYNC_ALL,
+        0,
+        -1,
+        &ignored);
+}

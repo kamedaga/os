@@ -105,7 +105,7 @@ enum {
 static const char storage_boot_ext4_file[] = "hello.txt";
 static const char storage_boot_seed0root_file[] = "sbin/seed0root.elf";
 static const char storage_boot_seed0root_argv0[] = "/sbin/seed0root.elf";
-static const char storage_boot_koboxd_file[] = "sbin/koboxd.elf";
+static const char storage_boot_filed_file[] = "sbin/filed.elf";
 static const char storage_boot_ext4_initial[] = "storage_boot ext4 initial payload\n";
 static const char storage_boot_ext4_written[] = "storage_boot ext4 write_iter payload\n";
 
@@ -134,8 +134,8 @@ struct storage_boot_bootstrap_module {
 struct storage_boot_seed0root_bootstrap {
     uint64_t magic;
     uint64_t device_fd;
-    uint64_t koboxd_image_fd;
-    uint64_t koboxd_image_size;
+    uint64_t filed_image_fd;
+    uint64_t filed_image_size;
     uint64_t module_count;
     struct storage_boot_bootstrap_module modules[STORAGE_BOOT_BOOTSTRAP_MAX_MODULES];
 };
@@ -1711,29 +1711,29 @@ static int launch_seed0root_from_ext4(
     free(seed_dentry);
     fprintf(stderr, "[storage_boot] seed0root: free seed dentry done\n");
 
-    void *koboxd_inode = NULL;
-    void *koboxd_dentry = NULL;
+    void *filed_inode = NULL;
+    void *filed_dentry = NULL;
     status = ext4_lookup_name_at(
         ext4_module,
         &ops,
         sbin_inode,
         sbin_dentry,
-        "koboxd.elf",
-        &koboxd_inode,
-        &koboxd_dentry);
+        "filed.elf",
+        &filed_inode,
+        &filed_dentry);
     fprintf(stderr, "[storage_boot] seed0root: free sbin dentry\n");
     free(sbin_dentry);
     fprintf(stderr, "[storage_boot] seed0root: free sbin dentry done\n");
     if (status != 0) {
         fprintf(stderr, "[storage_boot] seed0root: lookup %s failed status=%d\n",
-            storage_boot_koboxd_file,
+            storage_boot_filed_file,
             status);
         return 27;
     }
-    fprintf(stderr, "[storage_boot] seed0root: lookup koboxd ok dentry=%p inode=%p\n", koboxd_dentry, koboxd_inode);
-    fprintf(stderr, "[storage_boot] seed0root: free koboxd dentry\n");
-    free(koboxd_dentry);
-    fprintf(stderr, "[storage_boot] seed0root: free koboxd dentry done\n");
+    fprintf(stderr, "[storage_boot] seed0root: lookup filed ok dentry=%p inode=%p\n", filed_dentry, filed_inode);
+    fprintf(stderr, "[storage_boot] seed0root: free filed dentry\n");
+    free(filed_dentry);
+    fprintf(stderr, "[storage_boot] seed0root: free filed dentry done\n");
 
     unsigned char *image = NULL;
     uint64_t image_size = 0;
@@ -1752,28 +1752,28 @@ static int launch_seed0root_from_ext4(
             status);
         return 24;
     }
-    unsigned char *koboxd_image = NULL;
-    uint64_t koboxd_image_size = 0;
+    unsigned char *filed_image = NULL;
+    uint64_t filed_image_size = 0;
     status = ext4_file_read_alloc(
         ext4_module,
         &ops,
-        koboxd_inode,
+        filed_inode,
         0,
         STORAGE_BOOT_MAX_ROOTFS_ELF_BYTES,
-        &koboxd_image,
-        &koboxd_image_size,
-        "koboxd");
+        &filed_image,
+        &filed_image_size,
+        "filed");
     if (status != 0) {
         free(image);
         fprintf(stderr, "[storage_boot] seed0root: read %s failed status=%d\n",
-            storage_boot_koboxd_file,
+            storage_boot_filed_file,
             status);
         return 28;
     }
-    const int koboxd_image_fd = create_inherited_vmo_from_bytes(koboxd_image, koboxd_image_size, "koboxd.elf");
-    if (koboxd_image_fd < 16) {
+    const int filed_image_fd = create_inherited_vmo_from_bytes(filed_image, filed_image_size, "filed.elf");
+    if (filed_image_fd < 16) {
         free(image);
-        free(koboxd_image);
+        free(filed_image);
         return 28;
     }
 
@@ -1782,8 +1782,8 @@ static int launch_seed0root_from_ext4(
     for (size_t i = 0; i < module_count; i++) {
         if (module_images[i].name == NULL || module_images[i].image_fd < 16 || module_images[i].size == 0) {
             free(image);
-            free(koboxd_image);
-            (void)pacha_fd_close(koboxd_image_fd);
+            free(filed_image);
+            (void)pacha_fd_close(filed_image_fd);
             return 30;
         }
         snprintf(module_table[i].name, sizeof(module_table[i].name), "%s", module_images[i].name);
@@ -1794,24 +1794,24 @@ static int launch_seed0root_from_ext4(
     const struct storage_boot_seed0root_bootstrap bootstrap = {
         .magic = STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_MAGIC,
         .device_fd = device_fd,
-        .koboxd_image_fd = (uint64_t)(uint32_t)koboxd_image_fd,
-        .koboxd_image_size = koboxd_image_size,
+        .filed_image_fd = (uint64_t)(uint32_t)filed_image_fd,
+        .filed_image_size = filed_image_size,
         .module_count = module_count,
     };
     struct storage_boot_seed0root_bootstrap bootstrap_package = bootstrap;
     memcpy(bootstrap_package.modules, module_table, sizeof(module_table));
-    free(koboxd_image);
+    free(filed_image);
     status = mark_fd_inherit((int)device_fd, "seed0root device fd");
     if (status != 0) {
         free(image);
-        (void)pacha_fd_close(koboxd_image_fd);
+        (void)pacha_fd_close(filed_image_fd);
         return 31;
     }
 
     const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
     if (bootstrap_fd < 16) {
         free(image);
-        (void)pacha_fd_close(koboxd_image_fd);
+        (void)pacha_fd_close(filed_image_fd);
         return 32;
     }
 
@@ -1820,13 +1820,13 @@ static int launch_seed0root_from_ext4(
     free(image);
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
-        (void)pacha_fd_close(koboxd_image_fd);
+        (void)pacha_fd_close(filed_image_fd);
         fprintf(stderr, "[storage_boot] seed0root: ELF load failed status=%d\n", status);
         return 25;
     }
     status = start_loaded_process(&loaded, storage_boot_seed0root_argv0, bootstrap_fd);
     (void)pacha_fd_close(bootstrap_fd);
-    (void)pacha_fd_close(koboxd_image_fd);
+    (void)pacha_fd_close(filed_image_fd);
     if (status != 0) {
         fprintf(stderr, "[storage_boot] seed0root: start failed status=%d\n", status);
         return 26;

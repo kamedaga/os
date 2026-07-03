@@ -2218,14 +2218,14 @@ pub const KernelState = struct {
 
     fn releaseDmaBufferObject(self: *KernelState, dma: DmaBufferObject) void {
         _ = self;
-        if (dma.iova == 0 or dma.size == 0) return;
+        if (dma.size == 0) return;
         _ = dma.device;
         vtd.unmapRange(dma.iova, dma.size);
     }
 
     fn releaseDmaMappingObject(self: *KernelState, mapping: DmaMappingObject) void {
         _ = self;
-        if (mapping.iova == 0 or mapping.size == 0) return;
+        if (mapping.size == 0) return;
         _ = mapping.device;
         vtd.unmapRange(mapping.iova, mapping.size);
     }
@@ -3872,7 +3872,7 @@ pub const KernelState = struct {
         flags: FdFlags,
         min_fd: Fd,
     ) KernelError!Fd {
-        if (dma.device == 0 or dma.user_va == 0 or dma.iova == 0 or dma.size == 0) return KernelError.InvalidState;
+        if (dma.device == 0 or dma.user_va == 0 or dma.size == 0) return KernelError.InvalidState;
         var payload = dma;
         payload.owner_principal_raw = @intFromEnum(owner);
         const object_ref = try self.createKernelObject(.dma_buffer, .{ .dma_buffer = payload });
@@ -3890,7 +3890,7 @@ pub const KernelState = struct {
         flags: FdFlags,
         min_fd: Fd,
     ) KernelError!Fd {
-        if (mapping.device == 0 or mapping.user_va == 0 or mapping.iova == 0 or mapping.size == 0) return KernelError.InvalidState;
+        if (mapping.device == 0 or mapping.user_va == 0 or mapping.size == 0) return KernelError.InvalidState;
         var payload = mapping;
         payload.owner_principal_raw = @intFromEnum(owner);
         const object_ref = try self.createKernelObject(.dma_mapping, .{ .dma_mapping = payload });

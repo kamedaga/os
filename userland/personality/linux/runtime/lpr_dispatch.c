@@ -183,6 +183,7 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_RENAME },
     { .nr = LPR_LINUX_SYS_MKDIR },
     { .nr = LPR_LINUX_SYS_RMDIR },
+    { .nr = LPR_LINUX_SYS_LINK },
     { .nr = LPR_LINUX_SYS_UNLINK },
     { .nr = LPR_LINUX_SYS_READLINK },
     { .nr = LPR_LINUX_SYS_CHMOD },
@@ -198,6 +199,7 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_NEWFSTATAT },
     { .nr = LPR_LINUX_SYS_UNLINKAT },
     { .nr = LPR_LINUX_SYS_RENAMEAT },
+    { .nr = LPR_LINUX_SYS_LINKAT },
     { .nr = LPR_LINUX_SYS_FCHMODAT },
     { .nr = LPR_LINUX_SYS_UTIMENSAT },
     { .nr = LPR_LINUX_SYS_GETRANDOM },
@@ -282,6 +284,7 @@ static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t 
     case LPR_LINUX_SYS_RENAME: return lpr_append_literal(out, end, "rename");
     case LPR_LINUX_SYS_MKDIR: return lpr_append_literal(out, end, "mkdir");
     case LPR_LINUX_SYS_RMDIR: return lpr_append_literal(out, end, "rmdir");
+    case LPR_LINUX_SYS_LINK: return lpr_append_literal(out, end, "link");
     case LPR_LINUX_SYS_UNLINK: return lpr_append_literal(out, end, "unlink");
     case LPR_LINUX_SYS_READLINK: return lpr_append_literal(out, end, "readlink");
     case LPR_LINUX_SYS_CHMOD: return lpr_append_literal(out, end, "chmod");
@@ -307,6 +310,7 @@ static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t 
     case LPR_LINUX_SYS_NEWFSTATAT: return lpr_append_literal(out, end, "newfstatat");
     case LPR_LINUX_SYS_UNLINKAT: return lpr_append_literal(out, end, "unlinkat");
     case LPR_LINUX_SYS_RENAMEAT: return lpr_append_literal(out, end, "renameat");
+    case LPR_LINUX_SYS_LINKAT: return lpr_append_literal(out, end, "linkat");
     case LPR_LINUX_SYS_FCHMODAT: return lpr_append_literal(out, end, "fchmodat");
     case LPR_LINUX_SYS_FACCESSAT: return lpr_append_literal(out, end, "faccessat");
     case LPR_LINUX_SYS_SYMLINKAT: return lpr_append_literal(out, end, "symlinkat");
@@ -1039,6 +1043,8 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
         return lpr_linux_mkdirat(LPR_LINUX_AT_FDCWD, a0, a1);
     case LPR_LINUX_SYS_RMDIR:
         return lpr_linux_unlinkat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_REMOVEDIR);
+    case LPR_LINUX_SYS_LINK:
+        return lpr_linux_linkat(LPR_LINUX_AT_FDCWD, a0, LPR_LINUX_AT_FDCWD, a1, 0);
     case LPR_LINUX_SYS_UNLINK:
         return lpr_linux_unlinkat(LPR_LINUX_AT_FDCWD, a0, 0);
     case LPR_LINUX_SYS_GETDENTS64:
@@ -1057,6 +1063,8 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
         return lpr_linux_unlinkat(a0, a1, a2);
     case LPR_LINUX_SYS_RENAMEAT:
         return lpr_linux_renameat(a0, a1, a2, a3);
+    case LPR_LINUX_SYS_LINKAT:
+        return lpr_linux_linkat(a0, a1, a2, a3, a4);
     case LPR_LINUX_SYS_FCHMODAT:
         return lpr_linux_fchmodat(a0, a1, a2, a3);
     case LPR_LINUX_SYS_FACCESSAT:

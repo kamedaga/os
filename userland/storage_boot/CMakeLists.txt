@@ -33,6 +33,7 @@ set(KOBOX_RUNTIME_SOURCES
   ${REPO_ROOT}/_kobox/src/linux_subsystem/input/input.c
   ${REPO_ROOT}/_kobox/src/linux_subsystem/input/input_symbols.c
   ${REPO_ROOT}/_kobox/src/linux_subsystem/kvm/kvm_symbols.c
+  ${REPO_ROOT}/_kobox/src/linux_subsystem/net/net_device.c
   ${REPO_ROOT}/_kobox/src/linux_subsystem/net/net_symbols.c
   ${REPO_ROOT}/_kobox/src/linux_subsystem/nvme/nvme.c
   ${REPO_ROOT}/_kobox/src/linux_subsystem/pci/pci.c

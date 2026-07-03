@@ -69,7 +69,7 @@ int koboxd_read_bootstrap_fd(int fd, koboxd_bootstrap_t *out_bootstrap)
     const long got = pacha_fd_read(fd, out_bootstrap, sizeof(*out_bootstrap));
     if (got != (long)sizeof(*out_bootstrap)) {
         fprintf(stderr,
-            "[koboxd] bootstrap fd read failed fd=%d got=%ld size=%llu\n",
+            "[filed-storage] bootstrap fd read failed fd=%d got=%ld size=%llu\n",
             fd,
             got,
             (unsigned long long)sizeof(*out_bootstrap));
@@ -94,7 +94,7 @@ int koboxd_validate_bootstrap_package(
         bootstrap->module_count > KOBOXD_BOOTSTRAP_MAX_MODULES)
     {
         fprintf(stderr,
-            "[koboxd] bootstrap invalid magic=0x%llx device_fd=%llu control_fd=%llu modules=%llu size=%llu\n",
+            "[filed-storage] bootstrap invalid magic=0x%llx device_fd=%llu control_fd=%llu modules=%llu size=%llu\n",
             (unsigned long long)bootstrap->magic,
             (unsigned long long)bootstrap->device_fd,
             (unsigned long long)bootstrap->control_fd,
@@ -110,7 +110,7 @@ int koboxd_validate_bootstrap_package(
             module->image_size < 4)
         {
             fprintf(stderr,
-                "[koboxd] bootstrap module invalid index=%llu name=%s fd=%llu size=%llu\n",
+                "[filed-storage] bootstrap module invalid index=%llu name=%s fd=%llu size=%llu\n",
                 (unsigned long long)i,
                 module->name,
                 (unsigned long long)module->image_fd,
@@ -129,13 +129,13 @@ int koboxd_validate_bootstrap_package(
             PACHA_MMAP_SHARED,
             0);
         if (image == NULL) {
-            fprintf(stderr, "[koboxd] bootstrap module mmap failed name=%s fd=%llu\n",
+            fprintf(stderr, "[filed-storage] bootstrap module mmap failed name=%s fd=%llu\n",
                 module->name,
                 (unsigned long long)module->image_fd);
             return -3;
         }
         if (image[0] != 0x7f || image[1] != 'E' || image[2] != 'L' || image[3] != 'F') {
-            fprintf(stderr, "[koboxd] bootstrap module is not ELF name=%s\n", module->name);
+            fprintf(stderr, "[filed-storage] bootstrap module is not ELF name=%s\n", module->name);
             (void)pacha_munmap((void *)image, map_size);
             return -4;
         }

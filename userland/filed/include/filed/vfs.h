@@ -406,6 +406,24 @@ filed_status_t filed_vfs_unlink_commit_ex(
     const char *name,
     filed_vfs_reclaim_result_t *out_reclaim);
 
+filed_status_t filed_vfs_link_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t old_parent_handle_id,
+    filed_handle_id_t new_parent_handle_id,
+    const char *old_name,
+    const char *new_name,
+    filed_vfs_io_decision_t *out_old_parent,
+    filed_vfs_io_decision_t *out_new_parent);
+filed_status_t filed_vfs_link_commit(
+    filed_vfs_t *vfs,
+    filed_handle_id_t new_parent_handle_id,
+    filed_backend_object_id_t child_backend_object,
+    filed_vnode_kind_t child_kind,
+    const char *new_name,
+    uint32_t rights,
+    uint32_t open_flags,
+    filed_vfs_open_result_t *out_open);
+
 filed_status_t filed_vfs_rename_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t old_parent_handle_id,

@@ -14,7 +14,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.c ${CMAKE_CURRENT_SOURCE_DIR}/src/next_stage_loader.c ${CMAKE_CURRENT_SOURCE_DIR}/src/pachaos_capsule_launcher.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libcapsule/src/capsule.c ${REPO_ROOT}/userland/libpacha/src/syscall.c"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/pachaos_capsule/include ${REPO_ROOT}/userland/storage_boot/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/pachaos_capsule/include ${REPO_ROOT}/userland/storage_boot/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0BOOT_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
@@ -25,6 +25,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/next_stage_loader.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/pachaos_capsule_launcher.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/pachaos_capsule_launcher.c"
+    "${REPO_ROOT}/userland/netd/include/netd/boot_config.h"
     "${REPO_ROOT}/userland/pachaos_capsule/include/pachaos_capsule/boot_config.h"
     "${REPO_ROOT}/userland/storage_boot/include/storage_boot/boot_config.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"

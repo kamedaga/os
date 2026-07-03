@@ -1,6 +1,5 @@
 #pragma once
 
-#include "ipc_service.h"
 #include "kobox/module.h"
 #include "linux_subsystem/fs/fs.h"
 
@@ -147,4 +146,3 @@ int koboxd_fs_backend_getdents(
     koboxd_fs_object_t *out_entries,
     size_t capacity,
     size_t *out_count);
-int koboxd_fs_backend_handle_ipc(void *ctx, const koboxd_ipc_request_t *request, koboxd_ipc_reply_t *reply);

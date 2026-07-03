@@ -52,6 +52,7 @@ typedef struct filed_kobox_direct_ops {
     int (*rename)(void *ctx, uint64_t old_parent_object_id, const char *old_name, uint64_t new_parent_object_id, const char *new_name, uint64_t *out_object_id);
     int (*release_object)(void *ctx, uint64_t object_id);
     int (*getdents)(void *ctx, uint64_t dir_object_id, uint64_t offset, koboxd_wire_fs_getdents_t *out_entries);
+    int (*sync_all)(void *ctx);
 } filed_kobox_direct_ops_t;
 
 void filed_kobox_backend_init(filed_kobox_backend_t *backend, int fs_fd);
@@ -138,3 +139,4 @@ int filed_kobox_backend_getdents(
     uint64_t dir_object_id,
     uint64_t offset,
     koboxd_wire_fs_getdents_t *out_entries);
+int filed_kobox_backend_sync_all(filed_kobox_backend_t *backend);

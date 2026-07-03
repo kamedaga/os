@@ -36,108 +36,9 @@ static const char *status_name(kb_status_t status)
     }
 }
 
-int main(int argc, char **argv)
+static int run_nvme_smoke(void)
 {
-    (void)argc;
-    (void)argv;
-
-    const struct pachaos_capsule_boot_config *cfg =
-        (const struct pachaos_capsule_boot_config *)(uintptr_t)PACHAOS_CAPSULE_BOOT_CONFIG_VA;
-    if (cfg->magic != PACHAOS_CAPSULE_BOOT_CONFIG_MAGIC ||
-        cfg->version != PACHAOS_CAPSULE_BOOT_CONFIG_VERSION ||
-        cfg->device_fd < 16 ||
-        cfg->module_count == 0 ||
-        cfg->module_count > PACHAOS_CAPSULE_MAX_MODULES) {
-        fprintf(stderr,
-            "[pachaos_capsule] invalid boot config magic=0x%llx version=%llu fd=%llu modules=%llu\n",
-            (unsigned long long)cfg->magic,
-            (unsigned long long)cfg->version,
-            (unsigned long long)cfg->device_fd,
-            (unsigned long long)cfg->module_count);
-        return 2;
-    }
-
-    printf("[pachaos_capsule] start device_fd=%llu modules=%llu loader=%s\n",
-        (unsigned long long)cfg->device_fd,
-        (unsigned long long)cfg->module_count,
-        kb_module_loader_version());
-
-    kb_device_backend_t *backend = NULL;
-    kb_status_t status = kb_pachaos_capsule_device_create(cfg->device_fd, &backend);
-    if (status != KB_OK || backend == NULL) {
-        fprintf(stderr, "[pachaos_capsule] device backend create failed status=%d\n", status);
-        return 3;
-    }
-
-    for (unsigned bar_index = 0; bar_index < 2; bar_index++) {
-        struct pacha_capsule_bar_info bar = {0};
-        int bar_status = pacha_capsule_pci_bar_info((int)cfg->device_fd, bar_index, &bar);
-        printf("[pachaos_capsule] pci bar%u status=%d start=0x%llx end=0x%llx size=0x%llx flags=0x%llx\n",
-            bar_index,
-            bar_status,
-            (unsigned long long)bar.start,
-            (unsigned long long)bar.end,
-            (unsigned long long)bar.size,
-            (unsigned long long)bar.flags);
-    }
-    for (uint16_t offset = 0x10; offset <= 0x14; offset += 4) {
-        uint32_t value = 0;
-        int config_status = pacha_capsule_pci_config_read((int)cfg->device_fd, offset, 4, &value);
-        printf("[pachaos_capsule] pci config[0x%02x] status=%d value=0x%08x\n",
-            offset,
-            config_status,
-            value);
-    }
-
-    kb_module_t *modules[PACHAOS_CAPSULE_MAX_MODULES];
-    memset(modules, 0, sizeof(modules));
-    for (uint64_t i = 0; i < cfg->module_count; i++) {
-        const struct pachaos_capsule_module_config *module_cfg = &cfg->modules[i];
-        if (module_cfg->image_va == 0 || module_cfg->image_size == 0 || module_cfg->name[0] == '\0') {
-            fprintf(stderr, "[pachaos_capsule] invalid module slot=%llu\n", (unsigned long long)i);
-            return 4;
-        }
-        const kb_module_image_t image = {
-            .data = (const void *)(uintptr_t)module_cfg->image_va,
-            .size = (size_t)module_cfg->image_size,
-            .name = module_cfg->name,
-        };
-        status = kb_module_open_image(&image, backend, &modules[i]);
-        if (status != KB_OK || modules[i] == NULL) {
-            fprintf(stderr, "[pachaos_capsule] %s open failed status=%s(%d)\n",
-                module_cfg->name,
-                status_name(status),
-                status);
-            return 4;
-        }
-
-        int init_result = 0;
-        printf("[pachaos_capsule] %s init begin\n", module_cfg->name);
-        fflush(stdout);
-        status = kb_module_call_init(modules[i], &init_result);
-        if (status == KB_ERR_NOT_FOUND && i + 1u < cfg->module_count) {
-            printf("[pachaos_capsule] %s has no init_module\n", module_cfg->name);
-            continue;
-        }
-        printf("[pachaos_capsule] %s init returned status=%s(%d) result=%d\n",
-            module_cfg->name,
-            status_name(status),
-            status,
-            init_result);
-        fflush(stdout);
-        if (status != KB_OK || init_result != 0) {
-            fprintf(stderr,
-                "[pachaos_capsule] %s init failed status=%s(%d) result=%d\n",
-                module_cfg->name,
-                status_name(status),
-                status,
-                init_result);
-            return 5;
-        }
-    }
-
     printf("[pachaos_capsule] NVMe module stack loaded\n");
-    kb_shim_set_device_backend(backend);
     for (unsigned i = 0; i < 2048; i++) {
         kb_run_deferred_work();
         (void)kb_handle_any_irq(0);
@@ -209,6 +110,126 @@ int main(int argc, char **argv)
         verify[1],
         verify[2],
         verify[3]);
+    return 0;
+}
+
+static void log_pci_command(uint64_t device_fd, const char *label)
+{
+    uint32_t command = 0;
+    int status = pacha_capsule_pci_config_read((int)device_fd, 0x04, 2, &command);
+    printf("[pachaos_capsule] pci command %s status=%d value=0x%04x\n",
+        label,
+        status,
+        command & 0xffffu);
+}
+
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    const struct pachaos_capsule_boot_config *cfg =
+        (const struct pachaos_capsule_boot_config *)(uintptr_t)PACHAOS_CAPSULE_BOOT_CONFIG_VA;
+    if (cfg->magic != PACHAOS_CAPSULE_BOOT_CONFIG_MAGIC ||
+        cfg->version != PACHAOS_CAPSULE_BOOT_CONFIG_VERSION ||
+        cfg->device_fd < 16 ||
+        cfg->module_count == 0 ||
+        cfg->module_count > PACHAOS_CAPSULE_MAX_MODULES) {
+        fprintf(stderr,
+            "[pachaos_capsule] invalid boot config magic=0x%llx version=%llu fd=%llu modules=%llu\n",
+            (unsigned long long)cfg->magic,
+            (unsigned long long)cfg->version,
+            (unsigned long long)cfg->device_fd,
+            (unsigned long long)cfg->module_count);
+        return 2;
+    }
+
+    printf("[pachaos_capsule] start device_fd=%llu modules=%llu loader=%s\n",
+        (unsigned long long)cfg->device_fd,
+        (unsigned long long)cfg->module_count,
+        kb_module_loader_version());
+
+    kb_device_backend_t *backend = NULL;
+    kb_status_t status = kb_pachaos_capsule_device_create(cfg->device_fd, &backend);
+    if (status != KB_OK || backend == NULL) {
+        fprintf(stderr, "[pachaos_capsule] device backend create failed status=%d\n", status);
+        return 3;
+    }
+    kb_shim_set_device_backend(backend);
+
+    for (unsigned bar_index = 0; bar_index < 2; bar_index++) {
+        struct pacha_capsule_bar_info bar = {0};
+        int bar_status = pacha_capsule_pci_bar_info((int)cfg->device_fd, bar_index, &bar);
+        printf("[pachaos_capsule] pci bar%u status=%d start=0x%llx end=0x%llx size=0x%llx flags=0x%llx\n",
+            bar_index,
+            bar_status,
+            (unsigned long long)bar.start,
+            (unsigned long long)bar.end,
+            (unsigned long long)bar.size,
+            (unsigned long long)bar.flags);
+    }
+    for (uint16_t offset = 0x10; offset <= 0x14; offset += 4) {
+        uint32_t value = 0;
+        int config_status = pacha_capsule_pci_config_read((int)cfg->device_fd, offset, 4, &value);
+        printf("[pachaos_capsule] pci config[0x%02x] status=%d value=0x%08x\n",
+            offset,
+            config_status,
+            value);
+    }
+    log_pci_command(cfg->device_fd, "before-init");
+
+    kb_module_t *modules[PACHAOS_CAPSULE_MAX_MODULES];
+    memset(modules, 0, sizeof(modules));
+    for (uint64_t i = 0; i < cfg->module_count; i++) {
+        const struct pachaos_capsule_module_config *module_cfg = &cfg->modules[i];
+        if (module_cfg->image_va == 0 || module_cfg->image_size == 0 || module_cfg->name[0] == '\0') {
+            fprintf(stderr, "[pachaos_capsule] invalid module slot=%llu\n", (unsigned long long)i);
+            return 4;
+        }
+        const kb_module_image_t image = {
+            .data = (const void *)(uintptr_t)module_cfg->image_va,
+            .size = (size_t)module_cfg->image_size,
+            .name = module_cfg->name,
+        };
+        status = kb_module_open_image(&image, backend, &modules[i]);
+        if (status != KB_OK || modules[i] == NULL) {
+            fprintf(stderr, "[pachaos_capsule] %s open failed status=%s(%d)\n",
+                module_cfg->name,
+                status_name(status),
+                status);
+            return 4;
+        }
+
+        int init_result = 0;
+        printf("[pachaos_capsule] %s init begin\n", module_cfg->name);
+        fflush(stdout);
+        status = kb_module_call_init(modules[i], &init_result);
+        if (status == KB_ERR_NOT_FOUND && i + 1u < cfg->module_count) {
+            printf("[pachaos_capsule] %s has no init_module\n", module_cfg->name);
+            continue;
+        }
+        printf("[pachaos_capsule] %s init returned status=%s(%d) result=%d\n",
+            module_cfg->name,
+            status_name(status),
+            status,
+            init_result);
+        fflush(stdout);
+        if (status != KB_OK || init_result != 0) {
+            fprintf(stderr,
+                "[pachaos_capsule] %s init failed status=%s(%d) result=%d\n",
+                module_cfg->name,
+                status_name(status),
+                status,
+                init_result);
+            return 5;
+        }
+    }
+    log_pci_command(cfg->device_fd, "after-init");
+
+    int smoke_status = run_nvme_smoke();
+    if (smoke_status != 0) {
+        return smoke_status;
+    }
     fflush(stdout);
     fflush(stderr);
     for (;;) {

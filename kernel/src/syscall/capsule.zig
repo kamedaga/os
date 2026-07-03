@@ -97,10 +97,18 @@ fn mapPciBarIntoUser(proc: kernel.PrincipalId, user_va: u64, map_size: u64, flag
     const required_size = pageAlignUp((info.start - paddr) + info.size) orelse return false;
     if (map_size < required_size) return false;
     const size_usize: usize = @intCast(map_size);
-    if (user_vm.mapUserLinearRegion(proc, user_va, paddr, size_usize, true)) return true;
+    if (user_vm.mapUserUncachedLinearRegionWithProt(proc, user_va, paddr, size_usize, .{
+        .read = true,
+        .write = true,
+        .exec = false,
+    })) return true;
     if ((flags & capsule_abi.mmio_map_flag_replace_existing) == 0) return false;
     _ = user_vm.unmapUserLinearRegion(proc, user_va, size_usize);
-    return user_vm.mapUserLinearRegion(proc, user_va, paddr, size_usize, true);
+    return user_vm.mapUserUncachedLinearRegionWithProt(proc, user_va, paddr, size_usize, .{
+        .read = true,
+        .write = true,
+        .exec = false,
+    });
 }
 
 fn userDmaAddressForRange(

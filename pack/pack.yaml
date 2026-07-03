@@ -73,7 +73,6 @@ skip:
     - "musl_smoke"
     - "net_bench"
     - "net_status"
-    - "pachaos_capsule"
     - "pipe_probe"
     - "pipe_tools"
     - "rootfs_vfs"
@@ -319,6 +318,48 @@ apps:
     out: "EXT4.KO"
     bootfs: "/srv/kobox/ext4.ko"
     rootfs: "/usr/lib/kobox/ext4.ko"
+  kobox_virtio:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/virtio.ko"
+      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
+    out: "VIRTIO.KO"
+    bootfs: "/srv/kobox/virtio.ko"
+    rootfs: "/usr/lib/kobox/virtio.ko"
+  kobox_virtio_ring:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/virtio_ring.ko"
+      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
+    out: "VIRTRING.KO"
+    bootfs: "/srv/kobox/virtio_ring.ko"
+    rootfs: "/usr/lib/kobox/virtio_ring.ko"
+  kobox_virtio_pci:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/virtio_pci.ko"
+      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
+    out: "VIRTPCI.KO"
+    bootfs: "/srv/kobox/virtio_pci.ko"
+    rootfs: "/usr/lib/kobox/virtio_pci.ko"
+  kobox_failover:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/failover.ko"
+      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
+    out: "FAILOVER.KO"
+    bootfs: "/srv/kobox/failover.ko"
+    rootfs: "/usr/lib/kobox/failover.ko"
+  kobox_net_failover:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/net_failover.ko"
+      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
+    out: "NETFAIL.KO"
+    bootfs: "/srv/kobox/net_failover.ko"
+    rootfs: "/usr/lib/kobox/net_failover.ko"
+  kobox_virtio_net:
+    file:
+      path: ".artifacts/userland-fixtures/kobox-modules/virtio_net.ko"
+      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
+    out: "VIRTNET.KO"
+    bootfs: "/srv/kobox/virtio_net.ko"
+    rootfs: "/usr/lib/kobox/virtio_net.ko"
   kobox_run:
     file:
       path: ".artifacts/userland-fixtures/kobox/kobox-run.elf"
@@ -601,8 +642,9 @@ apps:
     role: "service"
     file:
       path: ".artifacts/cmake/pachaos_capsule/pachaos_capsule.elf"
-      rebuild: ["bash", "tools/build_pachaos_capsule.sh"]
+      rebuild: ["cmake", "--build", ".artifacts/cmake/pachaos_capsule", "--parallel", "1"]
       input:
+        - "userland/pachaos_capsule/CMakeLists.txt"
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
         - "userland/libpacha/include"
@@ -610,7 +652,26 @@ apps:
         - "userland/pachaos_capsule/src"
         - "userland/pachaos_capsule/include"
     out: "PCAPSULE.ELF"
+    bootfs: "/srv/pachaos_capsule.elf"
     rootfs: "/srv/pachaos_capsule.elf"
+  netd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/netd/netd.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/netd", "--parallel", "1"]
+      input:
+        - "userland/netd/CMakeLists.txt"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "userland/netd/src"
+        - "userland/netd/include"
+    out: "NETD.ELF"
+    bootfs: "/srv/netd.elf"
+    rootfs: "/srv/netd.elf"
   storage_boot:
     role: "service"
     file:
@@ -644,6 +705,7 @@ apps:
         - "musl/pachaos/include"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/seed0boot/src"
+        - "userland/netd/include"
         - "userland/pachaos_capsule/include"
         - "userland/storage_boot/include"
     out: "SEED0BT.ELF"
@@ -663,7 +725,6 @@ apps:
         - "userland/seed0root/CMakeLists.txt"
         - "userland/seed0root/src"
         - "userland/filed/include"
-        - "userland/koboxd/include"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
@@ -678,28 +739,6 @@ apps:
       rebuild: ["bash", "-lc", "mkdir -p .artifacts && printf 'lpr\\n' > .artifacts/seed0root_boot_profile.txt"]
     out: "BOOTPROFILE.TXT"
     rootfs: "/etc/pacha_boot_profile"
-  koboxd:
-    role: "service"
-    file:
-      path: ".artifacts/cmake/koboxd/koboxd.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/koboxd", "--parallel", "1"]
-      input:
-        - "userland/koboxd/CMakeLists.txt"
-        - "userland/koboxd/include"
-        - "userland/libcapsule/include"
-        - "userland/libcapsule/src"
-        - "userland/libpacha/include"
-        - "userland/libpacha/src"
-        - "_kobox/include"
-        - "_kobox/src"
-        - "musl/pachaos/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
-        - "userland/koboxd/src"
-        - "userland/filed/include"
-        - "userland/filed/src"
-        - "userland/personality/include"
-    out: "KOBOXD.ELF"
-    rootfs: "/sbin/koboxd.elf"
   filed:
     role: "service"
     file:
@@ -710,13 +749,19 @@ apps:
         - "userland/filed/include"
         - "userland/filed/src"
         - "userland/koboxd/include"
+        - "userland/koboxd/src"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
+        - "_kobox/include"
+        - "_kobox/src"
         - "musl/pachaos/include"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/personality/include"
+        - "userland/personality/linux/hde"
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
   net_bench:

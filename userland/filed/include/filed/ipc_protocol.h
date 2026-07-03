@@ -33,20 +33,24 @@ enum {
     FILED_WIRE_OP_RMDIR = 23,
     FILED_WIRE_OP_SYMLINK = 24,
     FILED_WIRE_OP_READLINK = 25,
-    FILED_WIRE_OP_SEEK = 26,
-    FILED_WIRE_OP_DUMP_METRICS = 27,
-    FILED_WIRE_OP_SET_CACHE_SLOTS = 28,
-    FILED_WIRE_OP_CONNECT = 29,
-    FILED_WIRE_OP_PING = 30,
-    FILED_WIRE_OP_FAST_DOORBELL = 31,
-    FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 32,
-    FILED_WIRE_OP_PWRITE_BATCH = 33,
-    FILED_WIRE_OP_WRITE_BATCH = 34,
-    FILED_WIRE_OP_PREAD_TO_VMO = 35,
-    FILED_WIRE_OP_FILE_VMO = 36,
+    FILED_WIRE_OP_LINK = 26,
+    FILED_WIRE_OP_SEEK = 27,
+    FILED_WIRE_OP_DUMP_METRICS = 28,
+    FILED_WIRE_OP_SET_CACHE_SLOTS = 29,
+    FILED_WIRE_OP_CONNECT = 30,
+    FILED_WIRE_OP_PING = 31,
+    FILED_WIRE_OP_FAST_DOORBELL = 32,
+    FILED_WIRE_OP_VALIDATE_OPEN_CACHE = 33,
+    FILED_WIRE_OP_PWRITE_BATCH = 34,
+    FILED_WIRE_OP_WRITE_BATCH = 35,
+    FILED_WIRE_OP_PREAD_TO_VMO = 36,
+    FILED_WIRE_OP_FILE_VMO = 37,
+    FILED_WIRE_OP_SYNC_ALL = 38,
 
     FILED_WIRE_NAME_BYTES = 96,
+    FILED_WIRE_PATH_BYTES = 480,
     FILED_WIRE_IO_BYTES = 7680,
+    FILED_WIRE_SYMLINK_TARGET_BYTES = FILED_WIRE_IO_BYTES,
     FILED_WIRE_DIRENT_NAME_BYTES = 96,
     FILED_WIRE_DIRENT_CAPACITY = 16,
     FILED_WIRE_PAGE_BYTES = 8192,
@@ -115,7 +119,7 @@ typedef struct filed_wire_openat {
     uint64_t object_generation;
     uint64_t dir_generation;
     uint64_t reserved0;
-    char name[FILED_WIRE_NAME_BYTES];
+    char name[FILED_WIRE_PATH_BYTES];
 } filed_wire_openat_t;
 
 typedef struct filed_wire_validate_open_cache {
@@ -252,40 +256,49 @@ typedef struct filed_wire_seek {
 typedef struct filed_wire_unlink {
     uint64_t dir_handle;
     uint64_t reserved0;
-    char name[FILED_WIRE_NAME_BYTES];
+    char name[FILED_WIRE_PATH_BYTES];
 } filed_wire_unlink_t;
 
 typedef struct filed_wire_mkdir {
     uint64_t dir_handle;
     uint64_t mode;
-    char name[FILED_WIRE_NAME_BYTES];
+    char name[FILED_WIRE_PATH_BYTES];
 } filed_wire_mkdir_t;
 
 typedef struct filed_wire_rmdir {
     uint64_t dir_handle;
     uint64_t reserved0;
-    char name[FILED_WIRE_NAME_BYTES];
+    char name[FILED_WIRE_PATH_BYTES];
 } filed_wire_rmdir_t;
 
 typedef struct filed_wire_symlink {
     uint64_t dir_handle;
     uint64_t target_length;
-    char name[FILED_WIRE_NAME_BYTES];
-    char target[FILED_WIRE_NAME_BYTES];
+    char name[FILED_WIRE_PATH_BYTES];
+    char target[FILED_WIRE_SYMLINK_TARGET_BYTES];
 } filed_wire_symlink_t;
 
 typedef struct filed_wire_readlink {
     uint64_t dir_handle;
     uint64_t target_length;
-    char name[FILED_WIRE_NAME_BYTES];
-    char target[FILED_WIRE_NAME_BYTES];
+    char name[FILED_WIRE_PATH_BYTES];
+    char target[FILED_WIRE_SYMLINK_TARGET_BYTES];
 } filed_wire_readlink_t;
+
+typedef struct filed_wire_link {
+    uint64_t old_dir_handle;
+    uint64_t new_dir_handle;
+    uint64_t flags;
+    uint64_t reserved0;
+    char old_name[FILED_WIRE_PATH_BYTES];
+    char new_name[FILED_WIRE_PATH_BYTES];
+} filed_wire_link_t;
 
 typedef struct filed_wire_rename {
     uint64_t old_dir_handle;
     uint64_t new_dir_handle;
-    char old_name[FILED_WIRE_NAME_BYTES];
-    char new_name[FILED_WIRE_NAME_BYTES];
+    char old_name[FILED_WIRE_PATH_BYTES];
+    char new_name[FILED_WIRE_PATH_BYTES];
 } filed_wire_rename_t;
 
 typedef struct filed_wire_handle_flags {
@@ -335,7 +348,7 @@ typedef struct filed_wire_exec_path {
     uint64_t envc;
     uint64_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
     filed_wire_exec_fd_patch_t fd_patches[FILED_WIRE_EXEC_MAX_FD_PATCHES];
-    char path[FILED_WIRE_NAME_BYTES];
+    char path[FILED_WIRE_PATH_BYTES];
     filed_wire_exec_string_ref_t argv[FILED_WIRE_EXEC_MAX_ARGS];
     filed_wire_exec_string_ref_t envp[FILED_WIRE_EXEC_MAX_ENVS];
     char strings[FILED_WIRE_EXEC_STRING_BYTES];

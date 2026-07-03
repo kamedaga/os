@@ -111,6 +111,13 @@ int main(int argc, char **argv)
     }
 
     printf("[seed0boot] storage_boot started\n");
+    printf("[seed0boot] netd starting\n");
+    capsule_status = seed0_launch_netd();
+    if (capsule_status != 0) {
+        fprintf(stderr, "[seed0boot] netd launch failed status=%d\n", capsule_status);
+        return 18;
+    }
+    printf("[seed0boot] netd started\n");
     printf("[seed0boot] ready\n");
     fflush(stdout);
     fflush(stderr);

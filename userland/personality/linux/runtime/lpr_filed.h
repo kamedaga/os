@@ -33,6 +33,7 @@ int64_t lpr_linux_unlinkat(uint64_t dirfd, uint64_t path, uint64_t flags);
 int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path);
 int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64_t group, uint64_t flags);
 int64_t lpr_linux_symlinkat(uint64_t target, uint64_t new_dirfd, uint64_t linkpath);
+int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path, uint64_t flags);
 int64_t lpr_linux_pipe2(uint64_t fds, uint64_t flags);
 int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec);
 int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls);
