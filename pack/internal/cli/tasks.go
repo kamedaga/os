@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -346,7 +347,7 @@ func smokeTestCommand(ctx *context) *cobra.Command {
 			return runSmokeTest(ctx, timeout, marker, noKVM, false)
 		},
 	}
-	cmd.Flags().DurationVar(&timeout, "timeout", 45*time.Second, "maximum time to wait for the smoke marker")
+	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "maximum time to wait for the smoke marker")
 	cmd.Flags().StringVar(&marker, "marker", "[seed2_root] manifest scheduler done", "serial log marker required for success")
 	cmd.Flags().BoolVar(&noKVM, "no-kvm", false, "run QEMU without KVM")
 	return cmd
@@ -480,7 +481,7 @@ func createSeed0rootProfileDiskScratch(ctx *context, profile string) (string, er
 }
 
 func restoreSeed0rootBootProfile(ctx *context) error {
-	if err := writeSeed0rootBootProfile(ctx, "normal"); err != nil {
+	if err := writeSeed0rootBootProfile(ctx, ""); err != nil {
 		return err
 	}
 	ui.Task("restore:seed0root-profile")
@@ -533,8 +534,8 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().DurationVar(&opts.Timeout, "timeout", 60*time.Second, "maximum time to wait for boot and console expectations")
-	cmd.Flags().StringVar(&opts.BootMarker, "boot-marker", "[seed2_root] manifest scheduler done", "serial log marker required before sending input")
+	cmd.Flags().DurationVar(&opts.Timeout, "timeout", 30*time.Second, "maximum time to wait for boot and console expectations")
+	cmd.Flags().StringVar(&opts.BootMarker, "boot-marker", "[seed0boot] hvc console spawn status=0", "serial log marker required before sending input")
 	cmd.Flags().StringArrayVar(&opts.Send, "send", nil, "string to send to the TTY; repeatable")
 	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "console output substring required for success; repeatable")
 	cmd.Flags().StringVar(&opts.Python, "python", "", "python3 script for detailed TTY testing")
@@ -874,6 +875,103 @@ func runBootfsSync(ctx *context, force bool) error {
 		{"bytes", fmt.Sprint(image.Bytes)},
 	})
 
+	if err := syncBootfsToLimineImage(ctx, image.Path); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func syncBootfsToLimineImage(ctx *context, bootfsPath string) error {
+	const limineFatPartitionByte = int64(2 * 1024 * 1024)
+	liminePath := ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot.img")
+	if _, err := os.Stat(liminePath); err != nil {
+		if os.IsNotExist(err) {
+			ui.KeyValues("Limine ESP", [][2]string{
+				{"state", "skipped"},
+				{"reason", "limine image missing"},
+			})
+			return nil
+		}
+		return err
+	}
+
+	initApp, ok := bootInitApp(ctx)
+	if !ok {
+		return fmt.Errorf("missing enabled boot app")
+	}
+	kernelStep := ctx.workspace.Kernel.Step
+	if kernelStep == "" {
+		kernelStep = "limine"
+	}
+	kernelPath := filepath.Join(ctx.workspace.Path(ctx.workspace.Kernel.Dir), "zig-out", "bin", kernelStep)
+	if kernelStep == "limine" {
+		kernelPath = filepath.Join(ctx.workspace.Path(ctx.workspace.Kernel.Dir), "zig-out", "bin", "limine", "pacha-kernel.elf")
+	}
+	initPath := ctx.workspace.ArtifactPath(initApp)
+	configPath := ctx.workspace.Path(ctx.workspace.Artifacts, "limine.conf")
+	for _, path := range []string{kernelPath, initPath, bootfsPath, configPath} {
+		if info, err := os.Stat(path); err != nil {
+			return err
+		} else if info.Size() == 0 {
+			return fmt.Errorf("empty limine input: %s", path)
+		}
+	}
+
+	ui.Task("sync:limine-esp")
+	tmpDir, err := os.MkdirTemp(ctx.workspace.Path(ctx.workspace.Artifacts), "limine-esp-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	mtoolsImage := fmt.Sprintf("%s@@%d", liminePath, limineFatPartitionByte)
+	limineBios := filepath.Join(tmpDir, "limine-bios.sys")
+	bootx64 := filepath.Join(tmpDir, "BOOTX64.EFI")
+	if err := runExternal("mcopy", "-o", "-i", mtoolsImage, "::/limine-bios.sys", limineBios); err != nil {
+		return err
+	}
+	if err := runExternal("mcopy", "-o", "-i", mtoolsImage, "::/EFI/BOOT/BOOTX64.EFI", bootx64); err != nil {
+		return err
+	}
+	if err := runExternal("mformat", "-i", mtoolsImage, "-F", "-v", "LIMINEBOOT", "::"); err != nil {
+		return err
+	}
+	if err := runExternal("mmd", "-i", mtoolsImage, "::/EFI"); err != nil {
+		return err
+	}
+	if err := runExternal("mmd", "-i", mtoolsImage, "::/EFI/BOOT"); err != nil {
+		return err
+	}
+	copies := [][2]string{
+		{limineBios, "::/limine-bios.sys"},
+		{bootx64, "::/EFI/BOOT/BOOTX64.EFI"},
+		{kernelPath, "::/KERNEL.ELF"},
+		{initPath, "::/INITAPP.ELF"},
+		{bootfsPath, "::/BOOTFS.IMG"},
+		{configPath, "::/limine.conf"},
+	}
+	for _, item := range copies {
+		if err := runExternal("mcopy", "-o", "-i", mtoolsImage, item[0], item[1]); err != nil {
+			return err
+		}
+	}
+	ui.KeyValues("Limine ESP", [][2]string{
+		{"state", "synced"},
+		{"image", ctx.workspace.Rel(liminePath)},
+		{"bootfs", ctx.workspace.Rel(bootfsPath)},
+	})
+	return nil
+}
+
+func runExternal(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	var combined bytes.Buffer
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s %s failed: %w\n%s", name, strings.Join(args, " "), err, combined.String())
+	}
 	return nil
 }
 

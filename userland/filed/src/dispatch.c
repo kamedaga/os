@@ -18,6 +18,8 @@
 enum {
     FILED_BOOTSTRAP_PATCH_BYTES = 4096,
     FILED_EXEC_FILED_ENDPOINT_FD = 240,
+    FILED_EXEC_NETD_SOCKET_ENDPOINT_FD = 241,
+    FILED_EXEC_TERMD_TTY_ENDPOINT_FD = 242,
     FILED_METRIC_OP_MAX = 64,
     FILED_PAGE_CACHE_BYTES = 16384,
     FILED_PAGE_CACHE_SLOTS = 64,
@@ -553,6 +555,8 @@ static const char *filed_op_name(uint64_t op)
     case FILED_WIRE_OP_DUMP_METRICS: return "dump_metrics";
     case FILED_WIRE_OP_SET_CACHE_SLOTS: return "set_cache_slots";
     case FILED_WIRE_OP_CONNECT: return "connect";
+    case FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT: return "set_netd_socket_endpoint";
+    case FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT: return "set_termd_tty_endpoint";
     case FILED_WIRE_OP_PING: return "ping";
     case FILED_WIRE_OP_FAST_DOORBELL: return "fast_doorbell";
     case FILED_WIRE_OP_VALIDATE_OPEN_CACHE: return "validate_open_cache";
@@ -1937,6 +1941,98 @@ static int filed_dispatch_set_inherit(int fd, int enabled)
         enabled ? PACHA_FD_FLAG_INHERIT : 0,
         PACHA_FD_FLAG_INHERIT);
     return status == 0 ? 0 : -22;
+}
+
+static int filed_dispatch_dup_endpoint_to_fixed(
+    int source_fd,
+    int target_fd,
+    int *out_fd)
+{
+    if (out_fd != NULL) {
+        *out_fd = -1;
+    }
+    if (source_fd < 16 || target_fd < 16) {
+        return -22;
+    }
+    (void)pacha_fd_close(target_fd);
+    const uint64_t endpoint_rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_SEND |
+        PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_TRANSFER;
+    const long dup_fd = pacha_fd_fcntl(
+        source_fd,
+        PACHA_FD_FCNTL_DUP,
+        (uint64_t)(uint32_t)target_fd,
+        endpoint_rights);
+    if (dup_fd != target_fd) {
+        fprintf(stderr,
+            "[filed] endpoint dup failed source=%d target=%d result=%ld\n",
+            source_fd,
+            target_fd,
+            dup_fd);
+        if (dup_fd >= 16) {
+            (void)pacha_fd_close((int)dup_fd);
+        }
+        return -24;
+    }
+    if (filed_dispatch_set_inherit((int)dup_fd, 1) != 0) {
+        fprintf(stderr,
+            "[filed] endpoint inherit failed fd=%ld source=%d target=%d\n",
+            dup_fd,
+            source_fd,
+            target_fd);
+        (void)pacha_fd_close((int)dup_fd);
+        return -13;
+    }
+    if (out_fd != NULL) {
+        *out_fd = (int)dup_fd;
+    }
+    return 0;
+}
+
+static int filed_dispatch_prepare_endpoint_to_fixed(
+    int source_fd,
+    int target_fd,
+    int *out_fd,
+    int *out_borrowed)
+{
+    if (out_fd != NULL) {
+        *out_fd = -1;
+    }
+    if (out_borrowed != NULL) {
+        *out_borrowed = 0;
+    }
+    if (source_fd < 16 || target_fd < 16 || out_fd == NULL || out_borrowed == NULL) {
+        return -22;
+    }
+    if (source_fd == target_fd) {
+        const int status = filed_dispatch_set_inherit(source_fd, 1);
+        if (status != 0) {
+            return status;
+        }
+        *out_fd = source_fd;
+        *out_borrowed = 1;
+        return 0;
+    }
+    return filed_dispatch_dup_endpoint_to_fixed(source_fd, target_fd, out_fd);
+}
+
+static void filed_dispatch_close_prepared_endpoint(int *fd, int borrowed)
+{
+    if (fd == NULL || *fd < 16) {
+        return;
+    }
+    (void)filed_dispatch_set_inherit(*fd, 0);
+    if (!borrowed) {
+        (void)pacha_fd_close(*fd);
+    }
+    *fd = -1;
 }
 
 static int64_t filed_status_to_wire(filed_status_t status)
@@ -3655,7 +3751,7 @@ static int filed_dispatch_pread_to_vmo(
 {
     int page_fd = -1;
     if (request == NULL ||
-        request->fd_count < 2 ||
+        request->fd_count < 1 ||
         request->fds == NULL ||
         request->fds[1].fd < 16)
     {
@@ -5340,6 +5436,11 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     int process_fd = -1;
     int thread_fd = -1;
     int exec_filed_endpoint_fd = -1;
+    int exec_netd_socket_endpoint_fd = -1;
+    int exec_termd_tty_endpoint_fd = -1;
+    int exec_filed_endpoint_borrowed = 0;
+    int exec_netd_socket_endpoint_borrowed = 0;
+    int exec_termd_tty_endpoint_borrowed = 0;
     filed_handle_id_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
@@ -5383,34 +5484,37 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
         inherit_handles[i] = dup_handle;
     }
 
-    if (runtime->client_endpoint_fd >= 16 &&
-        runtime->client_endpoint_fd != FILED_EXEC_FILED_ENDPOINT_FD)
-    {
-        const uint64_t endpoint_rights =
-            PACHA_FD_RIGHT_INSPECT |
-            PACHA_FD_RIGHT_WAIT |
-            PACHA_FD_RIGHT_POLL |
-            PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_SEND |
-            PACHA_FD_RIGHT_RECV |
-            PACHA_FD_RIGHT_SET_FLAGS |
-            PACHA_FD_RIGHT_CALL |
-            PACHA_FD_RIGHT_TRANSFER;
-        const long dup_fd = pacha_fd_fcntl(
+    if (runtime->client_endpoint_fd >= 16) {
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
             runtime->client_endpoint_fd,
-            PACHA_FD_FCNTL_DUP,
             FILED_EXEC_FILED_ENDPOINT_FD,
-            endpoint_rights);
-        if (dup_fd != FILED_EXEC_FILED_ENDPOINT_FD) {
-            if (dup_fd >= 16) {
-                (void)pacha_fd_close((int)dup_fd);
-            }
-            reply_status = -24;
+            &exec_filed_endpoint_fd,
+            &exec_filed_endpoint_borrowed);
+        if (reply_status != 0) {
             goto out;
         }
-        exec_filed_endpoint_fd = (int)dup_fd;
-        if (filed_dispatch_set_inherit(exec_filed_endpoint_fd, 1) != 0) {
-            reply_status = -13;
+    }
+    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+        runtime->netd_socket_endpoint_fd >= 16)
+    {
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
+            runtime->netd_socket_endpoint_fd,
+            FILED_EXEC_NETD_SOCKET_ENDPOINT_FD,
+            &exec_netd_socket_endpoint_fd,
+            &exec_netd_socket_endpoint_borrowed);
+        if (reply_status != 0) {
+            goto out;
+        }
+    }
+    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+        runtime->termd_tty_endpoint_fd >= 16)
+    {
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
+            runtime->termd_tty_endpoint_fd,
+            FILED_EXEC_TERMD_TTY_ENDPOINT_FD,
+            &exec_termd_tty_endpoint_fd,
+            &exec_termd_tty_endpoint_borrowed);
+        if (reply_status != 0) {
             goto out;
         }
     }
@@ -5443,10 +5547,9 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     filed_close_walk_handle(runtime, open_result.handle_id, 1);
 
 out:
-    if (exec_filed_endpoint_fd >= 16) {
-        (void)filed_dispatch_set_inherit(exec_filed_endpoint_fd, 0);
-        (void)pacha_fd_close(exec_filed_endpoint_fd);
-    }
+    filed_dispatch_close_prepared_endpoint(&exec_filed_endpoint_fd, exec_filed_endpoint_borrowed);
+    filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
+    filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
     if (reply_status != 0) {
         for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
@@ -5486,6 +5589,11 @@ static int filed_dispatch_exec_path(
     int thread_fd = -1;
     int bootstrap_fd = -1;
     int exec_filed_endpoint_fd = -1;
+    int exec_netd_socket_endpoint_fd = -1;
+    int exec_termd_tty_endpoint_fd = -1;
+    int exec_filed_endpoint_borrowed = 0;
+    int exec_netd_socket_endpoint_borrowed = 0;
+    int exec_termd_tty_endpoint_borrowed = 0;
     int inherit_fds[FILED_WIRE_EXEC_MAX_INHERIT_FDS];
     filed_handle_id_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
     memset(inherit_fds, 0, sizeof(inherit_fds));
@@ -5566,34 +5674,40 @@ static int filed_dispatch_exec_path(
 
     if ((exec->flags & FILED_WIRE_EXEC_INHERIT_FDS) == 0 &&
         inherit_fd_count == 0 &&
-        runtime->client_endpoint_fd >= 16 &&
-        runtime->client_endpoint_fd != FILED_EXEC_FILED_ENDPOINT_FD)
+        runtime->client_endpoint_fd >= 16)
     {
-        const uint64_t endpoint_rights =
-            PACHA_FD_RIGHT_INSPECT |
-            PACHA_FD_RIGHT_WAIT |
-            PACHA_FD_RIGHT_POLL |
-            PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_SEND |
-            PACHA_FD_RIGHT_RECV |
-            PACHA_FD_RIGHT_SET_FLAGS |
-            PACHA_FD_RIGHT_CALL |
-            PACHA_FD_RIGHT_TRANSFER;
-        const long dup_fd = pacha_fd_fcntl(
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
             runtime->client_endpoint_fd,
-            PACHA_FD_FCNTL_DUP,
             FILED_EXEC_FILED_ENDPOINT_FD,
-            endpoint_rights);
-        if (dup_fd != FILED_EXEC_FILED_ENDPOINT_FD) {
-            if (dup_fd >= 16) {
-                (void)pacha_fd_close((int)dup_fd);
-            }
-            reply_status = -24;
+            &exec_filed_endpoint_fd,
+            &exec_filed_endpoint_borrowed);
+        if (reply_status != 0) {
             goto out;
         }
-        exec_filed_endpoint_fd = (int)dup_fd;
-        if (filed_dispatch_set_inherit(exec_filed_endpoint_fd, 1) != 0) {
-            reply_status = -13;
+    }
+    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+        inherit_fd_count == 0 &&
+        runtime->netd_socket_endpoint_fd >= 16)
+    {
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
+            runtime->netd_socket_endpoint_fd,
+            FILED_EXEC_NETD_SOCKET_ENDPOINT_FD,
+            &exec_netd_socket_endpoint_fd,
+            &exec_netd_socket_endpoint_borrowed);
+        if (reply_status != 0) {
+            goto out;
+        }
+    }
+    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+        inherit_fd_count == 0 &&
+        runtime->termd_tty_endpoint_fd >= 16)
+    {
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
+            runtime->termd_tty_endpoint_fd,
+            FILED_EXEC_TERMD_TTY_ENDPOINT_FD,
+            &exec_termd_tty_endpoint_fd,
+            &exec_termd_tty_endpoint_borrowed);
+        if (reply_status != 0) {
             goto out;
         }
     }
@@ -5678,10 +5792,9 @@ static int filed_dispatch_exec_path(
     }
 
 out:
-    if (exec_filed_endpoint_fd >= 16) {
-        (void)filed_dispatch_set_inherit(exec_filed_endpoint_fd, 0);
-        (void)pacha_fd_close(exec_filed_endpoint_fd);
-    }
+    filed_dispatch_close_prepared_endpoint(&exec_filed_endpoint_fd, exec_filed_endpoint_borrowed);
+    filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
+    filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
     (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (bootstrap_fd >= 16) {
@@ -5784,6 +5897,50 @@ static int filed_dispatch_connect(
     return filed_send_reply(reply_fd, request->word3, reply_status, result);
 }
 
+static int filed_dispatch_set_netd_socket_endpoint(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    if (runtime == NULL ||
+        request == NULL ||
+        request->fds == NULL ||
+        request->fd_count < 1 ||
+        request->fds[0].fd < 16)
+    {
+        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
+    }
+
+    const int endpoint_fd = (int)request->fds[0].fd;
+    if (runtime->netd_socket_endpoint_fd >= 16) {
+        (void)pacha_fd_close(runtime->netd_socket_endpoint_fd);
+    }
+    runtime->netd_socket_endpoint_fd = endpoint_fd;
+    return filed_send_reply(reply_fd, request->word3, 0, (uint64_t)(uint32_t)endpoint_fd);
+}
+
+static int filed_dispatch_set_termd_tty_endpoint(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    if (runtime == NULL ||
+        request == NULL ||
+        request->fds == NULL ||
+        request->fd_count < 1 ||
+        request->fds[0].fd < 16)
+    {
+        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
+    }
+
+    const int endpoint_fd = (int)request->fds[0].fd;
+    if (runtime->termd_tty_endpoint_fd >= 16) {
+        (void)pacha_fd_close(runtime->termd_tty_endpoint_fd);
+    }
+    runtime->termd_tty_endpoint_fd = endpoint_fd;
+    return filed_send_reply(reply_fd, request->word3, 0, (uint64_t)(uint32_t)endpoint_fd);
+}
+
 static filed_page_dispatch_result_t filed_dispatch_session_page(
     filed_runtime_t *runtime,
     const struct pacha_ipc_msg *request,
@@ -5846,6 +6003,9 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_close_page(runtime, request);
     case FILED_WIRE_OP_SYNC_ALL:
         return filed_page_result(filed_kobox_backend_sync_all(&runtime->backend), 0);
+    case FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT:
+    case FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT:
+        return filed_page_result(-95, 0);
     default:
         return filed_page_result(-95, 0);
     }
@@ -6285,6 +6445,12 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
         break;
     case FILED_WIRE_OP_CONNECT:
         dispatch_status = filed_dispatch_connect(runtime, reply_fd, &request);
+        break;
+    case FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT:
+        dispatch_status = filed_dispatch_set_netd_socket_endpoint(runtime, reply_fd, &request);
+        break;
+    case FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT:
+        dispatch_status = filed_dispatch_set_termd_tty_endpoint(runtime, reply_fd, &request);
         break;
     case FILED_WIRE_OP_PING:
         dispatch_status = filed_send_reply(reply_fd, request.word3, 0, request.word2);

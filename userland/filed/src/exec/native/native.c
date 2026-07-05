@@ -1167,13 +1167,14 @@ static int filed_exec_start_plan(
         return -12;
     }
     memset(stack, 0, (size_t)PACHA_PROCESS_DEFAULT_STACK_SIZE);
-    const long stack_map = pacha_process_map(
+    const long stack_map = pacha_process_map_flags(
         plan->process_fd,
         stack_fd,
         PACHA_PROCESS_MAP_ANYWHERE,
         PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
-        0);
+        0,
+        PACHA_PROCESS_MAP_PRIVATE);
     if (stack_map < 4096) {
         (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);

@@ -14,6 +14,7 @@
 
 enum {
     SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
+    SEED0ROOT_STORAGE_READY_MAGIC = 0x3159445252545330ull,
     SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
     SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
     SEED0ROOT_FILED_STORAGE_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
@@ -53,6 +54,9 @@ enum {
     SEED0ROOT_BOOT_PROFILE_DYN_NEEDED = 1u << 5,
     SEED0ROOT_BOOT_PROFILE_CHIBICC = 1u << 6,
     SEED0ROOT_BOOT_PROFILE_APK = 1u << 7,
+    SEED0ROOT_BOOT_PROFILE_CURL = 1u << 8,
+    SEED0ROOT_BOOT_PROFILE_HTTPS = 1u << 9,
+    SEED0ROOT_BOOT_PROFILE_APK_UPDATE = 1u << 10,
 };
 
 struct seed0root_bootstrap_module {
@@ -64,6 +68,7 @@ struct seed0root_bootstrap_module {
 struct seed0root_bootstrap {
     uint64_t magic;
     uint64_t device_fd;
+    uint64_t ready_channel_fd;
     uint64_t filed_image_fd;
     uint64_t filed_image_size;
     uint64_t module_count;
@@ -806,7 +811,24 @@ static int seed0root_read_filed_text(
 
 static int seed0root_profile_has_token(const char *profile, const char *token)
 {
-    return profile != NULL && token != NULL && strstr(profile, token) != NULL;
+    if (profile == NULL || token == NULL || token[0] == '\0') {
+        return 0;
+    }
+    const size_t token_len = strlen(token);
+    const char *p = profile;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') {
+            p++;
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != ',') {
+            p++;
+        }
+        if ((size_t)(p - start) == token_len && memcmp(start, token, token_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
@@ -851,6 +873,16 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
     }
     if (seed0root_profile_has_token(profile, "apk")) {
         flags |= SEED0ROOT_BOOT_PROFILE_APK;
+    }
+    if (seed0root_profile_has_token(profile, "apk-update")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_APK_UPDATE;
+    }
+    if (seed0root_profile_has_token(profile, "curl")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_CURL;
+    }
+    if (seed0root_profile_has_token(profile, "https") ||
+        seed0root_profile_has_token(profile, "curl-https")) {
+        flags |= SEED0ROOT_BOOT_PROFILE_HTTPS;
     }
     printf("[seed0root] boot profile flags=%u\n", flags);
     return flags;
@@ -1007,7 +1039,20 @@ static int seed0root_exec_add_string(
     return 0;
 }
 
-static int seed0root_run_exec_path_smoke_expect(
+static int seed0root_exit_code_expected(uint64_t exit_code, const uint64_t *expected_exits, uint64_t expected_count)
+{
+    if (expected_exits == NULL || expected_count == 0) {
+        return exit_code == 0;
+    }
+    for (uint64_t i = 0; i < expected_count; i++) {
+        if (exit_code == expected_exits[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int seed0root_run_exec_path_smoke_expect_any(
     int filed_endpoint_fd,
     const char *path,
     const char *const *argv,
@@ -1015,7 +1060,8 @@ static int seed0root_run_exec_path_smoke_expect(
     const char *env,
     const char *label,
     uint64_t exec_flags,
-    uint64_t expected_exit)
+    const uint64_t *expected_exits,
+    uint64_t expected_count)
 {
     if (filed_endpoint_fd < 16 || path == NULL || label == NULL ||
         argc > FILED_WIRE_EXEC_MAX_ARGS)
@@ -1103,7 +1149,7 @@ static int seed0root_run_exec_path_smoke_expect(
     status = seed0root_wait_process(process_fd, label, &wait_result);
     if (status == -5 &&
         wait_result.state == SEED0ROOT_TASK_STATE_EXITED &&
-        wait_result.exit_code == expected_exit)
+        seed0root_exit_code_expected(wait_result.exit_code, expected_exits, expected_count))
     {
         status = 0;
     }
@@ -1136,6 +1182,29 @@ static int seed0root_run_exec_path_smoke_expect(
     (void)pacha_fd_close(thread_fd);
     (void)pacha_fd_close(process_fd);
     return status;
+}
+
+static int seed0root_run_exec_path_smoke_expect(
+    int filed_endpoint_fd,
+    const char *path,
+    const char *const *argv,
+    uint64_t argc,
+    const char *env,
+    const char *label,
+    uint64_t exec_flags,
+    uint64_t expected_exit)
+{
+    const uint64_t expected_exits[] = {expected_exit};
+    return seed0root_run_exec_path_smoke_expect_any(
+        filed_endpoint_fd,
+        path,
+        argv,
+        argc,
+        env,
+        label,
+        exec_flags,
+        expected_exits,
+        1);
 }
 
 static int seed0root_run_exec_path_smoke(
@@ -1229,6 +1298,19 @@ static int seed0root_run_lpr_ldmusl_smoke(int filed_endpoint_fd)
         FILED_WIRE_EXEC_LINUX_LPR);
 }
 
+static int seed0root_run_lpr_pty_probe(int filed_endpoint_fd)
+{
+    const char *argv[] = { "/cmd/lpr_pty_probe.elf" };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/lpr_pty_probe.elf",
+        argv,
+        1,
+        "LD_LIBRARY_PATH=/lib/linux",
+        "lpr pty probe",
+        FILED_WIRE_EXEC_LINUX_LPR);
+}
+
 static int seed0root_run_lpr_busybox_command(
     int filed_endpoint_fd,
     const char *label,
@@ -1283,6 +1365,18 @@ static int seed0root_run_lpr_busybox_dynamic_smoke(int filed_endpoint_fd)
         "/etc/pacha_boot_profile",
     };
     status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox cat", cat_argv, 3);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *stty_argv[] = {
+        "busybox",
+        "stty",
+        "-F",
+        "/dev/ptmx",
+        "-a",
+    };
+    status = seed0root_run_lpr_busybox_command(filed_endpoint_fd, "lpr busybox stty ptmx", stty_argv, 5);
     if (status != 0) {
         return status;
     }
@@ -1460,6 +1554,238 @@ static int seed0root_run_lpr_dyn_needed_smoke(int filed_endpoint_fd)
         FILED_WIRE_EXEC_LINUX_LPR);
 }
 
+static int seed0root_run_curl_example(int filed_endpoint_fd)
+{
+    const char *argv[] = {
+        "curl",
+        "-sS",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "20",
+        "http://example.com/",
+    };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/curl.elf",
+        argv,
+        7,
+        "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
+        "curl example.com workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+}
+
+static void seed0root_log_curl_timing(int filed_endpoint_fd, const char *path)
+{
+    char timing[512];
+    const int status = seed0root_read_filed_text(filed_endpoint_fd, path, timing, sizeof(timing));
+    if (status != 0) {
+        printf("[seed0root] curl timing read failed path=%s status=%d\n", path, status);
+        return;
+    }
+    size_t len = strlen(timing);
+    if (len == 0 || timing[len - 1] != '\n') {
+        if (len + 1 < sizeof(timing)) {
+            timing[len++] = '\n';
+            timing[len] = '\0';
+        }
+    }
+    printf("[seed0root] curl timing %s", timing);
+}
+
+static int seed0root_run_curl_https_expected_failure(
+    int filed_endpoint_fd,
+    const char *url,
+    const char *cacert_path,
+    const char *body_path,
+    const char *timing_path,
+    const char *timing_format,
+    const char *label,
+    const uint64_t *expected_exits,
+    uint64_t expected_count,
+    const char *connect_timeout,
+    const char *max_time)
+{
+    const char *argv[] = {
+        "curl",
+        "-sS",
+        "--http1.1",
+        "--connect-timeout",
+        connect_timeout,
+        "--max-time",
+        max_time,
+        "--cacert",
+        cacert_path,
+        "--output",
+        body_path,
+        "--write-out",
+        timing_format,
+        url,
+    };
+    const int status = seed0root_run_exec_path_smoke_expect_any(
+        filed_endpoint_fd,
+        "/cmd/curl.elf",
+        argv,
+        14,
+        "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
+        label,
+        FILED_WIRE_EXEC_LINUX_LPR,
+        expected_exits,
+        expected_count);
+    seed0root_log_curl_timing(filed_endpoint_fd, timing_path);
+    return status;
+}
+
+static int seed0root_run_curl_https_example(int filed_endpoint_fd)
+{
+    const char *head_timing_format =
+        "%output{/tmp/curl-https-head.timing}"
+        "curl_phase=HEAD url=%{url_effective} http=%{http_code} "
+        "dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} "
+        "pretransfer=%{time_pretransfer} first_byte=%{time_starttransfer} "
+        "total=%{time_total} exit=%{exitcode} error=%{errormsg}\n";
+    const char *get_timing_format =
+        "%output{/tmp/curl-https-get.timing}"
+        "curl_phase=GET url=%{url_effective} http=%{http_code} "
+        "dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} "
+        "pretransfer=%{time_pretransfer} first_byte=%{time_starttransfer} "
+        "total=%{time_total} exit=%{exitcode} error=%{errormsg}\n";
+    const char *cert_failure_timing_format =
+        "%output{/tmp/curl-https-cert-failure.timing}"
+        "curl_phase=CERT_FAILURE url=%{url_effective} http=%{http_code} "
+        "dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} "
+        "pretransfer=%{time_pretransfer} first_byte=%{time_starttransfer} "
+        "total=%{time_total} exit=%{exitcode} error=%{errormsg}\n";
+    const char *dns_failure_timing_format =
+        "%output{/tmp/curl-https-dns-failure.timing}"
+        "curl_phase=DNS_FAILURE url=%{url_effective} http=%{http_code} "
+        "dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} "
+        "pretransfer=%{time_pretransfer} first_byte=%{time_starttransfer} "
+        "total=%{time_total} exit=%{exitcode} error=%{errormsg}\n";
+    const char *timeout_timing_format =
+        "%output{/tmp/curl-https-connect-timeout.timing}"
+        "curl_phase=CONNECT_TIMEOUT url=%{url_effective} http=%{http_code} "
+        "dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} "
+        "pretransfer=%{time_pretransfer} first_byte=%{time_starttransfer} "
+        "total=%{time_total} exit=%{exitcode} error=%{errormsg}\n";
+    const char *head_argv[] = {
+        "curl",
+        "-sS",
+        "--fail",
+        "--http1.1",
+        "-I",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "30",
+        "--cacert",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "--output",
+        "/tmp/curl-https-head.headers",
+        "--write-out",
+        head_timing_format,
+        "https://example.com/",
+    };
+    int status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/curl.elf",
+        head_argv,
+        16,
+        "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
+        "curl https example.com HEAD workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    seed0root_log_curl_timing(filed_endpoint_fd, "/tmp/curl-https-head.timing");
+    if (status != 0) {
+        return status;
+    }
+
+    const char *get_argv[] = {
+        "curl",
+        "-sS",
+        "--fail",
+        "--http1.1",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "30",
+        "--cacert",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "--output",
+        "/tmp/curl-https-get.body",
+        "--write-out",
+        get_timing_format,
+        "https://example.com/",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/curl.elf",
+        get_argv,
+        15,
+        "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
+        "curl https example.com GET workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    seed0root_log_curl_timing(filed_endpoint_fd, "/tmp/curl-https-get.timing");
+    if (status != 0) {
+        return status;
+    }
+
+    const uint64_t cert_failure_exits[] = {60, 77};
+    status = seed0root_run_curl_https_expected_failure(
+        filed_endpoint_fd,
+        "https://example.com/",
+        "/tmp/curl-https-get.body",
+        "/tmp/curl-https-cert-failure.body",
+        "/tmp/curl-https-cert-failure.timing",
+        cert_failure_timing_format,
+        "curl https cert failure workload",
+        cert_failure_exits,
+        2,
+        "10",
+        "30");
+    if (status != 0) {
+        return status;
+    }
+
+    const uint64_t dns_failure_exits[] = {6};
+    status = seed0root_run_curl_https_expected_failure(
+        filed_endpoint_fd,
+        "https://pachaos-invalid.invalid/",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/tmp/curl-https-dns-failure.body",
+        "/tmp/curl-https-dns-failure.timing",
+        dns_failure_timing_format,
+        "curl https dns failure workload",
+        dns_failure_exits,
+        1,
+        "3",
+        "6");
+    if (status != 0) {
+        return status;
+    }
+
+    const uint64_t timeout_exits[] = {7, 28};
+    status = seed0root_run_curl_https_expected_failure(
+        filed_endpoint_fd,
+        "https://10.255.255.1/",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/tmp/curl-https-connect-timeout.body",
+        "/tmp/curl-https-connect-timeout.timing",
+        timeout_timing_format,
+        "curl https connect timeout workload",
+        timeout_exits,
+        2,
+        "2",
+        "4");
+    if (status != 0) {
+        return status;
+    }
+
+    if (status == 0) {
+        printf("[seed0root] curl https example.com profile completed status=0\n");
+    }
+    return status;
+}
+
 static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
 {
     const char *cc1_argv[] = {
@@ -1607,6 +1933,8 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         "--no-network",
         "--no-scripts",
         "--allow-untrusted",
+        "--timeout",
+        "10",
         "--repository",
         "/var/cache/apk/offline",
         "--cache-dir",
@@ -1713,6 +2041,143 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         FILED_WIRE_EXEC_LINUX_LPR);
 }
 
+static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
+{
+    const char *dirs[] = {
+        "/tmp/apk-update-root",
+        "/tmp/apk-update-root/var",
+        "/tmp/apk-update-root/var/cache",
+        "/tmp/apk-update-root/var/cache/apk",
+        "/tmp/apk-update-root/var/lib",
+        "/tmp/apk-update-root/var/lib/apk",
+        "/tmp/apk-update-root/var/log",
+        "/tmp/apk-update-root/etc",
+        "/tmp/apk-update-root/etc/apk",
+        "/tmp/apk-update-root/lib",
+        "/tmp/apk-update-root/lib/apk",
+        "/tmp/apk-update-root/lib/apk/db",
+    };
+    for (uint64_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i += 1) {
+        const char *mkdir_argv[] = {
+            "busybox", "mkdir", dirs[i],
+        };
+        int status = seed0root_run_exec_path_smoke(
+            filed_endpoint_fd,
+            "/cmd/alpine-busybox.elf",
+            mkdir_argv,
+            3,
+            "PACHA_APK_UPDATE_PREP=1",
+            "apk update prep mkdir",
+            FILED_WIRE_EXEC_LINUX_LPR);
+        if (status != 0) {
+            return status;
+        }
+    }
+
+    const char *resolv_cp_argv[] = {
+        "busybox", "cp", "/etc/resolv.conf", "/tmp/apk-update-root/etc/resolv.conf",
+    };
+    int status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/alpine-busybox.elf",
+        resolv_cp_argv,
+        sizeof(resolv_cp_argv) / sizeof(resolv_cp_argv[0]),
+        "PACHA_APK_UPDATE_PREP=1",
+        "apk update prep resolv.conf",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *apk_env = "LD_LIBRARY_PATH=/opt/apk-offline/lib:/lib:/lib/linux:/usr/lib";
+    const char *initdb_argv[] = {
+        "/cmd/apk-offline.elf",
+        "--root",
+        "/tmp/apk-update-root",
+        "--no-network",
+        "--cache-dir",
+        "/tmp/apk-update-root/var/cache/apk",
+        "add",
+        "--initdb",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/apk-offline.elf",
+        initdb_argv,
+        sizeof(initdb_argv) / sizeof(initdb_argv[0]),
+        apk_env,
+        "apk update initdb workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *apk_argv[] = {
+        "/cmd/apk-offline.elf",
+        "--root",
+        "/tmp/apk-update-root",
+        "--allow-untrusted",
+        "--progress=no",
+        "--logfile=no",
+        "--sync=no",
+        "--repository",
+        "http://dl-cdn.alpinelinux.org/alpine/edge/main",
+        "--cache-dir",
+        "/tmp/apk-update-root/var/cache/apk",
+        "update",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/apk-offline.elf",
+        apk_argv,
+        sizeof(apk_argv) / sizeof(apk_argv[0]),
+        apk_env,
+        "apk update workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *apk_add_argv[] = {
+        "/cmd/apk-offline.elf",
+        "--root",
+        "/tmp/apk-update-root",
+        "--allow-untrusted",
+        "--progress=no",
+        "--logfile=no",
+        "--sync=no",
+        "--repository",
+        "http://dl-cdn.alpinelinux.org/alpine/edge/main",
+        "--cache-dir",
+        "/tmp/apk-update-root/var/cache/apk",
+        "add",
+        "zlib",
+    };
+    status = seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/apk-offline.elf",
+        apk_add_argv,
+        sizeof(apk_add_argv) / sizeof(apk_add_argv[0]),
+        apk_env,
+        "apk add zlib workload",
+        FILED_WIRE_EXEC_LINUX_LPR);
+    if (status != 0) {
+        return status;
+    }
+
+    const char *zlib_stat_argv[] = {
+        "busybox", "test", "-e", "/tmp/apk-update-root/usr/lib/libz.so.1",
+    };
+    return seed0root_run_exec_path_smoke(
+        filed_endpoint_fd,
+        "/cmd/alpine-busybox.elf",
+        zlib_stat_argv,
+        sizeof(zlib_stat_argv) / sizeof(zlib_stat_argv[0]),
+        "PACHA_APK_ADD_VERIFY=1",
+        "apk add zlib verify",
+        FILED_WIRE_EXEC_LINUX_LPR);
+}
+
 static int seed0root_run_storage_services(int filed_endpoint_fd)
 {
     int status = 0;
@@ -1721,9 +2186,7 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
     } else {
         return -1;
     }
-    const unsigned boot_profile = (status == 0 && filed_endpoint_fd >= 16) ?
-        seed0root_boot_profile_flags(filed_endpoint_fd) :
-        SEED0ROOT_DEFAULT_BOOT_PROFILE;
+    const unsigned boot_profile = seed0root_boot_profile_flags(filed_endpoint_fd);
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_FS_WRITE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_filed_no_cache_probe(filed_endpoint_fd);
     }
@@ -1740,6 +2203,9 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
         status = seed0root_run_lpr_ldmusl_smoke(filed_endpoint_fd);
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_lpr_pty_probe(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_lpr_busybox_dynamic_smoke(filed_endpoint_fd);
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_MEMORY) != 0 && status == 0 && filed_endpoint_fd >= 16) {
@@ -1750,6 +2216,12 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_DYN_NEEDED) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_lpr_dyn_needed_smoke(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_CURL) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_curl_example(filed_endpoint_fd);
+    }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_HTTPS) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_curl_https_example(filed_endpoint_fd);
     }
     if ((boot_profile & (SEED0ROOT_BOOT_PROFILE_BENCH | SEED0ROOT_BOOT_PROFILE_LUA)) != 0 &&
         status == 0 &&
@@ -1764,6 +2236,9 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_APK) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_apk_offline_bench(filed_endpoint_fd);
     }
+    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_APK_UPDATE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
+        status = seed0root_run_apk_update_smoke(filed_endpoint_fd);
+    }
     const unsigned metrics_profile =
         boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
                         SEED0ROOT_BOOT_PROFILE_MEMORY |
@@ -1772,7 +2247,10 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
                         SEED0ROOT_BOOT_PROFILE_LUA |
                         SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
                         SEED0ROOT_BOOT_PROFILE_CHIBICC |
-                        SEED0ROOT_BOOT_PROFILE_APK);
+                        SEED0ROOT_BOOT_PROFILE_APK |
+                        SEED0ROOT_BOOT_PROFILE_APK_UPDATE |
+                        SEED0ROOT_BOOT_PROFILE_CURL |
+                        SEED0ROOT_BOOT_PROFILE_HTTPS);
     const unsigned sync_profile =
         boot_profile & (SEED0ROOT_BOOT_PROFILE_FS_WRITE |
                         SEED0ROOT_BOOT_PROFILE_MEMORY |
@@ -1781,7 +2259,10 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
                         SEED0ROOT_BOOT_PROFILE_LUA |
                         SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
                         SEED0ROOT_BOOT_PROFILE_CHIBICC |
-                        SEED0ROOT_BOOT_PROFILE_APK);
+                        SEED0ROOT_BOOT_PROFILE_APK |
+                        SEED0ROOT_BOOT_PROFILE_APK_UPDATE |
+                        SEED0ROOT_BOOT_PROFILE_CURL |
+                        SEED0ROOT_BOOT_PROFILE_HTTPS);
     if (metrics_profile != 0 && status == 0 && filed_endpoint_fd >= 16) {
         const int metrics_status = seed0root_dump_filed_metrics(filed_endpoint_fd);
         printf("[seed0root] filed metrics dump status=%d\n", metrics_status);
@@ -2015,18 +2496,43 @@ static int prepare_filed_storage_bootstrap(
     return 0;
 }
 
+static int seed0root_send_storage_ready(int ready_channel_fd, int filed_client_fd)
+{
+    if (ready_channel_fd < 16 || filed_client_fd < 16) {
+        return -1;
+    }
+
+    struct pacha_ipc_fd fd_item = {
+        .fd = (uint64_t)(uint32_t)filed_client_fd,
+        .rights = seed0root_channel_rights,
+        .flags = 0,
+        .transfer_flags = 0,
+    };
+    struct pacha_ipc_msg msg = {
+        .word0 = SEED0ROOT_STORAGE_READY_MAGIC,
+        .word1 = 0,
+        .word2 = 0,
+        .word3 = 0,
+        .fds = &fd_item,
+        .fd_count = 1,
+    };
+    return pacha_ipc_send(ready_channel_fd, &msg);
+}
+
 static int launch_filed(const struct seed0root_bootstrap *bootstrap)
 {
     if (bootstrap->magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap->filed_image_fd < 16 ||
         bootstrap->filed_image_size == 0 ||
         bootstrap->device_fd < 16 ||
+        bootstrap->ready_channel_fd < 16 ||
         bootstrap->module_count == 0 ||
         bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES) {
         fprintf(stderr,
-            "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu filed_fd=%llu size=%llu modules=%llu\n",
+            "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu ready_fd=%llu filed_fd=%llu size=%llu modules=%llu\n",
             (unsigned long long)bootstrap->magic,
             (unsigned long long)bootstrap->device_fd,
+            (unsigned long long)bootstrap->ready_channel_fd,
             (unsigned long long)bootstrap->filed_image_fd,
             (unsigned long long)bootstrap->filed_image_size,
             (unsigned long long)bootstrap->module_count);
@@ -2136,6 +2642,16 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
     (void)pacha_fd_close(filed_endpoint_fd);
     printf("[seed0root] filed started\n");
     fflush(stdout);
+    status = seed0root_send_storage_ready((int)bootstrap->ready_channel_fd, filed_client_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(filed_client_fd);
+        fprintf(stderr, "[seed0root] storage ready send failed status=%d fd=%llu\n",
+            status,
+            (unsigned long long)bootstrap->ready_channel_fd);
+        return status;
+    }
+    printf("[seed0root] storage ready signal sent\n");
+    fflush(stdout);
     status = seed0root_run_storage_services(filed_client_fd);
     (void)pacha_fd_close(filed_client_fd);
     if (status != 0) {
@@ -2161,10 +2677,11 @@ int main(int argc, char **argv)
     fflush(stdout);
     struct seed0root_bootstrap bootstrap;
     bootstrap_status = read_bootstrap_fd(bootstrap_fd, &bootstrap, sizeof(bootstrap), "seed0root");
-    printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu filed_fd=%llu filed_size=%llu modules=%llu\n",
+    printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu ready_fd=%llu filed_fd=%llu filed_size=%llu modules=%llu\n",
         bootstrap_status,
         (unsigned long long)bootstrap.magic,
         (unsigned long long)bootstrap.device_fd,
+        (unsigned long long)bootstrap.ready_channel_fd,
         (unsigned long long)bootstrap.filed_image_fd,
         (unsigned long long)bootstrap.filed_image_size,
         (unsigned long long)bootstrap.module_count);
@@ -2172,6 +2689,7 @@ int main(int argc, char **argv)
     if (bootstrap_status != 0 ||
         bootstrap.magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap.device_fd < 16 ||
+        bootstrap.ready_channel_fd < 16 ||
         bootstrap.filed_image_fd < 16 ||
         bootstrap.filed_image_size == 0 ||
         bootstrap.module_count == 0 ||

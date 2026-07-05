@@ -1,6 +1,7 @@
 #include "lpr_linux_syscall.h"
 #include "lpr_filed.h"
 #include "lpr_memory.h"
+#include "lpr_socket.h"
 #include "lpr_vfs_local.h"
 #include "support/string.h"
 #include "support/syscall.h"
@@ -8,6 +9,16 @@
 #include <pachaos/abi.h>
 #include <personality/linux_lpr.h>
 #include <stddef.h>
+
+#ifndef LPR_TRACE_MMAP_CALLS
+#define LPR_TRACE_MMAP_CALLS 0
+#endif
+#ifndef LPR_TRACE_PATCH_MAPPING
+#define LPR_TRACE_PATCH_MAPPING 0
+#endif
+#ifndef LPR_TRACE_SOCKET_SYSCALLS
+#define LPR_TRACE_SOCKET_SYSCALLS 0
+#endif
 
 #define LPR_LINUX_PROT_READ 0x1ull
 #define LPR_LINUX_PROT_WRITE 0x2ull
@@ -49,7 +60,7 @@ const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
     return lpr_active_user_frame;
 }
 
-#if LPR_TRACE_PATCH_MAPPING || LPR_TRACE_SYSCALL_METRICS || LPR_TRACE_MMAP_LOADS || LPR_TRACE_MMAP_CALLS || LPR_TRACE_ENOSYS
+#if LPR_TRACE_PATCH_MAPPING || LPR_TRACE_SYSCALL_METRICS || LPR_TRACE_MMAP_LOADS || LPR_TRACE_MMAP_CALLS || LPR_TRACE_ENOSYS || LPR_TRACE_BAD_RETURN || LPR_TRACE_SOCKET_SYSCALLS
 static char *lpr_append_literal(char *out, const char *end, const char *text)
 {
     while (out < end && *text != 0) {
@@ -70,6 +81,77 @@ static char *lpr_append_u64(char *out, const char *end, uint64_t value)
         *out++ = tmp[--n];
     }
     return out;
+}
+#endif
+
+#if LPR_TRACE_SOCKET_SYSCALLS
+static char *lpr_append_i64_trace(char *out, const char *end, int64_t value)
+{
+    if (value < 0) {
+        out = lpr_append_literal(out, end, "-");
+        return lpr_append_u64(out, end, (uint64_t)(-value));
+    }
+    return lpr_append_u64(out, end, (uint64_t)value);
+}
+
+static int lpr_trace_socket_syscall_interesting(uint64_t nr)
+{
+    switch (nr) {
+    case LPR_LINUX_SYS_READ:
+    case LPR_LINUX_SYS_WRITE:
+    case LPR_LINUX_SYS_READV:
+    case LPR_LINUX_SYS_WRITEV:
+    case LPR_LINUX_SYS_IOCTL:
+    case LPR_LINUX_SYS_SELECT:
+    case LPR_LINUX_SYS_PSELECT6:
+    case LPR_LINUX_SYS_POLL:
+    case LPR_LINUX_SYS_PPOLL:
+    case LPR_LINUX_SYS_SOCKET:
+    case LPR_LINUX_SYS_CONNECT:
+    case LPR_LINUX_SYS_SENDTO:
+    case LPR_LINUX_SYS_RECVFROM:
+    case LPR_LINUX_SYS_SENDMSG:
+    case LPR_LINUX_SYS_RECVMSG:
+    case LPR_LINUX_SYS_SENDMMSG:
+    case LPR_LINUX_SYS_RECVMMSG:
+    case LPR_LINUX_SYS_SHUTDOWN:
+    case LPR_LINUX_SYS_BIND:
+    case LPR_LINUX_SYS_GETSOCKNAME:
+    case LPR_LINUX_SYS_GETPEERNAME:
+    case LPR_LINUX_SYS_SETSOCKOPT:
+    case LPR_LINUX_SYS_GETSOCKOPT:
+    case LPR_LINUX_SYS_FCNTL:
+    case LPR_LINUX_SYS_CLOCK_GETTIME:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void lpr_trace_socket_syscall_event(const char *phase,
+                                           uint64_t nr,
+                                           uint64_t a0,
+                                           uint64_t a1,
+                                           uint64_t a2,
+                                           int64_t result)
+{
+    char line[256];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_append_literal(out, end, "[lpr_runtime] syscall ");
+    out = lpr_append_literal(out, end, phase);
+    out = lpr_append_literal(out, end, " nr=");
+    out = lpr_append_u64(out, end, nr);
+    out = lpr_append_literal(out, end, " a0=");
+    out = lpr_append_u64(out, end, a0);
+    out = lpr_append_literal(out, end, " a1=");
+    out = lpr_append_u64(out, end, a1);
+    out = lpr_append_literal(out, end, " a2=");
+    out = lpr_append_u64(out, end, a2);
+    out = lpr_append_literal(out, end, " result=");
+    out = lpr_append_i64_trace(out, end, result);
+    out = lpr_append_literal(out, end, "\n");
+    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
 }
 #endif
 
@@ -177,6 +259,9 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_GETPID },
     { .nr = LPR_LINUX_SYS_EXIT },
     { .nr = LPR_LINUX_SYS_FCNTL },
+    { .nr = LPR_LINUX_SYS_FLOCK },
+    { .nr = LPR_LINUX_SYS_SELECT },
+    { .nr = LPR_LINUX_SYS_PSELECT6 },
     { .nr = LPR_LINUX_SYS_FSYNC },
     { .nr = LPR_LINUX_SYS_FDATASYNC },
     { .nr = LPR_LINUX_SYS_GETCWD },
@@ -202,6 +287,8 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_LINKAT },
     { .nr = LPR_LINUX_SYS_FCHMODAT },
     { .nr = LPR_LINUX_SYS_UTIMENSAT },
+    { .nr = LPR_LINUX_SYS_RECVMMSG },
+    { .nr = LPR_LINUX_SYS_SENDMMSG },
     { .nr = LPR_LINUX_SYS_GETRANDOM },
 };
 
@@ -270,6 +357,7 @@ static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t 
     case LPR_LINUX_SYS_ACCESS: return lpr_append_literal(out, end, "access");
     case LPR_LINUX_SYS_PIPE: return lpr_append_literal(out, end, "pipe");
     case LPR_LINUX_SYS_DUP: return lpr_append_literal(out, end, "dup");
+    case LPR_LINUX_SYS_DUP2: return lpr_append_literal(out, end, "dup2");
     case LPR_LINUX_SYS_CLONE: return lpr_append_literal(out, end, "clone");
     case LPR_LINUX_SYS_FORK: return lpr_append_literal(out, end, "fork");
     case LPR_LINUX_SYS_VFORK: return lpr_append_literal(out, end, "vfork");
@@ -278,6 +366,9 @@ static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t 
     case LPR_LINUX_SYS_GETPID: return lpr_append_literal(out, end, "getpid");
     case LPR_LINUX_SYS_EXIT: return lpr_append_literal(out, end, "exit");
     case LPR_LINUX_SYS_FCNTL: return lpr_append_literal(out, end, "fcntl");
+    case LPR_LINUX_SYS_FLOCK: return lpr_append_literal(out, end, "flock");
+    case LPR_LINUX_SYS_SELECT: return lpr_append_literal(out, end, "select");
+    case LPR_LINUX_SYS_PSELECT6: return lpr_append_literal(out, end, "pselect6");
     case LPR_LINUX_SYS_FSYNC: return lpr_append_literal(out, end, "fsync");
     case LPR_LINUX_SYS_FDATASYNC: return lpr_append_literal(out, end, "fdatasync");
     case LPR_LINUX_SYS_GETCWD: return lpr_append_literal(out, end, "getcwd");
@@ -316,6 +407,8 @@ static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t 
     case LPR_LINUX_SYS_SYMLINKAT: return lpr_append_literal(out, end, "symlinkat");
     case LPR_LINUX_SYS_UNSHARE: return lpr_append_literal(out, end, "unshare");
     case LPR_LINUX_SYS_UTIMENSAT: return lpr_append_literal(out, end, "utimensat");
+    case LPR_LINUX_SYS_RECVMMSG: return lpr_append_literal(out, end, "recvmmsg");
+    case LPR_LINUX_SYS_SENDMMSG: return lpr_append_literal(out, end, "sendmmsg");
     case LPR_LINUX_SYS_DUP3: return lpr_append_literal(out, end, "dup3");
     case LPR_LINUX_SYS_PIPE2: return lpr_append_literal(out, end, "pipe2");
     case LPR_LINUX_SYS_GETRANDOM: return lpr_append_literal(out, end, "getrandom");
@@ -356,7 +449,7 @@ static void lpr_trace_syscall_dump(uint64_t exit_nr)
         out = lpr_append_literal(out, end, " errors=");
         out = lpr_append_u64(out, end, metric->errors);
         out = lpr_append_literal(out, end, "\n");
-        lpr_trace_write_line(line, (uint64_t)(out - line));
+        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
     }
     char *out = line;
     const char *end = line + sizeof(line);
@@ -549,6 +642,33 @@ static uint64_t lpr_page_align_up(uint64_t value)
     return (value + mask) & ~mask;
 }
 
+static void lpr_copy_uts_field(char *dst, const char *src)
+{
+    uint64_t i = 0;
+    for (; i < 64 && src[i] != 0; i += 1) {
+        dst[i] = src[i];
+    }
+    for (; i < 65; i += 1) {
+        dst[i] = 0;
+    }
+}
+
+static int64_t lpr_linux_uname(uint64_t uts_raw)
+{
+    if (uts_raw == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    char *uts = (char *)(uintptr_t)uts_raw;
+    lpr_memset(uts, 0, 65u * 6u);
+    lpr_copy_uts_field(uts + 65u * 0u, "Linux");
+    lpr_copy_uts_field(uts + 65u * 1u, "pachaos");
+    lpr_copy_uts_field(uts + 65u * 2u, "6.12.0");
+    lpr_copy_uts_field(uts + 65u * 3u, "PachaOS Linux shim");
+    lpr_copy_uts_field(uts + 65u * 4u, "x86_64");
+    lpr_copy_uts_field(uts + 65u * 5u, "localdomain");
+    return 0;
+}
+
 static lpr_file_map_cache_entry_t *lpr_file_map_cache_find(uint64_t handle, uint64_t offset, uint64_t length)
 {
     if (handle == 0 || offset + length < offset) {
@@ -708,25 +828,32 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
         int64_t mapped = 0;
         int64_t vmo_fd = -1;
         uint64_t mapped_prot = load_prot;
-        const uint64_t direct_map_flags =
+        const uint64_t readonly_shared_map_flags =
             (pacha_flags & (PACHAOS_MMAP_FIXED | PACHAOS_MMAP_FIXED_NOREPLACE | PACHAOS_MMAP_NORESERVE)) |
             PACHAOS_MMAP_SHARED;
+        const uint64_t private_file_map_flags =
+            pacha_flags & (PACHAOS_MMAP_FIXED |
+                           PACHAOS_MMAP_FIXED_NOREPLACE |
+                           PACHAOS_MMAP_NORESERVE |
+                           PACHAOS_MMAP_PRIVATE |
+                           PACHAOS_MMAP_SHARED);
+        const uint64_t direct_map_flags =
+            (prot & (LPR_LINUX_PROT_WRITE | LPR_LINUX_PROT_EXEC)) == 0
+                ? readonly_shared_map_flags
+                : private_file_map_flags;
         lpr_file_map_cache_entry_t *cache = lpr_file_map_cache_find(handle, offset, map_len);
 #if LPR_TRACE_MMAP_LOADS
         lpr_trace_file_map_cache(cache != 0 ? "hit" : "miss", handle, offset, map_len, cache != 0 ? cache->length : 0);
 #endif
         if (cache != 0) {
             if ((prot & (LPR_LINUX_PROT_WRITE | LPR_LINUX_PROT_EXEC)) == 0) {
-                const uint64_t cached_map_flags =
-                    (pacha_flags & (PACHAOS_MMAP_FIXED | PACHAOS_MMAP_FIXED_NOREPLACE | PACHAOS_MMAP_NORESERVE)) |
-                    PACHAOS_MMAP_SHARED;
                 mapped = lpr_pacha_syscall6(
                     PACHAOS_SYSCALL_MMAP,
                     cache->vmo_fd,
                     addr,
                     map_len,
                     final_prot,
-                    cached_map_flags,
+                    readonly_shared_map_flags,
                     offset);
                 if (mapped >= 4096) {
                     done = len;
@@ -937,6 +1064,9 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
                                           uint64_t a5) {
     switch (nr) {
     case LPR_LINUX_SYS_READ:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_read(a0, a1, a2);
+        }
         return lpr_linux_read(a0, a1, a2);
     case LPR_LINUX_SYS_GETPID:
         return lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID);
@@ -944,10 +1074,16 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
     case LPR_LINUX_SYS_SET_TID_ADDRESS:
         return lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
     case LPR_LINUX_SYS_WRITE:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_write(a0, a1, a2);
+        }
         return lpr_linux_write(a0, a1, a2);
     case LPR_LINUX_SYS_OPEN:
         return lpr_linux_openat(LPR_LINUX_AT_FDCWD, a0, a1, a2);
     case LPR_LINUX_SYS_CLOSE:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_close(a0);
+        }
         return lpr_linux_close(a0);
     case LPR_LINUX_SYS_STAT:
         return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0);
@@ -988,6 +1124,8 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
     case LPR_LINUX_SYS_GETEUID:
     case LPR_LINUX_SYS_GETEGID:
         return 0;
+    case LPR_LINUX_SYS_UNAME:
+        return lpr_linux_uname(a0);
     case LPR_LINUX_SYS_SETUID:
     case LPR_LINUX_SYS_SETGID:
         return a0 == 0 ? 0 : -LPR_LINUX_EPERM;
@@ -999,8 +1137,14 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
         return (int64_t)previous;
     }
     case LPR_LINUX_SYS_IOCTL:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_ioctl(a0, a1, a2);
+        }
         return lpr_linux_ioctl(a0, a1, a2);
     case LPR_LINUX_SYS_FSTAT:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_fstat(a0, a1);
+        }
         return lpr_linux_fstat(a0, a1);
     case LPR_LINUX_SYS_FSYNC:
     case LPR_LINUX_SYS_FDATASYNC:
@@ -1008,8 +1152,14 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
     case LPR_LINUX_SYS_PREAD64:
         return lpr_linux_pread64(a0, a1, a2, a3);
     case LPR_LINUX_SYS_READV:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_readv(a0, a1, a2);
+        }
         return lpr_linux_readv(a0, a1, a2);
     case LPR_LINUX_SYS_WRITEV:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_writev(a0, a1, a2);
+        }
         return lpr_linux_writev(a0, a1, a2);
     case LPR_LINUX_SYS_ACCESS:
         return lpr_linux_access(a0, a1);
@@ -1019,6 +1169,8 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
         return lpr_linux_pipe2(a0, a1);
     case LPR_LINUX_SYS_DUP:
         return lpr_linux_dup(a0, 0, 0);
+    case LPR_LINUX_SYS_DUP2:
+        return lpr_linux_dup2(a0, a1, 0);
     case LPR_LINUX_SYS_CLONE:
         return lpr_linux_clone(a0, a1, a2, a3, a4);
     case LPR_LINUX_SYS_FORK:
@@ -1030,7 +1182,7 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
     case LPR_LINUX_SYS_WAIT4:
         return lpr_linux_wait4(a0, a1, a2, a3);
     case LPR_LINUX_SYS_DUP3:
-        return -LPR_LINUX_ENOTSUP;
+        return lpr_linux_dup2(a0, a1, a2);
     case LPR_LINUX_SYS_READLINK:
         return lpr_linux_readlink(a0, a1, a2);
     case LPR_LINUX_SYS_CHMOD:
@@ -1075,10 +1227,59 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
         return 0;
     case LPR_LINUX_SYS_UTIMENSAT:
         return lpr_linux_utimensat(a0, a1, a2, a3);
+    case LPR_LINUX_SYS_EVENTFD:
+        return lpr_linux_eventfd2(a0, 0);
+    case LPR_LINUX_SYS_EVENTFD2:
+        return lpr_linux_eventfd2(a0, a1);
     case LPR_LINUX_SYS_GETCWD:
         return lpr_linux_getcwd(a0, a1);
     case LPR_LINUX_SYS_FCNTL:
+        if (lpr_linux_socket_fd_active(a0)) {
+            return lpr_linux_socket_fcntl(a0, a1, a2);
+        }
         return lpr_linux_fcntl(a0, a1, a2);
+    case LPR_LINUX_SYS_FLOCK:
+        return lpr_linux_flock(a0, a1);
+    case LPR_LINUX_SYS_SELECT:
+        return lpr_linux_select(a0, a1, a2, a3, a4);
+    case LPR_LINUX_SYS_PSELECT6:
+        return lpr_linux_pselect6(a0, a1, a2, a3, a4, a5);
+    case LPR_LINUX_SYS_POLL:
+        return lpr_linux_poll(a0, a1, a2);
+    case LPR_LINUX_SYS_PPOLL:
+        return lpr_linux_ppoll(a0, a1, a2, a3, a4);
+    case LPR_LINUX_SYS_SOCKET:
+        return lpr_linux_socket(a0, a1, a2);
+    case LPR_LINUX_SYS_CONNECT:
+        return lpr_linux_connect(a0, a1, a2);
+    case LPR_LINUX_SYS_SENDTO:
+        return lpr_linux_sendto(a0, a1, a2, a3, a4, a5);
+    case LPR_LINUX_SYS_RECVFROM:
+        return lpr_linux_recvfrom(a0, a1, a2, a3, a4, a5);
+    case LPR_LINUX_SYS_SENDMSG:
+        return lpr_linux_sendmsg(a0, a1, a2);
+    case LPR_LINUX_SYS_RECVMSG:
+        return lpr_linux_recvmsg(a0, a1, a2);
+    case LPR_LINUX_SYS_SENDMMSG:
+        return lpr_linux_sendmmsg(a0, a1, a2, a3);
+    case LPR_LINUX_SYS_RECVMMSG:
+        return lpr_linux_recvmmsg(a0, a1, a2, a3, a4);
+    case LPR_LINUX_SYS_SHUTDOWN:
+        return lpr_linux_shutdown(a0, a1);
+    case LPR_LINUX_SYS_SETSOCKOPT:
+        return lpr_linux_setsockopt(a0, a1, a2, a3, a4);
+    case LPR_LINUX_SYS_GETSOCKOPT:
+        return lpr_linux_getsockopt(a0, a1, a2, a3, a4);
+    case LPR_LINUX_SYS_GETSOCKNAME:
+        return lpr_linux_getsockname(a0, a1, a2);
+    case LPR_LINUX_SYS_GETPEERNAME:
+        return lpr_linux_getpeername(a0, a1, a2);
+    case LPR_LINUX_SYS_BIND:
+        return lpr_linux_bind(a0, a1, a2);
+    case LPR_LINUX_SYS_LISTEN:
+    case LPR_LINUX_SYS_ACCEPT:
+    case LPR_LINUX_SYS_SOCKETPAIR:
+        return -LPR_LINUX_EOPNOTSUPP;
     default:
         return -LPR_LINUX_ENOSYS;
     }
@@ -1104,6 +1305,27 @@ int64_t lpr_dispatch_syscall_frame(const struct lpr_linux_user_frame *frame,
                                    uint64_t a5) {
     const struct lpr_linux_user_frame *saved_frame = lpr_active_user_frame;
     lpr_active_user_frame = frame;
+#if LPR_TRACE_BAD_RETURN
+    if (frame != 0 && frame->rip < LPR_LOW_GUARD_END_VA) {
+        char line[256];
+        char *out = line;
+        const char *end = line + sizeof(line);
+        out = lpr_append_literal(out, end, "[lpr_runtime] bad_return nr=");
+        out = lpr_append_u64(out, end, nr);
+        out = lpr_append_literal(out, end, " rip=");
+        out = lpr_append_u64(out, end, frame->rip);
+        out = lpr_append_literal(out, end, " rcx=");
+        out = lpr_append_u64(out, end, frame->rcx);
+        out = lpr_append_literal(out, end, "\n");
+        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    }
+#endif
+#if LPR_TRACE_SOCKET_SYSCALLS
+    const int trace_socket_syscall = lpr_trace_socket_syscall_interesting(nr);
+    if (trace_socket_syscall) {
+        lpr_trace_socket_syscall_event("enter", nr, a0, a1, a2, 0);
+    }
+#endif
 #if LPR_TRACE_SYSCALL_METRICS
     if (nr == LPR_LINUX_SYS_EXIT || nr == LPR_LINUX_SYS_EXIT_GROUP) {
         lpr_trace_syscall_record(nr, 0, 0);
@@ -1123,10 +1345,20 @@ int64_t lpr_dispatch_syscall_frame(const struct lpr_linux_user_frame *frame,
         lpr_trace_slow_syscall(nr, a0, a1, a2, a3, a4, a5, result, cycles);
     }
 #endif
+#if LPR_TRACE_SOCKET_SYSCALLS
+    if (trace_socket_syscall) {
+        lpr_trace_socket_syscall_event("exit", nr, a0, a1, a2, result);
+    }
+#endif
     lpr_active_user_frame = saved_frame;
     return result;
 #else
     const int64_t result = lpr_dispatch_syscall_inner(nr, a0, a1, a2, a3, a4, a5);
+#if LPR_TRACE_SOCKET_SYSCALLS
+    if (trace_socket_syscall) {
+        lpr_trace_socket_syscall_event("exit", nr, a0, a1, a2, result);
+    }
+#endif
 #if LPR_TRACE_ENOSYS
     if (result == -LPR_LINUX_ENOSYS) {
         lpr_trace_enosys_syscall(nr, a0, a1, a2, a3, a4, a5);

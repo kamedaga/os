@@ -119,7 +119,8 @@ pub const ThreadContext = struct {
     pkru: u32 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
-    signal_pending: bool = false,
+    stopped: bool = false,
+    pending_signal: u32 = 0,
     wake_tick: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
@@ -128,10 +129,11 @@ pub const ThreadContext = struct {
 const ThreadHotState = extern struct {
     allocated: u8 = 0,
     ready: u8 = 0,
-    signal_pending: u8 = 0,
+    stopped: u8 = 0,
     wait_mailbox: u8 = 0,
     owner_process: kernel.PrincipalId = default_process_principal,
-    _pad0: [8]u8 = [_]u8{0} ** 8,
+    pending_signal: u32 = 0,
+    _pad0: [4]u8 = [_]u8{0} ** 4,
     wake_tick: u64 = 0,
     cr3: u64 = 0,
 };
@@ -1212,6 +1214,7 @@ fn claimExternalCommittedUserEntryFromAp(cpu_slot: usize, out_entry: *scheduler_
 fn markThreadReadyLocked(thread_index: usize, ready: bool, notify: bool) bool {
     const ctx = threadContextMutable(thread_index) orelse return false;
     if (!ctx.allocated) return false;
+    if (ready and ctx.stopped) return false;
     const was_ready = ctx.ready;
     if (ready) schedulerFullMemoryFence();
     ctx.ready = ready;
@@ -1691,9 +1694,10 @@ fn hotStateFromContext(ctx: *const ThreadContext) ThreadHotState {
     return .{
         .allocated = boolByte(ctx.allocated),
         .ready = boolByte(ctx.ready),
-        .signal_pending = boolByte(ctx.signal_pending),
+        .stopped = boolByte(ctx.stopped),
         .wait_mailbox = boolByte(ctx.wait_mailbox),
         .owner_process = ctx.owner_process,
+        .pending_signal = ctx.pending_signal,
         .wake_tick = ctx.wake_tick,
         .cr3 = ctx.cr3,
     };
@@ -1709,8 +1713,12 @@ fn setThreadHotReady(thread_index: usize, ready: bool) void {
     if (getThreadHotState(thread_index)) |hot| hot.ready = boolByte(ready);
 }
 
-fn setThreadHotSignalPending(thread_index: usize, pending: bool) void {
-    if (getThreadHotState(thread_index)) |hot| hot.signal_pending = boolByte(pending);
+fn setThreadHotPendingSignal(thread_index: usize, signo: u32) void {
+    if (getThreadHotState(thread_index)) |hot| hot.pending_signal = signo;
+}
+
+fn setThreadHotStopped(thread_index: usize, stopped: bool) void {
+    if (getThreadHotState(thread_index)) |hot| hot.stopped = boolByte(stopped);
 }
 
 fn setThreadHotWaitState(thread_index: usize, wait_mailbox: bool, wake_tick: u64, ready: bool) void {
@@ -1753,7 +1761,8 @@ fn initializeThreadContextWithReadyState(
     ctx.pkru = 0;
     ctx.ready = initial_ready;
     ctx.wait_mailbox = false;
-    ctx.signal_pending = false;
+    ctx.stopped = false;
+    ctx.pending_signal = 0;
     ctx.wake_tick = 0;
     ctx.frame = initial_frame;
     ctx.fx_state = initial_fx_state;
@@ -2112,6 +2121,11 @@ pub fn wakeIfWaiting(thread_index: usize) void {
     if (!ctx.allocated) return;
     ctx.wait_mailbox = false;
     ctx.wake_tick = 0;
+    if (ctx.stopped) {
+        ctx.ready = false;
+        setThreadHotWaitState(thread_index, false, 0, false);
+        return;
+    }
     ctx.ready = true;
     setThreadHotWaitState(thread_index, false, 0, true);
     if (!policyActive()) verifiedWakeThread(thread_index);
@@ -2131,6 +2145,11 @@ fn wakeIfWaitingGenerationInternal(thread_index: usize, generation: u32, resume_
     if (resume_rax) |value| ctx.frame.rax = value;
     ctx.wait_mailbox = false;
     ctx.wake_tick = 0;
+    if (ctx.stopped) {
+        ctx.ready = false;
+        setThreadHotWaitState(thread_index, false, 0, false);
+        return true;
+    }
     ctx.ready = true;
     setThreadHotWaitState(thread_index, false, 0, true);
     if (!policyActive()) verifiedWakeThread(thread_index);
@@ -2163,41 +2182,108 @@ pub fn wakeMailboxWaiter(principal: kernel.PrincipalId) void {
 }
 
 pub fn wakeBlockedThread(principal: kernel.PrincipalId) void {
+    _ = deliverSignal(principal, 1);
+}
+
+pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) bool {
+    if (signo == 0) return false;
     var first_ready: ?usize = null;
     var i: usize = 0;
     while (i < thread_contexts.len) : (i += 1) {
         const hot = getThreadHotStateConst(i) orelse continue;
         if (hot.allocated == 0 or hot.owner_process != principal) continue;
+        if (hot.stopped != 0) continue;
         if (hot.ready == 0) {
             wakeIfWaiting(i);
-            return;
+            thread_table_lock.lock();
+            defer thread_table_lock.unlock();
+            const ctx = threadContextMutable(i) orelse return false;
+            if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) return false;
+            ctx.pending_signal = signo;
+            setThreadHotPendingSignal(i, signo);
+            return true;
         }
         if (first_ready == null) first_ready = i;
     }
     if (first_ready) |thread_index| {
         thread_table_lock.lock();
         defer thread_table_lock.unlock();
-        const ctx = threadContextMutable(thread_index) orelse return;
-        if (!ctx.allocated or ctx.owner_process != principal) return;
-        ctx.signal_pending = true;
-        setThreadHotSignalPending(thread_index, true);
-    }
-}
-
-pub fn consumeSignal(principal: kernel.PrincipalId) bool {
-    var i: usize = 0;
-    while (i < thread_contexts.len) : (i += 1) {
-        const hot = getThreadHotStateConst(i) orelse continue;
-        if (hot.allocated == 0 or hot.owner_process != principal or hot.signal_pending == 0) continue;
-        thread_table_lock.lock();
-        defer thread_table_lock.unlock();
-        const ctx = threadContextMutable(i) orelse return false;
-        if (!ctx.allocated or ctx.owner_process != principal or !ctx.signal_pending) return false;
-        ctx.signal_pending = false;
-        setThreadHotSignalPending(i, false);
+        const ctx = threadContextMutable(thread_index) orelse return false;
+        if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) return false;
+        ctx.pending_signal = signo;
+        setThreadHotPendingSignal(thread_index, signo);
         return true;
     }
     return false;
+}
+
+pub fn consumeSignal(principal: kernel.PrincipalId) bool {
+    return consumeSignalNumber(principal) != 0;
+}
+
+pub fn consumeSignalNumber(principal: kernel.PrincipalId) u32 {
+    var i: usize = 0;
+    while (i < thread_contexts.len) : (i += 1) {
+        const hot = getThreadHotStateConst(i) orelse continue;
+        if (hot.allocated == 0 or hot.owner_process != principal or hot.pending_signal == 0) continue;
+        thread_table_lock.lock();
+        defer thread_table_lock.unlock();
+        const ctx = threadContextMutable(i) orelse return 0;
+        if (!ctx.allocated or ctx.owner_process != principal or ctx.pending_signal == 0) return 0;
+        const signo = ctx.pending_signal;
+        ctx.pending_signal = 0;
+        setThreadHotPendingSignal(i, 0);
+        return signo;
+    }
+    return 0;
+}
+
+pub fn stopPrincipalThreads(principal: kernel.PrincipalId) usize {
+    var stopped_count: usize = 0;
+    thread_table_lock.lock();
+    defer thread_table_lock.unlock();
+    var i: usize = 0;
+    while (i < thread_contexts.len) : (i += 1) {
+        const ctx = threadContextMutable(i) orelse continue;
+        if (!ctx.allocated or ctx.owner_process != principal) continue;
+        ctx.stopped = true;
+        ctx.ready = false;
+        setThreadHotStopped(i, true);
+        setThreadHotReady(i, false);
+        if (!policyActive()) verifiedBlockThread(i);
+        stopped_count += 1;
+    }
+    return stopped_count;
+}
+
+pub fn continuePrincipalThreads(principal: kernel.PrincipalId) usize {
+    var continued_count: usize = 0;
+    var publish_buf: [initialThreadCapacity]usize = undefined;
+    var publish_count: usize = 0;
+    {
+        thread_table_lock.lock();
+        defer thread_table_lock.unlock();
+        var i: usize = 0;
+        while (i < thread_contexts.len) : (i += 1) {
+            const ctx = threadContextMutable(i) orelse continue;
+            if (!ctx.allocated or ctx.owner_process != principal or !ctx.stopped) continue;
+            ctx.stopped = false;
+            ctx.ready = true;
+            setThreadHotStopped(i, false);
+            setThreadHotReady(i, true);
+            if (!policyActive()) verifiedWakeThread(i);
+            if (publish_count < publish_buf.len) {
+                publish_buf[publish_count] = i;
+                publish_count += 1;
+            }
+            continued_count += 1;
+        }
+    }
+    var i: usize = 0;
+    while (i < publish_count) : (i += 1) {
+        publishThreadReady(publish_buf[i]);
+    }
+    return continued_count;
 }
 
 pub fn releasePrincipalThreads(principal: kernel.PrincipalId) usize {

@@ -10,11 +10,15 @@ pub const syscall_thread_start: u64 = 7;
 pub const syscall_thread_kill: u64 = 8;
 pub const syscall_thread_wait: u64 = 9;
 pub const syscall_thread_exit: u64 = 10;
-pub const syscall_thread_set_fs_base: u64 = 11;
-pub const syscall_thread_set_gs_base: u64 = 12;
-pub const syscall_process_clone: u64 = 13;
-pub const syscall_process_map: u64 = 14;
-pub const syscall_process_map_batch: u64 = 15;
+pub const syscall_process_signal: u64 = 11;
+pub const syscall_process_consume_signal: u64 = 12;
+pub const syscall_process_stop: u64 = 13;
+pub const syscall_process_continue: u64 = 14;
+pub const syscall_thread_set_fs_base: u64 = 15;
+pub const syscall_thread_set_gs_base: u64 = 16;
+pub const syscall_process_clone: u64 = 17;
+pub const syscall_process_map: u64 = 18;
+pub const syscall_process_map_batch: u64 = 19;
 pub const syscall_process_last: u64 = syscall_process_map_batch;
 pub const syscall_process_count: u64 = syscall_process_last - syscall_process_first + 1;
 
@@ -58,6 +62,10 @@ pub const status_size: u64 = 32;
 pub const state_active: u64 = 1;
 pub const state_exited: u64 = 2;
 pub const state_killed: u64 = 3;
+pub const state_stopped: u64 = 4;
+pub const state_continued: u64 = 5;
+
+pub const signal_max: u32 = 64;
 
 pub const process_map_flag_none: u64 = 0;
 pub const process_map_flag_private: u64 = 1 << 0;

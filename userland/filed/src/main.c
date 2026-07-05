@@ -1,6 +1,5 @@
 #include <stdio.h>
 
-#include "filed/exec_linux_lpr.h"
 #include "filed/runtime.h"
 
 int main(int argc, char **argv)
@@ -24,15 +23,6 @@ int main(int argc, char **argv)
         fflush(stdout);
         return 1;
     }
-    status = filed_exec_linux_lpr_prewarm(&runtime);
-    if (status != 0) {
-        printf("[filed] lpr prewarm status=%d\n", status);
-        fflush(stdout);
-    } else {
-        printf("[filed] lpr prewarm ready\n");
-        fflush(stdout);
-    }
-
     printf("[filed] ready\n");
     fflush(stdout);
 

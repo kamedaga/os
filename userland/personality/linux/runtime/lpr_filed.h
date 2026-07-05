@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define LPR_FILED_ENDPOINT_FD 240
+#define LPR_TERMD_TTY_ENDPOINT_FD 242
 
 int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mode);
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count);
@@ -18,6 +19,7 @@ int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf);
 int64_t lpr_linux_fsync(uint64_t fd);
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
+int64_t lpr_linux_flock(uint64_t fd, uint64_t operation);
 int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path, uint64_t statbuf, uint64_t flags);
 int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags);
@@ -35,7 +37,9 @@ int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64
 int64_t lpr_linux_symlinkat(uint64_t target, uint64_t new_dirfd, uint64_t linkpath);
 int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path, uint64_t flags);
 int64_t lpr_linux_pipe2(uint64_t fds, uint64_t flags);
+int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags);
 int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec);
+int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls);
 int64_t lpr_linux_fork(void);
 int64_t lpr_linux_vfork(void);
@@ -43,6 +47,10 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status, uint64_t options, uint64_
 int64_t lpr_linux_execve(uint64_t path, uint64_t argv, uint64_t envp);
 int lpr_linux_filed_fd_active(uint64_t fd);
 uint64_t lpr_linux_filed_fd_handle(uint64_t fd);
+int lpr_linux_eventfd_active(uint64_t fd);
+uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events);
+int lpr_linux_tty_fd_active(uint64_t fd);
+uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events);
 void lpr_linux_readv_cache_trace_dump(void);
 
 #endif

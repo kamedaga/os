@@ -1977,7 +1977,7 @@ static int lpr_exec_load_file_image_into_process(
                 .size = segment->map_size,
                 .prot = segment->prot,
                 .vmo_offset = 0,
-                .flags = PACHA_PROCESS_MAP_SHARED,
+                .flags = PACHA_PROCESS_MAP_PRIVATE,
             };
             close_fds[map_entry_count] = close_segment_vmo ? segment_vmo_fd : -1;
             map_entry_count++;
@@ -2130,7 +2130,7 @@ int lpr_exec_prepare_file_into_map_batch(
             .size = segment->map_size,
             .prot = segment->prot,
             .vmo_offset = 0,
-            .flags = PACHA_PROCESS_MAP_SHARED,
+            .flags = PACHA_PROCESS_MAP_PRIVATE,
         };
         batch->close_fds[batch->count] = close_segment_vmo ? segment_vmo_fd : -1;
         batch->count++;

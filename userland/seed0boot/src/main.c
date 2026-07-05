@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "filed/ipc_protocol.h"
 #include "pacha/ipc.h"
 #include "pachaos_capsule_launcher.h"
 
@@ -35,6 +36,267 @@ static const uint64_t seed0_channel_rights =
     PACHA_FD_RIGHT_RECV |
     PACHA_FD_RIGHT_CALL |
     PACHA_FD_RIGHT_TRANSFER;
+
+enum {
+    SEED0_STORAGE_READY_MAGIC = 0x3159445252545330ull,
+};
+
+static int seed0_register_netd_socket_endpoint(int filed_endpoint_fd, int netd_socket_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16 || netd_socket_endpoint_fd < 16) {
+        return -22;
+    }
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    fd_item.fd = (uint64_t)(uint32_t)netd_socket_endpoint_fd;
+    fd_item.rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_SEND |
+        PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_TRANSFER;
+
+    const uint64_t request_id = 0x53454544304e4554ull;
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT,
+        .word2 = 0,
+        .word3 = request_id,
+        .fds = &fd_item,
+        .fd_count = 1,
+    };
+    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
+        reply.word3 != request_id ||
+        (int64_t)reply.word1 != 0)
+    {
+        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
+    }
+    return 0;
+}
+
+static int seed0_register_termd_tty_endpoint(int filed_endpoint_fd, int termd_tty_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16 || termd_tty_endpoint_fd < 16) {
+        return -22;
+    }
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    fd_item.fd = (uint64_t)(uint32_t)termd_tty_endpoint_fd;
+    fd_item.rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_SEND |
+        PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_TRANSFER;
+
+    const uint64_t request_id = 0x5345454430545459ull;
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT,
+        .word2 = 0,
+        .word3 = request_id,
+        .fds = &fd_item,
+        .fd_count = 1,
+    };
+    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
+        reply.word3 != request_id ||
+        (int64_t)reply.word1 != 0)
+    {
+        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
+    }
+    return 0;
+}
+
+static int seed0_wait_filed_ready(int filed_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16) {
+        return -22;
+    }
+
+    const uint64_t request_id = 0x534545443046494cull;
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = FILED_WIRE_OP_HELLO,
+        .word2 = 0,
+        .word3 = request_id,
+    };
+    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
+        reply.word3 != request_id ||
+        (int64_t)reply.word1 != 0)
+    {
+        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
+    }
+    return 0;
+}
+
+static int seed0_filed_exec_add_string(
+    filed_wire_exec_path_t *exec,
+    filed_wire_exec_string_ref_t *ref,
+    const char *value)
+{
+    if (exec == NULL || ref == NULL || value == NULL) {
+        return -22;
+    }
+    const uint64_t length = (uint64_t)strlen(value) + 1u;
+    if (length == 0 ||
+        length > UINT16_MAX ||
+        exec->string_bytes + length > FILED_WIRE_EXEC_STRING_BYTES)
+    {
+        return -7;
+    }
+    ref->offset = (uint16_t)exec->string_bytes;
+    ref->length = (uint16_t)length;
+    memcpy(exec->strings + exec->string_bytes, value, (size_t)length);
+    exec->string_bytes += length;
+    return 0;
+}
+
+static int seed0_spawn_lpr_hvc_console(int filed_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16) {
+        return -22;
+    }
+
+    const uint64_t rights =
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const int page_fd = pacha_vmo_create(FILED_WIRE_PAGE_BYTES, rights, 0);
+    if (page_fd < 16) {
+        return page_fd;
+    }
+    void *page = pacha_mmap(
+        page_fd,
+        FILED_WIRE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (page == NULL) {
+        (void)pacha_fd_close(page_fd);
+        return -14;
+    }
+
+    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    memset(exec, 0, sizeof(*exec));
+    exec->dir_handle = 0;
+    exec->flags = FILED_WIRE_EXEC_LINUX_LPR;
+    exec->argc = 1;
+    exec->envc = 1;
+    snprintf(exec->path, sizeof(exec->path), "%s", "/cmd/lpr_hvc_console.elf");
+    int status = seed0_filed_exec_add_string(exec, &exec->argv[0], "/cmd/lpr_hvc_console.elf");
+    if (status == 0) {
+        status = seed0_filed_exec_add_string(exec, &exec->envp[0], "LD_LIBRARY_PATH=/lib/linux");
+    }
+    if (status != 0) {
+        (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+        (void)pacha_fd_close(page_fd);
+        return status;
+    }
+
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    fd_item.fd = (uint64_t)(uint32_t)page_fd;
+    fd_item.rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+
+    const uint64_t request_id = 0x5345454430485643ull;
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = FILED_WIRE_OP_EXEC_PATH,
+        .word2 = 0,
+        .word3 = request_id,
+        .fds = &fd_item,
+        .fd_count = 1,
+    };
+    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+
+    struct pacha_ipc_fd reply_fds[2];
+    memset(reply_fds, 0, sizeof(reply_fds));
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.fds = reply_fds;
+    reply.fd_capacity = 2;
+    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
+        reply.word3 != request_id ||
+        (int64_t)reply.word1 != 0)
+    {
+        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
+    }
+    if (reply.fd_count < 2 || reply_fds[0].fd < 16 || reply_fds[1].fd < 16) {
+        if (reply_fds[1].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[1].fd);
+        }
+        if (reply_fds[0].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[0].fd);
+        }
+        return -5;
+    }
+    printf("[seed0boot] hvc console started process_fd=%llu thread_fd=%llu\n",
+        (unsigned long long)reply_fds[0].fd,
+        (unsigned long long)reply_fds[1].fd);
+    (void)pacha_fd_close((int)reply_fds[1].fd);
+    (void)pacha_fd_close((int)reply_fds[0].fd);
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -103,21 +365,95 @@ int main(int argc, char **argv)
         return 14;
     }
 
+    struct pacha_ipc_channel_pair storage_ready_pair = { .a = -1, .b = -1 };
+    if (pacha_ipc_channel_create(&storage_ready_pair, seed0_channel_rights, PACHA_FD_FLAG_INHERIT) != 0 ||
+        storage_ready_pair.a < 16 ||
+        storage_ready_pair.b < 16) {
+        fprintf(stderr,
+            "[seed0boot] storage ready channel create failed a=%d b=%d\n",
+            storage_ready_pair.a,
+            storage_ready_pair.b);
+        return 15;
+    }
+
     printf("[seed0boot] storage_boot starting\n");
-    int capsule_status = seed0_launch_storage_boot_nvme();
+    int capsule_status = seed0_launch_storage_boot_nvme(storage_ready_pair.b);
     if (capsule_status != 0) {
         fprintf(stderr, "[seed0boot] storage_boot launch failed status=%d\n", capsule_status);
         return 17;
     }
+    (void)pacha_fd_close(storage_ready_pair.b);
 
     printf("[seed0boot] storage_boot started\n");
-    printf("[seed0boot] netd starting\n");
-    capsule_status = seed0_launch_netd();
-    if (capsule_status != 0) {
-        fprintf(stderr, "[seed0boot] netd launch failed status=%d\n", capsule_status);
+
+    struct pacha_ipc_fd ready_fds[1];
+    memset(ready_fds, 0, sizeof(ready_fds));
+    struct pacha_ipc_msg ready_msg = {
+        .fds = ready_fds,
+        .fd_capacity = 1,
+    };
+    int ready_status = pacha_ipc_recv_wait(storage_ready_pair.a, &ready_msg, PACHA_FD_WAIT_FOREVER);
+    if (ready_status != 0 ||
+        ready_msg.word0 != SEED0_STORAGE_READY_MAGIC ||
+        ready_msg.word1 != 0 ||
+        ready_msg.fd_count != 1 ||
+        ready_fds[0].fd < 16) {
+        fprintf(stderr,
+            "[seed0boot] storage ready recv failed status=%d word0=0x%llx word1=%llu fds=%llu fd0=%llu\n",
+            ready_status,
+            (unsigned long long)ready_msg.word0,
+            (unsigned long long)ready_msg.word1,
+            (unsigned long long)ready_msg.fd_count,
+            (unsigned long long)ready_fds[0].fd);
         return 18;
     }
+    const int filed_endpoint_fd = (int)ready_fds[0].fd;
+    (void)pacha_fd_close(storage_ready_pair.a);
+    printf("[seed0boot] filed endpoint received fd=%d\n", filed_endpoint_fd);
+
+    const int filed_ready_status = seed0_wait_filed_ready(filed_endpoint_fd);
+    if (filed_ready_status != 0) {
+        fprintf(stderr, "[seed0boot] filed ready wait failed status=%d\n", filed_ready_status);
+        return 19;
+    }
+    printf("[seed0boot] filed ready\n");
+
+    printf("[seed0boot] termd starting\n");
+    int termd_tty_endpoint_fd = -1;
+    capsule_status = seed0_launch_termd(&termd_tty_endpoint_fd);
+    if (capsule_status != 0) {
+        fprintf(stderr, "[seed0boot] termd launch failed status=%d\n", capsule_status);
+        return 20;
+    }
+    printf("[seed0boot] termd started\n");
+    if (termd_tty_endpoint_fd >= 16) {
+        const int register_status = seed0_register_termd_tty_endpoint(filed_endpoint_fd, termd_tty_endpoint_fd);
+        if (register_status != 0) {
+            fprintf(stderr, "[seed0boot] termd tty endpoint register failed status=%d\n", register_status);
+            return 21;
+        }
+        (void)pacha_fd_close(termd_tty_endpoint_fd);
+    }
+    const int hvc_status = seed0_spawn_lpr_hvc_console(filed_endpoint_fd);
+    printf("[seed0boot] hvc console spawn status=%d\n", hvc_status);
+
+    printf("[seed0boot] netd starting\n");
+    int netd_socket_endpoint_fd = -1;
+    capsule_status = seed0_launch_netd(filed_endpoint_fd, &netd_socket_endpoint_fd);
+    if (capsule_status != 0) {
+        fprintf(stderr, "[seed0boot] netd launch failed status=%d\n", capsule_status);
+        return 22;
+    }
     printf("[seed0boot] netd started\n");
+    if (netd_socket_endpoint_fd >= 16) {
+        const int register_status = seed0_register_netd_socket_endpoint(filed_endpoint_fd, netd_socket_endpoint_fd);
+        if (register_status != 0) {
+            fprintf(stderr, "[seed0boot] netd socket endpoint register failed status=%d\n", register_status);
+            return 23;
+        }
+        (void)pacha_fd_close(netd_socket_endpoint_fd);
+    }
+    (void)pacha_fd_close(filed_endpoint_fd);
     printf("[seed0boot] ready\n");
     fflush(stdout);
     fflush(stderr);

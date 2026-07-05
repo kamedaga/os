@@ -228,6 +228,8 @@ pub const TaskObjectState = enum(u8) {
     active = 1,
     exited = 2,
     killed = 3,
+    stopped = 4,
+    continued = 5,
 };
 
 pub const ProcessObject = struct {
@@ -1986,6 +1988,24 @@ pub const KernelState = struct {
         return paddr;
     }
 
+    fn nativeCowTableIsUnique(self: *const KernelState, table_ref: NativeCowTableRef) bool {
+        const table = self.nativeCowTableSlotConst(table_ref) orelse return false;
+        return table.ref_count == 1;
+    }
+
+    fn dirtyCowMappingProt(self: *const KernelState, entry: *const VmaEntry) MapProt {
+        var write = entry.prot.write;
+        if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
+            write = false;
+        }
+        return .{
+            .read = entry.prot.read,
+            .write = write,
+            .exec = entry.prot.exec,
+            .pkey = entry.prot.pkey,
+        };
+    }
+
     fn setNativeCowPagePaddr(
         self: *KernelState,
         table_ref: NativeCowTableRef,
@@ -2027,6 +2047,33 @@ pub const KernelState = struct {
         try self.retainNativeCowTable(table_ref);
         entry.cow_table = table_ref;
         entry.cow_page_offset = 0;
+    }
+
+    fn detachSharedEntryCowTable(self: *KernelState, entry: *VmaEntry, free_list: *FreePageList) KernelError!void {
+        if (entry.cow_table.isNull()) return KernelError.InvalidState;
+        if (self.nativeCowTableIsUnique(entry.cow_table)) return;
+        const old_ref = entry.cow_table;
+        const old_table = self.nativeCowTableSlotConst(old_ref) orelse return KernelError.InvalidState;
+        const new_ref = try self.createNativeCowTable(old_table.page_count);
+        try self.retainNativeCowTable(new_ref);
+        var installed = false;
+        errdefer if (!installed) self.releaseNativeCowTable(new_ref, free_list);
+
+        var page_index: u32 = 0;
+        while (page_index < old_table.page_count) : (page_index += 1) {
+            const src_paddr = vmoBackingPageStorePaddr(old_table.page_store_start, old_table.page_count, page_index) orelse return KernelError.InvalidState;
+            if (src_paddr == 0) continue;
+            const copied_paddr = (self.allocPhysicalPage(free_list) catch return KernelError.OutOfFreePages).paddr;
+            var copied_installed = false;
+            defer if (!copied_installed) free_list.appendPage(0, copied_paddr) catch {};
+            copyPhysicalPage(copied_paddr, src_paddr);
+            try self.setNativeCowPagePaddr(new_ref, page_index, copied_paddr);
+            copied_installed = true;
+        }
+
+        entry.cow_table = new_ref;
+        self.releaseNativeCowTable(old_ref, free_list);
+        installed = true;
     }
 
     fn releaseUnmappedAnonymousVmoPageRange(
@@ -2705,12 +2752,7 @@ pub const KernelState = struct {
             (self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse return null);
         return .{
             .paddr = paddr,
-            .prot = if (dirty_paddr != null) .{
-                .read = entry.prot.read,
-                .write = entry.prot.write,
-                .exec = entry.prot.exec,
-                .pkey = entry.prot.pkey,
-            } else nativeFaultMappingProt(entry),
+            .prot = if (dirty_paddr != null) self.dirtyCowMappingProt(entry) else nativeFaultMappingProt(entry),
         };
     }
 
@@ -2728,12 +2770,7 @@ pub const KernelState = struct {
             (self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse return null);
         return .{
             .paddr = paddr,
-            .prot = if (dirty_paddr != null) .{
-                .read = entry.prot.read,
-                .write = entry.prot.write,
-                .exec = entry.prot.exec,
-                .pkey = entry.prot.pkey,
-            } else nativeFaultMappingProt(entry),
+            .prot = if (dirty_paddr != null) self.dirtyCowMappingProt(entry) else nativeFaultMappingProt(entry),
         };
     }
 
@@ -2878,6 +2915,19 @@ pub const KernelState = struct {
             const page_delta = (fault_page_va - entry.start_va) / native_page_size;
             const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
             if (self.entryDirtyPagePaddr(entry, fault_page_va)) |owned_paddr| {
+                if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
+                    self.detachSharedEntryCowTable(entry, free_list) catch return null;
+                    const detached_paddr = self.entryDirtyPagePaddr(entry, fault_page_va) orelse return null;
+                    return .{
+                        .paddr = detached_paddr,
+                        .prot = .{
+                            .read = entry.prot.read,
+                            .write = entry.prot.write,
+                            .exec = entry.prot.exec,
+                            .pkey = entry.prot.pkey,
+                        },
+                    };
+                }
                 return .{
                     .paddr = owned_paddr,
                     .prot = .{
@@ -3091,6 +3141,7 @@ pub const KernelState = struct {
 
     fn releaseVmaCowPageRange(self: *KernelState, entry: *const VmaEntry, first_page_delta: usize, page_count: usize, free_list: ?*FreePageList) void {
         if (entry.cow_table.isNull() or page_count == 0) return;
+        if (!self.nativeCowTableIsUnique(entry.cow_table)) return;
         if (first_page_delta > std.math.maxInt(u32) or page_count > std.math.maxInt(u32)) return;
         const delta: u32 = @intCast(first_page_delta);
         if (entry.cow_page_offset > std.math.maxInt(u32) - delta) return;

@@ -31,6 +31,8 @@ static int load_one_module(
     int allow_missing_init,
     kb_module_t **out_module)
 {
+    printf("[filed-storage] module lookup name=%s\n", name);
+    fflush(stdout);
     if (out_module != NULL) {
         *out_module = NULL;
     }
@@ -57,6 +59,12 @@ static int load_one_module(
             (unsigned long long)desc->image_size);
         return -2;
     }
+    printf("[filed-storage] module mapped name=%s addr=%p map_bytes=%llu image_bytes=%llu\n",
+        name,
+        mapped_image,
+        (unsigned long long)map_size,
+        (unsigned long long)desc->image_size);
+    fflush(stdout);
 
     kb_module_t *module = NULL;
     const kb_module_image_t image = {
@@ -64,6 +72,10 @@ static int load_one_module(
         .size = (size_t)desc->image_size,
         .name = desc->name,
     };
+    printf("[filed-storage] module open name=%s bytes=%llu\n",
+        name,
+        (unsigned long long)desc->image_size);
+    fflush(stdout);
     kb_status_t status = kb_module_open_image(&image, backend, &module);
     if (status != KB_OK || module == NULL) {
         fprintf(stderr, "[filed-storage] %s open failed status=%s(%d)\n",
@@ -78,6 +90,8 @@ static int load_one_module(
     }
 
     int init_result = 0;
+    printf("[filed-storage] module init start name=%s module=%p\n", name, (void *)module);
+    fflush(stdout);
     status = kb_module_call_init(module, &init_result);
     if (status == KB_ERR_NOT_FOUND && allow_missing_init) {
         return 0;
@@ -90,6 +104,8 @@ static int load_one_module(
             init_result);
         return -4;
     }
+    printf("[filed-storage] module init done name=%s result=%d\n", name, init_result);
+    fflush(stdout);
     return 0;
 }
 
@@ -116,8 +132,17 @@ int koboxd_storage_runtime_init(
     memset(runtime, 0, sizeof(*runtime));
 
     printf("[filed-storage] nvme starting\n");
+    fflush(stdout);
 
+    printf("[filed-storage] device backend create start fd=%llu\n",
+        (unsigned long long)bootstrap->device_fd);
+    fflush(stdout);
     kb_status_t status = kb_pachaos_capsule_device_create(bootstrap->device_fd, &runtime->device_backend);
+    printf("[filed-storage] device backend create done status=%s(%d) backend=%p\n",
+        status_name(status),
+        status,
+        (void *)runtime->device_backend);
+    fflush(stdout);
     if (status != KB_OK || runtime->device_backend == NULL) {
         fprintf(stderr, "[filed-storage] device backend create failed status=%s(%d)\n",
             status_name(status),
@@ -125,7 +150,11 @@ int koboxd_storage_runtime_init(
         return -2;
     }
 
+    printf("[filed-storage] set device backend start backend=%p\n", (void *)runtime->device_backend);
+    fflush(stdout);
     kb_shim_set_device_backend(runtime->device_backend);
+    printf("[filed-storage] set device backend done backend=%p\n", (void *)runtime->device_backend);
+    fflush(stdout);
     int load_status = load_one_module(bootstrap, runtime->device_backend, "nvme-auth.ko", 1, NULL);
     if (load_status != 0) {
         return load_status;

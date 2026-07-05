@@ -15,6 +15,7 @@ for the full license text and copyright notices.
 | musl libc | `userland/fixtures/musl/libc.so`, `userland/fixtures/musl/ld-musl-x86_64.so.1` | MIT | https://musl.libc.org/ |
 | dash | `userland/fixtures/shell/dash.elf` | BSD-3-Clause for the runtime binary | Built from dash 0.5.12. The upstream source tree also contains GPL-2.0+ build helper code in `mksignames.c`, which is not directly linked into dash. |
 | FreeBSD TTY line discipline code | `userland/tty_service/src/bsd_line/` | BSD-2-Clause | Derived from FreeBSD files listed in `userland/tty_service/src/bsd_line/README.md`. |
+| Linux 6.8 TTY sources | `third_party/linux-6.8-tty/` | GPL-1.0+ / GPL-2.0 / GPL-2.0-or-later per file SPDX headers | Imported from Linux kernel v6.8 for the planned `termd` kobox/Linux TTY island. |
 | Cantarell fonts | `tools/Cantarell-Regular.ttf`, `tools/Cantarell-Bold.ttf` | SIL Open Font License 1.1 | https://gitlab.gnome.org/GNOME/cantarell-fonts |
 | JetBrains Mono fonts | `tools/JetBrainsMono-Regular.ttf`, `tools/JetBrainsMono-Bold.ttf` | SIL Open Font License 1.1 | https://github.com/JetBrains/JetBrainsMono |
 
@@ -40,3 +41,13 @@ images as needed.
 
 The small musl-linked smoke/test binaries in `.artifacts/userland-fixtures/`
 are built from local source under `userland/fixtures/src/wsl_musl/`.
+
+## Downloaded Source Dependencies
+
+These files are not intended to be tracked in Git. They are cached under
+`.artifacts/third_party/` for local builds or future integration work.
+
+| Component | Generated files | License | Build script / source |
+|---|---|---|---|
+| libuinet source | `libuinet/` | Mixed permissive notices from libuinet, FreeBSD-derived sources, and bundled libraries; retain per-file notices. The upstream tree has no single top-level license file. | `pack/scripts/download_libuinet.sh`, https://github.com/pkelsey/libuinet |
+| Mbed TLS source | `mbedtls/`, `.artifacts/mbedtls-pachaos/lib/libmbedtls-pachaos.a` | Apache-2.0 OR GPL-2.0-or-later | `pack/scripts/download_mbedtls.sh`, `pack/scripts/build_mbedtls_pachaos.sh`, https://github.com/Mbed-TLS/mbedtls |

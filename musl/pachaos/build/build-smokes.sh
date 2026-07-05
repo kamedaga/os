@@ -15,6 +15,7 @@ app_out="${1:-$out_dir/hello-libc-scaffold.elf}"
 extra_sources="${PACHAOS_MUSL_EXTRA_SOURCES:-}"
 extra_include_dirs="${PACHAOS_MUSL_EXTRA_INCLUDE_DIRS:-}"
 extra_cflags="${PACHAOS_MUSL_EXTRA_CFLAGS:-}"
+extra_link_inputs="${PACHAOS_MUSL_EXTRA_LINK_INPUTS:-}"
 static_pie="${PACHAOS_MUSL_STATIC_PIE:-1}"
 
 rm -rf "$obj_dir" "$sysroot"
@@ -395,6 +396,11 @@ for src in $extra_sources; do
   extra_index=$((extra_index + 1))
 done
 
+extra_link_input_array=()
+for link_input in $extra_link_inputs; do
+  extra_link_input_array+=("$link_input")
+done
+
 link_flags=(
   -target "$target"
   --sysroot "$sysroot"
@@ -424,6 +430,7 @@ fi
   "$sysroot/usr/lib/crti.o" \
   "${app_objects[@]}" \
   -Wl,--start-group \
+  "${extra_link_input_array[@]}" \
   "$sysroot/usr/lib/libc.a" \
   -Wl,--end-group \
   "$sysroot/usr/lib/crtn.o" \

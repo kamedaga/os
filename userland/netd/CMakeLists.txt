@@ -7,6 +7,10 @@ project(netd C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(NETD_ELF "${CMAKE_BINARY_DIR}/netd.elf")
+set(NETD_LIBUINET_ARCHIVE "${REPO_ROOT}/.artifacts/libuinet-pachaos/lib/libuinet.a")
+set(NETD_LIBUINET_INCLUDE "${REPO_ROOT}/.artifacts/libuinet-pachaos/include")
+set(NETD_MBEDTLS_ARCHIVE "${REPO_ROOT}/.artifacts/mbedtls-pachaos/lib/libmbedtls-pachaos.a")
+set(NETD_MBEDTLS_INCLUDE "${REPO_ROOT}/.artifacts/mbedtls-pachaos/include")
 
 set(KOBOX_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/libipc/src/ipc.c
@@ -73,12 +77,41 @@ set(KOBOX_RUNTIME_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/device.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/driver.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/libuinet_backend.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/mbedtls_compat.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/module_stack.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/packet_io.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/socket_service.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/upper.c
 )
 
 string(REPLACE ";" " " KOBOX_RUNTIME_SOURCES_ENV "${KOBOX_RUNTIME_SOURCES}")
+
+add_custom_command(
+  OUTPUT "${NETD_LIBUINET_ARCHIVE}"
+  COMMAND bash "${REPO_ROOT}/pack/scripts/build_libuinet_pachaos.sh"
+  DEPENDS
+    "${REPO_ROOT}/pack/scripts/build_libuinet_pachaos.sh"
+    "${REPO_ROOT}/pack/scripts/download_libuinet.sh"
+    "${REPO_ROOT}/pack/scripts/apply_libuinet_pachaos_overlay.sh"
+    "${REPO_ROOT}/third_party/libuinet/pachaos_overlay/lib/libuinet/api_include/uinet_pachaos_api.h"
+    "${REPO_ROOT}/third_party/libuinet/pachaos_overlay/lib/libuinet/uinet_if_pachaos.c"
+    "${REPO_ROOT}/third_party/libuinet/pachaos_overlay/lib/libuinet/uinet_if_pachaos.h"
+    "${REPO_ROOT}/third_party/libuinet/pachaos_overlay/lib/libuinet/uinet_pachaos_host.c"
+  WORKING_DIRECTORY "${REPO_ROOT}"
+  VERBATIM
+)
+
+add_custom_command(
+  OUTPUT "${NETD_MBEDTLS_ARCHIVE}"
+  COMMAND bash "${REPO_ROOT}/pack/scripts/build_mbedtls_pachaos.sh"
+  DEPENDS
+    "${REPO_ROOT}/pack/scripts/build_mbedtls_pachaos.sh"
+    "${REPO_ROOT}/pack/scripts/download_mbedtls.sh"
+  WORKING_DIRECTORY "${REPO_ROOT}"
+  VERBATIM
+)
 
 add_custom_command(
   OUTPUT "${NETD_ELF}"
@@ -86,19 +119,31 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOX_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
+      "PACHAOS_MUSL_EXTRA_LINK_INPUTS=${NETD_LIBUINET_ARCHIVE} ${NETD_MBEDTLS_ARCHIVE}"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${NETD_LIBUINET_INCLUDE} ${NETD_MBEDTLS_INCLUDE} ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -DNETD_WITH_LIBUINET -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${NETD_ELF}"
   DEPENDS
+    "${NETD_LIBUINET_ARCHIVE}"
+    "${NETD_MBEDTLS_ARCHIVE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/netd_internal.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/device.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/driver.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libuinet_backend.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libuinet_backend.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mbedtls_compat.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/metrics.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/module_stack.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/packet_io.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/socket_service.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/socket_service.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/upper.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/upper.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/netd/boot_config.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/netd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"

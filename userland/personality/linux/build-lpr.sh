@@ -27,6 +27,8 @@ clang \
   -I"$repo_root/userland/libpacha/include" \
   -I"$repo_root/userland/libipc/include" \
   -I"$repo_root/userland/filed/include" \
+  -I"$repo_root/userland/netd/include" \
+  -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/personality/linux/hde" \
   -DHDE64_USE_LPR_MEMSET=1 \
   "$repo_root/userland/personality/linux/runtime/lpr_runtime.c" \
@@ -35,6 +37,7 @@ clang \
   "$repo_root/userland/personality/linux/runtime/lpr_memory.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs_local.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_filed.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_socket.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_dispatch.c" \
   "$repo_root/userland/personality/linux/runtime/support/arena.c" \
   "$repo_root/userland/personality/linux/runtime/support/elf.c" \

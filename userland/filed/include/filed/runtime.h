@@ -39,6 +39,8 @@ typedef struct filed_runtime {
     filed_tmpfs_backend_t tmpfs;
     int bootstrap_fd;
     int client_endpoint_fd;
+    int netd_socket_endpoint_fd;
+    int termd_tty_endpoint_fd;
     filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
     filed_file_vmo_cache_entry_t file_vmo_cache[FILED_RUNTIME_FILE_VMO_CACHE_SLOTS];
     uint64_t request_sequence;

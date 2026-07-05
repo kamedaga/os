@@ -255,6 +255,34 @@ pub fn presentUserPagePaddr(principal: kernel.PrincipalId, va: u64) ?u64 {
     return ptePaddr(entry);
 }
 
+pub fn writeProtectPresentUserPagesForForkCow(principal: kernel.PrincipalId, va_start: u64, size_bytes: u64) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if ((va_start & 0xFFF) != 0 or (size_bytes & 0xFFF) != 0) return false;
+    if (size_bytes == 0) return true;
+    _ = userRangeEndVa(h, va_start, size_bytes) orelse return false;
+
+    var changed = false;
+    var offset: u64 = 0;
+    while (offset < size_bytes) : (offset += 4096) {
+        const va = va_start + offset;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const old_entry = pt_page[index.pt];
+        if ((old_entry & h.page_present) == 0 or (old_entry & h.page_user) == 0) continue;
+        if ((old_entry & h.page_rw) == 0) continue;
+        pt_page[index.pt] = old_entry & ~h.page_rw;
+        changed = true;
+    }
+    if (changed) {
+        h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_bytes));
+    }
+    return true;
+}
+
 fn reservationEndPage(base_va: u64, page_count: u64) ?u64 {
     if (page_count == 0) return null;
     if ((base_va & 0xFFF) != 0) return null;

@@ -100,28 +100,18 @@ fn cloneUserFrameFromVa(h: anytype, proc: kernel.PrincipalId, frame_va: u64, sys
     return child;
 }
 
-fn copyForkAnonymousPresentPages(state: *kernel.KernelState, from: kernel.PrincipalId, to: kernel.PrincipalId, free_list: *kernel.FreePageList) u64 {
+fn writeProtectForkCowVmas(state: *kernel.KernelState, from: kernel.PrincipalId) u64 {
     const source_table = state.getVmaTable(from) orelse return sc.syscall_err_invalid;
-    var copied_pages: u64 = 0;
-    var scanned_vmas: u64 = 0;
     var active_index: usize = 0;
     while (active_index < source_table.active_count) : (active_index += 1) {
         const entry_index: usize = @intCast(source_table.active_indices[active_index]);
         const source_entry = &source_table.entries[entry_index];
         if (!source_entry.active) continue;
         if (!source_entry.flags.fork_cow) continue;
-        scanned_vmas += 1;
-        var va = source_entry.start_va;
-        while (va < source_entry.endVa()) : (va += kernel.native_page_size) {
-            const src_paddr = user_vm.presentUserPagePaddr(from, va) orelse continue;
-            state.copyForkAnonymousPresentPageToChild(to, entry_index, va, src_paddr, free_list) catch |err| return switch (err) {
-                kernel.KernelError.OutOfFreePages, kernel.KernelError.TableFull => sc.syscall_err_alloc,
-                else => sc.syscall_err_invalid,
-            };
-            copied_pages += 1;
+        if (!user_vm.writeProtectPresentUserPagesForForkCow(from, source_entry.start_va, source_entry.size_bytes)) {
+            return sc.syscall_err_map;
         }
     }
-    kernel_log.writeFmt("[process.clone] fork anon copy vmas={} pages={}\n", .{ scanned_vmas, copied_pages });
     return sc.syscall_ok;
 }
 
@@ -130,7 +120,13 @@ fn stateWord(state: kernel.TaskObjectState) u64 {
         .active => process_abi.state_active,
         .exited => process_abi.state_exited,
         .killed => process_abi.state_killed,
+        .stopped => process_abi.state_stopped,
+        .continued => process_abi.state_continued,
     };
+}
+
+fn processRunnable(state: kernel.TaskObjectState) bool {
+    return state == .active or state == .continued;
 }
 
 fn writeProcessStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, process: kernel.ProcessObject) u64 {
@@ -220,7 +216,7 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
     if (!isUserEntryVa(frame.rsi) or !isUserEntryVa(frame.rdx)) return sc.syscall_err_invalid;
     if (frame.r8 != 0 and !user_vm.isUserCanonicalVa(frame.r8)) return sc.syscall_err_invalid;
     const process = state.processObjectForFd(proc, @intCast(frame.rdi), .{ .spawn = true, .set_context = true }) orelse return sc.syscall_err_invalid;
-    if (process.state != .active) return sc.syscall_err_invalid;
+    if (!processRunnable(process.state)) return sc.syscall_err_invalid;
     const owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
     if (!state.hasActivePrincipal(owner)) return sc.syscall_err_invalid;
     const thread_index = scheduler.allocateSuspendedThread(owner, h.user_spaces, buildUserTrapFrame(frame.rsi, frame.rdx), h.free_list) orelse return sc.syscall_err_alloc;
@@ -275,8 +271,8 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         kernel.KernelError.TableFull => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
     };
-    const copy_status = copyForkAnonymousPresentPages(state, proc, child, h.free_list);
-    if (copy_status != sc.syscall_ok) return copy_status;
+    const protect_status = writeProtectForkCowVmas(state, proc);
+    if (protect_status != sc.syscall_ok) return protect_status;
     if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) return sc.syscall_err_map;
 
     const child_frame = if ((frame.rsi & process_abi.process_clone_flag_user_frame) != 0)
@@ -310,7 +306,7 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
 
 fn startThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) u64 {
     const thread = state.threadObjectForFd(proc, fd, .{ .start = true }) orelse return sc.syscall_err_invalid;
-    if (thread.state != .active or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
+    if (!processRunnable(thread.state) or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
     if (!scheduler.markThreadReady(@intCast(thread.thread_index), true)) return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
@@ -320,6 +316,40 @@ fn killThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.F
     if (threadObjectIsLive(thread)) {
         _ = scheduler.releaseThread(@intCast(thread.thread_index));
     }
+    return sc.syscall_ok;
+}
+
+fn signalProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, signo: u32) u64 {
+    if (signo == 0 or signo > process_abi.signal_max) return sc.syscall_err_invalid;
+    const process = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
+    if (!processRunnable(process.state)) return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
+    if (!scheduler.deliverSignal(target, signo)) return sc.syscall_err_not_ready;
+    return sc.syscall_ok;
+}
+
+fn consumeCurrentSignal() u64 {
+    return scheduler.consumeSignalNumber(scheduler.currentPrincipal());
+}
+
+fn stopProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
+    const process = state.setProcessObjectStateForFd(proc, fd, .{ .kill = true }, .stopped, code) catch return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
+    state.markProcessObjectsExited(target, .stopped, code);
+    state.markThreadObjectsExitedForPrincipal(target, .stopped, code);
+    _ = scheduler.stopPrincipalThreads(target);
+    return sc.syscall_ok;
+}
+
+fn continueProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
+    const process = state.setProcessObjectStateForFd(proc, fd, .{ .kill = true }, .continued, code) catch return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
+    state.markProcessObjectsExited(target, .continued, code);
+    state.markThreadObjectsExitedForPrincipal(target, .continued, code);
+    _ = scheduler.continuePrincipalThreads(target);
     return sc.syscall_ok;
 }
 
@@ -507,7 +537,7 @@ fn mapIntoProcess(
         kernel_log.write("process.map failed process-fd\n");
         return sc.syscall_err_invalid;
     };
-    if (process.state != .active) {
+    if (!processRunnable(process.state)) {
         kernel_log.write("process.map failed process-state\n");
         return sc.syscall_err_invalid;
     }
@@ -564,7 +594,7 @@ fn mapBatchIntoProcess(
     }
 
     const process = state.processObjectForFd(proc, process_fd, .{ .map_into = true }) orelse return sc.syscall_err_invalid;
-    if (process.state != .active) return sc.syscall_err_invalid;
+    if (!processRunnable(process.state)) return sc.syscall_err_invalid;
     const target_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
     if (!state.hasActivePrincipal(target_owner)) return sc.syscall_err_invalid;
 
@@ -641,6 +671,10 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_thread_kill => killThread(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
         sc.syscall_thread_wait => waitThread(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_thread_exit => exitCurrentThread(h, state, proc, frame, @truncate(frame.rdi)),
+        sc.syscall_process_signal => signalProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
+        sc.syscall_process_consume_signal => consumeCurrentSignal(),
+        sc.syscall_process_stop => stopProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
+        sc.syscall_process_continue => continueProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
         sc.syscall_thread_set_fs_base => blk: {
             const fs_base = frame.rdi;
             if (fs_base != 0 and !user_vm.isUserCanonicalVa(fs_base)) break :blk sc.syscall_err_invalid;

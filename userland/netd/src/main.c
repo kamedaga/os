@@ -1,6 +1,7 @@
 #include "netd_internal.h"
 
 #include "kobox/module.h"
+#include "socket_service.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -10,17 +11,17 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
 {
     if (cfg == NULL ||
         cfg->magic != NETD_BOOT_CONFIG_MAGIC ||
-        cfg->version != NETD_BOOT_CONFIG_VERSION ||
         cfg->device_fd < 16 ||
+        cfg->socket_endpoint_fd < 16 ||
         cfg->module_count == 0 ||
         cfg->module_count > NETD_MAX_MODULES ||
         (cfg->flags & ~(NETD_BOOT_FLAG_SMOKE | NETD_BOOT_FLAG_TRACE | NETD_BOOT_FLAG_METRIC)) != 0) {
         if (cfg != NULL) {
             fprintf(stderr,
-                "[netd] invalid boot config magic=0x%llx version=%llu fd=%llu modules=%llu\n",
+                "[netd] invalid boot config magic=0x%llx fd=%llu socket_fd=%llu modules=%llu\n",
                 (unsigned long long)cfg->magic,
-                (unsigned long long)cfg->version,
                 (unsigned long long)cfg->device_fd,
+                (unsigned long long)cfg->socket_endpoint_fd,
                 (unsigned long long)cfg->module_count);
         }
         return 0;
@@ -45,8 +46,9 @@ int main(int argc, char **argv)
 
     netd_metrics_set_enabled((cfg->flags & NETD_BOOT_FLAG_METRIC) != 0);
 
-    printf("[netd] start device_fd=%llu modules=%llu loader=%s\n",
+    printf("[netd] start device_fd=%llu socket_fd=%llu modules=%llu loader=%s\n",
         (unsigned long long)cfg->device_fd,
+        (unsigned long long)cfg->socket_endpoint_fd,
         (unsigned long long)cfg->module_count,
         kb_module_loader_version());
     uint64_t total_start_cycles = netd_metrics_read_tsc();
@@ -67,6 +69,10 @@ int main(int argc, char **argv)
     if (status != 0) {
         return status;
     }
+    status = netd_socket_service_start(&runtime);
+    if (status != 0) {
+        return status;
+    }
 
     printf("[netd] ready\n");
     netd_metrics_record("total_to_ready", total_start_cycles, netd_metrics_read_tsc());
@@ -76,6 +82,7 @@ int main(int argc, char **argv)
 
     for (;;) {
         netd_packet_io_pump_once();
+        netd_socket_service_poll();
         for (unsigned i = 0; i < 4096; i++) {
             __asm__ volatile("pause");
         }

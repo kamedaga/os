@@ -41,9 +41,7 @@ skip:
     - "apk_arch"
     - "apk_repositories"
     - "apk_world"
-    - "ca_certificates"
     - "capsule_demo"
-    - "curl"
     - "dash"
     - "dns_lookup"
     - "esp_server"
@@ -173,10 +171,12 @@ apps:
     rootfs: ["/cmd/capsule_demo.elf", "/bin/capsule_demo"]
   curl:
     file:
-      path: ".artifacts/userland-fixtures/curl.elf"
-      rebuild: ["bash", "tools/build_wsl_curl.sh"]
-    out: "CURL.ELF"
-    rootfs: ["/cmd/curl.elf", "/bin/curl"]
+      path: ".artifacts/userland-fixtures/curl-root"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input:
+        - "tools/build_wsl_curl.sh"
+    out: "CURLROOT"
+    rootfs: "/"
   dash:
     file: "userland/fixtures/shell/dash.elf"
     out: "DASH.ELF"
@@ -360,6 +360,109 @@ apps:
     out: "VIRTNET.KO"
     bootfs: "/srv/kobox/virtio_net.ko"
     rootfs: "/usr/lib/kobox/virtio_net.ko"
+  kobox_linux_tty_core:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_tty_core.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "TTYCORE.KO"
+    bootfs: "/srv/kobox/linux_tty_core.ko"
+    rootfs: "/usr/lib/kobox/linux_tty_core.ko"
+  kobox_linux_tty_n_null:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_tty_n_null.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "TTYNULL.KO"
+    bootfs: "/srv/kobox/linux_tty_n_null.ko"
+    rootfs: "/usr/lib/kobox/linux_tty_n_null.ko"
+  kobox_linux_virtio:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_virtio.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "LXVIRT.KO"
+    bootfs: "/srv/kobox/linux_virtio.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio.ko"
+  kobox_linux_virtio_ring:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_virtio_ring.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "LXVTRNG.KO"
+    bootfs: "/srv/kobox/linux_virtio_ring.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_ring.ko"
+  kobox_linux_virtio_pci_modern_dev:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_virtio_pci_modern_dev.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "LXVMODN.KO"
+    bootfs: "/srv/kobox/linux_virtio_pci_modern_dev.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_pci_modern_dev.ko"
+  kobox_linux_virtio_pci_legacy_dev:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_virtio_pci_legacy_dev.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "LXVLEGD.KO"
+    bootfs: "/srv/kobox/linux_virtio_pci_legacy_dev.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_pci_legacy_dev.ko"
+  kobox_linux_virtio_pci:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_virtio_pci.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "LXVPCI.KO"
+    bootfs: "/srv/kobox/linux_virtio_pci.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_pci.ko"
+  kobox_linux_virtio_console:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_virtio_console.ko"
+      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
+      input:
+        - "pack/scripts/build_linux_kconfig_tools.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "third_party/linux-6.8-tty"
+    out: "TTYVCON.KO"
+    bootfs: "/srv/kobox/linux_virtio_console.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_console.ko"
   kobox_run:
     file:
       path: ".artifacts/userland-fixtures/kobox/kobox-run.elf"
@@ -458,6 +561,24 @@ apps:
         - "userland/fixtures/linux/lpr_ldmusl_smoke.c"
     out: "LPRLDMUS.ELF"
     rootfs: "/cmd/lpr_ldmusl_smoke.elf"
+  lpr_pty_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_pty_probe.elf"
+      rebuild: ["bash", "tools/build_lpr_pty_probe.sh", ".artifacts/userland-fixtures/lpr_pty_probe.elf"]
+      input:
+        - "tools/build_lpr_pty_probe.sh"
+        - "userland/fixtures/linux/lpr_pty_probe.c"
+    out: "LPRPTY.ELF"
+    rootfs: "/cmd/lpr_pty_probe.elf"
+  lpr_hvc_console:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_hvc_console.elf"
+      rebuild: ["bash", "tools/build_lpr_hvc_console.sh", ".artifacts/userland-fixtures/lpr_hvc_console.elf"]
+      input:
+        - "tools/build_lpr_hvc_console.sh"
+        - "userland/fixtures/linux/lpr_hvc_console.c"
+    out: "LPRHVC.ELF"
+    rootfs: "/cmd/lpr_hvc_console.elf"
   lpr_busybox_dynamic:
     file:
       path: ".artifacts/userland-fixtures/lpr-busybox-dynamic-root"
@@ -638,6 +759,13 @@ apps:
         - "tools/copy_lpr_linux_musl.sh"
     out: "ROOT"
     rootfs: "/"
+  libuinet_source:
+    role: "asset"
+    file:
+      path: ".artifacts/third_party/libuinet"
+      rebuild: ["bash", "pack/scripts/download_libuinet.sh", ".artifacts/third_party/libuinet"]
+      input:
+        - "pack/scripts/download_libuinet.sh"
   pachaos_capsule:
     role: "service"
     file:
@@ -667,11 +795,32 @@ apps:
         - "userland/libpacha/src"
         - "musl/pachaos/include"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "userland/filed/include"
         - "userland/netd/src"
         - "userland/netd/include"
     out: "NETD.ELF"
     bootfs: "/srv/netd.elf"
     rootfs: "/srv/netd.elf"
+  termd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/termd/termd.elf"
+      rebuild: ["cmake", "--build", ".artifacts/cmake/termd", "--parallel", "1"]
+      input:
+        - "userland/termd/CMakeLists.txt"
+        - "userland/termd/src"
+        - "userland/termd/include"
+        - "third_party/linux-6.8-tty"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "TERMD.ELF"
+    bootfs: "/srv/termd.elf"
+    rootfs: "/srv/termd.elf"
   storage_boot:
     role: "service"
     file:
@@ -706,6 +855,7 @@ apps:
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/seed0boot/src"
         - "userland/netd/include"
+        - "userland/termd/include"
         - "userland/pachaos_capsule/include"
         - "userland/storage_boot/include"
     out: "SEED0BT.ELF"
@@ -736,7 +886,7 @@ apps:
   seed0root_boot_profile:
     file:
       path: ".artifacts/seed0root_boot_profile.txt"
-      rebuild: ["bash", "-lc", "mkdir -p .artifacts && printf 'lpr\\n' > .artifacts/seed0root_boot_profile.txt"]
+      rebuild: ["bash", "-lc", "mkdir -p .artifacts && : > .artifacts/seed0root_boot_profile.txt"]
     out: "BOOTPROFILE.TXT"
     rootfs: "/etc/pacha_boot_profile"
   filed:

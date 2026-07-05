@@ -153,13 +153,14 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *req
     }
     stage_start = lpr_exec_now_ns();
     stage_start_cycles = lpr_exec_now_cycles();
-    const long stack_map = pacha_process_map(
+    const long stack_map = pacha_process_map_flags(
         plan->process_fd,
         stack_fd,
         PACHA_PROCESS_MAP_ANYWHERE,
         PACHA_PROCESS_DEFAULT_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
-        0);
+        0,
+        PACHA_PROCESS_MAP_PRIVATE);
     lpr_exec_metric("start_stack_map_child", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_stack_map_child", stage_start_cycles, lpr_exec_now_cycles());
     if (stack_map < 4096) {

@@ -1,6 +1,7 @@
 #include "netd_internal.h"
 
 #include "linux_subsystem/net/net_device.h"
+#include "upper.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -24,7 +25,6 @@ struct netd_packet_io {
     uint64_t rx_frames;
     uint64_t tx_frames;
     uint64_t rx_drops;
-    uint64_t upper_delivered;
     int trace;
 };
 
@@ -68,17 +68,16 @@ static void netd_packet_rx_callback(void *ctx, void *dev, const void *frame, siz
     }
 }
 
-static void netd_packet_deliver_upper(const struct netd_rx_frame *frame)
-{
-    (void)frame;
-    g_packet_io.upper_delivered++;
-}
-
 static void netd_packet_io_drain_rx(void)
 {
     while (g_packet_io.rx_count != 0) {
         const struct netd_rx_frame *frame = &g_packet_io.rx_queue[g_packet_io.rx_head];
-        netd_packet_deliver_upper(frame);
+        const struct netd_upper_frame upper_frame = {
+            .dev = frame->dev,
+            .bytes = frame->bytes,
+            .len = frame->len,
+        };
+        (void)netd_upper_receive_frame(&upper_frame);
         g_packet_io.rx_head = (g_packet_io.rx_head + 1u) % NETD_RX_QUEUE_CAP;
         g_packet_io.rx_count--;
     }
@@ -134,7 +133,7 @@ static int netd_packet_io_smoke(void)
         tx_status,
         (unsigned long long)g_packet_io.tx_frames,
         (unsigned long long)g_packet_io.rx_frames,
-        (unsigned long long)g_packet_io.upper_delivered,
+        (unsigned long long)netd_upper_delivered_frames(),
         (unsigned long long)g_packet_io.rx_drops);
     return tx_status == 0 ? 0 : 1;
 }
@@ -147,6 +146,10 @@ int netd_packet_io_start(struct netd_runtime *runtime)
 
     memset(&g_packet_io, 0, sizeof(g_packet_io));
     g_packet_io.trace = (runtime->cfg->flags & NETD_BOOT_FLAG_TRACE) != 0;
+    int upper_status = netd_upper_start(runtime);
+    if (upper_status != 0) {
+        return upper_status;
+    }
     kb_net_device_set_rx_frame_callback(netd_packet_rx_callback, &g_packet_io);
 
     if ((runtime->cfg->flags & NETD_BOOT_FLAG_SMOKE) != 0) {
@@ -164,4 +167,5 @@ void netd_packet_io_pump_once(void)
 {
     kb_net_device_poll();
     netd_packet_io_drain_rx();
+    netd_upper_poll();
 }

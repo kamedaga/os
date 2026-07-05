@@ -177,12 +177,20 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 	}
 	var consoleArgs []string
 	if opts.NewTerminal {
+		if plan.ConsoleSocket == "" {
+			span.Fail("console terminal failed")
+			return Result{}, fmt.Errorf("--new-terminal requires virtio-console")
+		}
 		if opts.DryRun {
 			span.Set(2, "preparing console preview")
-			consoleArgs = consoleTerminalPreview(workspace, plan.ConsoleSocket)
+			consoleArgs, err = consoleTerminalPreview(workspace, plan.ConsoleSocket, plan.HostTimeLog)
+			if err != nil {
+				span.Fail("console terminal failed")
+				return Result{}, err
+			}
 		} else {
 			span.Set(2, "preparing console terminal")
-			consoleArgs, err = consoleTerminalCommand(workspace, plan.ConsoleSocket)
+			consoleArgs, err = consoleTerminalCommand(workspace, plan.ConsoleSocket, plan.HostTimeLog)
 			if err != nil {
 				span.Fail("console terminal failed")
 				return Result{}, err
@@ -232,14 +240,16 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 			span.Done("qemu exited")
 			return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog}, nil
 		}
-		span.Message("starting console terminal")
-		consoleCmd := exec.Command(consoleArgs[0], consoleArgs[1:]...)
-		consoleCmd.Dir = workspace.Root
-		if err := consoleCmd.Start(); err != nil {
-			_ = cmd.Process.Kill()
-			<-done
-			span.Fail("console terminal start failed")
-			return Result{}, err
+		if opts.NewTerminal {
+			span.Message("starting console terminal")
+			consoleCmd := exec.Command(consoleArgs[0], consoleArgs[1:]...)
+			consoleCmd.Dir = workspace.Root
+			if err := consoleCmd.Start(); err != nil {
+				_ = cmd.Process.Kill()
+				<-done
+				span.Fail("console terminal start failed")
+				return Result{}, err
+			}
 		}
 	}
 	span.Done("qemu started")
@@ -253,7 +263,7 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 	span := progress.Use(opts.Progress).Start("qemu smoke", 4)
 	defer span.Close()
 	if opts.Timeout <= 0 {
-		opts.Timeout = 45 * time.Second
+		opts.Timeout = 30 * time.Second
 	}
 	if opts.Marker == "" {
 		opts.Marker = "[seed2_root] manifest scheduler done"
@@ -381,16 +391,16 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	span := progress.Use(opts.Progress).Start("qemu tty test", 6)
 	defer span.Close()
 	if opts.Timeout <= 0 {
-		opts.Timeout = 60 * time.Second
+		opts.Timeout = 30 * time.Second
 	}
 	if opts.BootMarker == "" {
-		opts.BootMarker = "[seed2_root] manifest scheduler done"
+		opts.BootMarker = "[seed0boot] hvc console spawn status=0"
 	}
 	if len(opts.Send) == 0 && opts.Python == "" {
-		opts.Send = []string{"/bin/fastfetch"}
+		opts.Send = []string{"hello from pacgo"}
 	}
 	if len(opts.Expect) == 0 && opts.Python == "" {
-		opts.Expect = []string{"PachaOS"}
+		opts.Expect = []string{"PachaOS hvc0 ready", "pacha-hvc received: hello from pacgo"}
 	}
 
 	span.Set(1, "building qemu command")
@@ -503,6 +513,18 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		return result, fmt.Errorf("qemu exited before virtio-console socket was ready")
 	}
 
+	var ttyClient *ttyConsoleClient
+	if opts.Python == "" {
+		ttyClient, err = startTTYConsoleClient(plan.ConsoleSocket, consoleFile)
+		if err != nil {
+			terminateQEMU(cmd, done)
+			scanners.Wait()
+			span.Fail("virtio-console connect failed")
+			return result, err
+		}
+		defer ttyClient.Close()
+	}
+
 	span.Set(4, "waiting for boot marker")
 	timer := time.NewTimer(opts.Timeout)
 	defer timer.Stop()
@@ -528,7 +550,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		testErr = runPythonTTYTest(workspace, plan.ConsoleSocket, result, opts)
 	} else {
 		span.Set(5, "sending tty input")
-		result.Sent, result.Matched, testErr = runSendExpectTTY(plan.ConsoleSocket, opts.Send, opts.Expect, opts.Timeout, consoleFile)
+		result.Sent, result.Matched, testErr = ttyClient.SendAndExpect(opts.Send, opts.Expect, opts.Timeout)
 	}
 
 	span.Set(6, "stopping qemu")
@@ -542,16 +564,26 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	return result, nil
 }
 
-func runSendExpectTTY(socketPath string, sends []string, expects []string, timeout time.Duration, consoleFile *os.File) (int, []string, error) {
+type ttyConsoleClient struct {
+	conn        net.Conn
+	consoleFile *os.File
+	output      strings.Builder
+	outputMu    sync.Mutex
+	readDone    chan error
+	closeOnce   sync.Once
+}
+
+func startTTYConsoleClient(socketPath string, consoleFile *os.File) (*ttyConsoleClient, error) {
 	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	defer conn.Close()
 
-	var output strings.Builder
-	var outputMu sync.Mutex
-	readDone := make(chan error, 1)
+	client := &ttyConsoleClient{
+		conn:        conn,
+		consoleFile: consoleFile,
+		readDone:    make(chan error, 1),
+	}
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -559,21 +591,33 @@ func runSendExpectTTY(socketPath string, sends []string, expects []string, timeo
 			if n > 0 {
 				chunk := buf[:n]
 				_, _ = consoleFile.Write(chunk)
-				outputMu.Lock()
-				_, _ = output.Write(chunk)
-				outputMu.Unlock()
+				client.outputMu.Lock()
+				_, _ = client.output.Write(chunk)
+				client.outputMu.Unlock()
 			}
 			if err != nil {
 				if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
-					readDone <- nil
+					client.readDone <- nil
 				} else {
-					readDone <- err
+					client.readDone <- err
 				}
 				return
 			}
 		}
 	}()
+	return client, nil
+}
 
+func (client *ttyConsoleClient) Close() {
+	if client == nil {
+		return
+	}
+	client.closeOnce.Do(func() {
+		_ = client.conn.Close()
+	})
+}
+
+func (client *ttyConsoleClient) SendAndExpect(sends []string, expects []string, timeout time.Duration) (int, []string, error) {
 	sent := 0
 	for _, value := range sends {
 		if value == "" {
@@ -582,10 +626,10 @@ func runSendExpectTTY(socketPath string, sends []string, expects []string, timeo
 		if !strings.HasSuffix(value, "\n") {
 			value += "\n"
 		}
-		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if _, err := io.WriteString(conn, value); err != nil {
-			_ = conn.Close()
-			<-readDone
+		_ = client.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.WriteString(client.conn, value); err != nil {
+			client.Close()
+			<-client.readDone
 			return sent, nil, err
 		}
 		sent++
@@ -598,9 +642,9 @@ func runSendExpectTTY(socketPath string, sends []string, expects []string, timeo
 	matched := make([]string, 0, len(expects))
 	seen := make(map[string]bool, len(expects))
 	for {
-		outputMu.Lock()
-		text := output.String()
-		outputMu.Unlock()
+		client.outputMu.Lock()
+		text := client.output.String()
+		client.outputMu.Unlock()
 		for _, expect := range expects {
 			if expect == "" || seen[expect] {
 				continue
@@ -611,15 +655,15 @@ func runSendExpectTTY(socketPath string, sends []string, expects []string, timeo
 			}
 		}
 		if len(matched) == len(expects) {
-			_ = conn.Close()
-			<-readDone
+			client.Close()
+			<-client.readDone
 			return sent, matched, nil
 		}
 		select {
-		case err := <-readDone:
-			outputMu.Lock()
-			text = output.String()
-			outputMu.Unlock()
+		case err := <-client.readDone:
+			client.outputMu.Lock()
+			text = client.output.String()
+			client.outputMu.Unlock()
 			for _, expect := range expects {
 				if expect == "" || seen[expect] {
 					continue
@@ -638,11 +682,20 @@ func runSendExpectTTY(socketPath string, sends []string, expects []string, timeo
 			return sent, matched, fmt.Errorf("virtio-console closed before expected output")
 		case <-ticker.C:
 		case <-deadline.C:
-			_ = conn.Close()
-			<-readDone
+			client.Close()
+			<-client.readDone
 			return sent, matched, fmt.Errorf("expected console output not found within %s: %s", timeout, strings.Join(missingExpectations(expects, seen), ", "))
 		}
 	}
+}
+
+func runSendExpectTTY(socketPath string, sends []string, expects []string, timeout time.Duration, consoleFile *os.File) (int, []string, error) {
+	client, err := startTTYConsoleClient(socketPath, consoleFile)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer client.Close()
+	return client.SendAndExpect(sends, expects, timeout)
 }
 
 func runPythonTTYTest(workspace *config.Workspace, socketPath string, result TTYTestResult, opts TTYTestOptions) error {
@@ -740,6 +793,30 @@ func qemuDiskPathAndFormat(workspace *config.Workspace, opts Options) (string, s
 	return diskPath, diskFormat, nil
 }
 
+func appendConsoleArgs(workspace *config.Workspace, args []string, opts Options) ([]string, string, error) {
+	console := opts.Console
+	if console == "" && opts.NewTerminal {
+		console = "pty"
+	}
+	switch console {
+	case "", "none", "off":
+		return args, "", nil
+	case "pty":
+		socketPath, err := consoleSocketPath(workspace)
+		if err != nil {
+			return nil, "", err
+		}
+		args = append(args,
+			"-chardev", "socket,id=virtcon0,path="+socketPath+",server=on,wait=off",
+			"-device", "virtio-serial-pci,disable-legacy=on,id=virtserial0",
+			"-device", "virtconsole,chardev=virtcon0,name=org.pachaos.console.0",
+		)
+		return args, socketPath, nil
+	default:
+		return nil, "", fmt.Errorf("invalid console %q; expected off, none, or pty", opts.Console)
+	}
+}
+
 func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Options) (commandPlan, error) {
 	imagePath := opts.LimineImage
 	imagePath, err := limineImagePath(workspace, imagePath)
@@ -786,11 +863,17 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		args = append(args, "-enable-kvm")
 	}
 	args = appendNetworkArgs(args, opts.NoNet)
+	var consoleSocket string
+	args, consoleSocket, err = appendConsoleArgs(workspace, args, opts)
+	if err != nil {
+		return commandPlan{}, err
+	}
 	args = append(args, opts.ExtraArgs...)
 	return commandPlan{
-		Args:        args,
-		LogPath:     logPath,
-		HostTimeLog: hostTimeLogPath,
+		Args:          args,
+		LogPath:       logPath,
+		HostTimeLog:   hostTimeLogPath,
+		ConsoleSocket: consoleSocket,
 	}, nil
 }
 
@@ -852,11 +935,17 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		args = append(args, "-enable-kvm")
 	}
 	args = appendNetworkArgs(args, opts.NoNet)
+	var consoleSocket string
+	args, consoleSocket, err = appendConsoleArgs(workspace, args, opts)
+	if err != nil {
+		return commandPlan{}, err
+	}
 	args = append(args, opts.ExtraArgs...)
 	return commandPlan{
-		Args:        args,
-		LogPath:     logPath,
-		HostTimeLog: hostTimeLogPath,
+		Args:          args,
+		LogPath:       logPath,
+		HostTimeLog:   hostTimeLogPath,
+		ConsoleSocket: consoleSocket,
 	}, nil
 }
 
@@ -866,8 +955,8 @@ func appendNetworkArgs(args []string, noNet bool) []string {
 	}
 	return append(args,
 		"-net", "none",
-		"-netdev", "user,id=net0",
-		"-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56,disable-legacy=on",
+		"-netdev", "user,id=net0,hostfwd=udp:127.0.0.1:10015-10.0.2.15:7777,hostfwd=tcp:127.0.0.1:10016-10.0.2.15:7778",
+		"-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56,disable-legacy=on,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off",
 	)
 }
 
@@ -987,48 +1076,155 @@ func waitForSocketOrExit(socketPath string, done <-chan error, timeout time.Dura
 	}
 }
 
-func consoleTerminalCommand(workspace *config.Workspace, socketPath string) ([]string, error) {
+func consoleTerminalCommand(workspace *config.Workspace, socketPath string, readyLogPath string) ([]string, error) {
 	if socketPath == "" {
 		return nil, fmt.Errorf("--new-terminal requires virtio-console")
 	}
-	script := consoleTerminalScript(workspace, socketPath)
-	candidates := [][]string{
-		{"x-terminal-emulator", "-e", "bash", "-lc", script},
-		{"gnome-terminal", "--", "bash", "-lc", script},
-		{"konsole", "-e", "bash", "-lc", script},
-		{"xfce4-terminal", "--command", "bash -lc " + shellQuote(script)},
-		{"kitty", "bash", "-lc", script},
-		{"alacritty", "-e", "bash", "-lc", script},
-		{"wezterm", "start", "--cwd", workspace.Root, "bash", "-lc", script},
+	scriptPath, err := consoleTerminalScriptPath(workspace, socketPath, readyLogPath)
+	if err != nil {
+		return nil, err
 	}
-	for _, candidate := range candidates {
+	for _, candidate := range consoleTerminalCandidates(workspace, scriptPath) {
 		if path, err := exec.LookPath(candidate[0]); err == nil {
 			candidate[0] = path
 			return candidate, nil
 		}
 	}
-	return nil, fmt.Errorf("no terminal emulator found; install x-terminal-emulator, gnome-terminal, konsole, xfce4-terminal, kitty, alacritty, or wezterm")
+	return nil, fmt.Errorf("no terminal emulator found; install Windows Terminal, x-terminal-emulator, gnome-terminal, konsole, xfce4-terminal, kitty, alacritty, or wezterm")
 }
 
-func consoleTerminalPreview(workspace *config.Workspace, socketPath string) []string {
-	return []string{"<terminal>", "bash", "-lc", consoleTerminalScript(workspace, socketPath)}
+func consoleTerminalPreview(workspace *config.Workspace, socketPath string, readyLogPath string) ([]string, error) {
+	if socketPath == "" {
+		return nil, fmt.Errorf("--new-terminal requires virtio-console")
+	}
+	scriptPath, err := consoleTerminalScriptPath(workspace, socketPath, readyLogPath)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range consoleTerminalCandidates(workspace, scriptPath) {
+		if path, err := exec.LookPath(candidate[0]); err == nil {
+			candidate[0] = path
+			return candidate, nil
+		}
+	}
+	return []string{"<terminal>", "bash", scriptPath}, nil
 }
 
-func consoleTerminalScript(workspace *config.Workspace, socketPath string) string {
+func consoleTerminalCandidates(workspace *config.Workspace, scriptPath string) [][]string {
+	candidates := [][]string{}
+	if distro := os.Getenv("WSL_DISTRO_NAME"); distro != "" {
+		candidates = append(candidates, []string{
+			"wt.exe",
+			"-w", "-1",
+			"new-tab",
+			"--title", "PachaOS virtio-console",
+			"wsl.exe",
+			"-d", distro,
+			"--cd", workspace.Root,
+			"--",
+			"bash", scriptPath,
+		})
+	}
+	candidates = append(candidates,
+		[]string{"x-terminal-emulator", "-e", "bash", scriptPath},
+		[]string{"gnome-terminal", "--", "bash", scriptPath},
+		[]string{"konsole", "-e", "bash", scriptPath},
+		[]string{"xfce4-terminal", "--command", "bash " + shellQuote(scriptPath)},
+		[]string{"kitty", "bash", scriptPath},
+		[]string{"alacritty", "-e", "bash", scriptPath},
+		[]string{"wezterm", "start", "--cwd", workspace.Root, "bash", scriptPath},
+	)
+	return candidates
+}
+
+func consoleTerminalScriptPath(workspace *config.Workspace, socketPath string, readyLogPath string) (string, error) {
+	dir := workspace.Path(workspace.Artifacts, "qemu")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	name := strings.TrimSuffix(filepath.Base(socketPath), ".sock") + ".sh"
+	path := filepath.Join(dir, name)
+	content := consoleTerminalScriptContent(workspace, socketPath, readyLogPath)
+	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func consoleTerminalScriptContent(workspace *config.Workspace, socketPath string, readyLogPath string) string {
 	return strings.Join([]string{
+		"#!/usr/bin/env bash",
+		"set +e",
 		"cd " + shellQuote(workspace.Root),
 		"sock=" + shellQuote(socketPath),
-		"if ! command -v socat >/dev/null 2>&1; then echo 'missing socat'; exec bash; fi",
+		"ready_log=" + shellQuote(readyLogPath),
+		"ready_marker='[seed0boot] hvc console spawn status=0'",
 		"echo 'CapabilityOS virtio-console'",
 		"echo 'waiting for '\"$sock\"",
-		"while [ ! -S \"$sock\" ]; do sleep 0.05; done",
+		"while [ ! -S \"$sock\" ]; do",
+		"  sleep 0.05",
+		"done",
+		"attempt=0",
+		"while :; do",
+		"attempt=$((attempt + 1))",
+		"started=$(date +%s 2>/dev/null || echo 0)",
 		"echo 'connected'",
-		"socat -,raw,echo=0 UNIX-CONNECT:\"$sock\"",
-		"status=$?",
+		"if command -v socat >/dev/null 2>&1; then",
+		"  socat -,raw,echo=0 UNIX-CONNECT:\"$sock\"",
+		"  status=$?",
+		"elif command -v python3 >/dev/null 2>&1; then",
+		"  python3 - \"$sock\" <<'PY'",
+		consoleTerminalPythonBridge(),
+		"PY",
+		"  status=$?",
+		"else",
+		"  echo 'missing socat or python3'",
+		"  status=127",
+		"fi",
+		"ended=$(date +%s 2>/dev/null || echo 0)",
+		"elapsed=$((ended - started))",
+		"if [ \"$status\" -eq 0 ] && [ \"$elapsed\" -lt 2 ] && [ \"$attempt\" -lt 60 ]; then",
+		"  echo",
+		"  echo 'virtio-console disconnected before it was ready; reconnecting'",
+		"  sleep 0.1",
+		"  continue",
+		"fi",
+		"break",
+		"done",
 		"echo",
 		"echo virtio-console exited: $status",
 		"exec bash",
-	}, "; ")
+		"",
+	}, "\n")
+}
+
+func consoleTerminalPythonBridge() string {
+	return strings.Join([]string{
+		"import os, select, socket, sys, termios, tty",
+		"sock_path = sys.argv[1]",
+		"sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+		"sock.connect(sock_path)",
+		"tty_fd = os.open('/dev/tty', os.O_RDWR)",
+		"old_termios = termios.tcgetattr(tty_fd)",
+		"tty.setraw(tty_fd)",
+		"try:",
+		"    while True:",
+		"        readable, _, _ = select.select([tty_fd, sock], [], [])",
+		"        if tty_fd in readable:",
+		"            data = os.read(tty_fd, 4096)",
+		"            if not data:",
+		"                break",
+		"            sock.sendall(data)",
+		"        if sock in readable:",
+		"            data = sock.recv(4096)",
+		"            if not data:",
+		"                break",
+		"            os.write(tty_fd, data)",
+		"finally:",
+		"    termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_termios)",
+		"    os.close(tty_fd)",
+		"    sock.close()",
+	}, "\n")
 }
 
 func firstNonEmpty(values ...string) string {
