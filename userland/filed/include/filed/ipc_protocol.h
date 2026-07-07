@@ -48,6 +48,9 @@ enum {
     FILED_WIRE_OP_PREAD_TO_VMO = 38,
     FILED_WIRE_OP_FILE_VMO = 39,
     FILED_WIRE_OP_SYNC_ALL = 40,
+    FILED_WIRE_OP_EXEC_SELF = 41,
+    FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR = 42,
+    FILED_WIRE_OP_ERROR_GET = 43,
 
     FILED_WIRE_NAME_BYTES = 96,
     FILED_WIRE_PATH_BYTES = 480,
@@ -102,7 +105,12 @@ enum {
     FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS = 1u << 2,
     FILED_WIRE_EXEC_INHERIT_HANDLES = 1u << 3,
     FILED_WIRE_EXEC_LINUX_LPR = 1u << 4,
-    FILED_WIRE_EXEC_MAX_INHERIT_FDS = 4,
+    FILED_WIRE_EXEC_LINUX_BOOTSTRAP = 1u << 5,
+    FILED_WIRE_EXEC_SELF = 1u << 6,
+    FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO = 1u << 7,
+    FILED_WIRE_EXEC_LPR_FD_TABLE = 1u << 8,
+    FILED_WIRE_EXEC_TRANSFER_PROCESS_FD = 1u << 9,
+    FILED_WIRE_EXEC_MAX_INHERIT_FDS = 16,
     FILED_WIRE_EXEC_MAX_INHERIT_HANDLES = 4,
     FILED_WIRE_EXEC_MAX_FD_PATCHES = 4,
     FILED_WIRE_EXEC_MAX_ARGS = 128,
@@ -112,7 +120,14 @@ enum {
     FILED_WIRE_EXEC_PATCH_INHERIT_FD = 1,
     FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FD = 2,
     FILED_WIRE_EXEC_PATCH_INHERIT_HANDLE = 3,
+
+    FILED_WIRE_EXEC_LPR_FD_FILED = 1,
+    FILED_WIRE_EXEC_LPR_FD_TTY = 2,
+    FILED_WIRE_EXEC_LPR_FD_EVENT = 3,
 };
+
+#define FILED_WIRE_EXEC_LPR_FD_TABLE_MAGIC 0x3144424652504c46ull
+#define FILED_WIRE_EXEC_LPR_FD_TABLE_VERSION 2ull
 
 typedef struct filed_wire_openat {
     uint64_t dir_handle;
@@ -339,6 +354,23 @@ typedef struct filed_wire_exec_string_ref {
     uint16_t length;
 } filed_wire_exec_string_ref_t;
 
+typedef struct filed_wire_exec_lpr_fd {
+    uint64_t fd;
+    uint64_t kind;
+    uint64_t flags;
+    uint64_t handle;
+    uint64_t offset_or_counter;
+} filed_wire_exec_lpr_fd_t;
+
+typedef struct filed_wire_exec_lpr_fd_table {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t byte_size;
+    uint64_t fd_count;
+    uint64_t reserved0;
+    uint64_t reserved1;
+} filed_wire_exec_lpr_fd_table_t;
+
 typedef struct filed_wire_exec_path {
     uint64_t dir_handle;
     uint64_t flags;
@@ -348,13 +380,33 @@ typedef struct filed_wire_exec_path {
     uint64_t string_bytes;
     uint64_t argc;
     uint64_t envc;
+    uint64_t linux_pid;
+    uint64_t linux_ppid;
+    uint64_t linux_sid;
+    uint64_t linux_pgrp;
+    uint64_t linux_next_pid;
+    uint64_t cwd_handle;
+    uint64_t lpr_fd_table_bytes;
+    uint64_t lpr_supervisor_token;
+    uint64_t lpr_fd_table_token;
     uint64_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
+    uint64_t inherit_fd_targets[FILED_WIRE_EXEC_MAX_INHERIT_FDS];
     filed_wire_exec_fd_patch_t fd_patches[FILED_WIRE_EXEC_MAX_FD_PATCHES];
     char path[FILED_WIRE_PATH_BYTES];
+    filed_wire_exec_string_ref_t cwd;
+    filed_wire_exec_string_ref_t ctty;
     filed_wire_exec_string_ref_t argv[FILED_WIRE_EXEC_MAX_ARGS];
     filed_wire_exec_string_ref_t envp[FILED_WIRE_EXEC_MAX_ENVS];
     char strings[FILED_WIRE_EXEC_STRING_BYTES];
 } filed_wire_exec_path_t;
+
+typedef char filed_wire_exec_path_fits_wire_page[
+    sizeof(filed_wire_exec_path_t) <= FILED_WIRE_PAGE_BYTES ? 1 : -1];
+
+static inline int filed_wire_exec_string_ref_empty(filed_wire_exec_string_ref_t ref)
+{
+    return ref.offset == 0 && ref.length == 0;
+}
 
 static inline int filed_wire_exec_string_ref_valid(
     const filed_wire_exec_path_t *request,

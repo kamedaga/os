@@ -1,16 +1,16 @@
-pub const syscall_ipc_first: u64 = 50;
-pub const syscall_ipc_endpoint_create: u64 = 50;
-pub const syscall_ipc_channel_create: u64 = 51;
-pub const syscall_ipc_send: u64 = 52;
-pub const syscall_ipc_recv: u64 = 53;
-pub const syscall_ipc_call: u64 = 54;
-pub const syscall_ipc_reply: u64 = 55;
-pub const syscall_ipc_recv_wait: u64 = 56;
+pub const syscall_ipc_first: u64 = 52;
+pub const syscall_ipc_endpoint_create: u64 = 52;
+pub const syscall_ipc_channel_create: u64 = 53;
+pub const syscall_ipc_send: u64 = 54;
+pub const syscall_ipc_recv: u64 = 55;
+pub const syscall_ipc_call: u64 = 56;
+pub const syscall_ipc_reply: u64 = 57;
+pub const syscall_ipc_recv_wait: u64 = 58;
 pub const syscall_ipc_last: u64 = syscall_ipc_recv_wait;
 pub const syscall_ipc_count: u64 = syscall_ipc_last - syscall_ipc_first + 1;
 
 pub const max_inline_words: u64 = 4;
-pub const max_transfer_fds: u64 = 8;
+pub const max_transfer_fds: u64 = 19;
 
 pub const msg_word0_offset: u64 = 0;
 pub const msg_word1_offset: u64 = 8;

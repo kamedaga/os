@@ -123,6 +123,8 @@ pub const invalid_dma_device_id: DmaDeviceId = 0;
 pub const Fd = u32;
 pub const fd_table_entries: usize = 256;
 pub const max_fd_objects: usize = 4096;
+pub const max_pipes: usize = 256;
+pub const pipe_buffer_bytes: usize = 4096;
 pub const fd_known_flags_mask: u32 = (@as(u32, 1) << 4) - 1;
 pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 44) - 1;
 
@@ -222,6 +224,7 @@ pub const KernelObjectKind = enum(u16) {
     serial = 14,
     schedctl = 15,
     sched_event = 16,
+    pipe = 17,
 };
 
 pub const TaskObjectState = enum(u8) {
@@ -322,6 +325,31 @@ pub const SchedulerEventObject = struct {
     owner_principal_raw: PrincipalRaw = 0,
 };
 
+pub const PipeRef = struct {
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: PipeRef) bool {
+        return self.generation == 0;
+    }
+};
+
+pub const PipeEndpointObject = struct {
+    pipe: PipeRef = .{},
+    write: bool = false,
+};
+
+pub const PipePair = struct {
+    read: Fd = 0,
+    write: Fd = 0,
+};
+
+pub const PipeIoError = error{
+    InvalidState,
+    NotReady,
+    Closed,
+};
+
 pub const KernelObjectRef = struct {
     kind: KernelObjectKind = .none,
     index: u32 = 0,
@@ -350,6 +378,7 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     serial: SerialObject,
     schedctl: SchedulerControlObject,
     sched_event: SchedulerEventObject,
+    pipe: PipeEndpointObject,
 };
 
 pub const KernelObjectSlot = struct {
@@ -391,7 +420,7 @@ pub const max_ipc_endpoints: usize = 1024;
 pub const max_ipc_channels: usize = 512;
 pub const max_ipc_replies: usize = 1024;
 pub const max_ipc_queue_messages: usize = 16;
-pub const max_ipc_message_fds: usize = 8;
+pub const max_ipc_message_fds: usize = 19;
 pub const max_ipc_waiters: usize = 256;
 
 pub const IpcEndpointRef = struct {
@@ -477,6 +506,17 @@ pub const TaskFdWaiter = struct {
 
 pub const max_task_fd_waiters: usize = 64;
 const max_ipc_object_waiters: usize = 8;
+
+pub const PipeSlot = struct {
+    active: bool = false,
+    generation: u32 = 1,
+    read_refs: u32 = 0,
+    write_refs: u32 = 0,
+    head: u16 = 0,
+    len: u16 = 0,
+    data: [pipe_buffer_bytes]u8 = [_]u8{0} ** pipe_buffer_bytes,
+    waiters: [2]IpcWaitList = .{ .{}, .{} },
+};
 
 const IpcWaitList = struct {
     waiters: [max_ipc_object_waiters]IpcWaiter = [_]IpcWaiter{.{}} ** max_ipc_object_waiters,
@@ -565,10 +605,16 @@ const IpcWaitList = struct {
 
     fn takeReadable(self: *IpcWaitList, out: []ThreadWakeTarget) usize {
         const fd_abi = @import("kernel_abi_root").fd_abi;
+        return self.takeEvents(fd_abi.event_readable, out);
+    }
+
+    fn takeEvents(self: *IpcWaitList, ready_events: u64, out: []ThreadWakeTarget) usize {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
         var count: usize = 0;
         for (self.waiters[0..]) |*waiter| {
             if (!waiter.active) continue;
-            if ((waiter.events & fd_abi.event_readable) == 0) continue;
+            const revents = ready_events & (waiter.events | fd_abi.event_error | fd_abi.event_hangup);
+            if (revents == 0) continue;
             const target = ThreadWakeTarget{
                 .owner = waiter.owner,
                 .thread_index = waiter.thread_index,
@@ -577,7 +623,7 @@ const IpcWaitList = struct {
                 .recv_msg_va = waiter.recv_msg_va,
                 .recv_fd = waiter.recv_fd,
                 .recv_fd_capacity = waiter.recv_fd_capacity,
-                .revents = fd_abi.event_readable,
+                .revents = revents,
             };
             waiter.* = .{};
             if (count < out.len) {
@@ -787,6 +833,8 @@ pub const VmaTable = struct {
 pub const NativeVmaFaultMapping = struct {
     paddr: u64,
     prot: MapProt,
+    invalidate_start_va: u64 = 0,
+    invalidate_size_bytes: u64 = 0,
 };
 
 fn vmObjectBackingFreePageCount() u64 {
@@ -1414,9 +1462,11 @@ pub const KernelState = struct {
     fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
     vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
     fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
+    pipes: [max_pipes]PipeSlot = [_]PipeSlot{.{}} ** max_pipes,
     task_fd_waiters: [max_task_fd_waiters]TaskFdWaiter = [_]TaskFdWaiter{.{}} ** max_task_fd_waiters,
     irq_publish_slots: [max_fd_objects]IrqPublishSlot = [_]IrqPublishSlot{.{}} ** max_fd_objects,
     next_fd_object_scan: usize = 0,
+    next_pipe_scan: usize = 0,
     native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
     next_native_vmo_scan: usize = 0,
     native_cow_tables: [max_native_cow_tables]NativeCowTableSlot = [_]NativeCowTableSlot{.{}} ** max_native_cow_tables,
@@ -1443,6 +1493,7 @@ pub const KernelState = struct {
         self.aslr_sequence = 1;
 
         for (&self.fd_objects) |*slot| slot.generation = 1;
+        for (&self.pipes) |*slot| slot.generation = 1;
         for (&self.native_vmos) |*slot| slot.generation = 1;
         for (&self.native_cow_tables) |*slot| slot.generation = 1;
         for (&self.ipc_endpoints) |*slot| slot.generation = 1;
@@ -1822,6 +1873,150 @@ pub const KernelState = struct {
             return .{ .index = @intCast(index), .generation = slot.generation };
         }
         return KernelError.TableFull;
+    }
+
+    fn pipeSlot(self: *KernelState, pipe_ref: PipeRef) ?*PipeSlot {
+        if (pipe_ref.isNull()) return null;
+        const index: usize = @intCast(pipe_ref.index);
+        if (index >= max_pipes) return null;
+        const slot = &self.pipes[index];
+        if (!slot.active or slot.generation != pipe_ref.generation) return null;
+        return slot;
+    }
+
+    fn pipeSlotConst(self: *const KernelState, pipe_ref: PipeRef) ?*const PipeSlot {
+        if (pipe_ref.isNull()) return null;
+        const index: usize = @intCast(pipe_ref.index);
+        if (index >= max_pipes) return null;
+        const slot = &self.pipes[index];
+        if (!slot.active or slot.generation != pipe_ref.generation) return null;
+        return slot;
+    }
+
+    fn createPipe(self: *KernelState) KernelError!PipeRef {
+        var offset: usize = 0;
+        while (offset < max_pipes) : (offset += 1) {
+            const index = (self.next_pipe_scan + offset) % max_pipes;
+            const slot = &self.pipes[index];
+            if (slot.active) continue;
+            if (slot.generation == 0) slot.generation = 1;
+            const generation = slot.generation;
+            slot.* = .{
+                .active = true,
+                .generation = generation,
+                .read_refs = 1,
+                .write_refs = 1,
+            };
+            self.next_pipe_scan = (index + 1) % max_pipes;
+            return .{ .index = @intCast(index), .generation = generation };
+        }
+        return KernelError.TableFull;
+    }
+
+    fn clearPipeSlot(slot: *PipeSlot) void {
+        slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+    }
+
+    fn releasePipeEndpoint(self: *KernelState, endpoint: PipeEndpointObject) void {
+        const slot = self.pipeSlot(endpoint.pipe) orelse return;
+        if (endpoint.write) {
+            if (slot.write_refs != 0) slot.write_refs -= 1;
+        } else {
+            if (slot.read_refs != 0) slot.read_refs -= 1;
+        }
+        if (slot.read_refs == 0 and slot.write_refs == 0) clearPipeSlot(slot);
+    }
+
+    fn pipeEndpointFromPayload(payload: *const KernelObjectPayload) ?PipeEndpointObject {
+        return switch (payload.*) {
+            .pipe => |endpoint| endpoint,
+            else => null,
+        };
+    }
+
+    pub fn pipeEndpointForFd(self: *const KernelState, owner: PrincipalId, fd: Fd) ?PipeEndpointObject {
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        return pipeEndpointFromPayload(&slot.payload);
+    }
+
+    fn pipeUsed(slot: *const PipeSlot) usize {
+        return @intCast(slot.len);
+    }
+
+    fn pipeFree(slot: *const PipeSlot) usize {
+        return pipe_buffer_bytes - pipeUsed(slot);
+    }
+
+    fn pipeReadyEventsForEndpoint(slot: *const PipeSlot, endpoint: PipeEndpointObject) u64 {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        var ready: u64 = 0;
+        if (endpoint.write) {
+            if (slot.read_refs == 0) {
+                ready |= fd_abi.event_error | fd_abi.event_hangup;
+            } else if (pipeFree(slot) != 0) {
+                ready |= fd_abi.event_writable;
+            }
+        } else {
+            if (slot.len != 0 or slot.write_refs == 0) ready |= fd_abi.event_readable;
+            if (slot.write_refs == 0) ready |= fd_abi.event_hangup;
+        }
+        return ready;
+    }
+
+    pub fn pipeReadyEventsForFd(self: *const KernelState, owner: PrincipalId, fd: Fd) ?u64 {
+        const entry = self.fdEntryConst(owner, fd) orelse return null;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+        const endpoint = pipeEndpointFromPayload(&slot.payload) orelse return null;
+        const pipe = self.pipeSlotConst(endpoint.pipe) orelse return null;
+        return pipeReadyEventsForEndpoint(pipe, endpoint);
+    }
+
+    pub fn pipeReadyEventsForSide(self: *const KernelState, pipe_ref: PipeRef, write_side: bool) ?u64 {
+        const pipe = self.pipeSlotConst(pipe_ref) orelse return null;
+        return pipeReadyEventsForEndpoint(pipe, .{ .pipe = pipe_ref, .write = write_side });
+    }
+
+    pub fn pipeReadBytes(self: *KernelState, owner: PrincipalId, fd: Fd, out: []u8) PipeIoError!usize {
+        const view = self.fdPayloadWithRightsConst(owner, fd, .{ .read = true }) orelse return PipeIoError.InvalidState;
+        const endpoint = pipeEndpointFromPayload(view.payload) orelse return PipeIoError.InvalidState;
+        if (endpoint.write) return PipeIoError.InvalidState;
+        if (out.len == 0) return 0;
+        const pipe = self.pipeSlot(endpoint.pipe) orelse return PipeIoError.InvalidState;
+        if (pipe.len == 0) {
+            if (pipe.write_refs == 0) return 0;
+            return PipeIoError.NotReady;
+        }
+        const count = @min(out.len, @as(usize, @intCast(pipe.len)));
+        const first = @min(count, pipe_buffer_bytes - @as(usize, pipe.head));
+        @memcpy(out[0..first], pipe.data[@as(usize, pipe.head) .. @as(usize, pipe.head) + first]);
+        if (first < count) {
+            @memcpy(out[first..count], pipe.data[0 .. count - first]);
+        }
+        pipe.head = @intCast((@as(usize, pipe.head) + count) % pipe_buffer_bytes);
+        pipe.len = @intCast(@as(usize, pipe.len) - count);
+        return count;
+    }
+
+    pub fn pipeWriteBytes(self: *KernelState, owner: PrincipalId, fd: Fd, in: []const u8, atomic: bool) PipeIoError!usize {
+        const view = self.fdPayloadWithRightsConst(owner, fd, .{ .write = true }) orelse return PipeIoError.InvalidState;
+        const endpoint = pipeEndpointFromPayload(view.payload) orelse return PipeIoError.InvalidState;
+        if (!endpoint.write) return PipeIoError.InvalidState;
+        if (in.len == 0) return 0;
+        const pipe = self.pipeSlot(endpoint.pipe) orelse return PipeIoError.InvalidState;
+        if (pipe.read_refs == 0) return PipeIoError.Closed;
+        const free = pipeFree(pipe);
+        if (free == 0) return PipeIoError.NotReady;
+        if (atomic and free < in.len) return PipeIoError.NotReady;
+        const count = @min(in.len, free);
+        const tail = (@as(usize, pipe.head) + @as(usize, @intCast(pipe.len))) % pipe_buffer_bytes;
+        const first = @min(count, pipe_buffer_bytes - tail);
+        @memcpy(pipe.data[tail .. tail + first], in[0..first]);
+        if (first < count) {
+            @memcpy(pipe.data[0 .. count - first], in[first..count]);
+        }
+        pipe.len = @intCast(@as(usize, pipe.len) + count);
+        return count;
     }
 
     fn resetNativeIpcObjects(self: *KernelState) void {
@@ -2296,6 +2491,7 @@ pub const KernelState = struct {
             .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
             .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
             .irq => |irq| self.releaseIrqObject(irq),
+            .pipe => |pipe| self.releasePipeEndpoint(pipe),
             else => {},
         }
     }
@@ -2314,6 +2510,7 @@ pub const KernelState = struct {
             .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
             .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
             .irq => |irq| self.releaseIrqObject(irq),
+            .pipe => |pipe| self.releasePipeEndpoint(pipe),
             else => {},
         }
     }
@@ -2347,7 +2544,11 @@ pub const KernelState = struct {
             if (slot.kind != .none) self.releaseKernelObjectPayload(slot);
             slot.* = .{};
         }
+        for (self.pipes[0..]) |*slot| {
+            slot.* = .{ .generation = nextObjectGeneration(slot.generation) };
+        }
         self.next_fd_object_scan = 0;
+        self.next_pipe_scan = 0;
     }
 
     fn resetNativeVmoTable(self: *KernelState) void {
@@ -2926,6 +3127,8 @@ pub const KernelState = struct {
                             .exec = entry.prot.exec,
                             .pkey = entry.prot.pkey,
                         },
+                        .invalidate_start_va = entry.start_va,
+                        .invalidate_size_bytes = entry.size_bytes,
                     };
                 }
                 return .{
@@ -2940,6 +3143,13 @@ pub const KernelState = struct {
             }
             const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
             if (src_paddr == 0 and !entry.flags.anonymous) return null;
+            var invalidate_start_va: u64 = 0;
+            var invalidate_size_bytes: u64 = 0;
+            if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
+                self.detachSharedEntryCowTable(entry, free_list) catch return null;
+                invalidate_start_va = entry.start_va;
+                invalidate_size_bytes = entry.size_bytes;
+            }
             const new_paddr = (self.allocPhysicalPage(free_list) catch return null).paddr;
             var installed = false;
             defer if (!installed) free_list.appendPage(0, new_paddr) catch {};
@@ -2959,6 +3169,8 @@ pub const KernelState = struct {
                     .exec = entry.prot.exec,
                     .pkey = entry.prot.pkey,
                 },
+                .invalidate_start_va = invalidate_start_va,
+                .invalidate_size_bytes = invalidate_size_bytes,
             };
         }
         return null;
@@ -3193,6 +3405,31 @@ pub const KernelState = struct {
         const index = processIndexFromPrincipal(owner) orelse return;
         self.releaseVmaTableForProcessIndexWithFreeList(index, free_list);
         self.releaseFdTableForProcessIndexWithFreeList(index, free_list);
+    }
+
+    pub fn replaceVmaTableForExec(
+        self: *KernelState,
+        dest_owner: PrincipalId,
+        source_owner: PrincipalId,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        if (dest_owner == source_owner) return KernelError.InvalidState;
+        const dest_index = processIndexFromPrincipal(dest_owner) orelse return KernelError.InvalidState;
+        const source_index = processIndexFromPrincipal(source_owner) orelse return KernelError.InvalidState;
+        const dest_table = self.vmaTableForProcessIndex(dest_index) orelse return KernelError.InvalidState;
+        const source_table = self.vmaTableForProcessIndex(source_index) orelse return KernelError.InvalidState;
+
+        self.releaseVmaTableForProcessIndexWithFreeList(dest_index, free_list);
+        var active_pos: usize = 0;
+        while (active_pos < source_table.active_count) : (active_pos += 1) {
+            const vma_index: usize = @intCast(source_table.active_indices[active_pos]);
+            dest_table.entries[vma_index] = source_table.entries[vma_index];
+            dest_table.active_indices[active_pos] = @intCast(vma_index);
+            source_table.entries[vma_index] = .{};
+            source_table.active_indices[active_pos] = 0;
+        }
+        dest_table.active_count = source_table.active_count;
+        source_table.active_count = 0;
     }
 
     pub fn resetProcessRuntimeTables(self: *KernelState, index: usize) void {
@@ -3457,6 +3694,15 @@ pub const KernelState = struct {
             .sched_event => {
                 info.size_bytes = @import("scheduler.zig").connection.pendingEventCount();
             },
+            .pipe => |endpoint| {
+                if (self.pipeSlotConst(endpoint.pipe)) |pipe| {
+                    info.size_bytes = pipe.len;
+                    info.extra =
+                        (if (endpoint.write) @as(u64, 1) else @as(u64, 0)) |
+                        (@as(u64, pipe.read_refs) << 8) |
+                        (@as(u64, pipe.write_refs) << 40);
+                }
+            },
             else => {},
         }
         return info;
@@ -3629,6 +3875,10 @@ pub const KernelState = struct {
                 .timer => |timer| timerDueCount(timer, now_tick) != 0,
                 .serial => false,
                 .sched_event => entry.rights.read and @import("scheduler.zig").connection.eventQueueReadable(),
+                .pipe => |endpoint| blk: {
+                    const pipe = self.pipeSlotConst(endpoint.pipe) orelse break :blk false;
+                    break :blk !endpoint.write and (pipe.len != 0 or pipe.write_refs == 0);
+                },
                 else => false,
             };
             if (readable) ready |= @import("kernel_abi_root").fd_abi.event_readable;
@@ -3639,11 +3889,23 @@ pub const KernelState = struct {
                 .event => entry.rights.write,
                 .serial => entry.rights.write,
                 .schedctl => entry.rights.write,
+                .pipe => |endpoint| blk: {
+                    const pipe = self.pipeSlotConst(endpoint.pipe) orelse break :blk false;
+                    break :blk endpoint.write and pipe.read_refs != 0 and pipeFree(pipe) != 0;
+                },
                 else => false,
             };
             if (writable) ready |= @import("kernel_abi_root").fd_abi.event_writable;
         }
-        return ready & requested;
+        switch (slot.payload) {
+            .pipe => |endpoint| {
+                const pipe = self.pipeSlotConst(endpoint.pipe) orelse return null;
+                const pipe_ready = pipeReadyEventsForEndpoint(pipe, endpoint);
+                ready |= pipe_ready & (@import("kernel_abi_root").fd_abi.event_error | @import("kernel_abi_root").fd_abi.event_hangup);
+            },
+            else => {},
+        }
+        return ready & (requested | @import("kernel_abi_root").fd_abi.event_error | @import("kernel_abi_root").fd_abi.event_hangup);
     }
 
     pub fn fdNextWakeTick(self: *const KernelState, owner: PrincipalId, fd: Fd, now_tick: u64) ?u64 {
@@ -4009,6 +4271,46 @@ pub const KernelState = struct {
         };
     }
 
+    fn pipeRights(readable: bool) FdRights {
+        return .{
+            .inspect = true,
+            .dup = true,
+            .transfer = true,
+            .wait = true,
+            .poll = true,
+            .set_flags = true,
+            .close = true,
+            .read = readable,
+            .write = !readable,
+        };
+    }
+
+    pub fn createPipePairFds(
+        self: *KernelState,
+        owner: PrincipalId,
+        flags: FdFlags,
+        min_fd: Fd,
+    ) KernelError!PipePair {
+        try self.requireActiveProcess(owner);
+        const pipe_ref = try self.createPipe();
+        const read_object = self.createKernelObject(.pipe, .{ .pipe = .{ .pipe = pipe_ref, .write = false } }) catch |err| {
+            if (self.pipeSlot(pipe_ref)) |slot| clearPipeSlot(slot);
+            return err;
+        };
+        errdefer if (self.kernelObjectSlot(read_object)) |slot| self.clearKernelObjectSlot(slot);
+        const write_object = self.createKernelObject(.pipe, .{ .pipe = .{ .pipe = pipe_ref, .write = true } }) catch |err| {
+            if (self.pipeSlot(pipe_ref)) |slot| {
+                if (slot.write_refs != 0) slot.write_refs -= 1;
+            }
+            return err;
+        };
+        errdefer if (self.kernelObjectSlot(write_object)) |slot| self.clearKernelObjectSlot(slot);
+        const read_fd = try self.installFd(owner, read_object, pipeRights(true), flags, min_fd);
+        errdefer self.closeFd(owner, read_fd) catch {};
+        const write_fd = try self.installFd(owner, write_object, pipeRights(false), flags, min_fd);
+        return .{ .read = read_fd, .write = write_fd };
+    }
+
     pub fn createSerialFdAt(
         self: *KernelState,
         owner: PrincipalId,
@@ -4345,6 +4647,21 @@ pub const KernelState = struct {
         if (object_ref.isNull()) return KernelError.InvalidState;
         table.entries[index] = .{};
         self.releaseKernelObjectWithFreeList(object_ref, free_list);
+    }
+
+    pub fn closeCloexecFdsWithFreeList(
+        self: *KernelState,
+        owner: PrincipalId,
+        free_list: *FreePageList,
+    ) KernelError!void {
+        const table = try self.fdTableForActiveProcess(owner);
+        var fd_index: usize = 0;
+        while (fd_index < fd_table_entries) : (fd_index += 1) {
+            const entry = table.entries[fd_index];
+            if (entry.object.isNull() or !entry.flags.cloexec) continue;
+            table.entries[fd_index] = .{};
+            self.releaseKernelObjectWithFreeList(entry.object, free_list);
+        }
     }
 
     pub fn dupFd(
@@ -4733,6 +5050,75 @@ pub const KernelState = struct {
         const slot = self.kernelObjectSlotConst(entry.object) orelse return;
         const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return;
         waiters.unregister(thread_index, thread_generation);
+    }
+
+    fn pipeWaitListForEndpoint(self: *KernelState, endpoint: PipeEndpointObject) ?*IpcWaitList {
+        const pipe = self.pipeSlot(endpoint.pipe) orelse return null;
+        return &pipe.waiters[if (endpoint.write) 1 else 0];
+    }
+
+    pub fn registerPipeWaiterForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        requested_events: u64,
+        pollfd_va: u64,
+        thread_index: usize,
+        thread_generation: u32,
+    ) KernelError!bool {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+        const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+        if (!entry.rights.poll and !entry.rights.wait) return KernelError.InvalidState;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+        const endpoint = pipeEndpointFromPayload(&slot.payload) orelse return false;
+        const matched_events = if (endpoint.write)
+            requested_events & (fd_abi.event_writable | fd_abi.event_error | fd_abi.event_hangup)
+        else
+            requested_events & (fd_abi.event_readable | fd_abi.event_error | fd_abi.event_hangup);
+        if (matched_events == 0) return true;
+        const key = IpcWaitKey{
+            .kind = .pipe,
+            .index = endpoint.pipe.index,
+            .generation = endpoint.pipe.generation,
+            .side = if (endpoint.write) 1 else 0,
+        };
+        const waiters = self.pipeWaitListForEndpoint(endpoint) orelse return KernelError.InvalidState;
+        try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, thread_index, thread_generation);
+        return true;
+    }
+
+    pub fn unregisterPipeWaiterForFd(
+        self: *KernelState,
+        owner: PrincipalId,
+        fd: Fd,
+        requested_events: u64,
+        thread_index: usize,
+        thread_generation: u32,
+    ) void {
+        const fd_abi = @import("kernel_abi_root").fd_abi;
+        const entry = self.fdEntryConst(owner, fd) orelse return;
+        if (!entry.rights.poll and !entry.rights.wait) return;
+        const slot = self.kernelObjectSlotConst(entry.object) orelse return;
+        const endpoint = pipeEndpointFromPayload(&slot.payload) orelse return;
+        const matched_events = if (endpoint.write)
+            requested_events & (fd_abi.event_writable | fd_abi.event_error | fd_abi.event_hangup)
+        else
+            requested_events & (fd_abi.event_readable | fd_abi.event_error | fd_abi.event_hangup);
+        if (matched_events == 0) return;
+        const waiters = self.pipeWaitListForEndpoint(endpoint) orelse return;
+        waiters.unregister(thread_index, thread_generation);
+    }
+
+    pub fn takePipeWaiters(
+        self: *KernelState,
+        pipe_ref: PipeRef,
+        write_side: bool,
+        ready_events: u64,
+        out: []ThreadWakeTarget,
+    ) usize {
+        const pipe = self.pipeSlot(pipe_ref) orelse return 0;
+        return pipe.waiters[if (write_side) 1 else 0].takeEvents(ready_events, out);
     }
 
     pub fn registerTaskReadableWaiterForFd(

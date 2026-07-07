@@ -7,6 +7,7 @@ project(pacha_ipc C)
 
 add_library(pacha_ipc STATIC
   src/ipc.c
+  src/error_conveyor.c
   ../libpacha/src/syscall.c
 )
 

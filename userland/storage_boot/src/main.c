@@ -135,6 +135,7 @@ struct storage_boot_seed0root_bootstrap {
     uint64_t magic;
     uint64_t device_fd;
     uint64_t ready_channel_fd;
+    uint64_t service_ready_channel_fd;
     uint64_t filed_image_fd;
     uint64_t filed_image_size;
     uint64_t module_count;
@@ -1663,10 +1664,12 @@ static int launch_seed0root_from_ext4(
     const kb_fs_mount_path_probe_t *probe,
     uint64_t device_fd,
     uint64_t ready_channel_fd,
+    uint64_t service_ready_channel_fd,
     const struct storage_boot_module_image *module_images,
     size_t module_count)
 {
     if (ready_channel_fd < 16 ||
+        service_ready_channel_fd < 16 ||
         module_images == NULL ||
         module_count == 0 ||
         module_count > STORAGE_BOOT_BOOTSTRAP_MAX_MODULES) {
@@ -1800,6 +1803,7 @@ static int launch_seed0root_from_ext4(
         .magic = STORAGE_BOOT_SEED0ROOT_BOOTSTRAP_MAGIC,
         .device_fd = device_fd,
         .ready_channel_fd = ready_channel_fd,
+        .service_ready_channel_fd = service_ready_channel_fd,
         .filed_image_fd = (uint64_t)(uint32_t)filed_image_fd,
         .filed_image_size = filed_image_size,
         .module_count = module_count,
@@ -1808,6 +1812,18 @@ static int launch_seed0root_from_ext4(
     memcpy(bootstrap_package.modules, module_table, sizeof(module_table));
     free(filed_image);
     status = mark_fd_inherit((int)device_fd, "seed0root device fd");
+    if (status != 0) {
+        free(image);
+        (void)pacha_fd_close(filed_image_fd);
+        return 31;
+    }
+    status = mark_fd_inherit((int)ready_channel_fd, "seed0root ready channel fd");
+    if (status != 0) {
+        free(image);
+        (void)pacha_fd_close(filed_image_fd);
+        return 31;
+    }
+    status = mark_fd_inherit((int)service_ready_channel_fd, "seed0root service ready channel fd");
     if (status != 0) {
         free(image);
         (void)pacha_fd_close(filed_image_fd);
@@ -1952,13 +1968,15 @@ int main(int argc, char **argv)
         cfg.magic != STORAGE_BOOT_CONFIG_MAGIC ||
         cfg.device_fd < 16 ||
         cfg.ready_channel_fd < 16 ||
+        cfg.service_ready_channel_fd < 16 ||
         cfg.module_count == 0 ||
         cfg.module_count > STORAGE_BOOT_MAX_MODULES) {
         fprintf(stderr,
-            "[storage_boot] invalid boot config magic=0x%llx fd=%llu ready_fd=%llu modules=%llu\n",
+            "[storage_boot] invalid boot config magic=0x%llx fd=%llu ready_fd=%llu service_ready_fd=%llu modules=%llu\n",
             (unsigned long long)cfg.magic,
             (unsigned long long)cfg.device_fd,
             (unsigned long long)cfg.ready_channel_fd,
+            (unsigned long long)cfg.service_ready_channel_fd,
             (unsigned long long)cfg.module_count);
         return 2;
     }
@@ -2043,6 +2061,7 @@ int main(int argc, char **argv)
         &probe,
         cfg.device_fd,
         cfg.ready_channel_fd,
+        cfg.service_ready_channel_fd,
         seed0root_modules,
         cfg.module_count);
     free_bootstrap_module_images(seed0root_modules, cfg.module_count);

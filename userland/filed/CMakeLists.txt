@@ -29,6 +29,7 @@ set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/node.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/page.c"
   "${REPO_ROOT}/userland/libipc/src/ipc.c"
+  "${REPO_ROOT}/userland/libipc/src/error_conveyor.c"
   "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
   "${REPO_ROOT}/userland/personality/linux/hde/hde64.c"
@@ -103,7 +104,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/hde ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/hde ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
@@ -121,6 +122,8 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/tmpfs_backend.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/tmpfs_internal.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/vfs.h"
+    "${REPO_ROOT}/userland/termd/include/termd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/libipc/include/pacha/error_conveyor.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/internal.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/private.h"

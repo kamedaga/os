@@ -39,13 +39,19 @@ lpr_syscall_entry:
     add $24, %rsp
     lea lpr_entry_user_frame(%rip), %r11
     mov 120(%r11), %rcx
-    mov 128(%r11), %rsp
+    mov 0(%r11), %r15
+    mov 8(%r11), %r14
+    mov 16(%r11), %r13
+    mov 24(%r11), %r12
+    mov 32(%r11), %rbp
+    mov 40(%r11), %rbx
     mov 56(%r11), %r10
     mov 64(%r11), %r9
     mov 72(%r11), %r8
     mov 80(%r11), %rdi
     mov 88(%r11), %rsi
     mov 96(%r11), %rdx
+    mov 128(%r11), %rsp
     jmp *%rcx
 .size lpr_syscall_entry, .-lpr_syscall_entry
 

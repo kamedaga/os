@@ -591,6 +591,7 @@ fn exitCurrentProcess(
     var handoff_loaded = false;
     if (handoff_prepared) {
         if (exit_handoff_target) |target| {
+            if (before_ap_idle) |callback| callback.run(callback.context);
             handoff_loaded = scheduler.loadExitHandoffThread(out_frame, target.thread_index, target.thread_generation);
             if (handoff_loaded) {
                 if (enable_exit_teardown_metrics) {
@@ -641,6 +642,7 @@ fn exitCurrentProcess(
             },
         );
     }
+    if (before_ap_idle) |callback| callback.run(callback.context);
     loadRunnableThreadOrIdle(out_frame);
 }
 

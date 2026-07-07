@@ -12,14 +12,19 @@
 #include "filed/page_cache.h"
 #include "filed/tmpfs_backend.h"
 #include "pacha/abi.h"
+#include "pacha/error_conveyor.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
+#include "personality/linux_lpr.h"
+#include "termd/ipc_protocol.h"
 
 enum {
     FILED_BOOTSTRAP_PATCH_BYTES = 4096,
+    FILED_EXEC_MAX_FDS = 256,
     FILED_EXEC_FILED_ENDPOINT_FD = 240,
     FILED_EXEC_NETD_SOCKET_ENDPOINT_FD = 241,
     FILED_EXEC_TERMD_TTY_ENDPOINT_FD = 242,
+    FILED_EXEC_LPR_BOOTSTRAP_FD = LPR_BOOTSTRAP_FD,
     FILED_METRIC_OP_MAX = 64,
     FILED_PAGE_CACHE_BYTES = 16384,
     FILED_PAGE_CACHE_SLOTS = 64,
@@ -140,6 +145,8 @@ static uint64_t filed_file_vmo_cache_hits;
 static uint64_t filed_file_vmo_cache_misses;
 static uint64_t filed_file_vmo_cache_stores;
 static uint64_t filed_file_vmo_cache_evictions;
+static pacha_errconv_store_t filed_errconv_store;
+static int filed_errconv_store_ready;
 
 static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object);
 
@@ -565,6 +572,11 @@ static const char *filed_op_name(uint64_t op)
     case FILED_WIRE_OP_PREAD_TO_VMO: return "pread_to_vmo";
     case FILED_WIRE_OP_FILE_VMO: return "file_vmo";
     case FILED_WIRE_OP_SYNC_ALL: return "sync_all";
+    case FILED_WIRE_OP_EXEC_SELF: return "exec_self";
+    case FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR:
+        return "register_termd_signal_supervisor";
+    case FILED_WIRE_OP_ERROR_GET:
+        return "error_get";
     default: return "unknown";
     }
 }
@@ -1757,12 +1769,51 @@ void filed_dump_cache_metrics(const filed_runtime_t *runtime)
         (unsigned long long)filed_dir_cache.evictions);
 }
 
-static int filed_send_reply(int reply_fd, uint64_t request_id, int64_t status, uint64_t result)
+static pacha_errconv_store_t *filed_errors(void)
+{
+    if (!filed_errconv_store_ready) {
+        pacha_errconv_store_init(&filed_errconv_store, PACHA_ERRCONV_COMPONENT_FILED);
+        filed_errconv_store_ready = 1;
+    }
+    return &filed_errconv_store;
+}
+
+static uint64_t filed_error_token(
+    int64_t status,
+    uint64_t op,
+    uint64_t stage,
+    int64_t raw_status,
+    uint64_t request_id,
+    uint64_t fd_count,
+    uint64_t subject,
+    uint64_t child_token,
+    const char *text)
+{
+    return pacha_errconv_error_token(
+        filed_errors(),
+        status,
+        PACHA_ERRCONV_DOMAIN_FILED_STATUS,
+        op,
+        stage,
+        raw_status,
+        request_id,
+        fd_count,
+        subject,
+        child_token,
+        text);
+}
+
+static int filed_send_reply_with_error(
+    int reply_fd,
+    uint64_t request_id,
+    int64_t status,
+    uint64_t result,
+    uint64_t error_token)
 {
     const struct pacha_ipc_msg reply = {
         .word0 = FILED_WIRE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
-        .word2 = result,
+        .word2 = status < 0 ? error_token : result,
         .word3 = request_id,
     };
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
@@ -1770,12 +1821,41 @@ static int filed_send_reply(int reply_fd, uint64_t request_id, int64_t status, u
     return reply_status;
 }
 
+static int filed_send_reply(int reply_fd, uint64_t request_id, int64_t status, uint64_t result)
+{
+    const uint64_t token = status < 0 ?
+        filed_error_token(
+            status,
+            0,
+            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            status,
+            request_id,
+            0,
+            0,
+            0,
+            "filed negative reply") :
+        0;
+    return filed_send_reply_with_error(reply_fd, request_id, status, result, token);
+}
+
 static int filed_send_session_reply(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
+    const uint64_t token = status < 0 ?
+        filed_error_token(
+            status,
+            0,
+            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            status,
+            request_id,
+            0,
+            0,
+            0,
+            "filed session negative reply") :
+        0;
     const struct pacha_ipc_msg reply = {
         .word0 = FILED_WIRE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
-        .word2 = result,
+        .word2 = status < 0 ? token : result,
         .word3 = request_id,
     };
     return filed_ipc_send_wait(channel_fd, &reply);
@@ -1799,7 +1879,18 @@ static int filed_send_vmo_reply(
     struct pacha_ipc_msg reply = {
         .word0 = FILED_WIRE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
-        .word2 = result,
+        .word2 = status < 0 ?
+            filed_error_token(
+                status,
+                0,
+                PACHA_ERRCONV_STAGE_STATUS_MAP,
+                status,
+                request_id,
+                0,
+                0,
+                0,
+                "filed vmo negative reply") :
+            result,
         .word3 = request_id,
         .fds = status == 0 && vmo_fd >= 16 ? &fd : NULL,
         .fd_count = status == 0 && vmo_fd >= 16 ? 1u : 0u,
@@ -1884,17 +1975,22 @@ static int filed_send_exec_reply(
     int reply_fd,
     uint64_t request_id,
     int process_fd,
-    int thread_fd)
+    int thread_fd,
+    int transfer_process_fd)
 {
+    uint64_t process_rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_KILL;
+    if (transfer_process_fd) {
+        process_rights |= PACHA_FD_RIGHT_TRANSFER;
+    }
     struct pacha_ipc_fd fds[2] = {
         {
             .fd = (uint64_t)(uint32_t)process_fd,
-            .rights =
-                PACHA_FD_RIGHT_INSPECT |
-                PACHA_FD_RIGHT_CLOSE |
-                PACHA_FD_RIGHT_WAIT |
-                PACHA_FD_RIGHT_POLL |
-                PACHA_FD_RIGHT_KILL,
+            .rights = process_rights,
             .flags = 0,
             .transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_CLOEXEC,
         },
@@ -1930,9 +2026,76 @@ static int filed_send_exec_reply(
     return status;
 }
 
+static int filed_send_exec_self_reply(
+    int reply_fd,
+    uint64_t request_id,
+    int process_fd,
+    int thread_fd,
+    int bootstrap_fd)
+{
+    struct pacha_ipc_fd fds[3] = {
+        {
+            .fd = (uint64_t)(uint32_t)process_fd,
+            .rights =
+                PACHA_FD_RIGHT_INSPECT |
+                PACHA_FD_RIGHT_CLOSE |
+                PACHA_FD_RIGHT_WAIT |
+                PACHA_FD_RIGHT_POLL |
+                PACHA_FD_RIGHT_KILL |
+                PACHA_FD_RIGHT_MAP_INTO |
+                PACHA_FD_RIGHT_SET_CONTEXT,
+            .flags = 0,
+            .transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_CLOEXEC,
+        },
+        {
+            .fd = (uint64_t)(uint32_t)thread_fd,
+            .rights =
+                PACHA_FD_RIGHT_INSPECT |
+                PACHA_FD_RIGHT_CLOSE |
+                PACHA_FD_RIGHT_WAIT |
+                PACHA_FD_RIGHT_KILL |
+                PACHA_FD_RIGHT_SET_CONTEXT,
+            .flags = 0,
+            .transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_CLOEXEC,
+        },
+        {
+            .fd = (uint64_t)(uint32_t)bootstrap_fd,
+            .rights =
+                PACHA_FD_RIGHT_INSPECT |
+                PACHA_FD_RIGHT_DUP |
+                PACHA_FD_RIGHT_SET_FLAGS |
+                PACHA_FD_RIGHT_CLOSE |
+                PACHA_FD_RIGHT_READ |
+                PACHA_FD_RIGHT_MAP_READ,
+            .flags = 0,
+            .transfer_flags = PACHA_IPC_TRANSFER_MOVE,
+        },
+    };
+    struct pacha_ipc_msg reply = {
+        .word0 = FILED_WIRE_REPLY_MAGIC,
+        .word1 = 0,
+        .word2 = (uint64_t)(uint32_t)process_fd,
+        .word3 = request_id,
+        .fds = fds,
+        .fd_count = 3,
+    };
+    const int status = pacha_ipc_reply(reply_fd, &reply);
+    (void)pacha_fd_close(reply_fd);
+    if (status != 0) {
+        (void)pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_KILL,
+            (uint64_t)(uint32_t)process_fd,
+            1);
+        (void)pacha_fd_close(thread_fd);
+        (void)pacha_fd_close(process_fd);
+        (void)pacha_fd_close(bootstrap_fd);
+    }
+    return status;
+}
+
 static int filed_dispatch_set_inherit(int fd, int enabled)
 {
-    if (fd < 16) {
+    if (fd < 0 || fd >= FILED_EXEC_MAX_FDS) {
         return -22;
     }
     const long status = pacha_fd_fcntl(
@@ -1941,6 +2104,344 @@ static int filed_dispatch_set_inherit(int fd, int enabled)
         enabled ? PACHA_FD_FLAG_INHERIT : 0,
         PACHA_FD_FLAG_INHERIT);
     return status == 0 ? 0 : -22;
+}
+
+typedef struct filed_dispatch_saved_fd {
+    int fd;
+    uint64_t rights;
+    uint64_t flags;
+} filed_dispatch_saved_fd_t;
+
+static void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved)
+{
+    if (saved == NULL) {
+        return;
+    }
+    saved->fd = -1;
+    saved->rights = 0;
+    saved->flags = 0;
+}
+
+static void filed_dispatch_close_owned_fd(int *fd)
+{
+    if (fd == NULL || *fd < 0) {
+        return;
+    }
+    (void)pacha_fd_close(*fd);
+    *fd = -1;
+}
+
+static int filed_dispatch_save_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved)
+{
+    if (saved == NULL || target_fd < 0 || target_fd >= FILED_EXEC_MAX_FDS) {
+        return -22;
+    }
+    filed_dispatch_saved_fd_init(saved);
+
+    struct pacha_fd_info info;
+    memset(&info, 0, sizeof(info));
+    if (pacha_fd_get_info(target_fd, &info) != 0) {
+        return 0;
+    }
+
+    const long dup_fd = pacha_fd_fcntl(
+        target_fd,
+        PACHA_FD_FCNTL_DUP,
+        16,
+        info.rights);
+    if (dup_fd < 16) {
+        return -13;
+    }
+    saved->fd = (int)dup_fd;
+    saved->rights = info.rights;
+    saved->flags = info.flags;
+    return 0;
+}
+
+static void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved)
+{
+    if (saved == NULL || target_fd < 0 || target_fd >= FILED_EXEC_MAX_FDS) {
+        return;
+    }
+    (void)pacha_fd_close(target_fd);
+    if (saved->fd < 0) {
+        return;
+    }
+
+    const long dup_fd = pacha_fd_fcntl(
+        saved->fd,
+        PACHA_FD_FCNTL_DUP,
+        (uint64_t)(uint32_t)target_fd,
+        saved->rights);
+    if (dup_fd == target_fd) {
+        (void)pacha_fd_fcntl(
+            (int)dup_fd,
+            PACHA_FD_FCNTL_SET_FLAGS,
+            saved->flags,
+            PACHA_FD_FLAG_CLOEXEC |
+                PACHA_FD_FLAG_NONBLOCK |
+                PACHA_FD_FLAG_INHERIT |
+                PACHA_FD_FLAG_PRIVATE);
+    } else if (dup_fd >= 0) {
+        (void)pacha_fd_close((int)dup_fd);
+    }
+    (void)pacha_fd_close(saved->fd);
+    filed_dispatch_saved_fd_init(saved);
+}
+
+static int filed_dispatch_exec_default_stdio_valid(const filed_wire_exec_path_t *exec)
+{
+    if (exec == NULL) {
+        return 0;
+    }
+    const int wants_default_stdio =
+        (exec->flags & FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO) != 0;
+    if (!wants_default_stdio) {
+        return filed_wire_exec_string_ref_empty(exec->ctty);
+    }
+    if ((exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) !=
+        (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+    {
+        return 0;
+    }
+    return filed_wire_exec_string_ref_valid(exec, exec->ctty);
+}
+
+static const filed_wire_exec_lpr_fd_t *filed_dispatch_lpr_fd_table_entries(
+    const filed_wire_exec_lpr_fd_table_t *table)
+{
+    return (const filed_wire_exec_lpr_fd_t *)((const unsigned char *)table + sizeof(*table));
+}
+
+static int filed_dispatch_lpr_fd_desc_valid(const filed_wire_exec_lpr_fd_t *fd)
+{
+    if (fd == NULL || fd->fd > LPR_LINUX_FD_MAX) {
+        return 0;
+    }
+    switch (fd->kind) {
+    case FILED_WIRE_EXEC_LPR_FD_FILED:
+    case FILED_WIRE_EXEC_LPR_FD_TTY:
+        return fd->handle != 0;
+    case FILED_WIRE_EXEC_LPR_FD_EVENT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int filed_dispatch_exec_lpr_fd_table_valid(
+    const filed_wire_exec_path_t *exec,
+    const filed_wire_exec_lpr_fd_table_t *table,
+    int allow_table)
+{
+    if (exec == NULL) {
+        return 0;
+    }
+    const int wants_table = (exec->flags & FILED_WIRE_EXEC_LPR_FD_TABLE) != 0;
+    if (!wants_table) {
+        return exec->lpr_fd_table_bytes == 0 && table == NULL;
+    }
+    if (!allow_table ||
+        table == NULL ||
+        exec->lpr_fd_table_bytes < sizeof(*table) ||
+        (exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) !=
+            (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+    {
+        return 0;
+    }
+    if (table->magic != FILED_WIRE_EXEC_LPR_FD_TABLE_MAGIC ||
+        table->version != FILED_WIRE_EXEC_LPR_FD_TABLE_VERSION ||
+        table->reserved0 != 0 ||
+        table->reserved1 != 0 ||
+        table->byte_size < sizeof(*table) ||
+        table->byte_size > exec->lpr_fd_table_bytes)
+    {
+        return 0;
+    }
+    if (table->fd_count > LPR_LINUX_FD_LIMIT ||
+        table->fd_count > (UINT64_MAX - sizeof(*table)) / sizeof(filed_wire_exec_lpr_fd_t))
+    {
+        return 0;
+    }
+    const uint64_t expected_size =
+        sizeof(*table) + table->fd_count * sizeof(filed_wire_exec_lpr_fd_t);
+    if (table->byte_size != expected_size) {
+        return 0;
+    }
+    const filed_wire_exec_lpr_fd_t *entries = filed_dispatch_lpr_fd_table_entries(table);
+    for (uint64_t i = 0; i < table->fd_count; ++i) {
+        if (!filed_dispatch_lpr_fd_desc_valid(&entries[i])) {
+            return 0;
+        }
+        if (i != 0 && entries[i].fd <= entries[i - 1u].fd) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int filed_dispatch_create_lpr_bootstrap_fd(
+    const filed_wire_exec_path_t *exec,
+    const filed_wire_exec_lpr_fd_table_t *fd_table)
+{
+    if (exec == NULL) {
+        return -22;
+    }
+    const uint64_t local_fd_count = fd_table != NULL ? fd_table->fd_count : 0;
+    if (local_fd_count > (UINT64_MAX - sizeof(struct lpr_bootstrap)) / sizeof(lpr_bootstrap_fd_t)) {
+        return -22;
+    }
+    const uint64_t local_fd_bytes = local_fd_count * sizeof(lpr_bootstrap_fd_t);
+    const uint64_t bootstrap_bytes = sizeof(struct lpr_bootstrap) + local_fd_bytes;
+    const uint64_t rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const int fd = pacha_vmo_create(bootstrap_bytes, rights, 0);
+    if (fd < 16) {
+        return fd < 0 ? fd : -12;
+    }
+    struct lpr_bootstrap *bootstrap = pacha_mmap(
+        fd,
+        bootstrap_bytes,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (bootstrap == NULL) {
+        (void)pacha_fd_close(fd);
+        return -12;
+    }
+    memset(bootstrap, 0, sizeof(*bootstrap));
+    bootstrap->magic = LPR_BOOTSTRAP_MAGIC;
+    bootstrap->version = LPR_BOOTSTRAP_VERSION;
+    bootstrap->byte_size = bootstrap_bytes;
+    bootstrap->local_fd_table_offset = sizeof(struct lpr_bootstrap);
+    bootstrap->local_fd_table_bytes = local_fd_bytes;
+    bootstrap->local_fd_count = local_fd_count;
+    bootstrap->linux_pid = exec->linux_pid;
+    bootstrap->linux_ppid = exec->linux_ppid;
+    bootstrap->linux_sid = exec->linux_sid;
+    bootstrap->linux_pgrp = exec->linux_pgrp;
+    bootstrap->linux_next_pid = exec->linux_next_pid;
+    bootstrap->cwd_handle = exec->cwd_handle;
+    bootstrap->supervisor_token = exec->lpr_supervisor_token;
+    bootstrap->supervisor_endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
+    bootstrap->fd_table_token = exec->lpr_fd_table_token;
+    if (exec->lpr_supervisor_token != 0) {
+        bootstrap->flags |= LPR_BOOTSTRAP_FLAG_SUPERVISOR;
+    }
+    if (fd_table != NULL && local_fd_count != 0) {
+        const filed_wire_exec_lpr_fd_t *in = filed_dispatch_lpr_fd_table_entries(fd_table);
+        lpr_bootstrap_fd_t *out =
+            (lpr_bootstrap_fd_t *)((unsigned char *)bootstrap + bootstrap->local_fd_table_offset);
+        for (uint64_t i = 0; i < local_fd_count; ++i) {
+            out[i].fd = in[i].fd;
+            out[i].kind = in[i].kind;
+            out[i].flags = in[i].flags;
+            out[i].handle = in[i].handle;
+            out[i].offset_or_counter = in[i].offset_or_counter;
+        }
+    }
+    if ((exec->flags & FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO) != 0) {
+        bootstrap->flags |= LPR_BOOTSTRAP_FLAG_DEFAULT_STDIO;
+        const char *ctty = filed_wire_exec_string(exec, exec->ctty);
+        if (ctty != NULL) {
+            snprintf(bootstrap->ctty, sizeof(bootstrap->ctty), "%s", ctty);
+        }
+    }
+    if (!filed_wire_exec_string_ref_empty(exec->cwd)) {
+        const char *cwd = filed_wire_exec_string(exec, exec->cwd);
+        if (cwd != NULL) {
+            snprintf(bootstrap->cwd, sizeof(bootstrap->cwd), "%s", cwd);
+        }
+    }
+    (void)pacha_munmap(bootstrap, bootstrap_bytes);
+    return fd;
+}
+
+static int filed_dispatch_prepare_inherit_fd_to_target(
+    int source_fd,
+    uint64_t target_raw,
+    int *out_fd,
+    filed_dispatch_saved_fd_t *saved)
+{
+    if (out_fd != NULL) {
+        *out_fd = -1;
+    }
+    if (source_fd < 0 ||
+        target_raw >= FILED_EXEC_MAX_FDS ||
+        out_fd == NULL ||
+        saved == NULL)
+    {
+        return -22;
+    }
+
+    const int target_fd = (int)(uint32_t)target_raw;
+    struct pacha_fd_info source_info;
+    memset(&source_info, 0, sizeof(source_info));
+    if (pacha_fd_get_info(source_fd, &source_info) != 0) {
+        return -13;
+    }
+
+    const uint64_t inherit_flags =
+        (source_info.flags & ~PACHA_FD_FLAG_CLOEXEC) |
+        PACHA_FD_FLAG_INHERIT;
+    const uint64_t flag_mask =
+        PACHA_FD_FLAG_CLOEXEC |
+        PACHA_FD_FLAG_NONBLOCK |
+        PACHA_FD_FLAG_INHERIT |
+        PACHA_FD_FLAG_PRIVATE;
+
+    if (source_fd == target_fd) {
+        const long status = pacha_fd_fcntl(
+            source_fd,
+            PACHA_FD_FCNTL_SET_FLAGS,
+            inherit_flags,
+            flag_mask);
+        if (status != 0) {
+            return -13;
+        }
+        *out_fd = source_fd;
+        return 0;
+    }
+
+    int status = filed_dispatch_save_target_fd(target_fd, saved);
+    if (status != 0) {
+        return status;
+    }
+    (void)pacha_fd_close(target_fd);
+
+    const long dup_fd = pacha_fd_fcntl(
+        source_fd,
+        PACHA_FD_FCNTL_DUP,
+        (uint64_t)(uint32_t)target_fd,
+        source_info.rights);
+    if (dup_fd != target_fd) {
+        if (dup_fd >= 0) {
+            (void)pacha_fd_close((int)dup_fd);
+        }
+        filed_dispatch_restore_target_fd(target_fd, saved);
+        return -13;
+    }
+    (void)pacha_fd_close(source_fd);
+
+    const long flag_status = pacha_fd_fcntl(
+        (int)dup_fd,
+        PACHA_FD_FCNTL_SET_FLAGS,
+        inherit_flags,
+        flag_mask);
+    if (flag_status != 0) {
+        filed_dispatch_restore_target_fd(target_fd, saved);
+        return -13;
+    }
+
+    *out_fd = (int)dup_fd;
+    return 0;
 }
 
 static int filed_dispatch_dup_endpoint_to_fixed(
@@ -5431,17 +5932,23 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
     const uint64_t known_flags =
         FILED_WIRE_EXEC_INHERIT_HANDLES |
-        FILED_WIRE_EXEC_LINUX_LPR;
+        FILED_WIRE_EXEC_LINUX_LPR |
+        FILED_WIRE_EXEC_LINUX_BOOTSTRAP |
+        FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_WIRE_EXEC_TRANSFER_PROCESS_FD;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
     int exec_filed_endpoint_fd = -1;
     int exec_netd_socket_endpoint_fd = -1;
     int exec_termd_tty_endpoint_fd = -1;
+    int exec_lpr_bootstrap_fd = -1;
     int exec_filed_endpoint_borrowed = 0;
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
+    filed_dispatch_saved_fd_t lpr_bootstrap_saved;
     filed_handle_id_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
+    filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
     if ((exec->flags & ~known_flags) != 0 ||
@@ -5451,7 +5958,11 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
         exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
         exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
         exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
-        !filed_name_is_terminated(exec->path, sizeof(exec->path)))
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
+        (!filed_wire_exec_string_ref_empty(exec->cwd) &&
+            !filed_wire_exec_string_ref_valid(exec, exec->cwd)) ||
+        !filed_dispatch_exec_default_stdio_valid(exec) ||
+        !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
     {
         goto out;
     }
@@ -5518,6 +6029,24 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
+    if ((exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) ==
+        (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+    {
+        const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
+        if (bootstrap_source_fd < 16) {
+            reply_status = bootstrap_source_fd < 0 ? bootstrap_source_fd : -12;
+            goto out;
+        }
+        reply_status = filed_dispatch_prepare_inherit_fd_to_target(
+            bootstrap_source_fd,
+            FILED_EXEC_LPR_BOOTSTRAP_FD,
+            &exec_lpr_bootstrap_fd,
+            &lpr_bootstrap_saved);
+        if (reply_status != 0) {
+            (void)pacha_fd_close(bootstrap_source_fd);
+            goto out;
+        }
+    }
 
     filed_wire_openat_t openat;
     memset(&openat, 0, sizeof(openat));
@@ -5550,6 +6079,16 @@ out:
     filed_dispatch_close_prepared_endpoint(&exec_filed_endpoint_fd, exec_filed_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
+    if (exec_lpr_bootstrap_fd >= 0) {
+        if (lpr_bootstrap_saved.fd >= 0) {
+            filed_dispatch_restore_target_fd(exec_lpr_bootstrap_fd, &lpr_bootstrap_saved);
+        } else {
+            filed_dispatch_close_owned_fd(&exec_lpr_bootstrap_fd);
+        }
+    } else if (lpr_bootstrap_saved.fd >= 0) {
+        (void)pacha_fd_close(lpr_bootstrap_saved.fd);
+        filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
+    }
     if (reply_status != 0) {
         for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
@@ -5583,7 +6122,11 @@ static int filed_dispatch_exec_path(
         FILED_WIRE_EXEC_INHERIT_FDS |
         FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS |
         FILED_WIRE_EXEC_INHERIT_HANDLES |
-        FILED_WIRE_EXEC_LINUX_LPR;
+        FILED_WIRE_EXEC_LINUX_LPR |
+        FILED_WIRE_EXEC_LINUX_BOOTSTRAP |
+        FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_WIRE_EXEC_TRANSFER_PROCESS_FD;
+    const uint64_t exec_flags = exec->flags;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
@@ -5591,23 +6134,45 @@ static int filed_dispatch_exec_path(
     int exec_filed_endpoint_fd = -1;
     int exec_netd_socket_endpoint_fd = -1;
     int exec_termd_tty_endpoint_fd = -1;
+    int exec_lpr_bootstrap_fd = -1;
     int exec_filed_endpoint_borrowed = 0;
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
     int inherit_fds[FILED_WIRE_EXEC_MAX_INHERIT_FDS];
+    filed_dispatch_saved_fd_t inherit_saved[FILED_WIRE_EXEC_MAX_INHERIT_FDS];
+    filed_dispatch_saved_fd_t lpr_bootstrap_saved;
     filed_handle_id_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
-    memset(inherit_fds, 0, sizeof(inherit_fds));
+    memset(inherit_fds, 0xff, sizeof(inherit_fds));
+    for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_FDS; ++i) {
+        filed_dispatch_saved_fd_init(&inherit_saved[i]);
+    }
+    filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
-    if ((exec->flags & ~known_flags) != 0 ||
+    if ((exec_flags & ~known_flags) != 0 ||
         exec->inherit_fd_count > FILED_WIRE_EXEC_MAX_INHERIT_FDS ||
         exec->inherit_handle_count > FILED_WIRE_EXEC_MAX_INHERIT_HANDLES ||
         exec->fd_patch_count > FILED_WIRE_EXEC_MAX_FD_PATCHES ||
         exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
         exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
         exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
-        !filed_name_is_terminated(exec->path, sizeof(exec->path)))
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
+        (!filed_wire_exec_string_ref_empty(exec->cwd) &&
+            !filed_wire_exec_string_ref_valid(exec, exec->cwd)) ||
+        !filed_dispatch_exec_default_stdio_valid(exec) ||
+        !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
     {
+        fprintf(stderr,
+            "[filed] exec_path invalid path=%.*s flags=0x%llx inherit_fds=%llu inherit_handles=%llu fd_patches=%llu argc=%llu envc=%llu string_bytes=%llu\n",
+            (int)sizeof(exec->path),
+            exec->path,
+            (unsigned long long)exec_flags,
+            (unsigned long long)exec->inherit_fd_count,
+            (unsigned long long)exec->inherit_handle_count,
+            (unsigned long long)exec->fd_patch_count,
+            (unsigned long long)exec->argc,
+            (unsigned long long)exec->envc,
+            (unsigned long long)exec->string_bytes);
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
@@ -5624,34 +6189,48 @@ static int filed_dispatch_exec_path(
     const uint64_t inherit_handle_count = exec->inherit_handle_count;
 
     const uint64_t has_bootstrap =
-        (exec->flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0 ? 1u : 0u;
-    if ((exec->flags & FILED_WIRE_EXEC_INHERIT_FDS) == 0 && inherit_fd_count != 0) {
+        (exec_flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0 ? 1u : 0u;
+    if ((exec_flags & FILED_WIRE_EXEC_INHERIT_FDS) == 0 && inherit_fd_count != 0) {
         goto out;
     }
-    if ((exec->flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) == 0 && exec->fd_patch_count != 0) {
+    if ((exec_flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) == 0 && exec->fd_patch_count != 0) {
         goto out;
     }
-    if ((exec->flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) != 0 && has_bootstrap == 0) {
+    if ((exec_flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) != 0 && has_bootstrap == 0) {
         goto out;
     }
-    if ((exec->flags & FILED_WIRE_EXEC_INHERIT_HANDLES) == 0 && inherit_handle_count != 0) {
+    if ((exec_flags & FILED_WIRE_EXEC_INHERIT_HANDLES) == 0 && inherit_handle_count != 0) {
         goto out;
     }
 
     const uint64_t expected_fd_count = 1u + inherit_fd_count + has_bootstrap + 1u;
     if (request->fd_count != expected_fd_count || request->fds == NULL) {
+        fprintf(stderr,
+            "[filed] exec_path fd_count invalid path=%s got=%llu expected=%llu inherit=%llu bootstrap=%llu\n",
+            exec->path,
+            (unsigned long long)request->fd_count,
+            (unsigned long long)expected_fd_count,
+            (unsigned long long)inherit_fd_count,
+            (unsigned long long)has_bootstrap);
         goto out;
     }
 
     for (uint64_t i = 0; i < inherit_fd_count; ++i) {
         const uint64_t fd_index = 1u + i;
-        if (request->fds[fd_index].fd < 16) {
+        if (request->fds[fd_index].fd >= FILED_EXEC_MAX_FDS) {
             goto out;
         }
-        inherit_fds[i] = (int)request->fds[fd_index].fd;
+        reply_status = filed_dispatch_prepare_inherit_fd_to_target(
+            (int)request->fds[fd_index].fd,
+            exec->inherit_fd_targets[i],
+            &inherit_fds[i],
+            &inherit_saved[i]);
+        if (reply_status != 0) {
+            goto out;
+        }
     }
 
-    if ((exec->flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0) {
+    if ((exec_flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0) {
         const uint64_t fd_index = 1u + inherit_fd_count;
         if (request->fds[fd_index].fd < 16) {
             goto out;
@@ -5672,9 +6251,7 @@ static int filed_dispatch_exec_path(
         inherit_handles[i] = dup_handle;
     }
 
-    if ((exec->flags & FILED_WIRE_EXEC_INHERIT_FDS) == 0 &&
-        inherit_fd_count == 0 &&
-        runtime->client_endpoint_fd >= 16)
+    if (runtime->client_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
             runtime->client_endpoint_fd,
@@ -5685,8 +6262,7 @@ static int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
-        inherit_fd_count == 0 &&
+    if ((exec_flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
         runtime->netd_socket_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -5698,8 +6274,7 @@ static int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
-        inherit_fd_count == 0 &&
+    if ((exec_flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
         runtime->termd_tty_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -5711,8 +6286,26 @@ static int filed_dispatch_exec_path(
             goto out;
         }
     }
+    if ((exec_flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) ==
+        (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+    {
+        const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
+        if (bootstrap_source_fd < 16) {
+            reply_status = bootstrap_source_fd < 0 ? bootstrap_source_fd : -12;
+            goto out;
+        }
+        reply_status = filed_dispatch_prepare_inherit_fd_to_target(
+            bootstrap_source_fd,
+            FILED_EXEC_LPR_BOOTSTRAP_FD,
+            &exec_lpr_bootstrap_fd,
+            &lpr_bootstrap_saved);
+        if (reply_status != 0) {
+            (void)pacha_fd_close(bootstrap_source_fd);
+            goto out;
+        }
+    }
 
-    if ((exec->flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
+    if ((exec_flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
         void *bootstrap_page = pacha_mmap(
             bootstrap_fd,
             FILED_BOOTSTRAP_PATCH_BYTES,
@@ -5774,6 +6367,10 @@ static int filed_dispatch_exec_path(
     memset(&open_result, 0, sizeof(open_result));
     reply_status = filed_openat_path(runtime, &openat, &open_result);
     if (reply_status != 0) {
+        fprintf(stderr,
+            "[filed] exec_path open failed path=%s status=%lld\n",
+            exec->path,
+            (long long)reply_status);
         goto out;
     }
 
@@ -5788,6 +6385,10 @@ static int filed_dispatch_exec_path(
         &thread_fd);
     filed_close_walk_handle(runtime, open_result.handle_id, 1);
     if (reply_status != 0) {
+        fprintf(stderr,
+            "[filed] exec_path exec failed path=%s status=%lld\n",
+            exec->path,
+            (long long)reply_status);
         goto out;
     }
 
@@ -5795,14 +6396,31 @@ out:
     filed_dispatch_close_prepared_endpoint(&exec_filed_endpoint_fd, exec_filed_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
+    if (exec_lpr_bootstrap_fd >= 0) {
+        if (lpr_bootstrap_saved.fd >= 0) {
+            filed_dispatch_restore_target_fd(exec_lpr_bootstrap_fd, &lpr_bootstrap_saved);
+        } else {
+            filed_dispatch_close_owned_fd(&exec_lpr_bootstrap_fd);
+        }
+    } else if (lpr_bootstrap_saved.fd >= 0) {
+        (void)pacha_fd_close(lpr_bootstrap_saved.fd);
+        filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
+    }
     (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (bootstrap_fd >= 16) {
         (void)pacha_fd_close(bootstrap_fd);
     }
     for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_FDS; ++i) {
-        if (inherit_fds[i] >= 16) {
-            (void)pacha_fd_close(inherit_fds[i]);
+        if (inherit_fds[i] >= 0) {
+            if (inherit_saved[i].fd >= 0) {
+                filed_dispatch_restore_target_fd(inherit_fds[i], &inherit_saved[i]);
+            } else {
+                filed_dispatch_close_owned_fd(&inherit_fds[i]);
+            }
+        } else if (inherit_saved[i].fd >= 0) {
+            (void)pacha_fd_close(inherit_saved[i].fd);
+            filed_dispatch_saved_fd_init(&inherit_saved[i]);
         }
     }
     if (reply_status != 0) {
@@ -5813,7 +6431,12 @@ out:
         }
     }
     if (reply_status == 0 && process_fd >= 16 && thread_fd >= 16) {
-        const int send_status = filed_send_exec_reply(reply_fd, request->word3, process_fd, thread_fd);
+        const int send_status = filed_send_exec_reply(
+            reply_fd,
+            request->word3,
+            process_fd,
+            thread_fd,
+            (exec_flags & FILED_WIRE_EXEC_TRANSFER_PROCESS_FD) != 0);
         if (send_status != 0) {
             for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_HANDLES; ++i) {
                 if (inherit_handles[i] != 0) {
@@ -5822,6 +6445,154 @@ out:
             }
         }
         return send_status;
+    }
+    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+}
+
+static int filed_dispatch_exec_self(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    int page_fd = -1;
+    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    if (page == NULL) {
+        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    }
+
+    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    const uint64_t known_flags =
+        FILED_WIRE_EXEC_LINUX_LPR |
+        FILED_WIRE_EXEC_LINUX_BOOTSTRAP |
+        FILED_WIRE_EXEC_SELF |
+        FILED_WIRE_EXEC_LPR_FD_TABLE;
+    int64_t reply_status = -22;
+    int process_fd = -1;
+    int thread_fd = -1;
+    int bootstrap_fd = -1;
+    int lpr_fd_table_fd = -1;
+    void *lpr_fd_table_page = NULL;
+    const filed_wire_exec_lpr_fd_table_t *lpr_fd_table = NULL;
+    const int wants_lpr_fd_table = (exec->flags & FILED_WIRE_EXEC_LPR_FD_TABLE) != 0;
+    const uint64_t expected_request_fd_count = wants_lpr_fd_table ? 3u : 2u;
+
+    if ((exec->flags & ~known_flags) != 0 ||
+        (exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP | FILED_WIRE_EXEC_SELF)) !=
+            (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP | FILED_WIRE_EXEC_SELF) ||
+        exec->inherit_fd_count != 0 ||
+        exec->inherit_handle_count != 0 ||
+        exec->fd_patch_count != 0 ||
+        exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
+        exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
+        exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
+        request->fd_count != expected_request_fd_count ||
+        request->fds == NULL ||
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
+        (!filed_wire_exec_string_ref_empty(exec->cwd) &&
+            !filed_wire_exec_string_ref_valid(exec, exec->cwd)) ||
+        !filed_wire_exec_string_ref_empty(exec->ctty) ||
+        (wants_lpr_fd_table &&
+            (exec->lpr_fd_table_bytes < sizeof(filed_wire_exec_lpr_fd_table_t) ||
+                request->fds[1].fd < 16)) ||
+        (!wants_lpr_fd_table &&
+            !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 1)))
+    {
+        goto out;
+    }
+    for (uint64_t i = 0; i < exec->argc; ++i) {
+        if (!filed_wire_exec_string_ref_valid(exec, exec->argv[i])) {
+            goto out;
+        }
+    }
+    for (uint64_t i = 0; i < exec->envc; ++i) {
+        if (!filed_wire_exec_string_ref_valid(exec, exec->envp[i])) {
+            goto out;
+        }
+    }
+
+    if (wants_lpr_fd_table) {
+        lpr_fd_table_fd = (int)request->fds[1].fd;
+        lpr_fd_table_page = pacha_mmap(
+            lpr_fd_table_fd,
+            exec->lpr_fd_table_bytes,
+            PACHA_PROT_READ,
+            PACHA_MMAP_SHARED,
+            0);
+        if (lpr_fd_table_page == NULL) {
+            goto out;
+        }
+        lpr_fd_table = (const filed_wire_exec_lpr_fd_table_t *)lpr_fd_table_page;
+        if (!filed_dispatch_exec_lpr_fd_table_valid(exec, lpr_fd_table, 1)) {
+            goto out;
+        }
+    }
+
+    bootstrap_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, lpr_fd_table);
+    if (bootstrap_fd < 16) {
+        reply_status = bootstrap_fd < 0 ? bootstrap_fd : -12;
+        bootstrap_fd = -1;
+        goto out;
+    }
+
+    filed_wire_openat_t openat;
+    memset(&openat, 0, sizeof(openat));
+    openat.dir_handle = exec->dir_handle;
+    openat.rights =
+        FILED_WIRE_RIGHT_READ |
+        FILED_WIRE_RIGHT_EXEC |
+        FILED_WIRE_RIGHT_STAT;
+    snprintf(openat.name, sizeof(openat.name), "%s", exec->path);
+
+    filed_vfs_open_result_t open_result;
+    memset(&open_result, 0, sizeof(open_result));
+    reply_status = filed_openat_path(runtime, &openat, &open_result);
+    if (reply_status != 0) {
+        fprintf(stderr,
+            "[filed] exec_self open failed path=%s status=%lld\n",
+            exec->path,
+            (long long)reply_status);
+        goto out;
+    }
+
+    reply_status = filed_exec_linux_lpr_prepare_self(
+        runtime,
+        open_result.handle_id,
+        exec,
+        &process_fd,
+        &thread_fd);
+    filed_close_walk_handle(runtime, open_result.handle_id, 1);
+    if (reply_status != 0) {
+        fprintf(stderr,
+            "[filed] exec_self prepare failed path=%s status=%lld\n",
+            exec->path,
+            (long long)reply_status);
+        goto out;
+    }
+
+out:
+    if (lpr_fd_table_page != NULL) {
+        (void)pacha_munmap(lpr_fd_table_page, exec->lpr_fd_table_bytes);
+    }
+    if (lpr_fd_table_fd >= 16) {
+        (void)pacha_fd_close(lpr_fd_table_fd);
+    }
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    if (reply_status == 0 && process_fd >= 16 && thread_fd >= 16 && bootstrap_fd >= 16) {
+        return filed_send_exec_self_reply(reply_fd, request->word3, process_fd, thread_fd, bootstrap_fd);
+    }
+    if (process_fd >= 16) {
+        (void)pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_KILL,
+            (uint64_t)(uint32_t)process_fd,
+            1);
+        (void)pacha_fd_close(process_fd);
+    }
+    if (thread_fd >= 16) {
+        (void)pacha_fd_close(thread_fd);
+    }
+    if (bootstrap_fd >= 16) {
+        (void)pacha_fd_close(bootstrap_fd);
     }
     return filed_send_reply(reply_fd, request->word3, reply_status, 0);
 }
@@ -5941,6 +6712,276 @@ static int filed_dispatch_set_termd_tty_endpoint(
     return filed_send_reply(reply_fd, request->word3, 0, (uint64_t)(uint32_t)endpoint_fd);
 }
 
+static uint64_t filed_import_termd_error(
+    filed_runtime_t *runtime,
+    uint64_t child_token,
+    uint64_t request_id,
+    int64_t status,
+    uint64_t fd_count,
+    uint64_t subject,
+    const char *text)
+{
+    pacha_errconv_frame_t parent;
+    memset(&parent, 0, sizeof(parent));
+    parent.domain = PACHA_ERRCONV_DOMAIN_TERMD_STATUS;
+    parent.component = PACHA_ERRCONV_COMPONENT_FILED;
+    parent.op = FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR;
+    parent.stage = PACHA_ERRCONV_STAGE_CHILD_STATUS;
+    parent.status = status;
+    parent.raw_status = status;
+    parent.request_id = request_id;
+    parent.fd_count = fd_count;
+    parent.subject = subject;
+    parent.child_token = child_token;
+    pacha_errconv_frame_text(&parent, text);
+
+    if (runtime == NULL || runtime->termd_tty_endpoint_fd < 16 || child_token == 0) {
+        return pacha_errconv_begin(filed_errors(), status, &parent);
+    }
+
+    const uint64_t rights =
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const int page_fd = pacha_vmo_create(TERMD_WIRE_PAGE_BYTES, rights, 0);
+    if (page_fd < 16) {
+        const uint64_t token = pacha_errconv_begin(filed_errors(), status, &parent);
+        pacha_errconv_frame_t frame;
+        memset(&frame, 0, sizeof(frame));
+        frame.domain = PACHA_ERRCONV_DOMAIN_KERNEL_STATUS;
+        frame.component = PACHA_ERRCONV_COMPONENT_FILED;
+        frame.op = TERMD_WIRE_OP_ERROR_GET;
+        frame.stage = PACHA_ERRCONV_STAGE_KERNEL_SYSCALL;
+        frame.status = page_fd;
+        frame.raw_status = page_fd;
+        frame.request_id = request_id;
+        frame.child_token = child_token;
+        pacha_errconv_frame_text(&frame, "create child error page failed");
+        (void)pacha_errconv_append(filed_errors(), token, &frame);
+        return token;
+    }
+
+    void *page = pacha_mmap(
+        page_fd,
+        TERMD_WIRE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (page == NULL) {
+        const uint64_t token = pacha_errconv_begin(filed_errors(), status, &parent);
+        pacha_errconv_frame_t frame;
+        memset(&frame, 0, sizeof(frame));
+        frame.domain = PACHA_ERRCONV_DOMAIN_KERNEL_STATUS;
+        frame.component = PACHA_ERRCONV_COMPONENT_FILED;
+        frame.op = TERMD_WIRE_OP_ERROR_GET;
+        frame.stage = PACHA_ERRCONV_STAGE_MAP_PAGE;
+        frame.status = -5;
+        frame.raw_status = -5;
+        frame.request_id = request_id;
+        frame.child_token = child_token;
+        pacha_errconv_frame_text(&frame, "map child error page failed");
+        (void)pacha_errconv_append(filed_errors(), token, &frame);
+        (void)pacha_fd_close(page_fd);
+        return token;
+    }
+    memset(page, 0, TERMD_WIRE_PAGE_BYTES);
+
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    fd_item.fd = (uint64_t)(uint32_t)page_fd;
+    fd_item.rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const struct pacha_ipc_msg get_request = {
+        .word0 = TERMD_WIRE_REQUEST_MAGIC,
+        .word1 = TERMD_WIRE_OP_ERROR_GET,
+        .word2 = child_token,
+        .word3 = request_id ^ 0x45524745545f5445ull,
+        .fds = &fd_item,
+        .fd_count = 1,
+    };
+    const int error_reply_fd = pacha_ipc_call(runtime->termd_tty_endpoint_fd, &get_request);
+    int64_t get_status = error_reply_fd;
+    if (error_reply_fd >= 16) {
+        struct pacha_ipc_msg get_reply;
+        memset(&get_reply, 0, sizeof(get_reply));
+        get_status = pacha_ipc_recv_wait(error_reply_fd, &get_reply, PACHA_FD_WAIT_FOREVER);
+        (void)pacha_fd_close(error_reply_fd);
+        if (get_status == 0 &&
+            (get_reply.word0 != TERMD_WIRE_REPLY_MAGIC ||
+             get_reply.word3 != get_request.word3))
+        {
+            get_status = -5;
+        } else if (get_status == 0) {
+            get_status = (int64_t)get_reply.word1;
+        }
+    }
+
+    uint64_t token = 0;
+    if (get_status == 0) {
+        token = pacha_errconv_import_page(
+            filed_errors(),
+            status,
+            &parent,
+            page,
+            TERMD_WIRE_PAGE_BYTES);
+    } else {
+        token = pacha_errconv_begin(filed_errors(), status, &parent);
+        pacha_errconv_frame_t frame;
+        memset(&frame, 0, sizeof(frame));
+        frame.domain = PACHA_ERRCONV_DOMAIN_TERMD_STATUS;
+        frame.component = PACHA_ERRCONV_COMPONENT_FILED;
+        frame.op = TERMD_WIRE_OP_ERROR_GET;
+        frame.stage = PACHA_ERRCONV_STAGE_ERROR_GET;
+        frame.status = get_status;
+        frame.raw_status = get_status;
+        frame.request_id = get_request.word3;
+        frame.child_token = child_token;
+        pacha_errconv_frame_text(&frame, "child error get failed");
+        (void)pacha_errconv_append(filed_errors(), token, &frame);
+    }
+
+    (void)pacha_munmap(page, TERMD_WIRE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return token;
+}
+
+static int filed_dispatch_error_get(
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    if (request == NULL ||
+        request->fds == NULL ||
+        request->fd_count < 1 ||
+        request->fds[0].fd < 16)
+    {
+        return filed_send_reply_with_error(
+            reply_fd,
+            request != NULL ? request->word3 : 0,
+            -22,
+            0,
+            0);
+    }
+    const int page_fd = (int)(uint32_t)request->fds[0].fd;
+    void *page = pacha_mmap(
+        page_fd,
+        FILED_WIRE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (page == NULL) {
+        return filed_send_reply_with_error(reply_fd, request->word3, -14, 0, 0);
+    }
+    const int status =
+        pacha_errconv_export(filed_errors(), request->word2, page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    return filed_send_reply_with_error(reply_fd, request->word3, status, 0, 0);
+}
+
+static int filed_dispatch_register_termd_signal_supervisor(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    if (runtime == NULL ||
+        request == NULL ||
+        request->fds == NULL ||
+        request->fd_count < 1 ||
+        request->fds[0].fd < 16 ||
+        runtime->termd_tty_endpoint_fd < 16)
+    {
+        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
+    }
+
+    const int supervisor_endpoint_fd = (int)(uint32_t)request->fds[0].fd;
+    struct pacha_ipc_fd termd_fd;
+    memset(&termd_fd, 0, sizeof(termd_fd));
+    termd_fd.fd = (uint64_t)(uint32_t)supervisor_endpoint_fd;
+    termd_fd.rights =
+        PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_CLOSE;
+
+    const struct pacha_ipc_msg termd_request = {
+        .word0 = TERMD_WIRE_REQUEST_MAGIC,
+        .word1 = TERMD_WIRE_OP_REGISTER_SIGNAL_SUPERVISOR,
+        .word2 = 0,
+        .word3 = request->word3,
+        .fds = &termd_fd,
+        .fd_count = 1,
+    };
+    const int termd_reply_fd =
+        pacha_ipc_call(runtime->termd_tty_endpoint_fd, &termd_request);
+    if (termd_reply_fd < 16) {
+        const uint64_t token = filed_error_token(
+            termd_reply_fd,
+            FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+            PACHA_ERRCONV_STAGE_CHILD_RPC_CALL,
+            termd_reply_fd,
+            request->word3,
+            request->fd_count,
+            (uint64_t)(uint32_t)runtime->termd_tty_endpoint_fd,
+            0,
+            "termd signal supervisor call failed");
+        (void)pacha_fd_close(supervisor_endpoint_fd);
+        return filed_send_reply_with_error(reply_fd, request->word3, termd_reply_fd, 0, token);
+    }
+
+    struct pacha_ipc_msg termd_reply;
+    memset(&termd_reply, 0, sizeof(termd_reply));
+    const int recv_status =
+        pacha_ipc_recv_wait(termd_reply_fd, &termd_reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(termd_reply_fd);
+    (void)pacha_fd_close(supervisor_endpoint_fd);
+
+    int64_t status = recv_status;
+    uint64_t result = 0;
+    uint64_t error_token = 0;
+    if (recv_status == 0) {
+        if (termd_reply.word0 != TERMD_WIRE_REPLY_MAGIC ||
+            termd_reply.word3 != termd_request.word3)
+        {
+            status = -5;
+            error_token = filed_error_token(
+                status,
+                FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+                PACHA_ERRCONV_STAGE_REPLY_MAGIC,
+                (int64_t)termd_reply.word0,
+                request->word3,
+                request->fd_count,
+                termd_reply.word3,
+                0,
+                "termd signal supervisor reply mismatch");
+        } else {
+            status = (int64_t)termd_reply.word1;
+            result = termd_reply.word2;
+            if (status < 0) {
+                error_token = filed_import_termd_error(
+                    runtime,
+                    termd_reply.word2,
+                    request->word3,
+                    status,
+                    request->fd_count,
+                    TERMD_WIRE_OP_REGISTER_SIGNAL_SUPERVISOR,
+                    "termd signal supervisor returned error");
+            }
+        }
+    } else {
+        error_token = filed_error_token(
+            status,
+            FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+            PACHA_ERRCONV_STAGE_CHILD_RPC_RECV,
+            status,
+            request->word3,
+            request->fd_count,
+            (uint64_t)(uint32_t)termd_reply_fd,
+            0,
+            "termd signal supervisor reply recv failed");
+    }
+    return filed_send_reply_with_error(reply_fd, request->word3, status, result, error_token);
+}
+
 static filed_page_dispatch_result_t filed_dispatch_session_page(
     filed_runtime_t *runtime,
     const struct pacha_ipc_msg *request,
@@ -5999,6 +7040,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_seek_page(runtime, page);
     case FILED_WIRE_OP_EXEC_PATH:
         return filed_dispatch_exec_path_session_page(runtime, page);
+    case FILED_WIRE_OP_EXEC_SELF:
+        return filed_page_result(-95, 0);
     case FILED_WIRE_OP_CLOSE:
         return filed_dispatch_close_page(runtime, request);
     case FILED_WIRE_OP_SYNC_ALL:
@@ -6416,6 +7459,9 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
     case FILED_WIRE_OP_EXEC_PATH:
         dispatch_status = filed_dispatch_exec_path(runtime, reply_fd, &request);
         break;
+    case FILED_WIRE_OP_EXEC_SELF:
+        dispatch_status = filed_dispatch_exec_self(runtime, reply_fd, &request);
+        break;
     case FILED_WIRE_OP_DUMP_METRICS:
         filed_dump_dispatch_metrics();
         filed_dump_cache_metrics(runtime);
@@ -6451,6 +7497,13 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
         break;
     case FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT:
         dispatch_status = filed_dispatch_set_termd_tty_endpoint(runtime, reply_fd, &request);
+        break;
+    case FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR:
+        dispatch_status =
+            filed_dispatch_register_termd_signal_supervisor(runtime, reply_fd, &request);
+        break;
+    case FILED_WIRE_OP_ERROR_GET:
+        dispatch_status = filed_dispatch_error_get(reply_fd, &request);
         break;
     case FILED_WIRE_OP_PING:
         dispatch_status = filed_send_reply(reply_fd, request.word3, 0, request.word2);

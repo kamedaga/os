@@ -1,25 +1,26 @@
 pub const fd_table_entries: u32 = 256;
 pub const first_dynamic_fd: u32 = 16;
 
-pub const syscall_fd_first: u64 = 27;
-pub const syscall_fd_close: u64 = 27;
-pub const syscall_fd_dup: u64 = 28;
-pub const syscall_fd_get_info: u64 = 29;
-pub const syscall_fd_set_flags: u64 = 30;
-pub const syscall_fd_read: u64 = 31;
-pub const syscall_fd_write: u64 = 32;
-pub const syscall_fd_readv: u64 = 33;
-pub const syscall_fd_writev: u64 = 34;
-pub const syscall_fd_fcntl: u64 = 35;
-pub const syscall_fd_poll: u64 = 36;
-pub const syscall_fd_wait_many: u64 = 37;
-pub const syscall_fd_ioctl: u64 = 38;
-pub const syscall_fd_stat: u64 = 39;
-pub const syscall_eventfd_create: u64 = 40;
-pub const syscall_timerfd_create: u64 = 41;
-pub const syscall_timerfd_settime: u64 = 42;
-pub const syscall_timerfd_gettime: u64 = 43;
-pub const syscall_vmo_create: u64 = 44;
+pub const syscall_fd_first: u64 = 28;
+pub const syscall_fd_close: u64 = 28;
+pub const syscall_fd_dup: u64 = 29;
+pub const syscall_fd_get_info: u64 = 30;
+pub const syscall_fd_set_flags: u64 = 31;
+pub const syscall_fd_read: u64 = 32;
+pub const syscall_fd_write: u64 = 33;
+pub const syscall_fd_readv: u64 = 34;
+pub const syscall_fd_writev: u64 = 35;
+pub const syscall_fd_fcntl: u64 = 36;
+pub const syscall_fd_poll: u64 = 37;
+pub const syscall_fd_wait_many: u64 = 38;
+pub const syscall_fd_ioctl: u64 = 39;
+pub const syscall_fd_stat: u64 = 40;
+pub const syscall_eventfd_create: u64 = 41;
+pub const syscall_pipe_create: u64 = 42;
+pub const syscall_timerfd_create: u64 = 43;
+pub const syscall_timerfd_settime: u64 = 44;
+pub const syscall_timerfd_gettime: u64 = 45;
+pub const syscall_vmo_create: u64 = 46;
 pub const syscall_fd_last: u64 = syscall_vmo_create;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -84,6 +85,7 @@ pub const fd_kind_timer: u64 = 13;
 pub const fd_kind_serial: u64 = 14;
 pub const fd_kind_schedctl: u64 = 15;
 pub const fd_kind_sched_event: u64 = 16;
+pub const fd_kind_pipe: u64 = 17;
 
 pub const fd_info_kind_offset: u64 = 0;
 pub const fd_info_rights_offset: u64 = 8;
@@ -154,6 +156,12 @@ pub const iovec_base_offset: u64 = 0;
 pub const iovec_len_offset: u64 = 8;
 pub const iovec_size: u64 = 16;
 pub const max_iovecs: u64 = 16;
+
+pub const pipe_pair_read_fd_offset: u64 = 0;
+pub const pipe_pair_write_fd_offset: u64 = 8;
+pub const pipe_pair_size: u64 = 16;
+pub const pipe_buffer_bytes: u64 = 4096;
+pub const pipe_buf: u64 = 4096;
 
 pub const timerfd_clock_monotonic: u64 = 1;
 pub const timerfd_flag_abstime: u64 = 1 << 0;

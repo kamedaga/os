@@ -19,7 +19,8 @@ pub const syscall_thread_set_gs_base: u64 = 16;
 pub const syscall_process_clone: u64 = 17;
 pub const syscall_process_map: u64 = 18;
 pub const syscall_process_map_batch: u64 = 19;
-pub const syscall_process_last: u64 = syscall_process_map_batch;
+pub const syscall_process_exec_from: u64 = 20;
+pub const syscall_process_last: u64 = syscall_process_exec_from;
 pub const syscall_process_count: u64 = syscall_process_last - syscall_process_first + 1;
 
 pub const process_flag_none: u64 = 0;
@@ -81,6 +82,9 @@ pub const process_map_batch_entry_prot_offset: u64 = 24;
 pub const process_map_batch_entry_vmo_offset_offset: u64 = 32;
 pub const process_map_batch_entry_flags_offset: u64 = 40;
 pub const process_map_batch_entry_size: u64 = 48;
+
+pub const process_exec_from_flag_none: u64 = 0;
+pub const process_exec_from_known_flags_mask: u64 = process_exec_from_flag_none;
 
 pub const aux_base_va: u64 = 0x0000_7000_0000_0000;
 pub const aux_page_bytes: u64 = 0x1000;

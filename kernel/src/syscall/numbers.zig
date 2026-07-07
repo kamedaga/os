@@ -26,6 +26,7 @@ pub const syscall_thread_set_gs_base: u64 = process_abi.syscall_thread_set_gs_ba
 pub const syscall_process_clone: u64 = process_abi.syscall_process_clone;
 pub const syscall_process_map: u64 = process_abi.syscall_process_map;
 pub const syscall_process_map_batch: u64 = process_abi.syscall_process_map_batch;
+pub const syscall_process_exec_from: u64 = process_abi.syscall_process_exec_from;
 
 pub const syscall_getpid: u64 = runtime_abi.syscall_getpid;
 pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
@@ -49,6 +50,7 @@ pub const syscall_fd_wait_many: u64 = fd_abi.syscall_fd_wait_many;
 pub const syscall_fd_ioctl: u64 = fd_abi.syscall_fd_ioctl;
 pub const syscall_fd_stat: u64 = fd_abi.syscall_fd_stat;
 pub const syscall_eventfd_create: u64 = fd_abi.syscall_eventfd_create;
+pub const syscall_pipe_create: u64 = fd_abi.syscall_pipe_create;
 pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
@@ -88,6 +90,7 @@ pub const syscall_err_not_ready: u64 = 2;
 pub const syscall_err_alloc: u64 = 3;
 pub const syscall_err_map: u64 = 4;
 pub const syscall_err_empty: u64 = 5;
+pub const syscall_err_closed: u64 = 6;
 
 test "native syscall numbers are contiguous" {
     const std = @import("std");
@@ -111,6 +114,7 @@ test "native syscall numbers are contiguous" {
         syscall_process_clone,
         syscall_process_map,
         syscall_process_map_batch,
+        syscall_process_exec_from,
         syscall_getpid,
         syscall_gettid,
         syscall_clock_gettime,
@@ -132,6 +136,7 @@ test "native syscall numbers are contiguous" {
         syscall_fd_ioctl,
         syscall_fd_stat,
         syscall_eventfd_create,
+        syscall_pipe_create,
         syscall_timerfd_create,
         syscall_timerfd_settime,
         syscall_timerfd_gettime,
@@ -174,6 +179,7 @@ test "syscall status numbers are contiguous" {
         syscall_err_alloc,
         syscall_err_map,
         syscall_err_empty,
+        syscall_err_closed,
     };
     for (expected, 0..) |nr, index| {
         try std.testing.expectEqual(@as(u64, @intCast(index)), nr);

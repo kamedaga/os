@@ -91,20 +91,17 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 	}
 	contentFingerprint := opts.Fingerprint
 	if len(contentFingerprint) == 0 {
-		contentFingerprint = layoutFingerprint
-		if partitionName != "rootfs" {
-			span.Message("loading manifest for content fingerprint")
-			manifest, err := LoadManifestWithOptionsProgress(manifestPath, LoadOptions{CheckSymlinks: true}, span)
-			if err != nil {
-				span.Fail("manifest load failed")
-				return Result{}, err
-			}
-			span.Message("hashing manifest sources")
-			contentFingerprint, err = Fingerprint(manifest)
-			if err != nil {
-				span.Fail("source fingerprint failed")
-				return Result{}, err
-			}
+		span.Message("loading manifest for content fingerprint")
+		manifest, err := LoadManifestWithOptionsProgress(manifestPath, LoadOptions{CheckSymlinks: true}, span)
+		if err != nil {
+			span.Fail("manifest load failed")
+			return Result{}, err
+		}
+		span.Message("hashing manifest sources")
+		contentFingerprint, err = Fingerprint(manifest)
+		if err != nil {
+			span.Fail("source fingerprint failed")
+			return Result{}, err
 		}
 	}
 	syncFingerprint := syncCacheFingerprint(contentFingerprint, cacheFilesystem)
@@ -129,28 +126,6 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 				Filesystem: filesystem,
 			}, nil
 		}
-	}
-	if partitionName == "rootfs" && !opts.Force && len(opts.ChangedSources) == 0 && layoutCacheMatches(workspace, partitionName, layoutFingerprint, cacheFilesystem) {
-		span.Message("counting cached rootfs entries")
-		counts, err := LoadManifestCounts(manifestPath)
-		if err != nil {
-			span.Fail("manifest count failed")
-			return Result{}, err
-		}
-		if err := writeFingerprint(cachePath, syncFingerprint); err != nil {
-			span.Fail("cache write failed")
-			return Result{}, err
-		}
-		span.Done("rootfs up-to-date")
-		return Result{
-			Disk:       diskPath,
-			Manifest:   manifestPath,
-			Partition:  partition.Index,
-			Skipped:    true,
-			Files:      counts.Files,
-			Dirs:       counts.Dirs,
-			Filesystem: filesystem,
-		}, nil
 	}
 	if !opts.Full && !opts.Force && filesystem == "fat32" {
 		if partitionName == "rootfs" && len(opts.ChangedSources) > 0 {

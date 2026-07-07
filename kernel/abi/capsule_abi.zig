@@ -1,16 +1,16 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 57;
-pub const syscall_capsule_query: u64 = 57;
-pub const syscall_capsule_derive_mmio: u64 = 58;
-pub const syscall_capsule_derive_dma_buffer: u64 = 59;
-pub const syscall_capsule_derive_dma_mapping: u64 = 60;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 61;
-pub const syscall_capsule_derive_irq: u64 = 62;
-pub const syscall_capsule_pci_config_read: u64 = 63;
-pub const syscall_capsule_pci_config_write: u64 = 64;
-pub const syscall_capsule_pci_bar_info: u64 = 65;
-pub const syscall_capsule_irq_poll: u64 = 66;
+pub const syscall_capsule_first: u64 = 59;
+pub const syscall_capsule_query: u64 = 59;
+pub const syscall_capsule_derive_mmio: u64 = 60;
+pub const syscall_capsule_derive_dma_buffer: u64 = 61;
+pub const syscall_capsule_derive_dma_mapping: u64 = 62;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 63;
+pub const syscall_capsule_derive_irq: u64 = 64;
+pub const syscall_capsule_pci_config_read: u64 = 65;
+pub const syscall_capsule_pci_config_write: u64 = 66;
+pub const syscall_capsule_pci_bar_info: u64 = 67;
+pub const syscall_capsule_irq_poll: u64 = 68;
 pub const syscall_capsule_last: u64 = syscall_capsule_irq_poll;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 

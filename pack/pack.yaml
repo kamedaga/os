@@ -529,6 +529,7 @@ apps:
       input:
         - "userland/personality/include"
         - "userland/personality/linux/runtime"
+        - "userland/lpr_supervisor/include"
         - "musl/pachaos/include"
         - "userland/personality/linux/build-lpr.sh"
         - "userland/personality/linux/check-lpr-namespace.sh"
@@ -587,6 +588,22 @@ apps:
         - "pack/scripts/download_lpr_busybox_dynamic.sh"
     out: "LPRBBROOT"
     rootfs: "/"
+  lpr_busybox_cmd:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-busybox-dynamic-root/cmd/alpine-busybox.elf"
+      rebuild: ["bash", "pack/scripts/download_lpr_busybox_dynamic.sh", ".artifacts/userland-fixtures/lpr-busybox-dynamic-root"]
+      input:
+        - "pack/scripts/download_lpr_busybox_dynamic.sh"
+    out: "BUSYBOX.ELF"
+    rootfs: ["/cmd/busybox", "/bin/stty", "/bin/sleep"]
+  lpr_bash_dynamic:
+    file:
+      path: ".artifacts/userland-fixtures/lpr-bash-dynamic-root/bin/bash"
+      rebuild: ["bash", "pack/scripts/download_lpr_bash_dynamic.sh", ".artifacts/userland-fixtures/lpr-bash-dynamic-root"]
+      input:
+        - "pack/scripts/download_lpr_bash_dynamic.sh"
+    out: "BASH.ELF"
+    rootfs: "/bin/bash"
   lpr_apk_offline:
     file:
       path: ".artifacts/userland-fixtures/lpr-apk-offline-root"
@@ -875,6 +892,8 @@ apps:
         - "userland/seed0root/CMakeLists.txt"
         - "userland/seed0root/src"
         - "userland/filed/include"
+        - "userland/lpr_supervisor/include"
+        - "userland/personality/include"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
@@ -914,6 +933,23 @@ apps:
         - "userland/personality/linux/hde"
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
+  lpr_supervisor:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/lpr_supervisor/lpr_supervisor.elf"
+      rebuild: ["bash", "-lc", "cmake -S userland/lpr_supervisor -B .artifacts/cmake/lpr_supervisor && cmake --build .artifacts/cmake/lpr_supervisor --parallel 1"]
+      input:
+        - "userland/lpr_supervisor/CMakeLists.txt"
+        - "userland/lpr_supervisor/include"
+        - "userland/lpr_supervisor/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "LPRSUP.ELF"
+    rootfs: "/sbin/lpr_supervisor.elf"
   net_bench:
     file:
       path: ".artifacts/userland-fixtures/net_bench.elf"

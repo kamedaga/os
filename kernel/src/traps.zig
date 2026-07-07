@@ -537,6 +537,14 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     defer user_vm.unlockAddressSpaces();
     if (write_access) {
         if (h.state.ensureNativeVmaCowMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {
+            if (mapping.invalidate_size_bytes != 0) {
+                if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return 0;
+                if (!user_vm.invalidatePresentUserLinearRegionPtes(
+                    principal,
+                    mapping.invalidate_start_va,
+                    @intCast(mapping.invalidate_size_bytes),
+                )) return 0;
+            }
             var paddrs = [_]u64{mapping.paddr};
             if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) {
                 if (user_vm.remapTrustedUserPaddrsWithProt(

@@ -19,6 +19,8 @@ enum {
     TERMD_WIRE_OP_DUP = 10,
     TERMD_WIRE_OP_TAKE_SIGNAL = 11,
     TERMD_WIRE_OP_OPEN_HVC = 12,
+    TERMD_WIRE_OP_REGISTER_SIGNAL_SUPERVISOR = 13,
+    TERMD_WIRE_OP_ERROR_GET = 14,
 
     TERMD_WIRE_PAGE_BYTES = 8192,
     TERMD_WIRE_IO_BYTES = TERMD_WIRE_PAGE_BYTES - 256,
@@ -38,14 +40,20 @@ typedef struct termd_wire_open {
     uint64_t process_id;
     uint64_t pgrp_id;
     uint64_t pts_index;
-    uint64_t reserved[3];
+    uint64_t signal_mask;
+    uint64_t signal_ignored;
+    uint64_t reserved[1];
 } termd_wire_open_t;
 
 typedef struct termd_wire_io {
     uint64_t handle;
     uint64_t length;
     uint64_t flags;
-    uint64_t reserved[5];
+    uint64_t session_id;
+    uint64_t process_id;
+    uint64_t pgrp_id;
+    uint64_t signal_mask;
+    uint64_t signal_ignored;
     uint8_t data[TERMD_WIRE_IO_BYTES];
 } termd_wire_io_t;
 
@@ -56,7 +64,11 @@ typedef struct termd_wire_ioctl {
     uint64_t arg1;
     uint64_t result0;
     uint64_t result1;
-    uint64_t reserved[2];
+    uint64_t session_id;
+    uint64_t process_id;
+    uint64_t pgrp_id;
+    uint64_t signal_mask;
+    uint64_t signal_ignored;
     uint8_t data[256];
 } termd_wire_ioctl_t;
 
@@ -66,7 +78,11 @@ typedef struct termd_wire_poll {
     uint32_t revents;
     int32_t error;
     uint32_t reserved0;
-    uint64_t reserved[5];
+    uint64_t session_id;
+    uint64_t process_id;
+    uint64_t pgrp_id;
+    uint64_t signal_mask;
+    uint64_t signal_ignored;
 } termd_wire_poll_t;
 
 typedef struct termd_wire_signal {

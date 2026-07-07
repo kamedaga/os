@@ -30,7 +30,9 @@
 #define LPR_LINUX_SYS_SELECT 23ull
 #define LPR_LINUX_SYS_DUP 32ull
 #define LPR_LINUX_SYS_DUP2 33ull
+#define LPR_LINUX_SYS_NANOSLEEP 35ull
 #define LPR_LINUX_SYS_GETPID 39ull
+#define LPR_LINUX_SYS_KILL 62ull
 #define LPR_LINUX_SYS_SOCKET 41ull
 #define LPR_LINUX_SYS_CONNECT 42ull
 #define LPR_LINUX_SYS_ACCEPT 43ull
@@ -58,6 +60,8 @@
 #define LPR_LINUX_SYS_FSYNC 74ull
 #define LPR_LINUX_SYS_FDATASYNC 75ull
 #define LPR_LINUX_SYS_GETCWD 79ull
+#define LPR_LINUX_SYS_CHDIR 80ull
+#define LPR_LINUX_SYS_FCHDIR 81ull
 #define LPR_LINUX_SYS_RENAME 82ull
 #define LPR_LINUX_SYS_MKDIR 83ull
 #define LPR_LINUX_SYS_RMDIR 84ull
@@ -66,19 +70,33 @@
 #define LPR_LINUX_SYS_READLINK 89ull
 #define LPR_LINUX_SYS_CHMOD 90ull
 #define LPR_LINUX_SYS_FCHMOD 91ull
+#define LPR_LINUX_SYS_CHOWN 92ull
+#define LPR_LINUX_SYS_FCHOWN 93ull
+#define LPR_LINUX_SYS_LCHOWN 94ull
 #define LPR_LINUX_SYS_UMASK 95ull
+#define LPR_LINUX_SYS_GETRLIMIT 97ull
 #define LPR_LINUX_SYS_GETUID 102ull
 #define LPR_LINUX_SYS_GETGID 104ull
 #define LPR_LINUX_SYS_SETUID 105ull
 #define LPR_LINUX_SYS_SETGID 106ull
 #define LPR_LINUX_SYS_GETEUID 107ull
 #define LPR_LINUX_SYS_GETEGID 108ull
+#define LPR_LINUX_SYS_SETPGID 109ull
+#define LPR_LINUX_SYS_GETPPID 110ull
+#define LPR_LINUX_SYS_GETPGRP 111ull
+#define LPR_LINUX_SYS_SETSID 112ull
+#define LPR_LINUX_SYS_GETRESUID 118ull
+#define LPR_LINUX_SYS_GETRESGID 120ull
+#define LPR_LINUX_SYS_GETPGID 121ull
+#define LPR_LINUX_SYS_GETSID 124ull
 #define LPR_LINUX_SYS_SETPRIORITY 138ull
+#define LPR_LINUX_SYS_SETRLIMIT 160ull
 #define LPR_LINUX_SYS_ARCH_PRCTL 158ull
 #define LPR_LINUX_SYS_GETTID 186ull
 #define LPR_LINUX_SYS_GETDENTS64 217ull
 #define LPR_LINUX_SYS_SET_TID_ADDRESS 218ull
 #define LPR_LINUX_SYS_CLOCK_GETTIME 228ull
+#define LPR_LINUX_SYS_CLOCK_NANOSLEEP 230ull
 #define LPR_LINUX_SYS_EXIT_GROUP 231ull
 #define LPR_LINUX_SYS_OPENAT 257ull
 #define LPR_LINUX_SYS_MKDIRAT 258ull
@@ -99,12 +117,19 @@
 #define LPR_LINUX_SYS_EVENTFD2 290ull
 #define LPR_LINUX_SYS_DUP3 292ull
 #define LPR_LINUX_SYS_PIPE2 293ull
+#define LPR_LINUX_SYS_CLOSE_RANGE 436ull
 #define LPR_LINUX_SYS_RECVMMSG 299ull
+#define LPR_LINUX_SYS_PRLIMIT64 302ull
 #define LPR_LINUX_SYS_SENDMMSG 307ull
 #define LPR_LINUX_SYS_GETRANDOM 318ull
 
+#define LPR_LINUX_FD_MAX 0x7fffffffull
+#define LPR_LINUX_FD_LIMIT (LPR_LINUX_FD_MAX + 1ull)
+
 #define LPR_LINUX_EPERM 1
 #define LPR_LINUX_ENOENT 2
+#define LPR_LINUX_ESRCH 3
+#define LPR_LINUX_EINTR 4
 #define LPR_LINUX_EIO 5
 #define LPR_LINUX_E2BIG 7
 #define LPR_LINUX_EBADF 9
@@ -145,6 +170,47 @@
 #define LPR_LINUX_ARCH_SET_FS 0x1002ull
 #define LPR_LINUX_ARCH_GET_FS 0x1003ull
 #define LPR_LINUX_ARCH_GET_GS 0x1004ull
+
+#define LPR_BOOTSTRAP_FD 243
+#define LPR_SUPERVISOR_ENDPOINT_FD 244
+#define LPR_BOOTSTRAP_MAGIC 0x315450424c50524cull
+#define LPR_BOOTSTRAP_VERSION 5ull
+#define LPR_BOOTSTRAP_FLAG_DEFAULT_STDIO 1ull
+#define LPR_BOOTSTRAP_FLAG_SUPERVISOR 2ull
+#define LPR_BOOTSTRAP_FD_FILED 1u
+#define LPR_BOOTSTRAP_FD_TTY 2u
+#define LPR_BOOTSTRAP_FD_EVENT 3u
+#define LPR_BOOTSTRAP_CTTY_BYTES 64
+#define LPR_BOOTSTRAP_CWD_BYTES 480
+
+typedef struct lpr_bootstrap_fd {
+    uint64_t fd;
+    uint64_t kind;
+    uint64_t flags;
+    uint64_t handle;
+    uint64_t offset_or_counter;
+} lpr_bootstrap_fd_t;
+
+struct lpr_bootstrap {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t byte_size;
+    uint64_t local_fd_table_offset;
+    uint64_t local_fd_table_bytes;
+    uint64_t local_fd_count;
+    uint64_t linux_pid;
+    uint64_t linux_ppid;
+    uint64_t linux_sid;
+    uint64_t linux_pgrp;
+    uint64_t linux_next_pid;
+    uint64_t cwd_handle;
+    uint64_t supervisor_token;
+    uint64_t supervisor_endpoint_fd;
+    uint64_t fd_table_token;
+    uint64_t flags;
+    char ctty[LPR_BOOTSTRAP_CTTY_BYTES];
+    char cwd[LPR_BOOTSTRAP_CWD_BYTES];
+};
 
 int64_t lpr_start(struct lpr_runtime_page *runtime);
 int64_t lpr_patch_mapping(const struct lpr_patch_mapping_request *request,

@@ -154,7 +154,7 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
             lock_held = false;
         }
         base_hooks.exit_current_process(proc, 0, frame, null, null);
-        return sc.syscall_ok;
+        return frame.rax;
     }
 
     if (process_syscalls.dispatch(h, state, proc, frame)) |result| {

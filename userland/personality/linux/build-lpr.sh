@@ -27,6 +27,7 @@ clang \
   -I"$repo_root/userland/libpacha/include" \
   -I"$repo_root/userland/libipc/include" \
   -I"$repo_root/userland/filed/include" \
+  -I"$repo_root/userland/lpr_supervisor/include" \
   -I"$repo_root/userland/netd/include" \
   -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/personality/linux/hde" \

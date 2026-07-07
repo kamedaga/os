@@ -147,12 +147,34 @@ long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count) {
     return pacha_syscall2(PACHA_FD_SYSCALL_POLL, (uint64_t)(uintptr_t)fds, count);
 }
 
+static long pacha_fd_ready_count(const struct pacha_pollfd *fds, uint64_t count) {
+    long ready = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        if (fds[i].revents != 0) {
+            ready += 1;
+        }
+    }
+    return ready;
+}
+
 long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks) {
     for (;;) {
         const long ret = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY, (uint64_t)(uintptr_t)fds, count, timeout_ticks, 0);
-        if (ret != -2 && ret != 2) return ret;
-        if (timeout_ticks == 0) return ret;
-        if (timeout_ticks != UINT64_MAX) return ret;
+        if (ret > 0 && fds != NULL && (uint64_t)ret <= count) {
+            const long ready = pacha_fd_ready_count(fds, count);
+            if (ready != 0) {
+                return ready;
+            }
+        }
+        if (ret == PACHA_SYSCALL_ERR_NOT_READY || ret == PACHA_ERR_NOT_READY) {
+            if (timeout_ticks == 0) return PACHA_ERR_NOT_READY;
+            if (timeout_ticks != UINT64_MAX) return PACHA_ERR_NOT_READY;
+            continue;
+        }
+        if (ret > 0 && ret <= PACHA_SYSCALL_ERR_CLOSED) {
+            return -ret;
+        }
+        return ret;
     }
 }
 

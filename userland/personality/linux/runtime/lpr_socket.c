@@ -60,6 +60,24 @@
 #define LPR_TRACE_NETD_CALLS 0
 #endif
 
+#define LPR_USER_LOW_GUARD_END 4096ull
+#define LPR_USER_CANONICAL_END 0x0000800000000000ull
+
+static int lpr_user_range_plausible(uint64_t ptr, uint64_t bytes)
+{
+    if (bytes == 0) {
+        return 1;
+    }
+    if (ptr < LPR_USER_LOW_GUARD_END) {
+        return 0;
+    }
+    if (ptr > UINT64_MAX - (bytes - 1u)) {
+        return 0;
+    }
+    const uint64_t end = ptr + bytes - 1u;
+    return ptr < LPR_USER_CANONICAL_END && end < LPR_USER_CANONICAL_END;
+}
+
 typedef struct lpr_socket_fd {
     uint8_t active;
     uint8_t type;
@@ -511,6 +529,13 @@ static int64_t lpr_netd_call(uint64_t op, int page_fd, uint64_t word2, uint64_t 
 int lpr_linux_socket_fd_active(uint64_t fd)
 {
     return fd < LPR_SOCKET_FD_TABLE_SIZE && lpr_sockets[fd].active;
+}
+
+int lpr_linux_socket_fd_cloexec(uint64_t fd)
+{
+    return fd < LPR_SOCKET_FD_TABLE_SIZE &&
+        lpr_sockets[fd].active &&
+        lpr_sockets[fd].cloexec;
 }
 
 static int lpr_socket_alloc_fd(void)
@@ -1338,6 +1363,23 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             }
             continue;
         }
+        if (lpr_linux_pipe_fd_active(fd)) {
+            fds[i].revents = (int16_t)lpr_linux_pipe_poll_events(fd, (uint32_t)fds[i].events);
+            if (fds[i].revents != 0) {
+                ready++;
+            }
+            continue;
+        }
+        {
+            const uint32_t native_revents = lpr_linux_native_fd_poll_events(fd, (uint32_t)fds[i].events);
+            if (native_revents != LPR_LINUX_POLLNVAL) {
+                fds[i].revents = (int16_t)native_revents;
+                if (fds[i].revents != 0) {
+                    ready++;
+                }
+                continue;
+            }
+        }
         if (!lpr_linux_socket_fd_active(fd)) {
             fds[i].revents = LPR_LINUX_POLLNVAL;
             ready++;
@@ -1416,6 +1458,11 @@ int64_t lpr_linux_poll(uint64_t fds_raw, uint64_t nfds, uint64_t timeout_ms)
     if (fds_raw == 0 && nfds != 0) {
         return -LPR_LINUX_EFAULT;
     }
+    if (nfds > UINT64_MAX / sizeof(lpr_linux_pollfd_t) ||
+        !lpr_user_range_plausible(fds_raw, nfds * sizeof(lpr_linux_pollfd_t)))
+    {
+        return -LPR_LINUX_EFAULT;
+    }
     return lpr_linux_poll_wait(
         (lpr_linux_pollfd_t *)(uintptr_t)fds_raw,
         nfds,
@@ -1429,8 +1476,16 @@ int64_t lpr_linux_ppoll(uint64_t fds, uint64_t nfds, uint64_t timeout_ts, uint64
     if (fds == 0 && nfds != 0) {
         return -LPR_LINUX_EFAULT;
     }
+    if (nfds > UINT64_MAX / sizeof(lpr_linux_pollfd_t) ||
+        !lpr_user_range_plausible(fds, nfds * sizeof(lpr_linux_pollfd_t)))
+    {
+        return -LPR_LINUX_EFAULT;
+    }
     int64_t timeout_ms = -1;
     if (timeout_ts != 0) {
+        if (!lpr_user_range_plausible(timeout_ts, sizeof(lpr_linux_timespec_t))) {
+            return -LPR_LINUX_EFAULT;
+        }
         const lpr_linux_timespec_t *ts = (const lpr_linux_timespec_t *)(uintptr_t)timeout_ts;
         if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000ll) {
             return -LPR_LINUX_EINVAL;
@@ -1510,11 +1565,43 @@ static int64_t lpr_linux_select_scan(
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
             is_write = (revents & LPR_LINUX_POLLOUT) != 0;
             is_except = (revents & LPR_LINUX_POLLERR) != 0;
-        } else if (lpr_linux_filed_fd_active(fd)) {
-            is_read = want_read;
-            is_write = want_write;
+        } else if (lpr_linux_pipe_fd_active(fd)) {
+            uint32_t events = 0;
+            if (want_read) {
+                events |= LPR_LINUX_POLLIN;
+            }
+            if (want_write) {
+                events |= LPR_LINUX_POLLOUT;
+            }
+            if (want_except) {
+                events |= LPR_LINUX_POLLERR;
+            }
+            const uint32_t revents = lpr_linux_pipe_poll_events(fd, events);
+            is_read = (revents & (LPR_LINUX_POLLIN | 0x0010u)) != 0;
+            is_write = (revents & LPR_LINUX_POLLOUT) != 0;
+            is_except = (revents & LPR_LINUX_POLLERR) != 0;
         } else {
-            return -LPR_LINUX_EBADF;
+            uint32_t events = 0;
+            if (want_read) {
+                events |= LPR_LINUX_POLLIN;
+            }
+            if (want_write) {
+                events |= LPR_LINUX_POLLOUT;
+            }
+            if (want_except) {
+                events |= LPR_LINUX_POLLERR;
+            }
+            const uint32_t revents = lpr_linux_native_fd_poll_events(fd, events);
+            if (revents != LPR_LINUX_POLLNVAL) {
+                is_read = (revents & (LPR_LINUX_POLLIN | 0x0010u)) != 0;
+                is_write = (revents & LPR_LINUX_POLLOUT) != 0;
+                is_except = (revents & LPR_LINUX_POLLERR) != 0;
+            } else if (lpr_linux_filed_fd_active(fd)) {
+                is_read = want_read;
+                is_write = want_write;
+            } else {
+                return -LPR_LINUX_EBADF;
+            }
         }
 
         if (want_read && is_read) {
@@ -1548,6 +1635,13 @@ static int64_t lpr_linux_select_wait(
         return -LPR_LINUX_EINVAL;
     }
     const uint64_t words = lpr_fdset_word_count(nfds);
+    const uint64_t fdset_bytes = words * sizeof(uint64_t);
+    if (!lpr_user_range_plausible(readfds, readfds != 0 ? fdset_bytes : 0) ||
+        !lpr_user_range_plausible(writefds, writefds != 0 ? fdset_bytes : 0) ||
+        !lpr_user_range_plausible(exceptfds, exceptfds != 0 ? fdset_bytes : 0))
+    {
+        return -LPR_LINUX_EFAULT;
+    }
     uint64_t read_orig[LPR_SELECT_MAX_WORDS];
     uint64_t write_orig[LPR_SELECT_MAX_WORDS];
     uint64_t except_orig[LPR_SELECT_MAX_WORDS];
@@ -1618,6 +1712,9 @@ int64_t lpr_linux_select(uint64_t nfds, uint64_t readfds, uint64_t writefds, uin
 {
     int64_t timeout_ms = -1;
     if (timeout != 0) {
+        if (!lpr_user_range_plausible(timeout, sizeof(lpr_linux_timeval_t))) {
+            return -LPR_LINUX_EFAULT;
+        }
         const int64_t status = lpr_socket_timeval_to_ms((const lpr_linux_timeval_t *)(uintptr_t)timeout, &timeout_ms);
         if (status != 0) {
             return status;
@@ -1631,6 +1728,9 @@ int64_t lpr_linux_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds, u
     (void)sigmask;
     int64_t timeout_ms = -1;
     if (timeout != 0) {
+        if (!lpr_user_range_plausible(timeout, sizeof(lpr_linux_timespec_t))) {
+            return -LPR_LINUX_EFAULT;
+        }
         const int64_t status = lpr_socket_timespec_to_ms((const lpr_linux_timespec_t *)(uintptr_t)timeout, &timeout_ms);
         if (status != 0) {
             return status;

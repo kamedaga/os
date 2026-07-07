@@ -32,6 +32,7 @@ struct termd_linux_tty_island {
     int ptmx_registered;
     int32_t load_status;
     int32_t init_status;
+    uint64_t signal_generation;
     const char *loader_version;
     kb_device_backend_t *backend;
     kb_platform_t *platform;
@@ -55,6 +56,10 @@ int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
     const termd_wire_open_t *request,
     uint64_t *out_handle);
+int termd_linux_tty_island_open_ctty(
+    struct termd_linux_tty_island *island,
+    const termd_wire_open_t *request,
+    uint64_t *out_handle);
 int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t handle);
 int termd_linux_tty_island_dup(
     struct termd_linux_tty_island *island,
@@ -66,10 +71,15 @@ int termd_linux_tty_island_ioctl(
 int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
     termd_wire_poll_t *request);
+void termd_linux_tty_island_pump(struct termd_linux_tty_island *island);
 int termd_linux_tty_island_io(
     struct termd_linux_tty_island *island,
     int write,
     termd_wire_io_t *request,
+    uint64_t *out_result);
+int termd_linux_tty_island_take_signal(
+    struct termd_linux_tty_island *island,
+    termd_wire_signal_t *request,
     uint64_t *out_result);
 
 #endif

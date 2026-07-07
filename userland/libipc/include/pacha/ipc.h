@@ -11,7 +11,7 @@ extern "C" {
 #endif
 
 enum {
-    PACHA_IPC_MAX_TRANSFER_FDS = 8,
+    PACHA_IPC_MAX_TRANSFER_FDS = 19,
     PACHA_IPC_FAST_RING_ENTRIES = 64,
 
     PACHA_IPC_TRANSFER_MOVE = 1u << 0,

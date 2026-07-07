@@ -427,7 +427,7 @@ static int filed_exec_open_absolute_path(
 
 static int filed_exec_set_inherit(int fd, int enabled)
 {
-    if (fd < 16) {
+    if (fd < 0) {
         return -22;
     }
     const long status = pacha_fd_fcntl(
@@ -472,7 +472,7 @@ static int filed_exec_prepare_inherit_fds(
     if ((request->flags & FILED_WIRE_EXEC_INHERIT_FDS) != 0) {
         for (uint64_t i = 0; i < inherit_fd_count; ++i) {
             const int fd = inherit_fds[i];
-            if (fd < 16) {
+            if (fd < 0) {
                 return -22;
             }
             if (filed_exec_set_inherit(fd, 1) != 0) {
@@ -504,7 +504,7 @@ static void filed_exec_clear_prepared_inherit_fds(const int *prepared, uint64_t 
         return;
     }
     for (uint64_t i = 0; i < count; ++i) {
-        if (prepared[i] >= 16) {
+        if (prepared[i] >= 0) {
             (void)filed_exec_set_inherit(prepared[i], 0);
         }
     }

@@ -126,6 +126,13 @@ pub const ThreadContext = struct {
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
 };
 
+pub const SuspendedThreadImage = struct {
+    frame: TrapFrame,
+    fs_base: u64,
+    gs_base: u64,
+    pkru: u32,
+};
+
 const ThreadHotState = extern struct {
     allocated: u8 = 0,
     ready: u8 = 0,
@@ -1738,6 +1745,41 @@ pub fn threadReady(thread_index: usize) bool {
     return hot.allocated != 0 and hot.ready != 0;
 }
 
+pub fn debugDumpRunnableState(reason: []const u8) void {
+    kernel_log.writeFmt(
+        "[sched-debug] reason={s} cpu={} policy={} verified={}\n",
+        .{
+            reason,
+            currentCpu(),
+            if (policyActive()) @as(u8, 1) else @as(u8, 0),
+            if (verifiedCoreReady()) @as(u8, 1) else @as(u8, 0),
+        },
+    );
+    var i: usize = 0;
+    while (i < thread_contexts.len) : (i += 1) {
+        const ctx = threadContext(i) orelse continue;
+        if (!ctx.allocated) continue;
+        const hot = getThreadHotStateConst(i) orelse continue;
+        kernel_log.writeFmt(
+            "[sched-debug] thread={} gen={} owner={} cpu={} ready={} wait={} stopped={} wake={} hot_ready={} hot_wait={} hot_stopped={} hot_wake={}\n",
+            .{
+                i,
+                ctx.generation,
+                @intFromEnum(ctx.owner_process),
+                ctx.cpu_slot,
+                if (ctx.ready) @as(u8, 1) else @as(u8, 0),
+                if (ctx.wait_mailbox) @as(u8, 1) else @as(u8, 0),
+                if (ctx.stopped) @as(u8, 1) else @as(u8, 0),
+                ctx.wake_tick,
+                hot.ready,
+                hot.wait_mailbox,
+                hot.stopped,
+                hot.wake_tick,
+            },
+        );
+    }
+}
+
 fn initializeThreadContextWithReadyState(
     thread_index: usize,
     owner_process: kernel.PrincipalId,
@@ -1824,7 +1866,11 @@ fn allocateThreadWithReadyState(owner_process: kernel.PrincipalId, user_spaces: 
             const ctx = threadContext(i) orelse continue;
             if (ctx.allocated) continue;
             if (!initializeThreadContextWithReadyState(i, owner_process, user_spaces, initial_frame, initial_ready)) return null;
-            if (!policyActive()) verifiedAddThread(i, thread_contexts[i].generation, initial_ready);
+            if (!policyActive()) {
+                verifiedAddThread(i, thread_contexts[i].generation, initial_ready);
+            } else if (initial_ready) {
+                publishThreadReady(i);
+            }
             return i;
         }
         if (!ensureThreadCapacity(thread_contexts.len + 1, free_list)) return null;
@@ -1939,6 +1985,77 @@ pub fn currentFsBase() u64 {
 
 pub fn currentGsBase() u64 {
     return x86_platform.readGsBase();
+}
+
+pub fn suspendedThreadImage(
+    thread_index: usize,
+    expected_generation: u32,
+    owner_process: kernel.PrincipalId,
+) ?SuspendedThreadImage {
+    thread_table_lock.lock();
+    defer thread_table_lock.unlock();
+    const ctx = threadContext(thread_index) orelse return null;
+    if (!ctx.allocated or
+        ctx.generation != expected_generation or
+        ctx.owner_process != owner_process or
+        ctx.ready or
+        ctx.wait_mailbox or
+        ctx.wake_tick != 0)
+    {
+        return null;
+    }
+    return .{
+        .frame = ctx.frame,
+        .fs_base = ctx.fs_base,
+        .gs_base = ctx.gs_base,
+        .pkru = ctx.pkru,
+    };
+}
+
+pub fn installExecContextForCurrentThread(
+    user_spaces: []UserAddressSpace,
+    owner_process: kernel.PrincipalId,
+    image: SuspendedThreadImage,
+) bool {
+    const space = getUserSpace(user_spaces, owner_process) orelse return false;
+    const cr3 = x86_platform.cr3WithUserPcid(space.cr3, pcidForPrincipal(owner_process));
+    const current_thread = currentThread();
+
+    thread_table_lock.lock();
+    {
+        const ctx = threadContextMutable(current_thread) orelse {
+            thread_table_lock.unlock();
+            return false;
+        };
+        if (!ctx.allocated or ctx.owner_process != owner_process) {
+            thread_table_lock.unlock();
+            return false;
+        }
+        ctx.cr3 = cr3;
+        ctx.fs_base = image.fs_base;
+        ctx.gs_base = image.gs_base;
+        ctx.pkru = image.pkru;
+        ctx.frame = image.frame;
+        ctx.ready = true;
+        ctx.wait_mailbox = false;
+        ctx.wake_tick = 0;
+        ctx.stopped = false;
+        syncHotStateFromContext(current_thread);
+    }
+    thread_table_lock.unlock();
+
+    if (schedulerStateForSlot(currentCpu())) |state| {
+        state.lock.lock();
+        state.current_thread = current_thread;
+        state.current_principal = owner_process;
+        state.current_cr3 = cr3;
+        state.is_idle = false;
+        state.lock.unlock();
+    }
+    x86_platform.writeFsBase(image.fs_base);
+    x86_platform.writeGsBase(image.gs_base);
+    x86_platform.writePkru(image.pkru);
+    return true;
 }
 
 fn saveCurrentThreadContextFromFrame(frame: *const TrapFrame) void {
@@ -2182,7 +2299,7 @@ pub fn wakeMailboxWaiter(principal: kernel.PrincipalId) void {
 }
 
 pub fn wakeBlockedThread(principal: kernel.PrincipalId) void {
-    _ = deliverSignal(principal, 1);
+    wakeMailboxWaiter(principal);
 }
 
 pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) bool {

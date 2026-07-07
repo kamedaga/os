@@ -96,8 +96,51 @@ fn wakeOwners(h: anytype, owners: []const kernel.PrincipalId) void {
     }
 }
 
+fn statusFromPipeError(err: kernel.PipeIoError) u64 {
+    const status = switch (err) {
+        kernel.PipeIoError.InvalidState => sc.syscall_err_invalid,
+        kernel.PipeIoError.NotReady => sc.syscall_err_not_ready,
+        kernel.PipeIoError.Closed => sc.syscall_err_closed,
+    };
+    return 0 -% status;
+}
+
+fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) bool {
+    for (targets) |target| {
+        if (target.pollfd_va != 0) {
+            if (!h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents)) return false;
+        }
+        _ = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
+    }
+    return true;
+}
+
+fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool, ready_events: u64) bool {
+    var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
+    const wake_count = state.takePipeWaiters(pipe_ref, write_side, ready_events, wake_storage[0..]);
+    return wakeThreadTargets(h, wake_storage[0..wake_count]);
+}
+
 fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64, len: u64) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
+    if (state.pipeEndpointForFd(proc, fd)) |endpoint| {
+        if (endpoint.write) return sc.syscall_err_invalid;
+        if (len == 0) return 0;
+        var total: u64 = 0;
+        var buf: [256]u8 = undefined;
+        while (total < len) {
+            const chunk_len: usize = @intCast(@min(len - total, buf.len));
+            const got = state.pipeReadBytes(proc, fd, buf[0..chunk_len]) catch |err| {
+                return if (total != 0) total else statusFromPipeError(err);
+            };
+            if (got == 0) return total;
+            if (!h.copy_bytes_to_user_va(proc, out_va + total, buf[0..got])) return sc.syscall_err_invalid;
+            total += got;
+            if (!wakePipeWaiters(h, state, endpoint.pipe, true, fd_abi.event_writable)) return sc.syscall_err_invalid;
+            if (got < chunk_len) return total;
+        }
+        return total;
+    }
     if (state.fdPayloadWithRightsConst(proc, fd, .{ .read = true })) |view| {
         switch (view.payload.*) {
             .sched_event => {
@@ -140,6 +183,32 @@ fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: 
 }
 
 fn fdWrite(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, in_va: u64, len: u64) u64 {
+    if (state.pipeEndpointForFd(proc, fd)) |endpoint| {
+        if (!endpoint.write) return sc.syscall_err_invalid;
+        if (in_va == 0 and len != 0) return sc.syscall_err_invalid;
+        if (len == 0) return 0;
+        var total: u64 = 0;
+        var buf: [kernel.pipe_buffer_bytes]u8 = undefined;
+        if (len <= kernel.pipe_buffer_bytes) {
+            const chunk_len: usize = @intCast(len);
+            if (!h.copy_user_bytes_from_va(proc, in_va, buf[0..chunk_len])) return sc.syscall_err_invalid;
+            const written = state.pipeWriteBytes(proc, fd, buf[0..chunk_len], true) catch |err| return statusFromPipeError(err);
+            if (!wakePipeWaiters(h, state, endpoint.pipe, false, fd_abi.event_readable)) return sc.syscall_err_invalid;
+            return written;
+        }
+        while (total < len) {
+            const chunk_len: usize = @intCast(@min(len - total, buf.len));
+            if (!h.copy_user_bytes_from_va(proc, in_va + total, buf[0..chunk_len])) return if (total != 0) total else sc.syscall_err_invalid;
+            const written = state.pipeWriteBytes(proc, fd, buf[0..chunk_len], false) catch |err| {
+                return if (total != 0) total else statusFromPipeError(err);
+            };
+            if (written == 0) return total;
+            total += written;
+            if (!wakePipeWaiters(h, state, endpoint.pipe, false, fd_abi.event_readable)) return sc.syscall_err_invalid;
+            if (written < chunk_len) return total;
+        }
+        return total;
+    }
     if (state.fdPayloadWithRightsConst(proc, fd, .{ .write = true })) |view| {
         switch (view.payload.*) {
             .serial => return fdWriteSerial(h, proc, in_va, len) orelse sc.syscall_err_invalid,
@@ -171,12 +240,39 @@ fn fdWriteSerial(h: anytype, proc: kernel.PrincipalId, in_va: u64, len: u64) ?u6
 
 fn fdReadv(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, iov_va: u64, iov_count: u64) u64 {
     if (iov_va == 0 or iov_count == 0 or iov_count > fd_abi.max_iovecs) return sc.syscall_err_invalid;
+    if (state.pipeEndpointForFd(proc, fd)) |endpoint| {
+        if (endpoint.write) return sc.syscall_err_invalid;
+        var total: u64 = 0;
+        var buf: [256]u8 = undefined;
+        var i: u64 = 0;
+        while (i < iov_count) : (i += 1) {
+            const item_va = iov_va + i * fd_abi.iovec_size;
+            const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+            const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+            if (len == 0) continue;
+            if (base == 0) return if (total != 0) total else sc.syscall_err_invalid;
+            var offset: u64 = 0;
+            while (offset < len) {
+                const chunk_len: usize = @intCast(@min(len - offset, buf.len));
+                const got = state.pipeReadBytes(proc, fd, buf[0..chunk_len]) catch |err| {
+                    return if (total != 0) total else statusFromPipeError(err);
+                };
+                if (got == 0) return total;
+                if (!h.copy_bytes_to_user_va(proc, base + offset, buf[0..got])) return sc.syscall_err_invalid;
+                offset += got;
+                total += got;
+                if (!wakePipeWaiters(h, state, endpoint.pipe, true, fd_abi.event_writable)) return sc.syscall_err_invalid;
+                if (got < chunk_len) return total;
+            }
+        }
+        return if (total != 0) total else sc.syscall_err_not_ready;
+    }
     var i: u64 = 0;
     while (i < iov_count) : (i += 1) {
         const item_va = iov_va + i * fd_abi.iovec_size;
         const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
         const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
-        if (len < fd_abi.timerfd_read_size) continue;
+        if (len == 0) continue;
         return fdRead(h, state, proc, fd, base, len);
     }
     return sc.syscall_err_invalid;
@@ -184,6 +280,60 @@ fn fdReadv(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
 
 fn fdWritev(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, iov_va: u64, iov_count: u64) u64 {
     if (iov_va == 0 or iov_count == 0 or iov_count > fd_abi.max_iovecs) return sc.syscall_err_invalid;
+    if (state.pipeEndpointForFd(proc, fd)) |endpoint| {
+        if (!endpoint.write) return sc.syscall_err_invalid;
+        var requested: u64 = 0;
+        var i: u64 = 0;
+        while (i < iov_count) : (i += 1) {
+            const item_va = iov_va + i * fd_abi.iovec_size;
+            _ = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+            const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+            const next, const overflow = @addWithOverflow(requested, len);
+            if (overflow != 0) return sc.syscall_err_invalid;
+            requested = next;
+        }
+        if (requested == 0) return 0;
+        var buf: [kernel.pipe_buffer_bytes]u8 = undefined;
+        if (requested <= kernel.pipe_buffer_bytes) {
+            var copied: usize = 0;
+            i = 0;
+            while (i < iov_count) : (i += 1) {
+                const item_va = iov_va + i * fd_abi.iovec_size;
+                const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return sc.syscall_err_invalid;
+                const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return sc.syscall_err_invalid;
+                if (len == 0) continue;
+                const len_usize: usize = @intCast(len);
+                if (base == 0 or !h.copy_user_bytes_from_va(proc, base, buf[copied .. copied + len_usize])) return sc.syscall_err_invalid;
+                copied += len_usize;
+            }
+            const written = state.pipeWriteBytes(proc, fd, buf[0..copied], true) catch |err| return statusFromPipeError(err);
+            if (!wakePipeWaiters(h, state, endpoint.pipe, false, fd_abi.event_readable)) return sc.syscall_err_invalid;
+            return written;
+        }
+        var total: u64 = 0;
+        i = 0;
+        while (i < iov_count) : (i += 1) {
+            const item_va = iov_va + i * fd_abi.iovec_size;
+            const base = h.read_user_u64(proc, item_va + fd_abi.iovec_base_offset) orelse return if (total != 0) total else sc.syscall_err_invalid;
+            const len = h.read_user_u64(proc, item_va + fd_abi.iovec_len_offset) orelse return if (total != 0) total else sc.syscall_err_invalid;
+            if (len == 0) continue;
+            if (base == 0) return if (total != 0) total else sc.syscall_err_invalid;
+            var offset: u64 = 0;
+            while (offset < len) {
+                const chunk_len: usize = @intCast(@min(len - offset, buf.len));
+                if (!h.copy_user_bytes_from_va(proc, base + offset, buf[0..chunk_len])) return if (total != 0) total else sc.syscall_err_invalid;
+                const written = state.pipeWriteBytes(proc, fd, buf[0..chunk_len], false) catch |err| {
+                    return if (total != 0) total else statusFromPipeError(err);
+                };
+                if (written == 0) return total;
+                offset += written;
+                total += written;
+                if (!wakePipeWaiters(h, state, endpoint.pipe, false, fd_abi.event_readable)) return sc.syscall_err_invalid;
+                if (written < chunk_len) return total;
+            }
+        }
+        return total;
+    }
     if (state.fdPayloadWithRightsConst(proc, fd, .{ .write = true })) |view| {
         switch (view.payload.*) {
             .serial => {
@@ -275,6 +425,9 @@ fn registerCachedWaitersForPoll(
         if (try state.registerTaskReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation)) {
             continue;
         }
+        if (try state.registerPipeWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation)) {
+            continue;
+        }
         try state.registerIpcReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation);
     }
 }
@@ -287,6 +440,7 @@ fn unregisterCachedWaitersForPoll(
     thread_generation: u32,
 ) void {
     for (items) |item| {
+        state.unregisterPipeWaiterForFd(proc, item.fd, item.events, thread_index, thread_generation);
         state.unregisterIpcReadableWaiterForFd(proc, item.fd, item.events, thread_index, thread_generation);
     }
     state.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
@@ -449,6 +603,22 @@ fn eventfdCreate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *T
         rights,
         first_dynamic_fd,
     ) catch |err| statusFromKernelError(err);
+}
+
+fn pipeCreate(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    const out_pair_va = frame.rdi;
+    const flags_bits = frame.rsi;
+    if (out_pair_va == 0 or (flags_bits & ~@as(u64, fd_abi.known_flags_mask)) != 0) return sc.syscall_err_invalid;
+    const flags = kernel.fdFlagsFromBits(@truncate(flags_bits));
+    const pair = state.createPipePairFds(proc, flags, first_dynamic_fd) catch |err| return statusFromKernelError(err);
+    if (!h.write_user_u64(proc, out_pair_va + fd_abi.pipe_pair_read_fd_offset, pair.read) or
+        !h.write_user_u64(proc, out_pair_va + fd_abi.pipe_pair_write_fd_offset, pair.write))
+    {
+        state.closeFdWithFreeList(proc, pair.read, h.free_list) catch {};
+        state.closeFdWithFreeList(proc, pair.write, h.free_list) catch {};
+        return sc.syscall_err_invalid;
+    }
+    return sc.syscall_ok;
 }
 
 fn defaultVmoRights(rights: kernel.FdRights) kernel.FdRights {
@@ -653,7 +823,7 @@ fn statModeForFd(info: kernel.FdInfo) u64 {
     const kind_bits: u64 = switch (info.kind) {
         .serial => fd_abi.stat_mode_ifchr,
         .vmo => fd_abi.stat_mode_ifreg,
-        .event, .timer, .endpoint, .channel, .reply => fd_abi.stat_mode_ififo,
+        .event, .timer, .endpoint, .channel, .reply, .pipe => fd_abi.stat_mode_ififo,
         else => fd_abi.stat_mode_ifreg,
     };
     var mode = kind_bits;
@@ -775,7 +945,14 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
         sc.syscall_fd_close => blk: {
+            const pipe_endpoint = state.pipeEndpointForFd(proc, @intCast(frame.rdi));
             state.closeFdWithFreeList(proc, @intCast(frame.rdi), h.free_list) catch break :blk sc.syscall_err_invalid;
+            if (pipe_endpoint) |endpoint| {
+                const wake_side_write = !endpoint.write;
+                if (state.pipeReadyEventsForSide(endpoint.pipe, wake_side_write)) |ready_events| {
+                    if (ready_events != 0 and !wakePipeWaiters(h, state, endpoint.pipe, wake_side_write, ready_events)) break :blk sc.syscall_err_invalid;
+                }
+            }
             break :blk sc.syscall_ok;
         },
         sc.syscall_fd_dup => state.dupFd(
@@ -800,6 +977,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_fd_ioctl => fdIoctl(h, state, proc, @intCast(frame.rdi), frame.rsi, frame.rdx, frame),
         sc.syscall_fd_stat => writeFdStat(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_eventfd_create => eventfdCreate(state, proc, frame),
+        sc.syscall_pipe_create => pipeCreate(h, state, proc, frame),
         sc.syscall_timerfd_create => timerfdCreate(state, proc, frame),
         sc.syscall_timerfd_settime => timerfdSettime(h, state, proc, frame),
         sc.syscall_timerfd_gettime => timerfdGettime(h, state, proc, @intCast(frame.rdi), frame.rsi),

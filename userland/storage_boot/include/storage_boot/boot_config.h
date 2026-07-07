@@ -18,9 +18,10 @@ struct storage_boot_config {
     uint64_t magic;
     uint64_t device_fd;
     uint64_t ready_channel_fd;
+    uint64_t service_ready_channel_fd;
     uint64_t module_count;
     struct storage_boot_module_config modules[STORAGE_BOOT_MAX_MODULES];
-    uint64_t reserved[7];
+    uint64_t reserved[6];
 };
 
 #endif

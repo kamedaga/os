@@ -66,8 +66,26 @@ enum {
     TERMD_LINUX_TTY_FLAGS_OFFSET = 0x1a0,
     TERMD_LINUX_TTY_COUNT_OFFSET = 0x1a8,
     TERMD_LINUX_TTY_CTRL_PGRP_OFFSET = 0x1c0,
+    TERMD_LINUX_TTY_CTRL_SESSION_OFFSET = 0x1c8,
     TERMD_LINUX_TTY_LINK_OFFSET = 0x1e0,
     TERMD_LINUX_TTY_DRIVER_SUBTYPE_OFFSET = 0x3a,
+    TERMD_LINUX_TASK_SIGNAL_OFFSET = 0x848,
+    TERMD_LINUX_TASK_SIGHAND_OFFSET = 0x850,
+    TERMD_LINUX_TASK_BLOCKED_OFFSET = 0x858,
+    TERMD_LINUX_TASK_REAL_BLOCKED_OFFSET = 0x860,
+    TERMD_LINUX_SIGNAL_PIDS_OFFSET = 0x168,
+    TERMD_LINUX_SIGNAL_TTY_OLD_PGRP_OFFSET = 0x190,
+    TERMD_LINUX_SIGNAL_LEADER_OFFSET = 0x198,
+    TERMD_LINUX_SIGNAL_TTY_OFFSET = 0x1a0,
+    TERMD_LINUX_SIGHAND_ACTION_OFFSET = 0x20,
+    TERMD_LINUX_K_SIGACTION_BYTES = 0x20,
+    TERMD_LINUX_SIGACTION_HANDLER_OFFSET = 0x0,
+    TERMD_LINUX_SIGNAL_MAX = 64,
+    TERMD_LINUX_SIG_IGN = 1,
+    TERMD_LINUX_PIDTYPE_PID = 0,
+    TERMD_LINUX_PIDTYPE_TGID = 1,
+    TERMD_LINUX_PIDTYPE_PGID = 2,
+    TERMD_LINUX_PIDTYPE_SID = 3,
     TERMD_LINUX_FMODE_READ = 0x1,
     TERMD_LINUX_FMODE_WRITE = 0x2,
     TERMD_LINUX_TCGETS = 0x5401,
@@ -76,6 +94,7 @@ enum {
     TERMD_LINUX_TIOCGPGRP = 0x540f,
     TERMD_LINUX_TIOCSPGRP = 0x5410,
     TERMD_LINUX_FIONREAD = 0x541b,
+    TERMD_LINUX_ESRCH = 3,
     TERMD_LINUX_EPOLLIN = 0x0001,
     TERMD_LINUX_EPOLLPRI = 0x0002,
     TERMD_LINUX_EPOLLOUT = 0x0004,
@@ -112,7 +131,10 @@ typedef struct termd_linux_tty_handle {
     uint64_t handle;
     uint64_t dev;
     uint32_t pts_index;
-    uint32_t reserved1;
+    uint32_t session_id;
+    uint32_t process_id;
+    uint32_t pgrp_id;
+    uint32_t reserved_owner;
     void *cdev;
     void *fops;
     void *open;
@@ -204,7 +226,21 @@ static void *handle_file_tty(const termd_linux_tty_handle_t *handle)
 
 static void drain_linux_tty_work(void)
 {
+    for (unsigned i = 0; i < 4; i++) {
+        kb_run_deferred_work();
+        if (kb_handle_any_irq(0) != 0) {
+            break;
+        }
+    }
     kb_run_deferred_work();
+}
+
+void termd_linux_tty_island_pump(struct termd_linux_tty_island *island)
+{
+    if (island == NULL || !island->ready) {
+        return;
+    }
+    drain_linux_tty_work();
 }
 
 static int enter_owner_context(kb_module_t *owner, termd_linux_owner_context_t *context)
@@ -253,25 +289,245 @@ static void leave_owner_context(const termd_linux_owner_context_t *context)
     kb_loader_set_active_module(context->previous_owner);
 }
 
-static void install_default_foreground_pgrp(termd_linux_tty_handle_t *handle)
+typedef struct termd_linux_tty_owner_ids {
+    uint32_t session_id;
+    uint32_t process_id;
+    uint32_t pgrp_id;
+} termd_linux_tty_owner_ids_t;
+
+static uint32_t termd_linux_tty_wire_id(uint64_t value)
+{
+    return value != 0 && value <= UINT32_MAX ? (uint32_t)value : 0;
+}
+
+static termd_linux_tty_owner_ids_t termd_linux_tty_handle_ids(
+    const termd_linux_tty_handle_t *handle)
+{
+    termd_linux_tty_owner_ids_t ids = {0, 0, 0};
+    if (handle != NULL) {
+        ids.session_id = handle->session_id;
+        ids.process_id = handle->process_id;
+        ids.pgrp_id = handle->pgrp_id;
+    }
+    return ids;
+}
+
+static termd_linux_tty_owner_ids_t termd_linux_tty_merge_ids(
+    const termd_linux_tty_handle_t *handle,
+    uint64_t session_id,
+    uint64_t process_id,
+    uint64_t pgrp_id)
+{
+    termd_linux_tty_owner_ids_t ids = termd_linux_tty_handle_ids(handle);
+    const uint32_t wire_session = termd_linux_tty_wire_id(session_id);
+    const uint32_t wire_process = termd_linux_tty_wire_id(process_id);
+    const uint32_t wire_pgrp = termd_linux_tty_wire_id(pgrp_id);
+    if (wire_session != 0) {
+        ids.session_id = wire_session;
+    }
+    if (wire_process != 0) {
+        ids.process_id = wire_process;
+    }
+    if (wire_pgrp != 0) {
+        ids.pgrp_id = wire_pgrp;
+    }
+    if (ids.process_id == 0) {
+        ids.process_id = ids.pgrp_id != 0 ? ids.pgrp_id : ids.session_id;
+    }
+    if (ids.pgrp_id == 0) {
+        ids.pgrp_id = ids.process_id != 0 ? ids.process_id : ids.session_id;
+    }
+    if (ids.session_id == 0) {
+        ids.session_id = ids.process_id != 0 ? ids.process_id : ids.pgrp_id;
+    }
+    return ids;
+}
+
+static void termd_linux_tty_record_owner(
+    termd_linux_tty_handle_t *handle,
+    const termd_wire_open_t *request)
+{
+    if (handle == NULL || request == NULL) {
+        return;
+    }
+    const termd_linux_tty_owner_ids_t ids = termd_linux_tty_merge_ids(
+        NULL,
+        request->session_id,
+        request->process_id,
+        request->pgrp_id);
+    handle->session_id = ids.session_id;
+    handle->process_id = ids.process_id;
+    handle->pgrp_id = ids.pgrp_id;
+}
+
+static void *termd_linux_tty_real_tty(const termd_linux_tty_handle_t *handle)
 {
     void *tty = handle_file_tty(handle);
-    if (tty == NULL || read_ptr_field(tty, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET) != NULL) {
+    if (tty == NULL) {
+        return NULL;
+    }
+    if (handle != NULL && handle->master) {
+        void *link = read_ptr_field(tty, TERMD_LINUX_TTY_LINK_OFFSET);
+        if (link != NULL) {
+            return link;
+        }
+    }
+    return tty;
+}
+
+static void termd_linux_signal_write_pid(void *signal, uint32_t pid_type, void *pid)
+{
+    if (signal != NULL && pid_type < TERMD_LINUX_PIDTYPE_SID + 1u && pid != NULL) {
+        write_ptr_field(
+            signal,
+            TERMD_LINUX_SIGNAL_PIDS_OFFSET + ((size_t)pid_type * sizeof(void *)),
+            pid);
+    }
+}
+
+static uint64_t termd_linux_signal_bit(uint32_t sig)
+{
+    if (sig == 0 || sig > TERMD_LINUX_SIGNAL_MAX) {
+        return 0;
+    }
+    return 1ull << (sig - 1u);
+}
+
+static void termd_linux_tty_write_task_signal_state(
+    void *task,
+    uint64_t signal_mask,
+    uint64_t signal_ignored)
+{
+    if (task == NULL) {
         return;
     }
+    write_u64_field(task, TERMD_LINUX_TASK_BLOCKED_OFFSET, signal_mask);
+    write_u64_field(task, TERMD_LINUX_TASK_REAL_BLOCKED_OFFSET, signal_mask);
+
+    void *sighand = read_ptr_field(task, TERMD_LINUX_TASK_SIGHAND_OFFSET);
+    if (sighand == NULL) {
+        return;
+    }
+    for (uint32_t sig = 1; sig <= TERMD_LINUX_SIGNAL_MAX; sig += 1) {
+        const uint64_t bit = termd_linux_signal_bit(sig);
+        void *handler = (signal_ignored & bit) != 0 ?
+            (void *)(uintptr_t)TERMD_LINUX_SIG_IGN :
+            NULL;
+        write_ptr_field(
+            sighand,
+            TERMD_LINUX_SIGHAND_ACTION_OFFSET +
+                ((size_t)(sig - 1u) * TERMD_LINUX_K_SIGACTION_BYTES) +
+                TERMD_LINUX_SIGACTION_HANDLER_OFFSET,
+            handler);
+    }
+}
+
+static void termd_linux_tty_write_task_state(
+    void *task,
+    const termd_linux_tty_owner_ids_t *ids,
+    void *process,
+    void *pgrp,
+    void *session,
+    void *tty,
+    uint64_t signal_mask,
+    uint64_t signal_ignored)
+{
+    if (task == NULL || ids == NULL) {
+        return;
+    }
+    termd_linux_tty_write_task_signal_state(task, signal_mask, signal_ignored);
+    void *signal = read_ptr_field(task, TERMD_LINUX_TASK_SIGNAL_OFFSET);
+    if (signal == NULL) {
+        return;
+    }
+    termd_linux_signal_write_pid(signal, TERMD_LINUX_PIDTYPE_PID, process);
+    termd_linux_signal_write_pid(signal, TERMD_LINUX_PIDTYPE_TGID, process);
+    termd_linux_signal_write_pid(signal, TERMD_LINUX_PIDTYPE_PGID, pgrp);
+    termd_linux_signal_write_pid(signal, TERMD_LINUX_PIDTYPE_SID, session);
+    write_u32_field(
+        signal,
+        TERMD_LINUX_SIGNAL_LEADER_OFFSET,
+        ids->process_id != 0 && ids->process_id == ids->session_id ? 1u : 0u);
+    write_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OLD_PGRP_OFFSET, NULL);
+    if (tty != NULL) {
+        write_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OFFSET, tty);
+    }
+}
+
+static void termd_linux_tty_sync_current_state(
+    termd_linux_tty_handle_t *handle,
+    termd_linux_tty_owner_ids_t ids,
+    int install_initial_foreground,
+    const void *function,
+    uint64_t signal_mask,
+    uint64_t signal_ignored)
+{
+    if (handle == NULL || ids.session_id == 0 || ids.pgrp_id == 0) {
+        return;
+    }
+    void *real_tty = termd_linux_tty_real_tty(handle);
     termd_linux_owner_context_t context;
-    int has_context = enter_handle_function_context(handle, handle->open, &context);
-    void *pid = kb_find_vpid(1);
+    const void *owner_function = function != NULL ?
+        function :
+        (handle->ioctl != NULL ? handle->ioctl : handle->open);
+    int has_context = enter_handle_function_context(
+        handle,
+        owner_function,
+        &context);
+    void *process = ids.process_id != 0 ? kb_find_vpid((int)ids.process_id) : NULL;
+    void *pgrp = kb_find_vpid((int)ids.pgrp_id);
+    void *session = kb_find_vpid((int)ids.session_id);
+    if (process == NULL) {
+        process = pgrp != NULL ? pgrp : session;
+    }
+    void *current_task = kb_loader_module_current_task(kb_loader_active_module());
+    termd_linux_tty_write_task_state(
+        current_task,
+        &ids,
+        process,
+        pgrp,
+        session,
+        real_tty,
+        signal_mask,
+        signal_ignored);
+    termd_linux_tty_write_task_state(
+        kb_pid_task(process, TERMD_LINUX_PIDTYPE_PID),
+        &ids,
+        process,
+        pgrp,
+        session,
+        real_tty,
+        signal_mask,
+        signal_ignored);
+    termd_linux_tty_write_task_state(
+        kb_pid_task(pgrp, TERMD_LINUX_PIDTYPE_PGID),
+        &ids,
+        process,
+        pgrp,
+        session,
+        real_tty,
+        signal_mask,
+        signal_ignored);
+    termd_linux_tty_write_task_state(
+        kb_pid_task(session, TERMD_LINUX_PIDTYPE_SID),
+        &ids,
+        process,
+        pgrp,
+        session,
+        real_tty,
+        signal_mask,
+        signal_ignored);
+    if (real_tty != NULL && session != NULL) {
+        write_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_SESSION_OFFSET, session);
+        if (install_initial_foreground &&
+            pgrp != NULL &&
+            read_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET) == NULL)
+        {
+            write_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET, pgrp);
+        }
+    }
     if (has_context) {
         leave_owner_context(&context);
-    }
-    if (pid == NULL) {
-        return;
-    }
-    write_ptr_field(tty, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET, pid);
-    void *link = read_ptr_field(tty, TERMD_LINUX_TTY_LINK_OFFSET);
-    if (link != NULL && read_ptr_field(link, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET) == NULL) {
-        write_ptr_field(link, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET, pid);
     }
 }
 
@@ -606,6 +862,14 @@ int termd_linux_tty_island_open_pts(
     handle->release = record->fops_view.release;
     handle->owner = record->owner_module;
     prepare_tty_file(handle, request->flags);
+    termd_linux_tty_record_owner(handle, request);
+    termd_linux_tty_sync_current_state(
+        handle,
+        termd_linux_tty_handle_ids(handle),
+        0,
+        handle->open,
+        request->signal_mask,
+        request->signal_ignored);
 
     int result = call_handle_open(handle);
     if (result != 0) {
@@ -621,7 +885,13 @@ int termd_linux_tty_island_open_pts(
 
     handle->flags = (uint32_t)request->flags;
     handle->ref_count = 1;
-    install_default_foreground_pgrp(handle);
+    termd_linux_tty_sync_current_state(
+        handle,
+        termd_linux_tty_handle_ids(handle),
+        1,
+        handle->open,
+        request->signal_mask,
+        request->signal_ignored);
     *out_handle = handle->handle;
     printf(
         "[termd] linux tty pts open ready index=%llu handle=%llu\n",
@@ -677,6 +947,14 @@ int termd_linux_tty_island_open_hvc(
     handle->release = record->fops_view.release;
     handle->owner = record->owner_module;
     prepare_tty_file(handle, request->flags);
+    termd_linux_tty_record_owner(handle, request);
+    termd_linux_tty_sync_current_state(
+        handle,
+        termd_linux_tty_handle_ids(handle),
+        0,
+        handle->open,
+        request->signal_mask,
+        request->signal_ignored);
 
     int result = call_handle_open(handle);
     drain_linux_tty_work();
@@ -691,12 +969,69 @@ int termd_linux_tty_island_open_hvc(
 
     handle->flags = (uint32_t)request->flags;
     handle->ref_count = 1;
-    install_default_foreground_pgrp(handle);
+    termd_linux_tty_sync_current_state(
+        handle,
+        termd_linux_tty_handle_ids(handle),
+        1,
+        handle->open,
+        request->signal_mask,
+        request->signal_ignored);
     *out_handle = handle->handle;
     printf(
         "[termd] linux tty hvc open ready index=%llu handle=%llu\n",
         (unsigned long long)request->pts_index,
         (unsigned long long)handle->handle);
+    return 0;
+}
+
+int termd_linux_tty_island_open_ctty(
+    struct termd_linux_tty_island *island,
+    const termd_wire_open_t *request,
+    uint64_t *out_handle)
+{
+    if (request == NULL) {
+        return -22;
+    }
+    termd_wire_open_t hvc_request = *request;
+    hvc_request.pts_index = 0;
+    return termd_linux_tty_island_open_hvc(island, &hvc_request, out_handle);
+}
+
+int termd_linux_tty_island_take_signal(
+    struct termd_linux_tty_island *island,
+    termd_wire_signal_t *request,
+    uint64_t *out_result)
+{
+    if (island == NULL || request == NULL || out_result == NULL) {
+        return -22;
+    }
+    *out_result = 0;
+    if (!island->ready) {
+        return -19;
+    }
+    drain_linux_tty_work();
+    int pgrp = 0;
+    int sig = 0;
+    uint64_t generation = island->signal_generation;
+    const int status = kb_take_pending_pgrp_signal(
+        island->signal_generation,
+        &pgrp,
+        &sig,
+        &generation);
+    if (status < 0) {
+        return status;
+    }
+    if (status == 0 || sig == 0 || pgrp <= 0) {
+        request->signo = 0;
+        request->pgrp_id = 0;
+        request->generation = island->signal_generation;
+        return 0;
+    }
+    island->signal_generation = generation;
+    request->signo = (uint32_t)sig;
+    request->pgrp_id = (uint32_t)pgrp;
+    request->generation = generation;
+    *out_result = 1;
     return 0;
 }
 
@@ -780,6 +1115,30 @@ int termd_linux_tty_island_ioctl(
     if (handle == NULL) {
         return -9;
     }
+    termd_linux_tty_owner_ids_t caller_ids = termd_linux_tty_merge_ids(
+        handle,
+        request->session_id,
+        request->process_id,
+        request->pgrp_id);
+    if (request->request == TERMD_LINUX_TIOCSPGRP && request->arg0 > 0 && request->arg0 <= UINT32_MAX) {
+        termd_linux_tty_owner_ids_t target_ids = caller_ids;
+        target_ids.process_id = (uint32_t)request->arg0;
+        target_ids.pgrp_id = (uint32_t)request->arg0;
+        termd_linux_tty_sync_current_state(
+            handle,
+            target_ids,
+            0,
+            handle->ioctl,
+            request->signal_mask,
+            request->signal_ignored);
+    }
+    termd_linux_tty_sync_current_state(
+        handle,
+        caller_ids,
+        0,
+        handle->ioctl,
+        request->signal_mask,
+        request->signal_ignored);
 
     if (request->request == TERMD_LINUX_TIOCSWINSZ) {
         memset(request->data, 0, 8u);
@@ -847,6 +1206,17 @@ int termd_linux_tty_island_poll(
     if (handle == NULL) {
         return -9;
     }
+    termd_linux_tty_sync_current_state(
+        handle,
+        termd_linux_tty_merge_ids(
+            handle,
+            request->session_id,
+            request->process_id,
+            request->pgrp_id),
+        0,
+        handle->poll,
+        request->signal_mask,
+        request->signal_ignored);
     if (handle->poll == NULL) {
         request->revents = TERMD_WIRE_POLLERR;
         return 0;
@@ -863,16 +1233,6 @@ int termd_linux_tty_island_poll(
         request->events |
         TERMD_WIRE_POLLERR |
         TERMD_WIRE_POLLHUP);
-    if (request->revents != 0 ||
-        kb_linux_kernel_decode_major(handle->dev) != TERMD_LINUX_HVC_MAJOR)
-    {
-        printf(
-            "[termd] linux tty poll handle=%llu events=0x%x mask=0x%x revents=0x%x\n",
-            (unsigned long long)request->handle,
-            (unsigned)request->events,
-            (unsigned)mask,
-            (unsigned)request->revents);
-    }
     return 0;
 }
 
@@ -897,6 +1257,17 @@ int termd_linux_tty_island_io(
     if (iter_fn == NULL) {
         return -95;
     }
+    termd_linux_tty_sync_current_state(
+        handle,
+        termd_linux_tty_merge_ids(
+            handle,
+            request->session_id,
+            request->process_id,
+            request->pgrp_id),
+        0,
+        iter_fn,
+        request->signal_mask,
+        request->signal_ignored);
     if (request->length > TERMD_WIRE_IO_BYTES) {
         request->length = TERMD_WIRE_IO_BYTES;
     }
@@ -924,12 +1295,6 @@ int termd_linux_tty_island_io(
     if (has_context) {
         leave_owner_context(&context);
     }
-    printf(
-        "[termd] linux tty %s handle=%llu length=%llu result=%ld\n",
-        write ? "write" : "read",
-        (unsigned long long)request->handle,
-        (unsigned long long)request->length,
-        result);
     const int hvc_no_input = !write &&
         result == 0 &&
         kb_linux_kernel_decode_major(handle->dev) == TERMD_LINUX_HVC_MAJOR;

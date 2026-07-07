@@ -1237,6 +1237,38 @@ pub fn unmapPresentUserLinearRegion(
     return true;
 }
 
+pub fn invalidatePresentUserLinearRegionPtes(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) bool {
+    lockAddressSpaces();
+    defer unlockAddressSpaces();
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (size_bytes == 0) return false;
+    if ((va_start & 0xFFF) != 0) return false;
+
+    const size_u64: u64 = @intCast(size_bytes);
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+
+    var offset: u64 = 0;
+    while (offset < size_u64) : (offset += 4096) {
+        const va = va_start + offset;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
+        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const old_entry = pt_page[index.pt];
+        if ((old_entry & h.page_present) == 0) continue;
+        if ((old_entry & h.page_user) == 0) continue;
+        pt_page[index.pt] = 0;
+    }
+
+    h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
+
+    return true;
+}
+
 pub fn collectUserLinearRegionPaddrs(
     principal: kernel.PrincipalId,
     va_start: u64,

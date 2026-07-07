@@ -125,6 +125,14 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
             false,
             h.free_list,
         )) |mapping| {
+            if (mapping.invalidate_size_bytes != 0) {
+                if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return null;
+                if (!user_vm.invalidatePresentUserLinearRegionPtes(
+                    principal,
+                    mapping.invalidate_start_va,
+                    @intCast(mapping.invalidate_size_bytes),
+                )) return null;
+            }
             var paddrs = [_]u64{mapping.paddr};
             if (user_vm.lookupUserMappedPaddrForVa(principal, page_va) != null) {
                 if (!user_vm.remapTrustedUserPaddrsWithProt(

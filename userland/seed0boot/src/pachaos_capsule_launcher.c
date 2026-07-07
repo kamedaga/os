@@ -444,7 +444,7 @@ int seed0_launch_netd(int filed_endpoint_fd, int *out_socket_endpoint_fd)
     return 0;
 }
 
-int seed0_launch_termd(int *out_tty_endpoint_fd)
+int seed0_launch_termd(int ready_channel_fd, int *out_tty_endpoint_fd)
 {
     static const struct seed0_capsule_module_spec module_specs[] = {
         {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
@@ -459,6 +459,10 @@ int seed0_launch_termd(int *out_tty_endpoint_fd)
 
     if (out_tty_endpoint_fd != 0) {
         *out_tty_endpoint_fd = -1;
+    }
+    if (ready_channel_fd < 16) {
+        fprintf(stderr, "[seed0boot] termd: ready channel fd missing\n");
+        return -1;
     }
 
     const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
@@ -528,6 +532,11 @@ int seed0_launch_termd(int *out_tty_endpoint_fd)
         (void)pacha_fd_close(tty_endpoint_fd);
         return status;
     }
+    status = mark_device_inherit(ready_channel_fd, "termd ready channel");
+    if (status != 0) {
+        (void)pacha_fd_close(tty_endpoint_fd);
+        return status;
+    }
 
     struct seed0_loaded_process loaded;
     status = seed0_load_elf_process("/srv/termd.elf", daemon_image, daemon_size, &loaded);
@@ -541,6 +550,7 @@ int seed0_launch_termd(int *out_tty_endpoint_fd)
     config.magic = TERMD_BOOT_CONFIG_MAGIC;
     config.tty_endpoint_fd = SEED0_TERMD_TTY_ENDPOINT_FD;
     config.device_fd = device_fd >= 16 ? (uint64_t)(uint32_t)device_fd : 0;
+    config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
     config.module_count = module_count;
     for (uint64_t i = 0; i < module_count; i++) {
         config.modules[i].image_va = TERMD_MODULE_IMAGE_VA +
@@ -593,7 +603,7 @@ int seed0_launch_termd(int *out_tty_endpoint_fd)
     return 0;
 }
 
-int seed0_launch_storage_boot_nvme(int ready_channel_fd)
+int seed0_launch_storage_boot_nvme(int ready_channel_fd, int service_ready_channel_fd)
 {
     static const struct seed0_capsule_module_spec module_specs[] = {
         {"/srv/kobox/nvme-auth.ko", "nvme-auth.ko"},
@@ -612,7 +622,7 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd)
         return -1;
     }
     const int device_fd = (int)device->init_device_fd;
-    if (ready_channel_fd < 16) {
+    if (ready_channel_fd < 16 || service_ready_channel_fd < 16) {
         fprintf(stderr, "[seed0boot] storage_boot: ready channel fd missing\n");
         return -1;
     }
@@ -650,6 +660,7 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd)
     config.magic = STORAGE_BOOT_CONFIG_MAGIC;
     config.device_fd = (uint64_t)(uint32_t)device_fd;
     config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
+    config.service_ready_channel_fd = (uint64_t)(uint32_t)service_ready_channel_fd;
     config.module_count = module_count;
     for (uint64_t i = 0; i < module_count; i++) {
         config.modules[i].image_fd = (uint64_t)(uint32_t)module_fds[i];

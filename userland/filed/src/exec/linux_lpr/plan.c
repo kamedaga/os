@@ -11,6 +11,9 @@
 #ifndef FILED_LPR_TRACE
 #define FILED_LPR_TRACE 0
 #endif
+#ifndef FILED_LPR_TRACE_BASES
+#define FILED_LPR_TRACE_BASES 0
+#endif
 
 // /lib/ld-musl-x86_64.so.1はPachaOS Native muslなため/linuxへ.
 static const char *lpr_exec_interpreter_namespace_path(const char *interp_path)
@@ -535,6 +538,14 @@ static int load_plan(
         lpr_exec_discard_process_fd(process_fd);
         return status;
     }
+#if FILED_LPR_TRACE_BASES
+    fprintf(stderr,
+        "[filed] linux-lpr bases runtime_base=0x%llx runtime_entry=0x%llx main_base=0x%llx main_entry=0x%llx\n",
+        (unsigned long long)lpr_loaded.base,
+        (unsigned long long)lpr_loaded.entry,
+        (unsigned long long)main_loaded.base,
+        (unsigned long long)main_loaded.entry);
+#endif
 
     plan->main_entry = main_loaded.entry;
     plan->runtime_entry = main_loaded.entry;
@@ -574,6 +585,12 @@ static int load_plan(
             lpr_exec_discard_process_fd(process_fd);
             return status;
         }
+#if FILED_LPR_TRACE_BASES
+        fprintf(stderr,
+            "[filed] linux-lpr interp_base=0x%llx interp_entry=0x%llx\n",
+            (unsigned long long)interp_loaded.base,
+            (unsigned long long)interp_loaded.entry);
+#endif
         plan->runtime_entry = interp_loaded.entry;
         plan->interpreter_base = interp_loaded.base;
     }
@@ -665,13 +682,14 @@ int filed_exec_linux_lpr_prewarm(struct filed_runtime *runtime)
     return 0;
 }
 
-int filed_exec_linux_lpr_handle(
+static int filed_exec_linux_lpr_handle_mode(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
     const filed_wire_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
+    int start_thread,
     int *out_process_fd,
     int *out_thread_fd)
 {
@@ -747,7 +765,7 @@ int filed_exec_linux_lpr_handle(
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-    status = lpr_exec_start_plan(&plan, request, bootstrap_fd);
+    status = lpr_exec_start_plan(&plan, request, bootstrap_fd, start_thread);
     LPR_EXEC_STAGE_RECORD_TO("start_plan", stage_start, stage_start_cycles, start_plan_cycles);
     lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
     if (status != 0) {
@@ -775,4 +793,45 @@ int filed_exec_linux_lpr_handle(
         load_plan_cycles,
         start_plan_cycles);
     return 0;
+}
+
+int filed_exec_linux_lpr_handle(
+    struct filed_runtime *runtime,
+    filed_handle_id_t handle_id,
+    const filed_wire_exec_path_t *request,
+    const int *inherit_fds,
+    uint64_t inherit_fd_count,
+    int bootstrap_fd,
+    int *out_process_fd,
+    int *out_thread_fd)
+{
+    return filed_exec_linux_lpr_handle_mode(
+        runtime,
+        handle_id,
+        request,
+        inherit_fds,
+        inherit_fd_count,
+        bootstrap_fd,
+        1,
+        out_process_fd,
+        out_thread_fd);
+}
+
+int filed_exec_linux_lpr_prepare_self(
+    struct filed_runtime *runtime,
+    filed_handle_id_t handle_id,
+    const filed_wire_exec_path_t *request,
+    int *out_process_fd,
+    int *out_thread_fd)
+{
+    return filed_exec_linux_lpr_handle_mode(
+        runtime,
+        handle_id,
+        request,
+        NULL,
+        0,
+        -1,
+        0,
+        out_process_fd,
+        out_thread_fd);
 }

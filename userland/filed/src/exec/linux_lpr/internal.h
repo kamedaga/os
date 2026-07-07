@@ -280,5 +280,5 @@ int lpr_exec_prepare_inherit_fds(
     int *prepared,
     uint64_t *out_prepared_count);
 void lpr_exec_clear_prepared_inherit_fds(const int *prepared, uint64_t count);
-int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *request, int bootstrap_fd);
+int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *request, int bootstrap_fd, int start_thread);
 void lpr_exec_discard_process_fd(int process_fd);

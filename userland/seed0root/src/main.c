@@ -1,6 +1,10 @@
+#include "pacha/error_conveyor.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 #include "filed/ipc_protocol.h"
+#include "lpr_supervisor/boot_config.h"
+#include "lpr_supervisor/ipc_protocol.h"
+#include "personality/linux_lpr.h"
 
 #ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
 #define SEED0ROOT_DEFAULT_BOOT_PROFILE 0u
@@ -15,6 +19,7 @@
 enum {
     SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
     SEED0ROOT_STORAGE_READY_MAGIC = 0x3159445252545330ull,
+    SEED0ROOT_SERVICES_READY_MAGIC = 0x3159445256533053ull,
     SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
     SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
     SEED0ROOT_FILED_STORAGE_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
@@ -69,6 +74,7 @@ struct seed0root_bootstrap {
     uint64_t magic;
     uint64_t device_fd;
     uint64_t ready_channel_fd;
+    uint64_t service_ready_channel_fd;
     uint64_t filed_image_fd;
     uint64_t filed_image_size;
     uint64_t module_count;
@@ -327,7 +333,11 @@ static int map_elf_segment(
     return 0;
 }
 
-static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
+static int create_inherited_vmo_from_bytes_with_extra_rights(
+    const void *data,
+    uint64_t size,
+    const char *label,
+    uint64_t extra_rights)
 {
     if (data == NULL || size == 0) {
         return -1;
@@ -348,7 +358,8 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_READ |
         PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
+        PACHA_FD_RIGHT_MAP_WRITE |
+        extra_rights;
     const int fd = pacha_vmo_create(map_size, rights, 0);
     if (fd < 16) {
         return -3;
@@ -379,6 +390,11 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
         fflush(stdout);
     }
     return fd;
+}
+
+static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
+{
+    return create_inherited_vmo_from_bytes_with_extra_rights(data, size, label, 0);
 }
 
 static int read_bootstrap_fd(int fd, void *out, uint64_t size, const char *label)
@@ -488,6 +504,9 @@ static int recv_ipc_wait(int fd, struct pacha_ipc_msg *msg)
     return -2;
 }
 
+static void seed0root_dump_filed_error_token(int endpoint_fd, uint64_t token, const char *context);
+static void seed0root_dump_lprs_error_token(int endpoint_fd, uint64_t token, const char *context);
+
 static int seed0root_filed_call(
     int endpoint_fd,
     uint64_t op,
@@ -524,6 +543,29 @@ static int seed0root_filed_call(
     };
     const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
     if (reply_fd < 16) {
+        struct pacha_fd_info endpoint_info;
+        struct pacha_fd_info transfer_info;
+        memset(&endpoint_info, 0, sizeof(endpoint_info));
+        memset(&transfer_info, 0, sizeof(transfer_info));
+        const int endpoint_info_status = pacha_fd_get_info(endpoint_fd, &endpoint_info);
+        const int transfer_info_status = transfer_fd >= 16 ?
+            pacha_fd_get_info(transfer_fd, &transfer_info) :
+            -22;
+        fprintf(stderr,
+            "[seed0root] filed call failed op=%llu request=0x%llx endpoint_fd=%d endpoint_info=%d kind=%llu rights=0x%llx flags=0x%llx transfer_fd=%d transfer_info=%d kind=%llu rights=0x%llx flags=0x%llx result=%d\n",
+            (unsigned long long)op,
+            (unsigned long long)request_id,
+            endpoint_fd,
+            endpoint_info_status,
+            (unsigned long long)endpoint_info.kind,
+            (unsigned long long)endpoint_info.rights,
+            (unsigned long long)endpoint_info.flags,
+            transfer_fd,
+            transfer_info_status,
+            (unsigned long long)transfer_info.kind,
+            (unsigned long long)transfer_info.rights,
+            (unsigned long long)transfer_info.flags,
+            reply_fd);
         return reply_fd;
     }
 
@@ -539,6 +581,126 @@ static int seed0root_filed_call(
         return -2;
     }
     if ((int64_t)out_reply->word1 < 0) {
+        if (out_reply->word2 != 0) {
+            seed0root_dump_filed_error_token(endpoint_fd, out_reply->word2, "filed call");
+        }
+        fprintf(stderr,
+            "[seed0root] filed negative reply op=%llu request=0x%llx status=%lld result=%llu fd_count=%llu\n",
+            (unsigned long long)op,
+            (unsigned long long)request_id,
+            (long long)(int64_t)out_reply->word1,
+            (unsigned long long)out_reply->word2,
+            (unsigned long long)out_reply->fd_count);
+        fflush(stderr);
+        return (int)(int64_t)out_reply->word1;
+    }
+    return 0;
+}
+
+static int seed0root_filed_call_fdv(
+    int endpoint_fd,
+    uint64_t op,
+    uint64_t request_id,
+    const struct pacha_ipc_fd *fds,
+    uint64_t fd_count,
+    uint64_t word2,
+    struct pacha_ipc_msg *out_reply,
+    struct pacha_ipc_fd *reply_fds,
+    uint64_t reply_fd_capacity)
+{
+    if (endpoint_fd < 16 || request_id == 0 || out_reply == NULL) {
+        return -1;
+    }
+    const struct pacha_ipc_msg request = {
+        .word0 = FILED_WIRE_REQUEST_MAGIC,
+        .word1 = op,
+        .word2 = word2,
+        .word3 = request_id,
+        .fds = (struct pacha_ipc_fd *)fds,
+        .fd_count = fd_count,
+    };
+    const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+    memset(out_reply, 0, sizeof(*out_reply));
+    out_reply->fds = reply_fds;
+    out_reply->fd_capacity = reply_fd_capacity;
+    const int recv_status = recv_ipc_wait(reply_fd, out_reply);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (out_reply->word0 != FILED_WIRE_REPLY_MAGIC || out_reply->word3 != request_id) {
+        return -2;
+    }
+    if ((int64_t)out_reply->word1 < 0) {
+        if (out_reply->word2 != 0) {
+            seed0root_dump_filed_error_token(endpoint_fd, out_reply->word2, "filed fdv call");
+        }
+        return (int)(int64_t)out_reply->word1;
+    }
+    return 0;
+}
+
+static int seed0root_lprs_call(
+    int endpoint_fd,
+    uint64_t op,
+    uint64_t request_id,
+    int page_fd,
+    uint64_t word2,
+    int transfer_fd,
+    struct pacha_ipc_msg *out_reply)
+{
+    if (endpoint_fd < 16 || request_id == 0 || out_reply == NULL) {
+        return -1;
+    }
+    struct pacha_ipc_fd fds[2];
+    uint64_t fd_count = 0;
+    memset(fds, 0, sizeof(fds));
+    if (page_fd >= 16) {
+        fds[fd_count].fd = (uint64_t)(uint32_t)page_fd;
+        fds[fd_count].rights =
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ |
+            PACHA_FD_RIGHT_MAP_WRITE;
+        fd_count++;
+    }
+    if (transfer_fd >= 16) {
+        fds[fd_count].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[fd_count].rights =
+            PACHA_FD_RIGHT_INSPECT |
+            PACHA_FD_RIGHT_WAIT |
+            PACHA_FD_RIGHT_POLL |
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_KILL;
+        fd_count++;
+    }
+    const struct pacha_ipc_msg request = {
+        .word0 = LPRS_WIRE_REQUEST_MAGIC,
+        .word1 = op,
+        .word2 = word2,
+        .word3 = request_id,
+        .fds = fd_count != 0 ? fds : NULL,
+        .fd_count = fd_count,
+    };
+    const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+    memset(out_reply, 0, sizeof(*out_reply));
+    const int recv_status = recv_ipc_wait(reply_fd, out_reply);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (out_reply->word0 != LPRS_WIRE_REPLY_MAGIC || out_reply->word3 != request_id) {
+        return -2;
+    }
+    if ((int64_t)out_reply->word1 < 0) {
+        if (out_reply->word2 != 0) {
+            seed0root_dump_lprs_error_token(endpoint_fd, out_reply->word2, "lpr supervisor call");
+        }
         return (int)(int64_t)out_reply->word1;
     }
     return 0;
@@ -1015,6 +1177,105 @@ static int seed0root_create_filed_wire_page(int *out_fd, void **out_mapped)
 static void seed0root_destroy_filed_wire_page(int fd, void *mapped)
 {
     seed0root_destroy_wire_page(FILED_WIRE_PAGE_BYTES, fd, mapped);
+}
+
+static void seed0root_dump_service_error_token(
+    int endpoint_fd,
+    uint64_t request_magic,
+    uint64_t reply_magic,
+    uint64_t error_get_op,
+    uint64_t page_bytes,
+    uint64_t token,
+    const char *context)
+{
+    if (endpoint_fd < 16 || token == 0 || page_bytes == 0) {
+        return;
+    }
+    int page_fd = -1;
+    void *page = NULL;
+    if (seed0root_create_wire_page(page_bytes, &page_fd, &page) != 0) {
+        return;
+    }
+
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    fd_item.fd = (uint64_t)(uint32_t)page_fd;
+    fd_item.rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+
+    const uint64_t request_id = 0x4552524745540000ull ^ token ^ error_get_op;
+    const struct pacha_ipc_msg request = {
+        .word0 = request_magic,
+        .word1 = error_get_op,
+        .word2 = token,
+        .word3 = request_id,
+        .fds = &fd_item,
+        .fd_count = 1,
+    };
+    const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
+    if (reply_fd < 16) {
+        fprintf(stderr,
+            "[seed0root] error-get call failed context=%s token=0x%llx status=%d\n",
+            context != NULL ? context : "unknown",
+            (unsigned long long)token,
+            reply_fd);
+        seed0root_destroy_wire_page(page_bytes, page_fd, page);
+        return;
+    }
+
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0 ||
+        reply.word0 != reply_magic ||
+        reply.word3 != request_id ||
+        (int64_t)reply.word1 != 0)
+    {
+        fprintf(stderr,
+            "[seed0root] error-get failed context=%s token=0x%llx recv=%d magic=0x%llx status=%lld request=0x%llx\n",
+            context != NULL ? context : "unknown",
+            (unsigned long long)token,
+            recv_status,
+            (unsigned long long)reply.word0,
+            (long long)(int64_t)reply.word1,
+            (unsigned long long)reply.word3);
+        seed0root_destroy_wire_page(page_bytes, page_fd, page);
+        return;
+    }
+
+    (void)pacha_errconv_dump_page_to_fd(
+        2,
+        context != NULL ? context : "[seed0root:error]",
+        page,
+        page_bytes);
+    seed0root_destroy_wire_page(page_bytes, page_fd, page);
+}
+
+static void seed0root_dump_filed_error_token(int endpoint_fd, uint64_t token, const char *context)
+{
+    seed0root_dump_service_error_token(
+        endpoint_fd,
+        FILED_WIRE_REQUEST_MAGIC,
+        FILED_WIRE_REPLY_MAGIC,
+        FILED_WIRE_OP_ERROR_GET,
+        FILED_WIRE_PAGE_BYTES,
+        token,
+        context != NULL ? context : "[seed0root:filed-error]");
+}
+
+static void seed0root_dump_lprs_error_token(int endpoint_fd, uint64_t token, const char *context)
+{
+    seed0root_dump_service_error_token(
+        endpoint_fd,
+        LPRS_WIRE_REQUEST_MAGIC,
+        LPRS_WIRE_REPLY_MAGIC,
+        LPRS_WIRE_OP_ERROR_GET,
+        LPRS_WIRE_PAGE_BYTES,
+        token,
+        context != NULL ? context : "[seed0root:lprs-error]");
 }
 
 static int seed0root_exec_add_string(
@@ -2278,9 +2539,6 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
             (unsigned long long)sync_elapsed_ns,
             (unsigned long long)(sync_elapsed_ns / 1000ull));
     }
-    if (filed_endpoint_fd >= 16) {
-        (void)pacha_fd_close(filed_endpoint_fd);
-    }
     return status;
 }
 
@@ -2519,6 +2777,373 @@ static int seed0root_send_storage_ready(int ready_channel_fd, int filed_client_f
     return pacha_ipc_send(ready_channel_fd, &msg);
 }
 
+static int seed0root_wait_services_ready(int service_ready_channel_fd)
+{
+    if (service_ready_channel_fd < 16) {
+        return -22;
+    }
+    struct pacha_ipc_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    const int status = recv_ipc_wait(service_ready_channel_fd, &msg);
+    (void)pacha_fd_close(service_ready_channel_fd);
+    if (status != 0 ||
+        msg.word0 != SEED0ROOT_SERVICES_READY_MAGIC ||
+        msg.word1 != 0)
+    {
+        fprintf(stderr,
+            "[seed0root] services ready wait failed status=%d word0=0x%llx word1=%llu\n",
+            status,
+            (unsigned long long)msg.word0,
+            (unsigned long long)msg.word1);
+        return status != 0 ? status : -5;
+    }
+    printf("[seed0root] services ready signal received\n");
+    fflush(stdout);
+    return 0;
+}
+
+static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16 || out_endpoint_fd == NULL) {
+        return -22;
+    }
+    *out_endpoint_fd = -1;
+    const int endpoint_fd = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (endpoint_fd < 16) {
+        return endpoint_fd < 0 ? endpoint_fd : -5;
+    }
+
+    struct lprs_boot_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.magic = LPRS_BOOT_CONFIG_MAGIC;
+    cfg.endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
+    const int bootstrap_fd = create_inherited_vmo_from_bytes_with_extra_rights(
+        &cfg,
+        sizeof(cfg),
+        "lpr supervisor bootstrap fd",
+        PACHA_FD_RIGHT_DUP);
+    if (bootstrap_fd < 16) {
+        (void)pacha_fd_close(endpoint_fd);
+        return bootstrap_fd;
+    }
+
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_filed_wire_page(&page_fd, &page);
+    if (status != 0) {
+        (void)pacha_fd_close(bootstrap_fd);
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
+    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    exec->dir_handle = 0;
+    exec->flags = FILED_WIRE_EXEC_INHERIT_FDS;
+    exec->inherit_fd_count = 2;
+    exec->inherit_fd_targets[0] = LPR_SUPERVISOR_ENDPOINT_FD;
+    exec->inherit_fd_targets[1] = LPRS_BOOT_CONFIG_FD;
+    exec->argc = 2;
+    snprintf(exec->path, sizeof(exec->path), "%s", "/sbin/lpr_supervisor.elf");
+    status = seed0root_exec_add_string(exec, &exec->argv[0], "/sbin/lpr_supervisor.elf");
+    if (status != 0) {
+        seed0root_destroy_filed_wire_page(page_fd, page);
+        (void)pacha_fd_close(bootstrap_fd);
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
+    char boot_arg[32];
+    snprintf(boot_arg, sizeof(boot_arg), "--boot-fd=%u", (unsigned)LPRS_BOOT_CONFIG_FD);
+    status = seed0root_exec_add_string(exec, &exec->argv[1], boot_arg);
+    if (status != 0) {
+        seed0root_destroy_filed_wire_page(page_fd, page);
+        (void)pacha_fd_close(bootstrap_fd);
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
+
+    struct pacha_ipc_fd fds[3];
+    memset(fds, 0, sizeof(fds));
+    fds[0].fd = (uint64_t)(uint32_t)page_fd;
+    fds[0].rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    fds[1].fd = (uint64_t)(uint32_t)endpoint_fd;
+    fds[1].rights = seed0root_channel_rights;
+    fds[2].fd = (uint64_t)(uint32_t)bootstrap_fd;
+    fds[2].rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_MAP_READ;
+
+    struct pacha_ipc_fd reply_fds[2];
+    memset(reply_fds, 0, sizeof(reply_fds));
+    struct pacha_ipc_msg reply;
+    status = seed0root_filed_call_fdv(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_EXEC_PATH,
+        0x5eed1001u,
+        fds,
+        3,
+        0,
+        &reply,
+        reply_fds,
+        2);
+    seed0root_destroy_filed_wire_page(page_fd, page);
+    (void)pacha_fd_close(bootstrap_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
+    if (reply.fd_count < 2 || reply_fds[0].fd < 16 || reply_fds[1].fd < 16) {
+        if (reply_fds[1].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[1].fd);
+        }
+        if (reply_fds[0].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[0].fd);
+        }
+        (void)pacha_fd_close(endpoint_fd);
+        return -5;
+    }
+    (void)pacha_fd_close((int)reply_fds[1].fd);
+    (void)pacha_fd_close((int)reply_fds[0].fd);
+
+    memset(&reply, 0, sizeof(reply));
+    status = seed0root_lprs_call(
+        endpoint_fd,
+        LPRS_WIRE_OP_HELLO,
+        0x5eed1002u,
+        -1,
+        0,
+        -1,
+        &reply);
+    if (status != 0) {
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
+    printf("[seed0root] lpr supervisor started endpoint_fd=%d\n", endpoint_fd);
+    fflush(stdout);
+    *out_endpoint_fd = endpoint_fd;
+    return 0;
+}
+
+static int seed0root_register_termd_signal_supervisor(
+    int filed_endpoint_fd,
+    int supervisor_endpoint_fd)
+{
+    if (filed_endpoint_fd < 16 || supervisor_endpoint_fd < 16) {
+        return -22;
+    }
+
+    struct pacha_ipc_fd fd_item;
+    memset(&fd_item, 0, sizeof(fd_item));
+    fd_item.fd = (uint64_t)(uint32_t)supervisor_endpoint_fd;
+    fd_item.rights = seed0root_channel_rights;
+
+    struct pacha_ipc_msg request;
+    memset(&request, 0, sizeof(request));
+    request.word0 = FILED_WIRE_REQUEST_MAGIC;
+    request.word1 = FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR;
+    request.word2 = 0;
+    request.word3 = 0x5eed1005u;
+    request.fds = &fd_item;
+    request.fd_count = 1;
+
+    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
+    if (reply_fd < 16) {
+        return reply_fd;
+    }
+
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
+        reply.word3 != request.word3 ||
+        (int64_t)reply.word1 != 0)
+    {
+        if ((int64_t)reply.word1 < 0 && reply.word2 != 0) {
+            seed0root_dump_filed_error_token(
+                filed_endpoint_fd,
+                reply.word2,
+                "register termd signal supervisor");
+        }
+        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
+    }
+    printf("[seed0root] termd signal supervisor registered result=%llu\n",
+        (unsigned long long)reply.word2);
+    fflush(stdout);
+    return 0;
+}
+
+static int seed0root_register_lpr_bash(int supervisor_endpoint_fd, lprs_wire_process_state_t *out_state)
+{
+    if (supervisor_endpoint_fd < 16 || out_state == NULL) {
+        return -22;
+    }
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_filed_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+    lprs_wire_register_exec_t *reg = (lprs_wire_register_exec_t *)page;
+    memset(reg, 0, sizeof(*reg));
+    snprintf(reg->state.ctty, sizeof(reg->state.ctty), "%s", "/dev/hvc0");
+    snprintf(reg->state.cwd, sizeof(reg->state.cwd), "%s", "/");
+    struct pacha_ipc_msg reply;
+    status = seed0root_lprs_call(
+        supervisor_endpoint_fd,
+        LPRS_WIRE_OP_REGISTER_EXEC,
+        0x5eed1003u,
+        page_fd,
+        0,
+        -1,
+        &reply);
+    if (status == 0) {
+        memcpy(out_state, &reg->state, sizeof(*out_state));
+    }
+    seed0root_destroy_filed_wire_page(page_fd, page);
+    return status;
+}
+
+static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoint_fd)
+{
+    static const char *const argv[] = {
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-i",
+    };
+    static const char *const envp[] = {
+        "PATH=/bin:/cmd:/usr/bin",
+        "TERM=xterm",
+        "HOME=/home",
+        "LD_LIBRARY_PATH=/lib/linux:/usr/lib",
+    };
+    if (filed_endpoint_fd < 16 || supervisor_endpoint_fd < 16) {
+        return -22;
+    }
+    lprs_wire_process_state_t bash_state;
+    memset(&bash_state, 0, sizeof(bash_state));
+    int status = seed0root_register_lpr_bash(supervisor_endpoint_fd, &bash_state);
+    if (status != 0 || bash_state.token == 0 || bash_state.pid == 0) {
+        return status != 0 ? status : -5;
+    }
+
+    int page_fd = -1;
+    void *page = NULL;
+    status = seed0root_create_filed_wire_page(&page_fd, &page);
+    if (status != 0) {
+        return status;
+    }
+    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    exec->dir_handle = 0;
+    exec->flags =
+        FILED_WIRE_EXEC_LINUX_LPR |
+        FILED_WIRE_EXEC_LINUX_BOOTSTRAP |
+        FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_WIRE_EXEC_INHERIT_FDS |
+        FILED_WIRE_EXEC_TRANSFER_PROCESS_FD;
+    exec->inherit_fd_count = 1;
+    exec->inherit_fd_targets[0] = LPR_SUPERVISOR_ENDPOINT_FD;
+    exec->linux_pid = bash_state.pid;
+    exec->linux_ppid = bash_state.ppid;
+    exec->linux_sid = bash_state.sid;
+    exec->linux_pgrp = bash_state.pgrp;
+    exec->linux_next_pid = 0;
+    exec->lpr_supervisor_token = bash_state.token;
+    exec->lpr_fd_table_token = bash_state.token;
+    exec->argc = sizeof(argv) / sizeof(argv[0]);
+    exec->envc = sizeof(envp) / sizeof(envp[0]);
+    snprintf(exec->path, sizeof(exec->path), "%s", "/bin/bash");
+    status = seed0root_exec_add_string(exec, &exec->ctty, "/dev/hvc0");
+    if (status != 0) {
+        seed0root_destroy_filed_wire_page(page_fd, page);
+        return status;
+    }
+    for (uint64_t i = 0; i < exec->argc; i++) {
+        status = seed0root_exec_add_string(exec, &exec->argv[i], argv[i]);
+        if (status != 0) {
+            seed0root_destroy_filed_wire_page(page_fd, page);
+            return status;
+        }
+    }
+    for (uint64_t i = 0; i < exec->envc; i++) {
+        status = seed0root_exec_add_string(exec, &exec->envp[i], envp[i]);
+        if (status != 0) {
+            seed0root_destroy_filed_wire_page(page_fd, page);
+            return status;
+        }
+    }
+
+    struct pacha_ipc_fd fds[2];
+    memset(fds, 0, sizeof(fds));
+    fds[0].fd = (uint64_t)(uint32_t)page_fd;
+    fds[0].rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    fds[1].fd = (uint64_t)(uint32_t)supervisor_endpoint_fd;
+    fds[1].rights = seed0root_channel_rights;
+
+    struct pacha_ipc_fd reply_fds[2];
+    memset(reply_fds, 0, sizeof(reply_fds));
+    struct pacha_ipc_msg reply;
+    status = seed0root_filed_call_fdv(
+        filed_endpoint_fd,
+        FILED_WIRE_OP_EXEC_PATH,
+        0x5eed0ba5u,
+        fds,
+        2,
+        0,
+        &reply,
+        reply_fds,
+        2);
+    seed0root_destroy_filed_wire_page(page_fd, page);
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] bash exec failed status=%d\n", status);
+        return status;
+    }
+    if (reply.fd_count < 2 || reply_fds[0].fd < 16 || reply_fds[1].fd < 16) {
+        if (reply_fds[1].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[1].fd);
+        }
+        if (reply_fds[0].fd >= 16) {
+            (void)pacha_fd_close((int)reply_fds[0].fd);
+        }
+        return -5;
+    }
+    printf("[seed0root] bash started process_fd=%llu thread_fd=%llu\n",
+        (unsigned long long)reply_fds[0].fd,
+        (unsigned long long)reply_fds[1].fd);
+    fflush(stdout);
+    memset(&reply, 0, sizeof(reply));
+    status = seed0root_lprs_call(
+        supervisor_endpoint_fd,
+        LPRS_WIRE_OP_REGISTER_PROCESS_FD,
+        0x5eed1004u,
+        -1,
+        bash_state.token,
+        (int)reply_fds[0].fd,
+        &reply);
+    (void)pacha_fd_close((int)reply_fds[1].fd);
+    if (status != 0) {
+        (void)pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);
+    }
+    (void)pacha_fd_close((int)reply_fds[0].fd);
+    if (status != 0) {
+        fprintf(stderr, "[seed0root] bash supervisor register failed status=%d\n", status);
+        return status;
+    }
+    return 0;
+}
+
 static int launch_filed(const struct seed0root_bootstrap *bootstrap)
 {
     if (bootstrap->magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
@@ -2526,13 +3151,15 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
         bootstrap->filed_image_size == 0 ||
         bootstrap->device_fd < 16 ||
         bootstrap->ready_channel_fd < 16 ||
+        bootstrap->service_ready_channel_fd < 16 ||
         bootstrap->module_count == 0 ||
         bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES) {
         fprintf(stderr,
-            "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu ready_fd=%llu filed_fd=%llu size=%llu modules=%llu\n",
+            "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu ready_fd=%llu service_ready_fd=%llu filed_fd=%llu size=%llu modules=%llu\n",
             (unsigned long long)bootstrap->magic,
             (unsigned long long)bootstrap->device_fd,
             (unsigned long long)bootstrap->ready_channel_fd,
+            (unsigned long long)bootstrap->service_ready_channel_fd,
             (unsigned long long)bootstrap->filed_image_fd,
             (unsigned long long)bootstrap->filed_image_size,
             (unsigned long long)bootstrap->module_count);
@@ -2642,7 +3269,19 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
     (void)pacha_fd_close(filed_endpoint_fd);
     printf("[seed0root] filed started\n");
     fflush(stdout);
-    status = seed0root_send_storage_ready((int)bootstrap->ready_channel_fd, filed_client_fd);
+    const long boot_client_dup =
+        pacha_fd_fcntl(filed_client_fd, PACHA_FD_FCNTL_DUP, 16, seed0root_channel_rights);
+    if (boot_client_dup < 16) {
+        (void)pacha_fd_close(filed_client_fd);
+        fprintf(stderr,
+            "[seed0root] storage ready filed endpoint dup failed status=%ld fd=%d\n",
+            boot_client_dup,
+            filed_client_fd);
+        return boot_client_dup < 0 ? (int)boot_client_dup : -2;
+    }
+    const int boot_client_fd = (int)boot_client_dup;
+    status = seed0root_send_storage_ready((int)bootstrap->ready_channel_fd, boot_client_fd);
+    (void)pacha_fd_close(boot_client_fd);
     if (status != 0) {
         (void)pacha_fd_close(filed_client_fd);
         fprintf(stderr, "[seed0root] storage ready send failed status=%d fd=%llu\n",
@@ -2652,10 +3291,40 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
     }
     printf("[seed0root] storage ready signal sent\n");
     fflush(stdout);
+    status = seed0root_wait_services_ready((int)bootstrap->service_ready_channel_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(filed_client_fd);
+        return status;
+    }
     status = seed0root_run_storage_services(filed_client_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(filed_client_fd);
+        fprintf(stderr, "[seed0root] filed service failed status=%d\n", status);
+        return status;
+    }
+    int lpr_supervisor_endpoint_fd = -1;
+    status = seed0root_start_lpr_supervisor(filed_client_fd, &lpr_supervisor_endpoint_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(filed_client_fd);
+        fprintf(stderr, "[seed0root] lpr supervisor launch failed status=%d\n", status);
+        return status;
+    }
+    status = seed0root_register_termd_signal_supervisor(
+        filed_client_fd,
+        lpr_supervisor_endpoint_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
+        (void)pacha_fd_close(filed_client_fd);
+        fprintf(stderr,
+            "[seed0root] termd signal supervisor register failed status=%d\n",
+            status);
+        return status;
+    }
+    status = seed0root_spawn_lpr_bash(filed_client_fd, lpr_supervisor_endpoint_fd);
+    (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
     (void)pacha_fd_close(filed_client_fd);
     if (status != 0) {
-        fprintf(stderr, "[seed0root] filed service failed status=%d\n", status);
+        fprintf(stderr, "[seed0root] bash launch failed status=%d\n", status);
         return status;
     }
     printf("[seed0root] storage ready\n");
@@ -2677,11 +3346,12 @@ int main(int argc, char **argv)
     fflush(stdout);
     struct seed0root_bootstrap bootstrap;
     bootstrap_status = read_bootstrap_fd(bootstrap_fd, &bootstrap, sizeof(bootstrap), "seed0root");
-    printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu ready_fd=%llu filed_fd=%llu filed_size=%llu modules=%llu\n",
+    printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu ready_fd=%llu service_ready_fd=%llu filed_fd=%llu filed_size=%llu modules=%llu\n",
         bootstrap_status,
         (unsigned long long)bootstrap.magic,
         (unsigned long long)bootstrap.device_fd,
         (unsigned long long)bootstrap.ready_channel_fd,
+        (unsigned long long)bootstrap.service_ready_channel_fd,
         (unsigned long long)bootstrap.filed_image_fd,
         (unsigned long long)bootstrap.filed_image_size,
         (unsigned long long)bootstrap.module_count);
@@ -2690,6 +3360,7 @@ int main(int argc, char **argv)
         bootstrap.magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap.device_fd < 16 ||
         bootstrap.ready_channel_fd < 16 ||
+        bootstrap.service_ready_channel_fd < 16 ||
         bootstrap.filed_image_fd < 16 ||
         bootstrap.filed_image_size == 0 ||
         bootstrap.module_count == 0 ||
