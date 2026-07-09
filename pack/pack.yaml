@@ -791,6 +791,18 @@ apps:
     file: "tests/fixtures/pipe_stress.sh"
     out: "PIPESTRS.SH"
     rootfs: "/cmd/pipe_stress.sh"
+  gnu_smoke_script:
+    file: "tests/fixtures/gnu_coreutils_smoke.sh"
+    out: "GNUSMOKE.SH"
+    rootfs: "/cmd/gnu_smoke.sh"
+  ext4_write_script:
+    file: "tests/fixtures/ext4_persist_write.sh"
+    out: "EXT4W.SH"
+    rootfs: "/cmd/ext4_w.sh"
+  ext4_read_script:
+    file: "tests/fixtures/ext4_persist_read.sh"
+    out: "EXT4R.SH"
+    rootfs: "/cmd/ext4_r.sh"
   chibicc_toolchain_root:
     file:
       path: ".artifacts/userland-fixtures/lpr-chibicc-toolchain-root"
