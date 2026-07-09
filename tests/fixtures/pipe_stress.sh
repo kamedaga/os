@@ -51,6 +51,39 @@ run_iter() {
   run_case "I${it}_CASE8" "5"     "bash -c '$b yes C | $b head -n 5 | $b wc -l'"
 }
 
+if [ "x$iters" = "xdiag" ]; then
+    b=$bb
+    echo "DIAG_16K=BEGIN"
+    $b yes A | $b head -c 16384 | $b wc -c
+    echo "DIAG_16K=AFTER"
+    echo "DIAG_64K=BEGIN"
+    $b yes A | $b head -c 65536 | $b wc -c
+    echo "DIAG_64K=AFTER"
+    echo "DIAG_SH_64K=BEGIN"
+    $b sh -c "$b yes A | $b head -c 65536 | $b wc -c"
+    echo "DIAG_SH_64K=AFTER status=$?"
+    echo "DIAG_TIMEOUT_ECHO=BEGIN"
+    $b timeout -s KILL 3 $b sh -c "echo timeout-ok"
+    echo "DIAG_TIMEOUT_ECHO=AFTER status=$?"
+    echo "DIAG_TIMEOUT_64K=BEGIN"
+    $b timeout -s KILL 3 $b sh -c "$b yes A | $b head -c 65536 | $b wc -c"
+    echo "DIAG_TIMEOUT_64K=AFTER status=$?"
+    echo "DIAG_TIMEOUT_64K_REDIRECT=BEGIN"
+    rm -f "$out" 2>/dev/null
+    $b timeout -s KILL 3 $b sh -c "$b yes A | $b head -c 65536 | $b wc -c" > "$out" 2>/dev/null
+    st=$?
+    got=$($b cat "$out" 2>/dev/null)
+    echo "DIAG_TIMEOUT_64K_REDIRECT=AFTER status=$st got=[$got]"
+    echo "DIAG_EPIPE=BEGIN"
+    $b sh -c "$b yes B | $b head -n 3 | $b wc -l"
+    echo "DIAG_EPIPE=AFTER status=$?"
+    echo "DIAG_TIMEOUT_EPIPE=BEGIN"
+    $b timeout -s KILL 3 $b sh -c "$b yes B | $b head -n 3 | $b wc -l"
+    echo "DIAG_TIMEOUT_EPIPE=AFTER status=$?"
+    echo "PIPE_STRESS_DONE"
+    exit 0
+fi
+
 i=1
 while [ "$i" -le "$iters" ]; do
   echo "PIPE_STRESS_ITER_${i}_BEGIN"

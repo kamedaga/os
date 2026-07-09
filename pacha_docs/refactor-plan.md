@@ -162,6 +162,8 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - kernel pipe (`state/pipe.zig`) 側の blocking/wakeup/EOF バグはその場で修正 (kernel 編集許可済み)。
 - 受け入れ: 新パイプスモーク全ケース通過 + 既存スモーク 3 本通過。以後このスモークを標準検証セットに加える。
 
+**Phase 3 実行順の改訂 (2026-07-10, ユーザー判断)**: T3.0 のバグ探索は部分修正 3 件 (17bebd0, 94f1cd9) の後で一時停止。残る症状 (16K+ パイプ停止 / grep -q 後のシェル停止 / 実行反復での OOM 劣化 / loader 非決定失敗) はサブシステム横断で「共有状態の腐敗が別々の顔で見えている」パターンであり、未リファクタの LPR 構造 (fd シャドウテーブル分裂、.inc、static 状態) が原因を見えにくくしている。よって **T3.1 → T3.3+T3.4 (構造整理) を先に行い、その上で T3.0 の残バグに戻る**。red のままの pipe-stress / gnu-coreutils スモークは泥の検出器として固定し、リファクタ中は「green は green のまま、red は同一の red のまま」を挙動保存の判定に使う。
+
 **T3.1 syscall dispatch の table 化 + .inc 廃止**
 - 3 つの switch を `{nr, handler}` の単一テーブルに。`lpr_vfs/*.inc` 等の textual include を通常の .c/.h に変換 (build script 更新込み)。
 - 受け入れ: 全スモーク通過。ENOSYS トレース (T0.1 経由) が syscall 名付きで出る。
