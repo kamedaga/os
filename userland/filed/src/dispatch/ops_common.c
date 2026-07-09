@@ -67,6 +67,7 @@ int64_t filed_close_handle_runtime(
         if (flush_status != 0) {
             return flush_status;
         }
+        filed_cache_release_object(runtime, reclaim.backend_object);
     }
     return filed_release_reclaimed_object(runtime, &reclaim);
 }

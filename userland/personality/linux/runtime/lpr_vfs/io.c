@@ -66,7 +66,8 @@ static int64_t lpr_filed_io_chunked(uint32_t op, uint64_t fd, uint64_t buf, uint
 
 static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t offset, uint64_t requested)
 {
-    if (!lpr_fd_shadow_offset_eligible(fd) ||
+    if (lpr_shared_file_mapping_active ||
+        !lpr_fd_shadow_offset_eligible(fd) ||
         requested == 0 ||
         requested > LPR_FILED_PAGE_CACHE_BYTES)
     {

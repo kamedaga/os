@@ -63,8 +63,6 @@ mkdir -p "${build_dir}"
   "${repo_root}/userland/filed/src/tmpfs/meta.c" \
   "${repo_root}/userland/filed/src/tmpfs/node.c" \
   "${repo_root}/userland/filed/src/tmpfs/page.c" \
-  "${repo_root}/userland/libipc/src/ipc.c" \
-  "${repo_root}/userland/libpacha/src/syscall.c" \
   "${repo_root}/userland/filed/tests/cache_consistency_test.c" \
   -o "${build_dir}/cache_consistency_test"
 

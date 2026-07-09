@@ -135,6 +135,84 @@ int64_t lpr_linux_fsync(uint64_t fd)
     return lpr_filed_call(FILED_V2_OP_VFS_FSYNC, -1, lpr_fd_filed_payload(fd)->handle, &ignored);
 }
 
+int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
+{
+    if (!lpr_fd_is_filed(fd)) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if ((int64_t)length < 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    filed_v2_truncate_t *truncate = (filed_v2_truncate_t *)page;
+    lpr_memset(truncate, 0, sizeof(*truncate));
+    truncate->handle = lpr_fd_filed_payload(fd)->handle;
+    truncate->size = length;
+    uint64_t ignored = 0;
+    const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_TRUNCATE, page_fd, 0, &ignored);
+    lpr_destroy_wire_page(page_fd, page);
+    if (status == 0) {
+        lpr_page_cache_clear();
+    }
+    return status;
+}
+
+int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
+{
+    const uint64_t known_flags =
+        LPR_LINUX_MFD_CLOEXEC |
+        LPR_LINUX_MFD_ALLOW_SEALING;
+    if (name_raw == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    if ((flags & ~known_flags) != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    const char *name = (const char *)(uintptr_t)name_raw;
+    const size_t name_length = lpr_strnlen(name, FILED_V2_MEMFD_NAME_BYTES);
+    if (name_length >= FILED_V2_MEMFD_NAME_BYTES) {
+        return -LPR_LINUX_EINVAL;
+    }
+
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    filed_v2_memfd_create_t *memfd = (filed_v2_memfd_create_t *)page;
+    lpr_memset(memfd, 0, sizeof(*memfd));
+    memfd->flags =
+        ((flags & LPR_LINUX_MFD_CLOEXEC) != 0 ? FILED_V2_MEMFD_CLOEXEC : 0) |
+        ((flags & LPR_LINUX_MFD_ALLOW_SEALING) != 0 ? FILED_V2_MEMFD_ALLOW_SEALING : 0);
+    lpr_memcpy(memfd->name, name, name_length);
+    memfd->name[name_length] = '\0';
+
+    uint64_t handle = 0;
+    const int64_t status = lpr_filed_call(
+        FILED_V2_OP_VFS_MEMFD_CREATE,
+        page_fd,
+        0,
+        &handle);
+    lpr_destroy_wire_page(page_fd, page);
+    if (status != 0) {
+        return status;
+    }
+    uint64_t open_flags = LPR_LINUX_O_RDWR;
+    if ((flags & LPR_LINUX_MFD_CLOEXEC) != 0) {
+        open_flags |= LPR_LINUX_O_CLOEXEC;
+    }
+    const int fd = lpr_fd_alloc(handle, open_flags);
+    if (fd < 0) {
+        (void)lpr_filed_close_handle(handle);
+        return fd;
+    }
+    return fd;
+}
+
 int64_t lpr_linux_sync(void)
 {
     uint64_t ignored = 0;

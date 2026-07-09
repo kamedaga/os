@@ -160,6 +160,7 @@
 #define PACHA_FD_RIGHT_BUS_MASTER (1ull << 41)
 #define PACHA_FD_RIGHT_READ (1ull << 42)
 #define PACHA_FD_RIGHT_WRITE (1ull << 43)
+#define PACHA_FD_RIGHT_REVOKE (1ull << 44)
 
 #define PACHA_FD_KIND_PROCESS 1
 #define PACHA_FD_KIND_THREAD 2

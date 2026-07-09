@@ -46,6 +46,8 @@ enum {
     FILED_V2_OP_VFS_SYNC_ALL = 0x021du,
     FILED_V2_OP_VFS_UTIMENS = 0x021eu,
     FILED_V2_OP_VFS_CHMOD = 0x021fu,
+    FILED_V2_OP_VFS_SHARED_FILE_VMO = 0x0220u,
+    FILED_V2_OP_VFS_MEMFD_CREATE = 0x0221u,
 
     FILED_V2_OP_EXEC_PATH = 0x0301u,
     FILED_V2_OP_EXEC_SELF = 0x0302u,
@@ -85,6 +87,13 @@ enum {
     FILED_V2_OPEN_APPEND = 1u << 6,
     FILED_V2_OPEN_NONBLOCK = 1u << 7,
     FILED_V2_OPEN_SYNC = 1u << 8,
+
+    FILED_V2_FILE_VMO_WRITE = 1u << 0,
+    FILED_V2_FILE_VMO_EXEC = 1u << 1,
+
+    FILED_V2_MEMFD_CLOEXEC = 1u << 0,
+    FILED_V2_MEMFD_ALLOW_SEALING = 1u << 1,
+    FILED_V2_MEMFD_NAME_BYTES = 250u,
 };
 
 typedef struct filed_v2_service_endpoint_request {
@@ -125,6 +134,12 @@ typedef struct filed_v2_file_vmo_request {
     uint64_t reserved0;
     uint64_t reserved1;
 } filed_v2_file_vmo_request_t;
+
+typedef struct filed_v2_memfd_create_request {
+    uint64_t flags;
+    uint64_t reserved0;
+    char name[FILED_V2_MEMFD_NAME_BYTES];
+} filed_v2_memfd_create_request_t;
 
 typedef struct filed_v2_exec_request {
     uint64_t dir_handle;

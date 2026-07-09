@@ -115,6 +115,12 @@ typedef struct filed_v2_file_vmo {
     uint64_t reserved1;
 } filed_v2_file_vmo_t;
 
+typedef struct filed_v2_memfd_create {
+    uint64_t flags;
+    uint64_t reserved0;
+    char name[FILED_V2_MEMFD_NAME_BYTES];
+} filed_v2_memfd_create_t;
+
 typedef struct filed_v2_fast_header {
     uint64_t magic;
     uint64_t version;

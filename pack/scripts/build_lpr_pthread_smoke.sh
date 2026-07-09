@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 out_base="${1:-.artifacts/userland-fixtures/lpr_pthread_smoke}"
-src="${repo_root}/userland/fixtures/src/wsl_musl/lpr_pthread_smoke.c"
+src="${2:-${repo_root}/userland/fixtures/src/wsl_musl/lpr_pthread_smoke.c}"
 cc="${PACHAOS_HOST_CLANG:-/usr/bin/clang}"
 mirror="${PACHAOS_ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 branch="${PACHAOS_ALPINE_BRANCH:-v3.18}"
@@ -98,4 +98,4 @@ if readelf -l "${out_abs}.static.elf" | grep -q 'Requesting program interpreter'
 fi
 readelf -l "${out_abs}.dynamic.elf" | grep -q '/lib/ld-musl-x86_64.so.1'
 
-printf 'built static and dynamic LPR pthread smokes at %s.{static,dynamic}.elf\n' "${out_abs}"
+printf 'built static and dynamic LPR musl fixtures at %s.{static,dynamic}.elf\n' "${out_abs}"

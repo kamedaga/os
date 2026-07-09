@@ -818,7 +818,11 @@ lpr_filed_page_cache_entry_t *lpr_page_cache_lookup(
     uint64_t offset,
     uint64_t requested)
 {
-    if (handle == 0 || requested == 0 || requested > LPR_FILED_PAGE_CACHE_BYTES) {
+    if (lpr_shared_file_mapping_active ||
+        handle == 0 ||
+        requested == 0 ||
+        requested > LPR_FILED_PAGE_CACHE_BYTES)
+    {
         return 0;
     }
     const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
@@ -899,6 +903,9 @@ int64_t lpr_filed_v2_payload_size(uint32_t op, uint32_t *out_payload_size)
         return 0;
     case FILED_V2_OP_VFS_CHMOD:
         *out_payload_size = sizeof(filed_v2_chmod_t);
+        return 0;
+    case FILED_V2_OP_VFS_MEMFD_CREATE:
+        *out_payload_size = sizeof(filed_v2_memfd_create_t);
         return 0;
     case FILED_V2_OP_VFS_PREAD:
     case FILED_V2_OP_VFS_READ:

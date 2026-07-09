@@ -35,6 +35,7 @@ typedef struct filed_runtime {
     struct filed_dispatch_state *dispatch_state;
     void *storage_runtime;
     uint64_t request_sequence;
+    uint64_t memfd_sequence;
     uint64_t syncer_ticks;
     uint64_t syncer_flushes;
     uint64_t syncer_errors;

@@ -1,6 +1,12 @@
 #include "../lpr_filed_internal.h"
 
-int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded)
+static int64_t lpr_linux_file_vmo_call(
+    uint32_t op,
+    uint64_t request_flags,
+    uint64_t fd,
+    uint64_t file_offset,
+    uint64_t length,
+    uint64_t *out_loaded)
 {
     if (out_loaded != 0) {
         *out_loaded = 0;
@@ -24,6 +30,7 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, u
     file_vmo->handle = lpr_fd_filed_payload(fd)->handle;
     file_vmo->file_offset = file_offset;
     file_vmo->length = length;
+    file_vmo->flags = request_flags;
 
     struct pacha_ipc_fd request_fd;
     struct pacha_ipc_fd reply_fd_items[1];
@@ -45,7 +52,7 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, u
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
     header->service_id = FILED_V2_SERVICE_ID;
-    header->op = FILED_V2_OP_VFS_FILE_VMO;
+    header->op = op;
     header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
     header->request_id = request_id;
     header->trace_id = request_id;
@@ -83,7 +90,7 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, u
         reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
         reply_header->service_id != FILED_V2_SERVICE_ID ||
-        reply_header->op != FILED_V2_OP_VFS_FILE_VMO ||
+        reply_header->op != op ||
         reply_header->request_id != request_id)
     {
         lpr_destroy_pread_vmo_wire_page(page_fd, page);
@@ -103,6 +110,35 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, u
     }
     lpr_destroy_pread_vmo_wire_page(page_fd, page);
     return (int64_t)reply_fd_items[0].fd;
+}
+
+int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded)
+{
+    return lpr_linux_file_vmo_call(
+        FILED_V2_OP_VFS_FILE_VMO,
+        0,
+        fd,
+        file_offset,
+        length,
+        out_loaded);
+}
+
+int64_t lpr_linux_shared_file_vmo(
+    uint64_t fd,
+    uint64_t file_offset,
+    uint64_t length,
+    int writable,
+    int executable,
+    uint64_t *out_file_size)
+{
+    return lpr_linux_file_vmo_call(
+        FILED_V2_OP_VFS_SHARED_FILE_VMO,
+        (writable ? FILED_V2_FILE_VMO_WRITE : 0) |
+            (executable ? FILED_V2_FILE_VMO_EXEC : 0),
+        fd,
+        file_offset,
+        length,
+        out_file_size);
 }
 
 int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)

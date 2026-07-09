@@ -26,4 +26,5 @@ uint64_t filed_cache_dirty_count(struct filed_runtime *runtime);
 bool filed_cache_object_dirty(struct filed_runtime *runtime, uint64_t backend_object);
 int filed_cache_flush_object(struct filed_runtime *runtime, uint64_t backend_object);
 void filed_cache_invalidate(struct filed_runtime *runtime, uint64_t backend_object);
+void filed_cache_release_object(struct filed_runtime *runtime, uint64_t backend_object);
 void filed_dump_cache_metrics(const struct filed_runtime *runtime);

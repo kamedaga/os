@@ -220,6 +220,10 @@ int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
 }
 
+int pacha_vmo_revoke(int fd) {
+    return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_VMO_REVOKE, (uint64_t)(uint32_t)fd));
+}
+
 void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
     const long result = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, (uint64_t)(uint32_t)fd, 0, size, prot, flags, offset);
     if (result < 4096) return (void *)0;

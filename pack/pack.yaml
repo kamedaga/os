@@ -728,6 +728,16 @@ apps:
     file: "tests/fixtures/lpr_pthread_smoke.sh"
     out: "LPRPTHRD.SH"
     rootfs: "/cmd/lpr_pthread_smoke.sh"
+  lpr_shared_mapping_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_shared_mapping_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_shared_mapping_smoke", "userland/fixtures/src/wsl_musl/lpr_shared_mapping_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_shared_mapping_smoke.c"
+    out: "LPRSHMAP.ELF"
+    rootfs: "/cmd/lpr_shared_mapping.elf"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"

@@ -443,6 +443,10 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
     }
 
     filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(runtime);
+    if (entry == NULL) {
+        (void)pacha_fd_close(vmo_fd);
+        return filed_page_result(-28, 0);
+    }
     memset(entry, 0, sizeof(*entry));
     entry->active = 1;
     entry->vmo_fd = vmo_fd;
@@ -558,6 +562,225 @@ int filed_dispatch_file_vmo_v2(
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
     (void)pacha_fd_close(reply_fd);
     return reply_status;
+}
+
+int filed_dispatch_shared_file_vmo_v2(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request,
+    void *reply_page,
+    const pacha_service_request_header_t *header)
+{
+    if (runtime == NULL || request == NULL || reply_page == NULL || header == NULL ||
+        header->payload_size < sizeof(filed_v2_file_vmo_request_t))
+    {
+        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
+    }
+
+    const filed_v2_file_vmo_request_t *shared_vmo =
+        (const filed_v2_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
+    int64_t reply_status = -22;
+    filed_file_vmo_cache_entry_t *entry = NULL;
+    filed_vfs_io_decision_t decision;
+    filed_vfs_stat_snapshot_t snapshot;
+    memset(&decision, 0, sizeof(decision));
+    memset(&snapshot, 0, sizeof(snapshot));
+
+    const uint64_t known_flags = FILED_V2_FILE_VMO_WRITE | FILED_V2_FILE_VMO_EXEC;
+    const int writable = (shared_vmo->flags & FILED_V2_FILE_VMO_WRITE) != 0;
+    const int executable = (shared_vmo->flags & FILED_V2_FILE_VMO_EXEC) != 0;
+    if (shared_vmo->length != 0 &&
+        (shared_vmo->file_offset & 4095u) == 0 &&
+        shared_vmo->file_offset <= UINT64_MAX - shared_vmo->length &&
+        shared_vmo->reserved0 == 0 &&
+        shared_vmo->reserved1 == 0 &&
+        (shared_vmo->flags & ~known_flags) == 0)
+    {
+        filed_status_t status = filed_vfs_pread_prepare(
+            &runtime->vfs,
+            (filed_handle_id_t)(uint32_t)shared_vmo->handle,
+            shared_vmo->file_offset,
+            shared_vmo->length,
+            &decision);
+        reply_status = filed_status_to_wire(status);
+        if (status == FILED_OK && writable) {
+            filed_vfs_io_decision_t write_decision;
+            memset(&write_decision, 0, sizeof(write_decision));
+            status = filed_vfs_pwrite_prepare(
+                &runtime->vfs,
+                (filed_handle_id_t)(uint32_t)shared_vmo->handle,
+                shared_vmo->file_offset,
+                shared_vmo->length,
+                &write_decision);
+            reply_status = filed_status_to_wire(status);
+            if (status == FILED_OK && write_decision.backend_object != decision.backend_object) {
+                reply_status = -5;
+                status = FILED_ERR_IO;
+            }
+        }
+        if (status == FILED_OK) {
+            status = filed_vfs_get_stat_snapshot(
+                &runtime->vfs,
+                (filed_handle_id_t)(uint32_t)shared_vmo->handle,
+                &snapshot);
+            reply_status = filed_status_to_wire(status);
+        }
+        if (status == FILED_OK && !snapshot.valid) {
+            storage_v2_statx_reply_t backend_stat;
+            memset(&backend_stat, 0, sizeof(backend_stat));
+            reply_status = filed_backend_statx(runtime, decision.backend_object, &backend_stat);
+            if (reply_status == 0) {
+                snapshot = filed_stat_snapshot_from_backend(
+                    &backend_stat,
+                    shared_vmo->handle,
+                    decision.object_generation,
+                    decision.dir_generation);
+                (void)filed_vfs_update_stat_snapshot(
+                    &runtime->vfs,
+                    decision.backend_object,
+                    &snapshot);
+            }
+        }
+        if (status == FILED_OK && reply_status == 0 && snapshot.valid) {
+            reply_status = filed_cache_create_shared_vmo(
+                runtime,
+                decision.backend_object,
+                decision.object_generation,
+                snapshot.size,
+                shared_vmo->file_offset + shared_vmo->length,
+                &entry);
+            if (reply_status == 0 && entry != NULL) {
+                if (writable) {
+                    entry->writable_lent = 1;
+                }
+                filed_runtime_publish_generation(
+                    runtime,
+                    (filed_handle_id_t)(uint32_t)shared_vmo->handle,
+                    decision.object_generation,
+                    decision.dir_generation);
+            }
+        }
+    }
+
+    pacha_service_reply_header_init(
+        (pacha_service_reply_header_t *)reply_page,
+        header,
+        reply_status,
+        PACHA_SERVICE_ERROR_FILED_VFS,
+        reply_status == 0 && entry != NULL ? entry->logical_size : 0,
+        0);
+    uint64_t transfer_rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ;
+    if (writable) {
+        transfer_rights |= PACHA_FD_RIGHT_MAP_WRITE;
+    }
+    if (executable) {
+        transfer_rights |= PACHA_FD_RIGHT_MAP_EXEC;
+    }
+    struct pacha_ipc_fd fd = {
+        .fd = (uint64_t)(uint32_t)(entry != NULL ? entry->vmo_fd : -1),
+        .rights = transfer_rights,
+        .flags = 0,
+        .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
+    };
+    struct pacha_ipc_msg reply = {
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
+        .word1 = (uint64_t)reply_status,
+        .word2 = reply_status == 0 && entry != NULL ? entry->logical_size : 0,
+        .word3 = header->request_id,
+        .fds = reply_status == 0 && entry != NULL && entry->vmo_fd >= 16 ? &fd : NULL,
+        .fd_count = reply_status == 0 && entry != NULL && entry->vmo_fd >= 16 ? 1u : 0u,
+    };
+    const int send_status = pacha_ipc_reply(reply_fd, &reply);
+    (void)pacha_fd_close(reply_fd);
+    return send_status;
+}
+
+filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
+    filed_v2_memfd_create_t *memfd = (filed_v2_memfd_create_t *)page;
+    const uint64_t known_flags =
+        FILED_V2_MEMFD_CLOEXEC |
+        FILED_V2_MEMFD_ALLOW_SEALING;
+    if (runtime == NULL || memfd == NULL || !runtime->tmpfs_root_handle_valid ||
+        memfd->reserved0 != 0 ||
+        (memfd->flags & ~known_flags) != 0 ||
+        memchr(memfd->name, '\0', sizeof(memfd->name)) == NULL)
+    {
+        return filed_page_result(-22, 0);
+    }
+
+    const uint64_t root_object = filed_tmpfs_backend_root_object(&runtime->tmpfs);
+    if (root_object == 0) {
+        return filed_page_result(-5, 0);
+    }
+    char internal_name[FILED_V2_NAME_BYTES];
+    const uint64_t sequence = ++runtime->memfd_sequence;
+    const int name_length = snprintf(
+        internal_name,
+        sizeof(internal_name),
+        ".memfd-%llu",
+        (unsigned long long)sequence);
+    if (name_length <= 0 || (size_t)name_length >= sizeof(internal_name)) {
+        return filed_page_result(-75, 0);
+    }
+
+    uint64_t object_id = 0;
+    int reply_status = filed_tmpfs_backend_create(
+        &runtime->tmpfs,
+        root_object,
+        internal_name,
+        0600,
+        &object_id);
+    if (reply_status != 0) {
+        return filed_page_result(reply_status, 0);
+    }
+
+    filed_vfs_open_result_t opened;
+    memset(&opened, 0, sizeof(opened));
+    const uint32_t open_flags =
+        (memfd->flags & FILED_V2_MEMFD_CLOEXEC) != 0 ? FILED_OPEN_CLOEXEC : 0;
+    filed_status_t status = filed_vfs_create_backend_child(
+        &runtime->vfs,
+        runtime->tmpfs_root_handle_id,
+        object_id,
+        FILED_VNODE_REGULAR,
+        internal_name,
+        FILED_RIGHT_READ | FILED_RIGHT_WRITE | FILED_RIGHT_STAT,
+        open_flags,
+        &opened);
+    if (status != FILED_OK) {
+        (void)filed_tmpfs_backend_unlink(&runtime->tmpfs, root_object, internal_name);
+        (void)filed_tmpfs_backend_release_object(&runtime->tmpfs, object_id);
+        return filed_page_result(filed_status_to_wire(status), 0);
+    }
+
+    storage_v2_statx_reply_t backend_stat;
+    memset(&backend_stat, 0, sizeof(backend_stat));
+    reply_status = filed_tmpfs_backend_statx(&runtime->tmpfs, object_id, &backend_stat);
+    if (reply_status == 0) {
+        const filed_vfs_stat_snapshot_t snapshot = filed_stat_snapshot_from_backend(
+            &backend_stat,
+            opened.handle_id,
+            opened.object_generation,
+            opened.dir_generation);
+        (void)filed_vfs_update_stat_snapshot(&runtime->vfs, object_id, &snapshot);
+        reply_status = filed_tmpfs_backend_unlink(&runtime->tmpfs, root_object, internal_name);
+    }
+    if (reply_status == 0) {
+        status = filed_vfs_unlink_commit(
+            &runtime->vfs,
+            runtime->tmpfs_root_handle_id,
+            internal_name);
+        reply_status = filed_status_to_wire(status);
+    }
+    filed_cache_invalidate(runtime, root_object);
+    if (reply_status != 0) {
+        (void)filed_close_handle_runtime(runtime, opened.handle_id);
+        return filed_page_result(reply_status, 0);
+    }
+    return filed_page_result(0, opened.handle_id);
 }
 
 filed_page_dispatch_result_t filed_dispatch_read_page(

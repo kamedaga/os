@@ -81,6 +81,8 @@ const char *filed_op_name(uint64_t op)
     case FILED_V2_OP_VFS_WRITE_BATCH: return "write_batch";
     case FILED_V2_OP_VFS_PREAD_TO_VMO: return "pread_to_vmo";
     case FILED_V2_OP_VFS_FILE_VMO: return "file_vmo";
+    case FILED_V2_OP_VFS_SHARED_FILE_VMO: return "shared_file_vmo";
+    case FILED_V2_OP_VFS_MEMFD_CREATE: return "memfd_create";
     case FILED_V2_OP_VFS_SYNC_ALL: return "sync_all";
     case FILED_V2_OP_EXEC_SELF: return "exec_self";
     case FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR:

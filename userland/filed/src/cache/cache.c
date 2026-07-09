@@ -2,6 +2,7 @@
 #include "internal.h"
 
 static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object);
+static void filed_file_vmo_cache_release_object(filed_runtime_t *runtime, uint64_t backend_object);
 
 static uint64_t filed_cache_next_object_clock(filed_runtime_t *runtime)
 {
@@ -113,10 +114,15 @@ static filed_page_cache_slot_t *filed_page_cache_find(
 bool filed_cache_object_dirty(filed_runtime_t *runtime, uint64_t backend_object)
 {
     filed_page_cache_ensure_configured(runtime);
-    if (filed_backend_object_is_tmpfs(backend_object)) {
+    if (backend_object == 0) {
         return false;
     }
-    if (backend_object == 0 || filed_page_cache.active_slots == 0) {
+    filed_file_vmo_cache_entry_t *shared =
+        filed_file_vmo_cache_shared_lookup(runtime, backend_object);
+    if (shared != NULL && (shared->dirty || shared->writable_lent)) {
+        return true;
+    }
+    if (filed_backend_object_is_tmpfs(backend_object) || filed_page_cache.active_slots == 0) {
         return false;
     }
     for (size_t i = 0; i < filed_page_cache.active_slots; ++i) {
@@ -135,6 +141,12 @@ uint64_t filed_cache_dirty_count(filed_runtime_t *runtime)
     for (size_t i = 0; i < filed_page_cache.active_slots; ++i) {
         const filed_page_cache_slot_t *slot = &filed_page_cache.slots[i];
         if (slot->valid && slot->dirty) {
+            count++;
+        }
+    }
+    for (size_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (entry->active && entry->shared && (entry->dirty || entry->writable_lent)) {
             count++;
         }
     }
@@ -183,9 +195,54 @@ static int filed_page_cache_flush_slot(
     return 0;
 }
 
+static int filed_shared_vmo_flush_entry(
+    filed_runtime_t *runtime,
+    filed_file_vmo_cache_entry_t *entry)
+{
+    if (entry == NULL || !entry->active || !entry->shared || entry->mapped == NULL ||
+        (!entry->dirty && !entry->writable_lent))
+    {
+        return 0;
+    }
+    uint64_t offset = 0;
+    while (offset < entry->logical_size) {
+        uint64_t chunk = entry->logical_size - offset;
+        if (chunk > STORAGE_V2_IO_BYTES) {
+            chunk = STORAGE_V2_IO_BYTES;
+        }
+        uint64_t bytes = 0;
+        const int status = filed_backend_pwrite(
+            runtime,
+            entry->backend_object,
+            offset,
+            (const uint8_t *)entry->mapped + offset,
+            chunk,
+            &bytes);
+        if (status != 0 || bytes != chunk) {
+            filed_page_cache.flush_errors++;
+            return status != 0 ? status : -5;
+        }
+        offset += bytes;
+    }
+    entry->dirty = 0;
+    filed_page_cache.flushes++;
+    return 0;
+}
+
 int filed_cache_flush_object(filed_runtime_t *runtime, uint64_t backend_object)
 {
     filed_page_cache_ensure_configured(runtime);
+    for (size_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (entry->active && entry->shared &&
+            (backend_object == 0 || entry->backend_object == backend_object))
+        {
+            const int status = filed_shared_vmo_flush_entry(runtime, entry);
+            if (status != 0) {
+                return status;
+            }
+        }
+    }
     if (filed_backend_object_is_tmpfs(backend_object)) {
         return 0;
     }
@@ -467,6 +524,21 @@ int filed_cached_pread(
     if (length == 0) {
         return 0;
     }
+    filed_file_vmo_cache_entry_t *shared =
+        filed_file_vmo_cache_shared_lookup(runtime, backend_object);
+    if (shared != NULL && shared->mapped != NULL) {
+        if (offset >= shared->logical_size) {
+            return 0;
+        }
+        uint64_t available = shared->logical_size - offset;
+        if (length > available) {
+            length = available;
+        }
+        memcpy(buffer, (const uint8_t *)shared->mapped + offset, (size_t)length);
+        shared->clock = ++filed_file_vmo_cache.clock;
+        *out_bytes = length;
+        return 0;
+    }
     if (filed_backend_object_is_tmpfs(backend_object)) {
         filed_page_cache.direct_reads++;
         return filed_backend_pread(
@@ -603,6 +675,25 @@ int filed_cached_pwrite_ex(
     }
     if (offset + length < offset) {
         return -75;
+    }
+    filed_file_vmo_cache_entry_t *shared =
+        filed_file_vmo_cache_shared_lookup(runtime, backend_object);
+    if (shared != NULL && shared->mapped != NULL) {
+        if (offset + length <= shared->length) {
+            memcpy((uint8_t *)shared->mapped + offset, buffer, (size_t)length);
+            if (offset + length > shared->logical_size) {
+                shared->logical_size = offset + length;
+            }
+            shared->dirty = 1;
+            shared->clock = ++filed_file_vmo_cache.clock;
+            *out_bytes = length;
+            return 0;
+        }
+        int status = filed_shared_vmo_flush_entry(runtime, shared);
+        if (status != 0) {
+            return status;
+        }
+        filed_file_vmo_cache_invalidate_object(runtime, backend_object);
     }
     if (filed_backend_object_is_tmpfs(backend_object)) {
         return filed_backend_pwrite(
@@ -920,13 +1011,27 @@ void filed_negative_lookup_cache_store(
     filed_cache_note_attachment(runtime, parent_backend_object, FILED_CACHE_ATTACHMENT_NEGATIVE);
 }
 
-static void filed_file_vmo_cache_clear_entry(filed_file_vmo_cache_entry_t *entry)
+static void filed_file_vmo_cache_clear_entry(
+    filed_file_vmo_cache_entry_t *entry,
+    bool revoke_shared)
 {
     if (entry == NULL || !entry->active) {
         return;
     }
-    if (entry->vmo_fd >= 16) {
-        (void)pacha_fd_close(entry->vmo_fd);
+    if (entry->shared && revoke_shared && entry->vmo_fd >= 16) {
+        if (pacha_vmo_revoke(entry->vmo_fd) != 0) {
+            if (entry->mapped != NULL) {
+                (void)pacha_munmap(entry->mapped, entry->length);
+            }
+            (void)pacha_fd_close(entry->vmo_fd);
+        }
+    } else {
+        if (entry->mapped != NULL && entry->vmo_fd >= 16) {
+            (void)pacha_munmap(entry->mapped, entry->length);
+        }
+        if (entry->vmo_fd >= 16) {
+            (void)pacha_fd_close(entry->vmo_fd);
+        }
     }
     memset(entry, 0, sizeof(*entry));
     entry->vmo_fd = -1;
@@ -940,7 +1045,20 @@ static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uin
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
         if (entry->active && entry->backend_object == backend_object) {
-            filed_file_vmo_cache_clear_entry(entry);
+            filed_file_vmo_cache_clear_entry(entry, entry->shared != 0);
+        }
+    }
+}
+
+static void filed_file_vmo_cache_release_object(filed_runtime_t *runtime, uint64_t backend_object)
+{
+    if (runtime == NULL || backend_object == 0) {
+        return;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (entry->active && entry->backend_object == backend_object) {
+            filed_file_vmo_cache_clear_entry(entry, false);
         }
     }
 }
@@ -957,7 +1075,7 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_lookup(
     }
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
-        if (entry->active &&
+        if (entry->active && !entry->shared &&
             entry->backend_object == backend_object &&
             entry->object_generation == object_generation &&
             entry->file_offset == file_offset &&
@@ -974,21 +1092,155 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_lookup(
 
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime)
 {
-    uint64_t slot = 0;
+    filed_file_vmo_cache_entry_t *oldest_entry = NULL;
     uint64_t oldest = UINT64_MAX;
+    (void)runtime;
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
         if (!entry->active) {
             return entry;
         }
-        if (entry->clock < oldest) {
+        if (!entry->shared && entry->clock < oldest) {
             oldest = entry->clock;
-            slot = i;
+            oldest_entry = entry;
         }
     }
+    if (oldest_entry == NULL) {
+        return NULL;
+    }
     filed_file_vmo_cache_evictions++;
-    filed_file_vmo_cache_clear_entry(&filed_file_vmo_cache.entries[slot]);
-    return &filed_file_vmo_cache.entries[slot];
+    filed_file_vmo_cache_clear_entry(oldest_entry, false);
+    return oldest_entry;
+}
+
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_shared_lookup(
+    filed_runtime_t *runtime,
+    uint64_t backend_object)
+{
+    if (runtime == NULL || backend_object == 0) {
+        return NULL;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (entry->active && entry->shared && entry->backend_object == backend_object) {
+            entry->clock = ++filed_file_vmo_cache.clock;
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+int filed_cache_create_shared_vmo(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint64_t object_generation,
+    uint64_t logical_size,
+    uint64_t required_end,
+    filed_file_vmo_cache_entry_t **out_entry)
+{
+    if (runtime == NULL || backend_object == 0 || out_entry == NULL || required_end == 0)
+    {
+        return -22;
+    }
+    *out_entry = NULL;
+    uint64_t capacity = logical_size > required_end ? logical_size : required_end;
+    if (capacity > UINT64_MAX - 4095u) {
+        return -75;
+    }
+    capacity = (capacity + 4095u) & ~4095ull;
+    if (capacity == 0) {
+        return -27;
+    }
+
+    filed_file_vmo_cache_entry_t *existing =
+        filed_file_vmo_cache_shared_lookup(runtime, backend_object);
+    if (existing != NULL) {
+        if (existing->length >= capacity) {
+            if (logical_size > existing->logical_size) {
+                existing->logical_size = logical_size;
+            }
+            *out_entry = existing;
+            return 0;
+        }
+        const int flush_status = filed_shared_vmo_flush_entry(runtime, existing);
+        if (flush_status != 0) {
+            return flush_status;
+        }
+        filed_file_vmo_cache_clear_entry(existing, true);
+    }
+
+    int status = filed_cache_flush_object(runtime, backend_object);
+    if (status != 0) {
+        return status;
+    }
+    const uint64_t rights =
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE |
+        PACHA_FD_RIGHT_MAP_EXEC |
+        PACHA_FD_RIGHT_REVOKE;
+    const int vmo_fd = pacha_vmo_create(capacity, rights, 0);
+    if (vmo_fd < 16) {
+        return -12;
+    }
+    void *mapped = pacha_mmap(
+        vmo_fd,
+        capacity,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (mapped == NULL) {
+        (void)pacha_fd_close(vmo_fd);
+        return -12;
+    }
+
+    uint64_t loaded = 0;
+    while (loaded < logical_size) {
+        uint64_t chunk = logical_size - loaded;
+        if (chunk > STORAGE_V2_IO_BYTES) {
+            chunk = STORAGE_V2_IO_BYTES;
+        }
+        uint64_t bytes = 0;
+        status = filed_backend_pread(
+            runtime,
+            backend_object,
+            loaded,
+            (uint8_t *)mapped + loaded,
+            chunk,
+            &bytes);
+        if (status != 0) {
+            (void)pacha_munmap(mapped, capacity);
+            (void)pacha_fd_close(vmo_fd);
+            return status;
+        }
+        if (bytes == 0) {
+            break;
+        }
+        loaded += bytes;
+    }
+
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(runtime);
+    if (entry == NULL) {
+        (void)pacha_munmap(mapped, capacity);
+        (void)pacha_fd_close(vmo_fd);
+        return -28;
+    }
+    filed_page_cache_invalidate_object(runtime, backend_object);
+    memset(entry, 0, sizeof(*entry));
+    entry->active = 1;
+    entry->shared = 1;
+    entry->vmo_fd = vmo_fd;
+    entry->backend_object = backend_object;
+    entry->object_generation = object_generation;
+    entry->length = capacity;
+    entry->logical_size = logical_size;
+    entry->clock = ++filed_file_vmo_cache.clock;
+    entry->mapped = mapped;
+    filed_cache_note_attachment(runtime, backend_object, FILED_CACHE_ATTACHMENT_VMO);
+    filed_file_vmo_cache_stores++;
+    *out_entry = entry;
+    return 0;
 }
 
 void filed_cache_invalidate(filed_runtime_t *runtime, uint64_t backend_object)
@@ -1005,6 +1257,22 @@ void filed_cache_invalidate(filed_runtime_t *runtime, uint64_t backend_object)
         }
     }
     filed_file_vmo_cache_invalidate_object(runtime, backend_object);
+    for (size_t i = 0; i < FILED_CACHE_OBJECT_SLOTS; ++i) {
+        filed_cache_object_entry_t *entry = &filed_cache.objects[i];
+        if (entry->valid && entry->backend_object == backend_object) {
+            memset(entry, 0, sizeof(*entry));
+            return;
+        }
+    }
+}
+
+void filed_cache_release_object(filed_runtime_t *runtime, uint64_t backend_object)
+{
+    if (runtime == NULL || backend_object == 0) {
+        return;
+    }
+    filed_page_cache_invalidate_object(runtime, backend_object);
+    filed_file_vmo_cache_release_object(runtime, backend_object);
     for (size_t i = 0; i < FILED_CACHE_OBJECT_SLOTS; ++i) {
         filed_cache_object_entry_t *entry = &filed_cache.objects[i];
         if (entry->valid && entry->backend_object == backend_object) {

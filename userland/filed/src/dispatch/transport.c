@@ -43,6 +43,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_write_page(runtime, page);
     case FILED_V2_OP_VFS_TRUNCATE:
         return filed_dispatch_truncate_page(runtime, page);
+    case FILED_V2_OP_VFS_MEMFD_CREATE:
+        return filed_dispatch_memfd_create_page(runtime, page);
     case FILED_V2_OP_VFS_UNLINK:
         return filed_dispatch_unlink_page(runtime, page);
     case FILED_V2_OP_VFS_RENAME:
@@ -674,8 +676,29 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
+    case FILED_V2_OP_VFS_MEMFD_CREATE:
+        if (header->payload_size < sizeof(filed_v2_memfd_create_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_memfd_create_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
     case FILED_V2_OP_VFS_FILE_VMO: {
         const int reply_status = filed_dispatch_file_vmo_v2(
+            runtime,
+            reply_fd,
+            request,
+            page,
+            header);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        filed_close_received_fds_except(request, reply_fd, -1);
+        return filed_v2_route_replied(reply_status);
+    }
+    case FILED_V2_OP_VFS_SHARED_FILE_VMO: {
+        const int reply_status = filed_dispatch_shared_file_vmo_v2(
             runtime,
             reply_fd,
             request,
@@ -834,6 +857,8 @@ static int filed_dispatch_client_v2(
     case FILED_V2_OP_VFS_UTIMENS:
     case FILED_V2_OP_VFS_CHMOD:
     case FILED_V2_OP_VFS_FILE_VMO:
+    case FILED_V2_OP_VFS_SHARED_FILE_VMO:
+    case FILED_V2_OP_VFS_MEMFD_CREATE:
     case FILED_V2_OP_VFS_PREAD_TO_VMO:
     case FILED_V2_OP_VFS_SYNC_ALL: {
         const filed_v2_route_result_t route = filed_dispatch_client_vfs_v2(

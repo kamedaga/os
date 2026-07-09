@@ -39,6 +39,8 @@
 #define LPR_LINUX_O_DIRECTORY 00200000ull
 #define LPR_LINUX_O_NOFOLLOW 00400000ull
 #define LPR_LINUX_O_CLOEXEC 02000000ull
+#define LPR_LINUX_MFD_CLOEXEC 0x0001ull
+#define LPR_LINUX_MFD_ALLOW_SEALING 0x0002ull
 #define LPR_LINUX_CLOSE_RANGE_UNSHARE (1ull << 1u)
 #define LPR_LINUX_CLOSE_RANGE_CLOEXEC (1ull << 2u)
 #define LPR_LINUX_F_DUPFD 0ull
@@ -365,6 +367,7 @@ typedef struct lpr_cache_state {
     uint64_t readv_bytes;
     lpr_file_map_cache_entry_t file_map[LPR_FILE_MAP_CACHE_ENTRIES];
     uint64_t file_map_clock;
+    uint32_t shared_file_mapping_active;
 } lpr_cache_state_t;
 
 typedef struct lpr_memory_state {
@@ -428,6 +431,7 @@ extern lpr_state_t lpr_state;
 #define lpr_readv_cache_bytes (lpr_state.caches.readv_bytes)
 #define lpr_file_map_cache (lpr_state.caches.file_map)
 #define lpr_file_map_cache_clock (lpr_state.caches.file_map_clock)
+#define lpr_shared_file_mapping_active (lpr_state.caches.shared_file_mapping_active)
 #define lpr_request_id (lpr_state.filed_rpc.request_id)
 #define lpr_filed_endpoint_checked (lpr_state.filed_rpc.endpoint_checked)
 #define lpr_wire_page_fd (lpr_state.filed_rpc.wire_page_fd)
@@ -685,10 +689,12 @@ int64_t lpr_linux_fchmodat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uin
 int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64_t group, uint64_t flags);
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
 int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded);
+int64_t lpr_linux_shared_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int writable, int executable, uint64_t *out_file_size);
 int64_t lpr_linux_flock(uint64_t fd, uint64_t operation);
 int64_t lpr_linux_fork(void);
 int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf);
 int64_t lpr_linux_fsync(uint64_t fd);
+int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length);
 int64_t lpr_linux_getcwd(uint64_t buf, uint64_t size);
 int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_linux_getpgid(uint64_t pid_raw);
@@ -702,6 +708,7 @@ int64_t lpr_linux_kill(uint64_t pid_raw, uint64_t sig_raw);
 int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new_dirfd, uint64_t new_path_raw, uint64_t flags);
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 int64_t lpr_linux_mkdirat(uint64_t dirfd, uint64_t path_raw, uint64_t mode);
+int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags);
 int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t dev);
 int64_t lpr_linux_nanosleep(uint64_t req_raw, uint64_t rem_raw);
 int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf, uint64_t flags);

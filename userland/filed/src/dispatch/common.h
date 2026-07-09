@@ -139,6 +139,8 @@ filed_page_dispatch_result_t filed_dispatch_chmod_page(filed_runtime_t *runtime,
 filed_page_dispatch_result_t filed_dispatch_pread_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(filed_runtime_t *runtime, void *page, int vmo_fd);
 int filed_dispatch_file_vmo_v2(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_request_header_t *header);
+int filed_dispatch_shared_file_vmo_v2(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_request_header_t *header);
+filed_page_dispatch_result_t filed_dispatch_memfd_create_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_read_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pwrite_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_write_page(filed_runtime_t *runtime, void *page);

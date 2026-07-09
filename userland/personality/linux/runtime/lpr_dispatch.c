@@ -22,6 +22,9 @@
 #define LPR_LINUX_MAP_ANONYMOUS 0x20ull
 #define LPR_LINUX_MAP_NORESERVE 0x4000ull
 #define LPR_LINUX_MAP_FIXED_NOREPLACE 0x100000ull
+#define LPR_LINUX_MS_ASYNC 0x1ull
+#define LPR_LINUX_MS_INVALIDATE 0x2ull
+#define LPR_LINUX_MS_SYNC 0x4ull
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status);
 static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
 
@@ -196,6 +199,7 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_MMAP },
     { .nr = LPR_LINUX_SYS_MPROTECT },
     { .nr = LPR_LINUX_SYS_MUNMAP },
+    { .nr = LPR_LINUX_SYS_MSYNC },
     { .nr = LPR_LINUX_SYS_BRK },
     { .nr = LPR_LINUX_SYS_IOCTL },
     { .nr = LPR_LINUX_SYS_PREAD64 },
@@ -216,6 +220,7 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_PSELECT6 },
     { .nr = LPR_LINUX_SYS_FSYNC },
     { .nr = LPR_LINUX_SYS_FDATASYNC },
+    { .nr = LPR_LINUX_SYS_FTRUNCATE },
     { .nr = LPR_LINUX_SYS_SYNC },
     { .nr = LPR_LINUX_SYS_GETCWD },
     { .nr = LPR_LINUX_SYS_CHDIR },
@@ -561,15 +566,64 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
         return -LPR_LINUX_EINVAL;
     }
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_filed_fd_active(fd)) {
-        if ((flags & LPR_LINUX_MAP_SHARED) != 0) {
-            return -LPR_LINUX_ENOTSUP;
-        }
         if ((offset & 4095ull) != 0) {
             return -LPR_LINUX_EINVAL;
         }
         const uint64_t map_len = lpr_mmap_page_align_up(len);
         if (map_len == 0) {
             return -LPR_LINUX_ENOMEM;
+        }
+        if ((flags & LPR_LINUX_MAP_SHARED) != 0) {
+            uint64_t file_size = 0;
+            const int writable = (prot & LPR_LINUX_PROT_WRITE) != 0;
+            const int executable = (prot & LPR_LINUX_PROT_EXEC) != 0;
+            const int64_t shared_vmo_fd = lpr_linux_shared_file_vmo(
+                fd,
+                offset,
+                map_len,
+                writable,
+                executable,
+                &file_size);
+            (void)file_size;
+            if (shared_vmo_fd < 16) {
+                lpr_trace_mmap_error(
+                    "shared_file_vmo",
+                    addr,
+                    len,
+                    prot,
+                    flags,
+                    fd,
+                    offset,
+                    shared_vmo_fd);
+                return shared_vmo_fd;
+            }
+            const int64_t mapped = lpr_pacha_syscall6(
+                PACHAOS_SYSCALL_MMAP,
+                (uint64_t)(uint32_t)shared_vmo_fd,
+                addr,
+                map_len,
+                lpr_linux_prot_to_pacha(prot),
+                pacha_flags,
+                offset);
+            (void)lpr_pacha_syscall1(
+                PACHAOS_SYSCALL_FD_CLOSE,
+                (uint64_t)(uint32_t)shared_vmo_fd);
+            if (mapped < 4096) {
+                lpr_trace_mmap_error(
+                    "shared_mmap",
+                    addr,
+                    len,
+                    prot,
+                    flags,
+                    fd,
+                    offset,
+                    mapped);
+                return lpr_linux_pacha_status_to_errno(mapped);
+            }
+            lpr_page_cache_clear();
+            lpr_shared_file_mapping_active = 1;
+            lpr_trace_mmap_call("mmap", addr, len, prot, flags, fd, offset, mapped);
+            return mapped;
         }
         const uint64_t load_prot =
             PACHAOS_PROT_READ |
@@ -786,6 +840,22 @@ file_mapping_ready:
     return result;
 }
 
+static int64_t lpr_dispatch_msync(uint64_t addr, uint64_t len, uint64_t flags)
+{
+    const uint64_t known_flags =
+        LPR_LINUX_MS_ASYNC |
+        LPR_LINUX_MS_INVALIDATE |
+        LPR_LINUX_MS_SYNC;
+    if ((addr & 4095u) != 0 ||
+        (flags & ~known_flags) != 0 ||
+        ((flags & LPR_LINUX_MS_ASYNC) != 0 && (flags & LPR_LINUX_MS_SYNC) != 0))
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    (void)len;
+    return lpr_linux_sync();
+}
+
 typedef int64_t (*lpr_syscall_handler_t)(
     uint64_t a0,
     uint64_t a1,
@@ -814,6 +884,7 @@ static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_dispatch_mmap(a0, a1, a2, a3, a4, a5); }
 static int64_t lpr_sys_mprotect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT, a0, a1, lpr_linux_prot_to_pacha(a2))); }
 static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; const int64_t result = lpr_linux_pacha_status_to_errno(lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, a0, a1)); lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result); return result; }
+static int64_t lpr_sys_msync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_msync(a0, a1, a2); }
 static int64_t lpr_sys_brk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_brk(a0); }
 static int64_t lpr_sys_rt_sigaction(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigaction(a0, a1, a2, a3); }
 static int64_t lpr_sys_rt_sigprocmask(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigprocmask(a0, a1, a2, a3); }
@@ -852,6 +923,7 @@ static int64_t lpr_sys_kill(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 static int64_t lpr_sys_uname(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_uname(a0); }
 static int64_t lpr_sys_fstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_socket_fd_active(a0) ? lpr_linux_socket_fstat(a0, a1) : lpr_linux_fstat(a0, a1); }
 static int64_t lpr_sys_fsync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fsync(a0); }
+static int64_t lpr_sys_ftruncate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_ftruncate(a0, a1); }
 static int64_t lpr_sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sync(); }
 static int64_t lpr_sys_getcwd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getcwd(a0, a1); }
 static int64_t lpr_sys_chdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_chdir(a0); }
@@ -963,6 +1035,7 @@ static int64_t lpr_sys_recvmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
 static int64_t lpr_sys_prlimit64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_prlimit64(a0, a1, a2, a3); }
 static int64_t lpr_sys_sendmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_sendmmsg(a0, a1, a2, a3); }
 static int64_t lpr_sys_getrandom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_pacha_syscall3(PACHAOS_SYSCALL_GETRANDOM, a0, a1, a2); }
+static int64_t lpr_sys_memfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_memfd_create(a0, a1); }
 static int64_t lpr_sys_fcntl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket_fd_active(a0) ? lpr_linux_socket_fcntl(a0, a1, a2) : lpr_linux_fcntl(a0, a1, a2); }
 static int64_t lpr_sys_flock(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_flock(a0, a1); }
 static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_poll(a0, a1, a2); }
@@ -984,6 +1057,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_MMAP, "mmap", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_mmap, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MPROTECT, "mprotect", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_mprotect, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MUNMAP, "munmap", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_munmap, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_MSYNC, "msync", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_msync, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_BRK, "brk", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_brk, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RT_SIGACTION, "rt_sigaction", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_rt_sigaction, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RT_SIGPROCMASK, "rt_sigprocmask", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_rt_sigprocmask, 0),
@@ -1025,6 +1099,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_FLOCK, "flock", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_flock, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FSYNC, "fsync", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fsync, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FDATASYNC, "fdatasync", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fsync, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FTRUNCATE, "ftruncate", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_ftruncate, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETCWD, "getcwd", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getcwd, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_CHDIR, "chdir", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_chdir, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FCHDIR, "fchdir", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fchdir, 0),
@@ -1089,6 +1164,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_PRLIMIT64, "prlimit64", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_prlimit64, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SENDMMSG, "sendmmsg", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_sendmmsg, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_GETRANDOM, "getrandom", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_getrandom, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_MEMFD_CREATE, "memfd_create", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_memfd_create, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOSE_RANGE, "close_range", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_close_range, LPR_SYSCALL_TRACE),
 };
 
@@ -1112,6 +1188,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_MMAP].handler = lpr_sys_mmap;
     lpr_syscall_table[LPR_LINUX_SYS_MPROTECT].handler = lpr_sys_mprotect;
     lpr_syscall_table[LPR_LINUX_SYS_MUNMAP].handler = lpr_sys_munmap;
+    lpr_syscall_table[LPR_LINUX_SYS_MSYNC].handler = lpr_sys_msync;
     lpr_syscall_table[LPR_LINUX_SYS_BRK].handler = lpr_sys_brk;
     lpr_syscall_table[LPR_LINUX_SYS_RT_SIGACTION].handler = lpr_sys_rt_sigaction;
     lpr_syscall_table[LPR_LINUX_SYS_RT_SIGPROCMASK].handler = lpr_sys_rt_sigprocmask;
@@ -1153,6 +1230,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_FLOCK].handler = lpr_sys_flock;
     lpr_syscall_table[LPR_LINUX_SYS_FSYNC].handler = lpr_sys_fsync;
     lpr_syscall_table[LPR_LINUX_SYS_FDATASYNC].handler = lpr_sys_fsync;
+    lpr_syscall_table[LPR_LINUX_SYS_FTRUNCATE].handler = lpr_sys_ftruncate;
     lpr_syscall_table[LPR_LINUX_SYS_GETCWD].handler = lpr_sys_getcwd;
     lpr_syscall_table[LPR_LINUX_SYS_CHDIR].handler = lpr_sys_chdir;
     lpr_syscall_table[LPR_LINUX_SYS_FCHDIR].handler = lpr_sys_fchdir;
@@ -1217,6 +1295,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_PRLIMIT64].handler = lpr_sys_prlimit64;
     lpr_syscall_table[LPR_LINUX_SYS_SENDMMSG].handler = lpr_sys_sendmmsg;
     lpr_syscall_table[LPR_LINUX_SYS_GETRANDOM].handler = lpr_sys_getrandom;
+    lpr_syscall_table[LPR_LINUX_SYS_MEMFD_CREATE].handler = lpr_sys_memfd_create;
     lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE].handler = lpr_sys_close_range;
     lpr_syscall_table_initialized = 1;
 }
