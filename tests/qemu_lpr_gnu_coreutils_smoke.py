@@ -26,7 +26,7 @@ class Console:
     def _remaining(self, per_call: float | None = None) -> float:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("qemu coreutils mini smoke timed out")
+            raise TimeoutError("qemu GNU coreutils smoke timed out")
         return remaining if per_call is None else min(remaining, per_call)
 
     def _record(self, chunk: bytes) -> None:
@@ -65,7 +65,7 @@ class Console:
         return bytes(self.output[-size:]).decode("utf-8", errors="replace")
 
     def run(self, name: str, line: str, expects: list[bytes]) -> None:
-        print(f"\n[qemu-lpr-coreutils-mini-smoke] run: {name}", flush=True)
+        print(f"\n[qemu-lpr-gnu-coreutils-smoke] run: {name}", flush=True)
         self.read_available()
         self.output.clear()
         self.sock.sendall(line.encode("utf-8") + b"\n")
@@ -82,28 +82,28 @@ def main() -> int:
     )
     try:
         console.wait_for(PROMPT, "initial prompt", per_call_timeout=10.0)
-        console.run("coreutils list", "/bin/coreutils", [b"coreutils-mini commands:\r\n", b"cat coreutils echo", b" sleep sync tail"])
-        console.run("coreutils version", "/bin/coreutils --version", [b"\r\ncoreutils-mini (PachaOS)\r\n"])
-        console.run("echo cat pipe", "/bin/echo mini | /bin/cat", [b"\r\nmini\r\n"])
-        console.run("printf wc pipe", "/bin/printf abc | /bin/wc -c", [b"\r\n3\r\n"])
-        console.run("head", "/bin/printf 'a\\nb\\nc\\n' | /bin/head -n 2", [b"\r\na\r\nb\r\n"])
-        console.run("tail", "/bin/printf 'a\\nb\\nc\\n' | /bin/tail -n 2", [b"\r\nb\r\nc\r\n"])
-        console.run("grep", "/bin/printf 'aa\\nbb\\n' | /bin/grep bb", [b"\r\nbb\r\n"])
-        console.run("yes head wc", "/bin/yes y | /bin/head -n 3 | /bin/wc -l", [b"\r\n3\r\n"])
-        console.run("redirection cat", "/bin/printf redir >/tmp/coremini-f; /bin/cat </tmp/coremini-f", [b"\r\nredir"])
-        console.run("ls sees file", "/bin/ls /tmp | /bin/grep coremini-f", [b"\r\ncoremini-f\r\n"])
+        console.run("coreutils version", "/bin/coreutils --version", [b"GNU coreutils"])
+        console.run("ls version", "/bin/ls --version", [b"GNU coreutils"])
+        console.run("echo cat pipe", "/bin/echo gnu | /bin/cat", [b"\r\ngnu\r\n"])
+        console.run("printf wc pipe", "/usr/bin/printf abc | /usr/bin/wc -c", [b"\r\n3\r\n"])
+        console.run("head", "/usr/bin/printf 'a\\nb\\nc\\n' | /usr/bin/head -n 2", [b"\r\na\r\nb\r\n"])
+        console.run("tail", "/usr/bin/printf 'a\\nb\\nc\\n' | /usr/bin/tail -n 2", [b"\r\nb\r\nc\r\n"])
+        console.run("busybox grep pipe", "/usr/bin/printf 'aa\\nbb\\n' | /cmd/busybox grep bb", [b"\r\nbb\r\n"])
+        console.run("yes head wc", "/usr/bin/yes y | /usr/bin/head -n 3 | /usr/bin/wc -l", [b"\r\n3\r\n"])
+        console.run("redirection cat", "/usr/bin/printf redir >/tmp/coreutils-f; /bin/cat </tmp/coreutils-f", [b"\r\nredir"])
+        console.run("ls sees file", "/bin/ls /tmp | /cmd/busybox grep coreutils-f", [b"\r\ncoreutils-f\r\n"])
         console.run("busybox ls missing path", "busybox ls /nonexistent 2>&1 || /bin/true", [b"No such file or directory"])
-        console.run("test true", "/bin/test -e /tmp/coremini-f && /bin/true && /bin/echo true-ok", [b"\r\ntrue-ok\r\n"])
+        console.run("test true", "/usr/bin/test -e /tmp/coreutils-f && /bin/true && /bin/echo true-ok", [b"\r\ntrue-ok\r\n"])
         console.run("false", "/bin/false || /bin/echo false-ok", [b"\r\nfalse-ok\r\n"])
-        console.run("mkdir", "/bin/mkdir /tmp/coremini-d && /bin/echo mkdir-ok", [b"\r\nmkdir-ok\r\n"])
-        console.run("touch", "/bin/touch /tmp/coremini-d/x && /bin/test -f /tmp/coremini-d/x && /bin/echo touch-ok", [b"\r\ntouch-ok\r\n"])
+        console.run("mkdir", "/bin/mkdir /tmp/coreutils-d && /bin/echo mkdir-ok", [b"\r\nmkdir-ok\r\n"])
+        console.run("touch", "/bin/touch /tmp/coreutils-d/x && /usr/bin/test -f /tmp/coreutils-d/x && /bin/echo touch-ok", [b"\r\ntouch-ok\r\n"])
         console.run("sync", "/bin/sync && /bin/echo sync-ok", [b"\r\nsync-ok\r\n"])
-        console.run("rm file", "/bin/rm /tmp/coremini-d/x && /bin/echo rm-file-ok", [b"\r\nrm-file-ok\r\n"])
-        console.run("rm dir", "/bin/rm /tmp/coremini-d && /bin/echo rm-dir-ok", [b"\r\nrm-dir-ok\r\n"])
-        print("\n[qemu-lpr-coreutils-mini-smoke] passed", flush=True)
+        console.run("rm file", "/bin/rm /tmp/coreutils-d/x && /bin/echo rm-file-ok", [b"\r\nrm-file-ok\r\n"])
+        console.run("rm dir", "/bin/rm /tmp/coreutils-d && /bin/echo rm-dir-ok", [b"\r\nrm-dir-ok\r\n"])
+        print("\n[qemu-lpr-gnu-coreutils-smoke] passed", flush=True)
         return 0
     except Exception as exc:
-        sys.stderr.write(f"\n[qemu-lpr-coreutils-mini-smoke] failed: {exc}\n")
+        sys.stderr.write(f"\n[qemu-lpr-gnu-coreutils-smoke] failed: {exc}\n")
         return 1
     finally:
         console.close()

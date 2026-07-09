@@ -6,7 +6,9 @@
 # - 各ケースは busybox timeout -s KILL でラップし、1 ケースのハングを最大 3 秒に閉じ込める
 # - 結果はコマンド置換でなくファイル経由で回収する (孫プロセス残留でも読み取りが
 #   ブロックしない)
-# 出力: I<iter>_CASE<n>=OK / =FAIL want=[..] got=[..]、全完了で PIPE_STRESS_DONE
+# - パイプラインは busybox applet で構成する (ユーザー指示: 実バイナリで検証する。
+#   自作 fixture ではなく busybox が基準)
+# 出力: I<iter>_CASE<n>=BEGIN / =OK / =FAIL want=[..] got=[..]、全完了で PIPE_STRESS_DONE
 
 bb=/cmd/busybox
 iters="${1:-5}"
@@ -21,13 +23,13 @@ check() {
   fi
 }
 
-# ケース本体を timeout 付き bash で実行し、結果をファイルから回収する
+# ケース本体を timeout 付き busybox sh で実行し、結果をファイルから回収する
 run_case() {
   name="$1"; want="$2"; cmd="$3"
   echo "${name}=BEGIN"
   rm -f "$out" 2>/dev/null
-  $bb timeout -s KILL 3 bash -c "$cmd" > "$out" 2>/dev/null
-  got=$(cat "$out" 2>/dev/null)
+  $bb timeout -s KILL 3 $bb sh -c "$cmd" > "$out" 2>/dev/null
+  got=$($bb cat "$out" 2>/dev/null)
   # 数値比較の空白差異 (wc 実装差) を吸収
   case "$want" in
     *[!0-9]*) : ;;
@@ -38,14 +40,15 @@ run_case() {
 
 run_iter() {
   it="$1"
-  run_case "I${it}_CASE1" "2"     "printf 'a\nb\nab\n' | grep a | wc -l"
-  run_case "I${it}_CASE2" "3"     "printf '1\n2\n3\n4\n' | grep -v 2 | wc -l"
-  run_case "I${it}_CASE3" "65536" "yes A | head -c 65536 | wc -c"
-  run_case "I${it}_CASE4" "3"     "yes B | head -n 3 | wc -l"
-  run_case "I${it}_CASE5" "done"  "echo done | cat"
-  run_case "I${it}_CASE6" "2"     "echo r1 > /tmp/ps_f; echo r2 >> /tmp/ps_f; cat /tmp/ps_f | wc -l; rm -f /tmp/ps_f"
-  run_case "I${it}_CASE7" "2"     "( echo sub1; echo sub2 ) | wc -l"
-  run_case "I${it}_CASE8" "5"     "$bb sh -c 'yes C | head -n 5 | wc -l'"
+  b=$bb
+  run_case "I${it}_CASE1" "2"     "$b printf 'a\nb\nab\n' | $b grep a | $b wc -l"
+  run_case "I${it}_CASE2" "3"     "$b printf '1\n2\n3\n4\n' | $b grep -v 2 | $b wc -l"
+  run_case "I${it}_CASE3" "65536" "$b yes A | $b head -c 65536 | $b wc -c"
+  run_case "I${it}_CASE4" "3"     "$b yes B | $b head -n 3 | $b wc -l"
+  run_case "I${it}_CASE5" "done"  "$b echo done | $b cat"
+  run_case "I${it}_CASE6" "2"     "$b echo r1 > /tmp/ps_f; $b echo r2 >> /tmp/ps_f; $b cat /tmp/ps_f | $b wc -l; $b rm -f /tmp/ps_f"
+  run_case "I${it}_CASE7" "2"     "( $b echo sub1; $b echo sub2 ) | $b wc -l"
+  run_case "I${it}_CASE8" "5"     "bash -c '$b yes C | $b head -n 5 | $b wc -l'"
 }
 
 i=1

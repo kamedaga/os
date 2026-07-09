@@ -12,4 +12,4 @@ fi
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
-  --python "$repo_root/tests/qemu_lpr_coreutils_mini_smoke.py"
+  --python "$repo_root/tests/qemu_lpr_gnu_coreutils_smoke.py"

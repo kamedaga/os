@@ -177,14 +177,13 @@ apps:
         - "tools/build_wsl_curl.sh"
     out: "CURLROOT"
     rootfs: "/"
-  coreutils_mini:
+  gnu_coreutils:
     file:
-      path: ".artifacts/userland-fixtures/coreutils-mini-root"
-      rebuild: ["bash", "tools/build_wsl_coreutils_mini.sh"]
+      path: ".artifacts/userland-fixtures/gnu-coreutils-root"
+      rebuild: ["bash", "tools/download_wsl_gnu_coreutils.sh", ".artifacts/userland-fixtures/gnu-coreutils-root"]
       input:
-        - "tools/build_wsl_coreutils_mini.sh"
-        - "userland/fixtures/src/wsl_musl/coreutils_mini.c"
-    out: "COREMINIROOT"
+        - "tools/download_wsl_gnu_coreutils.sh"
+    out: "GNUCOREUTILS"
     rootfs: "/"
   dash:
     file: "userland/fixtures/shell/dash.elf"
