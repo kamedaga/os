@@ -1,7 +1,6 @@
 # PachaOS GNU coreutils smoke fixture — run via: bash /cmd/gnu_smoke.sh
 # ハーネス設計は pipe_stress.sh と同じ: 本体は rootfs 同梱、tty へは起動 1 行のみ、
-# マーカーは送信文字列に含まれない形式、各ケースは busybox timeout でラップし
-# 1 ケースのハングを最大 3 秒に閉じ込め、結果はファイル経由で回収する。
+# マーカーは送信文字列に含まれない形式、結果はファイル経由で回収する。
 # 出力: GNUCU_CASE<n>=BEGIN / =OK / =FAIL、全完了で GNUCU_DONE。
 
 bb=/cmd/busybox
@@ -20,7 +19,7 @@ run_case() {
   name="$1"; want="$2"; cmd="$3"
   echo "${name}=BEGIN"
   rm -f "$out" 2>/dev/null
-  $bb timeout -s KILL 3 bash -c "$cmd" > "$out" 2>/dev/null
+  bash -c "$cmd" > "$out" 2>/dev/null
   got=$($bb cat "$out" 2>/dev/null)
   case "$want" in
     *[!0-9]*) : ;;

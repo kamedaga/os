@@ -6,7 +6,6 @@
 #include "lpr_filed.h"
 #include "lpr_linux_syscall.h"
 #include "lpr_process/client.h"
-#include "lpr_process/supervisor_fd_snapshot.h"
 #include "lpr_socket.h"
 #include "support/string.h"
 #include "support/syscall.h"
@@ -327,8 +326,6 @@ int64_t lpr_supervisor_call_token(
     uint64_t *out_result);
 int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
 int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state);
-int lpr_supervisor_fd_table_replace(void);
-int lpr_supervisor_fd_table_restore(uint64_t token);
 int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
 void lpr_pipe_after_fork_child(void);
 void lpr_cwd_init(void);
@@ -343,10 +340,6 @@ void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd);
 int lpr_prepare_exec_local_fds(filed_v2_exec_path_t *exec, lpr_exec_local_fd_table_t *local_table);
 void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table);
 int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count);
-int lpr_supervisor_snapshot_count(void *ctx, uint64_t *out_count);
-int lpr_supervisor_snapshot_next(void *ctx, uint64_t *cursor, lprs_v2_fd_desc_t *out, int *out_has);
-int lpr_supervisor_snapshot_install(void *ctx, const lprs_v2_fd_desc_t *in);
-void lpr_supervisor_snapshot_ops(lpr_supervisor_fd_snapshot_ops_t *ops);
 void lpr_readlink_cache_clear(void);
 int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_status);
 void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status);
@@ -440,14 +433,7 @@ int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_runtime_reserved_fd(uint64_t fd);
-int lpr_supervisor_fd_snapshot_replace( uint64_t token, const lpr_supervisor_fd_snapshot_ops_t *ops, void *ctx);
-int lpr_supervisor_fd_snapshot_restore( uint64_t token, const lpr_supervisor_fd_snapshot_ops_t *ops, void *ctx);
-int lpr_supervisor_fd_table_replace(void);
-int lpr_supervisor_fd_table_restore(uint64_t token);
 int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state);
-int lpr_supervisor_snapshot_count(void *ctx, uint64_t *out_count);
-int lpr_supervisor_snapshot_install(void *ctx, const lprs_v2_fd_desc_t *in);
-int lpr_supervisor_snapshot_next( void *ctx, uint64_t *cursor, lprs_v2_fd_desc_t *out, int *out_has);
 int lpr_timespec_less_equal( const struct pachaos_timespec *lhs, const struct pachaos_timespec *rhs);
 int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags);
 int32_t lpr_linux_alloc_child_pid(void);
@@ -579,8 +565,6 @@ uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info);
 uint32_t lpr_pipe_poll_events_from_pacha(uint64_t events);
 uint64_t lpr_align_up_4096(uint64_t value);
 uint64_t lpr_align_up_pow2(uint64_t value, uint64_t align);
-uint64_t lpr_control_fd_flags_to_lprs(uint64_t fd);
-uint64_t lpr_control_status_flags_to_lprs(uint64_t fd);
 uint64_t lpr_exec_fd_table_bytes_for_capacity(uint64_t capacity);
 uint64_t lpr_exec_fd_table_capacity_for_count(uint64_t count);
 uint64_t lpr_fd_table_next_capacity(uint64_t required_capacity);
@@ -589,8 +573,6 @@ uint64_t lpr_linux_filed_fd_handle(uint64_t fd);
 uint64_t lpr_linux_ignored_signal_mask(void);
 uint64_t lpr_linux_signal_bit(uint32_t sig);
 uint64_t lpr_linux_unblockable_signal_mask(void);
-uint64_t lpr_lprs_fd_flags_to_linux(uint64_t fd_flags);
-uint64_t lpr_lprs_status_flags_to_linux(uint64_t status_flags);
 uint64_t lpr_open_flags(uint64_t flags);
 uint64_t lpr_open_rights(uint64_t flags);
 uint64_t lpr_page_align_up(uint64_t value);
@@ -638,7 +620,6 @@ void lpr_pipe_after_fork_child(void);
 void lpr_pipe_close_fd(uint64_t fd);
 void lpr_readlink_cache_clear(void);
 void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status);
-void lpr_supervisor_snapshot_ops(lpr_supervisor_fd_snapshot_ops_t *ops);
 void lpr_timespec_subtract( const struct pachaos_timespec *end, const struct pachaos_timespec *start, struct pachaos_timespec *out);
 void lpr_trace_clone_args(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid);
 void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user_frame *frame, int64_t status);

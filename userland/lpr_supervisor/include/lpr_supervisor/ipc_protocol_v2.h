@@ -32,28 +32,12 @@ enum {
     LPRS_V2_OP_SIGNAL_KILL = 0x0201u,
     LPRS_V2_OP_SIGNAL_DELIVER_TTY = 0x0202u,
 
-    LPRS_V2_OP_FD_TABLE_REPLACE_BEGIN = 0x0301u,
-    LPRS_V2_OP_FD_TABLE_REPLACE_CHUNK = 0x0302u,
-    LPRS_V2_OP_FD_TABLE_REPLACE_COMMIT = 0x0303u,
-    LPRS_V2_OP_FD_TABLE_GET_CHUNK = 0x0304u,
-
     LPRS_V2_OP_CWD_GET = 0x0401u,
     LPRS_V2_OP_CWD_SET = 0x0402u,
 
     LPRS_V2_OP_DIAG_DUMP = 0x7f01u,
     LPRS_V2_OP_DIAG_ERROR_GET = 0x7f02u,
 
-    LPRS_V2_FD_KIND_NONE = 0u,
-    LPRS_V2_FD_KIND_FILED = 1u,
-    LPRS_V2_FD_KIND_TTY = 2u,
-    LPRS_V2_FD_KIND_PIPE = 3u,
-    LPRS_V2_FD_KIND_EVENT = 4u,
-    LPRS_V2_FD_KIND_SOCKET = 5u,
-    LPRS_V2_FD_KIND_NATIVE = 6u,
-
-    LPRS_V2_FD_CLOEXEC = 1u << 0,
-    LPRS_V2_FILE_NONBLOCK = 1u << 0,
-    LPRS_V2_FILE_APPEND = 1u << 1,
 };
 
 typedef struct lprs_v2_token_request {
@@ -126,26 +110,6 @@ typedef struct lprs_v2_cwd {
     char cwd[LPRS_V2_CWD_BYTES];
 } lprs_v2_cwd_t;
 
-typedef struct lprs_v2_fd_desc {
-    uint64_t fd;
-    uint64_t kind;
-    uint64_t fd_flags;
-    uint64_t status_flags;
-    uint64_t handle;
-    uint64_t offset_or_counter;
-} lprs_v2_fd_desc_t;
-
-typedef struct lprs_v2_fd_table_page {
-    uint64_t token;
-    uint64_t start_index;
-    uint64_t total_count;
-    uint64_t count;
-    lprs_v2_fd_desc_t entries[];
-} lprs_v2_fd_table_page_t;
-
-#define LPRS_V2_FD_TABLE_PAGE_MAX \
-    ((LPRS_V2_PAYLOAD_BYTES - sizeof(lprs_v2_fd_table_page_t)) / sizeof(lprs_v2_fd_desc_t))
-
 typedef struct lprs_v2_diag_error_get {
     uint64_t token;
 } lprs_v2_diag_error_get_t;
@@ -157,8 +121,5 @@ _Static_assert(sizeof(lprs_v2_pid_op_t) == 32, "lprs_v2_pid_op size");
 _Static_assert(sizeof(lprs_v2_kill_t) == 32, "lprs_v2_kill size");
 _Static_assert(sizeof(lprs_v2_tty_signal_t) == 24, "lprs_v2_tty_signal size");
 _Static_assert(sizeof(lprs_v2_cwd_t) == 496, "lprs_v2_cwd size");
-_Static_assert(sizeof(lprs_v2_fd_desc_t) == 48, "lprs_v2_fd_desc size");
 _Static_assert(sizeof(lprs_v2_process_state_t) <= LPRS_V2_PAYLOAD_BYTES,
     "lprs_v2_process_state fits payload");
-_Static_assert(sizeof(lprs_v2_fd_table_page_t) <= LPRS_V2_PAYLOAD_BYTES,
-    "lprs_v2_fd_table_page fits payload");

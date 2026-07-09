@@ -74,12 +74,6 @@ int lpr_load_bootstrap(void)
     {
         lpr_supervisor_token = lpr_bootstrap.supervisor_token;
         lpr_supervisor_enabled = 1;
-        const int restore_status = lpr_supervisor_fd_table_restore(lpr_supervisor_token);
-        if (restore_status != 0) {
-            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
-            for (;;) {
-            }
-        }
     }
     lpr_bootstrap_valid = 1;
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
@@ -276,4 +270,3 @@ void lpr_linux_process_clear_children(void)
 {
     lpr_memset(lpr_linux_processes, 0, sizeof(lpr_linux_processes));
 }
-

@@ -266,16 +266,6 @@ void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd)
     }
 }
 
-int lpr_supervisor_fd_table_replace(void)
-{
-    if (!lpr_supervisor_enabled || lpr_supervisor_token == 0) {
-        return 0;
-    }
-    lpr_supervisor_fd_snapshot_ops_t ops;
-    lpr_supervisor_snapshot_ops(&ops);
-    return lpr_supervisor_fd_snapshot_replace(lpr_supervisor_token, &ops, 0);
-}
-
 int lpr_prepare_exec_local_fds(
     filed_v2_exec_path_t *exec,
     lpr_exec_local_fd_table_t *local_table)

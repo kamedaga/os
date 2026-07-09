@@ -25,8 +25,6 @@ int64_t lpr_supervisor_call_token(
     uint64_t *out_result);
 int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
 int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state);
-int lpr_supervisor_fd_table_replace(void);
-int lpr_supervisor_fd_table_restore(uint64_t token);
 int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
 void lpr_pipe_after_fork_child(void);
 void lpr_cwd_init(void);

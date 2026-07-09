@@ -95,25 +95,16 @@ int main(void)
     failures += expect(
         in_range(LPRS_V2_OP_PROCESS_REGISTER_EXEC, 0x0100u, 0x01ffu) &&
         in_range(LPRS_V2_OP_SIGNAL_KILL, 0x0200u, 0x02ffu) &&
-        in_range(LPRS_V2_OP_FD_TABLE_GET_CHUNK, 0x0300u, 0x03ffu) &&
         in_range(LPRS_V2_OP_CWD_GET, 0x0400u, 0x04ffu) &&
         in_range(LPRS_V2_OP_DIAG_DUMP, 0x7f00u, 0x7fffu),
         "lprs op ranges");
     failures += expect(sizeof(lprs_v2_process_state_t) == 608, "lprs process state size");
-    failures += expect(sizeof(lprs_v2_fd_desc_t) == 48, "lprs fd desc size");
     failures += expect(
         FILED_V2_EXEC_LPR_FD_PIPE == 3 &&
         FILED_V2_EXEC_LPR_FD_EVENT == 4 &&
-        LPRS_V2_FD_KIND_PIPE == 3 &&
-        LPRS_V2_FD_KIND_EVENT == 4 &&
         LPR_CLIENT_FD_KIND_PIPE == 3 &&
         LPR_CLIENT_FD_KIND_EVENT == 4,
         "lpr fd kind order keeps pipe before event");
-    failures += expect(
-        sizeof(lprs_v2_fd_table_page_t) +
-            LPRS_V2_FD_TABLE_PAGE_MAX * sizeof(lprs_v2_fd_desc_t) <=
-            LPRS_V2_PAYLOAD_BYTES,
-        "lprs fd table fits v2 payload");
 
     return failures == 0 ? 0 : 1;
 }

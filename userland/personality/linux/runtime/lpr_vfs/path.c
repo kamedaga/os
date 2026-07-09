@@ -654,14 +654,6 @@ int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state)
     return status == 0 ? 0 : (int)status;
 }
 
-
-int lpr_supervisor_fd_table_restore(uint64_t token)
-{
-    lpr_supervisor_fd_snapshot_ops_t ops;
-    lpr_supervisor_snapshot_ops(&ops);
-    return lpr_supervisor_fd_snapshot_restore(token, &ops, 0);
-}
-
 int lpr_create_pread_vmo_wire_page(void **out_page)
 {
     if (out_page == 0) {

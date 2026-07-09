@@ -16,35 +16,6 @@ enum {
     LPRS_WNOHANG = 1,
 };
 
-typedef struct lprs_fd_slot {
-    uint8_t active;
-    uint8_t reserved0;
-    uint16_t reserved1;
-    uint32_t file_index;
-    uint64_t fd;
-    uint64_t fd_flags;
-} lprs_fd_slot_t;
-
-typedef struct lprs_file {
-    uint8_t active;
-    uint8_t reserved0;
-    uint16_t reserved1;
-    uint32_t refcount;
-    uint64_t kind;
-    uint64_t status_flags;
-    uint64_t handle;
-    uint64_t offset_or_counter;
-} lprs_file_t;
-
-typedef struct lprs_filedesc {
-    lprs_fd_slot_t *slots;
-    uint64_t slot_count;
-    uint64_t slot_capacity;
-    lprs_file_t *files;
-    uint64_t file_count;
-    uint64_t file_capacity;
-} lprs_filedesc_t;
-
 typedef struct lprs_process {
     uint8_t active;
     uint8_t waited;
@@ -60,9 +31,6 @@ typedef struct lprs_process {
     int process_fd;
     char ctty[LPRS_V2_CTTY_BYTES];
     char cwd[LPRS_V2_CWD_BYTES];
-    lprs_filedesc_t filedesc;
-    lprs_filedesc_t staged_filedesc;
-    uint8_t fd_replace_active;
 } lprs_process_t;
 
 typedef struct lprs_process_status {
@@ -203,130 +171,6 @@ static int lprs_ensure_process_capacity(uint64_t needed)
     return 0;
 }
 
-static void lprs_filedesc_release(lprs_filedesc_t *fdp)
-{
-    if (fdp == NULL) {
-        return;
-    }
-    free(fdp->slots);
-    free(fdp->files);
-    memset(fdp, 0, sizeof(*fdp));
-}
-
-static void lprs_filedesc_swap(lprs_filedesc_t *a, lprs_filedesc_t *b)
-{
-    lprs_filedesc_t tmp = *a;
-    *a = *b;
-    *b = tmp;
-}
-
-static int lprs_filedesc_ensure_slots(lprs_filedesc_t *fdp, uint64_t needed)
-{
-    if (needed <= fdp->slot_capacity) {
-        return 0;
-    }
-    uint64_t new_capacity = fdp->slot_capacity == 0 ? 16 : fdp->slot_capacity;
-    while (new_capacity < needed) {
-        if (new_capacity > UINT64_MAX / 2u) {
-            return PACHA_STATUS_ENOMEM;
-        }
-        new_capacity *= 2u;
-    }
-    lprs_fd_slot_t *new_slots =
-        (lprs_fd_slot_t *)realloc(fdp->slots, (size_t)(new_capacity * sizeof(*new_slots)));
-    if (new_slots == NULL) {
-        return PACHA_STATUS_ENOMEM;
-    }
-    memset(new_slots + fdp->slot_capacity, 0,
-        (size_t)((new_capacity - fdp->slot_capacity) * sizeof(*new_slots)));
-    fdp->slots = new_slots;
-    fdp->slot_capacity = new_capacity;
-    return 0;
-}
-
-static int lprs_filedesc_ensure_files(lprs_filedesc_t *fdp, uint64_t needed)
-{
-    if (needed <= fdp->file_capacity) {
-        return 0;
-    }
-    uint64_t new_capacity = fdp->file_capacity == 0 ? 16 : fdp->file_capacity;
-    while (new_capacity < needed) {
-        if (new_capacity > UINT64_MAX / 2u) {
-            return PACHA_STATUS_ENOMEM;
-        }
-        new_capacity *= 2u;
-    }
-    lprs_file_t *new_files =
-        (lprs_file_t *)realloc(fdp->files, (size_t)(new_capacity * sizeof(*new_files)));
-    if (new_files == NULL) {
-        return PACHA_STATUS_ENOMEM;
-    }
-    memset(new_files + fdp->file_capacity, 0,
-        (size_t)((new_capacity - fdp->file_capacity) * sizeof(*new_files)));
-    fdp->files = new_files;
-    fdp->file_capacity = new_capacity;
-    return 0;
-}
-
-static int lprs_filedesc_append_desc(lprs_filedesc_t *fdp, const lprs_v2_fd_desc_t *desc)
-{
-    if (fdp == NULL || desc == NULL || desc->kind == LPRS_V2_FD_KIND_NONE) {
-        return PACHA_STATUS_EINVAL;
-    }
-    const int slot_status = lprs_filedesc_ensure_slots(fdp, fdp->slot_count + 1u);
-    if (slot_status != 0) {
-        return slot_status;
-    }
-    const int file_status = lprs_filedesc_ensure_files(fdp, fdp->file_count + 1u);
-    if (file_status != 0) {
-        return file_status;
-    }
-
-    if (fdp->file_count > UINT32_MAX) {
-        return PACHA_STATUS_ENOMEM;
-    }
-    const uint64_t file_index = fdp->file_count++;
-    lprs_file_t *file = &fdp->files[file_index];
-    memset(file, 0, sizeof(*file));
-    file->active = 1;
-    file->refcount = 1;
-    file->kind = desc->kind;
-    file->status_flags = desc->status_flags;
-    file->handle = desc->handle;
-    file->offset_or_counter = desc->offset_or_counter;
-
-    lprs_fd_slot_t *slot = &fdp->slots[fdp->slot_count++];
-    memset(slot, 0, sizeof(*slot));
-    slot->active = 1;
-    slot->file_index = (uint32_t)file_index;
-    slot->fd = desc->fd;
-    slot->fd_flags = desc->fd_flags;
-    return 0;
-}
-
-static int lprs_filedesc_read_desc(const lprs_filedesc_t *fdp, uint64_t index, lprs_v2_fd_desc_t *out)
-{
-    if (fdp == NULL || out == NULL || index >= fdp->slot_count) {
-        return PACHA_STATUS_EINVAL;
-    }
-    const lprs_fd_slot_t *slot = &fdp->slots[index];
-    if (!slot->active || slot->file_index >= fdp->file_count) {
-        return PACHA_STATUS_EINVAL;
-    }
-    const lprs_file_t *file = &fdp->files[slot->file_index];
-    if (!file->active) {
-        return PACHA_STATUS_EINVAL;
-    }
-    memset(out, 0, sizeof(*out));
-    out->fd = slot->fd;
-    out->kind = file->kind;
-    out->fd_flags = slot->fd_flags;
-    out->status_flags = file->status_flags;
-    out->handle = file->handle;
-    out->offset_or_counter = file->offset_or_counter;
-    return 0;
-}
-
 static void lprs_process_release_owned(lprs_process_t *proc)
 {
     if (proc == NULL) {
@@ -335,8 +179,6 @@ static void lprs_process_release_owned(lprs_process_t *proc)
     if (proc->process_fd >= 16) {
         (void)pacha_fd_close(proc->process_fd);
     }
-    lprs_filedesc_release(&proc->filedesc);
-    lprs_filedesc_release(&proc->staged_filedesc);
     memset(proc, 0, sizeof(*proc));
     proc->process_fd = -1;
 }
@@ -825,82 +667,6 @@ static int lprs_cwd_set(void *page)
     return 0;
 }
 
-static int lprs_fd_replace_begin(uint64_t token)
-{
-    lprs_process_t *proc = lprs_find_by_token(token);
-    if (proc == NULL) {
-        return PACHA_STATUS_ESRCH;
-    }
-    lprs_filedesc_release(&proc->staged_filedesc);
-    proc->fd_replace_active = 1;
-    return 0;
-}
-
-static int lprs_fd_replace_chunk(void *page)
-{
-    if (page == NULL) {
-        return PACHA_STATUS_EINVAL;
-    }
-    lprs_v2_fd_table_page_t *req = (lprs_v2_fd_table_page_t *)page;
-    if (req->count > LPRS_V2_FD_TABLE_PAGE_MAX) {
-        return PACHA_STATUS_EINVAL;
-    }
-    lprs_process_t *proc = lprs_find_by_token(req->token);
-    if (proc == NULL || !proc->fd_replace_active) {
-        return proc == NULL ? PACHA_STATUS_ESRCH : PACHA_STATUS_EINVAL;
-    }
-    for (uint64_t i = 0; i < req->count; ++i) {
-        const int status = lprs_filedesc_append_desc(&proc->staged_filedesc, &req->entries[i]);
-        if (status != 0) {
-            return status;
-        }
-    }
-    return 0;
-}
-
-static int lprs_fd_replace_commit(uint64_t token)
-{
-    lprs_process_t *proc = lprs_find_by_token(token);
-    if (proc == NULL || !proc->fd_replace_active) {
-        return proc == NULL ? PACHA_STATUS_ESRCH : PACHA_STATUS_EINVAL;
-    }
-    lprs_filedesc_swap(&proc->filedesc, &proc->staged_filedesc);
-    lprs_filedesc_release(&proc->staged_filedesc);
-    proc->fd_replace_active = 0;
-    return 0;
-}
-
-static int lprs_fd_get_chunk(void *page)
-{
-    if (page == NULL) {
-        return PACHA_STATUS_EINVAL;
-    }
-    lprs_v2_fd_table_page_t *req = (lprs_v2_fd_table_page_t *)page;
-    lprs_process_t *proc = lprs_find_by_token(req->token);
-    if (proc == NULL) {
-        return PACHA_STATUS_ESRCH;
-    }
-    const uint64_t start = req->start_index;
-    const uint64_t max_count = LPRS_V2_FD_TABLE_PAGE_MAX;
-    uint64_t count = 0;
-    if (start < proc->filedesc.slot_count) {
-        count = proc->filedesc.slot_count - start;
-        if (count > max_count) {
-            count = max_count;
-        }
-        for (uint64_t i = 0; i < count; ++i) {
-            const int status =
-                lprs_filedesc_read_desc(&proc->filedesc, start + i, &req->entries[i]);
-            if (status != 0) {
-                return status;
-            }
-        }
-    }
-    req->total_count = proc->filedesc.slot_count;
-    req->count = count;
-    return 0;
-}
-
 static void *lprs_map_request_page(const struct pacha_ipc_msg *request, int *out_page_fd)
 {
     if (out_page_fd != NULL) {
@@ -1098,26 +864,6 @@ static int lprs_dispatch_v2(
             status = lprs_deliver_tty_signal_fields(sig->pgrp, sig->signal, &sig->delivered);
             reply_payload_size = sizeof(*sig);
         }
-        break;
-    case LPRS_V2_OP_FD_TABLE_REPLACE_BEGIN:
-        status = token == 0 ? PACHA_STATUS_EINVAL : lprs_fd_replace_begin(token);
-        break;
-    case LPRS_V2_OP_FD_TABLE_REPLACE_CHUNK:
-        status = header.payload_size < sizeof(lprs_v2_fd_table_page_t) ?
-            PACHA_STATUS_EINVAL :
-            lprs_fd_replace_chunk(payload);
-        break;
-    case LPRS_V2_OP_FD_TABLE_REPLACE_COMMIT:
-        status = token == 0 ? PACHA_STATUS_EINVAL : lprs_fd_replace_commit(token);
-        break;
-    case LPRS_V2_OP_FD_TABLE_GET_CHUNK:
-        status = header.payload_size < sizeof(lprs_v2_fd_table_page_t) ?
-            PACHA_STATUS_EINVAL :
-            lprs_fd_get_chunk(payload);
-        reply_payload_size = status == 0 ?
-            (uint32_t)(sizeof(lprs_v2_fd_table_page_t) +
-                ((lprs_v2_fd_table_page_t *)payload)->count * sizeof(lprs_v2_fd_desc_t)) :
-            0;
         break;
     case LPRS_V2_OP_CWD_GET:
         status = token == 0 ? PACHA_STATUS_EINVAL : lprs_cwd_get(token, payload);

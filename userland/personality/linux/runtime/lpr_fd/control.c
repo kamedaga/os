@@ -436,52 +436,6 @@ uint64_t lpr_filed_control_offset(uint64_t fd)
     return filed != 0 ? filed->offset : 0;
 }
 
-uint64_t lpr_control_fd_flags_to_lprs(uint64_t fd)
-{
-    uint16_t fd_flags = 0;
-    if (fd >= lpr_fd_table_capacity ||
-        lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &fd_flags) != 0)
-    {
-        return 0;
-    }
-    return (fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? LPRS_V2_FD_CLOEXEC : 0;
-}
-
-uint64_t lpr_control_status_flags_to_lprs(uint64_t fd)
-{
-    uint32_t status_flags = 0;
-    if (fd >= lpr_fd_table_capacity ||
-        lpr_fd_table_get_status_flags(&lpr_control_fd_table, (uint32_t)fd, &status_flags) != 0)
-    {
-        return 0;
-    }
-    uint64_t out = 0;
-    if ((status_flags & LPR_FD_TABLE_STATUS_NONBLOCK) != 0) {
-        out |= LPRS_V2_FILE_NONBLOCK;
-    }
-    if ((status_flags & LPR_FD_TABLE_STATUS_APPEND) != 0) {
-        out |= LPRS_V2_FILE_APPEND;
-    }
-    return out;
-}
-
-uint64_t lpr_lprs_fd_flags_to_linux(uint64_t fd_flags)
-{
-    return (fd_flags & LPRS_V2_FD_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0;
-}
-
-uint64_t lpr_lprs_status_flags_to_linux(uint64_t status_flags)
-{
-    uint64_t out = 0;
-    if ((status_flags & LPRS_V2_FILE_NONBLOCK) != 0) {
-        out |= LPR_LINUX_O_NONBLOCK;
-    }
-    if ((status_flags & LPRS_V2_FILE_APPEND) != 0) {
-        out |= LPR_LINUX_O_APPEND;
-    }
-    return out;
-}
-
 void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset)
 {
     if (fd < lpr_fd_table_capacity) {
