@@ -168,6 +168,8 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - **移動系 (T3.1)**: green は green のまま、red は同一の red のまま (症状が変わったら挙動を変えた兆候)。
 - **再設計系 (T3.3)**: 挙動保存を目的にしない。目標意味論は古いコードではなく **Linux の fd/pipe セマンティクス**。red スモーク (pipe-stress CASE3+, gnu CASE2) の green 化が受け入れ基準の一部。元の状態管理が酷い部分を挙動ごと温存しても改善しないため、根本から作り直す (ユーザー判断)。
 
+**結果 (2026-07-10, aea43e9 で T3.0/T3.3 完了)**: 構造先行の判断は正解だった。再設計の過程で点修正では到達不能だった泥バグ 5 件を発見・修正: ① teardown/kill/exec 時の pipe peer wake 欠落 ② fork 子の RPC scratch VMO 共有破壊 ③ filed IO reply の payload 上限超過 memcpy (「clone 子 fault」の正体) ④ legacy RPC の reply result 上書き → read/write が偽 0/EOF (両 CASE3 ハングの共通真因) ⑤ プロセス終了時の FILED handle 全リーク → 256 枠枯渇 (Bug D = 反復 OOM の実体)。Bug C (loader) は③で解消。全スモーク green (pipe-stress 5 反復 40 ケース、gnu 全ケース + loader 10 回、state-leak 50 回)。
+
 **T3.1 syscall dispatch の table 化 + .inc 廃止**
 - 3 つの switch を `{nr, handler}` の単一テーブルに。`lpr_vfs/*.inc` 等の textual include を通常の .c/.h に変換 (build script 更新込み)。
 - 受け入れ: 全スモーク通過。ENOSYS トレース (T0.1 経由) が syscall 名付きで出る。
