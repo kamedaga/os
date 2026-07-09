@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <personality/linux_lpr.h>
+#include <personality/zpoline.h>
 #include "lpr_low_layout.h"
 
 enum lpr_loader_status {

@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <personality/linux_lpr.h>
+#include <personality/zpoline.h>
 
 void lpr_syscall_entry(void) {
 }

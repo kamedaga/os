@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <hde64.h>
 #include <personality/linux_lpr.h>
+#include <personality/zpoline.h>
 
 extern void lpr_syscall_entry(void);
 extern void lpr_trap_entry(void);

@@ -1293,7 +1293,7 @@ int lpr_exec_read_full_file_image(
 
 int lpr_exec_read_meta(filed_runtime_t *runtime, const lpr_exec_file_t *file, lpr_exec_meta_t *out_meta)
 {
-    unsigned char prefix[LPR_EXEC_PAGE_SIZE];
+    unsigned char prefix[LPR_IMAGE_PAGE_SIZE];
     uint64_t prefix_size = 0;
 
     if (runtime == NULL || file == NULL || out_meta == NULL) {

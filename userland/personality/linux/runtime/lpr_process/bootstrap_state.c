@@ -1,5 +1,25 @@
 #include "../lpr_filed_internal.h"
 
+#define LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS 127ull
+
+static void lpr_image_abi_mismatch_exit(uint64_t actual_version)
+{
+    pacha_trace5(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_IMAGE_ABI_MISMATCH,
+        PACHA_TRACE_CLASS_ERROR,
+        actual_version,
+        LPR_IMAGE_ABI_VERSION,
+        LPR_BOOTSTRAP_IMAGE_ABI_VERSION_OFFSET,
+        LPR_BOOTSTRAP_HEADER_SIZE,
+        LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
+    (void)lpr_pacha_syscall1(
+        PACHAOS_SYSCALL_PROCESS_EXIT,
+        LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
+    for (;;) {
+    }
+}
+
 int lpr_load_bootstrap(void)
 {
     if (lpr_bootstrap_checked) {
@@ -13,9 +33,14 @@ int lpr_load_bootstrap(void)
         (uint64_t)(uintptr_t)&lpr_bootstrap,
         sizeof(lpr_bootstrap));
     if (got != (int64_t)sizeof(lpr_bootstrap) ||
-        lpr_bootstrap.magic != LPR_BOOTSTRAP_MAGIC ||
-        lpr_bootstrap.version != LPR_BOOTSTRAP_VERSION ||
-        lpr_bootstrap.byte_size < sizeof(lpr_bootstrap) ||
+        lpr_bootstrap.magic != LPR_BOOTSTRAP_MAGIC)
+    {
+        goto invalid;
+    }
+    if (lpr_bootstrap.image_abi_version != LPR_IMAGE_ABI_VERSION) {
+        lpr_image_abi_mismatch_exit(lpr_bootstrap.image_abi_version);
+    }
+    if (lpr_bootstrap.byte_size < sizeof(lpr_bootstrap) ||
         lpr_bootstrap.local_fd_count > LPR_FD_TABLE_MAX_SIZE ||
         lpr_bootstrap.local_fd_count > UINT64_MAX / sizeof(lpr_bootstrap_fd_t))
     {
@@ -53,9 +78,16 @@ int lpr_load_bootstrap(void)
         const lpr_bootstrap_fd_t *descs =
             (const lpr_bootstrap_fd_t *)((uintptr_t)mapped +
                 lpr_bootstrap.local_fd_table_offset);
+        if (mapped_bootstrap->image_abi_version != LPR_IMAGE_ABI_VERSION) {
+            const uint64_t actual_version = mapped_bootstrap->image_abi_version;
+            (void)lpr_pacha_syscall2(
+                PACHAOS_SYSCALL_MUNMAP,
+                (uint64_t)(uintptr_t)mapped,
+                lpr_bootstrap.byte_size);
+            lpr_image_abi_mismatch_exit(actual_version);
+        }
         const int install_ok =
             mapped_bootstrap->magic == LPR_BOOTSTRAP_MAGIC &&
-            mapped_bootstrap->version == LPR_BOOTSTRAP_VERSION &&
             mapped_bootstrap->byte_size == lpr_bootstrap.byte_size &&
             mapped_bootstrap->local_fd_count == lpr_bootstrap.local_fd_count &&
             lpr_install_bootstrap_local_fds(descs, lpr_bootstrap.local_fd_count);

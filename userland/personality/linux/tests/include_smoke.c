@@ -1,5 +1,6 @@
 #include <personality/personality_abi.h>
 #include <personality/runtime_page.h>
+#include <personality/lpr_image_abi.h>
 #include <personality/zpoline.h>
 #include <personality/coordinator_protocol_v2.h>
 #include <personality/linux_lpr.h>

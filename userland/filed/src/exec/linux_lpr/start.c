@@ -275,53 +275,55 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_v2_exec_path_t *reque
         }
     }
     const uint64_t argv0_va = argv_va[0];
-    sp &= ~15ull;
-    sp -= 16;
+    sp &= ~(LPR_IMAGE_INITIAL_STACK_ALIGNMENT - 1u);
+    sp -= LPR_IMAGE_INITIAL_RANDOM_BYTES;
     const uint64_t random_va = stack_base + sp;
-    if (pacha_getrandom(stack + sp, 16, 0) != 16) {
+    if (pacha_getrandom(stack + sp, LPR_IMAGE_INITIAL_RANDOM_BYTES, 0) !=
+        (int)LPR_IMAGE_INITIAL_RANDOM_BYTES)
+    {
         (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -5;
     }
-    sp &= ~15ull;
+    sp &= ~(LPR_IMAGE_INITIAL_STACK_ALIGNMENT - 1u);
 
     const int has_bootstrap =
         (request->flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0 && bootstrap_fd >= 16;
     if (push_u64(stack, &sp, 0) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_NULL) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_NULL) != 0 ||
         (has_bootstrap &&
             (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 ||
-             push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
+             push_u64(stack, &sp, LPR_IMAGE_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, argv0_va) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_EXECFN) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_RANDOM) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_RANDOM) != 0 ||
         push_u64(stack, &sp, plan->main_entry) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_ENTRY) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_ENTRY) != 0 ||
         push_u64(stack, &sp, plan->interpreter_base) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_BASE) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_BASE) != 0 ||
         push_u64(stack, &sp, 0) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_SECURE) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_SECURE) != 0 ||
         push_u64(stack, &sp, 100) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_CLKTCK) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_CLKTCK) != 0 ||
         push_u64(stack, &sp, 0) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_HWCAP) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_HWCAP) != 0 ||
         push_u64(stack, &sp, 0) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_EGID) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_EGID) != 0 ||
         push_u64(stack, &sp, 0) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_GID) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_GID) != 0 ||
         push_u64(stack, &sp, 0) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_EUID) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_EUID) != 0 ||
         push_u64(stack, &sp, 0) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_UID) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_PAGE_SIZE) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_PAGESZ) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_UID) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_PAGE_SIZE) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_PAGESZ) != 0 ||
         push_u64(stack, &sp, plan->phnum) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_PHNUM) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_PHNUM) != 0 ||
         push_u64(stack, &sp, plan->phent) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_PHENT) != 0 ||
+        push_u64(stack, &sp, LPR_IMAGE_AT_PHENT) != 0 ||
         push_u64(stack, &sp, plan->phdr_va) != 0 ||
-        push_u64(stack, &sp, LPR_EXEC_AT_PHDR) != 0)
+        push_u64(stack, &sp, LPR_IMAGE_AT_PHDR) != 0)
     {
         (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
@@ -376,7 +378,13 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_v2_exec_path_t *reque
         PACHA_FD_RIGHT_SET_CONTEXT;
     stage_start = lpr_exec_now_ns();
     stage_start_cycles = lpr_exec_now_cycles();
-    const int thread_fd = pacha_thread_create(plan->process_fd, plan->runtime_entry, stack_base + sp, 0, 0, thread_rights);
+    const int thread_fd = pacha_thread_create(
+        plan->process_fd,
+        plan->runtime_entry,
+        stack_base + sp,
+        LPR_IMAGE_INITIAL_THREAD_ARG0,
+        LPR_IMAGE_INITIAL_THREAD_ARG1,
+        thread_rights);
     lpr_exec_metric("start_thread_create", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_thread_create", stage_start_cycles, lpr_exec_now_cycles());
     if (thread_fd < 16) {

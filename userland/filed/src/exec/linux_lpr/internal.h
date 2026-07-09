@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include <personality/zpoline.h>
+#include <personality/lpr_image_abi.h>
 
 #include "filed/payload_v2.h"
 #include "filed/runtime.h"
@@ -13,7 +13,6 @@
 #include "pacha/ipc.h"
 
 enum {
-    LPR_EXEC_PAGE_SIZE = 4096,
     LPR_EXEC_EHDR_BYTES = 64,
     LPR_EXEC_PHDR_BYTES = 56,
     LPR_EXEC_SHDR_BYTES = 64,
@@ -32,34 +31,16 @@ enum {
     LPR_EXEC_PF_R = 4,
     LPR_EXEC_SHT_SYMTAB = 2,
     LPR_EXEC_SHT_DYNSYM = 11,
-    LPR_EXEC_AT_NULL = 0,
-    LPR_EXEC_AT_PHDR = 3,
-    LPR_EXEC_AT_PHENT = 4,
-    LPR_EXEC_AT_PHNUM = 5,
-    LPR_EXEC_AT_PAGESZ = 6,
-    LPR_EXEC_AT_BASE = 7,
-    LPR_EXEC_AT_ENTRY = 9,
-    LPR_EXEC_AT_UID = 11,
-    LPR_EXEC_AT_EUID = 12,
-    LPR_EXEC_AT_GID = 13,
-    LPR_EXEC_AT_EGID = 14,
-    LPR_EXEC_AT_HWCAP = 16,
-    LPR_EXEC_AT_CLKTCK = 17,
-    LPR_EXEC_AT_SECURE = 23,
-    LPR_EXEC_AT_RANDOM = 25,
-    LPR_EXEC_AT_EXECFN = 31,
     LPR_EXEC_MAX_IMAGE_BYTES = 64ull * 1024ull * 1024ull,
     LPR_EXEC_MAX_INTERP_BYTES = 256,
-    LPR_EXEC_LPR_BASE = 0x04000000ull,
-    LPR_EXEC_MAIN_DYN_BASE = 0x10000000ull,
-    LPR_EXEC_INTERP_DYN_BASE = 0x20000000ull,
     LPR_EXEC_WALK_RIGHTS =
         FILED_RIGHT_LOOKUP |
         FILED_RIGHT_STAT |
         FILED_RIGHT_GETDENTS,
 };
 
-#define LPR_EXEC_RUNTIME_PATH "/lib/pacha/lpr-linux-x86_64.so"
+_Static_assert(LPR_IMAGE_PAGE_SIZE == 4096ull, "filed exec page size must match the LPR image ABI");
+_Static_assert(LPR_IMAGE_AT_BOOTSTRAP_FD == PACHA_AT_BOOTSTRAP_FD, "bootstrap auxv key must match the Pacha ABI");
 
 typedef struct lpr_exec_image {
     unsigned char *bytes;
@@ -142,15 +123,15 @@ static inline void lpr_exec_wr64(unsigned char *p, uint64_t value)
 
 static inline uint64_t lpr_exec_align_down(uint64_t value)
 {
-    return value & ~(uint64_t)(LPR_EXEC_PAGE_SIZE - 1);
+    return value & ~(uint64_t)(LPR_IMAGE_PAGE_SIZE - 1);
 }
 
 static inline int lpr_exec_align_up(uint64_t value, uint64_t *out)
 {
-    if (out == NULL || value > UINT64_MAX - (LPR_EXEC_PAGE_SIZE - 1)) {
+    if (out == NULL || value > UINT64_MAX - (LPR_IMAGE_PAGE_SIZE - 1)) {
         return -75;
     }
-    *out = (value + (LPR_EXEC_PAGE_SIZE - 1)) & ~(uint64_t)(LPR_EXEC_PAGE_SIZE - 1);
+    *out = (value + (LPR_IMAGE_PAGE_SIZE - 1)) & ~(uint64_t)(LPR_IMAGE_PAGE_SIZE - 1);
     return 0;
 }
 

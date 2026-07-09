@@ -84,6 +84,7 @@ const char *pacha_trace_event_name(uint32_t event)
     case PACHA_TRACE_EVENT_LPR_SOCKET_CREATE: return "socket.create";
     case PACHA_TRACE_EVENT_LPR_SOCKET_CONNECT: return "socket.connect";
     case PACHA_TRACE_EVENT_LPR_NETD_CALL: return "netd.call";
+    case PACHA_TRACE_EVENT_LPR_IMAGE_ABI_MISMATCH: return "image_abi.mismatch";
     case PACHA_TRACE_EVENT_FILED_METRIC_DISPATCH: return "filed.metric.dispatch";
     case PACHA_TRACE_EVENT_FILED_METRIC_FAST: return "filed.metric.fast";
     case PACHA_TRACE_EVENT_FILED_METRIC_FAST_OP: return "filed.metric.fast_op";

@@ -456,7 +456,7 @@ int filed_dispatch_create_lpr_bootstrap_fd(
     }
     memset(bootstrap, 0, sizeof(*bootstrap));
     bootstrap->magic = LPR_BOOTSTRAP_MAGIC;
-    bootstrap->version = LPR_BOOTSTRAP_VERSION;
+    bootstrap->image_abi_version = LPR_IMAGE_ABI_VERSION;
     bootstrap->byte_size = bootstrap_bytes;
     bootstrap->local_fd_table_offset = sizeof(struct lpr_bootstrap);
     bootstrap->local_fd_table_bytes = local_fd_bytes;

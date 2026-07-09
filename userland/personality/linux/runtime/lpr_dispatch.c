@@ -10,6 +10,7 @@
 #include <pacha/trace.h>
 #include <pachaos/abi.h>
 #include <personality/linux_lpr.h>
+#include <personality/zpoline.h>
 #include <stddef.h>
 
 #define LPR_LINUX_PROT_READ 0x1ull
@@ -1038,6 +1039,7 @@ static void lpr_syscall_table_init(void)
     if (lpr_syscall_table_initialized) {
         return;
     }
+    (void)lpr_load_bootstrap();
     lpr_syscall_table[LPR_LINUX_SYS_READ].handler = lpr_sys_read;
     lpr_syscall_table[LPR_LINUX_SYS_WRITE].handler = lpr_sys_write;
     lpr_syscall_table[LPR_LINUX_SYS_OPEN].handler = lpr_sys_open;

@@ -18,6 +18,7 @@
 #include "pacha/status.h"
 #include "pacha/syscall.h"
 #include "pacha/trace.h"
+#include "personality/lpr_image_abi.h"
 #include "personality/linux_lpr.h"
 #include "termd/ipc_protocol_v2.h"
 #include "../internal/dispatch_state.h"

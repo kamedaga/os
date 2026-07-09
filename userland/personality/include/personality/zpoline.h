@@ -2,23 +2,7 @@
 #define PERSONALITY_ZPOLINE_H
 
 #include <stdint.h>
-#include "personality_abi.h"
-
-#define LPR_ZPOLINE_PAGE_VA 0ull
-#define LPR_ZPOLINE_PAGE_SIZE PERSONALITY_PAGE_SIZE
-#define LPR_LOW_GUARD_START_VA (LPR_ZPOLINE_PAGE_VA + LPR_ZPOLINE_PAGE_SIZE)
-#define LPR_LOW_GUARD_END_VA 0x00100000ull
-#define LPR_LOW_GUARD_SIZE (LPR_LOW_GUARD_END_VA - LPR_LOW_GUARD_START_VA)
-#define LPR_LOW_USER_MIN_VA LPR_LOW_GUARD_END_VA
-#define LPR_LINUX_ET_EXEC_BASE_VA 0x00400000ull
-#define LPR_ZPOLINE_PATCH_FROM0 0x0fu
-#define LPR_ZPOLINE_PATCH_FROM1 0x05u
-#define LPR_ZPOLINE_PATCH_TO0 0xffu
-#define LPR_ZPOLINE_PATCH_TO1 0xd0u
-#define LPR_ZPOLINE_SHIM_SIZE 14u
-#define LPR_ZPOLINE_SHIM_OFFSET 512u
-#define LPR_ZPOLINE_DIRECT_LIMIT LPR_ZPOLINE_SHIM_OFFSET
-#define LPR_ZPOLINE_MAX_SYSCALL_NR LPR_ZPOLINE_DIRECT_LIMIT
+#include "lpr_image_abi.h"
 
 enum lpr_patch_flags {
     LPR_PATCH_FLAG_EXECUTABLE = 1u << 0,
@@ -56,5 +40,11 @@ _Static_assert(LPR_LOW_GUARD_SIZE >= PERSONALITY_PAGE_SIZE, "low guard must cont
 _Static_assert(LPR_LOW_GUARD_END_VA <= LPR_LINUX_ET_EXEC_BASE_VA, "low guard must not reserve normal ET_EXEC base");
 _Static_assert(LPR_ZPOLINE_SHIM_OFFSET == 512, "zpoline shim should keep normal Linux syscall numbers short");
 _Static_assert(LPR_ZPOLINE_SHIM_OFFSET + LPR_ZPOLINE_SHIM_SIZE < LPR_ZPOLINE_PAGE_SIZE, "zpoline shim must fit in the low page");
+
+int64_t lpr_patch_mapping(const struct lpr_patch_mapping_request *request,
+                          struct lpr_patch_mapping_result *result);
+int64_t lpr_init_zpoline_page(uint8_t *page);
+int64_t lpr_build_zpoline_page(uint8_t *page, uint64_t handler_va);
+uint64_t lpr_zpoline_common_offset(void);
 
 #endif

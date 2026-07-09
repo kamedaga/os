@@ -1,0 +1,118 @@
+#pragma once
+
+#include "personality_abi.h"
+
+/*
+ * Process-image contract shared by filed's Linux exec builder and the LPR
+ * runtime.  Keep this header limited to constants: runtime types and helpers
+ * belong to their respective internal headers.
+ */
+
+#define LPR_IMAGE_ABI_VERSION 5ull
+
+/* Fixed process-image mappings. */
+#define LPR_IMAGE_PAGE_SIZE PERSONALITY_PAGE_SIZE
+#define LPR_IMAGE_RUNTIME_PATH "/lib/pacha/lpr-linux-x86_64.so"
+#define LPR_IMAGE_RUNTIME_BASE_VA 0x04000000ull
+#define LPR_IMAGE_MAIN_DYN_BASE_VA 0x10000000ull
+#define LPR_IMAGE_INTERP_DYN_BASE_VA 0x20000000ull
+#define LPR_LINUX_ET_EXEC_BASE_VA 0x00400000ull
+
+/*
+ * Initial-entry protocol: AT_ENTRY always names the main executable entry,
+ * AT_BASE is zero without PT_INTERP and otherwise names the interpreter base,
+ * and the initial instruction pointer is the interpreter entry when present.
+ */
+#define LPR_IMAGE_INITIAL_STACK_ALIGNMENT 16ull
+#define LPR_IMAGE_INITIAL_RANDOM_BYTES 16ull
+#define LPR_IMAGE_INITIAL_THREAD_ARG0 0ull
+#define LPR_IMAGE_INITIAL_THREAD_ARG1 0ull
+#define LPR_IMAGE_SYSCALL_ENTRY_SYMBOL "lpr_syscall_entry"
+
+/* Linux/Pacha auxv keys emitted by the exec builder. */
+#define LPR_IMAGE_AT_NULL 0ull
+#define LPR_IMAGE_AT_PHDR 3ull
+#define LPR_IMAGE_AT_PHENT 4ull
+#define LPR_IMAGE_AT_PHNUM 5ull
+#define LPR_IMAGE_AT_PAGESZ 6ull
+#define LPR_IMAGE_AT_BASE 7ull
+#define LPR_IMAGE_AT_ENTRY 9ull
+#define LPR_IMAGE_AT_UID 11ull
+#define LPR_IMAGE_AT_EUID 12ull
+#define LPR_IMAGE_AT_GID 13ull
+#define LPR_IMAGE_AT_EGID 14ull
+#define LPR_IMAGE_AT_HWCAP 16ull
+#define LPR_IMAGE_AT_CLKTCK 17ull
+#define LPR_IMAGE_AT_SECURE 23ull
+#define LPR_IMAGE_AT_RANDOM 25ull
+#define LPR_IMAGE_AT_EXECFN 31ull
+#define LPR_IMAGE_AT_BOOTSTRAP_FD 0x70000000ull
+
+/* Low zpoline mapping and guard hole. */
+#define LPR_ZPOLINE_PAGE_VA 0ull
+#define LPR_ZPOLINE_PAGE_SIZE LPR_IMAGE_PAGE_SIZE
+#define LPR_LOW_GUARD_START_VA (LPR_ZPOLINE_PAGE_VA + LPR_ZPOLINE_PAGE_SIZE)
+#define LPR_LOW_GUARD_END_VA 0x00100000ull
+#define LPR_LOW_GUARD_SIZE (LPR_LOW_GUARD_END_VA - LPR_LOW_GUARD_START_VA)
+#define LPR_LOW_USER_MIN_VA LPR_LOW_GUARD_END_VA
+
+/* Patched Linux syscall instruction and the direct-call NOP sled. */
+#define LPR_ZPOLINE_PATCH_FROM0 0x0fu
+#define LPR_ZPOLINE_PATCH_FROM1 0x05u
+#define LPR_ZPOLINE_PATCH_TO0 0xffu
+#define LPR_ZPOLINE_PATCH_TO1 0xd0u
+#define LPR_ZPOLINE_NOP_BYTE 0x90u
+#define LPR_ZPOLINE_SHIM_OFFSET 512u
+#define LPR_ZPOLINE_SHIM_SIZE 14u
+#define LPR_ZPOLINE_DIRECT_LIMIT LPR_ZPOLINE_SHIM_OFFSET
+#define LPR_ZPOLINE_MAX_SYSCALL_NR LPR_ZPOLINE_DIRECT_LIMIT
+
+/* Common zpoline shim: pop %rcx; movabs handler,%r11; jmp *%r11. */
+#define LPR_ZPOLINE_SHIM_POP_RCX_OFFSET 0u
+#define LPR_ZPOLINE_SHIM_POP_RCX_BYTE 0x59u
+#define LPR_ZPOLINE_SHIM_MOVABS_R11_OFFSET 1u
+#define LPR_ZPOLINE_SHIM_MOVABS_R11_BYTE0 0x49u
+#define LPR_ZPOLINE_SHIM_MOVABS_R11_BYTE1 0xbbu
+#define LPR_ZPOLINE_SHIM_HANDLER_VA_OFFSET 3u
+#define LPR_ZPOLINE_SHIM_HANDLER_VA_SIZE 8u
+#define LPR_ZPOLINE_SHIM_JMP_R11_OFFSET 11u
+#define LPR_ZPOLINE_SHIM_JMP_R11_BYTE0 0x41u
+#define LPR_ZPOLINE_SHIM_JMP_R11_BYTE1 0xffu
+#define LPR_ZPOLINE_SHIM_JMP_R11_BYTE2 0xe3u
+
+/* Bootstrap VMO and fixed descriptor inherited by the new process. */
+#define LPR_BOOTSTRAP_FD 243
+#define LPR_SUPERVISOR_ENDPOINT_FD 244
+#define LPR_BOOTSTRAP_MAGIC 0x315450424c50524cull
+#define LPR_BOOTSTRAP_FLAG_DEFAULT_STDIO 1ull
+#define LPR_BOOTSTRAP_FLAG_SUPERVISOR 2ull
+#define LPR_BOOTSTRAP_FD_FILED 1u
+#define LPR_BOOTSTRAP_FD_TTY 2u
+#define LPR_BOOTSTRAP_FD_PIPE 3u
+#define LPR_BOOTSTRAP_FD_EVENT 4u
+#define LPR_BOOTSTRAP_FD_SOCKET 5u
+#define LPR_BOOTSTRAP_FD_NATIVE 6u
+#define LPR_BOOTSTRAP_CTTY_BYTES 64u
+#define LPR_BOOTSTRAP_CWD_BYTES 480u
+
+/* Byte layout of struct lpr_bootstrap; the local fd table follows the header. */
+#define LPR_BOOTSTRAP_MAGIC_OFFSET 0u
+#define LPR_BOOTSTRAP_IMAGE_ABI_VERSION_OFFSET 8u
+#define LPR_BOOTSTRAP_BYTE_SIZE_OFFSET 16u
+#define LPR_BOOTSTRAP_LOCAL_FD_TABLE_OFFSET_OFFSET 24u
+#define LPR_BOOTSTRAP_LOCAL_FD_TABLE_BYTES_OFFSET 32u
+#define LPR_BOOTSTRAP_LOCAL_FD_COUNT_OFFSET 40u
+#define LPR_BOOTSTRAP_LINUX_PID_OFFSET 48u
+#define LPR_BOOTSTRAP_LINUX_PPID_OFFSET 56u
+#define LPR_BOOTSTRAP_LINUX_SID_OFFSET 64u
+#define LPR_BOOTSTRAP_LINUX_PGRP_OFFSET 72u
+#define LPR_BOOTSTRAP_LINUX_NEXT_PID_OFFSET 80u
+#define LPR_BOOTSTRAP_CWD_HANDLE_OFFSET 88u
+#define LPR_BOOTSTRAP_SUPERVISOR_TOKEN_OFFSET 96u
+#define LPR_BOOTSTRAP_SUPERVISOR_ENDPOINT_FD_OFFSET 104u
+#define LPR_BOOTSTRAP_FD_TABLE_TOKEN_OFFSET 112u
+#define LPR_BOOTSTRAP_FLAGS_OFFSET 120u
+#define LPR_BOOTSTRAP_CTTY_OFFSET 128u
+#define LPR_BOOTSTRAP_CWD_OFFSET 192u
+#define LPR_BOOTSTRAP_HEADER_SIZE 672u
+#define LPR_BOOTSTRAP_FD_ENTRY_SIZE 40u

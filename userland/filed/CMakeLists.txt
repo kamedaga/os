@@ -156,7 +156,7 @@ add_custom_command(
     ${FILED_EXTRA_SOURCES}
     "${REPO_ROOT}/userland/koboxd/include/koboxd/control_protocol_v2.h"
     "${REPO_ROOT}/userland/koboxd/include/koboxd/storage_protocol_v2.h"
-    "${REPO_ROOT}/userland/personality/include/personality/zpoline.h"
+    "${REPO_ROOT}/userland/personality/include/personality/lpr_image_abi.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM

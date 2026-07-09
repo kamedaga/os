@@ -128,7 +128,7 @@ static int lpr_exec_get_runtime_image(
         return 0;
     }
 
-    int status = lpr_exec_open_absolute_file(runtime, LPR_EXEC_RUNTIME_PATH, &file);
+    int status = lpr_exec_open_absolute_file(runtime, LPR_IMAGE_RUNTIME_PATH, &file);
     if (status != 0) {
         return status;
     }
@@ -151,7 +151,7 @@ static int lpr_exec_get_runtime_image(
         return status;
     }
     uint64_t syscall_entry_offset = 0;
-    status = lpr_exec_image_find_symbol(&image, "lpr_syscall_entry", &syscall_entry_offset);
+    status = lpr_exec_image_find_symbol(&image, LPR_IMAGE_SYSCALL_ENTRY_SYMBOL, &syscall_entry_offset);
     if (status != 0 || syscall_entry_offset == 0) {
         free(image.bytes);
         lpr_exec_close_file(runtime, &file);
@@ -491,7 +491,7 @@ static int load_plan(
     status = lpr_exec_get_runtime_image(runtime, &lpr_image, &syscall_entry_offset);
     LPR_EXEC_STAGE_RECORD("get_lpr_runtime", stage_start, stage_start_cycles);
     if (status != 0) {
-        fprintf(stderr, "[filed] linux-lpr: runtime missing path=%s status=%d\n", LPR_EXEC_RUNTIME_PATH, status);
+        fprintf(stderr, "[filed] linux-lpr: runtime missing path=%s status=%d\n", LPR_IMAGE_RUNTIME_PATH, status);
         return status;
     }
 
@@ -517,7 +517,7 @@ static int load_plan(
     status = lpr_exec_load_image_with_low_layout_into_process(
         process_fd,
         lpr_image,
-        LPR_EXEC_LPR_BASE,
+        LPR_IMAGE_RUNTIME_BASE_VA,
         0,
         syscall_entry_offset,
         &lpr_loaded);
@@ -538,7 +538,7 @@ static int load_plan(
         runtime,
         main_file,
         main_meta,
-        LPR_EXEC_MAIN_DYN_BASE,
+        LPR_IMAGE_MAIN_DYN_BASE_VA,
         1,
         &file_map_batch,
         &main_loaded);
@@ -585,7 +585,7 @@ static int load_plan(
             runtime,
             interp_file,
             interp_meta,
-            LPR_EXEC_INTERP_DYN_BASE,
+            LPR_IMAGE_INTERP_DYN_BASE_VA,
             1,
             &file_map_batch,
             &interp_loaded);
@@ -639,7 +639,7 @@ static int lpr_exec_prewarm_runtime(filed_runtime_t *runtime)
     status = lpr_exec_load_image_with_low_layout_into_process(
         process_fd,
         lpr_image,
-        LPR_EXEC_LPR_BASE,
+        LPR_IMAGE_RUNTIME_BASE_VA,
         0,
         syscall_entry_offset,
         &loaded);
@@ -668,7 +668,7 @@ static int lpr_exec_prewarm_interpreter(filed_runtime_t *runtime)
         runtime,
         interp_file,
         interp_meta,
-        LPR_EXEC_INTERP_DYN_BASE,
+        LPR_IMAGE_INTERP_DYN_BASE_VA,
         1,
         &batch,
         &loaded);

@@ -1,11 +1,12 @@
 #ifndef PERSONALITY_LINUX_LPR_H
 #define PERSONALITY_LINUX_LPR_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <pacha/status.h>
+#include "lpr_image_abi.h"
 #include "personality_abi.h"
 #include "runtime_page.h"
-#include "zpoline.h"
 
 #define LPR_LINUX_SYS_READ 0ull
 #define LPR_LINUX_SYS_WRITE 1ull
@@ -133,21 +134,6 @@
 #define LPR_LINUX_ARCH_GET_FS 0x1003ull
 #define LPR_LINUX_ARCH_GET_GS 0x1004ull
 
-#define LPR_BOOTSTRAP_FD 243
-#define LPR_SUPERVISOR_ENDPOINT_FD 244
-#define LPR_BOOTSTRAP_MAGIC 0x315450424c50524cull
-#define LPR_BOOTSTRAP_VERSION 5ull
-#define LPR_BOOTSTRAP_FLAG_DEFAULT_STDIO 1ull
-#define LPR_BOOTSTRAP_FLAG_SUPERVISOR 2ull
-#define LPR_BOOTSTRAP_FD_FILED 1u
-#define LPR_BOOTSTRAP_FD_TTY 2u
-#define LPR_BOOTSTRAP_FD_PIPE 3u
-#define LPR_BOOTSTRAP_FD_EVENT 4u
-#define LPR_BOOTSTRAP_FD_SOCKET 5u
-#define LPR_BOOTSTRAP_FD_NATIVE 6u
-#define LPR_BOOTSTRAP_CTTY_BYTES 64
-#define LPR_BOOTSTRAP_CWD_BYTES 480
-
 typedef struct lpr_bootstrap_fd {
     uint64_t fd;
     uint64_t kind;
@@ -158,7 +144,7 @@ typedef struct lpr_bootstrap_fd {
 
 struct lpr_bootstrap {
     uint64_t magic;
-    uint64_t version;
+    uint64_t image_abi_version;
     uint64_t byte_size;
     uint64_t local_fd_table_offset;
     uint64_t local_fd_table_bytes;
@@ -177,11 +163,27 @@ struct lpr_bootstrap {
     char cwd[LPR_BOOTSTRAP_CWD_BYTES];
 };
 
+_Static_assert(sizeof(lpr_bootstrap_fd_t) == LPR_BOOTSTRAP_FD_ENTRY_SIZE, "lpr bootstrap fd size");
+_Static_assert(offsetof(struct lpr_bootstrap, magic) == LPR_BOOTSTRAP_MAGIC_OFFSET, "lpr bootstrap magic offset");
+_Static_assert(offsetof(struct lpr_bootstrap, image_abi_version) == LPR_BOOTSTRAP_IMAGE_ABI_VERSION_OFFSET, "lpr bootstrap image ABI version offset");
+_Static_assert(offsetof(struct lpr_bootstrap, byte_size) == LPR_BOOTSTRAP_BYTE_SIZE_OFFSET, "lpr bootstrap byte size offset");
+_Static_assert(offsetof(struct lpr_bootstrap, local_fd_table_offset) == LPR_BOOTSTRAP_LOCAL_FD_TABLE_OFFSET_OFFSET, "lpr bootstrap fd table offset field");
+_Static_assert(offsetof(struct lpr_bootstrap, local_fd_table_bytes) == LPR_BOOTSTRAP_LOCAL_FD_TABLE_BYTES_OFFSET, "lpr bootstrap fd table bytes offset");
+_Static_assert(offsetof(struct lpr_bootstrap, local_fd_count) == LPR_BOOTSTRAP_LOCAL_FD_COUNT_OFFSET, "lpr bootstrap fd count offset");
+_Static_assert(offsetof(struct lpr_bootstrap, linux_pid) == LPR_BOOTSTRAP_LINUX_PID_OFFSET, "lpr bootstrap pid offset");
+_Static_assert(offsetof(struct lpr_bootstrap, linux_ppid) == LPR_BOOTSTRAP_LINUX_PPID_OFFSET, "lpr bootstrap ppid offset");
+_Static_assert(offsetof(struct lpr_bootstrap, linux_sid) == LPR_BOOTSTRAP_LINUX_SID_OFFSET, "lpr bootstrap sid offset");
+_Static_assert(offsetof(struct lpr_bootstrap, linux_pgrp) == LPR_BOOTSTRAP_LINUX_PGRP_OFFSET, "lpr bootstrap pgrp offset");
+_Static_assert(offsetof(struct lpr_bootstrap, linux_next_pid) == LPR_BOOTSTRAP_LINUX_NEXT_PID_OFFSET, "lpr bootstrap next pid offset");
+_Static_assert(offsetof(struct lpr_bootstrap, cwd_handle) == LPR_BOOTSTRAP_CWD_HANDLE_OFFSET, "lpr bootstrap cwd handle offset");
+_Static_assert(offsetof(struct lpr_bootstrap, supervisor_token) == LPR_BOOTSTRAP_SUPERVISOR_TOKEN_OFFSET, "lpr bootstrap supervisor token offset");
+_Static_assert(offsetof(struct lpr_bootstrap, supervisor_endpoint_fd) == LPR_BOOTSTRAP_SUPERVISOR_ENDPOINT_FD_OFFSET, "lpr bootstrap supervisor fd offset");
+_Static_assert(offsetof(struct lpr_bootstrap, fd_table_token) == LPR_BOOTSTRAP_FD_TABLE_TOKEN_OFFSET, "lpr bootstrap fd table token offset");
+_Static_assert(offsetof(struct lpr_bootstrap, flags) == LPR_BOOTSTRAP_FLAGS_OFFSET, "lpr bootstrap flags offset");
+_Static_assert(offsetof(struct lpr_bootstrap, ctty) == LPR_BOOTSTRAP_CTTY_OFFSET, "lpr bootstrap ctty offset");
+_Static_assert(offsetof(struct lpr_bootstrap, cwd) == LPR_BOOTSTRAP_CWD_OFFSET, "lpr bootstrap cwd offset");
+_Static_assert(sizeof(struct lpr_bootstrap) == LPR_BOOTSTRAP_HEADER_SIZE, "lpr bootstrap header size");
+
 int64_t lpr_start(struct lpr_runtime_page *runtime);
-int64_t lpr_patch_mapping(const struct lpr_patch_mapping_request *request,
-                          struct lpr_patch_mapping_result *result);
-int64_t lpr_init_zpoline_page(uint8_t *page);
-int64_t lpr_build_zpoline_page(uint8_t *page, uint64_t handler_va);
-uint64_t lpr_zpoline_common_offset(void);
 
 #endif
