@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "pacha/ipc.h"
+#include "pacha/trace.h"
 
 #ifndef FILED_LPR_TRACE
 #define FILED_LPR_TRACE 0
@@ -392,30 +393,39 @@ void filed_exec_linux_lpr_dump_metrics(void)
         const uint64_t logical = one_start + i;
         const lpr_exec_one_metric_t *metric =
             &lpr_exec_one_metrics[logical % LPR_EXEC_ONE_METRIC_SLOTS];
-        printf(
-            "[filed] metric scope=lpr_exec_one index=%llu path=%s total_before_reply_cycles=%llu prepare_inherit_cycles=%llu init_main_file_cycles=%llu read_main_meta_cycles=%llu load_plan_cycles=%llu start_plan_cycles=%llu\n",
-            (unsigned long long)logical,
-            metric->path,
-            (unsigned long long)metric->total_before_reply_cycles,
-            (unsigned long long)metric->prepare_inherit_cycles,
-            (unsigned long long)metric->init_main_file_cycles,
-            (unsigned long long)metric->read_main_meta_cycles,
-            (unsigned long long)metric->load_plan_cycles,
-            (unsigned long long)metric->start_plan_cycles);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_EXEC_METRIC,
+            PACHA_TRACE_CLASS_METRIC,
+            logical,
+            pacha_trace_name_id(metric->path),
+            metric->total_before_reply_cycles,
+            metric->prepare_inherit_cycles,
+            metric->init_main_file_cycles,
+            metric->read_main_meta_cycles);
+        pacha_trace3(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_EXEC_METRIC,
+            PACHA_TRACE_CLASS_METRIC,
+            logical,
+            metric->load_plan_cycles,
+            metric->start_plan_cycles);
     }
     for (int i = 0; i < LPR_EXEC_STAGE_MAX; ++i) {
         const lpr_exec_stage_metric_t *metric = &lpr_exec_stage_metrics[i];
         if (metric->count == 0 || metric->name == NULL) {
             continue;
         }
-        printf(
-            "[filed] metric scope=lpr_exec_stage op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu\n",
-            metric->name,
-            (unsigned long long)metric->count,
-            (unsigned long long)(metric->total_ns / metric->count),
-            (unsigned long long)metric->max_ns,
-            (unsigned long long)(metric->count == 0 ? 0 : metric->total_cycles / metric->count),
-            (unsigned long long)metric->max_cycles);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_EXEC_METRIC,
+            PACHA_TRACE_CLASS_METRIC,
+            pacha_trace_name_id(metric->name),
+            metric->count,
+            metric->total_ns / metric->count,
+            metric->max_ns,
+            metric->count == 0 ? 0 : metric->total_cycles / metric->count,
+            metric->max_cycles);
     }
     lpr_exec_image_dump_metrics();
     lpr_exec_map_dump_metrics();

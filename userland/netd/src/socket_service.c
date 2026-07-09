@@ -3,6 +3,7 @@
 #include "libuinet_backend.h"
 #include "netd/ipc_protocol_v2.h"
 #include "pacha/ipc.h"
+#include "pacha/trace.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -23,18 +24,12 @@ static void netd_socket_trace_data_op(uint64_t op, int status, uint64_t result)
             g_netd_socket_recv_bytes += result;
             if (result == 0 || g_netd_socket_recv_bytes <= 4096 ||
                 (g_netd_socket_recv_bytes % (128u * 1024u)) < result) {
-                printf("[netd] socket recv status=%d bytes=%llu total=%llu\n",
-                    status,
-                    (unsigned long long)result,
-                    (unsigned long long)g_netd_socket_recv_bytes);
+                pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_IO, op, (uint64_t)status, result, g_netd_socket_recv_bytes);
             }
             return;
         }
         if (op == NETD_V2_OP_CONNECT || (status != 0 && status != -11)) {
-            printf("[netd] socket op=%llu status=%d result=%llu\n",
-                (unsigned long long)op,
-                status,
-                (unsigned long long)result);
+            pacha_trace3(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, status != 0 ? PACHA_TRACE_CLASS_ERROR : PACHA_TRACE_CLASS_IO, op, (uint64_t)status, result);
         }
     }
 }
@@ -48,21 +43,11 @@ static int netd_socket_send_reply(uint64_t op, int reply_fd, uint64_t request_id
         .word3 = request_id,
     };
     if (g_netd_socket_trace && (op == NETD_V2_OP_CONNECT || op == NETD_V2_OP_POLL)) {
-        printf("[netd] socket reply begin op=%llu status=%lld result=%llu reply_fd=%d\n",
-            (unsigned long long)op,
-            (long long)status,
-            (unsigned long long)result,
-            reply_fd);
-        fflush(stdout);
+        pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_DEBUG, op, (uint64_t)status, result, (uint64_t)(uint32_t)reply_fd);
     }
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
     if (g_netd_socket_trace && (op == NETD_V2_OP_CONNECT || op == NETD_V2_OP_POLL)) {
-        printf("[netd] socket reply end op=%llu status=%d result=%llu reply_fd=%d\n",
-            (unsigned long long)op,
-            reply_status,
-            (unsigned long long)result,
-            reply_fd);
-        fflush(stdout);
+        pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, reply_status != 0 ? PACHA_TRACE_CLASS_ERROR : PACHA_TRACE_CLASS_DEBUG, op, (uint64_t)reply_status, result, (uint64_t)(uint32_t)reply_fd);
     }
     (void)pacha_fd_close(reply_fd);
     return reply_status;
@@ -198,11 +183,14 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
         netd_socket_trace_data_op(request->word1, status, result);
     }
     if (g_netd_socket_trace || (status != 0 && status != -11 && status != -115)) {
-        printf("[netd] socket request op=%llu status=%d result=%llu fds=%llu\n",
-            (unsigned long long)request->word1,
-            status,
-            (unsigned long long)result,
-            (unsigned long long)request->fd_count);
+        pacha_trace4(
+            PACHA_TRACE_COMPONENT_NETD,
+            PACHA_TRACE_EVENT_NETD_SOCKET,
+            status != 0 ? PACHA_TRACE_CLASS_ERROR : PACHA_TRACE_CLASS_DEBUG,
+            request->word1,
+            (uint64_t)status,
+            result,
+            request->fd_count);
     }
     if (page != NULL) {
         (void)pacha_munmap(page, NETD_V2_PAGE_BYTES);
@@ -226,10 +214,10 @@ int netd_socket_service_start(struct netd_runtime *runtime)
     g_netd_socket_errors = 0;
     g_netd_socket_trace = (runtime->cfg->flags & NETD_BOOT_FLAG_TRACE) != 0;
     if (g_netd_socket_endpoint_fd < 16) {
-        fprintf(stderr, "[netd] socket service endpoint missing fd=%d\n", g_netd_socket_endpoint_fd);
+        pacha_trace1(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_ERROR, (uint64_t)(uint32_t)g_netd_socket_endpoint_fd);
         return 8;
     }
-    printf("[netd] socket service ready endpoint_fd=%d\n", g_netd_socket_endpoint_fd);
+    pacha_trace1(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_STATE, (uint64_t)(uint32_t)g_netd_socket_endpoint_fd);
     return 0;
 }
 

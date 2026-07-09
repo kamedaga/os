@@ -10,15 +10,12 @@
 #include <pacha/error_conveyor.h>
 #include <pacha/ipc.h>
 #include <pacha/service_abi.h>
+#include <pacha/trace.h>
 #include <pachaos/abi.h>
 #include <personality/lpr_client_abi.h>
 #include <personality/linux_lpr.h>
 #include <stddef.h>
 #include <stdint.h>
-
-#ifndef LPR_TRACE_PROCESS_CALLS
-#define LPR_TRACE_PROCESS_CALLS 0
-#endif
 
 __attribute__((visibility("hidden")))
 void *memset(void *dst, int c, size_t n)

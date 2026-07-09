@@ -7,6 +7,7 @@ project(pacha C)
 
 add_library(pacha STATIC
   src/syscall.c
+  src/trace.c
 )
 
 target_include_directories(pacha PUBLIC

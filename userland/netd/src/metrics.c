@@ -1,5 +1,6 @@
 #include "netd_internal.h"
 
+#include <pacha/trace.h>
 #include <stdio.h>
 
 struct netd_metric {
@@ -58,15 +59,21 @@ void netd_metrics_print(void)
     for (unsigned i = 0; i < g_netd_metric_count; i++) {
         const struct netd_metric *metric = &g_netd_metrics[i];
         if (metric->name != NULL) {
-            printf("[netd] metric stage=%s name=%s cycles=%llu size=%llu\n",
-                metric->stage,
-                metric->name,
-                (unsigned long long)metric->cycles,
-                (unsigned long long)metric->size);
+            pacha_trace4(
+                PACHA_TRACE_COMPONENT_NETD,
+                PACHA_TRACE_EVENT_NETD_METRIC,
+                PACHA_TRACE_CLASS_METRIC,
+                pacha_trace_name_id(metric->stage),
+                pacha_trace_name_id(metric->name),
+                metric->cycles,
+                metric->size);
         } else {
-            printf("[netd] metric stage=%s cycles=%llu\n",
-                metric->stage,
-                (unsigned long long)metric->cycles);
+            pacha_trace2(
+                PACHA_TRACE_COMPONENT_NETD,
+                PACHA_TRACE_EVENT_NETD_METRIC,
+                PACHA_TRACE_CLASS_METRIC,
+                pacha_trace_name_id(metric->stage),
+                metric->cycles);
         }
     }
 }

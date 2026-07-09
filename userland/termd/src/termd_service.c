@@ -6,6 +6,7 @@
 #include <pacha/abi.h>
 #include <pacha/error_conveyor.h>
 #include <pacha/service_abi.h>
+#include <pacha/trace.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -436,12 +437,7 @@ void termd_service_forward_pending_tty_signals(termd_service_t *service)
         const int send_status =
             termd_send_tty_signal_to_supervisor(service, signal_req.pgrp_id, signal_req.signo);
         if (send_status != 0) {
-            fprintf(stderr,
-                "[termd] supervisor tty signal delivery failed pgrp=%u signo=%u status=%d\n",
-                (unsigned)signal_req.pgrp_id,
-                (unsigned)signal_req.signo,
-                send_status);
-            fflush(stderr);
+            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, signal_req.pgrp_id, signal_req.signo, (uint64_t)send_status);
             break;
         }
     }

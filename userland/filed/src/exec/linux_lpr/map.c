@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "pacha/ipc.h"
+#include "pacha/trace.h"
 typedef struct lpr_exec_map_metric_record {
     const char *name;
     uint64_t count;
@@ -118,15 +119,17 @@ void lpr_exec_map_dump_metrics(void)
         if (metric->name == NULL || metric->count == 0) {
             continue;
         }
-        printf(
-            "[filed] metric scope=lpr_map op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu bytes=%llu\n",
-            metric->name,
-            (unsigned long long)metric->count,
-            (unsigned long long)(metric->total_ns / metric->count),
-            (unsigned long long)metric->max_ns,
-            (unsigned long long)(metric->total_cycles / metric->count),
-            (unsigned long long)metric->max_cycles,
-            (unsigned long long)metric->total_bytes);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_EXEC_METRIC,
+            PACHA_TRACE_CLASS_METRIC,
+            pacha_trace_name_id(metric->name),
+            metric->count,
+            metric->total_ns / metric->count,
+            metric->max_ns,
+            metric->total_cycles / metric->count,
+            metric->max_cycles);
+        pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_EXEC_METRIC, PACHA_TRACE_CLASS_METRIC, pacha_trace_name_id(metric->name), metric->total_bytes);
     }
 }
 

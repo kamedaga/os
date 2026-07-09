@@ -13,7 +13,7 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/error_conveyor.c ${REPO_ROOT}/userland/libpacha/src/syscall.c"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/error_conveyor.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libpacha/src/trace.c"
       "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__"
       bash "${REPO_ROOT}/musl/pachaos/build/build-app-dynamic.sh" "${LPR_SUPERVISOR_ELF}"
@@ -26,6 +26,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/libipc/include/pacha/error_conveyor.h"
     "${REPO_ROOT}/userland/libipc/include/pacha/service_abi.h"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
+    "${REPO_ROOT}/userland/libpacha/src/trace.c"
     "${REPO_ROOT}/musl/pachaos/build/build-app-dynamic.sh"
     "${REPO_ROOT}/musl/pachaos/build/build-runtime.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"

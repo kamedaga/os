@@ -3,6 +3,7 @@
 #include "ipc_wire.h"
 #include "koboxd/control_protocol_v2.h"
 #include "pacha/service_abi.h"
+#include "pacha/trace.h"
 
 #include <stdio.h>
 
@@ -14,7 +15,7 @@ int koboxd_control_serve_get_endpoint(
     struct pacha_ipc_msg request = {0};
     int status = koboxd_recv_ipc_wait(control_fd, &request);
     if (status != 0) {
-        fprintf(stderr, "[koboxd] control recv failed status=%d\n", status);
+        pacha_trace2(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, 1, (uint64_t)status);
         return status;
     }
     if (request.word0 != KOBOXD_V2_CONTROL_MAGIC ||
@@ -22,12 +23,7 @@ int koboxd_control_serve_get_endpoint(
         request.word2 != expected_kind ||
         request.word3 != PACHA_SERVICE_ABI_VERSION)
     {
-        fprintf(stderr,
-            "[koboxd] control request invalid word0=0x%llx op=%llu kind=%llu version=%llu\n",
-            (unsigned long long)request.word0,
-            (unsigned long long)request.word1,
-            (unsigned long long)request.word2,
-            (unsigned long long)request.word3);
+        pacha_trace4(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, request.word0, request.word1, request.word2, request.word3);
         return -2;
     }
 
@@ -40,7 +36,7 @@ int koboxd_control_serve_get_endpoint(
     if (expected_kind == KOBOXD_V2_ENDPOINT_FILED) {
         const int endpoint_fd = pacha_ipc_endpoint_create(koboxd_service_channel_rights, 0);
         if (endpoint_fd < 16) {
-            fprintf(stderr, "[koboxd] filed endpoint create failed status=%d\n", endpoint_fd);
+            pacha_trace2(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, 2, (uint64_t)endpoint_fd);
             return endpoint_fd < 0 ? endpoint_fd : -1;
         }
         const long dup_fd = pacha_fd_fcntl(
@@ -50,7 +46,7 @@ int koboxd_control_serve_get_endpoint(
             koboxd_service_channel_rights);
         if (dup_fd < 16) {
             (void)pacha_fd_close(endpoint_fd);
-            fprintf(stderr, "[koboxd] filed endpoint dup failed status=%ld\n", dup_fd);
+            pacha_trace2(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, 3, (uint64_t)dup_fd);
             return dup_fd < 0 ? (int)dup_fd : -1;
         }
         endpoint->endpoint_fd = endpoint_fd;
@@ -59,7 +55,7 @@ int koboxd_control_serve_get_endpoint(
         struct pacha_ipc_channel_pair pair;
         status = koboxd_create_service_channel_pair(&pair);
         if (status != 0) {
-            fprintf(stderr, "[koboxd] service channel create failed status=%d\n", status);
+            pacha_trace2(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, 4, (uint64_t)status);
             return status;
         }
         endpoint->endpoint_fd = pair.b;
@@ -72,10 +68,7 @@ int koboxd_control_serve_get_endpoint(
         if (client_fd >= 16) {
             (void)pacha_fd_close(client_fd);
         }
-        fprintf(stderr,
-            "[koboxd] endpoint fd send failed kind=%llu status=%d\n",
-            (unsigned long long)expected_kind,
-            status);
+        pacha_trace2(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, expected_kind, (uint64_t)status);
         return status;
     }
     return 0;

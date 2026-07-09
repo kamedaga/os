@@ -4,6 +4,7 @@
 #include "support/string.h"
 #include "support/syscall.h"
 #include <pacha/ipc.h>
+#include <pacha/trace.h>
 #include <pachaos/abi.h>
 #include <personality/lpr_client_abi.h>
 #include <personality/linux_lpr.h>
@@ -56,9 +57,6 @@
 #define LPR_LINUX_UIO_MAXIOV 1024u
 #define LPR_NETD_DEFAULT_ADDR_BE 0x0f02000au
 #define LPR_NETD_EPHEMERAL_PORT_BASE 49152u
-#ifndef LPR_TRACE_NETD_CALLS
-#define LPR_TRACE_NETD_CALLS 0
-#endif
 
 #define LPR_USER_LOW_GUARD_END 4096ull
 #define LPR_USER_CANONICAL_END 0x0000800000000000ull
@@ -184,60 +182,16 @@ static int64_t lpr_negative_status(int64_t status)
     return status < 0 ? status : -LPR_LINUX_EIO;
 }
 
-#if LPR_TRACE_NETD_CALLS
-static char *lpr_socket_debug_append_literal(char *out, const char *end, const char *text)
-{
-    while (out < end && *text != 0) {
-        *out++ = *text++;
-    }
-    return out;
-}
-
-static char *lpr_socket_debug_append_u64(char *out, const char *end, uint64_t value)
-{
-    char tmp[32];
-    uint64_t n = 0;
-    do {
-        tmp[n++] = (char)('0' + (value % 10u));
-        value /= 10u;
-    } while (value != 0 && n < sizeof(tmp));
-    while (n != 0 && out < end) {
-        *out++ = tmp[--n];
-    }
-    return out;
-}
-
 static void lpr_socket_debug_connect(const char *phase, uint32_t addr_be, uint16_t port_be, int64_t status)
 {
-    const uint8_t *addr = (const uint8_t *)&addr_be;
-    const uint8_t *port = (const uint8_t *)&port_be;
-    char line[160];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_socket_debug_append_literal(out, end, "[lpr_socket] connect ");
-    out = lpr_socket_debug_append_literal(out, end, phase);
-    out = lpr_socket_debug_append_literal(out, end, " addr=");
-    out = lpr_socket_debug_append_u64(out, end, addr[0]);
-    out = lpr_socket_debug_append_literal(out, end, ".");
-    out = lpr_socket_debug_append_u64(out, end, addr[1]);
-    out = lpr_socket_debug_append_literal(out, end, ".");
-    out = lpr_socket_debug_append_u64(out, end, addr[2]);
-    out = lpr_socket_debug_append_literal(out, end, ".");
-    out = lpr_socket_debug_append_u64(out, end, addr[3]);
-    out = lpr_socket_debug_append_literal(out, end, " port=");
-    out = lpr_socket_debug_append_u64(out, end, ((uint64_t)port[0] << 8) | port[1]);
-    out = lpr_socket_debug_append_literal(out, end, " status=");
-    if (status < 0) {
-        out = lpr_socket_debug_append_literal(out, end, "-");
-        status = -status;
-    }
-    out = lpr_socket_debug_append_u64(out, end, (uint64_t)status);
-    out = lpr_socket_debug_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall3(
-        PACHAOS_SYSCALL_FD_WRITE,
-        2,
-        (uint64_t)(uintptr_t)line,
-        (uint64_t)(out - line));
+    pacha_trace4(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_SOCKET_CONNECT,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id(phase),
+        addr_be,
+        port_be,
+        (uint64_t)status);
 }
 
 static void lpr_netd_debug_call(const char *phase, uint64_t op, uint64_t request_id, int64_t status, uint64_t result)
@@ -245,48 +199,16 @@ static void lpr_netd_debug_call(const char *phase, uint64_t op, uint64_t request
     if (op != NETD_V2_OP_POLL && op != NETD_V2_OP_CONNECT) {
         return;
     }
-    char line[192];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_socket_debug_append_literal(out, end, "[lpr_socket] netd ");
-    out = lpr_socket_debug_append_literal(out, end, phase);
-    out = lpr_socket_debug_append_literal(out, end, " op=");
-    out = lpr_socket_debug_append_u64(out, end, op);
-    out = lpr_socket_debug_append_literal(out, end, " req=");
-    out = lpr_socket_debug_append_u64(out, end, request_id);
-    out = lpr_socket_debug_append_literal(out, end, " status=");
-    if (status < 0) {
-        out = lpr_socket_debug_append_literal(out, end, "-");
-        status = -status;
-    }
-    out = lpr_socket_debug_append_u64(out, end, (uint64_t)status);
-    out = lpr_socket_debug_append_literal(out, end, " result=");
-    out = lpr_socket_debug_append_u64(out, end, result);
-    out = lpr_socket_debug_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall3(
-        PACHAOS_SYSCALL_FD_WRITE,
-        2,
-        (uint64_t)(uintptr_t)line,
-        (uint64_t)(out - line));
+    pacha_trace5(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_NETD_CALL,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id(phase),
+        op,
+        request_id,
+        (uint64_t)status,
+        result);
 }
-#else
-static void lpr_socket_debug_connect(const char *phase, uint32_t addr_be, uint16_t port_be, int64_t status)
-{
-    (void)phase;
-    (void)addr_be;
-    (void)port_be;
-    (void)status;
-}
-
-static void lpr_netd_debug_call(const char *phase, uint64_t op, uint64_t request_id, int64_t status, uint64_t result)
-{
-    (void)phase;
-    (void)op;
-    (void)request_id;
-    (void)status;
-    (void)result;
-}
-#endif
 
 static int lpr_socket_connect_target_supported(uint32_t addr_be)
 {
@@ -350,55 +272,17 @@ static void lpr_fdset_clear(uint64_t *set, uint64_t fd)
     set[fd / 64u] &= ~(1ull << (fd % 64u));
 }
 
-#if LPR_TRACE_SOCKET
-static char *lpr_socket_append_literal(char *out, const char *end, const char *text)
-{
-    while (out < end && *text != 0) {
-        *out++ = *text++;
-    }
-    return out;
-}
-
-static char *lpr_socket_append_u64(char *out, const char *end, uint64_t value)
-{
-    char tmp[20];
-    uint64_t n = 0;
-    do {
-        tmp[n++] = (char)('0' + (value % 10u));
-        value /= 10u;
-    } while (value != 0 && n < sizeof(tmp));
-    while (out < end && n != 0) {
-        *out++ = tmp[--n];
-    }
-    return out;
-}
-
-static char *lpr_socket_append_i64(char *out, const char *end, int64_t value)
-{
-    if (value < 0) {
-        out = lpr_socket_append_literal(out, end, "-");
-        return lpr_socket_append_u64(out, end, (uint64_t)(-value));
-    }
-    return lpr_socket_append_u64(out, end, (uint64_t)value);
-}
-
 static void lpr_socket_trace_socket(uint64_t domain, uint64_t type, uint64_t protocol, int64_t result)
 {
-    char line[192];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_socket_append_literal(out, end, "[lpr_socket] socket domain=");
-    out = lpr_socket_append_u64(out, end, domain);
-    out = lpr_socket_append_literal(out, end, " type=");
-    out = lpr_socket_append_u64(out, end, type);
-    out = lpr_socket_append_literal(out, end, " protocol=");
-    out = lpr_socket_append_u64(out, end, protocol);
-    out = lpr_socket_append_literal(out, end, " result=");
-    out = lpr_socket_append_i64(out, end, result);
-    out = lpr_socket_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    pacha_trace4(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_SOCKET_CREATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        domain,
+        type,
+        protocol,
+        (uint64_t)result);
 }
-#endif
 
 static int lpr_netd_endpoint_ready(void)
 {
@@ -587,9 +471,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
 {
     if (domain != LPR_LINUX_AF_INET) {
         const int64_t result = -LPR_LINUX_EAFNOSUPPORT;
-#if LPR_TRACE_SOCKET
         lpr_socket_trace_socket(domain, type, protocol, result);
-#endif
         return result;
     }
     const uint64_t flags = type & (LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC);
@@ -607,9 +489,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
         }
     } else {
         const int64_t result = -LPR_LINUX_ESOCKTNOSUPPORT;
-#if LPR_TRACE_SOCKET
         lpr_socket_trace_socket(domain, type, protocol, result);
-#endif
         return result;
     }
 
@@ -628,18 +508,14 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
     const int64_t status = lpr_netd_call(NETD_V2_OP_SOCKET, page_fd, 0, &handle);
     lpr_netd_destroy_page(page_fd, page);
     if (status != 0) {
-#if LPR_TRACE_SOCKET
         lpr_socket_trace_socket(domain, type, protocol, status);
-#endif
         return status;
     }
 
     const int fd = lpr_socket_alloc_fd();
     if (fd < 0) {
         (void)lpr_netd_call(NETD_V2_OP_CLOSE, -1, handle, 0);
-#if LPR_TRACE_SOCKET
         lpr_socket_trace_socket(domain, type, protocol, fd);
-#endif
         return fd;
     }
     lpr_sockets[fd].active = 1;
@@ -661,9 +537,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
     lpr_sockets[fd].local_port_be = lpr_socket_next_port_be();
     lpr_sockets[fd].peer_addr_be = 0;
     lpr_sockets[fd].peer_port_be = 0;
-#if LPR_TRACE_SOCKET
     lpr_socket_trace_socket(domain, type, protocol, fd);
-#endif
     return fd;
 }
 

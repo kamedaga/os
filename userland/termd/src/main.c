@@ -3,6 +3,7 @@
 
 #include <pacha/abi.h>
 #include <pacha/ipc.h>
+#include <pacha/trace.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -16,7 +17,7 @@ int main(void)
         cfg->magic != TERMD_BOOT_CONFIG_MAGIC ||
         cfg->tty_endpoint_fd < 16 ||
         cfg->ready_channel_fd < 16) {
-        fprintf(stderr, "[termd] invalid boot config\n");
+        pacha_trace0(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_BOOT_CONFIG_INVALID, PACHA_TRACE_CLASS_ERROR);
         return 1;
     }
 
@@ -26,7 +27,7 @@ int main(void)
 
     const int island_status = termd_linux_tty_island_init(&tty_island, cfg);
     if (island_status != 0) {
-        fprintf(stderr, "[termd] kobox Linux TTY island init failed status=%d\n", island_status);
+        pacha_trace1(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_ISLAND_INIT, PACHA_TRACE_CLASS_ERROR, (uint64_t)island_status);
     }
 
     if (tty_island.ready) {
@@ -56,10 +57,7 @@ int main(void)
     const int ready_send_status =
         termd_service_send_boot_ready(&service, ready_status, tty_island.source_count);
     if (ready_send_status != 0) {
-        fprintf(stderr, "[termd] boot ready send failed status=%d ready_status=%d\n",
-            ready_send_status,
-            ready_status);
-        fflush(stderr);
+        pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_BOOT_READY_SEND, PACHA_TRACE_CLASS_ERROR, (uint64_t)ready_send_status, (uint64_t)ready_status);
         return 1;
     }
     if (ready_status != 0) {
@@ -79,7 +77,7 @@ int main(void)
             (void)termd_service_dispatch_request(&service, &request, fds);
             termd_service_forward_pending_tty_signals(&service);
         } else if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY) {
-            fprintf(stderr, "[termd] recv failed status=%d\n", status);
+            pacha_trace1(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_RECV, PACHA_TRACE_CLASS_ERROR, (uint64_t)status);
         } else {
             termd_service_forward_pending_tty_signals(&service);
         }

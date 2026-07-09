@@ -32,6 +32,7 @@ set(FILED_EXTRA_SOURCES
   "${REPO_ROOT}/userland/libipc/src/error_conveyor.c"
   "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
+  "${REPO_ROOT}/userland/libpacha/src/trace.c"
   "${REPO_ROOT}/userland/personality/linux/hde/hde64.c"
   "${REPO_ROOT}/_kobox/src/device/device_backend.c"
   "${REPO_ROOT}/_kobox/src/device/pachaos_capsule/device_pachaos_capsule.c"

@@ -929,16 +929,15 @@ int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
     if (lpr_readlink_cache_lookup(path_string, path_len, &cached_status)) {
         return cached_status;
     }
-#if LPR_TRACE_READLINK_PATHS
     const char *trace_path = path_string;
     if (trace_path != 0) {
-        const char prefix[] = "[lpr_runtime] readlink path=";
-        const char suffix[] = "\n";
-        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)prefix, sizeof(prefix) - 1u);
-        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)trace_path, (uint64_t)lpr_strnlen(trace_path, FILED_V2_PATH_BYTES));
-        (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)suffix, sizeof(suffix) - 1u);
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_LPR,
+            PACHA_TRACE_EVENT_LPR_PROCESS,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("readlink_path"),
+            pacha_trace_name_id(trace_path));
     }
-#endif
     char target[FILED_V2_SYMLINK_TARGET_BYTES];
     lpr_memset(target, 0, sizeof(target));
     const int64_t status = lpr_linux_readlinkat_to_buffer(

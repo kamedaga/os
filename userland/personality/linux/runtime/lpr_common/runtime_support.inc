@@ -300,56 +300,9 @@ static int lpr_fd_table_ensure_fd(uint64_t fd)
     return lpr_fd_table_ensure_capacity(fd + 1u);
 }
 
-#if LPR_TRACE_PROCESS_CALLS
-static char *lpr_clone_trace_append_literal(char *out, const char *end, const char *text)
-{
-    while (out < end && *text != 0) {
-        *out++ = *text++;
-    }
-    return out;
-}
-
-static char *lpr_clone_trace_append_u64(char *out, const char *end, uint64_t value)
-{
-    char tmp[20];
-    uint64_t n = 0;
-    do {
-        tmp[n++] = (char)('0' + (value % 10u));
-        value /= 10u;
-    } while (value != 0 && n < sizeof(tmp));
-    while (out < end && n != 0) {
-        *out++ = tmp[--n];
-    }
-    return out;
-}
-
-static char *lpr_clone_trace_append_hex64(char *out, const char *end, uint64_t value)
-{
-    static const char digits[] = "0123456789abcdef";
-    out = lpr_clone_trace_append_literal(out, end, "0x");
-    for (int shift = 60; shift >= 0; shift -= 4) {
-        if (out < end) {
-            *out++ = digits[(value >> (uint64_t)shift) & 0xfu];
-        }
-    }
-    return out;
-}
-
 static void lpr_trace_clone_args(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid)
 {
-    char line[224];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_clone_trace_append_literal(out, end, "[lpr_runtime] clone flags=");
-    out = lpr_clone_trace_append_u64(out, end, flags);
-    out = lpr_clone_trace_append_literal(out, end, " child_stack=");
-    out = lpr_clone_trace_append_u64(out, end, child_stack);
-    out = lpr_clone_trace_append_literal(out, end, " parent_tid=");
-    out = lpr_clone_trace_append_u64(out, end, parent_tid);
-    out = lpr_clone_trace_append_literal(out, end, " child_tid=");
-    out = lpr_clone_trace_append_u64(out, end, child_tid);
-    out = lpr_clone_trace_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_LOG, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    pacha_trace4(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_CLONE_ARGS, PACHA_TRACE_CLASS_STATE, flags, child_stack, parent_tid, child_tid);
 }
 
 static void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user_frame *frame, int64_t status)
@@ -357,151 +310,42 @@ static void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user
     if (frame == 0) {
         return;
     }
-    char line[384];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_clone_trace_append_literal(out, end, "[lpr_runtime] clone_frame ");
-    out = lpr_clone_trace_append_literal(out, end, event);
-    out = lpr_clone_trace_append_literal(out, end, " frame=");
-    out = lpr_clone_trace_append_hex64(out, end, (uint64_t)(uintptr_t)frame);
-    out = lpr_clone_trace_append_literal(out, end, " rip=");
-    out = lpr_clone_trace_append_hex64(out, end, frame->rip);
-    out = lpr_clone_trace_append_literal(out, end, " rsp=");
-    out = lpr_clone_trace_append_hex64(out, end, frame->rsp);
-    out = lpr_clone_trace_append_literal(out, end, " rcx=");
-    out = lpr_clone_trace_append_hex64(out, end, frame->rcx);
-    out = lpr_clone_trace_append_literal(out, end, " rax=");
-    out = lpr_clone_trace_append_hex64(out, end, frame->rax);
-    out = lpr_clone_trace_append_literal(out, end, " rdx=");
-    out = lpr_clone_trace_append_hex64(out, end, frame->rdx);
-    out = lpr_clone_trace_append_literal(out, end, " status=");
-    if (status < 0) {
-        out = lpr_clone_trace_append_literal(out, end, "-");
-        status = -status;
-    }
-    out = lpr_clone_trace_append_u64(out, end, (uint64_t)status);
-    out = lpr_clone_trace_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_CLONE_FRAME,
+        PACHA_TRACE_CLASS_STATE,
+        pacha_trace_name_id(event),
+        (uint64_t)(uintptr_t)frame,
+        frame->rip,
+        frame->rsp,
+        frame->rcx,
+        (uint64_t)status);
+    pacha_trace3(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_CLONE_FRAME, PACHA_TRACE_CLASS_STATE, frame->rax, frame->rdx, frame->rflags);
 }
 
 static void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, int64_t status)
 {
-    char line[224];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_clone_trace_append_literal(out, end, "[lpr_runtime] process ");
-    out = lpr_clone_trace_append_literal(out, end, event);
-    out = lpr_clone_trace_append_literal(out, end, " pid=");
-    if (lpr_linux_current_pid < 0) {
-        out = lpr_clone_trace_append_literal(out, end, "-");
-        out = lpr_clone_trace_append_u64(out, end, (uint64_t)(-lpr_linux_current_pid));
-    } else {
-        out = lpr_clone_trace_append_u64(out, end, (uint64_t)lpr_linux_current_pid);
-    }
-    out = lpr_clone_trace_append_literal(out, end, " a=");
-    out = lpr_clone_trace_append_u64(out, end, a);
-    out = lpr_clone_trace_append_literal(out, end, " b=");
-    out = lpr_clone_trace_append_u64(out, end, b);
-    out = lpr_clone_trace_append_literal(out, end, " status=");
-    if (status < 0) {
-        out = lpr_clone_trace_append_literal(out, end, "-");
-        status = -status;
-    }
-    out = lpr_clone_trace_append_u64(out, end, (uint64_t)status);
-    out = lpr_clone_trace_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_LOG, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
-}
-#else
-static void lpr_trace_clone_args(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid)
-{
-    (void)flags;
-    (void)child_stack;
-    (void)parent_tid;
-    (void)child_tid;
+    pacha_trace5(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_PROCESS,
+        PACHA_TRACE_CLASS_STATE,
+        pacha_trace_name_id(event),
+        (uint64_t)lpr_linux_current_pid,
+        a,
+        b,
+        (uint64_t)status);
 }
 
-static void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user_frame *frame, int64_t status)
-{
-    (void)event;
-    (void)frame;
-    (void)status;
-}
-
-static void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, int64_t status)
-{
-    (void)event;
-    (void)a;
-    (void)b;
-    (void)status;
-}
-#endif
-
-#if LPR_TRACE_READV_SIZES || LPR_TRACE_READV_CACHE_STATS
-static char *lpr_trace_append_literal(char *out, const char *end, const char *text)
-{
-    while (out < end && *text != 0) {
-        *out++ = *text++;
-    }
-    return out;
-}
-
-static char *lpr_trace_append_u64(char *out, const char *end, uint64_t value)
-{
-    char tmp[20];
-    uint64_t n = 0;
-    do {
-        tmp[n++] = (char)('0' + (value % 10u));
-        value /= 10u;
-    } while (value != 0 && n < sizeof(tmp));
-    while (out < end && n != 0) {
-        *out++ = tmp[--n];
-    }
-    return out;
-}
-#endif
-
-#if LPR_TRACE_READV_SIZES
 static void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, uint64_t coalesced, uint64_t offset)
 {
-    char line[224];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_trace_append_literal(out, end, "[lpr_runtime] readv_size fd=");
-    out = lpr_trace_append_u64(out, end, fd);
-    out = lpr_trace_append_literal(out, end, " iov=");
-    out = lpr_trace_append_u64(out, end, iov_count);
-    out = lpr_trace_append_literal(out, end, " requested=");
-    out = lpr_trace_append_u64(out, end, requested);
-    out = lpr_trace_append_literal(out, end, " coalesced=");
-    out = lpr_trace_append_u64(out, end, coalesced);
-    out = lpr_trace_append_literal(out, end, " offset=");
-    out = lpr_trace_append_u64(out, end, offset);
-    out = lpr_trace_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    pacha_trace5(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_READV_SIZE, PACHA_TRACE_CLASS_DEBUG, fd, iov_count, requested, coalesced, offset);
 }
 
 static void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status)
 {
-    char line[192];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_trace_append_literal(out, end, "[lpr_runtime] readv_to_vmo_status fd=");
-    out = lpr_trace_append_u64(out, end, fd);
-    out = lpr_trace_append_literal(out, end, " requested=");
-    out = lpr_trace_append_u64(out, end, requested);
-    out = lpr_trace_append_literal(out, end, " status=");
-    if (status < 0) {
-        out = lpr_trace_append_literal(out, end, "-");
-        out = lpr_trace_append_u64(out, end, (uint64_t)(-status));
-    } else {
-        out = lpr_trace_append_u64(out, end, (uint64_t)status);
-    }
-    out = lpr_trace_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    pacha_trace3(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_READV_TO_VMO_STATUS, PACHA_TRACE_CLASS_DEBUG, fd, requested, (uint64_t)status);
 }
-#endif
 
-#if LPR_TRACE_READV_CACHE_STATS
 static uint64_t lpr_readv_cache_total;
 static uint64_t lpr_readv_cache_coalesced;
 static uint64_t lpr_readv_cache_hit;
@@ -511,36 +355,25 @@ static uint64_t lpr_readv_cache_cross_page;
 static uint64_t lpr_readv_cache_to_vmo;
 static uint64_t lpr_readv_cache_bytes;
 
-static char *lpr_trace_append_field_u64(char *out, const char *end, const char *name, uint64_t value)
-{
-    out = lpr_trace_append_literal(out, end, " ");
-    out = lpr_trace_append_literal(out, end, name);
-    out = lpr_trace_append_literal(out, end, "=");
-    return lpr_trace_append_u64(out, end, value);
-}
-
 void lpr_linux_readv_cache_trace_dump(void)
 {
-    char line[384];
-    char *out = line;
-    const char *end = line + sizeof(line);
-    out = lpr_trace_append_literal(out, end, "[lpr_runtime] metric scope=lpr_readv_cache");
-    out = lpr_trace_append_field_u64(out, end, "total", lpr_readv_cache_total);
-    out = lpr_trace_append_field_u64(out, end, "coalesced", lpr_readv_cache_coalesced);
-    out = lpr_trace_append_field_u64(out, end, "hit", lpr_readv_cache_hit);
-    out = lpr_trace_append_field_u64(out, end, "fill", lpr_readv_cache_fill);
-    out = lpr_trace_append_field_u64(out, end, "fallback", lpr_readv_cache_fallback);
-    out = lpr_trace_append_field_u64(out, end, "cross_page", lpr_readv_cache_cross_page);
-    out = lpr_trace_append_field_u64(out, end, "to_vmo", lpr_readv_cache_to_vmo);
-    out = lpr_trace_append_field_u64(out, end, "bytes", lpr_readv_cache_bytes);
-    out = lpr_trace_append_literal(out, end, "\n");
-    (void)lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_WRITE, 2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_READV_CACHE_METRIC,
+        PACHA_TRACE_CLASS_METRIC,
+        lpr_readv_cache_total,
+        lpr_readv_cache_coalesced,
+        lpr_readv_cache_hit,
+        lpr_readv_cache_fill,
+        lpr_readv_cache_fallback,
+        lpr_readv_cache_bytes);
+    pacha_trace2(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_READV_CACHE_METRIC,
+        PACHA_TRACE_CLASS_METRIC,
+        lpr_readv_cache_cross_page,
+        lpr_readv_cache_to_vmo);
 }
-#else
-void lpr_linux_readv_cache_trace_dump(void)
-{
-}
-#endif
 
 static int64_t lpr_pacha_status_to_errno(int64_t status)
 {

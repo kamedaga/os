@@ -202,9 +202,7 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 
 int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 {
-#if LPR_TRACE_READV_CACHE_STATS
     lpr_readv_cache_total++;
-#endif
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
     }
@@ -251,14 +249,12 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         return lpr_native_pipe_readv(fd, iov_raw, iov_count);
     }
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
-#if LPR_TRACE_READV_SIZES
     uint64_t trace_requested = 0;
     for (uint64_t i = 0; i < iov_count; i += 1) {
         if (iov[i].len != 0 && trace_requested <= UINT64_MAX - iov[i].len) {
             trace_requested += iov[i].len;
         }
     }
-#endif
     if (iov_count > 1 &&
         lpr_fd_shadow_offset_eligible(fd) &&
         lpr_fds[fd].offset_valid)
@@ -275,13 +271,9 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         }
         if (requested != 0 && requested <= FILED_V2_IO_BYTES) {
             const uint64_t offset = lpr_filed_control_offset(fd);
-#if LPR_TRACE_READV_CACHE_STATS
             lpr_readv_cache_coalesced++;
             lpr_readv_cache_bytes += requested;
-#endif
-#if LPR_TRACE_READV_SIZES
             lpr_trace_readv_size(fd, iov_count, requested, 1, offset);
-#endif
             if (requested <= LPR_FILED_PAGE_CACHE_BYTES) {
                 const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
                 const uint64_t page_offset = offset - page_start;
@@ -290,22 +282,18 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                     lpr_filed_page_cache_entry_t *entry =
                         lpr_page_cache_get(fd, offset, requested, &cache_hit);
                     if (entry != 0) {
-#if LPR_TRACE_READV_CACHE_STATS
                         if (cache_hit) {
                             lpr_readv_cache_hit++;
                         } else {
                             lpr_readv_cache_fill++;
                         }
-#endif
                         (void)lpr_scatter_iov(iov, iov_count, entry->data + page_offset, requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
                         lpr_fds[fd].pread_active = 1;
                         return (int64_t)requested;
                     }
                 } else {
-#if LPR_TRACE_READV_CACHE_STATS
                     lpr_readv_cache_cross_page++;
-#endif
                     const uint64_t first_len = LPR_FILED_PAGE_CACHE_BYTES - page_offset;
                     const uint64_t second_len = requested - first_len;
                     int first_hit = 0;
@@ -318,13 +306,11 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                         uint8_t cache_scratch[LPR_FILED_PAGE_CACHE_BYTES];
                         lpr_memcpy(cache_scratch, first->data + page_offset, (size_t)first_len);
                         lpr_memcpy(cache_scratch + first_len, second->data, (size_t)second_len);
-#if LPR_TRACE_READV_CACHE_STATS
                         if (first_hit && second_hit) {
                             lpr_readv_cache_hit++;
                         } else {
                             lpr_readv_cache_fill++;
                         }
-#endif
                         (void)lpr_scatter_iov(iov, iov_count, cache_scratch, requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
                         lpr_fds[fd].pread_active = 1;
@@ -332,9 +318,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                     }
                 }
             }
-#if LPR_TRACE_READV_CACHE_STATS
             lpr_readv_cache_fallback++;
-#endif
             uint8_t scratch[FILED_V2_IO_BYTES];
             const int64_t n = lpr_filed_io(FILED_V2_OP_VFS_PREAD, fd, (uint64_t)(uintptr_t)scratch, requested, offset);
             if (n < 0) {
@@ -351,12 +335,8 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             unsigned char *mapped = 0;
             uint64_t map_len = 0;
             if (lpr_readv_scratch_vmo(requested, &vmo_fd, &mapped, &map_len) == 0) {
-#if LPR_TRACE_READV_CACHE_STATS
                 lpr_readv_cache_to_vmo++;
-#endif
-#if LPR_TRACE_READV_SIZES
                 lpr_trace_readv_size(fd, iov_count, requested, 2, lpr_filed_control_offset(fd));
-#endif
                 const uint64_t offset = lpr_filed_control_offset(fd);
                 const int64_t n = lpr_linux_pread_to_vmo(
                     fd,
@@ -374,20 +354,16 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                     }
                     return (int64_t)got;
                 }
-#if LPR_TRACE_READV_SIZES
                 lpr_trace_readv_to_vmo_status(fd, requested, n);
-#endif
             }
         }
     }
-#if LPR_TRACE_READV_SIZES
     lpr_trace_readv_size(
         fd,
         iov_count,
         trace_requested,
         0,
         lpr_fd_is_filed(fd) ? lpr_filed_control_offset(fd) : 0);
-#endif
     int64_t total = 0;
     for (uint64_t i = 0; i < iov_count; i += 1) {
         if (iov[i].len == 0) {
@@ -523,4 +499,3 @@ int64_t lpr_linux_pread_to_vmo(
     lpr_destroy_pread_vmo_wire_page(page_fd, page);
     return result;
 }
-

@@ -5,6 +5,7 @@
 #include <pacha/error_conveyor.h>
 #include <pacha/ipc.h>
 #include <pacha/syscall.h>
+#include <pacha/trace.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1247,13 +1248,13 @@ int main(int argc, char **argv)
     int bootstrap_fd = -1;
     int status = lprs_find_bootstrap_fd(argc, argv, &bootstrap_fd);
     if (status != 0) {
-        fprintf(stderr, "[lpr_supervisor] missing bootstrap fd status=%d\n", status);
+        pacha_trace1(PACHA_TRACE_COMPONENT_LPR_SUPERVISOR, PACHA_TRACE_EVENT_LPRS_BOOTSTRAP, PACHA_TRACE_CLASS_ERROR, (uint64_t)status);
         return 1;
     }
     struct lprs_boot_config cfg;
     status = lprs_read_bootstrap(bootstrap_fd, &cfg);
     if (status != 0) {
-        fprintf(stderr, "[lpr_supervisor] invalid bootstrap status=%d\n", status);
+        pacha_trace1(PACHA_TRACE_COMPONENT_LPR_SUPERVISOR, PACHA_TRACE_EVENT_LPRS_BOOTSTRAP, PACHA_TRACE_CLASS_ERROR, (uint64_t)status);
         return 1;
     }
     g_endpoint_fd = (int)(uint32_t)cfg.endpoint_fd;

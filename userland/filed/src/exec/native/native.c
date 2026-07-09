@@ -12,6 +12,7 @@
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
+#include "pacha/trace.h"
 
 enum {
     FILED_EXEC_PAGE_SIZE = 4096,
@@ -90,10 +91,7 @@ static void filed_exec_metric(const char *op, uint64_t start_ns, uint64_t end_ns
     if (op == NULL || start_ns == 0 || end_ns < start_ns) {
         return;
     }
-    printf(
-        "[filed] metric scope=exec op=%s ns=%llu\n",
-        op,
-        (unsigned long long)(end_ns - start_ns));
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_EXEC_METRIC, PACHA_TRACE_CLASS_METRIC, pacha_trace_name_id(op), end_ns - start_ns);
 }
 
 static uint16_t filed_exec_rd16(const unsigned char *p)

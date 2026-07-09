@@ -7,6 +7,7 @@
 #include "filed/fd_ipc.h"
 #include "koboxd/control_protocol_v2.h"
 #include "pacha/abi.h"
+#include "pacha/trace.h"
 
 static int filed_kobox_call_with_fd(
     filed_kobox_backend_t *backend,
@@ -198,22 +199,20 @@ void filed_kobox_backend_dump_metrics(const filed_kobox_backend_t *backend)
         if (metric->count == 0) {
             continue;
         }
-        printf(
-            "[filed] metric scope=kobox_client op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu errors=%llu\n",
-            filed_kobox_backend_op_name(filed_kobox_backend_metric_op(op)),
-            (unsigned long long)metric->count,
-            (unsigned long long)(metric->total_ns / metric->count),
-            (unsigned long long)metric->max_ns,
-            (unsigned long long)(metric->total_cycles / metric->count),
-            (unsigned long long)metric->max_cycles,
-            (unsigned long long)metric->errors);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_EXEC_METRIC,
+            PACHA_TRACE_CLASS_METRIC,
+            pacha_trace_name_id(filed_kobox_backend_op_name(filed_kobox_backend_metric_op(op))),
+            metric->count,
+            metric->total_ns / metric->count,
+            metric->max_ns,
+            metric->total_cycles / metric->count,
+            metric->max_cycles);
+        pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_EXEC_METRIC, PACHA_TRACE_CLASS_METRIC, op, metric->errors);
     }
-    printf(
-        "[filed] metric scope=kobox_client op=bytes_read count=%llu\n",
-        (unsigned long long)backend->bytes_read);
-    printf(
-        "[filed] metric scope=kobox_client op=bytes_written count=%llu\n",
-        (unsigned long long)backend->bytes_written);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_EXEC_METRIC, PACHA_TRACE_CLASS_METRIC, 1, backend->bytes_read);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_EXEC_METRIC, PACHA_TRACE_CLASS_METRIC, 2, backend->bytes_written);
 }
 
 static int filed_kobox_wire_page(

@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "filed/page_cache.h"
+#include "pacha/trace.h"
 
 #ifndef FILED_LPR_TRACE
 #define FILED_LPR_TRACE 0
@@ -159,13 +160,15 @@ void lpr_exec_image_dump_metrics(void)
         {
             continue;
         }
-        printf(
-            "[filed] metric scope=lpr_image op=%s count=%llu avg_ns=%llu max_ns=%llu bytes=%llu\n",
-            metric->name,
-            (unsigned long long)metric->count,
-            (unsigned long long)(metric->total_ns / metric->count),
-            (unsigned long long)metric->max_ns,
-            (unsigned long long)metric->total_bytes);
+        pacha_trace5(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_EXEC_METRIC,
+            PACHA_TRACE_CLASS_METRIC,
+            pacha_trace_name_id(metric->name),
+            metric->count,
+            metric->total_ns / metric->count,
+            metric->max_ns,
+            metric->total_bytes);
     }
 }
 

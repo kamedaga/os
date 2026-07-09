@@ -11,6 +11,8 @@
 #include "linux_subsystem/kvm/kvm_symbols.h"
 #include "loader/module_context.h"
 
+#include <pacha/trace.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -755,7 +757,7 @@ static void initialize_ptmx_winsize(struct termd_linux_tty_island *island, termd
     termd_write_u16(winsize, 2, 80);
     const long result = call_handle_ioctl(handle, TERMD_LINUX_TIOCSWINSZ, winsize);
     if (result != 0) {
-        printf("[termd] linux tty ptmx initial winsize failed status=%ld\n", result);
+        pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("ptmx_winsize"), (uint64_t)result);
     }
 }
 
@@ -790,7 +792,7 @@ int termd_linux_tty_island_open_ptmx(
     prepare_tty_file(handle, flags);
     int result = call_handle_open(handle);
     if (result != 0) {
-        printf("[termd] linux tty ptmx open failed status=%d\n", result);
+        pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("ptmx_open"), (uint64_t)result);
         memset(handle, 0, sizeof(*handle));
         return result;
     }
@@ -873,10 +875,7 @@ int termd_linux_tty_island_open_pts(
 
     int result = call_handle_open(handle);
     if (result != 0) {
-        printf(
-            "[termd] linux tty pts open failed index=%llu status=%d\n",
-            (unsigned long long)request->pts_index,
-            result);
+        pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("pts_open"), request->pts_index, (uint64_t)result);
         log_tty_state("pts-failed", probe_tty);
         log_tty_state("pts-failed-link", probe_link);
         memset(handle, 0, sizeof(*handle));
@@ -922,11 +921,7 @@ int termd_linux_tty_island_open_hvc(
     pump_hvc0_cdev_ready();
     const kb_cdev_record_t *record = kb_linux_kernel_find_active_cdev(dev);
     if (record == NULL || !record->has_fops_view || record->fops_view.open == NULL) {
-        printf(
-            "[termd] linux tty hvc open missing index=%llu dev=%u:%llu\n",
-            (unsigned long long)request->pts_index,
-            (unsigned)TERMD_LINUX_HVC_MAJOR,
-            (unsigned long long)request->pts_index);
+        pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("hvc_open_missing"), request->pts_index, TERMD_LINUX_HVC_MAJOR);
         return -19;
     }
 
@@ -959,10 +954,7 @@ int termd_linux_tty_island_open_hvc(
     int result = call_handle_open(handle);
     drain_linux_tty_work();
     if (result != 0) {
-        printf(
-            "[termd] linux tty hvc open failed index=%llu status=%d\n",
-            (unsigned long long)request->pts_index,
-            result);
+        pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("hvc_open"), request->pts_index, (uint64_t)result);
         memset(handle, 0, sizeof(*handle));
         return result;
     }
@@ -1155,11 +1147,7 @@ int termd_linux_tty_island_ioctl(
         request->data);
 
     if (result != 0) {
-        printf(
-            "[termd] linux tty ioctl failed handle=%llu request=0x%llx status=%ld\n",
-            (unsigned long long)request->handle,
-            (unsigned long long)request->request,
-            result);
+        pacha_trace4(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("ioctl"), request->handle, request->request, (uint64_t)result);
         return (int)result;
     }
 
@@ -1334,9 +1322,7 @@ static int termd_linux_tty_island_mount_devpts(struct termd_linux_tty_island *is
         if (island->devpts_status == 0) {
             island->devpts_status = -19;
         }
-        printf("[termd] linux tty devpts mount failed status=%d root=%p\n",
-            (int)island->devpts_status,
-            island->devpts_root);
+        pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("devpts_mount"), (uint64_t)island->devpts_status, (uint64_t)(uintptr_t)island->devpts_root);
         return island->devpts_status;
     }
     island->devpts_status = 0;
@@ -1359,19 +1345,13 @@ static kb_status_t termd_linux_tty_island_create_backend(
         (void)setenv("KOBOX_VIRTIO_NO_EVENT_IDX", "1", 1);
         kb_status_t status = kb_pachaos_capsule_device_create(cfg->device_fd, out_backend);
         if (status != KB_OK || *out_backend == NULL) {
-            fprintf(stderr,
-                "[termd] virtio-console backend create failed fd=%llu status=%d\n",
-                (unsigned long long)cfg->device_fd,
-                (int)status);
+            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("virtio_backend_create"), cfg->device_fd, (uint64_t)status);
             return status;
         }
         kb_shim_set_device_backend(*out_backend);
         const int dma_status = kb_kvm_prepare_dma_arena(*out_backend);
         if (dma_status != 0) {
-            fprintf(stderr,
-                "[termd] virtio-console dma arena prepare failed fd=%llu status=%d\n",
-                (unsigned long long)cfg->device_fd,
-                dma_status);
+            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("virtio_dma_prepare"), cfg->device_fd, (uint64_t)dma_status);
             return KB_ERR_IO;
         }
         printf("[termd] virtio-console backend ready fd=%llu\n",
@@ -1440,9 +1420,7 @@ int termd_linux_tty_island_init(
             (unsigned long long)module_cfg->image_size);
         status = kb_module_open_image(&image, backend, &island->modules[i]);
         if (status != KB_OK || island->modules[i] == NULL) {
-            fprintf(stderr, "[termd] linux tty module phase=open failed name=%s status=%d\n",
-                module_cfg->name,
-                (int)status);
+            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_open"), pacha_trace_name_id(module_cfg->name), (uint64_t)status);
             island->load_status = (int32_t)status;
             return 0;
         }
@@ -1457,17 +1435,12 @@ int termd_linux_tty_island_init(
             continue;
         }
         if (status != KB_OK) {
-            fprintf(stderr, "[termd] linux tty module phase=init_call failed name=%s status=%d result=%d\n",
-                module_cfg->name,
-                (int)status,
-                init_result);
+            pacha_trace4(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_init_call"), pacha_trace_name_id(module_cfg->name), (uint64_t)status, (uint64_t)init_result);
             island->init_status = (int32_t)status;
             return 0;
         }
         if (init_result != 0) {
-            fprintf(stderr, "[termd] linux tty module phase=init_result failed name=%s result=%d\n",
-                module_cfg->name,
-                init_result);
+            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_init_result"), pacha_trace_name_id(module_cfg->name), (uint64_t)init_result);
             island->init_status = (int32_t)init_result;
             return 0;
         }
@@ -1509,7 +1482,7 @@ int termd_linux_tty_island_init(
     if (cfg->device_fd >= 16) {
         const int hvc_status = wait_hvc0_cdev_ready();
         if (hvc_status != 0) {
-            printf("[termd] linux tty hvc0 wait failed status=%d\n", hvc_status);
+            pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("hvc0_wait"), (uint64_t)hvc_status);
         }
     }
     log_hvc0_cdev_state();

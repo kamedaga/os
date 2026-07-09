@@ -16,6 +16,7 @@
 #include "pacha/error_conveyor.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
+#include "pacha/trace.h"
 #include "personality/linux_lpr.h"
 #include "termd/ipc_protocol_v2.h"
 
@@ -822,101 +823,91 @@ static void filed_dump_dispatch_metrics(void)
         if (metric->count == 0) {
             continue;
         }
-        printf(
-            "[filed] metric scope=dispatch op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu reply_errors=%llu\n",
-            filed_op_name(op),
-            (unsigned long long)metric->count,
-            (unsigned long long)(metric->total_ns / metric->count),
-            (unsigned long long)metric->max_ns,
-            (unsigned long long)(metric->total_cycles / metric->count),
-            (unsigned long long)metric->max_cycles,
-            (unsigned long long)metric->reply_errors);
+        (void)filed_op_name(op);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_METRIC_DISPATCH,
+            PACHA_TRACE_CLASS_METRIC,
+            op,
+            metric->count,
+            metric->total_ns / metric->count,
+            metric->max_ns,
+            metric->total_cycles / metric->count,
+            metric->max_cycles);
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_METRIC_DISPATCH,
+            PACHA_TRACE_CLASS_METRIC,
+            op,
+            metric->reply_errors);
     }
-    printf(
-        "[filed] metric scope=fast op=filed_fast_enqueued count=%llu\n",
-        (unsigned long long)filed_fast_metrics.enqueued);
-    printf(
-        "[filed] metric scope=fast op=filed_fast_completed count=%llu\n",
-        (unsigned long long)filed_fast_metrics.completed);
-    printf(
-        "[filed] metric scope=fast op=filed_fast_batches count=%llu\n",
-        (unsigned long long)filed_fast_metrics.batches);
-    printf(
-        "[filed] metric scope=fast op=filed_fast_ring_full count=%llu\n",
-        (unsigned long long)filed_fast_metrics.ring_full);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FAST, PACHA_TRACE_CLASS_METRIC, 1, filed_fast_metrics.enqueued);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FAST, PACHA_TRACE_CLASS_METRIC, 2, filed_fast_metrics.completed);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FAST, PACHA_TRACE_CLASS_METRIC, 3, filed_fast_metrics.batches);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FAST, PACHA_TRACE_CLASS_METRIC, 4, filed_fast_metrics.ring_full);
     if (filed_fast_metrics.doorbells != 0) {
-        printf(
-            "[filed] metric scope=fast op=filed_fast_recv avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu count=%llu\n",
-            (unsigned long long)(filed_fast_metrics.recv_total_ns / filed_fast_metrics.doorbells),
-            (unsigned long long)filed_fast_metrics.recv_max_ns,
-            (unsigned long long)(filed_fast_metrics.recv_total_cycles / filed_fast_metrics.doorbells),
-            (unsigned long long)filed_fast_metrics.recv_max_cycles,
-            (unsigned long long)filed_fast_metrics.doorbells);
-        printf(
-            "[filed] metric scope=fast op=filed_fast_drain avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu count=%llu\n",
-            (unsigned long long)(filed_fast_metrics.drain_total_ns / filed_fast_metrics.doorbells),
-            (unsigned long long)filed_fast_metrics.drain_max_ns,
-            (unsigned long long)(filed_fast_metrics.drain_total_cycles / filed_fast_metrics.doorbells),
-            (unsigned long long)filed_fast_metrics.drain_max_cycles,
-            (unsigned long long)filed_fast_metrics.doorbells);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_METRIC_FAST,
+            PACHA_TRACE_CLASS_METRIC,
+            5,
+            filed_fast_metrics.doorbells,
+            filed_fast_metrics.recv_total_ns / filed_fast_metrics.doorbells,
+            filed_fast_metrics.recv_max_ns,
+            filed_fast_metrics.recv_total_cycles / filed_fast_metrics.doorbells,
+            filed_fast_metrics.recv_max_cycles);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_METRIC_FAST,
+            PACHA_TRACE_CLASS_METRIC,
+            6,
+            filed_fast_metrics.doorbells,
+            filed_fast_metrics.drain_total_ns / filed_fast_metrics.doorbells,
+            filed_fast_metrics.drain_max_ns,
+            filed_fast_metrics.drain_total_cycles / filed_fast_metrics.doorbells,
+            filed_fast_metrics.drain_max_cycles);
     }
     if (filed_fast_metrics.doorbells != 0) {
-        printf(
-            "[filed] metric scope=fast op=filed_fast_reply avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu count=%llu\n",
-            (unsigned long long)(filed_fast_metrics.reply_total_ns / filed_fast_metrics.doorbells),
-            (unsigned long long)filed_fast_metrics.reply_max_ns,
-            (unsigned long long)(filed_fast_metrics.reply_total_cycles / filed_fast_metrics.doorbells),
-            (unsigned long long)filed_fast_metrics.reply_max_cycles,
-            (unsigned long long)filed_fast_metrics.doorbells);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_METRIC_FAST,
+            PACHA_TRACE_CLASS_METRIC,
+            7,
+            filed_fast_metrics.doorbells,
+            filed_fast_metrics.reply_total_ns / filed_fast_metrics.doorbells,
+            filed_fast_metrics.reply_max_ns,
+            filed_fast_metrics.reply_total_cycles / filed_fast_metrics.doorbells,
+            filed_fast_metrics.reply_max_cycles);
     }
     for (uint64_t op = 0; op < FILED_METRIC_OP_MAX; ++op) {
         const filed_fast_op_metric_t *metric = &filed_fast_op_metrics[op];
         if (metric->count == 0) {
             continue;
         }
-        printf(
-            "[filed] metric scope=fast_op op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu errors=%llu\n",
-            filed_op_name(op),
-            (unsigned long long)metric->count,
-            (unsigned long long)(metric->total_ns / metric->count),
-            (unsigned long long)metric->max_ns,
-            (unsigned long long)(metric->total_cycles / metric->count),
-            (unsigned long long)metric->max_cycles,
-            (unsigned long long)metric->errors);
+        (void)filed_op_name(op);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_FILED,
+            PACHA_TRACE_EVENT_FILED_METRIC_FAST_OP,
+            PACHA_TRACE_CLASS_METRIC,
+            op,
+            metric->count,
+            metric->total_ns / metric->count,
+            metric->max_ns,
+            metric->total_cycles / metric->count,
+            metric->max_cycles);
+        pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FAST_OP, PACHA_TRACE_CLASS_METRIC, op, metric->errors);
     }
-    printf(
-        "[filed] metric scope=vfs op=target_lookup_vfs_hit count=%llu\n",
-        (unsigned long long)filed_target_lookup_vfs_hits);
-    printf(
-        "[filed] metric scope=vfs op=target_lookup_backend_hit count=%llu\n",
-        (unsigned long long)filed_target_lookup_backend_hits);
-    printf(
-        "[filed] metric scope=vfs op=target_lookup_miss count=%llu\n",
-        (unsigned long long)filed_target_lookup_misses);
-    printf(
-        "[filed] metric scope=lookup_cache op=negative_hit count=%llu\n",
-        (unsigned long long)filed_negative_lookup_cache.hits);
-    printf(
-        "[filed] metric scope=lookup_cache op=negative_miss count=%llu\n",
-        (unsigned long long)filed_negative_lookup_cache.misses);
-    printf(
-        "[filed] metric scope=lookup_cache op=negative_store count=%llu\n",
-        (unsigned long long)filed_negative_lookup_cache.stores);
-    printf(
-        "[filed] metric scope=lookup_cache op=negative_evict count=%llu\n",
-        (unsigned long long)filed_negative_lookup_cache.evictions);
-    printf(
-        "[filed] metric scope=file_vmo_cache op=hit count=%llu\n",
-        (unsigned long long)filed_file_vmo_cache_hits);
-    printf(
-        "[filed] metric scope=file_vmo_cache op=miss count=%llu\n",
-        (unsigned long long)filed_file_vmo_cache_misses);
-    printf(
-        "[filed] metric scope=file_vmo_cache op=store count=%llu\n",
-        (unsigned long long)filed_file_vmo_cache_stores);
-    printf(
-        "[filed] metric scope=file_vmo_cache op=evict count=%llu\n",
-        (unsigned long long)filed_file_vmo_cache_evictions);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_LOOKUP, PACHA_TRACE_CLASS_METRIC, 1, filed_target_lookup_vfs_hits);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_LOOKUP, PACHA_TRACE_CLASS_METRIC, 2, filed_target_lookup_backend_hits);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_LOOKUP, PACHA_TRACE_CLASS_METRIC, 3, filed_target_lookup_misses);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_LOOKUP, PACHA_TRACE_CLASS_METRIC, 4, filed_negative_lookup_cache.hits);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_LOOKUP, PACHA_TRACE_CLASS_METRIC, 5, filed_negative_lookup_cache.misses);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_LOOKUP, PACHA_TRACE_CLASS_METRIC, 6, filed_negative_lookup_cache.stores);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_LOOKUP, PACHA_TRACE_CLASS_METRIC, 7, filed_negative_lookup_cache.evictions);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO, PACHA_TRACE_CLASS_METRIC, 1, filed_file_vmo_cache_hits);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO, PACHA_TRACE_CLASS_METRIC, 2, filed_file_vmo_cache_misses);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO, PACHA_TRACE_CLASS_METRIC, 3, filed_file_vmo_cache_stores);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO, PACHA_TRACE_CLASS_METRIC, 4, filed_file_vmo_cache_evictions);
 }
 
 static uint64_t filed_page_cache_next_clock(filed_runtime_t *runtime)
@@ -1748,39 +1739,17 @@ int filed_cached_pwrite(
 void filed_dump_cache_metrics(const filed_runtime_t *runtime)
 {
     (void)runtime;
-    printf(
-        "[filed] metric scope=cache op=filed_cache_hit count=%llu\n",
-        (unsigned long long)filed_page_cache.hits);
-    printf(
-        "[filed] metric scope=cache op=filed_cache_miss count=%llu\n",
-        (unsigned long long)filed_page_cache.misses);
-    printf(
-        "[filed] metric scope=cache op=filed_cache_evict count=%llu\n",
-        (unsigned long long)filed_page_cache.evictions);
-    printf(
-        "[filed] metric scope=cache op=filed_cache_direct_read count=%llu\n",
-        (unsigned long long)filed_page_cache.direct_reads);
-    printf(
-        "[filed] metric scope=cache op=filed_cache_dirty_write count=%llu\n",
-        (unsigned long long)filed_page_cache.dirty_writes);
-    printf(
-        "[filed] metric scope=cache op=filed_cache_flush count=%llu\n",
-        (unsigned long long)filed_page_cache.flushes);
-    printf(
-        "[filed] metric scope=cache op=filed_cache_flush_error count=%llu\n",
-        (unsigned long long)filed_page_cache.flush_errors);
-    printf(
-        "[filed] metric scope=cache op=filed_cache_active_slots count=%llu\n",
-        (unsigned long long)filed_page_cache.active_slots);
-    printf(
-        "[filed] metric scope=dir_cache op=filed_dir_cache_hit count=%llu\n",
-        (unsigned long long)filed_dir_cache.hits);
-    printf(
-        "[filed] metric scope=dir_cache op=filed_dir_cache_miss count=%llu\n",
-        (unsigned long long)filed_dir_cache.misses);
-    printf(
-        "[filed] metric scope=dir_cache op=filed_dir_cache_evict count=%llu\n",
-        (unsigned long long)filed_dir_cache.evictions);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 1, filed_page_cache.hits);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 2, filed_page_cache.misses);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 3, filed_page_cache.evictions);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 4, filed_page_cache.direct_reads);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 5, filed_page_cache.dirty_writes);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 6, filed_page_cache.flushes);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 7, filed_page_cache.flush_errors);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 8, filed_page_cache.active_slots);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 9, filed_dir_cache.hits);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 10, filed_dir_cache.misses);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 11, filed_dir_cache.evictions);
 }
 
 static pacha_errconv_store_t *filed_errors(void)
