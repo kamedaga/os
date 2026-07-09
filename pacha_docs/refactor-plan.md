@@ -113,12 +113,12 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 
 ### Phase 1 — kernel
 
-**T1.1 [kernel] リソースリーク耐久テスト (VMO/プロセスライフサイクルの実証)**
-- 前提修正 (2026-07-09 調査): hikitugi.md の cap-tree revoke 問題 (`revokeVmObjectCapTree`) は FD-based 再設計で既に存在しない。現行は `NativeVmoSlot` の refcount + 親チェーン解放。よって本タスクは意味論変更ではなく「現行モデルにリークがないことの実証と、見つかったリークの修正」。
-- kernel の空きページ数・使用中 VMO/fd/process スロット数を userland から読める診断手段を用意 (既存の観測経路があればそれを使い、なければ最小の診断 syscall or ログを追加)。
-- QEMU スモークとして「fork/exec を N 回 (20 回以上) 繰り返し、空きページ数が定常状態に収束する (単調減少しない)」テストを `tests/` に追加。ワークロードは rootfs 同梱の chibicc コンパイルサイクル (`/cmd/chibicc.elf` で `/cmd/chibicc_workload.c` をコンパイル → as → ld → 実行) を第一候補とし、clang 復旧 (T4.5) までの代理負荷とする。
-- 見つかったリーク (VMO, fd, IPC, process slot) は修正する。
-- 受け入れ: 新規耐久スモーク通過 + 既存スモーク 3 本通過。将来 clang が動くようになったら T4.5 で同型のテストを clang に差し替える。
+**T1.1 [kernel] VM object の参照 drop と revoke の分離 (現行 FD モデルでの完成)** ※挙動変更
+- 補足 (2026-07-09 調査): 旧 `revokeVmObjectCapTree` は FD-based 再設計で消滅し、fd 層は per-fd refcount (`closeFd` は自 entry のみ解放、transfer copy は retain) になっている。本タスクはこの分離を全経路で完成させる。ユーザーにより kernel 編集は許可済み。
+- **参照経路の監査と修正**: fd entry / VMA マッピング (mmap 中の VMO) / IPC 転送中メッセージ / fork・COW / プロセス終了 cleanup / exec による address space 置換、の各経路が「自分の retain を持ち、drop は自分の参照だけを落とす」ことを監査。drop が他保持者の backing を壊す経路、または retain 漏れ・release 漏れ (リーク) を修正する。
+- **明示 revoke の新設**: `vmo_revoke` 相当を新設。所有サービス (filed 等) が配布済み VMO を無効化できる (全 fd table / VMA から該当 object を除去し、以後の使用はエラー、backing を回収)。revoke 権限は fd rights で制御。プロセス終了時の自プロセス cleanup は従来通り。
+- **kernel unit test**: `tests/kernel_state.zig` 系に retain/release 不変条件のテストを追加 (任意順の close で他保持者が壊れない / refcount 0 で free list に全ページが戻る / 二重 close 安全 / revoke 後の全保持者無効化)。
+- 受け入れ: kernel unit test (`zig build test`) + QEMU スモーク 3 本通過。fork/exec 反復のリーク耐久スモーク (chibicc サイクル) は T4.5 で clang 版と併せて導入する。
 
 **T1.2 [kernel] kernel.zig の分割** ※挙動変更なし
 - `KernelState` のフィールドとメソッドをドメインごとに移動: `state/process.zig`, `state/fd.zig`, `state/vmo.zig`, `state/vma.zig`, `state/pipe.zig`, `state/ipc.zig`。kernel.zig は合成と初期化のみ (目安 1,000 行以下)。
