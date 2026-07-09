@@ -250,6 +250,9 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 
 int64_t lpr_linux_close(uint64_t fd)
 {
+    if (lpr_linux_socket_fd_active(fd)) {
+        return lpr_linux_socket_close(fd);
+    }
     if (lpr_linux_tty_fd_active(fd)) {
         uint32_t refcount = 0;
         (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);

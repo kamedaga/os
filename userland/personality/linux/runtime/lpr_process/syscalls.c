@@ -24,6 +24,8 @@ int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_ti
     if (user_frame == 0) {
         return -LPR_LINUX_ENOSYS;
     }
+    struct lpr_linux_user_frame child_frame;
+    lpr_memcpy(&child_frame, user_frame, sizeof(child_frame));
     lpr_linux_process_state_init();
     int32_t child_pid = 0;
     uint64_t child_token = 0;
@@ -69,9 +71,9 @@ int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_ti
     lpr_linux_pending_child_sid = lpr_linux_current_sid;
     lpr_linux_pending_child_pgrp = lpr_linux_current_pgrp;
     lpr_supervisor_pending_child_token = child_token;
-    lpr_trace_clone_frame("before_drop", user_frame, 0);
+    lpr_trace_clone_frame("before_drop", &child_frame, 0);
     lpr_filed_session_drop();
-    lpr_trace_clone_frame("before_syscall", user_frame, 0);
+    lpr_trace_clone_frame("before_syscall", &child_frame, 0);
     uint64_t child_process_rights =
         PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_WAIT |
@@ -85,8 +87,8 @@ int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_ti
         PACHAOS_SYSCALL_PROCESS_CLONE,
         child_process_rights,
         PACHA_PROCESS_CLONE_CURRENT_THREAD | PACHA_PROCESS_CLONE_USER_FRAME,
-        (uint64_t)(uintptr_t)user_frame);
-    lpr_trace_clone_frame("after_syscall", user_frame, ret);
+        (uint64_t)(uintptr_t)&child_frame);
+    lpr_trace_clone_frame("after_syscall", &child_frame, ret);
     if (ret == 0) {
         lpr_trace_process_event("clone_child", flags, child_stack, 0);
         lpr_linux_process_state_checked = 1;
@@ -612,9 +614,7 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     local_table.fd = -1;
     local_table.map_bytes = 0;
     local_table.table = 0;
-    status = lpr_supervisor_enabled ?
-        lpr_supervisor_fd_table_replace() :
-        lpr_prepare_exec_local_fds(&exec, &local_table);
+    status = lpr_prepare_exec_local_fds(&exec, &local_table);
     if (status != 0) {
         lpr_discard_exec_cwd(&exec);
         return status;
@@ -666,4 +666,3 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     for (;;) {
     }
 }
-

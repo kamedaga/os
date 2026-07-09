@@ -439,6 +439,79 @@ void lpr_destroy_tty_wire_page(int fd, void *page)
     }
 }
 
+void lpr_reset_fork_child_rpc_state(void)
+{
+    if (lpr_wire_page != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)lpr_wire_page,
+            FILED_V2_PAGE_BYTES);
+    }
+    if (lpr_wire_page_fd >= 16) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_wire_page_fd);
+    }
+    lpr_wire_page_fd = -1;
+    lpr_wire_page = 0;
+    lpr_wire_page_busy = 0;
+
+    if (lpr_tty_wire_page != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)lpr_tty_wire_page,
+            TERMD_V2_PAGE_BYTES);
+    }
+    if (lpr_tty_wire_page_fd >= 16) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_tty_wire_page_fd);
+    }
+    lpr_tty_wire_page_fd = -1;
+    lpr_tty_wire_page = 0;
+    lpr_tty_wire_page_busy = 0;
+
+    if (lpr_session_page != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)lpr_session_page,
+            FILED_V2_SESSION_PAGE_BYTES);
+    }
+    if (lpr_session_page_fd >= 16) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_session_page_fd);
+    }
+    if (lpr_session_fd >= 16) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_session_fd);
+    }
+    lpr_session_fd = -1;
+    lpr_session_page_fd = -1;
+    lpr_session_page = 0;
+    lpr_session_checked = 0;
+    lpr_session_payload_busy = 0;
+
+    if (lpr_readv_vmo_map != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)lpr_readv_vmo_map,
+            lpr_readv_vmo_len);
+    }
+    if (lpr_readv_vmo_fd >= 16) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_readv_vmo_fd);
+    }
+    lpr_readv_vmo_fd = -1;
+    lpr_readv_vmo_map = 0;
+    lpr_readv_vmo_len = 0;
+
+    if (lpr_pread_vmo_page != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)lpr_pread_vmo_page,
+            FILED_V2_PAGE_BYTES);
+    }
+    if (lpr_pread_vmo_page_fd >= 16) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_pread_vmo_page_fd);
+    }
+    lpr_pread_vmo_page_fd = -1;
+    lpr_pread_vmo_page = 0;
+    lpr_pread_vmo_page_busy = 0;
+}
+
 int lpr_create_standalone_wire_page(void **out_page)
 {
     if (out_page == 0) {
@@ -1096,4 +1169,3 @@ int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_r
     }
     return 0;
 }
-

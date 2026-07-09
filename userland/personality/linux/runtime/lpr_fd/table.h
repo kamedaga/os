@@ -52,6 +52,30 @@ typedef struct lpr_tty_fd {
     uint64_t handle;
 } lpr_tty_fd_t;
 
+typedef struct lpr_socket_fd {
+    uint8_t active;
+    uint8_t type;
+    uint8_t cloexec;
+    uint8_t connected;
+    uint8_t connecting;
+    uint32_t flags;
+    uint32_t sndbuf;
+    uint32_t rcvbuf;
+    int32_t reuseaddr;
+    int32_t keepalive;
+    int32_t tcp_nodelay;
+    int32_t sndtimeo_ms;
+    int32_t rcvtimeo_ms;
+    uint64_t handle;
+    int32_t last_error;
+    uint32_t local_addr_be;
+    uint16_t local_port_be;
+    uint16_t reserved0;
+    uint32_t peer_addr_be;
+    uint16_t peer_port_be;
+    uint16_t reserved1;
+} lpr_socket_fd_t;
+
 typedef enum lpr_fd_kind {
     LPR_FD_NONE = LPR_FD_TABLE_KIND_EMPTY,
     LPR_FD_FILED = LPR_FD_TABLE_KIND_FILED,
@@ -66,6 +90,7 @@ typedef union lpr_fd_payload {
     lpr_pipe_fd_t pipe;
     lpr_event_fd_t eventfd;
     lpr_tty_fd_t tty;
+    lpr_socket_fd_t socket;
 } lpr_fd_payload_t;
 
 typedef struct lpr_fd_table_entry {

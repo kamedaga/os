@@ -188,7 +188,8 @@ int lpr_exec_local_fd_active(uint64_t fd)
     return lpr_fd_is_filed(fd) ||
         lpr_linux_tty_fd_active(fd) ||
         lpr_pipe_fd_is_active(fd) ||
-        lpr_linux_eventfd_active(fd);
+        lpr_linux_eventfd_active(fd) ||
+        lpr_linux_socket_fd_active(fd);
 }
 
 int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve)
@@ -226,11 +227,6 @@ int lpr_count_exec_local_fds(uint64_t *out_count)
             count++;
             continue;
         }
-        if (lpr_linux_socket_fd_active(fd) &&
-            !lpr_linux_socket_fd_cloexec(fd))
-        {
-            return -LPR_LINUX_ENOTSUP;
-        }
     }
     *out_count = count;
     return 0;
@@ -262,6 +258,11 @@ void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd)
         desc->kind = FILED_V2_EXEC_LPR_FD_EVENT;
         desc->flags = (lpr_fd_event_payload(fd)->flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->offset_or_counter = lpr_fd_event_payload(fd)->counter;
+    } else if (lpr_linux_socket_fd_active(fd)) {
+        desc->kind = FILED_V2_EXEC_LPR_FD_SOCKET;
+        desc->flags = (lpr_fd_socket_payload(fd)->flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
+        desc->handle = lpr_fd_socket_payload(fd)->handle;
+        desc->offset_or_counter = lpr_fd_socket_payload(fd)->type;
     }
 }
 

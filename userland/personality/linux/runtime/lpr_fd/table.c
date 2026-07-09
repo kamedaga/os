@@ -97,6 +97,15 @@ static void lpr_fd_table_fill_payload(
         file->payload.eventfd.flags =
             (install->status_flags & LPR_FD_TABLE_STATUS_NONBLOCK ? 00004000u : 0u);
         break;
+    case LPR_FD_TABLE_KIND_SOCKET:
+        file->payload.socket.active = 1;
+        file->payload.socket.handle = install->backend_id;
+        file->payload.socket.flags =
+            00000002u |
+            (install->status_flags & LPR_FD_TABLE_STATUS_NONBLOCK ? 00004000u : 0u);
+        file->payload.socket.cloexec =
+            (install->fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? 1u : 0u;
+        break;
     default:
         break;
     }

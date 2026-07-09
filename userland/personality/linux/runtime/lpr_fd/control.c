@@ -42,6 +42,12 @@ lpr_tty_fd_t *lpr_fd_tty_payload(uint64_t fd)
     return object != 0 && object->kind == LPR_FD_TABLE_KIND_TTY ? &object->payload.tty : 0;
 }
 
+lpr_socket_fd_t *lpr_fd_socket_payload(uint64_t fd)
+{
+    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
+    return object != 0 && object->kind == LPR_FD_TABLE_KIND_SOCKET ? &object->payload.socket : 0;
+}
+
 static int lpr_fd_kind_active(uint64_t fd, uint8_t kind)
 {
     const lpr_fd_object_t *object = lpr_fd_object_for_fd_const(fd);
@@ -117,7 +123,8 @@ int lpr_fd_local_active(uint64_t fd)
         (object->kind == LPR_FD_TABLE_KIND_FILED ||
             object->kind == LPR_FD_TABLE_KIND_PIPE ||
             object->kind == LPR_FD_TABLE_KIND_EVENT ||
-            object->kind == LPR_FD_TABLE_KIND_TTY);
+            object->kind == LPR_FD_TABLE_KIND_TTY ||
+            object->kind == LPR_FD_TABLE_KIND_SOCKET);
 }
 
 uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info)
@@ -237,6 +244,12 @@ int lpr_control_install_fd(
             object->payload.eventfd.flags = (uint32_t)linux_flags;
             object->payload.eventfd.counter = offset;
             break;
+        case LPR_FD_TABLE_KIND_SOCKET:
+            object->payload.socket.flags = (uint32_t)linux_flags;
+            object->payload.socket.cloexec =
+                (linux_flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
+            object->payload.socket.handle = backend_id;
+            break;
         default:
             break;
         }
@@ -325,6 +338,10 @@ void lpr_control_sync_legacy_flags(uint64_t fd)
     case LPR_FD_TABLE_KIND_PIPE:
         object->payload.pipe.flags =
             lpr_control_merge_legacy_flags(object->payload.pipe.flags, 0, status_flags);
+        break;
+    case LPR_FD_TABLE_KIND_SOCKET:
+        object->payload.socket.flags =
+            lpr_control_merge_legacy_flags(object->payload.socket.flags, 0, status_flags);
         break;
     default:
         break;
@@ -572,7 +589,6 @@ int lpr_fd_slot_available(uint64_t fd)
     return fd < lpr_fd_table_capacity &&
         !lpr_runtime_reserved_fd(fd) &&
         !lpr_control_fd_active(fd) &&
-        !lpr_linux_socket_fd_active(fd) &&
         !lpr_native_fd_info(fd, &native_info);
 }
 
@@ -651,6 +667,29 @@ int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
         return 0;
     }
+    for (uint64_t existing = 0; existing < lpr_fd_table_capacity; existing += 1) {
+        if (existing == fd || !lpr_linux_tty_fd_active(existing)) {
+            continue;
+        }
+        const lpr_tty_fd_t *existing_tty = lpr_fd_tty_payload(existing);
+        if (existing_tty == 0 || existing_tty->handle != desc->handle) {
+            continue;
+        }
+        if (lpr_control_dup_fd(
+                existing,
+                fd,
+                (desc->flags & LPR_LINUX_O_CLOEXEC) != 0) != 0)
+        {
+            return 0;
+        }
+        (void)lpr_control_set_status_flags(fd, desc->flags);
+        lpr_tty_fd_t *tty = lpr_fd_tty_payload(fd);
+        if (tty != 0) {
+            tty->flags = desc->flags;
+            tty->handle = desc->handle;
+        }
+        return 1;
+    }
     if (lpr_control_install_fd(
         fd,
         LPR_FD_TABLE_KIND_TTY,
@@ -720,6 +759,35 @@ int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     return 1;
 }
 
+int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+{
+    if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
+        return 0;
+    }
+    if (lpr_control_install_fd(
+        fd,
+        LPR_FD_TABLE_KIND_SOCKET,
+        desc->flags,
+        desc->handle,
+        0) != 0)
+    {
+        return 0;
+    }
+    lpr_socket_fd_t *socket = lpr_fd_socket_payload(fd);
+    if (socket == 0) {
+        lpr_control_close_fd(fd);
+        return 0;
+    }
+    socket->active = 1;
+    socket->flags = desc->flags;
+    socket->handle = desc->handle;
+    socket->cloexec = (desc->flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
+    socket->type = (uint8_t)desc->offset_or_counter;
+    socket->sndbuf = 256u * 1024u;
+    socket->rcvbuf = 256u * 1024u;
+    return 1;
+}
+
 int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
 {
     uint64_t fd = 0;
@@ -735,6 +803,8 @@ int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
         return lpr_restore_bootstrap_pipe_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_EVENT:
         return lpr_restore_bootstrap_event_fd(desc, fd);
+    case LPR_BOOTSTRAP_FD_SOCKET:
+        return lpr_restore_bootstrap_socket_fd(desc, fd);
     default:
         return 0;
     }
@@ -771,7 +841,7 @@ void lpr_state_dump(const char *reason)
     pacha_trace6(
         PACHA_TRACE_COMPONENT_LPR,
         PACHA_TRACE_EVENT_LPR_PROCESS,
-        PACHA_TRACE_CLASS_STATE,
+        PACHA_TRACE_CLASS_ERROR,
         pacha_trace_name_id("lpr.state.begin"),
         (uint64_t)(uint32_t)lpr_linux_current_pid,
         lpr_control_fd_table.generation,
@@ -791,7 +861,7 @@ void lpr_state_dump(const char *reason)
         pacha_trace6(
             PACHA_TRACE_COMPONENT_LPR,
             PACHA_TRACE_EVENT_LPR_PROCESS,
-            PACHA_TRACE_CLASS_STATE,
+            PACHA_TRACE_CLASS_ERROR,
             pacha_trace_name_id("lpr.fd.entry"),
             fd,
             object->kind,
@@ -803,7 +873,7 @@ void lpr_state_dump(const char *reason)
             pacha_trace6(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
-                PACHA_TRACE_CLASS_STATE,
+                PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.filed"),
                 fd,
                 object->payload.filed.handle,
@@ -815,7 +885,7 @@ void lpr_state_dump(const char *reason)
             pacha_trace6(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
-                PACHA_TRACE_CLASS_STATE,
+                PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.pipe"),
                 fd,
                 fd,
@@ -827,7 +897,7 @@ void lpr_state_dump(const char *reason)
             pacha_trace3(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
-                PACHA_TRACE_CLASS_STATE,
+                PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.eventfd"),
                 fd,
                 object->payload.eventfd.counter);
@@ -836,42 +906,32 @@ void lpr_state_dump(const char *reason)
             pacha_trace4(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
-                PACHA_TRACE_CLASS_STATE,
+                PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.tty"),
                 fd,
                 object->payload.tty.handle,
                 (uint64_t)(uint32_t)lpr_linux_current_pgrp);
             break;
+        case LPR_FD_TABLE_KIND_SOCKET:
+            pacha_trace6(
+                PACHA_TRACE_COMPONENT_LPR,
+                PACHA_TRACE_EVENT_LPR_PROCESS,
+                PACHA_TRACE_CLASS_ERROR,
+                pacha_trace_name_id("lpr.fd.socket"),
+                fd,
+                object->payload.socket.handle,
+                object->payload.socket.connected,
+                object->payload.socket.connecting,
+                (uint64_t)(uint32_t)object->payload.socket.last_error);
+            break;
         default:
             break;
         }
     }
-    for (uint64_t fd = 0; fd < 128u; fd += 1) {
-        if (!lpr_linux_socket_fd_active(fd)) {
-            continue;
-        }
-        pacha_trace6(
-            PACHA_TRACE_COMPONENT_LPR,
-            PACHA_TRACE_EVENT_LPR_PROCESS,
-            PACHA_TRACE_CLASS_STATE,
-            pacha_trace_name_id("lpr.fd.entry"),
-            fd,
-            LPR_FD_TABLE_KIND_SOCKET,
-            0,
-            0,
-            1);
-        pacha_trace3(
-            PACHA_TRACE_COMPONENT_LPR,
-            PACHA_TRACE_EVENT_LPR_PROCESS,
-            PACHA_TRACE_CLASS_STATE,
-            pacha_trace_name_id("lpr.fd.socket"),
-            fd,
-            0);
-    }
     pacha_trace3(
         PACHA_TRACE_COMPONENT_LPR,
         PACHA_TRACE_EVENT_LPR_PROCESS,
-        PACHA_TRACE_CLASS_STATE,
+        PACHA_TRACE_CLASS_ERROR,
         pacha_trace_name_id("lpr.state.end"),
         lpr_control_fd_table.generation,
         crc);

@@ -357,6 +357,7 @@ int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd)
     switch (fd->kind) {
     case FILED_V2_EXEC_LPR_FD_FILED:
     case FILED_V2_EXEC_LPR_FD_TTY:
+    case FILED_V2_EXEC_LPR_FD_SOCKET:
         return fd->handle != 0;
     case FILED_V2_EXEC_LPR_FD_PIPE:
     case FILED_V2_EXEC_LPR_FD_EVENT:
