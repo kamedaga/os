@@ -48,8 +48,8 @@ int lpr_load_bootstrap(void)
         if (mapped < 4096) {
             goto invalid;
         }
-        const struct lpr_bootstrap *mapped_bootstrap =
-            (const struct lpr_bootstrap *)(uintptr_t)mapped;
+        const lpr_bootstrap_t *mapped_bootstrap =
+            (const lpr_bootstrap_t *)(uintptr_t)mapped;
         const lpr_bootstrap_fd_t *descs =
             (const lpr_bootstrap_fd_t *)((uintptr_t)mapped +
                 lpr_bootstrap.local_fd_table_offset);

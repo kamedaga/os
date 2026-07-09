@@ -1,16 +1,11 @@
 #include "lpr_memory.h"
-#include "lpr_linux_syscall.h"
-#include "support/syscall.h"
+#include "lpr_filed_internal.h"
 
 #include <pachaos/abi.h>
 
 enum {
     LPR_BRK_RESERVE_SIZE = 64ull * 1024ull * 1024ull,
 };
-
-static uint64_t g_brk_base;
-static uint64_t g_brk_current;
-static uint64_t g_brk_limit;
 
 static uint64_t align_up_page(uint64_t value)
 {
@@ -23,7 +18,7 @@ static uint64_t align_up_page(uint64_t value)
 
 static int init_brk(void)
 {
-    if (g_brk_base != 0) {
+    if (lpr_brk_base != 0) {
         return 0;
     }
     const int64_t mapped = lpr_pacha_syscall6(
@@ -37,13 +32,13 @@ static int init_brk(void)
     if (mapped < 4096) {
         return -1;
     }
-    g_brk_base = (uint64_t)mapped;
-    g_brk_current = g_brk_base;
-    g_brk_limit = g_brk_base + LPR_BRK_RESERVE_SIZE;
-    if (g_brk_limit < g_brk_base) {
-        g_brk_base = 0;
-        g_brk_current = 0;
-        g_brk_limit = 0;
+    lpr_brk_base = (uint64_t)mapped;
+    lpr_brk_current = lpr_brk_base;
+    lpr_brk_limit = lpr_brk_base + LPR_BRK_RESERVE_SIZE;
+    if (lpr_brk_limit < lpr_brk_base) {
+        lpr_brk_base = 0;
+        lpr_brk_current = 0;
+        lpr_brk_limit = 0;
         return -1;
     }
     return 0;
@@ -55,12 +50,12 @@ int64_t lpr_linux_brk(uint64_t requested)
         return 0;
     }
     if (requested == 0) {
-        return (int64_t)g_brk_current;
+        return (int64_t)lpr_brk_current;
     }
     const uint64_t aligned = align_up_page(requested);
-    if (aligned == 0 || requested < g_brk_base || aligned > g_brk_limit) {
-        return (int64_t)g_brk_current;
+    if (aligned == 0 || requested < lpr_brk_base || aligned > lpr_brk_limit) {
+        return (int64_t)lpr_brk_current;
     }
-    g_brk_current = requested;
-    return (int64_t)g_brk_current;
+    lpr_brk_current = requested;
+    return (int64_t)lpr_brk_current;
 }

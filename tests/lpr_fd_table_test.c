@@ -11,6 +11,23 @@
     } \
 } while (0)
 
+static uint32_t futex_wait_calls;
+static uint32_t futex_wake_calls;
+
+static void fake_futex_wait(volatile uint32_t *word, uint32_t expected)
+{
+    CHECK(expected == 1u);
+    futex_wait_calls++;
+    *word = 0;
+}
+
+static void fake_futex_wake(volatile uint32_t *word, uint32_t count)
+{
+    CHECK(*word == 0u);
+    CHECK(count == 1u);
+    futex_wake_calls++;
+}
+
 static void test_dup_shares_file_object(void)
 {
     lpr_fd_table_slot_t slots[8];
@@ -98,7 +115,9 @@ static void test_close_range_cloexec_is_fd_local(void)
     CHECK(lpr_fd_table_install_at(&table, 2, &install) == 0);
     uint32_t dup_fd = 0;
     CHECK(lpr_fd_table_dup(&table, 2, 3, 0, &dup_fd) == 0);
+    const uint64_t generation_before = table.generation;
     CHECK(lpr_fd_table_close_range(&table, 3, 7, 1) == 0);
+    CHECK(table.generation == generation_before + 1u);
 
     uint16_t fd_flags = 0;
     CHECK(lpr_fd_table_get_fd_flags(&table, 2, &fd_flags) == 0);
@@ -109,6 +128,36 @@ static void test_close_range_cloexec_is_fd_local(void)
     uint32_t status_flags = 0;
     CHECK(lpr_fd_table_get_status_flags(&table, 2, &status_flags) == 0);
     CHECK(status_flags == LPR_FD_TABLE_STATUS_NONBLOCK);
+}
+
+static void test_futex_lock_single_thread_fast_path(void)
+{
+    lpr_fd_table_slot_t slots[8];
+    lpr_fd_table_file_t files[8];
+    lpr_fd_table_t table;
+    volatile uint32_t thread_count = 1;
+    lpr_fd_table_init(&table, slots, 8, files, 8);
+    lpr_fd_table_configure_lock(
+        &table,
+        &thread_count,
+        fake_futex_wait,
+        fake_futex_wake);
+
+    futex_wait_calls = 0;
+    futex_wake_calls = 0;
+    const lpr_fd_table_install_t install = {
+        .kind = LPR_FD_TABLE_KIND_FILED,
+        .backend_id = 42u,
+    };
+    CHECK(lpr_fd_table_install_at(&table, 3, &install) == 0);
+    CHECK(futex_wait_calls == 0u);
+    CHECK(futex_wake_calls == 0u);
+
+    thread_count = 2;
+    table.lock.word = 1;
+    CHECK(lpr_fd_table_install_at(&table, 4, &install) == 0);
+    CHECK(futex_wait_calls == 1u);
+    CHECK(futex_wake_calls == 1u);
 }
 
 static void test_fcntl_dupfd_shape(void)
@@ -153,5 +202,6 @@ int main(void)
     test_dup2_closes_target_atomically_in_model();
     test_close_range_cloexec_is_fd_local();
     test_fcntl_dupfd_shape();
+    test_futex_lock_single_thread_fast_path();
     return 0;
 }

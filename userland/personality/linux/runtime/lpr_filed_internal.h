@@ -10,6 +10,7 @@
 #include "support/string.h"
 #include "support/syscall.h"
 #include <pacha/ipc.h>
+#include <pacha/abi.h>
 #include <pacha/service_abi.h>
 #include <pacha/status.h>
 #include <pacha/trace.h>
@@ -100,6 +101,8 @@
 #define LPR_LINUX_CLOCK_REALTIME 0ull
 #define LPR_LINUX_CLOCK_MONOTONIC 1ull
 #define LPR_LINUX_TIMER_ABSTIME 1ull
+#define LPR_FILE_MAP_CACHE_ENTRIES 4u
+#define LPR_FILE_MAP_CACHE_MIN_BYTES 65536ull
 
 #define LPR_LINUX_S_IFMT 0170000ull
 #define LPR_LINUX_S_IFIFO 0010000ull
@@ -202,82 +205,263 @@ typedef struct lpr_pacha_process_status {
     uint64_t generation;
 } lpr_pacha_process_status_t;
 
+typedef struct lpr_linux_rlimit {
+    uint64_t cur;
+    uint64_t max;
+} lpr_linux_rlimit_t;
+
+enum {
+    LPR_LINUX_RLIMIT_CPU = 0,
+    LPR_LINUX_RLIMIT_FSIZE = 1,
+    LPR_LINUX_RLIMIT_DATA = 2,
+    LPR_LINUX_RLIMIT_STACK = 3,
+    LPR_LINUX_RLIMIT_CORE = 4,
+    LPR_LINUX_RLIMIT_RSS = 5,
+    LPR_LINUX_RLIMIT_NPROC = 6,
+    LPR_LINUX_RLIMIT_NOFILE = 7,
+    LPR_LINUX_RLIMIT_MEMLOCK = 8,
+    LPR_LINUX_RLIMIT_AS = 9,
+    LPR_LINUX_RLIMIT_LOCKS = 10,
+    LPR_LINUX_RLIMIT_SIGPENDING = 11,
+    LPR_LINUX_RLIMIT_MSGQUEUE = 12,
+    LPR_LINUX_RLIMIT_NICE = 13,
+    LPR_LINUX_RLIMIT_RTPRIO = 14,
+    LPR_LINUX_RLIMIT_RTTIME = 15,
+    LPR_LINUX_RLIMIT_COUNT = 16,
+};
+
+typedef struct lpr_file_map_cache_entry {
+    uint8_t active;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    uint32_t vmo_fd;
+    uint64_t handle;
+    uint64_t length;
+} lpr_file_map_cache_entry_t;
+
 enum {
     LPR_READLINK_CACHE_ENTRIES = 8,
 };
 
+typedef struct lpr_fd_storage_state {
+    lpr_fd_table_slot_t slots_initial[LPR_FD_TABLE_INITIAL_SIZE];
+    lpr_fd_table_file_t files_initial[LPR_FD_TABLE_INITIAL_SIZE];
+    lpr_fd_table_slot_t *slots;
+    lpr_fd_table_file_t *files;
+    uint64_t capacity;
+    void *dynamic_base;
+    uint64_t dynamic_bytes;
+} lpr_fd_storage_state_t;
+
+typedef struct lpr_process_state {
+    int default_stdio_checked;
+    int bootstrap_checked;
+    int bootstrap_valid;
+    int bootstrap_local_fds_installed;
+    struct lpr_bootstrap bootstrap;
+    int checked;
+    int32_t current_pid;
+    int32_t current_ppid;
+    int32_t current_sid;
+    int32_t current_pgrp;
+    int32_t next_pid;
+    int32_t pending_child_pid;
+    int32_t pending_child_ppid;
+    int32_t pending_child_sid;
+    int32_t pending_child_pgrp;
+    uint64_t supervisor_token;
+    uint64_t supervisor_pending_child_token;
+    int supervisor_enabled;
+    lpr_linux_process_entry_t entries[LPR_LINUX_PROCESS_TABLE_SIZE];
+} lpr_process_state_t;
+
+typedef struct lpr_signal_state {
+    lpr_linux_sigaction_record_t actions[LPR_LINUX_SIGNAL_MAX + 1u];
+    uint64_t mask;
+    uint64_t pending_mask;
+    int dispatching;
+} lpr_signal_state_t;
+
+typedef struct lpr_cwd_state {
+    int checked;
+    uint64_t handle;
+    char path[FILED_V2_PATH_BYTES];
+} lpr_cwd_state_t;
+
+typedef struct lpr_rlimit_state {
+    uint8_t initialized;
+    lpr_linux_rlimit_t values[LPR_LINUX_RLIMIT_COUNT];
+} lpr_rlimit_state_t;
+
+typedef struct lpr_filed_rpc_state {
+    uint64_t request_id;
+    int endpoint_checked;
+    int wire_page_fd;
+    void *wire_page;
+    int wire_page_busy;
+    int session_fd;
+    int session_page_fd;
+    void *session_page;
+    int session_checked;
+    int session_payload_busy;
+    int readv_vmo_fd;
+    void *readv_vmo_map;
+    uint64_t readv_vmo_len;
+    int pread_vmo_page_fd;
+    void *pread_vmo_page;
+    int pread_vmo_page_busy;
+} lpr_filed_rpc_state_t;
+
+typedef struct lpr_termd_rpc_state {
+    uint64_t request_id;
+    int wire_page_fd;
+    void *wire_page;
+    int wire_page_busy;
+} lpr_termd_rpc_state_t;
+
+typedef struct lpr_netd_rpc_state {
+    uint64_t request_id;
+    int page_fd;
+    void *page;
+    int page_busy;
+    uint16_t next_ephemeral_port;
+} lpr_netd_rpc_state_t;
+
+typedef struct lpr_cache_state {
+    lpr_readlink_cache_entry_t readlink[LPR_READLINK_CACHE_ENTRIES];
+    lpr_filed_page_cache_entry_t page[LPR_FILED_PAGE_CACHE_ENTRIES];
+    uint64_t readlink_clock;
+    uint64_t page_clock;
+    uint64_t readv_total;
+    uint64_t readv_coalesced;
+    uint64_t readv_hit;
+    uint64_t readv_fill;
+    uint64_t readv_fallback;
+    uint64_t readv_cross_page;
+    uint64_t readv_to_vmo;
+    uint64_t readv_bytes;
+    lpr_file_map_cache_entry_t file_map[LPR_FILE_MAP_CACHE_ENTRIES];
+    uint64_t file_map_clock;
+} lpr_cache_state_t;
+
+typedef struct lpr_memory_state {
+    uint64_t brk_base;
+    uint64_t brk_current;
+    uint64_t brk_limit;
+} lpr_memory_state_t;
+
+typedef struct lpr_debug_state {
+    const struct lpr_linux_user_frame *active_user_frame;
+} lpr_debug_state_t;
+
+typedef struct lpr_bootstrap lpr_bootstrap_t;
+
+static inline void lpr_exec_set_supervisor_tokens(
+    filed_v2_exec_path_t *exec,
+    uint64_t token)
+{
+    exec->lpr_supervisor_token = token;
+    exec->lpr_fd_table_token = token;
+}
+
 typedef struct lpr_state {
     lpr_fd_table_t fd_table;
-    uint64_t generation;
+    lpr_fd_storage_state_t fd_storage;
+    volatile uint32_t thread_count;
+    lpr_process_state_t process;
+    lpr_signal_state_t signal;
+    lpr_cwd_state_t cwd;
+    lpr_rlimit_state_t rlimits;
+    uint64_t umask_value;
+    lpr_filed_rpc_state_t filed_rpc;
+    lpr_termd_rpc_state_t termd_rpc;
+    lpr_netd_rpc_state_t netd_rpc;
+    lpr_cache_state_t caches;
+    lpr_memory_state_t memory;
+    lpr_debug_state_t debug;
 } lpr_state_t;
 
-extern lpr_fd_table_slot_t lpr_control_slots_initial[LPR_FD_TABLE_INITIAL_SIZE];
-extern lpr_fd_table_file_t lpr_control_files_initial[LPR_FD_TABLE_INITIAL_SIZE];
-extern lpr_fd_table_slot_t *lpr_control_slots;
-extern lpr_fd_table_file_t *lpr_control_files;
 extern lpr_state_t lpr_state;
 #define lpr_control_fd_table (lpr_state.fd_table)
-extern uint64_t lpr_fd_table_capacity;
-extern void *lpr_fd_table_dynamic_base;
-extern uint64_t lpr_fd_table_dynamic_bytes;
-extern lpr_readlink_cache_entry_t lpr_readlink_cache[LPR_READLINK_CACHE_ENTRIES];
-extern lpr_filed_page_cache_entry_t lpr_page_cache[LPR_FILED_PAGE_CACHE_ENTRIES];
-extern uint64_t lpr_readlink_cache_clock;
-extern uint64_t lpr_page_cache_clock;
-extern uint64_t lpr_readv_cache_total;
-extern uint64_t lpr_readv_cache_coalesced;
-extern uint64_t lpr_readv_cache_hit;
-extern uint64_t lpr_readv_cache_fill;
-extern uint64_t lpr_readv_cache_fallback;
-extern uint64_t lpr_readv_cache_cross_page;
-extern uint64_t lpr_readv_cache_to_vmo;
-extern uint64_t lpr_readv_cache_bytes;
-extern uint64_t lpr_request_id;
-extern int lpr_filed_endpoint_checked;
-extern int lpr_wire_page_fd;
-extern void *lpr_wire_page;
-extern int lpr_wire_page_busy;
-extern int lpr_tty_wire_page_fd;
-extern void *lpr_tty_wire_page;
-extern int lpr_tty_wire_page_busy;
-extern int lpr_session_fd;
-extern int lpr_session_page_fd;
-extern void *lpr_session_page;
-extern int lpr_session_checked;
-extern int lpr_session_payload_busy;
-extern uint64_t lpr_termd_request_id;
-extern int lpr_readv_vmo_fd;
-extern void *lpr_readv_vmo_map;
-extern uint64_t lpr_readv_vmo_len;
-extern int lpr_pread_vmo_page_fd;
-extern void *lpr_pread_vmo_page;
-extern int lpr_pread_vmo_page_busy;
-extern int lpr_default_stdio_checked;
-extern int lpr_bootstrap_checked;
-extern int lpr_bootstrap_valid;
-extern int lpr_bootstrap_local_fds_installed;
-extern struct lpr_bootstrap lpr_bootstrap;
-extern int lpr_linux_process_state_checked;
-extern int32_t lpr_linux_current_pid;
-extern int32_t lpr_linux_current_ppid;
-extern int32_t lpr_linux_current_sid;
-extern int32_t lpr_linux_current_pgrp;
-extern int32_t lpr_linux_next_pid;
-extern int32_t lpr_linux_pending_child_pid;
-extern int32_t lpr_linux_pending_child_ppid;
-extern int32_t lpr_linux_pending_child_sid;
-extern int32_t lpr_linux_pending_child_pgrp;
-extern uint64_t lpr_supervisor_token;
-extern uint64_t lpr_supervisor_pending_child_token;
-extern int lpr_supervisor_enabled;
-extern lpr_linux_process_entry_t lpr_linux_processes[LPR_LINUX_PROCESS_TABLE_SIZE];
-extern lpr_linux_sigaction_record_t lpr_linux_sigactions[LPR_LINUX_SIGNAL_MAX + 1u];
-extern uint64_t lpr_linux_signal_mask;
-extern uint64_t lpr_linux_pending_signal_mask;
-extern int lpr_linux_signal_dispatching;
-extern int lpr_cwd_checked;
-extern uint64_t lpr_cwd_handle;
-extern char lpr_cwd_path[FILED_V2_PATH_BYTES];
+#define lpr_control_slots_initial (lpr_state.fd_storage.slots_initial)
+#define lpr_control_files_initial (lpr_state.fd_storage.files_initial)
+#define lpr_control_slots (lpr_state.fd_storage.slots)
+#define lpr_control_files (lpr_state.fd_storage.files)
+#define lpr_fd_table_capacity (lpr_state.fd_storage.capacity)
+#define lpr_fd_table_dynamic_base (lpr_state.fd_storage.dynamic_base)
+#define lpr_fd_table_dynamic_bytes (lpr_state.fd_storage.dynamic_bytes)
+#define lpr_readlink_cache (lpr_state.caches.readlink)
+#define lpr_page_cache (lpr_state.caches.page)
+#define lpr_readlink_cache_clock (lpr_state.caches.readlink_clock)
+#define lpr_page_cache_clock (lpr_state.caches.page_clock)
+#define lpr_readv_cache_total (lpr_state.caches.readv_total)
+#define lpr_readv_cache_coalesced (lpr_state.caches.readv_coalesced)
+#define lpr_readv_cache_hit (lpr_state.caches.readv_hit)
+#define lpr_readv_cache_fill (lpr_state.caches.readv_fill)
+#define lpr_readv_cache_fallback (lpr_state.caches.readv_fallback)
+#define lpr_readv_cache_cross_page (lpr_state.caches.readv_cross_page)
+#define lpr_readv_cache_to_vmo (lpr_state.caches.readv_to_vmo)
+#define lpr_readv_cache_bytes (lpr_state.caches.readv_bytes)
+#define lpr_file_map_cache (lpr_state.caches.file_map)
+#define lpr_file_map_cache_clock (lpr_state.caches.file_map_clock)
+#define lpr_request_id (lpr_state.filed_rpc.request_id)
+#define lpr_filed_endpoint_checked (lpr_state.filed_rpc.endpoint_checked)
+#define lpr_wire_page_fd (lpr_state.filed_rpc.wire_page_fd)
+#define lpr_wire_page (lpr_state.filed_rpc.wire_page)
+#define lpr_wire_page_busy (lpr_state.filed_rpc.wire_page_busy)
+#define lpr_session_fd (lpr_state.filed_rpc.session_fd)
+#define lpr_session_page_fd (lpr_state.filed_rpc.session_page_fd)
+#define lpr_session_page (lpr_state.filed_rpc.session_page)
+#define lpr_session_checked (lpr_state.filed_rpc.session_checked)
+#define lpr_session_payload_busy (lpr_state.filed_rpc.session_payload_busy)
+#define lpr_readv_vmo_fd (lpr_state.filed_rpc.readv_vmo_fd)
+#define lpr_readv_vmo_map (lpr_state.filed_rpc.readv_vmo_map)
+#define lpr_readv_vmo_len (lpr_state.filed_rpc.readv_vmo_len)
+#define lpr_pread_vmo_page_fd (lpr_state.filed_rpc.pread_vmo_page_fd)
+#define lpr_pread_vmo_page (lpr_state.filed_rpc.pread_vmo_page)
+#define lpr_pread_vmo_page_busy (lpr_state.filed_rpc.pread_vmo_page_busy)
+#define lpr_termd_request_id (lpr_state.termd_rpc.request_id)
+#define lpr_tty_wire_page_fd (lpr_state.termd_rpc.wire_page_fd)
+#define lpr_tty_wire_page (lpr_state.termd_rpc.wire_page)
+#define lpr_tty_wire_page_busy (lpr_state.termd_rpc.wire_page_busy)
+#define lpr_default_stdio_checked (lpr_state.process.default_stdio_checked)
+#define lpr_bootstrap_checked (lpr_state.process.bootstrap_checked)
+#define lpr_bootstrap_valid (lpr_state.process.bootstrap_valid)
+#define lpr_bootstrap_local_fds_installed (lpr_state.process.bootstrap_local_fds_installed)
+#define lpr_bootstrap (lpr_state.process.bootstrap)
+#define lpr_linux_process_state_checked (lpr_state.process.checked)
+#define lpr_linux_current_pid (lpr_state.process.current_pid)
+#define lpr_linux_current_ppid (lpr_state.process.current_ppid)
+#define lpr_linux_current_sid (lpr_state.process.current_sid)
+#define lpr_linux_current_pgrp (lpr_state.process.current_pgrp)
+#define lpr_linux_next_pid (lpr_state.process.next_pid)
+#define lpr_linux_pending_child_pid (lpr_state.process.pending_child_pid)
+#define lpr_linux_pending_child_ppid (lpr_state.process.pending_child_ppid)
+#define lpr_linux_pending_child_sid (lpr_state.process.pending_child_sid)
+#define lpr_linux_pending_child_pgrp (lpr_state.process.pending_child_pgrp)
+#define lpr_supervisor_token (lpr_state.process.supervisor_token)
+#define lpr_supervisor_pending_child_token (lpr_state.process.supervisor_pending_child_token)
+#define lpr_supervisor_enabled (lpr_state.process.supervisor_enabled)
+#define lpr_linux_processes (lpr_state.process.entries)
+#define lpr_linux_sigactions (lpr_state.signal.actions)
+#define lpr_linux_signal_mask (lpr_state.signal.mask)
+#define lpr_linux_pending_signal_mask (lpr_state.signal.pending_mask)
+#define lpr_linux_signal_dispatching (lpr_state.signal.dispatching)
+#define lpr_cwd_checked (lpr_state.cwd.checked)
+#define lpr_cwd_handle (lpr_state.cwd.handle)
+#define lpr_cwd_path (lpr_state.cwd.path)
+#define lpr_linux_rlimits_initialized (lpr_state.rlimits.initialized)
+#define lpr_linux_rlimits (lpr_state.rlimits.values)
+#define lpr_linux_umask_value (lpr_state.umask_value)
+#define lpr_brk_base (lpr_state.memory.brk_base)
+#define lpr_brk_current (lpr_state.memory.brk_current)
+#define lpr_brk_limit (lpr_state.memory.brk_limit)
+#define lpr_active_user_frame (lpr_state.debug.active_user_frame)
+#define lpr_netd_request_id (lpr_state.netd_rpc.request_id)
+#define lpr_netd_page_fd (lpr_state.netd_rpc.page_fd)
+#define lpr_netd_page (lpr_state.netd_rpc.page)
+#define lpr_netd_page_busy (lpr_state.netd_rpc.page_busy)
+#define lpr_next_ephemeral_port (lpr_state.netd_rpc.next_ephemeral_port)
 
 void lpr_filed_session_drop(void);
 void *lpr_session_payload_slot(uint64_t slot);

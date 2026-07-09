@@ -789,8 +789,14 @@ int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t co
 void lpr_state_dump(const char *reason)
 {
     lpr_fd_arrays_init();
+    lpr_fd_table_lock(&lpr_control_fd_table);
     const uint64_t reason_id = reason != 0 ? pacha_trace_name_id(reason) : 0;
-    const uint64_t open_count = lpr_fd_table_open_count(&lpr_control_fd_table);
+    uint64_t open_count = 0;
+    uint64_t live_object_count = 0;
+    for (uint64_t fd = 0; fd < lpr_fd_table_capacity; fd += 1) {
+        open_count += lpr_control_fd_table.slots[fd].active ? 1u : 0u;
+        live_object_count += lpr_control_fd_table.files[fd].active ? 1u : 0u;
+    }
     uint64_t crc = lpr_control_fd_table.generation ^ open_count;
     pacha_trace6(
         PACHA_TRACE_COMPONENT_LPR,
@@ -801,6 +807,16 @@ void lpr_state_dump(const char *reason)
         lpr_control_fd_table.generation,
         lpr_fd_table_capacity,
         open_count,
+        reason_id);
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_LPR_PROCESS,
+        PACHA_TRACE_CLASS_ERROR,
+        pacha_trace_name_id("lpr.state.counts"),
+        (uint64_t)(uint32_t)lpr_linux_current_pid,
+        lpr_control_fd_table.generation,
+        open_count,
+        live_object_count,
         reason_id);
     for (uint64_t fd = 0; fd < lpr_fd_table_capacity; fd += 1) {
         const lpr_fd_table_slot_t *slot = &lpr_control_fd_table.slots[fd];
@@ -889,4 +905,5 @@ void lpr_state_dump(const char *reason)
         pacha_trace_name_id("lpr.state.end"),
         lpr_control_fd_table.generation,
         crc);
+    lpr_fd_table_unlock(&lpr_control_fd_table);
 }

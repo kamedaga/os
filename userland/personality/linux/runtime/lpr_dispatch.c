@@ -1,5 +1,5 @@
 #include "lpr_linux_syscall.h"
-#include "lpr_filed.h"
+#include "lpr_filed_internal.h"
 #include "lpr_memory.h"
 #include "lpr_socket.h"
 #include "lpr_vfs_local.h"
@@ -21,59 +21,6 @@
 #define LPR_LINUX_MAP_ANONYMOUS 0x20ull
 #define LPR_LINUX_MAP_NORESERVE 0x4000ull
 #define LPR_LINUX_MAP_FIXED_NOREPLACE 0x100000ull
-#define LPR_LINUX_AT_FDCWD ((uint64_t)(int64_t)-100)
-#define LPR_LINUX_AT_SYMLINK_NOFOLLOW 0x100ull
-#define LPR_LINUX_AT_REMOVEDIR 0x200ull
-#define LPR_LINUX_AT_EMPTY_PATH 0x1000ull
-
-static uint64_t lpr_linux_umask_value;
-
-typedef struct lpr_linux_rlimit {
-    uint64_t cur;
-    uint64_t max;
-} lpr_linux_rlimit_t;
-
-enum {
-    LPR_LINUX_RLIMIT_CPU = 0,
-    LPR_LINUX_RLIMIT_FSIZE = 1,
-    LPR_LINUX_RLIMIT_DATA = 2,
-    LPR_LINUX_RLIMIT_STACK = 3,
-    LPR_LINUX_RLIMIT_CORE = 4,
-    LPR_LINUX_RLIMIT_RSS = 5,
-    LPR_LINUX_RLIMIT_NPROC = 6,
-    LPR_LINUX_RLIMIT_NOFILE = 7,
-    LPR_LINUX_RLIMIT_MEMLOCK = 8,
-    LPR_LINUX_RLIMIT_AS = 9,
-    LPR_LINUX_RLIMIT_LOCKS = 10,
-    LPR_LINUX_RLIMIT_SIGPENDING = 11,
-    LPR_LINUX_RLIMIT_MSGQUEUE = 12,
-    LPR_LINUX_RLIMIT_NICE = 13,
-    LPR_LINUX_RLIMIT_RTPRIO = 14,
-    LPR_LINUX_RLIMIT_RTTIME = 15,
-    LPR_LINUX_RLIMIT_COUNT = 16,
-};
-
-static uint8_t lpr_linux_rlimits_initialized;
-static lpr_linux_rlimit_t lpr_linux_rlimits[LPR_LINUX_RLIMIT_COUNT];
-
-typedef struct lpr_file_map_cache_entry {
-    uint8_t active;
-    uint8_t reserved0;
-    uint16_t reserved1;
-    uint32_t vmo_fd;
-    uint64_t handle;
-    uint64_t length;
-} lpr_file_map_cache_entry_t;
-
-enum {
-    LPR_FILE_MAP_CACHE_ENTRIES = 4,
-    LPR_FILE_MAP_CACHE_MIN_BYTES = 65536,
-};
-
-static lpr_file_map_cache_entry_t lpr_file_map_cache[LPR_FILE_MAP_CACHE_ENTRIES];
-static uint64_t lpr_file_map_cache_clock;
-static const struct lpr_linux_user_frame *lpr_active_user_frame;
-
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status);
 static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
 
@@ -460,7 +407,7 @@ static void lpr_trace_enosys_syscall(uint64_t nr,
     pacha_trace2(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_ENOSYS, PACHA_TRACE_CLASS_ERROR, nr, a5);
 }
 
-static uint64_t lpr_page_align_up(uint64_t value)
+static uint64_t lpr_mmap_page_align_up(uint64_t value)
 {
     const uint64_t mask = 4095ull;
     if (value > UINT64_MAX - mask) {
@@ -619,7 +566,7 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
         if ((offset & 4095ull) != 0) {
             return -LPR_LINUX_EINVAL;
         }
-        const uint64_t map_len = lpr_page_align_up(len);
+        const uint64_t map_len = lpr_mmap_page_align_up(len);
         if (map_len == 0) {
             return -LPR_LINUX_ENOMEM;
         }

@@ -35,4 +35,11 @@ run_case "GNUCU_CASE4" "3"   "/usr/bin/printf abc | /usr/bin/wc -c"
 run_case "GNUCU_CASE5" "2"   "/usr/bin/printf 'a\nb\nc\n' | /usr/bin/head -n 2 | /usr/bin/wc -l"
 run_case "GNUCU_CASE6" "2"   "/usr/bin/printf 'a\nb\nc\n' | /usr/bin/tail -n 2 | /usr/bin/wc -l"
 run_case "GNUCU_CASE7" "a"   "/usr/bin/printf 'z\na\n' | /usr/bin/sort | /usr/bin/head -n 1"
+
+i=0
+while [ "$i" -lt 10 ]; do
+  /bin/coreutils --version >/dev/null || exit 1
+  i=$((i + 1))
+done
+echo "GNUCU_LOADER_REPEAT=OK"
 echo "GNUCU_DONE"

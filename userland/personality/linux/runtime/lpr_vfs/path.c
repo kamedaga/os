@@ -1143,6 +1143,7 @@ int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_r
         }
         return status;
     }
+    const uint64_t reply_result = reply_header->result;
     if (op != FILED_V2_OP_VFS_OPENAT &&
         op != FILED_V2_OP_VFS_CLOSE &&
         op != FILED_V2_OP_VFS_FSYNC &&
@@ -1151,7 +1152,7 @@ int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_r
         lpr_memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, payload_size);
     }
     if (out_result != 0) {
-        *out_result = reply_header->result;
+        *out_result = reply_result;
     }
     if (page != owned_page) {
         (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)page, FILED_V2_PAGE_BYTES);

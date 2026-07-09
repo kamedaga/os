@@ -23,4 +23,5 @@ fi
   --expect 'GNUCU_CASE5=OK' \
   --expect 'GNUCU_CASE6=OK' \
   --expect 'GNUCU_CASE7=OK' \
+  --expect 'GNUCU_LOADER_REPEAT=OK' \
   --expect 'GNUCU_DONE'

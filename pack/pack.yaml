@@ -795,6 +795,10 @@ apps:
     file: "tests/fixtures/gnu_coreutils_smoke.sh"
     out: "GNUSMOKE.SH"
     rootfs: "/cmd/gnu_smoke.sh"
+  lpr_state_leak_script:
+    file: "tests/fixtures/lpr_state_leak_smoke.sh"
+    out: "LPRLEAK.SH"
+    rootfs: "/cmd/lpr_state_leak.sh"
   ext4_write_script:
     file: "tests/fixtures/ext4_persist_write.sh"
     out: "EXT4W.SH"

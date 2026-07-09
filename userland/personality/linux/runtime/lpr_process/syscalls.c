@@ -576,8 +576,7 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     exec.linux_pgrp = (uint64_t)(uint32_t)lpr_linux_current_pgrp;
     exec.linux_next_pid = (uint64_t)(uint32_t)lpr_linux_next_pid;
     if (lpr_supervisor_enabled) {
-        exec.lpr_supervisor_token = lpr_supervisor_token;
-        exec.lpr_fd_table_token = lpr_supervisor_token;
+        lpr_exec_set_supervisor_tokens(&exec, lpr_supervisor_token);
     }
     lpr_trace_process_event("execve_begin", path_len, 0, 0);
 

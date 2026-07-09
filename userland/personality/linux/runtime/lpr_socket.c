@@ -1,7 +1,6 @@
 #include "lpr_socket.h"
 
-#include "lpr_filed.h"
-#include "lpr_fd/table.h"
+#include "lpr_filed_internal.h"
 #include "support/string.h"
 #include "support/syscall.h"
 #include <pacha/ipc.h>
@@ -84,11 +83,6 @@ typedef struct lpr_linux_sockaddr_in {
     uint8_t zero[8];
 } lpr_linux_sockaddr_in_t;
 
-typedef struct lpr_linux_iovec {
-    uint64_t base;
-    uint64_t len;
-} lpr_linux_iovec_t;
-
 typedef struct lpr_linux_msghdr {
     uint64_t msg_name;
     uint32_t msg_namelen;
@@ -113,42 +107,10 @@ typedef struct lpr_linux_pollfd {
     int16_t revents;
 } lpr_linux_pollfd_t;
 
-typedef struct lpr_linux_timespec {
-    int64_t tv_sec;
-    int64_t tv_nsec;
-} lpr_linux_timespec_t;
-
 typedef struct lpr_linux_timeval {
     int64_t tv_sec;
     int64_t tv_usec;
 } lpr_linux_timeval_t;
-
-typedef struct lpr_linux_stat {
-    uint64_t st_dev;
-    uint64_t st_ino;
-    uint64_t st_nlink;
-    uint32_t st_mode;
-    uint32_t st_uid;
-    uint32_t st_gid;
-    uint32_t __pad0;
-    uint64_t st_rdev;
-    int64_t st_size;
-    int64_t st_blksize;
-    int64_t st_blocks;
-    int64_t st_atime_sec;
-    int64_t st_atime_nsec;
-    int64_t st_mtime_sec;
-    int64_t st_mtime_nsec;
-    int64_t st_ctime_sec;
-    int64_t st_ctime_nsec;
-    int64_t __unused[3];
-} lpr_linux_stat_t;
-
-static uint64_t lpr_netd_request_id = 0x4c50524e45544401ull;
-static int lpr_netd_page_fd = -1;
-static void *lpr_netd_page;
-static int lpr_netd_page_busy;
-static uint16_t lpr_next_ephemeral_port = LPR_NETD_EPHEMERAL_PORT_BASE;
 
 static int64_t lpr_linux_sleep_ms(uint64_t ms);
 static int64_t lpr_linux_socket_wait_events(uint64_t fd, uint32_t events, int32_t timeout_ms);

@@ -9,6 +9,58 @@ static void lpr_fd_table_zero(void *ptr, uint64_t size)
     }
 }
 
+static int lpr_fd_table_lock_enabled(const lpr_fd_table_t *table)
+{
+    return table != 0 &&
+        table->lock.thread_count != 0 &&
+        __atomic_load_n(table->lock.thread_count, __ATOMIC_RELAXED) > 1u;
+}
+
+void lpr_fd_table_configure_lock(
+    lpr_fd_table_t *table,
+    const volatile uint32_t *thread_count,
+    lpr_futex_wait_fn futex_wait,
+    lpr_futex_wake_fn futex_wake)
+{
+    if (table == 0) {
+        return;
+    }
+    table->lock.word = 0;
+    table->lock.thread_count = thread_count;
+    table->lock.futex_wait = futex_wait;
+    table->lock.futex_wake = futex_wake;
+}
+
+void lpr_fd_table_lock(lpr_fd_table_t *table)
+{
+    if (!lpr_fd_table_lock_enabled(table)) {
+        return;
+    }
+    while (!__atomic_compare_exchange_n(
+        &table->lock.word,
+        &(uint32_t){0},
+        1u,
+        0,
+        __ATOMIC_ACQUIRE,
+        __ATOMIC_RELAXED))
+    {
+        if (table->lock.futex_wait != 0) {
+            table->lock.futex_wait(&table->lock.word, 1u);
+        }
+    }
+}
+
+void lpr_fd_table_unlock(lpr_fd_table_t *table)
+{
+    if (!lpr_fd_table_lock_enabled(table)) {
+        return;
+    }
+    __atomic_store_n(&table->lock.word, 0u, __ATOMIC_RELEASE);
+    if (table->lock.futex_wake != 0) {
+        table->lock.futex_wake(&table->lock.word, 1u);
+    }
+}
+
 static int lpr_fd_table_valid(const lpr_fd_table_t *table)
 {
     return table != 0 &&
@@ -158,6 +210,7 @@ void lpr_fd_table_init(
     table->files = files;
     table->file_count = file_count;
     table->generation = 1;
+    lpr_fd_table_zero(&table->lock, sizeof(table->lock));
     if (slots != 0) {
         lpr_fd_table_zero(slots, (uint64_t)slot_count * sizeof(slots[0]));
     }
@@ -166,7 +219,7 @@ void lpr_fd_table_init(
     }
 }
 
-int lpr_fd_table_install_at(
+static int lpr_fd_table_install_at_unlocked(
     lpr_fd_table_t *table,
     uint32_t fd,
     const lpr_fd_table_install_t *install)
@@ -194,28 +247,44 @@ int lpr_fd_table_install_at(
     return 0;
 }
 
+int lpr_fd_table_install_at(
+    lpr_fd_table_t *table,
+    uint32_t fd,
+    const lpr_fd_table_install_t *install)
+{
+    lpr_fd_table_lock(table);
+    const int status = lpr_fd_table_install_at_unlocked(table, fd, install);
+    lpr_fd_table_unlock(table);
+    return status;
+}
+
 int lpr_fd_table_alloc(
     lpr_fd_table_t *table,
     uint32_t min_fd,
     const lpr_fd_table_install_t *install,
     uint32_t *out_fd)
 {
+    lpr_fd_table_lock(table);
     if (!lpr_fd_table_valid(table) || out_fd == 0 || min_fd >= table->slot_count) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     for (uint32_t fd = min_fd; fd < table->slot_count; fd++) {
         if (!table->slots[fd].active) {
-            if (lpr_fd_table_install_at(table, fd, install) != 0) {
+            if (lpr_fd_table_install_at_unlocked(table, fd, install) != 0) {
+                lpr_fd_table_unlock(table);
                 return -1;
             }
             *out_fd = fd;
+            lpr_fd_table_unlock(table);
             return 0;
         }
     }
+    lpr_fd_table_unlock(table);
     return -1;
 }
 
-int lpr_fd_table_close(lpr_fd_table_t *table, uint32_t fd)
+static int lpr_fd_table_close_unlocked(lpr_fd_table_t *table, uint32_t fd)
 {
     lpr_fd_table_slot_t *slot = lpr_fd_table_slot(table, fd);
     if (slot == 0 || !slot->active) {
@@ -235,6 +304,14 @@ int lpr_fd_table_close(lpr_fd_table_t *table, uint32_t fd)
     return 0;
 }
 
+int lpr_fd_table_close(lpr_fd_table_t *table, uint32_t fd)
+{
+    lpr_fd_table_lock(table);
+    const int status = lpr_fd_table_close_unlocked(table, fd);
+    lpr_fd_table_unlock(table);
+    return status;
+}
+
 int lpr_fd_table_dup(
     lpr_fd_table_t *table,
     uint32_t old_fd,
@@ -242,9 +319,11 @@ int lpr_fd_table_dup(
     uint16_t new_fd_flags,
     uint32_t *out_fd)
 {
+    lpr_fd_table_lock(table);
     const lpr_fd_table_slot_t *old_slot = lpr_fd_table_slot_const(table, old_fd);
     lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd(table, old_fd);
     if (old_slot == 0 || file == 0 || out_fd == 0 || min_fd >= table->slot_count) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     for (uint32_t fd = min_fd; fd < table->slot_count; fd++) {
@@ -255,9 +334,11 @@ int lpr_fd_table_dup(
             file->refcount++;
             table->generation++;
             *out_fd = fd;
+            lpr_fd_table_unlock(table);
             return 0;
         }
     }
+    lpr_fd_table_unlock(table);
     return -1;
 }
 
@@ -267,16 +348,20 @@ int lpr_fd_table_dup2(
     uint32_t new_fd,
     uint16_t new_fd_flags)
 {
+    lpr_fd_table_lock(table);
     const lpr_fd_table_slot_t *old_slot = lpr_fd_table_slot_const(table, old_fd);
     lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd(table, old_fd);
     lpr_fd_table_slot_t *new_slot = lpr_fd_table_slot(table, new_fd);
     if (old_slot == 0 || file == 0 || new_slot == 0) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     if (old_fd == new_fd) {
+        lpr_fd_table_unlock(table);
         return 0;
     }
-    if (new_slot->active && lpr_fd_table_close(table, new_fd) != 0) {
+    if (new_slot->active && lpr_fd_table_close_unlocked(table, new_fd) != 0) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     new_slot->active = 1;
@@ -284,6 +369,7 @@ int lpr_fd_table_dup2(
     new_slot->file_index = old_slot->file_index;
     file->refcount++;
     table->generation++;
+    lpr_fd_table_unlock(table);
     return 0;
 }
 
@@ -293,125 +379,168 @@ int lpr_fd_table_close_range(
     uint32_t last,
     uint32_t cloexec_only)
 {
+    lpr_fd_table_lock(table);
     if (!lpr_fd_table_valid(table) || first > last) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     if (last >= table->slot_count) {
         last = table->slot_count - 1u;
     }
     if (first >= table->slot_count) {
+        lpr_fd_table_unlock(table);
         return 0;
     }
+    const uint64_t old_generation = table->generation;
+    uint32_t changed = 0;
     for (uint32_t fd = first; fd <= last; fd++) {
         if (!table->slots[fd].active) {
             continue;
         }
         if (cloexec_only) {
             table->slots[fd].fd_flags |= LPR_FD_TABLE_FD_CLOEXEC;
-            table->generation++;
+            changed = 1;
         } else {
-            (void)lpr_fd_table_close(table, fd);
+            if (lpr_fd_table_close_unlocked(table, fd) == 0) {
+                changed = 1;
+            }
         }
     }
+    if (changed) {
+        table->generation = old_generation + 1u;
+    }
+    lpr_fd_table_unlock(table);
     return 0;
 }
 
 int lpr_fd_table_get_fd_flags(const lpr_fd_table_t *table, uint32_t fd, uint16_t *out_flags)
 {
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
     const lpr_fd_table_slot_t *slot = lpr_fd_table_slot_const(table, fd);
     if (slot == 0 || !slot->active || out_flags == 0) {
+        lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return -1;
     }
     *out_flags = slot->fd_flags;
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return 0;
 }
 
 int lpr_fd_table_set_fd_flags(lpr_fd_table_t *table, uint32_t fd, uint16_t flags)
 {
+    lpr_fd_table_lock(table);
     lpr_fd_table_slot_t *slot = lpr_fd_table_slot(table, fd);
     if (slot == 0 || !slot->active) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     slot->fd_flags = flags;
     table->generation++;
+    lpr_fd_table_unlock(table);
     return 0;
 }
 
 int lpr_fd_table_get_status_flags(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_flags)
 {
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
     const lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd_const(table, fd);
     if (file == 0 || out_flags == 0) {
+        lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return -1;
     }
     *out_flags = file->status_flags;
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return 0;
 }
 
 int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, uint32_t fd, uint32_t flags)
 {
+    lpr_fd_table_lock(table);
     lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd(table, fd);
     if (file == 0) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     file->status_flags = flags;
     table->generation++;
+    lpr_fd_table_unlock(table);
     return 0;
 }
 
 int lpr_fd_table_get_offset(const lpr_fd_table_t *table, uint32_t fd, uint64_t *out_offset)
 {
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
     const lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd_const(table, fd);
     if (file == 0 || out_offset == 0) {
+        lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return -1;
     }
     *out_offset = file->offset;
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return 0;
 }
 
 int lpr_fd_table_set_offset(lpr_fd_table_t *table, uint32_t fd, uint64_t offset)
 {
+    lpr_fd_table_lock(table);
     lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd(table, fd);
     if (file == 0) {
+        lpr_fd_table_unlock(table);
         return -1;
     }
     file->offset = offset;
     table->generation++;
+    lpr_fd_table_unlock(table);
     return 0;
 }
 
 lpr_fd_object_t *lpr_fd_table_object_for_fd(lpr_fd_table_t *table, uint32_t fd)
 {
-    return lpr_fd_table_file_for_fd(table, fd);
+    lpr_fd_table_lock(table);
+    lpr_fd_object_t *object = lpr_fd_table_file_for_fd(table, fd);
+    lpr_fd_table_unlock(table);
+    return object;
 }
 
 const lpr_fd_object_t *lpr_fd_table_object_for_fd_const(const lpr_fd_table_t *table, uint32_t fd)
 {
-    return lpr_fd_table_file_for_fd_const(table, fd);
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
+    const lpr_fd_object_t *object = lpr_fd_table_file_for_fd_const(table, fd);
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
+    return object;
 }
 
 int lpr_fd_table_get_kind(const lpr_fd_table_t *table, uint32_t fd, uint8_t *out_kind)
 {
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
     const lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd_const(table, fd);
     if (file == 0 || out_kind == 0) {
+        lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return -1;
     }
     *out_kind = file->kind;
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return 0;
 }
 
 int lpr_fd_table_get_refcount(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_refcount)
 {
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
     const lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd_const(table, fd);
     if (file == 0 || out_refcount == 0) {
+        lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return -1;
     }
     *out_refcount = file->refcount;
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return 0;
 }
 
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table)
 {
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
     if (!lpr_fd_table_valid(table)) {
+        lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return 0;
     }
     uint32_t count = 0;
@@ -420,12 +549,15 @@ uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table)
             count++;
         }
     }
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return count;
 }
 
 uint32_t lpr_fd_table_live_file_count(const lpr_fd_table_t *table)
 {
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
     if (!lpr_fd_table_valid(table)) {
+        lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return 0;
     }
     uint32_t count = 0;
@@ -434,5 +566,6 @@ uint32_t lpr_fd_table_live_file_count(const lpr_fd_table_t *table)
             count++;
         }
     }
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return count;
 }

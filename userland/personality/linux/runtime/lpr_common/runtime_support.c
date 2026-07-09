@@ -77,6 +77,23 @@ void lpr_zero_bytes(void *ptr, uint64_t len)
     }
 }
 
+static void lpr_fd_lock_futex_wait(volatile uint32_t *word, uint32_t expected)
+{
+    (void)lpr_pacha_syscall3(
+        PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+        (uint64_t)(uintptr_t)word,
+        expected,
+        UINT64_MAX);
+}
+
+static void lpr_fd_lock_futex_wake(volatile uint32_t *word, uint32_t count)
+{
+    (void)lpr_pacha_syscall2(
+        PACHA_RUNTIME_SYSCALL_FUTEX_WAKE,
+        (uint64_t)(uintptr_t)word,
+        count);
+}
+
 void lpr_fd_arrays_init(void)
 {
     if (lpr_fd_table_capacity != 0) {
@@ -91,6 +108,11 @@ void lpr_fd_arrays_init(void)
         LPR_FD_TABLE_INITIAL_SIZE,
         lpr_control_files,
         LPR_FD_TABLE_INITIAL_SIZE);
+    lpr_fd_table_configure_lock(
+        &lpr_control_fd_table,
+        &lpr_state.thread_count,
+        lpr_fd_lock_futex_wait,
+        lpr_fd_lock_futex_wake);
 }
 
 uint64_t lpr_align_up_pow2(uint64_t value, uint64_t align)
@@ -205,6 +227,15 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
         (lpr_fd_table_slot_t *)(void *)(base + control_slot_offset);
     lpr_fd_table_file_t *new_control_files =
         (lpr_fd_table_file_t *)(void *)(base + control_file_offset);
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    if (required_capacity <= lpr_fd_table_capacity) {
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)mapped,
+            total_bytes);
+        return 0;
+    }
     lpr_memcpy(
         new_control_slots,
         lpr_control_slots,
@@ -225,9 +256,11 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
     lpr_control_fd_table.files = lpr_control_files;
     lpr_control_fd_table.slot_count = (uint32_t)new_capacity;
     lpr_control_fd_table.file_count = (uint32_t)new_capacity;
+    lpr_control_fd_table.generation++;
     lpr_fd_table_capacity = new_capacity;
     lpr_fd_table_dynamic_base = (void *)(uintptr_t)mapped;
     lpr_fd_table_dynamic_bytes = total_bytes;
+    lpr_fd_table_unlock(&lpr_control_fd_table);
     return 0;
 }
 
@@ -287,15 +320,6 @@ void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t stat
 {
     pacha_trace3(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_READV_TO_VMO_STATUS, PACHA_TRACE_CLASS_DEBUG, fd, requested, (uint64_t)status);
 }
-
-uint64_t lpr_readv_cache_total;
-uint64_t lpr_readv_cache_coalesced;
-uint64_t lpr_readv_cache_hit;
-uint64_t lpr_readv_cache_fill;
-uint64_t lpr_readv_cache_fallback;
-uint64_t lpr_readv_cache_cross_page;
-uint64_t lpr_readv_cache_to_vmo;
-uint64_t lpr_readv_cache_bytes;
 
 void lpr_linux_readv_cache_trace_dump(void)
 {

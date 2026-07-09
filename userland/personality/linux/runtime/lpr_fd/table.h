@@ -116,12 +116,23 @@ typedef struct lpr_fd_table_object {
 typedef lpr_fd_entry_t lpr_fd_table_slot_t;
 typedef lpr_fd_object_t lpr_fd_table_file_t;
 
+typedef void (*lpr_futex_wait_fn)(volatile uint32_t *word, uint32_t expected);
+typedef void (*lpr_futex_wake_fn)(volatile uint32_t *word, uint32_t count);
+
+typedef struct lpr_lock {
+    volatile uint32_t word;
+    const volatile uint32_t *thread_count;
+    lpr_futex_wait_fn futex_wait;
+    lpr_futex_wake_fn futex_wake;
+} lpr_lock_t;
+
 typedef struct lpr_fd_table {
     lpr_fd_entry_t *slots;
     uint32_t slot_count;
     lpr_fd_object_t *files;
     uint32_t file_count;
     uint64_t generation;
+    lpr_lock_t lock;
 } lpr_fd_table_t;
 
 typedef struct lpr_fd_table_install {
@@ -139,6 +150,14 @@ void lpr_fd_table_init(
     uint32_t slot_count,
     lpr_fd_table_file_t *files,
     uint32_t file_count);
+
+void lpr_fd_table_configure_lock(
+    lpr_fd_table_t *table,
+    const volatile uint32_t *thread_count,
+    lpr_futex_wait_fn futex_wait,
+    lpr_futex_wake_fn futex_wake);
+void lpr_fd_table_lock(lpr_fd_table_t *table);
+void lpr_fd_table_unlock(lpr_fd_table_t *table);
 
 int lpr_fd_table_install_at(
     lpr_fd_table_t *table,
