@@ -91,7 +91,7 @@ Phase 5  プロトコル刷新 (_v2 廃止、envelope 統一)
 ```
 
 依存: 0 → (1, 2, 3 は並行可) → 4。5 は最後 (機械的リネームが主)。
-Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) は T1.1 の受け入れテスト。
+Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) は T1.1 の受け入れテスト。
 
 ---
 
@@ -162,7 +162,11 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - kernel pipe (`state/pipe.zig`) 側の blocking/wakeup/EOF バグはその場で修正 (kernel 編集許可済み)。
 - 受け入れ: 新パイプスモーク全ケース通過 + 既存スモーク 3 本通過。以後このスモークを標準検証セットに加える。
 
-**Phase 3 実行順の改訂 (2026-07-10, ユーザー判断)**: T3.0 のバグ探索は部分修正 3 件 (17bebd0, 94f1cd9) の後で一時停止。残る症状 (16K+ パイプ停止 / grep -q 後のシェル停止 / 実行反復での OOM 劣化 / loader 非決定失敗) はサブシステム横断で「共有状態の腐敗が別々の顔で見えている」パターンであり、未リファクタの LPR 構造 (fd シャドウテーブル分裂、.inc、static 状態) が原因を見えにくくしている。よって **T3.1 → T3.3+T3.4 (構造整理) を先に行い、その上で T3.0 の残バグに戻る**。red のままの pipe-stress / gnu-coreutils スモークは泥の検出器として固定し、リファクタ中は「green は green のまま、red は同一の red のまま」を挙動保存の判定に使う。
+**Phase 3 実行順の改訂 (2026-07-10, ユーザー判断)**: T3.0 のバグ探索は部分修正 3 件 (17bebd0, 94f1cd9) の後で一時停止。残る症状 (16K+ パイプ停止 / grep -q 後のシェル停止 / 実行反復での OOM 劣化 / loader 非決定失敗) はサブシステム横断で「共有状態の腐敗が別々の顔で見えている」パターンであり、未リファクタの LPR 構造 (fd シャドウテーブル分裂、.inc、static 状態) が原因を見えにくくしている。よって **T3.1 (機械的変換) → T3.3 (状態モデル再設計) を先に行い、その上で T3.0 の残バグに戻る**。
+
+判定基準はタスク種別で分ける:
+- **移動系 (T3.1)**: green は green のまま、red は同一の red のまま (症状が変わったら挙動を変えた兆候)。
+- **再設計系 (T3.3)**: 挙動保存を目的にしない。目標意味論は古いコードではなく **Linux の fd/pipe セマンティクス**。red スモーク (pipe-stress CASE3+, gnu CASE2) の green 化が受け入れ基準の一部。元の状態管理が酷い部分を挙動ごと温存しても改善しないため、根本から作り直す (ユーザー判断)。
 
 **T3.1 syscall dispatch の table 化 + .inc 廃止**
 - 3 つの switch を `{nr, handler}` の単一テーブルに。`lpr_vfs/*.inc` 等の textual include を通常の .c/.h に変換 (build script 更新込み)。
@@ -172,17 +176,18 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - wire page 確保/破棄・call・reply 検証・errno 変換の定型を `lpr_rpc.{c,h}` に集約。lpr_filed / lpr_socket / lpr_tty / lpr_process の各クライアントを移行。
 - 受け入れ: 全スモーク通過。コード量削減を PR に記録。
 
-**T3.3 Linux fd 状態の単一所有**
-- LPR in-process fd table を唯一の実体とし、lpr_supervisor 側の常時ミラー (`lprs_filedesc_t` 更新経路) を廃止。fork/execve の瞬間だけ snapshot を serialize して渡す形 (`supervisor_fd_snapshot.c` を唯一の転送経路に)。
-- 受け入れ: fork/exec/pipe/dup を使うスモーク (`run-lpr-qemu-fd-pipe-smoke.sh`, coreutils-mini) 通過。
-
-**T3.4 LPR 状態の構造体化と lock 導入 (thread-safe 準備)**
-- file-scope static (fd table, rlimits, umask, file_map_cache, vfs cache, socket table…) を `lpr_state_t` 1 つに集約。fd table と mmap 経路に futex ベースの軽量 lock を入れる。single-thread 時のオーバーヘッドは fast path で回避。
-- 受け入れ: 全スモーク通過。ベンチ非劣化 (±5%)。
+**T3.3 LPR 状態モデルの再設計 (旧 T3.3+T3.4 統合)** ※挙動変更あり — 目標意味論は Linux
+- 改訂 (2026-07-10, ユーザー判断): 元の状態管理が酷い部分は挙動保存の移動では改善しない。根本から作り直す。
+- **設計を先に書く**: 実装前に `pacha_docs/lpr-state-design.md` として目標モデルを文書化し、それに沿って実装する。
+  - **単一 fd table**: fd 種別ごとのシャドウテーブル (`lpr_pipe_fds` / socket / eventfd / filed fd / tty) と相互 negative check を全廃し、kind タグ + kind 別 payload を持つ 1 枚の fd table に統合。fd の判定・dup/dup2・close・CLOEXEC はすべてこの 1 枚の上の一様な操作。
+  - **明示的ライフサイクル**: open / dup / dup2 / pipe / socket 作成、fork 時の snapshot serialize、execve 時の継承、close の各遷移を単一モジュールが所有。lpr_supervisor の常時ミラー (`lprs_filedesc_t` 更新経路) は廃止し、fork/exec の瞬間の snapshot 転送 (`supervisor_fd_snapshot.c`) だけにする。
+  - **状態の集約**: 残りの file-scope static (rlimits, umask, file_map_cache, vfs cache…) を `lpr_state_t` に集約。thread-safe 化 (lock 導入) は T4.1 の前提として fd table と mmap 経路に futex ベースで入れる (single-thread fast path 維持)。
+  - **可観測性を設計に含める**: fd table 全体と各 kind の状態を 1 回のトレースイベント列でダンプできる debug 機能 (`lpr_state_dump()`) を最初から持たせる。T3.0 残バグの診断に使う。
+- 受け入れ: green スモーク維持 + **red スモークの green 化または「診断された理由付きの red」** (pipe-stress 全ケース×5反復, gnu-coreutils 全ケース)。fd-pipe / ext4 通過。ベンチ非劣化 (±10%)。
 
 ### Phase 4 — clang / mesa3d ギャップ
 
-**T4.1 CLONE_THREAD 対応** (依存: T3.4)
+**T4.1 CLONE_THREAD 対応** (依存: T3.3)
 - `lpr_linux_clone` の CLONE_THREAD|CLONE_VM 経路を kernel `thread_create/thread_start` に配線。`set_tid_address` / CLONE_CHILD_CLEARTID の futex wake / `gettid` / TLS (clone の tls 引数) / `exit` (スレッド単位) を実装。
 - 受け入れ: musl pthread テスト (create/join/mutex/cond, 4 スレッド) が QEMU で通る新規スモーク。
 
@@ -222,6 +227,6 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 |---|---|---|
 | 1 | T0.1, T0.2 | — |
 | 2 | T1.1 (最優先: clang 根治), T1.2, T2.1, T3.1 | Phase 0 |
-| 3 | T1.3, T1.4, T2.2, T2.3, T3.0 (pipe 安定化), T3.2, T3.3 | 上記 |
-| 4 | T3.4 → T4.1, T2.2 → T4.2, T4.3, T4.4, T4.5 | Phase 1–3 |
+| 3 | T1.3, T1.4, T2.2, T2.3, T3.0→T3.1→T3.3 (状態モデル再設計)→T3.0再開, T3.2 | 上記 |
+| 4 | T3.3 → T4.1, T2.2 → T4.2, T4.3, T4.4, T4.5 | Phase 1–3 |
 | 5 | T5.1 | 全部 |
