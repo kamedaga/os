@@ -200,6 +200,12 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - T1.1 の耐久スモーク (chibicc コンパイルループ) を clang 版に差し替え/併設し CI 化。
 - 受け入れ: clang でのコンパイル 10 回連続成功、ページリークなし。これが本リファクタリング全体の完了基準。
 
+**T4.6 [kernel] 非同期シグナル配送 (CPU-bound プロセスへの割込み)**
+- 現状 (2026-07-09 ユーザー情報): signal は syscall 待機中のプロセスにしか届かず、CPU-bound 実行中のプロセスには Ctrl-C も kill も効かない。バグではなく未実装。
+- timer interrupt からのユーザー復帰時に pending signal をチェックして配送する経路を kernel に追加。SIGKILL は handler なしで即終了、それ以外は LPR の signal 経路 (lpr_supervisor) へ。
+- clang (Ctrl-C 中断)、timeout ベースのツール、mesa のウォッチドッグ系に必要。
+- 受け入れ: CPU-bound ループ (`while :; do :; done` 相当) が Ctrl-C / kill / busybox timeout で確実に止まる QEMU スモーク。
+
 ### Phase 5 — プロトコル刷新
 
 **T5.1 `_v2` 廃止と envelope 統一**
