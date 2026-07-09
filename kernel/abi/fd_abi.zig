@@ -21,8 +21,8 @@ pub const syscall_timerfd_create: u64 = 43;
 pub const syscall_timerfd_settime: u64 = 44;
 pub const syscall_timerfd_gettime: u64 = 45;
 pub const syscall_vmo_create: u64 = 46;
-pub const syscall_vmo_revoke: u64 = 69;
-pub const syscall_fd_last: u64 = syscall_vmo_create;
+pub const syscall_vmo_revoke: u64 = 47;
+pub const syscall_fd_last: u64 = syscall_vmo_revoke;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
 pub const flag_cloexec: u32 = 1 << 0;

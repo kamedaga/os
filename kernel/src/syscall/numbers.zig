@@ -81,7 +81,7 @@ pub const syscall_capsule_pci_config_write: u64 = capsule_abi.syscall_capsule_pc
 pub const syscall_capsule_pci_bar_info: u64 = capsule_abi.syscall_capsule_pci_bar_info;
 pub const syscall_capsule_irq_poll: u64 = capsule_abi.syscall_capsule_irq_poll;
 
-pub const syscall_last: u64 = syscall_vmo_revoke;
+pub const syscall_last: u64 = syscall_capsule_irq_poll;
 
 pub const user_log_max_bytes: usize = 256;
 
@@ -142,6 +142,7 @@ test "native syscall numbers are contiguous" {
         syscall_timerfd_settime,
         syscall_timerfd_gettime,
         syscall_vmo_create,
+        syscall_vmo_revoke,
         syscall_mmap,
         syscall_munmap,
         syscall_mprotect,
@@ -164,7 +165,6 @@ test "native syscall numbers are contiguous" {
         syscall_capsule_pci_config_write,
         syscall_capsule_pci_bar_info,
         syscall_capsule_irq_poll,
-        syscall_vmo_revoke,
     };
     try std.testing.expectEqual(@as(usize, syscall_last), expected.len);
     for (expected, 1..) |nr, index| {
