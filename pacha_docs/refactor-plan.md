@@ -113,11 +113,12 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 
 ### Phase 1 — kernel
 
-**T1.1 [kernel] VM object の参照 drop と revoke の分離** ※挙動変更
-- `release_vm_object` を「呼び出し元の cap slot のみ解放、backing は refcount 0 で解放」に変更。subtree 無効化は新設の明示 `revoke_vm_object` のみが行う (プロセス終了時の cleanup は revoke 相当を維持)。
-- grant で refcount を増やし、親の release が子 (LinuxAbiServer 等) の cap を壊さないこと。
-- 受け入れ: 新規テスト = clang を 5 回連続実行して成功 + 実行前後で kernel free page count が単調減少しない (リークなし)。全スモーク通過。
-- 注: hikitugi.md の `SYSCALL_DROP_VM_OBJECT_CAP` 提案の恒久版。正当性説明を PR に書く。
+**T1.1 [kernel] リソースリーク耐久テスト (VMO/プロセスライフサイクルの実証)**
+- 前提修正 (2026-07-09 調査): hikitugi.md の cap-tree revoke 問題 (`revokeVmObjectCapTree`) は FD-based 再設計で既に存在しない。現行は `NativeVmoSlot` の refcount + 親チェーン解放。よって本タスクは意味論変更ではなく「現行モデルにリークがないことの実証と、見つかったリークの修正」。
+- kernel の空きページ数・使用中 VMO/fd/process スロット数を userland から読める診断手段を用意 (既存の観測経路があればそれを使い、なければ最小の診断 syscall or ログを追加)。
+- QEMU スモークとして「fork/exec を N 回 (busybox 実行 ×20 以上) 繰り返し、空きページ数が定常状態に収束する (単調減少しない)」テストを `tests/` に追加。
+- 見つかったリーク (VMO, fd, IPC, process slot) は修正する。
+- 受け入れ: 新規耐久スモーク通過 + 既存スモーク 3 本通過。将来 clang が動くようになったら T4.5 で同型のテストを clang に差し替える。
 
 **T1.2 [kernel] kernel.zig の分割** ※挙動変更なし
 - `KernelState` のフィールドとメソッドをドメインごとに移動: `state/process.zig`, `state/fd.zig`, `state/vmo.zig`, `state/vma.zig`, `state/pipe.zig`, `state/ipc.zig`。kernel.zig は合成と初期化のみ (目安 1,000 行以下)。
